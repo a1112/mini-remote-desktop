@@ -1,0 +1,32 @@
+# Logs
+*.log
+*.err.log
+
+# Node.js
+node_modules/
+package-lock.json
+
+# Rust
+target/
+Cargo.lock
+**/*.rs.bk
+*.pdb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+*.png
+
+# Test outputs
+perf/

@@ -1,0 +1,26 @@
+[package]
+name = "agent-rust"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+bytes = "1.7"
+futures-util = "0.3"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+nvenc = "0.1"
+openh264 = "0.8"
+screenshots = "0.8"
+serde_json = "1.0"
+tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio-tungstenite = "0.24"
+webrtc = "0.12"
+rtp = "0.12"
+rtcp = "0.12"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }

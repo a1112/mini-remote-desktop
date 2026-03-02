@@ -1,0 +1,11 @@
+{
+  "wsUrl": "ws://localhost:9527",
+  "capture": {
+    "fps": 30,
+    "minWidth": 1280,
+    "maxWidth": 1920,
+    "minHeight": 720,
+    "maxHeight": 1080
+  }
+}
+

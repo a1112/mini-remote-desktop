@@ -1,0 +1,14 @@
+{
+  "name": "mini-remote-agent",
+  "version": "1.0.0",
+  "description": "Mini Remote Desktop Agent - 被控端",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "dependencies": {
+    "electron": "^33.2.1",
+    "ws": "^8.18.0",
+    "robotjs": "^0.6.0"
+  }
+}
