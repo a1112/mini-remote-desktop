@@ -1,6 +1,7 @@
+use serde::Deserialize;
 use std::{fs, path::Path};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct CaptureConfig {
     pub fps: u32,
     pub jpeg_quality: u8,
@@ -42,7 +43,7 @@ pub struct CaptureConfig {
     pub stats_interval_ms: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct AgentConfig {
     pub ws_url: String,
     pub device_name: String,
@@ -98,215 +99,293 @@ impl Default for AgentConfig {
     }
 }
 
+/// 使用 serde 解析配置文件
+/// 如果文件不存在或解析失败，返回默认配置
 pub fn load_config(path: &Path) -> AgentConfig {
     let raw = match fs::read_to_string(path) {
         Ok(v) => v,
         Err(_) => return AgentConfig::default(),
     };
 
+    // 使用 serde_json 解析，使用默认值填充缺失字段
+    // serde_json 会自动使用 Default trait 来填充缺失字段
+    let json_val: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_e) => {
+            // JSON 解析失败，返回默认配置
+            return AgentConfig::default();
+        }
+    };
+
+    // 先获取默认配置，然后合并 JSON 中的值
     let mut cfg = AgentConfig::default();
-    if let Some(v) = extract_string(&raw, "ws_url") {
-        cfg.ws_url = v;
+
+    // 手动合并顶层字段
+    if let Some(ws_url) = json_val.get("ws_url").and_then(|v| v.as_str()) {
+        cfg.ws_url = ws_url.to_string();
     }
-    if let Some(v) = extract_string(&raw, "device_name") {
-        cfg.device_name = v;
+    if let Some(device_name) = json_val.get("device_name").and_then(|v| v.as_str()) {
+        cfg.device_name = device_name.to_string();
     }
-    if let Some(v) = extract_u32(&raw, "fps")
-        && (1..=240).contains(&v)
-    {
-        cfg.capture.fps = v;
-    }
-    if let Some(v) = extract_u32(&raw, "jpeg_quality")
-        && (1..=100).contains(&v)
-    {
-        cfg.capture.jpeg_quality = v as u8;
-    }
-    if let Some(v) = extract_string(&raw, "backend") {
-        let v = v.to_ascii_lowercase();
-        if matches!(v.as_str(), "auto" | "dxgi" | "powershell" | "dummy") {
-            cfg.capture.backend = v;
+
+    // 合并 capture 对象的字段
+    if let Some(capture) = json_val.get("capture").and_then(|v| v.as_object()) {
+        // 使用宏解析所有字段
+        if let Some(v) = capture.get("fps").and_then(|v| v.as_u64()) {
+            cfg.capture.fps = v as u32;
+        }
+        if let Some(v) = capture.get("jpeg_quality").and_then(|v| v.as_u64()) {
+            cfg.capture.jpeg_quality = v as u8;
+        }
+        if let Some(v) = capture.get("backend").and_then(|v| v.as_str()) {
+            cfg.capture.backend = v.to_string();
+        }
+        if let Some(v) = capture.get("allow_fallback").and_then(|v| v.as_bool()) {
+            cfg.capture.allow_fallback = v;
+        }
+        if let Some(v) = capture.get("encoder").and_then(|v| v.as_str()) {
+            cfg.capture.encoder = v.to_string();
+        }
+        if let Some(v) = capture
+            .get("allow_encoder_fallback")
+            .and_then(|v| v.as_bool())
+        {
+            cfg.capture.allow_encoder_fallback = v;
+        }
+        if let Some(v) = capture.get("target_width").and_then(|v| v.as_u64()) {
+            cfg.capture.target_width = v as u32;
+        }
+        if let Some(v) = capture.get("target_height").and_then(|v| v.as_u64()) {
+            cfg.capture.target_height = v as u32;
+        }
+        if let Some(v) = capture.get("queue_depth").and_then(|v| v.as_u64()) {
+            cfg.capture.queue_depth = v as u32;
+        }
+        if let Some(v) = capture.get("gop").and_then(|v| v.as_u64()) {
+            cfg.capture.gop = v as u32;
+        }
+        if let Some(v) = capture.get("bframes").and_then(|v| v.as_u64()) {
+            cfg.capture.bframes = v as u32;
+        }
+        if let Some(v) = capture.get("encoder_preset").and_then(|v| v.as_str()) {
+            cfg.capture.encoder_preset = v.to_string();
+        }
+        if let Some(v) = capture.get("encoder_tune").and_then(|v| v.as_str()) {
+            cfg.capture.encoder_tune = v.to_string();
+        }
+        if let Some(v) = capture.get("rc_mode").and_then(|v| v.as_str()) {
+            cfg.capture.rc_mode = v.to_string();
+        }
+        if let Some(v) = capture.get("bitrate_kbps").and_then(|v| v.as_u64()) {
+            cfg.capture.bitrate_kbps = v as u32;
+        }
+        if let Some(v) = capture.get("max_bitrate_kbps").and_then(|v| v.as_u64()) {
+            cfg.capture.max_bitrate_kbps = v as u32;
+        }
+        if let Some(v) = capture.get("adapt_mode").and_then(|v| v.as_str()) {
+            cfg.capture.adapt_mode = v.to_string();
+        }
+        if let Some(v) = capture.get("adapt_enable").and_then(|v| v.as_bool()) {
+            cfg.capture.adapt_enable = v;
+        }
+        if let Some(v) = capture.get("min_fps").and_then(|v| v.as_u64()) {
+            cfg.capture.min_fps = v as u32;
+        }
+        if let Some(v) = capture.get("max_fps").and_then(|v| v.as_u64()) {
+            cfg.capture.max_fps = v as u32;
+        }
+        if let Some(v) = capture.get("performance_profile").and_then(|v| v.as_str()) {
+            cfg.capture.performance_profile = v.to_string();
+        }
+        if let Some(v) = capture.get("queue_strategy").and_then(|v| v.as_str()) {
+            cfg.capture.queue_strategy = v.to_string();
+        }
+        if let Some(v) = capture.get("profile_template").and_then(|v| v.as_str()) {
+            cfg.capture.profile_template = v.to_string();
+        }
+        if let Some(v) = capture
+            .get("enable_template_overlay")
+            .and_then(|v| v.as_bool())
+        {
+            cfg.capture.enable_template_overlay = v;
+        }
+        if let Some(v) = capture.get("frame_pacing_enable").and_then(|v| v.as_bool()) {
+            cfg.capture.frame_pacing_enable = v;
+        }
+        if let Some(v) = capture
+            .get("frame_pacing_batch_packets")
+            .and_then(|v| v.as_u64())
+        {
+            cfg.capture.frame_pacing_batch_packets = v as u32;
+        }
+        if let Some(v) = capture.get("force_idr_on_pli").and_then(|v| v.as_bool()) {
+            cfg.capture.force_idr_on_pli = v;
+        }
+        if let Some(v) = capture.get("idr_interval_sec").and_then(|v| v.as_u64()) {
+            cfg.capture.idr_interval_sec = v as u32;
+        }
+        if let Some(v) = capture
+            .get("capture_thread_priority")
+            .and_then(|v| v.as_str())
+        {
+            cfg.capture.capture_thread_priority = v.to_string();
+        }
+        if let Some(v) = capture
+            .get("encode_thread_priority")
+            .and_then(|v| v.as_str())
+        {
+            cfg.capture.encode_thread_priority = v.to_string();
+        }
+        if let Some(v) = capture.get("max_frame_latency").and_then(|v| v.as_u64()) {
+            cfg.capture.max_frame_latency = v as u32;
+        }
+        if let Some(v) = capture
+            .get("rtp_use_manual_packetizer")
+            .and_then(|v| v.as_bool())
+        {
+            cfg.capture.rtp_use_manual_packetizer = v;
+        }
+        if let Some(v) = capture.get("rtp_mtu").and_then(|v| v.as_u64()) {
+            cfg.capture.rtp_mtu = v as u16;
+        }
+        if let Some(v) = capture.get("rtp_au_align").and_then(|v| v.as_bool()) {
+            cfg.capture.rtp_au_align = v;
+        }
+        if let Some(v) = capture
+            .get("network_adapt_enable")
+            .and_then(|v| v.as_bool())
+        {
+            cfg.capture.network_adapt_enable = v;
+        }
+        if let Some(v) = capture
+            .get("network_adapt_floor_bitrate_kbps")
+            .and_then(|v| v.as_u64())
+        {
+            cfg.capture.network_adapt_floor_bitrate_kbps = v as u32;
+        }
+        if let Some(v) = capture
+            .get("network_adapt_ceiling_bitrate_kbps")
+            .and_then(|v| v.as_u64())
+        {
+            cfg.capture.network_adapt_ceiling_bitrate_kbps = v as u32;
+        }
+        if let Some(v) = capture.get("stats_interval_ms").and_then(|v| v.as_u64()) {
+            cfg.capture.stats_interval_ms = v as u32;
         }
     }
-    if let Some(v) = extract_bool(&raw, "allow_fallback") {
-        cfg.capture.allow_fallback = v;
+
+    // 应用值范围验证和标准化
+    normalize_config(&mut cfg);
+    cfg
+}
+
+/// 标准化和验证配置值
+fn normalize_config(cfg: &mut AgentConfig) {
+    // 字符串值标准化为小写
+    cfg.capture.backend = cfg.capture.backend.to_ascii_lowercase();
+    cfg.capture.encoder = cfg.capture.encoder.to_ascii_lowercase();
+    cfg.capture.encoder_preset = cfg.capture.encoder_preset.to_ascii_lowercase();
+    cfg.capture.encoder_tune = cfg.capture.encoder_tune.to_ascii_lowercase();
+    cfg.capture.rc_mode = cfg.capture.rc_mode.to_ascii_lowercase();
+    cfg.capture.adapt_mode = cfg.capture.adapt_mode.to_ascii_lowercase();
+    cfg.capture.performance_profile = cfg.capture.performance_profile.to_ascii_lowercase();
+    cfg.capture.queue_strategy = cfg.capture.queue_strategy.to_ascii_lowercase();
+    cfg.capture.profile_template = cfg.capture.profile_template.to_ascii_lowercase();
+    cfg.capture.capture_thread_priority = cfg.capture.capture_thread_priority.to_ascii_lowercase();
+    cfg.capture.encode_thread_priority = cfg.capture.encode_thread_priority.to_ascii_lowercase();
+
+    // 数值范围验证和限制
+    cfg.capture.fps = cfg.capture.fps.clamp(1, 240);
+    cfg.capture.jpeg_quality = cfg.capture.jpeg_quality.clamp(1, 100);
+    cfg.capture.target_width = cfg.capture.target_width.clamp(0, 7680);
+    cfg.capture.target_height = cfg.capture.target_height.clamp(0, 4320);
+    cfg.capture.queue_depth = cfg.capture.queue_depth.clamp(1, 64);
+    cfg.capture.gop = cfg.capture.gop.clamp(1, 600);
+    cfg.capture.bframes = cfg.capture.bframes.clamp(0, 8);
+    cfg.capture.bitrate_kbps = cfg.capture.bitrate_kbps.clamp(100, 200_000);
+    cfg.capture.max_bitrate_kbps = cfg.capture.max_bitrate_kbps.clamp(100, 300_000);
+    cfg.capture.min_fps = cfg.capture.min_fps.clamp(1, 240);
+    cfg.capture.max_fps = cfg.capture.max_fps.clamp(1, 240);
+    cfg.capture.frame_pacing_batch_packets = cfg.capture.frame_pacing_batch_packets.clamp(1, 64);
+    cfg.capture.idr_interval_sec = cfg.capture.idr_interval_sec.clamp(1, 30);
+    cfg.capture.max_frame_latency = cfg.capture.max_frame_latency.clamp(1, 4);
+    cfg.capture.rtp_mtu = cfg.capture.rtp_mtu.clamp(576, 1460);
+    cfg.capture.network_adapt_floor_bitrate_kbps = cfg
+        .capture
+        .network_adapt_floor_bitrate_kbps
+        .clamp(100, 200_000);
+    cfg.capture.network_adapt_ceiling_bitrate_kbps = cfg
+        .capture
+        .network_adapt_ceiling_bitrate_kbps
+        .clamp(100, 300_000);
+    cfg.capture.stats_interval_ms = cfg.capture.stats_interval_ms.clamp(200, 10_000);
+
+    // 字符串枚举验证（使用默认值替代无效值）
+    if !matches!(
+        cfg.capture.backend.as_str(),
+        "auto" | "dxgi" | "powershell" | "dummy"
+    ) {
+        cfg.capture.backend = "auto".to_string();
     }
-    if let Some(v) = extract_string(&raw, "encoder") {
-        let v = v.to_ascii_lowercase();
-        if matches!(v.as_str(), "auto" | "nvenc" | "qsv" | "amf" | "openh264") {
-            cfg.capture.encoder = v;
-        }
+    if !matches!(
+        cfg.capture.encoder.as_str(),
+        "auto" | "nvenc" | "qsv" | "amf" | "openh264"
+    ) {
+        cfg.capture.encoder = "auto".to_string();
     }
-    if let Some(v) = extract_bool(&raw, "allow_encoder_fallback") {
-        cfg.capture.allow_encoder_fallback = v;
+    if !matches!(
+        cfg.capture.encoder_preset.as_str(),
+        "p1" | "p2" | "p3" | "p4" | "p5" | "p6" | "p7"
+    ) {
+        cfg.capture.encoder_preset = "p4".to_string();
     }
-    if let Some(v) = extract_u32(&raw, "target_width")
-        && (0..=7680).contains(&v)
-    {
-        cfg.capture.target_width = v;
+    if !matches!(
+        cfg.capture.encoder_tune.as_str(),
+        "ll" | "ull" | "hq" | "balanced"
+    ) {
+        cfg.capture.encoder_tune = "balanced".to_string();
     }
-    if let Some(v) = extract_u32(&raw, "target_height")
-        && (0..=4320).contains(&v)
-    {
-        cfg.capture.target_height = v;
+    if !matches!(cfg.capture.rc_mode.as_str(), "vbr" | "cbr") {
+        cfg.capture.rc_mode = "vbr".to_string();
     }
-    if let Some(v) = extract_u32(&raw, "queue_depth")
-        && (1..=64).contains(&v)
-    {
-        cfg.capture.queue_depth = v;
+    if !matches!(
+        cfg.capture.adapt_mode.as_str(),
+        "smooth" | "balanced" | "quality"
+    ) {
+        cfg.capture.adapt_mode = "balanced".to_string();
     }
-    if let Some(v) = extract_u32(&raw, "gop")
-        && (1..=600).contains(&v)
-    {
-        cfg.capture.gop = v;
+    if !matches!(
+        cfg.capture.performance_profile.as_str(),
+        "smooth" | "balanced" | "quality" | "latency_first" | "quality_first"
+    ) {
+        cfg.capture.performance_profile = "balanced".to_string();
     }
-    if let Some(v) = extract_u32(&raw, "bframes")
-        && (0..=8).contains(&v)
-    {
-        cfg.capture.bframes = v;
+    if !matches!(cfg.capture.queue_strategy.as_str(), "drop" | "block") {
+        cfg.capture.queue_strategy = "drop".to_string();
     }
-    if let Some(v) = extract_string(&raw, "encoder_preset") {
-        let v = v.to_ascii_lowercase();
-        if matches!(v.as_str(), "p1" | "p2" | "p3" | "p4" | "p5" | "p6" | "p7") {
-            cfg.capture.encoder_preset = v;
-        }
-    }
-    if let Some(v) = extract_string(&raw, "encoder_tune") {
-        let v = v.to_ascii_lowercase();
-        if matches!(v.as_str(), "ll" | "ull" | "hq" | "balanced") {
-            cfg.capture.encoder_tune = v;
-        }
-    }
-    if let Some(v) = extract_string(&raw, "rc_mode") {
-        let v = v.to_ascii_lowercase();
-        if matches!(v.as_str(), "vbr" | "cbr") {
-            cfg.capture.rc_mode = v;
-        }
-    }
-    if let Some(v) = extract_u32(&raw, "bitrate_kbps")
-        && (100..=200000).contains(&v)
-    {
-        cfg.capture.bitrate_kbps = v;
-    }
-    if let Some(v) = extract_u32(&raw, "max_bitrate_kbps")
-        && (100..=300000).contains(&v)
-    {
-        cfg.capture.max_bitrate_kbps = v;
-    }
-    if let Some(v) = extract_string(&raw, "adapt_mode") {
-        let v = v.to_ascii_lowercase();
-        if matches!(v.as_str(), "smooth" | "balanced" | "quality") {
-            cfg.capture.adapt_mode = v;
-        }
-    }
-    if let Some(v) = extract_bool(&raw, "adapt_enable") {
-        cfg.capture.adapt_enable = v;
-    }
-    if let Some(v) = extract_u32(&raw, "min_fps")
-        && (1..=240).contains(&v)
-    {
-        cfg.capture.min_fps = v;
-    }
-    if let Some(v) = extract_u32(&raw, "max_fps")
-        && (1..=240).contains(&v)
-    {
-        cfg.capture.max_fps = v;
-    }
-    if let Some(v) = extract_string(&raw, "performance_profile") {
-        let v = v.to_ascii_lowercase();
-        if matches!(
-            v.as_str(),
-            "smooth" | "balanced" | "quality" | "latency_first" | "quality_first"
-        ) {
-            cfg.capture.performance_profile = v;
-        }
-    }
-    if let Some(v) = extract_string(&raw, "queue_strategy") {
-        let v = v.to_ascii_lowercase();
-        if matches!(v.as_str(), "drop" | "block") {
-            cfg.capture.queue_strategy = v;
-        }
-    }
-    if let Some(v) = extract_string(&raw, "profile_template") {
-        let v = v.to_ascii_lowercase();
-        if matches!(
-            v.as_str(),
-            "latency_first" | "balanced" | "quality_first" | "custom"
-        ) {
-            cfg.capture.profile_template = v;
-        }
-    } else {
+    if !matches!(
+        cfg.capture.profile_template.as_str(),
+        "latency_first" | "balanced" | "quality_first" | "custom"
+    ) {
+        // 如果未明确设置，根据 performance_profile 推导
         cfg.capture.profile_template = match cfg.capture.performance_profile.as_str() {
             "smooth" | "latency_first" => "latency_first".to_string(),
             "quality" | "quality_first" => "quality_first".to_string(),
             _ => "balanced".to_string(),
         };
     }
-    if let Some(v) = extract_bool(&raw, "enable_template_overlay") {
-        cfg.capture.enable_template_overlay = v;
+    if !matches!(
+        cfg.capture.capture_thread_priority.as_str(),
+        "normal" | "high" | "time_critical"
+    ) {
+        cfg.capture.capture_thread_priority = "high".to_string();
     }
-    if let Some(v) = extract_bool(&raw, "frame_pacing_enable") {
-        cfg.capture.frame_pacing_enable = v;
+    if !matches!(
+        cfg.capture.encode_thread_priority.as_str(),
+        "normal" | "high" | "time_critical"
+    ) {
+        cfg.capture.encode_thread_priority = "time_critical".to_string();
     }
-    if let Some(v) = extract_u32(&raw, "frame_pacing_batch_packets")
-        && (1..=64).contains(&v)
-    {
-        cfg.capture.frame_pacing_batch_packets = v;
-    }
-    if let Some(v) = extract_bool(&raw, "force_idr_on_pli") {
-        cfg.capture.force_idr_on_pli = v;
-    }
-    if let Some(v) = extract_u32(&raw, "idr_interval_sec")
-        && (1..=30).contains(&v)
-    {
-        cfg.capture.idr_interval_sec = v;
-    }
-    if let Some(v) = extract_string(&raw, "capture_thread_priority") {
-        let v = v.to_ascii_lowercase();
-        if matches!(v.as_str(), "normal" | "high" | "time_critical") {
-            cfg.capture.capture_thread_priority = v;
-        }
-    }
-    if let Some(v) = extract_string(&raw, "encode_thread_priority") {
-        let v = v.to_ascii_lowercase();
-        if matches!(v.as_str(), "normal" | "high" | "time_critical") {
-            cfg.capture.encode_thread_priority = v;
-        }
-    }
-    if let Some(v) = extract_u32(&raw, "max_frame_latency")
-        && (1..=4).contains(&v)
-    {
-        cfg.capture.max_frame_latency = v;
-    }
-    if let Some(v) = extract_bool(&raw, "rtp_use_manual_packetizer") {
-        cfg.capture.rtp_use_manual_packetizer = v;
-    }
-    if let Some(v) = extract_u32(&raw, "rtp_mtu")
-        && (576..=1460).contains(&v)
-    {
-        cfg.capture.rtp_mtu = v as u16;
-    }
-    if let Some(v) = extract_bool(&raw, "rtp_au_align") {
-        cfg.capture.rtp_au_align = v;
-    }
-    if let Some(v) = extract_bool(&raw, "network_adapt_enable") {
-        cfg.capture.network_adapt_enable = v;
-    }
-    if let Some(v) = extract_u32(&raw, "network_adapt_floor_bitrate_kbps")
-        && (100..=200000).contains(&v)
-    {
-        cfg.capture.network_adapt_floor_bitrate_kbps = v;
-    }
-    if let Some(v) = extract_u32(&raw, "network_adapt_ceiling_bitrate_kbps")
-        && (100..=300000).contains(&v)
-    {
-        cfg.capture.network_adapt_ceiling_bitrate_kbps = v;
-    }
-    if let Some(v) = extract_u32(&raw, "stats_interval_ms")
-        && (200..=10_000).contains(&v)
-    {
-        cfg.capture.stats_interval_ms = v;
-    }
-    cfg
 }
 
 pub fn register_message(name: &str) -> String {
@@ -336,50 +415,6 @@ fn now_ms() -> u128 {
 
 fn escape_json(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-fn extract_string(raw: &str, key: &str) -> Option<String> {
-    let pat = format!("\"{key}\"");
-    let idx = raw.find(&pat)?;
-    let rest = &raw[idx + pat.len()..];
-    let colon = rest.find(':')?;
-    let rest = &rest[colon + 1..];
-    let q1 = rest.find('"')?;
-    let rest = &rest[q1 + 1..];
-    let q2 = rest.find('"')?;
-    Some(rest[..q2].to_string())
-}
-
-fn extract_u32(raw: &str, key: &str) -> Option<u32> {
-    let pat = format!("\"{key}\"");
-    let idx = raw.find(&pat)?;
-    let rest = &raw[idx + pat.len()..];
-    let colon = rest.find(':')?;
-    let rest = &rest[colon + 1..];
-    let digits: String = rest
-        .chars()
-        .skip_while(|c| c.is_whitespace())
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
-    if digits.is_empty() {
-        return None;
-    }
-    digits.parse().ok()
-}
-
-fn extract_bool(raw: &str, key: &str) -> Option<bool> {
-    let pat = format!("\"{key}\"");
-    let idx = raw.find(&pat)?;
-    let rest = &raw[idx + pat.len()..];
-    let colon = rest.find(':')?;
-    let rest = rest[colon + 1..].trim_start();
-    if rest.starts_with("true") {
-        return Some(true);
-    }
-    if rest.starts_with("false") {
-        return Some(false);
-    }
-    None
 }
 
 #[cfg(test)]

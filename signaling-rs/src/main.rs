@@ -1,22 +1,94 @@
-﻿use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, RwLock};
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
-const PORT: u16 = 9527;
+const DEFAULT_PORT: u16 = 9527;
+const DEFAULT_CHANNEL_CAPACITY: usize = 32;
+const DEFAULT_MAX_MSG_SIZE: usize = 1_048_576; // 1MB
+const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 30;
+const DEFAULT_CONNECTION_TIMEOUT_SECS: u64 = 60;
+
+/// 服务器配置
+#[derive(Debug, Clone, Deserialize)]
+struct ServerConfig {
+    #[serde(default = "default_port")]
+    port: u16,
+    #[serde(default = "default_host")]
+    host: String,
+    #[serde(default = "default_channel_capacity")]
+    channel_capacity: usize,
+    #[serde(default = "default_max_msg_size")]
+    max_msg_size: usize,
+    #[serde(default = "default_heartbeat_interval")]
+    heartbeat_interval_secs: u64,
+    #[serde(default = "default_connection_timeout")]
+    connection_timeout_secs: u64,
+}
+
+fn default_port() -> u16 { DEFAULT_PORT }
+fn default_host() -> String { "0.0.0.0".to_string() }
+fn default_channel_capacity() -> usize { DEFAULT_CHANNEL_CAPACITY }
+fn default_max_msg_size() -> usize { DEFAULT_MAX_MSG_SIZE }
+fn default_heartbeat_interval() -> u64 { DEFAULT_HEARTBEAT_INTERVAL_SECS }
+fn default_connection_timeout() -> u64 { DEFAULT_CONNECTION_TIMEOUT_SECS }
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            port: default_port(),
+            host: default_host(),
+            channel_capacity: default_channel_capacity(),
+            max_msg_size: default_max_msg_size(),
+            heartbeat_interval_secs: default_heartbeat_interval(),
+            connection_timeout_secs: default_connection_timeout(),
+        }
+    }
+}
+
+/// 从配置文件加载配置，如果文件不存在或解析失败则返回默认配置
+fn load_config(path: &Path) -> ServerConfig {
+    match std::fs::read_to_string(path) {
+        Ok(content) => {
+            match toml::from_str::<ServerConfig>(&content) {
+                Ok(mut cfg) => {
+                    // 验证并限制配置值
+                    cfg.port = cfg.port.clamp(1024, 65535);
+                    cfg.channel_capacity = cfg.channel_capacity.clamp(1, 1024);
+                    cfg.max_msg_size = cfg.max_msg_size.clamp(1024, 100 * 1024 * 1024);
+                    cfg.heartbeat_interval_secs = cfg.heartbeat_interval_secs.clamp(5, 300);
+                    cfg.connection_timeout_secs = cfg.connection_timeout_secs.clamp(10, 600);
+                    info!(config_path = %path.display(), ?cfg, "loaded configuration from file");
+                    cfg
+                }
+                Err(e) => {
+                    warn!(error = %e, path = %path.display(), "failed to parse config file, using defaults");
+                    ServerConfig::default()
+                }
+            }
+        }
+        Err(_) => {
+            info!(path = %path.display(), "config file not found, using defaults");
+            ServerConfig::default()
+        }
+    }
+}
 
 #[derive(Clone)]
 struct Device {
     id: String,
     kind: String,
     name: String,
-    tx: mpsc::UnboundedSender<Message>,
+    tx: mpsc::Sender<Message>,
     last_seen: Instant,
 }
 
@@ -25,38 +97,60 @@ struct State {
     devices: HashMap<String, Device>,
 }
 
-type SharedState = Arc<Mutex<State>>;
+type SharedState = Arc<RwLock<State>>;
 
 #[tokio::main]
 async fn main() {
-    let listener = TcpListener::bind(("0.0.0.0", PORT))
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            std::env::var("RUST_LOG")
+                .unwrap_or_else(|_| "signaling_rs=info,tokio=warn".to_string()),
+        )
+        .init();
+
+    // 加载配置文件
+    let cfg = load_config(Path::new("config.toml"));
+
+    let listener = TcpListener::bind((cfg.host.as_str(), cfg.port))
         .await
         .expect("bind signaling-rs failed");
 
-    println!("[SIGNALING-RS] listening ws://0.0.0.0:{PORT}");
+    info!(
+        host = %cfg.host,
+        port = cfg.port,
+        channel_capacity = cfg.channel_capacity,
+        max_msg_size = cfg.max_msg_size,
+        "signaling server listening"
+    );
 
-    let state = Arc::new(Mutex::new(State::default()));
-    spawn_timeout_sweeper(state.clone());
+    let state = Arc::new(RwLock::new(State::default()));
+    spawn_timeout_sweeper(
+        state.clone(),
+        Duration::from_secs(cfg.heartbeat_interval_secs),
+        Duration::from_secs(cfg.connection_timeout_secs),
+    );
 
     loop {
         let (stream, addr) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("[SIGNALING-RS] accept error: {e}");
+                error!(error = %e, "accept error");
                 continue;
             }
         };
 
         let state = state.clone();
+        let channel_capacity = cfg.channel_capacity;
+        let max_msg_size = cfg.max_msg_size;
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(stream, state).await {
-                eprintln!("[SIGNALING-RS] {} error: {e}", addr);
+            if let Err(e) = handle_conn(stream, state, channel_capacity, max_msg_size).await {
+                error!(address = %addr, error = %e, "connection error");
             }
         });
     }
 }
 
-async fn handle_conn(stream: TcpStream, state: SharedState) -> Result<(), String> {
+async fn handle_conn(stream: TcpStream, state: SharedState, channel_capacity: usize, max_msg_size: usize) -> Result<(), String> {
     let ws = accept_async(stream)
         .await
         .map_err(|e| format!("ws handshake failed: {e}"))?;
@@ -64,7 +158,7 @@ async fn handle_conn(stream: TcpStream, state: SharedState) -> Result<(), String
     let conn_id = Uuid::new_v4().to_string();
     let (mut ws_tx, mut ws_rx) = ws.split();
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+    let (tx, mut rx) = mpsc::channel::<Message>(channel_capacity);
 
     let write_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
@@ -78,6 +172,7 @@ async fn handle_conn(stream: TcpStream, state: SharedState) -> Result<(), String
         json!({"type":"system","action":"connected","payload":{"deviceId":conn_id}})
             .to_string(),
     ))
+    .await
     .map_err(|e| format!("send connected failed: {e}"))?;
 
     while let Some(msg) = ws_rx.next().await {
@@ -95,6 +190,18 @@ async fn handle_conn(stream: TcpStream, state: SharedState) -> Result<(), String
         }
 
         let text = msg.into_text().map_err(|e| format!("text decode failed: {e}"))?;
+
+        // 验证消息大小
+        if text.len() > max_msg_size {
+            warn!(
+                conn_id = %conn_id,
+                size = text.len(),
+                max_size = max_msg_size,
+                "message too large, rejecting"
+            );
+            continue;
+        }
+
         handle_message(&conn_id, &tx, &text, &state).await;
     }
 
@@ -103,8 +210,9 @@ async fn handle_conn(stream: TcpStream, state: SharedState) -> Result<(), String
     Ok(())
 }
 
-async fn handle_message(conn_id: &str, tx: &mpsc::UnboundedSender<Message>, text: &str, state: &SharedState) {
+async fn handle_message(conn_id: &str, tx: &mpsc::Sender<Message>, text: &str, state: &SharedState) {
     let Ok(v) = serde_json::from_str::<Value>(text) else {
+        warn!(conn_id = %conn_id, "invalid json message");
         return;
     };
 
@@ -119,7 +227,7 @@ async fn handle_message(conn_id: &str, tx: &mpsc::UnboundedSender<Message>, text
                 .unwrap_or_else(|| format!("{kind}-{conn_id}"));
 
             {
-                let mut s = state.lock().await;
+                let mut s = state.write().await;
                 s.devices.insert(
                     conn_id.to_string(),
                     Device {
@@ -132,7 +240,7 @@ async fn handle_message(conn_id: &str, tx: &mpsc::UnboundedSender<Message>, text
                 );
             }
 
-            println!("[SUCCESS] {kind} registered: {name} ({conn_id})");
+            info!(kind = %kind, name = %name, conn_id = %conn_id, "device registered");
             send_registered(conn_id, tx, state).await;
             broadcast_device_list(state, Some(conn_id)).await;
         }
@@ -147,6 +255,7 @@ async fn handle_message(conn_id: &str, tx: &mpsc::UnboundedSender<Message>, text
         "offer" => {
             let target = v["payload"]["targetDeviceId"].as_str().unwrap_or("");
             if target.is_empty() {
+                warn!(conn_id = %conn_id, "offer missing targetDeviceId");
                 return;
             }
             let offer = v["payload"]["offer"].clone();
@@ -166,6 +275,7 @@ async fn handle_message(conn_id: &str, tx: &mpsc::UnboundedSender<Message>, text
         "answer" => {
             let controller_id = v["payload"]["controllerId"].as_str().unwrap_or("");
             if controller_id.is_empty() {
+                warn!(conn_id = %conn_id, "answer missing controllerId");
                 return;
             }
             let payload = v["payload"].clone();
@@ -175,6 +285,7 @@ async fn handle_message(conn_id: &str, tx: &mpsc::UnboundedSender<Message>, text
         "iceCandidate" => {
             let target = v["payload"]["targetDeviceId"].as_str().unwrap_or("");
             if target.is_empty() {
+                warn!(conn_id = %conn_id, "iceCandidate missing targetDeviceId");
                 return;
             }
             let candidate = v["payload"]["candidate"].clone();
@@ -186,11 +297,13 @@ async fn handle_message(conn_id: &str, tx: &mpsc::UnboundedSender<Message>, text
             .to_string();
             send_to_device(target, &msg, state).await;
         }
-        _ => {}
+        _ => {
+            warn!(conn_id = %conn_id, action = %action, "unknown action");
+        }
     }
 }
 
-async fn send_registered(conn_id: &str, tx: &mpsc::UnboundedSender<Message>, state: &SharedState) {
+async fn send_registered(conn_id: &str, tx: &mpsc::Sender<Message>, state: &SharedState) {
     let list = build_device_list(state).await;
     let msg = json!({
         "type":"device",
@@ -201,14 +314,14 @@ async fn send_registered(conn_id: &str, tx: &mpsc::UnboundedSender<Message>, sta
     let _ = tx.send(Message::Text(msg));
 }
 
-async fn send_device_list(tx: &mpsc::UnboundedSender<Message>, state: &SharedState) {
+async fn send_device_list(tx: &mpsc::Sender<Message>, state: &SharedState) {
     let list = build_device_list(state).await;
     let msg = json!({"type":"device","action":"deviceList","payload":{"deviceList":list}}).to_string();
     let _ = tx.send(Message::Text(msg));
 }
 
 async fn build_device_list(state: &SharedState) -> Vec<Value> {
-    let s = state.lock().await;
+    let s = state.read().await;
     s.devices
         .values()
         .filter(|d| d.kind == "agent" || d.kind == "agent-rust")
@@ -217,21 +330,29 @@ async fn build_device_list(state: &SharedState) -> Vec<Value> {
 }
 
 async fn broadcast_device_list(state: &SharedState, exclude_id: Option<&str>) {
-    let list = build_device_list(state).await;
-    let msg = Message::Text(
-        json!({"type":"device","action":"deviceList","payload":{"deviceList":list}})
-            .to_string(),
-    );
-
-    let targets = {
-        let s = state.lock().await;
-        s.devices
+    // 一次加锁完成所有操作
+    let (list, targets) = {
+        let s = state.read().await;
+        let list: Vec<Value> = s
+            .devices
+            .values()
+            .filter(|d| d.kind == "agent" || d.kind == "agent-rust")
+            .map(|d| json!({"id":d.id,"name":d.name,"online":true}))
+            .collect();
+        let targets: Vec<mpsc::Sender<Message>> = s
+            .devices
             .values()
             .filter(|d| d.kind == "controller")
             .filter(|d| exclude_id.map(|x| x != d.id).unwrap_or(true))
             .map(|d| d.tx.clone())
-            .collect::<Vec<_>>()
+            .collect();
+        (list, targets)
     };
+
+    let msg = Message::Text(
+        json!({"type":"device","action":"deviceList","payload":{"deviceList":list}})
+            .to_string(),
+    );
 
     for tx in targets {
         let _ = tx.send(msg.clone());
@@ -240,43 +361,48 @@ async fn broadcast_device_list(state: &SharedState, exclude_id: Option<&str>) {
 
 async fn send_to_device(target_id: &str, msg: &str, state: &SharedState) {
     let tx = {
-        let s = state.lock().await;
+        let s = state.read().await;
         s.devices.get(target_id).map(|d| d.tx.clone())
     };
     if let Some(tx) = tx {
         let _ = tx.send(Message::Text(msg.to_string()));
+    } else {
+        warn!(target_id = %target_id, "device not found");
     }
 }
 
 async fn touch(conn_id: &str, state: &SharedState) {
-    let mut s = state.lock().await;
+    let mut s = state.write().await;
     if let Some(d) = s.devices.get_mut(conn_id) {
         d.last_seen = Instant::now();
     }
 }
 
 async fn on_disconnect(conn_id: &str, state: &SharedState) {
-    let removed = {
-        let mut s = state.lock().await;
-        s.devices.remove(conn_id)
-    };
-
-    if let Some(d) = removed {
-        println!("[INFO] device offline: {} ({})", d.name, d.id);
-
-        let msg = Message::Text(
-            json!({"type":"device","action":"offline","payload":{"deviceId":d.id}})
-                .to_string(),
-        );
-
-        let targets = {
-            let s = state.lock().await;
-            s.devices
+    // 一次加锁完成所有操作
+    let (device_info, targets) = {
+        let mut s = state.write().await;
+        let removed = s.devices.remove(conn_id);
+        if let Some(ref d) = removed {
+            let targets: Vec<mpsc::Sender<Message>> = s
+                .devices
                 .values()
                 .filter(|v| v.kind == "controller")
                 .map(|v| v.tx.clone())
-                .collect::<Vec<_>>()
-        };
+                .collect();
+            (Some((d.name.clone(), d.id.clone())), targets)
+        } else {
+            (None, Vec::new())
+        }
+    };
+
+    if let Some((name, id)) = device_info {
+        info!(name = %name, conn_id = %id, "device offline");
+
+        let msg = Message::Text(
+            json!({"type":"device","action":"offline","payload":{"deviceId":id}})
+                .to_string(),
+        );
 
         for tx in targets {
             let _ = tx.send(msg.clone());
@@ -284,15 +410,15 @@ async fn on_disconnect(conn_id: &str, state: &SharedState) {
     }
 }
 
-fn spawn_timeout_sweeper(state: SharedState) {
+fn spawn_timeout_sweeper(state: SharedState, heartbeat_interval: Duration, connection_timeout: Duration) {
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(Duration::from_secs(30)).await;
+            tokio::time::sleep(heartbeat_interval).await;
             let stale = {
-                let s = state.lock().await;
+                let s = state.read().await;
                 s.devices
                     .values()
-                    .filter(|d| d.last_seen.elapsed() > Duration::from_secs(60))
+                    .filter(|d| d.last_seen.elapsed() > connection_timeout)
                     .map(|d| d.id.clone())
                     .collect::<Vec<_>>()
             };
