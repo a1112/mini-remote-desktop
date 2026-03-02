@@ -85,7 +85,8 @@ impl NetAdaptController {
         let remb_kbps = (bitrate_bps / 1000.0).max(self.min_bitrate_kbps as f32) as u32;
         let target_br = (remb_kbps as f32 * 0.92) as u32;
         let target_br = target_br.clamp(self.min_bitrate_kbps, self.max_bitrate_kbps);
-        self.current_bitrate_kbps.store(target_br, Ordering::Relaxed);
+        self.current_bitrate_kbps
+            .store(target_br, Ordering::Relaxed);
         (next_fps, target_br)
     }
 

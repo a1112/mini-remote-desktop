@@ -37,6 +37,8 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use webrtc::api::APIBuilder;
 use webrtc::api::media_engine::MediaEngine;
+use webrtc::ice_transport::ice_candidate_pair::RTCIceCandidatePair;
+use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::media::Sample;
 use webrtc::peer_connection::RTCPeerConnection;
@@ -45,7 +47,10 @@ use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::rtp_transceiver::rtp_sender::RTCRtpSender;
-use webrtc::rtp_transceiver::{RTCPFeedback, TYPE_RTCP_FB_CCM, TYPE_RTCP_FB_GOOG_REMB, TYPE_RTCP_FB_NACK, TYPE_RTCP_FB_TRANSPORT_CC};
+use webrtc::rtp_transceiver::{
+    RTCPFeedback, TYPE_RTCP_FB_CCM, TYPE_RTCP_FB_GOOG_REMB, TYPE_RTCP_FB_NACK,
+    TYPE_RTCP_FB_TRANSPORT_CC,
+};
 use webrtc::track::track_local::TrackLocal;
 use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
@@ -91,6 +96,7 @@ enum RuntimeVideoEncoder {
         fps: u32,
         ffmpeg_bin: String,
         ffmpeg_cfg: agent_rust::CaptureConfig,
+        applied_bitrate_kbps: u32,
         pipe: Option<FfmpegPipeEncoder>,
         wh: Option<(u32, u32)>,
     },
@@ -300,6 +306,17 @@ async fn create_peer_connection(
         println!("[RustAgent-M2] pc state: {s}");
         Box::pin(async {})
     }));
+    pc.on_ice_connection_state_change(Box::new(|s: RTCIceConnectionState| {
+        println!("[RustAgent-M2] ice state: {s}");
+        Box::pin(async {})
+    }));
+    pc.sctp()
+        .transport()
+        .ice_transport()
+        .on_selected_candidate_pair_change(Box::new(move |p: RTCIceCandidatePair| {
+            println!("[RustAgent-M2] selected-candidate pair: {}", p);
+            Box::pin(async {})
+        }));
 
     Ok(pc)
 }
@@ -484,11 +501,18 @@ async fn attach_video_track_with_policy(
                     tokio::spawn(async move {
                         let mut next_due = Instant::now();
                         while let Some(encoded) = encoded_rx.recv().await {
-                            if let Some(v) = adapt2.tick_recover() {
-                                println!("[RustAgent-M2] net-adapt recover target_fps={v}");
+                            if let Some((fps_v, br_v)) = adapt2.tick_recover() {
+                                println!(
+                                    "[RustAgent-M2] net-adapt recover target_fps={} target_bitrate_kbps={}",
+                                    fps_v, br_v
+                                );
                             }
                             let target_fps = adapt2.current_fps().max(1);
+                            let target_bitrate = adapt2.current_bitrate_kbps().max(100);
                             stats2.target_fps.store(target_fps, Ordering::Relaxed);
+                            stats2
+                                .target_bitrate_kbps
+                                .store(target_bitrate, Ordering::Relaxed);
                             let frame_gap =
                                 Duration::from_millis((1000.0 / target_fps as f64).max(1.0) as u64);
                             if Instant::now() < next_due {
@@ -597,6 +621,7 @@ async fn attach_video_track_with_policy(
         let latest = latest.clone();
         let encode_cfg = effective_cfg.clone();
         let keyframe_request2 = keyframe_request.clone();
+        let adapt2 = adapt.clone();
         std::thread::spawn(move || {
             let mut encoder = match build_video_encoder(
                 fps,
@@ -624,15 +649,21 @@ async fn attach_video_track_with_policy(
                 if keyframe_request2.swap(false, Ordering::Relaxed) {
                     request_keyframe(&mut encoder);
                 }
+                let target_bitrate_kbps = Some(adapt2.current_bitrate_kbps());
 
-                let encoded =
-                    match encode_rgba_frame(&mut encoder, &frame.rgba, frame.width, frame.height) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            eprintln!("[RustAgent-M2] h264 encode failed: {e}");
-                            continue;
-                        }
-                    };
+                let encoded = match encode_rgba_frame(
+                    &mut encoder,
+                    &frame.rgba,
+                    frame.width,
+                    frame.height,
+                    target_bitrate_kbps,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("[RustAgent-M2] h264 encode failed: {e}");
+                        continue;
+                    }
+                };
                 if encoded.is_empty() {
                     continue;
                 }
@@ -661,11 +692,18 @@ async fn attach_video_track_with_policy(
         tokio::spawn(async move {
             let mut next_due = Instant::now();
             while let Some(encoded) = encoded_rx.recv().await {
-                if let Some(v) = adapt2.tick_recover() {
-                    println!("[RustAgent-M2] net-adapt recover target_fps={v}");
+                if let Some((fps_v, br_v)) = adapt2.tick_recover() {
+                    println!(
+                        "[RustAgent-M2] net-adapt recover target_fps={} target_bitrate_kbps={}",
+                        fps_v, br_v
+                    );
                 }
                 let target_fps = adapt2.current_fps().max(1);
+                let target_bitrate = adapt2.current_bitrate_kbps().max(100);
                 stats2.target_fps.store(target_fps, Ordering::Relaxed);
+                stats2
+                    .target_bitrate_kbps
+                    .store(target_bitrate, Ordering::Relaxed);
                 let frame_gap = Duration::from_millis((1000.0 / target_fps as f64).max(1.0) as u64);
                 if Instant::now() < next_due {
                     stats2.rtp_au_skipped.fetch_add(1, Ordering::Relaxed);
@@ -753,10 +791,14 @@ fn spawn_rtcp_feedback_loop(
                 if let Some(nack) = pkt.as_any().downcast_ref::<TransportLayerNack>() {
                     stats.nack_count.fetch_add(1, Ordering::Relaxed);
                     if enable_network_adapt {
-                        let target = adapt.on_nack_burst();
+                        let (target_fps, target_bitrate_kbps) = adapt.on_nack_burst();
+                        stats.target_fps.store(target_fps, Ordering::Relaxed);
+                        stats
+                            .target_bitrate_kbps
+                            .store(target_bitrate_kbps, Ordering::Relaxed);
                         println!(
-                            "[RustAgent-M2] rtcp nack sender_ssrc={} media_ssrc={} target_fps={}",
-                            nack.sender_ssrc, nack.media_ssrc, target
+                            "[RustAgent-M2] rtcp nack sender_ssrc={} media_ssrc={} target_fps={} target_bitrate_kbps={}",
+                            nack.sender_ssrc, nack.media_ssrc, target_fps, target_bitrate_kbps
                         );
                     } else {
                         println!(
@@ -775,10 +817,14 @@ fn spawn_rtcp_feedback_loop(
                     stats
                         .last_remb_kbps
                         .store((remb.bitrate / 1000.0) as u32, Ordering::Relaxed);
-                    let target = adapt.on_remb_bps(remb.bitrate);
+                    let (target_fps, target_bitrate_kbps) = adapt.on_remb_bps(remb.bitrate);
+                    stats.target_fps.store(target_fps, Ordering::Relaxed);
+                    stats
+                        .target_bitrate_kbps
+                        .store(target_bitrate_kbps, Ordering::Relaxed);
                     println!(
-                        "[RustAgent-M2] rtcp remb bitrate_bps={:.0} target_fps={}",
-                        remb.bitrate, target
+                        "[RustAgent-M2] rtcp remb bitrate_bps={:.0} target_fps={} target_bitrate_kbps={}",
+                        remb.bitrate, target_fps, target_bitrate_kbps
                     );
                 }
             }
@@ -798,11 +844,12 @@ fn spawn_stats_panel(stats: Arc<RuntimeStats>, adapt: Arc<NetAdaptController>, i
             let remb = stats.remb_count.load(Ordering::Relaxed);
             let remb_kbps = stats.last_remb_kbps.load(Ordering::Relaxed);
             let target_fps = adapt.current_fps();
+            let target_bitrate_kbps = stats.target_bitrate_kbps.load(Ordering::Relaxed);
             let sent = stats.rtp_au_sent.load(Ordering::Relaxed);
             let skipped = stats.rtp_au_skipped.load(Ordering::Relaxed);
             println!(
-                "[RustAgent-M2][RTCP-PANEL] pli={} fir={} nack={} remb={} remb_kbps={} target_fps={} au_sent={} au_skipped={}",
-                pli, fir, nack, remb, remb_kbps, target_fps, sent, skipped
+                "[RustAgent-M2][RTCP-PANEL] pli={} fir={} nack={} remb={} remb_kbps={} target_fps={} target_bitrate_kbps={} au_sent={} au_skipped={}",
+                pli, fir, nack, remb, remb_kbps, target_fps, target_bitrate_kbps, sent, skipped
             );
         }
     });
@@ -1015,6 +1062,7 @@ fn build_video_encoder(
                     fps,
                     ffmpeg_bin,
                     ffmpeg_cfg: cfg.clone(),
+                    applied_bitrate_kbps: cfg.bitrate_kbps.max(100),
                     pipe: None,
                     wh: None,
                 });
@@ -1050,6 +1098,7 @@ fn encode_rgba_frame(
     rgba: &[u8],
     width: u32,
     height: u32,
+    target_bitrate_kbps: Option<u32>,
 ) -> Result<Vec<u8>> {
     match encoder {
         RuntimeVideoEncoder::OpenH264(enc) => {
@@ -1063,9 +1112,20 @@ fn encode_rgba_frame(
             fps,
             ffmpeg_bin,
             ffmpeg_cfg,
+            applied_bitrate_kbps,
             pipe,
             wh,
         } => {
+            if let Some(target) = target_bitrate_kbps {
+                let target = target.max(100);
+                let drift = applied_bitrate_kbps.abs_diff(target);
+                if drift >= 800 {
+                    ffmpeg_cfg.bitrate_kbps = target;
+                    ffmpeg_cfg.max_bitrate_kbps = ffmpeg_cfg.max_bitrate_kbps.max(target);
+                    *applied_bitrate_kbps = target;
+                    *pipe = None;
+                }
+            }
             if pipe.is_none() || wh != &Some((width, height)) {
                 *pipe = Some(start_ffmpeg_pipe(
                     *backend, *fps, ffmpeg_bin, ffmpeg_cfg, width, height,
