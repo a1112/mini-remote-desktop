@@ -8,7 +8,29 @@ import json
 import platform
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
+
+
+@dataclass
+class TransportConfig:
+    """Transport protocol configuration."""
+
+    preferred: str = "auto"  # "auto", "quic", "webrtc"
+    fallback: str = "webrtc"
+    auto_switch: bool = True
+    connection_timeout: float = 5.0
+
+    # Performance thresholds for switching
+    rtt_threshold_ms: float = 100.0
+    packet_loss_threshold: float = 5.0
+    min_fps_threshold: float = 15.0
+
+    # WebRTC-specific
+    webrtc_ice_servers: Optional[list] = None
+
+    # QUIC-specific
+    quic_host: str = "0.0.0.0"
+    quic_port: int = 0
 
 
 @dataclass
@@ -45,11 +67,17 @@ class AgentConfig:
     ws_url: str = "ws://127.0.0.1:9527"
     device_name: str = "Python Agent"
     capture: CaptureConfig = field(default_factory=CaptureConfig)
+    transport: TransportConfig = field(default_factory=TransportConfig)
 
     # NVENC specific settings
     quality: int = 24  # QP value (18-51, lower is better)
     monitor_index: int = 0  # Monitor to capture
     encoder_type: str = "nvenc"  # "nvenc" or "software"
+
+    @property
+    def framerate(self) -> int:
+        """Get target frame rate (alias for capture.fps)."""
+        return self.capture.fps
 
     @classmethod
     def from_file(cls, path: Optional[Path] = None) -> "AgentConfig":
@@ -104,6 +132,13 @@ class AgentConfig:
             config.monitor_index = int(data["monitor_index"])
         if "encoder_type" in data:
             config.encoder_type = str(data["encoder_type"])
+
+        # Transport configuration
+        if "transport" in data and isinstance(data["transport"], dict):
+            transport_data = data["transport"]
+            for key, value in transport_data.items():
+                if hasattr(config.transport, key):
+                    setattr(config.transport, key, value)
 
         # Set quality from capture bitrate if specified (approximate mapping)
         if config.quality == 24 and config.capture.bitrate_kbps:

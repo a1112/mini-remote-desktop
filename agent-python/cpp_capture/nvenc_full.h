@@ -103,6 +103,17 @@ NVENC_API int get_nvenc_encoded_frame(
 );
 
 /**
+ * 零拷贝编码：直接从 D3D11 纹理编码 (无需 CPU 复制)
+ * 使用 NVENC MapInputResource API
+ */
+NVENC_API int encode_nvenc_frame_d3d11_zerocopy(
+    HNVENCEncoder handle,
+    void* d3d11_texture,
+    long long timestamp,
+    int force_keyframe
+);
+
+/**
  * 释放编码后的帧数据
  */
 NVENC_API void free_nvenc_encoded_frame(NVENCEncodedFrame* frame);
@@ -140,6 +151,7 @@ public:
                    const NVENCEncodeConfig* config);
     bool EncodeFromCPU(const unsigned char* data, int size, long long timestamp, bool force_keyframe);
     bool EncodeFromD3D11(ID3D11Texture2D* texture, long long timestamp, bool force_keyframe);
+    bool EncodeFromD3D11_ZeroCopy(ID3D11Texture2D* texture, long long timestamp, bool force_keyframe);  // 零拷贝版本
     bool GetEncodedFrame(NVENCEncodedFrame* frame);
     void RequestKeyframe();
     void Release();
@@ -157,6 +169,7 @@ private:
     // D3D11 组件
     ComPtr<ID3D11Device> d3d11_device_;
     ComPtr<ID3D11DeviceContext> d3d11_context_;
+    ComPtr<ID3D11Texture2D> intermediate_texture_;  // 用于从外部 D3D11 设备复制纹理
 
     // CUDA 组件
     CUcontext cuda_context_;
@@ -192,4 +205,5 @@ private:
     bool nvenc_loaded_;
     long long current_pts_;
     bool force_keyframe_;
+    bool use_abgr_format_;  // 是否使用 ABGR 格式输入（无需颜色转换）
 };

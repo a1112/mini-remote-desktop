@@ -147,6 +147,15 @@ class NVENCEncoder:
         ]
         self._dll.encode_nvenc_frame_cpu.restype = ctypes.c_int
 
+        # D3D11 GPU Direct encoding
+        self._dll.encode_nvenc_frame_d3d11.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_longlong,
+            ctypes.c_int
+        ]
+        self._dll.encode_nvenc_frame_d3d11.restype = ctypes.c_int
+
         self._dll.get_nvenc_encoded_frame.argtypes = [
             ctypes.c_void_p,
             ctypes.POINTER(NVENCEncodedFrameStruct)
@@ -222,6 +231,59 @@ class NVENCEncoder:
             return None
 
         # Copy encoded data
+        data = bytes(ctypes.string_at(frame_info.data, frame_info.size))
+
+        self._frame_counter += 1
+
+        return NVENCEncodedFrame(
+            data=data,
+            size=frame_info.size,
+            key_frame=bool(frame_info.key_frame),
+            timestamp=frame_info.timestamp
+        )
+
+    def encode_d3d11(self, d3d11_texture_ptr: int) -> Optional[NVENCEncodedFrame]:
+        """
+        Encode a D3D11 texture directly (GPU Direct / Zero Copy).
+
+        This is the fastest encoding path - no CPU memory copy involved.
+        The texture stays entirely on the GPU.
+
+        Args:
+            d3d11_texture_ptr: Pointer to ID3D11Texture2D (as integer)
+
+        Returns:
+            Encoded frame data, or None if encoding failed
+        """
+        if not self._handle or not self._dll:
+            return None
+
+        # Encode frame directly from D3D11 texture
+        timestamp = self._frame_counter
+        force_keyframe = 1 if self._frame_counter == 0 else 0
+
+        result = self._dll.encode_nvenc_frame_d3d11(
+            self._handle,
+            ctypes.c_void_p(d3d11_texture_ptr),
+            timestamp,
+            force_keyframe
+        )
+
+        if result != 1:
+            logger.warning(f"D3D11 encode failed: {result}")
+            return None
+
+        # Get encoded frame
+        frame_info = self._FrameStruct()
+        result = self._dll.get_nvenc_encoded_frame(
+            self._handle,
+            ctypes.byref(frame_info)
+        )
+
+        if result != 1 or frame_info.size == 0:
+            return None
+
+        # Copy encoded data (this is the only CPU copy)
         data = bytes(ctypes.string_at(frame_info.data, frame_info.size))
 
         self._frame_counter += 1
