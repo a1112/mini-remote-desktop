@@ -134,22 +134,9 @@ pub struct SessionDescriptionJson {
 
 impl From<RTCSessionDescription> for SessionDescriptionJson {
     fn from(sd: RTCSessionDescription) -> Self {
-        // 直接访问 SDP 字符串
-        let sdp_str = match sd.unmarshal() {
-            Ok(s) => s.to_string(),
-            Err(_) => String::new(),
-        };
-
-        // 根据 SDP 内容推断类型
-        let sdp_type = if sdp_str.contains("m=video") {
-            "offer"  // 简化处理，实际应该从 SDP 中解析
-        } else {
-            "answer"
-        };
-
         Self {
-            sdp_type: sdp_type.to_string(),
-            sdp: sdp_str,
+            sdp_type: sd.sdp_type.to_string(),
+            sdp: sd.sdp,
         }
     }
 }
@@ -176,6 +163,15 @@ pub struct IceCandidateJson {
     pub sdp_mid: Option<String>,
     #[serde(rename = "sdpMLineIndex")]
     pub sdp_mline_index: Option<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuicTransportInfo {
+    pub addr: String,
+    #[serde(rename = "serverName")]
+    pub server_name: String,
+    #[serde(rename = "certDerBase64")]
+    pub cert_der_base64: String,
 }
 
 impl From<RTCIceCandidateInit> for IceCandidateJson {
@@ -225,6 +221,8 @@ pub enum SignalingMessagePayload {
     Answer {
         answer: RTCSessionDescription,
         controller_id: String,
+        selected_transport: String,
+        quic: Option<QuicTransportInfo>,
     },
     IceCandidate {
         target_device_id: Option<String>,
@@ -242,9 +240,9 @@ pub fn create_register_message(name: &str) -> String {
             "type": "controller",
             "name": name,
             "protocolVersion": 2,
-            "transports": ["webrtc"],
+            "transports": ["webrtc", "quic"],
             "capabilities": {
-                "protocols": ["webrtc"],
+                "protocols": ["webrtc", "quic"],
                 "platforms": ["windows", "linux", "macos"],
                 "codecs": ["h264"],
                 "features": ["multi-end-compat", "capability-negotiation"]

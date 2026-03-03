@@ -11,6 +11,7 @@ pub struct CaptureConfig {
     pub allow_fallback: bool,
     pub encoder: String,
     pub allow_encoder_fallback: bool,
+    pub strict_gpu_direct: bool,
     pub target_width: u32,
     pub target_height: u32,
     pub queue_depth: u32,
@@ -110,6 +111,7 @@ impl Default for AgentConfig {
                 allow_fallback: true,
                 encoder: "auto".to_string(),
                 allow_encoder_fallback: true,
+                strict_gpu_direct: false,
                 target_width: 0,
                 target_height: 0,
                 queue_depth: 8,
@@ -212,6 +214,9 @@ pub fn load_config(path: &Path) -> AgentConfig {
             .and_then(|v| v.as_bool())
         {
             cfg.capture.allow_encoder_fallback = v;
+        }
+        if let Some(v) = capture.get("strict_gpu_direct").and_then(|v| v.as_bool()) {
+            cfg.capture.strict_gpu_direct = v;
         }
         if let Some(v) = capture.get("target_width").and_then(|v| v.as_u64()) {
             cfg.capture.target_width = v as u32;
@@ -394,6 +399,13 @@ fn normalize_config(cfg: &mut AgentConfig) {
     cfg.capture.capture_thread_priority = cfg.capture.capture_thread_priority.to_ascii_lowercase();
     cfg.capture.encode_thread_priority = cfg.capture.encode_thread_priority.to_ascii_lowercase();
 
+    if cfg.capture.strict_gpu_direct {
+        cfg.capture.backend = "dxgi".to_string();
+        cfg.capture.encoder = "nvenc".to_string();
+        cfg.capture.allow_fallback = false;
+        cfg.capture.allow_encoder_fallback = false;
+    }
+
     // 数值范围验证和限制
     cfg.capture.fps = cfg.capture.fps.clamp(1, 240);
     cfg.capture.jpeg_quality = cfg.capture.jpeg_quality.clamp(1, 100);
@@ -456,7 +468,7 @@ fn normalize_config(cfg: &mut AgentConfig) {
     // 字符串枚举验证（使用默认值替代无效值）
     if !matches!(
         cfg.capture.backend.as_str(),
-        "auto" | "dxgi" | "powershell" | "dummy"
+        "auto" | "dxgi" | "wgc" | "powershell" | "dummy"
     ) {
         cfg.capture.backend = "auto".to_string();
     }
@@ -565,6 +577,7 @@ mod tests {
         assert!(cfg.capture.allow_fallback);
         assert_eq!(cfg.capture.encoder, "auto");
         assert!(cfg.capture.allow_encoder_fallback);
+        assert!(!cfg.capture.strict_gpu_direct);
         assert_eq!(cfg.capture.profile_template, "balanced");
         assert!(cfg.capture.rtp_use_manual_packetizer);
     }
@@ -593,6 +606,7 @@ mod tests {
             "ws_url":"ws://1.2.3.4:9527",
             "capture":{
                 "fps":120,
+                "strict_gpu_direct":true,
                 "target_width":2560,
                 "target_height":1440,
                 "queue_depth":16,
@@ -645,6 +659,11 @@ mod tests {
         fs::remove_file(&p).ok();
         assert_eq!(cfg.ws_url, "ws://1.2.3.4:9527");
         assert_eq!(cfg.capture.fps, 120);
+        assert!(cfg.capture.strict_gpu_direct);
+        assert_eq!(cfg.capture.backend, "dxgi");
+        assert_eq!(cfg.capture.encoder, "nvenc");
+        assert!(!cfg.capture.allow_fallback);
+        assert!(!cfg.capture.allow_encoder_fallback);
         assert_eq!(cfg.capture.target_width, 2560);
         assert_eq!(cfg.capture.target_height, 1440);
         assert_eq!(cfg.capture.queue_depth, 16);

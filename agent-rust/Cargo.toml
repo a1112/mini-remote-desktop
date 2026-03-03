@@ -6,10 +6,15 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0"
 bytes = "1.7"
+base64 = "0.22"
 futures-util = "0.3"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+interceptor = "0.13"
 nvenc = "0.1"
 openh264 = "0.8"
+quinn = "0.11"
+rcgen = "0.13"
+rustls = "0.23"
 screenshots = "0.8"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -21,9 +26,18 @@ webrtc = "0.12"
 rtp = "0.12"
 rtcp = "0.12"
 windows = { version = "0.62", features = [
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+    "Win32_UI_WindowsAndMessaging",
 ] }

@@ -1,29 +1,11 @@
 @echo off
-echo Setting up Visual Studio environment...
-call "D:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
-
-echo.
-echo Compiling dxgi_capture.dll...
-echo.
-
-cd /d "%~dp0"
-
-cl.exe /LD /MD /O2 /EHsc /std:c++17 dxgi_capture.cpp /link d3d11.lib dxgi.lib /OUT:dxgi_capture.dll
-
-if %errorlevel% equ 0 (
-    echo.
-    echo ========================================================================
-    echo 编译成功!
-    echo ========================================================================
-    copy /Y dxgi_capture.dll ..\
-    echo DLL 已复制到项目根目录
-    echo.
-    dir dxgi_capture.dll
+setlocal
+call "D:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
+call "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin\nvcc.exe" -ptx -m=64 -O3 -arch=sm_75 bgra_to_nv12.cu -o bgra_to_nv12.ptx
+if exist bgra_to_nv12.ptx (
+    echo SUCCESS: PTX file created
+    dir bgra_to_nv12.ptx
 ) else (
-    echo.
-    echo ========================================================================
-    echo 编译失败!
-    echo ========================================================================
+    echo FAILED: PTX file not created
 )
-
-pause
+endlocal

@@ -32,6 +32,7 @@ pub fn choose_encoder_backend(cfg: &CaptureConfig) -> (VideoEncoderBackend, Vec<
     let mut logs = Vec::new();
     let requested = cfg.encoder.to_ascii_lowercase();
     let caps = detect_gpu_caps(&mut logs);
+    let fallback_allowed = cfg.allow_encoder_fallback && !cfg.strict_gpu_direct;
 
     let mut order = match requested.as_str() {
         "nvenc" => vec![VideoEncoderBackend::Nvenc],
@@ -46,9 +47,10 @@ pub fn choose_encoder_backend(cfg: &CaptureConfig) -> (VideoEncoderBackend, Vec<
         ],
     };
 
-    if !cfg.allow_encoder_fallback {
+    if !fallback_allowed {
         order.truncate(1);
     }
+    let forced = order.first().copied().unwrap_or(VideoEncoderBackend::Nvenc);
 
     for enc in order {
         if encoder_available(enc, &caps) {
@@ -56,6 +58,14 @@ pub fn choose_encoder_backend(cfg: &CaptureConfig) -> (VideoEncoderBackend, Vec<
             return (enc, logs);
         }
         logs.push(format!("video encoder {} unavailable", enc.as_str()));
+    }
+
+    if !fallback_allowed {
+        logs.push(format!(
+            "strict encoder selection active, forcing {}",
+            forced.as_str()
+        ));
+        return (forced, logs);
     }
 
     logs.push("all requested encoders unavailable, fallback to openh264".to_string());

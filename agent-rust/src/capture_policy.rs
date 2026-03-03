@@ -4,6 +4,7 @@ use std::process::Command;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureBackend {
     Dxgi,
+    Wgc,
     Powershell,
     Dummy,
 }
@@ -12,6 +13,7 @@ impl CaptureBackend {
     pub fn as_str(self) -> &'static str {
         match self {
             CaptureBackend::Dxgi => "dxgi",
+            CaptureBackend::Wgc => "wgc",
             CaptureBackend::Powershell => "powershell",
             CaptureBackend::Dummy => "dummy",
         }
@@ -21,20 +23,24 @@ impl CaptureBackend {
 pub fn choose_backend(cfg: &CaptureConfig) -> (CaptureBackend, Vec<String>) {
     let mut logs = Vec::new();
     let requested = cfg.backend.to_ascii_lowercase();
+    let fallback_allowed = cfg.allow_fallback && !cfg.strict_gpu_direct;
     let mut order = match requested.as_str() {
         "dxgi" => vec![CaptureBackend::Dxgi],
+        "wgc" => vec![CaptureBackend::Wgc],
         "powershell" => vec![CaptureBackend::Powershell],
         "dummy" => vec![CaptureBackend::Dummy],
         _ => vec![
             CaptureBackend::Dxgi,
+            CaptureBackend::Wgc,
             CaptureBackend::Powershell,
             CaptureBackend::Dummy,
         ],
     };
 
-    if !cfg.allow_fallback {
+    if !fallback_allowed {
         order.truncate(1);
     }
+    let forced = order.first().copied().unwrap_or(CaptureBackend::Dxgi);
 
     for backend in order {
         match probe_backend(backend) {
@@ -49,6 +55,14 @@ pub fn choose_backend(cfg: &CaptureConfig) -> (CaptureBackend, Vec<String>) {
                 ));
             }
         }
+    }
+
+    if !fallback_allowed {
+        logs.push(format!(
+            "strict capture selection active, forcing {}",
+            forced.as_str()
+        ));
+        return (forced, logs);
     }
 
     logs.push("all requested backends failed, fallback to dummy".to_string());
@@ -68,8 +82,25 @@ fn probe_backend(backend: CaptureBackend) -> Result<(), String> {
                 .map_err(|e| format!("dxgi capture failed: {e}"))?;
             Ok(())
         }
+        CaptureBackend::Wgc => probe_wgc(),
         CaptureBackend::Powershell => probe_powershell(),
         CaptureBackend::Dummy => Ok(()),
+    }
+}
+
+fn probe_wgc() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+        let hwnd = unsafe { GetForegroundWindow() };
+        if hwnd.0.is_null() {
+            return Err("no foreground window for wgc".to_string());
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        Err("wgc only supports windows".to_string())
     }
 }
 

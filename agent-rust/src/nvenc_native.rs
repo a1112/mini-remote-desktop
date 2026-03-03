@@ -37,6 +37,7 @@ mod imp {
         CreateDXGIFactory1, DXGI_ADAPTER_DESC1, DXGI_ADAPTER_FLAG3_REMOTE,
         DXGI_ADAPTER_FLAG3_SOFTWARE, DXGI_OUTDUPL_FRAME_INFO, IDXGIAdapter, IDXGIAdapter1,
         IDXGIFactory1, IDXGIOutput1, IDXGIOutput5, IDXGIOutputDuplication, IDXGIResource,
+        DXGI_ERROR_WAIT_TIMEOUT,
     };
     use windows::core::Interface;
 
@@ -59,6 +60,9 @@ mod imp {
         pub copy_frames: u64,
         pub scale_frames: u64,
         pub direct_register_failures: u64,
+        pub acquire_ok: u64,
+        pub acquire_timeout: u64,
+        pub acquire_errors: u64,
     }
 
     pub struct NativeNvencPipeline {
@@ -323,7 +327,7 @@ mod imp {
                 strict_gpu_direct: cfg.strict_gpu_direct,
                 adapter_summary,
                 direct_resources: VecDeque::new(),
-                direct_resource_capacity: 8,
+                direct_resource_capacity: direct_resource_cache_capacity(),
                 stats: NativePathStats::default(),
             })
         }
@@ -599,15 +603,24 @@ mod imp {
             })
         }
 
-        fn acquire_frame(&self) -> Result<Option<DupFrame>> {
+        fn acquire_frame(&mut self) -> Result<Option<DupFrame>> {
             let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
             let mut resource: Option<IDXGIResource> = None;
             match unsafe {
                 self.duplication
                     .AcquireNextFrame(16, &mut info, &mut resource)
             } {
-                Ok(()) => {}
-                Err(_) => return Ok(None),
+                Ok(()) => {
+                    self.stats.acquire_ok = self.stats.acquire_ok.saturating_add(1);
+                }
+                Err(e) => {
+                    if e.code() == DXGI_ERROR_WAIT_TIMEOUT {
+                        self.stats.acquire_timeout = self.stats.acquire_timeout.saturating_add(1);
+                        return Ok(None);
+                    }
+                    self.stats.acquire_errors = self.stats.acquire_errors.saturating_add(1);
+                    return Err(anyhow!("AcquireNextFrame failed: {e}"));
+                }
             }
 
             let resource = resource.ok_or_else(|| anyhow!("AcquireNextFrame resource is none"))?;
@@ -694,7 +707,7 @@ mod imp {
                 frame_idx: 0,
                 strict_gpu_direct: cfg.strict_gpu_direct,
                 direct_resources: VecDeque::new(),
-                direct_resource_capacity: 8,
+                direct_resource_capacity: direct_resource_cache_capacity(),
                 stats: NativePathStats::default(),
             })
         }
@@ -970,6 +983,14 @@ mod imp {
             "hq" => NVencTuningInfo::HighQuality,
             _ => NVencTuningInfo::LowLatency,
         }
+    }
+
+    fn direct_resource_cache_capacity() -> usize {
+        std::env::var("AGENT_NVENC_DIRECT_CACHE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(32)
+            .clamp(8, 256)
     }
 
     fn encode_picture(

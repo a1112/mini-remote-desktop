@@ -15,6 +15,7 @@
 #include <iostream>
 #include <cstring>
 #include <algorithm>
+#include <cstdint>
 
 // CUDA 错误检查
 #define CUDA_CHECK(call) \
@@ -45,6 +46,66 @@
         } \
     } while(0)
 
+static inline uint8_t ClampToByte(int v) {
+    if (v < 0) return 0;
+    if (v > 255) return 255;
+    return static_cast<uint8_t>(v);
+}
+
+// CPU reference conversion used by fallback paths.
+static void ConvertBGRAtoNV12CPU(
+    const uint8_t* src_bgra,
+    int src_stride,
+    int width,
+    int height,
+    uint8_t* dst_y,
+    uint8_t* dst_uv,
+    int dst_pitch
+) {
+    // Luma plane
+    for (int y = 0; y < height; ++y) {
+        const uint8_t* src_row = src_bgra + y * src_stride;
+        uint8_t* dst_row = dst_y + y * dst_pitch;
+        for (int x = 0; x < width; ++x) {
+            const int b = src_row[x * 4 + 0];
+            const int g = src_row[x * 4 + 1];
+            const int r = src_row[x * 4 + 2];
+            dst_row[x] = ClampToByte((77 * r + 150 * g + 29 * b + 128) >> 8);
+        }
+    }
+
+    // Chroma plane (interleaved UV, 2x2 subsampling)
+    for (int y = 0; y < height; y += 2) {
+        uint8_t* uv_row = dst_uv + (y / 2) * dst_pitch;
+        for (int x = 0; x < width; x += 2) {
+            int u_sum = 0;
+            int v_sum = 0;
+            int count = 0;
+
+            for (int dy = 0; dy < 2 && (y + dy) < height; ++dy) {
+                const uint8_t* src_row = src_bgra + (y + dy) * src_stride;
+                for (int dx = 0; dx < 2 && (x + dx) < width; ++dx) {
+                    const int b = src_row[(x + dx) * 4 + 0];
+                    const int g = src_row[(x + dx) * 4 + 1];
+                    const int r = src_row[(x + dx) * 4 + 2];
+
+                    // BT.601 full-range integer approximation
+                    u_sum += (((-43 * r - 85 * g + 128 * b + 128) >> 8) + 128);
+                    v_sum += (((128 * r - 107 * g - 21 * b + 128) >> 8) + 128);
+                    ++count;
+                }
+            }
+
+            const int uv_idx = x;
+            const int safe_count = (count > 0) ? count : 1;
+            uv_row[uv_idx + 0] = ClampToByte(u_sum / safe_count);
+            if (uv_idx + 1 < dst_pitch) {
+                uv_row[uv_idx + 1] = ClampToByte(v_sum / safe_count);
+            }
+        }
+    }
+}
+
 // ============================================================================
 // NVENCEncoderImpl Implementation
 // ============================================================================
@@ -55,6 +116,7 @@ NVENCEncoderImpl::NVENCEncoderImpl()
     , nvenc_encoder_(nullptr)
     , registered_resource_(nullptr)
     , mapped_resource_(nullptr)
+    , registered_source_texture_(nullptr)
     , current_input_buffer_(0)
     , current_bitstream_buffer_(0)
     , current_pts_(0)
@@ -66,6 +128,19 @@ NVENCEncoderImpl::NVENCEncoderImpl()
     , cuda_stream_(nullptr)
     , nvenc_dll_(nullptr)
     , use_abgr_format_(false)
+    , zerocopy_only_(false)
+    , zc_encode_calls_(0)
+    , zc_encode_submit_success_(0)
+    , zc_encode_submit_need_more_input_(0)
+    , zc_encode_submit_fail_(0)
+    , zc_slot_busy_skips_(0)
+    , zc_map_failures_(0)
+    , zc_lock_busy_count_(0)
+    , zc_lock_retryable_count_(0)
+    , zc_lock_failures_(0)
+    , zc_bitstream_outputs_(0)
+    , zc_unmap_count_(0)
+    , zc_pending_peak_(0)
 {
     std::memset(&nvenc_api_, 0, sizeof(nvenc_api_));
 }
@@ -75,7 +150,7 @@ NVENCEncoderImpl::~NVENCEncoderImpl() {
 }
 
 bool NVENCEncoderImpl::Initialize(ID3D11Device* d3d11_device, ID3D11DeviceContext* d3d11_context,
-                                   const NVENCEncodeConfig* config) {
+                                   const NVENCEncodeConfig* config, bool zerocopy_only) {
     if (!d3d11_device || !d3d11_context || !config) {
         return false;
     }
@@ -83,6 +158,7 @@ bool NVENCEncoderImpl::Initialize(ID3D11Device* d3d11_device, ID3D11DeviceContex
     d3d11_device_ = d3d11_device;
     d3d11_context_ = d3d11_context;
     config_ = *config;
+    zerocopy_only_ = zerocopy_only;
 
     // 设置默认值
     if (config_.framerate <= 0) config_.framerate = 60;
@@ -95,10 +171,14 @@ bool NVENCEncoderImpl::Initialize(ID3D11Device* d3d11_device, ID3D11DeviceContex
     std::cout << "[NVENC] Initializing encoder " << config_.width << "x" << config_.height
               << " @ " << config_.framerate << "fps, " << (config_.bitrate / 1000000.0) << "Mbps" << std::endl;
 
-    // 初始化 CUDA
-    if (!InitializeCUDA()) {
-        std::cerr << "[NVENC] CUDA initialization failed" << std::endl;
-        return false;
+    // Zero-copy-only session does not require CUDA interop.
+    if (!zerocopy_only_) {
+        if (!InitializeCUDA()) {
+            std::cerr << "[NVENC] CUDA initialization failed" << std::endl;
+            return false;
+        }
+    } else {
+        std::cout << "[NVENC] CUDA initialization skipped (zerocopy-only session)" << std::endl;
     }
 
     // 加载 NVENC
@@ -246,9 +326,10 @@ bool NVENCEncoderImpl::InitializeNVENCSession() {
             std::cerr << "[NVENC] nvEncOpenEncodeSessionEx (CUDA) failed: " << err << std::endl;
             return false;
         }
+        std::cout << "[NVENC] Session opened with CUDA device type" << std::endl;
+    } else {
+        std::cout << "[NVENC] Session opened with DirectX device type (required for zero-copy)" << std::endl;
     }
-
-    std::cout << "[NVENC] Session opened successfully" << std::endl;
     return true;
 }
 
@@ -310,7 +391,13 @@ bool NVENCEncoderImpl::InitializeEncoderParams() {
     // 码率控制配置
     encodeConfig.rcParams.version = NV_ENC_RC_PARAMS_VER;
 
-    if (config_.rc_mode == 0 || config_.rc_mode == 3) {
+    if (zerocopy_only_) {
+        // Keep zerocopy session close to NVENC preset defaults to avoid param conflicts.
+        encodeConfig.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CONSTQP;
+        encodeConfig.rcParams.constQP.qpIntra = config_.quality;
+        encodeConfig.rcParams.constQP.qpInterP = config_.quality;
+        encodeConfig.rcParams.constQP.qpInterB = config_.quality + 1;
+    } else if (config_.rc_mode == 0 || config_.rc_mode == 3) {
         // ConstQP / CQ (Constant Quality) 模式 - 固定质量模式
         encodeConfig.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CONSTQP;
         encodeConfig.rcParams.constQP.qpIntra = config_.quality;
@@ -393,8 +480,10 @@ bool NVENCEncoderImpl::InitializeEncoderParams() {
     initializeParams.darHeight = config_.height;
     initializeParams.frameRateNum = config_.framerate;
     initializeParams.frameRateDen = 1;
+    initializeParams.maxEncodeWidth = config_.width;
+    initializeParams.maxEncodeHeight = config_.height;
     initializeParams.enableEncodeAsync = 0;
-    initializeParams.enablePTD = 0;
+    initializeParams.enablePTD = 1;
     initializeParams.reportSliceOffsets = 0;
     initializeParams.enableSubFrameWrite = 0;
     initializeParams.enableExternalMEHints = 0;
@@ -404,8 +493,34 @@ bool NVENCEncoderImpl::InitializeEncoderParams() {
     initializeParams.enableOutputInVidmem = 0;
     initializeParams.tuningInfo = NV_ENC_TUNING_INFO_HIGH_QUALITY;
     initializeParams.encodeConfig = &encodeConfig;
-    // 指定输入格式（对于 DirectX 接口，需要明确指定）
-    initializeParams.bufferFormat = NV_ENC_BUFFER_FORMAT_ABGR;
+    // Dedicated zero-copy session uses ARGB; mixed session keeps format flexible.
+    initializeParams.bufferFormat = zerocopy_only_ ? NV_ENC_BUFFER_FORMAT_ARGB : NV_ENC_BUFFER_FORMAT_UNDEFINED;
+
+    // Debug: print input formats supported by this codec/session.
+    if (nvenc_api_.nvEncGetInputFormats) {
+        NV_ENC_BUFFER_FORMAT fmts[64] = {};
+        uint32_t fmt_count = 0;
+        NVENCSTATUS fmt_err = nvenc_api_.nvEncGetInputFormats(
+            nvenc_encoder_,
+            NV_ENC_CODEC_H264_GUID,
+            fmts,
+            64,
+            &fmt_count
+        );
+        if (fmt_err == NV_ENC_SUCCESS) {
+            bool has_argb = false;
+            bool has_abgr = false;
+            for (uint32_t i = 0; i < fmt_count && i < 64; ++i) {
+                if (fmts[i] == NV_ENC_BUFFER_FORMAT_ARGB) has_argb = true;
+                if (fmts[i] == NV_ENC_BUFFER_FORMAT_ABGR) has_abgr = true;
+            }
+            std::cout << "[NVENC] InputFormats count=" << fmt_count
+                      << ", ARGB=" << (has_argb ? 1 : 0)
+                      << ", ABGR=" << (has_abgr ? 1 : 0) << std::endl;
+        } else {
+            std::cout << "[NVENC] nvEncGetInputFormats failed: " << fmt_err << std::endl;
+        }
+    }
 
     err = nvenc_api_.nvEncInitializeEncoder(nvenc_encoder_, &initializeParams);
     if (err != NV_ENC_SUCCESS) {
@@ -421,31 +536,135 @@ bool NVENCEncoderImpl::AllocateBuffers() {
     const uint32_t numBuffers = 4;
     input_buffers_.resize(numBuffers);
     bitstream_buffers_.resize(numBuffers);
+    zerocopy_registered_resources_.clear();
+    zerocopy_textures_.clear();
+    zerocopy_slot_inflight_.clear();
+    video_output_views_.clear();
+    video_input_view_.Reset();
 
-    // 暂时强制使用 NV12 格式，因为 ABGR 编码有问题
-    // TODO: 修复 ABGR 格式编码问题
-    use_abgr_format_ = false;
+    // Dedicated zero-copy session uses ARGB buffers; mixed mode keeps NV12.
+    use_abgr_format_ = zerocopy_only_;
 
-    NV_ENC_CREATE_INPUT_BUFFER createInputBufferParams = {};
-    createInputBufferParams.version = NV_ENC_CREATE_INPUT_BUFFER_VER;
-    createInputBufferParams.width = config_.width;
-    createInputBufferParams.height = config_.height;
-    createInputBufferParams.bufferFmt = NV_ENC_BUFFER_FORMAT_NV12;
-
-    for (uint32_t i = 0; i < numBuffers; i++) {
-        NVENCSTATUS err = nvenc_api_.nvEncCreateInputBuffer(nvenc_encoder_, &createInputBufferParams);
-        if (err != NV_ENC_SUCCESS) {
-            std::cerr << "[NVENC] nvEncCreateInputBuffer failed: " << err << std::endl;
+    if (zerocopy_only_) {
+        // Build D3D11 video processor for BGRA->NV12 conversion.
+        HRESULT hr = d3d11_device_->QueryInterface(__uuidof(ID3D11VideoDevice), &video_device_);
+        if (FAILED(hr) || !video_device_) {
+            std::cerr << "[NVENC] QueryInterface(ID3D11VideoDevice) failed: 0x" << std::hex << hr << std::dec << std::endl;
             return false;
         }
-        input_buffers_[i] = createInputBufferParams.inputBuffer;
+        ComPtr<ID3D11DeviceContext> base_context;
+        d3d11_device_->GetImmediateContext(&base_context);
+        hr = base_context->QueryInterface(__uuidof(ID3D11VideoContext), &video_context_);
+        if (FAILED(hr) || !video_context_) {
+            std::cerr << "[NVENC] QueryInterface(ID3D11VideoContext) failed: 0x" << std::hex << hr << std::dec << std::endl;
+            return false;
+        }
+
+        D3D11_VIDEO_PROCESSOR_CONTENT_DESC content_desc = {};
+        content_desc.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+        content_desc.InputFrameRate.Numerator = config_.framerate;
+        content_desc.InputFrameRate.Denominator = 1;
+        content_desc.InputWidth = config_.width;
+        content_desc.InputHeight = config_.height;
+        content_desc.OutputFrameRate.Numerator = config_.framerate;
+        content_desc.OutputFrameRate.Denominator = 1;
+        content_desc.OutputWidth = config_.width;
+        content_desc.OutputHeight = config_.height;
+        content_desc.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
+
+        hr = video_device_->CreateVideoProcessorEnumerator(&content_desc, &video_processor_enum_);
+        if (FAILED(hr) || !video_processor_enum_) {
+            std::cerr << "[NVENC] CreateVideoProcessorEnumerator failed: 0x" << std::hex << hr << std::dec << std::endl;
+            return false;
+        }
+        hr = video_device_->CreateVideoProcessor(video_processor_enum_.Get(), 0, &video_processor_);
+        if (FAILED(hr) || !video_processor_) {
+            std::cerr << "[NVENC] CreateVideoProcessor failed: 0x" << std::hex << hr << std::dec << std::endl;
+            return false;
+        }
+
+        // Sample-style: pre-create/register NV12 textures and map them per frame.
+        zerocopy_textures_.resize(numBuffers);
+        zerocopy_registered_resources_.resize(numBuffers, nullptr);
+        zerocopy_slot_inflight_.assign(numBuffers, false);
+        video_output_views_.resize(numBuffers);
+
+        D3D11_TEXTURE2D_DESC texDesc = {};
+        texDesc.Width = config_.width;
+        texDesc.Height = config_.height;
+        texDesc.MipLevels = 1;
+        texDesc.ArraySize = 1;
+        texDesc.Format = DXGI_FORMAT_NV12;
+        texDesc.SampleDesc.Count = 1;
+        texDesc.Usage = D3D11_USAGE_DEFAULT;
+        texDesc.BindFlags = D3D11_BIND_RENDER_TARGET;
+        texDesc.CPUAccessFlags = 0;
+        texDesc.MiscFlags = 0;
+
+        for (uint32_t i = 0; i < numBuffers; ++i) {
+            HRESULT hr = d3d11_device_->CreateTexture2D(&texDesc, nullptr, &zerocopy_textures_[i]);
+            if (FAILED(hr) || !zerocopy_textures_[i]) {
+                std::cerr << "[NVENC] Failed to create zerocopy texture: 0x" << std::hex << hr << std::dec << std::endl;
+                return false;
+            }
+
+            NV_ENC_REGISTER_RESOURCE reg = {};
+            reg.version = NV_ENC_REGISTER_RESOURCE_VER;
+            reg.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX;
+            reg.resourceToRegister = zerocopy_textures_[i].Get();
+            reg.width = config_.width;
+            reg.height = config_.height;
+            reg.pitch = 0;
+            reg.subResourceIndex = 0;
+            reg.bufferFormat = NV_ENC_BUFFER_FORMAT_NV12;
+            reg.bufferUsage = NV_ENC_INPUT_IMAGE;
+
+            NVENCSTATUS err = nvenc_api_.nvEncRegisterResource(nvenc_encoder_, &reg);
+            if (err != NV_ENC_SUCCESS) {
+                std::cerr << "[NVENC] nvEncRegisterResource(zerocopy) failed: " << err << std::endl;
+                return false;
+            }
+            zerocopy_registered_resources_[i] = reg.registeredResource;
+
+            D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC out_desc = {};
+            out_desc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+            out_desc.Texture2D.MipSlice = 0;
+            hr = video_device_->CreateVideoProcessorOutputView(
+                zerocopy_textures_[i].Get(),
+                video_processor_enum_.Get(),
+                &out_desc,
+                &video_output_views_[i]
+            );
+            if (FAILED(hr) || !video_output_views_[i]) {
+                std::cerr << "[NVENC] CreateVideoProcessorOutputView(slot) failed: 0x" << std::hex << hr << std::dec << std::endl;
+                return false;
+            }
+        }
+    } else {
+        NV_ENC_CREATE_INPUT_BUFFER createInputBufferParams = {};
+        createInputBufferParams.version = NV_ENC_CREATE_INPUT_BUFFER_VER;
+        createInputBufferParams.width = config_.width;
+        createInputBufferParams.height = config_.height;
+        createInputBufferParams.bufferFmt = NV_ENC_BUFFER_FORMAT_NV12;
+
+        for (uint32_t i = 0; i < numBuffers; i++) {
+            NVENCSTATUS err = nvenc_api_.nvEncCreateInputBuffer(nvenc_encoder_, &createInputBufferParams);
+            if (err != NV_ENC_SUCCESS) {
+                std::cerr << "[NVENC] nvEncCreateInputBuffer failed: " << err << std::endl;
+                return false;
+            }
+            input_buffers_[i] = createInputBufferParams.inputBuffer;
+        }
     }
 
-    std::cout << "[NVENC] Input buffer format: NV12 (BGRA→NV12 conversion required)" << std::endl;
+    std::cout << "[NVENC] Input buffer mode: "
+              << (zerocopy_only_ ? "D3D11 registered textures (zerocopy)" : "NV12 buffers")
+              << std::endl;
 
     NV_ENC_CREATE_BITSTREAM_BUFFER createBitstreamBufferParams = {};
     createBitstreamBufferParams.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
-    createBitstreamBufferParams.size = config_.width * config_.height * 3 / 2;
+    // Keep a larger bitstream buffer headroom for intra spikes.
+    createBitstreamBufferParams.size = config_.width * config_.height * 4;
 
     for (uint32_t i = 0; i < numBuffers; i++) {
         NVENCSTATUS err = nvenc_api_.nvEncCreateBitstreamBuffer(nvenc_encoder_, &createBitstreamBufferParams);
@@ -476,6 +695,25 @@ bool NVENCEncoderImpl::AllocateBuffers() {
     if (FAILED(hr)) {
         std::cerr << "[NVENC] Failed to create intermediate texture: 0x" << std::hex << hr << std::endl;
         return false;
+    }
+
+    if (zerocopy_only_) {
+        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC in_desc = {};
+        in_desc.FourCC = 0;
+        in_desc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+        in_desc.Texture2D.MipSlice = 0;
+        in_desc.Texture2D.ArraySlice = 0;
+
+        hr = video_device_->CreateVideoProcessorInputView(
+            intermediate_texture_.Get(),
+            video_processor_enum_.Get(),
+            &in_desc,
+            &video_input_view_
+        );
+        if (FAILED(hr) || !video_input_view_) {
+            std::cerr << "[NVENC] CreateVideoProcessorInputView failed: 0x" << std::hex << hr << std::dec << std::endl;
+            return false;
+        }
     }
 
     std::cout << "[NVENC] Created intermediate texture for cross-device copy" << std::endl;
@@ -527,25 +765,18 @@ bool NVENCEncoderImpl::EncodeFromCPU(const unsigned char* data, int size, long l
         return false;
     }
 
-    // 转换 BGRA 到 NV12
+    // 转换 BGRA 到 NV12 (CPU fallback with proper UV)
     uint8_t* dstY = (uint8_t*)lockInputBufferParams.bufferDataPtr;
-    const uint8_t* srcBGRA = data;
-    int width = config_.width;
-    int height = config_.height;
-
-    // Y 分量
-    for (int y = 0; y < height; y++) {
-        for (int x = 0; x < width; x++) {
-            int srcIdx = (y * width + x) * 4;
-            dstY[y * lockInputBufferParams.pitch + x] =
-                (299 * srcBGRA[srcIdx + 2] + 587 * srcBGRA[srcIdx + 1] + 114 * srcBGRA[srcIdx + 0]) / 1000;
-        }
-    }
-
-    // UV 分量
-    uint8_t* dstUV = dstY + lockInputBufferParams.pitch * height;
-    int uvSize = (lockInputBufferParams.pitch * height) / 2;
-    std::memset(dstUV, 128, uvSize);
+    uint8_t* dstUV = dstY + lockInputBufferParams.pitch * config_.height;
+    ConvertBGRAtoNV12CPU(
+        data,
+        config_.width * 4,
+        config_.width,
+        config_.height,
+        dstY,
+        dstUV,
+        lockInputBufferParams.pitch
+    );
 
     nvenc_api_.nvEncUnlockInputBuffer(nvenc_encoder_, lockInputBufferParams.inputBuffer);
 
@@ -700,26 +931,12 @@ bool NVENCEncoderImpl::EncodeFromD3D11(ID3D11Texture2D* texture, long long times
         }
     } else {
         // NV12 格式：使用 CUDA kernel 进行 GPU 端 BGRA→NV12 转换
-        // 分配 GPU 端 NV12 缓冲区
-        int nv12Size = dstPitch * config_.height * 3 / 2;  // NV12 = Y + UV/4
-        CUdeviceptr nv12Buffer = 0;
-        cudaErr = cuMemAlloc(&nv12Buffer, nv12Size);
-        if (cudaErr != CUDA_SUCCESS) {
-            std::cerr << "[NVENC] cuMemAlloc (NV12) failed: " << cudaErr << std::endl;
-            nvenc_api_.nvEncUnlockInputBuffer(nvenc_encoder_, lockInputBufferParams.inputBuffer);
-            cuGraphicsUnmapResources(1, &cudaResource, cuda_stream_);
-            cuGraphicsUnregisterResource(cudaResource);
-            cuCtxPopCurrent(&prev_context);
-            return false;
-        }
-
         // 分配临时 BGRA 缓冲区（GPU 端）
         int bgraSize = config_.width * config_.height * 4;
         CUdeviceptr bgraBuffer = 0;
         cudaErr = cuMemAlloc(&bgraBuffer, bgraSize);
         if (cudaErr != CUDA_SUCCESS) {
             std::cerr << "[NVENC] cuMemAlloc (BGRA) failed: " << cudaErr << std::endl;
-            cuMemFree(nv12Buffer);
             nvenc_api_.nvEncUnlockInputBuffer(nvenc_encoder_, lockInputBufferParams.inputBuffer);
             cuGraphicsUnmapResources(1, &cudaResource, cuda_stream_);
             cuGraphicsUnregisterResource(cudaResource);
@@ -744,7 +961,6 @@ bool NVENCEncoderImpl::EncodeFromD3D11(ID3D11Texture2D* texture, long long times
         if (cudaErr != CUDA_SUCCESS) {
             std::cerr << "[NVENC] cuMemcpy2D failed: " << cudaErr << std::endl;
             cuMemFree(bgraBuffer);
-            cuMemFree(nv12Buffer);
             nvenc_api_.nvEncUnlockInputBuffer(nvenc_encoder_, lockInputBufferParams.inputBuffer);
             cuGraphicsUnmapResources(1, &cudaResource, cuda_stream_);
             cuGraphicsUnregisterResource(cudaResource);
@@ -774,7 +990,6 @@ bool NVENCEncoderImpl::EncodeFromD3D11(ID3D11Texture2D* texture, long long times
 
         if (cudaErr != CUDA_SUCCESS) {
             std::cerr << "[NVENC] cuMemcpyDtoH failed: " << cudaErr << std::endl;
-            cuMemFree(nv12Buffer);
             nvenc_api_.nvEncUnlockInputBuffer(nvenc_encoder_, lockInputBufferParams.inputBuffer);
             cuGraphicsUnmapResources(1, &cudaResource, cuda_stream_);
             cuGraphicsUnregisterResource(cudaResource);
@@ -782,27 +997,18 @@ bool NVENCEncoderImpl::EncodeFromD3D11(ID3D11Texture2D* texture, long long times
             return false;
         }
 
-        // BGRA → NV12 转换 (CPU 上完成，后续将优化为 CUDA kernel)
+        // BGRA → NV12 转换 (CPU fallback with proper UV)
         uint8_t* nv12Y = dstBuffer;
         uint8_t* nv12UV = nv12Y + dstPitch * config_.height;
-
-        // Y 分量
-        for (int y = 0; y < config_.height; y++) {
-            for (int x = 0; x < config_.width; x++) {
-                int srcIdx = y * config_.width * 4 + x * 4;
-                int dstIdx = y * dstPitch + x;
-                uint8_t B = bgraData[srcIdx + 0];
-                uint8_t G = bgraData[srcIdx + 1];
-                uint8_t R = bgraData[srcIdx + 2];
-                nv12Y[dstIdx] = (299 * R + 587 * G + 114 * B) / 1000;
-            }
-        }
-
-        // UV 分量
-        int uvSize = (dstPitch * config_.height) / 2;
-        for (int i = 0; i < uvSize; i++) {
-            nv12UV[i] = 128;
-        }
+        ConvertBGRAtoNV12CPU(
+            bgraData.data(),
+            config_.width * 4,
+            config_.width,
+            config_.height,
+            nv12Y,
+            nv12UV,
+            dstPitch
+        );
     }
 
     // 8. 取消映射 CUDA 资源
@@ -867,9 +1073,93 @@ bool NVENCEncoderImpl::EncodeFromD3D11(ID3D11Texture2D* texture, long long times
     return false;
 }
 
+bool NVENCEncoderImpl::DrainPendingPackets(bool do_not_wait) {
+    if (!nvenc_encoder_) {
+        return false;
+    }
+
+    bool drained_any = false;
+    while (!pending_packets_.empty()) {
+        const PendingPacket front = pending_packets_.front();
+
+        NV_ENC_LOCK_BITSTREAM lockBitstreamData = {};
+        lockBitstreamData.version = NV_ENC_LOCK_BITSTREAM_VER;
+        lockBitstreamData.outputBitstream = bitstream_buffers_[front.bitstream_index];
+        lockBitstreamData.doNotWait = do_not_wait ? 1 : 0;
+
+        NVENCSTATUS lock_err = nvenc_api_.nvEncLockBitstream(nvenc_encoder_, &lockBitstreamData);
+        if (lock_err != NV_ENC_SUCCESS) {
+            if (do_not_wait) {
+                // Non-blocking poll: any non-success means "not ready yet".
+                if (lock_err == NV_ENC_ERR_LOCK_BUSY) {
+                    zc_lock_busy_count_++;
+                } else {
+                    zc_lock_retryable_count_++;
+                }
+            } else if (lock_err == NV_ENC_ERR_LOCK_BUSY ||
+                       lock_err == NV_ENC_ERR_NEED_MORE_INPUT ||
+                       lock_err == NV_ENC_ERR_ENCODER_BUSY) {
+                zc_lock_retryable_count_++;
+            } else {
+                zc_lock_failures_++;
+            }
+            break;
+        }
+
+        if (lockBitstreamData.bitstreamSizeInBytes > 0) {
+            EncodedOutput output;
+            output.data.assign(
+                (uint8_t*)lockBitstreamData.bitstreamBufferPtr,
+                (uint8_t*)lockBitstreamData.bitstreamBufferPtr + lockBitstreamData.bitstreamSizeInBytes
+            );
+            output.timestamp = front.timestamp;
+            output.key_frame = front.key_frame;
+            output_queue_.push_back(output);
+            zc_bitstream_outputs_++;
+        }
+
+        nvenc_api_.nvEncUnlockBitstream(nvenc_encoder_, lockBitstreamData.outputBitstream);
+        if (front.mapped_resource) {
+            nvenc_api_.nvEncUnmapInputResource(nvenc_encoder_, front.mapped_resource);
+            zc_unmap_count_++;
+        }
+        if (front.bitstream_index < zerocopy_slot_inflight_.size()) {
+            zerocopy_slot_inflight_[front.bitstream_index] = false;
+        }
+        pending_packets_.pop_front();
+        drained_any = true;
+    }
+
+    return drained_any;
+}
+
+bool NVENCEncoderImpl::GetZeroCopyStats(NVENCZeroCopyStats* stats) const {
+    if (!stats) {
+        return false;
+    }
+    stats->encode_calls = zc_encode_calls_;
+    stats->encode_submit_success = zc_encode_submit_success_;
+    stats->encode_submit_need_more_input = zc_encode_submit_need_more_input_;
+    stats->encode_submit_fail = zc_encode_submit_fail_;
+    stats->slot_busy_skips = zc_slot_busy_skips_;
+    stats->map_failures = zc_map_failures_;
+    stats->lock_busy_count = zc_lock_busy_count_;
+    stats->lock_retryable_count = zc_lock_retryable_count_;
+    stats->lock_failures = zc_lock_failures_;
+    stats->bitstream_outputs = zc_bitstream_outputs_;
+    stats->unmap_count = zc_unmap_count_;
+    stats->pending_peak = zc_pending_peak_;
+    stats->pending_current = static_cast<unsigned int>(pending_packets_.size());
+    return true;
+}
+
 bool NVENCEncoderImpl::GetEncodedFrame(NVENCEncodedFrame* frame) {
     if (!initialized_ || !frame) {
         return false;
+    }
+
+    if (!pending_packets_.empty()) {
+        DrainPendingPackets(false);
     }
 
     if (output_queue_.empty()) {
@@ -893,10 +1183,23 @@ void NVENCEncoderImpl::RequestKeyframe() {
 
 void NVENCEncoderImpl::Cleanup() {
     output_queue_.clear();
+    if (!pending_packets_.empty() && nvenc_encoder_) {
+        for (const auto& pkt : pending_packets_) {
+            if (pkt.mapped_resource) {
+                nvenc_api_.nvEncUnmapInputResource(nvenc_encoder_, pkt.mapped_resource);
+                zc_unmap_count_++;
+            }
+        }
+    }
+    pending_packets_.clear();
+    zerocopy_slot_inflight_.clear();
+    video_input_view_.Reset();
+    video_output_views_.clear();
 
     // 解除映射（如果还在映射状态）
     if (mapped_resource_ && nvenc_encoder_) {
         nvenc_api_.nvEncUnmapInputResource(nvenc_encoder_, mapped_resource_);
+        zc_unmap_count_++;
         mapped_resource_ = nullptr;
     }
 
@@ -904,7 +1207,18 @@ void NVENCEncoderImpl::Cleanup() {
     if (registered_resource_ && nvenc_encoder_) {
         nvenc_api_.nvEncUnregisterResource(nvenc_encoder_, registered_resource_);
         registered_resource_ = nullptr;
+        registered_source_texture_ = nullptr;
     }
+
+    if (!zerocopy_registered_resources_.empty() && nvenc_encoder_) {
+        for (void* reg : zerocopy_registered_resources_) {
+            if (reg) {
+                nvenc_api_.nvEncUnregisterResource(nvenc_encoder_, reg);
+            }
+        }
+    }
+    zerocopy_registered_resources_.clear();
+    zerocopy_textures_.clear();
 
     if (nvenc_encoder_) {
         for (auto buf : input_buffers_) {
@@ -952,119 +1266,148 @@ bool NVENCEncoderImpl::EncodeFromD3D11_ZeroCopy(ID3D11Texture2D* texture, long l
     if (!initialized_ || !texture) {
         return false;
     }
+    zc_encode_calls_++;
 
-    // 将外部纹理复制到我们的中间纹理 (跨设备 GPU-GPU 复制，无 CPU 参与)
-    if (intermediate_texture_) {
-        d3d11_context_->CopyResource(intermediate_texture_.Get(), texture);
-        d3d11_context_->Flush();
-    } else {
+    if (zerocopy_registered_resources_.empty() || zerocopy_textures_.empty()) {
+        std::cerr << "[NVENC-ZeroCopy] Zerocopy resources not initialized" << std::endl;
         return false;
     }
 
-    // 注册中间纹理到 NVENC (如果还没注册)
-    if (!registered_resource_) {
-        NV_ENC_REGISTER_RESOURCE registerResParams = {};
-        registerResParams.version = NV_ENC_REGISTER_RESOURCE_VER;
-        registerResParams.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX;
-        registerResParams.resourceToRegister = intermediate_texture_.Get();
-        registerResParams.width = config_.width;
-        registerResParams.height = config_.height;
-        registerResParams.pitch = 0;  // DirectX 资源设为 0
-        registerResParams.subResourceIndex = 0;
-        registerResParams.bufferFormat = NV_ENC_BUFFER_FORMAT_ABGR;  // DXGI_B8G8R8A8_UNORM = ABGR
-        registerResParams.bufferUsage = NV_ENC_INPUT_IMAGE;
-        registerResParams.pInputFencePoint = nullptr;
-        registerResParams.chromaOffset[0] = 0;
-        registerResParams.chromaOffset[1] = 0;
-        registerResParams.chromaOffsetIn[0] = 0;
-        registerResParams.chromaOffsetIn[1] = 0;
-
-        NVENCSTATUS err = nvenc_api_.nvEncRegisterResource(nvenc_encoder_, &registerResParams);
-        if (err != NV_ENC_SUCCESS) {
-            std::cerr << "[NVENC-ZeroCopy] Failed to register resource: " << err << std::endl;
-            return false;
-        }
-        registered_resource_ = registerResParams.registeredResource;
-        std::cout << "[NVENC-ZeroCopy] Registered D3D11 texture to NVENC" << std::endl;
+    if (!pending_packets_.empty()) {
+        DrainPendingPackets(true);
     }
+
+    const uint32_t idx = current_input_buffer_ % static_cast<uint32_t>(zerocopy_textures_.size());
+    if (idx < zerocopy_slot_inflight_.size() && zerocopy_slot_inflight_[idx]) {
+        // Slot still owned by NVENC; backpressure instead of reusing mapped resources.
+        zc_slot_busy_skips_++;
+        return false;
+    }
+
+    ID3D11Texture2D* encode_texture = zerocopy_textures_[idx].Get();
+    void* registered = zerocopy_registered_resources_[idx];
+    if (!encode_texture || !registered) {
+        std::cerr << "[NVENC-ZeroCopy] Invalid zerocopy resource slot" << std::endl;
+        return false;
+    }
+
+    if (!intermediate_texture_ || !video_device_ || !video_context_ || !video_processor_ || !video_processor_enum_ || !video_input_view_) {
+        std::cerr << "[NVENC-ZeroCopy] Video processor path not initialized" << std::endl;
+        return false;
+    }
+
+    // 1) Copy source BGRA to stable intermediate texture.
+    d3d11_context_->CopyResource(intermediate_texture_.Get(), texture);
+
+    // 2) Use D3D11 VideoProcessor to convert BGRA -> NV12 texture (GPU-only).
+    if (idx >= video_output_views_.size() || !video_output_views_[idx]) {
+        std::cerr << "[NVENC-ZeroCopy] Video processor output view missing for slot " << idx << std::endl;
+        return false;
+    }
+
+    D3D11_VIDEO_PROCESSOR_STREAM stream = {};
+    stream.Enable = TRUE;
+    stream.pInputSurface = video_input_view_.Get();
+    HRESULT hr = video_context_->VideoProcessorBlt(
+        video_processor_.Get(),
+        video_output_views_[idx].Get(),
+        0,
+        1,
+        &stream
+    );
+    if (FAILED(hr)) {
+        std::cerr << "[NVENC-ZeroCopy] VideoProcessorBlt failed: 0x" << std::hex << hr << std::dec << std::endl;
+        return false;
+    }
+    d3d11_context_->Flush();
 
     // 映射资源到 NVENC 输入缓冲区
     NV_ENC_MAP_INPUT_RESOURCE mapInputResParams = {};
     mapInputResParams.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
     mapInputResParams.subResourceIndex = 0;
     mapInputResParams.inputResource = nullptr;  // 已废弃
-    mapInputResParams.registeredResource = registered_resource_;
+    mapInputResParams.registeredResource = registered;
 
     NVENCSTATUS err = nvenc_api_.nvEncMapInputResource(nvenc_encoder_, &mapInputResParams);
     if (err != NV_ENC_SUCCESS) {
         std::cerr << "[NVENC-ZeroCopy] Failed to map input resource: " << err << std::endl;
-        // 尝试取消注册并重新注册
-        if (registered_resource_) {
-            nvenc_api_.nvEncUnregisterResource(nvenc_encoder_, registered_resource_);
-            registered_resource_ = nullptr;
-        }
+        zc_map_failures_++;
         return false;
     }
 
-    mapped_resource_ = mapInputResParams.mappedResource;
+    void* mapped_resource = mapInputResParams.mappedResource;
+    mapped_resource_ = mapped_resource;
+
+    // 调试：打印映射后的格式
+    std::cout << "[NVENC-ZeroCopy] Mapped resource format: 0x" << std::hex
+              << mapInputResParams.mappedBufferFmt << std::dec << std::endl;
 
     // 编码帧参数 - 直接使用映射的资源
     NV_ENC_PIC_PARAMS picParams = {};
     picParams.version = NV_ENC_PIC_PARAMS_VER;
-    picParams.inputBuffer = mapped_resource_;  // 使用映射的资源！
-    picParams.outputBitstream = bitstream_buffers_[current_bitstream_buffer_];
+    picParams.inputBuffer = mapped_resource;  // 使用映射的资源！
+    picParams.outputBitstream = bitstream_buffers_[idx];
     picParams.inputWidth = config_.width;
     picParams.inputHeight = config_.height;
-    picParams.inputPitch = config_.width * 4;  // ABGR 每像素 4 字节
     picParams.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
-    picParams.frameIdx = current_pts_;
-    picParams.bufferFmt = mapInputResParams.mappedBufferFmt;  // 使用映射的格式
+    picParams.bufferFmt = NV_ENC_BUFFER_FORMAT_NV12;
 
-    if (force_keyframe || force_keyframe_ || current_pts_ % config_.gop_size == 0) {
-        picParams.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR;
+    std::cout << "[NVENC-ZeroCopy] Pic params: width=" << picParams.inputWidth
+              << ", height=" << picParams.inputHeight
+              << ", pitch=" << picParams.inputPitch
+              << ", bufferFmt=" << picParams.bufferFmt
+              << ", inputBuffer=" << picParams.inputBuffer
+              << ", outputBitstream=" << picParams.outputBitstream << std::endl;
+
+    const bool want_idr = (force_keyframe || force_keyframe_ || (current_pts_ % config_.gop_size == 0));
+    picParams.encodePicFlags = want_idr ? NV_ENC_PIC_FLAG_FORCEIDR : 0;
+    if (want_idr) {
         force_keyframe_ = false;
-    } else {
-        picParams.encodePicFlags = 0;
     }
 
     // 编码图片 (完全在 GPU 上，无 CPU 复制！)
     err = nvenc_api_.nvEncEncodePicture(nvenc_encoder_, &picParams);
-
-    // 立即解除映射 (编码已提交到 GPU)
-    if (mapped_resource_) {
-        nvenc_api_.nvEncUnmapInputResource(nvenc_encoder_, mapped_resource_);
-        mapped_resource_ = nullptr;
-    }
-
-    current_input_buffer_ = (current_input_buffer_ + 1) % input_buffers_.size();
-    current_bitstream_buffer_ = (current_bitstream_buffer_ + 1) % bitstream_buffers_.size();
+    current_input_buffer_ = (current_input_buffer_ + 1) % static_cast<uint32_t>(zerocopy_textures_.size());
+    current_bitstream_buffer_ = current_input_buffer_;
 
     if (err == NV_ENC_SUCCESS || err == NV_ENC_ERR_NEED_MORE_INPUT) {
-        uint32_t lastBuffer = (current_bitstream_buffer_ - 1 + bitstream_buffers_.size()) % bitstream_buffers_.size();
-
-        NV_ENC_LOCK_BITSTREAM lockBitstreamData = {};
-        lockBitstreamData.version = NV_ENC_LOCK_BITSTREAM_VER;
-        lockBitstreamData.outputBitstream = bitstream_buffers_[lastBuffer];
-        lockBitstreamData.doNotWait = 0;
-
-        err = nvenc_api_.nvEncLockBitstream(nvenc_encoder_, &lockBitstreamData);
-        if (err == NV_ENC_SUCCESS && lockBitstreamData.bitstreamSizeInBytes > 0) {
-            EncodedOutput output;
-            output.data.assign((uint8_t*)lockBitstreamData.bitstreamBufferPtr,
-                             (uint8_t*)lockBitstreamData.bitstreamBufferPtr + lockBitstreamData.bitstreamSizeInBytes);
-            output.timestamp = current_pts_;
-            output.key_frame = (picParams.encodePicFlags & NV_ENC_PIC_FLAG_FORCEIDR) != 0;
-
-            output_queue_.push_back(output);
-            current_pts_++;
-
-            nvenc_api_.nvEncUnlockBitstream(nvenc_encoder_, lockBitstreamData.outputBitstream);
+        if (err == NV_ENC_SUCCESS) {
+            zc_encode_submit_success_++;
+        } else {
+            zc_encode_submit_need_more_input_++;
         }
+        PendingPacket pkt = {};
+        pkt.bitstream_index = idx;
+        pkt.timestamp = current_pts_++;
+        pkt.key_frame = want_idr;
+        pkt.mapped_resource = mapped_resource;
+        pending_packets_.push_back(pkt);
+        if (pending_packets_.size() > zc_pending_peak_) {
+            zc_pending_peak_ = static_cast<unsigned int>(pending_packets_.size());
+        }
+        if (idx < zerocopy_slot_inflight_.size()) {
+            zerocopy_slot_inflight_[idx] = true;
+        }
+        mapped_resource_ = nullptr;
+
+        DrainPendingPackets(true);
 
         return true;
     }
 
     std::cerr << "[NVENC-ZeroCopy] Encode picture failed: " << err << std::endl;
+    zc_encode_submit_fail_++;
+    if (nvenc_api_.nvEncGetLastErrorString) {
+        const char* msg = nvenc_api_.nvEncGetLastErrorString(nvenc_encoder_);
+        if (msg) {
+            std::cerr << "[NVENC-ZeroCopy] LastError: " << msg << std::endl;
+        }
+    }
+    if (mapped_resource) {
+        nvenc_api_.nvEncUnmapInputResource(nvenc_encoder_, mapped_resource);
+        zc_unmap_count_++;
+    }
+    mapped_resource_ = nullptr;
     return false;
 }
 
@@ -1119,7 +1462,32 @@ NVENC_API HNVENCEncoder init_nvenc_encoder_d3d11(
     if (!encoder->Initialize(
         static_cast<ID3D11Device*>(d3d11_device),
         static_cast<ID3D11DeviceContext*>(d3d11_context),
-        config
+        config,
+        false
+    )) {
+        delete encoder;
+        return nullptr;
+    }
+
+    return static_cast<HNVENCEncoder>(encoder);
+}
+
+NVENC_API HNVENCEncoder init_nvenc_encoder_d3d11_zerocopy(
+    void* d3d11_device,
+    void* d3d11_context,
+    const NVENCEncodeConfig* config
+) {
+    if (!d3d11_device || !d3d11_context || !config) {
+        return nullptr;
+    }
+
+    NVENCEncoderImpl* encoder = new NVENCEncoderImpl();
+
+    if (!encoder->Initialize(
+        static_cast<ID3D11Device*>(d3d11_device),
+        static_cast<ID3D11DeviceContext*>(d3d11_context),
+        config,
+        true
     )) {
         delete encoder;
         return nullptr;
@@ -1182,6 +1550,14 @@ NVENC_API int get_nvenc_encoded_frame(
     }
 
     return encoder->GetEncodedFrame(frame) ? 1 : 0;
+}
+
+NVENC_API int get_nvenc_zerocopy_stats(HNVENCEncoder handle, NVENCZeroCopyStats* stats) {
+    NVENCEncoderImpl* encoder = static_cast<NVENCEncoderImpl*>(handle);
+    if (!encoder || !encoder->IsInitialized() || !stats) {
+        return 0;
+    }
+    return encoder->GetZeroCopyStats(stats) ? 1 : 0;
 }
 
 // 新函数: 获取编码帧并写入提供的缓冲区 (Python ctypes 友好)

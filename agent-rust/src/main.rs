@@ -23,11 +23,12 @@ use crate::profile::apply_capture_profile;
 use crate::quic_tx::{QuicAu, QuicServerAdvert, start_quic_sender};
 use crate::rtp_send::{RtpH264Sender, RtpH264SenderConfig};
 use crate::runtime_stats::{RuntimeStats, spawn_rtcp_feedback_loop, spawn_stats_panel};
-use agent_rust::{SessionSwitch, load_config};
+use agent_rust::load_config;
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -59,9 +60,12 @@ use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSampl
 
 #[derive(Default)]
 struct SessionState {
-    controller_id: Option<String>,
-    pc: Option<Arc<RTCPeerConnection>>,
-    switcher: SessionSwitch,
+    sessions: HashMap<String, SessionEntry>,
+}
+
+struct SessionEntry {
+    pc: Arc<RTCPeerConnection>,
+    running: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,6 +156,8 @@ async fn main() -> Result<()> {
         "capture configuration"
     );
 
+    let capture_cfg = Arc::new(Mutex::new(cfg.capture.clone()));
+
     let (ws, _) = connect_async(&cfg.ws_url)
         .await
         .with_context(|| format!("connect signaling failed: {}", cfg.ws_url))?;
@@ -236,19 +242,47 @@ async fn main() -> Result<()> {
                 "session transport negotiated"
             );
 
-            let (old_pc, session_running) = {
+            let max_clients = std::env::var("AGENT_MAX_CLIENTS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(4)
+                .max(1);
+            let session_running = Arc::new(AtomicBool::new(true));
+            let old_entry = {
                 let mut s = session.lock().await;
-                let old_pc = s.pc.take();
-                let (_gen, running) = s.switcher.begin();
-                (old_pc, running)
+                if !s.sessions.contains_key(&controller_id) && s.sessions.len() >= max_clients {
+                    warn!(
+                        controller_id = %controller_id,
+                        max_clients,
+                        active_clients = s.sessions.len(),
+                        "rejecting offer: max client limit reached"
+                    );
+                    None
+                } else {
+                    s.sessions.remove(&controller_id)
+                }
             };
-            if let Some(pc) = old_pc {
+            if old_entry.is_none() {
+                let s = session.lock().await;
+                if !s.sessions.contains_key(&controller_id) && s.sessions.len() >= max_clients {
+                    let err_msg = json!({
+                        "type": "webrtc",
+                        "action": "error",
+                        "payload": {
+                            "controllerId": controller_id,
+                            "message": format!("max clients reached ({max_clients})"),
+                        }
+                    });
+                    let _ = ws_send_json(&write, &err_msg).await;
+                    continue;
+                }
+            }
+            if let Some(entry) = old_entry {
+                entry.running.store(false, Ordering::SeqCst);
+                let pc = entry.pc;
                 if let Err(e) = pc.close().await {
                     warn!(error = %e, "failed to close previous peer connection");
                 }
-                // Give the transport stack a brief cool-down window.
-                // Without this, rapid re-offer can leave the next session stuck at ICE connected
-                // but never reaching peer connection connected on some hosts.
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
 
@@ -264,10 +298,11 @@ async fn main() -> Result<()> {
             }
 
             let pc = create_peer_connection(write.clone(), controller_id.clone()).await?;
+            let effective_capture_cfg = { capture_cfg.lock().await.clone() };
             attach_video_track_with_policy(
                 pc.clone(),
-                &cfg.capture,
-                session_running,
+                &effective_capture_cfg,
+                session_running.clone(),
                 selected_transport,
                 quic_tx,
             )
@@ -290,7 +325,7 @@ async fn main() -> Result<()> {
                 "action": "answer",
                 "payload": {
                     "answer": { "type": offer_type.replace("offer", "answer"), "sdp": answer.sdp },
-                    "controllerId": controller_id,
+                    "controllerId": controller_id.clone(),
                     "selectedTransport": selected_transport.as_str(),
                     "quic": quic_advert.as_ref().map(|q| json!({
                         "addr": q.addr,
@@ -309,8 +344,35 @@ async fn main() -> Result<()> {
             info!("WebRTC answer sent");
 
             let mut s = session.lock().await;
-            s.controller_id = Some(controller_id);
-            s.pc = Some(pc);
+            s.sessions.insert(
+                controller_id,
+                SessionEntry {
+                    pc,
+                    running: session_running,
+                },
+            );
+            continue;
+        }
+
+        if typ == "control" && action == "updateCapture" {
+            let patch = v["payload"]["capture"].clone();
+            let controller_id = v["payload"]["controllerId"].as_str().unwrap_or("").to_string();
+            if let Err(e) = apply_capture_patch(&capture_cfg, &patch).await {
+                warn!(error = %e, "apply capture update failed");
+            } else {
+                info!(controller_id = %controller_id, patch = %patch, "capture settings updated");
+            }
+            let entries = {
+                let mut s = session.lock().await;
+                let all: Vec<SessionEntry> = s.sessions.drain().map(|(_, v)| v).collect();
+                all
+            };
+            for entry in entries {
+                entry.running.store(false, Ordering::SeqCst);
+                if let Err(e) = entry.pc.close().await {
+                    warn!(error = %e, "failed to close peer connection after updateCapture");
+                }
+            }
             continue;
         }
 
@@ -319,20 +381,30 @@ async fn main() -> Result<()> {
             if candidate.is_null() {
                 continue;
             }
-            let mut s = session.lock().await;
-            if let Some(pc) = &mut s.pc {
-                let cand: webrtc::ice_transport::ice_candidate::RTCIceCandidateInit =
-                    serde_json::from_value(candidate.clone()).context("parse remote ice failed")?;
-                if let Err(e) = pc.add_ice_candidate(cand).await {
-                    warn!(error = %e, "failed to add remote ice candidate");
+            let controller_id = v["payload"]["controllerId"].as_str().unwrap_or("").to_string();
+            let cand: webrtc::ice_transport::ice_candidate::RTCIceCandidateInit =
+                serde_json::from_value(candidate.clone()).context("parse remote ice failed")?;
+            let target_pc = {
+                let s = session.lock().await;
+                if controller_id.is_empty() {
+                    s.sessions.values().next().map(|e| e.pc.clone())
+                } else {
+                    s.sessions.get(&controller_id).map(|e| e.pc.clone())
                 }
+            };
+            if let Some(pc) = target_pc {
+                if let Err(e) = pc.add_ice_candidate(cand).await {
+                    warn!(error = %e, controller_id = %controller_id, "failed to add remote ice candidate");
+                }
+            } else {
+                warn!(controller_id = %controller_id, "no active session for incoming ICE candidate");
             }
         }
     }
 
     let had_active_session = {
         let s = session.lock().await;
-        s.pc.is_some()
+        !s.sessions.is_empty()
     };
     if had_active_session {
         warn!(
@@ -342,18 +414,67 @@ async fn main() -> Result<()> {
         tokio::time::sleep(Duration::from_secs(20)).await;
     }
 
-    let old_pc = {
+    let entries = {
         let mut s = session.lock().await;
-        s.switcher.stop_current();
-        s.controller_id = None;
-        s.pc.take()
+        s.sessions.drain().map(|(_, v)| v).collect::<Vec<_>>()
     };
-    if let Some(pc) = old_pc {
-        if let Err(e) = pc.close().await {
+    for entry in entries {
+        entry.running.store(false, Ordering::SeqCst);
+        if let Err(e) = entry.pc.close().await {
             warn!(error = %e, "failed to close peer connection on shutdown");
         }
     }
 
+    Ok(())
+}
+
+async fn apply_capture_patch(
+    capture_cfg: &Arc<Mutex<agent_rust::CaptureConfig>>,
+    patch: &Value,
+) -> Result<()> {
+    let mut cfg = capture_cfg.lock().await;
+    if let Some(v) = patch.get("targetWidth").and_then(|v| v.as_u64()) {
+        cfg.target_width = v as u32;
+    }
+    if let Some(v) = patch.get("targetHeight").and_then(|v| v.as_u64()) {
+        cfg.target_height = v as u32;
+    }
+    if let Some(v) = patch.get("bitrateKbps").and_then(|v| v.as_u64()) {
+        let br = (v as u32).max(100);
+        cfg.bitrate_kbps = br;
+        if cfg.max_bitrate_kbps < br {
+            cfg.max_bitrate_kbps = br;
+        }
+    }
+    if let Some(v) = patch.get("backend").and_then(|v| v.as_str()) {
+        cfg.backend = v.to_ascii_lowercase();
+    }
+    if let Some(v) = patch.get("encoder").and_then(|v| v.as_str()) {
+        cfg.encoder = v.to_ascii_lowercase();
+    }
+    if let Some(v) = patch.get("windowMode").and_then(|v| v.as_str()) {
+        match v.to_ascii_lowercase().as_str() {
+            "auto" => {
+                unsafe {
+                    std::env::remove_var("AGENT_WGC_WINDOW_HWND");
+                }
+            }
+            "foreground" => {
+                #[cfg(windows)]
+                unsafe {
+                    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+                    let hwnd = GetForegroundWindow();
+                    if !hwnd.0.is_null() {
+                        std::env::set_var(
+                            "AGENT_WGC_WINDOW_HWND",
+                            format!("{:?}", hwnd.0 as isize),
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
     Ok(())
 }
 

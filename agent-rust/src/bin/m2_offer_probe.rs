@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
+use interceptor::registry::Registry;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -7,7 +8,10 @@ use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant, timeout};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use webrtc::api::APIBuilder;
+use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
+use webrtc::api::setting_engine::SettingEngine;
+use webrtc::dtls::extension::extension_use_srtp::SrtpProtectionProfile;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
 use webrtc::ice_transport::ice_server::RTCIceServer;
@@ -16,9 +20,13 @@ use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
+use webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirection;
+use webrtc::rtp_transceiver::RTCRtpTransceiverInit;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let verbose = parse_verbose_flag();
     let ws_url = "ws://127.0.0.1:9527";
     let (ws, _) = connect_async(ws_url)
@@ -82,9 +90,31 @@ async fn main() -> Result<()> {
         }));
     }
 
-    pc.add_transceiver_from_kind(RTPCodecType::Video, None)
-        .await?;
+    pc.add_transceiver_from_kind(
+        RTPCodecType::Video,
+        Some(RTCRtpTransceiverInit {
+            direction: RTCRtpTransceiverDirection::Recvonly,
+            send_encodings: vec![],
+        }),
+    )
+    .await?;
     let offer = pc.create_offer(None).await?;
+    if verbose {
+        for line in offer.sdp.lines() {
+            if line.starts_with("m=video")
+                || line.starts_with("a=mid:")
+                || line.starts_with("a=send")
+                || line.starts_with("a=recv")
+                || line.starts_with("a=inactive")
+                || line.starts_with("a=rtpmap:")
+                || line.starts_with("a=fmtp:")
+                || line.starts_with("a=setup:")
+                || line.starts_with("a=fingerprint:")
+            {
+                println!("probe_offer_sdp: {line}");
+            }
+        }
+    }
     pc.set_local_description(offer.clone()).await?;
     ws_send_json(
         &write,
@@ -108,6 +138,7 @@ async fn main() -> Result<()> {
     let hard_deadline = Instant::now() + Duration::from_secs(run_secs + 45);
     let mut media_start: Option<Instant> = None;
     let mut remote_ice_count: u64 = 0;
+    let mut signaling_closed = false;
 
     while Instant::now() < hard_deadline {
         if let Some(s) = media_start {
@@ -116,19 +147,66 @@ async fn main() -> Result<()> {
             }
         }
 
+        if signaling_closed {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            continue;
+        }
+
         let msg = match timeout(Duration::from_millis(500), read.next()).await {
-            Ok(Some(v)) => v?,
-            Ok(None) => break,
+            Ok(Some(v)) => match v {
+                Ok(m) => m,
+                Err(e) => {
+                    if media_start.is_some() {
+                        eprintln!("probe_warn: signaling read error after answer: {e}");
+                        signaling_closed = true;
+                        continue;
+                    }
+                    return Err(e.into());
+                }
+            },
+            Ok(None) => {
+                if media_start.is_some() {
+                    eprintln!("probe_warn: signaling disconnected after answer");
+                    signaling_closed = true;
+                    continue;
+                }
+                return Err(anyhow!("signaling disconnected before answer"));
+            }
             Err(_) => continue,
         };
         let text = msg.into_text()?;
-        let v: Value = serde_json::from_str(&text)?;
+        let v: Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(e) => {
+                if media_start.is_some() {
+                    eprintln!("probe_warn: signaling json parse failed after answer: {e}");
+                    continue;
+                }
+                return Err(e.into());
+            }
+        };
 
         if v["type"] == "webrtc" && v["action"] == "answer" && media_start.is_none() {
             println!("answer_received=true");
             let sdp = v["payload"]["answer"]["sdp"]
                 .as_str()
                 .ok_or_else(|| anyhow!("answer.sdp missing"))?;
+            if verbose {
+                for line in sdp.lines() {
+                    if line.starts_with("m=video")
+                        || line.starts_with("a=mid:")
+                        || line.starts_with("a=send")
+                        || line.starts_with("a=recv")
+                        || line.starts_with("a=inactive")
+                        || line.starts_with("a=rtpmap:")
+                        || line.starts_with("a=fmtp:")
+                        || line.starts_with("a=setup:")
+                        || line.starts_with("a=fingerprint:")
+                    {
+                        println!("probe_answer_sdp: {line}");
+                    }
+                }
+            }
             pc.set_remote_description(RTCSessionDescription::answer(sdp.to_string())?)
                 .await
                 .context("set remote answer failed")?;
@@ -190,7 +268,20 @@ async fn build_pc(
 ) -> Result<Arc<RTCPeerConnection>> {
     let mut m = MediaEngine::default();
     m.register_default_codecs()?;
-    let api = APIBuilder::new().with_media_engine(m).build();
+    let mut registry = Registry::new();
+    registry = register_default_interceptors(registry, &mut m)?;
+    let mut se = SettingEngine::default();
+    se.set_srtp_protection_profiles(vec![
+        SrtpProtectionProfile::Srtp_Aead_Aes_128_Gcm,
+        SrtpProtectionProfile::Srtp_Aes128_Cm_Hmac_Sha1_80,
+        SrtpProtectionProfile::Srtp_Aes128_Cm_Hmac_Sha1_32,
+    ]);
+    se.set_include_loopback_candidate(true);
+    let api = APIBuilder::new()
+        .with_media_engine(m)
+        .with_interceptor_registry(registry)
+        .with_setting_engine(se)
+        .build();
     let pc = Arc::new(
         api.new_peer_connection(RTCConfiguration {
             ice_servers: vec![RTCIceServer {

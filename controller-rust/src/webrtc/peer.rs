@@ -10,6 +10,7 @@ use uuid::Uuid;
 use webrtc::{
     api::APIBuilder,
     api::media_engine::MediaEngine,
+    api::setting_engine::SettingEngine,
     ice_transport::ice_candidate::RTCIceCandidateInit,
     ice_transport::ice_connection_state::RTCIceConnectionState,
     peer_connection::configuration::RTCConfiguration,
@@ -71,7 +72,12 @@ impl PeerConnectionManager {
         // 注册 H.264 编解码器
         m.register_default_codecs()?;
 
-        let api = APIBuilder::new().with_media_engine(m).build();
+        let mut se = SettingEngine::default();
+        se.set_include_loopback_candidate(true);
+        let api = APIBuilder::new()
+            .with_media_engine(m)
+            .with_setting_engine(se)
+            .build();
 
         // 创建 ICE 服务器配置
         let ice_servers: Vec<webrtc::ice_transport::ice_server::RTCIceServer> = config

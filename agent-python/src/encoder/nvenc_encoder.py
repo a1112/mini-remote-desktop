@@ -66,6 +66,7 @@ class NVENCEncoder:
         self._handle: Optional[ctypes.c_void_p] = None
         self._dll: Optional[ctypes.CDLL] = None
         self._frame_counter = 0
+        self._zerocopy_disabled = False
 
     def initialize(self) -> bool:
         """
@@ -87,12 +88,26 @@ class NVENCEncoder:
 
             # Initialize encoder
             config_struct = self._create_config_struct()
+            dev = ctypes.c_void_p(self._d3d11_device)
+            ctx = ctypes.c_void_p(self._d3d11_context)
 
-            self._handle = self._dll.init_nvenc_encoder_d3d11(
-                ctypes.c_void_p(self._d3d11_device),
-                ctypes.c_void_p(self._d3d11_context),
-                ctypes.byref(config_struct)
-            )
+            # Zero-copy encode path requires zerocopy session initialization in native layer.
+            self._handle = None
+            if getattr(self, "_has_zerocopy_init_d3d11", False):
+                self._handle = self._dll.init_nvenc_encoder_d3d11_zerocopy(
+                    dev,
+                    ctx,
+                    ctypes.byref(config_struct)
+                )
+                if not self._handle:
+                    logger.warning("Zero-copy NVENC init failed, falling back to regular D3D11 init")
+
+            if not self._handle:
+                self._handle = self._dll.init_nvenc_encoder_d3d11(
+                    dev,
+                    ctx,
+                    ctypes.byref(config_struct)
+                )
 
             if not self._handle:
                 logger.error("Failed to initialize NVENC encoder")
@@ -138,6 +153,15 @@ class NVENCEncoder:
         ]
         self._dll.init_nvenc_encoder_d3d11.restype = ctypes.c_void_p
 
+        self._has_zerocopy_init_d3d11 = hasattr(self._dll, "init_nvenc_encoder_d3d11_zerocopy")
+        if self._has_zerocopy_init_d3d11:
+            self._dll.init_nvenc_encoder_d3d11_zerocopy.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.POINTER(NVENCEncodeConfigStruct)
+            ]
+            self._dll.init_nvenc_encoder_d3d11_zerocopy.restype = ctypes.c_void_p
+
         self._dll.encode_nvenc_frame_cpu.argtypes = [
             ctypes.c_void_p,
             ctypes.POINTER(ctypes.c_ubyte),
@@ -155,6 +179,17 @@ class NVENCEncoder:
             ctypes.c_int
         ]
         self._dll.encode_nvenc_frame_d3d11.restype = ctypes.c_int
+
+        # Optional: true zero-copy D3D11 path
+        self._has_zerocopy_d3d11 = hasattr(self._dll, "encode_nvenc_frame_d3d11_zerocopy")
+        if self._has_zerocopy_d3d11:
+            self._dll.encode_nvenc_frame_d3d11_zerocopy.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_longlong,
+                ctypes.c_int
+            ]
+            self._dll.encode_nvenc_frame_d3d11_zerocopy.restype = ctypes.c_int
 
         self._dll.get_nvenc_encoded_frame.argtypes = [
             ctypes.c_void_p,
@@ -262,12 +297,31 @@ class NVENCEncoder:
         timestamp = self._frame_counter
         force_keyframe = 1 if self._frame_counter == 0 else 0
 
-        result = self._dll.encode_nvenc_frame_d3d11(
-            self._handle,
-            ctypes.c_void_p(d3d11_texture_ptr),
-            timestamp,
-            force_keyframe
+        result = 0
+
+        # Prefer zero-copy path when DLL exposes it; fall back to regular D3D11 path.
+        has_zerocopy = (not self._zerocopy_disabled) and hasattr(self._dll, "encode_nvenc_frame_d3d11_zerocopy") and getattr(
+            self, "_has_zerocopy_d3d11", True
         )
+        if has_zerocopy:
+            result = self._dll.encode_nvenc_frame_d3d11_zerocopy(
+                self._handle,
+                ctypes.c_void_p(d3d11_texture_ptr),
+                timestamp,
+                force_keyframe
+            )
+            if result != 1:
+                # Disable noisy/broken zero-copy path after first hard failure.
+                self._zerocopy_disabled = True
+                logger.warning("D3D11 zero-copy path disabled after failure; falling back to D3D11 copy path")
+
+        if result != 1:
+            result = self._dll.encode_nvenc_frame_d3d11(
+                self._handle,
+                ctypes.c_void_p(d3d11_texture_ptr),
+                timestamp,
+                force_keyframe
+            )
 
         if result != 1:
             logger.warning(f"D3D11 encode failed: {result}")

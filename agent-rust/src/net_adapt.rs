@@ -245,7 +245,12 @@ impl NetAdaptController {
             if let Ok(mut s) = self.quality_low_streak.lock() {
                 *s = 0;
             }
-            let streak = self.quality_high_streak.lock().ok().map(|v| *v).unwrap_or(0);
+            let streak = self
+                .quality_high_streak
+                .lock()
+                .ok()
+                .map(|v| *v)
+                .unwrap_or(0);
             let now = Instant::now();
             let last_nack = self.last_nack.lock().ok().map(|v| *v).unwrap_or(now);
             if streak >= 4
@@ -298,7 +303,8 @@ impl NetAdaptController {
     fn apply_tier(&self, idx: u32, reason_code: u32) {
         let idx = idx.clamp(0, 4);
         let fps = self.tier_fps[idx as usize].clamp(self.min_fps, self.max_fps);
-        let br = self.tier_bitrate_kbps[idx as usize].clamp(self.min_bitrate_kbps, self.max_bitrate_kbps);
+        let br = self.tier_bitrate_kbps[idx as usize]
+            .clamp(self.min_bitrate_kbps, self.max_bitrate_kbps);
         self.current_tier_idx.store(idx, Ordering::Relaxed);
         self.current_fps.store(fps, Ordering::Relaxed);
         self.current_bitrate_kbps.store(br, Ordering::Relaxed);

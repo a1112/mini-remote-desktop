@@ -26,6 +26,16 @@ pub struct RuntimeStats {
     pub tier_level: AtomicU32,
     pub tier_reason_code: AtomicU32,
     pub tier_switch_count: AtomicU64,
+    pub native_direct_frames: AtomicU64,
+    pub native_copy_frames: AtomicU64,
+    pub native_scale_frames: AtomicU64,
+    pub native_direct_register_failures: AtomicU64,
+    pub native_acquire_ok: AtomicU64,
+    pub native_acquire_timeout: AtomicU64,
+    pub native_acquire_errors: AtomicU64,
+    pub quic_au_sent: AtomicU64,
+    pub quic_au_dropped: AtomicU64,
+    pub quic_bytes_sent: AtomicU64,
 }
 
 impl RuntimeStats {
@@ -239,6 +249,18 @@ pub fn spawn_stats_panel(
                 tier_level,
                 tier_reason,
                 tier_switch_count,
+                native_direct_frames = stats.native_direct_frames.load(Ordering::Relaxed),
+                native_copy_frames = stats.native_copy_frames.load(Ordering::Relaxed),
+                native_scale_frames = stats.native_scale_frames.load(Ordering::Relaxed),
+                native_direct_register_failures = stats
+                    .native_direct_register_failures
+                    .load(Ordering::Relaxed),
+                native_acquire_ok = stats.native_acquire_ok.load(Ordering::Relaxed),
+                native_acquire_timeout = stats.native_acquire_timeout.load(Ordering::Relaxed),
+                native_acquire_errors = stats.native_acquire_errors.load(Ordering::Relaxed),
+                quic_au_sent = stats.quic_au_sent.load(Ordering::Relaxed),
+                quic_au_dropped = stats.quic_au_dropped.load(Ordering::Relaxed),
+                quic_bytes_sent = stats.quic_bytes_sent.load(Ordering::Relaxed),
                 "[RTCP-PANEL]"
             );
         }

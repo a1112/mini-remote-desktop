@@ -1,6 +1,6 @@
 use super::protocol::{
     create_register_message, DeviceInfo, SignalingMessage, SignalingMessagePayload,
-    SessionDescriptionJson,
+    SessionDescriptionJson, QuicTransportInfo,
 };
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -24,6 +24,7 @@ type WsWrite = Arc<
 pub struct SignalingConfig {
     pub ws_url: String,
     pub device_name: String,
+    pub preferred_transport: String,
 }
 
 impl Default for SignalingConfig {
@@ -31,6 +32,10 @@ impl Default for SignalingConfig {
         Self {
             ws_url: "ws://127.0.0.1:9527".to_string(),
             device_name: "Rust Controller".to_string(),
+            preferred_transport: std::env::var("MRD_TRANSPORT")
+                .ok()
+                .unwrap_or_else(|| "webrtc".to_string())
+                .to_ascii_lowercase(),
         }
     }
 }
@@ -157,9 +162,9 @@ impl SignalingClient {
                 "offer": offer_json,
                 "sessionId": session_id,
                 "controllerId": controller_id,
-                "transport": "webrtc",
+                "transport": self.config.preferred_transport,
                 "capabilities": {
-                    "protocols": ["webrtc"],
+                    "protocols": ["webrtc", "quic"],
                     "platforms": ["windows", "linux", "macos"],
                     "codecs": ["h264"],
                     "features": ["multi-end-compat", "capability-negotiation"]
@@ -168,6 +173,11 @@ impl SignalingClient {
         })
         .to_string();
 
+        info!(
+            target_device_id = %target_device_id,
+            transport = %self.config.preferred_transport,
+            "sending offer"
+        );
         self.send_text(&msg).await?;
         Ok(())
     }
@@ -196,6 +206,26 @@ impl SignalingClient {
 
         self.send_text(&msg).await?;
         Ok(())
+    }
+
+    pub async fn send_capture_update(
+        &self,
+        target_device_id: &str,
+        capture_patch: serde_json::Value,
+    ) -> Result<()> {
+        let device_id = self.device_id.lock().await;
+        let controller_id = device_id.as_ref().context("not registered")?;
+        let msg = serde_json::json!({
+            "type": "control",
+            "action": "updateCapture",
+            "payload": {
+                "targetDeviceId": target_device_id,
+                "controllerId": controller_id,
+                "capture": capture_patch,
+            }
+        })
+        .to_string();
+        self.send_text(&msg).await
     }
 
     /// 获取设备 ID
@@ -285,6 +315,11 @@ async fn handle_message(
                 .as_str()
                 .unwrap_or("")
                 .to_string();
+            let selected_transport = v["payload"]["selectedTransport"]
+                .as_str()
+                .unwrap_or("webrtc")
+                .to_string();
+            let quic = serde_json::from_value::<QuicTransportInfo>(v["payload"]["quic"].clone()).ok();
 
             if let Ok(sd_json) = serde_json::from_value::<SessionDescriptionJson>(answer_json) {
                 if let Ok(answer) = sd_json.try_into() {
@@ -292,6 +327,8 @@ async fn handle_message(
                         .send(SignalingMessagePayload::Answer {
                             answer,
                             controller_id,
+                            selected_transport,
+                            quic,
                         })
                         .await
                         .ok();

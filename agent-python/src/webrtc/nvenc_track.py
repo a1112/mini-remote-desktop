@@ -20,7 +20,12 @@ except ImportError:
     VideoFrame = None
     HAS_AIORTC = False
 
-from ..encoder.nvenc_encoder import NVENCEncoder, NVENCEncodedFrame, create_nvenc_encoder
+try:
+    # Package import path: src.webrtc.nvenc_track
+    from ..encoder.nvenc_encoder import NVENCEncoder, NVENCEncodedFrame, create_nvenc_encoder
+except ImportError:
+    # Script/top-level import path: webrtc.nvenc_track with src on sys.path
+    from encoder.nvenc_encoder import NVENCEncoder, NVENCEncodedFrame, create_nvenc_encoder
 
 logger = logging.getLogger(__name__)
 

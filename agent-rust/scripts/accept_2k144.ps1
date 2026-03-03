@@ -136,8 +136,8 @@ try {
         try {
             $pp | Wait-Process -Timeout ($ProbeSecs + 90)
         } finally {
-            if (Get-Process -Id $ap.Id -ErrorAction SilentlyContinue) { Stop-Process -Id $ap.Id -Force }
-            if (Get-Process -Id $sp.Id -ErrorAction SilentlyContinue) { Stop-Process -Id $sp.Id -Force }
+            if (Get-Process -Id $ap.Id -ErrorAction SilentlyContinue) { Stop-Process -Id $ap.Id -Force -ErrorAction SilentlyContinue }
+            if (Get-Process -Id $sp.Id -ErrorAction SilentlyContinue) { Stop-Process -Id $sp.Id -Force -ErrorAction SilentlyContinue }
         }
 
         $probe = Get-ProbeStats $probeLog

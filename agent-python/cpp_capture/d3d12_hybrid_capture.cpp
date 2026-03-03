@@ -2,6 +2,9 @@
  * D3D12 混合捕获实现
  *
  * D3D11 Desktop Duplication + D3D12 输出
+ *
+ * 更新: 使用 DXGI 1.5+ DuplicateOutput1 API 支持多并发捕获器
+ *       可以与 Windows Game Bar 等应用共存
  */
 
 // 定义导出
@@ -9,6 +12,9 @@
 
 // 先包含头文件 (在 extern "C" 之前)
 #include "d3d12_hybrid_capture.h"
+
+// 确保 DXGI 1.6 可用 (需要 Windows 10 SDK)
+#include <dxgi1_6.h>
 
 #include <iostream>
 #include <vector>
@@ -263,7 +269,56 @@ bool D3D12HybridCapturer::InitializeDesktopDuplication() {
     width_ = desktop_rect.right - desktop_rect.left;
     height_ = desktop_rect.bottom - desktop_rect.top;
 
-    ComPtr<IDXGIOutput1> output1;
+    // 首先尝试 DXGI 1.5+ 的 DuplicateOutput1 (支持多并发捕获)
+    ComPtr<IDXGIOutput5> output5;
+    hr = output.As(&output5);
+    ComPtr<IDXGIOutput1> output1;  // Declare here for goto to work
+    ComPtr<IDXGIOutputDuplication> temp_duplication;
+
+    if (SUCCEEDED(hr)) {
+        std::cout << "[DXGI] IDXGIOutput5 available, trying DuplicateOutput1..." << std::endl;
+
+        // DuplicateOutput1: 接受 5 参数
+        // 关键: 必须传递有效的格式列表，不能使用 nullptr/0
+        // HRESULT DuplicateOutput1(
+        //     IUnknown *pDevice,
+        //     UINT Flags,
+        //     UINT SupportedFormatsCount,
+        //     const DXGI_FORMAT *pSupportedFormats,
+        //     IDXGIOutputDuplication **ppOutputDuplication
+        // );
+
+        // 指定支持的格式列表
+        DXGI_FORMAT supported_formats[] = {
+            DXGI_FORMAT_B8G8R8A8_UNORM,
+        };
+
+        hr = output5->DuplicateOutput1(
+            d3d11_device_.Get(),
+            0,                                      // Flags
+            1,                                      // SupportedFormatsCount
+            supported_formats,                      // pSupportedFormats
+            &temp_duplication                       // ppOutputDuplication (输出参数)
+        );
+
+        if (SUCCEEDED(hr)) {
+            std::cout << "[DXGI] DuplicateOutput1 succeeded - concurrent capture enabled!" << std::endl;
+            duplication_ = temp_duplication.Detach();
+            goto create_staging;
+        }
+
+        std::cerr << "[DXGI] DuplicateOutput1 failed: 0x" << std::hex << hr << std::dec << std::endl;
+        if (hr == DXGI_ERROR_INVALID_CALL) {
+            std::cerr << "[DXGI] Error: DXGI_ERROR_INVALID_CALL - driver may not support DuplicateOutput1" << std::endl;
+        } else if (hr == E_ACCESSDENIED || hr == DXGI_ERROR_ACCESS_DENIED) {
+            std::cerr << "[DXGI] Access denied even with DuplicateOutput1, trying legacy..." << std::endl;
+        } else if (hr == ERROR_NOT_SUPPORTED) {
+            std::cerr << "[DXGI] ERROR_NOT_SUPPORTED - DuplicateOutput1 not available" << std::endl;
+        }
+        std::cerr << "[DXGI] Falling back to legacy DuplicateOutput..." << std::endl;
+    }
+
+    // 回退到旧版 DuplicateOutput
     hr = output.As(&output1);
     if (FAILED(hr)) {
         return false;
@@ -271,15 +326,23 @@ bool D3D12HybridCapturer::InitializeDesktopDuplication() {
 
     hr = output1->DuplicateOutput(d3d11_device_.Get(), &duplication_);
     if (FAILED(hr)) {
-        if (hr == E_ACCESSDENIED) {
-            std::cerr << "Desktop Duplication access denied" << std::endl;
+        std::cerr << "[DXGI] Legacy DuplicateOutput failed: 0x" << std::hex << hr << std::dec << std::endl;
+        if (hr == E_ACCESSDENIED || hr == DXGI_ERROR_ACCESS_DENIED) {
+            std::cerr << "[DXGI] DXGI_ERROR_ACCESS_DENIED - Another app may be using Desktop Duplication" << std::endl;
+            std::cerr << "[DXGI] Common causes:" << std::endl;
+            std::cerr << "[DXGI]   - Windows Game Bar (Win+G)" << std::endl;
+            std::cerr << "[DXGI]   - NVIDIA ShadowPlay / GeForce Experience" << std::endl;
+            std::cerr << "[DXGI]   - Other screen recording software" << std::endl;
+            std::cerr << "[DXGI]   - Remote desktop session" << std::endl;
         } else if (hr == ERROR_NOT_SUPPORTED || hr == E_INVALIDARG) {
-            std::cerr << "Desktop Duplication not supported" << std::endl;
-        } else {
-            std::cerr << "DuplicateOutput failed: " << std::hex << hr << std::endl;
+            std::cerr << "[DXGI] Desktop Duplication not supported on this system" << std::endl;
         }
         return false;
     }
+
+    std::cout << "[DXGI] Legacy DuplicateOutput succeeded" << std::endl;
+
+create_staging:
 
     // 创建 staging texture
     D3D11_TEXTURE2D_DESC staging_desc = {};

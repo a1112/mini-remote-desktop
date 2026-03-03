@@ -349,15 +349,20 @@ class NVENCAgent:
             frame = self._wgc_capture.capture_frame()
 
             if frame:
-                # Copy to CPU memory
-                if self._wgc_capture.copy_to_cpu(buffer):
-                    frame_bytes = bytes(buffer)
+                sent_gpu_direct = False
 
+                # Prefer GPU-direct texture path for transport manager pipeline.
+                if use_transport_manager and self._encoder:
+                    texture_ptr = int(frame.d3d11_texture) if frame.d3d11_texture else 0
+                    if texture_ptr:
+                        sent_gpu_direct = await self._encode_and_send_texture(texture_ptr, frame.timestamp)
+
+                # Fallback to CPU path (legacy and/or GPU-direct unavailable).
+                if not sent_gpu_direct and self._wgc_capture.copy_to_cpu(buffer):
+                    frame_bytes = bytes(buffer)
                     if use_transport_manager and self._encoder:
-                        # Direct encode and send via TransportManager
                         await self._encode_and_send_frame(frame_bytes, frame.timestamp)
                     elif self._video_track:
-                        # Send to encoder track (legacy mode)
                         await self._video_track.send_frame(frame_bytes)
 
             # Frame rate control
@@ -380,30 +385,52 @@ class NVENCAgent:
             # Encode with NVENC
             encoded = self._encoder.encode(frame_bytes)
             if encoded:
-                # Detect keyframe (H.264 IDR frame)
-                is_keyframe = self._is_keyframe(encoded.data)
-
-                # Create FrameInfo
-                frame_info = FrameInfo(
-                    data=encoded.data,
-                    timestamp=timestamp or int(time.time() * 1000000),
-                    is_keyframe=is_keyframe,
-                    width=self._width,
-                    height=self._height,
-                    frame_number=self._frame_number,
-                )
-
-                # Send via transport manager
-                await self._transport_manager.send_media(frame_info)
-
-                self._frame_number += 1
-
-                # Periodically request keyframe update
-                if is_keyframe:
-                    self._last_keyframe_time = time.time()
+                await self._send_encoded_frame(encoded, timestamp)
 
         except Exception as e:
             logger.debug(f"Frame encode/send error: {e}")
+
+    async def _encode_and_send_texture(self, d3d11_texture_ptr: int, timestamp: int) -> bool:
+        """
+        Encode GPU texture directly and send via TransportManager.
+
+        Returns:
+            True if direct path succeeded and frame was sent.
+        """
+        if not self._encoder or not self._transport_manager:
+            return False
+
+        try:
+            encoded = self._encoder.encode_d3d11(d3d11_texture_ptr)
+            if not encoded:
+                return False
+
+            await self._send_encoded_frame(encoded, timestamp)
+            return True
+        except Exception as e:
+            logger.debug(f"GPU-direct encode/send error: {e}")
+            return False
+
+    async def _send_encoded_frame(self, encoded, timestamp: int) -> None:
+        """Send already encoded frame via transport manager."""
+        # Detect keyframe (H.264 IDR frame)
+        is_keyframe = self._is_keyframe(encoded.data)
+
+        frame_info = FrameInfo(
+            data=encoded.data,
+            timestamp=timestamp or int(time.time() * 1000000),
+            is_keyframe=is_keyframe,
+            width=self._width,
+            height=self._height,
+            frame_number=self._frame_number,
+        )
+
+        await self._transport_manager.send_media(frame_info)
+
+        self._frame_number += 1
+
+        if is_keyframe:
+            self._last_keyframe_time = time.time()
 
     def _is_keyframe(self, data: bytes) -> bool:
         """Check if H.264 data is a keyframe (IDR)."""

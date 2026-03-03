@@ -8,12 +8,14 @@
 
 #include <windows.h>
 #include <d3d11.h>
+#include <d3d11_1.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cudaD3D11.h>
 #include <wrl/client.h>
 #include <memory>
 #include <vector>
+#include <deque>
 
 // NVENC SDK 路径 - 编译时需要
 // 注意: 编译时需要添加 /I"J:\ProjectTest\远程探查\mini-remote-desktop\tools\Video_Codec_Interface_13.0.37\Interface"
@@ -67,6 +69,15 @@ NVENC_API int is_cuda_d3d11_interop_supported();
  * 初始化 NVENC 编码器 (D3D11 版本)
  */
 NVENC_API HNVENCEncoder init_nvenc_encoder_d3d11(
+    void* d3d11_device,
+    void* d3d11_context,
+    const NVENCEncodeConfig* config
+);
+
+/**
+ * 初始化 NVENC 编码器 (D3D11 零拷贝专用会话)
+ */
+NVENC_API HNVENCEncoder init_nvenc_encoder_d3d11_zerocopy(
     void* d3d11_device,
     void* d3d11_context,
     const NVENCEncodeConfig* config
@@ -137,6 +148,26 @@ struct NVENCVersion {
 };
 NVENC_API void get_nvenc_version(NVENCVersion* version);
 
+/**
+ * 零拷贝路径运行时统计
+ */
+struct NVENCZeroCopyStats {
+    unsigned long long encode_calls;
+    unsigned long long encode_submit_success;
+    unsigned long long encode_submit_need_more_input;
+    unsigned long long encode_submit_fail;
+    unsigned long long slot_busy_skips;
+    unsigned long long map_failures;
+    unsigned long long lock_busy_count;
+    unsigned long long lock_retryable_count;
+    unsigned long long lock_failures;
+    unsigned long long bitstream_outputs;
+    unsigned long long unmap_count;
+    unsigned int pending_peak;
+    unsigned int pending_current;
+};
+NVENC_API int get_nvenc_zerocopy_stats(HNVENCEncoder handle, NVENCZeroCopyStats* stats);
+
 #ifdef __cplusplus
 }
 #endif
@@ -148,11 +179,12 @@ public:
     ~NVENCEncoderImpl();
 
     bool Initialize(ID3D11Device* d3d11_device, ID3D11DeviceContext* d3d11_context,
-                   const NVENCEncodeConfig* config);
+                   const NVENCEncodeConfig* config, bool zerocopy_only = false);
     bool EncodeFromCPU(const unsigned char* data, int size, long long timestamp, bool force_keyframe);
     bool EncodeFromD3D11(ID3D11Texture2D* texture, long long timestamp, bool force_keyframe);
     bool EncodeFromD3D11_ZeroCopy(ID3D11Texture2D* texture, long long timestamp, bool force_keyframe);  // 零拷贝版本
     bool GetEncodedFrame(NVENCEncodedFrame* frame);
+    bool GetZeroCopyStats(NVENCZeroCopyStats* stats) const;
     void RequestKeyframe();
     void Release();
     bool IsInitialized() const { return initialized_; }
@@ -164,12 +196,20 @@ private:
     bool InitializeEncoderParams();
     bool AllocateBuffers();
     bool RegisterD3D11Resource(ID3D11Texture2D* texture);
+    bool DrainPendingPackets(bool do_not_wait);
     void Cleanup();
 
     // D3D11 组件
     ComPtr<ID3D11Device> d3d11_device_;
     ComPtr<ID3D11DeviceContext> d3d11_context_;
     ComPtr<ID3D11Texture2D> intermediate_texture_;  // 用于从外部 D3D11 设备复制纹理
+    std::vector<ComPtr<ID3D11Texture2D>> zerocopy_textures_; // 轮转的 zerocopy 输入纹理
+    ComPtr<ID3D11VideoDevice> video_device_;
+    ComPtr<ID3D11VideoContext> video_context_;
+    ComPtr<ID3D11VideoProcessorEnumerator> video_processor_enum_;
+    ComPtr<ID3D11VideoProcessor> video_processor_;
+    ComPtr<ID3D11VideoProcessorInputView> video_input_view_;
+    std::vector<ComPtr<ID3D11VideoProcessorOutputView>> video_output_views_;
 
     // CUDA 组件
     CUcontext cuda_context_;
@@ -183,8 +223,11 @@ private:
     // NVENC 资源
     std::vector<void*> input_buffers_;      // NVENC 输入缓冲区
     std::vector<void*> bitstream_buffers_;  // 输出位流缓冲区
+    std::vector<void*> zerocopy_registered_resources_; // 对应 zerocopy_textures_ 的注册句柄
+    std::vector<bool> zerocopy_slot_inflight_; // 每个槽位是否仍有未回收包
     void* registered_resource_;             // 注册的 D3D11 资源
     void* mapped_resource_;                 // 映射的资源
+    void* registered_source_texture_;       // 当前已注册的源纹理指针
 
     // 编码配置
     NVENCEncodeConfig config_;
@@ -197,7 +240,14 @@ private:
         long long timestamp;
         bool key_frame;
     };
+    struct PendingPacket {
+        uint32_t bitstream_index;
+        long long timestamp;
+        bool key_frame;
+        void* mapped_resource;
+    };
     std::vector<EncodedOutput> output_queue_;
+    std::deque<PendingPacket> pending_packets_;
 
     // 状态
     bool initialized_;
@@ -206,4 +256,17 @@ private:
     long long current_pts_;
     bool force_keyframe_;
     bool use_abgr_format_;  // 是否使用 ABGR 格式输入（无需颜色转换）
+    bool zerocopy_only_;
+    unsigned long long zc_encode_calls_;
+    unsigned long long zc_encode_submit_success_;
+    unsigned long long zc_encode_submit_need_more_input_;
+    unsigned long long zc_encode_submit_fail_;
+    unsigned long long zc_slot_busy_skips_;
+    unsigned long long zc_map_failures_;
+    unsigned long long zc_lock_busy_count_;
+    unsigned long long zc_lock_retryable_count_;
+    unsigned long long zc_lock_failures_;
+    unsigned long long zc_bitstream_outputs_;
+    unsigned long long zc_unmap_count_;
+    unsigned int zc_pending_peak_;
 };
