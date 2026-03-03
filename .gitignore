@@ -27,9 +27,13 @@ Thumbs.db
 *.tmp
 *.temp
 *.png
+*.err
+*.o
+debug/
 
 # Test outputs
 perf/
 tools/ffmpeg-min/
 /signaling-rs/target-codex-hotfix
 /agent-rust/target-codex-debug
+client-qt/venv

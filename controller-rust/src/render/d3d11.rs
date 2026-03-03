@@ -343,6 +343,17 @@ impl D3D11Renderer {
             .filter(|v| *v > 0.0)
             .map(|ms| (ms * 1000.0) as u64)
             .unwrap_or(0);
+        let render_drop_old = env_flag("MRD_RENDER_DROP_OLD", true);
+        let adaptive_present = env_flag("MRD_PRESENT_ADAPTIVE", true);
+        let adaptive_present_min_fps = std::env::var("MRD_PRESENT_ADAPTIVE_MIN_FPS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(60.0);
+        let adaptive_present_max_fps = std::env::var("MRD_PRESENT_ADAPTIVE_MAX_FPS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(240.0);
+        let explicit_present_target = d3d11_present_target_fps_is_set();
 
         let mut d3d = D3DContext::new(window, &config)?;
         let idle_wait_timeout_ms = idle_wait_timeout_ms(config.low_latency_mode);
@@ -393,7 +404,32 @@ impl D3D11Renderer {
                 }
             };
 
-            if let Some(frame) = maybe_frame {
+            if let Some(mut frame) = maybe_frame {
+                if render_drop_old {
+                    let mut replaced = 0u64;
+                    for _ in 0..2 {
+                        let newer = {
+                            let mut guard = match shared_frame.try_lock() {
+                                Ok(g) => g,
+                                Err(_) => break,
+                            };
+                            if guard.sequence > last_frame_sequence {
+                                last_frame_sequence = guard.sequence;
+                                guard.latest.take()
+                            } else {
+                                None
+                            }
+                        };
+                        match newer {
+                            Some(newer_frame) => {
+                                frame = newer_frame;
+                                replaced = replaced.saturating_add(1);
+                            }
+                            None => break,
+                        }
+                    }
+                    stale_dropped_frames = stale_dropped_frames.saturating_add(replaced);
+                }
                 if render_max_age_us > 0 && frame.capture_start_unix_us != 0 {
                     if let Ok(elapsed) =
                         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
@@ -536,6 +572,13 @@ impl D3D11Renderer {
                 let dt = last_rate_sample.elapsed().as_secs_f64().max(0.001);
                 let render_fps = (rendered.saturating_sub(last_rendered_count)) as f64 / dt;
                 let recv_fps = (recv.saturating_sub(last_received_count)) as f64 / dt;
+                if adaptive_present && !explicit_present_target {
+                    d3d.present_min_interval = adaptive_present_interval(
+                        recv_fps,
+                        adaptive_present_min_fps,
+                        adaptive_present_max_fps,
+                    );
+                }
                 metrics.rendered_frames = rendered;
                 metrics.render_fps = render_fps;
                 metrics.received_frames = recv;
@@ -548,6 +591,7 @@ impl D3D11Renderer {
                     stale_dropped_total = stale_dropped_frames,
                     stale_dropped_per_sec = stale_dropped_frames.saturating_sub(last_stale_dropped_count),
                     age_dropped_total = age_dropped_frames,
+                    drop_old_enabled = render_drop_old,
                     gpu_external_frames,
                     cpu_upload_frames,
                     gpu_zero_copy_ratio = format!(
@@ -2063,9 +2107,37 @@ fn idle_wait_timeout_ms(low_latency_mode: bool) -> u32 {
     }
 }
 
+fn env_flag(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(default)
+}
+
+fn d3d11_present_target_fps_is_set() -> bool {
+    std::env::var("MRD_PRESENT_TARGET_FPS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .map(|fps| fps > 0.0)
+        .unwrap_or(false)
+}
+
+fn adaptive_present_interval(recv_fps: f64, min_fps: f64, max_fps: f64) -> Option<Duration> {
+    if !recv_fps.is_finite() || recv_fps <= 0.0 {
+        return None;
+    }
+    let min_fps = min_fps.max(1.0);
+    let max_fps = max_fps.max(min_fps);
+    let target = recv_fps.clamp(min_fps, max_fps);
+    Some(Duration::from_secs_f64((1.0 / target).max(0.000_5)))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{idle_wait_timeout_ms, present_params};
+    use super::{
+        adaptive_present_interval, d3d11_present_target_fps_is_set, idle_wait_timeout_ms,
+        present_params,
+    };
     use windows::Win32::Graphics::Dxgi::{
         DXGI_PRESENT, DXGI_PRESENT_ALLOW_TEARING, DXGI_PRESENT_DO_NOT_WAIT,
     };
@@ -2109,6 +2181,24 @@ mod tests {
     #[test]
     fn idle_wait_timeout_is_five_ms_when_not_low_latency() {
         assert_eq!(idle_wait_timeout_ms(false), 5);
+    }
+
+    #[test]
+    fn adaptive_present_interval_clamps_upper_bound() {
+        let d = adaptive_present_interval(300.0, 60.0, 180.0).expect("interval");
+        let fps = 1.0 / d.as_secs_f64();
+        assert!(fps <= 180.5 && fps >= 179.0);
+    }
+
+    #[test]
+    fn explicit_present_target_detection() {
+        unsafe {
+            std::env::set_var("MRD_PRESENT_TARGET_FPS", "120");
+        }
+        assert!(d3d11_present_target_fps_is_set());
+        unsafe {
+            std::env::remove_var("MRD_PRESENT_TARGET_FPS");
+        }
     }
 }
 
