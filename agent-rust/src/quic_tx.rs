@@ -5,6 +5,7 @@ use quinn::{Endpoint, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -25,9 +26,22 @@ pub struct QuicServerAdvert {
     pub cert_der_base64: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct QuicAu {
+    pub payload: Arc<[u8]>,
+    pub tx_unix_us: u64,
+}
+
+fn unix_time_us() -> u64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(v) => v.as_micros().min(u64::MAX as u128) as u64,
+        Err(_) => 0,
+    }
+}
+
 pub fn start_quic_sender(
     bind_addr: SocketAddr,
-) -> Result<(QuicServerAdvert, mpsc::Sender<Arc<[u8]>>)> {
+) -> Result<(QuicServerAdvert, mpsc::Sender<QuicAu>)> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let cert = rcgen::generate_simple_self_signed(vec!["agent-rust".to_string()])
@@ -56,7 +70,7 @@ pub fn start_quic_sender(
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(64)
         .clamp(1, 512);
-    let (tx, mut rx) = mpsc::channel::<Arc<[u8]>>(queue);
+    let (tx, mut rx) = mpsc::channel::<QuicAu>(queue);
 
     tokio::spawn(async move {
         let mut seq: u64 = 0;
@@ -73,19 +87,28 @@ pub fn start_quic_sender(
                         Ok(mut stream) => {
                             while let Some(frame) = rx.recv().await {
                                 seq = seq.saturating_add(1);
-                                let len = frame.len() as u32;
+                                let len = frame.payload.len() as u32;
                                 if wire_debug && wire_debug_left > 0 {
                                     info!(
                                         seq,
                                         len,
-                                        hash = format!("{:016x}", fnv1a64(frame.as_ref())),
+                                        hash = format!("{:016x}", fnv1a64(frame.payload.as_ref())),
+                                        tx_unix_us = frame.tx_unix_us,
                                         "quic wire tx frame"
                                     );
                                     wire_debug_left -= 1;
                                 }
                                 if stream.write_u32(len).await.is_err()
                                     || stream.write_u64(seq).await.is_err()
-                                    || stream.write_all(frame.as_ref()).await.is_err()
+                                    || stream
+                                        .write_u64(if frame.tx_unix_us == 0 {
+                                            unix_time_us()
+                                        } else {
+                                            frame.tx_unix_us
+                                        })
+                                        .await
+                                        .is_err()
+                                    || stream.write_all(frame.payload.as_ref()).await.is_err()
                                 {
                                     warn!("quic sender stream write failed, waiting for reconnect");
                                     break;

@@ -6,7 +6,10 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0"
 bytes = "1.7"
+base64 = "0.22"
 futures-util = "0.3"
+quinn = "0.11"
+rustls = "0.23"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "sync", "time"] }
@@ -25,6 +28,7 @@ rtcp = "0.12"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D_Fxc",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
@@ -32,10 +36,11 @@ windows = { version = "0.62", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
 ] }
 
 # FFmpeg 解码器 (可选)
-ffmpeg-next = { version = "7.1", optional = true, default-features = false, features = ["static"] }
+ffmpeg-next = { version = "6.1", optional = true, features = ["static"] }
 
 [features]
 default = []

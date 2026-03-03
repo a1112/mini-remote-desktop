@@ -187,6 +187,7 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         let mut decode_samples_ms: std::collections::VecDeque<f64> = std::collections::VecDeque::with_capacity(1024);
         let mut frame_interval_ms: std::collections::VecDeque<f64> = std::collections::VecDeque::with_capacity(1024);
+        let mut e2e_samples_ms: std::collections::VecDeque<f64> = std::collections::VecDeque::with_capacity(1024);
         let mut last_decoded_at: Option<std::time::Instant> = None;
         let mut last_stats_at = std::time::Instant::now();
         let decoder_backend_label = {
@@ -237,6 +238,20 @@ async fn main() -> Result<()> {
                             }
                             frame_interval_ms.push_back(delta_ms);
                         }
+                        if newest.tx_unix_us != 0 {
+                            if let Ok(elapsed) =
+                                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                            {
+                                let now_us = elapsed.as_micros().min(u64::MAX as u128) as u64;
+                                if now_us >= newest.tx_unix_us {
+                                    let e2e_ms = (now_us - newest.tx_unix_us) as f64 / 1000.0;
+                                    if e2e_samples_ms.len() >= 1024 {
+                                        e2e_samples_ms.pop_front();
+                                    }
+                                    e2e_samples_ms.push_back(e2e_ms);
+                                }
+                            }
+                        }
                         last_decoded_at = Some(now);
                     }
                     Ok(None) => {}
@@ -281,12 +296,37 @@ async fn main() -> Result<()> {
                             / frame_interval_ms.len() as f64;
                         var.sqrt()
                     };
+                    let (e2e_avg, e2e_p50, e2e_p95, e2e_p99, e2e_samples) = if e2e_samples_ms.is_empty() {
+                        (-1.0, -1.0, -1.0, -1.0, 0usize)
+                    } else {
+                        let mut e2e_sorted: Vec<f64> = e2e_samples_ms.iter().copied().collect();
+                        e2e_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                        let idx = |p: f64| -> usize {
+                            ((e2e_sorted.len() as f64) * p)
+                                .floor()
+                                .min((e2e_sorted.len().saturating_sub(1)) as f64)
+                                as usize
+                        };
+                        let avg = e2e_sorted.iter().sum::<f64>() / e2e_sorted.len() as f64;
+                        (
+                            avg,
+                            e2e_sorted[idx(0.50)],
+                            e2e_sorted[idx(0.95)],
+                            e2e_sorted[idx(0.99)],
+                            e2e_sorted.len(),
+                        )
+                    };
                     info!(
                         backend = %decoder_backend_label,
                         fps = format!("{:.2}", fps),
                         avg_decode_ms = format!("{:.3}", avg_decode),
                         p95_decode_ms = format!("{:.3}", p95),
                         jitter_ms = format!("{:.3}", jitter),
+                        e2e_avg_ms = format!("{:.3}", e2e_avg),
+                        e2e_p50_ms = format!("{:.3}", e2e_p50),
+                        e2e_p95_ms = format!("{:.3}", e2e_p95),
+                        e2e_p99_ms = format!("{:.3}", e2e_p99),
+                        e2e_samples,
                         samples = decode_sorted.len(),
                         "[DECODER-STATS]"
                     );
@@ -569,6 +609,7 @@ mod tests {
             timestamp: 2,
             is_keyframe: false,
             sequence: 2,
+            tx_unix_us: 0,
         })
         .await
         .unwrap();
@@ -577,6 +618,7 @@ mod tests {
             timestamp: 3,
             is_keyframe: false,
             sequence: 3,
+            tx_unix_us: 0,
         })
         .await
         .unwrap();
@@ -585,6 +627,7 @@ mod tests {
             timestamp: 1,
             is_keyframe: true,
             sequence: 1,
+            tx_unix_us: 0,
         };
         let picked = select_frame_for_decode(&mut rx, first);
         assert_eq!(picked.sequence, 1);

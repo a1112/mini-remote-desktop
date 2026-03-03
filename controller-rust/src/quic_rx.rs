@@ -155,7 +155,7 @@ pub async fn connect_quic_receiver(
         .context("quic connect failed")?;
     info!(remote = %addr, "quic receiver connected");
 
-    let (tx, rx) = mpsc::channel::<VideoFrame>(256);
+    let (tx, rx) = mpsc::channel::<VideoFrame>(32);
     tokio::spawn(async move {
         let wire_debug = std::env::var("MRD_QUIC_WIRE_DEBUG")
             .ok()
@@ -181,6 +181,10 @@ pub async fn connect_quic_receiver(
                     Ok(v) => v,
                     Err(_) => break,
                 };
+                let tx_unix_us = match stream.read_u64().await {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
                 let mut buf = vec![0_u8; len];
                 if let Err(e) = stream.read_exact(&mut buf).await {
                     error!(error = %e, "quic read frame payload failed");
@@ -190,6 +194,7 @@ pub async fn connect_quic_receiver(
                     info!(
                         seq,
                         len,
+                        tx_unix_us,
                         hash = format!("{:016x}", fnv1a64(&buf)),
                         "quic wire rx frame"
                     );
@@ -213,6 +218,7 @@ pub async fn connect_quic_receiver(
                     timestamp: seq,
                     is_keyframe,
                     sequence: seq,
+                    tx_unix_us,
                 };
                 if tx.try_send(frame).is_err() {
                     // drop when decoder path is temporarily saturated

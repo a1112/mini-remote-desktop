@@ -1,13 +1,15 @@
 use super::super::signaling::SignalingClient;
 use anyhow::{Context, Result};
 use bytes::Bytes;
+use rtp::codecs::h264::H264Packet;
+use rtp::packetizer::Depacketizer;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 use uuid::Uuid;
 use webrtc::{
     api::APIBuilder,
-    api::media_engine::{MediaEngine, MIME_TYPE_H264},
+    api::media_engine::MediaEngine,
     ice_transport::ice_candidate::RTCIceCandidateInit,
     ice_transport::ice_connection_state::RTCIceConnectionState,
     peer_connection::configuration::RTCConfiguration,
@@ -15,7 +17,6 @@ use webrtc::{
     rtp_transceiver::rtp_codec::RTPCodecType,
     track::track_remote::TrackRemote,
 };
-use webrtc::util::Unmarshal;
 
 /// 视频帧数据
 #[derive(Debug, Clone)]
@@ -28,6 +29,8 @@ pub struct VideoFrame {
     pub is_keyframe: bool,
     /// 序列号
     pub sequence: u64,
+    /// 发送端 Unix 微秒时间戳（仅 QUIC 路径有效，WebRTC 为 0）
+    pub tx_unix_us: u64,
 }
 
 /// PeerConnection 管理器配置
@@ -99,7 +102,7 @@ impl PeerConnectionManager {
         info!(target = %target_device_id, "video transceiver added for receiving");
 
         // 创建视频帧通道
-        let (frame_tx, frame_rx) = mpsc::channel(30);
+        let (frame_tx, frame_rx) = mpsc::channel(32);
         let frame_rx = Arc::new(Mutex::new(frame_rx));
         let (ice_candidate_tx, _ice_candidate_rx) = mpsc::channel(10);
 
@@ -157,51 +160,74 @@ impl PeerConnectionManager {
         frame_tx: mpsc::Sender<VideoFrame>,
     ) -> Result<()> {
         let mut packet_count = 0u64;
-        let mut h264_buffer = Vec::new();
-        let mut last_timestamp = 0u32;
+        let mut access_unit = Vec::<u8>::new();
+        let mut depacketizer = H264Packet::default();
+        depacketizer.is_avc = false; // output AnnexB for decoder input
+        let mut current_timestamp: Option<u32> = None;
 
         info!(
             codec = %track.codec().capability.mime_type,
             "starting to read video track"
         );
 
-        // 读取 RTP 包 - read_rtp 返回的 packet 已经可以直接使用
+        // 读取 RTP 包并进行 H264 depacketize -> AnnexB AU 重组。
         while let Ok((packet, _)) = track.read_rtp().await {
             packet_count += 1;
-
             let timestamp = packet.header.timestamp;
-
-            // 检查是否是新的帧（时间戳变化）
-            if timestamp != last_timestamp && last_timestamp != 0 {
-                // 发送前一帧
-                if !h264_buffer.is_empty() {
-                    let frame = VideoFrame {
-                        data: Bytes::from(h264_buffer.clone()),
-                        timestamp: last_timestamp as u64,
-                        is_keyframe: false, // TODO: 检测关键帧
-                        sequence: packet_count,
-                    };
-
-                    if let Err(_e) = frame_tx.try_send(frame) {
-                        // 通道已满或已关闭，丢弃帧
-                        debug!("frame channel full/closed, dropping frame");
-                    }
-                    h264_buffer.clear();
-                }
+            if current_timestamp.is_none() {
+                current_timestamp = Some(timestamp);
             }
 
-            last_timestamp = timestamp;
+            // 若时间戳跳变但上一帧未靠 marker 结束，兜底刷新一次。
+            if Some(timestamp) != current_timestamp && !access_unit.is_empty() {
+                let ts = current_timestamp.unwrap_or(timestamp);
+                let is_key = contains_idr_annexb(&access_unit);
+                let frame = VideoFrame {
+                    data: Bytes::from(std::mem::take(&mut access_unit)),
+                    timestamp: ts as u64,
+                    is_keyframe: is_key,
+                    sequence: packet.header.sequence_number as u64,
+                    tx_unix_us: 0,
+                };
+                if let Err(_e) = frame_tx.try_send(frame) {
+                    debug!("frame channel full/closed, dropping fallback AU");
+                }
+                current_timestamp = Some(timestamp);
+            }
 
-            // 将 RTP payload 添加到缓冲区
-            // 注意：这里需要处理 H.264 RTP payload 格式
-            // 简化实现：直接复制 payload
-            h264_buffer.extend_from_slice(&packet.payload);
+            let dep = depacketizer.depacketize(&packet.payload);
+            let nalu = match dep {
+                Ok(v) => v,
+                Err(e) => {
+                    debug!(error = %e, "depacketize failed, dropping RTP payload");
+                    continue;
+                }
+            };
+            if !nalu.is_empty() {
+                access_unit.extend_from_slice(&nalu);
+            }
+
+            if packet.header.marker && !access_unit.is_empty() {
+                let ts = current_timestamp.unwrap_or(timestamp);
+                let is_key = contains_idr_annexb(&access_unit);
+                let frame = VideoFrame {
+                    data: Bytes::from(std::mem::take(&mut access_unit)),
+                    timestamp: ts as u64,
+                    is_keyframe: is_key,
+                    sequence: packet.header.sequence_number as u64,
+                    tx_unix_us: 0,
+                };
+                if let Err(_e) = frame_tx.try_send(frame) {
+                    debug!("frame channel full/closed, dropping decoded AU");
+                }
+                current_timestamp = None;
+            }
 
             // 每 1000 个包记录一次
             if packet_count % 1000 == 0 {
                 debug!(
                     packets = packet_count,
-                    buffer_size = h264_buffer.len(),
+                    au_buffer_size = access_unit.len(),
                     "received RTP packets"
                 );
             }
@@ -250,4 +276,36 @@ impl PeerConnectionManager {
         // TODO: 实现 PLI/FIR 请求
         Ok(())
     }
+}
+
+fn contains_idr_annexb(buf: &[u8]) -> bool {
+    let mut i = 0usize;
+    while i + 4 < buf.len() {
+        let sc_len = if i + 3 < buf.len()
+            && buf[i] == 0
+            && buf[i + 1] == 0
+            && buf[i + 2] == 1
+        {
+            3
+        } else if i + 4 < buf.len()
+            && buf[i] == 0
+            && buf[i + 1] == 0
+            && buf[i + 2] == 0
+            && buf[i + 3] == 1
+        {
+            4
+        } else {
+            i += 1;
+            continue;
+        };
+        let hdr = i + sc_len;
+        if hdr < buf.len() {
+            let nal_type = buf[hdr] & 0x1F;
+            if nal_type == 5 {
+                return true;
+            }
+        }
+        i = hdr.saturating_add(1);
+    }
+    false
 }
