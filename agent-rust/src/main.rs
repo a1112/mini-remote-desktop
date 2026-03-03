@@ -19,7 +19,7 @@ use crate::nvenc_native::NativeNvencPipeline;
 use crate::profile::apply_capture_profile;
 use crate::rtp_send::{RtpH264Sender, RtpH264SenderConfig};
 use crate::runtime_stats::{RuntimeStats, spawn_rtcp_feedback_loop, spawn_stats_panel};
-use agent_rust::{SessionSwitch, load_config, register_message};
+use agent_rust::{SessionSwitch, load_config};
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
@@ -58,6 +58,28 @@ struct SessionState {
     controller_id: Option<String>,
     pc: Option<Arc<RTCPeerConnection>>,
     switcher: SessionSwitch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionTransport {
+    WebRtc,
+    Quic,
+}
+
+impl SessionTransport {
+    fn parse(v: Option<&str>) -> Self {
+        match v.unwrap_or("webrtc").to_ascii_lowercase().as_str() {
+            "quic" => SessionTransport::Quic,
+            _ => SessionTransport::WebRtc,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            SessionTransport::WebRtc => "webrtc",
+            SessionTransport::Quic => "quic",
+        }
+    }
 }
 
 type WsWrite = futures_util::stream::SplitSink<
@@ -124,8 +146,23 @@ async fn main() -> Result<()> {
         let action = v["action"].as_str().unwrap_or("");
 
         if typ == "system" && action == "connected" {
-            let reg = register_message(&cfg.device_name);
-            ws_send_json(&write, &serde_json::from_str::<Value>(&reg)?).await?;
+            let reg = json!({
+                "type":"device",
+                "action":"register",
+                "payload":{
+                    "type":"agent-rust",
+                    "name": cfg.device_name,
+                    "protocolVersion": 2,
+                    "transports": ["webrtc"],
+                    "capabilities": {
+                        "protocols": ["webrtc"],
+                        "platforms": ["windows"],
+                        "codecs": ["h264"],
+                        "features": ["multi-end-compat", "capability-negotiation"]
+                    }
+                }
+            });
+            ws_send_json(&write, &reg).await?;
             info!(device_name = %cfg.device_name, "registered with signaling server");
             continue;
         }
@@ -133,6 +170,13 @@ async fn main() -> Result<()> {
         if typ == "webrtc" && action == "offer" {
             let payload = &v["payload"];
             let controller_id = payload["controllerId"].as_str().unwrap_or("").to_string();
+            let requested_transport =
+                SessionTransport::parse(payload["transport"].as_str());
+            let controller_caps = payload
+                .get("capabilities")
+                .filter(|val| val.is_object())
+                .cloned()
+                .unwrap_or_else(|| json!({}));
             let offer_type = payload["offer"]["type"]
                 .as_str()
                 .unwrap_or("offer")
@@ -142,6 +186,23 @@ async fn main() -> Result<()> {
                 warn!("received invalid offer payload");
                 continue;
             }
+
+            let selected_transport = match requested_transport {
+                SessionTransport::WebRtc => SessionTransport::WebRtc,
+                SessionTransport::Quic => {
+                    warn!(
+                        requested_transport = requested_transport.as_str(),
+                        "transport not implemented on agent, falling back to webrtc"
+                    );
+                    SessionTransport::WebRtc
+                }
+            };
+            info!(
+                requested_transport = requested_transport.as_str(),
+                selected_transport = selected_transport.as_str(),
+                controller_caps = %controller_caps,
+                "session transport negotiated"
+            );
 
             let (old_pc, session_running) = {
                 let mut s = session.lock().await;
@@ -179,7 +240,14 @@ async fn main() -> Result<()> {
                 "action": "answer",
                 "payload": {
                     "answer": { "type": offer_type.replace("offer", "answer"), "sdp": answer.sdp },
-                    "controllerId": controller_id
+                    "controllerId": controller_id,
+                    "selectedTransport": selected_transport.as_str(),
+                    "agentCapabilities": {
+                        "protocols": ["webrtc"],
+                        "platforms": ["windows"],
+                        "codecs": ["h264"],
+                        "features": ["multi-end-compat", "capability-negotiation"]
+                    }
                 }
             });
             ws_send_json(&write, &msg).await?;

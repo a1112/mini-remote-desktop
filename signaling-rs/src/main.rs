@@ -88,6 +88,8 @@ struct Device {
     id: String,
     kind: String,
     name: String,
+    capabilities: Option<Value>,
+    transports: Vec<String>,
     tx: mpsc::Sender<Message>,
     last_seen: Instant,
 }
@@ -231,6 +233,18 @@ async fn handle_message(conn_id: &str, tx: &mpsc::Sender<Message>, text: &str, s
                 .as_str()
                 .map(ToString::to_string)
                 .unwrap_or_else(|| format!("{kind}-{conn_id}"));
+            let capabilities = v["payload"]
+                .get("capabilities")
+                .filter(|val| val.is_object())
+                .cloned();
+            let transports = v["payload"]["transports"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|item| item.as_str().map(ToString::to_string))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
 
             {
                 let mut s = state.write().await;
@@ -240,6 +254,8 @@ async fn handle_message(conn_id: &str, tx: &mpsc::Sender<Message>, text: &str, s
                         id: conn_id.to_string(),
                         kind: kind.clone(),
                         name: name.clone(),
+                        capabilities,
+                        transports,
                         tx: tx.clone(),
                         last_seen: Instant::now(),
                     },
@@ -265,6 +281,16 @@ async fn handle_message(conn_id: &str, tx: &mpsc::Sender<Message>, text: &str, s
                 return;
             }
             let offer = v["payload"]["offer"].clone();
+            let transport = v["payload"]
+                .get("transport")
+                .and_then(|vv| vv.as_str())
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "webrtc".to_string());
+            let capabilities = v["payload"]
+                .get("capabilities")
+                .filter(|val| val.is_object())
+                .cloned()
+                .unwrap_or_else(|| json!({}));
             let msg = json!({
                 "type":"webrtc",
                 "action":"offer",
@@ -272,7 +298,9 @@ async fn handle_message(conn_id: &str, tx: &mpsc::Sender<Message>, text: &str, s
                   "targetDeviceId": target,
                   "offer": offer,
                   "sessionId": Uuid::new_v4().to_string(),
-                  "controllerId": conn_id
+                  "controllerId": conn_id,
+                  "transport": transport,
+                  "capabilities": capabilities,
                 }
             })
             .to_string();
@@ -336,7 +364,7 @@ async fn build_device_list(state: &SharedState) -> Vec<Value> {
     s.devices
         .values()
         .filter(|d| d.kind == "agent" || d.kind == "agent-rust")
-        .map(|d| json!({"id":d.id,"name":d.name,"online":true}))
+        .map(device_to_list_item)
         .collect()
 }
 
@@ -348,7 +376,7 @@ async fn broadcast_device_list(state: &SharedState, exclude_id: Option<&str>) {
             .devices
             .values()
             .filter(|d| d.kind == "agent" || d.kind == "agent-rust")
-            .map(|d| json!({"id":d.id,"name":d.name,"online":true}))
+            .map(device_to_list_item)
             .collect();
         let targets: Vec<mpsc::Sender<Message>> = s
             .devices
@@ -368,6 +396,28 @@ async fn broadcast_device_list(state: &SharedState, exclude_id: Option<&str>) {
     for tx in targets {
         let _ = tx.try_send(msg.clone());
     }
+}
+
+fn device_to_list_item(d: &Device) -> Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("id".to_string(), Value::String(d.id.clone()));
+    obj.insert("name".to_string(), Value::String(d.name.clone()));
+    obj.insert("online".to_string(), Value::Bool(true));
+    if let Some(cap) = &d.capabilities {
+        obj.insert("capabilities".to_string(), cap.clone());
+    }
+    if !d.transports.is_empty() {
+        obj.insert(
+            "transports".to_string(),
+            Value::Array(
+                d.transports
+                    .iter()
+                    .map(|v| Value::String(v.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    Value::Object(obj)
 }
 
 async fn send_to_device(target_id: &str, msg: &str, state: &SharedState) {

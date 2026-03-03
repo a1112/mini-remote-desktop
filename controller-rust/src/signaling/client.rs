@@ -156,7 +156,14 @@ impl SignalingClient {
                 "targetDeviceId": target_device_id,
                 "offer": offer_json,
                 "sessionId": session_id,
-                "controllerId": controller_id
+                "controllerId": controller_id,
+                "transport": "webrtc",
+                "capabilities": {
+                    "protocols": ["webrtc"],
+                    "platforms": ["windows", "linux", "macos"],
+                    "codecs": ["h264"],
+                    "features": ["multi-end-compat", "capability-negotiation"]
+                }
             }
         })
         .to_string();

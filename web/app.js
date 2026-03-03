@@ -19,6 +19,15 @@ const CONFIG = {
   ]
 };
 
+function buildWebCapabilities() {
+  return {
+    protocols: ['webrtc'],
+    platforms: ['web'],
+    codecs: ['h264'],
+    features: ['multi-end-compat', 'capability-negotiation']
+  };
+}
+
 // ==================== 状态 ====================
 const state = {
   ws: null,
@@ -85,7 +94,17 @@ function handleMessage(message) {
       if (action === 'connected') {
         state.deviceId = payload.deviceId;
         // 注册为控制器
-        send({ type: 'device', action: 'register', payload: { type: 'controller', name: 'Web 控制端' } });
+        send({
+          type: 'device',
+          action: 'register',
+          payload: {
+            type: 'controller',
+            name: 'Web 控制端',
+            protocolVersion: 2,
+            transports: ['webrtc'],
+            capabilities: buildWebCapabilities()
+          }
+        });
       }
       break;
 
@@ -248,7 +267,9 @@ async function connect() {
     action: 'offer',
     payload: {
       targetDeviceId: state.selectedDevice,
-      offer: offer
+      offer: offer,
+      transport: 'webrtc',
+      capabilities: buildWebCapabilities()
     }
   });
 

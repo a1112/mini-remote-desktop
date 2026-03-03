@@ -240,7 +240,15 @@ pub fn create_register_message(name: &str) -> String {
         "action": "register",
         "payload": {
             "type": "controller",
-            "name": name
+            "name": name,
+            "protocolVersion": 2,
+            "transports": ["webrtc"],
+            "capabilities": {
+                "protocols": ["webrtc"],
+                "platforms": ["windows", "linux", "macos"],
+                "codecs": ["h264"],
+                "features": ["multi-end-compat", "capability-negotiation"]
+            }
         }
     })
     .to_string()
