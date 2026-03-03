@@ -1,4 +1,6 @@
 use serde::Deserialize;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{fs, path::Path};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -41,6 +43,8 @@ pub struct CaptureConfig {
     pub network_adapt_floor_bitrate_kbps: u32,
     pub network_adapt_ceiling_bitrate_kbps: u32,
     pub stats_interval_ms: u32,
+    pub max_fps_mode: bool,
+    pub idle_repeat_fps: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -48,6 +52,39 @@ pub struct AgentConfig {
     pub ws_url: String,
     pub device_name: String,
     pub capture: CaptureConfig,
+}
+
+#[derive(Debug)]
+pub struct SessionSwitch {
+    generation: u64,
+    current_running: Option<Arc<AtomicBool>>,
+}
+
+impl Default for SessionSwitch {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            current_running: None,
+        }
+    }
+}
+
+impl SessionSwitch {
+    pub fn begin(&mut self) -> (u64, Arc<AtomicBool>) {
+        if let Some(prev) = self.current_running.take() {
+            prev.store(false, Ordering::SeqCst);
+        }
+        self.generation = self.generation.saturating_add(1);
+        let running = Arc::new(AtomicBool::new(true));
+        self.current_running = Some(running.clone());
+        (self.generation, running)
+    }
+
+    pub fn stop_current(&mut self) {
+        if let Some(flag) = self.current_running.take() {
+            flag.store(false, Ordering::SeqCst);
+        }
+    }
 }
 
 impl Default for AgentConfig {
@@ -94,6 +131,8 @@ impl Default for AgentConfig {
                 network_adapt_floor_bitrate_kbps: 6000,
                 network_adapt_ceiling_bitrate_kbps: 80000,
                 stats_interval_ms: 1000,
+                max_fps_mode: false,
+                idle_repeat_fps: 12,
             },
         }
     }
@@ -272,6 +311,12 @@ pub fn load_config(path: &Path) -> AgentConfig {
         if let Some(v) = capture.get("stats_interval_ms").and_then(|v| v.as_u64()) {
             cfg.capture.stats_interval_ms = v as u32;
         }
+        if let Some(v) = capture.get("max_fps_mode").and_then(|v| v.as_bool()) {
+            cfg.capture.max_fps_mode = v;
+        }
+        if let Some(v) = capture.get("idle_repeat_fps").and_then(|v| v.as_u64()) {
+            cfg.capture.idle_repeat_fps = v as u32;
+        }
     }
 
     // 应用值范围验证和标准化
@@ -319,6 +364,7 @@ fn normalize_config(cfg: &mut AgentConfig) {
         .network_adapt_ceiling_bitrate_kbps
         .clamp(100, 300_000);
     cfg.capture.stats_interval_ms = cfg.capture.stats_interval_ms.clamp(200, 10_000);
+    cfg.capture.idle_repeat_fps = cfg.capture.idle_repeat_fps.clamp(1, 240);
 
     // 字符串枚举验证（使用默认值替代无效值）
     if !matches!(
@@ -420,6 +466,7 @@ fn escape_json(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
     use std::{fs, path::PathBuf, time::Duration};
 
     #[test]
@@ -491,6 +538,8 @@ mod tests {
                 "network_adapt_floor_bitrate_kbps":6000,
                 "network_adapt_ceiling_bitrate_kbps":80000,
                 "stats_interval_ms":1000
+                ,"max_fps_mode":true,
+                "idle_repeat_fps":12
             }
         }"#;
         fs::write(&p, raw).expect("write test config");
@@ -513,5 +562,18 @@ mod tests {
         assert_eq!(cfg.capture.frame_pacing_batch_packets, 8);
         assert_eq!(cfg.capture.rtp_mtu, 1200);
         assert_eq!(cfg.capture.network_adapt_floor_bitrate_kbps, 6000);
+        assert!(cfg.capture.max_fps_mode);
+        assert_eq!(cfg.capture.idle_repeat_fps, 12);
+    }
+
+    #[test]
+    fn session_switch_stops_previous_session_on_begin() {
+        let mut sw = SessionSwitch::default();
+        let (_gen1, flag1) = sw.begin();
+        assert!(flag1.load(Ordering::Relaxed));
+
+        let (_gen2, flag2) = sw.begin();
+        assert!(!flag1.load(Ordering::Relaxed));
+        assert!(flag2.load(Ordering::Relaxed));
     }
 }

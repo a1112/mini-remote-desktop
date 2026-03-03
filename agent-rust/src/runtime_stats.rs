@@ -19,6 +19,10 @@ pub struct RuntimeStats {
     pub target_bitrate_kbps: AtomicU32,
     pub rtp_au_sent: AtomicU64,
     pub rtp_au_skipped: AtomicU64,
+    pub encoded_au_total: AtomicU64,
+    pub sent_au_total: AtomicU64,
+    pub unique_sent_au_total: AtomicU64,
+    pub repeated_sent_au_total: AtomicU64,
 }
 
 impl RuntimeStats {
@@ -45,7 +49,17 @@ pub fn spawn_rtcp_feedback_loop(
             let (pkts, _) = match read {
                 Ok(v) => v,
                 Err(e) => {
-                    tracing::error!(error = %e, "rtcp read stopped");
+                    let msg = e.to_string();
+                    // Session switch or peer close can surface as transport/datachannel closed.
+                    // Treat these as expected shutdown signals to keep logs actionable.
+                    if msg.contains("DataChannel is not opened")
+                        || msg.contains("SessionSRTP has been closed")
+                        || msg.contains("closed")
+                    {
+                        tracing::info!(error = %e, "rtcp read stopped (session closed)");
+                    } else {
+                        tracing::warn!(error = %e, "rtcp read stopped");
+                    }
                     break;
                 }
             };
@@ -125,12 +139,21 @@ pub fn spawn_stats_panel(
     stats: Arc<RuntimeStats>,
     adapt: Arc<NetAdaptController>,
     interval_ms: u32,
+    running: Arc<AtomicBool>,
 ) {
     let interval_ms = interval_ms.clamp(200, 10_000) as u64;
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms));
-        loop {
+        let mut last_ts = std::time::Instant::now();
+        let mut last_encoded = 0_u64;
+        let mut last_sent = 0_u64;
+        let mut last_unique_sent = 0_u64;
+        let mut last_repeated_sent = 0_u64;
+        while running.load(Ordering::SeqCst) {
             ticker.tick().await;
+            let now = std::time::Instant::now();
+            let dt = (now - last_ts).as_secs_f64().max(0.001);
+            last_ts = now;
             let pli = stats.pli_count.load(Ordering::Relaxed);
             let fir = stats.fir_count.load(Ordering::Relaxed);
             let nack = stats.nack_count.load(Ordering::Relaxed);
@@ -140,6 +163,20 @@ pub fn spawn_stats_panel(
             let target_bitrate_kbps = stats.target_bitrate_kbps.load(Ordering::Relaxed);
             let sent = stats.rtp_au_sent.load(Ordering::Relaxed);
             let skipped = stats.rtp_au_skipped.load(Ordering::Relaxed);
+            let encoded_total = stats.encoded_au_total.load(Ordering::Relaxed);
+            let sent_total = stats.sent_au_total.load(Ordering::Relaxed);
+            let unique_sent_total = stats.unique_sent_au_total.load(Ordering::Relaxed);
+            let repeated_sent_total = stats.repeated_sent_au_total.load(Ordering::Relaxed);
+            let encode_fps = (encoded_total.saturating_sub(last_encoded) as f64 / dt) as f32;
+            let send_fps = (sent_total.saturating_sub(last_sent) as f64 / dt) as f32;
+            let unique_send_fps =
+                (unique_sent_total.saturating_sub(last_unique_sent) as f64 / dt) as f32;
+            let repeat_send_fps =
+                (repeated_sent_total.saturating_sub(last_repeated_sent) as f64 / dt) as f32;
+            last_encoded = encoded_total;
+            last_sent = sent_total;
+            last_unique_sent = unique_sent_total;
+            last_repeated_sent = repeated_sent_total;
             tracing::info!(
                 pli,
                 fir,
@@ -150,6 +187,14 @@ pub fn spawn_stats_panel(
                 target_bitrate_kbps,
                 au_sent = sent,
                 au_skipped = skipped,
+                encoded_total,
+                sent_total,
+                unique_sent_total,
+                repeated_sent_total,
+                encode_fps,
+                send_fps,
+                unique_send_fps,
+                repeat_send_fps,
                 "[RTCP-PANEL]"
             );
         }

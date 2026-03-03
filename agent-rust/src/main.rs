@@ -19,7 +19,7 @@ use crate::nvenc_native::NativeNvencPipeline;
 use crate::profile::apply_capture_profile;
 use crate::rtp_send::{RtpH264Sender, RtpH264SenderConfig};
 use crate::runtime_stats::{RuntimeStats, spawn_rtcp_feedback_loop, spawn_stats_panel};
-use agent_rust::{load_config, register_message};
+use agent_rust::{SessionSwitch, load_config, register_message};
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
@@ -34,6 +34,8 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use tracing::{error, info, warn};
 use webrtc::api::APIBuilder;
 use webrtc::api::media_engine::MediaEngine;
+use webrtc::api::setting_engine::SettingEngine;
+use webrtc::dtls::extension::extension_use_srtp::SrtpProtectionProfile;
 use webrtc::ice_transport::ice_candidate_pair::RTCIceCandidatePair;
 use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
 use webrtc::ice_transport::ice_server::RTCIceServer;
@@ -55,6 +57,7 @@ use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSampl
 struct SessionState {
     controller_id: Option<String>,
     pc: Option<Arc<RTCPeerConnection>>,
+    switcher: SessionSwitch,
 }
 
 type WsWrite = futures_util::stream::SplitSink<
@@ -140,8 +143,24 @@ async fn main() -> Result<()> {
                 continue;
             }
 
+            let (old_pc, session_running) = {
+                let mut s = session.lock().await;
+                let old_pc = s.pc.take();
+                let (_gen, running) = s.switcher.begin();
+                (old_pc, running)
+            };
+            if let Some(pc) = old_pc {
+                if let Err(e) = pc.close().await {
+                    warn!(error = %e, "failed to close previous peer connection");
+                }
+                // Give the transport stack a brief cool-down window.
+                // Without this, rapid re-offer can leave the next session stuck at ICE connected
+                // but never reaching peer connection connected on some hosts.
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+
             let pc = create_peer_connection(write.clone(), controller_id.clone()).await?;
-            attach_video_track_with_policy(pc.clone(), &cfg.capture).await?;
+            attach_video_track_with_policy(pc.clone(), &cfg.capture, session_running).await?;
 
             pc.set_remote_description(RTCSessionDescription::offer(offer_sdp)?)
                 .await
@@ -188,6 +207,18 @@ async fn main() -> Result<()> {
         }
     }
 
+    let old_pc = {
+        let mut s = session.lock().await;
+        s.switcher.stop_current();
+        s.controller_id = None;
+        s.pc.take()
+    };
+    if let Some(pc) = old_pc {
+        if let Err(e) = pc.close().await {
+            warn!(error = %e, "failed to close peer connection on shutdown");
+        }
+    }
+
     Ok(())
 }
 
@@ -197,7 +228,16 @@ async fn create_peer_connection(
 ) -> Result<Arc<RTCPeerConnection>> {
     let mut m = MediaEngine::default();
     m.register_default_codecs()?;
-    let api = APIBuilder::new().with_media_engine(m).build();
+    let mut se = SettingEngine::default();
+    se.set_srtp_protection_profiles(vec![
+        SrtpProtectionProfile::Srtp_Aead_Aes_128_Gcm,
+        SrtpProtectionProfile::Srtp_Aes128_Cm_Hmac_Sha1_80,
+        SrtpProtectionProfile::Srtp_Aes128_Cm_Hmac_Sha1_32,
+    ]);
+    let api = APIBuilder::new()
+        .with_media_engine(m)
+        .with_setting_engine(se)
+        .build();
 
     let pc = Arc::new(
         api.new_peer_connection(RTCConfiguration {
@@ -259,6 +299,7 @@ async fn create_peer_connection(
 async fn attach_video_track_with_policy(
     pc: Arc<RTCPeerConnection>,
     capture_cfg: &agent_rust::CaptureConfig,
+    session_running: Arc<AtomicBool>,
 ) -> Result<()> {
     let mut effective_cfg = capture_cfg.clone();
     apply_capture_profile(&mut effective_cfg);
@@ -368,6 +409,7 @@ async fn attach_video_track_with_policy(
         stats.clone(),
         adapt.clone(),
         effective_cfg.stats_interval_ms,
+        session_running.clone(),
     );
 
     if encoder_backend == VideoEncoderBackend::Nvenc {
@@ -382,7 +424,26 @@ async fn attach_video_track_with_policy(
         } else {
             input_h
         };
-        match NativeNvencPipeline::new(target_w, target_h, &effective_cfg) {
+        let native_init = async {
+            let mut last_err: Option<anyhow::Error> = None;
+            for attempt in 0..6 {
+                match NativeNvencPipeline::new(target_w, target_h, &effective_cfg) {
+                    Ok(v) => return Ok(v),
+                    Err(e) => {
+                        let msg = e.to_string();
+                        let duplicate_output = msg.contains("DuplicateOutput");
+                        last_err = Some(e);
+                        if duplicate_output && attempt < 5 {
+                            tokio::time::sleep(Duration::from_millis(120)).await;
+                            continue;
+                        }
+                        break;
+                    }
+                }
+            }
+            Err(last_err.unwrap_or_else(|| anyhow!("native nvenc init failed")))
+        };
+        match native_init.await {
             Ok(mut native) => {
                 info!(
                     input_w,
@@ -397,11 +458,13 @@ async fn attach_video_track_with_policy(
                 let (encoded_tx, mut encoded_rx) =
                     tokio::sync::mpsc::channel::<Vec<u8>>(queue_depth);
                 let keyframe_request2 = keyframe_request.clone();
+                let stats_encode = stats.clone();
+                let session_running_encode = session_running.clone();
                 let idr_interval_frames =
                     effective_cfg.fps.max(1) * effective_cfg.idr_interval_sec.max(1);
                 std::thread::spawn(move || {
                     let mut encoded_frames: u32 = 0;
-                    loop {
+                    while session_running_encode.load(Ordering::SeqCst) {
                         let force_idr = keyframe_request2.swap(false, Ordering::Relaxed)
                             || (idr_interval_frames > 0
                                 && encoded_frames > 0
@@ -409,6 +472,9 @@ async fn attach_video_track_with_policy(
                         match native.encode_next(force_idr) {
                             Ok(Some(v)) if !v.is_empty() => {
                                 encoded_frames = encoded_frames.saturating_add(1);
+                                stats_encode
+                                    .encoded_au_total
+                                    .fetch_add(1, Ordering::Relaxed);
                                 if block_queue {
                                     let _ = encoded_tx.blocking_send(v);
                                 } else {
@@ -440,21 +506,77 @@ async fn attach_video_track_with_policy(
                         adapt,
                         stats,
                         enable_network_adapt,
+                        effective_cfg.max_fps_mode,
+                        effective_cfg.idle_repeat_fps,
+                        session_running.clone(),
                     ));
                 } else if let Some(track) = sample_track.clone() {
-                    let frame_duration = Duration::from_millis(
-                        (1000.0 / effective_cfg.fps.max(1) as f64).max(1.0).round() as u64,
-                    );
+                    let fps = effective_cfg.fps.max(1);
+                    let stats_send = stats.clone();
+                    let repeat_last = effective_cfg.max_fps_mode;
+                    let idle_repeat_fps = effective_cfg.idle_repeat_fps.max(1);
+                    let session_running_send = session_running.clone();
                     tokio::spawn(async move {
-                        while let Some(encoded) = encoded_rx.recv().await {
+                        let mut last_encoded: Option<Vec<u8>> = None;
+                        let mut next_due = Instant::now();
+                        while session_running_send.load(Ordering::SeqCst) {
+                            wait_until_due(next_due).await;
+                            let mut got_fresh = false;
+                            while let Ok(encoded) = encoded_rx.try_recv() {
+                                last_encoded = Some(encoded);
+                                got_fresh = true;
+                            }
+                            if !got_fresh
+                                && last_encoded.is_some()
+                                && let Ok(Some(v)) =
+                                    tokio::time::timeout(Duration::from_millis(2), encoded_rx.recv())
+                                        .await
+                            {
+                                last_encoded = Some(v);
+                                got_fresh = true;
+                            }
+                            let encoded = if let Some(v) = last_encoded.as_ref() {
+                                v.clone()
+                            } else {
+                                match encoded_rx.recv().await {
+                                    Some(v) => {
+                                        last_encoded = Some(v.clone());
+                                        got_fresh = true;
+                                        v
+                                    }
+                                    None => break,
+                                }
+                            };
+                            let send_fps = if got_fresh || !repeat_last {
+                                fps
+                            } else {
+                                idle_repeat_fps
+                            };
+                            let send_gap =
+                                Duration::from_millis((1000.0 / send_fps as f64).max(1.0) as u64);
+                            next_due = advance_send_deadline(next_due, send_gap, Instant::now());
                             let sample = Sample {
                                 data: Bytes::from(encoded),
-                                duration: frame_duration,
+                                duration: send_gap,
                                 ..Default::default()
                             };
                             if let Err(e) = track.write_sample(&sample).await {
                                 error!(error = %e, "sample write failed");
                                 break;
+                            }
+                            stats_send.sent_au_total.fetch_add(1, Ordering::Relaxed);
+                            stats_send.rtp_au_sent.fetch_add(1, Ordering::Relaxed);
+                            if got_fresh {
+                                stats_send
+                                    .unique_sent_au_total
+                                    .fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                stats_send
+                                    .repeated_sent_au_total
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                            if !repeat_last {
+                                last_encoded = None;
                             }
                         }
                     });
@@ -489,6 +611,7 @@ async fn attach_video_track_with_policy(
         let latest = latest.clone();
         let target_width = effective_cfg.target_width;
         let target_height = effective_cfg.target_height;
+        let session_running_capture = session_running.clone();
         std::thread::spawn(move || {
             let mut capturer = match build_frame_capturer(backend) {
                 Ok(v) => v,
@@ -499,7 +622,8 @@ async fn attach_video_track_with_policy(
                 }
             };
             let mut next_tick = Instant::now();
-            while running.load(Ordering::Relaxed) {
+            while running.load(Ordering::Relaxed) && session_running_capture.load(Ordering::SeqCst)
+            {
                 match capturer.capture() {
                     Ok((mut rgba, mut width, mut height)) => {
                         if target_width > 0
@@ -536,6 +660,9 @@ async fn attach_video_track_with_policy(
         let encode_cfg = effective_cfg.clone();
         let keyframe_request2 = keyframe_request.clone();
         let adapt2 = adapt.clone();
+        let stats_encode = stats.clone();
+        let session_running_encode = session_running.clone();
+        let idr_interval_frames = fps.max(1) * effective_cfg.idr_interval_sec.max(1);
         std::thread::spawn(move || {
             let mut encoder = match build_video_encoder(
                 fps,
@@ -550,8 +677,9 @@ async fn attach_video_track_with_policy(
                     return;
                 }
             };
+            let mut encoded_frames: u32 = 0;
 
-            while running.load(Ordering::Relaxed) {
+            while running.load(Ordering::Relaxed) && session_running_encode.load(Ordering::SeqCst) {
                 let frame = match latest.lock() {
                     Ok(mut slot) => slot.take(),
                     Err(_) => None,
@@ -560,7 +688,10 @@ async fn attach_video_track_with_policy(
                     std::thread::sleep(Duration::from_millis(1));
                     continue;
                 };
-                if keyframe_request2.swap(false, Ordering::Relaxed) {
+                let interval_force = idr_interval_frames > 0
+                    && encoded_frames > 0
+                    && encoded_frames.is_multiple_of(idr_interval_frames);
+                if keyframe_request2.swap(false, Ordering::Relaxed) || interval_force {
                     request_keyframe(&mut encoder);
                 }
 
@@ -587,6 +718,10 @@ async fn attach_video_track_with_policy(
                 if encoded.is_empty() {
                     continue;
                 }
+                encoded_frames = encoded_frames.saturating_add(1);
+                stats_encode
+                    .encoded_au_total
+                    .fetch_add(1, Ordering::Relaxed);
                 if block_queue {
                     let _ = encoded_tx.blocking_send(encoded);
                 } else {
@@ -612,19 +747,75 @@ async fn attach_video_track_with_policy(
             adapt,
             stats,
             enable_network_adapt,
+            effective_cfg.max_fps_mode,
+            effective_cfg.idle_repeat_fps,
+            session_running.clone(),
         ));
     } else if let Some(track) = sample_track {
+        let stats_send = stats.clone();
+        let repeat_last = effective_cfg.max_fps_mode;
+        let idle_repeat_fps = effective_cfg.idle_repeat_fps.max(1);
+        let session_running_send = session_running.clone();
         tokio::spawn(async move {
-            while let Some(encoded) = encoded_rx.recv().await {
+            let mut last_encoded: Option<Vec<u8>> = None;
+            let mut next_due = Instant::now();
+            while session_running_send.load(Ordering::SeqCst) {
+                wait_until_due(next_due).await;
+                let mut got_fresh = false;
+                while let Ok(encoded) = encoded_rx.try_recv() {
+                    last_encoded = Some(encoded);
+                    got_fresh = true;
+                }
+                if !got_fresh
+                    && last_encoded.is_some()
+                    && let Ok(Some(v)) =
+                        tokio::time::timeout(Duration::from_millis(2), encoded_rx.recv()).await
+                {
+                    last_encoded = Some(v);
+                    got_fresh = true;
+                }
+                let encoded = if let Some(v) = last_encoded.as_ref() {
+                    v.clone()
+                } else {
+                    match encoded_rx.recv().await {
+                        Some(v) => {
+                            last_encoded = Some(v.clone());
+                            got_fresh = true;
+                            v
+                        }
+                        None => break,
+                    }
+                };
+                let send_fps = if got_fresh || !repeat_last {
+                    fps
+                } else {
+                    idle_repeat_fps
+                };
+                let send_gap = Duration::from_millis((1000.0 / send_fps as f64).max(1.0) as u64);
+                next_due = advance_send_deadline(next_due, send_gap, Instant::now());
                 let sample = Sample {
                     data: Bytes::from(encoded),
-                    duration: frame_duration,
+                    duration: send_gap,
                     ..Default::default()
                 };
                 if let Err(e) = track.write_sample(&sample).await {
                     error!(error = %e, "sample write failed");
                     running.store(false, Ordering::Relaxed);
                     break;
+                }
+                stats_send.sent_au_total.fetch_add(1, Ordering::Relaxed);
+                stats_send.rtp_au_sent.fetch_add(1, Ordering::Relaxed);
+                if got_fresh {
+                    stats_send
+                        .unique_sent_au_total
+                        .fetch_add(1, Ordering::Relaxed);
+                } else {
+                    stats_send
+                        .repeated_sent_au_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                if !repeat_last {
+                    last_encoded = None;
                 }
             }
         });
@@ -639,10 +830,14 @@ async fn spawn_send_loop_rtp(
     adapt: Arc<NetAdaptController>,
     stats: Arc<RuntimeStats>,
     enable_network_adapt: bool,
+    repeat_last_au_on_idle: bool,
+    idle_repeat_fps: u32,
+    session_running: Arc<AtomicBool>,
 ) {
     let mut next_due = Instant::now();
     let mut next_recover_tick = Instant::now();
-    while let Some(encoded) = encoded_rx.recv().await {
+    let mut last_encoded: Option<Vec<u8>> = None;
+    while session_running.load(Ordering::SeqCst) {
         if enable_network_adapt && Instant::now() >= next_recover_tick {
             if let Some((fps_v, br_v)) = adapt.tick_recover() {
                 info!(
@@ -661,18 +856,59 @@ async fn spawn_send_loop_rtp(
             .target_bitrate_kbps
             .store(target_bitrate, Ordering::Relaxed);
 
-        let frame_gap = Duration::from_millis((1000.0 / target_fps as f64).max(1.0) as u64);
-        let now = Instant::now();
-        if now < next_due {
-            tokio::time::sleep(next_due - now).await;
-        }
-        next_due = Instant::now() + frame_gap;
+        let idle_repeat_fps = idle_repeat_fps.max(1);
+        wait_until_due(next_due).await;
 
+        let mut got_fresh = false;
+        while let Ok(encoded) = encoded_rx.try_recv() {
+            last_encoded = Some(encoded);
+            got_fresh = true;
+        }
+        if !got_fresh
+            && last_encoded.is_some()
+            && let Ok(Some(v)) =
+                tokio::time::timeout(Duration::from_millis(2), encoded_rx.recv()).await
+        {
+            last_encoded = Some(v);
+            got_fresh = true;
+        }
+        if last_encoded.is_none() {
+            match encoded_rx.recv().await {
+                Some(v) => {
+                    last_encoded = Some(v);
+                    got_fresh = true;
+                }
+                None => break,
+            }
+        }
+        let Some(encoded) = (if let Some(v) = last_encoded.as_ref() {
+            Some(v.clone())
+        } else {
+            None
+        }) else {
+            continue;
+        };
+        let send_fps = if got_fresh || !repeat_last_au_on_idle {
+            target_fps
+        } else {
+            idle_repeat_fps
+        };
+        let frame_gap = Duration::from_millis((1000.0 / send_fps as f64).max(1.0) as u64);
+        next_due = advance_send_deadline(next_due, frame_gap, Instant::now());
         if let Err(e) = sender.send_access_unit(&encoded).await {
             error!(error = %e, "RTP write failed");
             break;
         }
         stats.rtp_au_sent.fetch_add(1, Ordering::Relaxed);
+        stats.sent_au_total.fetch_add(1, Ordering::Relaxed);
+        if got_fresh {
+            stats.unique_sent_au_total.fetch_add(1, Ordering::Relaxed);
+        } else {
+            stats.repeated_sent_au_total.fetch_add(1, Ordering::Relaxed);
+        }
+        if !repeat_last_au_on_idle {
+            last_encoded = None;
+        }
     }
 }
 
@@ -682,4 +918,48 @@ async fn ws_send_json(ws: &Arc<Mutex<WsWrite>>, v: &Value) -> Result<()> {
     w.send(Message::Text(text))
         .await
         .map_err(|e| anyhow!("ws send failed: {e}"))
+}
+
+fn advance_send_deadline(prev_due: Instant, gap: Duration, now: Instant) -> Instant {
+    let next = prev_due + gap;
+    if next < now { now } else { next }
+}
+
+async fn wait_until_due(deadline: Instant) {
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let remain = deadline - now;
+        if remain > Duration::from_millis(2) {
+            tokio::time::sleep(remain - Duration::from_millis(1)).await;
+        } else {
+            std::hint::spin_loop();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn advance_send_deadline_keeps_constant_cadence_when_not_late() {
+        let now = Instant::now();
+        let prev = now + Duration::from_millis(20);
+        let gap = Duration::from_millis(16);
+        let next = advance_send_deadline(prev, gap, now);
+        assert_eq!(next, prev + gap);
+    }
+
+    #[test]
+    fn advance_send_deadline_catches_up_when_late() {
+        let now = Instant::now();
+        let prev = now - Duration::from_millis(50);
+        let gap = Duration::from_millis(16);
+        let next = advance_send_deadline(prev, gap, now);
+        assert_eq!(next, now);
+    }
+
 }

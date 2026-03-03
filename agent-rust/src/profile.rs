@@ -66,4 +66,9 @@ pub fn apply_capture_profile(cfg: &mut agent_rust::CaptureConfig) {
     if !matches!(cfg.queue_strategy.as_str(), "drop" | "block") {
         cfg.queue_strategy = "drop".to_string();
     }
+    if cfg.max_fps_mode {
+        cfg.frame_pacing_enable = false;
+        cfg.queue_strategy = "drop".to_string();
+        cfg.enable_template_overlay = false;
+    }
 }

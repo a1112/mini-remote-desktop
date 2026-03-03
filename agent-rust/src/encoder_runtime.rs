@@ -297,7 +297,41 @@ impl FfmpegPipeEncoder {
 }
 
 fn resolve_ffmpeg_bin() -> String {
-    std::env::var("AGENT_FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".to_string())
+    resolve_ffmpeg_bin_from(
+        std::env::var("AGENT_FFMPEG_PATH").ok(),
+        std::env::current_dir().ok(),
+    )
+}
+
+fn resolve_ffmpeg_bin_from(env_ffmpeg: Option<String>, cwd: Option<std::path::PathBuf>) -> String {
+    if let Some(v) = env_ffmpeg {
+        let v = v.trim();
+        if !v.is_empty() {
+            return v.to_string();
+        }
+    }
+
+    if let Some(cwd) = cwd {
+        let candidates = [
+            cwd.join("tools").join("ffmpeg-min").join("ffmpeg.exe"),
+            cwd.join("..")
+                .join("tools")
+                .join("ffmpeg-min")
+                .join("ffmpeg.exe"),
+            cwd.join("..")
+                .join("..")
+                .join("tools")
+                .join("ffmpeg-min")
+                .join("ffmpeg.exe"),
+        ];
+        for p in candidates {
+            if p.is_file() {
+                return p.to_string_lossy().to_string();
+            }
+        }
+    }
+
+    "ffmpeg".to_string()
 }
 
 fn probe_ffmpeg_encoder(ffmpeg_bin: &str, codec: &str) -> Result<()> {
@@ -478,6 +512,7 @@ impl<'a> BitReader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn ffmpeg_codec_mapping_is_correct() {
@@ -494,5 +529,42 @@ mod tests {
             Some("h264_amf")
         );
         assert_eq!(ffmpeg_codec_name(VideoEncoderBackend::OpenH264), None);
+    }
+
+    #[test]
+    fn resolve_ffmpeg_prefers_env_path() {
+        let got = resolve_ffmpeg_bin_from(
+            Some("C:/custom/ffmpeg.exe".to_string()),
+            Some(PathBuf::from("J:/tmp/agent-rust")),
+        );
+        assert_eq!(got, "C:/custom/ffmpeg.exe");
+    }
+
+    #[test]
+    fn resolve_ffmpeg_uses_repo_tools_when_present() {
+        let base = std::env::temp_dir().join(format!(
+            "mini-rd-ffmpeg-resolve-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let agent_dir = base.join("mini-remote-desktop").join("agent-rust");
+        let ffmpeg_exe = base
+            .join("mini-remote-desktop")
+            .join("tools")
+            .join("ffmpeg-min")
+            .join("ffmpeg.exe");
+        std::fs::create_dir_all(ffmpeg_exe.parent().expect("ffmpeg parent")).expect("mkdir");
+        std::fs::create_dir_all(&agent_dir).expect("agent dir");
+        std::fs::write(&ffmpeg_exe, b"fake").expect("touch ffmpeg");
+
+        let got = resolve_ffmpeg_bin_from(None, Some(agent_dir));
+        let got_canon = PathBuf::from(got).canonicalize().expect("canonical got");
+        let expect_canon = ffmpeg_exe.canonicalize().expect("canonical expect");
+        assert_eq!(got_canon, expect_canon);
+
+        let _ = std::fs::remove_dir_all(base);
     }
 }

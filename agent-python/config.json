@@ -1,0 +1,27 @@
+{
+  "ws_url": "ws://127.0.0.1:9527",
+  "device_name": "Python Agent",
+  "capture": {
+    "fps": 30,
+    "backend": "gdi",
+    "encoder": "software",
+    "target_width": 1920,
+    "target_height": 1080,
+    "queue_depth": 8,
+    "gop": 60,
+    "bitrate_kbps": 5000,
+    "max_bitrate_kbps": 8000,
+    "min_fps": 15,
+    "max_fps": 60,
+    "frame_pacing_enable": true,
+    "frame_pacing_batch_packets": 6,
+    "force_idr_on_pli": true,
+    "idr_interval_sec": 2,
+    "rtp_use_manual_packetizer": true,
+    "rtp_mtu": 1200,
+    "network_adapt_enable": true,
+    "network_adapt_floor_bitrate_kbps": 2000,
+    "network_adapt_ceiling_bitrate_kbps": 10000,
+    "stats_interval_ms": 1000
+  }
+}

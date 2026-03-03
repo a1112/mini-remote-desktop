@@ -9,14 +9,17 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use webrtc::api::APIBuilder;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
+use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::configuration::RTCConfiguration;
+use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let verbose = parse_verbose_flag();
     let ws_url = "ws://127.0.0.1:9527";
     let (ws, _) = connect_async(ws_url)
         .await
@@ -41,32 +44,10 @@ async fn main() -> Result<()> {
     )
     .await?;
 
-    let mut target_id = String::new();
-    for _ in 0..10 {
-        if let Some(msg) = read.next().await {
-            let text = msg?.into_text()?;
-            let v: Value = serde_json::from_str(&text)?;
-            if v["type"] == "device" {
-                if let Some(list) = v["payload"]["deviceList"].as_array() {
-                    for d in list {
-                        if let Some(id) = d["id"].as_str() {
-                            target_id = id.to_string();
-                            break;
-                        }
-                    }
-                }
-            }
-            if !target_id.is_empty() {
-                break;
-            }
-        }
-    }
-    if target_id.is_empty() {
-        anyhow::bail!("no target device found");
-    }
+    let target_id = discover_target_device(&write, &mut read).await?;
     println!("target_id={target_id}");
 
-    let pc = build_pc(write.clone(), target_id.clone()).await?;
+    let pc = build_pc(write.clone(), target_id.clone(), verbose).await?;
     let frame_count = Arc::new(AtomicU64::new(0));
     let packet_count = Arc::new(AtomicU64::new(0));
     {
@@ -76,10 +57,25 @@ async fn main() -> Result<()> {
             let frame_count = frame_count.clone();
             let packet_count = packet_count.clone();
             Box::pin(async move {
+                let mut last_marker_ts: Option<u32> = None;
+                let mut media_ssrc: Option<u32> = None;
                 while let Ok((pkt, _)) = track.read_rtp().await {
+                    let ssrc = pkt.header.ssrc;
+                    if media_ssrc.is_none() {
+                        media_ssrc = Some(ssrc);
+                        println!("probe_media_ssrc={ssrc}");
+                    }
+                    if media_ssrc != Some(ssrc) {
+                        continue;
+                    }
+
                     packet_count.fetch_add(1, Ordering::Relaxed);
                     if pkt.header.marker {
-                        frame_count.fetch_add(1, Ordering::Relaxed);
+                        let ts = pkt.header.timestamp;
+                        if last_marker_ts != Some(ts) {
+                            frame_count.fetch_add(1, Ordering::Relaxed);
+                            last_marker_ts = Some(ts);
+                        }
                     }
                 }
             })
@@ -111,6 +107,7 @@ async fn main() -> Result<()> {
         .unwrap_or(15);
     let hard_deadline = Instant::now() + Duration::from_secs(run_secs + 45);
     let mut media_start: Option<Instant> = None;
+    let mut remote_ice_count: u64 = 0;
 
     while Instant::now() < hard_deadline {
         if let Some(s) = media_start {
@@ -145,6 +142,10 @@ async fn main() -> Result<()> {
                 let cand: RTCIceCandidateInit = serde_json::from_value(cand_v.clone())
                     .context("parse remote candidate failed")?;
                 let _ = pc.add_ice_candidate(cand).await;
+                remote_ice_count += 1;
+                if verbose && remote_ice_count <= 6 {
+                    println!("probe_remote_ice_recv={remote_ice_count}");
+                }
             }
         }
     }
@@ -157,8 +158,17 @@ async fn main() -> Result<()> {
     let packets = packet_count.load(Ordering::Relaxed);
     let fps = frames as f64 / secs;
     println!(
-        "media_stats: seconds={:.2} frames={} packets={} estimated_fps={:.2}",
-        secs, frames, packets, fps
+        "media_stats: seconds={:.2} frames={} packets={} estimated_fps={:.2} packets_per_frame={:.2} remote_ice={}",
+        secs,
+        frames,
+        packets,
+        fps,
+        if frames > 0 {
+            packets as f64 / frames as f64
+        } else {
+            0.0
+        },
+        remote_ice_count
     );
 
     Ok(())
@@ -176,6 +186,7 @@ async fn build_pc(
         >,
     >,
     target_id: String,
+    verbose: bool,
 ) -> Result<Arc<RTCPeerConnection>> {
     let mut m = MediaEngine::default();
     m.register_default_codecs()?;
@@ -191,11 +202,28 @@ async fn build_pc(
         .await?,
     );
 
+    let verbose_ice = verbose;
+    pc.on_ice_connection_state_change(Box::new(move |s: RTCIceConnectionState| {
+        if verbose_ice {
+            println!("probe_ice_state={s}");
+        }
+        Box::pin(async {})
+    }));
+    let verbose_pc = verbose;
+    pc.on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
+        if verbose_pc {
+            println!("probe_pc_state={s}");
+        }
+        Box::pin(async {})
+    }));
+
     {
         let write = write.clone();
+        let local_ice_sent = Arc::new(AtomicU64::new(0));
         pc.on_ice_candidate(Box::new(move |cand| {
             let write = write.clone();
             let target_id = target_id.clone();
+            let local_ice_sent = local_ice_sent.clone();
             Box::pin(async move {
                 if let Some(c) = cand {
                     if let Ok(cjson) = c.to_json() {
@@ -211,6 +239,10 @@ async fn build_pc(
                             }),
                         )
                         .await;
+                        let n = local_ice_sent.fetch_add(1, Ordering::Relaxed) + 1;
+                        if verbose && n <= 6 {
+                            println!("probe_local_ice_sent={n}");
+                        }
                     }
                 }
             })
@@ -218,6 +250,19 @@ async fn build_pc(
     }
 
     Ok(pc)
+}
+
+fn parse_verbose_flag() -> bool {
+    if std::env::args().any(|a| a == "--verbose" || a == "-v") {
+        return true;
+    }
+    std::env::var("PROBE_VERBOSE")
+        .ok()
+        .map(|v| {
+            let s = v.trim().to_ascii_lowercase();
+            matches!(s.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
 }
 
 async fn ws_send_json(
@@ -236,4 +281,125 @@ async fn ws_send_json(
     let mut w = ws.lock().await;
     w.send(Message::Text(v.to_string())).await?;
     Ok(())
+}
+
+async fn discover_target_device(
+    write: &Arc<
+        Mutex<
+            futures_util::stream::SplitSink<
+                tokio_tungstenite::WebSocketStream<
+                    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+                >,
+                Message,
+            >,
+        >,
+    >,
+    read: &mut futures_util::stream::SplitStream<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    >,
+) -> Result<String> {
+    let timeout_secs = std::env::var("DISCOVERY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0 && *v <= 120)
+        .unwrap_or(20);
+    let preferred_name = std::env::var("PROBE_TARGET_NAME").ok();
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let mut last_pull = Instant::now() - Duration::from_secs(3);
+
+    let mut seen_messages = 0_u64;
+    let mut seen_lists = 0_u64;
+    let mut last_list_summary = String::new();
+
+    loop {
+        if Instant::now() >= deadline {
+            return Err(anyhow!(
+                "device discovery timeout after {}s: seen_messages={} seen_device_lists={} last_device_list={}",
+                timeout_secs,
+                seen_messages,
+                seen_lists,
+                if last_list_summary.is_empty() {
+                    "<empty>".to_string()
+                } else {
+                    last_list_summary
+                }
+            ));
+        }
+
+        if Instant::now().duration_since(last_pull) >= Duration::from_secs(1) {
+            ws_send_json(
+                write,
+                &json!({"type":"device","action":"getDeviceList","payload":{}}),
+            )
+            .await
+            .context("send getDeviceList failed")?;
+            last_pull = Instant::now();
+        }
+
+        let msg = match timeout(Duration::from_millis(600), read.next()).await {
+            Ok(Some(v)) => v?,
+            Ok(None) => return Err(anyhow!("signaling disconnected during device discovery")),
+            Err(_) => continue,
+        };
+        if !msg.is_text() {
+            continue;
+        }
+        seen_messages += 1;
+        let text = msg.into_text()?;
+        let v: Value = serde_json::from_str(&text).context("parse signaling message failed")?;
+
+        if v["type"] != "device" {
+            continue;
+        }
+
+        let Some(list) = v["payload"]["deviceList"].as_array() else {
+            continue;
+        };
+        seen_lists += 1;
+        let mut lines = Vec::new();
+        for d in list {
+            let id = d["id"].as_str().unwrap_or("");
+            let name = d["name"].as_str().unwrap_or("");
+            let online = d["online"].as_bool().unwrap_or(false);
+            lines.push(format!("{name}({id}) online={online}"));
+        }
+        last_list_summary = lines.join(", ");
+
+        if let Some(ref preferred_name) = preferred_name {
+            if let Some(id) = list.iter().find_map(|d| {
+                let name = d["name"].as_str().unwrap_or("");
+                let online = d["online"].as_bool().unwrap_or(true);
+                let id = d["id"].as_str().unwrap_or("");
+                if online && name == preferred_name && !id.is_empty() {
+                    Some(id.to_string())
+                } else {
+                    None
+                }
+            }) {
+                println!("device_discovery=matched_preferred_name");
+                return Ok(id);
+            }
+        }
+
+        if let Some(id) = list.iter().find_map(|d| {
+            let online = d["online"].as_bool().unwrap_or(true);
+            let id = d["id"].as_str().unwrap_or("");
+            let name = d["name"].as_str().unwrap_or("");
+            if online
+                && !id.is_empty()
+                && !name.is_empty()
+                && !name.eq_ignore_ascii_case("m2-probe")
+                && !name.eq_ignore_ascii_case("Web 控制端")
+            {
+                Some(id.to_string())
+            } else {
+                None
+            }
+        }) {
+            println!("device_discovery=matched_first_online_agent_like");
+            return Ok(id);
+        }
+    }
 }

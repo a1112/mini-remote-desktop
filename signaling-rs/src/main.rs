@@ -218,6 +218,12 @@ async fn handle_message(conn_id: &str, tx: &mpsc::Sender<Message>, text: &str, s
 
     let action = v["action"].as_str().unwrap_or("");
 
+    // Treat any valid message as activity. This prevents active clients from
+    // being swept only because they don't send explicit ping.
+    if action != "register" {
+        touch(conn_id, state).await;
+    }
+
     match action {
         "register" => {
             let kind = v["payload"]["type"].as_str().unwrap_or("unknown").to_string();
@@ -250,7 +256,7 @@ async fn handle_message(conn_id: &str, tx: &mpsc::Sender<Message>, text: &str, s
         "ping" => {
             touch(conn_id, state).await;
             let msg = json!({"type":"device","action":"pong"}).to_string();
-            let _ = tx.send(Message::Text(msg));
+            let _ = tx.try_send(Message::Text(msg));
         }
         "offer" => {
             let target = v["payload"]["targetDeviceId"].as_str().unwrap_or("");
@@ -311,13 +317,18 @@ async fn send_registered(conn_id: &str, tx: &mpsc::Sender<Message>, state: &Shar
         "payload":{"deviceId": conn_id, "deviceList": list}
     })
     .to_string();
-    let _ = tx.send(Message::Text(msg));
+    info!(conn_id = %conn_id, device_count = list.len(), "sending registered message");
+    if let Err(e) = tx.try_send(Message::Text(msg.clone())) {
+        error!(error = %e, "failed to send registered message");
+    } else {
+        info!(msg = %msg, "registered message sent");
+    }
 }
 
 async fn send_device_list(tx: &mpsc::Sender<Message>, state: &SharedState) {
     let list = build_device_list(state).await;
     let msg = json!({"type":"device","action":"deviceList","payload":{"deviceList":list}}).to_string();
-    let _ = tx.send(Message::Text(msg));
+    let _ = tx.try_send(Message::Text(msg));
 }
 
 async fn build_device_list(state: &SharedState) -> Vec<Value> {
@@ -355,7 +366,7 @@ async fn broadcast_device_list(state: &SharedState, exclude_id: Option<&str>) {
     );
 
     for tx in targets {
-        let _ = tx.send(msg.clone());
+        let _ = tx.try_send(msg.clone());
     }
 }
 
@@ -365,7 +376,9 @@ async fn send_to_device(target_id: &str, msg: &str, state: &SharedState) {
         s.devices.get(target_id).map(|d| d.tx.clone())
     };
     if let Some(tx) = tx {
-        let _ = tx.send(Message::Text(msg.to_string()));
+        if let Err(e) = tx.try_send(Message::Text(msg.to_string())) {
+            warn!(error = %e, target_id = %target_id, "failed to send message to device");
+        }
     } else {
         warn!(target_id = %target_id, "device not found");
     }
@@ -405,7 +418,7 @@ async fn on_disconnect(conn_id: &str, state: &SharedState) {
         );
 
         for tx in targets {
-            let _ = tx.send(msg.clone());
+            let _ = tx.try_send(msg.clone());
         }
     }
 }
