@@ -253,7 +253,7 @@ mod mf_backend {
         D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0,
     };
     use windows::Win32::Graphics::Direct3D11::{
-        D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX,
+        D3D11_BIND_SHADER_RESOURCE, D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX,
         D3D11_TEXTURE2D_DESC, ID3D11Device,
         ID3D11DeviceContext, ID3D11Texture2D, D3D11CreateDevice, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
         D3D11_SDK_VERSION,
@@ -300,6 +300,8 @@ mod mf_backend {
         shared_slot_cursor: usize,
         shared_slot_w: u32,
         shared_slot_h: u32,
+        shared_keyed_enabled: bool,
+        shared_keyed_failures: u32,
         output_width: u32,
         output_height: u32,
         frame_index: u64,
@@ -365,6 +367,8 @@ mod mf_backend {
                 shared_slot_cursor: 0,
                 shared_slot_w: 0,
                 shared_slot_h: 0,
+                shared_keyed_enabled: true,
+                shared_keyed_failures: 0,
                 output_width: 0,
                 output_height: 0,
                 frame_index: 0,
@@ -581,9 +585,10 @@ mod mf_backend {
                 .ok()
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
-            if enable_shared_keyed {
+            if enable_shared_keyed && self.shared_keyed_enabled {
                 match self.copy_to_shared_nv12_slot(&tex, subresource, &desc)? {
                     Some(shared_handle) => {
+                        self.shared_keyed_failures = 0;
                         return Ok(Some(DecodedFrame {
                             data: DecodedFrameData::D3d11SharedNv12 { shared_handle },
                             width: self.output_width.max(1),
@@ -594,6 +599,14 @@ mod mf_backend {
                         }));
                     }
                     None => {
+                        self.shared_keyed_failures = self.shared_keyed_failures.saturating_add(1);
+                        if self.shared_keyed_failures >= 8 {
+                            self.shared_keyed_enabled = false;
+                            tracing::warn!(
+                                failures = self.shared_keyed_failures,
+                                "shared-keyed path disabled after repeated sync failures; falling back to renderable NV12"
+                            );
+                        }
                         tracing::debug!("shared-keyed path unavailable for this frame; fallback to renderable NV12");
                     }
                 }
@@ -649,15 +662,8 @@ mod mf_backend {
             let idx = self.render_surface_cursor % self.render_surfaces.len();
             self.render_surface_cursor = self.render_surface_cursor.wrapping_add(1);
             let dst = self.render_surfaces[idx].clone();
-            let region = D3D11_BOX {
-                left: 0,
-                top: 0,
-                front: 0,
-                right: src_desc.Width,
-                bottom: src_desc.Height,
-                back: 1,
-            };
             unsafe {
+                // For NV12 surfaces, copy full subresource to keep Y/UV planes in sync.
                 self.context.CopySubresourceRegion(
                     &dst,
                     0,
@@ -666,7 +672,7 @@ mod mf_backend {
                     0,
                     src_tex,
                     src_subresource,
-                    Some(&region),
+                    None,
                 );
             }
             Ok(dst)
@@ -739,7 +745,7 @@ mod mf_backend {
                 .unwrap_or(1)
                 .max(1);
             let total = self.shared_slots.len();
-            let mut picked: Option<(usize, u64)> = None;
+            let mut picked: Option<usize> = None;
             for offset in 0..total {
                 let idx = (self.shared_slot_cursor + offset) % total;
                 let slot = &mut self.shared_slots[idx];
@@ -749,17 +755,11 @@ mod mf_backend {
                     }
                     match slot.keyed_mutex.AcquireSync(0, timeout_ms) {
                         Ok(()) => {
-                            picked = Some((idx, 0));
+                            picked = Some(idx);
                             break;
                         }
                         Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {
-                            if !slot.primed {
-                                continue;
-                            }
-                            if slot.keyed_mutex.AcquireSync(1, 0).is_ok() {
-                                picked = Some((idx, 1));
-                                break;
-                            }
+                            continue;
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, "decode keyed mutex AcquireSync failed; resetting shared slot pool");
@@ -770,23 +770,16 @@ mod mf_backend {
                     }
                 }
             }
-            let Some((idx, acquired_key)) = picked else {
+            let Some(idx) = picked else {
                 return Ok(None);
             };
             self.shared_slot_cursor = (idx + 1) % total;
             let slot = &mut self.shared_slots[idx];
-            let region = D3D11_BOX {
-                left: 0,
-                top: 0,
-                front: 0,
-                right: src_desc.Width,
-                bottom: src_desc.Height,
-                back: 1,
-            };
             unsafe {
                 if trace_copy {
                     tracing::info!(slot = idx, "shared-keyed decode before CopySubresourceRegion");
                 }
+                // For NV12 surfaces, copy full subresource to keep Y/UV planes in sync.
                 self.context.CopySubresourceRegion(
                     &slot.texture,
                     0,
@@ -795,16 +788,17 @@ mod mf_backend {
                     0,
                     src_tex,
                     src_subresource,
-                    Some(&region),
+                    None,
                 );
+                // Ensure queued copy reaches GPU before handing ownership to render side.
+                self.context.Flush();
                 if trace_copy {
-                    tracing::info!(slot = idx, acquired_key, "shared-keyed decode before ReleaseSync(1)");
+                    tracing::info!(slot = idx, "shared-keyed decode before ReleaseSync(1)");
                 }
                 if let Err(e) = slot.keyed_mutex.ReleaseSync(1) {
                     tracing::warn!(
                         error = %e,
                         slot = idx,
-                        acquired_key,
                         primed = slot.primed,
                         "decode keyed mutex ReleaseSync failed; resetting shared slot pool"
                     );
@@ -817,9 +811,6 @@ mod mf_backend {
                 }
             }
             slot.primed = true;
-            if trace_copy && acquired_key == 1 {
-                tracing::debug!("reclaimed stale shared slot with key=1");
-            }
             Ok(Some(slot.shared_handle))
         }
     }

@@ -117,6 +117,37 @@ pub fn sleep_until(deadline: Instant) {
     }
 }
 
+fn unix_time_us() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|v| v.as_micros().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
+}
+
+fn env_flag(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(default)
+}
+
+fn env_u32(name: &str, default: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(default)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
 fn capture_via_powershell() -> Result<(Vec<u8>, u32, u32)> {
     let temp_path = std::env::temp_dir().join("mini-rust-agent-ps-capture.jpg");
     let path = temp_path
@@ -181,6 +212,13 @@ pub(crate) struct WgcWindowCapturer {
     fixed_hwnd: Option<windows::Win32::Foundation::HWND>,
     active_hwnd: windows::Win32::Foundation::HWND,
     consecutive_timeouts: u32,
+    disable_rebind: bool,
+    rebind_timeout_threshold: u32,
+    rebind_cooldown: Duration,
+    last_rebind_at: Instant,
+    qpc_freq: i64,
+    qpc_base: i64,
+    unix_base_us: u64,
 }
 
 #[cfg(windows)]
@@ -235,6 +273,17 @@ impl WgcWindowCapturer {
         let fixed_hwnd = resolve_wgc_window_hwnd();
         let active_hwnd = select_wgc_target_hwnd(fixed_hwnd)?;
         let (frame_pool, session) = create_wgc_capture_session(&device, active_hwnd)?;
+        let disable_rebind = env_flag("AGENT_WGC_DISABLE_REBIND", false);
+        // Keep legacy behavior by default (rebind immediately on timeout).
+        let rebind_timeout_threshold = env_u32("AGENT_WGC_REBIND_TIMEOUTS", 1).max(1);
+        let rebind_cooldown =
+            Duration::from_millis(env_u64("AGENT_WGC_REBIND_COOLDOWN_MS", 0).clamp(0, 10_000));
+        info!(
+            disable_rebind,
+            rebind_timeout_threshold,
+            rebind_cooldown_ms = rebind_cooldown.as_millis() as u64,
+            "wgc rebind policy configured"
+        );
 
         Ok(Self {
             _device: device,
@@ -247,6 +296,13 @@ impl WgcWindowCapturer {
             fixed_hwnd,
             active_hwnd,
             consecutive_timeouts: 0,
+            disable_rebind,
+            rebind_timeout_threshold,
+            rebind_cooldown,
+            last_rebind_at: Instant::now(),
+            qpc_freq: qpc_frequency(),
+            qpc_base: qpc_counter_now(),
+            unix_base_us: unix_time_us(),
         })
     }
 
@@ -327,14 +383,16 @@ impl WgcWindowCapturer {
             access.GetInterface::<windows::Win32::Graphics::Direct3D11::ID3D11Texture2D>()
         }
         .context("wgc: GetInterface(ID3D11Texture2D) failed")?;
+        let capture_start_us = frame
+            .SystemRelativeTime()
+            .ok()
+            .and_then(|v| self.system_relative_to_unix_us(v.Duration))
+            .unwrap_or_else(unix_time_us);
         Ok(WgcGpuFrame {
             texture,
             width,
             height,
-            capture_start_us: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|v| v.as_micros().min(u64::MAX as u128) as u64)
-                .unwrap_or(0),
+            capture_start_us,
             _frame: frame,
         })
     }
@@ -353,7 +411,18 @@ impl WgcWindowCapturer {
         }
 
         self.consecutive_timeouts = self.consecutive_timeouts.saturating_add(1);
+        if self.disable_rebind
+            || self.consecutive_timeouts < self.rebind_timeout_threshold
+            || self.last_rebind_at.elapsed() < self.rebind_cooldown
+        {
+            return Err(anyhow!(
+                "wgc: timed out waiting for next frame (hwnd={:?}, timeouts={})",
+                self.active_hwnd.0,
+                self.consecutive_timeouts
+            ));
+        }
         self.rebind_capture_session()?;
+        self.last_rebind_at = Instant::now();
 
         let retry_start = Instant::now();
         loop {
@@ -379,6 +448,9 @@ impl WgcWindowCapturer {
             self.session = session;
             self.active_hwnd = next_hwnd;
             self.consecutive_timeouts = 0;
+            self.qpc_freq = qpc_frequency();
+            self.qpc_base = qpc_counter_now();
+            self.unix_base_us = unix_time_us();
             info!(hwnd = ?next_hwnd.0, "wgc capture session rebound");
             return Ok(());
         }
@@ -436,6 +508,21 @@ impl WgcWindowCapturer {
         self.staging_height = height;
         Ok(())
     }
+
+    fn system_relative_to_unix_us(&self, qpc_ticks: i64) -> Option<u64> {
+        if self.qpc_freq <= 0 {
+            return None;
+        }
+        let delta_ticks = qpc_ticks.checked_sub(self.qpc_base)?;
+        let delta_us = (delta_ticks as i128)
+            .checked_mul(1_000_000)?
+            .checked_div(self.qpc_freq as i128)?;
+        let ts = (self.unix_base_us as i128).checked_add(delta_us)?;
+        if ts < 0 {
+            return None;
+        }
+        Some(ts.min(u64::MAX as i128) as u64)
+    }
 }
 
 #[cfg(windows)]
@@ -446,6 +533,7 @@ fn create_wgc_capture_session(
     windows::Graphics::Capture::Direct3D11CaptureFramePool,
     windows::Graphics::Capture::GraphicsCaptureSession,
 )> {
+    use windows::Foundation::TimeSpan;
     use windows::Graphics::Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem};
     use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
     use windows::Graphics::DirectX::DirectXPixelFormat;
@@ -481,10 +569,34 @@ fn create_wgc_capture_session(
         .context("wgc: create capture session failed")?;
     let _ = session.SetIsCursorCaptureEnabled(true);
     let _ = session.SetIsBorderRequired(false);
+    // Target 250Hz frame delivery when supported by current Windows build.
+    match session.SetMinUpdateInterval(TimeSpan { Duration: 40_000 }) {
+        Ok(()) => info!("wgc MinUpdateInterval set to 4ms"),
+        Err(e) => warn!(error = %e, "wgc MinUpdateInterval unavailable on this system"),
+    }
     session
         .StartCapture()
         .context("wgc: start capture failed")?;
     Ok((frame_pool, session))
+}
+
+#[cfg(windows)]
+fn qpc_frequency() -> i64 {
+    use windows::Win32::System::Performance::QueryPerformanceFrequency;
+    let mut freq = 0_i64;
+    if unsafe { QueryPerformanceFrequency(&mut freq) }.is_ok() && freq > 0 {
+        freq
+    } else {
+        0
+    }
+}
+
+#[cfg(windows)]
+fn qpc_counter_now() -> i64 {
+    use windows::Win32::System::Performance::QueryPerformanceCounter;
+    let mut counter = 0_i64;
+    let _ = unsafe { QueryPerformanceCounter(&mut counter) };
+    counter
 }
 
 #[cfg(windows)]
