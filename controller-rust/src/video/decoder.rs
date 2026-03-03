@@ -103,6 +103,7 @@ pub enum DecoderBackend {
     Auto,
     Software,
     D3d11va,
+    MfD3d11,
 }
 
 #[derive(Debug, Clone)]
@@ -130,6 +131,8 @@ pub trait Decoder {
 }
 
 pub enum H264Decoder {
+    #[cfg(all(windows, feature = "mf-decoder", feature = "ffmpeg-software"))]
+    MfWithFfmpegFallback(mf_backend::MfH264Decoder),
     #[cfg(feature = "ffmpeg-software")]
     Ffmpeg(ffmpeg_backend::FfmpegH264Decoder),
     Disabled,
@@ -137,6 +140,26 @@ pub enum H264Decoder {
 
 impl H264Decoder {
     pub fn new(config: H264DecoderConfig) -> Result<Self> {
+        #[cfg(all(windows, feature = "mf-decoder", feature = "ffmpeg-software"))]
+        {
+            let prefer_mf = matches!(config.backend, DecoderBackend::MfD3d11)
+                || std::env::var("MRD_DECODER_TRY_MF")
+                    .ok()
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(matches!(config.backend, DecoderBackend::Auto));
+            if prefer_mf {
+                match mf_backend::MfH264Decoder::new(config.clone()) {
+                    Ok(decoder) => return Ok(Self::MfWithFfmpegFallback(decoder)),
+                    Err(e) => {
+                        if matches!(config.backend, DecoderBackend::MfD3d11) {
+                            return Err(e);
+                        }
+                        tracing::warn!(error = %e, "mf_d3d11 backend unavailable, fallback to ffmpeg backend");
+                    }
+                }
+            }
+        }
+
         #[cfg(feature = "ffmpeg-software")]
         {
             Ok(Self::Ffmpeg(ffmpeg_backend::FfmpegH264Decoder::new(config)?))
@@ -154,6 +177,14 @@ impl H264Decoder {
 impl Decoder for H264Decoder {
     fn decode(&mut self, frame: &VideoFrame) -> Result<Option<DecodedFrame>> {
         match self {
+            #[cfg(all(windows, feature = "mf-decoder", feature = "ffmpeg-software"))]
+            Self::MfWithFfmpegFallback(decoder) => {
+                let mut out = decoder.decode(frame)?;
+                if let Some(decoded) = out.as_mut() {
+                    decoded.capture_start_unix_us = frame.tx_unix_us;
+                }
+                Ok(out)
+            }
             #[cfg(feature = "ffmpeg-software")]
             Self::Ffmpeg(decoder) => {
                 let mut out = decoder.decode(frame)?;
@@ -168,6 +199,8 @@ impl Decoder for H264Decoder {
 
     fn flush(&mut self) -> Result<Option<DecodedFrame>> {
         match self {
+            #[cfg(all(windows, feature = "mf-decoder", feature = "ffmpeg-software"))]
+            Self::MfWithFfmpegFallback(decoder) => decoder.flush(),
             #[cfg(feature = "ffmpeg-software")]
             Self::Ffmpeg(decoder) => decoder.flush(),
             Self::Disabled => Ok(None),
@@ -176,6 +209,8 @@ impl Decoder for H264Decoder {
 
     fn output_size(&self) -> Option<(u32, u32)> {
         match self {
+            #[cfg(all(windows, feature = "mf-decoder", feature = "ffmpeg-software"))]
+            Self::MfWithFfmpegFallback(decoder) => decoder.output_size(),
             #[cfg(feature = "ffmpeg-software")]
             Self::Ffmpeg(decoder) => decoder.output_size(),
             Self::Disabled => None,
@@ -184,9 +219,97 @@ impl Decoder for H264Decoder {
 
     fn backend_name(&self) -> &'static str {
         match self {
+            #[cfg(all(windows, feature = "mf-decoder", feature = "ffmpeg-software"))]
+            Self::MfWithFfmpegFallback(decoder) => decoder.backend_name(),
             #[cfg(feature = "ffmpeg-software")]
             Self::Ffmpeg(decoder) => decoder.backend_name(),
             Self::Disabled => "disabled",
+        }
+    }
+}
+
+#[cfg(all(windows, feature = "mf-decoder", feature = "ffmpeg-software"))]
+mod mf_backend {
+    use super::*;
+    use windows::core::Interface;
+    use windows::Win32::Media::MediaFoundation::{
+        CLSID_MSH264DecoderMFT, IMFTransform, MF_VERSION, MFSTARTUP_LITE, MFShutdown, MFStartup,
+    };
+    use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
+
+    pub struct MfH264Decoder {
+        inner: super::ffmpeg_backend::FfmpegH264Decoder,
+        _com_inited: bool,
+        mf_started: bool,
+    }
+
+    impl Drop for MfH264Decoder {
+        fn drop(&mut self) {
+            if self.mf_started {
+                unsafe {
+                    let _ = MFShutdown();
+                }
+            }
+            if self._com_inited {
+                unsafe {
+                    CoUninitialize();
+                }
+            }
+        }
+    }
+
+    impl MfH264Decoder {
+        pub fn new(config: H264DecoderConfig) -> Result<Self> {
+            let mut com_inited = false;
+            unsafe {
+                if CoInitializeEx(None, COINIT_MULTITHREADED).is_ok() {
+                    com_inited = true;
+                }
+                MFStartup(MF_VERSION, MFSTARTUP_LITE).context("MFStartup failed")?;
+            }
+
+            let h264_mft: IMFTransform = unsafe {
+                CoCreateInstance(&CLSID_MSH264DecoderMFT, None, CLSCTX_INPROC_SERVER)
+                    .context("CoCreateInstance(MSH264DecoderMFT) failed")?
+            };
+            let _ = h264_mft.cast::<IMFTransform>().context("invalid IMFTransform from CMSH264DecoderMFT")?;
+
+            let enable_experimental = std::env::var("MRD_MF_DECODE_EXPERIMENT")
+                .ok()
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if !enable_experimental {
+                tracing::warn!(
+                    "mf_d3d11 decoder route is integrated as probe stage; using ffmpeg decode core. set MRD_MF_DECODE_EXPERIMENT=1 to force MF-only (currently unsupported)"
+                );
+            } else {
+                anyhow::bail!("MRD_MF_DECODE_EXPERIMENT=1 requested, but full MF decode loop is not implemented yet");
+            }
+
+            let inner = super::ffmpeg_backend::FfmpegH264Decoder::new(config)?;
+            Ok(Self {
+                inner,
+                _com_inited: com_inited,
+                mf_started: true,
+            })
+        }
+    }
+
+    impl Decoder for MfH264Decoder {
+        fn decode(&mut self, frame: &VideoFrame) -> Result<Option<DecodedFrame>> {
+            self.inner.decode(frame)
+        }
+
+        fn flush(&mut self) -> Result<Option<DecodedFrame>> {
+            self.inner.flush()
+        }
+
+        fn output_size(&self) -> Option<(u32, u32)> {
+            self.inner.output_size()
+        }
+
+        fn backend_name(&self) -> &'static str {
+            "mf_d3d11_probe+ffmpeg"
         }
     }
 }

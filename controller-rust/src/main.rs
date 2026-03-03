@@ -84,6 +84,7 @@ fn load_config(path: &PathBuf) -> Result<ControllerConfig> {
     let decoder_backend = match decoder_mode_str.as_str() {
         "software" | "sw" => DecoderBackend::Software,
         "d3d11va" | "hardware" | "hw" => DecoderBackend::D3d11va,
+        "mf" | "mf_d3d11" | "mediafoundation" => DecoderBackend::MfD3d11,
         _ => DecoderBackend::Auto,
     };
     let num_threads = json["video"]["num_decode_threads"]
