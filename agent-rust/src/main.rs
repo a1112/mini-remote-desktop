@@ -123,6 +123,8 @@ type WsWrite = futures_util::stream::SplitSink<
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             std::env::var("RUST_LOG")
@@ -157,12 +159,14 @@ async fn main() -> Result<()> {
     let (write, mut read) = ws.split();
     let write = Arc::new(Mutex::new(write));
     let session = Arc::new(Mutex::new(SessionState::default()));
+    let mut ws_read_failed = false;
 
     while let Some(msg) = read.next().await {
         let msg = match msg {
             Ok(v) => v,
             Err(e) => {
                 error!(error = %e, "websocket read error");
+                ws_read_failed = true;
                 break;
             }
         };
@@ -326,6 +330,18 @@ async fn main() -> Result<()> {
         }
     }
 
+    let had_active_session = {
+        let s = session.lock().await;
+        s.pc.is_some()
+    };
+    if had_active_session {
+        warn!(
+            ws_read_failed = ws_read_failed,
+            "signaling stream ended while session active, entering grace period"
+        );
+        tokio::time::sleep(Duration::from_secs(20)).await;
+    }
+
     let old_pc = {
         let mut s = session.lock().await;
         s.switcher.stop_current();
@@ -353,6 +369,7 @@ async fn create_peer_connection(
         SrtpProtectionProfile::Srtp_Aes128_Cm_Hmac_Sha1_80,
         SrtpProtectionProfile::Srtp_Aes128_Cm_Hmac_Sha1_32,
     ]);
+    se.set_include_loopback_candidate(true);
     let api = APIBuilder::new()
         .with_media_engine(m)
         .with_setting_engine(se)
@@ -498,7 +515,14 @@ async fn attach_video_track_with_policy(
         ],
     };
 
-    let use_manual_packetizer = effective_cfg.rtp_use_manual_packetizer;
+    let use_manual_packetizer = if selected_transport == SessionTransport::WebRtc {
+        true
+    } else {
+        effective_cfg.rtp_use_manual_packetizer
+    };
+    if selected_transport == SessionTransport::WebRtc && !effective_cfg.rtp_use_manual_packetizer {
+        info!("forcing manual RTP packetizer for WebRTC media compatibility");
+    }
     let sample_track = if use_manual_packetizer {
         None
     } else {
@@ -680,6 +704,15 @@ async fn attach_video_track_with_policy(
                                 stats_encode
                                     .native_direct_register_failures
                                     .store(path_stats.direct_register_failures, Ordering::Relaxed);
+                                stats_encode
+                                    .native_acquire_ok
+                                    .store(path_stats.acquire_ok, Ordering::Relaxed);
+                                stats_encode
+                                    .native_acquire_timeout
+                                    .store(path_stats.acquire_timeout, Ordering::Relaxed);
+                                stats_encode
+                                    .native_acquire_errors
+                                    .store(path_stats.acquire_errors, Ordering::Relaxed);
                                 let encoded = pack_capture_ts_au(
                                     v.bytes,
                                     v.capture_start_us,
@@ -909,6 +942,15 @@ async fn attach_video_track_with_policy(
                                         path_stats.direct_register_failures,
                                         Ordering::Relaxed,
                                     );
+                                    stats_encode
+                                        .native_acquire_ok
+                                        .store(path_stats.acquire_ok, Ordering::Relaxed);
+                                    stats_encode
+                                        .native_acquire_timeout
+                                        .store(path_stats.acquire_timeout, Ordering::Relaxed);
+                                    stats_encode
+                                        .native_acquire_errors
+                                        .store(path_stats.acquire_errors, Ordering::Relaxed);
                                     let encoded = pack_capture_ts_au(
                                         v.bytes,
                                         if capture_start_us == 0 {
@@ -1320,6 +1362,9 @@ async fn spawn_send_loop_rtp(
     let mut next_due = Instant::now();
     let mut next_recover_tick = Instant::now();
     let mut last_encoded: Option<Arc<[u8]>> = None;
+    let mut last_sps: Option<Vec<u8>> = None;
+    let mut last_pps: Option<Vec<u8>> = None;
+    let mut consecutive_send_errors: u32 = 0;
     while session_running.load(Ordering::SeqCst) {
         if enable_network_adapt && Instant::now() >= next_recover_tick {
             if let Some((fps_v, br_v)) = adapt.tick_recover() {
@@ -1344,6 +1389,7 @@ async fn spawn_send_loop_rtp(
 
         let mut got_fresh = false;
         while let Ok(encoded) = encoded_rx.try_recv() {
+            update_h264_param_cache(encoded.as_ref(), &mut last_sps, &mut last_pps);
             last_encoded = Some(encoded);
             got_fresh = true;
         }
@@ -1352,12 +1398,14 @@ async fn spawn_send_loop_rtp(
             && let Ok(Some(v)) =
                 tokio::time::timeout(Duration::from_millis(2), encoded_rx.recv()).await
         {
+            update_h264_param_cache(v.as_ref(), &mut last_sps, &mut last_pps);
             last_encoded = Some(v);
             got_fresh = true;
         }
         if last_encoded.is_none() {
             match encoded_rx.recv().await {
                 Some(v) => {
+                    update_h264_param_cache(v.as_ref(), &mut last_sps, &mut last_pps);
                     last_encoded = Some(v);
                     got_fresh = true;
                 }
@@ -1378,10 +1426,30 @@ async fn spawn_send_loop_rtp(
         };
         let frame_gap = Duration::from_millis((1000.0 / send_fps as f64).max(1.0) as u64);
         next_due = advance_send_deadline(next_due, frame_gap, Instant::now());
-        if let Err(e) = sender.send_access_unit(encoded.as_ref()).await {
-            error!(error = %e, "RTP write failed");
-            break;
+        let au_for_send = if let Some(patched) =
+            patch_h264_au_with_cached_params(encoded.as_ref(), &last_sps, &last_pps)
+        {
+            Arc::<[u8]>::from(patched)
+        } else {
+            encoded.clone()
+        };
+        if let Err(e) = sender.send_access_unit(au_for_send.as_ref()).await {
+            consecutive_send_errors = consecutive_send_errors.saturating_add(1);
+            warn!(
+                error = %e,
+                consecutive_send_errors,
+                "RTP write failed, retrying"
+            );
+            // During ICE/DTLS startup, writes can transiently fail.
+            // Keep session alive and retry instead of tearing media loop down.
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            if consecutive_send_errors >= 400 {
+                error!("too many consecutive RTP send failures, stopping RTP loop");
+                break;
+            }
+            continue;
         }
+        consecutive_send_errors = 0;
         stats.rtp_au_sent.fetch_add(1, Ordering::Relaxed);
         stats.sent_au_total.fetch_add(1, Ordering::Relaxed);
         if got_fresh {

@@ -1,5 +1,5 @@
 use super::RendererConfig;
-use crate::video::decoder::DecodedFrame;
+use crate::video::decoder::{DecodedFrame, DecodedFrameData};
 use anyhow::{Context, Result};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -65,31 +65,50 @@ impl D3D11Renderer {
         config: RendererConfig,
         video_frames_received: Arc<AtomicU64>,
     ) -> Result<Self> {
-        let window = Self::create_window(config.window_width, config.window_height)?;
         let frame_count = Arc::new(AtomicU64::new(0));
         let running = Arc::new(AtomicBool::new(true));
         let shared_frame = Arc::new(Mutex::new(SharedFrame::default()));
+        let (window_tx, window_rx) = std::sync::mpsc::sync_channel::<std::result::Result<isize, String>>(1);
 
-        let window_handle: isize = window.0 as isize;
         let frame_count_clone = frame_count.clone();
         let video_frames_clone = video_frames_received.clone();
         let running_clone = running.clone();
         let shared_frame_clone = shared_frame.clone();
+        let config_clone = config.clone();
         thread::spawn(move || {
             unsafe {
                 let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
             }
+
+            let window = match Self::create_window(config_clone.window_width, config_clone.window_height) {
+                Ok(w) => {
+                    let _ = window_tx.send(Ok(w.0 as isize));
+                    w
+                }
+                Err(e) => {
+                    let _ = window_tx.send(Err(e.to_string()));
+                    running_clone.store(false, Ordering::Relaxed);
+                    return;
+                }
+            };
+
             if let Err(e) = Self::render_loop(
-                HWND(window_handle as *mut _),
+                window,
                 frame_count_clone,
                 video_frames_clone,
                 running_clone,
                 shared_frame_clone,
-                config.vsync,
+                config_clone.vsync,
             ) {
                 error!(error = %e, "render loop failed");
             }
         });
+
+        let window = match window_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(raw)) => HWND(raw as *mut _),
+            Ok(Err(e)) => return Err(anyhow::anyhow!("create window on render thread failed: {e}")),
+            Err(e) => return Err(anyhow::anyhow!("wait render thread window handle failed: {e}")),
+        };
 
         info!("D3D11 video renderer initialized");
         Ok(Self {
@@ -165,8 +184,18 @@ impl D3D11Renderer {
             };
 
             if let Some(frame) = maybe_frame {
-                d3d.upload_nv12(&frame)?;
-                d3d.draw_frame()?;
+                match &frame.data {
+                    DecodedFrameData::CpuNv12(_) => {
+                        d3d.upload_nv12(&frame)?;
+                        d3d.draw_frame()?;
+                    }
+                    DecodedFrameData::D3d11Nv12 {
+                        texture,
+                        subresource,
+                    } => {
+                        d3d.draw_external_nv12(texture, *subresource, frame.width, frame.height)?;
+                    }
+                }
                 if frame.capture_start_unix_us != 0 {
                     if let Ok(elapsed) =
                         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
@@ -312,7 +341,7 @@ impl Drop for D3D11Renderer {
         thread::sleep(Duration::from_millis(50));
         unsafe {
             if !self.window.is_invalid() {
-                let _ = DestroyWindow(self.window);
+                let _ = PostMessageW(Some(self.window), WM_CLOSE, WPARAM(0), LPARAM(0));
             }
         }
     }
@@ -552,8 +581,12 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
 
     fn upload_nv12(&mut self, frame: &DecodedFrame) -> Result<()> {
         self.ensure_textures(frame.width, frame.height)?;
-        let y = frame.y_plane();
-        let uv = frame.uv_plane();
+        let y = frame
+            .y_plane()
+            .context("CPU NV12 frame expected for upload path")?;
+        let uv = frame
+            .uv_plane()
+            .context("CPU NV12 frame expected for upload path")?;
         let width = frame.width as usize;
         let height = frame.height as usize;
 
@@ -586,7 +619,84 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
         Ok(())
     }
 
+    fn draw_external_nv12(
+        &mut self,
+        texture: &ID3D11Texture2D,
+        subresource: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<()> {
+        let (y_srv, uv_srv) = self.create_external_nv12_srvs(texture, subresource)?;
+        self.draw_with_srvs(width, height, &y_srv, &uv_srv)
+    }
+
+    fn create_external_nv12_srvs(
+        &self,
+        texture: &ID3D11Texture2D,
+        subresource: u32,
+    ) -> Result<(ID3D11ShaderResourceView, ID3D11ShaderResourceView)> {
+        unsafe {
+            let device3: ID3D11Device3 = self
+                .device
+                .cast()
+                .context("ID3D11Device3 required for NV12 plane SRV")?;
+
+            let mut y_desc = D3D11_SHADER_RESOURCE_VIEW_DESC1::default();
+            y_desc.Format = DXGI_FORMAT_R8_UNORM;
+            y_desc.ViewDimension = windows::Win32::Graphics::Direct3D::D3D_SRV_DIMENSION_TEXTURE2DARRAY;
+            y_desc.Anonymous.Texture2DArray = D3D11_TEX2D_ARRAY_SRV1 {
+                MostDetailedMip: 0,
+                MipLevels: 1,
+                FirstArraySlice: subresource,
+                ArraySize: 1,
+                PlaneSlice: 0,
+            };
+
+            let mut uv_desc = D3D11_SHADER_RESOURCE_VIEW_DESC1::default();
+            uv_desc.Format = DXGI_FORMAT_R8G8_UNORM;
+            uv_desc.ViewDimension = windows::Win32::Graphics::Direct3D::D3D_SRV_DIMENSION_TEXTURE2DARRAY;
+            uv_desc.Anonymous.Texture2DArray = D3D11_TEX2D_ARRAY_SRV1 {
+                MostDetailedMip: 0,
+                MipLevels: 1,
+                FirstArraySlice: subresource,
+                ArraySize: 1,
+                PlaneSlice: 1,
+            };
+
+            let mut y_srv1 = None;
+            device3
+                .CreateShaderResourceView1(texture, Some(&y_desc), Some(&mut y_srv1))
+                .context("CreateShaderResourceView1(Y) failed")?;
+            let mut uv_srv1 = None;
+            device3
+                .CreateShaderResourceView1(texture, Some(&uv_desc), Some(&mut uv_srv1))
+                .context("CreateShaderResourceView1(UV) failed")?;
+
+            let y_srv = y_srv1
+                .context("missing Y SRV1")?
+                .cast()
+                .context("cast Y SRV1->SRV failed")?;
+            let uv_srv = uv_srv1
+                .context("missing UV SRV1")?
+                .cast()
+                .context("cast UV SRV1->SRV failed")?;
+            Ok((y_srv, uv_srv))
+        }
+    }
+
     fn draw_frame(&mut self) -> Result<()> {
+        let y_srv = self.y_srv.clone().context("missing y srv")?;
+        let uv_srv = self.uv_srv.clone().context("missing uv srv")?;
+        self.draw_with_srvs(self.frame_width, self.frame_height, &y_srv, &uv_srv)
+    }
+
+    fn draw_with_srvs(
+        &mut self,
+        width: u32,
+        height: u32,
+        y_srv: &ID3D11ShaderResourceView,
+        uv_srv: &ID3D11ShaderResourceView,
+    ) -> Result<()> {
         unsafe {
             let clear = [0.05f32, 0.05f32, 0.08f32, 1.0f32];
             self.context.ClearRenderTargetView(&self.rtv, &clear);
@@ -595,8 +705,8 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
             let viewport = D3D11_VIEWPORT {
                 TopLeftX: 0.0,
                 TopLeftY: 0.0,
-                Width: self.frame_width.max(1) as f32,
-                Height: self.frame_height.max(1) as f32,
+                Width: width.max(1) as f32,
+                Height: height.max(1) as f32,
                 MinDepth: 0.0,
                 MaxDepth: 1.0,
             };
@@ -607,9 +717,8 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
             self.context.VSSetShader(&self.vs, None);
             self.context.PSSetShader(&self.ps, None);
 
-            let y_srv = self.y_srv.clone().context("missing y srv")?;
-            let uv_srv = self.uv_srv.clone().context("missing uv srv")?;
-            self.context.PSSetShaderResources(0, Some(&[Some(y_srv), Some(uv_srv)]));
+            self.context
+                .PSSetShaderResources(0, Some(&[Some(y_srv.clone()), Some(uv_srv.clone())]));
             self.context.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
             self.context.Draw(3, 0);
 
