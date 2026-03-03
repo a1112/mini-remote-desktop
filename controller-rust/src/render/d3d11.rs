@@ -1,6 +1,7 @@
 use super::RendererConfig;
 use crate::video::decoder::{DecodedFrame, DecodedFrameData};
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -320,16 +321,28 @@ impl D3D11Renderer {
         let mut last_frame_sequence = 0u64;
         let mut present_samples_ms: std::collections::VecDeque<f64> =
             std::collections::VecDeque::with_capacity(1024);
+        let mut shared_acquire_samples_ms: std::collections::VecDeque<f64> =
+            std::collections::VecDeque::with_capacity(1024);
+        let mut shared_copy_samples_ms: std::collections::VecDeque<f64> =
+            std::collections::VecDeque::with_capacity(1024);
+        let mut shared_release_samples_ms: std::collections::VecDeque<f64> =
+            std::collections::VecDeque::with_capacity(1024);
+        let mut shared_draw_samples_ms: std::collections::VecDeque<f64> =
+            std::collections::VecDeque::with_capacity(1024);
         let mut last_present_stats = Instant::now();
+        let mut last_shared_draw_stats = Instant::now();
         let mut ui_last_update = Instant::now();
         let mut last_rate_sample = Instant::now();
         let mut last_rendered_count = 0u64;
         let mut last_received_count = 0u64;
+        let mut last_stale_dropped_count = 0u64;
         let mut cpu_upload_frames = 0u64;
         let mut gpu_external_frames = 0u64;
+        let mut stale_dropped_frames = 0u64;
         let mut metrics = OverlayRenderMetrics::default();
 
         let mut d3d = D3DContext::new(window, &config)?;
+        let idle_wait_timeout_ms = idle_wait_timeout_ms(config.low_latency_mode);
 
         while running.load(Ordering::Relaxed) {
             unsafe {
@@ -347,9 +360,20 @@ impl D3D11Renderer {
             }
 
             let maybe_frame = {
-                let mut guard = match shared_frame.lock() {
+                let mut guard = match shared_frame.try_lock() {
                     Ok(g) => g,
-                    Err(_) => {
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        unsafe {
+                            let _ = MsgWaitForMultipleObjectsEx(
+                                None,
+                                idle_wait_timeout_ms,
+                                QS_ALLINPUT,
+                                MWMO_INPUTAVAILABLE,
+                            );
+                        }
+                        continue;
+                    }
+                    Err(std::sync::TryLockError::Poisoned(_)) => {
                         warn!("frame mutex poisoned");
                         break;
                     }
@@ -357,6 +381,10 @@ impl D3D11Renderer {
                 if guard.sequence == last_frame_sequence {
                     None
                 } else {
+                    if last_frame_sequence != 0 {
+                        let gap = guard.sequence.saturating_sub(last_frame_sequence.saturating_add(1));
+                        stale_dropped_frames = stale_dropped_frames.saturating_add(gap);
+                    }
                     last_frame_sequence = guard.sequence;
                     guard.latest.take()
                 }
@@ -369,12 +397,35 @@ impl D3D11Renderer {
                         d3d.upload_nv12(&frame)?;
                         d3d.draw_frame()?;
                     }
-                    DecodedFrameData::D3d11Nv12 {
-                        texture,
-                        subresource,
-                    } => {
+                    DecodedFrameData::D3d11Nv12 { texture, subresource } => {
                         gpu_external_frames = gpu_external_frames.saturating_add(1);
-                        d3d.draw_external_nv12(texture, *subresource, frame.width, frame.height)?;
+                        if let Err(e) =
+                            d3d.draw_external_nv12(texture, *subresource, frame.width, frame.height)
+                        {
+                            warn!(error = %e, "draw_external_nv12 failed; dropping frame");
+                            continue;
+                        }
+                    }
+                    DecodedFrameData::D3d11SharedNv12 { shared_handle } => {
+                        gpu_external_frames = gpu_external_frames.saturating_add(1);
+                        match d3d.draw_shared_nv12(*shared_handle, frame.width, frame.height) {
+                            Ok(timing) => {
+                                if shared_acquire_samples_ms.len() >= 1024 {
+                                    shared_acquire_samples_ms.pop_front();
+                                    shared_copy_samples_ms.pop_front();
+                                    shared_release_samples_ms.pop_front();
+                                    shared_draw_samples_ms.pop_front();
+                                }
+                                shared_acquire_samples_ms.push_back(timing.acquire_ms);
+                                shared_copy_samples_ms.push_back(timing.copy_ms);
+                                shared_release_samples_ms.push_back(timing.release_ms);
+                                shared_draw_samples_ms.push_back(timing.draw_ms);
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "draw_shared_nv12 failed; dropping frame");
+                                continue;
+                            }
+                        }
                     }
                 }
                 if frame.capture_start_unix_us != 0 {
@@ -394,7 +445,12 @@ impl D3D11Renderer {
                 frame_count.fetch_add(1, Ordering::Relaxed);
             } else {
                 unsafe {
-                    let _ = MsgWaitForMultipleObjectsEx(None, 5, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+                    let _ = MsgWaitForMultipleObjectsEx(
+                        None,
+                        idle_wait_timeout_ms,
+                        QS_ALLINPUT,
+                        MWMO_INPUTAVAILABLE,
+                    );
                 }
                 continue;
             }
@@ -422,6 +478,35 @@ impl D3D11Renderer {
                 );
                 last_present_stats = Instant::now();
             }
+            if last_shared_draw_stats.elapsed() >= Duration::from_secs(2)
+                && !shared_acquire_samples_ms.is_empty()
+            {
+                let summarize = |samples: &std::collections::VecDeque<f64>| -> (f64, f64) {
+                    let mut sorted: Vec<f64> = samples.iter().copied().collect();
+                    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    let p95_idx = (((sorted.len() as f64) * 0.95).floor() as usize)
+                        .min(sorted.len().saturating_sub(1));
+                    let avg = sorted.iter().sum::<f64>() / sorted.len() as f64;
+                    (avg, sorted[p95_idx])
+                };
+                let (acq_avg, acq_p95) = summarize(&shared_acquire_samples_ms);
+                let (copy_avg, copy_p95) = summarize(&shared_copy_samples_ms);
+                let (rel_avg, rel_p95) = summarize(&shared_release_samples_ms);
+                let (draw_avg, draw_p95) = summarize(&shared_draw_samples_ms);
+                info!(
+                    acquire_avg_ms = format!("{:.3}", acq_avg),
+                    acquire_p95_ms = format!("{:.3}", acq_p95),
+                    copy_avg_ms = format!("{:.3}", copy_avg),
+                    copy_p95_ms = format!("{:.3}", copy_p95),
+                    release_avg_ms = format!("{:.3}", rel_avg),
+                    release_p95_ms = format!("{:.3}", rel_p95),
+                    draw_avg_ms = format!("{:.3}", draw_avg),
+                    draw_p95_ms = format!("{:.3}", draw_p95),
+                    samples = shared_acquire_samples_ms.len(),
+                    "[SHARED-DRAW-STATS]"
+                );
+                last_shared_draw_stats = Instant::now();
+            }
 
             let rendered = frame_count.load(Ordering::Relaxed);
             let recv = video_frames_received.load(Ordering::Relaxed);
@@ -438,6 +523,8 @@ impl D3D11Renderer {
                     rendered_fps = format!("{:.2}", render_fps),
                     received_frames = recv,
                     received_fps = format!("{:.2}", recv_fps),
+                    stale_dropped_total = stale_dropped_frames,
+                    stale_dropped_per_sec = stale_dropped_frames.saturating_sub(last_stale_dropped_count),
                     gpu_external_frames,
                     cpu_upload_frames,
                     gpu_zero_copy_ratio = format!(
@@ -451,6 +538,7 @@ impl D3D11Renderer {
                 last_rate_sample = Instant::now();
                 last_rendered_count = rendered;
                 last_received_count = recv;
+                last_stale_dropped_count = stale_dropped_frames;
             }
             if ui_last_update.elapsed() >= Duration::from_millis(250) {
                 let shared = overlay_stats.lock().map(|v| v.clone()).unwrap_or_default();
@@ -1111,11 +1199,37 @@ struct D3DContext {
     uv_tex: Option<ID3D11Texture2D>,
     y_srv: Option<ID3D11ShaderResourceView>,
     uv_srv: Option<ID3D11ShaderResourceView>,
+    external_nv12_srv_cache:
+        HashMap<(usize, u32), (ID3D11ShaderResourceView, ID3D11ShaderResourceView)>,
+    shared_nv12_cache: HashMap<isize, SharedNv12View>,
+    shared_copy_tex: Option<ID3D11Texture2D>,
+    shared_copy_y_srv: Option<ID3D11ShaderResourceView>,
+    shared_copy_uv_srv: Option<ID3D11ShaderResourceView>,
+    shared_copy_w: u32,
+    shared_copy_h: u32,
     frame_width: u32,
     frame_height: u32,
     vsync: bool,
     allow_tearing: bool,
     low_latency_mode: bool,
+    present_min_interval: Option<Duration>,
+    last_present_at: Option<Instant>,
+    present_spin_us: u64,
+}
+
+struct SharedNv12View {
+    texture: ID3D11Texture2D,
+    keyed_mutex: IDXGIKeyedMutex,
+    y_srv: ID3D11ShaderResourceView,
+    uv_srv: ID3D11ShaderResourceView,
+}
+
+#[derive(Default)]
+struct SharedDrawTiming {
+    acquire_ms: f64,
+    copy_ms: f64,
+    draw_ms: f64,
+    release_ms: f64,
 }
 
 impl D3DContext {
@@ -1328,11 +1442,28 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
                 uv_tex: None,
                 y_srv: None,
                 uv_srv: None,
+                external_nv12_srv_cache: HashMap::new(),
+                shared_nv12_cache: HashMap::new(),
+                shared_copy_tex: None,
+                shared_copy_y_srv: None,
+                shared_copy_uv_srv: None,
+                shared_copy_w: 0,
+                shared_copy_h: 0,
                 frame_width: 0,
                 frame_height: 0,
                 vsync: config.vsync,
                 allow_tearing,
                 low_latency_mode: config.low_latency_mode,
+                present_min_interval: std::env::var("MRD_PRESENT_TARGET_FPS")
+                    .ok()
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .filter(|fps| *fps > 0.0)
+                    .map(|fps| Duration::from_secs_f64((1.0 / fps).max(0.000_5))),
+                last_present_at: None,
+                present_spin_us: std::env::var("MRD_PRESENT_SPIN_US")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(200),
             })
         }
     }
@@ -1452,8 +1583,149 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
         width: u32,
         height: u32,
     ) -> Result<()> {
-        let (y_srv, uv_srv) = self.create_external_nv12_srvs(texture, subresource)?;
+        let (y_srv, uv_srv) = self.external_nv12_srvs(texture, subresource)?;
         self.draw_with_srvs(width, height, &y_srv, &uv_srv)
+    }
+
+    fn draw_shared_nv12(
+        &mut self,
+        shared_handle: isize,
+        width: u32,
+        height: u32,
+    ) -> Result<SharedDrawTiming> {
+        static SHARED_DRAW_TRACE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let timeout_ms = std::env::var("MRD_D3D11_KEYED_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0);
+        let trace_draw = std::env::var("MRD_SHARED_KEYED_TRACE")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+            && SHARED_DRAW_TRACE.fetch_add(1, Ordering::Relaxed) < 32;
+        let (source_tex, keyed_mutex) = {
+            let view = self.ensure_shared_nv12_view(shared_handle)?;
+            (view.texture.clone(), view.keyed_mutex.clone())
+        };
+        let mut timing = SharedDrawTiming::default();
+        let t0 = Instant::now();
+        unsafe {
+            if trace_draw {
+                info!("shared-keyed render before AcquireSync(1)");
+            }
+            if let Err(e) = keyed_mutex.AcquireSync(1, timeout_ms) {
+                if e.code() == DXGI_ERROR_WAIT_TIMEOUT {
+                    anyhow::bail!("shared keyed mutex AcquireSync timeout");
+                }
+                return Err(anyhow::anyhow!("shared keyed mutex AcquireSync failed: {e}"));
+            }
+            if trace_draw {
+                info!("shared-keyed render acquired");
+            }
+        }
+        timing.acquire_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        let t1 = Instant::now();
+        self.ensure_shared_copy_texture(width, height)?;
+        let copy_tex = self
+            .shared_copy_tex
+            .as_ref()
+            .context("missing shared copy texture")?;
+        unsafe {
+            self.context.CopyResource(copy_tex, &source_tex);
+        }
+        timing.copy_ms = t1.elapsed().as_secs_f64() * 1000.0;
+
+        let t2 = Instant::now();
+        unsafe {
+            if trace_draw {
+                info!("shared-keyed render before ReleaseSync(0)");
+            }
+            keyed_mutex
+                .ReleaseSync(0)
+                .context("shared keyed mutex ReleaseSync failed")?;
+            if trace_draw {
+                info!("shared-keyed render released");
+            }
+        }
+        timing.release_ms = t2.elapsed().as_secs_f64() * 1000.0;
+
+        let y_srv = self
+            .shared_copy_y_srv
+            .as_ref()
+            .context("missing shared copy y srv")?
+            .clone();
+        let uv_srv = self
+            .shared_copy_uv_srv
+            .as_ref()
+            .context("missing shared copy uv srv")?
+            .clone();
+        let t3 = Instant::now();
+        self.draw_with_srvs(width, height, &y_srv, &uv_srv)?;
+        timing.draw_ms = t3.elapsed().as_secs_f64() * 1000.0;
+        Ok(timing)
+    }
+
+    fn ensure_shared_copy_texture(&mut self, width: u32, height: u32) -> Result<()> {
+        if self.shared_copy_tex.is_some() && self.shared_copy_w == width && self.shared_copy_h == height {
+            return Ok(());
+        }
+        unsafe {
+            self.shared_copy_w = width;
+            self.shared_copy_h = height;
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: width,
+                Height: height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_NV12,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+            };
+            let mut tex = None;
+            self.device
+                .CreateTexture2D(&desc, None, Some(&mut tex))
+                .context("CreateTexture2D(shared copy) failed")?;
+            let tex = tex.context("missing shared copy texture")?;
+            let (y_srv, uv_srv) = self.create_external_nv12_srvs(&tex, 0)?;
+            self.shared_copy_tex = Some(tex);
+            self.shared_copy_y_srv = Some(y_srv);
+            self.shared_copy_uv_srv = Some(uv_srv);
+        }
+        Ok(())
+    }
+
+    fn ensure_shared_nv12_view(&mut self, shared_handle: isize) -> Result<&SharedNv12View> {
+        if !self.shared_nv12_cache.contains_key(&shared_handle) {
+            let texture = unsafe { self.open_shared_texture(shared_handle)? };
+            let keyed_mutex: IDXGIKeyedMutex = texture
+                .cast()
+                .context("cast shared texture to IDXGIKeyedMutex failed")?;
+            let (y_srv, uv_srv) = self.create_external_nv12_srvs(&texture, 0)?;
+            self.shared_nv12_cache.insert(
+                shared_handle,
+                SharedNv12View {
+                    texture,
+                    keyed_mutex,
+                    y_srv,
+                    uv_srv,
+                },
+            );
+        }
+        self.shared_nv12_cache
+            .get(&shared_handle)
+            .context("shared nv12 view cache miss")
+    }
+
+    unsafe fn open_shared_texture(&self, shared_handle: isize) -> Result<ID3D11Texture2D> {
+        let mut texture: Option<ID3D11Texture2D> = None;
+        self.device
+            .OpenSharedResource(HANDLE(shared_handle as *mut c_void), &mut texture)
+            .context("OpenSharedResource(ID3D11Texture2D) failed")?;
+        texture.context("OpenSharedResource returned null texture")
     }
 
     fn create_external_nv12_srvs(
@@ -1462,41 +1734,95 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
         subresource: u32,
     ) -> Result<(ID3D11ShaderResourceView, ID3D11ShaderResourceView)> {
         unsafe {
+            let mut tex_desc = D3D11_TEXTURE2D_DESC::default();
+            texture.GetDesc(&mut tex_desc);
+            if tex_desc.Format != DXGI_FORMAT_NV12 {
+                anyhow::bail!(
+                    "external texture format is {:?}, expected NV12 (w={}, h={}, mips={}, array={})",
+                    tex_desc.Format,
+                    tex_desc.Width,
+                    tex_desc.Height,
+                    tex_desc.MipLevels,
+                    tex_desc.ArraySize
+                );
+            }
+
             let device3: ID3D11Device3 = self
                 .device
                 .cast()
                 .context("ID3D11Device3 required for NV12 plane SRV")?;
 
+            let mip_levels = tex_desc.MipLevels.max(1);
+            let mut array_slice = subresource / mip_levels;
+            let mip_slice = subresource % mip_levels;
+            if array_slice >= tex_desc.ArraySize.max(1) {
+                warn!(
+                    subresource,
+                    mip_levels,
+                    array_size = tex_desc.ArraySize,
+                    "external subresource out of range; clamping to 0"
+                );
+                array_slice = 0;
+            }
+
             let mut y_desc = D3D11_SHADER_RESOURCE_VIEW_DESC1::default();
             y_desc.Format = DXGI_FORMAT_R8_UNORM;
-            y_desc.ViewDimension = windows::Win32::Graphics::Direct3D::D3D_SRV_DIMENSION_TEXTURE2DARRAY;
-            y_desc.Anonymous.Texture2DArray = D3D11_TEX2D_ARRAY_SRV1 {
-                MostDetailedMip: 0,
-                MipLevels: 1,
-                FirstArraySlice: subresource,
-                ArraySize: 1,
-                PlaneSlice: 0,
-            };
-
             let mut uv_desc = D3D11_SHADER_RESOURCE_VIEW_DESC1::default();
             uv_desc.Format = DXGI_FORMAT_R8G8_UNORM;
-            uv_desc.ViewDimension = windows::Win32::Graphics::Direct3D::D3D_SRV_DIMENSION_TEXTURE2DARRAY;
-            uv_desc.Anonymous.Texture2DArray = D3D11_TEX2D_ARRAY_SRV1 {
-                MostDetailedMip: 0,
-                MipLevels: 1,
-                FirstArraySlice: subresource,
-                ArraySize: 1,
-                PlaneSlice: 1,
-            };
+            if tex_desc.ArraySize <= 1 {
+                y_desc.ViewDimension =
+                    windows::Win32::Graphics::Direct3D::D3D_SRV_DIMENSION_TEXTURE2D;
+                y_desc.Anonymous.Texture2D = D3D11_TEX2D_SRV1 {
+                    MostDetailedMip: mip_slice,
+                    MipLevels: 1,
+                    PlaneSlice: 0,
+                };
+                uv_desc.ViewDimension =
+                    windows::Win32::Graphics::Direct3D::D3D_SRV_DIMENSION_TEXTURE2D;
+                uv_desc.Anonymous.Texture2D = D3D11_TEX2D_SRV1 {
+                    MostDetailedMip: mip_slice,
+                    MipLevels: 1,
+                    PlaneSlice: 1,
+                };
+            } else {
+                y_desc.ViewDimension =
+                    windows::Win32::Graphics::Direct3D::D3D_SRV_DIMENSION_TEXTURE2DARRAY;
+                y_desc.Anonymous.Texture2DArray = D3D11_TEX2D_ARRAY_SRV1 {
+                    MostDetailedMip: mip_slice,
+                    MipLevels: 1,
+                    FirstArraySlice: array_slice,
+                    ArraySize: 1,
+                    PlaneSlice: 0,
+                };
+                uv_desc.ViewDimension =
+                    windows::Win32::Graphics::Direct3D::D3D_SRV_DIMENSION_TEXTURE2DARRAY;
+                uv_desc.Anonymous.Texture2DArray = D3D11_TEX2D_ARRAY_SRV1 {
+                    MostDetailedMip: mip_slice,
+                    MipLevels: 1,
+                    FirstArraySlice: array_slice,
+                    ArraySize: 1,
+                    PlaneSlice: 1,
+                };
+            }
 
             let mut y_srv1 = None;
             device3
                 .CreateShaderResourceView1(texture, Some(&y_desc), Some(&mut y_srv1))
-                .context("CreateShaderResourceView1(Y) failed")?;
+                .with_context(|| {
+                    format!(
+                        "CreateShaderResourceView1(Y) failed (subresource={}, w={}, h={}, mips={}, array={})",
+                        subresource, tex_desc.Width, tex_desc.Height, tex_desc.MipLevels, tex_desc.ArraySize
+                    )
+                })?;
             let mut uv_srv1 = None;
             device3
                 .CreateShaderResourceView1(texture, Some(&uv_desc), Some(&mut uv_srv1))
-                .context("CreateShaderResourceView1(UV) failed")?;
+                .with_context(|| {
+                    format!(
+                        "CreateShaderResourceView1(UV) failed (subresource={}, w={}, h={}, mips={}, array={})",
+                        subresource, tex_desc.Width, tex_desc.Height, tex_desc.MipLevels, tex_desc.ArraySize
+                    )
+                })?;
 
             let y_srv = y_srv1
                 .context("missing Y SRV1")?
@@ -1508,6 +1834,24 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
                 .context("cast UV SRV1->SRV failed")?;
             Ok((y_srv, uv_srv))
         }
+    }
+
+    fn external_nv12_srvs(
+        &mut self,
+        texture: &ID3D11Texture2D,
+        subresource: u32,
+    ) -> Result<(ID3D11ShaderResourceView, ID3D11ShaderResourceView)> {
+        let key = (texture.as_raw() as usize, subresource);
+        if let Some((y_srv, uv_srv)) = self.external_nv12_srv_cache.get(&key) {
+            return Ok((y_srv.clone(), uv_srv.clone()));
+        }
+        let (y_srv, uv_srv) = self.create_external_nv12_srvs(texture, subresource)?;
+        if self.external_nv12_srv_cache.len() >= 64 {
+            self.external_nv12_srv_cache.clear();
+        }
+        self.external_nv12_srv_cache
+            .insert(key, (y_srv.clone(), uv_srv.clone()));
+        Ok((y_srv, uv_srv))
     }
 
     fn draw_frame(&mut self) -> Result<()> {
@@ -1523,9 +1867,23 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
         y_srv: &ID3D11ShaderResourceView,
         uv_srv: &ID3D11ShaderResourceView,
     ) -> Result<()> {
+        if let Some(interval) = self.present_min_interval {
+            if let Some(last) = self.last_present_at {
+                let elapsed = last.elapsed();
+                if elapsed < interval {
+                    let remaining = interval - elapsed;
+                    let spin_budget = Duration::from_micros(self.present_spin_us.min(2_000));
+                    if remaining > spin_budget {
+                        std::thread::sleep(remaining - spin_budget);
+                    }
+                    let spin_start = Instant::now();
+                    while spin_start.elapsed() < spin_budget && last.elapsed() < interval {
+                        std::hint::spin_loop();
+                    }
+                }
+            }
+        }
         unsafe {
-            let clear = [0.05f32, 0.05f32, 0.08f32, 1.0f32];
-            self.context.ClearRenderTargetView(&self.rtv, &clear);
             self.context.OMSetRenderTargets(Some(&[Some(self.rtv.clone())]), None);
 
             let mut client = RECT::default();
@@ -1560,6 +1918,7 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
             }
             hr.ok().context("swapchain present failed")?;
         }
+        self.last_present_at = Some(Instant::now());
         Ok(())
     }
 }
@@ -1578,9 +1937,17 @@ fn present_params(vsync: bool, allow_tearing: bool, low_latency_mode: bool) -> (
     (0, flags)
 }
 
+fn idle_wait_timeout_ms(low_latency_mode: bool) -> u32 {
+    if low_latency_mode {
+        0
+    } else {
+        5
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::present_params;
+    use super::{idle_wait_timeout_ms, present_params};
     use windows::Win32::Graphics::Dxgi::{
         DXGI_PRESENT, DXGI_PRESENT_ALLOW_TEARING, DXGI_PRESENT_DO_NOT_WAIT,
     };
@@ -1614,6 +1981,16 @@ mod tests {
             flags,
             DXGI_PRESENT(DXGI_PRESENT_ALLOW_TEARING.0 | DXGI_PRESENT_DO_NOT_WAIT.0)
         );
+    }
+
+    #[test]
+    fn idle_wait_timeout_is_zero_in_low_latency_mode() {
+        assert_eq!(idle_wait_timeout_ms(true), 0);
+    }
+
+    #[test]
+    fn idle_wait_timeout_is_five_ms_when_not_low_latency() {
+        assert_eq!(idle_wait_timeout_ms(false), 5);
     }
 }
 
