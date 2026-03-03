@@ -76,4 +76,95 @@ pub fn apply_capture_profile(cfg: &mut agent_rust::CaptureConfig) {
             cfg.queue_depth = cfg.queue_depth.min(2);
         }
     }
+    if cfg.tier_limit_enable {
+        apply_multi_tier_limits(cfg);
+    }
+}
+
+fn apply_multi_tier_limits(cfg: &mut agent_rust::CaptureConfig) {
+    // 5-tier ladder inspired by cpp_capture style quality ladders.
+    let tiers = [
+        (cfg.tier_fps_l1, cfg.tier_bitrate_kbps_l1),
+        (cfg.tier_fps_l2, cfg.tier_bitrate_kbps_l2),
+        (cfg.tier_fps_l3, cfg.tier_bitrate_kbps_l3),
+        (cfg.tier_fps_l4, cfg.tier_bitrate_kbps_l4),
+        (cfg.tier_fps_l5, cfg.tier_bitrate_kbps_l5),
+    ];
+    let target = cfg.fps.max(1);
+    let (tier_fps, tier_br) = tiers
+        .iter()
+        .copied()
+        .filter(|(fps, _)| *fps <= target)
+        .next_back()
+        .unwrap_or(tiers[0]);
+
+    cfg.fps = cfg.fps.min(tier_fps);
+    cfg.max_fps = cfg.max_fps.min(tier_fps).max(cfg.min_fps.min(tier_fps));
+    cfg.min_fps = cfg.min_fps.min(cfg.max_fps).max(1);
+    cfg.idle_repeat_fps = cfg.idle_repeat_fps.min(tier_fps).max(1);
+    cfg.bitrate_kbps = cfg.bitrate_kbps.min(tier_br).max(100);
+    cfg.max_bitrate_kbps = cfg.max_bitrate_kbps.min(tier_br).max(cfg.bitrate_kbps);
+
+    // Lower tiers should keep queue shallow to avoid stale-frame bursts.
+    cfg.queue_depth = if tier_fps >= 144 {
+        cfg.queue_depth.min(4).max(2)
+    } else if tier_fps >= 120 {
+        cfg.queue_depth.min(6).max(2)
+    } else if tier_fps >= 60 {
+        cfg.queue_depth.min(8).max(3)
+    } else {
+        cfg.queue_depth.min(12).max(4)
+    };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_cfg() -> agent_rust::CaptureConfig {
+        let mut cfg = agent_rust::AgentConfig::default().capture;
+        cfg.tier_limit_enable = true;
+        cfg.tier_fps_l1 = 30;
+        cfg.tier_fps_l2 = 60;
+        cfg.tier_fps_l3 = 120;
+        cfg.tier_fps_l4 = 144;
+        cfg.tier_fps_l5 = 240;
+        cfg.tier_bitrate_kbps_l1 = 4000;
+        cfg.tier_bitrate_kbps_l2 = 8000;
+        cfg.tier_bitrate_kbps_l3 = 12000;
+        cfg.tier_bitrate_kbps_l4 = 18000;
+        cfg.tier_bitrate_kbps_l5 = 28000;
+        cfg
+    }
+
+    #[test]
+    fn tier_limits_clamp_to_144_for_target_180() {
+        let mut cfg = base_cfg();
+        cfg.fps = 180;
+        cfg.min_fps = 180;
+        cfg.max_fps = 180;
+        cfg.idle_repeat_fps = 180;
+        cfg.bitrate_kbps = 26000;
+        cfg.max_bitrate_kbps = 30000;
+        apply_capture_profile(&mut cfg);
+        assert_eq!(cfg.fps, 144);
+        assert_eq!(cfg.max_fps, 144);
+        assert_eq!(cfg.idle_repeat_fps, 144);
+        assert!(cfg.bitrate_kbps <= 18000);
+        assert!(cfg.max_bitrate_kbps <= 18000);
+    }
+
+    #[test]
+    fn tier_limits_keep_240_for_target_240() {
+        let mut cfg = base_cfg();
+        cfg.fps = 240;
+        cfg.min_fps = 240;
+        cfg.max_fps = 240;
+        cfg.idle_repeat_fps = 240;
+        cfg.bitrate_kbps = 26000;
+        cfg.max_bitrate_kbps = 30000;
+        apply_capture_profile(&mut cfg);
+        assert_eq!(cfg.fps, 240);
+        assert!(cfg.bitrate_kbps <= 28000);
+    }
 }

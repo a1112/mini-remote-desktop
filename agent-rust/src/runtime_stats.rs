@@ -1,4 +1,4 @@
-use crate::net_adapt::NetAdaptController;
+use crate::net_adapt::{NetAdaptController, tier_reason_label};
 use rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
 use rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use rtcp::payload_feedbacks::receiver_estimated_maximum_bitrate::ReceiverEstimatedMaximumBitrate;
@@ -23,6 +23,9 @@ pub struct RuntimeStats {
     pub sent_au_total: AtomicU64,
     pub unique_sent_au_total: AtomicU64,
     pub repeated_sent_au_total: AtomicU64,
+    pub tier_level: AtomicU32,
+    pub tier_reason_code: AtomicU32,
+    pub tier_switch_count: AtomicU64,
 }
 
 impl RuntimeStats {
@@ -30,6 +33,9 @@ impl RuntimeStats {
         Self {
             target_fps: AtomicU32::new(target_fps),
             target_bitrate_kbps: AtomicU32::new(target_bitrate_kbps),
+            tier_level: AtomicU32::new(0),
+            tier_reason_code: AtomicU32::new(0),
+            tier_switch_count: AtomicU64::new(0),
             ..Default::default()
         }
     }
@@ -90,6 +96,15 @@ pub fn spawn_rtcp_feedback_loop(
                         stats
                             .target_bitrate_kbps
                             .store(target_bitrate_kbps, Ordering::Relaxed);
+                        stats
+                            .tier_level
+                            .store(adapt.current_tier_level(), Ordering::Relaxed);
+                        stats
+                            .tier_reason_code
+                            .store(adapt.tier_reason_code(), Ordering::Relaxed);
+                        stats
+                            .tier_switch_count
+                            .store(adapt.tier_switch_count(), Ordering::Relaxed);
                         tracing::info!(
                             sender_ssrc = nack.sender_ssrc,
                             media_ssrc = nack.media_ssrc,
@@ -120,6 +135,15 @@ pub fn spawn_rtcp_feedback_loop(
                         stats
                             .target_bitrate_kbps
                             .store(target_bitrate_kbps, Ordering::Relaxed);
+                        stats
+                            .tier_level
+                            .store(adapt.current_tier_level(), Ordering::Relaxed);
+                        stats
+                            .tier_reason_code
+                            .store(adapt.tier_reason_code(), Ordering::Relaxed);
+                        stats
+                            .tier_switch_count
+                            .store(adapt.tier_switch_count(), Ordering::Relaxed);
                         tracing::info!(
                             bitrate_bps = remb.bitrate,
                             target_fps,
@@ -173,6 +197,23 @@ pub fn spawn_stats_panel(
                 (unique_sent_total.saturating_sub(last_unique_sent) as f64 / dt) as f32;
             let repeat_send_fps =
                 (repeated_sent_total.saturating_sub(last_repeated_sent) as f64 / dt) as f32;
+            if let Some((new_fps, new_bitrate)) = adapt.on_quality_sample(unique_send_fps) {
+                stats.target_fps.store(new_fps, Ordering::Relaxed);
+                stats
+                    .target_bitrate_kbps
+                    .store(new_bitrate, Ordering::Relaxed);
+            }
+            let tier_level = adapt.current_tier_level();
+            let tier_reason_code = adapt.tier_reason_code();
+            let tier_reason = tier_reason_label(tier_reason_code);
+            let tier_switch_count = adapt.tier_switch_count();
+            stats.tier_level.store(tier_level, Ordering::Relaxed);
+            stats
+                .tier_reason_code
+                .store(tier_reason_code, Ordering::Relaxed);
+            stats
+                .tier_switch_count
+                .store(tier_switch_count, Ordering::Relaxed);
             last_encoded = encoded_total;
             last_sent = sent_total;
             last_unique_sent = unique_sent_total;
@@ -195,6 +236,9 @@ pub fn spawn_stats_panel(
                 send_fps,
                 unique_send_fps,
                 repeat_send_fps,
+                tier_level,
+                tier_reason,
+                tier_switch_count,
                 "[RTCP-PANEL]"
             );
         }

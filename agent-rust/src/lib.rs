@@ -45,6 +45,17 @@ pub struct CaptureConfig {
     pub stats_interval_ms: u32,
     pub max_fps_mode: bool,
     pub idle_repeat_fps: u32,
+    pub tier_limit_enable: bool,
+    pub tier_fps_l1: u32,
+    pub tier_fps_l2: u32,
+    pub tier_fps_l3: u32,
+    pub tier_fps_l4: u32,
+    pub tier_fps_l5: u32,
+    pub tier_bitrate_kbps_l1: u32,
+    pub tier_bitrate_kbps_l2: u32,
+    pub tier_bitrate_kbps_l3: u32,
+    pub tier_bitrate_kbps_l4: u32,
+    pub tier_bitrate_kbps_l5: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -133,6 +144,17 @@ impl Default for AgentConfig {
                 stats_interval_ms: 1000,
                 max_fps_mode: false,
                 idle_repeat_fps: 12,
+                tier_limit_enable: true,
+                tier_fps_l1: 30,
+                tier_fps_l2: 60,
+                tier_fps_l3: 120,
+                tier_fps_l4: 144,
+                tier_fps_l5: 240,
+                tier_bitrate_kbps_l1: 4000,
+                tier_bitrate_kbps_l2: 8000,
+                tier_bitrate_kbps_l3: 12000,
+                tier_bitrate_kbps_l4: 18000,
+                tier_bitrate_kbps_l5: 28000,
             },
         }
     }
@@ -317,6 +339,39 @@ pub fn load_config(path: &Path) -> AgentConfig {
         if let Some(v) = capture.get("idle_repeat_fps").and_then(|v| v.as_u64()) {
             cfg.capture.idle_repeat_fps = v as u32;
         }
+        if let Some(v) = capture.get("tier_limit_enable").and_then(|v| v.as_bool()) {
+            cfg.capture.tier_limit_enable = v;
+        }
+        if let Some(v) = capture.get("tier_fps_l1").and_then(|v| v.as_u64()) {
+            cfg.capture.tier_fps_l1 = v as u32;
+        }
+        if let Some(v) = capture.get("tier_fps_l2").and_then(|v| v.as_u64()) {
+            cfg.capture.tier_fps_l2 = v as u32;
+        }
+        if let Some(v) = capture.get("tier_fps_l3").and_then(|v| v.as_u64()) {
+            cfg.capture.tier_fps_l3 = v as u32;
+        }
+        if let Some(v) = capture.get("tier_fps_l4").and_then(|v| v.as_u64()) {
+            cfg.capture.tier_fps_l4 = v as u32;
+        }
+        if let Some(v) = capture.get("tier_fps_l5").and_then(|v| v.as_u64()) {
+            cfg.capture.tier_fps_l5 = v as u32;
+        }
+        if let Some(v) = capture.get("tier_bitrate_kbps_l1").and_then(|v| v.as_u64()) {
+            cfg.capture.tier_bitrate_kbps_l1 = v as u32;
+        }
+        if let Some(v) = capture.get("tier_bitrate_kbps_l2").and_then(|v| v.as_u64()) {
+            cfg.capture.tier_bitrate_kbps_l2 = v as u32;
+        }
+        if let Some(v) = capture.get("tier_bitrate_kbps_l3").and_then(|v| v.as_u64()) {
+            cfg.capture.tier_bitrate_kbps_l3 = v as u32;
+        }
+        if let Some(v) = capture.get("tier_bitrate_kbps_l4").and_then(|v| v.as_u64()) {
+            cfg.capture.tier_bitrate_kbps_l4 = v as u32;
+        }
+        if let Some(v) = capture.get("tier_bitrate_kbps_l5").and_then(|v| v.as_u64()) {
+            cfg.capture.tier_bitrate_kbps_l5 = v as u32;
+        }
     }
 
     // 应用值范围验证和标准化
@@ -365,6 +420,38 @@ fn normalize_config(cfg: &mut AgentConfig) {
         .clamp(100, 300_000);
     cfg.capture.stats_interval_ms = cfg.capture.stats_interval_ms.clamp(200, 10_000);
     cfg.capture.idle_repeat_fps = cfg.capture.idle_repeat_fps.clamp(1, 240);
+    cfg.capture.tier_fps_l1 = cfg.capture.tier_fps_l1.clamp(1, 240);
+    cfg.capture.tier_fps_l2 = cfg.capture.tier_fps_l2.clamp(1, 240);
+    cfg.capture.tier_fps_l3 = cfg.capture.tier_fps_l3.clamp(1, 240);
+    cfg.capture.tier_fps_l4 = cfg.capture.tier_fps_l4.clamp(1, 240);
+    cfg.capture.tier_fps_l5 = cfg.capture.tier_fps_l5.clamp(1, 240);
+    cfg.capture.tier_bitrate_kbps_l1 = cfg.capture.tier_bitrate_kbps_l1.clamp(100, 300_000);
+    cfg.capture.tier_bitrate_kbps_l2 = cfg.capture.tier_bitrate_kbps_l2.clamp(100, 300_000);
+    cfg.capture.tier_bitrate_kbps_l3 = cfg.capture.tier_bitrate_kbps_l3.clamp(100, 300_000);
+    cfg.capture.tier_bitrate_kbps_l4 = cfg.capture.tier_bitrate_kbps_l4.clamp(100, 300_000);
+    cfg.capture.tier_bitrate_kbps_l5 = cfg.capture.tier_bitrate_kbps_l5.clamp(100, 300_000);
+
+    // Keep 5-tier profile monotonic to avoid oscillation and invalid ladders.
+    cfg.capture.tier_fps_l2 = cfg.capture.tier_fps_l2.max(cfg.capture.tier_fps_l1);
+    cfg.capture.tier_fps_l3 = cfg.capture.tier_fps_l3.max(cfg.capture.tier_fps_l2);
+    cfg.capture.tier_fps_l4 = cfg.capture.tier_fps_l4.max(cfg.capture.tier_fps_l3);
+    cfg.capture.tier_fps_l5 = cfg.capture.tier_fps_l5.max(cfg.capture.tier_fps_l4);
+    cfg.capture.tier_bitrate_kbps_l2 = cfg
+        .capture
+        .tier_bitrate_kbps_l2
+        .max(cfg.capture.tier_bitrate_kbps_l1);
+    cfg.capture.tier_bitrate_kbps_l3 = cfg
+        .capture
+        .tier_bitrate_kbps_l3
+        .max(cfg.capture.tier_bitrate_kbps_l2);
+    cfg.capture.tier_bitrate_kbps_l4 = cfg
+        .capture
+        .tier_bitrate_kbps_l4
+        .max(cfg.capture.tier_bitrate_kbps_l3);
+    cfg.capture.tier_bitrate_kbps_l5 = cfg
+        .capture
+        .tier_bitrate_kbps_l5
+        .max(cfg.capture.tier_bitrate_kbps_l4);
 
     // 字符串枚举验证（使用默认值替代无效值）
     if !matches!(
@@ -539,7 +626,18 @@ mod tests {
                 "network_adapt_ceiling_bitrate_kbps":80000,
                 "stats_interval_ms":1000
                 ,"max_fps_mode":true,
-                "idle_repeat_fps":12
+                "idle_repeat_fps":12,
+                "tier_limit_enable":true,
+                "tier_fps_l1":30,
+                "tier_fps_l2":60,
+                "tier_fps_l3":120,
+                "tier_fps_l4":144,
+                "tier_fps_l5":240,
+                "tier_bitrate_kbps_l1":4000,
+                "tier_bitrate_kbps_l2":8000,
+                "tier_bitrate_kbps_l3":12000,
+                "tier_bitrate_kbps_l4":18000,
+                "tier_bitrate_kbps_l5":28000
             }
         }"#;
         fs::write(&p, raw).expect("write test config");
@@ -564,6 +662,9 @@ mod tests {
         assert_eq!(cfg.capture.network_adapt_floor_bitrate_kbps, 6000);
         assert!(cfg.capture.max_fps_mode);
         assert_eq!(cfg.capture.idle_repeat_fps, 12);
+        assert!(cfg.capture.tier_limit_enable);
+        assert_eq!(cfg.capture.tier_fps_l4, 144);
+        assert_eq!(cfg.capture.tier_bitrate_kbps_l5, 28000);
     }
 
     #[test]

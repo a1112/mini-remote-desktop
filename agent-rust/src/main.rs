@@ -371,6 +371,29 @@ async fn attach_video_track_with_policy(
 ) -> Result<()> {
     let mut effective_cfg = capture_cfg.clone();
     apply_capture_profile(&mut effective_cfg);
+    if effective_cfg.tier_limit_enable {
+        info!(
+            tier_ladder_fps = %format!(
+                "{}/{}/{}/{}/{}",
+                effective_cfg.tier_fps_l1,
+                effective_cfg.tier_fps_l2,
+                effective_cfg.tier_fps_l3,
+                effective_cfg.tier_fps_l4,
+                effective_cfg.tier_fps_l5
+            ),
+            tier_ladder_bitrate_kbps = %format!(
+                "{}/{}/{}/{}/{}",
+                effective_cfg.tier_bitrate_kbps_l1,
+                effective_cfg.tier_bitrate_kbps_l2,
+                effective_cfg.tier_bitrate_kbps_l3,
+                effective_cfg.tier_bitrate_kbps_l4,
+                effective_cfg.tier_bitrate_kbps_l5
+            ),
+            selected_fps = effective_cfg.fps,
+            selected_bitrate_kbps = effective_cfg.bitrate_kbps,
+            "multi-tier limits applied"
+        );
+    }
 
     let (backend, logs) = choose_backend(capture_cfg);
     for line in logs {
@@ -459,11 +482,35 @@ async fn attach_video_track_with_policy(
             .network_adapt_ceiling_bitrate_kbps
             .max(effective_cfg.network_adapt_floor_bitrate_kbps.max(100)),
         effective_cfg.bitrate_kbps.max(100),
+        effective_cfg.tier_limit_enable,
+        [
+            effective_cfg.tier_fps_l1,
+            effective_cfg.tier_fps_l2,
+            effective_cfg.tier_fps_l3,
+            effective_cfg.tier_fps_l4,
+            effective_cfg.tier_fps_l5,
+        ],
+        [
+            effective_cfg.tier_bitrate_kbps_l1,
+            effective_cfg.tier_bitrate_kbps_l2,
+            effective_cfg.tier_bitrate_kbps_l3,
+            effective_cfg.tier_bitrate_kbps_l4,
+            effective_cfg.tier_bitrate_kbps_l5,
+        ],
     ));
     let stats = Arc::new(RuntimeStats::new(
         adapt.current_fps(),
         adapt.current_bitrate_kbps(),
     ));
+    stats
+        .tier_level
+        .store(adapt.current_tier_level(), Ordering::Relaxed);
+    stats
+        .tier_reason_code
+        .store(adapt.tier_reason_code(), Ordering::Relaxed);
+    stats
+        .tier_switch_count
+        .store(adapt.tier_switch_count(), Ordering::Relaxed);
 
     spawn_rtcp_feedback_loop(
         sender.clone(),
