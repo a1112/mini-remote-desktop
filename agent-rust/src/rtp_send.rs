@@ -64,9 +64,13 @@ impl RtpH264Sender {
         let sleep_dur = Duration::from_nanos(sleep_ns.max(100_000));
 
         let mut sent = 0usize;
-        for chunk in packets.chunks(self.frame_pacing_batch_packets) {
+        let mut next_due = tokio::time::Instant::now();
+        for (idx, chunk) in packets.chunks(self.frame_pacing_batch_packets).enumerate() {
+            if idx > 0 {
+                next_due += sleep_dur;
+                wait_until_due(next_due).await;
+            }
             sent += self.send_packets(chunk).await?;
-            tokio::time::sleep(sleep_dur).await;
         }
         Ok(sent)
     }
@@ -77,6 +81,25 @@ impl RtpH264Sender {
             n += self.track.write_rtp_with_extensions(pkt, &[]).await?;
         }
         Ok(n)
+    }
+}
+
+async fn wait_until_due(deadline: tokio::time::Instant) {
+    const COARSE_SLEEP_GUARD: Duration = Duration::from_millis(12);
+    const YIELD_SPIN_THRESHOLD: Duration = Duration::from_micros(200);
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let remain = deadline - now;
+        if remain > COARSE_SLEEP_GUARD {
+            tokio::time::sleep(remain - COARSE_SLEEP_GUARD).await;
+        } else if remain > YIELD_SPIN_THRESHOLD {
+            tokio::task::yield_now().await;
+        } else {
+            std::hint::spin_loop();
+        }
     }
 }
 

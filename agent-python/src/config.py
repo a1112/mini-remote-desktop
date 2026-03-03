@@ -16,7 +16,8 @@ class TransportConfig:
     """Transport protocol configuration."""
 
     preferred: str = "auto"  # "auto", "quic", "webrtc"
-    fallback: str = "webrtc"
+    fallback: str = "quic"
+    allow_webrtc_fallback: bool = False
     auto_switch: bool = True
     connection_timeout: float = 5.0
 

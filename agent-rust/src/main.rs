@@ -591,7 +591,19 @@ async fn attach_video_track_with_policy(
     for line in logs {
         info!("{}", line);
     }
-    let requested_backend = capture_cfg.backend.to_ascii_lowercase();
+    let forced_backend = std::env::var("AGENT_CAPTURE_BACKEND_FORCE")
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty());
+    let requested_backend = forced_backend
+        .as_deref()
+        .unwrap_or(&capture_cfg.backend)
+        .to_ascii_lowercase();
+    let mut backend_cfg = capture_cfg.clone();
+    if let Some(force) = forced_backend.as_deref() {
+        backend_cfg.backend = force.to_string();
+        info!(forced_backend = force, "capture backend forced by env");
+    }
     let (backend, logs) = if encoder_backend == VideoEncoderBackend::Nvenc
         && matches!(requested_backend.as_str(), "auto" | "dxgi")
     {
@@ -600,7 +612,7 @@ async fn attach_video_track_with_policy(
             vec!["capture backend selected: dxgi (native nvenc path bypass probe)".to_string()],
         )
     } else {
-        choose_backend(capture_cfg)
+        choose_backend(&backend_cfg)
     };
     for line in logs {
         info!("{}", line);

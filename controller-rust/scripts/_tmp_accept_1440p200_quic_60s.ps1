@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 
 $base = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $controllerDir = Join-Path $base 'controller-rust'
@@ -159,6 +159,8 @@ finally {
   Get-Process | Where-Object { $_.ProcessName -in @('signaling-rs','agent-rust','controller-rust') } |
     Stop-Process -Force -ErrorAction SilentlyContinue
 }
+
+
 
 
 

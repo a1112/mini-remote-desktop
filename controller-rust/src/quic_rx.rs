@@ -155,7 +155,12 @@ pub async fn connect_quic_receiver(
         .context("quic connect failed")?;
     info!(remote = %addr, "quic receiver connected");
 
-    let (tx, rx) = mpsc::channel::<VideoFrame>(32);
+    let rx_queue = std::env::var("MRD_QUIC_RX_QUEUE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0 && *v <= 1024)
+        .unwrap_or(8);
+    let (tx, rx) = mpsc::channel::<VideoFrame>(rx_queue);
     tokio::spawn(async move {
         let wire_debug = std::env::var("MRD_QUIC_WIRE_DEBUG")
             .ok()
@@ -172,6 +177,9 @@ pub async fn connect_quic_receiver(
                     break;
                 }
             };
+            // New stream may start in the middle of a GOP; wait for IDR to avoid
+            // feeding undecodable inter frames that inflate startup latency.
+            let mut waiting_for_keyframe = true;
             loop {
                 let len = match stream.read_u32().await {
                     Ok(v) => v as usize,
@@ -213,6 +221,13 @@ pub async fn connect_quic_receiver(
                     }
                 }
                 let is_keyframe = contains_idr_annexb(payload.as_ref());
+                if waiting_for_keyframe {
+                    if !is_keyframe {
+                        continue;
+                    }
+                    waiting_for_keyframe = false;
+                    info!(seq, "quic receiver synchronized on keyframe");
+                }
                 let frame = VideoFrame {
                     data: payload,
                     timestamp: seq,

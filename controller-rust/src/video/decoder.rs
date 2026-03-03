@@ -160,6 +160,22 @@ impl H264Decoder {
             .ok()
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(true);
+        let try_mf_fallback = std::env::var("MRD_TRY_MF_FALLBACK")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let hw_fail_fast = std::env::var("MRD_HARDWARE_FAIL_FAST")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if wants_hw {
+            tracing::info!(
+                allow_soft_fallback,
+                try_mf_fallback,
+                hw_fail_fast,
+                "hardware decode bootstrap policy"
+            );
+        }
 
         #[cfg(all(windows, feature = "mf-decoder", feature = "ffmpeg-software"))]
         if wants_hw {
@@ -171,20 +187,38 @@ impl H264Decoder {
                         return Ok(Self::Ffmpeg(decoder));
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, "ffmpeg d3d11va strict init failed; trying MF d3d11");
+                        if try_mf_fallback {
+                            tracing::warn!(error = %e, "ffmpeg d3d11va strict init failed; trying MF d3d11");
+                        } else {
+                            if hw_fail_fast {
+                                anyhow::bail!("ffmpeg d3d11va strict init failed (fail-fast enabled): {e}");
+                            }
+                            tracing::warn!(error = %e, "ffmpeg d3d11va strict init failed; MF fallback disabled");
+                        }
                     }
                 }
             } else {
-                tracing::warn!("h264_d3d11va decoder unavailable; skipping strict ffmpeg hw path");
+                if try_mf_fallback {
+                    tracing::warn!("h264_d3d11va decoder unavailable; skipping strict ffmpeg hw path");
+                } else {
+                    if hw_fail_fast {
+                        anyhow::bail!(
+                            "h264_d3d11va decoder unavailable and MF fallback disabled (fail-fast enabled)"
+                        );
+                    }
+                    tracing::warn!("h264_d3d11va decoder unavailable; MF fallback disabled, using software decoder");
+                }
             }
 
-            match mf_backend::MfH264Decoder::new(config.clone()) {
-                Ok(decoder) => {
-                    tracing::info!("decoder chain selected: mf_d3d11");
-                    return Ok(Self::MfD3d11(decoder));
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "mf_d3d11 init failed");
+            if try_mf_fallback {
+                match mf_backend::MfH264Decoder::new(config.clone()) {
+                    Ok(decoder) => {
+                        tracing::info!("decoder chain selected: mf_d3d11");
+                        return Ok(Self::MfD3d11(decoder));
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "mf_d3d11 init failed");
+                    }
                 }
             }
 
@@ -996,6 +1030,10 @@ mod ffmpeg_backend {
         strict_hw_output: bool,
         warned_non_hw_output: bool,
         warned_d3d11_extract_failed: bool,
+        d3d11_device_fail_fast: bool,
+        first_d3d11_device_ptr: Option<usize>,
+        first_d3d11_adapter_luid: Option<(u32, i32)>,
+        warned_d3d11_device_mismatch: bool,
     }
 
     // Decoder is guarded by a mutex in upper layer; one-thread access.
@@ -1010,19 +1048,31 @@ mod ffmpeg_backend {
             let backend_name = codec.name().to_string();
             let wants_hw = wants_d3d11va(&config);
             let has_d3d11va_decoder = decoder::find_by_name("h264_d3d11va").is_some();
+            let has_h264_decoder = decoder::find(codec::Id::H264).is_some();
+            let has_d3d11va_capability = has_d3d11va_decoder || has_h264_decoder;
             let require_hw = std::env::var("MRD_REQUIRE_D3D11VA")
                 .ok()
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
+            let d3d11_device_fail_fast = std::env::var("MRD_D3D11_DEVICE_FAIL_FAST")
+                .ok()
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(true);
             if wants_hw {
                 tracing::info!(
                     selected_codec = %backend_name,
                     has_h264_d3d11va_decoder = has_d3d11va_decoder,
+                    has_h264_decoder,
+                    has_d3d11va_capability,
                     require_d3d11va = require_hw,
+                    strict_hw_output,
+                    d3d11_device_fail_fast,
                     "decoder hardware intent"
                 );
-                if require_hw && !has_d3d11va_decoder {
-                    anyhow::bail!("MRD_REQUIRE_D3D11VA=1 but ffmpeg h264_d3d11va decoder is unavailable");
+                if require_hw && !has_d3d11va_capability {
+                    anyhow::bail!(
+                        "MRD_REQUIRE_D3D11VA=1 but ffmpeg has neither h264_d3d11va alias nor generic h264 decoder"
+                    );
                 }
             }
 
@@ -1103,6 +1153,10 @@ mod ffmpeg_backend {
                 strict_hw_output,
                 warned_non_hw_output: false,
                 warned_d3d11_extract_failed: false,
+                d3d11_device_fail_fast,
+                first_d3d11_device_ptr: None,
+                first_d3d11_adapter_luid: None,
+                warned_d3d11_device_mismatch: false,
             })
         }
 
@@ -1160,6 +1214,7 @@ mod ffmpeg_backend {
                     if self.video_frame.format() == format::Pixel::D3D11 {
                         match self.extract_d3d11_surface(&self.video_frame)? {
                             Some((texture, subresource)) => {
+                                self.check_d3d11_device_consistency(&texture)?;
                                 return Ok(Some(DecodedFrame::from_d3d11_nv12(
                                     texture,
                                     subresource,
@@ -1282,6 +1337,62 @@ mod ffmpeg_backend {
             }
             self.extract_nv12(&dst)
         }
+
+        #[cfg(windows)]
+        fn check_d3d11_device_consistency(
+            &mut self,
+            texture: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+        ) -> Result<()> {
+            use windows::Win32::Graphics::Dxgi::{DXGI_ADAPTER_DESC, IDXGIDevice};
+            use windows::core::Interface;
+
+            unsafe {
+                let dev = texture
+                    .GetDevice()
+                    .context("GetDevice on decoded D3D11 texture failed")?;
+                let dev_ptr = dev.as_raw() as usize;
+
+                let dxgi_device: IDXGIDevice = dev
+                    .cast()
+                    .context("cast decoded texture device to IDXGIDevice failed")?;
+                let adapter = dxgi_device
+                    .GetAdapter()
+                    .context("GetAdapter for decoded texture device failed")?;
+                let desc: DXGI_ADAPTER_DESC = adapter.GetDesc().context("GetDesc for adapter failed")?;
+                let luid = (desc.AdapterLuid.LowPart, desc.AdapterLuid.HighPart);
+
+                if self.first_d3d11_device_ptr.is_none() {
+                    self.first_d3d11_device_ptr = Some(dev_ptr);
+                    self.first_d3d11_adapter_luid = Some(luid);
+                    tracing::info!(
+                        decoded_device_ptr = format!("0x{dev_ptr:016x}"),
+                        decoded_adapter_luid = format!("{:08x}:{:08x}", luid.1 as u32, luid.0),
+                        "d3d11va decoded surface source recorded"
+                    );
+                    return Ok(());
+                }
+
+                let first_ptr = self.first_d3d11_device_ptr.unwrap_or(0);
+                let first_luid = self.first_d3d11_adapter_luid.unwrap_or((0, 0));
+                if first_ptr != dev_ptr || first_luid != luid {
+                    let msg = format!(
+                        "decoded D3D11 source device changed (first=0x{first_ptr:016x} {:08x}:{:08x}, now=0x{dev_ptr:016x} {:08x}:{:08x})",
+                        first_luid.1 as u32,
+                        first_luid.0,
+                        luid.1 as u32,
+                        luid.0
+                    );
+                    if self.d3d11_device_fail_fast {
+                        anyhow::bail!("{msg}");
+                    }
+                    if !self.warned_d3d11_device_mismatch {
+                        self.warned_d3d11_device_mismatch = true;
+                        tracing::warn!("{msg}");
+                    }
+                }
+            }
+            Ok(())
+        }
     }
 
     pub(super) fn preferred_decoder_names(config: &H264DecoderConfig) -> Vec<&'static str> {
@@ -1293,7 +1404,12 @@ mod ffmpeg_backend {
     }
 
     pub(super) fn has_d3d11va_decoder() -> bool {
-        decoder::find_by_name("h264_d3d11va").is_some()
+        if decoder::find_by_name("h264_d3d11va").is_some() {
+            return true;
+        }
+        // Newer FFmpeg builds may not expose `h264_d3d11va` as a separate decoder name.
+        // In that case we still can open `h264` with d3d11va hwaccel options.
+        decoder::find(codec::Id::H264).is_some()
     }
 
     fn pick_decoder_codec(config: &H264DecoderConfig) -> Option<Codec> {
@@ -1345,6 +1461,7 @@ mod ffmpeg_backend {
                 "h264"
             }
         }
+
     }
 }
 

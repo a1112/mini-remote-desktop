@@ -103,6 +103,12 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--allow-webrtc-fallback",
+        action="store_true",
+        help="Allow fallback to WebRTC decode path (disabled by default)"
+    )
+
+    parser.add_argument(
         "--no-transport-switch",
         action="store_true",
         help="Disable automatic transport protocol switching"
@@ -146,6 +152,8 @@ async def main():
 
     # Transport configuration
     config.transport.preferred = args.transport
+    config.transport.fallback = "webrtc" if args.allow_webrtc_fallback else "quic"
+    config.transport.allow_webrtc_fallback = args.allow_webrtc_fallback
     config.transport.auto_switch = not args.no_transport_switch
 
     # Print configuration
@@ -157,7 +165,10 @@ async def main():
     logger.info(f"  Monitor: {config.monitor_index}")
     logger.info(f"  Quality: QP={config.quality}")
     logger.info(f"  FPS: {config.capture.fps}")
-    logger.info(f"  Transport: {config.transport.preferred} (auto-switch: {config.transport.auto_switch})")
+    logger.info(
+        f"  Transport: {config.transport.preferred} "
+        f"(auto-switch: {config.transport.auto_switch}, webrtc-fallback: {config.transport.allow_webrtc_fallback})"
+    )
     logger.info("=" * 60)
 
     # Quality description

@@ -83,6 +83,7 @@ mod imp {
         adapter_summary: String,
         direct_resources: VecDeque<(usize, RegisteredResource)>,
         direct_resource_capacity: usize,
+        acquire_timeout_streak: u32,
         stats: NativePathStats,
     }
 
@@ -141,6 +142,7 @@ mod imp {
             let mut duplication = None::<IDXGIOutputDuplication>;
             let mut adapter_desc = None::<DXGI_ADAPTER_DESC1>;
             let mut output_index = 0_u32;
+            let mut output_name = String::from("unknown");
             let mut duplicate_api = "none";
             let mut duplicate_errors: Vec<String> = Vec::new();
 
@@ -189,7 +191,23 @@ mod imp {
                     };
                     outputs.push((output1, oi, attached, out_name));
                 }
-                outputs.sort_by_key(|(_, _, attached, _)| if *attached { 0_u8 } else { 1_u8 });
+                let preferred_output_name = std::env::var("AGENT_DXGI_OUTPUT_NAME")
+                    .ok()
+                    .map(|v| v.trim().to_ascii_lowercase())
+                    .filter(|v| !v.is_empty());
+                let preferred_output_index = std::env::var("AGENT_DXGI_OUTPUT_INDEX")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u32>().ok());
+                outputs.sort_by_key(|(_, oi, attached, out_name)| {
+                    let name_match = preferred_output_name
+                        .as_ref()
+                        .map(|p| out_name.to_ascii_lowercase() == *p)
+                        .unwrap_or(false);
+                    let index_match = preferred_output_index.map(|p| *oi == p).unwrap_or(false);
+                    let preferred_rank = if name_match || index_match { 0_u8 } else { 1_u8 };
+                    let attached_rank = if *attached { 0_u8 } else { 1_u8 };
+                    (preferred_rank, attached_rank, *oi)
+                });
                 for (output1, oi, _attached, out_name) in outputs {
                     match try_duplicate_output(&output1, &dev) {
                         Ok((dup, api)) => {
@@ -198,6 +216,7 @@ mod imp {
                             duplication = Some(dup);
                             adapter_desc = Some(desc);
                             output_index = oi;
+                            output_name = out_name;
                             duplicate_api = api;
                             break;
                         }
@@ -302,11 +321,12 @@ mod imp {
                 .create_bitstream_buffer()
                 .map_err(|e| anyhow!("NVENC create bitstream buffer failed: {e:?}"))?;
             let adapter_summary = format!(
-                "adapter='{}' luid={:08x}:{:08x} output_index={} duplicate_api={}",
+                "adapter='{}' luid={:08x}:{:08x} output_index={} output='{}' duplicate_api={}",
                 utf16z_to_string(&adapter_desc.Description),
                 adapter_desc.AdapterLuid.HighPart as u32,
                 adapter_desc.AdapterLuid.LowPart,
                 output_index,
+                output_name,
                 duplicate_api,
             );
 
@@ -328,6 +348,7 @@ mod imp {
                 adapter_summary,
                 direct_resources: VecDeque::new(),
                 direct_resource_capacity: direct_resource_cache_capacity(),
+                acquire_timeout_streak: 0,
                 stats: NativePathStats::default(),
             })
         }
@@ -611,13 +632,22 @@ mod imp {
                     .AcquireNextFrame(16, &mut info, &mut resource)
             } {
                 Ok(()) => {
+                    self.acquire_timeout_streak = 0;
                     self.stats.acquire_ok = self.stats.acquire_ok.saturating_add(1);
                 }
                 Err(e) => {
                     if e.code() == DXGI_ERROR_WAIT_TIMEOUT {
+                        self.acquire_timeout_streak =
+                            self.acquire_timeout_streak.saturating_add(1);
                         self.stats.acquire_timeout = self.stats.acquire_timeout.saturating_add(1);
+                        // Repeated empty polls can monopolize the D3D lock path and delay other
+                        // GPU work (reinit/copy/encode setup). Yield briefly on streaked timeouts.
+                        if self.acquire_timeout_streak >= 4 {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
                         return Ok(None);
                     }
+                    self.acquire_timeout_streak = 0;
                     self.stats.acquire_errors = self.stats.acquire_errors.saturating_add(1);
                     return Err(anyhow!("AcquireNextFrame failed: {e}"));
                 }

@@ -209,14 +209,30 @@ enum DecodeSelectPolicy {
 
 impl DecodeSelectPolicy {
     fn from_env() -> Self {
-        match std::env::var("MRD_DECODE_SELECT")
+        let requested = std::env::var("MRD_DECODE_SELECT")
             .ok()
             .unwrap_or_else(|| "ordered".to_string())
-            .to_ascii_lowercase()
-            .as_str()
-        {
+            .to_ascii_lowercase();
+        let allow_unsafe_latest = std::env::var("MRD_ALLOW_UNSAFE_LATEST")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        Self::from_env_value(&requested, allow_unsafe_latest)
+    }
+
+    fn from_env_value(requested: &str, allow_unsafe_latest: bool) -> Self {
+        match requested {
             "latest-key" | "latest_key" | "latestkey" | "key" => Self::LatestKeyframe,
-            "latest" => Self::Latest,
+            "latest" => {
+                if allow_unsafe_latest {
+                    Self::Latest
+                } else {
+                    warn!(
+                        "MRD_DECODE_SELECT=latest is unsafe for H.264 reference chain; using latest-keyframe (set MRD_ALLOW_UNSAFE_LATEST=1 to force)"
+                    );
+                    Self::LatestKeyframe
+                }
+            }
             _ => Self::Ordered,
         }
     }
@@ -329,6 +345,10 @@ async fn main() -> Result<()> {
         };
         rt.block_on(async move {
             let decode_select_policy = DecodeSelectPolicy::from_env();
+            let disable_decode_recover = std::env::var("MRD_DISABLE_DECODE_RECOVER")
+                .ok()
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
             let mut decode_samples_ms: std::collections::VecDeque<f64> = std::collections::VecDeque::with_capacity(1024);
             let mut frame_interval_ms: std::collections::VecDeque<f64> = std::collections::VecDeque::with_capacity(1024);
             let mut e2e_samples_ms: std::collections::VecDeque<f64> = std::collections::VecDeque::with_capacity(1024);
@@ -409,7 +429,7 @@ async fn main() -> Result<()> {
                     }
                     Ok(None) => {
                         no_output_streak = no_output_streak.saturating_add(1);
-                        if no_output_streak >= 300 && decode_recover_stage < 2 {
+                        if !disable_decode_recover && no_output_streak >= 300 && decode_recover_stage < 2 {
                             let mut next_cfg = video_cfg_for_recover.clone();
                             if decode_recover_stage == 0 {
                                 next_cfg.backend = DecoderBackend::MfD3d11;
@@ -446,7 +466,7 @@ async fn main() -> Result<()> {
                         let recoverable_hw_err = err_text.contains("hardware output required")
                             || err_text.contains("d3d11")
                             || err_text.contains("strict mode");
-                        if recoverable_hw_err && decode_recover_stage < 2 {
+                        if !disable_decode_recover && recoverable_hw_err && decode_recover_stage < 2 {
                             let mut next_cfg = video_cfg_for_recover.clone();
                             if decode_recover_stage == 0 {
                                 next_cfg.backend = DecoderBackend::MfD3d11;
@@ -977,5 +997,17 @@ mod tests {
             select_frame_for_decode(&mut rx, first, DecodeSelectPolicy::LatestKeyframe);
         assert_eq!(picked.sequence, 3);
         assert_eq!(dropped, 2);
+    }
+
+    #[test]
+    fn decode_select_latest_is_safened_by_default() {
+        let policy = DecodeSelectPolicy::from_env_value("latest", false);
+        assert_eq!(policy, DecodeSelectPolicy::LatestKeyframe);
+    }
+
+    #[test]
+    fn decode_select_latest_can_be_enabled_explicitly() {
+        let policy = DecodeSelectPolicy::from_env_value("latest", true);
+        assert_eq!(policy, DecodeSelectPolicy::Latest);
     }
 }

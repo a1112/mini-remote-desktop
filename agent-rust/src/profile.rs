@@ -67,6 +67,12 @@ pub fn apply_capture_profile(cfg: &mut agent_rust::CaptureConfig) {
         cfg.queue_strategy = "drop".to_string();
     }
     if cfg.max_fps_mode {
+        // In max-fps mode, prefer throughput/latency over quality knobs.
+        cfg.encoder_preset = "p1".to_string();
+        cfg.encoder_tune = "ull".to_string();
+        cfg.rc_mode = "cbr".to_string();
+        cfg.bframes = 0;
+        cfg.gop = cfg.gop.clamp(30, 60);
         cfg.frame_pacing_enable = false;
         cfg.queue_strategy = "drop".to_string();
         cfg.enable_template_overlay = false;
@@ -166,5 +172,23 @@ mod tests {
         apply_capture_profile(&mut cfg);
         assert_eq!(cfg.fps, 240);
         assert!(cfg.bitrate_kbps <= 28000);
+    }
+
+    #[test]
+    fn max_fps_mode_forces_latency_encoder_knobs() {
+        let mut cfg = base_cfg();
+        cfg.max_fps_mode = true;
+        cfg.fps = 240;
+        cfg.encoder_preset = "p5".to_string();
+        cfg.encoder_tune = "balanced".to_string();
+        cfg.rc_mode = "vbr".to_string();
+        cfg.bframes = 3;
+        cfg.gop = 240;
+        apply_capture_profile(&mut cfg);
+        assert_eq!(cfg.encoder_preset, "p1");
+        assert_eq!(cfg.encoder_tune, "ull");
+        assert_eq!(cfg.rc_mode, "cbr");
+        assert_eq!(cfg.bframes, 0);
+        assert!(cfg.gop <= 60);
     }
 }

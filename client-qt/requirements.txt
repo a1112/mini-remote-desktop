@@ -1,0 +1,45 @@
+# Multi-protocol Remote Desktop Client (Qt)
+# Python 3.10+
+
+# Qt Framework
+PySide6>=6.6.0
+
+# Async & Networking
+websockets>=12.0
+aiohttp>=3.9.0
+
+# WebRTC (aiortc)
+aiortc>=1.6.0
+
+# QUIC
+aioquic>=1.1.0
+pylsqpack>=0.3.3
+cryptography>=41.0.0
+
+# Video Decoding (Hardware Accelerated)
+# PyAV with hardware decoder support
+av>=12.0
+# Optional: Build PyAV with custom flags for hardware acceleration
+# ffmpeg-python>=0.2.0  # Alternative Python bindings
+
+# Arrays and Image Processing
+numpy>=1.24
+pillow>=10.0
+opencv-python>=4.9.0
+
+# Hardware Acceleration (Windows)
+comtypes>=1.4.0; sys_platform == 'win32'
+# D3D11 types for comtypes (install via comtypes downstream)
+# d3d11>=1.0.0  # Optional: D3D11 Python bindings
+
+# Utilities
+PyYAML>=6.0
+
+# Platform specific
+pywin32>=306; sys_platform == 'win32'
+
+# Performance Monitoring
+psutil>=6.0.0
+
+# Optional: Hardware decoder DLL loading
+# pypiwin32>=223; sys_platform == 'win32'

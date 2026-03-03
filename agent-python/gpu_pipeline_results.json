@@ -1,0 +1,75 @@
+{
+  "timestamp": 1772527305.6734254,
+  "gpu_info": {
+    "name": "Unknown",
+    "has_dxgi_cpp": false,
+    "has_nvenc": false,
+    "has_gpu_decode": true
+  },
+  "results": [
+    {
+      "resolution": "1280x720",
+      "width": 1280,
+      "height": 720,
+      "frames_captured": 120,
+      "frames_encoded": 120,
+      "frames_decoded": 0,
+      "duration_sec": 8.73158729998977,
+      "capture_fps": 13.743205659770544,
+      "encode_fps": 13.743205659770544,
+      "overall_fps": 13.743205659770544,
+      "avg_frame_time_ms": 72.75294749900543,
+      "avg_frame_size": 92160,
+      "bandwidth_mbps": 10.132590668835627,
+      "success": true
+    },
+    {
+      "resolution": "1920x1080",
+      "width": 1920,
+      "height": 1080,
+      "frames_captured": 120,
+      "frames_encoded": 120,
+      "frames_decoded": 0,
+      "duration_sec": 9.851102799992077,
+      "capture_fps": 12.181377297179003,
+      "encode_fps": 12.181377297179003,
+      "overall_fps": 12.181377297179003,
+      "avg_frame_time_ms": 82.08286250010133,
+      "avg_frame_size": 200000,
+      "bandwidth_mbps": 19.490203675486406,
+      "success": true
+    },
+    {
+      "resolution": "2560x1440",
+      "width": 2560,
+      "height": 1440,
+      "frames_captured": 60,
+      "frames_encoded": 60,
+      "frames_decoded": 0,
+      "duration_sec": 5.300618699984625,
+      "capture_fps": 11.319433333352961,
+      "encode_fps": 11.319433333352961,
+      "overall_fps": 11.319433333352961,
+      "avg_frame_time_ms": 88.32675000060893,
+      "avg_frame_size": 200000,
+      "bandwidth_mbps": 18.111093333364735,
+      "success": true
+    },
+    {
+      "resolution": "3840x2160",
+      "width": 3840,
+      "height": 2160,
+      "frames_captured": 60,
+      "frames_encoded": 60,
+      "frames_decoded": 0,
+      "duration_sec": 7.211687700008042,
+      "capture_fps": 8.319827826145756,
+      "encode_fps": 8.319827826145756,
+      "overall_fps": 8.319827826145756,
+      "avg_frame_time_ms": 120.17923833288175,
+      "avg_frame_size": 200000,
+      "bandwidth_mbps": 13.31172452183321,
+      "success": true
+    }
+  ]
+}

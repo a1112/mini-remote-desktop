@@ -9,8 +9,33 @@ import asyncio
 import time
 import statistics
 from pathlib import Path
+from typing import Optional, Sequence, Dict
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
+
+
+def safe_latency_stats(samples: Sequence[float]) -> Optional[Dict[str, float]]:
+    """Compute latency stats and return None when series is empty."""
+    if not samples:
+        return None
+
+    stats = {
+        "avg": statistics.mean(samples),
+        "min": min(samples),
+        "max": max(samples),
+    }
+
+    if len(samples) >= 20:
+        stats["p95"] = statistics.quantiles(samples, n=20)[18]
+    else:
+        stats["p95"] = stats["max"]
+
+    if len(samples) >= 100:
+        stats["p99"] = statistics.quantiles(samples, n=100)[98]
+    else:
+        stats["p99"] = stats["max"]
+
+    return stats
 
 
 async def benchmark_capture():
@@ -54,17 +79,18 @@ async def benchmark_capture():
 
     # Calculate stats
     fps = len(frames) / duration
-    avg_time = statistics.mean(times)
-    p95_time = statistics.quantiles(times, n=20)[18] if len(times) > 20 else max(times)
-    p99_time = statistics.quantiles(times, n=100)[98] if len(times) > 100 else max(times)
-    max_time = max(times)
-
     print(f"\nResults ({duration}s):")
     print(f"  Actual FPS:     {fps:.1f}")
-    print(f"  Frame time avg: {avg_time:.2f} ms")
-    print(f"  Frame time P95: {p95_time:.2f} ms")
-    print(f"  Frame time P99: {p99_time:.2f} ms")
-    print(f"  Frame time max: {max_time:.2f} ms")
+    stats = safe_latency_stats(times)
+    if not stats:
+        print("  No valid frames captured")
+        print("  Hint: check capture backend/session availability")
+        return
+
+    print(f"  Frame time avg: {stats['avg']:.2f} ms")
+    print(f"  Frame time P95: {stats['p95']:.2f} ms")
+    print(f"  Frame time P99: {stats['p99']:.2f} ms")
+    print(f"  Frame time max: {stats['max']:.2f} ms")
 
     # Rating
     if fps >= 55:
@@ -130,11 +156,11 @@ async def benchmark_encoding():
 
         await encoder.close()
 
-        if times:
-            avg = statistics.mean(times)
-            p95 = statistics.quantiles(times, n=20)[18] if len(times) > 20 else max(times)
+        stats = safe_latency_stats(times)
+        if stats:
+            avg = stats["avg"]
             print(f"  Encode time avg: {avg:.2f} ms")
-            print(f"  Encode time P95: {p95:.2f} ms")
+            print(f"  Encode time P95: {stats['p95']:.2f} ms")
             print(f"  Max FPS:       {1000/avg:.0f}")
             print(f"  Success rate:  {successful}/10")
 
@@ -148,6 +174,8 @@ async def benchmark_encoding():
             else:
                 rating = "较差"
             print(f"  Rating: {rating}")
+        else:
+            print("  No successful encoded frames")
 
 
 async def benchmark_end_to_end():
@@ -223,21 +251,25 @@ async def benchmark_end_to_end():
     print(f"  Successful frames: {successful}")
     print(f"  Actual pipeline FPS: {actual_fps:.1f}")
 
-    if pipeline_times:
+    pipeline_stats = safe_latency_stats(pipeline_times)
+    capture_stats = safe_latency_stats(capture_times)
+    encode_stats = safe_latency_stats(encode_times)
+
+    if pipeline_stats:
         print(f"  Pipeline latency:")
-        print(f"    Avg: {statistics.mean(pipeline_times):.2f} ms")
-        print(f"    P95: {statistics.quantiles(pipeline_times, n=20)[18]:.2f} ms")
-        print(f"    Max: {max(pipeline_times):.2f} ms")
+        print(f"    Avg: {pipeline_stats['avg']:.2f} ms")
+        print(f"    P95: {pipeline_stats['p95']:.2f} ms")
+        print(f"    Max: {pipeline_stats['max']:.2f} ms")
 
-    if capture_times:
+    if capture_stats:
         print(f"  Capture latency:")
-        print(f"    Avg: {statistics.mean(capture_times):.2f} ms")
-        print(f"    Max: {max(capture_times):.2f} ms")
+        print(f"    Avg: {capture_stats['avg']:.2f} ms")
+        print(f"    Max: {capture_stats['max']:.2f} ms")
 
-    if encode_times:
+    if encode_stats:
         print(f"  Encode latency:")
-        print(f"    Avg: {statistics.mean(encode_times):.2f} ms")
-        print(f"    Max: {max(encode_times):.2f} ms")
+        print(f"    Avg: {encode_stats['avg']:.2f} ms")
+        print(f"    Max: {encode_stats['max']:.2f} ms")
 
 
 async def main():

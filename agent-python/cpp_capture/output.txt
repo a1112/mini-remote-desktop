@@ -1,0 +1,4 @@
+Microsoft Windows [Version 10.0.26300.7877]
+(c) Microsoft Corporation. All rights reserved.
+
+J:\ProjectTest\远程探查\mini-remote-desktop\agent-python\cpp_capture>

@@ -226,13 +226,19 @@ class NVENCAgent:
 
             self._transport_manager = create_transport_manager(
                 preferred=self.config.transport.preferred,
+                fallback=self.config.transport.fallback,
+                allow_webrtc_fallback=self.config.transport.allow_webrtc_fallback,
                 auto_switch=self.config.transport.auto_switch,
             )
 
             # Setup protocol switch event handler
             self._transport_manager.on("protocol_switched", self._on_protocol_switched)
 
-            logger.info(f"Transport manager initialized: {self._transport_manager.available_protocols}")
+            logger.info(
+                "Transport manager initialized: %s (webrtc_fallback=%s)",
+                self._transport_manager.available_protocols,
+                self.config.transport.allow_webrtc_fallback,
+            )
             return True
 
         except Exception as e:
