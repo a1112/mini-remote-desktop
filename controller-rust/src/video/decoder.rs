@@ -209,6 +209,10 @@ mod ffmpeg_backend {
         output_width: u32,
         output_height: u32,
         backend_name: String,
+        first_output_logged: bool,
+        wants_hw: bool,
+        require_hw: bool,
+        warned_non_hw_output: bool,
     }
 
     // Decoder is guarded by a mutex in upper layer; one-thread access.
@@ -218,12 +222,49 @@ mod ffmpeg_backend {
         pub fn new(config: H264DecoderConfig) -> Result<Self> {
             ffmpeg_next::init()?;
 
-            let codec = pick_decoder_codec()
+            let codec = pick_decoder_codec(&config)
                 .context("H.264 decoder codec not found")?;
             let backend_name = codec.name().to_string();
             let wants_hw = wants_d3d11va(&config);
+            let has_d3d11va_decoder = decoder::find_by_name("h264_d3d11va").is_some();
+            let require_hw = std::env::var("MRD_REQUIRE_D3D11VA")
+                .ok()
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if wants_hw {
+                tracing::info!(
+                    selected_codec = %backend_name,
+                    has_h264_d3d11va_decoder = has_d3d11va_decoder,
+                    require_d3d11va = require_hw,
+                    "decoder hardware intent"
+                );
+                if require_hw && !has_d3d11va_decoder {
+                    anyhow::bail!("MRD_REQUIRE_D3D11VA=1 but ffmpeg h264_d3d11va decoder is unavailable");
+                }
+            }
 
-            let opened = if wants_hw {
+            let opened = if wants_hw && backend_name == "h264_d3d11va" {
+                let mut ctx = build_decoder_context(&config);
+                match ctx.decoder().open_as(codec) {
+                    Ok(opened) => {
+                        tracing::info!("opened ffmpeg h264_d3d11va decoder");
+                        opened
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "open h264_d3d11va decoder failed, fallback to plain h264 decoder"
+                        );
+                        let fallback = decoder::find(codec::Id::H264)
+                            .context("fallback H.264 decoder codec not found")?;
+                        let mut fallback_ctx = build_decoder_context(&config);
+                        fallback_ctx
+                            .decoder()
+                            .open_as(fallback)
+                            .context("open fallback h264 decoder failed")?
+                    }
+                }
+            } else if wants_hw {
                 let mut opts = ffmpeg_next::Dictionary::new();
                 opts.set("hwaccel", "d3d11va");
                 opts.set("hwaccel_output_format", "d3d11");
@@ -263,6 +304,10 @@ mod ffmpeg_backend {
                 output_width: 0,
                 output_height: 0,
                 backend_name,
+                first_output_logged: false,
+                wants_hw,
+                require_hw,
+                warned_non_hw_output: false,
             })
         }
 
@@ -288,6 +333,33 @@ mod ffmpeg_backend {
                     self.output_width = width;
                     self.output_height = height;
                     let pts = self.video_frame.pts().unwrap_or_default() as u64;
+                    if !self.first_output_logged {
+                        tracing::info!(
+                            decoder = %self.backend_name,
+                            output_format = ?self.video_frame.format(),
+                            "ffmpeg decoder first output frame format"
+                        );
+                        self.first_output_logged = true;
+                    }
+
+                    #[cfg(windows)]
+                    if self.wants_hw
+                        && self.video_frame.format() != format::Pixel::D3D11
+                        && !self.warned_non_hw_output
+                    {
+                        self.warned_non_hw_output = true;
+                        if self.require_hw {
+                            anyhow::bail!(
+                                "MRD_REQUIRE_D3D11VA=1 but decoder output is {:?}, not D3D11",
+                                self.video_frame.format()
+                            );
+                        }
+                        tracing::warn!(
+                            decoder = %self.backend_name,
+                            output_format = ?self.video_frame.format(),
+                            "hardware decode requested but output is not D3D11; falling back to CPU upload path"
+                        );
+                    }
 
                     #[cfg(windows)]
                     if self.video_frame.format() == format::Pixel::D3D11 {
@@ -403,7 +475,20 @@ mod ffmpeg_backend {
         }
     }
 
-    fn pick_decoder_codec() -> Option<Codec> {
+    pub(super) fn preferred_decoder_names(config: &H264DecoderConfig) -> Vec<&'static str> {
+        if wants_d3d11va(config) {
+            vec!["h264_d3d11va", "h264"]
+        } else {
+            vec!["h264"]
+        }
+    }
+
+    fn pick_decoder_codec(config: &H264DecoderConfig) -> Option<Codec> {
+        for name in preferred_decoder_names(config) {
+            if let Some(c) = decoder::find_by_name(name) {
+                return Some(c);
+            }
+        }
         decoder::find(codec::Id::H264)
     }
 
@@ -496,5 +581,24 @@ mod tests {
 
         c.enable_hardware = false;
         assert!(!ffmpeg_backend::wants_d3d11va(&c));
+    }
+
+    #[cfg(feature = "ffmpeg-software")]
+    #[test]
+    fn prefers_d3d11va_decoder_name_when_hw_requested() {
+        let mut c = H264DecoderConfig::default();
+        c.backend = DecoderBackend::D3d11va;
+        let names = ffmpeg_backend::preferred_decoder_names(&c);
+        assert_eq!(names.first().copied(), Some("h264_d3d11va"));
+    }
+
+    #[cfg(feature = "ffmpeg-software")]
+    #[test]
+    fn prefers_software_decoder_name_when_hw_disabled() {
+        let mut c = H264DecoderConfig::default();
+        c.backend = DecoderBackend::Software;
+        c.enable_hardware = false;
+        let names = ffmpeg_backend::preferred_decoder_names(&c);
+        assert_eq!(names, vec!["h264"]);
     }
 }
