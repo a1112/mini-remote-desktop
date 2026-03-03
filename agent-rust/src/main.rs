@@ -928,14 +928,21 @@ fn advance_send_deadline(prev_due: Instant, gap: Duration, now: Instant) -> Inst
 }
 
 async fn wait_until_due(deadline: Instant) {
+    // On Windows, short tokio::sleep durations are often rounded by coarse timer
+    // granularity (~15.6ms). Keep the final short wait in cooperative/yield-spin
+    // mode so high-fps pacing is not collapsed to ~64fps.
+    const COARSE_SLEEP_GUARD: Duration = Duration::from_millis(12);
+    const YIELD_SPIN_THRESHOLD: Duration = Duration::from_micros(200);
     loop {
         let now = Instant::now();
         if now >= deadline {
             break;
         }
         let remain = deadline - now;
-        if remain > Duration::from_millis(2) {
-            tokio::time::sleep(remain - Duration::from_millis(1)).await;
+        if remain > COARSE_SLEEP_GUARD {
+            tokio::time::sleep(remain - COARSE_SLEEP_GUARD).await;
+        } else if remain > YIELD_SPIN_THRESHOLD {
+            tokio::task::yield_now().await;
         } else {
             std::hint::spin_loop();
         }
@@ -962,6 +969,18 @@ mod tests {
         let gap = Duration::from_millis(16);
         let next = advance_send_deadline(prev, gap, now);
         assert_eq!(next, now);
+    }
+
+    #[tokio::test]
+    async fn wait_until_due_preserves_sub_10ms_deadline() {
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(4);
+        wait_until_due(deadline).await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(12),
+            "wait_until_due overslept short deadline: elapsed={elapsed:?}"
+        );
     }
 
 }
