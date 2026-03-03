@@ -21,3 +21,9 @@ heartbeat_interval_secs = 30
 # 连接超时 (秒，默认: 60)
 # 客户端在此时间内未发送心跳将被断开
 connection_timeout_secs = 60
+
+# UDP 服务发现（控制器广播探测）开关
+discovery_enable = true
+
+# UDP 服务发现端口（默认: 9528）
+discovery_port = 9528

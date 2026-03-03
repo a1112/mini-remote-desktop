@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, RwLock};
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
@@ -17,6 +17,8 @@ const DEFAULT_CHANNEL_CAPACITY: usize = 32;
 const DEFAULT_MAX_MSG_SIZE: usize = 1_048_576; // 1MB
 const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 30;
 const DEFAULT_CONNECTION_TIMEOUT_SECS: u64 = 60;
+const DEFAULT_DISCOVERY_PORT: u16 = 9528;
+const DISCOVERY_MAGIC: &[u8] = b"MRD_DISCOVER_V1";
 
 /// 服务器配置
 #[derive(Debug, Clone, Deserialize)]
@@ -33,6 +35,10 @@ struct ServerConfig {
     heartbeat_interval_secs: u64,
     #[serde(default = "default_connection_timeout")]
     connection_timeout_secs: u64,
+    #[serde(default = "default_discovery_enable")]
+    discovery_enable: bool,
+    #[serde(default = "default_discovery_port")]
+    discovery_port: u16,
 }
 
 fn default_port() -> u16 { DEFAULT_PORT }
@@ -41,6 +47,8 @@ fn default_channel_capacity() -> usize { DEFAULT_CHANNEL_CAPACITY }
 fn default_max_msg_size() -> usize { DEFAULT_MAX_MSG_SIZE }
 fn default_heartbeat_interval() -> u64 { DEFAULT_HEARTBEAT_INTERVAL_SECS }
 fn default_connection_timeout() -> u64 { DEFAULT_CONNECTION_TIMEOUT_SECS }
+fn default_discovery_enable() -> bool { true }
+fn default_discovery_port() -> u16 { DEFAULT_DISCOVERY_PORT }
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -51,6 +59,8 @@ impl Default for ServerConfig {
             max_msg_size: default_max_msg_size(),
             heartbeat_interval_secs: default_heartbeat_interval(),
             connection_timeout_secs: default_connection_timeout(),
+            discovery_enable: default_discovery_enable(),
+            discovery_port: default_discovery_port(),
         }
     }
 }
@@ -67,6 +77,7 @@ fn load_config(path: &Path) -> ServerConfig {
                     cfg.max_msg_size = cfg.max_msg_size.clamp(1024, 100 * 1024 * 1024);
                     cfg.heartbeat_interval_secs = cfg.heartbeat_interval_secs.clamp(5, 300);
                     cfg.connection_timeout_secs = cfg.connection_timeout_secs.clamp(10, 600);
+                    cfg.discovery_port = cfg.discovery_port.clamp(1024, 65535);
                     info!(config_path = %path.display(), ?cfg, "loaded configuration from file");
                     cfg
                 }
@@ -131,6 +142,18 @@ async fn main() {
         Duration::from_secs(cfg.heartbeat_interval_secs),
         Duration::from_secs(cfg.connection_timeout_secs),
     );
+    if cfg.discovery_enable {
+        let discovery_host = cfg.host.clone();
+        let discovery_port = cfg.discovery_port;
+        let ws_port = cfg.port;
+        tokio::spawn(async move {
+            if let Err(e) = run_discovery_responder(&discovery_host, discovery_port, ws_port).await {
+                error!(error = %e, "discovery responder stopped");
+            }
+        });
+    } else {
+        info!("UDP discovery responder disabled by config");
+    }
 
     loop {
         let (stream, addr) = match listener.accept().await {
@@ -149,6 +172,38 @@ async fn main() {
                 error!(address = %addr, error = %e, "connection error");
             }
         });
+    }
+}
+
+async fn run_discovery_responder(host: &str, discovery_port: u16, ws_port: u16) -> Result<(), String> {
+    let sock = UdpSocket::bind((host, discovery_port))
+        .await
+        .map_err(|e| format!("discovery udp bind failed: {e}"))?;
+    info!(
+        host = %host,
+        discovery_port,
+        ws_port,
+        "UDP discovery responder listening"
+    );
+    let mut buf = [0_u8; 512];
+    loop {
+        let (n, peer) = sock
+            .recv_from(&mut buf)
+            .await
+            .map_err(|e| format!("discovery recv_from failed: {e}"))?;
+        if &buf[..n] != DISCOVERY_MAGIC {
+            continue;
+        }
+        let reply = json!({
+            "proto": "mrd-discovery-v1",
+            "ws_port": ws_port
+        })
+        .to_string();
+        if let Err(e) = sock.send_to(reply.as_bytes(), peer).await {
+            warn!(error = %e, peer = %peer, "failed to send discovery response");
+            continue;
+        }
+        info!(peer = %peer, "sent discovery response");
     }
 }
 
@@ -327,6 +382,21 @@ async fn handle_message(conn_id: &str, tx: &mpsc::Sender<Message>, text: &str, s
                 "type":"webrtc",
                 "action":"iceCandidate",
                 "payload":{"candidate": candidate, "controllerId": conn_id}
+            })
+            .to_string();
+            send_to_device(target, &msg, state).await;
+        }
+        "updateCapture" => {
+            let target = v["payload"]["targetDeviceId"].as_str().unwrap_or("");
+            if target.is_empty() {
+                warn!(conn_id = %conn_id, "updateCapture missing targetDeviceId");
+                return;
+            }
+            let capture = v["payload"]["capture"].clone();
+            let msg = json!({
+                "type":"control",
+                "action":"updateCapture",
+                "payload":{"controllerId": conn_id, "capture": capture}
             })
             .to_string();
             send_to_device(target, &msg, state).await;

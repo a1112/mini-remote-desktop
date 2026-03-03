@@ -12,13 +12,15 @@ type FrameReceiver = Arc<Mutex<mpsc::Receiver<webrtc::peer::VideoFrame>>>;
 use anyhow::{Context, Result};
 use uuid::Uuid;
 use quic_rx::{QuicConnectInfo, connect_quic_receiver};
-use render::D3D11Renderer;
+use render::{D3D11Renderer, OverlaySwitchField};
 use signaling::{SignalingClient, SignalingMessagePayload};
 use signaling::client::SignalingConfig;
 use stats::StatsCollector;
+use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{error, info, warn};
 use video::{Decoder, DecoderBackend, H264Decoder, H264DecoderConfig};
@@ -53,10 +55,14 @@ fn load_config(path: &PathBuf) -> Result<ControllerConfig> {
         });
 
     let json: serde_json::Value = serde_json::from_str(&raw)?;
-    let ws_url = json["ws_url"]
-        .as_str()
-        .unwrap_or("ws://127.0.0.1:9527")
-        .to_string();
+    let ws_url = std::env::var("MRD_SIGNALING_URL")
+        .ok()
+        .or_else(|| {
+            json["ws_url"]
+                .as_str()
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "ws://127.0.0.1:9527".to_string());
     let device_name = json["device_name"]
         .as_str()
         .unwrap_or("Rust Controller")
@@ -102,6 +108,62 @@ fn load_config(path: &PathBuf) -> Result<ControllerConfig> {
     })
 }
 
+fn should_try_discovery(ws_url: &str) -> bool {
+    if std::env::var("MRD_DISCOVERY")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    ws_url.contains("127.0.0.1") || ws_url.contains("localhost") || ws_url.contains("0.0.0.0")
+}
+
+fn parse_ws_port(ws_url: &str) -> u16 {
+    let s = ws_url
+        .strip_prefix("ws://")
+        .or_else(|| ws_url.strip_prefix("wss://"))
+        .unwrap_or(ws_url);
+    let host_port = s.split('/').next().unwrap_or(s);
+    host_port
+        .rsplit(':')
+        .next()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(9527)
+}
+
+async fn discover_signaling_ws_url(default_ws_port: u16) -> Option<String> {
+    let discovery_port = std::env::var("MRD_DISCOVERY_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(9528);
+    let timeout_ms = std::env::var("MRD_DISCOVERY_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(900);
+    let sock = UdpSocket::bind("0.0.0.0:0").await.ok()?;
+    let _ = sock.set_broadcast(true);
+    let probe = b"MRD_DISCOVER_V1";
+    let _ = sock.send_to(probe, format!("255.255.255.255:{discovery_port}")).await;
+    let _ = sock.send_to(probe, format!("127.0.0.1:{discovery_port}")).await;
+    let mut buf = [0_u8; 512];
+    let recv = tokio::time::timeout(Duration::from_millis(timeout_ms), sock.recv_from(&mut buf))
+        .await
+        .ok()?
+        .ok()?;
+    let (n, addr) = recv;
+    if n == 0 {
+        return None;
+    }
+    let mut ws_port = default_ws_port;
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&buf[..n]) {
+        if let Some(p) = v.get("ws_port").and_then(|x| x.as_u64()) {
+            ws_port = p as u16;
+        }
+    }
+    Some(format!("ws://{}:{}", addr.ip(), ws_port))
+}
+
 fn select_frame_for_decode(
     _rx: &mut mpsc::Receiver<webrtc::peer::VideoFrame>,
     first: webrtc::peer::VideoFrame,
@@ -112,6 +174,8 @@ fn select_frame_for_decode(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // 初始化日志
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -124,7 +188,15 @@ async fn main() -> Result<()> {
 
     // 加载配置
     let config_path = PathBuf::from("config.json");
-    let config = load_config(&config_path)?;
+    let mut config = load_config(&config_path)?;
+    if should_try_discovery(&config.signaling.ws_url) {
+        if let Some(found) = discover_signaling_ws_url(parse_ws_port(&config.signaling.ws_url)).await {
+            info!(original = %config.signaling.ws_url, discovered = %found, "signaling discovery succeeded");
+            config.signaling.ws_url = found;
+        } else {
+            warn!(ws_url = %config.signaling.ws_url, "signaling discovery not found, using configured ws_url");
+        }
+    }
     info!(
         ws_url = %config.signaling.ws_url,
         device_name = %config.signaling.device_name,
@@ -146,6 +218,11 @@ async fn main() -> Result<()> {
         video_frames_received.clone(),
     )?);
     info!("DirectX 11 renderer initialized");
+    let overlay_stats = renderer.overlay_stats_handle();
+    if let Ok(mut ov) = overlay_stats.lock() {
+        ov.selected_transport = config.signaling.preferred_transport.clone();
+        ov.media_path = "webrtc".to_string();
+    }
 
     // 创建解码器
     let decoder = Arc::new(Mutex::new(H264Decoder::new(config.video.clone())?));
@@ -178,9 +255,9 @@ async fn main() -> Result<()> {
     let decoded_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let frame_count_clone = frame_count.clone();
     let decoded_count_clone = decoded_count.clone();
-    let video_frames_count_clone = video_frames_received.clone();
     let decoder_clone = decoder.clone();
     let render_sink = renderer.frame_sink();
+    let overlay_stats_for_decode = overlay_stats.clone();
 
     // 启动视频帧处理任务
     let frame_receiver_clone = frame_receiver.clone();
@@ -194,6 +271,9 @@ async fn main() -> Result<()> {
             let d = decoder_clone.lock().await;
             d.backend_name().to_string()
         };
+        if let Ok(mut ov) = overlay_stats_for_decode.lock() {
+            ov.decoder_backend = decoder_backend_label.clone();
+        }
         // 处理视频帧
         loop {
             let active_rx = {
@@ -218,11 +298,11 @@ async fn main() -> Result<()> {
                         let dec = decoded_count_clone
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                             + 1;
-                        // 仅在解码成功后计入渲染链路统计。
-                        video_frames_count_clone
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if dec % 100 == 0 {
                             info!(decoded_frames = dec, "decoded video frame");
+                        }
+                        if let Ok(mut ov) = overlay_stats_for_decode.lock() {
+                            ov.decoded_frames = dec;
                         }
 
                         let now = std::time::Instant::now();
@@ -257,6 +337,10 @@ async fn main() -> Result<()> {
                     Ok(None) => {}
                     Err(e) => {
                         warn!(error = %e, "decode failed");
+                        if let Ok(mut ov) = overlay_stats_for_decode.lock() {
+                            ov.decode_failures = ov.decode_failures.saturating_add(1);
+                            ov.last_decode_error = e.to_string();
+                        }
                     }
                 }
                 drop(decoder);
@@ -330,6 +414,16 @@ async fn main() -> Result<()> {
                         samples = decode_sorted.len(),
                         "[DECODER-STATS]"
                     );
+                    if let Ok(mut ov) = overlay_stats_for_decode.lock() {
+                        ov.decode_fps = fps;
+                        ov.avg_decode_ms = avg_decode;
+                        ov.p95_decode_ms = p95;
+                        ov.jitter_ms = jitter;
+                        ov.e2e_avg_ms = e2e_avg;
+                        ov.e2e_p50_ms = e2e_p50;
+                        ov.e2e_p95_ms = e2e_p95;
+                        ov.e2e_p99_ms = e2e_p99;
+                    }
                     last_stats_at = std::time::Instant::now();
                 }
                 // TODO: 解码并渲染视频帧
@@ -425,6 +519,9 @@ async fn main() -> Result<()> {
                         selected_transport,
                         quic,
                     } => {
+                        if let Ok(mut ov) = overlay_stats.lock() {
+                            ov.selected_transport = selected_transport.clone();
+                        }
                         info!(
                             controller_id = %controller_id,
                             selected_transport = %selected_transport,
@@ -455,11 +552,17 @@ async fn main() -> Result<()> {
                                     Ok(rx) => {
                                         *frame_receiver.lock().await = Some(rx);
                                         *connected.lock().await = true;
+                                        if let Ok(mut ov) = overlay_stats.lock() {
+                                            ov.media_path = "quic".to_string();
+                                        }
                                         info!("connected to QUIC media transport");
                                     }
                                     Err(e) => {
                                         if webrtc_ready {
                                             *connected.lock().await = true;
+                                            if let Ok(mut ov) = overlay_stats.lock() {
+                                                ov.media_path = "webrtc".to_string();
+                                            }
                                             warn!(
                                                 error = %e,
                                                 "failed to connect QUIC media transport, fallback to WebRTC media path"
@@ -474,12 +577,18 @@ async fn main() -> Result<()> {
                                 }
                             } else if webrtc_ready {
                                 *connected.lock().await = true;
+                                if let Ok(mut ov) = overlay_stats.lock() {
+                                    ov.media_path = "webrtc".to_string();
+                                }
                                 warn!("selected transport is quic but quic endpoint info is missing, fallback to WebRTC");
                             } else {
                                 warn!("selected transport is quic but quic endpoint info is missing");
                             }
                         } else if webrtc_ready {
                             *connected.lock().await = true;
+                            if let Ok(mut ov) = overlay_stats.lock() {
+                                ov.media_path = "webrtc".to_string();
+                            }
                         }
                     }
                     SignalingMessagePayload::IceCandidate { candidate, .. } => {
@@ -506,7 +615,71 @@ async fn main() -> Result<()> {
 
             // 检查窗口消息
             _ = tokio::time::sleep(Duration::from_millis(10)) => {
-                // 继续
+                let cmds = renderer.drain_overlay_switch_commands();
+                if !cmds.is_empty() {
+                    let target = current_agent_id.lock().await.clone();
+                    if let Some(target_device_id) = target {
+                        // 强制切换时先断开本地旧会话，避免旧流状态阻塞新配置生效。
+                        let old_manager = {
+                            let mut pm = peer_manager.write().await;
+                            pm.take()
+                        };
+                        if let Some(old) = old_manager {
+                            if let Err(e) = old.pc.close().await {
+                                warn!(error = %e, "failed to close previous controller peer on switch");
+                            }
+                        }
+                        *frame_receiver.lock().await = None;
+                        *connected.lock().await = false;
+
+                        for cmd in cmds {
+                            let patch = match cmd.field {
+                                OverlaySwitchField::Resolution => {
+                                    if cmd.value == "0x0" {
+                                        json!({"targetWidth": 0, "targetHeight": 0})
+                                    } else {
+                                        let parts: Vec<&str> = cmd.value.split('x').collect();
+                                        if parts.len() == 2 {
+                                            let w = parts[0].parse::<u32>().unwrap_or(0);
+                                            let h = parts[1].parse::<u32>().unwrap_or(0);
+                                            json!({"targetWidth": w, "targetHeight": h})
+                                        } else {
+                                            json!({})
+                                        }
+                                    }
+                                }
+                                OverlaySwitchField::CaptureWindow => json!({"windowMode": cmd.value}),
+                                OverlaySwitchField::Bitrate => {
+                                    let br = cmd.value.parse::<u32>().unwrap_or(12000);
+                                    json!({"bitrateKbps": br})
+                                }
+                                OverlaySwitchField::CaptureBackend => json!({"backend": cmd.value}),
+                                OverlaySwitchField::Encoder => json!({"encoder": cmd.value}),
+                            };
+                            if patch != json!({}) {
+                                if let Err(e) = signaling_arc
+                                    .send_capture_update(&target_device_id, patch.clone())
+                                    .await
+                                {
+                                    warn!(error = %e, "send capture update failed");
+                                    continue;
+                                }
+                                info!(target = %target_device_id, patch = %patch, "sent capture update");
+                            }
+                        }
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        let _ = initiate_webRTC_connection(
+                            &target_device_id,
+                            &signaling_arc,
+                            &peer_manager,
+                            &current_agent_id,
+                            &frame_receiver,
+                        )
+                        .await;
+                    } else {
+                        warn!("overlay switch requested but no active agent connected");
+                    }
+                }
             }
         }
     }

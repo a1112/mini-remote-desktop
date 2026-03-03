@@ -31,12 +31,160 @@ struct SharedFrame {
     sequence: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct OverlaySharedStats {
+    pub selected_transport: String,
+    pub media_path: String,
+    pub decoder_backend: String,
+    pub decoded_frames: u64,
+    pub decode_fps: f64,
+    pub avg_decode_ms: f64,
+    pub p95_decode_ms: f64,
+    pub jitter_ms: f64,
+    pub e2e_avg_ms: f64,
+    pub e2e_p50_ms: f64,
+    pub e2e_p95_ms: f64,
+    pub e2e_p99_ms: f64,
+    pub decode_failures: u64,
+    pub last_decode_error: String,
+}
+
+impl Default for OverlaySharedStats {
+    fn default() -> Self {
+        Self {
+            selected_transport: "unknown".to_string(),
+            media_path: "webrtc".to_string(),
+            decoder_backend: "h264".to_string(),
+            decoded_frames: 0,
+            decode_fps: 0.0,
+            avg_decode_ms: -1.0,
+            p95_decode_ms: -1.0,
+            jitter_ms: -1.0,
+            e2e_avg_ms: -1.0,
+            e2e_p50_ms: -1.0,
+            e2e_p95_ms: -1.0,
+            e2e_p99_ms: -1.0,
+            decode_failures: 0,
+            last_decode_error: String::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OverlayPanel {
+    Overview,
+    Pipeline,
+    Transport,
+    Debug,
+}
+
+impl OverlayPanel {
+    fn title(self) -> &'static str {
+        match self {
+            Self::Overview => "Overview",
+            Self::Pipeline => "Pipeline",
+            Self::Transport => "Transport",
+            Self::Debug => "Debug",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct OverlayRenderMetrics {
+    rendered_frames: u64,
+    render_fps: f64,
+    received_frames: u64,
+    receive_fps: f64,
+    present_avg_ms: f64,
+    present_p50_ms: f64,
+    present_p95_ms: f64,
+    present_p99_ms: f64,
+}
+
+#[derive(Debug)]
+struct OverlayUiState {
+    collapsed: bool,
+    panel: OverlayPanel,
+    last_text: String,
+    res_idx: usize,
+    win_idx: usize,
+    br_idx: usize,
+    cap_idx: usize,
+    enc_idx: usize,
+    control_queue: Arc<Mutex<Vec<OverlaySwitchCommand>>>,
+}
+
+impl OverlayUiState {
+    fn new(control_queue: Arc<Mutex<Vec<OverlaySwitchCommand>>>) -> Self {
+        Self {
+            collapsed: false,
+            panel: OverlayPanel::Overview,
+            last_text: String::new(),
+            res_idx: 1,
+            win_idx: 0,
+            br_idx: 2,
+            cap_idx: 0,
+            enc_idx: 0,
+            control_queue,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum OverlaySwitchField {
+    Resolution,
+    CaptureWindow,
+    Bitrate,
+    CaptureBackend,
+    Encoder,
+}
+
+#[derive(Debug, Clone)]
+pub struct OverlaySwitchCommand {
+    pub field: OverlaySwitchField,
+    pub value: String,
+}
+
+const RES_PRESETS: [(&str, &str, &str); 5] = [
+    ("native", "0x0", "RES:native"),
+    ("1080p", "1920x1080", "RES:1080p"),
+    ("2k", "2560x1440", "RES:2k"),
+    ("4k", "3840x2160", "RES:4k"),
+    ("720p", "1280x720", "RES:720p"),
+];
+const WIN_PRESETS: [(&str, &str); 2] = [("auto", "WIN:auto"), ("foreground", "WIN:fg")];
+const BR_PRESETS: [(&str, &str); 5] = [
+    ("8000", "BR:8M"),
+    ("12000", "BR:12M"),
+    ("20000", "BR:20M"),
+    ("30000", "BR:30M"),
+    ("50000", "BR:50M"),
+];
+const CAP_PRESETS: [(&str, &str); 3] = [("dxgi", "CAP:dxgi"), ("wgc", "CAP:wgc"), ("auto", "CAP:auto")];
+const ENC_PRESETS: [(&str, &str); 3] = [("nvenc", "ENC:nvenc"), ("openh264", "ENC:openh264"), ("auto", "ENC:auto")];
+
+const ID_BTN_COLLAPSE: i32 = 101;
+const ID_BTN_COPY: i32 = 102;
+const ID_BTN_OVERVIEW: i32 = 103;
+const ID_BTN_PIPELINE: i32 = 104;
+const ID_BTN_TRANSPORT: i32 = 105;
+const ID_BTN_DEBUG: i32 = 106;
+const ID_BTN_CLOSE: i32 = 107;
+const ID_BTN_RESOLUTION: i32 = 108;
+const ID_BTN_WINDOW: i32 = 109;
+const ID_BTN_BITRATE: i32 = 110;
+const ID_BTN_CAPTURE: i32 = 111;
+const ID_BTN_ENCODER: i32 = 112;
+const ID_EDIT_PANEL: i32 = 201;
+
 pub struct D3D11Renderer {
     window: HWND,
     frame_count: Arc<AtomicU64>,
     video_frames_received: Arc<AtomicU64>,
     running: Arc<AtomicBool>,
     shared_frame: Arc<Mutex<SharedFrame>>,
+    overlay_stats: Arc<Mutex<OverlaySharedStats>>,
+    overlay_control_queue: Arc<Mutex<Vec<OverlaySwitchCommand>>>,
 }
 
 #[derive(Clone)]
@@ -68,19 +216,27 @@ impl D3D11Renderer {
         let frame_count = Arc::new(AtomicU64::new(0));
         let running = Arc::new(AtomicBool::new(true));
         let shared_frame = Arc::new(Mutex::new(SharedFrame::default()));
+        let overlay_stats = Arc::new(Mutex::new(OverlaySharedStats::default()));
+        let overlay_control_queue = Arc::new(Mutex::new(Vec::<OverlaySwitchCommand>::new()));
         let (window_tx, window_rx) = std::sync::mpsc::sync_channel::<std::result::Result<isize, String>>(1);
 
         let frame_count_clone = frame_count.clone();
         let video_frames_clone = video_frames_received.clone();
         let running_clone = running.clone();
         let shared_frame_clone = shared_frame.clone();
+        let overlay_stats_clone = overlay_stats.clone();
+        let control_queue_clone = overlay_control_queue.clone();
         let config_clone = config.clone();
         thread::spawn(move || {
             unsafe {
                 let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
             }
 
-            let window = match Self::create_window(config_clone.window_width, config_clone.window_height) {
+            let window = match Self::create_window(
+                config_clone.window_width,
+                config_clone.window_height,
+                control_queue_clone.clone(),
+            ) {
                 Ok(w) => {
                     let _ = window_tx.send(Ok(w.0 as isize));
                     w
@@ -98,7 +254,8 @@ impl D3D11Renderer {
                 video_frames_clone,
                 running_clone,
                 shared_frame_clone,
-                config_clone.vsync,
+                overlay_stats_clone,
+                config_clone,
             ) {
                 error!(error = %e, "render loop failed");
             }
@@ -117,6 +274,8 @@ impl D3D11Renderer {
             video_frames_received,
             running,
             shared_frame,
+            overlay_stats,
+            overlay_control_queue,
         })
     }
 
@@ -131,6 +290,18 @@ impl D3D11Renderer {
         }
     }
 
+    pub fn overlay_stats_handle(&self) -> Arc<Mutex<OverlaySharedStats>> {
+        self.overlay_stats.clone()
+    }
+
+    pub fn drain_overlay_switch_commands(&self) -> Vec<OverlaySwitchCommand> {
+        if let Ok(mut q) = self.overlay_control_queue.lock() {
+            std::mem::take(&mut *q)
+        } else {
+            Vec::new()
+        }
+    }
+
     pub fn update_video_stats(&self, _frame: &super::super::webrtc::peer::VideoFrame) {
         self.video_frames_received.fetch_add(1, Ordering::Relaxed);
     }
@@ -141,7 +312,8 @@ impl D3D11Renderer {
         video_frames_received: Arc<AtomicU64>,
         running: Arc<AtomicBool>,
         shared_frame: Arc<Mutex<SharedFrame>>,
-        vsync: bool,
+        overlay_stats: Arc<Mutex<OverlaySharedStats>>,
+        config: RendererConfig,
     ) -> Result<()> {
         let mut msg = MSG::default();
         let started_at = Instant::now();
@@ -149,8 +321,15 @@ impl D3D11Renderer {
         let mut present_samples_ms: std::collections::VecDeque<f64> =
             std::collections::VecDeque::with_capacity(1024);
         let mut last_present_stats = Instant::now();
+        let mut ui_last_update = Instant::now();
+        let mut last_rate_sample = Instant::now();
+        let mut last_rendered_count = 0u64;
+        let mut last_received_count = 0u64;
+        let mut cpu_upload_frames = 0u64;
+        let mut gpu_external_frames = 0u64;
+        let mut metrics = OverlayRenderMetrics::default();
 
-        let mut d3d = D3DContext::new(window, vsync)?;
+        let mut d3d = D3DContext::new(window, &config)?;
 
         while running.load(Ordering::Relaxed) {
             unsafe {
@@ -186,6 +365,7 @@ impl D3D11Renderer {
             if let Some(frame) = maybe_frame {
                 match &frame.data {
                     DecodedFrameData::CpuNv12(_) => {
+                        cpu_upload_frames = cpu_upload_frames.saturating_add(1);
                         d3d.upload_nv12(&frame)?;
                         d3d.draw_frame()?;
                     }
@@ -193,6 +373,7 @@ impl D3D11Renderer {
                         texture,
                         subresource,
                     } => {
+                        gpu_external_frames = gpu_external_frames.saturating_add(1);
                         d3d.draw_external_nv12(texture, *subresource, frame.width, frame.height)?;
                     }
                 }
@@ -227,6 +408,10 @@ impl D3D11Renderer {
                         .min((sorted.len().saturating_sub(1)) as f64) as usize
                 };
                 let avg = sorted.iter().sum::<f64>() / sorted.len() as f64;
+                metrics.present_avg_ms = avg;
+                metrics.present_p50_ms = sorted[idx(0.50)];
+                metrics.present_p95_ms = sorted[idx(0.95)];
+                metrics.present_p99_ms = sorted[idx(0.99)];
                 info!(
                     capture_to_present_avg_ms = format!("{:.3}", avg),
                     capture_to_present_p50_ms = format!("{:.3}", sorted[idx(0.50)]),
@@ -239,18 +424,38 @@ impl D3D11Renderer {
             }
 
             let rendered = frame_count.load(Ordering::Relaxed);
-            if rendered % 240 == 0 && rendered > 0 {
-                let elapsed = started_at.elapsed().as_secs_f64().max(0.001);
-                let render_fps = (rendered as f64 / elapsed).round() as u64;
-                let recv = video_frames_received.load(Ordering::Relaxed);
-                let recv_fps = (recv as f64 / elapsed).round() as u64;
+            let recv = video_frames_received.load(Ordering::Relaxed);
+            if last_rate_sample.elapsed() >= Duration::from_secs(1) {
+                let dt = last_rate_sample.elapsed().as_secs_f64().max(0.001);
+                let render_fps = (rendered.saturating_sub(last_rendered_count)) as f64 / dt;
+                let recv_fps = (recv.saturating_sub(last_received_count)) as f64 / dt;
+                metrics.rendered_frames = rendered;
+                metrics.render_fps = render_fps;
+                metrics.received_frames = recv;
+                metrics.receive_fps = recv_fps;
                 info!(
                     rendered_frames = rendered,
-                    rendered_fps = render_fps,
+                    rendered_fps = format!("{:.2}", render_fps),
                     received_frames = recv,
-                    received_fps = recv_fps,
+                    received_fps = format!("{:.2}", recv_fps),
+                    gpu_external_frames,
+                    cpu_upload_frames,
+                    gpu_zero_copy_ratio = format!(
+                        "{:.3}",
+                        (gpu_external_frames as f64)
+                            / ((gpu_external_frames + cpu_upload_frames).max(1) as f64)
+                    ),
+                    uptime_s = format!("{:.2}", started_at.elapsed().as_secs_f64()),
                     "renderer progress"
                 );
+                last_rate_sample = Instant::now();
+                last_rendered_count = rendered;
+                last_received_count = recv;
+            }
+            if ui_last_update.elapsed() >= Duration::from_millis(250) {
+                let shared = overlay_stats.lock().map(|v| v.clone()).unwrap_or_default();
+                Self::update_overlay_panel(window, &metrics, &shared);
+                ui_last_update = Instant::now();
             }
         }
 
@@ -265,6 +470,26 @@ impl D3D11Renderer {
         lparam: LPARAM,
     ) -> LRESULT {
         match message {
+            WM_COMMAND => {
+                Self::on_overlay_command(window, wparam);
+                LRESULT(0)
+            }
+            WM_SIZE => {
+                Self::layout_overlay_controls(window);
+                LRESULT(0)
+            }
+            WM_ERASEBKGND => LRESULT(1),
+            WM_NCHITTEST => {
+                // Borderless window move area: top toolbar.
+                let x = (lparam.0 as i16) as i32;
+                let y = ((lparam.0 >> 16) as i16) as i32;
+                let mut pt = POINT { x, y };
+                let _ = ScreenToClient(window, &mut pt);
+                if pt.y >= 0 && pt.y <= 62 {
+                    return LRESULT(HTCAPTION as isize);
+                }
+                DefWindowProcW(window, message, wparam, lparam)
+            }
             WM_PAINT => {
                 let mut ps = PAINTSTRUCT::default();
                 let _ = BeginPaint(window, &mut ps);
@@ -275,11 +500,25 @@ impl D3D11Renderer {
                 PostQuitMessage(0);
                 LRESULT(0)
             }
+            WM_NCDESTROY => {
+                let ptr = unsafe { GetWindowLongPtrW(window, GWLP_USERDATA) as *mut OverlayUiState };
+                if !ptr.is_null() {
+                    unsafe {
+                        let _ = SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+                        drop(Box::from_raw(ptr));
+                    }
+                }
+                DefWindowProcW(window, message, wparam, lparam)
+            }
             _ => DefWindowProcW(window, message, wparam, lparam),
         }
     }
 
-    fn create_window(width: u32, height: u32) -> Result<HWND> {
+    fn create_window(
+        width: u32,
+        height: u32,
+        control_queue: Arc<Mutex<Vec<OverlaySwitchCommand>>>,
+    ) -> Result<HWND> {
         unsafe {
             let instance = GetModuleHandleW(None)?;
             let class_name = windows::core::w!("ControllerWindowD3D11");
@@ -288,7 +527,7 @@ impl D3D11Renderer {
                 lpfnWndProc: Some(Self::window_proc),
                 hInstance: instance.into(),
                 lpszClassName: class_name,
-                hbrBackground: HBRUSH((COLOR_WINDOW.0 + 1) as *mut _),
+                hbrBackground: HBRUSH::default(),
                 hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
                 cbClsExtra: 0,
                 cbWndExtra: 0,
@@ -303,11 +542,19 @@ impl D3D11Renderer {
                 }
             }
 
+            let borderless = std::env::var("MRD_BORDERLESS")
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(true);
+            let style = if borderless {
+                WS_POPUP | WS_VISIBLE | WS_CLIPCHILDREN | WS_SYSMENU | WS_MINIMIZEBOX
+            } else {
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN
+            };
             let window = CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 class_name,
                 windows::core::w!("Remote Desktop - D3D11"),
-                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                style,
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
                 width as i32,
@@ -318,7 +565,511 @@ impl D3D11Renderer {
                 None,
             )
             .context("failed to create window")?;
+            Self::init_overlay_controls(window, control_queue)?;
+            Self::layout_overlay_controls(window);
             Ok(window)
+        }
+    }
+
+    fn init_overlay_controls(
+        window: HWND,
+        control_queue: Arc<Mutex<Vec<OverlaySwitchCommand>>>,
+    ) -> Result<()> {
+        unsafe {
+            let hinstance = GetModuleHandleW(None)?;
+            let _collapse = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                windows::core::w!("BUTTON"),
+                windows::core::w!("收起"),
+                WS_CHILD | WS_VISIBLE,
+                8,
+                6,
+                60,
+                24,
+                Some(window),
+                Some(HMENU(ID_BTN_COLLAPSE as isize as *mut c_void)),
+                Some(hinstance.into()),
+                None,
+            )?;
+            let _copy = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                windows::core::w!("BUTTON"),
+                windows::core::w!("复制"),
+                WS_CHILD | WS_VISIBLE,
+                72,
+                6,
+                60,
+                24,
+                Some(window),
+                Some(HMENU(ID_BTN_COPY as isize as *mut c_void)),
+                Some(hinstance.into()),
+                None,
+            )?;
+            let _overview = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                windows::core::w!("BUTTON"),
+                windows::core::w!("总览"),
+                WS_CHILD | WS_VISIBLE,
+                136,
+                6,
+                56,
+                24,
+                Some(window),
+                Some(HMENU(ID_BTN_OVERVIEW as isize as *mut c_void)),
+                Some(hinstance.into()),
+                None,
+            )?;
+            let _pipeline = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                windows::core::w!("BUTTON"),
+                windows::core::w!("链路"),
+                WS_CHILD | WS_VISIBLE,
+                196,
+                6,
+                56,
+                24,
+                Some(window),
+                Some(HMENU(ID_BTN_PIPELINE as isize as *mut c_void)),
+                Some(hinstance.into()),
+                None,
+            )?;
+            let _transport = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                windows::core::w!("BUTTON"),
+                windows::core::w!("传输"),
+                WS_CHILD | WS_VISIBLE,
+                256,
+                6,
+                56,
+                24,
+                Some(window),
+                Some(HMENU(ID_BTN_TRANSPORT as isize as *mut c_void)),
+                Some(hinstance.into()),
+                None,
+            )?;
+            let _debug = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                windows::core::w!("BUTTON"),
+                windows::core::w!("调试"),
+                WS_CHILD | WS_VISIBLE,
+                316,
+                6,
+                56,
+                24,
+                Some(window),
+                Some(HMENU(ID_BTN_DEBUG as isize as *mut c_void)),
+                Some(hinstance.into()),
+                None,
+            )?;
+            let _close = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                windows::core::w!("BUTTON"),
+                windows::core::w!("关闭"),
+                WS_CHILD | WS_VISIBLE,
+                376,
+                6,
+                56,
+                24,
+                Some(window),
+                Some(HMENU(ID_BTN_CLOSE as isize as *mut c_void)),
+                Some(hinstance.into()),
+                None,
+            )?;
+            let _res = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                windows::core::w!("BUTTON"),
+                windows::core::w!("RES:1080p"),
+                WS_CHILD | WS_VISIBLE,
+                8,
+                34,
+                86,
+                24,
+                Some(window),
+                Some(HMENU(ID_BTN_RESOLUTION as isize as *mut c_void)),
+                Some(hinstance.into()),
+                None,
+            )?;
+            let _win = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                windows::core::w!("BUTTON"),
+                windows::core::w!("WIN:auto"),
+                WS_CHILD | WS_VISIBLE,
+                98,
+                34,
+                86,
+                24,
+                Some(window),
+                Some(HMENU(ID_BTN_WINDOW as isize as *mut c_void)),
+                Some(hinstance.into()),
+                None,
+            )?;
+            let _br = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                windows::core::w!("BUTTON"),
+                windows::core::w!("BR:20M"),
+                WS_CHILD | WS_VISIBLE,
+                188,
+                34,
+                86,
+                24,
+                Some(window),
+                Some(HMENU(ID_BTN_BITRATE as isize as *mut c_void)),
+                Some(hinstance.into()),
+                None,
+            )?;
+            let _cap = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                windows::core::w!("BUTTON"),
+                windows::core::w!("CAP:dxgi"),
+                WS_CHILD | WS_VISIBLE,
+                278,
+                34,
+                86,
+                24,
+                Some(window),
+                Some(HMENU(ID_BTN_CAPTURE as isize as *mut c_void)),
+                Some(hinstance.into()),
+                None,
+            )?;
+            let _enc = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                windows::core::w!("BUTTON"),
+                windows::core::w!("ENC:nvenc"),
+                WS_CHILD | WS_VISIBLE,
+                368,
+                34,
+                96,
+                24,
+                Some(window),
+                Some(HMENU(ID_BTN_ENCODER as isize as *mut c_void)),
+                Some(hinstance.into()),
+                None,
+            )?;
+            let _panel = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                windows::core::w!("EDIT"),
+                windows::core::w!(""),
+                WINDOW_STYLE(
+                    WS_CHILD.0
+                        | WS_VISIBLE.0
+                        | WS_VSCROLL.0
+                        | (ES_LEFT as u32)
+                        | (ES_MULTILINE as u32)
+                        | (ES_AUTOVSCROLL as u32)
+                        | (ES_READONLY as u32),
+                ),
+                8,
+                64,
+                500,
+                220,
+                Some(window),
+                Some(HMENU(ID_EDIT_PANEL as isize as *mut c_void)),
+                Some(hinstance.into()),
+                None,
+            )?;
+            let boxed = Box::new(OverlayUiState::new(control_queue));
+            let raw = Box::into_raw(boxed);
+            let _ = SetWindowLongPtrW(window, GWLP_USERDATA, raw as isize);
+        }
+        Ok(())
+    }
+
+    fn ui_state(window: HWND) -> Option<&'static mut OverlayUiState> {
+        unsafe {
+            let ptr = GetWindowLongPtrW(window, GWLP_USERDATA) as *mut OverlayUiState;
+            if ptr.is_null() { None } else { Some(&mut *ptr) }
+        }
+    }
+
+    fn on_overlay_command(window: HWND, wparam: WPARAM) {
+        let id = (wparam.0 & 0xFFFF) as i32;
+        if let Some(state) = Self::ui_state(window) {
+            match id {
+                ID_BTN_COLLAPSE => {
+                    state.collapsed = !state.collapsed;
+                    unsafe {
+                        let label = if state.collapsed {
+                            windows::core::w!("展开")
+                        } else {
+                            windows::core::w!("收起")
+                        };
+                        if let Ok(btn) = GetDlgItem(Some(window), ID_BTN_COLLAPSE) {
+                            let _ = SetWindowTextW(btn, label);
+                        }
+                    }
+                    Self::layout_overlay_controls(window);
+                }
+                ID_BTN_COPY => {
+                    let _ = Self::copy_text_to_clipboard(window, &state.last_text);
+                }
+                ID_BTN_OVERVIEW => state.panel = OverlayPanel::Overview,
+                ID_BTN_PIPELINE => state.panel = OverlayPanel::Pipeline,
+                ID_BTN_TRANSPORT => state.panel = OverlayPanel::Transport,
+                ID_BTN_DEBUG => state.panel = OverlayPanel::Debug,
+                ID_BTN_CLOSE => unsafe {
+                    let _ = PostMessageW(Some(window), WM_CLOSE, WPARAM(0), LPARAM(0));
+                },
+                ID_BTN_RESOLUTION => {
+                    state.res_idx = (state.res_idx + 1) % RES_PRESETS.len();
+                    let (value, label, btn) = (
+                        RES_PRESETS[state.res_idx].1.to_string(),
+                        RES_PRESETS[state.res_idx].2,
+                        ID_BTN_RESOLUTION,
+                    );
+                    Self::set_button_text(window, btn, label);
+                    if let Ok(mut q) = state.control_queue.lock() {
+                        q.push(OverlaySwitchCommand { field: OverlaySwitchField::Resolution, value });
+                    }
+                }
+                ID_BTN_WINDOW => {
+                    state.win_idx = (state.win_idx + 1) % WIN_PRESETS.len();
+                    let (value, label, btn) = (
+                        WIN_PRESETS[state.win_idx].0.to_string(),
+                        WIN_PRESETS[state.win_idx].1,
+                        ID_BTN_WINDOW,
+                    );
+                    Self::set_button_text(window, btn, label);
+                    if let Ok(mut q) = state.control_queue.lock() {
+                        q.push(OverlaySwitchCommand { field: OverlaySwitchField::CaptureWindow, value });
+                    }
+                }
+                ID_BTN_BITRATE => {
+                    state.br_idx = (state.br_idx + 1) % BR_PRESETS.len();
+                    let (value, label, btn) = (
+                        BR_PRESETS[state.br_idx].0.to_string(),
+                        BR_PRESETS[state.br_idx].1,
+                        ID_BTN_BITRATE,
+                    );
+                    Self::set_button_text(window, btn, label);
+                    if let Ok(mut q) = state.control_queue.lock() {
+                        q.push(OverlaySwitchCommand { field: OverlaySwitchField::Bitrate, value });
+                    }
+                }
+                ID_BTN_CAPTURE => {
+                    state.cap_idx = (state.cap_idx + 1) % CAP_PRESETS.len();
+                    let (value, label, btn) = (
+                        CAP_PRESETS[state.cap_idx].0.to_string(),
+                        CAP_PRESETS[state.cap_idx].1,
+                        ID_BTN_CAPTURE,
+                    );
+                    Self::set_button_text(window, btn, label);
+                    if let Ok(mut q) = state.control_queue.lock() {
+                        q.push(OverlaySwitchCommand { field: OverlaySwitchField::CaptureBackend, value });
+                    }
+                }
+                ID_BTN_ENCODER => {
+                    state.enc_idx = (state.enc_idx + 1) % ENC_PRESETS.len();
+                    let (value, label, btn) = (
+                        ENC_PRESETS[state.enc_idx].0.to_string(),
+                        ENC_PRESETS[state.enc_idx].1,
+                        ID_BTN_ENCODER,
+                    );
+                    Self::set_button_text(window, btn, label);
+                    if let Ok(mut q) = state.control_queue.lock() {
+                        q.push(OverlaySwitchCommand { field: OverlaySwitchField::Encoder, value });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn set_button_text(window: HWND, id: i32, label: &str) {
+        let mut w: Vec<u16> = label.encode_utf16().collect();
+        w.push(0);
+        unsafe {
+            if let Ok(btn) = GetDlgItem(Some(window), id) {
+                let _ = SetWindowTextW(btn, PCWSTR(w.as_ptr()));
+            }
+        }
+    }
+
+    fn layout_overlay_controls(window: HWND) {
+        unsafe {
+            let mut rect = RECT::default();
+            if GetClientRect(window, &mut rect).is_err() {
+                return;
+            }
+            let width = (rect.right - rect.left).max(320);
+            let Ok(panel) = GetDlgItem(Some(window), ID_EDIT_PANEL) else {
+                return;
+            };
+            let mut panel_h = 220;
+            if let Some(state) = Self::ui_state(window) {
+                if state.collapsed {
+                    panel_h = 0;
+                    let _ = ShowWindow(panel, SW_HIDE);
+                } else {
+                    let _ = ShowWindow(panel, SW_SHOW);
+                }
+            }
+            let _ = MoveWindow(panel, 8, 64, (width - 16).max(120), panel_h.max(0), true);
+            for id in [
+                ID_EDIT_PANEL,
+                ID_BTN_COLLAPSE,
+                ID_BTN_COPY,
+                ID_BTN_OVERVIEW,
+                ID_BTN_PIPELINE,
+                ID_BTN_TRANSPORT,
+                ID_BTN_DEBUG,
+                ID_BTN_CLOSE,
+                ID_BTN_RESOLUTION,
+                ID_BTN_WINDOW,
+                ID_BTN_BITRATE,
+                ID_BTN_CAPTURE,
+                ID_BTN_ENCODER,
+            ] {
+                if let Ok(ctrl) = GetDlgItem(Some(window), id) {
+                    let _ = SetWindowPos(
+                        ctrl,
+                        Some(HWND_TOP),
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
+                }
+            }
+        }
+    }
+
+    fn copy_text_to_clipboard(window: HWND, text: &str) -> Result<()> {
+        let _ = text;
+        unsafe {
+            let edit = GetDlgItem(Some(window), ID_EDIT_PANEL)
+                .map_err(|e| anyhow::anyhow!("GetDlgItem failed: {e}"))?;
+            // EM_SETSEL + WM_COPY
+            let _ = SendMessageW(edit, 0x00B1, Some(WPARAM(0)), Some(LPARAM(-1)));
+            let _ = SendMessageW(edit, WM_COPY, Some(WPARAM(0)), Some(LPARAM(0)));
+        }
+        Ok(())
+    }
+
+    fn update_overlay_panel(
+        window: HWND,
+        metrics: &OverlayRenderMetrics,
+        shared: &OverlaySharedStats,
+    ) {
+        let Some(state) = Self::ui_state(window) else {
+            return;
+        };
+        let panel_text = Self::build_panel_text(state.panel, metrics, shared);
+        if panel_text == state.last_text {
+            return;
+        }
+        state.last_text = panel_text.clone();
+        let wide: Vec<u16> = panel_text.encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe {
+            if let Ok(edit) = GetDlgItem(Some(window), ID_EDIT_PANEL) {
+                let _ = SetWindowTextW(edit, PCWSTR(wide.as_ptr()));
+            }
+        }
+    }
+
+    fn build_panel_text(
+        panel: OverlayPanel,
+        m: &OverlayRenderMetrics,
+        s: &OverlaySharedStats,
+    ) -> String {
+        match panel {
+            OverlayPanel::Overview => format!(
+                "Panel: {}\r\n\
+                 传输: selected={} / active={}\r\n\
+                 渲染: {:.2} FPS (frames={})\r\n\
+                 接收: {:.2} FPS (frames={})\r\n\
+                 解码: {:.2} FPS (frames={})\r\n\
+                 decode avg/p95: {:.3} / {:.3} ms\r\n\
+                 jitter: {:.3} ms\r\n\
+                 E2E avg/p50/p95/p99: {:.3} / {:.3} / {:.3} / {:.3} ms\r\n\
+                 present avg/p50/p95/p99: {:.3} / {:.3} / {:.3} / {:.3} ms\r\n\
+                 decode_failures: {}\r\n\
+                 操作: 收起 | 复制 | 切换面板",
+                panel.title(),
+                s.selected_transport,
+                s.media_path,
+                m.render_fps,
+                m.rendered_frames,
+                m.receive_fps,
+                m.received_frames,
+                s.decode_fps,
+                s.decoded_frames,
+                s.avg_decode_ms,
+                s.p95_decode_ms,
+                s.jitter_ms,
+                s.e2e_avg_ms,
+                s.e2e_p50_ms,
+                s.e2e_p95_ms,
+                s.e2e_p99_ms,
+                m.present_avg_ms,
+                m.present_p50_ms,
+                m.present_p95_ms,
+                m.present_p99_ms,
+                s.decode_failures,
+            ),
+            OverlayPanel::Pipeline => format!(
+                "Panel: {}\r\n\
+                 [Capture]\r\n\
+                 来源帧(接收): {:.2} FPS, frames={}\r\n\
+                 [Decode]\r\n\
+                 backend={} fps={:.2} frames={}\r\n\
+                 avg={:.3}ms p95={:.3}ms jitter={:.3}ms\r\n\
+                 [Render]\r\n\
+                 render_fps={:.2} rendered_frames={}\r\n\
+                 present avg={:.3} p50={:.3} p95={:.3} p99={:.3} ms\r\n\
+                 [End-to-End]\r\n\
+                 avg={:.3} p50={:.3} p95={:.3} p99={:.3} ms",
+                panel.title(),
+                m.receive_fps,
+                m.received_frames,
+                s.decoder_backend,
+                s.decode_fps,
+                s.decoded_frames,
+                s.avg_decode_ms,
+                s.p95_decode_ms,
+                s.jitter_ms,
+                m.render_fps,
+                m.rendered_frames,
+                m.present_avg_ms,
+                m.present_p50_ms,
+                m.present_p95_ms,
+                m.present_p99_ms,
+                s.e2e_avg_ms,
+                s.e2e_p50_ms,
+                s.e2e_p95_ms,
+                s.e2e_p99_ms,
+            ),
+            OverlayPanel::Transport => format!(
+                "Panel: {}\r\n\
+                 selected_transport={}\r\n\
+                 active_media_path={}\r\n\
+                 接收速率={:.2} FPS\r\n\
+                 注: 发送端码率/AU/丢包在 agent 侧日志 [RTCP-PANEL]\r\n\
+                 当前窗口可复制本面板全文。",
+                panel.title(),
+                s.selected_transport,
+                s.media_path,
+                m.receive_fps,
+            ),
+            OverlayPanel::Debug => format!(
+                "Panel: {}\r\n\
+                 decode_failures={}\r\n\
+                 last_decode_error={}\r\n\
+                 decoded_frames={}\r\n\
+                 rendered_frames={}\r\n\
+                 received_frames={}\r\n\
+                 decoder_backend={}\r\n\
+                 selected_transport={} active_path={}",
+                panel.title(),
+                s.decode_failures,
+                if s.last_decode_error.is_empty() { "none" } else { &s.last_decode_error },
+                s.decoded_frames,
+                m.rendered_frames,
+                m.received_frames,
+                s.decoder_backend,
+                s.selected_transport,
+                s.media_path,
+            ),
         }
     }
 
@@ -348,9 +1099,10 @@ impl Drop for D3D11Renderer {
 }
 
 struct D3DContext {
+    window: HWND,
     device: ID3D11Device,
     context: ID3D11DeviceContext,
-    swap_chain: IDXGISwapChain,
+    swap_chain: IDXGISwapChain1,
     rtv: ID3D11RenderTargetView,
     vs: ID3D11VertexShader,
     ps: ID3D11PixelShader,
@@ -362,46 +1114,85 @@ struct D3DContext {
     frame_width: u32,
     frame_height: u32,
     vsync: bool,
+    allow_tearing: bool,
+    low_latency_mode: bool,
 }
 
 impl D3DContext {
-    fn new(window: HWND, vsync: bool) -> Result<Self> {
+    fn new(window: HWND, config: &RendererConfig) -> Result<Self> {
         unsafe {
-            let mut swap_desc = DXGI_SWAP_CHAIN_DESC::default();
-            swap_desc.BufferCount = 2;
-            swap_desc.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-            swap_desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-            swap_desc.OutputWindow = window;
-            swap_desc.SampleDesc.Count = 1;
-            swap_desc.Windowed = TRUE;
-            swap_desc.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
-
             let feature_levels = [D3D_FEATURE_LEVEL_11_0];
             let mut device: Option<ID3D11Device> = None;
             let mut context: Option<ID3D11DeviceContext> = None;
-            let mut swap_chain: Option<IDXGISwapChain> = None;
             let mut chosen_level = D3D_FEATURE_LEVEL_11_0;
 
-            D3D11CreateDeviceAndSwapChain(
+            D3D11CreateDevice(
                 None,
                 D3D_DRIVER_TYPE_HARDWARE,
                 HMODULE::default(),
                 D3D11_CREATE_DEVICE_BGRA_SUPPORT,
                 Some(&feature_levels),
                 D3D11_SDK_VERSION,
-                Some(&swap_desc),
-                Some(&mut swap_chain),
                 Some(&mut device),
                 Some(&mut chosen_level),
                 Some(&mut context),
             )
-            .context("D3D11CreateDeviceAndSwapChain failed")?;
+            .context("D3D11CreateDevice failed")?;
 
             let device = device.context("missing D3D11 device")?;
             let context = context.context("missing D3D11 context")?;
-            let swap_chain = swap_chain.context("missing swap chain")?;
+            let dxgi_device: IDXGIDevice = device.cast().context("cast to IDXGIDevice failed")?;
+            let adapter = dxgi_device.GetAdapter().context("GetAdapter failed")?;
+            let factory: IDXGIFactory2 = adapter
+                .GetParent()
+                .context("GetParent IDXGIFactory2 failed")?;
+
+            let mut allow_tearing = false;
+            if let Ok(factory5) = factory.cast::<IDXGIFactory5>() {
+                let mut tearing: u32 = 0;
+                if factory5
+                    .CheckFeatureSupport(
+                        DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+                        &mut tearing as *mut _ as *mut c_void,
+                        std::mem::size_of::<u32>() as u32,
+                    )
+                    .is_ok()
+                {
+                    allow_tearing = tearing != 0;
+                }
+            }
+
+            let mut sc_desc1 = DXGI_SWAP_CHAIN_DESC1::default();
+            sc_desc1.Width = 0;
+            sc_desc1.Height = 0;
+            sc_desc1.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            sc_desc1.Stereo = FALSE;
+            sc_desc1.SampleDesc = DXGI_SAMPLE_DESC { Count: 1, Quality: 0 };
+            sc_desc1.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+            sc_desc1.BufferCount = 2;
+            sc_desc1.Scaling = DXGI_SCALING_STRETCH;
+            sc_desc1.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+            sc_desc1.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+            sc_desc1.Flags = if !config.vsync && allow_tearing {
+                DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0 as u32
+            } else {
+                0
+            };
+
+            let swap_chain = factory
+                .CreateSwapChainForHwnd(
+                    &device,
+                    window,
+                    &sc_desc1,
+                    None,
+                    None,
+                )
+                .context("CreateSwapChainForHwnd failed")?;
+            let _ = factory.MakeWindowAssociation(window, DXGI_MWA_NO_ALT_ENTER);
+
             if let Ok(dxgi_device1) = device.cast::<IDXGIDevice1>() {
-                let _ignored = unsafe { dxgi_device1.SetMaximumFrameLatency(1) };
+                let latency = config.max_frame_latency.clamp(1, 16);
+                let _ignored = dxgi_device1.SetMaximumFrameLatency(latency);
             }
 
             let back_buffer: ID3D11Texture2D = swap_chain
@@ -429,7 +1220,22 @@ VSOut main(uint vid : SV_VertexID) {
     return o;
 }";
 
-            let ps_src = b"
+            let ps_src_limited_709 = b"
+Texture2D texY  : register(t0);
+Texture2D texUV : register(t1);
+SamplerState samp : register(s0);
+float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
+    float y = texY.Sample(samp, uv).r;
+    float2 uvv = texUV.Sample(samp, uv).rg;
+    float c = max(0.0, y - (16.0 / 255.0)) * 1.16438356;
+    float u = uvv.x - 0.5;
+    float v = uvv.y - 0.5;
+    float r = c + 1.79274107 * v;
+    float g = c - 0.21324861 * u - 0.53290933 * v;
+    float b = c + 2.11240179 * u;
+    return float4(saturate(r), saturate(g), saturate(b), 1.0);
+}";
+            let ps_src_full_601 = b"
 Texture2D texY  : register(t0);
 Texture2D texUV : register(t1);
 SamplerState samp : register(s0);
@@ -443,6 +1249,15 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
     float b = y + 1.772 * u;
     return float4(saturate(r), saturate(g), saturate(b), 1.0);
 }";
+            let color_mode = std::env::var("MRD_COLOR_MODE")
+                .unwrap_or_else(|_| "limited709".to_string())
+                .to_ascii_lowercase();
+            let ps_src: &[u8] = if color_mode == "full601" {
+                &ps_src_full_601[..]
+            } else {
+                &ps_src_limited_709[..]
+            };
+            info!(%color_mode, "using yuv->rgb shader mode");
 
             let vs_blob = compile_hlsl(vs_src, b"main\0", b"vs_5_0\0")?;
             let ps_blob = compile_hlsl(ps_src, b"main\0", b"ps_5_0\0")?;
@@ -492,7 +1307,16 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
                 .context("CreateSamplerState failed")?;
             let sampler = sampler.context("missing sampler state")?;
 
+            info!(
+                vsync = config.vsync,
+                allow_tearing,
+                low_latency_mode = config.low_latency_mode,
+                max_frame_latency = config.max_frame_latency,
+                "D3D11 swapchain initialized"
+            );
+
             Ok(Self {
+                window,
                 device,
                 context,
                 swap_chain,
@@ -506,7 +1330,9 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
                 uv_srv: None,
                 frame_width: 0,
                 frame_height: 0,
-                vsync,
+                vsync: config.vsync,
+                allow_tearing,
+                low_latency_mode: config.low_latency_mode,
             })
         }
     }
@@ -692,8 +1518,8 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
 
     fn draw_with_srvs(
         &mut self,
-        width: u32,
-        height: u32,
+        _width: u32,
+        _height: u32,
         y_srv: &ID3D11ShaderResourceView,
         uv_srv: &ID3D11ShaderResourceView,
     ) -> Result<()> {
@@ -702,11 +1528,15 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
             self.context.ClearRenderTargetView(&self.rtv, &clear);
             self.context.OMSetRenderTargets(Some(&[Some(self.rtv.clone())]), None);
 
+            let mut client = RECT::default();
+            let _ = GetClientRect(self.window, &mut client);
+            let view_w = (client.right - client.left).max(1) as f32;
+            let view_h = (client.bottom - client.top).max(1) as f32;
             let viewport = D3D11_VIEWPORT {
                 TopLeftX: 0.0,
                 TopLeftY: 0.0,
-                Width: width.max(1) as f32,
-                Height: height.max(1) as f32,
+                Width: view_w,
+                Height: view_h,
                 MinDepth: 0.0,
                 MaxDepth: 1.0,
             };
@@ -722,12 +1552,68 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
             self.context.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
             self.context.Draw(3, 0);
 
-            let hr = self
-                .swap_chain
-                .Present(if self.vsync { 1 } else { 0 }, DXGI_PRESENT(0));
+            let (sync_interval, flags) =
+                present_params(self.vsync, self.allow_tearing, self.low_latency_mode);
+            let hr = self.swap_chain.Present(sync_interval, flags);
+            if hr == DXGI_ERROR_WAS_STILL_DRAWING {
+                return Ok(());
+            }
             hr.ok().context("swapchain present failed")?;
         }
         Ok(())
+    }
+}
+
+fn present_params(vsync: bool, allow_tearing: bool, low_latency_mode: bool) -> (u32, DXGI_PRESENT) {
+    let mut flags = DXGI_PRESENT(0);
+    if vsync {
+        return (1, flags);
+    }
+    if allow_tearing {
+        flags = DXGI_PRESENT(flags.0 | DXGI_PRESENT_ALLOW_TEARING.0);
+    }
+    if low_latency_mode {
+        flags = DXGI_PRESENT(flags.0 | DXGI_PRESENT_DO_NOT_WAIT.0);
+    }
+    (0, flags)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::present_params;
+    use windows::Win32::Graphics::Dxgi::{
+        DXGI_PRESENT, DXGI_PRESENT_ALLOW_TEARING, DXGI_PRESENT_DO_NOT_WAIT,
+    };
+
+    #[test]
+    fn present_params_with_vsync_disables_tearing_flag() {
+        let (sync, flags) = present_params(true, true, true);
+        assert_eq!(sync, 1);
+        assert_eq!(flags, DXGI_PRESENT(0));
+    }
+
+    #[test]
+    fn present_params_uses_tearing_when_allowed() {
+        let (sync, flags) = present_params(false, true, false);
+        assert_eq!(sync, 0);
+        assert_eq!(flags, DXGI_PRESENT_ALLOW_TEARING);
+    }
+
+    #[test]
+    fn present_params_without_tearing_falls_back_to_zero_flags() {
+        let (sync, flags) = present_params(false, false, false);
+        assert_eq!(sync, 0);
+        assert_eq!(flags, DXGI_PRESENT(0));
+    }
+
+    #[test]
+    fn present_params_adds_do_not_wait_in_low_latency_mode() {
+        let (sync, flags) = present_params(false, true, true);
+        assert_eq!(sync, 0);
+        assert_eq!(
+            flags,
+            DXGI_PRESENT(DXGI_PRESENT_ALLOW_TEARING.0 | DXGI_PRESENT_DO_NOT_WAIT.0)
+        );
     }
 }
 

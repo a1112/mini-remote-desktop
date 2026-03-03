@@ -3,8 +3,18 @@ use anyhow::{Context, Result};
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
+pub enum DecodedFrameData {
+    CpuNv12(Arc<Vec<u8>>),
+    #[cfg(windows)]
+    D3d11Nv12 {
+        texture: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+        subresource: u32,
+    },
+}
+
+#[derive(Debug, Clone)]
 pub struct DecodedFrame {
-    pub data: Arc<Vec<u8>>,
+    pub data: DecodedFrameData,
     pub width: u32,
     pub height: u32,
     pub timestamp: u64,
@@ -13,16 +23,78 @@ pub struct DecodedFrame {
 }
 
 impl DecodedFrame {
+    pub fn from_cpu_nv12(
+        data: Arc<Vec<u8>>,
+        width: u32,
+        height: u32,
+        timestamp: u64,
+        sequence: u64,
+        capture_start_unix_us: u64,
+    ) -> Self {
+        Self {
+            data: DecodedFrameData::CpuNv12(data),
+            width,
+            height,
+            timestamp,
+            sequence,
+            capture_start_unix_us,
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn from_d3d11_nv12(
+        texture: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+        subresource: u32,
+        width: u32,
+        height: u32,
+        timestamp: u64,
+        sequence: u64,
+        capture_start_unix_us: u64,
+    ) -> Self {
+        Self {
+            data: DecodedFrameData::D3d11Nv12 {
+                texture,
+                subresource,
+            },
+            width,
+            height,
+            timestamp,
+            sequence,
+            capture_start_unix_us,
+        }
+    }
+
+    pub fn cpu_nv12(&self) -> Option<&[u8]> {
+        match &self.data {
+            DecodedFrameData::CpuNv12(data) => Some(data.as_slice()),
+            #[cfg(windows)]
+            DecodedFrameData::D3d11Nv12 { .. } => None,
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn d3d11_surface(
+        &self,
+    ) -> Option<(&windows::Win32::Graphics::Direct3D11::ID3D11Texture2D, u32)> {
+        match &self.data {
+            DecodedFrameData::D3d11Nv12 {
+                texture,
+                subresource,
+            } => Some((texture, *subresource)),
+            _ => None,
+        }
+    }
+
     pub fn y_size(&self) -> usize {
         (self.width * self.height) as usize
     }
 
-    pub fn y_plane(&self) -> &[u8] {
-        &self.data[..self.y_size()]
+    pub fn y_plane(&self) -> Option<&[u8]> {
+        self.cpu_nv12().map(|data| &data[..self.y_size()])
     }
 
-    pub fn uv_plane(&self) -> &[u8] {
-        &self.data[self.y_size()..]
+    pub fn uv_plane(&self) -> Option<&[u8]> {
+        self.cpu_nv12().map(|data| &data[self.y_size()..])
     }
 }
 
@@ -146,19 +218,41 @@ mod ffmpeg_backend {
         pub fn new(config: H264DecoderConfig) -> Result<Self> {
             ffmpeg_next::init()?;
 
-            let codec = pick_decoder_codec(&config)
+            let codec = pick_decoder_codec()
                 .context("H.264 decoder codec not found")?;
             let backend_name = codec.name().to_string();
-            let mut ctx = codec::context::Context::new();
-            ctx.set_threading(codec::threading::Config {
-                kind: codec::threading::Type::Frame,
-                count: config.num_threads,
-            });
+            let wants_hw = wants_d3d11va(&config);
 
-            let decoder = ctx
-                .decoder()
-                .open_as(codec)
-                .context("open decoder failed")?
+            let opened = if wants_hw {
+                let mut opts = ffmpeg_next::Dictionary::new();
+                opts.set("hwaccel", "d3d11va");
+                opts.set("hwaccel_output_format", "d3d11");
+                let mut ctx = build_decoder_context(&config);
+                match ctx.decoder().open_as_with(codec, opts) {
+                    Ok(opened) => {
+                        tracing::info!(
+                            "opened ffmpeg h264 decoder with d3d11va options"
+                        );
+                        opened
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "open_as_with d3d11va failed, fallback to plain h264 decoder"
+                        );
+                        let mut fallback_ctx = build_decoder_context(&config);
+                        fallback_ctx.decoder()
+                            .open_as(codec)
+                            .context("open fallback h264 decoder failed")?
+                    }
+                }
+            } else {
+                let mut ctx = build_decoder_context(&config);
+                ctx.decoder()
+                    .open_as(codec)
+                    .context("open decoder failed")?
+            };
+            let decoder = opened
                 .video()
                 .context("video decoder init failed")?;
 
@@ -193,6 +287,24 @@ mod ffmpeg_backend {
                     let height = self.video_frame.height();
                     self.output_width = width;
                     self.output_height = height;
+                    let pts = self.video_frame.pts().unwrap_or_default() as u64;
+
+                    #[cfg(windows)]
+                    if self.video_frame.format() == format::Pixel::D3D11 {
+                        if let Some((texture, subresource)) =
+                            self.extract_d3d11_surface(&self.video_frame)?
+                        {
+                            return Ok(Some(DecodedFrame::from_d3d11_nv12(
+                                texture,
+                                subresource,
+                                width,
+                                height,
+                                pts,
+                                pts,
+                                0,
+                            )));
+                        }
+                    }
 
                     let nv12 = if self.video_frame.format() == format::Pixel::NV12 {
                         self.extract_nv12(&self.video_frame)?
@@ -200,18 +312,42 @@ mod ffmpeg_backend {
                         self.convert_to_nv12()?
                     };
 
-                    Ok(Some(DecodedFrame {
-                        data: Arc::new(nv12),
+                    Ok(Some(DecodedFrame::from_cpu_nv12(
+                        Arc::new(nv12),
                         width,
                         height,
-                        timestamp: self.video_frame.pts().unwrap_or_default() as u64,
-                        sequence: self.video_frame.pts().unwrap_or_default() as u64,
-                        capture_start_unix_us: 0,
-                    }))
+                        pts,
+                        pts,
+                        0,
+                    )))
                 }
                 Err(Error::Other { errno }) if errno == EAGAIN => Ok(None),
                 Err(Error::Eof) => Ok(None),
                 Err(e) => Err(anyhow::anyhow!("decoder receive failed: {}", e)),
+            }
+        }
+
+        #[cfg(windows)]
+        fn extract_d3d11_surface(
+            &self,
+            frame: &Video,
+        ) -> Result<Option<(windows::Win32::Graphics::Direct3D11::ID3D11Texture2D, u32)>> {
+            use std::ffi::c_void;
+            use windows::core::Interface;
+            use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
+
+            unsafe {
+                let av = frame.as_ptr();
+                if av.is_null() || (*av).data[0].is_null() {
+                    return Ok(None);
+                }
+
+                let raw_ptr = (*av).data[0] as *mut c_void;
+                let tex = ID3D11Texture2D::from_raw_borrowed(&raw_ptr)
+                    .context("invalid D3D11 texture pointer from AVFrame")?
+                    .clone();
+                let subresource = (*av).data[1] as usize as u32;
+                Ok(Some((tex, subresource)))
             }
         }
 
@@ -267,16 +403,22 @@ mod ffmpeg_backend {
         }
     }
 
-    fn pick_decoder_codec(config: &H264DecoderConfig) -> Option<Codec> {
-        if matches!(config.backend, DecoderBackend::D3d11va)
-            || (matches!(config.backend, DecoderBackend::Auto) && config.enable_hardware)
-        {
-            if let Some(c) = decoder::find_by_name("h264_d3d11va") {
-                return Some(c);
-            }
-            tracing::warn!("h264_d3d11va decoder not found, fallback to software h264");
-        }
+    fn pick_decoder_codec() -> Option<Codec> {
         decoder::find(codec::Id::H264)
+    }
+
+    fn build_decoder_context(config: &H264DecoderConfig) -> codec::context::Context {
+        let mut ctx = codec::context::Context::new();
+        ctx.set_threading(codec::threading::Config {
+            kind: codec::threading::Type::Frame,
+            count: config.num_threads,
+        });
+        ctx
+    }
+
+    pub(super) fn wants_d3d11va(config: &H264DecoderConfig) -> bool {
+        matches!(config.backend, DecoderBackend::D3d11va)
+            || (matches!(config.backend, DecoderBackend::Auto) && config.enable_hardware)
     }
 
     impl Decoder for FfmpegH264Decoder {
@@ -313,16 +455,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn decoded_frame_cpu_helpers_expose_planes() {
+        let frame = DecodedFrame::from_cpu_nv12(
+            Arc::new(vec![0u8; 1280 * 720 * 3 / 2]),
+            1280,
+            720,
+            0,
+            0,
+            0,
+        );
+        assert!(frame.cpu_nv12().is_some());
+        assert_eq!(frame.y_plane().unwrap().len(), 1280 * 720);
+        assert_eq!(frame.uv_plane().unwrap().len(), 1280 * 720 / 2);
+    }
+
+    #[test]
     fn decoded_frame_layout() {
-        let frame = DecodedFrame {
-            data: Arc::new(vec![0u8; 1280 * 720 * 3 / 2]),
-            width: 1280,
-            height: 720,
-            timestamp: 0,
-            sequence: 0,
-            capture_start_unix_us: 0,
-        };
-        assert_eq!(frame.y_plane().len(), 1280 * 720);
-        assert_eq!(frame.uv_plane().len(), 1280 * 720 / 2);
+        let frame = DecodedFrame::from_cpu_nv12(
+            Arc::new(vec![0u8; 1280 * 720 * 3 / 2]),
+            1280,
+            720,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(frame.y_plane().unwrap().len(), 1280 * 720);
+        assert_eq!(frame.uv_plane().unwrap().len(), 1280 * 720 / 2);
+    }
+
+    #[cfg(feature = "ffmpeg-software")]
+    #[test]
+    fn d3d11va_intent_from_config() {
+        let mut c = H264DecoderConfig::default();
+        c.backend = DecoderBackend::D3d11va;
+        assert!(ffmpeg_backend::wants_d3d11va(&c));
+
+        c.backend = DecoderBackend::Auto;
+        c.enable_hardware = true;
+        assert!(ffmpeg_backend::wants_d3d11va(&c));
+
+        c.enable_hardware = false;
+        assert!(!ffmpeg_backend::wants_d3d11va(&c));
     }
 }
