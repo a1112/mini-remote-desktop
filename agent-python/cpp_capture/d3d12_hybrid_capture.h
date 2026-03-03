@@ -89,6 +89,16 @@ EXPORT_API void free_hybrid_capture(HD3D12HybridCapture handle);
  */
 EXPORT_API void* get_hybrid_d3d11_resource(HD3D12HybridCapture handle);
 
+/**
+ * 获取 D3D11 设备 (用于 NVENC 编码器)
+ */
+EXPORT_API void* get_hybrid_d3d11_device(HD3D12HybridCapture handle);
+
+/**
+ * 获取 D3D11 上下文 (用于 NVENC 编码器)
+ */
+EXPORT_API void* get_hybrid_d3d11_context(HD3D12HybridCapture handle);
+
 #ifdef __cplusplus
 }
 #endif
@@ -107,6 +117,8 @@ public:
 
     ID3D12Device* GetD3D12Device() const { return d3d12_device_.Get(); }
     ID3D12CommandQueue* GetD3D12Queue() const { return d3d12_queue_.Get(); }
+    ID3D11Device* GetD3D11Device() const { return d3d11_device_.Get(); }
+    ID3D11DeviceContext* GetD3D11Context() const { return d3d11_context_.Get(); }
     ID3D11Texture2D* GetD3D11Resource() const { return captured_texture_d3d11_.Get(); }
     bool HasD3D12() const { return d3d12_enabled_; }
     bool IsInitialized() const { return initialized_; }

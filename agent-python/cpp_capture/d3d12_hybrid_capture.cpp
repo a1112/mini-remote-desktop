@@ -69,6 +69,16 @@ void* get_hybrid_d3d11_resource(HD3D12HybridCapture handle) {
     return capturer ? capturer->GetD3D11Resource() : nullptr;
 }
 
+void* get_hybrid_d3d11_device(HD3D12HybridCapture handle) {
+    D3D12HybridCapturer* capturer = static_cast<D3D12HybridCapturer*>(handle);
+    return capturer ? capturer->GetD3D11Device() : nullptr;
+}
+
+void* get_hybrid_d3d11_context(HD3D12HybridCapture handle) {
+    D3D12HybridCapturer* capturer = static_cast<D3D12HybridCapturer*>(handle);
+    return capturer ? capturer->GetD3D11Context() : nullptr;
+}
+
 void free_hybrid_capture(HD3D12HybridCapture handle) {
     D3D12HybridCapturer* capturer = static_cast<D3D12HybridCapturer*>(handle);
     if (capturer) {
