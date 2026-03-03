@@ -456,7 +456,7 @@ async fn attach_video_track_with_policy(
                 let queue_depth = effective_cfg.queue_depth.clamp(1, 64) as usize;
                 let block_queue = effective_cfg.queue_strategy == "block";
                 let (encoded_tx, mut encoded_rx) =
-                    tokio::sync::mpsc::channel::<Vec<u8>>(queue_depth);
+                    tokio::sync::mpsc::channel::<Arc<[u8]>>(queue_depth);
                 let keyframe_request2 = keyframe_request.clone();
                 let stats_encode = stats.clone();
                 let session_running_encode = session_running.clone();
@@ -475,10 +475,11 @@ async fn attach_video_track_with_policy(
                                 stats_encode
                                     .encoded_au_total
                                     .fetch_add(1, Ordering::Relaxed);
+                                let encoded = Arc::<[u8]>::from(v);
                                 if block_queue {
-                                    let _ = encoded_tx.blocking_send(v);
+                                    let _ = encoded_tx.blocking_send(encoded);
                                 } else {
-                                    let _ = encoded_tx.try_send(v);
+                                    let _ = encoded_tx.try_send(encoded);
                                 }
                             }
                             Ok(_) => {}
@@ -517,7 +518,7 @@ async fn attach_video_track_with_policy(
                     let idle_repeat_fps = effective_cfg.idle_repeat_fps.max(1);
                     let session_running_send = session_running.clone();
                     tokio::spawn(async move {
-                        let mut last_encoded: Option<Vec<u8>> = None;
+                        let mut last_encoded: Option<Arc<[u8]>> = None;
                         let mut next_due = Instant::now();
                         while session_running_send.load(Ordering::SeqCst) {
                             wait_until_due(next_due).await;
@@ -556,7 +557,7 @@ async fn attach_video_track_with_policy(
                                 Duration::from_millis((1000.0 / send_fps as f64).max(1.0) as u64);
                             next_due = advance_send_deadline(next_due, send_gap, Instant::now());
                             let sample = Sample {
-                                data: Bytes::from(encoded),
+                                data: Bytes::copy_from_slice(encoded.as_ref()),
                                 duration: send_gap,
                                 ..Default::default()
                             };
@@ -604,7 +605,7 @@ async fn attach_video_track_with_policy(
     let running = Arc::new(AtomicBool::new(true));
     let latest = Arc::new(std::sync::Mutex::new(None::<RawFrame>));
     let queue_depth = effective_cfg.queue_depth.clamp(1, 64) as usize;
-    let (encoded_tx, mut encoded_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(queue_depth);
+    let (encoded_tx, mut encoded_rx) = tokio::sync::mpsc::channel::<Arc<[u8]>>(queue_depth);
 
     {
         let running = running.clone();
@@ -722,6 +723,7 @@ async fn attach_video_track_with_policy(
                 stats_encode
                     .encoded_au_total
                     .fetch_add(1, Ordering::Relaxed);
+                let encoded = Arc::<[u8]>::from(encoded);
                 if block_queue {
                     let _ = encoded_tx.blocking_send(encoded);
                 } else {
@@ -757,7 +759,7 @@ async fn attach_video_track_with_policy(
         let idle_repeat_fps = effective_cfg.idle_repeat_fps.max(1);
         let session_running_send = session_running.clone();
         tokio::spawn(async move {
-            let mut last_encoded: Option<Vec<u8>> = None;
+            let mut last_encoded: Option<Arc<[u8]>> = None;
             let mut next_due = Instant::now();
             while session_running_send.load(Ordering::SeqCst) {
                 wait_until_due(next_due).await;
@@ -794,7 +796,7 @@ async fn attach_video_track_with_policy(
                 let send_gap = Duration::from_millis((1000.0 / send_fps as f64).max(1.0) as u64);
                 next_due = advance_send_deadline(next_due, send_gap, Instant::now());
                 let sample = Sample {
-                    data: Bytes::from(encoded),
+                    data: Bytes::copy_from_slice(encoded.as_ref()),
                     duration: send_gap,
                     ..Default::default()
                 };
@@ -826,7 +828,7 @@ async fn attach_video_track_with_policy(
 
 async fn spawn_send_loop_rtp(
     mut sender: RtpH264Sender,
-    mut encoded_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    mut encoded_rx: tokio::sync::mpsc::Receiver<Arc<[u8]>>,
     adapt: Arc<NetAdaptController>,
     stats: Arc<RuntimeStats>,
     enable_network_adapt: bool,
@@ -836,7 +838,7 @@ async fn spawn_send_loop_rtp(
 ) {
     let mut next_due = Instant::now();
     let mut next_recover_tick = Instant::now();
-    let mut last_encoded: Option<Vec<u8>> = None;
+    let mut last_encoded: Option<Arc<[u8]>> = None;
     while session_running.load(Ordering::SeqCst) {
         if enable_network_adapt && Instant::now() >= next_recover_tick {
             if let Some((fps_v, br_v)) = adapt.tick_recover() {
@@ -895,7 +897,7 @@ async fn spawn_send_loop_rtp(
         };
         let frame_gap = Duration::from_millis((1000.0 / send_fps as f64).max(1.0) as u64);
         next_due = advance_send_deadline(next_due, frame_gap, Instant::now());
-        if let Err(e) = sender.send_access_unit(&encoded).await {
+        if let Err(e) = sender.send_access_unit(encoded.as_ref()).await {
             error!(error = %e, "RTP write failed");
             break;
         }
