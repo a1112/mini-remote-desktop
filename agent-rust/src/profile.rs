@@ -70,5 +70,10 @@ pub fn apply_capture_profile(cfg: &mut agent_rust::CaptureConfig) {
         cfg.frame_pacing_enable = false;
         cfg.queue_strategy = "drop".to_string();
         cfg.enable_template_overlay = false;
+        if cfg.fps >= 100 {
+            // High-fps mode benefits from freshest-frame delivery and fewer duplicate sends.
+            cfg.rtp_use_manual_packetizer = true;
+            cfg.queue_depth = cfg.queue_depth.min(2);
+        }
     }
 }
