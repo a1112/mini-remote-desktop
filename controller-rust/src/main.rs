@@ -1,4 +1,5 @@
 mod input;
+mod quic_rx;
 mod render;
 mod signaling;
 mod stats;
@@ -10,16 +11,17 @@ type FrameReceiver = Arc<Mutex<mpsc::Receiver<webrtc::peer::VideoFrame>>>;
 
 use anyhow::{Context, Result};
 use uuid::Uuid;
+use quic_rx::{QuicConnectInfo, connect_quic_receiver};
 use render::D3D11Renderer;
 use signaling::{SignalingClient, SignalingMessagePayload};
 use signaling::client::SignalingConfig;
 use stats::StatsCollector;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{error, info, warn};
-use video::{Decoder, H264Decoder, H264DecoderConfig};
+use video::{Decoder, DecoderBackend, H264Decoder, H264DecoderConfig};
 use webrtc::peer::{PeerConfig, PeerConnectionManager};
 
 /// 控制器配置
@@ -59,11 +61,53 @@ fn load_config(path: &PathBuf) -> Result<ControllerConfig> {
         .as_str()
         .unwrap_or("Rust Controller")
         .to_string();
+    let preferred_transport = std::env::var("MRD_TRANSPORT")
+        .ok()
+        .or_else(|| {
+            json["transport"]
+                .as_str()
+                .map(|s| s.to_ascii_lowercase())
+        })
+        .unwrap_or_else(|| "webrtc".to_string());
+
+    let decoder_mode_str = std::env::var("MRD_DECODER")
+        .ok()
+        .or_else(|| json["video"]["decoder"].as_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| "auto".to_string())
+        .to_lowercase();
+    let decoder_backend = match decoder_mode_str.as_str() {
+        "software" | "sw" => DecoderBackend::Software,
+        "d3d11va" | "hardware" | "hw" => DecoderBackend::D3d11va,
+        _ => DecoderBackend::Auto,
+    };
+    let num_threads = json["video"]["num_decode_threads"]
+        .as_u64()
+        .map(|v| v as usize)
+        .unwrap_or(2);
+    let enable_hardware = json["video"]["enable_hardware_decode"]
+        .as_bool()
+        .unwrap_or(true);
 
     Ok(ControllerConfig {
-        signaling: SignalingConfig { ws_url, device_name },
-        video: H264DecoderConfig::default(),
+        signaling: SignalingConfig {
+            ws_url,
+            device_name,
+            preferred_transport,
+        },
+        video: H264DecoderConfig {
+            num_threads,
+            enable_hardware,
+            backend: decoder_backend,
+        },
     })
+}
+
+fn select_frame_for_decode(
+    _rx: &mut mpsc::Receiver<webrtc::peer::VideoFrame>,
+    first: webrtc::peer::VideoFrame,
+) -> webrtc::peer::VideoFrame {
+    // H.264 inter frames depend on previous references; keep decode order.
+    first
 }
 
 #[tokio::main]
@@ -84,6 +128,7 @@ async fn main() -> Result<()> {
     info!(
         ws_url = %config.signaling.ws_url,
         device_name = %config.signaling.device_name,
+        transport = %config.signaling.preferred_transport,
         "loaded configuration"
     );
 
@@ -96,15 +141,19 @@ async fn main() -> Result<()> {
     let video_frames_received = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // 创建渲染器（传递视频帧统计）
-    let renderer = D3D11Renderer::new_with_stats(
+    let renderer = Arc::new(D3D11Renderer::new_with_stats(
         render::RendererConfig::default(),
         video_frames_received.clone(),
-    )?;
+    )?);
     info!("DirectX 11 renderer initialized");
 
     // 创建解码器
-    let _decoder = H264Decoder::new(config.video.clone())?;
-    info!("video decoder initialized");
+    let decoder = Arc::new(Mutex::new(H264Decoder::new(config.video.clone())?));
+    let decoder_backend_name = {
+        let decoder_guard = decoder.lock().await;
+        decoder_guard.backend_name()
+    };
+    info!(backend = decoder_backend_name, "video decoder initialized");
 
     // 创建统计收集器
     let _stats = StatsCollector::new();
@@ -126,44 +175,127 @@ async fn main() -> Result<()> {
 
     // 视频帧统计
     let frame_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let decoded_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let frame_count_clone = frame_count.clone();
+    let decoded_count_clone = decoded_count.clone();
     let video_frames_count_clone = video_frames_received.clone();
+    let decoder_clone = decoder.clone();
+    let render_sink = renderer.frame_sink();
 
     // 启动视频帧处理任务
     let frame_receiver_clone = frame_receiver.clone();
     tokio::spawn(async move {
-        let local_rx: FrameReceiver = loop {
-            // 获取 receiver
-            let receiver_guard = frame_receiver_clone.lock().await;
-            if let Some(ref rx) = *receiver_guard {
-                break rx.clone();
-            }
-            drop(receiver_guard);
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut decode_samples_ms: std::collections::VecDeque<f64> = std::collections::VecDeque::with_capacity(1024);
+        let mut frame_interval_ms: std::collections::VecDeque<f64> = std::collections::VecDeque::with_capacity(1024);
+        let mut last_decoded_at: Option<std::time::Instant> = None;
+        let mut last_stats_at = std::time::Instant::now();
+        let decoder_backend_label = {
+            let d = decoder_clone.lock().await;
+            d.backend_name().to_string()
         };
-
         // 处理视频帧
         loop {
-            let mut rx = local_rx.lock().await;
-            if let Some(frame) = rx.recv().await {
+            let active_rx = {
+                let receiver_guard = frame_receiver_clone.lock().await;
+                receiver_guard.clone()
+            };
+            let Some(active_rx) = active_rx else {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            };
+            let mut rx = active_rx.lock().await;
+            let recv = tokio::time::timeout(Duration::from_millis(120), rx.recv()).await;
+            if let Ok(Some(frame)) = recv {
+                let newest = select_frame_for_decode(&mut rx, frame);
                 drop(rx);
+                let decode_started = std::time::Instant::now();
                 let count = frame_count_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                // 同时更新渲染器的统计计数器
-                video_frames_count_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut decoder = decoder_clone.lock().await;
+                match decoder.decode(&newest) {
+                    Ok(Some(decoded)) => {
+                        render_sink.submit(decoded);
+                        let dec = decoded_count_clone
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            + 1;
+                        // 仅在解码成功后计入渲染链路统计。
+                        video_frames_count_clone
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if dec % 100 == 0 {
+                            info!(decoded_frames = dec, "decoded video frame");
+                        }
+
+                        let now = std::time::Instant::now();
+                        let decode_ms = now.duration_since(decode_started).as_secs_f64() * 1000.0;
+                        if decode_samples_ms.len() >= 1024 {
+                            decode_samples_ms.pop_front();
+                        }
+                        decode_samples_ms.push_back(decode_ms);
+                        if let Some(prev) = last_decoded_at {
+                            let delta_ms = now.duration_since(prev).as_secs_f64() * 1000.0;
+                            if frame_interval_ms.len() >= 1024 {
+                                frame_interval_ms.pop_front();
+                            }
+                            frame_interval_ms.push_back(delta_ms);
+                        }
+                        last_decoded_at = Some(now);
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!(error = %e, "decode failed");
+                    }
+                }
+                drop(decoder);
                 // 每 100 帧记录一次
                 if count % 100 == 0 {
                     info!(
-                        bytes = frame.data.len(),
-                        timestamp = frame.timestamp,
-                        seq = frame.sequence,
+                        bytes = newest.data.len(),
+                        timestamp = newest.timestamp,
+                        seq = newest.sequence,
                         total_frames = count,
                         "received video frame"
                     );
                 }
+                if last_stats_at.elapsed() >= Duration::from_secs(2) && !decode_samples_ms.is_empty() {
+                    let mut decode_sorted: Vec<f64> = decode_samples_ms.iter().copied().collect();
+                    decode_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    let p95_idx = ((decode_sorted.len() as f64) * 0.95).floor() as usize;
+                    let p95 = decode_sorted[p95_idx.min(decode_sorted.len().saturating_sub(1))];
+                    let avg_decode = decode_sorted.iter().sum::<f64>() / decode_sorted.len() as f64;
+                    let fps = if frame_interval_ms.is_empty() {
+                        0.0
+                    } else {
+                        let avg_delta = frame_interval_ms.iter().sum::<f64>() / frame_interval_ms.len() as f64;
+                        if avg_delta > 0.0 { 1000.0 / avg_delta } else { 0.0 }
+                    };
+                    let jitter = if frame_interval_ms.len() < 2 {
+                        0.0
+                    } else {
+                        let mean = frame_interval_ms.iter().sum::<f64>() / frame_interval_ms.len() as f64;
+                        let var = frame_interval_ms
+                            .iter()
+                            .map(|v| {
+                                let d = v - mean;
+                                d * d
+                            })
+                            .sum::<f64>()
+                            / frame_interval_ms.len() as f64;
+                        var.sqrt()
+                    };
+                    info!(
+                        backend = %decoder_backend_label,
+                        fps = format!("{:.2}", fps),
+                        avg_decode_ms = format!("{:.3}", avg_decode),
+                        p95_decode_ms = format!("{:.3}", p95),
+                        jitter_ms = format!("{:.3}", jitter),
+                        samples = decode_sorted.len(),
+                        "[DECODER-STATS]"
+                    );
+                    last_stats_at = std::time::Instant::now();
+                }
                 // TODO: 解码并渲染视频帧
             } else {
-                // 通道关闭
-                break;
+                drop(rx);
+                continue;
             }
         }
     });
@@ -247,17 +379,67 @@ async fn main() -> Result<()> {
                             warn!("current agent disconnected");
                         }
                     }
-                    SignalingMessagePayload::Answer { answer, controller_id } => {
-                        info!("received WebRTC Answer from {}", controller_id);
-                        // 设置远程描述
+                    SignalingMessagePayload::Answer {
+                        answer,
+                        controller_id,
+                        selected_transport,
+                        quic,
+                    } => {
+                        info!(
+                            controller_id = %controller_id,
+                            selected_transport = %selected_transport,
+                            "received WebRTC answer"
+                        );
+                        // Always complete WebRTC SDP handshake first so media can fallback
+                        // immediately if QUIC transport setup fails.
+                        let mut webrtc_ready = false;
                         let manager = peer_manager.read().await;
                         if let Some(ref mgr) = *manager {
                             if let Err(e) = mgr.set_remote_description(answer).await {
                                 error!(error = %e, "failed to set remote description");
                             } else {
                                 info!("remote description set successfully");
-                                *connected.lock().await = true;
+                                webrtc_ready = true;
                             }
+                        }
+                        drop(manager);
+
+                        if selected_transport.eq_ignore_ascii_case("quic") {
+                            if let Some(q) = quic {
+                                let info = QuicConnectInfo {
+                                    addr: q.addr,
+                                    server_name: q.server_name,
+                                    cert_der_base64: q.cert_der_base64,
+                                };
+                                match connect_quic_receiver(&info).await {
+                                    Ok(rx) => {
+                                        *frame_receiver.lock().await = Some(rx);
+                                        *connected.lock().await = true;
+                                        info!("connected to QUIC media transport");
+                                    }
+                                    Err(e) => {
+                                        if webrtc_ready {
+                                            *connected.lock().await = true;
+                                            warn!(
+                                                error = %e,
+                                                "failed to connect QUIC media transport, fallback to WebRTC media path"
+                                            );
+                                        } else {
+                                            error!(
+                                                error = %e,
+                                                "failed to connect QUIC media transport and WebRTC fallback is unavailable"
+                                            );
+                                        }
+                                    }
+                                }
+                            } else if webrtc_ready {
+                                *connected.lock().await = true;
+                                warn!("selected transport is quic but quic endpoint info is missing, fallback to WebRTC");
+                            } else {
+                                warn!("selected transport is quic but quic endpoint info is missing");
+                            }
+                        } else if webrtc_ready {
+                            *connected.lock().await = true;
                         }
                     }
                     SignalingMessagePayload::IceCandidate { candidate, .. } => {
@@ -276,8 +458,9 @@ async fn main() -> Result<()> {
             // 定期打印统计信息
             _ = stats_interval.tick() => {
                 let count = frame_count.load(std::sync::atomic::Ordering::Relaxed);
+                let decoded = decoded_count.load(std::sync::atomic::Ordering::Relaxed);
                 if count > 0 {
-                    info!(total_frames = count, "video frames received so far");
+                    info!(total_frames = count, decoded_frames = decoded, "video frames received so far");
                 }
             }
 
@@ -371,4 +554,39 @@ async fn initiate_webRTC_connection(
     *frame_receiver.lock().await = Some(frame_rx);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+
+    #[tokio::test]
+    async fn select_frame_for_decode_preserves_decode_order() {
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.send(webrtc::peer::VideoFrame {
+            data: Bytes::from_static(&[0, 0, 0, 1, 0x61]),
+            timestamp: 2,
+            is_keyframe: false,
+            sequence: 2,
+        })
+        .await
+        .unwrap();
+        tx.send(webrtc::peer::VideoFrame {
+            data: Bytes::from_static(&[0, 0, 0, 1, 0x61]),
+            timestamp: 3,
+            is_keyframe: false,
+            sequence: 3,
+        })
+        .await
+        .unwrap();
+        let first = webrtc::peer::VideoFrame {
+            data: Bytes::from_static(&[0, 0, 0, 1, 0x65]),
+            timestamp: 1,
+            is_keyframe: true,
+            sequence: 1,
+        };
+        let picked = select_frame_for_decode(&mut rx, first);
+        assert_eq!(picked.sequence, 1);
+    }
 }
