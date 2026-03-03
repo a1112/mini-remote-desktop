@@ -46,6 +46,11 @@ class AgentConfig:
     device_name: str = "Python Agent"
     capture: CaptureConfig = field(default_factory=CaptureConfig)
 
+    # NVENC specific settings
+    quality: int = 24  # QP value (18-51, lower is better)
+    monitor_index: int = 0  # Monitor to capture
+    encoder_type: str = "nvenc"  # "nvenc" or "software"
+
     @classmethod
     def from_file(cls, path: Optional[Path] = None) -> "AgentConfig":
         """
@@ -92,6 +97,29 @@ class AgentConfig:
                 if hasattr(config.capture, key):
                     setattr(config.capture, key, value)
 
+        # NVENC specific settings
+        if "quality" in data:
+            config.quality = int(data["quality"])
+        if "monitor_index" in data:
+            config.monitor_index = int(data["monitor_index"])
+        if "encoder_type" in data:
+            config.encoder_type = str(data["encoder_type"])
+
+        # Set quality from capture bitrate if specified (approximate mapping)
+        if config.quality == 24 and config.capture.bitrate_kbps:
+            # Map bitrate to QP (approximate)
+            br = config.capture.bitrate_kbps // 1000  # Convert to Mbps
+            if br >= 20:
+                config.quality = 18
+            elif br >= 10:
+                config.quality = 24
+            elif br >= 5:
+                config.quality = 30
+            elif br >= 2:
+                config.quality = 36
+            else:
+                config.quality = 42
+
         # Normalize and validate
         _normalize_config(config)
 
@@ -137,3 +165,7 @@ def _normalize_config(config: AgentConfig) -> None:
 def get_default_config() -> AgentConfig:
     """Get default configuration."""
     return AgentConfig.from_file()
+
+
+# Convenience aliases
+AgentConfig.from_file_or_default = AgentConfig.from_file
