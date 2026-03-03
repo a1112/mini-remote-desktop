@@ -339,7 +339,14 @@ impl D3D11Renderer {
         let mut cpu_upload_frames = 0u64;
         let mut gpu_external_frames = 0u64;
         let mut stale_dropped_frames = 0u64;
+        let mut age_dropped_frames = 0u64;
         let mut metrics = OverlayRenderMetrics::default();
+        let render_max_age_us = std::env::var("MRD_RENDER_MAX_AGE_MS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| *v > 0.0)
+            .map(|ms| (ms * 1000.0) as u64)
+            .unwrap_or(0);
 
         let mut d3d = D3DContext::new(window, &config)?;
         let idle_wait_timeout_ms = idle_wait_timeout_ms(config.low_latency_mode);
@@ -391,6 +398,19 @@ impl D3D11Renderer {
             };
 
             if let Some(frame) = maybe_frame {
+                if render_max_age_us > 0 && frame.capture_start_unix_us != 0 {
+                    if let Ok(elapsed) =
+                        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                    {
+                        let now_us = elapsed.as_micros().min(u64::MAX as u128) as u64;
+                        if now_us > frame.capture_start_unix_us
+                            && now_us - frame.capture_start_unix_us > render_max_age_us
+                        {
+                            age_dropped_frames = age_dropped_frames.saturating_add(1);
+                            continue;
+                        }
+                    }
+                }
                 match &frame.data {
                     DecodedFrameData::CpuNv12(_) => {
                         cpu_upload_frames = cpu_upload_frames.saturating_add(1);
@@ -525,6 +545,7 @@ impl D3D11Renderer {
                     received_fps = format!("{:.2}", recv_fps),
                     stale_dropped_total = stale_dropped_frames,
                     stale_dropped_per_sec = stale_dropped_frames.saturating_sub(last_stale_dropped_count),
+                    age_dropped_total = age_dropped_frames,
                     gpu_external_frames,
                     cpu_upload_frames,
                     gpu_zero_copy_ratio = format!(
@@ -1633,6 +1654,8 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
             .context("missing shared copy texture")?;
         unsafe {
             self.context.CopyResource(copy_tex, &source_tex);
+            // Submit copy before releasing keyed mutex to avoid consumer/producer overlap artifacts.
+            self.context.Flush();
         }
         timing.copy_ms = t1.elapsed().as_secs_f64() * 1000.0;
 

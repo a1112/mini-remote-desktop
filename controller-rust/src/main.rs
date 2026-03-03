@@ -166,11 +166,57 @@ async fn discover_signaling_ws_url(default_ws_port: u16) -> Option<String> {
 }
 
 fn select_frame_for_decode(
-    _rx: &mut mpsc::Receiver<webrtc::peer::VideoFrame>,
+    rx: &mut mpsc::Receiver<webrtc::peer::VideoFrame>,
     first: webrtc::peer::VideoFrame,
-) -> webrtc::peer::VideoFrame {
-    // H.264 inter frames depend on previous references; keep decode order.
-    first
+    policy: DecodeSelectPolicy,
+) -> (webrtc::peer::VideoFrame, u64) {
+    match policy {
+        DecodeSelectPolicy::Ordered => (first, 0),
+        DecodeSelectPolicy::LatestKeyframe => {
+            // Prefer the newest keyframe in backlog; otherwise keep decode order.
+            let mut dropped = 0u64;
+            let mut newest_key: Option<webrtc::peer::VideoFrame> = None;
+            while let Ok(next) = rx.try_recv() {
+                dropped = dropped.saturating_add(1);
+                if next.is_keyframe {
+                    newest_key = Some(next);
+                }
+            }
+            (newest_key.unwrap_or(first), dropped)
+        }
+        DecodeSelectPolicy::Latest => {
+            // Aggressive low-latency mode: always decode freshest frame available.
+            let mut dropped = 0u64;
+            let mut newest = first;
+            while let Ok(next) = rx.try_recv() {
+                dropped = dropped.saturating_add(1);
+                newest = next;
+            }
+            (newest, dropped)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecodeSelectPolicy {
+    Ordered,
+    LatestKeyframe,
+    Latest,
+}
+
+impl DecodeSelectPolicy {
+    fn from_env() -> Self {
+        match std::env::var("MRD_DECODE_SELECT")
+            .ok()
+            .unwrap_or_else(|| "ordered".to_string())
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "latest-key" | "latest_key" | "latestkey" | "key" => Self::LatestKeyframe,
+            "latest" => Self::Latest,
+            _ => Self::Ordered,
+        }
+    }
 }
 
 #[tokio::main]
@@ -257,15 +303,20 @@ async fn main() -> Result<()> {
     let frame_count_clone = frame_count.clone();
     let decoded_count_clone = decoded_count.clone();
     let decoder_clone = decoder.clone();
+    let video_cfg_for_recover = config.video.clone();
     let render_sink = renderer.frame_sink();
     let overlay_stats_for_decode = overlay_stats.clone();
 
     // 启动视频帧处理任务
     let frame_receiver_clone = frame_receiver.clone();
     tokio::spawn(async move {
+        let decode_select_policy = DecodeSelectPolicy::from_env();
         let mut decode_samples_ms: std::collections::VecDeque<f64> = std::collections::VecDeque::with_capacity(1024);
         let mut frame_interval_ms: std::collections::VecDeque<f64> = std::collections::VecDeque::with_capacity(1024);
         let mut e2e_samples_ms: std::collections::VecDeque<f64> = std::collections::VecDeque::with_capacity(1024);
+        let mut dropped_old_frames = 0u64;
+        let mut decode_recover_stage = 0u8;
+        let mut no_output_streak = 0u32;
         let mut last_decoded_at: Option<std::time::Instant> = None;
         let mut last_stats_at = std::time::Instant::now();
         let decoder_backend_label = {
@@ -288,13 +339,16 @@ async fn main() -> Result<()> {
             let mut rx = active_rx.lock().await;
             let recv = tokio::time::timeout(Duration::from_millis(120), rx.recv()).await;
             if let Ok(Some(frame)) = recv {
-                let newest = select_frame_for_decode(&mut rx, frame);
+                let (newest, dropped_now) =
+                    select_frame_for_decode(&mut rx, frame, decode_select_policy);
+                dropped_old_frames = dropped_old_frames.saturating_add(dropped_now);
                 drop(rx);
                 let decode_started = std::time::Instant::now();
                 let count = frame_count_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 let mut decoder = decoder_clone.lock().await;
                 match decoder.decode(&newest) {
                     Ok(Some(decoded)) => {
+                        no_output_streak = 0;
                         render_sink.submit(decoded);
                         let dec = decoded_count_clone
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -335,8 +389,69 @@ async fn main() -> Result<()> {
                         }
                         last_decoded_at = Some(now);
                     }
-                    Ok(None) => {}
+                    Ok(None) => {
+                        no_output_streak = no_output_streak.saturating_add(1);
+                        if no_output_streak >= 300 && decode_recover_stage < 2 {
+                            let mut next_cfg = video_cfg_for_recover.clone();
+                            if decode_recover_stage == 0 {
+                                next_cfg.backend = DecoderBackend::MfD3d11;
+                                warn!(
+                                    no_output_streak,
+                                    "decoder produced no output for too long; trying MF d3d11 fallback"
+                                );
+                            } else {
+                                next_cfg.backend = DecoderBackend::Software;
+                                warn!(
+                                    no_output_streak,
+                                    "decoder still no output after MF fallback; trying software decoder"
+                                );
+                            }
+                            match H264Decoder::new(next_cfg) {
+                                Ok(new_decoder) => {
+                                    *decoder = new_decoder;
+                                    decode_recover_stage = decode_recover_stage.saturating_add(1);
+                                    no_output_streak = 0;
+                                    if let Ok(mut ov) = overlay_stats_for_decode.lock() {
+                                        ov.decoder_backend = decoder.backend_name().to_string();
+                                    }
+                                    continue;
+                                }
+                                Err(recover_err) => {
+                                    warn!(error = %recover_err, "decoder no-output recovery attempt failed");
+                                    decode_recover_stage = decode_recover_stage.saturating_add(1);
+                                }
+                            }
+                        }
+                    }
                     Err(e) => {
+                        let err_text = e.to_string().to_ascii_lowercase();
+                        let recoverable_hw_err = err_text.contains("hardware output required")
+                            || err_text.contains("d3d11")
+                            || err_text.contains("strict mode");
+                        if recoverable_hw_err && decode_recover_stage < 2 {
+                            let mut next_cfg = video_cfg_for_recover.clone();
+                            if decode_recover_stage == 0 {
+                                next_cfg.backend = DecoderBackend::MfD3d11;
+                                warn!("decode failed on hw strict path; trying MF d3d11 fallback");
+                            } else {
+                                next_cfg.backend = DecoderBackend::Software;
+                                warn!("decode failed after MF fallback; trying software decoder");
+                            }
+                            match H264Decoder::new(next_cfg) {
+                                Ok(new_decoder) => {
+                                    *decoder = new_decoder;
+                                    decode_recover_stage = decode_recover_stage.saturating_add(1);
+                                    if let Ok(mut ov) = overlay_stats_for_decode.lock() {
+                                        ov.decoder_backend = decoder.backend_name().to_string();
+                                    }
+                                    continue;
+                                }
+                                Err(recover_err) => {
+                                    warn!(error = %recover_err, "decoder recovery attempt failed");
+                                    decode_recover_stage = decode_recover_stage.saturating_add(1);
+                                }
+                            }
+                        }
                         warn!(error = %e, "decode failed");
                         if let Ok(mut ov) = overlay_stats_for_decode.lock() {
                             ov.decode_failures = ov.decode_failures.saturating_add(1);
@@ -403,6 +518,7 @@ async fn main() -> Result<()> {
                     };
                     info!(
                         backend = %decoder_backend_label,
+                        decode_select = ?decode_select_policy,
                         fps = format!("{:.2}", fps),
                         avg_decode_ms = format!("{:.3}", avg_decode),
                         p95_decode_ms = format!("{:.3}", p95),
@@ -411,6 +527,7 @@ async fn main() -> Result<()> {
                         e2e_p50_ms = format!("{:.3}", e2e_p50),
                         e2e_p95_ms = format!("{:.3}", e2e_p95),
                         e2e_p99_ms = format!("{:.3}", e2e_p99),
+                        decode_drop_old_total = dropped_old_frames,
                         e2e_samples,
                         samples = decode_sorted.len(),
                         "[DECODER-STATS]"
@@ -803,7 +920,42 @@ mod tests {
             sequence: 1,
             tx_unix_us: 0,
         };
-        let picked = select_frame_for_decode(&mut rx, first);
+        let (picked, dropped) = select_frame_for_decode(&mut rx, first, DecodeSelectPolicy::Ordered);
         assert_eq!(picked.sequence, 1);
+        assert_eq!(dropped, 0);
+    }
+
+    #[tokio::test]
+    async fn select_frame_for_decode_latest_key_prefers_new_keyframe() {
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.send(webrtc::peer::VideoFrame {
+            data: Bytes::from_static(&[0, 0, 0, 1, 0x61]),
+            timestamp: 2,
+            is_keyframe: false,
+            sequence: 2,
+            tx_unix_us: 0,
+        })
+        .await
+        .unwrap();
+        tx.send(webrtc::peer::VideoFrame {
+            data: Bytes::from_static(&[0, 0, 0, 1, 0x65]),
+            timestamp: 3,
+            is_keyframe: true,
+            sequence: 3,
+            tx_unix_us: 0,
+        })
+        .await
+        .unwrap();
+        let first = webrtc::peer::VideoFrame {
+            data: Bytes::from_static(&[0, 0, 0, 1, 0x61]),
+            timestamp: 1,
+            is_keyframe: false,
+            sequence: 1,
+            tx_unix_us: 0,
+        };
+        let (picked, dropped) =
+            select_frame_for_decode(&mut rx, first, DecodeSelectPolicy::LatestKeyframe);
+        assert_eq!(picked.sequence, 3);
+        assert_eq!(dropped, 2);
     }
 }

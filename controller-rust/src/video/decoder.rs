@@ -154,6 +154,54 @@ pub enum H264Decoder {
 
 impl H264Decoder {
     pub fn new(config: H264DecoderConfig) -> Result<Self> {
+        let wants_hw = matches!(config.backend, DecoderBackend::D3d11va)
+            || (matches!(config.backend, DecoderBackend::Auto) && config.enable_hardware);
+        let allow_soft_fallback = std::env::var("MRD_ALLOW_SOFTWARE_FALLBACK")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(true);
+
+        #[cfg(all(windows, feature = "mf-decoder", feature = "ffmpeg-software"))]
+        if wants_hw {
+            // Hardware-locked chain: FFmpeg d3d11va strict -> MF d3d11 -> optional software fallback.
+            if ffmpeg_backend::has_d3d11va_decoder() {
+                match ffmpeg_backend::FfmpegH264Decoder::new_with_options(config.clone(), true) {
+                    Ok(decoder) => {
+                        tracing::info!("decoder chain selected: ffmpeg d3d11va strict");
+                        return Ok(Self::Ffmpeg(decoder));
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "ffmpeg d3d11va strict init failed; trying MF d3d11");
+                    }
+                }
+            } else {
+                tracing::warn!("h264_d3d11va decoder unavailable; skipping strict ffmpeg hw path");
+            }
+
+            match mf_backend::MfH264Decoder::new(config.clone()) {
+                Ok(decoder) => {
+                    tracing::info!("decoder chain selected: mf_d3d11");
+                    return Ok(Self::MfD3d11(decoder));
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "mf_d3d11 init failed");
+                }
+            }
+
+            if !allow_soft_fallback {
+                anyhow::bail!(
+                    "hardware decode required but all hardware backends failed (set MRD_ALLOW_SOFTWARE_FALLBACK=1 to permit software fallback)"
+                );
+            }
+
+            let mut sw_cfg = config.clone();
+            sw_cfg.backend = DecoderBackend::Software;
+            tracing::warn!("all hardware backends failed; falling back to software decoder");
+            return Ok(Self::Ffmpeg(ffmpeg_backend::FfmpegH264Decoder::new_with_options(
+                sw_cfg, false,
+            )?));
+        }
+
         #[cfg(all(windows, feature = "mf-decoder", feature = "ffmpeg-software"))]
         {
             let prefer_mf = matches!(config.backend, DecoderBackend::MfD3d11)
@@ -176,7 +224,9 @@ impl H264Decoder {
 
         #[cfg(feature = "ffmpeg-software")]
         {
-            Ok(Self::Ffmpeg(ffmpeg_backend::FfmpegH264Decoder::new(config)?))
+            Ok(Self::Ffmpeg(ffmpeg_backend::FfmpegH264Decoder::new_with_options(
+                config, false,
+            )?))
         }
 
         #[cfg(not(feature = "ffmpeg-software"))]
@@ -943,14 +993,16 @@ mod ffmpeg_backend {
         first_output_logged: bool,
         wants_hw: bool,
         require_hw: bool,
+        strict_hw_output: bool,
         warned_non_hw_output: bool,
+        warned_d3d11_extract_failed: bool,
     }
 
     // Decoder is guarded by a mutex in upper layer; one-thread access.
     unsafe impl Send for FfmpegH264Decoder {}
 
     impl FfmpegH264Decoder {
-        pub fn new(config: H264DecoderConfig) -> Result<Self> {
+        pub fn new_with_options(config: H264DecoderConfig, strict_hw_output: bool) -> Result<Self> {
             ffmpeg_next::init()?;
 
             let codec = pick_decoder_codec(&config)
@@ -982,6 +1034,11 @@ mod ffmpeg_backend {
                         opened
                     }
                     Err(e) => {
+                        if strict_hw_output {
+                            return Err(anyhow::anyhow!(
+                                "open h264_d3d11va decoder failed in strict mode: {e}"
+                            ));
+                        }
                         tracing::warn!(
                             error = %e,
                             "open h264_d3d11va decoder failed, fallback to plain h264 decoder"
@@ -1008,6 +1065,11 @@ mod ffmpeg_backend {
                         opened
                     }
                     Err(e) => {
+                        if strict_hw_output {
+                            return Err(anyhow::anyhow!(
+                                "open_as_with d3d11va failed in strict mode: {e}"
+                            ));
+                        }
                         tracing::warn!(
                             error = %e,
                             "open_as_with d3d11va failed, fallback to plain h264 decoder"
@@ -1038,7 +1100,9 @@ mod ffmpeg_backend {
                 first_output_logged: false,
                 wants_hw,
                 require_hw,
+                strict_hw_output,
                 warned_non_hw_output: false,
+                warned_d3d11_extract_failed: false,
             })
         }
 
@@ -1079,9 +1143,9 @@ mod ffmpeg_backend {
                         && !self.warned_non_hw_output
                     {
                         self.warned_non_hw_output = true;
-                        if self.require_hw {
+                        if self.require_hw || self.strict_hw_output {
                             anyhow::bail!(
-                                "MRD_REQUIRE_D3D11VA=1 but decoder output is {:?}, not D3D11",
+                                "hardware output required but decoder output is {:?}, not D3D11",
                                 self.video_frame.format()
                             );
                         }
@@ -1094,18 +1158,32 @@ mod ffmpeg_backend {
 
                     #[cfg(windows)]
                     if self.video_frame.format() == format::Pixel::D3D11 {
-                        if let Some((texture, subresource)) =
-                            self.extract_d3d11_surface(&self.video_frame)?
-                        {
-                            return Ok(Some(DecodedFrame::from_d3d11_nv12(
-                                texture,
-                                subresource,
-                                width,
-                                height,
-                                pts,
-                                pts,
-                                0,
-                            )));
+                        match self.extract_d3d11_surface(&self.video_frame)? {
+                            Some((texture, subresource)) => {
+                                return Ok(Some(DecodedFrame::from_d3d11_nv12(
+                                    texture,
+                                    subresource,
+                                    width,
+                                    height,
+                                    pts,
+                                    pts,
+                                    0,
+                                )));
+                            }
+                            None => {
+                                if self.strict_hw_output || self.require_hw {
+                                    anyhow::bail!(
+                                        "hardware output required but failed to extract D3D11 surface from AVFrame"
+                                    );
+                                }
+                                if !self.warned_d3d11_extract_failed {
+                                    self.warned_d3d11_extract_failed = true;
+                                    tracing::warn!(
+                                        decoder = %self.backend_name,
+                                        "decoder produced D3D11 frame but extract_d3d11_surface failed; falling back to CPU upload path"
+                                    );
+                                }
+                            }
                         }
                     }
 
@@ -1212,6 +1290,10 @@ mod ffmpeg_backend {
         } else {
             vec!["h264"]
         }
+    }
+
+    pub(super) fn has_d3d11va_decoder() -> bool {
+        decoder::find_by_name("h264_d3d11va").is_some()
     }
 
     fn pick_decoder_codec(config: &H264DecoderConfig) -> Option<Codec> {
