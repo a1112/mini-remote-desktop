@@ -1,4 +1,5 @@
 use super::RendererConfig;
+use crate::thread_tuning::{apply_current_thread_tuning, ThreadRole};
 use crate::video::decoder::{DecodedFrame, DecodedFrameData};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -20,9 +21,6 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::*;
-use windows::Win32::System::Threading::{
-    GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST,
-};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR};
 
@@ -229,9 +227,7 @@ impl D3D11Renderer {
         let control_queue_clone = overlay_control_queue.clone();
         let config_clone = config.clone();
         thread::spawn(move || {
-            unsafe {
-                let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
-            }
+            let (_thread_tuning, _thread_tuning_guard) = apply_current_thread_tuning(ThreadRole::Render);
 
             let window = match Self::create_window(
                 config_clone.window_width,
@@ -422,8 +418,14 @@ impl D3D11Renderer {
                         if let Err(e) =
                             d3d.draw_external_nv12(texture, *subresource, frame.width, frame.height)
                         {
-                            warn!(error = %e, "draw_external_nv12 failed; dropping frame");
-                            continue;
+                            warn!(error = %e, "draw_external_nv12 failed; trying CPU readback fallback");
+                            cpu_upload_frames = cpu_upload_frames.saturating_add(1);
+                            if let Err(fallback_err) = d3d
+                                .draw_external_nv12_via_cpu(texture, *subresource, frame.width, frame.height)
+                            {
+                                warn!(error = %fallback_err, "draw_external_nv12 CPU fallback failed; dropping frame");
+                                continue;
+                            }
                         }
                     }
                     DecodedFrameData::D3d11SharedNv12 { shared_handle } => {
@@ -1228,6 +1230,9 @@ struct D3DContext {
     shared_copy_uv_srv: Option<ID3D11ShaderResourceView>,
     shared_copy_w: u32,
     shared_copy_h: u32,
+    external_readback_tex: Option<ID3D11Texture2D>,
+    external_readback_w: u32,
+    external_readback_h: u32,
     frame_width: u32,
     frame_height: u32,
     vsync: bool,
@@ -1470,6 +1475,9 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
                 shared_copy_uv_srv: None,
                 shared_copy_w: 0,
                 shared_copy_h: 0,
+                external_readback_tex: None,
+                external_readback_w: 0,
+                external_readback_h: 0,
                 frame_width: 0,
                 frame_height: 0,
                 vsync: config.vsync,
@@ -1606,6 +1614,93 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
     ) -> Result<()> {
         let (y_srv, uv_srv) = self.external_nv12_srvs(texture, subresource)?;
         self.draw_with_srvs(width, height, &y_srv, &uv_srv)
+    }
+
+    fn draw_external_nv12_via_cpu(
+        &mut self,
+        texture: &ID3D11Texture2D,
+        subresource: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<()> {
+        self.ensure_external_readback_texture(width, height)?;
+        let readback = self
+            .external_readback_tex
+            .as_ref()
+            .context("missing external readback texture")?;
+        unsafe {
+            self.context
+                .CopySubresourceRegion(readback, 0, 0, 0, 0, texture, subresource, None);
+
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            self.context
+                .Map(readback, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .context("Map external readback failed")?;
+
+            let y_rows = height as usize;
+            let uv_rows = (height / 2) as usize;
+            let row_bytes = width as usize;
+            let y_size = row_bytes * y_rows;
+            let mut nv12 = vec![0u8; y_size + row_bytes * uv_rows];
+            let src_y_base = mapped.pData as *const u8;
+            for row in 0..y_rows {
+                let src = src_y_base.add(row * mapped.RowPitch as usize);
+                let dst = nv12.as_mut_ptr().add(row * row_bytes);
+                std::ptr::copy_nonoverlapping(src, dst, row_bytes);
+            }
+            let src_uv_base = src_y_base.add(y_rows * mapped.RowPitch as usize);
+            let dst_uv_base = nv12.as_mut_ptr().add(y_size);
+            for row in 0..uv_rows {
+                let src = src_uv_base.add(row * mapped.RowPitch as usize);
+                let dst = dst_uv_base.add(row * row_bytes);
+                std::ptr::copy_nonoverlapping(src, dst, row_bytes);
+            }
+            self.context.Unmap(readback, 0);
+
+            let frame = DecodedFrame::from_cpu_nv12(
+                Arc::new(nv12),
+                width,
+                height,
+                0,
+                0,
+                0,
+            );
+            self.upload_nv12(&frame)?;
+            self.draw_frame()?;
+        }
+        Ok(())
+    }
+
+    fn ensure_external_readback_texture(&mut self, width: u32, height: u32) -> Result<()> {
+        if self.external_readback_tex.is_some()
+            && self.external_readback_w == width
+            && self.external_readback_h == height
+        {
+            return Ok(());
+        }
+        unsafe {
+            self.external_readback_w = width;
+            self.external_readback_h = height;
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: width,
+                Height: height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_NV12,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_STAGING,
+                BindFlags: 0,
+                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                MiscFlags: 0,
+            };
+            let mut tex = None;
+            self.device
+                .CreateTexture2D(&desc, None, Some(&mut tex))
+                .context("CreateTexture2D(external readback) failed")?;
+            self.external_readback_tex = tex;
+            self.external_nv12_srv_cache.clear();
+        }
+        Ok(())
     }
 
     fn draw_shared_nv12(

@@ -3,6 +3,7 @@ mod quic_rx;
 mod render;
 mod signaling;
 mod stats;
+mod thread_tuning;
 mod video;
 mod webrtc;
 
@@ -19,7 +20,9 @@ use stats::StatsCollector;
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
+use thread_tuning::{apply_current_thread_tuning, ThreadRole};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{error, info, warn};
@@ -309,44 +312,59 @@ async fn main() -> Result<()> {
 
     // 启动视频帧处理任务
     let frame_receiver_clone = frame_receiver.clone();
-    tokio::spawn(async move {
-        let decode_select_policy = DecodeSelectPolicy::from_env();
-        let mut decode_samples_ms: std::collections::VecDeque<f64> = std::collections::VecDeque::with_capacity(1024);
-        let mut frame_interval_ms: std::collections::VecDeque<f64> = std::collections::VecDeque::with_capacity(1024);
-        let mut e2e_samples_ms: std::collections::VecDeque<f64> = std::collections::VecDeque::with_capacity(1024);
-        let mut dropped_old_frames = 0u64;
-        let mut decode_recover_stage = 0u8;
-        let mut no_output_streak = 0u32;
-        let mut last_decoded_at: Option<std::time::Instant> = None;
-        let mut last_stats_at = std::time::Instant::now();
-        let decoder_backend_label = {
-            let d = decoder_clone.lock().await;
-            d.backend_name().to_string()
+    thread::Builder::new()
+        .name("mrd-decode".to_string())
+        .spawn(move || {
+        let (_decode_thread_tuning, _decode_thread_guard) =
+            apply_current_thread_tuning(ThreadRole::Decode);
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                error!(error = %e, "failed to build decode runtime");
+                return;
+            }
         };
-        if let Ok(mut ov) = overlay_stats_for_decode.lock() {
-            ov.decoder_backend = decoder_backend_label.clone();
-        }
-        // 处理视频帧
-        loop {
-            let active_rx = {
-                let receiver_guard = frame_receiver_clone.lock().await;
-                receiver_guard.clone()
+        rt.block_on(async move {
+            let decode_select_policy = DecodeSelectPolicy::from_env();
+            let mut decode_samples_ms: std::collections::VecDeque<f64> = std::collections::VecDeque::with_capacity(1024);
+            let mut frame_interval_ms: std::collections::VecDeque<f64> = std::collections::VecDeque::with_capacity(1024);
+            let mut e2e_samples_ms: std::collections::VecDeque<f64> = std::collections::VecDeque::with_capacity(1024);
+            let mut dropped_old_frames = 0u64;
+            let mut decode_recover_stage = 0u8;
+            let mut no_output_streak = 0u32;
+            let mut last_decoded_at: Option<std::time::Instant> = None;
+            let mut last_stats_at = std::time::Instant::now();
+            let decoder_backend_label = {
+                let d = decoder_clone.lock().await;
+                d.backend_name().to_string()
             };
-            let Some(active_rx) = active_rx else {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                continue;
-            };
-            let mut rx = active_rx.lock().await;
-            let recv = tokio::time::timeout(Duration::from_millis(120), rx.recv()).await;
-            if let Ok(Some(frame)) = recv {
-                let (newest, dropped_now) =
-                    select_frame_for_decode(&mut rx, frame, decode_select_policy);
-                dropped_old_frames = dropped_old_frames.saturating_add(dropped_now);
-                drop(rx);
-                let decode_started = std::time::Instant::now();
-                let count = frame_count_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                let mut decoder = decoder_clone.lock().await;
-                match decoder.decode(&newest) {
+            if let Ok(mut ov) = overlay_stats_for_decode.lock() {
+                ov.decoder_backend = decoder_backend_label.clone();
+            }
+            // 处理视频帧
+            loop {
+                let active_rx = {
+                    let receiver_guard = frame_receiver_clone.lock().await;
+                    receiver_guard.clone()
+                };
+                let Some(active_rx) = active_rx else {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                };
+                let mut rx = active_rx.lock().await;
+                let recv = tokio::time::timeout(Duration::from_millis(120), rx.recv()).await;
+                if let Ok(Some(frame)) = recv {
+                    let (newest, dropped_now) =
+                        select_frame_for_decode(&mut rx, frame, decode_select_policy);
+                    dropped_old_frames = dropped_old_frames.saturating_add(dropped_now);
+                    drop(rx);
+                    let decode_started = std::time::Instant::now();
+                    let count = frame_count_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    let mut decoder = decoder_clone.lock().await;
+                    match decoder.decode(&newest) {
                     Ok(Some(decoded)) => {
                         no_output_streak = 0;
                         render_sink.submit(decoded);
@@ -549,8 +567,10 @@ async fn main() -> Result<()> {
                 drop(rx);
                 continue;
             }
-        }
-    });
+            }
+        });
+    })
+    .context("failed to spawn decode thread")?;
 
     // 主事件循环
     loop {
