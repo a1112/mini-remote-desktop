@@ -23,6 +23,7 @@ tokio-tungstenite = "0.24"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 webrtc = "0.12"
+wtransport = "0.7"
 rtp = "0.12"
 rtcp = "0.12"
 common-control-proto = { path = "../common-control-proto" }
