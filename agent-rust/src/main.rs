@@ -389,11 +389,29 @@ fn roi_map_requested() -> bool {
             .unwrap_or(false)
 }
 
+fn roi_require_native() -> bool {
+    std::env::var("AGENT_ROI_REQUIRE_NATIVE")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(true)
+}
+
 fn nvenc_native_roi_enabled() -> bool {
     std::env::var("AGENT_NVENC_NATIVE_ROI_ENABLE")
         .ok()
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
+}
+
+fn effective_roi_request(roi_requested: bool, native_roi_enabled: bool, _require_native: bool) -> bool {
+    if !roi_requested {
+        return false;
+    }
+    // Default safety policy: do not allow ffmpeg ROI fallback when native ROI is unavailable.
+    if !native_roi_enabled {
+        return false;
+    }
+    true
 }
 
 fn get_or_start_shared_encoded_hub(
@@ -437,9 +455,19 @@ fn get_or_start_shared_encoded_hub(
             probe_interval_ms,
             "shared pipeline loop started"
         );
-        let roi_requested = roi_map_requested();
+        let roi_requested_raw = roi_map_requested();
         let native_roi = nvenc_native_roi_enabled();
-        if roi_requested && !native_roi {
+        let roi_require_native = roi_require_native();
+        let roi_requested = effective_roi_request(roi_requested_raw, native_roi, roi_require_native);
+        if roi_requested_raw && roi_require_native && !native_roi {
+            info!(
+                "shared pipeline: ROI requested with requireNative=true but native ROI unsupported; disabling ROI fallback"
+            );
+        } else if roi_requested_raw && !roi_require_native && !native_roi {
+            info!(
+                "shared pipeline: ROI quality mode requested but native ROI unsupported; blocking ffmpeg ROI fallback by policy"
+            );
+        } else if roi_requested && !native_roi {
             info!(
                 "shared pipeline: ROI map requested, using ffmpeg nvenc path (native nvenc ROI map disabled)"
             );
@@ -1593,6 +1621,7 @@ async fn apply_capture_patch(
             }
         }
         if let Some(roi) = qp.get("roi").and_then(|v| v.as_object()) {
+            let mut require_native_set = false;
             if let Some(v) = roi.get("enable").and_then(|v| v.as_bool()) {
                 unsafe {
                     std::env::set_var("AGENT_ROI_ENABLE", if v { "1" } else { "0" });
@@ -1637,6 +1666,17 @@ async fn apply_capture_patch(
             if let Some(v) = roi.get("minAreaPct").and_then(|v| v.as_f64()) {
                 unsafe {
                     std::env::set_var("AGENT_ROI_MIN_AREA_PCT", format!("{:.4}", v.clamp(0.0, 1.0)));
+                }
+            }
+            if let Some(v) = roi.get("requireNative").and_then(|v| v.as_bool()) {
+                unsafe {
+                    std::env::set_var("AGENT_ROI_REQUIRE_NATIVE", if v { "1" } else { "0" });
+                }
+                require_native_set = true;
+            }
+            if !require_native_set {
+                unsafe {
+                    std::env::set_var("AGENT_ROI_REQUIRE_NATIVE", "1");
                 }
             }
         }
@@ -1876,7 +1916,35 @@ fn apply_dynamic_vbv_and_roi_policy(cfg: &mut agent_rust::CaptureConfig) {
     }
 }
 
+fn env_flag_enabled(key: &str, default: bool) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|v| {
+            let s = v.trim().to_ascii_lowercase();
+            !(s == "0" || s == "false" || s == "off" || s == "no")
+        })
+        .unwrap_or(default)
+}
+
+fn parse_fps_cap_tier(v: &str) -> Option<u32> {
+    let s = v.trim().to_ascii_lowercase();
+    match s.as_str() {
+        "72" | "l1" | "tier1" | "safe" => Some(72),
+        "120" | "l2" | "tier2" | "balanced" => Some(120),
+        "144" | "l3" | "tier3" | "high" => Some(144),
+        "240" | "l4" | "tier4" | "max" | "unlocked" => Some(240),
+        _ => s
+            .parse::<u32>()
+            .ok()
+            .map(|n| n.clamp(12, 240))
+            .filter(|n| *n > 0),
+    }
+}
+
 fn codec_transport_fps_cap(selected_transport: SessionTransport) -> Option<u32> {
+    if !env_flag_enabled("AGENT_CODEC_FPS_CAP_ENABLE", true) {
+        return None;
+    }
     let codec = std::env::var("AGENT_VIDEO_CODEC_EFFECTIVE")
         .ok()
         .unwrap_or_else(|| "h264".to_string())
@@ -1896,10 +1964,14 @@ fn codec_transport_fps_cap(selected_transport: SessionTransport) -> Option<u32> 
         "AGENT_CODEC_FPS_CAP_WEBTRANSPORT_AV1" | "AGENT_CODEC_FPS_CAP_QUIC_AV1" => 72,
         _ => 90,
     };
+    let tier_default = std::env::var("AGENT_CODEC_FPS_CAP_TIER")
+        .ok()
+        .and_then(|v| parse_fps_cap_tier(&v))
+        .unwrap_or(default);
     let cap = std::env::var(key)
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(default)
+        .unwrap_or(tier_default)
         .clamp(12, 240);
     Some(cap)
 }
@@ -2420,8 +2492,15 @@ async fn attach_video_track_with_policy(
         return Ok(());
     }
 
-    let roi_requested = roi_map_requested();
+    let roi_requested_raw = roi_map_requested();
     let native_roi = nvenc_native_roi_enabled();
+    let roi_require_native = roi_require_native();
+    let roi_requested = effective_roi_request(roi_requested_raw, native_roi, roi_require_native);
+    if roi_requested_raw && roi_require_native && !native_roi {
+        info!("ROI requested with requireNative=true but native ROI unsupported; forcing native non-ROI path");
+    } else if roi_requested_raw && !roi_require_native && !native_roi {
+        info!("ROI quality mode requested but native ROI unsupported; forcing native non-ROI path");
+    }
     if roi_requested && !native_roi {
         info!("ROI map requested: skipping native NVENC path; fallback pipeline will use ffmpeg addroi");
     }
@@ -4328,6 +4407,14 @@ mod tests {
     fn parse_codec_priority_filters_and_orders() {
         let parsed = parse_codec_priority("av1,hevc,h264");
         assert_eq!(parsed, vec![VideoCodec::Av1, VideoCodec::Hevc, VideoCodec::H264]);
+    }
+
+    #[test]
+    fn effective_roi_request_respects_native_requirement() {
+        assert!(effective_roi_request(true, true, true));
+        assert!(!effective_roi_request(true, false, true));
+        assert!(!effective_roi_request(true, false, false));
+        assert!(!effective_roi_request(false, false, true));
     }
 
     #[test]

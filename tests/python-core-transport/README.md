@@ -41,6 +41,9 @@ cd J:\ProjectTest\remote-desktop\mini-remote-desktop
 python .\tests\python-core-transport\run_codec_roi_matrix.py
 ```
 
+The matrix report now includes `roi_mode` comparison (`quality` vs `performance(requireNative)`),
+with delta columns to compare FPS / jitter / CPU / GPU against baseline mode.
+
 Direct single-suite run with forced codec/ROI and native ROI probe switch:
 
 ```powershell

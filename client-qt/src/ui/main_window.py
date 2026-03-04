@@ -205,6 +205,17 @@ class MainWindow(QMainWindow):
         self._ctrl_encoder = add_combo(["nvenc", "openh264", "auto"], self._on_encoder_changed)
         layout.addWidget(self._ctrl_encoder)
 
+        roi_mode_cfg = (
+            self._config.get("transport_controls", {})
+            .get("roi_mode", {})
+        )
+        add_label("ROI")
+        self._ctrl_roi_mode = add_combo(["quality", "performance"], self._on_roi_mode_changed)
+        self._ctrl_roi_mode.setCurrentText(
+            "performance" if bool(roi_mode_cfg.get("require_native", True)) else "quality"
+        )
+        layout.addWidget(self._ctrl_roi_mode)
+
         pacer_cfg = (
             self._config.get("transport_controls", {})
             .get("quic_pacer", {})
@@ -297,6 +308,26 @@ class MainWindow(QMainWindow):
         if self._initializing_controls:
             return
         self._send_capture_patch({"encoder": self._ctrl_encoder.currentText()})
+
+    def _build_roi_mode_patch(self) -> dict:
+        require_native = self._ctrl_roi_mode.currentText() == "performance"
+        patch = {
+            "qualityPolicy": {
+                "roi": {
+                    "requireNative": require_native,
+                }
+            }
+        }
+        self._config.setdefault("transport_controls", {})
+        self._config["transport_controls"]["roi_mode"] = {
+            "require_native": require_native,
+        }
+        return patch
+
+    def _on_roi_mode_changed(self, _index: int) -> None:
+        if self._initializing_controls:
+            return
+        self._send_capture_patch(self._build_roi_mode_patch())
 
     def _build_quic_pacer_patch(self) -> dict:
         try:
