@@ -9,6 +9,7 @@ mod profile;
 mod quic_tx;
 mod rtp_send;
 mod runtime_stats;
+mod webtransport_tx;
 
 use crate::capture_policy::{CaptureBackend, choose_backend};
 use crate::capture_runtime::{
@@ -23,6 +24,7 @@ use crate::nvenc_native::{NativeEncodePath, NativeNvencPipeline, NativeNvencText
 use crate::capture_runtime::WgcWindowCapturer;
 use crate::profile::apply_capture_profile;
 use crate::quic_tx::{QuicAu, QuicServerAdvert, start_quic_sender};
+use crate::webtransport_tx::{WebTransportAdvert, start_webtransport_sender};
 use crate::rtp_send::{RtpH264Sender, RtpH264SenderConfig, TX_UNIX_US_EXT_URI};
 use crate::runtime_stats::{RuntimeStats, spawn_rtcp_feedback_loop, spawn_stats_panel};
 use agent_rust::load_config;
@@ -42,6 +44,8 @@ use tracing::{error, info, warn};
 use webrtc::api::APIBuilder;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::setting_engine::SettingEngine;
+use webrtc::data_channel::RTCDataChannel;
+use webrtc::data_channel::data_channel_state::RTCDataChannelState;
 use webrtc::dtls::extension::extension_use_srtp::SrtpProtectionProfile;
 use webrtc::ice_transport::ice_candidate_pair::RTCIceCandidatePair;
 use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
@@ -76,12 +80,14 @@ struct SessionEntry {
 enum SessionTransport {
     WebRtc,
     Quic,
+    WebTransport,
 }
 
 impl SessionTransport {
     fn parse(v: Option<&str>) -> Self {
         match v.unwrap_or("webrtc").to_ascii_lowercase().as_str() {
-            "quic" | "webtransport" => SessionTransport::Quic,
+            "quic" => SessionTransport::Quic,
+            "webtransport" => SessionTransport::WebTransport,
             _ => SessionTransport::WebRtc,
         }
     }
@@ -90,6 +96,7 @@ impl SessionTransport {
         match self {
             SessionTransport::WebRtc => "webrtc",
             SessionTransport::Quic => "quic",
+            SessionTransport::WebTransport => "webtransport",
         }
     }
 }
@@ -178,18 +185,11 @@ fn unix_time_us() -> u64 {
         .unwrap_or(0)
 }
 
-fn maybe_build_webtransport_endpoint(advert: &QuicServerAdvert) -> serde_json::Value {
-    let url = std::env::var("AGENT_WEBTRANSPORT_URL")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| format!("https://{}/mrd", advert.addr));
-    let alpn = std::env::var("AGENT_WEBTRANSPORT_ALPN")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| "h3".to_string());
+fn maybe_build_webtransport_endpoint(advert: &WebTransportAdvert) -> serde_json::Value {
     json!({
-        "url": url,
-        "alpn": alpn,
+        "url": advert.url,
+        "alpn": advert.alpn,
+        "certFingerprintSha256": advert.cert_fingerprint_sha256,
     })
 }
 
@@ -328,6 +328,7 @@ async fn main() -> Result<()> {
             let selected_transport = match requested_transport {
                 SessionTransport::WebRtc => SessionTransport::WebRtc,
                 SessionTransport::Quic => SessionTransport::Quic,
+                SessionTransport::WebTransport => SessionTransport::WebTransport,
             };
             info!(
                 requested_transport = requested_transport.as_str(),
@@ -381,24 +382,40 @@ async fn main() -> Result<()> {
             }
 
             let mut quic_advert: Option<QuicServerAdvert> = None;
+            let mut webtransport_advert: Option<WebTransportAdvert> = None;
             let mut quic_tx: Option<tokio::sync::mpsc::Sender<QuicAu>> = None;
-            if selected_transport == SessionTransport::Quic {
+            if matches!(
+                selected_transport,
+                SessionTransport::Quic | SessionTransport::WebTransport
+            ) {
                 let bind_addr: std::net::SocketAddr = "0.0.0.0:0"
                     .parse()
-                    .context("parse quic bind addr failed")?;
-                let (advert, tx) = start_quic_sender(bind_addr)?;
-                quic_advert = Some(advert);
-                quic_tx = Some(tx);
+                    .context("parse transport bind addr failed")?;
+                match selected_transport {
+                    SessionTransport::Quic => {
+                        let (advert, tx) = start_quic_sender(bind_addr)?;
+                        quic_advert = Some(advert);
+                        quic_tx = Some(tx);
+                    }
+                    SessionTransport::WebTransport => {
+                        let (advert, tx) = start_webtransport_sender(bind_addr)?;
+                        webtransport_advert = Some(advert);
+                        quic_tx = Some(tx);
+                    }
+                    SessionTransport::WebRtc => {}
+                }
             }
 
             let injector = Arc::new(InputInjector::new());
             let media_ready = Arc::new(AtomicBool::new(false));
+            let control_dc = Arc::new(Mutex::new(None));
             let pc =
                 create_peer_connection(
                     write.clone(),
                     controller_id.clone(),
                     injector.clone(),
                     media_ready.clone(),
+                    control_dc.clone(),
                 )
                     .await?;
             let effective_capture_cfg = { capture_cfg.lock().await.clone() };
@@ -409,6 +426,7 @@ async fn main() -> Result<()> {
                 media_ready,
                 selected_transport,
                 quic_tx,
+                control_dc,
             )
             .await?;
 
@@ -436,7 +454,7 @@ async fn main() -> Result<()> {
                         "serverName": q.server_name,
                         "certDerBase64": q.cert_der_base64,
                     })),
-                    "webtransport": quic_advert.as_ref().map(maybe_build_webtransport_endpoint),
+                    "webtransport": webtransport_advert.as_ref().map(maybe_build_webtransport_endpoint),
                     "agentCapabilities": {
                         "protocols": ["webrtc", "quic", "webtransport"],
                         "platforms": ["windows"],
@@ -584,11 +602,88 @@ async fn apply_capture_patch(
     Ok(())
 }
 
+fn spawn_control_stats_publisher(
+    control_dc: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
+    stats: Arc<RuntimeStats>,
+    running: Arc<AtomicBool>,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(1000));
+        let mut last_nack = 0_u64;
+        let mut last_pli = 0_u64;
+        let mut last_quic_drop = 0_u64;
+        let mut last_encoded = 0_u64;
+        let mut last_sent = 0_u64;
+        let mut last_unique_sent = 0_u64;
+        let mut last_repeated_sent = 0_u64;
+        while running.load(Ordering::SeqCst) {
+            ticker.tick().await;
+
+            let nack = stats.nack_count.load(Ordering::Relaxed);
+            let pli = stats.pli_count.load(Ordering::Relaxed);
+            let quic_drop = stats.quic_au_dropped.load(Ordering::Relaxed);
+            let encoded_total = stats.encoded_au_total.load(Ordering::Relaxed);
+            let sent_total = stats.sent_au_total.load(Ordering::Relaxed);
+            let unique_sent_total = stats.unique_sent_au_total.load(Ordering::Relaxed);
+            let repeated_sent_total = stats.repeated_sent_au_total.load(Ordering::Relaxed);
+
+            let nack_per_sec = nack.saturating_sub(last_nack);
+            let pli_per_sec = pli.saturating_sub(last_pli);
+            let quic_drop_per_sec = quic_drop.saturating_sub(last_quic_drop);
+            let encode_fps = encoded_total.saturating_sub(last_encoded);
+            let send_fps = sent_total.saturating_sub(last_sent);
+            let unique_send_fps = unique_sent_total.saturating_sub(last_unique_sent);
+            let repeat_send_fps = repeated_sent_total.saturating_sub(last_repeated_sent);
+            let queue_depth = encoded_total.saturating_sub(sent_total);
+
+            last_nack = nack;
+            last_pli = pli;
+            last_quic_drop = quic_drop;
+            last_encoded = encoded_total;
+            last_sent = sent_total;
+            last_unique_sent = unique_sent_total;
+            last_repeated_sent = repeated_sent_total;
+
+            let payload = json!({
+                "type": "agentStats",
+                "payload": {
+                    "tsMs": std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0),
+                    "targetFps": stats.target_fps.load(Ordering::Relaxed),
+                    "targetBitrateKbps": stats.target_bitrate_kbps.load(Ordering::Relaxed),
+                    "encodeFps": encode_fps,
+                    "sendFps": send_fps,
+                    "uniqueSendFps": unique_send_fps,
+                    "repeatSendFps": repeat_send_fps,
+                    "nackPerSec": nack_per_sec,
+                    "pliPerSec": pli_per_sec,
+                    "quicDropPerSec": quic_drop_per_sec,
+                    "queueDepth": queue_depth
+                }
+            });
+
+            let dc_opt = { control_dc.lock().await.clone() };
+            let Some(dc) = dc_opt else {
+                continue;
+            };
+            if dc.ready_state() != RTCDataChannelState::Open {
+                continue;
+            }
+            if let Err(e) = dc.send(&Bytes::from(payload.to_string())).await {
+                warn!(error = %e, "failed to send agent stats over control data channel");
+            }
+        }
+    });
+}
+
 async fn create_peer_connection(
     ws_write: Arc<Mutex<WsWrite>>,
     controller_id: String,
     injector: Arc<InputInjector>,
     media_ready: Arc<AtomicBool>,
+    control_dc: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
 ) -> Result<Arc<RTCPeerConnection>> {
     let mut m = MediaEngine::default();
     m.register_default_codecs()?;
@@ -669,13 +764,16 @@ async fn create_peer_connection(
     }));
     {
         let injector = injector.clone();
+        let control_dc_slot = control_dc.clone();
         pc.on_data_channel(Box::new(move |dc| {
             let injector = injector.clone();
+            let control_dc_slot = control_dc_slot.clone();
             Box::pin(async move {
                 let label = dc.label().to_string();
                 let class = match label.as_str() {
                     "ctrl_rt" => Some(ChannelClass::Realtime),
                     "ctrl_rel" => Some(ChannelClass::Reliable),
+                    "control" => Some(ChannelClass::Reliable),
                     _ => None,
                 };
                 if class.is_none() {
@@ -684,6 +782,10 @@ async fn create_peer_connection(
                 }
                 let class = class.unwrap_or(ChannelClass::Reliable);
                 info!(label = %label, class = ?class, "control data channel bound");
+                {
+                    let mut slot = control_dc_slot.lock().await;
+                    *slot = Some(dc.clone());
+                }
                 let injector = injector.clone();
                 dc.on_message(Box::new(move |msg| {
                     let injector = injector.clone();
@@ -691,6 +793,14 @@ async fn create_peer_connection(
                         if let Err(e) = injector.push_raw(class, &msg.data).await {
                             warn!(error = %e, "failed to decode/queue control frame");
                         }
+                    })
+                }));
+                let control_dc_slot = control_dc_slot.clone();
+                dc.on_close(Box::new(move || {
+                    let control_dc_slot = control_dc_slot.clone();
+                    Box::pin(async move {
+                        let mut slot = control_dc_slot.lock().await;
+                        *slot = None;
                     })
                 }));
             })
@@ -714,9 +824,13 @@ async fn attach_video_track_with_policy(
     media_ready: Arc<AtomicBool>,
     selected_transport: SessionTransport,
     quic_tx: Option<tokio::sync::mpsc::Sender<QuicAu>>,
+    control_dc: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
 ) -> Result<()> {
     let mut effective_cfg = capture_cfg.clone();
-    let with_capture_ts_header = selected_transport == SessionTransport::Quic;
+    let with_capture_ts_header = matches!(
+        selected_transport,
+        SessionTransport::Quic | SessionTransport::WebTransport
+    );
     apply_capture_profile(&mut effective_cfg);
     apply_transport_send_policy(selected_transport, &mut effective_cfg);
     if effective_cfg.tier_limit_enable {
@@ -871,6 +985,7 @@ async fn attach_video_track_with_policy(
         adapt.current_fps(),
         adapt.current_bitrate_kbps(),
     ));
+    spawn_control_stats_publisher(control_dc, stats.clone(), session_running.clone());
     stats
         .tier_level
         .store(adapt.current_tier_level(), Ordering::Relaxed);
@@ -1098,7 +1213,10 @@ async fn attach_video_track_with_policy(
                     }
                 });
 
-                if selected_transport == SessionTransport::Quic {
+                if matches!(
+                    selected_transport,
+                    SessionTransport::Quic | SessionTransport::WebTransport
+                ) {
                     let quic_sender = quic_tx
                         .as_ref()
                         .cloned()
@@ -1374,7 +1492,10 @@ async fn attach_video_track_with_policy(
                         }
                     });
 
-                    if selected_transport == SessionTransport::Quic {
+                    if matches!(
+                        selected_transport,
+                        SessionTransport::Quic | SessionTransport::WebTransport
+                    ) {
                         let quic_sender = quic_tx
                             .as_ref()
                             .cloned()
@@ -1585,7 +1706,10 @@ async fn attach_video_track_with_policy(
         });
     }
 
-    if selected_transport == SessionTransport::Quic {
+    if matches!(
+        selected_transport,
+        SessionTransport::Quic | SessionTransport::WebTransport
+    ) {
         let quic_sender = quic_tx
             .as_ref()
             .cloned()

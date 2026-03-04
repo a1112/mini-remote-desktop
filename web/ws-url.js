@@ -1,4 +1,4 @@
-const DEFAULT_BACKEND_WS = 'ws://198.18.0.1:9527';
+const DEFAULT_BACKEND_WS = 'ws://127.0.0.1:9527';
 
 export function buildWsUrl(locationLike, port = 9527) {
   const search = locationLike?.search || '';

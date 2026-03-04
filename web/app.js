@@ -1,6 +1,7 @@
 import { buildWsUrl } from './ws-url.js';
 import { WebRtcMediaClient } from './transport/webrtc-media.js';
 import { WebTransportMediaClient } from './transport/webtransport-media.js';
+import { AdaptiveTuner } from './transport/adaptive-tuner.js';
 import {
   buildOfferTransportPayload,
   buildWebCapabilities,
@@ -34,7 +35,17 @@ const state = {
     bytes: 0,
     frameCount: 0,
     lastFrameAt: 0,
-  }
+  },
+  webrtcStats: {
+    lastFramesDecoded: 0,
+  },
+  backendStats: {
+    nackPerSec: 0,
+    queueDepth: 0,
+    targetBitrateKbps: 0,
+    updatedAt: 0,
+  },
+  tuner: new AdaptiveTuner(),
 };
 
 const elements = {
@@ -142,6 +153,18 @@ function send(message) {
   }
 }
 
+function sendCaptureUpdate(capturePatch) {
+  if (!state.selectedDevice) return;
+  send({
+    type: 'control',
+    action: 'updateCapture',
+    payload: {
+      targetDeviceId: state.selectedDevice,
+      capture: capturePatch,
+    }
+  });
+}
+
 function updateDeviceList(devices) {
   state.devices.clear();
   devices.forEach(d => state.devices.set(d.id, d));
@@ -222,7 +245,14 @@ async function createWebRtcSession() {
     onDataChannelMessage: (raw) => {
       try {
         const data = JSON.parse(raw);
-        log('info', `DataChannel message: ${data.type || 'unknown'}`);
+        if (data?.type === 'agentStats' && data?.payload) {
+          state.backendStats.nackPerSec = Number(data.payload.nackPerSec || 0);
+          state.backendStats.queueDepth = Number(data.payload.queueDepth || 0);
+          state.backendStats.targetBitrateKbps = Number(data.payload.targetBitrateKbps || 0);
+          state.backendStats.updatedAt = Date.now();
+        } else {
+          log('info', `DataChannel message: ${data.type || 'unknown'}`);
+        }
       } catch (_) {}
     }
   });
@@ -393,40 +423,96 @@ async function startStats() {
 
   let lastBytes = 0;
   let lastTime = Date.now();
+  let lastFrameCount = state.wtStats.frameCount;
+  let lastFramesDecoded = state.webrtcStats.lastFramesDecoded || 0;
 
   state.statsInterval = setInterval(async () => {
     let currentBytes = 0;
     let currentLatency = 0;
+    let currentLossPct = null;
+    let fpsWindow = 0;
     if (state.mediaPath === 'webrtc' && state.webrtc?.pc) {
-      const stats = await state.webrtc.pc.getStats();
-      stats.forEach(report => {
-        if (report.type === 'inbound-rtp' && report.mediaType === 'video') {
-          currentBytes += report.bytesReceived || 0;
-          if (report.currentRoundTripTime) {
-            currentLatency = report.currentRoundTripTime * 1000;
+      try {
+        const stats = await state.webrtc.pc.getStats();
+        let packetsReceived = 0;
+        let packetsLost = 0;
+        let fpsFromReport = 0;
+        let framesDecoded = 0;
+        stats.forEach(report => {
+          const isInboundVideo =
+            report.type === 'inbound-rtp' &&
+            (report.mediaType === 'video' || report.kind === 'video');
+          if (isInboundVideo) {
+            currentBytes += report.bytesReceived || 0;
+            packetsReceived += report.packetsReceived || 0;
+            packetsLost += report.packetsLost || 0;
+            fpsFromReport = Math.max(fpsFromReport, report.framesPerSecond || 0);
+            framesDecoded += report.framesDecoded || 0;
           }
+          if (report.type === 'candidate-pair' && report.state === 'succeeded') {
+            if (report.currentRoundTripTime) {
+              currentLatency = Math.max(currentLatency, report.currentRoundTripTime * 1000);
+            }
+          }
+        });
+        const totalPackets = packetsReceived + packetsLost;
+        if (totalPackets > 0) {
+          currentLossPct = (packetsLost / totalPackets) * 100;
         }
-      });
+        if (fpsFromReport > 0) {
+          fpsWindow = fpsFromReport;
+        } else {
+          const nowTs = Date.now();
+          const elapsed = Math.max((nowTs - lastTime) / 1000, 0.001);
+          fpsWindow = Math.max(0, framesDecoded - lastFramesDecoded) / elapsed;
+        }
+        lastFramesDecoded = framesDecoded;
+        state.webrtcStats.lastFramesDecoded = framesDecoded;
+      } catch (e) {
+        log('warn', `webrtc getStats failed: ${e?.message || e}`);
+      }
     } else if (state.mediaPath === 'webtransport') {
       currentBytes = state.wtStats.bytes;
       const now = performance.now();
       if (state.wtStats.lastFrameAt > 0) {
         currentLatency = Math.max(0, now - state.wtStats.lastFrameAt);
       }
+      currentLossPct = null;
     }
 
     const now = Date.now();
     const elapsed = (now - lastTime) / 1000;
+    if (state.mediaPath === 'webtransport') {
+      fpsWindow = Math.max(0, state.wtStats.frameCount - lastFrameCount) / Math.max(elapsed, 0.001);
+    }
     const bitrate = ((currentBytes - lastBytes) * 8 / elapsed / 1000000).toFixed(2);
 
     lastBytes = currentBytes;
     lastTime = now;
+    lastFrameCount = state.wtStats.frameCount;
+
+    if (state.mediaPath === 'webtransport') {
+      const stallMs = state.wtStats.lastFrameAt > 0 ? Math.max(0, performance.now() - state.wtStats.lastFrameAt) : 0;
+      const patch = state.tuner.update({
+        nowMs: now,
+        fps: fpsWindow,
+        stallMs,
+        lossBurst: 0,
+        backend: {
+          nackBurst: state.backendStats.nackPerSec,
+          queueDepth: state.backendStats.queueDepth,
+        },
+      });
+      if (patch) {
+        sendCaptureUpdate(patch);
+        log('info', `adaptive tune bitrateKbps=${patch.bitrateKbps}`);
+      }
+    }
 
     elements.latency.textContent = currentLatency.toFixed(0);
     elements.bitrate.textContent = bitrate;
-    elements.fps.textContent = state.mediaPath === 'webtransport'
-      ? String(state.wtStats.frameCount)
-      : '-';
+    elements.fps.textContent = fpsWindow > 0 ? fpsWindow.toFixed(1) : '-';
+    elements.packetLoss.textContent = currentLossPct === null ? '-' : currentLossPct.toFixed(2);
   }, 1000);
 }
 
