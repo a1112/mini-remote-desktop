@@ -1,4 +1,4 @@
-$ErrorActionPreference='Stop'
+﻿$ErrorActionPreference='Stop'
 
 Add-Type @"
 using System;
@@ -69,7 +69,7 @@ $signalingDir=Join-Path $base 'signaling-rs'
 $signalingExe=Join-Path $signalingDir 'target-codex-hotfix/debug/signaling-rs.exe'
 $agentExe=Join-Path $agentDir 'target/debug/agent-rust.exe'
 $probeExe=Join-Path $agentDir 'target/debug/m2_offer_probe.exe'
-$ffmpegExe=Join-Path $base 'tools/ffmpeg-min/ffmpeg.exe'
+$ffmpegExe=Join-Path $base 'tools/ffmpeg_full_build/bin/ffmpeg.exe'
 $cfgPath=Join-Path $agentDir 'config.json'
 $bak=Join-Path $agentDir ('config.wgc.curve.'+(Get-Date -Format 'yyyyMMdd_HHmmss')+'.bak.json')
 Copy-Item $cfgPath $bak -Force
@@ -139,3 +139,5 @@ finally {
   if(Test-Path $bak){ Copy-Item $bak $cfgPath -Force; Remove-Item $bak -Force -ErrorAction SilentlyContinue }
   Get-Process | ? { $_.ProcessName -in @('signaling-rs','agent-rust','m2_offer_probe') } | Stop-Process -Force -ErrorAction SilentlyContinue
 }
+
+

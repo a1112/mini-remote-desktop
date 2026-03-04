@@ -155,11 +155,28 @@ pub async fn connect_quic_receiver(
         .context("quic connect failed")?;
     info!(remote = %addr, "quic receiver connected");
 
+    // Dynamically adjust queue size based on target FPS
+    let target_fps = std::env::var("MRD_TARGET_FPS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(60);
     let rx_queue = std::env::var("MRD_QUIC_RX_QUEUE")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|v| *v > 0 && *v <= 1024)
-        .unwrap_or(8);
+        .unwrap_or_else(|| {
+            // Adaptive queue sizing based on target FPS
+            match target_fps {
+                fps if fps >= 120 => 4,  // Minimal queue for high FPS
+                fps if fps >= 60 => 6,   // Moderate queue for standard high FPS
+                _ => 8,                   // Deeper queue for lower FPS
+            }
+        });
+    info!(
+        target_fps,
+        rx_queue,
+        "quic receiver queue size configured"
+    );
     let (tx, rx) = mpsc::channel::<VideoFrame>(rx_queue);
     tokio::spawn(async move {
         let wire_debug = std::env::var("MRD_QUIC_WIRE_DEBUG")
@@ -227,6 +244,8 @@ pub async fn connect_quic_receiver(
                     }
                     waiting_for_keyframe = false;
                     info!(seq, "quic receiver synchronized on keyframe");
+                } else if is_keyframe {
+                    info!(seq, "quic receiver observed keyframe");
                 }
                 let frame = VideoFrame {
                     data: payload,

@@ -197,6 +197,47 @@ fn select_frame_for_decode(
             }
             (newest, dropped)
         }
+        DecodeSelectPolicy::AdaptiveAge => {
+            // WebRTC path may not carry sender-side wall-clock timestamp.
+            // If tx_unix_us is unavailable, keep ordered behavior to avoid false stale drops.
+            if first.tx_unix_us == 0 {
+                return (first, 0);
+            }
+            // Adaptive mode: drop frames that are too old, but maintain order
+            let max_age_ms = policy.max_age_ms();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros() as u64;
+            let mut dropped = 0u64;
+            let mut selected = first;
+            let first_tx_us = selected.tx_unix_us;
+            let mut age_dropped = 0u64;
+
+            // Check if first frame is too old
+            let first_age_ms = (now.saturating_sub(selected.tx_unix_us)) / 1000;
+            if first_age_ms > max_age_ms {
+                // First frame is stale, look for a fresher one
+                while let Ok(next) = rx.try_recv() {
+                    dropped = dropped.saturating_add(1);
+                    let next_age_ms = (now.saturating_sub(next.tx_unix_us)) / 1000;
+                    if next_age_ms <= max_age_ms {
+                        selected = next;
+                        break;
+                    } else {
+                        age_dropped = age_dropped.saturating_add(1);
+                    }
+                }
+                // If all frames were too old, use the last one anyway
+                if dropped > 0 && selected.tx_unix_us == first_tx_us {
+                    if let Ok(last) = rx.try_recv() {
+                        dropped = dropped.saturating_add(1);
+                        selected = last;
+                    }
+                }
+            }
+            (selected, dropped)
+        }
     }
 }
 
@@ -205,6 +246,7 @@ enum DecodeSelectPolicy {
     Ordered,
     LatestKeyframe,
     Latest,
+    AdaptiveAge,
 }
 
 impl DecodeSelectPolicy {
@@ -233,8 +275,16 @@ impl DecodeSelectPolicy {
                     Self::LatestKeyframe
                 }
             }
+            "adaptive-age" | "adaptive_age" | "adaptive" => Self::AdaptiveAge,
             _ => Self::Ordered,
         }
+    }
+
+    fn max_age_ms(&self) -> u64 {
+        std::env::var("MRD_DECODE_ADAPTIVE_MAX_AGE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(50)  // Default 50ms
     }
 }
 
@@ -322,6 +372,7 @@ async fn main() -> Result<()> {
     let frame_count_clone = frame_count.clone();
     let decoded_count_clone = decoded_count.clone();
     let decoder_clone = decoder.clone();
+    let peer_manager_for_decode = peer_manager.clone();
     let video_cfg_for_recover = config.video.clone();
     let render_sink = renderer.frame_sink();
     let overlay_stats_for_decode = overlay_stats.clone();
@@ -355,6 +406,11 @@ async fn main() -> Result<()> {
             let mut dropped_old_frames = 0u64;
             let mut decode_recover_stage = 0u8;
             let mut no_output_streak = 0u32;
+            let mut waiting_recover_keyframe = false;
+            let mut waiting_probe_budget = 0u32;
+            let mut last_recover_keyframe_req = std::time::Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap_or_else(std::time::Instant::now);
             let mut last_decoded_at: Option<std::time::Instant> = None;
             let mut last_stats_at = std::time::Instant::now();
             let decoder_backend_label = {
@@ -383,6 +439,26 @@ async fn main() -> Result<()> {
                     drop(rx);
                     let decode_started = std::time::Instant::now();
                     let count = frame_count_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if waiting_recover_keyframe && !newest.is_keyframe {
+                        waiting_probe_budget = waiting_probe_budget.saturating_add(1);
+                        if last_recover_keyframe_req.elapsed() >= Duration::from_millis(500) {
+                            let manager_guard = peer_manager_for_decode.read().await;
+                            if let Some(ref mgr) = *manager_guard {
+                                let _ = mgr.request_keyframe().await;
+                            }
+                            last_recover_keyframe_req = std::time::Instant::now();
+                        }
+                        // Some senders/paths may not expose reliable keyframe markers.
+                        // Periodically probe decode to avoid getting stuck in permanent wait.
+                        if waiting_probe_budget % 120 != 0 {
+                            continue;
+                        }
+                    }
+                    if waiting_recover_keyframe && newest.is_keyframe {
+                        waiting_recover_keyframe = false;
+                        waiting_probe_budget = 0;
+                        info!(seq = newest.sequence, "decoder recovery synchronized on keyframe");
+                    }
                     let mut decoder = decoder_clone.lock().await;
                     match decoder.decode(&newest) {
                     Ok(Some(decoded)) => {
@@ -399,6 +475,11 @@ async fn main() -> Result<()> {
                         }
 
                         let now = std::time::Instant::now();
+                        if waiting_recover_keyframe {
+                            waiting_recover_keyframe = false;
+                            waiting_probe_budget = 0;
+                            info!(seq = newest.sequence, "decoder recovery probe succeeded");
+                        }
                         let decode_ms = now.duration_since(decode_started).as_secs_f64() * 1000.0;
                         if decode_samples_ms.len() >= 1024 {
                             decode_samples_ms.pop_front();
@@ -429,19 +510,36 @@ async fn main() -> Result<()> {
                     }
                     Ok(None) => {
                         no_output_streak = no_output_streak.saturating_add(1);
+                        if !disable_decode_recover
+                            && !waiting_recover_keyframe
+                            && no_output_streak >= 90
+                        {
+                            waiting_recover_keyframe = true;
+                            waiting_probe_budget = 0;
+                            last_recover_keyframe_req = std::time::Instant::now()
+                                .checked_sub(Duration::from_secs(1))
+                                .unwrap_or_else(std::time::Instant::now);
+                            warn!(
+                                no_output_streak,
+                                "decoder no-output streak; entering keyframe resync before backend fallback"
+                            );
+                        }
                         if !disable_decode_recover && no_output_streak >= 300 && decode_recover_stage < 2 {
                             let mut next_cfg = video_cfg_for_recover.clone();
-                            if decode_recover_stage == 0 {
+                            let current_backend = decoder.backend_name().to_ascii_lowercase();
+                            if decode_recover_stage == 0 && !current_backend.contains("mf") {
                                 next_cfg.backend = DecoderBackend::MfD3d11;
                                 warn!(
                                     no_output_streak,
+                                    current_backend = %current_backend,
                                     "decoder produced no output for too long; trying MF d3d11 fallback"
                                 );
                             } else {
                                 next_cfg.backend = DecoderBackend::Software;
                                 warn!(
                                     no_output_streak,
-                                    "decoder still no output after MF fallback; trying software decoder"
+                                    current_backend = %current_backend,
+                                    "decoder still no output; trying software decoder"
                                 );
                             }
                             match H264Decoder::new(next_cfg) {
@@ -449,6 +547,10 @@ async fn main() -> Result<()> {
                                     *decoder = new_decoder;
                                     decode_recover_stage = decode_recover_stage.saturating_add(1);
                                     no_output_streak = 0;
+                                    waiting_recover_keyframe = true;
+                                    last_recover_keyframe_req = std::time::Instant::now()
+                                        .checked_sub(Duration::from_secs(1))
+                                        .unwrap_or_else(std::time::Instant::now);
                                     if let Ok(mut ov) = overlay_stats_for_decode.lock() {
                                         ov.decoder_backend = decoder.backend_name().to_string();
                                     }
@@ -463,22 +565,57 @@ async fn main() -> Result<()> {
                     }
                     Err(e) => {
                         let err_text = e.to_string().to_ascii_lowercase();
+                        let non_hw_output_err =
+                            err_text.contains("hardware output required but decoder output is");
+                        if non_hw_output_err {
+                            // First-frame strict HW probe may produce software output.
+                            // Keep current decoder alive so following frames can continue on CPU path.
+                            warn!(
+                                "decoder reported non-D3D11 output in strict mode; keeping current decoder and continuing"
+                            );
+                            continue;
+                        }
+                        let invalid_bitstream_err =
+                            err_text.contains("invalid data found when processing input")
+                                || err_text.contains("send packet to decoder failed")
+                                || err_text.contains("corrupt");
+                        if !disable_decode_recover && invalid_bitstream_err {
+                            // Bitstream desync: wait for next keyframe and keep requesting PLI.
+                            waiting_recover_keyframe = true;
+                            last_recover_keyframe_req = std::time::Instant::now()
+                                .checked_sub(Duration::from_secs(1))
+                                .unwrap_or_else(std::time::Instant::now);
+                            let _ = decoder.flush();
+                            warn!("decode failed with invalid bitstream; waiting for keyframe resync");
+                            continue;
+                        }
                         let recoverable_hw_err = err_text.contains("hardware output required")
                             || err_text.contains("d3d11")
                             || err_text.contains("strict mode");
                         if !disable_decode_recover && recoverable_hw_err && decode_recover_stage < 2 {
                             let mut next_cfg = video_cfg_for_recover.clone();
-                            if decode_recover_stage == 0 {
+                            let current_backend = decoder.backend_name().to_ascii_lowercase();
+                            if decode_recover_stage == 0 && !current_backend.contains("mf") {
                                 next_cfg.backend = DecoderBackend::MfD3d11;
-                                warn!("decode failed on hw strict path; trying MF d3d11 fallback");
+                                warn!(
+                                    current_backend = %current_backend,
+                                    "decode failed on hw strict path; trying MF d3d11 fallback"
+                                );
                             } else {
                                 next_cfg.backend = DecoderBackend::Software;
-                                warn!("decode failed after MF fallback; trying software decoder");
+                                warn!(
+                                    current_backend = %current_backend,
+                                    "decode failed on current backend; trying software decoder"
+                                );
                             }
                             match H264Decoder::new(next_cfg) {
                                 Ok(new_decoder) => {
                                     *decoder = new_decoder;
                                     decode_recover_stage = decode_recover_stage.saturating_add(1);
+                                    waiting_recover_keyframe = true;
+                                    last_recover_keyframe_req = std::time::Instant::now()
+                                        .checked_sub(Duration::from_secs(1))
+                                        .unwrap_or_else(std::time::Instant::now);
                                     if let Ok(mut ov) = overlay_stats_for_decode.lock() {
                                         ov.decoder_backend = decoder.backend_name().to_string();
                                     }
@@ -554,8 +691,12 @@ async fn main() -> Result<()> {
                             e2e_sorted.len(),
                         )
                     };
+                    let current_backend = {
+                        let d = decoder_clone.lock().await;
+                        d.backend_name().to_string()
+                    };
                     info!(
-                        backend = %decoder_backend_label,
+                        backend = %current_backend,
                         decode_select = ?decode_select_policy,
                         fps = format!("{:.2}", fps),
                         avg_decode_ms = format!("{:.3}", avg_decode),
@@ -997,6 +1138,30 @@ mod tests {
             select_frame_for_decode(&mut rx, first, DecodeSelectPolicy::LatestKeyframe);
         assert_eq!(picked.sequence, 3);
         assert_eq!(dropped, 2);
+    }
+
+    #[tokio::test]
+    async fn select_frame_for_decode_adaptive_age_without_timestamp_keeps_first() {
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.send(webrtc::peer::VideoFrame {
+            data: Bytes::from_static(&[0, 0, 0, 1, 0x61]),
+            timestamp: 2,
+            is_keyframe: false,
+            sequence: 2,
+            tx_unix_us: 0,
+        })
+        .await
+        .unwrap();
+        let first = webrtc::peer::VideoFrame {
+            data: Bytes::from_static(&[0, 0, 0, 1, 0x65]),
+            timestamp: 1,
+            is_keyframe: true,
+            sequence: 1,
+            tx_unix_us: 0,
+        };
+        let (picked, dropped) = select_frame_for_decode(&mut rx, first, DecodeSelectPolicy::AdaptiveAge);
+        assert_eq!(picked.sequence, 1);
+        assert_eq!(dropped, 0);
     }
 
     #[test]

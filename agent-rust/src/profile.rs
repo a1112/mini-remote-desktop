@@ -85,6 +85,8 @@ pub fn apply_capture_profile(cfg: &mut agent_rust::CaptureConfig) {
     if cfg.tier_limit_enable {
         apply_multi_tier_limits(cfg);
     }
+    // Apply GPU-synchronized profile at the end so template/tier logic cannot override it.
+    apply_gpu_synchronized_profile(cfg);
 }
 
 fn apply_multi_tier_limits(cfg: &mut agent_rust::CaptureConfig) {
@@ -121,6 +123,32 @@ fn apply_multi_tier_limits(cfg: &mut agent_rust::CaptureConfig) {
     } else {
         cfg.queue_depth.min(12).max(4)
     };
+}
+
+/// Apply GPU-synchronized profile to align with controller's shared texture slots.
+/// This ensures the agent's queue depth doesn't exceed the controller's shared keyed mutex slots,
+/// preventing deadlock and minimizing latency.
+fn apply_gpu_synchronized_profile(cfg: &mut agent_rust::CaptureConfig) {
+    // Read the controller's shared texture slot count
+    let shared_slots = std::env::var("MRD_SHARED_KEYED_SLOTS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(8u32);  // Default to 8 slots
+
+    // Limit queue depth to not exceed shared slots
+    // This prevents the agent from producing frames faster than the controller can consume them
+    cfg.queue_depth = cfg.queue_depth.min(shared_slots);
+
+    // Set max frame latency to 1 for minimum latency
+    // This ensures each frame is processed immediately without buffering
+    cfg.max_frame_latency = cfg.max_frame_latency.min(1);
+
+    tracing::debug!(
+        shared_slots,
+        queue_depth = cfg.queue_depth,
+        max_frame_latency = cfg.max_frame_latency,
+        "applied GPU-synchronized profile"
+    );
 }
 
 #[cfg(test)]

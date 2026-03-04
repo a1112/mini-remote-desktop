@@ -1,4 +1,4 @@
-use crate::encoder_policy::VideoEncoderBackend;
+﻿use crate::encoder_policy::VideoEncoderBackend;
 use anyhow::{Context, Result, anyhow};
 use openh264::OpenH264API;
 use openh264::encoder::{Encoder, EncoderConfig, FrameRate, UsageType};
@@ -313,16 +313,14 @@ fn resolve_ffmpeg_bin_from(env_ffmpeg: Option<String>, cwd: Option<std::path::Pa
 
     if let Some(cwd) = cwd {
         let candidates = [
-            cwd.join("tools").join("ffmpeg-min").join("ffmpeg.exe"),
+            cwd.join("tools").join("ffmpeg_full_build").join("bin").join("ffmpeg.exe"),
             cwd.join("..")
                 .join("tools")
-                .join("ffmpeg-min")
-                .join("ffmpeg.exe"),
+                .join("ffmpeg_full_build").join("bin").join("ffmpeg.exe"),
             cwd.join("..")
                 .join("..")
                 .join("tools")
-                .join("ffmpeg-min")
-                .join("ffmpeg.exe"),
+                .join("ffmpeg_full_build").join("bin").join("ffmpeg.exe"),
         ];
         for p in candidates {
             if p.is_file() {
@@ -554,8 +552,7 @@ mod tests {
         let ffmpeg_exe = base
             .join("mini-remote-desktop")
             .join("tools")
-            .join("ffmpeg-min")
-            .join("ffmpeg.exe");
+            .join("ffmpeg_full_build").join("bin").join("ffmpeg.exe");
         std::fs::create_dir_all(ffmpeg_exe.parent().expect("ffmpeg parent")).expect("mkdir");
         std::fs::create_dir_all(&agent_dir).expect("agent dir");
         std::fs::write(&ffmpeg_exe, b"fake").expect("touch ffmpeg");
@@ -568,3 +565,5 @@ mod tests {
         let _ = std::fs::remove_dir_all(base);
     }
 }
+
+

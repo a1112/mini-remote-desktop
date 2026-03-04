@@ -25,6 +25,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 webrtc = "0.12"
 rtp = "0.12"
 rtcp = "0.12"
+common-control-proto = { path = "../common-control-proto" }
 windows = { version = "0.62", features = [
     "Graphics_Capture",
     "Graphics_DirectX",
@@ -40,5 +41,6 @@ windows = { version = "0.62", features = [
     "Win32_System_WinRT",
     "Win32_System_WinRT_Direct3D11",
     "Win32_System_WinRT_Graphics_Capture",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }

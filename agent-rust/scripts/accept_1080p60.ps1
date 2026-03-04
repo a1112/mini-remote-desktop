@@ -1,4 +1,4 @@
-param(
+﻿param(
     [int]$ProbeSecs = 15,
     [double]$MinProbeFps = 45.0,
     [double]$MinAgentSendFps = 45.0,
@@ -45,7 +45,7 @@ $binDir = if ([string]::IsNullOrWhiteSpace($AgentBinDir)) {
 }
 $agentExe = Join-Path $binDir "agent-rust.exe"
 $probeExe = Join-Path $binDir "m2_offer_probe.exe"
-$ffmpegExe = Join-Path $repoRoot "tools\ffmpeg-min\ffmpeg.exe"
+$ffmpegExe = Join-Path $repoRoot "tools\ffmpeg_full_build\\bin\\ffmpeg.exe"
 $cfgPath = Join-Path $agentDir "config.json"
 $cfgBak = Join-Path $agentDir ("config.accept_1080p60.{0}.bak.json" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
 
@@ -128,3 +128,5 @@ finally {
         Remove-Item $cfgBak -Force -ErrorAction SilentlyContinue
     }
 }
+
+

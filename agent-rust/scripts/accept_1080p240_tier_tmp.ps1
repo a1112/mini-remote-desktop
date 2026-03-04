@@ -1,11 +1,11 @@
-$ErrorActionPreference='Stop'
+﻿$ErrorActionPreference='Stop'
 $base=(Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $agentDir=Join-Path $base 'agent-rust'
 $signalingDir=Join-Path $base 'signaling-rs'
 $signalingExe=Join-Path $signalingDir 'target-codex-hotfix/debug/signaling-rs.exe'
 $agentExe=Join-Path $agentDir 'target/debug/agent-rust.exe'
 $probeExe=Join-Path $agentDir 'target/debug/m2_offer_probe.exe'
-$ffmpegExe=Join-Path $base 'tools/ffmpeg-min/ffmpeg.exe'
+$ffmpegExe=Join-Path $base 'tools/ffmpeg_full_build/bin/ffmpeg.exe'
 $cfgPath=Join-Path $agentDir 'config.json'
 $bak=Join-Path $agentDir ('config.accept_1080p240.tier.'+(Get-Date -Format 'yyyyMMdd_HHmmss')+'.bak.json')
 Copy-Item $cfgPath $bak -Force
@@ -41,3 +41,5 @@ Copy-Item $bak $cfgPath -Force
 Remove-Item $bak -Force -EA SilentlyContinue
 Get-Process | ? { $_.ProcessName -in @('signaling-rs','agent-rust','m2_offer_probe') } | Stop-Process -Force -EA SilentlyContinue
 }
+
+

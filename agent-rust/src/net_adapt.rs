@@ -1,6 +1,63 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+/// Network type classification based on RTT (Round-Trip Time)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkType {
+    /// Local network: RTT < 5ms (e.g., same machine or local LAN)
+    Local,
+    /// LAN: RTT 5-20ms
+    LAN,
+    /// Internet: RTT > 20ms
+    Internet,
+}
+
+impl NetworkType {
+    /// Detect network type based on RTT in milliseconds
+    pub fn from_rtt_ms(rtt_ms: u64) -> Self {
+        if rtt_ms < 5 {
+            NetworkType::Local
+        } else if rtt_ms <= 20 {
+            NetworkType::LAN
+        } else {
+            NetworkType::Internet
+        }
+    }
+
+    /// Get recommended configuration for this network type
+    pub fn recommended_config(&self) -> NetworkConfig {
+        match self {
+            NetworkType::Local => NetworkConfig {
+                fps: 240,
+                bitrate_kbps: 50000,
+                queue_depth: 4,
+                description: "local",
+            },
+            NetworkType::LAN => NetworkConfig {
+                fps: 120,
+                bitrate_kbps: 20000,
+                queue_depth: 8,
+                description: "lan",
+            },
+            NetworkType::Internet => NetworkConfig {
+                fps: 60,
+                bitrate_kbps: 5000,
+                queue_depth: 16,
+                description: "internet",
+            },
+        }
+    }
+}
+
+/// Network-specific configuration
+#[derive(Debug, Clone, Copy)]
+pub struct NetworkConfig {
+    pub fps: u32,
+    pub bitrate_kbps: u32,
+    pub queue_depth: usize,
+    pub description: &'static str,
+}
+
 pub const TIER_REASON_INIT: u32 = 1;
 pub const TIER_REASON_NACK: u32 = 2;
 pub const TIER_REASON_REMB_LOW: u32 = 3;
@@ -38,6 +95,10 @@ pub struct NetAdaptController {
     last_tier_change: std::sync::Mutex<Instant>,
     last_nack: std::sync::Mutex<Instant>,
     last_recover: std::sync::Mutex<Instant>,
+    // Network type detection
+    rtt_samples: std::sync::Mutex<Vec<u64>>,
+    network_type: std::sync::Mutex<NetworkType>,
+    last_rtt_update: std::sync::Mutex<Instant>,
 }
 
 impl NetAdaptController {
@@ -96,6 +157,9 @@ impl NetAdaptController {
             last_tier_change: std::sync::Mutex::new(now),
             last_nack: std::sync::Mutex::new(now),
             last_recover: std::sync::Mutex::new(now),
+            rtt_samples: std::sync::Mutex::new(Vec::with_capacity(32)),
+            network_type: std::sync::Mutex::new(NetworkType::Internet), // Default to safest
+            last_rtt_update: std::sync::Mutex::new(now),
         }
     }
 
@@ -121,6 +185,77 @@ impl NetAdaptController {
 
     pub fn tier_switch_count(&self) -> u64 {
         self.tier_switch_count.load(Ordering::Relaxed)
+    }
+
+    /// Update RTT sample and re-detect network type
+    pub fn update_rtt(&self, rtt_ms: u64) {
+        let now = Instant::now();
+        let mut rtt_samples = self.rtt_samples.lock().unwrap();
+        rtt_samples.push(rtt_ms);
+        // Keep only last 32 samples
+        if rtt_samples.len() > 32 {
+            let keep_count = rtt_samples.len() - 32;
+            rtt_samples.drain(0..keep_count);
+        }
+        // Calculate median RTT
+        let mut sorted = rtt_samples.clone();
+        sorted.sort();
+        let median_rtt = sorted.get(sorted.len() / 2).copied().unwrap_or(rtt_ms);
+
+        // Update network type
+        let new_type = NetworkType::from_rtt_ms(median_rtt);
+        let mut network_type = self.network_type.lock().unwrap();
+        if *network_type != new_type {
+            tracing::info!(
+                old_type = ?*network_type,
+                new_type = ?new_type,
+                median_rtt_ms = median_rtt,
+                "network type changed"
+            );
+            *network_type = new_type;
+        }
+        if let Ok(mut t) = self.last_rtt_update.lock() {
+            *t = now;
+        }
+    }
+
+    /// Get current detected network type
+    pub fn network_type(&self) -> NetworkType {
+        *self.network_type.lock().unwrap()
+    }
+
+    /// Get recommended configuration based on detected network type
+    pub fn recommended_config(&self) -> NetworkConfig {
+        self.network_type().recommended_config()
+    }
+
+    /// Apply network-adaptive profile to capture config
+    pub fn apply_network_adaptive_profile(&self, cfg: &mut agent_rust::CaptureConfig) {
+        let net_config = self.recommended_config();
+        let current_type = self.network_type();
+
+        // Only apply if network adaptation is enabled
+        let enable_net_adapt = std::env::var("MRD_ENABLE_NETWORK_ADAPTIVE")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
+        if !enable_net_adapt {
+            return;
+        }
+
+        // Apply network-specific limits
+        cfg.fps = cfg.fps.min(net_config.fps);
+        cfg.bitrate_kbps = cfg.bitrate_kbps.min(net_config.bitrate_kbps);
+        cfg.queue_depth = cfg.queue_depth.min(net_config.queue_depth as u32);
+
+        tracing::debug!(
+            network_type = ?current_type,
+            recommended_fps = net_config.fps,
+            recommended_bitrate = net_config.bitrate_kbps,
+            recommended_queue = net_config.queue_depth,
+            "applied network-adaptive profile"
+        );
     }
 
     pub fn on_nack_burst(&self) -> (u32, u32) {

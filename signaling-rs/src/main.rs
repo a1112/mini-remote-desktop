@@ -3,6 +3,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -13,7 +14,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 const DEFAULT_PORT: u16 = 9527;
-const DEFAULT_CHANNEL_CAPACITY: usize = 32;
+const DEFAULT_CHANNEL_CAPACITY: usize = 128;  // Increased from 32 to 128 for better backpressure handling
 const DEFAULT_MAX_MSG_SIZE: usize = 1_048_576; // 1MB
 const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 30;
 const DEFAULT_CONNECTION_TIMEOUT_SECS: u64 = 60;
@@ -103,6 +104,23 @@ struct Device {
     transports: Vec<String>,
     tx: mpsc::Sender<Message>,
     last_seen: Instant,
+    metrics: Arc<DeviceMetrics>,
+}
+
+struct DeviceMetrics {
+    messages_sent: AtomicU64,
+    messages_dropped: AtomicU64,
+    last_queue_full: Arc<std::sync::Mutex<Instant>>,
+}
+
+impl Default for DeviceMetrics {
+    fn default() -> Self {
+        Self {
+            messages_sent: AtomicU64::new(0),
+            messages_dropped: AtomicU64::new(0),
+            last_queue_full: Arc::new(std::sync::Mutex::new(Instant::now())),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -313,6 +331,7 @@ async fn handle_message(conn_id: &str, tx: &mpsc::Sender<Message>, text: &str, s
                         transports,
                         tx: tx.clone(),
                         last_seen: Instant::now(),
+                        metrics: Arc::new(DeviceMetrics::default()),
                     },
                 );
             }
@@ -491,13 +510,40 @@ fn device_to_list_item(d: &Device) -> Value {
 }
 
 async fn send_to_device(target_id: &str, msg: &str, state: &SharedState) {
-    let tx = {
+    let target = {
         let s = state.read().await;
-        s.devices.get(target_id).map(|d| d.tx.clone())
+        s.devices.get(target_id).map(|d| (d.tx.clone(), d.metrics.clone()))
     };
-    if let Some(tx) = tx {
-        if let Err(e) = tx.try_send(Message::Text(msg.to_string())) {
-            warn!(error = %e, target_id = %target_id, "failed to send message to device");
+    if let Some((tx, metrics)) = target {
+        // Try non-blocking send first for lowest latency
+        match tx.try_send(Message::Text(msg.to_string())) {
+            Ok(_) => {
+                metrics.messages_sent.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                // Queue is full, try with backpressure timeout
+                let timeout = Duration::from_millis(100);
+                match tokio::time::timeout(timeout, tx.send(Message::Text(msg.to_string()))).await {
+                    Ok(Ok(_)) => {
+                        metrics.messages_sent.fetch_add(1, Ordering::Relaxed);
+                        if let Ok(mut t) = metrics.last_queue_full.lock() {
+                            *t = Instant::now();
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
+                        warn!(error = %e, target_id = %target_id, "message send failed after queue full");
+                    }
+                    Err(_) => {
+                        metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
+                        warn!(target_id = %target_id, "message send timeout after queue full");
+                    }
+                }
+            }
+            Err(e) => {
+                metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
+                warn!(error = %e, target_id = %target_id, "message send failed");
+            }
         }
     } else {
         warn!(target_id = %target_id, "device not found");

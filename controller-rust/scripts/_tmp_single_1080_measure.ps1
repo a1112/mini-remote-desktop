@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 
 $base = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $agentDir = Join-Path $base 'agent-rust'
@@ -9,7 +9,7 @@ $bak = Join-Path $agentDir ('config.single1080.' + (Get-Date -Format 'yyyyMMdd_H
 $signalingExe = Join-Path $signalingDir 'target/debug/signaling-rs.exe'
 $agentExe = Join-Path $agentDir 'target/debug/agent-rust.exe'
 $controllerExe = Join-Path $controllerDir 'target/debug/controller-rust.exe'
-$ffmpegExe = Join-Path $base 'tools/ffmpeg-min/ffmpeg.exe'
+$ffmpegExe = Join-Path $base 'tools/ffmpeg_full_build/bin/ffmpeg.exe'
 
 Copy-Item $agentCfg $bak -Force
 
@@ -106,3 +106,5 @@ finally {
   }
   Stop-Mrd
 }
+
+

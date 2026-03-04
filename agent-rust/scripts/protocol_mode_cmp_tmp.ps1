@@ -5,7 +5,7 @@ $signalingDir=Join-Path $base 'signaling-rs'
 $signalingExe=Join-Path $signalingDir 'target-codex-hotfix/debug/signaling-rs.exe'
 $agentExe=Join-Path $agentDir 'target/debug/agent-rust.exe'
 $probeExe=Join-Path $agentDir 'target/debug/m2_offer_probe.exe'
-$ffmpegExe=Join-Path $base 'tools/ffmpeg-min/ffmpeg.exe'
+$ffmpegExe=Join-Path $base 'tools/ffmpeg_full_build/bin/ffmpeg.exe'
 $cfgPath=Join-Path $agentDir 'config.json'
 $bak=Join-Path $agentDir ('config.protocol_mode_cmp.'+(Get-Date -Format 'yyyyMMdd_HHmmss')+'.bak.json')
 Copy-Item $cfgPath $bak -Force
@@ -38,3 +38,5 @@ try {
     Write-Output ("case={0} probe={1:N2} send={2:N2} unique={3:N2} frames={4}" -f $c.name,$p.fps,$a.send,$a.unique,$p.frames)
   }
 } finally { Copy-Item $bak $cfgPath -Force; Remove-Item $bak -Force -ErrorAction SilentlyContinue; Get-Process|?{$_.ProcessName -in @('signaling-rs','agent-rust','m2_offer_probe')}|Stop-Process -Force -ErrorAction SilentlyContinue }
+
+

@@ -163,7 +163,7 @@ impl H264Decoder {
         let try_mf_fallback = std::env::var("MRD_TRY_MF_FALLBACK")
             .ok()
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+            .unwrap_or(false);  // Default to false to prefer FFmpeg d3d11va
         let hw_fail_fast = std::env::var("MRD_HARDWARE_FAIL_FAST")
             .ok()
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -684,11 +684,11 @@ mod mf_backend {
                     }
                     None => {
                         self.shared_keyed_failures = self.shared_keyed_failures.saturating_add(1);
-                        if self.shared_keyed_failures >= 8 {
+                        if self.shared_keyed_failures >= 1 {
                             self.shared_keyed_enabled = false;
                             tracing::warn!(
                                 failures = self.shared_keyed_failures,
-                                "shared-keyed path disabled after repeated sync failures; falling back to renderable NV12"
+                                "shared-keyed path disabled after sync failure; falling back to renderable NV12"
                             );
                         }
                         tracing::debug!("shared-keyed path unavailable for this frame; fallback to renderable NV12");
@@ -847,6 +847,7 @@ mod mf_backend {
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, "decode keyed mutex AcquireSync failed; resetting shared slot pool");
+                            self.shared_keyed_enabled = false;
                             self.shared_slots.clear();
                             self.shared_slot_cursor = 0;
                             return Ok(None);
@@ -886,6 +887,7 @@ mod mf_backend {
                         primed = slot.primed,
                         "decode keyed mutex ReleaseSync failed; resetting shared slot pool"
                     );
+                    self.shared_keyed_enabled = false;
                     self.shared_slots.clear();
                     self.shared_slot_cursor = 0;
                     return Ok(None);
@@ -1407,8 +1409,8 @@ mod ffmpeg_backend {
         if decoder::find_by_name("h264_d3d11va").is_some() {
             return true;
         }
-        // Newer FFmpeg builds may not expose `h264_d3d11va` as a separate decoder name.
-        // In that case we still can open `h264` with d3d11va hwaccel options.
+        // Try to use h264 decoder with d3d11va hwaccel
+        // This may work if FFmpeg has d3d11va support
         decoder::find(codec::Id::H264).is_some()
     }
 

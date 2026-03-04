@@ -22,6 +22,7 @@ uuid = { version = "1.18", features = ["v4", "serde"] }
 webrtc = "0.12"
 rtp = "0.12"
 rtcp = "0.12"
+common-control-proto = { path = "../common-control-proto" }
 
 # Windows 特定依赖
 [target.'cfg(windows)'.dependencies]

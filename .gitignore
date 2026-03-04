@@ -37,3 +37,4 @@ tools/ffmpeg-min/
 /signaling-rs/target-codex-hotfix
 /agent-rust/target-codex-debug
 client-qt/venv
+/tools/ffmpeg_full_build/

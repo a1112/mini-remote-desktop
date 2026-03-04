@@ -1,4 +1,4 @@
-$ErrorActionPreference='Stop'
+﻿$ErrorActionPreference='Stop'
 $base = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $controllerDir=Join-Path $base 'controller-rust'
 $agentDir=Join-Path $base 'agent-rust'
@@ -6,7 +6,7 @@ $signalingDir=Join-Path $base 'signaling-rs'
 $signalingExe=Join-Path $signalingDir 'target/debug/signaling-rs.exe'
 $agentExe=Join-Path $agentDir 'target/debug/agent-rust.exe'
 $controllerExe=Join-Path $controllerDir 'target/debug/controller-rust.exe'
-$ffmpegExe=Join-Path $base 'tools/ffmpeg-min/ffmpeg.exe'
+$ffmpegExe=Join-Path $base 'tools/ffmpeg_full_build/bin/ffmpeg.exe'
 $cfgPath=Join-Path $agentDir 'config.json'
 $bak=Join-Path $agentDir ('config.tmp.compare.'+(Get-Date -Format 'yyyyMMdd_HHmmss')+'.bak.json')
 Copy-Item $cfgPath $bak -Force
@@ -57,3 +57,5 @@ try {
     Write-Output ("mode={0} logs controller={1} agent={2}" -f $mode,$clog,$alog)
   }
 } finally { if(Test-Path $bak){Copy-Item $bak $cfgPath -Force; Remove-Item $bak -Force -ErrorAction SilentlyContinue}; StopAll }
+
+

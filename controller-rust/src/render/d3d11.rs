@@ -466,7 +466,7 @@ impl D3D11Renderer {
                     }
                     DecodedFrameData::D3d11SharedNv12 { shared_handle } => {
                         gpu_external_frames = gpu_external_frames.saturating_add(1);
-                        match d3d.draw_shared_nv12(*shared_handle, frame.width, frame.height) {
+                        match d3d.draw_shared_nv12(*shared_handle, frame.width, frame.height, gpu_external_frames, cpu_upload_frames) {
                             Ok(timing) => {
                                 if shared_acquire_samples_ms.len() >= 1024 {
                                     shared_acquire_samples_ms.pop_front();
@@ -938,6 +938,16 @@ impl D3D11Renderer {
 
     fn on_overlay_command(window: HWND, wparam: WPARAM) {
         let id = (wparam.0 & 0xFFFF) as i32;
+        let notify = ((wparam.0 >> 16) & 0xFFFF) as u16;
+        let is_switch_button = matches!(
+            id,
+            ID_BTN_RESOLUTION | ID_BTN_WINDOW | ID_BTN_BITRATE | ID_BTN_CAPTURE | ID_BTN_ENCODER
+        );
+        // Only treat real button clicks as switch commands.
+        // Focus/paint notifications can also arrive via WM_COMMAND and must not enqueue control patches.
+        if is_switch_button && notify != BN_CLICKED as u16 {
+            return;
+        }
         if let Some(state) = Self::ui_state(window) {
             match id {
                 ID_BTN_COLLAPSE => {
@@ -1752,12 +1762,22 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
         shared_handle: isize,
         width: u32,
         height: u32,
+        gpu_external_frames: u64,
+        cpu_upload_frames: u64,
     ) -> Result<SharedDrawTiming> {
         static SHARED_DRAW_TRACE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let timeout_ms = std::env::var("MRD_D3D11_KEYED_TIMEOUT_MS")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(0);
+        // Dynamic timeout: use lower timeout when GPU path is stable, higher when unstable
+        let timeout_ms = if gpu_external_frames > cpu_upload_frames {
+            std::env::var("MRD_D3D11_KEYED_TIMEOUT_MS")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(2)  // 2ms when GPU is stable
+        } else {
+            std::env::var("MRD_D3D11_KEYED_TIMEOUT_MS_FALLBACK")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(8)  // 8ms when GPU is unstable
+        };
         let trace_draw = std::env::var("MRD_SHARED_KEYED_TRACE")
             .ok()
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))

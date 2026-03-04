@@ -63,6 +63,22 @@ mod imp {
         pub acquire_ok: u64,
         pub acquire_timeout: u64,
         pub acquire_errors: u64,
+        // Health monitoring fields
+        pub direct_path_streak: u32,
+        pub consecutive_failures: u32,
+        pub health_check_last: u64,  // Unix timestamp us
+    }
+
+    impl NativePathStats {
+        /// Check if direct path is healthy and should be preferred
+        pub fn is_direct_path_healthy(&self) -> bool {
+            self.direct_frames > 100 && self.direct_register_failures == 0
+        }
+
+        /// Check if we have a stable direct path streak
+        pub fn has_stable_direct_streak(&self) -> bool {
+            self.direct_path_streak >= 50
+        }
     }
 
     pub struct NativeNvencPipeline {
@@ -406,6 +422,8 @@ mod imp {
                         Err(e) => {
                             self.stats.direct_register_failures =
                                 self.stats.direct_register_failures.saturating_add(1);
+                            self.stats.consecutive_failures = self.stats.consecutive_failures.saturating_add(1);
+                            self.stats.direct_path_streak = 0;
                             if self.strict_gpu_direct {
                                 return Err(anyhow!(
                                     "strict_gpu_direct direct register failed: {e:?}"
@@ -426,6 +444,9 @@ mod imp {
                     drop(frame);
                     self.frame_idx = frame_idx.saturating_add(1);
                     self.stats.direct_frames = self.stats.direct_frames.saturating_add(1);
+                    self.stats.direct_path_streak = self.stats.direct_path_streak.saturating_add(1);
+                    self.stats.consecutive_failures = 0;
+                    self.stats.health_check_last = capture_start_us;
                     return Ok(Some(NativeEncodeResult {
                         bytes: normalize_h264_au(bytes),
                         path: NativeEncodePath::DirectTexture,
@@ -790,6 +811,8 @@ mod imp {
                         Err(e) => {
                             self.stats.direct_register_failures =
                                 self.stats.direct_register_failures.saturating_add(1);
+                            self.stats.consecutive_failures = self.stats.consecutive_failures.saturating_add(1);
+                            self.stats.direct_path_streak = 0;
                             if self.strict_gpu_direct {
                                 return Err(anyhow!(
                                     "strict_gpu_direct direct register failed: {e:?}"

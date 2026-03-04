@@ -2,7 +2,7 @@
 ///
 /// 将本地键盘和鼠标事件转发到远程代理
 
-use std::sync::Arc;
+use common_control_proto::ControlEvent;
 use tokio::sync::mpsc;
 
 /// 输入事件
@@ -27,6 +27,20 @@ pub enum InputEvent {
     MouseWheel {
         delta: i32,
     },
+}
+
+impl From<InputEvent> for ControlEvent {
+    fn from(value: InputEvent) -> Self {
+        match value {
+            InputEvent::Keyboard { key, pressed } => Self::Key { key, pressed },
+            InputEvent::MouseMove { x, y } => Self::MouseMove { x, y },
+            InputEvent::MouseButton { button, pressed } => Self::MouseButton {
+                button: button as u8,
+                pressed,
+            },
+            InputEvent::MouseWheel { delta } => Self::MouseWheel { delta },
+        }
+    }
 }
 
 /// 输入管理器

@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 
 $base = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $controllerDir = Join-Path $base 'controller-rust'
@@ -8,7 +8,7 @@ $signalingDir = Join-Path $base 'signaling-rs'
 $signalingExe = Join-Path $signalingDir 'target/debug/signaling-rs.exe'
 $agentExe = Join-Path $agentDir 'target/debug/agent-rust.exe'
 $controllerExe = Join-Path $controllerDir 'target/debug/controller-rust.exe'
-$ffmpegExe = Join-Path $base 'tools/ffmpeg-min/ffmpeg.exe'
+$ffmpegExe = Join-Path $base 'tools/ffmpeg_full_build/bin/ffmpeg.exe'
 $agentCfgPath = Join-Path $agentDir 'config.json'
 $agentBak = Join-Path $agentDir ('config.accept.quic240.gpudirectcmp.' + (Get-Date -Format 'yyyyMMdd_HHmmss') + '.bak.json')
 
@@ -166,4 +166,6 @@ finally {
   }
   Stop-MrdProcs
 }
+
+
 

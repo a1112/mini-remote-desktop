@@ -1,16 +1,21 @@
 use super::super::signaling::SignalingClient;
 use anyhow::{Context, Result};
 use bytes::Bytes;
+use common_control_proto::{ChannelClass, ControlEvent, Frame};
+use rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use rtp::codecs::h264::H264Packet;
 use rtp::packetizer::Depacketizer;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 use webrtc::{
     api::APIBuilder,
     api::media_engine::MediaEngine,
     api::setting_engine::SettingEngine,
+    data_channel::data_channel_init::RTCDataChannelInit,
+    data_channel::RTCDataChannel,
     ice_transport::ice_candidate::RTCIceCandidateInit,
     ice_transport::ice_connection_state::RTCIceConnectionState,
     peer_connection::configuration::RTCConfiguration,
@@ -56,6 +61,11 @@ pub struct PeerConnectionManager {
     ice_candidate_tx: mpsc::Sender<RTCIceCandidateInit>,
     /// 视频帧接收器（使用 Arc<Mutex<>> 以便共享）
     frame_rx: Arc<Mutex<mpsc::Receiver<VideoFrame>>>,
+    ctrl_rt_dc: Arc<RTCDataChannel>,
+    ctrl_rel_dc: Arc<RTCDataChannel>,
+    seq_rt: AtomicU32,
+    seq_rel: AtomicU32,
+    video_ssrc: Arc<AtomicU32>,
 }
 
 impl PeerConnectionManager {
@@ -108,12 +118,47 @@ impl PeerConnectionManager {
         info!(target = %target_device_id, "video transceiver added for receiving");
 
         // 创建视频帧通道
-        let (frame_tx, frame_rx) = mpsc::channel(32);
+        let (frame_tx, frame_rx) = mpsc::channel(128);
         let frame_rx = Arc::new(Mutex::new(frame_rx));
         let (ice_candidate_tx, _ice_candidate_rx) = mpsc::channel(10);
+        let video_ssrc = Arc::new(AtomicU32::new(0));
+
+        let ctrl_rt_dc = pc
+            .create_data_channel(
+                "ctrl_rt",
+                Some(RTCDataChannelInit {
+                    ordered: Some(false),
+                    max_retransmits: Some(0),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .context("failed to create ctrl_rt data channel")?;
+        ctrl_rt_dc.on_open(Box::new(move || {
+            Box::pin(async move {
+                info!("control data channel ctrl_rt open");
+            })
+        }));
+
+        let ctrl_rel_dc = pc
+            .create_data_channel(
+                "ctrl_rel",
+                Some(RTCDataChannelInit {
+                    ordered: Some(true),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .context("failed to create ctrl_rel data channel")?;
+        ctrl_rel_dc.on_open(Box::new(move || {
+            Box::pin(async move {
+                info!("control data channel ctrl_rel open");
+            })
+        }));
 
         // 设置 track 接收回调
         let frame_tx_clone = frame_tx.clone();
+        let video_ssrc_for_track = video_ssrc.clone();
         pc.on_track(Box::new(move |track, _, _| {
             info!(
                 "received track: codec={}, kind={}, id={}",
@@ -123,8 +168,9 @@ impl PeerConnectionManager {
             );
 
             let frame_tx = frame_tx_clone.clone();
+            let video_ssrc = video_ssrc_for_track.clone();
             Box::pin(async move {
-                if let Err(e) = Self::handle_video_track(track, frame_tx).await {
+                if let Err(e) = Self::handle_video_track(track, frame_tx, video_ssrc).await {
                     error!(error = %e, "error handling video track");
                 }
             })
@@ -155,21 +201,57 @@ impl PeerConnectionManager {
                 _session_id: session_id,
                 ice_candidate_tx,
                 frame_rx: frame_rx.clone(),
+                ctrl_rt_dc,
+                ctrl_rel_dc,
+                seq_rt: AtomicU32::new(0),
+                seq_rel: AtomicU32::new(0),
+                video_ssrc,
             },
             frame_rx,
         ))
+    }
+
+    pub async fn send_control_event(
+        &self,
+        event: ControlEvent,
+        flags: u8,
+        ts_us: u64,
+    ) -> Result<()> {
+        let (seq, dc) = match event.channel_class() {
+            ChannelClass::Realtime => (
+                self.seq_rt.fetch_add(1, Ordering::Relaxed).wrapping_add(1),
+                &self.ctrl_rt_dc,
+            ),
+            ChannelClass::Reliable => (
+                self.seq_rel.fetch_add(1, Ordering::Relaxed).wrapping_add(1),
+                &self.ctrl_rel_dc,
+            ),
+        };
+        let frame = Frame {
+            flags,
+            seq,
+            ts_us,
+            event,
+        };
+        let bytes = Bytes::from(frame.encode());
+        dc.send(&bytes)
+            .await
+            .context("failed to send control frame")?;
+        Ok(())
     }
 
     /// 处理视频 track，读取 RTP 包并组装 H.264 帧
     async fn handle_video_track(
         track: Arc<TrackRemote>,
         frame_tx: mpsc::Sender<VideoFrame>,
+        video_ssrc: Arc<AtomicU32>,
     ) -> Result<()> {
         let mut packet_count = 0u64;
         let mut access_unit = Vec::<u8>::new();
         let mut depacketizer = H264Packet::default();
         depacketizer.is_avc = false; // output AnnexB for decoder input
         let mut current_timestamp: Option<u32> = None;
+        let mut au_debug_count = 0u32;
 
         info!(
             codec = %track.codec().capability.mime_type,
@@ -177,8 +259,19 @@ impl PeerConnectionManager {
         );
 
         // 读取 RTP 包并进行 H264 depacketize -> AnnexB AU 重组。
-        while let Ok((packet, _)) = track.read_rtp().await {
+        loop {
+            let (packet, _) = match track.read_rtp().await {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(error = %e, total_packets = packet_count, "video track read_rtp ended");
+                    break;
+                }
+            };
             packet_count += 1;
+            let current_ssrc = packet.header.ssrc;
+            if video_ssrc.load(Ordering::Relaxed) != current_ssrc {
+                video_ssrc.store(current_ssrc, Ordering::Relaxed);
+            }
             let timestamp = packet.header.timestamp;
             if current_timestamp.is_none() {
                 current_timestamp = Some(timestamp);
@@ -216,6 +309,22 @@ impl PeerConnectionManager {
             if packet.header.marker && !access_unit.is_empty() {
                 let ts = current_timestamp.unwrap_or(timestamp);
                 let is_key = contains_idr_annexb(&access_unit);
+                if au_debug_count < 8 {
+                    let has_sc3 = access_unit.starts_with(&[0, 0, 1]);
+                    let has_sc4 = access_unit.starts_with(&[0, 0, 0, 1]);
+                    info!(
+                        au_idx = au_debug_count,
+                        au_len = access_unit.len(),
+                        seq = packet.header.sequence_number,
+                        ts = ts,
+                        key = is_key,
+                        startcode3 = has_sc3,
+                        startcode4 = has_sc4,
+                        head = %hex_head(&access_unit, 20),
+                        "webrtc h264 access unit"
+                    );
+                    au_debug_count = au_debug_count.saturating_add(1);
+                }
                 let frame = VideoFrame {
                     data: Bytes::from(std::mem::take(&mut access_unit)),
                     timestamp: ts as u64,
@@ -279,7 +388,17 @@ impl PeerConnectionManager {
 
     /// 请求关键帧
     pub async fn request_keyframe(&self) -> Result<()> {
-        // TODO: 实现 PLI/FIR 请求
+        let media_ssrc = self.video_ssrc.load(Ordering::Relaxed);
+        if media_ssrc == 0 {
+            return Ok(());
+        }
+        self.pc
+            .write_rtcp(&[Box::new(PictureLossIndication {
+                sender_ssrc: 0,
+                media_ssrc,
+            })])
+            .await
+            .context("failed to send RTCP PLI")?;
         Ok(())
     }
 }
@@ -314,4 +433,17 @@ fn contains_idr_annexb(buf: &[u8]) -> bool {
         i = hdr.saturating_add(1);
     }
     false
+}
+
+fn hex_head(buf: &[u8], max_bytes: usize) -> String {
+    let n = buf.len().min(max_bytes);
+    let mut out = String::with_capacity(n.saturating_mul(3));
+    for (i, b) in buf.iter().take(n).enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{:02x}", b);
+    }
+    out
 }
