@@ -104,7 +104,11 @@ class SignalingSession:
         assert self.ws is not None
         await self.ws.send(json.dumps(payload))
 
-    async def register(self) -> None:
+    async def register(self, codecs: Optional[List[str]] = None, features: Optional[List[str]] = None) -> None:
+        codecs = [str(c).lower() for c in (codecs or ["h264"]) if str(c).strip()]
+        if not codecs:
+            codecs = ["h264"]
+        features = [str(f) for f in (features or ["core-transport-suite"]) if str(f).strip()]
         await self.send({
             "type": "device",
             "action": "register",
@@ -116,8 +120,8 @@ class SignalingSession:
                 "capabilities": {
                     "protocols": ["webrtc", "quic", "webtransport"],
                     "platforms": ["python"],
-                    "codecs": ["h264"],
-                    "features": ["core-transport-suite"],
+                    "codecs": codecs,
+                    "features": features,
                 },
             },
         })
@@ -164,7 +168,7 @@ class QuicFrameProtocol(QuicConnectionProtocol):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.stream_buffers: Dict[int, bytearray] = {}
-        self.frames: List[Tuple[float, int, int]] = []  # (rx_ts, seq, tx_us)
+        self.frames: List[Tuple[float, int, int, int]] = []  # (rx_ts, seq, tx_us, payload_len)
         self.connected_event = asyncio.Event()
 
     def connection_made(self, transport):
@@ -188,7 +192,7 @@ class QuicFrameProtocol(QuicConnectionProtocol):
             seq = struct.unpack(">Q", bytes(buf[4:12]))[0]
             tx_us = struct.unpack(">Q", bytes(buf[12:20]))[0]
             rx_ts = time.perf_counter()
-            self.frames.append((rx_ts, seq, tx_us))
+            self.frames.append((rx_ts, seq, tx_us, length))
             del buf[:frame_len]
 
 
@@ -202,7 +206,7 @@ class WebTransportFrameProtocol(QuicConnectionProtocol):
         self.session_ready = asyncio.Event()
         self.session_failed = asyncio.Event()
         self.stream_buffers: Dict[int, bytearray] = {}
-        self.frames: List[Tuple[float, int, int]] = []
+        self.frames: List[Tuple[float, int, int, int]] = []
 
     def start_session(self) -> None:
         sid = self._quic.get_next_available_stream_id(is_unidirectional=False)
@@ -249,8 +253,21 @@ class WebTransportFrameProtocol(QuicConnectionProtocol):
             seq = struct.unpack(">Q", bytes(buf[4:12]))[0]
             tx_us = struct.unpack(">Q", bytes(buf[12:20]))[0]
             rx_ts = time.perf_counter()
-            self.frames.append((rx_ts, seq, tx_us))
+            self.frames.append((rx_ts, seq, tx_us, length))
             del buf[:frame_len]
+
+
+def summarize_sizes_bytes(sizes: List[int]) -> Dict[str, Any]:
+    if not sizes:
+        return {"samples": 0}
+    return {
+        "samples": len(sizes),
+        "min": int(min(sizes)),
+        "mean": round(statistics.mean(sizes), 3),
+        "p95": round(percentile([float(s) for s in sizes], 95), 3),
+        "p99": round(percentile([float(s) for s in sizes], 99), 3),
+        "max": int(max(sizes)),
+    }
 
 
 class ServerPerfMonitor:
@@ -437,6 +454,21 @@ class CoreTransportSuite:
         self.cfg = cfg
         self.duration_sec = int(cfg.get("duration_sec", 30))
         self.thresholds = cfg.get("thresholds", {})
+        self.analysis = cfg.get("analysis") or {}
+        self.controller_codecs = [
+            str(c).lower()
+            for c in (self.analysis.get("controller_codecs") or ["h264"])
+            if str(c).strip()
+        ]
+        if not self.controller_codecs:
+            self.controller_codecs = ["h264"]
+        self.controller_features = [
+            str(f)
+            for f in (self.analysis.get("controller_features") or ["core-transport-suite"])
+            if str(f).strip()
+        ]
+        if not self.controller_features:
+            self.controller_features = ["core-transport-suite"]
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
         self.log_dir = root / "logs" / f"core-transport-suite-{ts}"
         self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -469,7 +501,7 @@ class CoreTransportSuite:
         agent_env.setdefault("AGENT_QUIC_QUEUE", "256")
         agent_env.setdefault("AGENT_WEBTRANSPORT_QUEUE", "256")
         # QUIC/WebTransport pacer: smooth sender bursts to reduce tail jitter.
-        analysis = self.cfg.get("analysis") or {}
+        analysis = self.analysis
         pacer = analysis.get("quic_pacer") or {}
         agent_env["AGENT_QUIC_PACE_ENABLE"] = str(
             pacer.get("enable", False)
@@ -496,6 +528,14 @@ class CoreTransportSuite:
         agent_env["AGENT_QUIC_QUEUE_RATE_LINK_COOLDOWN_MS"] = str(
             int(qrl.get("cooldown_ms", 200))
         )
+        for k, v in (analysis.get("agent_env") or {}).items():
+            key = str(k).strip()
+            if not key:
+                continue
+            if isinstance(v, bool):
+                agent_env[key] = "1" if v else "0"
+            else:
+                agent_env[key] = str(v)
 
         agent = subprocess.Popen(
             ["cargo", "run", "--bin", "agent-rust"],
@@ -543,12 +583,16 @@ class CoreTransportSuite:
                 except Exception:
                     pass
 
-    def _parse_agent_health(self, agent_out: Path, agent_err: Path) -> Tuple[int, int]:
+    def _read_agent_text(self, agent_out: Path, agent_err: Path) -> str:
         text = ""
         if agent_out.exists():
             text += agent_out.read_text(encoding="utf-8", errors="ignore")
         if agent_err.exists():
             text += "\n" + agent_err.read_text(encoding="utf-8", errors="ignore")
+        return text
+
+    def _parse_agent_health(self, agent_out: Path, agent_err: Path) -> Tuple[int, int]:
+        text = self._read_agent_text(agent_out, agent_err)
         error_count = 0
         for line in text.splitlines():
             clean = re.sub(r"\x1b\[[0-9;]*m", "", line).strip()
@@ -567,6 +611,35 @@ class CoreTransportSuite:
                 except Exception:
                     pass
         return error_count, quic_drop
+
+    def _parse_agent_encoder_diag(self, agent_out: Path, agent_err: Path) -> Dict[str, Any]:
+        text = self._read_agent_text(agent_out, agent_err)
+        restart_count = 0
+        ffmpeg_pipe_start_count = 0
+        roi_requested_count = 0
+        roi_applied_count = 0
+        for line in text.splitlines():
+            clean = re.sub(r"\x1b\[[0-9;]*m", "", line).strip()
+            if "ffmpeg_pipe_restart" in clean:
+                restart_count += 1
+            if "ffmpeg_pipe_start" in clean:
+                ffmpeg_pipe_start_count += 1
+                m_req = re.search(r"roi_requested[=:](true|false|1|0)", clean, re.IGNORECASE)
+                if m_req and m_req.group(1).lower() in ("true", "1"):
+                    roi_requested_count += 1
+                m_app = re.search(r"roi_applied[=:](true|false|1|0)", clean, re.IGNORECASE)
+                if m_app and m_app.group(1).lower() in ("true", "1"):
+                    roi_applied_count += 1
+        roi_effectiveness = None
+        if roi_requested_count > 0:
+            roi_effectiveness = round(roi_applied_count / max(1, roi_requested_count), 3)
+        return {
+            "ffmpeg_pipe_restart_count": restart_count,
+            "ffmpeg_pipe_start_count": ffmpeg_pipe_start_count,
+            "roi_requested_count": roi_requested_count,
+            "roi_applied_count": roi_applied_count,
+            "roi_effectiveness": roi_effectiveness,
+        }
 
     async def _run_control_offer(self, signaling: SignalingSession, target_id: str, transport: str):
         pc = RTCPeerConnection(
@@ -635,8 +708,8 @@ class CoreTransportSuite:
                     "capabilities": {
                         "protocols": ["webrtc", "quic", "webtransport"],
                         "platforms": ["python"],
-                        "codecs": ["h264"],
-                        "features": ["core-transport-suite"],
+                        "codecs": list(self.controller_codecs),
+                        "features": list(self.controller_features),
                     },
                 },
             }
@@ -669,19 +742,19 @@ class CoreTransportSuite:
 
         return pc, frame_times, payload, connected_ev.is_set()
 
-    async def _receive_quic_frames(self, addr: str, duration_sec: int) -> List[Tuple[float, int, int]]:
+    async def _receive_quic_frames(self, addr: str, duration_sec: int) -> List[Tuple[float, int, int, int]]:
         host, port_str = addr.rsplit(":", 1)
         port = int(port_str)
         cfg = QuicConfiguration(is_client=True)
         cfg.verify_mode = ssl.CERT_NONE
-        frames: List[Tuple[float, int, int]] = []
+        frames: List[Tuple[float, int, int, int]] = []
         async with connect(host, port, configuration=cfg, create_protocol=QuicFrameProtocol) as client:
             protocol: QuicFrameProtocol = client
             await asyncio.sleep(duration_sec)
             frames = list(protocol.frames)
         return frames
 
-    async def _receive_webtransport_frames(self, url: str, alpn: str, duration_sec: int) -> List[Tuple[float, int, int]]:
+    async def _receive_webtransport_frames(self, url: str, alpn: str, duration_sec: int) -> List[Tuple[float, int, int, int]]:
         parsed = urlparse(url)
         host = parsed.hostname or "127.0.0.1"
         port = parsed.port or 443
@@ -701,14 +774,15 @@ class CoreTransportSuite:
         ) as client:
             protocol: WebTransportFrameProtocol = client
             protocol.start_session()
-            done, _ = await asyncio.wait(
-                [
-                    asyncio.create_task(protocol.session_ready.wait()),
-                    asyncio.create_task(protocol.session_failed.wait()),
-                ],
+            ready_task = asyncio.create_task(protocol.session_ready.wait())
+            failed_task = asyncio.create_task(protocol.session_failed.wait())
+            done, pending = await asyncio.wait(
+                [ready_task, failed_task],
                 timeout=10.0,
                 return_when=asyncio.FIRST_COMPLETED,
             )
+            for t in pending:
+                t.cancel()
             if not done or protocol.session_failed.is_set() or not protocol.session_ready.is_set():
                 return []
             await asyncio.sleep(duration_sec)
@@ -767,6 +841,25 @@ class CoreTransportSuite:
             raw={},
         )
 
+    def _apply_diag_thresholds(self, res: TransportCaseResult) -> None:
+        diag_th = (self.thresholds.get("diag") or {})
+        raw = res.raw or {}
+        diag = raw.get("encoder_diag") or {}
+        if "ffmpeg_restart_max" in diag_th:
+            max_restart = int(diag_th.get("ffmpeg_restart_max", 1_000_000))
+            rs = int(diag.get("ffmpeg_pipe_restart_count", 0))
+            if rs > max_restart:
+                res.ok = False
+                if res.reason == "ok":
+                    res.reason = f"ffmpeg restart too high: {rs} > {max_restart}"
+        if "roi_effectiveness_min" in diag_th:
+            min_eff = float(diag_th.get("roi_effectiveness_min", 0.0))
+            eff = diag.get("roi_effectiveness")
+            if eff is not None and float(eff) < min_eff:
+                res.ok = False
+                if res.reason == "ok":
+                    res.reason = f"roi effectiveness too low: {eff} < {min_eff}"
+
     def _steady_state_times(self, frame_times: List[float]) -> List[float]:
         if len(frame_times) <= 3:
             return list(frame_times)
@@ -811,7 +904,7 @@ class CoreTransportSuite:
 
             signaling = SignalingSession("ws://127.0.0.1:9527")
             await signaling.connect()
-            await signaling.register()
+            await signaling.register(codecs=self.controller_codecs, features=self.controller_features)
             target_id = await signaling.discover_agent(timeout_sec=25)
             await self._send_capture_patch(signaling, target_id)
 
@@ -838,17 +931,19 @@ class CoreTransportSuite:
                     raw={"answer_payload": answer_payload},
                 )
 
-            frame_records: List[Tuple[float, int, int]] = []
+            frame_records: List[Tuple[float, int, int, int]] = []
             if transport == "webrtc":
                 await asyncio.sleep(self.duration_sec)
                 frame_times = list(webrtc_frame_times)
                 tx_us: List[int] = []
+                au_sizes: List[int] = []
             elif transport == "quic":
                 quic = answer_payload.get("quic") or {}
                 addr = quic.get("addr") or ""
                 frame_records = await self._receive_quic_frames(addr, self.duration_sec)
                 frame_times = [t[0] for t in frame_records]
                 tx_us = [t[2] for t in frame_records]
+                au_sizes = [int(t[3]) for t in frame_records]
             elif transport == "webtransport":
                 wt = answer_payload.get("webtransport") or {}
                 url = wt.get("url") or ""
@@ -856,14 +951,17 @@ class CoreTransportSuite:
                 frame_records = await self._receive_webtransport_frames(url, alpn, self.duration_sec)
                 frame_times = [t[0] for t in frame_records]
                 tx_us = [t[2] for t in frame_records]
+                au_sizes = [int(t[3]) for t in frame_records]
             else:
                 frame_times = []
                 tx_us = []
+                au_sizes = []
 
             await pc.close()
             await signaling.close()
 
             agent_errors, quic_drop = self._parse_agent_health(agent_out, agent_err)
+            encoder_diag = self._parse_agent_encoder_diag(agent_out, agent_err)
             res = self._evaluate_case(
                 transport=transport,
                 frame_times=frame_times,
@@ -878,7 +976,11 @@ class CoreTransportSuite:
                 "answer_payload": answer_payload,
                 "connected": connected,
                 "records": len(frame_records),
+                "duration_sec": self.duration_sec,
+                "au_size_bytes": summarize_sizes_bytes(au_sizes),
+                "encoder_diag": encoder_diag,
             }
+            self._apply_diag_thresholds(res)
             return res
 
         except Exception as e:
@@ -952,12 +1054,15 @@ class CoreTransportSuite:
         lines.append("")
         lines.append("## Summary")
         lines.append("")
-        lines.append("| transport | ok | selected | frames | p95(ms) | p99(ms) | >100ms | >200ms | agent_errors | quic_drop | reason |")
-        lines.append("|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---|")
+        lines.append("| transport | ok | selected | frames | p95(ms) | p99(ms) | >100ms | >200ms | agent_errors | quic_drop | ffmpeg_restart | roi_effective | au_mean(B) | au_p95(B) | reason |")
+        lines.append("|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|")
         for r in payload["results"]:
             j = r.get("jitter_ms") or {}
+            raw = r.get("raw") or {}
+            diag = raw.get("encoder_diag") or {}
+            au = raw.get("au_size_bytes") or {}
             lines.append(
-                "| {transport} | {ok} | {selected} | {frames} | {p95} | {p99} | {g100} | {g200} | {ae} | {qd} | {reason} |".format(
+                "| {transport} | {ok} | {selected} | {frames} | {p95} | {p99} | {g100} | {g200} | {ae} | {qd} | {rs} | {roi} | {aumean} | {aup95} | {reason} |".format(
                     transport=r["transport"],
                     ok="PASS" if r["ok"] else "FAIL",
                     selected=r.get("selected_transport") or "-",
@@ -968,6 +1073,10 @@ class CoreTransportSuite:
                     g200=j.get("gt_200ms", 0),
                     ae=r.get("agent_error_count", 0),
                     qd=r.get("agent_quic_drop", 0),
+                    rs=diag.get("ffmpeg_pipe_restart_count", 0),
+                    roi=diag.get("roi_effectiveness", "-"),
+                    aumean=au.get("mean", "-"),
+                    aup95=au.get("p95", "-"),
                     reason=(r.get("reason") or "")[:80],
                 )
             )
@@ -1022,11 +1131,40 @@ def parse_args():
         nargs="+",
         default=["webrtc", "quic", "webtransport"],
     )
+    parser.add_argument("--codec", default="", help="Preferred codec for controller capability and capture patch (h264/hevc/av1)")
+    parser.add_argument("--roi-enable", action="store_true", help="Enable ROI capture patch")
+    parser.add_argument("--roi-rect", default="0.30,0.30,0.40,0.40", help="ROI rect normalized x,y,w,h")
+    parser.add_argument("--roi-qoffset", type=float, default=-0.125, help="ROI qoffset, usually negative")
+    parser.add_argument("--native-roi-probe", action="store_true", help="Enable native ROI path probe switch in agent")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
+    if args.codec:
+        cfg_path = Path(args.config).resolve()
+        cfg = load_config(cfg_path)
+        analysis = cfg.setdefault("analysis", {})
+        codec = str(args.codec).strip().lower()
+        analysis["controller_codecs"] = [codec, "h264"]
+        cap = dict(analysis.get("capture_patch") or {})
+        cap["codecPolicy"] = {"force": codec}
+        if args.roi_enable:
+            rect_vals = [float(x.strip()) for x in str(args.roi_rect).split(",")]
+            if len(rect_vals) == 4:
+                cap["qualityPolicy"] = cap.get("qualityPolicy") or {}
+                cap["qualityPolicy"]["roi"] = {
+                    "enable": True,
+                    "rect": {"x": rect_vals[0], "y": rect_vals[1], "w": rect_vals[2], "h": rect_vals[3]},
+                    "qoffset": float(args.roi_qoffset),
+                }
+        analysis["capture_patch"] = cap
+        env_overrides = dict(analysis.get("agent_env") or {})
+        env_overrides["AGENT_NVENC_NATIVE_ROI_ENABLE"] = "1" if args.native_roi_probe else "0"
+        analysis["agent_env"] = env_overrides
+        tmp_cfg = cfg_path.parent / f".tmp.codec-roi.{int(time.time())}.json"
+        tmp_cfg.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        args.config = str(tmp_cfg)
     asyncio.run(main_async(args))
 
 

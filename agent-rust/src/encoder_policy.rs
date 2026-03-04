@@ -1,5 +1,7 @@
 use agent_rust::CaptureConfig;
+use std::collections::HashMap;
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoEncoderBackend {
@@ -28,10 +30,34 @@ struct GpuCaps {
     detect_unknown: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EffectiveCodec {
+    H264,
+    Hevc,
+    Av1,
+}
+
+impl EffectiveCodec {
+    fn from_env() -> Self {
+        match std::env::var("AGENT_VIDEO_CODEC_EFFECTIVE")
+            .ok()
+            .unwrap_or_else(|| "h264".to_string())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "hevc" | "h265" => EffectiveCodec::Hevc,
+            "av1" => EffectiveCodec::Av1,
+            _ => EffectiveCodec::H264,
+        }
+    }
+}
+
 pub fn choose_encoder_backend(cfg: &CaptureConfig) -> (VideoEncoderBackend, Vec<String>) {
     let mut logs = Vec::new();
     let requested = cfg.encoder.to_ascii_lowercase();
     let caps = detect_gpu_caps(&mut logs);
+    let codec = EffectiveCodec::from_env();
     let fallback_allowed = cfg.allow_encoder_fallback && !cfg.strict_gpu_direct;
 
     let mut order = match requested.as_str() {
@@ -53,7 +79,7 @@ pub fn choose_encoder_backend(cfg: &CaptureConfig) -> (VideoEncoderBackend, Vec<
     let forced = order.first().copied().unwrap_or(VideoEncoderBackend::Nvenc);
 
     for enc in order {
-        if encoder_available(enc, &caps) {
+        if encoder_available(enc, &caps) && backend_supports_codec(enc, codec, &mut logs) {
             logs.push(format!("video encoder selected: {}", enc.as_str()));
             return (enc, logs);
         }
@@ -70,6 +96,70 @@ pub fn choose_encoder_backend(cfg: &CaptureConfig) -> (VideoEncoderBackend, Vec<
 
     logs.push("all requested encoders unavailable, fallback to openh264".to_string());
     (VideoEncoderBackend::OpenH264, logs)
+}
+
+fn backend_supports_codec(
+    enc: VideoEncoderBackend,
+    codec: EffectiveCodec,
+    logs: &mut Vec<String>,
+) -> bool {
+    let Some(name) = ffmpeg_encoder_name(enc, codec) else {
+        return true;
+    };
+    match probe_ffmpeg_encoder(name) {
+        Some(true) => true,
+        Some(false) => {
+            logs.push(format!("ffmpeg encoder {name} not available for codec {:?}", codec));
+            false
+        }
+        None => {
+            logs.push(format!("ffmpeg probe unavailable, keep optimistic path for {name}"));
+            true
+        }
+    }
+}
+
+fn ffmpeg_encoder_name(enc: VideoEncoderBackend, codec: EffectiveCodec) -> Option<&'static str> {
+    match (enc, codec) {
+        (VideoEncoderBackend::Nvenc, EffectiveCodec::H264) => Some("h264_nvenc"),
+        (VideoEncoderBackend::Nvenc, EffectiveCodec::Hevc) => Some("hevc_nvenc"),
+        (VideoEncoderBackend::Nvenc, EffectiveCodec::Av1) => Some("av1_nvenc"),
+        (VideoEncoderBackend::Qsv, EffectiveCodec::H264) => Some("h264_qsv"),
+        (VideoEncoderBackend::Qsv, EffectiveCodec::Hevc) => Some("hevc_qsv"),
+        (VideoEncoderBackend::Qsv, EffectiveCodec::Av1) => Some("av1_qsv"),
+        (VideoEncoderBackend::Amf, EffectiveCodec::H264) => Some("h264_amf"),
+        (VideoEncoderBackend::Amf, EffectiveCodec::Hevc) => Some("hevc_amf"),
+        (VideoEncoderBackend::Amf, EffectiveCodec::Av1) => Some("av1_amf"),
+        (VideoEncoderBackend::OpenH264, _) => None,
+    }
+}
+
+fn probe_ffmpeg_encoder(name: &str) -> Option<bool> {
+    static CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some(v) = guard.get(name) {
+            return Some(*v);
+        }
+    }
+
+    let ffmpeg_bin = std::env::var("AGENT_FFMPEG_PATH")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "ffmpeg".to_string());
+    let out = Command::new(ffmpeg_bin)
+        .args(["-hide_banner", "-encoders"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let txt = String::from_utf8_lossy(&out.stdout).to_ascii_lowercase();
+    let ok = txt.contains(&name.to_ascii_lowercase());
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(name.to_string(), ok);
+    }
+    Some(ok)
 }
 
 fn encoder_available(enc: VideoEncoderBackend, caps: &GpuCaps) -> bool {

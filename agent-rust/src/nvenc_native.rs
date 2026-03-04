@@ -8,9 +8,9 @@ mod imp {
     use nvenc::session::{InitParams, NeedsConfig, Session};
     use nvenc::sys::enums::{NVencBufferFormat, NVencPicStruct, NVencPicType, NVencTuningInfo};
     use nvenc::sys::guids::{
-        NV_ENC_CODEC_H264_GUID, NV_ENC_PRESET_P1_GUID, NV_ENC_PRESET_P2_GUID,
-        NV_ENC_PRESET_P3_GUID, NV_ENC_PRESET_P4_GUID, NV_ENC_PRESET_P5_GUID, NV_ENC_PRESET_P6_GUID,
-        NV_ENC_PRESET_P7_GUID,
+        NV_ENC_CODEC_AV1_GUID, NV_ENC_CODEC_H264_GUID, NV_ENC_CODEC_HEVC_GUID,
+        NV_ENC_PRESET_P1_GUID, NV_ENC_PRESET_P2_GUID, NV_ENC_PRESET_P3_GUID, NV_ENC_PRESET_P4_GUID,
+        NV_ENC_PRESET_P5_GUID, NV_ENC_PRESET_P6_GUID, NV_ENC_PRESET_P7_GUID,
     };
     use std::collections::VecDeque;
     use windows::Win32::Foundation::HMODULE;
@@ -297,12 +297,14 @@ mod imp {
             let video_context: ID3D11VideoContext =
                 context.cast().context("cast ID3D11VideoContext failed")?;
 
+            let codec_kind = selected_codec_kind();
+            let codec_guid = codec_guid(codec_kind);
             let session: Session<NeedsConfig> =
                 Session::open_dx(&device).map_err(|e| anyhow!("NVENC open_dx failed: {e:?}"))?;
             let preset_guid = preset_guid(&cfg.encoder_preset);
             let (session, mut preset) = session
                 .get_encode_preset_config_ex(
-                    NV_ENC_CODEC_H264_GUID,
+                    codec_guid.clone(),
                     preset_guid.clone(),
                     tuning_from_cfg(cfg),
                 )
@@ -314,7 +316,7 @@ mod imp {
             preset.preset_cfg.gop_len = cfg.gop.max(1);
 
             let init = InitParams {
-                encode_guid: NV_ENC_CODEC_H264_GUID,
+                encode_guid: codec_guid,
                 preset_guid,
                 resolution: [width.max(2), height.max(2)],
                 aspect_ratio: [width.max(2), height.max(2)],
@@ -452,7 +454,7 @@ mod imp {
                     self.stats.consecutive_failures = 0;
                     self.stats.health_check_last = capture_start_us;
                     return Ok(Some(NativeEncodeResult {
-                        bytes: normalize_h264_au(bytes),
+                        bytes: normalize_bitstream_by_codec(selected_codec_kind(), bytes),
                         path: NativeEncodePath::DirectTexture,
                         capture_start_us,
                     }));
@@ -477,7 +479,7 @@ mod imp {
             drop(frame);
             self.frame_idx = frame_idx.saturating_add(1);
             Ok(Some(NativeEncodeResult {
-                bytes: normalize_h264_au(bytes),
+                bytes: normalize_bitstream_by_codec(selected_codec_kind(), bytes),
                 path,
                 capture_start_us,
             }))
@@ -695,6 +697,8 @@ mod imp {
             height: u32,
             cfg: &agent_rust::CaptureConfig,
         ) -> Result<Self> {
+            let codec_kind = selected_codec_kind();
+            let codec_guid = codec_guid(codec_kind);
             let fps = cfg.fps.max(1);
             let video_device: ID3D11VideoDevice =
                 device.cast().context("cast ID3D11VideoDevice failed")?;
@@ -706,7 +710,7 @@ mod imp {
             let preset_guid = preset_guid(&cfg.encoder_preset);
             let (session, mut preset) = session
                 .get_encode_preset_config_ex(
-                    NV_ENC_CODEC_H264_GUID,
+                    codec_guid.clone(),
                     preset_guid.clone(),
                     tuning_from_cfg(cfg),
                 )
@@ -720,7 +724,7 @@ mod imp {
             let target_width = width.max(2);
             let target_height = height.max(2);
             let init = InitParams {
-                encode_guid: NV_ENC_CODEC_H264_GUID,
+                encode_guid: codec_guid,
                 preset_guid,
                 resolution: [target_width, target_height],
                 aspect_ratio: [target_width, target_height],
@@ -838,7 +842,7 @@ mod imp {
                     self.frame_idx = frame_idx.saturating_add(1);
                     self.stats.direct_frames = self.stats.direct_frames.saturating_add(1);
                     return Ok(Some(NativeEncodeResult {
-                        bytes: normalize_h264_au(bytes),
+                        bytes: normalize_bitstream_by_codec(selected_codec_kind(), bytes),
                         path: NativeEncodePath::DirectTexture,
                         capture_start_us: 0,
                     }));
@@ -862,7 +866,7 @@ mod imp {
             )?;
             self.frame_idx = frame_idx.saturating_add(1);
             Ok(Some(NativeEncodeResult {
-                bytes: normalize_h264_au(bytes),
+                bytes: normalize_bitstream_by_codec(selected_codec_kind(), bytes),
                 path,
                 capture_start_us: 0,
             }))
@@ -1181,9 +1185,45 @@ mod imp {
         }
     }
 
-    fn normalize_h264_au(buf: Vec<u8>) -> Vec<u8> {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum NvencCodecKind {
+        H264,
+        Hevc,
+        Av1,
+    }
+
+    fn selected_codec_kind() -> NvencCodecKind {
+        match std::env::var("AGENT_VIDEO_CODEC_EFFECTIVE")
+            .ok()
+            .unwrap_or_else(|| "h264".to_string())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "hevc" | "h265" => NvencCodecKind::Hevc,
+            "av1" => NvencCodecKind::Av1,
+            _ => NvencCodecKind::H264,
+        }
+    }
+
+    fn codec_guid(codec: NvencCodecKind) -> nvenc::sys::structs::Guid {
+        match codec {
+            NvencCodecKind::H264 => NV_ENC_CODEC_H264_GUID,
+            NvencCodecKind::Hevc => NV_ENC_CODEC_HEVC_GUID,
+            NvencCodecKind::Av1 => NV_ENC_CODEC_AV1_GUID,
+        }
+    }
+
+    fn normalize_bitstream_by_codec(codec: NvencCodecKind, buf: Vec<u8>) -> Vec<u8> {
+        match codec {
+            NvencCodecKind::Av1 => buf,
+            NvencCodecKind::H264 | NvencCodecKind::Hevc => normalize_annexb_au(buf),
+        }
+    }
+
+    fn normalize_annexb_au(buf: Vec<u8>) -> Vec<u8> {
         // Native NVENC bitstream format can vary by driver/runtime.
-        // WebRTC H264 sender expects AnnexB access units.
+        // H264/HEVC senders prefer AnnexB access units.
         if looks_like_annexb(&buf) {
             return buf;
         }

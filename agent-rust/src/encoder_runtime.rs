@@ -13,12 +13,53 @@ pub enum RuntimeVideoEncoder {
     HwFfmpeg {
         backend: VideoEncoderBackend,
         fps: u32,
+        transport_hint: String,
         ffmpeg_bin: String,
         ffmpeg_cfg: agent_rust::CaptureConfig,
         applied_bitrate_kbps: u32,
         pipe: Option<FfmpegPipeEncoder>,
         wh: Option<(u32, u32)>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EffectiveVideoCodec {
+    H264,
+    Hevc,
+    Av1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EffectiveTransportHint {
+    WebRtc,
+    QuicLike,
+    Unknown,
+}
+
+impl EffectiveTransportHint {
+    fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "webrtc" => EffectiveTransportHint::WebRtc,
+            "quic" | "webtransport" => EffectiveTransportHint::QuicLike,
+            _ => EffectiveTransportHint::Unknown,
+        }
+    }
+}
+
+impl EffectiveVideoCodec {
+    fn from_env() -> Self {
+        match std::env::var("AGENT_VIDEO_CODEC_EFFECTIVE")
+            .ok()
+            .unwrap_or_else(|| "h264".to_string())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "hevc" | "h265" => EffectiveVideoCodec::Hevc,
+            "av1" => EffectiveVideoCodec::Av1,
+            _ => EffectiveVideoCodec::H264,
+        }
+    }
 }
 
 pub struct FfmpegPipeEncoder {
@@ -48,14 +89,17 @@ pub fn build_video_encoder(
     cfg: &agent_rust::CaptureConfig,
     backend: VideoEncoderBackend,
     allow_fallback: bool,
+    transport_hint: &str,
 ) -> Result<RuntimeVideoEncoder> {
-    if let Some(codec) = ffmpeg_codec_name(backend) {
+    let selected_codec = EffectiveVideoCodec::from_env();
+    if let Some(codec) = ffmpeg_codec_name(backend, selected_codec) {
         let ffmpeg_bin = resolve_ffmpeg_bin();
         match probe_ffmpeg_encoder(&ffmpeg_bin, codec) {
             Ok(()) => {
                 return Ok(RuntimeVideoEncoder::HwFfmpeg {
                     backend,
                     fps,
+                    transport_hint: transport_hint.to_string(),
                     ffmpeg_bin,
                     ffmpeg_cfg: cfg.clone(),
                     applied_bitrate_kbps: cfg.bitrate_kbps.max(100),
@@ -107,6 +151,7 @@ pub fn encode_rgba_frame(
         RuntimeVideoEncoder::HwFfmpeg {
             backend,
             fps,
+            transport_hint,
             ffmpeg_bin,
             ffmpeg_cfg,
             applied_bitrate_kbps,
@@ -125,7 +170,13 @@ pub fn encode_rgba_frame(
             }
             if pipe.is_none() || wh != &Some((width, height)) {
                 *pipe = Some(start_ffmpeg_pipe(
-                    *backend, *fps, ffmpeg_bin, ffmpeg_cfg, width, height,
+                    *backend,
+                    *fps,
+                    transport_hint,
+                    ffmpeg_bin,
+                    ffmpeg_cfg,
+                    width,
+                    height,
                 )?);
                 *wh = Some((width, height));
             }
@@ -136,8 +187,20 @@ pub fn encode_rgba_frame(
             {
                 Ok(v) => Ok(v),
                 Err(e) => {
+                    tracing::warn!(
+                        backend = backend.as_str(),
+                        transport = transport_hint,
+                        error = %e,
+                        "ffmpeg_pipe_restart reason=encode_error"
+                    );
                     *pipe = Some(start_ffmpeg_pipe(
-                        *backend, *fps, ffmpeg_bin, ffmpeg_cfg, width, height,
+                        *backend,
+                        *fps,
+                        transport_hint,
+                        ffmpeg_bin,
+                        ffmpeg_cfg,
+                        width,
+                        height,
                     )?);
                     pipe.as_mut()
                         .expect("pipe initialized after restart")
@@ -152,12 +215,16 @@ pub fn encode_rgba_frame(
 fn start_ffmpeg_pipe(
     backend: VideoEncoderBackend,
     fps: u32,
+    transport_hint_raw: &str,
     ffmpeg_bin: &str,
     cfg: &agent_rust::CaptureConfig,
     width: u32,
     height: u32,
 ) -> Result<FfmpegPipeEncoder> {
-    let codec = ffmpeg_codec_name(backend).ok_or_else(|| anyhow!("not a ffmpeg hw backend"))?;
+    let selected_codec = EffectiveVideoCodec::from_env();
+    let transport_hint = EffectiveTransportHint::parse(transport_hint_raw);
+    let codec =
+        ffmpeg_codec_name(backend, selected_codec).ok_or_else(|| anyhow!("not a ffmpeg hw backend"))?;
     let size = format!("{width}x{height}");
     let fps_s = fps.to_string();
 
@@ -202,12 +269,44 @@ fn start_ffmpeg_pipe(
             "{}k",
             (cfg.max_bitrate_kbps.max(cfg.bitrate_kbps.max(100)) * 2)
         ),
-        "-bsf:v".to_string(),
-        "h264_metadata=aud=insert".to_string(),
-        "-f".to_string(),
-        "h264".to_string(),
-        "-".to_string(),
     ];
+    if backend == VideoEncoderBackend::Nvenc {
+        apply_nvenc_transport_template(&mut args, cfg, selected_codec, transport_hint);
+    }
+    let roi_requested = std::env::var("AGENT_ROI_ENABLE")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let roi_filter = ffmpeg_roi_filter_expr(width, height);
+    if let Some(vf) = roi_filter.as_ref() {
+        args.push("-vf".to_string());
+        args.push(vf.clone());
+    }
+    match selected_codec {
+        EffectiveVideoCodec::H264 => {
+            args.push("-bsf:v".to_string());
+            args.push("h264_metadata=aud=insert".to_string());
+            args.push("-f".to_string());
+            args.push("h264".to_string());
+        }
+        EffectiveVideoCodec::Hevc => {
+            args.push("-f".to_string());
+            args.push("hevc".to_string());
+        }
+        EffectiveVideoCodec::Av1 => {
+            args.push("-f".to_string());
+            args.push("obu".to_string());
+        }
+    }
+    args.push("-".to_string());
+    tracing::info!(
+        backend = backend.as_str(),
+        codec = codec,
+        transport = transport_hint_raw,
+        roi_requested,
+        roi_applied = roi_filter.is_some(),
+        "ffmpeg_pipe_start"
+    );
     let mut cmd = Command::new(ffmpeg_bin);
     cmd.args(args.drain(..));
     cmd.stdin(std::process::Stdio::piped());
@@ -261,6 +360,46 @@ fn start_ffmpeg_pipe(
         stream_buf: Vec::with_capacity(256 * 1024),
         poll_wait_ms: (1000_u64 / fps.max(1) as u64).clamp(1, 8),
     })
+}
+
+fn apply_nvenc_transport_template(
+    args: &mut Vec<String>,
+    cfg: &agent_rust::CaptureConfig,
+    codec: EffectiveVideoCodec,
+    transport: EffectiveTransportHint,
+) {
+    if transport == EffectiveTransportHint::Unknown {
+        return;
+    }
+    let ll_enable = std::env::var("AGENT_NVENC_LL_TEMPLATE_ENABLE")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(true);
+    if !ll_enable {
+        return;
+    }
+    let strict_quic_like = matches!(transport, EffectiveTransportHint::QuicLike);
+    if strict_quic_like {
+        args.push("-preset".to_string());
+        args.push("p1".to_string());
+        args.push("-tune".to_string());
+        args.push("ll".to_string());
+        args.push("-rc".to_string());
+        args.push("cbr".to_string());
+        args.push("-rc-lookahead".to_string());
+        args.push("0".to_string());
+        args.push("-zerolatency".to_string());
+        args.push("1".to_string());
+        args.push("-bf".to_string());
+        args.push("0".to_string());
+    }
+    // Keep AV1/HEVC GOP bounded for low-tail latency transports.
+    if strict_quic_like && (codec == EffectiveVideoCodec::Hevc || codec == EffectiveVideoCodec::Av1)
+    {
+        let max_gop = cfg.fps.max(1) * 2;
+        args.push("-g".to_string());
+        args.push(cfg.gop.max(1).min(max_gop).to_string());
+    }
 }
 
 impl FfmpegPipeEncoder {
@@ -358,12 +497,112 @@ fn probe_ffmpeg_encoder(ffmpeg_bin: &str, codec: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn ffmpeg_codec_name(backend: VideoEncoderBackend) -> Option<&'static str> {
+fn ffmpeg_codec_name(
+    backend: VideoEncoderBackend,
+    codec: EffectiveVideoCodec,
+) -> Option<&'static str> {
     match backend {
-        VideoEncoderBackend::Nvenc => Some("h264_nvenc"),
-        VideoEncoderBackend::Qsv => Some("h264_qsv"),
-        VideoEncoderBackend::Amf => Some("h264_amf"),
+        VideoEncoderBackend::Nvenc => match codec {
+            EffectiveVideoCodec::H264 => Some("h264_nvenc"),
+            EffectiveVideoCodec::Hevc => Some("hevc_nvenc"),
+            EffectiveVideoCodec::Av1 => Some("av1_nvenc"),
+        },
+        VideoEncoderBackend::Qsv => match codec {
+            EffectiveVideoCodec::H264 => Some("h264_qsv"),
+            EffectiveVideoCodec::Hevc => Some("hevc_qsv"),
+            EffectiveVideoCodec::Av1 => Some("av1_qsv"),
+        },
+        VideoEncoderBackend::Amf => match codec {
+            EffectiveVideoCodec::H264 => Some("h264_amf"),
+            EffectiveVideoCodec::Hevc => Some("hevc_amf"),
+            EffectiveVideoCodec::Av1 => Some("av1_amf"),
+        },
         VideoEncoderBackend::OpenH264 => None,
+    }
+}
+
+fn ffmpeg_roi_filter_expr(width: u32, height: u32) -> Option<String> {
+    let enabled = std::env::var("AGENT_ROI_ENABLE")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+    let rect = std::env::var("AGENT_ROI_RECT").ok()?;
+    let parts: Vec<&str> = rect.split(',').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let x_raw = parts.first()?.trim().parse::<f64>().ok()?;
+    let y_raw = parts.get(1)?.trim().parse::<f64>().ok()?;
+    let w_raw = parts.get(2)?.trim().parse::<f64>().ok()?;
+    let h_raw = parts.get(3)?.trim().parse::<f64>().ok()?;
+    if !x_raw.is_finite() || !y_raw.is_finite() || !w_raw.is_finite() || !h_raw.is_finite() {
+        return None;
+    }
+    // Accept both normalized rect (0..1) and absolute pixel rect.
+    let normalized = x_raw <= 1.0 && y_raw <= 1.0 && w_raw <= 1.0 && h_raw <= 1.0;
+    let (x, y, w, h) = if normalized {
+        (
+            (x_raw.max(0.0) * width as f64).round() as u32,
+            (y_raw.max(0.0) * height as f64).round() as u32,
+            (w_raw.max(0.0) * width as f64).round() as u32,
+            (h_raw.max(0.0) * height as f64).round() as u32,
+        )
+    } else {
+        (
+            x_raw.max(0.0).round() as u32,
+            y_raw.max(0.0).round() as u32,
+            w_raw.max(0.0).round() as u32,
+            h_raw.max(0.0).round() as u32,
+        )
+    };
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let nx = (x.min(width.saturating_sub(1)) as f64) / (width as f64);
+    let ny = (y.min(height.saturating_sub(1)) as f64) / (height as f64);
+    let nw = (w.min(width.saturating_sub(x).max(1)) as f64) / (width as f64);
+    let nh = (h.min(height.saturating_sub(y).max(1)) as f64) / (height as f64);
+    let area = nw * nh;
+    let min_area = std::env::var("AGENT_ROI_MIN_AREA_PCT")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0);
+    if area <= min_area {
+        return None;
+    }
+    // Full-frame ROI is effectively no-op and adds filter overhead.
+    if nw >= 0.995 && nh >= 0.995 {
+        return None;
+    }
+    let qoffset = std::env::var("AGENT_ROI_QOFFSET")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or_else(|| {
+            let boost = std::env::var("AGENT_ROI_BOOST_PCT")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(15.0)
+                .clamp(0.0, 200.0);
+            -(boost / 250.0).clamp(0.0, 0.8)
+        })
+        .clamp(-1.0, 1.0);
+    let base = format!("addroi=x={nx:.6}:y={ny:.6}:w={nw:.6}:h={nh:.6}:qoffset={qoffset:.3}");
+    let frame_interval = std::env::var("AGENT_ROI_FRAME_INTERVAL")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(1)
+        .clamp(1, 120);
+    if frame_interval <= 1 {
+        Some(base)
+    } else {
+        Some(format!("{base}:enable=not(mod(n\\,{frame_interval}))"))
     }
 }
 
@@ -518,22 +757,39 @@ impl<'a> BitReader<'a> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn ffmpeg_codec_mapping_is_correct() {
         assert_eq!(
-            ffmpeg_codec_name(VideoEncoderBackend::Nvenc),
+            ffmpeg_codec_name(VideoEncoderBackend::Nvenc, EffectiveVideoCodec::H264),
             Some("h264_nvenc")
         );
         assert_eq!(
-            ffmpeg_codec_name(VideoEncoderBackend::Qsv),
+            ffmpeg_codec_name(VideoEncoderBackend::Nvenc, EffectiveVideoCodec::Hevc),
+            Some("hevc_nvenc")
+        );
+        assert_eq!(
+            ffmpeg_codec_name(VideoEncoderBackend::Nvenc, EffectiveVideoCodec::Av1),
+            Some("av1_nvenc")
+        );
+        assert_eq!(
+            ffmpeg_codec_name(VideoEncoderBackend::Qsv, EffectiveVideoCodec::H264),
             Some("h264_qsv")
         );
         assert_eq!(
-            ffmpeg_codec_name(VideoEncoderBackend::Amf),
+            ffmpeg_codec_name(VideoEncoderBackend::Amf, EffectiveVideoCodec::H264),
             Some("h264_amf")
         );
-        assert_eq!(ffmpeg_codec_name(VideoEncoderBackend::OpenH264), None);
+        assert_eq!(
+            ffmpeg_codec_name(VideoEncoderBackend::OpenH264, EffectiveVideoCodec::H264),
+            None
+        );
     }
 
     #[test]
@@ -572,5 +828,37 @@ mod tests {
         assert_eq!(got_canon, expect_canon);
 
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn roi_expr_accepts_normalized_rect() {
+        let _guard = env_lock().lock().expect("env lock");
+        unsafe {
+            std::env::set_var("AGENT_ROI_ENABLE", "1");
+            std::env::set_var("AGENT_ROI_RECT", "0.25,0.25,0.5,0.5");
+            std::env::set_var("AGENT_ROI_QOFFSET", "-0.2");
+        }
+        let vf = ffmpeg_roi_filter_expr(1920, 1080);
+        assert!(vf.is_some());
+        unsafe {
+            std::env::remove_var("AGENT_ROI_ENABLE");
+            std::env::remove_var("AGENT_ROI_RECT");
+            std::env::remove_var("AGENT_ROI_QOFFSET");
+        }
+    }
+
+    #[test]
+    fn roi_expr_skips_full_frame_rect() {
+        let _guard = env_lock().lock().expect("env lock");
+        unsafe {
+            std::env::set_var("AGENT_ROI_ENABLE", "1");
+            std::env::set_var("AGENT_ROI_RECT", "0,0,1,1");
+        }
+        let vf = ffmpeg_roi_filter_expr(1280, 720);
+        assert!(vf.is_none());
+        unsafe {
+            std::env::remove_var("AGENT_ROI_ENABLE");
+            std::env::remove_var("AGENT_ROI_RECT");
+        }
     }
 }

@@ -32,6 +32,22 @@ cd J:\ProjectTest\remote-desktop\mini-remote-desktop
 python .\tests\python-core-transport\run_core_transport_suite.py
 ```
 
+## HEVC/AV1 + ROI matrix
+
+Run codec/ROI matrix on core transports (includes WebRTC and WebTransport):
+
+```powershell
+cd J:\ProjectTest\remote-desktop\mini-remote-desktop
+python .\tests\python-core-transport\run_codec_roi_matrix.py
+```
+
+Direct single-suite run with forced codec/ROI and native ROI probe switch:
+
+```powershell
+cd J:\ProjectTest\remote-desktop\mini-remote-desktop
+python .\tests\python-core-transport\run_core_transport_suite.py --transports webtransport --codec av1 --roi-enable --native-roi-probe
+```
+
 ## Output
 
 A timestamped folder is created under `mini-remote-desktop/logs/`, containing:

@@ -113,6 +113,31 @@ impl SessionTransport {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VideoCodec {
+    H264,
+    Hevc,
+    Av1,
+}
+
+impl VideoCodec {
+    fn parse(raw: Option<&str>) -> Self {
+        match raw.unwrap_or("h264").trim().to_ascii_lowercase().as_str() {
+            "hevc" | "h265" => VideoCodec::Hevc,
+            "av1" => VideoCodec::Av1,
+            _ => VideoCodec::H264,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            VideoCodec::H264 => "h264",
+            VideoCodec::Hevc => "hevc",
+            VideoCodec::Av1 => "av1",
+        }
+    }
+}
+
 fn parse_transport_priority(raw: &str) -> Vec<SessionTransport> {
     raw.split(',')
         .filter_map(|s| match s.trim().to_ascii_lowercase().as_str() {
@@ -122,6 +147,63 @@ fn parse_transport_priority(raw: &str) -> Vec<SessionTransport> {
             _ => None,
         })
         .collect()
+}
+
+fn parse_codec_priority(raw: &str) -> Vec<VideoCodec> {
+    raw.split(',')
+        .filter_map(|s| {
+            let codec = VideoCodec::parse(Some(s.trim()));
+            if s.trim().is_empty() {
+                None
+            } else {
+                Some(codec)
+            }
+        })
+        .collect()
+}
+
+fn controller_supports_codec(controller_caps: &Value, codec: VideoCodec) -> bool {
+    let wanted = codec.as_str();
+    let Some(codecs) = controller_caps.get("codecs").and_then(|v| v.as_array()) else {
+        return codec == VideoCodec::H264;
+    };
+    if codecs.is_empty() {
+        return codec == VideoCodec::H264;
+    }
+    codecs
+        .iter()
+        .filter_map(|v| v.as_str())
+        .any(|v| v.eq_ignore_ascii_case(wanted))
+}
+
+fn select_codec_by_strategy(selected_transport: SessionTransport, controller_caps: &Value) -> VideoCodec {
+    let force = std::env::var("AGENT_CODEC_FORCE")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(|v| VideoCodec::parse(Some(v.as_str())));
+    if let Some(codec) = force {
+        if selected_transport == SessionTransport::WebRtc && codec != VideoCodec::H264 {
+            return VideoCodec::H264;
+        }
+        return codec;
+    }
+    let priority_raw = std::env::var("AGENT_CODEC_PRIORITY")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "av1,hevc,h264".to_string());
+    let mut priority = parse_codec_priority(&priority_raw);
+    if priority.is_empty() {
+        priority = vec![VideoCodec::H264];
+    }
+    if selected_transport == SessionTransport::WebRtc {
+        return VideoCodec::H264;
+    }
+    for codec in priority {
+        if controller_supports_codec(controller_caps, codec) {
+            return codec;
+        }
+    }
+    VideoCodec::H264
 }
 
 fn transport_allowed_by_env(transport: SessionTransport) -> bool {
@@ -296,6 +378,24 @@ fn shared_pipeline_enabled() -> bool {
         .unwrap_or(true)
 }
 
+fn roi_map_requested() -> bool {
+    std::env::var("AGENT_ROI_ENABLE")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+        && std::env::var("AGENT_ROI_RECT")
+            .ok()
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+}
+
+fn nvenc_native_roi_enabled() -> bool {
+    std::env::var("AGENT_NVENC_NATIVE_ROI_ENABLE")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 fn get_or_start_shared_encoded_hub(
     effective_cfg: &agent_rust::CaptureConfig,
     backend: CaptureBackend,
@@ -337,7 +437,17 @@ fn get_or_start_shared_encoded_hub(
             probe_interval_ms,
             "shared pipeline loop started"
         );
-        if encoder_backend == VideoEncoderBackend::Nvenc && backend == CaptureBackend::Dxgi {
+        let roi_requested = roi_map_requested();
+        let native_roi = nvenc_native_roi_enabled();
+        if roi_requested && !native_roi {
+            info!(
+                "shared pipeline: ROI map requested, using ffmpeg nvenc path (native nvenc ROI map disabled)"
+            );
+        }
+        if encoder_backend == VideoEncoderBackend::Nvenc
+            && backend == CaptureBackend::Dxgi
+            && (!roi_requested || native_roi)
+        {
             let (input_w, input_h) = match detect_input_resolution() {
                 Ok(v) => v,
                 Err(e) => {
@@ -463,7 +573,10 @@ fn get_or_start_shared_encoded_hub(
             }
         }
 
-        if encoder_backend == VideoEncoderBackend::Nvenc && backend == CaptureBackend::Wgc {
+        if encoder_backend == VideoEncoderBackend::Nvenc
+            && backend == CaptureBackend::Wgc
+            && (!roi_requested || native_roi)
+        {
             #[cfg(windows)]
             {
                 if let Ok(mut wgc) = WgcWindowCapturer::new() {
@@ -620,13 +733,14 @@ fn get_or_start_shared_encoded_hub(
                 return;
             }
         };
-        let mut encoder = match build_video_encoder(initial_fps, &cfg, encoder_backend, true) {
+        let mut encoder =
+            match build_video_encoder(initial_fps, &cfg, encoder_backend, true, "quic") {
             Ok(v) => v,
             Err(e) => {
                 error!(error = %e, "shared pipeline encoder initialization failed");
                 return;
             }
-        };
+            };
         let mut next_tick = Instant::now();
         let mut probe_last = Instant::now();
         let mut probe_frames: u64 = 0;
@@ -950,7 +1064,7 @@ async fn main() -> Result<()> {
                     "capabilities": {
                         "protocols": ["webrtc", "quic", "webtransport"],
                         "platforms": ["windows"],
-                        "codecs": ["h264"],
+                        "codecs": ["h264", "hevc", "av1"],
                         "features": ["multi-end-compat", "capability-negotiation", "transport-failover"]
                     }
                 }
@@ -1028,9 +1142,14 @@ async fn main() -> Result<()> {
             };
             let selected_transport =
                 select_transport_by_strategy(requested_transport, &controller_caps, concurrent_clients);
+            let selected_codec = select_codec_by_strategy(selected_transport, &controller_caps);
+            unsafe {
+                std::env::set_var("AGENT_VIDEO_CODEC_EFFECTIVE", selected_codec.as_str());
+            }
             info!(
                 requested_transport = requested_transport.as_str(),
                 selected_transport = selected_transport.as_str(),
+                selected_codec = selected_codec.as_str(),
                 concurrent_clients,
                 controller_caps = %controller_caps,
                 "session transport negotiated"
@@ -1104,6 +1223,7 @@ async fn main() -> Result<()> {
                     "answer": { "type": offer_type.replace("offer", "answer"), "sdp": answer.sdp },
                     "controllerId": controller_id.clone(),
                     "selectedTransport": selected_transport.as_str(),
+                    "selectedCodec": selected_codec.as_str(),
                     "quic": quic_advert.as_ref().map(|q| json!({
                         "addr": q.addr,
                         "serverName": q.server_name,
@@ -1113,7 +1233,7 @@ async fn main() -> Result<()> {
                     "agentCapabilities": {
                         "protocols": ["webrtc", "quic", "webtransport"],
                         "platforms": ["windows"],
-                        "codecs": ["h264"],
+                        "codecs": ["h264", "hevc", "av1"],
                         "features": ["multi-end-compat", "capability-negotiation", "transport-failover"]
                     }
                 }
@@ -1434,6 +1554,115 @@ async fn apply_capture_patch(
             }
         }
     }
+    if let Some(codec) = patch.get("codecPolicy").and_then(|v| v.as_object()) {
+        if let Some(v) = codec.get("force").and_then(|v| v.as_str()) {
+            let c = VideoCodec::parse(Some(v));
+            unsafe {
+                std::env::set_var("AGENT_CODEC_FORCE", c.as_str());
+            }
+        }
+        if let Some(v) = codec.get("priority").and_then(|v| v.as_str()) {
+            let normalized = parse_codec_priority(v)
+                .into_iter()
+                .map(VideoCodec::as_str)
+                .collect::<Vec<_>>()
+                .join(",");
+            if !normalized.is_empty() {
+                unsafe {
+                    std::env::set_var("AGENT_CODEC_PRIORITY", normalized);
+                }
+            }
+        }
+    }
+    if let Some(qp) = patch.get("qualityPolicy").and_then(|v| v.as_object()) {
+        if let Some(vbv) = qp.get("dynamicVbv").and_then(|v| v.as_object()) {
+            if let Some(v) = vbv.get("enable").and_then(|v| v.as_bool()) {
+                unsafe {
+                    std::env::set_var("AGENT_DYNAMIC_VBV_ENABLE", if v { "1" } else { "0" });
+                }
+            }
+            if let Some(v) = vbv.get("minKbps").and_then(|v| v.as_u64()) {
+                unsafe {
+                    std::env::set_var("AGENT_DYNAMIC_VBV_MIN_KBPS", v.clamp(100, 300_000).to_string());
+                }
+            }
+            if let Some(v) = vbv.get("maxKbps").and_then(|v| v.as_u64()) {
+                unsafe {
+                    std::env::set_var("AGENT_DYNAMIC_VBV_MAX_KBPS", v.clamp(100, 500_000).to_string());
+                }
+            }
+        }
+        if let Some(roi) = qp.get("roi").and_then(|v| v.as_object()) {
+            if let Some(v) = roi.get("enable").and_then(|v| v.as_bool()) {
+                unsafe {
+                    std::env::set_var("AGENT_ROI_ENABLE", if v { "1" } else { "0" });
+                }
+            }
+            if let Some(v) = roi.get("boostPct").and_then(|v| v.as_u64()) {
+                unsafe {
+                    std::env::set_var("AGENT_ROI_BOOST_PCT", v.clamp(0, 200).to_string());
+                }
+            }
+            if let Some(rect) = roi.get("rect").and_then(|v| v.as_object()) {
+                let num = |k: &str| -> Option<f64> {
+                    let v = rect.get(k)?;
+                    v.as_f64()
+                        .or_else(|| v.as_i64().map(|x| x as f64))
+                        .or_else(|| v.as_u64().map(|x| x as f64))
+                };
+                let x = num("x").unwrap_or(0.0).max(0.0);
+                let y = num("y").unwrap_or(0.0).max(0.0);
+                let w = num("w").unwrap_or(0.0);
+                let h = num("h").unwrap_or(0.0);
+                if w > 0.0 && h > 0.0 {
+                    unsafe {
+                        std::env::set_var(
+                            "AGENT_ROI_RECT",
+                            format!("{x:.6},{y:.6},{w:.6},{h:.6}"),
+                        );
+                    }
+                }
+            }
+            if let Some(v) = roi.get("qoffset").and_then(|v| v.as_f64()) {
+                let q = v.clamp(-1.0, 1.0);
+                unsafe {
+                    std::env::set_var("AGENT_ROI_QOFFSET", format!("{q:.3}"));
+                }
+            }
+            if let Some(v) = roi.get("frameInterval").and_then(|v| v.as_u64()) {
+                unsafe {
+                    std::env::set_var("AGENT_ROI_FRAME_INTERVAL", v.clamp(1, 120).to_string());
+                }
+            }
+            if let Some(v) = roi.get("minAreaPct").and_then(|v| v.as_f64()) {
+                unsafe {
+                    std::env::set_var("AGENT_ROI_MIN_AREA_PCT", format!("{:.4}", v.clamp(0.0, 1.0)));
+                }
+            }
+        }
+        if let Some(content) = qp.get("content").and_then(|v| v.as_object()) {
+            if let Some(mode) = content.get("mode").and_then(|v| v.as_str()) {
+                let m = mode.trim().to_ascii_lowercase();
+                if matches!(m.as_str(), "auto" | "text" | "video") {
+                    unsafe {
+                        std::env::set_var("AGENT_CONTENT_MODE", m);
+                    }
+                }
+            }
+        }
+        if let Some(vbv) = qp.get("dynamicVbv").and_then(|v| v.as_object()) {
+            if let Some(v) = vbv.get("strict").and_then(|v| v.as_bool()) {
+                unsafe {
+                    std::env::set_var("AGENT_DYNAMIC_VBV_STRICT_ENABLE", if v { "1" } else { "0" });
+                }
+            }
+            if let Some(v) = vbv.get("headroomPct").and_then(|v| v.as_u64()) {
+                unsafe {
+                    std::env::set_var("AGENT_DYNAMIC_VBV_STRICT_HEADROOM_PCT", v.clamp(0, 50).to_string());
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1553,6 +1782,158 @@ fn apply_multi_client_adaptation(cfg: &mut agent_rust::CaptureConfig, concurrent
         fair_mode,
         strict_gpu_direct = cfg.strict_gpu_direct,
         "applied multi-client adaptation profile"
+    );
+}
+
+fn apply_dynamic_vbv_and_roi_policy(cfg: &mut agent_rust::CaptureConfig) {
+    let vbv_enable = std::env::var("AGENT_DYNAMIC_VBV_ENABLE")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if vbv_enable {
+        let vbv_min = std::env::var("AGENT_DYNAMIC_VBV_MIN_KBPS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(cfg.network_adapt_floor_bitrate_kbps.max(100))
+            .clamp(100, 300_000);
+        let vbv_max = std::env::var("AGENT_DYNAMIC_VBV_MAX_KBPS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(cfg.network_adapt_ceiling_bitrate_kbps.max(vbv_min))
+            .clamp(vbv_min, 500_000);
+        cfg.network_adapt_floor_bitrate_kbps = vbv_min;
+        cfg.network_adapt_ceiling_bitrate_kbps = vbv_max;
+        cfg.bitrate_kbps = cfg.bitrate_kbps.clamp(vbv_min, vbv_max);
+        cfg.max_bitrate_kbps = cfg.max_bitrate_kbps.clamp(vbv_min, vbv_max).max(cfg.bitrate_kbps);
+        let strict = std::env::var("AGENT_DYNAMIC_VBV_STRICT_ENABLE")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if strict {
+            let headroom = std::env::var("AGENT_DYNAMIC_VBV_STRICT_HEADROOM_PCT")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(10)
+                .clamp(0, 50);
+            let strict_max = cfg
+                .bitrate_kbps
+                .saturating_mul(100 + headroom)
+                .saturating_div(100)
+                .max(cfg.bitrate_kbps);
+            cfg.network_adapt_ceiling_bitrate_kbps = strict_max;
+            cfg.max_bitrate_kbps = cfg.max_bitrate_kbps.min(strict_max).max(cfg.bitrate_kbps);
+        }
+    }
+
+    let roi_enable = std::env::var("AGENT_ROI_ENABLE")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if roi_enable {
+        let boost_pct = std::env::var("AGENT_ROI_BOOST_PCT")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(15)
+            .clamp(0, 200);
+        if boost_pct > 0 {
+            let boosted = cfg
+                .bitrate_kbps
+                .saturating_mul(100 + boost_pct)
+                .saturating_div(100)
+                .clamp(100, cfg.max_bitrate_kbps.max(100));
+            cfg.bitrate_kbps = boosted;
+            cfg.max_bitrate_kbps = cfg.max_bitrate_kbps.max(boosted);
+        }
+    }
+    let content_mode = std::env::var("AGENT_CONTENT_MODE")
+        .ok()
+        .unwrap_or_else(|| "auto".to_string())
+        .to_ascii_lowercase();
+    match content_mode.as_str() {
+        "text" => {
+            let new_fps = cfg.fps.saturating_mul(85).saturating_div(100).max(cfg.min_fps.max(12));
+            cfg.fps = new_fps.min(cfg.max_fps.max(1));
+            cfg.bitrate_kbps = cfg
+                .bitrate_kbps
+                .saturating_mul(110)
+                .saturating_div(100)
+                .min(cfg.max_bitrate_kbps.max(100));
+            cfg.encoder_tune = "hq".to_string();
+        }
+        "video" => {
+            let new_fps = cfg.fps.saturating_mul(115).saturating_div(100).max(cfg.min_fps.max(24));
+            cfg.fps = new_fps.min(cfg.max_fps.max(1));
+            cfg.bitrate_kbps = cfg
+                .bitrate_kbps
+                .saturating_mul(95)
+                .saturating_div(100)
+                .max(cfg.network_adapt_floor_bitrate_kbps.max(100));
+            if cfg.encoder_tune == "balanced" {
+                cfg.encoder_tune = "ll".to_string();
+            }
+        }
+        _ => {}
+    }
+}
+
+fn codec_transport_fps_cap(selected_transport: SessionTransport) -> Option<u32> {
+    let codec = std::env::var("AGENT_VIDEO_CODEC_EFFECTIVE")
+        .ok()
+        .unwrap_or_else(|| "h264".to_string())
+        .to_ascii_lowercase();
+    let key = match (selected_transport, codec.as_str()) {
+        (SessionTransport::WebTransport, "av1") => "AGENT_CODEC_FPS_CAP_WEBTRANSPORT_AV1",
+        (SessionTransport::WebTransport, "hevc") | (SessionTransport::WebTransport, "h265") => {
+            "AGENT_CODEC_FPS_CAP_WEBTRANSPORT_HEVC"
+        }
+        (SessionTransport::Quic, "av1") => "AGENT_CODEC_FPS_CAP_QUIC_AV1",
+        (SessionTransport::Quic, "hevc") | (SessionTransport::Quic, "h265") => {
+            "AGENT_CODEC_FPS_CAP_QUIC_HEVC"
+        }
+        _ => return None,
+    };
+    let default = match key {
+        "AGENT_CODEC_FPS_CAP_WEBTRANSPORT_AV1" | "AGENT_CODEC_FPS_CAP_QUIC_AV1" => 72,
+        _ => 90,
+    };
+    let cap = std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(default)
+        .clamp(12, 240);
+    Some(cap)
+}
+
+fn apply_codec_transport_limits(
+    selected_transport: SessionTransport,
+    cfg: &mut agent_rust::CaptureConfig,
+) {
+    let Some(cap) = codec_transport_fps_cap(selected_transport) else {
+        return;
+    };
+    let old_fps = cfg.fps;
+    let old_max = cfg.max_fps;
+    let old_min = cfg.min_fps;
+    cfg.fps = cfg.fps.min(cap);
+    cfg.max_fps = cfg.max_fps.min(cap).max(1);
+    cfg.min_fps = cfg.min_fps.min(cfg.max_fps).max(1);
+    cfg.idle_repeat_fps = cfg.idle_repeat_fps.min(cfg.max_fps).max(1);
+    cfg.tier_fps_l1 = cfg.tier_fps_l1.min(cfg.max_fps).max(1);
+    cfg.tier_fps_l2 = cfg.tier_fps_l2.min(cfg.max_fps).max(1);
+    cfg.tier_fps_l3 = cfg.tier_fps_l3.min(cfg.max_fps).max(1);
+    cfg.tier_fps_l4 = cfg.tier_fps_l4.min(cfg.max_fps).max(1);
+    cfg.tier_fps_l5 = cfg.tier_fps_l5.min(cfg.max_fps).max(1);
+    info!(
+        selected_transport = selected_transport.as_str(),
+        codec = %std::env::var("AGENT_VIDEO_CODEC_EFFECTIVE").unwrap_or_else(|_| "h264".to_string()),
+        fps_cap = cap,
+        old_fps,
+        old_min_fps = old_min,
+        old_max_fps = old_max,
+        new_fps = cfg.fps,
+        new_min_fps = cfg.min_fps,
+        new_max_fps = cfg.max_fps,
+        "applied codec transport fps cap"
     );
 }
 
@@ -1800,9 +2181,11 @@ async fn attach_video_track_with_policy(
     };
     apply_capture_profile(&mut effective_cfg);
     apply_transport_send_policy(selected_transport, &mut effective_cfg);
+    apply_codec_transport_limits(selected_transport, &mut effective_cfg);
     if let Some(v) = active_sessions {
         apply_stream_fair_share(&mut effective_cfg, v);
     }
+    apply_dynamic_vbv_and_roi_policy(&mut effective_cfg);
     if effective_cfg.tier_limit_enable {
         info!(
             tier_ladder_fps = %format!(
@@ -2037,7 +2420,15 @@ async fn attach_video_track_with_policy(
         return Ok(());
     }
 
-    if encoder_backend == VideoEncoderBackend::Nvenc && backend == CaptureBackend::Dxgi {
+    let roi_requested = roi_map_requested();
+    let native_roi = nvenc_native_roi_enabled();
+    if roi_requested && !native_roi {
+        info!("ROI map requested: skipping native NVENC path; fallback pipeline will use ffmpeg addroi");
+    }
+    if encoder_backend == VideoEncoderBackend::Nvenc
+        && backend == CaptureBackend::Dxgi
+        && (!roi_requested || native_roi)
+    {
         let (input_w, input_h) = detect_input_resolution()?;
         let target_w = if effective_cfg.target_width > 0 {
             effective_cfg.target_width
@@ -2314,7 +2705,10 @@ async fn attach_video_track_with_policy(
         }
     }
 
-    if encoder_backend == VideoEncoderBackend::Nvenc && backend == CaptureBackend::Wgc {
+    if encoder_backend == VideoEncoderBackend::Nvenc
+        && backend == CaptureBackend::Wgc
+        && (!roi_requested || native_roi)
+    {
         #[cfg(windows)]
         {
             let mut wgc = WgcWindowCapturer::new()?;
@@ -2682,6 +3076,7 @@ async fn attach_video_track_with_policy(
                 &encode_cfg,
                 encoder_backend,
                 allow_encoder_fallback,
+                selected_transport.as_str(),
             ) {
                 Ok(e) => e,
                 Err(e) => {
@@ -3927,5 +4322,18 @@ mod tests {
             &caps,
             SessionTransport::WebTransport
         ));
+    }
+
+    #[test]
+    fn parse_codec_priority_filters_and_orders() {
+        let parsed = parse_codec_priority("av1,hevc,h264");
+        assert_eq!(parsed, vec![VideoCodec::Av1, VideoCodec::Hevc, VideoCodec::H264]);
+    }
+
+    #[test]
+    fn codec_strategy_keeps_webrtc_on_h264() {
+        let caps = json!({ "codecs": ["h264", "hevc", "av1"] });
+        let selected = select_codec_by_strategy(SessionTransport::WebRtc, &caps);
+        assert_eq!(selected, VideoCodec::H264);
     }
 }
