@@ -45,7 +45,8 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message;
@@ -112,7 +113,647 @@ impl SessionTransport {
     }
 }
 
+fn parse_transport_priority(raw: &str) -> Vec<SessionTransport> {
+    raw.split(',')
+        .filter_map(|s| match s.trim().to_ascii_lowercase().as_str() {
+            "webrtc" => Some(SessionTransport::WebRtc),
+            "quic" => Some(SessionTransport::Quic),
+            "webtransport" => Some(SessionTransport::WebTransport),
+            _ => None,
+        })
+        .collect()
+}
+
+fn transport_allowed_by_env(transport: SessionTransport) -> bool {
+    let key = match transport {
+        SessionTransport::WebRtc => "AGENT_TRANSPORT_ENABLE_WEBRTC",
+        SessionTransport::Quic => "AGENT_TRANSPORT_ENABLE_QUIC",
+        SessionTransport::WebTransport => "AGENT_TRANSPORT_ENABLE_WEBTRANSPORT",
+    };
+    std::env::var(key)
+        .ok()
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true)
+}
+
+fn controller_supports_transport(controller_caps: &Value, transport: SessionTransport) -> bool {
+    let wanted = transport.as_str();
+    let Some(protocols) = controller_caps.get("protocols").and_then(|v| v.as_array()) else {
+        // Backward compatibility: old clients might not provide capabilities.
+        return true;
+    };
+    if protocols.is_empty() {
+        return true;
+    }
+    protocols
+        .iter()
+        .filter_map(|v| v.as_str())
+        .any(|v| v.eq_ignore_ascii_case(wanted))
+}
+
+fn select_transport_by_strategy(
+    requested: SessionTransport,
+    controller_caps: &Value,
+    concurrent_clients: usize,
+) -> SessionTransport {
+    let auto = std::env::var("AGENT_TRANSPORT_AUTO_ENABLE")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(true);
+    let multi_client_upgrade_at = std::env::var("AGENT_TRANSPORT_MULTI_CLIENT_UPGRADE_AT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(2)
+        .clamp(1, 64);
+    let default_priority = "webtransport,quic,webrtc".to_string();
+    let priority = std::env::var("AGENT_TRANSPORT_AUTO_PRIORITY")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or(default_priority);
+    let mut order = Vec::new();
+    order.push(requested);
+    if auto {
+        let priority_list = parse_transport_priority(&priority);
+        if concurrent_clients >= multi_client_upgrade_at && requested == SessionTransport::WebRtc {
+            order.extend(
+                priority_list
+                    .iter()
+                    .copied()
+                    .filter(|v| *v != SessionTransport::WebRtc),
+            );
+            order.push(SessionTransport::WebRtc);
+        } else {
+            order.extend(priority_list);
+        }
+    } else {
+        order.extend([
+            SessionTransport::WebRtc,
+            SessionTransport::Quic,
+            SessionTransport::WebTransport,
+        ]);
+    }
+
+    let mut dedup = Vec::new();
+    for t in order {
+        if dedup.contains(&t) {
+            continue;
+        }
+        dedup.push(t);
+    }
+
+    for candidate in dedup {
+        if transport_allowed_by_env(candidate)
+            && controller_supports_transport(controller_caps, candidate)
+        {
+            return candidate;
+        }
+    }
+
+    SessionTransport::WebRtc
+}
+
 const CAPTURE_TS_MAGIC: &[u8; 4] = b"TSU1";
+static ACTIVE_STREAM_SESSIONS: AtomicU32 = AtomicU32::new(0);
+static SHARED_ENCODED_HUB: OnceLock<Arc<SharedEncodedHub>> = OnceLock::new();
+
+struct SharedEncodedHub {
+    tx: tokio::sync::broadcast::Sender<Arc<[u8]>>,
+    fps_ref: Arc<AtomicU32>,
+}
+
+fn decrement_active_stream_sessions() {
+    loop {
+        let cur = ACTIVE_STREAM_SESSIONS.load(Ordering::Relaxed);
+        if cur == 0 {
+            return;
+        }
+        if ACTIVE_STREAM_SESSIONS
+            .compare_exchange(cur, cur - 1, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return;
+        }
+    }
+}
+
+fn apply_stream_fair_share(cfg: &mut agent_rust::CaptureConfig, active_sessions: u32) {
+    let enable = std::env::var("AGENT_STREAM_FAIR_SHARE_ENABLE")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(true);
+    if !enable || active_sessions <= 1 {
+        return;
+    }
+    let total_fps_budget = std::env::var("AGENT_STREAM_TOTAL_FPS_BUDGET")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(120)
+        .clamp(1, 1000);
+    let total_bitrate_budget = std::env::var("AGENT_STREAM_TOTAL_BITRATE_BUDGET_KBPS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(24_000)
+        .clamp(100, 1_000_000);
+    let min_fps = std::env::var("AGENT_STREAM_MIN_FPS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(8)
+        .clamp(1, 240);
+    let min_bitrate = std::env::var("AGENT_STREAM_MIN_BITRATE_KBPS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(1200)
+        .clamp(100, 300_000);
+
+    let target_fps = (total_fps_budget / active_sessions.max(1))
+        .clamp(min_fps, cfg.max_fps.max(1))
+        .clamp(cfg.min_fps.max(1), cfg.max_fps.max(1));
+    let target_br = (total_bitrate_budget / active_sessions.max(1))
+        .max(min_bitrate)
+        .min(cfg.max_bitrate_kbps.max(min_bitrate));
+
+    cfg.fps = target_fps;
+    cfg.max_fps = cfg.max_fps.min(target_fps).max(1);
+    cfg.min_fps = cfg.min_fps.min(target_fps).max(1);
+    cfg.tier_fps_l1 = cfg.tier_fps_l1.min(target_fps).max(1);
+    cfg.tier_fps_l2 = cfg.tier_fps_l2.min(target_fps).max(1);
+    cfg.tier_fps_l3 = cfg.tier_fps_l3.min(target_fps).max(1);
+    cfg.tier_fps_l4 = cfg.tier_fps_l4.min(target_fps).max(1);
+    cfg.tier_fps_l5 = cfg.tier_fps_l5.min(target_fps).max(1);
+    cfg.bitrate_kbps = target_br;
+    info!(
+        active_sessions,
+        fair_fps = cfg.fps,
+        fair_bitrate_kbps = cfg.bitrate_kbps,
+        "applied stream fair-share"
+    );
+}
+
+fn shared_pipeline_enabled() -> bool {
+    std::env::var("AGENT_SHARED_CAPTURE_ENCODE_ENABLE")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(true)
+}
+
+fn get_or_start_shared_encoded_hub(
+    effective_cfg: &agent_rust::CaptureConfig,
+    backend: CaptureBackend,
+    encoder_backend: VideoEncoderBackend,
+    with_capture_ts_header: bool,
+) -> Result<Arc<SharedEncodedHub>> {
+    if let Some(hub) = SHARED_ENCODED_HUB.get() {
+        return Ok(hub.clone());
+    }
+    let cfg = effective_cfg.clone();
+    let capacity = cfg.queue_depth.clamp(8, 256) as usize;
+    let initial_fps = cfg.fps.clamp(cfg.min_fps.max(1), cfg.max_fps.max(1)).max(1);
+    let fps_ref = Arc::new(AtomicU32::new(initial_fps));
+    let (tx, _) = tokio::sync::broadcast::channel::<Arc<[u8]>>(capacity);
+    let hub = Arc::new(SharedEncodedHub {
+        tx: tx.clone(),
+        fps_ref: fps_ref.clone(),
+    });
+    if SHARED_ENCODED_HUB.set(hub.clone()).is_err() {
+        if let Some(existing) = SHARED_ENCODED_HUB.get() {
+            return Ok(existing.clone());
+        }
+    }
+
+    std::thread::spawn(move || {
+        let probe_enable = std::env::var("AGENT_SHARED_PIPELINE_PROBE_ENABLE")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let probe_interval_ms = std::env::var("AGENT_SHARED_PIPELINE_PROBE_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(1000)
+            .clamp(200, 10_000);
+        let probe_interval = Duration::from_millis(probe_interval_ms);
+        info!(
+            shared_fps = fps_ref.load(Ordering::Relaxed),
+            probe_enable,
+            probe_interval_ms,
+            "shared pipeline loop started"
+        );
+        if encoder_backend == VideoEncoderBackend::Nvenc && backend == CaptureBackend::Dxgi {
+            let (input_w, input_h) = match detect_input_resolution() {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "shared pipeline detect input resolution failed; falling back to CPU path"
+                    );
+                    (0, 0)
+                }
+            };
+            let target_w = if cfg.target_width > 0 {
+                cfg.target_width
+            } else {
+                input_w.max(2)
+            };
+            let target_h = if cfg.target_height > 0 {
+                cfg.target_height
+            } else {
+                input_h.max(2)
+            };
+            if target_w > 0 && target_h > 0 {
+                match NativeNvencPipeline::new(target_w, target_h, &cfg) {
+                    Ok(mut native) => {
+                        info!(
+                            target_w,
+                            target_h,
+                            adapter = %native.adapter_summary(),
+                            "shared pipeline native NVENC dxgi path enabled"
+                        );
+                        let mut next_tick = Instant::now();
+                        let mut probe_last = Instant::now();
+                        let mut probe_frames: u64 = 0;
+                        let mut probe_loop_count: u64 = 0;
+                        let mut probe_wait_us: u128 = 0;
+                        let mut probe_capture_us: u128 = 0;
+                        let mut probe_resize_us: u128 = 0;
+                        let mut probe_encode_us: u128 = 0;
+                        let mut probe_capture_err: u64 = 0;
+                        let mut probe_encode_err: u64 = 0;
+                        let mut probe_encode_empty: u64 = 0;
+                        let mut probe_sent: u64 = 0;
+                        let mut probe_dropped: u64 = 0;
+                        loop {
+                            let loop_start = Instant::now();
+                            wait_encode_tick(&mut next_tick, fps_ref.load(Ordering::Relaxed).max(1));
+                            probe_wait_us =
+                                probe_wait_us.saturating_add(loop_start.elapsed().as_micros());
+                            let work_start = Instant::now();
+                            match native.encode_next(false) {
+                                Ok(Some(v)) if !v.bytes.is_empty() => {
+                                    probe_capture_us = probe_capture_us
+                                        .saturating_add(work_start.elapsed().as_micros());
+                                    let encoded = pack_capture_ts_au(
+                                        v.bytes,
+                                        v.capture_start_us,
+                                        with_capture_ts_header,
+                                    );
+                                    if tx.send(encoded).is_ok() {
+                                        probe_sent = probe_sent.saturating_add(1);
+                                    } else {
+                                        probe_dropped = probe_dropped.saturating_add(1);
+                                    }
+                                    probe_frames = probe_frames.saturating_add(1);
+                                }
+                                Ok(_) => {
+                                    probe_capture_us = probe_capture_us
+                                        .saturating_add(work_start.elapsed().as_micros());
+                                    probe_encode_empty = probe_encode_empty.saturating_add(1);
+                                }
+                                Err(e) => {
+                                    probe_capture_us = probe_capture_us
+                                        .saturating_add(work_start.elapsed().as_micros());
+                                    probe_encode_err = probe_encode_err.saturating_add(1);
+                                    warn!(error = %e, "shared native nvenc encode_next failed");
+                                    std::thread::sleep(Duration::from_millis(2));
+                                }
+                            }
+                            probe_loop_count = probe_loop_count.saturating_add(1);
+                            if probe_enable && probe_last.elapsed() >= probe_interval {
+                                let elapsed_s = probe_last.elapsed().as_secs_f64().max(0.001);
+                                let fps = probe_frames as f64 / elapsed_s;
+                                let wait_ms = (probe_wait_us as f64 / 1000.0) / elapsed_s;
+                                let cap_ms = (probe_capture_us as f64 / 1000.0) / elapsed_s;
+                                let resize_ms = (probe_resize_us as f64 / 1000.0) / elapsed_s;
+                                let enc_ms = (probe_encode_us as f64 / 1000.0) / elapsed_s;
+                                info!(
+                                    shared_target_fps = fps_ref.load(Ordering::Relaxed),
+                                    shared_fps = format!("{fps:.2}"),
+                                    loops = probe_loop_count,
+                                    sent = probe_sent,
+                                    dropped = probe_dropped,
+                                    capture_err = probe_capture_err,
+                                    encode_err = probe_encode_err,
+                                    encode_empty = probe_encode_empty,
+                                    wait_ms_per_s = format!("{wait_ms:.2}"),
+                                    capture_ms_per_s = format!("{cap_ms:.2}"),
+                                    resize_ms_per_s = format!("{resize_ms:.2}"),
+                                    encode_ms_per_s = format!("{enc_ms:.2}"),
+                                    "shared pipeline probe"
+                                );
+                                probe_last = Instant::now();
+                                probe_frames = 0;
+                                probe_loop_count = 0;
+                                probe_wait_us = 0;
+                                probe_capture_us = 0;
+                                probe_resize_us = 0;
+                                probe_encode_us = 0;
+                                probe_capture_err = 0;
+                                probe_encode_err = 0;
+                                probe_encode_empty = 0;
+                                probe_sent = 0;
+                                probe_dropped = 0;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "shared native NVENC dxgi init failed; falling back to CPU path"
+                        );
+                    }
+                }
+            }
+        }
+
+        if encoder_backend == VideoEncoderBackend::Nvenc && backend == CaptureBackend::Wgc {
+            #[cfg(windows)]
+            {
+                if let Ok(mut wgc) = WgcWindowCapturer::new() {
+                    if let Ok(first) = wgc.capture_gpu_frame(Duration::from_millis(250)) {
+                        let target_w = if cfg.target_width > 0 {
+                            cfg.target_width
+                        } else {
+                            first.width
+                        };
+                        let target_h = if cfg.target_height > 0 {
+                            cfg.target_height
+                        } else {
+                            first.height
+                        };
+                        match NativeNvencTexturePipeline::new(
+                            wgc.device(),
+                            wgc.context(),
+                            target_w,
+                            target_h,
+                            &cfg,
+                        ) {
+                    Ok(mut native) => {
+                        info!(
+                            target_w,
+                            target_h,
+                            "shared pipeline native NVENC wgc-texture path enabled"
+                        );
+                        let mut next_tick = Instant::now();
+                        let mut probe_last = Instant::now();
+                        let mut probe_frames: u64 = 0;
+                        let mut probe_loop_count: u64 = 0;
+                        let mut probe_wait_us: u128 = 0;
+                        let mut probe_capture_us: u128 = 0;
+                        let mut probe_resize_us: u128 = 0;
+                        let mut probe_encode_us: u128 = 0;
+                        let mut probe_capture_err: u64 = 0;
+                        let mut probe_encode_err: u64 = 0;
+                        let mut probe_encode_empty: u64 = 0;
+                        let mut probe_sent: u64 = 0;
+                        let mut probe_dropped: u64 = 0;
+                        loop {
+                            let loop_start = Instant::now();
+                            wait_encode_tick(&mut next_tick, fps_ref.load(Ordering::Relaxed).max(1));
+                            probe_wait_us =
+                                probe_wait_us.saturating_add(loop_start.elapsed().as_micros());
+                            let capture_start = Instant::now();
+                            let captured = match wgc.capture_gpu_frame(Duration::from_millis(120)) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    probe_capture_us = probe_capture_us
+                                        .saturating_add(capture_start.elapsed().as_micros());
+                                    probe_capture_err = probe_capture_err.saturating_add(1);
+                                    warn!(error = %e, "shared wgc capture failed");
+                                    continue;
+                                }
+                            };
+                            probe_capture_us = probe_capture_us
+                                .saturating_add(capture_start.elapsed().as_micros());
+                            let encode_start = Instant::now();
+                            match native.encode_texture(&captured.texture, false) {
+                                Ok(Some(v)) if !v.bytes.is_empty() => {
+                                    probe_encode_us = probe_encode_us
+                                        .saturating_add(encode_start.elapsed().as_micros());
+                                    let encoded = pack_capture_ts_au(
+                                        v.bytes,
+                                        if captured.capture_start_us == 0 {
+                                            v.capture_start_us
+                                        } else {
+                                            captured.capture_start_us
+                                        },
+                                        with_capture_ts_header,
+                                    );
+                                    if tx.send(encoded).is_ok() {
+                                        probe_sent = probe_sent.saturating_add(1);
+                                    } else {
+                                        probe_dropped = probe_dropped.saturating_add(1);
+                                    }
+                                    probe_frames = probe_frames.saturating_add(1);
+                                }
+                                Ok(_) => {
+                                    probe_encode_us = probe_encode_us
+                                        .saturating_add(encode_start.elapsed().as_micros());
+                                    probe_encode_empty = probe_encode_empty.saturating_add(1);
+                                }
+                                Err(e) => {
+                                    probe_encode_us = probe_encode_us
+                                        .saturating_add(encode_start.elapsed().as_micros());
+                                    probe_encode_err = probe_encode_err.saturating_add(1);
+                                    warn!(error = %e, "shared wgc native encode failed");
+                                }
+                            }
+                            probe_loop_count = probe_loop_count.saturating_add(1);
+                            if probe_enable && probe_last.elapsed() >= probe_interval {
+                                let elapsed_s = probe_last.elapsed().as_secs_f64().max(0.001);
+                                let fps = probe_frames as f64 / elapsed_s;
+                                let wait_ms = (probe_wait_us as f64 / 1000.0) / elapsed_s;
+                                let cap_ms = (probe_capture_us as f64 / 1000.0) / elapsed_s;
+                                let resize_ms = (probe_resize_us as f64 / 1000.0) / elapsed_s;
+                                let enc_ms = (probe_encode_us as f64 / 1000.0) / elapsed_s;
+                                info!(
+                                    shared_target_fps = fps_ref.load(Ordering::Relaxed),
+                                    shared_fps = format!("{fps:.2}"),
+                                    loops = probe_loop_count,
+                                    sent = probe_sent,
+                                    dropped = probe_dropped,
+                                    capture_err = probe_capture_err,
+                                    encode_err = probe_encode_err,
+                                    encode_empty = probe_encode_empty,
+                                    wait_ms_per_s = format!("{wait_ms:.2}"),
+                                    capture_ms_per_s = format!("{cap_ms:.2}"),
+                                    resize_ms_per_s = format!("{resize_ms:.2}"),
+                                    encode_ms_per_s = format!("{enc_ms:.2}"),
+                                    "shared pipeline probe"
+                                );
+                                probe_last = Instant::now();
+                                probe_frames = 0;
+                                probe_loop_count = 0;
+                                probe_wait_us = 0;
+                                probe_capture_us = 0;
+                                probe_resize_us = 0;
+                                probe_encode_us = 0;
+                                probe_capture_err = 0;
+                                probe_encode_err = 0;
+                                probe_encode_empty = 0;
+                                probe_sent = 0;
+                                probe_dropped = 0;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "shared native NVENC wgc-texture init failed; falling back to CPU path"
+                        );
+                    }
+                        }
+                    } else {
+                        warn!("shared WGC warmup capture failed; falling back to CPU path");
+                    }
+                } else {
+                    warn!("shared WGC capturer init failed; falling back to CPU path");
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                warn!("shared WGC native path requires Windows; falling back to CPU path");
+            }
+        }
+
+        let mut capturer = match build_frame_capturer(backend) {
+            Ok(v) => v,
+            Err(e) => {
+                error!(error = %e, "shared pipeline capture initialization failed");
+                return;
+            }
+        };
+        let mut encoder = match build_video_encoder(initial_fps, &cfg, encoder_backend, true) {
+            Ok(v) => v,
+            Err(e) => {
+                error!(error = %e, "shared pipeline encoder initialization failed");
+                return;
+            }
+        };
+        let mut next_tick = Instant::now();
+        let mut probe_last = Instant::now();
+        let mut probe_frames: u64 = 0;
+        let mut probe_loop_count: u64 = 0;
+        let mut probe_wait_us: u128 = 0;
+        let mut probe_capture_us: u128 = 0;
+        let mut probe_resize_us: u128 = 0;
+        let mut probe_encode_us: u128 = 0;
+        let mut probe_capture_err: u64 = 0;
+        let mut probe_encode_err: u64 = 0;
+        let mut probe_encode_empty: u64 = 0;
+        let mut probe_sent: u64 = 0;
+        let mut probe_dropped: u64 = 0;
+        loop {
+            let loop_start = Instant::now();
+            wait_encode_tick(&mut next_tick, fps_ref.load(Ordering::Relaxed).max(1));
+            probe_wait_us = probe_wait_us.saturating_add(loop_start.elapsed().as_micros());
+            let capture_start = Instant::now();
+            match capturer.capture() {
+                Ok((mut rgba, mut width, mut height)) => {
+                    probe_capture_us =
+                        probe_capture_us.saturating_add(capture_start.elapsed().as_micros());
+                    if cfg.target_width > 0
+                        && cfg.target_height > 0
+                        && (cfg.target_width != width || cfg.target_height != height)
+                    {
+                        let resize_start = Instant::now();
+                        if let Some((resized, rw, rh)) = resize_rgba_fast(
+                            &rgba,
+                            width,
+                            height,
+                            cfg.target_width,
+                            cfg.target_height,
+                        ) {
+                            rgba = resized;
+                            width = rw;
+                            height = rh;
+                        }
+                        probe_resize_us =
+                            probe_resize_us.saturating_add(resize_start.elapsed().as_micros());
+                    }
+                    let capture_start_us = unix_time_us();
+                    let encode_start = Instant::now();
+                    match encode_rgba_frame(
+                        &mut encoder,
+                        &rgba,
+                        width,
+                        height,
+                        Some(cfg.bitrate_kbps.max(100)),
+                        false,
+                    ) {
+                        Ok(encoded) if !encoded.is_empty() => {
+                            probe_encode_us =
+                                probe_encode_us.saturating_add(encode_start.elapsed().as_micros());
+                            let encoded = pack_capture_ts_au(
+                                encoded,
+                                capture_start_us,
+                                with_capture_ts_header,
+                            );
+                            if tx.send(encoded).is_ok() {
+                                probe_sent = probe_sent.saturating_add(1);
+                            } else {
+                                probe_dropped = probe_dropped.saturating_add(1);
+                            }
+                            probe_frames = probe_frames.saturating_add(1);
+                        }
+                        Ok(_) => {
+                            probe_encode_us =
+                                probe_encode_us.saturating_add(encode_start.elapsed().as_micros());
+                            probe_encode_empty = probe_encode_empty.saturating_add(1);
+                        }
+                        Err(e) => {
+                            probe_encode_us =
+                                probe_encode_us.saturating_add(encode_start.elapsed().as_micros());
+                            probe_encode_err = probe_encode_err.saturating_add(1);
+                            warn!(error = %e, "shared pipeline encode failed");
+                        }
+                    }
+                }
+                Err(e) => {
+                    probe_capture_us =
+                        probe_capture_us.saturating_add(capture_start.elapsed().as_micros());
+                    probe_capture_err = probe_capture_err.saturating_add(1);
+                    warn!(error = %e, "shared pipeline capture failed");
+                }
+            }
+            probe_loop_count = probe_loop_count.saturating_add(1);
+            if probe_enable && probe_last.elapsed() >= probe_interval {
+                let elapsed_s = probe_last.elapsed().as_secs_f64().max(0.001);
+                let fps = probe_frames as f64 / elapsed_s;
+                let wait_ms = (probe_wait_us as f64 / 1000.0) / elapsed_s;
+                let cap_ms = (probe_capture_us as f64 / 1000.0) / elapsed_s;
+                let resize_ms = (probe_resize_us as f64 / 1000.0) / elapsed_s;
+                let enc_ms = (probe_encode_us as f64 / 1000.0) / elapsed_s;
+                info!(
+                    shared_target_fps = fps_ref.load(Ordering::Relaxed),
+                    shared_fps = format!("{fps:.2}"),
+                    loops = probe_loop_count,
+                    sent = probe_sent,
+                    dropped = probe_dropped,
+                    capture_err = probe_capture_err,
+                    encode_err = probe_encode_err,
+                    encode_empty = probe_encode_empty,
+                    wait_ms_per_s = format!("{wait_ms:.2}"),
+                    capture_ms_per_s = format!("{cap_ms:.2}"),
+                    resize_ms_per_s = format!("{resize_ms:.2}"),
+                    encode_ms_per_s = format!("{enc_ms:.2}"),
+                    "shared pipeline probe"
+                );
+                probe_last = Instant::now();
+                probe_frames = 0;
+                probe_loop_count = 0;
+                probe_wait_us = 0;
+                probe_capture_us = 0;
+                probe_resize_us = 0;
+                probe_encode_us = 0;
+                probe_capture_err = 0;
+                probe_encode_err = 0;
+                probe_encode_empty = 0;
+                probe_sent = 0;
+                probe_dropped = 0;
+            }
+        }
+    });
+
+    Ok(hub)
+}
 
 fn h264_debug_budget() -> usize {
     std::env::var("AGENT_H264_DEBUG_COUNT")
@@ -338,18 +979,6 @@ async fn main() -> Result<()> {
                 continue;
             }
 
-            let selected_transport = match requested_transport {
-                SessionTransport::WebRtc => SessionTransport::WebRtc,
-                SessionTransport::Quic => SessionTransport::Quic,
-                SessionTransport::WebTransport => SessionTransport::WebTransport,
-            };
-            info!(
-                requested_transport = requested_transport.as_str(),
-                selected_transport = selected_transport.as_str(),
-                controller_caps = %controller_caps,
-                "session transport negotiated"
-            );
-
             let max_clients = std::env::var("AGENT_MAX_CLIENTS")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
@@ -393,6 +1022,19 @@ async fn main() -> Result<()> {
                 }
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
+            let concurrent_clients = {
+                let s = session.lock().await;
+                s.sessions.len().saturating_add(1)
+            };
+            let selected_transport =
+                select_transport_by_strategy(requested_transport, &controller_caps, concurrent_clients);
+            info!(
+                requested_transport = requested_transport.as_str(),
+                selected_transport = selected_transport.as_str(),
+                concurrent_clients,
+                controller_caps = %controller_caps,
+                "session transport negotiated"
+            );
 
             let mut quic_advert: Option<QuicServerAdvert> = None;
             let mut webtransport_advert: Option<WebTransportAdvert> = None;
@@ -430,7 +1072,8 @@ async fn main() -> Result<()> {
                 control_dc.clone(),
             )
             .await?;
-            let effective_capture_cfg = { capture_cfg.lock().await.clone() };
+            let mut effective_capture_cfg = { capture_cfg.lock().await.clone() };
+            apply_multi_client_adaptation(&mut effective_capture_cfg, concurrent_clients);
             attach_video_track_with_policy(
                 pc.clone(),
                 &effective_capture_cfg,
@@ -575,6 +1218,17 @@ async fn apply_capture_patch(
     patch: &Value,
 ) -> Result<()> {
     let mut cfg = capture_cfg.lock().await;
+    if let Some(v) = patch.get("targetFps").and_then(|v| v.as_u64()) {
+        let fps = (v as u32).clamp(1, 240);
+        cfg.fps = fps;
+        cfg.max_fps = cfg.max_fps.max(fps);
+        cfg.min_fps = cfg.min_fps.min(fps);
+        cfg.tier_fps_l1 = cfg.tier_fps_l1.min(fps);
+        cfg.tier_fps_l2 = cfg.tier_fps_l2.min(fps);
+        cfg.tier_fps_l3 = cfg.tier_fps_l3.min(fps);
+        cfg.tier_fps_l4 = cfg.tier_fps_l4.min(fps);
+        cfg.tier_fps_l5 = cfg.tier_fps_l5.min(fps);
+    }
     if let Some(v) = patch.get("targetWidth").and_then(|v| v.as_u64()) {
         cfg.target_width = v as u32;
     }
@@ -615,7 +1269,291 @@ async fn apply_capture_patch(
             _ => {}
         }
     }
+    if let Some(pacer) = patch.get("quicPacer").and_then(|v| v.as_object()) {
+        if let Some(v) = pacer.get("enable").and_then(|v| v.as_bool()) {
+            unsafe {
+                std::env::set_var("AGENT_QUIC_PACE_ENABLE", if v { "1" } else { "0" });
+            }
+        }
+        if let Some(v) = pacer.get("mode").and_then(|v| v.as_str()) {
+            let mode = match v.to_ascii_lowercase().as_str() {
+                "auto" => "auto",
+                _ => "manual",
+            };
+            unsafe {
+                std::env::set_var("AGENT_QUIC_PACE_MODE", mode);
+            }
+        }
+        if let Some(v) = pacer.get("intervalMs").and_then(|v| v.as_u64()) {
+            let v = v.clamp(1, 100);
+            unsafe {
+                std::env::set_var("AGENT_QUIC_PACE_INTERVAL_MS", v.to_string());
+            }
+        }
+        if let Some(v) = pacer.get("burst").and_then(|v| v.as_u64()) {
+            let v = v.clamp(1, 16);
+            unsafe {
+                std::env::set_var("AGENT_QUIC_PACE_BURST", v.to_string());
+            }
+        }
+        if let Some(v) = pacer.get("autoOnFull").and_then(|v| v.as_u64()) {
+            let v = v.clamp(1, 1000);
+            unsafe {
+                std::env::set_var("AGENT_QUIC_PACE_AUTO_ON_FULL", v.to_string());
+            }
+        }
+        if let Some(v) = pacer.get("autoOffOk").and_then(|v| v.as_u64()) {
+            let v = v.clamp(1, 5000);
+            unsafe {
+                std::env::set_var("AGENT_QUIC_PACE_AUTO_OFF_OK", v.to_string());
+            }
+        }
+    }
+    if let Some(link) = patch.get("quicQueueRateLink").and_then(|v| v.as_object()) {
+        if let Some(v) = link.get("enable").and_then(|v| v.as_bool()) {
+            unsafe {
+                std::env::set_var(
+                    "AGENT_QUIC_QUEUE_RATE_LINK_ENABLE",
+                    if v { "1" } else { "0" },
+                );
+            }
+        }
+        if let Some(v) = link.get("minFps").and_then(|v| v.as_u64()) {
+            unsafe {
+                std::env::set_var(
+                    "AGENT_QUIC_QUEUE_RATE_LINK_MIN_FPS",
+                    v.clamp(1, 240).to_string(),
+                );
+            }
+        }
+        if let Some(v) = link.get("maxFps").and_then(|v| v.as_u64()) {
+            unsafe {
+                std::env::set_var(
+                    "AGENT_QUIC_QUEUE_RATE_LINK_MAX_FPS",
+                    v.clamp(1, 240).to_string(),
+                );
+            }
+        }
+        if let Some(v) = link.get("downStep").and_then(|v| v.as_u64()) {
+            unsafe {
+                std::env::set_var(
+                    "AGENT_QUIC_QUEUE_RATE_LINK_DOWN_STEP",
+                    v.clamp(1, 60).to_string(),
+                );
+            }
+        }
+        if let Some(v) = link.get("upStep").and_then(|v| v.as_u64()) {
+            unsafe {
+                std::env::set_var(
+                    "AGENT_QUIC_QUEUE_RATE_LINK_UP_STEP",
+                    v.clamp(1, 30).to_string(),
+                );
+            }
+        }
+        if let Some(v) = link.get("fullThreshold").and_then(|v| v.as_u64()) {
+            unsafe {
+                std::env::set_var(
+                    "AGENT_QUIC_QUEUE_RATE_LINK_FULL_THRESHOLD",
+                    v.clamp(1, 2000).to_string(),
+                );
+            }
+        }
+        if let Some(v) = link.get("okThreshold").and_then(|v| v.as_u64()) {
+            unsafe {
+                std::env::set_var(
+                    "AGENT_QUIC_QUEUE_RATE_LINK_OK_THRESHOLD",
+                    v.clamp(1, 20_000).to_string(),
+                );
+            }
+        }
+        if let Some(v) = link.get("cooldownMs").and_then(|v| v.as_u64()) {
+            unsafe {
+                std::env::set_var(
+                    "AGENT_QUIC_QUEUE_RATE_LINK_COOLDOWN_MS",
+                    v.clamp(0, 10_000).to_string(),
+                );
+            }
+        }
+    }
+    if let Some(strategy) = patch.get("transportStrategy").and_then(|v| v.as_object()) {
+        if let Some(v) = strategy.get("autoEnable").and_then(|v| v.as_bool()) {
+            unsafe {
+                std::env::set_var("AGENT_TRANSPORT_AUTO_ENABLE", if v { "1" } else { "0" });
+            }
+        }
+        if let Some(v) = strategy.get("priority").and_then(|v| v.as_str()) {
+            let normalized = parse_transport_priority(v)
+                .into_iter()
+                .map(SessionTransport::as_str)
+                .collect::<Vec<_>>()
+                .join(",");
+            if !normalized.is_empty() {
+                unsafe {
+                    std::env::set_var("AGENT_TRANSPORT_AUTO_PRIORITY", normalized);
+                }
+            }
+        }
+        if let Some(v) = strategy
+            .get("multiClientUpgradeAt")
+            .and_then(|v| v.as_u64())
+        {
+            unsafe {
+                std::env::set_var(
+                    "AGENT_TRANSPORT_MULTI_CLIENT_UPGRADE_AT",
+                    v.clamp(1, 64).to_string(),
+                );
+            }
+        }
+        if let Some(v) = strategy.get("enableWebRtc").and_then(|v| v.as_bool()) {
+            unsafe {
+                std::env::set_var("AGENT_TRANSPORT_ENABLE_WEBRTC", if v { "1" } else { "0" });
+            }
+        }
+        if let Some(v) = strategy.get("enableQuic").and_then(|v| v.as_bool()) {
+            unsafe {
+                std::env::set_var("AGENT_TRANSPORT_ENABLE_QUIC", if v { "1" } else { "0" });
+            }
+        }
+        if let Some(v) = strategy
+            .get("enableWebTransport")
+            .and_then(|v| v.as_bool())
+        {
+            unsafe {
+                std::env::set_var(
+                    "AGENT_TRANSPORT_ENABLE_WEBTRANSPORT",
+                    if v { "1" } else { "0" },
+                );
+            }
+        }
+        if let Some(v) = strategy.get("sharedEncodeEnable").and_then(|v| v.as_bool()) {
+            unsafe {
+                std::env::set_var(
+                    "AGENT_SHARED_CAPTURE_ENCODE_ENABLE",
+                    if v { "1" } else { "0" },
+                );
+            }
+        }
+    }
     Ok(())
+}
+
+fn apply_multi_client_adaptation(cfg: &mut agent_rust::CaptureConfig, concurrent_clients: usize) {
+    let enabled = std::env::var("AGENT_MULTI_CLIENT_ADAPT_ENABLE")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(true);
+    if !enabled || concurrent_clients <= 1 {
+        return;
+    }
+    let clients = concurrent_clients.clamp(1, 32) as u32;
+    let fair_mode = std::env::var("AGENT_MULTI_CLIENT_FAIR_MODE")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(true);
+    let fair_target_clients = std::env::var("AGENT_MULTI_CLIENT_FAIR_TARGET_CLIENTS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .map(|v| v.clamp(1, 32));
+    let max_clients_env = std::env::var("AGENT_MAX_CLIENTS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .map(|v| v.clamp(1, 32));
+    let budget_clients = if fair_mode {
+        fair_target_clients
+            .or(max_clients_env)
+            .unwrap_or(clients)
+            .max(clients)
+    } else {
+        clients
+    };
+    let fps_min = std::env::var("AGENT_MULTI_CLIENT_MIN_FPS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(24)
+        .clamp(1, 240);
+    let br_min = std::env::var("AGENT_MULTI_CLIENT_MIN_BITRATE_KBPS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(6000)
+        .clamp(100, 300_000);
+    let fps_ratio_num = std::env::var("AGENT_MULTI_CLIENT_FPS_RATIO_NUM")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(82)
+        .clamp(1, 100);
+    let fps_ratio_den = std::env::var("AGENT_MULTI_CLIENT_FPS_RATIO_DEN")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(100)
+        .max(1);
+    let br_ratio_num = std::env::var("AGENT_MULTI_CLIENT_BR_RATIO_NUM")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(78)
+        .clamp(1, 100);
+    let br_ratio_den = std::env::var("AGENT_MULTI_CLIENT_BR_RATIO_DEN")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(100)
+        .max(1);
+    let force_openh264_at = std::env::var("AGENT_MULTI_CLIENT_FORCE_OPENH264_AT")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(3)
+        .clamp(2, 32);
+    let total_fps_budget = std::env::var("AGENT_MULTI_CLIENT_TOTAL_FPS_BUDGET")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(144)
+        .clamp(1, 1000);
+    let total_bitrate_budget = std::env::var("AGENT_MULTI_CLIENT_TOTAL_BITRATE_BUDGET_KBPS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(32_000)
+        .clamp(100, 1_000_000);
+
+    let base_fps = cfg.fps.max(1);
+    let base_br = cfg.bitrate_kbps.max(100);
+    let mut target_fps = base_fps;
+    let mut target_br = base_br;
+    for _ in 1..budget_clients {
+        target_fps = target_fps.saturating_mul(fps_ratio_num) / fps_ratio_den;
+        target_br = target_br.saturating_mul(br_ratio_num) / br_ratio_den;
+    }
+    let fair_fps_cap = (total_fps_budget / budget_clients.max(1)).max(1);
+    let fair_br_cap = (total_bitrate_budget / budget_clients.max(1)).max(100);
+    target_fps = target_fps.min(fair_fps_cap);
+    target_br = target_br.min(fair_br_cap);
+    target_fps = target_fps
+        .clamp(fps_min, cfg.max_fps.max(1))
+        .clamp(cfg.min_fps.max(1), cfg.max_fps.max(1));
+    target_br = target_br.clamp(br_min, cfg.max_bitrate_kbps.max(br_min));
+
+    cfg.fps = target_fps;
+    cfg.max_fps = cfg.max_fps.min(target_fps).max(1);
+    cfg.min_fps = cfg.min_fps.min(target_fps).max(1);
+    cfg.tier_fps_l1 = cfg.tier_fps_l1.min(target_fps).max(1);
+    cfg.tier_fps_l2 = cfg.tier_fps_l2.min(target_fps).max(1);
+    cfg.tier_fps_l3 = cfg.tier_fps_l3.min(target_fps).max(1);
+    cfg.tier_fps_l4 = cfg.tier_fps_l4.min(target_fps).max(1);
+    cfg.tier_fps_l5 = cfg.tier_fps_l5.min(target_fps).max(1);
+    cfg.bitrate_kbps = target_br;
+    cfg.max_fps_mode = false;
+    cfg.allow_encoder_fallback = true;
+    cfg.strict_gpu_direct = false;
+    if budget_clients >= force_openh264_at {
+        cfg.encoder = "openh264".to_string();
+    }
+    info!(
+        concurrent_clients,
+        budget_clients,
+        target_fps = cfg.fps,
+        target_bitrate_kbps = cfg.bitrate_kbps,
+        encoder = %cfg.encoder,
+        fair_mode,
+        strict_gpu_direct = cfg.strict_gpu_direct,
+        "applied multi-client adaptation profile"
+    );
 }
 
 fn spawn_control_stats_publisher(
@@ -847,8 +1785,24 @@ async fn attach_video_track_with_policy(
         selected_transport,
         SessionTransport::Quic | SessionTransport::WebTransport
     );
+    let active_sessions = if with_capture_ts_header {
+        let v = ACTIVE_STREAM_SESSIONS.fetch_add(1, Ordering::Relaxed) + 1;
+        let running = session_running.clone();
+        tokio::spawn(async move {
+            while running.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            decrement_active_stream_sessions();
+        });
+        Some(v)
+    } else {
+        None
+    };
     apply_capture_profile(&mut effective_cfg);
     apply_transport_send_policy(selected_transport, &mut effective_cfg);
+    if let Some(v) = active_sessions {
+        apply_stream_fair_share(&mut effective_cfg, v);
+    }
     if effective_cfg.tier_limit_enable {
         info!(
             tier_ladder_fps = %format!(
@@ -1029,6 +1983,60 @@ async fn attach_video_track_with_policy(
         session_running.clone(),
     );
 
+    if matches!(
+        selected_transport,
+        SessionTransport::Quic | SessionTransport::WebTransport
+    ) && shared_pipeline_enabled()
+    {
+        let hub = get_or_start_shared_encoded_hub(
+            &effective_cfg,
+            backend,
+            encoder_backend,
+            with_capture_ts_header,
+        )?;
+        let quic_sender = quic_tx
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| anyhow!("quic transport selected but quic sender missing"))?;
+        let queue_depth = effective_cfg.queue_depth.clamp(4, 256) as usize;
+        let (encoded_tx, encoded_rx) = tokio::sync::mpsc::channel::<Arc<[u8]>>(queue_depth);
+        let mut encoded_sub = hub.tx.subscribe();
+        let session_running_fanout = session_running.clone();
+        let stats_fanout = stats.clone();
+        tokio::spawn(async move {
+            while session_running_fanout.load(Ordering::SeqCst) {
+                match encoded_sub.recv().await {
+                    Ok(encoded) => {
+                        if encoded_tx.try_send(encoded).is_err() {
+                            stats_fanout.quic_au_dropped.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        stats_fanout
+                            .quic_au_dropped
+                            .fetch_add(skipped as u64, Ordering::Relaxed);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+        let stats_send = stats.clone();
+        let session_running_send = session_running.clone();
+        tokio::spawn(spawn_send_loop_quic(
+            quic_sender,
+            encoded_rx,
+            stats_send,
+            session_running_send,
+            Some(hub.fps_ref.clone()),
+        ));
+        info!(
+            selected_transport = selected_transport.as_str(),
+            queue_depth,
+            "attached shared capture+encode fanout for transport session"
+        );
+        return Ok(());
+    }
+
     if encoder_backend == VideoEncoderBackend::Nvenc && backend == CaptureBackend::Dxgi {
         let (input_w, input_h) = detect_input_resolution()?;
         let target_w = if effective_cfg.target_width > 0 {
@@ -1078,15 +2086,18 @@ async fn attach_video_track_with_policy(
                 let block_queue = effective_cfg.queue_strategy == "block";
                 let (encoded_tx, mut encoded_rx) =
                     tokio::sync::mpsc::channel::<Arc<[u8]>>(queue_depth);
+                let queue_link_fps = Arc::new(AtomicU32::new(effective_cfg.fps.max(1)));
                 let keyframe_request2 = keyframe_request.clone();
                 let stats_encode = stats.clone();
                 let session_running_encode = session_running.clone();
                 let effective_cfg_encode = effective_cfg.clone();
                 let selected_transport_encode = selected_transport;
+                let queue_link_fps_encode = queue_link_fps.clone();
                 let idr_interval =
                     Duration::from_secs(effective_cfg.idr_interval_sec.max(1) as u64);
                 std::thread::spawn(move || {
                     let mut encoded_frames: u32 = 0;
+                    let mut next_encode_due = Instant::now();
                     let strict_gpu_direct = effective_cfg.strict_gpu_direct;
                     let mut missing_idr_streak: u32 = 0;
                     let mut keyframe_burst_remain: u8 = 0;
@@ -1094,6 +2105,10 @@ async fn attach_video_track_with_policy(
                         std::time::Instant::now() - Duration::from_secs(10);
                     let mut last_interval_force = std::time::Instant::now();
                     while session_running_encode.load(Ordering::SeqCst) {
+                        wait_encode_tick(
+                            &mut next_encode_due,
+                            queue_link_fps_encode.load(Ordering::Relaxed).max(1),
+                        );
                         let keyframe_requested = keyframe_request2.swap(false, Ordering::Relaxed);
                         if keyframe_requested {
                             keyframe_burst_remain = keyframe_burst_len();
@@ -1244,6 +2259,7 @@ async fn attach_video_track_with_policy(
                         encoded_rx,
                         stats_send,
                         session_running_send,
+                        Some(queue_link_fps.clone()),
                     ));
                 } else if let Some(track) = rtp_track.clone() {
                     let sender = RtpH264Sender::new(
@@ -1337,15 +2353,18 @@ async fn attach_video_track_with_policy(
                     let block_queue = effective_cfg.queue_strategy == "block";
                     let (encoded_tx, mut encoded_rx) =
                         tokio::sync::mpsc::channel::<Arc<[u8]>>(queue_depth);
+                    let queue_link_fps = Arc::new(AtomicU32::new(effective_cfg.fps.max(1)));
                     let keyframe_request2 = keyframe_request.clone();
                     let stats_encode = stats.clone();
                     let session_running_encode = session_running.clone();
                     let effective_cfg_encode = effective_cfg.clone();
                     let selected_transport_encode = selected_transport;
+                    let queue_link_fps_encode = queue_link_fps.clone();
                     let idr_interval =
                         Duration::from_secs(effective_cfg.idr_interval_sec.max(1) as u64);
                     std::thread::spawn(move || {
                         let mut encoded_frames: u32 = 0;
+                        let mut next_encode_due = Instant::now();
                         let strict_gpu_direct = effective_cfg.strict_gpu_direct;
                         let mut missing_idr_streak: u32 = 0;
                         let mut keyframe_burst_remain: u8 = 0;
@@ -1353,6 +2372,10 @@ async fn attach_video_track_with_policy(
                             std::time::Instant::now() - Duration::from_secs(10);
                         let mut last_interval_force = std::time::Instant::now();
                         while session_running_encode.load(Ordering::SeqCst) {
+                            wait_encode_tick(
+                                &mut next_encode_due,
+                                queue_link_fps_encode.load(Ordering::Relaxed).max(1),
+                            );
                             let keyframe_requested =
                                 keyframe_request2.swap(false, Ordering::Relaxed);
                             if keyframe_requested {
@@ -1520,6 +2543,7 @@ async fn attach_video_track_with_policy(
                             encoded_rx,
                             stats_send,
                             session_running_send,
+                            Some(queue_link_fps.clone()),
                         ));
                     } else if let Some(track) = rtp_track.clone() {
                         let sender = RtpH264Sender::new(
@@ -1591,6 +2615,7 @@ async fn attach_video_track_with_policy(
     let latest = Arc::new(std::sync::Mutex::new(None::<RawFrame>));
     let queue_depth = effective_cfg.queue_depth.clamp(1, 64) as usize;
     let (encoded_tx, mut encoded_rx) = tokio::sync::mpsc::channel::<Arc<[u8]>>(queue_depth);
+    let queue_link_fps = Arc::new(AtomicU32::new(fps.max(1)));
 
     {
         let running = running.clone();
@@ -1649,6 +2674,7 @@ async fn attach_video_track_with_policy(
         let adapt2 = adapt.clone();
         let stats_encode = stats.clone();
         let session_running_encode = session_running.clone();
+        let queue_link_fps_encode = queue_link_fps.clone();
         let idr_interval_frames = fps.max(1) * effective_cfg.idr_interval_sec.max(1);
         std::thread::spawn(move || {
             let mut encoder = match build_video_encoder(
@@ -1665,8 +2691,13 @@ async fn attach_video_track_with_policy(
                 }
             };
             let mut encoded_frames: u32 = 0;
+            let mut next_encode_due = Instant::now();
 
             while running.load(Ordering::Relaxed) && session_running_encode.load(Ordering::SeqCst) {
+                wait_encode_tick(
+                    &mut next_encode_due,
+                    queue_link_fps_encode.load(Ordering::Relaxed).max(1),
+                );
                 let frame = match latest.lock() {
                     Ok(mut slot) => slot.take(),
                     Err(_) => None,
@@ -1735,6 +2766,7 @@ async fn attach_video_track_with_policy(
             encoded_rx,
             stats_send,
             session_running_send,
+            Some(queue_link_fps.clone()),
         ));
     } else if let Some(track) = rtp_track {
         let sender = RtpH264Sender::new(
@@ -2260,7 +3292,250 @@ async fn spawn_send_loop_quic(
     mut encoded_rx: tokio::sync::mpsc::Receiver<Arc<[u8]>>,
     stats: Arc<RuntimeStats>,
     session_running: Arc<AtomicBool>,
+    queue_link_fps: Option<Arc<AtomicU32>>,
 ) {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum PaceMode {
+        Manual,
+        Auto,
+    }
+
+    struct QuicPacer {
+        enabled: bool,
+        mode: PaceMode,
+        interval: Duration,
+        burst: f64,
+        tokens: f64,
+        last_refill: tokio::time::Instant,
+        auto_active: bool,
+        pressure: i32,
+        auto_on_full: i32,
+        auto_off_ok: i32,
+    }
+
+    impl QuicPacer {
+        fn from_env() -> Self {
+            let enabled = std::env::var("AGENT_QUIC_PACE_ENABLE")
+                .ok()
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            let mode = match std::env::var("AGENT_QUIC_PACE_MODE")
+                .ok()
+                .unwrap_or_else(|| "manual".to_string())
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "auto" => PaceMode::Auto,
+                _ => PaceMode::Manual,
+            };
+            let interval_ms = std::env::var("AGENT_QUIC_PACE_INTERVAL_MS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(2)
+                .clamp(1, 100);
+            let burst = std::env::var("AGENT_QUIC_PACE_BURST")
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(4)
+                .clamp(1, 16) as f64;
+            let auto_on_full = std::env::var("AGENT_QUIC_PACE_AUTO_ON_FULL")
+                .ok()
+                .and_then(|s| s.parse::<i32>().ok())
+                .unwrap_or(8)
+                .clamp(1, 1000);
+            let auto_off_ok = std::env::var("AGENT_QUIC_PACE_AUTO_OFF_OK")
+                .ok()
+                .and_then(|s| s.parse::<i32>().ok())
+                .unwrap_or(64)
+                .clamp(1, 5000);
+            Self {
+                enabled,
+                mode,
+                interval: Duration::from_millis(interval_ms),
+                burst,
+                tokens: burst,
+                last_refill: tokio::time::Instant::now(),
+                auto_active: false,
+                pressure: 0,
+                auto_on_full,
+                auto_off_ok,
+            }
+        }
+
+        fn should_pace(&self) -> bool {
+            self.enabled
+                && match self.mode {
+                    PaceMode::Manual => true,
+                    PaceMode::Auto => self.auto_active,
+                }
+        }
+
+        fn on_send_ok(&mut self) {
+            if !self.enabled || self.mode != PaceMode::Auto {
+                return;
+            }
+            self.pressure = self.pressure.saturating_sub(1);
+            if self.auto_active && self.pressure <= -self.auto_off_ok {
+                self.auto_active = false;
+                self.pressure = 0;
+            }
+        }
+
+        fn on_send_full(&mut self) {
+            if !self.enabled || self.mode != PaceMode::Auto {
+                return;
+            }
+            self.pressure = self.pressure.saturating_add(4).clamp(-10_000, 10_000);
+            if !self.auto_active && self.pressure >= self.auto_on_full {
+                self.auto_active = true;
+                self.tokens = self.burst;
+                self.last_refill = tokio::time::Instant::now();
+            }
+        }
+
+        async fn wait_turn(&mut self) {
+            if !self.should_pace() {
+                return;
+            }
+            loop {
+                let now = tokio::time::Instant::now();
+                let elapsed = now.saturating_duration_since(self.last_refill);
+                let step = self.interval.as_secs_f64();
+                if step > 0.0 {
+                    self.tokens =
+                        (self.tokens + elapsed.as_secs_f64() / step).clamp(0.0, self.burst);
+                }
+                self.last_refill = now;
+                if self.tokens >= 1.0 {
+                    self.tokens -= 1.0;
+                    return;
+                }
+                let need = ((1.0 - self.tokens).max(0.0) * step).clamp(0.0, 0.050);
+                tokio::time::sleep(Duration::from_secs_f64(need)).await;
+            }
+        }
+    }
+
+    struct QueueRateLink {
+        enabled: bool,
+        min_fps: u32,
+        max_fps: u32,
+        down_step: u32,
+        up_step: u32,
+        full_threshold: u32,
+        ok_threshold: u32,
+        cooldown: Duration,
+        full_streak: u32,
+        ok_streak: u32,
+        last_change: Instant,
+        fps_ref: Option<Arc<AtomicU32>>,
+    }
+
+    impl QueueRateLink {
+        fn from_env(fps_ref: Option<Arc<AtomicU32>>) -> Self {
+            let enabled = std::env::var("AGENT_QUIC_QUEUE_RATE_LINK_ENABLE")
+                .ok()
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(true);
+            let current_fps = fps_ref
+                .as_ref()
+                .map(|v| v.load(Ordering::Relaxed))
+                .unwrap_or(60)
+                .max(1);
+            let min_fps = std::env::var("AGENT_QUIC_QUEUE_RATE_LINK_MIN_FPS")
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(24)
+                .clamp(1, 240);
+            let max_fps = std::env::var("AGENT_QUIC_QUEUE_RATE_LINK_MAX_FPS")
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(current_fps.max(min_fps))
+                .clamp(min_fps, 240);
+            let down_step = std::env::var("AGENT_QUIC_QUEUE_RATE_LINK_DOWN_STEP")
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(8)
+                .clamp(1, 60);
+            let up_step = std::env::var("AGENT_QUIC_QUEUE_RATE_LINK_UP_STEP")
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(2)
+                .clamp(1, 30);
+            let full_threshold = std::env::var("AGENT_QUIC_QUEUE_RATE_LINK_FULL_THRESHOLD")
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(8)
+                .clamp(1, 2000);
+            let ok_threshold = std::env::var("AGENT_QUIC_QUEUE_RATE_LINK_OK_THRESHOLD")
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(120)
+                .clamp(1, 20_000);
+            let cooldown_ms = std::env::var("AGENT_QUIC_QUEUE_RATE_LINK_COOLDOWN_MS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(200)
+                .clamp(0, 10_000);
+            Self {
+                enabled: enabled && fps_ref.is_some(),
+                min_fps,
+                max_fps,
+                down_step,
+                up_step,
+                full_threshold,
+                ok_threshold,
+                cooldown: Duration::from_millis(cooldown_ms),
+                full_streak: 0,
+                ok_streak: 0,
+                last_change: Instant::now(),
+                fps_ref,
+            }
+        }
+
+        fn reduce_on_full(&mut self) {
+            if !self.enabled {
+                return;
+            }
+            self.full_streak = self.full_streak.saturating_add(1);
+            self.ok_streak = 0;
+            if self.full_streak < self.full_threshold || self.last_change.elapsed() < self.cooldown {
+                return;
+            }
+            if let Some(fps_ref) = &self.fps_ref {
+                let cur = fps_ref.load(Ordering::Relaxed).max(1);
+                let next = cur.saturating_sub(self.down_step).clamp(self.min_fps, self.max_fps);
+                if next < cur {
+                    fps_ref.store(next, Ordering::Relaxed);
+                    self.last_change = Instant::now();
+                    self.full_streak = 0;
+                    warn!(current_fps = cur, next_fps = next, "queue-pressure rate link downshift");
+                }
+            }
+        }
+
+        fn recover_on_ok(&mut self) {
+            if !self.enabled {
+                return;
+            }
+            self.ok_streak = self.ok_streak.saturating_add(1);
+            self.full_streak = 0;
+            if self.ok_streak < self.ok_threshold || self.last_change.elapsed() < self.cooldown {
+                return;
+            }
+            if let Some(fps_ref) = &self.fps_ref {
+                let cur = fps_ref.load(Ordering::Relaxed).max(1);
+                let next = cur.saturating_add(self.up_step).clamp(self.min_fps, self.max_fps);
+                if next > cur {
+                    fps_ref.store(next, Ordering::Relaxed);
+                    self.last_change = Instant::now();
+                    self.ok_streak = 0;
+                    info!(current_fps = cur, next_fps = next, "queue-pressure rate link recover");
+                }
+            }
+        }
+    }
+
     let quic_debug = std::env::var("AGENT_QUIC_DEBUG")
         .ok()
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -2274,6 +3549,8 @@ async fn spawn_send_loop_quic(
     let mut last_sps: Option<Vec<u8>> = None;
     let mut last_pps: Option<Vec<u8>> = None;
     let mut dropped = 0_u64;
+    let mut pacer = QuicPacer::from_env();
+    let mut rate_link = QueueRateLink::from_env(queue_link_fps.clone());
     while session_running.load(Ordering::SeqCst) {
         let encoded = match encoded_rx.recv().await {
             Some(v) => v,
@@ -2326,8 +3603,11 @@ async fn spawn_send_loop_quic(
                 capture_start_us
             },
         };
+        pacer.wait_turn().await;
         match quic_sender.try_send(quic_au) {
             Ok(()) => {
+                pacer.on_send_ok();
+                rate_link.recover_on_ok();
                 stats.sent_au_total.fetch_add(1, Ordering::Relaxed);
                 stats.unique_sent_au_total.fetch_add(1, Ordering::Relaxed);
                 stats.quic_au_sent.fetch_add(1, Ordering::Relaxed);
@@ -2336,6 +3616,8 @@ async fn spawn_send_loop_quic(
                     .fetch_add(out.len() as u64, Ordering::Relaxed);
             }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                pacer.on_send_full();
+                rate_link.reduce_on_full();
                 dropped = dropped.saturating_add(1);
                 stats.quic_au_dropped.fetch_add(1, Ordering::Relaxed);
                 if dropped.is_multiple_of(120) {
@@ -2455,6 +3737,16 @@ async fn ws_send_json(ws: &Arc<Mutex<WsWrite>>, v: &Value) -> Result<()> {
 fn advance_send_deadline(prev_due: Instant, gap: Duration, now: Instant) -> Instant {
     let next = prev_due + gap;
     if next < now { now } else { next }
+}
+
+fn wait_encode_tick(next_due: &mut Instant, fps: u32) {
+    let fps = fps.max(1);
+    let gap = Duration::from_millis((1000.0 / fps as f64).max(1.0) as u64);
+    let now = Instant::now();
+    if *next_due > now {
+        std::thread::sleep(*next_due - now);
+    }
+    *next_due = Instant::now() + gap;
 }
 
 async fn wait_until_due(deadline: Instant) {
@@ -2611,5 +3903,29 @@ mod tests {
         assert!(!should_force_webrtc_manual_packetizer(Some("0")));
         assert!(!should_force_webrtc_manual_packetizer(Some("false")));
         assert!(!should_force_webrtc_manual_packetizer(Some("off")));
+    }
+
+    #[test]
+    fn parse_transport_priority_filters_invalid_items() {
+        let parsed = parse_transport_priority("webtransport,invalid,quic,webrtc");
+        assert_eq!(
+            parsed,
+            vec![
+                SessionTransport::WebTransport,
+                SessionTransport::Quic,
+                SessionTransport::WebRtc
+            ]
+        );
+    }
+
+    #[test]
+    fn controller_supports_transport_respects_protocol_caps() {
+        let caps = json!({ "protocols": ["webrtc", "quic"] });
+        assert!(controller_supports_transport(&caps, SessionTransport::WebRtc));
+        assert!(controller_supports_transport(&caps, SessionTransport::Quic));
+        assert!(!controller_supports_transport(
+            &caps,
+            SessionTransport::WebTransport
+        ));
     }
 }

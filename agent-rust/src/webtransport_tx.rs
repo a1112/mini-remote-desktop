@@ -6,7 +6,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use wtransport::endpoint::IncomingSession;
-use wtransport::{Endpoint, Identity, ServerConfig};
+use wtransport::{Endpoint, Identity, SendStream, ServerConfig};
 
 #[derive(Clone, Debug)]
 pub struct WebTransportAdvert {
@@ -79,12 +79,7 @@ async fn handle_incoming_session(
         .context("webtransport session accept failed")?;
     info!(remote = %connection.remote_address(), "webtransport client connected");
 
-    let mut stream = connection
-        .open_uni()
-        .await
-        .context("webtransport open uni init failed")?
-        .await
-        .context("webtransport open uni failed")?;
+    let mut stream = open_send_stream(&connection).await?;
 
     while let Some(frame) = rx.recv().await {
         let len = frame.payload.len() as u32;
@@ -107,6 +102,42 @@ async fn handle_incoming_session(
         }
     }
     Ok(true)
+}
+
+async fn open_send_stream(connection: &wtransport::Connection) -> Result<SendStream> {
+    let mut last_error = String::new();
+    for _ in 0..20 {
+        match connection.open_uni().await {
+            Ok(opening) => match opening.await {
+                Ok(stream) => return Ok(stream),
+                Err(e) => {
+                    last_error = format!("open_uni failed: {e}");
+                }
+            },
+            Err(e) => {
+                last_error = format!("open_uni init failed: {e}");
+            }
+        }
+
+        match connection.open_bi().await {
+            Ok(opening) => match opening.await {
+                Ok((send_stream, _recv_stream)) => return Ok(send_stream),
+                Err(e) => {
+                    last_error = format!("open_bi failed: {e}");
+                }
+            },
+            Err(e) => {
+                last_error = format!("open_bi init failed: {e}");
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    Err(anyhow::anyhow!(
+        "webtransport open stream failed after retries: {}",
+        last_error
+    ))
 }
 
 pub fn start_webtransport_sender(

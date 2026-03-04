@@ -38,3 +38,4 @@ tools/ffmpeg-min/
 /agent-rust/target-codex-debug
 client-qt/venv
 /tools/ffmpeg_full_build/
+/logs

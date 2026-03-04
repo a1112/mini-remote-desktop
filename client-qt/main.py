@@ -110,7 +110,7 @@ def main():
     app.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps, True)
 
     # Create and show main window
-    window = MainWindow()
+    window = MainWindow(signaling_url=args.signaling_url)
     window.show()
 
     logger.info("Application started")

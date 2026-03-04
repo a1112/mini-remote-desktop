@@ -1,0 +1,10 @@
+﻿{
+  "duration_sec": 8,
+  "thresholds": {
+    "control_connect_timeout_sec": 20,
+    "min_frames": {"webrtc": 20, "quic": 20, "webtransport": 10},
+    "jitter": {"p95_ms_max": 80.0, "p99_ms_max": 200.0, "gt_100ms_max": 20, "gt_200ms_max": 5},
+    "agent_errors_max": 10,
+    "agent_quic_drop_max": 5000
+  }
+}

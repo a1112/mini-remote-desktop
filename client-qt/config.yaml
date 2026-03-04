@@ -33,6 +33,16 @@ protocols:
     enabled: true
     # JPEG streaming settings
 
+# Runtime transport controls sent via signaling "updateCapture"
+transport_controls:
+  quic_pacer:
+    enable: false
+    mode: "auto"          # auto, manual
+    interval_ms: 2        # token refill interval
+    burst: 4              # token bucket burst
+    auto_on_full: 8       # queue-full pressure threshold to enable pacing
+    auto_off_ok: 64       # consecutive-send relief threshold to disable pacing
+
 # Video Configuration
 video:
   # Decoder settings

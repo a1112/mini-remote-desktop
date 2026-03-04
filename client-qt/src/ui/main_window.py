@@ -4,6 +4,7 @@ Main application window for the remote desktop client.
 
 import asyncio
 import logging
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -20,6 +21,7 @@ import numpy.typing as npt
 
 from ..core.stats import Stats, ConnectionState
 from ..signaling.client import SignalingClient, SignalingConfig
+from ..signaling.protocol import DeviceInfo
 from ..protocols.manager import ProtocolManager, ProtocolConfig
 from .video_view_factory import create_video_view
 from .device_panel import DevicePanel
@@ -38,13 +40,16 @@ class MainWindow(QMainWindow):
     - UI components (Video, Device list, Stats)
     """
 
-    def __init__(self):
+    def __init__(self, signaling_url: Optional[str] = None):
         """Initialize main window."""
         super().__init__()
         self._initializing_controls = True
 
         # Configuration
         self._load_config()
+        if signaling_url:
+            self._config.setdefault("signaling", {})
+            self._config["signaling"]["ws_url"] = signaling_url
 
         # Core components
         self._signaling = SignalingClient(SignalingConfig(
@@ -60,7 +65,13 @@ class MainWindow(QMainWindow):
         self._stats = Stats()
 
         # Event loop reference
-        self._event_loop = asyncio.get_event_loop()
+        self._async_loop = asyncio.new_event_loop()
+        self._async_thread = threading.Thread(
+            target=self._run_async_loop,
+            name="qt-client-async-loop",
+            daemon=True,
+        )
+        self._async_thread.start()
         self._pending_tasks = []
 
         # Setup UI
@@ -194,6 +205,40 @@ class MainWindow(QMainWindow):
         self._ctrl_encoder = add_combo(["nvenc", "openh264", "auto"], self._on_encoder_changed)
         layout.addWidget(self._ctrl_encoder)
 
+        pacer_cfg = (
+            self._config.get("transport_controls", {})
+            .get("quic_pacer", {})
+        )
+        add_label("PACER")
+        self._ctrl_pacer_enable = add_combo(["off", "on"], self._on_quic_pacer_changed)
+        self._ctrl_pacer_enable.setCurrentText("on" if bool(pacer_cfg.get("enable", False)) else "off")
+        layout.addWidget(self._ctrl_pacer_enable)
+
+        add_label("MODE")
+        self._ctrl_pacer_mode = add_combo(["auto", "manual"], self._on_quic_pacer_changed)
+        self._ctrl_pacer_mode.setCurrentText(str(pacer_cfg.get("mode", "auto")).lower())
+        layout.addWidget(self._ctrl_pacer_mode)
+
+        add_label("I")
+        self._ctrl_pacer_interval = add_combo(["1", "2", "3", "4", "5", "8"], self._on_quic_pacer_changed)
+        self._ctrl_pacer_interval.setCurrentText(str(int(pacer_cfg.get("interval_ms", 2))))
+        layout.addWidget(self._ctrl_pacer_interval)
+
+        add_label("B")
+        self._ctrl_pacer_burst = add_combo(["1", "2", "4", "6", "8", "12", "16"], self._on_quic_pacer_changed)
+        self._ctrl_pacer_burst.setCurrentText(str(int(pacer_cfg.get("burst", 4))))
+        layout.addWidget(self._ctrl_pacer_burst)
+
+        add_label("ON")
+        self._ctrl_pacer_on_full = add_combo(["4", "8", "12", "16", "24", "32"], self._on_quic_pacer_changed)
+        self._ctrl_pacer_on_full.setCurrentText(str(int(pacer_cfg.get("auto_on_full", 8))))
+        layout.addWidget(self._ctrl_pacer_on_full)
+
+        add_label("OFF")
+        self._ctrl_pacer_off_ok = add_combo(["16", "32", "64", "96", "128", "256"], self._on_quic_pacer_changed)
+        self._ctrl_pacer_off_ok.setCurrentText(str(int(pacer_cfg.get("auto_off_ok", 64))))
+        layout.addWidget(self._ctrl_pacer_off_ok)
+
         layout.addStretch(1)
         return bar
 
@@ -252,6 +297,49 @@ class MainWindow(QMainWindow):
         if self._initializing_controls:
             return
         self._send_capture_patch({"encoder": self._ctrl_encoder.currentText()})
+
+    def _build_quic_pacer_patch(self) -> dict:
+        try:
+            interval_ms = int(self._ctrl_pacer_interval.currentText())
+        except ValueError:
+            interval_ms = 2
+        try:
+            burst = int(self._ctrl_pacer_burst.currentText())
+        except ValueError:
+            burst = 4
+        try:
+            auto_on_full = int(self._ctrl_pacer_on_full.currentText())
+        except ValueError:
+            auto_on_full = 8
+        try:
+            auto_off_ok = int(self._ctrl_pacer_off_ok.currentText())
+        except ValueError:
+            auto_off_ok = 64
+        patch = {
+            "quicPacer": {
+                "enable": self._ctrl_pacer_enable.currentText() == "on",
+                "mode": self._ctrl_pacer_mode.currentText(),
+                "intervalMs": max(1, min(100, interval_ms)),
+                "burst": max(1, min(16, burst)),
+                "autoOnFull": max(1, min(1000, auto_on_full)),
+                "autoOffOk": max(1, min(5000, auto_off_ok)),
+            }
+        }
+        self._config.setdefault("transport_controls", {})
+        self._config["transport_controls"]["quic_pacer"] = {
+            "enable": patch["quicPacer"]["enable"],
+            "mode": patch["quicPacer"]["mode"],
+            "interval_ms": patch["quicPacer"]["intervalMs"],
+            "burst": patch["quicPacer"]["burst"],
+            "auto_on_full": patch["quicPacer"]["autoOnFull"],
+            "auto_off_ok": patch["quicPacer"]["autoOffOk"],
+        }
+        return patch
+
+    def _on_quic_pacer_changed(self, _index: int) -> None:
+        if self._initializing_controls:
+            return
+        self._send_capture_patch(self._build_quic_pacer_patch())
 
     def _create_left_panel(self) -> QWidget:
         """Create left panel with device list and stats."""
@@ -378,19 +466,47 @@ class MainWindow(QMainWindow):
         self._device_panel.disconnect_requested.connect(self._on_device_disconnect)
 
         # Protocol manager signals
-        self._protocol_manager.on_frame_received(self._on_video_frame)
-        self._protocol_manager.on_stats_update(self._on_stats_update)
-        self._protocol_manager.on_state_change(self._on_connection_state)
+        self._protocol_manager.on_frame_received(
+            lambda frame: self._ui_call(self._on_video_frame, frame)
+        )
+        self._protocol_manager.on_stats_update(
+            lambda stats: self._ui_call(self._on_stats_update, stats)
+        )
+        self._protocol_manager.on_state_change(
+            lambda state: self._ui_call(self._on_connection_state, state)
+        )
 
         # Signaling client signals
-        self._signaling.on("connected", self._on_signaling_connected)
-        self._signaling.on("registered", self._on_signaling_registered)
-        self._signaling.on("device_list", self._on_device_list)
-        self._signaling.on("device_offline", self._on_device_offline)
-        self._signaling.on("answer", self._on_webrtc_answer)
-        self._signaling.on("ice_candidate", self._on_ice_candidate)
-        self._signaling.on("disconnected", self._on_signaling_disconnected)
-        self._signaling.on("error", self._on_signaling_error)
+        self._signaling.on(
+            "connected",
+            lambda device_id: self._ui_call(self._on_signaling_connected, device_id),
+        )
+        self._signaling.on(
+            "registered",
+            lambda device_id, device_list: self._ui_call(
+                self._on_signaling_registered, device_id, device_list
+            ),
+        )
+        self._signaling.on(
+            "device_list",
+            lambda device_list: self._ui_call(self._on_device_list, device_list),
+        )
+        self._signaling.on(
+            "device_offline",
+            lambda device_id: self._ui_call(self._on_device_offline, device_id),
+        )
+        self._signaling.on(
+            "answer",
+            lambda answer_sdp: self._ui_call(self._on_webrtc_answer, answer_sdp),
+        )
+        self._signaling.on(
+            "ice_candidate",
+            lambda candidate: self._ui_call(self._on_ice_candidate, candidate),
+        )
+        self._signaling.on(
+            "disconnected", lambda: self._ui_call(self._on_signaling_disconnected)
+        )
+        self._signaling.on("error", lambda err: self._ui_call(self._on_signaling_error, err))
 
         # Stats signals
         self._stats.register_callback(self._on_stats_callback)
@@ -424,7 +540,6 @@ class MainWindow(QMainWindow):
 
     def _on_device_list(self, device_list: list) -> None:
         """Handle device list update."""
-        from ...signaling.protocol import DeviceInfo
         devices = [DeviceInfo.from_dict(d) if isinstance(d, dict) else d for d in device_list]
         self._device_panel.set_devices(devices)
 
@@ -551,21 +666,25 @@ a=setup:actpass
         self._status_bar.showMessage(f"Error: {error}")
 
     def _run_async(self, coro) -> None:
-        """Run async coroutine in a background thread."""
-        import concurrent.futures
-
-        def run_in_thread():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+        """Run coroutine on the dedicated background asyncio loop."""
+        if self._async_loop.is_closed():
+            logger.warning("Async loop is already closed; dropping task")
+            return
+        future = asyncio.run_coroutine_threadsafe(coro, self._async_loop)
+        self._pending_tasks.append(future)
+        def _cleanup(done_future):
             try:
-                loop.run_until_complete(coro)
-            finally:
-                loop.close()
+                self._pending_tasks.remove(done_future)
+            except ValueError:
+                pass
+        future.add_done_callback(_cleanup)
 
-        # Run in thread pool to avoid blocking Qt
-        import threading
-        thread = threading.Thread(target=run_in_thread, daemon=True)
-        thread.start()
+    def _run_async_loop(self) -> None:
+        asyncio.set_event_loop(self._async_loop)
+        self._async_loop.run_forever()
+
+    def _ui_call(self, fn, *args, **kwargs) -> None:
+        QTimer.singleShot(0, lambda: fn(*args, **kwargs))
 
     def _show_settings(self) -> None:
         """Show settings dialog."""
@@ -592,9 +711,15 @@ a=setup:actpass
 
         self._run_async(cleanup())
 
-        # Cancel pending tasks
-        for task in self._pending_tasks:
+        # Cancel pending tasks submitted to async loop
+        for task in list(self._pending_tasks):
             if not task.done():
                 task.cancel()
+
+        # Stop dedicated async loop
+        if not self._async_loop.is_closed():
+            self._async_loop.call_soon_threadsafe(self._async_loop.stop)
+        if self._async_thread.is_alive():
+            self._async_thread.join(timeout=1.0)
 
         event.accept()
