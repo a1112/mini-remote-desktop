@@ -1,118 +1,75 @@
-# Agent Rust Support Matrix
+﻿# agent-rust 支持列表与扩展方向（2026-03-04）
 
-This document summarizes the current supported capabilities in `mini-remote-desktop/agent-rust` based on source code and runtime config.
+## 当前支持列表
 
-## Scope
+### 1) 传输与会话
+- WebRTC 视频主链路（H264）
+- QUIC 发送链路（实验/并行路径）
+- WebTransport 发送链路（实验/并行路径）
+- 信令注册能力上报（`webrtc/quic/webtransport`）
+- 控制通道双路接收：`ctrl_rt`（实时）/`ctrl_rel`（可靠）
 
-- Project: `mini-remote-desktop/agent-rust`
-- Key files reviewed:
-- `src/main.rs`
-- `src/lib.rs`
-- `src/capture_policy.rs`
-- `src/capture_runtime.rs`
-- `src/encoder_policy.rs`
-- `src/encoder_runtime.rs`
-- `src/input_injector.rs`
-- `src/net_adapt.rs`
-- `src/quic_tx.rs`
-- `src/webtransport_tx.rs`
-- `config.json`
+### 2) 控制协议（common-control-proto）
+- 协议版本：`v2`
+- 已支持事件：
+  - 鼠标：移动、按键、滚轮
+  - 键盘：按下/抬起
+  - 手柄：轴/按键（协议已支持）
+  - 剪贴板：`ClipboardSet` / `ClipboardGet`
+  - 文件：`FileControl` / `FileChunk`
+  - 音频控制：`AudioControl`
+- 事件分类：
+  - `Realtime`：MouseMove / MouseWheel / GamepadAxis
+  - `Reliable`：其余事件
 
-## Current Support List
+### 3) Agent 注入与处理
+- Windows `SendInput`：鼠标 + 键盘注入已实现
+- 手柄注入：当前为 stub（记录告警，未接入虚拟手柄驱动）
+- 剪贴板：已接入事件处理，当前为进程内缓存（历史队列）
+- 文件传输：已接入控制与分片重组（内存态），支持 begin/chunk/complete/cancel 基础流
+- 音频控制：已接入会话参数管理（内存态）
 
-| Area | Status | Details |
-|---|---|---|
-| Signaling | Supported | WebSocket signaling (`ws_url`), register handshake, offer/answer, ICE candidate exchange. |
-| Protocol negotiation | Supported | Negotiates `webrtc` / `quic` / `webtransport` per session. |
-| Media codec | Supported (video) | Advertised codec is `h264`. |
-| Capture backends | Supported | `dxgi`, `wgc`, `powershell`, `dummy`, with fallback policy. |
-| Encoder backends | Supported | `nvenc`, `qsv`, `amf`, `openh264`, with fallback policy and strict mode. |
-| WebRTC media path | Supported | RTP H264 send loop with manual packetizer strategy and IDR bootstrap gating. |
-| QUIC media path | Supported | Access Unit send over QUIC uni-stream with frame envelope and queueing. |
-| WebTransport media path | Supported | WebTransport uni-stream send with self-signed cert + hash advertisement. |
-| RTCP feedback loop | Supported | Handles PLI/FIR/NACK/REMB and updates adaptive targets. |
-| Adaptive quality control | Supported | Tiered FPS/bitrate adaptation, recovery logic, RTT-based network type detection hooks. |
-| Dynamic capture update | Supported | `control/updateCapture` applies patch and restarts peer sessions. |
-| Input injection | Partial | Mouse move/button/wheel + keyboard via Windows SendInput. |
-| Gamepad control | Not fully supported | Gamepad event branch exists but is stubbed (warning only). |
-| Multi-client sessions | Supported | Session map with per-controller connection, max-client guard (`AGENT_MAX_CLIENTS`). |
-| Stats/observability | Supported | Runtime stats panel, RTCP counters, control latency panel logs. |
-| Platform runtime | Windows-focused | Capability advertises `platforms: ["windows"]`; Windows capture/input paths are primary. |
+### 4) 观测与验证
+- 控制路径延迟统计：`[CTRL-LAT]` 每秒输出 `P50/P95/P99`
+- 本地验证结果：
+  - `common-control-proto`: `cargo test` 通过
+  - `agent-rust`: `cargo check` / `cargo test` 通过
 
-## Configuration Surface (High-Level)
+## 扩展方向（设计 1 / 2 / 3）
 
-Main configurable dimensions in `CaptureConfig`:
+### 设计 1：剪贴板系统级落地（跨平台最小闭环）
+目标：把当前“内存态剪贴板”升级为“系统剪贴板读写”。
+- Windows: `OpenClipboard/GetClipboardData/SetClipboardData`
+- Linux/macOS: 使用平台适配层（x11/wayland/pbcopy）
+- 增加 `ClipboardGet` 的响应回传通道（当前仅本地处理）
 
-- Capture and render pacing: `fps`, `min_fps`, `max_fps`, `idle_repeat_fps`, `frame_pacing_enable`, `queue_depth`, `queue_strategy`
-- Capture backend and fallback: `backend`, `allow_fallback`, `strict_gpu_direct`
-- Encoder and rate control: `encoder`, `allow_encoder_fallback`, `encoder_preset`, `encoder_tune`, `rc_mode`, `bitrate_kbps`, `max_bitrate_kbps`, `gop`, `bframes`
-- RTP path options: `rtp_use_manual_packetizer`, `rtp_mtu`, `rtp_au_align`, `force_idr_on_pli`, `idr_interval_sec`
-- Adaptation and profile: `adapt_enable`, `adapt_mode`, `performance_profile`, `profile_template`, `network_adapt_enable`
-- Multi-tier limits: `tier_limit_enable` + L1-L5 FPS/bitrate ladder settings
+已执行：
+- 协议与 agent 事件入口已打通（`ClipboardSet/Get`）
+- 当前状态可用于联调和压测，但不具备系统粘贴板互通
 
-## Known Gaps
+### 设计 2：文件传输可靠化（可恢复、可校验）
+目标：把当前“内存重组”升级为“可断点恢复 + 落盘 + 校验”。
+- 增加 transfer 元信息（文件名、大小、mtime、权限）
+- 分片 ACK/NACK 与重传窗口
+- 断线重连后按 `transfer_id + chunk_idx` 续传
+- 完整 SHA-256 校验（当前为 16 字节摘要占位）
 
-| Gap | Impact |
-|---|---|
-| No audio pipeline | Remote desktop experience is video-only; missing voice/system-audio use cases. |
-| Gamepad not implemented | Controller/gamepad scenarios cannot be executed end-to-end. |
-| Clipboard/file transfer not in agent-rust data path | Productivity workflows remain incomplete for desktop control. |
-| Cross-platform execution is limited | Linux/macOS capture/input parity is not complete in this Rust agent. |
-| WebRTC codec diversity not exposed | H264-only path limits compatibility/performance tuning options. |
+已执行：
+- `FileControl/FileChunk` 编解码完成
+- agent 侧 begin/chunk/complete/cancel 流程可跑通
 
-## Recommended Expansion Directions
+### 设计 3：手柄与音频控制生产化
+目标：完成“可用输入外设 + 音频参数联动”的生产链路。
+- 手柄：接入 ViGEm（Windows）实现虚拟 XInput 注入
+- 音频：将 `AudioControl` 与采集/编码配置联动（codec/rate/ch/frame）
+- 增加端到端兼容矩阵（Xbox/DS 系列映射）
 
-### Priority 1: Complete control-plane ergonomics
+已执行：
+- 协议已支持 `Gamepad*` 与 `AudioControl`
+- agent 侧 `AudioControl` 已有状态管理入口
+- 手柄仍是 stub，需下一阶段驱动级实现
 
-- Implement gamepad injection path (axis/button mapping and deadzone handling).
-- Add clipboard sync as reliable control channel messages.
-- Add file transfer control/data protocol (chunking, resume, integrity check).
-
-Why first:
-
-- These features directly increase user-perceived completeness of remote control.
-- They reuse existing reliable/realtime control channel architecture.
-
-### Priority 2: Add audio streaming and A/V synchronization
-
-- Add optional audio capture and transport channel.
-- Define sync strategy between video timestamps and audio playout timestamps.
-- Expose config toggles for audio bitrate/latency profile.
-
-Why second:
-
-- Audio is a major capability gap for practical remote desktop usage.
-- Existing transport/metrics code can be extended for audio telemetry.
-
-### Priority 3: Transport hardening and resilience
-
-- Unify QUIC/WebTransport sender behavior and backpressure policy.
-- Add better reconnect and session-resume behavior for transient network loss.
-- Add end-to-end transport compatibility tests across protocol modes.
-
-Why third:
-
-- Current core works, but robustness under unstable networks is where production quality is decided.
-
-### Priority 4: Cross-platform roadmap
-
-- Introduce Linux/macOS capture backend abstractions with capability advert updates.
-- Separate platform-specific input injectors behind trait-based interfaces.
-
-Why fourth:
-
-- Enables wider deployment while preserving current Windows-optimized path.
-
-## Practical Next-Step Plan
-
-- Step 1: Implement gamepad injection (smallest high-impact gap).
-- Step 2: Add clipboard sync over reliable channel.
-- Step 3: Add audio pipeline prototype behind feature flag.
-- Step 4: Add protocol-mode integration tests (webrtc/quic/webtransport matrix).
-
-## Validation Checklist for Future Extensions
-
-- Unit tests for config normalization and fallback behavior.
-- Integration tests for offer negotiation by selected transport.
-- Runtime soak tests with adaptive mode on/off and tier limit on/off.
-- Latency and dropped-frame metrics baselines captured per protocol mode.
+## 建议优先级
+1. 先做设计 2（文件可靠化）：收益最大，且不依赖驱动。
+2. 再做设计 1（系统剪贴板）：快速形成用户可感知功能闭环。
+3. 最后做设计 3（ViGEm + 音频联动）：实现复杂度最高，适合在前两项稳定后推进。

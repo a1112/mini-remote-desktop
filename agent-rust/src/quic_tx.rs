@@ -51,10 +51,13 @@ pub fn start_quic_sender(
 
     let cert_chain = vec![CertificateDer::from(cert_der.clone())];
     let key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(key_der));
-    let server_config =
-        ServerConfig::with_single_cert(cert_chain, key).context("quic: build server config failed")?;
-    let endpoint = Endpoint::server(server_config, bind_addr).context("quic: bind endpoint failed")?;
-    let local_addr = endpoint.local_addr().context("quic: read local addr failed")?;
+    let server_config = ServerConfig::with_single_cert(cert_chain, key)
+        .context("quic: build server config failed")?;
+    let endpoint =
+        Endpoint::server(server_config, bind_addr).context("quic: bind endpoint failed")?;
+    let local_addr = endpoint
+        .local_addr()
+        .context("quic: read local addr failed")?;
     let advertise_addr = std::env::var("AGENT_QUIC_ADVERTISE_ADDR")
         .ok()
         .filter(|s| !s.trim().is_empty())

@@ -7,8 +7,8 @@ use rtp::sequence::new_random_sequencer;
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
-use webrtc::util::marshal::{Marshal, MarshalSize};
 use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
+use webrtc::util::marshal::{Marshal, MarshalSize};
 
 pub const TX_UNIX_US_EXT_URI: &str = "urn:mini-remote-desktop:tx-unix-us";
 

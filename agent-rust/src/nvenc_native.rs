@@ -19,15 +19,14 @@ mod imp {
     use windows::Win32::Graphics::Direct3D11::{
         D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_FLAG,
         D3D11_SDK_VERSION, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC,
-        D3D11_USAGE_DEFAULT,
-        D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
-        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0,
-        D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0,
-        D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
-        D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D, D3D11CreateDevice,
-        ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D, ID3D11VideoContext,
-        ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator,
-        ID3D11VideoProcessorOutputView,
+        D3D11_USAGE_DEFAULT, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+        D3D11_VIDEO_PROCESSOR_CONTENT_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC,
+        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC,
+        D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_STREAM,
+        D3D11_VIDEO_USAGE_PLAYBACK_NORMAL, D3D11_VPIV_DIMENSION_TEXTURE2D,
+        D3D11_VPOV_DIMENSION_TEXTURE2D, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
+        ID3D11Resource, ID3D11Texture2D, ID3D11VideoContext, ID3D11VideoDevice,
+        ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorOutputView,
     };
     use windows::Win32::Graphics::Dxgi::{
         Common::{
@@ -35,9 +34,9 @@ mod imp {
             DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_SAMPLE_DESC,
         },
         CreateDXGIFactory1, DXGI_ADAPTER_DESC1, DXGI_ADAPTER_FLAG3_REMOTE,
-        DXGI_ADAPTER_FLAG3_SOFTWARE, DXGI_OUTDUPL_FRAME_INFO, IDXGIAdapter, IDXGIAdapter1,
-        IDXGIFactory1, IDXGIOutput1, IDXGIOutput5, IDXGIOutputDuplication, IDXGIResource,
-        DXGI_ERROR_WAIT_TIMEOUT,
+        DXGI_ADAPTER_FLAG3_SOFTWARE, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
+        IDXGIAdapter, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1, IDXGIOutput5,
+        IDXGIOutputDuplication, IDXGIResource,
     };
     use windows::core::Interface;
 
@@ -66,7 +65,7 @@ mod imp {
         // Health monitoring fields
         pub direct_path_streak: u32,
         pub consecutive_failures: u32,
-        pub health_check_last: u64,  // Unix timestamp us
+        pub health_check_last: u64, // Unix timestamp us
     }
 
     impl NativePathStats {
@@ -220,7 +219,11 @@ mod imp {
                         .map(|p| out_name.to_ascii_lowercase() == *p)
                         .unwrap_or(false);
                     let index_match = preferred_output_index.map(|p| *oi == p).unwrap_or(false);
-                    let preferred_rank = if name_match || index_match { 0_u8 } else { 1_u8 };
+                    let preferred_rank = if name_match || index_match {
+                        0_u8
+                    } else {
+                        1_u8
+                    };
                     let attached_rank = if *attached { 0_u8 } else { 1_u8 };
                     (preferred_rank, attached_rank, *oi)
                 });
@@ -422,7 +425,8 @@ mod imp {
                         Err(e) => {
                             self.stats.direct_register_failures =
                                 self.stats.direct_register_failures.saturating_add(1);
-                            self.stats.consecutive_failures = self.stats.consecutive_failures.saturating_add(1);
+                            self.stats.consecutive_failures =
+                                self.stats.consecutive_failures.saturating_add(1);
                             self.stats.direct_path_streak = 0;
                             if self.strict_gpu_direct {
                                 return Err(anyhow!(
@@ -658,8 +662,7 @@ mod imp {
                 }
                 Err(e) => {
                     if e.code() == DXGI_ERROR_WAIT_TIMEOUT {
-                        self.acquire_timeout_streak =
-                            self.acquire_timeout_streak.saturating_add(1);
+                        self.acquire_timeout_streak = self.acquire_timeout_streak.saturating_add(1);
                         self.stats.acquire_timeout = self.stats.acquire_timeout.saturating_add(1);
                         // Repeated empty polls can monopolize the D3D lock path and delay other
                         // GPU work (reinit/copy/encode setup). Yield briefly on streaked timeouts.
@@ -794,10 +797,11 @@ mod imp {
                     .iter()
                     .position(|(k, _)| *k == src_key);
                 if direct_idx.is_none() {
-                    match self
-                        .encoder
-                        .register_resource_dx11(src_texture, NVencBufferFormat::ARGB, 0)
-                    {
+                    match self.encoder.register_resource_dx11(
+                        src_texture,
+                        NVencBufferFormat::ARGB,
+                        0,
+                    ) {
                         Ok(resource) => {
                             self.direct_resources.push_back((src_key, resource));
                             while self.direct_resources.len() > self.direct_resource_capacity {
@@ -811,7 +815,8 @@ mod imp {
                         Err(e) => {
                             self.stats.direct_register_failures =
                                 self.stats.direct_register_failures.saturating_add(1);
-                            self.stats.consecutive_failures = self.stats.consecutive_failures.saturating_add(1);
+                            self.stats.consecutive_failures =
+                                self.stats.consecutive_failures.saturating_add(1);
                             self.stats.direct_path_streak = 0;
                             if self.strict_gpu_direct {
                                 return Err(anyhow!(
@@ -1315,7 +1320,9 @@ impl NativeNvencTexturePipeline {
         _height: u32,
         _cfg: &agent_rust::CaptureConfig,
     ) -> Result<Self> {
-        Err(anyhow!("native NVENC texture pipeline only supports Windows"))
+        Err(anyhow!(
+            "native NVENC texture pipeline only supports Windows"
+        ))
     }
 
     pub fn path_stats(&self) -> NativePathStats {

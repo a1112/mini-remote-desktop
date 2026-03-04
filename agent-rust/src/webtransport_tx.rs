@@ -59,8 +59,13 @@ fn advertise_url(port: u16) -> String {
     format!("https://{}:{}{}", host, port, path)
 }
 
-async fn handle_incoming_session(rx: &mut mpsc::Receiver<QuicAu>, incoming: IncomingSession) -> Result<bool> {
-    let session_request = incoming.await.context("webtransport incoming await failed")?;
+async fn handle_incoming_session(
+    rx: &mut mpsc::Receiver<QuicAu>,
+    incoming: IncomingSession,
+) -> Result<bool> {
+    let session_request = incoming
+        .await
+        .context("webtransport incoming await failed")?;
     let path = session_request.path().to_string();
     if path != "/mrd" && path != "/" {
         warn!(path = %path, "webtransport request path not allowed");
@@ -104,9 +109,12 @@ async fn handle_incoming_session(rx: &mut mpsc::Receiver<QuicAu>, incoming: Inco
     Ok(true)
 }
 
-pub fn start_webtransport_sender(bind_addr: SocketAddr) -> Result<(WebTransportAdvert, mpsc::Sender<QuicAu>)> {
+pub fn start_webtransport_sender(
+    bind_addr: SocketAddr,
+) -> Result<(WebTransportAdvert, mpsc::Sender<QuicAu>)> {
     let sans = default_sans();
-    let identity = Identity::self_signed(sans).context("webtransport self-signed identity failed")?;
+    let identity =
+        Identity::self_signed(sans).context("webtransport self-signed identity failed")?;
     let cert_hash = identity
         .certificate_chain()
         .as_slice()

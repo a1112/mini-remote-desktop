@@ -1,17 +1,28 @@
+mod audio_control;
 mod capture_policy;
 mod capture_runtime;
+mod clipboard;
+mod control_plane;
 mod encoder_policy;
 mod encoder_runtime;
+mod file_ops;
+mod file_transfer;
 mod input_injector;
 mod net_adapt;
 mod nvenc_native;
 mod profile;
 mod quic_tx;
+mod rclone_mount;
 mod rtp_send;
 mod runtime_stats;
+mod security;
+mod webdav_client;
+mod webdav_mount;
 mod webtransport_tx;
 
 use crate::capture_policy::{CaptureBackend, choose_backend};
+#[cfg(windows)]
+use crate::capture_runtime::WgcWindowCapturer;
 use crate::capture_runtime::{
     RawFrame, build_frame_capturer, detect_input_resolution, resize_rgba_fast, sleep_until,
 };
@@ -20,16 +31,15 @@ use crate::encoder_runtime::{build_video_encoder, encode_rgba_frame, request_key
 use crate::input_injector::InputInjector;
 use crate::net_adapt::NetAdaptController;
 use crate::nvenc_native::{NativeEncodePath, NativeNvencPipeline, NativeNvencTexturePipeline};
-#[cfg(windows)]
-use crate::capture_runtime::WgcWindowCapturer;
 use crate::profile::apply_capture_profile;
 use crate::quic_tx::{QuicAu, QuicServerAdvert, start_quic_sender};
-use crate::webtransport_tx::{WebTransportAdvert, start_webtransport_sender};
 use crate::rtp_send::{RtpH264Sender, RtpH264SenderConfig, TX_UNIX_US_EXT_URI};
 use crate::runtime_stats::{RuntimeStats, spawn_rtcp_feedback_loop, spawn_stats_panel};
+use crate::webtransport_tx::{WebTransportAdvert, start_webtransport_sender};
 use agent_rust::load_config;
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
+use common_control_proto::ChannelClass;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -55,7 +65,9 @@ use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
-use webrtc::rtp_transceiver::rtp_codec::{RTCRtpCodecCapability, RTCRtpHeaderExtensionCapability, RTPCodecType};
+use webrtc::rtp_transceiver::rtp_codec::{
+    RTCRtpCodecCapability, RTCRtpHeaderExtensionCapability, RTPCodecType,
+};
 use webrtc::rtp_transceiver::{
     RTCPFeedback, TYPE_RTCP_FB_CCM, TYPE_RTCP_FB_GOOG_REMB, TYPE_RTCP_FB_NACK,
     TYPE_RTCP_FB_TRANSPORT_CC,
@@ -63,7 +75,6 @@ use webrtc::rtp_transceiver::{
 use webrtc::track::track_local::TrackLocal;
 use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
-use common_control_proto::ChannelClass;
 
 #[derive(Default)]
 struct SessionState {
@@ -121,7 +132,9 @@ fn nvenc_recreate_on_force_idr_enabled_from(raw: Option<&str>) -> bool {
 
 fn nvenc_recreate_on_force_idr_enabled() -> bool {
     nvenc_recreate_on_force_idr_enabled_from(
-        std::env::var("AGENT_NVENC_RECREATE_ON_FORCE_IDR").ok().as_deref(),
+        std::env::var("AGENT_NVENC_RECREATE_ON_FORCE_IDR")
+            .ok()
+            .as_deref(),
     )
 }
 
@@ -409,15 +422,14 @@ async fn main() -> Result<()> {
             let injector = Arc::new(InputInjector::new());
             let media_ready = Arc::new(AtomicBool::new(false));
             let control_dc = Arc::new(Mutex::new(None));
-            let pc =
-                create_peer_connection(
-                    write.clone(),
-                    controller_id.clone(),
-                    injector.clone(),
-                    media_ready.clone(),
-                    control_dc.clone(),
-                )
-                    .await?;
+            let pc = create_peer_connection(
+                write.clone(),
+                controller_id.clone(),
+                injector.clone(),
+                media_ready.clone(),
+                control_dc.clone(),
+            )
+            .await?;
             let effective_capture_cfg = { capture_cfg.lock().await.clone() };
             attach_video_track_with_policy(
                 pc.clone(),
@@ -480,7 +492,10 @@ async fn main() -> Result<()> {
 
         if typ == "control" && action == "updateCapture" {
             let patch = v["payload"]["capture"].clone();
-            let controller_id = v["payload"]["controllerId"].as_str().unwrap_or("").to_string();
+            let controller_id = v["payload"]["controllerId"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
             if let Err(e) = apply_capture_patch(&capture_cfg, &patch).await {
                 warn!(error = %e, "apply capture update failed");
             } else {
@@ -505,7 +520,10 @@ async fn main() -> Result<()> {
             if candidate.is_null() {
                 continue;
             }
-            let controller_id = v["payload"]["controllerId"].as_str().unwrap_or("").to_string();
+            let controller_id = v["payload"]["controllerId"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
             let cand: webrtc::ice_transport::ice_candidate::RTCIceCandidateInit =
                 serde_json::from_value(candidate.clone()).context("parse remote ice failed")?;
             let target_pc = {
@@ -578,11 +596,9 @@ async fn apply_capture_patch(
     }
     if let Some(v) = patch.get("windowMode").and_then(|v| v.as_str()) {
         match v.to_ascii_lowercase().as_str() {
-            "auto" => {
-                unsafe {
-                    std::env::remove_var("AGENT_WGC_WINDOW_HWND");
-                }
-            }
+            "auto" => unsafe {
+                std::env::remove_var("AGENT_WGC_WINDOW_HWND");
+            },
             "foreground" => {
                 #[cfg(windows)]
                 unsafe {
@@ -1067,7 +1083,8 @@ async fn attach_video_track_with_policy(
                 let session_running_encode = session_running.clone();
                 let effective_cfg_encode = effective_cfg.clone();
                 let selected_transport_encode = selected_transport;
-                let idr_interval = Duration::from_secs(effective_cfg.idr_interval_sec.max(1) as u64);
+                let idr_interval =
+                    Duration::from_secs(effective_cfg.idr_interval_sec.max(1) as u64);
                 std::thread::spawn(move || {
                     let mut encoded_frames: u32 = 0;
                     let strict_gpu_direct = effective_cfg.strict_gpu_direct;
@@ -1217,10 +1234,9 @@ async fn attach_video_track_with_policy(
                     selected_transport,
                     SessionTransport::Quic | SessionTransport::WebTransport
                 ) {
-                    let quic_sender = quic_tx
-                        .as_ref()
-                        .cloned()
-                        .ok_or_else(|| anyhow!("quic transport selected but quic sender missing"))?;
+                    let quic_sender = quic_tx.as_ref().cloned().ok_or_else(|| {
+                        anyhow!("quic transport selected but quic sender missing")
+                    })?;
                     let stats_send = stats.clone();
                     let session_running_send = session_running.clone();
                     tokio::spawn(spawn_send_loop_quic(
@@ -1376,10 +1392,8 @@ async fn attach_video_track_with_policy(
                                 }
                             }
                             let capture = wgc.capture_gpu_frame(Duration::from_millis(120));
-                            let capture_start_us = capture
-                                .as_ref()
-                                .map(|f| f.capture_start_us)
-                                .unwrap_or(0);
+                            let capture_start_us =
+                                capture.as_ref().map(|f| f.capture_start_us).unwrap_or(0);
                             let encoded_res = capture
                                 .and_then(|frame| native.encode_texture(&frame.texture, force_idr));
                             match encoded_res {
@@ -1496,10 +1510,9 @@ async fn attach_video_track_with_policy(
                         selected_transport,
                         SessionTransport::Quic | SessionTransport::WebTransport
                     ) {
-                        let quic_sender = quic_tx
-                            .as_ref()
-                            .cloned()
-                            .ok_or_else(|| anyhow!("quic transport selected but quic sender missing"))?;
+                        let quic_sender = quic_tx.as_ref().cloned().ok_or_else(|| {
+                            anyhow!("quic transport selected but quic sender missing")
+                        })?;
                         let stats_send = stats.clone();
                         let session_running_send = session_running.clone();
                         tokio::spawn(spawn_send_loop_quic(
@@ -1515,7 +1528,8 @@ async fn attach_video_track_with_policy(
                                 fps: effective_cfg.fps.max(1),
                                 mtu: effective_cfg.rtp_mtu,
                                 frame_pacing_enable: effective_cfg.frame_pacing_enable,
-                                frame_pacing_batch_packets: effective_cfg.frame_pacing_batch_packets,
+                                frame_pacing_batch_packets: effective_cfg
+                                    .frame_pacing_batch_packets,
                             },
                         );
                         tokio::spawn(spawn_send_loop_rtp(
@@ -1864,8 +1878,9 @@ fn apply_transport_send_policy(
     if selected_transport == SessionTransport::WebRtc {
         // Default to manual packetizer for low-latency RTP path, but allow
         // sample-track fallback when debugging decode interoperability.
-        cfg.rtp_use_manual_packetizer =
-            should_force_webrtc_manual_packetizer(std::env::var("AGENT_WEBRTC_MANUAL_RTP").ok().as_deref());
+        cfg.rtp_use_manual_packetizer = should_force_webrtc_manual_packetizer(
+            std::env::var("AGENT_WEBRTC_MANUAL_RTP").ok().as_deref(),
+        );
         cfg.max_fps_mode = false;
         info!(
             rtp_use_manual_packetizer = cfg.rtp_use_manual_packetizer,
@@ -1947,7 +1962,8 @@ async fn spawn_send_loop_sample(
         }
         if !got_fresh
             && last_encoded.is_some()
-            && let Ok(Some(v)) = tokio::time::timeout(Duration::from_millis(2), encoded_rx.recv()).await
+            && let Ok(Some(v)) =
+                tokio::time::timeout(Duration::from_millis(2), encoded_rx.recv()).await
         {
             update_h264_param_cache(v.as_ref(), &mut last_sps, &mut last_pps);
             last_encoded = Some(v);
@@ -2352,7 +2368,9 @@ fn patch_h264_au_with_cached_params(
     if !has_idr || (has_sps && has_pps) {
         return None;
     }
-    let mut out = Vec::with_capacity(au.len() + sps.as_ref().map_or(0, |v| v.len()) + pps.as_ref().map_or(0, |v| v.len()));
+    let mut out = Vec::with_capacity(
+        au.len() + sps.as_ref().map_or(0, |v| v.len()) + pps.as_ref().map_or(0, |v| v.len()),
+    );
     if let Some(v) = sps {
         out.extend_from_slice(v);
     }
@@ -2387,7 +2405,8 @@ fn parse_annexb_nals_view(buf: &[u8]) -> Vec<AnnexbNalView<'_>> {
             i += 3;
             continue;
         }
-        if i + 4 < buf.len() && buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 0 && buf[i + 3] == 1 {
+        if i + 4 < buf.len() && buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 0 && buf[i + 3] == 1
+        {
             starts.push((i, 4usize));
             i += 4;
             continue;
@@ -2400,7 +2419,11 @@ fn parse_annexb_nals_view(buf: &[u8]) -> Vec<AnnexbNalView<'_>> {
     let mut out = Vec::with_capacity(starts.len());
     for (idx, (sc, sclen)) in starts.iter().enumerate() {
         let start = sc + sclen;
-        let end = if idx + 1 < starts.len() { starts[idx + 1].0 } else { buf.len() };
+        let end = if idx + 1 < starts.len() {
+            starts[idx + 1].0
+        } else {
+            buf.len()
+        };
         if start >= end || end > buf.len() {
             continue;
         }
@@ -2413,7 +2436,11 @@ fn parse_annexb_nals_view(buf: &[u8]) -> Vec<AnnexbNalView<'_>> {
     out
 }
 
-fn should_gate_rtp_until_first_idr(wait_first_idr: bool, first_idr_sent: bool, has_idr: bool) -> bool {
+fn should_gate_rtp_until_first_idr(
+    wait_first_idr: bool,
+    first_idr_sent: bool,
+    has_idr: bool,
+) -> bool {
     wait_first_idr && !first_idr_sent && !has_idr
 }
 

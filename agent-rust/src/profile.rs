@@ -133,7 +133,7 @@ fn apply_gpu_synchronized_profile(cfg: &mut agent_rust::CaptureConfig) {
     let shared_slots = std::env::var("MRD_SHARED_KEYED_SLOTS")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(8u32);  // Default to 8 slots
+        .unwrap_or(8u32); // Default to 8 slots
 
     // Limit queue depth to not exceed shared slots
     // This prevents the agent from producing frames faster than the controller can consume them

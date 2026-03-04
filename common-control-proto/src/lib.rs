@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u8 = 1;
+pub const PROTOCOL_VERSION: u8 = 2;
 pub const HEADER_LEN: usize = 17;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,6 +18,12 @@ pub enum EventType {
     Key = 4,
     GamepadAxis = 5,
     GamepadButton = 6,
+    ClipboardSet = 7,
+    ClipboardGet = 8,
+    FileControl = 9,
+    FileChunk = 10,
+    AudioControl = 11,
+    FileMount = 12,
 }
 
 impl TryFrom<u8> for EventType {
@@ -31,6 +37,12 @@ impl TryFrom<u8> for EventType {
             4 => Ok(Self::Key),
             5 => Ok(Self::GamepadAxis),
             6 => Ok(Self::GamepadButton),
+            7 => Ok(Self::ClipboardSet),
+            8 => Ok(Self::ClipboardGet),
+            9 => Ok(Self::FileControl),
+            10 => Ok(Self::FileChunk),
+            11 => Ok(Self::AudioControl),
+            12 => Ok(Self::FileMount),
             _ => Err(ProtoError::UnknownEventType(value)),
         }
     }
@@ -44,6 +56,34 @@ pub enum ControlEvent {
     Key { key: u32, pressed: bool },
     GamepadAxis { gamepad: u8, axis: u8, value: i16 },
     GamepadButton { gamepad: u8, button: u8, pressed: bool },
+    ClipboardSet { mime: u8, bytes: Vec<u8> },
+    ClipboardGet {},
+    FileControl {
+        op: u8,
+        transfer_id: u64,
+        arg0: u64,
+        arg1: u64,
+    },
+    FileChunk {
+        transfer_id: u64,
+        chunk_idx: u32,
+        total_chunks: u32,
+        sha256_16: [u8; 16],
+        payload: Vec<u8>,
+    },
+    AudioControl {
+        op: u8,
+        codec: u8,
+        sample_rate: u32,
+        channels: u8,
+        frame_ms: u16,
+    },
+    FileMount {
+        op: u8,
+        mount_id: u64,
+        flags: u32,
+        path: String,
+    },
 }
 
 impl ControlEvent {
@@ -55,6 +95,12 @@ impl ControlEvent {
             Self::Key { .. } => EventType::Key,
             Self::GamepadAxis { .. } => EventType::GamepadAxis,
             Self::GamepadButton { .. } => EventType::GamepadButton,
+            Self::ClipboardSet { .. } => EventType::ClipboardSet,
+            Self::ClipboardGet { .. } => EventType::ClipboardGet,
+            Self::FileControl { .. } => EventType::FileControl,
+            Self::FileChunk { .. } => EventType::FileChunk,
+            Self::AudioControl { .. } => EventType::AudioControl,
+            Self::FileMount { .. } => EventType::FileMount,
         }
     }
 
@@ -63,7 +109,15 @@ impl ControlEvent {
             Self::MouseMove { .. } | Self::MouseWheel { .. } | Self::GamepadAxis { .. } => {
                 ChannelClass::Realtime
             }
-            Self::MouseButton { .. } | Self::Key { .. } | Self::GamepadButton { .. } => {
+            Self::MouseButton { .. }
+            | Self::Key { .. }
+            | Self::GamepadButton { .. }
+            | Self::ClipboardSet { .. }
+            | Self::ClipboardGet { .. }
+            | Self::FileControl { .. }
+            | Self::FileChunk { .. }
+            | Self::AudioControl { .. }
+            | Self::FileMount { .. } => {
                 ChannelClass::Reliable
             }
         }
@@ -176,6 +230,73 @@ fn encode_event_payload(event: &ControlEvent) -> Vec<u8> {
             button,
             pressed,
         } => vec![*gamepad, *button, u8::from(*pressed)],
+        ControlEvent::ClipboardSet { mime, bytes } => {
+            let mut v = Vec::with_capacity(1 + 4 + bytes.len());
+            v.push(*mime);
+            v.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            v.extend_from_slice(bytes);
+            v
+        }
+        ControlEvent::ClipboardGet {} => Vec::new(),
+        ControlEvent::FileControl {
+            op,
+            transfer_id,
+            arg0,
+            arg1,
+        } => {
+            let mut v = Vec::with_capacity(1 + 8 + 8 + 8);
+            v.push(*op);
+            v.extend_from_slice(&transfer_id.to_be_bytes());
+            v.extend_from_slice(&arg0.to_be_bytes());
+            v.extend_from_slice(&arg1.to_be_bytes());
+            v
+        }
+        ControlEvent::FileChunk {
+            transfer_id,
+            chunk_idx,
+            total_chunks,
+            sha256_16,
+            payload,
+        } => {
+            let mut v = Vec::with_capacity(8 + 4 + 4 + 16 + 4 + payload.len());
+            v.extend_from_slice(&transfer_id.to_be_bytes());
+            v.extend_from_slice(&chunk_idx.to_be_bytes());
+            v.extend_from_slice(&total_chunks.to_be_bytes());
+            v.extend_from_slice(sha256_16);
+            v.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            v.extend_from_slice(payload);
+            v
+        }
+        ControlEvent::AudioControl {
+            op,
+            codec,
+            sample_rate,
+            channels,
+            frame_ms,
+        } => {
+            let mut v = Vec::with_capacity(1 + 1 + 4 + 1 + 2);
+            v.push(*op);
+            v.push(*codec);
+            v.extend_from_slice(&sample_rate.to_be_bytes());
+            v.push(*channels);
+            v.extend_from_slice(&frame_ms.to_be_bytes());
+            v
+        }
+        ControlEvent::FileMount {
+            op,
+            mount_id,
+            flags,
+            path,
+        } => {
+            let path_bytes = path.as_bytes();
+            let mut v = Vec::with_capacity(1 + 8 + 4 + 2 + path_bytes.len());
+            v.push(*op);
+            v.extend_from_slice(&mount_id.to_be_bytes());
+            v.extend_from_slice(&flags.to_be_bytes());
+            v.extend_from_slice(&(path_bytes.len() as u16).to_be_bytes());
+            v.extend_from_slice(path_bytes);
+            v
+        }
     }
 }
 
@@ -222,6 +343,121 @@ fn decode_event_payload(typ: EventType, payload: &[u8]) -> Result<ControlEvent, 
                 gamepad: payload[0],
                 button: payload[1],
                 pressed: payload[2] != 0,
+            })
+        }
+        EventType::ClipboardSet => {
+            if payload.len() < 5 {
+                return Err(ProtoError::InvalidEventPayloadLength {
+                    event_type: typ,
+                    expected: 5,
+                    actual: payload.len(),
+                });
+            }
+            let mime = payload[0];
+            let len = u32::from_be_bytes([payload[1], payload[2], payload[3], payload[4]]) as usize;
+            if payload.len() != 5 + len {
+                return Err(ProtoError::PayloadLengthMismatch {
+                    declared: 5 + len,
+                    actual: payload.len(),
+                });
+            }
+            Ok(ControlEvent::ClipboardSet {
+                mime,
+                bytes: payload[5..].to_vec(),
+            })
+        }
+        EventType::ClipboardGet => {
+            expect_payload_len(typ, payload, 0)?;
+            Ok(ControlEvent::ClipboardGet {})
+        }
+        EventType::FileControl => {
+            expect_payload_len(typ, payload, 25)?;
+            Ok(ControlEvent::FileControl {
+                op: payload[0],
+                transfer_id: u64::from_be_bytes([
+                    payload[1], payload[2], payload[3], payload[4], payload[5], payload[6],
+                    payload[7], payload[8],
+                ]),
+                arg0: u64::from_be_bytes([
+                    payload[9], payload[10], payload[11], payload[12], payload[13], payload[14],
+                    payload[15], payload[16],
+                ]),
+                arg1: u64::from_be_bytes([
+                    payload[17], payload[18], payload[19], payload[20], payload[21], payload[22],
+                    payload[23], payload[24],
+                ]),
+            })
+        }
+        EventType::FileChunk => {
+            if payload.len() < 36 {
+                return Err(ProtoError::InvalidEventPayloadLength {
+                    event_type: typ,
+                    expected: 36,
+                    actual: payload.len(),
+                });
+            }
+            let transfer_id = u64::from_be_bytes([
+                payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6],
+                payload[7],
+            ]);
+            let chunk_idx = u32::from_be_bytes([payload[8], payload[9], payload[10], payload[11]]);
+            let total_chunks =
+                u32::from_be_bytes([payload[12], payload[13], payload[14], payload[15]]);
+            let mut sha256_16 = [0_u8; 16];
+            sha256_16.copy_from_slice(&payload[16..32]);
+            let declared =
+                u32::from_be_bytes([payload[32], payload[33], payload[34], payload[35]]) as usize;
+            if payload.len() != 36 + declared {
+                return Err(ProtoError::PayloadLengthMismatch {
+                    declared: 36 + declared,
+                    actual: payload.len(),
+                });
+            }
+            Ok(ControlEvent::FileChunk {
+                transfer_id,
+                chunk_idx,
+                total_chunks,
+                sha256_16,
+                payload: payload[36..].to_vec(),
+            })
+        }
+        EventType::AudioControl => {
+            expect_payload_len(typ, payload, 9)?;
+            Ok(ControlEvent::AudioControl {
+                op: payload[0],
+                codec: payload[1],
+                sample_rate: u32::from_be_bytes([payload[2], payload[3], payload[4], payload[5]]),
+                channels: payload[6],
+                frame_ms: u16::from_be_bytes([payload[7], payload[8]]),
+            })
+        }
+        EventType::FileMount => {
+            if payload.len() < 15 {
+                return Err(ProtoError::InvalidEventPayloadLength {
+                    event_type: typ,
+                    expected: 15,
+                    actual: payload.len(),
+                });
+            }
+            let op = payload[0];
+            let mount_id = u64::from_be_bytes([
+                payload[1], payload[2], payload[3], payload[4], payload[5], payload[6], payload[7],
+                payload[8],
+            ]);
+            let flags = u32::from_be_bytes([payload[9], payload[10], payload[11], payload[12]]);
+            let declared_len = u16::from_be_bytes([payload[13], payload[14]]) as usize;
+            if payload.len() != 15 + declared_len {
+                return Err(ProtoError::PayloadLengthMismatch {
+                    declared: 15 + declared_len,
+                    actual: payload.len(),
+                });
+            }
+            let path = String::from_utf8_lossy(&payload[15..]).to_string();
+            Ok(ControlEvent::FileMount {
+                op,
+                mount_id,
+                flags,
+                path,
             })
         }
     }
@@ -299,5 +535,57 @@ mod tests {
         assert!(!tracker.validate_and_update(9));
         assert!(tracker.validate_and_update(11));
     }
-}
 
+    #[test]
+    fn encode_decode_roundtrip_clipboard_set() {
+        let frame = Frame {
+            flags: 0,
+            seq: 7,
+            ts_us: 42,
+            event: ControlEvent::ClipboardSet {
+                mime: 1,
+                bytes: b"hello".to_vec(),
+            },
+        };
+        let bytes = frame.encode();
+        let decoded = Frame::decode(&bytes).expect("decode clipboard set");
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn encode_decode_roundtrip_file_chunk() {
+        let frame = Frame {
+            flags: 3,
+            seq: 99,
+            ts_us: 1_001,
+            event: ControlEvent::FileChunk {
+                transfer_id: 1234,
+                chunk_idx: 2,
+                total_chunks: 9,
+                sha256_16: [0xAB; 16],
+                payload: vec![1, 2, 3, 4, 5],
+            },
+        };
+        let bytes = frame.encode();
+        let decoded = Frame::decode(&bytes).expect("decode file chunk");
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn encode_decode_roundtrip_file_mount() {
+        let frame = Frame {
+            flags: 1,
+            seq: 123,
+            ts_us: 9_999,
+            event: ControlEvent::FileMount {
+                op: 1,
+                mount_id: 77,
+                flags: 0b101,
+                path: "C:/Users/Public".to_string(),
+            },
+        };
+        let bytes = frame.encode();
+        let decoded = Frame::decode(&bytes).expect("decode file mount");
+        assert_eq!(decoded, frame);
+    }
+}

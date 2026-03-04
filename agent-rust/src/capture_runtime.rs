@@ -397,7 +397,10 @@ impl WgcWindowCapturer {
         })
     }
 
-    fn poll_next_frame(&mut self, timeout: Duration) -> Result<windows::Graphics::Capture::Direct3D11CaptureFrame> {
+    fn poll_next_frame(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<windows::Graphics::Capture::Direct3D11CaptureFrame> {
         let start = Instant::now();
         loop {
             if let Ok(frame) = self.frame_pool.TryGetNextFrame() {
