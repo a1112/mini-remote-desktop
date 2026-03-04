@@ -593,17 +593,11 @@ fn ffmpeg_roi_filter_expr(width: u32, height: u32) -> Option<String> {
             -(boost / 250.0).clamp(0.0, 0.8)
         })
         .clamp(-1.0, 1.0);
-    let base = format!("addroi=x={nx:.6}:y={ny:.6}:w={nw:.6}:h={nh:.6}:qoffset={qoffset:.3}");
-    let frame_interval = std::env::var("AGENT_ROI_FRAME_INTERVAL")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(1)
-        .clamp(1, 120);
-    if frame_interval <= 1 {
-        Some(base)
-    } else {
-        Some(format!("{base}:enable=not(mod(n\\,{frame_interval}))"))
-    }
+    // NOTE: some ffmpeg builds reject addroi with an `enable=` clause, which can
+    // cause encoder subprocess crash loops. Keep ROI expression conservative here.
+    Some(format!(
+        "addroi=x={nx:.6}:y={ny:.6}:w={nw:.6}:h={nh:.6}:qoffset={qoffset:.3}"
+    ))
 }
 
 fn take_one_access_unit_by_aud(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
@@ -859,6 +853,23 @@ mod tests {
         unsafe {
             std::env::remove_var("AGENT_ROI_ENABLE");
             std::env::remove_var("AGENT_ROI_RECT");
+        }
+    }
+
+    #[test]
+    fn roi_expr_does_not_append_enable_clause_for_frame_interval() {
+        let _guard = env_lock().lock().expect("env lock");
+        unsafe {
+            std::env::set_var("AGENT_ROI_ENABLE", "1");
+            std::env::set_var("AGENT_ROI_RECT", "0.25,0.25,0.5,0.5");
+            std::env::set_var("AGENT_ROI_FRAME_INTERVAL", "4");
+        }
+        let vf = ffmpeg_roi_filter_expr(1920, 1080).expect("roi expr");
+        assert!(!vf.contains(":enable="), "unexpected enable clause: {vf}");
+        unsafe {
+            std::env::remove_var("AGENT_ROI_ENABLE");
+            std::env::remove_var("AGENT_ROI_RECT");
+            std::env::remove_var("AGENT_ROI_FRAME_INTERVAL");
         }
     }
 }

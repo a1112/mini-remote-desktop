@@ -274,6 +274,7 @@ class ServerPerfMonitor:
     def __init__(self, pid: int, interval_sec: float = 1.0):
         self.pid = pid
         self.interval_sec = interval_sec
+        self._start_wall_ts = time.time()
         self._stop_event = asyncio.Event()
         self._task: Optional[asyncio.Task] = None
         self.samples: List[Dict[str, Any]] = []
@@ -362,6 +363,19 @@ class ServerPerfMonitor:
             if preferred:
                 preferred.sort(key=lambda x: x.pid)
                 return preferred[-1]
+            # Fallback: cargo parent may hide child tree in some runs.
+            global_agent = []
+            for p in psutil.process_iter(attrs=["pid", "name", "create_time"]):
+                try:
+                    name = str((p.info or {}).get("name") or "").lower()
+                    cts = float((p.info or {}).get("create_time") or 0.0)
+                except Exception:
+                    continue
+                if "agent-rust" in name and cts >= self._start_wall_ts - 120.0:
+                    global_agent.append(p)
+            if global_agent:
+                global_agent.sort(key=lambda x: x.pid)
+                return global_agent[-1]
             fallback.sort(key=lambda x: x.pid)
             return fallback[-1] if fallback else parent
         except Exception:
