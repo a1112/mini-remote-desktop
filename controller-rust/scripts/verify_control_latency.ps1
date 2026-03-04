@@ -22,15 +22,16 @@ $worstP99 = 0.0
 $maxSamples = 0
 
 foreach ($line in $lines) {
-  if ($line -match "one_way_p95_ms[=\s]+(?<p95>[0-9]+(\.[0-9]+)?)") {
+  $plain = [regex]::Replace($line, "\x1B\[[0-9;]*m", "")
+  if ($plain -match "one_way_p95_ms[=\s]+`"?(?<p95>[0-9]+(\.[0-9]+)?)`"?") {
     $p95 = [double]$Matches["p95"]
     if ($p95 -gt $worstP95) { $worstP95 = $p95 }
   }
-  if ($line -match "one_way_p99_ms[=\s]+(?<p99>[0-9]+(\.[0-9]+)?)") {
+  if ($plain -match "one_way_p99_ms[=\s]+`"?(?<p99>[0-9]+(\.[0-9]+)?)`"?") {
     $p99 = [double]$Matches["p99"]
     if ($p99 -gt $worstP99) { $worstP99 = $p99 }
   }
-  if ($line -match "samples[=\s]+(?<n>[0-9]+)") {
+  if ($plain -match "samples[=\s]+(?<n>[0-9]+)") {
     $n = [int]$Matches["n"]
     if ($n -gt $maxSamples) { $maxSamples = $n }
   }
@@ -59,4 +60,3 @@ if ($worstP99 -ge $P99ThresholdMs) {
 
 Write-Host "SLO PASS"
 exit 0
-

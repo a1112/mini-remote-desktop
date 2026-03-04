@@ -297,36 +297,10 @@ impl PeerConnectionManager {
                 current_timestamp = Some(timestamp);
             }
 
-            // 若时间戳跳变但上一帧未靠 marker 结束，兜底刷新一次。
+            // Finalize AU on RTP timestamp change.
+            // Some senders may set marker on each NAL (e.g. SPS/PPS/IDR), which would split
+            // a single access unit if we flushed on marker.
             if Some(timestamp) != current_timestamp && !access_unit.is_empty() {
-                let ts = current_timestamp.unwrap_or(timestamp);
-                let is_key = contains_idr_annexb(&access_unit);
-                let frame = VideoFrame {
-                    data: Bytes::from(std::mem::take(&mut access_unit)),
-                    timestamp: ts as u64,
-                    is_keyframe: is_key,
-                    sequence: packet.header.sequence_number as u64,
-                    tx_unix_us,
-                };
-                if let Err(_e) = frame_tx.try_send(frame) {
-                    debug!("frame channel full/closed, dropping fallback AU");
-                }
-                current_timestamp = Some(timestamp);
-            }
-
-            let dep = depacketizer.depacketize(&packet.payload);
-            let nalu = match dep {
-                Ok(v) => v,
-                Err(e) => {
-                    debug!(error = %e, "depacketize failed, dropping RTP payload");
-                    continue;
-                }
-            };
-            if !nalu.is_empty() {
-                access_unit.extend_from_slice(&nalu);
-            }
-
-            if packet.header.marker && !access_unit.is_empty() {
                 let ts = current_timestamp.unwrap_or(timestamp);
                 let is_key = contains_idr_annexb(&access_unit);
                 if au_debug_count < 8 {
@@ -353,9 +327,25 @@ impl PeerConnectionManager {
                     tx_unix_us,
                 };
                 if let Err(_e) = frame_tx.try_send(frame) {
-                    debug!("frame channel full/closed, dropping decoded AU");
+                    debug!("frame channel full/closed, dropping fallback AU");
                 }
-                current_timestamp = None;
+                current_timestamp = Some(timestamp);
+            }
+
+            let dep = depacketizer.depacketize(&packet.payload);
+            let nalu = match dep {
+                Ok(v) => v,
+                Err(e) => {
+                    debug!(error = %e, "depacketize failed, dropping RTP payload");
+                    continue;
+                }
+            };
+            if !nalu.is_empty() {
+                access_unit.extend_from_slice(&nalu);
+            }
+
+            if packet.header.marker {
+                debug!("marker observed; waiting for timestamp change to finalize AU");
             }
 
             // 每 1000 个包记录一次
@@ -365,6 +355,21 @@ impl PeerConnectionManager {
                     au_buffer_size = access_unit.len(),
                     "received RTP packets"
                 );
+            }
+        }
+
+        if !access_unit.is_empty() {
+            let ts = current_timestamp.unwrap_or(0);
+            let is_key = contains_idr_annexb(&access_unit);
+            let frame = VideoFrame {
+                data: Bytes::from(std::mem::take(&mut access_unit)),
+                timestamp: ts as u64,
+                is_keyframe: is_key,
+                sequence: packet_count,
+                tx_unix_us: 0,
+            };
+            if let Err(_e) = frame_tx.try_send(frame) {
+                debug!("frame channel full/closed, dropping trailing AU");
             }
         }
 

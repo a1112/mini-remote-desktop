@@ -11,6 +11,7 @@ mod webrtc;
 type FrameReceiver = Arc<Mutex<mpsc::Receiver<webrtc::peer::VideoFrame>>>;
 
 use anyhow::{Context, Result};
+use common_control_proto::ControlEvent;
 use uuid::Uuid;
 use quic_rx::{QuicConnectInfo, connect_quic_receiver};
 use render::{D3D11Renderer, OverlaySwitchField};
@@ -18,10 +19,11 @@ use signaling::{SignalingClient, SignalingMessagePayload};
 use signaling::client::SignalingConfig;
 use stats::StatsCollector;
 use serde_json::json;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thread_tuning::{apply_current_thread_tuning, ThreadRole};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex, RwLock};
@@ -166,6 +168,159 @@ async fn discover_signaling_ws_url(default_ws_port: u16) -> Option<String> {
         }
     }
     Some(format!("ws://{}:{}", addr.ip(), ws_port))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ControlBenchConfig {
+    enabled: bool,
+    rate_hz: u32,
+    log_interval_ms: u64,
+    amplitude_px: i32,
+}
+
+impl ControlBenchConfig {
+    fn from_env() -> Self {
+        let enabled = std::env::var("MRD_CTRL_BENCH_ENABLE").ok();
+        let rate_hz = std::env::var("MRD_CTRL_BENCH_RATE_HZ")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok());
+        let log_interval_ms = std::env::var("MRD_CTRL_BENCH_LOG_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok());
+        let amplitude_px = std::env::var("MRD_CTRL_BENCH_AMPLITUDE_PX")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok());
+        Self::from_values(enabled.as_deref(), rate_hz, log_interval_ms, amplitude_px)
+    }
+
+    fn from_values(
+        enabled: Option<&str>,
+        rate_hz: Option<u32>,
+        log_interval_ms: Option<u64>,
+        amplitude_px: Option<i32>,
+    ) -> Self {
+        Self {
+            enabled: enabled
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            rate_hz: rate_hz.map(|v| v.clamp(1, 2000)).unwrap_or(250),
+            log_interval_ms: log_interval_ms.map(|v| v.clamp(200, 10_000)).unwrap_or(1000),
+            amplitude_px: amplitude_px.map(|v| v.clamp(1, 4000)).unwrap_or(4),
+        }
+    }
+}
+
+#[derive(Default)]
+struct ControlTxStats {
+    attempts: u64,
+    sent: u64,
+    failed: u64,
+    not_ready: u64,
+    send_call_us: VecDeque<u64>,
+}
+
+impl ControlTxStats {
+    fn push_send_us(&mut self, v: u64) {
+        const MAX_SAMPLES: usize = 4096;
+        self.send_call_us.push_back(v);
+        while self.send_call_us.len() > MAX_SAMPLES {
+            let _ = self.send_call_us.pop_front();
+        }
+    }
+
+    fn p95_send_ms(&self) -> f64 {
+        percentile_u64(&self.send_call_us, 95).unwrap_or(0.0) / 1000.0
+    }
+}
+
+fn unix_time_us() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
+}
+
+fn percentile_u64(v: &VecDeque<u64>, p: usize) -> Option<f64> {
+    if v.is_empty() {
+        return None;
+    }
+    let mut sorted: Vec<u64> = v.iter().copied().collect();
+    sorted.sort_unstable();
+    let idx = ((sorted.len() - 1) * p) / 100;
+    Some(sorted[idx] as f64)
+}
+
+async fn run_control_bench(
+    peer_manager: Arc<RwLock<Option<Arc<PeerConnectionManager>>>>,
+    connected: Arc<Mutex<bool>>,
+    cfg: ControlBenchConfig,
+) {
+    if !cfg.enabled {
+        return;
+    }
+    let tick_us = (1_000_000u64 / cfg.rate_hz as u64).max(500);
+    let mut ticker = tokio::time::interval(Duration::from_micros(tick_us));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut stats = ControlTxStats::default();
+    let mut next_log = Instant::now() + Duration::from_millis(cfg.log_interval_ms);
+    let mut flip = false;
+
+    info!(
+        enabled = cfg.enabled,
+        rate_hz = cfg.rate_hz,
+        amplitude_px = cfg.amplitude_px,
+        log_interval_ms = cfg.log_interval_ms,
+        "control latency benchmark enabled"
+    );
+
+    loop {
+        ticker.tick().await;
+        stats.attempts = stats.attempts.saturating_add(1);
+        if !*connected.lock().await {
+            stats.not_ready = stats.not_ready.saturating_add(1);
+            continue;
+        }
+
+        let maybe_mgr = { peer_manager.read().await.clone() };
+        let Some(mgr) = maybe_mgr else {
+            stats.not_ready = stats.not_ready.saturating_add(1);
+            continue;
+        };
+
+        let event = if flip {
+            ControlEvent::MouseMove {
+                x: cfg.amplitude_px,
+                y: 0,
+            }
+        } else {
+            ControlEvent::MouseMove {
+                x: -cfg.amplitude_px,
+                y: 0,
+            }
+        };
+        flip = !flip;
+
+        let started = Instant::now();
+        match mgr.send_control_event(event, 0, unix_time_us()).await {
+            Ok(()) => stats.sent = stats.sent.saturating_add(1),
+            Err(_) => stats.failed = stats.failed.saturating_add(1),
+        }
+        stats.push_send_us(started.elapsed().as_micros().min(u64::MAX as u128) as u64);
+
+        if Instant::now() >= next_log {
+            info!(
+                target_rate_hz = cfg.rate_hz,
+                attempts = stats.attempts,
+                sent = stats.sent,
+                failed = stats.failed,
+                not_ready = stats.not_ready,
+                send_call_p95_ms = format!("{:.3}", stats.p95_send_ms()),
+                sample_window = stats.send_call_us.len(),
+                "[CTRL-TX]"
+            );
+            next_log = Instant::now() + Duration::from_millis(cfg.log_interval_ms);
+        }
+    }
 }
 
 fn select_frame_for_decode(
@@ -354,11 +509,20 @@ async fn main() -> Result<()> {
     // 连接状态
     let connected = Arc::new(Mutex::new(false));
     let current_agent_id = Arc::new(Mutex::new(None::<String>));
-    let peer_manager = Arc::new(RwLock::new(None::<PeerConnectionManager>));
+    let peer_manager = Arc::new(RwLock::new(None::<Arc<PeerConnectionManager>>));
     let signaling_arc = Arc::new(signaling);
 
     // 视频帧接收器
     let frame_receiver: Arc<Mutex<Option<FrameReceiver>>> = Arc::new(Mutex::new(None));
+
+    let control_bench_cfg = ControlBenchConfig::from_env();
+    if control_bench_cfg.enabled {
+        let peer_manager_for_bench = peer_manager.clone();
+        let connected_for_bench = connected.clone();
+        tokio::spawn(async move {
+            run_control_bench(peer_manager_for_bench, connected_for_bench, control_bench_cfg).await;
+        });
+    }
 
     // 统计更新定时器
     let mut stats_interval = tokio::time::interval(Duration::from_secs(1));
@@ -400,6 +564,18 @@ async fn main() -> Result<()> {
                 .ok()
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
+            let no_output_recover_streak = std::env::var("MRD_NO_OUTPUT_RECOVER_STREAK")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(180)
+                .clamp(30, 2000);
+            let no_output_recover_cooldown = Duration::from_millis(
+                std::env::var("MRD_NO_OUTPUT_RECOVER_COOLDOWN_MS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(1200)
+                    .clamp(100, 10_000),
+            );
             let mut decode_samples_ms: std::collections::VecDeque<f64> = std::collections::VecDeque::with_capacity(1024);
             let mut frame_interval_ms: std::collections::VecDeque<f64> = std::collections::VecDeque::with_capacity(1024);
             let mut e2e_samples_ms: std::collections::VecDeque<f64> = std::collections::VecDeque::with_capacity(1024);
@@ -415,6 +591,9 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(std::time::Instant::now);
             let mut last_recover_keyframe_req = std::time::Instant::now()
                 .checked_sub(Duration::from_secs(1))
+                .unwrap_or_else(std::time::Instant::now);
+            let mut last_recover_enter = std::time::Instant::now()
+                .checked_sub(Duration::from_secs(5))
                 .unwrap_or_else(std::time::Instant::now);
             let mut last_decoded_at: Option<std::time::Instant> = None;
             let mut last_stats_at = std::time::Instant::now();
@@ -479,6 +658,7 @@ async fn main() -> Result<()> {
                     }
                     if waiting_recover_keyframe && newest.is_keyframe {
                         waiting_recover_keyframe = false;
+                        no_output_streak = 0;
                         waiting_probe_budget = 0;
                         waiting_recover_since = None;
                         waiting_recover_pli_requests = 0;
@@ -502,6 +682,7 @@ async fn main() -> Result<()> {
                         let now = std::time::Instant::now();
                         if waiting_recover_keyframe {
                             waiting_recover_keyframe = false;
+                            no_output_streak = 0;
                             waiting_probe_budget = 0;
                             waiting_recover_since = None;
                             waiting_recover_pli_requests = 0;
@@ -539,15 +720,19 @@ async fn main() -> Result<()> {
                         no_output_streak = no_output_streak.saturating_add(1);
                         if !disable_decode_recover
                             && !waiting_recover_keyframe
-                            && no_output_streak >= 90
+                            && no_output_streak >= no_output_recover_streak
+                            && last_recover_enter.elapsed() >= no_output_recover_cooldown
                         {
+                            let streak_before_recover = no_output_streak;
                             waiting_recover_keyframe = true;
+                            no_output_streak = 0;
+                            last_recover_enter = std::time::Instant::now();
                             waiting_probe_budget = 0;
                             last_recover_keyframe_req = std::time::Instant::now()
                                 .checked_sub(Duration::from_secs(1))
                                 .unwrap_or_else(std::time::Instant::now);
                             warn!(
-                                no_output_streak,
+                                no_output_streak = streak_before_recover,
                                 "decoder no-output streak; entering keyframe resync before backend fallback"
                             );
                         }
@@ -609,6 +794,8 @@ async fn main() -> Result<()> {
                         if !disable_decode_recover && invalid_bitstream_err {
                             // Bitstream desync: wait for next keyframe and keep requesting PLI.
                             waiting_recover_keyframe = true;
+                            no_output_streak = 0;
+                            last_recover_enter = std::time::Instant::now();
                             last_recover_keyframe_req = std::time::Instant::now()
                                 .checked_sub(Duration::from_secs(1))
                                 .unwrap_or_else(std::time::Instant::now);
@@ -640,6 +827,8 @@ async fn main() -> Result<()> {
                                     *decoder = new_decoder;
                                     decode_recover_stage = decode_recover_stage.saturating_add(1);
                                     waiting_recover_keyframe = true;
+                                    no_output_streak = 0;
+                                    last_recover_enter = std::time::Instant::now();
                                     last_recover_keyframe_req = std::time::Instant::now()
                                         .checked_sub(Duration::from_secs(1))
                                         .unwrap_or_else(std::time::Instant::now);
@@ -1015,7 +1204,7 @@ async fn main() -> Result<()> {
 async fn initiate_webRTC_connection(
     target_device_id: &str,
     signaling: &Arc<SignalingClient>,
-    peer_manager: &Arc<RwLock<Option<PeerConnectionManager>>>,
+    peer_manager: &Arc<RwLock<Option<Arc<PeerConnectionManager>>>>,
     current_agent_id: &Arc<Mutex<Option<String>>>,
     frame_receiver: &Arc<Mutex<Option<FrameReceiver>>>,
 ) -> Result<()> {
@@ -1088,7 +1277,7 @@ async fn initiate_webRTC_connection(
     info!(target = %target_device_id, "WebRTC offer sent");
 
     // 保存 manager 和 frame receiver
-    *peer_manager.write().await = Some(manager);
+    *peer_manager.write().await = Some(Arc::new(manager));
     *current_agent_id.lock().await = Some(target_device_id.to_string());
     *frame_receiver.lock().await = Some(frame_rx);
 
@@ -1201,5 +1390,26 @@ mod tests {
     fn decode_select_latest_can_be_enabled_explicitly() {
         let policy = DecodeSelectPolicy::from_env_value("latest", true);
         assert_eq!(policy, DecodeSelectPolicy::Latest);
+    }
+
+    #[test]
+    fn control_bench_config_clamps_values() {
+        let cfg = ControlBenchConfig::from_values(Some("true"), Some(9_999), Some(10), Some(0));
+        assert!(cfg.enabled);
+        assert_eq!(cfg.rate_hz, 2_000);
+        assert_eq!(cfg.log_interval_ms, 200);
+        assert_eq!(cfg.amplitude_px, 1);
+    }
+
+    #[test]
+    fn percentile_u64_returns_expected_bucket() {
+        let mut v = VecDeque::new();
+        v.push_back(1);
+        v.push_back(2);
+        v.push_back(10);
+        v.push_back(20);
+        v.push_back(30);
+        let p95 = percentile_u64(&v, 95).unwrap();
+        assert_eq!(p95, 20.0);
     }
 }

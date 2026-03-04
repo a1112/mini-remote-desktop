@@ -81,7 +81,7 @@ enum SessionTransport {
 impl SessionTransport {
     fn parse(v: Option<&str>) -> Self {
         match v.unwrap_or("webrtc").to_ascii_lowercase().as_str() {
-            "quic" => SessionTransport::Quic,
+            "quic" | "webtransport" => SessionTransport::Quic,
             _ => SessionTransport::WebRtc,
         }
     }
@@ -134,9 +134,31 @@ fn should_recreate_nvenc_on_missing_idr(
     encoder_backend: VideoEncoderBackend,
     missing_idr_streak: u32,
 ) -> bool {
+    let threshold = std::env::var("AGENT_NVENC_MISSING_IDR_RECREATE_STREAK")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(12)
+        .clamp(4, 240);
     selected_transport == SessionTransport::WebRtc
         && encoder_backend == VideoEncoderBackend::Nvenc
-        && missing_idr_streak >= 24
+        && missing_idr_streak >= threshold
+}
+
+fn nvenc_missing_idr_recreate_cooldown() -> Duration {
+    let cooldown_ms = std::env::var("AGENT_NVENC_MISSING_IDR_RECREATE_COOLDOWN_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(300)
+        .clamp(100, 5000);
+    Duration::from_millis(cooldown_ms)
+}
+
+fn keyframe_burst_len() -> u8 {
+    std::env::var("AGENT_KEYFRAME_BURST")
+        .ok()
+        .and_then(|v| v.parse::<u8>().ok())
+        .unwrap_or(6)
+        .clamp(1, 30)
 }
 
 fn next_missing_idr_streak(prev: u32, force_idr: bool, has_idr: bool) -> u32 {
@@ -154,6 +176,21 @@ fn unix_time_us() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|v| v.as_micros().min(u64::MAX as u128) as u64)
         .unwrap_or(0)
+}
+
+fn maybe_build_webtransport_endpoint(advert: &QuicServerAdvert) -> serde_json::Value {
+    let url = std::env::var("AGENT_WEBTRANSPORT_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| format!("https://{}/mrd", advert.addr));
+    let alpn = std::env::var("AGENT_WEBTRANSPORT_ALPN")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "h3".to_string());
+    json!({
+        "url": url,
+        "alpn": alpn,
+    })
 }
 
 fn pack_capture_ts_au(bytes: Vec<u8>, capture_start_us: u64, with_header: bool) -> Arc<[u8]> {
@@ -255,12 +292,12 @@ async fn main() -> Result<()> {
                     "type":"agent-rust",
                     "name": cfg.device_name,
                     "protocolVersion": 2,
-                    "transports": ["webrtc", "quic"],
+                    "transports": ["webrtc", "quic", "webtransport"],
                     "capabilities": {
-                        "protocols": ["webrtc", "quic"],
+                        "protocols": ["webrtc", "quic", "webtransport"],
                         "platforms": ["windows"],
                         "codecs": ["h264"],
-                        "features": ["multi-end-compat", "capability-negotiation"]
+                        "features": ["multi-end-compat", "capability-negotiation", "transport-failover"]
                     }
                 }
             });
@@ -355,14 +392,21 @@ async fn main() -> Result<()> {
             }
 
             let injector = Arc::new(InputInjector::new());
+            let media_ready = Arc::new(AtomicBool::new(false));
             let pc =
-                create_peer_connection(write.clone(), controller_id.clone(), injector.clone())
+                create_peer_connection(
+                    write.clone(),
+                    controller_id.clone(),
+                    injector.clone(),
+                    media_ready.clone(),
+                )
                     .await?;
             let effective_capture_cfg = { capture_cfg.lock().await.clone() };
             attach_video_track_with_policy(
                 pc.clone(),
                 &effective_capture_cfg,
                 session_running.clone(),
+                media_ready,
                 selected_transport,
                 quic_tx,
             )
@@ -392,11 +436,12 @@ async fn main() -> Result<()> {
                         "serverName": q.server_name,
                         "certDerBase64": q.cert_der_base64,
                     })),
+                    "webtransport": quic_advert.as_ref().map(maybe_build_webtransport_endpoint),
                     "agentCapabilities": {
-                        "protocols": ["webrtc", "quic"],
+                        "protocols": ["webrtc", "quic", "webtransport"],
                         "platforms": ["windows"],
                         "codecs": ["h264"],
-                        "features": ["multi-end-compat", "capability-negotiation"]
+                        "features": ["multi-end-compat", "capability-negotiation", "transport-failover"]
                     }
                 }
             });
@@ -543,6 +588,7 @@ async fn create_peer_connection(
     ws_write: Arc<Mutex<WsWrite>>,
     controller_id: String,
     injector: Arc<InputInjector>,
+    media_ready: Arc<AtomicBool>,
 ) -> Result<Arc<RTCPeerConnection>> {
     let mut m = MediaEngine::default();
     m.register_default_codecs()?;
@@ -603,8 +649,18 @@ async fn create_peer_connection(
         }));
     }
 
-    pc.on_peer_connection_state_change(Box::new(|s: RTCPeerConnectionState| {
-        info!(state = %s, "peer connection state changed");
+    pc.on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
+        if s == RTCPeerConnectionState::Connected {
+            media_ready.store(true, Ordering::SeqCst);
+        } else if matches!(
+            s,
+            RTCPeerConnectionState::Disconnected
+                | RTCPeerConnectionState::Failed
+                | RTCPeerConnectionState::Closed
+        ) {
+            media_ready.store(false, Ordering::SeqCst);
+        }
+        info!(state = %s, media_ready = media_ready.load(Ordering::SeqCst), "peer connection state changed");
         Box::pin(async {})
     }));
     pc.on_ice_connection_state_change(Box::new(move |s: RTCIceConnectionState| {
@@ -655,6 +711,7 @@ async fn attach_video_track_with_policy(
     pc: Arc<RTCPeerConnection>,
     capture_cfg: &agent_rust::CaptureConfig,
     session_running: Arc<AtomicBool>,
+    media_ready: Arc<AtomicBool>,
     selected_transport: SessionTransport,
     quic_tx: Option<tokio::sync::mpsc::Sender<QuicAu>>,
 ) -> Result<()> {
@@ -895,20 +952,29 @@ async fn attach_video_track_with_policy(
                 let session_running_encode = session_running.clone();
                 let effective_cfg_encode = effective_cfg.clone();
                 let selected_transport_encode = selected_transport;
-                let idr_interval_frames =
-                    effective_cfg.fps.max(1) * effective_cfg.idr_interval_sec.max(1);
+                let idr_interval = Duration::from_secs(effective_cfg.idr_interval_sec.max(1) as u64);
                 std::thread::spawn(move || {
                     let mut encoded_frames: u32 = 0;
                     let strict_gpu_direct = effective_cfg.strict_gpu_direct;
                     let mut missing_idr_streak: u32 = 0;
+                    let mut keyframe_burst_remain: u8 = 0;
                     let mut last_missing_idr_recreate =
                         std::time::Instant::now() - Duration::from_secs(10);
+                    let mut last_interval_force = std::time::Instant::now();
                     while session_running_encode.load(Ordering::SeqCst) {
                         let keyframe_requested = keyframe_request2.swap(false, Ordering::Relaxed);
-                        let interval_force = idr_interval_frames > 0
-                            && encoded_frames > 0
-                            && encoded_frames.is_multiple_of(idr_interval_frames);
-                        let force_idr = keyframe_requested || interval_force;
+                        if keyframe_requested {
+                            keyframe_burst_remain = keyframe_burst_len();
+                        }
+                        let interval_force = last_interval_force.elapsed() >= idr_interval;
+                        if interval_force {
+                            last_interval_force = std::time::Instant::now();
+                        }
+                        let in_keyframe_burst = keyframe_burst_remain > 0;
+                        let force_idr = in_keyframe_burst || interval_force;
+                        if in_keyframe_burst {
+                            keyframe_burst_remain = keyframe_burst_remain.saturating_sub(1);
+                        }
                         if should_recreate_nvenc_on_force_idr(
                             selected_transport_encode,
                             encoder_backend,
@@ -934,8 +1000,14 @@ async fn attach_video_track_with_policy(
                                 let has_idr = parse_annexb_nals_view(v.bytes.as_ref())
                                     .iter()
                                     .any(|n| n.nal_type == 5);
-                                missing_idr_streak =
-                                    next_missing_idr_streak(missing_idr_streak, force_idr, has_idr);
+                                missing_idr_streak = next_missing_idr_streak(
+                                    missing_idr_streak,
+                                    in_keyframe_burst,
+                                    has_idr,
+                                );
+                                if has_idr {
+                                    keyframe_burst_remain = 0;
+                                }
                                 if force_idr && !has_idr && missing_idr_streak % 8 == 0 {
                                     warn!(
                                         missing_idr_streak,
@@ -947,7 +1019,8 @@ async fn attach_video_track_with_policy(
                                     selected_transport_encode,
                                     encoder_backend,
                                     missing_idr_streak,
-                                ) && last_missing_idr_recreate.elapsed() >= Duration::from_millis(800)
+                                ) && last_missing_idr_recreate.elapsed()
+                                    >= nvenc_missing_idr_recreate_cooldown()
                                 {
                                     last_missing_idr_recreate = std::time::Instant::now();
                                     match NativeNvencPipeline::new(
@@ -1056,6 +1129,8 @@ async fn attach_video_track_with_policy(
                         enable_network_adapt,
                         effective_cfg.max_fps_mode,
                         effective_cfg.idle_repeat_fps,
+                        keyframe_request.clone(),
+                        media_ready.clone(),
                         session_running.clone(),
                     ));
                 } else if let Some(track) = sample_track.clone() {
@@ -1071,6 +1146,8 @@ async fn attach_video_track_with_policy(
                         stats_send,
                         repeat_last,
                         idle_repeat_fps,
+                        keyframe_request.clone(),
+                        media_ready.clone(),
                         session_running_send,
                     ));
                 }
@@ -1131,21 +1208,31 @@ async fn attach_video_track_with_policy(
                     let session_running_encode = session_running.clone();
                     let effective_cfg_encode = effective_cfg.clone();
                     let selected_transport_encode = selected_transport;
-                    let idr_interval_frames =
-                        effective_cfg.fps.max(1) * effective_cfg.idr_interval_sec.max(1);
+                    let idr_interval =
+                        Duration::from_secs(effective_cfg.idr_interval_sec.max(1) as u64);
                     std::thread::spawn(move || {
                         let mut encoded_frames: u32 = 0;
                         let strict_gpu_direct = effective_cfg.strict_gpu_direct;
                         let mut missing_idr_streak: u32 = 0;
+                        let mut keyframe_burst_remain: u8 = 0;
                         let mut last_missing_idr_recreate =
                             std::time::Instant::now() - Duration::from_secs(10);
+                        let mut last_interval_force = std::time::Instant::now();
                         while session_running_encode.load(Ordering::SeqCst) {
                             let keyframe_requested =
                                 keyframe_request2.swap(false, Ordering::Relaxed);
-                            let interval_force = idr_interval_frames > 0
-                                && encoded_frames > 0
-                                && encoded_frames.is_multiple_of(idr_interval_frames);
-                            let force_idr = keyframe_requested || interval_force;
+                            if keyframe_requested {
+                                keyframe_burst_remain = keyframe_burst_len();
+                            }
+                            let interval_force = last_interval_force.elapsed() >= idr_interval;
+                            if interval_force {
+                                last_interval_force = std::time::Instant::now();
+                            }
+                            let in_keyframe_burst = keyframe_burst_remain > 0;
+                            let force_idr = in_keyframe_burst || interval_force;
+                            if in_keyframe_burst {
+                                keyframe_burst_remain = keyframe_burst_remain.saturating_sub(1);
+                            }
                             if should_recreate_nvenc_on_force_idr(
                                 selected_transport_encode,
                                 encoder_backend,
@@ -1184,9 +1271,12 @@ async fn attach_video_track_with_policy(
                                         .any(|n| n.nal_type == 5);
                                     missing_idr_streak = next_missing_idr_streak(
                                         missing_idr_streak,
-                                        force_idr,
+                                        in_keyframe_burst,
                                         has_idr,
                                     );
+                                    if has_idr {
+                                        keyframe_burst_remain = 0;
+                                    }
                                     if force_idr && !has_idr && missing_idr_streak % 8 == 0 {
                                         warn!(
                                             missing_idr_streak,
@@ -1198,7 +1288,8 @@ async fn attach_video_track_with_policy(
                                         selected_transport_encode,
                                         encoder_backend,
                                         missing_idr_streak,
-                                    ) && last_missing_idr_recreate.elapsed() >= Duration::from_millis(800)
+                                    ) && last_missing_idr_recreate.elapsed()
+                                        >= nvenc_missing_idr_recreate_cooldown()
                                     {
                                         last_missing_idr_recreate = std::time::Instant::now();
                                         match NativeNvencTexturePipeline::new(
@@ -1314,6 +1405,8 @@ async fn attach_video_track_with_policy(
                             enable_network_adapt,
                             effective_cfg.max_fps_mode,
                             effective_cfg.idle_repeat_fps,
+                            keyframe_request.clone(),
+                            media_ready.clone(),
                             session_running.clone(),
                         ));
                     } else if let Some(track) = sample_track.clone() {
@@ -1329,6 +1422,8 @@ async fn attach_video_track_with_policy(
                             stats_send,
                             repeat_last,
                             idle_repeat_fps,
+                            keyframe_request.clone(),
+                            media_ready.clone(),
                             session_running_send,
                         ));
                     }
@@ -1521,6 +1616,8 @@ async fn attach_video_track_with_policy(
             enable_network_adapt,
             effective_cfg.max_fps_mode,
             effective_cfg.idle_repeat_fps,
+            keyframe_request.clone(),
+            media_ready,
             session_running.clone(),
         ));
     } else if let Some(track) = sample_track {
@@ -1641,14 +1738,23 @@ fn apply_transport_send_policy(
     cfg: &mut agent_rust::CaptureConfig,
 ) {
     if selected_transport == SessionTransport::WebRtc {
-        // WebRTC receiver expects stable AnnexB AU bootstrap; force manual packetizer.
-        cfg.rtp_use_manual_packetizer = true;
+        // Default to manual packetizer for low-latency RTP path, but allow
+        // sample-track fallback when debugging decode interoperability.
+        cfg.rtp_use_manual_packetizer =
+            should_force_webrtc_manual_packetizer(std::env::var("AGENT_WEBRTC_MANUAL_RTP").ok().as_deref());
         cfg.max_fps_mode = false;
         info!(
             rtp_use_manual_packetizer = cfg.rtp_use_manual_packetizer,
             max_fps_mode = cfg.max_fps_mode,
             "applied WebRTC-safe media send policy"
         );
+    }
+}
+
+fn should_force_webrtc_manual_packetizer(raw: Option<&str>) -> bool {
+    match raw.map(|v| v.trim().to_ascii_lowercase()) {
+        Some(v) if matches!(v.as_str(), "0" | "false" | "off" | "no") => false,
+        _ => true,
     }
 }
 
@@ -1659,9 +1765,12 @@ async fn spawn_send_loop_sample(
     stats_send: Arc<RuntimeStats>,
     repeat_last: bool,
     idle_repeat_fps: u32,
+    keyframe_request: Arc<AtomicBool>,
+    media_ready: Arc<AtomicBool>,
     session_running_send: Arc<AtomicBool>,
 ) {
     let mut last_encoded: Option<Arc<[u8]>> = None;
+    let mut bootstrap_idr: Option<Arc<[u8]>> = None;
     let mut last_sps: Option<Vec<u8>> = None;
     let mut last_pps: Option<Vec<u8>> = None;
     let h264_debug = std::env::var("AGENT_H264_DEBUG")
@@ -1670,7 +1779,41 @@ async fn spawn_send_loop_sample(
         .unwrap_or(false);
     let mut h264_debug_left = h264_debug_budget();
     let mut next_due = Instant::now();
+    let mut first_idr_sent = false;
+    let mut last_gate_force = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or_else(Instant::now);
+    let mut last_media_ready = false;
     while session_running_send.load(Ordering::SeqCst) {
+        let now_ready = media_ready.load(Ordering::SeqCst);
+        if now_ready != last_media_ready {
+            if now_ready {
+                first_idr_sent = false;
+                last_encoded = bootstrap_idr.take();
+                keyframe_request.store(true, Ordering::Relaxed);
+                info!("sample send unblocked on connected state; forcing keyframe bootstrap");
+            } else {
+                first_idr_sent = false;
+                warn!("sample send gated: peer connection not ready");
+            }
+            last_media_ready = now_ready;
+        }
+        if !now_ready {
+            while let Ok(encoded) = encoded_rx.try_recv() {
+                update_h264_param_cache(encoded.as_ref(), &mut last_sps, &mut last_pps);
+                if parse_annexb_nals_view(encoded.as_ref())
+                    .iter()
+                    .any(|n| n.nal_type == 5)
+                {
+                    bootstrap_idr = Some(encoded.clone());
+                }
+                last_encoded = Some(encoded);
+            }
+            keyframe_request.store(true, Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_millis(8)).await;
+            continue;
+        }
+
         wait_until_due(next_due).await;
         let mut got_fresh = false;
         while let Ok(encoded) = encoded_rx.try_recv() {
@@ -1713,6 +1856,20 @@ async fn spawn_send_loop_sample(
         } else {
             encoded.clone()
         };
+        let has_idr = parse_annexb_nals_view(au_for_send.as_ref())
+            .iter()
+            .any(|n| n.nal_type == 5);
+        if should_gate_rtp_until_first_idr(true, first_idr_sent, has_idr) {
+            if last_gate_force.elapsed() >= Duration::from_millis(120) {
+                keyframe_request.store(true, Ordering::Relaxed);
+                last_gate_force = Instant::now();
+            }
+            continue;
+        }
+        if has_idr && !first_idr_sent {
+            first_idr_sent = true;
+            info!("sample bootstrap: first IDR observed and sent");
+        }
         if h264_debug && h264_debug_left > 0 {
             let nals = parse_annexb_nals_view(au_for_send.as_ref());
             let nal_types: Vec<u8> = nals.iter().map(|n| n.nal_type).collect();
@@ -1770,11 +1927,14 @@ async fn spawn_send_loop_rtp(
     enable_network_adapt: bool,
     repeat_last_au_on_idle: bool,
     idle_repeat_fps: u32,
+    keyframe_request: Arc<AtomicBool>,
+    media_ready: Arc<AtomicBool>,
     session_running: Arc<AtomicBool>,
 ) {
     let mut next_due = Instant::now();
     let mut next_recover_tick = Instant::now();
     let mut last_encoded: Option<Arc<[u8]>> = None;
+    let mut bootstrap_idr: Option<Arc<[u8]>> = None;
     let mut last_sps: Option<Vec<u8>> = None;
     let mut last_pps: Option<Vec<u8>> = None;
     let h264_debug = std::env::var("AGENT_H264_DEBUG")
@@ -1783,7 +1943,45 @@ async fn spawn_send_loop_rtp(
         .unwrap_or(false);
     let mut h264_debug_left = h264_debug_budget();
     let mut consecutive_send_errors: u32 = 0;
+    let gate_until_first_idr = std::env::var("AGENT_RTP_WAIT_FIRST_IDR")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(true);
+    let mut first_idr_sent = false;
+    let mut last_gate_force = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or_else(Instant::now);
+    let mut last_media_ready = false;
     while session_running.load(Ordering::SeqCst) {
+        let now_ready = media_ready.load(Ordering::SeqCst);
+        if now_ready != last_media_ready {
+            if now_ready {
+                first_idr_sent = false;
+                last_encoded = bootstrap_idr.take();
+                keyframe_request.store(true, Ordering::Relaxed);
+                info!("media send unblocked on connected state; forcing keyframe bootstrap");
+            } else {
+                first_idr_sent = false;
+                warn!("media send gated: peer connection not ready");
+            }
+            last_media_ready = now_ready;
+        }
+        if !now_ready {
+            while let Ok(encoded) = encoded_rx.try_recv() {
+                update_h264_param_cache(encoded.as_ref(), &mut last_sps, &mut last_pps);
+                if parse_annexb_nals_view(encoded.as_ref())
+                    .iter()
+                    .any(|n| n.nal_type == 5)
+                {
+                    bootstrap_idr = Some(encoded.clone());
+                }
+                last_encoded = Some(encoded);
+            }
+            keyframe_request.store(true, Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_millis(8)).await;
+            continue;
+        }
+
         if enable_network_adapt && Instant::now() >= next_recover_tick {
             if let Some((fps_v, br_v)) = adapt.tick_recover() {
                 info!(
@@ -1851,12 +2049,25 @@ async fn spawn_send_loop_rtp(
         } else {
             encoded.clone()
         };
+        let has_idr = parse_annexb_nals_view(au_for_send.as_ref())
+            .iter()
+            .any(|n| n.nal_type == 5);
+        if should_gate_rtp_until_first_idr(gate_until_first_idr, first_idr_sent, has_idr) {
+            if last_gate_force.elapsed() >= Duration::from_millis(120) {
+                keyframe_request.store(true, Ordering::Relaxed);
+                last_gate_force = Instant::now();
+            }
+            continue;
+        }
+        if has_idr && !first_idr_sent {
+            first_idr_sent = true;
+            info!("RTP bootstrap: first IDR observed and sent");
+        }
         if h264_debug && h264_debug_left > 0 {
             let nals = parse_annexb_nals_view(au_for_send.as_ref());
             let nal_types: Vec<u8> = nals.iter().map(|n| n.nal_type).collect();
             let has_sps = nal_types.contains(&7);
             let has_pps = nal_types.contains(&8);
-            let has_idr = nal_types.contains(&5);
             let take = au_for_send.len().min(12);
             let mut head = String::new();
             for b in &au_for_send[..take] {
@@ -2078,6 +2289,10 @@ fn parse_annexb_nals_view(buf: &[u8]) -> Vec<AnnexbNalView<'_>> {
     out
 }
 
+fn should_gate_rtp_until_first_idr(wait_first_idr: bool, first_idr_sent: bool, has_idr: bool) -> bool {
+    wait_first_idr && !first_idr_sent && !has_idr
+}
+
 async fn ws_send_json(ws: &Arc<Mutex<WsWrite>>, v: &Value) -> Result<()> {
     let text = v.to_string();
     let mut w = ws.lock().await;
@@ -2228,5 +2443,22 @@ mod tests {
         apply_transport_send_policy(SessionTransport::WebRtc, &mut cfg);
         assert!(cfg.rtp_use_manual_packetizer);
         assert!(!cfg.max_fps_mode);
+    }
+
+    #[test]
+    fn rtp_bootstrap_gate_waits_until_first_idr() {
+        assert!(should_gate_rtp_until_first_idr(true, false, false));
+        assert!(!should_gate_rtp_until_first_idr(true, false, true));
+        assert!(!should_gate_rtp_until_first_idr(true, true, false));
+        assert!(!should_gate_rtp_until_first_idr(false, false, false));
+    }
+
+    #[test]
+    fn manual_rtp_override_parser() {
+        assert!(should_force_webrtc_manual_packetizer(None));
+        assert!(should_force_webrtc_manual_packetizer(Some("1")));
+        assert!(!should_force_webrtc_manual_packetizer(Some("0")));
+        assert!(!should_force_webrtc_manual_packetizer(Some("false")));
+        assert!(!should_force_webrtc_manual_packetizer(Some("off")));
     }
 }
