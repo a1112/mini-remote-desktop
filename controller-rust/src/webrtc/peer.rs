@@ -20,9 +20,11 @@ use webrtc::{
     ice_transport::ice_connection_state::RTCIceConnectionState,
     peer_connection::configuration::RTCConfiguration,
     peer_connection::sdp::session_description::RTCSessionDescription,
-    rtp_transceiver::rtp_codec::RTPCodecType,
+    rtp_transceiver::rtp_codec::{RTCRtpHeaderExtensionCapability, RTPCodecType},
     track::track_remote::TrackRemote,
 };
+
+const TX_UNIX_US_EXT_URI: &str = "urn:mini-remote-desktop:tx-unix-us";
 
 /// 视频帧数据
 #[derive(Debug, Clone)]
@@ -81,6 +83,13 @@ impl PeerConnectionManager {
         let mut m = MediaEngine::default();
         // 注册 H.264 编解码器
         m.register_default_codecs()?;
+        m.register_header_extension(
+            RTCRtpHeaderExtensionCapability {
+                uri: TX_UNIX_US_EXT_URI.to_string(),
+            },
+            RTPCodecType::Video,
+            None,
+        )?;
 
         let mut se = SettingEngine::default();
         se.set_include_loopback_candidate(true);
@@ -257,6 +266,13 @@ impl PeerConnectionManager {
             codec = %track.codec().capability.mime_type,
             "starting to read video track"
         );
+        let tx_ext_id = track
+            .params()
+            .header_extensions
+            .iter()
+            .find(|e| e.uri == TX_UNIX_US_EXT_URI)
+            .map(|e| e.id as u8);
+        info!(tx_ext_id = ?tx_ext_id, "webrtc tx-unix-us header extension mapping");
 
         // 读取 RTP 包并进行 H264 depacketize -> AnnexB AU 重组。
         loop {
@@ -273,6 +289,10 @@ impl PeerConnectionManager {
                 video_ssrc.store(current_ssrc, Ordering::Relaxed);
             }
             let timestamp = packet.header.timestamp;
+            let tx_unix_us = tx_ext_id
+                .and_then(|id| packet.header.get_extension(id))
+                .and_then(|v| parse_tx_unix_us_extension(&v))
+                .unwrap_or(0);
             if current_timestamp.is_none() {
                 current_timestamp = Some(timestamp);
             }
@@ -286,7 +306,7 @@ impl PeerConnectionManager {
                     timestamp: ts as u64,
                     is_keyframe: is_key,
                     sequence: packet.header.sequence_number as u64,
-                    tx_unix_us: 0,
+                    tx_unix_us,
                 };
                 if let Err(_e) = frame_tx.try_send(frame) {
                     debug!("frame channel full/closed, dropping fallback AU");
@@ -330,7 +350,7 @@ impl PeerConnectionManager {
                     timestamp: ts as u64,
                     is_keyframe: is_key,
                     sequence: packet.header.sequence_number as u64,
-                    tx_unix_us: 0,
+                    tx_unix_us,
                 };
                 if let Err(_e) = frame_tx.try_send(frame) {
                     debug!("frame channel full/closed, dropping decoded AU");
@@ -433,6 +453,15 @@ fn contains_idr_annexb(buf: &[u8]) -> bool {
         i = hdr.saturating_add(1);
     }
     false
+}
+
+fn parse_tx_unix_us_extension(payload: &[u8]) -> Option<u64> {
+    if payload.len() != 8 {
+        return None;
+    }
+    let mut b = [0u8; 8];
+    b.copy_from_slice(payload);
+    Some(u64::from_be_bytes(b))
 }
 
 fn hex_head(buf: &[u8], max_bytes: usize) -> String {

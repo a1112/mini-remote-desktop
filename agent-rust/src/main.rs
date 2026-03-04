@@ -23,7 +23,7 @@ use crate::nvenc_native::{NativeEncodePath, NativeNvencPipeline, NativeNvencText
 use crate::capture_runtime::WgcWindowCapturer;
 use crate::profile::apply_capture_profile;
 use crate::quic_tx::{QuicAu, QuicServerAdvert, start_quic_sender};
-use crate::rtp_send::{RtpH264Sender, RtpH264SenderConfig};
+use crate::rtp_send::{RtpH264Sender, RtpH264SenderConfig, TX_UNIX_US_EXT_URI};
 use crate::runtime_stats::{RuntimeStats, spawn_rtcp_feedback_loop, spawn_stats_panel};
 use agent_rust::load_config;
 use anyhow::{Context, Result, anyhow};
@@ -51,7 +51,7 @@ use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
-use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
+use webrtc::rtp_transceiver::rtp_codec::{RTCRtpCodecCapability, RTCRtpHeaderExtensionCapability, RTPCodecType};
 use webrtc::rtp_transceiver::{
     RTCPFeedback, TYPE_RTCP_FB_CCM, TYPE_RTCP_FB_GOOG_REMB, TYPE_RTCP_FB_NACK,
     TYPE_RTCP_FB_TRANSPORT_CC,
@@ -108,7 +108,7 @@ fn nvenc_recreate_on_force_idr_enabled_from(raw: Option<&str>) -> bool {
     match raw.map(|v| v.trim().to_ascii_lowercase()) {
         Some(v) if matches!(v.as_str(), "0" | "false" | "off" | "no") => false,
         Some(v) if matches!(v.as_str(), "1" | "true" | "on" | "yes") => true,
-        _ => true,
+        _ => false,
     }
 }
 
@@ -127,6 +127,26 @@ fn should_recreate_nvenc_on_force_idr(
         && selected_transport == SessionTransport::WebRtc
         && encoder_backend == VideoEncoderBackend::Nvenc
         && nvenc_recreate_on_force_idr_enabled()
+}
+
+fn should_recreate_nvenc_on_missing_idr(
+    selected_transport: SessionTransport,
+    encoder_backend: VideoEncoderBackend,
+    missing_idr_streak: u32,
+) -> bool {
+    selected_transport == SessionTransport::WebRtc
+        && encoder_backend == VideoEncoderBackend::Nvenc
+        && missing_idr_streak >= 24
+}
+
+fn next_missing_idr_streak(prev: u32, force_idr: bool, has_idr: bool) -> u32 {
+    if has_idr {
+        0
+    } else if force_idr {
+        prev.saturating_add(1)
+    } else {
+        prev
+    }
 }
 
 fn unix_time_us() -> u64 {
@@ -526,6 +546,13 @@ async fn create_peer_connection(
 ) -> Result<Arc<RTCPeerConnection>> {
     let mut m = MediaEngine::default();
     m.register_default_codecs()?;
+    m.register_header_extension(
+        RTCRtpHeaderExtensionCapability {
+            uri: TX_UNIX_US_EXT_URI.to_string(),
+        },
+        RTPCodecType::Video,
+        None,
+    )?;
     let mut se = SettingEngine::default();
     se.set_srtp_protection_profiles(vec![
         SrtpProtectionProfile::Srtp_Aead_Aes_128_Gcm,
@@ -634,17 +661,7 @@ async fn attach_video_track_with_policy(
     let mut effective_cfg = capture_cfg.clone();
     let with_capture_ts_header = selected_transport == SessionTransport::Quic;
     apply_capture_profile(&mut effective_cfg);
-    if selected_transport == SessionTransport::WebRtc {
-        // WebRTC path favors stable decoder bootstrap over ultra-aggressive RTP burst mode.
-        // Keep QUIC tuning unchanged.
-        effective_cfg.rtp_use_manual_packetizer = false;
-        effective_cfg.max_fps_mode = false;
-        info!(
-            rtp_use_manual_packetizer = effective_cfg.rtp_use_manual_packetizer,
-            max_fps_mode = effective_cfg.max_fps_mode,
-            "applied WebRTC-safe media send policy"
-        );
-    }
+    apply_transport_send_policy(selected_transport, &mut effective_cfg);
     if effective_cfg.tier_limit_enable {
         info!(
             tier_ladder_fps = %format!(
@@ -883,6 +900,9 @@ async fn attach_video_track_with_policy(
                 std::thread::spawn(move || {
                     let mut encoded_frames: u32 = 0;
                     let strict_gpu_direct = effective_cfg.strict_gpu_direct;
+                    let mut missing_idr_streak: u32 = 0;
+                    let mut last_missing_idr_recreate =
+                        std::time::Instant::now() - Duration::from_secs(10);
                     while session_running_encode.load(Ordering::SeqCst) {
                         let keyframe_requested = keyframe_request2.swap(false, Ordering::Relaxed);
                         let interval_force = idr_interval_frames > 0
@@ -911,6 +931,43 @@ async fn attach_video_track_with_policy(
                         }
                         match native.encode_next(force_idr) {
                             Ok(Some(v)) if !v.bytes.is_empty() => {
+                                let has_idr = parse_annexb_nals_view(v.bytes.as_ref())
+                                    .iter()
+                                    .any(|n| n.nal_type == 5);
+                                missing_idr_streak =
+                                    next_missing_idr_streak(missing_idr_streak, force_idr, has_idr);
+                                if force_idr && !has_idr && missing_idr_streak % 8 == 0 {
+                                    warn!(
+                                        missing_idr_streak,
+                                        seq_like = encoded_frames,
+                                        "force_idr requested but encoded AU still has no IDR"
+                                    );
+                                }
+                                if should_recreate_nvenc_on_missing_idr(
+                                    selected_transport_encode,
+                                    encoder_backend,
+                                    missing_idr_streak,
+                                ) && last_missing_idr_recreate.elapsed() >= Duration::from_millis(800)
+                                {
+                                    last_missing_idr_recreate = std::time::Instant::now();
+                                    match NativeNvencPipeline::new(
+                                        target_w,
+                                        target_h,
+                                        &effective_cfg_encode,
+                                    ) {
+                                        Ok(v2) => {
+                                            native = v2;
+                                            missing_idr_streak = 0;
+                                            warn!(
+                                                "recreated native NVENC pipeline due to prolonged missing IDR after keyframe requests"
+                                            );
+                                        }
+                                        Err(e) => warn!(
+                                            error = %e,
+                                            "failed to recreate native NVENC pipeline on missing IDR recovery"
+                                        ),
+                                    }
+                                }
                                 encoded_frames = encoded_frames.saturating_add(1);
                                 stats_encode
                                     .encoded_au_total
@@ -1079,6 +1136,9 @@ async fn attach_video_track_with_policy(
                     std::thread::spawn(move || {
                         let mut encoded_frames: u32 = 0;
                         let strict_gpu_direct = effective_cfg.strict_gpu_direct;
+                        let mut missing_idr_streak: u32 = 0;
+                        let mut last_missing_idr_recreate =
+                            std::time::Instant::now() - Duration::from_secs(10);
                         while session_running_encode.load(Ordering::SeqCst) {
                             let keyframe_requested =
                                 keyframe_request2.swap(false, Ordering::Relaxed);
@@ -1119,6 +1179,48 @@ async fn attach_video_track_with_policy(
                                 .and_then(|frame| native.encode_texture(&frame.texture, force_idr));
                             match encoded_res {
                                 Ok(Some(v)) if !v.bytes.is_empty() => {
+                                    let has_idr = parse_annexb_nals_view(v.bytes.as_ref())
+                                        .iter()
+                                        .any(|n| n.nal_type == 5);
+                                    missing_idr_streak = next_missing_idr_streak(
+                                        missing_idr_streak,
+                                        force_idr,
+                                        has_idr,
+                                    );
+                                    if force_idr && !has_idr && missing_idr_streak % 8 == 0 {
+                                        warn!(
+                                            missing_idr_streak,
+                                            seq_like = encoded_frames,
+                                            "WGC force_idr requested but encoded AU still has no IDR"
+                                        );
+                                    }
+                                    if should_recreate_nvenc_on_missing_idr(
+                                        selected_transport_encode,
+                                        encoder_backend,
+                                        missing_idr_streak,
+                                    ) && last_missing_idr_recreate.elapsed() >= Duration::from_millis(800)
+                                    {
+                                        last_missing_idr_recreate = std::time::Instant::now();
+                                        match NativeNvencTexturePipeline::new(
+                                            wgc.device(),
+                                            wgc.context(),
+                                            target_w,
+                                            target_h,
+                                            &effective_cfg_encode,
+                                        ) {
+                                            Ok(v2) => {
+                                                native = v2;
+                                                missing_idr_streak = 0;
+                                                warn!(
+                                                    "recreated WGC native NVENC texture pipeline due to prolonged missing IDR after keyframe requests"
+                                                );
+                                            }
+                                            Err(e) => warn!(
+                                                error = %e,
+                                                "failed to recreate WGC native NVENC texture pipeline on missing IDR recovery"
+                                            ),
+                                        }
+                                    }
                                     encoded_frames = encoded_frames.saturating_add(1);
                                     stats_encode
                                         .encoded_au_total
@@ -1532,6 +1634,22 @@ async fn attach_video_track_with_policy(
     }
 
     Ok(())
+}
+
+fn apply_transport_send_policy(
+    selected_transport: SessionTransport,
+    cfg: &mut agent_rust::CaptureConfig,
+) {
+    if selected_transport == SessionTransport::WebRtc {
+        // WebRTC receiver expects stable AnnexB AU bootstrap; force manual packetizer.
+        cfg.rtp_use_manual_packetizer = true;
+        cfg.max_fps_mode = false;
+        info!(
+            rtp_use_manual_packetizer = cfg.rtp_use_manual_packetizer,
+            max_fps_mode = cfg.max_fps_mode,
+            "applied WebRTC-safe media send policy"
+        );
+    }
 }
 
 async fn spawn_send_loop_sample(
@@ -2030,8 +2148,8 @@ mod tests {
     }
 
     #[test]
-    fn nvenc_recreate_env_parse_defaults_to_enabled() {
-        assert!(nvenc_recreate_on_force_idr_enabled_from(None));
+    fn nvenc_recreate_env_parse_defaults_to_disabled() {
+        assert!(!nvenc_recreate_on_force_idr_enabled_from(None));
         assert!(nvenc_recreate_on_force_idr_enabled_from(Some("1")));
         assert!(nvenc_recreate_on_force_idr_enabled_from(Some("true")));
         assert!(nvenc_recreate_on_force_idr_enabled_from(Some("yes")));
@@ -2047,7 +2165,7 @@ mod tests {
 
     #[test]
     fn recreate_policy_only_for_webrtc_nvenc_with_external_keyframe_request() {
-        assert!(should_recreate_nvenc_on_force_idr(
+        assert!(!should_recreate_nvenc_on_force_idr(
             SessionTransport::WebRtc,
             VideoEncoderBackend::Nvenc,
             true,
@@ -2067,5 +2185,48 @@ mod tests {
             VideoEncoderBackend::Nvenc,
             false,
         ));
+    }
+
+    #[test]
+    fn missing_idr_recovery_policy_only_for_webrtc_nvenc() {
+        assert!(should_recreate_nvenc_on_missing_idr(
+            SessionTransport::WebRtc,
+            VideoEncoderBackend::Nvenc,
+            24,
+        ));
+        assert!(!should_recreate_nvenc_on_missing_idr(
+            SessionTransport::Quic,
+            VideoEncoderBackend::Nvenc,
+            24,
+        ));
+        assert!(!should_recreate_nvenc_on_missing_idr(
+            SessionTransport::WebRtc,
+            VideoEncoderBackend::OpenH264,
+            24,
+        ));
+        assert!(!should_recreate_nvenc_on_missing_idr(
+            SessionTransport::WebRtc,
+            VideoEncoderBackend::Nvenc,
+            8,
+        ));
+    }
+
+    #[test]
+    fn missing_idr_streak_updates_with_force_and_idr() {
+        assert_eq!(next_missing_idr_streak(0, true, false), 1);
+        assert_eq!(next_missing_idr_streak(5, true, false), 6);
+        assert_eq!(next_missing_idr_streak(6, false, false), 6);
+        assert_eq!(next_missing_idr_streak(6, true, true), 0);
+        assert_eq!(next_missing_idr_streak(6, false, true), 0);
+    }
+
+    #[test]
+    fn transport_policy_forces_manual_packetizer_for_webrtc() {
+        let mut cfg = agent_rust::AgentConfig::default().capture;
+        cfg.rtp_use_manual_packetizer = false;
+        cfg.max_fps_mode = true;
+        apply_transport_send_policy(SessionTransport::WebRtc, &mut cfg);
+        assert!(cfg.rtp_use_manual_packetizer);
+        assert!(!cfg.max_fps_mode);
     }
 }

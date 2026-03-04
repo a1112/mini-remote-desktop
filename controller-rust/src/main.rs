@@ -408,6 +408,11 @@ async fn main() -> Result<()> {
             let mut no_output_streak = 0u32;
             let mut waiting_recover_keyframe = false;
             let mut waiting_probe_budget = 0u32;
+            let mut waiting_recover_since: Option<std::time::Instant> = None;
+            let mut waiting_recover_pli_requests: u32 = 0;
+            let mut last_wait_diag_at = std::time::Instant::now()
+                .checked_sub(Duration::from_secs(2))
+                .unwrap_or_else(std::time::Instant::now);
             let mut last_recover_keyframe_req = std::time::Instant::now()
                 .checked_sub(Duration::from_secs(1))
                 .unwrap_or_else(std::time::Instant::now);
@@ -440,13 +445,31 @@ async fn main() -> Result<()> {
                     let decode_started = std::time::Instant::now();
                     let count = frame_count_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     if waiting_recover_keyframe && !newest.is_keyframe {
+                        if waiting_recover_since.is_none() {
+                            waiting_recover_since = Some(std::time::Instant::now());
+                            waiting_recover_pli_requests = 0;
+                        }
                         waiting_probe_budget = waiting_probe_budget.saturating_add(1);
                         if last_recover_keyframe_req.elapsed() >= Duration::from_millis(500) {
                             let manager_guard = peer_manager_for_decode.read().await;
                             if let Some(ref mgr) = *manager_guard {
                                 let _ = mgr.request_keyframe().await;
+                                waiting_recover_pli_requests =
+                                    waiting_recover_pli_requests.saturating_add(1);
                             }
                             last_recover_keyframe_req = std::time::Instant::now();
+                        }
+                        if let Some(since) = waiting_recover_since {
+                            if last_wait_diag_at.elapsed() >= Duration::from_secs(1) {
+                                warn!(
+                                    wait_ms = since.elapsed().as_millis() as u64,
+                                    pli_requests = waiting_recover_pli_requests,
+                                    probe_budget = waiting_probe_budget,
+                                    seq = newest.sequence,
+                                    "waiting for recover keyframe: still receiving non-keyframes"
+                                );
+                                last_wait_diag_at = std::time::Instant::now();
+                            }
                         }
                         // Some senders/paths may not expose reliable keyframe markers.
                         // Periodically probe decode to avoid getting stuck in permanent wait.
@@ -457,6 +480,8 @@ async fn main() -> Result<()> {
                     if waiting_recover_keyframe && newest.is_keyframe {
                         waiting_recover_keyframe = false;
                         waiting_probe_budget = 0;
+                        waiting_recover_since = None;
+                        waiting_recover_pli_requests = 0;
                         info!(seq = newest.sequence, "decoder recovery synchronized on keyframe");
                     }
                     let mut decoder = decoder_clone.lock().await;
@@ -478,6 +503,8 @@ async fn main() -> Result<()> {
                         if waiting_recover_keyframe {
                             waiting_recover_keyframe = false;
                             waiting_probe_budget = 0;
+                            waiting_recover_since = None;
+                            waiting_recover_pli_requests = 0;
                             info!(seq = newest.sequence, "decoder recovery probe succeeded");
                         }
                         let decode_ms = now.duration_since(decode_started).as_secs_f64() * 1000.0;

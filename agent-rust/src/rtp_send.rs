@@ -1,11 +1,16 @@
 use anyhow::Result;
 use bytes::Bytes;
+use rtp::extension::HeaderExtension;
 use rtp::packet::Packet;
 use rtp::packetizer::{Packetizer, new_packetizer};
 use rtp::sequence::new_random_sequencer;
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
+use webrtc::util::marshal::{Marshal, MarshalSize};
 use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
+
+pub const TX_UNIX_US_EXT_URI: &str = "urn:mini-remote-desktop:tx-unix-us";
 
 pub struct RtpH264SenderConfig {
     pub fps: u32,
@@ -54,9 +59,15 @@ impl RtpH264Sender {
         if packets.is_empty() {
             return Ok(0);
         }
+        let tx_unix_us = unix_time_us();
+        let tx_ext = HeaderExtension::Custom {
+            uri: Cow::Borrowed(TX_UNIX_US_EXT_URI),
+            extension: Box::new(TxUnixUsExtension { tx_unix_us }),
+        };
+        let ext_arr = [tx_ext];
 
         if !self.frame_pacing_enable || packets.len() <= self.frame_pacing_batch_packets {
-            return self.send_packets(&packets).await;
+            return self.send_packets(&packets, &ext_arr).await;
         }
 
         let batches = packets.len().div_ceil(self.frame_pacing_batch_packets);
@@ -70,18 +81,46 @@ impl RtpH264Sender {
                 next_due += sleep_dur;
                 wait_until_due(next_due).await;
             }
-            sent += self.send_packets(chunk).await?;
+            sent += self.send_packets(chunk, &ext_arr).await?;
         }
         Ok(sent)
     }
 
-    async fn send_packets(&self, packets: &[Packet]) -> Result<usize> {
+    async fn send_packets(&self, packets: &[Packet], ext: &[HeaderExtension]) -> Result<usize> {
         let mut n = 0usize;
         for pkt in packets {
-            n += self.track.write_rtp_with_extensions(pkt, &[]).await?;
+            n += self.track.write_rtp_with_extensions(pkt, ext).await?;
         }
         Ok(n)
     }
+}
+
+#[derive(Debug)]
+struct TxUnixUsExtension {
+    tx_unix_us: u64,
+}
+
+impl MarshalSize for TxUnixUsExtension {
+    fn marshal_size(&self) -> usize {
+        8
+    }
+}
+
+impl Marshal for TxUnixUsExtension {
+    fn marshal_to(&self, buf: &mut [u8]) -> webrtc::util::Result<usize> {
+        if buf.len() < 8 {
+            return Err(webrtc::util::Error::ErrBufferShort);
+        }
+        buf[..8].copy_from_slice(&self.tx_unix_us.to_be_bytes());
+        Ok(8)
+    }
+}
+
+fn unix_time_us() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|v| v.as_micros().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
 }
 
 async fn wait_until_due(deadline: tokio::time::Instant) {
