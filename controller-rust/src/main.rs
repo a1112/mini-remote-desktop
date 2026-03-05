@@ -134,6 +134,36 @@ fn load_config(path: &PathBuf) -> Result<ControllerConfig> {
         .ok()
         .or_else(|| json["record"]["container"].as_str().map(|s| s.to_string()))
         .unwrap_or_else(|| "mp4".to_string());
+    let record_video_codec = std::env::var("MRD_RECORD_CODEC")
+        .ok()
+        .or_else(|| {
+            json["record"]["video_codec"]
+                .as_str()
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "copy".to_string());
+    let record_video_preset = std::env::var("MRD_RECORD_PRESET")
+        .ok()
+        .or_else(|| {
+            json["record"]["video_preset"]
+                .as_str()
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "p4".to_string());
+    let record_video_crf = std::env::var("MRD_RECORD_CRF")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        .or_else(|| json["record"]["video_crf"].as_i64().map(|v| v as i32))
+        .unwrap_or(23);
+    let record_video_bitrate_kbps = std::env::var("MRD_RECORD_BITRATE_KBPS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .or_else(|| {
+            json["record"]["video_bitrate_kbps"]
+                .as_u64()
+                .map(|v| v as u32)
+        })
+        .unwrap_or(0);
     let record_queue_depth = std::env::var("MRD_RECORD_QUEUE")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -162,6 +192,10 @@ fn load_config(path: &PathBuf) -> Result<ControllerConfig> {
             segment_seconds: record_segment_seconds,
             input_fps: record_input_fps,
             container: record_container,
+            video_codec: record_video_codec,
+            video_preset: record_video_preset,
+            video_crf: record_video_crf,
+            video_bitrate_kbps: record_video_bitrate_kbps,
             queue_depth: record_queue_depth,
         },
     })

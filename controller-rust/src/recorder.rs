@@ -19,6 +19,10 @@ pub struct RecordingConfig {
     pub segment_seconds: u32,
     pub input_fps: u32,
     pub container: String,
+    pub video_codec: String,
+    pub video_preset: String,
+    pub video_crf: i32,
+    pub video_bitrate_kbps: u32,
     pub queue_depth: usize,
 }
 
@@ -31,6 +35,10 @@ impl Default for RecordingConfig {
             segment_seconds: 60,
             input_fps: 60,
             container: "mp4".to_string(),
+            video_codec: "copy".to_string(),
+            video_preset: "p4".to_string(),
+            video_crf: 23,
+            video_bitrate_kbps: 0,
             queue_depth: 512,
         }
     }
@@ -97,6 +105,9 @@ impl Recorder {
         let segment_seconds = config.segment_seconds.clamp(5, 24 * 3600);
         let input_fps = config.input_fps.clamp(1, 240);
         let queue_depth = config.queue_depth.clamp(16, 4096);
+        let video_codec = normalize_codec(&config.video_codec);
+        let video_preset = resolve_preset(&video_codec, &config.video_preset);
+        let use_copy = video_codec == "copy";
 
         let mut cmd = Command::new(&config.ffmpeg_path);
         cmd.arg("-hide_banner")
@@ -111,16 +122,35 @@ impl Recorder {
             .arg(input_fps.to_string())
             .arg("-i")
             .arg("pipe:0")
-            .arg("-an")
-            .arg("-c:v")
-            .arg("copy")
-            .arg("-f")
+            .arg("-an");
+
+        if use_copy {
+            cmd.arg("-c:v").arg("copy");
+        } else {
+            cmd.arg("-c:v").arg(&video_codec);
+            if let Some(preset) = video_preset.as_deref() {
+                cmd.arg("-preset").arg(preset);
+            }
+            if config.video_bitrate_kbps > 0 {
+                cmd.arg("-b:v")
+                    .arg(format!("{}k", config.video_bitrate_kbps));
+            }
+            if supports_crf(&video_codec) && config.video_crf >= 0 {
+                cmd.arg("-crf").arg(config.video_crf.to_string());
+            }
+            cmd.arg("-g").arg((segment_seconds * input_fps).to_string());
+            cmd.arg("-force_key_frames")
+                .arg(format!("expr:gte(t,n_forced*{})", segment_seconds));
+        }
+
+        cmd.arg("-f")
             .arg("segment")
             .arg("-segment_time")
-            .arg(segment_seconds.to_string())
-            .arg("-break_non_keyframes")
-            .arg("1")
-            .arg("-reset_timestamps")
+            .arg(segment_seconds.to_string());
+        if use_copy {
+            cmd.arg("-break_non_keyframes").arg("1");
+        }
+        cmd.arg("-reset_timestamps")
             .arg("1")
             .arg("-strftime")
             .arg("1")
@@ -193,6 +223,10 @@ impl Recorder {
             segment_seconds,
             input_fps,
             container,
+            video_codec,
+            video_preset = ?video_preset,
+            video_crf = config.video_crf,
+            video_bitrate_kbps = config.video_bitrate_kbps,
             queue_depth,
             "receiver recording enabled"
         );
@@ -255,4 +289,53 @@ impl Drop for Recorder {
             let _ = worker.join();
         }
     }
+}
+
+fn normalize_codec(codec: &str) -> String {
+    let v = codec.trim().to_ascii_lowercase();
+    if v.is_empty() {
+        "copy".to_string()
+    } else {
+        v
+    }
+}
+
+fn supports_crf(codec: &str) -> bool {
+    matches!(codec, "libx264" | "libx265" | "libsvtav1")
+}
+
+fn resolve_preset(codec: &str, configured: &str) -> Option<String> {
+    let normalized = configured.trim().to_ascii_lowercase();
+    let preset = if normalized.is_empty() || normalized == "auto" {
+        match codec {
+            "libx264" => "veryfast".to_string(),
+            "libx265" => "medium".to_string(),
+            "h264_nvenc" | "hevc_nvenc" => "p4".to_string(),
+            _ => return None,
+        }
+    } else {
+        normalized
+    };
+
+    if matches!(codec, "libx264" | "libx265")
+        && matches!(
+            preset.as_str(),
+            "p1" | "p2" | "p3" | "p4" | "p5" | "p6" | "p7"
+        )
+    {
+        return Some(if codec == "libx264" {
+            "veryfast".to_string()
+        } else {
+            "medium".to_string()
+        });
+    }
+    if matches!(codec, "h264_nvenc" | "hevc_nvenc")
+        && !matches!(
+            preset.as_str(),
+            "p1" | "p2" | "p3" | "p4" | "p5" | "p6" | "p7"
+        )
+    {
+        return Some("p4".to_string());
+    }
+    Some(preset)
 }

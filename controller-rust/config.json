@@ -23,5 +23,18 @@
         "update_interval_ms": 1000,
         "show_fps": true,
         "show_latency": true
+    },
+    "record": {
+        "enabled": false,
+        "output_dir": "recordings",
+        "ffmpeg_path": "J:/ProjectTest/remote-desktop/mini-remote-desktop/tools/ffmpeg_full_build/bin/ffmpeg.exe",
+        "segment_seconds": 60,
+        "input_fps": 180,
+        "container": "mp4",
+        "video_codec": "copy",
+        "video_preset": "p4",
+        "video_crf": 23,
+        "video_bitrate_kbps": 0,
+        "queue_depth": 1024
     }
 }
