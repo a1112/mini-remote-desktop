@@ -512,7 +512,7 @@ class CoreTransportSuite:
             raise RuntimeError("signaling server not ready on ws://127.0.0.1:9527")
         agent_env = os.environ.copy()
         # Raise sender queue to reduce burst drops/stalls in QUIC/WebTransport tests.
-        agent_env.setdefault("AGENT_QUIC_QUEUE", "256")
+        agent_env.setdefault("AGENT_QUIC_QUEUE", "512")
         agent_env.setdefault("AGENT_WEBTRANSPORT_QUEUE", "256")
         # QUIC/WebTransport pacer: smooth sender bursts to reduce tail jitter.
         analysis = self.analysis
