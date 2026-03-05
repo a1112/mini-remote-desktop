@@ -27,6 +27,7 @@ pub struct CaptureConfig {
     pub min_fps: u32,
     pub max_fps: u32,
     pub performance_profile: String,
+    pub fps_mode: String,
     pub queue_strategy: String,
     pub profile_template: String,
     pub enable_template_overlay: bool,
@@ -127,6 +128,7 @@ impl Default for AgentConfig {
                 min_fps: 24,
                 max_fps: 120,
                 performance_profile: "balanced".to_string(),
+                fps_mode: "balanced".to_string(),
                 queue_strategy: "drop".to_string(),
                 profile_template: "balanced".to_string(),
                 enable_template_overlay: true,
@@ -263,6 +265,9 @@ pub fn load_config(path: &Path) -> AgentConfig {
         if let Some(v) = capture.get("performance_profile").and_then(|v| v.as_str()) {
             cfg.capture.performance_profile = v.to_string();
         }
+        if let Some(v) = capture.get("fps_mode").and_then(|v| v.as_str()) {
+            cfg.capture.fps_mode = v.to_string();
+        }
         if let Some(v) = capture.get("queue_strategy").and_then(|v| v.as_str()) {
             cfg.capture.queue_strategy = v.to_string();
         }
@@ -394,6 +399,7 @@ fn normalize_config(cfg: &mut AgentConfig) {
     cfg.capture.rc_mode = cfg.capture.rc_mode.to_ascii_lowercase();
     cfg.capture.adapt_mode = cfg.capture.adapt_mode.to_ascii_lowercase();
     cfg.capture.performance_profile = cfg.capture.performance_profile.to_ascii_lowercase();
+    cfg.capture.fps_mode = cfg.capture.fps_mode.to_ascii_lowercase();
     cfg.capture.queue_strategy = cfg.capture.queue_strategy.to_ascii_lowercase();
     cfg.capture.profile_template = cfg.capture.profile_template.to_ascii_lowercase();
     cfg.capture.capture_thread_priority = cfg.capture.capture_thread_priority.to_ascii_lowercase();
@@ -505,6 +511,18 @@ fn normalize_config(cfg: &mut AgentConfig) {
     ) {
         cfg.capture.performance_profile = "balanced".to_string();
     }
+    if !matches!(
+        cfg.capture.fps_mode.as_str(),
+        "latency"
+            | "balanced"
+            | "throughput"
+            | "latency_first"
+            | "balanced_first"
+            | "throughput_first"
+            | "max"
+    ) {
+        cfg.capture.fps_mode = "balanced".to_string();
+    }
     if !matches!(cfg.capture.queue_strategy.as_str(), "drop" | "block") {
         cfg.capture.queue_strategy = "drop".to_string();
     }
@@ -579,6 +597,7 @@ mod tests {
         assert!(cfg.capture.allow_encoder_fallback);
         assert!(!cfg.capture.strict_gpu_direct);
         assert_eq!(cfg.capture.profile_template, "balanced");
+        assert_eq!(cfg.capture.fps_mode, "balanced");
         assert!(cfg.capture.rtp_use_manual_packetizer);
     }
 
@@ -622,6 +641,7 @@ mod tests {
                 "min_fps":24,
                 "max_fps":120,
                 "performance_profile":"smooth",
+                "fps_mode":"throughput",
                 "queue_strategy":"block",
                 "profile_template":"custom",
                 "enable_template_overlay":false,
@@ -673,6 +693,7 @@ mod tests {
         assert_eq!(cfg.capture.max_bitrate_kbps, 30000);
         assert!(cfg.capture.adapt_enable);
         assert_eq!(cfg.capture.performance_profile, "smooth");
+        assert_eq!(cfg.capture.fps_mode, "throughput");
         assert_eq!(cfg.capture.queue_strategy, "block");
         assert_eq!(cfg.capture.profile_template, "custom");
         assert!(!cfg.capture.enable_template_overlay);

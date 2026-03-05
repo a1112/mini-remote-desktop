@@ -91,34 +91,48 @@ pub fn apply_capture_profile(cfg: &mut agent_rust::CaptureConfig) {
 
 fn apply_multi_tier_limits(cfg: &mut agent_rust::CaptureConfig) {
     // 5-tier ladder inspired by cpp_capture style quality ladders.
+    // Keep FPS continuous (no hard 144/120 cliffs), and use tier bitrates as anchors.
     let tiers = [
-        (cfg.tier_fps_l1, cfg.tier_bitrate_kbps_l1),
-        (cfg.tier_fps_l2, cfg.tier_bitrate_kbps_l2),
-        (cfg.tier_fps_l3, cfg.tier_bitrate_kbps_l3),
-        (cfg.tier_fps_l4, cfg.tier_bitrate_kbps_l4),
-        (cfg.tier_fps_l5, cfg.tier_bitrate_kbps_l5),
+        (cfg.tier_fps_l1.max(1), cfg.tier_bitrate_kbps_l1.max(100)),
+        (cfg.tier_fps_l2.max(1), cfg.tier_bitrate_kbps_l2.max(100)),
+        (cfg.tier_fps_l3.max(1), cfg.tier_bitrate_kbps_l3.max(100)),
+        (cfg.tier_fps_l4.max(1), cfg.tier_bitrate_kbps_l4.max(100)),
+        (cfg.tier_fps_l5.max(1), cfg.tier_bitrate_kbps_l5.max(100)),
     ];
-    let target = cfg.fps.max(1);
-    let (tier_fps, tier_br) = tiers
-        .iter()
-        .copied()
-        .filter(|(fps, _)| *fps <= target)
-        .next_back()
-        .unwrap_or(tiers[0]);
+    let target = cfg.fps.clamp(cfg.min_fps.max(1), cfg.max_fps.max(1)).max(1);
 
-    cfg.fps = cfg.fps.min(tier_fps);
-    cfg.max_fps = cfg.max_fps.min(tier_fps).max(cfg.min_fps.min(tier_fps));
+    let tier_br = if target <= tiers[0].0 {
+        tiers[0].1
+    } else if target >= tiers[4].0 {
+        tiers[4].1
+    } else {
+        let mut out = tiers[4].1;
+        for w in tiers.windows(2) {
+            let (fps_lo, br_lo) = w[0];
+            let (fps_hi, br_hi) = w[1];
+            if target >= fps_lo && target <= fps_hi {
+                let span = (fps_hi.saturating_sub(fps_lo)).max(1) as f64;
+                let t = (target.saturating_sub(fps_lo)) as f64 / span;
+                out = (br_lo as f64 + (br_hi as f64 - br_lo as f64) * t).round() as u32;
+                break;
+            }
+        }
+        out
+    };
+
+    cfg.fps = target;
+    cfg.max_fps = cfg.max_fps.max(cfg.fps).max(1);
     cfg.min_fps = cfg.min_fps.min(cfg.max_fps).max(1);
-    cfg.idle_repeat_fps = cfg.idle_repeat_fps.min(tier_fps).max(1);
+    cfg.idle_repeat_fps = cfg.idle_repeat_fps.min(cfg.max_fps).max(1);
     cfg.bitrate_kbps = cfg.bitrate_kbps.min(tier_br).max(100);
     cfg.max_bitrate_kbps = cfg.max_bitrate_kbps.min(tier_br).max(cfg.bitrate_kbps);
 
     // Lower tiers should keep queue shallow to avoid stale-frame bursts.
-    cfg.queue_depth = if tier_fps >= 144 {
+    cfg.queue_depth = if target >= 144 {
         cfg.queue_depth.min(4).max(2)
-    } else if tier_fps >= 120 {
+    } else if target >= 120 {
         cfg.queue_depth.min(6).max(2)
-    } else if tier_fps >= 60 {
+    } else if target >= 60 {
         cfg.queue_depth.min(8).max(3)
     } else {
         cfg.queue_depth.min(12).max(4)
@@ -172,7 +186,7 @@ mod tests {
     }
 
     #[test]
-    fn tier_limits_clamp_to_144_for_target_180() {
+    fn tier_limits_keep_continuous_fps_for_target_180() {
         let mut cfg = base_cfg();
         cfg.fps = 180;
         cfg.min_fps = 180;
@@ -181,11 +195,11 @@ mod tests {
         cfg.bitrate_kbps = 26000;
         cfg.max_bitrate_kbps = 30000;
         apply_capture_profile(&mut cfg);
-        assert_eq!(cfg.fps, 144);
-        assert_eq!(cfg.max_fps, 144);
-        assert_eq!(cfg.idle_repeat_fps, 144);
-        assert!(cfg.bitrate_kbps <= 18000);
-        assert!(cfg.max_bitrate_kbps <= 18000);
+        assert_eq!(cfg.fps, 180);
+        assert_eq!(cfg.max_fps, 180);
+        assert_eq!(cfg.idle_repeat_fps, 180);
+        assert!(cfg.bitrate_kbps <= 23000);
+        assert!(cfg.max_bitrate_kbps <= 23000);
     }
 
     #[test]

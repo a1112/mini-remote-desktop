@@ -4,7 +4,6 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use quinn::{Endpoint, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
@@ -28,7 +27,7 @@ pub struct QuicServerAdvert {
 
 #[derive(Clone, Debug)]
 pub struct QuicAu {
-    pub payload: Arc<[u8]>,
+    pub payload: Vec<u8>,
     pub tx_unix_us: u64,
 }
 
@@ -95,7 +94,7 @@ pub fn start_quic_sender(
                                     info!(
                                         seq,
                                         len,
-                                        hash = format!("{:016x}", fnv1a64(frame.payload.as_ref())),
+                                        hash = format!("{:016x}", fnv1a64(frame.payload.as_slice())),
                                         tx_unix_us = frame.tx_unix_us,
                                         "quic wire tx frame"
                                     );
@@ -111,7 +110,7 @@ pub fn start_quic_sender(
                                         })
                                         .await
                                         .is_err()
-                                    || stream.write_all(frame.payload.as_ref()).await.is_err()
+                                    || stream.write_all(frame.payload.as_slice()).await.is_err()
                                 {
                                     warn!("quic sender stream write failed, waiting for reconnect");
                                     break;

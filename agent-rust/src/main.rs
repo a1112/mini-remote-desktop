@@ -956,6 +956,23 @@ fn nvenc_missing_idr_recreate_cooldown() -> Duration {
     Duration::from_millis(cooldown_ms)
 }
 
+fn nvenc_missing_idr_recreate_budget_per_window() -> u32 {
+    std::env::var("AGENT_NVENC_MISSING_IDR_RECREATE_BUDGET")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(3)
+        .clamp(1, 32)
+}
+
+fn nvenc_missing_idr_recreate_window() -> Duration {
+    let window_ms = std::env::var("AGENT_NVENC_MISSING_IDR_RECREATE_WINDOW_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(15_000)
+        .clamp(1000, 120_000);
+    Duration::from_millis(window_ms)
+}
+
 fn keyframe_burst_len() -> u8 {
     std::env::var("AGENT_KEYFRAME_BURST")
         .ok()
@@ -1366,8 +1383,22 @@ async fn apply_capture_patch(
     patch: &Value,
 ) -> Result<()> {
     let mut cfg = capture_cfg.lock().await;
-    if let Some(v) = patch.get("targetFps").and_then(|v| v.as_u64()) {
-        let fps = (v as u32).clamp(1, 240);
+    let get_u32 = |camel: &str, snake: &str| -> Option<u32> {
+        patch
+            .get(camel)
+            .or_else(|| patch.get(snake))
+            .and_then(|v| v.as_u64())
+            .map(|v| (v as u32).clamp(1, 240))
+    };
+    let get_u32_raw = |camel: &str, snake: &str| -> Option<u32> {
+        patch
+            .get(camel)
+            .or_else(|| patch.get(snake))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32)
+    };
+
+    if let Some(fps) = get_u32("targetFps", "fps") {
         cfg.fps = fps;
         cfg.max_fps = cfg.max_fps.max(fps);
         cfg.min_fps = cfg.min_fps.min(fps);
@@ -1377,13 +1408,26 @@ async fn apply_capture_patch(
         cfg.tier_fps_l4 = cfg.tier_fps_l4.min(fps);
         cfg.tier_fps_l5 = cfg.tier_fps_l5.min(fps);
     }
-    if let Some(v) = patch.get("targetWidth").and_then(|v| v.as_u64()) {
+    if let Some(min_fps) = get_u32("minFps", "min_fps") {
+        cfg.min_fps = min_fps;
+    }
+    if let Some(max_fps) = get_u32("maxFps", "max_fps") {
+        cfg.max_fps = max_fps;
+    }
+    cfg.max_fps = cfg.max_fps.max(cfg.min_fps);
+    cfg.fps = cfg.fps.clamp(cfg.min_fps, cfg.max_fps);
+
+    if let Some(v) = get_u32_raw("targetWidth", "target_width") {
         cfg.target_width = v as u32;
     }
-    if let Some(v) = patch.get("targetHeight").and_then(|v| v.as_u64()) {
+    if let Some(v) = get_u32_raw("targetHeight", "target_height") {
         cfg.target_height = v as u32;
     }
-    if let Some(v) = patch.get("bitrateKbps").and_then(|v| v.as_u64()) {
+    if let Some(v) = patch
+        .get("bitrateKbps")
+        .or_else(|| patch.get("bitrate_kbps"))
+        .and_then(|v| v.as_u64())
+    {
         let br = (v as u32).max(100);
         cfg.bitrate_kbps = br;
         if cfg.max_bitrate_kbps < br {
@@ -1941,6 +1985,73 @@ fn parse_fps_cap_tier(v: &str) -> Option<u32> {
     }
 }
 
+fn apply_fps_mode_policy(cfg: &mut agent_rust::CaptureConfig) {
+    let mode = resolve_fps_mode(cfg);
+    apply_fps_mode_policy_with_mode(cfg, &mode);
+}
+
+fn resolve_fps_mode(cfg: &agent_rust::CaptureConfig) -> String {
+    std::env::var("AGENT_FPS_MODE")
+        .ok()
+        .unwrap_or_else(|| cfg.fps_mode.clone())
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn apply_fps_mode_policy_with_mode(cfg: &mut agent_rust::CaptureConfig, mode: &str) {
+    match mode {
+        "throughput" | "max" | "throughput_first" => {
+            // Throughput mode should not inherit max_fps_mode's tiny-queue clamp.
+            cfg.max_fps_mode = false;
+            cfg.frame_pacing_enable = false;
+            cfg.queue_strategy = "drop".to_string();
+            cfg.queue_depth = cfg.queue_depth.clamp(8, 32);
+            cfg.rtp_use_manual_packetizer = true;
+            // Throughput mode prefers highest stable cadence and lets transport pacing handle bursts.
+            cfg.tier_limit_enable = env_flag_enabled("AGENT_FPS_MODE_KEEP_TIER_LIMIT", false);
+            if let Some(tier) = std::env::var("AGENT_CODEC_FPS_CAP_TIER")
+                .ok()
+                .and_then(|v| parse_fps_cap_tier(&v))
+            {
+                cfg.max_fps = cfg.max_fps.max(tier);
+                if env_flag_enabled("AGENT_FPS_MODE_FORCE_TARGET", true) {
+                    cfg.fps = cfg.fps.max(tier);
+                }
+            }
+            cfg.max_fps = cfg.max_fps.max(cfg.fps.max(1));
+            cfg.min_fps = cfg.min_fps.min(cfg.max_fps).max(1);
+            cfg.idle_repeat_fps = cfg.idle_repeat_fps.max(cfg.fps).clamp(1, cfg.max_fps.max(1));
+            info!(
+                fps_mode = mode,
+                fps = cfg.fps,
+                min_fps = cfg.min_fps,
+                max_fps = cfg.max_fps,
+                queue_depth = cfg.queue_depth,
+                tier_limit_enable = cfg.tier_limit_enable,
+                "applied fps mode policy"
+            );
+        }
+        "latency" | "latency_first" => {
+            cfg.max_fps_mode = false;
+            cfg.frame_pacing_enable = false;
+            cfg.queue_strategy = "drop".to_string();
+            cfg.queue_depth = cfg.queue_depth.clamp(2, 8);
+            info!(fps_mode = mode, "applied fps mode policy");
+        }
+        "balanced" | "balanced_first" => {
+            cfg.max_fps_mode = false;
+            cfg.queue_strategy = "drop".to_string();
+            cfg.frame_pacing_enable = true;
+            cfg.queue_depth = cfg.queue_depth.clamp(4, 16);
+            cfg.tier_limit_enable = env_flag_enabled("AGENT_FPS_MODE_KEEP_TIER_LIMIT", true);
+            info!(fps_mode = mode, "applied fps mode policy");
+        }
+        _ => {
+            info!(fps_mode = mode, "unknown fps mode; keeping defaults");
+        }
+    }
+}
+
 fn codec_transport_fps_cap(selected_transport: SessionTransport) -> Option<u32> {
     if !env_flag_enabled("AGENT_CODEC_FPS_CAP_ENABLE", true) {
         return None;
@@ -1983,9 +2094,20 @@ fn apply_codec_transport_limits(
     let Some(cap) = codec_transport_fps_cap(selected_transport) else {
         return;
     };
+    let uplift_enable = env_flag_enabled("AGENT_CODEC_FPS_CAP_UPLIFT_ENABLE", true);
+    let force_target = env_flag_enabled("AGENT_CODEC_FPS_CAP_FORCE_TARGET", true);
     let old_fps = cfg.fps;
     let old_max = cfg.max_fps;
     let old_min = cfg.min_fps;
+    if uplift_enable {
+        cfg.max_fps = cfg.max_fps.max(cap);
+        if force_target && cfg.fps < cap {
+            cfg.fps = cap;
+        }
+        cfg.tier_fps_l5 = cfg.tier_fps_l5.max(cap);
+        cfg.tier_fps_l4 = cfg.tier_fps_l4.max(cfg.tier_fps_l3);
+        cfg.tier_fps_l5 = cfg.tier_fps_l5.max(cfg.tier_fps_l4);
+    }
     cfg.fps = cfg.fps.min(cap);
     cfg.max_fps = cfg.max_fps.min(cap).max(1);
     cfg.min_fps = cfg.min_fps.min(cfg.max_fps).max(1);
@@ -2023,6 +2145,12 @@ fn spawn_control_stats_publisher(
         let mut last_sent = 0_u64;
         let mut last_unique_sent = 0_u64;
         let mut last_repeated_sent = 0_u64;
+        let mut last_enqueue_wait_us_total = 0_u64;
+        let mut last_capture_to_send_us_total = 0_u64;
+        let mut last_encode_approx_us_total = 0_u64;
+        let mut last_capture_encode_samples = 0_u64;
+        let mut last_transport_send_us_total = 0_u64;
+        let mut last_transport_send_samples = 0_u64;
         while running.load(Ordering::SeqCst) {
             ticker.tick().await;
 
@@ -2033,6 +2161,20 @@ fn spawn_control_stats_publisher(
             let sent_total = stats.sent_au_total.load(Ordering::Relaxed);
             let unique_sent_total = stats.unique_sent_au_total.load(Ordering::Relaxed);
             let repeated_sent_total = stats.repeated_sent_au_total.load(Ordering::Relaxed);
+            let enqueue_wait_us_total = stats
+                .transport_enqueue_wait_us_total
+                .load(Ordering::Relaxed);
+            let capture_to_send_us_total = stats
+                .transport_capture_to_send_us_total
+                .load(Ordering::Relaxed);
+            let encode_approx_us_total = stats
+                .transport_encode_approx_us_total
+                .load(Ordering::Relaxed);
+            let capture_encode_samples = stats
+                .transport_capture_encode_samples
+                .load(Ordering::Relaxed);
+            let transport_send_us_total = stats.transport_send_us_total.load(Ordering::Relaxed);
+            let transport_send_samples = stats.transport_send_samples.load(Ordering::Relaxed);
 
             let nack_per_sec = nack.saturating_sub(last_nack);
             let pli_per_sec = pli.saturating_sub(last_pli);
@@ -2042,6 +2184,39 @@ fn spawn_control_stats_publisher(
             let unique_send_fps = unique_sent_total.saturating_sub(last_unique_sent);
             let repeat_send_fps = repeated_sent_total.saturating_sub(last_repeated_sent);
             let queue_depth = encoded_total.saturating_sub(sent_total);
+            let enqueue_wait_us_delta =
+                enqueue_wait_us_total.saturating_sub(last_enqueue_wait_us_total);
+            let capture_to_send_us_delta =
+                capture_to_send_us_total.saturating_sub(last_capture_to_send_us_total);
+            let encode_approx_us_delta =
+                encode_approx_us_total.saturating_sub(last_encode_approx_us_total);
+            let capture_encode_samples_delta =
+                capture_encode_samples.saturating_sub(last_capture_encode_samples);
+            let transport_send_us_delta =
+                transport_send_us_total.saturating_sub(last_transport_send_us_total);
+            let transport_send_samples_delta =
+                transport_send_samples.saturating_sub(last_transport_send_samples);
+            let enqueue_wait_avg_us = if encode_fps > 0 {
+                enqueue_wait_us_delta as f64 / encode_fps as f64
+            } else {
+                0.0
+            };
+            let transport_send_avg_us = if transport_send_samples_delta > 0 {
+                transport_send_us_delta as f64 / transport_send_samples_delta as f64
+            } else {
+                0.0
+            };
+            let p = stats.transport_latency_percentiles_ms();
+            let capture_to_send_avg_us = if capture_encode_samples_delta > 0 {
+                capture_to_send_us_delta as f64 / capture_encode_samples_delta as f64
+            } else {
+                0.0
+            };
+            let encode_approx_avg_us = if capture_encode_samples_delta > 0 {
+                encode_approx_us_delta as f64 / capture_encode_samples_delta as f64
+            } else {
+                0.0
+            };
 
             last_nack = nack;
             last_pli = pli;
@@ -2050,6 +2225,12 @@ fn spawn_control_stats_publisher(
             last_sent = sent_total;
             last_unique_sent = unique_sent_total;
             last_repeated_sent = repeated_sent_total;
+            last_enqueue_wait_us_total = enqueue_wait_us_total;
+            last_capture_to_send_us_total = capture_to_send_us_total;
+            last_encode_approx_us_total = encode_approx_us_total;
+            last_capture_encode_samples = capture_encode_samples;
+            last_transport_send_us_total = transport_send_us_total;
+            last_transport_send_samples = transport_send_samples;
 
             let payload = json!({
                 "type": "agentStats",
@@ -2067,7 +2248,21 @@ fn spawn_control_stats_publisher(
                     "nackPerSec": nack_per_sec,
                     "pliPerSec": pli_per_sec,
                     "quicDropPerSec": quic_drop_per_sec,
-                    "queueDepth": queue_depth
+                    "queueDepth": queue_depth,
+                    "enqueueWaitAvgUs": (enqueue_wait_avg_us * 10.0).round() / 10.0,
+                    "transportSendAvgUs": (transport_send_avg_us * 10.0).round() / 10.0,
+                    "captureMs": (capture_to_send_avg_us / 1000.0 * 1000.0).round() / 1000.0,
+                    "captureP50Ms": (p.capture.p50 * 1000.0).round() / 1000.0,
+                    "captureP95Ms": (p.capture.p95 * 1000.0).round() / 1000.0,
+                    "encodeMs": (encode_approx_avg_us / 1000.0 * 1000.0).round() / 1000.0,
+                    "encodeP50Ms": (p.encode.p50 * 1000.0).round() / 1000.0,
+                    "encodeP95Ms": (p.encode.p95 * 1000.0).round() / 1000.0,
+                    "queueWaitMs": (enqueue_wait_avg_us / 1000.0 * 1000.0).round() / 1000.0,
+                    "queueWaitP50Ms": (p.queue_wait.p50 * 1000.0).round() / 1000.0,
+                    "queueWaitP95Ms": (p.queue_wait.p95 * 1000.0).round() / 1000.0,
+                    "sendMs": (transport_send_avg_us / 1000.0 * 1000.0).round() / 1000.0,
+                    "sendP50Ms": (p.send.p50 * 1000.0).round() / 1000.0,
+                    "sendP95Ms": (p.send.p95 * 1000.0).round() / 1000.0
                 }
             });
 
@@ -2251,7 +2446,11 @@ async fn attach_video_track_with_policy(
     } else {
         None
     };
+    apply_fps_mode_policy(&mut effective_cfg);
     apply_capture_profile(&mut effective_cfg);
+    // Re-apply fps mode after profile/template overlay to keep queue/pacing/tier
+    // controls consistent with the requested runtime mode.
+    apply_fps_mode_policy(&mut effective_cfg);
     apply_transport_send_policy(selected_transport, &mut effective_cfg);
     apply_codec_transport_limits(selected_transport, &mut effective_cfg);
     if let Some(v) = active_sessions {
@@ -2573,6 +2772,8 @@ async fn attach_video_track_with_policy(
                     let mut keyframe_burst_remain: u8 = 0;
                     let mut last_missing_idr_recreate =
                         std::time::Instant::now() - Duration::from_secs(10);
+                    let mut missing_idr_recreate_window_start = std::time::Instant::now();
+                    let mut missing_idr_recreate_count: u32 = 0;
                     let mut last_interval_force = std::time::Instant::now();
                     while session_running_encode.load(Ordering::SeqCst) {
                         wait_encode_tick(
@@ -2624,6 +2825,8 @@ async fn attach_video_track_with_policy(
                                 );
                                 if has_idr {
                                     keyframe_burst_remain = 0;
+                                    missing_idr_recreate_count = 0;
+                                    missing_idr_recreate_window_start = std::time::Instant::now();
                                 }
                                 if force_idr && !has_idr && missing_idr_streak % 8 == 0 {
                                     warn!(
@@ -2632,6 +2835,12 @@ async fn attach_video_track_with_policy(
                                         "force_idr requested but encoded AU still has no IDR"
                                     );
                                 }
+                                if missing_idr_recreate_window_start.elapsed()
+                                    >= nvenc_missing_idr_recreate_window()
+                                {
+                                    missing_idr_recreate_window_start = std::time::Instant::now();
+                                    missing_idr_recreate_count = 0;
+                                }
                                 if should_recreate_nvenc_on_missing_idr(
                                     selected_transport_encode,
                                     encoder_backend,
@@ -2639,23 +2848,40 @@ async fn attach_video_track_with_policy(
                                 ) && last_missing_idr_recreate.elapsed()
                                     >= nvenc_missing_idr_recreate_cooldown()
                                 {
-                                    last_missing_idr_recreate = std::time::Instant::now();
-                                    match NativeNvencPipeline::new(
-                                        target_w,
-                                        target_h,
-                                        &effective_cfg_encode,
-                                    ) {
-                                        Ok(v2) => {
-                                            native = v2;
-                                            missing_idr_streak = 0;
+                                    if missing_idr_recreate_count
+                                        >= nvenc_missing_idr_recreate_budget_per_window()
+                                    {
+                                        if missing_idr_recreate_count
+                                            == nvenc_missing_idr_recreate_budget_per_window()
+                                        {
                                             warn!(
-                                                "recreated native NVENC pipeline due to prolonged missing IDR after keyframe requests"
+                                                missing_idr_streak,
+                                                recreate_budget = nvenc_missing_idr_recreate_budget_per_window(),
+                                                recreate_window_ms = nvenc_missing_idr_recreate_window().as_millis() as u64,
+                                                "skip NVENC recreate on missing IDR due to budget limit"
                                             );
                                         }
-                                        Err(e) => warn!(
-                                            error = %e,
-                                            "failed to recreate native NVENC pipeline on missing IDR recovery"
-                                        ),
+                                    } else {
+                                        last_missing_idr_recreate = std::time::Instant::now();
+                                        match NativeNvencPipeline::new(
+                                            target_w,
+                                            target_h,
+                                            &effective_cfg_encode,
+                                        ) {
+                                            Ok(v2) => {
+                                                native = v2;
+                                                missing_idr_streak = 0;
+                                                missing_idr_recreate_count =
+                                                    missing_idr_recreate_count.saturating_add(1);
+                                                warn!(
+                                                    "recreated native NVENC pipeline due to prolonged missing IDR after keyframe requests"
+                                                );
+                                            }
+                                            Err(e) => warn!(
+                                                error = %e,
+                                                "failed to recreate native NVENC pipeline on missing IDR recovery"
+                                            ),
+                                        }
                                     }
                                 }
                                 encoded_frames = encoded_frames.saturating_add(1);
@@ -2843,6 +3069,8 @@ async fn attach_video_track_with_policy(
                         let mut keyframe_burst_remain: u8 = 0;
                         let mut last_missing_idr_recreate =
                             std::time::Instant::now() - Duration::from_secs(10);
+                        let mut missing_idr_recreate_window_start = std::time::Instant::now();
+                        let mut missing_idr_recreate_count: u32 = 0;
                         let mut last_interval_force = std::time::Instant::now();
                         while session_running_encode.load(Ordering::SeqCst) {
                             wait_encode_tick(
@@ -2904,6 +3132,9 @@ async fn attach_video_track_with_policy(
                                     );
                                     if has_idr {
                                         keyframe_burst_remain = 0;
+                                        missing_idr_recreate_count = 0;
+                                        missing_idr_recreate_window_start =
+                                            std::time::Instant::now();
                                     }
                                     if force_idr && !has_idr && missing_idr_streak % 8 == 0 {
                                         warn!(
@@ -2912,6 +3143,13 @@ async fn attach_video_track_with_policy(
                                             "WGC force_idr requested but encoded AU still has no IDR"
                                         );
                                     }
+                                    if missing_idr_recreate_window_start.elapsed()
+                                        >= nvenc_missing_idr_recreate_window()
+                                    {
+                                        missing_idr_recreate_window_start =
+                                            std::time::Instant::now();
+                                        missing_idr_recreate_count = 0;
+                                    }
                                     if should_recreate_nvenc_on_missing_idr(
                                         selected_transport_encode,
                                         encoder_backend,
@@ -2919,25 +3157,43 @@ async fn attach_video_track_with_policy(
                                     ) && last_missing_idr_recreate.elapsed()
                                         >= nvenc_missing_idr_recreate_cooldown()
                                     {
-                                        last_missing_idr_recreate = std::time::Instant::now();
-                                        match NativeNvencTexturePipeline::new(
-                                            wgc.device(),
-                                            wgc.context(),
-                                            target_w,
-                                            target_h,
-                                            &effective_cfg_encode,
-                                        ) {
-                                            Ok(v2) => {
-                                                native = v2;
-                                                missing_idr_streak = 0;
+                                        if missing_idr_recreate_count
+                                            >= nvenc_missing_idr_recreate_budget_per_window()
+                                        {
+                                            if missing_idr_recreate_count
+                                                == nvenc_missing_idr_recreate_budget_per_window()
+                                            {
                                                 warn!(
-                                                    "recreated WGC native NVENC texture pipeline due to prolonged missing IDR after keyframe requests"
+                                                    missing_idr_streak,
+                                                    recreate_budget = nvenc_missing_idr_recreate_budget_per_window(),
+                                                    recreate_window_ms = nvenc_missing_idr_recreate_window().as_millis() as u64,
+                                                    "skip WGC NVENC recreate on missing IDR due to budget limit"
                                                 );
                                             }
-                                            Err(e) => warn!(
-                                                error = %e,
-                                                "failed to recreate WGC native NVENC texture pipeline on missing IDR recovery"
-                                            ),
+                                        } else {
+                                            last_missing_idr_recreate = std::time::Instant::now();
+                                            match NativeNvencTexturePipeline::new(
+                                                wgc.device(),
+                                                wgc.context(),
+                                                target_w,
+                                                target_h,
+                                                &effective_cfg_encode,
+                                            ) {
+                                                Ok(v2) => {
+                                                    native = v2;
+                                                    missing_idr_streak = 0;
+                                                    missing_idr_recreate_count =
+                                                        missing_idr_recreate_count
+                                                            .saturating_add(1);
+                                                    warn!(
+                                                        "recreated WGC native NVENC texture pipeline due to prolonged missing IDR after keyframe requests"
+                                                    );
+                                                }
+                                                Err(e) => warn!(
+                                                    error = %e,
+                                                    "failed to recreate WGC native NVENC texture pipeline on missing IDR recovery"
+                                                ),
+                                            }
                                         }
                                     }
                                     encoded_frames = encoded_frames.saturating_add(1);
@@ -3314,7 +3570,7 @@ async fn attach_video_track_with_policy(
                 } else {
                     idle_repeat_fps
                 };
-                let send_gap = Duration::from_millis((1000.0 / send_fps as f64).max(1.0) as u64);
+                let send_gap = frame_gap_from_fps(send_fps);
                 next_due = advance_send_deadline(next_due, send_gap, Instant::now());
                 let au_for_send = if let Some(patched) =
                     patch_h264_au_with_cached_params(encoded.as_ref(), &last_sps, &last_pps)
@@ -3493,7 +3749,7 @@ async fn spawn_send_loop_sample(
         } else {
             idle_repeat_fps
         };
-        let send_gap = Duration::from_millis((1000.0 / send_fps as f64).max(1.0) as u64);
+        let send_gap = frame_gap_from_fps(send_fps);
         next_due = advance_send_deadline(next_due, send_gap, Instant::now());
         let au_for_send = if let Some(patched) =
             patch_h264_au_with_cached_params(encoded.as_ref(), &last_sps, &last_pps)
@@ -3686,7 +3942,7 @@ async fn spawn_send_loop_rtp(
         } else {
             idle_repeat_fps
         };
-        let frame_gap = Duration::from_millis((1000.0 / send_fps as f64).max(1.0) as u64);
+        let frame_gap = frame_gap_from_fps(send_fps);
         next_due = advance_send_deadline(next_due, frame_gap, Instant::now());
         let au_for_send = if let Some(patched) =
             patch_h264_au_with_cached_params(encoded.as_ref(), &last_sps, &last_pps)
@@ -4014,27 +4270,53 @@ async fn spawn_send_loop_quic(
         .ok()
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+    let codec_effective = std::env::var("AGENT_VIDEO_CODEC_EFFECTIVE")
+        .ok()
+        .unwrap_or_else(|| "h264".to_string())
+        .to_ascii_lowercase();
+    let should_patch_h264 = codec_effective == "h264";
     let mut debug_left = 8usize;
     let max_au_bytes = std::env::var("AGENT_QUIC_MAX_AU_BYTES")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(1_500_000)
         .clamp(64 * 1024, 8 * 1024 * 1024);
+    let min_gap_us = std::env::var("AGENT_QUIC_MIN_GAP_US")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0)
+        .min(50_000);
+    let min_gap = if min_gap_us > 0 {
+        Some(Duration::from_micros(min_gap_us))
+    } else {
+        None
+    };
     let mut last_sps: Option<Vec<u8>> = None;
     let mut last_pps: Option<Vec<u8>> = None;
     let mut dropped = 0_u64;
     let mut pacer = QuicPacer::from_env();
     let mut rate_link = QueueRateLink::from_env(queue_link_fps.clone());
+    let mut last_send_at: Option<Instant> = None;
+    let mut congestion_backoff: u32 = 0;
     while session_running.load(Ordering::SeqCst) {
+        let recv_wait_start = Instant::now();
         let encoded = match encoded_rx.recv().await {
             Some(v) => v,
             None => break,
         };
+        let enqueue_wait_us = recv_wait_start.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        stats.encoded_au_total.fetch_add(1, Ordering::Relaxed);
+        stats
+            .transport_enqueue_wait_us_total
+            .fetch_add(enqueue_wait_us, Ordering::Relaxed);
+        stats.record_transport_queue_wait_us(enqueue_wait_us);
         let (capture_start_us, payload) = unpack_capture_ts_au(encoded.as_ref());
         let mut out = payload.to_vec();
-        update_h264_param_cache(&out, &mut last_sps, &mut last_pps);
-        if let Some(patched) = patch_h264_au_with_cached_params(&out, &last_sps, &last_pps) {
-            out = patched;
+        if should_patch_h264 {
+            update_h264_param_cache(&out, &mut last_sps, &mut last_pps);
+            if let Some(patched) = patch_h264_au_with_cached_params(&out, &last_sps, &last_pps) {
+                out = patched;
+            }
         }
         if quic_debug && debug_left > 0 {
             let take = out.len().min(12);
@@ -4043,10 +4325,14 @@ async fn spawn_send_loop_quic(
                 use std::fmt::Write as _;
                 let _ = write!(&mut head, "{:02X} ", b);
             }
-            let nal_types: Vec<u8> = parse_annexb_nals_view(&out)
-                .iter()
-                .map(|n| n.nal_type)
-                .collect();
+            let nal_types: Vec<u8> = if should_patch_h264 {
+                parse_annexb_nals_view(&out)
+                    .iter()
+                    .map(|n| n.nal_type)
+                    .collect()
+            } else {
+                Vec::new()
+            };
             info!(
                 au_bytes = out.len(),
                 head = %head.trim_end(),
@@ -4068,30 +4354,50 @@ async fn spawn_send_loop_quic(
             }
             continue;
         }
-        let out = Arc::<[u8]>::from(out);
+        let out_len = out.len() as u64;
         let quic_au = QuicAu {
-            payload: out.clone(),
+            payload: out,
             tx_unix_us: if capture_start_us == 0 {
                 unix_time_us()
             } else {
                 capture_start_us
             },
         };
-        pacer.wait_turn().await;
+        // Avoid artificial fixed-rate throttling. Only apply transport pacing when
+        // pacing is active or we recently observed queue congestion.
+        if should_throttle_quic_send(pacer.should_pace(), congestion_backoff) {
+            pacer.wait_turn().await;
+            if let (Some(gap), Some(last)) = (min_gap, last_send_at) {
+                let elapsed = last.elapsed();
+                if elapsed < gap {
+                    tokio::time::sleep(gap - elapsed).await;
+                }
+            }
+        }
+        let capture_to_send_start_us = if capture_start_us > 0 {
+            unix_time_us().saturating_sub(capture_start_us)
+        } else {
+            0
+        };
+        let send_attempt_start = Instant::now();
         match quic_sender.try_send(quic_au) {
             Ok(()) => {
+                last_send_at = Some(Instant::now());
                 pacer.on_send_ok();
                 rate_link.recover_on_ok();
+                if congestion_backoff > 0 {
+                    congestion_backoff = congestion_backoff.saturating_sub(1);
+                }
                 stats.sent_au_total.fetch_add(1, Ordering::Relaxed);
                 stats.unique_sent_au_total.fetch_add(1, Ordering::Relaxed);
                 stats.quic_au_sent.fetch_add(1, Ordering::Relaxed);
-                stats
-                    .quic_bytes_sent
-                    .fetch_add(out.len() as u64, Ordering::Relaxed);
+                stats.quic_bytes_sent.fetch_add(out_len, Ordering::Relaxed);
             }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                last_send_at = Some(Instant::now());
                 pacer.on_send_full();
                 rate_link.reduce_on_full();
+                congestion_backoff = congestion_backoff.saturating_add(4).min(64);
                 dropped = dropped.saturating_add(1);
                 stats.quic_au_dropped.fetch_add(1, Ordering::Relaxed);
                 if dropped.is_multiple_of(120) {
@@ -4102,6 +4408,31 @@ async fn spawn_send_loop_quic(
                 error!("quic sender channel closed");
                 break;
             }
+        }
+        let send_elapsed_us = send_attempt_start
+            .elapsed()
+            .as_micros()
+            .min(u64::MAX as u128) as u64;
+        stats
+            .transport_send_us_total
+            .fetch_add(send_elapsed_us, Ordering::Relaxed);
+        stats
+            .transport_send_samples
+            .fetch_add(1, Ordering::Relaxed);
+        stats.record_transport_send_us(send_elapsed_us);
+        if capture_to_send_start_us > 0 {
+            let capture_us = capture_to_send_start_us.saturating_add(send_elapsed_us);
+            let encode_us = capture_to_send_start_us.saturating_sub(send_elapsed_us);
+            stats
+                .transport_capture_to_send_us_total
+                .fetch_add(capture_us, Ordering::Relaxed);
+            stats
+                .transport_encode_approx_us_total
+                .fetch_add(encode_us, Ordering::Relaxed);
+            stats
+                .transport_capture_encode_samples
+                .fetch_add(1, Ordering::Relaxed);
+            stats.record_transport_capture_encode_us(capture_us, encode_us);
         }
     }
 }
@@ -4213,14 +4544,27 @@ fn advance_send_deadline(prev_due: Instant, gap: Duration, now: Instant) -> Inst
     if next < now { now } else { next }
 }
 
+fn frame_gap_from_fps(fps: u32) -> Duration {
+    let fps = fps.max(1) as f64;
+    Duration::from_secs_f64((1.0 / fps).max(0.000_5))
+}
+
 fn wait_encode_tick(next_due: &mut Instant, fps: u32) {
-    let fps = fps.max(1);
-    let gap = Duration::from_millis((1000.0 / fps as f64).max(1.0) as u64);
+    let gap = frame_gap_from_fps(fps);
     let now = Instant::now();
     if *next_due > now {
         std::thread::sleep(*next_due - now);
     }
-    *next_due = Instant::now() + gap;
+    let wake = Instant::now();
+    *next_due = if *next_due <= wake {
+        wake + gap
+    } else {
+        *next_due + gap
+    };
+}
+
+fn should_throttle_quic_send(pacer_active: bool, congestion_backoff: u32) -> bool {
+    pacer_active || congestion_backoff > 0
 }
 
 async fn wait_until_due(deadline: Instant) {
@@ -4422,5 +4766,54 @@ mod tests {
         let caps = json!({ "codecs": ["h264", "hevc", "av1"] });
         let selected = select_codec_by_strategy(SessionTransport::WebRtc, &caps);
         assert_eq!(selected, VideoCodec::H264);
+    }
+
+    #[test]
+    fn quic_send_throttle_only_when_needed() {
+        assert!(!should_throttle_quic_send(false, 0));
+        assert!(should_throttle_quic_send(true, 0));
+        assert!(should_throttle_quic_send(false, 1));
+    }
+
+    #[test]
+    fn fps_mode_throughput_relaxes_tier_and_pacing() {
+        let mut cfg = agent_rust::AgentConfig::default().capture;
+        cfg.fps = 200;
+        cfg.max_fps = 200;
+        cfg.queue_depth = 2;
+        cfg.tier_limit_enable = true;
+        cfg.frame_pacing_enable = true;
+        apply_fps_mode_policy_with_mode(&mut cfg, "throughput");
+        assert!(!cfg.tier_limit_enable);
+        assert!(!cfg.frame_pacing_enable);
+        assert!(cfg.queue_depth >= 8);
+    }
+
+    #[test]
+    fn fps_mode_latency_prefers_small_queue_without_pacing() {
+        let mut cfg = agent_rust::AgentConfig::default().capture;
+        cfg.queue_depth = 32;
+        cfg.frame_pacing_enable = true;
+        apply_fps_mode_policy_with_mode(&mut cfg, "latency");
+        assert!(!cfg.frame_pacing_enable);
+        assert!(cfg.queue_depth <= 8);
+    }
+
+    #[test]
+    fn fps_mode_balanced_restores_pacing_window() {
+        let mut cfg = agent_rust::AgentConfig::default().capture;
+        cfg.queue_depth = 1;
+        cfg.frame_pacing_enable = false;
+        apply_fps_mode_policy_with_mode(&mut cfg, "balanced");
+        assert!(cfg.frame_pacing_enable);
+        assert!(cfg.queue_depth >= 4);
+    }
+
+    #[test]
+    fn fps_mode_prefers_config_when_env_missing() {
+        let mut cfg = agent_rust::AgentConfig::default().capture;
+        cfg.fps_mode = "throughput".to_string();
+        let mode = resolve_fps_mode(&cfg);
+        assert_eq!(mode, "throughput");
     }
 }
