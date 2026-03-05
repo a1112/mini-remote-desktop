@@ -1,3 +1,5 @@
+mod audio_playback;
+mod audio_quic_rx;
 mod input;
 mod quic_rx;
 mod recorder;
@@ -10,8 +12,11 @@ mod webrtc;
 
 // 视频帧接收器类型别名
 type FrameReceiver = Arc<Mutex<mpsc::Receiver<webrtc::peer::VideoFrame>>>;
+type AudioReceiver = Arc<Mutex<mpsc::Receiver<audio_quic_rx::AudioFrame>>>;
 
 use anyhow::{Context, Result};
+use audio_playback::spawn_audio_playback;
+use audio_quic_rx::{connect_audio_quic_receiver, AudioQuicConnectInfo};
 use common_control_proto::ControlEvent;
 use quic_rx::{connect_quic_receiver, QuicConnectInfo};
 use recorder::{Recorder, RecordingConfig};
@@ -22,6 +27,7 @@ use signaling::{SignalingClient, SignalingMessagePayload};
 use stats::StatsCollector;
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -164,6 +170,42 @@ fn load_config(path: &PathBuf) -> Result<ControllerConfig> {
                 .map(|v| v as u32)
         })
         .unwrap_or(0);
+    let record_audio_enabled = std::env::var("MRD_RECORD_AUDIO_ENABLE")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .or_else(|| json["record"]["audio_enabled"].as_bool())
+        .unwrap_or(true);
+    let record_audio_codec = std::env::var("MRD_RECORD_AUDIO_CODEC")
+        .ok()
+        .or_else(|| {
+            json["record"]["audio_codec"]
+                .as_str()
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "aac".to_string());
+    let record_audio_bitrate_kbps = std::env::var("MRD_RECORD_AUDIO_BITRATE_KBPS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .or_else(|| {
+            json["record"]["audio_bitrate_kbps"]
+                .as_u64()
+                .map(|v| v as u32)
+        })
+        .unwrap_or(160);
+    let record_audio_sample_rate = std::env::var("MRD_RECORD_AUDIO_SAMPLE_RATE")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .or_else(|| {
+            json["record"]["audio_sample_rate"]
+                .as_u64()
+                .map(|v| v as u32)
+        })
+        .unwrap_or(48_000);
+    let record_audio_channels = std::env::var("MRD_RECORD_AUDIO_CHANNELS")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .or_else(|| json["record"]["audio_channels"].as_u64().map(|v| v as u16))
+        .unwrap_or(2);
     let record_queue_depth = std::env::var("MRD_RECORD_QUEUE")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -196,6 +238,11 @@ fn load_config(path: &PathBuf) -> Result<ControllerConfig> {
             video_preset: record_video_preset,
             video_crf: record_video_crf,
             video_bitrate_kbps: record_video_bitrate_kbps,
+            audio_enabled: record_audio_enabled,
+            audio_codec: record_audio_codec,
+            audio_bitrate_kbps: record_audio_bitrate_kbps,
+            audio_sample_rate: record_audio_sample_rate,
+            audio_channels: record_audio_channels,
             queue_depth: record_queue_depth,
         },
     })
@@ -416,6 +463,44 @@ async fn run_control_bench(
     }
 }
 
+async fn push_audio_route_if_configured(
+    peer_manager: &Arc<RwLock<Option<Arc<PeerConnectionManager>>>>,
+) {
+    let mode = std::env::var("MRD_AUDIO_ROUTE_MODE")
+        .ok()
+        .and_then(|v| v.parse::<u8>().ok())
+        .unwrap_or(0);
+    let scope = std::env::var("MRD_AUDIO_ROUTE_SCOPE")
+        .ok()
+        .and_then(|v| v.parse::<u8>().ok())
+        .unwrap_or(0);
+    let target_pid = std::env::var("MRD_AUDIO_ROUTE_PID")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(0);
+    let follow_children = std::env::var("MRD_AUDIO_ROUTE_FOLLOW_CHILDREN")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(true);
+    let event = ControlEvent::AudioRouteControl {
+        mode,
+        scope,
+        target_pid,
+        follow_children,
+    };
+    let mgr = { peer_manager.read().await.clone() };
+    if let Some(m) = mgr {
+        if let Err(e) = m.send_control_event(event, 0, unix_time_us()).await {
+            warn!(error = %e, "send initial audio route control failed");
+        } else {
+            info!(
+                mode,
+                scope, target_pid, follow_children, "initial audio route control sent"
+            );
+        }
+    }
+}
+
 fn select_frame_for_decode(
     rx: &mut mpsc::Receiver<webrtc::peer::VideoFrame>,
     first: webrtc::peer::VideoFrame,
@@ -628,6 +713,8 @@ async fn main() -> Result<()> {
 
     // 视频帧接收器
     let frame_receiver: Arc<Mutex<Option<FrameReceiver>>> = Arc::new(Mutex::new(None));
+    let audio_receiver: Arc<Mutex<Option<AudioReceiver>>> = Arc::new(Mutex::new(None));
+    let audio_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let control_bench_cfg = ControlBenchConfig::from_env();
     if control_bench_cfg.enabled {
@@ -652,6 +739,7 @@ async fn main() -> Result<()> {
     // 视频帧统计
     let frame_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let decoded_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let latest_video_tx_us = Arc::new(AtomicU64::new(0));
     let frame_count_clone = frame_count.clone();
     let decoded_count_clone = decoded_count.clone();
     let decoder_clone = decoder.clone();
@@ -660,6 +748,7 @@ async fn main() -> Result<()> {
     let render_sink = renderer.frame_sink();
     let overlay_stats_for_decode = overlay_stats.clone();
     let recorder_for_decode = recorder.clone();
+    let latest_video_tx_us_for_decode = latest_video_tx_us.clone();
 
     // 启动视频帧处理任务
     let frame_receiver_clone = frame_receiver.clone();
@@ -864,6 +953,7 @@ async fn main() -> Result<()> {
                             frame_interval_ms.push_back(delta_ms);
                         }
                         if newest.tx_unix_us != 0 {
+                            latest_video_tx_us_for_decode.store(newest.tx_unix_us, Ordering::Relaxed);
                             if let Ok(elapsed) =
                                 std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                             {
@@ -1294,6 +1384,7 @@ async fn main() -> Result<()> {
                         controller_id,
                         selected_transport,
                         quic,
+                        audio_quic,
                     } => {
                         if let Ok(mut ov) = overlay_stats.lock() {
                             ov.selected_transport = selected_transport.clone();
@@ -1316,6 +1407,9 @@ async fn main() -> Result<()> {
                             }
                         }
                         drop(manager);
+                        if webrtc_ready {
+                            push_audio_route_if_configured(&peer_manager).await;
+                        }
 
                         if selected_transport.eq_ignore_ascii_case("quic") {
                             if let Some(q) = quic {
@@ -1332,6 +1426,35 @@ async fn main() -> Result<()> {
                                             ov.media_path = "quic".to_string();
                                         }
                                         info!("connected to QUIC media transport");
+                                        if let Some(aq) = audio_quic {
+                                            let audio_info = AudioQuicConnectInfo {
+                                                addr: aq.addr,
+                                                server_name: aq.server_name,
+                                                cert_der_base64: aq.cert_der_base64,
+                                                codec: aq.codec,
+                                                sample_rate: aq.sample_rate,
+                                                channels: aq.channels,
+                                            };
+                                            match connect_audio_quic_receiver(&audio_info).await {
+                                                Ok(arx) => {
+                                                    *audio_receiver.lock().await = Some(arx.clone());
+                                                    if !audio_started.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                                                        if let Err(e) = spawn_audio_playback(
+                                                            arx,
+                                                            latest_video_tx_us.clone(),
+                                                            Some(recorder.clone()),
+                                                        ) {
+                                                            warn!(error = %e, "audio playback init failed");
+                                                        } else {
+                                                            info!("audio playback initialized");
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    warn!(error = %e, "audio quic transport connect failed");
+                                                }
+                                            }
+                                        }
                                     }
                                     Err(e) => {
                                         if webrtc_ready {

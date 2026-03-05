@@ -23,6 +23,11 @@ pub struct RecordingConfig {
     pub video_preset: String,
     pub video_crf: i32,
     pub video_bitrate_kbps: u32,
+    pub audio_enabled: bool,
+    pub audio_codec: String,
+    pub audio_bitrate_kbps: u32,
+    pub audio_sample_rate: u32,
+    pub audio_channels: u16,
     pub queue_depth: usize,
 }
 
@@ -39,6 +44,11 @@ impl Default for RecordingConfig {
             video_preset: "p4".to_string(),
             video_crf: 23,
             video_bitrate_kbps: 0,
+            audio_enabled: true,
+            audio_codec: "aac".to_string(),
+            audio_bitrate_kbps: 160,
+            audio_sample_rate: 48_000,
+            audio_channels: 2,
             queue_depth: 512,
         }
     }
@@ -56,6 +66,7 @@ pub struct RecordingStats {
 
 enum RecorderMsg {
     Frame(bytes::Bytes),
+    AudioPcm(bytes::Bytes),
     Stop,
 }
 
@@ -67,6 +78,9 @@ struct RecordingStatsAtomic {
     write_failures: AtomicU64,
     bytes_written: AtomicU64,
     write_total_us: AtomicU64,
+    audio_packets: AtomicU64,
+    audio_bytes_written: AtomicU64,
+    audio_write_failures: AtomicU64,
 }
 
 pub struct Recorder {
@@ -108,6 +122,16 @@ impl Recorder {
         let video_codec = normalize_codec(&config.video_codec);
         let video_preset = resolve_preset(&video_codec, &config.video_preset);
         let use_copy = video_codec == "copy";
+        let audio_enabled = config.audio_enabled;
+        let audio_sample_rate = config.audio_sample_rate.clamp(8_000, 192_000);
+        let audio_channels = config.audio_channels.clamp(1, 8);
+        let audio_codec = resolve_audio_codec(&config.audio_codec);
+        let audio_bitrate_kbps = config.audio_bitrate_kbps.clamp(16, 1536);
+        let audio_udp_port = if audio_enabled {
+            Some(pick_local_udp_port().context("pick local udp port for recorder audio failed")?)
+        } else {
+            None
+        };
 
         let mut cmd = Command::new(&config.ffmpeg_path);
         cmd.arg("-hide_banner")
@@ -121,8 +145,23 @@ impl Recorder {
             .arg("-r")
             .arg(input_fps.to_string())
             .arg("-i")
-            .arg("pipe:0")
-            .arg("-an");
+            .arg("pipe:0");
+        if let Some(port) = audio_udp_port {
+            let audio_input =
+                format!("udp://127.0.0.1:{port}?fifo_size=1048576&overrun_nonfatal=1");
+            cmd.arg("-thread_queue_size")
+                .arg("512")
+                .arg("-f")
+                .arg("f32le")
+                .arg("-ar")
+                .arg(audio_sample_rate.to_string())
+                .arg("-ac")
+                .arg(audio_channels.to_string())
+                .arg("-i")
+                .arg(audio_input);
+        } else {
+            cmd.arg("-an");
+        }
 
         if use_copy {
             cmd.arg("-c:v").arg("copy");
@@ -141,6 +180,14 @@ impl Recorder {
             cmd.arg("-g").arg((segment_seconds * input_fps).to_string());
             cmd.arg("-force_key_frames")
                 .arg(format!("expr:gte(t,n_forced*{})", segment_seconds));
+        }
+
+        if audio_udp_port.is_some() {
+            cmd.arg("-map").arg("0:v:0").arg("-map").arg("1:a:0");
+            cmd.arg("-c:a").arg(&audio_codec);
+            if audio_codec != "copy" {
+                cmd.arg("-b:a").arg(format!("{audio_bitrate_kbps}k"));
+            }
         }
 
         cmd.arg("-f")
@@ -167,6 +214,15 @@ impl Recorder {
         })?;
         let Some(mut stdin) = child.stdin.take() else {
             return Err(anyhow::anyhow!("ffmpeg recorder stdin not available"));
+        };
+        let audio_socket = if let Some(port) = audio_udp_port {
+            let sock = std::net::UdpSocket::bind("127.0.0.1:0")
+                .context("bind recorder audio udp sender failed")?;
+            sock.connect(("127.0.0.1", port))
+                .context("connect recorder audio udp sender failed")?;
+            Some(sock)
+        } else {
+            None
         };
 
         let (tx, rx): (SyncSender<RecorderMsg>, Receiver<RecorderMsg>) =
@@ -202,6 +258,24 @@ impl Recorder {
                                 }
                             }
                         }
+                        Ok(RecorderMsg::AudioPcm(data)) => {
+                            if let Some(sock) = audio_socket.as_ref() {
+                                match sock.send(data.as_ref()) {
+                                    Ok(n) => {
+                                        stats_worker.audio_packets.fetch_add(1, Ordering::Relaxed);
+                                        stats_worker
+                                            .audio_bytes_written
+                                            .fetch_add(n as u64, Ordering::Relaxed);
+                                    }
+                                    Err(e) => {
+                                        stats_worker
+                                            .audio_write_failures
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        warn!(error = %e, "recorder audio udp send failed");
+                                    }
+                                }
+                            }
+                        }
                         Ok(RecorderMsg::Stop) => break,
                         Err(_) => break,
                     }
@@ -227,6 +301,11 @@ impl Recorder {
             video_preset = ?video_preset,
             video_crf = config.video_crf,
             video_bitrate_kbps = config.video_bitrate_kbps,
+            audio_enabled,
+            audio_codec,
+            audio_bitrate_kbps,
+            audio_sample_rate,
+            audio_channels,
             queue_depth,
             "receiver recording enabled"
         );
@@ -252,6 +331,29 @@ impl Recorder {
                 }
                 Err(TrySendError::Disconnected(_)) => {
                     self.stats.write_failures.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    pub fn record_audio_f32(&self, samples: &[f32]) {
+        if !self.enabled || samples.is_empty() {
+            return;
+        }
+        let mut buf = Vec::<u8>::with_capacity(samples.len() * std::mem::size_of::<f32>());
+        for s in samples {
+            buf.extend_from_slice(&s.to_le_bytes());
+        }
+        if let Some(tx) = &self.tx {
+            match tx.try_send(RecorderMsg::AudioPcm(bytes::Bytes::from(buf))) {
+                Ok(_) => {}
+                Err(TrySendError::Full(_)) => {
+                    self.stats.dropped_frames.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    self.stats
+                        .audio_write_failures
+                        .fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -338,4 +440,22 @@ fn resolve_preset(codec: &str, configured: &str) -> Option<String> {
         return Some("p4".to_string());
     }
     Some(preset)
+}
+
+fn resolve_audio_codec(codec: &str) -> String {
+    match codec.trim().to_ascii_lowercase().as_str() {
+        "aac" | "libopus" | "opus" => codec.trim().to_ascii_lowercase(),
+        "copy" => "aac".to_string(),
+        _ => "aac".to_string(),
+    }
+}
+
+fn pick_local_udp_port() -> Result<u16> {
+    let sock =
+        std::net::UdpSocket::bind("127.0.0.1:0").context("bind temporary udp socket failed")?;
+    let port = sock
+        .local_addr()
+        .context("query local udp addr failed")?
+        .port();
+    Ok(port)
 }
