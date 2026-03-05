@@ -28,6 +28,9 @@ webrtc = "0.12"
 wtransport = "0.7"
 rtp = "0.12"
 rtcp = "0.12"
+cpal = { path = "../../audio/cpal" }
+audiopus = { version = "0.3.0-rc.0", default-features = false, features = ["coder"] }
+audiopus_sys = { version = "0.2.2", features = ["static"] }
 common-control-proto = { path = "../common-control-proto" }
 windows = { version = "0.62", features = [
     "Graphics_Capture",

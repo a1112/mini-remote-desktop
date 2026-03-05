@@ -1,0 +1,104 @@
+﻿$ErrorActionPreference='Stop'
+$base='J:/ProjectTest/remote-desktop/mini-remote-desktop'
+$agentDir=Join-Path $base 'agent-rust'
+$controllerDir=Join-Path $base 'controller-rust'
+$signalingDir=Join-Path $base 'signaling-rs'
+$controllerCfgPath=Join-Path $controllerDir 'config.json'
+$agentCfgPath=Join-Path $agentDir 'config.json'
+$controllerBak=Join-Path $controllerDir ('config.recordcmp.' + (Get-Date -Format 'yyyyMMdd_HHmmss') + '.bak.json')
+$agentBak=Join-Path $agentDir ('config.recordcmp.' + (Get-Date -Format 'yyyyMMdd_HHmmss') + '.bak.json')
+$signalingExe=Join-Path $signalingDir 'target/debug/signaling-rs.exe'
+$agentExe=Join-Path $agentDir 'target/debug/agent-rust.exe'
+$controllerExe=Join-Path $controllerDir 'target/debug/controller-rust.exe'
+$ffmpegExe=Join-Path $base 'tools/ffmpeg_full_build/bin/ffmpeg.exe'
+
+function Stop-Mrd { Get-Process | Where-Object { $_.ProcessName -in @('signaling-rs','agent-rust','controller-rust') } | Stop-Process -Force -ErrorAction SilentlyContinue }
+function Set-JsonField($obj,[string]$name,$value){ if($obj.PSObject.Properties.Name -contains $name){$obj.$name=$value}else{$obj|Add-Member -NotePropertyName $name -NotePropertyValue $value} }
+function LastLine([string]$path,[string]$pat){ if(!(Test-Path $path)){return ''}; $line=(Get-Content $path | Select-String $pat | Select-Object -Last 1).Line; if(!$line){return ''}; return [regex]::Replace(($line|Out-String),"\x1B\[[0-9;]*m","").Trim() }
+function Extract([string]$text,[string]$pat){ $m=[regex]::Match($text,$pat); if($m.Success){return $m.Groups[1].Value}; return 'n/a' }
+
+$results=@()
+Copy-Item $controllerCfgPath $controllerBak -Force
+Copy-Item $agentCfgPath $agentBak -Force
+Write-Output 'phase=setup_ok'
+try {
+  $acfg=Get-Content $agentCfgPath -Raw | ConvertFrom-Json
+  $acfg.capture.target_width=2560; $acfg.capture.target_height=1440
+  $acfg.capture.fps=180; $acfg.capture.min_fps=180; $acfg.capture.max_fps=180; $acfg.capture.idle_repeat_fps=180
+  Set-JsonField $acfg.capture 'backend' 'dxgi'
+  Set-JsonField $acfg.capture 'encoder' 'nvenc'
+  Set-JsonField $acfg.capture 'strict_gpu_direct' $true
+  Set-JsonField $acfg.capture 'allow_fallback' $false
+  Set-JsonField $acfg.capture 'allow_encoder_fallback' $false
+  ($acfg | ConvertTo-Json -Depth 100) | Set-Content -Path $agentCfgPath -Encoding Ascii
+  Write-Output 'phase=agent_cfg_ok'
+
+  foreach($recordEnabled in @($false,$true)){
+    $mode=if($recordEnabled){'record_on'}else{'record_off'}
+    Write-Output ("phase=run_start mode={0}" -f $mode)
+    $dir=Join-Path $base ('recordings.cmp.' + $mode + '.' + (Get-Date -Format 'HHmmss'))
+
+    $ccfg=Get-Content $controllerCfgPath -Raw | ConvertFrom-Json
+    if(-not ($ccfg.PSObject.Properties.Name -contains 'render')){ $ccfg | Add-Member -NotePropertyName 'render' -NotePropertyValue ([pscustomobject]@{}) }
+    Set-JsonField $ccfg.render 'sr_mode' 'performance'
+    if(-not ($ccfg.PSObject.Properties.Name -contains 'record')){ $ccfg | Add-Member -NotePropertyName 'record' -NotePropertyValue ([pscustomobject]@{}) }
+    Set-JsonField $ccfg.record 'enabled' $recordEnabled
+    Set-JsonField $ccfg.record 'output_dir' $dir
+    Set-JsonField $ccfg.record 'ffmpeg_path' $ffmpegExe
+    Set-JsonField $ccfg.record 'segment_seconds' 10
+    Set-JsonField $ccfg.record 'input_fps' 180
+    Set-JsonField $ccfg.record 'container' 'mp4'
+    Set-JsonField $ccfg.record 'video_codec' 'copy'
+    Set-JsonField $ccfg.record 'video_preset' 'p4'
+    Set-JsonField $ccfg.record 'video_crf' 23
+    Set-JsonField $ccfg.record 'video_bitrate_kbps' 12000
+    Set-JsonField $ccfg.record 'queue_depth' 1024
+    ($ccfg | ConvertTo-Json -Depth 100) | Set-Content -Path $controllerCfgPath -Encoding Ascii
+
+    $tag='accept.record.cmp.' + $mode + '.' + (Get-Date -Format 'HHmmss')
+    $slog=Join-Path $base ($tag + '.s.log'); $serr=Join-Path $base ($tag + '.s.err')
+    $alog=Join-Path $base ($tag + '.a.log'); $aerr=Join-Path $base ($tag + '.a.err')
+    $clog=Join-Path $base ($tag + '.c.log'); $cerr=Join-Path $base ($tag + '.c.err')
+
+    Stop-Mrd
+    $sp=Start-Process -FilePath $signalingExe -WorkingDirectory $signalingDir -PassThru -RedirectStandardOutput $slog -RedirectStandardError $serr
+    Start-Sleep -Milliseconds 700
+    $acmd='/c set AGENT_FFMPEG_PATH=' + $ffmpegExe + '&& "' + $agentExe + '"'
+    $ap=Start-Process -FilePath 'cmd.exe' -ArgumentList $acmd -WorkingDirectory $agentDir -PassThru -RedirectStandardOutput $alog -RedirectStandardError $aerr
+    Start-Sleep -Seconds 2
+    $ccmd='/c set MRD_TRANSPORT=quic&& set MRD_DECODER=d3d11va&& set MRD_RENDER_MODE=low_latency&& set RUST_LOG=controller_rust=info,tokio=warn,webrtc=warn&& "' + $controllerExe + '"'
+    $cp=Start-Process -FilePath 'cmd.exe' -ArgumentList $ccmd -WorkingDirectory $controllerDir -PassThru -RedirectStandardOutput $clog -RedirectStandardError $cerr
+
+    Start-Sleep -Seconds 20
+
+    if(Get-Process -Id $cp.Id -ErrorAction SilentlyContinue){Stop-Process -Id $cp.Id -Force}
+    if(Get-Process -Id $ap.Id -ErrorAction SilentlyContinue){Stop-Process -Id $ap.Id -Force}
+    if(Get-Process -Id $sp.Id -ErrorAction SilentlyContinue){Stop-Process -Id $sp.Id -Force}
+
+    $dec=LastLine $clog '\[DECODER-STATS\]'
+    $pre=LastLine $clog '\[PRESENT-STATS\]'
+    $pipe=LastLine $clog '\[PIPELINE-STATS\]'
+    $rec=LastLine $clog '\[RECORD-STATS\]'
+    $fps=Extract $dec 'fps="?([0-9]+(?:\.[0-9]+)?)"?'
+    $p95=Extract $pre 'capture_to_present_p95_ms="?([0-9]+(?:\.[0-9]+)?)"?'
+    $pc95=Extract $pipe 'present_call_p95_ms="?([0-9]+(?:\.[0-9]+)?)"?'
+    $qw95=Extract $pipe 'stage_render_queue_wait_p95_ms="?([0-9]+(?:\.[0-9]+)?)"?'
+    $written=Extract $rec 'written_frames=([0-9]+)'
+    $dropped=Extract $rec 'dropped_frames=([0-9]+)'
+    $avgWrite=Extract $rec 'avg_write_us="?([0-9]+(?:\.[0-9]+)?)"?'
+    $mp4=0; if(Test-Path $dir){ $mp4=(Get-ChildItem -Path $dir -File -Filter '*.mp4' | Measure-Object).Count }
+
+    $obj=[pscustomobject]@{ mode=$mode; decode_fps=$fps; present_p95_ms=$p95; present_call_p95_ms=$pc95; queue_wait_p95_ms=$qw95; written_frames=$written; dropped_frames=$dropped; avg_write_us=$avgWrite; mp4_count=$mp4; clog=$clog }
+    $results += $obj
+    Write-Output ($obj | ConvertTo-Json -Compress)
+  }
+
+  Write-Output 'phase=summary'
+  $results | Format-Table -AutoSize | Out-String -Width 260 | Write-Output
+}
+finally {
+  if(Test-Path $controllerBak){ Copy-Item $controllerBak $controllerCfgPath -Force; Remove-Item $controllerBak -Force -ErrorAction SilentlyContinue }
+  if(Test-Path $agentBak){ Copy-Item $agentBak $agentCfgPath -Force; Remove-Item $agentBak -Force -ErrorAction SilentlyContinue }
+  Stop-Mrd
+  Write-Output 'phase=cleanup_done'
+}

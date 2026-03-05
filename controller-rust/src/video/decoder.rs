@@ -1,6 +1,7 @@
 use super::super::webrtc::peer::VideoFrame;
 use anyhow::{Context, Result};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
 pub enum DecodedFrameData {
@@ -24,6 +25,7 @@ pub struct DecodedFrame {
     pub timestamp: u64,
     pub sequence: u64,
     pub capture_start_unix_us: u64,
+    pub decode_ready_unix_us: u64,
 }
 
 impl DecodedFrame {
@@ -42,6 +44,7 @@ impl DecodedFrame {
             timestamp,
             sequence,
             capture_start_unix_us,
+            decode_ready_unix_us: current_unix_us(),
         }
     }
 
@@ -65,6 +68,7 @@ impl DecodedFrame {
             timestamp,
             sequence,
             capture_start_unix_us,
+            decode_ready_unix_us: current_unix_us(),
         }
     }
 
@@ -110,6 +114,13 @@ impl DecodedFrame {
     pub fn uv_plane(&self) -> Option<&[u8]> {
         self.cpu_nv12().map(|data| &data[self.y_size()..])
     }
+}
+
+fn current_unix_us() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,7 +174,7 @@ impl H264Decoder {
         let try_mf_fallback = std::env::var("MRD_TRY_MF_FALLBACK")
             .ok()
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);  // Default to false to prefer FFmpeg d3d11va
+            .unwrap_or(false); // Default to false to prefer FFmpeg d3d11va
         let hw_fail_fast = std::env::var("MRD_HARDWARE_FAIL_FAST")
             .ok()
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -191,7 +202,9 @@ impl H264Decoder {
                             tracing::warn!(error = %e, "ffmpeg d3d11va strict init failed; trying MF d3d11");
                         } else {
                             if hw_fail_fast {
-                                anyhow::bail!("ffmpeg d3d11va strict init failed (fail-fast enabled): {e}");
+                                anyhow::bail!(
+                                    "ffmpeg d3d11va strict init failed (fail-fast enabled): {e}"
+                                );
                             }
                             tracing::warn!(error = %e, "ffmpeg d3d11va strict init failed; MF fallback disabled");
                         }
@@ -199,7 +212,9 @@ impl H264Decoder {
                 }
             } else {
                 if try_mf_fallback {
-                    tracing::warn!("h264_d3d11va decoder unavailable; skipping strict ffmpeg hw path");
+                    tracing::warn!(
+                        "h264_d3d11va decoder unavailable; skipping strict ffmpeg hw path"
+                    );
                 } else {
                     if hw_fail_fast {
                         anyhow::bail!(
@@ -231,9 +246,9 @@ impl H264Decoder {
             let mut sw_cfg = config.clone();
             sw_cfg.backend = DecoderBackend::Software;
             tracing::warn!("all hardware backends failed; falling back to software decoder");
-            return Ok(Self::Ffmpeg(ffmpeg_backend::FfmpegH264Decoder::new_with_options(
-                sw_cfg, false,
-            )?));
+            return Ok(Self::Ffmpeg(
+                ffmpeg_backend::FfmpegH264Decoder::new_with_options(sw_cfg, false)?,
+            ));
         }
 
         #[cfg(all(windows, feature = "mf-decoder", feature = "ffmpeg-software"))]
@@ -258,9 +273,9 @@ impl H264Decoder {
 
         #[cfg(feature = "ffmpeg-software")]
         {
-            Ok(Self::Ffmpeg(ffmpeg_backend::FfmpegH264Decoder::new_with_options(
-                config, false,
-            )?))
+            Ok(Self::Ffmpeg(
+                ffmpeg_backend::FfmpegH264Decoder::new_with_options(config, false)?,
+            ))
         }
 
         #[cfg(not(feature = "ffmpeg-software"))]
@@ -331,29 +346,27 @@ mod mf_backend {
     use super::*;
     use std::collections::VecDeque;
     use std::mem::ManuallyDrop;
-    use windows::core::{Interface, IUnknown};
+    use windows::core::{IUnknown, Interface};
     use windows::Win32::Foundation::{E_NOTIMPL, HMODULE};
-    use windows::Win32::Graphics::Direct3D::{
-        D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0,
-    };
+    use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0};
     use windows::Win32::Graphics::Direct3D11::{
-        D3D11_BIND_SHADER_RESOURCE, D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX,
-        D3D11_TEXTURE2D_DESC, ID3D11Device,
-        ID3D11DeviceContext, ID3D11Texture2D, D3D11CreateDevice, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-        D3D11_SDK_VERSION,
+        D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+        D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+        D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
     };
     use windows::Win32::Graphics::Dxgi::{IDXGIKeyedMutex, IDXGIResource, DXGI_ERROR_WAIT_TIMEOUT};
     use windows::Win32::Media::MediaFoundation::{
         CLSID_MSH264DecoderMFT, IMFAttributes, IMFDXGIBuffer, IMFDXGIDeviceManager, IMFMediaBuffer,
         IMFMediaType, IMFSample, IMFTransform, MFCreateDXGIDeviceManager, MFCreateMediaType,
-        MFCreateMemoryBuffer, MFCreateSample, MF_E_NO_MORE_TYPES, MF_E_NOTACCEPTING,
-        MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_FRAME_RATE,
-        MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO,
-        MF_MT_SUBTYPE, MF_SA_D3D11_AWARE, MF_VERSION, MFMediaType_Video, MFSTARTUP_LITE, MFShutdown,
-        MFStartup, MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
-        MFT_INPUT_STATUS_ACCEPT_DATA, MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
-        MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
-        MFT_OUTPUT_DATA_BUFFER_FORMAT_CHANGE, MFT_OUTPUT_STREAM_INFO, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
+        MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFShutdown, MFStartup,
+        MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFSTARTUP_LITE,
+        MFT_INPUT_STATUS_ACCEPT_DATA, MFT_MESSAGE_COMMAND_FLUSH,
+        MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
+        MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_DATA_BUFFER_FORMAT_CHANGE,
+        MFT_OUTPUT_STREAM_INFO, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MF_E_NOTACCEPTING,
+        MF_E_NO_MORE_TYPES, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE,
+        MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
+        MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_SA_D3D11_AWARE, MF_VERSION,
     };
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
@@ -389,6 +402,8 @@ mod mf_backend {
         output_width: u32,
         output_height: u32,
         frame_index: u64,
+        max_drain_per_call: usize,
+        max_drain_spin_per_call: usize,
         com_inited: bool,
         mf_started: bool,
     }
@@ -399,10 +414,14 @@ mod mf_backend {
     impl Drop for MfH264Decoder {
         fn drop(&mut self) {
             if self.mf_started {
-                unsafe { let _ = MFShutdown(); }
+                unsafe {
+                    let _ = MFShutdown();
+                }
             }
             if self.com_inited {
-                unsafe { CoUninitialize(); }
+                unsafe {
+                    CoUninitialize();
+                }
             }
         }
     }
@@ -426,7 +445,9 @@ mod mf_backend {
             let (device, context) = create_d3d11_device()?;
             let manager = create_dxgi_device_manager(&device)?;
             unsafe {
-                let attrs: IMFAttributes = transform.GetAttributes().context("MFT GetAttributes failed")?;
+                let attrs: IMFAttributes = transform
+                    .GetAttributes()
+                    .context("MFT GetAttributes failed")?;
                 let _ = attrs.SetUINT32(&MF_SA_D3D11_AWARE, 1);
                 transform
                     .ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager.as_raw() as usize)
@@ -456,6 +477,16 @@ mod mf_backend {
                 output_width: 0,
                 output_height: 0,
                 frame_index: 0,
+                max_drain_per_call: std::env::var("MRD_MF_MAX_DRAIN_PER_CALL")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(6)
+                    .clamp(1, 32),
+                max_drain_spin_per_call: std::env::var("MRD_MF_MAX_DRAIN_SPIN_PER_CALL")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(64)
+                    .clamp(8, 512),
                 com_inited,
                 mf_started: true,
             };
@@ -495,7 +526,10 @@ mod mf_backend {
         fn configure_output_type_nv12(&mut self) -> Result<()> {
             let mut idx = 0u32;
             loop {
-                let mt = unsafe { self.transform.GetOutputAvailableType(self.output_stream_id, idx) };
+                let mt = unsafe {
+                    self.transform
+                        .GetOutputAvailableType(self.output_stream_id, idx)
+                };
                 let mt = match mt {
                     Ok(v) => v,
                     Err(e) if e.code() == MF_E_NO_MORE_TYPES => break,
@@ -537,18 +571,23 @@ mod mf_backend {
 
             let sample = unsafe { MFCreateSample().context("MFCreateSample failed")? };
             let buf = unsafe {
-                MFCreateMemoryBuffer(frame.data.len() as u32).context("MFCreateMemoryBuffer(input) failed")?
+                MFCreateMemoryBuffer(frame.data.len() as u32)
+                    .context("MFCreateMemoryBuffer(input) failed")?
             };
             unsafe {
                 let mut p = std::ptr::null_mut::<u8>();
-                buf.Lock(&mut p, None, None).context("input buffer lock failed")?;
+                buf.Lock(&mut p, None, None)
+                    .context("input buffer lock failed")?;
                 std::ptr::copy_nonoverlapping(frame.data.as_ptr(), p, frame.data.len());
                 buf.Unlock().ok();
                 buf.SetCurrentLength(frame.data.len() as u32)
                     .context("SetCurrentLength failed")?;
                 sample.AddBuffer(&buf).context("sample AddBuffer failed")?;
                 sample.SetSampleTime((frame.timestamp as i64) * 10_000).ok();
-                match self.transform.ProcessInput(self.input_stream_id, &sample, 0) {
+                match self
+                    .transform
+                    .ProcessInput(self.input_stream_id, &sample, 0)
+                {
                     Ok(()) => {}
                     Err(e) if e.code() == MF_E_NOTACCEPTING => {}
                     Err(e) => return Err(anyhow::anyhow!("ProcessInput failed: {e}")),
@@ -558,10 +597,25 @@ mod mf_backend {
         }
 
         fn drain_output(&mut self) -> Result<()> {
+            let mut emitted = 0usize;
+            let mut spin = 0usize;
             loop {
+                spin = spin.saturating_add(1);
+                if spin > self.max_drain_spin_per_call {
+                    tracing::warn!(
+                        spin = spin,
+                        max_spin = self.max_drain_spin_per_call,
+                        "mf drain_output reached spin limit; yield to next decode call"
+                    );
+                    break;
+                }
                 let provides_samples =
                     (self.output_info.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32)) != 0;
-                let prealloc = if provides_samples { None } else { Some(self.alloc_output_sample()?) };
+                let prealloc = if provides_samples {
+                    None
+                } else {
+                    Some(self.alloc_output_sample()?)
+                };
                 let mut out = MFT_OUTPUT_DATA_BUFFER {
                     dwStreamID: self.output_stream_id,
                     pSample: ManuallyDrop::new(prealloc.clone()),
@@ -573,13 +627,18 @@ mod mf_backend {
                 let r = unsafe { self.transform.ProcessOutput(0, out_slice, &mut status) };
                 match r {
                     Ok(()) => {
-                        let format_change = (out.dwStatus & (MFT_OUTPUT_DATA_BUFFER_FORMAT_CHANGE.0 as u32)) != 0;
+                        let format_change =
+                            (out.dwStatus & (MFT_OUTPUT_DATA_BUFFER_FORMAT_CHANGE.0 as u32)) != 0;
                         let sample = unsafe { ManuallyDrop::take(&mut out.pSample) }
                             .or(prealloc)
                             .context("ProcessOutput returned no sample")?;
                         let _events = unsafe { ManuallyDrop::take(&mut out.pEvents) };
                         if let Some(frame) = self.extract_decoded_frame(&sample)? {
                             self.queued.push_back(frame);
+                            emitted = emitted.saturating_add(1);
+                            if emitted >= self.max_drain_per_call {
+                                break;
+                            }
                         }
                         if format_change {
                             self.configure_output_type_nv12()?;
@@ -608,8 +667,13 @@ mod mf_backend {
         fn alloc_output_sample(&self) -> Result<IMFSample> {
             let sample = unsafe { MFCreateSample().context("MFCreateSample(output) failed")? };
             let cb = self.output_info.cbSize.max(1_048_576);
-            let buf = unsafe { MFCreateMemoryBuffer(cb).context("MFCreateMemoryBuffer(output) failed")? };
-            unsafe { sample.AddBuffer(&buf).context("output sample AddBuffer failed")?; }
+            let buf =
+                unsafe { MFCreateMemoryBuffer(cb).context("MFCreateMemoryBuffer(output) failed")? };
+            unsafe {
+                sample
+                    .AddBuffer(&buf)
+                    .context("output sample AddBuffer failed")?;
+            }
             Ok(sample)
         }
 
@@ -617,13 +681,21 @@ mod mf_backend {
             let pts = unsafe { sample.GetSampleTime().unwrap_or_default().max(0) as u64 };
             let count = unsafe { sample.GetBufferCount().context("GetBufferCount failed")? };
             for i in 0..count {
-                let buf = unsafe { sample.GetBufferByIndex(i).context("GetBufferByIndex failed")? };
+                let buf = unsafe {
+                    sample
+                        .GetBufferByIndex(i)
+                        .context("GetBufferByIndex failed")?
+                };
                 if let Some(frame) = self.try_extract_dxgi_frame(&buf, pts)? {
                     return Ok(Some(frame));
                 }
             }
             if count > 0 && self.output_width > 0 && self.output_height > 0 {
-                let buf = unsafe { sample.GetBufferByIndex(0).context("GetBufferByIndex(0) failed")? };
+                let buf = unsafe {
+                    sample
+                        .GetBufferByIndex(0)
+                        .context("GetBufferByIndex(0) failed")?
+                };
                 let data = extract_media_buffer_bytes(&buf)?;
                 self.frame_index = self.frame_index.wrapping_add(1);
                 return Ok(Some(DecodedFrame::from_cpu_nv12(
@@ -656,7 +728,9 @@ mod mf_backend {
                 return Ok(None);
             }
             let unk = unsafe { IUnknown::from_raw(raw as *mut _) };
-            let tex: ID3D11Texture2D = unk.cast().context("cast resource to ID3D11Texture2D failed")?;
+            let tex: ID3D11Texture2D = unk
+                .cast()
+                .context("cast resource to ID3D11Texture2D failed")?;
             let subresource = unsafe { dxgi.GetSubresourceIndex().unwrap_or(0) };
             let mut desc = Default::default();
             unsafe { tex.GetDesc(&mut desc) };
@@ -680,6 +754,7 @@ mod mf_backend {
                             timestamp: pts,
                             sequence: self.frame_index,
                             capture_start_unix_us: 0,
+                            decode_ready_unix_us: current_unix_us(),
                         }));
                     }
                     None => {
@@ -715,7 +790,11 @@ mod mf_backend {
             src_desc: &D3D11_TEXTURE2D_DESC,
         ) -> Result<ID3D11Texture2D> {
             if src_desc.Width == 0 || src_desc.Height == 0 {
-                anyhow::bail!("invalid MF output texture size {}x{}", src_desc.Width, src_desc.Height);
+                anyhow::bail!(
+                    "invalid MF output texture size {}x{}",
+                    src_desc.Width,
+                    src_desc.Height
+                );
             }
             if self.render_surfaces.is_empty()
                 || self.render_surface_w != src_desc.Width
@@ -774,7 +853,11 @@ mod mf_backend {
                 .unwrap_or(false)
                 && self.frame_index < 32;
             if src_desc.Width == 0 || src_desc.Height == 0 {
-                anyhow::bail!("invalid MF output texture size {}x{}", src_desc.Width, src_desc.Height);
+                anyhow::bail!(
+                    "invalid MF output texture size {}x{}",
+                    src_desc.Width,
+                    src_desc.Height
+                );
             }
             let slot_count = std::env::var("MRD_SHARED_KEYED_SLOTS")
                 .ok()
@@ -862,7 +945,10 @@ mod mf_backend {
             let slot = &mut self.shared_slots[idx];
             unsafe {
                 if trace_copy {
-                    tracing::info!(slot = idx, "shared-keyed decode before CopySubresourceRegion");
+                    tracing::info!(
+                        slot = idx,
+                        "shared-keyed decode before CopySubresourceRegion"
+                    );
                 }
                 // For NV12 surfaces, copy full subresource to keep Y/UV planes in sync.
                 self.context.CopySubresourceRegion(
@@ -1045,8 +1131,7 @@ mod ffmpeg_backend {
         pub fn new_with_options(config: H264DecoderConfig, strict_hw_output: bool) -> Result<Self> {
             ffmpeg_next::init()?;
 
-            let codec = pick_decoder_codec(&config)
-                .context("H.264 decoder codec not found")?;
+            let codec = pick_decoder_codec(&config).context("H.264 decoder codec not found")?;
             let backend_name = codec.name().to_string();
             let wants_hw = wants_d3d11va(&config);
             let has_d3d11va_decoder = decoder::find_by_name("h264_d3d11va").is_some();
@@ -1111,9 +1196,7 @@ mod ffmpeg_backend {
                 let mut ctx = build_decoder_context(&config);
                 match ctx.decoder().open_as_with(codec, opts) {
                     Ok(opened) => {
-                        tracing::info!(
-                            "opened ffmpeg h264 decoder with d3d11va options"
-                        );
+                        tracing::info!("opened ffmpeg h264 decoder with d3d11va options");
                         opened
                     }
                     Err(e) => {
@@ -1127,7 +1210,8 @@ mod ffmpeg_backend {
                             "open_as_with d3d11va failed, fallback to plain h264 decoder"
                         );
                         let mut fallback_ctx = build_decoder_context(&config);
-                        fallback_ctx.decoder()
+                        fallback_ctx
+                            .decoder()
                             .open_as(codec)
                             .context("open fallback h264 decoder failed")?
                     }
@@ -1138,9 +1222,7 @@ mod ffmpeg_backend {
                     .open_as(codec)
                     .context("open decoder failed")?
             };
-            let decoder = opened
-                .video()
-                .context("video decoder init failed")?;
+            let decoder = opened.video().context("video decoder init failed")?;
 
             Ok(Self {
                 decoder,
@@ -1345,8 +1427,8 @@ mod ffmpeg_backend {
             &mut self,
             texture: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
         ) -> Result<()> {
-            use windows::Win32::Graphics::Dxgi::{DXGI_ADAPTER_DESC, IDXGIDevice};
             use windows::core::Interface;
+            use windows::Win32::Graphics::Dxgi::{IDXGIDevice, DXGI_ADAPTER_DESC};
 
             unsafe {
                 let dev = texture
@@ -1360,7 +1442,8 @@ mod ffmpeg_backend {
                 let adapter = dxgi_device
                     .GetAdapter()
                     .context("GetAdapter for decoded texture device failed")?;
-                let desc: DXGI_ADAPTER_DESC = adapter.GetDesc().context("GetDesc for adapter failed")?;
+                let desc: DXGI_ADAPTER_DESC =
+                    adapter.GetDesc().context("GetDesc for adapter failed")?;
                 let luid = (desc.AdapterLuid.LowPart, desc.AdapterLuid.HighPart);
 
                 if self.first_d3d11_device_ptr.is_none() {
@@ -1463,7 +1546,6 @@ mod ffmpeg_backend {
                 "h264"
             }
         }
-
     }
 }
 

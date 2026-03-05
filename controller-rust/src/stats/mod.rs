@@ -1,5 +1,4 @@
 /// 性能统计模块
-
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -80,7 +79,8 @@ impl StatsCollector {
         self.fps_window.push(now);
 
         // 清理超过 2 秒的记录
-        self.fps_window.retain(|t| now.duration_since(*t) < Duration::from_secs(2));
+        self.fps_window
+            .retain(|t| now.duration_since(*t) < Duration::from_secs(2));
     }
 
     /// 记录丢包
@@ -104,7 +104,11 @@ impl StatsCollector {
 
         // 计算 FPS
         let fps = if self.fps_window.len() > 1 {
-            let duration = self.fps_window.last().unwrap().duration_since(*self.fps_window.first().unwrap());
+            let duration = self
+                .fps_window
+                .last()
+                .unwrap()
+                .duration_since(*self.fps_window.first().unwrap());
             let count = self.fps_window.len() - 1;
             if duration.as_secs_f32() > 0.0 {
                 (count as f64 / duration.as_secs_f64()).min(240.0)

@@ -29,6 +29,7 @@ Thumbs.db
 *.png
 *.err
 *.o
+*.mp4
 debug/
 
 # Test outputs

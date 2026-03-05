@@ -11,9 +11,9 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 use webrtc::{
-    api::APIBuilder,
     api::media_engine::MediaEngine,
     api::setting_engine::SettingEngine,
+    api::APIBuilder,
     data_channel::data_channel_init::RTCDataChannelInit,
     data_channel::RTCDataChannel,
     ice_transport::ice_candidate::RTCIceCandidateInit,
@@ -431,11 +431,7 @@ impl PeerConnectionManager {
 fn contains_idr_annexb(buf: &[u8]) -> bool {
     let mut i = 0usize;
     while i + 4 < buf.len() {
-        let sc_len = if i + 3 < buf.len()
-            && buf[i] == 0
-            && buf[i + 1] == 0
-            && buf[i + 2] == 1
-        {
+        let sc_len = if i + 3 < buf.len() && buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1 {
             3
         } else if i + 4 < buf.len()
             && buf[i] == 0

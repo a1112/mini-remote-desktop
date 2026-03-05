@@ -67,12 +67,7 @@ fn encode_wire_header(len: u32, seq: u64, tx_us: u64) -> [u8; 20] {
     hdr
 }
 
-fn encode_wire_packet(
-    scratch: &mut Vec<u8>,
-    payload: &[u8],
-    seq: u64,
-    tx_us: u64,
-) {
+fn encode_wire_packet(scratch: &mut Vec<u8>, payload: &[u8], seq: u64, tx_us: u64) {
     scratch.clear();
     scratch.reserve(20 + payload.len());
     append_wire_packet(scratch, payload, seq, tx_us);
@@ -195,7 +190,8 @@ async fn handle_incoming_session(
         }
         // Reuse the existing wire format for compatibility:
         // u32 len + u64 seq + u64 tx_unix_us + payload.
-        seq = encode_wire_batch_packets(&mut scratch, frame_batch.as_slice(), seq.saturating_add(1));
+        seq =
+            encode_wire_batch_packets(&mut scratch, frame_batch.as_slice(), seq.saturating_add(1));
         if stream.write_all(scratch.as_slice()).await.is_err() {
             warn!(
                 len = scratch.len() as u64,

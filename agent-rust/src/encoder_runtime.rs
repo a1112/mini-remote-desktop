@@ -223,8 +223,8 @@ fn start_ffmpeg_pipe(
 ) -> Result<FfmpegPipeEncoder> {
     let selected_codec = EffectiveVideoCodec::from_env();
     let transport_hint = EffectiveTransportHint::parse(transport_hint_raw);
-    let codec =
-        ffmpeg_codec_name(backend, selected_codec).ok_or_else(|| anyhow!("not a ffmpeg hw backend"))?;
+    let codec = ffmpeg_codec_name(backend, selected_codec)
+        .ok_or_else(|| anyhow!("not a ffmpeg hw backend"))?;
     let size = format!("{width}x{height}");
     let fps_s = fps.to_string();
 

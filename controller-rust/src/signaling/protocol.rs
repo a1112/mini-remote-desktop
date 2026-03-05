@@ -174,6 +174,19 @@ pub struct QuicTransportInfo {
     pub cert_der_base64: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioQuicTransportInfo {
+    pub addr: String,
+    #[serde(rename = "serverName")]
+    pub server_name: String,
+    #[serde(rename = "certDerBase64")]
+    pub cert_der_base64: String,
+    pub codec: String,
+    #[serde(rename = "sampleRate")]
+    pub sample_rate: u32,
+    pub channels: u16,
+}
+
 impl From<RTCIceCandidateInit> for IceCandidateJson {
     fn from(cand: RTCIceCandidateInit) -> Self {
         Self {
@@ -208,10 +221,19 @@ pub struct DeviceInfo {
 /// 信令消息载荷枚举（用于事件处理）
 #[derive(Debug, Clone)]
 pub enum SignalingMessagePayload {
-    Connected { device_id: String },
-    Registered { device_id: String, device_list: Vec<DeviceInfo> },
-    DeviceList { device_list: Vec<DeviceInfo> },
-    DeviceOffline { device_id: String },
+    Connected {
+        device_id: String,
+    },
+    Registered {
+        device_id: String,
+        device_list: Vec<DeviceInfo>,
+    },
+    DeviceList {
+        device_list: Vec<DeviceInfo>,
+    },
+    DeviceOffline {
+        device_id: String,
+    },
     Offer {
         target_device_id: String,
         controller_id: String,
@@ -223,6 +245,7 @@ pub enum SignalingMessagePayload {
         controller_id: String,
         selected_transport: String,
         quic: Option<QuicTransportInfo>,
+        audio_quic: Option<AudioQuicTransportInfo>,
     },
     IceCandidate {
         target_device_id: Option<String>,

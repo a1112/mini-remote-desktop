@@ -1,4 +1,6 @@
+mod audio_capture;
 mod audio_control;
+mod audio_quic_tx;
 mod capture_policy;
 mod capture_runtime;
 mod clipboard;
@@ -20,6 +22,8 @@ mod webdav_client;
 mod webdav_mount;
 mod webtransport_tx;
 
+use crate::audio_capture::spawn_loopback_capture;
+use crate::audio_quic_tx::{AudioQuicPacket, AudioQuicServerAdvert, start_audio_quic_sender};
 use crate::capture_policy::{CaptureBackend, choose_backend};
 #[cfg(windows)]
 use crate::capture_runtime::WgcWindowCapturer;
@@ -86,6 +90,7 @@ struct SessionEntry {
     pc: Arc<RTCPeerConnection>,
     running: Arc<AtomicBool>,
     _injector: Arc<InputInjector>,
+    _audio_stream: Option<cpal::Stream>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1257,8 +1262,10 @@ async fn main() -> Result<()> {
             );
 
             let mut quic_advert: Option<QuicServerAdvert> = None;
+            let mut audio_quic_advert: Option<AudioQuicServerAdvert> = None;
             let mut webtransport_advert: Option<WebTransportAdvert> = None;
             let mut quic_tx: Option<tokio::sync::mpsc::Sender<QuicAu>> = None;
+            let mut audio_quic_tx: Option<tokio::sync::mpsc::Sender<AudioQuicPacket>> = None;
             if matches!(
                 selected_transport,
                 SessionTransport::Quic | SessionTransport::WebTransport
@@ -1271,6 +1278,15 @@ async fn main() -> Result<()> {
                         let (advert, tx) = start_quic_sender(bind_addr)?;
                         quic_advert = Some(advert);
                         quic_tx = Some(tx);
+                        let audio_enabled = std::env::var("MRD_AUDIO_ENABLE")
+                            .ok()
+                            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                            .unwrap_or(true);
+                        if audio_enabled {
+                            let (audio_advert, audio_tx) = start_audio_quic_sender(bind_addr)?;
+                            audio_quic_advert = Some(audio_advert);
+                            audio_quic_tx = Some(audio_tx);
+                        }
                     }
                     SessionTransport::WebTransport => {
                         let (advert, tx) = start_webtransport_sender(bind_addr)?;
@@ -1282,6 +1298,7 @@ async fn main() -> Result<()> {
             }
 
             let injector = Arc::new(InputInjector::new());
+            let audio_ctrl = injector.audio_control_manager();
             let media_ready = Arc::new(AtomicBool::new(false));
             let control_dc = Arc::new(Mutex::new(None));
             let pc = create_peer_connection(
@@ -1317,6 +1334,18 @@ async fn main() -> Result<()> {
                 .await
                 .context("set local answer failed")?;
 
+            let audio_stream = if let Some(tx) = audio_quic_tx {
+                match spawn_loopback_capture(tx, audio_ctrl) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        warn!(error = %e, "audio loopback capture disabled");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
             let msg = json!({
                 "type": "webrtc",
                 "action": "answer",
@@ -1329,6 +1358,14 @@ async fn main() -> Result<()> {
                         "addr": q.addr,
                         "serverName": q.server_name,
                         "certDerBase64": q.cert_der_base64,
+                    })),
+                    "audioQuic": audio_quic_advert.as_ref().map(|q| json!({
+                        "addr": q.addr,
+                        "serverName": q.server_name,
+                        "certDerBase64": q.cert_der_base64,
+                        "codec": q.codec,
+                        "sampleRate": q.sample_rate,
+                        "channels": q.channels,
                     })),
                     "webtransport": webtransport_advert.as_ref().map(maybe_build_webtransport_endpoint),
                     "agentCapabilities": {
@@ -1349,6 +1386,7 @@ async fn main() -> Result<()> {
                     pc,
                     running: session_running,
                     _injector: injector,
+                    _audio_stream: audio_stream,
                 },
             );
             continue;
@@ -2043,6 +2081,130 @@ fn env_flag_enabled(key: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+fn env_u32(key: &str) -> Option<u32> {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+}
+
+fn env_str_lower(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty())
+}
+
+fn apply_capture_quality_env_overrides(cfg: &mut agent_rust::CaptureConfig) {
+    if let Some(v) = env_u32("AGENT_CAPTURE_FPS") {
+        cfg.fps = v.clamp(1, 240);
+    }
+    if let Some(v) = env_u32("AGENT_CAPTURE_MIN_FPS") {
+        cfg.min_fps = v.clamp(1, 240);
+    }
+    if let Some(v) = env_u32("AGENT_CAPTURE_MAX_FPS") {
+        cfg.max_fps = v.clamp(1, 240);
+    }
+    if let Some(v) = env_u32("AGENT_CAPTURE_JPEG_QUALITY") {
+        cfg.jpeg_quality = v.clamp(1, 100) as u8;
+    }
+    if let Some(v) = env_u32("AGENT_CAPTURE_GOP") {
+        cfg.gop = v.clamp(1, 600);
+    }
+    if let Some(v) = env_u32("AGENT_CAPTURE_BFRAMES") {
+        cfg.bframes = v.min(4);
+    }
+    if let Some(v) = env_u32("AGENT_CAPTURE_BITRATE_KBPS") {
+        cfg.bitrate_kbps = v.clamp(100, 300_000);
+    }
+    if let Some(v) = env_u32("AGENT_CAPTURE_MAX_BITRATE_KBPS") {
+        cfg.max_bitrate_kbps = v.clamp(100, 300_000);
+    }
+    if let Some(v) = env_u32("AGENT_CAPTURE_NETWORK_FLOOR_KBPS") {
+        cfg.network_adapt_floor_bitrate_kbps = v.clamp(100, 300_000);
+    }
+    if let Some(v) = env_u32("AGENT_CAPTURE_NETWORK_CEILING_KBPS") {
+        cfg.network_adapt_ceiling_bitrate_kbps = v.clamp(100, 300_000);
+    }
+    if let Some(v) = env_str_lower("AGENT_CAPTURE_ENCODER_PRESET")
+        && matches!(v.as_str(), "p1" | "p2" | "p3" | "p4" | "p5" | "p6" | "p7")
+    {
+        cfg.encoder_preset = v;
+    }
+    if let Some(v) = env_str_lower("AGENT_CAPTURE_ENCODER_TUNE")
+        && matches!(v.as_str(), "ll" | "ull" | "hq" | "balanced")
+    {
+        cfg.encoder_tune = v;
+    }
+    if let Some(v) = env_str_lower("AGENT_CAPTURE_ADAPT_MODE")
+        && matches!(v.as_str(), "smooth" | "balanced" | "quality")
+    {
+        cfg.adapt_mode = v;
+    }
+    if let Some(v) = env_str_lower("AGENT_CAPTURE_PERF_PROFILE")
+        && matches!(
+            v.as_str(),
+            "smooth" | "balanced" | "quality" | "latency_first" | "quality_first"
+        )
+    {
+        cfg.performance_profile = v;
+    }
+    if let Some(v) = env_str_lower("AGENT_CAPTURE_PROFILE_TEMPLATE")
+        && matches!(
+            v.as_str(),
+            "latency_first" | "balanced" | "quality_first" | "custom"
+        )
+    {
+        cfg.profile_template = v;
+    }
+    if let Some(v) = env_str_lower("AGENT_CAPTURE_FPS_MODE")
+        && matches!(
+            v.as_str(),
+            "latency"
+                | "balanced"
+                | "throughput"
+                | "latency_first"
+                | "balanced_first"
+                | "throughput_first"
+                | "max"
+        )
+    {
+        cfg.fps_mode = v;
+    }
+    if let Some(v) = std::env::var("AGENT_CAPTURE_TIER_LIMIT_ENABLE")
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+    {
+        cfg.tier_limit_enable = !(v == "0" || v == "false" || v == "off" || v == "no");
+    }
+
+    cfg.min_fps = cfg.min_fps.clamp(1, cfg.max_fps.max(1));
+    cfg.fps = cfg.fps.clamp(cfg.min_fps, cfg.max_fps.max(cfg.min_fps));
+    cfg.max_bitrate_kbps = cfg.max_bitrate_kbps.max(cfg.bitrate_kbps.max(100));
+    cfg.network_adapt_floor_bitrate_kbps = cfg
+        .network_adapt_floor_bitrate_kbps
+        .clamp(100, cfg.network_adapt_ceiling_bitrate_kbps.max(100));
+    cfg.network_adapt_ceiling_bitrate_kbps = cfg
+        .network_adapt_ceiling_bitrate_kbps
+        .max(cfg.network_adapt_floor_bitrate_kbps);
+    info!(
+        fps = cfg.fps,
+        min_fps = cfg.min_fps,
+        max_fps = cfg.max_fps,
+        encoder_preset = cfg.encoder_preset.as_str(),
+        encoder_tune = cfg.encoder_tune.as_str(),
+        bitrate_kbps = cfg.bitrate_kbps,
+        max_bitrate_kbps = cfg.max_bitrate_kbps,
+        network_floor_kbps = cfg.network_adapt_floor_bitrate_kbps,
+        network_ceiling_kbps = cfg.network_adapt_ceiling_bitrate_kbps,
+        adapt_mode = cfg.adapt_mode.as_str(),
+        performance_profile = cfg.performance_profile.as_str(),
+        profile_template = cfg.profile_template.as_str(),
+        fps_mode = cfg.fps_mode.as_str(),
+        tier_limit_enable = cfg.tier_limit_enable,
+        "applied capture quality env overrides"
+    );
+}
+
 fn parse_fps_cap_tier(v: &str) -> Option<u32> {
     let s = v.trim().to_ascii_lowercase();
     match s.as_str() {
@@ -2533,6 +2695,9 @@ async fn attach_video_track_with_policy(
         apply_stream_fair_share(&mut effective_cfg, v);
     }
     apply_dynamic_vbv_and_roi_policy(&mut effective_cfg);
+    apply_capture_quality_env_overrides(&mut effective_cfg);
+    apply_fps_mode_policy(&mut effective_cfg);
+    apply_codec_transport_limits(selected_transport, &mut effective_cfg);
     if effective_cfg.tier_limit_enable {
         info!(
             tier_ladder_fps = %format!(
@@ -4425,13 +4590,17 @@ async fn spawn_send_loop_quic(
             stats.record_transport_encode_output_interval_us(interval_us);
         }
         last_encoded_recv_at = Some(recv_wait_start);
-        let enqueue_wait_us = recv_wait_start.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        let (capture_start_us, payload) = unpack_capture_ts_au(encoded.as_ref());
+        let queue_wait_us = if capture_start_us > 0 {
+            unix_time_us().saturating_sub(capture_start_us)
+        } else {
+            recv_wait_start.elapsed().as_micros().min(u64::MAX as u128) as u64
+        };
         stats.encoded_au_total.fetch_add(1, Ordering::Relaxed);
         stats
             .transport_enqueue_wait_us_total
-            .fetch_add(enqueue_wait_us, Ordering::Relaxed);
-        stats.record_transport_queue_wait_us(enqueue_wait_us);
-        let (capture_start_us, payload) = unpack_capture_ts_au(encoded.as_ref());
+            .fetch_add(queue_wait_us, Ordering::Relaxed);
+        stats.record_transport_queue_wait_us(queue_wait_us);
         if capture_start_us > 0 {
             if let Some(prev) = last_capture_start_us {
                 if capture_start_us >= prev {
@@ -4504,7 +4673,7 @@ async fn spawn_send_loop_quic(
             }
         }
         let capture_to_send_start_us = if capture_start_us > 0 {
-            unix_time_us().saturating_sub(capture_start_us)
+            queue_wait_us
         } else {
             0
         };

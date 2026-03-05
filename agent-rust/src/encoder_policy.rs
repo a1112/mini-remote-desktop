@@ -109,11 +109,16 @@ fn backend_supports_codec(
     match probe_ffmpeg_encoder(name) {
         Some(true) => true,
         Some(false) => {
-            logs.push(format!("ffmpeg encoder {name} not available for codec {:?}", codec));
+            logs.push(format!(
+                "ffmpeg encoder {name} not available for codec {:?}",
+                codec
+            ));
             false
         }
         None => {
-            logs.push(format!("ffmpeg probe unavailable, keep optimistic path for {name}"));
+            logs.push(format!(
+                "ffmpeg probe unavailable, keep optimistic path for {name}"
+            ));
             true
         }
     }

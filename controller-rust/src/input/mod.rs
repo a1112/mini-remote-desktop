@@ -1,7 +1,6 @@
 /// 输入事件转发模块
 ///
 /// 将本地键盘和鼠标事件转发到远程代理
-
 use common_control_proto::ControlEvent;
 use tokio::sync::mpsc;
 
@@ -9,24 +8,13 @@ use tokio::sync::mpsc;
 #[derive(Debug, Clone)]
 pub enum InputEvent {
     /// 键盘事件
-    Keyboard {
-        key: u32,
-        pressed: bool,
-    },
+    Keyboard { key: u32, pressed: bool },
     /// 鼠标移动
-    MouseMove {
-        x: i32,
-        y: i32,
-    },
+    MouseMove { x: i32, y: i32 },
     /// 鼠标按钮
-    MouseButton {
-        button: u32,
-        pressed: bool,
-    },
+    MouseButton { button: u32, pressed: bool },
     /// 鼠标滚轮
-    MouseWheel {
-        delta: i32,
-    },
+    MouseWheel { delta: i32 },
 }
 
 impl From<InputEvent> for ControlEvent {

@@ -2,6 +2,7 @@
 import asyncio
 import base64
 from collections import Counter
+import gc
 import json
 import os
 import re
@@ -580,6 +581,16 @@ class CoreTransportSuite:
                 raise RuntimeError("agent-rust exited during startup")
         return signaling, agent, agent_out, agent_err
 
+    def _tune_probe_runtime(self) -> None:
+        analysis = self.analysis or {}
+        if not bool(analysis.get("probe_runtime_tuning", True)):
+            return
+        try:
+            if os.name == "nt":
+                psutil.Process(os.getpid()).nice(psutil.HIGH_PRIORITY_CLASS)
+        except Exception:
+            pass
+
     def _wait_tcp_open(self, host: str, port: int, timeout_sec: float) -> bool:
         deadline = time.time() + timeout_sec
         while time.time() < deadline:
@@ -988,6 +999,7 @@ class CoreTransportSuite:
         agent_err = None
         perf_monitor: Optional[ServerPerfMonitor] = None
         try:
+            self._tune_probe_runtime()
             signaling_proc, agent_proc, agent_out, agent_err = self._start_stack(transport)
             perf_monitor = ServerPerfMonitor(agent_proc.pid)
             await perf_monitor.start()
@@ -1023,30 +1035,40 @@ class CoreTransportSuite:
                 )
 
             frame_records: List[Tuple[float, int, int, int]] = []
-            if transport == "webrtc":
-                await asyncio.sleep(self.duration_sec)
-                frame_times = list(webrtc_frame_times)
-                tx_us: List[int] = []
-                au_sizes: List[int] = []
-            elif transport == "quic":
-                quic = answer_payload.get("quic") or {}
-                addr = quic.get("addr") or ""
-                frame_records = await self._receive_quic_frames(addr, self.duration_sec)
-                frame_times = [t[0] for t in frame_records]
-                tx_us = [t[2] for t in frame_records]
-                au_sizes = [int(t[3]) for t in frame_records]
-            elif transport == "webtransport":
-                wt = answer_payload.get("webtransport") or {}
-                url = wt.get("url") or ""
-                alpn = wt.get("alpn") or "h3"
-                frame_records = await self._receive_webtransport_frames(url, alpn, self.duration_sec)
-                frame_times = [t[0] for t in frame_records]
-                tx_us = [t[2] for t in frame_records]
-                au_sizes = [int(t[3]) for t in frame_records]
-            else:
-                frame_times = []
-                tx_us = []
-                au_sizes = []
+            gc_was_enabled = gc.isenabled()
+            if gc_was_enabled and bool((self.analysis or {}).get("probe_disable_gc", True)):
+                gc.disable()
+            try:
+                if transport == "webrtc":
+                    await asyncio.sleep(self.duration_sec)
+                    frame_times = list(webrtc_frame_times)
+                    tx_us: List[int] = []
+                    au_sizes: List[int] = []
+                elif transport == "quic":
+                    quic = answer_payload.get("quic") or {}
+                    addr = quic.get("addr") or ""
+                    frame_records = await self._receive_quic_frames(addr, self.duration_sec)
+                    frame_times = [t[0] for t in frame_records]
+                    tx_us = [t[2] for t in frame_records]
+                    au_sizes = [int(t[3]) for t in frame_records]
+                elif transport == "webtransport":
+                    wt = answer_payload.get("webtransport") or {}
+                    url = wt.get("url") or ""
+                    alpn = wt.get("alpn") or "h3"
+                    frame_records = await self._receive_webtransport_frames(url, alpn, self.duration_sec)
+                    frame_times = [t[0] for t in frame_records]
+                    tx_us = [t[2] for t in frame_records]
+                    au_sizes = [int(t[3]) for t in frame_records]
+                else:
+                    frame_times = []
+                    tx_us = []
+                    au_sizes = []
+            finally:
+                if gc_was_enabled:
+                    try:
+                        gc.enable()
+                    except Exception:
+                        pass
 
             await pc.close()
             await signaling.close()
@@ -1280,6 +1302,7 @@ if __name__ == "__main__":
         tmp_cfg.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
         args.config = str(tmp_cfg)
     asyncio.run(main_async(args))
+
 
 
 

@@ -1,6 +1,6 @@
 use super::protocol::{
-    create_register_message, DeviceInfo, SignalingMessage, SignalingMessagePayload,
-    SessionDescriptionJson, QuicTransportInfo,
+    create_register_message, AudioQuicTransportInfo, DeviceInfo, QuicTransportInfo,
+    SessionDescriptionJson, SignalingMessage, SignalingMessagePayload,
 };
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -115,9 +115,7 @@ impl SignalingClient {
                             }
                         };
 
-                        if let Err(e) =
-                            handle_message(&text, &device_id, &event_tx).await
-                        {
+                        if let Err(e) = handle_message(&text, &device_id, &event_tx).await {
                             warn!(error = %e, "failed to handle message");
                         }
                     }
@@ -239,7 +237,9 @@ impl SignalingClient {
         let write = write.as_ref().context("not connected")?;
         let mut write = write.lock().await;
         write
-            .send(tokio_tungstenite::tungstenite::Message::Text(text.to_string()))
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                text.to_string(),
+            ))
             .await
             .context("failed to send message")?;
         Ok(())
@@ -275,10 +275,7 @@ async fn handle_message(
             }
         }
         ("device", "registered") => {
-            let dev_id = v["payload"]["deviceId"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
+            let dev_id = v["payload"]["deviceId"].as_str().unwrap_or("").to_string();
             let device_list = parse_device_list(&v["payload"]["deviceList"]);
             tracing::debug!(device_id = %dev_id, count = device_list.len(), "sending Registered event to main loop");
             if event_tx
@@ -300,10 +297,7 @@ async fn handle_message(
                 .ok();
         }
         ("device", "offline") => {
-            let dev_id = v["payload"]["deviceId"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
+            let dev_id = v["payload"]["deviceId"].as_str().unwrap_or("").to_string();
             event_tx
                 .send(SignalingMessagePayload::DeviceOffline { device_id: dev_id })
                 .await
@@ -319,7 +313,11 @@ async fn handle_message(
                 .as_str()
                 .unwrap_or("webrtc")
                 .to_string();
-            let quic = serde_json::from_value::<QuicTransportInfo>(v["payload"]["quic"].clone()).ok();
+            let quic =
+                serde_json::from_value::<QuicTransportInfo>(v["payload"]["quic"].clone()).ok();
+            let audio_quic =
+                serde_json::from_value::<AudioQuicTransportInfo>(v["payload"]["audioQuic"].clone())
+                    .ok();
 
             if let Ok(sd_json) = serde_json::from_value::<SessionDescriptionJson>(answer_json) {
                 if let Ok(answer) = sd_json.try_into() {
@@ -329,6 +327,7 @@ async fn handle_message(
                             controller_id,
                             selected_transport,
                             quic,
+                            audio_quic,
                         })
                         .await
                         .ok();
@@ -340,11 +339,11 @@ async fn handle_message(
             let target_device_id = v["payload"]["targetDeviceId"]
                 .as_str()
                 .map(|s| s.to_string());
-            let controller_id = v["payload"]["controllerId"]
-                .as_str()
-                .map(|s| s.to_string());
+            let controller_id = v["payload"]["controllerId"].as_str().map(|s| s.to_string());
 
-            if let Ok(cand_json) = serde_json::from_value::<super::protocol::IceCandidateJson>(cand_json) {
+            if let Ok(cand_json) =
+                serde_json::from_value::<super::protocol::IceCandidateJson>(cand_json)
+            {
                 if let Ok(candidate) = cand_json.try_into() {
                     event_tx
                         .send(SignalingMessagePayload::IceCandidate {

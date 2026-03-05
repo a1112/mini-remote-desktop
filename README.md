@@ -4,11 +4,12 @@
 
 ## 特点
 
-- ✅ **极简架构** - 仅 3 个组件，无数据库依赖
-- ✅ **高性能** - 原生 WebRTC，零库开销
+- ✅ **极简架构** - 核心组件，可选数据库
+- ✅ **高性能** - 原生 Rust 实现，硬件加速
 - ✅ **P2P 连接** - 数据不经过服务器
+- ✅ **多协议支持** - WebRTC、QUIC、WebTransport
 - ✅ **完全私有** - 所有代码可控
-- ✅ **跨平台** - Web 控制端 + Electron 被控端
+- ✅ **跨平台** - Web、桌面、Qt 控制端
 
 ## 架构
 
@@ -225,3 +226,84 @@ cargo run
 1. 停止现有 Node 信令服务（占用 9527 的进程）。
 2. 启动 `signaling-rs`。
 3. 保持 `web` 与 `agent/agent-rust` 的 `ws://localhost:9527` 不变即可连接。
+
+## heartbeat-rs（UDP 心跳服务）
+
+目录：`heartbeat-rs/`
+
+参考 RustDesk hbbs 设计，使用 UDP 实现轻量级心跳保活机制。
+
+启动：
+
+```bash
+cd heartbeat-rs
+cargo run
+```
+
+默认监听：`UDP 0.0.0.0:21114`
+
+**特性**：
+- UDP 心跳，低开销（30秒间隔）
+- 维护设备在线状态和 IP 信息
+- 60秒超时自动断开
+- 支持 UDP 发现（端口 21115）
+
+**协议**：
+
+```json
+// 心跳消息
+{
+  "device_id": "F047A24581BD",
+  "device_type": "agent",
+  "device_name": "办公室电脑",
+  "protocol_version": 2,
+  "timestamp_ms": 1737269293000,
+  "transports": ["webrtc", "quic"]
+}
+```
+
+## Rdesk-Server（后端 API）
+
+目录：`Rdesk-Server/`
+
+FastAPI 后端，提供用户管理、设备注册等功能。
+
+启动：
+
+```bash
+cd Rdesk-Server
+python -m uvicorn app.main:app --host 0.0.0.0 --port 9530 --reload
+```
+
+**核心 API**：
+- `POST /api/v1/devices/register` - 设备注册（匿名）
+- `GET /api/v1/devices/check/{serial}` - 检查设备状态
+- `POST /api/v1/auth/login` - 用户登录
+- `GET /api/v1/users/me` - 用户信息
+
+**设备 ID 生成**：
+根据主板序列号生成 SHA256 哈希，取前12位作为设备 ID。
+
+## 完整启动顺序
+
+```bash
+# 1. PostgreSQL（可选，用于用户管理）
+# 2. Rdesk-Server（端口 9530）
+cd Rdesk-Server && python -m uvicorn app.main:app --port 9530 --reload
+
+# 3. signaling-rs（端口 9527 WebSocket, 9528 UDP 发现）
+cd signaling-rs && cargo run
+
+# 4. heartbeat-rs（端口 21114 UDP 心跳, 21115 UDP 发现）
+cd heartbeat-rs && cargo run
+
+# 5. agent-rust（被控端）
+cd agent-rust && cargo run
+
+# 6. Rdesk（Tauri 桌面控制端）
+cd Rdesk && npm run tauri dev
+```
+
+## 更多文档
+
+详细架构说明请参阅 [ARCHITECTURE.md](ARCHITECTURE.md)

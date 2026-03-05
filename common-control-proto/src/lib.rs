@@ -24,6 +24,7 @@ pub enum EventType {
     FileChunk = 10,
     AudioControl = 11,
     FileMount = 12,
+    AudioRouteControl = 13,
 }
 
 impl TryFrom<u8> for EventType {
@@ -43,6 +44,7 @@ impl TryFrom<u8> for EventType {
             10 => Ok(Self::FileChunk),
             11 => Ok(Self::AudioControl),
             12 => Ok(Self::FileMount),
+            13 => Ok(Self::AudioRouteControl),
             _ => Err(ProtoError::UnknownEventType(value)),
         }
     }
@@ -50,13 +52,35 @@ impl TryFrom<u8> for EventType {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ControlEvent {
-    MouseMove { x: i32, y: i32 },
-    MouseButton { button: u8, pressed: bool },
-    MouseWheel { delta: i32 },
-    Key { key: u32, pressed: bool },
-    GamepadAxis { gamepad: u8, axis: u8, value: i16 },
-    GamepadButton { gamepad: u8, button: u8, pressed: bool },
-    ClipboardSet { mime: u8, bytes: Vec<u8> },
+    MouseMove {
+        x: i32,
+        y: i32,
+    },
+    MouseButton {
+        button: u8,
+        pressed: bool,
+    },
+    MouseWheel {
+        delta: i32,
+    },
+    Key {
+        key: u32,
+        pressed: bool,
+    },
+    GamepadAxis {
+        gamepad: u8,
+        axis: u8,
+        value: i16,
+    },
+    GamepadButton {
+        gamepad: u8,
+        button: u8,
+        pressed: bool,
+    },
+    ClipboardSet {
+        mime: u8,
+        bytes: Vec<u8>,
+    },
     ClipboardGet {},
     FileControl {
         op: u8,
@@ -77,6 +101,12 @@ pub enum ControlEvent {
         sample_rate: u32,
         channels: u8,
         frame_ms: u16,
+    },
+    AudioRouteControl {
+        mode: u8,
+        scope: u8,
+        target_pid: u32,
+        follow_children: bool,
     },
     FileMount {
         op: u8,
@@ -101,6 +131,7 @@ impl ControlEvent {
             Self::FileChunk { .. } => EventType::FileChunk,
             Self::AudioControl { .. } => EventType::AudioControl,
             Self::FileMount { .. } => EventType::FileMount,
+            Self::AudioRouteControl { .. } => EventType::AudioRouteControl,
         }
     }
 
@@ -117,9 +148,8 @@ impl ControlEvent {
             | Self::FileControl { .. }
             | Self::FileChunk { .. }
             | Self::AudioControl { .. }
-            | Self::FileMount { .. } => {
-                ChannelClass::Reliable
-            }
+            | Self::FileMount { .. }
+            | Self::AudioRouteControl { .. } => ChannelClass::Reliable,
         }
     }
 }
@@ -297,6 +327,19 @@ fn encode_event_payload(event: &ControlEvent) -> Vec<u8> {
             v.extend_from_slice(path_bytes);
             v
         }
+        ControlEvent::AudioRouteControl {
+            mode,
+            scope,
+            target_pid,
+            follow_children,
+        } => {
+            let mut v = Vec::with_capacity(1 + 1 + 4 + 1);
+            v.push(*mode);
+            v.push(*scope);
+            v.extend_from_slice(&target_pid.to_be_bytes());
+            v.push(u8::from(*follow_children));
+            v
+        }
     }
 }
 
@@ -379,12 +422,24 @@ fn decode_event_payload(typ: EventType, payload: &[u8]) -> Result<ControlEvent, 
                     payload[7], payload[8],
                 ]),
                 arg0: u64::from_be_bytes([
-                    payload[9], payload[10], payload[11], payload[12], payload[13], payload[14],
-                    payload[15], payload[16],
+                    payload[9],
+                    payload[10],
+                    payload[11],
+                    payload[12],
+                    payload[13],
+                    payload[14],
+                    payload[15],
+                    payload[16],
                 ]),
                 arg1: u64::from_be_bytes([
-                    payload[17], payload[18], payload[19], payload[20], payload[21], payload[22],
-                    payload[23], payload[24],
+                    payload[17],
+                    payload[18],
+                    payload[19],
+                    payload[20],
+                    payload[21],
+                    payload[22],
+                    payload[23],
+                    payload[24],
                 ]),
             })
         }
@@ -458,6 +513,15 @@ fn decode_event_payload(typ: EventType, payload: &[u8]) -> Result<ControlEvent, 
                 mount_id,
                 flags,
                 path,
+            })
+        }
+        EventType::AudioRouteControl => {
+            expect_payload_len(typ, payload, 7)?;
+            Ok(ControlEvent::AudioRouteControl {
+                mode: payload[0],
+                scope: payload[1],
+                target_pid: u32::from_be_bytes([payload[2], payload[3], payload[4], payload[5]]),
+                follow_children: payload[6] != 0,
             })
         }
     }

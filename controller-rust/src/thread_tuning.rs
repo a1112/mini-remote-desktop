@@ -158,8 +158,12 @@ fn env_mmcss(name: &str, default: Option<String>) -> Option<String> {
 }
 
 #[cfg(windows)]
-unsafe fn avrt_set_mmcss_char(
-) -> Option<unsafe extern "system" fn(windows::core::PCWSTR, *mut u32) -> windows::Win32::Foundation::HANDLE> {
+unsafe fn avrt_set_mmcss_char() -> Option<
+    unsafe extern "system" fn(
+        windows::core::PCWSTR,
+        *mut u32,
+    ) -> windows::Win32::Foundation::HANDLE,
+> {
     use windows::core::PCSTR;
     use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
     let lib = LoadLibraryA(PCSTR(b"avrt.dll\0".as_ptr())).ok()?;

@@ -33,13 +33,13 @@ struct QueuedFrame {
 pub struct InputInjector {
     rt_tx: mpsc::Sender<QueuedFrame>,
     rel_tx: mpsc::Sender<QueuedFrame>,
+    audio_ctrl: Arc<StdMutex<AudioControlManager>>,
 }
 
-#[derive(Default)]
 struct InjectorContext {
     clipboard: StdMutex<ClipboardManager>,
     file_transfer: StdMutex<FileTransferManager>,
-    audio: StdMutex<AudioControlManager>,
+    audio: Arc<StdMutex<AudioControlManager>>,
     mount_dispatcher: StdMutex<MountDispatcher>,
 }
 
@@ -48,7 +48,13 @@ impl InputInjector {
         let (rt_tx, mut rt_rx) = mpsc::channel::<QueuedFrame>(8);
         let (rel_tx, mut rel_rx) = mpsc::channel::<QueuedFrame>(128);
         let stats = Arc::new(Mutex::new(LatencySamples::default()));
-        let ctx = Arc::new(InjectorContext::default());
+        let audio_ctrl = Arc::new(StdMutex::new(AudioControlManager::default()));
+        let ctx = Arc::new(InjectorContext {
+            clipboard: StdMutex::new(ClipboardManager::default()),
+            file_transfer: StdMutex::new(FileTransferManager::default()),
+            audio: audio_ctrl.clone(),
+            mount_dispatcher: StdMutex::new(MountDispatcher::default()),
+        });
 
         let stats_rt = stats.clone();
         let ctx_rt = ctx.clone();
@@ -109,7 +115,15 @@ impl InputInjector {
             }
         });
 
-        Self { rt_tx, rel_tx }
+        Self {
+            rt_tx,
+            rel_tx,
+            audio_ctrl,
+        }
+    }
+
+    pub fn audio_control_manager(&self) -> Arc<StdMutex<AudioControlManager>> {
+        self.audio_ctrl.clone()
     }
 
     pub async fn push_raw(&self, class: ChannelClass, data: &[u8]) -> Result<()> {
@@ -337,6 +351,10 @@ fn inject_event(event: &ControlEvent, ctx: &Arc<InjectorContext>) -> Result<()> 
                 sample_rate: *sample_rate,
                 channels: *channels,
                 frame_ms: *frame_ms,
+                route_mode: 0,
+                route_scope: 0,
+                target_pid: 0,
+                follow_children: true,
             });
             debug!(
                 op = *op,
@@ -345,6 +363,26 @@ fn inject_event(event: &ControlEvent, ctx: &Arc<InjectorContext>) -> Result<()> 
                 channels = *channels,
                 frame_ms = *frame_ms,
                 "audio control event handled"
+            );
+            Ok(())
+        }
+        ControlEvent::AudioRouteControl {
+            mode,
+            scope,
+            target_pid,
+            follow_children,
+        } => {
+            let mut audio = ctx
+                .audio
+                .lock()
+                .map_err(|_| anyhow!("audio mutex poisoned"))?;
+            audio.apply_route(*mode, *scope, *target_pid, *follow_children);
+            debug!(
+                mode = *mode,
+                scope = *scope,
+                target_pid = *target_pid,
+                follow_children = *follow_children,
+                "audio route control event handled"
             );
             Ok(())
         }
@@ -409,6 +447,7 @@ fn inject_event_windows(event: &ControlEvent) -> Result<()> {
         | ControlEvent::FileControl { .. }
         | ControlEvent::FileChunk { .. }
         | ControlEvent::AudioControl { .. }
+        | ControlEvent::AudioRouteControl { .. }
         | ControlEvent::FileMount { .. } => {}
     }
     Ok(())

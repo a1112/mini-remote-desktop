@@ -1,15 +1,15 @@
 use crate::webrtc::peer::VideoFrame;
 use anyhow::{Context, Result};
-use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use bytes::Bytes;
 use quinn::{ClientConfig, Endpoint};
-use rustls::RootCertStore;
 use rustls::pki_types::CertificateDer;
+use rustls::RootCertStore;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{mpsc, Mutex};
 use tracing::{error, info, warn};
 
 fn fnv1a64(data: &[u8]) -> u64 {
@@ -167,16 +167,12 @@ pub async fn connect_quic_receiver(
         .unwrap_or_else(|| {
             // Adaptive queue sizing based on target FPS
             match target_fps {
-                fps if fps >= 120 => 4,  // Minimal queue for high FPS
-                fps if fps >= 60 => 6,   // Moderate queue for standard high FPS
-                _ => 8,                   // Deeper queue for lower FPS
+                fps if fps >= 120 => 4, // Minimal queue for high FPS
+                fps if fps >= 60 => 6,  // Moderate queue for standard high FPS
+                _ => 8,                 // Deeper queue for lower FPS
             }
         });
-    info!(
-        target_fps,
-        rx_queue,
-        "quic receiver queue size configured"
-    );
+    info!(target_fps, rx_queue, "quic receiver queue size configured");
     let (tx, rx) = mpsc::channel::<VideoFrame>(rx_queue);
     tokio::spawn(async move {
         let wire_debug = std::env::var("MRD_QUIC_WIRE_DEBUG")

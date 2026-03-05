@@ -118,19 +118,19 @@ impl Default for AgentConfig {
                 queue_depth: 8,
                 gop: 60,
                 bframes: 0,
-                encoder_preset: "p4".to_string(),
-                encoder_tune: "balanced".to_string(),
+                encoder_preset: "p5".to_string(),
+                encoder_tune: "hq".to_string(),
                 rc_mode: "vbr".to_string(),
-                bitrate_kbps: 12000,
-                max_bitrate_kbps: 20000,
-                adapt_mode: "balanced".to_string(),
+                bitrate_kbps: 20000,
+                max_bitrate_kbps: 32000,
+                adapt_mode: "quality".to_string(),
                 adapt_enable: true,
                 min_fps: 24,
                 max_fps: 120,
-                performance_profile: "balanced".to_string(),
+                performance_profile: "quality".to_string(),
                 fps_mode: "balanced".to_string(),
                 queue_strategy: "drop".to_string(),
-                profile_template: "balanced".to_string(),
+                profile_template: "quality_first".to_string(),
                 enable_template_overlay: true,
                 frame_pacing_enable: true,
                 frame_pacing_batch_packets: 6,
@@ -143,7 +143,7 @@ impl Default for AgentConfig {
                 rtp_mtu: 1200,
                 rtp_au_align: true,
                 network_adapt_enable: true,
-                network_adapt_floor_bitrate_kbps: 6000,
+                network_adapt_floor_bitrate_kbps: 10000,
                 network_adapt_ceiling_bitrate_kbps: 80000,
                 stats_interval_ms: 1000,
                 max_fps_mode: false,
@@ -154,11 +154,11 @@ impl Default for AgentConfig {
                 tier_fps_l3: 120,
                 tier_fps_l4: 144,
                 tier_fps_l5: 240,
-                tier_bitrate_kbps_l1: 4000,
-                tier_bitrate_kbps_l2: 8000,
-                tier_bitrate_kbps_l3: 12000,
-                tier_bitrate_kbps_l4: 18000,
-                tier_bitrate_kbps_l5: 28000,
+                tier_bitrate_kbps_l1: 10000,
+                tier_bitrate_kbps_l2: 18000,
+                tier_bitrate_kbps_l3: 28000,
+                tier_bitrate_kbps_l4: 38000,
+                tier_bitrate_kbps_l5: 52000,
             },
         }
     }
@@ -596,7 +596,7 @@ mod tests {
         assert_eq!(cfg.capture.encoder, "auto");
         assert!(cfg.capture.allow_encoder_fallback);
         assert!(!cfg.capture.strict_gpu_direct);
-        assert_eq!(cfg.capture.profile_template, "balanced");
+        assert_eq!(cfg.capture.profile_template, "quality_first");
         assert_eq!(cfg.capture.fps_mode, "balanced");
         assert!(cfg.capture.rtp_use_manual_packetizer);
     }

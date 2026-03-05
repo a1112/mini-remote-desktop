@@ -94,7 +94,8 @@ pub fn start_quic_sender(
                                     info!(
                                         seq,
                                         len,
-                                        hash = format!("{:016x}", fnv1a64(frame.payload.as_slice())),
+                                        hash =
+                                            format!("{:016x}", fnv1a64(frame.payload.as_slice())),
                                         tx_unix_us = frame.tx_unix_us,
                                         "quic wire tx frame"
                                     );
