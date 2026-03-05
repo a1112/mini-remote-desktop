@@ -12,13 +12,12 @@ type FrameReceiver = Arc<Mutex<mpsc::Receiver<webrtc::peer::VideoFrame>>>;
 
 use anyhow::{Context, Result};
 use common_control_proto::ControlEvent;
-use uuid::Uuid;
-use quic_rx::{QuicConnectInfo, connect_quic_receiver};
+use quic_rx::{connect_quic_receiver, QuicConnectInfo};
 use render::{D3D11Renderer, OverlaySwitchField};
-use signaling::{SignalingClient, SignalingMessagePayload};
-use signaling::client::SignalingConfig;
-use stats::StatsCollector;
 use serde_json::json;
+use signaling::client::SignalingConfig;
+use signaling::{SignalingClient, SignalingMessagePayload};
+use stats::StatsCollector;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,6 +27,7 @@ use thread_tuning::{apply_current_thread_tuning, ThreadRole};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{error, info, warn};
+use uuid::Uuid;
 use video::{Decoder, DecoderBackend, H264Decoder, H264DecoderConfig};
 use webrtc::peer::{PeerConfig, PeerConnectionManager};
 
@@ -38,6 +38,8 @@ struct ControllerConfig {
     pub signaling: SignalingConfig,
     /// 视频解码器配置
     pub video: H264DecoderConfig,
+    /// 渲染配置
+    pub render: render::RendererConfig,
 }
 
 impl Default for ControllerConfig {
@@ -45,28 +47,25 @@ impl Default for ControllerConfig {
         Self {
             signaling: SignalingConfig::default(),
             video: H264DecoderConfig::default(),
+            render: render::RendererConfig::default(),
         }
     }
 }
 
 /// 从配置文件加载
 fn load_config(path: &PathBuf) -> Result<ControllerConfig> {
-    let raw = std::fs::read_to_string(path)
-        .unwrap_or_else(|_| {
-            r#"{
+    let raw = std::fs::read_to_string(path).unwrap_or_else(|_| {
+        r#"{
                 "ws_url": "ws://127.0.0.1:9527",
                 "device_name": "Rust Controller"
-            }"#.to_string()
-        });
+            }"#
+        .to_string()
+    });
 
     let json: serde_json::Value = serde_json::from_str(&raw)?;
     let ws_url = std::env::var("MRD_SIGNALING_URL")
         .ok()
-        .or_else(|| {
-            json["ws_url"]
-                .as_str()
-                .map(|s| s.to_string())
-        })
+        .or_else(|| json["ws_url"].as_str().map(|s| s.to_string()))
         .unwrap_or_else(|| "ws://127.0.0.1:9527".to_string());
     let device_name = json["device_name"]
         .as_str()
@@ -74,11 +73,7 @@ fn load_config(path: &PathBuf) -> Result<ControllerConfig> {
         .to_string();
     let preferred_transport = std::env::var("MRD_TRANSPORT")
         .ok()
-        .or_else(|| {
-            json["transport"]
-                .as_str()
-                .map(|s| s.to_ascii_lowercase())
-        })
+        .or_else(|| json["transport"].as_str().map(|s| s.to_ascii_lowercase()))
         .unwrap_or_else(|| "webrtc".to_string());
 
     let decoder_mode_str = std::env::var("MRD_DECODER")
@@ -99,6 +94,10 @@ fn load_config(path: &PathBuf) -> Result<ControllerConfig> {
     let enable_hardware = json["video"]["enable_hardware_decode"]
         .as_bool()
         .unwrap_or(true);
+    let sr_mode = json["render"]["sr_mode"]
+        .as_str()
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_else(|| "off".to_string());
 
     Ok(ControllerConfig {
         signaling: SignalingConfig {
@@ -110,6 +109,10 @@ fn load_config(path: &PathBuf) -> Result<ControllerConfig> {
             num_threads,
             enable_hardware,
             backend: decoder_backend,
+        },
+        render: render::RendererConfig {
+            sr_mode,
+            ..render::RendererConfig::default()
         },
     })
 }
@@ -150,8 +153,12 @@ async fn discover_signaling_ws_url(default_ws_port: u16) -> Option<String> {
     let sock = UdpSocket::bind("0.0.0.0:0").await.ok()?;
     let _ = sock.set_broadcast(true);
     let probe = b"MRD_DISCOVER_V1";
-    let _ = sock.send_to(probe, format!("255.255.255.255:{discovery_port}")).await;
-    let _ = sock.send_to(probe, format!("127.0.0.1:{discovery_port}")).await;
+    let _ = sock
+        .send_to(probe, format!("255.255.255.255:{discovery_port}"))
+        .await;
+    let _ = sock
+        .send_to(probe, format!("127.0.0.1:{discovery_port}"))
+        .await;
     let mut buf = [0_u8; 512];
     let recv = tokio::time::timeout(Duration::from_millis(timeout_ms), sock.recv_from(&mut buf))
         .await
@@ -204,7 +211,9 @@ impl ControlBenchConfig {
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
             rate_hz: rate_hz.map(|v| v.clamp(1, 2000)).unwrap_or(250),
-            log_interval_ms: log_interval_ms.map(|v| v.clamp(200, 10_000)).unwrap_or(1000),
+            log_interval_ms: log_interval_ms
+                .map(|v| v.clamp(200, 10_000))
+                .unwrap_or(1000),
             amplitude_px: amplitude_px.map(|v| v.clamp(1, 4000)).unwrap_or(4),
         }
     }
@@ -439,7 +448,7 @@ impl DecodeSelectPolicy {
         std::env::var("MRD_DECODE_ADAPTIVE_MAX_AGE_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(50)  // Default 50ms
+            .unwrap_or(50) // Default 50ms
     }
 }
 
@@ -461,7 +470,9 @@ async fn main() -> Result<()> {
     let config_path = PathBuf::from("config.json");
     let mut config = load_config(&config_path)?;
     if should_try_discovery(&config.signaling.ws_url) {
-        if let Some(found) = discover_signaling_ws_url(parse_ws_port(&config.signaling.ws_url)).await {
+        if let Some(found) =
+            discover_signaling_ws_url(parse_ws_port(&config.signaling.ws_url)).await
+        {
             info!(original = %config.signaling.ws_url, discovered = %found, "signaling discovery succeeded");
             config.signaling.ws_url = found;
         } else {
@@ -472,8 +483,25 @@ async fn main() -> Result<()> {
         ws_url = %config.signaling.ws_url,
         device_name = %config.signaling.device_name,
         transport = %config.signaling.preferred_transport,
+        sr_mode = %config.render.sr_mode,
         "loaded configuration"
     );
+    let allow_mf_on_webrtc = std::env::var("MRD_ALLOW_MF_ON_WEBRTC")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if config
+        .signaling
+        .preferred_transport
+        .eq_ignore_ascii_case("webrtc")
+        && config.video.backend == DecoderBackend::MfD3d11
+        && !allow_mf_on_webrtc
+    {
+        warn!(
+            "MRD_DECODER=mf on WebRTC is unstable in current build; falling back to d3d11va (set MRD_ALLOW_MF_ON_WEBRTC=1 to force mf)"
+        );
+        config.video.backend = DecoderBackend::D3d11va;
+    }
 
     // 创建信令客户端
     let (signaling, mut signaling_rx) = SignalingClient::new(config.signaling.clone());
@@ -485,7 +513,7 @@ async fn main() -> Result<()> {
 
     // 创建渲染器（传递视频帧统计）
     let renderer = Arc::new(D3D11Renderer::new_with_stats(
-        render::RendererConfig::default(),
+        config.render.clone(),
         video_frames_received.clone(),
     )?);
     info!("DirectX 11 renderer initialized");
@@ -520,7 +548,12 @@ async fn main() -> Result<()> {
         let peer_manager_for_bench = peer_manager.clone();
         let connected_for_bench = connected.clone();
         tokio::spawn(async move {
-            run_control_bench(peer_manager_for_bench, connected_for_bench, control_bench_cfg).await;
+            run_control_bench(
+                peer_manager_for_bench,
+                connected_for_bench,
+                control_bench_cfg,
+            )
+            .await;
         });
     }
 
@@ -576,6 +609,20 @@ async fn main() -> Result<()> {
                     .unwrap_or(1200)
                     .clamp(100, 10_000),
             );
+            let rx_stall_recover_after = Duration::from_millis(
+                std::env::var("MRD_RX_STALL_RECOVER_MS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(800)
+                    .clamp(100, 10_000),
+            );
+            let rx_stall_pli_interval = Duration::from_millis(
+                std::env::var("MRD_RX_STALL_PLI_INTERVAL_MS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(300)
+                    .clamp(100, 5000),
+            );
             let mut decode_samples_ms: std::collections::VecDeque<f64> = std::collections::VecDeque::with_capacity(1024);
             let mut frame_interval_ms: std::collections::VecDeque<f64> = std::collections::VecDeque::with_capacity(1024);
             let mut e2e_samples_ms: std::collections::VecDeque<f64> = std::collections::VecDeque::with_capacity(1024);
@@ -595,6 +642,13 @@ async fn main() -> Result<()> {
             let mut last_recover_enter = std::time::Instant::now()
                 .checked_sub(Duration::from_secs(5))
                 .unwrap_or_else(std::time::Instant::now);
+            let mut last_frame_rx_at = std::time::Instant::now();
+            let mut has_received_frame = false;
+            let mut last_rx_stall_pli_req = std::time::Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap_or_else(std::time::Instant::now);
+            let mut rx_stall_active = false;
+            let mut rx_stall_flush_issued = false;
             let mut last_decoded_at: Option<std::time::Instant> = None;
             let mut last_stats_at = std::time::Instant::now();
             let decoder_backend_label = {
@@ -617,6 +671,16 @@ async fn main() -> Result<()> {
                 let mut rx = active_rx.lock().await;
                 let recv = tokio::time::timeout(Duration::from_millis(120), rx.recv()).await;
                 if let Ok(Some(frame)) = recv {
+                    if rx_stall_active {
+                        info!(
+                            stall_ms = last_frame_rx_at.elapsed().as_millis() as u64,
+                            "video frame intake resumed after stall"
+                        );
+                        rx_stall_active = false;
+                        rx_stall_flush_issued = false;
+                    }
+                    has_received_frame = true;
+                    last_frame_rx_at = std::time::Instant::now();
                     let (newest, dropped_now) =
                         select_frame_for_decode(&mut rx, frame, decode_select_policy);
                     dropped_old_frames = dropped_old_frames.saturating_add(dropped_now);
@@ -942,6 +1006,37 @@ async fn main() -> Result<()> {
                 // TODO: 解码并渲染视频帧
             } else {
                 drop(rx);
+                if !disable_decode_recover
+                    && has_received_frame
+                    && last_frame_rx_at.elapsed() >= rx_stall_recover_after
+                {
+                    if !rx_stall_active {
+                        rx_stall_active = true;
+                        waiting_recover_keyframe = true;
+                        waiting_probe_budget = 0;
+                        no_output_streak = 0;
+                        waiting_recover_since = Some(std::time::Instant::now());
+                        waiting_recover_pli_requests = 0;
+                        warn!(
+                            stall_ms = last_frame_rx_at.elapsed().as_millis() as u64,
+                            "video frame intake stalled; entering keyframe resync"
+                        );
+                    }
+                    if !rx_stall_flush_issued {
+                        let mut decoder = decoder_clone.lock().await;
+                        let _ = decoder.flush();
+                        rx_stall_flush_issued = true;
+                    }
+                    if last_rx_stall_pli_req.elapsed() >= rx_stall_pli_interval {
+                        let manager_guard = peer_manager_for_decode.read().await;
+                        if let Some(ref mgr) = *manager_guard {
+                            let _ = mgr.request_keyframe().await;
+                            waiting_recover_pli_requests =
+                                waiting_recover_pli_requests.saturating_add(1);
+                        }
+                        last_rx_stall_pli_req = std::time::Instant::now();
+                    }
+                }
                 continue;
             }
             }
@@ -1213,14 +1308,21 @@ async fn initiate_webRTC_connection(
         target_device_id.to_string(),
         PeerConfig::default(),
         signaling.clone(),
-    ).await?;
+    )
+    .await?;
 
     // 创建 Offer
-    let offer = manager.pc.create_offer(None).await
+    let offer = manager
+        .pc
+        .create_offer(None)
+        .await
         .context("failed to create offer")?;
 
     // 设置本地描述（这会触发 ICE 收集）
-    manager.pc.set_local_description(offer.clone()).await
+    manager
+        .pc
+        .set_local_description(offer.clone())
+        .await
         .context("failed to set local description")?;
 
     // 等待 ICE 收集完成
@@ -1232,7 +1334,10 @@ async fn initiate_webRTC_connection(
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             let current_state = pc_clone.ice_gathering_state();
             if current_state != last_state {
-                info!("ICE gathering state changed: {:?} -> {:?}", last_state, current_state);
+                info!(
+                    "ICE gathering state changed: {:?} -> {:?}",
+                    last_state, current_state
+                );
                 last_state = current_state;
             }
             // Complete 状态的字符串表示是 "complete"
@@ -1249,7 +1354,10 @@ async fn initiate_webRTC_connection(
     let _ = ice_complete_rx.await;
 
     // 获取更新后的本地描述
-    let offer_to_send = manager.pc.local_description().await
+    let offer_to_send = manager
+        .pc
+        .local_description()
+        .await
         .context("no local description")?;
 
     // 打印 SDP 用于调试
@@ -1259,8 +1367,10 @@ async fn initiate_webRTC_connection(
             let has_ice = sdp_str.contains("ice-ufrag");
             info!("SDP contains ice-ufrag: {}", has_ice);
             if !has_ice {
-                warn!("SDP does NOT contain ice-ufrag! First 500 chars: {}",
-                      sdp_str.chars().take(500).collect::<String>());
+                warn!(
+                    "SDP does NOT contain ice-ufrag! First 500 chars: {}",
+                    sdp_str.chars().take(500).collect::<String>()
+                );
             }
         }
         Err(e) => {
@@ -1269,9 +1379,17 @@ async fn initiate_webRTC_connection(
     }
 
     // 发送 Offer
-    let _controller_id = signaling.device_id().await
+    let _controller_id = signaling
+        .device_id()
+        .await
         .context("controller not registered")?;
-    signaling.send_offer(target_device_id, &offer_to_send, &Uuid::new_v4().to_string()).await
+    signaling
+        .send_offer(
+            target_device_id,
+            &offer_to_send,
+            &Uuid::new_v4().to_string(),
+        )
+        .await
         .context("failed to send offer")?;
 
     info!(target = %target_device_id, "WebRTC offer sent");
@@ -1317,7 +1435,8 @@ mod tests {
             sequence: 1,
             tx_unix_us: 0,
         };
-        let (picked, dropped) = select_frame_for_decode(&mut rx, first, DecodeSelectPolicy::Ordered);
+        let (picked, dropped) =
+            select_frame_for_decode(&mut rx, first, DecodeSelectPolicy::Ordered);
         assert_eq!(picked.sequence, 1);
         assert_eq!(dropped, 0);
     }
@@ -1375,7 +1494,8 @@ mod tests {
             sequence: 1,
             tx_unix_us: 0,
         };
-        let (picked, dropped) = select_frame_for_decode(&mut rx, first, DecodeSelectPolicy::AdaptiveAge);
+        let (picked, dropped) =
+            select_frame_for_decode(&mut rx, first, DecodeSelectPolicy::AdaptiveAge);
         assert_eq!(picked.sequence, 1);
         assert_eq!(dropped, 0);
     }

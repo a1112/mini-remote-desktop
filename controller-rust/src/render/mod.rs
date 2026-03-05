@@ -6,6 +6,7 @@ pub struct RendererConfig {
     pub vsync: bool,
     pub low_latency_mode: bool,
     pub max_frame_latency: u32,
+    pub sr_mode: String,
 }
 
 impl Default for RendererConfig {
@@ -16,6 +17,7 @@ impl Default for RendererConfig {
             vsync: false,
             low_latency_mode: true,
             max_frame_latency: 1,
+            sr_mode: "off".to_string(),
         }
     }
 }
@@ -30,8 +32,8 @@ pub use d3d11::{D3D11Renderer, OverlaySwitchField};
 pub mod stub {
     use crate::video::decoder::DecodedFrame;
     use anyhow::Result;
-    use std::sync::Arc;
     use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
 
     /// 非 Windows 平台的存根实现
     pub struct D3D11Renderer;

@@ -10,11 +10,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 use windows::core::PCSTR;
+use windows::core::{Interface, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct3D::Fxc::{D3DCompile, D3DCOMPILE_ENABLE_STRICTNESS};
 use windows::Win32::Graphics::Direct3D::{
-    D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0, D3D_PRIMITIVE_TOPOLOGY,
-    D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob,
+    ID3DBlob, D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0, D3D_PRIMITIVE_TOPOLOGY,
+    D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
 };
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -22,7 +23,6 @@ use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{Interface, PCWSTR};
 
 #[derive(Default)]
 struct SharedFrame {
@@ -159,8 +159,16 @@ const BR_PRESETS: [(&str, &str); 5] = [
     ("30000", "BR:30M"),
     ("50000", "BR:50M"),
 ];
-const CAP_PRESETS: [(&str, &str); 3] = [("dxgi", "CAP:dxgi"), ("wgc", "CAP:wgc"), ("auto", "CAP:auto")];
-const ENC_PRESETS: [(&str, &str); 3] = [("nvenc", "ENC:nvenc"), ("openh264", "ENC:openh264"), ("auto", "ENC:auto")];
+const CAP_PRESETS: [(&str, &str); 3] = [
+    ("dxgi", "CAP:dxgi"),
+    ("wgc", "CAP:wgc"),
+    ("auto", "CAP:auto"),
+];
+const ENC_PRESETS: [(&str, &str); 3] = [
+    ("nvenc", "ENC:nvenc"),
+    ("openh264", "ENC:openh264"),
+    ("auto", "ENC:auto"),
+];
 
 const ID_BTN_COLLAPSE: i32 = 101;
 const ID_BTN_COPY: i32 = 102;
@@ -217,7 +225,8 @@ impl D3D11Renderer {
         let shared_frame = Arc::new(Mutex::new(SharedFrame::default()));
         let overlay_stats = Arc::new(Mutex::new(OverlaySharedStats::default()));
         let overlay_control_queue = Arc::new(Mutex::new(Vec::<OverlaySwitchCommand>::new()));
-        let (window_tx, window_rx) = std::sync::mpsc::sync_channel::<std::result::Result<isize, String>>(1);
+        let (window_tx, window_rx) =
+            std::sync::mpsc::sync_channel::<std::result::Result<isize, String>>(1);
 
         let frame_count_clone = frame_count.clone();
         let video_frames_clone = video_frames_received.clone();
@@ -227,7 +236,8 @@ impl D3D11Renderer {
         let control_queue_clone = overlay_control_queue.clone();
         let config_clone = config.clone();
         thread::spawn(move || {
-            let (_thread_tuning, _thread_tuning_guard) = apply_current_thread_tuning(ThreadRole::Render);
+            let (_thread_tuning, _thread_tuning_guard) =
+                apply_current_thread_tuning(ThreadRole::Render);
 
             let window = match Self::create_window(
                 config_clone.window_width,
@@ -260,8 +270,16 @@ impl D3D11Renderer {
 
         let window = match window_rx.recv_timeout(Duration::from_secs(5)) {
             Ok(Ok(raw)) => HWND(raw as *mut _),
-            Ok(Err(e)) => return Err(anyhow::anyhow!("create window on render thread failed: {e}")),
-            Err(e) => return Err(anyhow::anyhow!("wait render thread window handle failed: {e}")),
+            Ok(Err(e)) => {
+                return Err(anyhow::anyhow!(
+                    "create window on render thread failed: {e}"
+                ))
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "wait render thread window handle failed: {e}"
+                ))
+            }
         };
 
         info!("D3D11 video renderer initialized");
@@ -336,15 +354,18 @@ impl D3D11Renderer {
         let mut gpu_external_frames = 0u64;
         let mut stale_dropped_frames = 0u64;
         let mut age_dropped_frames = 0u64;
+        let mut smooth_repeated_frames = 0u64;
         let mut metrics = OverlayRenderMetrics::default();
+        let render_mode = RenderMode::from_env(config.low_latency_mode);
+        let low_latency_active = matches!(render_mode, RenderMode::LowLatency);
         let render_max_age_us = std::env::var("MRD_RENDER_MAX_AGE_MS")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|v| *v > 0.0)
             .map(|ms| (ms * 1000.0) as u64)
             .unwrap_or(0);
-        let render_drop_old = env_flag("MRD_RENDER_DROP_OLD", true);
-        let adaptive_present = env_flag("MRD_PRESENT_ADAPTIVE", true);
+        let render_drop_old = env_flag("MRD_RENDER_DROP_OLD", low_latency_active);
+        let adaptive_present = env_flag("MRD_PRESENT_ADAPTIVE", low_latency_active);
         let adaptive_present_min_fps = std::env::var("MRD_PRESENT_ADAPTIVE_MIN_FPS")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
@@ -354,9 +375,20 @@ impl D3D11Renderer {
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(240.0);
         let explicit_present_target = d3d11_present_target_fps_is_set();
+        let smooth_target_fps = std::env::var("MRD_SMOOTH_TARGET_FPS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(120.0)
+            .clamp(30.0, 360.0);
 
         let mut d3d = D3DContext::new(window, &config)?;
-        let idle_wait_timeout_ms = idle_wait_timeout_ms(config.low_latency_mode);
+        d3d.low_latency_mode = low_latency_active;
+        if matches!(render_mode, RenderMode::Smooth) && !explicit_present_target {
+            d3d.present_min_interval = Some(Duration::from_secs_f64(1.0 / smooth_target_fps));
+        }
+        let idle_wait_timeout_ms =
+            idle_wait_timeout_ms(low_latency_active || matches!(render_mode, RenderMode::Smooth));
+        let mut last_smooth_repeat_count = 0u64;
 
         while running.load(Ordering::Relaxed) {
             unsafe {
@@ -396,7 +428,9 @@ impl D3D11Renderer {
                     None
                 } else {
                     if last_frame_sequence != 0 {
-                        let gap = guard.sequence.saturating_sub(last_frame_sequence.saturating_add(1));
+                        let gap = guard
+                            .sequence
+                            .saturating_sub(last_frame_sequence.saturating_add(1));
                         stale_dropped_frames = stale_dropped_frames.saturating_add(gap);
                     }
                     last_frame_sequence = guard.sequence;
@@ -449,16 +483,22 @@ impl D3D11Renderer {
                         d3d.upload_nv12(&frame)?;
                         d3d.draw_frame()?;
                     }
-                    DecodedFrameData::D3d11Nv12 { texture, subresource } => {
+                    DecodedFrameData::D3d11Nv12 {
+                        texture,
+                        subresource,
+                    } => {
                         gpu_external_frames = gpu_external_frames.saturating_add(1);
                         if let Err(e) =
                             d3d.draw_external_nv12(texture, *subresource, frame.width, frame.height)
                         {
                             warn!(error = %e, "draw_external_nv12 failed; trying CPU readback fallback");
                             cpu_upload_frames = cpu_upload_frames.saturating_add(1);
-                            if let Err(fallback_err) = d3d
-                                .draw_external_nv12_via_cpu(texture, *subresource, frame.width, frame.height)
-                            {
+                            if let Err(fallback_err) = d3d.draw_external_nv12_via_cpu(
+                                texture,
+                                *subresource,
+                                frame.width,
+                                frame.height,
+                            ) {
                                 warn!(error = %fallback_err, "draw_external_nv12 CPU fallback failed; dropping frame");
                                 continue;
                             }
@@ -466,7 +506,13 @@ impl D3D11Renderer {
                     }
                     DecodedFrameData::D3d11SharedNv12 { shared_handle } => {
                         gpu_external_frames = gpu_external_frames.saturating_add(1);
-                        match d3d.draw_shared_nv12(*shared_handle, frame.width, frame.height, gpu_external_frames, cpu_upload_frames) {
+                        match d3d.draw_shared_nv12(
+                            *shared_handle,
+                            frame.width,
+                            frame.height,
+                            gpu_external_frames,
+                            cpu_upload_frames,
+                        ) {
                             Ok(timing) => {
                                 if shared_acquire_samples_ms.len() >= 1024 {
                                     shared_acquire_samples_ms.pop_front();
@@ -502,18 +548,29 @@ impl D3D11Renderer {
                 }
                 frame_count.fetch_add(1, Ordering::Relaxed);
             } else {
-                unsafe {
-                    let _ = MsgWaitForMultipleObjectsEx(
-                        None,
-                        idle_wait_timeout_ms,
-                        QS_ALLINPUT,
-                        MWMO_INPUTAVAILABLE,
-                    );
+                if matches!(render_mode, RenderMode::Smooth) {
+                    if let Err(e) = d3d.present_only() {
+                        warn!(error = %e, "smooth present-only path failed");
+                    } else {
+                        smooth_repeated_frames = smooth_repeated_frames.saturating_add(1);
+                        frame_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                } else {
+                    unsafe {
+                        let _ = MsgWaitForMultipleObjectsEx(
+                            None,
+                            idle_wait_timeout_ms,
+                            QS_ALLINPUT,
+                            MWMO_INPUTAVAILABLE,
+                        );
+                    }
                 }
                 continue;
             }
 
-            if last_present_stats.elapsed() >= Duration::from_secs(2) && !present_samples_ms.is_empty() {
+            if last_present_stats.elapsed() >= Duration::from_secs(2)
+                && !present_samples_ms.is_empty()
+            {
                 let mut sorted: Vec<f64> = present_samples_ms.iter().copied().collect();
                 sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                 let idx = |p: f64| -> usize {
@@ -589,8 +646,14 @@ impl D3D11Renderer {
                     received_frames = recv,
                     received_fps = format!("{:.2}", recv_fps),
                     stale_dropped_total = stale_dropped_frames,
-                    stale_dropped_per_sec = stale_dropped_frames.saturating_sub(last_stale_dropped_count),
+                    stale_dropped_per_sec =
+                        stale_dropped_frames.saturating_sub(last_stale_dropped_count),
                     age_dropped_total = age_dropped_frames,
+                    smooth_repeated_total = smooth_repeated_frames,
+                    smooth_repeated_per_sec =
+                        smooth_repeated_frames.saturating_sub(last_smooth_repeat_count),
+                    render_mode = render_mode.as_str(),
+                    sr_mode = d3d.sr_mode.as_str(),
                     drop_old_enabled = render_drop_old,
                     gpu_external_frames,
                     cpu_upload_frames,
@@ -606,6 +669,7 @@ impl D3D11Renderer {
                 last_rendered_count = rendered;
                 last_received_count = recv;
                 last_stale_dropped_count = stale_dropped_frames;
+                last_smooth_repeat_count = smooth_repeated_frames;
             }
             if ui_last_update.elapsed() >= Duration::from_millis(250) {
                 let shared = overlay_stats.lock().map(|v| v.clone()).unwrap_or_default();
@@ -656,7 +720,8 @@ impl D3D11Renderer {
                 LRESULT(0)
             }
             WM_NCDESTROY => {
-                let ptr = unsafe { GetWindowLongPtrW(window, GWLP_USERDATA) as *mut OverlayUiState };
+                let ptr =
+                    unsafe { GetWindowLongPtrW(window, GWLP_USERDATA) as *mut OverlayUiState };
                 if !ptr.is_null() {
                     unsafe {
                         let _ = SetWindowLongPtrW(window, GWLP_USERDATA, 0);
@@ -932,7 +997,11 @@ impl D3D11Renderer {
     fn ui_state(window: HWND) -> Option<&'static mut OverlayUiState> {
         unsafe {
             let ptr = GetWindowLongPtrW(window, GWLP_USERDATA) as *mut OverlayUiState;
-            if ptr.is_null() { None } else { Some(&mut *ptr) }
+            if ptr.is_null() {
+                None
+            } else {
+                Some(&mut *ptr)
+            }
         }
     }
 
@@ -983,7 +1052,10 @@ impl D3D11Renderer {
                     );
                     Self::set_button_text(window, btn, label);
                     if let Ok(mut q) = state.control_queue.lock() {
-                        q.push(OverlaySwitchCommand { field: OverlaySwitchField::Resolution, value });
+                        q.push(OverlaySwitchCommand {
+                            field: OverlaySwitchField::Resolution,
+                            value,
+                        });
                     }
                 }
                 ID_BTN_WINDOW => {
@@ -995,7 +1067,10 @@ impl D3D11Renderer {
                     );
                     Self::set_button_text(window, btn, label);
                     if let Ok(mut q) = state.control_queue.lock() {
-                        q.push(OverlaySwitchCommand { field: OverlaySwitchField::CaptureWindow, value });
+                        q.push(OverlaySwitchCommand {
+                            field: OverlaySwitchField::CaptureWindow,
+                            value,
+                        });
                     }
                 }
                 ID_BTN_BITRATE => {
@@ -1007,7 +1082,10 @@ impl D3D11Renderer {
                     );
                     Self::set_button_text(window, btn, label);
                     if let Ok(mut q) = state.control_queue.lock() {
-                        q.push(OverlaySwitchCommand { field: OverlaySwitchField::Bitrate, value });
+                        q.push(OverlaySwitchCommand {
+                            field: OverlaySwitchField::Bitrate,
+                            value,
+                        });
                     }
                 }
                 ID_BTN_CAPTURE => {
@@ -1019,7 +1097,10 @@ impl D3D11Renderer {
                     );
                     Self::set_button_text(window, btn, label);
                     if let Ok(mut q) = state.control_queue.lock() {
-                        q.push(OverlaySwitchCommand { field: OverlaySwitchField::CaptureBackend, value });
+                        q.push(OverlaySwitchCommand {
+                            field: OverlaySwitchField::CaptureBackend,
+                            value,
+                        });
                     }
                 }
                 ID_BTN_ENCODER => {
@@ -1031,7 +1112,10 @@ impl D3D11Renderer {
                     );
                     Self::set_button_text(window, btn, label);
                     if let Ok(mut q) = state.control_queue.lock() {
-                        q.push(OverlaySwitchCommand { field: OverlaySwitchField::Encoder, value });
+                        q.push(OverlaySwitchCommand {
+                            field: OverlaySwitchField::Encoder,
+                            value,
+                        });
                     }
                 }
                 _ => {}
@@ -1124,7 +1208,10 @@ impl D3D11Renderer {
             return;
         }
         state.last_text = panel_text.clone();
-        let wide: Vec<u16> = panel_text.encode_utf16().chain(std::iter::once(0)).collect();
+        let wide: Vec<u16> = panel_text
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
         unsafe {
             if let Ok(edit) = GetDlgItem(Some(window), ID_EDIT_PANEL) {
                 let _ = SetWindowTextW(edit, PCWSTR(wide.as_ptr()));
@@ -1227,7 +1314,11 @@ impl D3D11Renderer {
                  selected_transport={} active_path={}",
                 panel.title(),
                 s.decode_failures,
-                if s.last_decode_error.is_empty() { "none" } else { &s.last_decode_error },
+                if s.last_decode_error.is_empty() {
+                    "none"
+                } else {
+                    &s.last_decode_error
+                },
                 s.decoded_frames,
                 m.rendered_frames,
                 m.received_frames,
@@ -1271,7 +1362,10 @@ struct D3DContext {
     rtv: ID3D11RenderTargetView,
     vs: ID3D11VertexShader,
     ps: ID3D11PixelShader,
+    ps_sr_quality: Option<ID3D11PixelShader>,
     sampler: ID3D11SamplerState,
+    sampler_performance: ID3D11SamplerState,
+    sr_mode: SrMode,
     y_tex: Option<ID3D11Texture2D>,
     uv_tex: Option<ID3D11Texture2D>,
     y_srv: Option<ID3D11ShaderResourceView>,
@@ -1295,6 +1389,69 @@ struct D3DContext {
     present_min_interval: Option<Duration>,
     last_present_at: Option<Instant>,
     present_spin_us: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenderMode {
+    LowLatency,
+    Smooth,
+}
+
+impl RenderMode {
+    fn from_env(default_low_latency: bool) -> Self {
+        if let Ok(v) = std::env::var("MRD_RENDER_MODE") {
+            match v.to_ascii_lowercase().as_str() {
+                "smooth" => return Self::Smooth,
+                "low_latency" | "low-latency" | "latency" => return Self::LowLatency,
+                _ => {}
+            }
+        }
+        if default_low_latency {
+            Self::LowLatency
+        } else {
+            Self::Smooth
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::LowLatency => "low_latency",
+            Self::Smooth => "smooth",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SrMode {
+    Off,
+    Performance,
+    Quality,
+}
+
+impl SrMode {
+    fn from_config_and_env(config_value: &str) -> Self {
+        if let Ok(v) = std::env::var("MRD_SR_MODE") {
+            match v.to_ascii_lowercase().as_str() {
+                "performance" | "perf" | "fast" => return Self::Performance,
+                "quality" | "hq" => return Self::Quality,
+                "off" | "disable" | "disabled" => return Self::Off,
+                _ => {}
+            }
+        }
+        match config_value.to_ascii_lowercase().as_str() {
+            "performance" | "perf" | "fast" => Self::Performance,
+            "quality" | "hq" => Self::Quality,
+            _ => Self::Off,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Performance => "performance",
+            Self::Quality => "quality",
+        }
+    }
 }
 
 struct SharedNv12View {
@@ -1361,7 +1518,10 @@ impl D3DContext {
             sc_desc1.Height = 0;
             sc_desc1.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
             sc_desc1.Stereo = FALSE;
-            sc_desc1.SampleDesc = DXGI_SAMPLE_DESC { Count: 1, Quality: 0 };
+            sc_desc1.SampleDesc = DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            };
             sc_desc1.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
             sc_desc1.BufferCount = 2;
             sc_desc1.Scaling = DXGI_SCALING_STRETCH;
@@ -1374,13 +1534,7 @@ impl D3DContext {
             };
 
             let swap_chain = factory
-                .CreateSwapChainForHwnd(
-                    &device,
-                    window,
-                    &sc_desc1,
-                    None,
-                    None,
-                )
+                .CreateSwapChainForHwnd(&device, window, &sc_desc1, None, None)
                 .context("CreateSwapChainForHwnd failed")?;
             let _ = factory.MakeWindowAssociation(window, DXGI_MWA_NO_ALT_ENTER);
 
@@ -1443,18 +1597,62 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
     float b = y + 1.772 * u;
     return float4(saturate(r), saturate(g), saturate(b), 1.0);
 }";
+            let ps_src_quality_limited_709 = b"
+Texture2D texY  : register(t0);
+Texture2D texUV : register(t1);
+SamplerState samp : register(s0);
+float sample_sharpened_y(float2 uv) {
+    float tex_w, tex_h;
+    texY.GetDimensions(tex_w, tex_h);
+    float2 texel = 1.0 / float2(tex_w, tex_h);
+    float center = texY.Sample(samp, uv).r;
+    float left = texY.Sample(samp, uv + float2(-texel.x, 0.0)).r;
+    float right = texY.Sample(samp, uv + float2(texel.x, 0.0)).r;
+    float up = texY.Sample(samp, uv + float2(0.0, -texel.y)).r;
+    float down = texY.Sample(samp, uv + float2(0.0, texel.y)).r;
+    float edge = (4.0 * center) - left - right - up - down;
+    float sharpen_strength = 0.22;
+    return saturate(center + sharpen_strength * edge);
+}
+float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
+    float y = sample_sharpened_y(uv);
+    float2 uvv = texUV.Sample(samp, uv).rg;
+    float c = max(0.0, y - (16.0 / 255.0)) * 1.16438356;
+    float u = uvv.x - 0.5;
+    float v = uvv.y - 0.5;
+    float r = c + 1.79274107 * v;
+    float g = c - 0.21324861 * u - 0.53290933 * v;
+    float b = c + 2.11240179 * u;
+    return float4(saturate(r), saturate(g), saturate(b), 1.0);
+}";
             let color_mode = std::env::var("MRD_COLOR_MODE")
                 .unwrap_or_else(|_| "limited709".to_string())
                 .to_ascii_lowercase();
+            let sr_mode = SrMode::from_config_and_env(&config.sr_mode);
+            let sr_quality_shader = env_flag("MRD_SR_QUALITY_SHADER", false);
             let ps_src: &[u8] = if color_mode == "full601" {
                 &ps_src_full_601[..]
             } else {
                 &ps_src_limited_709[..]
             };
-            info!(%color_mode, "using yuv->rgb shader mode");
+            info!(
+                %color_mode,
+                sr_mode = sr_mode.as_str(),
+                sr_quality_shader,
+                "using yuv->rgb shader mode"
+            );
 
             let vs_blob = compile_hlsl(vs_src, b"main\0", b"vs_5_0\0")?;
             let ps_blob = compile_hlsl(ps_src, b"main\0", b"ps_5_0\0")?;
+            let ps_quality_blob = if !sr_quality_shader || color_mode == "full601" {
+                None
+            } else {
+                Some(compile_hlsl(
+                    ps_src_quality_limited_709,
+                    b"main\0",
+                    b"ps_5_0\0",
+                )?)
+            };
 
             let mut vs = None;
             let vs_bytes = std::slice::from_raw_parts(
@@ -1462,11 +1660,7 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
                 vs_blob.GetBufferSize(),
             );
             device
-                .CreateVertexShader(
-                    vs_bytes,
-                    None,
-                    Some(&mut vs),
-                )
+                .CreateVertexShader(vs_bytes, None, Some(&mut vs))
                 .context("CreateVertexShader failed")?;
             let vs = vs.context("missing vertex shader")?;
             let mut ps = None;
@@ -1475,13 +1669,22 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
                 ps_blob.GetBufferSize(),
             );
             device
-                .CreatePixelShader(
-                    ps_bytes,
-                    None,
-                    Some(&mut ps),
-                )
+                .CreatePixelShader(ps_bytes, None, Some(&mut ps))
                 .context("CreatePixelShader failed")?;
             let ps = ps.context("missing pixel shader")?;
+            let ps_sr_quality = if let Some(ps_quality_blob) = ps_quality_blob {
+                let mut ps_quality = None;
+                let ps_quality_bytes = std::slice::from_raw_parts(
+                    ps_quality_blob.GetBufferPointer() as *const u8,
+                    ps_quality_blob.GetBufferSize(),
+                );
+                device
+                    .CreatePixelShader(ps_quality_bytes, None, Some(&mut ps_quality))
+                    .context("CreatePixelShader(sr-quality) failed")?;
+                ps_quality
+            } else {
+                None
+            };
 
             let sampler_desc = D3D11_SAMPLER_DESC {
                 Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
@@ -1500,6 +1703,24 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
                 .CreateSamplerState(&sampler_desc, Some(&mut sampler))
                 .context("CreateSamplerState failed")?;
             let sampler = sampler.context("missing sampler state")?;
+            let perf_sampler_desc = D3D11_SAMPLER_DESC {
+                Filter: D3D11_FILTER_ANISOTROPIC,
+                AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+                MipLODBias: 0.0,
+                MaxAnisotropy: 8,
+                ComparisonFunc: D3D11_COMPARISON_ALWAYS,
+                BorderColor: [0.0, 0.0, 0.0, 0.0],
+                MinLOD: 0.0,
+                MaxLOD: f32::MAX,
+            };
+            let mut sampler_performance = None;
+            device
+                .CreateSamplerState(&perf_sampler_desc, Some(&mut sampler_performance))
+                .context("CreateSamplerState(performance) failed")?;
+            let sampler_performance =
+                sampler_performance.context("missing performance sampler state")?;
 
             info!(
                 vsync = config.vsync,
@@ -1517,7 +1738,10 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
                 rtv,
                 vs,
                 ps,
+                ps_sr_quality,
                 sampler,
+                sampler_performance,
+                sr_mode,
                 y_tex: None,
                 uv_tex: None,
                 y_srv: None,
@@ -1566,7 +1790,10 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
                 MipLevels: 1,
                 ArraySize: 1,
                 Format: DXGI_FORMAT_R8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
                 Usage: D3D11_USAGE_DYNAMIC,
                 BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
                 CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
@@ -1578,7 +1805,10 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
                 MipLevels: 1,
                 ArraySize: 1,
                 Format: DXGI_FORMAT_R8G8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
                 Usage: D3D11_USAGE_DYNAMIC,
                 BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
                 CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
@@ -1711,14 +1941,7 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
             }
             self.context.Unmap(readback, 0);
 
-            let frame = DecodedFrame::from_cpu_nv12(
-                Arc::new(nv12),
-                width,
-                height,
-                0,
-                0,
-                0,
-            );
+            let frame = DecodedFrame::from_cpu_nv12(Arc::new(nv12), width, height, 0, 0, 0);
             self.upload_nv12(&frame)?;
             self.draw_frame()?;
         }
@@ -1741,7 +1964,10 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
                 MipLevels: 1,
                 ArraySize: 1,
                 Format: DXGI_FORMAT_NV12,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
                 Usage: D3D11_USAGE_STAGING,
                 BindFlags: 0,
                 CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
@@ -1765,18 +1991,19 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
         gpu_external_frames: u64,
         cpu_upload_frames: u64,
     ) -> Result<SharedDrawTiming> {
-        static SHARED_DRAW_TRACE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static SHARED_DRAW_TRACE: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
         // Dynamic timeout: use lower timeout when GPU path is stable, higher when unstable
         let timeout_ms = if gpu_external_frames > cpu_upload_frames {
             std::env::var("MRD_D3D11_KEYED_TIMEOUT_MS")
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or(2)  // 2ms when GPU is stable
+                .unwrap_or(2) // 2ms when GPU is stable
         } else {
             std::env::var("MRD_D3D11_KEYED_TIMEOUT_MS_FALLBACK")
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or(8)  // 8ms when GPU is unstable
+                .unwrap_or(8) // 8ms when GPU is unstable
         };
         let trace_draw = std::env::var("MRD_SHARED_KEYED_TRACE")
             .ok()
@@ -1797,7 +2024,9 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
                 if e.code() == DXGI_ERROR_WAIT_TIMEOUT {
                     anyhow::bail!("shared keyed mutex AcquireSync timeout");
                 }
-                return Err(anyhow::anyhow!("shared keyed mutex AcquireSync failed: {e}"));
+                return Err(anyhow::anyhow!(
+                    "shared keyed mutex AcquireSync failed: {e}"
+                ));
             }
             if trace_draw {
                 info!("shared-keyed render acquired");
@@ -1849,7 +2078,10 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
     }
 
     fn ensure_shared_copy_texture(&mut self, width: u32, height: u32) -> Result<()> {
-        if self.shared_copy_tex.is_some() && self.shared_copy_w == width && self.shared_copy_h == height {
+        if self.shared_copy_tex.is_some()
+            && self.shared_copy_w == width
+            && self.shared_copy_h == height
+        {
             return Ok(());
         }
         unsafe {
@@ -1861,7 +2093,10 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
                 MipLevels: 1,
                 ArraySize: 1,
                 Format: DXGI_FORMAT_NV12,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
                 Usage: D3D11_USAGE_DEFAULT,
                 BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
                 CPUAccessFlags: 0,
@@ -2044,29 +2279,15 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
 
     fn draw_with_srvs(
         &mut self,
-        _width: u32,
-        _height: u32,
+        width: u32,
+        height: u32,
         y_srv: &ID3D11ShaderResourceView,
         uv_srv: &ID3D11ShaderResourceView,
     ) -> Result<()> {
-        if let Some(interval) = self.present_min_interval {
-            if let Some(last) = self.last_present_at {
-                let elapsed = last.elapsed();
-                if elapsed < interval {
-                    let remaining = interval - elapsed;
-                    let spin_budget = Duration::from_micros(self.present_spin_us.min(2_000));
-                    if remaining > spin_budget {
-                        std::thread::sleep(remaining - spin_budget);
-                    }
-                    let spin_start = Instant::now();
-                    while spin_start.elapsed() < spin_budget && last.elapsed() < interval {
-                        std::hint::spin_loop();
-                    }
-                }
-            }
-        }
+        self.wait_present_interval();
         unsafe {
-            self.context.OMSetRenderTargets(Some(&[Some(self.rtv.clone())]), None);
+            self.context
+                .OMSetRenderTargets(Some(&[Some(self.rtv.clone())]), None);
 
             let mut client = RECT::default();
             let _ = GetClientRect(self.window, &mut client);
@@ -2084,17 +2305,33 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
             self.context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(
                 D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST.0,
             ));
+            let use_quality_sr =
+                should_apply_sr_quality(self.sr_mode, width as f32, height as f32, view_w, view_h);
+            let use_performance_sampler =
+                matches!(self.sr_mode, SrMode::Performance | SrMode::Quality)
+                    && is_upscaling(width as f32, height as f32, view_w, view_h);
             self.context.VSSetShader(&self.vs, None);
-            self.context.PSSetShader(&self.ps, None);
+            if use_quality_sr {
+                if let Some(ps_quality) = &self.ps_sr_quality {
+                    self.context.PSSetShader(ps_quality, None);
+                } else {
+                    self.context.PSSetShader(&self.ps, None);
+                }
+            } else {
+                self.context.PSSetShader(&self.ps, None);
+            }
 
             self.context
                 .PSSetShaderResources(0, Some(&[Some(y_srv.clone()), Some(uv_srv.clone())]));
-            self.context.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
+            let sampler = if use_performance_sampler {
+                self.sampler_performance.clone()
+            } else {
+                self.sampler.clone()
+            };
+            self.context.PSSetSamplers(0, Some(&[Some(sampler)]));
             self.context.Draw(3, 0);
 
-            let (sync_interval, flags) =
-                present_params(self.vsync, self.allow_tearing, self.low_latency_mode);
-            let hr = self.swap_chain.Present(sync_interval, flags);
+            let hr = self.present_swapchain();
             if hr == DXGI_ERROR_WAS_STILL_DRAWING {
                 return Ok(());
             }
@@ -2103,6 +2340,50 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
         self.last_present_at = Some(Instant::now());
         Ok(())
     }
+
+    fn present_only(&mut self) -> Result<()> {
+        self.wait_present_interval();
+        let hr = self.present_swapchain();
+        if hr == DXGI_ERROR_WAS_STILL_DRAWING {
+            return Ok(());
+        }
+        hr.ok().context("swapchain present-only failed")?;
+        self.last_present_at = Some(Instant::now());
+        Ok(())
+    }
+
+    fn present_swapchain(&self) -> windows::core::HRESULT {
+        let (sync_interval, flags) =
+            present_params(self.vsync, self.allow_tearing, self.low_latency_mode);
+        unsafe { self.swap_chain.Present(sync_interval, flags) }
+    }
+
+    fn wait_present_interval(&self) {
+        if let Some(interval) = self.present_min_interval {
+            if let Some(last) = self.last_present_at {
+                let elapsed = last.elapsed();
+                if elapsed < interval {
+                    let remaining = interval - elapsed;
+                    let spin_budget = Duration::from_micros(self.present_spin_us.min(2_000));
+                    if remaining > spin_budget {
+                        std::thread::sleep(remaining - spin_budget);
+                    }
+                    let spin_start = Instant::now();
+                    while spin_start.elapsed() < spin_budget && last.elapsed() < interval {
+                        std::hint::spin_loop();
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn is_upscaling(src_w: f32, src_h: f32, dst_w: f32, dst_h: f32) -> bool {
+    src_w > 1.0 && src_h > 1.0 && (dst_w > src_w + 1.0 || dst_h > src_h + 1.0)
+}
+
+fn should_apply_sr_quality(mode: SrMode, src_w: f32, src_h: f32, dst_w: f32, dst_h: f32) -> bool {
+    mode == SrMode::Quality && is_upscaling(src_w, src_h, dst_w, dst_h)
 }
 
 fn present_params(vsync: bool, allow_tearing: bool, low_latency_mode: bool) -> (u32, DXGI_PRESENT) {
@@ -2156,7 +2437,7 @@ fn adaptive_present_interval(recv_fps: f64, min_fps: f64, max_fps: f64) -> Optio
 mod tests {
     use super::{
         adaptive_present_interval, d3d11_present_target_fps_is_set, idle_wait_timeout_ms,
-        present_params,
+        present_params, should_apply_sr_quality, SrMode,
     };
     use windows::Win32::Graphics::Dxgi::{
         DXGI_PRESENT, DXGI_PRESENT_ALLOW_TEARING, DXGI_PRESENT_DO_NOT_WAIT,
@@ -2219,6 +2500,71 @@ mod tests {
         unsafe {
             std::env::remove_var("MRD_PRESENT_TARGET_FPS");
         }
+    }
+
+    #[test]
+    fn sr_mode_from_env_defaults_to_off() {
+        unsafe {
+            std::env::remove_var("MRD_SR_MODE");
+        }
+        assert_eq!(SrMode::from_config_and_env("off"), SrMode::Off);
+    }
+
+    #[test]
+    fn sr_mode_from_env_parses_known_values() {
+        unsafe {
+            std::env::set_var("MRD_SR_MODE", "quality");
+        }
+        assert_eq!(SrMode::from_config_and_env("off"), SrMode::Quality);
+        unsafe {
+            std::env::set_var("MRD_SR_MODE", "performance");
+        }
+        assert_eq!(SrMode::from_config_and_env("off"), SrMode::Performance);
+        unsafe {
+            std::env::set_var("MRD_SR_MODE", "off");
+        }
+        assert_eq!(SrMode::from_config_and_env("quality"), SrMode::Off);
+        unsafe {
+            std::env::remove_var("MRD_SR_MODE");
+        }
+    }
+
+    #[test]
+    fn sr_mode_uses_config_when_env_missing() {
+        unsafe {
+            std::env::remove_var("MRD_SR_MODE");
+        }
+        assert_eq!(SrMode::from_config_and_env("quality"), SrMode::Quality);
+        assert_eq!(
+            SrMode::from_config_and_env("performance"),
+            SrMode::Performance
+        );
+        assert_eq!(SrMode::from_config_and_env("invalid"), SrMode::Off);
+    }
+
+    #[test]
+    fn sr_quality_only_applies_when_upscaling() {
+        assert!(should_apply_sr_quality(
+            SrMode::Quality,
+            1920.0,
+            1080.0,
+            2560.0,
+            1440.0
+        ));
+        assert!(!should_apply_sr_quality(
+            SrMode::Quality,
+            2560.0,
+            1440.0,
+            1920.0,
+            1080.0
+        ));
+        assert!(!should_apply_sr_quality(
+            SrMode::Performance,
+            1920.0,
+            1080.0,
+            2560.0,
+            1440.0
+        ));
     }
 }
 
