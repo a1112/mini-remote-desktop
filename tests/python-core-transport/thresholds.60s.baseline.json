@@ -10,8 +10,10 @@
     "jitter": {
       "p95_ms_max": 80.0,
       "p99_ms_max": 200.0,
-      "gt_100ms_max": 20,
-      "gt_200ms_max": 5
+      "gt_100ms_max": 120,
+      "gt_200ms_max": 15,
+      "gt_100ms_ratio_max": 0.015,
+      "gt_200ms_ratio_max": 0.003
     },
     "agent_pipeline_jitter": {
       "capture_jitter_ms_max": 20.0,

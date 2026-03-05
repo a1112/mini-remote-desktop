@@ -50,17 +50,23 @@ def percentile(values: List[float], p: float) -> float:
 
 
 def summarize_intervals_ms(intervals_ms: List[float]) -> Dict[str, Any]:
+    total = len(intervals_ms)
+    gt_100 = sum(1 for x in intervals_ms if x > 100.0)
+    gt_200 = sum(1 for x in intervals_ms if x > 200.0)
+    gt_500 = sum(1 for x in intervals_ms if x > 500.0)
     return {
-        "samples": len(intervals_ms),
+        "samples": total,
         "mean": round(statistics.mean(intervals_ms), 3) if intervals_ms else 0.0,
         "std": round(statistics.pstdev(intervals_ms), 3) if len(intervals_ms) > 1 else 0.0,
         "p50": round(percentile(intervals_ms, 50), 3) if intervals_ms else 0.0,
         "p95": round(percentile(intervals_ms, 95), 3) if intervals_ms else 0.0,
         "p99": round(percentile(intervals_ms, 99), 3) if intervals_ms else 0.0,
         "max": round(max(intervals_ms), 3) if intervals_ms else 0.0,
-        "gt_100ms": sum(1 for x in intervals_ms if x > 100.0),
-        "gt_200ms": sum(1 for x in intervals_ms if x > 200.0),
-        "gt_500ms": sum(1 for x in intervals_ms if x > 500.0),
+        "gt_100ms": gt_100,
+        "gt_200ms": gt_200,
+        "gt_500ms": gt_500,
+        "gt_100ms_ratio": round((gt_100 / total), 6) if total > 0 else 0.0,
+        "gt_200ms_ratio": round((gt_200 / total), 6) if total > 0 else 0.0,
     }
 
 
@@ -868,6 +874,12 @@ class CoreTransportSuite:
         if jitter["gt_200ms"] > int(jth.get("gt_200ms_max", 1_000_000)):
             ok = False
             reason = reason or f"too many >200ms stalls: {jitter['gt_200ms']}"
+        if jitter["gt_100ms_ratio"] > float(jth.get("gt_100ms_ratio_max", 1.0)):
+            ok = False
+            reason = reason or f">100ms stall ratio too high: {jitter['gt_100ms_ratio']}"
+        if jitter["gt_200ms_ratio"] > float(jth.get("gt_200ms_ratio_max", 1.0)):
+            ok = False
+            reason = reason or f">200ms stall ratio too high: {jitter['gt_200ms_ratio']}"
 
         if agent_errors > int(self.thresholds.get("agent_errors_max", 0)):
             ok = False
@@ -1136,15 +1148,15 @@ class CoreTransportSuite:
         lines.append("")
         lines.append("## Summary")
         lines.append("")
-        lines.append("| transport | ok | selected | frames | p95(ms) | p99(ms) | >100ms | >200ms | agent_errors | quic_drop | ffmpeg_restart | roi_effective | au_mean(B) | au_p95(B) | reason |")
-        lines.append("|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|")
+        lines.append("| transport | ok | selected | frames | p95(ms) | p99(ms) | >100ms | >100 ratio | >200ms | >200 ratio | agent_errors | quic_drop | ffmpeg_restart | roi_effective | au_mean(B) | au_p95(B) | reason |")
+        lines.append("|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|")
         for r in payload["results"]:
             j = r.get("jitter_ms") or {}
             raw = r.get("raw") or {}
             diag = raw.get("encoder_diag") or {}
             au = raw.get("au_size_bytes") or {}
             lines.append(
-                "| {transport} | {ok} | {selected} | {frames} | {p95} | {p99} | {g100} | {g200} | {ae} | {qd} | {rs} | {roi} | {aumean} | {aup95} | {reason} |".format(
+                "| {transport} | {ok} | {selected} | {frames} | {p95} | {p99} | {g100} | {g100r} | {g200} | {g200r} | {ae} | {qd} | {rs} | {roi} | {aumean} | {aup95} | {reason} |".format(
                     transport=r["transport"],
                     ok="PASS" if r["ok"] else "FAIL",
                     selected=r.get("selected_transport") or "-",
@@ -1152,7 +1164,9 @@ class CoreTransportSuite:
                     p95=j.get("p95", 0),
                     p99=j.get("p99", 0),
                     g100=j.get("gt_100ms", 0),
+                    g100r=j.get("gt_100ms_ratio", 0),
                     g200=j.get("gt_200ms", 0),
+                    g200r=j.get("gt_200ms_ratio", 0),
                     ae=r.get("agent_error_count", 0),
                     qd=r.get("agent_quic_drop", 0),
                     rs=diag.get("ffmpeg_pipe_restart_count", 0),

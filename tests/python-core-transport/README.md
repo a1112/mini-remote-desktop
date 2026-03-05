@@ -68,6 +68,8 @@ A timestamped folder is created under `mini-remote-desktop/logs/`, containing:
 The report also includes `Agent Pipeline` jitter metrics parsed from agent-side
 `[PIPELINE-STATS]` logs (capture / encode-output / send-interval / queue-wait / send std).
 Thresholds are configured under `thresholds.*.json -> thresholds.agent_pipeline_jitter`.
+Jitter thresholds now support both absolute and ratio limits for long runs:
+`gt_100ms_max` + `gt_100ms_ratio_max`, `gt_200ms_max` + `gt_200ms_ratio_max`.
 
 ## Notes
 

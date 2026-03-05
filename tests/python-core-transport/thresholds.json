@@ -11,7 +11,9 @@
       "p95_ms_max": 25.0,
       "p99_ms_max": 80.0,
       "gt_100ms_max": 5,
-      "gt_200ms_max": 1
+      "gt_200ms_max": 1,
+      "gt_100ms_ratio_max": 0.01,
+      "gt_200ms_ratio_max": 0.002
     },
     "agent_pipeline_jitter": {
       "capture_jitter_ms_max": 12.0,
