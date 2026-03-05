@@ -655,6 +655,41 @@ class CoreTransportSuite:
             "roi_effectiveness": roi_effectiveness,
         }
 
+    @staticmethod
+    def _extract_numeric_field(text: str, key: str) -> Optional[float]:
+        m = re.search(rf"{re.escape(key)}[=:]\"?(-?\d+(?:\.\d+)?)\"?", text)
+        if not m:
+            return None
+        try:
+            return float(m.group(1))
+        except Exception:
+            return None
+
+    def _parse_agent_pipeline_metrics(self, agent_out: Path, agent_err: Path) -> Dict[str, Any]:
+        text = self._read_agent_text(agent_out, agent_err)
+        last_line = ""
+        for line in text.splitlines():
+            clean = re.sub(r"\x1b\[[0-9;]*m", "", line).strip()
+            if "[PIPELINE-STATS]" not in clean:
+                continue
+            if "side=\"agent\"" in clean or "side=agent" in clean:
+                last_line = clean
+        if not last_line:
+            return {}
+        keys = [
+            "stage_capture_jitter_ms",
+            "stage_encode_output_jitter_ms",
+            "stage_send_interval_jitter_ms",
+            "stage_queue_wait_std_ms",
+            "stage_send_std_ms",
+            "stage_capture_std_ms",
+            "stage_encode_std_ms",
+        ]
+        out: Dict[str, Any] = {"line": last_line}
+        for key in keys:
+            out[key] = self._extract_numeric_field(last_line, key)
+        return out
+
     async def _run_control_offer(self, signaling: SignalingSession, target_id: str, transport: str):
         pc = RTCPeerConnection(
             RTCConfiguration(
@@ -874,6 +909,36 @@ class CoreTransportSuite:
                 if res.reason == "ok":
                     res.reason = f"roi effectiveness too low: {eff} < {min_eff}"
 
+    def _apply_pipeline_thresholds(self, res: TransportCaseResult) -> None:
+        pj = (self.thresholds.get("agent_pipeline_jitter") or {})
+        if not pj:
+            return
+        raw = res.raw or {}
+        metrics = raw.get("agent_pipeline") or {}
+        checks = [
+            ("capture_jitter_ms_max", "stage_capture_jitter_ms"),
+            ("encode_output_jitter_ms_max", "stage_encode_output_jitter_ms"),
+            ("send_interval_jitter_ms_max", "stage_send_interval_jitter_ms"),
+            ("queue_wait_std_ms_max", "stage_queue_wait_std_ms"),
+            ("send_std_ms_max", "stage_send_std_ms"),
+        ]
+        for th_key, metric_key in checks:
+            if th_key not in pj:
+                continue
+            limit = float(pj.get(th_key, 1e9))
+            value = metrics.get(metric_key)
+            if value is None:
+                res.ok = False
+                if res.reason == "ok":
+                    res.reason = f"missing agent pipeline metric: {metric_key}"
+                continue
+            if float(value) > limit:
+                res.ok = False
+                if res.reason == "ok":
+                    res.reason = (
+                        f"agent {metric_key} too high: {value:.3f} > {limit:.3f}"
+                    )
+
     def _steady_state_times(self, frame_times: List[float]) -> List[float]:
         if len(frame_times) <= 3:
             return list(frame_times)
@@ -976,6 +1041,7 @@ class CoreTransportSuite:
 
             agent_errors, quic_drop = self._parse_agent_health(agent_out, agent_err)
             encoder_diag = self._parse_agent_encoder_diag(agent_out, agent_err)
+            agent_pipeline = self._parse_agent_pipeline_metrics(agent_out, agent_err)
             res = self._evaluate_case(
                 transport=transport,
                 frame_times=frame_times,
@@ -993,8 +1059,10 @@ class CoreTransportSuite:
                 "duration_sec": self.duration_sec,
                 "au_size_bytes": summarize_sizes_bytes(au_sizes),
                 "encoder_diag": encoder_diag,
+                "agent_pipeline": agent_pipeline,
             }
             self._apply_diag_thresholds(res)
+            self._apply_pipeline_thresholds(res)
             return res
 
         except Exception as e:
@@ -1108,6 +1176,24 @@ class CoreTransportSuite:
             gmem = p.get("gpu_mem_used_mb") or {}
             lines.append(
                 f"| {r.get('transport')} | {cpu.get('mean')} | {cpu.get('p95')} | {rss.get('mean')} | {gpu.get('mean')} | {gmem.get('mean')} |"
+            )
+
+        lines.append("")
+        lines.append("## Agent Pipeline")
+        lines.append("")
+        lines.append("| transport | capture_jitter(ms) | encode_out_jitter(ms) | send_interval_jitter(ms) | queue_wait_std(ms) | send_std(ms) |")
+        lines.append("|---|---:|---:|---:|---:|---:|")
+        for r in payload["results"]:
+            p = ((r.get("raw") or {}).get("agent_pipeline") or {})
+            lines.append(
+                "| {t} | {c} | {e} | {s} | {q} | {sd} |".format(
+                    t=r.get("transport"),
+                    c=p.get("stage_capture_jitter_ms"),
+                    e=p.get("stage_encode_output_jitter_ms"),
+                    s=p.get("stage_send_interval_jitter_ms"),
+                    q=p.get("stage_queue_wait_std_ms"),
+                    sd=p.get("stage_send_std_ms"),
+                )
             )
 
         lines.append("")

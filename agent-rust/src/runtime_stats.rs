@@ -13,17 +13,23 @@ use webrtc::rtp_transceiver::rtp_sender::RTCRtpSender;
 const LATENCY_WINDOW_SAMPLES: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Default)]
-pub struct PercentilePairMs {
+pub struct StatSummaryMs {
+    pub avg: f64,
     pub p50: f64,
     pub p95: f64,
+    pub p99: f64,
+    pub std: f64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TransportLatencyPercentilesMs {
-    pub capture: PercentilePairMs,
-    pub encode: PercentilePairMs,
-    pub queue_wait: PercentilePairMs,
-    pub send: PercentilePairMs,
+    pub capture: StatSummaryMs,
+    pub encode: StatSummaryMs,
+    pub queue_wait: StatSummaryMs,
+    pub send: StatSummaryMs,
+    pub capture_interval: StatSummaryMs,
+    pub encode_output_interval: StatSummaryMs,
+    pub send_interval: StatSummaryMs,
 }
 
 #[derive(Default)]
@@ -64,6 +70,9 @@ pub struct RuntimeStats {
     transport_encode_us_window: Mutex<VecDeque<u32>>,
     transport_queue_wait_us_window: Mutex<VecDeque<u32>>,
     transport_send_us_window: Mutex<VecDeque<u32>>,
+    transport_capture_interval_us_window: Mutex<VecDeque<u32>>,
+    transport_encode_output_interval_us_window: Mutex<VecDeque<u32>>,
+    transport_send_interval_us_window: Mutex<VecDeque<u32>>,
 }
 
 impl RuntimeStats {
@@ -90,22 +99,34 @@ impl RuntimeStats {
         }
     }
 
-    fn percentile_pair_ms(window: &Mutex<VecDeque<u32>>) -> PercentilePairMs {
+    fn summarize_ms(window: &Mutex<VecDeque<u32>>) -> StatSummaryMs {
         let guard = match window.lock() {
             Ok(v) => v,
-            Err(_) => return PercentilePairMs::default(),
+            Err(_) => return StatSummaryMs::default(),
         };
         if guard.is_empty() {
-            return PercentilePairMs::default();
+            return StatSummaryMs::default();
         }
         let mut sorted: Vec<u32> = guard.iter().copied().collect();
         sorted.sort_unstable();
         let idx = |p: f64| -> usize {
             ((sorted.len() as f64 * p).floor() as usize).min(sorted.len().saturating_sub(1))
         };
-        PercentilePairMs {
+        let avg_us = sorted.iter().map(|v| *v as f64).sum::<f64>() / sorted.len() as f64;
+        let var_us = sorted
+            .iter()
+            .map(|v| {
+                let d = *v as f64 - avg_us;
+                d * d
+            })
+            .sum::<f64>()
+            / sorted.len() as f64;
+        StatSummaryMs {
+            avg: avg_us / 1000.0,
             p50: sorted[idx(0.50)] as f64 / 1000.0,
             p95: sorted[idx(0.95)] as f64 / 1000.0,
+            p99: sorted[idx(0.99)] as f64 / 1000.0,
+            std: var_us.sqrt() / 1000.0,
         }
     }
 
@@ -122,12 +143,32 @@ impl RuntimeStats {
         Self::push_window(&self.transport_encode_us_window, encode_us);
     }
 
+    pub fn record_transport_capture_interval_us(&self, interval_us: u64) {
+        Self::push_window(&self.transport_capture_interval_us_window, interval_us);
+    }
+
+    pub fn record_transport_encode_output_interval_us(&self, interval_us: u64) {
+        Self::push_window(
+            &self.transport_encode_output_interval_us_window,
+            interval_us,
+        );
+    }
+
+    pub fn record_transport_send_interval_us(&self, interval_us: u64) {
+        Self::push_window(&self.transport_send_interval_us_window, interval_us);
+    }
+
     pub fn transport_latency_percentiles_ms(&self) -> TransportLatencyPercentilesMs {
         TransportLatencyPercentilesMs {
-            capture: Self::percentile_pair_ms(&self.transport_capture_us_window),
-            encode: Self::percentile_pair_ms(&self.transport_encode_us_window),
-            queue_wait: Self::percentile_pair_ms(&self.transport_queue_wait_us_window),
-            send: Self::percentile_pair_ms(&self.transport_send_us_window),
+            capture: Self::summarize_ms(&self.transport_capture_us_window),
+            encode: Self::summarize_ms(&self.transport_encode_us_window),
+            queue_wait: Self::summarize_ms(&self.transport_queue_wait_us_window),
+            send: Self::summarize_ms(&self.transport_send_us_window),
+            capture_interval: Self::summarize_ms(&self.transport_capture_interval_us_window),
+            encode_output_interval: Self::summarize_ms(
+                &self.transport_encode_output_interval_us_window,
+            ),
+            send_interval: Self::summarize_ms(&self.transport_send_interval_us_window),
         }
     }
 }
@@ -404,18 +445,53 @@ pub fn spawn_stats_panel(
                 capture_ms = format!("{:.3}", capture_to_send_avg_us / 1000.0),
                 capture_p50_ms = format!("{:.3}", p.capture.p50),
                 capture_p95_ms = format!("{:.3}", p.capture.p95),
+                capture_p99_ms = format!("{:.3}", p.capture.p99),
+                capture_std_ms = format!("{:.3}", p.capture.std),
                 encode_ms = format!("{:.3}", encode_approx_avg_us / 1000.0),
                 encode_p50_ms = format!("{:.3}", p.encode.p50),
                 encode_p95_ms = format!("{:.3}", p.encode.p95),
+                encode_p99_ms = format!("{:.3}", p.encode.p99),
+                encode_std_ms = format!("{:.3}", p.encode.std),
                 queue_wait_ms = format!("{:.3}", enqueue_wait_avg_us / 1000.0),
                 queue_wait_p50_ms = format!("{:.3}", p.queue_wait.p50),
                 queue_wait_p95_ms = format!("{:.3}", p.queue_wait.p95),
+                queue_wait_p99_ms = format!("{:.3}", p.queue_wait.p99),
+                queue_wait_std_ms = format!("{:.3}", p.queue_wait.std),
                 send_ms = format!("{:.3}", transport_send_avg_us / 1000.0),
                 send_p50_ms = format!("{:.3}", p.send.p50),
                 send_p95_ms = format!("{:.3}", p.send.p95),
+                send_p99_ms = format!("{:.3}", p.send.p99),
+                send_std_ms = format!("{:.3}", p.send.std),
                 enqueue_wait_avg_us = format!("{enqueue_wait_avg_us:.1}"),
                 transport_send_avg_us = format!("{transport_send_avg_us:.1}"),
                 "[RTCP-PANEL]"
+            );
+            tracing::info!(
+                side = "agent",
+                window_s = 1,
+                fps_encode = format!("{encode_fps:.2}"),
+                fps_send = format!("{send_fps:.2}"),
+                stage_capture_ms = format!("{:.3}", capture_to_send_avg_us / 1000.0),
+                stage_capture_p95_ms = format!("{:.3}", p.capture.p95),
+                stage_capture_p99_ms = format!("{:.3}", p.capture.p99),
+                stage_capture_std_ms = format!("{:.3}", p.capture.std),
+                stage_capture_jitter_ms = format!("{:.3}", p.capture_interval.std),
+                stage_encode_ms = format!("{:.3}", encode_approx_avg_us / 1000.0),
+                stage_encode_p95_ms = format!("{:.3}", p.encode.p95),
+                stage_encode_p99_ms = format!("{:.3}", p.encode.p99),
+                stage_encode_std_ms = format!("{:.3}", p.encode.std),
+                stage_encode_output_jitter_ms = format!("{:.3}", p.encode_output_interval.std),
+                stage_queue_wait_ms = format!("{:.3}", enqueue_wait_avg_us / 1000.0),
+                stage_queue_wait_p95_ms = format!("{:.3}", p.queue_wait.p95),
+                stage_queue_wait_p99_ms = format!("{:.3}", p.queue_wait.p99),
+                stage_queue_wait_std_ms = format!("{:.3}", p.queue_wait.std),
+                stage_send_ms = format!("{:.3}", transport_send_avg_us / 1000.0),
+                stage_send_p95_ms = format!("{:.3}", p.send.p95),
+                stage_send_p99_ms = format!("{:.3}", p.send.p99),
+                stage_send_std_ms = format!("{:.3}", p.send.std),
+                stage_send_interval_jitter_ms = format!("{:.3}", p.send_interval.std),
+                overall_tx_ms = format!("{:.3}", capture_to_send_avg_us / 1000.0),
+                "[PIPELINE-STATS]"
             );
         }
     });
@@ -432,11 +508,19 @@ mod tests {
             stats.record_transport_queue_wait_us((i * 1000) as u64);
             stats.record_transport_send_us((i * 500) as u64);
             stats.record_transport_capture_encode_us((i * 2000) as u64, (i * 700) as u64);
+            stats.record_transport_capture_interval_us((i * 800) as u64);
+            stats.record_transport_encode_output_interval_us((i * 900) as u64);
+            stats.record_transport_send_interval_us((i * 600) as u64);
         }
         let p = stats.transport_latency_percentiles_ms();
         assert!(p.queue_wait.p50 >= 50.0 && p.queue_wait.p95 >= 95.0);
+        assert!(p.queue_wait.p99 >= 99.0);
+        assert!(p.queue_wait.std > 0.0);
         assert!(p.send.p50 >= 25.0 && p.send.p95 >= 47.5);
         assert!(p.capture.p50 >= 100.0 && p.capture.p95 >= 190.0);
         assert!(p.encode.p50 >= 35.0 && p.encode.p95 >= 66.5);
+        assert!(p.capture_interval.std > 0.0);
+        assert!(p.encode_output_interval.std > 0.0);
+        assert!(p.send_interval.std > 0.0);
     }
 }

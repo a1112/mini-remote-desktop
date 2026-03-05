@@ -94,10 +94,23 @@ struct OverlayRenderMetrics {
     render_fps: f64,
     received_frames: u64,
     receive_fps: f64,
+    render_queue_wait_avg_ms: f64,
+    render_queue_wait_p95_ms: f64,
+    render_queue_wait_p99_ms: f64,
+    render_queue_wait_std_ms: f64,
+    render_interval_avg_ms: f64,
+    render_interval_p95_ms: f64,
+    render_interval_p99_ms: f64,
+    render_interval_std_ms: f64,
+    present_call_avg_ms: f64,
+    present_call_p95_ms: f64,
+    present_call_p99_ms: f64,
+    present_call_std_ms: f64,
     present_avg_ms: f64,
     present_p50_ms: f64,
     present_p95_ms: f64,
     present_p99_ms: f64,
+    present_std_ms: f64,
 }
 
 #[derive(Debug)]
@@ -335,6 +348,12 @@ impl D3D11Renderer {
         let mut last_frame_sequence = 0u64;
         let mut present_samples_ms: std::collections::VecDeque<f64> =
             std::collections::VecDeque::with_capacity(1024);
+        let mut present_call_samples_ms: std::collections::VecDeque<f64> =
+            std::collections::VecDeque::with_capacity(1024);
+        let mut render_queue_wait_samples_ms: std::collections::VecDeque<f64> =
+            std::collections::VecDeque::with_capacity(1024);
+        let mut render_interval_samples_ms: std::collections::VecDeque<f64> =
+            std::collections::VecDeque::with_capacity(1024);
         let mut shared_acquire_samples_ms: std::collections::VecDeque<f64> =
             std::collections::VecDeque::with_capacity(1024);
         let mut shared_copy_samples_ms: std::collections::VecDeque<f64> =
@@ -389,6 +408,31 @@ impl D3D11Renderer {
         let idle_wait_timeout_ms =
             idle_wait_timeout_ms(low_latency_active || matches!(render_mode, RenderMode::Smooth));
         let mut last_smooth_repeat_count = 0u64;
+        let mut last_render_present_at: Option<Instant> = None;
+
+        let summarize =
+            |samples: &std::collections::VecDeque<f64>| -> Option<(f64, f64, f64, f64)> {
+                if samples.is_empty() {
+                    return None;
+                }
+                let mut sorted: Vec<f64> = samples.iter().copied().collect();
+                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let idx = |p: f64| -> usize {
+                    ((sorted.len() as f64) * p)
+                        .floor()
+                        .min((sorted.len().saturating_sub(1)) as f64) as usize
+                };
+                let avg = sorted.iter().sum::<f64>() / sorted.len() as f64;
+                let var = sorted
+                    .iter()
+                    .map(|v| {
+                        let d = *v - avg;
+                        d * d
+                    })
+                    .sum::<f64>()
+                    / sorted.len() as f64;
+                Some((avg, sorted[idx(0.95)], sorted[idx(0.99)], var.sqrt()))
+            };
 
         while running.load(Ordering::Relaxed) {
             unsafe {
@@ -477,6 +521,21 @@ impl D3D11Renderer {
                         }
                     }
                 }
+                if frame.decode_ready_unix_us != 0 {
+                    if let Ok(elapsed) =
+                        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                    {
+                        let now_us = elapsed.as_micros().min(u64::MAX as u128) as u64;
+                        if now_us >= frame.decode_ready_unix_us {
+                            let queue_wait_ms =
+                                (now_us - frame.decode_ready_unix_us) as f64 / 1000.0;
+                            if render_queue_wait_samples_ms.len() >= 1024 {
+                                render_queue_wait_samples_ms.pop_front();
+                            }
+                            render_queue_wait_samples_ms.push_back(queue_wait_ms);
+                        }
+                    }
+                }
                 match &frame.data {
                     DecodedFrameData::CpuNv12(_) => {
                         cpu_upload_frames = cpu_upload_frames.saturating_add(1);
@@ -532,6 +591,19 @@ impl D3D11Renderer {
                         }
                     }
                 }
+                if present_call_samples_ms.len() >= 1024 {
+                    present_call_samples_ms.pop_front();
+                }
+                present_call_samples_ms.push_back(d3d.last_present_call_ms());
+                let render_now = Instant::now();
+                if let Some(prev) = last_render_present_at {
+                    let delta_ms = render_now.duration_since(prev).as_secs_f64() * 1000.0;
+                    if render_interval_samples_ms.len() >= 1024 {
+                        render_interval_samples_ms.pop_front();
+                    }
+                    render_interval_samples_ms.push_back(delta_ms);
+                }
+                last_render_present_at = Some(render_now);
                 if frame.capture_start_unix_us != 0 {
                     if let Ok(elapsed) =
                         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
@@ -552,6 +624,19 @@ impl D3D11Renderer {
                     if let Err(e) = d3d.present_only() {
                         warn!(error = %e, "smooth present-only path failed");
                     } else {
+                        if present_call_samples_ms.len() >= 1024 {
+                            present_call_samples_ms.pop_front();
+                        }
+                        present_call_samples_ms.push_back(d3d.last_present_call_ms());
+                        let render_now = Instant::now();
+                        if let Some(prev) = last_render_present_at {
+                            let delta_ms = render_now.duration_since(prev).as_secs_f64() * 1000.0;
+                            if render_interval_samples_ms.len() >= 1024 {
+                                render_interval_samples_ms.pop_front();
+                            }
+                            render_interval_samples_ms.push_back(delta_ms);
+                        }
+                        last_render_present_at = Some(render_now);
                         smooth_repeated_frames = smooth_repeated_frames.saturating_add(1);
                         frame_count.fetch_add(1, Ordering::Relaxed);
                     }
@@ -583,11 +668,33 @@ impl D3D11Renderer {
                 metrics.present_p50_ms = sorted[idx(0.50)];
                 metrics.present_p95_ms = sorted[idx(0.95)];
                 metrics.present_p99_ms = sorted[idx(0.99)];
+                metrics.present_std_ms = summarize(&present_samples_ms)
+                    .map(|(_, _, _, std)| std)
+                    .unwrap_or(0.0);
+                if let Some((avg, p95, p99, std)) = summarize(&present_call_samples_ms) {
+                    metrics.present_call_avg_ms = avg;
+                    metrics.present_call_p95_ms = p95;
+                    metrics.present_call_p99_ms = p99;
+                    metrics.present_call_std_ms = std;
+                }
+                if let Some((avg, p95, p99, std)) = summarize(&render_queue_wait_samples_ms) {
+                    metrics.render_queue_wait_avg_ms = avg;
+                    metrics.render_queue_wait_p95_ms = p95;
+                    metrics.render_queue_wait_p99_ms = p99;
+                    metrics.render_queue_wait_std_ms = std;
+                }
+                if let Some((avg, p95, p99, std)) = summarize(&render_interval_samples_ms) {
+                    metrics.render_interval_avg_ms = avg;
+                    metrics.render_interval_p95_ms = p95;
+                    metrics.render_interval_p99_ms = p99;
+                    metrics.render_interval_std_ms = std;
+                }
                 info!(
                     capture_to_present_avg_ms = format!("{:.3}", avg),
                     capture_to_present_p50_ms = format!("{:.3}", sorted[idx(0.50)]),
                     capture_to_present_p95_ms = format!("{:.3}", sorted[idx(0.95)]),
                     capture_to_present_p99_ms = format!("{:.3}", sorted[idx(0.99)]),
+                    capture_to_present_std_ms = format!("{:.3}", metrics.present_std_ms),
                     samples = sorted.len(),
                     "[PRESENT-STATS]"
                 );
@@ -664,6 +771,35 @@ impl D3D11Renderer {
                     ),
                     uptime_s = format!("{:.2}", started_at.elapsed().as_secs_f64()),
                     "renderer progress"
+                );
+                info!(
+                    side = "controller_render",
+                    window_s = 1,
+                    fps_render = format!("{:.2}", render_fps),
+                    fps_receive = format!("{:.2}", recv_fps),
+                    stage_render_queue_wait_ms = format!("{:.3}", metrics.render_queue_wait_avg_ms),
+                    stage_render_queue_wait_p95_ms =
+                        format!("{:.3}", metrics.render_queue_wait_p95_ms),
+                    stage_render_queue_wait_p99_ms =
+                        format!("{:.3}", metrics.render_queue_wait_p99_ms),
+                    stage_render_queue_wait_std_ms =
+                        format!("{:.3}", metrics.render_queue_wait_std_ms),
+                    stage_render_interval_jitter_ms =
+                        format!("{:.3}", metrics.render_interval_std_ms),
+                    stage_render_interval_p95_ms = format!("{:.3}", metrics.render_interval_p95_ms),
+                    present_call_ms = format!("{:.3}", metrics.present_call_avg_ms),
+                    present_call_p95_ms = format!("{:.3}", metrics.present_call_p95_ms),
+                    present_call_p99_ms = format!("{:.3}", metrics.present_call_p99_ms),
+                    present_call_std_ms = format!("{:.3}", metrics.present_call_std_ms),
+                    stage_render_present_ms = format!("{:.3}", metrics.present_avg_ms),
+                    stage_render_present_p95_ms = format!("{:.3}", metrics.present_p95_ms),
+                    stage_render_present_p99_ms = format!("{:.3}", metrics.present_p99_ms),
+                    stage_render_present_std_ms = format!("{:.3}", metrics.present_std_ms),
+                    overall_capture_to_present_ms = format!("{:.3}", metrics.present_avg_ms),
+                    overall_capture_to_present_p95_ms = format!("{:.3}", metrics.present_p95_ms),
+                    render_mode = render_mode.as_str(),
+                    sr_mode = d3d.sr_mode.as_str(),
+                    "[PIPELINE-STATS]"
                 );
                 last_rate_sample = Instant::now();
                 last_rendered_count = rendered;
@@ -1389,6 +1525,7 @@ struct D3DContext {
     present_min_interval: Option<Duration>,
     last_present_at: Option<Instant>,
     present_spin_us: u64,
+    last_present_call_ms: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1771,6 +1908,7 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
                     .ok()
                     .and_then(|v| v.parse::<u64>().ok())
                     .unwrap_or(200),
+                last_present_call_ms: 0.0,
             })
         }
     }
@@ -2352,10 +2490,17 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
         Ok(())
     }
 
-    fn present_swapchain(&self) -> windows::core::HRESULT {
+    fn present_swapchain(&mut self) -> windows::core::HRESULT {
         let (sync_interval, flags) =
             present_params(self.vsync, self.allow_tearing, self.low_latency_mode);
-        unsafe { self.swap_chain.Present(sync_interval, flags) }
+        let t0 = Instant::now();
+        let hr = unsafe { self.swap_chain.Present(sync_interval, flags) };
+        self.last_present_call_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        hr
+    }
+
+    fn last_present_call_ms(&self) -> f64 {
+        self.last_present_call_ms
     }
 
     fn wait_present_interval(&self) {

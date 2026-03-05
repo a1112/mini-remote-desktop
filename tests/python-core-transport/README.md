@@ -44,6 +44,13 @@ python .\tests\python-core-transport\run_codec_roi_matrix.py
 The matrix report now includes `roi_mode` comparison (`quality` vs `performance(requireNative)`),
 with delta columns to compare FPS / jitter / CPU / GPU against baseline mode.
 
+FPS cap tier matrix (72/120/144/180/240) across resolutions:
+
+```powershell
+cd J:\ProjectTest\remote-desktop\mini-remote-desktop
+python .\tests\python-core-transport\run_fps_tier_matrix.py --codec av1 --transport webtransport --tiers 72,120,144,180,240 --resolutions 1280x720,1920x1080
+```
+
 Direct single-suite run with forced codec/ROI and native ROI probe switch:
 
 ```powershell
@@ -57,6 +64,10 @@ A timestamped folder is created under `mini-remote-desktop/logs/`, containing:
 - `suite_result.json`
 - `suite_report.md`
 - per-transport logs (`signaling.*.log`, `agent.*.log`)
+
+The report also includes `Agent Pipeline` jitter metrics parsed from agent-side
+`[PIPELINE-STATS]` logs (capture / encode-output / send-interval / queue-wait / send std).
+Thresholds are configured under `thresholds.*.json -> thresholds.agent_pipeline_jitter`.
 
 ## Notes
 

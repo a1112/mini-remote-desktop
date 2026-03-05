@@ -712,6 +712,7 @@ async fn main() -> Result<()> {
             );
             let mut decode_samples_ms: std::collections::VecDeque<f64> = std::collections::VecDeque::with_capacity(1024);
             let mut frame_interval_ms: std::collections::VecDeque<f64> = std::collections::VecDeque::with_capacity(1024);
+            let mut rx_interval_ms: std::collections::VecDeque<f64> = std::collections::VecDeque::with_capacity(1024);
             let mut e2e_samples_ms: std::collections::VecDeque<f64> = std::collections::VecDeque::with_capacity(1024);
             let mut dropped_old_frames = 0u64;
             let mut decode_recover_stage = 0u8;
@@ -737,6 +738,7 @@ async fn main() -> Result<()> {
             let mut rx_stall_active = false;
             let mut rx_stall_flush_issued = false;
             let mut last_decoded_at: Option<std::time::Instant> = None;
+            let mut last_rx_sample_at: Option<std::time::Instant> = None;
             let mut last_stats_at = std::time::Instant::now();
             let decoder_backend_label = {
                 let d = decoder_clone.lock().await;
@@ -758,6 +760,15 @@ async fn main() -> Result<()> {
                 let mut rx = active_rx.lock().await;
                 let recv = tokio::time::timeout(Duration::from_millis(120), rx.recv()).await;
                 if let Ok(Some(frame)) = recv {
+                    let rx_now = std::time::Instant::now();
+                    if let Some(prev) = last_rx_sample_at {
+                        let delta_ms = rx_now.duration_since(prev).as_secs_f64() * 1000.0;
+                        if rx_interval_ms.len() >= 1024 {
+                            rx_interval_ms.pop_front();
+                        }
+                        rx_interval_ms.push_back(delta_ms);
+                    }
+                    last_rx_sample_at = Some(rx_now);
                     if rx_stall_active {
                         info!(
                             stall_ms = last_frame_rx_at.elapsed().as_millis() as u64,
@@ -1018,7 +1029,22 @@ async fn main() -> Result<()> {
                     decode_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                     let p95_idx = ((decode_sorted.len() as f64) * 0.95).floor() as usize;
                     let p95 = decode_sorted[p95_idx.min(decode_sorted.len().saturating_sub(1))];
+                    let p99_idx = ((decode_sorted.len() as f64) * 0.99).floor() as usize;
+                    let p99 = decode_sorted[p99_idx.min(decode_sorted.len().saturating_sub(1))];
                     let avg_decode = decode_sorted.iter().sum::<f64>() / decode_sorted.len() as f64;
+                    let decode_std = if decode_sorted.len() < 2 {
+                        0.0
+                    } else {
+                        let var = decode_sorted
+                            .iter()
+                            .map(|v| {
+                                let d = *v - avg_decode;
+                                d * d
+                            })
+                            .sum::<f64>()
+                            / decode_sorted.len() as f64;
+                        var.sqrt()
+                    };
                     let fps = if frame_interval_ms.is_empty() {
                         0.0
                     } else {
@@ -1038,6 +1064,28 @@ async fn main() -> Result<()> {
                             .sum::<f64>()
                             / frame_interval_ms.len() as f64;
                         var.sqrt()
+                    };
+                    let transport_jitter = if rx_interval_ms.len() < 2 {
+                        0.0
+                    } else {
+                        let mean = rx_interval_ms.iter().sum::<f64>() / rx_interval_ms.len() as f64;
+                        let var = rx_interval_ms
+                            .iter()
+                            .map(|v| {
+                                let d = v - mean;
+                                d * d
+                            })
+                            .sum::<f64>()
+                            / rx_interval_ms.len() as f64;
+                        var.sqrt()
+                    };
+                    let transport_iat_p95 = if rx_interval_ms.is_empty() {
+                        0.0
+                    } else {
+                        let mut sorted: Vec<f64> = rx_interval_ms.iter().copied().collect();
+                        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                        let idx = ((sorted.len() as f64) * 0.95).floor() as usize;
+                        sorted[idx.min(sorted.len().saturating_sub(1))]
                     };
                     let (e2e_avg, e2e_p50, e2e_p95, e2e_p99, e2e_samples) = if e2e_samples_ms.is_empty() {
                         (-1.0, -1.0, -1.0, -1.0, 0usize)
@@ -1069,7 +1117,11 @@ async fn main() -> Result<()> {
                         fps = format!("{:.2}", fps),
                         avg_decode_ms = format!("{:.3}", avg_decode),
                         p95_decode_ms = format!("{:.3}", p95),
+                        p99_decode_ms = format!("{:.3}", p99),
+                        std_decode_ms = format!("{:.3}", decode_std),
                         jitter_ms = format!("{:.3}", jitter),
+                        transport_iat_p95_ms = format!("{:.3}", transport_iat_p95),
+                        transport_jitter_ms = format!("{:.3}", transport_jitter),
                         e2e_avg_ms = format!("{:.3}", e2e_avg),
                         e2e_p50_ms = format!("{:.3}", e2e_p50),
                         e2e_p95_ms = format!("{:.3}", e2e_p95),
@@ -1078,6 +1130,22 @@ async fn main() -> Result<()> {
                         e2e_samples,
                         samples = decode_sorted.len(),
                         "[DECODER-STATS]"
+                    );
+                    info!(
+                        side = "controller_decode",
+                        window_s = 2,
+                        fps_decode = format!("{:.2}", fps),
+                        stage_decode_ms = format!("{:.3}", avg_decode),
+                        stage_decode_p95_ms = format!("{:.3}", p95),
+                        stage_decode_p99_ms = format!("{:.3}", p99),
+                        stage_decode_std_ms = format!("{:.3}", decode_std),
+                        jitter_ms = format!("{:.3}", jitter),
+                        stage_transport_iat_p95_ms = format!("{:.3}", transport_iat_p95),
+                        stage_transport_jitter_ms = format!("{:.3}", transport_jitter),
+                        overall_e2e_ms = format!("{:.3}", e2e_avg),
+                        overall_e2e_p95_ms = format!("{:.3}", e2e_p95),
+                        overall_e2e_p99_ms = format!("{:.3}", e2e_p99),
+                        "[PIPELINE-STATS]"
                     );
                     if let Ok(mut ov) = overlay_stats_for_decode.lock() {
                         ov.decode_fps = fps;
