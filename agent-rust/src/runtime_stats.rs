@@ -113,14 +113,28 @@ impl RuntimeStats {
             ((sorted.len() as f64 * p).floor() as usize).min(sorted.len().saturating_sub(1))
         };
         let avg_us = sorted.iter().map(|v| *v as f64).sum::<f64>() / sorted.len() as f64;
-        let var_us = sorted
+        // Robust std: suppress startup/occasional outliers by using central 90% band.
+        let low = sorted[idx(0.05)] as f64;
+        let high = sorted[idx(0.95)] as f64;
+        let core: Vec<f64> = sorted
+            .iter()
+            .map(|v| *v as f64)
+            .filter(|v| *v >= low && *v <= high)
+            .collect();
+        let std_base = if core.is_empty() {
+            sorted.iter().map(|v| *v as f64).collect::<Vec<f64>>()
+        } else {
+            core
+        };
+        let std_mean = std_base.iter().sum::<f64>() / std_base.len() as f64;
+        let var_us = std_base
             .iter()
             .map(|v| {
-                let d = *v as f64 - avg_us;
+                let d = *v - std_mean;
                 d * d
             })
             .sum::<f64>()
-            / sorted.len() as f64;
+            / std_base.len() as f64;
         StatSummaryMs {
             avg: avg_us / 1000.0,
             p50: sorted[idx(0.50)] as f64 / 1000.0,

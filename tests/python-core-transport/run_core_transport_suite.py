@@ -518,11 +518,11 @@ class CoreTransportSuite:
         analysis = self.analysis
         pacer = analysis.get("quic_pacer") or {}
         agent_env["AGENT_QUIC_PACE_ENABLE"] = str(
-            pacer.get("enable", False)
+            pacer.get("enable", True)
         ).lower().replace("true", "1").replace("false", "0")
         agent_env["AGENT_QUIC_PACE_MODE"] = str(pacer.get("mode", "manual"))
-        agent_env["AGENT_QUIC_PACE_INTERVAL_MS"] = str(int(pacer.get("interval_ms", 2)))
-        agent_env["AGENT_QUIC_PACE_BURST"] = str(int(pacer.get("burst", 4)))
+        agent_env["AGENT_QUIC_PACE_INTERVAL_MS"] = str(int(pacer.get("interval_ms", 1)))
+        agent_env["AGENT_QUIC_PACE_BURST"] = str(int(pacer.get("burst", 2)))
         agent_env["AGENT_QUIC_PACE_AUTO_ON_FULL"] = str(int(pacer.get("auto_on_full", 8)))
         agent_env["AGENT_QUIC_PACE_AUTO_OFF_OK"] = str(int(pacer.get("auto_off_ok", 64)))
         qrl = analysis.get("quic_queue_rate_link") or {}
