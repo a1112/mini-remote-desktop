@@ -1,5 +1,6 @@
 mod input;
 mod quic_rx;
+mod recorder;
 mod render;
 mod signaling;
 mod stats;
@@ -13,6 +14,7 @@ type FrameReceiver = Arc<Mutex<mpsc::Receiver<webrtc::peer::VideoFrame>>>;
 use anyhow::{Context, Result};
 use common_control_proto::ControlEvent;
 use quic_rx::{connect_quic_receiver, QuicConnectInfo};
+use recorder::{Recorder, RecordingConfig};
 use render::{D3D11Renderer, OverlaySwitchField};
 use serde_json::json;
 use signaling::client::SignalingConfig;
@@ -40,6 +42,8 @@ struct ControllerConfig {
     pub video: H264DecoderConfig,
     /// 渲染配置
     pub render: render::RendererConfig,
+    /// 录制配置
+    pub recording: RecordingConfig,
 }
 
 impl Default for ControllerConfig {
@@ -48,6 +52,7 @@ impl Default for ControllerConfig {
             signaling: SignalingConfig::default(),
             video: H264DecoderConfig::default(),
             render: render::RendererConfig::default(),
+            recording: RecordingConfig::default(),
         }
     }
 }
@@ -98,6 +103,42 @@ fn load_config(path: &PathBuf) -> Result<ControllerConfig> {
         .as_str()
         .map(|s| s.to_ascii_lowercase())
         .unwrap_or_else(|| "off".to_string());
+    let record_enabled = std::env::var("MRD_RECORD_ENABLE")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .or_else(|| json["record"]["enabled"].as_bool())
+        .unwrap_or(false);
+    let record_output_dir = std::env::var("MRD_RECORD_DIR")
+        .ok()
+        .or_else(|| json["record"]["output_dir"].as_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| "recordings".to_string());
+    let record_ffmpeg_path = std::env::var("MRD_RECORD_FFMPEG")
+        .ok()
+        .or_else(|| {
+            json["record"]["ffmpeg_path"]
+                .as_str()
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "ffmpeg".to_string());
+    let record_segment_seconds = std::env::var("MRD_RECORD_SEGMENT_SEC")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .or_else(|| json["record"]["segment_seconds"].as_u64().map(|v| v as u32))
+        .unwrap_or(60);
+    let record_input_fps = std::env::var("MRD_RECORD_FPS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .or_else(|| json["record"]["input_fps"].as_u64().map(|v| v as u32))
+        .unwrap_or(60);
+    let record_container = std::env::var("MRD_RECORD_CONTAINER")
+        .ok()
+        .or_else(|| json["record"]["container"].as_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| "mp4".to_string());
+    let record_queue_depth = std::env::var("MRD_RECORD_QUEUE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .or_else(|| json["record"]["queue_depth"].as_u64().map(|v| v as usize))
+        .unwrap_or(512);
 
     Ok(ControllerConfig {
         signaling: SignalingConfig {
@@ -113,6 +154,15 @@ fn load_config(path: &PathBuf) -> Result<ControllerConfig> {
         render: render::RendererConfig {
             sr_mode,
             ..render::RendererConfig::default()
+        },
+        recording: RecordingConfig {
+            enabled: record_enabled,
+            output_dir: record_output_dir,
+            ffmpeg_path: record_ffmpeg_path,
+            segment_seconds: record_segment_seconds,
+            input_fps: record_input_fps,
+            container: record_container,
+            queue_depth: record_queue_depth,
         },
     })
 }
@@ -484,6 +534,7 @@ async fn main() -> Result<()> {
         device_name = %config.signaling.device_name,
         transport = %config.signaling.preferred_transport,
         sr_mode = %config.render.sr_mode,
+        recording_enabled = config.recording.enabled,
         "loaded configuration"
     );
     let allow_mf_on_webrtc = std::env::var("MRD_ALLOW_MF_ON_WEBRTC")
@@ -522,6 +573,7 @@ async fn main() -> Result<()> {
         ov.selected_transport = config.signaling.preferred_transport.clone();
         ov.media_path = "webrtc".to_string();
     }
+    let recorder = Arc::new(Recorder::new(config.recording.clone())?);
 
     // 创建解码器
     let decoder = Arc::new(Mutex::new(H264Decoder::new(config.video.clone())?));
@@ -573,6 +625,7 @@ async fn main() -> Result<()> {
     let video_cfg_for_recover = config.video.clone();
     let render_sink = renderer.frame_sink();
     let overlay_stats_for_decode = overlay_stats.clone();
+    let recorder_for_decode = recorder.clone();
 
     // 启动视频帧处理任务
     let frame_receiver_clone = frame_receiver.clone();
@@ -684,6 +737,7 @@ async fn main() -> Result<()> {
                     let (newest, dropped_now) =
                         select_frame_for_decode(&mut rx, frame, decode_select_policy);
                     dropped_old_frames = dropped_old_frames.saturating_add(dropped_now);
+                    recorder_for_decode.record_frame(&newest);
                     drop(rx);
                     let decode_started = std::time::Instant::now();
                     let count = frame_count_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -1001,6 +1055,16 @@ async fn main() -> Result<()> {
                         ov.e2e_p95_ms = e2e_p95;
                         ov.e2e_p99_ms = e2e_p99;
                     }
+                    let rec = recorder_for_decode.snapshot();
+                    info!(
+                        in_frames = rec.in_frames,
+                        written_frames = rec.written_frames,
+                        dropped_frames = rec.dropped_frames,
+                        write_failures = rec.write_failures,
+                        bytes_written = rec.bytes_written,
+                        avg_write_us = format!("{:.1}", rec.avg_write_us),
+                        "[RECORD-STATS]"
+                    );
                     last_stats_at = std::time::Instant::now();
                 }
                 // TODO: 解码并渲染视频帧
