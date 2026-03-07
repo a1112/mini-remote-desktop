@@ -11,7 +11,7 @@ use mrd_render::{
 use mrd_render_d3d11::D3d11RendererFactory;
 use serde::{Deserialize, Serialize};
 
-use crate::frame_sink::DecodedFrameSink;
+use crate::frame_sink::{DecodedFrameSink, DEFAULT_SOURCE_ID};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedFrameSnapshotResponse {
@@ -31,6 +31,8 @@ pub struct RenderHostSnapshot {
     pub preview_data_url: Option<String>,
     pub renderer_backend: Option<String>,
     pub renderer_snapshot: Option<RendererSnapshotResponse>,
+    pub surface_source_bindings: Vec<SurfaceSourceBindingResponse>,
+    pub available_source_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,8 +44,15 @@ pub struct RendererSnapshotResponse {
     pub last_pixel_format: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SurfaceSourceBindingResponse {
+    pub surface_id: String,
+    pub source_id: String,
+}
+
 pub struct RenderHost {
     renderers: HashMap<SessionId, HashMap<String, BoxedRenderer>>,
+    surface_sources: HashMap<SessionId, HashMap<String, String>>,
     frame_sink: Option<Arc<Mutex<DecodedFrameSink>>>,
 }
 
@@ -51,6 +60,7 @@ impl RenderHost {
     pub fn with_frame_sink(frame_sink: Arc<Mutex<DecodedFrameSink>>) -> Self {
         Self {
             renderers: HashMap::new(),
+            surface_sources: HashMap::new(),
             frame_sink: Some(frame_sink),
         }
     }
@@ -61,7 +71,7 @@ impl RenderHost {
         surface_id: String,
         window_handle: isize,
     ) -> Result<(), String> {
-        let renderers = self.renderers.entry(session_id).or_default();
+        let renderers = self.renderers.entry(session_id.clone()).or_default();
         if !renderers.contains_key(&surface_id) {
             let factory = D3d11RendererFactory;
             let mut renderer = factory
@@ -70,13 +80,19 @@ impl RenderHost {
             renderer
                 .attach_target(RenderTarget::WindowHandle(window_handle))
                 .map_err(|error| format!("attach renderer target failed: {error}"))?;
-            renderers.insert(surface_id, renderer);
+            renderers.insert(surface_id.clone(), renderer);
         }
+        self.surface_sources
+            .entry(session_id)
+            .or_default()
+            .entry(surface_id)
+            .or_insert_with(|| DEFAULT_SOURCE_ID.to_string());
         Ok(())
     }
 
     pub fn detach_session(&mut self, session_id: &SessionId) {
         self.renderers.remove(session_id);
+        self.surface_sources.remove(session_id);
     }
 
     pub fn detach_surface(&mut self, session_id: &SessionId, surface_id: &str) {
@@ -86,6 +102,29 @@ impl RenderHost {
                 self.renderers.remove(session_id);
             }
         }
+        if let Some(surface_sources) = self.surface_sources.get_mut(session_id) {
+            surface_sources.remove(surface_id);
+            if surface_sources.is_empty() {
+                self.surface_sources.remove(session_id);
+            }
+        }
+    }
+
+    pub fn bind_surface_source(
+        &mut self,
+        session_id: &SessionId,
+        surface_id: &str,
+        source_id: String,
+    ) -> Result<(), String> {
+        let surface_sources = self
+            .surface_sources
+            .get_mut(session_id)
+            .ok_or_else(|| format!("未找到会话 renderer: {}", session_id.0))?;
+        if !surface_sources.contains_key(surface_id) {
+            return Err(format!("未找到 surface: {}", surface_id));
+        }
+        surface_sources.insert(surface_id.to_string(), source_id);
+        Ok(())
     }
 
     pub fn snapshot(&mut self, session_id: &SessionId) -> Result<RenderHostSnapshot, String> {
@@ -105,6 +144,8 @@ impl RenderHost {
                 preview_data_url: None,
                 renderer_backend: None,
                 renderer_snapshot: None,
+                surface_source_bindings: Vec::new(),
+                available_source_ids: Vec::new(),
             });
         };
 
@@ -115,14 +156,49 @@ impl RenderHost {
                 frame_sink.latest_frame(session_id).cloned(),
             )
         };
+        let available_source_ids = {
+            let frame_sink = frame_sink.lock().expect("lock decoded frame sink");
+            frame_sink.list_sources(session_id)
+        };
+        let surface_source_bindings = self
+            .surface_sources
+            .get(session_id)
+            .map(|bindings| {
+                bindings
+                    .iter()
+                    .map(|(surface_id, source_id)| SurfaceSourceBindingResponse {
+                        surface_id: surface_id.clone(),
+                        source_id: source_id.clone(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
 
         if let (Some(surface_renderers), Some(frame_to_upload)) =
             (self.renderers.get_mut(session_id), latest_frame.as_ref())
         {
-            let render_frame = decoded_frame_to_render_frame(frame_to_upload);
-            for renderer in surface_renderers.values_mut() {
+            let latest_source_frames = {
+                let frame_sink = frame_sink.lock().expect("lock decoded frame sink");
+                available_source_ids
+                    .iter()
+                    .filter_map(|source_id| {
+                        frame_sink
+                            .latest_frame_for_source(session_id, source_id)
+                            .cloned()
+                            .map(|frame| (source_id.clone(), frame))
+                    })
+                    .collect::<HashMap<_, _>>()
+            };
+            for (surface_id, renderer) in surface_renderers.iter_mut() {
+                let source_bound_frame = self
+                    .surface_sources
+                    .get(session_id)
+                    .and_then(|bindings| bindings.get(surface_id))
+                    .and_then(|source_id| latest_source_frames.get(source_id));
+                let render_frame =
+                    decoded_frame_to_render_frame(source_bound_frame.unwrap_or(frame_to_upload));
                 renderer
-                    .upload_frame(render_frame.clone())
+                    .upload_frame(render_frame)
                     .map_err(|error| format!("upload latest frame to renderer failed: {error}"))?;
             }
         }
@@ -145,6 +221,8 @@ impl RenderHost {
                 .get(session_id)
                 .and_then(|renderers| (!renderers.is_empty()).then(|| "d3d11".to_string())),
             renderer_snapshot,
+            surface_source_bindings,
+            available_source_ids,
         })
     }
 }
@@ -153,6 +231,7 @@ impl Default for RenderHost {
     fn default() -> Self {
         Self {
             renderers: HashMap::new(),
+            surface_sources: HashMap::new(),
             frame_sink: None,
         }
     }
@@ -235,8 +314,8 @@ fn renderer_snapshot_response(snapshot: RendererSnapshot) -> RendererSnapshotRes
 
 #[cfg(test)]
 mod tests {
-    use super::RenderHost;
-    use crate::frame_sink::DecodedFrameSink;
+    use super::{RenderHost, SurfaceSourceBindingResponse};
+    use crate::frame_sink::{DecodedFrameSink, DEFAULT_SOURCE_ID};
     use mrd_decode::{DecodedFrame, PixelFormat};
     use mrd_proto::SessionId;
 
@@ -267,6 +346,13 @@ mod tests {
         assert!(snapshot.attached);
         assert_eq!(snapshot.surface_count, 1);
         assert_eq!(snapshot.attached_surface_ids, vec!["surface-1".to_string()]);
+        assert_eq!(
+            snapshot.surface_source_bindings,
+            vec![SurfaceSourceBindingResponse {
+                surface_id: "surface-1".to_string(),
+                source_id: DEFAULT_SOURCE_ID.to_string(),
+            }]
+        );
         assert_eq!(snapshot.frame.as_ref().map(|frame| frame.width), Some(4));
         assert_eq!(snapshot.renderer_backend.as_deref(), Some("d3d11"));
         assert_eq!(

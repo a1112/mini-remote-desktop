@@ -40,6 +40,7 @@ pub struct WebrtcHostSnapshot {
     pub last_decoded_width: usize,
     pub last_decoded_height: usize,
     pub last_decoded_pixel_format: Option<String>,
+    pub available_video_source_ids: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -297,11 +298,16 @@ async fn build_peer_connection(
         let access_unit_counter = on_track_access_unit_counter.clone();
         Box::pin(async move {
             let mime_type = track.codec().capability.mime_type.clone();
-            {
+            let source_id = {
                 let mut snapshot = snapshot.lock().expect("lock host snapshot");
                 snapshot.remote_video_track_count += 1;
                 snapshot.last_remote_codec = Some(mime_type.clone());
-            }
+                let source_id = format!("video-track-{}", snapshot.remote_video_track_count);
+                if !snapshot.available_video_source_ids.contains(&source_id) {
+                    snapshot.available_video_source_ids.push(source_id.clone());
+                }
+                source_id
+            };
 
             let mut h264_assembler = if mime_type.eq_ignore_ascii_case("video/h264") {
                 Some(H264AccessUnitAssembler::default())
@@ -332,6 +338,7 @@ async fn build_peer_connection(
                     if let Some(decoder) = decoder.as_mut() {
                         let _ = decode_access_unit_into_snapshot(
                             session_id.clone(),
+                            source_id.clone(),
                             snapshot.clone(),
                             frame_sink.clone(),
                             decoder.as_mut(),
@@ -349,6 +356,7 @@ async fn build_peer_connection(
 
 fn decode_access_unit_into_snapshot(
     session_id: SessionId,
+    source_id: String,
     snapshot: Arc<Mutex<WebrtcHostSnapshot>>,
     frame_sink: Option<Arc<Mutex<DecodedFrameSink>>>,
     decoder: &mut dyn VideoDecoder,
@@ -358,12 +366,13 @@ fn decode_access_unit_into_snapshot(
         .push_access_unit(access_unit)
         .map_err(|e| format!("software decoder 解码 access unit 失败: {e}"))?;
     let frames = decoder.drain_decoded_frames();
-    apply_decoded_frames_to_snapshot(session_id, snapshot, frame_sink, frames);
+    apply_decoded_frames_to_snapshot(session_id, source_id, snapshot, frame_sink, frames);
     Ok(())
 }
 
 fn apply_decoded_frames_to_snapshot(
     session_id: SessionId,
+    source_id: String,
     snapshot: Arc<Mutex<WebrtcHostSnapshot>>,
     frame_sink: Option<Arc<Mutex<DecodedFrameSink>>>,
     frames: Vec<DecodedFrame>,
@@ -384,7 +393,7 @@ fn apply_decoded_frames_to_snapshot(
             frame_sink
                 .lock()
                 .expect("lock decoded frame sink")
-                .ingest_frame(session_id.clone(), frame);
+                .ingest_frame_for_source(session_id.clone(), source_id.clone(), frame);
         }
     }
 }
@@ -423,6 +432,7 @@ mod tests {
         assert_eq!(snapshot.last_decoded_width, 0);
         assert_eq!(snapshot.last_decoded_height, 0);
         assert_eq!(snapshot.last_decoded_pixel_format, None);
+        assert!(snapshot.available_video_source_ids.is_empty());
     }
 
     #[tokio::test]
@@ -479,6 +489,7 @@ mod tests {
         let mut decoder = mrd_decode::create_decoder("h264_software").expect("decoder instance");
         decode_access_unit_into_snapshot(
             SessionId("session-3".into()),
+            "video-track-1".to_string(),
             snapshot.clone(),
             None,
             decoder.as_mut(),

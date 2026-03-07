@@ -24,6 +24,7 @@ import { withTauriWindow } from "../utils/tauriWindow";
 import { isTauriRuntime } from "../utils/runtime";
 import {
   attachRenderHostSession,
+  bindRenderSurfaceSource,
   detachRenderHostSession,
   getRenderHostSnapshot,
   type RenderHostSnapshot,
@@ -65,6 +66,7 @@ export function RemoteSessionPage() {
   const [renderSurfaces, setRenderSurfaces] = useState<RenderSurfaceDescriptor[]>([]);
   const [selectedSessionSurfaceId, setSelectedSessionSurfaceId] = useState<string | null>(null);
   const [newSurfaceName, setNewSurfaceName] = useState("");
+  const [selectedSourceId, setSelectedSourceId] = useState<string | null>(null);
 
   const noDragSelector =
     'button, a, input, select, textarea, [role="button"], [role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"], [data-radix-collection-item], [data-no-drag="true"]';
@@ -92,7 +94,10 @@ export function RemoteSessionPage() {
 
     const refreshSnapshot = async () => {
       const snapshot = await getRenderHostSnapshot(id);
-      if (active) setRenderSnapshot(snapshot);
+      if (active) {
+        setRenderSnapshot(snapshot);
+        setSelectedSourceId((current) => current ?? snapshot.available_source_ids[0] ?? null);
+      }
     };
 
     void attachRenderHostSession(id)
@@ -242,6 +247,12 @@ export function RemoteSessionPage() {
       setRenderSurfaces(await listRenderSurfaces(id));
       setRenderSnapshot(await getRenderHostSnapshot(id));
     }
+  };
+
+  const handleBindSurfaceSource = async () => {
+    if (!id || !selectedSessionSurfaceId || !selectedSourceId) return;
+    await bindRenderSurfaceSource(id, selectedSessionSurfaceId, selectedSourceId);
+    setRenderSnapshot(await getRenderHostSnapshot(id));
   };
 
   const handleTauriDragStart = (event: React.MouseEvent<HTMLDivElement>) => {
@@ -536,6 +547,51 @@ export function RemoteSessionPage() {
                   ) : (
                     <div className="text-gray-500" style={{ fontSize: 10 }}>
                       当前会话还没有显式 surface
+                    </div>
+                  )}
+                </div>
+              </div>
+              <div className="rounded-md bg-white/6 px-2 py-2">
+                <div className="mb-2 text-gray-400" style={{ fontSize: 10 }}>
+                  Surface Sources
+                </div>
+                <div className="flex gap-2">
+                  <select
+                    value={selectedSourceId ?? ""}
+                    onChange={(event) => setSelectedSourceId(event.target.value || null)}
+                    className="min-w-0 flex-1 rounded-md border border-white/10 bg-black/20 px-2 py-1 text-gray-200 outline-none"
+                    style={{ fontSize: 10 }}
+                  >
+                    <option value="">选择 source</option>
+                    {renderSnapshot?.available_source_ids.map((sourceId) => (
+                      <option key={sourceId} value={sourceId}>
+                        {sourceId}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    onClick={() => void handleBindSurfaceSource()}
+                    disabled={!selectedSessionSurfaceId || !selectedSourceId}
+                    className="rounded-md bg-fuchsia-500/15 px-2 py-1 text-fuchsia-200 hover:bg-fuchsia-500/25 disabled:cursor-not-allowed disabled:opacity-50"
+                    style={{ fontSize: 10 }}
+                  >
+                    绑定 source
+                  </button>
+                </div>
+                <div className="mt-2 space-y-1">
+                  {renderSnapshot?.surface_source_bindings.length ? (
+                    renderSnapshot.surface_source_bindings.map((binding) => (
+                      <div
+                        key={`${binding.surface_id}-${binding.source_id}`}
+                        className="rounded-md bg-white/6 px-2 py-1.5 text-gray-300"
+                        style={{ fontSize: 10 }}
+                      >
+                        {binding.surface_id} · {binding.source_id}
+                      </div>
+                    ))
+                  ) : (
+                    <div className="text-gray-500" style={{ fontSize: 10 }}>
+                      当前还没有显式 source 绑定
                     </div>
                   )}
                 </div>

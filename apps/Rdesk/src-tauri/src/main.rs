@@ -82,6 +82,7 @@ struct WebrtcHostSnapshotResponse {
     last_decoded_width: usize,
     last_decoded_height: usize,
     last_decoded_pixel_format: Option<String>,
+    available_video_source_ids: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -102,6 +103,8 @@ struct RenderHostSnapshotResponse {
     preview_data_url: Option<String>,
     renderer_backend: Option<String>,
     renderer_snapshot: Option<RendererSnapshotResponse>,
+    surface_source_bindings: Vec<SurfaceSourceBindingResponseResponse>,
+    available_source_ids: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -120,6 +123,12 @@ struct RenderSurfaceDescriptorResponse {
     name: String,
     role: String,
     current: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct SurfaceSourceBindingResponseResponse {
+    surface_id: String,
+    source_id: String,
 }
 
 /// Tauri 命令：获取硬件信息
@@ -511,6 +520,20 @@ async fn render_host_snapshot(
 }
 
 #[tauri::command]
+async fn bind_render_surface_source(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+    surface_id: String,
+    source_id: String,
+) -> Result<(), String> {
+    state
+        .render_host
+        .lock()
+        .expect("lock render host")
+        .bind_surface_source(&SessionId(session_id), &surface_id, source_id)
+}
+
+#[tauri::command]
 fn open_render_window(app: tauri::AppHandle, session_id: String) -> Result<String, String> {
     let state = app.state::<AppState>();
     let surface_id = state
@@ -796,6 +819,7 @@ fn webrtc_host_snapshot_response(snapshot: &WebrtcHostSnapshot) -> WebrtcHostSna
         last_decoded_width: snapshot.last_decoded_width,
         last_decoded_height: snapshot.last_decoded_height,
         last_decoded_pixel_format: snapshot.last_decoded_pixel_format.clone(),
+        available_video_source_ids: snapshot.available_video_source_ids.clone(),
     }
 }
 
@@ -826,6 +850,15 @@ fn render_host_snapshot_response(snapshot: RenderHostSnapshot) -> RenderHostSnap
         preview_data_url: snapshot.preview_data_url,
         renderer_backend: snapshot.renderer_backend,
         renderer_snapshot: snapshot.renderer_snapshot,
+        surface_source_bindings: snapshot
+            .surface_source_bindings
+            .into_iter()
+            .map(|binding| SurfaceSourceBindingResponseResponse {
+                surface_id: binding.surface_id,
+                source_id: binding.source_id,
+            })
+            .collect(),
+        available_source_ids: snapshot.available_source_ids,
     }
 }
 
@@ -1102,6 +1135,7 @@ fn main() {
             decoded_frame_snapshot,
             decoded_frame_preview,
             render_host_attach_session,
+            bind_render_surface_source,
             bind_current_render_window_surface,
             render_host_detach_session,
             render_host_snapshot,

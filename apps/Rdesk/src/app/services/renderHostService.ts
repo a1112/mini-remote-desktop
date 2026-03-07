@@ -20,6 +20,11 @@ export type RenderHostSnapshot = {
     last_height: number;
     last_pixel_format: string | null;
   } | null;
+  surface_source_bindings: {
+    surface_id: string;
+    source_id: string;
+  }[];
+  available_source_ids: string[];
 };
 
 export const attachRenderHostSession = async (sessionId: string): Promise<void> =>
@@ -37,4 +42,15 @@ export const getRenderHostSnapshot = async (
 ): Promise<RenderHostSnapshot> =>
   invoke<RenderHostSnapshot>("render_host_snapshot", {
     sessionId,
+  });
+
+export const bindRenderSurfaceSource = async (
+  sessionId: string,
+  surfaceId: string,
+  sourceId: string
+): Promise<void> =>
+  invoke("bind_render_surface_source", {
+    sessionId,
+    surfaceId,
+    sourceId,
   });
