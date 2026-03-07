@@ -393,14 +393,16 @@ async fn decoded_frame_preview(
 
 #[tauri::command]
 async fn render_host_attach_session(
+    window: tauri::Window,
     state: tauri::State<'_, AppState>,
     session_id: String,
 ) -> Result<(), String> {
+    let window_handle = current_window_handle(&window)?;
     state
         .render_host
         .lock()
         .expect("lock render host")
-        .attach_session(SessionId(session_id))
+        .attach_session(SessionId(session_id), window_handle)
 }
 
 #[tauri::command]
@@ -596,6 +598,22 @@ fn render_host_snapshot_response(snapshot: RenderHostSnapshot) -> RenderHostSnap
         preview_data_url: snapshot.preview_data_url,
         renderer_backend: snapshot.renderer_backend,
         renderer_snapshot: snapshot.renderer_snapshot,
+    }
+}
+
+fn current_window_handle(window: &tauri::Window) -> Result<isize, String> {
+    #[cfg(target_os = "windows")]
+    {
+        return window
+            .hwnd()
+            .map(|hwnd| hwnd.0)
+            .map_err(|error| format!("获取窗口句柄失败: {error}"));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = window;
+        Err("当前平台不支持窗口句柄渲染目标".to_string())
     }
 }
 
@@ -1157,7 +1175,7 @@ mod tests {
                 },
             );
         let mut render_host = RenderHost::with_frame_sink(sink);
-        let _ = render_host.attach_session(SessionId("session-render".into()));
+        let _ = render_host.attach_session(SessionId("session-render".into()), 0);
 
         let response = render_host_snapshot_response(
             render_host

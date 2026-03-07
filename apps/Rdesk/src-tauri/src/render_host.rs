@@ -55,7 +55,11 @@ impl RenderHost {
         }
     }
 
-    pub fn attach_session(&mut self, session_id: SessionId) -> Result<(), String> {
+    pub fn attach_session(
+        &mut self,
+        session_id: SessionId,
+        window_handle: isize,
+    ) -> Result<(), String> {
         self.attached_sessions.insert(session_id.clone());
         if !self.renderers.contains_key(&session_id) {
             let factory = D3d11RendererFactory;
@@ -63,7 +67,7 @@ impl RenderHost {
                 .create()
                 .map_err(|error| format!("create d3d11 renderer failed: {error}"))?;
             renderer
-                .attach_target(RenderTarget::WindowHandle(0))
+                .attach_target(RenderTarget::WindowHandle(window_handle))
                 .map_err(|error| format!("attach renderer target failed: {error}"))?;
             self.renderers.insert(session_id, renderer);
         }
@@ -231,7 +235,7 @@ mod tests {
 
         let mut render_host = RenderHost::with_frame_sink(sink);
         render_host
-            .attach_session(SessionId("session-render".into()))
+            .attach_session(SessionId("session-render".into()), 0)
             .expect("attach session");
 
         let snapshot = render_host
