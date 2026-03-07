@@ -21,6 +21,8 @@ base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png"] }
 mrd-proto = { path = "../../../crates/mrd-proto" }
 mrd-decode = { path = "../../../crates/mrd-decode" }
+mrd-render = { path = "../../../crates/mrd-render" }
+mrd-render-d3d11 = { path = "../../../crates/mrd-render-d3d11" }
 mrd-signal-client = { path = "../../../crates/mrd-signal-client" }
 mrd-signal-proto = { path = "../../../crates/mrd-signal-proto" }
 serde_json = "1.0"

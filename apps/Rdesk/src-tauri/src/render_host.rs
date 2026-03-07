@@ -1,10 +1,15 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 
-use mrd_proto::SessionId;
 use image::{codecs::png::PngEncoder, ColorType, ImageEncoder};
+use mrd_proto::SessionId;
+use mrd_render::{
+    BoxedRenderer, RenderFrame, RenderPixelFormat, RenderTarget, RendererFactory, RendererSnapshot,
+};
+use mrd_render_d3d11::D3d11RendererFactory;
+use serde::{Deserialize, Serialize};
 
 use crate::frame_sink::DecodedFrameSink;
 
@@ -22,11 +27,22 @@ pub struct RenderHostSnapshot {
     pub attached: bool,
     pub frame: Option<DecodedFrameSnapshotResponse>,
     pub preview_data_url: Option<String>,
+    pub renderer_backend: Option<String>,
+    pub renderer_snapshot: Option<RendererSnapshotResponse>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RendererSnapshotResponse {
+    pub attached_to_target: bool,
+    pub uploaded_frame_count: u64,
+    pub last_width: usize,
+    pub last_height: usize,
+    pub last_pixel_format: Option<String>,
+}
+
 pub struct RenderHost {
     attached_sessions: HashSet<SessionId>,
+    renderers: HashMap<SessionId, BoxedRenderer>,
     frame_sink: Option<Arc<Mutex<DecodedFrameSink>>>,
 }
 
@@ -34,40 +50,85 @@ impl RenderHost {
     pub fn with_frame_sink(frame_sink: Arc<Mutex<DecodedFrameSink>>) -> Self {
         Self {
             attached_sessions: HashSet::new(),
+            renderers: HashMap::new(),
             frame_sink: Some(frame_sink),
         }
     }
 
-    pub fn attach_session(&mut self, session_id: SessionId) {
-        self.attached_sessions.insert(session_id);
+    pub fn attach_session(&mut self, session_id: SessionId) -> Result<(), String> {
+        self.attached_sessions.insert(session_id.clone());
+        if !self.renderers.contains_key(&session_id) {
+            let factory = D3d11RendererFactory;
+            let mut renderer = factory
+                .create()
+                .map_err(|error| format!("create d3d11 renderer failed: {error}"))?;
+            renderer
+                .attach_target(RenderTarget::WindowHandle(0))
+                .map_err(|error| format!("attach renderer target failed: {error}"))?;
+            self.renderers.insert(session_id, renderer);
+        }
+        Ok(())
     }
 
     pub fn detach_session(&mut self, session_id: &SessionId) {
         self.attached_sessions.remove(session_id);
+        self.renderers.remove(session_id);
     }
 
-    pub fn snapshot(&self, session_id: &SessionId) -> Result<RenderHostSnapshot, String> {
+    pub fn snapshot(&mut self, session_id: &SessionId) -> Result<RenderHostSnapshot, String> {
         let attached = self.attached_sessions.contains(session_id);
         let Some(frame_sink) = self.frame_sink.as_ref() else {
             return Ok(RenderHostSnapshot {
                 attached,
                 frame: None,
                 preview_data_url: None,
+                renderer_backend: None,
+                renderer_snapshot: None,
             });
         };
 
-        let frame = frame_sink
-            .lock()
-            .expect("lock decoded frame sink")
-            .snapshot(session_id)
-            .map(decoded_frame_snapshot_response);
+        let (frame, latest_frame) = {
+            let frame_sink = frame_sink.lock().expect("lock decoded frame sink");
+            (
+                frame_sink.snapshot(session_id).map(decoded_frame_snapshot_response),
+                frame_sink.latest_frame(session_id).cloned(),
+            )
+        };
+
+        if let (Some(renderer), Some(frame_to_upload)) =
+            (self.renderers.get_mut(session_id), latest_frame.as_ref())
+        {
+            renderer
+                .upload_frame(decoded_frame_to_render_frame(frame_to_upload))
+                .map_err(|error| format!("upload latest frame to renderer failed: {error}"))?;
+        }
+
         let preview_data_url = decoded_frame_preview_with(frame_sink.as_ref(), session_id.0.clone())?;
+        let renderer_snapshot = self
+            .renderers
+            .get(session_id)
+            .map(|renderer| renderer_snapshot_response(renderer.snapshot()));
 
         Ok(RenderHostSnapshot {
             attached,
             frame,
             preview_data_url,
+            renderer_backend: self
+                .renderers
+                .get(session_id)
+                .map(|_| "d3d11".to_string()),
+            renderer_snapshot,
         })
+    }
+}
+
+impl Default for RenderHost {
+    fn default() -> Self {
+        Self {
+            attached_sessions: HashSet::new(),
+            renderers: HashMap::new(),
+            frame_sink: None,
+        }
     }
 }
 
@@ -123,6 +184,29 @@ pub fn render_host_snapshot_with(
         .snapshot(&SessionId(session_id))
 }
 
+fn decoded_frame_to_render_frame(frame: &mrd_decode::DecodedFrame) -> RenderFrame {
+    RenderFrame {
+        width: frame.width,
+        height: frame.height,
+        pixel_format: match frame.pixel_format {
+            mrd_decode::PixelFormat::Rgb24 => RenderPixelFormat::Rgb24,
+        },
+        data: frame.data.clone(),
+    }
+}
+
+fn renderer_snapshot_response(snapshot: RendererSnapshot) -> RendererSnapshotResponse {
+    RendererSnapshotResponse {
+        attached_to_target: snapshot.attached_to_target,
+        uploaded_frame_count: snapshot.uploaded_frame_count,
+        last_width: snapshot.last_width,
+        last_height: snapshot.last_height,
+        last_pixel_format: snapshot.last_pixel_format.map(|format| match format {
+            RenderPixelFormat::Rgb24 => "Rgb24".to_string(),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::RenderHost;
@@ -146,7 +230,9 @@ mod tests {
             );
 
         let mut render_host = RenderHost::with_frame_sink(sink);
-        render_host.attach_session(SessionId("session-render".into()));
+        render_host
+            .attach_session(SessionId("session-render".into()))
+            .expect("attach session");
 
         let snapshot = render_host
             .snapshot(&SessionId("session-render".into()))
@@ -154,6 +240,14 @@ mod tests {
 
         assert!(snapshot.attached);
         assert_eq!(snapshot.frame.as_ref().map(|frame| frame.width), Some(4));
+        assert_eq!(snapshot.renderer_backend.as_deref(), Some("d3d11"));
+        assert_eq!(
+            snapshot
+                .renderer_snapshot
+                .as_ref()
+                .map(|renderer| renderer.uploaded_frame_count),
+            Some(1)
+        );
         assert!(snapshot
             .preview_data_url
             .as_deref()

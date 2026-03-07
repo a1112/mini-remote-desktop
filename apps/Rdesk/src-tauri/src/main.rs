@@ -19,7 +19,9 @@ use mrd_signal_client::encode_message;
 use mrd_signal_proto::{IceCandidate, SessionDescription, SignalMessage};
 use realtime_management::{RealtimeManagementClient, RealtimeStatus};
 use realtime_runtime::{RealtimeRegistration, RealtimeRuntime};
-use render_host::{render_host_snapshot_with, RenderHost, RenderHostSnapshot};
+use render_host::{
+    render_host_snapshot_with, RenderHost, RenderHostSnapshot, RendererSnapshotResponse,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tokio::sync::Mutex;
@@ -89,6 +91,8 @@ struct RenderHostSnapshotResponse {
     attached: bool,
     frame: Option<DecodedFrameSnapshotResponse>,
     preview_data_url: Option<String>,
+    renderer_backend: Option<String>,
+    renderer_snapshot: Option<RendererSnapshotResponse>,
 }
 
 /// Tauri 命令：获取硬件信息
@@ -396,8 +400,7 @@ async fn render_host_attach_session(
         .render_host
         .lock()
         .expect("lock render host")
-        .attach_session(SessionId(session_id));
-    Ok(())
+        .attach_session(SessionId(session_id))
 }
 
 #[tauri::command]
@@ -591,6 +594,8 @@ fn render_host_snapshot_response(snapshot: RenderHostSnapshot) -> RenderHostSnap
             bytes: frame.bytes,
         }),
         preview_data_url: snapshot.preview_data_url,
+        renderer_backend: snapshot.renderer_backend,
+        renderer_snapshot: snapshot.renderer_snapshot,
     }
 }
 
@@ -1152,7 +1157,7 @@ mod tests {
                 },
             );
         let mut render_host = RenderHost::with_frame_sink(sink);
-        render_host.attach_session(SessionId("session-render".into()));
+        let _ = render_host.attach_session(SessionId("session-render".into()));
 
         let response = render_host_snapshot_response(
             render_host

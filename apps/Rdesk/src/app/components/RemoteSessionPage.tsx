@@ -287,6 +287,12 @@ export function RemoteSessionPage() {
         <div className="absolute bottom-3 left-3 px-2.5 py-1.5 rounded-lg bg-black/60 backdrop-blur-sm border border-white/10 text-gray-400" style={{ fontSize: 11 }}>
           {device.name} · {device.os} · {renderSnapshot?.frame ? `${renderSnapshot.frame.width}×${renderSnapshot.frame.height}` : "1920×1080"}
         </div>
+
+        <div className="absolute bottom-3 right-3 px-2.5 py-1.5 rounded-lg bg-black/60 backdrop-blur-sm border border-white/10 text-gray-400" style={{ fontSize: 11 }}>
+          {renderSnapshot?.renderer_backend
+            ? `${renderSnapshot.renderer_backend} · ${renderSnapshot.renderer_snapshot?.uploaded_frame_count ?? 0} uploads`
+            : "renderer idle"}
+        </div>
       </div>
 
       {/* Status bar */}

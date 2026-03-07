@@ -10,6 +10,14 @@ export type RenderHostSnapshot = {
     bytes: number;
   } | null;
   preview_data_url: string | null;
+  renderer_backend: string | null;
+  renderer_snapshot: {
+    attached_to_target: boolean;
+    uploaded_frame_count: number;
+    last_width: number;
+    last_height: number;
+    last_pixel_format: string | null;
+  } | null;
 };
 
 export const attachRenderHostSession = async (sessionId: string): Promise<void> =>

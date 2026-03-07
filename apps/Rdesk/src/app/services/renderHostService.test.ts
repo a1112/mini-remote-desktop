@@ -38,6 +38,14 @@ describe("renderHostService", () => {
         bytes: 2764800,
       },
       preview_data_url: "data:image/png;base64,abc123",
+      renderer_backend: "d3d11",
+      renderer_snapshot: {
+        attached_to_target: true,
+        uploaded_frame_count: 1,
+        last_width: 1280,
+        last_height: 720,
+        last_pixel_format: "Rgb24",
+      },
     });
 
     const { getRenderHostSnapshot } = await import("./renderHostService");
@@ -49,5 +57,7 @@ describe("renderHostService", () => {
     expect(snapshot.attached).toBe(true);
     expect(snapshot.frame?.width).toBe(1280);
     expect(snapshot.preview_data_url).toBe("data:image/png;base64,abc123");
+    expect(snapshot.renderer_backend).toBe("d3d11");
+    expect(snapshot.renderer_snapshot?.uploaded_frame_count).toBe(1);
   });
 });

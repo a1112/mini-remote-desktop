@@ -6,6 +6,8 @@ members = [
   "crates/mrd-decode",
   "crates/mrd-pipeline-core",
   "crates/mrd-proto",
+  "crates/mrd-render",
+  "crates/mrd-render-d3d11",
   "crates/mrd-session",
   "crates/mrd-signal-client",
   "crates/mrd-signal-proto",
