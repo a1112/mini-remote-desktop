@@ -1,0 +1,13 @@
+[package]
+name = "mrd-signal-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mrd-signal-proto = { path = "../mrd-signal-proto" }
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+mrd-proto = { path = "../mrd-proto" }
