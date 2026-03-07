@@ -67,6 +67,14 @@ export type WebrtcHostSnapshot = {
   lastDecodedPixelFormat?: string;
 };
 
+export type DecodedFrameSnapshot = {
+  frameCount: number;
+  width: number;
+  height: number;
+  pixelFormat?: string;
+  bytes: number;
+};
+
 type RealtimeRegistrationPayload = {
   handle: number;
   device_id: string;
@@ -224,5 +232,12 @@ export const getWebrtcHostSnapshot = async (
   sessionId: string
 ): Promise<WebrtcHostSnapshot | null> =>
   invoke<WebrtcHostSnapshot | null>("webrtc_host_snapshot", {
+    sessionId,
+  });
+
+export const getDecodedFrameSnapshot = async (
+  sessionId: string
+): Promise<DecodedFrameSnapshot | null> =>
+  invoke<DecodedFrameSnapshot | null>("decoded_frame_snapshot", {
     sessionId,
   });

@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod device_info;
+mod frame_sink;
 mod realtime_client;
 mod realtime_management;
 mod realtime_runtime;
@@ -10,6 +11,7 @@ mod webrtc_media;
 mod webrtc_session;
 
 use device_info::HardwareInfo;
+use frame_sink::{DecodedFrameSink, DecodedFrameSnapshot};
 use mrd_proto::{BackendRole, DeviceId, SessionId};
 use mrd_signal_client::encode_message;
 use mrd_signal_proto::{IceCandidate, SessionDescription, SignalMessage};
@@ -23,6 +25,7 @@ use webrtc_session::{WebrtcSessionCoordinator, WebrtcSessionSnapshot};
 
 #[derive(Clone)]
 struct AppState {
+    frame_sink: std::sync::Arc<std::sync::Mutex<DecodedFrameSink>>,
     realtime_runtime: RealtimeRuntime,
     webrtc_host: std::sync::Arc<Mutex<WebrtcHost>>,
     webrtc_sessions: std::sync::Arc<Mutex<WebrtcSessionCoordinator>>,
@@ -66,6 +69,15 @@ struct WebrtcHostSnapshotResponse {
     last_decoded_width: usize,
     last_decoded_height: usize,
     last_decoded_pixel_format: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct DecodedFrameSnapshotResponse {
+    frame_count: u64,
+    width: usize,
+    height: usize,
+    pixel_format: String,
+    bytes: usize,
 }
 
 /// Tauri 命令：获取硬件信息
@@ -348,6 +360,14 @@ async fn webrtc_host_snapshot(
     Ok(webrtc_host_snapshot_with(state.webrtc_host.as_ref(), session_id).await)
 }
 
+#[tauri::command]
+async fn decoded_frame_snapshot(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+) -> Result<Option<DecodedFrameSnapshotResponse>, String> {
+    Ok(decoded_frame_snapshot_with(state.frame_sink.as_ref(), session_id))
+}
+
 /// Tauri 命令：设备注册
 ///
 /// 调用后端 API 进行设备注册，后端根据主板序列号生成设备ID
@@ -491,6 +511,18 @@ fn webrtc_host_snapshot_response(snapshot: &WebrtcHostSnapshot) -> WebrtcHostSna
         last_decoded_width: snapshot.last_decoded_width,
         last_decoded_height: snapshot.last_decoded_height,
         last_decoded_pixel_format: snapshot.last_decoded_pixel_format.clone(),
+    }
+}
+
+fn decoded_frame_snapshot_response(snapshot: &DecodedFrameSnapshot) -> DecodedFrameSnapshotResponse {
+    DecodedFrameSnapshotResponse {
+        frame_count: snapshot.frame_count,
+        width: snapshot.width,
+        height: snapshot.height,
+        pixel_format: match snapshot.pixel_format {
+            mrd_decode::PixelFormat::Rgb24 => "Rgb24".to_string(),
+        },
+        bytes: snapshot.bytes,
     }
 }
 
@@ -646,11 +678,23 @@ async fn webrtc_host_snapshot_with(
         .map(|snapshot| webrtc_host_snapshot_response(&snapshot))
 }
 
+fn decoded_frame_snapshot_with(
+    sink: &std::sync::Mutex<DecodedFrameSink>,
+    session_id: String,
+) -> Option<DecodedFrameSnapshotResponse> {
+    sink.lock()
+        .expect("lock decoded frame sink")
+        .snapshot(&SessionId(session_id))
+        .map(decoded_frame_snapshot_response)
+}
+
 fn main() {
+    let frame_sink = std::sync::Arc::new(std::sync::Mutex::new(DecodedFrameSink::default()));
     tauri::Builder::default()
         .manage(AppState {
+            frame_sink: frame_sink.clone(),
             realtime_runtime: RealtimeRuntime::from_env(),
-            webrtc_host: std::sync::Arc::new(Mutex::new(WebrtcHost::default())),
+            webrtc_host: std::sync::Arc::new(Mutex::new(WebrtcHost::with_frame_sink(frame_sink))),
             webrtc_sessions: std::sync::Arc::new(Mutex::new(WebrtcSessionCoordinator::default())),
         })
         .invoke_handler(tauri::generate_handler![
@@ -678,7 +722,8 @@ fn main() {
             webrtc_host_create_answer,
             webrtc_host_apply_remote_answer,
             webrtc_host_apply_remote_ice_candidate,
-            webrtc_host_snapshot
+            webrtc_host_snapshot,
+            decoded_frame_snapshot
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -687,7 +732,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        drain_realtime_events_with, realtime_accept_session_with, realtime_register_with,
+        decoded_frame_snapshot_with, drain_realtime_events_with, realtime_accept_session_with,
+        realtime_register_with,
         realtime_request_session_with, webrtc_apply_remote_answer_with,
         webrtc_apply_remote_ice_candidate_with, webrtc_create_local_offer_with,
         webrtc_host_apply_remote_answer_with, webrtc_host_apply_remote_offer_with,
@@ -695,7 +741,7 @@ mod tests {
         webrtc_host_snapshot_with, webrtc_snapshot_with, webrtc_sync_realtime_events_with,
     };
     use crate::{
-        realtime_runtime::RealtimeRuntime, webrtc_host::WebrtcHost,
+        frame_sink::DecodedFrameSink, realtime_runtime::RealtimeRuntime, webrtc_host::WebrtcHost,
         webrtc_session::WebrtcSessionCoordinator,
     };
     use axum::{
@@ -892,8 +938,12 @@ mod tests {
 
     #[tokio::test]
     async fn webrtc_host_helpers_complete_offer_answer_roundtrip() {
-        let controller_host = Mutex::new(WebrtcHost::default());
-        let agent_host = Mutex::new(WebrtcHost::default());
+        let controller_host = Mutex::new(WebrtcHost::with_frame_sink(std::sync::Arc::new(
+            std::sync::Mutex::new(DecodedFrameSink::default()),
+        )));
+        let agent_host = Mutex::new(WebrtcHost::with_frame_sink(std::sync::Arc::new(
+            std::sync::Mutex::new(DecodedFrameSink::default()),
+        )));
 
         let offer = webrtc_host_create_offer_with(&controller_host, "session-3".into())
             .await
@@ -935,5 +985,29 @@ mod tests {
         assert_eq!(controller_snapshot.last_decoded_pixel_format, None);
         assert!(agent_snapshot.remote_offer.is_some());
         assert!(agent_snapshot.local_answer.is_some());
+    }
+
+    #[test]
+    fn decoded_frame_snapshot_reports_latest_ingested_frame() {
+        let sink = std::sync::Mutex::new(DecodedFrameSink::default());
+        sink.lock()
+            .expect("lock decoded frame sink")
+            .ingest_frame(
+                SessionId("session-9".into()),
+                mrd_decode::DecodedFrame {
+                    width: 640,
+                    height: 360,
+                    pixel_format: mrd_decode::PixelFormat::Rgb24,
+                    data: vec![0; 640 * 360 * 3],
+                },
+            );
+
+        let snapshot = decoded_frame_snapshot_with(&sink, "session-9".into()).expect("snapshot");
+
+        assert_eq!(snapshot.frame_count, 1);
+        assert_eq!(snapshot.width, 640);
+        assert_eq!(snapshot.height, 360);
+        assert_eq!(snapshot.pixel_format, "Rgb24");
+        assert_eq!(snapshot.bytes, 640 * 360 * 3);
     }
 }

@@ -27,6 +27,11 @@ interface RealtimeSessionCardProps {
   hostLastDecodedWidth: number;
   hostLastDecodedHeight: number;
   hostLastDecodedPixelFormat: string;
+  sinkFrameCount: number;
+  sinkWidth: number;
+  sinkHeight: number;
+  sinkPixelFormat: string;
+  sinkBytes: number;
   handle: number | null;
   loading: boolean;
   error: string | null;
@@ -76,6 +81,11 @@ export function RealtimeSessionCard({
   hostLastDecodedWidth,
   hostLastDecodedHeight,
   hostLastDecodedPixelFormat,
+  sinkFrameCount,
+  sinkWidth,
+  sinkHeight,
+  sinkPixelFormat,
+  sinkBytes,
   handle,
   loading,
   error,
@@ -234,6 +244,24 @@ export function RealtimeSessionCard({
             }
           />
           <RealtimeSessionMetric label="最近解码格式" value={hostLastDecodedPixelFormat || "-"} />
+        </div>
+      </div>
+
+      <div
+        className={`mt-3 rounded-lg border px-3 py-2 ${isDark ? "border-gray-700 bg-[#1f1f1f]" : "border-gray-200 bg-gray-50"}`}
+        style={{ fontSize: 12 }}
+      >
+        <div className={isDark ? "text-gray-300" : "text-gray-700"} style={{ fontSize: 12 }}>
+          Decoded Frame Sink
+        </div>
+        <div className="grid grid-cols-2 gap-3 mt-2">
+          <RealtimeSessionMetric label="已缓存帧数" value={String(sinkFrameCount)} />
+          <RealtimeSessionMetric
+            label="最近帧尺寸"
+            value={sinkWidth > 0 && sinkHeight > 0 ? `${sinkWidth}x${sinkHeight}` : "-"}
+          />
+          <RealtimeSessionMetric label="最近帧格式" value={sinkPixelFormat || "-"} />
+          <RealtimeSessionMetric label="最近帧字节数" value={sinkBytes > 0 ? String(sinkBytes) : "-"} />
         </div>
       </div>
 

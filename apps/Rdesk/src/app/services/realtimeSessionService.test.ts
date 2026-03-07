@@ -269,4 +269,24 @@ describe("realtimeSessionService", () => {
       sessionId: "session-2",
     });
   });
+
+  it("reads decoded frame sink snapshots via tauri invoke", async () => {
+    invokeMock.mockResolvedValueOnce({
+      frameCount: 2,
+      width: 1280,
+      height: 720,
+      pixelFormat: "Rgb24",
+      bytes: 2764800,
+    });
+
+    const { getDecodedFrameSnapshot } = await import("./realtimeSessionService");
+    const snapshot = await getDecodedFrameSnapshot("session-3");
+
+    expect(invokeMock).toHaveBeenCalledWith("decoded_frame_snapshot", {
+      sessionId: "session-3",
+    });
+    expect(snapshot?.frameCount).toBe(2);
+    expect(snapshot?.pixelFormat).toBe("Rgb24");
+    expect(snapshot?.bytes).toBe(2764800);
+  });
 });

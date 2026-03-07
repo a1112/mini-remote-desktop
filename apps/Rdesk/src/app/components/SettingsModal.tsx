@@ -28,6 +28,7 @@ import {
   drainRealtimeEvents,
   createWebrtcHostAnswer,
   createWebrtcHostOffer,
+  getDecodedFrameSnapshot,
   getWebrtcHostSnapshot,
   getWebrtcSnapshot,
   applyWebrtcRemoteIceCandidate,
@@ -39,6 +40,7 @@ import {
   syncWebrtcRealtimeEvents,
   type WebrtcHostSnapshot,
   type WebrtcSessionSnapshot,
+  type DecodedFrameSnapshot,
 } from "../services/realtimeSessionService";
 
 function Toggle({ value, onChange }: { value: boolean; onChange: (v: boolean) => void }) {
@@ -163,6 +165,7 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
   const [realtimeIceSdpMlineIndex, setRealtimeIceSdpMlineIndex] = useState(0);
   const [realtimeSnapshot, setRealtimeSnapshot] = useState<WebrtcSessionSnapshot | null>(null);
   const [realtimeHostSnapshot, setRealtimeHostSnapshot] = useState<WebrtcHostSnapshot | null>(null);
+  const [decodedFrameSnapshot, setDecodedFrameSnapshot] = useState<DecodedFrameSnapshot | null>(null);
 
   useEffect(() => {
     if (open) {
@@ -313,6 +316,8 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
     try {
       const snapshot = await getWebrtcHostSnapshot(realtimeSessionId);
       setRealtimeHostSnapshot(snapshot);
+      const decodedSnapshot = await getDecodedFrameSnapshot(realtimeSessionId);
+      setDecodedFrameSnapshot(decodedSnapshot);
     } catch (error) {
       setRealtimeError(error instanceof Error ? error.message : "读取 native host 快照失败");
     } finally {
@@ -333,6 +338,8 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
       setRealtimeSnapshot(snapshot);
       const hostSnapshot = await getWebrtcHostSnapshot(realtimeSessionId);
       setRealtimeHostSnapshot(hostSnapshot);
+      const decodedSnapshot = await getDecodedFrameSnapshot(realtimeSessionId);
+      setDecodedFrameSnapshot(decodedSnapshot);
       const nextEvents = await drainRealtimeEvents(realtimeHandle);
       setRealtimeEvents(nextEvents);
     } catch (error) {
@@ -362,6 +369,8 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
       setRealtimeSnapshot(snapshot);
       const hostSnapshot = await getWebrtcHostSnapshot(realtimeSessionId);
       setRealtimeHostSnapshot(hostSnapshot);
+      const decodedSnapshot = await getDecodedFrameSnapshot(realtimeSessionId);
+      setDecodedFrameSnapshot(decodedSnapshot);
       const nextEvents = await drainRealtimeEvents(realtimeHandle);
       setRealtimeEvents(nextEvents);
     } catch (error) {
@@ -392,6 +401,8 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
       setRealtimeSnapshot(snapshot);
       const hostSnapshot = await getWebrtcHostSnapshot(realtimeSessionId);
       setRealtimeHostSnapshot(hostSnapshot);
+      const decodedSnapshot = await getDecodedFrameSnapshot(realtimeSessionId);
+      setDecodedFrameSnapshot(decodedSnapshot);
       const nextEvents = await drainRealtimeEvents(realtimeHandle);
       setRealtimeEvents(nextEvents);
     } catch (error) {
@@ -433,6 +444,8 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
       setRealtimeSnapshot(snapshot);
       const hostSnapshot = await getWebrtcHostSnapshot(realtimeSessionId);
       setRealtimeHostSnapshot(hostSnapshot);
+      const decodedSnapshot = await getDecodedFrameSnapshot(realtimeSessionId);
+      setDecodedFrameSnapshot(decodedSnapshot);
       const nextEvents = await drainRealtimeEvents(realtimeHandle);
       setRealtimeEvents(nextEvents);
     } catch (error) {
@@ -725,6 +738,11 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                   hostLastDecodedWidth={realtimeHostSnapshot?.lastDecodedWidth ?? 0}
                   hostLastDecodedHeight={realtimeHostSnapshot?.lastDecodedHeight ?? 0}
                   hostLastDecodedPixelFormat={realtimeHostSnapshot?.lastDecodedPixelFormat ?? ""}
+                  sinkFrameCount={decodedFrameSnapshot?.frameCount ?? 0}
+                  sinkWidth={decodedFrameSnapshot?.width ?? 0}
+                  sinkHeight={decodedFrameSnapshot?.height ?? 0}
+                  sinkPixelFormat={decodedFrameSnapshot?.pixelFormat ?? ""}
+                  sinkBytes={decodedFrameSnapshot?.bytes ?? 0}
                   handle={realtimeHandle}
                   loading={realtimeLoading}
                   error={realtimeError}

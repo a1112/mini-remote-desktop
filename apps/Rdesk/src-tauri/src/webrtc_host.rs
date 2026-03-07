@@ -6,6 +6,7 @@ use std::{
     },
 };
 
+use crate::frame_sink::DecodedFrameSink;
 use mrd_proto::SessionId;
 use mrd_signal_proto::{IceCandidate, SessionDescription};
 use crate::webrtc_media::H264AccessUnitAssembler;
@@ -50,9 +51,17 @@ struct HostedPeer {
 #[derive(Debug, Default)]
 pub struct WebrtcHost {
     sessions: HashMap<SessionId, HostedPeer>,
+    frame_sink: Option<Arc<Mutex<DecodedFrameSink>>>,
 }
 
 impl WebrtcHost {
+    pub fn with_frame_sink(frame_sink: Arc<Mutex<DecodedFrameSink>>) -> Self {
+        Self {
+            sessions: HashMap::new(),
+            frame_sink: Some(frame_sink),
+        }
+    }
+
     pub async fn create_offer(
         &mut self,
         session_id: SessionId,
@@ -205,7 +214,12 @@ impl WebrtcHost {
         }
 
         let snapshot = Arc::new(Mutex::new(WebrtcHostSnapshot::default()));
-        let pc = build_peer_connection(snapshot.clone()).await?;
+        let pc = build_peer_connection(
+            session_id.clone(),
+            snapshot.clone(),
+            self.frame_sink.clone(),
+        )
+        .await?;
         self.sessions.insert(
             session_id.clone(),
             HostedPeer {
@@ -218,7 +232,9 @@ impl WebrtcHost {
 }
 
 async fn build_peer_connection(
+    session_id: SessionId,
     snapshot: Arc<Mutex<WebrtcHostSnapshot>>,
+    frame_sink: Option<Arc<Mutex<DecodedFrameSink>>>,
 ) -> Result<Arc<RTCPeerConnection>, String> {
     let mut media_engine = MediaEngine::default();
     media_engine
@@ -269,10 +285,14 @@ async fn build_peer_connection(
     let packet_counter = Arc::new(AtomicU64::new(0));
     let access_unit_counter = Arc::new(AtomicU64::new(0));
     let on_track_snapshot = snapshot.clone();
+    let on_track_session_id = session_id.clone();
+    let on_track_frame_sink = frame_sink.clone();
     let on_track_counter = packet_counter.clone();
     let on_track_access_unit_counter = access_unit_counter.clone();
     pc.on_track(Box::new(move |track: Arc<TrackRemote>, _, _| {
         let snapshot = on_track_snapshot.clone();
+        let session_id = on_track_session_id.clone();
+        let frame_sink = on_track_frame_sink.clone();
         let counter = on_track_counter.clone();
         let access_unit_counter = on_track_access_unit_counter.clone();
         Box::pin(async move {
@@ -310,8 +330,13 @@ async fn build_peer_connection(
                     snapshot_guard.last_remote_access_unit_bytes = access_unit.len();
                     drop(snapshot_guard);
                     if let Some(decoder) = decoder.as_mut() {
-                        let _ =
-                            decode_access_unit_into_snapshot(snapshot.clone(), decoder.as_mut(), &access_unit);
+                        let _ = decode_access_unit_into_snapshot(
+                            session_id.clone(),
+                            snapshot.clone(),
+                            frame_sink.clone(),
+                            decoder.as_mut(),
+                            &access_unit,
+                        );
                     }
                     continue;
                 }
@@ -323,7 +348,9 @@ async fn build_peer_connection(
 }
 
 fn decode_access_unit_into_snapshot(
+    session_id: SessionId,
     snapshot: Arc<Mutex<WebrtcHostSnapshot>>,
+    frame_sink: Option<Arc<Mutex<DecodedFrameSink>>>,
     decoder: &mut dyn VideoDecoder,
     access_unit: &[u8],
 ) -> Result<(), String> {
@@ -331,12 +358,14 @@ fn decode_access_unit_into_snapshot(
         .push_access_unit(access_unit)
         .map_err(|e| format!("software decoder 解码 access unit 失败: {e}"))?;
     let frames = decoder.drain_decoded_frames();
-    apply_decoded_frames_to_snapshot(snapshot, frames);
+    apply_decoded_frames_to_snapshot(session_id, snapshot, frame_sink, frames);
     Ok(())
 }
 
 fn apply_decoded_frames_to_snapshot(
+    session_id: SessionId,
     snapshot: Arc<Mutex<WebrtcHostSnapshot>>,
+    frame_sink: Option<Arc<Mutex<DecodedFrameSink>>>,
     frames: Vec<DecodedFrame>,
 ) {
     if frames.is_empty() {
@@ -351,6 +380,12 @@ fn apply_decoded_frames_to_snapshot(
         snapshot.last_decoded_pixel_format = Some(match frame.pixel_format {
             PixelFormat::Rgb24 => "Rgb24".to_string(),
         });
+        if let Some(frame_sink) = frame_sink.as_ref() {
+            frame_sink
+                .lock()
+                .expect("lock decoded frame sink")
+                .ingest_frame(session_id.clone(), frame);
+        }
     }
 }
 
@@ -442,8 +477,14 @@ mod tests {
         let access_unit = encoder.encode(&yuv).expect("encode access unit").to_vec();
 
         let mut decoder = mrd_decode::create_decoder("h264_software").expect("decoder instance");
-        decode_access_unit_into_snapshot(snapshot.clone(), decoder.as_mut(), access_unit.as_slice())
-            .expect("decode access unit into snapshot");
+        decode_access_unit_into_snapshot(
+            SessionId("session-3".into()),
+            snapshot.clone(),
+            None,
+            decoder.as_mut(),
+            access_unit.as_slice(),
+        )
+        .expect("decode access unit into snapshot");
 
         let snapshot = snapshot.lock().expect("lock host snapshot").clone();
         assert_eq!(snapshot.decoded_frame_count, 1);

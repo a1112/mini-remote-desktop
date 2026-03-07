@@ -40,6 +40,11 @@ describe("RealtimeSessionCard", () => {
         hostLastDecodedWidth={1280}
         hostLastDecodedHeight={720}
         hostLastDecodedPixelFormat="Rgb24"
+        sinkFrameCount={2}
+        sinkWidth={1280}
+        sinkHeight={720}
+        sinkPixelFormat="Rgb24"
+        sinkBytes={2764800}
         loading={false}
         error={null}
         events={[
@@ -85,5 +90,7 @@ describe("RealtimeSessionCard", () => {
     expect(html).toContain("42");
     expect(html).toContain("1280x720");
     expect(html).toContain("Rgb24");
+    expect(html).toContain("Decoded Frame Sink");
+    expect(html).toContain("2764800");
   });
 });
