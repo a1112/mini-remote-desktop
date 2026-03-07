@@ -24,6 +24,7 @@ use render_host::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use tauri::Manager;
 use tokio::sync::Mutex;
 use webrtc_host::{WebrtcHost, WebrtcHostSnapshot};
 use webrtc_session::{WebrtcSessionCoordinator, WebrtcSessionSnapshot};
@@ -425,6 +426,27 @@ async fn render_host_snapshot(
 ) -> Result<RenderHostSnapshotResponse, String> {
     let snapshot = render_host_snapshot_with(state.render_host.as_ref(), session_id)?;
     Ok(render_host_snapshot_response(snapshot))
+}
+
+#[tauri::command]
+fn open_render_window(app: tauri::AppHandle, session_id: String) -> Result<String, String> {
+    let label = format!("render-{session_id}");
+    if let Some(window) = app.get_window(&label) {
+        let _ = window.show();
+        let _ = window.set_focus();
+        return Ok(label);
+    }
+
+    let url = format!("/session/{session_id}");
+    tauri::WindowBuilder::new(&app, label.clone(), tauri::WindowUrl::App(url.into()))
+        .title(format!("Remote Session {session_id}"))
+        .decorations(false)
+        .resizable(true)
+        .inner_size(1280.0, 800.0)
+        .build()
+        .map_err(|error| format!("创建渲染窗口失败: {error}"))?;
+
+    Ok(label)
 }
 
 /// Tauri 命令：设备注册
@@ -848,7 +870,8 @@ fn main() {
             decoded_frame_preview,
             render_host_attach_session,
             render_host_detach_session,
-            render_host_snapshot
+            render_host_snapshot,
+            open_render_window
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

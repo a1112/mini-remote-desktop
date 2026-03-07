@@ -28,6 +28,7 @@ import {
   getRenderHostSnapshot,
   type RenderHostSnapshot,
 } from "../services/renderHostService";
+import { openRenderWindow } from "../services/renderWindowService";
 
 export function RemoteSessionPage() {
   const { id } = useParams();
@@ -96,6 +97,11 @@ export function RemoteSessionPage() {
   const handleDisconnect = () => {
     if (device) navigate(`/devices/${device.id}`);
     else navigate("/");
+  };
+
+  const handlePopOutWindow = async () => {
+    if (!id || !isTauriRuntime()) return;
+    await openRenderWindow(id);
   };
 
   const handleTauriDragStart = (event: React.MouseEvent<HTMLDivElement>) => {
@@ -227,6 +233,14 @@ export function RemoteSessionPage() {
           >
             <Power style={{ width: 11, height: 11 }} />
             断开
+          </button>
+          <button
+            onClick={() => void handlePopOutWindow()}
+            className="flex items-center gap-1 px-2 py-1 rounded-md bg-blue-500/15 text-blue-300 hover:bg-blue-500/25 transition-colors"
+            style={{ fontSize: 11 }}
+          >
+            <Monitor style={{ width: 11, height: 11 }} />
+            独立窗口
           </button>
 
           {/* Window controls */}
