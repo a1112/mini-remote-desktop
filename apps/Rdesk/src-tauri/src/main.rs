@@ -5,6 +5,7 @@ mod device_info;
 mod realtime_client;
 mod realtime_management;
 mod realtime_runtime;
+mod webrtc_session;
 
 use device_info::HardwareInfo;
 use mrd_proto::{BackendRole, DeviceId, SessionId};
@@ -14,10 +15,13 @@ use realtime_management::{RealtimeManagementClient, RealtimeStatus};
 use realtime_runtime::{RealtimeRegistration, RealtimeRuntime};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use tokio::sync::Mutex;
+use webrtc_session::{WebrtcSessionCoordinator, WebrtcSessionSnapshot};
 
 #[derive(Clone)]
 struct AppState {
     realtime_runtime: RealtimeRuntime,
+    webrtc_sessions: std::sync::Arc<Mutex<WebrtcSessionCoordinator>>,
 }
 
 /// 设备注册响应
@@ -32,6 +36,14 @@ struct DeviceRegistrationResponse {
 struct RealtimeRegistrationResponse {
     handle: u64,
     device_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct WebrtcSessionSnapshotResponse {
+    local_offer: Option<String>,
+    remote_offer: Option<String>,
+    remote_answer: Option<String>,
+    remote_ice_candidates: Vec<IceCandidate>,
 }
 
 /// Tauri 命令：获取硬件信息
@@ -168,6 +180,65 @@ async fn realtime_send_ice_candidate(
         .await
 }
 
+#[tauri::command]
+async fn webrtc_create_local_offer(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+    sdp: String,
+) -> Result<String, String> {
+    let description =
+        webrtc_create_local_offer_with(state.webrtc_sessions.as_ref(), session_id, sdp).await?;
+    Ok(description.sdp)
+}
+
+#[tauri::command]
+async fn webrtc_apply_remote_answer(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+    sdp: String,
+) -> Result<(), String> {
+    webrtc_apply_remote_answer_with(state.webrtc_sessions.as_ref(), session_id, sdp).await
+}
+
+#[tauri::command]
+async fn webrtc_apply_remote_ice_candidate(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+    candidate: String,
+    sdp_mid: Option<String>,
+    sdp_mline_index: Option<u16>,
+) -> Result<(), String> {
+    webrtc_apply_remote_ice_candidate_with(
+        state.webrtc_sessions.as_ref(),
+        session_id,
+        candidate,
+        sdp_mid,
+        sdp_mline_index,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn webrtc_sync_realtime_events(
+    state: tauri::State<'_, AppState>,
+    handle: u64,
+) -> Result<WebrtcSessionSnapshotResponse, String> {
+    webrtc_sync_realtime_events_with(
+        &state.realtime_runtime,
+        state.webrtc_sessions.as_ref(),
+        handle,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn webrtc_snapshot(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+) -> Result<Option<WebrtcSessionSnapshotResponse>, String> {
+    Ok(webrtc_snapshot_with(state.webrtc_sessions.as_ref(), session_id).await)
+}
+
 /// Tauri 命令：设备注册
 ///
 /// 调用后端 API 进行设备注册，后端根据主板序列号生成设备ID
@@ -286,10 +357,106 @@ fn realtime_registration_response(registration: RealtimeRegistration) -> Realtim
     }
 }
 
+fn webrtc_snapshot_response(snapshot: &WebrtcSessionSnapshot) -> WebrtcSessionSnapshotResponse {
+    WebrtcSessionSnapshotResponse {
+        local_offer: snapshot.local_offer.clone(),
+        remote_offer: snapshot.remote_offer.clone(),
+        remote_answer: snapshot.remote_answer.clone(),
+        remote_ice_candidates: snapshot.remote_ice_candidates.clone(),
+    }
+}
+
+async fn webrtc_create_local_offer_with(
+    coordinator: &Mutex<WebrtcSessionCoordinator>,
+    session_id: String,
+    sdp: String,
+) -> Result<SessionDescription, String> {
+    coordinator
+        .lock()
+        .await
+        .create_local_offer(SessionId(session_id), sdp)
+}
+
+async fn webrtc_apply_remote_answer_with(
+    coordinator: &Mutex<WebrtcSessionCoordinator>,
+    session_id: String,
+    sdp: String,
+) -> Result<(), String> {
+    coordinator
+        .lock()
+        .await
+        .apply_remote_answer(SessionId(session_id), sdp)
+}
+
+async fn webrtc_apply_remote_ice_candidate_with(
+    coordinator: &Mutex<WebrtcSessionCoordinator>,
+    session_id: String,
+    candidate: String,
+    sdp_mid: Option<String>,
+    sdp_mline_index: Option<u16>,
+) -> Result<(), String> {
+    coordinator.lock().await.apply_remote_ice_candidate(
+        SessionId(session_id.clone()),
+        IceCandidate {
+            session_id: SessionId(session_id),
+            candidate,
+            sdp_mid,
+            sdp_mline_index,
+        },
+    )
+}
+
+async fn webrtc_sync_realtime_events_with(
+    runtime: &RealtimeRuntime,
+    coordinator: &Mutex<WebrtcSessionCoordinator>,
+    handle: u64,
+) -> Result<WebrtcSessionSnapshotResponse, String> {
+    let events = runtime.drain_events(handle).await?;
+    let mut last_session_id: Option<SessionId> = None;
+
+    {
+        let mut sessions = coordinator.lock().await;
+        for event in events {
+            match event {
+                SignalMessage::WebrtcOffer(description) => {
+                    last_session_id = Some(description.session_id.clone());
+                    sessions.apply_remote_offer(description.session_id, description.sdp)?;
+                }
+                SignalMessage::WebrtcAnswer(description) => {
+                    last_session_id = Some(description.session_id.clone());
+                    sessions.apply_remote_answer(description.session_id, description.sdp)?;
+                }
+                SignalMessage::IceCandidate(candidate) => {
+                    last_session_id = Some(candidate.session_id.clone());
+                    sessions.apply_remote_ice_candidate(candidate.session_id.clone(), candidate)?;
+                }
+                _ => {}
+            }
+        }
+
+        let session_id = last_session_id.ok_or_else(|| "未收到可应用的 webrtc 事件".to_string())?;
+        let snapshot = sessions
+            .snapshot(&session_id)
+            .ok_or_else(|| format!("未找到会话协商快照: {}", session_id.0))?;
+        Ok(webrtc_snapshot_response(snapshot))
+    }
+}
+
+async fn webrtc_snapshot_with(
+    coordinator: &Mutex<WebrtcSessionCoordinator>,
+    session_id: String,
+) -> Option<WebrtcSessionSnapshotResponse> {
+    let sessions = coordinator.lock().await;
+    sessions
+        .snapshot(&SessionId(session_id))
+        .map(webrtc_snapshot_response)
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(AppState {
             realtime_runtime: RealtimeRuntime::from_env(),
+            webrtc_sessions: std::sync::Arc::new(Mutex::new(WebrtcSessionCoordinator::default())),
         })
         .invoke_handler(tauri::generate_handler![
             get_hardware_info,
@@ -305,7 +472,12 @@ fn main() {
             realtime_drain_events,
             realtime_send_offer,
             realtime_send_answer,
-            realtime_send_ice_candidate
+            realtime_send_ice_candidate,
+            webrtc_create_local_offer,
+            webrtc_apply_remote_answer,
+            webrtc_apply_remote_ice_candidate,
+            webrtc_sync_realtime_events,
+            webrtc_snapshot
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -315,9 +487,11 @@ fn main() {
 mod tests {
     use super::{
         drain_realtime_events_with, realtime_accept_session_with, realtime_register_with,
-        realtime_request_session_with,
+        realtime_request_session_with, webrtc_apply_remote_answer_with,
+        webrtc_apply_remote_ice_candidate_with, webrtc_create_local_offer_with,
+        webrtc_snapshot_with, webrtc_sync_realtime_events_with,
     };
-    use crate::realtime_runtime::RealtimeRuntime;
+    use crate::{realtime_runtime::RealtimeRuntime, webrtc_session::WebrtcSessionCoordinator};
     use axum::{
         extract::ws::{Message, WebSocket, WebSocketUpgrade},
         response::IntoResponse,
@@ -326,9 +500,10 @@ mod tests {
     };
     use futures_util::StreamExt;
     use mrd_signal_client::{decode_message, encode_message};
-    use mrd_proto::DeviceId;
+    use mrd_proto::{DeviceId, SessionId};
     use mrd_signal_proto::SignalMessage;
     use tokio::net::TcpListener;
+    use tokio::sync::Mutex;
 
     async fn ws_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
         ws.on_upgrade(handle_socket)
@@ -411,5 +586,101 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert!(matches!(events[0], SignalMessage::SessionRequest(_)));
         assert!(matches!(events[1], SignalMessage::SessionAccept(_)));
+    }
+
+    #[tokio::test]
+    async fn webrtc_helpers_record_and_report_snapshot() {
+        let coordinator = Mutex::new(WebrtcSessionCoordinator::default());
+
+        let offer = webrtc_create_local_offer_with(
+            &coordinator,
+            "session-1".into(),
+            "offer-sdp".into(),
+        )
+        .await
+        .expect("create local offer");
+        assert_eq!(offer.sdp, "offer-sdp");
+
+        webrtc_apply_remote_answer_with(&coordinator, "session-1".into(), "answer-sdp".into())
+            .await
+            .expect("apply answer");
+        webrtc_apply_remote_ice_candidate_with(
+            &coordinator,
+            "session-1".into(),
+            "candidate:1 1 UDP 123 127.0.0.1 5000 typ host".into(),
+            Some("0".into()),
+            Some(0),
+        )
+        .await
+        .expect("apply ice");
+
+        let snapshot = webrtc_snapshot_with(&coordinator, "session-1".into())
+            .await
+            .expect("snapshot exists");
+        assert_eq!(snapshot.local_offer.as_deref(), Some("offer-sdp"));
+        assert_eq!(snapshot.remote_offer, None);
+        assert_eq!(snapshot.remote_answer.as_deref(), Some("answer-sdp"));
+        assert_eq!(snapshot.remote_ice_candidates.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn syncing_realtime_events_applies_offer_answer_and_ice() {
+        let runtime = RealtimeRuntime::new(spawn_server().await);
+        let coordinator = Mutex::new(WebrtcSessionCoordinator::default());
+
+        let registration = realtime_register_with(
+            &runtime,
+            "controller".into(),
+            Some("controller-1".into()),
+            "Rdesk".into(),
+        )
+        .await
+        .expect("register realtime connection");
+
+        runtime
+            .send_offer(
+                registration.handle,
+                mrd_signal_proto::SessionDescription {
+                    session_id: SessionId("session-2".into()),
+                    sdp: "offer-sdp".into(),
+                },
+            )
+            .await
+            .expect("send offer");
+        runtime
+            .send_answer(
+                registration.handle,
+                mrd_signal_proto::SessionDescription {
+                    session_id: SessionId("session-2".into()),
+                    sdp: "answer-sdp".into(),
+                },
+            )
+            .await
+            .expect("send answer");
+        runtime
+            .send_ice_candidate(
+                registration.handle,
+                mrd_signal_proto::IceCandidate {
+                    session_id: SessionId("session-2".into()),
+                    candidate: "candidate:2 1 UDP 123 127.0.0.1 5001 typ host".into(),
+                    sdp_mid: Some("0".into()),
+                    sdp_mline_index: Some(0),
+                },
+            )
+            .await
+            .expect("send ice");
+
+        let snapshot = webrtc_sync_realtime_events_with(
+            &runtime,
+            &coordinator,
+            registration.handle,
+        )
+        .await
+        .expect("sync realtime events");
+
+        assert_eq!(snapshot.remote_offer.as_deref(), Some("offer-sdp"));
+        assert_eq!(snapshot.local_offer, None);
+        assert_eq!(snapshot.remote_answer.as_deref(), Some("answer-sdp"));
+        assert_eq!(snapshot.remote_ice_candidates.len(), 1);
     }
 }
