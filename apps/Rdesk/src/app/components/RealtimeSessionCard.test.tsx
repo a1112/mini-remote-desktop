@@ -31,6 +31,11 @@ describe("RealtimeSessionCard", () => {
         hostLocalAnswer="host-answer-sdp"
         hostRemoteAnswer="host-remote-answer-sdp"
         hostRemoteIceCount={2}
+        hostRemoteVideoTrackCount={1}
+        hostRemoteRtpPacketCount={42}
+        hostLastRemoteCodec="video/h264"
+        hostRemoteH264AccessUnitCount={5}
+        hostLastRemoteAccessUnitBytes={1200}
         loading={false}
         error={null}
         events={[
@@ -72,5 +77,7 @@ describe("RealtimeSessionCard", () => {
     expect(html).toContain("remote-offer-sdp");
     expect(html).toContain("Native Host 快照");
     expect(html).toContain("host-answer-sdp");
+    expect(html).toContain("video/h264");
+    expect(html).toContain("42");
   });
 });

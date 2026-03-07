@@ -18,6 +18,11 @@ interface RealtimeSessionCardProps {
   hostLocalAnswer: string;
   hostRemoteAnswer: string;
   hostRemoteIceCount: number;
+  hostRemoteVideoTrackCount: number;
+  hostRemoteRtpPacketCount: number;
+  hostLastRemoteCodec: string;
+  hostRemoteH264AccessUnitCount: number;
+  hostLastRemoteAccessUnitBytes: number;
   handle: number | null;
   loading: boolean;
   error: string | null;
@@ -58,6 +63,11 @@ export function RealtimeSessionCard({
   hostLocalAnswer,
   hostRemoteAnswer,
   hostRemoteIceCount,
+  hostRemoteVideoTrackCount,
+  hostRemoteRtpPacketCount,
+  hostLastRemoteCodec,
+  hostRemoteH264AccessUnitCount,
+  hostLastRemoteAccessUnitBytes,
   handle,
   loading,
   error,
@@ -201,6 +211,11 @@ export function RealtimeSessionCard({
           <RealtimeSessionMetric label="本地 Answer" value={hostLocalAnswer || "-"} />
           <RealtimeSessionMetric label="远端 Answer" value={hostRemoteAnswer || "-"} />
           <RealtimeSessionMetric label="远端 ICE 数" value={String(hostRemoteIceCount)} />
+          <RealtimeSessionMetric label="远端视频 Track 数" value={String(hostRemoteVideoTrackCount)} />
+          <RealtimeSessionMetric label="远端 RTP 包数" value={String(hostRemoteRtpPacketCount)} />
+          <RealtimeSessionMetric label="最近远端编解码" value={hostLastRemoteCodec || "-"} />
+          <RealtimeSessionMetric label="H264 AU 数" value={String(hostRemoteH264AccessUnitCount)} />
+          <RealtimeSessionMetric label="最近 AU 字节数" value={String(hostLastRemoteAccessUnitBytes)} />
         </div>
       </div>
 

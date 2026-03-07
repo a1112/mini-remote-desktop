@@ -8,6 +8,7 @@ use std::{
 
 use mrd_proto::SessionId;
 use mrd_signal_proto::{IceCandidate, SessionDescription};
+use crate::webrtc_media::H264AccessUnitAssembler;
 use webrtc::{
     api::{media_engine::MediaEngine, setting_engine::SettingEngine, APIBuilder},
     data_channel::data_channel_init::RTCDataChannelInit,
@@ -31,6 +32,8 @@ pub struct WebrtcHostSnapshot {
     pub remote_video_track_count: usize,
     pub remote_rtp_packet_count: u64,
     pub last_remote_codec: Option<String>,
+    pub remote_h264_access_unit_count: u64,
+    pub last_remote_access_unit_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -259,22 +262,40 @@ async fn build_peer_connection(
     .map_err(|e| format!("创建 control data channel 失败: {}", e))?;
 
     let packet_counter = Arc::new(AtomicU64::new(0));
+    let access_unit_counter = Arc::new(AtomicU64::new(0));
     let on_track_snapshot = snapshot.clone();
     let on_track_counter = packet_counter.clone();
+    let on_track_access_unit_counter = access_unit_counter.clone();
     pc.on_track(Box::new(move |track: Arc<TrackRemote>, _, _| {
         let snapshot = on_track_snapshot.clone();
         let counter = on_track_counter.clone();
+        let access_unit_counter = on_track_access_unit_counter.clone();
         Box::pin(async move {
+            let mime_type = track.codec().capability.mime_type.clone();
             {
                 let mut snapshot = snapshot.lock().expect("lock host snapshot");
                 snapshot.remote_video_track_count += 1;
-                snapshot.last_remote_codec = Some(track.codec().capability.mime_type.clone());
+                snapshot.last_remote_codec = Some(mime_type.clone());
             }
+
+            let mut h264_assembler = if mime_type.eq_ignore_ascii_case("video/h264") {
+                Some(H264AccessUnitAssembler::default())
+            } else {
+                None
+            };
 
             while let Ok((_packet, _)) = track.read_rtp().await {
                 let packet_count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                let next_access_unit = h264_assembler.as_mut().and_then(|assembler| {
+                    assembler.push_rtp_payload(&_packet.payload, _packet.header.marker)
+                });
                 let mut snapshot = snapshot.lock().expect("lock host snapshot");
                 snapshot.remote_rtp_packet_count = packet_count;
+                if let Some(access_unit) = next_access_unit {
+                    let access_unit_count = access_unit_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    snapshot.remote_h264_access_unit_count = access_unit_count;
+                    snapshot.last_remote_access_unit_bytes = access_unit.len();
+                }
             }
         })
     }));
@@ -287,6 +308,7 @@ mod tests {
     use mrd_proto::SessionId;
 
     use super::WebrtcHost;
+    use crate::webrtc_media::H264AccessUnitAssembler;
 
     #[tokio::test]
     async fn creating_offer_records_local_offer() {
@@ -303,6 +325,8 @@ mod tests {
             .expect("host snapshot");
         assert!(snapshot.local_offer.as_deref().unwrap_or_default().contains("m=application"));
         assert_eq!(snapshot.remote_video_track_count, 0);
+        assert_eq!(snapshot.remote_h264_access_unit_count, 0);
+        assert_eq!(snapshot.last_remote_access_unit_bytes, 0);
     }
 
     #[tokio::test]
@@ -338,5 +362,19 @@ mod tests {
         assert!(controller_snapshot.remote_answer.is_some());
         assert!(agent_snapshot.remote_offer.is_some());
         assert!(agent_snapshot.local_answer.is_some());
+    }
+
+    #[test]
+    fn h264_access_unit_assembler_reconstructs_fua_payloads() {
+        let mut assembler = H264AccessUnitAssembler::default();
+
+        assert_eq!(
+            assembler.push_rtp_payload(&[0x7c, 0x85, 0xaa, 0xbb], false),
+            None
+        );
+        assert_eq!(
+            assembler.push_rtp_payload(&[0x7c, 0x45, 0xcc, 0xdd], true),
+            Some(vec![0, 0, 0, 1, 0x65, 0xaa, 0xbb, 0xcc, 0xdd])
+        );
     }
 }

@@ -6,6 +6,7 @@ mod realtime_client;
 mod realtime_management;
 mod realtime_runtime;
 mod webrtc_host;
+mod webrtc_media;
 mod webrtc_session;
 
 use device_info::HardwareInfo;
@@ -59,6 +60,8 @@ struct WebrtcHostSnapshotResponse {
     remote_video_track_count: usize,
     remote_rtp_packet_count: u64,
     last_remote_codec: Option<String>,
+    remote_h264_access_unit_count: u64,
+    last_remote_access_unit_bytes: usize,
 }
 
 /// Tauri 命令：获取硬件信息
@@ -478,6 +481,8 @@ fn webrtc_host_snapshot_response(snapshot: &WebrtcHostSnapshot) -> WebrtcHostSna
         remote_video_track_count: snapshot.remote_video_track_count,
         remote_rtp_packet_count: snapshot.remote_rtp_packet_count,
         last_remote_codec: snapshot.last_remote_codec.clone(),
+        remote_h264_access_unit_count: snapshot.remote_h264_access_unit_count,
+        last_remote_access_unit_bytes: snapshot.last_remote_access_unit_bytes,
     }
 }
 
@@ -914,6 +919,8 @@ mod tests {
         assert!(controller_snapshot.local_offer.is_some());
         assert!(controller_snapshot.remote_answer.is_some());
         assert_eq!(controller_snapshot.remote_video_track_count, 0);
+        assert_eq!(controller_snapshot.remote_h264_access_unit_count, 0);
+        assert_eq!(controller_snapshot.last_remote_access_unit_bytes, 0);
         assert!(agent_snapshot.remote_offer.is_some());
         assert!(agent_snapshot.local_answer.is_some());
     }

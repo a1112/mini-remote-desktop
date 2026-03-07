@@ -56,6 +56,11 @@ export type WebrtcHostSnapshot = {
   localAnswer?: string;
   remoteAnswer?: string;
   remoteIceCount: number;
+  remoteVideoTrackCount: number;
+  remoteRtpPacketCount: number;
+  lastRemoteCodec?: string;
+  remoteH264AccessUnitCount: number;
+  lastRemoteAccessUnitBytes: number;
 };
 
 type RealtimeRegistrationPayload = {

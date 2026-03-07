@@ -716,6 +716,11 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                   hostLocalAnswer={realtimeHostSnapshot?.localAnswer ?? ""}
                   hostRemoteAnswer={realtimeHostSnapshot?.remoteAnswer ?? ""}
                   hostRemoteIceCount={realtimeHostSnapshot?.remoteIceCount ?? 0}
+                  hostRemoteVideoTrackCount={realtimeHostSnapshot?.remoteVideoTrackCount ?? 0}
+                  hostRemoteRtpPacketCount={realtimeHostSnapshot?.remoteRtpPacketCount ?? 0}
+                  hostLastRemoteCodec={realtimeHostSnapshot?.lastRemoteCodec ?? ""}
+                  hostRemoteH264AccessUnitCount={realtimeHostSnapshot?.remoteH264AccessUnitCount ?? 0}
+                  hostLastRemoteAccessUnitBytes={realtimeHostSnapshot?.lastRemoteAccessUnitBytes ?? 0}
                   handle={realtimeHandle}
                   loading={realtimeLoading}
                   error={realtimeError}
