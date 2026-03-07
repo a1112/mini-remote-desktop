@@ -212,6 +212,10 @@ describe("realtimeSessionService", () => {
         lastRemoteCodec: "video/h264",
         remoteH264AccessUnitCount: 0,
         lastRemoteAccessUnitBytes: 0,
+        decodedFrameCount: 1,
+        lastDecodedWidth: 16,
+        lastDecodedHeight: 16,
+        lastDecodedPixelFormat: "Rgb24",
       });
 
     const {
@@ -239,6 +243,8 @@ describe("realtimeSessionService", () => {
     expect(answer).toBe("generated-answer-sdp");
     expect(snapshot?.remoteIceCount).toBe(1);
     expect(snapshot?.lastRemoteCodec).toBe("video/h264");
+    expect(snapshot?.decodedFrameCount).toBe(1);
+    expect(snapshot?.lastDecodedPixelFormat).toBe("Rgb24");
     expect(invokeMock).toHaveBeenNthCalledWith(1, "webrtc_host_create_offer", {
       sessionId: "session-2",
     });

@@ -62,6 +62,10 @@ struct WebrtcHostSnapshotResponse {
     last_remote_codec: Option<String>,
     remote_h264_access_unit_count: u64,
     last_remote_access_unit_bytes: usize,
+    decoded_frame_count: u64,
+    last_decoded_width: usize,
+    last_decoded_height: usize,
+    last_decoded_pixel_format: Option<String>,
 }
 
 /// Tauri 命令：获取硬件信息
@@ -483,6 +487,10 @@ fn webrtc_host_snapshot_response(snapshot: &WebrtcHostSnapshot) -> WebrtcHostSna
         last_remote_codec: snapshot.last_remote_codec.clone(),
         remote_h264_access_unit_count: snapshot.remote_h264_access_unit_count,
         last_remote_access_unit_bytes: snapshot.last_remote_access_unit_bytes,
+        decoded_frame_count: snapshot.decoded_frame_count,
+        last_decoded_width: snapshot.last_decoded_width,
+        last_decoded_height: snapshot.last_decoded_height,
+        last_decoded_pixel_format: snapshot.last_decoded_pixel_format.clone(),
     }
 }
 
@@ -921,6 +929,10 @@ mod tests {
         assert_eq!(controller_snapshot.remote_video_track_count, 0);
         assert_eq!(controller_snapshot.remote_h264_access_unit_count, 0);
         assert_eq!(controller_snapshot.last_remote_access_unit_bytes, 0);
+        assert_eq!(controller_snapshot.decoded_frame_count, 0);
+        assert_eq!(controller_snapshot.last_decoded_width, 0);
+        assert_eq!(controller_snapshot.last_decoded_height, 0);
+        assert_eq!(controller_snapshot.last_decoded_pixel_format, None);
         assert!(agent_snapshot.remote_offer.is_some());
         assert!(agent_snapshot.local_answer.is_some());
     }

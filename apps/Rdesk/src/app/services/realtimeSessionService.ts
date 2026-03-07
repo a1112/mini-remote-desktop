@@ -61,6 +61,10 @@ export type WebrtcHostSnapshot = {
   lastRemoteCodec?: string;
   remoteH264AccessUnitCount: number;
   lastRemoteAccessUnitBytes: number;
+  decodedFrameCount: number;
+  lastDecodedWidth: number;
+  lastDecodedHeight: number;
+  lastDecodedPixelFormat?: string;
 };
 
 type RealtimeRegistrationPayload = {

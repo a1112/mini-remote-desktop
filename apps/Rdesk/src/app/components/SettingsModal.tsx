@@ -721,6 +721,10 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                   hostLastRemoteCodec={realtimeHostSnapshot?.lastRemoteCodec ?? ""}
                   hostRemoteH264AccessUnitCount={realtimeHostSnapshot?.remoteH264AccessUnitCount ?? 0}
                   hostLastRemoteAccessUnitBytes={realtimeHostSnapshot?.lastRemoteAccessUnitBytes ?? 0}
+                  hostDecodedFrameCount={realtimeHostSnapshot?.decodedFrameCount ?? 0}
+                  hostLastDecodedWidth={realtimeHostSnapshot?.lastDecodedWidth ?? 0}
+                  hostLastDecodedHeight={realtimeHostSnapshot?.lastDecodedHeight ?? 0}
+                  hostLastDecodedPixelFormat={realtimeHostSnapshot?.lastDecodedPixelFormat ?? ""}
                   handle={realtimeHandle}
                   loading={realtimeLoading}
                   error={realtimeError}

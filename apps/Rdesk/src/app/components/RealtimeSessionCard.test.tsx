@@ -36,6 +36,10 @@ describe("RealtimeSessionCard", () => {
         hostLastRemoteCodec="video/h264"
         hostRemoteH264AccessUnitCount={5}
         hostLastRemoteAccessUnitBytes={1200}
+        hostDecodedFrameCount={3}
+        hostLastDecodedWidth={1280}
+        hostLastDecodedHeight={720}
+        hostLastDecodedPixelFormat="Rgb24"
         loading={false}
         error={null}
         events={[
@@ -79,5 +83,7 @@ describe("RealtimeSessionCard", () => {
     expect(html).toContain("host-answer-sdp");
     expect(html).toContain("video/h264");
     expect(html).toContain("42");
+    expect(html).toContain("1280x720");
+    expect(html).toContain("Rgb24");
   });
 });

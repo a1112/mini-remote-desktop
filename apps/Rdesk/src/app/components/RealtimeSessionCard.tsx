@@ -23,6 +23,10 @@ interface RealtimeSessionCardProps {
   hostLastRemoteCodec: string;
   hostRemoteH264AccessUnitCount: number;
   hostLastRemoteAccessUnitBytes: number;
+  hostDecodedFrameCount: number;
+  hostLastDecodedWidth: number;
+  hostLastDecodedHeight: number;
+  hostLastDecodedPixelFormat: string;
   handle: number | null;
   loading: boolean;
   error: string | null;
@@ -68,6 +72,10 @@ export function RealtimeSessionCard({
   hostLastRemoteCodec,
   hostRemoteH264AccessUnitCount,
   hostLastRemoteAccessUnitBytes,
+  hostDecodedFrameCount,
+  hostLastDecodedWidth,
+  hostLastDecodedHeight,
+  hostLastDecodedPixelFormat,
   handle,
   loading,
   error,
@@ -216,6 +224,16 @@ export function RealtimeSessionCard({
           <RealtimeSessionMetric label="最近远端编解码" value={hostLastRemoteCodec || "-"} />
           <RealtimeSessionMetric label="H264 AU 数" value={String(hostRemoteH264AccessUnitCount)} />
           <RealtimeSessionMetric label="最近 AU 字节数" value={String(hostLastRemoteAccessUnitBytes)} />
+          <RealtimeSessionMetric label="已解码帧数" value={String(hostDecodedFrameCount)} />
+          <RealtimeSessionMetric
+            label="最近解码尺寸"
+            value={
+              hostLastDecodedWidth > 0 && hostLastDecodedHeight > 0
+                ? `${hostLastDecodedWidth}x${hostLastDecodedHeight}`
+                : "-"
+            }
+          />
+          <RealtimeSessionMetric label="最近解码格式" value={hostLastDecodedPixelFormat || "-"} />
         </div>
       </div>
 

@@ -9,6 +9,7 @@ use std::{
 use mrd_proto::SessionId;
 use mrd_signal_proto::{IceCandidate, SessionDescription};
 use crate::webrtc_media::H264AccessUnitAssembler;
+use mrd_decode::{DecodedFrame, PixelFormat, VideoDecoder};
 use webrtc::{
     api::{media_engine::MediaEngine, setting_engine::SettingEngine, APIBuilder},
     data_channel::data_channel_init::RTCDataChannelInit,
@@ -34,6 +35,10 @@ pub struct WebrtcHostSnapshot {
     pub last_remote_codec: Option<String>,
     pub remote_h264_access_unit_count: u64,
     pub last_remote_access_unit_bytes: usize,
+    pub decoded_frame_count: u64,
+    pub last_decoded_width: usize,
+    pub last_decoded_height: usize,
+    pub last_decoded_pixel_format: Option<String>,
 }
 
 #[derive(Debug)]
@@ -283,18 +288,32 @@ async fn build_peer_connection(
             } else {
                 None
             };
+            let mut decoder = if mime_type.eq_ignore_ascii_case("video/h264") {
+                match mrd_decode::create_decoder("h264_software") {
+                    Ok(decoder) => Some(decoder),
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
 
             while let Ok((_packet, _)) = track.read_rtp().await {
                 let packet_count = counter.fetch_add(1, Ordering::Relaxed) + 1;
                 let next_access_unit = h264_assembler.as_mut().and_then(|assembler| {
                     assembler.push_rtp_payload(&_packet.payload, _packet.header.marker)
                 });
-                let mut snapshot = snapshot.lock().expect("lock host snapshot");
-                snapshot.remote_rtp_packet_count = packet_count;
+                let mut snapshot_guard = snapshot.lock().expect("lock host snapshot");
+                snapshot_guard.remote_rtp_packet_count = packet_count;
                 if let Some(access_unit) = next_access_unit {
                     let access_unit_count = access_unit_counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    snapshot.remote_h264_access_unit_count = access_unit_count;
-                    snapshot.last_remote_access_unit_bytes = access_unit.len();
+                    snapshot_guard.remote_h264_access_unit_count = access_unit_count;
+                    snapshot_guard.last_remote_access_unit_bytes = access_unit.len();
+                    drop(snapshot_guard);
+                    if let Some(decoder) = decoder.as_mut() {
+                        let _ =
+                            decode_access_unit_into_snapshot(snapshot.clone(), decoder.as_mut(), &access_unit);
+                    }
+                    continue;
                 }
             }
         })
@@ -303,11 +322,49 @@ async fn build_peer_connection(
     Ok(pc)
 }
 
+fn decode_access_unit_into_snapshot(
+    snapshot: Arc<Mutex<WebrtcHostSnapshot>>,
+    decoder: &mut dyn VideoDecoder,
+    access_unit: &[u8],
+) -> Result<(), String> {
+    decoder
+        .push_access_unit(access_unit)
+        .map_err(|e| format!("software decoder 解码 access unit 失败: {e}"))?;
+    let frames = decoder.drain_decoded_frames();
+    apply_decoded_frames_to_snapshot(snapshot, frames);
+    Ok(())
+}
+
+fn apply_decoded_frames_to_snapshot(
+    snapshot: Arc<Mutex<WebrtcHostSnapshot>>,
+    frames: Vec<DecodedFrame>,
+) {
+    if frames.is_empty() {
+        return;
+    }
+
+    let mut snapshot = snapshot.lock().expect("lock host snapshot");
+    for frame in frames {
+        snapshot.decoded_frame_count += 1;
+        snapshot.last_decoded_width = frame.width;
+        snapshot.last_decoded_height = frame.height;
+        snapshot.last_decoded_pixel_format = Some(match frame.pixel_format {
+            PixelFormat::Rgb24 => "Rgb24".to_string(),
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use mrd_proto::SessionId;
+    use std::sync::{Arc, Mutex};
 
-    use super::WebrtcHost;
+    use mrd_proto::SessionId;
+    use openh264::{
+        encoder::Encoder,
+        formats::{RgbSliceU8, YUVBuffer},
+    };
+
+    use super::{decode_access_unit_into_snapshot, WebrtcHost, WebrtcHostSnapshot};
     use crate::webrtc_media::H264AccessUnitAssembler;
 
     #[tokio::test]
@@ -327,6 +384,10 @@ mod tests {
         assert_eq!(snapshot.remote_video_track_count, 0);
         assert_eq!(snapshot.remote_h264_access_unit_count, 0);
         assert_eq!(snapshot.last_remote_access_unit_bytes, 0);
+        assert_eq!(snapshot.decoded_frame_count, 0);
+        assert_eq!(snapshot.last_decoded_width, 0);
+        assert_eq!(snapshot.last_decoded_height, 0);
+        assert_eq!(snapshot.last_decoded_pixel_format, None);
     }
 
     #[tokio::test]
@@ -362,6 +423,33 @@ mod tests {
         assert!(controller_snapshot.remote_answer.is_some());
         assert!(agent_snapshot.remote_offer.is_some());
         assert!(agent_snapshot.local_answer.is_some());
+    }
+
+    #[test]
+    fn decoding_access_unit_updates_snapshot_statistics() {
+        let snapshot = Arc::new(Mutex::new(WebrtcHostSnapshot::default()));
+        let mut rgb = Vec::with_capacity(16 * 16 * 3);
+        for y in 0..16 {
+            for x in 0..16 {
+                rgb.push((x * 16) as u8);
+                rgb.push((y * 16) as u8);
+                rgb.push(96);
+            }
+        }
+        let rgb_source = RgbSliceU8::new(&rgb, (16, 16));
+        let yuv = YUVBuffer::from_rgb_source(rgb_source);
+        let mut encoder = Encoder::new().expect("openh264 encoder");
+        let access_unit = encoder.encode(&yuv).expect("encode access unit").to_vec();
+
+        let mut decoder = mrd_decode::create_decoder("h264_software").expect("decoder instance");
+        decode_access_unit_into_snapshot(snapshot.clone(), decoder.as_mut(), access_unit.as_slice())
+            .expect("decode access unit into snapshot");
+
+        let snapshot = snapshot.lock().expect("lock host snapshot").clone();
+        assert_eq!(snapshot.decoded_frame_count, 1);
+        assert_eq!(snapshot.last_decoded_width, 16);
+        assert_eq!(snapshot.last_decoded_height, 16);
+        assert_eq!(snapshot.last_decoded_pixel_format.as_deref(), Some("Rgb24"));
     }
 
     #[test]
