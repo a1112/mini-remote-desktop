@@ -12,6 +12,7 @@ mod webrtc_media;
 mod webrtc_session;
 mod render_window_registry;
 mod render_surface_catalog;
+mod session_lifecycle;
 
 use device_info::HardwareInfo;
 use frame_sink::{DecodedFrameSink, DecodedFrameSnapshot};
@@ -24,8 +25,9 @@ use realtime_runtime::{RealtimeRegistration, RealtimeRuntime};
 use render_host::{
     render_host_snapshot_with, RenderHost, RenderHostSnapshot, RendererSnapshotResponse,
 };
-use render_surface_catalog::{RenderSurfaceCatalog, RenderSurfaceDescriptor};
+use render_surface_catalog::RenderSurfaceDescriptor;
 use render_window_registry::{RenderWindowContext, RenderWindowRegistry};
+use session_lifecycle::{SessionLifecycleCoordinator, SessionLifecycleSnapshot, SurfaceSourceBinding};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tauri::Manager;
@@ -38,7 +40,7 @@ struct AppState {
     frame_sink: std::sync::Arc<std::sync::Mutex<DecodedFrameSink>>,
     render_host: std::sync::Arc<std::sync::Mutex<RenderHost>>,
     render_windows: std::sync::Arc<std::sync::Mutex<RenderWindowRegistry>>,
-    render_surfaces: std::sync::Arc<std::sync::Mutex<RenderSurfaceCatalog>>,
+    session_lifecycle: std::sync::Arc<std::sync::Mutex<SessionLifecycleCoordinator>>,
     realtime_runtime: RealtimeRuntime,
     webrtc_host: std::sync::Arc<Mutex<WebrtcHost>>,
     webrtc_sessions: std::sync::Arc<Mutex<WebrtcSessionCoordinator>>,
@@ -129,6 +131,15 @@ struct RenderSurfaceDescriptorResponse {
 struct SurfaceSourceBindingResponseResponse {
     surface_id: String,
     source_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct SessionLifecycleSnapshotResponse {
+    session_id: String,
+    current_surface_id: Option<String>,
+    surfaces: Vec<RenderSurfaceDescriptorResponse>,
+    available_source_ids: Vec<String>,
+    surface_source_bindings: Vec<SurfaceSourceBindingResponseResponse>,
 }
 
 /// Tauri 命令：获取硬件信息
@@ -527,6 +538,11 @@ async fn bind_render_surface_source(
     source_id: String,
 ) -> Result<(), String> {
     state
+        .session_lifecycle
+        .lock()
+        .expect("lock session lifecycle")
+        .bind_surface_source(SessionId(session_id.clone()), surface_id.clone(), source_id.clone())?;
+    state
         .render_host
         .lock()
         .expect("lock render host")
@@ -534,12 +550,37 @@ async fn bind_render_surface_source(
 }
 
 #[tauri::command]
+async fn session_lifecycle_snapshot(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+) -> Result<SessionLifecycleSnapshotResponse, String> {
+    let session_id = SessionId(session_id);
+    let available_source_ids = state
+        .render_host
+        .lock()
+        .expect("lock render host")
+        .snapshot(&session_id)?
+        .available_source_ids;
+    state
+        .session_lifecycle
+        .lock()
+        .expect("lock session lifecycle")
+        .update_available_sources(session_id.clone(), available_source_ids);
+    let snapshot = state
+        .session_lifecycle
+        .lock()
+        .expect("lock session lifecycle")
+        .snapshot(&session_id);
+    Ok(session_lifecycle_snapshot_response(snapshot))
+}
+
+#[tauri::command]
 fn open_render_window(app: tauri::AppHandle, session_id: String) -> Result<String, String> {
     let state = app.state::<AppState>();
     let surface_id = state
-        .render_surfaces
+        .session_lifecycle
         .lock()
-        .expect("lock render surface catalog")
+        .expect("lock session lifecycle")
         .create_surface(SessionId(session_id.clone()), None)
         .surface_id;
     let result = state
@@ -558,9 +599,9 @@ fn open_render_surface_window(
 ) -> Result<String, String> {
     let state = app.state::<AppState>();
     state
-        .render_surfaces
+        .session_lifecycle
         .lock()
-        .expect("lock render surface catalog")
+        .expect("lock session lifecycle")
         .ensure_surface(SessionId(session_id.clone()), surface_id.clone());
     let result = state
         .render_windows
@@ -620,12 +661,12 @@ fn list_render_surfaces(
     session_id: String,
 ) -> Result<Vec<RenderSurfaceDescriptorResponse>, String> {
     let session_id = SessionId(session_id);
-    let catalog = state
-        .render_surfaces
+    let lifecycle = state
+        .session_lifecycle
         .lock()
-        .expect("lock render surface catalog");
-    let current_surface_id = catalog.current_surface_id(&session_id);
-    let surfaces = catalog
+        .expect("lock session lifecycle");
+    let current_surface_id = lifecycle.current_surface_id(&session_id);
+    let surfaces = lifecycle
         .list_surfaces(&session_id)
         .into_iter()
         .map(|surface| render_surface_descriptor_response(surface, current_surface_id.as_deref()))
@@ -640,9 +681,9 @@ fn create_render_surface(
     name: Option<String>,
 ) -> Result<RenderSurfaceDescriptorResponse, String> {
     let surface = state
-        .render_surfaces
+        .session_lifecycle
         .lock()
-        .expect("lock render surface catalog")
+        .expect("lock session lifecycle")
         .create_surface(SessionId(session_id), name);
     let current_surface_id = surface.surface_id.clone();
     Ok(render_surface_descriptor_response(
@@ -658,9 +699,9 @@ fn select_current_render_surface(
     surface_id: String,
 ) -> Result<(), String> {
     state
-        .render_surfaces
+        .session_lifecycle
         .lock()
-        .expect("lock render surface catalog")
+        .expect("lock session lifecycle")
         .select_current_surface(SessionId(session_id), surface_id)
 }
 
@@ -670,9 +711,9 @@ fn current_render_surface(
     session_id: String,
 ) -> Result<Option<String>, String> {
     Ok(state
-        .render_surfaces
+        .session_lifecycle
         .lock()
-        .expect("lock render surface catalog")
+        .expect("lock session lifecycle")
         .current_surface_id(&SessionId(session_id)))
 }
 
@@ -882,6 +923,38 @@ fn render_surface_descriptor_response(
         surface_id: surface.surface_id,
         name: surface.name,
         role: surface.role,
+    }
+}
+
+fn surface_source_binding_response(
+    binding: SurfaceSourceBinding,
+) -> SurfaceSourceBindingResponseResponse {
+    SurfaceSourceBindingResponseResponse {
+        surface_id: binding.surface_id,
+        source_id: binding.source_id,
+    }
+}
+
+fn session_lifecycle_snapshot_response(
+    snapshot: SessionLifecycleSnapshot,
+) -> SessionLifecycleSnapshotResponse {
+    let current_surface_id = snapshot.current_surface_id.clone();
+    SessionLifecycleSnapshotResponse {
+        session_id: snapshot.session_id,
+        current_surface_id: current_surface_id.clone(),
+        surfaces: snapshot
+            .surfaces
+            .into_iter()
+            .map(|surface| {
+                render_surface_descriptor_response(surface, current_surface_id.as_deref())
+            })
+            .collect(),
+        available_source_ids: snapshot.available_source_ids,
+        surface_source_bindings: snapshot
+            .surface_source_bindings
+            .into_iter()
+            .map(surface_source_binding_response)
+            .collect(),
     }
 }
 
@@ -1095,13 +1168,14 @@ fn main() {
     let frame_sink = std::sync::Arc::new(std::sync::Mutex::new(DecodedFrameSink::default()));
     let render_host = std::sync::Arc::new(std::sync::Mutex::new(RenderHost::with_frame_sink(frame_sink.clone())));
     let render_windows = std::sync::Arc::new(std::sync::Mutex::new(RenderWindowRegistry::default()));
-    let render_surfaces = std::sync::Arc::new(std::sync::Mutex::new(RenderSurfaceCatalog::default()));
+    let session_lifecycle =
+        std::sync::Arc::new(std::sync::Mutex::new(SessionLifecycleCoordinator::default()));
     tauri::Builder::default()
         .manage(AppState {
             frame_sink: frame_sink.clone(),
             render_host,
             render_windows,
-            render_surfaces,
+            session_lifecycle,
             realtime_runtime: RealtimeRuntime::from_env(),
             webrtc_host: std::sync::Arc::new(Mutex::new(WebrtcHost::with_frame_sink(frame_sink))),
             webrtc_sessions: std::sync::Arc::new(Mutex::new(WebrtcSessionCoordinator::default())),
@@ -1136,6 +1210,7 @@ fn main() {
             decoded_frame_preview,
             render_host_attach_session,
             bind_render_surface_source,
+            session_lifecycle_snapshot,
             bind_current_render_window_surface,
             render_host_detach_session,
             render_host_snapshot,
