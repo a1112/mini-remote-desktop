@@ -1,4 +1,10 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+};
 
 use mrd_proto::SessionId;
 use mrd_signal_proto::{IceCandidate, SessionDescription};
@@ -11,6 +17,8 @@ use webrtc::{
         sdp::session_description::RTCSessionDescription,
         RTCPeerConnection,
     },
+    rtp_transceiver::{rtp_codec::RTPCodecType, RTCRtpTransceiverInit},
+    track::track_remote::TrackRemote,
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -20,12 +28,15 @@ pub struct WebrtcHostSnapshot {
     pub local_answer: Option<String>,
     pub remote_answer: Option<String>,
     pub remote_ice_count: usize,
+    pub remote_video_track_count: usize,
+    pub remote_rtp_packet_count: u64,
+    pub last_remote_codec: Option<String>,
 }
 
 #[derive(Debug)]
 struct HostedPeer {
     pc: Arc<RTCPeerConnection>,
-    snapshot: WebrtcHostSnapshot,
+    snapshot: Arc<Mutex<WebrtcHostSnapshot>>,
 }
 
 #[derive(Debug, Default)]
@@ -51,7 +62,11 @@ impl WebrtcHost {
             .sessions
             .get_mut(&session_id)
             .ok_or_else(|| format!("未找到 webrtc host 会话: {}", session_id.0))?;
-        session.snapshot.local_offer = Some(offer.sdp.clone());
+        session
+            .snapshot
+            .lock()
+            .expect("lock host snapshot")
+            .local_offer = Some(offer.sdp.clone());
 
         Ok(SessionDescription {
             session_id,
@@ -75,7 +90,11 @@ impl WebrtcHost {
             .sessions
             .get_mut(&session_id)
             .ok_or_else(|| format!("未找到 webrtc host 会话: {}", session_id.0))?;
-        session.snapshot.remote_offer = Some(sdp);
+        session
+            .snapshot
+            .lock()
+            .expect("lock host snapshot")
+            .remote_offer = Some(sdp);
         Ok(())
     }
 
@@ -96,7 +115,11 @@ impl WebrtcHost {
             .sessions
             .get_mut(&session_id)
             .ok_or_else(|| format!("未找到 webrtc host 会话: {}", session_id.0))?;
-        session.snapshot.local_answer = Some(answer.sdp.clone());
+        session
+            .snapshot
+            .lock()
+            .expect("lock host snapshot")
+            .local_answer = Some(answer.sdp.clone());
 
         Ok(SessionDescription {
             session_id,
@@ -120,7 +143,11 @@ impl WebrtcHost {
             .sessions
             .get_mut(&session_id)
             .ok_or_else(|| format!("未找到 webrtc host 会话: {}", session_id.0))?;
-        session.snapshot.remote_answer = Some(sdp);
+        session
+            .snapshot
+            .lock()
+            .expect("lock host snapshot")
+            .remote_answer = Some(sdp);
         Ok(())
     }
 
@@ -144,12 +171,21 @@ impl WebrtcHost {
             .sessions
             .get_mut(&session_id)
             .ok_or_else(|| format!("未找到 webrtc host 会话: {}", session_id.0))?;
-        session.snapshot.remote_ice_count += 1;
+        session
+            .snapshot
+            .lock()
+            .expect("lock host snapshot")
+            .remote_ice_count += 1;
         Ok(())
     }
 
-    pub fn snapshot(&self, session_id: &SessionId) -> Option<&WebrtcHostSnapshot> {
-        self.sessions.get(session_id).map(|peer| &peer.snapshot)
+    pub fn snapshot(&self, session_id: &SessionId) -> Option<WebrtcHostSnapshot> {
+        self.sessions.get(session_id).map(|peer| {
+            peer.snapshot
+                .lock()
+                .expect("lock host snapshot")
+                .clone()
+        })
     }
 
     async fn get_or_create_peer(
@@ -160,19 +196,22 @@ impl WebrtcHost {
             return Ok(peer.pc.clone());
         }
 
-        let pc = build_peer_connection().await?;
+        let snapshot = Arc::new(Mutex::new(WebrtcHostSnapshot::default()));
+        let pc = build_peer_connection(snapshot.clone()).await?;
         self.sessions.insert(
             session_id.clone(),
             HostedPeer {
                 pc: pc.clone(),
-                snapshot: WebrtcHostSnapshot::default(),
+                snapshot,
             },
         );
         Ok(pc)
     }
 }
 
-async fn build_peer_connection() -> Result<Arc<RTCPeerConnection>, String> {
+async fn build_peer_connection(
+    snapshot: Arc<Mutex<WebrtcHostSnapshot>>,
+) -> Result<Arc<RTCPeerConnection>, String> {
     let mut media_engine = MediaEngine::default();
     media_engine
         .register_default_codecs()
@@ -198,6 +237,16 @@ async fn build_peer_connection() -> Result<Arc<RTCPeerConnection>, String> {
         .map_err(|e| format!("创建 PeerConnection 失败: {}", e))?,
     );
 
+    pc.add_transceiver_from_kind(
+        RTPCodecType::Video,
+        Some(RTCRtpTransceiverInit {
+            direction: webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirection::Recvonly,
+            send_encodings: vec![],
+        }),
+    )
+    .await
+    .map_err(|e| format!("注册视频接收 transceiver 失败: {}", e))?;
+
     pc.create_data_channel(
         "control",
         Some(RTCDataChannelInit {
@@ -208,6 +257,27 @@ async fn build_peer_connection() -> Result<Arc<RTCPeerConnection>, String> {
     )
     .await
     .map_err(|e| format!("创建 control data channel 失败: {}", e))?;
+
+    let packet_counter = Arc::new(AtomicU64::new(0));
+    let on_track_snapshot = snapshot.clone();
+    let on_track_counter = packet_counter.clone();
+    pc.on_track(Box::new(move |track: Arc<TrackRemote>, _, _| {
+        let snapshot = on_track_snapshot.clone();
+        let counter = on_track_counter.clone();
+        Box::pin(async move {
+            {
+                let mut snapshot = snapshot.lock().expect("lock host snapshot");
+                snapshot.remote_video_track_count += 1;
+                snapshot.last_remote_codec = Some(track.codec().capability.mime_type.clone());
+            }
+
+            while let Ok((_packet, _)) = track.read_rtp().await {
+                let packet_count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                let mut snapshot = snapshot.lock().expect("lock host snapshot");
+                snapshot.remote_rtp_packet_count = packet_count;
+            }
+        })
+    }));
 
     Ok(pc)
 }
@@ -232,6 +302,7 @@ mod tests {
             .snapshot(&SessionId("session-1".into()))
             .expect("host snapshot");
         assert!(snapshot.local_offer.as_deref().unwrap_or_default().contains("m=application"));
+        assert_eq!(snapshot.remote_video_track_count, 0);
     }
 
     #[tokio::test]

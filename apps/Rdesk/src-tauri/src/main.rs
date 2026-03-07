@@ -56,6 +56,9 @@ struct WebrtcHostSnapshotResponse {
     local_answer: Option<String>,
     remote_answer: Option<String>,
     remote_ice_count: usize,
+    remote_video_track_count: usize,
+    remote_rtp_packet_count: u64,
+    last_remote_codec: Option<String>,
 }
 
 /// Tauri 命令：获取硬件信息
@@ -472,6 +475,9 @@ fn webrtc_host_snapshot_response(snapshot: &WebrtcHostSnapshot) -> WebrtcHostSna
         local_answer: snapshot.local_answer.clone(),
         remote_answer: snapshot.remote_answer.clone(),
         remote_ice_count: snapshot.remote_ice_count,
+        remote_video_track_count: snapshot.remote_video_track_count,
+        remote_rtp_packet_count: snapshot.remote_rtp_packet_count,
+        last_remote_codec: snapshot.last_remote_codec.clone(),
     }
 }
 
@@ -624,7 +630,7 @@ async fn webrtc_host_snapshot_with(
 ) -> Option<WebrtcHostSnapshotResponse> {
     let host = host.lock().await;
     host.snapshot(&SessionId(session_id))
-        .map(webrtc_host_snapshot_response)
+        .map(|snapshot| webrtc_host_snapshot_response(&snapshot))
 }
 
 fn main() {
@@ -907,6 +913,7 @@ mod tests {
 
         assert!(controller_snapshot.local_offer.is_some());
         assert!(controller_snapshot.remote_answer.is_some());
+        assert_eq!(controller_snapshot.remote_video_track_count, 0);
         assert!(agent_snapshot.remote_offer.is_some());
         assert!(agent_snapshot.local_answer.is_some());
     }
