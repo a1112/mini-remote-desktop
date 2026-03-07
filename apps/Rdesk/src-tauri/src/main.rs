@@ -446,6 +446,49 @@ async fn render_host_attach_session(
 }
 
 #[tauri::command]
+async fn bind_current_render_window_surface(
+    window: tauri::Window,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    surface_id: String,
+) -> Result<(), String> {
+    let window_label = window.label().to_string();
+    let window_handle = current_window_handle(&window)?;
+    let (session_id, previous_surface_id) = state
+        .render_windows
+        .lock()
+        .expect("lock render window registry")
+        .rebind_window_surface(&app, &window_label, surface_id.clone())?;
+
+    if let Some(previous_surface_id) = previous_surface_id {
+        let remaining_count = state
+            .render_windows
+            .lock()
+            .expect("lock render window registry")
+            .surface_window_count(&app, &session_id, &previous_surface_id);
+        if remaining_count == 0 {
+            state
+                .render_host
+                .lock()
+                .expect("lock render host")
+                .detach_surface(&session_id, &previous_surface_id);
+        }
+    }
+
+    state
+        .render_host
+        .lock()
+        .expect("lock render host")
+        .attach_session(session_id, surface_id, window_handle)?;
+    state
+        .render_windows
+        .lock()
+        .expect("lock render window registry")
+        .set_renderer_attached(&app, &window_label, true);
+    Ok(())
+}
+
+#[tauri::command]
 async fn render_host_detach_session(
     state: tauri::State<'_, AppState>,
     session_id: String,
@@ -1059,6 +1102,7 @@ fn main() {
             decoded_frame_snapshot,
             decoded_frame_preview,
             render_host_attach_session,
+            bind_current_render_window_surface,
             render_host_detach_session,
             render_host_snapshot,
             open_render_window,

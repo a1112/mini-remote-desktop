@@ -45,6 +45,11 @@ export const closeRenderWindow = async (label: string): Promise<void> =>
 export const getRenderWindowContext = async (): Promise<RenderWindowContext | null> =>
   invoke("render_window_context");
 
+export const bindCurrentRenderWindowSurface = async (surfaceId: string): Promise<void> =>
+  invoke("bind_current_render_window_surface", {
+    surfaceId,
+  });
+
 export const listRenderSurfaces = async (
   sessionId: string
 ): Promise<RenderSurfaceDescriptor[]> =>

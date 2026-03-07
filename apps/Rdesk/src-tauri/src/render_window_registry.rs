@@ -134,6 +134,38 @@ impl RenderWindowRegistry {
 
         None
     }
+
+    pub fn rebind_window_surface<R: tauri::Runtime>(
+        &mut self,
+        app: &tauri::AppHandle<R>,
+        label: &str,
+        surface_id: String,
+    ) -> Result<(SessionId, Option<String>), String> {
+        for (session_id, entries) in self.windows_by_session.iter_mut() {
+            entries.retain(|entry| app.get_window(&entry.label).is_some());
+            if let Some(entry) = entries.iter_mut().find(|entry| entry.label == label) {
+                let previous_surface_id = (entry.surface_id != surface_id).then(|| entry.surface_id.clone());
+                entry.surface_id = surface_id;
+                return Ok((session_id.clone(), previous_surface_id));
+            }
+        }
+
+        Err(format!("未找到渲染窗口: {}", label))
+    }
+
+    pub fn surface_window_count<R: tauri::Runtime>(
+        &mut self,
+        app: &tauri::AppHandle<R>,
+        session_id: &SessionId,
+        surface_id: &str,
+    ) -> usize {
+        let entries = self.windows_by_session.entry(session_id.clone()).or_default();
+        entries.retain(|entry| app.get_window(&entry.label).is_some());
+        entries
+            .iter()
+            .filter(|entry| entry.surface_id == surface_id)
+            .count()
+    }
 }
 
 #[cfg(test)]
@@ -206,5 +238,71 @@ mod tests {
         assert_eq!(context.role, "controller");
         assert!(context.renderer_attached);
         assert_eq!(context.session_window_count, 2);
+    }
+
+    #[test]
+    fn rebinding_window_surface_returns_previous_surface() {
+        let mut registry = RenderWindowRegistry::default();
+        let session = SessionId("session-a".into());
+        registry.windows_by_session.insert(
+            session.clone(),
+            vec![RenderWindowEntry {
+                label: "render-session-a-1".into(),
+                surface_id: "surface-1".into(),
+                role: "controller".into(),
+                renderer_attached: true,
+            }],
+        );
+
+        let entries = registry.windows_by_session.get_mut(&session).expect("entries");
+        let previous = if let Some(entry) = entries.iter_mut().find(|entry| entry.label == "render-session-a-1") {
+            let previous = (entry.surface_id != "surface-2").then(|| entry.surface_id.clone());
+            entry.surface_id = "surface-2".into();
+            previous
+        } else {
+            None
+        };
+
+        assert_eq!(previous.as_deref(), Some("surface-1"));
+        assert_eq!(entries[0].surface_id, "surface-2");
+    }
+
+    #[test]
+    fn surface_window_count_counts_matching_entries() {
+        let mut registry = RenderWindowRegistry::default();
+        let session = SessionId("session-a".into());
+        registry.windows_by_session.insert(
+            session,
+            vec![
+                RenderWindowEntry {
+                    label: "render-session-a-1".into(),
+                    surface_id: "surface-1".into(),
+                    role: "controller".into(),
+                    renderer_attached: true,
+                },
+                RenderWindowEntry {
+                    label: "render-session-a-2".into(),
+                    surface_id: "surface-1".into(),
+                    role: "controller".into(),
+                    renderer_attached: false,
+                },
+                RenderWindowEntry {
+                    label: "render-session-a-3".into(),
+                    surface_id: "surface-2".into(),
+                    role: "controller".into(),
+                    renderer_attached: false,
+                },
+            ],
+        );
+
+        let count = registry
+            .windows_by_session
+            .get(&SessionId("session-a".into()))
+            .expect("entries")
+            .iter()
+            .filter(|entry| entry.surface_id == "surface-1")
+            .count();
+
+        assert_eq!(count, 2);
     }
 }

@@ -79,6 +79,15 @@ impl RenderHost {
         self.renderers.remove(session_id);
     }
 
+    pub fn detach_surface(&mut self, session_id: &SessionId, surface_id: &str) {
+        if let Some(renderers) = self.renderers.get_mut(session_id) {
+            renderers.remove(surface_id);
+            if renderers.is_empty() {
+                self.renderers.remove(session_id);
+            }
+        }
+    }
+
     pub fn snapshot(&mut self, session_id: &SessionId) -> Result<RenderHostSnapshot, String> {
         let attached_surface_ids = self
             .renderers

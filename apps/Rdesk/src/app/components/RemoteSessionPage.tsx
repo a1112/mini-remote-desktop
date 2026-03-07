@@ -29,6 +29,7 @@ import {
   type RenderHostSnapshot,
 } from "../services/renderHostService";
 import {
+  bindCurrentRenderWindowSurface,
   closeRenderWindow,
   createRenderSurface,
   getCurrentRenderSurface,
@@ -228,6 +229,19 @@ export function RemoteSessionPage() {
     if (!id || !isTauriRuntime() || !selectedSessionSurfaceId) return;
     await openRenderSurfaceWindow(id, selectedSessionSurfaceId);
     setRenderWindows(await listRenderWindows(id));
+  };
+
+  const handleBindCurrentWindowSurface = async () => {
+    if (!isTauriRuntime() || !selectedSessionSurfaceId) return;
+    await bindCurrentRenderWindowSurface(selectedSessionSurfaceId);
+    const context = await getRenderWindowContext();
+    setCurrentSurfaceId(context?.surface_id ?? null);
+    setRendererAttached(context?.renderer_attached ?? false);
+    if (id) {
+      setRenderWindows(await listRenderWindows(id));
+      setRenderSurfaces(await listRenderSurfaces(id));
+      setRenderSnapshot(await getRenderHostSnapshot(id));
+    }
   };
 
   const handleTauriDragStart = (event: React.MouseEvent<HTMLDivElement>) => {
@@ -468,6 +482,14 @@ export function RemoteSessionPage() {
                   style={{ fontSize: 10 }}
                 >
                   打开已选 surface
+                </button>
+                <button
+                  onClick={() => void handleBindCurrentWindowSurface()}
+                  disabled={!selectedSessionSurfaceId || selectedSessionSurfaceId === currentSurfaceId}
+                  className="rounded-md bg-amber-500/15 px-2 py-1 text-amber-200 hover:bg-amber-500/25 disabled:cursor-not-allowed disabled:opacity-50"
+                  style={{ fontSize: 10 }}
+                >
+                  绑定当前窗口
                 </button>
               </div>
               <div className="rounded-md bg-white/6 px-2 py-2">

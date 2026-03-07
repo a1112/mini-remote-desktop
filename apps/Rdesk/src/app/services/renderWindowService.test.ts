@@ -166,4 +166,15 @@ describe("renderWindowService", () => {
     });
     expect(surfaceId).toBe("surface-2");
   });
+
+  it("rebinds the current render window to another surface", async () => {
+    invokeMock.mockResolvedValue(undefined);
+
+    const { bindCurrentRenderWindowSurface } = await import("./renderWindowService");
+    await bindCurrentRenderWindowSurface("surface-3");
+
+    expect(invokeMock).toHaveBeenCalledWith("bind_current_render_window_surface", {
+      surfaceId: "surface-3",
+    });
+  });
 });
