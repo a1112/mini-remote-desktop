@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "type", content = "payload")]
 pub enum SignalMessage {
     Register(RegisterRequest),
+    Registered(RegisteredResponse),
     SessionRequest(SessionRequest),
     SessionAccept(SessionAccept),
     WebrtcOffer(SessionDescription),
@@ -17,6 +18,11 @@ pub struct RegisterRequest {
     pub role: BackendRole,
     pub device_id: Option<DeviceId>,
     pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RegisteredResponse {
+    pub device_id: DeviceId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
