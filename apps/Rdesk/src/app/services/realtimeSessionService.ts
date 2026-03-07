@@ -75,6 +75,36 @@ export type DecodedFrameSnapshot = {
   bytes: number;
 };
 
+export type SessionRuntimeSnapshot = {
+  lifecycle: {
+    sessionId: string;
+    currentSurfaceId?: string;
+    surfaces: Array<{
+      current: boolean;
+      surfaceId: string;
+      name: string;
+      role: string;
+    }>;
+    availableSourceIds: string[];
+    surfaceSourceBindings: Array<{
+      surfaceId: string;
+      sourceId: string;
+    }>;
+  };
+  renderHost: {
+    attached: boolean;
+    surfaceCount: number;
+    attachedSurfaceIds: string[];
+    availableSourceIds: string[];
+    surfaceSourceBindings: Array<{
+      surfaceId: string;
+      sourceId: string;
+    }>;
+  };
+  webrtcHost: WebrtcHostSnapshot;
+  webrtcSignaling?: WebrtcSessionSnapshot | null;
+};
+
 type RealtimeRegistrationPayload = {
   handle: number;
   device_id: string;
@@ -247,4 +277,18 @@ export const getDecodedFramePreview = async (
 ): Promise<string | null> =>
   invoke<string | null>("decoded_frame_preview", {
     sessionId,
+  });
+
+export const getSessionRuntimeSnapshot = async (
+  sessionId: string
+): Promise<SessionRuntimeSnapshot> =>
+  invoke<SessionRuntimeSnapshot>("session_runtime_snapshot", {
+    sessionId,
+  });
+
+export const syncRealtimeIntoSessionRuntime = async (
+  handle: number
+): Promise<SessionRuntimeSnapshot | null> =>
+  invoke<SessionRuntimeSnapshot | null>("session_runtime_sync_realtime", {
+    handle,
   });

@@ -301,4 +301,78 @@ describe("realtimeSessionService", () => {
     });
     expect(preview).toBe("data:image/png;base64,abc123");
   });
+
+  it("reads aggregated session runtime snapshots via tauri invoke", async () => {
+    invokeMock
+      .mockResolvedValueOnce({
+        lifecycle: {
+          sessionId: "session-5",
+          currentSurfaceId: "surface-a",
+          surfaces: [
+            {
+              current: true,
+              surfaceId: "surface-a",
+              name: "Main",
+              role: "viewer",
+            },
+          ],
+          availableSourceIds: ["video-track-1"],
+          surfaceSourceBindings: [
+            {
+              surfaceId: "surface-a",
+              sourceId: "video-track-1",
+            },
+          ],
+        },
+        renderHost: {
+          attached: true,
+          surfaceCount: 1,
+          attachedSurfaceIds: ["surface-a"],
+          availableSourceIds: ["video-track-1"],
+          surfaceSourceBindings: [
+            {
+              surfaceId: "surface-a",
+              sourceId: "video-track-1",
+            },
+          ],
+        },
+        webrtcHost: {
+          remoteIceCount: 1,
+          remoteVideoTrackCount: 1,
+          remoteRtpPacketCount: 10,
+          remoteH264AccessUnitCount: 3,
+          lastRemoteAccessUnitBytes: 1200,
+          decodedFrameCount: 2,
+          lastDecodedWidth: 1280,
+          lastDecodedHeight: 720,
+          lastDecodedPixelFormat: "Rgb24",
+        },
+        webrtcSignaling: {
+          localOffer: "offer-sdp",
+          remoteOffer: "remote-offer-sdp",
+          remoteAnswer: "answer-sdp",
+          remoteIceCandidates: [],
+        },
+      })
+      .mockResolvedValueOnce(null);
+
+    const {
+      getSessionRuntimeSnapshot,
+      syncRealtimeIntoSessionRuntime,
+    } = await import("./realtimeSessionService");
+
+    const snapshot = await getSessionRuntimeSnapshot("session-5");
+    const syncedSnapshot = await syncRealtimeIntoSessionRuntime(9);
+
+    expect(invokeMock).toHaveBeenNthCalledWith(1, "session_runtime_snapshot", {
+      sessionId: "session-5",
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(2, "session_runtime_sync_realtime", {
+      handle: 9,
+    });
+    expect(snapshot.lifecycle.currentSurfaceId).toBe("surface-a");
+    expect(snapshot.renderHost.surfaceSourceBindings[0].sourceId).toBe("video-track-1");
+    expect(snapshot.webrtcHost.decodedFrameCount).toBe(2);
+    expect(syncedSnapshot).toBeNull();
+  });
 });
