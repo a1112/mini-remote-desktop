@@ -45,4 +45,22 @@ describe("renderWindowService", () => {
       label: "render-session-1-2",
     });
   });
+
+  it("reads the current render window context", async () => {
+    invokeMock.mockResolvedValue({
+      label: "render-session-1-2",
+      session_id: "session-1",
+      session_window_count: 2,
+    });
+
+    const { getRenderWindowContext } = await import("./renderWindowService");
+    const context = await getRenderWindowContext();
+
+    expect(invokeMock).toHaveBeenCalledWith("render_window_context");
+    expect(context).toEqual({
+      label: "render-session-1-2",
+      session_id: "session-1",
+      session_window_count: 2,
+    });
+  });
 });

@@ -1,7 +1,15 @@
 use std::collections::HashMap;
 
 use mrd_proto::SessionId;
+use serde::Serialize;
 use tauri::Manager;
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RenderWindowContext {
+    pub label: String,
+    pub session_id: String,
+    pub session_window_count: usize,
+}
 
 #[derive(Default)]
 pub struct RenderWindowRegistry {
@@ -60,11 +68,30 @@ impl RenderWindowRegistry {
 
         Ok(())
     }
+
+    pub fn context_for_label<R: tauri::Runtime>(
+        &mut self,
+        app: &tauri::AppHandle<R>,
+        label: &str,
+    ) -> Option<RenderWindowContext> {
+        for (session_id, labels) in self.windows_by_session.iter_mut() {
+            labels.retain(|candidate| app.get_window(candidate).is_some());
+            if labels.iter().any(|candidate| candidate == label) {
+                return Some(RenderWindowContext {
+                    label: label.to_string(),
+                    session_id: session_id.0.clone(),
+                    session_window_count: labels.len(),
+                });
+            }
+        }
+
+        None
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::RenderWindowRegistry;
+    use super::{RenderWindowContext, RenderWindowRegistry};
     use mrd_proto::SessionId;
 
     #[test]
@@ -79,5 +106,18 @@ mod tests {
 
         assert_eq!(first, "render-session-a-1");
         assert_eq!(second, "render-session-a-2");
+    }
+
+    #[test]
+    fn render_window_context_carries_label_and_session_counts() {
+        let context = RenderWindowContext {
+            label: "render-session-a-2".into(),
+            session_id: "session-a".into(),
+            session_window_count: 2,
+        };
+
+        assert_eq!(context.label, "render-session-a-2");
+        assert_eq!(context.session_id, "session-a");
+        assert_eq!(context.session_window_count, 2);
     }
 }

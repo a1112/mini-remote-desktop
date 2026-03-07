@@ -30,6 +30,7 @@ import {
 } from "../services/renderHostService";
 import {
   closeRenderWindow,
+  getRenderWindowContext,
   listRenderWindows,
   openRenderWindow,
 } from "../services/renderWindowService";
@@ -48,6 +49,8 @@ export function RemoteSessionPage() {
   const [isMaximized, setIsMaximized] = useState(false);
   const [renderSnapshot, setRenderSnapshot] = useState<RenderHostSnapshot | null>(null);
   const [renderWindows, setRenderWindows] = useState<string[]>([]);
+  const [currentRenderWindowLabel, setCurrentRenderWindowLabel] = useState<string | null>(null);
+  const [currentRenderWindowCount, setCurrentRenderWindowCount] = useState<number | null>(null);
 
   const noDragSelector =
     'button, a, input, select, textarea, [role="button"], [role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"], [data-radix-collection-item], [data-no-drag="true"]';
@@ -92,6 +95,25 @@ export function RemoteSessionPage() {
       void detachRenderHostSession(id).catch(() => {});
     };
   }, [id]);
+
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+
+    let active = true;
+
+    const refreshContext = async () => {
+      const context = await getRenderWindowContext();
+      if (!active) return;
+      setCurrentRenderWindowLabel(context?.label ?? null);
+      setCurrentRenderWindowCount(context?.session_window_count ?? null);
+    };
+
+    void refreshContext().catch(() => {});
+
+    return () => {
+      active = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (!id || !isTauriRuntime()) return;
@@ -339,10 +361,15 @@ export function RemoteSessionPage() {
                 <span style={{ fontSize: 11 }}>渲染窗口</span>
               </div>
               <span className="text-gray-400" style={{ fontSize: 11 }}>
-                {renderWindows.length}
+                {currentRenderWindowCount ?? renderWindows.length}
               </span>
             </div>
             <div className="px-3 py-2 space-y-2">
+              {currentRenderWindowLabel ? (
+                <div className="rounded-md bg-blue-500/10 px-2 py-1.5 text-blue-200" style={{ fontSize: 11 }}>
+                  当前窗口: {currentRenderWindowLabel}
+                </div>
+              ) : null}
               {renderWindows.length > 0 ? (
                 renderWindows.map((label) => (
                   <div

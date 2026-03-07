@@ -23,7 +23,7 @@ use realtime_runtime::{RealtimeRegistration, RealtimeRuntime};
 use render_host::{
     render_host_snapshot_with, RenderHost, RenderHostSnapshot, RendererSnapshotResponse,
 };
-use render_window_registry::RenderWindowRegistry;
+use render_window_registry::{RenderWindowContext, RenderWindowRegistry};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tauri::Manager;
@@ -97,6 +97,13 @@ struct RenderHostSnapshotResponse {
     preview_data_url: Option<String>,
     renderer_backend: Option<String>,
     renderer_snapshot: Option<RendererSnapshotResponse>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct RenderWindowContextResponse {
+    label: String,
+    session_id: String,
+    session_window_count: usize,
 }
 
 /// Tauri 命令：获取硬件信息
@@ -467,6 +474,22 @@ fn close_render_window(app: tauri::AppHandle, label: String) -> Result<(), Strin
     result
 }
 
+#[tauri::command]
+fn render_window_context(
+    window: tauri::Window,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<RenderWindowContextResponse>, String> {
+    let label = window.label().to_string();
+    let context = state
+        .render_windows
+        .lock()
+        .expect("lock render window registry")
+        .context_for_label(&app, &label)
+        .map(render_window_context_response);
+    Ok(context)
+}
+
 /// Tauri 命令：设备注册
 ///
 /// 调用后端 API 进行设备注册，后端根据主板序列号生成设备ID
@@ -638,6 +661,14 @@ fn render_host_snapshot_response(snapshot: RenderHostSnapshot) -> RenderHostSnap
         preview_data_url: snapshot.preview_data_url,
         renderer_backend: snapshot.renderer_backend,
         renderer_snapshot: snapshot.renderer_snapshot,
+    }
+}
+
+fn render_window_context_response(context: RenderWindowContext) -> RenderWindowContextResponse {
+    RenderWindowContextResponse {
+        label: context.label,
+        session_id: context.session_id,
+        session_window_count: context.session_window_count,
     }
 }
 
@@ -893,7 +924,8 @@ fn main() {
             render_host_snapshot,
             open_render_window,
             list_render_windows,
-            close_render_window
+            close_render_window,
+            render_window_context
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
