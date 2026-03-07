@@ -9,7 +9,7 @@ mod realtime_runtime;
 use device_info::HardwareInfo;
 use mrd_proto::{BackendRole, DeviceId, SessionId};
 use mrd_signal_client::encode_message;
-use mrd_signal_proto::SignalMessage;
+use mrd_signal_proto::{IceCandidate, SessionDescription, SignalMessage};
 use realtime_management::{RealtimeManagementClient, RealtimeStatus};
 use realtime_runtime::{RealtimeRegistration, RealtimeRuntime};
 use serde::{Deserialize, Serialize};
@@ -105,6 +105,67 @@ async fn realtime_drain_events(
         .into_iter()
         .map(|event| encode_message(&event).map_err(|e| format!("编码 realtime 事件失败: {}", e)))
         .collect()
+}
+
+#[tauri::command]
+async fn realtime_send_offer(
+    state: tauri::State<'_, AppState>,
+    handle: u64,
+    session_id: String,
+    sdp: String,
+) -> Result<(), String> {
+    state
+        .realtime_runtime
+        .send_offer(
+            handle,
+            SessionDescription {
+                session_id: SessionId(session_id),
+                sdp,
+            },
+        )
+        .await
+}
+
+#[tauri::command]
+async fn realtime_send_answer(
+    state: tauri::State<'_, AppState>,
+    handle: u64,
+    session_id: String,
+    sdp: String,
+) -> Result<(), String> {
+    state
+        .realtime_runtime
+        .send_answer(
+            handle,
+            SessionDescription {
+                session_id: SessionId(session_id),
+                sdp,
+            },
+        )
+        .await
+}
+
+#[tauri::command]
+async fn realtime_send_ice_candidate(
+    state: tauri::State<'_, AppState>,
+    handle: u64,
+    session_id: String,
+    candidate: String,
+    sdp_mid: Option<String>,
+    sdp_mline_index: Option<u16>,
+) -> Result<(), String> {
+    state
+        .realtime_runtime
+        .send_ice_candidate(
+            handle,
+            IceCandidate {
+                session_id: SessionId(session_id),
+                candidate,
+                sdp_mid,
+                sdp_mline_index,
+            },
+        )
+        .await
 }
 
 /// Tauri 命令：设备注册
@@ -241,7 +302,10 @@ fn main() {
             realtime_register,
             realtime_request_session,
             realtime_accept_session,
-            realtime_drain_events
+            realtime_drain_events,
+            realtime_send_offer,
+            realtime_send_answer,
+            realtime_send_ice_candidate
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

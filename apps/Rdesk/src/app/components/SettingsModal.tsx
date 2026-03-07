@@ -26,6 +26,9 @@ import {
   drainRealtimeEvents,
   registerRealtimeSession,
   requestRealtimeSession,
+  sendRealtimeAnswer,
+  sendRealtimeIceCandidate,
+  sendRealtimeOffer,
 } from "../services/realtimeSessionService";
 
 function Toggle({ value, onChange }: { value: boolean; onChange: (v: boolean) => void }) {
@@ -141,6 +144,13 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
   const [realtimeTargetDeviceId, setRealtimeTargetDeviceId] = useState("agent-1");
   const [realtimeHandle, setRealtimeHandle] = useState<number | null>(null);
   const [realtimeEvents, setRealtimeEvents] = useState<string[]>([]);
+  const [realtimeOfferSdp, setRealtimeOfferSdp] = useState("offer-sdp");
+  const [realtimeAnswerSdp, setRealtimeAnswerSdp] = useState("answer-sdp");
+  const [realtimeIceCandidate, setRealtimeIceCandidate] = useState(
+    "candidate:1 1 UDP 123 127.0.0.1 5000 typ host",
+  );
+  const [realtimeIceSdpMid, setRealtimeIceSdpMid] = useState("0");
+  const [realtimeIceSdpMlineIndex, setRealtimeIceSdpMlineIndex] = useState(0);
 
   useEffect(() => {
     if (open) {
@@ -267,6 +277,77 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
       setRealtimeEvents(nextEvents);
     } catch (error) {
       setRealtimeError(error instanceof Error ? error.message : "拉取 realtime 事件失败");
+    } finally {
+      setRealtimeLoading(false);
+    }
+  };
+
+  const sendRealtimeOfferSignal = async () => {
+    if (realtimeHandle === null) {
+      setRealtimeError("请先注册 realtime controller");
+      return;
+    }
+
+    setRealtimeLoading(true);
+    setRealtimeError(null);
+    try {
+      await sendRealtimeOffer({
+        handle: realtimeHandle,
+        sessionId: realtimeSessionId,
+        sdp: realtimeOfferSdp,
+      });
+      const nextEvents = await drainRealtimeEvents(realtimeHandle);
+      setRealtimeEvents(nextEvents);
+    } catch (error) {
+      setRealtimeError(error instanceof Error ? error.message : "发送 offer 失败");
+    } finally {
+      setRealtimeLoading(false);
+    }
+  };
+
+  const sendRealtimeAnswerSignal = async () => {
+    if (realtimeHandle === null) {
+      setRealtimeError("请先注册 realtime controller");
+      return;
+    }
+
+    setRealtimeLoading(true);
+    setRealtimeError(null);
+    try {
+      await sendRealtimeAnswer({
+        handle: realtimeHandle,
+        sessionId: realtimeSessionId,
+        sdp: realtimeAnswerSdp,
+      });
+      const nextEvents = await drainRealtimeEvents(realtimeHandle);
+      setRealtimeEvents(nextEvents);
+    } catch (error) {
+      setRealtimeError(error instanceof Error ? error.message : "发送 answer 失败");
+    } finally {
+      setRealtimeLoading(false);
+    }
+  };
+
+  const sendRealtimeIceSignal = async () => {
+    if (realtimeHandle === null) {
+      setRealtimeError("请先注册 realtime controller");
+      return;
+    }
+
+    setRealtimeLoading(true);
+    setRealtimeError(null);
+    try {
+      await sendRealtimeIceCandidate({
+        handle: realtimeHandle,
+        sessionId: realtimeSessionId,
+        candidate: realtimeIceCandidate,
+        sdpMid: realtimeIceSdpMid,
+        sdpMlineIndex: realtimeIceSdpMlineIndex,
+      });
+      const nextEvents = await drainRealtimeEvents(realtimeHandle);
+      setRealtimeEvents(nextEvents);
+    } catch (error) {
+      setRealtimeError(error instanceof Error ? error.message : "发送 ICE 失败");
     } finally {
       setRealtimeLoading(false);
     }
@@ -532,6 +613,11 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                   deviceId={realtimeDeviceId}
                   sessionId={realtimeSessionId}
                   targetDeviceId={realtimeTargetDeviceId}
+                  offerSdp={realtimeOfferSdp}
+                  answerSdp={realtimeAnswerSdp}
+                  iceCandidate={realtimeIceCandidate}
+                  iceSdpMid={realtimeIceSdpMid}
+                  iceSdpMlineIndex={realtimeIceSdpMlineIndex}
                   handle={realtimeHandle}
                   loading={realtimeLoading}
                   error={realtimeError}
@@ -539,9 +625,17 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                   onDeviceIdChange={setRealtimeDeviceId}
                   onSessionIdChange={setRealtimeSessionId}
                   onTargetDeviceIdChange={setRealtimeTargetDeviceId}
+                  onOfferSdpChange={setRealtimeOfferSdp}
+                  onAnswerSdpChange={setRealtimeAnswerSdp}
+                  onIceCandidateChange={setRealtimeIceCandidate}
+                  onIceSdpMidChange={setRealtimeIceSdpMid}
+                  onIceSdpMlineIndexChange={setRealtimeIceSdpMlineIndex}
                   onRegister={() => void registerRealtimeController()}
                   onRequest={() => void requestRealtimeControllerSession()}
                   onAccept={() => void acceptRealtimeControllerSession()}
+                  onSendOffer={() => void sendRealtimeOfferSignal()}
+                  onSendAnswer={() => void sendRealtimeAnswerSignal()}
+                  onSendIceCandidate={() => void sendRealtimeIceSignal()}
                   onRefreshEvents={() => void refreshRealtimeEvents()}
                 />
               </SettingsSection>

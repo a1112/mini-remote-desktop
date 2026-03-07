@@ -78,4 +78,50 @@ describe("realtimeSessionService", () => {
       "{\"type\":\"session\",\"action\":\"accept\",\"payload\":{\"sessionId\":\"session-1\"}}",
     ]);
   });
+
+  it("sends webrtc offer answer and ice via tauri invoke", async () => {
+    invokeMock.mockResolvedValue(undefined);
+
+    const {
+      sendRealtimeAnswer,
+      sendRealtimeIceCandidate,
+      sendRealtimeOffer,
+    } = await import("./realtimeSessionService");
+
+    await sendRealtimeOffer({
+      handle: 1,
+      sessionId: "session-1",
+      sdp: "offer-sdp",
+    });
+    await sendRealtimeAnswer({
+      handle: 1,
+      sessionId: "session-1",
+      sdp: "answer-sdp",
+    });
+    await sendRealtimeIceCandidate({
+      handle: 1,
+      sessionId: "session-1",
+      candidate: "candidate:1 1 UDP 123 127.0.0.1 5000 typ host",
+      sdpMid: "0",
+      sdpMlineIndex: 0,
+    });
+
+    expect(invokeMock).toHaveBeenNthCalledWith(1, "realtime_send_offer", {
+      handle: 1,
+      sessionId: "session-1",
+      sdp: "offer-sdp",
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(2, "realtime_send_answer", {
+      handle: 1,
+      sessionId: "session-1",
+      sdp: "answer-sdp",
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(3, "realtime_send_ice_candidate", {
+      handle: 1,
+      sessionId: "session-1",
+      candidate: "candidate:1 1 UDP 123 127.0.0.1 5000 typ host",
+      sdpMid: "0",
+      sdpMlineIndex: 0,
+    });
+  });
 });

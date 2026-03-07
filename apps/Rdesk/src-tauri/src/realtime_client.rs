@@ -2,7 +2,8 @@ use futures_util::{SinkExt, StreamExt};
 use mrd_proto::{BackendRole, DeviceId, SessionId};
 use mrd_signal_client::{decode_message, encode_message};
 use mrd_signal_proto::{
-    RegisterRequest, RegisteredResponse, SessionAccept, SessionRequest, SignalMessage,
+    IceCandidate, RegisterRequest, RegisteredResponse, SessionAccept, SessionDescription,
+    SessionRequest, SignalMessage,
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
@@ -109,6 +110,18 @@ impl RealtimeConnection {
             .await
     }
 
+    pub async fn send_offer(&mut self, description: SessionDescription) -> Result<(), String> {
+        self.send_message(SignalMessage::WebrtcOffer(description)).await
+    }
+
+    pub async fn send_answer(&mut self, description: SessionDescription) -> Result<(), String> {
+        self.send_message(SignalMessage::WebrtcAnswer(description)).await
+    }
+
+    pub async fn send_ice_candidate(&mut self, candidate: IceCandidate) -> Result<(), String> {
+        self.send_message(SignalMessage::IceCandidate(candidate)).await
+    }
+
     pub async fn recv_event(&mut self) -> Result<SignalMessage, String> {
         let Some(Ok(Message::Text(raw))) = self.socket.next().await else {
             return Err("未收到 signaling 事件".into());
@@ -147,7 +160,7 @@ mod tests {
     use futures_util::StreamExt;
     use mrd_proto::{BackendRole, DeviceId, SessionId};
     use mrd_signal_client::{decode_message, encode_message};
-    use mrd_signal_proto::{RegisteredResponse, SignalMessage};
+    use mrd_signal_proto::{IceCandidate, RegisteredResponse, SessionDescription, SignalMessage};
     use tokio::net::TcpListener;
 
     async fn ws_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
@@ -245,6 +258,56 @@ mod tests {
 
         let drained = connection.drain_inbound_events();
         assert_eq!(drained.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn offer_answer_and_ice_roundtrip_into_event_queue() {
+        let ws_url = spawn_server().await;
+        let client = RealtimeClient::new(ws_url);
+
+        let mut connection = client
+            .connect_and_register(
+                BackendRole::Controller,
+                Some(DeviceId("controller-1".into())),
+                "Rdesk".into(),
+            )
+            .await
+            .expect("connect and register");
+
+        connection
+            .send_offer(SessionDescription {
+                session_id: SessionId("session-1".into()),
+                sdp: "offer-sdp".into(),
+            })
+            .await
+            .expect("send offer");
+        let offer = connection.recv_event().await.expect("receive offer event");
+        assert!(matches!(offer, SignalMessage::WebrtcOffer(_)));
+
+        connection
+            .send_answer(SessionDescription {
+                session_id: SessionId("session-1".into()),
+                sdp: "answer-sdp".into(),
+            })
+            .await
+            .expect("send answer");
+        let answer = connection.recv_event().await.expect("receive answer event");
+        assert!(matches!(answer, SignalMessage::WebrtcAnswer(_)));
+
+        connection
+            .send_ice_candidate(IceCandidate {
+                session_id: SessionId("session-1".into()),
+                candidate: "candidate:1 1 UDP 123 127.0.0.1 5000 typ host".into(),
+                sdp_mid: Some("0".into()),
+                sdp_mline_index: Some(0),
+            })
+            .await
+            .expect("send ice candidate");
+        let ice = connection.recv_event().await.expect("receive ice event");
+        assert!(matches!(ice, SignalMessage::IceCandidate(_)));
+
+        let drained = connection.drain_inbound_events();
+        assert_eq!(drained.len(), 3);
     }
 
     #[test]

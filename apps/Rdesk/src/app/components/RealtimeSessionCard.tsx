@@ -4,6 +4,11 @@ interface RealtimeSessionCardProps {
   deviceId: string;
   sessionId: string;
   targetDeviceId: string;
+  offerSdp: string;
+  answerSdp: string;
+  iceCandidate: string;
+  iceSdpMid: string;
+  iceSdpMlineIndex: number;
   handle: number | null;
   loading: boolean;
   error: string | null;
@@ -11,9 +16,17 @@ interface RealtimeSessionCardProps {
   onDeviceIdChange: (value: string) => void;
   onSessionIdChange: (value: string) => void;
   onTargetDeviceIdChange: (value: string) => void;
+  onOfferSdpChange: (value: string) => void;
+  onAnswerSdpChange: (value: string) => void;
+  onIceCandidateChange: (value: string) => void;
+  onIceSdpMidChange: (value: string) => void;
+  onIceSdpMlineIndexChange: (value: number) => void;
   onRegister: () => void;
   onRequest: () => void;
   onAccept: () => void;
+  onSendOffer: () => void;
+  onSendAnswer: () => void;
+  onSendIceCandidate: () => void;
   onRefreshEvents: () => void;
 }
 
@@ -21,6 +34,11 @@ export function RealtimeSessionCard({
   deviceId,
   sessionId,
   targetDeviceId,
+  offerSdp,
+  answerSdp,
+  iceCandidate,
+  iceSdpMid,
+  iceSdpMlineIndex,
   handle,
   loading,
   error,
@@ -28,9 +46,17 @@ export function RealtimeSessionCard({
   onDeviceIdChange,
   onSessionIdChange,
   onTargetDeviceIdChange,
+  onOfferSdpChange,
+  onAnswerSdpChange,
+  onIceCandidateChange,
+  onIceSdpMidChange,
+  onIceSdpMlineIndexChange,
   onRegister,
   onRequest,
   onAccept,
+  onSendOffer,
+  onSendAnswer,
+  onSendIceCandidate,
   onRefreshEvents,
 }: RealtimeSessionCardProps) {
   const { isDark } = useTheme();
@@ -131,6 +157,100 @@ export function RealtimeSessionCard({
         </RealtimeActionButton>
         <RealtimeActionButton isDark={isDark} disabled={loading || handle === null} onClick={onAccept}>
           接受请求
+        </RealtimeActionButton>
+      </div>
+
+      <div className="grid grid-cols-2 gap-3 mt-3">
+        <label className="flex flex-col gap-1">
+          <span className={isDark ? "text-gray-400" : "text-gray-500"} style={{ fontSize: 11 }}>
+            Offer SDP
+          </span>
+          <textarea
+            value={offerSdp}
+            onChange={(event) => onOfferSdpChange(event.target.value)}
+            className={`px-3 py-2 rounded-lg border outline-none min-h-24 ${
+              isDark
+                ? "bg-[#1f1f1f] border-gray-700 text-gray-100"
+                : "bg-white border-gray-200 text-gray-800"
+            }`}
+            style={{ fontSize: 12 }}
+          />
+        </label>
+        <label className="flex flex-col gap-1">
+          <span className={isDark ? "text-gray-400" : "text-gray-500"} style={{ fontSize: 11 }}>
+            Answer SDP
+          </span>
+          <textarea
+            value={answerSdp}
+            onChange={(event) => onAnswerSdpChange(event.target.value)}
+            className={`px-3 py-2 rounded-lg border outline-none min-h-24 ${
+              isDark
+                ? "bg-[#1f1f1f] border-gray-700 text-gray-100"
+                : "bg-white border-gray-200 text-gray-800"
+            }`}
+            style={{ fontSize: 12 }}
+          />
+        </label>
+      </div>
+
+      <div className="grid grid-cols-3 gap-3 mt-3">
+        <label className="flex flex-col gap-1">
+          <span className={isDark ? "text-gray-400" : "text-gray-500"} style={{ fontSize: 11 }}>
+            ICE Candidate
+          </span>
+          <textarea
+            value={iceCandidate}
+            onChange={(event) => onIceCandidateChange(event.target.value)}
+            className={`px-3 py-2 rounded-lg border outline-none min-h-24 ${
+              isDark
+                ? "bg-[#1f1f1f] border-gray-700 text-gray-100"
+                : "bg-white border-gray-200 text-gray-800"
+            }`}
+            style={{ fontSize: 12 }}
+          />
+        </label>
+        <label className="flex flex-col gap-1">
+          <span className={isDark ? "text-gray-400" : "text-gray-500"} style={{ fontSize: 11 }}>
+            ICE Mid
+          </span>
+          <input
+            value={iceSdpMid}
+            onChange={(event) => onIceSdpMidChange(event.target.value)}
+            className={`px-3 py-2 rounded-lg border outline-none ${
+              isDark
+                ? "bg-[#1f1f1f] border-gray-700 text-gray-100"
+                : "bg-white border-gray-200 text-gray-800"
+            }`}
+            style={{ fontSize: 12 }}
+          />
+        </label>
+        <label className="flex flex-col gap-1">
+          <span className={isDark ? "text-gray-400" : "text-gray-500"} style={{ fontSize: 11 }}>
+            ICE MLine
+          </span>
+          <input
+            type="number"
+            value={iceSdpMlineIndex}
+            onChange={(event) => onIceSdpMlineIndexChange(Number(event.target.value))}
+            className={`px-3 py-2 rounded-lg border outline-none ${
+              isDark
+                ? "bg-[#1f1f1f] border-gray-700 text-gray-100"
+                : "bg-white border-gray-200 text-gray-800"
+            }`}
+            style={{ fontSize: 12 }}
+          />
+        </label>
+      </div>
+
+      <div className="flex gap-2 mt-3">
+        <RealtimeActionButton isDark={isDark} disabled={loading || handle === null} onClick={onSendOffer}>
+          发送 Offer
+        </RealtimeActionButton>
+        <RealtimeActionButton isDark={isDark} disabled={loading || handle === null} onClick={onSendAnswer}>
+          发送 Answer
+        </RealtimeActionButton>
+        <RealtimeActionButton isDark={isDark} disabled={loading || handle === null} onClick={onSendIceCandidate}>
+          发送 ICE
         </RealtimeActionButton>
       </div>
 

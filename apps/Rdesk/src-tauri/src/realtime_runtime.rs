@@ -1,7 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use mrd_proto::{BackendRole, DeviceId, SessionId};
-use mrd_signal_proto::SignalMessage;
+use mrd_signal_proto::{IceCandidate, SessionDescription, SignalMessage};
 use tokio::sync::Mutex;
 
 use crate::realtime_client::{RealtimeClient, RealtimeConnection};
@@ -102,6 +102,51 @@ impl RealtimeRuntime {
         Ok(connection.drain_inbound_events())
     }
 
+    pub async fn send_offer(
+        &self,
+        handle: u64,
+        description: SessionDescription,
+    ) -> Result<(), String> {
+        let mut state = self.inner.lock().await;
+        let connection = state
+            .connections
+            .get_mut(&handle)
+            .ok_or_else(|| format!("未找到 realtime 连接句柄: {}", handle))?;
+
+        connection.send_offer(description).await?;
+        connection.recv_event().await.map(|_| ())
+    }
+
+    pub async fn send_answer(
+        &self,
+        handle: u64,
+        description: SessionDescription,
+    ) -> Result<(), String> {
+        let mut state = self.inner.lock().await;
+        let connection = state
+            .connections
+            .get_mut(&handle)
+            .ok_or_else(|| format!("未找到 realtime 连接句柄: {}", handle))?;
+
+        connection.send_answer(description).await?;
+        connection.recv_event().await.map(|_| ())
+    }
+
+    pub async fn send_ice_candidate(
+        &self,
+        handle: u64,
+        candidate: IceCandidate,
+    ) -> Result<(), String> {
+        let mut state = self.inner.lock().await;
+        let connection = state
+            .connections
+            .get_mut(&handle)
+            .ok_or_else(|| format!("未找到 realtime 连接句柄: {}", handle))?;
+
+        connection.send_ice_candidate(candidate).await?;
+        connection.recv_event().await.map(|_| ())
+    }
+
     async fn next_handle(&self) -> u64 {
         let mut state = self.inner.lock().await;
         state.next_handle += 1;
@@ -121,7 +166,9 @@ mod tests {
     use futures_util::StreamExt;
     use mrd_proto::{BackendRole, DeviceId, SessionId};
     use mrd_signal_client::{decode_message, encode_message};
-    use mrd_signal_proto::{RegisteredResponse, SignalMessage};
+    use mrd_signal_proto::{
+        IceCandidate, RegisteredResponse, SessionDescription, SignalMessage,
+    };
     use tokio::net::TcpListener;
 
     async fn ws_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
@@ -224,5 +271,64 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert!(matches!(events[0], SignalMessage::SessionRequest(_)));
         assert!(matches!(events[1], SignalMessage::SessionAccept(_)));
+    }
+
+    #[tokio::test]
+    async fn offer_answer_and_ice_roundtrip_through_runtime_queue() {
+        let runtime = RealtimeRuntime::new(spawn_server().await);
+
+        let registration = runtime
+            .register(
+                BackendRole::Controller,
+                Some(DeviceId("controller-1".into())),
+                "Rdesk".into(),
+            )
+            .await
+            .expect("register runtime connection");
+
+        runtime
+            .send_offer(
+                registration.handle,
+                SessionDescription {
+                    session_id: SessionId("session-1".into()),
+                    sdp: "offer-sdp".into(),
+                },
+            )
+            .await
+            .expect("send offer");
+
+        runtime
+            .send_answer(
+                registration.handle,
+                SessionDescription {
+                    session_id: SessionId("session-1".into()),
+                    sdp: "answer-sdp".into(),
+                },
+            )
+            .await
+            .expect("send answer");
+
+        runtime
+            .send_ice_candidate(
+                registration.handle,
+                IceCandidate {
+                    session_id: SessionId("session-1".into()),
+                    candidate: "candidate:1 1 UDP 123 127.0.0.1 5000 typ host".into(),
+                    sdp_mid: Some("0".into()),
+                    sdp_mline_index: Some(0),
+                },
+            )
+            .await
+            .expect("send ice candidate");
+
+        let events = runtime
+            .drain_events(registration.handle)
+            .await
+            .expect("drain realtime events");
+
+        assert_eq!(events.len(), 3);
+        assert!(matches!(events[0], SignalMessage::WebrtcOffer(_)));
+        assert!(matches!(events[1], SignalMessage::WebrtcAnswer(_)));
+        assert!(matches!(events[2], SignalMessage::IceCandidate(_)));
     }
 }

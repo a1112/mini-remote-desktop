@@ -24,6 +24,20 @@ export type RealtimeSessionAccept = {
   sessionId: string;
 };
 
+export type RealtimeSessionDescription = {
+  handle: number;
+  sessionId: string;
+  sdp: string;
+};
+
+export type RealtimeIceCandidate = {
+  handle: number;
+  sessionId: string;
+  candidate: string;
+  sdpMid?: string;
+  sdpMlineIndex?: number;
+};
+
 type RealtimeRegistrationPayload = {
   handle: number;
   device_id: string;
@@ -63,3 +77,32 @@ export const acceptRealtimeSession = async (
 
 export const drainRealtimeEvents = async (handle: number): Promise<string[]> =>
   invoke<string[]>("realtime_drain_events", { handle });
+
+export const sendRealtimeOffer = async (
+  request: RealtimeSessionDescription
+): Promise<void> =>
+  invoke("realtime_send_offer", {
+    handle: request.handle,
+    sessionId: request.sessionId,
+    sdp: request.sdp,
+  });
+
+export const sendRealtimeAnswer = async (
+  request: RealtimeSessionDescription
+): Promise<void> =>
+  invoke("realtime_send_answer", {
+    handle: request.handle,
+    sessionId: request.sessionId,
+    sdp: request.sdp,
+  });
+
+export const sendRealtimeIceCandidate = async (
+  request: RealtimeIceCandidate
+): Promise<void> =>
+  invoke("realtime_send_ice_candidate", {
+    handle: request.handle,
+    sessionId: request.sessionId,
+    candidate: request.candidate,
+    sdpMid: request.sdpMid,
+    sdpMlineIndex: request.sdpMlineIndex,
+  });

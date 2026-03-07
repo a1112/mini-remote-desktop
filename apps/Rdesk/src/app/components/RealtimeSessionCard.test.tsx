@@ -17,6 +17,11 @@ describe("RealtimeSessionCard", () => {
         sessionId="session-1"
         targetDeviceId="agent-1"
         handle={7}
+        offerSdp="offer-sdp"
+        answerSdp="answer-sdp"
+        iceCandidate="candidate:1 1 UDP 123 127.0.0.1 5000 typ host"
+        iceSdpMid="0"
+        iceSdpMlineIndex={0}
         loading={false}
         error={null}
         events={[
@@ -26,9 +31,17 @@ describe("RealtimeSessionCard", () => {
         onDeviceIdChange={() => {}}
         onSessionIdChange={() => {}}
         onTargetDeviceIdChange={() => {}}
+        onOfferSdpChange={() => {}}
+        onAnswerSdpChange={() => {}}
+        onIceCandidateChange={() => {}}
+        onIceSdpMidChange={() => {}}
+        onIceSdpMlineIndexChange={() => {}}
         onRegister={() => {}}
         onRequest={() => {}}
         onAccept={() => {}}
+        onSendOffer={() => {}}
+        onSendAnswer={() => {}}
+        onSendIceCandidate={() => {}}
         onRefreshEvents={() => {}}
       />
     );
@@ -38,5 +51,11 @@ describe("RealtimeSessionCard", () => {
     expect(html).toContain("session-1");
     expect(html).toContain("request");
     expect(html).toContain("accept");
+    expect(html).toContain("Offer SDP");
+    expect(html).toContain("Answer SDP");
+    expect(html).toContain("ICE Candidate");
+    expect(html).toContain("发送 Offer");
+    expect(html).toContain("发送 Answer");
+    expect(html).toContain("发送 ICE");
   });
 });
