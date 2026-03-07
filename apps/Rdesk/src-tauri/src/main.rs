@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod device_info;
+mod realtime_client;
 mod realtime_management;
 
 use device_info::HardwareInfo;
