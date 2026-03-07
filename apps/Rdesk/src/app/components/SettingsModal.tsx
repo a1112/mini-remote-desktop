@@ -13,6 +13,7 @@ import {
   Settings,
 } from "lucide-react";
 import { useTheme } from "./ThemeContext";
+import { RealtimeSessionCard } from "./RealtimeSessionCard";
 import {
   getRealtimeStatus,
   restartRealtime,
@@ -20,6 +21,12 @@ import {
   stopRealtime,
   type RealtimeStatus,
 } from "../services/realtimeService";
+import {
+  acceptRealtimeSession,
+  drainRealtimeEvents,
+  registerRealtimeSession,
+  requestRealtimeSession,
+} from "../services/realtimeSessionService";
 
 function Toggle({ value, onChange }: { value: boolean; onChange: (v: boolean) => void }) {
   return (
@@ -129,6 +136,11 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
   const [realtimeStatus, setRealtimeStatus] = useState<RealtimeStatus | null>(null);
   const [realtimeLoading, setRealtimeLoading] = useState(false);
   const [realtimeError, setRealtimeError] = useState<string | null>(null);
+  const [realtimeDeviceId, setRealtimeDeviceId] = useState("controller-1");
+  const [realtimeSessionId, setRealtimeSessionId] = useState("session-1");
+  const [realtimeTargetDeviceId, setRealtimeTargetDeviceId] = useState("agent-1");
+  const [realtimeHandle, setRealtimeHandle] = useState<number | null>(null);
+  const [realtimeEvents, setRealtimeEvents] = useState<string[]>([]);
 
   useEffect(() => {
     if (open) {
@@ -174,6 +186,87 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
       setRealtimeStatus(next);
     } catch (error) {
       setRealtimeError(error instanceof Error ? error.message : "执行 realtime 操作失败");
+    } finally {
+      setRealtimeLoading(false);
+    }
+  };
+
+  const registerRealtimeController = async () => {
+    setRealtimeLoading(true);
+    setRealtimeError(null);
+    try {
+      const registration = await registerRealtimeSession({
+        role: "controller",
+        deviceId: realtimeDeviceId,
+        name: "Rdesk Controller",
+      });
+      setRealtimeHandle(registration.handle);
+      setRealtimeDeviceId(registration.deviceId);
+    } catch (error) {
+      setRealtimeError(error instanceof Error ? error.message : "注册 realtime 会话失败");
+    } finally {
+      setRealtimeLoading(false);
+    }
+  };
+
+  const requestRealtimeControllerSession = async () => {
+    if (realtimeHandle === null) {
+      setRealtimeError("请先注册 realtime controller");
+      return;
+    }
+
+    setRealtimeLoading(true);
+    setRealtimeError(null);
+    try {
+      await requestRealtimeSession({
+        handle: realtimeHandle,
+        sessionId: realtimeSessionId,
+        targetDeviceId: realtimeTargetDeviceId,
+      });
+      const nextEvents = await drainRealtimeEvents(realtimeHandle);
+      setRealtimeEvents(nextEvents);
+    } catch (error) {
+      setRealtimeError(error instanceof Error ? error.message : "发起 realtime session 失败");
+    } finally {
+      setRealtimeLoading(false);
+    }
+  };
+
+  const acceptRealtimeControllerSession = async () => {
+    if (realtimeHandle === null) {
+      setRealtimeError("请先注册 realtime controller");
+      return;
+    }
+
+    setRealtimeLoading(true);
+    setRealtimeError(null);
+    try {
+      await acceptRealtimeSession({
+        handle: realtimeHandle,
+        sessionId: realtimeSessionId,
+      });
+      const nextEvents = await drainRealtimeEvents(realtimeHandle);
+      setRealtimeEvents(nextEvents);
+    } catch (error) {
+      setRealtimeError(error instanceof Error ? error.message : "接受 realtime session 失败");
+    } finally {
+      setRealtimeLoading(false);
+    }
+  };
+
+  const refreshRealtimeEvents = async () => {
+    if (realtimeHandle === null) {
+      setRealtimeError("请先注册 realtime controller");
+      return;
+    }
+
+    setRealtimeLoading(true);
+    setRealtimeError(null);
+    try {
+      const nextEvents = await drainRealtimeEvents(realtimeHandle);
+      setRealtimeEvents(nextEvents);
+    } catch (error) {
+      setRealtimeError(error instanceof Error ? error.message : "拉取 realtime 事件失败");
     } finally {
       setRealtimeLoading(false);
     }
@@ -435,6 +528,22 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                     </ActionButton>
                   </div>
                 </div>
+                <RealtimeSessionCard
+                  deviceId={realtimeDeviceId}
+                  sessionId={realtimeSessionId}
+                  targetDeviceId={realtimeTargetDeviceId}
+                  handle={realtimeHandle}
+                  loading={realtimeLoading}
+                  error={realtimeError}
+                  events={realtimeEvents}
+                  onDeviceIdChange={setRealtimeDeviceId}
+                  onSessionIdChange={setRealtimeSessionId}
+                  onTargetDeviceIdChange={setRealtimeTargetDeviceId}
+                  onRegister={() => void registerRealtimeController()}
+                  onRequest={() => void requestRealtimeControllerSession()}
+                  onAccept={() => void acceptRealtimeControllerSession()}
+                  onRefreshEvents={() => void refreshRealtimeEvents()}
+                />
               </SettingsSection>
             )}
 
