@@ -22,6 +22,10 @@ describe("RealtimeSessionCard", () => {
         iceCandidate="candidate:1 1 UDP 123 127.0.0.1 5000 typ host"
         iceSdpMid="0"
         iceSdpMlineIndex={0}
+        snapshotLocalOffer="offer-sdp"
+        snapshotRemoteOffer="remote-offer-sdp"
+        snapshotRemoteAnswer="answer-sdp"
+        snapshotRemoteIceCount={1}
         loading={false}
         error={null}
         events={[
@@ -43,6 +47,7 @@ describe("RealtimeSessionCard", () => {
         onSendAnswer={() => {}}
         onSendIceCandidate={() => {}}
         onRefreshEvents={() => {}}
+        onSyncSnapshot={() => {}}
       />
     );
 
@@ -57,5 +62,8 @@ describe("RealtimeSessionCard", () => {
     expect(html).toContain("发送 Offer");
     expect(html).toContain("发送 Answer");
     expect(html).toContain("发送 ICE");
+    expect(html).toContain("同步快照");
+    expect(html).toContain("协商快照");
+    expect(html).toContain("remote-offer-sdp");
   });
 });

@@ -9,6 +9,10 @@ interface RealtimeSessionCardProps {
   iceCandidate: string;
   iceSdpMid: string;
   iceSdpMlineIndex: number;
+  snapshotLocalOffer: string;
+  snapshotRemoteOffer: string;
+  snapshotRemoteAnswer: string;
+  snapshotRemoteIceCount: number;
   handle: number | null;
   loading: boolean;
   error: string | null;
@@ -28,6 +32,7 @@ interface RealtimeSessionCardProps {
   onSendAnswer: () => void;
   onSendIceCandidate: () => void;
   onRefreshEvents: () => void;
+  onSyncSnapshot: () => void;
 }
 
 export function RealtimeSessionCard({
@@ -39,6 +44,10 @@ export function RealtimeSessionCard({
   iceCandidate,
   iceSdpMid,
   iceSdpMlineIndex,
+  snapshotLocalOffer,
+  snapshotRemoteOffer,
+  snapshotRemoteAnswer,
+  snapshotRemoteIceCount,
   handle,
   loading,
   error,
@@ -58,6 +67,7 @@ export function RealtimeSessionCard({
   onSendAnswer,
   onSendIceCandidate,
   onRefreshEvents,
+  onSyncSnapshot,
 }: RealtimeSessionCardProps) {
   const { isDark } = useTheme();
 
@@ -72,18 +82,32 @@ export function RealtimeSessionCard({
             使用最小 WebSocket 会话链做 controller/agent 调试，不直接进入完整媒体协商。
           </div>
         </div>
-        <button
-          onClick={onRefreshEvents}
-          disabled={loading || handle === null}
-          className={`px-3 py-1.5 rounded-lg border transition-colors ${
-            isDark
-              ? "border-gray-600 text-gray-300 hover:bg-gray-800 disabled:opacity-50"
-              : "border-gray-200 text-gray-700 hover:bg-gray-50 disabled:opacity-50"
-          }`}
-          style={{ fontSize: 12 }}
-        >
-          拉取事件
-        </button>
+        <div className="flex gap-2">
+          <button
+            onClick={onRefreshEvents}
+            disabled={loading || handle === null}
+            className={`px-3 py-1.5 rounded-lg border transition-colors ${
+              isDark
+                ? "border-gray-600 text-gray-300 hover:bg-gray-800 disabled:opacity-50"
+                : "border-gray-200 text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+            }`}
+            style={{ fontSize: 12 }}
+          >
+            拉取事件
+          </button>
+          <button
+            onClick={onSyncSnapshot}
+            disabled={loading || handle === null}
+            className={`px-3 py-1.5 rounded-lg border transition-colors ${
+              isDark
+                ? "border-gray-600 text-gray-300 hover:bg-gray-800 disabled:opacity-50"
+                : "border-gray-200 text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+            }`}
+            style={{ fontSize: 12 }}
+          >
+            同步快照
+          </button>
+        </div>
       </div>
 
       <div className="grid grid-cols-3 gap-3 mt-3">
@@ -137,6 +161,21 @@ export function RealtimeSessionCard({
       <div className="grid grid-cols-2 gap-3 mt-3">
         <RealtimeSessionMetric label="连接句柄" value={handle === null ? "-" : String(handle)} />
         <RealtimeSessionMetric label="最近事件数" value={String(events.length)} />
+      </div>
+
+      <div
+        className={`mt-3 rounded-lg border px-3 py-2 ${isDark ? "border-gray-700 bg-[#1f1f1f]" : "border-gray-200 bg-gray-50"}`}
+        style={{ fontSize: 12 }}
+      >
+        <div className={isDark ? "text-gray-300" : "text-gray-700"} style={{ fontSize: 12 }}>
+          协商快照
+        </div>
+        <div className="grid grid-cols-2 gap-3 mt-2">
+          <RealtimeSessionMetric label="本地 Offer" value={snapshotLocalOffer || "-"} />
+          <RealtimeSessionMetric label="远端 Offer" value={snapshotRemoteOffer || "-"} />
+          <RealtimeSessionMetric label="远端 Answer" value={snapshotRemoteAnswer || "-"} />
+          <RealtimeSessionMetric label="远端 ICE 数" value={String(snapshotRemoteIceCount)} />
+        </div>
       </div>
 
       {error && (

@@ -23,12 +23,18 @@ import {
 } from "../services/realtimeService";
 import {
   acceptRealtimeSession,
+  createWebrtcLocalOffer,
   drainRealtimeEvents,
+  getWebrtcSnapshot,
+  applyWebrtcRemoteAnswer,
+  applyWebrtcRemoteIceCandidate,
   registerRealtimeSession,
   requestRealtimeSession,
   sendRealtimeAnswer,
   sendRealtimeIceCandidate,
   sendRealtimeOffer,
+  syncWebrtcRealtimeEvents,
+  type WebrtcSessionSnapshot,
 } from "../services/realtimeSessionService";
 
 function Toggle({ value, onChange }: { value: boolean; onChange: (v: boolean) => void }) {
@@ -151,6 +157,7 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
   );
   const [realtimeIceSdpMid, setRealtimeIceSdpMid] = useState("0");
   const [realtimeIceSdpMlineIndex, setRealtimeIceSdpMlineIndex] = useState(0);
+  const [realtimeSnapshot, setRealtimeSnapshot] = useState<WebrtcSessionSnapshot | null>(null);
 
   useEffect(() => {
     if (open) {
@@ -282,6 +289,39 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
     }
   };
 
+  const refreshWebrtcSnapshot = async () => {
+    setRealtimeLoading(true);
+    setRealtimeError(null);
+    try {
+      const snapshot = await getWebrtcSnapshot(realtimeSessionId);
+      setRealtimeSnapshot(snapshot);
+    } catch (error) {
+      setRealtimeError(error instanceof Error ? error.message : "读取 webrtc 快照失败");
+    } finally {
+      setRealtimeLoading(false);
+    }
+  };
+
+  const syncRealtimeEventsIntoWebrtcSnapshot = async () => {
+    if (realtimeHandle === null) {
+      setRealtimeError("请先注册 realtime controller");
+      return;
+    }
+
+    setRealtimeLoading(true);
+    setRealtimeError(null);
+    try {
+      const snapshot = await syncWebrtcRealtimeEvents(realtimeHandle);
+      setRealtimeSnapshot(snapshot);
+      const nextEvents = await drainRealtimeEvents(realtimeHandle);
+      setRealtimeEvents(nextEvents);
+    } catch (error) {
+      setRealtimeError(error instanceof Error ? error.message : "同步 webrtc 快照失败");
+    } finally {
+      setRealtimeLoading(false);
+    }
+  };
+
   const sendRealtimeOfferSignal = async () => {
     if (realtimeHandle === null) {
       setRealtimeError("请先注册 realtime controller");
@@ -291,11 +331,15 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
     setRealtimeLoading(true);
     setRealtimeError(null);
     try {
+      const localOffer = await createWebrtcLocalOffer(realtimeSessionId, realtimeOfferSdp);
       await sendRealtimeOffer({
         handle: realtimeHandle,
         sessionId: realtimeSessionId,
-        sdp: realtimeOfferSdp,
+        sdp: localOffer,
       });
+      setRealtimeOfferSdp(localOffer);
+      const snapshot = await getWebrtcSnapshot(realtimeSessionId);
+      setRealtimeSnapshot(snapshot);
       const nextEvents = await drainRealtimeEvents(realtimeHandle);
       setRealtimeEvents(nextEvents);
     } catch (error) {
@@ -314,11 +358,14 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
     setRealtimeLoading(true);
     setRealtimeError(null);
     try {
+      await applyWebrtcRemoteAnswer(realtimeSessionId, realtimeAnswerSdp);
       await sendRealtimeAnswer({
         handle: realtimeHandle,
         sessionId: realtimeSessionId,
         sdp: realtimeAnswerSdp,
       });
+      const snapshot = await getWebrtcSnapshot(realtimeSessionId);
+      setRealtimeSnapshot(snapshot);
       const nextEvents = await drainRealtimeEvents(realtimeHandle);
       setRealtimeEvents(nextEvents);
     } catch (error) {
@@ -337,6 +384,12 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
     setRealtimeLoading(true);
     setRealtimeError(null);
     try {
+      await applyWebrtcRemoteIceCandidate({
+        sessionId: realtimeSessionId,
+        candidate: realtimeIceCandidate,
+        sdpMid: realtimeIceSdpMid,
+        sdpMlineIndex: realtimeIceSdpMlineIndex,
+      });
       await sendRealtimeIceCandidate({
         handle: realtimeHandle,
         sessionId: realtimeSessionId,
@@ -344,6 +397,8 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
         sdpMid: realtimeIceSdpMid,
         sdpMlineIndex: realtimeIceSdpMlineIndex,
       });
+      const snapshot = await getWebrtcSnapshot(realtimeSessionId);
+      setRealtimeSnapshot(snapshot);
       const nextEvents = await drainRealtimeEvents(realtimeHandle);
       setRealtimeEvents(nextEvents);
     } catch (error) {
@@ -618,6 +673,10 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                   iceCandidate={realtimeIceCandidate}
                   iceSdpMid={realtimeIceSdpMid}
                   iceSdpMlineIndex={realtimeIceSdpMlineIndex}
+                  snapshotLocalOffer={realtimeSnapshot?.localOffer ?? ""}
+                  snapshotRemoteOffer={realtimeSnapshot?.remoteOffer ?? ""}
+                  snapshotRemoteAnswer={realtimeSnapshot?.remoteAnswer ?? ""}
+                  snapshotRemoteIceCount={realtimeSnapshot?.remoteIceCandidates.length ?? 0}
                   handle={realtimeHandle}
                   loading={realtimeLoading}
                   error={realtimeError}
@@ -637,7 +696,22 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                   onSendAnswer={() => void sendRealtimeAnswerSignal()}
                   onSendIceCandidate={() => void sendRealtimeIceSignal()}
                   onRefreshEvents={() => void refreshRealtimeEvents()}
+                  onSyncSnapshot={() => void syncRealtimeEventsIntoWebrtcSnapshot()}
                 />
+                <div className="mt-3">
+                  <button
+                    onClick={() => void refreshWebrtcSnapshot()}
+                    disabled={realtimeLoading}
+                    className={`px-3 py-1.5 rounded-lg border transition-colors ${
+                      isDark
+                        ? "border-gray-600 text-gray-300 hover:bg-gray-800 disabled:opacity-50"
+                        : "border-gray-200 text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+                    }`}
+                    style={{ fontSize: 12 }}
+                  >
+                    读取当前快照
+                  </button>
+                </div>
               </SettingsSection>
             )}
 
