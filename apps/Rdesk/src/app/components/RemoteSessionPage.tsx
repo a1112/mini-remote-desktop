@@ -28,7 +28,11 @@ import {
   getRenderHostSnapshot,
   type RenderHostSnapshot,
 } from "../services/renderHostService";
-import { openRenderWindow } from "../services/renderWindowService";
+import {
+  closeRenderWindow,
+  listRenderWindows,
+  openRenderWindow,
+} from "../services/renderWindowService";
 
 export function RemoteSessionPage() {
   const { id } = useParams();
@@ -43,6 +47,7 @@ export function RemoteSessionPage() {
   const [elapsed, setElapsed] = useState(0);
   const [isMaximized, setIsMaximized] = useState(false);
   const [renderSnapshot, setRenderSnapshot] = useState<RenderHostSnapshot | null>(null);
+  const [renderWindows, setRenderWindows] = useState<string[]>([]);
 
   const noDragSelector =
     'button, a, input, select, textarea, [role="button"], [role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"], [data-radix-collection-item], [data-no-drag="true"]';
@@ -88,6 +93,28 @@ export function RemoteSessionPage() {
     };
   }, [id]);
 
+  useEffect(() => {
+    if (!id || !isTauriRuntime()) return;
+
+    let active = true;
+
+    const refreshWindows = async () => {
+      const labels = await listRenderWindows(id);
+      if (active) setRenderWindows(labels);
+    };
+
+    void refreshWindows().catch(() => {});
+
+    const timer = window.setInterval(() => {
+      void refreshWindows().catch(() => {});
+    }, 2000);
+
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [id]);
+
   const formatTime = (s: number) => {
     const m = Math.floor(s / 60);
     const sec = s % 60;
@@ -102,6 +129,13 @@ export function RemoteSessionPage() {
   const handlePopOutWindow = async () => {
     if (!id || !isTauriRuntime()) return;
     await openRenderWindow(id);
+    setRenderWindows(await listRenderWindows(id));
+  };
+
+  const handleCloseRenderWindow = async (label: string) => {
+    if (!id || !isTauriRuntime()) return;
+    await closeRenderWindow(label);
+    setRenderWindows(await listRenderWindows(id));
   };
 
   const handleTauriDragStart = (event: React.MouseEvent<HTMLDivElement>) => {
@@ -296,6 +330,45 @@ export function RemoteSessionPage() {
           <div className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />
           连接稳定
         </div>
+
+        {isTauriRuntime() ? (
+          <div className="absolute top-3 left-3 w-72 max-w-[calc(100%-1.5rem)] rounded-lg bg-black/60 backdrop-blur-sm border border-white/10 text-gray-300">
+            <div className="flex items-center justify-between px-3 py-2 border-b border-white/10">
+              <div className="flex items-center gap-2">
+                <Monitor style={{ width: 12, height: 12 }} className="text-blue-300" />
+                <span style={{ fontSize: 11 }}>渲染窗口</span>
+              </div>
+              <span className="text-gray-400" style={{ fontSize: 11 }}>
+                {renderWindows.length}
+              </span>
+            </div>
+            <div className="px-3 py-2 space-y-2">
+              {renderWindows.length > 0 ? (
+                renderWindows.map((label) => (
+                  <div
+                    key={label}
+                    className="flex items-center justify-between gap-2 rounded-md bg-white/6 px-2 py-1.5"
+                  >
+                    <span className="truncate text-gray-300" style={{ fontSize: 11 }}>
+                      {label}
+                    </span>
+                    <button
+                      onClick={() => void handleCloseRenderWindow(label)}
+                      className="rounded-md px-2 py-1 text-red-300 hover:bg-red-500/15"
+                      style={{ fontSize: 10 }}
+                    >
+                      关闭
+                    </button>
+                  </div>
+                ))
+              ) : (
+                <div className="text-gray-500" style={{ fontSize: 11 }}>
+                  当前会话还没有独立渲染窗口
+                </div>
+              )}
+            </div>
+          </div>
+        ) : null}
 
         {/* Device info badge */}
         <div className="absolute bottom-3 left-3 px-2.5 py-1.5 rounded-lg bg-black/60 backdrop-blur-sm border border-white/10 text-gray-400" style={{ fontSize: 11 }}>
