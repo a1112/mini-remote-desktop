@@ -26,6 +26,11 @@ describe("RealtimeSessionCard", () => {
         snapshotRemoteOffer="remote-offer-sdp"
         snapshotRemoteAnswer="answer-sdp"
         snapshotRemoteIceCount={1}
+        hostLocalOffer="host-offer-sdp"
+        hostRemoteOffer="host-remote-offer-sdp"
+        hostLocalAnswer="host-answer-sdp"
+        hostRemoteAnswer="host-remote-answer-sdp"
+        hostRemoteIceCount={2}
         loading={false}
         error={null}
         events={[
@@ -59,11 +64,13 @@ describe("RealtimeSessionCard", () => {
     expect(html).toContain("Offer SDP");
     expect(html).toContain("Answer SDP");
     expect(html).toContain("ICE Candidate");
-    expect(html).toContain("发送 Offer");
-    expect(html).toContain("发送 Answer");
-    expect(html).toContain("发送 ICE");
+    expect(html).toContain("生成 Offer 并发送");
+    expect(html).toContain("生成 Answer 并发送");
+    expect(html).toContain("应用并发送 ICE");
     expect(html).toContain("同步快照");
     expect(html).toContain("协商快照");
     expect(html).toContain("remote-offer-sdp");
+    expect(html).toContain("Native Host 快照");
+    expect(html).toContain("host-answer-sdp");
   });
 });

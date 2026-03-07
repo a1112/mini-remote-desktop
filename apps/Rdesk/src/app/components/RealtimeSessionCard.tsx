@@ -13,6 +13,11 @@ interface RealtimeSessionCardProps {
   snapshotRemoteOffer: string;
   snapshotRemoteAnswer: string;
   snapshotRemoteIceCount: number;
+  hostLocalOffer: string;
+  hostRemoteOffer: string;
+  hostLocalAnswer: string;
+  hostRemoteAnswer: string;
+  hostRemoteIceCount: number;
   handle: number | null;
   loading: boolean;
   error: string | null;
@@ -48,6 +53,11 @@ export function RealtimeSessionCard({
   snapshotRemoteOffer,
   snapshotRemoteAnswer,
   snapshotRemoteIceCount,
+  hostLocalOffer,
+  hostRemoteOffer,
+  hostLocalAnswer,
+  hostRemoteAnswer,
+  hostRemoteIceCount,
   handle,
   loading,
   error,
@@ -178,6 +188,22 @@ export function RealtimeSessionCard({
         </div>
       </div>
 
+      <div
+        className={`mt-3 rounded-lg border px-3 py-2 ${isDark ? "border-gray-700 bg-[#1f1f1f]" : "border-gray-200 bg-gray-50"}`}
+        style={{ fontSize: 12 }}
+      >
+        <div className={isDark ? "text-gray-300" : "text-gray-700"} style={{ fontSize: 12 }}>
+          Native Host 快照
+        </div>
+        <div className="grid grid-cols-2 gap-3 mt-2">
+          <RealtimeSessionMetric label="本地 Offer" value={hostLocalOffer || "-"} />
+          <RealtimeSessionMetric label="远端 Offer" value={hostRemoteOffer || "-"} />
+          <RealtimeSessionMetric label="本地 Answer" value={hostLocalAnswer || "-"} />
+          <RealtimeSessionMetric label="远端 Answer" value={hostRemoteAnswer || "-"} />
+          <RealtimeSessionMetric label="远端 ICE 数" value={String(hostRemoteIceCount)} />
+        </div>
+      </div>
+
       {error && (
         <div
           className={`mt-3 rounded-lg px-3 py-2 ${isDark ? "bg-red-900/20 text-red-300" : "bg-red-50 text-red-600"}`}
@@ -283,13 +309,13 @@ export function RealtimeSessionCard({
 
       <div className="flex gap-2 mt-3">
         <RealtimeActionButton isDark={isDark} disabled={loading || handle === null} onClick={onSendOffer}>
-          发送 Offer
+          生成 Offer 并发送
         </RealtimeActionButton>
         <RealtimeActionButton isDark={isDark} disabled={loading || handle === null} onClick={onSendAnswer}>
-          发送 Answer
+          生成 Answer 并发送
         </RealtimeActionButton>
         <RealtimeActionButton isDark={isDark} disabled={loading || handle === null} onClick={onSendIceCandidate}>
-          发送 ICE
+          应用并发送 ICE
         </RealtimeActionButton>
       </div>
 

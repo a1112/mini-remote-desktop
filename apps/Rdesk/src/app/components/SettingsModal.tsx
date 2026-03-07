@@ -23,10 +23,13 @@ import {
 } from "../services/realtimeService";
 import {
   acceptRealtimeSession,
-  createWebrtcLocalOffer,
+  applyWebrtcHostRemoteIceCandidate,
+  applyWebrtcHostRemoteOffer,
   drainRealtimeEvents,
+  createWebrtcHostAnswer,
+  createWebrtcHostOffer,
+  getWebrtcHostSnapshot,
   getWebrtcSnapshot,
-  applyWebrtcRemoteAnswer,
   applyWebrtcRemoteIceCandidate,
   registerRealtimeSession,
   requestRealtimeSession,
@@ -34,6 +37,7 @@ import {
   sendRealtimeIceCandidate,
   sendRealtimeOffer,
   syncWebrtcRealtimeEvents,
+  type WebrtcHostSnapshot,
   type WebrtcSessionSnapshot,
 } from "../services/realtimeSessionService";
 
@@ -158,6 +162,7 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
   const [realtimeIceSdpMid, setRealtimeIceSdpMid] = useState("0");
   const [realtimeIceSdpMlineIndex, setRealtimeIceSdpMlineIndex] = useState(0);
   const [realtimeSnapshot, setRealtimeSnapshot] = useState<WebrtcSessionSnapshot | null>(null);
+  const [realtimeHostSnapshot, setRealtimeHostSnapshot] = useState<WebrtcHostSnapshot | null>(null);
 
   useEffect(() => {
     if (open) {
@@ -302,6 +307,19 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
     }
   };
 
+  const refreshWebrtcHostSnapshot = async () => {
+    setRealtimeLoading(true);
+    setRealtimeError(null);
+    try {
+      const snapshot = await getWebrtcHostSnapshot(realtimeSessionId);
+      setRealtimeHostSnapshot(snapshot);
+    } catch (error) {
+      setRealtimeError(error instanceof Error ? error.message : "读取 native host 快照失败");
+    } finally {
+      setRealtimeLoading(false);
+    }
+  };
+
   const syncRealtimeEventsIntoWebrtcSnapshot = async () => {
     if (realtimeHandle === null) {
       setRealtimeError("请先注册 realtime controller");
@@ -313,6 +331,8 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
     try {
       const snapshot = await syncWebrtcRealtimeEvents(realtimeHandle);
       setRealtimeSnapshot(snapshot);
+      const hostSnapshot = await getWebrtcHostSnapshot(realtimeSessionId);
+      setRealtimeHostSnapshot(hostSnapshot);
       const nextEvents = await drainRealtimeEvents(realtimeHandle);
       setRealtimeEvents(nextEvents);
     } catch (error) {
@@ -331,7 +351,7 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
     setRealtimeLoading(true);
     setRealtimeError(null);
     try {
-      const localOffer = await createWebrtcLocalOffer(realtimeSessionId, realtimeOfferSdp);
+      const localOffer = await createWebrtcHostOffer(realtimeSessionId);
       await sendRealtimeOffer({
         handle: realtimeHandle,
         sessionId: realtimeSessionId,
@@ -340,6 +360,8 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
       setRealtimeOfferSdp(localOffer);
       const snapshot = await getWebrtcSnapshot(realtimeSessionId);
       setRealtimeSnapshot(snapshot);
+      const hostSnapshot = await getWebrtcHostSnapshot(realtimeSessionId);
+      setRealtimeHostSnapshot(hostSnapshot);
       const nextEvents = await drainRealtimeEvents(realtimeHandle);
       setRealtimeEvents(nextEvents);
     } catch (error) {
@@ -358,14 +380,18 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
     setRealtimeLoading(true);
     setRealtimeError(null);
     try {
-      await applyWebrtcRemoteAnswer(realtimeSessionId, realtimeAnswerSdp);
+      await applyWebrtcHostRemoteOffer(realtimeSessionId, realtimeOfferSdp);
+      const generatedAnswer = await createWebrtcHostAnswer(realtimeSessionId);
       await sendRealtimeAnswer({
         handle: realtimeHandle,
         sessionId: realtimeSessionId,
-        sdp: realtimeAnswerSdp,
+        sdp: generatedAnswer,
       });
+      setRealtimeAnswerSdp(generatedAnswer);
       const snapshot = await getWebrtcSnapshot(realtimeSessionId);
       setRealtimeSnapshot(snapshot);
+      const hostSnapshot = await getWebrtcHostSnapshot(realtimeSessionId);
+      setRealtimeHostSnapshot(hostSnapshot);
       const nextEvents = await drainRealtimeEvents(realtimeHandle);
       setRealtimeEvents(nextEvents);
     } catch (error) {
@@ -384,6 +410,12 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
     setRealtimeLoading(true);
     setRealtimeError(null);
     try {
+      await applyWebrtcHostRemoteIceCandidate({
+        sessionId: realtimeSessionId,
+        candidate: realtimeIceCandidate,
+        sdpMid: realtimeIceSdpMid,
+        sdpMlineIndex: realtimeIceSdpMlineIndex,
+      });
       await applyWebrtcRemoteIceCandidate({
         sessionId: realtimeSessionId,
         candidate: realtimeIceCandidate,
@@ -399,6 +431,8 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
       });
       const snapshot = await getWebrtcSnapshot(realtimeSessionId);
       setRealtimeSnapshot(snapshot);
+      const hostSnapshot = await getWebrtcHostSnapshot(realtimeSessionId);
+      setRealtimeHostSnapshot(hostSnapshot);
       const nextEvents = await drainRealtimeEvents(realtimeHandle);
       setRealtimeEvents(nextEvents);
     } catch (error) {
@@ -677,6 +711,11 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                   snapshotRemoteOffer={realtimeSnapshot?.remoteOffer ?? ""}
                   snapshotRemoteAnswer={realtimeSnapshot?.remoteAnswer ?? ""}
                   snapshotRemoteIceCount={realtimeSnapshot?.remoteIceCandidates.length ?? 0}
+                  hostLocalOffer={realtimeHostSnapshot?.localOffer ?? ""}
+                  hostRemoteOffer={realtimeHostSnapshot?.remoteOffer ?? ""}
+                  hostLocalAnswer={realtimeHostSnapshot?.localAnswer ?? ""}
+                  hostRemoteAnswer={realtimeHostSnapshot?.remoteAnswer ?? ""}
+                  hostRemoteIceCount={realtimeHostSnapshot?.remoteIceCount ?? 0}
                   handle={realtimeHandle}
                   loading={realtimeLoading}
                   error={realtimeError}
@@ -699,18 +738,32 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                   onSyncSnapshot={() => void syncRealtimeEventsIntoWebrtcSnapshot()}
                 />
                 <div className="mt-3">
-                  <button
-                    onClick={() => void refreshWebrtcSnapshot()}
-                    disabled={realtimeLoading}
-                    className={`px-3 py-1.5 rounded-lg border transition-colors ${
-                      isDark
-                        ? "border-gray-600 text-gray-300 hover:bg-gray-800 disabled:opacity-50"
-                        : "border-gray-200 text-gray-700 hover:bg-gray-50 disabled:opacity-50"
-                    }`}
-                    style={{ fontSize: 12 }}
-                  >
-                    读取当前快照
-                  </button>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => void refreshWebrtcSnapshot()}
+                      disabled={realtimeLoading}
+                      className={`px-3 py-1.5 rounded-lg border transition-colors ${
+                        isDark
+                          ? "border-gray-600 text-gray-300 hover:bg-gray-800 disabled:opacity-50"
+                          : "border-gray-200 text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+                      }`}
+                      style={{ fontSize: 12 }}
+                    >
+                      读取当前快照
+                    </button>
+                    <button
+                      onClick={() => void refreshWebrtcHostSnapshot()}
+                      disabled={realtimeLoading}
+                      className={`px-3 py-1.5 rounded-lg border transition-colors ${
+                        isDark
+                          ? "border-gray-600 text-gray-300 hover:bg-gray-800 disabled:opacity-50"
+                          : "border-gray-200 text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+                      }`}
+                      style={{ fontSize: 12 }}
+                    >
+                      读取 Host 快照
+                    </button>
+                  </div>
                 </div>
               </SettingsSection>
             )}
