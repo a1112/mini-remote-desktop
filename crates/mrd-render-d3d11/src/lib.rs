@@ -20,6 +20,7 @@ impl RendererFactory for D3d11RendererFactory {
 #[cfg(windows)]
 struct RenderSurface {
     swap_chain: windows::Win32::Graphics::Dxgi::IDXGISwapChain1,
+    back_buffer: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
     render_target_view: windows::Win32::Graphics::Direct3D11::ID3D11RenderTargetView,
 }
 
@@ -159,6 +160,7 @@ impl D3d11Renderer {
 
         Ok(Some(RenderSurface {
             swap_chain,
+            back_buffer,
             render_target_view,
         }))
     }
@@ -213,6 +215,63 @@ impl D3d11Renderer {
         }
         Ok(())
     }
+
+    #[cfg(windows)]
+    fn rgb24_to_bgra(frame: &RenderFrame) -> Result<Vec<u8>, RenderError> {
+        let expected = frame
+            .width
+            .checked_mul(frame.height)
+            .and_then(|pixels| pixels.checked_mul(3))
+            .ok_or_else(|| RenderError::Message("frame size overflow".into()))?;
+        if frame.data.len() != expected {
+            return Err(RenderError::Message(format!(
+                "Rgb24 frame bytes mismatch: expected {expected}, got {}",
+                frame.data.len()
+            )));
+        }
+
+        let mut bgra = Vec::with_capacity(frame.width * frame.height * 4);
+        for chunk in frame.data.chunks_exact(3) {
+            bgra.push(chunk[2]);
+            bgra.push(chunk[1]);
+            bgra.push(chunk[0]);
+            bgra.push(255);
+        }
+        Ok(bgra)
+    }
+
+    #[cfg(windows)]
+    fn present_uploaded_frame(&self, frame: &RenderFrame) -> Result<(), RenderError> {
+        let Some(surface) = self.surface.as_ref() else {
+            return Ok(());
+        };
+
+        let bgra = Self::rgb24_to_bgra(frame)?;
+        let row_pitch = frame
+            .width
+            .checked_mul(4)
+            .ok_or_else(|| RenderError::Message("row pitch overflow".into()))?
+            as u32;
+
+        unsafe {
+            self.context.UpdateSubresource(
+                &surface.back_buffer,
+                0,
+                None,
+                bgra.as_ptr() as *const core::ffi::c_void,
+                row_pitch,
+                0,
+            );
+            self.context
+                .OMSetRenderTargets(Some(&[Some(surface.render_target_view.clone())]), None);
+            surface
+                .swap_chain
+                .Present(1, 0)
+                .ok()
+                .map_err(|error| RenderError::Message(format!("present 失败: {error}")))?;
+        }
+        Ok(())
+    }
 }
 
 impl RendererInstance for D3d11Renderer {
@@ -234,7 +293,11 @@ impl RendererInstance for D3d11Renderer {
         }
 
         #[cfg(windows)]
-        self.present_clear_frame(&frame)?;
+        if self.surface.is_some() {
+            self.present_uploaded_frame(&frame)?;
+        } else {
+            self.present_clear_frame(&frame)?;
+        }
 
         self.uploaded_frame_count += 1;
         self.last_width = frame.width;
