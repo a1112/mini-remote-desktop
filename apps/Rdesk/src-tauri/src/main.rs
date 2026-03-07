@@ -13,6 +13,7 @@ mod webrtc_session;
 mod render_window_registry;
 mod render_surface_catalog;
 mod session_lifecycle;
+mod session_runtime;
 
 use device_info::HardwareInfo;
 use frame_sink::{DecodedFrameSink, DecodedFrameSnapshot};
@@ -28,6 +29,7 @@ use render_host::{
 use render_surface_catalog::RenderSurfaceDescriptor;
 use render_window_registry::{RenderWindowContext, RenderWindowRegistry};
 use session_lifecycle::{SessionLifecycleCoordinator, SessionLifecycleSnapshot, SurfaceSourceBinding};
+use session_runtime::sync_session_runtime;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tauri::Manager;
@@ -140,6 +142,14 @@ struct SessionLifecycleSnapshotResponse {
     surfaces: Vec<RenderSurfaceDescriptorResponse>,
     available_source_ids: Vec<String>,
     surface_source_bindings: Vec<SurfaceSourceBindingResponseResponse>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct SessionRuntimeSnapshotResponse {
+    lifecycle: SessionLifecycleSnapshotResponse,
+    render_host: RenderHostSnapshotResponse,
+    webrtc_host: WebrtcHostSnapshotResponse,
+    webrtc_signaling: Option<WebrtcSessionSnapshotResponse>,
 }
 
 /// Tauri 命令：获取硬件信息
@@ -452,11 +462,23 @@ async fn render_host_attach_session(
         .context_for_label(&window.app_handle(), window.label())
         .map(|context| context.surface_id)
         .unwrap_or_else(|| "surface-1".to_string());
+    let session_id = SessionId(session_id);
     state
         .render_host
         .lock()
         .expect("lock render host")
-        .attach_session(SessionId(session_id), surface_id, window_handle)?;
+        .attach_session(session_id.clone(), surface_id, window_handle)?;
+    {
+        let mut lifecycle = state
+            .session_lifecycle
+            .lock()
+            .expect("lock session lifecycle");
+        let mut render_host = state
+            .render_host
+            .lock()
+            .expect("lock render host");
+        sync_session_runtime(&mut lifecycle, &mut render_host, &session_id)?;
+    }
     state
         .render_windows
         .lock()
@@ -499,7 +521,18 @@ async fn bind_current_render_window_surface(
         .render_host
         .lock()
         .expect("lock render host")
-        .attach_session(session_id, surface_id, window_handle)?;
+        .attach_session(session_id.clone(), surface_id, window_handle)?;
+    {
+        let mut lifecycle = state
+            .session_lifecycle
+            .lock()
+            .expect("lock session lifecycle");
+        let mut render_host = state
+            .render_host
+            .lock()
+            .expect("lock render host");
+        sync_session_runtime(&mut lifecycle, &mut render_host, &session_id)?;
+    }
     state
         .render_windows
         .lock()
@@ -526,7 +559,19 @@ async fn render_host_snapshot(
     state: tauri::State<'_, AppState>,
     session_id: String,
 ) -> Result<RenderHostSnapshotResponse, String> {
-    let snapshot = render_host_snapshot_with(state.render_host.as_ref(), session_id)?;
+    let session_id = SessionId(session_id);
+    {
+        let mut lifecycle = state
+            .session_lifecycle
+            .lock()
+            .expect("lock session lifecycle");
+        let mut render_host = state
+            .render_host
+            .lock()
+            .expect("lock render host");
+        sync_session_runtime(&mut lifecycle, &mut render_host, &session_id)?;
+    }
+    let snapshot = render_host_snapshot_with(state.render_host.as_ref(), session_id.0)?;
     Ok(render_host_snapshot_response(snapshot))
 }
 
@@ -537,16 +582,24 @@ async fn bind_render_surface_source(
     surface_id: String,
     source_id: String,
 ) -> Result<(), String> {
+    let session_id = SessionId(session_id);
     state
         .session_lifecycle
         .lock()
         .expect("lock session lifecycle")
-        .bind_surface_source(SessionId(session_id.clone()), surface_id.clone(), source_id.clone())?;
-    state
-        .render_host
-        .lock()
-        .expect("lock render host")
-        .bind_surface_source(&SessionId(session_id), &surface_id, source_id)
+        .bind_surface_source(session_id.clone(), surface_id, source_id)?;
+    {
+        let mut lifecycle = state
+            .session_lifecycle
+            .lock()
+            .expect("lock session lifecycle");
+        let mut render_host = state
+            .render_host
+            .lock()
+            .expect("lock render host");
+        sync_session_runtime(&mut lifecycle, &mut render_host, &session_id)?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -555,23 +608,56 @@ async fn session_lifecycle_snapshot(
     session_id: String,
 ) -> Result<SessionLifecycleSnapshotResponse, String> {
     let session_id = SessionId(session_id);
-    let available_source_ids = state
-        .render_host
-        .lock()
-        .expect("lock render host")
-        .snapshot(&session_id)?
-        .available_source_ids;
-    state
-        .session_lifecycle
-        .lock()
-        .expect("lock session lifecycle")
-        .update_available_sources(session_id.clone(), available_source_ids);
+    {
+        let mut lifecycle = state
+            .session_lifecycle
+            .lock()
+            .expect("lock session lifecycle");
+        let mut render_host = state
+            .render_host
+            .lock()
+            .expect("lock render host");
+        sync_session_runtime(&mut lifecycle, &mut render_host, &session_id)?;
+    }
     let snapshot = state
         .session_lifecycle
         .lock()
         .expect("lock session lifecycle")
         .snapshot(&session_id);
     Ok(session_lifecycle_snapshot_response(snapshot))
+}
+
+#[tauri::command]
+async fn session_runtime_snapshot(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+) -> Result<SessionRuntimeSnapshotResponse, String> {
+    let session_id = SessionId(session_id);
+    let lifecycle_snapshot = {
+        let mut lifecycle = state
+            .session_lifecycle
+            .lock()
+            .expect("lock session lifecycle");
+        let mut render_host = state
+            .render_host
+            .lock()
+            .expect("lock render host");
+        sync_session_runtime(&mut lifecycle, &mut render_host, &session_id)?;
+        lifecycle.snapshot(&session_id)
+    };
+
+    let render_host_snapshot = render_host_snapshot_with(state.render_host.as_ref(), session_id.0.clone())?;
+    let webrtc_host_snapshot = webrtc_host_snapshot_with(state.webrtc_host.as_ref(), session_id.0.clone())
+        .await
+        .ok_or_else(|| format!("未找到 webrtc host 会话: {}", session_id.0))?;
+    let webrtc_signaling = webrtc_snapshot_with(state.webrtc_sessions.as_ref(), session_id.0.clone()).await;
+
+    Ok(SessionRuntimeSnapshotResponse {
+        lifecycle: session_lifecycle_snapshot_response(lifecycle_snapshot),
+        render_host: render_host_snapshot_response(render_host_snapshot),
+        webrtc_host: webrtc_host_snapshot,
+        webrtc_signaling,
+    })
 }
 
 #[tauri::command]
@@ -1211,6 +1297,7 @@ fn main() {
             render_host_attach_session,
             bind_render_surface_source,
             session_lifecycle_snapshot,
+            session_runtime_snapshot,
             bind_current_render_window_surface,
             render_host_detach_session,
             render_host_snapshot,
