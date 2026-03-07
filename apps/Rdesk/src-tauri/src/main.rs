@@ -632,32 +632,39 @@ async fn session_runtime_snapshot(
     state: tauri::State<'_, AppState>,
     session_id: String,
 ) -> Result<SessionRuntimeSnapshotResponse, String> {
-    let session_id = SessionId(session_id);
-    let lifecycle_snapshot = {
-        let mut lifecycle = state
-            .session_lifecycle
-            .lock()
-            .expect("lock session lifecycle");
-        let mut render_host = state
-            .render_host
-            .lock()
-            .expect("lock render host");
-        sync_session_runtime(&mut lifecycle, &mut render_host, &session_id)?;
-        lifecycle.snapshot(&session_id)
+    session_runtime_snapshot_with(
+        state.session_lifecycle.as_ref(),
+        state.render_host.as_ref(),
+        state.webrtc_host.as_ref(),
+        state.webrtc_sessions.as_ref(),
+        SessionId(session_id),
+    )
+    .await
+}
+
+#[tauri::command]
+async fn session_runtime_sync_realtime(
+    state: tauri::State<'_, AppState>,
+    handle: u64,
+) -> Result<Option<SessionRuntimeSnapshotResponse>, String> {
+    let Some(session_id) = apply_realtime_events_to_webrtc_sessions(
+        &state.realtime_runtime,
+        state.webrtc_sessions.as_ref(),
+        handle,
+    )
+    .await? else {
+        return Ok(None);
     };
 
-    let render_host_snapshot = render_host_snapshot_with(state.render_host.as_ref(), session_id.0.clone())?;
-    let webrtc_host_snapshot = webrtc_host_snapshot_with(state.webrtc_host.as_ref(), session_id.0.clone())
-        .await
-        .ok_or_else(|| format!("未找到 webrtc host 会话: {}", session_id.0))?;
-    let webrtc_signaling = webrtc_snapshot_with(state.webrtc_sessions.as_ref(), session_id.0.clone()).await;
-
-    Ok(SessionRuntimeSnapshotResponse {
-        lifecycle: session_lifecycle_snapshot_response(lifecycle_snapshot),
-        render_host: render_host_snapshot_response(render_host_snapshot),
-        webrtc_host: webrtc_host_snapshot,
-        webrtc_signaling,
-    })
+    session_runtime_snapshot_with(
+        state.session_lifecycle.as_ref(),
+        state.render_host.as_ref(),
+        state.webrtc_host.as_ref(),
+        state.webrtc_sessions.as_ref(),
+        session_id,
+    )
+    .await
+    .map(Some)
 }
 
 #[tauri::command]
@@ -1105,6 +1112,21 @@ async fn webrtc_sync_realtime_events_with(
     coordinator: &Mutex<WebrtcSessionCoordinator>,
     handle: u64,
 ) -> Result<WebrtcSessionSnapshotResponse, String> {
+    let session_id = apply_realtime_events_to_webrtc_sessions(runtime, coordinator, handle)
+        .await?
+        .ok_or_else(|| "未收到可应用的 webrtc 事件".to_string())?;
+    let sessions = coordinator.lock().await;
+    let snapshot = sessions
+        .snapshot(&session_id)
+        .ok_or_else(|| format!("未找到会话协商快照: {}", session_id.0))?;
+    Ok(webrtc_snapshot_response(snapshot))
+}
+
+async fn apply_realtime_events_to_webrtc_sessions(
+    runtime: &RealtimeRuntime,
+    coordinator: &Mutex<WebrtcSessionCoordinator>,
+    handle: u64,
+) -> Result<Option<SessionId>, String> {
     let events = runtime.drain_events(handle).await?;
     let mut last_session_id: Option<SessionId> = None;
 
@@ -1127,13 +1149,37 @@ async fn webrtc_sync_realtime_events_with(
                 _ => {}
             }
         }
-
-        let session_id = last_session_id.ok_or_else(|| "未收到可应用的 webrtc 事件".to_string())?;
-        let snapshot = sessions
-            .snapshot(&session_id)
-            .ok_or_else(|| format!("未找到会话协商快照: {}", session_id.0))?;
-        Ok(webrtc_snapshot_response(snapshot))
     }
+
+    Ok(last_session_id)
+}
+
+async fn session_runtime_snapshot_with(
+    lifecycle: &std::sync::Mutex<SessionLifecycleCoordinator>,
+    render_host: &std::sync::Mutex<RenderHost>,
+    webrtc_host: &Mutex<WebrtcHost>,
+    webrtc_sessions: &Mutex<WebrtcSessionCoordinator>,
+    session_id: SessionId,
+) -> Result<SessionRuntimeSnapshotResponse, String> {
+    let lifecycle_snapshot = {
+        let mut lifecycle = lifecycle.lock().expect("lock session lifecycle");
+        let mut render_host = render_host.lock().expect("lock render host");
+        sync_session_runtime(&mut lifecycle, &mut render_host, &session_id)?;
+        lifecycle.snapshot(&session_id)
+    };
+
+    let render_host_snapshot = render_host_snapshot_with(render_host, session_id.0.clone())?;
+    let webrtc_host_snapshot = webrtc_host_snapshot_with(webrtc_host, session_id.0.clone())
+        .await
+        .ok_or_else(|| format!("未找到 webrtc host 会话: {}", session_id.0))?;
+    let webrtc_signaling = webrtc_snapshot_with(webrtc_sessions, session_id.0.clone()).await;
+
+    Ok(SessionRuntimeSnapshotResponse {
+        lifecycle: session_lifecycle_snapshot_response(lifecycle_snapshot),
+        render_host: render_host_snapshot_response(render_host_snapshot),
+        webrtc_host: webrtc_host_snapshot,
+        webrtc_signaling,
+    })
 }
 
 async fn webrtc_snapshot_with(
@@ -1298,6 +1344,7 @@ fn main() {
             bind_render_surface_source,
             session_lifecycle_snapshot,
             session_runtime_snapshot,
+            session_runtime_sync_realtime,
             bind_current_render_window_surface,
             render_host_detach_session,
             render_host_snapshot,
