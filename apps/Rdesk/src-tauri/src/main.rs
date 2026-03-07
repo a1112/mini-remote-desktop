@@ -10,6 +10,7 @@ mod realtime_runtime;
 mod webrtc_host;
 mod webrtc_media;
 mod webrtc_session;
+mod render_window_registry;
 
 use device_info::HardwareInfo;
 use frame_sink::{DecodedFrameSink, DecodedFrameSnapshot};
@@ -22,6 +23,7 @@ use realtime_runtime::{RealtimeRegistration, RealtimeRuntime};
 use render_host::{
     render_host_snapshot_with, RenderHost, RenderHostSnapshot, RendererSnapshotResponse,
 };
+use render_window_registry::RenderWindowRegistry;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tauri::Manager;
@@ -33,6 +35,7 @@ use webrtc_session::{WebrtcSessionCoordinator, WebrtcSessionSnapshot};
 struct AppState {
     frame_sink: std::sync::Arc<std::sync::Mutex<DecodedFrameSink>>,
     render_host: std::sync::Arc<std::sync::Mutex<RenderHost>>,
+    render_windows: std::sync::Arc<std::sync::Mutex<RenderWindowRegistry>>,
     realtime_runtime: RealtimeRuntime,
     webrtc_host: std::sync::Arc<Mutex<WebrtcHost>>,
     webrtc_sessions: std::sync::Arc<Mutex<WebrtcSessionCoordinator>>,
@@ -430,23 +433,38 @@ async fn render_host_snapshot(
 
 #[tauri::command]
 fn open_render_window(app: tauri::AppHandle, session_id: String) -> Result<String, String> {
-    let label = format!("render-{session_id}");
-    if let Some(window) = app.get_window(&label) {
-        let _ = window.show();
-        let _ = window.set_focus();
-        return Ok(label);
-    }
+    let state = app.state::<AppState>();
+    let result = state
+        .render_windows
+        .lock()
+        .expect("lock render window registry")
+        .open_window(&app, SessionId(session_id));
+    result
+}
 
-    let url = format!("/session/{session_id}");
-    tauri::WindowBuilder::new(&app, label.clone(), tauri::WindowUrl::App(url.into()))
-        .title(format!("Remote Session {session_id}"))
-        .decorations(false)
-        .resizable(true)
-        .inner_size(1280.0, 800.0)
-        .build()
-        .map_err(|error| format!("创建渲染窗口失败: {error}"))?;
+#[tauri::command]
+fn list_render_windows(
+    app: tauri::AppHandle,
+    session_id: String,
+) -> Result<Vec<String>, String> {
+    let state = app.state::<AppState>();
+    let labels = state
+        .render_windows
+        .lock()
+        .expect("lock render window registry")
+        .list_windows(&app, &SessionId(session_id));
+    Ok(labels)
+}
 
-    Ok(label)
+#[tauri::command]
+fn close_render_window(app: tauri::AppHandle, label: String) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let result = state
+        .render_windows
+        .lock()
+        .expect("lock render window registry")
+        .close_window(&app, &label);
+    result
 }
 
 /// Tauri 命令：设备注册
@@ -832,10 +850,12 @@ fn decoded_frame_preview_with(
 fn main() {
     let frame_sink = std::sync::Arc::new(std::sync::Mutex::new(DecodedFrameSink::default()));
     let render_host = std::sync::Arc::new(std::sync::Mutex::new(RenderHost::with_frame_sink(frame_sink.clone())));
+    let render_windows = std::sync::Arc::new(std::sync::Mutex::new(RenderWindowRegistry::default()));
     tauri::Builder::default()
         .manage(AppState {
             frame_sink: frame_sink.clone(),
             render_host,
+            render_windows,
             realtime_runtime: RealtimeRuntime::from_env(),
             webrtc_host: std::sync::Arc::new(Mutex::new(WebrtcHost::with_frame_sink(frame_sink))),
             webrtc_sessions: std::sync::Arc::new(Mutex::new(WebrtcSessionCoordinator::default())),
@@ -871,7 +891,9 @@ fn main() {
             render_host_attach_session,
             render_host_detach_session,
             render_host_snapshot,
-            open_render_window
+            open_render_window,
+            list_render_windows,
+            close_render_window
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
