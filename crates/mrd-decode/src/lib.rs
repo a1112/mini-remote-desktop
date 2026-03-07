@@ -1,0 +1,129 @@
+pub use mrd_pipeline_core::RuntimeStatus;
+use openh264::{
+    decoder::Decoder as OpenH264Decoder,
+    formats::YUVSource,
+    Error as OpenH264Error,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodecKind {
+    H264,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PixelFormat {
+    Rgb24,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecoderDescriptor {
+    pub id: &'static str,
+    pub codec: CodecKind,
+    pub runtime_status: RuntimeStatus,
+    pub output_formats: &'static [PixelFormat],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedFrame {
+    pub width: usize,
+    pub height: usize,
+    pub pixel_format: PixelFormat,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedFrameInfo {
+    pub width: usize,
+    pub height: usize,
+    pub pixel_format: PixelFormat,
+    pub bytes: usize,
+}
+
+#[derive(Debug)]
+pub struct DecoderError {
+    message: String,
+}
+
+impl DecoderError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for DecoderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for DecoderError {}
+
+impl From<OpenH264Error> for DecoderError {
+    fn from(value: OpenH264Error) -> Self {
+        Self::new(format!("openh264 解码失败: {value}"))
+    }
+}
+
+pub trait VideoDecoder: Send {
+    fn push_access_unit(&mut self, access_unit: &[u8]) -> Result<(), DecoderError>;
+    fn drain_decoded_frames(&mut self) -> Vec<DecodedFrame>;
+}
+
+const RGB24_OUTPUTS: &[PixelFormat] = &[PixelFormat::Rgb24];
+const H264_SOFTWARE_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
+    id: "h264_software",
+    codec: CodecKind::H264,
+    runtime_status: RuntimeStatus::RuntimeBacked,
+    output_formats: RGB24_OUTPUTS,
+};
+
+pub fn available_decoder_descriptors() -> Vec<DecoderDescriptor> {
+    vec![H264_SOFTWARE_DESCRIPTOR.clone()]
+}
+
+pub fn create_decoder(id: &str) -> Result<Box<dyn VideoDecoder>, DecoderError> {
+    match id {
+        "h264_software" => Ok(Box::new(H264SoftwareDecoder::new()?)),
+        other => Err(DecoderError::new(format!("未知 decoder backend: {other}"))),
+    }
+}
+
+pub struct H264SoftwareDecoder {
+    decoder: OpenH264Decoder,
+    pending_frames: Vec<DecodedFrame>,
+}
+
+impl H264SoftwareDecoder {
+    pub fn new() -> Result<Self, DecoderError> {
+        Ok(Self {
+            decoder: OpenH264Decoder::new()?,
+            pending_frames: Vec::new(),
+        })
+    }
+}
+
+impl VideoDecoder for H264SoftwareDecoder {
+    fn push_access_unit(&mut self, access_unit: &[u8]) -> Result<(), DecoderError> {
+        match self.decoder.decode(access_unit)? {
+            Some(yuv) => {
+                let mut rgb = vec![0_u8; yuv.rgb8_len()];
+                yuv.write_rgb8(&mut rgb);
+                let (width, height) = yuv.dimensions();
+                self.pending_frames.push(DecodedFrame {
+                    width,
+                    height,
+                    pixel_format: PixelFormat::Rgb24,
+                    data: rgb,
+                });
+                Ok(())
+            }
+            None => Err(DecoderError::new("访问单元未生成完整可解码帧")),
+        }
+    }
+
+    fn drain_decoded_frames(&mut self) -> Vec<DecodedFrame> {
+        std::mem::take(&mut self.pending_frames)
+    }
+}

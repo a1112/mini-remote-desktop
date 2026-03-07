@@ -3,6 +3,7 @@ members = [
   "apps/Rdesk/src-tauri",
   "apps/realtime-server",
   "common-control-proto",
+  "crates/mrd-decode",
   "crates/mrd-pipeline-core",
   "crates/mrd-proto",
   "crates/mrd-session",

@@ -1,0 +1,9 @@
+[package]
+name = "mrd-decode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+openh264 = "0.8"
+mrd-pipeline-core = { path = "../mrd-pipeline-core" }
