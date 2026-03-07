@@ -5,16 +5,27 @@ use serde::Serialize;
 use tauri::Manager;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RenderWindowEntry {
+    pub label: String,
+    pub surface_id: String,
+    pub role: String,
+    pub renderer_attached: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RenderWindowContext {
     pub label: String,
     pub session_id: String,
+    pub surface_id: String,
+    pub role: String,
+    pub renderer_attached: bool,
     pub session_window_count: usize,
 }
 
 #[derive(Default)]
 pub struct RenderWindowRegistry {
     next_ids: HashMap<SessionId, u32>,
-    windows_by_session: HashMap<SessionId, Vec<String>>,
+    windows_by_session: HashMap<SessionId, Vec<RenderWindowEntry>>,
 }
 
 impl RenderWindowRegistry {
@@ -25,6 +36,7 @@ impl RenderWindowRegistry {
     ) -> Result<String, String> {
         let next_id = self.next_ids.entry(session_id.clone()).or_insert(1);
         let label = format!("render-{}-{}", session_id.0, *next_id);
+        let surface_id = format!("surface-{}", *next_id);
         *next_id += 1;
 
         let url = format!("/session/{}", session_id.0);
@@ -39,7 +51,12 @@ impl RenderWindowRegistry {
         self.windows_by_session
             .entry(session_id)
             .or_default()
-            .push(label.clone());
+            .push(RenderWindowEntry {
+                label: label.clone(),
+                surface_id,
+                role: "controller".to_string(),
+                renderer_attached: false,
+            });
         Ok(label)
     }
 
@@ -48,9 +65,12 @@ impl RenderWindowRegistry {
         app: &tauri::AppHandle<R>,
         session_id: &SessionId,
     ) -> Vec<String> {
-        let labels = self.windows_by_session.entry(session_id.clone()).or_default();
-        labels.retain(|label| app.get_window(label).is_some());
-        labels.clone()
+        let entries = self.windows_by_session.entry(session_id.clone()).or_default();
+        entries.retain(|entry| app.get_window(&entry.label).is_some());
+        entries
+            .iter()
+            .map(|entry| entry.label.clone())
+            .collect()
     }
 
     pub fn close_window<R: tauri::Runtime>(
@@ -62,11 +82,26 @@ impl RenderWindowRegistry {
             let _ = window.close();
         }
 
-        for labels in self.windows_by_session.values_mut() {
-            labels.retain(|candidate| candidate != label);
+        for entries in self.windows_by_session.values_mut() {
+            entries.retain(|candidate| candidate.label != label);
         }
 
         Ok(())
+    }
+
+    pub fn set_renderer_attached<R: tauri::Runtime>(
+        &mut self,
+        app: &tauri::AppHandle<R>,
+        label: &str,
+        renderer_attached: bool,
+    ) {
+        for entries in self.windows_by_session.values_mut() {
+            entries.retain(|entry| app.get_window(&entry.label).is_some());
+            if let Some(entry) = entries.iter_mut().find(|entry| entry.label == label) {
+                entry.renderer_attached = renderer_attached;
+                return;
+            }
+        }
     }
 
     pub fn context_for_label<R: tauri::Runtime>(
@@ -74,13 +109,16 @@ impl RenderWindowRegistry {
         app: &tauri::AppHandle<R>,
         label: &str,
     ) -> Option<RenderWindowContext> {
-        for (session_id, labels) in self.windows_by_session.iter_mut() {
-            labels.retain(|candidate| app.get_window(candidate).is_some());
-            if labels.iter().any(|candidate| candidate == label) {
+        for (session_id, entries) in self.windows_by_session.iter_mut() {
+            entries.retain(|entry| app.get_window(&entry.label).is_some());
+            if let Some(entry) = entries.iter().find(|entry| entry.label == label) {
                 return Some(RenderWindowContext {
                     label: label.to_string(),
                     session_id: session_id.0.clone(),
-                    session_window_count: labels.len(),
+                    surface_id: entry.surface_id.clone(),
+                    role: entry.role.clone(),
+                    renderer_attached: entry.renderer_attached,
+                    session_window_count: entries.len(),
                 });
             }
         }
@@ -113,11 +151,17 @@ mod tests {
         let context = RenderWindowContext {
             label: "render-session-a-2".into(),
             session_id: "session-a".into(),
+            surface_id: "surface-2".into(),
+            role: "controller".into(),
+            renderer_attached: true,
             session_window_count: 2,
         };
 
         assert_eq!(context.label, "render-session-a-2");
         assert_eq!(context.session_id, "session-a");
+        assert_eq!(context.surface_id, "surface-2");
+        assert_eq!(context.role, "controller");
+        assert!(context.renderer_attached);
         assert_eq!(context.session_window_count, 2);
     }
 }

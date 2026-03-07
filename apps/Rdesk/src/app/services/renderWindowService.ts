@@ -3,6 +3,9 @@ import { invoke } from "@tauri-apps/api/tauri";
 export type RenderWindowContext = {
   label: string;
   session_id: string;
+  surface_id: string;
+  role: string;
+  renderer_attached: boolean;
   session_window_count: number;
 };
 

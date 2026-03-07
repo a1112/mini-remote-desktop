@@ -103,6 +103,9 @@ struct RenderHostSnapshotResponse {
 struct RenderWindowContextResponse {
     label: String,
     session_id: String,
+    surface_id: String,
+    role: String,
+    renderer_attached: bool,
     session_window_count: usize,
 }
 
@@ -413,7 +416,13 @@ async fn render_host_attach_session(
         .render_host
         .lock()
         .expect("lock render host")
-        .attach_session(SessionId(session_id), window_handle)
+        .attach_session(SessionId(session_id), window_handle)?;
+    state
+        .render_windows
+        .lock()
+        .expect("lock render window registry")
+        .set_renderer_attached(&window.app_handle(), window.label(), true);
+    Ok(())
 }
 
 #[tauri::command]
@@ -668,6 +677,9 @@ fn render_window_context_response(context: RenderWindowContext) -> RenderWindowC
     RenderWindowContextResponse {
         label: context.label,
         session_id: context.session_id,
+        surface_id: context.surface_id,
+        role: context.role,
+        renderer_attached: context.renderer_attached,
         session_window_count: context.session_window_count,
     }
 }

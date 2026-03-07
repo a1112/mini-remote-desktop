@@ -51,6 +51,9 @@ export function RemoteSessionPage() {
   const [renderWindows, setRenderWindows] = useState<string[]>([]);
   const [currentRenderWindowLabel, setCurrentRenderWindowLabel] = useState<string | null>(null);
   const [currentRenderWindowCount, setCurrentRenderWindowCount] = useState<number | null>(null);
+  const [currentSurfaceId, setCurrentSurfaceId] = useState<string | null>(null);
+  const [currentWindowRole, setCurrentWindowRole] = useState<string | null>(null);
+  const [rendererAttached, setRendererAttached] = useState<boolean>(false);
 
   const noDragSelector =
     'button, a, input, select, textarea, [role="button"], [role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"], [data-radix-collection-item], [data-no-drag="true"]';
@@ -106,6 +109,9 @@ export function RemoteSessionPage() {
       if (!active) return;
       setCurrentRenderWindowLabel(context?.label ?? null);
       setCurrentRenderWindowCount(context?.session_window_count ?? null);
+      setCurrentSurfaceId(context?.surface_id ?? null);
+      setCurrentWindowRole(context?.role ?? null);
+      setRendererAttached(context?.renderer_attached ?? false);
     };
 
     void refreshContext().catch(() => {});
@@ -367,7 +373,12 @@ export function RemoteSessionPage() {
             <div className="px-3 py-2 space-y-2">
               {currentRenderWindowLabel ? (
                 <div className="rounded-md bg-blue-500/10 px-2 py-1.5 text-blue-200" style={{ fontSize: 11 }}>
-                  当前窗口: {currentRenderWindowLabel}
+                  <div>当前窗口: {currentRenderWindowLabel}</div>
+                  <div className="mt-1 text-blue-100/80">
+                    {currentSurfaceId ? `surface: ${currentSurfaceId}` : "surface: -"}
+                    {currentWindowRole ? ` · role: ${currentWindowRole}` : ""}
+                    {rendererAttached ? " · renderer attached" : " · renderer pending"}
+                  </div>
                 </div>
               ) : null}
               {renderWindows.length > 0 ? (

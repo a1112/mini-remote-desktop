@@ -50,6 +50,9 @@ describe("renderWindowService", () => {
     invokeMock.mockResolvedValue({
       label: "render-session-1-2",
       session_id: "session-1",
+      surface_id: "surface-2",
+      role: "controller",
+      renderer_attached: true,
       session_window_count: 2,
     });
 
@@ -60,6 +63,9 @@ describe("renderWindowService", () => {
     expect(context).toEqual({
       label: "render-session-1-2",
       session_id: "session-1",
+      surface_id: "surface-2",
+      role: "controller",
+      renderer_attached: true,
       session_window_count: 2,
     });
   });
