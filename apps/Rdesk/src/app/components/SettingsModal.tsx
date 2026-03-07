@@ -13,6 +13,13 @@ import {
   Settings,
 } from "lucide-react";
 import { useTheme } from "./ThemeContext";
+import {
+  getRealtimeStatus,
+  restartRealtime,
+  startRealtime,
+  stopRealtime,
+  type RealtimeStatus,
+} from "../services/realtimeService";
 
 function Toggle({ value, onChange }: { value: boolean; onChange: (v: boolean) => void }) {
   return (
@@ -119,6 +126,9 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
   const [notifyDisconnect, setNotifyDisconnect] = useState(true);
   const [notifyRequest, setNotifyRequest] = useState(true);
   const [sound, setSound] = useState(true);
+  const [realtimeStatus, setRealtimeStatus] = useState<RealtimeStatus | null>(null);
+  const [realtimeLoading, setRealtimeLoading] = useState(false);
+  const [realtimeError, setRealtimeError] = useState<string | null>(null);
 
   useEffect(() => {
     if (open) {
@@ -135,6 +145,39 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
     window.addEventListener("keydown", handleKey);
     return () => window.removeEventListener("keydown", handleKey);
   }, [open, onClose]);
+
+  useEffect(() => {
+    if (!open) return;
+    void refreshRealtimeStatus();
+  }, [open]);
+
+  const refreshRealtimeStatus = async () => {
+    setRealtimeLoading(true);
+    setRealtimeError(null);
+    try {
+      const next = await getRealtimeStatus();
+      setRealtimeStatus(next);
+    } catch (error) {
+      setRealtimeError(error instanceof Error ? error.message : "读取 realtime 状态失败");
+    } finally {
+      setRealtimeLoading(false);
+    }
+  };
+
+  const runRealtimeAction = async (
+    action: () => Promise<RealtimeStatus>,
+  ) => {
+    setRealtimeLoading(true);
+    setRealtimeError(null);
+    try {
+      const next = await action();
+      setRealtimeStatus(next);
+    } catch (error) {
+      setRealtimeError(error instanceof Error ? error.message : "执行 realtime 操作失败");
+    } finally {
+      setRealtimeLoading(false);
+    }
+  };
 
   if (!open && !visible) return null;
 
@@ -312,6 +355,86 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                     ))}
                   </div>
                 </div>
+                <div className={`p-3.5 rounded-xl border mt-3 ${isDark ? "bg-[#2a2a2a] border-gray-700" : "bg-white border-gray-200"}`}>
+                  <div className="flex items-start justify-between gap-4">
+                    <div>
+                      <div className={isDark ? "text-gray-200" : "text-gray-800"} style={{ fontSize: 13 }}>
+                        Realtime Sidecar
+                      </div>
+                      <div className={`mt-0.5 ${isDark ? "text-gray-500" : "text-gray-400"}`} style={{ fontSize: 11 }}>
+                        读取并控制 `Rdesk-Server` 挂载的 realtime-server 进程。
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => void refreshRealtimeStatus()}
+                      disabled={realtimeLoading}
+                      className={`px-3 py-1.5 rounded-lg border transition-colors ${
+                        isDark
+                          ? "border-gray-600 text-gray-300 hover:bg-gray-800 disabled:opacity-50"
+                          : "border-gray-200 text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+                      }`}
+                      style={{ fontSize: 12 }}
+                    >
+                      刷新
+                    </button>
+                  </div>
+
+                  <div className="grid grid-cols-4 gap-3 mt-3">
+                    <RealtimeMetric
+                      label="运行状态"
+                      value={realtimeStatus?.running ? "运行中" : "未运行"}
+                      tone={realtimeStatus?.running ? "good" : "warn"}
+                    />
+                    <RealtimeMetric
+                      label="健康检查"
+                      value={realtimeStatus?.reachable ? "可达" : "不可达"}
+                      tone={realtimeStatus?.reachable ? "good" : "warn"}
+                    />
+                    <RealtimeMetric
+                      label="服务状态"
+                      value={realtimeStatus?.status ?? "未知"}
+                      tone={realtimeStatus?.status === "ok" ? "good" : "neutral"}
+                    />
+                    <RealtimeMetric
+                      label="进程 PID"
+                      value={realtimeStatus?.pid ? String(realtimeStatus.pid) : "-"}
+                      tone="neutral"
+                    />
+                  </div>
+
+                  {realtimeError && (
+                    <div
+                      className={`mt-3 rounded-lg px-3 py-2 ${isDark ? "bg-red-900/20 text-red-300" : "bg-red-50 text-red-600"}`}
+                      style={{ fontSize: 12 }}
+                    >
+                      {realtimeError}
+                    </div>
+                  )}
+
+                  <div className="flex gap-2 mt-3">
+                    <ActionButton
+                      isDark={isDark}
+                      disabled={realtimeLoading}
+                      onClick={() => void runRealtimeAction(startRealtime)}
+                    >
+                      启动
+                    </ActionButton>
+                    <ActionButton
+                      isDark={isDark}
+                      disabled={realtimeLoading}
+                      onClick={() => void runRealtimeAction(stopRealtime)}
+                    >
+                      停止
+                    </ActionButton>
+                    <ActionButton
+                      isDark={isDark}
+                      disabled={realtimeLoading}
+                      onClick={() => void runRealtimeAction(restartRealtime)}
+                    >
+                      重启
+                    </ActionButton>
+                  </div>
+                </div>
               </SettingsSection>
             )}
 
@@ -451,6 +574,61 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
         </div>
       </div>
     </div>
+  );
+}
+
+function RealtimeMetric({
+  label,
+  value,
+  tone,
+}: {
+  label: string;
+  value: string;
+  tone: "good" | "warn" | "neutral";
+}) {
+  const toneClass =
+    tone === "good"
+      ? "text-green-600"
+      : tone === "warn"
+        ? "text-amber-500"
+        : "text-blue-500";
+
+  return (
+    <div className="text-center">
+      <div className={`font-semibold ${toneClass}`} style={{ fontSize: 15 }}>
+        {value}
+      </div>
+      <div className="text-gray-400" style={{ fontSize: 11 }}>
+        {label}
+      </div>
+    </div>
+  );
+}
+
+function ActionButton({
+  isDark,
+  disabled,
+  onClick,
+  children,
+}: {
+  isDark: boolean;
+  disabled?: boolean;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      className={`px-3 py-1.5 rounded-lg border transition-colors ${
+        isDark
+          ? "border-gray-600 text-gray-300 hover:bg-gray-800 disabled:opacity-50"
+          : "border-gray-200 text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+      }`}
+      style={{ fontSize: 12 }}
+    >
+      {children}
+    </button>
   );
 }
 
