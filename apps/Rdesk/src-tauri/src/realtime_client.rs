@@ -1,7 +1,9 @@
 use futures_util::{SinkExt, StreamExt};
-use mrd_proto::{BackendRole, DeviceId};
+use mrd_proto::{BackendRole, DeviceId, SessionId};
 use mrd_signal_client::{decode_message, encode_message};
-use mrd_signal_proto::{RegisterRequest, RegisteredResponse, SignalMessage};
+use mrd_signal_proto::{
+    RegisterRequest, RegisteredResponse, SessionAccept, SessionRequest, SignalMessage,
+};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 const DEFAULT_SIGNALING_URL: &str = "ws://127.0.0.1:9532/ws";
@@ -9,6 +11,15 @@ const DEFAULT_SIGNALING_URL: &str = "ws://127.0.0.1:9532/ws";
 #[derive(Debug, Clone)]
 pub struct RealtimeClient {
     signaling_url: String,
+}
+
+#[derive(Debug)]
+pub struct RealtimeConnection {
+    socket: tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    pub registered: RegisteredResponse,
+    inbound_events: Vec<SignalMessage>,
 }
 
 impl RealtimeClient {
@@ -28,12 +39,12 @@ impl RealtimeClient {
         &self.signaling_url
     }
 
-    pub async fn register(
+    pub async fn connect_and_register(
         &self,
         role: BackendRole,
         device_id: Option<DeviceId>,
         name: String,
-    ) -> Result<RegisteredResponse, String> {
+    ) -> Result<RealtimeConnection, String> {
         let (mut ws, _) = connect_async(&self.signaling_url)
             .await
             .map_err(|e| format!("连接 realtime signaling 失败: {}", e))?;
@@ -59,9 +70,68 @@ impl RealtimeClient {
             decode_message(&raw).map_err(|e| format!("解析 register 响应失败: {}", e))?;
 
         match response {
-            SignalMessage::Registered(registered) => Ok(registered),
+            SignalMessage::Registered(registered) => Ok(RealtimeConnection {
+                socket: ws,
+                registered,
+                inbound_events: Vec::new(),
+            }),
             other => Err(format!("unexpected register response: {:?}", other)),
         }
+    }
+
+    pub async fn register(
+        &self,
+        role: BackendRole,
+        device_id: Option<DeviceId>,
+        name: String,
+    ) -> Result<RegisteredResponse, String> {
+        let connection = self.connect_and_register(role, device_id, name).await?;
+        Ok(connection.registered)
+    }
+}
+
+impl RealtimeConnection {
+    pub async fn request_session(
+        &mut self,
+        session_id: SessionId,
+        target_device_id: DeviceId,
+    ) -> Result<(), String> {
+        let message = SignalMessage::SessionRequest(SessionRequest {
+            session_id,
+            source_device_id: self.registered.device_id.clone(),
+            target_device_id,
+        });
+        self.send_message(message).await
+    }
+
+    pub async fn accept_session(&mut self, session_id: SessionId) -> Result<(), String> {
+        self.send_message(SignalMessage::SessionAccept(SessionAccept { session_id }))
+            .await
+    }
+
+    pub async fn recv_event(&mut self) -> Result<SignalMessage, String> {
+        let Some(Ok(Message::Text(raw))) = self.socket.next().await else {
+            return Err("未收到 signaling 事件".into());
+        };
+
+        let message =
+            decode_message(&raw).map_err(|e| format!("解析 signaling 事件失败: {}", e))?;
+        self.inbound_events.push(message.clone());
+        Ok(message)
+    }
+
+    pub fn drain_inbound_events(&mut self) -> Vec<SignalMessage> {
+        std::mem::take(&mut self.inbound_events)
+    }
+
+    async fn send_message(&mut self, message: SignalMessage) -> Result<(), String> {
+        let payload =
+            encode_message(&message).map_err(|e| format!("编码 signaling 消息失败: {}", e))?;
+
+        self.socket
+            .send(Message::Text(payload))
+            .await
+            .map_err(|e| format!("发送 signaling 消息失败: {}", e))
     }
 }
 
@@ -74,8 +144,8 @@ mod tests {
         routing::get,
         Router,
     };
-    use futures_util::{SinkExt, StreamExt};
-    use mrd_proto::{BackendRole, DeviceId};
+    use futures_util::StreamExt;
+    use mrd_proto::{BackendRole, DeviceId, SessionId};
     use mrd_signal_client::{decode_message, encode_message};
     use mrd_signal_proto::{RegisteredResponse, SignalMessage};
     use tokio::net::TcpListener;
@@ -101,6 +171,15 @@ mod tests {
             .send(Message::Text(ack.into()))
             .await
             .expect("send registered response");
+
+        while let Some(Ok(Message::Text(raw))) = socket.next().await {
+            let signal = decode_message(&raw).expect("decode session signal");
+            let outbound = encode_message(&signal).expect("encode echoed session signal");
+            socket
+                .send(Message::Text(outbound.into()))
+                .await
+                .expect("echo session signal");
+        }
     }
 
     async fn spawn_server() -> String {
@@ -132,6 +211,40 @@ mod tests {
             .expect("register over websocket");
 
         assert_eq!(registered.device_id, DeviceId("controller-1".into()));
+    }
+
+    #[tokio::test]
+    async fn request_and_accept_session_roundtrip_into_event_queue() {
+        let ws_url = spawn_server().await;
+        let client = RealtimeClient::new(ws_url);
+
+        let mut connection = client
+            .connect_and_register(
+                BackendRole::Controller,
+                Some(DeviceId("controller-1".into())),
+                "Rdesk".into(),
+            )
+            .await
+            .expect("connect and register");
+
+        connection
+            .request_session(SessionId("session-1".into()), DeviceId("agent-1".into()))
+            .await
+            .expect("request session");
+
+        let request = connection.recv_event().await.expect("receive request event");
+        assert!(matches!(request, SignalMessage::SessionRequest(_)));
+
+        connection
+            .accept_session(SessionId("session-1".into()))
+            .await
+            .expect("accept session");
+
+        let accept = connection.recv_event().await.expect("receive accept event");
+        assert!(matches!(accept, SignalMessage::SessionAccept(_)));
+
+        let drained = connection.drain_inbound_events();
+        assert_eq!(drained.len(), 2);
     }
 
     #[test]
