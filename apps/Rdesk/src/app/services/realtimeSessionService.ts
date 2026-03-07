@@ -241,3 +241,10 @@ export const getDecodedFrameSnapshot = async (
   invoke<DecodedFrameSnapshot | null>("decoded_frame_snapshot", {
     sessionId,
   });
+
+export const getDecodedFramePreview = async (
+  sessionId: string
+): Promise<string | null> =>
+  invoke<string | null>("decoded_frame_preview", {
+    sessionId,
+  });

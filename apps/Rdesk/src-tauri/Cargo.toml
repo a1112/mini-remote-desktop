@@ -17,6 +17,8 @@ tauri-build = { version = "1.5.5", features = [] }
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
 futures-util = "0.3"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png"] }
 mrd-proto = { path = "../../../crates/mrd-proto" }
 mrd-decode = { path = "../../../crates/mrd-decode" }
 mrd-signal-client = { path = "../../../crates/mrd-signal-client" }

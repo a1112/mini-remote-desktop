@@ -32,6 +32,7 @@ interface RealtimeSessionCardProps {
   sinkHeight: number;
   sinkPixelFormat: string;
   sinkBytes: number;
+  sinkPreviewUrl: string;
   handle: number | null;
   loading: boolean;
   error: string | null;
@@ -86,6 +87,7 @@ export function RealtimeSessionCard({
   sinkHeight,
   sinkPixelFormat,
   sinkBytes,
+  sinkPreviewUrl,
   handle,
   loading,
   error,
@@ -262,6 +264,21 @@ export function RealtimeSessionCard({
           />
           <RealtimeSessionMetric label="最近帧格式" value={sinkPixelFormat || "-"} />
           <RealtimeSessionMetric label="最近帧字节数" value={sinkBytes > 0 ? String(sinkBytes) : "-"} />
+        </div>
+        <div className="mt-3">
+          {sinkPreviewUrl ? (
+            <img
+              src={sinkPreviewUrl}
+              alt="Decoded frame preview"
+              className="w-full max-h-48 rounded-lg border border-black/10 object-contain"
+            />
+          ) : (
+            <div
+              className={`rounded-lg border px-3 py-8 text-center ${isDark ? "border-gray-700 text-gray-500" : "border-gray-200 text-gray-400"}`}
+            >
+              暂无预览帧
+            </div>
+          )}
         </div>
       </div>
 

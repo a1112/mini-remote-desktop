@@ -289,4 +289,16 @@ describe("realtimeSessionService", () => {
     expect(snapshot?.pixelFormat).toBe("Rgb24");
     expect(snapshot?.bytes).toBe(2764800);
   });
+
+  it("reads decoded frame preview via tauri invoke", async () => {
+    invokeMock.mockResolvedValueOnce("data:image/png;base64,abc123");
+
+    const { getDecodedFramePreview } = await import("./realtimeSessionService");
+    const preview = await getDecodedFramePreview("session-4");
+
+    expect(invokeMock).toHaveBeenCalledWith("decoded_frame_preview", {
+      sessionId: "session-4",
+    });
+    expect(preview).toBe("data:image/png;base64,abc123");
+  });
 });

@@ -12,6 +12,7 @@ mod webrtc_session;
 
 use device_info::HardwareInfo;
 use frame_sink::{DecodedFrameSink, DecodedFrameSnapshot};
+use image::{codecs::png::PngEncoder, ColorType, ImageEncoder};
 use mrd_proto::{BackendRole, DeviceId, SessionId};
 use mrd_signal_client::encode_message;
 use mrd_signal_proto::{IceCandidate, SessionDescription, SignalMessage};
@@ -368,6 +369,14 @@ async fn decoded_frame_snapshot(
     Ok(decoded_frame_snapshot_with(state.frame_sink.as_ref(), session_id))
 }
 
+#[tauri::command]
+async fn decoded_frame_preview(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+) -> Result<Option<String>, String> {
+    decoded_frame_preview_with(state.frame_sink.as_ref(), session_id)
+}
+
 /// Tauri 命令：设备注册
 ///
 /// 调用后端 API 进行设备注册，后端根据主板序列号生成设备ID
@@ -688,6 +697,34 @@ fn decoded_frame_snapshot_with(
         .map(decoded_frame_snapshot_response)
 }
 
+fn decoded_frame_preview_with(
+    sink: &std::sync::Mutex<DecodedFrameSink>,
+    session_id: String,
+) -> Result<Option<String>, String> {
+    let latest_frame = {
+        let sink = sink.lock().expect("lock decoded frame sink");
+        sink.latest_frame(&SessionId(session_id)).cloned()
+    };
+
+    let Some(frame) = latest_frame else {
+        return Ok(None);
+    };
+
+    let mut png = Vec::new();
+    PngEncoder::new(&mut png)
+        .write_image(
+            &frame.data,
+            frame.width as u32,
+            frame.height as u32,
+            ColorType::Rgb8.into(),
+        )
+        .map_err(|error| format!("encode decoded frame preview failed: {error}"))?;
+
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(png);
+    Ok(Some(format!("data:image/png;base64,{encoded}")))
+}
+
 fn main() {
     let frame_sink = std::sync::Arc::new(std::sync::Mutex::new(DecodedFrameSink::default()));
     tauri::Builder::default()
@@ -723,7 +760,8 @@ fn main() {
             webrtc_host_apply_remote_answer,
             webrtc_host_apply_remote_ice_candidate,
             webrtc_host_snapshot,
-            decoded_frame_snapshot
+            decoded_frame_snapshot,
+            decoded_frame_preview
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -732,7 +770,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        decoded_frame_snapshot_with, drain_realtime_events_with, realtime_accept_session_with,
+        decoded_frame_preview_with, decoded_frame_snapshot_with, drain_realtime_events_with, realtime_accept_session_with,
         realtime_register_with,
         realtime_request_session_with, webrtc_apply_remote_answer_with,
         webrtc_apply_remote_ice_candidate_with, webrtc_create_local_offer_with,
@@ -1009,5 +1047,29 @@ mod tests {
         assert_eq!(snapshot.height, 360);
         assert_eq!(snapshot.pixel_format, "Rgb24");
         assert_eq!(snapshot.bytes, 640 * 360 * 3);
+    }
+
+    #[test]
+    fn decoded_frame_preview_encodes_png_data_url() {
+        let sink = std::sync::Mutex::new(DecodedFrameSink::default());
+        sink.lock()
+            .expect("lock decoded frame sink")
+            .ingest_frame(
+                SessionId("session-preview".into()),
+                mrd_decode::DecodedFrame {
+                    width: 2,
+                    height: 2,
+                    pixel_format: mrd_decode::PixelFormat::Rgb24,
+                    data: vec![
+                        255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255,
+                    ],
+                },
+            );
+
+        let preview = decoded_frame_preview_with(&sink, "session-preview".into())
+            .expect("encode preview")
+            .expect("preview exists");
+
+        assert!(preview.starts_with("data:image/png;base64,"));
     }
 }
