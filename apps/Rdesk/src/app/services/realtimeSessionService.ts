@@ -50,6 +50,14 @@ export type WebrtcSessionSnapshot = {
   }>;
 };
 
+export type WebrtcHostSnapshot = {
+  localOffer?: string;
+  remoteOffer?: string;
+  localAnswer?: string;
+  remoteAnswer?: string;
+  remoteIceCount: number;
+};
+
 type RealtimeRegistrationPayload = {
   handle: number;
   device_id: string;
@@ -158,5 +166,54 @@ export const getWebrtcSnapshot = async (
   sessionId: string
 ): Promise<WebrtcSessionSnapshot | null> =>
   invoke<WebrtcSessionSnapshot | null>("webrtc_snapshot", {
+    sessionId,
+  });
+
+export const createWebrtcHostOffer = async (
+  sessionId: string
+): Promise<string> =>
+  invoke<string>("webrtc_host_create_offer", {
+    sessionId,
+  });
+
+export const applyWebrtcHostRemoteOffer = async (
+  sessionId: string,
+  sdp: string
+): Promise<void> =>
+  invoke("webrtc_host_apply_remote_offer", {
+    sessionId,
+    sdp,
+  });
+
+export const createWebrtcHostAnswer = async (
+  sessionId: string
+): Promise<string> =>
+  invoke<string>("webrtc_host_create_answer", {
+    sessionId,
+  });
+
+export const applyWebrtcHostRemoteAnswer = async (
+  sessionId: string,
+  sdp: string
+): Promise<void> =>
+  invoke("webrtc_host_apply_remote_answer", {
+    sessionId,
+    sdp,
+  });
+
+export const applyWebrtcHostRemoteIceCandidate = async (
+  request: Omit<RealtimeIceCandidate, "handle">
+): Promise<void> =>
+  invoke("webrtc_host_apply_remote_ice_candidate", {
+    sessionId: request.sessionId,
+    candidate: request.candidate,
+    sdpMid: request.sdpMid,
+    sdpMlineIndex: request.sdpMlineIndex,
+  });
+
+export const getWebrtcHostSnapshot = async (
+  sessionId: string
+): Promise<WebrtcHostSnapshot | null> =>
+  invoke<WebrtcHostSnapshot | null>("webrtc_host_snapshot", {
     sessionId,
   });

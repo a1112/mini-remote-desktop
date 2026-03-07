@@ -193,4 +193,68 @@ describe("realtimeSessionService", () => {
       sessionId: "session-1",
     });
   });
+
+  it("bridges webrtc host offer answer and snapshot commands via tauri invoke", async () => {
+    invokeMock
+      .mockResolvedValueOnce("generated-offer-sdp")
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce("generated-answer-sdp")
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce({
+        localOffer: "generated-offer-sdp",
+        remoteOffer: "remote-offer-sdp",
+        localAnswer: "generated-answer-sdp",
+        remoteAnswer: "remote-answer-sdp",
+        remoteIceCount: 1,
+      });
+
+    const {
+      applyWebrtcHostRemoteAnswer,
+      applyWebrtcHostRemoteIceCandidate,
+      applyWebrtcHostRemoteOffer,
+      createWebrtcHostAnswer,
+      createWebrtcHostOffer,
+      getWebrtcHostSnapshot,
+    } = await import("./realtimeSessionService");
+
+    const offer = await createWebrtcHostOffer("session-2");
+    await applyWebrtcHostRemoteOffer("session-2", "remote-offer-sdp");
+    const answer = await createWebrtcHostAnswer("session-2");
+    await applyWebrtcHostRemoteAnswer("session-2", "remote-answer-sdp");
+    await applyWebrtcHostRemoteIceCandidate({
+      sessionId: "session-2",
+      candidate: "candidate:2 1 UDP 123 127.0.0.1 5001 typ host",
+      sdpMid: "0",
+      sdpMlineIndex: 0,
+    });
+    const snapshot = await getWebrtcHostSnapshot("session-2");
+
+    expect(offer).toBe("generated-offer-sdp");
+    expect(answer).toBe("generated-answer-sdp");
+    expect(snapshot?.remoteIceCount).toBe(1);
+    expect(invokeMock).toHaveBeenNthCalledWith(1, "webrtc_host_create_offer", {
+      sessionId: "session-2",
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(2, "webrtc_host_apply_remote_offer", {
+      sessionId: "session-2",
+      sdp: "remote-offer-sdp",
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(3, "webrtc_host_create_answer", {
+      sessionId: "session-2",
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(4, "webrtc_host_apply_remote_answer", {
+      sessionId: "session-2",
+      sdp: "remote-answer-sdp",
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(5, "webrtc_host_apply_remote_ice_candidate", {
+      sessionId: "session-2",
+      candidate: "candidate:2 1 UDP 123 127.0.0.1 5001 typ host",
+      sdpMid: "0",
+      sdpMlineIndex: 0,
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(6, "webrtc_host_snapshot", {
+      sessionId: "session-2",
+    });
+  });
 });

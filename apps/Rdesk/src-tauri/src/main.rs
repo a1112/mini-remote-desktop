@@ -5,6 +5,7 @@ mod device_info;
 mod realtime_client;
 mod realtime_management;
 mod realtime_runtime;
+mod webrtc_host;
 mod webrtc_session;
 
 use device_info::HardwareInfo;
@@ -16,11 +17,13 @@ use realtime_runtime::{RealtimeRegistration, RealtimeRuntime};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tokio::sync::Mutex;
+use webrtc_host::{WebrtcHost, WebrtcHostSnapshot};
 use webrtc_session::{WebrtcSessionCoordinator, WebrtcSessionSnapshot};
 
 #[derive(Clone)]
 struct AppState {
     realtime_runtime: RealtimeRuntime,
+    webrtc_host: std::sync::Arc<Mutex<WebrtcHost>>,
     webrtc_sessions: std::sync::Arc<Mutex<WebrtcSessionCoordinator>>,
 }
 
@@ -44,6 +47,15 @@ struct WebrtcSessionSnapshotResponse {
     remote_offer: Option<String>,
     remote_answer: Option<String>,
     remote_ice_candidates: Vec<IceCandidate>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct WebrtcHostSnapshotResponse {
+    local_offer: Option<String>,
+    remote_offer: Option<String>,
+    local_answer: Option<String>,
+    remote_answer: Option<String>,
+    remote_ice_count: usize,
 }
 
 /// Tauri 命令：获取硬件信息
@@ -239,6 +251,93 @@ async fn webrtc_snapshot(
     Ok(webrtc_snapshot_with(state.webrtc_sessions.as_ref(), session_id).await)
 }
 
+#[tauri::command]
+async fn webrtc_host_create_offer(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+) -> Result<String, String> {
+    let description =
+        webrtc_host_create_offer_with(state.webrtc_host.as_ref(), session_id.clone()).await?;
+    webrtc_create_local_offer_with(state.webrtc_sessions.as_ref(), session_id, description.sdp.clone())
+        .await?;
+    Ok(description.sdp)
+}
+
+#[tauri::command]
+async fn webrtc_host_apply_remote_offer(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+    sdp: String,
+) -> Result<(), String> {
+    webrtc_host_apply_remote_offer_with(state.webrtc_host.as_ref(), session_id.clone(), sdp.clone())
+        .await?;
+    state
+        .webrtc_sessions
+        .lock()
+        .await
+        .apply_remote_offer(SessionId(session_id), sdp)
+}
+
+#[tauri::command]
+async fn webrtc_host_create_answer(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+) -> Result<String, String> {
+    let description =
+        webrtc_host_create_answer_with(state.webrtc_host.as_ref(), session_id.clone()).await?;
+    state
+        .webrtc_sessions
+        .lock()
+        .await
+        .apply_remote_answer(SessionId(session_id), description.sdp.clone())?;
+    Ok(description.sdp)
+}
+
+#[tauri::command]
+async fn webrtc_host_apply_remote_answer(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+    sdp: String,
+) -> Result<(), String> {
+    webrtc_host_apply_remote_answer_with(state.webrtc_host.as_ref(), session_id.clone(), sdp.clone())
+        .await?;
+    webrtc_apply_remote_answer_with(state.webrtc_sessions.as_ref(), session_id, sdp).await
+}
+
+#[tauri::command]
+async fn webrtc_host_apply_remote_ice_candidate(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+    candidate: String,
+    sdp_mid: Option<String>,
+    sdp_mline_index: Option<u16>,
+) -> Result<(), String> {
+    webrtc_host_apply_remote_ice_candidate_with(
+        state.webrtc_host.as_ref(),
+        session_id.clone(),
+        candidate.clone(),
+        sdp_mid.clone(),
+        sdp_mline_index,
+    )
+    .await?;
+    webrtc_apply_remote_ice_candidate_with(
+        state.webrtc_sessions.as_ref(),
+        session_id,
+        candidate,
+        sdp_mid,
+        sdp_mline_index,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn webrtc_host_snapshot(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+) -> Result<Option<WebrtcHostSnapshotResponse>, String> {
+    Ok(webrtc_host_snapshot_with(state.webrtc_host.as_ref(), session_id).await)
+}
+
 /// Tauri 命令：设备注册
 ///
 /// 调用后端 API 进行设备注册，后端根据主板序列号生成设备ID
@@ -366,6 +465,16 @@ fn webrtc_snapshot_response(snapshot: &WebrtcSessionSnapshot) -> WebrtcSessionSn
     }
 }
 
+fn webrtc_host_snapshot_response(snapshot: &WebrtcHostSnapshot) -> WebrtcHostSnapshotResponse {
+    WebrtcHostSnapshotResponse {
+        local_offer: snapshot.local_offer.clone(),
+        remote_offer: snapshot.remote_offer.clone(),
+        local_answer: snapshot.local_answer.clone(),
+        remote_answer: snapshot.remote_answer.clone(),
+        remote_ice_count: snapshot.remote_ice_count,
+    }
+}
+
 async fn webrtc_create_local_offer_with(
     coordinator: &Mutex<WebrtcSessionCoordinator>,
     session_id: String,
@@ -452,10 +561,77 @@ async fn webrtc_snapshot_with(
         .map(webrtc_snapshot_response)
 }
 
+async fn webrtc_host_create_offer_with(
+    host: &Mutex<WebrtcHost>,
+    session_id: String,
+) -> Result<SessionDescription, String> {
+    host.lock().await.create_offer(SessionId(session_id)).await
+}
+
+async fn webrtc_host_apply_remote_offer_with(
+    host: &Mutex<WebrtcHost>,
+    session_id: String,
+    sdp: String,
+) -> Result<(), String> {
+    host.lock()
+        .await
+        .apply_remote_offer(SessionId(session_id), sdp)
+        .await
+}
+
+async fn webrtc_host_create_answer_with(
+    host: &Mutex<WebrtcHost>,
+    session_id: String,
+) -> Result<SessionDescription, String> {
+    host.lock().await.create_answer(SessionId(session_id)).await
+}
+
+async fn webrtc_host_apply_remote_answer_with(
+    host: &Mutex<WebrtcHost>,
+    session_id: String,
+    sdp: String,
+) -> Result<(), String> {
+    host.lock()
+        .await
+        .apply_remote_answer(SessionId(session_id), sdp)
+        .await
+}
+
+async fn webrtc_host_apply_remote_ice_candidate_with(
+    host: &Mutex<WebrtcHost>,
+    session_id: String,
+    candidate: String,
+    sdp_mid: Option<String>,
+    sdp_mline_index: Option<u16>,
+) -> Result<(), String> {
+    host.lock()
+        .await
+        .apply_remote_ice_candidate(
+            SessionId(session_id.clone()),
+            IceCandidate {
+                session_id: SessionId(session_id),
+                candidate,
+                sdp_mid,
+                sdp_mline_index,
+            },
+        )
+        .await
+}
+
+async fn webrtc_host_snapshot_with(
+    host: &Mutex<WebrtcHost>,
+    session_id: String,
+) -> Option<WebrtcHostSnapshotResponse> {
+    let host = host.lock().await;
+    host.snapshot(&SessionId(session_id))
+        .map(webrtc_host_snapshot_response)
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(AppState {
             realtime_runtime: RealtimeRuntime::from_env(),
+            webrtc_host: std::sync::Arc::new(Mutex::new(WebrtcHost::default())),
             webrtc_sessions: std::sync::Arc::new(Mutex::new(WebrtcSessionCoordinator::default())),
         })
         .invoke_handler(tauri::generate_handler![
@@ -477,7 +653,13 @@ fn main() {
             webrtc_apply_remote_answer,
             webrtc_apply_remote_ice_candidate,
             webrtc_sync_realtime_events,
-            webrtc_snapshot
+            webrtc_snapshot,
+            webrtc_host_create_offer,
+            webrtc_host_apply_remote_offer,
+            webrtc_host_create_answer,
+            webrtc_host_apply_remote_answer,
+            webrtc_host_apply_remote_ice_candidate,
+            webrtc_host_snapshot
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -489,9 +671,14 @@ mod tests {
         drain_realtime_events_with, realtime_accept_session_with, realtime_register_with,
         realtime_request_session_with, webrtc_apply_remote_answer_with,
         webrtc_apply_remote_ice_candidate_with, webrtc_create_local_offer_with,
-        webrtc_snapshot_with, webrtc_sync_realtime_events_with,
+        webrtc_host_apply_remote_answer_with, webrtc_host_apply_remote_offer_with,
+        webrtc_host_create_answer_with, webrtc_host_create_offer_with,
+        webrtc_host_snapshot_with, webrtc_snapshot_with, webrtc_sync_realtime_events_with,
     };
-    use crate::{realtime_runtime::RealtimeRuntime, webrtc_session::WebrtcSessionCoordinator};
+    use crate::{
+        realtime_runtime::RealtimeRuntime, webrtc_host::WebrtcHost,
+        webrtc_session::WebrtcSessionCoordinator,
+    };
     use axum::{
         extract::ws::{Message, WebSocket, WebSocketUpgrade},
         response::IntoResponse,
@@ -682,5 +869,45 @@ mod tests {
         assert_eq!(snapshot.local_offer, None);
         assert_eq!(snapshot.remote_answer.as_deref(), Some("answer-sdp"));
         assert_eq!(snapshot.remote_ice_candidates.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn webrtc_host_helpers_complete_offer_answer_roundtrip() {
+        let controller_host = Mutex::new(WebrtcHost::default());
+        let agent_host = Mutex::new(WebrtcHost::default());
+
+        let offer = webrtc_host_create_offer_with(&controller_host, "session-3".into())
+            .await
+            .expect("controller create offer");
+        webrtc_host_apply_remote_offer_with(
+            &agent_host,
+            "session-3".into(),
+            offer.sdp.clone(),
+        )
+        .await
+        .expect("agent apply remote offer");
+
+        let answer = webrtc_host_create_answer_with(&agent_host, "session-3".into())
+            .await
+            .expect("agent create answer");
+        webrtc_host_apply_remote_answer_with(
+            &controller_host,
+            "session-3".into(),
+            answer.sdp.clone(),
+        )
+        .await
+        .expect("controller apply remote answer");
+
+        let controller_snapshot = webrtc_host_snapshot_with(&controller_host, "session-3".into())
+            .await
+            .expect("controller host snapshot");
+        let agent_snapshot = webrtc_host_snapshot_with(&agent_host, "session-3".into())
+            .await
+            .expect("agent host snapshot");
+
+        assert!(controller_snapshot.local_offer.is_some());
+        assert!(controller_snapshot.remote_answer.is_some());
+        assert!(agent_snapshot.remote_offer.is_some());
+        assert!(agent_snapshot.local_answer.is_some());
     }
 }
