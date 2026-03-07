@@ -2,6 +2,8 @@
 
 FastAPI management server for Rdesk devices and session requests.
 
+Current product path: `apps/Rdesk-Server`
+
 ## Quick Start
 
 1. Create PostgreSQL database:
@@ -13,7 +15,7 @@ CREATE DATABASE rdesk_server;
 2. Install dependencies:
 
 ```powershell
-cd J:\ProjectTest\remote-desktop\mini-remote-desktop\Rdesk-Server
+cd G:\Project\mini-remote-desktop\apps\Rdesk-Server
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt

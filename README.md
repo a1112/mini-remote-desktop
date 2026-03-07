@@ -93,6 +93,9 @@ npm start
 
 ```
 mini-remote-desktop/
+├── apps/
+│   ├── Rdesk/          # 客户端产品主线
+│   └── Rdesk-Server/   # 服务端产品主线
 ├── server/
 │   ├── index.js      # 信令服务器 (~200 行)
 │   └── package.json
@@ -104,7 +107,7 @@ mini-remote-desktop/
 │   ├── index.html    # Agent 界面
 │   ├── renderer.js   # 渲染进程
 │   └── package.json
-└── start-all.bat     # 一键启动脚本
+└── start-all.bat     # 历史启动脚本（待回收）
 ```
 
 ## 技术栈
