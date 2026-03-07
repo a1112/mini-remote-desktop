@@ -93,6 +93,8 @@ struct DecodedFrameSnapshotResponse {
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct RenderHostSnapshotResponse {
     attached: bool,
+    surface_count: usize,
+    attached_surface_ids: Vec<String>,
     frame: Option<DecodedFrameSnapshotResponse>,
     preview_data_url: Option<String>,
     renderer_backend: Option<String>,
@@ -412,11 +414,18 @@ async fn render_host_attach_session(
     session_id: String,
 ) -> Result<(), String> {
     let window_handle = current_window_handle(&window)?;
+    let surface_id = state
+        .render_windows
+        .lock()
+        .expect("lock render window registry")
+        .context_for_label(&window.app_handle(), window.label())
+        .map(|context| context.surface_id)
+        .unwrap_or_else(|| "surface-1".to_string());
     state
         .render_host
         .lock()
         .expect("lock render host")
-        .attach_session(SessionId(session_id), window_handle)?;
+        .attach_session(SessionId(session_id), surface_id, window_handle)?;
     state
         .render_windows
         .lock()
@@ -660,6 +669,8 @@ fn decoded_frame_snapshot_response(snapshot: &DecodedFrameSnapshot) -> DecodedFr
 fn render_host_snapshot_response(snapshot: RenderHostSnapshot) -> RenderHostSnapshotResponse {
     RenderHostSnapshotResponse {
         attached: snapshot.attached,
+        surface_count: snapshot.surface_count,
+        attached_surface_ids: snapshot.attached_surface_ids,
         frame: snapshot.frame.map(|frame| DecodedFrameSnapshotResponse {
             frame_count: frame.frame_count,
             width: frame.width,
@@ -1264,7 +1275,7 @@ mod tests {
                 },
             );
         let mut render_host = RenderHost::with_frame_sink(sink);
-        let _ = render_host.attach_session(SessionId("session-render".into()), 0);
+        let _ = render_host.attach_session(SessionId("session-render".into()), "surface-1".into(), 0);
 
         let response = render_host_snapshot_response(
             render_host
@@ -1273,6 +1284,8 @@ mod tests {
         );
 
         assert!(response.attached);
+        assert_eq!(response.surface_count, 1);
+        assert_eq!(response.attached_surface_ids, vec!["surface-1".to_string()]);
         assert_eq!(response.frame.as_ref().map(|frame| frame.width), Some(2));
         assert!(response
             .preview_data_url

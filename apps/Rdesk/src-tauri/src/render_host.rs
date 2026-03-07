@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::{Arc, Mutex},
 };
 
@@ -25,6 +25,8 @@ pub struct DecodedFrameSnapshotResponse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderHostSnapshot {
     pub attached: bool,
+    pub surface_count: usize,
+    pub attached_surface_ids: Vec<String>,
     pub frame: Option<DecodedFrameSnapshotResponse>,
     pub preview_data_url: Option<String>,
     pub renderer_backend: Option<String>,
@@ -41,15 +43,13 @@ pub struct RendererSnapshotResponse {
 }
 
 pub struct RenderHost {
-    attached_sessions: HashSet<SessionId>,
-    renderers: HashMap<SessionId, BoxedRenderer>,
+    renderers: HashMap<SessionId, HashMap<String, BoxedRenderer>>,
     frame_sink: Option<Arc<Mutex<DecodedFrameSink>>>,
 }
 
 impl RenderHost {
     pub fn with_frame_sink(frame_sink: Arc<Mutex<DecodedFrameSink>>) -> Self {
         Self {
-            attached_sessions: HashSet::new(),
             renderers: HashMap::new(),
             frame_sink: Some(frame_sink),
         }
@@ -58,10 +58,11 @@ impl RenderHost {
     pub fn attach_session(
         &mut self,
         session_id: SessionId,
+        surface_id: String,
         window_handle: isize,
     ) -> Result<(), String> {
-        self.attached_sessions.insert(session_id.clone());
-        if !self.renderers.contains_key(&session_id) {
+        let renderers = self.renderers.entry(session_id).or_default();
+        if !renderers.contains_key(&surface_id) {
             let factory = D3d11RendererFactory;
             let mut renderer = factory
                 .create()
@@ -69,21 +70,28 @@ impl RenderHost {
             renderer
                 .attach_target(RenderTarget::WindowHandle(window_handle))
                 .map_err(|error| format!("attach renderer target failed: {error}"))?;
-            self.renderers.insert(session_id, renderer);
+            renderers.insert(surface_id, renderer);
         }
         Ok(())
     }
 
     pub fn detach_session(&mut self, session_id: &SessionId) {
-        self.attached_sessions.remove(session_id);
         self.renderers.remove(session_id);
     }
 
     pub fn snapshot(&mut self, session_id: &SessionId) -> Result<RenderHostSnapshot, String> {
-        let attached = self.attached_sessions.contains(session_id);
+        let attached_surface_ids = self
+            .renderers
+            .get(session_id)
+            .map(|renderers| renderers.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let attached = !attached_surface_ids.is_empty();
+        let surface_count = attached_surface_ids.len();
         let Some(frame_sink) = self.frame_sink.as_ref() else {
             return Ok(RenderHostSnapshot {
                 attached,
+                surface_count,
+                attached_surface_ids,
                 frame: None,
                 preview_data_url: None,
                 renderer_backend: None,
@@ -99,28 +107,34 @@ impl RenderHost {
             )
         };
 
-        if let (Some(renderer), Some(frame_to_upload)) =
+        if let (Some(surface_renderers), Some(frame_to_upload)) =
             (self.renderers.get_mut(session_id), latest_frame.as_ref())
         {
-            renderer
-                .upload_frame(decoded_frame_to_render_frame(frame_to_upload))
-                .map_err(|error| format!("upload latest frame to renderer failed: {error}"))?;
+            let render_frame = decoded_frame_to_render_frame(frame_to_upload);
+            for renderer in surface_renderers.values_mut() {
+                renderer
+                    .upload_frame(render_frame.clone())
+                    .map_err(|error| format!("upload latest frame to renderer failed: {error}"))?;
+            }
         }
 
         let preview_data_url = decoded_frame_preview_with(frame_sink.as_ref(), session_id.0.clone())?;
         let renderer_snapshot = self
             .renderers
             .get(session_id)
+            .and_then(|renderers| renderers.values().next())
             .map(|renderer| renderer_snapshot_response(renderer.snapshot()));
 
         Ok(RenderHostSnapshot {
             attached,
+            surface_count,
+            attached_surface_ids,
             frame,
             preview_data_url,
             renderer_backend: self
                 .renderers
                 .get(session_id)
-                .map(|_| "d3d11".to_string()),
+                .and_then(|renderers| (!renderers.is_empty()).then(|| "d3d11".to_string())),
             renderer_snapshot,
         })
     }
@@ -129,7 +143,6 @@ impl RenderHost {
 impl Default for RenderHost {
     fn default() -> Self {
         Self {
-            attached_sessions: HashSet::new(),
             renderers: HashMap::new(),
             frame_sink: None,
         }
@@ -235,7 +248,7 @@ mod tests {
 
         let mut render_host = RenderHost::with_frame_sink(sink);
         render_host
-            .attach_session(SessionId("session-render".into()), 0)
+            .attach_session(SessionId("session-render".into()), "surface-1".into(), 0)
             .expect("attach session");
 
         let snapshot = render_host
@@ -243,6 +256,8 @@ mod tests {
             .expect("render host snapshot");
 
         assert!(snapshot.attached);
+        assert_eq!(snapshot.surface_count, 1);
+        assert_eq!(snapshot.attached_surface_ids, vec!["surface-1".to_string()]);
         assert_eq!(snapshot.frame.as_ref().map(|frame| frame.width), Some(4));
         assert_eq!(snapshot.renderer_backend.as_deref(), Some("d3d11"));
         assert_eq!(

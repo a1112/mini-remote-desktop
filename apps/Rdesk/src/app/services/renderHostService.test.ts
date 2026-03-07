@@ -30,6 +30,8 @@ describe("renderHostService", () => {
   it("reads render host snapshots via tauri invoke", async () => {
     invokeMock.mockResolvedValue({
       attached: true,
+      surface_count: 2,
+      attached_surface_ids: ["surface-1", "surface-2"],
       frame: {
         frame_count: 1,
         width: 1280,
@@ -55,6 +57,8 @@ describe("renderHostService", () => {
       sessionId: "session-2",
     });
     expect(snapshot.attached).toBe(true);
+    expect(snapshot.surface_count).toBe(2);
+    expect(snapshot.attached_surface_ids).toEqual(["surface-1", "surface-2"]);
     expect(snapshot.frame?.width).toBe(1280);
     expect(snapshot.preview_data_url).toBe("data:image/png;base64,abc123");
     expect(snapshot.renderer_backend).toBe("d3d11");

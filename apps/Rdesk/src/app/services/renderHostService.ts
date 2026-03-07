@@ -2,6 +2,8 @@ import { invoke } from "@tauri-apps/api/tauri";
 
 export type RenderHostSnapshot = {
   attached: boolean;
+  surface_count: number;
+  attached_surface_ids: string[];
   frame: {
     frame_count: number;
     width: number;
