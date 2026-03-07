@@ -1,5 +1,20 @@
 # Mini Remote Desktop
 
+## Rebuild Notice
+
+This repository is being rebuilt into a clean product-oriented workspace.
+
+The long-term mainline is moving toward:
+
+- `apps/Rdesk`
+- `apps/Rdesk-Server`
+- `apps/realtime-server`
+- `crates/*`
+- `labs/GPUTest`
+- `junk/*`
+
+Until the rebuild is complete, recovered trees and older projects should be treated as reference material, not as architecture-defining sources of truth.
+
 极简高性能远程桌面方案 - 完全私有化部署
 
 ## 特点
