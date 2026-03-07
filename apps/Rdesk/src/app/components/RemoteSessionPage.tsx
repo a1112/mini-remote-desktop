@@ -21,6 +21,13 @@ import {
 } from "lucide-react";
 import { useTheme } from "./ThemeContext";
 import { withTauriWindow } from "../utils/tauriWindow";
+import { isTauriRuntime } from "../utils/runtime";
+import {
+  attachRenderHostSession,
+  detachRenderHostSession,
+  getRenderHostSnapshot,
+  type RenderHostSnapshot,
+} from "../services/renderHostService";
 
 export function RemoteSessionPage() {
   const { id } = useParams();
@@ -34,6 +41,7 @@ export function RemoteSessionPage() {
   const [quality, setQuality] = useState(87);
   const [elapsed, setElapsed] = useState(0);
   const [isMaximized, setIsMaximized] = useState(false);
+  const [renderSnapshot, setRenderSnapshot] = useState<RenderHostSnapshot | null>(null);
 
   const noDragSelector =
     'button, a, input, select, textarea, [role="button"], [role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"], [data-radix-collection-item], [data-no-drag="true"]';
@@ -53,6 +61,31 @@ export function RemoteSessionPage() {
       if (typeof next === "boolean") setIsMaximized(next);
     });
   }, []);
+
+  useEffect(() => {
+    if (!id || !isTauriRuntime()) return;
+
+    let active = true;
+
+    const refreshSnapshot = async () => {
+      const snapshot = await getRenderHostSnapshot(id);
+      if (active) setRenderSnapshot(snapshot);
+    };
+
+    void attachRenderHostSession(id)
+      .then(refreshSnapshot)
+      .catch(() => {});
+
+    const timer = window.setInterval(() => {
+      void refreshSnapshot().catch(() => {});
+    }, 1000);
+
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+      void detachRenderHostSession(id).catch(() => {});
+    };
+  }, [id]);
 
   const formatTime = (s: number) => {
     const m = Math.floor(s / 60);
@@ -228,12 +261,21 @@ export function RemoteSessionPage() {
 
       {/* Remote screen — full area */}
       <div className="flex-1 relative overflow-hidden cursor-crosshair select-none">
-        <img
-          src="https://images.unsplash.com/photo-1651832710372-a2b0da73a98f?crop=entropy&cs=tinysrgb&fit=max&fm=jpg&ixid=M3w3Nzg4Nzd8MHwxfHNlYXJjaHwxfHxyZW1vdGUlMjBkZXNrdG9wJTIwY29tcHV0ZXIlMjBzY3JlZW58ZW58MXx8fHwxNzcyNjE5MDE0fDA&ixlib=rb-4.1.0&q=80&w=1080"
-          alt="Remote desktop"
-          className="w-full h-full object-cover opacity-90"
-          draggable={false}
-        />
+        {renderSnapshot?.preview_data_url ? (
+          <img
+            src={renderSnapshot.preview_data_url}
+            alt="Remote desktop"
+            className="w-full h-full object-contain bg-black"
+            draggable={false}
+          />
+        ) : (
+          <img
+            src="https://images.unsplash.com/photo-1651832710372-a2b0da73a98f?crop=entropy&cs=tinysrgb&fit=max&fm=jpg&ixid=M3w3Nzg4Nzd8MHwxfHNlYXJjaHwxfHxyZW1vdGUlMjBkZXNrdG9wJTIwY29tcHV0ZXIlMjBzY3JlZW58ZW58MXx8fHwxNzcyNjE5MDE0fDA&ixlib=rb-4.1.0&q=80&w=1080"
+            alt="Remote desktop"
+            className="w-full h-full object-cover opacity-90"
+            draggable={false}
+          />
+        )}
 
         {/* Connection quality overlay */}
         <div className="absolute top-3 right-3 flex items-center gap-2 px-2.5 py-1.5 rounded-lg bg-black/60 backdrop-blur-sm border border-white/10 text-gray-300" style={{ fontSize: 11 }}>
@@ -243,16 +285,22 @@ export function RemoteSessionPage() {
 
         {/* Device info badge */}
         <div className="absolute bottom-3 left-3 px-2.5 py-1.5 rounded-lg bg-black/60 backdrop-blur-sm border border-white/10 text-gray-400" style={{ fontSize: 11 }}>
-          {device.name} · {device.os} · 1920×1080
+          {device.name} · {device.os} · {renderSnapshot?.frame ? `${renderSnapshot.frame.width}×${renderSnapshot.frame.height}` : "1920×1080"}
         </div>
       </div>
 
       {/* Status bar */}
       <div className="flex items-center justify-between px-4 py-1.5 bg-[#232340] border-t border-white/10 shrink-0">
         <div className="flex items-center gap-4">
-          <StatusItem label="分辨率" value="1920×1080" />
+          <StatusItem
+            label="分辨率"
+            value={renderSnapshot?.frame ? `${renderSnapshot.frame.width}×${renderSnapshot.frame.height}` : "1920×1080"}
+          />
           <StatusItem label="帧率" value="60 fps" />
-          <StatusItem label="带宽" value="4.2 MB/s" />
+          <StatusItem
+            label="帧缓冲"
+            value={renderSnapshot?.frame ? `${Math.round(renderSnapshot.frame.bytes / 1024)} KB` : "-"}
+          />
         </div>
         <div className="flex items-center gap-1 text-green-400" style={{ fontSize: 11 }}>
           <Lock style={{ width: 11, height: 11 }} />

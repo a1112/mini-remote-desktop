@@ -3,6 +3,7 @@
 
 mod device_info;
 mod frame_sink;
+mod render_host;
 mod realtime_client;
 mod realtime_management;
 mod realtime_runtime;
@@ -18,6 +19,7 @@ use mrd_signal_client::encode_message;
 use mrd_signal_proto::{IceCandidate, SessionDescription, SignalMessage};
 use realtime_management::{RealtimeManagementClient, RealtimeStatus};
 use realtime_runtime::{RealtimeRegistration, RealtimeRuntime};
+use render_host::{render_host_snapshot_with, RenderHost, RenderHostSnapshot};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tokio::sync::Mutex;
@@ -27,6 +29,7 @@ use webrtc_session::{WebrtcSessionCoordinator, WebrtcSessionSnapshot};
 #[derive(Clone)]
 struct AppState {
     frame_sink: std::sync::Arc<std::sync::Mutex<DecodedFrameSink>>,
+    render_host: std::sync::Arc<std::sync::Mutex<RenderHost>>,
     realtime_runtime: RealtimeRuntime,
     webrtc_host: std::sync::Arc<Mutex<WebrtcHost>>,
     webrtc_sessions: std::sync::Arc<Mutex<WebrtcSessionCoordinator>>,
@@ -79,6 +82,13 @@ struct DecodedFrameSnapshotResponse {
     height: usize,
     pixel_format: String,
     bytes: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct RenderHostSnapshotResponse {
+    attached: bool,
+    frame: Option<DecodedFrameSnapshotResponse>,
+    preview_data_url: Option<String>,
 }
 
 /// Tauri 命令：获取硬件信息
@@ -377,6 +387,41 @@ async fn decoded_frame_preview(
     decoded_frame_preview_with(state.frame_sink.as_ref(), session_id)
 }
 
+#[tauri::command]
+async fn render_host_attach_session(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+) -> Result<(), String> {
+    state
+        .render_host
+        .lock()
+        .expect("lock render host")
+        .attach_session(SessionId(session_id));
+    Ok(())
+}
+
+#[tauri::command]
+async fn render_host_detach_session(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+) -> Result<(), String> {
+    state
+        .render_host
+        .lock()
+        .expect("lock render host")
+        .detach_session(&SessionId(session_id));
+    Ok(())
+}
+
+#[tauri::command]
+async fn render_host_snapshot(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+) -> Result<RenderHostSnapshotResponse, String> {
+    let snapshot = render_host_snapshot_with(state.render_host.as_ref(), session_id)?;
+    Ok(render_host_snapshot_response(snapshot))
+}
+
 /// Tauri 命令：设备注册
 ///
 /// 调用后端 API 进行设备注册，后端根据主板序列号生成设备ID
@@ -532,6 +577,20 @@ fn decoded_frame_snapshot_response(snapshot: &DecodedFrameSnapshot) -> DecodedFr
             mrd_decode::PixelFormat::Rgb24 => "Rgb24".to_string(),
         },
         bytes: snapshot.bytes,
+    }
+}
+
+fn render_host_snapshot_response(snapshot: RenderHostSnapshot) -> RenderHostSnapshotResponse {
+    RenderHostSnapshotResponse {
+        attached: snapshot.attached,
+        frame: snapshot.frame.map(|frame| DecodedFrameSnapshotResponse {
+            frame_count: frame.frame_count,
+            width: frame.width,
+            height: frame.height,
+            pixel_format: frame.pixel_format,
+            bytes: frame.bytes,
+        }),
+        preview_data_url: snapshot.preview_data_url,
     }
 }
 
@@ -727,9 +786,11 @@ fn decoded_frame_preview_with(
 
 fn main() {
     let frame_sink = std::sync::Arc::new(std::sync::Mutex::new(DecodedFrameSink::default()));
+    let render_host = std::sync::Arc::new(std::sync::Mutex::new(RenderHost::with_frame_sink(frame_sink.clone())));
     tauri::Builder::default()
         .manage(AppState {
             frame_sink: frame_sink.clone(),
+            render_host,
             realtime_runtime: RealtimeRuntime::from_env(),
             webrtc_host: std::sync::Arc::new(Mutex::new(WebrtcHost::with_frame_sink(frame_sink))),
             webrtc_sessions: std::sync::Arc::new(Mutex::new(WebrtcSessionCoordinator::default())),
@@ -761,7 +822,10 @@ fn main() {
             webrtc_host_apply_remote_ice_candidate,
             webrtc_host_snapshot,
             decoded_frame_snapshot,
-            decoded_frame_preview
+            decoded_frame_preview,
+            render_host_attach_session,
+            render_host_detach_session,
+            render_host_snapshot
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -771,7 +835,7 @@ fn main() {
 mod tests {
     use super::{
         decoded_frame_preview_with, decoded_frame_snapshot_with, drain_realtime_events_with, realtime_accept_session_with,
-        realtime_register_with,
+        realtime_register_with, render_host_snapshot_response,
         realtime_request_session_with, webrtc_apply_remote_answer_with,
         webrtc_apply_remote_ice_candidate_with, webrtc_create_local_offer_with,
         webrtc_host_apply_remote_answer_with, webrtc_host_apply_remote_offer_with,
@@ -779,7 +843,7 @@ mod tests {
         webrtc_host_snapshot_with, webrtc_snapshot_with, webrtc_sync_realtime_events_with,
     };
     use crate::{
-        frame_sink::DecodedFrameSink, realtime_runtime::RealtimeRuntime, webrtc_host::WebrtcHost,
+        frame_sink::DecodedFrameSink, realtime_runtime::RealtimeRuntime, render_host::RenderHost, webrtc_host::WebrtcHost,
         webrtc_session::WebrtcSessionCoordinator,
     };
     use axum::{
@@ -1071,5 +1135,36 @@ mod tests {
             .expect("preview exists");
 
         assert!(preview.starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn render_host_snapshot_reports_attachment_and_preview() {
+        let sink = std::sync::Arc::new(std::sync::Mutex::new(DecodedFrameSink::default()));
+        sink.lock()
+            .expect("lock decoded frame sink")
+            .ingest_frame(
+                SessionId("session-render".into()),
+                mrd_decode::DecodedFrame {
+                    width: 2,
+                    height: 2,
+                    pixel_format: mrd_decode::PixelFormat::Rgb24,
+                    data: vec![255; 12],
+                },
+            );
+        let mut render_host = RenderHost::with_frame_sink(sink);
+        render_host.attach_session(SessionId("session-render".into()));
+
+        let response = render_host_snapshot_response(
+            render_host
+                .snapshot(&SessionId("session-render".into()))
+                .expect("render host snapshot"),
+        );
+
+        assert!(response.attached);
+        assert_eq!(response.frame.as_ref().map(|frame| frame.width), Some(2));
+        assert!(response
+            .preview_data_url
+            .as_deref()
+            .map_or(false, |value: &str| value.starts_with("data:image/png;base64,")));
     }
 }
