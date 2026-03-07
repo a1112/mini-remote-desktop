@@ -11,6 +11,7 @@ mod webrtc_host;
 mod webrtc_media;
 mod webrtc_session;
 mod render_window_registry;
+mod render_surface_catalog;
 
 use device_info::HardwareInfo;
 use frame_sink::{DecodedFrameSink, DecodedFrameSnapshot};
@@ -23,6 +24,7 @@ use realtime_runtime::{RealtimeRegistration, RealtimeRuntime};
 use render_host::{
     render_host_snapshot_with, RenderHost, RenderHostSnapshot, RendererSnapshotResponse,
 };
+use render_surface_catalog::{RenderSurfaceCatalog, RenderSurfaceDescriptor};
 use render_window_registry::{RenderWindowContext, RenderWindowRegistry};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -36,6 +38,7 @@ struct AppState {
     frame_sink: std::sync::Arc<std::sync::Mutex<DecodedFrameSink>>,
     render_host: std::sync::Arc<std::sync::Mutex<RenderHost>>,
     render_windows: std::sync::Arc<std::sync::Mutex<RenderWindowRegistry>>,
+    render_surfaces: std::sync::Arc<std::sync::Mutex<RenderSurfaceCatalog>>,
     realtime_runtime: RealtimeRuntime,
     webrtc_host: std::sync::Arc<Mutex<WebrtcHost>>,
     webrtc_sessions: std::sync::Arc<Mutex<WebrtcSessionCoordinator>>,
@@ -109,6 +112,14 @@ struct RenderWindowContextResponse {
     role: String,
     renderer_attached: bool,
     session_window_count: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct RenderSurfaceDescriptorResponse {
+    surface_id: String,
+    name: String,
+    role: String,
+    current: bool,
 }
 
 /// Tauri 命令：获取硬件信息
@@ -459,11 +470,17 @@ async fn render_host_snapshot(
 #[tauri::command]
 fn open_render_window(app: tauri::AppHandle, session_id: String) -> Result<String, String> {
     let state = app.state::<AppState>();
+    let surface_id = state
+        .render_surfaces
+        .lock()
+        .expect("lock render surface catalog")
+        .create_surface(SessionId(session_id.clone()), None)
+        .surface_id;
     let result = state
         .render_windows
         .lock()
         .expect("lock render window registry")
-        .open_window(&app, SessionId(session_id), None);
+        .open_window(&app, SessionId(session_id), Some(surface_id));
     result
 }
 
@@ -474,6 +491,11 @@ fn open_render_surface_window(
     surface_id: String,
 ) -> Result<String, String> {
     let state = app.state::<AppState>();
+    state
+        .render_surfaces
+        .lock()
+        .expect("lock render surface catalog")
+        .ensure_surface(SessionId(session_id.clone()), surface_id.clone());
     let result = state
         .render_windows
         .lock()
@@ -524,6 +546,68 @@ fn render_window_context(
         .context_for_label(&app, &label)
         .map(render_window_context_response);
     Ok(context)
+}
+
+#[tauri::command]
+fn list_render_surfaces(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+) -> Result<Vec<RenderSurfaceDescriptorResponse>, String> {
+    let session_id = SessionId(session_id);
+    let catalog = state
+        .render_surfaces
+        .lock()
+        .expect("lock render surface catalog");
+    let current_surface_id = catalog.current_surface_id(&session_id);
+    let surfaces = catalog
+        .list_surfaces(&session_id)
+        .into_iter()
+        .map(|surface| render_surface_descriptor_response(surface, current_surface_id.as_deref()))
+        .collect();
+    Ok(surfaces)
+}
+
+#[tauri::command]
+fn create_render_surface(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+    name: Option<String>,
+) -> Result<RenderSurfaceDescriptorResponse, String> {
+    let surface = state
+        .render_surfaces
+        .lock()
+        .expect("lock render surface catalog")
+        .create_surface(SessionId(session_id), name);
+    let current_surface_id = surface.surface_id.clone();
+    Ok(render_surface_descriptor_response(
+        surface,
+        Some(current_surface_id.as_str()),
+    ))
+}
+
+#[tauri::command]
+fn select_current_render_surface(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+    surface_id: String,
+) -> Result<(), String> {
+    state
+        .render_surfaces
+        .lock()
+        .expect("lock render surface catalog")
+        .select_current_surface(SessionId(session_id), surface_id)
+}
+
+#[tauri::command]
+fn current_render_surface(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+) -> Result<Option<String>, String> {
+    Ok(state
+        .render_surfaces
+        .lock()
+        .expect("lock render surface catalog")
+        .current_surface_id(&SessionId(session_id)))
 }
 
 /// Tauri 命令：设备注册
@@ -710,6 +794,18 @@ fn render_window_context_response(context: RenderWindowContext) -> RenderWindowC
         role: context.role,
         renderer_attached: context.renderer_attached,
         session_window_count: context.session_window_count,
+    }
+}
+
+fn render_surface_descriptor_response(
+    surface: RenderSurfaceDescriptor,
+    current_surface_id: Option<&str>,
+) -> RenderSurfaceDescriptorResponse {
+    RenderSurfaceDescriptorResponse {
+        current: current_surface_id == Some(surface.surface_id.as_str()),
+        surface_id: surface.surface_id,
+        name: surface.name,
+        role: surface.role,
     }
 }
 
@@ -923,11 +1019,13 @@ fn main() {
     let frame_sink = std::sync::Arc::new(std::sync::Mutex::new(DecodedFrameSink::default()));
     let render_host = std::sync::Arc::new(std::sync::Mutex::new(RenderHost::with_frame_sink(frame_sink.clone())));
     let render_windows = std::sync::Arc::new(std::sync::Mutex::new(RenderWindowRegistry::default()));
+    let render_surfaces = std::sync::Arc::new(std::sync::Mutex::new(RenderSurfaceCatalog::default()));
     tauri::Builder::default()
         .manage(AppState {
             frame_sink: frame_sink.clone(),
             render_host,
             render_windows,
+            render_surfaces,
             realtime_runtime: RealtimeRuntime::from_env(),
             webrtc_host: std::sync::Arc::new(Mutex::new(WebrtcHost::with_frame_sink(frame_sink))),
             webrtc_sessions: std::sync::Arc::new(Mutex::new(WebrtcSessionCoordinator::default())),
@@ -967,7 +1065,11 @@ fn main() {
             open_render_surface_window,
             list_render_windows,
             close_render_window,
-            render_window_context
+            render_window_context,
+            list_render_surfaces,
+            create_render_surface,
+            select_current_render_surface,
+            current_render_surface
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

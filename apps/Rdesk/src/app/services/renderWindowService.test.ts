@@ -104,4 +104,66 @@ describe("renderWindowService", () => {
     });
     expect(label).toBe("render-session-1-3");
   });
+
+  it("lists explicit render surfaces for a session", async () => {
+    invokeMock.mockResolvedValue([
+      {
+        surface_id: "surface-1",
+        name: "Surface 1",
+        role: "controller",
+        current: true,
+      },
+      {
+        surface_id: "surface-2",
+        name: "Screen B",
+        role: "controller",
+        current: false,
+      },
+    ]);
+
+    const { listRenderSurfaces } = await import("./renderWindowService");
+    const surfaces = await listRenderSurfaces("session-1");
+
+    expect(invokeMock).toHaveBeenCalledWith("list_render_surfaces", {
+      sessionId: "session-1",
+    });
+    expect(surfaces[0]?.current).toBe(true);
+    expect(surfaces[1]?.name).toBe("Screen B");
+  });
+
+  it("creates and selects an explicit render surface", async () => {
+    invokeMock.mockResolvedValueOnce({
+      surface_id: "surface-3",
+      name: "Editor",
+      role: "controller",
+      current: true,
+    });
+    invokeMock.mockResolvedValueOnce(undefined);
+
+    const { createRenderSurface, selectCurrentRenderSurface } = await import("./renderWindowService");
+    const surface = await createRenderSurface("session-1", "Editor");
+    await selectCurrentRenderSurface("session-1", "surface-3");
+
+    expect(invokeMock).toHaveBeenNthCalledWith(1, "create_render_surface", {
+      sessionId: "session-1",
+      name: "Editor",
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(2, "select_current_render_surface", {
+      sessionId: "session-1",
+      surfaceId: "surface-3",
+    });
+    expect(surface.surface_id).toBe("surface-3");
+  });
+
+  it("reads the current render surface id for a session", async () => {
+    invokeMock.mockResolvedValue("surface-2");
+
+    const { getCurrentRenderSurface } = await import("./renderWindowService");
+    const surfaceId = await getCurrentRenderSurface("session-1");
+
+    expect(invokeMock).toHaveBeenCalledWith("current_render_surface", {
+      sessionId: "session-1",
+    });
+    expect(surfaceId).toBe("surface-2");
+  });
 });

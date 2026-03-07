@@ -9,6 +9,13 @@ export type RenderWindowContext = {
   session_window_count: number;
 };
 
+export type RenderSurfaceDescriptor = {
+  surface_id: string;
+  name: string;
+  role: string;
+  current: boolean;
+};
+
 export const openRenderWindow = async (sessionId: string): Promise<string> =>
   invoke("open_render_window", {
     sessionId,
@@ -37,3 +44,35 @@ export const closeRenderWindow = async (label: string): Promise<void> =>
 
 export const getRenderWindowContext = async (): Promise<RenderWindowContext | null> =>
   invoke("render_window_context");
+
+export const listRenderSurfaces = async (
+  sessionId: string
+): Promise<RenderSurfaceDescriptor[]> =>
+  invoke<RenderSurfaceDescriptor[]>("list_render_surfaces", {
+    sessionId,
+  });
+
+export const createRenderSurface = async (
+  sessionId: string,
+  name?: string
+): Promise<RenderSurfaceDescriptor> =>
+  invoke<RenderSurfaceDescriptor>("create_render_surface", {
+    sessionId,
+    name,
+  });
+
+export const selectCurrentRenderSurface = async (
+  sessionId: string,
+  surfaceId: string
+): Promise<void> =>
+  invoke("select_current_render_surface", {
+    sessionId,
+    surfaceId,
+  });
+
+export const getCurrentRenderSurface = async (
+  sessionId: string
+): Promise<string | null> =>
+  invoke<string | null>("current_render_surface", {
+    sessionId,
+  });

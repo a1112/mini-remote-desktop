@@ -30,10 +30,15 @@ import {
 } from "../services/renderHostService";
 import {
   closeRenderWindow,
+  createRenderSurface,
+  getCurrentRenderSurface,
   getRenderWindowContext,
+  listRenderSurfaces,
   listRenderWindows,
   openRenderWindow,
   openRenderSurfaceWindow,
+  selectCurrentRenderSurface,
+  type RenderSurfaceDescriptor,
   type RenderWindowContext,
 } from "../services/renderWindowService";
 
@@ -56,6 +61,9 @@ export function RemoteSessionPage() {
   const [currentSurfaceId, setCurrentSurfaceId] = useState<string | null>(null);
   const [currentWindowRole, setCurrentWindowRole] = useState<string | null>(null);
   const [rendererAttached, setRendererAttached] = useState<boolean>(false);
+  const [renderSurfaces, setRenderSurfaces] = useState<RenderSurfaceDescriptor[]>([]);
+  const [selectedSessionSurfaceId, setSelectedSessionSurfaceId] = useState<string | null>(null);
+  const [newSurfaceName, setNewSurfaceName] = useState("");
 
   const noDragSelector =
     'button, a, input, select, textarea, [role="button"], [role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"], [data-radix-collection-item], [data-no-drag="true"]';
@@ -98,6 +106,33 @@ export function RemoteSessionPage() {
       active = false;
       window.clearInterval(timer);
       void detachRenderHostSession(id).catch(() => {});
+    };
+  }, [id]);
+
+  useEffect(() => {
+    if (!id || !isTauriRuntime()) return;
+
+    let active = true;
+
+    const refreshSurfaces = async () => {
+      const [surfaces, currentSurface] = await Promise.all([
+        listRenderSurfaces(id),
+        getCurrentRenderSurface(id),
+      ]);
+      if (!active) return;
+      setRenderSurfaces(surfaces);
+      setSelectedSessionSurfaceId(currentSurface ?? surfaces[0]?.surface_id ?? null);
+    };
+
+    void refreshSurfaces().catch(() => {});
+
+    const timer = window.setInterval(() => {
+      void refreshSurfaces().catch(() => {});
+    }, 2000);
+
+    return () => {
+      active = false;
+      window.clearInterval(timer);
     };
   }, [id]);
 
@@ -171,6 +206,27 @@ export function RemoteSessionPage() {
   const handleCloseRenderWindow = async (label: string) => {
     if (!id || !isTauriRuntime()) return;
     await closeRenderWindow(label);
+    setRenderWindows(await listRenderWindows(id));
+  };
+
+  const handleCreateSurface = async () => {
+    if (!id || !isTauriRuntime()) return;
+    const surface = await createRenderSurface(id, newSurfaceName.trim() || undefined);
+    setNewSurfaceName("");
+    setRenderSurfaces(await listRenderSurfaces(id));
+    setSelectedSessionSurfaceId(surface.surface_id);
+  };
+
+  const handleSelectSurface = async (surfaceId: string) => {
+    if (!id || !isTauriRuntime()) return;
+    await selectCurrentRenderSurface(id, surfaceId);
+    setSelectedSessionSurfaceId(surfaceId);
+    setRenderSurfaces(await listRenderSurfaces(id));
+  };
+
+  const handleOpenSelectedSurfaceWindow = async () => {
+    if (!id || !isTauriRuntime() || !selectedSessionSurfaceId) return;
+    await openRenderSurfaceWindow(id, selectedSessionSurfaceId);
     setRenderWindows(await listRenderWindows(id));
   };
 
@@ -405,6 +461,62 @@ export function RemoteSessionPage() {
                 >
                   复用当前 surface
                 </button>
+                <button
+                  onClick={() => void handleOpenSelectedSurfaceWindow()}
+                  disabled={!selectedSessionSurfaceId}
+                  className="rounded-md bg-emerald-500/15 px-2 py-1 text-emerald-200 hover:bg-emerald-500/25 disabled:cursor-not-allowed disabled:opacity-50"
+                  style={{ fontSize: 10 }}
+                >
+                  打开已选 surface
+                </button>
+              </div>
+              <div className="rounded-md bg-white/6 px-2 py-2">
+                <div className="mb-2 text-gray-400" style={{ fontSize: 10 }}>
+                  Session Surfaces
+                </div>
+                <div className="flex gap-2">
+                  <input
+                    value={newSurfaceName}
+                    onChange={(event) => setNewSurfaceName(event.target.value)}
+                    placeholder="新 surface 名称"
+                    className="min-w-0 flex-1 rounded-md border border-white/10 bg-black/20 px-2 py-1 text-gray-200 outline-none"
+                    style={{ fontSize: 10 }}
+                  />
+                  <button
+                    onClick={() => void handleCreateSurface()}
+                    className="rounded-md bg-white/8 px-2 py-1 text-gray-200 hover:bg-white/12"
+                    style={{ fontSize: 10 }}
+                  >
+                    创建
+                  </button>
+                </div>
+                <div className="mt-2 space-y-1">
+                  {renderSurfaces.length > 0 ? (
+                    renderSurfaces.map((surface) => (
+                      <button
+                        key={surface.surface_id}
+                        onClick={() => void handleSelectSurface(surface.surface_id)}
+                        className={`flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left ${
+                          surface.current || selectedSessionSurfaceId === surface.surface_id
+                            ? "bg-blue-500/15 text-blue-200"
+                            : "bg-white/6 text-gray-300 hover:bg-white/10"
+                        }`}
+                        style={{ fontSize: 10 }}
+                      >
+                        <span className="truncate">
+                          {surface.name} · {surface.surface_id}
+                        </span>
+                        <span className="ml-2 shrink-0 text-[10px] text-gray-400">
+                          {surface.current ? "current" : surface.role}
+                        </span>
+                      </button>
+                    ))
+                  ) : (
+                    <div className="text-gray-500" style={{ fontSize: 10 }}>
+                      当前会话还没有显式 surface
+                    </div>
+                  )}
+                </div>
               </div>
               {renderWindows.length > 0 ? (
                 renderWindows.map((window) => (
