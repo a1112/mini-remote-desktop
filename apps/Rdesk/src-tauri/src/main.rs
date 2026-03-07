@@ -2,8 +2,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod device_info;
+mod realtime_management;
 
 use device_info::HardwareInfo;
+use realtime_management::{RealtimeManagementClient, RealtimeStatus};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -19,6 +21,26 @@ struct DeviceRegistrationResponse {
 #[tauri::command]
 fn get_hardware_info() -> Result<HardwareInfo, String> {
     Ok(device_info::get_hardware_info())
+}
+
+#[tauri::command]
+async fn realtime_status() -> Result<RealtimeStatus, String> {
+    RealtimeManagementClient::from_env().status().await
+}
+
+#[tauri::command]
+async fn realtime_start() -> Result<RealtimeStatus, String> {
+    RealtimeManagementClient::from_env().start().await
+}
+
+#[tauri::command]
+async fn realtime_stop() -> Result<RealtimeStatus, String> {
+    RealtimeManagementClient::from_env().stop().await
+}
+
+#[tauri::command]
+async fn realtime_restart() -> Result<RealtimeStatus, String> {
+    RealtimeManagementClient::from_env().restart().await
 }
 
 /// Tauri 命令：设备注册
@@ -86,7 +108,11 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_hardware_info,
             register_device,
-            check_device_registration
+            check_device_registration,
+            realtime_status,
+            realtime_start,
+            realtime_stop,
+            realtime_restart
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

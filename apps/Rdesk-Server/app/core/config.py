@@ -14,7 +14,11 @@ class Settings(BaseSettings):
     db_url: str = "postgresql+asyncpg://postgres:519223@127.0.0.1:5432/rdesk_server"
     jwt_secret: str = "change_me_for_production"
     jwt_expire_minutes: int = 60 * 24 * 7
-    signaling_ws_url: str = "ws://127.0.0.1:9527"
+    signaling_ws_url: str = "ws://127.0.0.1:9532/ws"
+    realtime_server_health_url: str = "http://127.0.0.1:9532/health"
+    realtime_server_command: str = "cargo"
+    realtime_server_args: str = "run -p realtime-server --manifest-path G:/Project/mini-remote-desktop/Cargo.toml"
+    realtime_server_workdir: str = "G:/Project/mini-remote-desktop"
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
 
 

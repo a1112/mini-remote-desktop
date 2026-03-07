@@ -8,6 +8,7 @@ from app.api.v1.router import api_router
 from app.core.config import settings
 from app.db.init_db import seed_initial_data
 from app.db.session import AsyncSessionLocal, Base, engine
+from app.services.realtime_manager import RealtimeSidecarManager
 import app.models  # noqa: F401
 
 
@@ -21,6 +22,11 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Rdesk-Server", version="0.1.0", lifespan=lifespan)
+app.state.realtime_manager = RealtimeSidecarManager(
+    health_url=settings.realtime_server_health_url,
+    command=[settings.realtime_server_command, *settings.realtime_server_args.split()],
+    workdir=settings.realtime_server_workdir,
+)
 
 app.add_middleware(
     CORSMiddleware,
