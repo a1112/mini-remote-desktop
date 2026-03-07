@@ -33,6 +33,8 @@ import {
   getRenderWindowContext,
   listRenderWindows,
   openRenderWindow,
+  openRenderSurfaceWindow,
+  type RenderWindowContext,
 } from "../services/renderWindowService";
 
 export function RemoteSessionPage() {
@@ -48,7 +50,7 @@ export function RemoteSessionPage() {
   const [elapsed, setElapsed] = useState(0);
   const [isMaximized, setIsMaximized] = useState(false);
   const [renderSnapshot, setRenderSnapshot] = useState<RenderHostSnapshot | null>(null);
-  const [renderWindows, setRenderWindows] = useState<string[]>([]);
+  const [renderWindows, setRenderWindows] = useState<RenderWindowContext[]>([]);
   const [currentRenderWindowLabel, setCurrentRenderWindowLabel] = useState<string | null>(null);
   const [currentRenderWindowCount, setCurrentRenderWindowCount] = useState<number | null>(null);
   const [currentSurfaceId, setCurrentSurfaceId] = useState<string | null>(null);
@@ -127,8 +129,8 @@ export function RemoteSessionPage() {
     let active = true;
 
     const refreshWindows = async () => {
-      const labels = await listRenderWindows(id);
-      if (active) setRenderWindows(labels);
+      const windows = await listRenderWindows(id);
+      if (active) setRenderWindows(windows);
     };
 
     void refreshWindows().catch(() => {});
@@ -157,6 +159,12 @@ export function RemoteSessionPage() {
   const handlePopOutWindow = async () => {
     if (!id || !isTauriRuntime()) return;
     await openRenderWindow(id);
+    setRenderWindows(await listRenderWindows(id));
+  };
+
+  const handleOpenCurrentSurfaceWindow = async () => {
+    if (!id || !isTauriRuntime() || !currentSurfaceId) return;
+    await openRenderSurfaceWindow(id, currentSurfaceId);
     setRenderWindows(await listRenderWindows(id));
   };
 
@@ -381,17 +389,39 @@ export function RemoteSessionPage() {
                   </div>
                 </div>
               ) : null}
+              <div className="flex gap-2">
+                <button
+                  onClick={() => void handlePopOutWindow()}
+                  className="rounded-md bg-white/8 px-2 py-1 text-gray-200 hover:bg-white/12"
+                  style={{ fontSize: 10 }}
+                >
+                  新建 surface 窗口
+                </button>
+                <button
+                  onClick={() => void handleOpenCurrentSurfaceWindow()}
+                  disabled={!currentSurfaceId}
+                  className="rounded-md bg-blue-500/15 px-2 py-1 text-blue-200 hover:bg-blue-500/25 disabled:cursor-not-allowed disabled:opacity-50"
+                  style={{ fontSize: 10 }}
+                >
+                  复用当前 surface
+                </button>
+              </div>
               {renderWindows.length > 0 ? (
-                renderWindows.map((label) => (
+                renderWindows.map((window) => (
                   <div
-                    key={label}
+                    key={window.label}
                     className="flex items-center justify-between gap-2 rounded-md bg-white/6 px-2 py-1.5"
                   >
-                    <span className="truncate text-gray-300" style={{ fontSize: 11 }}>
-                      {label}
-                    </span>
+                    <div className="min-w-0">
+                      <div className="truncate text-gray-300" style={{ fontSize: 11 }}>
+                        {window.label}
+                      </div>
+                      <div className="truncate text-gray-500" style={{ fontSize: 10 }}>
+                        {window.surface_id} · {window.role} · {window.renderer_attached ? "attached" : "pending"}
+                      </div>
+                    </div>
                     <button
-                      onClick={() => void handleCloseRenderWindow(label)}
+                      onClick={() => void handleCloseRenderWindow(window.label)}
                       className="rounded-md px-2 py-1 text-red-300 hover:bg-red-500/15"
                       style={{ fontSize: 10 }}
                     >

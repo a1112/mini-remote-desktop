@@ -463,7 +463,22 @@ fn open_render_window(app: tauri::AppHandle, session_id: String) -> Result<Strin
         .render_windows
         .lock()
         .expect("lock render window registry")
-        .open_window(&app, SessionId(session_id));
+        .open_window(&app, SessionId(session_id), None);
+    result
+}
+
+#[tauri::command]
+fn open_render_surface_window(
+    app: tauri::AppHandle,
+    session_id: String,
+    surface_id: String,
+) -> Result<String, String> {
+    let state = app.state::<AppState>();
+    let result = state
+        .render_windows
+        .lock()
+        .expect("lock render window registry")
+        .open_window(&app, SessionId(session_id), Some(surface_id));
     result
 }
 
@@ -471,14 +486,17 @@ fn open_render_window(app: tauri::AppHandle, session_id: String) -> Result<Strin
 fn list_render_windows(
     app: tauri::AppHandle,
     session_id: String,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<RenderWindowContextResponse>, String> {
     let state = app.state::<AppState>();
-    let labels = state
+    let windows = state
         .render_windows
         .lock()
         .expect("lock render window registry")
-        .list_windows(&app, &SessionId(session_id));
-    Ok(labels)
+        .list_window_contexts(&app, &SessionId(session_id))
+        .into_iter()
+        .map(render_window_context_response)
+        .collect();
+    Ok(windows)
 }
 
 #[tauri::command]
@@ -946,6 +964,7 @@ fn main() {
             render_host_detach_session,
             render_host_snapshot,
             open_render_window,
+            open_render_surface_window,
             list_render_windows,
             close_render_window,
             render_window_context

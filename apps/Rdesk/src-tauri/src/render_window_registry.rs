@@ -33,10 +33,11 @@ impl RenderWindowRegistry {
         &mut self,
         app: &tauri::AppHandle<R>,
         session_id: SessionId,
+        surface_id: Option<String>,
     ) -> Result<String, String> {
         let next_id = self.next_ids.entry(session_id.clone()).or_insert(1);
         let label = format!("render-{}-{}", session_id.0, *next_id);
-        let surface_id = format!("surface-{}", *next_id);
+        let surface_id = surface_id.unwrap_or_else(|| format!("surface-{}", *next_id));
         *next_id += 1;
 
         let url = format!("/session/{}", session_id.0);
@@ -60,16 +61,24 @@ impl RenderWindowRegistry {
         Ok(label)
     }
 
-    pub fn list_windows<R: tauri::Runtime>(
+    pub fn list_window_contexts<R: tauri::Runtime>(
         &mut self,
         app: &tauri::AppHandle<R>,
         session_id: &SessionId,
-    ) -> Vec<String> {
+    ) -> Vec<RenderWindowContext> {
         let entries = self.windows_by_session.entry(session_id.clone()).or_default();
         entries.retain(|entry| app.get_window(&entry.label).is_some());
+        let count = entries.len();
         entries
             .iter()
-            .map(|entry| entry.label.clone())
+            .map(|entry| RenderWindowContext {
+                label: entry.label.clone(),
+                session_id: session_id.0.clone(),
+                surface_id: entry.surface_id.clone(),
+                role: entry.role.clone(),
+                renderer_attached: entry.renderer_attached,
+                session_window_count: count,
+            })
             .collect()
     }
 
@@ -129,7 +138,7 @@ impl RenderWindowRegistry {
 
 #[cfg(test)]
 mod tests {
-    use super::{RenderWindowContext, RenderWindowRegistry};
+    use super::{RenderWindowContext, RenderWindowEntry, RenderWindowRegistry};
     use mrd_proto::SessionId;
 
     #[test]
@@ -144,6 +153,40 @@ mod tests {
 
         assert_eq!(first, "render-session-a-1");
         assert_eq!(second, "render-session-a-2");
+    }
+
+    #[test]
+    fn explicit_surface_id_can_be_reused_for_new_window() {
+        let mut registry = RenderWindowRegistry::default();
+        let session = SessionId("session-a".into());
+
+        let next = registry.next_ids.entry(session.clone()).or_insert(1);
+        let first_label = format!("render-{}-{}", session.0, *next);
+        *next += 1;
+        let second_label = format!("render-{}-{}", session.0, *next);
+
+        registry.windows_by_session.insert(
+            session.clone(),
+            vec![
+                RenderWindowEntry {
+                    label: first_label,
+                    surface_id: "surface-1".into(),
+                    role: "controller".into(),
+                    renderer_attached: true,
+                },
+                RenderWindowEntry {
+                    label: second_label,
+                    surface_id: "surface-1".into(),
+                    role: "controller".into(),
+                    renderer_attached: false,
+                },
+            ],
+        );
+
+        let entries = registry.windows_by_session.get(&session).expect("session entries");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].surface_id, "surface-1");
+        assert_eq!(entries[1].surface_id, "surface-1");
     }
 
     #[test]

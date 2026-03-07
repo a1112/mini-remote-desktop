@@ -14,8 +14,19 @@ export const openRenderWindow = async (sessionId: string): Promise<string> =>
     sessionId,
   });
 
-export const listRenderWindows = async (sessionId: string): Promise<string[]> =>
-  invoke("list_render_windows", {
+export const openRenderSurfaceWindow = async (
+  sessionId: string,
+  surfaceId: string
+): Promise<string> =>
+  invoke("open_render_surface_window", {
+    sessionId,
+    surfaceId,
+  });
+
+export const listRenderWindows = async (
+  sessionId: string
+): Promise<RenderWindowContext[]> =>
+  invoke<RenderWindowContext[]>("list_render_windows", {
     sessionId,
   });
 
