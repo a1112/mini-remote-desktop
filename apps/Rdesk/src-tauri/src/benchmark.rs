@@ -439,6 +439,7 @@ mod tests {
             1812.5,
             0,
             3,
+            vec![],
             vec![
                 (
                     StageId::EncodeTotal,
@@ -590,6 +591,7 @@ mod tests {
             1812.5,
             0,
             3,
+            vec![],
             vec![(
                 StageId::EncodeTotal,
                 StageStatsSnapshot::from_durations_ms(&[2.0, 4.0, 6.0], 3000),

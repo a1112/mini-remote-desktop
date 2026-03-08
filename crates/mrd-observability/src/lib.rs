@@ -121,6 +121,7 @@ pub struct PipelineProbeSnapshot {
     pub bitrate_kbps: f64,
     pub dropped_frames: u64,
     pub keyframes: u64,
+    pub counters: Vec<(String, u64)>,
     pub stages: Vec<(StageId, StageStatsSnapshot)>,
 }
 
@@ -136,8 +137,10 @@ impl PipelineProbeSnapshot {
         bitrate_kbps: f64,
         dropped_frames: u64,
         keyframes: u64,
+        mut counters: Vec<(String, u64)>,
         mut stages: Vec<(StageId, StageStatsSnapshot)>,
     ) -> Self {
+        counters.sort_by(|left, right| left.0.cmp(&right.0));
         stages.sort_by_key(|entry| entry.0);
         Self {
             session_id,
@@ -149,6 +152,7 @@ impl PipelineProbeSnapshot {
             bitrate_kbps,
             dropped_frames,
             keyframes,
+            counters,
             stages,
         }
     }
@@ -359,6 +363,20 @@ impl ProbeSessionHandle {
         self.state.lock().expect("lock probe state").dropped_frames += count;
     }
 
+    pub fn increment_counter(&self, name: impl Into<String>, count: u64) {
+        let mut state = self.state.lock().expect("lock probe state");
+        let name = name.into();
+        *state.counters.entry(name).or_default() += count;
+    }
+
+    pub fn set_counter(&self, name: impl Into<String>, value: u64) {
+        self.state
+            .lock()
+            .expect("lock probe state")
+            .counters
+            .insert(name.into(), value);
+    }
+
     pub fn record_stage(
         &self,
         stage: StageId,
@@ -396,6 +414,7 @@ struct ProbeState {
     transport: Option<String>,
     dropped_frames: u64,
     keyframes: u64,
+    counters: HashMap<String, u64>,
     event_capacity: usize,
     window: Duration,
     events: VecDeque<RecordedSample>,
@@ -416,6 +435,7 @@ impl ProbeState {
             transport: None,
             dropped_frames: 0,
             keyframes: 0,
+            counters: HashMap::new(),
             event_capacity,
             window,
             events: VecDeque::with_capacity(event_capacity),
@@ -499,6 +519,7 @@ impl ProbeState {
             bitrate_kbps,
             self.dropped_frames,
             self.keyframes,
+            self.counters.iter().map(|(k, v)| (k.clone(), *v)).collect(),
             stages,
         )
     }
@@ -581,6 +602,7 @@ mod tests {
             2048.0,
             0,
             2,
+            vec![],
             vec![(
                 StageId::EncodeTotal,
                 StageStatsSnapshot::from_durations_ms(&[1.0, 3.0], 1024),
@@ -595,6 +617,7 @@ mod tests {
         assert_eq!(snapshot.fps, 30.0);
         assert_eq!(snapshot.bitrate_kbps, 2048.0);
         assert_eq!(snapshot.keyframes, 2);
+        assert!(snapshot.counters.is_empty());
         assert_eq!(snapshot.stages.len(), 1);
         assert_eq!(snapshot.stages[0].0, StageId::EncodeTotal);
     }
@@ -623,6 +646,8 @@ mod tests {
         handle.set_backend("dxgi");
         handle.set_codec("h264");
         handle.set_transport("webrtc");
+        handle.increment_counter("reassembly_expired", 2);
+        handle.set_counter("pending_frames", 1);
         handle.record_stage(StageId::CaptureCopy, Duration::from_millis(2), 1024, false);
         handle.record_stage(StageId::EncodeTotal, Duration::from_millis(4), 2048, true);
         handle.record_stage(StageId::FrameSinkIngest, Duration::from_millis(1), 512, false);
@@ -640,6 +665,14 @@ mod tests {
             .stages
             .iter()
             .any(|(stage, stats)| *stage == StageId::EncodeTotal && stats.count == 1));
+        assert!(snapshot
+            .counters
+            .iter()
+            .any(|(name, value)| name == "pending_frames" && *value == 1));
+        assert!(snapshot
+            .counters
+            .iter()
+            .any(|(name, value)| name == "reassembly_expired" && *value == 2));
     }
 
     #[test]

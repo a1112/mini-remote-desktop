@@ -1,8 +1,7 @@
 use std::{fs, path::Path, time::Instant};
 
-use bytes::Bytes;
 use mrd_observability::{ComponentKind, ComponentResult};
-use mrd_transport_quic_quinn::QuinnDatagramPair;
+use mrd_transport_quic_quinn::{fragment_access_unit, QuinnDatagramPair};
 
 #[tokio::test]
 #[ignore]
@@ -13,10 +12,14 @@ async fn perf_quinn_transport_sender_reports_latency_distribution() {
         .unwrap_or(120);
     let case_name = std::env::var("MRD_COMPONENT_CASE_NAME")
         .unwrap_or_else(|_| "transport_sender.quic_quinn".into());
-    let payload = vec![0x5a; 1024];
     let pair = QuinnDatagramPair::loopback()
         .await
         .expect("initialize quinn loopback pair");
+    let max_datagram_size = pair
+        .client
+        .max_datagram_size()
+        .expect("quinn max datagram size");
+    let payload = vec![0x5a; max_datagram_size * 2 + 333];
 
     let mut latencies_ms = Vec::with_capacity(sample_count as usize);
     let mut payload_bytes = Vec::with_capacity(sample_count as usize);
@@ -25,15 +28,28 @@ async fn perf_quinn_transport_sender_reports_latency_distribution() {
     let mut failure_count = 0_u64;
     let started_at = Instant::now();
 
-    for _ in 0..sample_count {
+    for frame_id in 0..sample_count {
+        let datagrams = fragment_access_unit(
+            frame_id as u32,
+            33_000 * frame_id,
+            frame_id % 30 == 0,
+            &payload,
+            max_datagram_size,
+        )
+        .expect("fragment payload");
         let iter_started_at = Instant::now();
-        match pair.client.send_datagram(Bytes::from(payload.clone())) {
+        let send_result = datagrams
+            .iter()
+            .try_for_each(|datagram| pair.client.send_datagram(datagram.clone()));
+        match send_result {
             Ok(()) => {
                 latencies_ms.push(iter_started_at.elapsed().as_secs_f64() * 1000.0);
                 payload_bytes.push(payload.len());
-                packets_per_sample.push(1);
+                packets_per_sample.push(datagrams.len());
                 success_count += 1;
-                let _ = pair.server.read_datagram().await.expect("drain server datagram");
+                for _ in 0..datagrams.len() {
+                    let _ = pair.server.read_datagram().await.expect("drain server datagram");
+                }
             }
             Err(_) => {
                 failure_count += 1;

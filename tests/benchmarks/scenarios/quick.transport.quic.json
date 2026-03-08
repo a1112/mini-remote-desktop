@@ -6,8 +6,8 @@
   "encode_backend": "openh264",
   "decode_backend": "h264_software",
   "renderer_backend": "d3d11",
-  "width": 16,
-  "height": 16,
+  "width": 1280,
+  "height": 720,
   "fps": 30,
   "duration_secs": 20,
   "threshold_file": "transport.quick.json"

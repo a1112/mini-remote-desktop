@@ -8,12 +8,14 @@ use std::{
     time::Duration,
 };
 
-use bytes::{BufMut, Bytes, BytesMut};
 use mrd_encode_openh264::OpenH264Encoder;
 use mrd_observability::{PipelineProbeSnapshot, ProbeRegistry, StageId};
 use mrd_pipeline_core::{CapturedFrame, FrameCapture, FramePixelFormat, VideoEncoder};
 use mrd_proto::SessionId;
-use mrd_transport_quic_quinn::QuinnDatagramPair;
+use mrd_transport_quic_quinn::{
+    fragment_access_unit, QuicAuReassembler, QuicAuReassemblerConfig, QuicAuReassemblerStats,
+    QuinnDatagramPair,
+};
 
 use crate::frame_sink::{DecodedFrameSink, DecodedFrameSnapshot, DEFAULT_SOURCE_ID};
 
@@ -86,6 +88,14 @@ mod tests {
             .stages
             .iter()
             .any(|(stage, stats)| *stage == StageId::FrameSinkIngest && stats.count > 0));
+        assert!(receiver_probe
+            .counters
+            .iter()
+            .any(|(name, _)| name == "quic_receiver_completed_frames"));
+        assert!(receiver_probe
+            .counters
+            .iter()
+            .any(|(name, _)| name == "quic_receiver_pending_frames"));
     }
 
     #[tokio::test]
@@ -212,6 +222,8 @@ impl QuicHostedPairHarness {
         let client = self.pair.client.clone();
         let sender_task = tokio::spawn(async move {
             let mut last_tick = tokio::time::Instant::now();
+            let mut frame_id = 0_u32;
+            let max_datagram_size = client.max_datagram_size().unwrap_or(1200);
             while running.load(Ordering::Relaxed) {
                 sender_probe.record_stage(StageId::CaptureWait, last_tick.elapsed(), 0, false);
                 last_tick = tokio::time::Instant::now();
@@ -240,9 +252,26 @@ impl QuicHostedPairHarness {
                         access_unit.bytes.len(),
                         access_unit.is_keyframe,
                     );
-                    let datagram = encode_datagram(&access_unit);
+                    let datagrams = match fragment_access_unit(
+                        frame_id,
+                        access_unit.timestamp_us,
+                        access_unit.is_keyframe,
+                        &access_unit.bytes,
+                        max_datagram_size,
+                    ) {
+                        Ok(datagrams) => datagrams,
+                        Err(_) => break,
+                    };
                     let send_started_at = std::time::Instant::now();
-                    if client.send_datagram(datagram).is_err() {
+                    let mut send_failed = false;
+                    sender_probe.set_counter("quic_sender_fragments", datagrams.len() as u64);
+                    for datagram in datagrams {
+                        if client.send_datagram(datagram).is_err() {
+                            send_failed = true;
+                            break;
+                        }
+                    }
+                    if send_failed {
                         break;
                     }
                     sender_probe.record_stage(
@@ -251,6 +280,7 @@ impl QuicHostedPairHarness {
                         access_unit.bytes.len(),
                         access_unit.is_keyframe,
                     );
+                    frame_id = frame_id.wrapping_add(1);
                 }
 
                 tokio::time::sleep(Duration::from_millis((1000 / fps.max(1)) as u64)).await;
@@ -263,11 +293,28 @@ impl QuicHostedPairHarness {
         let server = self.pair.server.clone();
         let receiver_task = tokio::spawn(async move {
             let mut decoder = mrd_decode::create_decoder("h264_software").expect("decoder");
+            let mut reassembler = QuicAuReassembler::new(QuicAuReassemblerConfig {
+                frame_timeout: Duration::from_millis(250),
+                max_pending_frames: 64,
+            });
+            let mut last_reassembly_drop_total = 0_u64;
             while running.load(Ordering::Relaxed) {
                 let receive_started_at = std::time::Instant::now();
-                let payload = match server.read_datagram().await {
-                    Ok(payload) => payload,
-                    Err(_) => break,
+                let payload = match tokio::time::timeout(Duration::from_millis(25), server.read_datagram()).await {
+                    Ok(Ok(payload)) => payload,
+                    Ok(Err(_)) => break,
+                    Err(_) => {
+                        reassembler.prune_expired();
+                        let total_drops =
+                            sync_reassembly_probe(&receiver_probe, reassembler.stats());
+                        if total_drops > last_reassembly_drop_total {
+                            receiver_probe.increment_dropped_frames(
+                                total_drops - last_reassembly_drop_total,
+                            );
+                            last_reassembly_drop_total = total_drops;
+                        }
+                        continue;
+                    }
                 };
                 receiver_probe.record_stage(
                     StageId::NetworkIngress,
@@ -276,20 +323,40 @@ impl QuicHostedPairHarness {
                     false,
                 );
 
-                let (timestamp_us, is_keyframe, access_unit) = match decode_datagram(&payload) {
-                    Ok(parts) => parts,
-                    Err(_) => break,
+                let Some(frame) = (match reassembler.push_datagram(&payload) {
+                    Ok(frame) => {
+                        let total_drops =
+                            sync_reassembly_probe(&receiver_probe, reassembler.stats());
+                        if total_drops > last_reassembly_drop_total {
+                            receiver_probe.increment_dropped_frames(
+                                total_drops - last_reassembly_drop_total,
+                            );
+                            last_reassembly_drop_total = total_drops;
+                        }
+                        frame
+                    }
+                    Err(_) => {
+                        receiver_probe.increment_dropped_frames(1);
+                        receiver_probe.increment_counter("quic_receiver_reassembly_errors", 1);
+                        let total_drops =
+                            sync_reassembly_probe(&receiver_probe, reassembler.stats());
+                        last_reassembly_drop_total = total_drops;
+                        continue;
+                    }
+                }) else {
+                    continue;
                 };
                 let decode_started_at = std::time::Instant::now();
-                if decoder.push_access_unit(&access_unit).is_err() {
+                if decoder.push_access_unit(frame.payload.as_ref()).is_err() {
+                    receiver_probe.increment_dropped_frames(1);
                     continue;
                 }
                 let frames = decoder.drain_decoded_frames();
                 receiver_probe.record_stage(
                     StageId::DecodeTotal,
                     decode_started_at.elapsed(),
-                    access_unit.len(),
-                    is_keyframe,
+                    frame.payload.len(),
+                    frame.is_keyframe,
                 );
                 for frame in frames {
                     let bytes = frame.data.len();
@@ -305,8 +372,11 @@ impl QuicHostedPairHarness {
                         false,
                     );
                 }
-
-                let _ = timestamp_us;
+                let total_drops = sync_reassembly_probe(&receiver_probe, reassembler.stats());
+                if total_drops > last_reassembly_drop_total {
+                    receiver_probe.increment_dropped_frames(total_drops - last_reassembly_drop_total);
+                    last_reassembly_drop_total = total_drops;
+                }
             }
         });
 
@@ -379,6 +449,24 @@ impl QuicHostedPairHarness {
     }
 }
 
+fn sync_reassembly_probe(
+    receiver_probe: &mrd_observability::ProbeSessionHandle,
+    stats: QuicAuReassemblerStats,
+) -> u64 {
+    receiver_probe.set_counter("quic_receiver_completed_frames", stats.completed_frames);
+    receiver_probe.set_counter("quic_receiver_expired_frames", stats.expired_frames);
+    receiver_probe.set_counter("quic_receiver_evicted_frames", stats.evicted_frames);
+    receiver_probe.set_counter("quic_receiver_duplicate_fragments", stats.duplicate_fragments);
+    receiver_probe.set_counter("quic_receiver_rejected_fragments", stats.rejected_fragments);
+    receiver_probe.set_counter("quic_receiver_pending_frames", stats.pending_frames);
+    let dropped = stats
+        .expired_frames
+        .saturating_add(stats.evicted_frames)
+        .saturating_add(stats.rejected_fragments);
+    receiver_probe.set_counter("quic_receiver_reassembly_drops", dropped);
+    dropped
+}
+
 pub(crate) async fn run_quic_benchmark_pipeline(
     session_id: SessionId,
     width: usize,
@@ -438,25 +526,4 @@ impl Drop for QuicHostedPairHarness {
             task.abort();
         }
     }
-}
-
-fn encode_datagram(access_unit: &mrd_pipeline_core::EncodedAccessUnit) -> Bytes {
-    let mut buffer = BytesMut::with_capacity(access_unit.bytes.len() + 9);
-    buffer.put_u64_le(access_unit.timestamp_us);
-    buffer.put_u8(u8::from(access_unit.is_keyframe));
-    buffer.extend_from_slice(&access_unit.bytes);
-    buffer.freeze()
-}
-
-fn decode_datagram(payload: &[u8]) -> Result<(u64, bool, Vec<u8>), String> {
-    if payload.len() < 9 {
-        return Err("payload too small".into());
-    }
-    let mut timestamp = [0_u8; 8];
-    timestamp.copy_from_slice(&payload[..8]);
-    Ok((
-        u64::from_le_bytes(timestamp),
-        payload[8] != 0,
-        payload[9..].to_vec(),
-    ))
 }
