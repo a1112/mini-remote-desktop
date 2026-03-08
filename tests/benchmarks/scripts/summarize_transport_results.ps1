@@ -58,7 +58,10 @@ $summary | ConvertTo-Json -Depth 8 | Set-Content $summaryPath -Encoding Ascii
 $headers = @(
   'run_id','scenario','transport','capture_backend','encode_backend','decode_backend','renderer_backend',
   'width','height','fps_target','duration_secs','session_established','first_frame_seen','first_frame_time_ms',
-  'probe_complete','fps_observed','bitrate_kbps','keyframes','dropped_frames','zero_write_access_unit_count',
+  'probe_complete','fps_observed','bitrate_kbps','keyframes','dropped_frames',
+  'quic_receiver_completed_frames','quic_receiver_expired_frames','quic_receiver_evicted_frames',
+  'quic_receiver_duplicate_fragments','quic_receiver_rejected_fragments','quic_receiver_pending_frames',
+  'quic_receiver_reassembly_drops','zero_write_access_unit_count',
   'warning_count','error_count','restart_count','encode_total_p95_ms','send_write_p95_ms','decode_total_p95_ms',
   'frame_sink_ingest_p95_ms','render_upload_p95_ms','render_present_p95_ms','run_passed'
 )
@@ -98,6 +101,14 @@ $report = @(
   "| render_upload_p95_ms | $($summary.render_upload_p95_ms) |",
   "| render_present_p95_ms | $($summary.render_present_p95_ms) |",
   "| keyframes | $($summary.keyframes) |",
+  "| dropped_frames | $($summary.dropped_frames) |",
+  "| quic_receiver_completed_frames | $($summary.quic_receiver_completed_frames) |",
+  "| quic_receiver_expired_frames | $($summary.quic_receiver_expired_frames) |",
+  "| quic_receiver_evicted_frames | $($summary.quic_receiver_evicted_frames) |",
+  "| quic_receiver_duplicate_fragments | $($summary.quic_receiver_duplicate_fragments) |",
+  "| quic_receiver_rejected_fragments | $($summary.quic_receiver_rejected_fragments) |",
+  "| quic_receiver_pending_frames | $($summary.quic_receiver_pending_frames) |",
+  "| quic_receiver_reassembly_drops | $($summary.quic_receiver_reassembly_drops) |",
   "| warning_count | $($summary.warning_count) |",
   "| error_count | $($summary.error_count) |",
   "| restart_count | $($summary.restart_count) |",

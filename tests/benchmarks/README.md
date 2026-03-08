@@ -21,6 +21,13 @@ powershell -ExecutionPolicy Bypass -File tests/benchmarks/scripts/run_transport_
   -ScenarioPath tests/benchmarks/scenarios/steady.transport.60s.json
 ```
 
+Steady QUIC baseline:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tests/benchmarks/scripts/run_transport_matrix.ps1 `
+  -ScenarioPath tests/benchmarks/scenarios/steady.transport.60s.quic.json
+```
+
 Generated files:
 - `manifest.json`
 - `summary.json`

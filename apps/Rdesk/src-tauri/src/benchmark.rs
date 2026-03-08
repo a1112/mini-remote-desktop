@@ -43,6 +43,13 @@ pub struct BenchmarkSummary {
     pub bitrate_kbps: f64,
     pub keyframes: u64,
     pub dropped_frames: u64,
+    pub quic_receiver_completed_frames: Option<u64>,
+    pub quic_receiver_expired_frames: Option<u64>,
+    pub quic_receiver_evicted_frames: Option<u64>,
+    pub quic_receiver_duplicate_fragments: Option<u64>,
+    pub quic_receiver_rejected_fragments: Option<u64>,
+    pub quic_receiver_pending_frames: Option<u64>,
+    pub quic_receiver_reassembly_drops: Option<u64>,
     pub zero_write_access_unit_count: u64,
     pub warning_count: u64,
     pub error_count: u64,
@@ -57,6 +64,13 @@ pub struct BenchmarkSummary {
 }
 
 impl BenchmarkSummary {
+    fn counter(probe: &PipelineProbeSnapshot, name: &str) -> Option<u64> {
+        probe.counters
+            .iter()
+            .find(|(candidate, _)| candidate == name)
+            .map(|(_, value)| *value)
+    }
+
     pub fn from_probe(
         manifest: &BenchmarkManifest,
         probe: &PipelineProbeSnapshot,
@@ -105,6 +119,22 @@ impl BenchmarkSummary {
             bitrate_kbps: probe.bitrate_kbps,
             keyframes: probe.keyframes,
             dropped_frames: probe.dropped_frames,
+            quic_receiver_completed_frames: Self::counter(probe, "quic_receiver_completed_frames"),
+            quic_receiver_expired_frames: Self::counter(probe, "quic_receiver_expired_frames"),
+            quic_receiver_evicted_frames: Self::counter(probe, "quic_receiver_evicted_frames"),
+            quic_receiver_duplicate_fragments: Self::counter(
+                probe,
+                "quic_receiver_duplicate_fragments",
+            ),
+            quic_receiver_rejected_fragments: Self::counter(
+                probe,
+                "quic_receiver_rejected_fragments",
+            ),
+            quic_receiver_pending_frames: Self::counter(probe, "quic_receiver_pending_frames"),
+            quic_receiver_reassembly_drops: Self::counter(
+                probe,
+                "quic_receiver_reassembly_drops",
+            ),
             zero_write_access_unit_count: 0,
             warning_count: 0,
             error_count: 0,
@@ -164,6 +194,34 @@ impl BenchmarkSummary {
             bitrate_kbps: sender_probe.bitrate_kbps,
             keyframes: sender_probe.keyframes.max(receiver_probe.keyframes),
             dropped_frames: sender_probe.dropped_frames.max(receiver_probe.dropped_frames),
+            quic_receiver_completed_frames: Self::counter(
+                receiver_probe,
+                "quic_receiver_completed_frames",
+            ),
+            quic_receiver_expired_frames: Self::counter(
+                receiver_probe,
+                "quic_receiver_expired_frames",
+            ),
+            quic_receiver_evicted_frames: Self::counter(
+                receiver_probe,
+                "quic_receiver_evicted_frames",
+            ),
+            quic_receiver_duplicate_fragments: Self::counter(
+                receiver_probe,
+                "quic_receiver_duplicate_fragments",
+            ),
+            quic_receiver_rejected_fragments: Self::counter(
+                receiver_probe,
+                "quic_receiver_rejected_fragments",
+            ),
+            quic_receiver_pending_frames: Self::counter(
+                receiver_probe,
+                "quic_receiver_pending_frames",
+            ),
+            quic_receiver_reassembly_drops: Self::counter(
+                receiver_probe,
+                "quic_receiver_reassembly_drops",
+            ),
             zero_write_access_unit_count,
             warning_count: 0,
             error_count: 0,
@@ -199,6 +257,13 @@ impl BenchmarkSummary {
             "bitrate_kbps",
             "keyframes",
             "dropped_frames",
+            "quic_receiver_completed_frames",
+            "quic_receiver_expired_frames",
+            "quic_receiver_evicted_frames",
+            "quic_receiver_duplicate_fragments",
+            "quic_receiver_rejected_fragments",
+            "quic_receiver_pending_frames",
+            "quic_receiver_reassembly_drops",
             "zero_write_access_unit_count",
             "warning_count",
             "error_count",
@@ -234,6 +299,13 @@ impl BenchmarkSummary {
             self.bitrate_kbps.to_string(),
             self.keyframes.to_string(),
             self.dropped_frames.to_string(),
+            option_u64(self.quic_receiver_completed_frames),
+            option_u64(self.quic_receiver_expired_frames),
+            option_u64(self.quic_receiver_evicted_frames),
+            option_u64(self.quic_receiver_duplicate_fragments),
+            option_u64(self.quic_receiver_rejected_fragments),
+            option_u64(self.quic_receiver_pending_frames),
+            option_u64(self.quic_receiver_reassembly_drops),
             self.zero_write_access_unit_count.to_string(),
             self.warning_count.to_string(),
             self.error_count.to_string(),
@@ -352,6 +424,10 @@ fn option_f64(value: Option<f64>) -> String {
     value.map(|item| item.to_string()).unwrap_or_default()
 }
 
+fn option_u64(value: Option<u64>) -> String {
+    value.map(|item| item.to_string()).unwrap_or_default()
+}
+
 fn render_markdown_report(
     manifest: &BenchmarkManifest,
     summary: &BenchmarkSummary,
@@ -383,6 +459,14 @@ Duration: `{duration}s`\n\n\
 | render_upload_p95_ms | {render_p95} |\n\
 | render_present_p95_ms | {present_p95} |\n\
 | keyframes | {keyframes} |\n\
+| dropped_frames | {dropped_frames} |\n\
+| quic_receiver_completed_frames | {quic_completed} |\n\
+| quic_receiver_expired_frames | {quic_expired} |\n\
+| quic_receiver_evicted_frames | {quic_evicted} |\n\
+| quic_receiver_duplicate_fragments | {quic_duplicate} |\n\
+| quic_receiver_rejected_fragments | {quic_rejected} |\n\
+| quic_receiver_pending_frames | {quic_pending} |\n\
+| quic_receiver_reassembly_drops | {quic_drops} |\n\
 | warning_count | {warning_count} |\n\
 | error_count | {error_count} |\n\
 \n## Paths\n\n\
@@ -412,6 +496,14 @@ Duration: `{duration}s`\n\n\
         render_p95 = option_f64(summary.render_upload_p95_ms),
         present_p95 = option_f64(summary.render_present_p95_ms),
         keyframes = summary.keyframes,
+        dropped_frames = summary.dropped_frames,
+        quic_completed = option_u64(summary.quic_receiver_completed_frames),
+        quic_expired = option_u64(summary.quic_receiver_expired_frames),
+        quic_evicted = option_u64(summary.quic_receiver_evicted_frames),
+        quic_duplicate = option_u64(summary.quic_receiver_duplicate_fragments),
+        quic_rejected = option_u64(summary.quic_receiver_rejected_fragments),
+        quic_pending = option_u64(summary.quic_receiver_pending_frames),
+        quic_drops = option_u64(summary.quic_receiver_reassembly_drops),
         warning_count = summary.warning_count,
         error_count = summary.error_count,
         session_id = session_id,
@@ -489,6 +581,7 @@ mod tests {
         assert_eq!(summary.decode_total_p95_ms, Some(5.0));
         assert_eq!(summary.frame_sink_ingest_p95_ms, Some(1.5));
         assert_eq!(summary.render_upload_p95_ms, None);
+        assert_eq!(summary.quic_receiver_completed_frames, None);
     }
 
     #[test]
@@ -531,6 +624,13 @@ mod tests {
             bitrate_kbps: 1400.0,
             keyframes: 1,
             dropped_frames: 0,
+            quic_receiver_completed_frames: None,
+            quic_receiver_expired_frames: None,
+            quic_receiver_evicted_frames: None,
+            quic_receiver_duplicate_fragments: None,
+            quic_receiver_rejected_fragments: None,
+            quic_receiver_pending_frames: None,
+            quic_receiver_reassembly_drops: None,
             zero_write_access_unit_count: 0,
             warning_count: 0,
             error_count: 0,
@@ -552,6 +652,7 @@ mod tests {
         assert_eq!(row[0], "quick-webrtc-20260308-abc123");
         assert_eq!(row[1], "quick.transport");
         assert_eq!(row[2], "webrtc");
+        assert!(header.contains(&"quic_receiver_completed_frames"));
     }
 
     #[test]
