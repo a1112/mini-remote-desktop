@@ -1,0 +1,17 @@
+[package]
+name = "mrd-transport-quic-quinn"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bytes.workspace = true
+quinn = "0.11.9"
+rcgen = "0.14"
+rustls = "0.23.5"
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+mrd-observability = { path = "../mrd-observability" }
+serde_json = { workspace = true }

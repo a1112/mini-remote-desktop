@@ -15,6 +15,8 @@ mod render_window_registry;
 mod render_surface_catalog;
 mod session_lifecycle;
 mod session_runtime;
+#[cfg(test)]
+mod quic_transport_harness;
 
 use device_info::HardwareInfo;
 use frame_sink::{DecodedFrameSink, DecodedFrameSnapshot};
@@ -1463,9 +1465,17 @@ mod tests {
     use mrd_signal_client::{decode_message, encode_message};
     use mrd_proto::{DeviceId, SessionId};
     use mrd_signal_proto::SignalMessage;
+    use std::sync::Once;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use tokio::net::TcpListener;
     use tokio::sync::Mutex;
+
+    fn ensure_rustls_crypto_provider() {
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(|| {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        });
+    }
 
     async fn ws_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
         ws.on_upgrade(handle_socket)
@@ -1725,11 +1735,13 @@ mod tests {
 
     #[tokio::test]
     async fn benchmark_run_writes_requested_artifacts() {
+        ensure_rustls_crypto_provider();
         let artifact_root = std::env::var("MRD_BENCH_ARTIFACT_ROOT")
             .unwrap_or_else(|_| std::env::temp_dir().join("mrd-bench-default").display().to_string());
         let scenario = std::env::var("MRD_BENCH_SCENARIO").unwrap_or_else(|_| "quick.transport".into());
         let profile =
             std::env::var("MRD_BENCH_PROFILE").unwrap_or_else(|_| "transport-webrtc-baseline".into());
+        let transport = std::env::var("MRD_BENCH_TRANSPORT").unwrap_or_else(|_| "webrtc".into());
         let run_id = std::env::var("MRD_BENCH_RUN_ID").unwrap_or_else(|_| {
             let ts = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -1756,6 +1768,55 @@ mod tests {
             .unwrap_or(20);
         let git_commit = std::env::var("MRD_BENCH_GIT_COMMIT").unwrap_or_else(|_| "unknown".into());
         let session_id = SessionId("session-benchmark".into());
+
+        if transport == "quic_quinn" {
+            let outcome = crate::quic_transport_harness::run_quic_benchmark_pipeline(
+                session_id.clone(),
+                width,
+                height,
+                fps,
+                duration_secs,
+            )
+            .await
+            .expect("run quic benchmark pipeline");
+            let manifest = BenchmarkManifest {
+                run_id: run_id.clone(),
+                scenario,
+                transport,
+                capture_backend: "synthetic".into(),
+                encode_backend: "openh264".into(),
+                decode_backend: "h264_software".into(),
+                renderer_backend: "d3d11".into(),
+                width: width as u32,
+                height: height as u32,
+                fps,
+                duration_secs,
+                git_commit,
+            };
+            let summary = BenchmarkSummary::from_transport_probes(
+                &manifest,
+                &outcome.sender_probe,
+                &outcome.receiver_probe,
+                true,
+                outcome.sink_snapshot.frame_count > 0,
+                outcome.first_frame_time_ms,
+                0,
+            );
+            let paths = BenchmarkPaths::new(
+                std::path::Path::new(&artifact_root),
+                date,
+                profile,
+                run_id,
+            );
+            write_benchmark_artifacts(&paths, &manifest, &summary, &session_id.0, &outcome.receiver_probe)
+                .expect("write quic benchmark artifacts");
+
+            assert!(paths.summary_json.exists());
+            assert!(paths.summary_csv.exists());
+            assert!(paths.report_md.exists());
+            assert!(summary.run_passed, "benchmark summary should pass: {summary:?}");
+            return;
+        }
 
         let sink = std::sync::Arc::new(std::sync::Mutex::new(DecodedFrameSink::default()));
         let mut controller = WebrtcHost::with_frame_sink(sink.clone());
@@ -1814,7 +1875,7 @@ mod tests {
         let manifest = BenchmarkManifest {
             run_id: run_id.clone(),
             scenario,
-            transport: "webrtc".into(),
+            transport,
             capture_backend: "dxgi".into(),
             encode_backend: "openh264".into(),
             decode_backend: "h264_software".into(),

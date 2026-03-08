@@ -882,7 +882,7 @@ fn run_blocking_desktop_sender_loop<C, E>(
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::{Arc, Mutex}, time::Duration};
+    use std::{sync::{Arc, Mutex, Once}, time::Duration};
 
     use mrd_encode_openh264::OpenH264Encoder;
     use mrd_observability::{PipelineProbeSnapshot, ProbeRegistry, StageId};
@@ -897,8 +897,16 @@ mod tests {
     use crate::frame_sink::{DecodedFrameSink, DecodedFrameSnapshot};
     use crate::webrtc_media::H264AccessUnitAssembler;
 
+    fn ensure_rustls_crypto_provider() {
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(|| {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        });
+    }
+
     #[tokio::test]
     async fn creating_offer_records_local_offer() {
+        ensure_rustls_crypto_provider();
         let mut host = WebrtcHost::default();
 
         let offer = host
@@ -923,6 +931,7 @@ mod tests {
 
     #[tokio::test]
     async fn offer_answer_roundtrip_between_two_hosts() {
+        ensure_rustls_crypto_provider();
         let mut controller = WebrtcHost::default();
         let mut agent = WebrtcHost::default();
         let session_id = SessionId("session-2".into());
@@ -1153,6 +1162,7 @@ mod tests {
 
     #[tokio::test]
     async fn embedded_sender_delivers_decoded_frames_to_remote_host() {
+        ensure_rustls_crypto_provider();
         let sink = Arc::new(Mutex::new(crate::frame_sink::DecodedFrameSink::default()));
         let mut controller = WebrtcHost::with_frame_sink(sink.clone());
         let mut agent = WebrtcHost::default();
@@ -1264,6 +1274,7 @@ mod tests {
 
     #[tokio::test]
     async fn single_process_pipeline_exposes_probe_stages() {
+        ensure_rustls_crypto_provider();
         let mut harness = HostedPairHarness::new("session-composed-probe");
 
         harness.start().await.expect("start composed pipeline");
@@ -1307,6 +1318,7 @@ mod tests {
 
     #[tokio::test]
     async fn single_process_pipeline_delivers_remote_frames() {
+        ensure_rustls_crypto_provider();
         let mut harness = HostedPairHarness::new("session-composed-frames");
 
         harness.start().await.expect("start composed pipeline");
@@ -1328,6 +1340,7 @@ mod tests {
 
     #[tokio::test]
     async fn single_process_pipeline_runs_for_fixed_duration_without_stalling() {
+        ensure_rustls_crypto_provider();
         let mut harness = HostedPairHarness::new("session-composed-stable");
 
         harness.start().await.expect("start composed pipeline");

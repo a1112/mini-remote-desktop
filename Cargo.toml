@@ -15,6 +15,7 @@ members = [
   "crates/mrd-signal-client",
   "crates/mrd-signal-proto",
   "crates/mrd-signal-server",
+  "crates/mrd-transport-quic-quinn",
   "crates/mrd-transport-webrtc",
   "heartbeat-rs",
 ]

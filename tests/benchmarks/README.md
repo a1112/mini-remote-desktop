@@ -4,7 +4,7 @@ This directory contains the new mainline benchmark harness for transport compari
 
 Current status:
 - `webrtc` baseline is runnable now.
-- `quic` is intentionally not wired into the mainline yet.
+- `quic_quinn` smoke scenarios can use the same artifact schema.
 - all benchmark artifacts are written under `artifacts/benchmarks/`.
 
 Quick run:

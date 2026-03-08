@@ -18,6 +18,7 @@ tauri-build = { version = "1.5.5", features = [] }
 axum = { version = "0.8", features = ["ws"] }
 futures-util = "0.3"
 base64 = "0.22"
+bytes = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }
 mrd-proto = { path = "../../../crates/mrd-proto" }
 mrd-pipeline-core = { path = "../../../crates/mrd-pipeline-core" }
@@ -29,6 +30,7 @@ mrd-render = { path = "../../../crates/mrd-render" }
 mrd-render-d3d11 = { path = "../../../crates/mrd-render-d3d11" }
 mrd-signal-client = { path = "../../../crates/mrd-signal-client" }
 mrd-signal-proto = { path = "../../../crates/mrd-signal-proto" }
+mrd-transport-quic-quinn = { path = "../../../crates/mrd-transport-quic-quinn" }
 mrd-transport-webrtc = { path = "../../../crates/mrd-transport-webrtc" }
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
@@ -43,6 +45,7 @@ webrtc = "0.12"
 
 [dev-dependencies]
 openh264 = "0.8"
+rustls = "0.23.5"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["sysinfoapi", "minwindef"] }
