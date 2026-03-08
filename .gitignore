@@ -5,6 +5,7 @@
 # Node.js
 node_modules/
 package-lock.json
+dist/
 
 # Rust
 target/
@@ -31,6 +32,8 @@ Thumbs.db
 *.o
 *.mp4
 debug/
+*.pyc
+__pycache__/
 
 # Test outputs
 perf/
