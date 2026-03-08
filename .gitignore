@@ -43,3 +43,7 @@ tools/ffmpeg-min/
 client-qt/venv
 /tools/ffmpeg_full_build/
 /logs
+/artifacts/benchmarks/
+/artifacts/component-matrix/
+/tests/benchmarks/tmp/
+/tests/component-matrix/tmp/

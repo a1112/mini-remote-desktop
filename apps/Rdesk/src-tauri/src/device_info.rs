@@ -226,16 +226,6 @@ fn get_cpu_info() -> CpuInfo {
 fn get_total_memory_mb() -> u64 {
     #[cfg(target_os = "windows")]
     {
-        use winreg::enums::*;
-        use winreg::RegKey;
-
-        if let Ok(key) = RegKey::predef(HKEY_LOCAL_MACHINE)
-            .open_subkey(r"HARDWARE\DESCRIPTION\System\CentralProcessor\0")
-        {
-            // 这个方法可能不准确，使用更可靠的方法
-        }
-
-        // 使用 sysinfo 或直接读取系统信息
         use std::mem;
         use winapi::um::sysinfoapi::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 

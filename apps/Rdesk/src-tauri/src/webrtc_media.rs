@@ -20,6 +20,7 @@ impl H264AccessUnitAssembler {
                     None
                 }
             }
+            24 => self.push_stap_a(payload, marker),
             28 => self.push_fua(payload, marker),
             _ => {
                 if marker {
@@ -43,7 +44,9 @@ impl H264AccessUnitAssembler {
         let reconstructed_nal = (fu_indicator & 0xe0) | (fu_header & 0x1f);
 
         if start {
-            self.reset();
+            if self.fua_active {
+                self.reset();
+            }
             self.annex_b_buffer.extend_from_slice(&[0, 0, 0, 1, reconstructed_nal]);
             self.annex_b_buffer.extend_from_slice(&payload[2..]);
             self.fua_active = true;
@@ -56,6 +59,31 @@ impl H264AccessUnitAssembler {
 
         if end || marker {
             self.fua_active = false;
+            return self.take_access_unit();
+        }
+
+        None
+    }
+
+    fn push_stap_a(&mut self, payload: &[u8], marker: bool) -> Option<Vec<u8>> {
+        if payload.len() < 3 {
+            self.reset();
+            return None;
+        }
+
+        let mut offset = 1usize;
+        while offset + 2 <= payload.len() {
+            let nal_len = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+            offset += 2;
+            if offset + nal_len > payload.len() {
+                self.reset();
+                return None;
+            }
+            self.append_nal(&payload[offset..offset + nal_len]);
+            offset += nal_len;
+        }
+
+        if marker {
             return self.take_access_unit();
         }
 
@@ -108,6 +136,35 @@ mod tests {
         assert_eq!(
             assembler.push_rtp_payload(&[0x7c, 0x45, 0xcc, 0xdd], true),
             Some(vec![0, 0, 0, 1, 0x65, 0xaa, 0xbb, 0xcc, 0xdd])
+        );
+    }
+
+    #[test]
+    fn stap_a_then_fua_preserves_full_access_unit_until_marker() {
+        let mut assembler = H264AccessUnitAssembler::default();
+
+        assert_eq!(
+            assembler.push_rtp_payload(
+                &[
+                    24,
+                    0, 2, 0x67, 0x42,
+                    0, 2, 0x68, 0xce,
+                ],
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            assembler.push_rtp_payload(&[0x7c, 0x85, 0xaa, 0xbb], false),
+            None
+        );
+        assert_eq!(
+            assembler.push_rtp_payload(&[0x7c, 0x45, 0xcc, 0xdd], true),
+            Some(vec![
+                0, 0, 0, 1, 0x67, 0x42,
+                0, 0, 0, 1, 0x68, 0xce,
+                0, 0, 0, 1, 0x65, 0xaa, 0xbb, 0xcc, 0xdd,
+            ])
         );
     }
 }

@@ -1,26 +1,44 @@
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
+    time::Duration,
 };
 
 use crate::frame_sink::DecodedFrameSink;
+use crate::webrtc_media::H264AccessUnitAssembler;
+use mrd_capture_dxgi::DxgiDesktopCapture;
+use mrd_decode::{DecodedFrame, PixelFormat, VideoDecoder};
+use mrd_encode_openh264::OpenH264Encoder;
+use mrd_observability::{
+    MediaProbeEvent, PipelineProbeSnapshot, ProbeRegistry, ProbeSessionHandle, StageId,
+};
+use mrd_pipeline_core::{FrameCapture, VideoEncoder};
 use mrd_proto::SessionId;
 use mrd_signal_proto::{IceCandidate, SessionDescription};
-use crate::webrtc_media::H264AccessUnitAssembler;
-use mrd_decode::{DecodedFrame, PixelFormat, VideoDecoder};
+use mrd_transport_webrtc::H264RtpSender;
+use tokio::task::JoinHandle;
 use webrtc::{
-    api::{media_engine::MediaEngine, setting_engine::SettingEngine, APIBuilder},
+    api::{
+        interceptor_registry::register_default_interceptors,
+        media_engine::MediaEngine,
+        setting_engine::SettingEngine,
+        APIBuilder,
+    },
     data_channel::data_channel_init::RTCDataChannelInit,
     ice_transport::{ice_candidate::RTCIceCandidateInit, ice_server::RTCIceServer},
+    ice_transport::ice_connection_state::RTCIceConnectionState,
+    interceptor::registry::Registry,
     peer_connection::{
         configuration::RTCConfiguration,
+        peer_connection_state::RTCPeerConnectionState,
         sdp::session_description::RTCSessionDescription,
         RTCPeerConnection,
     },
     rtp_transceiver::{rtp_codec::RTPCodecType, RTCRtpTransceiverInit},
+    track::track_local::TrackLocal,
     track::track_remote::TrackRemote,
 };
 
@@ -41,25 +59,44 @@ pub struct WebrtcHostSnapshot {
     pub last_decoded_height: usize,
     pub last_decoded_pixel_format: Option<String>,
     pub available_video_source_ids: Vec<String>,
+    pub local_video_track_count: usize,
+    pub captured_frame_count: u64,
+    pub sent_access_unit_count: u64,
+    pub sent_rtp_bytes: u64,
+    pub zero_write_access_unit_count: u64,
+    pub sender_running: bool,
+    pub peer_connection_state: Option<String>,
+    pub ice_connection_state: Option<String>,
 }
 
-#[derive(Debug)]
 struct HostedPeer {
     pc: Arc<RTCPeerConnection>,
     snapshot: Arc<Mutex<WebrtcHostSnapshot>>,
+    sample_sender: Option<Arc<tokio::sync::Mutex<H264RtpSender>>>,
+    sender_running: Arc<AtomicBool>,
+    sender_task: Option<JoinHandle<()>>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct WebrtcHost {
     sessions: HashMap<SessionId, HostedPeer>,
     frame_sink: Option<Arc<Mutex<DecodedFrameSink>>>,
+    probe_registry: ProbeRegistry,
 }
 
 impl WebrtcHost {
     pub fn with_frame_sink(frame_sink: Arc<Mutex<DecodedFrameSink>>) -> Self {
+        Self::with_frame_sink_and_probes(frame_sink, ProbeRegistry::default())
+    }
+
+    pub fn with_frame_sink_and_probes(
+        frame_sink: Arc<Mutex<DecodedFrameSink>>,
+        probe_registry: ProbeRegistry,
+    ) -> Self {
         Self {
             sessions: HashMap::new(),
             frame_sink: Some(frame_sink),
+            probe_registry,
         }
     }
 
@@ -68,13 +105,27 @@ impl WebrtcHost {
         session_id: SessionId,
     ) -> Result<SessionDescription, String> {
         let pc = self.get_or_create_peer(&session_id).await?;
+        let should_add_recvonly = self
+            .sessions
+            .get(&session_id)
+            .map(|session| session.sample_sender.is_none())
+            .unwrap_or(true);
+        if should_add_recvonly {
+            ensure_recvonly_video_transceiver(&pc).await?;
+        }
         let offer = pc
             .create_offer(None)
             .await
             .map_err(|e| format!("创建 WebRTC offer 失败: {}", e))?;
+        let mut gather_complete = pc.gathering_complete_promise().await;
         pc.set_local_description(offer.clone())
             .await
             .map_err(|e| format!("设置本地 offer 失败: {}", e))?;
+        let _ = gather_complete.recv().await;
+        let local = pc
+            .local_description()
+            .await
+            .ok_or_else(|| format!("缺少本地 offer 描述: {}", session_id.0))?;
 
         let session = self
             .sessions
@@ -84,11 +135,11 @@ impl WebrtcHost {
             .snapshot
             .lock()
             .expect("lock host snapshot")
-            .local_offer = Some(offer.sdp.clone());
+            .local_offer = Some(local.sdp.clone());
 
         Ok(SessionDescription {
             session_id,
-            sdp: offer.sdp,
+            sdp: local.sdp,
         })
     }
 
@@ -125,9 +176,15 @@ impl WebrtcHost {
             .create_answer(None)
             .await
             .map_err(|e| format!("创建 WebRTC answer 失败: {}", e))?;
+        let mut gather_complete = pc.gathering_complete_promise().await;
         pc.set_local_description(answer.clone())
             .await
             .map_err(|e| format!("设置本地 answer 失败: {}", e))?;
+        let _ = gather_complete.recv().await;
+        let local = pc
+            .local_description()
+            .await
+            .ok_or_else(|| format!("缺少本地 answer 描述: {}", session_id.0))?;
 
         let session = self
             .sessions
@@ -137,11 +194,11 @@ impl WebrtcHost {
             .snapshot
             .lock()
             .expect("lock host snapshot")
-            .local_answer = Some(answer.sdp.clone());
+            .local_answer = Some(local.sdp.clone());
 
         Ok(SessionDescription {
             session_id,
-            sdp: answer.sdp,
+            sdp: local.sdp,
         })
     }
 
@@ -206,6 +263,148 @@ impl WebrtcHost {
         })
     }
 
+    pub fn probe_snapshot(&self, session_id: &SessionId) -> Option<PipelineProbeSnapshot> {
+        self.probe_registry
+            .snapshot(session_id, crate::frame_sink::DEFAULT_SOURCE_ID)
+    }
+
+    pub fn probe_recent_events(&self, session_id: &SessionId, limit: usize) -> Vec<MediaProbeEvent> {
+        self.probe_registry
+            .recent_events(session_id, crate::frame_sink::DEFAULT_SOURCE_ID, limit)
+    }
+
+    pub async fn start_embedded_desktop_sender(
+        &mut self,
+        session_id: SessionId,
+        fps: u32,
+    ) -> Result<(), String> {
+        let pc = self.get_or_create_peer(&session_id).await?;
+        let session = self
+            .sessions
+            .get_mut(&session_id)
+            .ok_or_else(|| format!("未找到 webrtc host 会话: {}", session_id.0))?;
+
+        if session.sender_running.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        let sample_sender = ensure_sample_sender(&pc, &session_id, session).await?;
+        let probe = self
+            .probe_registry
+            .session_handle(session_id.clone(), crate::frame_sink::DEFAULT_SOURCE_ID);
+        probe.set_backend("dxgi");
+        probe.set_codec("h264");
+        probe.set_transport("webrtc");
+        session.sender_running.store(true, Ordering::Relaxed);
+        {
+            let mut snapshot = session.snapshot.lock().expect("lock host snapshot");
+            snapshot.sender_running = true;
+        }
+        let running = session.sender_running.clone();
+        let snapshot = session.snapshot.clone();
+        let frame_interval = Duration::from_millis((1000 / fps.max(1)) as u64);
+        let task = tokio::task::spawn_blocking(move || {
+            let mut capture = match DxgiDesktopCapture::new_primary() {
+                Ok(capture) => capture,
+                Err(_) => {
+                    snapshot.lock().expect("lock host snapshot").sender_running = false;
+                    running.store(false, Ordering::Relaxed);
+                    return;
+                }
+            };
+            let mut encoder = match OpenH264Encoder::new(capture.width(), capture.height(), fps) {
+                Ok(encoder) => encoder,
+                Err(_) => {
+                    snapshot.lock().expect("lock host snapshot").sender_running = false;
+                    running.store(false, Ordering::Relaxed);
+                    return;
+                }
+            };
+            let handle = tokio::runtime::Handle::current();
+            run_blocking_desktop_sender_loop(
+                &mut capture,
+                &mut encoder,
+                frame_interval,
+                sample_sender,
+                snapshot,
+                probe,
+                running,
+                handle,
+            );
+        });
+        session.sender_task = Some(task);
+        Ok(())
+    }
+
+    pub async fn stop_embedded_video_sender(&mut self, session_id: &SessionId) -> Result<(), String> {
+        let session = self
+            .sessions
+            .get_mut(session_id)
+            .ok_or_else(|| format!("未找到 webrtc host 会话: {}", session_id.0))?;
+        session.sender_running.store(false, Ordering::Relaxed);
+        if let Some(task) = session.sender_task.take() {
+            task.abort();
+        }
+        session
+            .snapshot
+            .lock()
+            .expect("lock host snapshot")
+            .sender_running = false;
+        Ok(())
+    }
+
+    async fn start_sender_with_components<C, E>(
+        &mut self,
+        session_id: SessionId,
+        capture: C,
+        encoder: E,
+        frame_interval: Duration,
+    ) -> Result<(), String>
+    where
+        C: FrameCapture + Send + 'static,
+        E: VideoEncoder + Send + 'static,
+    {
+        let pc = self.get_or_create_peer(&session_id).await?;
+        let session = self
+            .sessions
+            .get_mut(&session_id)
+            .ok_or_else(|| format!("未找到 webrtc host 会话: {}", session_id.0))?;
+
+        if session.sender_running.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        let sample_sender = if let Some(sender) = session.sample_sender.as_ref() {
+            sender.clone()
+        } else {
+            ensure_sample_sender(&pc, &session_id, session).await?
+        };
+        let probe = self
+            .probe_registry
+            .session_handle(session_id.clone(), crate::frame_sink::DEFAULT_SOURCE_ID);
+        probe.set_codec("h264");
+        probe.set_transport("webrtc");
+
+        session.sender_running.store(true, Ordering::Relaxed);
+        {
+            let mut snapshot = session.snapshot.lock().expect("lock host snapshot");
+            snapshot.sender_running = true;
+        }
+        let running = session.sender_running.clone();
+        let snapshot = session.snapshot.clone();
+        let task = tokio::spawn(run_embedded_sender_loop(
+            capture,
+            encoder,
+            frame_interval,
+            sample_sender,
+            snapshot,
+            probe,
+            running,
+        ));
+        session.sender_task = Some(task);
+        Ok(())
+    }
+
     async fn get_or_create_peer(
         &mut self,
         session_id: &SessionId,
@@ -215,10 +414,16 @@ impl WebrtcHost {
         }
 
         let snapshot = Arc::new(Mutex::new(WebrtcHostSnapshot::default()));
+        let probe = self
+            .probe_registry
+            .session_handle(session_id.clone(), crate::frame_sink::DEFAULT_SOURCE_ID);
+        probe.set_codec("h264");
+        probe.set_transport("webrtc");
         let pc = build_peer_connection(
             session_id.clone(),
             snapshot.clone(),
             self.frame_sink.clone(),
+            probe,
         )
         .await?;
         self.sessions.insert(
@@ -226,27 +431,96 @@ impl WebrtcHost {
             HostedPeer {
                 pc: pc.clone(),
                 snapshot,
+                sample_sender: None,
+                sender_running: Arc::new(AtomicBool::new(false)),
+                sender_task: None,
             },
         );
         Ok(pc)
     }
+
+    #[cfg(test)]
+    pub(crate) async fn start_test_video_sender<C, E>(
+        &mut self,
+        session_id: SessionId,
+        capture: C,
+        encoder: E,
+        frame_interval: Duration,
+    ) -> Result<(), String>
+    where
+        C: FrameCapture + Send + 'static,
+        E: VideoEncoder + Send + 'static,
+    {
+        self.start_sender_with_components(session_id, capture, encoder, frame_interval)
+            .await
+    }
+}
+
+async fn ensure_sample_sender(
+    pc: &Arc<RTCPeerConnection>,
+    session_id: &SessionId,
+    session: &mut HostedPeer,
+) -> Result<Arc<tokio::sync::Mutex<H264RtpSender>>, String> {
+    if let Some(sender) = session.sample_sender.as_ref() {
+        return Ok(sender.clone());
+    }
+
+    let sender = Arc::new(tokio::sync::Mutex::new(H264RtpSender::new(
+        "video",
+        format!("{}-embedded", session_id.0),
+        30,
+        1200,
+    )));
+    let track: Arc<dyn TrackLocal + Send + Sync> = sender.lock().await.track();
+    let rtp_sender = pc
+        .add_track(track)
+        .await
+        .map_err(|error| format!("add local video track failed: {error}"))?;
+    tokio::spawn(async move {
+        while rtp_sender.read_rtcp().await.is_ok() {}
+    });
+    session.sample_sender = Some(sender.clone());
+    session
+        .snapshot
+        .lock()
+        .expect("lock host snapshot")
+        .local_video_track_count = 1;
+    Ok(sender)
+}
+
+async fn ensure_recvonly_video_transceiver(pc: &Arc<RTCPeerConnection>) -> Result<(), String> {
+    pc.add_transceiver_from_kind(
+        RTPCodecType::Video,
+        Some(RTCRtpTransceiverInit {
+            direction: webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirection::Recvonly,
+            send_encodings: vec![],
+        }),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| format!("注册视频接收 transceiver 失败: {}", e))
 }
 
 async fn build_peer_connection(
     session_id: SessionId,
     snapshot: Arc<Mutex<WebrtcHostSnapshot>>,
     frame_sink: Option<Arc<Mutex<DecodedFrameSink>>>,
+    probe: ProbeSessionHandle,
 ) -> Result<Arc<RTCPeerConnection>, String> {
     let mut media_engine = MediaEngine::default();
     media_engine
         .register_default_codecs()
         .map_err(|e| format!("注册默认编解码器失败: {}", e))?;
+    let mut interceptor_registry = Registry::new();
+    interceptor_registry = register_default_interceptors(interceptor_registry, &mut media_engine)
+        .map_err(|e| format!("注册默认 interceptor 失败: {}", e))?;
 
     let mut setting_engine = SettingEngine::default();
     setting_engine.set_include_loopback_candidate(true);
 
     let api = APIBuilder::new()
         .with_media_engine(media_engine)
+        .with_interceptor_registry(interceptor_registry)
         .with_setting_engine(setting_engine)
         .build();
 
@@ -262,16 +536,6 @@ async fn build_peer_connection(
         .map_err(|e| format!("创建 PeerConnection 失败: {}", e))?,
     );
 
-    pc.add_transceiver_from_kind(
-        RTPCodecType::Video,
-        Some(RTCRtpTransceiverInit {
-            direction: webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirection::Recvonly,
-            send_encodings: vec![],
-        }),
-    )
-    .await
-    .map_err(|e| format!("注册视频接收 transceiver 失败: {}", e))?;
-
     pc.create_data_channel(
         "control",
         Some(RTCDataChannelInit {
@@ -285,15 +549,37 @@ async fn build_peer_connection(
 
     let packet_counter = Arc::new(AtomicU64::new(0));
     let access_unit_counter = Arc::new(AtomicU64::new(0));
+    let connection_snapshot = snapshot.clone();
+    pc.on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
+        let snapshot = connection_snapshot.clone();
+        Box::pin(async move {
+            snapshot
+                .lock()
+                .expect("lock host snapshot")
+                .peer_connection_state = Some(state.to_string());
+        })
+    }));
+    let ice_snapshot = snapshot.clone();
+    pc.on_ice_connection_state_change(Box::new(move |state: RTCIceConnectionState| {
+        let snapshot = ice_snapshot.clone();
+        Box::pin(async move {
+            snapshot
+                .lock()
+                .expect("lock host snapshot")
+                .ice_connection_state = Some(state.to_string());
+        })
+    }));
     let on_track_snapshot = snapshot.clone();
     let on_track_session_id = session_id.clone();
     let on_track_frame_sink = frame_sink.clone();
+    let on_track_probe = probe.clone();
     let on_track_counter = packet_counter.clone();
     let on_track_access_unit_counter = access_unit_counter.clone();
     pc.on_track(Box::new(move |track: Arc<TrackRemote>, _, _| {
         let snapshot = on_track_snapshot.clone();
         let session_id = on_track_session_id.clone();
         let frame_sink = on_track_frame_sink.clone();
+        let probe = on_track_probe.clone();
         let counter = on_track_counter.clone();
         let access_unit_counter = on_track_access_unit_counter.clone();
         Box::pin(async move {
@@ -324,10 +610,18 @@ async fn build_peer_connection(
             };
 
             while let Ok((_packet, _)) = track.read_rtp().await {
+                let ingress_started_at = std::time::Instant::now();
                 let packet_count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                let assemble_started_at = std::time::Instant::now();
                 let next_access_unit = h264_assembler.as_mut().and_then(|assembler| {
                     assembler.push_rtp_payload(&_packet.payload, _packet.header.marker)
                 });
+                probe.record_stage(
+                    StageId::NetworkIngress,
+                    ingress_started_at.elapsed(),
+                    _packet.payload.len(),
+                    false,
+                );
                 let mut snapshot_guard = snapshot.lock().expect("lock host snapshot");
                 snapshot_guard.remote_rtp_packet_count = packet_count;
                 if let Some(access_unit) = next_access_unit {
@@ -335,12 +629,19 @@ async fn build_peer_connection(
                     snapshot_guard.remote_h264_access_unit_count = access_unit_count;
                     snapshot_guard.last_remote_access_unit_bytes = access_unit.len();
                     drop(snapshot_guard);
+                    probe.record_stage(
+                        StageId::H264Assemble,
+                        assemble_started_at.elapsed(),
+                        access_unit.len(),
+                        access_unit.windows(5).any(|window| window == [0, 0, 0, 1, 0x65]),
+                    );
                     if let Some(decoder) = decoder.as_mut() {
                         let _ = decode_access_unit_into_snapshot(
                             session_id.clone(),
                             source_id.clone(),
                             snapshot.clone(),
                             frame_sink.clone(),
+                            probe.clone(),
                             decoder.as_mut(),
                             &access_unit,
                         );
@@ -359,14 +660,22 @@ fn decode_access_unit_into_snapshot(
     source_id: String,
     snapshot: Arc<Mutex<WebrtcHostSnapshot>>,
     frame_sink: Option<Arc<Mutex<DecodedFrameSink>>>,
+    probe: ProbeSessionHandle,
     decoder: &mut dyn VideoDecoder,
     access_unit: &[u8],
 ) -> Result<(), String> {
+    let started_at = std::time::Instant::now();
     decoder
         .push_access_unit(access_unit)
         .map_err(|e| format!("software decoder 解码 access unit 失败: {e}"))?;
     let frames = decoder.drain_decoded_frames();
-    apply_decoded_frames_to_snapshot(session_id, source_id, snapshot, frame_sink, frames);
+    probe.record_stage(
+        StageId::DecodeTotal,
+        started_at.elapsed(),
+        access_unit.len(),
+        access_unit.windows(5).any(|window| window == [0, 0, 0, 1, 0x65]),
+    );
+    apply_decoded_frames_to_snapshot(session_id, source_id, snapshot, frame_sink, probe, frames);
     Ok(())
 }
 
@@ -375,6 +684,7 @@ fn apply_decoded_frames_to_snapshot(
     source_id: String,
     snapshot: Arc<Mutex<WebrtcHostSnapshot>>,
     frame_sink: Option<Arc<Mutex<DecodedFrameSink>>>,
+    probe: ProbeSessionHandle,
     frames: Vec<DecodedFrame>,
 ) {
     if frames.is_empty() {
@@ -390,18 +700,193 @@ fn apply_decoded_frames_to_snapshot(
             PixelFormat::Rgb24 => "Rgb24".to_string(),
         });
         if let Some(frame_sink) = frame_sink.as_ref() {
+            let bytes = frame.data.len();
+            let started_at = std::time::Instant::now();
             frame_sink
                 .lock()
                 .expect("lock decoded frame sink")
                 .ingest_frame_for_source(session_id.clone(), source_id.clone(), frame);
+            probe.record_stage(StageId::FrameSinkIngest, started_at.elapsed(), bytes, false);
         }
     }
 }
 
+async fn run_embedded_sender_loop<C, E>(
+    mut capture: C,
+    mut encoder: E,
+    frame_interval: Duration,
+    sample_sender: Arc<tokio::sync::Mutex<H264RtpSender>>,
+    snapshot: Arc<Mutex<WebrtcHostSnapshot>>,
+    probe: ProbeSessionHandle,
+    running: Arc<AtomicBool>,
+) where
+    C: FrameCapture + Send + 'static,
+    E: VideoEncoder + Send + 'static,
+{
+    let mut last_tick = std::time::Instant::now();
+    while running.load(Ordering::Relaxed) {
+        probe.record_stage(StageId::CaptureWait, last_tick.elapsed(), 0, false);
+        let capture_started_at = std::time::Instant::now();
+        match capture.capture_frame() {
+            Ok(frame) => {
+                probe.record_stage(
+                    StageId::CaptureCopy,
+                    capture_started_at.elapsed(),
+                    frame.data.len(),
+                    false,
+                );
+                {
+                    let mut guard = snapshot.lock().expect("lock host snapshot");
+                    guard.captured_frame_count += 1;
+                    guard.sender_running = true;
+                }
+                let encode_started_at = std::time::Instant::now();
+                match encoder.encode(&frame) {
+                    Ok(access_units) => {
+                        let total_encoded_bytes =
+                            access_units.iter().map(|access_unit| access_unit.bytes.len()).sum();
+                        let keyframe = access_units.iter().any(|access_unit| access_unit.is_keyframe);
+                        probe.record_stage(
+                            StageId::EncodeTotal,
+                            encode_started_at.elapsed(),
+                            total_encoded_bytes,
+                            keyframe,
+                        );
+                        for access_unit in access_units {
+                            let send_started_at = std::time::Instant::now();
+                            if let Ok(written) =
+                                sample_sender.lock().await.send_access_unit(&access_unit).await
+                            {
+                                probe.record_stage(
+                                    StageId::SendPacketize,
+                                    Duration::from_micros(1),
+                                    access_unit.bytes.len(),
+                                    access_unit.is_keyframe,
+                                );
+                                probe.record_stage(
+                                    StageId::SendWrite,
+                                    send_started_at.elapsed(),
+                                    written,
+                                    access_unit.is_keyframe,
+                                );
+                                let mut guard = snapshot.lock().expect("lock host snapshot");
+                                guard.sent_access_unit_count += 1;
+                                guard.sent_rtp_bytes += written as u64;
+                                if written == 0 {
+                                    guard.zero_write_access_unit_count += 1;
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        running.store(false, Ordering::Relaxed);
+                    }
+                }
+            }
+            Err(_) => {
+                running.store(false, Ordering::Relaxed);
+            }
+        }
+
+        last_tick = std::time::Instant::now();
+        tokio::time::sleep(frame_interval).await;
+    }
+
+    snapshot.lock().expect("lock host snapshot").sender_running = false;
+}
+
+fn run_blocking_desktop_sender_loop<C, E>(
+    capture: &mut C,
+    encoder: &mut E,
+    frame_interval: Duration,
+    sample_sender: Arc<tokio::sync::Mutex<H264RtpSender>>,
+    snapshot: Arc<Mutex<WebrtcHostSnapshot>>,
+    probe: ProbeSessionHandle,
+    running: Arc<AtomicBool>,
+    handle: tokio::runtime::Handle,
+) where
+    C: FrameCapture,
+    E: VideoEncoder,
+{
+    let mut last_tick = std::time::Instant::now();
+    while running.load(Ordering::Relaxed) {
+        probe.record_stage(StageId::CaptureWait, last_tick.elapsed(), 0, false);
+        let capture_started_at = std::time::Instant::now();
+        match capture.capture_frame() {
+            Ok(frame) => {
+                probe.record_stage(
+                    StageId::CaptureCopy,
+                    capture_started_at.elapsed(),
+                    frame.data.len(),
+                    false,
+                );
+                {
+                    let mut guard = snapshot.lock().expect("lock host snapshot");
+                    guard.captured_frame_count += 1;
+                    guard.sender_running = true;
+                }
+                let encode_started_at = std::time::Instant::now();
+                match encoder.encode(&frame) {
+                    Ok(access_units) => {
+                        let total_encoded_bytes =
+                            access_units.iter().map(|access_unit| access_unit.bytes.len()).sum();
+                        let keyframe = access_units.iter().any(|access_unit| access_unit.is_keyframe);
+                        probe.record_stage(
+                            StageId::EncodeTotal,
+                            encode_started_at.elapsed(),
+                            total_encoded_bytes,
+                            keyframe,
+                        );
+                        for access_unit in access_units {
+                            let send_started_at = std::time::Instant::now();
+                            if let Ok(written) = handle.block_on(async {
+                                sample_sender.lock().await.send_access_unit(&access_unit).await
+                            }) {
+                                probe.record_stage(
+                                    StageId::SendPacketize,
+                                    Duration::from_micros(1),
+                                    access_unit.bytes.len(),
+                                    access_unit.is_keyframe,
+                                );
+                                probe.record_stage(
+                                    StageId::SendWrite,
+                                    send_started_at.elapsed(),
+                                    written,
+                                    access_unit.is_keyframe,
+                                );
+                                let mut guard = snapshot.lock().expect("lock host snapshot");
+                                guard.sent_access_unit_count += 1;
+                                guard.sent_rtp_bytes += written as u64;
+                                if written == 0 {
+                                    guard.zero_write_access_unit_count += 1;
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        running.store(false, Ordering::Relaxed);
+                    }
+                }
+            }
+            Err(_) => {
+                running.store(false, Ordering::Relaxed);
+            }
+        }
+
+        last_tick = std::time::Instant::now();
+        std::thread::sleep(frame_interval);
+    }
+
+    snapshot.lock().expect("lock host snapshot").sender_running = false;
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{sync::{Arc, Mutex}, time::Duration};
 
+    use mrd_encode_openh264::OpenH264Encoder;
+    use mrd_observability::{ProbeRegistry, StageId};
+    use mrd_pipeline_core::{CapturedFrame, FrameCapture, FramePixelFormat};
     use mrd_proto::SessionId;
     use openh264::{
         encoder::Encoder,
@@ -492,6 +977,8 @@ mod tests {
             "video-track-1".to_string(),
             snapshot.clone(),
             None,
+            ProbeRegistry::default()
+                .session_handle(SessionId("session-3".into()), crate::frame_sink::DEFAULT_SOURCE_ID),
             decoder.as_mut(),
             access_unit.as_slice(),
         )
@@ -516,5 +1003,141 @@ mod tests {
             assembler.push_rtp_payload(&[0x7c, 0x45, 0xcc, 0xdd], true),
             Some(vec![0, 0, 0, 1, 0x65, 0xaa, 0xbb, 0xcc, 0xdd])
         );
+    }
+
+    struct FakeCapture {
+        tick: u8,
+    }
+
+    impl FrameCapture for FakeCapture {
+        fn capture_frame(&mut self) -> Result<CapturedFrame, mrd_pipeline_core::PipelineError> {
+            self.tick = self.tick.wrapping_add(1);
+            let mut data = vec![0_u8; 16 * 16 * 4];
+            for chunk in data.chunks_exact_mut(4) {
+                chunk[0] = self.tick;
+                chunk[1] = 64;
+                chunk[2] = 192;
+                chunk[3] = 255;
+            }
+
+            Ok(CapturedFrame {
+                width: 16,
+                height: 16,
+                pixel_format: FramePixelFormat::Bgra32,
+                timestamp_us: self.tick as u64 * 33_000,
+                data,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn embedded_sender_delivers_decoded_frames_to_remote_host() {
+        let sink = Arc::new(Mutex::new(crate::frame_sink::DecodedFrameSink::default()));
+        let mut controller = WebrtcHost::with_frame_sink(sink.clone());
+        let mut agent = WebrtcHost::default();
+        let session_id = SessionId("session-e2e".into());
+
+        agent
+            .start_test_video_sender(
+                session_id.clone(),
+                FakeCapture { tick: 0 },
+                OpenH264Encoder::new(16, 16, 30).expect("openh264 encoder"),
+                Duration::from_millis(33),
+            )
+            .await
+            .expect("start embedded sender");
+
+        let offer = agent
+            .create_offer(session_id.clone())
+            .await
+            .expect("agent offer");
+
+        controller
+            .apply_remote_offer(session_id.clone(), offer.sdp)
+            .await
+            .expect("controller apply offer");
+
+        let answer = controller
+            .create_answer(session_id.clone())
+            .await
+            .expect("controller answer");
+        assert!(
+            answer.sdp.contains("m=video"),
+            "controller answer should negotiate a video m-line: {}",
+            answer.sdp
+        );
+        assert!(
+            answer.sdp.to_ascii_lowercase().contains("a=recvonly")
+                || answer.sdp.to_ascii_lowercase().contains("a=sendrecv"),
+            "controller answer should expose a receiving video direction: {}",
+            answer.sdp
+        );
+        assert!(
+            answer.sdp.to_ascii_lowercase().contains("h264"),
+            "controller answer should include H264 codec negotiation: {}",
+            answer.sdp
+        );
+
+        agent
+            .apply_remote_answer(session_id.clone(), answer.sdp)
+            .await
+            .expect("agent apply answer");
+
+        let wait_result = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let snapshot = controller.snapshot(&session_id).expect("controller snapshot");
+                if snapshot.decoded_frame_count > 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+
+        let controller_snapshot = controller.snapshot(&session_id).expect("controller snapshot");
+        let agent_snapshot = agent.snapshot(&session_id).expect("agent snapshot");
+        let controller_probe = controller
+            .probe_snapshot(&session_id)
+            .expect("controller probe snapshot");
+        let agent_probe = agent.probe_snapshot(&session_id).expect("agent probe snapshot");
+        let controller_stats = controller
+            .sessions
+            .get(&session_id)
+            .expect("controller peer")
+            .pc
+            .get_stats()
+            .await;
+        let agent_stats = agent
+            .sessions
+            .get(&session_id)
+            .expect("agent peer")
+            .pc
+            .get_stats()
+            .await;
+        let controller_report_count = controller_stats.reports.len();
+        let agent_report_count = agent_stats.reports.len();
+        assert!(
+            wait_result.is_ok(),
+            "remote host receives decoded frames: controller={controller_snapshot:?} agent={agent_snapshot:?} controller_reports={controller_report_count} agent_reports={agent_report_count} controller_stats={controller_stats:?} agent_stats={agent_stats:?}"
+        );
+
+        assert!(controller_snapshot.decoded_frame_count > 0);
+        assert!(controller_snapshot.remote_h264_access_unit_count > 0);
+        assert!(controller_probe
+            .stages
+            .iter()
+            .any(|(stage, stats)| *stage == StageId::DecodeTotal && stats.count > 0));
+        assert!(controller_probe
+            .stages
+            .iter()
+            .any(|(stage, stats)| *stage == StageId::FrameSinkIngest && stats.count > 0));
+        assert!(agent_probe
+            .stages
+            .iter()
+            .any(|(stage, stats)| *stage == StageId::EncodeTotal && stats.count > 0));
+        assert!(agent_probe
+            .stages
+            .iter()
+            .any(|(stage, stats)| *stage == StageId::SendWrite && stats.count > 0));
     }
 }

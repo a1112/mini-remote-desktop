@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mini-remote-desktop.local/schemas/component-result.schema.json",
+  "title": "ComponentResult",
+  "type": "object",
+  "required": [
+    "component",
+    "backend",
+    "case_name",
+    "sample_count",
+    "duration_sec",
+    "success_count",
+    "failure_count",
+    "throughput_fps",
+    "latency_ms"
+  ],
+  "properties": {
+    "component": { "type": "string" },
+    "backend": { "type": "string" },
+    "case_name": { "type": "string" },
+    "sample_count": { "type": "integer", "minimum": 0 },
+    "duration_sec": { "type": "number", "minimum": 0 },
+    "success_count": { "type": "integer", "minimum": 0 },
+    "failure_count": { "type": "integer", "minimum": 0 },
+    "throughput_fps": { "type": "number", "minimum": 0 },
+    "latency_ms": {
+      "type": "object",
+      "required": ["count", "bytes", "avg_ms", "p50_ms", "p95_ms", "p99_ms", "max_ms", "jitter_ms"]
+    }
+  },
+  "additionalProperties": true
+}

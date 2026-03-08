@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod device_info;
+mod benchmark;
 mod frame_sink;
 mod render_host;
 mod realtime_client;
@@ -18,6 +19,7 @@ mod session_runtime;
 use device_info::HardwareInfo;
 use frame_sink::{DecodedFrameSink, DecodedFrameSnapshot};
 use image::{codecs::png::PngEncoder, ColorType, ImageEncoder};
+use mrd_observability::{MediaProbeEvent, PipelineProbeSnapshot, ProbeRegistry};
 use mrd_proto::{BackendRole, DeviceId, SessionId};
 use mrd_signal_client::encode_message;
 use mrd_signal_proto::{IceCandidate, SessionDescription, SignalMessage};
@@ -87,6 +89,14 @@ struct WebrtcHostSnapshotResponse {
     last_decoded_height: usize,
     last_decoded_pixel_format: Option<String>,
     available_video_source_ids: Vec<String>,
+    local_video_track_count: usize,
+    captured_frame_count: u64,
+    sent_access_unit_count: u64,
+    sent_rtp_bytes: u64,
+    zero_write_access_unit_count: u64,
+    sender_running: bool,
+    peer_connection_state: Option<String>,
+    ice_connection_state: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -430,6 +440,52 @@ async fn webrtc_host_snapshot(
     session_id: String,
 ) -> Result<Option<WebrtcHostSnapshotResponse>, String> {
     Ok(webrtc_host_snapshot_with(state.webrtc_host.as_ref(), session_id).await)
+}
+
+#[tauri::command]
+async fn session_runtime_probe_snapshot(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+) -> Result<Option<PipelineProbeSnapshot>, String> {
+    let host = state.webrtc_host.lock().await;
+    Ok(host.probe_snapshot(&SessionId(session_id)))
+}
+
+#[tauri::command]
+async fn session_runtime_probe_recent_events(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+    limit: Option<usize>,
+) -> Result<Vec<MediaProbeEvent>, String> {
+    let host = state.webrtc_host.lock().await;
+    Ok(host.probe_recent_events(&SessionId(session_id), limit.unwrap_or(64)))
+}
+
+#[tauri::command]
+async fn webrtc_host_start_embedded_desktop_sender(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+    fps: Option<u32>,
+) -> Result<(), String> {
+    state
+        .webrtc_host
+        .lock()
+        .await
+        .start_embedded_desktop_sender(SessionId(session_id), fps.unwrap_or(15))
+        .await
+}
+
+#[tauri::command]
+async fn webrtc_host_stop_embedded_video_sender(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+) -> Result<(), String> {
+    state
+        .webrtc_host
+        .lock()
+        .await
+        .stop_embedded_video_sender(&SessionId(session_id))
+        .await
 }
 
 #[tauri::command]
@@ -954,6 +1010,14 @@ fn webrtc_host_snapshot_response(snapshot: &WebrtcHostSnapshot) -> WebrtcHostSna
         last_decoded_height: snapshot.last_decoded_height,
         last_decoded_pixel_format: snapshot.last_decoded_pixel_format.clone(),
         available_video_source_ids: snapshot.available_video_source_ids.clone(),
+        local_video_track_count: snapshot.local_video_track_count,
+        captured_frame_count: snapshot.captured_frame_count,
+        sent_access_unit_count: snapshot.sent_access_unit_count,
+        sent_rtp_bytes: snapshot.sent_rtp_bytes,
+        zero_write_access_unit_count: snapshot.zero_write_access_unit_count,
+        sender_running: snapshot.sender_running,
+        peer_connection_state: snapshot.peer_connection_state.clone(),
+        ice_connection_state: snapshot.ice_connection_state.clone(),
     }
 }
 
@@ -1298,7 +1362,10 @@ fn decoded_frame_preview_with(
 
 fn main() {
     let frame_sink = std::sync::Arc::new(std::sync::Mutex::new(DecodedFrameSink::default()));
-    let render_host = std::sync::Arc::new(std::sync::Mutex::new(RenderHost::with_frame_sink(frame_sink.clone())));
+    let probe_registry = ProbeRegistry::default();
+    let render_host = std::sync::Arc::new(std::sync::Mutex::new(
+        RenderHost::with_frame_sink_and_probes(frame_sink.clone(), Some(probe_registry.clone())),
+    ));
     let render_windows = std::sync::Arc::new(std::sync::Mutex::new(RenderWindowRegistry::default()));
     let session_lifecycle =
         std::sync::Arc::new(std::sync::Mutex::new(SessionLifecycleCoordinator::default()));
@@ -1309,7 +1376,10 @@ fn main() {
             render_windows,
             session_lifecycle,
             realtime_runtime: RealtimeRuntime::from_env(),
-            webrtc_host: std::sync::Arc::new(Mutex::new(WebrtcHost::with_frame_sink(frame_sink))),
+            webrtc_host: std::sync::Arc::new(Mutex::new(WebrtcHost::with_frame_sink_and_probes(
+                frame_sink,
+                probe_registry,
+            ))),
             webrtc_sessions: std::sync::Arc::new(Mutex::new(WebrtcSessionCoordinator::default())),
         })
         .invoke_handler(tauri::generate_handler![
@@ -1338,6 +1408,10 @@ fn main() {
             webrtc_host_apply_remote_answer,
             webrtc_host_apply_remote_ice_candidate,
             webrtc_host_snapshot,
+            session_runtime_probe_snapshot,
+            session_runtime_probe_recent_events,
+            webrtc_host_start_embedded_desktop_sender,
+            webrtc_host_stop_embedded_video_sender,
             decoded_frame_snapshot,
             decoded_frame_preview,
             render_host_attach_session,
@@ -1365,6 +1439,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
+        benchmark::{write_benchmark_artifacts, BenchmarkManifest, BenchmarkPaths, BenchmarkSummary},
         decoded_frame_preview_with, decoded_frame_snapshot_with, drain_realtime_events_with, realtime_accept_session_with,
         realtime_register_with, render_host_snapshot_response,
         realtime_request_session_with, webrtc_apply_remote_answer_with,
@@ -1384,9 +1459,11 @@ mod tests {
         Router,
     };
     use futures_util::StreamExt;
+    use mrd_pipeline_core::{CapturedFrame, FrameCapture, FramePixelFormat};
     use mrd_signal_client::{decode_message, encode_message};
     use mrd_proto::{DeviceId, SessionId};
     use mrd_signal_proto::SignalMessage;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use tokio::net::TcpListener;
     use tokio::sync::Mutex;
 
@@ -1618,6 +1695,158 @@ mod tests {
         assert_eq!(controller_snapshot.last_decoded_pixel_format, None);
         assert!(agent_snapshot.remote_offer.is_some());
         assert!(agent_snapshot.local_answer.is_some());
+    }
+
+    struct BenchmarkCapture {
+        tick: u8,
+        width: usize,
+        height: usize,
+    }
+
+    impl FrameCapture for BenchmarkCapture {
+        fn capture_frame(&mut self) -> Result<CapturedFrame, mrd_pipeline_core::PipelineError> {
+            self.tick = self.tick.wrapping_add(1);
+            let mut data = vec![0_u8; self.width * self.height * 4];
+            for chunk in data.chunks_exact_mut(4) {
+                chunk[0] = self.tick;
+                chunk[1] = 64;
+                chunk[2] = 192;
+                chunk[3] = 255;
+            }
+            Ok(CapturedFrame {
+                width: self.width,
+                height: self.height,
+                pixel_format: FramePixelFormat::Bgra32,
+                timestamp_us: self.tick as u64 * 33_000,
+                data,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn benchmark_run_writes_requested_artifacts() {
+        let artifact_root = std::env::var("MRD_BENCH_ARTIFACT_ROOT")
+            .unwrap_or_else(|_| std::env::temp_dir().join("mrd-bench-default").display().to_string());
+        let scenario = std::env::var("MRD_BENCH_SCENARIO").unwrap_or_else(|_| "quick.transport".into());
+        let profile =
+            std::env::var("MRD_BENCH_PROFILE").unwrap_or_else(|_| "transport-webrtc-baseline".into());
+        let run_id = std::env::var("MRD_BENCH_RUN_ID").unwrap_or_else(|_| {
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("unix epoch")
+                .as_secs();
+            format!("quick-webrtc-{ts}")
+        });
+        let date = std::env::var("MRD_BENCH_DATE").unwrap_or_else(|_| "2026-03-08".into());
+        let width = std::env::var("MRD_BENCH_WIDTH")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1280);
+        let height = std::env::var("MRD_BENCH_HEIGHT")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(720);
+        let fps = std::env::var("MRD_BENCH_FPS")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(30);
+        let duration_secs = std::env::var("MRD_BENCH_DURATION_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(20);
+        let git_commit = std::env::var("MRD_BENCH_GIT_COMMIT").unwrap_or_else(|_| "unknown".into());
+        let session_id = SessionId("session-benchmark".into());
+
+        let sink = std::sync::Arc::new(std::sync::Mutex::new(DecodedFrameSink::default()));
+        let mut controller = WebrtcHost::with_frame_sink(sink.clone());
+        let mut agent = WebrtcHost::default();
+
+        agent
+            .start_test_video_sender(
+                session_id.clone(),
+                BenchmarkCapture {
+                    tick: 0,
+                    width,
+                    height,
+                },
+                mrd_encode_openh264::OpenH264Encoder::new(width, height, fps).expect("openh264 encoder"),
+                Duration::from_millis((1000 / fps.max(1)) as u64),
+            )
+            .await
+            .expect("start benchmark sender");
+
+        let offer = agent
+            .create_offer(session_id.clone())
+            .await
+            .expect("agent offer");
+        controller
+            .apply_remote_offer(session_id.clone(), offer.sdp)
+            .await
+            .expect("controller apply offer");
+        let answer = controller
+            .create_answer(session_id.clone())
+            .await
+            .expect("controller answer");
+        agent
+            .apply_remote_answer(session_id.clone(), answer.sdp)
+            .await
+            .expect("agent apply answer");
+
+        let started_at = Instant::now();
+        let first_frame_time_ms = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let snapshot = controller.snapshot(&session_id).expect("controller snapshot");
+                if snapshot.decoded_frame_count > 0 {
+                    break started_at.elapsed().as_secs_f64() * 1000.0;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("first frame within timeout");
+
+        tokio::time::sleep(Duration::from_secs(duration_secs)).await;
+
+        let controller_snapshot = controller.snapshot(&session_id).expect("controller snapshot");
+        let agent_snapshot = agent.snapshot(&session_id).expect("agent snapshot");
+        let controller_probe = controller.probe_snapshot(&session_id).expect("controller probe");
+        let agent_probe = agent.probe_snapshot(&session_id).expect("agent probe");
+        let manifest = BenchmarkManifest {
+            run_id: run_id.clone(),
+            scenario,
+            transport: "webrtc".into(),
+            capture_backend: "dxgi".into(),
+            encode_backend: "openh264".into(),
+            decode_backend: "h264_software".into(),
+            renderer_backend: "d3d11".into(),
+            width: width as u32,
+            height: height as u32,
+            fps,
+            duration_secs,
+            git_commit,
+        };
+        let summary = BenchmarkSummary::from_transport_probes(
+            &manifest,
+            &agent_probe,
+            &controller_probe,
+            true,
+            controller_snapshot.decoded_frame_count > 0,
+            first_frame_time_ms,
+            agent_snapshot.zero_write_access_unit_count,
+        );
+        let paths = BenchmarkPaths::new(
+            std::path::Path::new(&artifact_root),
+            date,
+            profile,
+            run_id,
+        );
+        write_benchmark_artifacts(&paths, &manifest, &summary, &session_id.0, &controller_probe)
+            .expect("write benchmark artifacts");
+
+        assert!(paths.summary_json.exists());
+        assert!(paths.summary_csv.exists());
+        assert!(paths.report_md.exists());
+        assert!(summary.run_passed, "benchmark summary should pass: {summary:?}");
     }
 
     #[test]

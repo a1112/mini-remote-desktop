@@ -4,6 +4,7 @@ use std::{
 };
 
 use image::{codecs::png::PngEncoder, ColorType, ImageEncoder};
+use mrd_observability::{ProbeRegistry, StageId};
 use mrd_proto::SessionId;
 use mrd_render::{
     BoxedRenderer, RenderFrame, RenderPixelFormat, RenderTarget, RendererFactory, RendererSnapshot,
@@ -54,14 +55,23 @@ pub struct RenderHost {
     renderers: HashMap<SessionId, HashMap<String, BoxedRenderer>>,
     surface_sources: HashMap<SessionId, HashMap<String, String>>,
     frame_sink: Option<Arc<Mutex<DecodedFrameSink>>>,
+    probe_registry: Option<ProbeRegistry>,
 }
 
 impl RenderHost {
     pub fn with_frame_sink(frame_sink: Arc<Mutex<DecodedFrameSink>>) -> Self {
+        Self::with_frame_sink_and_probes(frame_sink, None)
+    }
+
+    pub fn with_frame_sink_and_probes(
+        frame_sink: Arc<Mutex<DecodedFrameSink>>,
+        probe_registry: Option<ProbeRegistry>,
+    ) -> Self {
         Self {
             renderers: HashMap::new(),
             surface_sources: HashMap::new(),
             frame_sink: Some(frame_sink),
+            probe_registry,
         }
     }
 
@@ -197,9 +207,21 @@ impl RenderHost {
                     .and_then(|source_id| latest_source_frames.get(source_id));
                 let render_frame =
                     decoded_frame_to_render_frame(source_bound_frame.unwrap_or(frame_to_upload));
+                let bytes = render_frame.data.len();
+                let started_at = std::time::Instant::now();
                 renderer
                     .upload_frame(render_frame)
                     .map_err(|error| format!("upload latest frame to renderer failed: {error}"))?;
+                if let Some(probe_registry) = self.probe_registry.as_ref() {
+                    probe_registry
+                        .session_handle(session_id.clone(), DEFAULT_SOURCE_ID)
+                        .record_stage(
+                            StageId::RenderUpload,
+                            started_at.elapsed(),
+                            bytes,
+                            false,
+                        );
+                }
             }
         }
 
@@ -233,6 +255,7 @@ impl Default for RenderHost {
             renderers: HashMap::new(),
             surface_sources: HashMap::new(),
             frame_sink: None,
+            probe_registry: None,
         }
     }
 }

@@ -15,3 +15,7 @@ windows = { version = "0.52", features = [
   "Win32_Graphics_Dxgi_Common",
   "Win32_UI_WindowsAndMessaging",
 ] }
+
+[dev-dependencies]
+mrd-observability = { path = "../mrd-observability" }
+serde_json = { workspace = true }

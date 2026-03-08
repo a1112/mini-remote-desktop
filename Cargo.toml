@@ -3,7 +3,10 @@ members = [
   "apps/Rdesk/src-tauri",
   "apps/realtime-server",
   "common-control-proto",
+  "crates/mrd-capture-dxgi",
   "crates/mrd-decode",
+  "crates/mrd-encode-openh264",
+  "crates/mrd-observability",
   "crates/mrd-pipeline-core",
   "crates/mrd-proto",
   "crates/mrd-render",
@@ -12,6 +15,7 @@ members = [
   "crates/mrd-signal-client",
   "crates/mrd-signal-proto",
   "crates/mrd-signal-server",
+  "crates/mrd-transport-webrtc",
   "heartbeat-rs",
 ]
 resolver = "2"
@@ -31,3 +35,4 @@ thiserror = "1.0"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytes = "1"
