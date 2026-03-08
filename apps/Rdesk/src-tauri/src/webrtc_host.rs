@@ -885,7 +885,7 @@ mod tests {
     use std::{sync::{Arc, Mutex}, time::Duration};
 
     use mrd_encode_openh264::OpenH264Encoder;
-    use mrd_observability::{ProbeRegistry, StageId};
+    use mrd_observability::{PipelineProbeSnapshot, ProbeRegistry, StageId};
     use mrd_pipeline_core::{CapturedFrame, FrameCapture, FramePixelFormat};
     use mrd_proto::SessionId;
     use openh264::{
@@ -894,6 +894,7 @@ mod tests {
     };
 
     use super::{decode_access_unit_into_snapshot, WebrtcHost, WebrtcHostSnapshot};
+    use crate::frame_sink::{DecodedFrameSink, DecodedFrameSnapshot};
     use crate::webrtc_media::H264AccessUnitAssembler;
 
     #[tokio::test]
@@ -1030,6 +1031,126 @@ mod tests {
         }
     }
 
+    struct HostedPairHarness {
+        controller: WebrtcHost,
+        agent: WebrtcHost,
+        sink: Arc<Mutex<DecodedFrameSink>>,
+        session_id: SessionId,
+    }
+
+    struct FrameProgressSample {
+        start_frame_count: u64,
+        end_frame_count: u64,
+        observed_samples: usize,
+    }
+
+    impl HostedPairHarness {
+        fn new(session_id: &str) -> Self {
+            let sink = Arc::new(Mutex::new(DecodedFrameSink::default()));
+            Self {
+                controller: WebrtcHost::with_frame_sink(sink.clone()),
+                agent: WebrtcHost::default(),
+                sink,
+                session_id: SessionId(session_id.into()),
+            }
+        }
+
+        async fn start(&mut self) -> Result<(), String> {
+            self.agent
+                .start_test_video_sender(
+                    self.session_id.clone(),
+                    FakeCapture { tick: 0 },
+                    OpenH264Encoder::new(16, 16, 30).expect("openh264 encoder"),
+                    Duration::from_millis(33),
+                )
+                .await?;
+
+            let offer = self.agent.create_offer(self.session_id.clone()).await?;
+            self.controller
+                .apply_remote_offer(self.session_id.clone(), offer.sdp)
+                .await?;
+            let answer = self.controller.create_answer(self.session_id.clone()).await?;
+            self.agent
+                .apply_remote_answer(self.session_id.clone(), answer.sdp)
+                .await?;
+            Ok(())
+        }
+
+        async fn wait_for_first_frame(&self, timeout: Duration) -> Result<(), String> {
+            tokio::time::timeout(timeout, async {
+                loop {
+                    let snapshot = self
+                        .controller
+                        .snapshot(&self.session_id)
+                        .expect("controller snapshot");
+                    if snapshot.decoded_frame_count > 0 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .map_err(|_| format!("timed out waiting for first frame for {}", self.session_id.0))
+        }
+
+        fn controller_snapshot(&self) -> WebrtcHostSnapshot {
+            self.controller
+                .snapshot(&self.session_id)
+                .expect("controller snapshot")
+        }
+
+        fn agent_snapshot(&self) -> WebrtcHostSnapshot {
+            self.agent.snapshot(&self.session_id).expect("agent snapshot")
+        }
+
+        fn controller_probe(&self) -> PipelineProbeSnapshot {
+            self.controller
+                .probe_snapshot(&self.session_id)
+                .expect("controller probe snapshot")
+        }
+
+        fn agent_probe(&self) -> PipelineProbeSnapshot {
+            self.agent
+                .probe_snapshot(&self.session_id)
+                .expect("agent probe snapshot")
+        }
+
+        fn sink_snapshot(&self) -> Option<DecodedFrameSnapshot> {
+            self.sink
+                .lock()
+                .expect("lock sink")
+                .snapshot(&self.session_id)
+                .cloned()
+        }
+
+        async fn sample_frame_progress(
+            &self,
+            duration: Duration,
+            step: Duration,
+        ) -> FrameProgressSample {
+            let start_frame_count = self
+                .sink_snapshot()
+                .map(|snapshot| snapshot.frame_count)
+                .unwrap_or(0);
+            let started_at = tokio::time::Instant::now();
+            let mut observed_samples = 0usize;
+            while started_at.elapsed() < duration {
+                tokio::time::sleep(step).await;
+                observed_samples += 1;
+            }
+            let end_frame_count = self
+                .sink_snapshot()
+                .map(|snapshot| snapshot.frame_count)
+                .unwrap_or(0);
+
+            FrameProgressSample {
+                start_frame_count,
+                end_frame_count,
+                observed_samples,
+            }
+        }
+    }
+
     #[tokio::test]
     async fn embedded_sender_delivers_decoded_frames_to_remote_host() {
         let sink = Arc::new(Mutex::new(crate::frame_sink::DecodedFrameSink::default()));
@@ -1139,5 +1260,89 @@ mod tests {
             .stages
             .iter()
             .any(|(stage, stats)| *stage == StageId::SendWrite && stats.count > 0));
+    }
+
+    #[tokio::test]
+    async fn single_process_pipeline_exposes_probe_stages() {
+        let mut harness = HostedPairHarness::new("session-composed-probe");
+
+        harness.start().await.expect("start composed pipeline");
+        harness
+            .wait_for_first_frame(Duration::from_secs(8))
+            .await
+            .expect("remote decoded frame");
+
+        let controller_probe = harness.controller_probe();
+        let agent_probe = harness.agent_probe();
+
+        assert!(controller_probe
+            .stages
+            .iter()
+            .any(|(stage, stats)| *stage == StageId::NetworkIngress && stats.count > 0));
+        assert!(controller_probe
+            .stages
+            .iter()
+            .any(|(stage, stats)| *stage == StageId::H264Assemble && stats.count > 0));
+        assert!(controller_probe
+            .stages
+            .iter()
+            .any(|(stage, stats)| *stage == StageId::DecodeTotal && stats.count > 0));
+        assert!(controller_probe
+            .stages
+            .iter()
+            .any(|(stage, stats)| *stage == StageId::FrameSinkIngest && stats.count > 0));
+        assert!(agent_probe
+            .stages
+            .iter()
+            .any(|(stage, stats)| *stage == StageId::CaptureCopy && stats.count > 0));
+        assert!(agent_probe
+            .stages
+            .iter()
+            .any(|(stage, stats)| *stage == StageId::EncodeTotal && stats.count > 0));
+        assert!(agent_probe
+            .stages
+            .iter()
+            .any(|(stage, stats)| *stage == StageId::SendWrite && stats.count > 0));
+    }
+
+    #[tokio::test]
+    async fn single_process_pipeline_delivers_remote_frames() {
+        let mut harness = HostedPairHarness::new("session-composed-frames");
+
+        harness.start().await.expect("start composed pipeline");
+        harness
+            .wait_for_first_frame(Duration::from_secs(8))
+            .await
+            .expect("remote decoded frame");
+
+        let controller_snapshot = harness.controller_snapshot();
+        let agent_snapshot = harness.agent_snapshot();
+        let sink_snapshot = harness.sink_snapshot().expect("sink snapshot");
+
+        assert!(controller_snapshot.decoded_frame_count > 0);
+        assert!(controller_snapshot.remote_rtp_packet_count > 0);
+        assert!(controller_snapshot.remote_h264_access_unit_count > 0);
+        assert!(agent_snapshot.sender_running);
+        assert!(sink_snapshot.frame_count > 0);
+    }
+
+    #[tokio::test]
+    async fn single_process_pipeline_runs_for_fixed_duration_without_stalling() {
+        let mut harness = HostedPairHarness::new("session-composed-stable");
+
+        harness.start().await.expect("start composed pipeline");
+        harness
+            .wait_for_first_frame(Duration::from_secs(8))
+            .await
+            .expect("remote decoded frame");
+
+        let progress = harness
+            .sample_frame_progress(Duration::from_secs(2), Duration::from_millis(250))
+            .await;
+
+        assert!(progress.start_frame_count > 0);
+        assert!(progress.end_frame_count > progress.start_frame_count);
+        assert!(progress.observed_samples > 0);
+        assert!(harness.agent_snapshot().sender_running);
     }
 }
