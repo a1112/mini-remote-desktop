@@ -9,6 +9,7 @@ Current first wave:
 
 Current second wave:
 - `mrd-transport-webrtc` sender boundary
+- `mrd-transport-webrtc` receiver boundary
 - `mrd-render-d3d11`
 
 Each crate owns:
@@ -18,6 +19,10 @@ Each crate owns:
 Transport sender measures:
 - `packetize + sender-boundary` latency distribution
 - access-unit size, written bytes, packets-per-sample
+
+Transport receiver measures:
+- `RTP payload -> Annex-B access unit` latency distribution
+- payload bytes, reassembled access-unit size, packets-per-sample
 
 Render measures:
 - `upload_frame()` boundary latency distribution
