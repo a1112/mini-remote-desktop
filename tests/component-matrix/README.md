@@ -5,6 +5,7 @@ This directory contains single-component performance validation for mainline cra
 Current first wave:
 - `mrd-capture-dxgi`
 - `mrd-encode-openh264`
+- `mrd-encode-nvenc`
 - `mrd-decode`
 
 Current second wave:
@@ -17,6 +18,9 @@ Current second wave:
 Each crate owns:
 - normal functionality tests in `cargo test`
 - ignored performance tests for latency/throughput distribution
+
+Hardware encode notes:
+- `mrd-encode-nvenc` is hardware-gated. On non-NVIDIA or unsupported hosts it still writes a result artifact, but the case will fail with zero throughput instead of crashing the matrix harness.
 
 Transport sender measures:
 - `packetize + sender-boundary` latency distribution
