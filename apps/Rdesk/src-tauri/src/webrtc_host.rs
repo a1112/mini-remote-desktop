@@ -18,7 +18,7 @@ use mrd_observability::{
 use mrd_pipeline_core::{FrameCapture, VideoEncoder};
 use mrd_proto::SessionId;
 use mrd_signal_proto::{IceCandidate, SessionDescription};
-use mrd_transport_webrtc::H264RtpSender;
+use mrd_transport_webrtc::{H264Profile, H264RtpSender};
 use tokio::task::JoinHandle;
 use webrtc::{
     api::{
@@ -58,6 +58,8 @@ pub struct WebrtcHostSnapshot {
     pub last_decoded_width: usize,
     pub last_decoded_height: usize,
     pub last_decoded_pixel_format: Option<String>,
+    pub decode_error_count: u64,
+    pub last_decode_error: Option<String>,
     pub available_video_source_ids: Vec<String>,
     pub local_video_track_count: usize,
     pub captured_frame_count: u64,
@@ -288,7 +290,8 @@ impl WebrtcHost {
             return Ok(());
         }
 
-        let sample_sender = ensure_sample_sender(&pc, &session_id, session).await?;
+        let sample_sender =
+            ensure_sample_sender(&pc, &session_id, session, H264Profile::Baseline).await?;
         let probe = self
             .probe_registry
             .session_handle(session_id.clone(), crate::frame_sink::DEFAULT_SOURCE_ID);
@@ -377,7 +380,7 @@ impl WebrtcHost {
         let sample_sender = if let Some(sender) = session.sample_sender.as_ref() {
             sender.clone()
         } else {
-            ensure_sample_sender(&pc, &session_id, session).await?
+            ensure_sample_sender(&pc, &session_id, session, H264Profile::Baseline).await?
         };
         let probe = self
             .probe_registry
@@ -402,6 +405,25 @@ impl WebrtcHost {
             running,
         ));
         session.sender_task = Some(task);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn prepare_test_video_sender_with_backend(
+        &mut self,
+        session_id: SessionId,
+        backend: &str,
+    ) -> Result<(), String> {
+        let pc = self.get_or_create_peer(&session_id).await?;
+        let session = self
+            .sessions
+            .get_mut(&session_id)
+            .ok_or_else(|| format!("未找到 webrtc host 会话: {}", session_id.0))?;
+        let profile = match backend {
+            "nvenc" => H264Profile::High,
+            _ => H264Profile::Baseline,
+        };
+        let _ = ensure_sample_sender(&pc, &session_id, session, profile).await?;
         Ok(())
     }
 
@@ -460,16 +482,18 @@ async fn ensure_sample_sender(
     pc: &Arc<RTCPeerConnection>,
     session_id: &SessionId,
     session: &mut HostedPeer,
+    profile: H264Profile,
 ) -> Result<Arc<tokio::sync::Mutex<H264RtpSender>>, String> {
     if let Some(sender) = session.sample_sender.as_ref() {
         return Ok(sender.clone());
     }
 
-    let sender = Arc::new(tokio::sync::Mutex::new(H264RtpSender::new(
+    let sender = Arc::new(tokio::sync::Mutex::new(H264RtpSender::new_with_profile(
         "video",
         format!("{}-embedded", session_id.0),
         30,
         1200,
+        profile,
     )));
     let track: Arc<dyn TrackLocal + Send + Sync> = sender.lock().await.track();
     let rtp_sender = pc
@@ -665,9 +689,13 @@ fn decode_access_unit_into_snapshot(
     access_unit: &[u8],
 ) -> Result<(), String> {
     let started_at = std::time::Instant::now();
-    decoder
-        .push_access_unit(access_unit)
-        .map_err(|e| format!("software decoder 解码 access unit 失败: {e}"))?;
+    if let Err(error) = decoder.push_access_unit(access_unit) {
+        let message = format!("software decoder 解码 access unit 失败: {error}");
+        let mut snapshot_guard = snapshot.lock().expect("lock host snapshot after decode error");
+        snapshot_guard.decode_error_count += 1;
+        snapshot_guard.last_decode_error = Some(message.clone());
+        return Err(message);
+    }
     let frames = decoder.drain_decoded_frames();
     probe.record_stage(
         StageId::DecodeTotal,
@@ -884,9 +912,10 @@ fn run_blocking_desktop_sender_loop<C, E>(
 mod tests {
     use std::{sync::{Arc, Mutex, Once}, time::Duration};
 
+    use mrd_encode_nvenc::NvencH264Encoder;
     use mrd_encode_openh264::OpenH264Encoder;
     use mrd_observability::{PipelineProbeSnapshot, ProbeRegistry, StageId};
-    use mrd_pipeline_core::{CapturedFrame, FrameCapture, FramePixelFormat};
+    use mrd_pipeline_core::{CapturedFrame, FrameCapture, FramePixelFormat, VideoEncoder};
     use mrd_proto::SessionId;
     use openh264::{
         encoder::Encoder,
@@ -999,6 +1028,44 @@ mod tests {
         assert_eq!(snapshot.last_decoded_width, 16);
         assert_eq!(snapshot.last_decoded_height, 16);
         assert_eq!(snapshot.last_decoded_pixel_format.as_deref(), Some("Rgb24"));
+        assert_eq!(snapshot.decode_error_count, 0);
+        assert_eq!(snapshot.last_decode_error, None);
+    }
+
+    #[test]
+    fn decode_failure_updates_snapshot_diagnostics() {
+        let snapshot = Arc::new(Mutex::new(WebrtcHostSnapshot::default()));
+        let mut decoder = mrd_decode::create_decoder("h264_software").expect("decoder instance");
+
+        let error = decode_access_unit_into_snapshot(
+            SessionId("session-decode-error".into()),
+            "video-track-1".to_string(),
+            snapshot.clone(),
+            None,
+            ProbeRegistry::default().session_handle(
+                SessionId("session-decode-error".into()),
+                crate::frame_sink::DEFAULT_SOURCE_ID,
+            ),
+            decoder.as_mut(),
+            &[0, 1, 2, 3],
+        )
+        .expect_err("invalid access unit should fail");
+
+        let snapshot = snapshot.lock().expect("lock host snapshot").clone();
+        assert!(
+            error.contains("decoder"),
+            "decode error should mention decoder path: {error}"
+        );
+        assert_eq!(snapshot.decode_error_count, 1);
+        assert!(
+            snapshot
+                .last_decode_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("decoder"),
+            "snapshot should retain last decode error: {:?}",
+            snapshot.last_decode_error
+        );
     }
 
     #[test]
@@ -1074,6 +1141,26 @@ mod tests {
                 )
                 .await?;
 
+            self.finish_signaling().await
+        }
+
+        async fn start_with_encoder<E>(&mut self, encoder: E) -> Result<(), String>
+        where
+            E: VideoEncoder + Send + 'static,
+        {
+            self.agent
+                .start_test_video_sender(
+                    self.session_id.clone(),
+                    FakeCapture { tick: 0 },
+                    encoder,
+                    Duration::from_millis(33),
+                )
+                .await?;
+
+            self.finish_signaling().await
+        }
+
+        async fn finish_signaling(&mut self) -> Result<(), String> {
             let offer = self.agent.create_offer(self.session_id.clone()).await?;
             self.controller
                 .apply_remote_offer(self.session_id.clone(), offer.sdp)
@@ -1357,5 +1444,83 @@ mod tests {
         assert!(progress.end_frame_count > progress.start_frame_count);
         assert!(progress.observed_samples > 0);
         assert!(harness.agent_snapshot().sender_running);
+    }
+
+    #[tokio::test]
+    async fn nvenc_single_process_pipeline_delivers_remote_frames() {
+        ensure_rustls_crypto_provider();
+        let Ok(encoder) = NvencH264Encoder::new(16, 16, 30) else {
+            return;
+        };
+        let mut harness = HostedPairHarness::new("session-composed-nvenc");
+
+        harness
+            .start_with_encoder(encoder)
+            .await
+            .expect("start nvenc composed pipeline");
+        harness
+            .wait_for_first_frame(Duration::from_secs(8))
+            .await
+            .expect("remote decoded frame");
+
+        let controller_snapshot = harness.controller_snapshot();
+        let agent_probe = harness.agent_probe();
+        assert!(controller_snapshot.decoded_frame_count > 0);
+        assert!(controller_snapshot.remote_h264_access_unit_count > 0);
+        assert!(agent_probe
+            .stages
+            .iter()
+            .any(|(stage, stats)| *stage == StageId::EncodeTotal && stats.count > 0));
+    }
+
+    #[test]
+    fn nvenc_720p_access_unit_survives_rtp_ingress_and_software_decode() {
+        let Ok(mut encoder) = NvencH264Encoder::new(1280, 720, 30) else {
+            return;
+        };
+        let mut frame = vec![0_u8; 1280 * 720 * 4];
+        for (index, chunk) in frame.chunks_exact_mut(4).enumerate() {
+            let x = (index % 1280) as u8;
+            let y = ((index / 1280) % 256) as u8;
+            chunk[0] = x;
+            chunk[1] = y;
+            chunk[2] = x.wrapping_add(y);
+            chunk[3] = 255;
+        }
+
+        let access_unit = encoder
+            .encode(&CapturedFrame {
+                width: 1280,
+                height: 720,
+                pixel_format: FramePixelFormat::Bgra32,
+                timestamp_us: 33_000,
+                data: frame,
+            })
+            .expect("encode nvenc frame")
+            .into_iter()
+            .next()
+            .expect("single access unit");
+        let mut sender = mrd_transport_webrtc::H264RtpSender::new("video", "stream", 30, 1200);
+        let packets = sender
+            .packetize_access_unit(&access_unit)
+            .expect("packetize access unit");
+        let mut ingress = mrd_transport_webrtc::H264RtpIngress::default();
+        let reassembled = packets
+            .into_iter()
+            .filter_map(|packet| {
+                ingress.push_payload(&packet.payload, packet.header.marker, access_unit.timestamp_us)
+            })
+            .last()
+            .expect("reassembled access unit");
+        let mut decoder = mrd_decode::create_decoder("h264_software").expect("decoder instance");
+
+        decoder
+            .push_access_unit(&reassembled.bytes)
+            .expect("decode reassembled access unit");
+        let frames = decoder.drain_decoded_frames();
+        assert!(
+            !frames.is_empty(),
+            "reassembled access unit should decode into at least one frame"
+        );
     }
 }

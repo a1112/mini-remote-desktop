@@ -23,6 +23,12 @@ pub struct H264RtpSender {
     frame_samples: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum H264Profile {
+    Baseline,
+    High,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct H264AccessUnitAssembler {
     annex_b_buffer: Vec<u8>,
@@ -166,10 +172,24 @@ impl H264RtpSender {
         fps: u32,
         mtu: u16,
     ) -> Self {
+        Self::new_with_profile(track_id, stream_id, fps, mtu, H264Profile::Baseline)
+    }
+
+    pub fn new_with_profile(
+        track_id: impl Into<String>,
+        stream_id: impl Into<String>,
+        fps: u32,
+        mtu: u16,
+        profile: H264Profile,
+    ) -> Self {
+        let payload_type = match profile {
+            H264Profile::Baseline => 102,
+            H264Profile::High => 123,
+        };
         let payloader = Box::<rtp::codecs::h264::H264Payloader>::default();
         let packetizer = Box::new(new_packetizer(
             mtu.max(576) as usize,
-            102,
+            payload_type,
             0,
             payloader,
             Box::new(new_random_sequencer()),
@@ -177,7 +197,7 @@ impl H264RtpSender {
         ));
         Self {
             track: Arc::new(TrackLocalStaticRTP::new(
-                h264_codec_capability(),
+                h264_codec_capability(profile),
                 track_id.into(),
                 stream_id.into(),
             )),
@@ -225,13 +245,18 @@ impl H264RtpSender {
     }
 }
 
-pub fn h264_codec_capability() -> RTCRtpCodecCapability {
+pub fn h264_codec_capability(profile: H264Profile) -> RTCRtpCodecCapability {
+    let profile_level_id = match profile {
+        H264Profile::Baseline => "42e01f",
+        H264Profile::High => "640032",
+    };
     RTCRtpCodecCapability {
         mime_type: "video/H264".to_string(),
         clock_rate: 90_000,
         channels: 0,
-        sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
-            .to_string(),
+        sdp_fmtp_line: format!(
+            "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id={profile_level_id}"
+        ),
         rtcp_feedback: vec![],
     }
 }
@@ -256,7 +281,8 @@ fn annex_b_contains_keyframe(access_unit: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{annex_b_contains_keyframe, H264AccessUnitAssembler, H264RtpIngress};
-    use mrd_pipeline_core::VideoCodec;
+    use mrd_encode_nvenc::NvencH264Encoder;
+    use mrd_pipeline_core::{CapturedFrame, FramePixelFormat, VideoCodec, VideoEncoder};
 
     #[test]
     fn single_nal_emits_annex_b_access_unit_on_marker() {
@@ -321,5 +347,43 @@ mod tests {
     #[test]
     fn keyframe_detector_marks_idr_annex_b_payloads() {
         assert!(annex_b_contains_keyframe(&[0, 0, 0, 1, 0x65, 0xaa]));
+    }
+
+    #[test]
+    fn nvenc_access_unit_survives_rtp_packetize_and_ingress_reassembly() {
+        let Ok(mut encoder) = NvencH264Encoder::new(16, 16, 30) else {
+            return;
+        };
+        let frame = CapturedFrame {
+            width: 16,
+            height: 16,
+            pixel_format: FramePixelFormat::Bgra32,
+            timestamp_us: 33_000,
+            data: vec![0x55; 16 * 16 * 4],
+        };
+        let access_unit = encoder
+            .encode(&frame)
+            .expect("encode nvenc frame")
+            .into_iter()
+            .next()
+            .expect("single access unit");
+        let mut sender = super::H264RtpSender::new("video", "stream", 30, 1200);
+        let packets = sender
+            .packetize_access_unit(&access_unit)
+            .expect("packetize nvenc access unit");
+        let mut ingress = H264RtpIngress::default();
+        let mut reassembled = None;
+        for packet in packets {
+            reassembled = ingress.push_payload(
+                &packet.payload,
+                packet.header.marker,
+                access_unit.timestamp_us,
+            );
+        }
+
+        let reassembled = reassembled.expect("reassembled access unit");
+        assert_eq!(reassembled.codec, VideoCodec::H264);
+        assert!(annex_b_contains_keyframe(&reassembled.bytes));
+        assert!(!reassembled.bytes.is_empty());
     }
 }
