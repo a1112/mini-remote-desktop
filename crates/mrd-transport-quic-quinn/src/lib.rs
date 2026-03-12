@@ -61,8 +61,10 @@ pub struct QuinnDatagramPair {
 
 impl QuinnDatagramPair {
     pub async fn loopback() -> Result<Self, QuinnTransportError> {
-        let server_crypto = rcgen::generate_simple_self_signed(vec!["localhost".into()])
-            .map_err(|error| QuinnTransportError::Message(format!("generate cert failed: {error}")))?;
+        let server_crypto =
+            rcgen::generate_simple_self_signed(vec!["localhost".into()]).map_err(|error| {
+                QuinnTransportError::Message(format!("generate cert failed: {error}"))
+            })?;
         let server_cert = rustls::pki_types::CertificateDer::from(server_crypto.cert);
         let server_key =
             rustls::pki_types::PrivatePkcs8KeyDer::from(server_crypto.signing_key.serialize_der());
@@ -76,23 +78,26 @@ impl QuinnDatagramPair {
             server_config,
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
         )
-        .map_err(|error| QuinnTransportError::Message(format!("server endpoint failed: {error}")))?;
-        let server_addr = server_endpoint
-            .local_addr()
-            .map_err(|error| QuinnTransportError::Message(format!("server local_addr failed: {error}")))?;
+        .map_err(|error| {
+            QuinnTransportError::Message(format!("server endpoint failed: {error}"))
+        })?;
+        let server_addr = server_endpoint.local_addr().map_err(|error| {
+            QuinnTransportError::Message(format!("server local_addr failed: {error}"))
+        })?;
 
         let mut roots = RootCertStore::empty();
-        roots
-            .add(server_cert)
-            .map_err(|error| QuinnTransportError::Message(format!("add root cert failed: {error}")))?;
-        let client_config = ClientConfig::with_root_certificates(Arc::new(roots))
-            .map_err(|error| QuinnTransportError::Message(format!("client config failed: {error}")))?;
+        roots.add(server_cert).map_err(|error| {
+            QuinnTransportError::Message(format!("add root cert failed: {error}"))
+        })?;
+        let client_config =
+            ClientConfig::with_root_certificates(Arc::new(roots)).map_err(|error| {
+                QuinnTransportError::Message(format!("client config failed: {error}"))
+            })?;
 
         let mut client_endpoint =
-            Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
-                .map_err(|error| {
-                    QuinnTransportError::Message(format!("client endpoint failed: {error}"))
-                })?;
+            Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).map_err(
+                |error| QuinnTransportError::Message(format!("client endpoint failed: {error}")),
+            )?;
         client_endpoint.set_default_client_config(client_config);
 
         let client_connecting = client_endpoint
@@ -185,7 +190,9 @@ impl QuicAuFragment {
         let fragment_index = bytes.get_u16_le();
         let fragment_count = bytes.get_u16_le();
         if fragment_count == 0 {
-            return Err(QuinnTransportError::Message("fragment_count must be non-zero".into()));
+            return Err(QuinnTransportError::Message(
+                "fragment_count must be non-zero".into(),
+            ));
         }
         if fragment_index >= fragment_count {
             return Err(QuinnTransportError::Message(
@@ -216,10 +223,7 @@ pub fn fragment_access_unit(
         ));
     }
     let max_fragment_payload = max_datagram_size - QUIC_AU_FRAGMENT_HEADER_LEN;
-    let fragment_count = payload
-        .len()
-        .div_ceil(max_fragment_payload)
-        .max(1);
+    let fragment_count = payload.len().div_ceil(max_fragment_payload).max(1);
     if fragment_count > u16::MAX as usize {
         return Err(QuinnTransportError::Message(
             "fragment_count exceeds u16 range".into(),
@@ -355,7 +359,9 @@ impl QuicAuReassembler {
                 self.stats.duplicate_fragments = self.stats.duplicate_fragments.saturating_add(1);
                 return Ok(None);
             }
-            entry.fragments.insert(fragment.fragment_index, fragment.payload);
+            entry
+                .fragments
+                .insert(fragment.fragment_index, fragment.payload);
         }
         self.enforce_pending_limit();
 

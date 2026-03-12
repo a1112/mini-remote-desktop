@@ -11,15 +11,19 @@ mod imp {
     use nvenc::encoder::{Encoder, RegisteredResource};
     use nvenc::session::{InitParams, NeedsConfig, Session};
     use nvenc::sys::enums::{NVencBufferFormat, NVencPicStruct, NVencPicType, NVencTuningInfo};
-    use nvenc::sys::guids::{NV_ENC_CODEC_H264_GUID, NV_ENC_PRESET_P3_GUID};
+    use nvenc::sys::guids::{
+        NV_ENC_CODEC_H264_GUID, NV_ENC_H264_PROFILE_BASELINE_GUID, NV_ENC_H264_PROFILE_HIGH_GUID,
+        NV_ENC_PRESET_P3_GUID,
+    };
+    use nvenc::sys::structs::Guid;
     use windows::Win32::Foundation::HMODULE;
     use windows::Win32::Graphics::Direct3D::{
         D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0,
     };
     use windows::Win32::Graphics::Direct3D11::{
+        D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
         D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-        D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11CreateDevice,
-        ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+        D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
     };
     use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 
@@ -36,18 +40,33 @@ mod imp {
         frame_index: usize,
     }
 
+    unsafe impl Send for NvencH264Encoder {}
+
     impl NvencH264Encoder {
         pub fn new(width: usize, height: usize, fps: u32) -> Result<Self, PipelineError> {
+            Self::new_with_profile(width, height, fps, NV_ENC_H264_PROFILE_HIGH_GUID)
+        }
+
+        pub fn new_baseline(width: usize, height: usize, fps: u32) -> Result<Self, PipelineError> {
+            Self::new_with_profile(width, height, fps, NV_ENC_H264_PROFILE_BASELINE_GUID)
+        }
+
+        fn new_with_profile(
+            width: usize,
+            height: usize,
+            fps: u32,
+            profile_guid: Guid,
+        ) -> Result<Self, PipelineError> {
             let width = width.max(2);
             let height = height.max(2);
             let fps = fps.max(1);
-            let (device, context) = create_d3d11_device()
-                .map_err(|error| PipelineError::message(format!("create d3d11 device failed: {error}")))?;
+            let (device, context) = create_d3d11_device().map_err(|error| {
+                PipelineError::message(format!("create d3d11 device failed: {error}"))
+            })?;
 
-            let session: Session<NeedsConfig> =
-                Session::open_dx(&device).map_err(|error| {
-                    PipelineError::message(format!("nvenc open_dx failed: {error:?}"))
-                })?;
+            let session: Session<NeedsConfig> = Session::open_dx(&device).map_err(|error| {
+                PipelineError::message(format!("nvenc open_dx failed: {error:?}"))
+            })?;
             let (session, mut preset) = session
                 .get_encode_preset_config_ex(
                     NV_ENC_CODEC_H264_GUID,
@@ -57,6 +76,7 @@ mod imp {
                 .map_err(|error| {
                     PipelineError::message(format!("nvenc preset config failed: {error:?}"))
                 })?;
+            preset.preset_cfg.profile_guid = profile_guid;
             preset.preset_cfg.rc_params.average_bit_rate = 12_000_000;
             preset.preset_cfg.frame_interval_p = 1;
             preset.preset_cfg.gop_len = fps;
@@ -76,9 +96,10 @@ mod imp {
             let encoder = session.init_encoder(init).map_err(|error| {
                 PipelineError::message(format!("nvenc init encoder failed: {error:?}"))
             })?;
-            let texture = create_encode_texture(&device, width as u32, height as u32).map_err(
-                |error| PipelineError::message(format!("create nvenc texture failed: {error}")),
-            )?;
+            let texture =
+                create_encode_texture(&device, width as u32, height as u32).map_err(|error| {
+                    PipelineError::message(format!("create nvenc texture failed: {error}"))
+                })?;
             let registered = encoder
                 .register_resource_dx11(&texture, NVencBufferFormat::ARGB, 0)
                 .map_err(|error| {
@@ -349,20 +370,29 @@ pub struct NvencH264Encoder;
 #[cfg(not(windows))]
 impl NvencH264Encoder {
     pub fn new(_width: usize, _height: usize, _fps: u32) -> Result<Self, PipelineError> {
-        Err(PipelineError::message("nvenc encoder only supports Windows"))
+        Err(PipelineError::message(
+            "nvenc encoder only supports Windows",
+        ))
+    }
+
+    pub fn new_baseline(_width: usize, _height: usize, _fps: u32) -> Result<Self, PipelineError> {
+        Err(PipelineError::message(
+            "nvenc encoder only supports Windows",
+        ))
     }
 
     pub fn probe_h264_available() -> Result<(), PipelineError> {
-        Err(PipelineError::message("nvenc encoder only supports Windows"))
+        Err(PipelineError::message(
+            "nvenc encoder only supports Windows",
+        ))
     }
 }
 
 #[cfg(not(windows))]
 impl VideoEncoder for NvencH264Encoder {
-    fn encode(
-        &mut self,
-        _frame: &CapturedFrame,
-    ) -> Result<Vec<EncodedAccessUnit>, PipelineError> {
-        Err(PipelineError::message("nvenc encoder only supports Windows"))
+    fn encode(&mut self, _frame: &CapturedFrame) -> Result<Vec<EncodedAccessUnit>, PipelineError> {
+        Err(PipelineError::message(
+            "nvenc encoder only supports Windows",
+        ))
     }
 }

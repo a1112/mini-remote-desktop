@@ -3,6 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use mrd_decode_nvdec::{probe_runtime as probe_nvdec_runtime, NvdecCapabilityProbe};
 use mrd_observability::{PipelineProbeSnapshot, StageId};
 use serde::{Deserialize, Serialize};
 
@@ -60,12 +61,41 @@ pub struct BenchmarkSummary {
     pub frame_sink_ingest_p95_ms: Option<f64>,
     pub render_upload_p95_ms: Option<f64>,
     pub render_present_p95_ms: Option<f64>,
+    pub nvdec_runtime_summary: String,
+    pub nvdec_h264_capability: String,
+    pub nvdec_hevc_capability: String,
+    pub nvdec_hevc_main10_capability: String,
     pub run_passed: bool,
 }
 
 impl BenchmarkSummary {
+    fn nvdec_capability_summary() -> (String, String, String, String) {
+        let runtime = probe_nvdec_runtime();
+        let capability_text = |codec: &str, bit_depth_minus8: u8| {
+            runtime
+                .capability_probes
+                .iter()
+                .find(|probe| probe.codec == codec && probe.bit_depth_minus8 == bit_depth_minus8)
+                .map(render_nvdec_capability)
+                .unwrap_or_else(|| {
+                    format!(
+                        "{codec} {}-bit capability probe unavailable",
+                        bit_depth_minus8 + 8
+                    )
+                })
+        };
+
+        (
+            runtime.summary,
+            capability_text("h264", 0),
+            capability_text("hevc", 0),
+            capability_text("hevc", 2),
+        )
+    }
+
     fn counter(probe: &PipelineProbeSnapshot, name: &str) -> Option<u64> {
-        probe.counters
+        probe
+            .counters
             .iter()
             .find(|(candidate, _)| candidate == name)
             .map(|(_, value)| *value)
@@ -78,6 +108,12 @@ impl BenchmarkSummary {
         first_frame_seen: bool,
         first_frame_time_ms: f64,
     ) -> Self {
+        let (
+            nvdec_runtime_summary,
+            nvdec_h264_capability,
+            nvdec_hevc_capability,
+            nvdec_hevc_main10_capability,
+        ) = Self::nvdec_capability_summary();
         let stage_p95 = |stage: StageId| {
             probe
                 .stages
@@ -131,10 +167,7 @@ impl BenchmarkSummary {
                 "quic_receiver_rejected_fragments",
             ),
             quic_receiver_pending_frames: Self::counter(probe, "quic_receiver_pending_frames"),
-            quic_receiver_reassembly_drops: Self::counter(
-                probe,
-                "quic_receiver_reassembly_drops",
-            ),
+            quic_receiver_reassembly_drops: Self::counter(probe, "quic_receiver_reassembly_drops"),
             zero_write_access_unit_count: 0,
             warning_count: 0,
             error_count: 0,
@@ -145,6 +178,10 @@ impl BenchmarkSummary {
             frame_sink_ingest_p95_ms: stage_p95(StageId::FrameSinkIngest),
             render_upload_p95_ms: stage_p95(StageId::RenderUpload),
             render_present_p95_ms: stage_p95(StageId::RenderPresent),
+            nvdec_runtime_summary,
+            nvdec_h264_capability,
+            nvdec_hevc_capability,
+            nvdec_hevc_main10_capability,
             run_passed: session_established && first_frame_seen && probe_complete,
         }
     }
@@ -158,6 +195,12 @@ impl BenchmarkSummary {
         first_frame_time_ms: f64,
         zero_write_access_unit_count: u64,
     ) -> Self {
+        let (
+            nvdec_runtime_summary,
+            nvdec_h264_capability,
+            nvdec_hevc_capability,
+            nvdec_hevc_main10_capability,
+        ) = Self::nvdec_capability_summary();
         let find_stage = |probe: &PipelineProbeSnapshot, stage: StageId| {
             probe
                 .stages
@@ -193,7 +236,9 @@ impl BenchmarkSummary {
             fps_observed: receiver_probe.fps,
             bitrate_kbps: sender_probe.bitrate_kbps,
             keyframes: sender_probe.keyframes.max(receiver_probe.keyframes),
-            dropped_frames: sender_probe.dropped_frames.max(receiver_probe.dropped_frames),
+            dropped_frames: sender_probe
+                .dropped_frames
+                .max(receiver_probe.dropped_frames),
             quic_receiver_completed_frames: Self::counter(
                 receiver_probe,
                 "quic_receiver_completed_frames",
@@ -232,6 +277,10 @@ impl BenchmarkSummary {
             frame_sink_ingest_p95_ms: find_stage(receiver_probe, StageId::FrameSinkIngest),
             render_upload_p95_ms: find_stage(receiver_probe, StageId::RenderUpload),
             render_present_p95_ms: find_stage(receiver_probe, StageId::RenderPresent),
+            nvdec_runtime_summary,
+            nvdec_h264_capability,
+            nvdec_hevc_capability,
+            nvdec_hevc_main10_capability,
             run_passed: session_established && first_frame_seen && probe_complete,
         }
     }
@@ -274,6 +323,10 @@ impl BenchmarkSummary {
             "frame_sink_ingest_p95_ms",
             "render_upload_p95_ms",
             "render_present_p95_ms",
+            "nvdec_runtime_summary",
+            "nvdec_h264_capability",
+            "nvdec_hevc_capability",
+            "nvdec_hevc_main10_capability",
             "run_passed",
         ]
     }
@@ -316,9 +369,20 @@ impl BenchmarkSummary {
             option_f64(self.frame_sink_ingest_p95_ms),
             option_f64(self.render_upload_p95_ms),
             option_f64(self.render_present_p95_ms),
+            self.nvdec_runtime_summary.clone(),
+            self.nvdec_h264_capability.clone(),
+            self.nvdec_hevc_capability.clone(),
+            self.nvdec_hevc_main10_capability.clone(),
             self.run_passed.to_string(),
         ]
     }
+}
+
+fn render_nvdec_capability(probe: &NvdecCapabilityProbe) -> String {
+    format!(
+        "runtime_supported={} ({}) ; wired_supported={} ({})",
+        probe.runtime_supported, probe.runtime_reason, probe.wired_supported, probe.wired_reason
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -338,12 +402,7 @@ pub struct BenchmarkPaths {
 }
 
 impl BenchmarkPaths {
-    pub fn new(
-        repo_root: &Path,
-        date: String,
-        profile: String,
-        run_id: String,
-    ) -> Self {
+    pub fn new(repo_root: &Path, date: String, profile: String, run_id: String) -> Self {
         let run_dir = repo_root
             .join("artifacts")
             .join("benchmarks")
@@ -374,7 +433,12 @@ impl BenchmarkPaths {
     }
 
     pub fn ensure_dirs(&self) -> Result<(), String> {
-        for dir in [&self.run_dir, &self.logs_dir, &self.sessions_dir, &self.reports_dir] {
+        for dir in [
+            &self.run_dir,
+            &self.logs_dir,
+            &self.sessions_dir,
+            &self.reports_dir,
+        ] {
             fs::create_dir_all(dir)
                 .map_err(|error| format!("create benchmark artifact dir failed: {error}"))?;
         }
@@ -415,8 +479,11 @@ pub fn write_benchmark_artifacts(
             .map_err(|error| format!("serialize benchmark probe failed: {error}"))?,
     )
     .map_err(|error| format!("write benchmark probe failed: {error}"))?;
-    fs::write(&paths.report_md, render_markdown_report(manifest, summary, session_id))
-        .map_err(|error| format!("write benchmark markdown report failed: {error}"))?;
+    fs::write(
+        &paths.report_md,
+        render_markdown_report(manifest, summary, session_id),
+    )
+    .map_err(|error| format!("write benchmark markdown report failed: {error}"))?;
     Ok(())
 }
 
@@ -469,6 +536,11 @@ Duration: `{duration}s`\n\n\
 | quic_receiver_reassembly_drops | {quic_drops} |\n\
 | warning_count | {warning_count} |\n\
 | error_count | {error_count} |\n\
+\n## NVDEC Capability\n\n\
+- nvdec_runtime_summary: `{nvdec_runtime_summary}`\n\
+- nvdec_h264: `{nvdec_h264_capability}`\n\
+- nvdec_hevc: `{nvdec_hevc_capability}`\n\
+- nvdec_hevc_main10: `{nvdec_hevc_main10_capability}`\n\
 \n## Paths\n\n\
 - Probe: `sessions/{session_id}.probe.json`\n\
 - Summary: `summary.json`\n\
@@ -506,6 +578,10 @@ Duration: `{duration}s`\n\n\
         quic_drops = option_u64(summary.quic_receiver_reassembly_drops),
         warning_count = summary.warning_count,
         error_count = summary.error_count,
+        nvdec_runtime_summary = summary.nvdec_runtime_summary,
+        nvdec_h264_capability = summary.nvdec_h264_capability,
+        nvdec_hevc_capability = summary.nvdec_hevc_capability,
+        nvdec_hevc_main10_capability = summary.nvdec_hevc_main10_capability,
         session_id = session_id,
     )
 }
@@ -582,6 +658,10 @@ mod tests {
         assert_eq!(summary.frame_sink_ingest_p95_ms, Some(1.5));
         assert_eq!(summary.render_upload_p95_ms, None);
         assert_eq!(summary.quic_receiver_completed_frames, None);
+        assert!(!summary.nvdec_runtime_summary.is_empty());
+        assert!(!summary.nvdec_h264_capability.is_empty());
+        assert!(!summary.nvdec_hevc_capability.is_empty());
+        assert!(!summary.nvdec_hevc_main10_capability.is_empty());
     }
 
     #[test]
@@ -599,7 +679,9 @@ mod tests {
         assert!(paths.summary_csv.ends_with(r"summary.csv"));
         assert!(paths.report_md.ends_with(r"reports\markdown-report.md"));
         assert!(paths.host_stdout.ends_with(r"logs\host.stdout.log"));
-        assert!(paths.probe_json("session-bench").ends_with(r"sessions\session-bench.probe.json"));
+        assert!(paths
+            .probe_json("session-bench")
+            .ends_with(r"sessions\session-bench.probe.json"));
     }
 
     #[test]
@@ -641,6 +723,10 @@ mod tests {
             frame_sink_ingest_p95_ms: None,
             render_upload_p95_ms: None,
             render_present_p95_ms: None,
+            nvdec_runtime_summary: "nvdec runtime libraries and core exports are present".into(),
+            nvdec_h264_capability: "runtime=true wired=true".into(),
+            nvdec_hevc_capability: "runtime=true wired=false".into(),
+            nvdec_hevc_main10_capability: "runtime=false wired=false".into(),
             run_passed: false,
         };
 
@@ -653,14 +739,13 @@ mod tests {
         assert_eq!(row[1], "quick.transport");
         assert_eq!(row[2], "webrtc");
         assert!(header.contains(&"quic_receiver_completed_frames"));
+        assert!(header.contains(&"nvdec_hevc_main10_capability"));
     }
 
     #[test]
     fn writing_benchmark_artifacts_creates_expected_files() {
-        let temp_root = std::env::temp_dir().join(format!(
-            "mrd-bench-artifacts-{}",
-            std::process::id()
-        ));
+        let temp_root =
+            std::env::temp_dir().join(format!("mrd-bench-artifacts-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp_root);
         let paths = BenchmarkPaths::new(
             &temp_root,
@@ -708,6 +793,8 @@ mod tests {
         assert!(paths.summary_csv.exists());
         assert!(paths.report_md.exists());
         assert!(paths.probe_json("session-bench").exists());
+        let report = std::fs::read_to_string(&paths.report_md).expect("read benchmark report");
+        assert!(report.contains("nvdec_hevc_main10"));
 
         let _ = std::fs::remove_dir_all(&temp_root);
     }

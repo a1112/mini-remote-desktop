@@ -1,0 +1,17 @@
+[package]
+name = "mrd-decode-nvdec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_System_LibraryLoader",
+] }
+
+[features]
+default = []
+
+[dev-dependencies]
+openh264 = "0.8"

@@ -28,11 +28,7 @@ impl WebrtcSessionCoordinator {
         Ok(SessionDescription { session_id, sdp })
     }
 
-    pub fn apply_remote_offer(
-        &mut self,
-        session_id: SessionId,
-        sdp: String,
-    ) -> Result<(), String> {
+    pub fn apply_remote_offer(&mut self, session_id: SessionId, sdp: String) -> Result<(), String> {
         let snapshot = self.sessions.entry(session_id).or_default();
         snapshot.remote_offer = Some(sdp);
         Ok(())

@@ -14,16 +14,18 @@ pub struct DxgiDesktopCapture {
 
 impl DxgiDesktopCapture {
     pub fn new_primary() -> Result<Self, PipelineError> {
-        let display = Display::primary()
-            .map_err(|error| PipelineError::message(format!("open primary display failed: {error}")))?;
+        let display = Display::primary().map_err(|error| {
+            PipelineError::message(format!("open primary display failed: {error}"))
+        })?;
         Self::new(display)
     }
 
     pub fn new(display: Display) -> Result<Self, PipelineError> {
         let width = display.width();
         let height = display.height();
-        let capturer = Capturer::new(display)
-            .map_err(|error| PipelineError::message(format!("create dxgi capturer failed: {error}")))?;
+        let capturer = Capturer::new(display).map_err(|error| {
+            PipelineError::message(format!("create dxgi capturer failed: {error}"))
+        })?;
 
         Ok(Self {
             capturer,
@@ -49,7 +51,9 @@ impl FrameCapture for DxgiDesktopCapture {
                     let packed = repack_bgra(frame.as_ref(), self.width, self.height)?;
                     let timestamp_us = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
-                        .map_err(|error| PipelineError::message(format!("system time failed: {error}")))?
+                        .map_err(|error| {
+                            PipelineError::message(format!("system time failed: {error}"))
+                        })?
                         .as_micros() as u64;
 
                     return Ok(CapturedFrame {
@@ -64,7 +68,9 @@ impl FrameCapture for DxgiDesktopCapture {
                     thread::sleep(Duration::from_millis(5));
                 }
                 Err(error) => {
-                    return Err(PipelineError::message(format!("capture frame failed: {error}")));
+                    return Err(PipelineError::message(format!(
+                        "capture frame failed: {error}"
+                    )));
                 }
             }
         }
@@ -99,12 +105,14 @@ mod tests {
     #[test]
     fn repack_bgra_strips_padding_stride() {
         let frame = vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0,
-            9, 10, 11, 12, 13, 14, 15, 16, 0, 0, 0, 0,
+            1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 9, 10, 11, 12, 13, 14, 15, 16, 0, 0, 0, 0,
         ];
 
         let packed = repack_bgra(&frame, 2, 2).expect("packed frame");
 
-        assert_eq!(packed, vec![1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]);
+        assert_eq!(
+            packed,
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        );
     }
 }

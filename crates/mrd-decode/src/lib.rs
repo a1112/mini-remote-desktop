@@ -1,9 +1,5 @@
 pub use mrd_pipeline_core::RuntimeStatus;
-use openh264::{
-    decoder::Decoder as OpenH264Decoder,
-    formats::YUVSource,
-    Error as OpenH264Error,
-};
+use openh264::{decoder::Decoder as OpenH264Decoder, formats::YUVSource, Error as OpenH264Error};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodecKind {
@@ -50,6 +46,10 @@ impl DecoderError {
             message: message.into(),
         }
     }
+
+    pub fn from_message(message: impl Into<String>) -> Self {
+        Self::new(message)
+    }
 }
 
 impl std::fmt::Display for DecoderError {
@@ -78,14 +78,21 @@ const H264_SOFTWARE_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
     runtime_status: RuntimeStatus::RuntimeBacked,
     output_formats: RGB24_OUTPUTS,
 };
+const NVDEC_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
+    id: "nvdec",
+    codec: CodecKind::H264,
+    runtime_status: RuntimeStatus::RuntimeBacked,
+    output_formats: RGB24_OUTPUTS,
+};
 
 pub fn available_decoder_descriptors() -> Vec<DecoderDescriptor> {
-    vec![H264_SOFTWARE_DESCRIPTOR.clone()]
+    vec![H264_SOFTWARE_DESCRIPTOR.clone(), NVDEC_DESCRIPTOR.clone()]
 }
 
 pub fn create_decoder(id: &str) -> Result<Box<dyn VideoDecoder>, DecoderError> {
     match id {
         "h264_software" => Ok(Box::new(H264SoftwareDecoder::new()?)),
+        "nvdec" => Ok(Box::new(NvdecVideoDecoder::new()?)),
         other => Err(DecoderError::new(format!("未知 decoder backend: {other}"))),
     }
 }
@@ -93,6 +100,17 @@ pub fn create_decoder(id: &str) -> Result<Box<dyn VideoDecoder>, DecoderError> {
 pub struct H264SoftwareDecoder {
     decoder: OpenH264Decoder,
     pending_frames: Vec<DecodedFrame>,
+}
+
+pub struct NvdecVideoDecoder {
+    decoder: mrd_decode_nvdec::NvdecDecoder,
+}
+
+impl NvdecVideoDecoder {
+    pub fn new() -> Result<Self, DecoderError> {
+        let decoder = mrd_decode_nvdec::NvdecDecoder::new().map_err(DecoderError::from_message)?;
+        Ok(Self { decoder })
+    }
 }
 
 impl H264SoftwareDecoder {
@@ -125,5 +143,26 @@ impl VideoDecoder for H264SoftwareDecoder {
 
     fn drain_decoded_frames(&mut self) -> Vec<DecodedFrame> {
         std::mem::take(&mut self.pending_frames)
+    }
+}
+
+impl VideoDecoder for NvdecVideoDecoder {
+    fn push_access_unit(&mut self, access_unit: &[u8]) -> Result<(), DecoderError> {
+        self.decoder
+            .push_access_unit(access_unit)
+            .map_err(DecoderError::from_message)
+    }
+
+    fn drain_decoded_frames(&mut self) -> Vec<DecodedFrame> {
+        self.decoder
+            .drain_decoded_frames()
+            .into_iter()
+            .map(|frame| DecodedFrame {
+                width: frame.width,
+                height: frame.height,
+                pixel_format: PixelFormat::Rgb24,
+                data: frame.data,
+            })
+            .collect()
     }
 }

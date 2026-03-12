@@ -95,11 +95,21 @@ struct ServerConfig {
     connection_timeout_secs: u64,
 }
 
-fn default_udp_port() -> u16 { DEFAULT_UDP_PORT }
-fn default_ws_port() -> u16 { DEFAULT_WEBSOCKET_PORT }
-fn default_host() -> String { "0.0.0.0".to_string() }
-fn default_heartbeat_interval() -> u64 { HEARTBEAT_INTERVAL_SECS }
-fn default_timeout() -> u64 { CONNECTION_TIMEOUT_SECS }
+fn default_udp_port() -> u16 {
+    DEFAULT_UDP_PORT
+}
+fn default_ws_port() -> u16 {
+    DEFAULT_WEBSOCKET_PORT
+}
+fn default_host() -> String {
+    "0.0.0.0".to_string()
+}
+fn default_heartbeat_interval() -> u64 {
+    HEARTBEAT_INTERVAL_SECS
+}
+fn default_timeout() -> u64 {
+    CONNECTION_TIMEOUT_SECS
+}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -189,11 +199,7 @@ async fn main() -> Result<()> {
 }
 
 /// 处理心跳消息
-async fn handle_heartbeat(
-    data: &[u8],
-    addr: SocketAddr,
-    state: SharedState,
-) -> Result<()> {
+async fn handle_heartbeat(data: &[u8], addr: SocketAddr, state: SharedState) -> Result<()> {
     // 解析 JSON 消息
     let msg: HeartbeatMessage = serde_json::from_slice(data)?;
 
@@ -273,8 +279,16 @@ async fn print_statistics(state: SharedState) {
         let (total, agents, controllers) = {
             let s = state.read().await;
             let total = s.devices.len();
-            let agents = s.devices.values().filter(|d| d.device_type == "agent").count();
-            let controllers = s.devices.values().filter(|d| d.device_type == "controller").count();
+            let agents = s
+                .devices
+                .values()
+                .filter(|d| d.device_type == "agent")
+                .count();
+            let controllers = s
+                .devices
+                .values()
+                .filter(|d| d.device_type == "controller")
+                .count();
             (total, agents, controllers)
         };
 

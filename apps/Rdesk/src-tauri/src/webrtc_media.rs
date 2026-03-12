@@ -34,14 +34,7 @@ mod tests {
         let mut assembler = H264AccessUnitAssembler::default();
 
         assert_eq!(
-            assembler.push_rtp_payload(
-                &[
-                    24,
-                    0, 2, 0x67, 0x42,
-                    0, 2, 0x68, 0xce,
-                ],
-                false
-            ),
+            assembler.push_rtp_payload(&[24, 0, 2, 0x67, 0x42, 0, 2, 0x68, 0xce,], false),
             None
         );
         assert_eq!(
@@ -51,9 +44,8 @@ mod tests {
         assert_eq!(
             assembler.push_rtp_payload(&[0x7c, 0x45, 0xcc, 0xdd], true),
             Some(vec![
-                0, 0, 0, 1, 0x67, 0x42,
-                0, 0, 0, 1, 0x68, 0xce,
-                0, 0, 0, 1, 0x65, 0xaa, 0xbb, 0xcc, 0xdd,
+                0, 0, 0, 1, 0x67, 0x42, 0, 0, 0, 1, 0x68, 0xce, 0, 0, 0, 1, 0x65, 0xaa, 0xbb, 0xcc,
+                0xdd,
             ])
         );
     }

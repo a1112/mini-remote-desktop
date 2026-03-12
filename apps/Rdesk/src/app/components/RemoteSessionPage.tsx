@@ -20,6 +20,18 @@ import {
   Signal,
 } from "lucide-react";
 import { useTheme } from "./ThemeContext";
+import {
+  getDecodePolicy,
+  getNvdecRuntimeProbe,
+  setDecodePolicy,
+  type DecodePolicyResponse,
+  type DecoderPolicy,
+  type NvdecRuntimeProbe,
+} from "../services/realtimeService";
+import {
+  getWebrtcHostSnapshot,
+  type WebrtcHostSnapshot,
+} from "../services/realtimeSessionService";
 import { withTauriWindow } from "../utils/tauriWindow";
 import { isTauriRuntime } from "../utils/runtime";
 import {
@@ -67,6 +79,9 @@ export function RemoteSessionPage() {
   const [selectedSessionSurfaceId, setSelectedSessionSurfaceId] = useState<string | null>(null);
   const [newSurfaceName, setNewSurfaceName] = useState("");
   const [selectedSourceId, setSelectedSourceId] = useState<string | null>(null);
+  const [nvdecProbe, setNvdecProbe] = useState<NvdecRuntimeProbe | null>(null);
+  const [decodePolicy, setDecodePolicyState] = useState<DecodePolicyResponse | null>(null);
+  const [webrtcHostSnapshot, setWebrtcHostSnapshot] = useState<WebrtcHostSnapshot | null>(null);
 
   const noDragSelector =
     'button, a, input, select, textarea, [role="button"], [role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"], [data-radix-collection-item], [data-no-drag="true"]';
@@ -120,6 +135,28 @@ export function RemoteSessionPage() {
 
     let active = true;
 
+    const refreshHostSnapshot = async () => {
+      const snapshot = await getWebrtcHostSnapshot(id);
+      if (active) setWebrtcHostSnapshot(snapshot);
+    };
+
+    void refreshHostSnapshot().catch(() => {});
+
+    const timer = window.setInterval(() => {
+      void refreshHostSnapshot().catch(() => {});
+    }, 1000);
+
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [id]);
+
+  useEffect(() => {
+    if (!id || !isTauriRuntime()) return;
+
+    let active = true;
+
     const refreshSurfaces = async () => {
       const [surfaces, currentSurface] = await Promise.all([
         listRenderSurfaces(id),
@@ -163,6 +200,39 @@ export function RemoteSessionPage() {
       active = false;
     };
   }, []);
+
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+
+    let active = true;
+
+    const refreshNvdecProbe = async () => {
+      const [probe, policy] = await Promise.all([
+        getNvdecRuntimeProbe(),
+        getDecodePolicy(),
+      ]);
+      if (!active) return;
+      setNvdecProbe(probe);
+      setDecodePolicyState(policy);
+    };
+
+    void refreshNvdecProbe().catch(() => {});
+
+    const timer = window.setInterval(() => {
+      void refreshNvdecProbe().catch(() => {});
+    }, 5000);
+
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  const handleUpdateDecodePolicy = async (nextPolicy: DecoderPolicy) => {
+    if (!isTauriRuntime()) return;
+    const next = await setDecodePolicy(nextPolicy);
+    setDecodePolicyState(next);
+  };
 
   useEffect(() => {
     if (!id || !isTauriRuntime()) return;
@@ -594,6 +664,132 @@ export function RemoteSessionPage() {
                       当前还没有显式 source 绑定
                     </div>
                   )}
+                </div>
+              </div>
+              <div className="rounded-md bg-white/6 px-2 py-2">
+                <div className="mb-2 flex items-center justify-between gap-2">
+                  <span className="text-gray-400" style={{ fontSize: 10 }}>
+                    NVDEC Capability
+                  </span>
+                  <span className="text-gray-500" style={{ fontSize: 10 }}>
+                    {nvdecProbe?.backend ?? "windows-nvdec"}
+                  </span>
+                </div>
+                <div
+                  className="rounded-md bg-black/20 px-2 py-1.5 text-gray-300"
+                  style={{ fontSize: 10 }}
+                >
+                  {nvdecProbe?.summary ?? "未读取 NVDEC 状态"}
+                </div>
+                <div className="mt-2 flex items-center justify-between gap-2 rounded-md bg-white/6 px-2 py-1.5">
+                  <div>
+                    <div className="text-gray-400" style={{ fontSize: 10 }}>
+                      Policy
+                    </div>
+                    <div className="mt-1 text-gray-200" style={{ fontSize: 10 }}>
+                      {decodePolicy?.decode_policy ?? "auto"}
+                    </div>
+                  </div>
+                  <select
+                    value={decodePolicy?.decode_policy ?? "auto"}
+                    onChange={(event) =>
+                      void handleUpdateDecodePolicy(event.target.value as DecoderPolicy)
+                    }
+                    className="rounded-md border border-white/10 bg-black/20 px-2 py-1 text-gray-200 outline-none"
+                    style={{ fontSize: 10 }}
+                  >
+                    <option value="auto">auto</option>
+                    <option value="software">software</option>
+                    <option value="nvdec">nvdec</option>
+                  </select>
+                </div>
+                <div className="mt-2 grid grid-cols-2 gap-2">
+                  <div
+                    className="rounded-md bg-white/6 px-2 py-1.5 text-gray-300"
+                    style={{ fontSize: 10 }}
+                  >
+                    <div className="text-gray-500">Preferred</div>
+                    <div className="mt-1">
+                      {webrtcHostSnapshot?.preferredDecodeBackend ?? "未选择"}
+                    </div>
+                  </div>
+                  <div
+                    className="rounded-md bg-white/6 px-2 py-1.5 text-gray-300"
+                    style={{ fontSize: 10 }}
+                  >
+                    <div className="text-gray-500">Active</div>
+                    <div className="mt-1">
+                      {webrtcHostSnapshot?.activeDecodeBackend ?? "未激活"}
+                    </div>
+                  </div>
+                </div>
+                <div
+                  className="mt-2 rounded-md bg-white/6 px-2 py-1.5 text-gray-400"
+                  style={{ fontSize: 10 }}
+                >
+                  {webrtcHostSnapshot?.decodeBackendReason ?? "当前会话还没有 decoder 选择信息"}
+                </div>
+                <div className="mt-2 grid grid-cols-2 gap-2">
+                  <div
+                    className="rounded-md bg-white/6 px-2 py-1.5 text-gray-300"
+                    style={{ fontSize: 10 }}
+                  >
+                    <div className="text-gray-500">Fallbacks</div>
+                    <div className="mt-1">
+                      {webrtcHostSnapshot?.decodeFallbackCount ?? 0}
+                    </div>
+                  </div>
+                  <div
+                    className="rounded-md bg-white/6 px-2 py-1.5 text-gray-300"
+                    style={{ fontSize: 10 }}
+                  >
+                    <div className="text-gray-500">Policy</div>
+                    <div className="mt-1">
+                      {webrtcHostSnapshot?.decodePolicy ?? decodePolicy?.decode_policy ?? "auto"}
+                    </div>
+                  </div>
+                </div>
+                <div
+                  className="mt-2 rounded-md bg-white/6 px-2 py-1.5 text-gray-400"
+                  style={{ fontSize: 10 }}
+                >
+                  {webrtcHostSnapshot?.lastDecodeFallbackReason ?? "当前会话没有 fallback 记录"}
+                </div>
+                <div className="mt-2 space-y-1">
+                  {[
+                    { label: "H264", codec: "h264", bitDepthMinus8: 0 },
+                    { label: "HEVC", codec: "hevc", bitDepthMinus8: 0 },
+                    { label: "Main10", codec: "hevc", bitDepthMinus8: 2 },
+                  ].map((item) => {
+                    const capability = nvdecProbe?.capability_probes.find(
+                      (probe) =>
+                        probe.codec === item.codec &&
+                        probe.bit_depth_minus8 === item.bitDepthMinus8,
+                    );
+                    return (
+                      <div
+                        key={`${item.codec}-${item.bitDepthMinus8}`}
+                        className="rounded-md bg-white/6 px-2 py-1.5 text-gray-300"
+                        style={{ fontSize: 10 }}
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span>{item.label}</span>
+                          <span
+                            className={
+                              capability?.runtime_supported
+                                ? "text-green-300"
+                                : "text-amber-300"
+                            }
+                          >
+                            {capability?.runtime_supported ? "runtime" : "no-runtime"}
+                          </span>
+                        </div>
+                        <div className="mt-1 text-gray-500">
+                          {capability?.wired_supported ? "已接线" : capability?.wired_reason ?? "未读取"}
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
               {renderWindows.length > 0 ? (

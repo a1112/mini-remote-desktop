@@ -156,9 +156,15 @@ mod tests {
 
         let snapshot = coordinator.snapshot(&session_id);
 
-        assert_eq!(snapshot.current_surface_id, Some(surface.surface_id.clone()));
+        assert_eq!(
+            snapshot.current_surface_id,
+            Some(surface.surface_id.clone())
+        );
         assert_eq!(snapshot.available_source_ids.len(), 2);
         assert_eq!(snapshot.surface_source_bindings.len(), 1);
-        assert_eq!(snapshot.surface_source_bindings[0].source_id, "video-track-2");
+        assert_eq!(
+            snapshot.surface_source_bindings[0].source_id,
+            "video-track-2"
+        );
     }
 }

@@ -9,6 +9,7 @@ $cases = @(
   "tests/component-matrix/cases/encode.openh264.json",
   "tests/component-matrix/cases/encode.nvenc.json",
   "tests/component-matrix/cases/decode.h264_software.json",
+  "tests/component-matrix/cases/decode.nvenc_720p.json",
   "tests/component-matrix/cases/transport_sender.webrtc_rtp.json",
   "tests/component-matrix/cases/transport_sender.quic_quinn.json",
   "tests/component-matrix/cases/transport_receiver.h264_assemble.json",

@@ -69,7 +69,8 @@ fn perf_webrtc_transport_receiver_reports_latency_distribution() {
     if let Ok(result_path) = std::env::var("MRD_COMPONENT_RESULT_PATH") {
         fs::write(
             Path::new(&result_path),
-            serde_json::to_string_pretty(&result).expect("serialize transport receiver perf result"),
+            serde_json::to_string_pretty(&result)
+                .expect("serialize transport receiver perf result"),
         )
         .expect("write transport receiver perf result");
     }

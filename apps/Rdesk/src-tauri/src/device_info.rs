@@ -81,8 +81,8 @@ fn get_motherboard_serial() -> String {
         use winreg::enums::*;
         use winreg::RegKey;
 
-        if let Ok(key) = RegKey::predef(HKEY_LOCAL_MACHINE)
-            .open_subkey(r"SOFTWARE\Microsoft\Cryptography")
+        if let Ok(key) =
+            RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey(r"SOFTWARE\Microsoft\Cryptography")
         {
             if let Ok(guid) = key.get_value::<String, _>("MachineGuid") {
                 // MachineGuid 格式: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
@@ -141,7 +141,10 @@ fn get_os_version() -> String {
             if display_version.is_empty() {
                 format!("{} Build {}", product_name, build_number)
             } else {
-                format!("{} {} Build {}", product_name, display_version, build_number)
+                format!(
+                    "{} {} Build {}",
+                    product_name, display_version, build_number
+                )
             }
         } else {
             "Windows".to_string()
@@ -308,7 +311,11 @@ fn parse_gpu_info(text: &str) -> Vec<GpuInfo> {
         }
 
         // 简单的厂商检测
-        let vendor = if name.contains("NVIDIA") || name.contains("GeForce") || name.contains("Quadro") || name.contains("RTX") {
+        let vendor = if name.contains("NVIDIA")
+            || name.contains("GeForce")
+            || name.contains("Quadro")
+            || name.contains("RTX")
+        {
             "NVIDIA".to_string()
         } else if name.contains("AMD") || name.contains("Radeon") || name.contains("AMD Radeon") {
             "AMD".to_string()
@@ -348,7 +355,10 @@ mod tests {
     #[test]
     fn test_get_hardware_info() {
         let info = get_hardware_info();
-        assert!(!info.motherboard_serial.is_empty(), "Motherboard serial should not be empty");
+        assert!(
+            !info.motherboard_serial.is_empty(),
+            "Motherboard serial should not be empty"
+        );
         assert!(!info.hostname.is_empty(), "Hostname should not be empty");
         assert!(!info.os_type.is_empty(), "OS type should not be empty");
         println!("Hardware Info: {}", info);

@@ -56,9 +56,7 @@ impl RealtimeRuntime {
         };
 
         let mut state = self.inner.lock().await;
-        state
-            .connections
-            .insert(registration.handle, connection);
+        state.connections.insert(registration.handle, connection);
 
         Ok(registration)
     }
@@ -166,9 +164,7 @@ mod tests {
     use futures_util::StreamExt;
     use mrd_proto::{BackendRole, DeviceId, SessionId};
     use mrd_signal_client::{decode_message, encode_message};
-    use mrd_signal_proto::{
-        IceCandidate, RegisteredResponse, SessionDescription, SignalMessage,
-    };
+    use mrd_signal_proto::{IceCandidate, RegisteredResponse, SessionDescription, SignalMessage};
     use tokio::net::TcpListener;
 
     async fn ws_handler(ws: WebSocketUpgrade) -> impl IntoResponse {

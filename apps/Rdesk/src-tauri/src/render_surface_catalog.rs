@@ -31,7 +31,10 @@ impl RenderSurfaceCatalog {
         };
         *next_id += 1;
 
-        let surfaces = self.surfaces_by_session.entry(session_id.clone()).or_default();
+        let surfaces = self
+            .surfaces_by_session
+            .entry(session_id.clone())
+            .or_default();
         surfaces.push(surface.clone());
         self.current_surface_by_session
             .insert(session_id, surface.surface_id.clone());
@@ -43,7 +46,10 @@ impl RenderSurfaceCatalog {
         session_id: SessionId,
         surface_id: String,
     ) -> RenderSurfaceDescriptor {
-        let surfaces = self.surfaces_by_session.entry(session_id.clone()).or_default();
+        let surfaces = self
+            .surfaces_by_session
+            .entry(session_id.clone())
+            .or_default();
         if let Some(surface) = surfaces
             .iter()
             .find(|surface| surface.surface_id == surface_id)
@@ -61,7 +67,8 @@ impl RenderSurfaceCatalog {
             role: "controller".to_string(),
         };
         surfaces.push(surface.clone());
-        self.current_surface_by_session.insert(session_id, surface_id);
+        self.current_surface_by_session
+            .insert(session_id, surface_id);
         surface
     }
 
@@ -81,10 +88,14 @@ impl RenderSurfaceCatalog {
             .surfaces_by_session
             .get(&session_id)
             .ok_or_else(|| format!("未找到会话 surface: {}", session_id.0))?;
-        if !surfaces.iter().any(|surface| surface.surface_id == surface_id) {
+        if !surfaces
+            .iter()
+            .any(|surface| surface.surface_id == surface_id)
+        {
             return Err(format!("未找到 surface: {}", surface_id));
         }
-        self.current_surface_by_session.insert(session_id, surface_id);
+        self.current_surface_by_session
+            .insert(session_id, surface_id);
         Ok(())
     }
 
@@ -101,7 +112,8 @@ mod tests {
     #[test]
     fn creating_surface_marks_it_current() {
         let mut catalog = RenderSurfaceCatalog::default();
-        let surface = catalog.create_surface(SessionId("session-a".into()), Some("Screen A".into()));
+        let surface =
+            catalog.create_surface(SessionId("session-a".into()), Some("Screen A".into()));
 
         assert_eq!(surface.surface_id, "surface-1");
         assert_eq!(surface.name, "Screen A");

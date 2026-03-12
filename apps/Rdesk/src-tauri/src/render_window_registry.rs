@@ -66,7 +66,10 @@ impl RenderWindowRegistry {
         app: &tauri::AppHandle<R>,
         session_id: &SessionId,
     ) -> Vec<RenderWindowContext> {
-        let entries = self.windows_by_session.entry(session_id.clone()).or_default();
+        let entries = self
+            .windows_by_session
+            .entry(session_id.clone())
+            .or_default();
         entries.retain(|entry| app.get_window(&entry.label).is_some());
         let count = entries.len();
         entries
@@ -144,7 +147,8 @@ impl RenderWindowRegistry {
         for (session_id, entries) in self.windows_by_session.iter_mut() {
             entries.retain(|entry| app.get_window(&entry.label).is_some());
             if let Some(entry) = entries.iter_mut().find(|entry| entry.label == label) {
-                let previous_surface_id = (entry.surface_id != surface_id).then(|| entry.surface_id.clone());
+                let previous_surface_id =
+                    (entry.surface_id != surface_id).then(|| entry.surface_id.clone());
                 entry.surface_id = surface_id;
                 return Ok((session_id.clone(), previous_surface_id));
             }
@@ -159,7 +163,10 @@ impl RenderWindowRegistry {
         session_id: &SessionId,
         surface_id: &str,
     ) -> usize {
-        let entries = self.windows_by_session.entry(session_id.clone()).or_default();
+        let entries = self
+            .windows_by_session
+            .entry(session_id.clone())
+            .or_default();
         entries.retain(|entry| app.get_window(&entry.label).is_some());
         entries
             .iter()
@@ -215,7 +222,10 @@ mod tests {
             ],
         );
 
-        let entries = registry.windows_by_session.get(&session).expect("session entries");
+        let entries = registry
+            .windows_by_session
+            .get(&session)
+            .expect("session entries");
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].surface_id, "surface-1");
         assert_eq!(entries[1].surface_id, "surface-1");
@@ -254,8 +264,14 @@ mod tests {
             }],
         );
 
-        let entries = registry.windows_by_session.get_mut(&session).expect("entries");
-        let previous = if let Some(entry) = entries.iter_mut().find(|entry| entry.label == "render-session-a-1") {
+        let entries = registry
+            .windows_by_session
+            .get_mut(&session)
+            .expect("entries");
+        let previous = if let Some(entry) = entries
+            .iter_mut()
+            .find(|entry| entry.label == "render-session-a-1")
+        {
             let previous = (entry.surface_id != "surface-2").then(|| entry.surface_id.clone());
             entry.surface_id = "surface-2".into();
             previous

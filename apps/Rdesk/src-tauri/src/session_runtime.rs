@@ -15,11 +15,7 @@ pub fn sync_session_runtime(
 
     let lifecycle_snapshot = lifecycle.snapshot(session_id);
     for binding in lifecycle_snapshot.surface_source_bindings {
-        let _ = render_host.bind_surface_source(
-            session_id,
-            &binding.surface_id,
-            binding.source_id,
-        );
+        let _ = render_host.bind_surface_source(session_id, &binding.surface_id, binding.source_id);
     }
 
     Ok(())
@@ -33,8 +29,7 @@ mod tests {
     use mrd_proto::SessionId;
 
     use crate::{
-        frame_sink::DecodedFrameSink,
-        render_host::RenderHost,
+        frame_sink::DecodedFrameSink, render_host::RenderHost,
         session_lifecycle::SessionLifecycleCoordinator,
     };
 
@@ -80,7 +75,10 @@ mod tests {
             .snapshot(&session_id)
             .expect("render host snapshot after sync");
 
-        assert_eq!(render_snapshot.available_source_ids, vec!["video-track-2".to_string()]);
+        assert_eq!(
+            render_snapshot.available_source_ids,
+            vec!["video-track-2".to_string()]
+        );
         assert_eq!(render_snapshot.surface_source_bindings.len(), 1);
         assert_eq!(
             render_snapshot.surface_source_bindings[0].surface_id,

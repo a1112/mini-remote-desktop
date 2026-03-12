@@ -33,9 +33,36 @@ pub enum H264Profile {
 pub struct H264AccessUnitAssembler {
     annex_b_buffer: Vec<u8>,
     fua_active: bool,
+    last_sequence_number: Option<u16>,
+    drop_until_marker: bool,
 }
 
 impl H264AccessUnitAssembler {
+    pub fn push_rtp_packet(
+        &mut self,
+        payload: &[u8],
+        marker: bool,
+        sequence_number: u16,
+    ) -> Option<Vec<u8>> {
+        if let Some(previous) = self.last_sequence_number {
+            let expected = previous.wrapping_add(1);
+            if sequence_number != expected && self.has_incomplete_access_unit() {
+                self.reset();
+                self.drop_until_marker = true;
+            }
+        }
+        self.last_sequence_number = Some(sequence_number);
+
+        if self.drop_until_marker {
+            if marker {
+                self.drop_until_marker = false;
+            }
+            return None;
+        }
+
+        self.push_rtp_payload(payload, marker)
+    }
+
     pub fn push_rtp_payload(&mut self, payload: &[u8], marker: bool) -> Option<Vec<u8>> {
         if payload.is_empty() {
             return None;
@@ -140,6 +167,10 @@ impl H264AccessUnitAssembler {
         self.annex_b_buffer.clear();
         self.fua_active = false;
     }
+
+    fn has_incomplete_access_unit(&self) -> bool {
+        self.fua_active || !self.annex_b_buffer.is_empty()
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -148,6 +179,23 @@ pub struct H264RtpIngress {
 }
 
 impl H264RtpIngress {
+    pub fn push_packet(
+        &mut self,
+        payload: &[u8],
+        marker: bool,
+        sequence_number: u16,
+        timestamp_us: u64,
+    ) -> Option<EncodedAccessUnit> {
+        self.assembler
+            .push_rtp_packet(payload, marker, sequence_number)
+            .map(|bytes| EncodedAccessUnit {
+                codec: VideoCodec::H264,
+                timestamp_us,
+                is_keyframe: annex_b_contains_keyframe(&bytes),
+                bytes,
+            })
+    }
+
     pub fn push_payload(
         &mut self,
         payload: &[u8],
@@ -235,11 +283,10 @@ impl H264RtpSender {
         let packets = self.packetize_access_unit(access_unit)?;
         let mut written = 0usize;
         for packet in packets {
-            written += self
-                .track
-                .write_rtp(&packet)
-                .await
-                .map_err(|error| TransportError::Message(format!("write_rtp failed: {error}")))?;
+            written +=
+                self.track.write_rtp(&packet).await.map_err(|error| {
+                    TransportError::Message(format!("write_rtp failed: {error}"))
+                })?;
         }
         Ok(written)
     }
@@ -261,7 +308,7 @@ pub fn h264_codec_capability(profile: H264Profile) -> RTCRtpCodecCapability {
     }
 }
 
-fn annex_b_contains_keyframe(access_unit: &[u8]) -> bool {
+pub fn annex_b_contains_keyframe(access_unit: &[u8]) -> bool {
     let mut offset = 0usize;
     while offset + 4 < access_unit.len() {
         if access_unit[offset..].starts_with(&[0, 0, 0, 1]) {
@@ -324,8 +371,8 @@ mod tests {
         assert_eq!(
             assembler.push_rtp_payload(&[0x7c, 0x45, 0xcc, 0xdd], true),
             Some(vec![
-                0, 0, 0, 1, 0x67, 0x42, 0, 0, 0, 1, 0x68, 0xce, 0, 0, 0, 1, 0x65, 0xaa,
-                0xbb, 0xcc, 0xdd,
+                0, 0, 0, 1, 0x67, 0x42, 0, 0, 0, 1, 0x68, 0xce, 0, 0, 0, 1, 0x65, 0xaa, 0xbb, 0xcc,
+                0xdd,
             ])
         );
     }
@@ -334,7 +381,9 @@ mod tests {
     fn ingress_wraps_annex_b_payload_as_h264_access_unit() {
         let mut ingress = H264RtpIngress::default();
 
-        assert!(ingress.push_payload(&[0x7c, 0x85, 0xaa, 0xbb], false, 33_000).is_none());
+        assert!(ingress
+            .push_payload(&[0x7c, 0x85, 0xaa, 0xbb], false, 33_000)
+            .is_none());
         let access_unit = ingress
             .push_payload(&[0x7c, 0x45, 0xcc, 0xdd], true, 33_000)
             .expect("completed access unit");
@@ -345,8 +394,42 @@ mod tests {
     }
 
     #[test]
+    fn sequence_gap_drops_incomplete_fua_access_unit() {
+        let mut ingress = H264RtpIngress::default();
+
+        assert!(ingress
+            .push_packet(&[0x7c, 0x85, 0xaa, 0xbb], false, 10, 33_000)
+            .is_none());
+        assert!(ingress
+            .push_packet(&[0x7c, 0x45, 0xcc, 0xdd], true, 12, 33_000)
+            .is_none());
+    }
+
+    #[test]
+    fn sequence_gap_recovers_on_next_complete_access_unit() {
+        let mut ingress = H264RtpIngress::default();
+
+        assert!(ingress
+            .push_packet(&[0x7c, 0x85, 0xaa, 0xbb], false, 21, 33_000)
+            .is_none());
+        assert!(ingress
+            .push_packet(&[0x7c, 0x45, 0xcc, 0xdd], true, 23, 33_000)
+            .is_none());
+
+        let access_unit = ingress
+            .push_packet(&[0x65, 0x11, 0x22, 0x33], true, 24, 66_000)
+            .expect("recovered single NAL access unit");
+        assert!(annex_b_contains_keyframe(&access_unit.bytes));
+    }
+
+    #[test]
     fn keyframe_detector_marks_idr_annex_b_payloads() {
         assert!(annex_b_contains_keyframe(&[0, 0, 0, 1, 0x65, 0xaa]));
+    }
+
+    #[test]
+    fn keyframe_detector_accepts_idr_with_lower_nri() {
+        assert!(annex_b_contains_keyframe(&[0, 0, 0, 1, 0x25, 0xaa]));
     }
 
     #[test]

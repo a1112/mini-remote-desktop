@@ -320,7 +320,11 @@ impl ProbeRegistry {
         ProbeSessionHandle { state }
     }
 
-    pub fn snapshot(&self, session_id: &SessionId, stream_id: &str) -> Option<PipelineProbeSnapshot> {
+    pub fn snapshot(
+        &self,
+        session_id: &SessionId,
+        stream_id: &str,
+    ) -> Option<PipelineProbeSnapshot> {
         let sessions = self.sessions.lock().expect("lock probe registry");
         sessions
             .get(&(session_id.clone(), stream_id.to_string()))
@@ -384,10 +388,12 @@ impl ProbeSessionHandle {
         bytes: usize,
         is_keyframe: bool,
     ) {
-        self.state
-            .lock()
-            .expect("lock probe state")
-            .record_stage(stage, duration, bytes, is_keyframe);
+        self.state.lock().expect("lock probe state").record_stage(
+            stage,
+            duration,
+            bytes,
+            is_keyframe,
+        );
     }
 
     pub fn snapshot(&self) -> PipelineProbeSnapshot {
@@ -395,7 +401,10 @@ impl ProbeSessionHandle {
     }
 
     pub fn recent_events(&self, limit: usize) -> Vec<MediaProbeEvent> {
-        self.state.lock().expect("lock probe state").recent_events(limit)
+        self.state
+            .lock()
+            .expect("lock probe state")
+            .recent_events(limit)
     }
 }
 
@@ -493,7 +502,11 @@ impl ProbeState {
             .iter()
             .filter(|sample| sample.event.stage == StageId::FrameSinkIngest)
             .count() as f64;
-        let fps = if seconds > 0.0 { frame_count / seconds } else { 0.0 };
+        let fps = if seconds > 0.0 {
+            frame_count / seconds
+        } else {
+            0.0
+        };
         let bitrate_kbps = if seconds > 0.0 {
             (total_bytes as f64 * 8.0) / 1000.0 / seconds
         } else {
@@ -504,7 +517,10 @@ impl ProbeState {
             .into_iter()
             .map(|(stage, durations_ms)| {
                 let bytes = bytes_by_stage.get(&stage).copied().unwrap_or_default();
-                (stage, StageStatsSnapshot::from_durations_ms(&durations_ms, bytes))
+                (
+                    stage,
+                    StageStatsSnapshot::from_durations_ms(&durations_ms, bytes),
+                )
             })
             .collect::<Vec<_>>();
         stages.sort_by_key(|entry| entry.0);
@@ -650,7 +666,12 @@ mod tests {
         handle.set_counter("pending_frames", 1);
         handle.record_stage(StageId::CaptureCopy, Duration::from_millis(2), 1024, false);
         handle.record_stage(StageId::EncodeTotal, Duration::from_millis(4), 2048, true);
-        handle.record_stage(StageId::FrameSinkIngest, Duration::from_millis(1), 512, false);
+        handle.record_stage(
+            StageId::FrameSinkIngest,
+            Duration::from_millis(1),
+            512,
+            false,
+        );
 
         let snapshot = registry
             .snapshot(&SessionId("session-probe".into()), "video-main")
@@ -700,7 +721,13 @@ mod tests {
         assert_eq!(result.throughput_fps, 30.0);
         assert_eq!(result.latency_ms.p50_ms, Some(4.0));
         assert_eq!(result.latency_ms.p95_ms, Some(8.0));
-        assert_eq!(result.access_unit_bytes.as_ref().and_then(|stats| stats.p95), Some(1500.0));
+        assert_eq!(
+            result
+                .access_unit_bytes
+                .as_ref()
+                .and_then(|stats| stats.p95),
+            Some(1500.0)
+        );
         assert_eq!(result.written_bytes, None);
         assert_eq!(result.packets_per_sample, None);
         assert_eq!(result.keyframe_ratio, Some(0.25));

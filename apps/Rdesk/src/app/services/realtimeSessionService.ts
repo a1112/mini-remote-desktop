@@ -65,6 +65,12 @@ export type WebrtcHostSnapshot = {
   lastDecodedWidth: number;
   lastDecodedHeight: number;
   lastDecodedPixelFormat?: string;
+  decodePolicy?: string;
+  preferredDecodeBackend?: string;
+  activeDecodeBackend?: string;
+  decodeBackendReason?: string;
+  decodeFallbackCount: number;
+  lastDecodeFallbackReason?: string;
 };
 
 export type DecodedFrameSnapshot = {

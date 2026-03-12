@@ -199,6 +199,9 @@ mod tests {
 
         assert_eq!(snapshot.frame_count, 1);
         assert_eq!(snapshot.width, 800);
-        assert_eq!(sink.list_sources(&session_id), vec!["video-track-1".to_string()]);
+        assert_eq!(
+            sink.list_sources(&session_id),
+            vec!["video-track-1".to_string()]
+        );
     }
 }
