@@ -35,6 +35,10 @@ impl OpenH264Encoder {
             frame_index: 0,
         })
     }
+
+    pub fn new_speed(width: usize, height: usize, fps: u32) -> Result<Self, PipelineError> {
+        Self::new(width, height, fps)
+    }
 }
 
 impl VideoEncoder for OpenH264Encoder {

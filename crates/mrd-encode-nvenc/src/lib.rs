@@ -51,6 +51,22 @@ mod imp {
             Self::new_with_profile(width, height, fps, NV_ENC_H264_PROFILE_BASELINE_GUID)
         }
 
+        pub fn new_low_latency_p1(
+            width: usize,
+            height: usize,
+            fps: u32,
+        ) -> Result<Self, PipelineError> {
+            Self::new(width, height, fps)
+        }
+
+        pub fn new_high_quality_p5(
+            width: usize,
+            height: usize,
+            fps: u32,
+        ) -> Result<Self, PipelineError> {
+            Self::new(width, height, fps)
+        }
+
         fn new_with_profile(
             width: usize,
             height: usize,
@@ -376,6 +392,26 @@ impl NvencH264Encoder {
     }
 
     pub fn new_baseline(_width: usize, _height: usize, _fps: u32) -> Result<Self, PipelineError> {
+        Err(PipelineError::message(
+            "nvenc encoder only supports Windows",
+        ))
+    }
+
+    pub fn new_low_latency_p1(
+        _width: usize,
+        _height: usize,
+        _fps: u32,
+    ) -> Result<Self, PipelineError> {
+        Err(PipelineError::message(
+            "nvenc encoder only supports Windows",
+        ))
+    }
+
+    pub fn new_high_quality_p5(
+        _width: usize,
+        _height: usize,
+        _fps: u32,
+    ) -> Result<Self, PipelineError> {
         Err(PipelineError::message(
             "nvenc encoder only supports Windows",
         ))

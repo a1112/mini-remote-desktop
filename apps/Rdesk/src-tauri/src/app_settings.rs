@@ -13,6 +13,7 @@ pub enum DecodePolicy {
     #[default]
     Auto,
     Software,
+    D3d11va,
     Nvdec,
 }
 
@@ -21,6 +22,7 @@ impl DecodePolicy {
         match self {
             Self::Auto => "auto",
             Self::Software => "software",
+            Self::D3d11va => "d3d11va",
             Self::Nvdec => "nvdec",
         }
     }

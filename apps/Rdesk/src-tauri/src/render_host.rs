@@ -267,6 +267,7 @@ fn decoded_frame_snapshot_response(
         height: snapshot.height,
         pixel_format: match snapshot.pixel_format {
             mrd_decode::PixelFormat::Rgb24 => "Rgb24".to_string(),
+            mrd_decode::PixelFormat::D3d11Texture => "D3d11Texture".to_string(),
         },
         bytes: snapshot.bytes,
     }
@@ -284,11 +285,14 @@ fn decoded_frame_preview_with(
     let Some(frame) = latest_frame else {
         return Ok(None);
     };
+    let Some(rgb) = frame.cpu_bytes() else {
+        return Ok(None);
+    };
 
     let mut png = Vec::new();
     PngEncoder::new(&mut png)
         .write_image(
-            &frame.data,
+            rgb,
             frame.width as u32,
             frame.height as u32,
             ColorType::Rgb8.into(),
@@ -316,8 +320,9 @@ fn decoded_frame_to_render_frame(frame: &mrd_decode::DecodedFrame) -> RenderFram
         height: frame.height,
         pixel_format: match frame.pixel_format {
             mrd_decode::PixelFormat::Rgb24 => RenderPixelFormat::Rgb24,
+            mrd_decode::PixelFormat::D3d11Texture => RenderPixelFormat::Rgb24,
         },
-        data: frame.data.clone(),
+        data: frame.cpu_bytes().map(|bytes| bytes.to_vec()).unwrap_or_default(),
     }
 }
 

@@ -159,6 +159,7 @@ pub(crate) struct QuicBenchmarkOutcome {
     pub receiver_probe: PipelineProbeSnapshot,
     pub sink_snapshot: DecodedFrameSnapshot,
     pub first_frame_time_ms: f64,
+    pub transport_label: String,
 }
 
 struct QuicHostedPairHarness {
@@ -497,6 +498,7 @@ pub(crate) async fn run_quic_benchmark_pipeline(
     fps: u32,
     duration_secs: u64,
     encode_backend: &str,
+    _decode_backend: &str,
 ) -> Result<QuicBenchmarkOutcome, String> {
     let mut harness = QuicHostedPairHarness::new(&session_id.0).await?;
     harness
@@ -521,6 +523,7 @@ pub(crate) async fn run_quic_benchmark_pipeline(
         receiver_probe: harness.receiver_probe(),
         sink_snapshot: harness.sink_snapshot().expect("sink snapshot"),
         first_frame_time_ms,
+        transport_label: "quic_quinn".to_string(),
     })
 }
 
@@ -551,9 +554,18 @@ fn create_test_encoder(
         "nvenc" => Ok(QuicBenchmarkEncoder::Nvenc(NvencH264Encoder::new(
             width, height, fps,
         )?)),
+        "nvenc_ll_p1" => Ok(QuicBenchmarkEncoder::Nvenc(
+            NvencH264Encoder::new_low_latency_p1(width, height, fps)?,
+        )),
+        "nvenc_hq_p5" => Ok(QuicBenchmarkEncoder::Nvenc(
+            NvencH264Encoder::new_high_quality_p5(width, height, fps)?,
+        )),
         "openh264" => Ok(QuicBenchmarkEncoder::OpenH264(OpenH264Encoder::new(
             width, height, fps,
         )?)),
+        "openh264_speed" => Ok(QuicBenchmarkEncoder::OpenH264(
+            OpenH264Encoder::new_speed(width, height, fps)?,
+        )),
         other => Err(PipelineError::message(format!(
             "unsupported test encoder backend: {other}"
         ))),

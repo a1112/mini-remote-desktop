@@ -381,12 +381,33 @@ impl WebrtcHost {
         session.sender_running.store(false, Ordering::Relaxed);
         if let Some(task) = session.sender_task.take() {
             task.abort();
+            let _ = task.await;
         }
         session
             .snapshot
             .lock()
             .expect("lock host snapshot")
             .sender_running = false;
+        Ok(())
+    }
+
+    pub async fn close_session(&mut self, session_id: &SessionId) -> Result<(), String> {
+        let mut session = self
+            .sessions
+            .remove(session_id)
+            .ok_or_else(|| format!("未找到 webrtc host 会话: {}", session_id.0))?;
+        session.sender_running.store(false, Ordering::Relaxed);
+        if let Some(task) = session.sender_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        session.sample_sender = None;
+        session
+            .snapshot
+            .lock()
+            .expect("lock host snapshot")
+            .sender_running = false;
+        let _ = tokio::time::timeout(Duration::from_secs(2), session.pc.close()).await;
         Ok(())
     }
 
@@ -860,6 +881,7 @@ struct DecoderSelection {
 fn preferred_backend_for_policy(policy: DecodePolicy) -> &'static str {
     match policy {
         DecodePolicy::Auto | DecodePolicy::Software => "h264_software",
+        DecodePolicy::D3d11va => "d3d11va",
         DecodePolicy::Nvdec => "nvdec",
     }
 }
@@ -868,6 +890,7 @@ fn h264_decoder_backend_order(policy: DecodePolicy) -> Vec<&'static str> {
     match policy {
         DecodePolicy::Auto => vec!["h264_software", "nvdec"],
         DecodePolicy::Software => vec!["h264_software"],
+        DecodePolicy::D3d11va => vec!["d3d11va", "h264_software"],
         DecodePolicy::Nvdec => vec!["nvdec", "h264_software"],
     }
 }
@@ -913,6 +936,9 @@ fn select_h264_decoder(policy: DecodePolicy) -> DecoderSelection {
                 }
                 DecodePolicy::Software => {
                     "software decode policy pins h264_software".to_string()
+                }
+                DecodePolicy::D3d11va => {
+                    "d3d11va decode policy selected d3d11va for realtime decode".to_string()
                 }
                 DecodePolicy::Nvdec => {
                     "nvdec decode policy selected nvdec for realtime decode".to_string()
@@ -981,6 +1007,7 @@ fn apply_decoded_frames_to_snapshot(
         snapshot.last_decoded_height = frame.height;
         snapshot.last_decoded_pixel_format = Some(match frame.pixel_format {
             PixelFormat::Rgb24 => "Rgb24".to_string(),
+            PixelFormat::D3d11Texture => "D3d11Texture".to_string(),
         });
         if let Some(frame_sink) = frame_sink.as_ref() {
             let bytes = frame.data.len();

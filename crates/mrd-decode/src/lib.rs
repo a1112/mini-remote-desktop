@@ -9,6 +9,7 @@ pub enum CodecKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PixelFormat {
     Rgb24,
+    D3d11Texture,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +26,31 @@ pub struct DecodedFrame {
     pub height: usize,
     pub pixel_format: PixelFormat,
     pub data: Vec<u8>,
+}
+
+impl DecodedFrame {
+    pub fn cpu_rgb24(width: usize, height: usize, data: Vec<u8>) -> Self {
+        Self {
+            width,
+            height,
+            pixel_format: PixelFormat::Rgb24,
+            data,
+        }
+    }
+
+    pub fn bytes_len(&self) -> usize {
+        match self.pixel_format {
+            PixelFormat::Rgb24 => self.data.len(),
+            PixelFormat::D3d11Texture => 0,
+        }
+    }
+
+    pub fn cpu_bytes(&self) -> Option<&[u8]> {
+        match self.pixel_format {
+            PixelFormat::Rgb24 => Some(self.data.as_slice()),
+            PixelFormat::D3d11Texture => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,12 +155,8 @@ impl VideoDecoder for H264SoftwareDecoder {
                 let mut rgb = vec![0_u8; yuv.rgb8_len()];
                 yuv.write_rgb8(&mut rgb);
                 let (width, height) = yuv.dimensions();
-                self.pending_frames.push(DecodedFrame {
-                    width,
-                    height,
-                    pixel_format: PixelFormat::Rgb24,
-                    data: rgb,
-                });
+                self.pending_frames
+                    .push(DecodedFrame::cpu_rgb24(width, height, rgb));
                 Ok(())
             }
             None => Err(DecoderError::new("访问单元未生成完整可解码帧")),
@@ -157,12 +179,7 @@ impl VideoDecoder for NvdecVideoDecoder {
         self.decoder
             .drain_decoded_frames()
             .into_iter()
-            .map(|frame| DecodedFrame {
-                width: frame.width,
-                height: frame.height,
-                pixel_format: PixelFormat::Rgb24,
-                data: frame.data,
-            })
+            .map(|frame| DecodedFrame::cpu_rgb24(frame.width, frame.height, frame.data))
             .collect()
     }
 }
