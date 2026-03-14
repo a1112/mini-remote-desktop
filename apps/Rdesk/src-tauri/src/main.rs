@@ -1083,6 +1083,7 @@ fn parse_decode_policy(value: &str) -> Result<DecodePolicy, String> {
     match value {
         "auto" => Ok(DecodePolicy::Auto),
         "software" => Ok(DecodePolicy::Software),
+        "d3d11va" => Ok(DecodePolicy::D3d11va),
         "nvdec" => Ok(DecodePolicy::Nvdec),
         other => Err(format!("未知 decode policy: {other}")),
     }
@@ -1166,6 +1167,7 @@ fn decoded_frame_snapshot_response(
         height: snapshot.height,
         pixel_format: match snapshot.pixel_format {
             mrd_decode::PixelFormat::Rgb24 => "Rgb24".to_string(),
+            mrd_decode::PixelFormat::D3d11Texture => "D3d11Texture".to_string(),
         },
         bytes: snapshot.bytes,
     }
@@ -1483,10 +1485,13 @@ fn decoded_frame_preview_with(
         return Ok(None);
     };
 
+    let Some(rgb) = frame.cpu_bytes() else {
+        return Ok(None);
+    };
     let mut png = Vec::new();
     PngEncoder::new(&mut png)
         .write_image(
-            &frame.data,
+            rgb,
             frame.width as u32,
             frame.height as u32,
             ColorType::Rgb8.into(),
@@ -1946,11 +1951,20 @@ mod tests {
             "nvenc" => Ok(BenchmarkEncoder::Nvenc(
                 mrd_encode_nvenc::NvencH264Encoder::new(width, height, fps)?,
             )),
+            "nvenc_ll_p1" => Ok(BenchmarkEncoder::Nvenc(
+                mrd_encode_nvenc::NvencH264Encoder::new_low_latency_p1(width, height, fps)?,
+            )),
+            "nvenc_hq_p5" => Ok(BenchmarkEncoder::Nvenc(
+                mrd_encode_nvenc::NvencH264Encoder::new_high_quality_p5(width, height, fps)?,
+            )),
             "nvenc_baseline" => Ok(BenchmarkEncoder::Nvenc(
                 mrd_encode_nvenc::NvencH264Encoder::new_baseline(width, height, fps)?,
             )),
             "openh264" => Ok(BenchmarkEncoder::OpenH264(
                 mrd_encode_openh264::OpenH264Encoder::new(width, height, fps)?,
+            )),
+            "openh264_speed" => Ok(BenchmarkEncoder::OpenH264(
+                mrd_encode_openh264::OpenH264Encoder::new_speed(width, height, fps)?,
             )),
             other => Err(mrd_pipeline_core::PipelineError::message(format!(
                 "unsupported benchmark encoder backend: {other}"
@@ -1958,7 +1972,24 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[test]
+    fn benchmark_encoder_accepts_variant_backends() {
+        for backend in ["openh264_speed", "nvenc_ll_p1", "nvenc_hq_p5"] {
+            let result = create_benchmark_encoder(backend, 128, 128, 30);
+            assert!(
+                !matches!(
+                    result,
+                    Err(ref error)
+                        if error
+                            .to_string()
+                            .contains("unsupported benchmark encoder backend")
+                ),
+                "expected benchmark backend {backend} to be recognized"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn benchmark_run_writes_requested_artifacts() {
         ensure_rustls_crypto_provider();
         let artifact_root = std::env::var("MRD_BENCH_ARTIFACT_ROOT").unwrap_or_else(|_| {
@@ -1998,6 +2029,8 @@ mod tests {
             .unwrap_or(20);
         let encode_backend =
             std::env::var("MRD_BENCH_ENCODE_BACKEND").unwrap_or_else(|_| "openh264".into());
+        let decode_backend =
+            std::env::var("MRD_BENCH_DECODE_BACKEND").unwrap_or_else(|_| "h264_software".into());
         let effective_encode_backend = if transport == "webrtc" && encode_backend == "nvenc" {
             "nvenc_baseline".to_string()
         } else {
@@ -2014,16 +2047,17 @@ mod tests {
                 fps,
                 duration_secs,
                 &encode_backend,
+                &decode_backend,
             )
             .await
             .expect("run quic benchmark pipeline");
             let manifest = BenchmarkManifest {
                 run_id: run_id.clone(),
                 scenario,
-                transport,
+                transport: outcome.transport_label.clone(),
                 capture_backend: "synthetic".into(),
                 encode_backend: encode_backend.clone(),
-                decode_backend: "h264_software".into(),
+                decode_backend: decode_backend.clone(),
                 renderer_backend: "d3d11".into(),
                 width: width as u32,
                 height: height as u32,
@@ -2059,6 +2093,11 @@ mod tests {
 
         let sink = std::sync::Arc::new(std::sync::Mutex::new(DecodedFrameSink::default()));
         let mut controller = WebrtcHost::with_frame_sink(sink.clone());
+        controller.set_decode_policy(match decode_backend.as_str() {
+            "h264_software" => crate::app_settings::DecodePolicy::Software,
+            "d3d11va" => crate::app_settings::DecodePolicy::D3d11va,
+            other => panic!("unsupported benchmark decode backend: {other}"),
+        });
         let mut agent = WebrtcHost::default();
 
         agent
@@ -2103,19 +2142,19 @@ mod tests {
         } else {
             8
         };
-        let first_frame_wait =
-            tokio::time::timeout(Duration::from_secs(first_frame_timeout_secs), async {
-                loop {
-                    let snapshot = controller
-                        .snapshot(&session_id)
-                        .expect("controller snapshot");
-                    if snapshot.decoded_frame_count > 0 {
-                        break started_at.elapsed().as_secs_f64() * 1000.0;
-                    }
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-            })
-            .await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(first_frame_timeout_secs);
+        let first_frame_wait = loop {
+            let snapshot = controller
+                .snapshot(&session_id)
+                .expect("controller snapshot");
+            if snapshot.decoded_frame_count > 0 {
+                break Ok(started_at.elapsed().as_secs_f64() * 1000.0);
+            }
+            if std::time::Instant::now() >= deadline {
+                break Err(());
+            }
+            tokio::task::yield_now().await;
+        };
         let first_frame_seen = first_frame_wait.is_ok();
         let first_frame_time_ms =
             first_frame_wait.unwrap_or_else(|_| started_at.elapsed().as_secs_f64() * 1000.0);
@@ -2136,7 +2175,7 @@ mod tests {
             transport,
             capture_backend: "dxgi".into(),
             encode_backend: effective_encode_backend,
-            decode_backend: "h264_software".into(),
+            decode_backend,
             renderer_backend: "d3d11".into(),
             width: width as u32,
             height: height as u32,
@@ -2167,6 +2206,23 @@ mod tests {
         assert!(paths.summary_json.exists());
         assert!(paths.summary_csv.exists());
         assert!(paths.report_md.exists());
+
+        controller
+            .stop_embedded_video_sender(&session_id)
+            .await
+            .expect("stop benchmark controller sender");
+        agent
+            .stop_embedded_video_sender(&session_id)
+            .await
+            .expect("stop benchmark agent sender");
+        controller
+            .close_session(&session_id)
+            .await
+            .expect("close benchmark controller session");
+        agent
+            .close_session(&session_id)
+            .await
+            .expect("close benchmark agent session");
     }
 
     #[tokio::test]
@@ -2244,12 +2300,7 @@ mod tests {
         let sink = std::sync::Mutex::new(DecodedFrameSink::default());
         sink.lock().expect("lock decoded frame sink").ingest_frame(
             SessionId("session-9".into()),
-            mrd_decode::DecodedFrame {
-                width: 640,
-                height: 360,
-                pixel_format: mrd_decode::PixelFormat::Rgb24,
-                data: vec![0; 640 * 360 * 3],
-            },
+            mrd_decode::DecodedFrame::cpu_rgb24(640, 360, vec![0; 640 * 360 * 3]),
         );
 
         let snapshot = decoded_frame_snapshot_with(&sink, "session-9".into()).expect("snapshot");
@@ -2266,12 +2317,11 @@ mod tests {
         let sink = std::sync::Mutex::new(DecodedFrameSink::default());
         sink.lock().expect("lock decoded frame sink").ingest_frame(
             SessionId("session-preview".into()),
-            mrd_decode::DecodedFrame {
-                width: 2,
-                height: 2,
-                pixel_format: mrd_decode::PixelFormat::Rgb24,
-                data: vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255],
-            },
+            mrd_decode::DecodedFrame::cpu_rgb24(
+                2,
+                2,
+                vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255],
+            ),
         );
 
         let preview = decoded_frame_preview_with(&sink, "session-preview".into())
@@ -2286,12 +2336,7 @@ mod tests {
         let sink = std::sync::Arc::new(std::sync::Mutex::new(DecodedFrameSink::default()));
         sink.lock().expect("lock decoded frame sink").ingest_frame(
             SessionId("session-render".into()),
-            mrd_decode::DecodedFrame {
-                width: 2,
-                height: 2,
-                pixel_format: mrd_decode::PixelFormat::Rgb24,
-                data: vec![255; 12],
-            },
+            mrd_decode::DecodedFrame::cpu_rgb24(2, 2, vec![255; 12]),
         );
         let mut render_host = RenderHost::with_frame_sink(sink);
         let _ =
