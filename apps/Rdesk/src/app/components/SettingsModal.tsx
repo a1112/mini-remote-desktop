@@ -15,10 +15,16 @@ import {
 import { useTheme } from "./ThemeContext";
 import { RealtimeSessionCard } from "./RealtimeSessionCard";
 import {
+  getDecodePolicy,
+  getNvdecRuntimeProbe,
   getRealtimeStatus,
   restartRealtime,
+  setDecodePolicy,
   startRealtime,
   stopRealtime,
+  type DecodePolicyResponse,
+  type DecoderPolicy,
+  type NvdecRuntimeProbe,
   type RealtimeStatus,
 } from "../services/realtimeService";
 import {
@@ -150,6 +156,8 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
   const [notifyRequest, setNotifyRequest] = useState(true);
   const [sound, setSound] = useState(true);
   const [realtimeStatus, setRealtimeStatus] = useState<RealtimeStatus | null>(null);
+  const [nvdecProbe, setNvdecProbe] = useState<NvdecRuntimeProbe | null>(null);
+  const [decodePolicy, setDecodePolicyState] = useState<DecodePolicyResponse | null>(null);
   const [realtimeLoading, setRealtimeLoading] = useState(false);
   const [realtimeError, setRealtimeError] = useState<string | null>(null);
   const [realtimeDeviceId, setRealtimeDeviceId] = useState("controller-1");
@@ -194,10 +202,31 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
     setRealtimeLoading(true);
     setRealtimeError(null);
     try {
-      const next = await getRealtimeStatus();
-      setRealtimeStatus(next);
+      const [nextStatus, nextNvdecProbe, nextDecodePolicy] = await Promise.all([
+        getRealtimeStatus(),
+        getNvdecRuntimeProbe(),
+        getDecodePolicy(),
+      ]);
+      setRealtimeStatus(nextStatus);
+      setNvdecProbe(nextNvdecProbe);
+      setDecodePolicyState(nextDecodePolicy);
     } catch (error) {
       setRealtimeError(error instanceof Error ? error.message : "读取 realtime 状态失败");
+    } finally {
+      setRealtimeLoading(false);
+    }
+  };
+
+  const updateDecodePolicy = async (nextPolicy: DecoderPolicy) => {
+    setRealtimeLoading(true);
+    setRealtimeError(null);
+    try {
+      const next = await setDecodePolicy(nextPolicy);
+      setDecodePolicyState(next);
+    } catch (error) {
+      setRealtimeError(
+        error instanceof Error ? error.message : "更新 decode policy 设置失败",
+      );
     } finally {
       setRealtimeLoading(false);
     }
@@ -690,6 +719,96 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                     />
                   </div>
 
+                  <div
+                    className={`mt-3 rounded-xl border p-3.5 ${
+                      isDark ? "bg-[#232323] border-gray-700" : "bg-gray-50 border-gray-200"
+                    }`}
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <div
+                          className={isDark ? "text-gray-200" : "text-gray-800"}
+                          style={{ fontSize: 13 }}
+                        >
+                          NVDEC Capability
+                        </div>
+                        <div
+                          className={`mt-0.5 ${isDark ? "text-gray-500" : "text-gray-400"}`}
+                          style={{ fontSize: 11 }}
+                        >
+                          当前 Windows NVDEC runtime、HEVC 和 Main10 接线状态。
+                        </div>
+                      </div>
+                      <div
+                        className={`${isDark ? "text-gray-400" : "text-gray-500"}`}
+                        style={{ fontSize: 11 }}
+                      >
+                        {nvdecProbe?.backend ?? "windows-nvdec"}
+                      </div>
+                    </div>
+
+                    <div
+                      className={`mt-3 rounded-lg px-3 py-2 ${
+                        isDark ? "bg-black/20 text-gray-300" : "bg-white text-gray-700"
+                      }`}
+                      style={{ fontSize: 12 }}
+                    >
+                      {nvdecProbe?.summary ?? "尚未读取 NVDEC 状态"}
+                    </div>
+
+                    <div
+                      className={`mt-3 rounded-lg border px-3 py-3 ${
+                        isDark ? "border-gray-700 bg-black/10" : "border-gray-200 bg-white"
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-3">
+                        <div>
+                          <div
+                            className={isDark ? "text-gray-200" : "text-gray-800"}
+                            style={{ fontSize: 12 }}
+                          >
+                            Decoder Policy
+                          </div>
+                          <div
+                            className={`mt-0.5 ${isDark ? "text-gray-500" : "text-gray-400"}`}
+                            style={{ fontSize: 11 }}
+                          >
+                            `auto` 默认保守，`software` 固定软件解码，`nvdec` 强制优先硬解并自动回退。
+                          </div>
+                        </div>
+                        <ModalSelect
+                          value={decodePolicy?.decode_policy ?? "auto"}
+                          options={["auto", "software", "nvdec"]}
+                          onChange={(value) =>
+                            void updateDecodePolicy(value as DecoderPolicy)
+                          }
+                        />
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 gap-2 mt-3">
+                      {[
+                        { label: "H264", codec: "h264", bitDepthMinus8: 0 },
+                        { label: "HEVC 8-bit", codec: "hevc", bitDepthMinus8: 0 },
+                        { label: "HEVC Main10", codec: "hevc", bitDepthMinus8: 2 },
+                      ].map((item) => {
+                        const capability = nvdecProbe?.capability_probes.find(
+                          (probe) =>
+                            probe.codec === item.codec &&
+                            probe.bit_depth_minus8 === item.bitDepthMinus8,
+                        );
+                        return (
+                          <NvdecCapabilityRow
+                            key={`${item.codec}-${item.bitDepthMinus8}`}
+                            isDark={isDark}
+                            label={item.label}
+                            capability={capability}
+                          />
+                        );
+                      })}
+                    </div>
+                  </div>
+
                   {realtimeError && (
                     <div
                       className={`mt-3 rounded-lg px-3 py-2 ${isDark ? "bg-red-900/20 text-red-300" : "bg-red-50 text-red-600"}`}
@@ -999,6 +1118,86 @@ function ActionButton({
     >
       {children}
     </button>
+  );
+}
+
+function NvdecCapabilityRow({
+  isDark,
+  label,
+  capability,
+}: {
+  isDark: boolean;
+  label: string;
+  capability?: NvdecRuntimeProbe["capability_probes"][number];
+}) {
+  const runtimeLabel = capability
+    ? capability.runtime_supported
+      ? "Runtime 支持"
+      : "Runtime 不支持"
+    : "未读取";
+  const wiredLabel = capability
+    ? capability.wired_supported
+      ? "已接线"
+      : "未接线"
+    : "未知";
+
+  return (
+    <div
+      className={`rounded-lg border px-3 py-2 ${
+        isDark ? "border-gray-700 bg-[#1d1d1d]" : "border-gray-200 bg-white"
+      }`}
+    >
+      <div className="flex items-center justify-between gap-3">
+        <div
+          className={`font-medium ${isDark ? "text-gray-200" : "text-gray-800"}`}
+          style={{ fontSize: 12 }}
+        >
+          {label}
+        </div>
+        <div className="flex items-center gap-2">
+          <span
+            className={`rounded-full px-2 py-0.5 ${
+              capability?.runtime_supported
+                ? isDark
+                  ? "bg-green-900/30 text-green-300"
+                  : "bg-green-50 text-green-700"
+                : isDark
+                  ? "bg-amber-900/30 text-amber-300"
+                  : "bg-amber-50 text-amber-700"
+            }`}
+            style={{ fontSize: 10 }}
+          >
+            {runtimeLabel}
+          </span>
+          <span
+            className={`rounded-full px-2 py-0.5 ${
+              capability?.wired_supported
+                ? isDark
+                  ? "bg-blue-900/30 text-blue-300"
+                  : "bg-blue-50 text-blue-700"
+                : isDark
+                  ? "bg-gray-800 text-gray-300"
+                  : "bg-gray-100 text-gray-600"
+            }`}
+            style={{ fontSize: 10 }}
+          >
+            {wiredLabel}
+          </span>
+        </div>
+      </div>
+      <div
+        className={`mt-1 ${isDark ? "text-gray-500" : "text-gray-500"}`}
+        style={{ fontSize: 11 }}
+      >
+        {capability?.runtime_reason ?? "未读取 runtime 能力"}
+      </div>
+      <div
+        className={`mt-0.5 ${isDark ? "text-gray-500" : "text-gray-500"}`}
+        style={{ fontSize: 11 }}
+      >
+        {capability?.wired_reason ?? "未读取 decode 接线状态"}
+      </div>
+    </div>
   );
 }
 

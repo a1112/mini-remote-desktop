@@ -111,15 +111,18 @@ impl RealtimeConnection {
     }
 
     pub async fn send_offer(&mut self, description: SessionDescription) -> Result<(), String> {
-        self.send_message(SignalMessage::WebrtcOffer(description)).await
+        self.send_message(SignalMessage::WebrtcOffer(description))
+            .await
     }
 
     pub async fn send_answer(&mut self, description: SessionDescription) -> Result<(), String> {
-        self.send_message(SignalMessage::WebrtcAnswer(description)).await
+        self.send_message(SignalMessage::WebrtcAnswer(description))
+            .await
     }
 
     pub async fn send_ice_candidate(&mut self, candidate: IceCandidate) -> Result<(), String> {
-        self.send_message(SignalMessage::IceCandidate(candidate)).await
+        self.send_message(SignalMessage::IceCandidate(candidate))
+            .await
     }
 
     pub async fn recv_event(&mut self) -> Result<SignalMessage, String> {
@@ -245,7 +248,10 @@ mod tests {
             .await
             .expect("request session");
 
-        let request = connection.recv_event().await.expect("receive request event");
+        let request = connection
+            .recv_event()
+            .await
+            .expect("receive request event");
         assert!(matches!(request, SignalMessage::SessionRequest(_)));
 
         connection

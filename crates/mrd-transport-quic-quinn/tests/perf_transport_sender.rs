@@ -48,7 +48,11 @@ async fn perf_quinn_transport_sender_reports_latency_distribution() {
                 packets_per_sample.push(datagrams.len());
                 success_count += 1;
                 for _ in 0..datagrams.len() {
-                    let _ = pair.server.read_datagram().await.expect("drain server datagram");
+                    let _ = pair
+                        .server
+                        .read_datagram()
+                        .await
+                        .expect("drain server datagram");
                 }
             }
             Err(_) => {

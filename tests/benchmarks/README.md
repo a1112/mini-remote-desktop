@@ -14,6 +14,16 @@ powershell -ExecutionPolicy Bypass -File tests/benchmarks/scripts/run_transport_
   -ScenarioPath tests/benchmarks/scenarios/quick.transport.json
 ```
 
+Quick NVENC runs:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tests/benchmarks/scripts/run_transport_matrix.ps1 `
+  -ScenarioPath tests/benchmarks/scenarios/quick.transport.nvenc.json
+
+powershell -ExecutionPolicy Bypass -File tests/benchmarks/scripts/run_transport_matrix.ps1 `
+  -ScenarioPath tests/benchmarks/scenarios/quick.transport.quic.nvenc.json
+```
+
 Steady baseline:
 
 ```powershell

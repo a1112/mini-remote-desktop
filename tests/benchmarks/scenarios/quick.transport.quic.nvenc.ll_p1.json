@@ -1,0 +1,14 @@
+{
+  "scenario": "quick.transport",
+  "profile": "transport-quic-quinn-nvenc-ll-p1",
+  "transport": "quic_quinn",
+  "capture_backend": "synthetic",
+  "encode_backend": "nvenc_ll_p1",
+  "decode_backend": "h264_software",
+  "renderer_backend": "d3d11",
+  "width": 1280,
+  "height": 720,
+  "fps": 30,
+  "duration_secs": 20,
+  "threshold_file": "transport.quick.json"
+}

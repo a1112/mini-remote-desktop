@@ -5,6 +5,7 @@ members = [
   "common-control-proto",
   "crates/mrd-capture-dxgi",
   "crates/mrd-decode",
+  "crates/mrd-decode-nvdec",
   "crates/mrd-encode-nvenc",
   "crates/mrd-encode-openh264",
   "crates/mrd-observability",

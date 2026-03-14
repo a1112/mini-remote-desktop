@@ -43,6 +43,8 @@ $psi.Environment["MRD_BENCH_FPS"] = [string]$scenario.fps
 $psi.Environment["MRD_BENCH_DURATION_SECS"] = [string]$scenario.duration_secs
 $psi.Environment["MRD_BENCH_GIT_COMMIT"] = $gitCommit
 $psi.Environment["MRD_BENCH_TRANSPORT"] = $scenario.transport
+$psi.Environment["MRD_BENCH_ENCODE_BACKEND"] = $scenario.encode_backend
+$psi.Environment["MRD_BENCH_DECODE_BACKEND"] = $scenario.decode_backend
 
 $process = New-Object System.Diagnostics.Process
 $process.StartInfo = $psi

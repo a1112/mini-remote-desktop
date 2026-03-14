@@ -39,10 +39,7 @@ async fn health() -> Json<HealthResponse> {
 
 type SharedState = Arc<Mutex<SignalingState>>;
 
-async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<SharedState>,
-) -> impl IntoResponse {
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<SharedState>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
@@ -106,28 +103,36 @@ async fn handle_socket(socket: WebSocket, state: SharedState) {
                 forward_to_peer(&state, &target, SignalMessage::SessionRequest(request)).await;
             }
             SignalMessage::SessionAccept(accept) => {
-                let Some(sender_id) = current_device.clone() else { continue };
+                let Some(sender_id) = current_device.clone() else {
+                    continue;
+                };
                 let Ok(peer) = resolve_peer(&state, &accept.session_id, &sender_id).await else {
                     continue;
                 };
                 forward_to_peer(&state, &peer, SignalMessage::SessionAccept(accept)).await;
             }
             SignalMessage::WebrtcOffer(offer) => {
-                let Some(sender_id) = current_device.clone() else { continue };
+                let Some(sender_id) = current_device.clone() else {
+                    continue;
+                };
                 let Ok(peer) = resolve_peer(&state, &offer.session_id, &sender_id).await else {
                     continue;
                 };
                 forward_to_peer(&state, &peer, SignalMessage::WebrtcOffer(offer)).await;
             }
             SignalMessage::WebrtcAnswer(answer) => {
-                let Some(sender_id) = current_device.clone() else { continue };
+                let Some(sender_id) = current_device.clone() else {
+                    continue;
+                };
                 let Ok(peer) = resolve_peer(&state, &answer.session_id, &sender_id).await else {
                     continue;
                 };
                 forward_to_peer(&state, &peer, SignalMessage::WebrtcAnswer(answer)).await;
             }
             SignalMessage::IceCandidate(candidate) => {
-                let Some(sender_id) = current_device.clone() else { continue };
+                let Some(sender_id) = current_device.clone() else {
+                    continue;
+                };
                 let Ok(peer) = resolve_peer(&state, &candidate.session_id, &sender_id).await else {
                     continue;
                 };
@@ -213,7 +218,11 @@ mod tests {
         SessionRequest, SignalMessage,
     };
     use std::sync::Arc;
-    use tokio::{net::TcpListener, sync::Mutex, time::{timeout, Duration}};
+    use tokio::{
+        net::TcpListener,
+        sync::Mutex,
+        time::{timeout, Duration},
+    };
     use tokio_tungstenite::{connect_async, tungstenite::Message};
 
     async fn spawn_server() -> String {
@@ -225,7 +234,9 @@ mod tests {
         let app = build_router(state);
 
         tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("serve test signaling");
+            axum::serve(listener, app)
+                .await
+                .expect("serve test signaling");
         });
 
         format!("ws://{}/ws", addr)

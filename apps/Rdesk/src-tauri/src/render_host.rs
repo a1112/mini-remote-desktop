@@ -162,7 +162,9 @@ impl RenderHost {
         let (frame, latest_frame) = {
             let frame_sink = frame_sink.lock().expect("lock decoded frame sink");
             (
-                frame_sink.snapshot(session_id).map(decoded_frame_snapshot_response),
+                frame_sink
+                    .snapshot(session_id)
+                    .map(decoded_frame_snapshot_response),
                 frame_sink.latest_frame(session_id).cloned(),
             )
         };
@@ -215,17 +217,13 @@ impl RenderHost {
                 if let Some(probe_registry) = self.probe_registry.as_ref() {
                     probe_registry
                         .session_handle(session_id.clone(), DEFAULT_SOURCE_ID)
-                        .record_stage(
-                            StageId::RenderUpload,
-                            started_at.elapsed(),
-                            bytes,
-                            false,
-                        );
+                        .record_stage(StageId::RenderUpload, started_at.elapsed(), bytes, false);
                 }
             }
         }
 
-        let preview_data_url = decoded_frame_preview_with(frame_sink.as_ref(), session_id.0.clone())?;
+        let preview_data_url =
+            decoded_frame_preview_with(frame_sink.as_ref(), session_id.0.clone())?;
         let renderer_snapshot = self
             .renderers
             .get(session_id)
@@ -269,6 +267,7 @@ fn decoded_frame_snapshot_response(
         height: snapshot.height,
         pixel_format: match snapshot.pixel_format {
             mrd_decode::PixelFormat::Rgb24 => "Rgb24".to_string(),
+            mrd_decode::PixelFormat::D3d11Texture => "D3d11Texture".to_string(),
         },
         bytes: snapshot.bytes,
     }
@@ -286,11 +285,14 @@ fn decoded_frame_preview_with(
     let Some(frame) = latest_frame else {
         return Ok(None);
     };
+    let Some(rgb) = frame.cpu_bytes() else {
+        return Ok(None);
+    };
 
     let mut png = Vec::new();
     PngEncoder::new(&mut png)
         .write_image(
-            &frame.data,
+            rgb,
             frame.width as u32,
             frame.height as u32,
             ColorType::Rgb8.into(),
@@ -318,8 +320,9 @@ fn decoded_frame_to_render_frame(frame: &mrd_decode::DecodedFrame) -> RenderFram
         height: frame.height,
         pixel_format: match frame.pixel_format {
             mrd_decode::PixelFormat::Rgb24 => RenderPixelFormat::Rgb24,
+            mrd_decode::PixelFormat::D3d11Texture => RenderPixelFormat::Rgb24,
         },
-        data: frame.data.clone(),
+        data: frame.cpu_bytes().map(|bytes| bytes.to_vec()).unwrap_or_default(),
     }
 }
 
@@ -345,17 +348,15 @@ mod tests {
     #[test]
     fn attached_session_exposes_preview_snapshot() {
         let sink = std::sync::Arc::new(std::sync::Mutex::new(DecodedFrameSink::default()));
-        sink.lock()
-            .expect("lock frame sink")
-            .ingest_frame(
-                SessionId("session-render".into()),
-                DecodedFrame {
-                    width: 4,
-                    height: 4,
-                    pixel_format: PixelFormat::Rgb24,
-                    data: vec![128; 4 * 4 * 3],
-                },
-            );
+        sink.lock().expect("lock frame sink").ingest_frame(
+            SessionId("session-render".into()),
+            DecodedFrame {
+                width: 4,
+                height: 4,
+                pixel_format: PixelFormat::Rgb24,
+                data: vec![128; 4 * 4 * 3],
+            },
+        );
 
         let mut render_host = RenderHost::with_frame_sink(sink);
         render_host

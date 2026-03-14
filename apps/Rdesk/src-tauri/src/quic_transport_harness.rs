@@ -8,9 +8,12 @@ use std::{
     time::Duration,
 };
 
+use mrd_encode_nvenc::NvencH264Encoder;
 use mrd_encode_openh264::OpenH264Encoder;
 use mrd_observability::{PipelineProbeSnapshot, ProbeRegistry, StageId};
-use mrd_pipeline_core::{CapturedFrame, FrameCapture, FramePixelFormat, VideoEncoder};
+use mrd_pipeline_core::{
+    CapturedFrame, FrameCapture, FramePixelFormat, PipelineError, VideoEncoder,
+};
 use mrd_proto::SessionId;
 use mrd_transport_quic_quinn::{
     fragment_access_unit, QuicAuReassembler, QuicAuReassemblerConfig, QuicAuReassemblerStats,
@@ -156,6 +159,7 @@ pub(crate) struct QuicBenchmarkOutcome {
     pub receiver_probe: PipelineProbeSnapshot,
     pub sink_snapshot: DecodedFrameSnapshot,
     pub first_frame_time_ms: f64,
+    pub transport_label: String,
 }
 
 struct QuicHostedPairHarness {
@@ -185,7 +189,7 @@ impl QuicHostedPairHarness {
     }
 
     async fn start(&mut self) -> Result<(), String> {
-        self.start_with_capture(FakeCapture { tick: 0 }, 16, 16, 30)
+        self.start_with_capture(FakeCapture { tick: 0 }, 16, 16, 30, "openh264")
             .await
     }
 
@@ -195,6 +199,7 @@ impl QuicHostedPairHarness {
         width: usize,
         height: usize,
         fps: u32,
+        encode_backend: &str,
     ) -> Result<(), String>
     where
         C: FrameCapture + Send + 'static,
@@ -203,14 +208,16 @@ impl QuicHostedPairHarness {
             return Ok(());
         }
 
-        let mut encoder = OpenH264Encoder::new(width, height, fps)
+        let mut encoder = create_test_encoder(encode_backend, width, height, fps)
             .map_err(|error| format!("create encoder failed: {error}"))?;
-        let sender_probe = self
-            .probe_registry
-            .session_handle(self.session_id.clone(), format!("{DEFAULT_SOURCE_ID}-sender"));
+        let sender_probe = self.probe_registry.session_handle(
+            self.session_id.clone(),
+            format!("{DEFAULT_SOURCE_ID}-sender"),
+        );
         sender_probe.set_backend("synthetic");
         sender_probe.set_codec("h264");
         sender_probe.set_transport("quic_quinn");
+        sender_probe.set_counter("quic_sender_encode_backend", 0);
 
         let receiver_probe = self
             .probe_registry
@@ -220,7 +227,9 @@ impl QuicHostedPairHarness {
 
         let running = self.running.clone();
         let client = self.pair.client.clone();
+        let encode_backend = encode_backend.to_string();
         let sender_task = tokio::spawn(async move {
+            sender_probe.set_backend(format!("synthetic+{encode_backend}"));
             let mut last_tick = tokio::time::Instant::now();
             let mut frame_id = 0_u32;
             let max_datagram_size = client.max_datagram_size().unwrap_or(1200);
@@ -300,22 +309,25 @@ impl QuicHostedPairHarness {
             let mut last_reassembly_drop_total = 0_u64;
             while running.load(Ordering::Relaxed) {
                 let receive_started_at = std::time::Instant::now();
-                let payload = match tokio::time::timeout(Duration::from_millis(25), server.read_datagram()).await {
-                    Ok(Ok(payload)) => payload,
-                    Ok(Err(_)) => break,
-                    Err(_) => {
-                        reassembler.prune_expired();
-                        let total_drops =
-                            sync_reassembly_probe(&receiver_probe, reassembler.stats());
-                        if total_drops > last_reassembly_drop_total {
-                            receiver_probe.increment_dropped_frames(
-                                total_drops - last_reassembly_drop_total,
-                            );
-                            last_reassembly_drop_total = total_drops;
+                let payload =
+                    match tokio::time::timeout(Duration::from_millis(25), server.read_datagram())
+                        .await
+                    {
+                        Ok(Ok(payload)) => payload,
+                        Ok(Err(_)) => break,
+                        Err(_) => {
+                            reassembler.prune_expired();
+                            let total_drops =
+                                sync_reassembly_probe(&receiver_probe, reassembler.stats());
+                            if total_drops > last_reassembly_drop_total {
+                                receiver_probe.increment_dropped_frames(
+                                    total_drops - last_reassembly_drop_total,
+                                );
+                                last_reassembly_drop_total = total_drops;
+                            }
+                            continue;
                         }
-                        continue;
-                    }
-                };
+                    };
                 receiver_probe.record_stage(
                     StageId::NetworkIngress,
                     receive_started_at.elapsed(),
@@ -328,9 +340,8 @@ impl QuicHostedPairHarness {
                         let total_drops =
                             sync_reassembly_probe(&receiver_probe, reassembler.stats());
                         if total_drops > last_reassembly_drop_total {
-                            receiver_probe.increment_dropped_frames(
-                                total_drops - last_reassembly_drop_total,
-                            );
+                            receiver_probe
+                                .increment_dropped_frames(total_drops - last_reassembly_drop_total);
                             last_reassembly_drop_total = total_drops;
                         }
                         frame
@@ -374,7 +385,8 @@ impl QuicHostedPairHarness {
                 }
                 let total_drops = sync_reassembly_probe(&receiver_probe, reassembler.stats());
                 if total_drops > last_reassembly_drop_total {
-                    receiver_probe.increment_dropped_frames(total_drops - last_reassembly_drop_total);
+                    receiver_probe
+                        .increment_dropped_frames(total_drops - last_reassembly_drop_total);
                     last_reassembly_drop_total = total_drops;
                 }
             }
@@ -402,10 +414,19 @@ impl QuicHostedPairHarness {
             }
         })
         .await
-        .map_err(|_| format!("timed out waiting for first QUIC frame for {}", self.session_id.0))
+        .map_err(|_| {
+            format!(
+                "timed out waiting for first QUIC frame for {}",
+                self.session_id.0
+            )
+        })
     }
 
-    async fn sample_frame_progress(&self, duration: Duration, step: Duration) -> FrameProgressSample {
+    async fn sample_frame_progress(
+        &self,
+        duration: Duration,
+        step: Duration,
+    ) -> FrameProgressSample {
         let start_frame_count = self
             .sink_snapshot()
             .map(|snapshot| snapshot.frame_count)
@@ -456,7 +477,10 @@ fn sync_reassembly_probe(
     receiver_probe.set_counter("quic_receiver_completed_frames", stats.completed_frames);
     receiver_probe.set_counter("quic_receiver_expired_frames", stats.expired_frames);
     receiver_probe.set_counter("quic_receiver_evicted_frames", stats.evicted_frames);
-    receiver_probe.set_counter("quic_receiver_duplicate_fragments", stats.duplicate_fragments);
+    receiver_probe.set_counter(
+        "quic_receiver_duplicate_fragments",
+        stats.duplicate_fragments,
+    );
     receiver_probe.set_counter("quic_receiver_rejected_fragments", stats.rejected_fragments);
     receiver_probe.set_counter("quic_receiver_pending_frames", stats.pending_frames);
     let dropped = stats
@@ -473,10 +497,22 @@ pub(crate) async fn run_quic_benchmark_pipeline(
     height: usize,
     fps: u32,
     duration_secs: u64,
+    encode_backend: &str,
+    _decode_backend: &str,
 ) -> Result<QuicBenchmarkOutcome, String> {
     let mut harness = QuicHostedPairHarness::new(&session_id.0).await?;
     harness
-        .start_with_capture(BenchmarkCapture { tick: 0, width, height }, width, height, fps)
+        .start_with_capture(
+            BenchmarkCapture {
+                tick: 0,
+                width,
+                height,
+            },
+            width,
+            height,
+            fps,
+            encode_backend,
+        )
         .await?;
     let started_at = std::time::Instant::now();
     harness.wait_for_first_frame(Duration::from_secs(8)).await?;
@@ -487,7 +523,53 @@ pub(crate) async fn run_quic_benchmark_pipeline(
         receiver_probe: harness.receiver_probe(),
         sink_snapshot: harness.sink_snapshot().expect("sink snapshot"),
         first_frame_time_ms,
+        transport_label: "quic_quinn".to_string(),
     })
+}
+
+enum QuicBenchmarkEncoder {
+    OpenH264(OpenH264Encoder),
+    Nvenc(NvencH264Encoder),
+}
+
+impl VideoEncoder for QuicBenchmarkEncoder {
+    fn encode(
+        &mut self,
+        frame: &CapturedFrame,
+    ) -> Result<Vec<mrd_pipeline_core::EncodedAccessUnit>, PipelineError> {
+        match self {
+            Self::OpenH264(encoder) => encoder.encode(frame),
+            Self::Nvenc(encoder) => encoder.encode(frame),
+        }
+    }
+}
+
+fn create_test_encoder(
+    backend: &str,
+    width: usize,
+    height: usize,
+    fps: u32,
+) -> Result<QuicBenchmarkEncoder, PipelineError> {
+    match backend {
+        "nvenc" => Ok(QuicBenchmarkEncoder::Nvenc(NvencH264Encoder::new(
+            width, height, fps,
+        )?)),
+        "nvenc_ll_p1" => Ok(QuicBenchmarkEncoder::Nvenc(
+            NvencH264Encoder::new_low_latency_p1(width, height, fps)?,
+        )),
+        "nvenc_hq_p5" => Ok(QuicBenchmarkEncoder::Nvenc(
+            NvencH264Encoder::new_high_quality_p5(width, height, fps)?,
+        )),
+        "openh264" => Ok(QuicBenchmarkEncoder::OpenH264(OpenH264Encoder::new(
+            width, height, fps,
+        )?)),
+        "openh264_speed" => Ok(QuicBenchmarkEncoder::OpenH264(
+            OpenH264Encoder::new_speed(width, height, fps)?,
+        )),
+        other => Err(PipelineError::message(format!(
+            "unsupported test encoder backend: {other}"
+        ))),
+    }
 }
 
 struct BenchmarkCapture {

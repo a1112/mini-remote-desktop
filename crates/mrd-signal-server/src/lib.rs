@@ -19,7 +19,11 @@ impl SessionRouter {
         self.routes.insert(session_id, route);
     }
 
-    pub fn resolve_peer(&self, session_id: &SessionId, sender: &DeviceId) -> Result<DeviceId, SessionRouteError> {
+    pub fn resolve_peer(
+        &self,
+        session_id: &SessionId,
+        sender: &DeviceId,
+    ) -> Result<DeviceId, SessionRouteError> {
         let route = self
             .routes
             .get(session_id)

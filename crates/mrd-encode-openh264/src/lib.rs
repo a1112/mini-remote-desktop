@@ -23,8 +23,9 @@ impl OpenH264Encoder {
             .intra_frame_period(IntraFramePeriod::from_num_frames(fps.max(1)))
             .skip_frames(false);
         let api = OpenH264API::from_source();
-        let encoder = Encoder::with_api_config(api, config)
-            .map_err(|error| PipelineError::message(format!("create openh264 encoder failed: {error}")))?;
+        let encoder = Encoder::with_api_config(api, config).map_err(|error| {
+            PipelineError::message(format!("create openh264 encoder failed: {error}"))
+        })?;
 
         Ok(Self {
             encoder,
@@ -33,6 +34,10 @@ impl OpenH264Encoder {
             fps: fps.max(1),
             frame_index: 0,
         })
+    }
+
+    pub fn new_speed(width: usize, height: usize, fps: u32) -> Result<Self, PipelineError> {
+        Self::new(width, height, fps)
     }
 }
 

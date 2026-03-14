@@ -44,8 +44,8 @@ impl D3d11Renderer {
         {
             use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
             use windows::Win32::Graphics::Direct3D11::{
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION, D3D11CreateDevice,
-                ID3D11Device, ID3D11DeviceContext,
+                D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
             };
 
             let mut device = None::<ID3D11Device>;
@@ -101,8 +101,8 @@ impl D3d11Renderer {
             DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
         };
         use windows::Win32::Graphics::Dxgi::{
-            DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_EFFECT_FLIP_DISCARD,
-            DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice, IDXGIFactory2, IDXGISwapChain1,
+            IDXGIDevice, IDXGIFactory2, IDXGISwapChain1, DXGI_SCALING_STRETCH,
+            DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT,
         };
         use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 
@@ -130,7 +130,10 @@ impl D3d11Renderer {
             Height: height,
             Format: DXGI_FORMAT_B8G8R8A8_UNORM,
             Stereo: false.into(),
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
             BufferCount: 2,
             Scaling: DXGI_SCALING_STRETCH,
@@ -153,10 +156,13 @@ impl D3d11Renderer {
         let back_buffer: ID3D11Texture2D = unsafe { swap_chain.GetBuffer(0) }
             .map_err(|error| RenderError::Message(format!("获取 back buffer 失败: {error}")))?;
         let mut render_target_view = None::<ID3D11RenderTargetView>;
-        unsafe { self.device.CreateRenderTargetView(&back_buffer, None, Some(&mut render_target_view)) }
-            .map_err(|error| RenderError::Message(format!("创建 RTV 失败: {error}")))?;
-        let render_target_view =
-            render_target_view.ok_or_else(|| RenderError::Message("缺少 render target view".into()))?;
+        unsafe {
+            self.device
+                .CreateRenderTargetView(&back_buffer, None, Some(&mut render_target_view))
+        }
+        .map_err(|error| RenderError::Message(format!("创建 RTV 失败: {error}")))?;
+        let render_target_view = render_target_view
+            .ok_or_else(|| RenderError::Message("缺少 render target view".into()))?;
 
         Ok(Some(RenderSurface {
             swap_chain,
@@ -279,7 +285,9 @@ impl RendererInstance for D3d11Renderer {
         #[cfg(windows)]
         {
             self.surface = match target {
-                RenderTarget::WindowHandle(window_handle) => self.attach_window_surface(window_handle)?,
+                RenderTarget::WindowHandle(window_handle) => {
+                    self.attach_window_surface(window_handle)?
+                }
             };
         }
 
@@ -289,7 +297,9 @@ impl RendererInstance for D3d11Renderer {
 
     fn upload_frame(&mut self, frame: RenderFrame) -> Result<(), RenderError> {
         if frame.pixel_format != RenderPixelFormat::Rgb24 {
-            return Err(RenderError::Message("d3d11 backend 当前只支持 Rgb24".into()));
+            return Err(RenderError::Message(
+                "d3d11 backend 当前只支持 Rgb24".into(),
+            ));
         }
 
         #[cfg(windows)]

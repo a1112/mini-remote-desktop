@@ -216,6 +216,12 @@ describe("realtimeSessionService", () => {
         lastDecodedWidth: 16,
         lastDecodedHeight: 16,
         lastDecodedPixelFormat: "Rgb24",
+        decodePolicy: "auto",
+        preferredDecodeBackend: "nvdec",
+        activeDecodeBackend: "h264_software",
+        decodeBackendReason: "nvdec unavailable, fell back to h264_software",
+        decodeFallbackCount: 1,
+        lastDecodeFallbackReason: "nvdec runtime probe unhealthy",
       });
 
     const {
@@ -245,6 +251,9 @@ describe("realtimeSessionService", () => {
     expect(snapshot?.lastRemoteCodec).toBe("video/h264");
     expect(snapshot?.decodedFrameCount).toBe(1);
     expect(snapshot?.lastDecodedPixelFormat).toBe("Rgb24");
+    expect(snapshot?.decodePolicy).toBe("auto");
+    expect(snapshot?.preferredDecodeBackend).toBe("nvdec");
+    expect(snapshot?.activeDecodeBackend).toBe("h264_software");
     expect(invokeMock).toHaveBeenNthCalledWith(1, "webrtc_host_create_offer", {
       sessionId: "session-2",
     });
@@ -346,6 +355,12 @@ describe("realtimeSessionService", () => {
           lastDecodedWidth: 1280,
           lastDecodedHeight: 720,
           lastDecodedPixelFormat: "Rgb24",
+          decodePolicy: "nvdec",
+          preferredDecodeBackend: "nvdec",
+          activeDecodeBackend: "nvdec",
+          decodeBackendReason: "using nvdec for current H264 track",
+          decodeFallbackCount: 0,
+          lastDecodeFallbackReason: undefined,
         },
         webrtcSignaling: {
           localOffer: "offer-sdp",

@@ -1,26 +1,31 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod device_info;
+mod app_settings;
 mod benchmark;
+mod device_info;
 mod frame_sink;
-mod render_host;
+#[cfg(test)]
+mod quic_transport_harness;
 mod realtime_client;
 mod realtime_management;
 mod realtime_runtime;
+mod render_host;
+mod render_surface_catalog;
+mod render_window_registry;
+mod session_lifecycle;
+mod session_runtime;
 mod webrtc_host;
 mod webrtc_media;
 mod webrtc_session;
-mod render_window_registry;
-mod render_surface_catalog;
-mod session_lifecycle;
-mod session_runtime;
-#[cfg(test)]
-mod quic_transport_harness;
 
+use app_settings::{
+    default_settings_path, load_settings, save_settings, AppSettings, DecodePolicy,
+};
 use device_info::HardwareInfo;
 use frame_sink::{DecodedFrameSink, DecodedFrameSnapshot};
 use image::{codecs::png::PngEncoder, ColorType, ImageEncoder};
+use mrd_decode_nvdec::probe_runtime as probe_nvdec_runtime;
 use mrd_observability::{MediaProbeEvent, PipelineProbeSnapshot, ProbeRegistry};
 use mrd_proto::{BackendRole, DeviceId, SessionId};
 use mrd_signal_client::encode_message;
@@ -32,9 +37,11 @@ use render_host::{
 };
 use render_surface_catalog::RenderSurfaceDescriptor;
 use render_window_registry::{RenderWindowContext, RenderWindowRegistry};
-use session_lifecycle::{SessionLifecycleCoordinator, SessionLifecycleSnapshot, SurfaceSourceBinding};
-use session_runtime::sync_session_runtime;
 use serde::{Deserialize, Serialize};
+use session_lifecycle::{
+    SessionLifecycleCoordinator, SessionLifecycleSnapshot, SurfaceSourceBinding,
+};
+use session_runtime::sync_session_runtime;
 use std::collections::HashMap;
 use tauri::Manager;
 use tokio::sync::Mutex;
@@ -48,6 +55,7 @@ struct AppState {
     render_windows: std::sync::Arc<std::sync::Mutex<RenderWindowRegistry>>,
     session_lifecycle: std::sync::Arc<std::sync::Mutex<SessionLifecycleCoordinator>>,
     realtime_runtime: RealtimeRuntime,
+    settings_path: std::path::PathBuf,
     webrtc_host: std::sync::Arc<Mutex<WebrtcHost>>,
     webrtc_sessions: std::sync::Arc<Mutex<WebrtcSessionCoordinator>>,
 }
@@ -84,12 +92,22 @@ struct WebrtcHostSnapshotResponse {
     remote_video_track_count: usize,
     remote_rtp_packet_count: u64,
     last_remote_codec: Option<String>,
+    last_remote_payload_type: Option<u8>,
+    last_remote_fmtp_line: Option<String>,
     remote_h264_access_unit_count: u64,
     last_remote_access_unit_bytes: usize,
+    recent_remote_access_unit_bytes: Vec<usize>,
+    recent_remote_access_unit_keyframes: Vec<bool>,
     decoded_frame_count: u64,
     last_decoded_width: usize,
     last_decoded_height: usize,
     last_decoded_pixel_format: Option<String>,
+    decode_policy: Option<String>,
+    preferred_decode_backend: Option<String>,
+    active_decode_backend: Option<String>,
+    decode_backend_reason: Option<String>,
+    decode_fallback_count: u64,
+    last_decode_fallback_reason: Option<String>,
     decode_error_count: u64,
     last_decode_error: Option<String>,
     available_video_source_ids: Vec<String>,
@@ -166,10 +184,58 @@ struct SessionRuntimeSnapshotResponse {
     webrtc_signaling: Option<WebrtcSessionSnapshotResponse>,
 }
 
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct NvdecCapabilityProbeResponse {
+    codec: String,
+    bit_depth_minus8: u8,
+    chroma_format: i32,
+    runtime_supported: bool,
+    runtime_reason: String,
+    wired_supported: bool,
+    wired_reason: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct NvdecRuntimeProbeResponse {
+    backend: String,
+    summary: String,
+    checked_items: Vec<String>,
+    capability_probes: Vec<NvdecCapabilityProbeResponse>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct DecodePolicyResponse {
+    decode_policy: String,
+}
+
 /// Tauri 命令：获取硬件信息
 #[tauri::command]
 fn get_hardware_info() -> Result<HardwareInfo, String> {
     Ok(device_info::get_hardware_info())
+}
+
+#[tauri::command]
+fn nvdec_runtime_probe() -> Result<NvdecRuntimeProbeResponse, String> {
+    Ok(nvdec_runtime_probe_response())
+}
+
+#[tauri::command]
+async fn decode_policy(state: tauri::State<'_, AppState>) -> Result<DecodePolicyResponse, String> {
+    Ok(decode_policy_with(state.webrtc_host.as_ref()).await)
+}
+
+#[tauri::command]
+async fn set_decode_policy(
+    state: tauri::State<'_, AppState>,
+    decode_policy: String,
+) -> Result<DecodePolicyResponse, String> {
+    let decode_policy = parse_decode_policy(&decode_policy)?;
+    set_decode_policy_with(
+        &state.settings_path,
+        state.webrtc_host.as_ref(),
+        decode_policy,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -366,8 +432,12 @@ async fn webrtc_host_create_offer(
 ) -> Result<String, String> {
     let description =
         webrtc_host_create_offer_with(state.webrtc_host.as_ref(), session_id.clone()).await?;
-    webrtc_create_local_offer_with(state.webrtc_sessions.as_ref(), session_id, description.sdp.clone())
-        .await?;
+    webrtc_create_local_offer_with(
+        state.webrtc_sessions.as_ref(),
+        session_id,
+        description.sdp.clone(),
+    )
+    .await?;
     Ok(description.sdp)
 }
 
@@ -377,8 +447,12 @@ async fn webrtc_host_apply_remote_offer(
     session_id: String,
     sdp: String,
 ) -> Result<(), String> {
-    webrtc_host_apply_remote_offer_with(state.webrtc_host.as_ref(), session_id.clone(), sdp.clone())
-        .await?;
+    webrtc_host_apply_remote_offer_with(
+        state.webrtc_host.as_ref(),
+        session_id.clone(),
+        sdp.clone(),
+    )
+    .await?;
     state
         .webrtc_sessions
         .lock()
@@ -407,8 +481,12 @@ async fn webrtc_host_apply_remote_answer(
     session_id: String,
     sdp: String,
 ) -> Result<(), String> {
-    webrtc_host_apply_remote_answer_with(state.webrtc_host.as_ref(), session_id.clone(), sdp.clone())
-        .await?;
+    webrtc_host_apply_remote_answer_with(
+        state.webrtc_host.as_ref(),
+        session_id.clone(),
+        sdp.clone(),
+    )
+    .await?;
     webrtc_apply_remote_answer_with(state.webrtc_sessions.as_ref(), session_id, sdp).await
 }
 
@@ -497,7 +575,10 @@ async fn decoded_frame_snapshot(
     state: tauri::State<'_, AppState>,
     session_id: String,
 ) -> Result<Option<DecodedFrameSnapshotResponse>, String> {
-    Ok(decoded_frame_snapshot_with(state.frame_sink.as_ref(), session_id))
+    Ok(decoded_frame_snapshot_with(
+        state.frame_sink.as_ref(),
+        session_id,
+    ))
 }
 
 #[tauri::command]
@@ -533,10 +614,7 @@ async fn render_host_attach_session(
             .session_lifecycle
             .lock()
             .expect("lock session lifecycle");
-        let mut render_host = state
-            .render_host
-            .lock()
-            .expect("lock render host");
+        let mut render_host = state.render_host.lock().expect("lock render host");
         sync_session_runtime(&mut lifecycle, &mut render_host, &session_id)?;
     }
     state
@@ -587,10 +665,7 @@ async fn bind_current_render_window_surface(
             .session_lifecycle
             .lock()
             .expect("lock session lifecycle");
-        let mut render_host = state
-            .render_host
-            .lock()
-            .expect("lock render host");
+        let mut render_host = state.render_host.lock().expect("lock render host");
         sync_session_runtime(&mut lifecycle, &mut render_host, &session_id)?;
     }
     state
@@ -625,10 +700,7 @@ async fn render_host_snapshot(
             .session_lifecycle
             .lock()
             .expect("lock session lifecycle");
-        let mut render_host = state
-            .render_host
-            .lock()
-            .expect("lock render host");
+        let mut render_host = state.render_host.lock().expect("lock render host");
         sync_session_runtime(&mut lifecycle, &mut render_host, &session_id)?;
     }
     let snapshot = render_host_snapshot_with(state.render_host.as_ref(), session_id.0)?;
@@ -653,10 +725,7 @@ async fn bind_render_surface_source(
             .session_lifecycle
             .lock()
             .expect("lock session lifecycle");
-        let mut render_host = state
-            .render_host
-            .lock()
-            .expect("lock render host");
+        let mut render_host = state.render_host.lock().expect("lock render host");
         sync_session_runtime(&mut lifecycle, &mut render_host, &session_id)?;
     }
     Ok(())
@@ -673,10 +742,7 @@ async fn session_lifecycle_snapshot(
             .session_lifecycle
             .lock()
             .expect("lock session lifecycle");
-        let mut render_host = state
-            .render_host
-            .lock()
-            .expect("lock render host");
+        let mut render_host = state.render_host.lock().expect("lock render host");
         sync_session_runtime(&mut lifecycle, &mut render_host, &session_id)?;
     }
     let snapshot = state
@@ -712,7 +778,8 @@ async fn session_runtime_sync_realtime(
         state.webrtc_sessions.as_ref(),
         handle,
     )
-    .await? else {
+    .await?
+    else {
         return Ok(None);
     };
 
@@ -937,11 +1004,7 @@ async fn realtime_register_with(
     name: String,
 ) -> Result<RealtimeRegistrationResponse, String> {
     let registration = runtime
-        .register(
-            parse_backend_role(&role)?,
-            device_id.map(DeviceId),
-            name,
-        )
+        .register(parse_backend_role(&role)?, device_id.map(DeviceId), name)
         .await?;
 
     Ok(realtime_registration_response(registration))
@@ -981,11 +1044,69 @@ fn parse_backend_role(role: &str) -> Result<BackendRole, String> {
     }
 }
 
-fn realtime_registration_response(registration: RealtimeRegistration) -> RealtimeRegistrationResponse {
+fn realtime_registration_response(
+    registration: RealtimeRegistration,
+) -> RealtimeRegistrationResponse {
     RealtimeRegistrationResponse {
         handle: registration.handle,
         device_id: registration.device_id.0,
     }
+}
+
+fn nvdec_runtime_probe_response() -> NvdecRuntimeProbeResponse {
+    let probe = probe_nvdec_runtime();
+    NvdecRuntimeProbeResponse {
+        backend: probe.backend.to_string(),
+        summary: probe.summary,
+        checked_items: probe
+            .checked_items
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        capability_probes: probe
+            .capability_probes
+            .into_iter()
+            .map(|capability| NvdecCapabilityProbeResponse {
+                codec: capability.codec,
+                bit_depth_minus8: capability.bit_depth_minus8,
+                chroma_format: capability.chroma_format,
+                runtime_supported: capability.runtime_supported,
+                runtime_reason: capability.runtime_reason,
+                wired_supported: capability.wired_supported,
+                wired_reason: capability.wired_reason,
+            })
+            .collect(),
+    }
+}
+
+fn parse_decode_policy(value: &str) -> Result<DecodePolicy, String> {
+    match value {
+        "auto" => Ok(DecodePolicy::Auto),
+        "software" => Ok(DecodePolicy::Software),
+        "d3d11va" => Ok(DecodePolicy::D3d11va),
+        "nvdec" => Ok(DecodePolicy::Nvdec),
+        other => Err(format!("未知 decode policy: {other}")),
+    }
+}
+
+async fn decode_policy_with(host: &Mutex<WebrtcHost>) -> DecodePolicyResponse {
+    let host = host.lock().await;
+    DecodePolicyResponse {
+        decode_policy: host.decode_policy().as_str().to_string(),
+    }
+}
+
+async fn set_decode_policy_with(
+    settings_path: &std::path::Path,
+    host: &Mutex<WebrtcHost>,
+    decode_policy: DecodePolicy,
+) -> Result<DecodePolicyResponse, String> {
+    save_settings(settings_path, &AppSettings { decode_policy })?;
+    let mut host = host.lock().await;
+    host.set_decode_policy(decode_policy);
+    Ok(DecodePolicyResponse {
+        decode_policy: host.decode_policy().as_str().to_string(),
+    })
 }
 
 fn webrtc_snapshot_response(snapshot: &WebrtcSessionSnapshot) -> WebrtcSessionSnapshotResponse {
@@ -1007,12 +1128,22 @@ fn webrtc_host_snapshot_response(snapshot: &WebrtcHostSnapshot) -> WebrtcHostSna
         remote_video_track_count: snapshot.remote_video_track_count,
         remote_rtp_packet_count: snapshot.remote_rtp_packet_count,
         last_remote_codec: snapshot.last_remote_codec.clone(),
+        last_remote_payload_type: snapshot.last_remote_payload_type,
+        last_remote_fmtp_line: snapshot.last_remote_fmtp_line.clone(),
         remote_h264_access_unit_count: snapshot.remote_h264_access_unit_count,
         last_remote_access_unit_bytes: snapshot.last_remote_access_unit_bytes,
+        recent_remote_access_unit_bytes: snapshot.recent_remote_access_unit_bytes.clone(),
+        recent_remote_access_unit_keyframes: snapshot.recent_remote_access_unit_keyframes.clone(),
         decoded_frame_count: snapshot.decoded_frame_count,
         last_decoded_width: snapshot.last_decoded_width,
         last_decoded_height: snapshot.last_decoded_height,
         last_decoded_pixel_format: snapshot.last_decoded_pixel_format.clone(),
+        decode_policy: snapshot.decode_policy.clone(),
+        preferred_decode_backend: snapshot.preferred_decode_backend.clone(),
+        active_decode_backend: snapshot.active_decode_backend.clone(),
+        decode_backend_reason: snapshot.decode_backend_reason.clone(),
+        decode_fallback_count: snapshot.decode_fallback_count,
+        last_decode_fallback_reason: snapshot.last_decode_fallback_reason.clone(),
         decode_error_count: snapshot.decode_error_count,
         last_decode_error: snapshot.last_decode_error.clone(),
         available_video_source_ids: snapshot.available_video_source_ids.clone(),
@@ -1027,13 +1158,16 @@ fn webrtc_host_snapshot_response(snapshot: &WebrtcHostSnapshot) -> WebrtcHostSna
     }
 }
 
-fn decoded_frame_snapshot_response(snapshot: &DecodedFrameSnapshot) -> DecodedFrameSnapshotResponse {
+fn decoded_frame_snapshot_response(
+    snapshot: &DecodedFrameSnapshot,
+) -> DecodedFrameSnapshotResponse {
     DecodedFrameSnapshotResponse {
         frame_count: snapshot.frame_count,
         width: snapshot.width,
         height: snapshot.height,
         pixel_format: match snapshot.pixel_format {
             mrd_decode::PixelFormat::Rgb24 => "Rgb24".to_string(),
+            mrd_decode::PixelFormat::D3d11Texture => "D3d11Texture".to_string(),
         },
         bytes: snapshot.bytes,
     }
@@ -1351,10 +1485,13 @@ fn decoded_frame_preview_with(
         return Ok(None);
     };
 
+    let Some(rgb) = frame.cpu_bytes() else {
+        return Ok(None);
+    };
     let mut png = Vec::new();
     PngEncoder::new(&mut png)
         .write_image(
-            &frame.data,
+            rgb,
             frame.width as u32,
             frame.height as u32,
             ColorType::Rgb8.into(),
@@ -1372,9 +1509,18 @@ fn main() {
     let render_host = std::sync::Arc::new(std::sync::Mutex::new(
         RenderHost::with_frame_sink_and_probes(frame_sink.clone(), Some(probe_registry.clone())),
     ));
-    let render_windows = std::sync::Arc::new(std::sync::Mutex::new(RenderWindowRegistry::default()));
+    let render_windows =
+        std::sync::Arc::new(std::sync::Mutex::new(RenderWindowRegistry::default()));
     let session_lifecycle =
         std::sync::Arc::new(std::sync::Mutex::new(SessionLifecycleCoordinator::default()));
+    let settings_path = default_settings_path();
+    let settings = load_settings(&settings_path).unwrap_or_else(|error| {
+        eprintln!("failed to load app settings: {error}");
+        AppSettings::default()
+    });
+    let mut webrtc_host =
+        WebrtcHost::with_frame_sink_and_probes(frame_sink.clone(), probe_registry);
+    webrtc_host.set_decode_policy(settings.decode_policy);
     tauri::Builder::default()
         .manage(AppState {
             frame_sink: frame_sink.clone(),
@@ -1382,14 +1528,15 @@ fn main() {
             render_windows,
             session_lifecycle,
             realtime_runtime: RealtimeRuntime::from_env(),
-            webrtc_host: std::sync::Arc::new(Mutex::new(WebrtcHost::with_frame_sink_and_probes(
-                frame_sink,
-                probe_registry,
-            ))),
+            settings_path,
+            webrtc_host: std::sync::Arc::new(Mutex::new(webrtc_host)),
             webrtc_sessions: std::sync::Arc::new(Mutex::new(WebrtcSessionCoordinator::default())),
         })
         .invoke_handler(tauri::generate_handler![
             get_hardware_info,
+            nvdec_runtime_probe,
+            decode_policy,
+            set_decode_policy,
             register_device,
             check_device_registration,
             realtime_status,
@@ -1445,17 +1592,21 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        benchmark::{write_benchmark_artifacts, BenchmarkManifest, BenchmarkPaths, BenchmarkSummary},
-        decoded_frame_preview_with, decoded_frame_snapshot_with, drain_realtime_events_with, realtime_accept_session_with,
-        realtime_register_with, render_host_snapshot_response,
-        realtime_request_session_with, webrtc_apply_remote_answer_with,
+        benchmark::{
+            write_benchmark_artifacts, BenchmarkManifest, BenchmarkPaths, BenchmarkSummary,
+        },
+        decode_policy_with, decoded_frame_preview_with, decoded_frame_snapshot_with,
+        drain_realtime_events_with, nvdec_runtime_probe_response, realtime_accept_session_with,
+        realtime_register_with, realtime_request_session_with, render_host_snapshot_response,
+        set_decode_policy_with, webrtc_apply_remote_answer_with,
         webrtc_apply_remote_ice_candidate_with, webrtc_create_local_offer_with,
         webrtc_host_apply_remote_answer_with, webrtc_host_apply_remote_offer_with,
-        webrtc_host_create_answer_with, webrtc_host_create_offer_with,
-        webrtc_host_snapshot_with, webrtc_snapshot_with, webrtc_sync_realtime_events_with,
+        webrtc_host_create_answer_with, webrtc_host_create_offer_with, webrtc_host_snapshot_with,
+        webrtc_snapshot_with, webrtc_sync_realtime_events_with,
     };
     use crate::{
-        frame_sink::DecodedFrameSink, realtime_runtime::RealtimeRuntime, render_host::RenderHost, webrtc_host::WebrtcHost,
+        app_settings::DecodePolicy, frame_sink::DecodedFrameSink,
+        realtime_runtime::RealtimeRuntime, render_host::RenderHost, webrtc_host::WebrtcHost,
         webrtc_session::WebrtcSessionCoordinator,
     };
     use axum::{
@@ -1466,8 +1617,8 @@ mod tests {
     };
     use futures_util::StreamExt;
     use mrd_pipeline_core::{CapturedFrame, FrameCapture, FramePixelFormat, VideoEncoder};
-    use mrd_signal_client::{decode_message, encode_message};
     use mrd_proto::{DeviceId, SessionId};
+    use mrd_signal_client::{decode_message, encode_message};
     use mrd_signal_proto::SignalMessage;
     use std::sync::Once;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1479,6 +1630,49 @@ mod tests {
         INSTALL.call_once(|| {
             let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         });
+    }
+
+    #[test]
+    fn nvdec_runtime_probe_response_reports_capabilities() {
+        let probe = nvdec_runtime_probe_response();
+
+        assert_eq!(probe.backend, "windows-nvdec");
+        assert!(probe
+            .capability_probes
+            .iter()
+            .any(|capability| capability.codec == "h264" && capability.bit_depth_minus8 == 0));
+        assert!(probe
+            .capability_probes
+            .iter()
+            .any(|capability| capability.codec == "hevc" && capability.bit_depth_minus8 == 0));
+        assert!(probe
+            .capability_probes
+            .iter()
+            .any(|capability| { capability.codec == "hevc" && capability.bit_depth_minus8 == 2 }));
+    }
+
+    #[tokio::test]
+    async fn decode_policy_helpers_roundtrip_persisted_policy() {
+        let host = Mutex::new(WebrtcHost::default());
+        let settings_path = std::env::temp_dir().join(format!(
+            "decode-policy-test-{}.json",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+
+        let initial = decode_policy_with(&host).await;
+        assert_eq!(initial.decode_policy, "auto");
+
+        let updated = set_decode_policy_with(&settings_path, &host, DecodePolicy::Nvdec)
+            .await
+            .expect("set decode policy");
+        assert_eq!(updated.decode_policy, "nvdec");
+
+        let reread = decode_policy_with(&host).await;
+        assert_eq!(reread.decode_policy, "nvdec");
+        let _ = std::fs::remove_file(settings_path);
     }
 
     async fn ws_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
@@ -1493,9 +1687,11 @@ mod tests {
         let message = decode_message(&raw).expect("decode register message");
         assert!(matches!(message, SignalMessage::Register(_)));
 
-        let ack = encode_message(&SignalMessage::Registered(mrd_signal_proto::RegisteredResponse {
-            device_id: DeviceId("controller-1".into()),
-        }))
+        let ack = encode_message(&SignalMessage::Registered(
+            mrd_signal_proto::RegisteredResponse {
+                device_id: DeviceId("controller-1".into()),
+            },
+        ))
         .expect("encode registered response");
 
         socket
@@ -1568,13 +1764,10 @@ mod tests {
     async fn webrtc_helpers_record_and_report_snapshot() {
         let coordinator = Mutex::new(WebrtcSessionCoordinator::default());
 
-        let offer = webrtc_create_local_offer_with(
-            &coordinator,
-            "session-1".into(),
-            "offer-sdp".into(),
-        )
-        .await
-        .expect("create local offer");
+        let offer =
+            webrtc_create_local_offer_with(&coordinator, "session-1".into(), "offer-sdp".into())
+                .await
+                .expect("create local offer");
         assert_eq!(offer.sdp, "offer-sdp");
 
         webrtc_apply_remote_answer_with(&coordinator, "session-1".into(), "answer-sdp".into())
@@ -1646,13 +1839,10 @@ mod tests {
             .await
             .expect("send ice");
 
-        let snapshot = webrtc_sync_realtime_events_with(
-            &runtime,
-            &coordinator,
-            registration.handle,
-        )
-        .await
-        .expect("sync realtime events");
+        let snapshot =
+            webrtc_sync_realtime_events_with(&runtime, &coordinator, registration.handle)
+                .await
+                .expect("sync realtime events");
 
         assert_eq!(snapshot.remote_offer.as_deref(), Some("offer-sdp"));
         assert_eq!(snapshot.local_offer, None);
@@ -1672,13 +1862,9 @@ mod tests {
         let offer = webrtc_host_create_offer_with(&controller_host, "session-3".into())
             .await
             .expect("controller create offer");
-        webrtc_host_apply_remote_offer_with(
-            &agent_host,
-            "session-3".into(),
-            offer.sdp.clone(),
-        )
-        .await
-        .expect("agent apply remote offer");
+        webrtc_host_apply_remote_offer_with(&agent_host, "session-3".into(), offer.sdp.clone())
+            .await
+            .expect("agent apply remote offer");
 
         let answer = webrtc_host_create_answer_with(&agent_host, "session-3".into())
             .await
@@ -1746,7 +1932,8 @@ mod tests {
         fn encode(
             &mut self,
             frame: &CapturedFrame,
-        ) -> Result<Vec<mrd_pipeline_core::EncodedAccessUnit>, mrd_pipeline_core::PipelineError> {
+        ) -> Result<Vec<mrd_pipeline_core::EncodedAccessUnit>, mrd_pipeline_core::PipelineError>
+        {
             match self {
                 Self::OpenH264(encoder) => encoder.encode(frame),
                 Self::Nvenc(encoder) => encoder.encode(frame),
@@ -1764,8 +1951,20 @@ mod tests {
             "nvenc" => Ok(BenchmarkEncoder::Nvenc(
                 mrd_encode_nvenc::NvencH264Encoder::new(width, height, fps)?,
             )),
+            "nvenc_ll_p1" => Ok(BenchmarkEncoder::Nvenc(
+                mrd_encode_nvenc::NvencH264Encoder::new_low_latency_p1(width, height, fps)?,
+            )),
+            "nvenc_hq_p5" => Ok(BenchmarkEncoder::Nvenc(
+                mrd_encode_nvenc::NvencH264Encoder::new_high_quality_p5(width, height, fps)?,
+            )),
+            "nvenc_baseline" => Ok(BenchmarkEncoder::Nvenc(
+                mrd_encode_nvenc::NvencH264Encoder::new_baseline(width, height, fps)?,
+            )),
             "openh264" => Ok(BenchmarkEncoder::OpenH264(
                 mrd_encode_openh264::OpenH264Encoder::new(width, height, fps)?,
+            )),
+            "openh264_speed" => Ok(BenchmarkEncoder::OpenH264(
+                mrd_encode_openh264::OpenH264Encoder::new_speed(width, height, fps)?,
             )),
             other => Err(mrd_pipeline_core::PipelineError::message(format!(
                 "unsupported benchmark encoder backend: {other}"
@@ -1773,14 +1972,36 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[test]
+    fn benchmark_encoder_accepts_variant_backends() {
+        for backend in ["openh264_speed", "nvenc_ll_p1", "nvenc_hq_p5"] {
+            let result = create_benchmark_encoder(backend, 128, 128, 30);
+            assert!(
+                !matches!(
+                    result,
+                    Err(ref error)
+                        if error
+                            .to_string()
+                            .contains("unsupported benchmark encoder backend")
+                ),
+                "expected benchmark backend {backend} to be recognized"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn benchmark_run_writes_requested_artifacts() {
         ensure_rustls_crypto_provider();
-        let artifact_root = std::env::var("MRD_BENCH_ARTIFACT_ROOT")
-            .unwrap_or_else(|_| std::env::temp_dir().join("mrd-bench-default").display().to_string());
-        let scenario = std::env::var("MRD_BENCH_SCENARIO").unwrap_or_else(|_| "quick.transport".into());
-        let profile =
-            std::env::var("MRD_BENCH_PROFILE").unwrap_or_else(|_| "transport-webrtc-baseline".into());
+        let artifact_root = std::env::var("MRD_BENCH_ARTIFACT_ROOT").unwrap_or_else(|_| {
+            std::env::temp_dir()
+                .join("mrd-bench-default")
+                .display()
+                .to_string()
+        });
+        let scenario =
+            std::env::var("MRD_BENCH_SCENARIO").unwrap_or_else(|_| "quick.transport".into());
+        let profile = std::env::var("MRD_BENCH_PROFILE")
+            .unwrap_or_else(|_| "transport-webrtc-baseline".into());
         let transport = std::env::var("MRD_BENCH_TRANSPORT").unwrap_or_else(|_| "webrtc".into());
         let run_id = std::env::var("MRD_BENCH_RUN_ID").unwrap_or_else(|_| {
             let ts = SystemTime::now()
@@ -1808,6 +2029,13 @@ mod tests {
             .unwrap_or(20);
         let encode_backend =
             std::env::var("MRD_BENCH_ENCODE_BACKEND").unwrap_or_else(|_| "openh264".into());
+        let decode_backend =
+            std::env::var("MRD_BENCH_DECODE_BACKEND").unwrap_or_else(|_| "h264_software".into());
+        let effective_encode_backend = if transport == "webrtc" && encode_backend == "nvenc" {
+            "nvenc_baseline".to_string()
+        } else {
+            encode_backend.clone()
+        };
         let git_commit = std::env::var("MRD_BENCH_GIT_COMMIT").unwrap_or_else(|_| "unknown".into());
         let session_id = SessionId("session-benchmark".into());
 
@@ -1819,16 +2047,17 @@ mod tests {
                 fps,
                 duration_secs,
                 &encode_backend,
+                &decode_backend,
             )
             .await
             .expect("run quic benchmark pipeline");
             let manifest = BenchmarkManifest {
                 run_id: run_id.clone(),
                 scenario,
-                transport,
+                transport: outcome.transport_label.clone(),
                 capture_backend: "synthetic".into(),
                 encode_backend: encode_backend.clone(),
-                decode_backend: "h264_software".into(),
+                decode_backend: decode_backend.clone(),
                 renderer_backend: "d3d11".into(),
                 width: width as u32,
                 height: height as u32,
@@ -1845,14 +2074,16 @@ mod tests {
                 outcome.first_frame_time_ms,
                 0,
             );
-            let paths = BenchmarkPaths::new(
-                std::path::Path::new(&artifact_root),
-                date,
-                profile,
-                run_id,
-            );
-            write_benchmark_artifacts(&paths, &manifest, &summary, &session_id.0, &outcome.receiver_probe)
-                .expect("write quic benchmark artifacts");
+            let paths =
+                BenchmarkPaths::new(std::path::Path::new(&artifact_root), date, profile, run_id);
+            write_benchmark_artifacts(
+                &paths,
+                &manifest,
+                &summary,
+                &session_id.0,
+                &outcome.receiver_probe,
+            )
+            .expect("write quic benchmark artifacts");
 
             assert!(paths.summary_json.exists());
             assert!(paths.summary_csv.exists());
@@ -1862,10 +2093,15 @@ mod tests {
 
         let sink = std::sync::Arc::new(std::sync::Mutex::new(DecodedFrameSink::default()));
         let mut controller = WebrtcHost::with_frame_sink(sink.clone());
+        controller.set_decode_policy(match decode_backend.as_str() {
+            "h264_software" => crate::app_settings::DecodePolicy::Software,
+            "d3d11va" => crate::app_settings::DecodePolicy::D3d11va,
+            other => panic!("unsupported benchmark decode backend: {other}"),
+        });
         let mut agent = WebrtcHost::default();
 
         agent
-            .prepare_test_video_sender_with_backend(session_id.clone(), &encode_backend)
+            .prepare_test_video_sender_with_backend(session_id.clone(), &effective_encode_backend)
             .await
             .expect("prepare benchmark sender track");
 
@@ -1893,7 +2129,7 @@ mod tests {
                     width,
                     height,
                 },
-                create_benchmark_encoder(&encode_backend, width, height, fps)
+                create_benchmark_encoder(&effective_encode_backend, width, height, fps)
                     .expect("benchmark encoder"),
                 Duration::from_millis((1000 / fps.max(1)) as u64),
             )
@@ -1901,34 +2137,45 @@ mod tests {
             .expect("start benchmark sender");
 
         let started_at = Instant::now();
-        let first_frame_timeout_secs = if encode_backend == "nvenc" { 20 } else { 8 };
-        let first_frame_wait = tokio::time::timeout(Duration::from_secs(first_frame_timeout_secs), async {
-            loop {
-                let snapshot = controller.snapshot(&session_id).expect("controller snapshot");
-                if snapshot.decoded_frame_count > 0 {
-                    break started_at.elapsed().as_secs_f64() * 1000.0;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
+        let first_frame_timeout_secs = if effective_encode_backend.starts_with("nvenc") {
+            20
+        } else {
+            8
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(first_frame_timeout_secs);
+        let first_frame_wait = loop {
+            let snapshot = controller
+                .snapshot(&session_id)
+                .expect("controller snapshot");
+            if snapshot.decoded_frame_count > 0 {
+                break Ok(started_at.elapsed().as_secs_f64() * 1000.0);
             }
-        })
-        .await;
+            if std::time::Instant::now() >= deadline {
+                break Err(());
+            }
+            tokio::task::yield_now().await;
+        };
         let first_frame_seen = first_frame_wait.is_ok();
-        let first_frame_time_ms = first_frame_wait
-            .unwrap_or_else(|_| started_at.elapsed().as_secs_f64() * 1000.0);
+        let first_frame_time_ms =
+            first_frame_wait.unwrap_or_else(|_| started_at.elapsed().as_secs_f64() * 1000.0);
 
         tokio::time::sleep(Duration::from_secs(duration_secs)).await;
 
-        let controller_snapshot = controller.snapshot(&session_id).expect("controller snapshot");
+        let controller_snapshot = controller
+            .snapshot(&session_id)
+            .expect("controller snapshot");
         let agent_snapshot = agent.snapshot(&session_id).expect("agent snapshot");
-        let controller_probe = controller.probe_snapshot(&session_id).expect("controller probe");
+        let controller_probe = controller
+            .probe_snapshot(&session_id)
+            .expect("controller probe");
         let agent_probe = agent.probe_snapshot(&session_id).expect("agent probe");
         let manifest = BenchmarkManifest {
             run_id: run_id.clone(),
             scenario,
             transport,
             capture_backend: "dxgi".into(),
-            encode_backend: encode_backend,
-            decode_backend: "h264_software".into(),
+            encode_backend: effective_encode_backend,
+            decode_backend,
             renderer_backend: "d3d11".into(),
             width: width as u32,
             height: height as u32,
@@ -1945,22 +2192,40 @@ mod tests {
             first_frame_time_ms,
             agent_snapshot.zero_write_access_unit_count,
         );
-        let paths = BenchmarkPaths::new(
-            std::path::Path::new(&artifact_root),
-            date,
-            profile,
-            run_id,
-        );
-        write_benchmark_artifacts(&paths, &manifest, &summary, &session_id.0, &controller_probe)
-            .expect("write benchmark artifacts");
+        let paths =
+            BenchmarkPaths::new(std::path::Path::new(&artifact_root), date, profile, run_id);
+        write_benchmark_artifacts(
+            &paths,
+            &manifest,
+            &summary,
+            &session_id.0,
+            &controller_probe,
+        )
+        .expect("write benchmark artifacts");
 
         assert!(paths.summary_json.exists());
         assert!(paths.summary_csv.exists());
         assert!(paths.report_md.exists());
+
+        controller
+            .stop_embedded_video_sender(&session_id)
+            .await
+            .expect("stop benchmark controller sender");
+        agent
+            .stop_embedded_video_sender(&session_id)
+            .await
+            .expect("stop benchmark agent sender");
+        controller
+            .close_session(&session_id)
+            .await
+            .expect("close benchmark controller session");
+        agent
+            .close_session(&session_id)
+            .await
+            .expect("close benchmark agent session");
     }
 
     #[tokio::test]
-    #[ignore = "known reproduction: webrtc + nvenc 720p receives no keyframes yet"]
     async fn webrtc_nvenc_720p_benchmark_capture_delivers_remote_frames() {
         ensure_rustls_crypto_provider();
         let session_id = SessionId("session-benchmark-nvenc-720p".into());
@@ -1969,7 +2234,7 @@ mod tests {
         let mut agent = WebrtcHost::default();
 
         agent
-            .prepare_test_video_sender_with_backend(session_id.clone(), "nvenc")
+            .prepare_test_video_sender_with_backend(session_id.clone(), "nvenc_baseline")
             .await
             .expect("prepare benchmark sender track");
 
@@ -1997,7 +2262,8 @@ mod tests {
                     width: 1280,
                     height: 720,
                 },
-                create_benchmark_encoder("nvenc", 1280, 720, 30).expect("nvenc encoder"),
+                create_benchmark_encoder("nvenc_baseline", 1280, 720, 30)
+                    .expect("nvenc baseline encoder"),
                 Duration::from_millis(33),
             )
             .await
@@ -2005,7 +2271,9 @@ mod tests {
 
         let wait_result = tokio::time::timeout(Duration::from_secs(12), async {
             loop {
-                let snapshot = controller.snapshot(&session_id).expect("controller snapshot");
+                let snapshot = controller
+                    .snapshot(&session_id)
+                    .expect("controller snapshot");
                 if snapshot.decoded_frame_count > 0 {
                     break;
                 }
@@ -2014,8 +2282,12 @@ mod tests {
         })
         .await;
 
-        let controller_snapshot = controller.snapshot(&session_id).expect("controller snapshot");
-        let controller_probe = controller.probe_snapshot(&session_id).expect("controller probe");
+        let controller_snapshot = controller
+            .snapshot(&session_id)
+            .expect("controller snapshot");
+        let controller_probe = controller
+            .probe_snapshot(&session_id)
+            .expect("controller probe");
         assert!(
             wait_result.is_ok(),
             "expected benchmark-style WebRTC+NVENC path to deliver frames: snapshot={controller_snapshot:?} probe={controller_probe:?}"
@@ -2026,17 +2298,10 @@ mod tests {
     #[test]
     fn decoded_frame_snapshot_reports_latest_ingested_frame() {
         let sink = std::sync::Mutex::new(DecodedFrameSink::default());
-        sink.lock()
-            .expect("lock decoded frame sink")
-            .ingest_frame(
-                SessionId("session-9".into()),
-                mrd_decode::DecodedFrame {
-                    width: 640,
-                    height: 360,
-                    pixel_format: mrd_decode::PixelFormat::Rgb24,
-                    data: vec![0; 640 * 360 * 3],
-                },
-            );
+        sink.lock().expect("lock decoded frame sink").ingest_frame(
+            SessionId("session-9".into()),
+            mrd_decode::DecodedFrame::cpu_rgb24(640, 360, vec![0; 640 * 360 * 3]),
+        );
 
         let snapshot = decoded_frame_snapshot_with(&sink, "session-9".into()).expect("snapshot");
 
@@ -2050,19 +2315,14 @@ mod tests {
     #[test]
     fn decoded_frame_preview_encodes_png_data_url() {
         let sink = std::sync::Mutex::new(DecodedFrameSink::default());
-        sink.lock()
-            .expect("lock decoded frame sink")
-            .ingest_frame(
-                SessionId("session-preview".into()),
-                mrd_decode::DecodedFrame {
-                    width: 2,
-                    height: 2,
-                    pixel_format: mrd_decode::PixelFormat::Rgb24,
-                    data: vec![
-                        255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255,
-                    ],
-                },
-            );
+        sink.lock().expect("lock decoded frame sink").ingest_frame(
+            SessionId("session-preview".into()),
+            mrd_decode::DecodedFrame::cpu_rgb24(
+                2,
+                2,
+                vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255],
+            ),
+        );
 
         let preview = decoded_frame_preview_with(&sink, "session-preview".into())
             .expect("encode preview")
@@ -2074,19 +2334,13 @@ mod tests {
     #[test]
     fn render_host_snapshot_reports_attachment_and_preview() {
         let sink = std::sync::Arc::new(std::sync::Mutex::new(DecodedFrameSink::default()));
-        sink.lock()
-            .expect("lock decoded frame sink")
-            .ingest_frame(
-                SessionId("session-render".into()),
-                mrd_decode::DecodedFrame {
-                    width: 2,
-                    height: 2,
-                    pixel_format: mrd_decode::PixelFormat::Rgb24,
-                    data: vec![255; 12],
-                },
-            );
+        sink.lock().expect("lock decoded frame sink").ingest_frame(
+            SessionId("session-render".into()),
+            mrd_decode::DecodedFrame::cpu_rgb24(2, 2, vec![255; 12]),
+        );
         let mut render_host = RenderHost::with_frame_sink(sink);
-        let _ = render_host.attach_session(SessionId("session-render".into()), "surface-1".into(), 0);
+        let _ =
+            render_host.attach_session(SessionId("session-render".into()), "surface-1".into(), 0);
 
         let response = render_host_snapshot_response(
             render_host
@@ -2101,6 +2355,7 @@ mod tests {
         assert!(response
             .preview_data_url
             .as_deref()
-            .map_or(false, |value: &str| value.starts_with("data:image/png;base64,")));
+            .map_or(false, |value: &str| value
+                .starts_with("data:image/png;base64,")));
     }
 }

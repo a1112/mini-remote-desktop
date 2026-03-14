@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+use crate::app_settings::DecodePolicy;
 use crate::frame_sink::DecodedFrameSink;
 use crate::webrtc_media::H264AccessUnitAssembler;
 use mrd_capture_dxgi::DxgiDesktopCapture;
@@ -18,24 +19,20 @@ use mrd_observability::{
 use mrd_pipeline_core::{FrameCapture, VideoEncoder};
 use mrd_proto::SessionId;
 use mrd_signal_proto::{IceCandidate, SessionDescription};
-use mrd_transport_webrtc::{H264Profile, H264RtpSender};
+use mrd_transport_webrtc::{annex_b_contains_keyframe, H264Profile, H264RtpSender};
 use tokio::task::JoinHandle;
 use webrtc::{
     api::{
-        interceptor_registry::register_default_interceptors,
-        media_engine::MediaEngine,
-        setting_engine::SettingEngine,
-        APIBuilder,
+        interceptor_registry::register_default_interceptors, media_engine::MediaEngine,
+        setting_engine::SettingEngine, APIBuilder,
     },
     data_channel::data_channel_init::RTCDataChannelInit,
-    ice_transport::{ice_candidate::RTCIceCandidateInit, ice_server::RTCIceServer},
     ice_transport::ice_connection_state::RTCIceConnectionState,
+    ice_transport::{ice_candidate::RTCIceCandidateInit, ice_server::RTCIceServer},
     interceptor::registry::Registry,
     peer_connection::{
-        configuration::RTCConfiguration,
-        peer_connection_state::RTCPeerConnectionState,
-        sdp::session_description::RTCSessionDescription,
-        RTCPeerConnection,
+        configuration::RTCConfiguration, peer_connection_state::RTCPeerConnectionState,
+        sdp::session_description::RTCSessionDescription, RTCPeerConnection,
     },
     rtp_transceiver::{rtp_codec::RTPCodecType, RTCRtpTransceiverInit},
     track::track_local::TrackLocal,
@@ -51,13 +48,26 @@ pub struct WebrtcHostSnapshot {
     pub remote_ice_count: usize,
     pub remote_video_track_count: usize,
     pub remote_rtp_packet_count: u64,
+    pub remote_sequence_gap_count: u64,
+    pub remote_out_of_order_count: u64,
+    pub last_remote_sequence_number: Option<u16>,
     pub last_remote_codec: Option<String>,
+    pub last_remote_payload_type: Option<u8>,
+    pub last_remote_fmtp_line: Option<String>,
     pub remote_h264_access_unit_count: u64,
     pub last_remote_access_unit_bytes: usize,
+    pub recent_remote_access_unit_bytes: Vec<usize>,
+    pub recent_remote_access_unit_keyframes: Vec<bool>,
     pub decoded_frame_count: u64,
     pub last_decoded_width: usize,
     pub last_decoded_height: usize,
     pub last_decoded_pixel_format: Option<String>,
+    pub decode_policy: Option<String>,
+    pub preferred_decode_backend: Option<String>,
+    pub active_decode_backend: Option<String>,
+    pub decode_backend_reason: Option<String>,
+    pub decode_fallback_count: u64,
+    pub last_decode_fallback_reason: Option<String>,
     pub decode_error_count: u64,
     pub last_decode_error: Option<String>,
     pub available_video_source_ids: Vec<String>,
@@ -79,11 +89,22 @@ struct HostedPeer {
     sender_task: Option<JoinHandle<()>>,
 }
 
-#[derive(Default)]
 pub struct WebrtcHost {
     sessions: HashMap<SessionId, HostedPeer>,
     frame_sink: Option<Arc<Mutex<DecodedFrameSink>>>,
     probe_registry: ProbeRegistry,
+    decode_policy: Arc<Mutex<DecodePolicy>>,
+}
+
+impl Default for WebrtcHost {
+    fn default() -> Self {
+        Self {
+            sessions: HashMap::new(),
+            frame_sink: None,
+            probe_registry: ProbeRegistry::default(),
+            decode_policy: Arc::new(Mutex::new(DecodePolicy::Auto)),
+        }
+    }
 }
 
 impl WebrtcHost {
@@ -99,7 +120,16 @@ impl WebrtcHost {
             sessions: HashMap::new(),
             frame_sink: Some(frame_sink),
             probe_registry,
+            decode_policy: Arc::new(Mutex::new(DecodePolicy::Auto)),
         }
+    }
+
+    pub fn decode_policy(&self) -> DecodePolicy {
+        *self.decode_policy.lock().expect("lock decode policy")
+    }
+
+    pub fn set_decode_policy(&mut self, decode_policy: DecodePolicy) {
+        *self.decode_policy.lock().expect("lock decode policy") = decode_policy;
     }
 
     pub async fn create_offer(
@@ -257,12 +287,9 @@ impl WebrtcHost {
     }
 
     pub fn snapshot(&self, session_id: &SessionId) -> Option<WebrtcHostSnapshot> {
-        self.sessions.get(session_id).map(|peer| {
-            peer.snapshot
-                .lock()
-                .expect("lock host snapshot")
-                .clone()
-        })
+        self.sessions
+            .get(session_id)
+            .map(|peer| peer.snapshot.lock().expect("lock host snapshot").clone())
     }
 
     pub fn probe_snapshot(&self, session_id: &SessionId) -> Option<PipelineProbeSnapshot> {
@@ -270,7 +297,11 @@ impl WebrtcHost {
             .snapshot(session_id, crate::frame_sink::DEFAULT_SOURCE_ID)
     }
 
-    pub fn probe_recent_events(&self, session_id: &SessionId, limit: usize) -> Vec<MediaProbeEvent> {
+    pub fn probe_recent_events(
+        &self,
+        session_id: &SessionId,
+        limit: usize,
+    ) -> Vec<MediaProbeEvent> {
         self.probe_registry
             .recent_events(session_id, crate::frame_sink::DEFAULT_SOURCE_ID, limit)
     }
@@ -339,7 +370,10 @@ impl WebrtcHost {
         Ok(())
     }
 
-    pub async fn stop_embedded_video_sender(&mut self, session_id: &SessionId) -> Result<(), String> {
+    pub async fn stop_embedded_video_sender(
+        &mut self,
+        session_id: &SessionId,
+    ) -> Result<(), String> {
         let session = self
             .sessions
             .get_mut(session_id)
@@ -347,12 +381,33 @@ impl WebrtcHost {
         session.sender_running.store(false, Ordering::Relaxed);
         if let Some(task) = session.sender_task.take() {
             task.abort();
+            let _ = task.await;
         }
         session
             .snapshot
             .lock()
             .expect("lock host snapshot")
             .sender_running = false;
+        Ok(())
+    }
+
+    pub async fn close_session(&mut self, session_id: &SessionId) -> Result<(), String> {
+        let mut session = self
+            .sessions
+            .remove(session_id)
+            .ok_or_else(|| format!("未找到 webrtc host 会话: {}", session_id.0))?;
+        session.sender_running.store(false, Ordering::Relaxed);
+        if let Some(task) = session.sender_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        session.sample_sender = None;
+        session
+            .snapshot
+            .lock()
+            .expect("lock host snapshot")
+            .sender_running = false;
+        let _ = tokio::time::timeout(Duration::from_secs(2), session.pc.close()).await;
         Ok(())
     }
 
@@ -387,6 +442,8 @@ impl WebrtcHost {
             .session_handle(session_id.clone(), crate::frame_sink::DEFAULT_SOURCE_ID);
         probe.set_codec("h264");
         probe.set_transport("webrtc");
+        let _ = wait_for_peer_connection_connected(&pc, Duration::from_secs(3)).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
 
         session.sender_running.store(true, Ordering::Relaxed);
         {
@@ -446,6 +503,7 @@ impl WebrtcHost {
             snapshot.clone(),
             self.frame_sink.clone(),
             probe,
+            self.decode_policy.clone(),
         )
         .await?;
         self.sessions.insert(
@@ -500,9 +558,7 @@ async fn ensure_sample_sender(
         .add_track(track)
         .await
         .map_err(|error| format!("add local video track failed: {error}"))?;
-    tokio::spawn(async move {
-        while rtp_sender.read_rtcp().await.is_ok() {}
-    });
+    tokio::spawn(async move { while rtp_sender.read_rtcp().await.is_ok() {} });
     session.sample_sender = Some(sender.clone());
     session
         .snapshot
@@ -510,6 +566,20 @@ async fn ensure_sample_sender(
         .expect("lock host snapshot")
         .local_video_track_count = 1;
     Ok(sender)
+}
+
+async fn wait_for_peer_connection_connected(
+    pc: &Arc<RTCPeerConnection>,
+    timeout: Duration,
+) -> bool {
+    let started_at = std::time::Instant::now();
+    while started_at.elapsed() < timeout {
+        if pc.connection_state() == RTCPeerConnectionState::Connected {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    pc.connection_state() == RTCPeerConnectionState::Connected
 }
 
 async fn ensure_recvonly_video_transceiver(pc: &Arc<RTCPeerConnection>) -> Result<(), String> {
@@ -530,6 +600,7 @@ async fn build_peer_connection(
     snapshot: Arc<Mutex<WebrtcHostSnapshot>>,
     frame_sink: Option<Arc<Mutex<DecodedFrameSink>>>,
     probe: ProbeSessionHandle,
+    decode_policy: Arc<Mutex<DecodePolicy>>,
 ) -> Result<Arc<RTCPeerConnection>, String> {
     let mut media_engine = MediaEngine::default();
     media_engine
@@ -599,6 +670,7 @@ async fn build_peer_connection(
     let on_track_probe = probe.clone();
     let on_track_counter = packet_counter.clone();
     let on_track_access_unit_counter = access_unit_counter.clone();
+    let on_track_decode_policy = decode_policy.clone();
     pc.on_track(Box::new(move |track: Arc<TrackRemote>, _, _| {
         let snapshot = on_track_snapshot.clone();
         let session_id = on_track_session_id.clone();
@@ -606,12 +678,17 @@ async fn build_peer_connection(
         let probe = on_track_probe.clone();
         let counter = on_track_counter.clone();
         let access_unit_counter = on_track_access_unit_counter.clone();
+        let decode_policy = on_track_decode_policy.clone();
         Box::pin(async move {
             let mime_type = track.codec().capability.mime_type.clone();
+            let fmtp_line = track.codec().capability.sdp_fmtp_line.clone();
+            let payload_type = track.codec().payload_type;
             let source_id = {
                 let mut snapshot = snapshot.lock().expect("lock host snapshot");
                 snapshot.remote_video_track_count += 1;
                 snapshot.last_remote_codec = Some(mime_type.clone());
+                snapshot.last_remote_payload_type = Some(payload_type);
+                snapshot.last_remote_fmtp_line = Some(fmtp_line.clone());
                 let source_id = format!("video-track-{}", snapshot.remote_video_track_count);
                 if !snapshot.available_video_source_ids.contains(&source_id) {
                     snapshot.available_video_source_ids.push(source_id.clone());
@@ -624,21 +701,38 @@ async fn build_peer_connection(
             } else {
                 None
             };
-            let mut decoder = if mime_type.eq_ignore_ascii_case("video/h264") {
-                match mrd_decode::create_decoder("h264_software") {
-                    Ok(decoder) => Some(decoder),
-                    Err(_) => None,
+            let (mut decoder, mut active_backend_id) = if mime_type.eq_ignore_ascii_case("video/h264")
+            {
+                let decode_policy = *decode_policy.lock().expect("lock decode policy");
+                let selection = select_h264_decoder(decode_policy);
+                {
+                    let mut snapshot = snapshot.lock().expect("lock host snapshot");
+                    snapshot.decode_policy = Some(decode_policy.as_str().to_string());
+                    snapshot.preferred_decode_backend =
+                        Some(preferred_backend_for_policy(decode_policy).to_string());
+                    snapshot.active_decode_backend = selection.backend_id.map(str::to_string);
+                    snapshot.decode_backend_reason = Some(selection.reason.clone());
+                    if let Some(fallback_reason) = selection.fallback_reason.clone() {
+                        snapshot.decode_fallback_count += 1;
+                        snapshot.last_decode_fallback_reason = Some(fallback_reason);
+                    }
                 }
+                (selection.decoder, selection.backend_id)
             } else {
-                None
+                (None, None)
             };
 
             while let Ok((_packet, _)) = track.read_rtp().await {
                 let ingress_started_at = std::time::Instant::now();
                 let packet_count = counter.fetch_add(1, Ordering::Relaxed) + 1;
                 let assemble_started_at = std::time::Instant::now();
+                let sequence_number = _packet.header.sequence_number;
                 let next_access_unit = h264_assembler.as_mut().and_then(|assembler| {
-                    assembler.push_rtp_payload(&_packet.payload, _packet.header.marker)
+                    assembler.push_rtp_packet(
+                        &_packet.payload,
+                        _packet.header.marker,
+                        sequence_number,
+                    )
                 });
                 probe.record_stage(
                     StageId::NetworkIngress,
@@ -648,27 +742,95 @@ async fn build_peer_connection(
                 );
                 let mut snapshot_guard = snapshot.lock().expect("lock host snapshot");
                 snapshot_guard.remote_rtp_packet_count = packet_count;
+                if let Some(previous) = snapshot_guard.last_remote_sequence_number {
+                    let expected = previous.wrapping_add(1);
+                    if sequence_number != expected {
+                        let distance = sequence_number.wrapping_sub(expected);
+                        if distance < 0x8000 {
+                            snapshot_guard.remote_sequence_gap_count += 1;
+                        } else {
+                            snapshot_guard.remote_out_of_order_count += 1;
+                        }
+                    }
+                }
+                snapshot_guard.last_remote_sequence_number = Some(sequence_number);
                 if let Some(access_unit) = next_access_unit {
                     let access_unit_count = access_unit_counter.fetch_add(1, Ordering::Relaxed) + 1;
                     snapshot_guard.remote_h264_access_unit_count = access_unit_count;
                     snapshot_guard.last_remote_access_unit_bytes = access_unit.len();
+                    snapshot_guard
+                        .recent_remote_access_unit_bytes
+                        .push(access_unit.len());
+                    snapshot_guard
+                        .recent_remote_access_unit_keyframes
+                        .push(annex_b_contains_keyframe(&access_unit));
+                    if snapshot_guard.recent_remote_access_unit_bytes.len() > 8 {
+                        snapshot_guard.recent_remote_access_unit_bytes.remove(0);
+                    }
+                    if snapshot_guard.recent_remote_access_unit_keyframes.len() > 8 {
+                        snapshot_guard.recent_remote_access_unit_keyframes.remove(0);
+                    }
                     drop(snapshot_guard);
                     probe.record_stage(
                         StageId::H264Assemble,
                         assemble_started_at.elapsed(),
                         access_unit.len(),
-                        access_unit.windows(5).any(|window| window == [0, 0, 0, 1, 0x65]),
+                        annex_b_contains_keyframe(&access_unit),
                     );
-                    if let Some(decoder) = decoder.as_mut() {
-                        let _ = decode_access_unit_into_snapshot(
+                    if let Some(decoder_ref) = decoder.as_mut() {
+                        if let Err(error) = decode_access_unit_into_snapshot(
                             session_id.clone(),
                             source_id.clone(),
                             snapshot.clone(),
                             frame_sink.clone(),
                             probe.clone(),
-                            decoder.as_mut(),
+                            decoder_ref.as_mut(),
                             &access_unit,
-                        );
+                        ) {
+                            if active_backend_id == Some("nvdec") {
+                                match mrd_decode::create_decoder("h264_software") {
+                                    Ok(mut software_decoder) => {
+                                        {
+                                            let mut snapshot_guard =
+                                                snapshot.lock().expect("lock host snapshot");
+                                            snapshot_guard.decode_fallback_count += 1;
+                                            snapshot_guard.last_decode_fallback_reason = Some(
+                                                format!(
+                                                    "nvdec decode failed, fell back to h264_software: {error}"
+                                                ),
+                                            );
+                                            snapshot_guard.active_decode_backend =
+                                                Some("h264_software".to_string());
+                                            snapshot_guard.decode_backend_reason = Some(
+                                                "nvdec session fell back to h264_software after decode error"
+                                                    .to_string(),
+                                            );
+                                        }
+                                        let retry = decode_access_unit_into_snapshot(
+                                            session_id.clone(),
+                                            source_id.clone(),
+                                            snapshot.clone(),
+                                            frame_sink.clone(),
+                                            probe.clone(),
+                                            software_decoder.as_mut(),
+                                            &access_unit,
+                                        );
+                                        decoder = Some(software_decoder);
+                                        active_backend_id = Some("h264_software");
+                                        let _ = retry;
+                                    }
+                                    Err(software_error) => {
+                                        let mut snapshot_guard =
+                                            snapshot.lock().expect("lock host snapshot");
+                                        snapshot_guard.last_decode_fallback_reason = Some(
+                                            format!(
+                                                "nvdec decode failed ({error}); fallback to h264_software failed ({software_error})"
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     }
                     continue;
                 }
@@ -690,8 +852,10 @@ fn decode_access_unit_into_snapshot(
 ) -> Result<(), String> {
     let started_at = std::time::Instant::now();
     if let Err(error) = decoder.push_access_unit(access_unit) {
-        let message = format!("software decoder 解码 access unit 失败: {error}");
-        let mut snapshot_guard = snapshot.lock().expect("lock host snapshot after decode error");
+        let message = format!("decoder 解码 access unit 失败: {error}");
+        let mut snapshot_guard = snapshot
+            .lock()
+            .expect("lock host snapshot after decode error");
         snapshot_guard.decode_error_count += 1;
         snapshot_guard.last_decode_error = Some(message.clone());
         return Err(message);
@@ -701,10 +865,127 @@ fn decode_access_unit_into_snapshot(
         StageId::DecodeTotal,
         started_at.elapsed(),
         access_unit.len(),
-        access_unit.windows(5).any(|window| window == [0, 0, 0, 1, 0x65]),
+        annex_b_contains_keyframe(access_unit),
     );
     apply_decoded_frames_to_snapshot(session_id, source_id, snapshot, frame_sink, probe, frames);
     Ok(())
+}
+
+struct DecoderSelection {
+    backend_id: Option<&'static str>,
+    decoder: Option<Box<dyn VideoDecoder>>,
+    reason: String,
+    fallback_reason: Option<String>,
+}
+
+fn preferred_backend_for_policy(policy: DecodePolicy) -> &'static str {
+    match policy {
+        DecodePolicy::Auto | DecodePolicy::Software => "h264_software",
+        DecodePolicy::D3d11va => "d3d11va",
+        DecodePolicy::Nvdec => "nvdec",
+    }
+}
+
+fn h264_decoder_backend_order(policy: DecodePolicy) -> Vec<&'static str> {
+    match policy {
+        DecodePolicy::Auto => vec!["h264_software", "nvdec"],
+        DecodePolicy::Software => vec!["h264_software"],
+        DecodePolicy::D3d11va => vec!["d3d11va", "h264_software"],
+        DecodePolicy::Nvdec => vec!["nvdec", "h264_software"],
+    }
+}
+
+fn select_h264_decoder(policy: DecodePolicy) -> DecoderSelection {
+    let order = h264_decoder_backend_order(policy);
+    let primary_backend = order[0];
+    let fallback_backend = order.get(1).copied();
+
+    if policy == DecodePolicy::Nvdec && !nvdec_runtime_supports_h264() {
+        return match mrd_decode::create_decoder("h264_software") {
+            Ok(decoder) => DecoderSelection {
+                backend_id: Some("h264_software"),
+                decoder: Some(decoder),
+                reason: "nvdec policy requested, but runtime probe is not healthy; using h264_software"
+                    .to_string(),
+                fallback_reason: Some(
+                    "nvdec policy requested, but runtime probe did not report healthy H264 support"
+                        .to_string(),
+                ),
+            },
+            Err(software_error) => DecoderSelection {
+                backend_id: None,
+                decoder: None,
+                reason: format!(
+                    "decoder unavailable: nvdec runtime probe unhealthy and h264_software failed ({software_error})"
+                ),
+                fallback_reason: Some(
+                    "nvdec runtime probe unhealthy; attempted software fallback".to_string(),
+                ),
+            },
+        };
+    }
+
+    match mrd_decode::create_decoder(primary_backend) {
+        Ok(decoder) => DecoderSelection {
+            backend_id: Some(primary_backend),
+            decoder: Some(decoder),
+            reason: match policy {
+                DecodePolicy::Auto => {
+                    "auto decode policy currently prefers h264_software for stable realtime decode"
+                        .to_string()
+                }
+                DecodePolicy::Software => {
+                    "software decode policy pins h264_software".to_string()
+                }
+                DecodePolicy::D3d11va => {
+                    "d3d11va decode policy selected d3d11va for realtime decode".to_string()
+                }
+                DecodePolicy::Nvdec => {
+                    "nvdec decode policy selected nvdec for realtime decode".to_string()
+                }
+            },
+            fallback_reason: None,
+        },
+        Err(primary_error) => match fallback_backend {
+            Some(fallback_backend) => match mrd_decode::create_decoder(fallback_backend) {
+                Ok(decoder) => DecoderSelection {
+                    backend_id: Some(fallback_backend),
+                    decoder: Some(decoder),
+                    reason: format!(
+                        "{primary_backend} unavailable, fell back to {fallback_backend}: {primary_error}"
+                    ),
+                    fallback_reason: Some(format!(
+                        "{primary_backend} unavailable, fell back to {fallback_backend}: {primary_error}"
+                    )),
+                },
+                Err(fallback_error) => DecoderSelection {
+                    backend_id: None,
+                    decoder: None,
+                    reason: format!(
+                        "decoder unavailable: {primary_backend} failed ({primary_error}); {fallback_backend} failed ({fallback_error})"
+                    ),
+                    fallback_reason: None,
+                },
+            },
+            None => DecoderSelection {
+                backend_id: None,
+                decoder: None,
+                reason: format!("decoder unavailable: {primary_backend} failed ({primary_error})"),
+                fallback_reason: None,
+            },
+        },
+    }
+}
+
+fn nvdec_runtime_supports_h264() -> bool {
+    let probe = mrd_decode_nvdec::probe_runtime();
+    probe.capability_probes.iter().any(|capability| {
+        capability.codec == "h264"
+            && capability.bit_depth_minus8 == 0
+            && capability.chroma_format == 1
+            && capability.runtime_supported
+            && capability.wired_supported
+    })
 }
 
 fn apply_decoded_frames_to_snapshot(
@@ -726,6 +1007,7 @@ fn apply_decoded_frames_to_snapshot(
         snapshot.last_decoded_height = frame.height;
         snapshot.last_decoded_pixel_format = Some(match frame.pixel_format {
             PixelFormat::Rgb24 => "Rgb24".to_string(),
+            PixelFormat::D3d11Texture => "D3d11Texture".to_string(),
         });
         if let Some(frame_sink) = frame_sink.as_ref() {
             let bytes = frame.data.len();
@@ -771,9 +1053,13 @@ async fn run_embedded_sender_loop<C, E>(
                 let encode_started_at = std::time::Instant::now();
                 match encoder.encode(&frame) {
                     Ok(access_units) => {
-                        let total_encoded_bytes =
-                            access_units.iter().map(|access_unit| access_unit.bytes.len()).sum();
-                        let keyframe = access_units.iter().any(|access_unit| access_unit.is_keyframe);
+                        let total_encoded_bytes = access_units
+                            .iter()
+                            .map(|access_unit| access_unit.bytes.len())
+                            .sum();
+                        let keyframe = access_units
+                            .iter()
+                            .any(|access_unit| access_unit.is_keyframe);
                         probe.record_stage(
                             StageId::EncodeTotal,
                             encode_started_at.elapsed(),
@@ -782,8 +1068,11 @@ async fn run_embedded_sender_loop<C, E>(
                         );
                         for access_unit in access_units {
                             let send_started_at = std::time::Instant::now();
-                            if let Ok(written) =
-                                sample_sender.lock().await.send_access_unit(&access_unit).await
+                            if let Ok(written) = sample_sender
+                                .lock()
+                                .await
+                                .send_access_unit(&access_unit)
+                                .await
                             {
                                 probe.record_stage(
                                     StageId::SendPacketize,
@@ -856,9 +1145,13 @@ fn run_blocking_desktop_sender_loop<C, E>(
                 let encode_started_at = std::time::Instant::now();
                 match encoder.encode(&frame) {
                     Ok(access_units) => {
-                        let total_encoded_bytes =
-                            access_units.iter().map(|access_unit| access_unit.bytes.len()).sum();
-                        let keyframe = access_units.iter().any(|access_unit| access_unit.is_keyframe);
+                        let total_encoded_bytes = access_units
+                            .iter()
+                            .map(|access_unit| access_unit.bytes.len())
+                            .sum();
+                        let keyframe = access_units
+                            .iter()
+                            .any(|access_unit| access_unit.is_keyframe);
                         probe.record_stage(
                             StageId::EncodeTotal,
                             encode_started_at.elapsed(),
@@ -868,7 +1161,11 @@ fn run_blocking_desktop_sender_loop<C, E>(
                         for access_unit in access_units {
                             let send_started_at = std::time::Instant::now();
                             if let Ok(written) = handle.block_on(async {
-                                sample_sender.lock().await.send_access_unit(&access_unit).await
+                                sample_sender
+                                    .lock()
+                                    .await
+                                    .send_access_unit(&access_unit)
+                                    .await
                             }) {
                                 probe.record_stage(
                                     StageId::SendPacketize,
@@ -910,7 +1207,10 @@ fn run_blocking_desktop_sender_loop<C, E>(
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::{Arc, Mutex, Once}, time::Duration};
+    use std::{
+        sync::{Arc, Mutex, Once},
+        time::Duration,
+    };
 
     use mrd_encode_nvenc::NvencH264Encoder;
     use mrd_encode_openh264::OpenH264Encoder;
@@ -922,7 +1222,11 @@ mod tests {
         formats::{RgbSliceU8, YUVBuffer},
     };
 
-    use super::{decode_access_unit_into_snapshot, WebrtcHost, WebrtcHostSnapshot};
+    use super::{
+        decode_access_unit_into_snapshot, h264_decoder_backend_order, select_h264_decoder,
+        WebrtcHost, WebrtcHostSnapshot,
+    };
+    use crate::app_settings::DecodePolicy;
     use crate::frame_sink::{DecodedFrameSink, DecodedFrameSnapshot};
     use crate::webrtc_media::H264AccessUnitAssembler;
 
@@ -947,7 +1251,11 @@ mod tests {
         let snapshot = host
             .snapshot(&SessionId("session-1".into()))
             .expect("host snapshot");
-        assert!(snapshot.local_offer.as_deref().unwrap_or_default().contains("m=application"));
+        assert!(snapshot
+            .local_offer
+            .as_deref()
+            .unwrap_or_default()
+            .contains("m=application"));
         assert_eq!(snapshot.remote_video_track_count, 0);
         assert_eq!(snapshot.remote_h264_access_unit_count, 0);
         assert_eq!(snapshot.last_remote_access_unit_bytes, 0);
@@ -1016,8 +1324,10 @@ mod tests {
             "video-track-1".to_string(),
             snapshot.clone(),
             None,
-            ProbeRegistry::default()
-                .session_handle(SessionId("session-3".into()), crate::frame_sink::DEFAULT_SOURCE_ID),
+            ProbeRegistry::default().session_handle(
+                SessionId("session-3".into()),
+                crate::frame_sink::DEFAULT_SOURCE_ID,
+            ),
             decoder.as_mut(),
             access_unit.as_slice(),
         )
@@ -1066,6 +1376,57 @@ mod tests {
             "snapshot should retain last decode error: {:?}",
             snapshot.last_decode_error
         );
+    }
+
+    #[test]
+    fn h264_decoder_selection_reports_backend_and_reason() {
+        let selection = select_h264_decoder(DecodePolicy::Auto);
+
+        assert_eq!(selection.backend_id.is_some(), selection.decoder.is_some());
+        assert!(
+            !selection.reason.is_empty(),
+            "decoder selection should always report a reason"
+        );
+
+        if let Some(backend_id) = selection.backend_id {
+            assert!(
+                backend_id == "nvdec" || backend_id == "h264_software",
+                "unexpected decoder backend: {backend_id}"
+            );
+        } else {
+            assert!(
+                selection.reason.contains("decoder unavailable"),
+                "missing decoder should report explicit reason: {}",
+                selection.reason
+            );
+        }
+    }
+
+    #[test]
+    fn h264_decoder_selection_order_respects_decode_policy() {
+        assert_eq!(
+            h264_decoder_backend_order(DecodePolicy::Auto),
+            vec!["h264_software", "nvdec"]
+        );
+        assert_eq!(
+            h264_decoder_backend_order(DecodePolicy::Software),
+            vec!["h264_software"]
+        );
+        assert_eq!(
+            h264_decoder_backend_order(DecodePolicy::Nvdec),
+            vec!["nvdec", "h264_software"]
+        );
+    }
+
+    #[test]
+    fn webrtc_host_decode_policy_defaults_to_auto() {
+        let mut host = WebrtcHost::default();
+
+        assert_eq!(host.decode_policy(), DecodePolicy::Auto);
+
+        host.set_decode_policy(DecodePolicy::Nvdec);
+
+        assert_eq!(host.decode_policy(), DecodePolicy::Nvdec);
     }
 
     #[test]
@@ -1165,7 +1526,10 @@ mod tests {
             self.controller
                 .apply_remote_offer(self.session_id.clone(), offer.sdp)
                 .await?;
-            let answer = self.controller.create_answer(self.session_id.clone()).await?;
+            let answer = self
+                .controller
+                .create_answer(self.session_id.clone())
+                .await?;
             self.agent
                 .apply_remote_answer(self.session_id.clone(), answer.sdp)
                 .await?;
@@ -1186,7 +1550,12 @@ mod tests {
                 }
             })
             .await
-            .map_err(|_| format!("timed out waiting for first frame for {}", self.session_id.0))
+            .map_err(|_| {
+                format!(
+                    "timed out waiting for first frame for {}",
+                    self.session_id.0
+                )
+            })
         }
 
         fn controller_snapshot(&self) -> WebrtcHostSnapshot {
@@ -1196,7 +1565,9 @@ mod tests {
         }
 
         fn agent_snapshot(&self) -> WebrtcHostSnapshot {
-            self.agent.snapshot(&self.session_id).expect("agent snapshot")
+            self.agent
+                .snapshot(&self.session_id)
+                .expect("agent snapshot")
         }
 
         fn controller_probe(&self) -> PipelineProbeSnapshot {
@@ -1303,7 +1674,9 @@ mod tests {
 
         let wait_result = tokio::time::timeout(Duration::from_secs(8), async {
             loop {
-                let snapshot = controller.snapshot(&session_id).expect("controller snapshot");
+                let snapshot = controller
+                    .snapshot(&session_id)
+                    .expect("controller snapshot");
                 if snapshot.decoded_frame_count > 0 {
                     break;
                 }
@@ -1312,12 +1685,16 @@ mod tests {
         })
         .await;
 
-        let controller_snapshot = controller.snapshot(&session_id).expect("controller snapshot");
+        let controller_snapshot = controller
+            .snapshot(&session_id)
+            .expect("controller snapshot");
         let agent_snapshot = agent.snapshot(&session_id).expect("agent snapshot");
         let controller_probe = controller
             .probe_snapshot(&session_id)
             .expect("controller probe snapshot");
-        let agent_probe = agent.probe_snapshot(&session_id).expect("agent probe snapshot");
+        let agent_probe = agent
+            .probe_snapshot(&session_id)
+            .expect("agent probe snapshot");
         let controller_stats = controller
             .sessions
             .get(&session_id)
@@ -1508,7 +1885,11 @@ mod tests {
         let reassembled = packets
             .into_iter()
             .filter_map(|packet| {
-                ingress.push_payload(&packet.payload, packet.header.marker, access_unit.timestamp_us)
+                ingress.push_payload(
+                    &packet.payload,
+                    packet.header.marker,
+                    access_unit.timestamp_us,
+                )
             })
             .last()
             .expect("reassembled access unit");

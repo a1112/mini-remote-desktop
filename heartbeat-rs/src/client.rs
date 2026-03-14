@@ -64,8 +64,12 @@ pub struct HeartbeatConfig {
     pub transports: Vec<String>,
 }
 
-fn default_heartbeat_interval() -> u64 { 30 }
-fn default_protocol_version() -> u32 { 2 }
+fn default_heartbeat_interval() -> u64 {
+    30
+}
+fn default_protocol_version() -> u32 {
+    2
+}
 
 impl Default for HeartbeatConfig {
     fn default() -> Self {
@@ -92,8 +96,8 @@ impl HeartbeatClient {
     /// 创建新的心跳客户端
     pub fn new(config: HeartbeatConfig) -> Result<Self> {
         // 绑定到随机端口
-        let socket = UdpSocket::bind("0.0.0.0:0")
-            .context("failed to bind UDP socket for heartbeat")?;
+        let socket =
+            UdpSocket::bind("0.0.0.0:0").context("failed to bind UDP socket for heartbeat")?;
 
         info!(
             server_addr = %config.server_addr,
@@ -192,10 +196,10 @@ async fn send_heartbeat(socket: &UdpSocket, config: &HeartbeatConfig) -> Result<
         transports: config.transports.clone(),
     };
 
-    let data = serde_json::to_vec(&msg)
-        .context("failed to serialize heartbeat message")?;
+    let data = serde_json::to_vec(&msg).context("failed to serialize heartbeat message")?;
 
-    socket.send_to(&data, config.server_addr)
+    socket
+        .send_to(&data, config.server_addr)
         .await
         .context("failed to send heartbeat UDP packet")?;
 
@@ -222,10 +226,11 @@ pub struct HeartbeatDiscovery {
 impl HeartbeatDiscovery {
     /// 创建发现客户端
     pub fn new(discovery_port: u16) -> Result<Self> {
-        let socket = UdpSocket::bind(("0.0.0.0", 0))
-            .context("failed to bind UDP socket for discovery")?;
+        let socket =
+            UdpSocket::bind(("0.0.0.0", 0)).context("failed to bind UDP socket for discovery")?;
 
-        socket.set_broadcast(true)
+        socket
+            .set_broadcast(true)
             .context("failed to enable broadcast")?;
 
         Ok(Self {
@@ -240,7 +245,8 @@ impl HeartbeatDiscovery {
         const BROADCAST_ADDR: &str = "255.255.255.255";
 
         // 发送广播发现消息
-        self.socket.send_to(DISCOVERY_MAGIC, (BROADCAST_ADDR, self.discovery_port))
+        self.socket
+            .send_to(DISCOVERY_MAGIC, (BROADCAST_ADDR, self.discovery_port))
             .await
             .context("failed to send discovery broadcast")?;
 

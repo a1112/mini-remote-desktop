@@ -48,6 +48,33 @@ fn nvenc_h264_access_unit_uses_high_profile() {
     );
 }
 
+#[test]
+fn nvenc_h264_access_unit_can_use_baseline_profile() {
+    let Ok(mut encoder) = NvencH264Encoder::new_baseline(1280, 720, 30) else {
+        return;
+    };
+
+    let frame = CapturedFrame {
+        width: 1280,
+        height: 720,
+        pixel_format: FramePixelFormat::Bgra32,
+        timestamp_us: 33_000,
+        data: vec![0x33; 1280 * 720 * 4],
+    };
+    let access_unit = encoder
+        .encode(&frame)
+        .expect("nvenc encode baseline frame")
+        .into_iter()
+        .next()
+        .expect("single access unit");
+    let profile_idc = extract_sps_profile_idc(&access_unit.bytes).expect("sps profile idc");
+
+    assert_eq!(
+        profile_idc, 0x42,
+        "baseline constructor should emit H264 baseline profile for webrtc compatibility"
+    );
+}
+
 fn extract_sps_profile_idc(access_unit: &[u8]) -> Option<u8> {
     let mut offset = 0usize;
     while offset + 6 <= access_unit.len() {

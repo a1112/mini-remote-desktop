@@ -26,7 +26,11 @@ async fn quinn_loopback_pair_roundtrips_single_datagram() {
     pair.client
         .send_datagram(Bytes::from_static(b"hello-quic"))
         .expect("send client datagram");
-    let payload = pair.server.read_datagram().await.expect("read server datagram");
+    let payload = pair
+        .server
+        .read_datagram()
+        .await
+        .expect("read server datagram");
 
     assert_eq!(payload, Bytes::from_static(b"hello-quic"));
 }

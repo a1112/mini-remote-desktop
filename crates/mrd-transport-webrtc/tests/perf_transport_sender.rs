@@ -84,7 +84,9 @@ fn perf_webrtc_transport_sender_reports_latency_distribution() {
 }
 
 fn synthetic_h264_access_unit() -> EncodedAccessUnit {
-    let mut bytes = vec![0, 0, 0, 1, 0x67, 0x42, 0xE0, 0x1F, 0x89, 0x8B, 0x60, 0x50, 0x1E, 0xD0];
+    let mut bytes = vec![
+        0, 0, 0, 1, 0x67, 0x42, 0xE0, 0x1F, 0x89, 0x8B, 0x60, 0x50, 0x1E, 0xD0,
+    ];
     bytes.extend_from_slice(&[0, 0, 0, 1, 0x68, 0xCE, 0x06, 0xE2]);
     bytes.extend_from_slice(&[0, 0, 0, 1, 0x65]);
     bytes.extend((0..4096).map(|index| (index % 251) as u8));
