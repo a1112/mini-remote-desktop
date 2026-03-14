@@ -45,6 +45,7 @@ $psi.Arguments = "test -p $($case.crate) $($case.test_name) -- --ignored --nocap
 $psi.Environment["MRD_COMPONENT_CASE_NAME"] = $case.case_name
 $psi.Environment["MRD_COMPONENT_SAMPLES"] = [string]$case.sample_count
 $psi.Environment["MRD_COMPONENT_RESULT_PATH"] = $resultPath
+$psi.Environment["MRD_COMPONENT_BACKEND"] = $case.backend
 
 $process = New-Object System.Diagnostics.Process
 $process.StartInfo = $psi
