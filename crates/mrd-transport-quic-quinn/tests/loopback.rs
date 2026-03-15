@@ -2,7 +2,8 @@ use bytes::Bytes;
 use std::time::Duration;
 
 use mrd_transport_quic_quinn::{
-    fragment_access_unit, QuicAuReassembler, QuicAuReassemblerConfig, QuinnDatagramPair,
+    fragment_access_unit, QuicAuReassembler, QuicAuReassemblerConfig, QuinnDatagramEndpoint,
+    QuinnDatagramPair, QuinnServerListener,
 };
 
 #[tokio::test]
@@ -107,4 +108,41 @@ async fn quinn_reassembler_tracks_duplicate_fragments() {
 
     assert!(completed.is_none());
     assert_eq!(reassembler.stats().duplicate_fragments, 1);
+}
+
+#[tokio::test]
+async fn quinn_bootstrap_supports_explicit_client_server_connection() {
+    let (listener, bootstrap) = QuinnServerListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind explicit quinn server");
+    let server_task = tokio::spawn(async move { listener.accept().await });
+    let client_endpoint = QuinnDatagramEndpoint::connect_client("127.0.0.1:0", &bootstrap)
+        .await
+        .expect("connect explicit quinn client");
+    let server_endpoint = server_task
+        .await
+        .expect("join server task")
+        .expect("accept server connection");
+
+    client_endpoint
+        .send_datagram(Bytes::from_static(b"client-to-server"))
+        .expect("send client datagram");
+    let server_payload = server_endpoint
+        .read_datagram()
+        .await
+        .expect("read server datagram");
+    assert_eq!(server_payload, Bytes::from_static(b"client-to-server"));
+
+    server_endpoint
+        .send_datagram(Bytes::from_static(b"server-to-client"))
+        .expect("send server datagram");
+    let client_payload = client_endpoint
+        .read_datagram()
+        .await
+        .expect("read client datagram");
+    assert_eq!(client_payload, Bytes::from_static(b"server-to-client"));
+
+    assert_eq!(bootstrap.transport, "quic_quinn");
+    assert_eq!(bootstrap.server_name, "localhost");
+    assert!(!bootstrap.cert_der.is_empty());
 }
