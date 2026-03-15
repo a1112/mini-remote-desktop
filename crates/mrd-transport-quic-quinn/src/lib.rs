@@ -35,7 +35,9 @@ impl QuinnServerListener {
         self.local_addr
     }
 
-    pub async fn bind(bind_addr: &str) -> Result<(Self, QuinnServerBootstrap), QuinnTransportError> {
+    pub async fn bind(
+        bind_addr: &str,
+    ) -> Result<(Self, QuinnServerBootstrap), QuinnTransportError> {
         let server_crypto =
             rcgen::generate_simple_self_signed(vec!["localhost".into()]).map_err(|error| {
                 QuinnTransportError::Message(format!("generate cert failed: {error}"))
@@ -53,14 +55,18 @@ impl QuinnServerListener {
         let bind_addr = bind_addr.parse::<SocketAddr>().map_err(|error| {
             QuinnTransportError::Message(format!("parse bind_addr failed: {error}"))
         })?;
-        let endpoint = Endpoint::server(server_config, bind_addr)
-            .map_err(|error| QuinnTransportError::Message(format!("server endpoint failed: {error}")))?;
+        let endpoint = Endpoint::server(server_config, bind_addr).map_err(|error| {
+            QuinnTransportError::Message(format!("server endpoint failed: {error}"))
+        })?;
         let local_addr = endpoint.local_addr().map_err(|error| {
             QuinnTransportError::Message(format!("server local_addr failed: {error}"))
         })?;
 
         Ok((
-            Self { endpoint, local_addr },
+            Self {
+                endpoint,
+                local_addr,
+            },
             QuinnServerBootstrap {
                 transport: "quic_quinn",
                 listen_addr: local_addr,
@@ -71,14 +77,13 @@ impl QuinnServerListener {
     }
 
     pub async fn accept(self) -> Result<QuinnDatagramEndpoint, QuinnTransportError> {
-        let connecting = self
-            .endpoint
-            .accept()
-            .await
-            .ok_or_else(|| QuinnTransportError::Message("server accept returned None".into()))?;
-        let connection = connecting
-            .await
-            .map_err(|error| QuinnTransportError::Message(format!("server handshake failed: {error}")))?;
+        let connecting =
+            self.endpoint.accept().await.ok_or_else(|| {
+                QuinnTransportError::Message("server accept returned None".into())
+            })?;
+        let connection = connecting.await.map_err(|error| {
+            QuinnTransportError::Message(format!("server handshake failed: {error}"))
+        })?;
         let metadata = QuicTransportMetadata {
             transport: "quic_quinn",
             local_addr: self.local_addr,
@@ -86,37 +91,53 @@ impl QuinnServerListener {
         };
 
         Ok(QuinnDatagramEndpoint {
-            endpoint: self.endpoint,
-            connection,
-            metadata,
+            inner: Arc::new(QuinnDatagramEndpointInner {
+                endpoint: self.endpoint,
+                connection,
+                metadata,
+            }),
         })
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct QuinnDatagramEndpoint {
+#[derive(Debug)]
+struct QuinnDatagramEndpointInner {
     endpoint: Endpoint,
     connection: Connection,
     metadata: QuicTransportMetadata,
 }
 
+impl Drop for QuinnDatagramEndpointInner {
+    fn drop(&mut self) {
+        self.connection.close(0_u32.into(), b"shutdown");
+        self.endpoint.close(0_u32.into(), b"shutdown");
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct QuinnDatagramEndpoint {
+    inner: Arc<QuinnDatagramEndpointInner>,
+}
+
 impl QuinnDatagramEndpoint {
     pub fn metadata(&self) -> &QuicTransportMetadata {
-        &self.metadata
+        &self.inner.metadata
     }
 
     pub fn max_datagram_size(&self) -> Option<usize> {
-        self.connection.max_datagram_size()
+        self.inner.connection.max_datagram_size()
     }
 
     pub fn send_datagram(&self, payload: Bytes) -> Result<(), QuinnTransportError> {
-        self.connection
+        self.inner
+            .connection
             .send_datagram(payload)
             .map_err(|error| QuinnTransportError::Message(format!("send_datagram failed: {error}")))
     }
 
     pub async fn read_datagram(&self) -> Result<Bytes, QuinnTransportError> {
-        self.connection
+        self.inner
+            .connection
             .read_datagram()
             .await
             .map_err(|error| QuinnTransportError::Message(format!("read_datagram failed: {error}")))
@@ -136,9 +157,9 @@ impl QuinnDatagramEndpoint {
                 QuinnTransportError::Message(format!("client config failed: {error}"))
             })?;
 
-        let bind_addr = bind_addr
-            .parse::<SocketAddr>()
-            .map_err(|error| QuinnTransportError::Message(format!("parse bind_addr failed: {error}")))?;
+        let bind_addr = bind_addr.parse::<SocketAddr>().map_err(|error| {
+            QuinnTransportError::Message(format!("parse bind_addr failed: {error}"))
+        })?;
         let mut client_endpoint = Endpoint::client(bind_addr).map_err(|error| {
             QuinnTransportError::Message(format!("client endpoint failed: {error}"))
         })?;
@@ -159,17 +180,12 @@ impl QuinnDatagramEndpoint {
         };
 
         Ok(Self {
-            endpoint: client_endpoint,
-            connection: client_connection,
-            metadata,
+            inner: Arc::new(QuinnDatagramEndpointInner {
+                endpoint: client_endpoint,
+                connection: client_connection,
+                metadata,
+            }),
         })
-    }
-}
-
-impl Drop for QuinnDatagramEndpoint {
-    fn drop(&mut self) {
-        self.connection.close(0_u32.into(), b"shutdown");
-        self.endpoint.close(0_u32.into(), b"shutdown");
     }
 }
 
@@ -183,9 +199,9 @@ impl QuinnDatagramPair {
         let (listener, bootstrap) = QuinnServerListener::bind("127.0.0.1:0").await?;
         let server_task = tokio::spawn(async move { listener.accept().await });
         let client = QuinnDatagramEndpoint::connect_client("127.0.0.1:0", &bootstrap).await?;
-        let server = server_task
-            .await
-            .map_err(|error| QuinnTransportError::Message(format!("server task join failed: {error}")))??;
+        let server = server_task.await.map_err(|error| {
+            QuinnTransportError::Message(format!("server task join failed: {error}"))
+        })??;
 
         Ok(Self { client, server })
     }

@@ -146,3 +146,31 @@ async fn quinn_bootstrap_supports_explicit_client_server_connection() {
     assert_eq!(bootstrap.server_name, "localhost");
     assert!(!bootstrap.cert_der.is_empty());
 }
+
+#[tokio::test]
+async fn quinn_cloned_endpoint_keeps_connection_alive_until_last_drop() {
+    let (listener, bootstrap) = QuinnServerListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind explicit quinn server");
+    let server_task = tokio::spawn(async move { listener.accept().await });
+    let client_endpoint = QuinnDatagramEndpoint::connect_client("127.0.0.1:0", &bootstrap)
+        .await
+        .expect("connect explicit quinn client");
+    let server_endpoint = server_task
+        .await
+        .expect("join server task")
+        .expect("accept server connection");
+
+    let retained_client = client_endpoint.clone();
+    drop(client_endpoint);
+
+    retained_client
+        .send_datagram(Bytes::from_static(b"clone-still-open"))
+        .expect("send client datagram after dropping original");
+    let server_payload = server_endpoint
+        .read_datagram()
+        .await
+        .expect("read server datagram after dropping original");
+
+    assert_eq!(server_payload, Bytes::from_static(b"clone-still-open"));
+}

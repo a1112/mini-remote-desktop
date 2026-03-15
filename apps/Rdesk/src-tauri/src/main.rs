@@ -5,9 +5,10 @@ mod app_settings;
 mod benchmark;
 mod device_info;
 mod frame_sink;
+mod quic_host;
+mod quic_session;
 #[cfg(test)]
 mod quic_transport_harness;
-mod quic_session;
 mod realtime_client;
 mod realtime_management;
 mod realtime_runtime;
@@ -31,9 +32,9 @@ use mrd_observability::{MediaProbeEvent, PipelineProbeSnapshot, ProbeRegistry};
 use mrd_proto::{BackendRole, DeviceId, SessionId};
 use mrd_signal_client::encode_message;
 use mrd_signal_proto::{IceCandidate, SessionDescription, SignalMessage};
+use quic_session::{QuicSessionCoordinator, QuicSessionSnapshot};
 use realtime_management::{RealtimeManagementClient, RealtimeStatus};
 use realtime_runtime::{RealtimeRegistration, RealtimeRuntime};
-use quic_session::{QuicSessionCoordinator, QuicSessionSnapshot};
 use render_host::{
     render_host_snapshot_with, RenderHost, RenderHostSnapshot, RendererSnapshotResponse,
 };
