@@ -7,6 +7,7 @@ mod device_info;
 mod frame_sink;
 #[cfg(test)]
 mod quic_transport_harness;
+mod quic_session;
 mod realtime_client;
 mod realtime_management;
 mod realtime_runtime;
@@ -32,6 +33,7 @@ use mrd_signal_client::encode_message;
 use mrd_signal_proto::{IceCandidate, SessionDescription, SignalMessage};
 use realtime_management::{RealtimeManagementClient, RealtimeStatus};
 use realtime_runtime::{RealtimeRegistration, RealtimeRuntime};
+use quic_session::{QuicSessionCoordinator, QuicSessionSnapshot};
 use render_host::{
     render_host_snapshot_with, RenderHost, RenderHostSnapshot, RendererSnapshotResponse,
 };
@@ -58,6 +60,7 @@ struct AppState {
     settings_path: std::path::PathBuf,
     webrtc_host: std::sync::Arc<Mutex<WebrtcHost>>,
     webrtc_sessions: std::sync::Arc<Mutex<WebrtcSessionCoordinator>>,
+    quic_sessions: std::sync::Arc<Mutex<QuicSessionCoordinator>>,
 }
 
 /// 设备注册响应
@@ -80,6 +83,19 @@ struct WebrtcSessionSnapshotResponse {
     remote_offer: Option<String>,
     remote_answer: Option<String>,
     remote_ice_candidates: Vec<IceCandidate>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct QuicSessionSnapshotResponse {
+    transport: String,
+    source_device_id: Option<String>,
+    target_device_id: Option<String>,
+    local_listen_addr: Option<String>,
+    local_server_name: Option<String>,
+    local_cert_der_b64: Option<String>,
+    remote_listen_addr: Option<String>,
+    remote_server_name: Option<String>,
+    remote_cert_der_b64: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -182,6 +198,7 @@ struct SessionRuntimeSnapshotResponse {
     render_host: RenderHostSnapshotResponse,
     webrtc_host: WebrtcHostSnapshotResponse,
     webrtc_signaling: Option<WebrtcSessionSnapshotResponse>,
+    quic_signaling: Option<QuicSessionSnapshotResponse>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -423,6 +440,14 @@ async fn webrtc_snapshot(
     session_id: String,
 ) -> Result<Option<WebrtcSessionSnapshotResponse>, String> {
     Ok(webrtc_snapshot_with(state.webrtc_sessions.as_ref(), session_id).await)
+}
+
+#[tauri::command]
+async fn quic_session_snapshot(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+) -> Result<Option<QuicSessionSnapshotResponse>, String> {
+    Ok(quic_snapshot_with(state.quic_sessions.as_ref(), session_id).await)
 }
 
 #[tauri::command]
@@ -763,6 +788,7 @@ async fn session_runtime_snapshot(
         state.render_host.as_ref(),
         state.webrtc_host.as_ref(),
         state.webrtc_sessions.as_ref(),
+        state.quic_sessions.as_ref(),
         SessionId(session_id),
     )
     .await
@@ -788,6 +814,7 @@ async fn session_runtime_sync_realtime(
         state.render_host.as_ref(),
         state.webrtc_host.as_ref(),
         state.webrtc_sessions.as_ref(),
+        state.quic_sessions.as_ref(),
         session_id,
     )
     .await
@@ -1118,6 +1145,20 @@ fn webrtc_snapshot_response(snapshot: &WebrtcSessionSnapshot) -> WebrtcSessionSn
     }
 }
 
+fn quic_snapshot_response(snapshot: &QuicSessionSnapshot) -> QuicSessionSnapshotResponse {
+    QuicSessionSnapshotResponse {
+        transport: snapshot.transport.clone(),
+        source_device_id: snapshot.source_device_id.clone(),
+        target_device_id: snapshot.target_device_id.clone(),
+        local_listen_addr: snapshot.local_listen_addr.clone(),
+        local_server_name: snapshot.local_server_name.clone(),
+        local_cert_der_b64: snapshot.local_cert_der_b64.clone(),
+        remote_listen_addr: snapshot.remote_listen_addr.clone(),
+        remote_server_name: snapshot.remote_server_name.clone(),
+        remote_cert_der_b64: snapshot.remote_cert_der_b64.clone(),
+    }
+}
+
 fn webrtc_host_snapshot_response(snapshot: &WebrtcHostSnapshot) -> WebrtcHostSnapshotResponse {
     WebrtcHostSnapshotResponse {
         local_offer: snapshot.local_offer.clone(),
@@ -1363,6 +1404,7 @@ async fn session_runtime_snapshot_with(
     render_host: &std::sync::Mutex<RenderHost>,
     webrtc_host: &Mutex<WebrtcHost>,
     webrtc_sessions: &Mutex<WebrtcSessionCoordinator>,
+    quic_sessions: &Mutex<QuicSessionCoordinator>,
     session_id: SessionId,
 ) -> Result<SessionRuntimeSnapshotResponse, String> {
     let lifecycle_snapshot = {
@@ -1377,12 +1419,14 @@ async fn session_runtime_snapshot_with(
         .await
         .ok_or_else(|| format!("未找到 webrtc host 会话: {}", session_id.0))?;
     let webrtc_signaling = webrtc_snapshot_with(webrtc_sessions, session_id.0.clone()).await;
+    let quic_signaling = quic_snapshot_with(quic_sessions, session_id.0.clone()).await;
 
     Ok(SessionRuntimeSnapshotResponse {
         lifecycle: session_lifecycle_snapshot_response(lifecycle_snapshot),
         render_host: render_host_snapshot_response(render_host_snapshot),
         webrtc_host: webrtc_host_snapshot,
         webrtc_signaling,
+        quic_signaling,
     })
 }
 
@@ -1394,6 +1438,16 @@ async fn webrtc_snapshot_with(
     sessions
         .snapshot(&SessionId(session_id))
         .map(webrtc_snapshot_response)
+}
+
+async fn quic_snapshot_with(
+    coordinator: &Mutex<QuicSessionCoordinator>,
+    session_id: String,
+) -> Option<QuicSessionSnapshotResponse> {
+    let sessions = coordinator.lock().await;
+    sessions
+        .snapshot(&SessionId(session_id))
+        .map(quic_snapshot_response)
 }
 
 async fn webrtc_host_create_offer_with(
@@ -1531,6 +1585,7 @@ fn main() {
             settings_path,
             webrtc_host: std::sync::Arc::new(Mutex::new(webrtc_host)),
             webrtc_sessions: std::sync::Arc::new(Mutex::new(WebrtcSessionCoordinator::default())),
+            quic_sessions: std::sync::Arc::new(Mutex::new(QuicSessionCoordinator::default())),
         })
         .invoke_handler(tauri::generate_handler![
             get_hardware_info,
@@ -1555,6 +1610,7 @@ fn main() {
             webrtc_apply_remote_ice_candidate,
             webrtc_sync_realtime_events,
             webrtc_snapshot,
+            quic_session_snapshot,
             webrtc_host_create_offer,
             webrtc_host_apply_remote_offer,
             webrtc_host_create_answer,
