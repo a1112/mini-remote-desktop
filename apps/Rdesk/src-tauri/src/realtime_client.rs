@@ -101,13 +101,23 @@ impl RealtimeConnection {
             session_id,
             source_device_id: self.registered.device_id.clone(),
             target_device_id,
+            transport: "webrtc".into(),
+            quic_listen_addr: None,
+            quic_server_name: None,
+            quic_cert_der_b64: None,
         });
         self.send_message(message).await
     }
 
     pub async fn accept_session(&mut self, session_id: SessionId) -> Result<(), String> {
-        self.send_message(SignalMessage::SessionAccept(SessionAccept { session_id }))
-            .await
+        self.send_message(SignalMessage::SessionAccept(SessionAccept {
+            session_id,
+            transport: "webrtc".into(),
+            quic_listen_addr: None,
+            quic_server_name: None,
+            quic_cert_der_b64: None,
+        }))
+        .await
     }
 
     pub async fn send_offer(&mut self, description: SessionDescription) -> Result<(), String> {
