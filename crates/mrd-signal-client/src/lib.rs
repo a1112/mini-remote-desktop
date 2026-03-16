@@ -18,8 +18,8 @@ pub fn decode_message(raw: &str) -> Result<SignalMessage, SignalClientError> {
 #[cfg(test)]
 mod tests {
     use super::{decode_message, encode_message};
-    use mrd_proto::{BackendRole, DeviceId};
-    use mrd_signal_proto::{RegisterRequest, SignalMessage};
+    use mrd_proto::{BackendRole, DeviceId, SessionId};
+    use mrd_signal_proto::{RegisterRequest, SessionAccept, SessionRequest, SignalMessage};
 
     #[test]
     fn register_message_roundtrip() {
@@ -33,5 +33,33 @@ mod tests {
         let decoded = decode_message(&encoded).expect("decode register message");
 
         assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn quic_session_messages_roundtrip() {
+        let request = SignalMessage::SessionRequest(SessionRequest {
+            session_id: SessionId("session-quic".into()),
+            source_device_id: DeviceId("controller-1".into()),
+            target_device_id: DeviceId("agent-1".into()),
+            transport: "quic_quinn".into(),
+            quic_listen_addr: Some("127.0.0.1:5000".into()),
+            quic_server_name: Some("localhost".into()),
+            quic_cert_der_b64: Some("AQID".into()),
+        });
+        let accept = SignalMessage::SessionAccept(SessionAccept {
+            session_id: SessionId("session-quic".into()),
+            transport: "quic_quinn".into(),
+            quic_listen_addr: Some("127.0.0.1:6000".into()),
+            quic_server_name: Some("localhost".into()),
+            quic_cert_der_b64: Some("BAUG".into()),
+        });
+
+        let encoded_request = encode_message(&request).expect("encode quic request");
+        let decoded_request = decode_message(&encoded_request).expect("decode quic request");
+        assert_eq!(decoded_request, request);
+
+        let encoded_accept = encode_message(&accept).expect("encode quic accept");
+        let decoded_accept = decode_message(&encoded_accept).expect("decode quic accept");
+        assert_eq!(decoded_accept, accept);
     }
 }

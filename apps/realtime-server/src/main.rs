@@ -307,6 +307,10 @@ mod tests {
                     session_id: SessionId("session-1".into()),
                     source_device_id: DeviceId("controller-1".into()),
                     target_device_id: DeviceId("agent-1".into()),
+                    transport: "webrtc".into(),
+                    quic_listen_addr: None,
+                    quic_server_name: None,
+                    quic_cert_der_b64: None,
                 }))
                 .expect("encode session request"),
             ))
@@ -328,6 +332,10 @@ mod tests {
             .send(Message::Text(
                 encode_message(&SignalMessage::SessionAccept(SessionAccept {
                     session_id: SessionId("session-1".into()),
+                    transport: "webrtc".into(),
+                    quic_listen_addr: None,
+                    quic_server_name: None,
+                    quic_cert_der_b64: None,
                 }))
                 .expect("encode session accept"),
             ))
