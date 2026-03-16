@@ -104,8 +104,7 @@ impl RealtimeRuntime {
                 quic_server_name,
                 quic_cert_der_b64,
             )
-            .await?;
-        connection.recv_event().await.map(|_| ())
+            .await
     }
 
     pub async fn accept_session(&self, handle: u64, session_id: SessionId) -> Result<(), String> {
@@ -136,8 +135,7 @@ impl RealtimeRuntime {
                 quic_server_name,
                 quic_cert_der_b64,
             )
-            .await?;
-        connection.recv_event().await.map(|_| ())
+            .await
     }
 
     pub async fn drain_events(&self, handle: u64) -> Result<Vec<SignalMessage>, String> {
@@ -146,6 +144,15 @@ impl RealtimeRuntime {
             .connections
             .get_mut(&handle)
             .ok_or_else(|| format!("未找到 realtime 连接句柄: {}", handle))?;
+
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_millis(5), connection.recv_event())
+                .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
 
         Ok(connection.drain_inbound_events())
     }
@@ -161,8 +168,7 @@ impl RealtimeRuntime {
             .get_mut(&handle)
             .ok_or_else(|| format!("未找到 realtime 连接句柄: {}", handle))?;
 
-        connection.send_offer(description).await?;
-        connection.recv_event().await.map(|_| ())
+        connection.send_offer(description).await
     }
 
     pub async fn send_answer(
@@ -176,8 +182,7 @@ impl RealtimeRuntime {
             .get_mut(&handle)
             .ok_or_else(|| format!("未找到 realtime 连接句柄: {}", handle))?;
 
-        connection.send_answer(description).await?;
-        connection.recv_event().await.map(|_| ())
+        connection.send_answer(description).await
     }
 
     pub async fn send_ice_candidate(
@@ -191,8 +196,16 @@ impl RealtimeRuntime {
             .get_mut(&handle)
             .ok_or_else(|| format!("未找到 realtime 连接句柄: {}", handle))?;
 
-        connection.send_ice_candidate(candidate).await?;
-        connection.recv_event().await.map(|_| ())
+        connection.send_ice_candidate(candidate).await
+    }
+
+    pub async fn device_id(&self, handle: u64) -> Result<DeviceId, String> {
+        let state = self.inner.lock().await;
+        let connection = state
+            .connections
+            .get(&handle)
+            .ok_or_else(|| format!("未找到 realtime 连接句柄: {}", handle))?;
+        Ok(connection.registered.device_id.clone())
     }
 
     async fn next_handle(&self) -> u64 {

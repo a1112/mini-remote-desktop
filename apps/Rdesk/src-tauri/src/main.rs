@@ -318,6 +318,22 @@ async fn realtime_request_session(
     quic_server_name: Option<String>,
     quic_cert_der_b64: Option<String>,
 ) -> Result<(), String> {
+    if transport.as_deref() == Some("quic_quinn") {
+        let source_device_id = state.realtime_runtime.device_id(handle).await?;
+        state
+            .quic_sessions
+            .lock()
+            .await
+            .request_session(
+                SessionId(session_id.clone()),
+                source_device_id,
+                DeviceId(target_device_id.clone()),
+                "quic_quinn".into(),
+                quic_listen_addr.clone(),
+                quic_server_name.clone(),
+                quic_cert_der_b64.clone(),
+            )?;
+    }
     realtime_request_session_with(
         &state.realtime_runtime,
         handle,
@@ -341,16 +357,41 @@ async fn realtime_accept_session(
     quic_server_name: Option<String>,
     quic_cert_der_b64: Option<String>,
 ) -> Result<(), String> {
+    let (transport, quic_listen_addr, quic_server_name, quic_cert_der_b64) =
+        if transport.as_deref() == Some("quic_quinn")
+            && (quic_listen_addr.is_none()
+                || quic_server_name.is_none()
+                || quic_cert_der_b64.is_none())
+        {
+            prepare_quic_accept_with(
+                state.quic_host.as_ref(),
+                state.quic_sessions.as_ref(),
+                SessionId(session_id.clone()),
+            )
+            .await?
+        } else {
+            (
+                transport.unwrap_or_else(|| "webrtc".into()),
+                quic_listen_addr,
+                quic_server_name,
+                quic_cert_der_b64,
+            )
+        };
     realtime_accept_session_with(
         &state.realtime_runtime,
         handle,
-        session_id,
-        transport,
+        session_id.clone(),
+        Some(transport.clone()),
         quic_listen_addr,
         quic_server_name,
         quic_cert_der_b64,
     )
-    .await
+    .await?;
+
+    if transport == "quic_quinn" {
+        spawn_quic_accept_completion(state.quic_host.clone(), SessionId(session_id));
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -494,6 +535,14 @@ async fn quic_session_snapshot(
 }
 
 #[tauri::command]
+async fn quic_host_snapshot(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+) -> Result<Option<QuicHostSnapshotResponse>, String> {
+    Ok(quic_host_snapshot_with(state.quic_host.as_ref(), session_id).await)
+}
+
+#[tauri::command]
 async fn webrtc_host_create_offer(
     state: tauri::State<'_, AppState>,
     session_id: String,
@@ -597,8 +646,12 @@ async fn session_runtime_probe_snapshot(
     state: tauri::State<'_, AppState>,
     session_id: String,
 ) -> Result<Option<PipelineProbeSnapshot>, String> {
-    let host = state.webrtc_host.lock().await;
-    Ok(host.probe_snapshot(&SessionId(session_id)))
+    let session_id = SessionId(session_id);
+    if let Some(snapshot) = state.webrtc_host.lock().await.probe_snapshot(&session_id) {
+        return Ok(Some(snapshot));
+    }
+    let host = state.quic_host.lock().await;
+    Ok(host.probe_snapshot(&session_id))
 }
 
 #[tauri::command]
@@ -607,8 +660,15 @@ async fn session_runtime_probe_recent_events(
     session_id: String,
     limit: Option<usize>,
 ) -> Result<Vec<MediaProbeEvent>, String> {
+    let session_id = SessionId(session_id);
+    let limit = limit.unwrap_or(64);
     let host = state.webrtc_host.lock().await;
-    Ok(host.probe_recent_events(&SessionId(session_id), limit.unwrap_or(64)))
+    let events = host.probe_recent_events(&session_id, limit);
+    if !events.is_empty() {
+        return Ok(events);
+    }
+    let host = state.quic_host.lock().await;
+    Ok(host.probe_recent_events(&session_id, limit))
 }
 
 #[tauri::command]
@@ -632,6 +692,33 @@ async fn webrtc_host_stop_embedded_video_sender(
 ) -> Result<(), String> {
     state
         .webrtc_host
+        .lock()
+        .await
+        .stop_embedded_video_sender(&SessionId(session_id))
+        .await
+}
+
+#[tauri::command]
+async fn quic_host_start_embedded_desktop_sender(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+    fps: Option<u32>,
+) -> Result<(), String> {
+    state
+        .quic_host
+        .lock()
+        .await
+        .start_embedded_desktop_sender(SessionId(session_id), fps.unwrap_or(15))
+        .await
+}
+
+#[tauri::command]
+async fn quic_host_stop_embedded_video_sender(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+) -> Result<(), String> {
+    state
+        .quic_host
         .lock()
         .await
         .stop_embedded_video_sender(&SessionId(session_id))
@@ -853,6 +940,14 @@ async fn session_runtime_sync_realtime(
     else {
         return Ok(None);
     };
+    let local_device_id = state.realtime_runtime.device_id(handle).await?;
+    sync_quic_host_from_session_snapshot_with(
+        state.quic_host.as_ref(),
+        state.quic_sessions.as_ref(),
+        &local_device_id,
+        &session_id,
+    )
+    .await?;
 
     session_runtime_snapshot_with(
         state.session_lifecycle.as_ref(),
@@ -1132,6 +1227,39 @@ async fn drain_realtime_events_with(
     handle: u64,
 ) -> Result<Vec<SignalMessage>, String> {
     runtime.drain_events(handle).await
+}
+
+async fn prepare_quic_accept_with(
+    quic_host: &Mutex<QuicHost>,
+    quic_sessions: &Mutex<QuicSessionCoordinator>,
+    session_id: SessionId,
+) -> Result<(String, Option<String>, Option<String>, Option<String>), String> {
+    use base64::Engine;
+
+    let bootstrap = quic_host
+        .lock()
+        .await
+        .prepare_listener(session_id.clone(), "127.0.0.1:0")
+        .await?;
+    quic_sessions.lock().await.accept_session(
+        session_id,
+        "quic_quinn".into(),
+        Some(bootstrap.listen_addr.to_string()),
+        Some(bootstrap.server_name.clone()),
+        Some(base64::engine::general_purpose::STANDARD.encode(&bootstrap.cert_der)),
+    )?;
+    Ok((
+        "quic_quinn".into(),
+        Some(bootstrap.listen_addr.to_string()),
+        Some(bootstrap.server_name),
+        Some(base64::engine::general_purpose::STANDARD.encode(&bootstrap.cert_der)),
+    ))
+}
+
+fn spawn_quic_accept_completion(quic_host: std::sync::Arc<Mutex<QuicHost>>, session_id: SessionId) {
+    tokio::spawn(async move {
+        let _ = quic_host.lock().await.accept_peer(session_id).await;
+    });
 }
 
 fn parse_backend_role(role: &str) -> Result<BackendRole, String> {
@@ -1519,6 +1647,70 @@ async fn apply_realtime_events_to_session_coordinators(
     Ok(last_session_id)
 }
 
+async fn sync_quic_host_from_session_snapshot_with(
+    quic_host: &Mutex<QuicHost>,
+    quic_sessions: &Mutex<QuicSessionCoordinator>,
+    local_device_id: &DeviceId,
+    session_id: &SessionId,
+) -> Result<(), String> {
+    let snapshot = {
+        let sessions = quic_sessions.lock().await;
+        sessions.snapshot(session_id).cloned()
+    };
+    let Some(snapshot) = snapshot else {
+        return Ok(());
+    };
+    if snapshot.transport != "quic_quinn" {
+        return Ok(());
+    }
+    if snapshot.source_device_id.as_deref() != Some(local_device_id.0.as_str()) {
+        return Ok(());
+    }
+    let remote_listen_addr = match snapshot.remote_listen_addr {
+        Some(value) => value,
+        None => return Ok(()),
+    };
+    let remote_server_name = match snapshot.remote_server_name {
+        Some(value) => value,
+        None => return Ok(()),
+    };
+    let remote_cert_der_b64 = match snapshot.remote_cert_der_b64 {
+        Some(value) => value,
+        None => return Ok(()),
+    };
+
+    {
+        let host = quic_host.lock().await;
+        if host.snapshot(session_id).is_some() {
+            return Ok(());
+        }
+    }
+
+    let cert_der = {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD
+            .decode(remote_cert_der_b64)
+            .map_err(|error| format!("decode remote QUIC cert failed: {error}"))?
+    };
+    quic_host
+        .lock()
+        .await
+        .connect_to_peer(
+            session_id.clone(),
+            "127.0.0.1:0",
+            &mrd_transport_quic_quinn::QuinnServerBootstrap {
+                transport: "quic_quinn",
+                listen_addr: remote_listen_addr
+                    .parse()
+                    .map_err(|error| format!("parse remote QUIC listen addr failed: {error}"))?,
+                server_name: remote_server_name,
+                cert_der,
+            },
+            "h264_software",
+        )
+        .await
+}
+
 async fn session_runtime_snapshot_with(
     lifecycle: &std::sync::Mutex<SessionLifecycleCoordinator>,
     render_host: &std::sync::Mutex<RenderHost>,
@@ -1743,6 +1935,7 @@ fn main() {
             webrtc_sync_realtime_events,
             webrtc_snapshot,
             quic_session_snapshot,
+            quic_host_snapshot,
             webrtc_host_create_offer,
             webrtc_host_apply_remote_offer,
             webrtc_host_create_answer,
@@ -1753,6 +1946,8 @@ fn main() {
             session_runtime_probe_recent_events,
             webrtc_host_start_embedded_desktop_sender,
             webrtc_host_stop_embedded_video_sender,
+            quic_host_start_embedded_desktop_sender,
+            quic_host_stop_embedded_video_sender,
             decoded_frame_snapshot,
             decoded_frame_preview,
             render_host_attach_session,
@@ -1788,9 +1983,10 @@ mod tests {
         },
         decode_policy_with, decoded_frame_preview_with, decoded_frame_snapshot_with,
         drain_realtime_events_with, nvdec_runtime_probe_response, quic_host_snapshot_with,
-        quic_snapshot_with, realtime_accept_session_with, realtime_register_with,
+        prepare_quic_accept_with, quic_snapshot_with, realtime_accept_session_with, realtime_register_with,
         realtime_request_session_with, render_host_snapshot_response,
-        session_runtime_snapshot_with, set_decode_policy_with, webrtc_apply_remote_answer_with,
+        session_runtime_snapshot_with, set_decode_policy_with, spawn_quic_accept_completion,
+        sync_quic_host_from_session_snapshot_with, webrtc_apply_remote_answer_with,
         webrtc_apply_remote_ice_candidate_with, webrtc_create_local_offer_with,
         webrtc_host_apply_remote_answer_with, webrtc_host_apply_remote_offer_with,
         webrtc_host_create_answer_with, webrtc_host_create_offer_with, webrtc_host_snapshot_with,
@@ -1808,15 +2004,15 @@ mod tests {
         routing::get,
         Router,
     };
-    use futures_util::StreamExt;
+    use futures_util::{SinkExt, StreamExt};
     use mrd_pipeline_core::{CapturedFrame, FrameCapture, FramePixelFormat, VideoEncoder};
     use mrd_proto::{DeviceId, SessionId};
     use mrd_signal_client::{decode_message, encode_message};
     use mrd_signal_proto::SignalMessage;
-    use std::sync::Once;
+    use std::{collections::HashMap, sync::Arc, sync::Once};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use tokio::net::TcpListener;
-    use tokio::sync::Mutex;
+    use tokio::sync::{mpsc, Mutex};
 
     fn ensure_rustls_crypto_provider() {
         static INSTALL: Once = Once::new();
@@ -1913,6 +2109,121 @@ mod tests {
             axum::serve(listener, app)
                 .await
                 .expect("serve helper test ws");
+        });
+
+        format!("ws://{}/ws", addr)
+    }
+
+    #[derive(Default)]
+    struct RoutedSignalingState {
+        peers: HashMap<DeviceId, mpsc::UnboundedSender<String>>,
+        routes: HashMap<SessionId, (DeviceId, DeviceId)>,
+    }
+
+    async fn routed_ws_handler(
+        ws: WebSocketUpgrade,
+        axum::extract::State(state): axum::extract::State<Arc<Mutex<RoutedSignalingState>>>,
+    ) -> impl IntoResponse {
+        ws.on_upgrade(move |socket| handle_routed_socket(socket, state))
+    }
+
+    async fn handle_routed_socket(
+        socket: WebSocket,
+        state: Arc<Mutex<RoutedSignalingState>>,
+    ) {
+        let (mut sender, mut receiver) = socket.split();
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let mut current_device: Option<DeviceId> = None;
+
+        let send_task = tokio::spawn(async move {
+            while let Some(message) = rx.recv().await {
+                if sender.send(Message::Text(message.into())).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        while let Some(Ok(Message::Text(raw))) = receiver.next().await {
+            let signal = decode_message(&raw).expect("decode routed signal");
+            match signal {
+                SignalMessage::Register(register) => {
+                    let device_id = register.device_id.expect("registered device id");
+                    state.lock().await.peers.insert(device_id.clone(), tx.clone());
+                    current_device = Some(device_id.clone());
+                    let ack = encode_message(&SignalMessage::Registered(
+                        mrd_signal_proto::RegisteredResponse { device_id },
+                    ))
+                    .expect("encode routed register ack");
+                    let _ = tx.send(ack);
+                }
+                SignalMessage::SessionRequest(request) => {
+                    state.lock().await.routes.insert(
+                        request.session_id.clone(),
+                        (
+                            request.source_device_id.clone(),
+                            request.target_device_id.clone(),
+                        ),
+                    );
+                    if let Some(peer) = state.lock().await.peers.get(&request.target_device_id) {
+                        let payload = encode_message(&SignalMessage::SessionRequest(request))
+                            .expect("encode routed request");
+                        let _ = peer.send(payload);
+                    }
+                }
+                SignalMessage::SessionAccept(accept) => {
+                    let Some(current_device) = current_device.clone() else {
+                        continue;
+                    };
+                    let peer = {
+                        let guard = state.lock().await;
+                        guard
+                            .routes
+                            .get(&accept.session_id)
+                            .and_then(|(controller, agent)| {
+                                if *agent == current_device {
+                                    Some(controller.clone())
+                                } else if *controller == current_device {
+                                    Some(agent.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                    };
+                    if let Some(peer) = peer {
+                        if let Some(target) = state.lock().await.peers.get(&peer) {
+                            let payload = encode_message(&SignalMessage::SessionAccept(accept))
+                                .expect("encode routed accept");
+                            let _ = target.send(payload);
+                        }
+                    }
+                }
+                SignalMessage::WebrtcOffer(_)
+                | SignalMessage::WebrtcAnswer(_)
+                | SignalMessage::IceCandidate(_)
+                | SignalMessage::Registered(_) => {}
+            }
+        }
+
+        if let Some(device_id) = current_device {
+            state.lock().await.peers.remove(&device_id);
+        }
+        send_task.abort();
+    }
+
+    async fn spawn_routed_server() -> String {
+        let state = Arc::new(Mutex::new(RoutedSignalingState::default()));
+        let app = Router::new()
+            .route("/ws", get(routed_ws_handler))
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind realtime routed test server");
+        let addr = listener.local_addr().expect("routed test server addr");
+
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve routed helper test ws");
         });
 
         format!("ws://{}/ws", addr)
@@ -2283,6 +2594,143 @@ mod tests {
             .expect("quic host runtime snapshot");
         assert_eq!(quic_snapshot.transport, "quic_quinn");
         assert!(host_snapshot.remote_datagram_count > 0);
+    }
+
+    #[tokio::test]
+    async fn realtime_quic_flow_connects_hosts_and_delivers_frames() {
+        let signaling_url = spawn_routed_server().await;
+        let controller_runtime = RealtimeRuntime::new(signaling_url.clone());
+        let agent_runtime = RealtimeRuntime::new(signaling_url);
+
+        let controller_registration = realtime_register_with(
+            &controller_runtime,
+            "controller".into(),
+            Some("controller-1".into()),
+            "controller".into(),
+        )
+        .await
+        .expect("register controller runtime");
+        let agent_registration = realtime_register_with(
+            &agent_runtime,
+            "agent".into(),
+            Some("agent-1".into()),
+            "agent".into(),
+        )
+        .await
+        .expect("register agent runtime");
+
+        let session_id = SessionId("session-quic-live-runtime".into());
+        let controller_sink =
+            std::sync::Arc::new(std::sync::Mutex::new(DecodedFrameSink::default()));
+        let controller_quic_host = std::sync::Arc::new(Mutex::new(QuicHost::with_frame_sink(
+            controller_sink.clone(),
+        )));
+        let agent_quic_host = std::sync::Arc::new(Mutex::new(QuicHost::default()));
+        let controller_webrtc = Mutex::new(WebrtcSessionCoordinator::default());
+        let agent_webrtc = Mutex::new(WebrtcSessionCoordinator::default());
+        let controller_quic = Mutex::new(QuicSessionCoordinator::default());
+        let agent_quic = Mutex::new(QuicSessionCoordinator::default());
+
+        controller_quic
+            .lock()
+            .await
+            .request_session(
+                session_id.clone(),
+                DeviceId("controller-1".into()),
+                DeviceId("agent-1".into()),
+                "quic_quinn".into(),
+                None,
+                None,
+                None,
+            )
+            .expect("record controller quic request");
+        realtime_request_session_with(
+            &controller_runtime,
+            controller_registration.handle,
+            session_id.0.clone(),
+            "agent-1".into(),
+            Some("quic_quinn".into()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("send quic session request");
+
+        let agent_session = apply_realtime_events_to_session_coordinators(
+            &agent_runtime,
+            &agent_webrtc,
+            &agent_quic,
+            agent_registration.handle,
+        )
+        .await
+        .expect("apply agent realtime events")
+        .expect("agent session id");
+        assert_eq!(agent_session, session_id);
+
+        let (transport, quic_listen_addr, quic_server_name, quic_cert_der_b64) =
+            prepare_quic_accept_with(agent_quic_host.as_ref(), &agent_quic, session_id.clone())
+                .await
+                .expect("prepare quic accept");
+        realtime_accept_session_with(
+            &agent_runtime,
+            agent_registration.handle,
+            session_id.0.clone(),
+            Some(transport),
+            quic_listen_addr,
+            quic_server_name,
+            quic_cert_der_b64,
+        )
+        .await
+        .expect("send quic session accept");
+        spawn_quic_accept_completion(agent_quic_host.clone(), session_id.clone());
+
+        let controller_session = apply_realtime_events_to_session_coordinators(
+            &controller_runtime,
+            &controller_webrtc,
+            &controller_quic,
+            controller_registration.handle,
+        )
+        .await
+        .expect("apply controller realtime events")
+        .expect("controller session id");
+        assert_eq!(controller_session, session_id);
+        sync_quic_host_from_session_snapshot_with(
+            controller_quic_host.as_ref(),
+            &controller_quic,
+            &DeviceId(controller_registration.device_id.clone()),
+            &session_id,
+        )
+        .await
+        .expect("connect controller quic host");
+
+        agent_quic_host
+            .lock()
+            .await
+            .start_test_video_sender_with_backend(session_id.clone(), 16, 16, 30, "openh264")
+            .await
+            .expect("start agent quic sender");
+        controller_quic_host
+            .lock()
+            .await
+            .wait_for_first_frame(&session_id, Duration::from_secs(5))
+            .await
+            .expect("wait for controller quic frame");
+
+        let host_snapshot =
+            quic_host_snapshot_with(controller_quic_host.as_ref(), session_id.0.clone())
+                .await
+                .expect("controller quic host snapshot");
+        assert!(host_snapshot.remote_datagram_count > 0);
+        assert!(host_snapshot.decoded_frame_count > 0);
+        assert!(
+            controller_sink
+                .lock()
+                .expect("lock controller sink")
+                .snapshot(&session_id)
+                .map(|snapshot| snapshot.frame_count > 0)
+                .unwrap_or(false)
+        );
     }
 
     struct BenchmarkCapture {

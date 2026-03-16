@@ -7,10 +7,13 @@ use std::{
     time::Duration,
 };
 
+use mrd_capture_dxgi::DxgiDesktopCapture;
 use mrd_decode::{DecodedFrame, PixelFormat, VideoDecoder};
 use mrd_encode_nvenc::NvencH264Encoder;
 use mrd_encode_openh264::OpenH264Encoder;
-use mrd_observability::{PipelineProbeSnapshot, ProbeRegistry, ProbeSessionHandle, StageId};
+use mrd_observability::{
+    MediaProbeEvent, PipelineProbeSnapshot, ProbeRegistry, ProbeSessionHandle, StageId,
+};
 use mrd_pipeline_core::{
     CapturedFrame, FrameCapture, FramePixelFormat, PipelineError, VideoEncoder,
 };
@@ -242,6 +245,68 @@ impl QuicHost {
         Ok(())
     }
 
+    pub async fn start_embedded_desktop_sender(
+        &mut self,
+        session_id: SessionId,
+        fps: u32,
+    ) -> Result<(), String> {
+        let session = self
+            .sessions
+            .get_mut(&session_id)
+            .ok_or_else(|| format!("unknown quic session: {}", session_id.0))?;
+        if session.sender_running.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        let endpoint = session
+            .endpoint
+            .clone()
+            .ok_or_else(|| format!("quic session missing endpoint: {}", session_id.0))?;
+        let snapshot = session.snapshot.clone();
+        let sender_running = session.sender_running.clone();
+        sender_running.store(true, Ordering::Relaxed);
+        let probe = self
+            .probe_registry
+            .session_handle(session_id, format!("{DEFAULT_SOURCE_ID}-sender"));
+        probe.set_backend("dxgi");
+        probe.set_codec("h264");
+        probe.set_transport("quic_quinn");
+        let frame_interval = Duration::from_millis((1000 / fps.max(1)) as u64);
+        let task = tokio::task::spawn_blocking(move || {
+            let mut capture = match DxgiDesktopCapture::new_primary() {
+                Ok(capture) => capture,
+                Err(error) => {
+                    let mut snapshot = snapshot.lock().expect("lock quic snapshot");
+                    snapshot.sender_running = false;
+                    snapshot.last_error = Some(format!("create dxgi capture failed: {error}"));
+                    sender_running.store(false, Ordering::Relaxed);
+                    return;
+                }
+            };
+            let mut encoder = match OpenH264Encoder::new(capture.width(), capture.height(), fps) {
+                Ok(encoder) => encoder,
+                Err(error) => {
+                    let mut snapshot = snapshot.lock().expect("lock quic snapshot");
+                    snapshot.sender_running = false;
+                    snapshot.last_error = Some(format!("create openh264 encoder failed: {error}"));
+                    sender_running.store(false, Ordering::Relaxed);
+                    return;
+                }
+            };
+            run_blocking_sender_loop(
+                &mut capture,
+                &mut encoder,
+                frame_interval,
+                endpoint,
+                snapshot,
+                sender_running,
+                probe,
+            );
+        });
+        session.sender_task = Some(task);
+        Ok(())
+    }
+
     pub async fn wait_for_first_frame(
         &self,
         session_id: &SessionId,
@@ -290,11 +355,41 @@ impl QuicHost {
             .snapshot(session_id, &format!("{DEFAULT_SOURCE_ID}-sender"))
     }
 
+    pub fn probe_recent_events(
+        &self,
+        session_id: &SessionId,
+        limit: usize,
+    ) -> Vec<MediaProbeEvent> {
+        self.probe_registry
+            .recent_events(session_id, DEFAULT_SOURCE_ID, limit)
+    }
+
     pub async fn close_session(&mut self, session_id: &SessionId) -> Result<(), String> {
         let Some(mut session) = self.sessions.remove(session_id) else {
             return Ok(());
         };
         session.stop_tasks();
+        Ok(())
+    }
+
+    pub async fn stop_embedded_video_sender(
+        &mut self,
+        session_id: &SessionId,
+    ) -> Result<(), String> {
+        let session = self
+            .sessions
+            .get_mut(session_id)
+            .ok_or_else(|| format!("unknown quic session: {}", session_id.0))?;
+        session.sender_running.store(false, Ordering::Relaxed);
+        if let Some(task) = session.sender_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        session
+            .snapshot
+            .lock()
+            .expect("lock quic snapshot")
+            .sender_running = false;
         Ok(())
     }
 
@@ -593,6 +688,104 @@ fn sync_reassembly_probe(
         receiver_probe.increment_dropped_frames(dropped - last_reassembly_drop_total);
     }
     dropped
+}
+
+fn run_blocking_sender_loop<C, E>(
+    capture: &mut C,
+    encoder: &mut E,
+    frame_interval: Duration,
+    endpoint: QuinnDatagramEndpoint,
+    snapshot: Arc<Mutex<QuicHostSnapshot>>,
+    running: Arc<AtomicBool>,
+    probe: ProbeSessionHandle,
+) where
+    C: FrameCapture,
+    E: VideoEncoder,
+{
+    let mut frame_id = 0_u32;
+    let mut last_tick = std::time::Instant::now();
+    let max_datagram_size = endpoint.max_datagram_size().unwrap_or(1200);
+    snapshot.lock().expect("lock quic snapshot").sender_running = true;
+    while running.load(Ordering::Relaxed) {
+        probe.record_stage(StageId::CaptureWait, last_tick.elapsed(), 0, false);
+        last_tick = std::time::Instant::now();
+
+        let capture_started_at = std::time::Instant::now();
+        let frame = match capture.capture_frame() {
+            Ok(frame) => frame,
+            Err(error) => {
+                snapshot.lock().expect("lock quic snapshot").last_error =
+                    Some(format!("capture_frame failed: {error}"));
+                break;
+            }
+        };
+        probe.record_stage(
+            StageId::CaptureCopy,
+            capture_started_at.elapsed(),
+            frame.data.len(),
+            false,
+        );
+
+        let encode_started_at = std::time::Instant::now();
+        let access_units = match encoder.encode(&frame) {
+            Ok(access_units) => access_units,
+            Err(error) => {
+                snapshot.lock().expect("lock quic snapshot").last_error =
+                    Some(format!("encode failed: {error}"));
+                break;
+            }
+        };
+        for access_unit in access_units {
+            probe.record_stage(
+                StageId::EncodeTotal,
+                encode_started_at.elapsed(),
+                access_unit.bytes.len(),
+                access_unit.is_keyframe,
+            );
+            let datagrams = match fragment_access_unit(
+                frame_id,
+                access_unit.timestamp_us,
+                access_unit.is_keyframe,
+                &access_unit.bytes,
+                max_datagram_size,
+            ) {
+                Ok(datagrams) => datagrams,
+                Err(error) => {
+                    snapshot.lock().expect("lock quic snapshot").last_error =
+                        Some(format!("fragment_access_unit failed: {error}"));
+                    break;
+                }
+            };
+            let send_started_at = std::time::Instant::now();
+            let mut send_failed = false;
+            for datagram in datagrams {
+                if endpoint.send_datagram(datagram).is_err() {
+                    snapshot.lock().expect("lock quic snapshot").last_error =
+                        Some("send_datagram failed".to_string());
+                    send_failed = true;
+                    break;
+                }
+            }
+            if send_failed {
+                break;
+            }
+            {
+                let mut snapshot = snapshot.lock().expect("lock quic snapshot");
+                snapshot.sender_running = true;
+                snapshot.sent_access_unit_count += 1;
+            }
+            probe.record_stage(
+                StageId::SendWrite,
+                send_started_at.elapsed(),
+                access_unit.bytes.len(),
+                access_unit.is_keyframe,
+            );
+            frame_id = frame_id.wrapping_add(1);
+        }
+
+        std::thread::sleep(frame_interval);
+    }
+    snapshot.lock().expect("lock quic snapshot").sender_running = false;
 }
 
 enum QuicHostEncoder {
