@@ -97,25 +97,57 @@ impl RealtimeConnection {
         session_id: SessionId,
         target_device_id: DeviceId,
     ) -> Result<(), String> {
+        self.request_session_with_transport(
+            session_id,
+            target_device_id,
+            "webrtc".into(),
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    pub async fn request_session_with_transport(
+        &mut self,
+        session_id: SessionId,
+        target_device_id: DeviceId,
+        transport: String,
+        quic_listen_addr: Option<String>,
+        quic_server_name: Option<String>,
+        quic_cert_der_b64: Option<String>,
+    ) -> Result<(), String> {
         let message = SignalMessage::SessionRequest(SessionRequest {
             session_id,
             source_device_id: self.registered.device_id.clone(),
             target_device_id,
-            transport: "webrtc".into(),
-            quic_listen_addr: None,
-            quic_server_name: None,
-            quic_cert_der_b64: None,
+            transport,
+            quic_listen_addr,
+            quic_server_name,
+            quic_cert_der_b64,
         });
         self.send_message(message).await
     }
 
     pub async fn accept_session(&mut self, session_id: SessionId) -> Result<(), String> {
+        self.accept_session_with_transport(session_id, "webrtc".into(), None, None, None)
+            .await
+    }
+
+    pub async fn accept_session_with_transport(
+        &mut self,
+        session_id: SessionId,
+        transport: String,
+        quic_listen_addr: Option<String>,
+        quic_server_name: Option<String>,
+        quic_cert_der_b64: Option<String>,
+    ) -> Result<(), String> {
         self.send_message(SignalMessage::SessionAccept(SessionAccept {
             session_id,
-            transport: "webrtc".into(),
-            quic_listen_addr: None,
-            quic_server_name: None,
-            quic_cert_der_b64: None,
+            transport,
+            quic_listen_addr,
+            quic_server_name,
+            quic_cert_der_b64,
         }))
         .await
     }

@@ -67,6 +67,28 @@ impl RealtimeRuntime {
         session_id: SessionId,
         target_device_id: DeviceId,
     ) -> Result<(), String> {
+        self.request_session_with_transport(
+            handle,
+            session_id,
+            target_device_id,
+            "webrtc".into(),
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    pub async fn request_session_with_transport(
+        &self,
+        handle: u64,
+        session_id: SessionId,
+        target_device_id: DeviceId,
+        transport: String,
+        quic_listen_addr: Option<String>,
+        quic_server_name: Option<String>,
+        quic_cert_der_b64: Option<String>,
+    ) -> Result<(), String> {
         let mut state = self.inner.lock().await;
         let connection = state
             .connections
@@ -74,19 +96,47 @@ impl RealtimeRuntime {
             .ok_or_else(|| format!("未找到 realtime 连接句柄: {}", handle))?;
 
         connection
-            .request_session(session_id, target_device_id)
+            .request_session_with_transport(
+                session_id,
+                target_device_id,
+                transport,
+                quic_listen_addr,
+                quic_server_name,
+                quic_cert_der_b64,
+            )
             .await?;
         connection.recv_event().await.map(|_| ())
     }
 
     pub async fn accept_session(&self, handle: u64, session_id: SessionId) -> Result<(), String> {
+        self.accept_session_with_transport(handle, session_id, "webrtc".into(), None, None, None)
+            .await
+    }
+
+    pub async fn accept_session_with_transport(
+        &self,
+        handle: u64,
+        session_id: SessionId,
+        transport: String,
+        quic_listen_addr: Option<String>,
+        quic_server_name: Option<String>,
+        quic_cert_der_b64: Option<String>,
+    ) -> Result<(), String> {
         let mut state = self.inner.lock().await;
         let connection = state
             .connections
             .get_mut(&handle)
             .ok_or_else(|| format!("未找到 realtime 连接句柄: {}", handle))?;
 
-        connection.accept_session(session_id).await?;
+        connection
+            .accept_session_with_transport(
+                session_id,
+                transport,
+                quic_listen_addr,
+                quic_server_name,
+                quic_cert_der_b64,
+            )
+            .await?;
         connection.recv_event().await.map(|_| ())
     }
 
