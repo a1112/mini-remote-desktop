@@ -498,30 +498,43 @@ pub(crate) async fn run_quic_benchmark_pipeline(
     fps: u32,
     duration_secs: u64,
     encode_backend: &str,
-    _decode_backend: &str,
+    decode_backend: &str,
 ) -> Result<QuicBenchmarkOutcome, String> {
-    let mut harness = QuicHostedPairHarness::new(&session_id.0).await?;
-    harness
-        .start_with_capture(
-            BenchmarkCapture {
-                tick: 0,
-                width,
-                height,
-            },
-            width,
-            height,
-            fps,
-            encode_backend,
-        )
+    let sink = Arc::new(Mutex::new(DecodedFrameSink::default()));
+    let mut agent = crate::quic_host::QuicHost::default();
+    let mut controller = crate::quic_host::QuicHost::with_frame_sink(sink.clone());
+    let bootstrap = agent.prepare_listener(session_id.clone(), "127.0.0.1:0").await?;
+    controller
+        .connect_to_peer(session_id.clone(), "127.0.0.1:0", &bootstrap, decode_backend)
+        .await?;
+    agent.accept_peer(session_id.clone()).await?;
+    agent
+        .start_test_video_sender_with_backend(session_id.clone(), width, height, fps, encode_backend)
         .await?;
     let started_at = std::time::Instant::now();
-    harness.wait_for_first_frame(Duration::from_secs(8)).await?;
+    controller
+        .wait_for_first_frame(&session_id, Duration::from_secs(8))
+        .await?;
     let first_frame_time_ms = started_at.elapsed().as_secs_f64() * 1000.0;
     tokio::time::sleep(Duration::from_secs(duration_secs)).await;
+    let sender_probe = agent
+        .sender_probe_snapshot(&session_id)
+        .ok_or_else(|| format!("missing quic sender probe: {}", session_id.0))?;
+    let receiver_probe = controller
+        .probe_snapshot(&session_id)
+        .ok_or_else(|| format!("missing quic receiver probe: {}", session_id.0))?;
+    let sink_snapshot = sink
+        .lock()
+        .expect("lock decoded frame sink")
+        .snapshot(&session_id)
+        .cloned()
+        .ok_or_else(|| format!("missing quic sink snapshot: {}", session_id.0))?;
+    controller.close_session(&session_id).await?;
+    agent.close_session(&session_id).await?;
     Ok(QuicBenchmarkOutcome {
-        sender_probe: harness.sender_probe(),
-        receiver_probe: harness.receiver_probe(),
-        sink_snapshot: harness.sink_snapshot().expect("sink snapshot"),
+        sender_probe,
+        receiver_probe,
+        sink_snapshot,
         first_frame_time_ms,
         transport_label: "quic_quinn".to_string(),
     })
@@ -569,32 +582,6 @@ fn create_test_encoder(
         other => Err(PipelineError::message(format!(
             "unsupported test encoder backend: {other}"
         ))),
-    }
-}
-
-struct BenchmarkCapture {
-    tick: u8,
-    width: usize,
-    height: usize,
-}
-
-impl FrameCapture for BenchmarkCapture {
-    fn capture_frame(&mut self) -> Result<CapturedFrame, mrd_pipeline_core::PipelineError> {
-        self.tick = self.tick.wrapping_add(1);
-        let mut data = vec![0_u8; self.width * self.height * 4];
-        for chunk in data.chunks_exact_mut(4) {
-            chunk[0] = self.tick;
-            chunk[1] = 64;
-            chunk[2] = 192;
-            chunk[3] = 255;
-        }
-        Ok(CapturedFrame {
-            width: self.width,
-            height: self.height,
-            pixel_format: FramePixelFormat::Bgra32,
-            timestamp_us: self.tick as u64 * 33_000,
-            data,
-        })
     }
 }
 
