@@ -4,6 +4,7 @@
 mod app_settings;
 mod benchmark;
 mod ipc_client;
+mod service_manager;
 mod device_info;
 mod frame_sink;
 mod quic_host;
@@ -297,6 +298,304 @@ async fn realtime_stop() -> Result<RealtimeStatus, String> {
 #[tauri::command]
 async fn realtime_restart() -> Result<RealtimeStatus, String> {
     RealtimeManagementClient::from_env().restart().await
+}
+
+// mrd-service lifecycle commands
+#[tauri::command]
+async fn service_start() -> Result<bool, String> {
+    let manager = service_manager::ServiceManager::new()
+        .map_err(|e| e.to_string())?;
+
+    tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            manager.start().await
+        })
+    }).await.map_err(|e| e.to_string())?;
+
+    Ok(true)
+}
+
+#[tauri::command]
+async fn service_stop() -> Result<bool, String> {
+    let manager = service_manager::ServiceManager::new()
+        .map_err(|e| e.to_string())?;
+
+    tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            manager.stop().await
+        })
+    }).await.map_err(|e| e.to_string())?;
+
+    Ok(true)
+}
+
+#[tauri::command]
+async fn service_status() -> Result<bool, String> {
+    let manager = service_manager::ServiceManager::new()
+        .map_err(|e| e.to_string())?;
+
+    tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            manager.is_running().await
+        })
+    }).await.map_err(|e| e.to_string())?;
+
+    Ok(true)
+}
+
+#[tauri::command]
+async fn service_health_check() -> Result<bool, String> {
+    let manager = service_manager::ServiceManager::new()
+        .map_err(|e| e.to_string())?;
+
+    tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            manager.health_check().await.map_err(|e| e.to_string())
+        })
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn service_wait_for_healthy(timeout_secs: u64) -> Result<bool, String> {
+    let manager = service_manager::ServiceManager::new()
+        .map_err(|e| e.to_string())?;
+
+    tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            manager.wait_for_healthy(timeout_secs).await.map_err(|e| e.to_string())
+        })
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn service_restart_with_backoff(max_attempts: u32) -> Result<bool, String> {
+    let manager = service_manager::ServiceManager::new()
+        .map_err(|e| e.to_string())?;
+
+    tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            manager.restart_with_backoff(max_attempts).await.map_err(|e| e.to_string())
+        })
+    }).await.map_err(|e| e.to_string())?;
+
+    Ok(true)
+}
+
+#[tauri::command]
+async fn service_pid() -> Result<Option<u32>, String> {
+    let manager = service_manager::ServiceManager::new()
+        .map_err(|e| e.to_string())?;
+
+    tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            Ok(manager.pid().await)
+        })
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn service_restart() -> Result<bool, String> {
+    let manager = service_manager::ServiceManager::new()
+        .map_err(|e| e.to_string())?;
+
+    tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            manager.restart().await
+        })
+    }).await.map_err(|e| e.to_string())?;
+
+    Ok(true)
+}
+
+// Service guard command - starts monitoring the service
+#[tauri::command]
+async fn service_start_guard() -> Result<String, String> {
+    use service_manager::{ServiceGuard, ServiceGuardConfig};
+    use std::sync::Arc;
+
+    let config = ServiceGuardConfig::default();
+    let guard = ServiceGuard::new(config).map_err(|e| e.to_string())?;
+
+    // Start the guard in the background
+    let handle = guard.start();
+
+    // Return a handle ID (in a real implementation, you'd store this)
+    Ok(format!("Guard started with handle: {:?}", handle))
+}
+
+// ============================================================================
+// IPC-based commands (migrated to use mrd-service)
+// ============================================================================
+
+/// Register device via IPC (migrated version)
+#[tauri::command]
+async fn ipc_register_device(
+    device_id: String,
+    device_name: String,
+) -> Result<String, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+    use mrd_proto::DeviceId;
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client.send_request(IpcRequest::RegisterDevice {
+        device_id: DeviceId(device_id),
+        device_name,
+    }).await.map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::DeviceRegistered { device_id } => Ok(device_id.0),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+/// List devices via IPC (migrated version)
+#[tauri::command]
+async fn ipc_list_devices() -> Result<Vec<mrd_ipc::DeviceInfo>, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client.send_request(IpcRequest::ListDevices).await.map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::DeviceList { devices } => Ok(devices),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+/// Start session via IPC (migrated version)
+#[tauri::command]
+async fn ipc_start_session(
+    session_id: String,
+    target_device_id: String,
+    transport_kind: String,
+) -> Result<String, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+    use mrd_proto::{SessionId, DeviceId};
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client.send_request(IpcRequest::StartSession {
+        session_id: SessionId(session_id),
+        target_device_id: DeviceId(target_device_id),
+        transport_kind,
+    }).await.map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::SessionStarted { session_id } => Ok(session_id.0),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+/// Accept session via IPC (migrated version)
+#[tauri::command]
+async fn ipc_accept_session(
+    session_id: String,
+    source_device_id: String,
+) -> Result<String, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+    use mrd_proto::{SessionId, DeviceId};
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client.send_request(IpcRequest::AcceptSession {
+        session_id: SessionId(session_id),
+        source_device_id: DeviceId(source_device_id),
+    }).await.map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::SessionAccepted { session_id } => Ok(session_id.0),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+/// Stop session via IPC (migrated version)
+#[tauri::command]
+async fn ipc_stop_session(
+    session_id: String,
+) -> Result<String, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+    use mrd_proto::SessionId;
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client.send_request(IpcRequest::StopSession {
+        session_id: SessionId(session_id),
+    }).await.map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::SessionStopped { session_id } => Ok(session_id.0),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+/// Get session snapshot via IPC (migrated version)
+#[tauri::command]
+async fn ipc_session_snapshot(
+    session_id: String,
+) -> Result<mrd_ipc::SessionRuntimeSnapshot, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+    use mrd_proto::SessionId;
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client.send_request(IpcRequest::SessionRuntimeSnapshot {
+        session_id: SessionId(session_id),
+    }).await.map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::SessionSnapshot { snapshot } => Ok(snapshot),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+/// Start sender via IPC (migrated version)
+#[tauri::command]
+async fn ipc_start_sender(
+    session_id: String,
+) -> Result<String, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+    use mrd_proto::SessionId;
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client.send_request(IpcRequest::StartSender {
+        session_id: SessionId(session_id),
+    }).await.map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::SenderStarted { session_id } => Ok(session_id.0),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+/// Start receiver via IPC (migrated version)
+#[tauri::command]
+async fn ipc_start_receiver(
+    session_id: String,
+) -> Result<String, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+    use mrd_proto::SessionId;
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client.send_request(IpcRequest::StartReceiver {
+        session_id: SessionId(session_id),
+    }).await.map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::ReceiverStarted { session_id } => Ok(session_id.0),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
 }
 
 #[tauri::command]
@@ -2044,7 +2343,25 @@ fn main() {
             list_render_surfaces,
             create_render_surface,
             select_current_render_surface,
-            current_render_surface
+            current_render_surface,
+            // Service lifecycle commands
+            service_start,
+            service_stop,
+            service_status,
+            service_health_check,
+            service_wait_for_healthy,
+            service_restart_with_backoff,
+            service_pid,
+            service_start_guard,
+            // IPC-based commands (migrated to use mrd-service)
+            ipc_register_device,
+            ipc_list_devices,
+            ipc_start_session,
+            ipc_accept_session,
+            ipc_stop_session,
+            ipc_session_snapshot,
+            ipc_start_sender,
+            ipc_start_receiver
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
