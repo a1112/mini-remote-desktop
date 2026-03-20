@@ -309,6 +309,41 @@ async fn realtime_register(
     realtime_register_with(&state.realtime_runtime, role, device_id, name).await
 }
 
+// Example of migrated realtime command using IPC
+#[tauri::command]
+async fn realtime_register_via_ipc(
+    role: String,
+    device_id: Option<String>,
+    name: String,
+) -> Result<RealtimeRegistrationResponse, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+
+    let device_id_for_register = device_id.unwrap_or_else(|| {
+        // Generate a device ID if not provided
+        use std::time::SystemTime;
+        format!("device-{}", SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis())
+    });
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client.send_request(IpcRequest::RegisterDevice {
+        device_id: mrd_proto::DeviceId(device_id_for_register),
+        device_name: name,
+    }).await.map_err(|e| format!("IPC error: {}", e))?;
+
+    match response {
+        IpcResponse::DeviceRegistered { device_id } => {
+            Ok(RealtimeRegistrationResponse {
+                handle: 0,  // TODO: Return actual handle from service
+                device_id: device_id.0,
+            })
+        }
+        IpcResponse::Error { code, message } => {
+            Err(format!("{}: {}", code, message))
+        }
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
 #[tauri::command]
 async fn realtime_request_session(
     state: tauri::State<'_, AppState>,
@@ -662,6 +697,26 @@ async fn webrtc_host_snapshot(
     session_id: String,
 ) -> Result<Option<WebrtcHostSnapshotResponse>, String> {
     Ok(webrtc_host_snapshot_with(state.webrtc_host.as_ref(), session_id).await)
+}
+
+// Example of migrated WebRTC command using IPC
+#[tauri::command]
+async fn webrtc_session_list_via_ipc() -> Result<Vec<String>, String> {
+    use mrd_ipc::IpcRequest;
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client.send_request(IpcRequest::ListDevices).await
+        .map_err(|e| format!("IPC error: {}", e))?;
+
+    match response {
+        mrd_ipc::IpcResponse::DeviceList { devices } => {
+            Ok(devices.into_iter().map(|d| d.device_id.0).collect())
+        }
+        mrd_ipc::IpcResponse::Error { code, message } => {
+            Err(format!("{}: {}", code, message))
+        }
+        _ => Err("Unexpected response".to_string()),
+    }
 }
 
 #[tauri::command]
