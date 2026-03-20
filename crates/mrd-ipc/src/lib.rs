@@ -7,6 +7,7 @@
 #![warn(missing_docs)]
 
 pub mod client;
+pub mod transport;
 
 use serde::{Deserialize, Serialize};
 use mrd_proto::{SessionId, DeviceId};

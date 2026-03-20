@@ -27,14 +27,23 @@ async fn main() -> Result<()> {
     info!("mrd-service starting...");
 
     // Initialize IPC server
-    let _ipc_server = IpcServer::new();
+    let ipc_server = IpcServer::new();
     info!("IPC server initialized");
 
     info!("mrd-service running (press Ctrl+C to stop)");
 
-    // Run until interrupted
-    tokio::signal::ctrl_c().await?;
-    info!("mrd-service shutting down");
+    // Start IPC server loop
+    tokio::select! {
+        result = ipc_server.run() => {
+            if let Err(e) = result {
+                eprintln!("IPC server error: {}", e);
+            }
+        }
+        _ = tokio::signal::ctrl_c() => {
+            info!("Shutdown requested");
+        }
+    }
 
+    info!("mrd-service shutting down");
     Ok(())
 }

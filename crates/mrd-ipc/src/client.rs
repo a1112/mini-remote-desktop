@@ -6,31 +6,36 @@ use anyhow::Result;
 use crate::{IpcRequest, IpcResponse};
 
 /// IPC client - communicates with mrd-service
-///
-/// This is a synchronous in-process implementation for development.
-/// The production version will use named pipes or Unix sockets.
-#[derive(Debug, Clone)]
 pub struct IpcClient {
-    // TODO: Replace with actual named pipe / socket connection
-    _marker: std::marker::PhantomData<()>,
+    // Stream will be created on first use
+    #[cfg(unix)]
+    stream: Option<crate::transport::IpcStream>,
+
+    #[cfg(windows)]
+    stream: Option<crate::transport::IpcStream>,
 }
 
 impl IpcClient {
     /// Create a new IPC client
     pub fn new() -> Self {
-        Self {
-            _marker: std::marker::PhantomData,
+        Self { stream: None }
+    }
+
+    /// Ensure the stream is connected
+    async fn ensure_connected(&mut self) -> Result<()> {
+        if self.stream.is_none() {
+            self.stream = Some(crate::transport::IpcClient::connect().await?);
         }
+        Ok(())
     }
 
     /// Send a request and return the response
-    pub async fn send_request(&self, request: IpcRequest) -> Result<IpcResponse> {
-        // TODO: Implement actual IPC transport
-        // For now, return a placeholder error
-        Ok(IpcResponse::Error {
-            code: "E501".to_string(),
-            message: format!("IPC not implemented yet: {:?}", std::mem::discriminant(&request)),
-        })
+    pub async fn send_request(&mut self, request: IpcRequest) -> Result<IpcResponse> {
+        self.ensure_connected().await?;
+        let stream = self.stream.as_mut().unwrap();
+        stream.send_request(&request).await?;
+        let response = stream.recv_response().await?;
+        Ok(response)
     }
 }
 

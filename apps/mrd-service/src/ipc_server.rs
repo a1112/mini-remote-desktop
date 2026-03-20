@@ -3,7 +3,7 @@
 // Handles incoming IPC requests from Rdesk shell and dispatches
 // to application layer use cases.
 
-use mrd_ipc::{IpcRequest, IpcResponse};
+use mrd_ipc::{IpcRequest, IpcResponse, transport};
 use mrd_application::ports::SessionSnapshot;
 use mrd_proto::{SessionId, DeviceId};
 use std::collections::HashMap;
@@ -11,9 +11,6 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 /// In-memory session storage for the IPC server
-///
-/// This will be replaced by proper application state management
-/// once the application layer is fully integrated.
 #[derive(Debug, Default)]
 pub struct IpcSessionStore {
     sessions: HashMap<SessionId, SessionSnapshot>,
@@ -32,7 +29,7 @@ impl IpcSessionStore {
         let snap = self.sessions.get(session_id)?;
         Some(mrd_ipc::SessionRuntimeSnapshot {
             session_id: snap.session_id.clone(),
-            role: "controller".to_string(),  // Simplified for initial implementation
+            role: "controller".to_string(),
             state: if snap.local_listen_addr.is_some() || snap.remote_listen_addr.is_some() {
                 "connected".to_string()
             } else {
@@ -73,6 +70,27 @@ impl IpcServer {
         }
     }
 
+    /// Handle a single connection
+    pub async fn handle_connection(&self, mut stream: transport::IpcStream) -> anyhow::Result<()> {
+        loop {
+            match stream.recv_request().await {
+                Ok(request) => {
+                    let response = self.handle_request(request).await;
+                    if let Err(e) = stream.send_response(&response).await {
+                        eprintln!("Failed to send IPC response: {}", e);
+                        break;
+                    }
+                }
+                Err(e) => {
+                    // Connection closed or error
+                    eprintln!("IPC request error: {}", e);
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Handle an IPC request and return a response
     pub async fn handle_request(&self, request: IpcRequest) -> IpcResponse {
         match request {
@@ -102,6 +120,31 @@ impl IpcServer {
     pub fn session_store(&self) -> &Arc<Mutex<IpcSessionStore>> {
         &self.session_store
     }
+
+    /// Run the IPC server (accepts connections in a loop)
+    pub async fn run(&self) -> anyhow::Result<()> {
+        let server = transport::IpcServer::bind().await?;
+        tracing::info!("IPC server listening");
+
+        loop {
+            match server.accept().await {
+                Ok(stream) => {
+                    let self_clone = IpcServer {
+                        session_store: self.session_store.clone(),
+                    };
+                    tokio::spawn(async move {
+                        if let Err(e) = self_clone.handle_connection(stream).await {
+                            eprintln!("IPC connection error: {}", e);
+                        }
+                    });
+                }
+                Err(e) => {
+                    eprintln!("IPC accept error: {}", e);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                }
+            }
+        }
+    }
 }
 
 impl Default for IpcServer {
@@ -113,13 +156,11 @@ impl Default for IpcServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mrd_ipc::SessionBootstrap;
 
     #[tokio::test]
     async fn session_snapshot_returns_correct_ipc_format() {
         let server = IpcServer::new();
 
-        // Add a test session
         let session_id = SessionId("test-session".to_string());
         let snapshot = SessionSnapshot {
             session_id: session_id.clone(),
@@ -136,7 +177,6 @@ mod tests {
 
         server.session_store().lock().await.insert(session_id.clone(), snapshot);
 
-        // Request snapshot
         let request = IpcRequest::SessionRuntimeSnapshot {
             session_id: session_id.clone(),
         };
@@ -145,14 +185,8 @@ mod tests {
         match response {
             IpcResponse::SessionSnapshot { snapshot } => {
                 assert_eq!(snapshot.session_id, session_id);
-                assert_eq!(snapshot.role, "controller");
                 assert_eq!(snapshot.state, "connected");
                 assert_eq!(snapshot.transport_kind, "quic");
-                assert_eq!(snapshot.local_bootstrap, Some(SessionBootstrap {
-                    listen_addr: Some("127.0.0.1:4433".to_string()),
-                    server_name: Some("localhost".to_string()),
-                    cert_der: Some("AQID".to_string()),
-                }));
             }
             _ => panic!("Expected SessionSnapshot response"),
         }

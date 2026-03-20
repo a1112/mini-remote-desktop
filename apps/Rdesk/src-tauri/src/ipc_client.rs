@@ -4,22 +4,22 @@
 // and RealtimeRuntime with IPC calls to mrd-service.
 
 use mrd_ipc::client::IpcClient;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 /// Global IPC client for communicating with mrd-service
-///
-/// TODO: Initialize this properly once mrd-service is running
 pub struct ServiceClient {
-    client: IpcClient,
+    client: Arc<Mutex<IpcClient>>,
 }
 
 impl ServiceClient {
     pub fn new() -> Self {
         Self {
-            client: IpcClient::new(),
+            client: Arc::new(Mutex::new(IpcClient::new())),
         }
     }
 
-    pub fn client(&self) -> &IpcClient {
+    pub fn client(&self) -> &Arc<Mutex<IpcClient>> {
         &self.client
     }
 }
