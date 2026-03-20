@@ -512,6 +512,7 @@ async fn ipc_accept_session(
 }
 
 /// Stop session via IPC (migrated version)
+#[cfg(test)]
 #[tauri::command]
 async fn ipc_stop_session(
     session_id: String,
@@ -532,6 +533,7 @@ async fn ipc_stop_session(
 }
 
 /// Get session snapshot via IPC (migrated version)
+#[cfg(test)]
 #[tauri::command]
 async fn ipc_session_snapshot(
     session_id: String,
@@ -552,6 +554,7 @@ async fn ipc_session_snapshot(
 }
 
 /// Start sender via IPC (migrated version)
+#[cfg(test)]
 #[tauri::command]
 async fn ipc_start_sender(
     session_id: String,
@@ -572,6 +575,7 @@ async fn ipc_start_sender(
 }
 
 /// Start receiver via IPC (migrated version)
+#[cfg(test)]
 #[tauri::command]
 async fn ipc_start_receiver(
     session_id: String,
@@ -591,6 +595,7 @@ async fn ipc_start_receiver(
     }
 }
 
+#[cfg(test)]
 #[tauri::command]
 async fn realtime_register(
     state: tauri::State<'_, AppState>,
@@ -602,6 +607,7 @@ async fn realtime_register(
 }
 
 // Example of migrated realtime command using IPC
+#[cfg(test)]
 #[tauri::command]
 async fn realtime_register_via_ipc(
     role: String,
@@ -636,6 +642,7 @@ async fn realtime_register_via_ipc(
     }
 }
 
+#[cfg(test)]
 #[tauri::command]
 async fn realtime_request_session(
     state: tauri::State<'_, AppState>,
@@ -676,6 +683,7 @@ async fn realtime_request_session(
     .await
 }
 
+#[cfg(test)]
 #[tauri::command]
 async fn realtime_accept_session(
     state: tauri::State<'_, AppState>,
@@ -723,6 +731,7 @@ async fn realtime_accept_session(
     Ok(())
 }
 
+#[cfg(test)]
 #[tauri::command]
 async fn realtime_drain_events(
     state: tauri::State<'_, AppState>,
@@ -735,6 +744,7 @@ async fn realtime_drain_events(
         .collect()
 }
 
+#[cfg(test)]
 #[tauri::command]
 async fn realtime_send_offer(
     state: tauri::State<'_, AppState>,
@@ -754,6 +764,7 @@ async fn realtime_send_offer(
         .await
 }
 
+#[cfg(test)]
 #[tauri::command]
 async fn realtime_send_answer(
     state: tauri::State<'_, AppState>,
@@ -773,6 +784,7 @@ async fn realtime_send_answer(
         .await
 }
 
+#[cfg(test)]
 #[tauri::command]
 async fn realtime_send_ice_candidate(
     state: tauri::State<'_, AppState>,
@@ -796,6 +808,7 @@ async fn realtime_send_ice_candidate(
         .await
 }
 
+#[cfg(test)]
 #[tauri::command]
 async fn webrtc_create_local_offer(
     state: tauri::State<'_, AppState>,
@@ -807,6 +820,7 @@ async fn webrtc_create_local_offer(
     Ok(description.sdp)
 }
 
+#[cfg(test)]
 #[tauri::command]
 async fn webrtc_apply_remote_answer(
     state: tauri::State<'_, AppState>,
@@ -816,6 +830,7 @@ async fn webrtc_apply_remote_answer(
     webrtc_apply_remote_answer_with(state.webrtc_sessions.as_ref(), session_id, sdp).await
 }
 
+#[cfg(test)]
 #[tauri::command]
 async fn webrtc_apply_remote_ice_candidate(
     state: tauri::State<'_, AppState>,
@@ -834,6 +849,7 @@ async fn webrtc_apply_remote_ice_candidate(
     .await
 }
 
+#[cfg(test)]
 #[tauri::command]
 async fn webrtc_sync_realtime_events(
     state: tauri::State<'_, AppState>,
@@ -847,6 +863,7 @@ async fn webrtc_sync_realtime_events(
     .await
 }
 
+#[cfg(test)]
 #[tauri::command]
 async fn webrtc_snapshot(
     state: tauri::State<'_, AppState>,
@@ -855,6 +872,7 @@ async fn webrtc_snapshot(
     Ok(webrtc_snapshot_with(state.webrtc_sessions.as_ref(), session_id).await)
 }
 
+#[cfg(test)]
 #[tauri::command]
 async fn quic_session_snapshot(
     state: tauri::State<'_, AppState>,
@@ -863,6 +881,7 @@ async fn quic_session_snapshot(
     Ok(quic_snapshot_with(state.quic_sessions.as_ref(), session_id).await)
 }
 
+#[cfg(test)]
 #[tauri::command]
 async fn quic_host_snapshot(
     state: tauri::State<'_, AppState>,
@@ -872,6 +891,7 @@ async fn quic_host_snapshot(
 }
 
 // Example of migrated command using IPC (for demonstration)
+#[cfg(test)]
 #[tauri::command]
 async fn quic_session_snapshot_via_ipc(
     session_id: String,
@@ -892,6 +912,7 @@ async fn quic_session_snapshot_via_ipc(
     }
 }
 
+#[cfg(test)]
 #[tauri::command]
 async fn webrtc_host_create_offer(
     state: tauri::State<'_, AppState>,
@@ -908,6 +929,7 @@ async fn webrtc_host_create_offer(
     Ok(description.sdp)
 }
 
+#[cfg(test)]
 #[tauri::command]
 async fn webrtc_host_apply_remote_offer(
     state: tauri::State<'_, AppState>,
@@ -927,6 +949,7 @@ async fn webrtc_host_apply_remote_offer(
         .apply_remote_offer(SessionId(session_id), sdp)
 }
 
+#[cfg(test)]
 #[tauri::command]
 async fn webrtc_host_create_answer(
     state: tauri::State<'_, AppState>,
@@ -942,6 +965,7 @@ async fn webrtc_host_create_answer(
     Ok(description.sdp)
 }
 
+#[cfg(test)]
 #[tauri::command]
 async fn webrtc_host_apply_remote_answer(
     state: tauri::State<'_, AppState>,
@@ -957,6 +981,7 @@ async fn webrtc_host_apply_remote_answer(
     webrtc_apply_remote_answer_with(state.webrtc_sessions.as_ref(), session_id, sdp).await
 }
 
+#[cfg(test)]
 #[tauri::command]
 async fn webrtc_host_apply_remote_ice_candidate(
     state: tauri::State<'_, AppState>,
@@ -983,6 +1008,7 @@ async fn webrtc_host_apply_remote_ice_candidate(
     .await
 }
 
+#[cfg(test)]
 #[tauri::command]
 async fn webrtc_host_snapshot(
     state: tauri::State<'_, AppState>,
@@ -1011,6 +1037,7 @@ async fn webrtc_session_list_via_ipc() -> Result<Vec<String>, String> {
     }
 }
 
+#[cfg(test)]
 #[tauri::command]
 async fn session_runtime_probe_snapshot(
     state: tauri::State<'_, AppState>,
@@ -1024,6 +1051,7 @@ async fn session_runtime_probe_snapshot(
     Ok(host.probe_snapshot(&session_id))
 }
 
+#[cfg(test)]
 #[tauri::command]
 async fn session_runtime_probe_recent_events(
     state: tauri::State<'_, AppState>,
@@ -1041,6 +1069,7 @@ async fn session_runtime_probe_recent_events(
     Ok(host.probe_recent_events(&session_id, limit))
 }
 
+#[cfg(test)]
 #[tauri::command]
 async fn webrtc_host_start_embedded_desktop_sender(
     state: tauri::State<'_, AppState>,
@@ -1055,6 +1084,7 @@ async fn webrtc_host_start_embedded_desktop_sender(
         .await
 }
 
+#[cfg(test)]
 #[tauri::command]
 async fn webrtc_host_stop_embedded_video_sender(
     state: tauri::State<'_, AppState>,
@@ -1067,6 +1097,7 @@ async fn webrtc_host_stop_embedded_video_sender(
         .stop_embedded_video_sender(&SessionId(session_id))
         .await
 }
+#[cfg(test)]
 
 #[tauri::command]
 async fn quic_host_start_embedded_desktop_sender(
@@ -1079,8 +1110,10 @@ async fn quic_host_start_embedded_desktop_sender(
         .lock()
         .await
         .start_embedded_desktop_sender(SessionId(session_id), fps.unwrap_or(15))
+#[cfg(test)]
         .await
 }
+#[cfg(test)]
 
 #[tauri::command]
 async fn quic_host_stop_embedded_video_sender(
@@ -1128,6 +1161,7 @@ async fn render_host_attach_session(
         .context_for_label(&window.app_handle(), window.label())
         .map(|context| context.surface_id)
         .unwrap_or_else(|| "surface-1".to_string());
+#[cfg(test)]
     let session_id = SessionId(session_id);
     state
         .render_host
@@ -1180,6 +1214,7 @@ async fn bind_current_render_window_surface(
         }
     }
 
+#[cfg(test)]
     state
         .render_host
         .lock()
@@ -1201,6 +1236,7 @@ async fn bind_current_render_window_surface(
     Ok(())
 }
 
+#[cfg(test)]
 #[tauri::command]
 async fn render_host_detach_session(
     state: tauri::State<'_, AppState>,
@@ -1214,6 +1250,7 @@ async fn render_host_detach_session(
     Ok(())
 }
 
+#[cfg(test)]
 #[tauri::command]
 async fn render_host_snapshot(
     state: tauri::State<'_, AppState>,
@@ -1232,6 +1269,7 @@ async fn render_host_snapshot(
     Ok(render_host_snapshot_response(snapshot))
 }
 
+#[cfg(test)]
 #[tauri::command]
 async fn bind_render_surface_source(
     state: tauri::State<'_, AppState>,
@@ -1256,6 +1294,7 @@ async fn bind_render_surface_source(
     Ok(())
 }
 
+#[cfg(test)]
 #[tauri::command]
 async fn session_lifecycle_snapshot(
     state: tauri::State<'_, AppState>,
@@ -1278,6 +1317,7 @@ async fn session_lifecycle_snapshot(
     Ok(session_lifecycle_snapshot_response(snapshot))
 }
 
+#[cfg(test)]
 #[tauri::command]
 async fn session_runtime_snapshot(
     state: tauri::State<'_, AppState>,
@@ -1295,6 +1335,7 @@ async fn session_runtime_snapshot(
     .await
 }
 
+#[cfg(test)]
 #[tauri::command]
 async fn session_runtime_sync_realtime(
     state: tauri::State<'_, AppState>,
@@ -1328,6 +1369,7 @@ async fn session_runtime_sync_realtime(
         state.quic_sessions.as_ref(),
         session_id,
     )
+#[cfg(test)]
     .await
     .map(Some)
 }
@@ -1348,6 +1390,7 @@ fn open_render_window(app: tauri::AppHandle, session_id: String) -> Result<Strin
         .open_window(&app, SessionId(session_id), Some(surface_id));
     result
 }
+#[cfg(test)]
 
 #[tauri::command]
 fn open_render_surface_window(
@@ -1410,6 +1453,7 @@ fn render_window_context(
         .expect("lock render window registry")
         .context_for_label(&app, &label)
         .map(render_window_context_response);
+#[cfg(test)]
     Ok(context)
 }
 
@@ -1428,6 +1472,7 @@ fn list_render_surfaces(
         .list_surfaces(&session_id)
         .into_iter()
         .map(|surface| render_surface_descriptor_response(surface, current_surface_id.as_deref()))
+#[cfg(test)]
         .collect();
     Ok(surfaces)
 }
@@ -1445,6 +1490,7 @@ fn create_render_surface(
         .create_surface(SessionId(session_id), name);
     let current_surface_id = surface.surface_id.clone();
     Ok(render_surface_descriptor_response(
+#[cfg(test)]
         surface,
         Some(current_surface_id.as_str()),
     ))
@@ -1456,6 +1502,7 @@ fn select_current_render_surface(
     session_id: String,
     surface_id: String,
 ) -> Result<(), String> {
+#[cfg(test)]
     state
         .session_lifecycle
         .lock()
