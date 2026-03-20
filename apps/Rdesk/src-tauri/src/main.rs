@@ -309,9 +309,9 @@ async fn service_start(state: tauri::State<'_, AppState>) -> Result<bool, String
     tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            manager.lock().unwrap().start().await
+            manager.lock().unwrap().start().await.map_err(|e| e.to_string())
         })
-    }).await.map_err(|e| e.to_string())?;
+    }).await.map_err(|e| e.to_string())??;
 
     Ok(true)
 }
@@ -323,9 +323,9 @@ async fn service_stop(state: tauri::State<'_, AppState>) -> Result<bool, String>
     tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            manager.lock().unwrap().stop().await
+            manager.lock().unwrap().stop().await.map_err(|e| e.to_string())
         })
-    }).await.map_err(|e| e.to_string())?;
+    }).await.map_err(|e| e.to_string())??;
 
     Ok(true)
 }
@@ -377,7 +377,7 @@ async fn service_restart_with_backoff(state: tauri::State<'_, AppState>, max_att
         rt.block_on(async {
             manager.lock().unwrap().restart_with_backoff(max_attempts).await.map_err(|e| e.to_string())
         })
-    }).await.map_err(|e| e.to_string())?;
+    }).await.map_err(|e| e.to_string())??;
 
     Ok(true)
 }
@@ -401,9 +401,9 @@ async fn service_restart(state: tauri::State<'_, AppState>) -> Result<bool, Stri
     tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            manager.lock().unwrap().restart().await
+            manager.lock().unwrap().restart().await.map_err(|e| e.to_string())
         })
-    }).await.map_err(|e| e.to_string())?;
+    }).await.map_err(|e| e.to_string())??;
 
     Ok(true)
 }

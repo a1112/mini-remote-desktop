@@ -326,3 +326,88 @@ async fn hard_cuted_service_owns_session_state() {
         _ => panic!("Expected SessionSnapshot response, got {:?}", response),
     }
 }
+
+#[tokio::test]
+async fn hard_cut_start_sender_updates_snapshot_state() {
+    let server = create_test_server();
+
+    let session_id = SessionId("sender-state-test".to_string());
+
+    // Start a session
+    let _ = server.handle_request(IpcRequest::StartSession {
+        session_id: session_id.clone(),
+        target_device_id: DeviceId("remote".to_string()),
+        transport_kind: "quic".to_string(),
+    }).await;
+
+    // Initially sender should not be active
+    let snap_response = server.handle_request(IpcRequest::SessionRuntimeSnapshot {
+        session_id: session_id.clone(),
+    }).await;
+
+    match snap_response {
+        IpcResponse::SessionSnapshot { snapshot } => {
+            assert!(!snapshot.sender_active, "Initial sender_active should be false");
+            assert!(!snapshot.receiver_active, "Initial receiver_active should be false");
+        }
+        _ => panic!("Expected SessionSnapshot response"),
+    }
+
+    // Start sender
+    let start_response = server.handle_request(IpcRequest::StartSender {
+        session_id: session_id.clone(),
+    }).await;
+
+    assert!(matches!(start_response, IpcResponse::SenderStarted { .. }),
+        "Expected SenderStarted response");
+
+    // Verify snapshot now reflects sender is active
+    let snap_response = server.handle_request(IpcRequest::SessionRuntimeSnapshot {
+        session_id: session_id.clone(),
+    }).await;
+
+    match snap_response {
+        IpcResponse::SessionSnapshot { snapshot } => {
+            assert!(snapshot.sender_active, "After StartSender, sender_active should be true");
+            assert!(!snapshot.receiver_active, "Receiver should still be inactive");
+            assert_eq!(snapshot.session_id, session_id);
+        }
+        _ => panic!("Expected SessionSnapshot response"),
+    }
+}
+
+#[tokio::test]
+async fn hard_cut_start_receiver_updates_snapshot_state() {
+    let server = create_test_server();
+
+    let session_id = SessionId("receiver-state-test".to_string());
+
+    // Start a session
+    let _ = server.handle_request(IpcRequest::StartSession {
+        session_id: session_id.clone(),
+        target_device_id: DeviceId("remote".to_string()),
+        transport_kind: "webrtc".to_string(),
+    }).await;
+
+    // Start receiver
+    let start_response = server.handle_request(IpcRequest::StartReceiver {
+        session_id: session_id.clone(),
+    }).await;
+
+    assert!(matches!(start_response, IpcResponse::ReceiverStarted { .. }),
+        "Expected ReceiverStarted response");
+
+    // Verify snapshot reflects receiver is active
+    let snap_response = server.handle_request(IpcRequest::SessionRuntimeSnapshot {
+        session_id: session_id.clone(),
+    }).await;
+
+    match snap_response {
+        IpcResponse::SessionSnapshot { snapshot } => {
+            assert!(!snapshot.sender_active, "Sender should still be inactive");
+            assert!(snapshot.receiver_active, "After StartReceiver, receiver_active should be true");
+            assert_eq!(snapshot.session_id, session_id);
+        }
+        _ => panic!("Expected SessionSnapshot response"),
+    }
+}

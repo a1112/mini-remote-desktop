@@ -37,6 +37,8 @@ pub async fn start_session(
         remote_cert_der_b64: None,
         lifecycle_state: "connecting".to_string(),
         last_error: None,
+        sender_active: false,
+        receiver_active: false,
     });
 
     IpcResponse::SessionStarted { session_id }
@@ -79,6 +81,8 @@ pub async fn accept_session(
             remote_cert_der_b64: None,
             lifecycle_state: "listening".to_string(),
             last_error: None,
+            sender_active: false,
+            receiver_active: false,
         });
     }
 
@@ -149,6 +153,8 @@ pub async fn session_snapshot(
                         None
                     },
                     last_error: s.last_error.clone(),
+                    sender_active: s.sender_active,
+                    receiver_active: s.receiver_active,
                 }
             }
         }

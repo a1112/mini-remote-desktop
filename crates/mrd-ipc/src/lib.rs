@@ -154,6 +154,9 @@ pub struct SessionRuntimeSnapshot {
     pub local_bootstrap: Option<SessionBootstrap>,
     pub remote_bootstrap: Option<SessionBootstrap>,
     pub last_error: Option<String>,
+    /// Media pipeline state
+    pub sender_active: bool,
+    pub receiver_active: bool,
 }
 
 /// Session bootstrap metadata

@@ -82,6 +82,9 @@ pub mod ports {
         pub lifecycle_state: String,
         /// Last error if any
         pub last_error: Option<String>,
+        /// Media pipeline state
+        pub sender_active: bool,
+        pub receiver_active: bool,
     }
 
     /// QUIC host port - manages QUIC transport connection

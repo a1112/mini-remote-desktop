@@ -113,6 +113,8 @@ impl IpcServer {
                     remote_cert_der_b64: None,
                     lifecycle_state: "connecting".to_string(),
                     last_error: None,
+                    sender_active: false,
+                    receiver_active: false,
                 });
 
                 IpcResponse::SessionStarted { session_id }
@@ -146,6 +148,8 @@ impl IpcServer {
                         remote_cert_der_b64: None,
                         lifecycle_state: "listening".to_string(),
                         last_error: None,
+                        sender_active: false,
+                        receiver_active: false,
                     });
                 }
 
@@ -155,34 +159,42 @@ impl IpcServer {
             IpcRequest::StartSender { session_id } => {
                 tracing::info!("Starting sender for session: {}", session_id.0);
 
-                // Verify session exists first
-                let sessions = self.app_state.sessions.lock().await;
-                if sessions.get(&session_id).is_none() {
+                let mut sessions = self.app_state.sessions.lock().await;
+                let existing = sessions.get(&session_id);
+                if let Some(snap) = existing {
+                    // Update snapshot to mark sender as active
+                    let new_snapshot = SessionSnapshot {
+                        sender_active: true,
+                        ..snap.clone()
+                    };
+                    sessions.insert(session_id.clone(), new_snapshot);
+                    IpcResponse::SenderStarted { session_id }
+                } else {
                     IpcResponse::Error {
                         code: "E404".to_string(),
                         message: format!("Session not found: {}", session_id.0),
                     }
-                } else {
-                    // TODO: Integrate with actual media pipeline
-                    // For now, just verify the session exists
-                    IpcResponse::SenderStarted { session_id }
                 }
             }
 
             IpcRequest::StartReceiver { session_id } => {
                 tracing::info!("Starting receiver for session: {}", session_id.0);
 
-                // Verify session exists first
-                let sessions = self.app_state.sessions.lock().await;
-                if sessions.get(&session_id).is_none() {
+                let mut sessions = self.app_state.sessions.lock().await;
+                let existing = sessions.get(&session_id);
+                if let Some(snap) = existing {
+                    // Update snapshot to mark receiver as active
+                    let new_snapshot = SessionSnapshot {
+                        receiver_active: true,
+                        ..snap.clone()
+                    };
+                    sessions.insert(session_id.clone(), new_snapshot);
+                    IpcResponse::ReceiverStarted { session_id }
+                } else {
                     IpcResponse::Error {
                         code: "E404".to_string(),
                         message: format!("Session not found: {}", session_id.0),
                     }
-                } else {
-                    // TODO: Integrate with actual media pipeline
-                    // For now, just verify the session exists
-                    IpcResponse::ReceiverStarted { session_id }
                 }
             }
 
@@ -305,6 +317,8 @@ impl IpcServer {
                 None
             },
             last_error: snap.last_error.clone(),
+            sender_active: snap.sender_active,
+            receiver_active: snap.receiver_active,
         })
     }
 
