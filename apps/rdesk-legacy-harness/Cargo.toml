@@ -1,0 +1,45 @@
+[package]
+name = "rdesk-legacy-harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum = { workspace = true, features = ["ws"] }
+base64 = "0.22"
+bytes.workspace = true
+futures-util = "0.3"
+image = { version = "0.25", default-features = false, features = ["png"] }
+mrd-capture-dxgi = { path = "../../crates/mrd-capture-dxgi" }
+mrd-decode = { path = "../../crates/mrd-decode" }
+mrd-decode-nvdec = { path = "../../crates/mrd-decode-nvdec" }
+mrd-encode-nvenc = { path = "../../crates/mrd-encode-nvenc" }
+mrd-encode-openh264 = { path = "../../crates/mrd-encode-openh264" }
+mrd-observability = { path = "../../crates/mrd-observability" }
+mrd-pipeline-core = { path = "../../crates/mrd-pipeline-core" }
+mrd-proto = { path = "../../crates/mrd-proto" }
+mrd-render = { path = "../../crates/mrd-render" }
+mrd-render-d3d11 = { path = "../../crates/mrd-render-d3d11" }
+mrd-session = { path = "../../crates/mrd-session" }
+mrd-signal-client = { path = "../../crates/mrd-signal-client" }
+mrd-signal-proto = { path = "../../crates/mrd-signal-proto" }
+mrd-transport-quic-quinn = { path = "../../crates/mrd-transport-quic-quinn" }
+mrd-transport-webrtc = { path = "../../crates/mrd-transport-webrtc" }
+num_cpus = "1.16"
+reqwest = { version = "0.12", features = ["json"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tokio.workspace = true
+tokio-tungstenite = "0.24"
+tracing.workspace = true
+webrtc = "0.12"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["sysinfoapi", "minwindef"] }
+
+[dev-dependencies]
+base64 = "0.22"
+openh264 = "0.8"
+rustls = "0.23.5"
+

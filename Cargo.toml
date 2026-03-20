@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "apps/Rdesk/src-tauri",
+  "apps/rdesk-legacy-harness",
   "apps/realtime-server",
   "apps/mrd-service",
   "common-control-proto",
