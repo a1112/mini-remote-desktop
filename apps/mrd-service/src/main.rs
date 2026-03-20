@@ -7,9 +7,12 @@
 // - Transport management
 // - IPC server for Rdesk UI shell
 
+mod ipc_server;
+
 use anyhow::Result;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
+use ipc_server::IpcServer;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -23,9 +26,9 @@ async fn main() -> Result<()> {
 
     info!("mrd-service starting...");
 
-    // TODO: Initialize IPC server
-    // TODO: Initialize application layer
-    // TODO: Run service loop
+    // Initialize IPC server
+    let _ipc_server = IpcServer::new();
+    info!("IPC server initialized");
 
     info!("mrd-service running (press Ctrl+C to stop)");
 
