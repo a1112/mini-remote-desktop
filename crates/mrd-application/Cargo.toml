@@ -1,0 +1,12 @@
+[package]
+name = "mrd-application"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+mrd-proto = { path = "../mrd-proto" }
+mrd-session = { path = "../mrd-session" }
+tokio.workspace = true
+tracing.workspace = true
