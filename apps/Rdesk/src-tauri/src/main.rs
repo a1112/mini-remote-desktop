@@ -32,6 +32,7 @@ use mrd_decode_nvdec::probe_runtime as probe_nvdec_runtime;
 use mrd_observability::{MediaProbeEvent, PipelineProbeSnapshot, ProbeRegistry};
 use mrd_proto::{BackendRole, DeviceId, SessionId};
 use mrd_signal_client::encode_message;
+use mrd_ipc;
 use mrd_signal_proto::{IceCandidate, SessionDescription, SignalMessage};
 use quic_host::{QuicHost, QuicHostSnapshot};
 use quic_session::{QuicSessionCoordinator, QuicSessionSnapshot};
@@ -541,6 +542,27 @@ async fn quic_host_snapshot(
     session_id: String,
 ) -> Result<Option<QuicHostSnapshotResponse>, String> {
     Ok(quic_host_snapshot_with(state.quic_host.as_ref(), session_id).await)
+}
+
+// Example of migrated command using IPC (for demonstration)
+#[tauri::command]
+async fn quic_session_snapshot_via_ipc(
+    session_id: String,
+) -> Result<Option<mrd_ipc::SessionRuntimeSnapshot>, String> {
+    use mrd_ipc::IpcRequest;
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client.send_request(IpcRequest::SessionRuntimeSnapshot {
+        session_id: SessionId(session_id),
+    }).await.map_err(|e| format!("IPC error: {}", e))?;
+
+    match response {
+        mrd_ipc::IpcResponse::SessionSnapshot { snapshot } => Ok(Some(snapshot)),
+        mrd_ipc::IpcResponse::Error { code, message } => {
+            Err(format!("{}: {}", code, message))
+        }
+        _ => Err("Unexpected response".to_string()),
+    }
 }
 
 #[tauri::command]
