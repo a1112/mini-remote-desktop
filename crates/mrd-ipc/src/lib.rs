@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use mrd_proto::{SessionId, DeviceId};
 
 /// IPC request from Rdesk to mrd-service
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type")]
 pub enum IpcRequest {
     /// Register local device with the service
@@ -52,7 +52,7 @@ pub enum IpcRequest {
 }
 
 /// IPC response from mrd-service to Rdesk
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type")]
 pub enum IpcResponse {
     /// Device registration successful
@@ -99,7 +99,7 @@ pub enum IpcResponse {
 }
 
 /// Device information DTO
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeviceInfo {
     pub device_id: DeviceId,
     pub device_name: String,
@@ -107,7 +107,7 @@ pub struct DeviceInfo {
 }
 
 /// Session runtime snapshot DTO (stable IPC contract)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionRuntimeSnapshot {
     pub session_id: SessionId,
     pub role: String,  // "controller" or "agent"
@@ -118,7 +118,7 @@ pub struct SessionRuntimeSnapshot {
 }
 
 /// Session bootstrap metadata
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionBootstrap {
     pub listen_addr: Option<String>,
     pub server_name: Option<String>,
