@@ -9,6 +9,60 @@ use std::collections::HashMap;
 use mrd_proto::{BackendRole, DeviceId, SessionId};
 use serde::{Deserialize, Serialize};
 
+/// Session lifecycle state - explicit state machine for session progression
+///
+/// This enum represents the authoritative lifecycle state of a session.
+/// Unlike inferred states from bootstrap metadata, this state is explicitly
+/// tracked and transitioned by the service.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SessionLifecycleState {
+    /// Session created but not yet listening or connecting
+    Created,
+    /// Local transport is listening for incoming connections (agent role)
+    Listening,
+    /// Actively connecting to remote peer (controller role)
+    Connecting,
+    /// Transport connection established
+    Connected,
+    /// Media streaming active
+    Streaming,
+    /// Session failed with error message
+    Failed { message: String },
+    /// Session closed cleanly
+    Closed,
+}
+
+impl SessionLifecycleState {
+    /// Check if this is an active state (can transition to streaming)
+    pub fn is_active(&self) -> bool {
+        matches!(self, Self::Listening | Self::Connecting | Self::Connected | Self::Streaming)
+    }
+
+    /// Check if this is a terminal state
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Failed { .. } | Self::Closed)
+    }
+
+    /// Get the string representation for IPC serialization
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Created => "created",
+            Self::Listening => "listening",
+            Self::Connecting => "connecting",
+            Self::Connected => "connected",
+            Self::Streaming => "streaming",
+            Self::Failed { .. } => "failed",
+            Self::Closed => "closed",
+        }
+    }
+}
+
+impl Default for SessionLifecycleState {
+    fn default() -> Self {
+        Self::Created
+    }
+}
+
 /// Capability set for a device
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CapabilitySet {
@@ -27,17 +81,48 @@ pub struct SessionPlan {
 }
 
 /// QUIC session snapshot (domain state, independent of Quinn)
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuicSessionSnapshot {
+    /// Transport protocol identifier
     pub transport: String,
+    /// Source device ID (controller)
     pub source_device_id: Option<String>,
+    /// Target device ID (agent)
     pub target_device_id: Option<String>,
+    /// Local listen address
     pub local_listen_addr: Option<String>,
+    /// Local server name (SNI)
     pub local_server_name: Option<String>,
+    /// Local certificate (DER, base64-encoded)
     pub local_cert_der_b64: Option<String>,
+    /// Remote listen address
     pub remote_listen_addr: Option<String>,
+    /// Remote server name
     pub remote_server_name: Option<String>,
+    /// Remote certificate (DER, base64-encoded)
     pub remote_cert_der_b64: Option<String>,
+    /// Explicit lifecycle state
+    pub lifecycle_state: SessionLifecycleState,
+    /// Last error message if any
+    pub last_error: Option<String>,
+}
+
+impl Default for QuicSessionSnapshot {
+    fn default() -> Self {
+        Self {
+            transport: String::new(),
+            source_device_id: None,
+            target_device_id: None,
+            local_listen_addr: None,
+            local_server_name: None,
+            local_cert_der_b64: None,
+            remote_listen_addr: None,
+            remote_server_name: None,
+            remote_cert_der_b64: None,
+            lifecycle_state: SessionLifecycleState::default(),
+            last_error: None,
+        }
+    }
 }
 
 /// QUIC session coordinator - manages QUIC session state at domain level
@@ -65,6 +150,7 @@ impl QuicSessionCoordinator {
         snapshot.local_listen_addr = local_listen_addr;
         snapshot.local_server_name = local_server_name;
         snapshot.local_cert_der_b64 = local_cert_der_b64;
+        snapshot.lifecycle_state = SessionLifecycleState::Connecting;
         Ok(())
     }
 
@@ -82,6 +168,40 @@ impl QuicSessionCoordinator {
         snapshot.remote_listen_addr = remote_listen_addr;
         snapshot.remote_server_name = remote_server_name;
         snapshot.remote_cert_der_b64 = remote_cert_der_b64;
+        snapshot.lifecycle_state = SessionLifecycleState::Listening;
+        Ok(())
+    }
+
+    /// Transition session to connected state
+    pub fn set_connected(&mut self, session_id: &SessionId) -> Result<(), String> {
+        let snapshot = self.sessions.get_mut(session_id)
+            .ok_or_else(|| format!("Session not found: {}", session_id.0))?;
+        snapshot.lifecycle_state = SessionLifecycleState::Connected;
+        Ok(())
+    }
+
+    /// Transition session to streaming state
+    pub fn set_streaming(&mut self, session_id: &SessionId) -> Result<(), String> {
+        let snapshot = self.sessions.get_mut(session_id)
+            .ok_or_else(|| format!("Session not found: {}", session_id.0))?;
+        snapshot.lifecycle_state = SessionLifecycleState::Streaming;
+        Ok(())
+    }
+
+    /// Mark session as failed
+    pub fn set_failed(&mut self, session_id: &SessionId, message: String) -> Result<(), String> {
+        let snapshot = self.sessions.get_mut(session_id)
+            .ok_or_else(|| format!("Session not found: {}", session_id.0))?;
+        snapshot.lifecycle_state = SessionLifecycleState::Failed { message: message.clone() };
+        snapshot.last_error = Some(message);
+        Ok(())
+    }
+
+    /// Close session
+    pub fn close(&mut self, session_id: &SessionId) -> Result<(), String> {
+        let snapshot = self.sessions.get_mut(session_id)
+            .ok_or_else(|| format!("Session not found: {}", session_id.0))?;
+        snapshot.lifecycle_state = SessionLifecycleState::Closed;
         Ok(())
     }
 

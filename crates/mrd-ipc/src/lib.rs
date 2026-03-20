@@ -23,6 +23,8 @@ pub enum IpcRequest {
     },
     /// List available devices
     ListDevices,
+    /// List all active sessions
+    ListSessions,
     /// Start a new session as controller
     StartSession {
         session_id: SessionId,
@@ -50,12 +52,20 @@ pub enum IpcRequest {
     SessionRuntimeSnapshot {
         session_id: SessionId,
     },
+    /// Get aggregated runtime snapshot
+    RuntimeSnapshot,
+    /// Get probe snapshot data
+    ProbeSnapshot {
+        session_id: SessionId,
+    },
     /// Stream probe events
     StreamProbeEvents,
+    /// Health check for service
+    ServiceHealth,
 }
 
 /// IPC response from mrd-service to Rdesk
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum IpcResponse {
     /// Device registration successful
@@ -65,6 +75,10 @@ pub enum IpcResponse {
     /// List of available devices
     DeviceList {
         devices: Vec<DeviceInfo>,
+    },
+    /// List of active sessions
+    SessionList {
+        sessions: Vec<SessionInfo>,
     },
     /// Session started successfully
     SessionStarted {
@@ -90,9 +104,21 @@ pub enum IpcResponse {
     SessionSnapshot {
         snapshot: SessionRuntimeSnapshot,
     },
+    /// Aggregated runtime snapshot
+    RuntimeSnapshot {
+        snapshot: RuntimeSnapshot,
+    },
+    /// Probe snapshot data
+    ProbeSnapshot {
+        snapshot: ProbeSnapshot,
+    },
     /// Probe event data
     ProbeEvent {
         event: Vec<u8>,  // Serialized probe event
+    },
+    /// Service health status
+    ServiceHealth {
+        status: ServiceStatus,
     },
     /// Error response
     Error {
@@ -109,6 +135,15 @@ pub struct DeviceInfo {
     pub is_online: bool,
 }
 
+/// Session information DTO (for list responses)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionInfo {
+    pub session_id: SessionId,
+    pub role: String,  // "controller" or "agent"
+    pub state: String,  // "created", "listening", "connecting", "connected", "streaming", "failed", "closed"
+    pub transport_kind: String,
+}
+
 /// Session runtime snapshot DTO (stable IPC contract)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionRuntimeSnapshot {
@@ -118,6 +153,7 @@ pub struct SessionRuntimeSnapshot {
     pub transport_kind: String,  // "quic" or "webrtc"
     pub local_bootstrap: Option<SessionBootstrap>,
     pub remote_bootstrap: Option<SessionBootstrap>,
+    pub last_error: Option<String>,
 }
 
 /// Session bootstrap metadata
@@ -126,4 +162,32 @@ pub struct SessionBootstrap {
     pub listen_addr: Option<String>,
     pub server_name: Option<String>,
     pub cert_der: Option<String>,  // Base64-encoded DER certificate
+}
+
+/// Aggregated runtime snapshot DTO
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeSnapshot {
+    pub sessions: Vec<SessionRuntimeSnapshot>,
+    pub device_id: Option<DeviceId>,
+    pub is_registered: bool,
+}
+
+/// Probe snapshot DTO
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProbeSnapshot {
+    pub session_id: SessionId,
+    pub frames_received: u64,
+    pub frames_decoded: u64,
+    pub frames_dropped: u64,
+    pub current_fps: Option<f32>,
+    pub bitrate_mbps: Option<f32>,
+    pub last_error: Option<String>,
+}
+
+/// Service status DTO
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServiceStatus {
+    pub running: bool,
+    pub healthy: bool,
+    pub pid: Option<u32>,
 }

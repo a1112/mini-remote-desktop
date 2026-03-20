@@ -7,12 +7,16 @@
 // - Transport management
 // - IPC server for Rdesk UI shell
 
+mod app_state;
+mod handlers;
 mod ipc_server;
 
 use anyhow::Result;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 use ipc_server::IpcServer;
+use app_state::AppState;
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -26,8 +30,12 @@ async fn main() -> Result<()> {
 
     info!("mrd-service starting...");
 
-    // Initialize IPC server
-    let ipc_server = IpcServer::new();
+    // Initialize application state
+    let app_state = Arc::new(AppState::new());
+    info!("Application state initialized");
+
+    // Initialize IPC server with app state
+    let ipc_server = IpcServer::new(app_state);
     info!("IPC server initialized");
 
     info!("mrd-service running (press Ctrl+C to stop)");

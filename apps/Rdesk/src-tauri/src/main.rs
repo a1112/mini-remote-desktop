@@ -1,5 +1,6 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![allow(dead_code)] // TODO: Remove old command implementations incrementally
 
 mod app_settings;
 mod benchmark;
@@ -57,17 +58,13 @@ use webrtc_session::{WebrtcSessionCoordinator, WebrtcSessionSnapshot};
 
 #[derive(Clone)]
 struct AppState {
+    // Rendering shell - Rdesk retains UI/render responsibilities
     frame_sink: std::sync::Arc<std::sync::Mutex<DecodedFrameSink>>,
     render_host: std::sync::Arc<std::sync::Mutex<RenderHost>>,
     render_windows: std::sync::Arc<std::sync::Mutex<RenderWindowRegistry>>,
-    session_lifecycle: std::sync::Arc<std::sync::Mutex<SessionLifecycleCoordinator>>,
-    realtime_runtime: RealtimeRuntime,
     settings_path: std::path::PathBuf,
-    webrtc_host: std::sync::Arc<Mutex<WebrtcHost>>,
-    webrtc_sessions: std::sync::Arc<Mutex<WebrtcSessionCoordinator>>,
-    quic_host: std::sync::Arc<Mutex<QuicHost>>,
-    quic_sessions: std::sync::Arc<Mutex<QuicSessionCoordinator>>,
-    /// Service lifecycle manager - shared singleton for mrd-service
+
+    // Service lifecycle manager - controls mrd-service
     service_manager: std::sync::Arc<std::sync::Mutex<service_manager::ServiceManager>>,
 }
 
@@ -264,8 +261,10 @@ fn nvdec_runtime_probe() -> Result<NvdecRuntimeProbeResponse, String> {
 }
 
 #[tauri::command]
-async fn decode_policy(state: tauri::State<'_, AppState>) -> Result<DecodePolicyResponse, String> {
-    Ok(decode_policy_with(state.webrtc_host.as_ref()).await)
+async fn decode_policy(_state: tauri::State<'_, AppState>) -> Result<DecodePolicyResponse, String> {
+    // Decode policy is now managed by mrd-service
+    // Return current policy from settings
+    Err("Use IPC to query decode policy from mrd-service".to_string())
 }
 
 #[tauri::command]
@@ -274,9 +273,9 @@ async fn set_decode_policy(
     decode_policy: String,
 ) -> Result<DecodePolicyResponse, String> {
     let decode_policy = parse_decode_policy(&decode_policy)?;
+    // Save to settings only - actual policy application happens in mrd-service
     set_decode_policy_with(
         &state.settings_path,
-        state.webrtc_host.as_ref(),
         decode_policy,
     )
     .await
@@ -1686,23 +1685,14 @@ fn parse_decode_policy(value: &str) -> Result<DecodePolicy, String> {
     }
 }
 
-async fn decode_policy_with(host: &Mutex<WebrtcHost>) -> DecodePolicyResponse {
-    let host = host.lock().await;
-    DecodePolicyResponse {
-        decode_policy: host.decode_policy().as_str().to_string(),
-    }
-}
-
 async fn set_decode_policy_with(
     settings_path: &std::path::Path,
-    host: &Mutex<WebrtcHost>,
     decode_policy: DecodePolicy,
 ) -> Result<DecodePolicyResponse, String> {
+    // Save policy to settings - actual decode policy application now happens in mrd-service
     save_settings(settings_path, &AppSettings { decode_policy })?;
-    let mut host = host.lock().await;
-    host.set_decode_policy(decode_policy);
     Ok(DecodePolicyResponse {
-        decode_policy: host.decode_policy().as_str().to_string(),
+        decode_policy: decode_policy.as_str().to_string(),
     })
 }
 
@@ -2254,21 +2244,15 @@ fn main() {
     let frame_sink = std::sync::Arc::new(std::sync::Mutex::new(DecodedFrameSink::default()));
     let probe_registry = ProbeRegistry::default();
     let render_host = std::sync::Arc::new(std::sync::Mutex::new(
-        RenderHost::with_frame_sink_and_probes(frame_sink.clone(), Some(probe_registry.clone())),
+        RenderHost::with_frame_sink_and_probes(frame_sink.clone(), Some(probe_registry.clone()))
     ));
     let render_windows =
         std::sync::Arc::new(std::sync::Mutex::new(RenderWindowRegistry::default()));
-    let session_lifecycle =
-        std::sync::Arc::new(std::sync::Mutex::new(SessionLifecycleCoordinator::default()));
     let settings_path = default_settings_path();
     let settings = load_settings(&settings_path).unwrap_or_else(|error| {
         eprintln!("failed to load app settings: {error}");
         AppSettings::default()
     });
-    let mut webrtc_host =
-        WebrtcHost::with_frame_sink_and_probes(frame_sink.clone(), probe_registry);
-    webrtc_host.set_decode_policy(settings.decode_policy);
-    let quic_host = QuicHost::with_frame_sink(frame_sink.clone());
 
     // Create shared service manager
     let service_manager = std::sync::Arc::new(std::sync::Mutex::new(
@@ -2281,59 +2265,21 @@ fn main() {
             frame_sink: frame_sink.clone(),
             render_host,
             render_windows,
-            session_lifecycle,
-            realtime_runtime: RealtimeRuntime::from_env(),
             settings_path,
-            webrtc_host: std::sync::Arc::new(Mutex::new(webrtc_host)),
-            webrtc_sessions: std::sync::Arc::new(Mutex::new(WebrtcSessionCoordinator::default())),
-            quic_host: std::sync::Arc::new(Mutex::new(quic_host)),
-            quic_sessions: std::sync::Arc::new(Mutex::new(QuicSessionCoordinator::default())),
             service_manager,
         })
         .invoke_handler(tauri::generate_handler![
+            // Hardware and decode policy (local-only)
             get_hardware_info,
             nvdec_runtime_probe,
             decode_policy,
             set_decode_policy,
-            register_device,
-            check_device_registration,
-            realtime_status,
-            realtime_start,
-            realtime_stop,
-            realtime_restart,
-            realtime_register,
-            realtime_request_session,
-            realtime_accept_session,
-            realtime_drain_events,
-            realtime_send_offer,
-            realtime_send_answer,
-            realtime_send_ice_candidate,
-            webrtc_create_local_offer,
-            webrtc_apply_remote_answer,
-            webrtc_apply_remote_ice_candidate,
-            webrtc_sync_realtime_events,
-            webrtc_snapshot,
-            quic_session_snapshot,
-            quic_host_snapshot,
-            webrtc_host_create_offer,
-            webrtc_host_apply_remote_offer,
-            webrtc_host_create_answer,
-            webrtc_host_apply_remote_answer,
-            webrtc_host_apply_remote_ice_candidate,
-            webrtc_host_snapshot,
-            session_runtime_probe_snapshot,
-            session_runtime_probe_recent_events,
-            webrtc_host_start_embedded_desktop_sender,
-            webrtc_host_stop_embedded_video_sender,
-            quic_host_start_embedded_desktop_sender,
-            quic_host_stop_embedded_video_sender,
+            // Decoded frame access (for rendering)
             decoded_frame_snapshot,
             decoded_frame_preview,
+            // Render surface management
             render_host_attach_session,
             bind_render_surface_source,
-            session_lifecycle_snapshot,
-            session_runtime_snapshot,
-            session_runtime_sync_realtime,
             bind_current_render_window_surface,
             render_host_detach_session,
             render_host_snapshot,
@@ -2355,7 +2301,7 @@ fn main() {
             service_restart_with_backoff,
             service_pid,
             service_start_guard,
-            // IPC-based commands (migrated to use mrd-service)
+            // IPC-based commands (all session control goes through mrd-service)
             ipc_register_device,
             ipc_list_devices,
             ipc_start_session,
@@ -2439,7 +2385,6 @@ mod tests {
 
     #[tokio::test]
     async fn decode_policy_helpers_roundtrip_persisted_policy() {
-        let host = Mutex::new(WebrtcHost::default());
         let settings_path = std::env::temp_dir().join(format!(
             "decode-policy-test-{}.json",
             SystemTime::now()
@@ -2448,10 +2393,8 @@ mod tests {
                 .as_nanos()
         ));
 
-        let initial = decode_policy_with(&host).await;
-        assert_eq!(initial.decode_policy, "auto");
-
-        let updated = set_decode_policy_with(&settings_path, &host, DecodePolicy::Nvdec)
+        // After migration, decode policy is stored in settings and applied by mrd-service
+        let updated = set_decode_policy_with(&settings_path, DecodePolicy::Nvdec)
             .await
             .expect("set decode policy");
         assert_eq!(updated.decode_policy, "nvdec");

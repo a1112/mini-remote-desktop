@@ -78,6 +78,10 @@ pub mod ports {
         pub remote_listen_addr: Option<String>,
         pub remote_server_name: Option<String>,
         pub remote_cert_der_b64: Option<String>,
+        /// Explicit lifecycle state from domain model
+        pub lifecycle_state: String,
+        /// Last error if any
+        pub last_error: Option<String>,
     }
 
     /// QUIC host port - manages QUIC transport connection
