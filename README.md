@@ -35,6 +35,7 @@ Historical implementations, temporary scripts, captured outputs, and recovered r
 mini-remote-desktop/
 ├── apps/
 │   ├── Rdesk/             # 桌面客户端产品主线
+│   ├── mrd-service/       # 本机核心服务（会话编排主入口）
 │   ├── Rdesk-Server/      # 后端产品主线
 │   └── realtime-server/   # 实时侧车服务
 ├── crates/                # 新主线共享 Rust crates
@@ -46,6 +47,18 @@ mini-remote-desktop/
 ├── labs/                  # 验证性实验目录（待进一步收敛）
 └── junk/                  # 历史实现、调试脚本、产物和参考代码
 ```
+
+### 正在进行的架构迁移
+
+仓库正在迁移到"薄壳 + 本机服务"架构：
+
+- `Rdesk` → UI 壳（仅负责界面展示，通过 IPC 调用服务）
+- `mrd-service` → 本机核心服务（会话编排的唯一入口）
+- `mrd-application` → 应用层用例编排
+- `mrd-session` → 会话领域模型
+- `mrd-ipc` → 本机进程间通信协议
+
+详细设计见：`docs/plans/2026-03-20-mrd-service-architecture-migration.md`
 
 ## Repository Status
 
