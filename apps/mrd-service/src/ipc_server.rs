@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 /// In-memory session storage for the IPC server
 #[derive(Debug, Default)]
 pub struct IpcSessionStore {
-    sessions: HashMap<SessionId, SessionSnapshot>,
+    pub(crate) sessions: HashMap<SessionId, SessionSnapshot>,
 }
 
 impl IpcSessionStore {
@@ -94,6 +94,81 @@ impl IpcServer {
     /// Handle an IPC request and return a response
     pub async fn handle_request(&self, request: IpcRequest) -> IpcResponse {
         match request {
+            IpcRequest::RegisterDevice { device_id, device_name } => {
+                tracing::info!("Registering device: {} ({})", device_id.0, device_name);
+                IpcResponse::DeviceRegistered { device_id }
+            }
+
+            IpcRequest::ListDevices => {
+                IpcResponse::DeviceList {
+                    devices: vec![],
+                }
+            }
+
+            IpcRequest::StartSession { session_id, target_device_id, transport_kind } => {
+                tracing::info!("Starting session: {} -> {} via {}",
+                    session_id.0, target_device_id.0, transport_kind);
+
+                let mut store = self.session_store.lock().await;
+                store.insert(session_id.clone(), SessionSnapshot {
+                    session_id: session_id.clone(),
+                    transport: transport_kind.clone(),
+                    source_device_id: None,  // Will be set when initialized
+                    target_device_id: Some(target_device_id),
+                    local_listen_addr: None,
+                    local_server_name: None,
+                    local_cert_der_b64: None,
+                    remote_listen_addr: None,
+                    remote_server_name: None,
+                    remote_cert_der_b64: None,
+                });
+
+                IpcResponse::SessionStarted { session_id }
+            }
+
+            IpcRequest::AcceptSession { session_id, source_device_id } => {
+                tracing::info!("Accepting session: {} from {}", session_id.0, source_device_id.0);
+
+                let mut store = self.session_store.lock().await;
+                // Update existing session or create new one
+                let snapshot = store.sessions.entry(session_id.clone()).or_insert_with(|| SessionSnapshot {
+                    session_id: session_id.clone(),
+                    transport: "unknown".to_string(),
+                    source_device_id: None,
+                    target_device_id: None,
+                    local_listen_addr: None,
+                    local_server_name: None,
+                    local_cert_der_b64: None,
+                    remote_listen_addr: None,
+                    remote_server_name: None,
+                    remote_cert_der_b64: None,
+                });
+                snapshot.source_device_id = Some(source_device_id);
+
+                IpcResponse::SessionAccepted { session_id }
+            }
+
+            IpcRequest::StartSender { session_id } => {
+                tracing::info!("Starting sender for session: {}", session_id.0);
+                // TODO: Integrate with actual media pipeline
+                IpcResponse::SenderStarted { session_id }
+            }
+
+            IpcRequest::StartReceiver { session_id } => {
+                tracing::info!("Starting receiver for session: {}", session_id.0);
+                // TODO: Integrate with actual media pipeline
+                IpcResponse::ReceiverStarted { session_id }
+            }
+
+            IpcRequest::StopSession { session_id } => {
+                tracing::info!("Stopping session: {}", session_id.0);
+
+                let mut store = self.session_store.lock().await;
+                store.sessions.remove(&session_id);
+
+                IpcResponse::SessionStopped { session_id }
+            }
+
             IpcRequest::SessionRuntimeSnapshot { session_id } => {
                 let store = self.session_store.lock().await;
                 match store.snapshot_to_ipc(&session_id) {
@@ -104,15 +179,13 @@ impl IpcServer {
                     },
                 }
             }
-            IpcRequest::ListDevices => {
-                IpcResponse::DeviceList {
-                    devices: vec![],
+
+            IpcRequest::StreamProbeEvents => {
+                IpcResponse::Error {
+                    code: "E501".to_string(),
+                    message: "Probe streaming not implemented yet".to_string(),
                 }
             }
-            _ => IpcResponse::Error {
-                code: "E501".to_string(),
-                message: "Not implemented yet".to_string(),
-            },
         }
     }
 
