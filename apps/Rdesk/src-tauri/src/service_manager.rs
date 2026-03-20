@@ -163,11 +163,18 @@ impl ServiceManager {
     pub async fn is_running(&self) -> bool {
         let mut child_guard = self.child.lock().await;
         if let Some(child) = child_guard.as_mut() {
-            // try_wait() returns Ok(exit_status) if process has exited
-            // is_err() means process is still running
-            return child.try_wait().is_err();
+            // try_wait() returns:
+            // - Ok(Some(exit_status)) if process has exited
+            // - Ok(None) if process is still running
+            // - Err(e) on error (rare)
+            match child.try_wait() {
+                Ok(None) => true,   // Still running
+                Ok(Some(_)) => false, // Exited
+                Err(_) => false,    // Error, assume not running
+            }
+        } else {
+            false
         }
-        false
     }
 
     /// Restart the service

@@ -52,8 +52,19 @@ impl IpcServer {
             }
 
             IpcRequest::ListDevices => {
+                let devices = self.app_state.devices.lock().await;
+                // Return the registered device, if any
+                let device_list = if let Some((id, name)) = devices.get_local_device() {
+                    vec![mrd_ipc::DeviceInfo {
+                        device_id: id.clone(),
+                        device_name: name.clone(),
+                        is_online: true, // Local device is always online
+                    }]
+                } else {
+                    vec![]
+                };
                 IpcResponse::DeviceList {
-                    devices: vec![],
+                    devices: device_list,
                 }
             }
 
@@ -143,14 +154,36 @@ impl IpcServer {
 
             IpcRequest::StartSender { session_id } => {
                 tracing::info!("Starting sender for session: {}", session_id.0);
-                // TODO: Integrate with actual media pipeline
-                IpcResponse::SenderStarted { session_id }
+
+                // Verify session exists first
+                let sessions = self.app_state.sessions.lock().await;
+                if sessions.get(&session_id).is_none() {
+                    IpcResponse::Error {
+                        code: "E404".to_string(),
+                        message: format!("Session not found: {}", session_id.0),
+                    }
+                } else {
+                    // TODO: Integrate with actual media pipeline
+                    // For now, just verify the session exists
+                    IpcResponse::SenderStarted { session_id }
+                }
             }
 
             IpcRequest::StartReceiver { session_id } => {
                 tracing::info!("Starting receiver for session: {}", session_id.0);
-                // TODO: Integrate with actual media pipeline
-                IpcResponse::ReceiverStarted { session_id }
+
+                // Verify session exists first
+                let sessions = self.app_state.sessions.lock().await;
+                if sessions.get(&session_id).is_none() {
+                    IpcResponse::Error {
+                        code: "E404".to_string(),
+                        message: format!("Session not found: {}", session_id.0),
+                    }
+                } else {
+                    // TODO: Integrate with actual media pipeline
+                    // For now, just verify the session exists
+                    IpcResponse::ReceiverStarted { session_id }
+                }
             }
 
             IpcRequest::StopSession { session_id } => {

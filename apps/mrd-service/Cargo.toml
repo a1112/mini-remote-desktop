@@ -4,6 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "mrd_service"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mrd-service"
+path = "src/main.rs"
+
 [dependencies]
 anyhow.workspace = true
 mrd-application = { path = "../../crates/mrd-application" }

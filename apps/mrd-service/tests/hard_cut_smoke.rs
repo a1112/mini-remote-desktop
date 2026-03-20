@@ -2,170 +2,327 @@
 //
 // These tests verify that mrd-service can independently handle
 // the core session flow without any shell-owned runtime.
+//
+// Tests use in-process IpcServer to avoid requiring an external service.
 
-use mrd_ipc::{IpcRequest, IpcResponse, client::IpcClient};
+use mrd_ipc::{IpcRequest, IpcResponse};
 use mrd_proto::{SessionId, DeviceId};
+use mrd_service::ipc_server::IpcServer;
+use mrd_service::app_state::AppState;
+use std::sync::Arc;
+
+/// Create an in-process IPC server for testing
+fn create_test_server() -> IpcServer {
+    let app_state = Arc::new(AppState::new());
+    IpcServer::new(app_state)
+}
 
 #[tokio::test]
 async fn hard_cut_service_responds_to_health_check() {
-    // This test verifies mrd-service can serve health checks
-    let mut client = IpcClient::new();
+    let server = create_test_server();
 
-    // Service health should be accessible
-    let response = client.send_request(IpcRequest::ServiceHealth).await;
+    let response = server.handle_request(IpcRequest::ServiceHealth).await;
 
     match response {
-        Ok(IpcResponse::ServiceHealth { status }) => {
+        IpcResponse::ServiceHealth { status } => {
             assert!(status.running, "Service should report running");
             assert!(status.healthy, "Service should report healthy");
         }
-        Ok(_) => panic!("Expected ServiceHealth response"),
-        Err(e) => panic!("IPC error: {}", e),
+        _ => panic!("Expected ServiceHealth response, got {:?}", response),
     }
 }
 
 #[tokio::test]
 async fn hard_cut_full_session_flow() {
-    let mut client = IpcClient::new();
+    let server = create_test_server();
 
     // Step 1: Register device
     let device_id = DeviceId("smoke-test-device".to_string());
-    let register_response = client.send_request(IpcRequest::RegisterDevice {
+    let register_response = server.handle_request(IpcRequest::RegisterDevice {
         device_id: device_id.clone(),
         device_name: "Smoke Test Device".to_string(),
     }).await;
 
-    match register_response {
-        Ok(IpcResponse::DeviceRegistered { .. }) => {}
-        Ok(_) => panic!("Expected DeviceRegistered response"),
-        Err(e) => panic!("IPC error: {}", e),
-    }
+    assert!(matches!(register_response, IpcResponse::DeviceRegistered { .. }),
+        "Expected DeviceRegistered response, got {:?}", register_response);
 
     // Step 2: List devices (should return our device)
-    let list_response = client.send_request(IpcRequest::ListDevices).await;
+    let list_response = server.handle_request(IpcRequest::ListDevices).await;
 
-    match list_response {
-        Ok(IpcResponse::DeviceList { .. }) => {
-            // TODO: Verify our device is in the list
-        }
-        Ok(_) => panic!("Expected DeviceList response"),
-        Err(e) => panic!("IPC error: {}", e),
-    }
+    assert!(matches!(list_response, IpcResponse::DeviceList { .. }),
+        "Expected DeviceList response, got {:?}", list_response);
 
     // Step 3: Start session as controller
     let session_id = SessionId("smoke-test-session".to_string());
     let target_device_id = DeviceId("remote-agent".to_string());
 
-    let start_response = client.send_request(IpcRequest::StartSession {
+    let start_response = server.handle_request(IpcRequest::StartSession {
         session_id: session_id.clone(),
         target_device_id,
         transport_kind: "quic".to_string(),
     }).await;
 
-    match start_response {
-        Ok(IpcResponse::SessionStarted { .. }) => {}
-        Ok(_) => panic!("Expected SessionStarted response"),
-        Err(e) => panic!("IPC error: {}", e),
-    }
+    assert!(matches!(start_response, IpcResponse::SessionStarted { .. }),
+        "Expected SessionStarted response, got {:?}", start_response);
 
     // Step 4: Get session snapshot
-    let snapshot_response = client.send_request(IpcRequest::SessionRuntimeSnapshot {
+    let snapshot_response = server.handle_request(IpcRequest::SessionRuntimeSnapshot {
         session_id: session_id.clone(),
     }).await;
 
     match snapshot_response {
-        Ok(IpcResponse::SessionSnapshot { snapshot }) => {
+        IpcResponse::SessionSnapshot { snapshot } => {
             assert_eq!(snapshot.session_id, session_id);
             assert_eq!(snapshot.role, "controller");
-            // State could be "created" or "connecting" depending on implementation
-            assert!(!snapshot.state.is_empty());
+            assert!(!snapshot.state.is_empty(), "State should not be empty");
         }
-        Ok(_) => panic!("Expected SessionSnapshot response"),
-        Err(e) => panic!("IPC error: {}", e),
+        _ => panic!("Expected SessionSnapshot response, got {:?}", snapshot_response),
     }
 
     // Step 5: Stop session
-    let stop_response = client.send_request(IpcRequest::StopSession {
+    let stop_response = server.handle_request(IpcRequest::StopSession {
         session_id: session_id.clone(),
     }).await;
 
-    match stop_response {
-        Ok(IpcResponse::SessionStopped { .. }) => {}
-        Ok(_) => panic!("Expected SessionStopped response"),
-        Err(e) => panic!("IPC error: {}", e),
-    }
+    assert!(matches!(stop_response, IpcResponse::SessionStopped { .. }),
+        "Expected SessionStopped response, got {:?}", stop_response);
 
     // Step 6: Verify session is gone
-    let snapshot_response = client.send_request(IpcRequest::SessionRuntimeSnapshot {
+    let error_response = server.handle_request(IpcRequest::SessionRuntimeSnapshot {
         session_id,
     }).await;
 
-    match snapshot_response {
-        Ok(IpcResponse::Error { code, .. }) => {
+    match error_response {
+        IpcResponse::Error { code, .. } => {
             assert_eq!(code, "E404", "Session should not exist after stop");
         }
-        Ok(_) => panic!("Expected error for non-existent session"),
-        Err(e) => panic!("IPC error: {}", e),
+        _ => panic!("Expected error for non-existent session, got {:?}", error_response),
     }
 }
 
 #[tokio::test]
 async fn hard_cut_runtime_snapshot_aggregates_state() {
-    let mut client = IpcClient::new();
+    let server = create_test_server();
 
-    // Start a session first
+    // Register a device first
+    let _ = server.handle_request(IpcRequest::RegisterDevice {
+        device_id: DeviceId("test-device".to_string()),
+        device_name: "Test Device".to_string(),
+    }).await;
+
+    // Start a session
     let session_id = SessionId("snapshot-test-session".to_string());
-    let _ = client.send_request(IpcRequest::StartSession {
+    let _ = server.handle_request(IpcRequest::StartSession {
         session_id: session_id.clone(),
         target_device_id: DeviceId("agent".to_string()),
         transport_kind: "webrtc".to_string(),
     }).await;
 
     // Get runtime snapshot
-    let response = client.send_request(IpcRequest::RuntimeSnapshot).await;
+    let response = server.handle_request(IpcRequest::RuntimeSnapshot).await;
 
     match response {
-        Ok(IpcResponse::RuntimeSnapshot { snapshot }) => {
-            // Should have our session
+        IpcResponse::RuntimeSnapshot { snapshot } => {
             assert!(!snapshot.sessions.is_empty(), "Should have at least one session");
-            assert!(snapshot.is_registered, "Should be registered after earlier operations");
+            assert!(snapshot.is_registered, "Should be registered after device registration");
+            assert_eq!(snapshot.sessions[0].session_id, session_id);
         }
-        Ok(_) => panic!("Expected RuntimeSnapshot response"),
-        Err(e) => panic!("IPC error: {}", e),
+        _ => panic!("Expected RuntimeSnapshot response, got {:?}", response),
     }
 }
 
 #[tokio::test]
 async fn hard_cut_list_sessions_returns_active_sessions() {
-    let mut client = IpcClient::new();
+    let server = create_test_server();
 
     // Start two sessions
     let session1 = SessionId("list-test-1".to_string());
     let session2 = SessionId("list-test-2".to_string());
 
     for session_id in [&session1, &session2] {
-        let _ = client.send_request(IpcRequest::StartSession {
+        let response = server.handle_request(IpcRequest::StartSession {
             session_id: session_id.clone(),
             target_device_id: DeviceId("agent".to_string()),
             transport_kind: "quic".to_string(),
         }).await;
+
+        assert!(matches!(response, IpcResponse::SessionStarted { .. }),
+            "Expected SessionStarted response");
     }
 
     // List sessions
-    let response = client.send_request(IpcRequest::ListSessions).await;
+    let response = server.handle_request(IpcRequest::ListSessions).await;
 
     match response {
-        Ok(IpcResponse::SessionList { sessions }) => {
-            assert!(sessions.len() >= 2, "Should have at least 2 sessions");
+        IpcResponse::SessionList { sessions } => {
+            assert!(sessions.len() >= 2, "Should have at least 2 sessions, got {}", sessions.len());
         }
-        Ok(_) => panic!("Expected SessionList response"),
-        Err(e) => panic!("IPC error: {}", e),
+        _ => panic!("Expected SessionList response, got {:?}", response),
     }
 
     // Cleanup
     for session_id in [&session1, &session2] {
-        let _ = client.send_request(IpcRequest::StopSession {
+        let _ = server.handle_request(IpcRequest::StopSession {
             session_id: session_id.clone(),
         }).await;
+    }
+}
+
+#[tokio::test]
+async fn hard_cut_list_devices_returns_registered_devices() {
+    let server = create_test_server();
+
+    // Initially no devices
+    let response = server.handle_request(IpcRequest::ListDevices).await;
+    match response {
+        IpcResponse::DeviceList { devices } => {
+            assert_eq!(devices.len(), 0, "Should have no devices initially");
+        }
+        _ => panic!("Expected DeviceList response, got {:?}", response),
+    }
+
+    // Register a device
+    let device_id = DeviceId("test-device".to_string());
+    let _ = server.handle_request(IpcRequest::RegisterDevice {
+        device_id: device_id.clone(),
+        device_name: "Test Device".to_string(),
+    }).await;
+
+    // Now should have one device
+    let response = server.handle_request(IpcRequest::ListDevices).await;
+    match response {
+        IpcResponse::DeviceList { devices } => {
+            assert_eq!(devices.len(), 1, "Should have 1 device after registration");
+            assert_eq!(devices[0].device_id, device_id);
+            assert_eq!(devices[0].device_name, "Test Device");
+            assert!(devices[0].is_online, "Local device should be online");
+        }
+        _ => panic!("Expected DeviceList response, got {:?}", response),
+    }
+}
+
+#[tokio::test]
+async fn hard_cut_sender_receiver_require_existing_session() {
+    let server = create_test_server();
+
+    let non_existent_session = SessionId("non-existent".to_string());
+
+    // StartSender should fail for non-existent session
+    let response = server.handle_request(IpcRequest::StartSender {
+        session_id: non_existent_session.clone(),
+    }).await;
+
+    match response {
+        IpcResponse::Error { code, .. } => {
+            assert_eq!(code, "E404", "Should return E404 for non-existent session");
+        }
+        _ => panic!("Expected error for non-existent session, got {:?}", response),
+    }
+
+    // StartReceiver should fail for non-existent session
+    let response = server.handle_request(IpcRequest::StartReceiver {
+        session_id: non_existent_session,
+    }).await;
+
+    match response {
+        IpcResponse::Error { code, .. } => {
+            assert_eq!(code, "E404", "Should return E404 for non-existent session");
+        }
+        _ => panic!("Expected error for non-existent session, got {:?}", response),
+    }
+
+    // After creating a session, StartSender should succeed
+    let valid_session = SessionId("valid-session".to_string());
+    let _ = server.handle_request(IpcRequest::StartSession {
+        session_id: valid_session.clone(),
+        target_device_id: DeviceId("remote".to_string()),
+        transport_kind: "quic".to_string(),
+    }).await;
+
+    let response = server.handle_request(IpcRequest::StartSender {
+        session_id: valid_session.clone(),
+    }).await;
+
+    assert!(matches!(response, IpcResponse::SenderStarted { .. }),
+        "StartSender should succeed for existing session, got {:?}", response);
+
+    let response = server.handle_request(IpcRequest::StartReceiver {
+        session_id: valid_session,
+    }).await;
+
+    assert!(matches!(response, IpcResponse::ReceiverStarted { .. }),
+        "StartReceiver should succeed for existing session, got {:?}", response);
+}
+
+#[tokio::test]
+async fn hard_cut_start_and_accept_session() {
+    let server = create_test_server();
+
+    let session_id = SessionId("accept-test-session".to_string());
+    let controller_device = DeviceId("controller".to_string());
+    let agent_device = DeviceId("agent".to_string());
+
+    // Start session as controller
+    let start_response = server.handle_request(IpcRequest::StartSession {
+        session_id: session_id.clone(),
+        target_device_id: agent_device.clone(),
+        transport_kind: "quic".to_string(),
+    }).await;
+
+    assert!(matches!(start_response, IpcResponse::SessionStarted { .. }),
+        "Expected SessionStarted response");
+
+    // Accept session as agent
+    let accept_response = server.handle_request(IpcRequest::AcceptSession {
+        session_id: session_id.clone(),
+        source_device_id: controller_device,
+    }).await;
+
+    assert!(matches!(accept_response, IpcResponse::SessionAccepted { .. }),
+        "Expected SessionAccepted response, got {:?}", accept_response);
+
+    // Verify snapshot shows both sides
+    let snap_response = server.handle_request(IpcRequest::SessionRuntimeSnapshot {
+        session_id,
+    }).await;
+
+    match snap_response {
+        IpcResponse::SessionSnapshot { snapshot } => {
+            // After accept, should have both source and target
+            // (implementation may vary, just verify we get a snapshot)
+            assert_eq!(snapshot.session_id.0, "accept-test-session");
+        }
+        _ => panic!("Expected SessionSnapshot response, got {:?}", snap_response),
+    }
+}
+
+#[tokio::test]
+async fn hard_cuted_service_owns_session_state() {
+    let server = create_test_server();
+
+    let session_id = SessionId("ownership-test".to_string());
+
+    // Start a session
+    let _ = server.handle_request(IpcRequest::StartSession {
+        session_id: session_id.clone(),
+        target_device_id: DeviceId("remote".to_string()),
+        transport_kind: "webrtc".to_string(),
+    }).await;
+
+    // Verify through snapshot that service owns the state
+    let response = server.handle_request(IpcRequest::SessionRuntimeSnapshot {
+        session_id: session_id.clone(),
+    }).await;
+
+    match response {
+        IpcResponse::SessionSnapshot { snapshot } => {
+            // Verify the snapshot comes from mrd-service's own registry
+            // not from any shell-owned state
+            assert_eq!(snapshot.session_id, session_id);
+            assert_eq!(snapshot.transport_kind, "webrtc");
+            assert_eq!(snapshot.role, "controller");
+            assert_eq!(snapshot.state, "connecting"); // Explicit state from domain
+        }
+        _ => panic!("Expected SessionSnapshot response, got {:?}", response),
     }
 }
