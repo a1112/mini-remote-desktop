@@ -27,14 +27,38 @@ impl IpcSessionStore {
 
     pub fn snapshot_to_ipc(&self, session_id: &SessionId) -> Option<mrd_ipc::SessionRuntimeSnapshot> {
         let snap = self.sessions.get(session_id)?;
+
+        // Determine role based on which device ID is set
+        // - target_device_id set → controller (initiating session)
+        // - source_device_id set → agent (accepting session)
+        let role = if snap.target_device_id.is_some() {
+            "controller"
+        } else if snap.source_device_id.is_some() {
+            "agent"
+        } else {
+            "unknown"
+        }.to_string();
+
+        // Determine state based on bootstrap information
+        // TODO: This is still simplified - real state machine needs integration
+        let state = if snap.local_listen_addr.is_some() && snap.remote_listen_addr.is_some() {
+            // Both sides have bootstrap - bidirectional established
+            "connected"
+        } else if snap.local_listen_addr.is_some() || snap.local_server_name.is_some() {
+            // Local side initialized - listening
+            "listening"
+        } else if snap.remote_listen_addr.is_some() || snap.remote_server_name.is_some() {
+            // Remote side info available - connecting
+            "connecting"
+        } else {
+            // Just created, no bootstrap yet
+            "created"
+        }.to_string();
+
         Some(mrd_ipc::SessionRuntimeSnapshot {
             session_id: snap.session_id.clone(),
-            role: "controller".to_string(),
-            state: if snap.local_listen_addr.is_some() || snap.remote_listen_addr.is_some() {
-                "connected".to_string()
-            } else {
-                "created".to_string()
-            },
+            role,
+            state,
             transport_kind: snap.transport.clone(),
             local_bootstrap: if snap.local_listen_addr.is_some() || snap.local_server_name.is_some() {
                 Some(mrd_ipc::SessionBootstrap {

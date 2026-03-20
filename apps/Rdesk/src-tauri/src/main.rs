@@ -67,6 +67,8 @@ struct AppState {
     webrtc_sessions: std::sync::Arc<Mutex<WebrtcSessionCoordinator>>,
     quic_host: std::sync::Arc<Mutex<QuicHost>>,
     quic_sessions: std::sync::Arc<Mutex<QuicSessionCoordinator>>,
+    /// Service lifecycle manager - shared singleton for mrd-service
+    service_manager: std::sync::Arc<std::sync::Mutex<service_manager::ServiceManager>>,
 }
 
 /// 设备注册响应
@@ -302,14 +304,13 @@ async fn realtime_restart() -> Result<RealtimeStatus, String> {
 
 // mrd-service lifecycle commands
 #[tauri::command]
-async fn service_start() -> Result<bool, String> {
-    let manager = service_manager::ServiceManager::new()
-        .map_err(|e| e.to_string())?;
+async fn service_start(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    let manager = state.service_manager.clone();
 
     tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            manager.start().await
+            manager.lock().unwrap().start().await
         })
     }).await.map_err(|e| e.to_string())?;
 
@@ -317,14 +318,13 @@ async fn service_start() -> Result<bool, String> {
 }
 
 #[tauri::command]
-async fn service_stop() -> Result<bool, String> {
-    let manager = service_manager::ServiceManager::new()
-        .map_err(|e| e.to_string())?;
+async fn service_stop(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    let manager = state.service_manager.clone();
 
     tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            manager.stop().await
+            manager.lock().unwrap().stop().await
         })
     }).await.map_err(|e| e.to_string())?;
 
@@ -332,55 +332,51 @@ async fn service_stop() -> Result<bool, String> {
 }
 
 #[tauri::command]
-async fn service_status() -> Result<bool, String> {
-    let manager = service_manager::ServiceManager::new()
-        .map_err(|e| e.to_string())?;
+async fn service_status(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    let manager = state.service_manager.clone();
 
-    tokio::task::spawn_blocking(move || {
+    let is_running = tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            manager.is_running().await
+            manager.lock().unwrap().is_running().await
         })
     }).await.map_err(|e| e.to_string())?;
 
-    Ok(true)
+    Ok(is_running)
 }
 
 #[tauri::command]
-async fn service_health_check() -> Result<bool, String> {
-    let manager = service_manager::ServiceManager::new()
-        .map_err(|e| e.to_string())?;
+async fn service_health_check(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    let manager = state.service_manager.clone();
 
     tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            manager.health_check().await.map_err(|e| e.to_string())
+            manager.lock().unwrap().health_check().await.map_err(|e| e.to_string())
         })
     }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-async fn service_wait_for_healthy(timeout_secs: u64) -> Result<bool, String> {
-    let manager = service_manager::ServiceManager::new()
-        .map_err(|e| e.to_string())?;
+async fn service_wait_for_healthy(state: tauri::State<'_, AppState>, timeout_secs: u64) -> Result<bool, String> {
+    let manager = state.service_manager.clone();
 
     tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            manager.wait_for_healthy(timeout_secs).await.map_err(|e| e.to_string())
+            manager.lock().unwrap().wait_for_healthy(timeout_secs).await.map_err(|e| e.to_string())
         })
     }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-async fn service_restart_with_backoff(max_attempts: u32) -> Result<bool, String> {
-    let manager = service_manager::ServiceManager::new()
-        .map_err(|e| e.to_string())?;
+async fn service_restart_with_backoff(state: tauri::State<'_, AppState>, max_attempts: u32) -> Result<bool, String> {
+    let manager = state.service_manager.clone();
 
     tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            manager.restart_with_backoff(max_attempts).await.map_err(|e| e.to_string())
+            manager.lock().unwrap().restart_with_backoff(max_attempts).await.map_err(|e| e.to_string())
         })
     }).await.map_err(|e| e.to_string())?;
 
@@ -388,27 +384,25 @@ async fn service_restart_with_backoff(max_attempts: u32) -> Result<bool, String>
 }
 
 #[tauri::command]
-async fn service_pid() -> Result<Option<u32>, String> {
-    let manager = service_manager::ServiceManager::new()
-        .map_err(|e| e.to_string())?;
+async fn service_pid(state: tauri::State<'_, AppState>) -> Result<Option<u32>, String> {
+    let manager = state.service_manager.clone();
 
     tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            Ok(manager.pid().await)
+            Ok(manager.lock().unwrap().pid().await)
         })
     }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-async fn service_restart() -> Result<bool, String> {
-    let manager = service_manager::ServiceManager::new()
-        .map_err(|e| e.to_string())?;
+async fn service_restart(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    let manager = state.service_manager.clone();
 
     tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            manager.restart().await
+            manager.lock().unwrap().restart().await
         })
     }).await.map_err(|e| e.to_string())?;
 
@@ -417,7 +411,7 @@ async fn service_restart() -> Result<bool, String> {
 
 // Service guard command - starts monitoring the service
 #[tauri::command]
-async fn service_start_guard() -> Result<String, String> {
+async fn service_start_guard(state: tauri::State<'_, AppState>) -> Result<String, String> {
     use service_manager::{ServiceGuard, ServiceGuardConfig};
     use std::sync::Arc;
 
@@ -2275,6 +2269,13 @@ fn main() {
         WebrtcHost::with_frame_sink_and_probes(frame_sink.clone(), probe_registry);
     webrtc_host.set_decode_policy(settings.decode_policy);
     let quic_host = QuicHost::with_frame_sink(frame_sink.clone());
+
+    // Create shared service manager
+    let service_manager = std::sync::Arc::new(std::sync::Mutex::new(
+        service_manager::ServiceManager::new()
+            .expect("failed to create ServiceManager")
+    ));
+
     tauri::Builder::default()
         .manage(AppState {
             frame_sink: frame_sink.clone(),
@@ -2287,6 +2288,7 @@ fn main() {
             webrtc_sessions: std::sync::Arc::new(Mutex::new(WebrtcSessionCoordinator::default())),
             quic_host: std::sync::Arc::new(Mutex::new(quic_host)),
             quic_sessions: std::sync::Arc::new(Mutex::new(QuicSessionCoordinator::default())),
+            service_manager,
         })
         .invoke_handler(tauri::generate_handler![
             get_hardware_info,
