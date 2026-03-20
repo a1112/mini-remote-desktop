@@ -22,6 +22,7 @@ bytes = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }
 mrd-proto = { path = "../../../crates/mrd-proto" }
 mrd-session = { path = "../../../crates/mrd-session" }
+mrd-ipc = { path = "../../../crates/mrd-ipc" }
 mrd-pipeline-core = { path = "../../../crates/mrd-pipeline-core" }
 mrd-capture-dxgi = { path = "../../../crates/mrd-capture-dxgi" }
 mrd-decode = { path = "../../../crates/mrd-decode" }

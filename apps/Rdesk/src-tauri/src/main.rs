@@ -3,6 +3,7 @@
 
 mod app_settings;
 mod benchmark;
+mod ipc_client;
 mod device_info;
 mod frame_sink;
 mod quic_host;
