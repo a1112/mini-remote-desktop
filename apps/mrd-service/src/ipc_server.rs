@@ -327,6 +327,8 @@ mod tests {
             remote_listen_addr: None,
             remote_server_name: None,
             remote_cert_der_b64: None,
+            lifecycle_state: "listening".to_string(),
+            last_error: None,
         };
 
         server.app_state().sessions().lock().await.insert(session_id.clone(), snapshot);
@@ -363,6 +365,8 @@ mod tests {
             remote_listen_addr: None,
             remote_server_name: None,
             remote_cert_der_b64: None,
+            lifecycle_state: "created".to_string(),
+            last_error: None,
         };
 
         server.app_state().sessions().lock().await.insert(session_id.clone(), snapshot);
