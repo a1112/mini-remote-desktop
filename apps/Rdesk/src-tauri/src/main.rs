@@ -1099,6 +1099,7 @@ async fn webrtc_host_stop_embedded_video_sender(
 }
 #[cfg(test)]
 
+#[cfg(test)]
 #[tauri::command]
 async fn quic_host_start_embedded_desktop_sender(
     state: tauri::State<'_, AppState>,
@@ -1110,11 +1111,11 @@ async fn quic_host_start_embedded_desktop_sender(
         .lock()
         .await
         .start_embedded_desktop_sender(SessionId(session_id), fps.unwrap_or(15))
-#[cfg(test)]
         .await
 }
 #[cfg(test)]
 
+#[cfg(test)]
 #[tauri::command]
 async fn quic_host_stop_embedded_video_sender(
     state: tauri::State<'_, AppState>,
@@ -1128,6 +1129,7 @@ async fn quic_host_stop_embedded_video_sender(
         .await
 }
 
+#[cfg(test)]
 #[tauri::command]
 async fn decoded_frame_snapshot(
     state: tauri::State<'_, AppState>,
@@ -1139,6 +1141,7 @@ async fn decoded_frame_snapshot(
     ))
 }
 
+#[cfg(test)]
 #[tauri::command]
 async fn decoded_frame_preview(
     state: tauri::State<'_, AppState>,
@@ -1147,6 +1150,7 @@ async fn decoded_frame_preview(
     decoded_frame_preview_with(state.frame_sink.as_ref(), session_id)
 }
 
+#[cfg(test)]
 #[tauri::command]
 async fn render_host_attach_session(
     window: tauri::Window,
@@ -1184,6 +1188,7 @@ async fn render_host_attach_session(
     Ok(())
 }
 
+#[cfg(test)]
 #[tauri::command]
 async fn bind_current_render_window_surface(
     window: tauri::Window,
@@ -1369,11 +1374,11 @@ async fn session_runtime_sync_realtime(
         state.quic_sessions.as_ref(),
         session_id,
     )
-#[cfg(test)]
     .await
     .map(Some)
 }
 
+#[cfg(test)]
 #[tauri::command]
 fn open_render_window(app: tauri::AppHandle, session_id: String) -> Result<String, String> {
     let state = app.state::<AppState>();
@@ -1392,6 +1397,7 @@ fn open_render_window(app: tauri::AppHandle, session_id: String) -> Result<Strin
 }
 #[cfg(test)]
 
+#[cfg(test)]
 #[tauri::command]
 fn open_render_surface_window(
     app: tauri::AppHandle,
@@ -1412,6 +1418,7 @@ fn open_render_surface_window(
     result
 }
 
+#[cfg(test)]
 #[tauri::command]
 fn list_render_windows(
     app: tauri::AppHandle,
@@ -1429,6 +1436,7 @@ fn list_render_windows(
     Ok(windows)
 }
 
+#[cfg(test)]
 #[tauri::command]
 fn close_render_window(app: tauri::AppHandle, label: String) -> Result<(), String> {
     let state = app.state::<AppState>();
@@ -1440,6 +1448,7 @@ fn close_render_window(app: tauri::AppHandle, label: String) -> Result<(), Strin
     result
 }
 
+#[cfg(test)]
 #[tauri::command]
 fn render_window_context(
     window: tauri::Window,
@@ -1457,6 +1466,7 @@ fn render_window_context(
     Ok(context)
 }
 
+#[cfg(test)]
 #[tauri::command]
 fn list_render_surfaces(
     state: tauri::State<'_, AppState>,
@@ -1472,11 +1482,11 @@ fn list_render_surfaces(
         .list_surfaces(&session_id)
         .into_iter()
         .map(|surface| render_surface_descriptor_response(surface, current_surface_id.as_deref()))
-#[cfg(test)]
         .collect();
     Ok(surfaces)
 }
 
+#[cfg(test)]
 #[tauri::command]
 fn create_render_surface(
     state: tauri::State<'_, AppState>,
@@ -1496,6 +1506,7 @@ fn create_render_surface(
     ))
 }
 
+#[cfg(test)]
 #[tauri::command]
 fn select_current_render_surface(
     state: tauri::State<'_, AppState>,
@@ -1510,6 +1521,7 @@ fn select_current_render_surface(
         .select_current_surface(SessionId(session_id), surface_id)
 }
 
+#[cfg(test)]
 #[tauri::command]
 fn current_render_surface(
     state: tauri::State<'_, AppState>,
@@ -2321,24 +2333,6 @@ fn main() {
             nvdec_runtime_probe,
             decode_policy,
             set_decode_policy,
-            // Decoded frame access (for rendering)
-            decoded_frame_snapshot,
-            decoded_frame_preview,
-            // Render surface management
-            render_host_attach_session,
-            bind_render_surface_source,
-            bind_current_render_window_surface,
-            render_host_detach_session,
-            render_host_snapshot,
-            open_render_window,
-            open_render_surface_window,
-            list_render_windows,
-            close_render_window,
-            render_window_context,
-            list_render_surfaces,
-            create_render_surface,
-            select_current_render_surface,
-            current_render_surface,
             // Service lifecycle commands
             service_start,
             service_stop,
@@ -2352,11 +2346,7 @@ fn main() {
             ipc_register_device,
             ipc_list_devices,
             ipc_start_session,
-            ipc_accept_session,
-            ipc_stop_session,
-            ipc_session_snapshot,
-            ipc_start_sender,
-            ipc_start_receiver
+            ipc_accept_session
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
