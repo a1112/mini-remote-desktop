@@ -1,6 +1,10 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-#![allow(dead_code)] // TODO: Remove old command implementations incrementally
+// Allow dead code for legacy modules that are:
+// 1. Used in #[cfg(test)] tests for validation
+// 2. Kept for reference during hard-cut migration
+// TODO: Remove after migration is complete and tests are updated
+#![allow(dead_code)]
 
 mod app_settings;
 mod benchmark;
