@@ -1,5 +1,13 @@
 import { invoke } from "@tauri-apps/api/tauri";
 
+/**
+ * Realtime session service
+ *
+ * DEPRECATED: All direct realtime commands have been removed.
+ * Use mrd-service IPC interface (ipc_* commands) instead.
+ * See realtimeService.ts for service lifecycle commands.
+ */
+
 export type RealtimeRole = "controller" | "agent";
 
 export type RealtimeRegistration = {
@@ -116,185 +124,246 @@ type RealtimeRegistrationPayload = {
   device_id: string;
 };
 
+/**
+ * @deprecated realtime_register command removed - use ipc_register_device instead
+ */
 export const registerRealtimeSession = async (
-  request: RealtimeRegistrationRequest
+  _request: RealtimeRegistrationRequest
 ): Promise<RealtimeRegistration> => {
-  const payload = await invoke<RealtimeRegistrationPayload>("realtime_register", {
-    role: request.role,
-    deviceId: request.deviceId,
-    name: request.name,
-  });
-
-  return {
-    handle: payload.handle,
-    deviceId: payload.device_id,
-  };
+  throw new Error(
+    "realtime_register 命令已移除。请使用 ipc_register_device 代替。"
+  );
 };
 
+/**
+ * @deprecated realtime_request_session command removed - use ipc_start_session instead
+ */
 export const requestRealtimeSession = async (
-  request: RealtimeSessionRequest
-): Promise<void> =>
-  invoke("realtime_request_session", {
-    handle: request.handle,
-    sessionId: request.sessionId,
-    targetDeviceId: request.targetDeviceId,
-  });
+  _request: RealtimeSessionRequest
+): Promise<void> => {
+  throw new Error(
+    "realtime_request_session 命令已移除。请使用 ipc_start_session 代替。"
+  );
+};
 
+/**
+ * @deprecated realtime_accept_session command removed - use ipc_accept_session instead
+ */
 export const acceptRealtimeSession = async (
-  request: RealtimeSessionAccept
-): Promise<void> =>
-  invoke("realtime_accept_session", {
-    handle: request.handle,
-    sessionId: request.sessionId,
-  });
+  _request: RealtimeSessionAccept
+): Promise<void> => {
+  throw new Error(
+    "realtime_accept_session 命令已移除。请使用 ipc_accept_session 代替。"
+  );
+};
 
-export const drainRealtimeEvents = async (handle: number): Promise<string[]> =>
-  invoke<string[]>("realtime_drain_events", { handle });
+/**
+ * @deprecated realtime_drain_events command removed
+ */
+export const drainRealtimeEvents = async (_handle: number): Promise<string[]> => {
+  throw new Error(
+    "realtime_drain_events 命令已移除。事件现在由 mrd-service 管理。"
+  );
+};
 
+/**
+ * @deprecated realtime_send_offer command removed - WebRTC signaling moved to mrd-service
+ */
 export const sendRealtimeOffer = async (
-  request: RealtimeSessionDescription
-): Promise<void> =>
-  invoke("realtime_send_offer", {
-    handle: request.handle,
-    sessionId: request.sessionId,
-    sdp: request.sdp,
-  });
+  _request: RealtimeSessionDescription
+): Promise<void> => {
+  throw new Error(
+    "realtime_send_offer 命令已移除。WebRTC 信令已迁移到 mrd-service。"
+  );
+};
 
+/**
+ * @deprecated realtime_send_answer command removed - WebRTC signaling moved to mrd-service
+ */
 export const sendRealtimeAnswer = async (
-  request: RealtimeSessionDescription
-): Promise<void> =>
-  invoke("realtime_send_answer", {
-    handle: request.handle,
-    sessionId: request.sessionId,
-    sdp: request.sdp,
-  });
+  _request: RealtimeSessionDescription
+): Promise<void> => {
+  throw new Error(
+    "realtime_send_answer 命令已移除。WebRTC 信令已迁移到 mrd-service。"
+  );
+};
 
+/**
+ * @deprecated realtime_send_ice_candidate command removed - WebRTC signaling moved to mrd-service
+ */
 export const sendRealtimeIceCandidate = async (
-  request: RealtimeIceCandidate
-): Promise<void> =>
-  invoke("realtime_send_ice_candidate", {
-    handle: request.handle,
-    sessionId: request.sessionId,
-    candidate: request.candidate,
-    sdpMid: request.sdpMid,
-    sdpMlineIndex: request.sdpMlineIndex,
-  });
+  _request: RealtimeIceCandidate
+): Promise<void> => {
+  throw new Error(
+    "realtime_send_ice_candidate 命令已移除。WebRTC 信令已迁移到 mrd-service。"
+  );
+};
 
+/**
+ * @deprecated webrtc_create_local_offer command removed - use ipc_start_session instead
+ */
 export const createWebrtcLocalOffer = async (
-  sessionId: string,
-  sdp: string
-): Promise<string> =>
-  invoke<string>("webrtc_create_local_offer", {
-    sessionId,
-    sdp,
-  });
+  _sessionId: string,
+  _sdp: string
+): Promise<string> => {
+  throw new Error(
+    "webrtc_create_local_offer 命令已移除。请使用 ipc_start_session 代替。"
+  );
+};
 
+/**
+ * @deprecated webrtc_apply_remote_answer command removed
+ */
 export const applyWebrtcRemoteAnswer = async (
-  sessionId: string,
-  sdp: string
-): Promise<void> =>
-  invoke("webrtc_apply_remote_answer", {
-    sessionId,
-    sdp,
-  });
+  _sessionId: string,
+  _sdp: string
+): Promise<void> => {
+  throw new Error(
+    "webrtc_apply_remote_answer 命令已移除。WebRTC 信令已迁移到 mrd-service。"
+  );
+};
 
+/**
+ * @deprecated webrtc_apply_remote_ice_candidate command removed
+ */
 export const applyWebrtcRemoteIceCandidate = async (
-  request: Omit<RealtimeIceCandidate, "handle">
-): Promise<void> =>
-  invoke("webrtc_apply_remote_ice_candidate", {
-    sessionId: request.sessionId,
-    candidate: request.candidate,
-    sdpMid: request.sdpMid,
-    sdpMlineIndex: request.sdpMlineIndex,
-  });
+  _request: Omit<RealtimeIceCandidate, "handle">
+): Promise<void> => {
+  throw new Error(
+    "webrtc_apply_remote_ice_candidate 命令已移除。WebRTC 信令已迁移到 mrd-service。"
+  );
+};
 
+/**
+ * @deprecated webrtc_sync_realtime_events command removed
+ */
 export const syncWebrtcRealtimeEvents = async (
-  handle: number
-): Promise<WebrtcSessionSnapshot> =>
-  invoke<WebrtcSessionSnapshot>("webrtc_sync_realtime_events", {
-    handle,
-  });
+  _handle: number
+): Promise<WebrtcSessionSnapshot> => {
+  throw new Error(
+    "webrtc_sync_realtime_events 命令已移除。事件现在由 mrd-service 管理。"
+  );
+};
 
+/**
+ * @deprecated webrtc_snapshot command removed - use ipc_session_snapshot instead
+ */
 export const getWebrtcSnapshot = async (
-  sessionId: string
-): Promise<WebrtcSessionSnapshot | null> =>
-  invoke<WebrtcSessionSnapshot | null>("webrtc_snapshot", {
-    sessionId,
-  });
+  _sessionId: string
+): Promise<WebrtcSessionSnapshot | null> => {
+  throw new Error(
+    "webrtc_snapshot 命令已移除。请使用 ipc_session_snapshot 代替。"
+  );
+};
 
+/**
+ * @deprecated webrtc_host_create_offer command removed
+ */
 export const createWebrtcHostOffer = async (
-  sessionId: string
-): Promise<string> =>
-  invoke<string>("webrtc_host_create_offer", {
-    sessionId,
-  });
+  _sessionId: string
+): Promise<string> => {
+  throw new Error(
+    "webrtc_host_create_offer 命令已移除。WebRTC 信令已迁移到 mrd-service。"
+  );
+};
 
+/**
+ * @deprecated webrtc_host_apply_remote_offer command removed
+ */
 export const applyWebrtcHostRemoteOffer = async (
-  sessionId: string,
-  sdp: string
-): Promise<void> =>
-  invoke("webrtc_host_apply_remote_offer", {
-    sessionId,
-    sdp,
-  });
+  _sessionId: string,
+  _sdp: string
+): Promise<void> => {
+  throw new Error(
+    "webrtc_host_apply_remote_offer 命令已移除。WebRTC 信令已迁移到 mrd-service。"
+  );
+};
 
+/**
+ * @deprecated webrtc_host_create_answer command removed
+ */
 export const createWebrtcHostAnswer = async (
-  sessionId: string
-): Promise<string> =>
-  invoke<string>("webrtc_host_create_answer", {
-    sessionId,
-  });
+  _sessionId: string
+): Promise<string> => {
+  throw new Error(
+    "webrtc_host_create_answer 命令已移除。WebRTC 信令已迁移到 mrd-service。"
+  );
+};
 
+/**
+ * @deprecated webrtc_host_apply_remote_answer command removed
+ */
 export const applyWebrtcHostRemoteAnswer = async (
-  sessionId: string,
-  sdp: string
-): Promise<void> =>
-  invoke("webrtc_host_apply_remote_answer", {
-    sessionId,
-    sdp,
-  });
+  _sessionId: string,
+  _sdp: string
+): Promise<void> => {
+  throw new Error(
+    "webrtc_host_apply_remote_answer 命令已移除。WebRTC 信令已迁移到 mrd-service。"
+  );
+};
 
+/**
+ * @deprecated webrtc_host_apply_remote_ice_candidate command removed
+ */
 export const applyWebrtcHostRemoteIceCandidate = async (
-  request: Omit<RealtimeIceCandidate, "handle">
-): Promise<void> =>
-  invoke("webrtc_host_apply_remote_ice_candidate", {
-    sessionId: request.sessionId,
-    candidate: request.candidate,
-    sdpMid: request.sdpMid,
-    sdpMlineIndex: request.sdpMlineIndex,
-  });
+  _request: Omit<RealtimeIceCandidate, "handle">
+): Promise<void> => {
+  throw new Error(
+    "webrtc_host_apply_remote_ice_candidate 命令已移除。WebRTC 信令已迁移到 mrd-service。"
+  );
+};
 
+/**
+ * @deprecated webrtc_host_snapshot command removed - use ipc_session_snapshot instead
+ */
 export const getWebrtcHostSnapshot = async (
-  sessionId: string
-): Promise<WebrtcHostSnapshot | null> =>
-  invoke<WebrtcHostSnapshot | null>("webrtc_host_snapshot", {
-    sessionId,
-  });
+  _sessionId: string
+): Promise<WebrtcHostSnapshot | null> => {
+  throw new Error(
+    "webrtc_host_snapshot 命令已移除。请使用 ipc_session_snapshot 代替。"
+  );
+};
 
+/**
+ * @deprecated decoded_frame_snapshot command removed - use ipc_session_snapshot instead
+ */
 export const getDecodedFrameSnapshot = async (
-  sessionId: string
-): Promise<DecodedFrameSnapshot | null> =>
-  invoke<DecodedFrameSnapshot | null>("decoded_frame_snapshot", {
-    sessionId,
-  });
+  _sessionId: string
+): Promise<DecodedFrameSnapshot | null> => {
+  throw new Error(
+    "decoded_frame_snapshot 命令已移除。请使用 ipc_session_snapshot 代替。"
+  );
+};
 
+/**
+ * @deprecated decoded_frame_preview command removed
+ */
 export const getDecodedFramePreview = async (
-  sessionId: string
-): Promise<string | null> =>
-  invoke<string | null>("decoded_frame_preview", {
-    sessionId,
-  });
+  _sessionId: string
+): Promise<string | null> => {
+  throw new Error(
+    "decoded_frame_preview 命令已移除。帧预览功能已迁移到 mrd-service。"
+  );
+};
 
+/**
+ * @deprecated session_runtime_snapshot command removed - use ipc_session_snapshot instead
+ */
 export const getSessionRuntimeSnapshot = async (
-  sessionId: string
-): Promise<SessionRuntimeSnapshot> =>
-  invoke<SessionRuntimeSnapshot>("session_runtime_snapshot", {
-    sessionId,
-  });
+  _sessionId: string
+): Promise<SessionRuntimeSnapshot> => {
+  throw new Error(
+    "session_runtime_snapshot 命令已移除。请使用 ipc_session_snapshot 代替。"
+  );
+};
 
+/**
+ * @deprecated session_runtime_sync_realtime command removed
+ */
 export const syncRealtimeIntoSessionRuntime = async (
-  handle: number
-): Promise<SessionRuntimeSnapshot | null> =>
-  invoke<SessionRuntimeSnapshot | null>("session_runtime_sync_realtime", {
-    handle,
-  });
+  _handle: number
+): Promise<SessionRuntimeSnapshot | null> => {
+  throw new Error(
+    "session_runtime_sync_realtime 命令已移除。事件现在由 mrd-service 管理。"
+  );
+};

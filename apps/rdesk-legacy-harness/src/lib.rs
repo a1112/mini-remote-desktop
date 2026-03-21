@@ -31,6 +31,7 @@ pub mod session_runtime;
 pub mod webrtc_host;
 pub mod webrtc_media;
 pub mod webrtc_session;
+pub mod test_helpers;
 
 // Re-export commonly used types from legacy modules
 pub use app_settings::*;

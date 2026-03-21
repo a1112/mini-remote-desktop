@@ -13,42 +13,27 @@ import {
   Settings,
 } from "lucide-react";
 import { useTheme } from "./ThemeContext";
-import { RealtimeSessionCard } from "./RealtimeSessionCard";
+import { IpcSessionCard } from "./IpcSessionCard";
 import {
-  getDecodePolicy,
-  getNvdecRuntimeProbe,
-  getRealtimeStatus,
-  restartRealtime,
   setDecodePolicy,
-  startRealtime,
-  stopRealtime,
+  serviceHealthCheck,
+  serviceRestart,
+  serviceStart,
+  serviceStatus,
+  serviceStop,
+  servicePid,
   type DecodePolicyResponse,
   type DecoderPolicy,
-  type NvdecRuntimeProbe,
-  type RealtimeStatus,
-} from "../services/realtimeService";
-import {
-  acceptRealtimeSession,
-  applyWebrtcHostRemoteIceCandidate,
-  applyWebrtcHostRemoteOffer,
-  drainRealtimeEvents,
-  createWebrtcHostAnswer,
-  createWebrtcHostOffer,
-  getDecodedFramePreview,
-  getDecodedFrameSnapshot,
-  getWebrtcHostSnapshot,
-  getWebrtcSnapshot,
-  applyWebrtcRemoteIceCandidate,
-  registerRealtimeSession,
-  requestRealtimeSession,
-  sendRealtimeAnswer,
-  sendRealtimeIceCandidate,
-  sendRealtimeOffer,
-  syncWebrtcRealtimeEvents,
-  type WebrtcHostSnapshot,
-  type WebrtcSessionSnapshot,
-  type DecodedFrameSnapshot,
-} from "../services/realtimeSessionService";
+} from "../services/serviceLifecycleService";
+
+/**
+ * Service status type (matches mrd-service lifecycle)
+ */
+type ServiceStatusInfo = {
+  running: boolean;
+  healthy: boolean;
+  pid?: number;
+};
 
 function Toggle({ value, onChange }: { value: boolean; onChange: (v: boolean) => void }) {
   return (
@@ -155,27 +140,10 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
   const [notifyDisconnect, setNotifyDisconnect] = useState(true);
   const [notifyRequest, setNotifyRequest] = useState(true);
   const [sound, setSound] = useState(true);
-  const [realtimeStatus, setRealtimeStatus] = useState<RealtimeStatus | null>(null);
-  const [nvdecProbe, setNvdecProbe] = useState<NvdecRuntimeProbe | null>(null);
-  const [decodePolicy, setDecodePolicyState] = useState<DecodePolicyResponse | null>(null);
-  const [realtimeLoading, setRealtimeLoading] = useState(false);
-  const [realtimeError, setRealtimeError] = useState<string | null>(null);
-  const [realtimeDeviceId, setRealtimeDeviceId] = useState("controller-1");
-  const [realtimeSessionId, setRealtimeSessionId] = useState("session-1");
-  const [realtimeTargetDeviceId, setRealtimeTargetDeviceId] = useState("agent-1");
-  const [realtimeHandle, setRealtimeHandle] = useState<number | null>(null);
-  const [realtimeEvents, setRealtimeEvents] = useState<string[]>([]);
-  const [realtimeOfferSdp, setRealtimeOfferSdp] = useState("offer-sdp");
-  const [realtimeAnswerSdp, setRealtimeAnswerSdp] = useState("answer-sdp");
-  const [realtimeIceCandidate, setRealtimeIceCandidate] = useState(
-    "candidate:1 1 UDP 123 127.0.0.1 5000 typ host",
-  );
-  const [realtimeIceSdpMid, setRealtimeIceSdpMid] = useState("0");
-  const [realtimeIceSdpMlineIndex, setRealtimeIceSdpMlineIndex] = useState(0);
-  const [realtimeSnapshot, setRealtimeSnapshot] = useState<WebrtcSessionSnapshot | null>(null);
-  const [realtimeHostSnapshot, setRealtimeHostSnapshot] = useState<WebrtcHostSnapshot | null>(null);
-  const [decodedFrameSnapshot, setDecodedFrameSnapshot] = useState<DecodedFrameSnapshot | null>(null);
-  const [decodedFramePreviewUrl, setDecodedFramePreviewUrl] = useState("");
+  const [serviceStatusInfo, setServiceStatusInfo] = useState<ServiceStatusInfo | null>(null);
+  const [serviceLoading, setServiceLoading] = useState(false);
+  const [serviceError, setServiceError] = useState<string | null>(null);
+  const [showDeprecationNotice, setShowDeprecationNotice] = useState(false);
 
   useEffect(() => {
     if (open) {
@@ -195,304 +163,52 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
 
   useEffect(() => {
     if (!open) return;
-    void refreshRealtimeStatus();
+    void refreshServiceStatus();
   }, [open]);
 
-  const refreshRealtimeStatus = async () => {
-    setRealtimeLoading(true);
-    setRealtimeError(null);
+  const refreshServiceStatus = async () => {
+    setServiceLoading(true);
+    setServiceError(null);
     try {
-      const [nextStatus, nextNvdecProbe, nextDecodePolicy] = await Promise.all([
-        getRealtimeStatus(),
-        getNvdecRuntimeProbe(),
-        getDecodePolicy(),
+      // Check service status and health
+      const [running, healthy, pid] = await Promise.all([
+        serviceStatus(),
+        serviceHealthCheck().catch(() => false),
+        servicePid().catch(() => null),
       ]);
-      setRealtimeStatus(nextStatus);
-      setNvdecProbe(nextNvdecProbe);
-      setDecodePolicyState(nextDecodePolicy);
+
+      setServiceStatusInfo({ running, healthy, pid: pid ?? undefined });
+
+      // NVDEC probe and decode policy moved to mrd-service
+      // These features are now managed through the service
+      setShowDeprecationNotice(true);
     } catch (error) {
-      setRealtimeError(error instanceof Error ? error.message : "读取 realtime 状态失败");
+      setServiceError(error instanceof Error ? error.message : "读取服务状态失败");
     } finally {
-      setRealtimeLoading(false);
+      setServiceLoading(false);
     }
   };
 
-  const updateDecodePolicy = async (nextPolicy: DecoderPolicy) => {
-    setRealtimeLoading(true);
-    setRealtimeError(null);
-    try {
-      const next = await setDecodePolicy(nextPolicy);
-      setDecodePolicyState(next);
-    } catch (error) {
-      setRealtimeError(
-        error instanceof Error ? error.message : "更新 decode policy 设置失败",
-      );
-    } finally {
-      setRealtimeLoading(false);
-    }
+  const updateDecodePolicy = async (_nextPolicy: DecoderPolicy) => {
+    alert("Decode Policy 功能已迁移到 mrd-service。请使用服务管理界面配置。");
   };
 
   const runRealtimeAction = async (
-    action: () => Promise<RealtimeStatus>,
+    action: () => Promise<boolean>,
   ) => {
-    setRealtimeLoading(true);
-    setRealtimeError(null);
+    setServiceLoading(true);
+    setServiceError(null);
     try {
-      const next = await action();
-      setRealtimeStatus(next);
+      await action();
+      // Refresh status after action
+      const running = await serviceStatus();
+      const healthy = await serviceHealthCheck().catch(() => false);
+      const pid = await servicePid().catch(() => null);
+      setServiceStatusInfo({ running, healthy, pid: pid ?? undefined });
     } catch (error) {
-      setRealtimeError(error instanceof Error ? error.message : "执行 realtime 操作失败");
+      setServiceError(error instanceof Error ? error.message : "执行服务操作失败");
     } finally {
-      setRealtimeLoading(false);
-    }
-  };
-
-  const registerRealtimeController = async () => {
-    setRealtimeLoading(true);
-    setRealtimeError(null);
-    try {
-      const registration = await registerRealtimeSession({
-        role: "controller",
-        deviceId: realtimeDeviceId,
-        name: "Rdesk Controller",
-      });
-      setRealtimeHandle(registration.handle);
-      setRealtimeDeviceId(registration.deviceId);
-    } catch (error) {
-      setRealtimeError(error instanceof Error ? error.message : "注册 realtime 会话失败");
-    } finally {
-      setRealtimeLoading(false);
-    }
-  };
-
-  const requestRealtimeControllerSession = async () => {
-    if (realtimeHandle === null) {
-      setRealtimeError("请先注册 realtime controller");
-      return;
-    }
-
-    setRealtimeLoading(true);
-    setRealtimeError(null);
-    try {
-      await requestRealtimeSession({
-        handle: realtimeHandle,
-        sessionId: realtimeSessionId,
-        targetDeviceId: realtimeTargetDeviceId,
-      });
-      const nextEvents = await drainRealtimeEvents(realtimeHandle);
-      setRealtimeEvents(nextEvents);
-    } catch (error) {
-      setRealtimeError(error instanceof Error ? error.message : "发起 realtime session 失败");
-    } finally {
-      setRealtimeLoading(false);
-    }
-  };
-
-  const acceptRealtimeControllerSession = async () => {
-    if (realtimeHandle === null) {
-      setRealtimeError("请先注册 realtime controller");
-      return;
-    }
-
-    setRealtimeLoading(true);
-    setRealtimeError(null);
-    try {
-      await acceptRealtimeSession({
-        handle: realtimeHandle,
-        sessionId: realtimeSessionId,
-      });
-      const nextEvents = await drainRealtimeEvents(realtimeHandle);
-      setRealtimeEvents(nextEvents);
-    } catch (error) {
-      setRealtimeError(error instanceof Error ? error.message : "接受 realtime session 失败");
-    } finally {
-      setRealtimeLoading(false);
-    }
-  };
-
-  const refreshRealtimeEvents = async () => {
-    if (realtimeHandle === null) {
-      setRealtimeError("请先注册 realtime controller");
-      return;
-    }
-
-    setRealtimeLoading(true);
-    setRealtimeError(null);
-    try {
-      const nextEvents = await drainRealtimeEvents(realtimeHandle);
-      setRealtimeEvents(nextEvents);
-    } catch (error) {
-      setRealtimeError(error instanceof Error ? error.message : "拉取 realtime 事件失败");
-    } finally {
-      setRealtimeLoading(false);
-    }
-  };
-
-  const refreshWebrtcSnapshot = async () => {
-    setRealtimeLoading(true);
-    setRealtimeError(null);
-    try {
-      const snapshot = await getWebrtcSnapshot(realtimeSessionId);
-      setRealtimeSnapshot(snapshot);
-    } catch (error) {
-      setRealtimeError(error instanceof Error ? error.message : "读取 webrtc 快照失败");
-    } finally {
-      setRealtimeLoading(false);
-    }
-  };
-
-  const refreshWebrtcHostSnapshot = async () => {
-    setRealtimeLoading(true);
-    setRealtimeError(null);
-    try {
-      const snapshot = await getWebrtcHostSnapshot(realtimeSessionId);
-      setRealtimeHostSnapshot(snapshot);
-      const decodedSnapshot = await getDecodedFrameSnapshot(realtimeSessionId);
-      setDecodedFrameSnapshot(decodedSnapshot);
-      const decodedPreview = await getDecodedFramePreview(realtimeSessionId);
-      setDecodedFramePreviewUrl(decodedPreview ?? "");
-    } catch (error) {
-      setRealtimeError(error instanceof Error ? error.message : "读取 native host 快照失败");
-    } finally {
-      setRealtimeLoading(false);
-    }
-  };
-
-  const syncRealtimeEventsIntoWebrtcSnapshot = async () => {
-    if (realtimeHandle === null) {
-      setRealtimeError("请先注册 realtime controller");
-      return;
-    }
-
-    setRealtimeLoading(true);
-    setRealtimeError(null);
-    try {
-      const snapshot = await syncWebrtcRealtimeEvents(realtimeHandle);
-      setRealtimeSnapshot(snapshot);
-      const hostSnapshot = await getWebrtcHostSnapshot(realtimeSessionId);
-      setRealtimeHostSnapshot(hostSnapshot);
-      const decodedSnapshot = await getDecodedFrameSnapshot(realtimeSessionId);
-      setDecodedFrameSnapshot(decodedSnapshot);
-      const decodedPreview = await getDecodedFramePreview(realtimeSessionId);
-      setDecodedFramePreviewUrl(decodedPreview ?? "");
-      const nextEvents = await drainRealtimeEvents(realtimeHandle);
-      setRealtimeEvents(nextEvents);
-    } catch (error) {
-      setRealtimeError(error instanceof Error ? error.message : "同步 webrtc 快照失败");
-    } finally {
-      setRealtimeLoading(false);
-    }
-  };
-
-  const sendRealtimeOfferSignal = async () => {
-    if (realtimeHandle === null) {
-      setRealtimeError("请先注册 realtime controller");
-      return;
-    }
-
-    setRealtimeLoading(true);
-    setRealtimeError(null);
-    try {
-      const localOffer = await createWebrtcHostOffer(realtimeSessionId);
-      await sendRealtimeOffer({
-        handle: realtimeHandle,
-        sessionId: realtimeSessionId,
-        sdp: localOffer,
-      });
-      setRealtimeOfferSdp(localOffer);
-      const snapshot = await getWebrtcSnapshot(realtimeSessionId);
-      setRealtimeSnapshot(snapshot);
-      const hostSnapshot = await getWebrtcHostSnapshot(realtimeSessionId);
-      setRealtimeHostSnapshot(hostSnapshot);
-      const decodedSnapshot = await getDecodedFrameSnapshot(realtimeSessionId);
-      setDecodedFrameSnapshot(decodedSnapshot);
-      const decodedPreview = await getDecodedFramePreview(realtimeSessionId);
-      setDecodedFramePreviewUrl(decodedPreview ?? "");
-      const nextEvents = await drainRealtimeEvents(realtimeHandle);
-      setRealtimeEvents(nextEvents);
-    } catch (error) {
-      setRealtimeError(error instanceof Error ? error.message : "发送 offer 失败");
-    } finally {
-      setRealtimeLoading(false);
-    }
-  };
-
-  const sendRealtimeAnswerSignal = async () => {
-    if (realtimeHandle === null) {
-      setRealtimeError("请先注册 realtime controller");
-      return;
-    }
-
-    setRealtimeLoading(true);
-    setRealtimeError(null);
-    try {
-      await applyWebrtcHostRemoteOffer(realtimeSessionId, realtimeOfferSdp);
-      const generatedAnswer = await createWebrtcHostAnswer(realtimeSessionId);
-      await sendRealtimeAnswer({
-        handle: realtimeHandle,
-        sessionId: realtimeSessionId,
-        sdp: generatedAnswer,
-      });
-      setRealtimeAnswerSdp(generatedAnswer);
-      const snapshot = await getWebrtcSnapshot(realtimeSessionId);
-      setRealtimeSnapshot(snapshot);
-      const hostSnapshot = await getWebrtcHostSnapshot(realtimeSessionId);
-      setRealtimeHostSnapshot(hostSnapshot);
-      const decodedSnapshot = await getDecodedFrameSnapshot(realtimeSessionId);
-      setDecodedFrameSnapshot(decodedSnapshot);
-      const decodedPreview = await getDecodedFramePreview(realtimeSessionId);
-      setDecodedFramePreviewUrl(decodedPreview ?? "");
-      const nextEvents = await drainRealtimeEvents(realtimeHandle);
-      setRealtimeEvents(nextEvents);
-    } catch (error) {
-      setRealtimeError(error instanceof Error ? error.message : "发送 answer 失败");
-    } finally {
-      setRealtimeLoading(false);
-    }
-  };
-
-  const sendRealtimeIceSignal = async () => {
-    if (realtimeHandle === null) {
-      setRealtimeError("请先注册 realtime controller");
-      return;
-    }
-
-    setRealtimeLoading(true);
-    setRealtimeError(null);
-    try {
-      await applyWebrtcHostRemoteIceCandidate({
-        sessionId: realtimeSessionId,
-        candidate: realtimeIceCandidate,
-        sdpMid: realtimeIceSdpMid,
-        sdpMlineIndex: realtimeIceSdpMlineIndex,
-      });
-      await applyWebrtcRemoteIceCandidate({
-        sessionId: realtimeSessionId,
-        candidate: realtimeIceCandidate,
-        sdpMid: realtimeIceSdpMid,
-        sdpMlineIndex: realtimeIceSdpMlineIndex,
-      });
-      await sendRealtimeIceCandidate({
-        handle: realtimeHandle,
-        sessionId: realtimeSessionId,
-        candidate: realtimeIceCandidate,
-        sdpMid: realtimeIceSdpMid,
-        sdpMlineIndex: realtimeIceSdpMlineIndex,
-      });
-      const snapshot = await getWebrtcSnapshot(realtimeSessionId);
-      setRealtimeSnapshot(snapshot);
-      const hostSnapshot = await getWebrtcHostSnapshot(realtimeSessionId);
-      setRealtimeHostSnapshot(hostSnapshot);
-      const decodedSnapshot = await getDecodedFrameSnapshot(realtimeSessionId);
-      setDecodedFrameSnapshot(decodedSnapshot);
-      const decodedPreview = await getDecodedFramePreview(realtimeSessionId);
-      setDecodedFramePreviewUrl(decodedPreview ?? "");
-      const nextEvents = await drainRealtimeEvents(realtimeHandle);
-      setRealtimeEvents(nextEvents);
-    } catch (error) {
-      setRealtimeError(error instanceof Error ? error.message : "发送 ICE 失败");
-    } finally {
-      setRealtimeLoading(false);
+      setServiceLoading(false);
     }
   };
 
@@ -676,15 +392,15 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                   <div className="flex items-start justify-between gap-4">
                     <div>
                       <div className={isDark ? "text-gray-200" : "text-gray-800"} style={{ fontSize: 13 }}>
-                        Realtime Sidecar
+                        mrd-service
                       </div>
                       <div className={`mt-0.5 ${isDark ? "text-gray-500" : "text-gray-400"}`} style={{ fontSize: 11 }}>
-                        读取并控制 `Rdesk-Server` 挂载的 realtime-server 进程。
+                        管理和控制 mrd-service 后台服务进程。
                       </div>
                     </div>
                     <button
-                      onClick={() => void refreshRealtimeStatus()}
-                      disabled={realtimeLoading}
+                      onClick={() => void refreshServiceStatus()}
+                      disabled={serviceLoading}
                       className={`px-3 py-1.5 rounded-lg border transition-colors ${
                         isDark
                           ? "border-gray-600 text-gray-300 hover:bg-gray-800 disabled:opacity-50"
@@ -696,234 +412,88 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                     </button>
                   </div>
 
-                  <div className="grid grid-cols-4 gap-3 mt-3">
+                  <div className="grid grid-cols-3 gap-3 mt-3">
                     <RealtimeMetric
                       label="运行状态"
-                      value={realtimeStatus?.running ? "运行中" : "未运行"}
-                      tone={realtimeStatus?.running ? "good" : "warn"}
+                      value={serviceStatusInfo?.running ? "运行中" : "未运行"}
+                      tone={serviceStatusInfo?.running ? "good" : "warn"}
                     />
                     <RealtimeMetric
                       label="健康检查"
-                      value={realtimeStatus?.reachable ? "可达" : "不可达"}
-                      tone={realtimeStatus?.reachable ? "good" : "warn"}
-                    />
-                    <RealtimeMetric
-                      label="服务状态"
-                      value={realtimeStatus?.status ?? "未知"}
-                      tone={realtimeStatus?.status === "ok" ? "good" : "neutral"}
+                      value={serviceStatusInfo?.healthy ? "健康" : "异常"}
+                      tone={serviceStatusInfo?.healthy ? "good" : "warn"}
                     />
                     <RealtimeMetric
                       label="进程 PID"
-                      value={realtimeStatus?.pid ? String(realtimeStatus.pid) : "-"}
+                      value={serviceStatusInfo?.pid ? String(serviceStatusInfo.pid) : "-"}
                       tone="neutral"
                     />
                   </div>
 
+                  {/* NVDEC and Decode Policy features moved to mrd-service */}
                   <div
                     className={`mt-3 rounded-xl border p-3.5 ${
                       isDark ? "bg-[#232323] border-gray-700" : "bg-gray-50 border-gray-200"
                     }`}
                   >
-                    <div className="flex items-start justify-between gap-3">
-                      <div>
-                        <div
-                          className={isDark ? "text-gray-200" : "text-gray-800"}
-                          style={{ fontSize: 13 }}
-                        >
-                          NVDEC Capability
-                        </div>
-                        <div
-                          className={`mt-0.5 ${isDark ? "text-gray-500" : "text-gray-400"}`}
-                          style={{ fontSize: 11 }}
-                        >
-                          当前 Windows NVDEC runtime、HEVC 和 Main10 接线状态。
-                        </div>
-                      </div>
-                      <div
-                        className={`${isDark ? "text-gray-400" : "text-gray-500"}`}
-                        style={{ fontSize: 11 }}
-                      >
-                        {nvdecProbe?.backend ?? "windows-nvdec"}
-                      </div>
+                    <div className={isDark ? "text-gray-300" : "text-gray-700"} style={{ fontSize: 13 }}>
+                      NVDEC 和 Decode Policy
                     </div>
-
+                    <div className={`mt-2 ${isDark ? "text-gray-400" : "text-gray-500"}`} style={{ fontSize: 12 }}>
+                      这些功能已迁移到 mrd-service。解码策略现在由服务内部管理。
+                    </div>
                     <div
-                      className={`mt-3 rounded-lg px-3 py-2 ${
-                        isDark ? "bg-black/20 text-gray-300" : "bg-white text-gray-700"
-                      }`}
-                      style={{ fontSize: 12 }}
+                      className={`mt-3 rounded-lg px-3 py-2 ${isDark ? "bg-amber-900/20 text-amber-300" : "bg-amber-50 text-amber-700"}`}
+                      style={{ fontSize: 11 }}
                     >
-                      {nvdecProbe?.summary ?? "尚未读取 NVDEC 状态"}
-                    </div>
-
-                    <div
-                      className={`mt-3 rounded-lg border px-3 py-3 ${
-                        isDark ? "border-gray-700 bg-black/10" : "border-gray-200 bg-white"
-                      }`}
-                    >
-                      <div className="flex items-center justify-between gap-3">
-                        <div>
-                          <div
-                            className={isDark ? "text-gray-200" : "text-gray-800"}
-                            style={{ fontSize: 12 }}
-                          >
-                            Decoder Policy
-                          </div>
-                          <div
-                            className={`mt-0.5 ${isDark ? "text-gray-500" : "text-gray-400"}`}
-                            style={{ fontSize: 11 }}
-                          >
-                            `auto` 默认保守，`software` 固定软件解码，`nvdec` 强制优先硬解并自动回退。
-                          </div>
-                        </div>
-                        <ModalSelect
-                          value={decodePolicy?.decode_policy ?? "auto"}
-                          options={["auto", "software", "nvdec"]}
-                          onChange={(value) =>
-                            void updateDecodePolicy(value as DecoderPolicy)
-                          }
-                        />
-                      </div>
-                    </div>
-
-                    <div className="grid grid-cols-1 gap-2 mt-3">
-                      {[
-                        { label: "H264", codec: "h264", bitDepthMinus8: 0 },
-                        { label: "HEVC 8-bit", codec: "hevc", bitDepthMinus8: 0 },
-                        { label: "HEVC Main10", codec: "hevc", bitDepthMinus8: 2 },
-                      ].map((item) => {
-                        const capability = nvdecProbe?.capability_probes.find(
-                          (probe) =>
-                            probe.codec === item.codec &&
-                            probe.bit_depth_minus8 === item.bitDepthMinus8,
-                        );
-                        return (
-                          <NvdecCapabilityRow
-                            key={`${item.codec}-${item.bitDepthMinus8}`}
-                            isDark={isDark}
-                            label={item.label}
-                            capability={capability}
-                          />
-                        );
-                      })}
+                      功能迁移说明：NVDEC capability 探测和 Decode Policy 配置现在通过 mrd-service IPC 接口提供。
+                      请使用上面的 IPC Session Control 来管理会话和媒体设置。
                     </div>
                   </div>
 
-                  {realtimeError && (
+                  {showDeprecationNotice && (
+                    <div
+                      className={`mt-3 rounded-lg px-3 py-2 ${isDark ? "bg-amber-900/20 text-amber-300" : "bg-amber-50 text-amber-700"}`}
+                      style={{ fontSize: 12 }}
+                    >
+                      部分功能已迁移到 mrd-service。请使用 IPC Session Control 进行会话管理。
+                    </div>
+                  )}
+
+                  {serviceError && (
                     <div
                       className={`mt-3 rounded-lg px-3 py-2 ${isDark ? "bg-red-900/20 text-red-300" : "bg-red-50 text-red-600"}`}
                       style={{ fontSize: 12 }}
                     >
-                      {realtimeError}
+                      {serviceError}
                     </div>
                   )}
 
                   <div className="flex gap-2 mt-3">
                     <ActionButton
                       isDark={isDark}
-                      disabled={realtimeLoading}
-                      onClick={() => void runRealtimeAction(startRealtime)}
+                      disabled={serviceLoading}
+                      onClick={() => void runRealtimeAction(serviceStart)}
                     >
                       启动
                     </ActionButton>
                     <ActionButton
                       isDark={isDark}
-                      disabled={realtimeLoading}
-                      onClick={() => void runRealtimeAction(stopRealtime)}
+                      disabled={serviceLoading}
+                      onClick={() => void runRealtimeAction(serviceStop)}
                     >
                       停止
                     </ActionButton>
                     <ActionButton
                       isDark={isDark}
-                      disabled={realtimeLoading}
-                      onClick={() => void runRealtimeAction(restartRealtime)}
+                      disabled={serviceLoading}
+                      onClick={() => void runRealtimeAction(serviceRestart)}
                     >
                       重启
                     </ActionButton>
                   </div>
                 </div>
-                <RealtimeSessionCard
-                  deviceId={realtimeDeviceId}
-                  sessionId={realtimeSessionId}
-                  targetDeviceId={realtimeTargetDeviceId}
-                  offerSdp={realtimeOfferSdp}
-                  answerSdp={realtimeAnswerSdp}
-                  iceCandidate={realtimeIceCandidate}
-                  iceSdpMid={realtimeIceSdpMid}
-                  iceSdpMlineIndex={realtimeIceSdpMlineIndex}
-                  snapshotLocalOffer={realtimeSnapshot?.localOffer ?? ""}
-                  snapshotRemoteOffer={realtimeSnapshot?.remoteOffer ?? ""}
-                  snapshotRemoteAnswer={realtimeSnapshot?.remoteAnswer ?? ""}
-                  snapshotRemoteIceCount={realtimeSnapshot?.remoteIceCandidates.length ?? 0}
-                  hostLocalOffer={realtimeHostSnapshot?.localOffer ?? ""}
-                  hostRemoteOffer={realtimeHostSnapshot?.remoteOffer ?? ""}
-                  hostLocalAnswer={realtimeHostSnapshot?.localAnswer ?? ""}
-                  hostRemoteAnswer={realtimeHostSnapshot?.remoteAnswer ?? ""}
-                  hostRemoteIceCount={realtimeHostSnapshot?.remoteIceCount ?? 0}
-                  hostRemoteVideoTrackCount={realtimeHostSnapshot?.remoteVideoTrackCount ?? 0}
-                  hostRemoteRtpPacketCount={realtimeHostSnapshot?.remoteRtpPacketCount ?? 0}
-                  hostLastRemoteCodec={realtimeHostSnapshot?.lastRemoteCodec ?? ""}
-                  hostRemoteH264AccessUnitCount={realtimeHostSnapshot?.remoteH264AccessUnitCount ?? 0}
-                  hostLastRemoteAccessUnitBytes={realtimeHostSnapshot?.lastRemoteAccessUnitBytes ?? 0}
-                  hostDecodedFrameCount={realtimeHostSnapshot?.decodedFrameCount ?? 0}
-                  hostLastDecodedWidth={realtimeHostSnapshot?.lastDecodedWidth ?? 0}
-                  hostLastDecodedHeight={realtimeHostSnapshot?.lastDecodedHeight ?? 0}
-                  hostLastDecodedPixelFormat={realtimeHostSnapshot?.lastDecodedPixelFormat ?? ""}
-                  sinkFrameCount={decodedFrameSnapshot?.frameCount ?? 0}
-                  sinkWidth={decodedFrameSnapshot?.width ?? 0}
-                  sinkHeight={decodedFrameSnapshot?.height ?? 0}
-                  sinkPixelFormat={decodedFrameSnapshot?.pixelFormat ?? ""}
-                  sinkBytes={decodedFrameSnapshot?.bytes ?? 0}
-                  sinkPreviewUrl={decodedFramePreviewUrl}
-                  handle={realtimeHandle}
-                  loading={realtimeLoading}
-                  error={realtimeError}
-                  events={realtimeEvents}
-                  onDeviceIdChange={setRealtimeDeviceId}
-                  onSessionIdChange={setRealtimeSessionId}
-                  onTargetDeviceIdChange={setRealtimeTargetDeviceId}
-                  onOfferSdpChange={setRealtimeOfferSdp}
-                  onAnswerSdpChange={setRealtimeAnswerSdp}
-                  onIceCandidateChange={setRealtimeIceCandidate}
-                  onIceSdpMidChange={setRealtimeIceSdpMid}
-                  onIceSdpMlineIndexChange={setRealtimeIceSdpMlineIndex}
-                  onRegister={() => void registerRealtimeController()}
-                  onRequest={() => void requestRealtimeControllerSession()}
-                  onAccept={() => void acceptRealtimeControllerSession()}
-                  onSendOffer={() => void sendRealtimeOfferSignal()}
-                  onSendAnswer={() => void sendRealtimeAnswerSignal()}
-                  onSendIceCandidate={() => void sendRealtimeIceSignal()}
-                  onRefreshEvents={() => void refreshRealtimeEvents()}
-                  onSyncSnapshot={() => void syncRealtimeEventsIntoWebrtcSnapshot()}
-                />
-                <div className="mt-3">
-                  <div className="flex gap-2">
-                    <button
-                      onClick={() => void refreshWebrtcSnapshot()}
-                      disabled={realtimeLoading}
-                      className={`px-3 py-1.5 rounded-lg border transition-colors ${
-                        isDark
-                          ? "border-gray-600 text-gray-300 hover:bg-gray-800 disabled:opacity-50"
-                          : "border-gray-200 text-gray-700 hover:bg-gray-50 disabled:opacity-50"
-                      }`}
-                      style={{ fontSize: 12 }}
-                    >
-                      读取当前快照
-                    </button>
-                    <button
-                      onClick={() => void refreshWebrtcHostSnapshot()}
-                      disabled={realtimeLoading}
-                      className={`px-3 py-1.5 rounded-lg border transition-colors ${
-                        isDark
-                          ? "border-gray-600 text-gray-300 hover:bg-gray-800 disabled:opacity-50"
-                          : "border-gray-200 text-gray-700 hover:bg-gray-50 disabled:opacity-50"
-                      }`}
-                      style={{ fontSize: 12 }}
-                    >
-                      读取 Host 快照
-                    </button>
-                  </div>
-                </div>
+                <IpcSessionCard />
               </SettingsSection>
             )}
 
@@ -1118,86 +688,6 @@ function ActionButton({
     >
       {children}
     </button>
-  );
-}
-
-function NvdecCapabilityRow({
-  isDark,
-  label,
-  capability,
-}: {
-  isDark: boolean;
-  label: string;
-  capability?: NvdecRuntimeProbe["capability_probes"][number];
-}) {
-  const runtimeLabel = capability
-    ? capability.runtime_supported
-      ? "Runtime 支持"
-      : "Runtime 不支持"
-    : "未读取";
-  const wiredLabel = capability
-    ? capability.wired_supported
-      ? "已接线"
-      : "未接线"
-    : "未知";
-
-  return (
-    <div
-      className={`rounded-lg border px-3 py-2 ${
-        isDark ? "border-gray-700 bg-[#1d1d1d]" : "border-gray-200 bg-white"
-      }`}
-    >
-      <div className="flex items-center justify-between gap-3">
-        <div
-          className={`font-medium ${isDark ? "text-gray-200" : "text-gray-800"}`}
-          style={{ fontSize: 12 }}
-        >
-          {label}
-        </div>
-        <div className="flex items-center gap-2">
-          <span
-            className={`rounded-full px-2 py-0.5 ${
-              capability?.runtime_supported
-                ? isDark
-                  ? "bg-green-900/30 text-green-300"
-                  : "bg-green-50 text-green-700"
-                : isDark
-                  ? "bg-amber-900/30 text-amber-300"
-                  : "bg-amber-50 text-amber-700"
-            }`}
-            style={{ fontSize: 10 }}
-          >
-            {runtimeLabel}
-          </span>
-          <span
-            className={`rounded-full px-2 py-0.5 ${
-              capability?.wired_supported
-                ? isDark
-                  ? "bg-blue-900/30 text-blue-300"
-                  : "bg-blue-50 text-blue-700"
-                : isDark
-                  ? "bg-gray-800 text-gray-300"
-                  : "bg-gray-100 text-gray-600"
-            }`}
-            style={{ fontSize: 10 }}
-          >
-            {wiredLabel}
-          </span>
-        </div>
-      </div>
-      <div
-        className={`mt-1 ${isDark ? "text-gray-500" : "text-gray-500"}`}
-        style={{ fontSize: 11 }}
-      >
-        {capability?.runtime_reason ?? "未读取 runtime 能力"}
-      </div>
-      <div
-        className={`mt-0.5 ${isDark ? "text-gray-500" : "text-gray-500"}`}
-        style={{ fontSize: 11 }}
-      >
-        {capability?.wired_reason ?? "未读取 decode 接线状态"}
-      </div>
-    </div>
   );
 }
 

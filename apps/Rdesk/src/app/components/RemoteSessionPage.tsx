@@ -34,27 +34,33 @@ import {
 } from "../services/realtimeSessionService";
 import { withTauriWindow } from "../utils/tauriWindow";
 import { isTauriRuntime } from "../utils/runtime";
-import {
-  attachRenderHostSession,
-  bindRenderSurfaceSource,
-  detachRenderHostSession,
-  getRenderHostSnapshot,
-  type RenderHostSnapshot,
-} from "../services/renderHostService";
-import {
-  bindCurrentRenderWindowSurface,
-  closeRenderWindow,
-  createRenderSurface,
-  getCurrentRenderSurface,
-  getRenderWindowContext,
-  listRenderSurfaces,
-  listRenderWindows,
-  openRenderWindow,
-  openRenderSurfaceWindow,
-  selectCurrentRenderSurface,
-  type RenderSurfaceDescriptor,
-  type RenderWindowContext,
-} from "../services/renderWindowService";
+// DEPRECATED: Rendering services removed - now managed by mrd-service
+// import {
+//   attachRenderHostSession,
+//   bindRenderSurfaceSource,
+//   detachRenderHostSession,
+//   getRenderHostSnapshot,
+//   type RenderHostSnapshot,
+// } from "../services/renderHostService";
+// import {
+//   bindCurrentRenderWindowSurface,
+//   closeRenderWindow,
+//   createRenderSurface,
+//   getCurrentRenderSurface,
+//   getRenderWindowContext,
+//   listRenderSurfaces,
+//   listRenderWindows,
+//   openRenderWindow,
+//   openRenderSurfaceWindow,
+//   selectCurrentRenderSurface,
+//   type RenderSurfaceDescriptor,
+//   type RenderWindowContext,
+// } from "../services/renderWindowService";
+
+// Placeholder types for disabled rendering features
+type RenderHostSnapshot = null;
+type RenderWindowContext = never;
+type RenderSurfaceDescriptor = never;
 
 export function RemoteSessionPage() {
   const { id } = useParams();
@@ -68,17 +74,8 @@ export function RemoteSessionPage() {
   const [quality, setQuality] = useState(87);
   const [elapsed, setElapsed] = useState(0);
   const [isMaximized, setIsMaximized] = useState(false);
-  const [renderSnapshot, setRenderSnapshot] = useState<RenderHostSnapshot | null>(null);
-  const [renderWindows, setRenderWindows] = useState<RenderWindowContext[]>([]);
-  const [currentRenderWindowLabel, setCurrentRenderWindowLabel] = useState<string | null>(null);
-  const [currentRenderWindowCount, setCurrentRenderWindowCount] = useState<number | null>(null);
-  const [currentSurfaceId, setCurrentSurfaceId] = useState<string | null>(null);
-  const [currentWindowRole, setCurrentWindowRole] = useState<string | null>(null);
-  const [rendererAttached, setRendererAttached] = useState<boolean>(false);
-  const [renderSurfaces, setRenderSurfaces] = useState<RenderSurfaceDescriptor[]>([]);
-  const [selectedSessionSurfaceId, setSelectedSessionSurfaceId] = useState<string | null>(null);
-  const [newSurfaceName, setNewSurfaceName] = useState("");
-  const [selectedSourceId, setSelectedSourceId] = useState<string | null>(null);
+  // Rendering features disabled - now managed by mrd-service
+  const [renderFeaturesDisabled, setRenderFeaturesDisabled] = useState(true);
   const [nvdecProbe, setNvdecProbe] = useState<NvdecRuntimeProbe | null>(null);
   const [decodePolicy, setDecodePolicyState] = useState<DecodePolicyResponse | null>(null);
   const [webrtcHostSnapshot, setWebrtcHostSnapshot] = useState<WebrtcHostSnapshot | null>(null);
@@ -102,159 +99,42 @@ export function RemoteSessionPage() {
     });
   }, []);
 
-  useEffect(() => {
-    if (!id || !isTauriRuntime()) return;
+  // Render host attachment disabled - now managed by mrd-service internally
+  // useEffect(() => {
+  //   if (!id || !isTauriRuntime()) return;
+  //   ... rendering setup code ...
+  // }, [id]);
 
-    let active = true;
+  // WebRTC host snapshot disabled - using deprecated service
+  // useEffect(() => {
+  //   ... webrtc snapshot code ...
+  // }, [id]);
 
-    const refreshSnapshot = async () => {
-      const snapshot = await getRenderHostSnapshot(id);
-      if (active) {
-        setRenderSnapshot(snapshot);
-        setSelectedSourceId((current) => current ?? snapshot.available_source_ids[0] ?? null);
-      }
-    };
+  // Render surfaces disabled - now managed by mrd-service
+  // useEffect(() => {
+  //   ... surfaces setup code ...
+  // }, [id]);
 
-    void attachRenderHostSession(id)
-      .then(refreshSnapshot)
-      .catch(() => {});
+  // Render window context refresh disabled - functions no longer available
+  // useEffect(() => {
+  //   if (!isTauriRuntime()) return;
+  //   ... context refresh code ...
+  // }, []);
 
-    const timer = window.setInterval(() => {
-      void refreshSnapshot().catch(() => {});
-    }, 1000);
+  // NVDEC probe and decode policy refresh disabled - deprecated functions
+  // useEffect(() => {
+  //   ... nvdec probe refresh code ...
+  // }, []);
 
-    return () => {
-      active = false;
-      window.clearInterval(timer);
-      void detachRenderHostSession(id).catch(() => {});
-    };
-  }, [id]);
-
-  useEffect(() => {
-    if (!id || !isTauriRuntime()) return;
-
-    let active = true;
-
-    const refreshHostSnapshot = async () => {
-      const snapshot = await getWebrtcHostSnapshot(id);
-      if (active) setWebrtcHostSnapshot(snapshot);
-    };
-
-    void refreshHostSnapshot().catch(() => {});
-
-    const timer = window.setInterval(() => {
-      void refreshHostSnapshot().catch(() => {});
-    }, 1000);
-
-    return () => {
-      active = false;
-      window.clearInterval(timer);
-    };
-  }, [id]);
-
-  useEffect(() => {
-    if (!id || !isTauriRuntime()) return;
-
-    let active = true;
-
-    const refreshSurfaces = async () => {
-      const [surfaces, currentSurface] = await Promise.all([
-        listRenderSurfaces(id),
-        getCurrentRenderSurface(id),
-      ]);
-      if (!active) return;
-      setRenderSurfaces(surfaces);
-      setSelectedSessionSurfaceId(currentSurface ?? surfaces[0]?.surface_id ?? null);
-    };
-
-    void refreshSurfaces().catch(() => {});
-
-    const timer = window.setInterval(() => {
-      void refreshSurfaces().catch(() => {});
-    }, 2000);
-
-    return () => {
-      active = false;
-      window.clearInterval(timer);
-    };
-  }, [id]);
-
-  useEffect(() => {
-    if (!isTauriRuntime()) return;
-
-    let active = true;
-
-    const refreshContext = async () => {
-      const context = await getRenderWindowContext();
-      if (!active) return;
-      setCurrentRenderWindowLabel(context?.label ?? null);
-      setCurrentRenderWindowCount(context?.session_window_count ?? null);
-      setCurrentSurfaceId(context?.surface_id ?? null);
-      setCurrentWindowRole(context?.role ?? null);
-      setRendererAttached(context?.renderer_attached ?? false);
-    };
-
-    void refreshContext().catch(() => {});
-
-    return () => {
-      active = false;
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!isTauriRuntime()) return;
-
-    let active = true;
-
-    const refreshNvdecProbe = async () => {
-      const [probe, policy] = await Promise.all([
-        getNvdecRuntimeProbe(),
-        getDecodePolicy(),
-      ]);
-      if (!active) return;
-      setNvdecProbe(probe);
-      setDecodePolicyState(policy);
-    };
-
-    void refreshNvdecProbe().catch(() => {});
-
-    const timer = window.setInterval(() => {
-      void refreshNvdecProbe().catch(() => {});
-    }, 5000);
-
-    return () => {
-      active = false;
-      window.clearInterval(timer);
-    };
-  }, []);
-
-  const handleUpdateDecodePolicy = async (nextPolicy: DecoderPolicy) => {
-    if (!isTauriRuntime()) return;
-    const next = await setDecodePolicy(nextPolicy);
-    setDecodePolicyState(next);
+  const handleUpdateDecodePolicy = async (_nextPolicy: DecoderPolicy) => {
+    alert("Decode Policy 功能已迁移到 mrd-service。此功能暂时不可用。");
   };
 
-  useEffect(() => {
-    if (!id || !isTauriRuntime()) return;
-
-    let active = true;
-
-    const refreshWindows = async () => {
-      const windows = await listRenderWindows(id);
-      if (active) setRenderWindows(windows);
-    };
-
-    void refreshWindows().catch(() => {});
-
-    const timer = window.setInterval(() => {
-      void refreshWindows().catch(() => {});
-    }, 2000);
-
-    return () => {
-      active = false;
-      window.clearInterval(timer);
-    };
-  }, [id]);
+  // Render windows refresh disabled - functions no longer available
+  // useEffect(() => {
+  //   if (!id || !isTauriRuntime()) return;
+  //   ... windows refresh code ...
+  // }, [id]);
 
   const formatTime = (s: number) => {
     const m = Math.floor(s / 60);
@@ -267,63 +147,51 @@ export function RemoteSessionPage() {
     else navigate("/");
   };
 
+  // Rendering functions disabled - features now managed by mrd-service
   const handlePopOutWindow = async () => {
-    if (!id || !isTauriRuntime()) return;
-    await openRenderWindow(id);
-    setRenderWindows(await listRenderWindows(id));
+    alert("渲染窗口功能已迁移到 mrd-service。此功能暂时不可用。");
   };
 
   const handleOpenCurrentSurfaceWindow = async () => {
-    if (!id || !isTauriRuntime() || !currentSurfaceId) return;
-    await openRenderSurfaceWindow(id, currentSurfaceId);
-    setRenderWindows(await listRenderWindows(id));
+    alert("Surface 窗口功能已迁移到 mrd-service。此功能暂时不可用。");
   };
 
-  const handleCloseRenderWindow = async (label: string) => {
-    if (!id || !isTauriRuntime()) return;
-    await closeRenderWindow(label);
-    setRenderWindows(await listRenderWindows(id));
+  const handleCloseRenderWindow = async (_label: string) => {
+    alert("渲染窗口功能已迁移到 mrd-service。此功能暂时不可用。");
   };
 
   const handleCreateSurface = async () => {
-    if (!id || !isTauriRuntime()) return;
-    const surface = await createRenderSurface(id, newSurfaceName.trim() || undefined);
-    setNewSurfaceName("");
-    setRenderSurfaces(await listRenderSurfaces(id));
-    setSelectedSessionSurfaceId(surface.surface_id);
+    alert("Surface 创建功能已迁移到 mrd-service。此功能暂时不可用。");
   };
 
-  const handleSelectSurface = async (surfaceId: string) => {
-    if (!id || !isTauriRuntime()) return;
-    await selectCurrentRenderSurface(id, surfaceId);
-    setSelectedSessionSurfaceId(surfaceId);
-    setRenderSurfaces(await listRenderSurfaces(id));
+  const handleSelectSurface = async (_surfaceId: string) => {
+    // No-op for now
   };
 
   const handleOpenSelectedSurfaceWindow = async () => {
-    if (!id || !isTauriRuntime() || !selectedSessionSurfaceId) return;
-    await openRenderSurfaceWindow(id, selectedSessionSurfaceId);
-    setRenderWindows(await listRenderWindows(id));
+    alert("Surface 窗口功能已迁移到 mrd-service。此功能暂时不可用。");
   };
 
   const handleBindCurrentWindowSurface = async () => {
-    if (!isTauriRuntime() || !selectedSessionSurfaceId) return;
-    await bindCurrentRenderWindowSurface(selectedSessionSurfaceId);
-    const context = await getRenderWindowContext();
-    setCurrentSurfaceId(context?.surface_id ?? null);
-    setRendererAttached(context?.renderer_attached ?? false);
-    if (id) {
-      setRenderWindows(await listRenderWindows(id));
-      setRenderSurfaces(await listRenderSurfaces(id));
-      setRenderSnapshot(await getRenderHostSnapshot(id));
-    }
+    alert("Surface 绑定功能已迁移到 mrd-service。此功能暂时不可用。");
   };
 
   const handleBindSurfaceSource = async () => {
-    if (!id || !selectedSessionSurfaceId || !selectedSourceId) return;
-    await bindRenderSurfaceSource(id, selectedSessionSurfaceId, selectedSourceId);
-    setRenderSnapshot(await getRenderHostSnapshot(id));
+    alert("Source 绑定功能已迁移到 mrd-service。此功能暂时不可用。");
   };
+
+  // Placeholder values for disabled rendering features
+  const [newSurfaceName, setNewSurfaceName] = useState("");
+  const [selectedSourceId, setSelectedSourceId] = useState<string | null>(null);
+  const [selectedSessionSurfaceId, setSelectedSessionSurfaceId] = useState<string | null>(null);
+  const renderWindows: any[] = [];
+  const currentSurfaceId = null;
+  const rendererAttached = false;
+  const currentRenderWindowCount = 0;
+  const renderSurfaces: any[] = [];
+  const renderSnapshot: null = null;
+  const currentRenderWindowLabel: null = null;
+  const currentWindowRole: null = null;
 
   const handleTauriDragStart = (event: React.MouseEvent<HTMLDivElement>) => {
     if (event.button !== 0) return;

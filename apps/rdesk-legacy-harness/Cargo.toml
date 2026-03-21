@@ -39,7 +39,10 @@ webrtc = "0.12"
 winapi = { version = "0.3", features = ["sysinfoapi", "minwindef"] }
 
 [dev-dependencies]
+axum = { workspace = true, features = ["ws"] }
 base64 = "0.22"
+futures-util = "0.3"
 openh264 = "0.8"
 rustls = "0.23.5"
+tokio-tungstenite = "0.24"
 

@@ -1,67 +1,27 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 
-const invokeMock = vi.fn();
+describe("renderHostService (DEPRECATED)", () => {
+  it("attachRenderHostSession throws deprecation error", async () => {
+    const { attachRenderHostSession } = await import("./renderHostService");
 
-vi.mock("@tauri-apps/api/tauri", () => ({
-  invoke: invokeMock,
-}));
-
-describe("renderHostService", () => {
-  beforeEach(() => {
-    invokeMock.mockReset();
+    await expect(attachRenderHostSession("session-1")).rejects.toThrow("render_host_attach_session 命令已移除");
   });
 
-  it("attaches and detaches render host sessions via tauri invoke", async () => {
-    invokeMock.mockResolvedValue(undefined);
+  it("detachRenderHostSession throws deprecation error", async () => {
+    const { detachRenderHostSession } = await import("./renderHostService");
 
-    const { attachRenderHostSession, detachRenderHostSession } = await import("./renderHostService");
-
-    await attachRenderHostSession("session-1");
-    await detachRenderHostSession("session-1");
-
-    expect(invokeMock).toHaveBeenNthCalledWith(1, "render_host_attach_session", {
-      sessionId: "session-1",
-    });
-    expect(invokeMock).toHaveBeenNthCalledWith(2, "render_host_detach_session", {
-      sessionId: "session-1",
-    });
+    await expect(detachRenderHostSession("session-1")).rejects.toThrow("render_host_detach_session 命令已移除");
   });
 
-  it("reads render host snapshots via tauri invoke", async () => {
-    invokeMock.mockResolvedValue({
-      attached: true,
-      surface_count: 2,
-      attached_surface_ids: ["surface-1", "surface-2"],
-      frame: {
-        frame_count: 1,
-        width: 1280,
-        height: 720,
-        pixel_format: "Rgb24",
-        bytes: 2764800,
-      },
-      preview_data_url: "data:image/png;base64,abc123",
-      renderer_backend: "d3d11",
-      renderer_snapshot: {
-        attached_to_target: true,
-        uploaded_frame_count: 1,
-        last_width: 1280,
-        last_height: 720,
-        last_pixel_format: "Rgb24",
-      },
-    });
-
+  it("getRenderHostSnapshot throws deprecation error", async () => {
     const { getRenderHostSnapshot } = await import("./renderHostService");
-    const snapshot = await getRenderHostSnapshot("session-2");
 
-    expect(invokeMock).toHaveBeenCalledWith("render_host_snapshot", {
-      sessionId: "session-2",
-    });
-    expect(snapshot.attached).toBe(true);
-    expect(snapshot.surface_count).toBe(2);
-    expect(snapshot.attached_surface_ids).toEqual(["surface-1", "surface-2"]);
-    expect(snapshot.frame?.width).toBe(1280);
-    expect(snapshot.preview_data_url).toBe("data:image/png;base64,abc123");
-    expect(snapshot.renderer_backend).toBe("d3d11");
-    expect(snapshot.renderer_snapshot?.uploaded_frame_count).toBe(1);
+    await expect(getRenderHostSnapshot("session-2")).rejects.toThrow("render_host_snapshot 命令已移除");
+  });
+
+  it("bindRenderSurfaceSource throws deprecation error", async () => {
+    const { bindRenderSurfaceSource } = await import("./renderHostService");
+
+    await expect(bindRenderSurfaceSource("session-1", "surface-1", "source-1")).rejects.toThrow("bind_render_surface_source 命令已移除");
   });
 });
