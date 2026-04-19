@@ -2,7 +2,7 @@
  * Canonical Tauri mock for all tests
  *
  * This is the single source of truth for mocking Tauri commands in tests.
- * Page tests should NOT mock @tauri-apps/api/tauri directly.
+ * Page tests should NOT mock @tauri-apps/api/core directly.
  *
  * Usage:
  *   import { mockInvoke } from '@/test/mocks/tauri';
@@ -43,7 +43,11 @@ export const mockTauriCommand = (
   });
 };
 
-// Setup mock for @tauri-apps/api/tauri
+// Setup mock for Tauri v2 (@tauri-apps/api/core) and v1 (@tauri-apps/api/tauri)
+vi.mock('@tauri-apps/api/core', () => ({
+  invoke: mockInvokeFn,
+}));
+
 vi.mock('@tauri-apps/api/tauri', () => ({
   invoke: mockInvokeFn,
 }));

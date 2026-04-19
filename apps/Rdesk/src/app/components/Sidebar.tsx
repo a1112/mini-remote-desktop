@@ -44,10 +44,12 @@ interface SidebarProps {
 const navItems = [
   { to: "/", label: "控制中心", icon: LayoutDashboard, end: true },
   { to: "/devices", label: "我的设备", icon: Monitor },
+  { to: "/test", label: "测试工作台", icon: Terminal },
 ];
 
 const iconMap: Record<string, typeof Monitor> = {
   Monitor,
+  Terminal,
   Laptop,
   Server,
   Smartphone,

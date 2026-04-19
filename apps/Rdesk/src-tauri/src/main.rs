@@ -6,6 +6,8 @@ mod ipc_client;
 mod service_manager;
 mod device_info;
 mod render_window_registry;
+mod test_harness;
+mod test_orchestrator;
 
 use app_settings::{
     default_settings_path, load_settings, save_settings, AppSettings, DecodePolicy,
@@ -16,13 +18,17 @@ use mrd_proto::DeviceId;
 use render_window_registry::RenderWindowContext;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tauri::Manager;
+use tauri::{Manager, menu::{Menu, MenuItem}};
 
 #[derive(Clone)]
 struct AppState {
     settings_path: std::path::PathBuf,
     // Service lifecycle manager - controls mrd-service
     service_manager: std::sync::Arc<std::sync::Mutex<service_manager::ServiceManager>>,
+    // Test harness for end-to-end pipeline visualization
+    test_harness: std::sync::Arc<std::sync::Mutex<test_harness::TestHarness>>,
+    // Test orchestrator - unified test execution and management
+    test_orchestrator: std::sync::Arc<test_orchestrator::TestOrchestrator>,
 }
 
 /// 设备注册响应
@@ -531,6 +537,206 @@ async fn set_decode_policy_with(
     })
 }
 
+// ============================================================================
+// Test harness commands - end-to-end pipeline visualization
+// ============================================================================
+
+#[tauri::command]
+fn test_harness_start(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.test_harness.lock().unwrap().start().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn test_harness_stop(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.test_harness.lock().unwrap().stop().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn test_harness_set_chain(state: tauri::State<'_, AppState>, chain: String) -> Result<(), String> {
+    use test_harness::TestChain;
+    let parsed = match chain.as_str() {
+        "nvenc_nvdec" => TestChain::NvencNvdec,
+        "nvenc_only" => TestChain::NvencOnly,
+        "openh264" => TestChain::OpenH264,
+        _ => return Err(format!("未知的测试链路: {}", chain)),
+    };
+    state.test_harness.lock().unwrap().set_chain(parsed);
+    Ok(())
+}
+
+// TODO: Add test_harness_set_matrix command for custom configurations
+// #[tauri::command]
+// fn test_harness_set_matrix(
+//     state: tauri::State<'_, AppState>,
+//     config: test_harness::MatrixConfig,
+// ) -> Result<(), String> {
+//     let chain = test_harness::TestChain::Custom {
+//         capture: config.capture,
+//         encoder: config.encoder,
+//         decoder: config.decoder,
+//     };
+//     state.test_harness.lock().unwrap().set_chain(chain);
+//     Ok(())
+// }
+
+#[tauri::command]
+fn test_harness_get_chain(state: tauri::State<'_, AppState>) -> String {
+    use test_harness::TestChain;
+    match state.test_harness.lock().unwrap().get_chain() {
+        TestChain::NvencNvdec => "nvenc_nvdec".to_string(),
+        TestChain::NvencOnly => "nvenc_only".to_string(),
+        TestChain::OpenH264 => "openh264".to_string(),
+        TestChain::Custom { .. } => "custom".to_string(),
+    }
+}
+
+#[tauri::command]
+fn test_harness_get_metrics(state: tauri::State<'_, AppState>) -> test_harness::HarnessMetrics {
+    state.test_harness.lock().unwrap().get_metrics()
+}
+
+#[tauri::command]
+fn test_harness_get_frames(state: tauri::State<'_, AppState>) -> (
+    Option<(String, usize, usize)>,
+    Option<(String, usize, usize)>,
+) {
+    let (captured, rendered) = state.test_harness.lock().unwrap().get_latest_frames();
+
+    let captured_base64 = captured.and_then(|(data, width, height)| {
+        encode_bgra_png_base64(&data, width, height).map(|png| (png, width, height))
+    });
+
+    let rendered_base64 = rendered.and_then(|(data, width, height)| {
+        encode_bgra_png_base64(&data, width, height).map(|png| (png, width, height))
+    });
+
+    (captured_base64, rendered_base64)
+}
+
+fn encode_bgra_png_base64(bgra: &[u8], width: usize, height: usize) -> Option<String> {
+    use base64::Engine;
+
+    let rgba = convert_bgra_to_rgba(bgra);
+    let image = image::RgbaImage::from_raw(width as u32, height as u32, rgba)?;
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image)
+        .write_to(&mut png, image::ImageFormat::Png)
+        .ok()?;
+    Some(base64::engine::general_purpose::STANDARD.encode(png.into_inner()))
+}
+
+fn convert_bgra_to_rgba(bgra: &[u8]) -> Vec<u8> {
+    bgra.chunks_exact(4)
+        .flat_map(|chunk| [chunk[2], chunk[1], chunk[0], chunk[3]])
+        .collect()
+}
+
+// ============================================================================
+// Test Workbench Commands (New Unified Test API)
+// ============================================================================
+
+/// List all available test scenarios
+#[tauri::command]
+fn test_list_scenarios(state: tauri::State<'_, AppState>) -> Vec<test_orchestrator::TestScenario> {
+    state.test_orchestrator.list_scenarios()
+}
+
+/// Get environment capabilities
+#[tauri::command]
+fn test_get_capabilities(state: tauri::State<'_, AppState>) -> Result<test_orchestrator::EnvironmentSnapshot, String> {
+    state.test_orchestrator.get_capabilities().map_err(|e| e.to_string())
+}
+
+/// Start a test run
+#[tauri::command]
+fn test_start_run(
+    state: tauri::State<'_, AppState>,
+    scenario_id: String,
+    config: test_orchestrator::TestConfigData,
+) -> Result<String, String> {
+    state.test_orchestrator.start_run(scenario_id, config)
+        .map_err(|e| e.to_string())
+}
+
+/// Stop a test run
+#[tauri::command]
+fn test_stop_run(state: tauri::State<'_, AppState>, run_id: String) -> Result<(), String> {
+    state.test_orchestrator.stop_run(&run_id)
+        .map_err(|e| e.to_string())
+}
+
+/// List test runs
+#[tauri::command]
+fn test_list_runs(
+    state: tauri::State<'_, AppState>,
+    scenario_id: Option<String>,
+    status: Option<String>,
+    limit: Option<usize>,
+) -> Vec<test_orchestrator::TestRun> {
+    state.test_orchestrator.list_runs(scenario_id, status, limit)
+}
+
+/// Get a test run
+#[tauri::command]
+fn test_get_run(
+    state: tauri::State<'_, AppState>,
+    run_id: String,
+) -> Option<test_orchestrator::TestRun> {
+    state.test_orchestrator.get_run(&run_id)
+}
+
+/// Get run events
+#[tauri::command]
+fn test_get_run_events(
+    state: tauri::State<'_, AppState>,
+    run_id: String,
+) -> Vec<test_orchestrator::TestStageEvent> {
+    state.test_orchestrator.get_run_events(&run_id)
+}
+
+/// Get run metrics
+#[tauri::command]
+fn test_get_run_metrics(
+    state: tauri::State<'_, AppState>,
+    run_id: String,
+) -> std::collections::HashMap<String, test_orchestrator::MetricSeries> {
+    state.test_orchestrator.get_run_metrics(&run_id)
+}
+
+/// Get run artifacts
+#[tauri::command]
+fn test_get_run_artifacts(
+    state: tauri::State<'_, AppState>,
+    run_id: String,
+) -> Vec<test_orchestrator::Artifact> {
+    state.test_orchestrator.get_run_artifacts(&run_id)
+}
+
+/// List test presets
+#[tauri::command]
+fn test_list_presets(state: tauri::State<'_, AppState>) -> Vec<test_orchestrator::TestPreset> {
+    state.test_orchestrator.list_presets()
+}
+
+/// Save a test preset
+#[tauri::command]
+fn test_save_preset(
+    state: tauri::State<'_, AppState>,
+    name: String,
+    description: String,
+    scenario_id: String,
+    config: test_orchestrator::TestConfigData,
+) -> String {
+    state.test_orchestrator.save_preset(name, description, scenario_id, config)
+}
+
+/// Delete a test preset
+#[tauri::command]
+fn test_delete_preset(state: tauri::State<'_, AppState>, preset_id: String) -> Result<(), String> {
+    state.test_orchestrator.delete_preset(&preset_id)
+        .map_err(|e| e.to_string())
+}
+
 fn main() {
     let settings_path = default_settings_path();
     let settings = load_settings(&settings_path).unwrap_or_else(|error| {
@@ -544,11 +750,126 @@ fn main() {
             .expect("failed to create ServiceManager")
     ));
 
+    // Create test harness for end-to-end pipeline visualization
+    let test_harness = std::sync::Arc::new(std::sync::Mutex::new(
+        test_harness::TestHarness::new()
+            .expect("failed to create TestHarness")
+    ));
+
+    // Create test orchestrator
+    let test_orchestrator = std::sync::Arc::new(test_orchestrator::TestOrchestrator::new(test_harness.clone()));
+
+    // Build the app
     tauri::Builder::default()
         .manage(AppState {
             settings_path,
             service_manager,
+            test_harness,
+            test_orchestrator,
         })
+        .setup(|app| {
+            // Step 1: Create system tray (before service startup)
+            let show_item = MenuItem::with_id(app, "show", "显示窗口", true, None::<&str>)?;
+            let hide_item = MenuItem::with_id(app, "hide", "隐藏窗口", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+            let items: Vec<&dyn tauri::menu::IsMenuItem<_>> = vec![&show_item, &hide_item, &quit_item];
+            let menu = Menu::with_items(app, &items)?;
+
+            // Load tray icon from embedded PNG data
+            let icon_bytes = include_bytes!("../icons/tray-icon.png");
+            let icon = tauri::image::Image::new_owned(icon_bytes.to_vec(), 32, 32);
+
+            let _tray = tauri::tray::TrayIconBuilder::new()
+                .icon(icon)
+                .menu(&menu)
+                .on_menu_event(move |app, event| {
+                    let main_window = app.get_webview_window("main").unwrap();
+                    match event.id().0.as_str() {
+                        "show" => {
+                            let _ = main_window.show();
+                            let _ = main_window.set_focus();
+                        }
+                        "hide" => {
+                            let _ = main_window.hide();
+                        }
+                        "quit" => {
+                            // Trigger full cleanup via window close
+                            let _ = main_window.close();
+                        }
+                        _ => {}
+                    }
+                })
+                .build(app)?;
+
+            // Step 2: Auto-start mrd-service on application launch
+            let service_mgr = app.state::<AppState>().service_manager.clone();
+            let _app_handle = app.handle().clone();
+
+            // Spawn a blocking task for service startup
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async move {
+                    // Start mrd-service
+                    if let Err(e) = service_mgr.lock().unwrap().start().await {
+                        eprintln!("Failed to auto-start mrd-service: {}", e);
+                        return;
+                    }
+
+                    // Wait for service to be healthy (max 30 seconds)
+                    if let Err(e) = service_mgr.lock().unwrap().wait_for_healthy(30).await {
+                        eprintln!("mrd-service health check failed: {}", e);
+                    } else {
+                        println!("mrd-service is ready");
+                    }
+                });
+            });
+
+            // Step 3: Set up window close event listener for cleanup
+            // Close flow: Stop sessions → Stop service → Cleanup tray → Exit
+            let main_window = app.get_webview_window("main").unwrap();
+            let service_mgr_for_close = app.state::<AppState>().service_manager.clone();
+            let app_handle_for_close = app.handle().clone();
+
+            main_window.on_window_event(move |event| {
+                if let tauri::WindowEvent::CloseRequested { .. } = event {
+                    // Intercept close request and perform full cleanup
+                    println!("Window close requested - performing cleanup...");
+
+                    let mgr = service_mgr_for_close.clone();
+                    let handle = app_handle_for_close.clone();
+
+                    // Spawn cleanup task
+                    std::thread::spawn(move || {
+                        let rt = tokio::runtime::Runtime::new().unwrap();
+                        rt.block_on(async move {
+                            // Stop all active sessions via IPC
+                            use mrd_ipc::{IpcRequest, IpcResponse};
+                            let mut client = mrd_ipc::client::IpcClient::new();
+                            if let Ok(IpcResponse::SessionList { sessions }) =
+                                client.send_request(IpcRequest::ListSessions).await
+                            {
+                                for session_info in sessions {
+                                    let _ = client.send_request(IpcRequest::StopSession {
+                                        session_id: session_info.session_id,
+                                    }).await;
+                                }
+                            }
+
+                            // Stop mrd-service
+                            let _ = mgr.lock().unwrap().stop().await;
+
+                            // Exit the application (tray will be cleaned up automatically)
+                            handle.exit(0);
+                        });
+                    });
+                }
+            });
+
+            Ok(())
+        })
+        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init())
         .invoke_handler(tauri::generate_handler![
             // Hardware and decode policy (local-only)
             get_hardware_info,
@@ -581,6 +902,26 @@ fn main() {
             register_device,
             check_device_registration,
             webrtc_session_list_via_ipc,
+            // Test harness commands
+            test_harness_start,
+            test_harness_stop,
+            test_harness_set_chain,
+            test_harness_get_chain,
+            test_harness_get_metrics,
+            test_harness_get_frames,
+            // Test Workbench commands (new unified test API)
+            test_list_scenarios,
+            test_get_capabilities,
+            test_start_run,
+            test_stop_run,
+            test_list_runs,
+            test_get_run,
+            test_get_run_events,
+            test_get_run_metrics,
+            test_get_run_artifacts,
+            test_list_presets,
+            test_save_preset,
+            test_delete_preset,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

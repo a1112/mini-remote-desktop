@@ -8,38 +8,33 @@ export type TauriWindowLike = {
 
 const getTauriWindow = async (): Promise<TauriWindowLike | null> => {
   if (typeof window === "undefined") return null;
-  const w = window as any;
-  const tauri = w.__TAURI__;
-  if (tauri?.webviewWindow?.getCurrentWebviewWindow) {
-    return tauri.webviewWindow.getCurrentWebviewWindow();
-  }
-  if (tauri?.window?.getCurrentWindow) {
-    return tauri.window.getCurrentWindow();
-  }
-
-  const internals = w.__TAURI_INTERNALS__;
-  const currentLabel = internals?.metadata?.currentWindow?.label;
-  if (internals?.invoke && currentLabel) {
-    const invokeWindow = (command: string) =>
-      internals.invoke(`plugin:window|${command}`, { label: currentLabel });
-    return {
-      startDragging: () => invokeWindow("start_dragging"),
-      minimize: () => invokeWindow("minimize"),
-      toggleMaximize: () => invokeWindow("toggle_maximize"),
-      isMaximized: () => invokeWindow("is_maximized"),
-      close: () => invokeWindow("close"),
-    };
-  }
 
   try {
-    const mod = await import("@tauri-apps/api/window");
-    if ((mod as any)?.appWindow) return (mod as any).appWindow as TauriWindowLike;
-    if (typeof (mod as any)?.getCurrent === "function") {
-      return (mod as any).getCurrent() as TauriWindowLike;
+    // Tauri v2: @tauri-apps/api/webviewWindow
+    const mod = await import("@tauri-apps/api/webviewWindow");
+    // v2.10+ uses WebviewWindow.getCurrent() class method
+    if ((mod as any)?.WebviewWindow?.getCurrent) {
+      return (mod as any).WebviewWindow.getCurrent() as TauriWindowLike;
+    }
+    // v2.0-2.9 fallback
+    if (typeof (mod as any)?.getCurrentWebviewWindow === "function") {
+      return (mod as any).getCurrentWebviewWindow() as TauriWindowLike;
     }
   } catch {
     // Ignore missing API when not running in Tauri.
   }
+
+  const w = window as any;
+  const tauri = w.__TAURI__;
+  // Tauri v2: webviewWindow API (global)
+  if (tauri?.webviewWindow?.WebviewWindow?.getCurrent) {
+    return tauri.webviewWindow.WebviewWindow.getCurrent();
+  }
+  // Fallback for older v2 versions
+  if (tauri?.webviewWindow?.getCurrentWebviewWindow) {
+    return tauri.webviewWindow.getCurrentWebviewWindow();
+  }
+
   return null;
 };
 

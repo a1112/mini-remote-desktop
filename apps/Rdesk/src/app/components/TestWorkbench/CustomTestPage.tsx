@@ -1,0 +1,395 @@
+import { useState } from "react";
+import { useNavigate } from "react-router";
+import { Play, Settings, Monitor, Cpu, Zap } from "lucide-react";
+import * as commands from "../../adapters/tauri/commands";
+import type { TestConfig } from "../../adapters/tauri/types";
+
+type CaptureId = NonNullable<TestConfig["capture_type"]>;
+type EncoderId = NonNullable<TestConfig["encoder_type"]>;
+type DecoderId = NonNullable<TestConfig["decoder_type"]>;
+
+interface CaptureOption {
+  id: CaptureId;
+  name: string;
+  description: string;
+  icon: React.ReactNode;
+}
+
+interface EncoderOption {
+  id: EncoderId;
+  name: string;
+  description: string;
+  icon: React.ReactNode;
+}
+
+interface DecoderOption {
+  id: DecoderId;
+  name: string;
+  description: string;
+}
+
+const CAPTURE_OPTIONS: CaptureOption[] = [
+  {
+    id: "dxgi",
+    name: "DXGI",
+    description: "DirectX Graphics Infrastructure - 高性能桌面捕获",
+    icon: <Monitor className="h-5 w-5" />,
+  },
+  {
+    id: "winrt",
+    name: "WinRT",
+    description: "Windows Runtime - 现代化屏幕捕获 API",
+    icon: <Monitor className="h-5 w-5" />,
+  },
+];
+
+const ENCODER_OPTIONS: EncoderOption[] = [
+  {
+    id: "nvenc_h264",
+    name: "NVENC H.264",
+    description: "NVIDIA 硬件编码器 - 低延迟高质量",
+    icon: <Zap className="h-5 w-5" />,
+  },
+  {
+    id: "nvenc_av1",
+    name: "NVENC AV1",
+    description: "NVIDIA AV1 编码器 - 新一代压缩效率",
+    icon: <Zap className="h-5 w-5" />,
+  },
+  {
+    id: "openh264",
+    name: "OpenH264",
+    description: "软件编码器 - 跨平台兼容",
+    icon: <Cpu className="h-5 w-5" />,
+  },
+];
+
+const DECODER_OPTIONS: DecoderOption[] = [
+  {
+    id: "nvdec",
+    name: "NVDEC",
+    description: "NVIDIA 硬件解码器 - GPU 加速",
+  },
+  {
+    id: "software",
+    name: "软件解码",
+    description: "FFmpeg 软件解码 - CPU 解码",
+  },
+];
+
+const RESOLUTIONS = [
+  { id: "1280x720", name: "720p", width: 1280, height: 720 },
+  { id: "1920x1080", name: "1080p", width: 1920, height: 1080 },
+  { id: "2560x1440", name: "1440p", width: 2560, height: 1440 },
+  { id: "3840x2160", name: "4K", width: 3840, height: 2160 },
+];
+
+const FPS_OPTIONS = [30, 60, 120, 144];
+
+const BITRATE_OPTIONS = [
+  { id: "1000", name: "1 Mbps", value: 1000000 },
+  { id: "3000", name: "3 Mbps", value: 3000000 },
+  { id: "5000", name: "5 Mbps", value: 5000000 },
+  { id: "10000", name: "10 Mbps", value: 10000000 },
+  { id: "20000", name: "20 Mbps", value: 20000000 },
+];
+
+export function CustomTestPage() {
+  const navigate = useNavigate();
+  const [selectedCapture, setSelectedCapture] = useState<CaptureId>("dxgi");
+  const [selectedEncoder, setSelectedEncoder] = useState<EncoderId>("nvenc_h264");
+  const [selectedDecoder, setSelectedDecoder] = useState<DecoderId>("nvdec");
+  const [selectedResolution, setSelectedResolution] = useState("1920x1080");
+  const [selectedFps, setSelectedFps] = useState(60);
+  const [selectedBitrate, setSelectedBitrate] = useState("5000");
+  const [starting, setStarting] = useState(false);
+
+  const handleStart = async () => {
+    setStarting(true);
+
+    const config: TestConfig = {
+      capture_type: selectedCapture,
+      encoder_type: selectedEncoder,
+      decoder_type: selectedDecoder,
+      renderer_type: "d3d11",
+      resolution: (() => {
+        const resolution = RESOLUTIONS.find((r) => r.id === selectedResolution)!;
+        return [resolution.width, resolution.height] as [number, number];
+      })(),
+      fps: selectedFps,
+      bitrate: Number(selectedBitrate) * 1000,
+      duration_ms: 30000,
+      warmup_ms: 2000,
+    };
+
+    const result = await commands.testStartRun({
+      scenarioId: "custom",
+      config,
+    });
+
+    if (result.ok) {
+      navigate(`/test/run/${result.value}`);
+    }
+
+    setStarting(false);
+  };
+
+  const canStart = () => {
+    // Check for incompatible combinations
+    if (selectedEncoder === "nvenc_av1") {
+      return false; // AV1 not yet implemented
+    }
+    return true;
+  };
+
+  return (
+    <div className="p-6 max-w-4xl mx-auto">
+      {/* Header */}
+      <div className="mb-6">
+        <h1 className="text-2xl font-bold text-foreground">自由组合测试</h1>
+        <p className="text-muted-foreground">
+          自定义测试配置，自由组合管道组件
+        </p>
+      </div>
+
+      {/* Pipeline Visualization */}
+      <div className="bg-card rounded-lg border p-6 mb-6">
+        <h2 className="text-sm font-medium mb-4 flex items-center gap-2">
+          <Settings className="h-4 w-4" />
+          管道配置
+        </h2>
+        <div className="flex items-center justify-center gap-2 md:gap-4">
+          {/* Capture */}
+          <PipelineStage
+            label="捕获"
+            value={CAPTURE_OPTIONS.find((c) => c.id === selectedCapture)?.name || "-"}
+            icon={<Monitor className="h-5 w-5" />}
+          />
+          <Arrow />
+          {/* Encoder */}
+          <PipelineStage
+            label="编码"
+            value={ENCODER_OPTIONS.find((e) => e.id === selectedEncoder)?.name || "-"}
+            icon={
+              ENCODER_OPTIONS.find((e) => e.id === selectedEncoder)?.icon || <Zap className="h-5 w-5" />
+            }
+          />
+          <Arrow />
+          {/* Decoder */}
+          <PipelineStage
+            label="解码"
+            value={DECODER_OPTIONS.find((d) => d.id === selectedDecoder)?.name || "-"}
+            icon={<Cpu className="h-5 w-5" />}
+          />
+        </div>
+      </div>
+
+      {/* Component Selection */}
+      <div className="grid md:grid-cols-3 gap-6 mb-6">
+        {/* Capture Selection */}
+        <div className="bg-card rounded-lg border p-4">
+          <h3 className="font-medium mb-3">捕获源</h3>
+          <div className="space-y-2">
+            {CAPTURE_OPTIONS.map((option) => (
+              <label
+                key={option.id}
+                className={`flex items-start gap-3 p-3 rounded cursor-pointer border transition-colors ${
+                  selectedCapture === option.id
+                    ? "bg-primary/10 border-primary"
+                    : "bg-background hover:bg-muted"
+                }`}
+              >
+                <input
+                  type="radio"
+                  name="capture"
+                  value={option.id}
+                  checked={selectedCapture === option.id}
+                  onChange={(e) => setSelectedCapture(e.target.value as CaptureId)}
+                  className="mt-1"
+                />
+                <div className="flex-1">
+                  <div className="flex items-center gap-2 font-medium text-sm">
+                    {option.icon}
+                    {option.name}
+                  </div>
+                  <p className="text-xs text-muted-foreground mt-1">{option.description}</p>
+                </div>
+              </label>
+            ))}
+          </div>
+        </div>
+
+        {/* Encoder Selection */}
+        <div className="bg-card rounded-lg border p-4">
+          <h3 className="font-medium mb-3">编码器</h3>
+          <div className="space-y-2">
+            {ENCODER_OPTIONS.map((option) => (
+              <label
+                key={option.id}
+                className={`flex items-start gap-3 p-3 rounded cursor-pointer border transition-colors ${
+                  selectedEncoder === option.id
+                    ? "bg-primary/10 border-primary"
+                    : "bg-background hover:bg-muted"
+                } ${option.id === "nvenc_av1" ? "opacity-50" : ""}`}
+              >
+                <input
+                  type="radio"
+                  name="encoder"
+                  value={option.id}
+                  checked={selectedEncoder === option.id}
+                  onChange={(e) => setSelectedEncoder(e.target.value as EncoderId)}
+                  className="mt-1"
+                  disabled={option.id === "nvenc_av1"}
+                />
+                <div className="flex-1">
+                  <div className="flex items-center gap-2 font-medium text-sm">
+                    {option.icon}
+                    {option.name}
+                    {option.id === "nvenc_av1" && (
+                      <span className="text-xs bg-yellow-100 text-yellow-800 px-1 rounded">
+                        即将推出
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-xs text-muted-foreground mt-1">{option.description}</p>
+                </div>
+              </label>
+            ))}
+          </div>
+        </div>
+
+        {/* Decoder Selection */}
+        <div className="bg-card rounded-lg border p-4">
+          <h3 className="font-medium mb-3">解码器</h3>
+          <div className="space-y-2">
+            {DECODER_OPTIONS.map((option) => (
+              <label
+                key={option.id}
+                className={`flex items-start gap-3 p-3 rounded cursor-pointer border transition-colors ${
+                  selectedDecoder === option.id
+                    ? "bg-primary/10 border-primary"
+                    : "bg-background hover:bg-muted"
+                }`}
+              >
+                <input
+                  type="radio"
+                  name="decoder"
+                  value={option.id}
+                  checked={selectedDecoder === option.id}
+                  onChange={(e) => setSelectedDecoder(e.target.value as DecoderId)}
+                  className="mt-1"
+                />
+                <div className="flex-1">
+                  <div className="font-medium text-sm">{option.name}</div>
+                  <p className="text-xs text-muted-foreground mt-1">{option.description}</p>
+                </div>
+              </label>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* Parameters */}
+      <div className="bg-card rounded-lg border p-4 mb-6">
+        <h3 className="font-medium mb-4">参数设置</h3>
+        <div className="grid md:grid-cols-3 gap-4">
+          {/* Resolution */}
+          <div>
+            <label className="block text-sm font-medium mb-2">分辨率</label>
+            <select
+              value={selectedResolution}
+              onChange={(e) => setSelectedResolution(e.target.value)}
+              className="w-full px-3 py-2 border rounded bg-background"
+            >
+              {RESOLUTIONS.map((r) => (
+                <option key={r.id} value={r.id}>
+                  {r.name} ({r.width}x{r.height})
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {/* FPS */}
+          <div>
+            <label className="block text-sm font-medium mb-2">帧率</label>
+            <select
+              value={selectedFps}
+              onChange={(e) => setSelectedFps(Number(e.target.value))}
+              className="w-full px-3 py-2 border rounded bg-background"
+            >
+              {FPS_OPTIONS.map((fps) => (
+                <option key={fps} value={fps}>
+                  {fps} FPS
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {/* Bitrate */}
+          <div>
+            <label className="block text-sm font-medium mb-2">码率</label>
+            <select
+              value={selectedBitrate}
+              onChange={(e) => setSelectedBitrate(e.target.value)}
+              className="w-full px-3 py-2 border rounded bg-background"
+            >
+              {BITRATE_OPTIONS.map((b) => (
+                <option key={b.id} value={b.id}>
+                  {b.name}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+      </div>
+
+      {/* Start Button */}
+      <div className="flex justify-center">
+        <button
+          onClick={handleStart}
+          disabled={starting || !canStart()}
+          className="flex items-center gap-2 px-6 py-3 bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          <Play className="h-5 w-5" />
+          {starting ? "启动中..." : "启动测试"}
+        </button>
+      </div>
+
+      {!canStart() && (
+        <p className="text-center text-sm text-yellow-600 mt-4">
+          当前配置暂不支持（AV1 编码器即将推出）
+        </p>
+      )}
+    </div>
+  );
+}
+
+function PipelineStage({
+  label,
+  value,
+  icon,
+}: {
+  label: string;
+  value: string;
+  icon: React.ReactNode;
+}) {
+  return (
+    <div className="flex flex-col items-center">
+      <div className="bg-primary/10 p-3 rounded-lg border border-primary">
+        {icon}
+      </div>
+      <p className="text-xs text-muted-foreground mt-2">{label}</p>
+      <p className="font-medium text-sm">{value}</p>
+    </div>
+  );
+}
+
+function Arrow() {
+  return (
+    <div className="flex items-center justify-center text-muted-foreground">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+        <path d="M5 12h14M12 5l7 7-7 7" />
+      </svg>
+    </div>
+  );
+}

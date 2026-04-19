@@ -203,5 +203,6 @@ export const getRuntimeSnapshot = async (): Promise<RuntimeSnapshot> => {
  * Note: This command is not yet implemented in main.rs
  */
 export const getProbeSnapshot = async (sessionId: string): Promise<ProbeSnapshot> => {
+  void sessionId;
   throw new Error("Probe snapshot not yet available through IPC");
 };

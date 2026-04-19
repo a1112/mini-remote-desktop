@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use mrd_proto::SessionId;
 use serde::Serialize;
-use tauri::Manager;
+use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RenderWindowEntry {
@@ -41,7 +41,7 @@ impl RenderWindowRegistry {
         *next_id += 1;
 
         let url = format!("/session/{}", session_id.0);
-        tauri::WindowBuilder::new(app, label.clone(), tauri::WindowUrl::App(url.into()))
+        WebviewWindowBuilder::new(app, label.clone(), WebviewUrl::App(url.into()))
             .title(format!("Remote Session {}", session_id.0))
             .decorations(false)
             .resizable(true)
@@ -70,7 +70,7 @@ impl RenderWindowRegistry {
             .windows_by_session
             .entry(session_id.clone())
             .or_default();
-        entries.retain(|entry| app.get_window(&entry.label).is_some());
+        entries.retain(|entry| app.get_webview_window(&entry.label).is_some());
         let count = entries.len();
         entries
             .iter()
@@ -90,7 +90,7 @@ impl RenderWindowRegistry {
         app: &tauri::AppHandle<R>,
         label: &str,
     ) -> Result<(), String> {
-        if let Some(window) = app.get_window(label) {
+        if let Some(window) = app.get_webview_window(label) {
             let _ = window.close();
         }
 
@@ -108,7 +108,7 @@ impl RenderWindowRegistry {
         renderer_attached: bool,
     ) {
         for entries in self.windows_by_session.values_mut() {
-            entries.retain(|entry| app.get_window(&entry.label).is_some());
+            entries.retain(|entry| app.get_webview_window(&entry.label).is_some());
             if let Some(entry) = entries.iter_mut().find(|entry| entry.label == label) {
                 entry.renderer_attached = renderer_attached;
                 return;
@@ -122,7 +122,7 @@ impl RenderWindowRegistry {
         label: &str,
     ) -> Option<RenderWindowContext> {
         for (session_id, entries) in self.windows_by_session.iter_mut() {
-            entries.retain(|entry| app.get_window(&entry.label).is_some());
+            entries.retain(|entry| app.get_webview_window(&entry.label).is_some());
             if let Some(entry) = entries.iter().find(|entry| entry.label == label) {
                 return Some(RenderWindowContext {
                     label: label.to_string(),
@@ -145,7 +145,7 @@ impl RenderWindowRegistry {
         surface_id: String,
     ) -> Result<(SessionId, Option<String>), String> {
         for (session_id, entries) in self.windows_by_session.iter_mut() {
-            entries.retain(|entry| app.get_window(&entry.label).is_some());
+            entries.retain(|entry| app.get_webview_window(&entry.label).is_some());
             if let Some(entry) = entries.iter_mut().find(|entry| entry.label == label) {
                 let previous_surface_id =
                     (entry.surface_id != surface_id).then(|| entry.surface_id.clone());
@@ -167,7 +167,7 @@ impl RenderWindowRegistry {
             .windows_by_session
             .entry(session_id.clone())
             .or_default();
-        entries.retain(|entry| app.get_window(&entry.label).is_some());
+        entries.retain(|entry| app.get_webview_window(&entry.label).is_some());
         entries
             .iter()
             .filter(|entry| entry.surface_id == surface_id)

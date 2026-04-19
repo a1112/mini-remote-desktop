@@ -8,7 +8,7 @@
  * and the change will propagate to all frontend code.
  */
 
-import { invoke } from '@tauri-apps/api/tauri';
+import { invoke } from '@tauri-apps/api/core';
 import type {
   AdapterResult,
   DeviceInfo,
@@ -16,8 +16,18 @@ import type {
   DecodePolicy,
   DecodePolicyResponse,
   HardwareInfo,
-  ServicePidResponse,
   SessionRuntimeSnapshot,
+  HarnessMetrics,
+  FrameData,
+  // Test Workbench Types
+  TestScenario,
+  TestRun,
+  TestConfig,
+  TestStageEvent,
+  MetricSeries,
+  Artifact,
+  TestPreset,
+  EnvironmentSnapshot,
 } from './types';
 
 /**
@@ -296,4 +306,169 @@ export async function checkDeviceRegistration(
  */
 export async function webrtcSessionListViaIpc(): Promise<AdapterResult<string[]>> {
   return invokeAdapter<string[]>('webrtc_session_list_via_ipc');
+}
+
+// ============================================================================
+// Test Workbench Commands (New Unified Test API)
+// ============================================================================
+
+/**
+ * List all available test scenarios
+ */
+export async function testListScenarios(): Promise<AdapterResult<TestScenario[]>> {
+  return invokeAdapter<TestScenario[]>('test_list_scenarios');
+}
+
+/**
+ * Get current environment capabilities
+ */
+export async function testGetCapabilities(): Promise<AdapterResult<EnvironmentSnapshot>> {
+  return invokeAdapter<EnvironmentSnapshot>('test_get_capabilities');
+}
+
+/**
+ * Start a test run with specified scenario and config
+ */
+export async function testStartRun(params: {
+  scenarioId: string;
+  config: TestConfig;
+}): Promise<AdapterResult<string>> {
+  return invokeAdapter<string>('test_start_run', {
+    scenarioId: params.scenarioId,
+    config: params.config,
+  });
+}
+
+/**
+ * Stop a running test
+ */
+export async function testStopRun(runId: string): Promise<AdapterResult<void>> {
+  return invokeAdapter<void>('test_stop_run', { runId });
+}
+
+/**
+ * List all test runs (with optional filters)
+ */
+export async function testListRuns(params?: {
+  scenarioId?: string;
+  status?: string;
+  limit?: number;
+}): Promise<AdapterResult<TestRun[]>> {
+  return invokeAdapter<TestRun[]>('test_list_runs', params);
+}
+
+/**
+ * Get details of a specific test run
+ */
+export async function testGetRun(runId: string): Promise<AdapterResult<TestRun | null>> {
+  return invokeAdapter<TestRun | null>('test_get_run', { runId });
+}
+
+/**
+ * Get metrics for a specific test run
+ */
+export async function testGetRunMetrics(runId: string): Promise<AdapterResult<Record<string, MetricSeries>>> {
+  return invokeAdapter<Record<string, MetricSeries>>('test_get_run_metrics', { runId });
+}
+
+/**
+ * Get stage events for a specific test run
+ */
+export async function testGetRunEvents(runId: string): Promise<AdapterResult<TestStageEvent[]>> {
+  return invokeAdapter<TestStageEvent[]>('test_get_run_events', { runId });
+}
+
+/**
+ * Get artifacts for a specific test run
+ */
+export async function testGetRunArtifacts(runId: string): Promise<AdapterResult<Artifact[]>> {
+  return invokeAdapter<Artifact[]>('test_get_run_artifacts', { runId });
+}
+
+/**
+ * List all test presets
+ */
+export async function testListPresets(): Promise<AdapterResult<TestPreset[]>> {
+  return invokeAdapter<TestPreset[]>('test_list_presets');
+}
+
+/**
+ * Save a new test preset
+ */
+export async function testSavePreset(params: {
+  name: string;
+  description: string;
+  scenarioId: string;
+  config: TestConfig;
+}): Promise<AdapterResult<string>> {
+  return invokeAdapter<string>('test_save_preset', {
+    name: params.name,
+    description: params.description,
+    scenarioId: params.scenarioId,
+    config: params.config,
+  });
+}
+
+/**
+ * Delete a test preset
+ */
+export async function testDeletePreset(presetId: string): Promise<AdapterResult<void>> {
+  return invokeAdapter<void>('test_delete_preset', { presetId });
+}
+
+// ============================================================================
+// Legacy Test Harness Commands (for backward compatibility)
+// ============================================================================
+
+/**
+ * Start the test harness
+ */
+export async function testHarnessStart(chain?: string): Promise<AdapterResult<null>> {
+  if (chain) {
+    const setChainResult = await testHarnessSetChain(chain);
+    if (!setChainResult.ok) {
+      return setChainResult;
+    }
+  }
+
+  return invokeAdapter<null>('test_harness_start');
+}
+
+/**
+ * Stop the test harness
+ */
+export async function testHarnessStop(): Promise<AdapterResult<null>> {
+  return invokeAdapter<null>('test_harness_stop');
+}
+
+/**
+ * Set the test chain configuration
+ */
+export async function testHarnessSetChain(chain: string): Promise<AdapterResult<null>> {
+  return invokeAdapter<null>('test_harness_set_chain', { chain });
+}
+
+/**
+ * Get the current test chain configuration
+ */
+export async function testHarnessGetChain(): Promise<AdapterResult<string>> {
+  return invokeAdapter<string>('test_harness_get_chain');
+}
+
+/**
+ * Get current test harness metrics
+ */
+export async function testHarnessGetMetrics(): Promise<AdapterResult<HarnessMetrics>> {
+  return invokeAdapter<HarnessMetrics>('test_harness_get_metrics');
+}
+
+/**
+ * Get latest captured and rendered frames as base64
+ */
+export async function testHarnessGetFrames(): Promise<
+  AdapterResult<[FrameData | null, FrameData | null]>
+> {
+  return invokeAdapter<[FrameData | null, FrameData | null]>(
+    'test_harness_get_frames'
+  );
 }
