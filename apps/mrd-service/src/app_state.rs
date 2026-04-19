@@ -121,6 +121,8 @@ mod tests {
             remote_cert_der_b64: None,
             lifecycle_state: "created".to_string(),
             last_error: None,
+            sender_active: false,
+            receiver_active: false,
         };
 
         registry.insert(session_id.clone(), snapshot);

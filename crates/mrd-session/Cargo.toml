@@ -7,3 +7,4 @@ license.workspace = true
 [dependencies]
 mrd-proto = { path = "../mrd-proto" }
 serde.workspace = true
+tokio.workspace = true

@@ -2,6 +2,9 @@ use mrd_render::{
     d3d11_descriptor, BoxedRenderer, RenderError, RenderFrame, RenderPixelFormat, RenderTarget,
     RendererDescriptor, RendererFactory, RendererInstance, RendererSnapshot,
 };
+
+pub mod simd;
+
 #[cfg(windows)]
 use windows::core::ComInterface;
 
@@ -173,7 +176,17 @@ impl D3d11Renderer {
 
     #[cfg(windows)]
     fn average_clear_color(frame: &RenderFrame) -> [f32; 4] {
-        if frame.data.is_empty() {
+        use mrd_render::RenderFrameData;
+        let data = match &frame.data {
+            RenderFrameData::Rgb24(data) => data,
+            RenderFrameData::Bgra32(data) => data,
+            #[cfg(windows)]
+            RenderFrameData::D3D11SharedNv12 { .. } => {
+                return [0.05, 0.05, 0.05, 1.0];
+            }
+        };
+
+        if data.is_empty() {
             return [0.05, 0.05, 0.05, 1.0];
         }
 
@@ -182,7 +195,7 @@ impl D3d11Renderer {
         let mut b: u64 = 0;
         let mut pixels: u64 = 0;
 
-        for chunk in frame.data.chunks_exact(3) {
+        for chunk in data.chunks_exact(3) {
             r += chunk[0] as u64;
             g += chunk[1] as u64;
             b += chunk[2] as u64;
@@ -223,26 +236,77 @@ impl D3d11Renderer {
     }
 
     #[cfg(windows)]
+    fn present_uploaded_frame_bgra(&self, frame: &RenderFrame) -> Result<(), RenderError> {
+        use mrd_render::RenderFrameData;
+        let Some(surface) = self.surface.as_ref() else {
+            return Ok(());
+        };
+
+        let data = match &frame.data {
+            RenderFrameData::Bgra32(data) => data,
+            _ => return Err(RenderError::Message("Expected Bgra32 frame data".into())),
+        };
+
+        let expected = frame
+            .width
+            .checked_mul(frame.height)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| RenderError::Message("frame size overflow".into()))?;
+        if data.len() != expected {
+            return Err(RenderError::Message(format!(
+                "Bgra32 frame bytes mismatch: expected {expected}, got {}",
+                data.len()
+            )));
+        }
+
+        let row_pitch = frame
+            .width
+            .checked_mul(4)
+            .ok_or_else(|| RenderError::Message("row pitch overflow".into()))?
+            as u32;
+
+        unsafe {
+            self.context.UpdateSubresource(
+                &surface.back_buffer,
+                0,
+                None,
+                data.as_ptr() as *const core::ffi::c_void,
+                row_pitch,
+                0,
+            );
+            self.context
+                .OMSetRenderTargets(Some(&[Some(surface.render_target_view.clone())]), None);
+            surface
+                .swap_chain
+                .Present(1, 0)
+                .ok()
+                .map_err(|error| RenderError::Message(format!("present 失败: {error}")))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
     fn rgb24_to_bgra(frame: &RenderFrame) -> Result<Vec<u8>, RenderError> {
+        use mrd_render::RenderFrameData;
+        let data = match &frame.data {
+            RenderFrameData::Rgb24(data) => data,
+            _ => return Err(RenderError::Message("Expected Rgb24 frame data".into())),
+        };
+
         let expected = frame
             .width
             .checked_mul(frame.height)
             .and_then(|pixels| pixels.checked_mul(3))
             .ok_or_else(|| RenderError::Message("frame size overflow".into()))?;
-        if frame.data.len() != expected {
+        if data.len() != expected {
             return Err(RenderError::Message(format!(
                 "Rgb24 frame bytes mismatch: expected {expected}, got {}",
-                frame.data.len()
+                data.len()
             )));
         }
 
-        let mut bgra = Vec::with_capacity(frame.width * frame.height * 4);
-        for chunk in frame.data.chunks_exact(3) {
-            bgra.push(chunk[2]);
-            bgra.push(chunk[1]);
-            bgra.push(chunk[0]);
-            bgra.push(255);
-        }
+        let mut bgra = vec![0_u8; frame.width * frame.height * 4];
+        simd::rgb24_to_bgra(data, &mut bgra, frame.width, frame.height);
         Ok(bgra)
     }
 
@@ -278,6 +342,38 @@ impl D3d11Renderer {
         }
         Ok(())
     }
+
+    #[cfg(windows)]
+    fn present_shared_texture_frame(&self, frame: &RenderFrame) -> Result<(), RenderError> {
+        use mrd_render::RenderFrameData;
+
+        let Some(surface) = self.surface.as_ref() else {
+            return Ok(());
+        };
+
+        let _shared_handle = match &frame.data {
+            RenderFrameData::D3D11SharedNv12 { shared_handle, width, height } => {
+                eprintln!("Received shared texture frame: handle={}, width={}, height={}", shared_handle, width, height);
+                *shared_handle
+            }
+            _ => return Err(RenderError::Message("Expected D3D11SharedNv12 frame data".into())),
+        };
+
+        unsafe {
+            // TODO: Implement proper shared texture opening and rendering
+            // For now, verify we received the shared handle and use clear color
+            let clear = Self::average_clear_color(frame);
+            self.context.ClearRenderTargetView(&surface.render_target_view, &clear);
+            self.context
+                .OMSetRenderTargets(Some(&[Some(surface.render_target_view.clone())]), None);
+            surface
+                .swap_chain
+                .Present(1, 0)
+                .ok()
+                .map_err(|error| RenderError::Message(format!("present 失败: {error}")))?;
+        }
+        Ok(())
+    }
 }
 
 impl RendererInstance for D3d11Renderer {
@@ -296,17 +392,33 @@ impl RendererInstance for D3d11Renderer {
     }
 
     fn upload_frame(&mut self, frame: RenderFrame) -> Result<(), RenderError> {
-        if frame.pixel_format != RenderPixelFormat::Rgb24 {
-            return Err(RenderError::Message(
-                "d3d11 backend 当前只支持 Rgb24".into(),
-            ));
-        }
-
-        #[cfg(windows)]
-        if self.surface.is_some() {
-            self.present_uploaded_frame(&frame)?;
-        } else {
-            self.present_clear_frame(&frame)?;
+        use mrd_render::RenderFrameData;
+        match &frame.data {
+            RenderFrameData::Rgb24(_) => {
+                #[cfg(windows)]
+                if self.surface.is_some() {
+                    self.present_uploaded_frame(&frame)?;
+                } else {
+                    self.present_clear_frame(&frame)?;
+                }
+            }
+            RenderFrameData::Bgra32(_) => {
+                #[cfg(windows)]
+                if self.surface.is_some() {
+                    self.present_uploaded_frame_bgra(&frame)?;
+                } else {
+                    self.present_clear_frame(&frame)?;
+                }
+            }
+            #[cfg(windows)]
+            RenderFrameData::D3D11SharedNv12 { .. } => {
+                #[cfg(windows)]
+                if self.surface.is_some() {
+                    self.present_shared_texture_frame(&frame)?;
+                } else {
+                    self.present_clear_frame(&frame)?;
+                }
+            }
         }
 
         self.uploaded_frame_count += 1;
@@ -342,12 +454,7 @@ mod tests {
             .attach_target(RenderTarget::WindowHandle(0))
             .expect("attach target");
         renderer
-            .upload_frame(RenderFrame {
-                width: 16,
-                height: 16,
-                pixel_format: RenderPixelFormat::Rgb24,
-                data: vec![128; 16 * 16 * 3],
-            })
+            .upload_frame(RenderFrame::from_rgb24(16, 16, vec![128; 16 * 16 * 3]))
             .expect("upload frame");
 
         let snapshot = renderer.snapshot();

@@ -1,0 +1,23 @@
+[package]
+name = "integration-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "full_pipeline_test"
+path = "full_pipeline_test.rs"
+
+[[bin]]
+name = "resolution_test"
+path = "resolution_test.rs"
+
+[dependencies]
+mrd-pipeline-core = { path = "../../crates/mrd-pipeline-core" }
+mrd-encode-nvenc = { path = "../../crates/mrd-encode-nvenc" }
+mrd-encode-nvenc-av1 = { path = "../../crates/mrd-encode-nvenc-av1" }
+mrd-decode-nvdec = { path = "../../crates/mrd-decode-nvdec" }
+mrd-decode = { path = "../../crates/mrd-decode" }
+mrd-transport-quic-quinn = { path = "../../crates/mrd-transport-quic-quinn" }
+mrd-capture-winrt = { path = "../../crates/mrd-capture-winrt" }
+mrd-observability = { path = "../../crates/mrd-observability" }

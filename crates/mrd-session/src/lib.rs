@@ -5,6 +5,8 @@
 
 #![warn(missing_docs)]
 
+pub mod scheduler;
+
 use std::collections::HashMap;
 use mrd_proto::{BackendRole, DeviceId, SessionId};
 use serde::{Deserialize, Serialize};

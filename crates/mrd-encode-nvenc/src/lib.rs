@@ -13,7 +13,7 @@ mod imp {
     use nvenc::sys::enums::{NVencBufferFormat, NVencPicStruct, NVencPicType, NVencTuningInfo};
     use nvenc::sys::guids::{
         NV_ENC_CODEC_H264_GUID, NV_ENC_H264_PROFILE_BASELINE_GUID, NV_ENC_H264_PROFILE_HIGH_GUID,
-        NV_ENC_PRESET_P3_GUID,
+        NV_ENC_PRESET_P1_GUID, NV_ENC_PRESET_P3_GUID, NV_ENC_PRESET_P6_GUID,
     };
     use nvenc::sys::structs::Guid;
     use windows::Win32::Foundation::HMODULE;
@@ -51,6 +51,193 @@ mod imp {
             Self::new_with_profile(width, height, fps, NV_ENC_H264_PROFILE_BASELINE_GUID)
         }
 
+        /// Ultra-low latency encoder for remote desktop scenarios
+        /// Uses UltraLowLatency tuning and P6 preset for minimum latency
+        pub fn new_ultra_low_latency(
+            width: usize,
+            height: usize,
+            fps: u32,
+        ) -> Result<Self, PipelineError> {
+            Self::new_ultra_low_latency_internal(width, height, fps, NV_ENC_H264_PROFILE_HIGH_GUID)
+        }
+
+        /// High refresh rate encoder (120Hz+) optimized for minimum latency
+        /// Uses Baseline profile, lower bitrate, and shorter GOP for maximum speed
+        /// Target: <7ms encode latency for 2K@144Hz
+        pub fn new_high_refresh_rate(
+            width: usize,
+            height: usize,
+            fps: u32,
+        ) -> Result<Self, PipelineError> {
+            Self::new_high_refresh_rate_internal(width, height, fps, 8_000_000)
+        }
+
+        /// Extreme low latency encoder for 144Hz+ gaming scenarios
+        /// Very aggressive settings for maximum speed at cost of quality
+        /// Target: <7ms encode latency for 2K@144Hz
+        pub fn new_extreme_low_latency(
+            width: usize,
+            height: usize,
+            fps: u32,
+        ) -> Result<Self, PipelineError> {
+            Self::new_high_refresh_rate_internal(width, height, fps, 5_000_000)
+        }
+
+        /// Maximum speed encoder using P1 preset (fastest preset)
+        /// Lowest quality but maximum speed for 144Hz+ gaming
+        pub fn new_max_speed(
+            width: usize,
+            height: usize,
+            fps: u32,
+        ) -> Result<Self, PipelineError> {
+            let width = width.max(2);
+            let height = height.max(2);
+            let fps = fps.max(1);
+            let (device, context) = create_d3d11_device().map_err(|error| {
+                PipelineError::message(format!("create d3d11 device failed: {error}"))
+            })?;
+
+            let session: Session<NeedsConfig> = Session::open_dx(&device).map_err(|error| {
+                PipelineError::message(format!("nvenc open_dx failed: {error:?}"))
+            })?;
+            let (session, mut preset) = session
+                .get_encode_preset_config_ex(
+                    NV_ENC_CODEC_H264_GUID,
+                    NV_ENC_PRESET_P1_GUID,
+                    NVencTuningInfo::UltraLowLatency,
+                )
+                .map_err(|error| {
+                    PipelineError::message(format!("nvenc preset config failed: {error:?}"))
+                })?;
+
+            // Maximum speed optimizations:
+            preset.preset_cfg.profile_guid = NV_ENC_H264_PROFILE_BASELINE_GUID;
+            preset.preset_cfg.rc_params.average_bit_rate = 5_000_000;
+            preset.preset_cfg.gop_len = fps.min(30);
+            preset.preset_cfg.frame_interval_p = 1;
+
+            let init = InitParams {
+                encode_guid: NV_ENC_CODEC_H264_GUID,
+                preset_guid: NV_ENC_PRESET_P1_GUID,
+                resolution: [width as u32, height as u32],
+                aspect_ratio: [width as u32, height as u32],
+                frame_rate: [fps, 1],
+                tuning_info: NVencTuningInfo::UltraLowLatency,
+                buffer_format: NVencBufferFormat::ARGB,
+                encode_config: &mut preset.preset_cfg,
+                enable_ptd: true,
+                max_encoder_resolution: [width as u32, height as u32],
+            };
+            let encoder = session.init_encoder(init).map_err(|error| {
+                PipelineError::message(format!("nvenc init encoder failed: {error:?}"))
+            })?;
+            let texture =
+                create_encode_texture(&device, width as u32, height as u32).map_err(|error| {
+                    PipelineError::message(format!("create nvenc texture failed: {error}"))
+                })?;
+            let registered = encoder
+                .register_resource_dx11(&texture, NVencBufferFormat::ARGB, 0)
+                .map_err(|error| {
+                    PipelineError::message(format!("nvenc register resource failed: {error:?}"))
+                })?;
+            let bitstream = encoder.create_bitstream_buffer().map_err(|error| {
+                PipelineError::message(format!("nvenc bitstream buffer failed: {error:?}"))
+            })?;
+
+            Ok(Self {
+                _device: device,
+                context,
+                texture,
+                encoder,
+                registered,
+                bitstream,
+                width,
+                height,
+                fps,
+                frame_index: 0,
+            })
+        }
+
+        fn new_high_refresh_rate_internal(
+            width: usize,
+            height: usize,
+            fps: u32,
+            bitrate: u32,
+        ) -> Result<Self, PipelineError> {
+            let width = width.max(2);
+            let height = height.max(2);
+            let fps = fps.max(1);
+            let (device, context) = create_d3d11_device().map_err(|error| {
+                PipelineError::message(format!("create d3d11 device failed: {error}"))
+            })?;
+
+            let session: Session<NeedsConfig> = Session::open_dx(&device).map_err(|error| {
+                PipelineError::message(format!("nvenc open_dx failed: {error:?}"))
+            })?;
+            let (session, mut preset) = session
+                .get_encode_preset_config_ex(
+                    NV_ENC_CODEC_H264_GUID,
+                    NV_ENC_PRESET_P6_GUID,
+                    NVencTuningInfo::UltraLowLatency,
+                )
+                .map_err(|error| {
+                    PipelineError::message(format!("nvenc preset config failed: {error:?}"))
+                })?;
+
+            // High refresh rate optimizations:
+            // - Use Baseline profile (faster than High/Main)
+            preset.preset_cfg.profile_guid = NV_ENC_H264_PROFILE_BASELINE_GUID;
+            // - Lower bitrate for faster encoding
+            preset.preset_cfg.rc_params.average_bit_rate = bitrate;
+            // - Very short GOP for minimal I-frame overhead
+            preset.preset_cfg.gop_len = fps.min(30);
+            // - Disable frame doubling
+            preset.preset_cfg.frame_interval_p = 1;
+
+            let init = InitParams {
+                encode_guid: NV_ENC_CODEC_H264_GUID,
+                preset_guid: NV_ENC_PRESET_P6_GUID,
+                resolution: [width as u32, height as u32],
+                aspect_ratio: [width as u32, height as u32],
+                frame_rate: [fps, 1],
+                tuning_info: NVencTuningInfo::UltraLowLatency,
+                buffer_format: NVencBufferFormat::ARGB,
+                encode_config: &mut preset.preset_cfg,
+                enable_ptd: true,
+                max_encoder_resolution: [width as u32, height as u32],
+            };
+            let encoder = session.init_encoder(init).map_err(|error| {
+                PipelineError::message(format!("nvenc init encoder failed: {error:?}"))
+            })?;
+            let texture =
+                create_encode_texture(&device, width as u32, height as u32).map_err(|error| {
+                    PipelineError::message(format!("create nvenc texture failed: {error}"))
+                })?;
+            let registered = encoder
+                .register_resource_dx11(&texture, NVencBufferFormat::ARGB, 0)
+                .map_err(|error| {
+                    PipelineError::message(format!("nvenc register resource failed: {error:?}"))
+                })?;
+            let bitstream = encoder.create_bitstream_buffer().map_err(|error| {
+                PipelineError::message(format!("nvenc bitstream buffer failed: {error:?}"))
+            })?;
+
+            Ok(Self {
+                _device: device,
+                context,
+                texture,
+                encoder,
+                registered,
+                bitstream,
+                width,
+                height,
+                fps,
+                frame_index: 0,
+            })
+        }
+
+        /// Low latency encoder with balanced quality
+        /// Uses LowLatency tuning and P3 preset
         pub fn new_low_latency_p1(
             width: usize,
             height: usize,
@@ -59,6 +246,8 @@ mod imp {
             Self::new(width, height, fps)
         }
 
+        /// High quality encoder (higher latency, better quality)
+        /// Uses HighQuality tuning and P5 preset
         pub fn new_high_quality_p5(
             width: usize,
             height: usize,
@@ -68,6 +257,15 @@ mod imp {
         }
 
         fn new_with_profile(
+            width: usize,
+            height: usize,
+            fps: u32,
+            profile_guid: Guid,
+        ) -> Result<Self, PipelineError> {
+            Self::new_low_latency_internal(width, height, fps, profile_guid)
+        }
+
+        fn new_low_latency_internal(
             width: usize,
             height: usize,
             fps: u32,
@@ -104,6 +302,78 @@ mod imp {
                 aspect_ratio: [width as u32, height as u32],
                 frame_rate: [fps, 1],
                 tuning_info: NVencTuningInfo::LowLatency,
+                buffer_format: NVencBufferFormat::ARGB,
+                encode_config: &mut preset.preset_cfg,
+                enable_ptd: true,
+                max_encoder_resolution: [width as u32, height as u32],
+            };
+            let encoder = session.init_encoder(init).map_err(|error| {
+                PipelineError::message(format!("nvenc init encoder failed: {error:?}"))
+            })?;
+            let texture =
+                create_encode_texture(&device, width as u32, height as u32).map_err(|error| {
+                    PipelineError::message(format!("create nvenc texture failed: {error}"))
+                })?;
+            let registered = encoder
+                .register_resource_dx11(&texture, NVencBufferFormat::ARGB, 0)
+                .map_err(|error| {
+                    PipelineError::message(format!("nvenc register resource failed: {error:?}"))
+                })?;
+            let bitstream = encoder.create_bitstream_buffer().map_err(|error| {
+                PipelineError::message(format!("nvenc bitstream buffer failed: {error:?}"))
+            })?;
+
+            Ok(Self {
+                _device: device,
+                context,
+                texture,
+                encoder,
+                registered,
+                bitstream,
+                width,
+                height,
+                fps,
+                frame_index: 0,
+            })
+        }
+
+        fn new_ultra_low_latency_internal(
+            width: usize,
+            height: usize,
+            fps: u32,
+            profile_guid: Guid,
+        ) -> Result<Self, PipelineError> {
+            let width = width.max(2);
+            let height = height.max(2);
+            let fps = fps.max(1);
+            let (device, context) = create_d3d11_device().map_err(|error| {
+                PipelineError::message(format!("create d3d11 device failed: {error}"))
+            })?;
+
+            let session: Session<NeedsConfig> = Session::open_dx(&device).map_err(|error| {
+                PipelineError::message(format!("nvenc open_dx failed: {error:?}"))
+            })?;
+            let (session, mut preset) = session
+                .get_encode_preset_config_ex(
+                    NV_ENC_CODEC_H264_GUID,
+                    NV_ENC_PRESET_P6_GUID,
+                    NVencTuningInfo::UltraLowLatency,
+                )
+                .map_err(|error| {
+                    PipelineError::message(format!("nvenc preset config failed: {error:?}"))
+                })?;
+            preset.preset_cfg.profile_guid = profile_guid;
+            preset.preset_cfg.rc_params.average_bit_rate = 12_000_000;
+            preset.preset_cfg.frame_interval_p = 1;
+            preset.preset_cfg.gop_len = fps;
+
+            let init = InitParams {
+                encode_guid: NV_ENC_CODEC_H264_GUID,
+                preset_guid: NV_ENC_PRESET_P6_GUID,
+                resolution: [width as u32, height as u32],
+                aspect_ratio: [width as u32, height as u32],
+                frame_rate: [fps, 1],
+                tuning_info: NVencTuningInfo::UltraLowLatency,
                 buffer_format: NVencBufferFormat::ARGB,
                 encode_config: &mut preset.preset_cfg,
                 enable_ptd: true,

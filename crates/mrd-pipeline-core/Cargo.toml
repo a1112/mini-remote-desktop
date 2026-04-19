@@ -8,3 +8,10 @@ license.workspace = true
 mrd-proto = { path = "../mrd-proto" }
 serde.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+mrd-session = { path = "../mrd-session" }
+mrd-decode = { path = "../mrd-decode" }
+mrd-decode-nvdec = { path = "../mrd-decode-nvdec" }
+mrd-render = { path = "../mrd-render" }
+mrd-render-d3d11 = { path = "../mrd-render-d3d11" }

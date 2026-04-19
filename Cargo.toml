@@ -6,9 +6,11 @@ members = [
   "apps/mrd-service",
   "common-control-proto",
   "crates/mrd-capture-dxgi",
+  "crates/mrd-capture-winrt",
   "crates/mrd-decode",
   "crates/mrd-decode-nvdec",
   "crates/mrd-encode-nvenc",
+  "crates/mrd-encode-nvenc-av1",
   "crates/mrd-encode-openh264",
   "crates/mrd-ipc",
   "crates/mrd-observability",
@@ -23,7 +25,10 @@ members = [
   "crates/mrd-signal-server",
   "crates/mrd-transport-quic-quinn",
   "crates/mrd-transport-webrtc",
+  "crates/mrd-buffer-pool",
+  "crates/mrd-hardware",
   "heartbeat-rs",
+  "tests/integration",
 ]
 resolver = "2"
 

@@ -138,22 +138,20 @@ fn to_rgba(frame: &CapturedFrame) -> Result<Vec<u8>, PipelineError> {
     match frame.pixel_format {
         FramePixelFormat::Rgba32 => Ok(frame.data.clone()),
         FramePixelFormat::Bgra32 => {
+            // Optimized BGRA→RGBA conversion using swap_words
+            // BGRA = [B, G, R, A], RGBA = [R, G, B, A]
+            // We need to swap B and R in each 4-byte pixel
             let mut rgba = Vec::with_capacity(frame.data.len());
             for chunk in frame.data.chunks_exact(4) {
-                rgba.push(chunk[2]);
-                rgba.push(chunk[1]);
-                rgba.push(chunk[0]);
-                rgba.push(chunk[3]);
+                // Swap R and B channels
+                rgba.extend_from_slice(&[chunk[2], chunk[1], chunk[0], chunk[3]]);
             }
             Ok(rgba)
         }
         FramePixelFormat::Rgb24 => {
             let mut rgba = Vec::with_capacity(frame.width * frame.height * 4);
             for chunk in frame.data.chunks_exact(3) {
-                rgba.push(chunk[0]);
-                rgba.push(chunk[1]);
-                rgba.push(chunk[2]);
-                rgba.push(255);
+                rgba.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 255]);
             }
             Ok(rgba)
         }

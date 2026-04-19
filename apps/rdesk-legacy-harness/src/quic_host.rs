@@ -8,14 +8,14 @@ use std::{
 };
 
 use mrd_capture_dxgi::DxgiDesktopCapture;
-use mrd_decode::{DecodedFrame, PixelFormat, VideoDecoder};
+use mrd_decode::{PixelFormat, VideoDecoder};
 use mrd_encode_nvenc::NvencH264Encoder;
 use mrd_encode_openh264::OpenH264Encoder;
 use mrd_observability::{
     MediaProbeEvent, PipelineProbeSnapshot, ProbeRegistry, ProbeSessionHandle, StageId,
 };
 use mrd_pipeline_core::{
-    CapturedFrame, FrameCapture, FramePixelFormat, PipelineError, VideoEncoder,
+    CapturedFrame, DecodedFrame, FrameCapture, FramePixelFormat, PipelineError, VideoEncoder,
 };
 use mrd_proto::SessionId;
 use mrd_transport_quic_quinn::{
@@ -649,12 +649,15 @@ fn apply_decoded_frames_to_snapshot(
         snapshot_guard.decoded_frame_count += 1;
         snapshot_guard.last_decoded_width = frame.width;
         snapshot_guard.last_decoded_height = frame.height;
-        snapshot_guard.last_decoded_pixel_format = Some(match frame.pixel_format {
-            PixelFormat::Rgb24 => "Rgb24".to_string(),
-            PixelFormat::D3d11Texture => "D3d11Texture".to_string(),
+        use mrd_pipeline_core::DecodedFrameData;
+        snapshot_guard.last_decoded_pixel_format = Some(match &frame.data {
+            DecodedFrameData::CpuRgb24(_) => "Rgb24".to_string(),
+            DecodedFrameData::CpuBgra32(_) => "Bgra32".to_string(),
+            #[cfg(windows)]
+            DecodedFrameData::D3D11SharedNv12 { .. } => "D3d11Texture".to_string(),
         });
         if let Some(frame_sink) = frame_sink.as_ref() {
-            let bytes = frame.data.len();
+            let bytes = frame.cpu_bytes().map(|b| b.len()).unwrap_or(0);
             let started_at = std::time::Instant::now();
             frame_sink
                 .lock()

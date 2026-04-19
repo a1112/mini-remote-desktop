@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
-use mrd_decode::{DecodedFrame, PixelFormat};
+use mrd_decode::PixelFormat;
+use mrd_pipeline_core::{DecodedFrame, DecodedFrameData};
 use mrd_proto::SessionId;
 
 pub const DEFAULT_SOURCE_ID: &str = "session-primary";
@@ -12,6 +13,19 @@ pub struct DecodedFrameSnapshot {
     pub height: usize,
     pub pixel_format: PixelFormat,
     pub bytes: usize,
+}
+
+fn pixel_format_from_frame(frame: &DecodedFrame) -> PixelFormat {
+    match &frame.data {
+        DecodedFrameData::CpuRgb24(_) => PixelFormat::Rgb24,
+        DecodedFrameData::CpuBgra32(_) => PixelFormat::Bgra32,
+        #[cfg(windows)]
+        DecodedFrameData::D3D11SharedNv12 { .. } => PixelFormat::D3d11Texture,
+    }
+}
+
+fn bytes_from_frame(frame: &DecodedFrame) -> usize {
+    frame.cpu_bytes().map(|b| b.len()).unwrap_or(0)
 }
 
 #[derive(Debug, Default)]
@@ -39,14 +53,16 @@ impl DecodedFrameSink {
             .map(|snapshot| snapshot.frame_count + 1)
             .unwrap_or(1);
 
+        let pixel_format = pixel_format_from_frame(&frame);
+        let bytes = bytes_from_frame(&frame);
         self.snapshots.insert(
             session_id.clone(),
             DecodedFrameSnapshot {
                 frame_count,
                 width: frame.width,
                 height: frame.height,
-                pixel_format: frame.pixel_format,
-                bytes: frame.data.len(),
+                pixel_format,
+                bytes,
             },
         );
         self.latest_frames.insert(session_id.clone(), frame);
@@ -57,14 +73,16 @@ impl DecodedFrameSink {
             .get(&source_key)
             .map(|snapshot| snapshot.frame_count + 1)
             .unwrap_or(1);
+
+        let latest_frame = &self.latest_frames[&session_id];
         self.source_snapshots.insert(
             source_key.clone(),
             DecodedFrameSnapshot {
                 frame_count: source_frame_count,
-                width: self.latest_frames[&session_id].width,
-                height: self.latest_frames[&session_id].height,
-                pixel_format: self.latest_frames[&session_id].pixel_format,
-                bytes: self.latest_frames[&session_id].data.len(),
+                width: latest_frame.width,
+                height: latest_frame.height,
+                pixel_format: pixel_format_from_frame(latest_frame),
+                bytes: bytes_from_frame(latest_frame),
             },
         );
         self.latest_source_frames
@@ -111,7 +129,8 @@ impl DecodedFrameSink {
 
 #[cfg(test)]
 mod tests {
-    use mrd_decode::{DecodedFrame, PixelFormat};
+    use mrd_pipeline_core::DecodedFrame;
+    use mrd_decode::PixelFormat;
     use mrd_proto::SessionId;
 
     use super::DecodedFrameSink;
@@ -122,12 +141,7 @@ mod tests {
 
         sink.ingest_frame(
             SessionId("session-1".into()),
-            DecodedFrame {
-                width: 640,
-                height: 360,
-                pixel_format: PixelFormat::Rgb24,
-                data: vec![0; 640 * 360 * 3],
-            },
+            DecodedFrame::from_cpu_rgb24(640, 360, 0, vec![0; 640 * 360 * 3]),
         );
 
         let snapshot = sink
@@ -148,21 +162,11 @@ mod tests {
 
         sink.ingest_frame(
             session_id.clone(),
-            DecodedFrame {
-                width: 320,
-                height: 180,
-                pixel_format: PixelFormat::Rgb24,
-                data: vec![1; 320 * 180 * 3],
-            },
+            DecodedFrame::from_cpu_rgb24(320, 180, 0, vec![1; 320 * 180 * 3]),
         );
         sink.ingest_frame(
             session_id.clone(),
-            DecodedFrame {
-                width: 1280,
-                height: 720,
-                pixel_format: PixelFormat::Rgb24,
-                data: vec![2; 1280 * 720 * 3],
-            },
+            DecodedFrame::from_cpu_rgb24(1280, 720, 0, vec![2; 1280 * 720 * 3]),
         );
 
         let snapshot = sink.snapshot(&session_id).expect("latest snapshot");
@@ -174,7 +178,7 @@ mod tests {
         assert_eq!(snapshot.bytes, 1280 * 720 * 3);
         assert_eq!(latest_frame.width, 1280);
         assert_eq!(latest_frame.height, 720);
-        assert_eq!(latest_frame.data.len(), 1280 * 720 * 3);
+        assert_eq!(latest_frame.cpu_bytes().unwrap().len(), 1280 * 720 * 3);
     }
 
     #[test]
@@ -185,12 +189,7 @@ mod tests {
         sink.ingest_frame_for_source(
             session_id.clone(),
             "video-track-1".into(),
-            DecodedFrame {
-                width: 800,
-                height: 600,
-                pixel_format: PixelFormat::Rgb24,
-                data: vec![3; 800 * 600 * 3],
-            },
+            DecodedFrame::from_cpu_rgb24(800, 600, 0, vec![3; 800 * 600 * 3]),
         );
 
         let snapshot = sink

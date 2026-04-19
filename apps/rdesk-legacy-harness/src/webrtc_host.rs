@@ -11,12 +11,12 @@ use crate::app_settings::DecodePolicy;
 use crate::frame_sink::DecodedFrameSink;
 use crate::webrtc_media::H264AccessUnitAssembler;
 use mrd_capture_dxgi::DxgiDesktopCapture;
-use mrd_decode::{DecodedFrame, PixelFormat, VideoDecoder};
+use mrd_decode::{PixelFormat, VideoDecoder};
 use mrd_encode_openh264::OpenH264Encoder;
 use mrd_observability::{
     MediaProbeEvent, PipelineProbeSnapshot, ProbeRegistry, ProbeSessionHandle, StageId,
 };
-use mrd_pipeline_core::{FrameCapture, VideoEncoder};
+use mrd_pipeline_core::{DecodedFrame, FrameCapture, VideoEncoder};
 use mrd_proto::SessionId;
 use mrd_signal_proto::{IceCandidate, SessionDescription};
 use mrd_transport_webrtc::{annex_b_contains_keyframe, H264Profile, H264RtpSender};
@@ -1005,12 +1005,15 @@ fn apply_decoded_frames_to_snapshot(
         snapshot.decoded_frame_count += 1;
         snapshot.last_decoded_width = frame.width;
         snapshot.last_decoded_height = frame.height;
-        snapshot.last_decoded_pixel_format = Some(match frame.pixel_format {
-            PixelFormat::Rgb24 => "Rgb24".to_string(),
-            PixelFormat::D3d11Texture => "D3d11Texture".to_string(),
+        use mrd_pipeline_core::DecodedFrameData;
+        snapshot.last_decoded_pixel_format = Some(match &frame.data {
+            DecodedFrameData::CpuRgb24(_) => "Rgb24".to_string(),
+            DecodedFrameData::CpuBgra32(_) => "Bgra32".to_string(),
+            #[cfg(windows)]
+            DecodedFrameData::D3D11SharedNv12 { .. } => "D3d11Texture".to_string(),
         });
         if let Some(frame_sink) = frame_sink.as_ref() {
-            let bytes = frame.data.len();
+            let bytes = frame.cpu_bytes().map(|b| b.len()).unwrap_or(0);
             let started_at = std::time::Instant::now();
             frame_sink
                 .lock()

@@ -2,6 +2,8 @@ use mrd_proto::SessionId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod encoder_config;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RuntimeStatus {
     ProfileOnly,
@@ -17,6 +19,7 @@ pub struct RuntimeBinding {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum VideoCodec {
     H264,
+    Av1,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -43,6 +46,112 @@ pub struct EncodedAccessUnit {
     pub bytes: Vec<u8>,
 }
 
+/// Decoded frame data type
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecodedFrameData {
+    /// CPU RGB24 data (existing path)
+    CpuRgb24(Vec<u8>),
+    /// CPU BGRA32 data (optimized path for D3D11 rendering)
+    CpuBgra32(Vec<u8>),
+    /// D3D11 shared texture handle (zero-copy path)
+    #[cfg(windows)]
+    D3D11SharedNv12 {
+        shared_handle: isize,
+        width: u32,
+        height: u32,
+    },
+}
+
+/// Decoded video frame
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedFrame {
+    pub width: usize,
+    pub height: usize,
+    pub timestamp_us: u64,
+    pub data: DecodedFrameData,
+}
+
+impl DecodedFrame {
+    /// Create a decoded frame from CPU RGB24 data
+    pub fn from_cpu_rgb24(width: usize, height: usize, timestamp_us: u64, data: Vec<u8>) -> Self {
+        Self {
+            width,
+            height,
+            timestamp_us,
+            data: DecodedFrameData::CpuRgb24(data),
+        }
+    }
+
+    /// Create a decoded frame from CPU BGRA32 data
+    pub fn from_cpu_bgra32(width: usize, height: usize, timestamp_us: u64, data: Vec<u8>) -> Self {
+        Self {
+            width,
+            height,
+            timestamp_us,
+            data: DecodedFrameData::CpuBgra32(data),
+        }
+    }
+
+    /// Create a decoded frame from D3D11 shared texture
+    #[cfg(windows)]
+    pub fn from_d3d11_shared_nv12(
+        width: usize,
+        height: usize,
+        timestamp_us: u64,
+        shared_handle: isize,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            timestamp_us,
+            data: DecodedFrameData::D3D11SharedNv12 {
+                shared_handle,
+                width: width as u32,
+                height: height as u32,
+            },
+        }
+    }
+
+    /// Check if this frame uses shared texture (zero-copy)
+    pub fn is_shared_texture(&self) -> bool {
+        matches!(self.data, DecodedFrameData::D3D11SharedNv12 { .. })
+    }
+
+    /// Get the CPU RGB24 data if available
+    pub fn cpu_rgb24(&self) -> Option<&[u8]> {
+        match &self.data {
+            DecodedFrameData::CpuRgb24(data) => Some(data.as_slice()),
+            _ => None,
+        }
+    }
+
+    /// Get the CPU BGRA32 data if available
+    pub fn cpu_bgra32(&self) -> Option<&[u8]> {
+        match &self.data {
+            DecodedFrameData::CpuBgra32(data) => Some(data.as_slice()),
+            _ => None,
+        }
+    }
+
+    /// Get any CPU data as bytes
+    pub fn cpu_bytes(&self) -> Option<&[u8]> {
+        match &self.data {
+            DecodedFrameData::CpuRgb24(data) | DecodedFrameData::CpuBgra32(data) => Some(data.as_slice()),
+            #[cfg(windows)]
+            DecodedFrameData::D3D11SharedNv12 { .. } => None,
+        }
+    }
+
+    /// Get the shared texture handle if available
+    #[cfg(windows)]
+    pub fn d3d11_shared_handle(&self) -> Option<isize> {
+        match &self.data {
+            DecodedFrameData::D3D11SharedNv12 { shared_handle, .. } => Some(*shared_handle),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum PipelineError {
     #[error("{0}")]
@@ -61,4 +170,12 @@ pub trait FrameCapture {
 
 pub trait VideoEncoder {
     fn encode(&mut self, frame: &CapturedFrame) -> Result<Vec<EncodedAccessUnit>, PipelineError>;
+}
+
+pub trait VideoDecoder: Send {
+    /// Push an encoded access unit to the decoder
+    fn push_access_unit(&mut self, access_unit: &[u8]) -> Result<(), PipelineError>;
+
+    /// Drain all decoded frames
+    fn drain_decoded_frames(&mut self) -> Vec<DecodedFrame>;
 }

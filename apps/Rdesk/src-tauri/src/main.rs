@@ -361,6 +361,71 @@ async fn ipc_start_receiver(
     }
 }
 
+/// List sessions via IPC (migrated version)
+#[tauri::command]
+async fn ipc_list_sessions() -> Result<Vec<mrd_ipc::SessionInfo>, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client.send_request(IpcRequest::ListSessions).await.map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::SessionList { sessions } => Ok(sessions),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+/// Get runtime snapshot via IPC (migrated version)
+#[tauri::command]
+async fn ipc_runtime_snapshot() -> Result<mrd_ipc::RuntimeSnapshot, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client.send_request(IpcRequest::RuntimeSnapshot).await.map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::RuntimeSnapshot { snapshot } => Ok(snapshot),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+/// Service health check via IPC (migrated version)
+#[tauri::command]
+async fn ipc_service_health() -> Result<mrd_ipc::ServiceStatus, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client.send_request(IpcRequest::ServiceHealth).await.map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::ServiceHealth { status } => Ok(status),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+/// Get probe snapshot via IPC (migrated version)
+#[tauri::command]
+async fn ipc_probe_snapshot(
+    session_id: String,
+) -> Result<mrd_ipc::ProbeSnapshot, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+    use mrd_proto::SessionId;
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client.send_request(IpcRequest::ProbeSnapshot {
+        session_id: SessionId(session_id),
+    }).await.map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::ProbeSnapshot { snapshot } => Ok(snapshot),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
 // Legacy Tauri commands removed - use rdesk-legacy-harness package for testing
 
 // Example of migrated WebRTC command using IPC
@@ -502,10 +567,14 @@ fn main() {
             // IPC-based commands (all session control goes through mrd-service)
             ipc_register_device,
             ipc_list_devices,
+            ipc_list_sessions,
             ipc_start_session,
             ipc_accept_session,
             ipc_stop_session,
             ipc_session_snapshot,
+            ipc_runtime_snapshot,
+            ipc_service_health,
+            ipc_probe_snapshot,
             ipc_start_sender,
             ipc_start_receiver,
             // Legacy commands

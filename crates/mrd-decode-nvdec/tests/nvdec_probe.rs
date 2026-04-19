@@ -192,7 +192,7 @@ fn nvdec_decoder_emits_rgb_frame() {
     );
     assert_eq!(frames[0].width, 128);
     assert_eq!(frames[0].height, 128);
-    assert_eq!(frames[0].data.len(), 128 * 128 * 3);
+    assert_eq!(frames[0].cpu_rgb24().unwrap().len(), 128 * 128 * 3);
 }
 
 #[test]

@@ -3,7 +3,7 @@ use std::{fs, path::Path, time::Instant};
 use mrd_decode::create_decoder;
 use mrd_encode_nvenc::NvencH264Encoder;
 use mrd_observability::{ComponentKind, ComponentResult};
-use mrd_pipeline_core::{CapturedFrame, FramePixelFormat, VideoEncoder};
+use mrd_pipeline_core::{CapturedFrame, FramePixelFormat, VideoEncoder, DecodedFrameData};
 use openh264::{
     encoder::Encoder,
     formats::{RgbSliceU8, YUVBuffer},
@@ -35,7 +35,10 @@ fn perf_h264_software_decode_reports_latency_distribution() {
             Ok(()) => {
                 let frames = decoder.drain_decoded_frames();
                 if let Some(frame) = frames.first() {
-                    decoded_frame_bytes = Some(frame.data.len());
+                    decoded_frame_bytes = match &frame.data {
+                        DecodedFrameData::CpuRgb24(data) => Some(data.len()),
+                        _ => Some(0),
+                    };
                     width = Some(frame.width as u32);
                     height = Some(frame.height as u32);
                 }
@@ -108,7 +111,10 @@ fn perf_nvenc_720p_decode_reports_latency_distribution() {
             Ok(()) => {
                 let frames = decoder.drain_decoded_frames();
                 if let Some(frame) = frames.first() {
-                    decoded_frame_bytes = Some(frame.data.len());
+                    decoded_frame_bytes = match &frame.data {
+                        DecodedFrameData::CpuRgb24(data) => Some(data.len()),
+                        _ => Some(0),
+                    };
                     width = Some(frame.width as u32);
                     height = Some(frame.height as u32);
                 }

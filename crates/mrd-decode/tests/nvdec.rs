@@ -1,4 +1,5 @@
 use mrd_decode::{available_decoder_descriptors, create_decoder};
+use mrd_pipeline_core::DecodedFrameData;
 use mrd_decode_nvdec::probe_h264_available;
 use openh264::{
     encoder::Encoder,
@@ -56,7 +57,13 @@ fn nvdec_decoder_roundtrips_valid_access_unit_when_supported() {
     assert!(!frames.is_empty(), "nvdec should emit at least one frame");
     assert_eq!(frames[0].width, 128);
     assert_eq!(frames[0].height, 128);
-    assert_eq!(frames[0].data.len(), 128 * 128 * 3);
+    // Check the data is in CPU RGB24 format
+    match &frames[0].data {
+        DecodedFrameData::CpuRgb24(data) => {
+            assert_eq!(data.len(), 128 * 128 * 3);
+        }
+        _ => panic!("Expected CpuRgb24 data"),
+    }
 }
 
 fn encoded_access_unit() -> Vec<u8> {

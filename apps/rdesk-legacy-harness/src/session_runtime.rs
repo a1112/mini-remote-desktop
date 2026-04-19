@@ -25,7 +25,8 @@ pub fn sync_session_runtime(
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use mrd_decode::{DecodedFrame, PixelFormat};
+    use mrd_pipeline_core::DecodedFrame;
+    use mrd_decode::PixelFormat;
     use mrd_proto::SessionId;
 
     use crate::{
@@ -44,12 +45,7 @@ mod tests {
             .ingest_frame_for_source(
                 session_id.clone(),
                 "video-track-2".into(),
-                DecodedFrame {
-                    width: 2,
-                    height: 2,
-                    pixel_format: PixelFormat::Rgb24,
-                    data: vec![255; 12],
-                },
+                DecodedFrame::from_cpu_rgb24(2, 2, 0, vec![255; 12]),
             );
 
         let mut render_host = RenderHost::with_frame_sink(sink);

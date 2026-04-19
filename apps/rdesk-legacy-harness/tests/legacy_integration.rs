@@ -301,7 +301,7 @@ fn decoded_frame_snapshot_reports_latest_ingested_frame() {
     let sink = std::sync::Mutex::new(DecodedFrameSink::default());
     sink.lock().expect("lock decoded frame sink").ingest_frame(
         SessionId("session-9".into()),
-        mrd_decode::DecodedFrame::cpu_rgb24(640, 360, vec![0; 640 * 360 * 3]),
+        mrd_pipeline_core::DecodedFrame::from_cpu_rgb24(640, 360, 0, vec![0; 640 * 360 * 3]),
     );
 
     let snapshot = decoded_frame_snapshot_with(&sink, "session-9".into()).expect("snapshot");
@@ -322,9 +322,10 @@ fn decoded_frame_preview_encodes_png_data_url() {
     let sink = std::sync::Mutex::new(DecodedFrameSink::default());
     sink.lock().expect("lock decoded frame sink").ingest_frame(
         SessionId("session-preview".into()),
-        mrd_decode::DecodedFrame::cpu_rgb24(
+        mrd_pipeline_core::DecodedFrame::from_cpu_rgb24(
             2,
             2,
+            0,
             vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255],
         ),
     );
@@ -345,7 +346,7 @@ fn render_host_snapshot_reports_attachment_and_preview() {
     let sink = std::sync::Arc::new(std::sync::Mutex::new(DecodedFrameSink::default()));
     sink.lock().expect("lock decoded frame sink").ingest_frame(
         SessionId("session-render".into()),
-        mrd_decode::DecodedFrame::cpu_rgb24(2, 2, vec![255; 12]),
+        mrd_pipeline_core::DecodedFrame::from_cpu_rgb24(2, 2, 0, vec![255; 12]),
     );
     let mut render_host = RenderHost::with_frame_sink(sink);
     let _ =

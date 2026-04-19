@@ -4,7 +4,9 @@ use std::{
 };
 
 use image::{codecs::png::PngEncoder, ColorType, ImageEncoder};
+use mrd_decode::PixelFormat;
 use mrd_observability::{ProbeRegistry, StageId};
+use mrd_pipeline_core::{DecodedFrame, DecodedFrameData};
 use mrd_proto::SessionId;
 use mrd_render::{
     BoxedRenderer, RenderFrame, RenderPixelFormat, RenderTarget, RendererFactory, RendererSnapshot,
@@ -209,7 +211,12 @@ impl RenderHost {
                     .and_then(|source_id| latest_source_frames.get(source_id));
                 let render_frame =
                     decoded_frame_to_render_frame(source_bound_frame.unwrap_or(frame_to_upload));
-                let bytes = render_frame.data.len();
+                let bytes = match &render_frame.data {
+                    mrd_render::RenderFrameData::Rgb24(data) => data.len(),
+                    mrd_render::RenderFrameData::Bgra32(data) => data.len(),
+                    #[cfg(windows)]
+                    mrd_render::RenderFrameData::D3D11SharedNv12 { .. } => render_frame.width * render_frame.height * 3 / 2, // NV12 size
+                };
                 let started_at = std::time::Instant::now();
                 renderer
                     .upload_frame(render_frame)
@@ -266,8 +273,9 @@ fn decoded_frame_snapshot_response(
         width: snapshot.width,
         height: snapshot.height,
         pixel_format: match snapshot.pixel_format {
-            mrd_decode::PixelFormat::Rgb24 => "Rgb24".to_string(),
-            mrd_decode::PixelFormat::D3d11Texture => "D3d11Texture".to_string(),
+            PixelFormat::Rgb24 => "Rgb24".to_string(),
+            PixelFormat::Bgra32 => "Bgra32".to_string(),
+            PixelFormat::D3d11Texture => "D3d11Texture".to_string(),
         },
         bytes: snapshot.bytes,
     }
@@ -314,15 +322,32 @@ pub fn render_host_snapshot_with(
         .snapshot(&SessionId(session_id))
 }
 
-fn decoded_frame_to_render_frame(frame: &mrd_decode::DecodedFrame) -> RenderFrame {
-    RenderFrame {
-        width: frame.width,
-        height: frame.height,
-        pixel_format: match frame.pixel_format {
-            mrd_decode::PixelFormat::Rgb24 => RenderPixelFormat::Rgb24,
-            mrd_decode::PixelFormat::D3d11Texture => RenderPixelFormat::Rgb24,
+fn decoded_frame_to_render_frame(frame: &DecodedFrame) -> RenderFrame {
+    use mrd_render::RenderFrameData;
+    match &frame.data {
+        DecodedFrameData::CpuRgb24(data) => RenderFrame {
+            width: frame.width,
+            height: frame.height,
+            pixel_format: RenderPixelFormat::Rgb24,
+            data: RenderFrameData::Rgb24(data.clone()),
         },
-        data: frame.cpu_bytes().map(|bytes| bytes.to_vec()).unwrap_or_default(),
+        DecodedFrameData::CpuBgra32(data) => RenderFrame {
+            width: frame.width,
+            height: frame.height,
+            pixel_format: RenderPixelFormat::Bgra32,
+            data: RenderFrameData::Bgra32(data.clone()),
+        },
+        #[cfg(windows)]
+        DecodedFrameData::D3D11SharedNv12 {
+            shared_handle: _,
+            width: _,
+            height: _,
+        } => RenderFrame {
+            width: frame.width,
+            height: frame.height,
+            pixel_format: RenderPixelFormat::Rgb24, // Will be updated to D3D11SharedNv12
+            data: RenderFrameData::Rgb24(vec![]), // Fallback for now
+        },
     }
 }
 
@@ -334,6 +359,9 @@ fn renderer_snapshot_response(snapshot: RendererSnapshot) -> RendererSnapshotRes
         last_height: snapshot.last_height,
         last_pixel_format: snapshot.last_pixel_format.map(|format| match format {
             RenderPixelFormat::Rgb24 => "Rgb24".to_string(),
+            RenderPixelFormat::Bgra32 => "Bgra32".to_string(),
+            #[cfg(windows)]
+            RenderPixelFormat::D3D11SharedNv12 => "D3D11SharedNv12".to_string(),
         }),
     }
 }
@@ -342,7 +370,8 @@ fn renderer_snapshot_response(snapshot: RendererSnapshot) -> RendererSnapshotRes
 mod tests {
     use super::{RenderHost, SurfaceSourceBindingResponse};
     use crate::frame_sink::{DecodedFrameSink, DEFAULT_SOURCE_ID};
-    use mrd_decode::{DecodedFrame, PixelFormat};
+    use mrd_pipeline_core::DecodedFrame;
+    use mrd_decode::PixelFormat;
     use mrd_proto::SessionId;
 
     #[test]
@@ -350,12 +379,7 @@ mod tests {
         let sink = std::sync::Arc::new(std::sync::Mutex::new(DecodedFrameSink::default()));
         sink.lock().expect("lock frame sink").ingest_frame(
             SessionId("session-render".into()),
-            DecodedFrame {
-                width: 4,
-                height: 4,
-                pixel_format: PixelFormat::Rgb24,
-                data: vec![128; 4 * 4 * 3],
-            },
+            DecodedFrame::from_cpu_rgb24(4, 4, 0, vec![128; 4 * 4 * 3]),
         );
 
         let mut render_host = RenderHost::with_frame_sink(sink);

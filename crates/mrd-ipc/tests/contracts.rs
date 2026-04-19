@@ -154,6 +154,9 @@ fn serialize_deserialize_session_snapshot_response() {
                 cert_der: Some("base64cert".to_string()),
             }),
             remote_bootstrap: None,
+            last_error: None,
+            sender_active: false,
+            receiver_active: false,
         },
     };
 

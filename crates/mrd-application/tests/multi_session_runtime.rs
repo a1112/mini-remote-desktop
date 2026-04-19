@@ -152,6 +152,10 @@ fn multiple_realtime_events_in_one_drain_cycle() {
                     remote_listen_addr: None,
                     remote_server_name: None,
                     remote_cert_der_b64: None,
+                    lifecycle_state: "created".to_string(),
+                    last_error: None,
+                    sender_active: false,
+                    receiver_active: false,
                 },
             );
             Ok(())
@@ -179,6 +183,10 @@ fn multiple_realtime_events_in_one_drain_cycle() {
                     remote_listen_addr,
                     remote_server_name,
                     remote_cert_der_b64,
+                    lifecycle_state: "listening".to_string(),
+                    last_error: None,
+                    sender_active: false,
+                    receiver_active: false,
                 },
             );
             Ok(())

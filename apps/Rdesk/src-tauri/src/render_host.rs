@@ -267,6 +267,7 @@ fn decoded_frame_snapshot_response(
         height: snapshot.height,
         pixel_format: match snapshot.pixel_format {
             mrd_decode::PixelFormat::Rgb24 => "Rgb24".to_string(),
+            mrd_decode::PixelFormat::Bgra32 => "Bgra32".to_string(),
             mrd_decode::PixelFormat::D3d11Texture => "D3d11Texture".to_string(),
         },
         bytes: snapshot.bytes,
@@ -320,6 +321,7 @@ fn decoded_frame_to_render_frame(frame: &mrd_decode::DecodedFrame) -> RenderFram
         height: frame.height,
         pixel_format: match frame.pixel_format {
             mrd_decode::PixelFormat::Rgb24 => RenderPixelFormat::Rgb24,
+            mrd_decode::PixelFormat::Bgra32 => RenderPixelFormat::Bgra32,
             mrd_decode::PixelFormat::D3d11Texture => RenderPixelFormat::Rgb24,
         },
         data: frame.cpu_bytes().map(|bytes| bytes.to_vec()).unwrap_or_default(),

@@ -1007,6 +1007,7 @@ fn apply_decoded_frames_to_snapshot(
         snapshot.last_decoded_height = frame.height;
         snapshot.last_decoded_pixel_format = Some(match frame.pixel_format {
             PixelFormat::Rgb24 => "Rgb24".to_string(),
+            PixelFormat::Bgra32 => "Bgra32".to_string(),
             PixelFormat::D3d11Texture => "D3d11Texture".to_string(),
         });
         if let Some(frame_sink) = frame_sink.as_ref() {

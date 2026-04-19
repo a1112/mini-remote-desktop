@@ -16,9 +16,8 @@ use crate::{
 };
 
 use image::{codecs::png::PngEncoder, ColorType, ImageEncoder};
-use mrd_decode::DecodedFrame;
 use mrd_decode_nvdec::probe_runtime as probe_nvdec_runtime;
-use mrd_pipeline_core::{CapturedFrame, FrameCapture, FramePixelFormat};
+use mrd_pipeline_core::{CapturedFrame, DecodedFrame, FrameCapture, FramePixelFormat};
 use mrd_proto::{BackendRole, DeviceId, SessionId};
 use mrd_signal_client::encode_message;
 use mrd_signal_proto::{IceCandidate, SessionDescription, SignalMessage};
@@ -303,6 +302,7 @@ pub fn decoded_frame_snapshot_response(
         height: snapshot.height,
         pixel_format: match snapshot.pixel_format {
             mrd_decode::PixelFormat::Rgb24 => "Rgb24".to_string(),
+            mrd_decode::PixelFormat::Bgra32 => "Bgra32".to_string(),
             mrd_decode::PixelFormat::D3d11Texture => "D3d11Texture".to_string(),
         },
         bytes: snapshot.bytes,
