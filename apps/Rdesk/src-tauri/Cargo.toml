@@ -56,6 +56,7 @@ nix = { version = "0.29", features = ["signal", "process"] }
 openh264 = "0.8"
 rustls = "0.23.5"
 
+mrd-service = { path = "../../mrd-service" }
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["sysinfoapi", "minwindef"] }
 

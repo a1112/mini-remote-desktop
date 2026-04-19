@@ -6,16 +6,39 @@
 // Unlike hard_cut_smoke.rs which uses in-process IpcServer, these tests
 // go through the real transport layer.
 
-use mrd_ipc::{IpcRequest, IpcResponse, client::IpcClient};
+use mrd_ipc::{IpcRequest, IpcResponse, client::IpcClient, transport::IpcEndpoint};
 use mrd_proto::{SessionId, DeviceId};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 
+fn test_endpoint(test_name: &str) -> IpcEndpoint {
+    #[cfg(windows)]
+    {
+        IpcEndpoint::named_pipe(format!(
+            r"\\.\pipe\mrd-service-{}-{}",
+            test_name,
+            std::process::id()
+        ))
+    }
+
+    #[cfg(unix)]
+    {
+        IpcEndpoint::unix_socket(format!(
+            "/tmp/mrd-service-{}-{}.sock",
+            test_name,
+            std::process::id()
+        ))
+    }
+}
+
 /// Start a real IPC server in the background
 async fn start_ipc_server() -> anyhow::Result<()> {
     let app_state = Arc::new(mrd_service::app_state::AppState::new());
-    let server = mrd_service::ipc_server::IpcServer::new(app_state);
+    let server = mrd_service::ipc_server::IpcServer::new_with_endpoint(
+        app_state,
+        test_endpoint("helper"),
+    );
 
     // Run server in background
     tokio::spawn(async move {
@@ -30,10 +53,13 @@ async fn start_ipc_server() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn ipc_transport_health_check_works() {
+    let endpoint = test_endpoint("health");
+
     // Start server in background
+    let server_endpoint = endpoint.clone();
     let server_handle = tokio::spawn(async {
         let app_state = Arc::new(mrd_service::app_state::AppState::new());
-        let server = mrd_service::ipc_server::IpcServer::new(app_state);
+        let server = mrd_service::ipc_server::IpcServer::new_with_endpoint(app_state, server_endpoint);
         let _ = server.run().await;
     });
 
@@ -41,7 +67,7 @@ async fn ipc_transport_health_check_works() {
     sleep(Duration::from_millis(200)).await;
 
     // Connect via real transport
-    let mut client = IpcClient::new();
+    let mut client = IpcClient::with_endpoint(endpoint);
     let response = client.send_request(IpcRequest::ServiceHealth).await;
 
     // Clean up server
@@ -59,16 +85,19 @@ async fn ipc_transport_health_check_works() {
 
 #[tokio::test]
 async fn ipc_transport_device_registration_flow() {
+    let endpoint = test_endpoint("device-registration");
+
     // Start server in background
+    let server_endpoint = endpoint.clone();
     let server_handle = tokio::spawn(async {
         let app_state = Arc::new(mrd_service::app_state::AppState::new());
-        let server = mrd_service::ipc_server::IpcServer::new(app_state);
+        let server = mrd_service::ipc_server::IpcServer::new_with_endpoint(app_state, server_endpoint);
         let _ = server.run().await;
     });
 
     sleep(Duration::from_millis(200)).await;
 
-    let mut client = IpcClient::new();
+    let mut client = IpcClient::with_endpoint(endpoint);
     let device_id = DeviceId("transport-test-device".to_string());
 
     // Register device
@@ -110,16 +139,19 @@ async fn ipc_transport_device_registration_flow() {
 
 #[tokio::test]
 async fn ipc_transport_session_flow_through_transport() {
+    let endpoint = test_endpoint("session-flow");
+
     // Start server in background
+    let server_endpoint = endpoint.clone();
     let server_handle = tokio::spawn(async {
         let app_state = Arc::new(mrd_service::app_state::AppState::new());
-        let server = mrd_service::ipc_server::IpcServer::new(app_state);
+        let server = mrd_service::ipc_server::IpcServer::new_with_endpoint(app_state, server_endpoint);
         let _ = server.run().await;
     });
 
     sleep(Duration::from_millis(200)).await;
 
-    let mut client = IpcClient::new();
+    let mut client = IpcClient::with_endpoint(endpoint);
     let session_id = SessionId("transport-session-test".to_string());
 
     // Start session
@@ -176,16 +208,19 @@ async fn ipc_transport_session_flow_through_transport() {
 
 #[tokio::test]
 async fn ipc_transport_error_propagation() {
+    let endpoint = test_endpoint("error-propagation");
+
     // Start server in background
+    let server_endpoint = endpoint.clone();
     let server_handle = tokio::spawn(async {
         let app_state = Arc::new(mrd_service::app_state::AppState::new());
-        let server = mrd_service::ipc_server::IpcServer::new(app_state);
+        let server = mrd_service::ipc_server::IpcServer::new_with_endpoint(app_state, server_endpoint);
         let _ = server.run().await;
     });
 
     sleep(Duration::from_millis(200)).await;
 
-    let mut client = IpcClient::new();
+    let mut client = IpcClient::with_endpoint(endpoint);
 
     // Try to get snapshot of non-existent session
     let response = client.send_request(IpcRequest::SessionRuntimeSnapshot {

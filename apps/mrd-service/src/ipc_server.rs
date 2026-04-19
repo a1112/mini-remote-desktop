@@ -5,19 +5,25 @@
 
 use mrd_ipc::{IpcRequest, IpcResponse, transport};
 use mrd_application::ports::SessionSnapshot;
-use mrd_proto::{SessionId, DeviceId};
 use std::sync::Arc;
-use tokio::sync::Mutex;
-use crate::app_state::{AppState, SessionRegistry};
+use crate::{
+    app_state::AppState,
+    handlers::{session, transport as transport_handlers},
+};
 
 /// IPC server - handles requests from Rdesk shell
 pub struct IpcServer {
     app_state: Arc<AppState>,
+    endpoint: transport::IpcEndpoint,
 }
 
 impl IpcServer {
     pub fn new(app_state: Arc<AppState>) -> Self {
-        Self { app_state }
+        Self::new_with_endpoint(app_state, transport::IpcEndpoint::default_service())
+    }
+
+    pub fn new_with_endpoint(app_state: Arc<AppState>, endpoint: transport::IpcEndpoint) -> Self {
+        Self { app_state, endpoint }
     }
 
     /// Handle a single connection
@@ -96,133 +102,27 @@ impl IpcServer {
             }
 
             IpcRequest::StartSession { session_id, target_device_id, transport_kind } => {
-                tracing::info!("Starting session: {} -> {} via {}",
-                    session_id.0, target_device_id.0, transport_kind);
-
-                let mut sessions = self.app_state.sessions.lock().await;
-                sessions.insert(session_id.clone(), SessionSnapshot {
-                    session_id: session_id.clone(),
-                    transport: transport_kind.clone(),
-                    source_device_id: None,  // Will be set when initialized
-                    target_device_id: Some(target_device_id),
-                    local_listen_addr: None,
-                    local_server_name: None,
-                    local_cert_der_b64: None,
-                    remote_listen_addr: None,
-                    remote_server_name: None,
-                    remote_cert_der_b64: None,
-                    lifecycle_state: "connecting".to_string(),
-                    last_error: None,
-                    sender_active: false,
-                    receiver_active: false,
-                });
-
-                IpcResponse::SessionStarted { session_id }
+                session::start_session(&self.app_state, session_id, target_device_id, transport_kind).await
             }
 
             IpcRequest::AcceptSession { session_id, source_device_id } => {
-                tracing::info!("Accepting session: {} from {}", session_id.0, source_device_id.0);
-
-                let mut sessions = self.app_state.sessions.lock().await;
-                // Update existing session or create new one
-                let existing = sessions.get(&session_id);
-                if let Some(snap) = existing {
-                    // Update existing session
-                    let new_snapshot = SessionSnapshot {
-                        source_device_id: Some(source_device_id),
-                        ..snap.clone()
-                    };
-                    sessions.insert(session_id.clone(), new_snapshot);
-                } else {
-                    // Create new session
-                    sessions.insert(session_id.clone(), SessionSnapshot {
-                        session_id: session_id.clone(),
-                        transport: "unknown".to_string(),
-                        source_device_id: Some(source_device_id),
-                        target_device_id: None,
-                        local_listen_addr: None,
-                        local_server_name: None,
-                        local_cert_der_b64: None,
-                        remote_listen_addr: None,
-                        remote_server_name: None,
-                        remote_cert_der_b64: None,
-                        lifecycle_state: "listening".to_string(),
-                        last_error: None,
-                        sender_active: false,
-                        receiver_active: false,
-                    });
-                }
-
-                IpcResponse::SessionAccepted { session_id }
+                session::accept_session(&self.app_state, session_id, source_device_id).await
             }
 
             IpcRequest::StartSender { session_id } => {
-                tracing::info!("Starting sender for session: {}", session_id.0);
-
-                let mut sessions = self.app_state.sessions.lock().await;
-                let existing = sessions.get(&session_id);
-                if let Some(snap) = existing {
-                    // Update snapshot to mark sender as active
-                    let new_snapshot = SessionSnapshot {
-                        sender_active: true,
-                        ..snap.clone()
-                    };
-                    sessions.insert(session_id.clone(), new_snapshot);
-                    IpcResponse::SenderStarted { session_id }
-                } else {
-                    IpcResponse::Error {
-                        code: "E404".to_string(),
-                        message: format!("Session not found: {}", session_id.0),
-                    }
-                }
+                transport_handlers::start_sender(&self.app_state, session_id).await
             }
 
             IpcRequest::StartReceiver { session_id } => {
-                tracing::info!("Starting receiver for session: {}", session_id.0);
-
-                let mut sessions = self.app_state.sessions.lock().await;
-                let existing = sessions.get(&session_id);
-                if let Some(snap) = existing {
-                    // Update snapshot to mark receiver as active
-                    let new_snapshot = SessionSnapshot {
-                        receiver_active: true,
-                        ..snap.clone()
-                    };
-                    sessions.insert(session_id.clone(), new_snapshot);
-                    IpcResponse::ReceiverStarted { session_id }
-                } else {
-                    IpcResponse::Error {
-                        code: "E404".to_string(),
-                        message: format!("Session not found: {}", session_id.0),
-                    }
-                }
+                transport_handlers::start_receiver(&self.app_state, session_id).await
             }
 
             IpcRequest::StopSession { session_id } => {
-                tracing::info!("Stopping session: {}", session_id.0);
-
-                let mut sessions = self.app_state.sessions.lock().await;
-                sessions.remove(&session_id);
-
-                IpcResponse::SessionStopped { session_id }
+                session::stop_session(&self.app_state, session_id).await
             }
 
             IpcRequest::SessionRuntimeSnapshot { session_id } => {
-                let sessions = self.app_state.sessions.lock().await;
-                let snap = sessions.get(&session_id);
-                match snap {
-                    Some(s) => match self.snapshot_to_ipc(s) {
-                        Some(snapshot) => IpcResponse::SessionSnapshot { snapshot },
-                        None => IpcResponse::Error {
-                            code: "E500".to_string(),
-                            message: "Failed to create snapshot".to_string(),
-                        }
-                    },
-                    None => IpcResponse::Error {
-                        code: "E404".to_string(),
-                        message: format!("Session not found: {}", session_id.0),
-                    },
-                }
+                session::session_snapshot(&self.app_state, session_id).await
             }
 
             IpcRequest::RuntimeSnapshot => {
@@ -256,18 +156,7 @@ impl IpcServer {
             }
 
             IpcRequest::ProbeSnapshot { session_id } => {
-                // TODO: Implement real probe snapshot
-                IpcResponse::ProbeSnapshot {
-                    snapshot: mrd_ipc::ProbeSnapshot {
-                        session_id,
-                        frames_received: 0,
-                        frames_decoded: 0,
-                        frames_dropped: 0,
-                        current_fps: None,
-                        bitrate_mbps: None,
-                        last_error: None,
-                    }
-                }
+                transport_handlers::probe_snapshot(&self.app_state, session_id).await
             }
 
             IpcRequest::StreamProbeEvents => {
@@ -329,7 +218,7 @@ impl IpcServer {
 
     /// Run the IPC server (accepts connections in a loop)
     pub async fn run(&self) -> anyhow::Result<()> {
-        let server = transport::IpcServer::bind().await?;
+        let server = transport::IpcServer::bind_with_endpoint(self.endpoint.clone()).await?;
         tracing::info!("IPC server listening");
 
         let app_state = self.app_state.clone();
@@ -355,6 +244,7 @@ impl IpcServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mrd_proto::{DeviceId, SessionId};
     use std::sync::Arc;
 
     #[tokio::test]

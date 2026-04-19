@@ -2,11 +2,10 @@
 //
 // These handlers implement the core session orchestration logic.
 
-use mrd_ipc::{IpcRequest, IpcResponse};
+use mrd_ipc::IpcResponse;
 use mrd_application::ports::SessionSnapshot;
 use mrd_proto::{SessionId, DeviceId};
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use crate::app_state::AppState;
 
 /// Handle session start request

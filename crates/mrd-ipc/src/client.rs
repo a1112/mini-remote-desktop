@@ -3,7 +3,7 @@
 // Provides a client for communicating with mrd-service over local IPC.
 
 use anyhow::Result;
-use crate::{IpcRequest, IpcResponse};
+use crate::{transport::IpcEndpoint, IpcRequest, IpcResponse};
 use std::time::Duration;
 
 /// Reconnection configuration
@@ -53,20 +53,34 @@ pub struct IpcClient {
 
     /// Reconnection configuration
     reconnect_config: ReconnectConfig,
+
+    /// Target endpoint for the service connection.
+    endpoint: IpcEndpoint,
 }
 
 impl IpcClient {
     /// Create a new IPC client
     pub fn new() -> Self {
-        Self::with_config(ReconnectConfig::default())
+        Self::with_config_and_endpoint(ReconnectConfig::default(), IpcEndpoint::default_service())
+    }
+
+    /// Create a new IPC client that connects to a custom endpoint.
+    pub fn with_endpoint(endpoint: IpcEndpoint) -> Self {
+        Self::with_config_and_endpoint(ReconnectConfig::default(), endpoint)
     }
 
     /// Create a new IPC client with custom reconnection config
     pub fn with_config(config: ReconnectConfig) -> Self {
+        Self::with_config_and_endpoint(config, IpcEndpoint::default_service())
+    }
+
+    /// Create a new IPC client with custom config and endpoint.
+    pub fn with_config_and_endpoint(config: ReconnectConfig, endpoint: IpcEndpoint) -> Self {
         Self {
             stream: None,
             state: ConnectionState::Disconnected,
             reconnect_config: config,
+            endpoint,
         }
     }
 
@@ -85,20 +99,38 @@ impl IpcClient {
         self.reconnect_config = config;
     }
 
+    async fn connect_once(&mut self) -> Result<()> {
+        self.state = ConnectionState::Connecting;
+
+        match crate::transport::IpcClient::connect_with_endpoint(&self.endpoint).await {
+            Ok(stream) => {
+                self.stream = Some(stream);
+                self.state = ConnectionState::Connected;
+                Ok(())
+            }
+            Err(e) => {
+                self.state = ConnectionState::Disconnected;
+                Err(e)
+            }
+        }
+    }
+
     /// Ensure the stream is connected with auto-reconnect
     async fn ensure_connected(&mut self) -> Result<()> {
-        // If we have a stream, verify it's still alive
+        // If we have a stream, assume it is still usable until I/O says otherwise.
         if self.stream.is_some() {
             return Ok(());
         }
 
-        self.state = ConnectionState::Connecting;
+        if !self.reconnect_config.enabled {
+            return self.connect_once().await;
+        }
 
         let mut attempt = 0;
         let mut delay = self.reconnect_config.initial_backoff;
 
         loop {
-            match crate::transport::IpcClient::connect().await {
+            match crate::transport::IpcClient::connect_with_endpoint(&self.endpoint).await {
                 Ok(stream) => {
                     self.stream = Some(stream);
                     self.state = ConnectionState::Connected;
@@ -162,11 +194,26 @@ impl IpcClient {
 
     /// Send a request with a single attempt (no auto-reconnect on failure)
     pub async fn send_request_no_reconnect(&mut self, request: IpcRequest) -> Result<IpcResponse> {
-        self.ensure_connected().await?;
+        if self.stream.is_none() {
+            self.connect_once().await?;
+        }
         let stream = self.stream.as_mut().unwrap();
-        stream.send_request(&request).await?;
-        let response = stream.recv_response().await?;
-        Ok(response)
+
+        match stream.send_request(&request).await {
+            Ok(()) => match stream.recv_response().await {
+                Ok(response) => Ok(response),
+                Err(e) => {
+                    self.stream = None;
+                    self.state = ConnectionState::Disconnected;
+                    Err(e)
+                }
+            },
+            Err(e) => {
+                self.stream = None;
+                self.state = ConnectionState::Disconnected;
+                Err(e)
+            }
+        }
     }
 
     /// Explicitly disconnect from the service

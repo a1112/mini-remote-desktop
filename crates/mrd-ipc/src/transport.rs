@@ -12,6 +12,58 @@ pub const SERVICE_SOCKET_PATH: &str = "/tmp/mrd-service.sock";
 
 const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 
+/// IPC endpoint used by clients and servers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IpcEndpoint {
+    /// Windows named pipe endpoint.
+    #[cfg(windows)]
+    NamedPipe(String),
+    /// Unix domain socket endpoint.
+    #[cfg(unix)]
+    UnixSocket(String),
+}
+
+impl IpcEndpoint {
+    /// Default service endpoint used by production Rdesk and mrd-service.
+    pub fn default_service() -> Self {
+        #[cfg(windows)]
+        {
+            Self::NamedPipe(SERVICE_PIPE_NAME.to_string())
+        }
+
+        #[cfg(unix)]
+        {
+            Self::UnixSocket(SERVICE_SOCKET_PATH.to_string())
+        }
+    }
+
+    /// Construct a Windows named pipe endpoint.
+    #[cfg(windows)]
+    pub fn named_pipe(path: impl Into<String>) -> Self {
+        Self::NamedPipe(path.into())
+    }
+
+    /// Construct a Unix domain socket endpoint.
+    #[cfg(unix)]
+    pub fn unix_socket(path: impl Into<String>) -> Self {
+        Self::UnixSocket(path.into())
+    }
+
+    #[cfg(windows)]
+    fn pipe_name(&self) -> &str {
+        match self {
+            Self::NamedPipe(path) => path,
+        }
+    }
+
+    #[cfg(unix)]
+    fn socket_path(&self) -> &str {
+        match self {
+            Self::UnixSocket(path) => path,
+        }
+    }
+}
+
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 
@@ -54,8 +106,13 @@ pub struct IpcServer {
 #[cfg(unix)]
 impl IpcServer {
     pub async fn bind() -> Result<Self> {
-        let _ = std::fs::remove_file(SERVICE_SOCKET_PATH);
-        let listener = UnixListener::bind(SERVICE_SOCKET_PATH)?;
+        Self::bind_with_endpoint(IpcEndpoint::default_service()).await
+    }
+
+    pub async fn bind_with_endpoint(endpoint: IpcEndpoint) -> Result<Self> {
+        let socket_path = endpoint.socket_path();
+        let _ = std::fs::remove_file(socket_path);
+        let listener = UnixListener::bind(socket_path)?;
         Ok(Self { listener })
     }
 
@@ -68,21 +125,23 @@ impl IpcServer {
 // Windows server
 #[cfg(windows)]
 pub struct IpcServer {
-    _marker: std::marker::PhantomData<()>,
+    endpoint: IpcEndpoint,
 }
 
 #[cfg(windows)]
 impl IpcServer {
     pub async fn bind() -> Result<Self> {
-        Ok(Self {
-            _marker: std::marker::PhantomData,
-        })
+        Self::bind_with_endpoint(IpcEndpoint::default_service()).await
+    }
+
+    pub async fn bind_with_endpoint(endpoint: IpcEndpoint) -> Result<Self> {
+        Ok(Self { endpoint })
     }
 
     pub async fn accept(&self) -> Result<IpcStream> {
         let server = ServerOptions::new()
             .first_pipe_instance(false)
-            .create(SERVICE_PIPE_NAME)?;
+            .create(self.endpoint.pipe_name())?;
         server.connect().await?;
         Ok(IpcStream::Server(server))
     }
@@ -95,7 +154,11 @@ pub struct IpcClient;
 #[cfg(unix)]
 impl IpcClient {
     pub async fn connect() -> Result<IpcStream> {
-        let socket = UnixStream::connect(SERVICE_SOCKET_PATH).await?;
+        Self::connect_with_endpoint(&IpcEndpoint::default_service()).await
+    }
+
+    pub async fn connect_with_endpoint(endpoint: &IpcEndpoint) -> Result<IpcStream> {
+        let socket = UnixStream::connect(endpoint.socket_path()).await?;
         Ok(IpcStream { socket })
     }
 }
@@ -107,7 +170,11 @@ pub struct IpcClient;
 #[cfg(windows)]
 impl IpcClient {
     pub async fn connect() -> Result<IpcStream> {
-        let pipe = ClientOptions::new().open(SERVICE_PIPE_NAME)?;
+        Self::connect_with_endpoint(&IpcEndpoint::default_service()).await
+    }
+
+    pub async fn connect_with_endpoint(endpoint: &IpcEndpoint) -> Result<IpcStream> {
+        let pipe = ClientOptions::new().open(endpoint.pipe_name())?;
         Ok(IpcStream::Client(pipe))
     }
 }
