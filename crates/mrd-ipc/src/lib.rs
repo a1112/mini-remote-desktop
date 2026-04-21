@@ -12,6 +12,74 @@ pub mod transport;
 use serde::{Deserialize, Serialize};
 use mrd_proto::{SessionId, DeviceId};
 
+// === Shell / Lifecycle DTOs (Phase 2) ===
+// Defined first to avoid forward references
+
+/// Reason for opening the UI
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenUiReason {
+    /// User clicked tray menu
+    TrayOpen,
+    /// Incoming session request
+    SessionIncoming,
+    /// User action (e.g., from diagnostics)
+    UserRequest,
+    /// Opening diagnostics/debugging view
+    Diagnostics,
+}
+
+/// Result of UI open operation
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UiOpenStatus {
+    /// Focused existing UI window
+    FocusedExisting,
+    /// Spawned new UI process
+    SpawnedNew,
+    /// UI unavailable (e.g., not configured)
+    Unavailable,
+}
+
+/// Reason for UI detachment
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UiDetachReason {
+    /// User closed UI window normally
+    UserClose,
+    /// User explicitly quit UI
+    UserQuit,
+    /// UI crashed
+    Crash,
+    /// Connection lost
+    ConnectionLost,
+}
+
+/// Service shutdown mode
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ShutdownMode {
+    /// Graceful shutdown - finish active sessions if possible
+    Graceful,
+    /// Force shutdown - terminate immediately
+    Force,
+    /// Shutdown after sessions end
+    AfterSessions,
+}
+
+/// Shell/service status snapshot
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShellStatusSnapshot {
+    pub service_pid: u32,
+    pub ui_pid: Option<u32>,
+    pub tray_available: bool,
+    pub autostart_enabled: Option<bool>,
+    pub active_session_count: usize,
+    pub last_error: Option<String>,
+}
+
+// === Core IPC Types ===
+
 /// IPC request from Rdesk to mrd-service
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type")]
@@ -62,6 +130,37 @@ pub enum IpcRequest {
     StreamProbeEvents,
     /// Health check for service
     ServiceHealth,
+
+    // === Shell / Lifecycle Commands (Phase 2) ===
+
+    /// Request to open/focus the UI
+    OpenUi {
+        reason: OpenUiReason,
+    },
+    /// Request to focus an existing UI window
+    FocusUi,
+    /// Notify service that UI has attached
+    UiAttached {
+        pid: u32,
+        executable_path: Option<String>,
+    },
+    /// Notify service that UI is detaching
+    UiDetached {
+        pid: u32,
+        reason: UiDetachReason,
+    },
+    /// Get current shell/service status
+    GetShellStatus,
+    /// Set autostart enabled state
+    SetAutostart {
+        enabled: bool,
+    },
+    /// Get autostart status
+    GetAutostartStatus,
+    /// Request service shutdown
+    ShutdownService {
+        mode: ShutdownMode,
+    },
 }
 
 /// IPC response from mrd-service to Rdesk
@@ -120,6 +219,25 @@ pub enum IpcResponse {
     ServiceHealth {
         status: ServiceStatus,
     },
+
+    // === Shell / Lifecycle Responses (Phase 2) ===
+
+    /// Result of UI open request
+    UiOpenResult {
+        status: UiOpenStatus,
+        pid: Option<u32>,
+    },
+    /// Shell/service status snapshot
+    ShellStatus {
+        status: ShellStatusSnapshot,
+    },
+    /// Autostart status
+    AutostartStatus {
+        enabled: bool,
+        supported: bool,
+    },
+    /// Generic acknowledgment
+    Ack,
     /// Error response
     Error {
         code: String,

@@ -1,11 +1,23 @@
 /**
  * Service lifecycle management
  *
- * Wraps mrd-service lifecycle commands through the Tauri adapter.
- * This is the only place in the frontend that should call these commands.
+ * Phase 6: Rdesk no longer owns service lifecycle - mrd-service is the owner.
+ * This service now only provides bootstrap behavior and IPC-based status queries.
+ * All actual lifecycle operations go through mrd-service IPC commands.
+ *
+ * For service lifecycle operations (start, stop, restart), use the shell commands:
+ * - shell_get_status: check service status
+ * - shell_shutdown_service: request service shutdown
  */
 
 import * as tauriAdapter from '../adapters/tauri';
+import type {
+  AdapterResult,
+  DecodePolicy,
+  DecodePolicyResponse,
+  ShutdownMode,
+  ShellStatusSnapshot,
+} from '../adapters/tauri';
 
 // Re-export types from adapter
 export type { DecodePolicy, DecodePolicyResponse } from '../adapters/tauri';
@@ -26,51 +38,55 @@ export class ServiceError extends Error {
 /**
  * Unwrap an adapter result, throwing a ServiceError if failed
  */
-function unwrapAdapterResult<T>(result: tauriAdapter.AdapterResult<T>): T {
+function unwrapAdapterResult<T>(result: AdapterResult<T>): T {
   if (result.ok) {
     return result.value;
   }
   throw new ServiceError(result.error.message, result.error.code);
 }
 
+function isServiceUnavailable(message: string): boolean {
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes('connection refused') ||
+    normalized.includes('cannot find the file') ||
+    normalized.includes('no such file') ||
+    normalized.includes('pipe') ||
+    normalized.includes('os error 2')
+  );
+}
+
+async function getShellStatusSnapshot(): Promise<ShellStatusSnapshot | null> {
+  const result = await tauriAdapter.shellGetStatus();
+  if (result.ok) {
+    return result.value;
+  }
+
+  if (isServiceUnavailable(result.error.message)) {
+    return null;
+  }
+
+  throw new ServiceError(result.error.message, result.error.code);
+}
+
 // ============================================================================
-// Service Lifecycle Commands
+// Bootstrap Commands (Phase 6: bootstrap-only behavior)
 // ============================================================================
 
 /**
- * Start the mrd-service
+ * Bootstrap mrd-service if not already running via IPC
+ *
+ * Phase 6: This is the ONLY start method. It checks IPC first,
+ * and only spawns the process if service is unreachable.
+ * Returns true if bootstrap was performed.
  */
-export const startService = async (): Promise<boolean> => {
-  const result = await tauriAdapter.serviceStart();
+export const bootstrapServiceIfNeeded = async (): Promise<boolean> => {
+  const result = await tauriAdapter.serviceBootstrapIfNeeded();
   return unwrapAdapterResult(result);
 };
 
 /**
- * Stop the mrd-service
- */
-export const stopService = async (): Promise<boolean> => {
-  const result = await tauriAdapter.serviceStop();
-  return unwrapAdapterResult(result);
-};
-
-/**
- * Check if mrd-service is running
- */
-export const getServiceStatus = async (): Promise<boolean> => {
-  const result = await tauriAdapter.serviceStatus();
-  return unwrapAdapterResult(result);
-};
-
-/**
- * Perform health check on mrd-service
- */
-export const serviceHealthCheck = async (): Promise<boolean> => {
-  const result = await tauriAdapter.serviceHealthCheck();
-  return unwrapAdapterResult(result);
-};
-
-/**
- * Wait for service to be healthy
+ * Wait for service to be healthy (with timeout)
  */
 export const waitForServiceHealthy = async (
   timeoutSecs: number
@@ -80,53 +96,99 @@ export const waitForServiceHealthy = async (
 };
 
 /**
- * Restart service with backoff retry
+ * Check if this instance bootstrapped the service
  */
+export const didBootstrapService = async (): Promise<boolean> => {
+  const result = await tauriAdapter.serviceDidBootstrap();
+  return unwrapAdapterResult(result);
+};
+
+// ============================================================================
+// Legacy Commands (deprecated - use shell commands instead)
+// ============================================================================
+
+/** @deprecated Use bootstrapServiceIfNeeded instead */
+export const startService = bootstrapServiceIfNeeded;
+
+/** @deprecated Service is no longer owned by Rdesk - use shell_shutdown_service IPC command */
+export const stopService = async (): Promise<boolean> => {
+  const result = await tauriAdapter.shellShutdownService('graceful');
+  unwrapAdapterResult(result);
+  return true;
+};
+
+/** @deprecated Use shell_get_status IPC command instead */
+export const getServiceStatus = async (): Promise<boolean> => {
+  const snapshot = await getShellStatusSnapshot();
+  return snapshot !== null;
+};
+
+/** @deprecated Use shell_get_status IPC command instead */
+export const serviceHealthCheck = async (): Promise<boolean> => {
+  const snapshot = await getShellStatusSnapshot();
+  return snapshot !== null && snapshot.last_error === null;
+};
+
+/** @deprecated Service restart is no longer owned by Rdesk */
 export const restartServiceWithBackoff = async (
   maxAttempts: number
 ): Promise<boolean> => {
-  const result = await tauriAdapter.serviceRestartWithBackoff(maxAttempts);
-  return unwrapAdapterResult(result);
+  let attempt = 0;
+  let lastError: unknown;
+
+  while (attempt < maxAttempts) {
+    try {
+      return await serviceRestart();
+    } catch (error) {
+      lastError = error;
+      attempt += 1;
+      if (attempt < maxAttempts) {
+        await new Promise((resolve) => setTimeout(resolve, attempt * 250));
+      }
+    }
+  }
+
+  if (lastError instanceof Error) {
+    throw lastError;
+  }
+  throw new ServiceError('restartServiceWithBackoff failed');
 };
 
-/**
- * Get service PID
- */
+/** @deprecated Service lifecycle is no longer owned by Rdesk */
 export const getServicePid = async (): Promise<number | null> => {
-  const result = await tauriAdapter.servicePid();
-  return unwrapAdapterResult(result);
+  const snapshot = await getShellStatusSnapshot();
+  return snapshot?.service_pid ?? null;
 };
 
-/**
- * Restart the service
- */
+/** @deprecated Service restart is no longer owned by Rdesk */
 export const serviceRestart = async (): Promise<boolean> => {
-  const result = await tauriAdapter.serviceRestart();
-  return unwrapAdapterResult(result);
+  const stopResult = await tauriAdapter.shellShutdownService('graceful' as ShutdownMode);
+  unwrapAdapterResult(stopResult);
+
+  const started = await bootstrapServiceIfNeeded();
+  await waitForServiceHealthy(10).catch(() => false);
+  return started;
 };
 
-/**
- * Start service guard (monitoring)
- */
+/** @deprecated Service guard is no longer needed - mrd-service manages its own lifecycle */
 export const startServiceGuard = async (): Promise<string> => {
-  const result = await tauriAdapter.serviceStartGuard();
-  return unwrapAdapterResult(result);
+  throw new Error('startServiceGuard is deprecated. mrd-service manages its own lifecycle.');
 };
 
 // ============================================================================
-// Convenience exports for backward compatibility
+// Convenience exports for backward compatibility (all deprecated)
 // ============================================================================
 
-/** @deprecated Use startService instead */
+/** @deprecated Use bootstrapServiceIfNeeded instead */
 export const serviceStart = startService;
 
-/** @deprecated Use stopService instead */
+/** @deprecated Use shell_shutdown_service instead */
 export const serviceStop = stopService;
 
-/** @deprecated Use getServiceStatus instead */
+/** @deprecated Use shell_get_status instead */
 export const serviceStatus = getServiceStatus;
 
-/** @deprecated Use getServicePid instead */
+/** @deprecated Use shell_get_status instead */
 export const servicePid = getServicePid;
 
 /**

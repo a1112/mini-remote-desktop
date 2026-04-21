@@ -18,7 +18,7 @@ use mrd_proto::DeviceId;
 use render_window_registry::RenderWindowContext;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tauri::{Manager, menu::{Menu, MenuItem}};
+use tauri::Manager;
 
 #[derive(Clone)]
 struct AppState {
@@ -77,61 +77,25 @@ async fn set_decode_policy(
     .await
 }
 
-// mrd-service lifecycle commands
+// ============================================================================
+// Bootstrap Commands (Phase 6: bootstrap-only behavior)
+// ============================================================================
+
+/// Bootstrap mrd-service if not already running via IPC
+/// Phase 6: This is the ONLY start method. Returns true if bootstrap was performed.
 #[tauri::command]
-async fn service_start(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+async fn service_bootstrap_if_needed(state: tauri::State<'_, AppState>) -> Result<bool, String> {
     let manager = state.service_manager.clone();
 
     tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            manager.lock().unwrap().start().await.map_err(|e| e.to_string())
-        })
-    }).await.map_err(|e| e.to_string())??;
-
-    Ok(true)
-}
-
-#[tauri::command]
-async fn service_stop(state: tauri::State<'_, AppState>) -> Result<bool, String> {
-    let manager = state.service_manager.clone();
-
-    tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            manager.lock().unwrap().stop().await.map_err(|e| e.to_string())
-        })
-    }).await.map_err(|e| e.to_string())??;
-
-    Ok(true)
-}
-
-#[tauri::command]
-async fn service_status(state: tauri::State<'_, AppState>) -> Result<bool, String> {
-    let manager = state.service_manager.clone();
-
-    let is_running = tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            manager.lock().unwrap().is_running().await
-        })
-    }).await.map_err(|e| e.to_string())?;
-
-    Ok(is_running)
-}
-
-#[tauri::command]
-async fn service_health_check(state: tauri::State<'_, AppState>) -> Result<bool, String> {
-    let manager = state.service_manager.clone();
-
-    tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            manager.lock().unwrap().health_check().await.map_err(|e| e.to_string())
+            manager.lock().unwrap().bootstrap_if_needed().await.map_err(|e| e.to_string())
         })
     }).await.map_err(|e| e.to_string())?
 }
 
+/// Wait for service to be healthy (with timeout)
 #[tauri::command]
 async fn service_wait_for_healthy(state: tauri::State<'_, AppState>, timeout_secs: u64) -> Result<bool, String> {
     let manager = state.service_manager.clone();
@@ -144,60 +108,138 @@ async fn service_wait_for_healthy(state: tauri::State<'_, AppState>, timeout_sec
     }).await.map_err(|e| e.to_string())?
 }
 
+/// Check if this instance bootstrapped the service
 #[tauri::command]
-async fn service_restart_with_backoff(state: tauri::State<'_, AppState>, max_attempts: u32) -> Result<bool, String> {
+async fn service_did_bootstrap(state: tauri::State<'_, AppState>) -> Result<bool, String> {
     let manager = state.service_manager.clone();
 
     tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            manager.lock().unwrap().restart_with_backoff(max_attempts).await.map_err(|e| e.to_string())
-        })
-    }).await.map_err(|e| e.to_string())??;
-
-    Ok(true)
-}
-
-#[tauri::command]
-async fn service_pid(state: tauri::State<'_, AppState>) -> Result<Option<u32>, String> {
-    let manager = state.service_manager.clone();
-
-    tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            Ok(manager.lock().unwrap().pid().await)
+            Ok(manager.lock().unwrap().did_bootstrap().await)
         })
     }).await.map_err(|e| e.to_string())?
 }
 
+// ============================================================================
+// Shell / Lifecycle Commands (Phase 2)
+// ============================================================================
+
+/// Register UI presence with mrd-service
 #[tauri::command]
-async fn service_restart(state: tauri::State<'_, AppState>) -> Result<bool, String> {
-    let manager = state.service_manager.clone();
+async fn shell_ui_attached() -> Result<(), String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
 
-    tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            manager.lock().unwrap().restart().await.map_err(|e| e.to_string())
-        })
-    }).await.map_err(|e| e.to_string())??;
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client.send_request(IpcRequest::UiAttached {
+        pid: std::process::id(),
+        executable_path: std::env::current_exe()
+            .ok()
+            .and_then(|p| p.to_str().map(String::from)),
+    }).await.map_err(|e| e.to_string())?;
 
-    Ok(true)
+    match response {
+        IpcResponse::Ack => Ok(()),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
 }
 
-// Service guard command - starts monitoring the service
+/// Notify mrd-service that UI is detaching
 #[tauri::command]
-async fn service_start_guard(state: tauri::State<'_, AppState>) -> Result<String, String> {
-    use service_manager::{ServiceGuard, ServiceGuardConfig};
-    use std::sync::Arc;
+async fn shell_ui_detached(reason: String) -> Result<(), String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
 
-    let config = ServiceGuardConfig::default();
-    let guard = ServiceGuard::new(config).map_err(|e| e.to_string())?;
+    let detach_reason = match reason.as_str() {
+        "user_close" => mrd_ipc::UiDetachReason::UserClose,
+        "user_quit" => mrd_ipc::UiDetachReason::UserQuit,
+        "crash" => mrd_ipc::UiDetachReason::Crash,
+        "connection_lost" => mrd_ipc::UiDetachReason::ConnectionLost,
+        _ => return Err(format!("Unknown detach reason: {}", reason)),
+    };
 
-    // Start the guard in the background
-    let handle = guard.start();
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client.send_request(IpcRequest::UiDetached {
+        pid: std::process::id(),
+        reason: detach_reason,
+    }).await.map_err(|e| e.to_string())?;
 
-    // Return a handle ID (in a real implementation, you'd store this)
-    Ok(format!("Guard started with handle: {:?}", handle))
+    match response {
+        IpcResponse::Ack => Ok(()),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+/// Get shell/service status
+#[tauri::command]
+async fn shell_get_status() -> Result<mrd_ipc::ShellStatusSnapshot, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client.send_request(IpcRequest::GetShellStatus).await.map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::ShellStatus { status } => Ok(status),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+/// Request service shutdown (Phase 2: returns error until fully implemented)
+#[tauri::command]
+async fn shell_shutdown_service(mode: String) -> Result<(), String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+
+    let shutdown_mode = match mode.as_str() {
+        "graceful" => mrd_ipc::ShutdownMode::Graceful,
+        "force" => mrd_ipc::ShutdownMode::Force,
+        "after_sessions" => mrd_ipc::ShutdownMode::AfterSessions,
+        _ => return Err(format!("Unknown shutdown mode: {}", mode)),
+    };
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client.send_request(IpcRequest::ShutdownService { mode: shutdown_mode }).await.map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::Ack => Ok(()),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+/// Quit UI and stop service (explicit user action)
+///
+/// Phase 6: This now uses IPC ShutdownService instead of directly stopping
+/// the service process. Rdesk no longer owns service lifecycle.
+#[tauri::command]
+async fn shell_quit_ui_and_stop_service(
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+    // Notify service that UI is detaching
+    let _ = shell_ui_detached("user_quit".to_string()).await;
+
+    // Stop all active sessions via IPC
+    use mrd_ipc::{IpcRequest, IpcResponse};
+    let mut client = mrd_ipc::client::IpcClient::new();
+    if let Ok(IpcResponse::SessionList { sessions }) =
+        client.send_request(IpcRequest::ListSessions).await
+    {
+        for session_info in sessions {
+            let _ = client.send_request(IpcRequest::StopSession {
+                session_id: session_info.session_id,
+            }).await;
+        }
+    }
+
+    // Request service shutdown via IPC (Phase 6: service owns lifecycle)
+    let _ = client.send_request(IpcRequest::ShutdownService {
+        mode: mrd_ipc::ShutdownMode::Graceful,
+    }).await;
+
+    // Exit the UI application
+    app_handle.exit(0);
+    Ok(())
 }
 
 // ============================================================================
@@ -739,12 +781,12 @@ fn test_delete_preset(state: tauri::State<'_, AppState>, preset_id: String) -> R
 
 fn main() {
     let settings_path = default_settings_path();
-    let settings = load_settings(&settings_path).unwrap_or_else(|error| {
+    let _settings = load_settings(&settings_path).unwrap_or_else(|error| {
         eprintln!("failed to load app settings: {error}");
         AppSettings::default()
     });
 
-    // Create shared service manager
+    // Create shared service manager (bootstrap-only in Phase 6)
     let service_manager = std::sync::Arc::new(std::sync::Mutex::new(
         service_manager::ServiceManager::new()
             .expect("failed to create ServiceManager")
@@ -768,51 +810,27 @@ fn main() {
             test_orchestrator,
         })
         .setup(|app| {
-            // Step 1: Create system tray (before service startup)
-            let show_item = MenuItem::with_id(app, "show", "显示窗口", true, None::<&str>)?;
-            let hide_item = MenuItem::with_id(app, "hide", "隐藏窗口", true, None::<&str>)?;
-            let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-            let items: Vec<&dyn tauri::menu::IsMenuItem<_>> = vec![&show_item, &hide_item, &quit_item];
-            let menu = Menu::with_items(app, &items)?;
-
-            // Load tray icon from embedded PNG data
-            let icon_bytes = include_bytes!("../icons/tray-icon.png");
-            let icon = tauri::image::Image::new_owned(icon_bytes.to_vec(), 32, 32);
-
-            let _tray = tauri::tray::TrayIconBuilder::new()
-                .icon(icon)
-                .menu(&menu)
-                .on_menu_event(move |app, event| {
-                    let main_window = app.get_webview_window("main").unwrap();
-                    match event.id().0.as_str() {
-                        "show" => {
-                            let _ = main_window.show();
-                            let _ = main_window.set_focus();
-                        }
-                        "hide" => {
-                            let _ = main_window.hide();
-                        }
-                        "quit" => {
-                            // Trigger full cleanup via window close
-                            let _ = main_window.close();
-                        }
-                        _ => {}
-                    }
-                })
-                .build(app)?;
-
-            // Step 2: Auto-start mrd-service on application launch
+            // Phase 6: Tray is now owned by mrd-service, not Rdesk
+            // Step 1: Bootstrap mrd-service if not already running
             let service_mgr = app.state::<AppState>().service_manager.clone();
-            let _app_handle = app.handle().clone();
 
-            // Spawn a blocking task for service startup
+            // Spawn a blocking task for service bootstrap
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 rt.block_on(async move {
-                    // Start mrd-service
-                    if let Err(e) = service_mgr.lock().unwrap().start().await {
-                        eprintln!("Failed to auto-start mrd-service: {}", e);
-                        return;
+                    // Bootstrap mrd-service only if not reachable via IPC
+                    let bootstrapped = match service_mgr.lock().unwrap().bootstrap_if_needed().await {
+                        Ok(did_bootstrap) => did_bootstrap,
+                        Err(e) => {
+                            eprintln!("Failed to bootstrap mrd-service: {}", e);
+                            return;
+                        }
+                    };
+
+                    if bootstrapped {
+                        println!("Bootstrapped mrd-service");
+                    } else {
+                        println!("mrd-service already running");
                     }
 
                     // Wait for service to be healthy (max 30 seconds)
@@ -820,47 +838,38 @@ fn main() {
                         eprintln!("mrd-service health check failed: {}", e);
                     } else {
                         println!("mrd-service is ready");
+
+                        // Register UI presence with service
+                        if let Err(e) = shell_ui_attached().await {
+                            eprintln!("Failed to register UI presence: {}", e);
+                        }
                     }
                 });
             });
 
-            // Step 3: Set up window close event listener for cleanup
-            // Close flow: Stop sessions → Stop service → Cleanup tray → Exit
+            // Step 2: Set up window close event listener
+            // Phase 6: Normal close does NOT stop service - service continues running
+            // Use shell_shutdown_service IPC command for service shutdown
             let main_window = app.get_webview_window("main").unwrap();
-            let service_mgr_for_close = app.state::<AppState>().service_manager.clone();
             let app_handle_for_close = app.handle().clone();
 
             main_window.on_window_event(move |event| {
                 if let tauri::WindowEvent::CloseRequested { .. } = event {
-                    // Intercept close request and perform full cleanup
-                    println!("Window close requested - performing cleanup...");
+                    // Notify service of UI detachment, but do NOT stop service
+                    println!("Window close requested - detaching UI (service stays running)...");
 
-                    let mgr = service_mgr_for_close.clone();
                     let handle = app_handle_for_close.clone();
 
-                    // Spawn cleanup task
+                    // Spawn task to notify service and exit UI only
                     std::thread::spawn(move || {
                         let rt = tokio::runtime::Runtime::new().unwrap();
                         rt.block_on(async move {
-                            // Stop all active sessions via IPC
-                            use mrd_ipc::{IpcRequest, IpcResponse};
-                            let mut client = mrd_ipc::client::IpcClient::new();
-                            if let Ok(IpcResponse::SessionList { sessions }) =
-                                client.send_request(IpcRequest::ListSessions).await
-                            {
-                                for session_info in sessions {
-                                    let _ = client.send_request(IpcRequest::StopSession {
-                                        session_id: session_info.session_id,
-                                    }).await;
-                                }
-                            }
-
-                            // Stop mrd-service
-                            let _ = mgr.lock().unwrap().stop().await;
-
-                            // Exit the application (tray will be cleaned up automatically)
-                            handle.exit(0);
+                            // Notify service that UI is detaching
+                            let _ = shell_ui_detached("user_close".to_string()).await;
                         });
+
+                        // Exit the UI only (service continues running)
+                        handle.exit(0);
                     });
                 }
             });
@@ -876,15 +885,10 @@ fn main() {
             nvdec_runtime_probe,
             decode_policy,
             set_decode_policy,
-            // Service lifecycle commands
-            service_start,
-            service_stop,
-            service_status,
-            service_health_check,
+            // Bootstrap commands (Phase 6: bootstrap-only behavior)
+            service_bootstrap_if_needed,
             service_wait_for_healthy,
-            service_restart_with_backoff,
-            service_pid,
-            service_start_guard,
+            service_did_bootstrap,
             // IPC-based commands (all session control goes through mrd-service)
             ipc_register_device,
             ipc_list_devices,
@@ -902,6 +906,12 @@ fn main() {
             register_device,
             check_device_registration,
             webrtc_session_list_via_ipc,
+            // Shell / Lifecycle commands (Phase 2-6: service owns lifecycle)
+            shell_ui_attached,
+            shell_ui_detached,
+            shell_get_status,
+            shell_shutdown_service,
+            shell_quit_ui_and_stop_service,
             // Test harness commands
             test_harness_start,
             test_harness_stop,

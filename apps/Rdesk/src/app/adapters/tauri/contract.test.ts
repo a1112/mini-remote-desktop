@@ -17,43 +17,25 @@ describe('Tauri Adapter Contract', () => {
   });
 
   /**
-   * Service lifecycle commands
+   * Bootstrap and shell lifecycle commands
    */
   describe('service lifecycle commands', () => {
-    it('service_start calls correct command', async () => {
+    it('service_bootstrap_if_needed calls correct command', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue(true);
+
+      await adapter.serviceBootstrapIfNeeded();
+
+      expect(mockInvoke).toHaveBeenCalledWith('service_bootstrap_if_needed', undefined);
+    });
+
+    it('service_start compatibility shim bootstraps via the new command', async () => {
       const mockInvoke = getMockInvoke();
       mockInvoke.mockResolvedValue(true);
 
       await adapter.serviceStart();
 
-      expect(mockInvoke).toHaveBeenCalledWith('service_start', undefined);
-    });
-
-    it('service_stop calls correct command', async () => {
-      const mockInvoke = getMockInvoke();
-      mockInvoke.mockResolvedValue(true);
-
-      await adapter.serviceStop();
-
-      expect(mockInvoke).toHaveBeenCalledWith('service_stop', undefined);
-    });
-
-    it('service_status calls correct command', async () => {
-      const mockInvoke = getMockInvoke();
-      mockInvoke.mockResolvedValue(true);
-
-      await adapter.serviceStatus();
-
-      expect(mockInvoke).toHaveBeenCalledWith('service_status', undefined);
-    });
-
-    it('service_health_check calls correct command', async () => {
-      const mockInvoke = getMockInvoke();
-      mockInvoke.mockResolvedValue(true);
-
-      await adapter.serviceHealthCheck();
-
-      expect(mockInvoke).toHaveBeenCalledWith('service_health_check', undefined);
+      expect(mockInvoke).toHaveBeenCalledWith('service_bootstrap_if_needed', undefined);
     });
 
     it('service_wait_for_healthy calls correct command with args', async () => {
@@ -67,42 +49,62 @@ describe('Tauri Adapter Contract', () => {
       });
     });
 
-    it('service_restart_with_backoff calls correct command with args', async () => {
+    it('service_did_bootstrap calls correct command', async () => {
       const mockInvoke = getMockInvoke();
       mockInvoke.mockResolvedValue(true);
 
-      await adapter.serviceRestartWithBackoff(3);
+      await adapter.serviceDidBootstrap();
 
-      expect(mockInvoke).toHaveBeenCalledWith('service_restart_with_backoff', {
-        maxAttempts: 3,
+      expect(mockInvoke).toHaveBeenCalledWith('service_did_bootstrap', undefined);
+    });
+
+    it('shell_get_status calls correct command', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue({
+        service_pid: 12345,
+        ui_pid: 54321,
+        tray_available: true,
+        autostart_enabled: true,
+        active_session_count: 0,
+        last_error: null,
+      });
+
+      await adapter.shellGetStatus();
+
+      expect(mockInvoke).toHaveBeenCalledWith('shell_get_status', undefined);
+    });
+
+    it('shell_shutdown_service calls correct command with args', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue(null);
+
+      await adapter.shellShutdownService('graceful');
+
+      expect(mockInvoke).toHaveBeenCalledWith('shell_shutdown_service', {
+        mode: 'graceful',
       });
     });
 
-    it('service_pid calls correct command', async () => {
-      const mockInvoke = getMockInvoke();
-      mockInvoke.mockResolvedValue(12345);
-
-      await adapter.servicePid();
-
-      expect(mockInvoke).toHaveBeenCalledWith('service_pid', undefined);
-    });
-
-    it('service_restart calls correct command', async () => {
+    it('deprecated lifecycle wrappers return errors instead of calling removed commands', async () => {
       const mockInvoke = getMockInvoke();
       mockInvoke.mockResolvedValue(true);
 
-      await adapter.serviceRestart();
+      const stopResult = await adapter.serviceStop();
+      const statusResult = await adapter.serviceStatus();
+      const healthResult = await adapter.serviceHealthCheck();
+      const pidResult = await adapter.servicePid();
+      const restartResult = await adapter.serviceRestart();
+      const restartBackoffResult = await adapter.serviceRestartWithBackoff(3);
+      const guardResult = await adapter.serviceStartGuard();
 
-      expect(mockInvoke).toHaveBeenCalledWith('service_restart', undefined);
-    });
-
-    it('service_start_guard calls correct command', async () => {
-      const mockInvoke = getMockInvoke();
-      mockInvoke.mockResolvedValue('Guard started');
-
-      await adapter.serviceStartGuard();
-
-      expect(mockInvoke).toHaveBeenCalledWith('service_start_guard', undefined);
+      expect(mockInvoke).not.toHaveBeenCalledWith('service_stop', undefined);
+      expect(stopResult.ok).toBe(false);
+      expect(statusResult.ok).toBe(false);
+      expect(healthResult.ok).toBe(false);
+      expect(pidResult.ok).toBe(false);
+      expect(restartResult.ok).toBe(false);
+      expect(restartBackoffResult.ok).toBe(false);
+      expect(guardResult.ok).toBe(false);
     });
   });
 
@@ -334,7 +336,7 @@ describe('Tauri Adapter Contract', () => {
       const mockInvoke = getMockInvoke();
       mockInvoke.mockRejectedValue(new Error('Command failed'));
 
-      const result = await adapter.serviceStatus();
+      const result = await adapter.serviceBootstrapIfNeeded();
 
       expect(result.ok).toBe(false);
       if (!result.ok) {
@@ -346,7 +348,7 @@ describe('Tauri Adapter Contract', () => {
       const mockInvoke = getMockInvoke();
       mockInvoke.mockRejectedValue('String error');
 
-      const result = await adapter.serviceStatus();
+      const result = await adapter.serviceBootstrapIfNeeded();
 
       expect(result.ok).toBe(false);
       if (!result.ok) {
@@ -358,7 +360,7 @@ describe('Tauri Adapter Contract', () => {
       const mockInvoke = getMockInvoke();
       mockInvoke.mockResolvedValue(true);
 
-      const result = await adapter.serviceStatus();
+      const result = await adapter.serviceBootstrapIfNeeded();
 
       expect(result.ok).toBe(true);
       if (result.ok) {

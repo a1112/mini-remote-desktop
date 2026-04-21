@@ -16,6 +16,8 @@ import type {
   DecodePolicy,
   DecodePolicyResponse,
   HardwareInfo,
+  ShutdownMode,
+  ShellStatusSnapshot,
   SessionRuntimeSnapshot,
   HarnessMetrics,
   FrameData,
@@ -47,39 +49,22 @@ async function invokeAdapter<T>(
 }
 
 // ============================================================================
-// Service Lifecycle Commands
+// Bootstrap Commands (Phase 6: bootstrap-only behavior)
 // ============================================================================
 
 /**
- * Start the mrd-service
+ * Bootstrap mrd-service if not already running via IPC
+ *
+ * Phase 6: This is the ONLY start method. It checks IPC first,
+ * and only spawns the process if service is unreachable.
+ * Returns true if bootstrap was performed.
  */
-export async function serviceStart(): Promise<AdapterResult<boolean>> {
-  return invokeAdapter<boolean>('service_start');
+export async function serviceBootstrapIfNeeded(): Promise<AdapterResult<boolean>> {
+  return invokeAdapter<boolean>('service_bootstrap_if_needed');
 }
 
 /**
- * Stop the mrd-service
- */
-export async function serviceStop(): Promise<AdapterResult<boolean>> {
-  return invokeAdapter<boolean>('service_stop');
-}
-
-/**
- * Check if mrd-service is running
- */
-export async function serviceStatus(): Promise<AdapterResult<boolean>> {
-  return invokeAdapter<boolean>('service_status');
-}
-
-/**
- * Health check for mrd-service
- */
-export async function serviceHealthCheck(): Promise<AdapterResult<boolean>> {
-  return invokeAdapter<boolean>('service_health_check');
-}
-
-/**
- * Wait for service to be healthy
+ * Wait for service to be healthy (with timeout)
  */
 export async function serviceWaitForHealthy(
   timeoutSecs: number
@@ -90,35 +75,72 @@ export async function serviceWaitForHealthy(
 }
 
 /**
- * Restart service with backoff retry
+ * Check if this instance bootstrapped the service
  */
+export async function serviceDidBootstrap(): Promise<AdapterResult<boolean>> {
+  return invokeAdapter<boolean>('service_did_bootstrap');
+}
+
+/**
+ * Get the shell-owned service/UI status snapshot via IPC.
+ */
+export async function shellGetStatus(): Promise<AdapterResult<ShellStatusSnapshot>> {
+  return invokeAdapter<ShellStatusSnapshot>('shell_get_status');
+}
+
+/**
+ * Ask mrd-service to shut itself down with the given mode.
+ */
+export async function shellShutdownService(
+  mode: ShutdownMode
+): Promise<AdapterResult<void>> {
+  return invokeAdapter<void>('shell_shutdown_service', { mode });
+}
+
+// ============================================================================
+// Legacy Service Lifecycle Commands (deprecated - use shell commands instead)
+// ============================================================================
+
+/** @deprecated Use serviceBootstrapIfNeeded instead */
+export async function serviceStart(): Promise<AdapterResult<boolean>> {
+  return invokeAdapter<boolean>('service_bootstrap_if_needed');
+}
+
+/** @deprecated Service is no longer owned by Rdesk - use shell_shutdown_service instead */
+export async function serviceStop(): Promise<AdapterResult<boolean>> {
+  return { ok: false, error: { message: 'serviceStop is deprecated. Use shell_shutdown_service IPC command instead.' } };
+}
+
+/** @deprecated Use shell_get_status instead */
+export async function serviceStatus(): Promise<AdapterResult<boolean>> {
+  return { ok: false, error: { message: 'serviceStatus is deprecated. Use shell_get_status IPC command instead.' } };
+}
+
+/** @deprecated Use shell_get_status instead */
+export async function serviceHealthCheck(): Promise<AdapterResult<boolean>> {
+  return { ok: false, error: { message: 'serviceHealthCheck is deprecated. Use shell_get_status IPC command instead.' } };
+}
+
+/** @deprecated Service lifecycle is no longer owned by Rdesk */
 export async function serviceRestartWithBackoff(
-  maxAttempts: number
+  _maxAttempts: number
 ): Promise<AdapterResult<boolean>> {
-  return invokeAdapter<boolean>('service_restart_with_backoff', {
-    maxAttempts,
-  });
+  return { ok: false, error: { message: 'serviceRestartWithBackoff is deprecated. Service restart is owned by mrd-service.' } };
 }
 
-/**
- * Get service PID
- */
+/** @deprecated Use shell_get_status instead */
 export async function servicePid(): Promise<AdapterResult<number | null>> {
-  return invokeAdapter<number | null>('service_pid');
+  return { ok: false, error: { message: 'servicePid is deprecated. Use shell_get_status IPC command instead.' } };
 }
 
-/**
- * Restart the service
- */
+/** @deprecated Service lifecycle is no longer owned by Rdesk */
 export async function serviceRestart(): Promise<AdapterResult<boolean>> {
-  return invokeAdapter<boolean>('service_restart');
+  return { ok: false, error: { message: 'serviceRestart is deprecated. Service restart is owned by mrd-service.' } };
 }
 
-/**
- * Start service guard (monitoring)
- */
+/** @deprecated Service guard is no longer needed - mrd-service manages its own lifecycle */
 export async function serviceStartGuard(): Promise<AdapterResult<string>> {
-  return invokeAdapter<string>('service_start_guard');
+  return { ok: false, error: { message: 'serviceStartGuard is deprecated. mrd-service manages its own lifecycle.' } };
 }
 
 // ============================================================================

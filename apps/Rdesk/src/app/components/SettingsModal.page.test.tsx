@@ -53,6 +53,15 @@ function renderSettingsModal(open: boolean = true) {
 }
 
 describe('SettingsModal - Page Level Tests', () => {
+  const runningStatus = {
+    service_pid: 12345,
+    ui_pid: 54321,
+    tray_available: true,
+    autostart_enabled: true,
+    active_session_count: 0,
+    last_error: null,
+  };
+
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -72,9 +81,7 @@ describe('SettingsModal - Page Level Tests', () => {
     it('renders modal when open', async () => {
       const mockInvoke = getMockInvoke();
       mockInvoke.mockImplementation((cmd: string) => {
-        if (cmd === 'service_status') return Promise.resolve(true);
-        if (cmd === 'service_health_check') return Promise.resolve(true);
-        if (cmd === 'service_pid') return Promise.resolve(12345);
+        if (cmd === 'shell_get_status') return Promise.resolve(runningStatus);
         return Promise.resolve(true);
       });
 
@@ -121,9 +128,7 @@ describe('SettingsModal - Page Level Tests', () => {
     it('fetches service status on mount', async () => {
       const mockInvoke = getMockInvoke();
       mockInvoke.mockImplementation((cmd: string) => {
-        if (cmd === 'service_status') return Promise.resolve(true);
-        if (cmd === 'service_health_check') return Promise.resolve(true);
-        if (cmd === 'service_pid') return Promise.resolve(12345);
+        if (cmd === 'shell_get_status') return Promise.resolve(runningStatus);
         return Promise.resolve(true);
       });
 
@@ -139,16 +144,14 @@ describe('SettingsModal - Page Level Tests', () => {
 
       // Service status should have been fetched
       await waitFor(() => {
-        expect(mockInvoke).toHaveBeenCalledWith('service_status', undefined);
+        expect(mockInvoke).toHaveBeenCalledWith('shell_get_status', undefined);
       });
     });
 
     it('displays running status when service is active', async () => {
       const mockInvoke = getMockInvoke();
       mockInvoke.mockImplementation((cmd: string) => {
-        if (cmd === 'service_status') return Promise.resolve(true);
-        if (cmd === 'service_health_check') return Promise.resolve(true);
-        if (cmd === 'service_pid') return Promise.resolve(12345);
+        if (cmd === 'shell_get_status') return Promise.resolve(runningStatus);
         return Promise.resolve(true);
       });
 
@@ -169,10 +172,10 @@ describe('SettingsModal - Page Level Tests', () => {
     it('displays stopped status when service is not running', async () => {
       const mockInvoke = getMockInvoke();
       mockInvoke.mockImplementation((cmd: string) => {
-        if (cmd === 'service_status') return Promise.resolve(false);
-        if (cmd === 'service_health_check') return Promise.resolve(false);
-        if (cmd === 'service_pid') return Promise.resolve(null);
-        return Promise.resolve(false);
+        if (cmd === 'shell_get_status') {
+          return Promise.reject(new Error('connection refused'));
+        }
+        return Promise.resolve(true);
       });
 
       renderSettingsModal(true);
@@ -214,9 +217,7 @@ describe('SettingsModal - Page Level Tests', () => {
     it('shows deprecation notice for NVDEC features', async () => {
       const mockInvoke = getMockInvoke();
       mockInvoke.mockImplementation((cmd: string) => {
-        if (cmd === 'service_status') return Promise.resolve(true);
-        if (cmd === 'service_health_check') return Promise.resolve(true);
-        if (cmd === 'service_pid') return Promise.resolve(12345);
+        if (cmd === 'shell_get_status') return Promise.resolve(runningStatus);
         return Promise.resolve(true);
       });
 
@@ -279,7 +280,12 @@ describe('SettingsModal - Page Level Tests', () => {
   describe('error handling', () => {
     it('displays error message when service status fetch fails', async () => {
       const mockInvoke = getMockInvoke();
-      mockInvoke.mockRejectedValue(new Error('Connection failed'));
+      mockInvoke.mockImplementation((cmd: string) => {
+        if (cmd === 'shell_get_status') {
+          return Promise.reject(new Error('Unexpected response'));
+        }
+        return Promise.resolve(true);
+      });
 
       renderSettingsModal(true);
 
@@ -290,22 +296,17 @@ describe('SettingsModal - Page Level Tests', () => {
       await userEvent.click(screen.getByText('网络'));
 
       await waitFor(() => {
-        expect(screen.getByText(/读取服务状态失败|Connection failed/)).toBeInTheDocument();
+        expect(screen.getByText(/读取服务状态失败|Unexpected response/)).toBeInTheDocument();
       });
     });
 
     it('displays error message when service action fails', async () => {
       const mockInvoke = getMockInvoke();
-      let callCount = 0;
-      // Initial load succeeds, then start fails
-      mockInvoke.mockImplementation(() => {
-        callCount++;
-        if (callCount <= 3) {
-          // Initial status checks
-          return Promise.resolve(false);
+      mockInvoke.mockImplementation((cmd: string) => {
+        if (cmd === 'shell_get_status') {
+          return Promise.reject(new Error('connection refused'));
         }
-        // Start command fails
-        if (callCount === 4) {
+        if (cmd === 'service_bootstrap_if_needed') {
           return Promise.reject(new Error('Start failed'));
         }
         return Promise.resolve(true);
@@ -346,7 +347,10 @@ describe('SettingsModal - Page Level Tests', () => {
   describe('user interactions', () => {
     it('closes modal when X button is clicked', async () => {
       const mockInvoke = getMockInvoke();
-      mockInvoke.mockResolvedValue(true);
+      mockInvoke.mockImplementation((cmd: string) => {
+        if (cmd === 'shell_get_status') return Promise.resolve(runningStatus);
+        return Promise.resolve(true);
+      });
 
       const { onClose } = renderSettingsModal(true);
 
@@ -368,7 +372,10 @@ describe('SettingsModal - Page Level Tests', () => {
 
     it('closes modal when Escape key is pressed', async () => {
       const mockInvoke = getMockInvoke();
-      mockInvoke.mockResolvedValue(true);
+      mockInvoke.mockImplementation((cmd: string) => {
+        if (cmd === 'shell_get_status') return Promise.resolve(runningStatus);
+        return Promise.resolve(true);
+      });
 
       const { onClose } = renderSettingsModal(true);
 
@@ -383,7 +390,10 @@ describe('SettingsModal - Page Level Tests', () => {
 
     it('switches between sections', async () => {
       const mockInvoke = getMockInvoke();
-      mockInvoke.mockResolvedValue(true);
+      mockInvoke.mockImplementation((cmd: string) => {
+        if (cmd === 'shell_get_status') return Promise.resolve(runningStatus);
+        return Promise.resolve(true);
+      });
 
       renderSettingsModal(true);
 
@@ -408,7 +418,10 @@ describe('SettingsModal - Page Level Tests', () => {
 
     it('toggles switches in general section', async () => {
       const mockInvoke = getMockInvoke();
-      mockInvoke.mockResolvedValue(true);
+      mockInvoke.mockImplementation((cmd: string) => {
+        if (cmd === 'shell_get_status') return Promise.resolve(runningStatus);
+        return Promise.resolve(true);
+      });
 
       renderSettingsModal(true);
 
@@ -438,26 +451,20 @@ describe('SettingsModal - Page Level Tests', () => {
   // ========================================================================
 
   describe('service lifecycle actions', () => {
-    it('calls service_start when start button is clicked', async () => {
+    it('calls service_bootstrap_if_needed when start button is clicked', async () => {
       const mockInvoke = getMockInvoke();
       let startCalled = false;
 
       mockInvoke.mockImplementation((cmd: string) => {
-        if (cmd === 'service_start') {
+        if (cmd === 'service_bootstrap_if_needed') {
           startCalled = true;
           return Promise.resolve(true);
         }
-        // Status checks return not running initially
-        if (startCalled) {
-          // After start, status returns running
-          if (cmd === 'service_status') return Promise.resolve(true);
-          if (cmd === 'service_health_check') return Promise.resolve(true);
-          if (cmd === 'service_pid') return Promise.resolve(12345);
-        } else {
-          // Before start, status returns not running
-          if (cmd === 'service_status') return Promise.resolve(false);
-          if (cmd === 'service_health_check') return Promise.resolve(false);
-          if (cmd === 'service_pid') return Promise.resolve(null);
+        if (cmd === 'shell_get_status') {
+          if (startCalled) {
+            return Promise.resolve(runningStatus);
+          }
+          return Promise.reject(new Error('connection refused'));
         }
         return Promise.resolve(true);
       });

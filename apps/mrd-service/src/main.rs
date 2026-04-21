@@ -6,10 +6,12 @@
 // - Media pipeline coordination
 // - Transport management
 // - IPC server for Rdesk UI shell
+// - Shell lifecycle (UI launcher, tray, autostart)
 
 mod app_state;
 mod handlers;
 mod ipc_server;
+mod shell;
 
 use anyhow::Result;
 use tracing::{info, Level};
@@ -30,9 +32,25 @@ async fn main() -> Result<()> {
 
     info!("mrd-service starting...");
 
-    // Initialize application state
-    let app_state = Arc::new(AppState::new());
+    // Initialize tray (Phase 4)
+    #[cfg(windows)]
+    let tray: Arc<std::sync::Mutex<dyn shell::TrayPort + Send + Sync>> =
+        Arc::new(std::sync::Mutex::new(shell::windows::WindowsTray::new()));
+    #[cfg(not(windows))]
+    let tray: Arc<std::sync::Mutex<dyn shell::TrayPort + Send + Sync>> =
+        Arc::new(std::sync::Mutex::new(shell::NoOpTray::with_availability(false)));
+
+    // Initialize application state with tray
+    let app_state = Arc::new(AppState::with_tray(tray.clone()));
     info!("Application state initialized");
+
+    // Install tray with initial model
+    let initial_model = shell::TrayModel::default();
+    if let Err(e) = tray.lock().unwrap().install(initial_model) {
+        info!("Tray not available: {}", e);
+    } else {
+        info!("Tray installed");
+    }
 
     // Initialize IPC server with app state
     let ipc_server = IpcServer::new(app_state);
@@ -51,6 +69,10 @@ async fn main() -> Result<()> {
             info!("Shutdown requested");
         }
     }
+
+    // Shutdown tray
+    info!("Shutting down tray...");
+    let _ = tray.lock().unwrap().shutdown();
 
     info!("mrd-service shutting down");
     Ok(())

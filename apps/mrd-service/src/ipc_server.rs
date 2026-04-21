@@ -9,12 +9,15 @@ use std::sync::Arc;
 use crate::{
     app_state::AppState,
     handlers::{session, transport as transport_handlers},
+    shell::{UiLauncherPort, AutostartPort},
 };
 
 /// IPC server - handles requests from Rdesk shell
 pub struct IpcServer {
     app_state: Arc<AppState>,
     endpoint: transport::IpcEndpoint,
+    ui_launcher: Arc<std::sync::Mutex<crate::shell::InMemoryUiLauncher>>,
+    autostart: Arc<std::sync::Mutex<dyn AutostartPort + Send + Sync>>,
 }
 
 impl IpcServer {
@@ -23,7 +26,37 @@ impl IpcServer {
     }
 
     pub fn new_with_endpoint(app_state: Arc<AppState>, endpoint: transport::IpcEndpoint) -> Self {
-        Self { app_state, endpoint }
+        let autostart: Arc<std::sync::Mutex<dyn AutostartPort + Send + Sync>> = if cfg!(windows) {
+            Arc::new(std::sync::Mutex::new(crate::shell::WindowsAutostart::new("mrd-service")))
+        } else {
+            Arc::new(std::sync::Mutex::new(crate::shell::NoOpAutostart::new("mrd-service")))
+        };
+
+        Self {
+            app_state,
+            endpoint,
+            ui_launcher: Arc::new(std::sync::Mutex::new(crate::shell::InMemoryUiLauncher::new())),
+            autostart,
+        }
+    }
+
+    pub fn new_with_launcher(
+        app_state: Arc<AppState>,
+        endpoint: transport::IpcEndpoint,
+        ui_launcher: Arc<std::sync::Mutex<crate::shell::InMemoryUiLauncher>>,
+    ) -> Self {
+        let autostart: Arc<std::sync::Mutex<dyn AutostartPort + Send + Sync>> = if cfg!(windows) {
+            Arc::new(std::sync::Mutex::new(crate::shell::WindowsAutostart::new("mrd-service")))
+        } else {
+            Arc::new(std::sync::Mutex::new(crate::shell::NoOpAutostart::new("mrd-service")))
+        };
+
+        Self {
+            app_state,
+            endpoint,
+            ui_launcher,
+            autostart,
+        }
     }
 
     /// Handle a single connection
@@ -165,6 +198,192 @@ impl IpcServer {
                     message: "Probe streaming not implemented yet".to_string(),
                 }
             }
+
+            // === Shell / Lifecycle Commands (Phase 2) ===
+
+            IpcRequest::OpenUi { reason } => {
+                // Phase 3: Use UI launcher to launch or focus UI
+                tracing::info!("OpenUi requested: reason={:?}", reason);
+                let launcher = self.ui_launcher.lock().unwrap();
+                let request = crate::shell::UiLaunchRequest {
+                    reason: format!("{:?}", reason),
+                };
+                match launcher.launch_or_focus(request) {
+                    Ok(crate::shell::UiLaunchResult::FocusedExisting { pid }) => {
+                        tracing::info!("Focused existing UI: pid={}", pid);
+                        IpcResponse::UiOpenResult {
+                            status: mrd_ipc::UiOpenStatus::FocusedExisting,
+                            pid: Some(pid),
+                        }
+                    }
+                    Ok(crate::shell::UiLaunchResult::SpawnedNew { pid }) => {
+                        tracing::info!("Spawned new UI: pid={}", pid);
+                        IpcResponse::UiOpenResult {
+                            status: mrd_ipc::UiOpenStatus::SpawnedNew,
+                            pid: Some(pid),
+                        }
+                    }
+                    Ok(crate::shell::UiLaunchResult::Unavailable) => {
+                        tracing::warn!("UI launch unavailable - no configured path");
+                        IpcResponse::UiOpenResult {
+                            status: mrd_ipc::UiOpenStatus::Unavailable,
+                            pid: None,
+                        }
+                    }
+                    Ok(crate::shell::UiLaunchResult::Failed { error }) => {
+                        tracing::error!("UI launch failed: {}", error);
+                        IpcResponse::Error {
+                            code: "E500".to_string(),
+                            message: error,
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("UI launch error: {}", e);
+                        IpcResponse::Error {
+                            code: "E500".to_string(),
+                            message: e.to_string(),
+                        }
+                    }
+                }
+            }
+
+            IpcRequest::FocusUi => {
+                // Phase 3: Use UI launcher to focus existing UI
+                tracing::info!("FocusUi requested");
+                let launcher = self.ui_launcher.lock().unwrap();
+                let request = crate::shell::UiLaunchRequest {
+                    reason: "focus".to_string(),
+                };
+                match launcher.launch_or_focus(request) {
+                    Ok(crate::shell::UiLaunchResult::FocusedExisting { .. }) => {
+                        IpcResponse::Ack
+                    }
+                    Ok(crate::shell::UiLaunchResult::SpawnedNew { .. }) => {
+                        IpcResponse::Ack
+                    }
+                    Ok(crate::shell::UiLaunchResult::Unavailable) => {
+                        IpcResponse::Error {
+                            code: "E404".to_string(),
+                            message: "UI not available".to_string(),
+                        }
+                    }
+                    Ok(crate::shell::UiLaunchResult::Failed { error }) => {
+                        IpcResponse::Error {
+                            code: "E500".to_string(),
+                            message: error,
+                        }
+                    }
+                    Err(e) => {
+                        IpcResponse::Error {
+                            code: "E500".to_string(),
+                            message: e.to_string(),
+                        }
+                    }
+                }
+            }
+
+            IpcRequest::UiAttached { pid, executable_path } => {
+                tracing::info!("UI attached: pid={} path={:?}", pid, executable_path);
+                let mut shell = self.app_state.shell.lock().await;
+                shell.ui_pid = Some(pid);
+                shell.ui_executable_path = executable_path.clone();
+                shell.last_error = None;
+
+                // Update launcher state and persist path
+                if let Some(path) = executable_path {
+                    let launcher = self.ui_launcher.lock().unwrap();
+                    let _ = launcher.set_ui_path(std::path::PathBuf::from(path));
+                }
+
+                IpcResponse::Ack
+            }
+
+            IpcRequest::UiDetached { pid, reason } => {
+                tracing::info!("UI detached: pid={} reason={:?}", pid, reason);
+                let mut shell = self.app_state.shell.lock().await;
+                // Only clear if the PID matches (or if it's the same UI)
+                if shell.ui_pid == Some(pid) {
+                    shell.ui_pid = None;
+                }
+                IpcResponse::Ack
+            }
+
+            IpcRequest::GetShellStatus => {
+                let shell = self.app_state.shell.lock().await;
+                let sessions = self.app_state.sessions.lock().await;
+                IpcResponse::ShellStatus {
+                    status: mrd_ipc::ShellStatusSnapshot {
+                        service_pid: std::process::id(),
+                        ui_pid: shell.ui_pid,
+                        tray_available: shell.tray_available,
+                        autostart_enabled: shell.autostart_enabled,
+                        active_session_count: sessions.list_all().len(),
+                        last_error: shell.last_error.clone(),
+                    }
+                }
+            }
+
+            IpcRequest::SetAutostart { enabled } => {
+                // Phase 5: Use autostart port
+                tracing::info!("SetAutostart: enabled={}", enabled);
+                let result = {
+                    let autostart = self.autostart.lock().unwrap();
+                    let supported = autostart.is_supported();
+                    let set_result = autostart.set_enabled(enabled);
+                    (supported, set_result)
+                };
+
+                match result {
+                    (supported, Ok(())) => {
+                        // Update shell state (now that autostart lock is released)
+                        let mut shell = self.app_state.shell.lock().await;
+                        shell.autostart_enabled = if supported {
+                            Some(enabled)
+                        } else {
+                            None
+                        };
+                        IpcResponse::Ack
+                    }
+                    (_supported, Err(e)) => {
+                        tracing::error!("SetAutostart failed: {}", e);
+                        IpcResponse::Error {
+                            code: "E500".to_string(),
+                            message: e.to_string(),
+                        }
+                    }
+                }
+            }
+
+            IpcRequest::GetAutostartStatus => {
+                let autostart = self.autostart.lock().unwrap();
+                let enabled = autostart.is_enabled().unwrap_or(false);
+                let supported = autostart.is_supported();
+                IpcResponse::AutostartStatus {
+                    enabled,
+                    supported,
+                }
+            }
+
+            IpcRequest::ShutdownService { mode } => {
+                tracing::info!("ShutdownService requested: mode={:?}", mode);
+                // Phase 2: Log only - actual shutdown will be implemented later
+                // For now, return Ack to acknowledge the request
+                match mode {
+                    mrd_ipc::ShutdownMode::Force => {
+                        // In Phase 3+, this would trigger immediate shutdown
+                        IpcResponse::Error {
+                            code: "E501".to_string(),
+                            message: "Force shutdown not yet implemented".to_string(),
+                        }
+                    }
+                    mrd_ipc::ShutdownMode::Graceful | mrd_ipc::ShutdownMode::AfterSessions => {
+                        IpcResponse::Error {
+                            code: "E501".to_string(),
+                            message: "Service shutdown not yet implemented".to_string(),
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -222,10 +441,25 @@ impl IpcServer {
         tracing::info!("IPC server listening");
 
         let app_state = self.app_state.clone();
+        let ui_launcher = self.ui_launcher.clone();
         loop {
             match server.accept().await {
                 Ok(stream) => {
-                    let server_clone = IpcServer::new(app_state.clone());
+                    // Create a new server instance for this connection
+                    // Note: For simplicity, we're creating a new autostart instance each time
+                    let new_autostart: Arc<std::sync::Mutex<dyn AutostartPort + Send + Sync>> =
+                        if cfg!(windows) {
+                            Arc::new(std::sync::Mutex::new(crate::shell::WindowsAutostart::new("mrd-service")))
+                        } else {
+                            Arc::new(std::sync::Mutex::new(crate::shell::NoOpAutostart::new("mrd-service")))
+                        };
+
+                    let server_clone = IpcServer {
+                        app_state: app_state.clone(),
+                        endpoint: self.endpoint.clone(),
+                        ui_launcher: ui_launcher.clone(),
+                        autostart: new_autostart,
+                    };
                     tokio::spawn(async move {
                         if let Err(e) = server_clone.handle_connection(stream).await {
                             eprintln!("IPC connection error: {}", e);

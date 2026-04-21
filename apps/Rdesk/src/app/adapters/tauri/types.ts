@@ -282,6 +282,17 @@ export interface ServicePidResponse {
   pid: number | null;
 }
 
+export type ShutdownMode = "graceful" | "force" | "after_sessions";
+
+export interface ShellStatusSnapshot {
+  service_pid: number;
+  ui_pid: number | null;
+  tray_available: boolean;
+  autostart_enabled: boolean | null;
+  active_session_count: number;
+  last_error: string | null;
+}
+
 /**
  * IPC Device types
  */

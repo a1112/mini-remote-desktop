@@ -37,6 +37,14 @@ describe("SettingsModal - Component Behavior", () => {
     open: true,
     onClose: vi.fn(),
   };
+  const runningStatus = {
+    service_pid: 12345,
+    ui_pid: 54321,
+    tray_available: true,
+    autostart_enabled: true,
+    active_session_count: 0,
+    last_error: null,
+  };
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -44,7 +52,10 @@ describe("SettingsModal - Component Behavior", () => {
 
   it("should render without crashing", async () => {
     const mockInvoke = getMockInvoke();
-    mockInvoke.mockResolvedValue(true);
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "shell_get_status") return Promise.resolve(runningStatus);
+      return Promise.resolve(true);
+    });
 
     render(<SettingsModal {...defaultProps} />);
 
@@ -55,7 +66,10 @@ describe("SettingsModal - Component Behavior", () => {
 
   it("should fetch service status on mount", async () => {
     const mockInvoke = getMockInvoke();
-    mockInvoke.mockResolvedValue(true);
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "shell_get_status") return Promise.resolve(runningStatus);
+      return Promise.resolve(true);
+    });
 
     render(<SettingsModal {...defaultProps} />);
 
@@ -65,13 +79,16 @@ describe("SettingsModal - Component Behavior", () => {
 
     // Service status should be fetched
     await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("service_status", undefined);
+      expect(mockInvoke).toHaveBeenCalledWith("shell_get_status", undefined);
     });
   });
 
   it("should show deprecation notice for migrated features", async () => {
     const mockInvoke = getMockInvoke();
-    mockInvoke.mockResolvedValue(true);
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "shell_get_status") return Promise.resolve(runningStatus);
+      return Promise.resolve(true);
+    });
 
     render(<SettingsModal {...defaultProps} />);
 
@@ -89,7 +106,10 @@ describe("SettingsModal - Component Behavior", () => {
 
   it("should handle service status refresh on button click", async () => {
     const mockInvoke = getMockInvoke();
-    mockInvoke.mockResolvedValue(true);
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "shell_get_status") return Promise.resolve(runningStatus);
+      return Promise.resolve(true);
+    });
 
     render(<SettingsModal {...defaultProps} />);
 
@@ -112,8 +132,13 @@ describe("SettingsModal - Component Behavior", () => {
   it("should call service lifecycle commands when buttons are clicked", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((cmd: string) => {
-      if (cmd === "service_start") return Promise.resolve(true);
-      return Promise.resolve(false);
+      if (cmd === "shell_get_status") {
+        return Promise.reject(new Error("connection refused"));
+      }
+      if (cmd === "service_bootstrap_if_needed") {
+        return Promise.resolve(true);
+      }
+      return Promise.resolve(true);
     });
 
     render(<SettingsModal {...defaultProps} />);
@@ -138,14 +163,19 @@ describe("SettingsModal - Component Behavior", () => {
       await userEvent.click(startButton);
 
       await waitFor(() => {
-        expect(mockInvoke).toHaveBeenCalledWith("service_start", undefined);
+        expect(mockInvoke).toHaveBeenCalledWith("service_bootstrap_if_needed", undefined);
       });
     }
   });
 
   it("should show error message when service operation fails", async () => {
     const mockInvoke = getMockInvoke();
-    mockInvoke.mockRejectedValue(new Error("Service unavailable"));
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "shell_get_status") {
+        return Promise.reject(new Error("Unexpected response"));
+      }
+      return Promise.resolve(true);
+    });
 
     render(<SettingsModal {...defaultProps} />);
 
@@ -156,13 +186,16 @@ describe("SettingsModal - Component Behavior", () => {
     await userEvent.click(screen.getByText("网络"));
 
     await waitFor(() => {
-      expect(screen.getByText(/读取服务状态失败|Service unavailable/)).toBeInTheDocument();
+      expect(screen.getByText(/读取服务状态失败|Unexpected response/)).toBeInTheDocument();
     });
   });
 
   it("should close modal when close button is clicked", async () => {
     const mockInvoke = getMockInvoke();
-    mockInvoke.mockResolvedValue(true);
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "shell_get_status") return Promise.resolve(runningStatus);
+      return Promise.resolve(true);
+    });
 
     render(<SettingsModal {...defaultProps} />);
 
@@ -184,7 +217,10 @@ describe("SettingsModal - Component Behavior", () => {
 
   it("should switch between sections when clicking nav items", async () => {
     const mockInvoke = getMockInvoke();
-    mockInvoke.mockResolvedValue(true);
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "shell_get_status") return Promise.resolve(runningStatus);
+      return Promise.resolve(true);
+    });
 
     render(<SettingsModal {...defaultProps} />);
 
@@ -203,7 +239,12 @@ describe("SettingsModal - Component Behavior", () => {
 
   it("should not crash when services are unavailable", async () => {
     const mockInvoke = getMockInvoke();
-    mockInvoke.mockRejectedValue(new Error("IPC timeout"));
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "shell_get_status") {
+        return Promise.reject(new Error("Unexpected response"));
+      }
+      return Promise.resolve(true);
+    });
     const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
     render(<SettingsModal {...defaultProps} />);
@@ -218,7 +259,7 @@ describe("SettingsModal - Component Behavior", () => {
 
     // Should show error message or handle the error gracefully
     await waitFor(() => {
-      expect(screen.getByText(/读取服务状态失败|IPC timeout/)).toBeInTheDocument();
+      expect(screen.getByText(/读取服务状态失败|Unexpected response/)).toBeInTheDocument();
     });
 
     const sawActWarning = consoleErrorSpy.mock.calls.some((call) =>

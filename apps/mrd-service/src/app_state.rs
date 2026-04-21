@@ -38,6 +38,26 @@ impl SessionRegistry {
     }
 }
 
+/// Shell state - tracks UI presence and service lifecycle
+#[derive(Debug, Default)]
+pub struct ShellState {
+    /// UI process PID if attached
+    pub ui_pid: Option<u32>,
+    /// UI executable path for relaunch
+    pub ui_executable_path: Option<String>,
+    /// Tray availability (platform-dependent)
+    pub tray_available: bool,
+    /// Autostart enabled state (None if not supported)
+    pub autostart_enabled: Option<bool>,
+    /// Active session count (for tray display)
+    pub active_session_count: usize,
+    /// Last error message
+    pub last_error: Option<String>,
+}
+
+/// Tray port - abstracts platform-specific tray implementation
+pub type TrayPortRef = Arc<std::sync::Mutex<dyn crate::shell::TrayPort + Send + Sync>>;
+
 /// Device registry
 #[derive(Debug, Default)]
 pub struct DeviceRegistry {
@@ -67,18 +87,30 @@ impl DeviceRegistry {
 /// - QuicHost / QuicSessionCoordinator
 /// - Media senders/receivers
 /// - Probe/telemetry state
+/// - Shell/UI lifecycle state
+/// - Tray port (Phase 4)
 pub struct AppState {
     /// Session registry - single source of truth for all sessions
     pub sessions: Arc<Mutex<SessionRegistry>>,
     /// Device registry
     pub devices: Arc<Mutex<DeviceRegistry>>,
+    /// Shell state - UI presence and service lifecycle
+    pub shell: Arc<Mutex<ShellState>>,
+    /// Tray port (Phase 4)
+    pub tray: TrayPortRef,
 }
 
 impl AppState {
     pub fn new() -> Self {
+        Self::with_tray(Arc::new(std::sync::Mutex::new(crate::shell::NoOpTray::new())))
+    }
+
+    pub fn with_tray(tray: TrayPortRef) -> Self {
         Self {
             sessions: Arc::new(Mutex::new(SessionRegistry::default())),
             devices: Arc::new(Mutex::new(DeviceRegistry::default())),
+            shell: Arc::new(Mutex::new(ShellState::default())),
+            tray,
         }
     }
 
@@ -90,6 +122,16 @@ impl AppState {
     /// Get a clone of the devices Arc for injection into handlers
     pub fn devices(&self) -> Arc<Mutex<DeviceRegistry>> {
         self.devices.clone()
+    }
+
+    /// Get a clone of the shell Arc for injection into handlers
+    pub fn shell(&self) -> Arc<Mutex<ShellState>> {
+        self.shell.clone()
+    }
+
+    /// Get a clone of the tray Arc for injection into handlers
+    pub fn tray(&self) -> TrayPortRef {
+        self.tray.clone()
     }
 }
 
