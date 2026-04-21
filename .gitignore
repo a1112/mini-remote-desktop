@@ -47,3 +47,7 @@ client-qt/venv
 /artifacts/component-matrix/
 /tests/benchmarks/tmp/
 /tests/component-matrix/tmp/
+
+# Generated local artifacts
+/apps/Rdesk/src-tauri/gen/
+/bin/
