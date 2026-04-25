@@ -153,8 +153,7 @@ export function ConnectionsModal({ open, onClose }: ConnectionsModalProps) {
   });
 
   const grouped = filtered.reduce((acc, s) => {
-    if (!acc[s.date]) acc[s.date] = [];
-    acc[s.date].push(s);
+    (acc[s.date] ??= []).push(s);
     return acc;
   }, {} as Record<string, typeof sessions>);
 

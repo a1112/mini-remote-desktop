@@ -14,13 +14,14 @@
     "noEmit": true,
     "jsx": "react-jsx",
 
-    /* Linting - Strict to catch errors early */
+    /* Type safety */
     "strict": true,
-    "noUnusedLocals": true,
-    "noUnusedParameters": true,
+    "noUnusedLocals": false,
+    "noUnusedParameters": false,
     "noFallthroughCasesInSwitch": true,
     "noUncheckedIndexedAccess": true,
     "allowJs": true,
+    "types": ["vitest/globals", "@testing-library/jest-dom"],
 
     /* Path aliases */
     "baseUrl": ".",

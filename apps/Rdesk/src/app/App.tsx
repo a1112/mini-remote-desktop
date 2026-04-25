@@ -7,7 +7,7 @@ export default function App() {
   return (
     <AuthProvider>
       <ThemeProvider>
-        <RouterProvider router={router} fallbackElement={<div />} />
+        <RouterProvider router={router} />
       </ThemeProvider>
     </AuthProvider>
   );

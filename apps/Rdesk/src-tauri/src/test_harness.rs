@@ -415,15 +415,11 @@ impl TestHarness {
                 total_latencies.push(pipeline_start.elapsed());
             }
 
-            if encode_latencies.len() > 1000 {
-                encode_latencies.remove(0);
-            }
-            if decode_latencies.len() > 1000 {
-                decode_latencies.remove(0);
-            }
-            if total_latencies.len() > 1000 {
-                total_latencies.remove(0);
-            }
+            Self::trim_latency_buffers(
+                &mut encode_latencies,
+                &mut decode_latencies,
+                &mut total_latencies,
+            );
 
             frame_count += 1;
 
@@ -507,6 +503,22 @@ impl TestHarness {
         (sorted[p50_idx], sorted[p95_idx])
     }
 
+    fn trim_latency_buffers(
+        encode_latencies: &mut Vec<Duration>,
+        decode_latencies: &mut Vec<Duration>,
+        total_latencies: &mut Vec<Duration>,
+    ) {
+        if encode_latencies.len() > 1000 {
+            encode_latencies.remove(0);
+        }
+        if decode_latencies.len() > 1000 {
+            decode_latencies.remove(0);
+        }
+        if total_latencies.len() > 1000 {
+            total_latencies.remove(0);
+        }
+    }
+
     pub fn stop(&mut self) -> Result<()> {
         self.running.store(false, Ordering::Relaxed);
 
@@ -571,4 +583,55 @@ fn downsample_frame(frame: &CapturedFrame, max_width: usize) -> Result<(Vec<u8>,
     }
 
     Ok((result, new_width, new_height))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trim_latency_buffers_handles_encode_only_samples() {
+        let mut encode_latencies = (0..=1000)
+            .map(Duration::from_millis)
+            .collect::<Vec<_>>();
+        let mut decode_latencies = Vec::new();
+        let mut total_latencies = Vec::new();
+
+        TestHarness::trim_latency_buffers(
+            &mut encode_latencies,
+            &mut decode_latencies,
+            &mut total_latencies,
+        );
+
+        assert_eq!(encode_latencies.len(), 1000);
+        assert_eq!(encode_latencies[0], Duration::from_millis(1));
+        assert!(decode_latencies.is_empty());
+        assert!(total_latencies.is_empty());
+    }
+
+    #[test]
+    fn trim_latency_buffers_trims_each_populated_series_independently() {
+        let mut encode_latencies = (0..=1000)
+            .map(Duration::from_millis)
+            .collect::<Vec<_>>();
+        let mut decode_latencies = (0..=1000)
+            .map(Duration::from_millis)
+            .collect::<Vec<_>>();
+        let mut total_latencies = (0..=1000)
+            .map(Duration::from_millis)
+            .collect::<Vec<_>>();
+
+        TestHarness::trim_latency_buffers(
+            &mut encode_latencies,
+            &mut decode_latencies,
+            &mut total_latencies,
+        );
+
+        assert_eq!(encode_latencies.len(), 1000);
+        assert_eq!(decode_latencies.len(), 1000);
+        assert_eq!(total_latencies.len(), 1000);
+        assert_eq!(encode_latencies[0], Duration::from_millis(1));
+        assert_eq!(decode_latencies[0], Duration::from_millis(1));
+        assert_eq!(total_latencies[0], Duration::from_millis(1));
+    }
 }

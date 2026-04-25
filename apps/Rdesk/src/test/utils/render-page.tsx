@@ -32,8 +32,8 @@ export const renderPage = (
     wrapperOptions?: Omit<RenderOptions, "wrapper">;
   }
 ) => {
-  const wrapper = (ui: React.ReactElement) => (
-    <PageProviders route={options?.route}>{ui}</PageProviders>
+  const wrapper = ({ children }: { children: React.ReactNode }) => (
+    <PageProviders route={options?.route}>{children}</PageProviders>
   );
 
   return render(ui, { wrapper, ...options?.wrapperOptions });

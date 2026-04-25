@@ -5,6 +5,8 @@
  * without actually using React Router's navigation.
  */
 
+import { vi } from "vitest";
+
 /**
  * Simulated navigation state for testing
  */

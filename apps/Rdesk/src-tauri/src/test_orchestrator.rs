@@ -445,6 +445,33 @@ impl TestOrchestrator {
                 }
 
                 let metrics = harness.lock().unwrap().get_metrics();
+
+                if let Some(error) = metrics.error_message.clone() {
+                    let _ = harness.lock().unwrap().stop();
+                    mark_run_failed(
+                        &orchestrator_runs,
+                        &orchestrator_events,
+                        &run_id_clone,
+                        &metrics,
+                        "runtime_failure",
+                        error,
+                    );
+                    break;
+                }
+
+                if !metrics.is_running {
+                    let message = "test harness stopped before duration elapsed".to_string();
+                    mark_run_failed(
+                        &orchestrator_runs,
+                        &orchestrator_events,
+                        &run_id_clone,
+                        &metrics,
+                        "runtime_stopped",
+                        message,
+                    );
+                    break;
+                }
+
                 {
                     let mut series = orchestrator_metrics.lock().unwrap();
                     let run_series = series.entry(run_id_clone.clone()).or_insert_with(HashMap::new);
@@ -686,6 +713,47 @@ fn summary_from_metrics(started_at: u64, metrics: &HarnessMetrics) -> TestRunSum
     }
 }
 
+fn mark_run_failed(
+    runs: &Arc<Mutex<HashMap<RunId, TestRun>>>,
+    events: &Arc<Mutex<HashMap<RunId, Vec<TestStageEvent>>>>,
+    run_id: &str,
+    metrics: &HarnessMetrics,
+    failure_reason: &str,
+    error_message: String,
+) {
+    let mut should_record_event = false;
+
+    {
+        let mut runs = runs.lock().unwrap();
+        if let Some(run) = runs.get_mut(run_id) {
+            if run.status == RunStatus::Running {
+                let mut summary = summary_from_metrics(run.started_at, metrics);
+                summary.error_message = Some(error_message.clone());
+                summary.failure_reason = Some(failure_reason.to_string());
+                run.status = RunStatus::Failed;
+                run.finished_at = Some(now_ms());
+                run.summary = Some(summary);
+                should_record_event = true;
+            }
+        }
+    }
+
+    if should_record_event {
+        events
+            .lock()
+            .unwrap()
+            .entry(run_id.to_string())
+            .or_insert_with(Vec::new)
+            .push(TestStageEvent {
+                stage: "running".to_string(),
+                status: "failed".to_string(),
+                timestamp: now_ms(),
+                duration_ms: None,
+                error: Some(error_message),
+            });
+    }
+}
+
 fn push_metric_sample(
     run_series: &mut HashMap<String, MetricSeries>,
     metric_name: &str,
@@ -732,5 +800,119 @@ fn compute_aggregation(samples: &[MetricDataPoint]) -> MetricAggregation {
         p50: Some(values[values.len() / 2]),
         p95: Some(values[((values.len() * 95) / 100).min(last)]),
         p99: Some(values[((values.len() * 99) / 100).min(last)]),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_env() -> EnvironmentSnapshot {
+        EnvironmentSnapshot {
+            cpu_brand: "test-cpu".to_string(),
+            cpu_cores: 8,
+            memory_gb: 16,
+            gpu_info: "test-gpu".to_string(),
+            available_encoders: vec!["openh264".to_string()],
+            available_decoders: vec!["software".to_string()],
+        }
+    }
+
+    #[test]
+    fn scenario_dispatch_rejects_unsupported_scenarios() {
+        let orchestrator = TestOrchestrator::default();
+        let error = orchestrator
+            .scenario_to_chain("capture.dxgi", &TestConfigData::default())
+            .unwrap_err();
+
+        assert!(error.to_string().contains("Unsupported test scenario"));
+    }
+
+    #[test]
+    fn matrix_dispatch_maps_explicit_encoder_decoder_pairs() {
+        let orchestrator = TestOrchestrator::default();
+        let openh264_config = TestConfigData {
+            encoder_type: Some("openh264".to_string()),
+            ..Default::default()
+        };
+        let nvenc_decode_config = TestConfigData {
+            encoder_type: Some("nvenc_h264".to_string()),
+            decoder_type: Some("nvdec".to_string()),
+            ..Default::default()
+        };
+        let nvenc_encode_config = TestConfigData {
+            encoder_type: Some("nvenc_h264".to_string()),
+            decoder_type: Some("software".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            orchestrator
+                .scenario_to_chain("matrix", &openh264_config)
+                .unwrap(),
+            TestChain::OpenH264
+        );
+        assert_eq!(
+            orchestrator
+                .scenario_to_chain("matrix", &nvenc_decode_config)
+                .unwrap(),
+            TestChain::NvencNvdec
+        );
+        assert_eq!(
+            orchestrator
+                .scenario_to_chain("matrix", &nvenc_encode_config)
+                .unwrap(),
+            TestChain::NvencOnly
+        );
+    }
+
+    #[test]
+    fn runtime_harness_error_marks_run_failed() {
+        let orchestrator = TestOrchestrator::default();
+        let run_id = "run_runtime_error".to_string();
+        let started_at = now_ms();
+
+        orchestrator.runs.lock().unwrap().insert(
+            run_id.clone(),
+            TestRun {
+                run_id: run_id.clone(),
+                scenario_id: "encode.openh264".to_string(),
+                run_mode: RunMode::Manual,
+                status: RunStatus::Running,
+                started_at,
+                finished_at: None,
+                config_snapshot: TestConfigData::default(),
+                environment_snapshot: test_env(),
+                summary: None,
+            },
+        );
+
+        let metrics = HarnessMetrics {
+            is_running: false,
+            frame_count: 12,
+            error_message: Some("gpu unavailable".to_string()),
+            ..Default::default()
+        };
+
+        mark_run_failed(
+            &orchestrator.runs,
+            &orchestrator.run_events,
+            &run_id,
+            &metrics,
+            "runtime_failure",
+            "gpu unavailable".to_string(),
+        );
+
+        let run = orchestrator.get_run(&run_id).unwrap();
+        let summary = run.summary.unwrap();
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(summary.frame_count, 12);
+        assert_eq!(summary.error_message.as_deref(), Some("gpu unavailable"));
+        assert_eq!(summary.failure_reason.as_deref(), Some("runtime_failure"));
+
+        let events = orchestrator.get_run_events(&run_id);
+        assert!(events.iter().any(|event| {
+            event.stage == "running" && event.status == "failed"
+        }));
     }
 }

@@ -438,8 +438,9 @@ describe('SettingsModal - Page Level Tests', () => {
       expect(toggleButtons.length).toBeGreaterThan(0);
 
       // Click first toggle and verify it's clickable
-      if (toggleButtons.length > 0) {
-        await userEvent.click(toggleButtons[0]);
+      const firstToggleButton = toggleButtons[0];
+      if (firstToggleButton) {
+        await userEvent.click(firstToggleButton);
         // If we get here without error, the toggle is clickable
         expect(true).toBe(true);
       }

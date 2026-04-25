@@ -51,3 +51,8 @@ client-qt/venv
 # Generated local artifacts
 /apps/Rdesk/src-tauri/gen/
 /bin/
+.claude/
+
+# Track committed Tauri app icons
+!apps/Rdesk/src-tauri/icons/
+!apps/Rdesk/src-tauri/icons/**/*.png

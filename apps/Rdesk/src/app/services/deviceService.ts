@@ -119,13 +119,12 @@ class DeviceRegistrationService {
    */
   private async getHardwareInfo(): Promise<HardwareInfo> {
     // 检查 Tauri 环境是否可用
-    const isTauriAvailable = typeof window !== "undefined" &&
-      window.__TAURI__ &&
-      typeof window.__TAURI__.invoke === "function";
+    const tauri = typeof window !== "undefined" ? window.__TAURI__ : undefined;
+    const isTauriAvailable = typeof tauri?.invoke === "function";
 
     if (isTauriAvailable) {
       try {
-        return await window.__TAURI__.invoke<HardwareInfo>("get_hardware_info");
+        return await tauri.invoke<HardwareInfo>("get_hardware_info");
       } catch (err) {
         console.warn("[DeviceService] Tauri 调用失败，使用模拟数据:", err);
         return this.getMockHardwareInfo();

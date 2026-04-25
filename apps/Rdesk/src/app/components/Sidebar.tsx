@@ -197,26 +197,31 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
   const getTopLevelMenuItems = () => {
     const items: Array<{
       icon?: any;
-      label: string;
+      label?: string;
       action?: () => void;
       type?: "divider";
       danger?: boolean;
       submenu?: string;
     }> = [];
+    const activeContextMenu = contextMenu;
+
+    if (!activeContextMenu) {
+      return items;
+    }
 
     // 在线设备特有菜单
     if (isContextOnline) {
       items.push(
-        { icon: Play, label: "远程桌面", action: () => { navigate(`/devices/${contextMenu!.deviceId}`); setContextMenu(null); } },
-        { icon: FolderIcon, label: "文件传输", action: () => { navigate(`/devices/${contextMenu!.deviceId}`); setContextMenu(null); } },
-        { icon: Terminal, label: "远程终端", action: () => { navigate(`/devices/${contextMenu!.deviceId}`); setContextMenu(null); } },
+        { icon: Play, label: "远程桌面", action: () => { navigate(`/devices/${activeContextMenu.deviceId}`); setContextMenu(null); } },
+        { icon: FolderIcon, label: "文件传输", action: () => { navigate(`/devices/${activeContextMenu.deviceId}`); setContextMenu(null); } },
+        { icon: Terminal, label: "远程终端", action: () => { navigate(`/devices/${activeContextMenu.deviceId}`); setContextMenu(null); } },
         { type: "divider" as const }
       );
     }
 
     // 通用菜单
     items.push(
-      { icon: Pencil, label: "重命名", action: () => contextMenuDevice && handleStartRename(contextMenu.deviceId, contextMenuDevice.name) },
+      { icon: Pencil, label: "重命名", action: () => contextMenuDevice && handleStartRename(activeContextMenu.deviceId, contextMenuDevice.name) },
       { icon: Star, label: "收藏设备", action: () => setContextMenu(null) },
       { icon: Copy, label: "复制 ID", action: () => contextMenuDevice && handleCopyId(contextMenuDevice.deviceId) },
       { type: "divider" as const }
@@ -226,7 +231,7 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
     items.push({
       icon: Ban,
       label: "禁用设备",
-      action: () => contextMenuDevice && handleToggleDevice(contextMenu.deviceId, contextMenuDevice.name)
+      action: () => contextMenuDevice && handleToggleDevice(activeContextMenu.deviceId, contextMenuDevice.name)
     });
 
     items.push({ type: "divider" as const });

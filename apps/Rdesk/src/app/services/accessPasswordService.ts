@@ -7,6 +7,8 @@
  * - 支持按小时整点自动刷新
  */
 
+import { useCallback, useEffect, useRef, useState } from "react";
+
 const ACCESS_PASSWORD_KEY = "rdesk_access_password";
 const REFRESH_MODE_KEY = "rdesk_password_refresh_mode";
 const API_BASE = "http://127.0.0.1:9530/api/v1";
@@ -61,8 +63,11 @@ class AccessPasswordService {
       throw new Error(`生成密码失败: ${response.status}`);
     }
 
-    const data = await response.json();
-    const newPassword = data.password;
+    const data = await response.json() as { password?: unknown };
+    const newPassword =
+      typeof data.password === "string" && data.password
+        ? data.password
+        : this.generateTemporaryPassword();
 
     // 保存到本地存储
     this.savePassword(newPassword);
@@ -85,8 +90,11 @@ class AccessPasswordService {
         });
 
         if (response.ok) {
-          const data = await response.json();
-          password = data.password;
+          const data = await response.json() as { password?: unknown };
+          password =
+            typeof data.password === "string" && data.password
+              ? data.password
+              : this.generateTemporaryPassword();
           this.savePassword(password);
         } else {
           // 如果获取失败，生成新密码
@@ -100,18 +108,6 @@ class AccessPasswordService {
       }
     }
 
-    return password;
-  }
-
-  /**
-   * 生成临时密码（仅用于离线场景）
-   */
-  private generateTemporaryPassword(): string {
-    const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // 排除易混淆字符
-    let password = "";
-    for (let i = 0; i < 8; i++) {
-      password += chars.charAt(Math.floor(Math.random() * chars.length));
-    }
     return password;
   }
 
@@ -181,8 +177,11 @@ class AccessPasswordService {
         return this.generateTemporaryPassword();
       }
 
-      const data = await response.json();
-      const newPassword = data.password;
+      const data = await response.json() as { password?: unknown };
+      const newPassword =
+        typeof data.password === "string" && data.password
+          ? data.password
+          : this.generateTemporaryPassword();
 
       // 保存到本地存储
       this.savePassword(newPassword);
@@ -249,9 +248,6 @@ class AccessPasswordService {
 
 // 导出单例
 export const accessPasswordService = new AccessPasswordService();
-
-// React Hook
-import { useState, useEffect, useRef, useCallback } from "react";
 
 export function useAccessPassword(deviceId: string | null = null) {
   const [password, setPassword] = useState<string | null>(null);

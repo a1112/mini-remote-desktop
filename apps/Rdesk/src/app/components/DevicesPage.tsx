@@ -57,8 +57,9 @@ export function DevicesPage() {
 
   // 默认选择第一个分组
   useEffect(() => {
-    if (groups.length > 0 && !selectedGroupId) {
-      setSelectedGroupId(groups[0].id);
+    const firstGroup = groups[0];
+    if (firstGroup && !selectedGroupId) {
+      setSelectedGroupId(firstGroup.id);
     }
   }, [groups, selectedGroupId]);
 

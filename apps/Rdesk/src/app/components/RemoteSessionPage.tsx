@@ -57,10 +57,41 @@ import { isTauriRuntime } from "../utils/runtime";
 //   type RenderWindowContext,
 // } from "../services/renderWindowService";
 
-// Placeholder types for disabled rendering features
-type RenderHostSnapshot = null;
-type RenderWindowContext = never;
-type RenderSurfaceDescriptor = never;
+// Placeholder types for disabled rendering features.
+type RenderFrame = {
+  width: number;
+  height: number;
+  bytes: number;
+};
+
+type RenderHostSnapshot = {
+  preview_data_url?: string;
+  frame?: RenderFrame;
+  renderer_backend?: string;
+  surface_count?: number;
+  renderer_snapshot?: {
+    uploaded_frame_count?: number;
+  };
+  available_source_ids: string[];
+  surface_source_bindings: Array<{
+    surface_id: string;
+    source_id: string;
+  }>;
+};
+
+type RenderWindowContext = {
+  label: string;
+  surface_id: string;
+  role: string;
+  renderer_attached: boolean;
+};
+
+type RenderSurfaceDescriptor = {
+  surface_id: string;
+  name: string;
+  role: string;
+  current?: boolean;
+};
 
 export function RemoteSessionPage() {
   const { id } = useParams();
@@ -184,14 +215,14 @@ export function RemoteSessionPage() {
   const [newSurfaceName, setNewSurfaceName] = useState("");
   const [selectedSourceId, setSelectedSourceId] = useState<string | null>(null);
   const [selectedSessionSurfaceId, setSelectedSessionSurfaceId] = useState<string | null>(null);
-  const renderWindows: any[] = [];
-  const currentSurfaceId = null;
+  const renderWindows: RenderWindowContext[] = [];
+  const currentSurfaceId: string | null = null;
   const rendererAttached = false;
   const currentRenderWindowCount = 0;
-  const renderSurfaces: any[] = [];
-  const renderSnapshot: null = null;
-  const currentRenderWindowLabel: null = null;
-  const currentWindowRole: null = null;
+  const renderSurfaces: RenderSurfaceDescriptor[] = [];
+  const renderSnapshot = null as RenderHostSnapshot | null;
+  const currentRenderWindowLabel: string | null = null;
+  const currentWindowRole: string | null = null;
 
   const handleTauriDragStart = (event: React.MouseEvent<HTMLDivElement>) => {
     if (event.button !== 0) return;

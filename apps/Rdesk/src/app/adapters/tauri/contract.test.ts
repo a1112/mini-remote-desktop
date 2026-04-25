@@ -329,6 +329,90 @@ describe('Tauri Adapter Contract', () => {
   });
 
   /**
+   * Test Workbench commands
+   */
+  describe('test workbench commands', () => {
+    it('test_list_scenarios calls correct command', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue([]);
+
+      await adapter.testListScenarios();
+
+      expect(mockInvoke).toHaveBeenCalledWith('test_list_scenarios', undefined);
+    });
+
+    it('test_start_run calls correct command with scenario and config', async () => {
+      const mockInvoke = getMockInvoke();
+      const config = {
+        capture_type: 'dxgi' as const,
+        encoder_type: 'openh264' as const,
+        duration_ms: 5000,
+      };
+      mockInvoke.mockResolvedValue('run-1');
+
+      await adapter.testStartRun({
+        scenarioId: 'matrix',
+        config,
+      });
+
+      expect(mockInvoke).toHaveBeenCalledWith('test_start_run', {
+        scenarioId: 'matrix',
+        config,
+      });
+    });
+
+    it('test_get_run_metrics calls correct command with run id', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue({});
+
+      await adapter.testGetRunMetrics('run-1');
+
+      expect(mockInvoke).toHaveBeenCalledWith('test_get_run_metrics', {
+        runId: 'run-1',
+      });
+    });
+
+    it('test_get_run_artifacts calls correct command with run id', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue([]);
+
+      await adapter.testGetRunArtifacts('run-1');
+
+      expect(mockInvoke).toHaveBeenCalledWith('test_get_run_artifacts', {
+        runId: 'run-1',
+      });
+    });
+
+    it('test preset commands call registered command names', async () => {
+      const mockInvoke = getMockInvoke();
+      const config = { encoder_type: 'openh264' as const };
+      mockInvoke.mockResolvedValueOnce([]);
+      mockInvoke.mockResolvedValueOnce('preset-1');
+      mockInvoke.mockResolvedValueOnce(undefined);
+
+      await adapter.testListPresets();
+      await adapter.testSavePreset({
+        name: 'OpenH264 smoke',
+        description: 'Software encode smoke test',
+        scenarioId: 'encode.openh264',
+        config,
+      });
+      await adapter.testDeletePreset('preset-1');
+
+      expect(mockInvoke).toHaveBeenNthCalledWith(1, 'test_list_presets', undefined);
+      expect(mockInvoke).toHaveBeenNthCalledWith(2, 'test_save_preset', {
+        name: 'OpenH264 smoke',
+        description: 'Software encode smoke test',
+        scenarioId: 'encode.openh264',
+        config,
+      });
+      expect(mockInvoke).toHaveBeenNthCalledWith(3, 'test_delete_preset', {
+        presetId: 'preset-1',
+      });
+    });
+  });
+
+  /**
    * Error handling
    */
   describe('error handling', () => {

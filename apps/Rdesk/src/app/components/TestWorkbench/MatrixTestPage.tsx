@@ -69,13 +69,26 @@ interface MatrixTest {
   duration?: number;
 }
 
-export function MatrixTestPage() {
+const STATUS_LABELS: Record<MatrixTest["status"], string> = {
+  pending: "待执行",
+  running: "运行中",
+  completed: "完成",
+  failed: "失败",
+  skipped: "跳过",
+};
+
+interface MatrixTestPageProps {
+  runDelayMs?: number;
+}
+
+export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) {
   const [dimensions, setDimensions] = useState<MatrixDimension[]>(MATRIX_DIMENSIONS);
   const [isRunning, setIsRunning] = useState(false);
   const [tests, setTests] = useState<MatrixTest[]>([]);
   const [currentTestIndex, setCurrentTestIndex] = useState(0);
   const [completedCount, setCompletedCount] = useState(0);
   const [failedCount, setFailedCount] = useState(0);
+  const [skippedCount, setSkippedCount] = useState(0);
 
   const toggleOption = (dimensionId: string, optionId: string) => {
     setDimensions(
@@ -168,6 +181,7 @@ export function MatrixTestPage() {
     setCurrentTestIndex(0);
     setCompletedCount(0);
     setFailedCount(0);
+    setSkippedCount(0);
 
     // Run tests sequentially (for now - could be parallelized)
     for (let i = 0; i < matrixTests.length; i++) {
@@ -178,6 +192,7 @@ export function MatrixTestPage() {
 
       // Skip AV1 encoder
       if (test.config.encoder_type === "nvenc_av1") {
+        setSkippedCount((count) => count + 1);
         setTests((prev) =>
           prev.map((t, idx) =>
             idx === i ? { ...t, status: "skipped" as const } : t
@@ -214,7 +229,7 @@ export function MatrixTestPage() {
         }
 
         // Wait for test to complete (simplified - in reality should poll)
-        await new Promise((resolve) => setTimeout(resolve, 7000));
+        await new Promise((resolve) => setTimeout(resolve, runDelayMs));
 
         const runResult = await commands.testGetRun(result.value);
         if (!runResult.ok || !runResult.value) {
@@ -254,7 +269,8 @@ export function MatrixTestPage() {
   };
 
   const totalTests = generateMatrix().length;
-  const progress = totalTests > 0 ? ((completedCount + failedCount) / totalTests) * 100 : 0;
+  const finishedCount = completedCount + failedCount + skippedCount;
+  const progress = totalTests > 0 ? (finishedCount / totalTests) * 100 : 0;
 
   const getStatusIcon = (status: MatrixTest["status"]) => {
     switch (status) {
@@ -362,9 +378,9 @@ export function MatrixTestPage() {
             </div>
             <div>
               <p className="text-2xl font-bold text-gray-400">
-                {totalTests - completedCount - failedCount}
+                {skippedCount}
               </p>
-              <p className="text-xs text-muted-foreground">待执行</p>
+              <p className="text-xs text-muted-foreground">跳过</p>
             </div>
           </div>
         )}
@@ -397,8 +413,11 @@ export function MatrixTestPage() {
                       : ""
                   }
                 >
-                  <td className="px-4 py-2">
+                  <td className="px-4 py-2 flex items-center gap-2">
                     {getStatusIcon(test.status)}
+                    <span className="text-xs text-muted-foreground">
+                      {STATUS_LABELS[test.status]}
+                    </span>
                   </td>
                   <td className="px-4 py-2 text-sm">{test.config.capture_type}</td>
                   <td className="px-4 py-2 text-sm">{test.config.encoder_type}</td>

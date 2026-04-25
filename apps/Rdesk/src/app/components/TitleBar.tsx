@@ -64,7 +64,7 @@ export function TitleBar({ onOpenConnections, onOpenSettings, onOpenTransfers, o
   const [userLabel, setUserLabel] = useState("未登录");
   const [userAvatarUrl, setUserAvatarUrl] = useState<string | null>(null);
   const [isLoggedIn, setIsLoggedIn] = useState(false);
-  const [userData, setUserData] = useState<{ username: string; email: string; role: string; avatar_url?: string } | null>(null);
+  const [userData, setUserData] = useState<{ id: string; username: string; email: string; role: string; avatar_url?: string } | null>(null);
   const transferRef = useRef<HTMLDivElement>(null);
   const notifRef = useRef<HTMLDivElement>(null);
   const userMenuRef = useRef<HTMLDivElement>(null);
@@ -114,6 +114,7 @@ export function TitleBar({ onOpenConnections, onOpenSettings, onOpenTransfers, o
         setUserAvatarUrl(parsed.avatar_url || null);
         setIsLoggedIn(true);
         setUserData({
+          id: parsed.id || "",
           username,
           email: parsed.email || "",
           role,
@@ -198,6 +199,7 @@ export function TitleBar({ onOpenConnections, onOpenSettings, onOpenTransfers, o
     { id: "3", name: "database-dump.sql", device: "服务器 A", direction: "upload" as const, progress: 34, speed: "", size: "890 MB", status: "paused" as const },
     { id: "4", name: "logs-2026-03.tar.gz", device: "服务器 B", direction: "download" as const, progress: 100, speed: "", size: "56 MB", status: "done" as const },
   ];
+  const lastTransferId = mockTransfers[mockTransfers.length - 1]?.id;
 
   const iconBtn = `flex items-center justify-center w-9 h-full transition-colors ${
     isDark
@@ -387,7 +389,7 @@ export function TitleBar({ onOpenConnections, onOpenSettings, onOpenTransfers, o
                     key={t.id}
                     className={`flex items-start gap-2.5 px-3 py-2.5 transition-colors ${
                       isDark ? "hover:bg-gray-800/50" : "hover:bg-gray-50"
-                    } ${t.id !== mockTransfers[mockTransfers.length - 1].id ? (isDark ? "border-b border-gray-800" : "border-b border-gray-50") : ""}`}
+                    } ${t.id !== lastTransferId ? (isDark ? "border-b border-gray-800" : "border-b border-gray-50") : ""}`}
                   >
                     {/* Direction icon */}
                     <div className={`mt-0.5 w-6 h-6 rounded-md flex items-center justify-center shrink-0 ${

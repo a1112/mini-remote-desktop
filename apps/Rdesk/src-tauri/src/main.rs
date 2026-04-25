@@ -673,6 +673,29 @@ fn convert_bgra_to_rgba(bgra: &[u8]) -> Vec<u8> {
         .collect()
 }
 
+#[cfg(test)]
+mod frame_encoding_tests {
+    use super::*;
+    use base64::Engine;
+
+    #[test]
+    fn bgra_frame_is_encoded_as_png() {
+        let bgra = [
+            0, 0, 255, 255,
+            0, 255, 0, 255,
+            255, 0, 0, 255,
+            255, 255, 255, 255,
+        ];
+
+        let encoded = encode_bgra_png_base64(&bgra, 2, 2).unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+
+        assert_eq!(&decoded[..8], b"\x89PNG\r\n\x1a\n");
+    }
+}
+
 // ============================================================================
 // Test Workbench Commands (New Unified Test API)
 // ============================================================================

@@ -12,11 +12,12 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router';
+import { Monitor } from 'lucide-react';
 import { RemoteSessionPage } from './RemoteSessionPage';
 import type { Device } from './deviceData';
 
 // Mock fetch globally to prevent HTTP requests
-global.fetch = vi.fn();
+globalThis.fetch = vi.fn();
 
 // Mock react-router - use importOriginal for components we need
 vi.mock('react-router', async (importOriginal) => {
@@ -39,7 +40,14 @@ vi.mock('./ThemeContext', () => ({
 
 // Mock Tauri window utils
 vi.mock('../utils/tauriWindow', () => ({
-  withTauriWindow: (fn: () => Promise<unknown>) => {
+  withTauriWindow: (fn: (appWindow: {
+    isMaximized: () => Promise<boolean>;
+    maximize: () => Promise<void>;
+    minimize: () => Promise<void>;
+    close: () => Promise<void>;
+    startDragging: () => Promise<void>;
+    toggleMaximize: () => Promise<void>;
+  }) => Promise<unknown>) => {
     // Mock appWindow with commonly used methods
     const mockAppWindow = {
       isMaximized: () => Promise.resolve(false),
@@ -99,7 +107,7 @@ const mockDevices: Device[] = [
     name: 'Test PC',
     deviceId: 'dev-001',
     os: 'Windows 11',
-    icon: () => <span>🖥</span> as any,
+    icon: Monitor,
     status: 'online',
     location: 'Office',
     ping: 24,
@@ -200,7 +208,7 @@ describe('RemoteSessionPage - Page Level Tests', () => {
   describe('migration state - disabled rendering features', () => {
     it('shows alert when trying to pop out render window', async () => {
       const mockAlert = vi.fn();
-      global.alert = mockAlert;
+      globalThis.alert = mockAlert;
 
       render(
         <MemoryRouter initialEntries={['/sessions/test-device-1']}>
@@ -225,7 +233,7 @@ describe('RemoteSessionPage - Page Level Tests', () => {
       }
 
       mockAlert.mockRestore();
-      delete (global as unknown as Record<string, unknown>).alert;
+      delete (globalThis as unknown as Record<string, unknown>).alert;
     });
 
     it('shows degraded state for rendering features', async () => {
