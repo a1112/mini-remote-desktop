@@ -31,7 +31,7 @@ pub enum UiLaunchResult {
 /// Request to open/focus the UI
 #[derive(Debug, Clone)]
 pub struct UiLaunchRequest {
-    pub reason: String,  // "tray_open", "session_incoming", "user_request", "diagnostics"
+    pub reason: String, // "tray_open", "session_incoming", "user_request", "diagnostics"
 }
 
 /// Port for UI launcher operations
@@ -109,7 +109,7 @@ impl UiLauncherPort for InMemoryUiLauncher {
         } else {
             // Simulate spawning new UI
             drop(pid_guard);
-            let new_pid = std::process::id();  // Use current PID as placeholder
+            let new_pid = std::process::id(); // Use current PID as placeholder
             *self.ui_pid.lock().unwrap() = Some(new_pid);
             Ok(UiLaunchResult::SpawnedNew { pid: new_pid })
         }
@@ -503,15 +503,19 @@ mod tests {
         let launcher = InMemoryUiLauncher::new();
 
         // First launch should spawn new
-        let result = launcher.launch_or_focus(UiLaunchRequest {
-            reason: "test".to_string(),
-        }).unwrap();
+        let result = launcher
+            .launch_or_focus(UiLaunchRequest {
+                reason: "test".to_string(),
+            })
+            .unwrap();
         assert!(matches!(result, UiLaunchResult::SpawnedNew { .. }));
 
         // Second launch should focus existing
-        let result = launcher.launch_or_focus(UiLaunchRequest {
-            reason: "test".to_string(),
-        }).unwrap();
+        let result = launcher
+            .launch_or_focus(UiLaunchRequest {
+                reason: "test".to_string(),
+            })
+            .unwrap();
         assert!(matches!(result, UiLaunchResult::FocusedExisting { .. }));
     }
 }

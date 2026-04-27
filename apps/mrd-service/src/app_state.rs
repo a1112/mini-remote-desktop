@@ -5,10 +5,10 @@
 // of truth for all session orchestration, transport runtime,
 // and media control.
 
+use mrd_application::ports::SessionSnapshot;
+use mrd_proto::{DeviceId, SessionId};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use mrd_proto::{SessionId, DeviceId};
-use mrd_application::ports::SessionSnapshot;
 
 /// Session registry tracking all active sessions
 #[derive(Debug, Default)]
@@ -102,7 +102,9 @@ pub struct AppState {
 
 impl AppState {
     pub fn new() -> Self {
-        Self::with_tray(Arc::new(std::sync::Mutex::new(crate::shell::NoOpTray::new())))
+        Self::with_tray(Arc::new(std::sync::Mutex::new(
+            crate::shell::NoOpTray::new(),
+        )))
     }
 
     pub fn with_tray(tray: TrayPortRef) -> Self {

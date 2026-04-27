@@ -2,11 +2,11 @@
 //
 // These handlers implement the core session orchestration logic.
 
-use mrd_ipc::IpcResponse;
-use mrd_application::ports::SessionSnapshot;
-use mrd_proto::{SessionId, DeviceId};
-use std::sync::Arc;
 use crate::app_state::AppState;
+use mrd_application::ports::SessionSnapshot;
+use mrd_ipc::IpcResponse;
+use mrd_proto::{DeviceId, SessionId};
+use std::sync::Arc;
 
 /// Handle session start request
 pub async fn start_session(
@@ -23,22 +23,25 @@ pub async fn start_session(
     );
 
     let mut sessions = app_state.sessions.lock().await;
-    sessions.insert(session_id.clone(), SessionSnapshot {
-        session_id: session_id.clone(),
-        transport: transport_kind.clone(),
-        source_device_id: None,
-        target_device_id: Some(target_device_id),
-        local_listen_addr: None,
-        local_server_name: None,
-        local_cert_der_b64: None,
-        remote_listen_addr: None,
-        remote_server_name: None,
-        remote_cert_der_b64: None,
-        lifecycle_state: "connecting".to_string(),
-        last_error: None,
-        sender_active: false,
-        receiver_active: false,
-    });
+    sessions.insert(
+        session_id.clone(),
+        SessionSnapshot {
+            session_id: session_id.clone(),
+            transport: transport_kind.clone(),
+            source_device_id: None,
+            target_device_id: Some(target_device_id),
+            local_listen_addr: None,
+            local_server_name: None,
+            local_cert_der_b64: None,
+            remote_listen_addr: None,
+            remote_server_name: None,
+            remote_cert_der_b64: None,
+            lifecycle_state: "connecting".to_string(),
+            last_error: None,
+            sender_active: false,
+            receiver_active: false,
+        },
+    );
 
     IpcResponse::SessionStarted { session_id }
 }
@@ -67,52 +70,122 @@ pub async fn accept_session(
         sessions.insert(session_id.clone(), new_snapshot);
     } else {
         // Create new session
-        sessions.insert(session_id.clone(), SessionSnapshot {
-            session_id: session_id.clone(),
-            transport: "unknown".to_string(),
-            source_device_id: Some(source_device_id),
-            target_device_id: None,
-            local_listen_addr: None,
-            local_server_name: None,
-            local_cert_der_b64: None,
-            remote_listen_addr: None,
-            remote_server_name: None,
-            remote_cert_der_b64: None,
-            lifecycle_state: "listening".to_string(),
-            last_error: None,
-            sender_active: false,
-            receiver_active: false,
-        });
+        sessions.insert(
+            session_id.clone(),
+            SessionSnapshot {
+                session_id: session_id.clone(),
+                transport: "unknown".to_string(),
+                source_device_id: Some(source_device_id),
+                target_device_id: None,
+                local_listen_addr: None,
+                local_server_name: None,
+                local_cert_der_b64: None,
+                remote_listen_addr: None,
+                remote_server_name: None,
+                remote_cert_der_b64: None,
+                lifecycle_state: "listening".to_string(),
+                last_error: None,
+                sender_active: false,
+                receiver_active: false,
+            },
+        );
     }
 
     IpcResponse::SessionAccepted { session_id }
 }
 
 /// Handle session stop request
-pub async fn stop_session(
-    app_state: &Arc<AppState>,
-    session_id: SessionId,
-) -> IpcResponse {
+pub async fn stop_session(app_state: &Arc<AppState>, session_id: SessionId) -> IpcResponse {
     tracing::info!("Stopping session: {}", session_id.0);
 
     let mut sessions = app_state.sessions.lock().await;
-    let removed = sessions.remove(&session_id);
+    if let Some(snapshot) = sessions.get(&session_id).cloned() {
+        sessions.insert(
+            session_id.clone(),
+            SessionSnapshot {
+                lifecycle_state: "closed".to_string(),
+                last_error: None,
+                sender_active: false,
+                receiver_active: false,
+                ..snapshot
+            },
+        );
+        return IpcResponse::SessionStopped { session_id };
+    }
 
-    if removed.is_some() {
-        IpcResponse::SessionStopped { session_id }
-    } else {
-        IpcResponse::Error {
-            code: "E404".to_string(),
-            message: format!("Session not found: {}", session_id.0),
-        }
+    IpcResponse::Error {
+        code: "E404".to_string(),
+        message: format!("Session not found: {}", session_id.0),
+    }
+}
+
+/// Handle session failure request.
+pub async fn fail_session(
+    app_state: &Arc<AppState>,
+    session_id: SessionId,
+    reason: String,
+) -> IpcResponse {
+    tracing::warn!("Failing session: {} reason={}", session_id.0, reason);
+
+    let mut sessions = app_state.sessions.lock().await;
+    if let Some(snapshot) = sessions.get(&session_id).cloned() {
+        sessions.insert(
+            session_id.clone(),
+            SessionSnapshot {
+                lifecycle_state: "failed".to_string(),
+                last_error: Some(reason.clone()),
+                sender_active: false,
+                receiver_active: false,
+                ..snapshot
+            },
+        );
+        drop(sessions);
+
+        let mut shell = app_state.shell.lock().await;
+        shell.last_error = Some(reason);
+
+        return IpcResponse::SessionFailed { session_id };
+    }
+
+    IpcResponse::Error {
+        code: "E404".to_string(),
+        message: format!("Session not found: {}", session_id.0),
+    }
+}
+
+/// Recover a failed or closed session into the startup state for its role.
+pub async fn recover_session(app_state: &Arc<AppState>, session_id: SessionId) -> IpcResponse {
+    tracing::info!("Recovering session: {}", session_id.0);
+
+    let mut sessions = app_state.sessions.lock().await;
+    if let Some(snapshot) = sessions.get(&session_id).cloned() {
+        let lifecycle_state = recovery_state_for(&snapshot).to_string();
+        sessions.insert(
+            session_id.clone(),
+            SessionSnapshot {
+                lifecycle_state,
+                last_error: None,
+                sender_active: false,
+                receiver_active: false,
+                ..snapshot
+            },
+        );
+        drop(sessions);
+
+        let mut shell = app_state.shell.lock().await;
+        shell.last_error = None;
+
+        return IpcResponse::SessionRecovered { session_id };
+    }
+
+    IpcResponse::Error {
+        code: "E404".to_string(),
+        message: format!("Session not found: {}", session_id.0),
     }
 }
 
 /// Handle session snapshot request
-pub async fn session_snapshot(
-    app_state: &Arc<AppState>,
-    session_id: SessionId,
-) -> IpcResponse {
+pub async fn session_snapshot(app_state: &Arc<AppState>, session_id: SessionId) -> IpcResponse {
     let sessions = app_state.sessions.lock().await;
     let snap = sessions.get(&session_id);
 
@@ -125,7 +198,8 @@ pub async fn session_snapshot(
                 "agent"
             } else {
                 "unknown"
-            }.to_string();
+            }
+            .to_string();
 
             IpcResponse::SessionSnapshot {
                 snapshot: mrd_ipc::SessionRuntimeSnapshot {
@@ -133,7 +207,9 @@ pub async fn session_snapshot(
                     role,
                     state: s.lifecycle_state.clone(),
                     transport_kind: s.transport.clone(),
-                    local_bootstrap: if s.local_listen_addr.is_some() || s.local_server_name.is_some() {
+                    local_bootstrap: if s.local_listen_addr.is_some()
+                        || s.local_server_name.is_some()
+                    {
                         Some(mrd_ipc::SessionBootstrap {
                             listen_addr: s.local_listen_addr.clone(),
                             server_name: s.local_server_name.clone(),
@@ -142,7 +218,9 @@ pub async fn session_snapshot(
                     } else {
                         None
                     },
-                    remote_bootstrap: if s.remote_listen_addr.is_some() || s.remote_server_name.is_some() {
+                    remote_bootstrap: if s.remote_listen_addr.is_some()
+                        || s.remote_server_name.is_some()
+                    {
                         Some(mrd_ipc::SessionBootstrap {
                             listen_addr: s.remote_listen_addr.clone(),
                             server_name: s.remote_server_name.clone(),
@@ -154,13 +232,23 @@ pub async fn session_snapshot(
                     last_error: s.last_error.clone(),
                     sender_active: s.sender_active,
                     receiver_active: s.receiver_active,
-                }
+                },
             }
         }
         None => IpcResponse::Error {
             code: "E404".to_string(),
             message: format!("Session not found: {}", session_id.0),
         },
+    }
+}
+
+fn recovery_state_for(snapshot: &SessionSnapshot) -> &'static str {
+    if snapshot.target_device_id.is_some() {
+        "connecting"
+    } else if snapshot.source_device_id.is_some() {
+        "listening"
+    } else {
+        "created"
     }
 }
 
@@ -180,10 +268,13 @@ mod tests {
             session_id.clone(),
             target_device_id,
             "quic".to_string(),
-        ).await;
+        )
+        .await;
 
         match response {
-            IpcResponse::SessionStarted { session_id: returned_id } => {
+            IpcResponse::SessionStarted {
+                session_id: returned_id,
+            } => {
                 assert_eq!(returned_id, session_id);
             }
             _ => panic!("Expected SessionStarted response"),
@@ -206,7 +297,8 @@ mod tests {
             session_id.clone(),
             DeviceId("agent".to_string()),
             "quic".to_string(),
-        ).await;
+        )
+        .await;
 
         // Then stop it
         let response = stop_session(&app_state, session_id.clone()).await;
@@ -216,9 +308,46 @@ mod tests {
             _ => panic!("Expected SessionStopped response"),
         }
 
-        // Verify session was removed
+        // Verify session was retained as closed so UI can observe the stop.
         let sessions = app_state.sessions.lock().await;
-        let stored = sessions.get(&session_id);
-        assert!(stored.is_none());
+        let stored = sessions
+            .get(&session_id)
+            .expect("closed session should remain");
+        assert_eq!(stored.lifecycle_state, "closed");
+        assert!(!stored.sender_active);
+        assert!(!stored.receiver_active);
+    }
+
+    #[tokio::test]
+    async fn fail_and_recover_session_updates_lifecycle_state() {
+        let app_state = Arc::new(AppState::new());
+        let session_id = SessionId("test-session".to_string());
+
+        let _ = start_session(
+            &app_state,
+            session_id.clone(),
+            DeviceId("agent".to_string()),
+            "quic".to_string(),
+        )
+        .await;
+
+        let response =
+            fail_session(&app_state, session_id.clone(), "transport lost".to_string()).await;
+        assert!(matches!(response, IpcResponse::SessionFailed { .. }));
+
+        {
+            let sessions = app_state.sessions.lock().await;
+            let stored = sessions.get(&session_id).expect("failed session");
+            assert_eq!(stored.lifecycle_state, "failed");
+            assert_eq!(stored.last_error.as_deref(), Some("transport lost"));
+        }
+
+        let response = recover_session(&app_state, session_id.clone()).await;
+        assert!(matches!(response, IpcResponse::SessionRecovered { .. }));
+
+        let sessions = app_state.sessions.lock().await;
+        let stored = sessions.get(&session_id).expect("recovered session");
+        assert_eq!(stored.lifecycle_state, "connecting");
+        assert!(stored.last_error.is_none());
     }
 }

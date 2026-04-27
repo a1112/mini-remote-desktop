@@ -2,10 +2,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app_settings;
-mod ipc_client;
-mod service_manager;
 mod device_info;
+mod ipc_client;
+mod platform;
+mod resource_monitor;
 mod render_window_registry;
+mod service_manager;
 mod test_harness;
 mod test_orchestrator;
 
@@ -14,11 +16,28 @@ use app_settings::{
 };
 use device_info::HardwareInfo;
 use mrd_ipc;
-use mrd_proto::DeviceId;
-use render_window_registry::RenderWindowContext;
+use resource_monitor::{ResourceMonitor, SystemResourceSnapshot};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tauri::Manager;
+use tauri::{
+    menu::{Menu, MenuItem, PredefinedMenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    AppHandle, Manager, WebviewWindow,
+};
+
+const TRAY_ICON_ID: &str = "rdesk-tray";
+const TRAY_MENU_SHOW_ID: &str = "rdesk-tray-show";
+const TRAY_MENU_HIDE_ID: &str = "rdesk-tray-hide";
+const TRAY_MENU_CENTER_ID: &str = "rdesk-tray-center";
+const TRAY_MENU_QUIT_ID: &str = "rdesk-tray-quit";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrayAction {
+    ShowWindow,
+    HideWindow,
+    CenterWindow,
+    QuitUi,
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -29,6 +48,8 @@ struct AppState {
     test_harness: std::sync::Arc<std::sync::Mutex<test_harness::TestHarness>>,
     // Test orchestrator - unified test execution and management
     test_orchestrator: std::sync::Arc<test_orchestrator::TestOrchestrator>,
+    // Lightweight resource sampler for the test workbench title bar
+    resource_monitor: std::sync::Arc<std::sync::Mutex<ResourceMonitor>>,
 }
 
 /// 设备注册响应
@@ -44,16 +65,164 @@ struct DecodePolicyResponse {
     decode_policy: String,
 }
 
+#[derive(Debug, Serialize)]
+struct ClientDiagnostics {
+    app_pid: u32,
+    app_exe_path: Option<String>,
+    current_dir: Option<String>,
+    log_dir: String,
+    service_exe_path: String,
+    service_stdout_log: String,
+    service_stderr_log: String,
+}
+
 /// Tauri 命令：获取硬件信息
 #[tauri::command]
 fn get_hardware_info() -> Result<HardwareInfo, String> {
     Ok(device_info::get_hardware_info())
 }
 
+#[tauri::command]
+async fn get_system_resource_snapshot(
+    state: tauri::State<'_, AppState>,
+) -> Result<SystemResourceSnapshot, String> {
+    let target_pid = query_service_pid().await;
+    Ok(state
+        .resource_monitor
+        .lock()
+        .unwrap()
+        .snapshot_for_process(target_pid, "mrd-service"))
+}
+
+async fn query_service_pid() -> Option<u32> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    match client.send_request(IpcRequest::ServiceHealth).await {
+        Ok(IpcResponse::ServiceHealth { status }) => status.pid,
+        _ => None,
+    }
+}
+
+#[tauri::command]
+fn start_drag_window(window: WebviewWindow) -> Result<(), String> {
+    window.start_dragging().map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn minimize_window(window: WebviewWindow) -> Result<(), String> {
+    window.minimize().map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn toggle_maximize_window(window: WebviewWindow) -> Result<bool, String> {
+    if window.is_maximized().map_err(|err| err.to_string())? {
+        window.unmaximize().map_err(|err| err.to_string())?;
+        Ok(false)
+    } else {
+        window.maximize().map_err(|err| err.to_string())?;
+        Ok(true)
+    }
+}
+
+#[tauri::command]
+fn hide_to_tray(window: WebviewWindow) -> Result<(), String> {
+    window.hide().map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn show_window(app_handle: AppHandle) -> Result<(), String> {
+    show_main_window(&app_handle)
+}
+
+#[tauri::command]
+fn center_window(window: WebviewWindow) -> Result<(), String> {
+    window.center().map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn close_window(window: WebviewWindow) -> Result<(), String> {
+    window.hide().map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn set_window_decorations(window: WebviewWindow, decorated: bool) -> Result<(), String> {
+    window
+        .set_decorations(decorated)
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn apply_native_chrome(window: WebviewWindow) -> platform::NativeBackdropStatus {
+    platform::configure_main_window(&window)
+}
+
+#[tauri::command]
+fn get_client_diagnostics(state: tauri::State<'_, AppState>) -> ClientDiagnostics {
+    let service_exe_path = state
+        .service_manager
+        .lock()
+        .unwrap()
+        .service_exe_path()
+        .display()
+        .to_string();
+
+    ClientDiagnostics {
+        app_pid: std::process::id(),
+        app_exe_path: std::env::current_exe()
+            .ok()
+            .map(|path| path.display().to_string()),
+        current_dir: std::env::current_dir()
+            .ok()
+            .map(|path| path.display().to_string()),
+        log_dir: service_manager::runtime_log_dir().display().to_string(),
+        service_exe_path,
+        service_stdout_log: service_manager::service_stdout_log_path()
+            .display()
+            .to_string(),
+        service_stderr_log: service_manager::service_stderr_log_path()
+            .display()
+            .to_string(),
+    }
+}
+
+#[tauri::command]
+fn open_diagnostics_folder() -> Result<(), String> {
+    let log_dir = service_manager::runtime_log_dir();
+    std::fs::create_dir_all(&log_dir).map_err(|error| error.to_string())?;
+
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = std::process::Command::new("explorer.exe");
+        command.arg(&log_dir);
+        command
+    };
+
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = std::process::Command::new("open");
+        command.arg(&log_dir);
+        command
+    };
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = {
+        let mut command = std::process::Command::new("xdg-open");
+        command.arg(&log_dir);
+        command
+    };
+
+    command.spawn().map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 // nvdec_runtime_probe - moved to rdesk-legacy-harness package
 #[tauri::command]
 fn nvdec_runtime_probe() -> Result<serde_json::Value, String> {
-    Err("nvdec_runtime_probe moved to mrd-service - use rdesk-legacy-harness for testing".to_string())
+    Err(
+        "nvdec_runtime_probe moved to mrd-service - use rdesk-legacy-harness for testing"
+            .to_string(),
+    )
 }
 
 #[tauri::command]
@@ -70,11 +239,7 @@ async fn set_decode_policy(
 ) -> Result<DecodePolicyResponse, String> {
     let decode_policy = parse_decode_policy(&decode_policy)?;
     // Save to settings only - actual policy application happens in mrd-service
-    set_decode_policy_with(
-        &state.settings_path,
-        decode_policy,
-    )
-    .await
+    set_decode_policy_with(&state.settings_path, decode_policy).await
 }
 
 // ============================================================================
@@ -90,22 +255,39 @@ async fn service_bootstrap_if_needed(state: tauri::State<'_, AppState>) -> Resul
     tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            manager.lock().unwrap().bootstrap_if_needed().await.map_err(|e| e.to_string())
+            manager
+                .lock()
+                .unwrap()
+                .bootstrap_if_needed()
+                .await
+                .map_err(|e| e.to_string())
         })
-    }).await.map_err(|e| e.to_string())?
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Wait for service to be healthy (with timeout)
 #[tauri::command]
-async fn service_wait_for_healthy(state: tauri::State<'_, AppState>, timeout_secs: u64) -> Result<bool, String> {
+async fn service_wait_for_healthy(
+    state: tauri::State<'_, AppState>,
+    timeout_secs: u64,
+) -> Result<bool, String> {
     let manager = state.service_manager.clone();
 
     tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            manager.lock().unwrap().wait_for_healthy(timeout_secs).await.map_err(|e| e.to_string())
+            manager
+                .lock()
+                .unwrap()
+                .wait_for_healthy(timeout_secs)
+                .await
+                .map_err(|e| e.to_string())
         })
-    }).await.map_err(|e| e.to_string())?
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Check if this instance bootstrapped the service
@@ -115,10 +297,10 @@ async fn service_did_bootstrap(state: tauri::State<'_, AppState>) -> Result<bool
 
     tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            Ok(manager.lock().unwrap().did_bootstrap().await)
-        })
-    }).await.map_err(|e| e.to_string())?
+        rt.block_on(async { Ok(manager.lock().unwrap().did_bootstrap().await) })
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 // ============================================================================
@@ -131,12 +313,15 @@ async fn shell_ui_attached() -> Result<(), String> {
     use mrd_ipc::{IpcRequest, IpcResponse};
 
     let mut client = mrd_ipc::client::IpcClient::new();
-    let response = client.send_request(IpcRequest::UiAttached {
-        pid: std::process::id(),
-        executable_path: std::env::current_exe()
-            .ok()
-            .and_then(|p| p.to_str().map(String::from)),
-    }).await.map_err(|e| e.to_string())?;
+    let response = client
+        .send_request(IpcRequest::UiAttached {
+            pid: std::process::id(),
+            executable_path: std::env::current_exe()
+                .ok()
+                .and_then(|p| p.to_str().map(String::from)),
+        })
+        .await
+        .map_err(|e| e.to_string())?;
 
     match response {
         IpcResponse::Ack => Ok(()),
@@ -159,10 +344,13 @@ async fn shell_ui_detached(reason: String) -> Result<(), String> {
     };
 
     let mut client = mrd_ipc::client::IpcClient::new();
-    let response = client.send_request(IpcRequest::UiDetached {
-        pid: std::process::id(),
-        reason: detach_reason,
-    }).await.map_err(|e| e.to_string())?;
+    let response = client
+        .send_request(IpcRequest::UiDetached {
+            pid: std::process::id(),
+            reason: detach_reason,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
 
     match response {
         IpcResponse::Ack => Ok(()),
@@ -177,7 +365,10 @@ async fn shell_get_status() -> Result<mrd_ipc::ShellStatusSnapshot, String> {
     use mrd_ipc::{IpcRequest, IpcResponse};
 
     let mut client = mrd_ipc::client::IpcClient::new();
-    let response = client.send_request(IpcRequest::GetShellStatus).await.map_err(|e| e.to_string())?;
+    let response = client
+        .send_request(IpcRequest::GetShellStatus)
+        .await
+        .map_err(|e| e.to_string())?;
 
     match response {
         IpcResponse::ShellStatus { status } => Ok(status),
@@ -199,7 +390,12 @@ async fn shell_shutdown_service(mode: String) -> Result<(), String> {
     };
 
     let mut client = mrd_ipc::client::IpcClient::new();
-    let response = client.send_request(IpcRequest::ShutdownService { mode: shutdown_mode }).await.map_err(|e| e.to_string())?;
+    let response = client
+        .send_request(IpcRequest::ShutdownService {
+            mode: shutdown_mode,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
 
     match response {
         IpcResponse::Ack => Ok(()),
@@ -213,9 +409,7 @@ async fn shell_shutdown_service(mode: String) -> Result<(), String> {
 /// Phase 6: This now uses IPC ShutdownService instead of directly stopping
 /// the service process. Rdesk no longer owns service lifecycle.
 #[tauri::command]
-async fn shell_quit_ui_and_stop_service(
-    app_handle: tauri::AppHandle,
-) -> Result<(), String> {
+async fn shell_quit_ui_and_stop_service(app_handle: tauri::AppHandle) -> Result<(), String> {
     // Notify service that UI is detaching
     let _ = shell_ui_detached("user_quit".to_string()).await;
 
@@ -226,16 +420,20 @@ async fn shell_quit_ui_and_stop_service(
         client.send_request(IpcRequest::ListSessions).await
     {
         for session_info in sessions {
-            let _ = client.send_request(IpcRequest::StopSession {
-                session_id: session_info.session_id,
-            }).await;
+            let _ = client
+                .send_request(IpcRequest::StopSession {
+                    session_id: session_info.session_id,
+                })
+                .await;
         }
     }
 
     // Request service shutdown via IPC (Phase 6: service owns lifecycle)
-    let _ = client.send_request(IpcRequest::ShutdownService {
-        mode: mrd_ipc::ShutdownMode::Graceful,
-    }).await;
+    let _ = client
+        .send_request(IpcRequest::ShutdownService {
+            mode: mrd_ipc::ShutdownMode::Graceful,
+        })
+        .await;
 
     // Exit the UI application
     app_handle.exit(0);
@@ -248,18 +446,18 @@ async fn shell_quit_ui_and_stop_service(
 
 /// Register device via IPC (migrated version)
 #[tauri::command]
-async fn ipc_register_device(
-    device_id: String,
-    device_name: String,
-) -> Result<String, String> {
+async fn ipc_register_device(device_id: String, device_name: String) -> Result<String, String> {
     use mrd_ipc::{IpcRequest, IpcResponse};
     use mrd_proto::DeviceId;
 
     let mut client = mrd_ipc::client::IpcClient::new();
-    let response = client.send_request(IpcRequest::RegisterDevice {
-        device_id: DeviceId(device_id),
-        device_name,
-    }).await.map_err(|e| e.to_string())?;
+    let response = client
+        .send_request(IpcRequest::RegisterDevice {
+            device_id: DeviceId(device_id),
+            device_name,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
 
     match response {
         IpcResponse::DeviceRegistered { device_id } => Ok(device_id.0),
@@ -274,7 +472,10 @@ async fn ipc_list_devices() -> Result<Vec<mrd_ipc::DeviceInfo>, String> {
     use mrd_ipc::{IpcRequest, IpcResponse};
 
     let mut client = mrd_ipc::client::IpcClient::new();
-    let response = client.send_request(IpcRequest::ListDevices).await.map_err(|e| e.to_string())?;
+    let response = client
+        .send_request(IpcRequest::ListDevices)
+        .await
+        .map_err(|e| e.to_string())?;
 
     match response {
         IpcResponse::DeviceList { devices } => Ok(devices),
@@ -291,14 +492,17 @@ async fn ipc_start_session(
     transport_kind: String,
 ) -> Result<String, String> {
     use mrd_ipc::{IpcRequest, IpcResponse};
-    use mrd_proto::{SessionId, DeviceId};
+    use mrd_proto::{DeviceId, SessionId};
 
     let mut client = mrd_ipc::client::IpcClient::new();
-    let response = client.send_request(IpcRequest::StartSession {
-        session_id: SessionId(session_id),
-        target_device_id: DeviceId(target_device_id),
-        transport_kind,
-    }).await.map_err(|e| e.to_string())?;
+    let response = client
+        .send_request(IpcRequest::StartSession {
+            session_id: SessionId(session_id),
+            target_device_id: DeviceId(target_device_id),
+            transport_kind,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
 
     match response {
         IpcResponse::SessionStarted { session_id } => Ok(session_id.0),
@@ -314,13 +518,16 @@ async fn ipc_accept_session(
     source_device_id: String,
 ) -> Result<String, String> {
     use mrd_ipc::{IpcRequest, IpcResponse};
-    use mrd_proto::{SessionId, DeviceId};
+    use mrd_proto::{DeviceId, SessionId};
 
     let mut client = mrd_ipc::client::IpcClient::new();
-    let response = client.send_request(IpcRequest::AcceptSession {
-        session_id: SessionId(session_id),
-        source_device_id: DeviceId(source_device_id),
-    }).await.map_err(|e| e.to_string())?;
+    let response = client
+        .send_request(IpcRequest::AcceptSession {
+            session_id: SessionId(session_id),
+            source_device_id: DeviceId(source_device_id),
+        })
+        .await
+        .map_err(|e| e.to_string())?;
 
     match response {
         IpcResponse::SessionAccepted { session_id } => Ok(session_id.0),
@@ -331,19 +538,63 @@ async fn ipc_accept_session(
 
 /// Stop session via IPC (migrated version)
 #[tauri::command]
-async fn ipc_stop_session(
-    session_id: String,
-) -> Result<String, String> {
+async fn ipc_stop_session(session_id: String) -> Result<String, String> {
     use mrd_ipc::{IpcRequest, IpcResponse};
     use mrd_proto::SessionId;
 
     let mut client = mrd_ipc::client::IpcClient::new();
-    let response = client.send_request(IpcRequest::StopSession {
-        session_id: SessionId(session_id),
-    }).await.map_err(|e| e.to_string())?;
+    let response = client
+        .send_request(IpcRequest::StopSession {
+            session_id: SessionId(session_id),
+        })
+        .await
+        .map_err(|e| e.to_string())?;
 
     match response {
         IpcResponse::SessionStopped { session_id } => Ok(session_id.0),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+/// Mark a session failed via IPC.
+#[tauri::command]
+async fn ipc_fail_session(session_id: String, reason: String) -> Result<String, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+    use mrd_proto::SessionId;
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::FailSession {
+            session_id: SessionId(session_id),
+            reason,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::SessionFailed { session_id } => Ok(session_id.0),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+/// Recover a failed or closed session via IPC.
+#[tauri::command]
+async fn ipc_recover_session(session_id: String) -> Result<String, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+    use mrd_proto::SessionId;
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::RecoverSession {
+            session_id: SessionId(session_id),
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::SessionRecovered { session_id } => Ok(session_id.0),
         IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
         _ => Err("Unexpected response".to_string()),
     }
@@ -358,9 +609,12 @@ async fn ipc_session_snapshot(
     use mrd_proto::SessionId;
 
     let mut client = mrd_ipc::client::IpcClient::new();
-    let response = client.send_request(IpcRequest::SessionRuntimeSnapshot {
-        session_id: SessionId(session_id),
-    }).await.map_err(|e| e.to_string())?;
+    let response = client
+        .send_request(IpcRequest::SessionRuntimeSnapshot {
+            session_id: SessionId(session_id),
+        })
+        .await
+        .map_err(|e| e.to_string())?;
 
     match response {
         IpcResponse::SessionSnapshot { snapshot } => Ok(snapshot),
@@ -371,16 +625,17 @@ async fn ipc_session_snapshot(
 
 /// Start sender via IPC (migrated version)
 #[tauri::command]
-async fn ipc_start_sender(
-    session_id: String,
-) -> Result<String, String> {
+async fn ipc_start_sender(session_id: String) -> Result<String, String> {
     use mrd_ipc::{IpcRequest, IpcResponse};
     use mrd_proto::SessionId;
 
     let mut client = mrd_ipc::client::IpcClient::new();
-    let response = client.send_request(IpcRequest::StartSender {
-        session_id: SessionId(session_id),
-    }).await.map_err(|e| e.to_string())?;
+    let response = client
+        .send_request(IpcRequest::StartSender {
+            session_id: SessionId(session_id),
+        })
+        .await
+        .map_err(|e| e.to_string())?;
 
     match response {
         IpcResponse::SenderStarted { session_id } => Ok(session_id.0),
@@ -391,16 +646,17 @@ async fn ipc_start_sender(
 
 /// Start receiver via IPC (migrated version)
 #[tauri::command]
-async fn ipc_start_receiver(
-    session_id: String,
-) -> Result<String, String> {
+async fn ipc_start_receiver(session_id: String) -> Result<String, String> {
     use mrd_ipc::{IpcRequest, IpcResponse};
     use mrd_proto::SessionId;
 
     let mut client = mrd_ipc::client::IpcClient::new();
-    let response = client.send_request(IpcRequest::StartReceiver {
-        session_id: SessionId(session_id),
-    }).await.map_err(|e| e.to_string())?;
+    let response = client
+        .send_request(IpcRequest::StartReceiver {
+            session_id: SessionId(session_id),
+        })
+        .await
+        .map_err(|e| e.to_string())?;
 
     match response {
         IpcResponse::ReceiverStarted { session_id } => Ok(session_id.0),
@@ -415,7 +671,10 @@ async fn ipc_list_sessions() -> Result<Vec<mrd_ipc::SessionInfo>, String> {
     use mrd_ipc::{IpcRequest, IpcResponse};
 
     let mut client = mrd_ipc::client::IpcClient::new();
-    let response = client.send_request(IpcRequest::ListSessions).await.map_err(|e| e.to_string())?;
+    let response = client
+        .send_request(IpcRequest::ListSessions)
+        .await
+        .map_err(|e| e.to_string())?;
 
     match response {
         IpcResponse::SessionList { sessions } => Ok(sessions),
@@ -430,7 +689,10 @@ async fn ipc_runtime_snapshot() -> Result<mrd_ipc::RuntimeSnapshot, String> {
     use mrd_ipc::{IpcRequest, IpcResponse};
 
     let mut client = mrd_ipc::client::IpcClient::new();
-    let response = client.send_request(IpcRequest::RuntimeSnapshot).await.map_err(|e| e.to_string())?;
+    let response = client
+        .send_request(IpcRequest::RuntimeSnapshot)
+        .await
+        .map_err(|e| e.to_string())?;
 
     match response {
         IpcResponse::RuntimeSnapshot { snapshot } => Ok(snapshot),
@@ -445,7 +707,10 @@ async fn ipc_service_health() -> Result<mrd_ipc::ServiceStatus, String> {
     use mrd_ipc::{IpcRequest, IpcResponse};
 
     let mut client = mrd_ipc::client::IpcClient::new();
-    let response = client.send_request(IpcRequest::ServiceHealth).await.map_err(|e| e.to_string())?;
+    let response = client
+        .send_request(IpcRequest::ServiceHealth)
+        .await
+        .map_err(|e| e.to_string())?;
 
     match response {
         IpcResponse::ServiceHealth { status } => Ok(status),
@@ -456,16 +721,17 @@ async fn ipc_service_health() -> Result<mrd_ipc::ServiceStatus, String> {
 
 /// Get probe snapshot via IPC (migrated version)
 #[tauri::command]
-async fn ipc_probe_snapshot(
-    session_id: String,
-) -> Result<mrd_ipc::ProbeSnapshot, String> {
+async fn ipc_probe_snapshot(session_id: String) -> Result<mrd_ipc::ProbeSnapshot, String> {
     use mrd_ipc::{IpcRequest, IpcResponse};
     use mrd_proto::SessionId;
 
     let mut client = mrd_ipc::client::IpcClient::new();
-    let response = client.send_request(IpcRequest::ProbeSnapshot {
-        session_id: SessionId(session_id),
-    }).await.map_err(|e| e.to_string())?;
+    let response = client
+        .send_request(IpcRequest::ProbeSnapshot {
+            session_id: SessionId(session_id),
+        })
+        .await
+        .map_err(|e| e.to_string())?;
 
     match response {
         IpcResponse::ProbeSnapshot { snapshot } => Ok(snapshot),
@@ -482,16 +748,16 @@ async fn webrtc_session_list_via_ipc() -> Result<Vec<String>, String> {
     use mrd_ipc::IpcRequest;
 
     let mut client = mrd_ipc::client::IpcClient::new();
-    let response = client.send_request(IpcRequest::ListDevices).await
+    let response = client
+        .send_request(IpcRequest::ListDevices)
+        .await
         .map_err(|e| format!("IPC error: {}", e))?;
 
     match response {
         mrd_ipc::IpcResponse::DeviceList { devices } => {
             Ok(devices.into_iter().map(|d| d.device_id.0).collect())
         }
-        mrd_ipc::IpcResponse::Error { code, message } => {
-            Err(format!("{}: {}", code, message))
-        }
+        mrd_ipc::IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
         _ => Err("Unexpected response".to_string()),
     }
 }
@@ -585,18 +851,29 @@ async fn set_decode_policy_with(
 
 #[tauri::command]
 fn test_harness_start(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    state.test_harness.lock().unwrap().start().map_err(|e| e.to_string())
+    state
+        .test_harness
+        .lock()
+        .unwrap()
+        .start()
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 fn test_harness_stop(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    state.test_harness.lock().unwrap().stop().map_err(|e| e.to_string())
+    state
+        .test_harness
+        .lock()
+        .unwrap()
+        .stop()
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 fn test_harness_set_chain(state: tauri::State<'_, AppState>, chain: String) -> Result<(), String> {
     use test_harness::TestChain;
     let parsed = match chain.as_str() {
+        "capture_only" => TestChain::CaptureOnly,
         "nvenc_nvdec" => TestChain::NvencNvdec,
         "nvenc_only" => TestChain::NvencOnly,
         "openh264" => TestChain::OpenH264,
@@ -625,6 +902,7 @@ fn test_harness_set_chain(state: tauri::State<'_, AppState>, chain: String) -> R
 fn test_harness_get_chain(state: tauri::State<'_, AppState>) -> String {
     use test_harness::TestChain;
     match state.test_harness.lock().unwrap().get_chain() {
+        TestChain::CaptureOnly => "capture_only".to_string(),
         TestChain::NvencNvdec => "nvenc_nvdec".to_string(),
         TestChain::NvencOnly => "nvenc_only".to_string(),
         TestChain::OpenH264 => "openh264".to_string(),
@@ -638,7 +916,9 @@ fn test_harness_get_metrics(state: tauri::State<'_, AppState>) -> test_harness::
 }
 
 #[tauri::command]
-fn test_harness_get_frames(state: tauri::State<'_, AppState>) -> (
+fn test_harness_get_frames(
+    state: tauri::State<'_, AppState>,
+) -> (
     Option<(String, usize, usize)>,
     Option<(String, usize, usize)>,
 ) {
@@ -681,10 +961,7 @@ mod frame_encoding_tests {
     #[test]
     fn bgra_frame_is_encoded_as_png() {
         let bgra = [
-            0, 0, 255, 255,
-            0, 255, 0, 255,
-            255, 0, 0, 255,
-            255, 255, 255, 255,
+            0, 0, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255, 255, 255, 255, 255,
         ];
 
         let encoded = encode_bgra_png_base64(&bgra, 2, 2).unwrap();
@@ -708,8 +985,20 @@ fn test_list_scenarios(state: tauri::State<'_, AppState>) -> Vec<test_orchestrat
 
 /// Get environment capabilities
 #[tauri::command]
-fn test_get_capabilities(state: tauri::State<'_, AppState>) -> Result<test_orchestrator::EnvironmentSnapshot, String> {
-    state.test_orchestrator.get_capabilities().map_err(|e| e.to_string())
+fn test_get_capabilities(
+    state: tauri::State<'_, AppState>,
+) -> Result<test_orchestrator::EnvironmentSnapshot, String> {
+    state
+        .test_orchestrator
+        .get_capabilities()
+        .map_err(|e| e.to_string())
+}
+
+/// List visible top-level windows that can be used as WinRT capture targets.
+#[tauri::command]
+fn test_list_window_capture_targets() -> Result<Vec<test_orchestrator::WindowCaptureTarget>, String>
+{
+    test_orchestrator::list_window_capture_targets().map_err(|e| e.to_string())
 }
 
 /// Start a test run
@@ -719,14 +1008,18 @@ fn test_start_run(
     scenario_id: String,
     config: test_orchestrator::TestConfigData,
 ) -> Result<String, String> {
-    state.test_orchestrator.start_run(scenario_id, config)
+    state
+        .test_orchestrator
+        .start_run(scenario_id, config)
         .map_err(|e| e.to_string())
 }
 
 /// Stop a test run
 #[tauri::command]
 fn test_stop_run(state: tauri::State<'_, AppState>, run_id: String) -> Result<(), String> {
-    state.test_orchestrator.stop_run(&run_id)
+    state
+        .test_orchestrator
+        .stop_run(&run_id)
         .map_err(|e| e.to_string())
 }
 
@@ -738,7 +1031,9 @@ fn test_list_runs(
     status: Option<String>,
     limit: Option<usize>,
 ) -> Vec<test_orchestrator::TestRun> {
-    state.test_orchestrator.list_runs(scenario_id, status, limit)
+    state
+        .test_orchestrator
+        .list_runs(scenario_id, status, limit)
 }
 
 /// Get a test run
@@ -792,14 +1087,144 @@ fn test_save_preset(
     scenario_id: String,
     config: test_orchestrator::TestConfigData,
 ) -> String {
-    state.test_orchestrator.save_preset(name, description, scenario_id, config)
+    state
+        .test_orchestrator
+        .save_preset(name, description, scenario_id, config)
 }
 
 /// Delete a test preset
 #[tauri::command]
 fn test_delete_preset(state: tauri::State<'_, AppState>, preset_id: String) -> Result<(), String> {
-    state.test_orchestrator.delete_preset(&preset_id)
+    state
+        .test_orchestrator
+        .delete_preset(&preset_id)
         .map_err(|e| e.to_string())
+}
+
+fn main_window(app: &AppHandle) -> Result<WebviewWindow, String> {
+    app.get_webview_window("main")
+        .ok_or_else(|| "main window not found".to_string())
+}
+
+fn show_main_window(app: &AppHandle) -> Result<(), String> {
+    let window = main_window(app)?;
+    let _ = window.unminimize();
+    window.show().map_err(|err| err.to_string())?;
+    window.set_focus().map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+fn hide_main_window(app: &AppHandle) -> Result<(), String> {
+    main_window(app)?.hide().map_err(|err| err.to_string())
+}
+
+fn detach_ui_async(reason: &'static str) {
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Runtime::new() else {
+            return;
+        };
+        rt.block_on(async move {
+            let _ = shell_ui_detached(reason.to_string()).await;
+        });
+    });
+}
+
+fn setup_system_tray(app: &AppHandle) -> tauri::Result<()> {
+    let show_item = MenuItem::with_id(app, TRAY_MENU_SHOW_ID, "Show Rdesk", true, None::<&str>)?;
+    let hide_item = MenuItem::with_id(app, TRAY_MENU_HIDE_ID, "Hide to Tray", true, None::<&str>)?;
+    let center_item = MenuItem::with_id(
+        app,
+        TRAY_MENU_CENTER_ID,
+        "Center Window",
+        true,
+        None::<&str>,
+    )?;
+    let separator = PredefinedMenuItem::separator(app)?;
+    let quit_item = MenuItem::with_id(app, TRAY_MENU_QUIT_ID, "Quit Rdesk", true, None::<&str>)?;
+    let menu = Menu::with_items(
+        app,
+        &[&show_item, &hide_item, &center_item, &separator, &quit_item],
+    )?;
+    let icon = app.default_window_icon().cloned().unwrap_or_else(|| {
+        let image = image::load_from_memory(include_bytes!("../icons/tray-icon.png"))
+            .expect("embedded tray icon should be a valid PNG")
+            .into_rgba8();
+        let (width, height) = image.dimensions();
+        tauri::image::Image::new_owned(image.into_raw(), width, height)
+    });
+
+    TrayIconBuilder::with_id(TRAY_ICON_ID)
+        .icon(icon)
+        .tooltip("Rdesk")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .build(app)?;
+
+    Ok(())
+}
+
+fn tray_action_from_menu_id(id: &str) -> Option<TrayAction> {
+    match id {
+        TRAY_MENU_SHOW_ID => Some(TrayAction::ShowWindow),
+        TRAY_MENU_HIDE_ID => Some(TrayAction::HideWindow),
+        TRAY_MENU_CENTER_ID => Some(TrayAction::CenterWindow),
+        TRAY_MENU_QUIT_ID => Some(TrayAction::QuitUi),
+        _ => None,
+    }
+}
+
+fn tray_action_from_icon_event(event: &TrayIconEvent) -> Option<TrayAction> {
+    match event {
+        TrayIconEvent::Click {
+            button: MouseButton::Left,
+            button_state: MouseButtonState::Up,
+            ..
+        }
+        | TrayIconEvent::DoubleClick {
+            button: MouseButton::Left,
+            ..
+        } => Some(TrayAction::ShowWindow),
+        _ => None,
+    }
+}
+
+fn apply_tray_action(app: &AppHandle, action: TrayAction) -> Result<(), String> {
+    match action {
+        TrayAction::ShowWindow => show_main_window(app),
+        TrayAction::HideWindow => hide_main_window(app),
+        TrayAction::CenterWindow => main_window(app)?.center().map_err(|err| err.to_string()),
+        TrayAction::QuitUi => {
+            detach_ui_async("user_quit");
+            app.exit(0);
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tray_tests {
+    use super::*;
+
+    #[test]
+    fn tray_menu_ids_map_to_actions() {
+        assert_eq!(
+            tray_action_from_menu_id(TRAY_MENU_SHOW_ID),
+            Some(TrayAction::ShowWindow)
+        );
+        assert_eq!(
+            tray_action_from_menu_id(TRAY_MENU_HIDE_ID),
+            Some(TrayAction::HideWindow)
+        );
+        assert_eq!(
+            tray_action_from_menu_id(TRAY_MENU_CENTER_ID),
+            Some(TrayAction::CenterWindow)
+        );
+        assert_eq!(
+            tray_action_from_menu_id(TRAY_MENU_QUIT_ID),
+            Some(TrayAction::QuitUi)
+        );
+        assert_eq!(tray_action_from_menu_id("unknown"), None);
+    }
 }
 
 fn main() {
@@ -811,18 +1236,19 @@ fn main() {
 
     // Create shared service manager (bootstrap-only in Phase 6)
     let service_manager = std::sync::Arc::new(std::sync::Mutex::new(
-        service_manager::ServiceManager::new()
-            .expect("failed to create ServiceManager")
+        service_manager::ServiceManager::new().expect("failed to create ServiceManager"),
     ));
 
     // Create test harness for end-to-end pipeline visualization
     let test_harness = std::sync::Arc::new(std::sync::Mutex::new(
-        test_harness::TestHarness::new()
-            .expect("failed to create TestHarness")
+        test_harness::TestHarness::new().expect("failed to create TestHarness"),
     ));
 
     // Create test orchestrator
-    let test_orchestrator = std::sync::Arc::new(test_orchestrator::TestOrchestrator::new(test_harness.clone()));
+    let test_orchestrator = std::sync::Arc::new(test_orchestrator::TestOrchestrator::new(
+        test_harness.clone(),
+    ));
+    let resource_monitor = std::sync::Arc::new(std::sync::Mutex::new(ResourceMonitor::new()));
 
     // Build the app
     tauri::Builder::default()
@@ -831,9 +1257,49 @@ fn main() {
             service_manager,
             test_harness,
             test_orchestrator,
+            resource_monitor,
+        })
+        .on_menu_event(|app, event| {
+            if let Some(action) = tray_action_from_menu_id(event.id().as_ref()) {
+                if let Err(error) = apply_tray_action(app, action) {
+                    eprintln!("tray menu action failed: {error}");
+                }
+            }
+        })
+        .on_tray_icon_event(|app, event| {
+            if event.id().as_ref() != TRAY_ICON_ID {
+                return;
+            }
+
+            if let Some(action) = tray_action_from_icon_event(&event) {
+                if let Err(error) = apply_tray_action(app, action) {
+                    eprintln!("tray icon action failed: {error}");
+                }
+            }
         })
         .setup(|app| {
-            // Phase 6: Tray is now owned by mrd-service, not Rdesk
+            setup_system_tray(app.handle())?;
+
+            if let Some(main_window) = app.get_webview_window("main") {
+                let backdrop_status = platform::configure_main_window(&main_window);
+                if !backdrop_status.applied {
+                    eprintln!(
+                        "failed to apply native backdrop: {}",
+                        backdrop_status.detail
+                    );
+                }
+
+                let app_handle_for_close = app.handle().clone();
+                main_window.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        if let Err(error) = hide_main_window(&app_handle_for_close) {
+                            eprintln!("failed to hide Rdesk window: {error}");
+                        }
+                    }
+                });
+            }
+
             // Step 1: Bootstrap mrd-service if not already running
             let service_mgr = app.state::<AppState>().service_manager.clone();
 
@@ -842,7 +1308,8 @@ fn main() {
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 rt.block_on(async move {
                     // Bootstrap mrd-service only if not reachable via IPC
-                    let bootstrapped = match service_mgr.lock().unwrap().bootstrap_if_needed().await {
+                    let bootstrapped = match service_mgr.lock().unwrap().bootstrap_if_needed().await
+                    {
                         Ok(did_bootstrap) => did_bootstrap,
                         Err(e) => {
                             eprintln!("Failed to bootstrap mrd-service: {}", e);
@@ -870,33 +1337,6 @@ fn main() {
                 });
             });
 
-            // Step 2: Set up window close event listener
-            // Phase 6: Normal close does NOT stop service - service continues running
-            // Use shell_shutdown_service IPC command for service shutdown
-            let main_window = app.get_webview_window("main").unwrap();
-            let app_handle_for_close = app.handle().clone();
-
-            main_window.on_window_event(move |event| {
-                if let tauri::WindowEvent::CloseRequested { .. } = event {
-                    // Notify service of UI detachment, but do NOT stop service
-                    println!("Window close requested - detaching UI (service stays running)...");
-
-                    let handle = app_handle_for_close.clone();
-
-                    // Spawn task to notify service and exit UI only
-                    std::thread::spawn(move || {
-                        let rt = tokio::runtime::Runtime::new().unwrap();
-                        rt.block_on(async move {
-                            // Notify service that UI is detaching
-                            let _ = shell_ui_detached("user_close".to_string()).await;
-                        });
-
-                        // Exit the UI only (service continues running)
-                        handle.exit(0);
-                    });
-                }
-            });
-
             Ok(())
         })
         .plugin(tauri_plugin_shell::init())
@@ -905,6 +1345,18 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             // Hardware and decode policy (local-only)
             get_hardware_info,
+            get_system_resource_snapshot,
+            start_drag_window,
+            minimize_window,
+            toggle_maximize_window,
+            hide_to_tray,
+            show_window,
+            center_window,
+            close_window,
+            set_window_decorations,
+            apply_native_chrome,
+            get_client_diagnostics,
+            open_diagnostics_folder,
             nvdec_runtime_probe,
             decode_policy,
             set_decode_policy,
@@ -919,6 +1371,8 @@ fn main() {
             ipc_start_session,
             ipc_accept_session,
             ipc_stop_session,
+            ipc_fail_session,
+            ipc_recover_session,
             ipc_session_snapshot,
             ipc_runtime_snapshot,
             ipc_service_health,
@@ -945,6 +1399,7 @@ fn main() {
             // Test Workbench commands (new unified test API)
             test_list_scenarios,
             test_get_capabilities,
+            test_list_window_capture_targets,
             test_start_run,
             test_stop_run,
             test_list_runs,

@@ -1,4 +1,6 @@
-import { Outlet, Link, useLocation } from "react-router";
+import { Outlet, Link, useLocation, useNavigate } from "react-router";
+import { useEffect, useState } from "react";
+import type { CSSProperties, MouseEvent, ReactNode } from "react";
 import {
   LayoutDashboard,
   Activity,
@@ -10,62 +12,316 @@ import {
   Layers,
   History,
   Package,
+  ArrowLeft,
+  Home,
+  Minus,
+  Square,
+  X,
+  Cpu,
+  MemoryStick,
+  Monitor,
+  Wifi,
 } from "lucide-react";
+import * as commands from "../../adapters/tauri/commands";
+import type { SystemResourceSnapshot } from "../../adapters/tauri/types";
 
 const navigation = [
-  { name: "总览", href: "/test", icon: LayoutDashboard },
-  { name: "采集测试", href: "/test/capture", icon: Eye },
-  { name: "编码测试", href: "/test/encode", icon: Film },
-  { name: "解码测试", href: "/test/decode", icon: Gauge },
-  { name: "渲染测试", href: "/test/render", icon: Layers },
-  { name: "传输测试", href: "/test/transport", icon: ArrowRightLeft },
-  { name: "端到端测试", href: "/test/e2e", icon: Activity },
-  { name: "自由组合", href: "/test/custom", icon: Settings },
-  { name: "矩阵测试", href: "/test/matrix", icon: Package },
-  { name: "历史记录", href: "/test/history", icon: History },
+  { name: "Overview", href: "/test", icon: LayoutDashboard },
+  { name: "Capture", href: "/test/capture", icon: Eye },
+  { name: "Encode", href: "/test/encode", icon: Film },
+  { name: "Decode", href: "/test/decode", icon: Gauge },
+  { name: "Render", href: "/test/render", icon: Layers },
+  { name: "Transport", href: "/test/transport", icon: ArrowRightLeft },
+  { name: "E2E", href: "/test/e2e", icon: Activity },
+  { name: "Custom", href: "/test/custom", icon: Settings },
+  { name: "Matrix", href: "/test/matrix", icon: Package },
+  { name: "History", href: "/test/history", icon: History },
 ];
 
 export function WorkbenchLayout() {
   const location = useLocation();
+  const navigate = useNavigate();
+  const [resourceSnapshot, setResourceSnapshot] =
+    useState<SystemResourceSnapshot | null>(null);
+
+  const noDragSelector =
+    'button, a, input, select, textarea, [role="button"], [data-no-drag="true"]';
+
+  useEffect(() => {
+    let cancelled = false;
+    let inFlight = false;
+
+    const refreshResources = async () => {
+      if (inFlight) return;
+      inFlight = true;
+
+      try {
+        const result = await commands.getSystemResourceSnapshot();
+        if (!cancelled && result.ok) {
+          setResourceSnapshot(result.value);
+        }
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    void refreshResources();
+    const intervalId = window.setInterval(() => void refreshResources(), 2000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, []);
+
+  const handleDragStart = (event: MouseEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
+    const target = event.target as HTMLElement | null;
+    if (target?.closest(noDragSelector)) return;
+    event.preventDefault();
+    void commands.startDragWindow();
+  };
+
+  const iconButton =
+    "flex h-9 w-9 items-center justify-center text-muted-foreground transition-colors hover:bg-muted hover:text-foreground";
 
   return (
-    <div className="flex h-screen bg-background">
-      {/* Sidebar Navigation */}
-      <aside className="w-64 border-r bg-card p-4">
-        <div className="mb-6">
-          <h1 className="text-xl font-bold text-foreground">测试工作台</h1>
-          <p className="text-sm text-muted-foreground">Rdesk Test Workbench</p>
+    <div className="flex h-screen flex-col bg-background text-foreground">
+      <header
+        className="flex h-11 shrink-0 select-none items-center border-b bg-card"
+        style={{ WebkitAppRegion: "drag" } as CSSProperties}
+        onMouseDown={handleDragStart}
+      >
+        <div className="flex items-center gap-1 px-2">
+          <button
+            type="button"
+            className={iconButton}
+            style={{ WebkitAppRegion: "no-drag" } as CSSProperties}
+            onClick={() => navigate(-1)}
+            title="Back"
+          >
+            <ArrowLeft className="h-4 w-4" />
+          </button>
+          <button
+            type="button"
+            className={iconButton}
+            style={{ WebkitAppRegion: "no-drag" } as CSSProperties}
+            onClick={() => navigate("/")}
+            title="Home"
+          >
+            <Home className="h-4 w-4" />
+          </button>
         </div>
 
-        <nav className="space-y-1">
-          {navigation.map((item) => {
-            const isActive = location.pathname === item.href;
-            return (
-              <Link
-                key={item.name}
-                to={item.href}
-                className={`flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors ${
-                  isActive
-                    ? "bg-primary text-primary-foreground"
-                    : "text-muted-foreground hover:bg-muted hover:text-foreground"
-                }`}
-              >
-                <item.icon className="h-4 w-4" />
-                {item.name}
-              </Link>
-            );
-          })}
-        </nav>
-
-        <div className="mt-auto pt-4 border-t text-xs text-muted-foreground">
-          <p>环境能力检测中...</p>
+        <div className="flex min-w-0 flex-1 items-center gap-3 px-2">
+          <div className="truncate text-sm font-semibold">Rdesk Test Workbench</div>
+          <ResourceMonitorStrip snapshot={resourceSnapshot} />
         </div>
-      </aside>
 
-      {/* Main Content Area */}
-      <main className="flex-1 overflow-auto">
-        <Outlet />
-      </main>
+        <div
+          className="flex h-full items-center"
+          style={{ WebkitAppRegion: "no-drag" } as CSSProperties}
+        >
+          <button
+            type="button"
+            className={iconButton}
+            onClick={() => void commands.minimizeWindow()}
+            title="Minimize"
+          >
+            <Minus className="h-4 w-4" />
+          </button>
+          <button
+            type="button"
+            className={iconButton}
+            onClick={() => void commands.toggleMaximizeWindow()}
+            title="Maximize"
+          >
+            <Square className="h-3.5 w-3.5" />
+          </button>
+          <button
+            type="button"
+            className="flex h-9 w-11 items-center justify-center text-muted-foreground transition-colors hover:bg-destructive hover:text-destructive-foreground"
+            onClick={() => void commands.closeWindow()}
+            title="Close"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+      </header>
+
+      <div className="flex min-h-0 flex-1">
+        <aside className="flex w-64 shrink-0 flex-col border-r bg-card p-4">
+          <div className="mb-6">
+            <h1 className="text-xl font-bold text-foreground">Test Workbench</h1>
+            <p className="text-sm text-muted-foreground">Rdesk media pipeline</p>
+          </div>
+
+          <nav className="space-y-1">
+            {navigation.map((item) => {
+              const isActive =
+                location.pathname === item.href ||
+                (item.href !== "/test" && location.pathname.startsWith(`${item.href}/`));
+              return (
+                <Link
+                  key={item.name}
+                  to={item.href}
+                  className={`flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors ${
+                    isActive
+                      ? "bg-primary text-primary-foreground"
+                      : "text-muted-foreground hover:bg-muted hover:text-foreground"
+                  }`}
+                >
+                  <item.icon className="h-4 w-4" />
+                  {item.name}
+                </Link>
+              );
+            })}
+          </nav>
+
+          <div className="mt-auto border-t pt-4 text-xs text-muted-foreground">
+            WebRTC capture display path
+          </div>
+        </aside>
+
+        <main className="min-w-0 flex-1 overflow-auto">
+          <Outlet />
+        </main>
+      </div>
     </div>
   );
+}
+
+function ResourceMonitorStrip({
+  snapshot,
+}: {
+  snapshot: SystemResourceSnapshot | null;
+}) {
+  const serviceTitle = snapshot
+    ? `${snapshot.target_name}${
+        snapshot.target_pid != null ? ` PID ${snapshot.target_pid}` : ""
+      }${snapshot.target_found ? "" : " not running"}`
+    : "mrd-service";
+  const gpuValue = formatGpuValue(snapshot);
+  const memoryTitle = snapshot
+    ? `${serviceTitle} memory ${formatMemory(snapshot.memory_used_mb)} (${formatPercent(
+        snapshot.memory_usage_percent
+      )} of system memory)`
+    : "mrd-service memory";
+  const gpuTitle = snapshot?.gpu_metrics_available
+    ? `${serviceTitle} GPU ${gpuValue}`
+    : `${serviceTitle} process GPU metrics unavailable`;
+  const networkTitle = snapshot
+    ? snapshot.network_metrics_available
+      ? `${serviceTitle} network Rx ${formatRate(snapshot.network_rx_bps)} Tx ${formatRate(
+          snapshot.network_tx_bps
+        )}`
+      : `${serviceTitle} process network metrics unavailable`
+    : "mrd-service network";
+
+  return (
+    <div className="hidden min-w-0 items-center gap-1 text-muted-foreground lg:flex">
+      <TitleMetric
+        icon={<Cpu className="h-3.5 w-3.5" />}
+        label="CPU"
+        value={snapshot ? formatPercent(snapshot.cpu_usage_percent) : "--"}
+        title={`${serviceTitle} CPU usage`}
+      />
+      <TitleMetric
+        icon={<MemoryStick className="h-3.5 w-3.5" />}
+        label="MEM"
+        value={snapshot ? formatMemory(snapshot.memory_used_mb) : "--"}
+        title={memoryTitle}
+      />
+      <TitleMetric
+        icon={<Monitor className="h-3.5 w-3.5" />}
+        label="GPU"
+        value={gpuValue}
+        title={gpuTitle}
+      />
+      <TitleMetric
+        icon={<Wifi className="h-3.5 w-3.5" />}
+        label="NET"
+        value={
+          snapshot?.network_metrics_available
+            ? `R ${formatRate(snapshot.network_rx_bps)} T ${formatRate(
+                snapshot.network_tx_bps
+              )}`
+            : "N/A"
+        }
+        title={networkTitle}
+        wide
+      />
+    </div>
+  );
+}
+
+function TitleMetric({
+  icon,
+  label,
+  value,
+  title,
+  wide = false,
+}: {
+  icon: ReactNode;
+  label: string;
+  value: string;
+  title: string;
+  wide?: boolean;
+}) {
+  return (
+    <div
+      className={`flex h-7 min-w-0 items-center gap-1.5 border-l border-border/70 pl-2 ${
+        wide ? "max-w-[180px]" : "max-w-[90px]"
+      }`}
+      title={title}
+    >
+      <span className="shrink-0 text-muted-foreground">{icon}</span>
+      <span className="shrink-0 text-[10px] font-semibold text-muted-foreground">
+        {label}
+      </span>
+      <span className="truncate font-mono text-[11px] font-semibold text-foreground">
+        {value}
+      </span>
+    </div>
+  );
+}
+
+function formatPercent(value: number) {
+  if (!Number.isFinite(value)) return "--";
+  return `${value.toFixed(value < 10 ? 1 : 0)}%`;
+}
+
+function formatMemory(valueMb: number) {
+  if (!Number.isFinite(valueMb)) return "--";
+  if (valueMb >= 1024) {
+    return `${(valueMb / 1024).toFixed(1)} GB`;
+  }
+  return `${Math.round(valueMb)} MB`;
+}
+
+function formatRate(bytesPerSecond: number) {
+  if (!Number.isFinite(bytesPerSecond) || bytesPerSecond <= 0) {
+    return "0B/s";
+  }
+
+  const units = ["B/s", "K/s", "M/s", "G/s"];
+  let value = bytesPerSecond;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+
+  return `${value >= 10 ? value.toFixed(0) : value.toFixed(1)}${units[unitIndex]}`;
+}
+
+function formatGpuValue(snapshot: SystemResourceSnapshot | null) {
+  if (!snapshot?.gpu_metrics_available) return "N/A";
+  if (snapshot.gpu_usage_percent != null) {
+    return formatPercent(snapshot.gpu_usage_percent);
+  }
+  if (snapshot.gpu_memory_used_mb != null) {
+    return formatMemory(snapshot.gpu_memory_used_mb);
+  }
+  return "N/A";
 }

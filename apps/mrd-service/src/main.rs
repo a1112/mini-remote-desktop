@@ -14,11 +14,11 @@ mod ipc_server;
 mod shell;
 
 use anyhow::Result;
+use app_state::AppState;
+use ipc_server::IpcServer;
+use std::sync::Arc;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
-use ipc_server::IpcServer;
-use app_state::AppState;
-use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -27,8 +27,7 @@ async fn main() -> Result<()> {
         .with_max_level(Level::INFO)
         .finish();
 
-    tracing::subscriber::set_global_default(subscriber)
-        .expect("setting default subscriber failed");
+    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
     info!("mrd-service starting...");
 
@@ -37,11 +36,17 @@ async fn main() -> Result<()> {
     let tray: Arc<std::sync::Mutex<dyn shell::TrayPort + Send + Sync>> =
         Arc::new(std::sync::Mutex::new(shell::windows::WindowsTray::new()));
     #[cfg(not(windows))]
-    let tray: Arc<std::sync::Mutex<dyn shell::TrayPort + Send + Sync>> =
-        Arc::new(std::sync::Mutex::new(shell::NoOpTray::with_availability(false)));
+    let tray: Arc<std::sync::Mutex<dyn shell::TrayPort + Send + Sync>> = Arc::new(
+        std::sync::Mutex::new(shell::NoOpTray::with_availability(false)),
+    );
 
     // Initialize application state with tray
     let app_state = Arc::new(AppState::with_tray(tray.clone()));
+    {
+        let tray_available = tray.lock().unwrap().is_available();
+        let mut shell = app_state.shell.lock().await;
+        shell.tray_available = tray_available;
+    }
     info!("Application state initialized");
 
     // Install tray with initial model

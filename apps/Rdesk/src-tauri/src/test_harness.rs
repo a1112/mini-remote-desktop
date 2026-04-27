@@ -5,16 +5,16 @@
 
 use anyhow::Result;
 use mrd_capture_dxgi::DxgiDesktopCapture;
+use mrd_decode_nvdec::NvdecDecoder;
 use mrd_encode_nvenc::NvencH264Encoder;
 use mrd_encode_openh264::OpenH264Encoder;
-use mrd_decode_nvdec::NvdecDecoder;
 use mrd_pipeline_core::{CapturedFrame, FrameCapture, VideoEncoder};
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 const DOWNSAMPLE_MAX_WIDTH: usize = 640;
 const FRAME_UPDATE_INTERVAL: usize = 10;
@@ -23,6 +23,10 @@ const FRAME_UPDATE_INTERVAL: usize = 10;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TestChain {
+    /// DXGI capture only, no encode/decode
+    #[serde(rename = "capture_only")]
+    CaptureOnly,
+
     /// DXGI capture + NVENC encode + NVDEC decode (fastest, full hardware)
     #[serde(rename = "nvenc_nvdec")]
     NvencNvdec,
@@ -37,7 +41,11 @@ pub enum TestChain {
 
     /// Custom configuration with explicit parameters
     #[serde(rename = "custom")]
-    Custom { capture: CaptureType, encoder: EncoderType, decoder: DecoderType },
+    Custom {
+        capture: CaptureType,
+        encoder: EncoderType,
+        decoder: DecoderType,
+    },
 }
 
 /// Available capture types
@@ -87,10 +95,15 @@ impl Default for TestConfig {
 impl TestChain {
     pub fn display_name(&self) -> &'static str {
         match self {
+            Self::CaptureOnly => "DXGI capture only",
             Self::NvencNvdec => "NVENC H.264 + NVDEC (全硬件加速)",
             Self::NvencOnly => "NVENC H.264 编码器测试",
             Self::OpenH264 => "OpenH264 编码器测试 (软件)",
-            Self::Custom { capture, encoder, decoder } => {
+            Self::Custom {
+                capture,
+                encoder,
+                decoder,
+            } => {
                 // Build a descriptive name
                 "自定义配置"
             }
@@ -99,6 +112,7 @@ impl TestChain {
 
     pub fn all() -> Vec<TestChain> {
         vec![
+            Self::CaptureOnly,
             Self::NvencNvdec,
             Self::NvencOnly,
             Self::OpenH264,
@@ -107,14 +121,16 @@ impl TestChain {
 
     pub fn capture_type(&self) -> CaptureType {
         match self {
-            Self::NvencNvdec | Self::NvencOnly | Self::OpenH264 => CaptureType::Dxgi,
+            Self::CaptureOnly | Self::NvencNvdec | Self::NvencOnly | Self::OpenH264 => {
+                CaptureType::Dxgi
+            }
             Self::Custom { capture, .. } => capture.clone(),
         }
     }
 
     pub fn encoder_type(&self) -> EncoderType {
         match self {
-            Self::NvencNvdec | Self::NvencOnly => EncoderType::NvencH264,
+            Self::CaptureOnly | Self::NvencNvdec | Self::NvencOnly => EncoderType::NvencH264,
             Self::OpenH264 => EncoderType::OpenH264,
             Self::Custom { encoder, .. } => encoder.clone(),
         }
@@ -123,7 +139,7 @@ impl TestChain {
     pub fn decoder_type(&self) -> DecoderType {
         match self {
             Self::NvencNvdec => DecoderType::Nvdec,
-            Self::NvencOnly | Self::OpenH264 => DecoderType::Software,
+            Self::CaptureOnly | Self::NvencOnly | Self::OpenH264 => DecoderType::Software,
             Self::Custom { decoder, .. } => decoder.clone(),
         }
     }
@@ -139,10 +155,13 @@ impl Default for TestChain {
 pub struct HarnessMetrics {
     pub is_running: bool,
     pub capture_fps: f64,
+    pub capture_latency_p50_ms: f64,
+    pub capture_latency_p95_ms: f64,
     pub encode_latency_p50_ms: f64,
     pub encode_latency_p95_ms: f64,
     pub decode_latency_p50_ms: f64,
     pub decode_latency_p95_ms: f64,
+    pub total_latency_p50_ms: f64,
     pub total_latency_p95_ms: f64,
     pub frame_count: usize,
     pub dropped_frames: usize,
@@ -155,10 +174,13 @@ impl Default for HarnessMetrics {
         Self {
             is_running: false,
             capture_fps: 0.0,
+            capture_latency_p50_ms: 0.0,
+            capture_latency_p95_ms: 0.0,
             encode_latency_p50_ms: 0.0,
             encode_latency_p95_ms: 0.0,
             decode_latency_p50_ms: 0.0,
             decode_latency_p95_ms: 0.0,
+            total_latency_p50_ms: 0.0,
             total_latency_p95_ms: 0.0,
             frame_count: 0,
             dropped_frames: 0,
@@ -177,7 +199,7 @@ struct FrameBuffer {
 // Pipeline state - defined outside impl
 struct PipelineState {
     capture: DxgiDesktopCapture,
-    encoder: Box<dyn VideoEncoder>,
+    encoder: Option<Box<dyn VideoEncoder>>,
     decoder: Option<NvdecDecoder>,
     use_decoder: bool,
     width: usize,
@@ -298,24 +320,41 @@ impl TestHarness {
         let height = capture.height();
 
         let (encoder, decoder, use_decoder) = match chain {
+            TestChain::CaptureOnly => (None, None, false),
             TestChain::NvencNvdec => {
                 let encoder = NvencH264Encoder::new_max_speed(width, height, 60)
                     .map_err(|e| anyhow::anyhow!("NVENC 编码器初始化失败: {:?}", e))?;
                 let decoder = NvdecDecoder::new()
                     .map_err(|e| anyhow::anyhow!("NVDEC 解码器初始化失败: {:?}", e))?;
-                (Box::new(encoder) as Box<dyn VideoEncoder>, Some(decoder), true)
+                (
+                    Some(Box::new(encoder) as Box<dyn VideoEncoder>),
+                    Some(decoder),
+                    true,
+                )
             }
             TestChain::NvencOnly => {
                 let encoder = NvencH264Encoder::new_max_speed(width, height, 60)
                     .map_err(|e| anyhow::anyhow!("NVENC 编码器初始化失败: {:?}", e))?;
-                (Box::new(encoder) as Box<dyn VideoEncoder>, None, false)
+                (
+                    Some(Box::new(encoder) as Box<dyn VideoEncoder>),
+                    None,
+                    false,
+                )
             }
             TestChain::OpenH264 => {
                 let encoder = OpenH264Encoder::new(width, height, 60)
                     .map_err(|e| anyhow::anyhow!("OpenH264 编码器初始化失败: {:?}", e))?;
-                (Box::new(encoder) as Box<dyn VideoEncoder>, None, false)
+                (
+                    Some(Box::new(encoder) as Box<dyn VideoEncoder>),
+                    None,
+                    false,
+                )
             }
-            TestChain::Custom { capture: _, encoder, decoder } => {
+            TestChain::Custom {
+                capture: _,
+                encoder,
+                decoder,
+            } => {
                 // For now, Custom configurations fall back to standard implementations
                 // TODO: Implement WinRT capture, AV1 encoding, software decoding
                 match encoder {
@@ -324,19 +363,24 @@ impl TestHarness {
                             .map_err(|e| anyhow::anyhow!("NVENC 编码器初始化失败: {:?}", e))?;
                         match decoder {
                             DecoderType::Nvdec => {
-                                let dec = NvdecDecoder::new()
-                                    .map_err(|e| anyhow::anyhow!("NVDEC 解码器初始化失败: {:?}", e))?;
-                                (Box::new(enc) as Box<dyn VideoEncoder>, Some(dec), true)
+                                let dec = NvdecDecoder::new().map_err(|e| {
+                                    anyhow::anyhow!("NVDEC 解码器初始化失败: {:?}", e)
+                                })?;
+                                (
+                                    Some(Box::new(enc) as Box<dyn VideoEncoder>),
+                                    Some(dec),
+                                    true,
+                                )
                             }
                             DecoderType::Software => {
-                                (Box::new(enc) as Box<dyn VideoEncoder>, None, false)
+                                (Some(Box::new(enc) as Box<dyn VideoEncoder>), None, false)
                             }
                         }
                     }
                     EncoderType::OpenH264 => {
                         let enc = OpenH264Encoder::new(width, height, 60)
                             .map_err(|e| anyhow::anyhow!("OpenH264 编码器初始化失败: {:?}", e))?;
-                        (Box::new(enc) as Box<dyn VideoEncoder>, None, false)
+                        (Some(Box::new(enc) as Box<dyn VideoEncoder>), None, false)
                     }
                     EncoderType::NvencAv1 => {
                         return Err(anyhow::anyhow!("AV1 编码器尚未实现"));
@@ -345,7 +389,14 @@ impl TestHarness {
             }
         };
 
-        Ok(PipelineState { capture, encoder, decoder, use_decoder, width, height })
+        Ok(PipelineState {
+            capture,
+            encoder,
+            decoder,
+            use_decoder,
+            width,
+            height,
+        })
     }
 
     fn process_loop(
@@ -355,6 +406,7 @@ impl TestHarness {
         running: Arc<AtomicBool>,
     ) {
         let start_time = Instant::now();
+        let mut capture_latencies = Vec::with_capacity(1000);
         let mut encode_latencies = Vec::with_capacity(1000);
         let mut decode_latencies = Vec::with_capacity(1000);
         let mut total_latencies = Vec::with_capacity(1000);
@@ -364,6 +416,7 @@ impl TestHarness {
         while running.load(Ordering::Relaxed) {
             let pipeline_start = Instant::now();
 
+            let capture_start = Instant::now();
             let captured_frame = match state.capture.capture_frame() {
                 Ok(frame) => frame,
                 Err(_) => {
@@ -372,20 +425,25 @@ impl TestHarness {
                     continue;
                 }
             };
+            let capture_latency = capture_start.elapsed();
 
-            let encode_start = Instant::now();
-            let encoded_units = match state.encoder.encode(&captured_frame) {
-                Ok(units) => units,
-                Err(_) => {
-                    dropped_frames += 1;
-                    thread::sleep(Duration::from_millis(1));
-                    continue;
-                }
+            let (encoded_units, encode_latency) = if let Some(encoder) = state.encoder.as_mut() {
+                let encode_start = Instant::now();
+                let encoded_units = match encoder.encode(&captured_frame) {
+                    Ok(units) => units,
+                    Err(_) => {
+                        dropped_frames += 1;
+                        thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                };
+                (encoded_units, Some(encode_start.elapsed()))
+            } else {
+                (Vec::new(), None)
             };
-            let encode_latency = encode_start.elapsed();
 
             // Decode if needed
-            let decode_latency = if state.use_decoder {
+            let decode_latency = if state.use_decoder && !encoded_units.is_empty() {
                 if let Some(ref mut decoder) = state.decoder.as_mut() {
                     let decode_start = Instant::now();
                     let mut got_frame = false;
@@ -409,13 +467,17 @@ impl TestHarness {
                 None
             };
 
-            encode_latencies.push(encode_latency);
+            capture_latencies.push(capture_latency);
+            if let Some(latency) = encode_latency {
+                encode_latencies.push(latency);
+            }
             if let Some(latency) = decode_latency {
                 decode_latencies.push(latency);
-                total_latencies.push(pipeline_start.elapsed());
             }
+            total_latencies.push(pipeline_start.elapsed());
 
             Self::trim_latency_buffers(
+                &mut capture_latencies,
                 &mut encode_latencies,
                 &mut decode_latencies,
                 &mut total_latencies,
@@ -440,6 +502,7 @@ impl TestHarness {
                     frame_count,
                     dropped_frames,
                     &start_time,
+                    &capture_latencies,
                     &encode_latencies,
                     &decode_latencies,
                     &total_latencies,
@@ -452,6 +515,7 @@ impl TestHarness {
             frame_count,
             dropped_frames,
             &start_time,
+            &capture_latencies,
             &encode_latencies,
             &decode_latencies,
             &total_latencies,
@@ -466,6 +530,7 @@ impl TestHarness {
         frame_count: usize,
         dropped_frames: usize,
         start_time: &Instant,
+        capture_latencies: &[Duration],
         encode_latencies: &[Duration],
         decode_latencies: &[Duration],
         total_latencies: &[Duration],
@@ -477,18 +542,22 @@ impl TestHarness {
             0.0
         };
 
+        let (p50_cap, p95_cap) = Self::compute_percentiles(capture_latencies);
         let (p50_enc, p95_enc) = Self::compute_percentiles(encode_latencies);
         let (p50_dec, p95_dec) = Self::compute_percentiles(decode_latencies);
-        let (_, p95_total) = Self::compute_percentiles(total_latencies);
+        let (p50_total, p95_total) = Self::compute_percentiles(total_latencies);
 
         let mut m = metrics.lock().unwrap();
         m.capture_fps = fps;
         m.frame_count = frame_count;
         m.dropped_frames = dropped_frames;
+        m.capture_latency_p50_ms = p50_cap.as_secs_f64() * 1000.0;
+        m.capture_latency_p95_ms = p95_cap.as_secs_f64() * 1000.0;
         m.encode_latency_p50_ms = p50_enc.as_secs_f64() * 1000.0;
         m.encode_latency_p95_ms = p95_enc.as_secs_f64() * 1000.0;
         m.decode_latency_p50_ms = p50_dec.as_secs_f64() * 1000.0;
         m.decode_latency_p95_ms = p95_dec.as_secs_f64() * 1000.0;
+        m.total_latency_p50_ms = p50_total.as_secs_f64() * 1000.0;
         m.total_latency_p95_ms = p95_total.as_secs_f64() * 1000.0;
     }
 
@@ -504,10 +573,14 @@ impl TestHarness {
     }
 
     fn trim_latency_buffers(
+        capture_latencies: &mut Vec<Duration>,
         encode_latencies: &mut Vec<Duration>,
         decode_latencies: &mut Vec<Duration>,
         total_latencies: &mut Vec<Duration>,
     ) {
+        if capture_latencies.len() > 1000 {
+            capture_latencies.remove(0);
+        }
         if encode_latencies.len() > 1000 {
             encode_latencies.remove(0);
         }
@@ -539,9 +612,17 @@ impl TestHarness {
         self.metrics.lock().unwrap().clone()
     }
 
-    pub fn get_latest_frames(&self) -> (Option<(Vec<u8>, usize, usize)>, Option<(Vec<u8>, usize, usize)>) {
+    pub fn get_latest_frames(
+        &self,
+    ) -> (
+        Option<(Vec<u8>, usize, usize)>,
+        Option<(Vec<u8>, usize, usize)>,
+    ) {
         let buf = self.frame_buffer.lock().unwrap();
-        let captured = buf.captured.as_ref().map(|data| (data.clone(), buf.width, buf.height));
+        let captured = buf
+            .captured
+            .as_ref()
+            .map(|data| (data.clone(), buf.width, buf.height));
         (captured, None)
     }
 }
@@ -591,18 +672,19 @@ mod tests {
 
     #[test]
     fn trim_latency_buffers_handles_encode_only_samples() {
-        let mut encode_latencies = (0..=1000)
-            .map(Duration::from_millis)
-            .collect::<Vec<_>>();
+        let mut capture_latencies = Vec::new();
+        let mut encode_latencies = (0..=1000).map(Duration::from_millis).collect::<Vec<_>>();
         let mut decode_latencies = Vec::new();
         let mut total_latencies = Vec::new();
 
         TestHarness::trim_latency_buffers(
+            &mut capture_latencies,
             &mut encode_latencies,
             &mut decode_latencies,
             &mut total_latencies,
         );
 
+        assert!(capture_latencies.is_empty());
         assert_eq!(encode_latencies.len(), 1000);
         assert_eq!(encode_latencies[0], Duration::from_millis(1));
         assert!(decode_latencies.is_empty());
@@ -611,27 +693,48 @@ mod tests {
 
     #[test]
     fn trim_latency_buffers_trims_each_populated_series_independently() {
-        let mut encode_latencies = (0..=1000)
-            .map(Duration::from_millis)
-            .collect::<Vec<_>>();
-        let mut decode_latencies = (0..=1000)
-            .map(Duration::from_millis)
-            .collect::<Vec<_>>();
-        let mut total_latencies = (0..=1000)
-            .map(Duration::from_millis)
-            .collect::<Vec<_>>();
+        let mut capture_latencies = (0..=1000).map(Duration::from_millis).collect::<Vec<_>>();
+        let mut encode_latencies = (0..=1000).map(Duration::from_millis).collect::<Vec<_>>();
+        let mut decode_latencies = (0..=1000).map(Duration::from_millis).collect::<Vec<_>>();
+        let mut total_latencies = (0..=1000).map(Duration::from_millis).collect::<Vec<_>>();
 
         TestHarness::trim_latency_buffers(
+            &mut capture_latencies,
             &mut encode_latencies,
             &mut decode_latencies,
             &mut total_latencies,
         );
 
+        assert_eq!(capture_latencies.len(), 1000);
         assert_eq!(encode_latencies.len(), 1000);
         assert_eq!(decode_latencies.len(), 1000);
         assert_eq!(total_latencies.len(), 1000);
+        assert_eq!(capture_latencies[0], Duration::from_millis(1));
         assert_eq!(encode_latencies[0], Duration::from_millis(1));
         assert_eq!(decode_latencies[0], Duration::from_millis(1));
         assert_eq!(total_latencies[0], Duration::from_millis(1));
+    }
+
+    #[test]
+    #[ignore = "manual perf probe: requires DXGI, NVENC, and NVDEC on the host"]
+    fn nvenc_nvdec_harness_prints_stage_metrics() {
+        let seconds = std::env::var("MRD_HARNESS_PROBE_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(5);
+        let chain = match std::env::var("MRD_HARNESS_CHAIN").as_deref() {
+            Ok("capture_only") => TestChain::CaptureOnly,
+            Ok("nvenc_only") => TestChain::NvencOnly,
+            Ok("openh264") => TestChain::OpenH264,
+            _ => TestChain::NvencNvdec,
+        };
+        let mut harness = TestHarness::new().expect("create harness");
+        harness.set_chain(chain);
+        harness.start().expect("start harness");
+        thread::sleep(Duration::from_secs(seconds));
+        let metrics = harness.get_metrics();
+        harness.stop().expect("stop harness");
+        println!("{metrics:#?}");
+        assert!(metrics.frame_count > 0);
     }
 }

@@ -1,11 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use mrd_ipc::{
-    client::IpcClient,
-    transport::IpcEndpoint,
-    IpcRequest, IpcResponse,
-};
+use mrd_ipc::{client::IpcClient, transport::IpcEndpoint, IpcRequest, IpcResponse};
 use mrd_proto::{DeviceId, SessionId};
 use tokio::{task::JoinHandle, time::sleep};
 
@@ -81,7 +77,10 @@ async fn smoke_shell_full_ipc_session_flow() {
         })
         .await
         .expect("register device");
-    assert!(matches!(register_response, IpcResponse::DeviceRegistered { .. }));
+    assert!(matches!(
+        register_response,
+        IpcResponse::DeviceRegistered { .. }
+    ));
 
     let list_devices = client
         .send_request(IpcRequest::ListDevices)
@@ -119,7 +118,10 @@ async fn smoke_shell_full_ipc_session_flow() {
         })
         .await
         .expect("start receiver");
-    assert!(matches!(receiver_response, IpcResponse::ReceiverStarted { .. }));
+    assert!(matches!(
+        receiver_response,
+        IpcResponse::ReceiverStarted { .. }
+    ));
 
     let snapshot_response = client
         .send_request(IpcRequest::SessionRuntimeSnapshot {
@@ -182,7 +184,9 @@ async fn smoke_shell_auto_reconnects_to_service() {
     sleep(Duration::from_millis(200)).await;
     client.disconnect();
 
-    let failed = client.send_request_no_reconnect(IpcRequest::ServiceHealth).await;
+    let failed = client
+        .send_request_no_reconnect(IpcRequest::ServiceHealth)
+        .await;
     assert!(failed.is_err(), "request should fail while service is down");
 
     let second_server = mrd_service::ipc_server::IpcServer::new_with_endpoint(

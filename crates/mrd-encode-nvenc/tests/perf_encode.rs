@@ -13,8 +13,9 @@ fn perf_nvenc_encode_reports_latency_distribution() {
         .unwrap_or(120);
     let case_name =
         std::env::var("MRD_COMPONENT_CASE_NAME").unwrap_or_else(|_| "encode.nvenc".into());
-    let width = 1280_u32;
-    let height = 720_u32;
+    let width = env_u32("MRD_COMPONENT_WIDTH").unwrap_or(1280);
+    let height = env_u32("MRD_COMPONENT_HEIGHT").unwrap_or(720);
+    let fps = env_u32("MRD_COMPONENT_FPS").unwrap_or(30);
     let frame = CapturedFrame {
         width: width as usize,
         height: height as usize,
@@ -24,7 +25,12 @@ fn perf_nvenc_encode_reports_latency_distribution() {
     };
 
     let started_at = Instant::now();
-    let Ok(mut encoder) = NvencH264Encoder::new(width as usize, height as usize, 30) else {
+    let Ok(mut encoder) = new_encoder_for_backend(
+        &std::env::var("MRD_COMPONENT_BACKEND").unwrap_or_else(|_| "nvenc".into()),
+        width as usize,
+        height as usize,
+        fps,
+    ) else {
         let result = ComponentResult::new(
             ComponentKind::Encode,
             "nvenc",
@@ -88,6 +94,26 @@ fn perf_nvenc_encode_reports_latency_distribution() {
         None,
     );
     write_result(&result);
+}
+
+fn env_u32(name: &str) -> Option<u32> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+}
+
+fn new_encoder_for_backend(
+    backend: &str,
+    width: usize,
+    height: usize,
+    fps: u32,
+) -> Result<NvencH264Encoder, mrd_pipeline_core::PipelineError> {
+    match backend {
+        "nvenc_max_speed" => NvencH264Encoder::new_max_speed(width, height, fps),
+        "nvenc_ll_p1" => NvencH264Encoder::new_low_latency_p1(width, height, fps),
+        "nvenc_hq_p5" => NvencH264Encoder::new_high_quality_p5(width, height, fps),
+        _ => NvencH264Encoder::new(width, height, fps),
+    }
 }
 
 fn synthetic_frame_bytes(width: usize, height: usize) -> Vec<u8> {

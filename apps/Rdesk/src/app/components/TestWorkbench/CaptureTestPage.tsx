@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import { Play, Square, Monitor, Activity, Gauge } from "lucide-react";
 import * as commands from "../../adapters/tauri/commands";
+import type { Artifact, WindowCaptureTarget } from "../../adapters/tauri/types";
 
 type CaptureType = "dxgi" | "winrt" | "synthetic";
 
@@ -22,7 +23,7 @@ const CAPTURE_OPTIONS: CaptureOption[] = [
     id: "winrt",
     name: "Windows Runtime Capture",
     description: "现代化屏幕捕获 API，支持窗口捕获",
-    available: false,
+    available: true,
   },
   {
     id: "synthetic",
@@ -39,14 +40,88 @@ interface CaptureMetrics {
   dropped_frames: number;
   resolution: [number, number];
   avg_latency_ms: number;
-  p95_latency_ms: number;
-  p99_latency_ms: number;
+  capture_latency_p95_ms: number;
+  encode_latency_p95_ms: number;
+  decode_latency_p95_ms: number;
+  total_latency_p95_ms: number;
+}
+
+function summarizeWindowProbeArtifacts(artifacts: Artifact[]): string | null {
+  const artifact = artifacts.find((item) => item.kind === "structured_log");
+  if (!artifact) return null;
+
+  try {
+    const parsed = JSON.parse(artifact.data) as {
+      target_count?: number;
+      selected_window?: {
+        capture_item_created?: boolean;
+        width?: number;
+        height?: number;
+        title?: string;
+      };
+      first_frame?: {
+        captured?: boolean;
+        width?: number;
+        height?: number;
+        byte_len?: number;
+        pixel_format?: string;
+      };
+      media_probe?: {
+        transport?: string;
+        encoded_width?: number;
+        encoded_height?: number;
+        encoded_bytes?: number;
+        transport_rtp_packet_count?: number;
+        transport_payload_bytes?: number;
+        decoded_frame_count?: number;
+        rendered_frame_count?: number;
+        render_backend?: string | null;
+      };
+    };
+    const targetCount = parsed.target_count ?? 0;
+    const selected = parsed.selected_window;
+    const firstFrame = parsed.first_frame;
+    const mediaProbe = parsed.media_probe;
+    if (firstFrame?.captured && firstFrame.width && firstFrame.height) {
+      const encodedSize =
+        mediaProbe?.encoded_width && mediaProbe?.encoded_height
+          ? `${mediaProbe.encoded_width}x${mediaProbe.encoded_height}, `
+          : "";
+      const transport =
+        mediaProbe?.transport === "webrtc_rtp_loopback"
+          ? ` over WebRTC RTP (${mediaProbe.transport_rtp_packet_count ?? 0} packets)`
+          : mediaProbe?.transport
+          ? ` over ${mediaProbe.transport}`
+          : "";
+      const mediaSummary = mediaProbe
+        ? `; encoded ${encodedSize}${mediaProbe.encoded_bytes ?? 0} bytes${transport}, decoded ${
+            mediaProbe.decoded_frame_count ?? 0
+          }, rendered ${mediaProbe.rendered_frame_count ?? 0}${
+            mediaProbe.render_backend ? ` via ${mediaProbe.render_backend}` : ""
+          }`
+        : "";
+      return `Captured first frame ${firstFrame.width}x${firstFrame.height}, ${
+        firstFrame.byte_len ?? 0
+      } bytes (${firstFrame.pixel_format ?? "BGRA"}) from ${targetCount} targets${mediaSummary}`;
+    }
+    if (selected?.capture_item_created && selected.width && selected.height) {
+      return `Found ${targetCount} targets; selected item ${selected.width}x${selected.height}`;
+    }
+    return `Found ${targetCount} window capture targets`;
+  } catch {
+    return null;
+  }
 }
 
 export function CaptureTestPage() {
   const [selectedCapture, setSelectedCapture] = useState<CaptureType>("dxgi");
   const [isRunning, setIsRunning] = useState(false);
   const [metrics, setMetrics] = useState<CaptureMetrics | null>(null);
+  const [windowTargets, setWindowTargets] = useState<WindowCaptureTarget[]>([]);
+  const [selectedWindowHwnd, setSelectedWindowHwnd] = useState<string | null>(null);
+  const [windowTargetsLoading, setWindowTargetsLoading] = useState(false);
+  const [windowTargetsError, setWindowTargetsError] = useState<string | null>(null);
+  const [singleWindowProbeResult, setSingleWindowProbeResult] = useState<string | null>(null);
 
   const selectedOption = CAPTURE_OPTIONS.find((o) => o.id === selectedCapture);
 
@@ -63,9 +138,11 @@ export function CaptureTestPage() {
           frame_count: result.value.frame_count,
           dropped_frames: result.value.dropped_frames,
           resolution: result.value.resolution,
-          avg_latency_ms: result.value.encode_latency_p50_ms, // Using encode latency as proxy
-          p95_latency_ms: result.value.encode_latency_p95_ms,
-          p99_latency_ms: result.value.encode_latency_p95_ms * 1.1, // Approximation
+          avg_latency_ms: result.value.total_latency_p50_ms,
+          capture_latency_p95_ms: result.value.capture_latency_p95_ms,
+          encode_latency_p95_ms: result.value.encode_latency_p95_ms,
+          decode_latency_p95_ms: result.value.decode_latency_p95_ms,
+          total_latency_p95_ms: result.value.total_latency_p95_ms,
         });
       }
     }, 200);
@@ -73,14 +150,89 @@ export function CaptureTestPage() {
     return () => clearInterval(interval);
   }, [isRunning]);
 
-  const handleStart = async () => {
-    if (selectedCapture === "winrt") return; // Not implemented yet
+  useEffect(() => {
+    if (selectedCapture !== "winrt") return;
 
+    let cancelled = false;
+    setWindowTargetsLoading(true);
+    setWindowTargetsError(null);
+
+    commands.testListWindowCaptureTargets()
+      .then((result) => {
+        if (cancelled) return;
+        if (result.ok) {
+          setWindowTargets(result.value);
+          setSelectedWindowHwnd((current) => {
+            if (current && result.value.some((target) => target.hwnd === current)) {
+              return current;
+            }
+            return result.value[0]?.hwnd ?? null;
+          });
+        } else {
+          setWindowTargets([]);
+          setSelectedWindowHwnd(null);
+          setWindowTargetsError(result.error.message);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setWindowTargetsLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedCapture]);
+
+  const handleStart = async () => {
     setIsRunning(true);
     setMetrics(null);
+    setSingleWindowProbeResult(null);
+
+    if (selectedCapture === "winrt") {
+      const selectedWindow = windowTargets.find((target) => target.hwnd === selectedWindowHwnd);
+      const result = await commands.testStartRun({
+        scenarioId: "single_window.local",
+        config: {
+          capture_type: "winrt",
+          input_source: "window",
+          window_hwnd: selectedWindow?.hwnd,
+          window_title: selectedWindow?.title,
+          encoder_type: "openh264",
+          decoder_type: "software",
+          renderer_type: "d3d11",
+          transport_kind: "webrtc",
+          duration_ms: 1000,
+        },
+      });
+
+      if (result.ok) {
+        const run = await commands.testGetRun(result.value);
+        const artifacts = await commands.testGetRunArtifacts(result.value);
+        const artifactSummary = artifacts.ok
+          ? summarizeWindowProbeArtifacts(artifacts.value)
+          : null;
+        if (run.ok && run.value?.summary) {
+          if (run.value.status === "failed" && run.value.summary.error_message) {
+            setSingleWindowProbeResult(run.value.summary.error_message);
+          } else {
+            setSingleWindowProbeResult(
+              artifactSummary ??
+                `Found ${run.value.summary.frame_count} window capture targets`
+            );
+          }
+        } else {
+          setSingleWindowProbeResult(`Probe run created: ${result.value}`);
+        }
+      } else {
+        setSingleWindowProbeResult(result.error.message);
+      }
+
+      setIsRunning(false);
+      return;
+    }
 
     // Start with appropriate chain
-    const chain = selectedCapture === "synthetic" ? "nvenc_only" : "nvenc_nvdec";
+    const chain = selectedCapture === "synthetic" ? "nvenc_only" : "capture_only";
     await commands.testHarnessStart(chain);
   };
 
@@ -156,12 +308,60 @@ export function CaptureTestPage() {
         </div>
       )}
 
+      {selectedCapture === "winrt" && (
+        <div className="bg-card rounded-lg border p-4 mb-6">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="font-medium">WinRT window targets</h3>
+            <button
+              onClick={() => {
+                setSelectedCapture("dxgi");
+                setTimeout(() => setSelectedCapture("winrt"), 0);
+              }}
+              disabled={windowTargetsLoading || isRunning}
+              className="text-sm px-3 py-1 rounded border hover:bg-muted disabled:opacity-50"
+            >
+              Refresh
+            </button>
+          </div>
+
+          {windowTargetsLoading && (
+            <p className="text-sm text-muted-foreground">Loading windows...</p>
+          )}
+          {windowTargetsError && (
+            <p className="text-sm text-red-600">{windowTargetsError}</p>
+          )}
+          {!windowTargetsLoading && !windowTargetsError && (
+            <div className="space-y-3">
+              <select
+                value={selectedWindowHwnd ?? ""}
+                onChange={(event) => setSelectedWindowHwnd(event.target.value || null)}
+                className="w-full rounded border bg-background px-3 py-2 text-sm"
+              >
+                {windowTargets.map((target) => (
+                  <option key={target.hwnd} value={target.hwnd}>
+                    {target.title} ({target.width}x{target.height})
+                  </option>
+                ))}
+              </select>
+              <div className="text-xs text-muted-foreground">
+                {windowTargets.length} targets
+              </div>
+            </div>
+          )}
+          {singleWindowProbeResult && (
+            <div className="mt-3 text-sm text-muted-foreground">
+              {singleWindowProbeResult}
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Control */}
       <div className="mb-6">
         {!isRunning ? (
           <button
             onClick={handleStart}
-            disabled={selectedCapture === "winrt"}
+            disabled={selectedCapture === "winrt" && (!selectedWindowHwnd || windowTargetsLoading)}
             className="flex items-center gap-2 px-6 py-3 bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 transition-colors disabled:opacity-50"
           >
             <Play className="h-5 w-5" />
@@ -181,7 +381,7 @@ export function CaptureTestPage() {
       {/* Metrics */}
       {metrics && (
         <>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-4 mb-6">
             <MetricCard
               icon={<Activity className="h-4 w-4" />}
               label="捕获帧率"
@@ -192,7 +392,13 @@ export function CaptureTestPage() {
               icon={<Gauge className="h-4 w-4" />}
               label="平均延迟"
               value={`${metrics.avg_latency_ms.toFixed(2)} ms`}
-              color={getLatencyColor(metrics.avg_latency_ms, 5, 10)}
+              color={getLatencyColor(metrics.avg_latency_ms, 16, 33)}
+            />
+            <MetricCard
+              icon={<Gauge className="h-4 w-4" />}
+              label="Pipeline P95"
+              value={`${metrics.total_latency_p95_ms.toFixed(2)} ms`}
+              color={getLatencyColor(metrics.total_latency_p95_ms, 16, 33)}
             />
             <MetricCard
               icon={<Monitor className="h-4 w-4" />}
@@ -211,9 +417,10 @@ export function CaptureTestPage() {
           <div className="bg-card rounded-lg border p-4">
             <h3 className="font-medium mb-4">延迟分布</h3>
             <div className="space-y-2">
-              <LatencyBar label="P50" value={metrics.avg_latency_ms} max={50} />
-              <LatencyBar label="P95" value={metrics.p95_latency_ms} max={50} />
-              <LatencyBar label="P99" value={metrics.p99_latency_ms} max={50} />
+              <LatencyBar label="Capture" value={metrics.capture_latency_p95_ms} max={100} />
+              <LatencyBar label="Encode" value={metrics.encode_latency_p95_ms} max={100} />
+              <LatencyBar label="Decode" value={metrics.decode_latency_p95_ms} max={100} />
+              <LatencyBar label="Total" value={metrics.total_latency_p95_ms} max={100} />
             </div>
           </div>
         </>

@@ -6,8 +6,8 @@
 // Unlike hard_cut_smoke.rs which uses in-process IpcServer, these tests
 // go through the real transport layer.
 
-use mrd_ipc::{IpcRequest, IpcResponse, client::IpcClient, transport::IpcEndpoint};
-use mrd_proto::{SessionId, DeviceId};
+use mrd_ipc::{client::IpcClient, transport::IpcEndpoint, IpcRequest, IpcResponse};
+use mrd_proto::{DeviceId, SessionId};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -35,10 +35,8 @@ fn test_endpoint(test_name: &str) -> IpcEndpoint {
 /// Start a real IPC server in the background
 async fn start_ipc_server() -> anyhow::Result<()> {
     let app_state = Arc::new(mrd_service::app_state::AppState::new());
-    let server = mrd_service::ipc_server::IpcServer::new_with_endpoint(
-        app_state,
-        test_endpoint("helper"),
-    );
+    let server =
+        mrd_service::ipc_server::IpcServer::new_with_endpoint(app_state, test_endpoint("helper"));
 
     // Run server in background
     tokio::spawn(async move {
@@ -59,7 +57,8 @@ async fn ipc_transport_health_check_works() {
     let server_endpoint = endpoint.clone();
     let server_handle = tokio::spawn(async {
         let app_state = Arc::new(mrd_service::app_state::AppState::new());
-        let server = mrd_service::ipc_server::IpcServer::new_with_endpoint(app_state, server_endpoint);
+        let server =
+            mrd_service::ipc_server::IpcServer::new_with_endpoint(app_state, server_endpoint);
         let _ = server.run().await;
     });
 
@@ -91,7 +90,8 @@ async fn ipc_transport_device_registration_flow() {
     let server_endpoint = endpoint.clone();
     let server_handle = tokio::spawn(async {
         let app_state = Arc::new(mrd_service::app_state::AppState::new());
-        let server = mrd_service::ipc_server::IpcServer::new_with_endpoint(app_state, server_endpoint);
+        let server =
+            mrd_service::ipc_server::IpcServer::new_with_endpoint(app_state, server_endpoint);
         let _ = server.run().await;
     });
 
@@ -101,13 +101,17 @@ async fn ipc_transport_device_registration_flow() {
     let device_id = DeviceId("transport-test-device".to_string());
 
     // Register device
-    let register_response = client.send_request(IpcRequest::RegisterDevice {
-        device_id: device_id.clone(),
-        device_name: "Transport Test Device".to_string(),
-    }).await;
+    let register_response = client
+        .send_request(IpcRequest::RegisterDevice {
+            device_id: device_id.clone(),
+            device_name: "Transport Test Device".to_string(),
+        })
+        .await;
 
     match register_response {
-        Ok(IpcResponse::DeviceRegistered { device_id: registered_id }) => {
+        Ok(IpcResponse::DeviceRegistered {
+            device_id: registered_id,
+        }) => {
             assert_eq!(registered_id, device_id);
         }
         Ok(other) => {
@@ -145,7 +149,8 @@ async fn ipc_transport_session_flow_through_transport() {
     let server_endpoint = endpoint.clone();
     let server_handle = tokio::spawn(async {
         let app_state = Arc::new(mrd_service::app_state::AppState::new());
-        let server = mrd_service::ipc_server::IpcServer::new_with_endpoint(app_state, server_endpoint);
+        let server =
+            mrd_service::ipc_server::IpcServer::new_with_endpoint(app_state, server_endpoint);
         let _ = server.run().await;
     });
 
@@ -155,11 +160,13 @@ async fn ipc_transport_session_flow_through_transport() {
     let session_id = SessionId("transport-session-test".to_string());
 
     // Start session
-    let start_response = client.send_request(IpcRequest::StartSession {
-        session_id: session_id.clone(),
-        target_device_id: DeviceId("remote-agent".to_string()),
-        transport_kind: "quic".to_string(),
-    }).await;
+    let start_response = client
+        .send_request(IpcRequest::StartSession {
+            session_id: session_id.clone(),
+            target_device_id: DeviceId("remote-agent".to_string()),
+            transport_kind: "quic".to_string(),
+        })
+        .await;
 
     match start_response {
         Ok(IpcResponse::SessionStarted { .. }) => {}
@@ -174,9 +181,11 @@ async fn ipc_transport_session_flow_through_transport() {
     }
 
     // Get session snapshot
-    let snap_response = client.send_request(IpcRequest::SessionRuntimeSnapshot {
-        session_id: session_id.clone(),
-    }).await;
+    let snap_response = client
+        .send_request(IpcRequest::SessionRuntimeSnapshot {
+            session_id: session_id.clone(),
+        })
+        .await;
 
     match snap_response {
         Ok(IpcResponse::SessionSnapshot { snapshot }) => {
@@ -193,9 +202,11 @@ async fn ipc_transport_session_flow_through_transport() {
     }
 
     // Stop session
-    let stop_response = client.send_request(IpcRequest::StopSession {
-        session_id: session_id.clone(),
-    }).await;
+    let stop_response = client
+        .send_request(IpcRequest::StopSession {
+            session_id: session_id.clone(),
+        })
+        .await;
 
     server_handle.abort();
 
@@ -214,7 +225,8 @@ async fn ipc_transport_error_propagation() {
     let server_endpoint = endpoint.clone();
     let server_handle = tokio::spawn(async {
         let app_state = Arc::new(mrd_service::app_state::AppState::new());
-        let server = mrd_service::ipc_server::IpcServer::new_with_endpoint(app_state, server_endpoint);
+        let server =
+            mrd_service::ipc_server::IpcServer::new_with_endpoint(app_state, server_endpoint);
         let _ = server.run().await;
     });
 
@@ -223,9 +235,11 @@ async fn ipc_transport_error_propagation() {
     let mut client = IpcClient::with_endpoint(endpoint);
 
     // Try to get snapshot of non-existent session
-    let response = client.send_request(IpcRequest::SessionRuntimeSnapshot {
-        session_id: SessionId("non-existent-session".to_string()),
-    }).await;
+    let response = client
+        .send_request(IpcRequest::SessionRuntimeSnapshot {
+            session_id: SessionId("non-existent-session".to_string()),
+        })
+        .await;
 
     server_handle.abort();
 

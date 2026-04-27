@@ -8,6 +8,7 @@ import { AuthModal } from "./AuthModal";
 import { useState } from "react";
 import { useTheme } from "./ThemeContext";
 import { DetailBarProvider } from "./DetailBarContext";
+import { ServiceStatusPanel } from "./ServiceStatusPanel";
 
 export function Layout() {
   const [collapsed, setCollapsed] = useState(false);
@@ -42,6 +43,7 @@ export function Layout() {
             collapsed={collapsed}
             onToggleSidebar={() => setCollapsed(!collapsed)}
           />
+          <ServiceStatusPanel />
           <main className="flex-1 overflow-y-auto overflow-x-hidden">
             <Outlet />
           </main>

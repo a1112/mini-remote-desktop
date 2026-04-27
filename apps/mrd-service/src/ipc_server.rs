@@ -3,14 +3,14 @@
 // Handles incoming IPC requests from Rdesk shell and dispatches
 // to application layer use cases.
 
-use mrd_ipc::{IpcRequest, IpcResponse, transport};
-use mrd_application::ports::SessionSnapshot;
-use std::sync::Arc;
 use crate::{
     app_state::AppState,
     handlers::{session, transport as transport_handlers},
-    shell::{UiLauncherPort, AutostartPort},
+    shell::{AutostartPort, UiLauncherPort},
 };
+use mrd_application::ports::SessionSnapshot;
+use mrd_ipc::{transport, IpcRequest, IpcResponse};
+use std::{io::ErrorKind, sync::Arc};
 
 /// IPC server - handles requests from Rdesk shell
 pub struct IpcServer {
@@ -27,15 +27,21 @@ impl IpcServer {
 
     pub fn new_with_endpoint(app_state: Arc<AppState>, endpoint: transport::IpcEndpoint) -> Self {
         let autostart: Arc<std::sync::Mutex<dyn AutostartPort + Send + Sync>> = if cfg!(windows) {
-            Arc::new(std::sync::Mutex::new(crate::shell::WindowsAutostart::new("mrd-service")))
+            Arc::new(std::sync::Mutex::new(crate::shell::WindowsAutostart::new(
+                "mrd-service",
+            )))
         } else {
-            Arc::new(std::sync::Mutex::new(crate::shell::NoOpAutostart::new("mrd-service")))
+            Arc::new(std::sync::Mutex::new(crate::shell::NoOpAutostart::new(
+                "mrd-service",
+            )))
         };
 
         Self {
             app_state,
             endpoint,
-            ui_launcher: Arc::new(std::sync::Mutex::new(crate::shell::InMemoryUiLauncher::new())),
+            ui_launcher: Arc::new(std::sync::Mutex::new(
+                crate::shell::InMemoryUiLauncher::new(),
+            )),
             autostart,
         }
     }
@@ -46,9 +52,13 @@ impl IpcServer {
         ui_launcher: Arc<std::sync::Mutex<crate::shell::InMemoryUiLauncher>>,
     ) -> Self {
         let autostart: Arc<std::sync::Mutex<dyn AutostartPort + Send + Sync>> = if cfg!(windows) {
-            Arc::new(std::sync::Mutex::new(crate::shell::WindowsAutostart::new("mrd-service")))
+            Arc::new(std::sync::Mutex::new(crate::shell::WindowsAutostart::new(
+                "mrd-service",
+            )))
         } else {
-            Arc::new(std::sync::Mutex::new(crate::shell::NoOpAutostart::new("mrd-service")))
+            Arc::new(std::sync::Mutex::new(crate::shell::NoOpAutostart::new(
+                "mrd-service",
+            )))
         };
 
         Self {
@@ -71,8 +81,9 @@ impl IpcServer {
                     }
                 }
                 Err(e) => {
-                    // Connection closed or error
-                    eprintln!("IPC request error: {}", e);
+                    if !is_connection_closed_error(&e) {
+                        eprintln!("IPC request error: {}", e);
+                    }
                     break;
                 }
             }
@@ -83,7 +94,10 @@ impl IpcServer {
     /// Handle an IPC request and return a response
     pub async fn handle_request(&self, request: IpcRequest) -> IpcResponse {
         match request {
-            IpcRequest::RegisterDevice { device_id, device_name } => {
+            IpcRequest::RegisterDevice {
+                device_id,
+                device_name,
+            } => {
                 tracing::info!("Registering device: {} ({})", device_id.0, device_name);
                 let mut devices = self.app_state.devices.lock().await;
                 devices.register(device_id.clone(), device_name);
@@ -109,8 +123,10 @@ impl IpcServer {
 
             IpcRequest::ListSessions => {
                 let sessions = self.app_state.sessions.lock().await;
-                let session_list = sessions.list_all().into_iter().map(|snap| {
-                    mrd_ipc::SessionInfo {
+                let session_list = sessions
+                    .list_all()
+                    .into_iter()
+                    .map(|snap| mrd_ipc::SessionInfo {
                         session_id: snap.session_id.clone(),
                         role: if snap.target_device_id.is_some() {
                             "controller".to_string()
@@ -119,28 +135,36 @@ impl IpcServer {
                         } else {
                             "unknown".to_string()
                         },
-                        state: if snap.local_listen_addr.is_some() && snap.remote_listen_addr.is_some() {
-                            "connected".to_string()
-                        } else if snap.local_listen_addr.is_some() {
-                            "listening".to_string()
-                        } else if snap.remote_listen_addr.is_some() {
-                            "connecting".to_string()
-                        } else {
-                            "created".to_string()
-                        },
+                        state: snap.lifecycle_state.clone(),
                         transport_kind: snap.transport.clone(),
-                    }
-                }).collect();
-                IpcResponse::SessionList { sessions: session_list }
+                        last_error: snap.last_error.clone(),
+                        sender_active: snap.sender_active,
+                        receiver_active: snap.receiver_active,
+                    })
+                    .collect();
+                IpcResponse::SessionList {
+                    sessions: session_list,
+                }
             }
 
-            IpcRequest::StartSession { session_id, target_device_id, transport_kind } => {
-                session::start_session(&self.app_state, session_id, target_device_id, transport_kind).await
+            IpcRequest::StartSession {
+                session_id,
+                target_device_id,
+                transport_kind,
+            } => {
+                session::start_session(
+                    &self.app_state,
+                    session_id,
+                    target_device_id,
+                    transport_kind,
+                )
+                .await
             }
 
-            IpcRequest::AcceptSession { session_id, source_device_id } => {
-                session::accept_session(&self.app_state, session_id, source_device_id).await
-            }
+            IpcRequest::AcceptSession {
+                session_id,
+                source_device_id,
+            } => session::accept_session(&self.app_state, session_id, source_device_id).await,
 
             IpcRequest::StartSender { session_id } => {
                 transport_handlers::start_sender(&self.app_state, session_id).await
@@ -154,6 +178,14 @@ impl IpcServer {
                 session::stop_session(&self.app_state, session_id).await
             }
 
+            IpcRequest::FailSession { session_id, reason } => {
+                session::fail_session(&self.app_state, session_id, reason).await
+            }
+
+            IpcRequest::RecoverSession { session_id } => {
+                session::recover_session(&self.app_state, session_id).await
+            }
+
             IpcRequest::SessionRuntimeSnapshot { session_id } => {
                 session::session_snapshot(&self.app_state, session_id).await
             }
@@ -162,7 +194,8 @@ impl IpcServer {
                 let sessions = self.app_state.sessions.lock().await;
                 let devices = self.app_state.devices.lock().await;
 
-                let session_snapshots: Vec<mrd_ipc::SessionRuntimeSnapshot> = sessions.list_all()
+                let session_snapshots: Vec<mrd_ipc::SessionRuntimeSnapshot> = sessions
+                    .list_all()
                     .into_iter()
                     .filter_map(|snap| self.snapshot_to_ipc(&snap))
                     .collect();
@@ -174,33 +207,28 @@ impl IpcServer {
                         sessions: session_snapshots,
                         device_id,
                         is_registered: devices.is_registered(),
-                    }
+                    },
                 }
             }
 
-            IpcRequest::ServiceHealth => {
-                IpcResponse::ServiceHealth {
-                    status: mrd_ipc::ServiceStatus {
-                        running: true,
-                        healthy: true,
-                        pid: Some(std::process::id()),
-                    }
-                }
-            }
+            IpcRequest::ServiceHealth => IpcResponse::ServiceHealth {
+                status: mrd_ipc::ServiceStatus {
+                    running: true,
+                    healthy: true,
+                    pid: Some(std::process::id()),
+                },
+            },
 
             IpcRequest::ProbeSnapshot { session_id } => {
                 transport_handlers::probe_snapshot(&self.app_state, session_id).await
             }
 
-            IpcRequest::StreamProbeEvents => {
-                IpcResponse::Error {
-                    code: "E501".to_string(),
-                    message: "Probe streaming not implemented yet".to_string(),
-                }
-            }
+            IpcRequest::StreamProbeEvents => IpcResponse::Error {
+                code: "E501".to_string(),
+                message: "Probe streaming not implemented yet".to_string(),
+            },
 
             // === Shell / Lifecycle Commands (Phase 2) ===
-
             IpcRequest::OpenUi { reason } => {
                 // Phase 3: Use UI launcher to launch or focus UI
                 tracing::info!("OpenUi requested: reason={:?}", reason);
@@ -255,34 +283,27 @@ impl IpcServer {
                     reason: "focus".to_string(),
                 };
                 match launcher.launch_or_focus(request) {
-                    Ok(crate::shell::UiLaunchResult::FocusedExisting { .. }) => {
-                        IpcResponse::Ack
-                    }
-                    Ok(crate::shell::UiLaunchResult::SpawnedNew { .. }) => {
-                        IpcResponse::Ack
-                    }
-                    Ok(crate::shell::UiLaunchResult::Unavailable) => {
-                        IpcResponse::Error {
-                            code: "E404".to_string(),
-                            message: "UI not available".to_string(),
-                        }
-                    }
-                    Ok(crate::shell::UiLaunchResult::Failed { error }) => {
-                        IpcResponse::Error {
-                            code: "E500".to_string(),
-                            message: error,
-                        }
-                    }
-                    Err(e) => {
-                        IpcResponse::Error {
-                            code: "E500".to_string(),
-                            message: e.to_string(),
-                        }
-                    }
+                    Ok(crate::shell::UiLaunchResult::FocusedExisting { .. }) => IpcResponse::Ack,
+                    Ok(crate::shell::UiLaunchResult::SpawnedNew { .. }) => IpcResponse::Ack,
+                    Ok(crate::shell::UiLaunchResult::Unavailable) => IpcResponse::Error {
+                        code: "E404".to_string(),
+                        message: "UI not available".to_string(),
+                    },
+                    Ok(crate::shell::UiLaunchResult::Failed { error }) => IpcResponse::Error {
+                        code: "E500".to_string(),
+                        message: error,
+                    },
+                    Err(e) => IpcResponse::Error {
+                        code: "E500".to_string(),
+                        message: e.to_string(),
+                    },
                 }
             }
 
-            IpcRequest::UiAttached { pid, executable_path } => {
+            IpcRequest::UiAttached {
+                pid,
+                executable_path,
+            } => {
                 tracing::info!("UI attached: pid={} path={:?}", pid, executable_path);
                 let mut shell = self.app_state.shell.lock().await;
                 shell.ui_pid = Some(pid);
@@ -311,15 +332,20 @@ impl IpcServer {
             IpcRequest::GetShellStatus => {
                 let shell = self.app_state.shell.lock().await;
                 let sessions = self.app_state.sessions.lock().await;
+                let active_session_count = sessions
+                    .list_all()
+                    .into_iter()
+                    .filter(|session| session.lifecycle_state != "closed")
+                    .count();
                 IpcResponse::ShellStatus {
                     status: mrd_ipc::ShellStatusSnapshot {
                         service_pid: std::process::id(),
                         ui_pid: shell.ui_pid,
                         tray_available: shell.tray_available,
                         autostart_enabled: shell.autostart_enabled,
-                        active_session_count: sessions.list_all().len(),
+                        active_session_count,
                         last_error: shell.last_error.clone(),
-                    }
+                    },
                 }
             }
 
@@ -337,11 +363,7 @@ impl IpcServer {
                     (supported, Ok(())) => {
                         // Update shell state (now that autostart lock is released)
                         let mut shell = self.app_state.shell.lock().await;
-                        shell.autostart_enabled = if supported {
-                            Some(enabled)
-                        } else {
-                            None
-                        };
+                        shell.autostart_enabled = if supported { Some(enabled) } else { None };
                         IpcResponse::Ack
                     }
                     (_supported, Err(e)) => {
@@ -358,10 +380,7 @@ impl IpcServer {
                 let autostart = self.autostart.lock().unwrap();
                 let enabled = autostart.is_enabled().unwrap_or(false);
                 let supported = autostart.is_supported();
-                IpcResponse::AutostartStatus {
-                    enabled,
-                    supported,
-                }
+                IpcResponse::AutostartStatus { enabled, supported }
             }
 
             IpcRequest::ShutdownService { mode } => {
@@ -396,7 +415,8 @@ impl IpcServer {
             "agent"
         } else {
             "unknown"
-        }.to_string();
+        }
+        .to_string();
 
         // Use explicit lifecycle state from domain model
         let state = snap.lifecycle_state.clone();
@@ -406,7 +426,8 @@ impl IpcServer {
             role,
             state,
             transport_kind: snap.transport.clone(),
-            local_bootstrap: if snap.local_listen_addr.is_some() || snap.local_server_name.is_some() {
+            local_bootstrap: if snap.local_listen_addr.is_some() || snap.local_server_name.is_some()
+            {
                 Some(mrd_ipc::SessionBootstrap {
                     listen_addr: snap.local_listen_addr.clone(),
                     server_name: snap.local_server_name.clone(),
@@ -415,7 +436,9 @@ impl IpcServer {
             } else {
                 None
             },
-            remote_bootstrap: if snap.remote_listen_addr.is_some() || snap.remote_server_name.is_some() {
+            remote_bootstrap: if snap.remote_listen_addr.is_some()
+                || snap.remote_server_name.is_some()
+            {
                 Some(mrd_ipc::SessionBootstrap {
                     listen_addr: snap.remote_listen_addr.clone(),
                     server_name: snap.remote_server_name.clone(),
@@ -449,9 +472,13 @@ impl IpcServer {
                     // Note: For simplicity, we're creating a new autostart instance each time
                     let new_autostart: Arc<std::sync::Mutex<dyn AutostartPort + Send + Sync>> =
                         if cfg!(windows) {
-                            Arc::new(std::sync::Mutex::new(crate::shell::WindowsAutostart::new("mrd-service")))
+                            Arc::new(std::sync::Mutex::new(crate::shell::WindowsAutostart::new(
+                                "mrd-service",
+                            )))
                         } else {
-                            Arc::new(std::sync::Mutex::new(crate::shell::NoOpAutostart::new("mrd-service")))
+                            Arc::new(std::sync::Mutex::new(crate::shell::NoOpAutostart::new(
+                                "mrd-service",
+                            )))
                         };
 
                     let server_clone = IpcServer {
@@ -475,11 +502,31 @@ impl IpcServer {
     }
 }
 
+fn is_connection_closed_error(error: &anyhow::Error) -> bool {
+    match error.downcast_ref::<std::io::Error>() {
+        Some(io_error) => matches!(
+            io_error.kind(),
+            ErrorKind::UnexpectedEof
+                | ErrorKind::BrokenPipe
+                | ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted
+        ),
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use mrd_proto::{DeviceId, SessionId};
     use std::sync::Arc;
+
+    #[test]
+    fn closed_ipc_connection_is_not_treated_as_request_error() {
+        let error = anyhow::Error::new(std::io::Error::new(ErrorKind::UnexpectedEof, "early eof"));
+
+        assert!(is_connection_closed_error(&error));
+    }
 
     #[tokio::test]
     async fn session_snapshot_returns_correct_ipc_format() {
@@ -504,7 +551,12 @@ mod tests {
             receiver_active: false,
         };
 
-        server.app_state().sessions().lock().await.insert(session_id.clone(), snapshot);
+        server
+            .app_state()
+            .sessions()
+            .lock()
+            .await
+            .insert(session_id.clone(), snapshot);
 
         let request = IpcRequest::SessionRuntimeSnapshot {
             session_id: session_id.clone(),
@@ -514,7 +566,7 @@ mod tests {
         match response {
             IpcResponse::SessionSnapshot { snapshot } => {
                 assert_eq!(snapshot.session_id, session_id);
-                assert_eq!(snapshot.state, "listening");  // Only local bootstrap
+                assert_eq!(snapshot.state, "listening"); // Only local bootstrap
                 assert_eq!(snapshot.transport_kind, "quic");
             }
             _ => panic!("Expected SessionSnapshot response"),
@@ -544,7 +596,12 @@ mod tests {
             receiver_active: false,
         };
 
-        server.app_state().sessions().lock().await.insert(session_id.clone(), snapshot);
+        server
+            .app_state()
+            .sessions()
+            .lock()
+            .await
+            .insert(session_id.clone(), snapshot);
 
         let response = server.handle_request(IpcRequest::ListSessions).await;
 
@@ -564,10 +621,12 @@ mod tests {
         let server = IpcServer::new(app_state);
 
         let device_id = DeviceId("test-device".to_string());
-        let _ = server.handle_request(IpcRequest::RegisterDevice {
-            device_id: device_id.clone(),
-            device_name: "Test Device".to_string(),
-        }).await;
+        let _ = server
+            .handle_request(IpcRequest::RegisterDevice {
+                device_id: device_id.clone(),
+                device_name: "Test Device".to_string(),
+            })
+            .await;
 
         let response = server.handle_request(IpcRequest::RuntimeSnapshot).await;
 

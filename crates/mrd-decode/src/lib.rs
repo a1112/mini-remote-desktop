@@ -1,8 +1,10 @@
 pub use mrd_pipeline_core::{
-    RuntimeStatus, VideoDecoder, DecodedFrame as CoreDecodedFrame, DecodedFrameData,
-    PipelineError,
+    DecodedFrame as CoreDecodedFrame, DecodedFrameData, PipelineError, RuntimeStatus, VideoDecoder,
 };
-use openh264::decoder::Decoder as OpenH264Decoder;
+use openh264::{
+    decoder::{DecodedYUV, Decoder as OpenH264Decoder},
+    formats::YUVSource,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodecKind {
@@ -25,7 +27,6 @@ pub struct DecoderDescriptor {
 }
 
 const RGB24_OUTPUTS: &[PixelFormat] = &[PixelFormat::Rgb24];
-const BGRA32_OUTPUTS: &[PixelFormat] = &[PixelFormat::Bgra32];
 
 const H264_SOFTWARE_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
     id: "h264_software",
@@ -42,23 +43,22 @@ const NVDEC_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
 };
 
 pub fn available_decoder_descriptors() -> Vec<DecoderDescriptor> {
-    vec![
-        H264_SOFTWARE_DESCRIPTOR.clone(),
-        NVDEC_DESCRIPTOR.clone(),
-    ]
+    vec![H264_SOFTWARE_DESCRIPTOR.clone(), NVDEC_DESCRIPTOR.clone()]
 }
 
 pub fn create_decoder(id: &str) -> Result<Box<dyn VideoDecoder>, PipelineError> {
     match id {
         "h264_software" => Ok(Box::new(H264SoftwareDecoder::new()?)),
         "nvdec" => Ok(Box::new(NvdecVideoDecoder::new()?)),
-        other => Err(PipelineError::Message(format!("未知 decoder backend: {other}"))),
+        other => Err(PipelineError::Message(format!(
+            "unknown decoder backend: {other}"
+        ))),
     }
 }
 
 pub struct H264SoftwareDecoder {
     decoder: OpenH264Decoder,
-    pending_timestamp_us: Option<u64>,
+    decoded_frames: Vec<CoreDecodedFrame>,
 }
 
 pub struct NvdecVideoDecoder {
@@ -68,7 +68,7 @@ pub struct NvdecVideoDecoder {
 impl NvdecVideoDecoder {
     pub fn new() -> Result<Self, PipelineError> {
         let decoder = mrd_decode_nvdec::NvdecDecoder::new()
-            .map_err(|e| PipelineError::Message(format!("nvdec 创建失败: {e}")))?;
+            .map_err(|e| PipelineError::Message(format!("nvdec create failed: {e}")))?;
         Ok(Self { decoder })
     }
 }
@@ -76,37 +76,61 @@ impl NvdecVideoDecoder {
 impl H264SoftwareDecoder {
     pub fn new() -> Result<Self, PipelineError> {
         Ok(Self {
-            decoder: OpenH264Decoder::new().map_err(|e| {
-                PipelineError::Message(format!("openh264 初始化失败: {e}"))
-            })?,
-            pending_timestamp_us: None,
+            decoder: OpenH264Decoder::new()
+                .map_err(|e| PipelineError::Message(format!("openh264 init failed: {e}")))?,
+            decoded_frames: Vec::new(),
         })
     }
 }
 
 impl VideoDecoder for H264SoftwareDecoder {
     fn push_access_unit(&mut self, access_unit: &[u8]) -> Result<(), PipelineError> {
-        match self.decoder.decode(access_unit) {
-            Ok(Some(_)) => Ok(()),
-            Ok(None) => Err(PipelineError::Message(
-                "访问单元未生成完整可解码帧".to_string(),
-            )),
-            Err(e) => Err(PipelineError::Message(format!("openh264 解码失败: {e}"))),
+        let decoded_frame = match self.decoder.decode(access_unit) {
+            Ok(Some(decoded)) => Some(decoded_yuv_to_rgb_frame(&decoded, 0)),
+            Ok(None) => None,
+            Err(e) => {
+                return Err(PipelineError::Message(format!(
+                    "openh264 decode failed: {e}"
+                )))
+            }
+        };
+
+        if let Some(frame) = decoded_frame {
+            self.decoded_frames.push(frame);
         }
+
+        Ok(())
     }
 
     fn drain_decoded_frames(&mut self) -> Vec<CoreDecodedFrame> {
-        let frames = Vec::new();
-        // TODO: 实现帧提取
-        frames
+        let flushed_frames = self
+            .decoder
+            .flush_remaining()
+            .map(|frames| {
+                frames
+                    .into_iter()
+                    .map(|decoded| decoded_yuv_to_rgb_frame(&decoded, 0))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        self.decoded_frames.extend(flushed_frames);
+
+        std::mem::take(&mut self.decoded_frames)
     }
+}
+
+fn decoded_yuv_to_rgb_frame(decoded: &DecodedYUV<'_>, timestamp_us: u64) -> CoreDecodedFrame {
+    let (width, height) = decoded.dimensions();
+    let mut rgb = vec![0_u8; width * height * 3];
+    decoded.write_rgb8(&mut rgb);
+    CoreDecodedFrame::from_cpu_rgb24(width, height, timestamp_us, rgb)
 }
 
 impl VideoDecoder for NvdecVideoDecoder {
     fn push_access_unit(&mut self, access_unit: &[u8]) -> Result<(), PipelineError> {
         self.decoder
             .push_access_unit(access_unit)
-            .map_err(|e| PipelineError::Message(format!("nvdec 解码失败: {e}")))
+            .map_err(|e| PipelineError::Message(format!("nvdec decode failed: {e}")))
     }
 
     fn drain_decoded_frames(&mut self) -> Vec<CoreDecodedFrame> {

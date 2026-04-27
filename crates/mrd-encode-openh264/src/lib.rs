@@ -17,6 +17,8 @@ pub struct OpenH264Encoder {
 
 impl OpenH264Encoder {
     pub fn new(width: usize, height: usize, fps: u32) -> Result<Self, PipelineError> {
+        validate_even_dimensions(width, height)?;
+
         let config = EncoderConfig::new()
             .usage_type(UsageType::ScreenContentRealTime)
             .max_frame_rate(FrameRate::from_hz(fps.max(1) as f32))
@@ -43,6 +45,8 @@ impl OpenH264Encoder {
 
 impl VideoEncoder for OpenH264Encoder {
     fn encode(&mut self, frame: &CapturedFrame) -> Result<Vec<EncodedAccessUnit>, PipelineError> {
+        validate_even_dimensions(frame.width, frame.height)?;
+
         if frame.width != self.width || frame.height != self.height {
             return Err(PipelineError::message(format!(
                 "frame size mismatch: expected {}x{}, got {}x{}",
@@ -70,6 +74,22 @@ impl VideoEncoder for OpenH264Encoder {
             bytes: normalize_h264_bitstream(bitstream.to_vec()),
         }])
     }
+}
+
+fn validate_even_dimensions(width: usize, height: usize) -> Result<(), PipelineError> {
+    if width == 0 || height == 0 {
+        return Err(PipelineError::message(format!(
+            "openh264 frame dimensions must be non-zero, got {width}x{height}"
+        )));
+    }
+
+    if width % 2 != 0 || height % 2 != 0 {
+        return Err(PipelineError::message(format!(
+            "openh264 requires even frame dimensions, got {width}x{height}"
+        )));
+    }
+
+    Ok(())
 }
 
 fn normalize_h264_bitstream(bytes: Vec<u8>) -> Vec<u8> {

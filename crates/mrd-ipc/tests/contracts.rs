@@ -1,8 +1,8 @@
 // IPC contract tests
 // Verify serialization/deserialization of all IPC messages
 
-use mrd_ipc::{IpcRequest, IpcResponse, DeviceInfo, SessionRuntimeSnapshot, SessionBootstrap};
-use mrd_proto::{SessionId, DeviceId};
+use mrd_ipc::{DeviceInfo, IpcRequest, IpcResponse, SessionBootstrap, SessionRuntimeSnapshot};
+use mrd_proto::{DeviceId, SessionId};
 
 fn test_device_id() -> DeviceId {
     DeviceId("test-device".to_string())
@@ -125,13 +125,11 @@ fn serialize_deserialize_device_registered_response() {
 #[test]
 fn serialize_deserialize_device_list_response() {
     let response = IpcResponse::DeviceList {
-        devices: vec![
-            DeviceInfo {
-                device_id: test_device_id(),
-                device_name: "Test Device".to_string(),
-                is_online: true,
-            }
-        ],
+        devices: vec![DeviceInfo {
+            device_id: test_device_id(),
+            device_name: "Test Device".to_string(),
+            is_online: true,
+        }],
     };
 
     let json = serde_json::to_string(&response).unwrap();

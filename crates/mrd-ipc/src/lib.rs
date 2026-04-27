@@ -9,8 +9,8 @@
 pub mod client;
 pub mod transport;
 
+use mrd_proto::{DeviceId, SessionId};
 use serde::{Deserialize, Serialize};
-use mrd_proto::{SessionId, DeviceId};
 
 // === Shell / Lifecycle DTOs (Phase 2) ===
 // Defined first to avoid forward references
@@ -97,7 +97,7 @@ pub enum IpcRequest {
     StartSession {
         session_id: SessionId,
         target_device_id: DeviceId,
-        transport_kind: String,  // "quic" or "webrtc"
+        transport_kind: String, // "quic" or "webrtc"
     },
     /// Accept an incoming session as agent
     AcceptSession {
@@ -105,38 +105,32 @@ pub enum IpcRequest {
         source_device_id: DeviceId,
     },
     /// Start sending media (controller role)
-    StartSender {
-        session_id: SessionId,
-    },
+    StartSender { session_id: SessionId },
     /// Start receiving media (agent role)
-    StartReceiver {
-        session_id: SessionId,
-    },
+    StartReceiver { session_id: SessionId },
     /// Stop a session
-    StopSession {
+    StopSession { session_id: SessionId },
+    /// Mark a session as failed and retain its failure reason.
+    FailSession {
         session_id: SessionId,
+        reason: String,
     },
+    /// Recover a failed or closed session back to its role-appropriate startup state.
+    RecoverSession { session_id: SessionId },
     /// Get current session runtime snapshot
-    SessionRuntimeSnapshot {
-        session_id: SessionId,
-    },
+    SessionRuntimeSnapshot { session_id: SessionId },
     /// Get aggregated runtime snapshot
     RuntimeSnapshot,
     /// Get probe snapshot data
-    ProbeSnapshot {
-        session_id: SessionId,
-    },
+    ProbeSnapshot { session_id: SessionId },
     /// Stream probe events
     StreamProbeEvents,
     /// Health check for service
     ServiceHealth,
 
     // === Shell / Lifecycle Commands (Phase 2) ===
-
     /// Request to open/focus the UI
-    OpenUi {
-        reason: OpenUiReason,
-    },
+    OpenUi { reason: OpenUiReason },
     /// Request to focus an existing UI window
     FocusUi,
     /// Notify service that UI has attached
@@ -145,22 +139,15 @@ pub enum IpcRequest {
         executable_path: Option<String>,
     },
     /// Notify service that UI is detaching
-    UiDetached {
-        pid: u32,
-        reason: UiDetachReason,
-    },
+    UiDetached { pid: u32, reason: UiDetachReason },
     /// Get current shell/service status
     GetShellStatus,
     /// Set autostart enabled state
-    SetAutostart {
-        enabled: bool,
-    },
+    SetAutostart { enabled: bool },
     /// Get autostart status
     GetAutostartStatus,
     /// Request service shutdown
-    ShutdownService {
-        mode: ShutdownMode,
-    },
+    ShutdownService { mode: ShutdownMode },
 }
 
 /// IPC response from mrd-service to Rdesk
@@ -168,81 +155,52 @@ pub enum IpcRequest {
 #[serde(tag = "type")]
 pub enum IpcResponse {
     /// Device registration successful
-    DeviceRegistered {
-        device_id: DeviceId,
-    },
+    DeviceRegistered { device_id: DeviceId },
     /// List of available devices
-    DeviceList {
-        devices: Vec<DeviceInfo>,
-    },
+    DeviceList { devices: Vec<DeviceInfo> },
     /// List of active sessions
-    SessionList {
-        sessions: Vec<SessionInfo>,
-    },
+    SessionList { sessions: Vec<SessionInfo> },
     /// Session started successfully
-    SessionStarted {
-        session_id: SessionId,
-    },
+    SessionStarted { session_id: SessionId },
     /// Session accepted successfully
-    SessionAccepted {
-        session_id: SessionId,
-    },
+    SessionAccepted { session_id: SessionId },
     /// Sender started
-    SenderStarted {
-        session_id: SessionId,
-    },
+    SenderStarted { session_id: SessionId },
     /// Receiver started
-    ReceiverStarted {
-        session_id: SessionId,
-    },
+    ReceiverStarted { session_id: SessionId },
     /// Session stopped
-    SessionStopped {
-        session_id: SessionId,
-    },
+    SessionStopped { session_id: SessionId },
+    /// Session failed
+    SessionFailed { session_id: SessionId },
+    /// Session recovered
+    SessionRecovered { session_id: SessionId },
     /// Session runtime snapshot
-    SessionSnapshot {
-        snapshot: SessionRuntimeSnapshot,
-    },
+    SessionSnapshot { snapshot: SessionRuntimeSnapshot },
     /// Aggregated runtime snapshot
-    RuntimeSnapshot {
-        snapshot: RuntimeSnapshot,
-    },
+    RuntimeSnapshot { snapshot: RuntimeSnapshot },
     /// Probe snapshot data
-    ProbeSnapshot {
-        snapshot: ProbeSnapshot,
-    },
+    ProbeSnapshot { snapshot: ProbeSnapshot },
     /// Probe event data
     ProbeEvent {
-        event: Vec<u8>,  // Serialized probe event
+        event: Vec<u8>, // Serialized probe event
     },
     /// Service health status
-    ServiceHealth {
-        status: ServiceStatus,
-    },
+    ServiceHealth { status: ServiceStatus },
 
     // === Shell / Lifecycle Responses (Phase 2) ===
-
     /// Result of UI open request
     UiOpenResult {
         status: UiOpenStatus,
         pid: Option<u32>,
     },
     /// Shell/service status snapshot
-    ShellStatus {
-        status: ShellStatusSnapshot,
-    },
+    ShellStatus { status: ShellStatusSnapshot },
     /// Autostart status
-    AutostartStatus {
-        enabled: bool,
-        supported: bool,
-    },
+    AutostartStatus { enabled: bool, supported: bool },
     /// Generic acknowledgment
     Ack,
     /// Error response
-    Error {
-        code: String,
-        message: String,
-    },
+    Error { code: String, message: String },
 }
 
 /// Device information DTO
@@ -258,17 +216,22 @@ pub struct DeviceInfo {
 pub struct SessionInfo {
     pub session_id: SessionId,
     pub role: String,  // "controller" or "agent"
-    pub state: String,  // "created", "listening", "connecting", "connected", "streaming", "failed", "closed"
+    pub state: String, // "created", "listening", "connecting", "connected", "streaming", "failed", "closed"
     pub transport_kind: String,
+    pub last_error: Option<String>,
+    /// Whether the media sender is currently marked active.
+    pub sender_active: bool,
+    /// Whether the media receiver is currently marked active.
+    pub receiver_active: bool,
 }
 
 /// Session runtime snapshot DTO (stable IPC contract)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionRuntimeSnapshot {
     pub session_id: SessionId,
-    pub role: String,  // "controller" or "agent"
-    pub state: String,  // "created", "listening", "connecting", "connected", "streaming", "failed", "closed"
-    pub transport_kind: String,  // "quic" or "webrtc"
+    pub role: String,           // "controller" or "agent"
+    pub state: String, // "created", "listening", "connecting", "connected", "streaming", "failed", "closed"
+    pub transport_kind: String, // "quic" or "webrtc"
     pub local_bootstrap: Option<SessionBootstrap>,
     pub remote_bootstrap: Option<SessionBootstrap>,
     pub last_error: Option<String>,
@@ -282,7 +245,7 @@ pub struct SessionRuntimeSnapshot {
 pub struct SessionBootstrap {
     pub listen_addr: Option<String>,
     pub server_name: Option<String>,
-    pub cert_der: Option<String>,  // Base64-encoded DER certificate
+    pub cert_der: Option<String>, // Base64-encoded DER certificate
 }
 
 /// Aggregated runtime snapshot DTO

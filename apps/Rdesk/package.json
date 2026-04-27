@@ -4,6 +4,8 @@
   "version": "0.0.1",
   "type": "module",
   "scripts": {
+    "build:service": "node scripts/prepare-mrd-service.mjs --release",
+    "build:service:dev": "node scripts/prepare-mrd-service.mjs --profile=debug",
     "build": "vite build",
     "dev": "vite",
     "test": "vitest run",

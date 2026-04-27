@@ -3,7 +3,7 @@ use std::{fs, path::Path, time::Instant};
 use mrd_decode::create_decoder;
 use mrd_encode_nvenc::NvencH264Encoder;
 use mrd_observability::{ComponentKind, ComponentResult};
-use mrd_pipeline_core::{CapturedFrame, FramePixelFormat, VideoEncoder, DecodedFrameData};
+use mrd_pipeline_core::{CapturedFrame, DecodedFrameData, FramePixelFormat, VideoEncoder};
 use openh264::{
     encoder::Encoder,
     formats::{RgbSliceU8, YUVBuffer},

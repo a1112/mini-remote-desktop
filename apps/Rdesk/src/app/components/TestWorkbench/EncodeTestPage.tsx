@@ -92,8 +92,8 @@ export function EncodeTestPage() {
 
     // Map encoder to test chain
     const chainMap: Record<EncoderType, "nvenc_nvdec" | "nvenc_only" | "openh264"> = {
-      nvenc_h264: "nvenc_nvdec",
-      nvenc_av1: "nvenc_nvdec",
+      nvenc_h264: "nvenc_only",
+      nvenc_av1: "nvenc_only",
       openh264: "openh264",
     };
 

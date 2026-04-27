@@ -270,7 +270,7 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn unix_socket_ipc_roundtrip() -> Result<()> {
-        use tokio::time::{Duration, sleep};
+        use tokio::time::{sleep, Duration};
 
         let server_handle = tokio::spawn(async {
             let server = IpcServer::bind().await?;

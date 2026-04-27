@@ -4,8 +4,8 @@
 
 use std::time::Duration;
 
-use mrd_ipc::{IpcRequest, IpcResponse, client::IpcClient};
-use mrd_proto::{SessionId, DeviceId};
+use mrd_ipc::{client::IpcClient, IpcRequest, IpcResponse};
+use mrd_proto::{DeviceId, SessionId};
 
 /// Helper to create a test session ID
 fn test_session_id() -> SessionId {
@@ -57,7 +57,10 @@ async fn ipc_client_sends_service_health_request() {
 #[test]
 fn ipc_client_transitions_connection_states() {
     let client = IpcClient::new();
-    assert_eq!(client.state(), &mrd_ipc::client::ConnectionState::Disconnected);
+    assert_eq!(
+        client.state(),
+        &mrd_ipc::client::ConnectionState::Disconnected
+    );
     assert!(!client.is_connected());
 }
 
@@ -90,7 +93,10 @@ fn ipc_client_disconnect_resets_state() {
     let mut client = IpcClient::new();
     // Even though not connected, disconnect should be idempotent
     client.disconnect();
-    assert_eq!(client.state(), &mrd_ipc::client::ConnectionState::Disconnected);
+    assert_eq!(
+        client.state(),
+        &mrd_ipc::client::ConnectionState::Disconnected
+    );
 }
 
 /// Test that requests can be created without connection

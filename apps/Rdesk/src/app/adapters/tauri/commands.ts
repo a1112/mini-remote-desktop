@@ -11,14 +11,20 @@
 import { invoke } from '@tauri-apps/api/core';
 import type {
   AdapterResult,
+  ClientDiagnostics,
   DeviceInfo,
   DeviceRegistrationResponse,
   DecodePolicy,
   DecodePolicyResponse,
   HardwareInfo,
+  SystemResourceSnapshot,
+  NativeBackdropStatus,
   ShutdownMode,
   ShellStatusSnapshot,
+  SessionInfo,
   SessionRuntimeSnapshot,
+  RuntimeSnapshot,
+  ProbeSnapshot,
   HarnessMetrics,
   FrameData,
   // Test Workbench Types
@@ -30,6 +36,7 @@ import type {
   Artifact,
   TestPreset,
   EnvironmentSnapshot,
+  WindowCaptureTarget,
 } from './types';
 
 /**
@@ -46,6 +53,56 @@ async function invokeAdapter<T>(
     const message = error instanceof Error ? error.message : String(error);
     return { ok: false, error: { message } };
   }
+}
+
+// ============================================================================
+// Window / Tray Commands
+// ============================================================================
+
+export async function startDragWindow(): Promise<AdapterResult<void>> {
+  return invokeAdapter<void>('start_drag_window');
+}
+
+export async function minimizeWindow(): Promise<AdapterResult<void>> {
+  return invokeAdapter<void>('minimize_window');
+}
+
+export async function toggleMaximizeWindow(): Promise<AdapterResult<boolean>> {
+  return invokeAdapter<boolean>('toggle_maximize_window');
+}
+
+export async function hideToTray(): Promise<AdapterResult<void>> {
+  return invokeAdapter<void>('hide_to_tray');
+}
+
+export async function showWindow(): Promise<AdapterResult<void>> {
+  return invokeAdapter<void>('show_window');
+}
+
+export async function centerWindow(): Promise<AdapterResult<void>> {
+  return invokeAdapter<void>('center_window');
+}
+
+export async function closeWindow(): Promise<AdapterResult<void>> {
+  return invokeAdapter<void>('close_window');
+}
+
+export async function setWindowDecorations(
+  decorated: boolean
+): Promise<AdapterResult<void>> {
+  return invokeAdapter<void>('set_window_decorations', { decorated });
+}
+
+export async function applyNativeChrome(): Promise<AdapterResult<NativeBackdropStatus>> {
+  return invokeAdapter<NativeBackdropStatus>('apply_native_chrome');
+}
+
+export async function getClientDiagnostics(): Promise<AdapterResult<ClientDiagnostics>> {
+  return invokeAdapter<ClientDiagnostics>('get_client_diagnostics');
+}
+
+export async function openDiagnosticsFolder(): Promise<AdapterResult<void>> {
+  return invokeAdapter<void>('open_diagnostics_folder');
 }
 
 // ============================================================================
@@ -211,12 +268,61 @@ export async function ipcStopSession(
 }
 
 /**
+ * Mark a session failed.
+ */
+export async function ipcFailSession(
+  sessionId: string,
+  reason: string
+): Promise<AdapterResult<string>> {
+  return invokeAdapter<string>('ipc_fail_session', {
+    sessionId,
+    reason,
+  });
+}
+
+/**
+ * Recover a failed or closed session.
+ */
+export async function ipcRecoverSession(
+  sessionId: string
+): Promise<AdapterResult<string>> {
+  return invokeAdapter<string>('ipc_recover_session', {
+    sessionId,
+  });
+}
+
+/**
  * Get session runtime snapshot
  */
 export async function ipcSessionSnapshot(
   sessionId: string
 ): Promise<AdapterResult<SessionRuntimeSnapshot>> {
   return invokeAdapter<SessionRuntimeSnapshot>('ipc_session_snapshot', {
+    sessionId,
+  });
+}
+
+/**
+ * List session summaries.
+ */
+export async function ipcListSessions(): Promise<AdapterResult<SessionInfo[]>> {
+  return invokeAdapter<SessionInfo[]>('ipc_list_sessions');
+}
+
+/**
+ * Get aggregated runtime snapshot.
+ */
+export async function ipcRuntimeSnapshot(): Promise<AdapterResult<RuntimeSnapshot>> {
+  return invokeAdapter<RuntimeSnapshot>('ipc_runtime_snapshot');
+}
+
+/**
+ * Get probe snapshot.
+ */
+export async function ipcProbeSnapshot(
+  sessionId: string
+): Promise<AdapterResult<ProbeSnapshot>> {
+  return invokeAdapter<ProbeSnapshot>('ipc_probe_snapshot', {
     sessionId,
   });
 }
@@ -256,6 +362,10 @@ export async function ipcStartReceiver(
  */
 export async function getHardwareInfo(): Promise<AdapterResult<HardwareInfo>> {
   return invokeAdapter<HardwareInfo>('get_hardware_info');
+}
+
+export async function getSystemResourceSnapshot(): Promise<AdapterResult<SystemResourceSnapshot>> {
+  return invokeAdapter<SystemResourceSnapshot>('get_system_resource_snapshot');
 }
 
 /**
@@ -346,6 +456,13 @@ export async function testListScenarios(): Promise<AdapterResult<TestScenario[]>
  */
 export async function testGetCapabilities(): Promise<AdapterResult<EnvironmentSnapshot>> {
   return invokeAdapter<EnvironmentSnapshot>('test_get_capabilities');
+}
+
+/**
+ * List visible top-level windows available to the WinRT window-capture path.
+ */
+export async function testListWindowCaptureTargets(): Promise<AdapterResult<WindowCaptureTarget[]>> {
+  return invokeAdapter<WindowCaptureTarget[]>('test_list_window_capture_targets');
 }
 
 /**

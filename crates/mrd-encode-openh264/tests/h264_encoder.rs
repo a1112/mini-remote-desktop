@@ -26,3 +26,15 @@ fn openh264_encoder_emits_h264_access_unit_for_bgra_frame() {
         "encoder output should be normalized to Annex-B for RTP packetization"
     );
 }
+
+#[test]
+fn openh264_encoder_rejects_odd_dimensions_without_panicking() {
+    let error = match OpenH264Encoder::new(17, 15, 30) {
+        Ok(_) => panic!("odd dimensions should fail"),
+        Err(error) => error,
+    };
+
+    assert!(error
+        .to_string()
+        .contains("openh264 requires even frame dimensions"));
+}

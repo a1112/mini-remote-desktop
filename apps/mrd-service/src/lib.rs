@@ -7,12 +7,10 @@ pub mod handlers;
 pub mod ipc_server;
 pub mod shell;
 
-pub use app_state::{AppState, SessionRegistry, DeviceRegistry};
+pub use app_state::{AppState, DeviceRegistry, SessionRegistry};
 pub use shell::{
-    UiLauncherPort, UiLaunchResult, UiLaunchRequest, InMemoryUiLauncher,
-    TrayPort, TrayModel, TrayMenuItem, TrayAction, NoOpTray,
-    build_tray_model,
-    AutostartPort, NoOpAutostart,
+    build_tray_model, AutostartPort, InMemoryUiLauncher, NoOpAutostart, NoOpTray, TrayAction,
+    TrayMenuItem, TrayModel, TrayPort, UiLaunchRequest, UiLaunchResult, UiLauncherPort,
 };
 #[cfg(windows)]
 pub use shell::{windows::WindowsTray, WindowsAutostart};

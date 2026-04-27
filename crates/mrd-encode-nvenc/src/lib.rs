@@ -85,11 +85,7 @@ mod imp {
 
         /// Maximum speed encoder using P1 preset (fastest preset)
         /// Lowest quality but maximum speed for 144Hz+ gaming
-        pub fn new_max_speed(
-            width: usize,
-            height: usize,
-            fps: u32,
-        ) -> Result<Self, PipelineError> {
+        pub fn new_max_speed(width: usize, height: usize, fps: u32) -> Result<Self, PipelineError> {
             let width = width.max(2);
             let height = height.max(2);
             let fps = fps.max(1);

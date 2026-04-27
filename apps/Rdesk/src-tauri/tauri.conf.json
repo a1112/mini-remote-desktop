@@ -4,21 +4,30 @@
   "version": "0.1.0",
   "identifier": "com.a1112.rdesk",
   "build": {
-    "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build",
+    "beforeDevCommand": "npm run build:service:dev && npm run dev -- --host 127.0.0.1 --port 5173 --strictPort",
+    "beforeBuildCommand": "npm run build:service && npm run build",
     "frontendDist": "../dist",
     "devUrl": "http://localhost:5173"
   },
   "app": {
     "withGlobalTauri": true,
+    "macOSPrivateApi": true,
     "windows": [
       {
         "label": "main",
         "title": "Rdesk",
         "width": 1100,
         "height": 600,
+        "minWidth": 720,
+        "minHeight": 480,
+        "center": true,
         "resizable": true,
+        "maximizable": true,
+        "minimizable": true,
+        "closable": true,
         "fullscreen": false,
+        "transparent": true,
+        "shadow": true,
         "decorations": false
       }
     ],

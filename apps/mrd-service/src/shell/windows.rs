@@ -4,7 +4,7 @@
 // Currently a placeholder that logs - full implementation would use
 // Win32 Shell_NotifyIcon directly via FFI.
 
-use super::{TrayPort, TrayModel};
+use super::{TrayModel, TrayPort};
 
 /// Windows tray implementation (placeholder)
 ///
@@ -32,14 +32,22 @@ impl TrayPort for WindowsTray {
     fn install(&self, model: TrayModel) -> anyhow::Result<()> {
         // Phase 4: Placeholder for Windows tray implementation
         tracing::info!("WindowsTray::install called - placeholder implementation");
-        tracing::info!("Model: status={}, sessions={}", model.status_text, model.session_count);
+        tracing::info!(
+            "Model: status={}, sessions={}",
+            model.status_text,
+            model.session_count
+        );
         tracing::info!("Menu items: {}", model.menu_items.len());
         Ok(())
     }
 
     fn update(&self, model: TrayModel) -> anyhow::Result<()> {
         tracing::info!("WindowsTray::update called - placeholder");
-        tracing::info!("Model: status={}, sessions={}", model.status_text, model.session_count);
+        tracing::info!(
+            "Model: status={}, sessions={}",
+            model.status_text,
+            model.session_count
+        );
         Ok(())
     }
 

@@ -2,8 +2,8 @@
 //
 // Provides a client for communicating with mrd-service over local IPC.
 
-use anyhow::Result;
 use crate::{transport::IpcEndpoint, IpcRequest, IpcResponse};
+use anyhow::Result;
 use std::time::Duration;
 
 /// Reconnection configuration

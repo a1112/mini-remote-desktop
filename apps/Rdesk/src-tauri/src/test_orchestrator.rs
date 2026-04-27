@@ -4,12 +4,18 @@
 //! runs, metrics collection, and artifact storage.
 
 use anyhow::Result;
+use base64::Engine;
+use mrd_pipeline_core::{
+    CapturedFrame, DecodedFrame, DecodedFrameData, EncodedAccessUnit, FramePixelFormat,
+    VideoEncoder,
+};
+use mrd_render::{RenderFrame, RenderTarget, RendererFactory};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::test_harness::{TestChain, HarnessMetrics, TestHarness};
+use crate::test_harness::{HarnessMetrics, TestChain, TestHarness};
 use std::thread;
 use std::time::Duration;
 
@@ -81,6 +87,10 @@ pub struct TestConfigData {
     pub duration_ms: Option<u64>,
     pub warmup_ms: Option<u64>,
     pub repeat_count: Option<u32>,
+    pub input_source: Option<String>,
+    pub window_hwnd: Option<String>,
+    pub window_title: Option<String>,
+    pub output_validation: Option<bool>,
 }
 
 /// Test run record
@@ -180,6 +190,64 @@ pub struct ArtifactMetadata {
     pub height: Option<usize>,
     pub format: Option<String>,
     pub size_bytes: Option<usize>,
+}
+
+/// A visible top-level window that can be used as a WinRT capture target.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowCaptureTarget {
+    pub hwnd: String,
+    pub title: String,
+    pub class_name: String,
+    pub width: u32,
+    pub height: u32,
+    pub process_id: u32,
+}
+
+struct WindowCaptureItemProbe {
+    hwnd: isize,
+    title: String,
+    class_name: String,
+    width: u32,
+    height: u32,
+}
+
+struct WindowCaptureFrameProbe {
+    hwnd: isize,
+    title: String,
+    class_name: String,
+    width: u32,
+    height: u32,
+    byte_len: usize,
+    pixel_format: String,
+    frame: mrd_pipeline_core::CapturedFrame,
+}
+
+struct SingleWindowMediaProbe {
+    transport: String,
+    encoded_width: usize,
+    encoded_height: usize,
+    access_unit_count: usize,
+    encoded_bytes: usize,
+    keyframe_count: usize,
+    transport_rtp_packet_count: usize,
+    transport_payload_bytes: usize,
+    encode_latency_ms: f64,
+    decode_latency_ms: f64,
+    decoded_frame_count: usize,
+    decoded_width: Option<usize>,
+    decoded_height: Option<usize>,
+    decoded_pixel_format: Option<String>,
+    render_backend: Option<String>,
+    render_latency_ms: Option<f64>,
+    rendered_frame_count: usize,
+    first_access_unit: Option<Vec<u8>>,
+}
+
+struct SingleWindowTransportProbe {
+    transport: String,
+    access_units: Vec<EncodedAccessUnit>,
+    rtp_packet_count: usize,
+    payload_bytes: usize,
 }
 
 /// Test preset
@@ -305,6 +373,31 @@ impl TestOrchestrator {
                     ..Default::default()
                 },
             },
+            TestScenario {
+                scenario_id: "single_window.local".to_string(),
+                scenario_kind: ScenarioKind::E2eLocal,
+                component_scope: vec![
+                    "winrt".to_string(),
+                    "openh264".to_string(),
+                    "webrtc".to_string(),
+                    "software_decode".to_string(),
+                    "d3d11_render".to_string(),
+                ],
+                display_name: "Single window local probe".to_string(),
+                description:
+                    "Captures one WinRT window frame and runs it through encode, WebRTC RTP, decode, and render."
+                        .to_string(),
+                supports_matrix: false,
+                default_config: TestConfigData {
+                    capture_type: Some("winrt".to_string()),
+                    encoder_type: Some("openh264".to_string()),
+                    decoder_type: Some("software".to_string()),
+                    transport_kind: Some("webrtc".to_string()),
+                    input_source: Some("window".to_string()),
+                    duration_ms: Some(1_000),
+                    ..Default::default()
+                },
+            },
         ]
     }
 
@@ -327,7 +420,8 @@ impl TestOrchestrator {
         }
 
         // Get GPU info string
-        let gpu_info = hw_info.gpu_info
+        let gpu_info = hw_info
+            .gpu_info
             .iter()
             .map(|g| g.name.clone())
             .collect::<Vec<_>>()
@@ -337,7 +431,11 @@ impl TestOrchestrator {
             cpu_brand: hw_info.cpu_info.name,
             cpu_cores: hw_info.cpu_info.cores,
             memory_gb: (hw_info.total_memory_mb / 1024) as u32,
-            gpu_info: if gpu_info.is_empty() { "Unknown".to_string() } else { gpu_info },
+            gpu_info: if gpu_info.is_empty() {
+                "Unknown".to_string()
+            } else {
+                gpu_info
+            },
             available_encoders,
             available_decoders,
         })
@@ -345,6 +443,10 @@ impl TestOrchestrator {
 
     /// Start a new test run
     pub fn start_run(&self, scenario_id: String, config: TestConfigData) -> Result<RunId> {
+        if scenario_id == "single_window.local" {
+            return self.start_single_window_probe(scenario_id, config);
+        }
+
         // Resolve the scenario before recording a run. Unsupported scenarios must
         // fail fast instead of leaving a phantom running record behind.
         let chain = self.scenario_to_chain(&scenario_id, &config)?;
@@ -431,7 +533,9 @@ impl TestOrchestrator {
                 };
 
                 if !is_running {
-                    orchestrator_events.lock().unwrap()
+                    orchestrator_events
+                        .lock()
+                        .unwrap()
                         .entry(run_id_clone.clone())
                         .or_insert_with(Vec::new)
                         .push(TestStageEvent {
@@ -474,11 +578,28 @@ impl TestOrchestrator {
 
                 {
                     let mut series = orchestrator_metrics.lock().unwrap();
-                    let run_series = series.entry(run_id_clone.clone()).or_insert_with(HashMap::new);
+                    let run_series = series
+                        .entry(run_id_clone.clone())
+                        .or_insert_with(HashMap::new);
                     push_metric_sample(run_series, "capture_fps", "fps", metrics.capture_fps);
-                    push_metric_sample(run_series, "encode_latency_p95_ms", "ms", metrics.encode_latency_p95_ms);
-                    push_metric_sample(run_series, "decode_latency_p95_ms", "ms", metrics.decode_latency_p95_ms);
-                    push_metric_sample(run_series, "total_latency_p95_ms", "ms", metrics.total_latency_p95_ms);
+                    push_metric_sample(
+                        run_series,
+                        "encode_latency_p95_ms",
+                        "ms",
+                        metrics.encode_latency_p95_ms,
+                    );
+                    push_metric_sample(
+                        run_series,
+                        "decode_latency_p95_ms",
+                        "ms",
+                        metrics.decode_latency_p95_ms,
+                    );
+                    push_metric_sample(
+                        run_series,
+                        "total_latency_p95_ms",
+                        "ms",
+                        metrics.total_latency_p95_ms,
+                    );
                 }
 
                 if now_ms().saturating_sub(started_at) >= duration_ms {
@@ -495,6 +616,595 @@ impl TestOrchestrator {
         });
 
         Ok(run_id)
+    }
+
+    fn start_single_window_probe(
+        &self,
+        scenario_id: String,
+        config: TestConfigData,
+    ) -> Result<RunId> {
+        let run_id = generate_run_id();
+        let started_at = now_ms();
+        let env_snapshot = self.get_capabilities()?;
+        let requested_hwnd = config.window_hwnd.clone();
+
+        let run = TestRun {
+            run_id: run_id.clone(),
+            scenario_id,
+            run_mode: RunMode::Manual,
+            status: RunStatus::Running,
+            started_at,
+            finished_at: None,
+            config_snapshot: config.clone(),
+            environment_snapshot: env_snapshot,
+            summary: None,
+        };
+
+        self.runs.lock().unwrap().insert(run_id.clone(), run);
+        self.record_stage_event(run_id.clone(), "prepare", "started", None, None);
+        self.record_stage_event(run_id.clone(), "capability_check", "started", None, None);
+
+        match list_window_capture_targets() {
+            Ok(targets) => {
+                self.record_stage_event(
+                    run_id.clone(),
+                    "capability_check",
+                    "completed",
+                    None,
+                    None,
+                );
+                let mut selected_window = serde_json::Value::Null;
+                let mut first_frame = serde_json::Value::Null;
+                let mut media_probe = serde_json::Value::Null;
+                let mut encoded_sample = None::<Vec<u8>>;
+
+                if let Some(hwnd_text) = requested_hwnd.as_deref() {
+                    self.record_stage_event(
+                        run_id.clone(),
+                        "capture",
+                        "item_probe_started",
+                        None,
+                        None,
+                    );
+                    let hwnd = match parse_hwnd(hwnd_text) {
+                        Ok(hwnd) => hwnd,
+                        Err(error) => {
+                            let message = error.to_string();
+                            self.record_stage_event(
+                                run_id.clone(),
+                                "capture",
+                                "item_probe_failed",
+                                None,
+                                Some(message.clone()),
+                            );
+                            if let Some(run) = self.runs.lock().unwrap().get_mut(&run_id) {
+                                run.status = RunStatus::Failed;
+                                run.finished_at = Some(now_ms());
+                                run.summary = Some(TestRunSummary {
+                                    total_duration_ms: now_ms().saturating_sub(started_at),
+                                    error_message: Some(message),
+                                    failure_reason: Some("initialization_failure".to_string()),
+                                    ..Default::default()
+                                });
+                            }
+                            return Ok(run_id);
+                        }
+                    };
+
+                    match probe_window_capture_item(hwnd) {
+                        Ok(probe) => {
+                            selected_window = serde_json::json!({
+                                "requested_hwnd": hwnd_text,
+                                "hwnd": format!("0x{:X}", probe.hwnd as usize),
+                                "title": probe.title,
+                                "class_name": probe.class_name,
+                                "width": probe.width,
+                                "height": probe.height,
+                                "capture_item_created": true,
+                            });
+                            self.record_stage_event(
+                                run_id.clone(),
+                                "capture",
+                                "item_probe_completed",
+                                None,
+                                None,
+                            );
+                        }
+                        Err(error) => {
+                            let message = error.to_string();
+                            self.record_stage_event(
+                                run_id.clone(),
+                                "capture",
+                                "item_probe_failed",
+                                None,
+                                Some(message.clone()),
+                            );
+                            if let Some(run) = self.runs.lock().unwrap().get_mut(&run_id) {
+                                run.status = RunStatus::Failed;
+                                run.finished_at = Some(now_ms());
+                                run.summary = Some(TestRunSummary {
+                                    total_duration_ms: now_ms().saturating_sub(started_at),
+                                    error_message: Some(message),
+                                    failure_reason: Some("initialization_failure".to_string()),
+                                    ..Default::default()
+                                });
+                            }
+                            return Ok(run_id);
+                        }
+                    }
+
+                    self.record_stage_event(
+                        run_id.clone(),
+                        "capture",
+                        "frame_probe_started",
+                        None,
+                        None,
+                    );
+                    match probe_window_first_frame(hwnd, Duration::from_millis(1_000)) {
+                        Ok(probe) => {
+                            let media_result =
+                                self.run_single_window_media_probe(&run_id, &probe.frame, &config);
+
+                            first_frame = serde_json::json!({
+                                "hwnd": format!("0x{:X}", probe.hwnd as usize),
+                                "title": probe.title,
+                                "class_name": probe.class_name,
+                                "width": probe.width,
+                                "height": probe.height,
+                                "byte_len": probe.byte_len,
+                                "pixel_format": probe.pixel_format,
+                                "captured": true,
+                            });
+                            self.record_stage_event(
+                                run_id.clone(),
+                                "capture",
+                                "frame_probe_completed",
+                                None,
+                                None,
+                            );
+
+                            match media_result {
+                                Ok(probe) => {
+                                    encoded_sample = probe.first_access_unit.clone();
+                                    media_probe = serde_json::json!({
+                                        "encoder": "openh264",
+                                        "decoder": "h264_software",
+                                        "transport": probe.transport,
+                                        "encoded_width": probe.encoded_width,
+                                        "encoded_height": probe.encoded_height,
+                                        "access_unit_count": probe.access_unit_count,
+                                        "encoded_bytes": probe.encoded_bytes,
+                                        "keyframe_count": probe.keyframe_count,
+                                        "transport_rtp_packet_count": probe.transport_rtp_packet_count,
+                                        "transport_payload_bytes": probe.transport_payload_bytes,
+                                        "encode_latency_ms": probe.encode_latency_ms,
+                                        "decode_latency_ms": probe.decode_latency_ms,
+                                        "decoded_frame_count": probe.decoded_frame_count,
+                                        "decoded_width": probe.decoded_width,
+                                        "decoded_height": probe.decoded_height,
+                                        "decoded_pixel_format": probe.decoded_pixel_format,
+                                        "render_backend": probe.render_backend,
+                                        "render_latency_ms": probe.render_latency_ms,
+                                        "rendered_frame_count": probe.rendered_frame_count,
+                                    });
+                                }
+                                Err(error) => {
+                                    let message = error.to_string();
+                                    self.record_stage_event(
+                                        run_id.clone(),
+                                        "encode",
+                                        "failed",
+                                        None,
+                                        Some(message.clone()),
+                                    );
+                                    if let Some(run) = self.runs.lock().unwrap().get_mut(&run_id) {
+                                        run.status = RunStatus::Failed;
+                                        run.finished_at = Some(now_ms());
+                                        run.summary = Some(TestRunSummary {
+                                            total_duration_ms: now_ms().saturating_sub(started_at),
+                                            error_message: Some(message),
+                                            failure_reason: Some("runtime_failure".to_string()),
+                                            frame_count: 1,
+                                            ..Default::default()
+                                        });
+                                    }
+                                    return Ok(run_id);
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            let message = error.to_string();
+                            self.record_stage_event(
+                                run_id.clone(),
+                                "capture",
+                                "frame_probe_failed",
+                                None,
+                                Some(message.clone()),
+                            );
+                            if let Some(run) = self.runs.lock().unwrap().get_mut(&run_id) {
+                                run.status = RunStatus::Failed;
+                                run.finished_at = Some(now_ms());
+                                run.summary = Some(TestRunSummary {
+                                    total_duration_ms: now_ms().saturating_sub(started_at),
+                                    error_message: Some(message),
+                                    failure_reason: Some("runtime_failure".to_string()),
+                                    ..Default::default()
+                                });
+                            }
+                            return Ok(run_id);
+                        }
+                    }
+                }
+
+                let artifact = serde_json::json!({
+                    "targets": targets,
+                    "target_count": targets.len(),
+                    "selected_window": selected_window,
+                    "first_frame": first_frame,
+                    "media_probe": media_probe,
+                });
+                let data =
+                    serde_json::to_string_pretty(&artifact).unwrap_or_else(|_| "[]".to_string());
+                let size_bytes = data.len();
+
+                self.run_artifacts
+                    .lock()
+                    .unwrap()
+                    .entry(run_id.clone())
+                    .or_insert_with(Vec::new)
+                    .push(Artifact {
+                        artifact_id: format!("artifact_{}", now_ms()),
+                        kind: "structured_log".to_string(),
+                        run_id: run_id.clone(),
+                        created_at: now_ms(),
+                        data,
+                        metadata: Some(ArtifactMetadata {
+                            width: None,
+                            height: None,
+                            format: Some("json".to_string()),
+                            size_bytes: Some(size_bytes),
+                        }),
+                    });
+
+                if let Some(sample) = encoded_sample {
+                    let sample_size = sample.len();
+                    self.run_artifacts
+                        .lock()
+                        .unwrap()
+                        .entry(run_id.clone())
+                        .or_insert_with(Vec::new)
+                        .push(Artifact {
+                            artifact_id: format!("encoded_{}", now_ms()),
+                            kind: "encoded_sample".to_string(),
+                            run_id: run_id.clone(),
+                            created_at: now_ms(),
+                            data: base64::engine::general_purpose::STANDARD.encode(sample),
+                            metadata: Some(ArtifactMetadata {
+                                width: None,
+                                height: None,
+                                format: Some("h264_annex_b".to_string()),
+                                size_bytes: Some(sample_size),
+                            }),
+                        });
+                }
+
+                if let Some(run) = self.runs.lock().unwrap().get_mut(&run_id) {
+                    run.status = RunStatus::Completed;
+                    run.finished_at = Some(now_ms());
+                    run.summary = Some(TestRunSummary {
+                        total_duration_ms: now_ms().saturating_sub(started_at),
+                        frame_count: if first_frame.is_null() { 0 } else { 1 },
+                        encode_latency_p50: media_probe
+                            .get("encode_latency_ms")
+                            .and_then(|value| value.as_f64()),
+                        encode_latency_p95: media_probe
+                            .get("encode_latency_ms")
+                            .and_then(|value| value.as_f64()),
+                        decode_latency_p50: media_probe
+                            .get("decode_latency_ms")
+                            .and_then(|value| value.as_f64()),
+                        decode_latency_p95: media_probe
+                            .get("decode_latency_ms")
+                            .and_then(|value| value.as_f64()),
+                        ..Default::default()
+                    });
+                }
+                self.record_stage_event(run_id.clone(), "summarize", "completed", None, None);
+            }
+            Err(error) => {
+                let message = error.to_string();
+                self.record_stage_event(
+                    run_id.clone(),
+                    "capability_check",
+                    "failed",
+                    None,
+                    Some(message.clone()),
+                );
+                if let Some(run) = self.runs.lock().unwrap().get_mut(&run_id) {
+                    run.status = RunStatus::Failed;
+                    run.finished_at = Some(now_ms());
+                    run.summary = Some(TestRunSummary {
+                        total_duration_ms: now_ms().saturating_sub(started_at),
+                        error_message: Some(message),
+                        failure_reason: Some("capability_mismatch".to_string()),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+
+        Ok(run_id)
+    }
+
+    fn run_single_window_media_probe(
+        &self,
+        run_id: &str,
+        frame: &CapturedFrame,
+        config: &TestConfigData,
+    ) -> Result<SingleWindowMediaProbe> {
+        let fps = config.fps.unwrap_or(30).max(1);
+        let encode_frame = Self::openh264_compatible_frame(frame)?;
+
+        self.record_stage_event(run_id.to_string(), "encode", "started", None, None);
+        let encode_started = std::time::Instant::now();
+        let mut encoder =
+            mrd_encode_openh264::OpenH264Encoder::new(encode_frame.width, encode_frame.height, fps)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let access_units = encoder
+            .encode(&encode_frame)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let encode_latency_ms = encode_started.elapsed().as_secs_f64() * 1000.0;
+
+        if access_units.is_empty() {
+            anyhow::bail!("OpenH264 produced no access units");
+        }
+
+        self.record_stage_event(run_id.to_string(), "encode", "completed", None, None);
+
+        let encoded_bytes = access_units
+            .iter()
+            .map(|unit| unit.bytes.len())
+            .sum::<usize>();
+        let keyframe_count = access_units.iter().filter(|unit| unit.is_keyframe).count();
+        let first_access_unit = access_units.first().map(|unit| unit.bytes.clone());
+
+        let transport_started_status = if config.transport_kind.as_deref() == Some("webrtc") {
+            "webrtc_rtp_started"
+        } else {
+            "loopback_started"
+        };
+        let transport_completed_status = if config.transport_kind.as_deref() == Some("webrtc") {
+            "webrtc_rtp_completed"
+        } else {
+            "loopback_completed"
+        };
+        self.record_stage_event(
+            run_id.to_string(),
+            "transport",
+            transport_started_status,
+            None,
+            None,
+        );
+        let transport_probe =
+            Self::transport_single_window_access_units(&access_units, fps, config)?;
+        self.record_stage_event(
+            run_id.to_string(),
+            "transport",
+            transport_completed_status,
+            None,
+            None,
+        );
+
+        self.record_stage_event(run_id.to_string(), "decode", "started", None, None);
+        let decode_started = std::time::Instant::now();
+        let mut decoder = mrd_decode::create_decoder("h264_software")
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        for unit in &transport_probe.access_units {
+            decoder
+                .push_access_unit(&unit.bytes)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        }
+        let decoded_frames = decoder.drain_decoded_frames();
+        let decoded_frame_count = decoded_frames.len();
+        let decode_latency_ms = decode_started.elapsed().as_secs_f64() * 1000.0;
+        let decode_status = if decoded_frame_count > 0 {
+            "completed"
+        } else {
+            "accepted_no_frame_drain"
+        };
+        self.record_stage_event(run_id.to_string(), "decode", decode_status, None, None);
+        let decoded_width = decoded_frames.first().map(|frame| frame.width);
+        let decoded_height = decoded_frames.first().map(|frame| frame.height);
+        let decoded_pixel_format = decoded_frames.first().map(Self::decoded_frame_format);
+
+        let (render_backend, render_latency_ms, rendered_frame_count) = if decoded_frames.is_empty()
+        {
+            self.record_stage_event(
+                run_id.to_string(),
+                "render",
+                "skipped_no_decoded_frame",
+                None,
+                None,
+            );
+            (None, None, 0)
+        } else {
+            self.record_stage_event(run_id.to_string(), "render", "started", None, None);
+            let render_started = std::time::Instant::now();
+            let factory = mrd_render_d3d11::D3d11RendererFactory;
+            let mut renderer = factory
+                .create()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            renderer
+                .attach_target(RenderTarget::WindowHandle(0))
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            for frame in &decoded_frames {
+                renderer
+                    .upload_frame(Self::decoded_frame_to_render_frame(frame))
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            }
+            let render_latency = render_started.elapsed().as_secs_f64() * 1000.0;
+            let uploaded = renderer.snapshot().uploaded_frame_count as usize;
+            self.record_stage_event(run_id.to_string(), "render", "completed", None, None);
+            (Some("d3d11".to_string()), Some(render_latency), uploaded)
+        };
+
+        Ok(SingleWindowMediaProbe {
+            transport: transport_probe.transport,
+            encoded_width: encode_frame.width,
+            encoded_height: encode_frame.height,
+            access_unit_count: transport_probe.access_units.len(),
+            encoded_bytes,
+            keyframe_count,
+            transport_rtp_packet_count: transport_probe.rtp_packet_count,
+            transport_payload_bytes: transport_probe.payload_bytes,
+            encode_latency_ms,
+            decode_latency_ms,
+            decoded_frame_count,
+            decoded_width,
+            decoded_height,
+            decoded_pixel_format,
+            render_backend,
+            render_latency_ms,
+            rendered_frame_count,
+            first_access_unit,
+        })
+    }
+
+    fn transport_single_window_access_units(
+        access_units: &[EncodedAccessUnit],
+        fps: u32,
+        config: &TestConfigData,
+    ) -> Result<SingleWindowTransportProbe> {
+        if config.transport_kind.as_deref() != Some("webrtc") {
+            let payload_bytes = access_units
+                .iter()
+                .map(|access_unit| access_unit.bytes.len())
+                .sum::<usize>();
+            return Ok(SingleWindowTransportProbe {
+                transport: "loopback".to_string(),
+                access_units: access_units.to_vec(),
+                rtp_packet_count: 0,
+                payload_bytes,
+            });
+        }
+
+        let mut sender = mrd_transport_webrtc::H264RtpSender::new(
+            "single-window-video",
+            "single-window-stream",
+            fps,
+            1200,
+        );
+        let mut ingress = mrd_transport_webrtc::H264RtpIngress::default();
+        let mut reassembled = Vec::new();
+        let mut rtp_packet_count = 0usize;
+        let mut payload_bytes = 0usize;
+
+        for access_unit in access_units {
+            let packets = sender
+                .packetize_access_unit(access_unit)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            for packet in packets {
+                rtp_packet_count += 1;
+                payload_bytes += packet.payload.len();
+                if let Some(received) = ingress.push_packet(
+                    &packet.payload,
+                    packet.header.marker,
+                    packet.header.sequence_number,
+                    access_unit.timestamp_us,
+                ) {
+                    reassembled.push(received);
+                }
+            }
+        }
+
+        if reassembled.is_empty() {
+            anyhow::bail!("WebRTC RTP loopback produced no H264 access units");
+        }
+
+        Ok(SingleWindowTransportProbe {
+            transport: "webrtc_rtp_loopback".to_string(),
+            access_units: reassembled,
+            rtp_packet_count,
+            payload_bytes,
+        })
+    }
+
+    fn openh264_compatible_frame(frame: &CapturedFrame) -> Result<CapturedFrame> {
+        let width = frame.width - (frame.width % 2);
+        let height = frame.height - (frame.height % 2);
+
+        if width == 0 || height == 0 {
+            anyhow::bail!(
+                "captured frame is too small for OpenH264: {}x{}",
+                frame.width,
+                frame.height
+            );
+        }
+
+        let bytes_per_pixel = match frame.pixel_format {
+            FramePixelFormat::Bgra32 | FramePixelFormat::Rgba32 => 4,
+            FramePixelFormat::Rgb24 => 3,
+        };
+        let source_stride = frame
+            .width
+            .checked_mul(bytes_per_pixel)
+            .ok_or_else(|| anyhow::anyhow!("captured frame stride overflow"))?;
+        let target_stride = width
+            .checked_mul(bytes_per_pixel)
+            .ok_or_else(|| anyhow::anyhow!("encoded frame stride overflow"))?;
+        let expected_len = source_stride
+            .checked_mul(frame.height)
+            .ok_or_else(|| anyhow::anyhow!("captured frame buffer size overflow"))?;
+
+        if frame.data.len() != expected_len {
+            anyhow::bail!(
+                "captured frame bytes mismatch: expected {}, got {}",
+                expected_len,
+                frame.data.len()
+            );
+        }
+
+        if width == frame.width && height == frame.height {
+            return Ok(frame.clone());
+        }
+
+        let mut data = Vec::with_capacity(target_stride * height);
+        for row in 0..height {
+            let start = row * source_stride;
+            data.extend_from_slice(&frame.data[start..start + target_stride]);
+        }
+
+        Ok(CapturedFrame {
+            width,
+            height,
+            pixel_format: frame.pixel_format,
+            timestamp_us: frame.timestamp_us,
+            data,
+        })
+    }
+
+    fn decoded_frame_format(frame: &DecodedFrame) -> String {
+        match &frame.data {
+            DecodedFrameData::CpuRgb24(_) => "Rgb24".to_string(),
+            DecodedFrameData::CpuBgra32(_) => "Bgra32".to_string(),
+            #[cfg(windows)]
+            DecodedFrameData::D3D11SharedNv12 { .. } => "D3D11SharedNv12".to_string(),
+        }
+    }
+
+    fn decoded_frame_to_render_frame(frame: &DecodedFrame) -> RenderFrame {
+        match &frame.data {
+            DecodedFrameData::CpuRgb24(data) => {
+                RenderFrame::from_rgb24(frame.width, frame.height, data.clone())
+            }
+            DecodedFrameData::CpuBgra32(data) => {
+                RenderFrame::from_bgra32(frame.width, frame.height, data.clone())
+            }
+            #[cfg(windows)]
+            DecodedFrameData::D3D11SharedNv12 { shared_handle, .. } => {
+                RenderFrame::from_d3d11_shared_nv12(frame.width, frame.height, *shared_handle)
+            }
+        }
     }
 
     /// Stop a running test
@@ -518,7 +1228,12 @@ impl TestOrchestrator {
     }
 
     /// List test runs
-    pub fn list_runs(&self, scenario_id: Option<String>, status: Option<String>, limit: Option<usize>) -> Vec<TestRun> {
+    pub fn list_runs(
+        &self,
+        scenario_id: Option<String>,
+        status: Option<String>,
+        limit: Option<usize>,
+    ) -> Vec<TestRun> {
         let runs = self.runs.lock().unwrap();
         let mut result: Vec<TestRun> = runs.values().cloned().collect();
 
@@ -565,7 +1280,14 @@ impl TestOrchestrator {
     }
 
     /// Record a stage event
-    pub fn record_stage_event(&self, run_id: String, stage: &str, status: &str, duration_ms: Option<u64>, error: Option<String>) {
+    pub fn record_stage_event(
+        &self,
+        run_id: String,
+        stage: &str,
+        status: &str,
+        duration_ms: Option<u64>,
+        error: Option<String>,
+    ) {
         let event = TestStageEvent {
             stage: stage.to_string(),
             status: status.to_string(),
@@ -613,7 +1335,13 @@ impl TestOrchestrator {
     }
 
     /// Save a preset
-    pub fn save_preset(&self, name: String, description: String, scenario_id: String, config: TestConfigData) -> String {
+    pub fn save_preset(
+        &self,
+        name: String,
+        description: String,
+        scenario_id: String,
+        config: TestConfigData,
+    ) -> String {
         let preset_id = generate_preset_id();
         let preset = TestPreset {
             preset_id: preset_id.clone(),
@@ -625,7 +1353,10 @@ impl TestOrchestrator {
             created_at: now_ms() / 1000,
         };
 
-        self.presets.lock().unwrap().insert(preset_id.clone(), preset);
+        self.presets
+            .lock()
+            .unwrap()
+            .insert(preset_id.clone(), preset);
         preset_id
     }
 
@@ -658,7 +1389,7 @@ impl TestOrchestrator {
 impl Default for TestOrchestrator {
     fn default() -> Self {
         Self::new(Arc::new(Mutex::new(
-            TestHarness::new().expect("failed to create default TestHarness")
+            TestHarness::new().expect("failed to create default TestHarness"),
         )))
     }
 }
@@ -676,6 +1407,95 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64
+}
+
+pub fn list_window_capture_targets() -> Result<Vec<WindowCaptureTarget>> {
+    list_window_capture_targets_impl()
+}
+
+fn parse_hwnd(input: &str) -> Result<isize> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("window hwnd is empty");
+    }
+
+    let value = if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        usize::from_str_radix(hex, 16)
+            .map_err(|error| anyhow::anyhow!("invalid window hwnd '{trimmed}': {error}"))?
+    } else {
+        trimmed
+            .parse::<usize>()
+            .map_err(|error| anyhow::anyhow!("invalid window hwnd '{trimmed}': {error}"))?
+    };
+
+    Ok(value as isize)
+}
+
+#[cfg(windows)]
+fn list_window_capture_targets_impl() -> Result<Vec<WindowCaptureTarget>> {
+    let targets = mrd_capture_winrt::enumerate_window_capture_targets()
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+
+    Ok(targets
+        .into_iter()
+        .map(|target| WindowCaptureTarget {
+            hwnd: format!("0x{:X}", target.hwnd as usize),
+            title: target.title,
+            class_name: target.class_name,
+            width: target.width,
+            height: target.height,
+            process_id: target.process_id,
+        })
+        .collect())
+}
+
+#[cfg(not(windows))]
+fn list_window_capture_targets_impl() -> Result<Vec<WindowCaptureTarget>> {
+    anyhow::bail!("WinRT window capture is only available on Windows")
+}
+
+#[cfg(windows)]
+fn probe_window_capture_item(hwnd: isize) -> Result<WindowCaptureItemProbe> {
+    let probe = mrd_capture_winrt::probe_window_capture_item(hwnd)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+
+    Ok(WindowCaptureItemProbe {
+        hwnd: probe.hwnd,
+        title: probe.title,
+        class_name: probe.class_name,
+        width: probe.width,
+        height: probe.height,
+    })
+}
+
+#[cfg(not(windows))]
+fn probe_window_capture_item(_hwnd: isize) -> Result<WindowCaptureItemProbe> {
+    anyhow::bail!("WinRT window capture is only available on Windows")
+}
+
+#[cfg(windows)]
+fn probe_window_first_frame(hwnd: isize, timeout: Duration) -> Result<WindowCaptureFrameProbe> {
+    let probe = mrd_capture_winrt::probe_window_first_frame(hwnd, timeout)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+
+    Ok(WindowCaptureFrameProbe {
+        hwnd: probe.hwnd,
+        title: probe.title,
+        class_name: probe.class_name,
+        width: probe.width,
+        height: probe.height,
+        byte_len: probe.byte_len,
+        pixel_format: format!("{:?}", probe.pixel_format),
+        frame: probe.frame,
+    })
+}
+
+#[cfg(not(windows))]
+fn probe_window_first_frame(_hwnd: isize, _timeout: Duration) -> Result<WindowCaptureFrameProbe> {
+    anyhow::bail!("WinRT window capture is only available on Windows")
 }
 
 impl Default for TestRunSummary {
@@ -829,6 +1649,45 @@ mod tests {
     }
 
     #[test]
+    fn list_scenarios_includes_single_window_local_probe() {
+        let orchestrator = TestOrchestrator::default();
+        let scenario = orchestrator
+            .list_scenarios()
+            .into_iter()
+            .find(|scenario| scenario.scenario_id == "single_window.local")
+            .expect("single window probe scenario should be registered");
+
+        assert_eq!(scenario.scenario_kind, ScenarioKind::E2eLocal);
+        assert!(!scenario.supports_matrix);
+        assert_eq!(
+            scenario.default_config.capture_type.as_deref(),
+            Some("winrt")
+        );
+        assert_eq!(
+            scenario.default_config.input_source.as_deref(),
+            Some("window")
+        );
+        assert_eq!(
+            scenario.default_config.transport_kind.as_deref(),
+            Some("webrtc")
+        );
+        assert!(scenario
+            .component_scope
+            .iter()
+            .any(|scope| scope == "winrt"));
+        assert!(scenario
+            .component_scope
+            .iter()
+            .any(|scope| scope == "webrtc"));
+    }
+
+    #[test]
+    fn parse_hwnd_accepts_hex_and_decimal() {
+        assert_eq!(parse_hwnd("0x2A").unwrap(), 42);
+        assert_eq!(parse_hwnd("42").unwrap(), 42);
+    }
+
+    #[test]
     fn matrix_dispatch_maps_explicit_encoder_decoder_pairs() {
         let orchestrator = TestOrchestrator::default();
         let openh264_config = TestConfigData {
@@ -911,8 +1770,79 @@ mod tests {
         assert_eq!(summary.failure_reason.as_deref(), Some("runtime_failure"));
 
         let events = orchestrator.get_run_events(&run_id);
-        assert!(events.iter().any(|event| {
-            event.stage == "running" && event.status == "failed"
-        }));
+        assert!(events
+            .iter()
+            .any(|event| { event.stage == "running" && event.status == "failed" }));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "manual smoke test: requires a visible capturable window and WinRT capture access"]
+    fn single_window_local_probe_smoke() {
+        let targets = list_window_capture_targets().expect("failed to list capture targets");
+        let target = targets
+            .into_iter()
+            .find(|target| {
+                target.width >= 32 && target.height >= 32 && !target.title.trim().is_empty()
+            })
+            .expect("no visible capture target found");
+
+        println!(
+            "capturing hwnd={} title={:?} size={}x{} pid={}",
+            target.hwnd, target.title, target.width, target.height, target.process_id
+        );
+
+        let orchestrator = TestOrchestrator::default();
+        let run_id = orchestrator
+            .start_run(
+                "single_window.local".to_string(),
+                TestConfigData {
+                    capture_type: Some("winrt".to_string()),
+                    input_source: Some("window".to_string()),
+                    window_hwnd: Some(target.hwnd.clone()),
+                    window_title: Some(target.title.clone()),
+                    encoder_type: Some("openh264".to_string()),
+                    decoder_type: Some("software".to_string()),
+                    renderer_type: Some("d3d11".to_string()),
+                    transport_kind: Some("webrtc".to_string()),
+                    duration_ms: Some(1_000),
+                    fps: Some(30),
+                    ..Default::default()
+                },
+            )
+            .expect("failed to start single-window probe");
+
+        let run = orchestrator
+            .get_run(&run_id)
+            .expect("probe run should be recorded");
+        println!(
+            "run status={:?} summary={}",
+            run.status,
+            serde_json::to_string_pretty(&run.summary).unwrap()
+        );
+
+        let events = orchestrator.get_run_events(&run_id);
+        println!("events={}", serde_json::to_string_pretty(&events).unwrap());
+
+        let artifacts = orchestrator.get_run_artifacts(&run_id);
+        for artifact in &artifacts {
+            println!(
+                "artifact kind={} metadata={}",
+                artifact.kind,
+                serde_json::to_string_pretty(&artifact.metadata).unwrap()
+            );
+            if artifact.kind == "structured_log" {
+                println!("{}", artifact.data);
+            }
+        }
+
+        assert_eq!(run.status, RunStatus::Completed);
+        assert!(artifacts
+            .iter()
+            .any(|artifact| artifact.kind == "structured_log"
+                && artifact
+                    .data
+                    .contains("\"transport\": \"webrtc_rtp_loopback\"")
+                && artifact.data.contains("\"rendered_frame_count\"")));
     }
 }

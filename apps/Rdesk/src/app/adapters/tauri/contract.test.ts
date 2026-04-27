@@ -16,6 +16,78 @@ describe('Tauri Adapter Contract', () => {
     vi.clearAllMocks();
   });
 
+  describe('window and tray commands', () => {
+    it('frameless window commands call registered command names', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue(undefined);
+
+      await adapter.startDragWindow();
+      await adapter.minimizeWindow();
+      await adapter.hideToTray();
+      await adapter.showWindow();
+      await adapter.centerWindow();
+      await adapter.closeWindow();
+
+      expect(mockInvoke).toHaveBeenNthCalledWith(1, 'start_drag_window', undefined);
+      expect(mockInvoke).toHaveBeenNthCalledWith(2, 'minimize_window', undefined);
+      expect(mockInvoke).toHaveBeenNthCalledWith(3, 'hide_to_tray', undefined);
+      expect(mockInvoke).toHaveBeenNthCalledWith(4, 'show_window', undefined);
+      expect(mockInvoke).toHaveBeenNthCalledWith(5, 'center_window', undefined);
+      expect(mockInvoke).toHaveBeenNthCalledWith(6, 'close_window', undefined);
+    });
+
+    it('toggle_maximize_window returns the new maximized state', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue(true);
+
+      const result = await adapter.toggleMaximizeWindow();
+
+      expect(mockInvoke).toHaveBeenCalledWith('toggle_maximize_window', undefined);
+      expect(result.ok && result.value).toBe(true);
+    });
+
+    it('window chrome commands pass expected arguments', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke
+        .mockResolvedValueOnce(undefined)
+        .mockResolvedValueOnce({
+          platform: 'Windows',
+          effect: 'Mica',
+          applied: true,
+          detail: 'Native backdrop applied',
+        });
+
+      await adapter.setWindowDecorations(false);
+      await adapter.applyNativeChrome();
+
+      expect(mockInvoke).toHaveBeenNthCalledWith(1, 'set_window_decorations', {
+        decorated: false,
+      });
+      expect(mockInvoke).toHaveBeenNthCalledWith(2, 'apply_native_chrome', undefined);
+    });
+
+    it('diagnostic commands call registered command names', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke
+        .mockResolvedValueOnce({
+          app_pid: 1,
+          app_exe_path: 'C:/mrd/app.exe',
+          current_dir: 'C:/mrd',
+          log_dir: 'C:/logs',
+          service_exe_path: 'C:/mrd/mrd-service.exe',
+          service_stdout_log: 'C:/logs/mrd-service.stdout.log',
+          service_stderr_log: 'C:/logs/mrd-service.stderr.log',
+        })
+        .mockResolvedValueOnce(undefined);
+
+      await adapter.getClientDiagnostics();
+      await adapter.openDiagnosticsFolder();
+
+      expect(mockInvoke).toHaveBeenNthCalledWith(1, 'get_client_diagnostics', undefined);
+      expect(mockInvoke).toHaveBeenNthCalledWith(2, 'open_diagnostics_folder', undefined);
+    });
+  });
+
   /**
    * Bootstrap and shell lifecycle commands
    */
@@ -178,6 +250,29 @@ describe('Tauri Adapter Contract', () => {
       });
     });
 
+    it('ipc_fail_session calls correct command with args', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue('session-123');
+
+      await adapter.ipcFailSession('session-123', 'transport lost');
+
+      expect(mockInvoke).toHaveBeenCalledWith('ipc_fail_session', {
+        sessionId: 'session-123',
+        reason: 'transport lost',
+      });
+    });
+
+    it('ipc_recover_session calls correct command with args', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue('session-123');
+
+      await adapter.ipcRecoverSession('session-123');
+
+      expect(mockInvoke).toHaveBeenCalledWith('ipc_recover_session', {
+        sessionId: 'session-123',
+      });
+    });
+
     it('ipc_session_snapshot calls correct command with args', async () => {
       const mockInvoke = getMockInvoke();
       const mockSnapshot = {
@@ -191,6 +286,44 @@ describe('Tauri Adapter Contract', () => {
       await adapter.ipcSessionSnapshot('session-123');
 
       expect(mockInvoke).toHaveBeenCalledWith('ipc_session_snapshot', {
+        sessionId: 'session-123',
+      });
+    });
+
+    it('ipc_list_sessions calls correct command', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue([]);
+
+      await adapter.ipcListSessions();
+
+      expect(mockInvoke).toHaveBeenCalledWith('ipc_list_sessions', undefined);
+    });
+
+    it('ipc_runtime_snapshot calls correct command', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue({
+        sessions: [],
+        device_id: null,
+        is_registered: false,
+      });
+
+      await adapter.ipcRuntimeSnapshot();
+
+      expect(mockInvoke).toHaveBeenCalledWith('ipc_runtime_snapshot', undefined);
+    });
+
+    it('ipc_probe_snapshot calls correct command with args', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue({
+        session_id: 'session-123',
+        frames_received: 0,
+        frames_decoded: 0,
+        frames_dropped: 0,
+      });
+
+      await adapter.ipcProbeSnapshot('session-123');
+
+      expect(mockInvoke).toHaveBeenCalledWith('ipc_probe_snapshot', {
         sessionId: 'session-123',
       });
     });
@@ -240,6 +373,34 @@ describe('Tauri Adapter Contract', () => {
       await adapter.getHardwareInfo();
 
       expect(mockInvoke).toHaveBeenCalledWith('get_hardware_info', undefined);
+    });
+
+    it('get_system_resource_snapshot calls correct command', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue({
+        target_name: 'mrd-service',
+        target_pid: 1234,
+        target_found: true,
+        cpu_usage_percent: 12,
+        memory_used_mb: 8192,
+        memory_total_mb: 32768,
+        memory_usage_percent: 25,
+        gpu_usage_percent: 8,
+        gpu_memory_used_mb: 1024,
+        gpu_memory_total_mb: 8192,
+        gpu_metrics_available: true,
+        network_rx_bps: 1024,
+        network_tx_bps: 2048,
+        network_metrics_available: true,
+        sampled_at_ms: 1,
+      });
+
+      await adapter.getSystemResourceSnapshot();
+
+      expect(mockInvoke).toHaveBeenCalledWith(
+        'get_system_resource_snapshot',
+        undefined
+      );
     });
 
     it('nvdec_runtime_probe calls correct command', async () => {
@@ -359,6 +520,15 @@ describe('Tauri Adapter Contract', () => {
         scenarioId: 'matrix',
         config,
       });
+    });
+
+    it('test_list_window_capture_targets calls correct command', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue([]);
+
+      await adapter.testListWindowCaptureTargets();
+
+      expect(mockInvoke).toHaveBeenCalledWith('test_list_window_capture_targets', undefined);
     });
 
     it('test_get_run_metrics calls correct command with run id', async () => {

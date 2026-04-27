@@ -102,6 +102,8 @@ export interface TestConfig {
 
   // I/O
   input_source?: "screen" | "window" | "synthetic";
+  window_hwnd?: string;
+  window_title?: string;
   output_validation?: boolean;
 }
 
@@ -132,6 +134,15 @@ export interface EnvironmentSnapshot {
   available_decoders: string[];
 }
 
+export interface WindowCaptureTarget {
+  hwnd: string;
+  title: string;
+  class_name: string;
+  width: number;
+  height: number;
+  process_id: number;
+}
+
 /**
  * Test run summary
  */
@@ -156,6 +167,8 @@ export interface TestRunSummary {
 export type FailureReason =
   | "capability_mismatch"
   | "initialization_failure"
+  | "runtime_failure"
+  | "runtime_stopped"
   | "warmup_timeout"
   | "runtime_instability"
   | "threshold_breach"
@@ -293,6 +306,23 @@ export interface ShellStatusSnapshot {
   last_error: string | null;
 }
 
+export interface NativeBackdropStatus {
+  platform: string;
+  effect: string;
+  applied: boolean;
+  detail: string;
+}
+
+export interface ClientDiagnostics {
+  app_pid: number;
+  app_exe_path: string | null;
+  current_dir: string | null;
+  log_dir: string;
+  service_exe_path: string;
+  service_stdout_log: string;
+  service_stderr_log: string;
+}
+
 /**
  * IPC Device types
  */
@@ -313,7 +343,7 @@ export interface DeviceRegistrationResponse {
  */
 export interface SessionRuntimeSnapshot {
   session_id: string;
-  role: "controller" | "agent";
+  role: "controller" | "agent" | "unknown";
   state:
     | "created"
     | "listening"
@@ -338,6 +368,39 @@ export interface SessionRuntimeSnapshot {
   receiver_active: boolean;
 }
 
+export interface SessionInfo {
+  session_id: string;
+  role: "controller" | "agent" | "unknown";
+  state:
+    | "created"
+    | "listening"
+    | "connecting"
+    | "connected"
+    | "streaming"
+    | "failed"
+    | "closed";
+  transport_kind: "quic" | "webrtc" | string;
+  last_error?: string | null;
+  sender_active: boolean;
+  receiver_active: boolean;
+}
+
+export interface RuntimeSnapshot {
+  sessions: SessionRuntimeSnapshot[];
+  device_id?: string | null;
+  is_registered: boolean;
+}
+
+export interface ProbeSnapshot {
+  session_id: string;
+  frames_received: number;
+  frames_decoded: number;
+  frames_dropped: number;
+  current_fps?: number | null;
+  bitrate_mbps?: number | null;
+  last_error?: string | null;
+}
+
 /**
  * Hardware info
  */
@@ -346,6 +409,24 @@ export interface HardwareInfo {
   cpu_cores: number;
   memory_gb: number;
   gpu_info: string;
+}
+
+export interface SystemResourceSnapshot {
+  target_name: string;
+  target_pid?: number | null;
+  target_found: boolean;
+  cpu_usage_percent: number;
+  memory_used_mb: number;
+  memory_total_mb: number;
+  memory_usage_percent: number;
+  gpu_usage_percent?: number | null;
+  gpu_memory_used_mb?: number | null;
+  gpu_memory_total_mb?: number | null;
+  gpu_metrics_available: boolean;
+  network_rx_bps: number;
+  network_tx_bps: number;
+  network_metrics_available: boolean;
+  sampled_at_ms: number;
 }
 
 /**
@@ -360,7 +441,7 @@ export interface DecodePolicyResponse {
 /**
  * Test harness types - end-to-end pipeline visualization
  */
-export type TestChain = "nvenc_nvdec" | "nvenc_only" | "openh264" | "custom";
+export type TestChain = "capture_only" | "nvenc_nvdec" | "nvenc_only" | "openh264" | "custom";
 
 export interface TestChainOption {
   value: TestChain;
@@ -387,10 +468,13 @@ export interface TestMatrixConfig {
 export interface HarnessMetrics {
   is_running: boolean;
   capture_fps: number;
+  capture_latency_p50_ms: number;
+  capture_latency_p95_ms: number;
   encode_latency_p50_ms: number;
   encode_latency_p95_ms: number;
   decode_latency_p50_ms: number;
   decode_latency_p95_ms: number;
+  total_latency_p50_ms: number;
   total_latency_p95_ms: number;
   frame_count: number;
   dropped_frames: number;

@@ -1,6 +1,6 @@
 use mrd_decode::{available_decoder_descriptors, create_decoder};
-use mrd_pipeline_core::DecodedFrameData;
 use mrd_decode_nvdec::probe_h264_available;
+use mrd_pipeline_core::DecodedFrameData;
 use openh264::{
     encoder::Encoder,
     formats::{RgbSliceU8, YUVBuffer},

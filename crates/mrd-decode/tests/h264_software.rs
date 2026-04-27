@@ -1,4 +1,6 @@
-use mrd_decode::{available_decoder_descriptors, create_decoder, CodecKind, PixelFormat, RuntimeStatus};
+use mrd_decode::{
+    available_decoder_descriptors, create_decoder, CodecKind, PixelFormat, RuntimeStatus,
+};
 use mrd_pipeline_core::DecodedFrameData;
 use openh264::{
     encoder::Encoder,
@@ -46,7 +48,11 @@ fn h264_software_decoder_emits_rgb_frame_for_valid_access_unit() {
         .expect("decode access unit");
     let frames = decoder.drain_decoded_frames();
 
-    // Note: Software decoder currently doesn't emit frames in drain_decoded_frames
-    // This test will be updated when frame extraction is implemented
-    assert_eq!(frames.len(), 0);
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].width, 16);
+    assert_eq!(frames[0].height, 16);
+    match &frames[0].data {
+        DecodedFrameData::CpuRgb24(data) => assert_eq!(data.len(), 16 * 16 * 3),
+        other => panic!("expected CpuRgb24 frame, got {other:?}"),
+    }
 }

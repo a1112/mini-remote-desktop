@@ -35,9 +35,12 @@ export interface DeviceInfo {
 
 export interface SessionInfo {
   session_id: string;
-  role: SessionRole;
+  role: SessionRole | "unknown";
   state: SessionState;
-  transport_kind: TransportKind;
+  transport_kind: TransportKind | string;
+  last_error?: string | null;
+  sender_active: boolean;
+  receiver_active: boolean;
 }
 
 export interface SessionBootstrap {
@@ -48,7 +51,7 @@ export interface SessionBootstrap {
 
 export interface SessionRuntimeSnapshot {
   session_id: string;
-  role: SessionRole;
+  role: SessionRole | "unknown";
   state: SessionState;
   transport_kind: TransportKind;
   local_bootstrap?: SessionBootstrap;
@@ -60,7 +63,7 @@ export interface SessionRuntimeSnapshot {
 
 export interface RuntimeSnapshot {
   sessions: SessionRuntimeSnapshot[];
-  device_id?: string;
+  device_id?: string | null;
   is_registered: boolean;
 }
 
@@ -69,9 +72,9 @@ export interface ProbeSnapshot {
   frames_received: number;
   frames_decoded: number;
   frames_dropped: number;
-  current_fps?: number;
-  bitrate_mbps?: number;
-  last_error?: string;
+  current_fps?: number | null;
+  bitrate_mbps?: number | null;
+  last_error?: string | null;
 }
 
 /**
@@ -156,6 +159,25 @@ export const stopSession = async (sessionId: string): Promise<string> => {
   return unwrapAdapterResult(result);
 };
 
+/**
+ * Mark a session failed.
+ */
+export const failSession = async (
+  sessionId: string,
+  reason: string
+): Promise<string> => {
+  const result = await tauriAdapter.ipcFailSession(sessionId, reason);
+  return unwrapAdapterResult(result);
+};
+
+/**
+ * Recover a failed or closed session.
+ */
+export const recoverSession = async (sessionId: string): Promise<string> => {
+  const result = await tauriAdapter.ipcRecoverSession(sessionId);
+  return unwrapAdapterResult(result);
+};
+
 // ============================================================================
 // Media Commands
 // ============================================================================
@@ -191,18 +213,25 @@ export const getSessionSnapshot = async (
 };
 
 /**
+ * List session summaries.
+ */
+export const listSessions = async (): Promise<SessionInfo[]> => {
+  const result = await tauriAdapter.ipcListSessions();
+  return unwrapAdapterResult(result);
+};
+
+/**
  * Get aggregated runtime snapshot (all sessions)
- * Note: This command is not yet implemented in main.rs
  */
 export const getRuntimeSnapshot = async (): Promise<RuntimeSnapshot> => {
-  throw new Error("Runtime snapshot not yet available through IPC");
+  const result = await tauriAdapter.ipcRuntimeSnapshot();
+  return unwrapAdapterResult(result);
 };
 
 /**
  * Get probe snapshot data
- * Note: This command is not yet implemented in main.rs
  */
 export const getProbeSnapshot = async (sessionId: string): Promise<ProbeSnapshot> => {
-  void sessionId;
-  throw new Error("Probe snapshot not yet available through IPC");
+  const result = await tauriAdapter.ipcProbeSnapshot(sessionId);
+  return unwrapAdapterResult(result);
 };
