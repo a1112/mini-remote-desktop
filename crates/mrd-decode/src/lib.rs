@@ -103,18 +103,6 @@ impl VideoDecoder for H264SoftwareDecoder {
     }
 
     fn drain_decoded_frames(&mut self) -> Vec<CoreDecodedFrame> {
-        let flushed_frames = self
-            .decoder
-            .flush_remaining()
-            .map(|frames| {
-                frames
-                    .into_iter()
-                    .map(|decoded| decoded_yuv_to_rgb_frame(&decoded, 0))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        self.decoded_frames.extend(flushed_frames);
-
         std::mem::take(&mut self.decoded_frames)
     }
 }
