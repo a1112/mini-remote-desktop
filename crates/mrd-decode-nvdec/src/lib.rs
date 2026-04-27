@@ -12,7 +12,8 @@ pub enum NvdecDecodedFrameData {
     /// D3D11 shared texture handle (zero-copy path)
     #[cfg(windows)]
     D3D11SharedNv12 {
-        shared_handle: isize,
+        shared_handle_y: isize,
+        shared_handle_uv: isize,
         width: u32,
         height: u32,
     },
@@ -78,7 +79,22 @@ impl NvdecDecodedFrame {
     pub fn d3d11_shared_handle(&self) -> Option<isize> {
         match &self.data {
             NvdecDecodedFrameData::CpuRgb24(_) | NvdecDecodedFrameData::CpuNv12 { .. } => None,
-            NvdecDecodedFrameData::D3D11SharedNv12 { shared_handle, .. } => Some(*shared_handle),
+            NvdecDecodedFrameData::D3D11SharedNv12 {
+                shared_handle_y, ..
+            } => Some(*shared_handle_y),
+        }
+    }
+
+    /// Get the shared Y and UV texture handles if available.
+    #[cfg(windows)]
+    pub fn d3d11_shared_handles(&self) -> Option<(isize, isize)> {
+        match &self.data {
+            NvdecDecodedFrameData::CpuRgb24(_) | NvdecDecodedFrameData::CpuNv12 { .. } => None,
+            NvdecDecodedFrameData::D3D11SharedNv12 {
+                shared_handle_y,
+                shared_handle_uv,
+                ..
+            } => Some((*shared_handle_y, *shared_handle_uv)),
         }
     }
 }
@@ -448,16 +464,14 @@ mod imp {
         unsafe extern "system" fn(c_int, *mut c_void, CUcontext) -> CUresult;
     type CuGraphicsResourceGetMappedPointerFn =
         unsafe extern "system" fn(*mut CUdeviceptr, *mut usize, *mut c_void) -> CUresult;
-    type CuMemcpyDtoHAsyncFn =
-        unsafe extern "system" fn(*mut c_void, CUdeviceptr, usize, CUcontext) -> CUresult;
     type CuMemcpyDtoDAsyncFn =
         unsafe extern "system" fn(CUdeviceptr, CUdeviceptr, usize, CUcontext) -> CUresult;
 
     // CUDA graphics register flags for D3D11
     const CU_GRAPHICS_REGISTER_FLAGS_NONE: u32 = 0x00;
-    const CU_GRAPHICS_REGISTER_FLAGS_SURFACE_LDST: u32 = 0x02;
 
     // D3D11 shared texture for CUDA-D3D11 interop
+    #[allow(dead_code)]
     struct D3D11SharedTexture {
         device: ID3D11Device,
         context: ID3D11DeviceContext,
@@ -567,18 +581,14 @@ mod imp {
 
         /// Get raw pointer to Y texture for CUDA-D3D11 interop
         fn y_texture_ptr(&self) -> *mut c_void {
-            unsafe {
-                let com_ptr: *const ID3D11Texture2D = &self.y_texture;
-                com_ptr as *const c_void as *mut c_void
-            }
+            let com_ptr: *const ID3D11Texture2D = &self.y_texture;
+            com_ptr as *const c_void as *mut c_void
         }
 
         /// Get raw pointer to UV texture for CUDA-D3D11 interop
         fn uv_texture_ptr(&self) -> *mut c_void {
-            unsafe {
-                let com_ptr: *const ID3D11Texture2D = &self.uv_texture;
-                com_ptr as *const c_void as *mut c_void
-            }
+            let com_ptr: *const ID3D11Texture2D = &self.uv_texture;
+            com_ptr as *const c_void as *mut c_void
         }
     }
 
@@ -1157,6 +1167,7 @@ mod imp {
         }
 
         /// Enable or disable D3D11 shared texture output
+        #[allow(dead_code)]
         pub fn enable_shared_texture(&mut self, enable: bool) {
             self.enable_shared_texture = enable;
             self.callback_state.use_shared_texture = enable;
@@ -1414,7 +1425,7 @@ mod imp {
             d3d11_uv_texture: *mut c_void,
             cuda_src_ptr: CUdeviceptr,
             y_pitch: u32,
-            width: usize,
+            _width: usize,
             height: usize,
         ) -> bool {
             // Check if all required CUDA-D3D11 interop functions are available
@@ -1872,12 +1883,15 @@ mod imp {
         // Output based on copy result
         if gpu_copy_success {
             // GPU zero-copy succeeded - output shared texture frame
-            if let Some(shared_y) = state.shared_texture_y {
+            if let (Some(shared_y), Some(shared_uv)) =
+                (state.shared_texture_y, state.shared_texture_uv)
+            {
                 state.frames.push(NvdecDecodedFrame {
                     width,
                     height,
                     data: NvdecDecodedFrameData::D3D11SharedNv12 {
-                        shared_handle: shared_y,
+                        shared_handle_y: shared_y,
+                        shared_handle_uv: shared_uv,
                         width: width as u32,
                         height: height as u32,
                     },
@@ -1909,26 +1923,7 @@ mod imp {
                 return 0;
             }
 
-            // Check if shared texture mode is enabled
-            if state.use_shared_texture {
-                if let (Some(shared_y), Some(_shared_uv)) =
-                    (state.shared_texture_y, state.shared_texture_uv)
-                {
-                    state.frames.push(NvdecDecodedFrame {
-                        width,
-                        height,
-                        data: NvdecDecodedFrameData::D3D11SharedNv12 {
-                            shared_handle: shared_y,
-                            width: width as u32,
-                            height: height as u32,
-                        },
-                    });
-                } else {
-                    push_cpu_decoded_frame(state, width, height, pitch as usize, nv12);
-                }
-            } else {
-                push_cpu_decoded_frame(state, width, height, pitch as usize, nv12);
-            }
+            push_cpu_decoded_frame(state, width, height, pitch as usize, nv12);
         }
 
         let unmap_result = unsafe { (state.cuvid_unmap_video_frame)(state.decoder, dev_ptr) };

@@ -89,6 +89,7 @@ export interface TestConfig {
   decoder_type?: "none" | "nvdec" | "software";
   renderer_type?: "d3d11";
   render_display?: boolean;
+  zero_copy?: boolean;
   transport_kind?: "loopback" | "quic" | "webrtc";
 
   // Parameters
@@ -465,6 +466,7 @@ export interface TestMatrixConfig {
   decoder: DecoderType;
   transport?: "loopback" | "quic" | "webrtc";
   renderer?: "none" | "d3d11";
+  zero_copy?: boolean;
   resolution?: [number, number];
   fps?: number;
   bitrate?: number;

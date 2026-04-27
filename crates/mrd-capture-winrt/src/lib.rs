@@ -434,13 +434,13 @@ impl WinrtCapture {
         }
         let data = copy_result?;
 
-        Ok(CapturedFrame {
+        Ok(CapturedFrame::from_cpu(
             width,
             height,
-            pixel_format: FramePixelFormat::Bgra32,
-            timestamp_us: now_us(),
+            FramePixelFormat::Bgra32,
+            now_us(),
             data,
-        })
+        ))
     }
 
     /// Check if capture is available

@@ -7,13 +7,13 @@ struct DummyCapture;
 
 impl FrameCapture for DummyCapture {
     fn capture_frame(&mut self) -> Result<CapturedFrame, PipelineError> {
-        Ok(CapturedFrame {
-            width: 2,
-            height: 2,
-            pixel_format: FramePixelFormat::Bgra32,
-            timestamp_us: 42,
-            data: vec![0; 16],
-        })
+        Ok(CapturedFrame::from_cpu(
+            2,
+            2,
+            FramePixelFormat::Bgra32,
+            42,
+            vec![0; 16],
+        ))
     }
 }
 

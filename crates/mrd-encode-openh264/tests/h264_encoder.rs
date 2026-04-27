@@ -4,13 +4,13 @@ use mrd_pipeline_core::{CapturedFrame, FramePixelFormat, VideoCodec, VideoEncode
 #[test]
 fn openh264_encoder_emits_h264_access_unit_for_bgra_frame() {
     let mut encoder = OpenH264Encoder::new(16, 16, 30).expect("create encoder");
-    let frame = CapturedFrame {
-        width: 16,
-        height: 16,
-        pixel_format: FramePixelFormat::Bgra32,
-        timestamp_us: 1234,
-        data: vec![127; 16 * 16 * 4],
-    };
+    let frame = CapturedFrame::from_cpu(
+        16,
+        16,
+        FramePixelFormat::Bgra32,
+        1234,
+        vec![127; 16 * 16 * 4],
+    );
 
     let access_units = encoder.encode(&frame).expect("encode frame");
 

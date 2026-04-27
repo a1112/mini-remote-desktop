@@ -16,13 +16,13 @@ fn perf_nvenc_encode_reports_latency_distribution() {
     let width = env_u32("MRD_COMPONENT_WIDTH").unwrap_or(1280);
     let height = env_u32("MRD_COMPONENT_HEIGHT").unwrap_or(720);
     let fps = env_u32("MRD_COMPONENT_FPS").unwrap_or(30);
-    let frame = CapturedFrame {
-        width: width as usize,
-        height: height as usize,
-        pixel_format: FramePixelFormat::Bgra32,
-        timestamp_us: 0,
-        data: synthetic_frame_bytes(width as usize, height as usize),
-    };
+    let frame = CapturedFrame::from_cpu(
+        width as usize,
+        height as usize,
+        FramePixelFormat::Bgra32,
+        0,
+        synthetic_frame_bytes(width as usize, height as usize),
+    );
 
     let started_at = Instant::now();
     let Ok(mut encoder) = new_encoder_for_backend(

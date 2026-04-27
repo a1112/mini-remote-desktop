@@ -2,10 +2,10 @@
 //!
 //! Tests performance at different resolutions and refresh rates.
 
-use std::time::{Duration, Instant};
+use mrd_capture_winrt::WinrtCapture;
 use mrd_encode_nvenc::NvencH264Encoder;
 use mrd_pipeline_core::{CapturedFrame, FramePixelFormat, VideoEncoder};
-use mrd_capture_winrt::WinrtCapture;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy)]
 enum EncoderMode {
@@ -39,8 +39,14 @@ fn main() {
     // Get capture info
     match mrd_capture_winrt::get_capture_info() {
         Ok(info) => {
-            println!("Monitor capture supported: {}", info.monitor_capture_supported);
-            println!("Window capture supported: {}", info.window_capture_supported);
+            println!(
+                "Monitor capture supported: {}",
+                info.monitor_capture_supported
+            );
+            println!(
+                "Window capture supported: {}",
+                info.window_capture_supported
+            );
         }
         Err(e) => println!("Failed to get capture info: {:?}", e),
     }
@@ -54,8 +60,10 @@ fn main() {
             print!("  @ {}Hz: ", fps);
 
             // Test with both encoder modes
-            let ull_result = test_encoding_at_resolution(width, height, fps, 30, EncoderMode::UltraLowLatency);
-            let hrr_result = test_encoding_at_resolution(width, height, fps, 30, EncoderMode::HighRefreshRate);
+            let ull_result =
+                test_encoding_at_resolution(width, height, fps, 30, EncoderMode::UltraLowLatency);
+            let hrr_result =
+                test_encoding_at_resolution(width, height, fps, 30, EncoderMode::HighRefreshRate);
 
             match (ull_result, hrr_result) {
                 (Ok(ull_stats), Ok(hrr_stats)) => {
@@ -66,7 +74,8 @@ fn main() {
                     } else {
                         -((hrr_p95 - ull_p95) as f64 / hrr_p95 as f64) * 100.0
                     };
-                    println!("ULL P50={:.2}ms/P95={:.2}ms | HRR P50={:.2}ms/P95={:.2}ms [Δ={:.1}%]",
+                    println!(
+                        "ULL P50={:.2}ms/P95={:.2}ms | HRR P50={:.2}ms/P95={:.2}ms [Δ={:.1}%]",
                         ull_stats.encode_p50.as_secs_f64() * 1000.0,
                         ull_stats.encode_p95.as_secs_f64() * 1000.0,
                         hrr_stats.encode_p50.as_secs_f64() * 1000.0,
@@ -75,7 +84,8 @@ fn main() {
                     );
                 }
                 (Ok(ull_stats), Err(_)) => {
-                    println!("ULL P50={:.2}ms, P95={:.2}ms | HRR N/A",
+                    println!(
+                        "ULL P50={:.2}ms, P95={:.2}ms | HRR N/A",
                         ull_stats.encode_p50.as_secs_f64() * 1000.0,
                         ull_stats.encode_p95.as_secs_f64() * 1000.0
                     );
@@ -112,13 +122,28 @@ fn test_2k_144hz_detailed() {
 
     // Ultra Low Latency mode
     print!("  ULL Mode: ");
-    match test_encoding_at_resolution(WIDTH, HEIGHT, FPS, FRAME_COUNT, EncoderMode::UltraLowLatency) {
+    match test_encoding_at_resolution(
+        WIDTH,
+        HEIGHT,
+        FPS,
+        FRAME_COUNT,
+        EncoderMode::UltraLowLatency,
+    ) {
         Ok(stats) => {
             let p50_ms = stats.encode_p50.as_secs_f64() * 1000.0;
             let p95_ms = stats.encode_p95.as_secs_f64() * 1000.0;
-            let p50_status = if p50_ms <= frame_budget_ms { "✓" } else { "⚠" };
-            let p95_status = if p95_ms <= frame_budget_ms { "✓" } else { "⚠" };
-            println!("P50={} {:.2}ms, P95={} {:.2}ms (Budget: {:.2}ms)",
+            let p50_status = if p50_ms <= frame_budget_ms {
+                "✓"
+            } else {
+                "⚠"
+            };
+            let p95_status = if p95_ms <= frame_budget_ms {
+                "✓"
+            } else {
+                "⚠"
+            };
+            println!(
+                "P50={} {:.2}ms, P95={} {:.2}ms (Budget: {:.2}ms)",
                 p50_status, p50_ms, p95_status, p95_ms, frame_budget_ms
             );
         }
@@ -127,13 +152,28 @@ fn test_2k_144hz_detailed() {
 
     // High Refresh Rate mode
     print!("  HRR Mode: ");
-    match test_encoding_at_resolution(WIDTH, HEIGHT, FPS, FRAME_COUNT, EncoderMode::HighRefreshRate) {
+    match test_encoding_at_resolution(
+        WIDTH,
+        HEIGHT,
+        FPS,
+        FRAME_COUNT,
+        EncoderMode::HighRefreshRate,
+    ) {
         Ok(stats) => {
             let p50_ms = stats.encode_p50.as_secs_f64() * 1000.0;
             let p95_ms = stats.encode_p95.as_secs_f64() * 1000.0;
-            let p50_status = if p50_ms <= frame_budget_ms { "✓" } else { "⚠" };
-            let p95_status = if p95_ms <= frame_budget_ms { "✓" } else { "⚠" };
-            println!("P50={} {:.2}ms, P95={} {:.2}ms (Budget: {:.2}ms)",
+            let p50_status = if p50_ms <= frame_budget_ms {
+                "✓"
+            } else {
+                "⚠"
+            };
+            let p95_status = if p95_ms <= frame_budget_ms {
+                "✓"
+            } else {
+                "⚠"
+            };
+            println!(
+                "P50={} {:.2}ms, P95={} {:.2}ms (Budget: {:.2}ms)",
                 p50_status, p50_ms, p95_status, p95_ms, frame_budget_ms
             );
         }
@@ -142,13 +182,28 @@ fn test_2k_144hz_detailed() {
 
     // Extreme Low Latency mode
     print!("  ELL Mode: ");
-    match test_encoding_at_resolution(WIDTH, HEIGHT, FPS, FRAME_COUNT, EncoderMode::ExtremeLowLatency) {
+    match test_encoding_at_resolution(
+        WIDTH,
+        HEIGHT,
+        FPS,
+        FRAME_COUNT,
+        EncoderMode::ExtremeLowLatency,
+    ) {
         Ok(stats) => {
             let p50_ms = stats.encode_p50.as_secs_f64() * 1000.0;
             let p95_ms = stats.encode_p95.as_secs_f64() * 1000.0;
-            let p50_status = if p50_ms <= frame_budget_ms { "✓" } else { "⚠" };
-            let p95_status = if p95_ms <= frame_budget_ms { "✓" } else { "⚠" };
-            println!("P50={} {:.2}ms, P95={} {:.2}ms (Budget: {:.2}ms)",
+            let p50_status = if p50_ms <= frame_budget_ms {
+                "✓"
+            } else {
+                "⚠"
+            };
+            let p95_status = if p95_ms <= frame_budget_ms {
+                "✓"
+            } else {
+                "⚠"
+            };
+            println!(
+                "P50={} {:.2}ms, P95={} {:.2}ms (Budget: {:.2}ms)",
                 p50_status, p50_ms, p95_status, p95_ms, frame_budget_ms
             );
         }
@@ -161,9 +216,18 @@ fn test_2k_144hz_detailed() {
         Ok(stats) => {
             let p50_ms = stats.encode_p50.as_secs_f64() * 1000.0;
             let p95_ms = stats.encode_p95.as_secs_f64() * 1000.0;
-            let p50_status = if p50_ms <= frame_budget_ms { "✓" } else { "⚠" };
-            let p95_status = if p95_ms <= frame_budget_ms { "✓" } else { "⚠" };
-            println!("P50={} {:.2}ms, P95={} {:.2}ms (Budget: {:.2}ms)",
+            let p50_status = if p50_ms <= frame_budget_ms {
+                "✓"
+            } else {
+                "⚠"
+            };
+            let p95_status = if p95_ms <= frame_budget_ms {
+                "✓"
+            } else {
+                "⚠"
+            };
+            println!(
+                "P50={} {:.2}ms, P95={} {:.2}ms (Budget: {:.2}ms)",
                 p50_status, p50_ms, p95_status, p95_ms, frame_budget_ms
             );
         }
@@ -194,21 +258,19 @@ fn test_encoding_at_resolution(
         EncoderMode::ExtremeLowLatency => {
             NvencH264Encoder::new_extreme_low_latency(width, height, fps)?
         }
-        EncoderMode::MaxSpeed => {
-            NvencH264Encoder::new_max_speed(width, height, fps)?
-        }
+        EncoderMode::MaxSpeed => NvencH264Encoder::new_max_speed(width, height, fps)?,
     };
 
     let mut encode_latencies = Vec::with_capacity(frame_count);
 
     for frame_idx in 0..frame_count {
-        let frame = CapturedFrame {
+        let frame = CapturedFrame::from_cpu(
             width,
             height,
-            pixel_format: FramePixelFormat::Bgra32,
-            timestamp_us: frame_idx as u64 * (1_000_000 / fps as u64),
-            data: synthetic_frame_bytes(width, height, frame_idx as u8),
-        };
+            FramePixelFormat::Bgra32,
+            frame_idx as u64 * (1_000_000 / fps as u64),
+            synthetic_frame_bytes(width, height, frame_idx as u8),
+        );
 
         let encode_start = Instant::now();
         encoder.encode(&frame)?;
@@ -262,11 +324,13 @@ mod tests {
     #[test]
     #[ignore]
     fn test_2k_144hz() {
-        let result = test_encoding_at_resolution(2560, 1440, 144, 120, EncoderMode::HighRefreshRate);
+        let result =
+            test_encoding_at_resolution(2560, 1440, 144, 120, EncoderMode::HighRefreshRate);
         assert!(result.is_ok(), "2K@144Hz encoding failed");
 
         if let Ok(stats) = result {
-            println!("2K@144Hz - P50: {:.2}ms, P95: {:.2}ms",
+            println!(
+                "2K@144Hz - P50: {:.2}ms, P95: {:.2}ms",
                 stats.encode_p50.as_secs_f64() * 1000.0,
                 stats.encode_p95.as_secs_f64() * 1000.0
             );
@@ -285,14 +349,29 @@ mod tests {
     fn test_2k_144hz_comparison() {
         println!("\n--- 2K 144Hz Mode Comparison ---");
 
-        let ull_result = test_encoding_at_resolution(2560, 1440, 144, 120, EncoderMode::UltraLowLatency);
-        let hrr_result = test_encoding_at_resolution(2560, 1440, 144, 120, EncoderMode::HighRefreshRate);
+        let ull_result =
+            test_encoding_at_resolution(2560, 1440, 144, 120, EncoderMode::UltraLowLatency);
+        let hrr_result =
+            test_encoding_at_resolution(2560, 1440, 144, 120, EncoderMode::HighRefreshRate);
 
         match (ull_result, hrr_result) {
             (Ok(ull), Ok(hrr)) => {
-                println!("ULL: P50={:.2}ms, P95={:.2}ms", ull.encode_p50.as_secs_f64() * 1000.0, ull.encode_p95.as_secs_f64() * 1000.0);
-                println!("HRR: P50={:.2}ms, P95={:.2}ms", hrr.encode_p50.as_secs_f64() * 1000.0, hrr.encode_p95.as_secs_f64() * 1000.0);
-                println!("Improvement: {:.1}%", ((ull.encode_p95.as_nanos() - hrr.encode_p95.as_nanos()) as f64 / ull.encode_p95.as_nanos() as f64) * 100.0);
+                println!(
+                    "ULL: P50={:.2}ms, P95={:.2}ms",
+                    ull.encode_p50.as_secs_f64() * 1000.0,
+                    ull.encode_p95.as_secs_f64() * 1000.0
+                );
+                println!(
+                    "HRR: P50={:.2}ms, P95={:.2}ms",
+                    hrr.encode_p50.as_secs_f64() * 1000.0,
+                    hrr.encode_p95.as_secs_f64() * 1000.0
+                );
+                println!(
+                    "Improvement: {:.1}%",
+                    ((ull.encode_p95.as_nanos() - hrr.encode_p95.as_nanos()) as f64
+                        / ull.encode_p95.as_nanos() as f64)
+                        * 100.0
+                );
             }
             _ => {}
         }

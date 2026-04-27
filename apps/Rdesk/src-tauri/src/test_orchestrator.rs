@@ -84,6 +84,7 @@ pub struct TestConfigData {
     pub decoder_type: Option<String>,
     pub renderer_type: Option<String>,
     pub render_display: Option<bool>,
+    pub zero_copy: Option<bool>,
     pub transport_kind: Option<String>,
     pub resolution: Option<[usize; 2]>,
     pub fps: Option<u32>,
@@ -1205,13 +1206,13 @@ impl TestOrchestrator {
             data.extend_from_slice(&frame.data[start..start + target_stride]);
         }
 
-        Ok(CapturedFrame {
+        Ok(CapturedFrame::from_cpu(
             width,
             height,
-            pixel_format: frame.pixel_format,
-            timestamp_us: frame.timestamp_us,
+            frame.pixel_format,
+            frame.timestamp_us,
             data,
-        })
+        ))
     }
 
     fn decoded_frame_format(frame: &DecodedFrame) -> String {
@@ -1238,9 +1239,16 @@ impl TestOrchestrator {
                 Self::cpu_nv12_to_rgb24(data, frame.width, frame.height, *pitch),
             ),
             #[cfg(windows)]
-            DecodedFrameData::D3D11SharedNv12 { shared_handle, .. } => {
-                RenderFrame::from_d3d11_shared_nv12(frame.width, frame.height, *shared_handle)
-            }
+            DecodedFrameData::D3D11SharedNv12 {
+                shared_handle_y,
+                shared_handle_uv,
+                ..
+            } => RenderFrame::from_d3d11_shared_nv12(
+                frame.width,
+                frame.height,
+                *shared_handle_y,
+                *shared_handle_uv,
+            ),
         }
     }
 
@@ -1615,6 +1623,7 @@ fn harness_config_from_data(config: &TestConfigData) -> HarnessConfig {
             (Some(true), Some("d3d11")) => Some(RendererType::D3d11),
             _ => None,
         },
+        zero_copy: config.zero_copy,
         transport: match config.transport_kind.as_deref() {
             Some("webrtc") | Some("webrtc_rtp") => Some(TransportKind::WebrtcRtp),
             Some("quic") | Some("quic_datagram") => Some(TransportKind::QuicDatagram),
@@ -1854,6 +1863,27 @@ mod tests {
         assert_eq!(
             harness_config_from_data(&enabled_config).renderer,
             Some(RendererType::D3d11)
+        );
+    }
+
+    #[test]
+    fn harness_config_passes_zero_copy_flag() {
+        let enabled_config = TestConfigData {
+            zero_copy: Some(true),
+            ..Default::default()
+        };
+        let disabled_config = TestConfigData {
+            zero_copy: Some(false),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            harness_config_from_data(&enabled_config).zero_copy,
+            Some(true)
+        );
+        assert_eq!(
+            harness_config_from_data(&disabled_config).zero_copy,
+            Some(false)
         );
     }
 

@@ -850,13 +850,13 @@ impl FrameCapture for BenchmarkCapture {
             chunk[2] = 192;
             chunk[3] = 255;
         }
-        Ok(CapturedFrame {
-            width: self.width,
-            height: self.height,
-            pixel_format: FramePixelFormat::Bgra32,
-            timestamp_us: self.tick as u64 * 33_000,
+        Ok(CapturedFrame::from_cpu(
+            self.width,
+            self.height,
+            FramePixelFormat::Bgra32,
+            self.tick as u64 * 33_000,
             data,
-        })
+        ))
     }
 }
 

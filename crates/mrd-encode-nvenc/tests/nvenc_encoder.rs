@@ -7,13 +7,13 @@ fn nvenc_encoder_is_probeable_or_emits_h264_access_unit() {
         return;
     };
 
-    let frame = CapturedFrame {
-        width: 16,
-        height: 16,
-        pixel_format: FramePixelFormat::Bgra32,
-        timestamp_us: 33_000,
-        data: vec![0x7f; 16 * 16 * 4],
-    };
+    let frame = CapturedFrame::from_cpu(
+        16,
+        16,
+        FramePixelFormat::Bgra32,
+        33_000,
+        vec![0x7f; 16 * 16 * 4],
+    );
     let access_units = encoder.encode(&frame).expect("nvenc encode frame");
 
     assert!(!access_units.is_empty());
@@ -27,13 +27,13 @@ fn nvenc_h264_access_unit_uses_high_profile() {
         return;
     };
 
-    let frame = CapturedFrame {
-        width: 1280,
-        height: 720,
-        pixel_format: FramePixelFormat::Bgra32,
-        timestamp_us: 33_000,
-        data: vec![0x55; 1280 * 720 * 4],
-    };
+    let frame = CapturedFrame::from_cpu(
+        1280,
+        720,
+        FramePixelFormat::Bgra32,
+        33_000,
+        vec![0x55; 1280 * 720 * 4],
+    );
     let access_unit = encoder
         .encode(&frame)
         .expect("nvenc encode frame")
@@ -54,13 +54,13 @@ fn nvenc_h264_access_unit_can_use_baseline_profile() {
         return;
     };
 
-    let frame = CapturedFrame {
-        width: 1280,
-        height: 720,
-        pixel_format: FramePixelFormat::Bgra32,
-        timestamp_us: 33_000,
-        data: vec![0x33; 1280 * 720 * 4],
-    };
+    let frame = CapturedFrame::from_cpu(
+        1280,
+        720,
+        FramePixelFormat::Bgra32,
+        33_000,
+        vec![0x33; 1280 * 720 * 4],
+    );
     let access_unit = encoder
         .encode(&frame)
         .expect("nvenc encode baseline frame")

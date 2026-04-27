@@ -25,7 +25,64 @@ struct RenderSurface {
     swap_chain: windows::Win32::Graphics::Dxgi::IDXGISwapChain1,
     back_buffer: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
     render_target_view: windows::Win32::Graphics::Direct3D11::ID3D11RenderTargetView,
+    width: u32,
+    height: u32,
 }
+
+#[cfg(windows)]
+struct SharedNv12Pipeline {
+    vertex_shader: windows::Win32::Graphics::Direct3D11::ID3D11VertexShader,
+    pixel_shader: windows::Win32::Graphics::Direct3D11::ID3D11PixelShader,
+    sampler: windows::Win32::Graphics::Direct3D11::ID3D11SamplerState,
+}
+
+#[cfg(windows)]
+const SHARED_NV12_VERTEX_SHADER: &str = r#"
+struct VsOut {
+    float4 position : SV_POSITION;
+    float2 uv : TEXCOORD0;
+};
+
+VsOut main(uint vertex_id : SV_VertexID) {
+    float2 positions[3] = {
+        float2(-1.0, -1.0),
+        float2(-1.0,  3.0),
+        float2( 3.0, -1.0)
+    };
+    float2 uvs[3] = {
+        float2(0.0, 1.0),
+        float2(0.0, -1.0),
+        float2(2.0, 1.0)
+    };
+
+    VsOut output;
+    output.position = float4(positions[vertex_id], 0.0, 1.0);
+    output.uv = uvs[vertex_id];
+    return output;
+}
+"#;
+
+#[cfg(windows)]
+const SHARED_NV12_PIXEL_SHADER: &str = r#"
+Texture2D y_texture : register(t0);
+Texture2D uv_texture : register(t1);
+SamplerState linear_sampler : register(s0);
+
+struct PsIn {
+    float4 position : SV_POSITION;
+    float2 uv : TEXCOORD0;
+};
+
+float4 main(PsIn input) : SV_TARGET {
+    float y = y_texture.Sample(linear_sampler, input.uv).r;
+    float2 uv = uv_texture.Sample(linear_sampler, input.uv).rg - float2(0.5, 0.5);
+
+    float r = y + 1.5748 * uv.y;
+    float g = y - 0.1873 * uv.x - 0.4681 * uv.y;
+    float b = y + 1.8556 * uv.x;
+    return float4(saturate(float3(r, g, b)), 1.0);
+}
+"#;
 
 pub struct D3d11Renderer {
     #[cfg(windows)]
@@ -34,6 +91,8 @@ pub struct D3d11Renderer {
     context: windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
     #[cfg(windows)]
     surface: Option<RenderSurface>,
+    #[cfg(windows)]
+    shared_nv12_pipeline: Option<SharedNv12Pipeline>,
     attached_to_target: bool,
     uploaded_frame_count: u64,
     last_width: usize,
@@ -77,6 +136,7 @@ impl D3d11Renderer {
                 device,
                 context,
                 surface: None,
+                shared_nv12_pipeline: None,
                 attached_to_target: false,
                 uploaded_frame_count: 0,
                 last_width: 0,
@@ -171,6 +231,8 @@ impl D3d11Renderer {
             swap_chain,
             back_buffer,
             render_target_view,
+            width,
+            height,
         }))
     }
 
@@ -344,25 +406,182 @@ impl D3d11Renderer {
     }
 
     #[cfg(windows)]
-    fn present_shared_texture_frame(&self, frame: &RenderFrame) -> Result<(), RenderError> {
+    fn compile_shader(source: &str, target: &'static [u8]) -> Result<Vec<u8>, RenderError> {
+        use windows::core::PCSTR;
+        use windows::Win32::Graphics::Direct3D::{Fxc::D3DCompile, ID3DBlob, ID3DInclude};
+
+        let mut code = None::<ID3DBlob>;
+        let mut errors = None::<ID3DBlob>;
+        let result = unsafe {
+            D3DCompile(
+                source.as_ptr() as *const core::ffi::c_void,
+                source.len(),
+                PCSTR::null(),
+                None,
+                None::<&ID3DInclude>,
+                PCSTR(b"main\0".as_ptr()),
+                PCSTR(target.as_ptr()),
+                0,
+                0,
+                &mut code,
+                Some(&mut errors),
+            )
+        };
+
+        if let Err(error) = result {
+            let details = errors
+                .as_ref()
+                .map(|blob| unsafe {
+                    let bytes = core::slice::from_raw_parts(
+                        blob.GetBufferPointer() as *const u8,
+                        blob.GetBufferSize(),
+                    );
+                    String::from_utf8_lossy(bytes).trim().to_string()
+                })
+                .filter(|message| !message.is_empty())
+                .unwrap_or_else(|| error.to_string());
+            return Err(RenderError::Message(format!(
+                "compile D3D11 shared NV12 shader failed: {details}"
+            )));
+        }
+
+        let code = code.ok_or_else(|| RenderError::Message("missing shader bytecode".into()))?;
+        let bytes = unsafe {
+            core::slice::from_raw_parts(code.GetBufferPointer() as *const u8, code.GetBufferSize())
+        };
+        Ok(bytes.to_vec())
+    }
+
+    #[cfg(windows)]
+    fn create_shared_nv12_pipeline(&self) -> Result<SharedNv12Pipeline, RenderError> {
+        use windows::Win32::Graphics::Direct3D11::{
+            ID3D11ClassLinkage, ID3D11PixelShader, ID3D11SamplerState, ID3D11VertexShader,
+            D3D11_COMPARISON_NEVER, D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_SAMPLER_DESC,
+            D3D11_TEXTURE_ADDRESS_CLAMP,
+        };
+
+        let vertex_code = Self::compile_shader(SHARED_NV12_VERTEX_SHADER, b"vs_5_0\0")?;
+        let pixel_code = Self::compile_shader(SHARED_NV12_PIXEL_SHADER, b"ps_5_0\0")?;
+
+        let mut vertex_shader = None::<ID3D11VertexShader>;
+        let mut pixel_shader = None::<ID3D11PixelShader>;
+        unsafe {
+            self.device
+                .CreateVertexShader(
+                    &vertex_code,
+                    None::<&ID3D11ClassLinkage>,
+                    Some(&mut vertex_shader),
+                )
+                .map_err(|error| {
+                    RenderError::Message(format!(
+                        "create shared NV12 vertex shader failed: {error}"
+                    ))
+                })?;
+            self.device
+                .CreatePixelShader(
+                    &pixel_code,
+                    None::<&ID3D11ClassLinkage>,
+                    Some(&mut pixel_shader),
+                )
+                .map_err(|error| {
+                    RenderError::Message(format!("create shared NV12 pixel shader failed: {error}"))
+                })?;
+        }
+
+        let sampler_desc = D3D11_SAMPLER_DESC {
+            Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+            AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+            AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+            AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+            MipLODBias: 0.0,
+            MaxAnisotropy: 1,
+            ComparisonFunc: D3D11_COMPARISON_NEVER,
+            BorderColor: [0.0, 0.0, 0.0, 0.0],
+            MinLOD: 0.0,
+            MaxLOD: f32::MAX,
+        };
+        let mut sampler = None::<ID3D11SamplerState>;
+        unsafe {
+            self.device
+                .CreateSamplerState(&sampler_desc, Some(&mut sampler))
+                .map_err(|error| {
+                    RenderError::Message(format!("create shared NV12 sampler failed: {error}"))
+                })?;
+        }
+
+        Ok(SharedNv12Pipeline {
+            vertex_shader: vertex_shader
+                .ok_or_else(|| RenderError::Message("missing vertex shader".into()))?,
+            pixel_shader: pixel_shader
+                .ok_or_else(|| RenderError::Message("missing pixel shader".into()))?,
+            sampler: sampler.ok_or_else(|| RenderError::Message("missing sampler".into()))?,
+        })
+    }
+
+    #[cfg(windows)]
+    fn ensure_shared_nv12_pipeline(&mut self) -> Result<&SharedNv12Pipeline, RenderError> {
+        if self.shared_nv12_pipeline.is_none() {
+            self.shared_nv12_pipeline = Some(self.create_shared_nv12_pipeline()?);
+        }
+        Ok(self.shared_nv12_pipeline.as_ref().unwrap())
+    }
+
+    #[cfg(windows)]
+    fn open_shared_texture_srv(
+        &self,
+        shared_handle: isize,
+    ) -> Result<windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView, RenderError> {
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::Graphics::Direct3D11::{
+            ID3D11Resource, ID3D11ShaderResourceView, ID3D11Texture2D,
+        };
+
+        if shared_handle == 0 {
+            return Err(RenderError::Message("shared texture handle is zero".into()));
+        }
+
+        let mut texture = None::<ID3D11Texture2D>;
+        unsafe {
+            self.device
+                .OpenSharedResource(HANDLE(shared_handle), &mut texture)
+                .map_err(|error| {
+                    RenderError::Message(format!("open shared D3D11 texture failed: {error}"))
+                })?;
+        }
+        let texture =
+            texture.ok_or_else(|| RenderError::Message("missing shared texture".into()))?;
+        let resource: ID3D11Resource = texture.cast().map_err(|error| {
+            RenderError::Message(format!("cast shared texture to resource failed: {error}"))
+        })?;
+
+        let mut srv = None::<ID3D11ShaderResourceView>;
+        unsafe {
+            self.device
+                .CreateShaderResourceView(&resource, None, Some(&mut srv))
+                .map_err(|error| {
+                    RenderError::Message(format!("create shared texture SRV failed: {error}"))
+                })?;
+        }
+        srv.ok_or_else(|| RenderError::Message("missing shared texture SRV".into()))
+    }
+
+    #[cfg(windows)]
+    fn present_shared_texture_frame(&mut self, frame: &RenderFrame) -> Result<(), RenderError> {
         use mrd_render::RenderFrameData;
+        use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+        use windows::Win32::Graphics::Direct3D11::{ID3D11ShaderResourceView, D3D11_VIEWPORT};
 
         let Some(surface) = self.surface.as_ref() else {
             return Ok(());
         };
 
-        let _shared_handle = match &frame.data {
+        let (shared_handle_y, shared_handle_uv) = match &frame.data {
             RenderFrameData::D3D11SharedNv12 {
-                shared_handle,
-                width,
-                height,
-            } => {
-                eprintln!(
-                    "Received shared texture frame: handle={}, width={}, height={}",
-                    shared_handle, width, height
-                );
-                *shared_handle
-            }
+                shared_handle_y,
+                shared_handle_uv,
+                width: _,
+                height: _,
+            } => (*shared_handle_y, *shared_handle_uv),
             _ => {
                 return Err(RenderError::Message(
                     "Expected D3D11SharedNv12 frame data".into(),
@@ -370,16 +589,46 @@ impl D3d11Renderer {
             }
         };
 
+        let surface_width = surface.width;
+        let surface_height = surface.height;
+        let render_target_view = surface.render_target_view.clone();
+        let swap_chain = surface.swap_chain.clone();
+        let y_srv = self.open_shared_texture_srv(shared_handle_y)?;
+        let uv_srv = self.open_shared_texture_srv(shared_handle_uv)?;
+        let (vertex_shader, pixel_shader, sampler) = {
+            let pipeline = self.ensure_shared_nv12_pipeline()?;
+            (
+                pipeline.vertex_shader.clone(),
+                pipeline.pixel_shader.clone(),
+                pipeline.sampler.clone(),
+            )
+        };
+
+        let viewport = D3D11_VIEWPORT {
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+            Width: surface_width as f32,
+            Height: surface_height as f32,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        };
+        let srvs = [Some(y_srv), Some(uv_srv)];
+        let samplers = [Some(sampler)];
+        let empty_srvs: [Option<ID3D11ShaderResourceView>; 2] = [None, None];
+
         unsafe {
-            // TODO: Implement proper shared texture opening and rendering
-            // For now, verify we received the shared handle and use clear color
-            let clear = Self::average_clear_color(frame);
             self.context
-                .ClearRenderTargetView(&surface.render_target_view, &clear);
+                .OMSetRenderTargets(Some(&[Some(render_target_view)]), None);
+            self.context.RSSetViewports(Some(&[viewport]));
             self.context
-                .OMSetRenderTargets(Some(&[Some(surface.render_target_view.clone())]), None);
-            surface
-                .swap_chain
+                .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            self.context.VSSetShader(&vertex_shader, None);
+            self.context.PSSetShader(&pixel_shader, None);
+            self.context.PSSetSamplers(0, Some(&samplers));
+            self.context.PSSetShaderResources(0, Some(&srvs));
+            self.context.Draw(3, 0);
+            self.context.PSSetShaderResources(0, Some(&empty_srvs));
+            swap_chain
                 .Present(0, 0)
                 .ok()
                 .map_err(|error| RenderError::Message(format!("present 失败: {error}")))?;

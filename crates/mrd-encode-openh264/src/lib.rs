@@ -347,17 +347,17 @@ mod conversion_tests {
 
     #[test]
     fn bgra_to_i420_writes_expected_limited_range_planes() {
-        let frame = CapturedFrame {
-            width: 2,
-            height: 2,
-            pixel_format: FramePixelFormat::Bgra32,
-            timestamp_us: 0,
-            data: [0, 0, 255, 255]
+        let frame = CapturedFrame::from_cpu(
+            2,
+            2,
+            FramePixelFormat::Bgra32,
+            0,
+            [0, 0, 255, 255]
                 .into_iter()
                 .cycle()
                 .take(2 * 2 * 4)
                 .collect(),
-        };
+        );
         let mut i420 = vec![0; i420_len(2, 2).expect("i420 size")];
 
         write_i420(&frame, &mut i420).expect("convert bgra to i420");

@@ -138,13 +138,13 @@ impl FrameCapture for FakeCapture {
             chunk[3] = 255;
         }
 
-        Ok(CapturedFrame {
-            width: 16,
-            height: 16,
-            pixel_format: FramePixelFormat::Bgra32,
-            timestamp_us: self.tick as u64 * 33_000,
+        Ok(CapturedFrame::from_cpu(
+            16,
+            16,
+            FramePixelFormat::Bgra32,
+            self.tick as u64 * 33_000,
             data,
-        })
+        ))
     }
 }
 
@@ -503,13 +503,26 @@ pub(crate) async fn run_quic_benchmark_pipeline(
     let sink = Arc::new(Mutex::new(DecodedFrameSink::default()));
     let mut agent = crate::quic_host::QuicHost::default();
     let mut controller = crate::quic_host::QuicHost::with_frame_sink(sink.clone());
-    let bootstrap = agent.prepare_listener(session_id.clone(), "127.0.0.1:0").await?;
+    let bootstrap = agent
+        .prepare_listener(session_id.clone(), "127.0.0.1:0")
+        .await?;
     controller
-        .connect_to_peer(session_id.clone(), "127.0.0.1:0", &bootstrap, decode_backend)
+        .connect_to_peer(
+            session_id.clone(),
+            "127.0.0.1:0",
+            &bootstrap,
+            decode_backend,
+        )
         .await?;
     agent.accept_peer(session_id.clone()).await?;
     agent
-        .start_test_video_sender_with_backend(session_id.clone(), width, height, fps, encode_backend)
+        .start_test_video_sender_with_backend(
+            session_id.clone(),
+            width,
+            height,
+            fps,
+            encode_backend,
+        )
         .await?;
     let started_at = std::time::Instant::now();
     controller
@@ -576,9 +589,9 @@ fn create_test_encoder(
         "openh264" => Ok(QuicBenchmarkEncoder::OpenH264(OpenH264Encoder::new(
             width, height, fps,
         )?)),
-        "openh264_speed" => Ok(QuicBenchmarkEncoder::OpenH264(
-            OpenH264Encoder::new_speed(width, height, fps)?,
-        )),
+        "openh264_speed" => Ok(QuicBenchmarkEncoder::OpenH264(OpenH264Encoder::new_speed(
+            width, height, fps,
+        )?)),
         other => Err(PipelineError::message(format!(
             "unsupported test encoder backend: {other}"
         ))),

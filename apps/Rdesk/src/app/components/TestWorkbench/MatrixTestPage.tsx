@@ -61,6 +61,14 @@ const MATRIX_DIMENSIONS: MatrixDimension[] = [
     ],
   },
   {
+    id: "memory",
+    name: "Memory",
+    options: [
+      { id: "cpu", name: "CPU", enabled: true },
+      { id: "d3d11_shared", name: "D3D11 shared texture", enabled: false },
+    ],
+  },
+  {
     id: "resolution",
     name: "分辨率",
     options: [
@@ -143,6 +151,12 @@ function unsupportedMatrixReason(config: TestConfig): string | null {
   }
   if (config.encoder_type === "nvenc_av1" && config.transport_kind === "webrtc") {
     return "WebRTC RTP matrix transport currently supports H.264 only";
+  }
+  if (config.zero_copy && config.decoder_type !== "nvdec") {
+    return "D3D11 shared texture path requires NVDEC";
+  }
+  if (config.zero_copy && (config.renderer_type !== "d3d11" || !config.render_display)) {
+    return "D3D11 shared texture path requires DX11 popup renderer";
   }
   return null;
 }
@@ -240,6 +254,9 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
             config.render_display = false;
           }
           break;
+        case "memory":
+          config.zero_copy = opt.id === "d3d11_shared";
+          break;
         case "resolution": {
           const [w, h] = opt.id.split("x").map(Number);
           if (w && h) {
@@ -261,6 +278,7 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
 
     config.transport_kind ??= "loopback";
     config.render_display ??= false;
+    config.zero_copy ??= false;
     config.bitrate ??= 5000000;
     config.duration_ms ??= 5000; // Short duration for matrix tests
     config.warmup_ms = 1000;
@@ -521,7 +539,7 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
       {/* Test Results Grid */}
       {tests.length > 0 && (
         <div className="bg-card rounded-lg border overflow-x-auto">
-          <table className="w-full min-w-[1320px]">
+          <table className="w-full min-w-[1440px]">
             <thead className="bg-muted">
               <tr>
                 <th className="px-4 py-2 text-left text-sm font-medium">状态</th>
@@ -534,6 +552,7 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
                 <th className="px-4 py-2 text-left text-sm font-medium">帧率</th>
                 <th className="px-4 py-2 text-left text-sm font-medium">码率</th>
                 <th className="px-4 py-2 text-left text-sm font-medium">Pipeline FPS</th>
+                <th className="px-4 py-2 text-left text-sm font-medium">Memory</th>
                 <th className="px-4 py-2 text-left text-sm font-medium">Transport P95</th>
                 <th className="px-4 py-2 text-left text-sm font-medium">延迟 P95</th>
                 <th className="px-4 py-2 text-left text-sm font-medium">时长</th>
@@ -571,6 +590,9 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
                   </td>
                   <td className="px-4 py-2 text-sm">
                     {test.result?.capture_fps?.toFixed(1) ?? "-"}
+                  </td>
+                  <td className="px-4 py-2 text-sm">
+                    {test.config.zero_copy ? "d3d11_shared" : "cpu"}
                   </td>
                   <td className="px-4 py-2 text-sm">
                     {test.result?.transport_latency_p95

@@ -5,7 +5,8 @@ use mrd_pipeline_core::{CapturedFrame, EncodedAccessUnit, PipelineError, VideoEn
 mod imp {
     use anyhow::{anyhow, Context};
     use mrd_pipeline_core::{
-        CapturedFrame, EncodedAccessUnit, FramePixelFormat, PipelineError, VideoCodec, VideoEncoder,
+        CapturedFrame, D3D11SharedBgraFrame, EncodedAccessUnit, FrameMemoryKind, FramePixelFormat,
+        PipelineError, VideoCodec, VideoEncoder,
     };
     use nvenc::bitstream::BitStream;
     use nvenc::encoder::{Encoder, RegisteredResource};
@@ -16,7 +17,7 @@ mod imp {
         NV_ENC_PRESET_P1_GUID, NV_ENC_PRESET_P3_GUID, NV_ENC_PRESET_P6_GUID,
     };
     use nvenc::sys::structs::Guid;
-    use windows::Win32::Foundation::HMODULE;
+    use windows::Win32::Foundation::{HANDLE, HMODULE};
     use windows::Win32::Graphics::Direct3D::{
         D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0,
     };
@@ -33,6 +34,7 @@ mod imp {
         texture: ID3D11Texture2D,
         encoder: Encoder,
         registered: RegisteredResource,
+        shared_input: Option<SharedInputResource>,
         bitstream: BitStream,
         width: usize,
         height: usize,
@@ -41,6 +43,14 @@ mod imp {
     }
 
     unsafe impl Send for NvencH264Encoder {}
+
+    struct SharedInputResource {
+        shared_handle: isize,
+        width: u32,
+        height: u32,
+        _texture: ID3D11Texture2D,
+        registered: RegisteredResource,
+    }
 
     impl NvencH264Encoder {
         pub fn new(width: usize, height: usize, fps: u32) -> Result<Self, PipelineError> {
@@ -171,6 +181,7 @@ mod imp {
                 texture,
                 encoder,
                 registered,
+                shared_input: None,
                 bitstream,
                 width,
                 height,
@@ -249,6 +260,7 @@ mod imp {
                 texture,
                 encoder,
                 registered,
+                shared_input: None,
                 bitstream,
                 width,
                 height,
@@ -352,6 +364,7 @@ mod imp {
                 texture,
                 encoder,
                 registered,
+                shared_input: None,
                 bitstream,
                 width,
                 height,
@@ -424,6 +437,7 @@ mod imp {
                 texture,
                 encoder,
                 registered,
+                shared_input: None,
                 bitstream,
                 width,
                 height,
@@ -436,9 +450,107 @@ mod imp {
             let _ = Self::new(16, 16, 30)?;
             Ok(())
         }
+
+        fn encode_shared_bgra(
+            &mut self,
+            frame: &CapturedFrame,
+            shared: &D3D11SharedBgraFrame,
+        ) -> Result<Vec<EncodedAccessUnit>, PipelineError> {
+            if shared.width as usize != self.width || shared.height as usize != self.height {
+                return Err(PipelineError::message(format!(
+                    "shared texture size mismatch: expected {}x{}, got {}x{}",
+                    self.width, self.height, shared.width, shared.height
+                )));
+            }
+
+            self.ensure_shared_input(shared)?;
+
+            let force_idr = self.frame_index == 0 || self.frame_index % self.fps as usize == 0;
+            let shared_input = self
+                .shared_input
+                .as_ref()
+                .ok_or_else(|| PipelineError::message("missing shared input resource"))?;
+            let bytes = encode_picture(
+                &mut self.encoder,
+                &self.bitstream,
+                &shared_input.registered,
+                self.frame_index,
+                force_idr,
+            )
+            .map_err(|error| PipelineError::message(error.to_string()))?;
+            self.frame_index += 1;
+
+            Ok(vec![EncodedAccessUnit {
+                codec: VideoCodec::H264,
+                timestamp_us: frame.timestamp_us,
+                is_keyframe: force_idr,
+                bytes: normalize_annexb_au(bytes),
+            }])
+        }
+
+        fn ensure_shared_input(
+            &mut self,
+            shared: &D3D11SharedBgraFrame,
+        ) -> Result<(), PipelineError> {
+            let needs_new = self
+                .shared_input
+                .as_ref()
+                .map(|input| {
+                    input.shared_handle != shared.shared_handle
+                        || input.width != shared.width
+                        || input.height != shared.height
+                })
+                .unwrap_or(true);
+
+            if !needs_new {
+                return Ok(());
+            }
+
+            if shared.shared_handle == 0 {
+                return Err(PipelineError::message("shared texture handle is zero"));
+            }
+
+            let mut texture = None::<ID3D11Texture2D>;
+            unsafe {
+                self._device.OpenSharedResource(
+                    HANDLE(shared.shared_handle as *mut core::ffi::c_void),
+                    &mut texture,
+                )
+            }
+            .map_err(|error| {
+                PipelineError::message(format!(
+                    "open shared D3D11 texture for NVENC failed: {error}"
+                ))
+            })?;
+            let texture =
+                texture.ok_or_else(|| PipelineError::message("missing opened shared texture"))?;
+
+            let registered = self
+                .encoder
+                .register_resource_dx11(&texture, NVencBufferFormat::ARGB, shared.row_pitch)
+                .map_err(|error| {
+                    PipelineError::message(format!(
+                        "nvenc register shared texture failed: {error:?}"
+                    ))
+                })?;
+
+            self.shared_input = Some(SharedInputResource {
+                shared_handle: shared.shared_handle,
+                width: shared.width,
+                height: shared.height,
+                _texture: texture,
+                registered,
+            });
+
+            Ok(())
+        }
     }
 
     impl VideoEncoder for NvencH264Encoder {
+        fn input_memory_kind(&self) -> FrameMemoryKind {
+            FrameMemoryKind::D3D11SharedBgra
+        }
+
         fn encode(
             &mut self,
             frame: &CapturedFrame,
@@ -449,6 +561,10 @@ mod imp {
                     self.width, self.height, frame.width, frame.height
                 )));
             }
+            if let Some(shared) = frame.d3d11_shared_bgra() {
+                return self.encode_shared_bgra(frame, shared);
+            }
+
             let bgra = to_bgra(frame)?;
             let row_pitch = self
                 .width

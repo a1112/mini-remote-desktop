@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 use mrd_decode::NvdecVideoDecoder;
 use mrd_encode_nvenc::NvencH264Encoder;
 use mrd_pipeline_core::{CapturedFrame, FramePixelFormat, VideoDecoder, VideoEncoder};
-use mrd_transport_quic_quinn::{fragment_access_unit, QuicAuFragment, QuicAuReassembler, QuicAuReassemblerConfig};
+use mrd_transport_quic_quinn::{
+    fragment_access_unit, QuicAuFragment, QuicAuReassembler, QuicAuReassemblerConfig,
+};
 
 fn main() {
     println!("=== Mini Remote Desktop - Full Pipeline Integration Test ===\n");
@@ -64,13 +66,13 @@ fn test_full_pipeline_nvenc_to_nvdec() {
 
     for frame_idx in 0..frame_count {
         // 1. Create synthetic frame
-        let frame = CapturedFrame {
+        let frame = CapturedFrame::from_cpu(
             width,
             height,
-            pixel_format: FramePixelFormat::Bgra32,
-            timestamp_us: frame_idx as u64 * 33_333,
-            data: synthetic_frame_bytes(width, height, frame_idx as u8),
-        };
+            FramePixelFormat::Bgra32,
+            frame_idx as u64 * 33_333,
+            synthetic_frame_bytes(width, height, frame_idx as u8),
+        );
 
         // 2. Encode
         let encode_start = Instant::now();
@@ -161,10 +163,16 @@ fn test_full_pipeline_nvenc_to_nvdec() {
 
     // Basic sanity checks
     if decoded_frame_count <= frame_count / 2 {
-        println!("WARNING: Only decoded {} out of {} frames", decoded_frame_count, frame_count);
+        println!(
+            "WARNING: Only decoded {} out of {} frames",
+            decoded_frame_count, frame_count
+        );
     }
     if encode_p95.as_millis() > 20 {
-        println!("WARNING: Encode P95 is {:.2}ms (target < 20ms)", encode_p95.as_secs_f64() * 1000.0);
+        println!(
+            "WARNING: Encode P95 is {:.2}ms (target < 20ms)",
+            encode_p95.as_secs_f64() * 1000.0
+        );
     } else {
         println!("✓ Encode P95 meets target (< 20ms)");
     }
@@ -183,7 +191,10 @@ fn test_ultra_low_latency_pipeline() {
     let encoder = match NvencH264Encoder::new_ultra_low_latency(width, height, fps) {
         Ok(e) => e,
         Err(e) => {
-            println!("NVENC ultra-low latency not available: {}, skipping test", e);
+            println!(
+                "NVENC ultra-low latency not available: {}, skipping test",
+                e
+            );
             return;
         }
     };
@@ -201,16 +212,19 @@ fn test_ultra_low_latency_pipeline() {
     let mut encoder = encoder;
     let mut decoder = decoder;
 
-    println!("Running ultra-low latency pipeline test: {} frames", frame_count);
+    println!(
+        "Running ultra-low latency pipeline test: {} frames",
+        frame_count
+    );
 
     for frame_idx in 0..frame_count {
-        let frame = CapturedFrame {
+        let frame = CapturedFrame::from_cpu(
             width,
             height,
-            pixel_format: FramePixelFormat::Bgra32,
-            timestamp_us: frame_idx as u64 * 33_333,
-            data: synthetic_frame_bytes(width, height, frame_idx as u8),
-        };
+            FramePixelFormat::Bgra32,
+            frame_idx as u64 * 33_333,
+            synthetic_frame_bytes(width, height, frame_idx as u8),
+        );
 
         let encode_start = Instant::now();
         let encoded_units = match encoder.encode(&frame) {
@@ -252,7 +266,10 @@ fn test_ultra_low_latency_pipeline() {
     if encode_p95.as_millis() < 15 {
         println!("✓ Ultra-low latency encode P95 meets target (< 15ms)");
     } else {
-        println!("WARNING: Encode P95 is {:.2}ms (target < 15ms)", encode_p95.as_secs_f64() * 1000.0);
+        println!(
+            "WARNING: Encode P95 is {:.2}ms (target < 15ms)",
+            encode_p95.as_secs_f64() * 1000.0
+        );
     }
 }
 
@@ -286,13 +303,13 @@ fn test_av1_pipeline() {
     println!("Running AV1 pipeline test: {} frames", frame_count);
 
     for frame_idx in 0..frame_count {
-        let frame = CapturedFrame {
+        let frame = CapturedFrame::from_cpu(
             width,
             height,
-            pixel_format: FramePixelFormat::Bgra32,
-            timestamp_us: frame_idx as u64 * 33_333,
-            data: synthetic_frame_bytes(width, height, frame_idx as u8),
-        };
+            FramePixelFormat::Bgra32,
+            frame_idx as u64 * 33_333,
+            synthetic_frame_bytes(width, height, frame_idx as u8),
+        );
 
         let encode_start = Instant::now();
         let encoded_units = match encoder.encode(&frame) {
@@ -336,9 +353,9 @@ fn synthetic_frame_bytes(width: usize, height: usize, value: u8) -> Vec<u8> {
         let x = (index % width) as u8;
         let y = (index / width) as u8;
         chunk[0] = x.wrapping_add(value); // B
-        chunk[1] = y;                     // G
+        chunk[1] = y; // G
         chunk[2] = value.wrapping_add(x); // R
-        chunk[3] = 255;                   // A
+        chunk[3] = 255; // A
     }
     bytes
 }

@@ -7,7 +7,10 @@
 
 use std::time::Duration;
 
-use mrd_pipeline_core::{CapturedFrame, EncodedAccessUnit, FrameCapture, PipelineError, VideoCodec, VideoEncoder};
+use mrd_pipeline_core::{
+    CapturedFrame, EncodedAccessUnit, FrameCapture, FramePixelFormat, PipelineError, VideoCodec,
+    VideoEncoder,
+};
 
 // Mock components for pipeline testing
 mod mock {
@@ -48,13 +51,13 @@ mod mock {
             let timestamp_us = self.frame_count as u64 * 33_333; // ~30fps
             self.frame_count += 1;
 
-            Ok(CapturedFrame {
-                width: self.width,
-                height: self.height,
-                pixel_format: mrd_pipeline_core::FramePixelFormat::Bgra32,
+            Ok(CapturedFrame::from_cpu(
+                self.width,
+                self.height,
+                FramePixelFormat::Bgra32,
                 timestamp_us,
-                data: vec![0x55; self.width * self.height * 4],
-            })
+                vec![0x55; self.width * self.height * 4],
+            ))
         }
     }
 
@@ -92,7 +95,10 @@ mod mock {
     }
 
     impl VideoEncoder for MockEncoder {
-        fn encode(&mut self, frame: &CapturedFrame) -> Result<Vec<EncodedAccessUnit>, PipelineError> {
+        fn encode(
+            &mut self,
+            frame: &CapturedFrame,
+        ) -> Result<Vec<EncodedAccessUnit>, PipelineError> {
             if let Some(delay) = self.frame_delay {
                 std::thread::sleep(delay);
             }
@@ -121,9 +127,7 @@ mod mock {
 
     impl MockDecoder {
         pub fn new() -> Self {
-            Self {
-                decode_delay: None,
-            }
+            Self { decode_delay: None }
         }
 
         pub fn with_delay(mut self, delay: Duration) -> Self {
@@ -139,7 +143,10 @@ mod mock {
     }
 
     impl MockDecoder {
-        pub fn decode(&mut self, _access_unit: &EncodedAccessUnit) -> Result<Vec<u8>, PipelineError> {
+        pub fn decode(
+            &mut self,
+            _access_unit: &EncodedAccessUnit,
+        ) -> Result<Vec<u8>, PipelineError> {
             if let Some(delay) = self.decode_delay {
                 std::thread::sleep(delay);
             }
@@ -208,14 +215,10 @@ fn e2e_mock_pipeline_processes_multiple_frames() {
 
     for _ in 0..frame_count {
         // Capture
-        let captured = capture
-            .capture_frame()
-            .expect("Failed to capture frame");
+        let captured = capture.capture_frame().expect("Failed to capture frame");
 
         // Encode
-        let encoded = encoder
-            .encode(&captured)
-            .expect("Failed to encode frame");
+        let encoded = encoder.encode(&captured).expect("Failed to encode frame");
         assert_eq!(encoded.len(), 1);
         let access_unit = &encoded[0];
 
@@ -223,14 +226,10 @@ fn e2e_mock_pipeline_processes_multiple_frames() {
         assert_eq!(access_unit.codec, VideoCodec::H264);
 
         // Decode
-        let decoded = decoder
-            .decode(access_unit)
-            .expect("Failed to decode frame");
+        let decoded = decoder.decode(access_unit).expect("Failed to decode frame");
 
         // Render
-        renderer
-            .render(&decoded)
-            .expect("Failed to render frame");
+        renderer.render(&decoded).expect("Failed to render frame");
     }
 
     assert_eq!(renderer.frame_count(), frame_count);
@@ -262,7 +261,8 @@ fn e2e_pipeline_propagates_capture_errors() {
     let mut capture = MockCapture::new(128, 128).with_max_frames(0);
     let mut encoder = MockEncoder::new();
 
-    let result = capture.capture_frame()
+    let result = capture
+        .capture_frame()
         .and_then(|frame| encoder.encode(&frame).map(|_| ()));
 
     assert!(result.is_err());
@@ -305,32 +305,48 @@ fn e2e_session_lifecycle_creates_streams_and_destroys() {
     let session_id = SessionId("test-session-1".to_string());
 
     // Create session
-    coordinator.request_session(
-        session_id.clone(),
-        DeviceId("controller-1".to_string()),
-        DeviceId("agent-1".to_string()),
-        "quic_quinn".to_string(),
-        Some("127.0.0.1:5000".to_string()),
-        Some("localhost".to_string()),
-        Some("AQID".to_string()),
-    ).expect("Failed to request session");
+    coordinator
+        .request_session(
+            session_id.clone(),
+            DeviceId("controller-1".to_string()),
+            DeviceId("agent-1".to_string()),
+            "quic_quinn".to_string(),
+            Some("127.0.0.1:5000".to_string()),
+            Some("localhost".to_string()),
+            Some("AQID".to_string()),
+        )
+        .expect("Failed to request session");
 
-    let snapshot = coordinator.snapshot(&session_id).expect("Session not found");
+    let snapshot = coordinator
+        .snapshot(&session_id)
+        .expect("Session not found");
     assert_eq!(snapshot.lifecycle_state, SessionLifecycleState::Connecting);
 
     // Connect
-    coordinator.set_connected(&session_id).expect("Failed to connect");
-    let snapshot = coordinator.snapshot(&session_id).expect("Session not found");
+    coordinator
+        .set_connected(&session_id)
+        .expect("Failed to connect");
+    let snapshot = coordinator
+        .snapshot(&session_id)
+        .expect("Session not found");
     assert_eq!(snapshot.lifecycle_state, SessionLifecycleState::Connected);
 
     // Stream
-    coordinator.set_streaming(&session_id).expect("Failed to start streaming");
-    let snapshot = coordinator.snapshot(&session_id).expect("Session not found");
+    coordinator
+        .set_streaming(&session_id)
+        .expect("Failed to start streaming");
+    let snapshot = coordinator
+        .snapshot(&session_id)
+        .expect("Session not found");
     assert_eq!(snapshot.lifecycle_state, SessionLifecycleState::Streaming);
 
     // Close
-    coordinator.close(&session_id).expect("Failed to close session");
-    let snapshot = coordinator.snapshot(&session_id).expect("Session not found");
+    coordinator
+        .close(&session_id)
+        .expect("Failed to close session");
+    let snapshot = coordinator
+        .snapshot(&session_id)
+        .expect("Session not found");
     assert_eq!(snapshot.lifecycle_state, SessionLifecycleState::Closed);
 }
 

@@ -5,6 +5,8 @@
 
 use anyhow::Result;
 use mrd_capture_dxgi::DxgiDesktopCapture;
+#[cfg(windows)]
+use mrd_capture_dxgi::DxgiSharedTextureCapture;
 use mrd_decode_nvdec::{NvdecDecoder, NvdecOutputMode};
 use mrd_encode_nvenc::NvencH264Encoder;
 #[cfg(windows)]
@@ -105,6 +107,7 @@ pub struct TestConfig {
     pub bitrate: Option<u32>,
     pub renderer: Option<RendererType>,
     pub transport: Option<TransportKind>,
+    pub zero_copy: Option<bool>,
 }
 
 impl Default for TestConfig {
@@ -115,6 +118,7 @@ impl Default for TestConfig {
             bitrate: None,
             renderer: None,
             transport: None,
+            zero_copy: None,
         }
     }
 }
@@ -225,7 +229,7 @@ struct FrameBuffer {
 
 // Pipeline state - defined outside impl
 struct PipelineState {
-    capture: DxgiDesktopCapture,
+    capture: Box<dyn FrameCapture>,
     encoder: Option<Box<dyn VideoEncoder>>,
     transport: PipelineTransport,
     decoder: Option<PipelineDecoder>,
@@ -725,9 +729,34 @@ impl TestHarness {
     }
 
     fn initialize_components(chain: &TestChain, config: &TestConfig) -> Result<PipelineState> {
-        let capture = DxgiDesktopCapture::new_primary()
-            .map_err(|e| anyhow::anyhow!("DXGI 捕获初始化失败: {:?}", e))?;
-        let (width, height) = select_pipeline_dimensions(capture.width(), capture.height(), config);
+        let use_shared_texture_decode = config.zero_copy.unwrap_or(false);
+        let (capture, capture_width, capture_height): (Box<dyn FrameCapture>, usize, usize) =
+            if use_shared_texture_decode {
+                #[cfg(windows)]
+                {
+                    let mut capture = DxgiSharedTextureCapture::new_primary().map_err(|e| {
+                        anyhow::anyhow!("DXGI shared texture capture init failed: {:?}", e)
+                    })?;
+                    let (width, height) =
+                        select_pipeline_dimensions(capture.width(), capture.height(), config);
+                    capture.set_target_dimensions(width, height);
+                    (Box::new(capture) as Box<dyn FrameCapture>, width, height)
+                }
+                #[cfg(not(windows))]
+                {
+                    return Err(anyhow::anyhow!(
+                        "D3D11 shared texture capture is only available on Windows"
+                    ));
+                }
+            } else {
+                let capture = DxgiDesktopCapture::new_primary()
+                    .map_err(|e| anyhow::anyhow!("DXGI 捕获初始化失败: {:?}", e))?;
+                let (width, height) =
+                    select_pipeline_dimensions(capture.width(), capture.height(), config);
+                (Box::new(capture) as Box<dyn FrameCapture>, width, height)
+            };
+
+        let (width, height) = (capture_width, capture_height);
         let fps = config.fps.unwrap_or(60).max(1);
         let low_latency_bitrate = config.bitrate.unwrap_or(12_000_000).max(1);
         let speed_bitrate = config.bitrate.unwrap_or(5_000_000).max(1);
@@ -738,8 +767,11 @@ impl TestHarness {
                 let encoder =
                     NvencH264Encoder::new_with_bitrate(width, height, fps, low_latency_bitrate)
                         .map_err(|e| anyhow::anyhow!("NVENC 编码器初始化失败: {:?}", e))?;
-                let decoder = NvdecDecoder::new_with_output_mode(NvdecOutputMode::CpuNv12)
+                let mut decoder = NvdecDecoder::new_with_output_mode(NvdecOutputMode::CpuNv12)
                     .map_err(|e| anyhow::anyhow!("NVDEC 解码器初始化失败: {:?}", e))?;
+                if use_shared_texture_decode {
+                    decoder.enable_shared_texture(true);
+                }
                 (
                     Some(Box::new(encoder) as Box<dyn VideoEncoder>),
                     Some(PipelineDecoder::Nvdec(decoder)),
@@ -795,8 +827,14 @@ impl TestHarness {
                                 low_latency_bitrate,
                             )
                             .map_err(|e| anyhow::anyhow!("NVENC 编码器初始化失败: {:?}", e))?;
-                            let dec = NvdecDecoder::new_with_output_mode(NvdecOutputMode::CpuNv12)
-                                .map_err(|e| anyhow::anyhow!("NVDEC 解码器初始化失败: {:?}", e))?;
+                            let mut dec =
+                                NvdecDecoder::new_with_output_mode(NvdecOutputMode::CpuNv12)
+                                    .map_err(|e| {
+                                        anyhow::anyhow!("NVDEC 解码器初始化失败: {:?}", e)
+                                    })?;
+                            if use_shared_texture_decode {
+                                dec.enable_shared_texture(true);
+                            }
                             (
                                 Some(Box::new(enc) as Box<dyn VideoEncoder>),
                                 Some(PipelineDecoder::Nvdec(dec)),
@@ -834,11 +872,14 @@ impl TestHarness {
                                 (Some(Box::new(enc) as Box<dyn VideoEncoder>), None, false)
                             }
                             DecoderType::Nvdec => {
-                                let dec =
+                                let mut dec =
                                     NvdecDecoder::new_with_output_mode(NvdecOutputMode::CpuNv12)
                                         .map_err(|e| {
                                             anyhow::anyhow!("NVDEC decoder init failed: {:?}", e)
                                         })?;
+                                if use_shared_texture_decode {
+                                    dec.enable_shared_texture(true);
+                                }
                                 (
                                     Some(Box::new(enc) as Box<dyn VideoEncoder>),
                                     Some(PipelineDecoder::Nvdec(dec)),
@@ -1211,10 +1252,17 @@ fn nvdec_frame_to_decoded_frame(frame: mrd_decode_nvdec::NvdecDecodedFrame) -> D
         }
         #[cfg(windows)]
         mrd_decode_nvdec::NvdecDecodedFrameData::D3D11SharedNv12 {
-            shared_handle,
+            shared_handle_y,
+            shared_handle_uv,
             width: _,
             height: _,
-        } => DecodedFrame::from_d3d11_shared_nv12(frame.width, frame.height, 0, shared_handle),
+        } => DecodedFrame::from_d3d11_shared_nv12(
+            frame.width,
+            frame.height,
+            0,
+            shared_handle_y,
+            shared_handle_uv,
+        ),
     }
 }
 
@@ -1239,9 +1287,16 @@ fn decoded_frame_to_render_frame(frame: &DecodedFrame) -> RenderFrame {
             cpu_nv12_to_rgb24(data, frame.width, frame.height, *pitch),
         ),
         #[cfg(windows)]
-        DecodedFrameData::D3D11SharedNv12 { shared_handle, .. } => {
-            RenderFrame::from_d3d11_shared_nv12(frame.width, frame.height, *shared_handle)
-        }
+        DecodedFrameData::D3D11SharedNv12 {
+            shared_handle_y,
+            shared_handle_uv,
+            ..
+        } => RenderFrame::from_d3d11_shared_nv12(
+            frame.width,
+            frame.height,
+            *shared_handle_y,
+            *shared_handle_uv,
+        ),
     }
 }
 
@@ -1382,12 +1437,14 @@ fn adapt_frame_dimensions_into(
 ) {
     let bytes_per_pixel = bytes_per_pixel(frame.pixel_format);
     let required_len = target_width * target_height * bytes_per_pixel;
-    let output = scratch.get_or_insert_with(|| CapturedFrame {
-        width: target_width,
-        height: target_height,
-        pixel_format: frame.pixel_format,
-        timestamp_us: frame.timestamp_us,
-        data: vec![0_u8; required_len],
+    let output = scratch.get_or_insert_with(|| {
+        CapturedFrame::from_cpu(
+            target_width,
+            target_height,
+            frame.pixel_format,
+            frame.timestamp_us,
+            vec![0_u8; required_len],
+        )
     });
 
     output.width = target_width;
@@ -1415,13 +1472,13 @@ fn resize_frame_nearest(
     let mut data = vec![0_u8; target_width * target_height * bytes_per_pixel];
 
     if frame.width == 0 || frame.height == 0 || bytes_per_pixel == 0 {
-        return CapturedFrame {
-            width: target_width,
-            height: target_height,
-            pixel_format: frame.pixel_format,
-            timestamp_us: frame.timestamp_us,
+        return CapturedFrame::from_cpu(
+            target_width,
+            target_height,
+            frame.pixel_format,
+            frame.timestamp_us,
             data,
-        };
+        );
     }
 
     for y in 0..target_height {
@@ -1439,13 +1496,13 @@ fn resize_frame_nearest(
         }
     }
 
-    CapturedFrame {
-        width: target_width,
-        height: target_height,
-        pixel_format: frame.pixel_format,
-        timestamp_us: frame.timestamp_us,
+    CapturedFrame::from_cpu(
+        target_width,
+        target_height,
+        frame.pixel_format,
+        frame.timestamp_us,
         data,
-    }
+    )
 }
 
 fn resize_frame_nearest_into(
@@ -1527,13 +1584,13 @@ fn crop_frame_center(
     let mut data = vec![0_u8; target_width * target_height * bytes_per_pixel];
 
     if frame.width == 0 || frame.height == 0 || bytes_per_pixel == 0 {
-        return CapturedFrame {
-            width: target_width,
-            height: target_height,
-            pixel_format: frame.pixel_format,
-            timestamp_us: frame.timestamp_us,
+        return CapturedFrame::from_cpu(
+            target_width,
+            target_height,
+            frame.pixel_format,
+            frame.timestamp_us,
             data,
-        };
+        );
     }
 
     let src_x = frame.width.saturating_sub(target_width) / 2;
@@ -1549,13 +1606,13 @@ fn crop_frame_center(
         }
     }
 
-    CapturedFrame {
-        width: target_width,
-        height: target_height,
-        pixel_format: frame.pixel_format,
-        timestamp_us: frame.timestamp_us,
+    CapturedFrame::from_cpu(
+        target_width,
+        target_height,
+        frame.pixel_format,
+        frame.timestamp_us,
         data,
-    }
+    )
 }
 
 fn bytes_per_pixel(format: FramePixelFormat) -> usize {
@@ -1659,15 +1716,15 @@ mod tests {
 
     #[test]
     fn resize_frame_nearest_outputs_requested_shape() {
-        let frame = CapturedFrame {
-            width: 3,
-            height: 2,
-            pixel_format: FramePixelFormat::Bgra32,
-            timestamp_us: 42,
-            data: vec![
+        let frame = CapturedFrame::from_cpu(
+            3,
+            2,
+            FramePixelFormat::Bgra32,
+            42,
+            vec![
                 1, 0, 0, 255, 2, 0, 0, 255, 3, 0, 0, 255, 4, 0, 0, 255, 5, 0, 0, 255, 6, 0, 0, 255,
             ],
-        };
+        );
 
         let resized = resize_frame_nearest(&frame, 2, 2);
 
@@ -1686,13 +1743,7 @@ mod tests {
         let pixels = (1_u8..=12)
             .flat_map(|value| [value, 0, 0, 255])
             .collect::<Vec<_>>();
-        let frame = CapturedFrame {
-            width: 4,
-            height: 3,
-            pixel_format: FramePixelFormat::Bgra32,
-            timestamp_us: 99,
-            data: pixels,
-        };
+        let frame = CapturedFrame::from_cpu(4, 3, FramePixelFormat::Bgra32, 99, pixels);
 
         let cropped = adapt_frame_dimensions(&frame, 2, 2);
 
@@ -1775,6 +1826,11 @@ mod tests {
                 Ok("webrtc") | Ok("webrtc_rtp") => Some(TransportKind::WebrtcRtp),
                 Ok("quic") | Ok("quic_datagram") => Some(TransportKind::QuicDatagram),
                 Ok("loopback") => Some(TransportKind::Loopback),
+                _ => None,
+            },
+            zero_copy: match std::env::var("MRD_HARNESS_ZERO_COPY").as_deref() {
+                Ok("1") | Ok("true") | Ok("d3d11_shared") => Some(true),
+                Ok("0") | Ok("false") | Ok("cpu") => Some(false),
                 _ => None,
             },
         });

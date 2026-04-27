@@ -194,13 +194,13 @@ fn nvenc_720p_access_units() -> Vec<Vec<u8>> {
             pixel[2] = x ^ y ^ (frame_index as u8);
             pixel[3] = 255;
         }
-        let frame = CapturedFrame {
-            width: 1280,
-            height: 720,
-            pixel_format: FramePixelFormat::Bgra32,
-            timestamp_us: frame_index * 33_000,
+        let frame = CapturedFrame::from_cpu(
+            1280,
+            720,
+            FramePixelFormat::Bgra32,
+            frame_index * 33_000,
             data,
-        };
+        );
         if let Ok(encoded) = encoder.encode(&frame) {
             access_units.extend(
                 encoded

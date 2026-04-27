@@ -16,13 +16,13 @@ fn perf_openh264_encode_reports_latency_distribution() {
     let width = 1280usize;
     let height = 720usize;
     let mut encoder = OpenH264Encoder::new(width, height, 30).expect("create openh264 encoder");
-    let frame = CapturedFrame {
+    let frame = CapturedFrame::from_cpu(
         width,
         height,
-        pixel_format: FramePixelFormat::Bgra32,
-        timestamp_us: 0,
-        data: synthetic_bgra_frame(width, height),
-    };
+        FramePixelFormat::Bgra32,
+        0,
+        synthetic_bgra_frame(width, height),
+    );
 
     let mut latencies_ms = Vec::with_capacity(sample_count as usize);
     let mut access_unit_sizes = Vec::with_capacity(sample_count as usize);

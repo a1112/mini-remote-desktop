@@ -21,7 +21,8 @@ pub enum RenderFrameData {
     /// D3D11 shared texture handle (zero-copy path)
     #[cfg(windows)]
     D3D11SharedNv12 {
-        shared_handle: isize,
+        shared_handle_y: isize,
+        shared_handle_uv: isize,
         width: u32,
         height: u32,
     },
@@ -58,13 +59,19 @@ impl RenderFrame {
 
     /// Create a frame from D3D11 shared NV12 texture
     #[cfg(windows)]
-    pub fn from_d3d11_shared_nv12(width: usize, height: usize, shared_handle: isize) -> Self {
+    pub fn from_d3d11_shared_nv12(
+        width: usize,
+        height: usize,
+        shared_handle_y: isize,
+        shared_handle_uv: isize,
+    ) -> Self {
         Self {
             width,
             height,
             pixel_format: RenderPixelFormat::D3D11SharedNv12,
             data: RenderFrameData::D3D11SharedNv12 {
-                shared_handle,
+                shared_handle_y,
+                shared_handle_uv,
                 width: width as u32,
                 height: height as u32,
             },
@@ -91,7 +98,22 @@ impl RenderFrame {
     #[cfg(windows)]
     pub fn shared_handle(&self) -> Option<isize> {
         match &self.data {
-            RenderFrameData::D3D11SharedNv12 { shared_handle, .. } => Some(*shared_handle),
+            RenderFrameData::D3D11SharedNv12 {
+                shared_handle_y, ..
+            } => Some(*shared_handle_y),
+            _ => None,
+        }
+    }
+
+    /// Get the shared Y and UV texture handles if available.
+    #[cfg(windows)]
+    pub fn shared_handles(&self) -> Option<(isize, isize)> {
+        match &self.data {
+            RenderFrameData::D3D11SharedNv12 {
+                shared_handle_y,
+                shared_handle_uv,
+                ..
+            } => Some((*shared_handle_y, *shared_handle_uv)),
             _ => None,
         }
     }
@@ -146,7 +168,6 @@ pub trait RendererFactory: Send + Sync {
     fn create(&self) -> Result<BoxedRenderer, RenderError>;
 }
 
-const RGB24_FORMATS: &[RenderPixelFormat] = &[RenderPixelFormat::Rgb24];
 const SUPPORTED_FORMATS: &[RenderPixelFormat] = &[
     RenderPixelFormat::Rgb24,
     RenderPixelFormat::Bgra32,
@@ -167,11 +188,20 @@ mod tests {
     use super::{d3d11_descriptor, RenderPixelFormat, RuntimeStatus};
 
     #[test]
-    fn d3d11_descriptor_reports_runtime_backed_rgb24_support() {
+    fn d3d11_descriptor_reports_runtime_backed_formats() {
         let descriptor = d3d11_descriptor();
 
         assert_eq!(descriptor.id, "d3d11");
         assert_eq!(descriptor.runtime_status, RuntimeStatus::RuntimeBacked);
-        assert_eq!(descriptor.supported_formats, &[RenderPixelFormat::Rgb24]);
+        assert!(descriptor
+            .supported_formats
+            .contains(&RenderPixelFormat::Rgb24));
+        assert!(descriptor
+            .supported_formats
+            .contains(&RenderPixelFormat::Bgra32));
+        #[cfg(windows)]
+        assert!(descriptor
+            .supported_formats
+            .contains(&RenderPixelFormat::D3D11SharedNv12));
     }
 }

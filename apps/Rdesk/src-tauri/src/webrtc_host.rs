@@ -1459,13 +1459,13 @@ mod tests {
                 chunk[3] = 255;
             }
 
-            Ok(CapturedFrame {
-                width: 16,
-                height: 16,
-                pixel_format: FramePixelFormat::Bgra32,
-                timestamp_us: self.tick as u64 * 33_000,
+            Ok(CapturedFrame::from_cpu(
+                16,
+                16,
+                FramePixelFormat::Bgra32,
+                self.tick as u64 * 33_000,
                 data,
-            })
+            ))
         }
     }
 
@@ -1867,13 +1867,13 @@ mod tests {
         }
 
         let access_unit = encoder
-            .encode(&CapturedFrame {
-                width: 1280,
-                height: 720,
-                pixel_format: FramePixelFormat::Bgra32,
-                timestamp_us: 33_000,
-                data: frame,
-            })
+            .encode(&CapturedFrame::from_cpu(
+                1280,
+                720,
+                FramePixelFormat::Bgra32,
+                33_000,
+                frame,
+            ))
             .expect("encode nvenc frame")
             .into_iter()
             .next()

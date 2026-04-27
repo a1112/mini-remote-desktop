@@ -135,14 +135,16 @@ impl VideoDecoder for NvdecVideoDecoder {
                 }
                 #[cfg(windows)]
                 NvdecDecodedFrameData::D3D11SharedNv12 {
-                    shared_handle,
+                    shared_handle_y,
+                    shared_handle_uv,
                     width: _,
                     height: _,
                 } => CoreDecodedFrame::from_d3d11_shared_nv12(
                     frame.width,
                     frame.height,
                     0,
-                    shared_handle,
+                    shared_handle_y,
+                    shared_handle_uv,
                 ),
             })
             .collect()
