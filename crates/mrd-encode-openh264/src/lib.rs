@@ -3,7 +3,8 @@ use mrd_pipeline_core::{
 };
 use openh264::{
     encoder::{
-        Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, RateControlMode, UsageType,
+        BitRate, Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, RateControlMode,
+        UsageType,
     },
     formats::YUVSlices,
     OpenH264API,
@@ -20,19 +21,48 @@ pub struct OpenH264Encoder {
 
 impl OpenH264Encoder {
     pub fn new(width: usize, height: usize, fps: u32) -> Result<Self, PipelineError> {
+        Self::new_internal(width, height, fps, None)
+    }
+
+    pub fn new_with_bitrate(
+        width: usize,
+        height: usize,
+        fps: u32,
+        bitrate: u32,
+    ) -> Result<Self, PipelineError> {
+        Self::new_internal(width, height, fps, Some(bitrate.max(1)))
+    }
+
+    fn new_internal(
+        width: usize,
+        height: usize,
+        fps: u32,
+        bitrate: Option<u32>,
+    ) -> Result<Self, PipelineError> {
         validate_even_dimensions(width, height)?;
 
-        let config = EncoderConfig::new()
+        let rate_control_mode = if bitrate.is_some() {
+            RateControlMode::Bitrate
+        } else {
+            RateControlMode::Off
+        };
+
+        let mut config = EncoderConfig::new()
             .usage_type(UsageType::ScreenContentRealTime)
             .max_frame_rate(FrameRate::from_hz(fps.max(1) as f32))
             .intra_frame_period(IntraFramePeriod::from_num_frames(fps.max(1)))
-            .rate_control_mode(RateControlMode::Off)
+            .rate_control_mode(rate_control_mode)
             .complexity(Complexity::Low)
             .num_threads(openh264_thread_count())
             .scene_change_detect(true)
             .adaptive_quantization(false)
             .background_detection(false)
-            .skip_frames(false);
+            .skip_frames(bitrate.is_some());
+
+        if let Some(bitrate) = bitrate {
+            config = config.bitrate(BitRate::from_bps(bitrate));
+        }
+
         let api = OpenH264API::from_source();
         let encoder = Encoder::with_api_config(api, config).map_err(|error| {
             PipelineError::message(format!("create openh264 encoder failed: {error}"))

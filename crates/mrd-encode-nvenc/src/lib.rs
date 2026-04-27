@@ -47,6 +47,21 @@ mod imp {
             Self::new_with_profile(width, height, fps, NV_ENC_H264_PROFILE_HIGH_GUID)
         }
 
+        pub fn new_with_bitrate(
+            width: usize,
+            height: usize,
+            fps: u32,
+            bitrate: u32,
+        ) -> Result<Self, PipelineError> {
+            Self::new_low_latency_internal(
+                width,
+                height,
+                fps,
+                NV_ENC_H264_PROFILE_HIGH_GUID,
+                bitrate.max(1),
+            )
+        }
+
         pub fn new_baseline(width: usize, height: usize, fps: u32) -> Result<Self, PipelineError> {
             Self::new_with_profile(width, height, fps, NV_ENC_H264_PROFILE_BASELINE_GUID)
         }
@@ -86,9 +101,19 @@ mod imp {
         /// Maximum speed encoder using P1 preset (fastest preset)
         /// Lowest quality but maximum speed for 144Hz+ gaming
         pub fn new_max_speed(width: usize, height: usize, fps: u32) -> Result<Self, PipelineError> {
+            Self::new_max_speed_with_bitrate(width, height, fps, 5_000_000)
+        }
+
+        pub fn new_max_speed_with_bitrate(
+            width: usize,
+            height: usize,
+            fps: u32,
+            bitrate: u32,
+        ) -> Result<Self, PipelineError> {
             let width = width.max(2);
             let height = height.max(2);
             let fps = fps.max(1);
+            let bitrate = bitrate.max(1);
             let (device, context) = create_d3d11_device().map_err(|error| {
                 PipelineError::message(format!("create d3d11 device failed: {error}"))
             })?;
@@ -108,7 +133,7 @@ mod imp {
 
             // Maximum speed optimizations:
             preset.preset_cfg.profile_guid = NV_ENC_H264_PROFILE_BASELINE_GUID;
-            preset.preset_cfg.rc_params.average_bit_rate = 5_000_000;
+            preset.preset_cfg.rc_params.average_bit_rate = bitrate;
             preset.preset_cfg.gop_len = fps.min(30);
             preset.preset_cfg.frame_interval_p = 1;
 
@@ -258,7 +283,7 @@ mod imp {
             fps: u32,
             profile_guid: Guid,
         ) -> Result<Self, PipelineError> {
-            Self::new_low_latency_internal(width, height, fps, profile_guid)
+            Self::new_low_latency_internal(width, height, fps, profile_guid, 12_000_000)
         }
 
         fn new_low_latency_internal(
@@ -266,10 +291,12 @@ mod imp {
             height: usize,
             fps: u32,
             profile_guid: Guid,
+            bitrate: u32,
         ) -> Result<Self, PipelineError> {
             let width = width.max(2);
             let height = height.max(2);
             let fps = fps.max(1);
+            let bitrate = bitrate.max(1);
             let (device, context) = create_d3d11_device().map_err(|error| {
                 PipelineError::message(format!("create d3d11 device failed: {error}"))
             })?;
@@ -287,7 +314,7 @@ mod imp {
                     PipelineError::message(format!("nvenc preset config failed: {error:?}"))
                 })?;
             preset.preset_cfg.profile_guid = profile_guid;
-            preset.preset_cfg.rc_params.average_bit_rate = 12_000_000;
+            preset.preset_cfg.rc_params.average_bit_rate = bitrate;
             preset.preset_cfg.frame_interval_p = 1;
             preset.preset_cfg.gop_len = fps;
 
@@ -657,7 +684,35 @@ impl NvencH264Encoder {
         ))
     }
 
+    pub fn new_with_bitrate(
+        _width: usize,
+        _height: usize,
+        _fps: u32,
+        _bitrate: u32,
+    ) -> Result<Self, PipelineError> {
+        Err(PipelineError::message(
+            "nvenc encoder only supports Windows",
+        ))
+    }
+
     pub fn new_baseline(_width: usize, _height: usize, _fps: u32) -> Result<Self, PipelineError> {
+        Err(PipelineError::message(
+            "nvenc encoder only supports Windows",
+        ))
+    }
+
+    pub fn new_max_speed(_width: usize, _height: usize, _fps: u32) -> Result<Self, PipelineError> {
+        Err(PipelineError::message(
+            "nvenc encoder only supports Windows",
+        ))
+    }
+
+    pub fn new_max_speed_with_bitrate(
+        _width: usize,
+        _height: usize,
+        _fps: u32,
+        _bitrate: u32,
+    ) -> Result<Self, PipelineError> {
         Err(PipelineError::message(
             "nvenc encoder only supports Windows",
         ))

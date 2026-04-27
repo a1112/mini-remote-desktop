@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Play, Grid3x3, CheckCircle2, XCircle, Clock, Loader2, Monitor } from "lucide-react";
 import * as commands from "../../adapters/tauri/commands";
-import type { TestConfig, TestRunSummary } from "../../adapters/tauri/types";
+import type { TestConfig, TestRun, TestRunSummary } from "../../adapters/tauri/types";
 
 interface MatrixDimension {
   id: string;
@@ -22,6 +22,7 @@ const MATRIX_DIMENSIONS: MatrixDimension[] = [
     options: [
       { id: "dxgi", name: "DXGI", enabled: true },
       { id: "winrt", name: "WinRT", enabled: false },
+      { id: "synthetic", name: "Synthetic", enabled: false },
     ],
   },
   {
@@ -46,9 +47,13 @@ const MATRIX_DIMENSIONS: MatrixDimension[] = [
     name: "分辨率",
     options: [
       { id: "1280x720", name: "720p", enabled: true },
+      { id: "1366x768", name: "768p", enabled: false },
       { id: "1600x900", name: "900p", enabled: false },
       { id: "1920x1080", name: "1080p", enabled: true },
+      { id: "1920x1200", name: "1200p", enabled: false },
       { id: "2560x1440", name: "1440p", enabled: false },
+      { id: "2560x1600", name: "1600p", enabled: false },
+      { id: "3440x1440", name: "UWQHD", enabled: false },
       { id: "3840x2160", name: "4K", enabled: false },
     ],
   },
@@ -56,10 +61,34 @@ const MATRIX_DIMENSIONS: MatrixDimension[] = [
     id: "fps",
     name: "帧率",
     options: [
+      { id: "24", name: "24 FPS", enabled: false },
       { id: "30", name: "30 FPS", enabled: true },
+      { id: "45", name: "45 FPS", enabled: false },
       { id: "60", name: "60 FPS", enabled: true },
       { id: "90", name: "90 FPS", enabled: false },
       { id: "120", name: "120 FPS", enabled: false },
+      { id: "144", name: "144 FPS", enabled: false },
+    ],
+  },
+  {
+    id: "bitrate",
+    name: "码率",
+    options: [
+      { id: "3000000", name: "3 Mbps", enabled: false },
+      { id: "5000000", name: "5 Mbps", enabled: true },
+      { id: "8000000", name: "8 Mbps", enabled: false },
+      { id: "12000000", name: "12 Mbps", enabled: false },
+      { id: "20000000", name: "20 Mbps", enabled: false },
+    ],
+  },
+  {
+    id: "duration",
+    name: "时长",
+    options: [
+      { id: "3000", name: "3 秒", enabled: false },
+      { id: "5000", name: "5 秒", enabled: true },
+      { id: "10000", name: "10 秒", enabled: false },
+      { id: "30000", name: "30 秒", enabled: false },
     ],
   },
 ];
@@ -70,6 +99,24 @@ interface MatrixTest {
   status: "pending" | "running" | "completed" | "failed" | "skipped";
   result?: TestRunSummary;
   duration?: number;
+}
+
+function isMatrixRunAcceptable(config: TestConfig, summary?: TestRunSummary): boolean {
+  if (!summary || summary.frame_count <= 0 || summary.error_message) {
+    return false;
+  }
+
+  const targetFps = Math.max(1, config.fps ?? 60);
+  const minFps = targetFps * 0.6;
+  const captureFps = summary.capture_fps ?? 0;
+  if (captureFps < minFps) {
+    return false;
+  }
+
+  const frameBudgetMs = 1000 / targetFps;
+  const maxTotalP95Ms = Math.max(100, frameBudgetMs * 4);
+  const totalLatencyP95 = summary.total_latency_p95 ?? Number.POSITIVE_INFINITY;
+  return totalLatencyP95 <= maxTotalP95Ms;
 }
 
 const STATUS_LABELS: Record<MatrixTest["status"], string> = {
@@ -165,6 +212,12 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
         case "fps":
           config.fps = Number(opt.id);
           break;
+        case "bitrate":
+          config.bitrate = Number(opt.id);
+          break;
+        case "duration":
+          config.duration_ms = Number(opt.id);
+          break;
       }
     });
 
@@ -172,11 +225,43 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
       config.renderer_type = "d3d11";
       config.render_display = true;
     }
-    config.bitrate = 5000000;
-    config.duration_ms = 5000; // Short duration for matrix tests
+    config.bitrate ??= 5000000;
+    config.duration_ms ??= 5000; // Short duration for matrix tests
     config.warmup_ms = 1000;
 
     return config;
+  };
+
+  const waitForRunCompletion = async (runId: string, config: TestConfig): Promise<TestRun | null> => {
+    const timeoutMs = Math.max(
+      runDelayMs,
+      (config.duration_ms ?? 5000) + (config.warmup_ms ?? 0) + 3000
+    );
+    const startedAt = Date.now();
+    let lastRun: TestRun | null = null;
+
+    while (Date.now() - startedAt <= timeoutMs) {
+      const runResult = await commands.testGetRun(runId);
+      if (!runResult.ok) {
+        throw new Error(runResult.error.message);
+      }
+      if (!runResult.value) {
+        return null;
+      }
+
+      lastRun = runResult.value;
+      if (
+        runResult.value.status === "completed" ||
+        runResult.value.status === "failed" ||
+        runResult.value.status === "cancelled"
+      ) {
+        return runResult.value;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+
+    return lastRun;
   };
 
   const handleStart = async () => {
@@ -215,15 +300,16 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
       );
 
       const startTime = Date.now();
-      const markFailed = (duration = Date.now() - startTime) => {
+      const markFailed = (duration = Date.now() - startTime, result?: TestRunSummary) => {
         setFailedCount((f) => f + 1);
         setTests((prev) =>
           prev.map((t, idx) =>
-            idx === i ? { ...t, status: "failed" as const, duration } : t
+            idx === i ? { ...t, status: "failed" as const, result, duration } : t
           )
         );
       };
 
+      let activeRunId: string | null = null;
       try {
         const result = await commands.testStartRun({
           scenarioId: "matrix",
@@ -235,20 +321,17 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
           continue;
         }
 
-        // Wait for test to complete (simplified - in reality should poll)
-        await new Promise((resolve) => setTimeout(resolve, runDelayMs));
-
-        const runResult = await commands.testGetRun(result.value);
-        if (!runResult.ok || !runResult.value) {
+        activeRunId = result.value;
+        const run = await waitForRunCompletion(activeRunId, test.config);
+        if (!run) {
           markFailed();
-          await commands.testStopRun(result.value);
+          await commands.testStopRun(activeRunId);
           continue;
         }
 
-        const run = runResult.value;
         const duration = Date.now() - startTime;
 
-        if (run.status === "completed") {
+        if (run.status === "completed" && isMatrixRunAcceptable(test.config, run.summary)) {
           setCompletedCount((c) => c + 1);
           setTests((prev) =>
             prev.map((t, idx) =>
@@ -258,17 +341,20 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
                     status: "completed" as const,
                     result: run.summary,
                     duration,
-                  }
+              }
                 : t
             )
           );
         } else {
-          markFailed(duration);
+          markFailed(duration, run.summary);
         }
 
-        await commands.testStopRun(result.value);
+        await commands.testStopRun(activeRunId);
       } catch {
         markFailed();
+        if (activeRunId) {
+          await commands.testStopRun(activeRunId);
+        }
       }
     }
 
@@ -324,7 +410,12 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
                       type="checkbox"
                       checked={opt.enabled}
                       onChange={() => toggleOption(dim.id, opt.id)}
-                      disabled={isRunning || opt.id === "nvenc_av1" || opt.id === "winrt"}
+                      disabled={
+                        isRunning ||
+                        opt.id === "nvenc_av1" ||
+                        opt.id === "winrt" ||
+                        opt.id === "synthetic"
+                      }
                       className="rounded"
                     />
                     <span className="text-sm">{opt.name}</span>
@@ -412,7 +503,7 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
       {/* Test Results Grid */}
       {tests.length > 0 && (
         <div className="bg-card rounded-lg border overflow-x-auto">
-          <table className="w-full min-w-[980px]">
+          <table className="w-full min-w-[1120px]">
             <thead className="bg-muted">
               <tr>
                 <th className="px-4 py-2 text-left text-sm font-medium">状态</th>
@@ -421,6 +512,7 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
                 <th className="px-4 py-2 text-left text-sm font-medium">解码器</th>
                 <th className="px-4 py-2 text-left text-sm font-medium">分辨率</th>
                 <th className="px-4 py-2 text-left text-sm font-medium">帧率</th>
+                <th className="px-4 py-2 text-left text-sm font-medium">码率</th>
                 <th className="px-4 py-2 text-left text-sm font-medium">DX11</th>
                 <th className="px-4 py-2 text-left text-sm font-medium">Pipeline FPS</th>
                 <th className="px-4 py-2 text-left text-sm font-medium">延迟 P95</th>
@@ -450,6 +542,9 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
                     {test.config.resolution?.join("x")}
                   </td>
                   <td className="px-4 py-2 text-sm">{test.config.fps}</td>
+                  <td className="px-4 py-2 text-sm">
+                    {test.config.bitrate ? `${(test.config.bitrate / 1000000).toFixed(0)} Mbps` : "-"}
+                  </td>
                   <td className="px-4 py-2 text-sm">
                     {test.config.renderer_type === "d3d11" && test.config.render_display ? "on" : "-"}
                   </td>

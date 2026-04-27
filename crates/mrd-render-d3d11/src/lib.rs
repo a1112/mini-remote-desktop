@@ -228,7 +228,7 @@ impl D3d11Renderer {
                 .ClearRenderTargetView(&surface.render_target_view, &clear);
             surface
                 .swap_chain
-                .Present(1, 0)
+                .Present(0, 0)
                 .ok()
                 .map_err(|error| RenderError::Message(format!("present 失败: {error}")))?;
         }
@@ -278,7 +278,7 @@ impl D3d11Renderer {
                 .OMSetRenderTargets(Some(&[Some(surface.render_target_view.clone())]), None);
             surface
                 .swap_chain
-                .Present(1, 0)
+                .Present(0, 0)
                 .ok()
                 .map_err(|error| RenderError::Message(format!("present 失败: {error}")))?;
         }
@@ -336,7 +336,7 @@ impl D3d11Renderer {
                 .OMSetRenderTargets(Some(&[Some(surface.render_target_view.clone())]), None);
             surface
                 .swap_chain
-                .Present(1, 0)
+                .Present(0, 0)
                 .ok()
                 .map_err(|error| RenderError::Message(format!("present 失败: {error}")))?;
         }
@@ -352,23 +352,35 @@ impl D3d11Renderer {
         };
 
         let _shared_handle = match &frame.data {
-            RenderFrameData::D3D11SharedNv12 { shared_handle, width, height } => {
-                eprintln!("Received shared texture frame: handle={}, width={}, height={}", shared_handle, width, height);
+            RenderFrameData::D3D11SharedNv12 {
+                shared_handle,
+                width,
+                height,
+            } => {
+                eprintln!(
+                    "Received shared texture frame: handle={}, width={}, height={}",
+                    shared_handle, width, height
+                );
                 *shared_handle
             }
-            _ => return Err(RenderError::Message("Expected D3D11SharedNv12 frame data".into())),
+            _ => {
+                return Err(RenderError::Message(
+                    "Expected D3D11SharedNv12 frame data".into(),
+                ))
+            }
         };
 
         unsafe {
             // TODO: Implement proper shared texture opening and rendering
             // For now, verify we received the shared handle and use clear color
             let clear = Self::average_clear_color(frame);
-            self.context.ClearRenderTargetView(&surface.render_target_view, &clear);
+            self.context
+                .ClearRenderTargetView(&surface.render_target_view, &clear);
             self.context
                 .OMSetRenderTargets(Some(&[Some(surface.render_target_view.clone())]), None);
             surface
                 .swap_chain
-                .Present(1, 0)
+                .Present(0, 0)
                 .ok()
                 .map_err(|error| RenderError::Message(format!("present 失败: {error}")))?;
         }
@@ -394,7 +406,8 @@ impl RendererInstance for D3d11Renderer {
     fn upload_frame(&mut self, frame: RenderFrame) -> Result<(), RenderError> {
         use mrd_render::RenderFrameData;
         match &frame.data {
-            RenderFrameData::Rgb24(_) => {
+            RenderFrameData::Rgb24(_) =>
+            {
                 #[cfg(windows)]
                 if self.surface.is_some() {
                     self.present_uploaded_frame(&frame)?;
@@ -402,7 +415,8 @@ impl RendererInstance for D3d11Renderer {
                     self.present_clear_frame(&frame)?;
                 }
             }
-            RenderFrameData::Bgra32(_) => {
+            RenderFrameData::Bgra32(_) =>
+            {
                 #[cfg(windows)]
                 if self.surface.is_some() {
                     self.present_uploaded_frame_bgra(&frame)?;
@@ -411,7 +425,8 @@ impl RendererInstance for D3d11Renderer {
                 }
             }
             #[cfg(windows)]
-            RenderFrameData::D3D11SharedNv12 { .. } => {
+            RenderFrameData::D3D11SharedNv12 { .. } =>
+            {
                 #[cfg(windows)]
                 if self.surface.is_some() {
                     self.present_shared_texture_frame(&frame)?;

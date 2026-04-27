@@ -246,55 +246,124 @@ impl PipelineDecoder {
     }
 }
 
+enum RenderInput {
+    Decoded(DecodedFrame),
+    Captured(CapturedFrame),
+}
+
+enum RenderCommand {
+    Frame(RenderInput),
+    Stop,
+}
+
 struct PipelineRenderer {
-    renderer: Box<dyn RendererInstance>,
-    #[cfg(windows)]
-    window: Option<D3d11TestWindow>,
+    sender: mpsc::SyncSender<RenderCommand>,
+    render_thread: Option<thread::JoinHandle<()>>,
+    last_error: Arc<Mutex<Option<String>>>,
 }
 
 impl PipelineRenderer {
     fn new(renderer_type: &RendererType, width: usize, height: usize) -> Result<Self> {
-        match renderer_type {
-            RendererType::D3d11 => {
-                #[cfg(windows)]
-                {
-                    let window = D3d11TestWindow::new(width, height)?;
-                    let factory = mrd_render_d3d11::D3d11RendererFactory;
-                    let mut renderer = factory.create().map_err(|error| {
-                        anyhow::anyhow!("create D3D11 renderer failed: {error}")
-                    })?;
-                    renderer
-                        .attach_target(RenderTarget::WindowHandle(window.hwnd_value()))
-                        .map_err(|error| {
-                            anyhow::anyhow!("attach D3D11 renderer failed: {error}")
-                        })?;
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let last_error = Arc::new(Mutex::new(None));
+        let thread_error = Arc::clone(&last_error);
+        let renderer_type = renderer_type.clone();
 
-                    Ok(Self {
-                        renderer,
-                        window: Some(window),
-                    })
+        let render_thread = thread::Builder::new()
+            .name("mrd-dx11-test-render".to_string())
+            .spawn(move || {
+                if let Err(error) = run_renderer_thread(renderer_type, width, height, receiver) {
+                    if let Ok(mut last_error) = thread_error.lock() {
+                        *last_error = Some(error.to_string());
+                    }
                 }
+            })
+            .map_err(|error| anyhow::anyhow!("spawn D3D11 render thread failed: {error}"))?;
 
-                #[cfg(not(windows))]
-                {
-                    anyhow::bail!("D3D11 render display is only available on Windows");
-                }
+        Ok(Self {
+            sender,
+            render_thread: Some(render_thread),
+            last_error,
+        })
+    }
+
+    fn submit_frame(&mut self, input: RenderInput) -> Result<()> {
+        if let Some(error) = self.last_error.lock().unwrap().clone() {
+            anyhow::bail!("D3D11 render thread failed: {error}");
+        }
+
+        match self.sender.try_send(RenderCommand::Frame(input)) {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(RenderCommand::Frame(_))) => Ok(()),
+            Err(mpsc::TrySendError::Full(RenderCommand::Stop)) => Ok(()),
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                anyhow::bail!("D3D11 render thread stopped")
             }
         }
     }
+}
 
-    fn pump_window_messages(&self) {
-        #[cfg(windows)]
-        if let Some(window) = &self.window {
-            window.pump_messages();
+impl Drop for PipelineRenderer {
+    fn drop(&mut self) {
+        let _ = self.sender.send(RenderCommand::Stop);
+        if let Some(render_thread) = self.render_thread.take() {
+            let _ = render_thread.join();
+        }
+    }
+}
+
+fn run_renderer_thread(
+    renderer_type: RendererType,
+    width: usize,
+    height: usize,
+    receiver: mpsc::Receiver<RenderCommand>,
+) -> Result<()> {
+    match renderer_type {
+        RendererType::D3d11 => {
+            #[cfg(windows)]
+            {
+                let window = D3d11TestWindow::new(width, height)?;
+                let factory = mrd_render_d3d11::D3d11RendererFactory;
+                let mut renderer = factory
+                    .create()
+                    .map_err(|error| anyhow::anyhow!("create D3D11 renderer failed: {error}"))?;
+                renderer
+                    .attach_target(RenderTarget::WindowHandle(window.hwnd_value()))
+                    .map_err(|error| anyhow::anyhow!("attach D3D11 renderer failed: {error}"))?;
+
+                run_d3d11_render_loop(window, renderer, receiver)
+            }
+
+            #[cfg(not(windows))]
+            {
+                let _ = (width, height, receiver);
+                anyhow::bail!("D3D11 render display is only available on Windows");
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn run_d3d11_render_loop(
+    window: D3d11TestWindow,
+    mut renderer: Box<dyn RendererInstance>,
+    receiver: mpsc::Receiver<RenderCommand>,
+) -> Result<()> {
+    loop {
+        window.pump_messages();
+        match receiver.recv_timeout(Duration::from_millis(8)) {
+            Ok(RenderCommand::Frame(input)) => {
+                let frame = render_input_to_frame(input);
+                renderer.upload_frame(frame).map_err(|error| {
+                    anyhow::anyhow!("upload frame to D3D11 renderer failed: {error}")
+                })?;
+            }
+            Ok(RenderCommand::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
     }
 
-    fn upload_frame(&mut self, frame: RenderFrame) -> Result<()> {
-        self.renderer
-            .upload_frame(frame)
-            .map_err(|error| anyhow::anyhow!("upload frame to D3D11 renderer failed: {error}"))
-    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -543,12 +612,15 @@ impl TestHarness {
             .map_err(|e| anyhow::anyhow!("DXGI 捕获初始化失败: {:?}", e))?;
         let (width, height) = select_pipeline_dimensions(capture.width(), capture.height(), config);
         let fps = config.fps.unwrap_or(60).max(1);
+        let low_latency_bitrate = config.bitrate.unwrap_or(12_000_000).max(1);
+        let speed_bitrate = config.bitrate.unwrap_or(5_000_000).max(1);
 
         let (encoder, decoder, use_decoder) = match chain {
             TestChain::CaptureOnly => (None, None, false),
             TestChain::NvencNvdec => {
-                let encoder = NvencH264Encoder::new(width, height, fps)
-                    .map_err(|e| anyhow::anyhow!("NVENC 编码器初始化失败: {:?}", e))?;
+                let encoder =
+                    NvencH264Encoder::new_with_bitrate(width, height, fps, low_latency_bitrate)
+                        .map_err(|e| anyhow::anyhow!("NVENC 编码器初始化失败: {:?}", e))?;
                 let decoder = NvdecDecoder::new_with_output_mode(NvdecOutputMode::CpuNv12)
                     .map_err(|e| anyhow::anyhow!("NVDEC 解码器初始化失败: {:?}", e))?;
                 (
@@ -558,8 +630,9 @@ impl TestHarness {
                 )
             }
             TestChain::NvencOnly => {
-                let encoder = NvencH264Encoder::new_max_speed(width, height, fps)
-                    .map_err(|e| anyhow::anyhow!("NVENC 编码器初始化失败: {:?}", e))?;
+                let encoder =
+                    NvencH264Encoder::new_max_speed_with_bitrate(width, height, fps, speed_bitrate)
+                        .map_err(|e| anyhow::anyhow!("NVENC 编码器初始化失败: {:?}", e))?;
                 (
                     Some(Box::new(encoder) as Box<dyn VideoEncoder>),
                     None,
@@ -567,8 +640,11 @@ impl TestHarness {
                 )
             }
             TestChain::OpenH264 => {
-                let encoder = OpenH264Encoder::new(width, height, fps)
-                    .map_err(|e| anyhow::anyhow!("OpenH264 编码器初始化失败: {:?}", e))?;
+                let encoder = match config.bitrate {
+                    Some(bitrate) => OpenH264Encoder::new_with_bitrate(width, height, fps, bitrate),
+                    None => OpenH264Encoder::new(width, height, fps),
+                }
+                .map_err(|e| anyhow::anyhow!("OpenH264 编码器初始化失败: {:?}", e))?;
                 (
                     Some(Box::new(encoder) as Box<dyn VideoEncoder>),
                     None,
@@ -585,8 +661,13 @@ impl TestHarness {
                 match encoder {
                     EncoderType::NvencH264 => match decoder {
                         DecoderType::Nvdec => {
-                            let enc = NvencH264Encoder::new(width, height, fps)
-                                .map_err(|e| anyhow::anyhow!("NVENC 编码器初始化失败: {:?}", e))?;
+                            let enc = NvencH264Encoder::new_with_bitrate(
+                                width,
+                                height,
+                                fps,
+                                low_latency_bitrate,
+                            )
+                            .map_err(|e| anyhow::anyhow!("NVENC 编码器初始化失败: {:?}", e))?;
                             let dec = NvdecDecoder::new_with_output_mode(NvdecOutputMode::CpuNv12)
                                 .map_err(|e| anyhow::anyhow!("NVDEC 解码器初始化失败: {:?}", e))?;
                             (
@@ -596,8 +677,13 @@ impl TestHarness {
                             )
                         }
                         DecoderType::Software => {
-                            let enc = NvencH264Encoder::new_max_speed(width, height, fps)
-                                .map_err(|e| anyhow::anyhow!("NVENC 编码器初始化失败: {:?}", e))?;
+                            let enc = NvencH264Encoder::new_max_speed_with_bitrate(
+                                width,
+                                height,
+                                fps,
+                                speed_bitrate,
+                            )
+                            .map_err(|e| anyhow::anyhow!("NVENC 编码器初始化失败: {:?}", e))?;
                             let dec = mrd_decode::create_decoder("h264_software").map_err(|e| {
                                 anyhow::anyhow!("software decoder init failed: {:?}", e)
                             })?;
@@ -609,8 +695,13 @@ impl TestHarness {
                         }
                     },
                     EncoderType::OpenH264 => {
-                        let enc = OpenH264Encoder::new(width, height, fps)
-                            .map_err(|e| anyhow::anyhow!("OpenH264 编码器初始化失败: {:?}", e))?;
+                        let enc = match config.bitrate {
+                            Some(bitrate) => {
+                                OpenH264Encoder::new_with_bitrate(width, height, fps, bitrate)
+                            }
+                            None => OpenH264Encoder::new(width, height, fps),
+                        }
+                        .map_err(|e| anyhow::anyhow!("OpenH264 编码器初始化失败: {:?}", e))?;
                         match decoder {
                             DecoderType::Nvdec => {
                                 let dec =
@@ -751,16 +842,11 @@ impl TestHarness {
             };
 
             if let Some(renderer) = state.renderer.as_mut() {
-                renderer.pump_window_messages();
-                let frame = decoded_frames
-                    .last()
-                    .map(decoded_frame_to_render_frame)
-                    .or_else(|| {
-                        (!state.use_decoder)
-                            .then(|| captured_frame_to_render_frame(&captured_frame))
-                    });
-                if let Some(frame) = frame {
-                    if let Err(error) = renderer.upload_frame(frame) {
+                let input = decoded_frames.pop().map(RenderInput::Decoded).or_else(|| {
+                    (!state.use_decoder).then(|| RenderInput::Captured(captured_frame.clone()))
+                });
+                if let Some(input) = input {
+                    if let Err(error) = renderer.submit_frame(input) {
                         let mut m = metrics.lock().unwrap();
                         m.error_message = Some(error.to_string());
                         running.store(false, Ordering::Relaxed);
@@ -948,6 +1034,13 @@ fn nvdec_frame_to_decoded_frame(frame: mrd_decode_nvdec::NvdecDecodedFrame) -> D
             width: _,
             height: _,
         } => DecodedFrame::from_d3d11_shared_nv12(frame.width, frame.height, 0, shared_handle),
+    }
+}
+
+fn render_input_to_frame(input: RenderInput) -> RenderFrame {
+    match input {
+        RenderInput::Decoded(frame) => decoded_frame_to_render_frame(&frame),
+        RenderInput::Captured(frame) => captured_frame_to_render_frame(&frame),
     }
 }
 
@@ -1483,7 +1576,9 @@ mod tests {
             fps: std::env::var("MRD_HARNESS_FPS")
                 .ok()
                 .and_then(|value| value.parse::<u32>().ok()),
-            bitrate: None,
+            bitrate: std::env::var("MRD_HARNESS_BITRATE")
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok()),
             renderer: match std::env::var("MRD_HARNESS_RENDERER").as_deref() {
                 Ok("d3d11") => Some(RendererType::D3d11),
                 _ => None,
