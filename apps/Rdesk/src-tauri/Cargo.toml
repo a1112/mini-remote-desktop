@@ -63,6 +63,7 @@ mrd-service = { path = "../../mrd-service" }
 
 [target.'cfg(windows)'.dependencies]
 mrd-capture-winrt = { path = "../../../crates/mrd-capture-winrt" }
+mrd-encode-nvenc-av1 = { path = "../../../crates/mrd-encode-nvenc-av1" }
 winapi = { version = "0.3", features = ["sysinfoapi", "minwindef"] }
 windows = { version = "0.52", features = [
   "Win32_Foundation",

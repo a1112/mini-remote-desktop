@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Play, Grid3x3, CheckCircle2, XCircle, Clock, Loader2, Monitor } from "lucide-react";
+import { Play, Grid3x3, CheckCircle2, XCircle, Clock, Loader2 } from "lucide-react";
 import * as commands from "../../adapters/tauri/commands";
 import type { TestConfig, TestRun, TestRunSummary } from "../../adapters/tauri/types";
 
@@ -38,8 +38,26 @@ const MATRIX_DIMENSIONS: MatrixDimension[] = [
     id: "decoder",
     name: "解码器",
     options: [
+      { id: "none", name: "None / encode only", enabled: false },
       { id: "nvdec", name: "NVDEC", enabled: true },
       { id: "software", name: "软件", enabled: true },
+    ],
+  },
+  {
+    id: "transport",
+    name: "传输层",
+    options: [
+      { id: "loopback", name: "Loopback", enabled: true },
+      { id: "webrtc", name: "WebRTC RTP", enabled: false },
+      { id: "quic", name: "QUIC Datagram", enabled: false },
+    ],
+  },
+  {
+    id: "renderer",
+    name: "渲染",
+    options: [
+      { id: "renderer_none", name: "No display", enabled: true },
+      { id: "d3d11", name: "DX11 popup", enabled: false },
     ],
   },
   {
@@ -119,6 +137,16 @@ function isMatrixRunAcceptable(config: TestConfig, summary?: TestRunSummary): bo
   return totalLatencyP95 <= maxTotalP95Ms;
 }
 
+function unsupportedMatrixReason(config: TestConfig): string | null {
+  if (config.encoder_type === "nvenc_av1" && config.decoder_type !== "none") {
+    return "NVENC AV1 currently supports encode-only matrix runs";
+  }
+  if (config.encoder_type === "nvenc_av1" && config.transport_kind === "webrtc") {
+    return "WebRTC RTP matrix transport currently supports H.264 only";
+  }
+  return null;
+}
+
 const STATUS_LABELS: Record<MatrixTest["status"], string> = {
   pending: "待执行",
   running: "运行中",
@@ -139,7 +167,6 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
   const [completedCount, setCompletedCount] = useState(0);
   const [failedCount, setFailedCount] = useState(0);
   const [skippedCount, setSkippedCount] = useState(0);
-  const [enableD3d11Render, setEnableD3d11Render] = useState(false);
 
   const toggleOption = (dimensionId: string, optionId: string) => {
     setDimensions(
@@ -202,6 +229,17 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
         case "decoder":
           config.decoder_type = opt.id as TestConfig["decoder_type"];
           break;
+        case "transport":
+          config.transport_kind = opt.id as TestConfig["transport_kind"];
+          break;
+        case "renderer":
+          if (opt.id === "d3d11") {
+            config.renderer_type = "d3d11";
+            config.render_display = true;
+          } else {
+            config.render_display = false;
+          }
+          break;
         case "resolution": {
           const [w, h] = opt.id.split("x").map(Number);
           if (w && h) {
@@ -221,10 +259,8 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
       }
     });
 
-    if (enableD3d11Render) {
-      config.renderer_type = "d3d11";
-      config.render_display = true;
-    }
+    config.transport_kind ??= "loopback";
+    config.render_display ??= false;
     config.bitrate ??= 5000000;
     config.duration_ms ??= 5000; // Short duration for matrix tests
     config.warmup_ms = 1000;
@@ -282,8 +318,7 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
       const test = matrixTests[i];
       if (!test) continue;
 
-      // Skip AV1 encoder
-      if (test.config.encoder_type === "nvenc_av1") {
+      if (unsupportedMatrixReason(test.config)) {
         setSkippedCount((count) => count + 1);
         setTests((prev) =>
           prev.map((t, idx) =>
@@ -412,7 +447,6 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
                       onChange={() => toggleOption(dim.id, opt.id)}
                       disabled={
                         isRunning ||
-                        opt.id === "nvenc_av1" ||
                         opt.id === "winrt" ||
                         opt.id === "synthetic"
                       }
@@ -421,7 +455,7 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
                     <span className="text-sm">{opt.name}</span>
                     {opt.id === "nvenc_av1" && (
                       <span className="text-xs bg-yellow-100 text-yellow-800 px-1 rounded">
-                        即将推出
+                        encode only
                       </span>
                     )}
                   </label>
@@ -429,22 +463,6 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
               </div>
             </div>
           ))}
-          <div>
-            <h3 className="font-medium text-sm mb-2 flex items-center gap-2">
-              <Monitor className="h-4 w-4" />
-              DX11 渲染显示
-            </h3>
-            <label className="flex items-center gap-2 p-2 rounded hover:bg-muted cursor-pointer">
-              <input
-                type="checkbox"
-                checked={enableD3d11Render}
-                onChange={() => setEnableD3d11Render((enabled) => !enabled)}
-                disabled={isRunning}
-                className="rounded"
-              />
-              <span className="text-sm">弹窗显示</span>
-            </label>
-          </div>
         </div>
       </div>
 
@@ -503,18 +521,20 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
       {/* Test Results Grid */}
       {tests.length > 0 && (
         <div className="bg-card rounded-lg border overflow-x-auto">
-          <table className="w-full min-w-[1120px]">
+          <table className="w-full min-w-[1320px]">
             <thead className="bg-muted">
               <tr>
                 <th className="px-4 py-2 text-left text-sm font-medium">状态</th>
                 <th className="px-4 py-2 text-left text-sm font-medium">捕获</th>
                 <th className="px-4 py-2 text-left text-sm font-medium">编码器</th>
                 <th className="px-4 py-2 text-left text-sm font-medium">解码器</th>
+                <th className="px-4 py-2 text-left text-sm font-medium">传输</th>
+                <th className="px-4 py-2 text-left text-sm font-medium">渲染</th>
                 <th className="px-4 py-2 text-left text-sm font-medium">分辨率</th>
                 <th className="px-4 py-2 text-left text-sm font-medium">帧率</th>
                 <th className="px-4 py-2 text-left text-sm font-medium">码率</th>
-                <th className="px-4 py-2 text-left text-sm font-medium">DX11</th>
                 <th className="px-4 py-2 text-left text-sm font-medium">Pipeline FPS</th>
+                <th className="px-4 py-2 text-left text-sm font-medium">Transport P95</th>
                 <th className="px-4 py-2 text-left text-sm font-medium">延迟 P95</th>
                 <th className="px-4 py-2 text-left text-sm font-medium">时长</th>
               </tr>
@@ -538,6 +558,10 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
                   <td className="px-4 py-2 text-sm">{test.config.capture_type}</td>
                   <td className="px-4 py-2 text-sm">{test.config.encoder_type}</td>
                   <td className="px-4 py-2 text-sm">{test.config.decoder_type}</td>
+                  <td className="px-4 py-2 text-sm">{test.config.transport_kind}</td>
+                  <td className="px-4 py-2 text-sm">
+                    {test.config.renderer_type === "d3d11" && test.config.render_display ? "d3d11" : "none"}
+                  </td>
                   <td className="px-4 py-2 text-sm">
                     {test.config.resolution?.join("x")}
                   </td>
@@ -546,10 +570,12 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
                     {test.config.bitrate ? `${(test.config.bitrate / 1000000).toFixed(0)} Mbps` : "-"}
                   </td>
                   <td className="px-4 py-2 text-sm">
-                    {test.config.renderer_type === "d3d11" && test.config.render_display ? "on" : "-"}
+                    {test.result?.capture_fps?.toFixed(1) ?? "-"}
                   </td>
                   <td className="px-4 py-2 text-sm">
-                    {test.result?.capture_fps?.toFixed(1) ?? "-"}
+                    {test.result?.transport_latency_p95
+                      ? `${test.result.transport_latency_p95.toFixed(2)} ms`
+                      : "-"}
                   </td>
                   <td className="px-4 py-2 text-sm">
                     {test.result?.total_latency_p95

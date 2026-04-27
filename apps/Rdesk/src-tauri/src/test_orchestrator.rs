@@ -17,7 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::test_harness::{
     CaptureType, DecoderType, EncoderType, HarnessMetrics, RendererType, TestChain,
-    TestConfig as HarnessConfig, TestHarness,
+    TestConfig as HarnessConfig, TestHarness, TransportKind,
 };
 use std::thread;
 use std::time::Duration;
@@ -130,6 +130,8 @@ pub struct TestRunSummary {
     pub capture_fps: Option<f64>,
     pub encode_latency_p50: Option<f64>,
     pub encode_latency_p95: Option<f64>,
+    pub transport_latency_p50: Option<f64>,
+    pub transport_latency_p95: Option<f64>,
     pub decode_latency_p50: Option<f64>,
     pub decode_latency_p95: Option<f64>,
     pub total_latency_p95: Option<f64>,
@@ -313,6 +315,7 @@ impl TestOrchestrator {
                     None => anyhow::bail!("Missing encoder_type for {}", scenario_id),
                 },
                 decoder: match config.decoder_type.as_deref().unwrap_or("software") {
+                    "none" => DecoderType::None,
                     "nvdec" => DecoderType::Nvdec,
                     "software" => DecoderType::Software,
                     other => anyhow::bail!("Unsupported decoder for {}: {}", scenario_id, other),
@@ -605,6 +608,12 @@ impl TestOrchestrator {
                         "encode_latency_p95_ms",
                         "ms",
                         metrics.encode_latency_p95_ms,
+                    );
+                    push_metric_sample(
+                        run_series,
+                        "transport_latency_p95_ms",
+                        "ms",
+                        metrics.transport_latency_p95_ms,
                     );
                     push_metric_sample(
                         run_series,
@@ -1326,6 +1335,8 @@ impl TestOrchestrator {
                     capture_fps: Some(metrics.capture_fps),
                     encode_latency_p50: Some(metrics.encode_latency_p50_ms),
                     encode_latency_p95: Some(metrics.encode_latency_p95_ms),
+                    transport_latency_p50: Some(metrics.transport_latency_p50_ms),
+                    transport_latency_p95: Some(metrics.transport_latency_p95_ms),
                     decode_latency_p50: Some(metrics.decode_latency_p50_ms),
                     decode_latency_p95: Some(metrics.decode_latency_p95_ms),
                     total_latency_p95: Some(metrics.total_latency_p95_ms),
@@ -1564,6 +1575,8 @@ impl Default for TestRunSummary {
             capture_fps: None,
             encode_latency_p50: None,
             encode_latency_p95: None,
+            transport_latency_p50: None,
+            transport_latency_p95: None,
             decode_latency_p50: None,
             decode_latency_p95: None,
             total_latency_p95: None,
@@ -1581,6 +1594,8 @@ fn summary_from_metrics(started_at: u64, metrics: &HarnessMetrics) -> TestRunSum
         capture_fps: Some(metrics.capture_fps),
         encode_latency_p50: Some(metrics.encode_latency_p50_ms),
         encode_latency_p95: Some(metrics.encode_latency_p95_ms),
+        transport_latency_p50: Some(metrics.transport_latency_p50_ms),
+        transport_latency_p95: Some(metrics.transport_latency_p95_ms),
         decode_latency_p50: Some(metrics.decode_latency_p50_ms),
         decode_latency_p95: Some(metrics.decode_latency_p95_ms),
         total_latency_p95: Some(metrics.total_latency_p95_ms),
@@ -1599,6 +1614,12 @@ fn harness_config_from_data(config: &TestConfigData) -> HarnessConfig {
         renderer: match (config.render_display, config.renderer_type.as_deref()) {
             (Some(true), Some("d3d11")) => Some(RendererType::D3d11),
             _ => None,
+        },
+        transport: match config.transport_kind.as_deref() {
+            Some("webrtc") | Some("webrtc_rtp") => Some(TransportKind::WebrtcRtp),
+            Some("quic") | Some("quic_datagram") => Some(TransportKind::QuicDatagram),
+            Some("loopback") | None => Some(TransportKind::Loopback),
+            Some(_) => None,
         },
     }
 }

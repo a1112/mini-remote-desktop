@@ -86,10 +86,10 @@ export interface TestConfig {
   // Component selection
   capture_type?: "dxgi" | "winrt" | "synthetic";
   encoder_type?: "nvenc_h264" | "nvenc_av1" | "openh264";
-  decoder_type?: "nvdec" | "software";
+  decoder_type?: "none" | "nvdec" | "software";
   renderer_type?: "d3d11";
   render_display?: boolean;
-  transport_kind?: "quic" | "webrtc";
+  transport_kind?: "loopback" | "quic" | "webrtc";
 
   // Parameters
   resolution?: [number, number];
@@ -153,6 +153,8 @@ export interface TestRunSummary {
   capture_fps?: number;
   encode_latency_p50?: number;
   encode_latency_p95?: number;
+  transport_latency_p50?: number;
+  transport_latency_p95?: number;
   decode_latency_p50?: number;
   decode_latency_p95?: number;
   total_latency_p95?: number;
@@ -455,12 +457,14 @@ export interface TestChainOption {
  */
 export type CaptureType = 'dxgi' | 'winrt' | 'synthetic';
 export type EncoderType = 'nvenc_h264' | 'nvenc_av1' | 'openh264';
-export type DecoderType = 'nvdec' | 'software';
+export type DecoderType = 'none' | 'nvdec' | 'software';
 
 export interface TestMatrixConfig {
   capture: CaptureType;
   encoder: EncoderType;
   decoder: DecoderType;
+  transport?: "loopback" | "quic" | "webrtc";
+  renderer?: "none" | "d3d11";
   resolution?: [number, number];
   fps?: number;
   bitrate?: number;

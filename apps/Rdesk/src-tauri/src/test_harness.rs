@@ -7,10 +7,12 @@ use anyhow::Result;
 use mrd_capture_dxgi::DxgiDesktopCapture;
 use mrd_decode_nvdec::{NvdecDecoder, NvdecOutputMode};
 use mrd_encode_nvenc::NvencH264Encoder;
+#[cfg(windows)]
+use mrd_encode_nvenc_av1::NvencAv1Encoder;
 use mrd_encode_openh264::OpenH264Encoder;
 use mrd_pipeline_core::{
-    CapturedFrame, DecodedFrame, DecodedFrameData, FrameCapture, FramePixelFormat, VideoDecoder,
-    VideoEncoder,
+    CapturedFrame, DecodedFrame, DecodedFrameData, EncodedAccessUnit, FrameCapture,
+    FramePixelFormat, VideoCodec, VideoDecoder, VideoEncoder,
 };
 use mrd_render::{RenderFrame, RenderTarget, RendererFactory, RendererInstance};
 use serde::{Deserialize, Serialize};
@@ -74,6 +76,7 @@ pub enum EncoderType {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DecoderType {
+    None,
     Nvdec,
     Software,
 }
@@ -85,6 +88,15 @@ pub enum RendererType {
     D3d11,
 }
 
+/// Available transport test paths for encoded access units.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportKind {
+    Loopback,
+    WebrtcRtp,
+    QuicDatagram,
+}
+
 /// Test configuration parameters
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TestConfig {
@@ -92,6 +104,7 @@ pub struct TestConfig {
     pub fps: Option<u32>,
     pub bitrate: Option<u32>,
     pub renderer: Option<RendererType>,
+    pub transport: Option<TransportKind>,
 }
 
 impl Default for TestConfig {
@@ -101,6 +114,7 @@ impl Default for TestConfig {
             fps: None,
             bitrate: None,
             renderer: None,
+            transport: None,
         }
     }
 }
@@ -148,7 +162,7 @@ impl TestChain {
     pub fn decoder_type(&self) -> DecoderType {
         match self {
             Self::NvencNvdec => DecoderType::Nvdec,
-            Self::CaptureOnly | Self::NvencOnly | Self::OpenH264 => DecoderType::Software,
+            Self::CaptureOnly | Self::NvencOnly | Self::OpenH264 => DecoderType::None,
             Self::Custom { decoder, .. } => decoder.clone(),
         }
     }
@@ -168,6 +182,8 @@ pub struct HarnessMetrics {
     pub capture_latency_p95_ms: f64,
     pub encode_latency_p50_ms: f64,
     pub encode_latency_p95_ms: f64,
+    pub transport_latency_p50_ms: f64,
+    pub transport_latency_p95_ms: f64,
     pub decode_latency_p50_ms: f64,
     pub decode_latency_p95_ms: f64,
     pub total_latency_p50_ms: f64,
@@ -187,6 +203,8 @@ impl Default for HarnessMetrics {
             capture_latency_p95_ms: 0.0,
             encode_latency_p50_ms: 0.0,
             encode_latency_p95_ms: 0.0,
+            transport_latency_p50_ms: 0.0,
+            transport_latency_p95_ms: 0.0,
             decode_latency_p50_ms: 0.0,
             decode_latency_p95_ms: 0.0,
             total_latency_p50_ms: 0.0,
@@ -209,6 +227,7 @@ struct FrameBuffer {
 struct PipelineState {
     capture: DxgiDesktopCapture,
     encoder: Option<Box<dyn VideoEncoder>>,
+    transport: PipelineTransport,
     decoder: Option<PipelineDecoder>,
     renderer: Option<PipelineRenderer>,
     use_decoder: bool,
@@ -220,6 +239,104 @@ struct PipelineState {
 enum PipelineDecoder {
     Nvdec(NvdecDecoder),
     Software(Box<dyn VideoDecoder>),
+}
+
+enum PipelineTransport {
+    Loopback,
+    WebrtcRtp {
+        sender: mrd_transport_webrtc::H264RtpSender,
+        ingress: mrd_transport_webrtc::H264RtpIngress,
+    },
+    QuicDatagram {
+        reassembler: mrd_transport_quic_quinn::QuicAuReassembler,
+        next_frame_id: u32,
+        max_datagram_size: usize,
+    },
+}
+
+impl PipelineTransport {
+    fn new(kind: Option<&TransportKind>, fps: u32) -> Self {
+        match kind.unwrap_or(&TransportKind::Loopback) {
+            TransportKind::Loopback => Self::Loopback,
+            TransportKind::WebrtcRtp => Self::WebrtcRtp {
+                sender: mrd_transport_webrtc::H264RtpSender::new(
+                    "matrix-video",
+                    "matrix-stream",
+                    fps,
+                    1200,
+                ),
+                ingress: mrd_transport_webrtc::H264RtpIngress::default(),
+            },
+            TransportKind::QuicDatagram => Self::QuicDatagram {
+                reassembler: mrd_transport_quic_quinn::QuicAuReassembler::default(),
+                next_frame_id: 0,
+                max_datagram_size: 1200,
+            },
+        }
+    }
+
+    fn transmit(&mut self, access_units: Vec<EncodedAccessUnit>) -> Result<Vec<EncodedAccessUnit>> {
+        match self {
+            Self::Loopback => Ok(access_units),
+            Self::WebrtcRtp { sender, ingress } => {
+                let mut reassembled = Vec::with_capacity(access_units.len());
+                for access_unit in access_units {
+                    if access_unit.codec != VideoCodec::H264 {
+                        anyhow::bail!("WebRTC RTP matrix transport only supports H.264");
+                    }
+                    let packets = sender
+                        .packetize_access_unit(&access_unit)
+                        .map_err(|error| anyhow::anyhow!("WebRTC RTP packetize failed: {error}"))?;
+                    for packet in packets {
+                        if let Some(unit) = ingress.push_packet(
+                            &packet.payload,
+                            packet.header.marker,
+                            packet.header.sequence_number,
+                            access_unit.timestamp_us,
+                        ) {
+                            reassembled.push(unit);
+                        }
+                    }
+                }
+                Ok(reassembled)
+            }
+            Self::QuicDatagram {
+                reassembler,
+                next_frame_id,
+                max_datagram_size,
+            } => {
+                let mut reassembled = Vec::with_capacity(access_units.len());
+                for access_unit in access_units {
+                    let frame_id = *next_frame_id;
+                    *next_frame_id = next_frame_id.wrapping_add(1);
+                    let datagrams = mrd_transport_quic_quinn::fragment_access_unit(
+                        frame_id,
+                        access_unit.timestamp_us,
+                        access_unit.is_keyframe,
+                        &access_unit.bytes,
+                        *max_datagram_size,
+                    )
+                    .map_err(|error| anyhow::anyhow!("QUIC AU fragment failed: {error}"))?;
+
+                    for datagram in datagrams {
+                        if let Some(frame) =
+                            reassembler.push_datagram(&datagram).map_err(|error| {
+                                anyhow::anyhow!("QUIC AU reassemble failed: {error}")
+                            })?
+                        {
+                            reassembled.push(EncodedAccessUnit {
+                                codec: access_unit.codec,
+                                timestamp_us: frame.timestamp_us,
+                                is_keyframe: frame.is_keyframe,
+                                bytes: frame.payload.to_vec(),
+                            });
+                        }
+                    }
+                }
+                Ok(reassembled)
+            }
+        }
+    }
 }
 
 impl PipelineDecoder {
@@ -660,6 +777,16 @@ impl TestHarness {
                 // TODO: Implement WinRT capture and AV1 encoding.
                 match encoder {
                     EncoderType::NvencH264 => match decoder {
+                        DecoderType::None => {
+                            let enc = NvencH264Encoder::new_max_speed_with_bitrate(
+                                width,
+                                height,
+                                fps,
+                                speed_bitrate,
+                            )
+                            .map_err(|e| anyhow::anyhow!("NVENC encoder init failed: {:?}", e))?;
+                            (Some(Box::new(enc) as Box<dyn VideoEncoder>), None, false)
+                        }
                         DecoderType::Nvdec => {
                             let enc = NvencH264Encoder::new_with_bitrate(
                                 width,
@@ -703,6 +830,9 @@ impl TestHarness {
                         }
                         .map_err(|e| anyhow::anyhow!("OpenH264 编码器初始化失败: {:?}", e))?;
                         match decoder {
+                            DecoderType::None => {
+                                (Some(Box::new(enc) as Box<dyn VideoEncoder>), None, false)
+                            }
                             DecoderType::Nvdec => {
                                 let dec =
                                     NvdecDecoder::new_with_output_mode(NvdecOutputMode::CpuNv12)
@@ -729,11 +859,31 @@ impl TestHarness {
                         }
                     }
                     EncoderType::NvencAv1 => {
-                        return Err(anyhow::anyhow!("AV1 编码器尚未实现"));
+                        if !matches!(decoder, DecoderType::None) {
+                            return Err(anyhow::anyhow!(
+                                "AV1 decoder path is not implemented; choose decoder none"
+                            ));
+                        }
+                        #[cfg(windows)]
+                        {
+                            let enc = NvencAv1Encoder::new_low_latency(width, height, fps)
+                                .map_err(|e| {
+                                    anyhow::anyhow!("NVENC AV1 encoder init failed: {:?}", e)
+                                })?;
+                            (Some(Box::new(enc) as Box<dyn VideoEncoder>), None, false)
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            return Err(anyhow::anyhow!(
+                                "NVENC AV1 encoder is only available on Windows"
+                            ));
+                        }
                     }
                 }
             }
         };
+
+        let transport = PipelineTransport::new(config.transport.as_ref(), fps);
 
         let renderer = config
             .renderer
@@ -744,6 +894,7 @@ impl TestHarness {
         Ok(PipelineState {
             capture,
             encoder,
+            transport,
             decoder,
             renderer,
             use_decoder,
@@ -762,6 +913,7 @@ impl TestHarness {
         let start_time = Instant::now();
         let mut capture_latencies = Vec::with_capacity(1000);
         let mut encode_latencies = Vec::with_capacity(1000);
+        let mut transport_latencies = Vec::with_capacity(1000);
         let mut decode_latencies = Vec::with_capacity(1000);
         let mut total_latencies = Vec::with_capacity(1000);
         let mut frame_count = 0_usize;
@@ -802,14 +954,29 @@ impl TestHarness {
                 (Vec::new(), None)
             };
 
+            let (transported_units, transport_latency) = if encoded_units.is_empty() {
+                (encoded_units, None)
+            } else {
+                let transport_start = Instant::now();
+                match state.transport.transmit(encoded_units) {
+                    Ok(units) => (units, Some(transport_start.elapsed())),
+                    Err(error) => {
+                        let mut m = metrics.lock().unwrap();
+                        m.error_message = Some(error.to_string());
+                        running.store(false, Ordering::Relaxed);
+                        break;
+                    }
+                }
+            };
+
             // Decode if needed
             let mut decoded_frames = Vec::new();
-            let decode_latency = if state.use_decoder && !encoded_units.is_empty() {
+            let decode_latency = if state.use_decoder && !transported_units.is_empty() {
                 if let Some(decoder) = state.decoder.as_mut() {
                     let decode_start = Instant::now();
                     let mut pushed_any = false;
                     let mut failed_units = 0_usize;
-                    for unit in &encoded_units {
+                    for unit in &transported_units {
                         match decoder.push_access_unit(&unit.bytes) {
                             Ok(()) => {
                                 pushed_any = true;
@@ -859,6 +1026,9 @@ impl TestHarness {
             if let Some(latency) = encode_latency {
                 encode_latencies.push(latency);
             }
+            if let Some(latency) = transport_latency {
+                transport_latencies.push(latency);
+            }
             if let Some(latency) = decode_latency {
                 decode_latencies.push(latency);
             }
@@ -867,6 +1037,7 @@ impl TestHarness {
             Self::trim_latency_buffers(
                 &mut capture_latencies,
                 &mut encode_latencies,
+                &mut transport_latencies,
                 &mut decode_latencies,
                 &mut total_latencies,
             );
@@ -892,6 +1063,7 @@ impl TestHarness {
                     &start_time,
                     &capture_latencies,
                     &encode_latencies,
+                    &transport_latencies,
                     &decode_latencies,
                     &total_latencies,
                 );
@@ -905,6 +1077,7 @@ impl TestHarness {
             &start_time,
             &capture_latencies,
             &encode_latencies,
+            &transport_latencies,
             &decode_latencies,
             &total_latencies,
         );
@@ -920,6 +1093,7 @@ impl TestHarness {
         start_time: &Instant,
         capture_latencies: &[Duration],
         encode_latencies: &[Duration],
+        transport_latencies: &[Duration],
         decode_latencies: &[Duration],
         total_latencies: &[Duration],
     ) {
@@ -932,6 +1106,7 @@ impl TestHarness {
 
         let (p50_cap, p95_cap) = Self::compute_percentiles(capture_latencies);
         let (p50_enc, p95_enc) = Self::compute_percentiles(encode_latencies);
+        let (p50_transport, p95_transport) = Self::compute_percentiles(transport_latencies);
         let (p50_dec, p95_dec) = Self::compute_percentiles(decode_latencies);
         let (p50_total, p95_total) = Self::compute_percentiles(total_latencies);
 
@@ -943,6 +1118,8 @@ impl TestHarness {
         m.capture_latency_p95_ms = p95_cap.as_secs_f64() * 1000.0;
         m.encode_latency_p50_ms = p50_enc.as_secs_f64() * 1000.0;
         m.encode_latency_p95_ms = p95_enc.as_secs_f64() * 1000.0;
+        m.transport_latency_p50_ms = p50_transport.as_secs_f64() * 1000.0;
+        m.transport_latency_p95_ms = p95_transport.as_secs_f64() * 1000.0;
         m.decode_latency_p50_ms = p50_dec.as_secs_f64() * 1000.0;
         m.decode_latency_p95_ms = p95_dec.as_secs_f64() * 1000.0;
         m.total_latency_p50_ms = p50_total.as_secs_f64() * 1000.0;
@@ -963,6 +1140,7 @@ impl TestHarness {
     fn trim_latency_buffers(
         capture_latencies: &mut Vec<Duration>,
         encode_latencies: &mut Vec<Duration>,
+        transport_latencies: &mut Vec<Duration>,
         decode_latencies: &mut Vec<Duration>,
         total_latencies: &mut Vec<Duration>,
     ) {
@@ -971,6 +1149,9 @@ impl TestHarness {
         }
         if encode_latencies.len() > 1000 {
             encode_latencies.remove(0);
+        }
+        if transport_latencies.len() > 1000 {
+            transport_latencies.remove(0);
         }
         if decode_latencies.len() > 1000 {
             decode_latencies.remove(0);
@@ -1392,12 +1573,14 @@ mod tests {
     fn trim_latency_buffers_handles_encode_only_samples() {
         let mut capture_latencies = Vec::new();
         let mut encode_latencies = (0..=1000).map(Duration::from_millis).collect::<Vec<_>>();
+        let mut transport_latencies = Vec::new();
         let mut decode_latencies = Vec::new();
         let mut total_latencies = Vec::new();
 
         TestHarness::trim_latency_buffers(
             &mut capture_latencies,
             &mut encode_latencies,
+            &mut transport_latencies,
             &mut decode_latencies,
             &mut total_latencies,
         );
@@ -1405,6 +1588,7 @@ mod tests {
         assert!(capture_latencies.is_empty());
         assert_eq!(encode_latencies.len(), 1000);
         assert_eq!(encode_latencies[0], Duration::from_millis(1));
+        assert!(transport_latencies.is_empty());
         assert!(decode_latencies.is_empty());
         assert!(total_latencies.is_empty());
     }
@@ -1413,22 +1597,26 @@ mod tests {
     fn trim_latency_buffers_trims_each_populated_series_independently() {
         let mut capture_latencies = (0..=1000).map(Duration::from_millis).collect::<Vec<_>>();
         let mut encode_latencies = (0..=1000).map(Duration::from_millis).collect::<Vec<_>>();
+        let mut transport_latencies = (0..=1000).map(Duration::from_millis).collect::<Vec<_>>();
         let mut decode_latencies = (0..=1000).map(Duration::from_millis).collect::<Vec<_>>();
         let mut total_latencies = (0..=1000).map(Duration::from_millis).collect::<Vec<_>>();
 
         TestHarness::trim_latency_buffers(
             &mut capture_latencies,
             &mut encode_latencies,
+            &mut transport_latencies,
             &mut decode_latencies,
             &mut total_latencies,
         );
 
         assert_eq!(capture_latencies.len(), 1000);
         assert_eq!(encode_latencies.len(), 1000);
+        assert_eq!(transport_latencies.len(), 1000);
         assert_eq!(decode_latencies.len(), 1000);
         assert_eq!(total_latencies.len(), 1000);
         assert_eq!(capture_latencies[0], Duration::from_millis(1));
         assert_eq!(encode_latencies[0], Duration::from_millis(1));
+        assert_eq!(transport_latencies[0], Duration::from_millis(1));
         assert_eq!(decode_latencies[0], Duration::from_millis(1));
         assert_eq!(total_latencies[0], Duration::from_millis(1));
     }
@@ -1581,6 +1769,12 @@ mod tests {
                 .and_then(|value| value.parse::<u32>().ok()),
             renderer: match std::env::var("MRD_HARNESS_RENDERER").as_deref() {
                 Ok("d3d11") => Some(RendererType::D3d11),
+                _ => None,
+            },
+            transport: match std::env::var("MRD_HARNESS_TRANSPORT").as_deref() {
+                Ok("webrtc") | Ok("webrtc_rtp") => Some(TransportKind::WebrtcRtp),
+                Ok("quic") | Ok("quic_datagram") => Some(TransportKind::QuicDatagram),
+                Ok("loopback") => Some(TransportKind::Loopback),
                 _ => None,
             },
         });

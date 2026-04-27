@@ -135,7 +135,8 @@ describe("MatrixTestPage failure handling", () => {
 
     render(<MatrixTestPage runDelayMs={0} />);
     selectSingleSupportedCombination();
-    fireEvent.click(screen.getByLabelText("弹窗显示"));
+    fireEvent.click(screen.getByLabelText("No display"));
+    fireEvent.click(screen.getByLabelText("DX11 popup"));
     fireEvent.click(screen.getByRole("button", { name: /启动矩阵测试/ }));
 
     await waitFor(() => {
@@ -145,6 +146,36 @@ describe("MatrixTestPage failure handling", () => {
           config: expect.objectContaining({
             renderer_type: "d3d11",
             render_display: true,
+          }),
+        })
+      );
+    });
+  });
+
+  it("passes selected transport matrix value", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_start_run") {
+        return Promise.resolve("run-1");
+      }
+      if (command === "test_get_run") {
+        return Promise.resolve(null);
+      }
+      return Promise.resolve(null);
+    });
+
+    render(<MatrixTestPage runDelayMs={0} />);
+    selectSingleSupportedCombination();
+    fireEvent.click(screen.getByLabelText("Loopback"));
+    fireEvent.click(screen.getByLabelText("QUIC Datagram"));
+    fireEvent.click(screen.getByRole("button", { name: /启动矩阵测试/ }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_start_run",
+        expect.objectContaining({
+          config: expect.objectContaining({
+            transport_kind: "quic",
           }),
         })
       );
