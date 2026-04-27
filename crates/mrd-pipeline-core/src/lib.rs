@@ -53,6 +53,8 @@ pub enum DecodedFrameData {
     CpuRgb24(Vec<u8>),
     /// CPU BGRA32 data (optimized path for D3D11 rendering)
     CpuBgra32(Vec<u8>),
+    /// CPU NV12 data with decoder pitch.
+    CpuNv12 { data: Vec<u8>, pitch: usize },
     /// D3D11 shared texture handle (zero-copy path)
     #[cfg(windows)]
     D3D11SharedNv12 {
@@ -89,6 +91,22 @@ impl DecodedFrame {
             height,
             timestamp_us,
             data: DecodedFrameData::CpuBgra32(data),
+        }
+    }
+
+    /// Create a decoded frame from CPU NV12 data
+    pub fn from_cpu_nv12(
+        width: usize,
+        height: usize,
+        timestamp_us: u64,
+        pitch: usize,
+        data: Vec<u8>,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            timestamp_us,
+            data: DecodedFrameData::CpuNv12 { data, pitch },
         }
     }
 
@@ -133,10 +151,20 @@ impl DecodedFrame {
         }
     }
 
+    /// Get the CPU NV12 data and pitch if available
+    pub fn cpu_nv12(&self) -> Option<(&[u8], usize)> {
+        match &self.data {
+            DecodedFrameData::CpuNv12 { data, pitch } => Some((data.as_slice(), *pitch)),
+            _ => None,
+        }
+    }
+
     /// Get any CPU data as bytes
     pub fn cpu_bytes(&self) -> Option<&[u8]> {
         match &self.data {
-            DecodedFrameData::CpuRgb24(data) | DecodedFrameData::CpuBgra32(data) => Some(data.as_slice()),
+            DecodedFrameData::CpuRgb24(data)
+            | DecodedFrameData::CpuBgra32(data)
+            | DecodedFrameData::CpuNv12 { data, .. } => Some(data.as_slice()),
             #[cfg(windows)]
             DecodedFrameData::D3D11SharedNv12 { .. } => None,
         }

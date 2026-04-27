@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use mrd_capture_dxgi::DxgiDesktopCapture;
-use mrd_decode_nvdec::NvdecDecoder;
+use mrd_decode_nvdec::{NvdecDecoder, NvdecOutputMode};
 use mrd_encode_nvenc::NvencH264Encoder;
 use mrd_encode_openh264::OpenH264Encoder;
 use mrd_pipeline_core::{CapturedFrame, FrameCapture, FramePixelFormat, VideoEncoder};
@@ -335,7 +335,7 @@ impl TestHarness {
             TestChain::NvencNvdec => {
                 let encoder = NvencH264Encoder::new(width, height, fps)
                     .map_err(|e| anyhow::anyhow!("NVENC 编码器初始化失败: {:?}", e))?;
-                let decoder = NvdecDecoder::new()
+                let decoder = NvdecDecoder::new_with_output_mode(NvdecOutputMode::CpuNv12)
                     .map_err(|e| anyhow::anyhow!("NVDEC 解码器初始化失败: {:?}", e))?;
                 (
                     Some(Box::new(encoder) as Box<dyn VideoEncoder>),
@@ -373,7 +373,7 @@ impl TestHarness {
                         DecoderType::Nvdec => {
                             let enc = NvencH264Encoder::new(width, height, fps)
                                 .map_err(|e| anyhow::anyhow!("NVENC 编码器初始化失败: {:?}", e))?;
-                            let dec = NvdecDecoder::new()
+                            let dec = NvdecDecoder::new_with_output_mode(NvdecOutputMode::CpuNv12)
                                 .map_err(|e| anyhow::anyhow!("NVDEC 解码器初始化失败: {:?}", e))?;
                             (
                                 Some(Box::new(enc) as Box<dyn VideoEncoder>),

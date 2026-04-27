@@ -1,6 +1,6 @@
 use mrd_decode_nvdec::{
     probe_h264_available, probe_hevc_available, probe_hevc_main10_available, probe_runtime,
-    NvdecDecoder,
+    NvdecDecoder, NvdecOutputMode,
 };
 use openh264::{
     encoder::Encoder,
@@ -193,6 +193,40 @@ fn nvdec_decoder_emits_rgb_frame() {
     assert_eq!(frames[0].width, 128);
     assert_eq!(frames[0].height, 128);
     assert_eq!(frames[0].cpu_rgb24().unwrap().len(), 128 * 128 * 3);
+}
+
+#[test]
+fn nvdec_decoder_can_emit_nv12_frame() {
+    let mut decoder = match NvdecDecoder::new_with_output_mode(NvdecOutputMode::CpuNv12) {
+        Ok(decoder) => decoder,
+        Err(error) => {
+            assert!(
+                error.contains("nvdec")
+                    || error.contains("cuda")
+                    || error.contains("cu")
+                    || error.contains("failed"),
+                "unexpected constructor error: {error}"
+            );
+            return;
+        }
+    };
+
+    let access_unit = encoded_access_unit();
+    decoder
+        .push_access_unit(access_unit.as_slice())
+        .expect("valid h264 access unit should traverse nvdec path");
+
+    let frames = decoder.drain_decoded_frames();
+    assert!(
+        !frames.is_empty(),
+        "nvdec should emit at least one decoded frame"
+    );
+    assert_eq!(frames[0].width, 128);
+    assert_eq!(frames[0].height, 128);
+    let (nv12, pitch) = frames[0].cpu_nv12().expect("expected CPU NV12 output");
+    assert!(pitch >= 128);
+    assert!(nv12.len() >= pitch * 128 * 3 / 2);
+    assert!(frames[0].cpu_rgb24().is_none());
 }
 
 #[test]

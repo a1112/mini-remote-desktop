@@ -142,6 +142,9 @@ impl VideoDecoder for NvdecVideoDecoder {
                 NvdecDecodedFrameData::CpuRgb24(data) => {
                     CoreDecodedFrame::from_cpu_rgb24(frame.width, frame.height, 0, data)
                 }
+                NvdecDecodedFrameData::CpuNv12 { data, pitch } => {
+                    CoreDecodedFrame::from_cpu_nv12(frame.width, frame.height, 0, pitch, data)
+                }
                 #[cfg(windows)]
                 NvdecDecodedFrameData::D3D11SharedNv12 {
                     shared_handle,

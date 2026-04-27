@@ -7,6 +7,8 @@ use std::ffi::{c_int, c_void};
 pub enum NvdecDecodedFrameData {
     /// CPU RGB24 data (standard path)
     CpuRgb24(Vec<u8>),
+    /// CPU NV12 data with decoder pitch.
+    CpuNv12 { data: Vec<u8>, pitch: usize },
     /// D3D11 shared texture handle (zero-copy path)
     #[cfg(windows)]
     D3D11SharedNv12 {
@@ -33,10 +35,19 @@ impl NvdecDecodedFrame {
         }
     }
 
+    /// Create a decoded frame from CPU NV12 data.
+    pub fn from_cpu_nv12(width: usize, height: usize, pitch: usize, data: Vec<u8>) -> Self {
+        Self {
+            width,
+            height,
+            data: NvdecDecodedFrameData::CpuNv12 { data, pitch },
+        }
+    }
+
     /// Check if this frame uses shared texture (zero-copy)
     pub fn is_shared_texture(&self) -> bool {
         match &self.data {
-            NvdecDecodedFrameData::CpuRgb24(_) => false,
+            NvdecDecodedFrameData::CpuRgb24(_) | NvdecDecodedFrameData::CpuNv12 { .. } => false,
             #[cfg(windows)]
             NvdecDecodedFrameData::D3D11SharedNv12 { .. } => true,
         }
@@ -46,6 +57,17 @@ impl NvdecDecodedFrame {
     pub fn cpu_rgb24(&self) -> Option<&[u8]> {
         match &self.data {
             NvdecDecodedFrameData::CpuRgb24(data) => Some(data.as_slice()),
+            NvdecDecodedFrameData::CpuNv12 { .. } => None,
+            #[cfg(windows)]
+            NvdecDecodedFrameData::D3D11SharedNv12 { .. } => None,
+        }
+    }
+
+    /// Get the CPU NV12 data and pitch if available.
+    pub fn cpu_nv12(&self) -> Option<(&[u8], usize)> {
+        match &self.data {
+            NvdecDecodedFrameData::CpuNv12 { data, pitch } => Some((data.as_slice(), *pitch)),
+            NvdecDecodedFrameData::CpuRgb24(_) => None,
             #[cfg(windows)]
             NvdecDecodedFrameData::D3D11SharedNv12 { .. } => None,
         }
@@ -55,10 +77,16 @@ impl NvdecDecodedFrame {
     #[cfg(windows)]
     pub fn d3d11_shared_handle(&self) -> Option<isize> {
         match &self.data {
-            NvdecDecodedFrameData::CpuRgb24(_) => None,
+            NvdecDecodedFrameData::CpuRgb24(_) | NvdecDecodedFrameData::CpuNv12 { .. } => None,
             NvdecDecodedFrameData::D3D11SharedNv12 { shared_handle, .. } => Some(*shared_handle),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NvdecOutputMode {
+    CpuRgb24,
+    CpuNv12,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,9 +164,13 @@ unsafe impl Send for NvdecDecoder {}
 
 impl NvdecDecoder {
     pub fn new() -> Result<Self, String> {
+        Self::new_with_output_mode(NvdecOutputMode::CpuRgb24)
+    }
+
+    pub fn new_with_output_mode(output_mode: NvdecOutputMode) -> Result<Self, String> {
         #[cfg(windows)]
         {
-            let session = imp::NvdecSession::new()?;
+            let session = imp::NvdecSession::new(output_mode)?;
             let runtime = NvdecRuntimeProbe {
                 backend: "windows-nvdec",
                 summary: "nvdec runtime libraries and core exports are present".to_string(),
@@ -164,6 +196,7 @@ impl NvdecDecoder {
 
         #[cfg(not(windows))]
         {
+            let _ = output_mode;
             Err("Windows-only nvdec backend is unavailable on this platform".to_string())
         }
     }
@@ -336,7 +369,7 @@ mod imp {
 
     use super::{
         c_int, c_void, NvdecCapabilityProbe, NvdecDecodedFrame, NvdecDecodedFrameData,
-        NvdecDiagnostics,
+        NvdecDiagnostics, NvdecOutputMode,
     };
     use std::{mem, ptr};
     use windows::core::{Interface, PCSTR};
@@ -982,6 +1015,7 @@ mod imp {
         sequence_width: u32,
         sequence_height: u32,
         diagnostics: NvdecDiagnostics,
+        output_mode: NvdecOutputMode,
         last_error: Option<String>,
         frames: Vec<NvdecDecodedFrame>,
         // Shared texture support (when enabled, outputs D3D11SharedNv12 frames)
@@ -991,7 +1025,7 @@ mod imp {
     }
 
     impl NvdecSession {
-        pub fn new() -> Result<Self, String> {
+        pub fn new(output_mode: NvdecOutputMode) -> Result<Self, String> {
             let cuda = CudaApi::load()?;
             let cuvid = CuvidApi::load()?;
 
@@ -1077,6 +1111,7 @@ mod imp {
                 sequence_width: 0,
                 sequence_height: 0,
                 diagnostics: NvdecDiagnostics::default(),
+                output_mode,
                 last_error: None,
                 frames: Vec::new(),
                 use_shared_texture: false,
@@ -1857,10 +1892,7 @@ mod imp {
                     (state.cu_memcpy_dtoh)(nv12.as_mut_ptr() as *mut c_void, dev_ptr, total)
                 };
                 if copy_result == CUDA_SUCCESS {
-                    let rgb = nv12_to_rgb(&nv12, width, height, pitch as usize);
-                    state
-                        .frames
-                        .push(NvdecDecodedFrame::from_cpu_rgb24(width, height, rgb));
+                    push_cpu_decoded_frame(state, width, height, pitch as usize, nv12);
                 }
             }
         } else {
@@ -1877,8 +1909,6 @@ mod imp {
                 return 0;
             }
 
-            let rgb = nv12_to_rgb(&nv12, width, height, pitch as usize);
-
             // Check if shared texture mode is enabled
             if state.use_shared_texture {
                 if let (Some(shared_y), Some(_shared_uv)) =
@@ -1894,14 +1924,10 @@ mod imp {
                         },
                     });
                 } else {
-                    state
-                        .frames
-                        .push(NvdecDecodedFrame::from_cpu_rgb24(width, height, rgb));
+                    push_cpu_decoded_frame(state, width, height, pitch as usize, nv12);
                 }
             } else {
-                state
-                    .frames
-                    .push(NvdecDecodedFrame::from_cpu_rgb24(width, height, rgb));
+                push_cpu_decoded_frame(state, width, height, pitch as usize, nv12);
             }
         }
 
@@ -1911,6 +1937,28 @@ mod imp {
             return 0;
         }
         1
+    }
+
+    fn push_cpu_decoded_frame(
+        state: &mut CallbackState,
+        width: usize,
+        height: usize,
+        pitch: usize,
+        nv12: Vec<u8>,
+    ) {
+        match state.output_mode {
+            NvdecOutputMode::CpuRgb24 => {
+                let rgb = nv12_to_rgb(&nv12, width, height, pitch);
+                state
+                    .frames
+                    .push(NvdecDecodedFrame::from_cpu_rgb24(width, height, rgb));
+            }
+            NvdecOutputMode::CpuNv12 => {
+                state
+                    .frames
+                    .push(NvdecDecodedFrame::from_cpu_nv12(width, height, pitch, nv12));
+            }
+        }
     }
 
     fn cuda_ok(

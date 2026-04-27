@@ -1192,6 +1192,7 @@ impl TestOrchestrator {
         match &frame.data {
             DecodedFrameData::CpuRgb24(_) => "Rgb24".to_string(),
             DecodedFrameData::CpuBgra32(_) => "Bgra32".to_string(),
+            DecodedFrameData::CpuNv12 { .. } => "Nv12".to_string(),
             #[cfg(windows)]
             DecodedFrameData::D3D11SharedNv12 { .. } => "D3D11SharedNv12".to_string(),
         }
@@ -1205,11 +1206,43 @@ impl TestOrchestrator {
             DecodedFrameData::CpuBgra32(data) => {
                 RenderFrame::from_bgra32(frame.width, frame.height, data.clone())
             }
+            DecodedFrameData::CpuNv12 { data, pitch } => RenderFrame::from_rgb24(
+                frame.width,
+                frame.height,
+                Self::cpu_nv12_to_rgb24(data, frame.width, frame.height, *pitch),
+            ),
             #[cfg(windows)]
             DecodedFrameData::D3D11SharedNv12 { shared_handle, .. } => {
                 RenderFrame::from_d3d11_shared_nv12(frame.width, frame.height, *shared_handle)
             }
         }
+    }
+
+    fn cpu_nv12_to_rgb24(nv12: &[u8], width: usize, height: usize, pitch: usize) -> Vec<u8> {
+        let mut rgb = vec![0_u8; width * height * 3];
+        let uv_base = pitch * height;
+        let mut out_idx = 0;
+
+        for y in 0..height {
+            let uv_row_start = uv_base + (y / 2) * pitch;
+            for x in 0..width {
+                let y_sample = nv12[y * pitch + x] as i32 - 16;
+                let uv_offset = uv_row_start + (x / 2) * 2;
+                let u = nv12[uv_offset] as i32 - 128;
+                let v = nv12[uv_offset + 1] as i32 - 128;
+
+                let r = (298 * y_sample + 409 * v + 128) >> 8;
+                let g = (298 * y_sample - 100 * u - 208 * v + 128) >> 8;
+                let b = (298 * y_sample + 516 * u + 128) >> 8;
+
+                rgb[out_idx] = r.clamp(0, 255) as u8;
+                rgb[out_idx + 1] = g.clamp(0, 255) as u8;
+                rgb[out_idx + 2] = b.clamp(0, 255) as u8;
+                out_idx += 3;
+            }
+        }
+
+        rgb
     }
 
     /// Stop a running test
