@@ -8,7 +8,7 @@ use mrd_capture_dxgi::DxgiDesktopCapture;
 use mrd_decode_nvdec::NvdecDecoder;
 use mrd_encode_nvenc::NvencH264Encoder;
 use mrd_encode_openh264::OpenH264Encoder;
-use mrd_pipeline_core::{CapturedFrame, FrameCapture, VideoEncoder};
+use mrd_pipeline_core::{CapturedFrame, FrameCapture, FramePixelFormat, VideoEncoder};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -99,11 +99,7 @@ impl TestChain {
             Self::NvencNvdec => "NVENC H.264 + NVDEC (全硬件加速)",
             Self::NvencOnly => "NVENC H.264 编码器测试",
             Self::OpenH264 => "OpenH264 编码器测试 (软件)",
-            Self::Custom {
-                capture,
-                encoder,
-                decoder,
-            } => {
+            Self::Custom { .. } => {
                 // Build a descriptive name
                 "自定义配置"
             }
@@ -209,6 +205,7 @@ struct PipelineState {
 pub struct TestHarness {
     running: Arc<AtomicBool>,
     chain: TestChain,
+    config: TestConfig,
     metrics: Arc<Mutex<HarnessMetrics>>,
     frame_buffer: Arc<Mutex<FrameBuffer>>,
     thread_handle: Option<thread::JoinHandle<()>>,
@@ -230,6 +227,7 @@ impl TestHarness {
         Ok(Self {
             running,
             chain: TestChain::default(),
+            config: TestConfig::default(),
             metrics,
             frame_buffer,
             thread_handle: None,
@@ -238,6 +236,10 @@ impl TestHarness {
 
     pub fn set_chain(&mut self, chain: TestChain) {
         self.chain = chain;
+    }
+
+    pub fn set_config(&mut self, config: TestConfig) {
+        self.config = config;
     }
 
     pub fn get_chain(&self) -> TestChain {
@@ -250,6 +252,7 @@ impl TestHarness {
         }
 
         let chain = self.chain.clone();
+        let config = self.config.clone();
         let frame_buffer = self.frame_buffer.clone();
         let metrics = self.metrics.clone();
         let running = self.running.clone();
@@ -259,7 +262,14 @@ impl TestHarness {
         running.store(true, Ordering::Relaxed);
 
         let handle = thread::spawn(move || {
-            Self::run_pipeline(frame_buffer, metrics, running_for_thread, chain, init_tx);
+            Self::run_pipeline(
+                frame_buffer,
+                metrics,
+                running_for_thread,
+                chain,
+                config,
+                init_tx,
+            );
         });
 
         match init_rx.recv() {
@@ -284,9 +294,10 @@ impl TestHarness {
         metrics: Arc<Mutex<HarnessMetrics>>,
         running: Arc<AtomicBool>,
         chain: TestChain,
+        config: TestConfig,
         init_tx: mpsc::Sender<Result<()>>,
     ) {
-        let state = match Self::initialize_components(&chain) {
+        let state = match Self::initialize_components(&chain, &config) {
             Ok(s) => s,
             Err(e) => {
                 let message = e.to_string();
@@ -313,16 +324,16 @@ impl TestHarness {
         Self::process_loop(state, frame_buffer, metrics, running);
     }
 
-    fn initialize_components(chain: &TestChain) -> Result<PipelineState> {
+    fn initialize_components(chain: &TestChain, config: &TestConfig) -> Result<PipelineState> {
         let capture = DxgiDesktopCapture::new_primary()
             .map_err(|e| anyhow::anyhow!("DXGI 捕获初始化失败: {:?}", e))?;
-        let width = capture.width();
-        let height = capture.height();
+        let (width, height) = select_pipeline_dimensions(capture.width(), capture.height(), config);
+        let fps = config.fps.unwrap_or(60).max(1);
 
         let (encoder, decoder, use_decoder) = match chain {
             TestChain::CaptureOnly => (None, None, false),
             TestChain::NvencNvdec => {
-                let encoder = NvencH264Encoder::new_max_speed(width, height, 60)
+                let encoder = NvencH264Encoder::new(width, height, fps)
                     .map_err(|e| anyhow::anyhow!("NVENC 编码器初始化失败: {:?}", e))?;
                 let decoder = NvdecDecoder::new()
                     .map_err(|e| anyhow::anyhow!("NVDEC 解码器初始化失败: {:?}", e))?;
@@ -333,7 +344,7 @@ impl TestHarness {
                 )
             }
             TestChain::NvencOnly => {
-                let encoder = NvencH264Encoder::new_max_speed(width, height, 60)
+                let encoder = NvencH264Encoder::new_max_speed(width, height, fps)
                     .map_err(|e| anyhow::anyhow!("NVENC 编码器初始化失败: {:?}", e))?;
                 (
                     Some(Box::new(encoder) as Box<dyn VideoEncoder>),
@@ -342,7 +353,7 @@ impl TestHarness {
                 )
             }
             TestChain::OpenH264 => {
-                let encoder = OpenH264Encoder::new(width, height, 60)
+                let encoder = OpenH264Encoder::new(width, height, fps)
                     .map_err(|e| anyhow::anyhow!("OpenH264 编码器初始化失败: {:?}", e))?;
                 (
                     Some(Box::new(encoder) as Box<dyn VideoEncoder>),
@@ -358,27 +369,26 @@ impl TestHarness {
                 // For now, Custom configurations fall back to standard implementations
                 // TODO: Implement WinRT capture, AV1 encoding, software decoding
                 match encoder {
-                    EncoderType::NvencH264 => {
-                        let enc = NvencH264Encoder::new_max_speed(width, height, 60)
-                            .map_err(|e| anyhow::anyhow!("NVENC 编码器初始化失败: {:?}", e))?;
-                        match decoder {
-                            DecoderType::Nvdec => {
-                                let dec = NvdecDecoder::new().map_err(|e| {
-                                    anyhow::anyhow!("NVDEC 解码器初始化失败: {:?}", e)
-                                })?;
-                                (
-                                    Some(Box::new(enc) as Box<dyn VideoEncoder>),
-                                    Some(dec),
-                                    true,
-                                )
-                            }
-                            DecoderType::Software => {
-                                (Some(Box::new(enc) as Box<dyn VideoEncoder>), None, false)
-                            }
+                    EncoderType::NvencH264 => match decoder {
+                        DecoderType::Nvdec => {
+                            let enc = NvencH264Encoder::new(width, height, fps)
+                                .map_err(|e| anyhow::anyhow!("NVENC 编码器初始化失败: {:?}", e))?;
+                            let dec = NvdecDecoder::new()
+                                .map_err(|e| anyhow::anyhow!("NVDEC 解码器初始化失败: {:?}", e))?;
+                            (
+                                Some(Box::new(enc) as Box<dyn VideoEncoder>),
+                                Some(dec),
+                                true,
+                            )
                         }
-                    }
+                        DecoderType::Software => {
+                            let enc = NvencH264Encoder::new_max_speed(width, height, fps)
+                                .map_err(|e| anyhow::anyhow!("NVENC 编码器初始化失败: {:?}", e))?;
+                            (Some(Box::new(enc) as Box<dyn VideoEncoder>), None, false)
+                        }
+                    },
                     EncoderType::OpenH264 => {
-                        let enc = OpenH264Encoder::new(width, height, 60)
+                        let enc = OpenH264Encoder::new(width, height, fps)
                             .map_err(|e| anyhow::anyhow!("OpenH264 编码器初始化失败: {:?}", e))?;
                         (Some(Box::new(enc) as Box<dyn VideoEncoder>), None, false)
                     }
@@ -428,8 +438,18 @@ impl TestHarness {
             let capture_latency = capture_start.elapsed();
 
             let (encoded_units, encode_latency) = if let Some(encoder) = state.encoder.as_mut() {
+                let prepared_frame;
+                let frame_for_encode = if captured_frame.width == state.width
+                    && captured_frame.height == state.height
+                {
+                    &captured_frame
+                } else {
+                    prepared_frame =
+                        adapt_frame_dimensions(&captured_frame, state.width, state.height);
+                    &prepared_frame
+                };
                 let encode_start = Instant::now();
-                let encoded_units = match encoder.encode(&captured_frame) {
+                let encoded_units = match encoder.encode(frame_for_encode) {
                     Ok(units) => units,
                     Err(_) => {
                         dropped_frames += 1;
@@ -444,21 +464,33 @@ impl TestHarness {
 
             // Decode if needed
             let decode_latency = if state.use_decoder && !encoded_units.is_empty() {
-                if let Some(ref mut decoder) = state.decoder.as_mut() {
+                if let Some(decoder) = state.decoder.as_mut() {
                     let decode_start = Instant::now();
-                    let mut got_frame = false;
+                    let mut pushed_any = false;
+                    let mut failed_units = 0_usize;
                     for unit in &encoded_units {
-                        if decoder.push_access_unit(&unit.bytes).is_ok() {
-                            if !decoder.drain_decoded_frames().is_empty() {
-                                got_frame = true;
-                                break;
+                        match decoder.push_access_unit(&unit.bytes) {
+                            Ok(()) => {
+                                pushed_any = true;
+                                if !decoder.drain_decoded_frames().is_empty() {
+                                    break;
+                                }
+                            }
+                            Err(_) => {
+                                failed_units += 1;
                             }
                         }
                     }
-                    if got_frame {
-                        Some(decode_start.elapsed())
+
+                    if !pushed_any {
+                        if failed_units > 0 {
+                            dropped_frames += 1;
+                            Some(decode_start.elapsed())
+                        } else {
+                            None
+                        }
                     } else {
-                        None
+                        Some(decode_start.elapsed())
                     }
                 } else {
                     None
@@ -602,7 +634,6 @@ impl TestHarness {
         {
             let mut m = self.metrics.lock().unwrap();
             m.is_running = false;
-            m.capture_fps = 0.0;
         }
 
         Ok(())
@@ -666,6 +697,126 @@ fn downsample_frame(frame: &CapturedFrame, max_width: usize) -> Result<(Vec<u8>,
     Ok((result, new_width, new_height))
 }
 
+fn select_pipeline_dimensions(
+    capture_width: usize,
+    capture_height: usize,
+    config: &TestConfig,
+) -> (usize, usize) {
+    let (width, height) = config.resolution.unwrap_or((capture_width, capture_height));
+
+    (even_dimension(width), even_dimension(height))
+}
+
+fn even_dimension(value: usize) -> usize {
+    let value = value.max(2);
+    if value % 2 == 0 {
+        value
+    } else {
+        value - 1
+    }
+}
+
+fn resize_frame_nearest(
+    frame: &CapturedFrame,
+    target_width: usize,
+    target_height: usize,
+) -> CapturedFrame {
+    let bytes_per_pixel = bytes_per_pixel(frame.pixel_format);
+    let mut data = vec![0_u8; target_width * target_height * bytes_per_pixel];
+
+    if frame.width == 0 || frame.height == 0 || bytes_per_pixel == 0 {
+        return CapturedFrame {
+            width: target_width,
+            height: target_height,
+            pixel_format: frame.pixel_format,
+            timestamp_us: frame.timestamp_us,
+            data,
+        };
+    }
+
+    for y in 0..target_height {
+        let src_y = (y * frame.height / target_height).min(frame.height.saturating_sub(1));
+        for x in 0..target_width {
+            let src_x = (x * frame.width / target_width).min(frame.width.saturating_sub(1));
+            let src_idx = (src_y * frame.width + src_x) * bytes_per_pixel;
+            let dst_idx = (y * target_width + x) * bytes_per_pixel;
+            if src_idx + bytes_per_pixel <= frame.data.len()
+                && dst_idx + bytes_per_pixel <= data.len()
+            {
+                data[dst_idx..dst_idx + bytes_per_pixel]
+                    .copy_from_slice(&frame.data[src_idx..src_idx + bytes_per_pixel]);
+            }
+        }
+    }
+
+    CapturedFrame {
+        width: target_width,
+        height: target_height,
+        pixel_format: frame.pixel_format,
+        timestamp_us: frame.timestamp_us,
+        data,
+    }
+}
+
+fn adapt_frame_dimensions(
+    frame: &CapturedFrame,
+    target_width: usize,
+    target_height: usize,
+) -> CapturedFrame {
+    if target_width <= frame.width && target_height <= frame.height {
+        crop_frame_center(frame, target_width, target_height)
+    } else {
+        resize_frame_nearest(frame, target_width, target_height)
+    }
+}
+
+fn crop_frame_center(
+    frame: &CapturedFrame,
+    target_width: usize,
+    target_height: usize,
+) -> CapturedFrame {
+    let bytes_per_pixel = bytes_per_pixel(frame.pixel_format);
+    let mut data = vec![0_u8; target_width * target_height * bytes_per_pixel];
+
+    if frame.width == 0 || frame.height == 0 || bytes_per_pixel == 0 {
+        return CapturedFrame {
+            width: target_width,
+            height: target_height,
+            pixel_format: frame.pixel_format,
+            timestamp_us: frame.timestamp_us,
+            data,
+        };
+    }
+
+    let src_x = frame.width.saturating_sub(target_width) / 2;
+    let src_y = frame.height.saturating_sub(target_height) / 2;
+    let row_bytes = target_width * bytes_per_pixel;
+
+    for y in 0..target_height {
+        let src_idx = ((src_y + y) * frame.width + src_x) * bytes_per_pixel;
+        let dst_idx = y * row_bytes;
+        if src_idx + row_bytes <= frame.data.len() && dst_idx + row_bytes <= data.len() {
+            data[dst_idx..dst_idx + row_bytes]
+                .copy_from_slice(&frame.data[src_idx..src_idx + row_bytes]);
+        }
+    }
+
+    CapturedFrame {
+        width: target_width,
+        height: target_height,
+        pixel_format: frame.pixel_format,
+        timestamp_us: frame.timestamp_us,
+        data,
+    }
+}
+
+fn bytes_per_pixel(format: FramePixelFormat) -> usize {
+    match format {
+        FramePixelFormat::Bgra32 | FramePixelFormat::Rgba32 => 4,
+        FramePixelFormat::Rgb24 => 3,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -716,6 +867,91 @@ mod tests {
     }
 
     #[test]
+    fn stop_preserves_last_metrics_snapshot() {
+        let mut harness = TestHarness::new().expect("create harness");
+        {
+            let mut metrics = harness.metrics.lock().unwrap();
+            metrics.is_running = true;
+            metrics.capture_fps = 12.5;
+            metrics.frame_count = 7;
+        }
+
+        harness.stop().expect("stop harness");
+
+        let metrics = harness.get_metrics();
+        assert!(!metrics.is_running);
+        assert_eq!(metrics.capture_fps, 12.5);
+        assert_eq!(metrics.frame_count, 7);
+    }
+
+    #[test]
+    fn select_pipeline_dimensions_rounds_to_even_values() {
+        let config = TestConfig::default();
+        assert_eq!(
+            select_pipeline_dimensions(1707, 1067, &config),
+            (1706, 1066)
+        );
+
+        let config = TestConfig {
+            resolution: Some((1921, 1081)),
+            ..Default::default()
+        };
+        assert_eq!(
+            select_pipeline_dimensions(1707, 1067, &config),
+            (1920, 1080)
+        );
+    }
+
+    #[test]
+    fn resize_frame_nearest_outputs_requested_shape() {
+        let frame = CapturedFrame {
+            width: 3,
+            height: 2,
+            pixel_format: FramePixelFormat::Bgra32,
+            timestamp_us: 42,
+            data: vec![
+                1, 0, 0, 255, 2, 0, 0, 255, 3, 0, 0, 255, 4, 0, 0, 255, 5, 0, 0, 255, 6, 0, 0, 255,
+            ],
+        };
+
+        let resized = resize_frame_nearest(&frame, 2, 2);
+
+        assert_eq!(resized.width, 2);
+        assert_eq!(resized.height, 2);
+        assert_eq!(resized.timestamp_us, 42);
+        assert_eq!(resized.data.len(), 2 * 2 * 4);
+        assert_eq!(resized.data[0], 1);
+        assert_eq!(resized.data[4], 2);
+        assert_eq!(resized.data[8], 4);
+        assert_eq!(resized.data[12], 5);
+    }
+
+    #[test]
+    fn adapt_frame_dimensions_crops_when_target_fits_source() {
+        let pixels = (1_u8..=12)
+            .flat_map(|value| [value, 0, 0, 255])
+            .collect::<Vec<_>>();
+        let frame = CapturedFrame {
+            width: 4,
+            height: 3,
+            pixel_format: FramePixelFormat::Bgra32,
+            timestamp_us: 99,
+            data: pixels,
+        };
+
+        let cropped = adapt_frame_dimensions(&frame, 2, 2);
+
+        assert_eq!(cropped.width, 2);
+        assert_eq!(cropped.height, 2);
+        assert_eq!(cropped.timestamp_us, 99);
+        assert_eq!(cropped.data.len(), 2 * 2 * 4);
+        assert_eq!(cropped.data[0], 2);
+        assert_eq!(cropped.data[4], 3);
+        assert_eq!(cropped.data[8], 6);
+        assert_eq!(cropped.data[12], 7);
+    }
+
+    #[test]
     #[ignore = "manual perf probe: requires DXGI, NVENC, and NVDEC on the host"]
     fn nvenc_nvdec_harness_prints_stage_metrics() {
         let seconds = std::env::var("MRD_HARNESS_PROBE_SECONDS")
@@ -730,10 +966,27 @@ mod tests {
         };
         let mut harness = TestHarness::new().expect("create harness");
         harness.set_chain(chain);
+        harness.set_config(TestConfig {
+            resolution: match (
+                std::env::var("MRD_HARNESS_WIDTH")
+                    .ok()
+                    .and_then(|value| value.parse::<usize>().ok()),
+                std::env::var("MRD_HARNESS_HEIGHT")
+                    .ok()
+                    .and_then(|value| value.parse::<usize>().ok()),
+            ) {
+                (Some(width), Some(height)) => Some((width, height)),
+                _ => None,
+            },
+            fps: std::env::var("MRD_HARNESS_FPS")
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok()),
+            bitrate: None,
+        });
         harness.start().expect("start harness");
         thread::sleep(Duration::from_secs(seconds));
-        let metrics = harness.get_metrics();
         harness.stop().expect("stop harness");
+        let metrics = harness.get_metrics();
         println!("{metrics:#?}");
         assert!(metrics.frame_count > 0);
     }

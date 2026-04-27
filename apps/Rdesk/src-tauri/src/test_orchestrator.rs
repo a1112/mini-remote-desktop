@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::test_harness::{HarnessMetrics, TestChain, TestHarness};
+use crate::test_harness::{HarnessMetrics, TestChain, TestConfig as HarnessConfig, TestHarness};
 use std::thread;
 use std::time::Duration;
 
@@ -479,6 +479,7 @@ impl TestOrchestrator {
 
         let mut harness = self.harness.lock().unwrap();
         harness.set_chain(chain.clone());
+        harness.set_config(harness_config_from_data(&config));
         if let Err(error) = harness.start() {
             let message = format!("Failed to start test harness: {}", error);
             drop(harness);
@@ -603,7 +604,11 @@ impl TestOrchestrator {
                 }
 
                 if now_ms().saturating_sub(started_at) >= duration_ms {
-                    let _ = harness.lock().unwrap().stop();
+                    let metrics = {
+                        let mut harness = harness.lock().unwrap();
+                        let _ = harness.stop();
+                        harness.get_metrics()
+                    };
                     let mut runs = orchestrator_runs.lock().unwrap();
                     if let Some(run) = runs.get_mut(&run_id_clone) {
                         run.status = RunStatus::Completed;
@@ -1212,8 +1217,11 @@ impl TestOrchestrator {
         let mut runs = self.runs.lock().unwrap();
         if let Some(run) = runs.get_mut(run_id) {
             if run.status == RunStatus::Running {
-                let metrics = self.harness.lock().unwrap().get_metrics();
-                let _ = self.harness.lock().unwrap().stop();
+                let metrics = {
+                    let mut harness = self.harness.lock().unwrap();
+                    let _ = harness.stop();
+                    harness.get_metrics()
+                };
                 run.status = RunStatus::Cancelled;
                 run.finished_at = Some(now_ms());
                 run.summary = Some(summary_from_metrics(run.started_at, &metrics));
@@ -1530,6 +1538,14 @@ fn summary_from_metrics(started_at: u64, metrics: &HarnessMetrics) -> TestRunSum
         frame_count: metrics.frame_count,
         error_message: metrics.error_message.clone(),
         ..Default::default()
+    }
+}
+
+fn harness_config_from_data(config: &TestConfigData) -> HarnessConfig {
+    HarnessConfig {
+        resolution: config.resolution.map(|[width, height]| (width, height)),
+        fps: config.fps,
+        bitrate: config.bitrate,
     }
 }
 

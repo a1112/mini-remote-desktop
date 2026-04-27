@@ -71,10 +71,8 @@ impl ResourceMonitor {
 
             if let Some(process) = self.system.process(sysinfo_pid) {
                 target_found = true;
-                cpu_usage_percent = normalize_process_cpu(
-                    process.cpu_usage(),
-                    self.system.cpus().len().max(1),
-                );
+                cpu_usage_percent =
+                    normalize_process_cpu(process.cpu_usage(), self.system.cpus().len().max(1));
                 memory_used = process.memory();
             }
         }
