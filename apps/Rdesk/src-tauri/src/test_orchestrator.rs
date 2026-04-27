@@ -15,7 +15,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::test_harness::{HarnessMetrics, TestChain, TestConfig as HarnessConfig, TestHarness};
+use crate::test_harness::{
+    CaptureType, DecoderType, EncoderType, HarnessMetrics, TestChain, TestConfig as HarnessConfig,
+    TestHarness,
+};
 use std::thread;
 use std::time::Duration;
 
@@ -292,15 +295,28 @@ impl TestOrchestrator {
             "e2e.local" => Ok(TestChain::NvencNvdec),
             "encode.nvenc_h264" => Ok(TestChain::NvencOnly),
             "encode.openh264" => Ok(TestChain::OpenH264),
-            "custom" | "matrix" => match config.encoder_type.as_deref() {
-                Some("openh264") => Ok(TestChain::OpenH264),
-                Some("nvenc_h264") if config.decoder_type.as_deref() == Some("nvdec") => {
-                    Ok(TestChain::NvencNvdec)
-                }
-                Some("nvenc_h264") => Ok(TestChain::NvencOnly),
-                Some(other) => anyhow::bail!("Unsupported encoder for {}: {}", scenario_id, other),
-                None => anyhow::bail!("Missing encoder_type for {}", scenario_id),
-            },
+            "custom" | "matrix" => Ok(TestChain::Custom {
+                capture: match config.capture_type.as_deref().unwrap_or("dxgi") {
+                    "dxgi" => CaptureType::Dxgi,
+                    "winrt" => CaptureType::Winrt,
+                    "synthetic" => CaptureType::Synthetic,
+                    other => anyhow::bail!("Unsupported capture for {}: {}", scenario_id, other),
+                },
+                encoder: match config.encoder_type.as_deref() {
+                    Some("nvenc_h264") => EncoderType::NvencH264,
+                    Some("openh264") => EncoderType::OpenH264,
+                    Some("nvenc_av1") => EncoderType::NvencAv1,
+                    Some(other) => {
+                        anyhow::bail!("Unsupported encoder for {}: {}", scenario_id, other)
+                    }
+                    None => anyhow::bail!("Missing encoder_type for {}", scenario_id),
+                },
+                decoder: match config.decoder_type.as_deref().unwrap_or("software") {
+                    "nvdec" => DecoderType::Nvdec,
+                    "software" => DecoderType::Software,
+                    other => anyhow::bail!("Unsupported decoder for {}: {}", scenario_id, other),
+                },
+            }),
             other => anyhow::bail!("Unsupported test scenario: {}", other),
         }
     }
@@ -1740,15 +1756,19 @@ mod tests {
     fn matrix_dispatch_maps_explicit_encoder_decoder_pairs() {
         let orchestrator = TestOrchestrator::default();
         let openh264_config = TestConfigData {
+            capture_type: Some("dxgi".to_string()),
             encoder_type: Some("openh264".to_string()),
+            decoder_type: Some("software".to_string()),
             ..Default::default()
         };
         let nvenc_decode_config = TestConfigData {
+            capture_type: Some("dxgi".to_string()),
             encoder_type: Some("nvenc_h264".to_string()),
             decoder_type: Some("nvdec".to_string()),
             ..Default::default()
         };
         let nvenc_encode_config = TestConfigData {
+            capture_type: Some("dxgi".to_string()),
             encoder_type: Some("nvenc_h264".to_string()),
             decoder_type: Some("software".to_string()),
             ..Default::default()
@@ -1758,19 +1778,31 @@ mod tests {
             orchestrator
                 .scenario_to_chain("matrix", &openh264_config)
                 .unwrap(),
-            TestChain::OpenH264
+            TestChain::Custom {
+                capture: CaptureType::Dxgi,
+                encoder: EncoderType::OpenH264,
+                decoder: DecoderType::Software,
+            }
         );
         assert_eq!(
             orchestrator
                 .scenario_to_chain("matrix", &nvenc_decode_config)
                 .unwrap(),
-            TestChain::NvencNvdec
+            TestChain::Custom {
+                capture: CaptureType::Dxgi,
+                encoder: EncoderType::NvencH264,
+                decoder: DecoderType::Nvdec,
+            }
         );
         assert_eq!(
             orchestrator
                 .scenario_to_chain("matrix", &nvenc_encode_config)
                 .unwrap(),
-            TestChain::NvencOnly
+            TestChain::Custom {
+                capture: CaptureType::Dxgi,
+                encoder: EncoderType::NvencH264,
+                decoder: DecoderType::Software,
+            }
         );
     }
 
