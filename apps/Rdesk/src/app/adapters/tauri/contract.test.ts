@@ -531,6 +531,23 @@ describe('Tauri Adapter Contract', () => {
       expect(mockInvoke).toHaveBeenCalledWith('test_list_window_capture_targets', undefined);
     });
 
+    it('test_harness_set_custom calls custom harness command', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue(null);
+
+      await adapter.testHarnessSetCustom({
+        capture: 'dxgi',
+        encoder: 'nvenc_h264',
+        decoder: 'software',
+      });
+
+      expect(mockInvoke).toHaveBeenCalledWith('test_harness_set_custom', {
+        capture: 'dxgi',
+        encoder: 'nvenc_h264',
+        decoder: 'software',
+      });
+    });
+
     it('test_get_run_metrics calls correct command with run id', async () => {
       const mockInvoke = getMockInvoke();
       mockInvoke.mockResolvedValue({});

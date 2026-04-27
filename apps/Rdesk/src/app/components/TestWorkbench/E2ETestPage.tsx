@@ -151,7 +151,7 @@ export function E2ETestPage() {
         <section className="mb-6 grid grid-cols-2 md:grid-cols-4 gap-4">
           <MetricCard
             icon={<Activity className="h-4 w-4" />}
-            label="捕获帧率"
+            label="Pipeline FPS"
             value={`${metrics.capture_fps.toFixed(1)} FPS`}
             color={getFpsColor(metrics.capture_fps)}
           />

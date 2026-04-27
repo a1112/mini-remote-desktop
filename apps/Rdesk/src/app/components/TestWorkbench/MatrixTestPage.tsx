@@ -398,7 +398,7 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
                 <th className="px-4 py-2 text-left text-sm font-medium">解码器</th>
                 <th className="px-4 py-2 text-left text-sm font-medium">分辨率</th>
                 <th className="px-4 py-2 text-left text-sm font-medium">帧率</th>
-                <th className="px-4 py-2 text-left text-sm font-medium">FPS</th>
+                <th className="px-4 py-2 text-left text-sm font-medium">Pipeline FPS</th>
                 <th className="px-4 py-2 text-left text-sm font-medium">延迟 P95</th>
                 <th className="px-4 py-2 text-left text-sm font-medium">时长</th>
               </tr>

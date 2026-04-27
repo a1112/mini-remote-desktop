@@ -37,6 +37,7 @@ import type {
   TestPreset,
   EnvironmentSnapshot,
   WindowCaptureTarget,
+  TestMatrixConfig,
 } from './types';
 
 /**
@@ -585,6 +586,17 @@ export async function testHarnessStop(): Promise<AdapterResult<null>> {
  */
 export async function testHarnessSetChain(chain: string): Promise<AdapterResult<null>> {
   return invokeAdapter<null>('test_harness_set_chain', { chain });
+}
+
+/**
+ * Set a custom test chain configuration.
+ */
+export async function testHarnessSetCustom(config: TestMatrixConfig): Promise<AdapterResult<null>> {
+  return invokeAdapter<null>('test_harness_set_custom', {
+    capture: config.capture,
+    encoder: config.encoder,
+    decoder: config.decoder,
+  });
 }
 
 /**

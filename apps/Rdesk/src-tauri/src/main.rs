@@ -883,20 +883,44 @@ fn test_harness_set_chain(state: tauri::State<'_, AppState>, chain: String) -> R
     Ok(())
 }
 
-// TODO: Add test_harness_set_matrix command for custom configurations
-// #[tauri::command]
-// fn test_harness_set_matrix(
-//     state: tauri::State<'_, AppState>,
-//     config: test_harness::MatrixConfig,
-// ) -> Result<(), String> {
-//     let chain = test_harness::TestChain::Custom {
-//         capture: config.capture,
-//         encoder: config.encoder,
-//         decoder: config.decoder,
-//     };
-//     state.test_harness.lock().unwrap().set_chain(chain);
-//     Ok(())
-// }
+#[tauri::command]
+fn test_harness_set_custom(
+    state: tauri::State<'_, AppState>,
+    capture: String,
+    encoder: String,
+    decoder: String,
+) -> Result<(), String> {
+    use test_harness::{CaptureType, DecoderType, EncoderType, TestChain};
+
+    let capture = match capture.as_str() {
+        "dxgi" => CaptureType::Dxgi,
+        "winrt" => CaptureType::Winrt,
+        "synthetic" => CaptureType::Synthetic,
+        _ => return Err(format!("Unsupported capture type: {}", capture)),
+    };
+    let encoder = match encoder.as_str() {
+        "nvenc_h264" => EncoderType::NvencH264,
+        "nvenc_av1" => EncoderType::NvencAv1,
+        "openh264" => EncoderType::OpenH264,
+        _ => return Err(format!("Unsupported encoder type: {}", encoder)),
+    };
+    let decoder = match decoder.as_str() {
+        "nvdec" => DecoderType::Nvdec,
+        "software" => DecoderType::Software,
+        _ => return Err(format!("Unsupported decoder type: {}", decoder)),
+    };
+
+    state
+        .test_harness
+        .lock()
+        .unwrap()
+        .set_chain(TestChain::Custom {
+            capture,
+            encoder,
+            decoder,
+        });
+    Ok(())
+}
 
 #[tauri::command]
 fn test_harness_get_chain(state: tauri::State<'_, AppState>) -> String {
@@ -1393,6 +1417,7 @@ fn main() {
             test_harness_start,
             test_harness_stop,
             test_harness_set_chain,
+            test_harness_set_custom,
             test_harness_get_chain,
             test_harness_get_metrics,
             test_harness_get_frames,

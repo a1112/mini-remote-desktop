@@ -85,13 +85,12 @@ export function DecodeTestPage() {
     setIsRunning(true);
     setMetrics(null);
 
-    // Map decoder to test chain
-    const chainMap: Record<DecoderType, "nvenc_nvdec" | "openh264"> = {
-      nvdec: "nvenc_nvdec",
-      software: "openh264",
-    };
-
-    await commands.testHarnessStart(chainMap[selectedDecoder]);
+    await commands.testHarnessSetCustom({
+      capture: "dxgi",
+      encoder: "nvenc_h264",
+      decoder: selectedDecoder,
+    });
+    await commands.testHarnessStart();
   };
 
   const handleStop = async () => {
@@ -188,7 +187,7 @@ export function DecodeTestPage() {
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
             <MetricCard
               icon={<Monitor className="h-4 w-4" />}
-              label="解码帧率"
+              label="Pipeline FPS"
               value={`${metrics.decode_fps.toFixed(1)} FPS`}
               color={getFpsColor(metrics.decode_fps)}
             />
