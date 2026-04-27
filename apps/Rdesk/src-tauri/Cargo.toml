@@ -64,6 +64,12 @@ mrd-service = { path = "../../mrd-service" }
 [target.'cfg(windows)'.dependencies]
 mrd-capture-winrt = { path = "../../../crates/mrd-capture-winrt" }
 winapi = { version = "0.3", features = ["sysinfoapi", "minwindef"] }
+windows = { version = "0.52", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_System_LibraryLoader",
+  "Win32_UI_WindowsAndMessaging",
+] }
 
 [features]
 # this feature is used for production builds or when `devPath` points to the filesystem and the built-in dev server is disabled.

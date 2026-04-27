@@ -88,6 +88,7 @@ export interface TestConfig {
   encoder_type?: "nvenc_h264" | "nvenc_av1" | "openh264";
   decoder_type?: "nvdec" | "software";
   renderer_type?: "d3d11";
+  render_display?: boolean;
   transport_kind?: "quic" | "webrtc";
 
   // Parameters

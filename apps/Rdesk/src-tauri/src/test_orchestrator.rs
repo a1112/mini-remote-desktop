@@ -16,8 +16,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::test_harness::{
-    CaptureType, DecoderType, EncoderType, HarnessMetrics, TestChain, TestConfig as HarnessConfig,
-    TestHarness,
+    CaptureType, DecoderType, EncoderType, HarnessMetrics, RendererType, TestChain,
+    TestConfig as HarnessConfig, TestHarness,
 };
 use std::thread;
 use std::time::Duration;
@@ -83,6 +83,7 @@ pub struct TestConfigData {
     pub encoder_type: Option<String>,
     pub decoder_type: Option<String>,
     pub renderer_type: Option<String>,
+    pub render_display: Option<bool>,
     pub transport_kind: Option<String>,
     pub resolution: Option<[usize; 2]>,
     pub fps: Option<u32>,
@@ -1595,6 +1596,10 @@ fn harness_config_from_data(config: &TestConfigData) -> HarnessConfig {
         resolution: config.resolution.map(|[width, height]| (width, height)),
         fps: config.fps,
         bitrate: config.bitrate,
+        renderer: match (config.render_display, config.renderer_type.as_deref()) {
+            (Some(true), Some("d3d11")) => Some(RendererType::D3d11),
+            _ => None,
+        },
     }
 }
 
@@ -1803,6 +1808,31 @@ mod tests {
                 encoder: EncoderType::NvencH264,
                 decoder: DecoderType::Software,
             }
+        );
+    }
+
+    #[test]
+    fn harness_config_requires_explicit_render_display_for_d3d11() {
+        let legacy_config = TestConfigData {
+            renderer_type: Some("d3d11".to_string()),
+            ..Default::default()
+        };
+        let disabled_config = TestConfigData {
+            renderer_type: Some("d3d11".to_string()),
+            render_display: Some(false),
+            ..Default::default()
+        };
+        let enabled_config = TestConfigData {
+            renderer_type: Some("d3d11".to_string()),
+            render_display: Some(true),
+            ..Default::default()
+        };
+
+        assert_eq!(harness_config_from_data(&legacy_config).renderer, None);
+        assert_eq!(harness_config_from_data(&disabled_config).renderer, None);
+        assert_eq!(
+            harness_config_from_data(&enabled_config).renderer,
+            Some(RendererType::D3d11)
         );
     }
 

@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Play, Grid3x3, CheckCircle2, XCircle, Clock, Loader2 } from "lucide-react";
+import { Play, Grid3x3, CheckCircle2, XCircle, Clock, Loader2, Monitor } from "lucide-react";
 import * as commands from "../../adapters/tauri/commands";
 import type { TestConfig, TestRunSummary } from "../../adapters/tauri/types";
 
@@ -45,6 +45,8 @@ const MATRIX_DIMENSIONS: MatrixDimension[] = [
     id: "resolution",
     name: "分辨率",
     options: [
+      { id: "1280x720", name: "720p", enabled: true },
+      { id: "1600x900", name: "900p", enabled: false },
       { id: "1920x1080", name: "1080p", enabled: true },
       { id: "2560x1440", name: "1440p", enabled: false },
       { id: "3840x2160", name: "4K", enabled: false },
@@ -54,8 +56,9 @@ const MATRIX_DIMENSIONS: MatrixDimension[] = [
     id: "fps",
     name: "帧率",
     options: [
-      { id: "30", name: "30 FPS", enabled: false },
+      { id: "30", name: "30 FPS", enabled: true },
       { id: "60", name: "60 FPS", enabled: true },
+      { id: "90", name: "90 FPS", enabled: false },
       { id: "120", name: "120 FPS", enabled: false },
     ],
   },
@@ -89,6 +92,7 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
   const [completedCount, setCompletedCount] = useState(0);
   const [failedCount, setFailedCount] = useState(0);
   const [skippedCount, setSkippedCount] = useState(0);
+  const [enableD3d11Render, setEnableD3d11Render] = useState(false);
 
   const toggleOption = (dimensionId: string, optionId: string) => {
     setDimensions(
@@ -164,7 +168,10 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
       }
     });
 
-    config.renderer_type = "d3d11";
+    if (enableD3d11Render) {
+      config.renderer_type = "d3d11";
+      config.render_display = true;
+    }
     config.bitrate = 5000000;
     config.duration_ms = 5000; // Short duration for matrix tests
     config.warmup_ms = 1000;
@@ -331,6 +338,22 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
               </div>
             </div>
           ))}
+          <div>
+            <h3 className="font-medium text-sm mb-2 flex items-center gap-2">
+              <Monitor className="h-4 w-4" />
+              DX11 渲染显示
+            </h3>
+            <label className="flex items-center gap-2 p-2 rounded hover:bg-muted cursor-pointer">
+              <input
+                type="checkbox"
+                checked={enableD3d11Render}
+                onChange={() => setEnableD3d11Render((enabled) => !enabled)}
+                disabled={isRunning}
+                className="rounded"
+              />
+              <span className="text-sm">弹窗显示</span>
+            </label>
+          </div>
         </div>
       </div>
 
@@ -388,8 +411,8 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
 
       {/* Test Results Grid */}
       {tests.length > 0 && (
-        <div className="bg-card rounded-lg border overflow-hidden">
-          <table className="w-full">
+        <div className="bg-card rounded-lg border overflow-x-auto">
+          <table className="w-full min-w-[980px]">
             <thead className="bg-muted">
               <tr>
                 <th className="px-4 py-2 text-left text-sm font-medium">状态</th>
@@ -398,6 +421,7 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
                 <th className="px-4 py-2 text-left text-sm font-medium">解码器</th>
                 <th className="px-4 py-2 text-left text-sm font-medium">分辨率</th>
                 <th className="px-4 py-2 text-left text-sm font-medium">帧率</th>
+                <th className="px-4 py-2 text-left text-sm font-medium">DX11</th>
                 <th className="px-4 py-2 text-left text-sm font-medium">Pipeline FPS</th>
                 <th className="px-4 py-2 text-left text-sm font-medium">延迟 P95</th>
                 <th className="px-4 py-2 text-left text-sm font-medium">时长</th>
@@ -426,6 +450,9 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
                     {test.config.resolution?.join("x")}
                   </td>
                   <td className="px-4 py-2 text-sm">{test.config.fps}</td>
+                  <td className="px-4 py-2 text-sm">
+                    {test.config.renderer_type === "d3d11" && test.config.render_display ? "on" : "-"}
+                  </td>
                   <td className="px-4 py-2 text-sm">
                     {test.result?.capture_fps?.toFixed(1) ?? "-"}
                   </td>

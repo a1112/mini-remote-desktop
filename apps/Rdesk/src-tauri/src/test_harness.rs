@@ -9,8 +9,10 @@ use mrd_decode_nvdec::{NvdecDecoder, NvdecOutputMode};
 use mrd_encode_nvenc::NvencH264Encoder;
 use mrd_encode_openh264::OpenH264Encoder;
 use mrd_pipeline_core::{
-    CapturedFrame, FrameCapture, FramePixelFormat, VideoDecoder, VideoEncoder,
+    CapturedFrame, DecodedFrame, DecodedFrameData, FrameCapture, FramePixelFormat, VideoDecoder,
+    VideoEncoder,
 };
+use mrd_render::{RenderFrame, RenderTarget, RendererFactory, RendererInstance};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -76,12 +78,20 @@ pub enum DecoderType {
     Software,
 }
 
+/// Available renderer types for live test display.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RendererType {
+    D3d11,
+}
+
 /// Test configuration parameters
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TestConfig {
     pub resolution: Option<(usize, usize)>,
     pub fps: Option<u32>,
     pub bitrate: Option<u32>,
+    pub renderer: Option<RendererType>,
 }
 
 impl Default for TestConfig {
@@ -90,6 +100,7 @@ impl Default for TestConfig {
             resolution: None,
             fps: None,
             bitrate: None,
+            renderer: None,
         }
     }
 }
@@ -199,6 +210,7 @@ struct PipelineState {
     capture: DxgiDesktopCapture,
     encoder: Option<Box<dyn VideoEncoder>>,
     decoder: Option<PipelineDecoder>,
+    renderer: Option<PipelineRenderer>,
     use_decoder: bool,
     width: usize,
     height: usize,
@@ -222,10 +234,184 @@ impl PipelineDecoder {
         }
     }
 
-    fn drain_decoded_frames(&mut self) -> usize {
+    fn drain_decoded_frames(&mut self) -> Vec<DecodedFrame> {
         match self {
-            Self::Nvdec(decoder) => decoder.drain_decoded_frames().len(),
-            Self::Software(decoder) => decoder.drain_decoded_frames().len(),
+            Self::Nvdec(decoder) => decoder
+                .drain_decoded_frames()
+                .into_iter()
+                .map(nvdec_frame_to_decoded_frame)
+                .collect(),
+            Self::Software(decoder) => decoder.drain_decoded_frames(),
+        }
+    }
+}
+
+struct PipelineRenderer {
+    renderer: Box<dyn RendererInstance>,
+    #[cfg(windows)]
+    window: Option<D3d11TestWindow>,
+}
+
+impl PipelineRenderer {
+    fn new(renderer_type: &RendererType, width: usize, height: usize) -> Result<Self> {
+        match renderer_type {
+            RendererType::D3d11 => {
+                #[cfg(windows)]
+                {
+                    let window = D3d11TestWindow::new(width, height)?;
+                    let factory = mrd_render_d3d11::D3d11RendererFactory;
+                    let mut renderer = factory.create().map_err(|error| {
+                        anyhow::anyhow!("create D3D11 renderer failed: {error}")
+                    })?;
+                    renderer
+                        .attach_target(RenderTarget::WindowHandle(window.hwnd_value()))
+                        .map_err(|error| {
+                            anyhow::anyhow!("attach D3D11 renderer failed: {error}")
+                        })?;
+
+                    Ok(Self {
+                        renderer,
+                        window: Some(window),
+                    })
+                }
+
+                #[cfg(not(windows))]
+                {
+                    anyhow::bail!("D3D11 render display is only available on Windows");
+                }
+            }
+        }
+    }
+
+    fn pump_window_messages(&self) {
+        #[cfg(windows)]
+        if let Some(window) = &self.window {
+            window.pump_messages();
+        }
+    }
+
+    fn upload_frame(&mut self, frame: RenderFrame) -> Result<()> {
+        self.renderer
+            .upload_frame(frame)
+            .map_err(|error| anyhow::anyhow!("upload frame to D3D11 renderer failed: {error}"))
+    }
+}
+
+#[cfg(windows)]
+struct D3d11TestWindow {
+    hwnd: windows::Win32::Foundation::HWND,
+}
+
+#[cfg(windows)]
+impl D3d11TestWindow {
+    fn new(frame_width: usize, frame_height: usize) -> Result<Self> {
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+        use windows::core::PCWSTR;
+        use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DefWindowProcW, LoadCursorW, RegisterClassW, ShowWindow, CS_HREDRAW,
+            CS_VREDRAW, CW_USEDEFAULT, HMENU, IDC_ARROW, SW_SHOW, WINDOW_EX_STYLE, WM_CLOSE,
+            WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+        };
+
+        unsafe extern "system" fn wnd_proc(
+            hwnd: HWND,
+            message: u32,
+            wparam: WPARAM,
+            lparam: LPARAM,
+        ) -> LRESULT {
+            if message == WM_CLOSE {
+                ShowWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::SW_HIDE);
+                return LRESULT(0);
+            }
+
+            DefWindowProcW(hwnd, message, wparam, lparam)
+        }
+
+        fn wide(value: &str) -> Vec<u16> {
+            OsStr::new(value)
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect()
+        }
+
+        let class_name = wide("RdeskD3D11TestWindow");
+        let title = wide("Rdesk DX11 Render Test");
+        let hmodule = unsafe { GetModuleHandleW(None) }
+            .map_err(|error| anyhow::anyhow!("get module handle failed: {error}"))?;
+        let hinstance = HINSTANCE(hmodule.0);
+        let cursor = unsafe { LoadCursorW(None, IDC_ARROW) }
+            .map_err(|error| anyhow::anyhow!("load cursor failed: {error}"))?;
+
+        let window_class = WNDCLASSW {
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(wnd_proc),
+            hInstance: hinstance,
+            hCursor: cursor,
+            lpszClassName: PCWSTR(class_name.as_ptr()),
+            ..Default::default()
+        };
+
+        unsafe {
+            RegisterClassW(&window_class);
+        }
+
+        let width = frame_width.clamp(640, 1280) as i32;
+        let height = frame_height.clamp(360, 800) as i32;
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                PCWSTR(class_name.as_ptr()),
+                PCWSTR(title.as_ptr()),
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                width,
+                height,
+                HWND(0),
+                HMENU(0),
+                hinstance,
+                None,
+            )
+        };
+
+        if hwnd.0 == 0 {
+            anyhow::bail!("create D3D11 render test window failed");
+        }
+
+        unsafe {
+            ShowWindow(hwnd, SW_SHOW);
+        }
+
+        Ok(Self { hwnd })
+    }
+
+    fn hwnd_value(&self) -> isize {
+        self.hwnd.0
+    }
+
+    fn pump_messages(&self) {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+        };
+
+        let mut message = MSG::default();
+        unsafe {
+            while PeekMessageW(&mut message, self.hwnd, 0, 0, PM_REMOVE).as_bool() {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for D3d11TestWindow {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(self.hwnd);
         }
     }
 }
@@ -458,10 +644,17 @@ impl TestHarness {
             }
         };
 
+        let renderer = config
+            .renderer
+            .as_ref()
+            .map(|renderer_type| PipelineRenderer::new(renderer_type, width, height))
+            .transpose()?;
+
         Ok(PipelineState {
             capture,
             encoder,
             decoder,
+            renderer,
             use_decoder,
             width,
             height,
@@ -519,6 +712,7 @@ impl TestHarness {
             };
 
             // Decode if needed
+            let mut decoded_frames = Vec::new();
             let decode_latency = if state.use_decoder && !encoded_units.is_empty() {
                 if let Some(decoder) = state.decoder.as_mut() {
                     let decode_start = Instant::now();
@@ -528,7 +722,8 @@ impl TestHarness {
                         match decoder.push_access_unit(&unit.bytes) {
                             Ok(()) => {
                                 pushed_any = true;
-                                if decoder.drain_decoded_frames() > 0 {
+                                decoded_frames = decoder.drain_decoded_frames();
+                                if !decoded_frames.is_empty() {
                                     break;
                                 }
                             }
@@ -554,6 +749,25 @@ impl TestHarness {
             } else {
                 None
             };
+
+            if let Some(renderer) = state.renderer.as_mut() {
+                renderer.pump_window_messages();
+                let frame = decoded_frames
+                    .last()
+                    .map(decoded_frame_to_render_frame)
+                    .or_else(|| {
+                        (!state.use_decoder)
+                            .then(|| captured_frame_to_render_frame(&captured_frame))
+                    });
+                if let Some(frame) = frame {
+                    if let Err(error) = renderer.upload_frame(frame) {
+                        let mut m = metrics.lock().unwrap();
+                        m.error_message = Some(error.to_string());
+                        running.store(false, Ordering::Relaxed);
+                        break;
+                    }
+                }
+            }
 
             capture_latencies.push(capture_latency);
             if let Some(latency) = encode_latency {
@@ -718,6 +932,104 @@ impl Drop for TestHarness {
     fn drop(&mut self) {
         let _ = self.stop();
     }
+}
+
+fn nvdec_frame_to_decoded_frame(frame: mrd_decode_nvdec::NvdecDecodedFrame) -> DecodedFrame {
+    match frame.data {
+        mrd_decode_nvdec::NvdecDecodedFrameData::CpuRgb24(data) => {
+            DecodedFrame::from_cpu_rgb24(frame.width, frame.height, 0, data)
+        }
+        mrd_decode_nvdec::NvdecDecodedFrameData::CpuNv12 { data, pitch } => {
+            DecodedFrame::from_cpu_nv12(frame.width, frame.height, 0, pitch, data)
+        }
+        #[cfg(windows)]
+        mrd_decode_nvdec::NvdecDecodedFrameData::D3D11SharedNv12 {
+            shared_handle,
+            width: _,
+            height: _,
+        } => DecodedFrame::from_d3d11_shared_nv12(frame.width, frame.height, 0, shared_handle),
+    }
+}
+
+fn decoded_frame_to_render_frame(frame: &DecodedFrame) -> RenderFrame {
+    match &frame.data {
+        DecodedFrameData::CpuRgb24(data) => {
+            RenderFrame::from_rgb24(frame.width, frame.height, data.clone())
+        }
+        DecodedFrameData::CpuBgra32(data) => {
+            RenderFrame::from_bgra32(frame.width, frame.height, data.clone())
+        }
+        DecodedFrameData::CpuNv12 { data, pitch } => RenderFrame::from_rgb24(
+            frame.width,
+            frame.height,
+            cpu_nv12_to_rgb24(data, frame.width, frame.height, *pitch),
+        ),
+        #[cfg(windows)]
+        DecodedFrameData::D3D11SharedNv12 { shared_handle, .. } => {
+            RenderFrame::from_d3d11_shared_nv12(frame.width, frame.height, *shared_handle)
+        }
+    }
+}
+
+fn captured_frame_to_render_frame(frame: &CapturedFrame) -> RenderFrame {
+    match frame.pixel_format {
+        FramePixelFormat::Bgra32 => {
+            RenderFrame::from_bgra32(frame.width, frame.height, frame.data.clone())
+        }
+        FramePixelFormat::Rgb24 => {
+            RenderFrame::from_rgb24(frame.width, frame.height, frame.data.clone())
+        }
+        FramePixelFormat::Rgba32 => RenderFrame::from_bgra32(
+            frame.width,
+            frame.height,
+            rgba32_to_bgra32(&frame.data, frame.width, frame.height),
+        ),
+    }
+}
+
+fn rgba32_to_bgra32(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
+    let mut bgra = vec![0_u8; width * height * 4];
+    for (src, dst) in rgba.chunks_exact(4).zip(bgra.chunks_exact_mut(4)) {
+        dst[0] = src[2];
+        dst[1] = src[1];
+        dst[2] = src[0];
+        dst[3] = src[3];
+    }
+    bgra
+}
+
+fn cpu_nv12_to_rgb24(nv12: &[u8], width: usize, height: usize, pitch: usize) -> Vec<u8> {
+    let mut rgb = vec![0_u8; width * height * 3];
+    let uv_base = pitch * height;
+    let mut out_idx = 0;
+
+    for y in 0..height {
+        let y_row_start = y * pitch;
+        let uv_row_start = uv_base + (y / 2) * pitch;
+        for x in 0..width {
+            let y_offset = y_row_start + x;
+            let uv_offset = uv_row_start + (x / 2) * 2;
+            if y_offset >= nv12.len() || uv_offset + 1 >= nv12.len() {
+                out_idx += 3;
+                continue;
+            }
+
+            let y_sample = nv12[y_offset] as i32 - 16;
+            let u = nv12[uv_offset] as i32 - 128;
+            let v = nv12[uv_offset + 1] as i32 - 128;
+
+            let r = (298 * y_sample + 409 * v + 128) >> 8;
+            let g = (298 * y_sample - 100 * u - 208 * v + 128) >> 8;
+            let b = (298 * y_sample + 516 * u + 128) >> 8;
+
+            rgb[out_idx] = r.clamp(0, 255) as u8;
+            rgb[out_idx + 1] = g.clamp(0, 255) as u8;
+            rgb[out_idx + 2] = b.clamp(0, 255) as u8;
+            out_idx += 3;
+        }
+    }
+
+    rgb
 }
 
 fn downsample_frame(frame: &CapturedFrame, max_width: usize) -> Result<(Vec<u8>, usize, usize)> {
@@ -1172,6 +1484,10 @@ mod tests {
                 .ok()
                 .and_then(|value| value.parse::<u32>().ok()),
             bitrate: None,
+            renderer: match std::env::var("MRD_HARNESS_RENDERER").as_deref() {
+                Ok("d3d11") => Some(RendererType::D3d11),
+                _ => None,
+            },
         });
         harness.start().expect("start harness");
         thread::sleep(Duration::from_secs(seconds));
