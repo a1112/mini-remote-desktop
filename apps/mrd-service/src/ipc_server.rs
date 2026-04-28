@@ -10,7 +10,9 @@ use crate::{
 };
 use mrd_application::ports::SessionSnapshot;
 use mrd_ipc::{transport, IpcRequest, IpcResponse};
-use std::{io::ErrorKind, sync::Arc};
+use std::{io::ErrorKind, sync::Arc, time::Duration};
+
+const LAN_DISCOVERY_REFRESH_WAIT_MS: u64 = 450;
 
 /// IPC server - handles requests from Rdesk shell
 pub struct IpcServer {
@@ -126,9 +128,14 @@ impl IpcServer {
             },
 
             IpcRequest::RefreshLanDiscovery => {
-                self.app_state.lan_discovery.request_probe();
                 IpcResponse::LanDiscoverySnapshot {
-                    snapshot: self.app_state.lan_discovery.snapshot().await,
+                    snapshot: self
+                        .app_state
+                        .lan_discovery
+                        .request_probe_and_wait(Duration::from_millis(
+                            LAN_DISCOVERY_REFRESH_WAIT_MS,
+                        ))
+                        .await,
                 }
             }
 

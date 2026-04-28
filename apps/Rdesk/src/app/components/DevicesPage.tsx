@@ -85,8 +85,11 @@ export function DevicesPage() {
 
   const handleRefresh = async () => {
     setRefreshing(true);
-    await Promise.all([refresh(), refreshGroups()]);
-    setTimeout(() => setRefreshing(false), 500);
+    try {
+      await Promise.all([refresh(), refreshGroups()]);
+    } finally {
+      setTimeout(() => setRefreshing(false), 500);
+    }
   };
 
   // 根据选中的分组筛选设备

@@ -20,6 +20,11 @@ export default defineConfig({
   // File types to support raw imports. Never add .css, .tsx, or .ts files to this.
   assetsInclude: ['**/*.svg', '**/*.csv'],
 
+  server: {
+    port: 9531,
+    strictPort: true,
+  },
+
   // Vitest configuration for component testing
   test: {
     globals: true,

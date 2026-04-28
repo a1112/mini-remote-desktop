@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     realtime_server_command: str = "cargo"
     realtime_server_args: str = "run -p realtime-server --manifest-path G:/Project/mini-remote-desktop/Cargo.toml"
     realtime_server_workdir: str = "G:/Project/mini-remote-desktop"
-    cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
+    cors_origins: str = "http://localhost:9531,http://127.0.0.1:9531"
 
 
 settings = Settings()

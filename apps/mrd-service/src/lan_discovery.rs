@@ -47,6 +47,7 @@ pub struct LanDiscoveryState {
     last_probe_ms: AtomicU64,
     peers: Mutex<HashMap<String, StoredLanPeer>>,
     probe_requested: Notify,
+    peer_changed: Notify,
 }
 
 impl LanDiscoveryState {
@@ -58,6 +59,7 @@ impl LanDiscoveryState {
             last_probe_ms: AtomicU64::new(0),
             peers: Mutex::new(HashMap::new()),
             probe_requested: Notify::new(),
+            peer_changed: Notify::new(),
         }
     }
 
@@ -71,6 +73,13 @@ impl LanDiscoveryState {
 
     pub fn request_probe(&self) {
         self.probe_requested.notify_one();
+    }
+
+    pub async fn request_probe_and_wait(&self, wait: Duration) -> LanDiscoverySnapshot {
+        let notified = self.peer_changed.notified();
+        self.request_probe();
+        let _ = timeout(wait, notified).await;
+        self.snapshot().await
     }
 
     async fn upsert_peer(&self, announcement: LanAnnouncement, addr: SocketAddr) {
@@ -90,6 +99,7 @@ impl LanDiscoveryState {
         };
 
         self.peers.lock().await.insert(peer.device_id.clone(), peer);
+        self.peer_changed.notify_one();
     }
 
     async fn prune_stale_peers(&self) {
@@ -692,6 +702,39 @@ mod tests {
             .await;
 
         assert!(state.snapshot().await.peers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn request_probe_and_wait_returns_after_peer_update() {
+        let state = Arc::new(LanDiscoveryState::default());
+        let waiting_state = state.clone();
+        let waiter = tokio::spawn(async move {
+            waiting_state
+                .request_probe_and_wait(Duration::from_secs(1))
+                .await
+        });
+
+        state
+            .upsert_peer(
+                LanAnnouncement {
+                    magic: DISCOVERY_MAGIC.to_string(),
+                    app_id: DISCOVERY_APP_ID.to_string(),
+                    instance_id: "remote-instance".to_string(),
+                    device_id: "remote-device".to_string(),
+                    device_name: "Remote Device".to_string(),
+                    device_type: "rdesk".to_string(),
+                    protocol_version: 1,
+                    discovery_port: 21116,
+                    transports: vec!["webrtc".to_string(), "quic".to_string()],
+                    timestamp_ms: now_ms(),
+                },
+                "192.168.1.50:21116".parse().unwrap(),
+            )
+            .await;
+
+        let snapshot = waiter.await.unwrap();
+        assert_eq!(snapshot.peers.len(), 1);
+        assert_eq!(snapshot.peers[0].device_id.0, "remote-device");
     }
 
     #[test]

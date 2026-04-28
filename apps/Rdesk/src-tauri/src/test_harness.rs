@@ -2059,6 +2059,7 @@ mod tests {
                 Ok("d3d11") => Some(RendererType::D3d11),
                 _ => None,
             },
+            renderer_target_hwnd: None,
             transport: match std::env::var("MRD_HARNESS_TRANSPORT").as_deref() {
                 Ok("webrtc") | Ok("webrtc_rtp") => Some(TransportKind::WebrtcRtp),
                 Ok("quic") | Ok("quic_datagram") => Some(TransportKind::QuicDatagram),

@@ -147,16 +147,20 @@ async fn smoke_shell_full_ipc_session_flow() {
         .expect("stop session");
     assert!(matches!(stop_response, IpcResponse::SessionStopped { .. }));
 
-    let missing_response = client
+    let stopped_snapshot_response = client
         .send_request(IpcRequest::SessionRuntimeSnapshot { session_id })
         .await
-        .expect("missing session snapshot");
+        .expect("stopped session snapshot");
 
     server.abort();
 
-    match missing_response {
-        IpcResponse::Error { code, .. } => assert_eq!(code, "E404"),
-        other => panic!("expected Error response, got {:?}", other),
+    match stopped_snapshot_response {
+        IpcResponse::SessionSnapshot { snapshot } => {
+            assert_eq!(snapshot.state, "closed");
+            assert!(!snapshot.sender_active);
+            assert!(!snapshot.receiver_active);
+        }
+        other => panic!("expected closed SessionSnapshot response, got {:?}", other),
     }
 }
 

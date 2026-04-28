@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Laptop, Monitor, Server, Smartphone } from "lucide-react";
 import {
   ipcLanDiscoverySnapshot,
@@ -70,6 +70,7 @@ const sourceLabels: Record<DeviceDiscoverySource, string> = {
 
 const API_BASE =
   (import.meta as any).env?.VITE_RDESK_SERVER_URL ?? "http://127.0.0.1:9530/api/v1";
+const LAN_DEEP_REFRESH_SETTLE_MS = 250;
 
 const uniqueSources = (sources: DeviceDiscoverySource[]) =>
   Array.from(new Set(sources));
@@ -132,6 +133,21 @@ const formatLanLastSeen = (ageMs: number) => {
   return `${Math.round(seconds / 60)} 分钟前`;
 };
 
+const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
+
+function mergeLanPeers(peerSets: LanPeerInfo[][]): LanPeerInfo[] {
+  const byDeviceId = new Map<string, LanPeerInfo>();
+  for (const peers of peerSets) {
+    for (const peer of peers) {
+      const existing = byDeviceId.get(peer.device_id);
+      if (!existing || peer.age_ms <= existing.age_ms) {
+        byDeviceId.set(peer.device_id, peer);
+      }
+    }
+  }
+  return Array.from(byDeviceId.values());
+}
+
 const lanPeerToDevice = (peer: LanPeerInfo): Device =>
   baseDevice("lan_p2p", {
     id: peer.device_id,
@@ -172,11 +188,21 @@ const localDeviceToDevice = (info: StoredDeviceInfo): Device =>
 
 async function fetchLanDevices(triggerProbe: boolean): Promise<Device[]> {
   if (!isTauriRuntime()) return [];
-  const result = triggerProbe
-    ? await ipcRefreshLanDiscovery()
-    : await ipcLanDiscoverySnapshot();
-  if (!result.ok) return [];
-  return result.value.peers.map(lanPeerToDevice);
+
+  if (!triggerProbe) {
+    const result = await ipcLanDiscoverySnapshot();
+    return result.ok ? result.value.peers.map(lanPeerToDevice) : [];
+  }
+
+  const first = await ipcRefreshLanDiscovery();
+  if (!first.ok) return [];
+  await sleep(LAN_DEEP_REFRESH_SETTLE_MS);
+  const second = await ipcLanDiscoverySnapshot();
+  const peers = mergeLanPeers([
+    first.value.peers,
+    second.ok ? second.value.peers : [],
+  ]);
+  return peers.map(lanPeerToDevice);
 }
 
 async function fetchLocalDevice(): Promise<Device | null> {
@@ -251,46 +277,61 @@ export interface UseDevicesOptions {
   enabled?: boolean;
 }
 
+type FetchDevicesOptions = {
+  deepRefresh?: boolean;
+};
+
 export function useDevices(options?: UseDevicesOptions) {
   const [devices, setDevices] = useState<Device[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const [currentDeviceId, setCurrentDeviceId] = useState<string | null>(null);
+  const hasLoadedRef = useRef(false);
   const { isLoggedIn, token } = useAuth();
 
   const { pollInterval = 30000, enabled = true } = options || {};
 
-  const fetchDevices = useCallback(async () => {
-    if (devices.length === 0) setLoading(true);
+  const fetchDevices = useCallback(async (fetchOptions?: FetchDevicesOptions) => {
+    if (!hasLoadedRef.current) setLoading(true);
     setError(null);
 
-    const [lanDevices, localDevice] = await Promise.all([
-      fetchLanDevices(true),
-      fetchLocalDevice(),
-    ]);
-    setCurrentDeviceId(localDevice?.deviceId ?? deviceService.getDeviceId());
-
-    if (!isLoggedIn || !token) {
-      setDevices(mergeDevices([], lanDevices, localDevice));
-      setLoading(false);
-      setLastUpdated(new Date());
-      return;
-    }
+    let lanDevices: Device[] = [];
+    let localDevice: Device | null = null;
 
     try {
-      const resp = await fetch(`${API_BASE}/devices`, {
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
-      });
-      if (!resp.ok) throw new Error(`Request failed: ${resp.status}`);
-      const data = (await resp.json()) as DeviceApi[];
-      setDevices(mergeDevices(data.map(toServerDevice), lanDevices, localDevice));
-      setLastUpdated(new Date());
+      [lanDevices, localDevice] = await Promise.all([
+        fetchLanDevices(Boolean(fetchOptions?.deepRefresh)),
+        fetchLocalDevice(),
+      ]);
+      setCurrentDeviceId(localDevice?.deviceId ?? deviceService.getDeviceId());
+
+      if (!isLoggedIn || !token) {
+        setDevices(mergeDevices([], lanDevices, localDevice));
+        return;
+      }
+
+      try {
+        const resp = await fetch(`${API_BASE}/devices`, {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        });
+        if (!resp.ok) throw new Error(`Request failed: ${resp.status}`);
+        const data = (await resp.json()) as DeviceApi[];
+        setDevices(mergeDevices(data.map(toServerDevice), lanDevices, localDevice));
+      } catch (e) {
+        setDevices(mergeDevices([], lanDevices, localDevice));
+        setError(
+          lanDevices.length > 0 || localDevice
+            ? null
+            : e instanceof Error
+              ? e.message
+              : "加载设备失败"
+        );
+      }
     } catch (e) {
       setDevices(mergeDevices([], lanDevices, localDevice));
-      setLastUpdated(new Date());
       setError(
         lanDevices.length > 0 || localDevice
           ? null
@@ -299,9 +340,11 @@ export function useDevices(options?: UseDevicesOptions) {
             : "加载设备失败"
       );
     } finally {
+      hasLoadedRef.current = true;
       setLoading(false);
+      setLastUpdated(new Date());
     }
-  }, [devices.length, isLoggedIn, token]);
+  }, [isLoggedIn, token]);
 
   useEffect(() => {
     void fetchDevices();
@@ -324,7 +367,12 @@ export function useDevices(options?: UseDevicesOptions) {
     return () => document.removeEventListener("visibilitychange", handleVisibilityChange);
   }, [fetchDevices, enabled]);
 
-  return { devices, loading, error, lastUpdated, refresh: fetchDevices, currentDeviceId };
+  const refresh = useCallback(
+    () => fetchDevices({ deepRefresh: true }),
+    [fetchDevices]
+  );
+
+  return { devices, loading, error, lastUpdated, refresh, currentDeviceId };
 }
 
 export function useDeviceById(id: string | undefined, devices: Device[]) {

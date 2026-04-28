@@ -35,6 +35,13 @@ import {
   type TestConfig,
   type TestMatrixConfig,
 } from "../adapters/tauri";
+import {
+  getProbeSnapshot,
+  getSessionSnapshot,
+  startReceiver,
+  type ProbeSnapshot,
+  type SessionRuntimeSnapshot,
+} from "../services/ipcSessionService";
 import { isTauriRuntime } from "../utils/runtime";
 import { withTauriWindow } from "../utils/tauriWindow";
 
@@ -98,6 +105,10 @@ const bitrateOptions: Option<BitrateKey>[] = [
 
 function optionLabel<T extends string>(options: Option<T>[], value: T) {
   return options.find((option) => option.value === value)?.label ?? value;
+}
+
+export function isLocalPipelinePreviewSession(sessionId: string): boolean {
+  return sessionId === "local-preview" || sessionId.startsWith("local-display-test");
 }
 
 function TitleSelect<T extends string>({
@@ -164,12 +175,19 @@ export function RemoteDisplayWindowPage() {
   const [metrics, setMetrics] = useState<HarnessMetrics | null>(null);
   const [capturedFrame, setCapturedFrame] = useState<FrameData | null>(null);
   const [testMessage, setTestMessage] = useState<string | null>(null);
+  const [sessionSnapshot, setSessionSnapshot] =
+    useState<SessionRuntimeSnapshot | null>(null);
+  const [probeSnapshot, setProbeSnapshot] = useState<ProbeSnapshot | null>(null);
 
   const sessionId = id ?? context?.session_id ?? "local-preview";
   const activeSurfaceId = context?.surface_id ?? surfaceId;
+  const isLocalPipelinePreview = isLocalPipelinePreviewSession(sessionId);
   const isNative = renderMode === "d3d11_native";
   const usesNativeSharedTexture =
     isNative && capture === "dxgi" && encoder === "nvenc_h264" && decoder === "nvdec";
+  const remoteFramesReceived = probeSnapshot?.frames_received ?? 0;
+  const remoteFramesDecoded = probeSnapshot?.frames_decoded ?? 0;
+  const hasRemoteFrames = remoteFramesReceived > 0 || remoteFramesDecoded > 0;
 
   const title = useMemo(() => {
     if (context?.label) return context.label;
@@ -271,9 +289,10 @@ export function RemoteDisplayWindowPage() {
   }, [isNative, testSettingsOpen]);
 
   const openTestSettings = useCallback(() => {
+    if (!isLocalPipelinePreview) return;
     setTestSettingsOpen(true);
     void syncNativeSurface({ visible: false });
-  }, [syncNativeSurface]);
+  }, [isLocalPipelinePreview, syncNativeSurface]);
 
   const closeTestSettings = useCallback(() => {
     setTestSettingsOpen(false);
@@ -335,7 +354,7 @@ export function RemoteDisplayWindowPage() {
   }, [scheduleNativeSurfaceSync]);
 
   useEffect(() => {
-    if (!isTestBusy) return;
+    if (!isLocalPipelinePreview || !isTestBusy) return;
 
     let cancelled = false;
     const poll = async () => {
@@ -375,10 +394,10 @@ export function RemoteDisplayWindowPage() {
       cancelled = true;
       window.clearInterval(interval);
     };
-  }, [currentRunId, isTestBusy, testStatus]);
+  }, [currentRunId, isLocalPipelinePreview, isTestBusy, testStatus]);
 
   useEffect(() => {
-    if (!isTestBusy || isNative) return;
+    if (!isLocalPipelinePreview || !isTestBusy || isNative) return;
 
     let cancelled = false;
     const poll = async () => {
@@ -398,7 +417,59 @@ export function RemoteDisplayWindowPage() {
       cancelled = true;
       window.clearInterval(interval);
     };
-  }, [isNative, isTestBusy]);
+  }, [isLocalPipelinePreview, isNative, isTestBusy]);
+
+  useEffect(() => {
+    if (isLocalPipelinePreview || !isTauriRuntime()) return;
+
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const [snapshot, probe] = await Promise.all([
+          getSessionSnapshot(sessionId),
+          getProbeSnapshot(sessionId),
+        ]);
+        if (cancelled) return;
+
+        setSessionSnapshot(snapshot);
+        setProbeSnapshot(probe);
+
+        const errorMessage = snapshot.last_error ?? probe.last_error ?? null;
+        if (errorMessage) {
+          setLastError(errorMessage);
+          setTestMessage(errorMessage);
+        } else if (snapshot.state === "failed") {
+          setTestStatus("failed");
+          setTestMessage("远程会话失败");
+        } else if (snapshot.receiver_active) {
+          setTestStatus("running");
+          setTestMessage(
+            probe.frames_decoded > 0 || probe.frames_received > 0
+              ? "远程接收中"
+              : "远程接收已启动，等待远端媒体帧"
+          );
+        } else if (testStatus === "running" || testStatus === "starting") {
+          setTestStatus("idle");
+          setTestMessage("远程会话已连接，等待启动接收侧");
+        }
+      } catch (error) {
+        if (cancelled) return;
+        const message = error instanceof Error ? error.message : String(error);
+        setLastError(message);
+        setTestMessage(message);
+      }
+    };
+
+    void poll();
+    const interval = window.setInterval(() => {
+      void poll();
+    }, 1_000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [isLocalPipelinePreview, sessionId, testStatus]);
 
   const noDragSelector =
     'button, a, input, select, textarea, [role="button"], [data-no-drag="true"]';
@@ -431,7 +502,65 @@ export function RemoteDisplayWindowPage() {
     setRenderMode("d3d11_native");
   }, []);
 
+  const handleStartRemoteReceiver = useCallback(async () => {
+    setTestSettingsOpen(false);
+    setLastError(null);
+    setTestMessage("启动远程接收侧");
+    setTestStatus("starting");
+    setCurrentRunId(null);
+    setMetrics(null);
+    setCapturedFrame(null);
+
+    try {
+      const snapshot = await getSessionSnapshot(sessionId);
+      setSessionSnapshot(snapshot);
+
+      if (snapshot.state === "failed") {
+        const message = snapshot.last_error ?? "远程会话已失败";
+        setTestStatus("failed");
+        setTestMessage(message);
+        setLastError(message);
+        return;
+      }
+
+      if (snapshot.role !== "controller" && snapshot.role !== "unknown") {
+        const message = `当前窗口角色为 ${snapshot.role}，不能作为远程接收端`;
+        setTestStatus("failed");
+        setTestMessage(message);
+        setLastError(message);
+        return;
+      }
+
+      if (!snapshot.receiver_active) {
+        await startReceiver(sessionId);
+      }
+
+      const [nextSnapshot, nextProbe] = await Promise.all([
+        getSessionSnapshot(sessionId),
+        getProbeSnapshot(sessionId),
+      ]);
+      setSessionSnapshot(nextSnapshot);
+      setProbeSnapshot(nextProbe);
+      setTestStatus("running");
+      setTestMessage(
+        nextProbe.frames_decoded > 0 || nextProbe.frames_received > 0
+          ? "远程接收中"
+          : "远程接收已启动，等待远端媒体帧"
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setTestStatus("failed");
+      setTestMessage(message);
+      setLastError(message);
+    }
+  }, [sessionId]);
+
   const handleStartTest = async () => {
+    if (!isLocalPipelinePreview) {
+      await handleStartRemoteReceiver();
+      return;
+    }
+
     setTestSettingsOpen(false);
     setLastError(null);
     setTestMessage("测试启动中");
@@ -473,6 +602,12 @@ export function RemoteDisplayWindowPage() {
   };
 
   const handleStopTest = async () => {
+    if (!isLocalPipelinePreview) {
+      setTestStatus("idle");
+      setTestMessage("远程接收由 mrd-service 管理，未停止会话");
+      return;
+    }
+
     setTestStatus("stopping");
     const result = currentRunId
       ? await testStopRun(currentRunId)
@@ -507,6 +642,19 @@ export function RemoteDisplayWindowPage() {
       .toString()
       .padStart(2, "0")}`;
   };
+
+  const primaryActionLabel = isLocalPipelinePreview
+    ? isTestBusy
+      ? "停止测试"
+      : "开始测试"
+    : testStatus === "starting"
+      ? "启动接收"
+      : testStatus === "running"
+        ? "刷新接收"
+        : "开始接收";
+  const statusLabel = isLocalPipelinePreview
+    ? "connected"
+    : sessionSnapshot?.state ?? "loading";
 
   return (
     <div className="flex h-screen w-screen flex-col overflow-hidden bg-[#080a0f] text-slate-100">
@@ -545,13 +693,20 @@ export function RemoteDisplayWindowPage() {
           className="hidden min-w-0 flex-1 items-center gap-1 overflow-x-auto px-2 lg:flex"
           style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}
         >
-          <button
-            className="inline-flex h-9 items-center gap-2 rounded-md border border-white/10 bg-black/20 px-3 text-[11px] font-medium text-slate-200 hover:bg-white/10"
-            onClick={openTestSettings}
-          >
-            <SlidersHorizontal className="h-3.5 w-3.5 text-cyan-300" />
-            测试配置
-          </button>
+          {isLocalPipelinePreview ? (
+            <button
+              className="inline-flex h-9 items-center gap-2 rounded-md border border-white/10 bg-black/20 px-3 text-[11px] font-medium text-slate-200 hover:bg-white/10"
+              onClick={openTestSettings}
+            >
+              <SlidersHorizontal className="h-3.5 w-3.5 text-cyan-300" />
+              测试配置
+            </button>
+          ) : (
+            <div className="inline-flex h-9 items-center gap-2 rounded-md border border-cyan-400/20 bg-cyan-400/10 px-3 text-[11px] font-medium text-cyan-100">
+              <Network className="h-3.5 w-3.5 text-cyan-300" />
+              LAN 远程会话
+            </div>
+          )}
         </div>
 
         <div
@@ -698,14 +853,14 @@ export function RemoteDisplayWindowPage() {
         className="relative min-h-0 flex-1 overflow-hidden bg-black"
       >
         <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,#172033_0,#05070a_58%,#000_100%)]" />
-        {!isNative && capturedFrame && (
+        {isLocalPipelinePreview && !isNative && capturedFrame && (
           <img
             src={`data:image/png;base64,${capturedFrame[0]}`}
             alt="Captured frame"
             className="absolute inset-0 h-full w-full object-contain"
           />
         )}
-        {!isNative && !capturedFrame && (
+        {isLocalPipelinePreview && !isNative && !capturedFrame && (
           <div className="absolute inset-0 flex items-center justify-center">
             <div className="text-center">
               <PanelTop className="mx-auto mb-3 h-9 w-9 text-slate-500" />
@@ -716,6 +871,36 @@ export function RemoteDisplayWindowPage() {
                 {testDescription}
               </div>
             </div>
+          </div>
+        )}
+        {!isLocalPipelinePreview && !hasRemoteFrames && (
+          <div className="absolute inset-0 flex items-center justify-center px-6">
+            <div className="max-w-xl rounded-xl border border-white/10 bg-black/45 px-6 py-5 text-center shadow-2xl backdrop-blur">
+              <Network className="mx-auto mb-3 h-9 w-9 text-cyan-300" />
+              <div className="text-sm font-semibold text-slate-100">等待远端媒体帧</div>
+              <div className="mt-2 text-xs leading-5 text-slate-400">
+                当前为 LAN 远程会话，不会再使用本机测试采集画面填充窗口。
+                {sessionSnapshot?.receiver_active
+                  ? " 接收侧已启动。"
+                  : " 点击开始接收启动接收侧。"}
+              </div>
+              <div className="mt-3 grid grid-cols-3 gap-2 text-[11px] text-slate-300">
+                <div className="rounded-md bg-white/8 px-2 py-1.5">
+                  state: {sessionSnapshot?.state ?? "loading"}
+                </div>
+                <div className="rounded-md bg-white/8 px-2 py-1.5">
+                  rx: {remoteFramesReceived}
+                </div>
+                <div className="rounded-md bg-white/8 px-2 py-1.5">
+                  decoded: {remoteFramesDecoded}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+        {!isLocalPipelinePreview && hasRemoteFrames && (
+          <div className="absolute right-3 top-3 rounded-md border border-cyan-400/20 bg-black/45 px-3 py-2 text-[11px] text-cyan-100 backdrop-blur">
+            remote rx {remoteFramesReceived} / decoded {remoteFramesDecoded}
           </div>
         )}
         {lastError && (
@@ -729,10 +914,16 @@ export function RemoteDisplayWindowPage() {
         <div className="flex min-w-0 items-center gap-4">
           <span className="inline-flex items-center gap-1.5">
             <Circle className="h-2 w-2 fill-emerald-400 text-emerald-400" />
-            connected
+            {statusLabel}
           </span>
           <span>render: {renderMode === "d3d11_native" ? "D3D11 native" : "Web preview"}</span>
-          <span className="hidden min-w-0 truncate md:inline">test: {testDescription}</span>
+          <span className="hidden min-w-0 truncate md:inline">
+            {isLocalPipelinePreview
+              ? `test: ${testDescription}`
+              : `remote: ${sessionSnapshot?.transport_kind ?? "unknown"} / receiver ${
+                  sessionSnapshot?.receiver_active ? "on" : "off"
+                }`}
+          </span>
           {metrics && (
             <span className="hidden lg:inline">
               {metrics.capture_fps.toFixed(1)} FPS / {metrics.total_latency_p95_ms.toFixed(1)} ms
@@ -749,29 +940,35 @@ export function RemoteDisplayWindowPage() {
         </div>
         <div className="flex shrink-0 items-center gap-2">
           {testMessage && <span className="hidden max-w-[220px] truncate md:inline">{testMessage}</span>}
-          <button
-            className="inline-flex h-7 items-center gap-1.5 rounded-md border border-white/10 px-2 text-slate-300 hover:bg-white/10"
-            onClick={openTestSettings}
-          >
-            <SlidersHorizontal className="h-3.5 w-3.5" />
-            配置
-          </button>
+          {isLocalPipelinePreview && (
+            <button
+              className="inline-flex h-7 items-center gap-1.5 rounded-md border border-white/10 px-2 text-slate-300 hover:bg-white/10"
+              onClick={openTestSettings}
+            >
+              <SlidersHorizontal className="h-3.5 w-3.5" />
+              配置
+            </button>
+          )}
           <button
             className={`inline-flex h-7 items-center gap-1.5 rounded-md px-2 font-medium ${
-              isTestBusy
+              isLocalPipelinePreview && isTestBusy
                 ? "bg-red-500/90 text-white hover:bg-red-400"
                 : "bg-cyan-500 text-white hover:bg-cyan-400"
             }`}
-            onClick={() => void (isTestBusy ? handleStopTest() : handleStartTest())}
+            onClick={() =>
+              void (isLocalPipelinePreview && isTestBusy
+                ? handleStopTest()
+                : handleStartTest())
+            }
           >
             {testStatus === "starting" || testStatus === "stopping" ? (
               <Loader2 className="h-3.5 w-3.5 animate-spin" />
-            ) : isTestBusy ? (
+            ) : isLocalPipelinePreview && isTestBusy ? (
               <Square className="h-3 w-3" />
             ) : (
               <Play className="h-3.5 w-3.5" />
             )}
-            {isTestBusy ? "停止测试" : "开始测试"}
+            {primaryActionLabel}
           </button>
           <span className="hidden items-center gap-1.5 xl:inline-flex">
             <MousePointer2 className="h-3.5 w-3.5" />

@@ -16,6 +16,8 @@ import { Monitor } from 'lucide-react';
 import { RemoteSessionPage } from './RemoteSessionPage';
 import type { Device } from './deviceData';
 
+const mockNavigate = vi.hoisted(() => vi.fn());
+
 // Mock fetch globally to prevent HTTP requests
 globalThis.fetch = vi.fn();
 
@@ -25,7 +27,7 @@ vi.mock('react-router', async (importOriginal) => {
   return {
     ...actual,
     useParams: () => ({ id: 'test-device-1' }),
-    useNavigate: () => vi.fn(),
+    useNavigate: () => mockNavigate,
   };
 });
 
@@ -212,7 +214,7 @@ describe('RemoteSessionPage - Page Level Tests', () => {
   // ========================================================================
 
   describe('migration state - disabled rendering features', () => {
-    it('shows alert when trying to pop out render window', async () => {
+    it('navigates to the route fallback when popping out outside Tauri', async () => {
       const mockAlert = vi.fn();
       globalThis.alert = mockAlert;
 
@@ -233,9 +235,8 @@ describe('RemoteSessionPage - Page Level Tests', () => {
       if (popOutButton) {
         await userEvent.click(popOutButton);
 
-        expect(mockAlert).toHaveBeenCalledWith(
-          expect.stringContaining('渲染窗口功能已迁移到 mrd-service')
-        );
+        expect(mockNavigate).toHaveBeenCalledWith('/session/test-device-1');
+        expect(mockAlert).not.toHaveBeenCalled();
       }
 
       mockAlert.mockRestore();
