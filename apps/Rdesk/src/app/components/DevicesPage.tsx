@@ -112,6 +112,20 @@ export function DevicesPage() {
   const inputBg = isDark
     ? "bg-[#2a2a2a] border-gray-600 text-gray-200 placeholder-gray-500"
     : "bg-[#f7f8fa] border-gray-200 text-gray-900 placeholder-gray-400";
+  const sourceBadgeClass = (source: Device["discoverySources"][number]) => {
+    if (source === "local") {
+      return isDark ? "bg-blue-900/50 text-blue-300" : "bg-blue-100 text-blue-700";
+    }
+    if (source === "lan_p2p") {
+      return isDark ? "bg-emerald-900/50 text-emerald-300" : "bg-emerald-100 text-emerald-700";
+    }
+    return isDark ? "bg-gray-800 text-gray-300" : "bg-gray-100 text-gray-700";
+  };
+  const sourceBadgeText: Record<Device["discoverySources"][number], string> = {
+    local: "本机",
+    lan_p2p: "P2P 局域网",
+    server: "服务器",
+  };
 
   // 当前选中的分组
   const currentGroup = groups.find((g) => g.id === selectedGroupId) || null;
@@ -177,6 +191,7 @@ export function DevicesPage() {
         targetDeviceName: device.name,
         targetOs: device.os,
         targetIp: device.ip,
+        lanP2P: device.p2pAvailable && !device.isLocal,
       });
       if (result.mode === "route") navigate(`/session/${result.sessionId}`);
     } catch (error) {
@@ -360,7 +375,7 @@ export function DevicesPage() {
                         <span className={`font-medium ${textBody}`} style={{ fontSize: 14 }}>
                           {device.name}
                         </span>
-                        {isCurrentDevice && (
+                        {isCurrentDevice && !device.isLocal && (
                           <span
                             className={`px-1.5 py-0.5 rounded text-[10px] ${
                               isDark
@@ -371,10 +386,18 @@ export function DevicesPage() {
                             本机
                           </span>
                         )}
+                        {device.discoverySources.map((source) => (
+                          <span
+                            key={source}
+                            className={`px-1.5 py-0.5 rounded text-[10px] ${sourceBadgeClass(source)}`}
+                          >
+                            {sourceBadgeText[source]}
+                          </span>
+                        ))}
                         {device.favorite && <Star className="w-3 h-3 text-yellow-500 fill-yellow-500" />}
                       </div>
                       <span className={textTertiary} style={{ fontSize: 12 }}>
-                        {device.os}
+                        {device.os} · {device.sourceLabel}
                       </span>
                     </div>
                   </div>

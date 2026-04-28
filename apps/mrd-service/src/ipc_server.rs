@@ -172,6 +172,20 @@ impl IpcServer {
                 .await
             }
 
+            IpcRequest::StartLanRemoteSession {
+                session_id,
+                target_device_id,
+                transport_kind,
+            } => {
+                session::start_lan_remote_session(
+                    &self.app_state,
+                    session_id,
+                    target_device_id,
+                    transport_kind,
+                )
+                .await
+            }
+
             IpcRequest::AcceptSession {
                 session_id,
                 source_device_id,

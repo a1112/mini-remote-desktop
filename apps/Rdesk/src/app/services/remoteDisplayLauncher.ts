@@ -1,7 +1,7 @@
 import { openRemoteDisplayWindow } from "../adapters/tauri";
 import { isTauriRuntime } from "../utils/runtime";
 import { deviceService } from "./deviceService";
-import { startSession, type TransportKind } from "./ipcSessionService";
+import { startLanRemoteSession, startSession, type TransportKind } from "./ipcSessionService";
 import { saveWebRemoteSession } from "./webRemoteSessionService";
 
 export type RemoteDisplayLaunchResult = {
@@ -26,6 +26,7 @@ export async function launchRemoteDisplayForDevice(
     targetOs?: string;
     targetIp?: string;
     localTest?: boolean;
+    lanP2P?: boolean;
   }
 ): Promise<RemoteDisplayLaunchResult> {
   const transportKind = isTauriRuntime() ? (options?.transportKind ?? "webrtc") : "webrtc";
@@ -45,7 +46,9 @@ export async function launchRemoteDisplayForDevice(
     return { sessionId, windowLabel: null, mode: "route" };
   }
 
-  const startedSessionId = await startSession(sessionId, targetDeviceId, transportKind);
+  const startedSessionId = options?.lanP2P
+    ? await startLanRemoteSession(sessionId, targetDeviceId, transportKind)
+    : await startSession(sessionId, targetDeviceId, transportKind);
 
   if (options?.openWindow === false) {
     return { sessionId: startedSessionId, windowLabel: null, mode: "route" };

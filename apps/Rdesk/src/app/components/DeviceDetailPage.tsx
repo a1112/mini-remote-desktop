@@ -374,6 +374,8 @@ function RemoteTab({ device }: { device: Device }) {
   const [connected, setConnected] = useState(false);
   const [launching, setLaunching] = useState(false);
   const isOnline = device.status === "online";
+  const isLanP2PRemote = device.p2pAvailable && !device.isLocal;
+  const preferredTransport = device.os.toLowerCase().includes("quic") ? "quic" : "webrtc";
 
   useEffect(() => {
     if (!connected) return;
@@ -395,10 +397,11 @@ function RemoteTab({ device }: { device: Device }) {
     setLaunching(true);
     try {
       const result = await launchRemoteDisplayForDevice(device.deviceId, {
-        transportKind: device.os.toLowerCase().includes("quic") ? "quic" : "webrtc",
+        transportKind: preferredTransport,
         targetDeviceName: device.name,
         targetOs: device.os,
         targetIp: device.ip,
+        lanP2P: isLanP2PRemote,
       });
       if (result.mode === "route") navigate(`/session/${result.sessionId}`);
     } catch (error) {
@@ -410,8 +413,8 @@ function RemoteTab({ device }: { device: Device }) {
 
   if (!isOnline) {
     return (
-      <div className={`flex items-center justify-center h-full ${isDark ? "bg-[#1a1a1a]" : "bg-[#f0f2f5]"}`}>
-        <div className="text-center">
+      <div className={`flex items-center justify-center h-full p-6 ${isDark ? "bg-[#1a1a1a]" : "bg-[#f0f2f5]"}`}>
+        <div className={`w-full max-w-[520px] rounded-xl border p-6 text-center shadow-sm ${isDark ? "bg-[#202020] border-gray-700" : "bg-white border-gray-200"}`}>
           <WifiOff className={`w-12 h-12 mx-auto mb-3 ${isDark ? "text-gray-600" : "text-gray-300"}`} />
           <div className={isDark ? "text-gray-400" : "text-gray-500"} style={{ fontSize: 16 }}>设备当前离线</div>
           <div className={`mt-1 ${isDark ? "text-gray-500" : "text-gray-400"}`} style={{ fontSize: 13 }}>最后在线: {device.lastSeen}</div>
@@ -422,17 +425,27 @@ function RemoteTab({ device }: { device: Device }) {
 
   if (!connected) {
     return (
-      <div className={`flex items-center justify-center h-full ${isDark ? "bg-[#1a1a1a]" : "bg-[#f0f2f5]"}`}>
-        <div className="text-center">
+      <div className={`flex items-center justify-center h-full p-6 ${isDark ? "bg-[#1a1a1a]" : "bg-[#f0f2f5]"}`}>
+        <div className={`w-full max-w-[520px] rounded-xl border p-6 text-center shadow-sm ${isDark ? "bg-[#202020] border-gray-700" : "bg-white border-gray-200"}`}>
           <div className={`w-16 h-16 rounded-2xl flex items-center justify-center mx-auto mb-4 ${isDark ? "bg-blue-900/30" : "bg-blue-50"}`}>
             <Monitor className="w-8 h-8 text-blue-600" />
           </div>
           <div className={`mb-1 ${isDark ? "text-gray-200" : "text-gray-800"}`} style={{ fontSize: 18 }}>连接到 {device.name}</div>
           <div className={`mb-6 ${isDark ? "text-gray-500" : "text-gray-400"}`} style={{ fontSize: 13 }}>{device.os} · {device.ip} · 延迟 {device.ping}ms</div>
+          <div className={`grid grid-cols-2 gap-3 mb-5 text-left ${isDark ? "text-gray-300" : "text-gray-700"}`} style={{ fontSize: 12 }}>
+            <div className={`rounded-lg px-3 py-2 ${isDark ? "bg-[#2a2a2a]" : "bg-gray-50"}`}>
+              <div className={isDark ? "text-gray-500" : "text-gray-400"}>发现来源</div>
+              <div className="mt-1 font-medium">{device.sourceLabel}</div>
+            </div>
+            <div className={`rounded-lg px-3 py-2 ${isDark ? "bg-[#2a2a2a]" : "bg-gray-50"}`}>
+              <div className={isDark ? "text-gray-500" : "text-gray-400"}>连接方式</div>
+              <div className="mt-1 font-medium">{isLanP2PRemote ? "P2P LAN 自动接受" : "mrd-service 会话"}</div>
+            </div>
+          </div>
           <button
             onClick={() => void handleStartRemote()}
             disabled={launching}
-            className="px-8 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white transition-colors shadow-sm disabled:cursor-not-allowed disabled:opacity-60"
+            className="w-full px-8 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white transition-colors shadow-sm disabled:cursor-not-allowed disabled:opacity-60"
             style={{ fontSize: 14 }}
           >
             发起远程连接

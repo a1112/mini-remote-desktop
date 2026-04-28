@@ -292,6 +292,19 @@ describe('Tauri Adapter Contract', () => {
       });
     });
 
+    it('ipc_start_lan_remote_session calls correct command with args', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue('session-123');
+
+      await adapter.ipcStartLanRemoteSession('session-123', 'device-456', 'quic');
+
+      expect(mockInvoke).toHaveBeenCalledWith('ipc_start_lan_remote_session', {
+        sessionId: 'session-123',
+        targetDeviceId: 'device-456',
+        transportKind: 'quic',
+      });
+    });
+
     it('ipc_accept_session calls correct command with args', async () => {
       const mockInvoke = getMockInvoke();
       mockInvoke.mockResolvedValue('session-123');

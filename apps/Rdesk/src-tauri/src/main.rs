@@ -732,6 +732,33 @@ async fn ipc_start_session(
     }
 }
 
+/// Start LAN P2P session via IPC and ask the peer to auto-accept it.
+#[tauri::command]
+async fn ipc_start_lan_remote_session(
+    session_id: String,
+    target_device_id: String,
+    transport_kind: String,
+) -> Result<String, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+    use mrd_proto::{DeviceId, SessionId};
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::StartLanRemoteSession {
+            session_id: SessionId(session_id),
+            target_device_id: DeviceId(target_device_id),
+            transport_kind,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::SessionStarted { session_id } => Ok(session_id.0),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
 /// Accept session via IPC (migrated version)
 #[tauri::command]
 async fn ipc_accept_session(
@@ -1688,6 +1715,7 @@ fn main() {
             ipc_refresh_lan_discovery,
             ipc_list_sessions,
             ipc_start_session,
+            ipc_start_lan_remote_session,
             ipc_accept_session,
             ipc_stop_session,
             ipc_fail_session,

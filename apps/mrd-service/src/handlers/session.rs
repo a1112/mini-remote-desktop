@@ -46,6 +46,86 @@ pub async fn start_session(
     IpcResponse::SessionStarted { session_id }
 }
 
+/// Start a LAN P2P remote session and request auto-accept on the target peer.
+pub async fn start_lan_remote_session(
+    app_state: &Arc<AppState>,
+    session_id: SessionId,
+    target_device_id: DeviceId,
+    transport_kind: String,
+) -> IpcResponse {
+    tracing::info!(
+        "Starting LAN remote session: {} -> {} via {}",
+        session_id.0,
+        target_device_id.0,
+        transport_kind
+    );
+
+    {
+        let mut sessions = app_state.sessions.lock().await;
+        sessions.insert(
+            session_id.clone(),
+            SessionSnapshot {
+                session_id: session_id.clone(),
+                transport: transport_kind.clone(),
+                source_device_id: None,
+                target_device_id: Some(target_device_id.clone()),
+                local_listen_addr: None,
+                local_server_name: None,
+                local_cert_der_b64: None,
+                remote_listen_addr: None,
+                remote_server_name: None,
+                remote_cert_der_b64: None,
+                lifecycle_state: "connecting".to_string(),
+                last_error: None,
+                sender_active: false,
+                receiver_active: false,
+            },
+        );
+    }
+
+    match crate::lan_discovery::request_lan_remote_session(
+        app_state,
+        &target_device_id,
+        &session_id,
+        &transport_kind,
+    )
+    .await
+    {
+        Ok(()) => {
+            let mut sessions = app_state.sessions.lock().await;
+            if let Some(snapshot) = sessions.get(&session_id).cloned() {
+                sessions.insert(
+                    session_id.clone(),
+                    SessionSnapshot {
+                        lifecycle_state: "connected".to_string(),
+                        last_error: None,
+                        ..snapshot
+                    },
+                );
+            }
+            IpcResponse::SessionStarted { session_id }
+        }
+        Err(error) => {
+            let message = error.to_string();
+            let mut sessions = app_state.sessions.lock().await;
+            if let Some(snapshot) = sessions.get(&session_id).cloned() {
+                sessions.insert(
+                    session_id.clone(),
+                    SessionSnapshot {
+                        lifecycle_state: "failed".to_string(),
+                        last_error: Some(message.clone()),
+                        ..snapshot
+                    },
+                );
+            }
+            IpcResponse::Error {
+                code: "E_LAN_REMOTE".to_string(),
+                message,
+            }
+        }
+    }
+}
+
 /// Handle session accept request
 pub async fn accept_session(
     app_state: &Arc<AppState>,
@@ -284,6 +364,38 @@ mod tests {
         let sessions = app_state.sessions.lock().await;
         let stored = sessions.get(&session_id);
         assert!(stored.is_some());
+    }
+
+    #[tokio::test]
+    async fn start_lan_remote_session_marks_missing_peer_failure() {
+        let app_state = Arc::new(AppState::new());
+        app_state
+            .devices
+            .lock()
+            .await
+            .register(DeviceId("controller".to_string()), "Controller".to_string());
+        let session_id = SessionId("lan-session".to_string());
+
+        let response = start_lan_remote_session(
+            &app_state,
+            session_id.clone(),
+            DeviceId("missing-peer".to_string()),
+            "webrtc".to_string(),
+        )
+        .await;
+
+        match response {
+            IpcResponse::Error { code, message } => {
+                assert_eq!(code, "E_LAN_REMOTE");
+                assert!(message.contains("missing-peer"));
+            }
+            _ => panic!("Expected LAN remote error response"),
+        }
+
+        let sessions = app_state.sessions.lock().await;
+        let stored = sessions.get(&session_id).expect("failed LAN session");
+        assert_eq!(stored.lifecycle_state, "failed");
+        assert!(stored.last_error.is_some());
     }
 
     #[tokio::test]

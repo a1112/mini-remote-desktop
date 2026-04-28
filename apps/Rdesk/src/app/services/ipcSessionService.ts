@@ -141,6 +141,22 @@ export const startSession = async (
 };
 
 /**
+ * Start a LAN P2P session as controller; the discovered peer auto-accepts.
+ */
+export const startLanRemoteSession = async (
+  sessionId: string,
+  targetDeviceId: string,
+  transportKind: TransportKind = "webrtc"
+): Promise<string> => {
+  const result = await tauriAdapter.ipcStartLanRemoteSession(
+    sessionId,
+    targetDeviceId,
+    transportKind
+  );
+  return unwrapAdapterResult(result);
+};
+
+/**
  * Accept an incoming session as agent
  */
 export const acceptSession = async (

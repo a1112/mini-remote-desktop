@@ -310,6 +310,21 @@ export async function ipcStartSession(
 }
 
 /**
+ * Start a LAN P2P remote session and request automatic accept on the peer.
+ */
+export async function ipcStartLanRemoteSession(
+  sessionId: string,
+  targetDeviceId: string,
+  transportKind: string
+): Promise<AdapterResult<string>> {
+  return invokeAdapter<string>('ipc_start_lan_remote_session', {
+    sessionId,
+    targetDeviceId,
+    transportKind,
+  });
+}
+
+/**
  * Accept an incoming session
  */
 export async function ipcAcceptSession(

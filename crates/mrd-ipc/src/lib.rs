@@ -103,6 +103,12 @@ pub enum IpcRequest {
         target_device_id: DeviceId,
         transport_kind: String, // "quic" or "webrtc"
     },
+    /// Start a LAN P2P session as controller and ask the discovered peer to accept it.
+    StartLanRemoteSession {
+        session_id: SessionId,
+        target_device_id: DeviceId,
+        transport_kind: String, // "quic" or "webrtc"
+    },
     /// Accept an incoming session as agent
     AcceptSession {
         session_id: SessionId,
