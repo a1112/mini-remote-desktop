@@ -17,6 +17,7 @@ import {
   Minus,
   Square,
   X,
+  Server,
   Cpu,
   MemoryStick,
   Monitor,
@@ -196,35 +197,45 @@ function ResourceMonitorStrip({
 }: {
   snapshot: SystemResourceSnapshot | null;
 }) {
-  const serviceTitle = snapshot
+  const targetTitle = snapshot
     ? `${snapshot.target_name}${
         snapshot.target_pid != null ? ` PID ${snapshot.target_pid}` : ""
       }${snapshot.target_found ? "" : " not running"}`
-    : "mrd-service";
+    : "resource target";
+  const targetValue = snapshot ? compactTargetName(snapshot.target_name) : "--";
   const gpuValue = formatGpuValue(snapshot);
   const memoryTitle = snapshot
-    ? `${serviceTitle} memory ${formatMemory(snapshot.memory_used_mb)} (${formatPercent(
+    ? `${targetTitle} memory ${formatMemory(snapshot.memory_used_mb)} (${formatPercent(
         snapshot.memory_usage_percent
       )} of system memory)`
-    : "mrd-service memory";
+    : "target memory";
+  const gpuScope = snapshot?.gpu_metrics_scope ?? "unavailable";
   const gpuTitle = snapshot?.gpu_metrics_available
-    ? `${serviceTitle} GPU ${gpuValue}`
-    : `${serviceTitle} process GPU metrics unavailable`;
+    ? `${formatScopeLabel(gpuScope, targetTitle)} GPU ${gpuValue}`
+    : "GPU metrics unavailable";
+  const networkScope = snapshot?.network_metrics_scope ?? "unavailable";
   const networkTitle = snapshot
     ? snapshot.network_metrics_available
-      ? `${serviceTitle} network Rx ${formatRate(snapshot.network_rx_bps)} Tx ${formatRate(
+      ? `${formatScopeLabel(networkScope, targetTitle)} network Rx ${formatRate(snapshot.network_rx_bps)} Tx ${formatRate(
           snapshot.network_tx_bps
         )}`
-      : `${serviceTitle} process network metrics unavailable`
-    : "mrd-service network";
+      : "network metrics unavailable"
+    : "network";
 
   return (
     <div className="hidden min-w-0 items-center gap-1 text-muted-foreground lg:flex">
       <TitleMetric
+        icon={<Server className="h-3.5 w-3.5" />}
+        label="SRC"
+        value={targetValue}
+        title={targetTitle}
+        wide
+      />
+      <TitleMetric
         icon={<Cpu className="h-3.5 w-3.5" />}
         label="CPU"
         value={snapshot ? formatPercent(snapshot.cpu_usage_percent) : "--"}
-        title={`${serviceTitle} CPU usage`}
+        title={`${targetTitle} CPU usage`}
       />
       <TitleMetric
         icon={<MemoryStick className="h-3.5 w-3.5" />}
@@ -246,7 +257,7 @@ function ResourceMonitorStrip({
             ? `R ${formatRate(snapshot.network_rx_bps)} T ${formatRate(
                 snapshot.network_tx_bps
               )}`
-            : "N/A"
+            : "--"
         }
         title={networkTitle}
         wide
@@ -316,12 +327,28 @@ function formatRate(bytesPerSecond: number) {
 }
 
 function formatGpuValue(snapshot: SystemResourceSnapshot | null) {
-  if (!snapshot?.gpu_metrics_available) return "N/A";
+  if (!snapshot?.gpu_metrics_available) return "--";
   if (snapshot.gpu_usage_percent != null) {
     return formatPercent(snapshot.gpu_usage_percent);
   }
   if (snapshot.gpu_memory_used_mb != null) {
     return formatMemory(snapshot.gpu_memory_used_mb);
   }
-  return "N/A";
+  return "--";
+}
+
+function compactTargetName(targetName: string) {
+  if (targetName === "Rdesk Workbench") return "Workbench";
+  return targetName;
+}
+
+function formatScopeLabel(scope: string | undefined, targetTitle: string) {
+  switch (scope) {
+    case "process":
+      return targetTitle;
+    case "system":
+      return "System";
+    default:
+      return "Unavailable";
+  }
 }

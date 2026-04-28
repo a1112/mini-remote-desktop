@@ -7,6 +7,9 @@
  * 3. 后续启动时验证设备状态
  */
 
+import { ipcRegisterDevice } from "../adapters/tauri";
+import { isTauriRuntime } from "../utils/runtime";
+
 interface HardwareInfo {
   motherboard_serial: string;
   hostname: string;
@@ -41,7 +44,13 @@ interface StoredDeviceInfo {
 }
 
 const DEVICE_INFO_KEY = "rdesk_device_info";
-const API_BASE = "http://127.0.0.1:9530/api/v1";
+const LOCAL_ACCESS_TOKEN = "local-p2p";
+const API_BASE = (
+  (import.meta as any).env?.VITE_RDESK_SERVER_URL ?? "http://127.0.0.1:9530/api/v1"
+).replace(/\/+$/, "");
+const DEVICE_REGISTRATION_MODE = (
+  (import.meta as any).env?.VITE_RDESK_DEVICE_REGISTRATION ?? "local"
+).toLowerCase();
 
 /**
  * 设备注册服务类
@@ -72,11 +81,18 @@ class DeviceRegistrationService {
   }
 
   private async _initialize(): Promise<StoredDeviceInfo | null> {
+    const useServerRegistration = this.shouldUseServerRegistration();
+
     // 1. 检查本地存储
     const stored = this.getStoredDeviceInfo();
     if (stored) {
       console.log("[DeviceService] 找到本地设备信息:", stored.device_id);
       this.deviceInfo = stored;
+      void this.syncWithLocalService(stored);
+
+      if (!useServerRegistration || this.isLocalOnlyDevice(stored)) {
+        return stored;
+      }
 
       // 验证设备是否仍然有效
       try {
@@ -93,6 +109,10 @@ class DeviceRegistrationService {
     // 2. 获取硬件信息并注册
     try {
       const hardwareInfo = await this.getHardwareInfo();
+      if (!useServerRegistration) {
+        return this.saveLocalDeviceInfo(hardwareInfo);
+      }
+
       const registration = await this.registerDevice(hardwareInfo);
 
       const deviceInfo: StoredDeviceInfo = {
@@ -105,13 +125,43 @@ class DeviceRegistrationService {
 
       this.saveDeviceInfo(deviceInfo);
       this.deviceInfo = deviceInfo;
+      void this.syncWithLocalService(deviceInfo);
 
       console.log("[DeviceService] 设备注册成功:", deviceInfo.device_id);
       return deviceInfo;
     } catch (err) {
+      try {
+        const hardwareInfo = await this.getHardwareInfo();
+        return this.saveLocalDeviceInfo(hardwareInfo);
+      } catch (fallbackErr) {
+        console.error("[DeviceService] LAN fallback registration failed:", fallbackErr);
+      }
       console.error("[DeviceService] 设备注册失败:", err);
       return null;
     }
+  }
+
+  private shouldUseServerRegistration(): boolean {
+    return DEVICE_REGISTRATION_MODE === "server" || DEVICE_REGISTRATION_MODE === "cloud";
+  }
+
+  private isLocalOnlyDevice(info: StoredDeviceInfo): boolean {
+    return info.access_token === LOCAL_ACCESS_TOKEN || info.device_id.startsWith("lan-");
+  }
+
+  private saveLocalDeviceInfo(hardwareInfo: HardwareInfo): StoredDeviceInfo {
+    const fallbackId = `lan-${hardwareInfo.motherboard_serial.replace(/[^a-zA-Z0-9]/g, "").slice(-16)}`;
+    const localInfo: StoredDeviceInfo = {
+      device_id: fallbackId,
+      device_name: hardwareInfo.hostname || "Rdesk LAN Device",
+      access_token: LOCAL_ACCESS_TOKEN,
+      motherboard_serial: hardwareInfo.motherboard_serial,
+      registered_at: new Date().toISOString(),
+    };
+    this.saveDeviceInfo(localInfo);
+    this.deviceInfo = localInfo;
+    void this.syncWithLocalService(localInfo);
+    return localInfo;
   }
 
   /**
@@ -238,6 +288,14 @@ class DeviceRegistrationService {
    */
   getAccessToken(): string | null {
     return this.deviceInfo?.access_token ?? null;
+  }
+
+  private async syncWithLocalService(info: StoredDeviceInfo): Promise<void> {
+    if (!isTauriRuntime()) return;
+    const result = await ipcRegisterDevice(info.device_id, info.device_name);
+    if (!result.ok) {
+      console.warn("[DeviceService] mrd-service device registration failed:", result.error.message);
+    }
   }
 
   /**

@@ -1,5 +1,5 @@
-pub mod recovery;
 pub mod low_latency;
+pub mod recovery;
 
 use std::{
     collections::{BTreeMap, HashMap},

@@ -7,6 +7,8 @@ use anyhow::Result;
 use mrd_capture_dxgi::DxgiDesktopCapture;
 #[cfg(windows)]
 use mrd_capture_dxgi::DxgiSharedTextureCapture;
+#[cfg(windows)]
+use mrd_capture_winrt::WinrtCapture;
 use mrd_decode_nvdec::{NvdecDecoder, NvdecOutputMode};
 use mrd_encode_nvenc::NvencH264Encoder;
 #[cfg(windows)]
@@ -24,8 +26,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const DOWNSAMPLE_MAX_WIDTH: usize = 640;
-const FRAME_UPDATE_INTERVAL: usize = 10;
+const WEB_PREVIEW_MAX_WIDTH: usize = 1280;
+const WEB_PREVIEW_FRAME_UPDATE_INTERVAL: usize = 3;
 
 /// Test chain configuration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -106,6 +108,7 @@ pub struct TestConfig {
     pub fps: Option<u32>,
     pub bitrate: Option<u32>,
     pub renderer: Option<RendererType>,
+    pub renderer_target_hwnd: Option<isize>,
     pub transport: Option<TransportKind>,
     pub zero_copy: Option<bool>,
 }
@@ -117,6 +120,7 @@ impl Default for TestConfig {
             fps: None,
             bitrate: None,
             renderer: None,
+            renderer_target_hwnd: None,
             transport: None,
             zero_copy: None,
         }
@@ -245,11 +249,21 @@ enum PipelineDecoder {
     Software(Box<dyn VideoDecoder>),
 }
 
+enum WebrtcRtpSender {
+    H264(mrd_transport_webrtc::H264RtpSender),
+    Av1(mrd_transport_webrtc::Av1RtpSender),
+}
+
+enum WebrtcRtpIngress {
+    H264(mrd_transport_webrtc::H264RtpIngress),
+    Av1(mrd_transport_webrtc::Av1RtpIngress),
+}
+
 enum PipelineTransport {
     Loopback,
     WebrtcRtp {
-        sender: mrd_transport_webrtc::H264RtpSender,
-        ingress: mrd_transport_webrtc::H264RtpIngress,
+        sender: WebrtcRtpSender,
+        ingress: WebrtcRtpIngress,
     },
     QuicDatagram {
         reassembler: mrd_transport_quic_quinn::QuicAuReassembler,
@@ -259,17 +273,28 @@ enum PipelineTransport {
 }
 
 impl PipelineTransport {
-    fn new(kind: Option<&TransportKind>, fps: u32) -> Self {
+    fn new(kind: Option<&TransportKind>, fps: u32, codec: VideoCodec) -> Self {
         match kind.unwrap_or(&TransportKind::Loopback) {
             TransportKind::Loopback => Self::Loopback,
-            TransportKind::WebrtcRtp => Self::WebrtcRtp {
-                sender: mrd_transport_webrtc::H264RtpSender::new(
-                    "matrix-video",
-                    "matrix-stream",
-                    fps,
-                    1200,
-                ),
-                ingress: mrd_transport_webrtc::H264RtpIngress::default(),
+            TransportKind::WebrtcRtp => match codec {
+                VideoCodec::H264 => Self::WebrtcRtp {
+                    sender: WebrtcRtpSender::H264(mrd_transport_webrtc::H264RtpSender::new(
+                        "matrix-video",
+                        "matrix-stream",
+                        fps,
+                        1200,
+                    )),
+                    ingress: WebrtcRtpIngress::H264(mrd_transport_webrtc::H264RtpIngress::default()),
+                },
+                VideoCodec::Av1 => Self::WebrtcRtp {
+                    sender: WebrtcRtpSender::Av1(mrd_transport_webrtc::Av1RtpSender::new(
+                        "matrix-video",
+                        "matrix-stream",
+                        fps,
+                        1200,
+                    )),
+                    ingress: WebrtcRtpIngress::Av1(mrd_transport_webrtc::Av1RtpIngress::default()),
+                },
             },
             TransportKind::QuicDatagram => Self::QuicDatagram {
                 reassembler: mrd_transport_quic_quinn::QuicAuReassembler::default(),
@@ -285,19 +310,34 @@ impl PipelineTransport {
             Self::WebrtcRtp { sender, ingress } => {
                 let mut reassembled = Vec::with_capacity(access_units.len());
                 for access_unit in access_units {
-                    if access_unit.codec != VideoCodec::H264 {
-                        anyhow::bail!("WebRTC RTP matrix transport only supports H.264");
-                    }
-                    let packets = sender
-                        .packetize_access_unit(&access_unit)
-                        .map_err(|error| anyhow::anyhow!("WebRTC RTP packetize failed: {error}"))?;
+                    let packets = match sender {
+                        WebrtcRtpSender::H264(sender) => sender
+                            .packetize_access_unit(&access_unit)
+                            .map_err(|error| {
+                                anyhow::anyhow!("WebRTC H264 RTP packetize failed: {error}")
+                            })?,
+                        WebrtcRtpSender::Av1(sender) => sender
+                            .packetize_access_unit(&access_unit)
+                            .map_err(|error| {
+                                anyhow::anyhow!("WebRTC AV1 RTP packetize failed: {error}")
+                            })?,
+                    };
                     for packet in packets {
-                        if let Some(unit) = ingress.push_packet(
-                            &packet.payload,
-                            packet.header.marker,
-                            packet.header.sequence_number,
-                            access_unit.timestamp_us,
-                        ) {
+                        let unit = match ingress {
+                            WebrtcRtpIngress::H264(ingress) => ingress.push_packet(
+                                &packet.payload,
+                                packet.header.marker,
+                                packet.header.sequence_number,
+                                access_unit.timestamp_us,
+                            ),
+                            WebrtcRtpIngress::Av1(ingress) => ingress.push_packet(
+                                &packet.payload,
+                                packet.header.marker,
+                                packet.header.sequence_number,
+                                access_unit.timestamp_us,
+                            ),
+                        };
+                        if let Some(unit) = unit {
                             reassembled.push(unit);
                         }
                     }
@@ -367,6 +407,7 @@ impl PipelineDecoder {
     }
 }
 
+#[derive(Clone)]
 enum RenderInput {
     Decoded(DecodedFrame),
     Captured(CapturedFrame),
@@ -384,7 +425,12 @@ struct PipelineRenderer {
 }
 
 impl PipelineRenderer {
-    fn new(renderer_type: &RendererType, width: usize, height: usize) -> Result<Self> {
+    fn new(
+        renderer_type: &RendererType,
+        width: usize,
+        height: usize,
+        target_hwnd: Option<isize>,
+    ) -> Result<Self> {
         let (sender, receiver) = mpsc::sync_channel(1);
         let last_error = Arc::new(Mutex::new(None));
         let thread_error = Arc::clone(&last_error);
@@ -393,7 +439,9 @@ impl PipelineRenderer {
         let render_thread = thread::Builder::new()
             .name("mrd-dx11-test-render".to_string())
             .spawn(move || {
-                if let Err(error) = run_renderer_thread(renderer_type, width, height, receiver) {
+                if let Err(error) =
+                    run_renderer_thread(renderer_type, width, height, target_hwnd, receiver)
+                {
                     if let Ok(mut last_error) = thread_error.lock() {
                         *last_error = Some(error.to_string());
                     }
@@ -437,19 +485,29 @@ fn run_renderer_thread(
     renderer_type: RendererType,
     width: usize,
     height: usize,
+    target_hwnd: Option<isize>,
     receiver: mpsc::Receiver<RenderCommand>,
 ) -> Result<()> {
     match renderer_type {
         RendererType::D3d11 => {
             #[cfg(windows)]
             {
-                let window = D3d11TestWindow::new(width, height)?;
+                let window = match target_hwnd {
+                    Some(_) => None,
+                    None => Some(D3d11TestWindow::new(width, height)?),
+                };
+                let hwnd = target_hwnd.unwrap_or_else(|| {
+                    window
+                        .as_ref()
+                        .expect("D3D11 test window exists")
+                        .hwnd_value()
+                });
                 let factory = mrd_render_d3d11::D3d11RendererFactory;
                 let mut renderer = factory
                     .create()
                     .map_err(|error| anyhow::anyhow!("create D3D11 renderer failed: {error}"))?;
                 renderer
-                    .attach_target(RenderTarget::WindowHandle(window.hwnd_value()))
+                    .attach_target(RenderTarget::WindowHandle(hwnd))
                     .map_err(|error| anyhow::anyhow!("attach D3D11 renderer failed: {error}"))?;
 
                 run_d3d11_render_loop(window, renderer, receiver)
@@ -457,7 +515,7 @@ fn run_renderer_thread(
 
             #[cfg(not(windows))]
             {
-                let _ = (width, height, receiver);
+                let _ = (width, height, target_hwnd, receiver);
                 anyhow::bail!("D3D11 render display is only available on Windows");
             }
         }
@@ -466,25 +524,40 @@ fn run_renderer_thread(
 
 #[cfg(windows)]
 fn run_d3d11_render_loop(
-    window: D3d11TestWindow,
+    window: Option<D3d11TestWindow>,
     mut renderer: Box<dyn RendererInstance>,
     receiver: mpsc::Receiver<RenderCommand>,
 ) -> Result<()> {
-    loop {
-        window.pump_messages();
-        match receiver.recv_timeout(Duration::from_millis(8)) {
-            Ok(RenderCommand::Frame(input)) => {
-                let frame = render_input_to_frame(input);
-                renderer.upload_frame(frame).map_err(|error| {
-                    anyhow::anyhow!("upload frame to D3D11 renderer failed: {error}")
-                })?;
+    match window {
+        Some(window) => loop {
+            window.pump_messages();
+            match receiver.recv_timeout(Duration::from_millis(8)) {
+                Ok(RenderCommand::Frame(input)) => {
+                    upload_render_input(&mut *renderer, input)?;
+                }
+                Ok(RenderCommand::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
-            Ok(RenderCommand::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-        }
+        },
+        None => loop {
+            match receiver.recv() {
+                Ok(RenderCommand::Frame(input)) => {
+                    upload_render_input(&mut *renderer, input)?;
+                }
+                Ok(RenderCommand::Stop) | Err(_) => break,
+            }
+        },
     }
 
     Ok(())
+}
+
+#[cfg(windows)]
+fn upload_render_input(renderer: &mut dyn RendererInstance, input: RenderInput) -> Result<()> {
+    let frame = render_input_to_frame(input);
+    renderer
+        .upload_frame(frame)
+        .map_err(|error| anyhow::anyhow!("upload frame to D3D11 renderer failed: {error}"))
 }
 
 #[cfg(windows)]
@@ -663,6 +736,13 @@ impl TestHarness {
         let running_for_thread = running.clone();
         let (init_tx, init_rx) = mpsc::channel();
 
+        {
+            let mut buf = self.frame_buffer.lock().unwrap();
+            buf.captured = None;
+            buf.width = 0;
+            buf.height = 0;
+        }
+
         running.store(true, Ordering::Relaxed);
 
         let handle = thread::spawn(move || {
@@ -730,8 +810,17 @@ impl TestHarness {
 
     fn initialize_components(chain: &TestChain, config: &TestConfig) -> Result<PipelineState> {
         let use_shared_texture_decode = config.zero_copy.unwrap_or(false);
+        let capture_type = match chain {
+            TestChain::Custom { capture, .. } => capture,
+            _ => &CaptureType::Dxgi,
+        };
         let (capture, capture_width, capture_height): (Box<dyn FrameCapture>, usize, usize) =
             if use_shared_texture_decode {
+                if *capture_type != CaptureType::Dxgi {
+                    return Err(anyhow::anyhow!(
+                        "D3D11 shared texture capture requires DXGI capture"
+                    ));
+                }
                 #[cfg(windows)]
                 {
                     let mut capture = DxgiSharedTextureCapture::new_primary().map_err(|e| {
@@ -749,17 +838,54 @@ impl TestHarness {
                     ));
                 }
             } else {
-                let capture = DxgiDesktopCapture::new_primary()
-                    .map_err(|e| anyhow::anyhow!("DXGI 捕获初始化失败: {:?}", e))?;
-                let (width, height) =
-                    select_pipeline_dimensions(capture.width(), capture.height(), config);
-                (Box::new(capture) as Box<dyn FrameCapture>, width, height)
+                match capture_type {
+                    CaptureType::Dxgi => {
+                        let capture = DxgiDesktopCapture::new_primary()
+                            .map_err(|e| anyhow::anyhow!("DXGI capture init failed: {:?}", e))?;
+                        let (width, height) =
+                            select_pipeline_dimensions(capture.width(), capture.height(), config);
+                        (Box::new(capture) as Box<dyn FrameCapture>, width, height)
+                    }
+                    CaptureType::Winrt => {
+                        #[cfg(windows)]
+                        {
+                            let capture = WinrtMonitorCapture::new_primary()?;
+                            let (width, height) = select_pipeline_dimensions(
+                                capture.width(),
+                                capture.height(),
+                                config,
+                            );
+                            (Box::new(capture) as Box<dyn FrameCapture>, width, height)
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            return Err(anyhow::anyhow!(
+                                "WinRT capture is only available on Windows"
+                            ));
+                        }
+                    }
+                    CaptureType::Synthetic => {
+                        let (width, height) = config.resolution.unwrap_or((1280, 720));
+                        (
+                            Box::new(SyntheticCapture::new(width, height)) as Box<dyn FrameCapture>,
+                            width,
+                            height,
+                        )
+                    }
+                }
             };
 
         let (width, height) = (capture_width, capture_height);
         let fps = config.fps.unwrap_or(60).max(1);
         let low_latency_bitrate = config.bitrate.unwrap_or(12_000_000).max(1);
         let speed_bitrate = config.bitrate.unwrap_or(5_000_000).max(1);
+        let encoded_codec = match chain {
+            TestChain::Custom {
+                encoder: EncoderType::NvencAv1,
+                ..
+            } => VideoCodec::Av1,
+            _ => VideoCodec::H264,
+        };
 
         let (encoder, decoder, use_decoder) = match chain {
             TestChain::CaptureOnly => (None, None, false),
@@ -804,33 +930,72 @@ impl TestHarness {
                 capture: _,
                 encoder,
                 decoder,
-            } => {
-                // For now, Custom configurations fall back to standard capture implementations.
-                // TODO: Implement WinRT capture and AV1 encoding.
-                match encoder {
-                    EncoderType::NvencH264 => match decoder {
+            } => match encoder {
+                EncoderType::NvencH264 => match decoder {
+                    DecoderType::None => {
+                        let enc = NvencH264Encoder::new_max_speed_with_bitrate(
+                            width,
+                            height,
+                            fps,
+                            speed_bitrate,
+                        )
+                        .map_err(|e| anyhow::anyhow!("NVENC encoder init failed: {:?}", e))?;
+                        (Some(Box::new(enc) as Box<dyn VideoEncoder>), None, false)
+                    }
+                    DecoderType::Nvdec => {
+                        let enc = NvencH264Encoder::new_with_bitrate(
+                            width,
+                            height,
+                            fps,
+                            low_latency_bitrate,
+                        )
+                        .map_err(|e| anyhow::anyhow!("NVENC 编码器初始化失败: {:?}", e))?;
+                        let mut dec = NvdecDecoder::new_with_output_mode(NvdecOutputMode::CpuNv12)
+                            .map_err(|e| anyhow::anyhow!("NVDEC 解码器初始化失败: {:?}", e))?;
+                        if use_shared_texture_decode {
+                            dec.enable_shared_texture(true);
+                        }
+                        (
+                            Some(Box::new(enc) as Box<dyn VideoEncoder>),
+                            Some(PipelineDecoder::Nvdec(dec)),
+                            true,
+                        )
+                    }
+                    DecoderType::Software => {
+                        let enc = NvencH264Encoder::new_max_speed_with_bitrate(
+                            width,
+                            height,
+                            fps,
+                            speed_bitrate,
+                        )
+                        .map_err(|e| anyhow::anyhow!("NVENC 编码器初始化失败: {:?}", e))?;
+                        let dec = mrd_decode::create_decoder("h264_software").map_err(|e| {
+                            anyhow::anyhow!("software decoder init failed: {:?}", e)
+                        })?;
+                        (
+                            Some(Box::new(enc) as Box<dyn VideoEncoder>),
+                            Some(PipelineDecoder::Software(dec)),
+                            true,
+                        )
+                    }
+                },
+                EncoderType::OpenH264 => {
+                    let enc = match config.bitrate {
+                        Some(bitrate) => {
+                            OpenH264Encoder::new_with_bitrate(width, height, fps, bitrate)
+                        }
+                        None => OpenH264Encoder::new(width, height, fps),
+                    }
+                    .map_err(|e| anyhow::anyhow!("OpenH264 编码器初始化失败: {:?}", e))?;
+                    match decoder {
                         DecoderType::None => {
-                            let enc = NvencH264Encoder::new_max_speed_with_bitrate(
-                                width,
-                                height,
-                                fps,
-                                speed_bitrate,
-                            )
-                            .map_err(|e| anyhow::anyhow!("NVENC encoder init failed: {:?}", e))?;
                             (Some(Box::new(enc) as Box<dyn VideoEncoder>), None, false)
                         }
                         DecoderType::Nvdec => {
-                            let enc = NvencH264Encoder::new_with_bitrate(
-                                width,
-                                height,
-                                fps,
-                                low_latency_bitrate,
-                            )
-                            .map_err(|e| anyhow::anyhow!("NVENC 编码器初始化失败: {:?}", e))?;
                             let mut dec =
                                 NvdecDecoder::new_with_output_mode(NvdecOutputMode::CpuNv12)
                                     .map_err(|e| {
-                                        anyhow::anyhow!("NVDEC 解码器初始化失败: {:?}", e)
+                                        anyhow::anyhow!("NVDEC decoder init failed: {:?}", e)
                                     })?;
                             if use_shared_texture_decode {
                                 dec.enable_shared_texture(true);
@@ -842,13 +1007,6 @@ impl TestHarness {
                             )
                         }
                         DecoderType::Software => {
-                            let enc = NvencH264Encoder::new_max_speed_with_bitrate(
-                                width,
-                                height,
-                                fps,
-                                speed_bitrate,
-                            )
-                            .map_err(|e| anyhow::anyhow!("NVENC 编码器初始化失败: {:?}", e))?;
                             let dec = mrd_decode::create_decoder("h264_software").map_err(|e| {
                                 anyhow::anyhow!("software decoder init failed: {:?}", e)
                             })?;
@@ -858,28 +1016,31 @@ impl TestHarness {
                                 true,
                             )
                         }
-                    },
-                    EncoderType::OpenH264 => {
-                        let enc = match config.bitrate {
-                            Some(bitrate) => {
-                                OpenH264Encoder::new_with_bitrate(width, height, fps, bitrate)
-                            }
-                            None => OpenH264Encoder::new(width, height, fps),
-                        }
-                        .map_err(|e| anyhow::anyhow!("OpenH264 编码器初始化失败: {:?}", e))?;
+                    }
+                }
+                EncoderType::NvencAv1 => {
+                    if use_shared_texture_decode {
+                        return Err(anyhow::anyhow!(
+                            "NVENC AV1 D3D11 shared input path is not implemented"
+                        ));
+                    }
+                    #[cfg(windows)]
+                    {
+                        let enc =
+                            NvencAv1Encoder::new_low_latency(width, height, fps).map_err(|e| {
+                                anyhow::anyhow!("NVENC AV1 encoder init failed: {:?}", e)
+                            })?;
                         match decoder {
                             DecoderType::None => {
                                 (Some(Box::new(enc) as Box<dyn VideoEncoder>), None, false)
                             }
                             DecoderType::Nvdec => {
-                                let mut dec =
-                                    NvdecDecoder::new_with_output_mode(NvdecOutputMode::CpuNv12)
-                                        .map_err(|e| {
-                                            anyhow::anyhow!("NVDEC decoder init failed: {:?}", e)
-                                        })?;
-                                if use_shared_texture_decode {
-                                    dec.enable_shared_texture(true);
-                                }
+                                let dec = NvdecDecoder::new_av1_with_output_mode(
+                                    NvdecOutputMode::CpuNv12,
+                                )
+                                .map_err(|e| {
+                                    anyhow::anyhow!("NVDEC AV1 decoder init failed: {:?}", e)
+                                })?;
                                 (
                                     Some(Box::new(enc) as Box<dyn VideoEncoder>),
                                     Some(PipelineDecoder::Nvdec(dec)),
@@ -887,49 +1048,30 @@ impl TestHarness {
                                 )
                             }
                             DecoderType::Software => {
-                                let dec =
-                                    mrd_decode::create_decoder("h264_software").map_err(|e| {
-                                        anyhow::anyhow!("software decoder init failed: {:?}", e)
-                                    })?;
-                                (
-                                    Some(Box::new(enc) as Box<dyn VideoEncoder>),
-                                    Some(PipelineDecoder::Software(dec)),
-                                    true,
-                                )
+                                return Err(anyhow::anyhow!(
+                                    "AV1 software decoder path is not implemented"
+                                ));
                             }
                         }
                     }
-                    EncoderType::NvencAv1 => {
-                        if !matches!(decoder, DecoderType::None) {
-                            return Err(anyhow::anyhow!(
-                                "AV1 decoder path is not implemented; choose decoder none"
-                            ));
-                        }
-                        #[cfg(windows)]
-                        {
-                            let enc = NvencAv1Encoder::new_low_latency(width, height, fps)
-                                .map_err(|e| {
-                                    anyhow::anyhow!("NVENC AV1 encoder init failed: {:?}", e)
-                                })?;
-                            (Some(Box::new(enc) as Box<dyn VideoEncoder>), None, false)
-                        }
-                        #[cfg(not(windows))]
-                        {
-                            return Err(anyhow::anyhow!(
-                                "NVENC AV1 encoder is only available on Windows"
-                            ));
-                        }
+                    #[cfg(not(windows))]
+                    {
+                        return Err(anyhow::anyhow!(
+                            "NVENC AV1 encoder is only available on Windows"
+                        ));
                     }
                 }
-            }
+            },
         };
 
-        let transport = PipelineTransport::new(config.transport.as_ref(), fps);
+        let transport = PipelineTransport::new(config.transport.as_ref(), fps, encoded_codec);
 
         let renderer = config
             .renderer
             .as_ref()
-            .map(|renderer_type| PipelineRenderer::new(renderer_type, width, height))
+            .map(|renderer_type| {
+                PipelineRenderer::new(renderer_type, width, height, config.renderer_target_hwnd)
+            })
             .transpose()?;
 
         Ok(PipelineState {
@@ -1049,17 +1191,20 @@ impl TestHarness {
                 None
             };
 
-            if let Some(renderer) = state.renderer.as_mut() {
-                let input = decoded_frames.pop().map(RenderInput::Decoded).or_else(|| {
+            let render_input = decoded_frames
+                .last()
+                .cloned()
+                .map(RenderInput::Decoded)
+                .or_else(|| {
                     (!state.use_decoder).then(|| RenderInput::Captured(captured_frame.clone()))
                 });
-                if let Some(input) = input {
-                    if let Err(error) = renderer.submit_frame(input) {
-                        let mut m = metrics.lock().unwrap();
-                        m.error_message = Some(error.to_string());
-                        running.store(false, Ordering::Relaxed);
-                        break;
-                    }
+
+            if let (Some(renderer), Some(input)) = (state.renderer.as_mut(), render_input) {
+                if let Err(error) = renderer.submit_frame(input) {
+                    let mut m = metrics.lock().unwrap();
+                    m.error_message = Some(error.to_string());
+                    running.store(false, Ordering::Relaxed);
+                    break;
                 }
             }
 
@@ -1085,9 +1230,11 @@ impl TestHarness {
 
             frame_count += 1;
 
-            if frame_count % FRAME_UPDATE_INTERVAL == 0 {
+            if frame_count % WEB_PREVIEW_FRAME_UPDATE_INTERVAL == 0
+                && !captured_frame.data.is_empty()
+            {
                 if let Ok((captured_ds, ds_width, ds_height)) =
-                    downsample_frame(&captured_frame, DOWNSAMPLE_MAX_WIDTH)
+                    downsample_frame(&captured_frame, WEB_PREVIEW_MAX_WIDTH)
                 {
                     let mut buf = frame_buffer.lock().unwrap();
                     buf.captured = Some(captured_ds);
@@ -1392,6 +1539,96 @@ fn downsample_frame(frame: &CapturedFrame, max_width: usize) -> Result<(Vec<u8>,
     }
 
     Ok((result, new_width, new_height))
+}
+
+struct SyntheticCapture {
+    tick: u64,
+    width: usize,
+    height: usize,
+}
+
+impl SyntheticCapture {
+    fn new(width: usize, height: usize) -> Self {
+        Self {
+            tick: 0,
+            width: even_dimension(width),
+            height: even_dimension(height),
+        }
+    }
+}
+
+impl FrameCapture for SyntheticCapture {
+    fn capture_frame(&mut self) -> Result<CapturedFrame, mrd_pipeline_core::PipelineError> {
+        self.tick = self.tick.wrapping_add(1);
+
+        let byte_len = self
+            .width
+            .checked_mul(self.height)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| {
+                mrd_pipeline_core::PipelineError::message("synthetic frame size overflow")
+            })?;
+        let mut data = vec![0_u8; byte_len];
+        let phase = (self.tick & 0xff) as u8;
+
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let idx = (y * self.width + x) * 4;
+                data[idx] = ((x as u8).wrapping_add(phase)) ^ ((y as u8) >> 1);
+                data[idx + 1] = (y as u8).wrapping_add(phase / 2);
+                data[idx + 2] = 192_u8.wrapping_sub(phase / 3);
+                data[idx + 3] = 255;
+            }
+        }
+
+        Ok(CapturedFrame::from_cpu(
+            self.width,
+            self.height,
+            FramePixelFormat::Bgra32,
+            self.tick.saturating_mul(16_667),
+            data,
+        ))
+    }
+}
+
+#[cfg(windows)]
+struct WinrtMonitorCapture {
+    inner: WinrtCapture,
+    width: usize,
+    height: usize,
+}
+
+#[cfg(windows)]
+impl WinrtMonitorCapture {
+    fn new_primary() -> Result<Self> {
+        let mut inner = WinrtCapture::from_monitor_index(0)
+            .map_err(|error| anyhow::anyhow!("WinRT capture init failed: {error}"))?;
+        let width = inner.width();
+        let height = inner.height();
+        inner
+            .start()
+            .map_err(|error| anyhow::anyhow!("WinRT capture start failed: {error}"))?;
+        Ok(Self {
+            inner,
+            width,
+            height,
+        })
+    }
+
+    fn width(&self) -> usize {
+        self.width
+    }
+
+    fn height(&self) -> usize {
+        self.height
+    }
+}
+
+#[cfg(windows)]
+impl FrameCapture for WinrtMonitorCapture {
+    fn capture_frame(&mut self) -> Result<CapturedFrame, mrd_pipeline_core::PipelineError> {
+        self.inner.capture_frame()
+    }
 }
 
 fn select_pipeline_dimensions(

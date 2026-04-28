@@ -66,6 +66,53 @@ describe('Tauri Adapter Contract', () => {
       expect(mockInvoke).toHaveBeenNthCalledWith(2, 'apply_native_chrome', undefined);
     });
 
+    it('remote display window commands call registered command names', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue({});
+
+      await adapter.openRemoteDisplayWindow({
+        sessionId: 'session-1',
+        surfaceId: 'surface-1',
+      });
+      await adapter.listRemoteDisplayWindows('session-1');
+      await adapter.currentRemoteDisplayWindowContext();
+      await adapter.configureRemoteDisplayNativeSurface({
+        enabled: true,
+        rect: { x: 0, y: 44, width: 1280, height: 720 },
+      });
+      await adapter.presentTestHarnessFrameOnNativeSurface();
+      await adapter.closeRemoteDisplayWindow('render-session-1-1');
+
+      expect(mockInvoke).toHaveBeenNthCalledWith(1, 'open_remote_display_window', {
+        sessionId: 'session-1',
+        surfaceId: 'surface-1',
+      });
+      expect(mockInvoke).toHaveBeenNthCalledWith(2, 'list_remote_display_windows', {
+        sessionId: 'session-1',
+      });
+      expect(mockInvoke).toHaveBeenNthCalledWith(
+        3,
+        'current_remote_display_window_context',
+        undefined
+      );
+      expect(mockInvoke).toHaveBeenNthCalledWith(
+        4,
+        'configure_remote_display_native_surface',
+        {
+          enabled: true,
+          rect: { x: 0, y: 44, width: 1280, height: 720 },
+        }
+      );
+      expect(mockInvoke).toHaveBeenNthCalledWith(
+        5,
+        'present_test_harness_frame_on_native_surface',
+        undefined
+      );
+      expect(mockInvoke).toHaveBeenNthCalledWith(6, 'close_remote_display_window', {
+        label: 'render-session-1-1',
+      });
+    });
+
     it('diagnostic commands call registered command names', async () => {
       const mockInvoke = getMockInvoke();
       mockInvoke
@@ -207,6 +254,24 @@ describe('Tauri Adapter Contract', () => {
       await adapter.ipcListDevices();
 
       expect(mockInvoke).toHaveBeenCalledWith('ipc_list_devices', undefined);
+    });
+
+    it('LAN discovery commands call correct command names', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue({
+        enabled: true,
+        running: true,
+        discovery_port: 21116,
+        instance_id: 'local',
+        last_probe_ms: 1,
+        peers: [],
+      });
+
+      await adapter.ipcLanDiscoverySnapshot();
+      await adapter.ipcRefreshLanDiscovery();
+
+      expect(mockInvoke).toHaveBeenNthCalledWith(1, 'ipc_lan_discovery_snapshot', undefined);
+      expect(mockInvoke).toHaveBeenNthCalledWith(2, 'ipc_refresh_lan_discovery', undefined);
     });
   });
 
@@ -389,9 +454,11 @@ describe('Tauri Adapter Contract', () => {
         gpu_memory_used_mb: 1024,
         gpu_memory_total_mb: 8192,
         gpu_metrics_available: true,
+        gpu_metrics_scope: "system",
         network_rx_bps: 1024,
         network_tx_bps: 2048,
         network_metrics_available: true,
+        network_metrics_scope: "system",
         sampled_at_ms: 1,
       });
 
@@ -529,6 +596,18 @@ describe('Tauri Adapter Contract', () => {
       await adapter.testListWindowCaptureTargets();
 
       expect(mockInvoke).toHaveBeenCalledWith('test_list_window_capture_targets', undefined);
+    });
+
+    it('test_list_window_capture_targets_with_previews passes preview limit', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue([]);
+
+      await adapter.testListWindowCaptureTargetsWithPreviews(12);
+
+      expect(mockInvoke).toHaveBeenCalledWith(
+        'test_list_window_capture_targets_with_previews',
+        { limit: 12 }
+      );
     });
 
     it('test_harness_set_custom calls custom harness command', async () => {

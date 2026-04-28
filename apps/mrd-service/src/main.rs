@@ -11,6 +11,7 @@
 mod app_state;
 mod handlers;
 mod ipc_server;
+mod lan_discovery;
 mod shell;
 
 use anyhow::Result;
@@ -48,6 +49,15 @@ async fn main() -> Result<()> {
         shell.tray_available = tray_available;
     }
     info!("Application state initialized");
+
+    match lan_discovery::start_lan_discovery(app_state.clone()).await {
+        Ok(()) => info!("LAN peer discovery started"),
+        Err(error) => {
+            let mut shell = app_state.shell.lock().await;
+            shell.last_error = Some(format!("LAN discovery failed: {error}"));
+            info!("LAN peer discovery unavailable: {}", error);
+        }
+    }
 
     // Install tray with initial model
     let initial_model = shell::TrayModel::default();

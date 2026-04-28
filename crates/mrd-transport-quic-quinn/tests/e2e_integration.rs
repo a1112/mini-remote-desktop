@@ -6,12 +6,11 @@
 use std::time::Duration;
 
 // We'll test the Quinn implementation directly
-use mrd_transport_quic_quinn::{
-    fragment_access_unit, QuinnDatagramPair, QuinnDatagramEndpoint, QuinnServerListener,
-    QuicAuFragment, QuicAuReassembler, QuicAuReassemblerConfig,
-    QUIC_AU_FRAGMENT_HEADER_LEN,
-};
 use bytes::Bytes;
+use mrd_transport_quic_quinn::{
+    fragment_access_unit, QuicAuFragment, QuicAuReassembler, QuicAuReassemblerConfig,
+    QuinnDatagramEndpoint, QuinnDatagramPair, QuinnServerListener, QUIC_AU_FRAGMENT_HEADER_LEN,
+};
 
 /// Test basic loopback connection establishment
 #[tokio::test]
@@ -51,15 +50,14 @@ async fn quic_client_connects_with_bootstrap() {
         .await
         .expect("Failed to bind server");
 
-    let server_task = tokio::spawn(async move {
-        listener.accept().await
-    });
+    let server_task = tokio::spawn(async move { listener.accept().await });
 
     let client = QuinnDatagramEndpoint::connect_client("127.0.0.1:0", &bootstrap)
         .await
         .expect("Failed to connect client");
 
-    let server = server_task.await
+    let server = server_task
+        .await
         .expect("Server task failed")
         .expect("Failed to get server endpoint");
 
@@ -158,15 +156,29 @@ async fn quic_max_datagram_size_is_reported() {
     let server_max = pair.server.max_datagram_size();
 
     // Both sides should report similar max sizes
-    assert!(client_max.is_some(), "Client should report max datagram size");
-    assert!(server_max.is_some(), "Server should report max datagram size");
+    assert!(
+        client_max.is_some(),
+        "Client should report max datagram size"
+    );
+    assert!(
+        server_max.is_some(),
+        "Server should report max datagram size"
+    );
 
     let client_max = client_max.unwrap();
     let server_max = server_max.unwrap();
 
     // Max sizes should be reasonable (> 1000 bytes)
-    assert!(client_max > 1000, "Client max datagram size too small: {}", client_max);
-    assert!(server_max > 1000, "Server max datagram size too small: {}", server_max);
+    assert!(
+        client_max > 1000,
+        "Client max datagram size too small: {}",
+        client_max
+    );
+    assert!(
+        server_max > 1000,
+        "Server max datagram size too small: {}",
+        server_max
+    );
 }
 
 /// Test access unit fragment encoding and decoding
@@ -281,8 +293,8 @@ fn quic_reassembler_reassembles_multiple_fragments() {
     let mut reassembler = QuicAuReassembler::new(QuicAuReassemblerConfig::default());
 
     let payload = Bytes::from(&b"large payload data that needs fragmentation"[..]);
-    let fragments = fragment_access_unit(5, 2000000, false, &payload, 100)
-        .expect("Failed to fragment");
+    let fragments =
+        fragment_access_unit(5, 2000000, false, &payload, 100).expect("Failed to fragment");
 
     let mut result = None;
     for encoded in &fragments {
@@ -291,7 +303,10 @@ fn quic_reassembler_reassembles_multiple_fragments() {
             .expect("Failed to push datagram");
     }
 
-    assert!(result.is_some(), "Should have completed frame after all fragments");
+    assert!(
+        result.is_some(),
+        "Should have completed frame after all fragments"
+    );
     let frame = result.unwrap();
     assert_eq!(frame.frame_id, 5);
     assert_eq!(frame.timestamp_us, 2000000);
@@ -305,8 +320,8 @@ fn quic_reassembler_handles_out_of_order_fragments() {
     let mut reassembler = QuicAuReassembler::new(QuicAuReassemblerConfig::default());
 
     let payload = Bytes::from(&b"data for out of order test"[..]);
-    let mut fragments = fragment_access_unit(10, 3000000, true, &payload, 50)
-        .expect("Failed to fragment");
+    let mut fragments =
+        fragment_access_unit(10, 3000000, true, &payload, 50).expect("Failed to fragment");
 
     // Reverse fragment order
     fragments.reverse();
@@ -330,8 +345,8 @@ fn quic_reassembler_rejects_duplicate_fragments() {
 
     // Create a frame with multiple fragments
     let payload = vec![0xAB_u8; 50]; // Small payload
-    let fragments = fragment_access_unit(20, 4000000, false, &payload, 30)
-        .expect("Failed to fragment");
+    let fragments =
+        fragment_access_unit(20, 4000000, false, &payload, 30).expect("Failed to fragment");
 
     // Send first fragment
     let encoded_0 = fragments[0].clone();
@@ -340,10 +355,16 @@ fn quic_reassembler_rejects_duplicate_fragments() {
     // Send first fragment again (duplicate) - should be detected
     let result = reassembler.push_datagram(&encoded_0[..]);
     assert!(result.is_ok(), "Duplicate should not error");
-    assert!(result.unwrap().is_none(), "Duplicate should not complete frame");
+    assert!(
+        result.unwrap().is_none(),
+        "Duplicate should not complete frame"
+    );
 
     let stats = reassembler.stats();
-    assert_eq!(stats.duplicate_fragments, 1, "Duplicate fragment should be counted");
+    assert_eq!(
+        stats.duplicate_fragments, 1,
+        "Duplicate fragment should be counted"
+    );
 
     // Send remaining fragments to complete frame
     for encoded in fragments.iter().skip(1) {
@@ -428,7 +449,10 @@ async fn quic_e2e_fragmented_frame_transmitted() {
         }
     }
 
-    assert!(received_frame.is_some(), "Should have received complete frame");
+    assert!(
+        received_frame.is_some(),
+        "Should have received complete frame"
+    );
     let frame = received_frame.unwrap();
     assert_eq!(frame.frame_id, 100);
     assert_eq!(frame.timestamp_us, 6000000);

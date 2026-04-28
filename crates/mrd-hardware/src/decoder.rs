@@ -75,9 +75,7 @@ impl DecoderDescriptor {
     pub fn is_available(&self) -> bool {
         match self.backend {
             #[cfg(feature = "nvdec")]
-            VideoDecoderBackend::Nvdec => {
-                mrd_decode_nvdec::probe_h264_available().is_ok()
-            }
+            VideoDecoderBackend::Nvdec => mrd_decode_nvdec::probe_h264_available().is_ok(),
             #[cfg(not(feature = "nvdec"))]
             VideoDecoderBackend::Nvdec => false,
             #[cfg(feature = "software_decoder")]
@@ -156,10 +154,7 @@ pub fn choose_decoder_backend(config: DecoderSelectorConfig) -> DecoderSelection
         );
 
         if !descriptor.is_available() {
-            logs.push(format!(
-                "Decoder '{}' is not available",
-                backend
-            ));
+            logs.push(format!("Decoder '{}' is not available", backend));
 
             // If this was explicitly requested and not available, check fallback
             if config.requested_backend == Some(backend) {
@@ -192,13 +187,11 @@ pub fn choose_decoder_backend(config: DecoderSelectorConfig) -> DecoderSelection
             #[cfg(feature = "software_decoder")]
             VideoDecoderBackend::Software => Ok(()),
             #[cfg(not(feature = "nvdec"))]
-            VideoDecoderBackend::Nvdec => {
-                Err(PipelineError::message("nvdec feature not enabled"))
-            }
+            VideoDecoderBackend::Nvdec => Err(PipelineError::message("nvdec feature not enabled")),
             #[cfg(not(feature = "software_decoder"))]
-            VideoDecoderBackend::Software => {
-                Err(PipelineError::message("software decoder feature not enabled"))
-            }
+            VideoDecoderBackend::Software => Err(PipelineError::message(
+                "software decoder feature not enabled",
+            )),
         };
 
         match probe_result {
@@ -211,10 +204,7 @@ pub fn choose_decoder_backend(config: DecoderSelectorConfig) -> DecoderSelection
                 };
             }
             Err(e) => {
-                logs.push(format!(
-                    "Decoder '{}' probe failed: {}",
-                    backend, e
-                ));
+                logs.push(format!("Decoder '{}' probe failed: {}", backend, e));
 
                 // If this was explicitly requested, check fallback
                 if config.requested_backend == Some(backend) {
@@ -262,16 +252,17 @@ pub fn create_decoder(
                 .map_err(|e| PipelineError::message(format!("nvdec create failed: {}", e)))?,
         )),
         #[cfg(feature = "software_decoder")]
-        VideoDecoderBackend::Software => Ok(Box::new(
-            mrd_decode::H264SoftwareDecoder::new()
-                .map_err(|e| PipelineError::message(format!("software decoder create failed: {}", e)))?,
-        )),
+        VideoDecoderBackend::Software => {
+            Ok(Box::new(mrd_decode::H264SoftwareDecoder::new().map_err(
+                |e| PipelineError::message(format!("software decoder create failed: {}", e)),
+            )?))
+        }
         #[cfg(not(feature = "nvdec"))]
         VideoDecoderBackend::Nvdec => Err(PipelineError::message("nvdec feature not enabled")),
         #[cfg(not(feature = "software_decoder"))]
-        VideoDecoderBackend::Software => {
-            Err(PipelineError::message("software decoder feature not enabled"))
-        }
+        VideoDecoderBackend::Software => Err(PipelineError::message(
+            "software decoder feature not enabled",
+        )),
     }
 }
 
@@ -288,8 +279,7 @@ mod tests {
 
     #[test]
     fn decoder_selector_config_with_backend_sets_backend() {
-        let config = DecoderSelectorConfig::new()
-            .with_backend(VideoDecoderBackend::Software);
+        let config = DecoderSelectorConfig::new().with_backend(VideoDecoderBackend::Software);
         assert_eq!(
             config.requested_backend,
             Some(VideoDecoderBackend::Software)
@@ -304,8 +294,7 @@ mod tests {
 
     #[test]
     fn choose_decoder_backend_returns_selection() {
-        let config = DecoderSelectorConfig::new()
-            .with_backend(VideoDecoderBackend::Software);
+        let config = DecoderSelectorConfig::new().with_backend(VideoDecoderBackend::Software);
         let selection = choose_decoder_backend(config);
         assert_eq!(selection.backend, VideoDecoderBackend::Software);
         assert!(!selection.using_hardware);

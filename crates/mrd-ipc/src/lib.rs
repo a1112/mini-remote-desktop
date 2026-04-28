@@ -91,6 +91,10 @@ pub enum IpcRequest {
     },
     /// List available devices
     ListDevices,
+    /// Get the current LAN peer discovery snapshot.
+    LanDiscoverySnapshot,
+    /// Send an immediate LAN discovery probe and return the current snapshot.
+    RefreshLanDiscovery,
     /// List all active sessions
     ListSessions,
     /// Start a new session as controller
@@ -158,6 +162,11 @@ pub enum IpcResponse {
     DeviceRegistered { device_id: DeviceId },
     /// List of available devices
     DeviceList { devices: Vec<DeviceInfo> },
+    /// LAN peer discovery snapshot.
+    LanDiscoverySnapshot {
+        /// Current discovery state.
+        snapshot: LanDiscoverySnapshot,
+    },
     /// List of active sessions
     SessionList { sessions: Vec<SessionInfo> },
     /// Session started successfully
@@ -209,6 +218,48 @@ pub struct DeviceInfo {
     pub device_id: DeviceId,
     pub device_name: String,
     pub is_online: bool,
+}
+
+/// Discovered LAN peer information.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LanPeerInfo {
+    /// Remote device id.
+    pub device_id: DeviceId,
+    /// Remote display name.
+    pub device_name: String,
+    /// Device role/type advertised by the peer.
+    pub device_type: String,
+    /// Peer IP address string.
+    pub ip: String,
+    /// UDP port used by the LAN discovery control plane.
+    pub discovery_port: u16,
+    /// Direct LAN control endpoint as `ip:port`.
+    pub p2p_control_addr: String,
+    /// Supported media/session transports, for example `webrtc` or `quic`.
+    pub transports: Vec<String>,
+    /// Protocol version advertised by the peer.
+    pub protocol_version: u32,
+    /// Milliseconds since this peer was last observed.
+    pub age_ms: u64,
+    /// Whether this peer was discovered through the local P2P LAN path.
+    pub p2p_available: bool,
+}
+
+/// LAN discovery state exposed over IPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LanDiscoverySnapshot {
+    /// Whether LAN discovery is enabled in this service process.
+    pub enabled: bool,
+    /// Whether the UDP discovery task is currently running.
+    pub running: bool,
+    /// Local UDP discovery port.
+    pub discovery_port: u16,
+    /// Local discovery instance id.
+    pub instance_id: String,
+    /// Last successful announce/probe timestamp in milliseconds since Unix epoch.
+    pub last_probe_ms: Option<u64>,
+    /// Currently known LAN peers.
+    pub peers: Vec<LanPeerInfo>,
 }
 
 /// Session information DTO (for list responses)

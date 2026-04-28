@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { useParams, useNavigate } from "react-router";
-import { useDeviceById, useDevices } from "./deviceData";
+import { type Device, useDeviceById, useDevices } from "./deviceData";
 import {
   X,
   Minus,
@@ -32,8 +32,13 @@ import {
   getWebrtcHostSnapshot,
   type WebrtcHostSnapshot,
 } from "../services/realtimeSessionService";
+import { openRemoteDisplayWindow } from "../adapters/tauri";
 import { withTauriWindow } from "../utils/tauriWindow";
 import { isTauriRuntime } from "../utils/runtime";
+import {
+  getWebRemoteSession,
+  type WebRemoteSession,
+} from "../services/webRemoteSessionService";
 // DEPRECATED: Rendering services removed - now managed by mrd-service
 // import {
 //   attachRenderHostSession,
@@ -93,12 +98,35 @@ type RenderSurfaceDescriptor = {
   current?: boolean;
 };
 
+function webSessionToDevice(session: WebRemoteSession): Device {
+  return {
+    id: session.sessionId,
+    name: session.targetDeviceName,
+    deviceId: session.targetDeviceId,
+    os: session.targetOs,
+    icon: Monitor,
+    status: "online",
+    location: session.mode === "web_to_local" ? "Local browser" : "Web remote",
+    ping: 1,
+    lastSeen: "just now",
+    cpu: null,
+    ram: null,
+    disk: null,
+    ip: session.targetIp,
+    group: "WebRTC",
+    favorite: false,
+  };
+}
+
 export function RemoteSessionPage() {
   const { id } = useParams();
   const navigate = useNavigate();
   const { isDark } = useTheme();
   const { devices, loading } = useDevices();
-  const device = useDeviceById(id, devices);
+  const routeDevice = useDeviceById(id, devices);
+  const webRemoteSession = id ? getWebRemoteSession(id) : null;
+  const device = routeDevice ?? (webRemoteSession ? webSessionToDevice(webRemoteSession) : undefined);
+  const isWebRemoteSession = Boolean(webRemoteSession && !routeDevice);
 
   const [muted, setMuted] = useState(false);
   const [latency, setLatency] = useState(device?.ping ?? 24);
@@ -110,6 +138,8 @@ export function RemoteSessionPage() {
   const [nvdecProbe, setNvdecProbe] = useState<NvdecRuntimeProbe | null>(null);
   const [decodePolicy, setDecodePolicyState] = useState<DecodePolicyResponse | null>(null);
   const [webrtcHostSnapshot, setWebrtcHostSnapshot] = useState<WebrtcHostSnapshot | null>(null);
+  const [webRtcState, setWebRtcState] = useState<"idle" | "connecting" | "connected" | "failed">("idle");
+  const [webRtcMessage, setWebRtcMessage] = useState("WebRTC waiting");
 
   const noDragSelector =
     'button, a, input, select, textarea, [role="button"], [role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"], [data-radix-collection-item], [data-no-drag="true"]';
@@ -122,6 +152,77 @@ export function RemoteSessionPage() {
     }, 1000);
     return () => clearInterval(timer);
   }, []);
+
+  useEffect(() => {
+    if (!webRemoteSession || isTauriRuntime()) return;
+    if (typeof RTCPeerConnection === "undefined") {
+      setWebRtcState("failed");
+      setWebRtcMessage("WebRTC is not available in this browser");
+      return;
+    }
+
+    let cancelled = false;
+    const left = new RTCPeerConnection();
+    const right = new RTCPeerConnection();
+    const channel = left.createDataChannel("rdesk-control");
+
+    const setSafeState = (state: typeof webRtcState, message: string) => {
+      if (cancelled) return;
+      setWebRtcState(state);
+      setWebRtcMessage(message);
+    };
+
+    setSafeState("connecting", "Creating browser WebRTC control channel");
+
+    left.onicecandidate = (event) => {
+      if (event.candidate) void right.addIceCandidate(event.candidate);
+    };
+    right.onicecandidate = (event) => {
+      if (event.candidate) void left.addIceCandidate(event.candidate);
+    };
+    left.onconnectionstatechange = () => {
+      if (left.connectionState === "connected") {
+        setSafeState("connected", "WebRTC control channel connected");
+      } else if (left.connectionState === "failed" || left.connectionState === "closed") {
+        setSafeState("failed", `WebRTC ${left.connectionState}`);
+      }
+    };
+    right.ondatachannel = (event) => {
+      event.channel.onmessage = (message) => {
+        setSafeState("connected", `WebRTC message: ${String(message.data)}`);
+      };
+    };
+    channel.onopen = () => {
+      channel.send(`web-remote-ready:${webRemoteSession.sessionId}`);
+      setSafeState("connected", "WebRTC control channel connected");
+    };
+    channel.onerror = () => {
+      setSafeState("failed", "WebRTC data channel error");
+    };
+
+    void (async () => {
+      try {
+        const offer = await left.createOffer();
+        await left.setLocalDescription(offer);
+        await right.setRemoteDescription(offer);
+        const answer = await right.createAnswer();
+        await right.setLocalDescription(answer);
+        await left.setRemoteDescription(answer);
+      } catch (error) {
+        setSafeState(
+          "failed",
+          error instanceof Error ? error.message : "WebRTC setup failed"
+        );
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      channel.close();
+      left.close();
+      right.close();
+    };
+  }, [webRemoteSession?.sessionId]);
 
   useEffect(() => {
     void withTauriWindow(async (appWindow) => {
@@ -174,13 +275,25 @@ export function RemoteSessionPage() {
   };
 
   const handleDisconnect = () => {
+    if (isWebRemoteSession) {
+      navigate("/devices");
+      return;
+    }
     if (device) navigate(`/devices/${device.id}`);
     else navigate("/");
   };
 
   // Rendering functions disabled - features now managed by mrd-service
   const handlePopOutWindow = async () => {
-    alert("渲染窗口功能已迁移到 mrd-service。此功能暂时不可用。");
+    if (!id) return;
+    if (!isTauriRuntime()) {
+      navigate(`/session/${id}`);
+      return;
+    }
+    const result = await openRemoteDisplayWindow({ sessionId: id });
+    if (!result.ok) {
+      alert(result.error.message);
+    }
   };
 
   const handleOpenCurrentSurfaceWindow = async () => {
@@ -256,7 +369,7 @@ export function RemoteSessionPage() {
     void withTauriWindow((appWindow) => appWindow.close());
   };
 
-  if (loading) {
+  if (loading && !webRemoteSession) {
     return <div className="flex items-center justify-center h-screen bg-[#1a1a1a] text-gray-400">加载设备中...</div>;
   }
 
@@ -416,6 +529,35 @@ export function RemoteSessionPage() {
           <div className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />
           连接稳定
         </div>
+
+        {isWebRemoteSession ? (
+          <div className="absolute top-3 left-3 w-80 max-w-[calc(100%-1.5rem)] rounded-lg bg-black/65 backdrop-blur-sm border border-white/10 text-gray-300">
+            <div className="flex items-center justify-between px-3 py-2 border-b border-white/10">
+              <div className="flex items-center gap-2">
+                <Wifi style={{ width: 12, height: 12 }} className="text-emerald-300" />
+                <span style={{ fontSize: 11 }}>WebRTC browser path</span>
+              </div>
+              <span
+                className={
+                  webRtcState === "connected"
+                    ? "text-emerald-300"
+                    : webRtcState === "failed"
+                      ? "text-red-300"
+                      : "text-amber-300"
+                }
+                style={{ fontSize: 11 }}
+              >
+                {webRtcState}
+              </span>
+            </div>
+            <div className="px-3 py-2 space-y-1" style={{ fontSize: 11 }}>
+              <div>{webRtcMessage}</div>
+              <div className="text-gray-500">
+                {webRemoteSession?.mode === "web_to_local" ? "web -> local" : "web -> peer"} / {id}
+              </div>
+            </div>
+          </div>
+        ) : null}
 
         {isTauriRuntime() ? (
           <div className="absolute top-3 left-3 w-72 max-w-[calc(100%-1.5rem)] rounded-lg bg-black/60 backdrop-blur-sm border border-white/10 text-gray-300">

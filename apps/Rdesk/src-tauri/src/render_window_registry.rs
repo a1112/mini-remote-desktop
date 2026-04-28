@@ -4,12 +4,21 @@ use mrd_proto::SessionId;
 use serde::Serialize;
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
+pub struct PendingRenderWindow {
+    pub label: String,
+    pub session_id: SessionId,
+    pub surface_id: String,
+    pub url: WebviewUrl,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RenderWindowEntry {
     pub label: String,
     pub surface_id: String,
     pub role: String,
     pub renderer_attached: bool,
+    pub render_mode: String,
+    pub native_surface_attached: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -19,6 +28,8 @@ pub struct RenderWindowContext {
     pub surface_id: String,
     pub role: String,
     pub renderer_attached: bool,
+    pub render_mode: String,
+    pub native_surface_attached: bool,
     pub session_window_count: usize,
 }
 
@@ -29,6 +40,43 @@ pub struct RenderWindowRegistry {
 }
 
 impl RenderWindowRegistry {
+    pub fn reserve_window(
+        &mut self,
+        session_id: SessionId,
+        surface_id: Option<String>,
+    ) -> Result<PendingRenderWindow, String> {
+        let next_id = self.next_ids.entry(session_id.clone()).or_insert(1);
+        let label = format!("render-{}-{}", session_id.0, *next_id);
+        let surface_id = surface_id.unwrap_or_else(|| format!("surface-{}", *next_id));
+        *next_id += 1;
+
+        let url = remote_display_url(&session_id.0, &surface_id)?;
+        Ok(PendingRenderWindow {
+            label,
+            session_id,
+            surface_id,
+            url,
+        })
+    }
+
+    pub fn register_window(
+        &mut self,
+        session_id: SessionId,
+        label: String,
+        surface_id: String,
+    ) -> usize {
+        let entries = self.windows_by_session.entry(session_id).or_default();
+        entries.push(RenderWindowEntry {
+            label,
+            surface_id,
+            role: "controller".to_string(),
+            renderer_attached: false,
+            render_mode: "web".to_string(),
+            native_surface_attached: false,
+        });
+        entries.len()
+    }
+
     pub fn open_window<R: tauri::Runtime>(
         &mut self,
         app: &tauri::AppHandle<R>,
@@ -40,12 +88,13 @@ impl RenderWindowRegistry {
         let surface_id = surface_id.unwrap_or_else(|| format!("surface-{}", *next_id));
         *next_id += 1;
 
-        let url = format!("/session/{}", session_id.0);
-        WebviewWindowBuilder::new(app, label.clone(), WebviewUrl::App(url.into()))
-            .title(format!("Remote Session {}", session_id.0))
+        let url = remote_display_url(&session_id.0, &surface_id)?;
+        WebviewWindowBuilder::new(app, label.clone(), url)
+            .title(format!("Rdesk Display {}", session_id.0))
             .decorations(false)
             .resizable(true)
             .inner_size(1280.0, 800.0)
+            .min_inner_size(720.0, 420.0)
             .build()
             .map_err(|error| format!("创建渲染窗口失败: {error}"))?;
 
@@ -57,6 +106,8 @@ impl RenderWindowRegistry {
                 surface_id,
                 role: "controller".to_string(),
                 renderer_attached: false,
+                render_mode: "web".to_string(),
+                native_surface_attached: false,
             });
         Ok(label)
     }
@@ -80,6 +131,8 @@ impl RenderWindowRegistry {
                 surface_id: entry.surface_id.clone(),
                 role: entry.role.clone(),
                 renderer_attached: entry.renderer_attached,
+                render_mode: entry.render_mode.clone(),
+                native_surface_attached: entry.native_surface_attached,
                 session_window_count: count,
             })
             .collect()
@@ -130,6 +183,8 @@ impl RenderWindowRegistry {
                     surface_id: entry.surface_id.clone(),
                     role: entry.role.clone(),
                     renderer_attached: entry.renderer_attached,
+                    render_mode: entry.render_mode.clone(),
+                    native_surface_attached: entry.native_surface_attached,
                     session_window_count: entries.len(),
                 });
             }
@@ -157,6 +212,36 @@ impl RenderWindowRegistry {
         Err(format!("未找到渲染窗口: {}", label))
     }
 
+    pub fn set_render_mode<R: tauri::Runtime>(
+        &mut self,
+        app: &tauri::AppHandle<R>,
+        label: &str,
+        render_mode: String,
+        native_surface_attached: bool,
+    ) -> Result<RenderWindowContext, String> {
+        for (session_id, entries) in self.windows_by_session.iter_mut() {
+            entries.retain(|entry| app.get_webview_window(&entry.label).is_some());
+            let count = entries.len();
+            if let Some(entry) = entries.iter_mut().find(|entry| entry.label == label) {
+                entry.render_mode = render_mode;
+                entry.native_surface_attached = native_surface_attached;
+                entry.renderer_attached = native_surface_attached;
+                return Ok(RenderWindowContext {
+                    label: entry.label.clone(),
+                    session_id: session_id.0.clone(),
+                    surface_id: entry.surface_id.clone(),
+                    role: entry.role.clone(),
+                    renderer_attached: entry.renderer_attached,
+                    render_mode: entry.render_mode.clone(),
+                    native_surface_attached: entry.native_surface_attached,
+                    session_window_count: count,
+                });
+            }
+        }
+
+        Err(format!("未找到渲染窗口: {}", label))
+    }
+
     pub fn surface_window_count<R: tauri::Runtime>(
         &mut self,
         app: &tauri::AppHandle<R>,
@@ -173,6 +258,11 @@ impl RenderWindowRegistry {
             .filter(|entry| entry.surface_id == surface_id)
             .count()
     }
+}
+
+fn remote_display_url(session_id: &str, surface_id: &str) -> Result<WebviewUrl, String> {
+    let path = format!("/display/{session_id}?surface={surface_id}");
+    Ok(WebviewUrl::App(path.into()))
 }
 
 #[cfg(test)]
@@ -212,12 +302,16 @@ mod tests {
                     surface_id: "surface-1".into(),
                     role: "controller".into(),
                     renderer_attached: true,
+                    render_mode: "d3d11_native".into(),
+                    native_surface_attached: true,
                 },
                 RenderWindowEntry {
                     label: second_label,
                     surface_id: "surface-1".into(),
                     role: "controller".into(),
                     renderer_attached: false,
+                    render_mode: "web".into(),
+                    native_surface_attached: false,
                 },
             ],
         );
@@ -239,6 +333,8 @@ mod tests {
             surface_id: "surface-2".into(),
             role: "controller".into(),
             renderer_attached: true,
+            render_mode: "d3d11_native".into(),
+            native_surface_attached: true,
             session_window_count: 2,
         };
 
@@ -247,6 +343,8 @@ mod tests {
         assert_eq!(context.surface_id, "surface-2");
         assert_eq!(context.role, "controller");
         assert!(context.renderer_attached);
+        assert_eq!(context.render_mode, "d3d11_native");
+        assert!(context.native_surface_attached);
         assert_eq!(context.session_window_count, 2);
     }
 
@@ -261,6 +359,8 @@ mod tests {
                 surface_id: "surface-1".into(),
                 role: "controller".into(),
                 renderer_attached: true,
+                render_mode: "d3d11_native".into(),
+                native_surface_attached: true,
             }],
         );
 
@@ -295,18 +395,24 @@ mod tests {
                     surface_id: "surface-1".into(),
                     role: "controller".into(),
                     renderer_attached: true,
+                    render_mode: "d3d11_native".into(),
+                    native_surface_attached: true,
                 },
                 RenderWindowEntry {
                     label: "render-session-a-2".into(),
                     surface_id: "surface-1".into(),
                     role: "controller".into(),
                     renderer_attached: false,
+                    render_mode: "web".into(),
+                    native_surface_attached: false,
                 },
                 RenderWindowEntry {
                     label: "render-session-a-3".into(),
                     surface_id: "surface-2".into(),
                     role: "controller".into(),
                     renderer_attached: false,
+                    render_mode: "web".into(),
+                    native_surface_attached: false,
                 },
             ],
         );

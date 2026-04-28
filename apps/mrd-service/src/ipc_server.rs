@@ -121,6 +121,17 @@ impl IpcServer {
                 }
             }
 
+            IpcRequest::LanDiscoverySnapshot => IpcResponse::LanDiscoverySnapshot {
+                snapshot: self.app_state.lan_discovery.snapshot().await,
+            },
+
+            IpcRequest::RefreshLanDiscovery => {
+                self.app_state.lan_discovery.request_probe();
+                IpcResponse::LanDiscoverySnapshot {
+                    snapshot: self.app_state.lan_discovery.snapshot().await,
+                }
+            }
+
             IpcRequest::ListSessions => {
                 let sessions = self.app_state.sessions.lock().await;
                 let session_list = sessions

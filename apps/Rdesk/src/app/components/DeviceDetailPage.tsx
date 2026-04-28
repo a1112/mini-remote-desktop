@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { useParams, useNavigate } from "react-router";
 import { type Device, useDeviceById, useDevices } from "./deviceData";
+import { launchRemoteDisplayForDevice } from "../services/remoteDisplayLauncher";
 import {
   ArrowLeft,
   Monitor,
@@ -371,6 +372,7 @@ function RemoteTab({ device }: { device: Device }) {
   const [quality, setQuality] = useState(87);
   const [elapsed, setElapsed] = useState(0);
   const [connected, setConnected] = useState(false);
+  const [launching, setLaunching] = useState(false);
   const isOnline = device.status === "online";
 
   useEffect(() => {
@@ -387,6 +389,23 @@ function RemoteTab({ device }: { device: Device }) {
     const m = Math.floor(s / 60);
     const sec = s % 60;
     return `${m.toString().padStart(2, "0")}:${sec.toString().padStart(2, "0")}`;
+  };
+
+  const handleStartRemote = async () => {
+    setLaunching(true);
+    try {
+      const result = await launchRemoteDisplayForDevice(device.deviceId, {
+        transportKind: device.os.toLowerCase().includes("quic") ? "quic" : "webrtc",
+        targetDeviceName: device.name,
+        targetOs: device.os,
+        targetIp: device.ip,
+      });
+      if (result.mode === "route") navigate(`/session/${result.sessionId}`);
+    } catch (error) {
+      alert(error instanceof Error ? error.message : "Open remote display failed");
+    } finally {
+      setLaunching(false);
+    }
   };
 
   if (!isOnline) {
@@ -411,8 +430,9 @@ function RemoteTab({ device }: { device: Device }) {
           <div className={`mb-1 ${isDark ? "text-gray-200" : "text-gray-800"}`} style={{ fontSize: 18 }}>连接到 {device.name}</div>
           <div className={`mb-6 ${isDark ? "text-gray-500" : "text-gray-400"}`} style={{ fontSize: 13 }}>{device.os} · {device.ip} · 延迟 {device.ping}ms</div>
           <button
-            onClick={() => navigate(`/session/${device.id}`)}
-            className="px-8 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white transition-colors shadow-sm"
+            onClick={() => void handleStartRemote()}
+            disabled={launching}
+            className="px-8 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white transition-colors shadow-sm disabled:cursor-not-allowed disabled:opacity-60"
             style={{ fontSize: 14 }}
           >
             发起远程连接

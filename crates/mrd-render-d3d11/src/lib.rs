@@ -300,6 +300,7 @@ impl D3d11Renderer {
     #[cfg(windows)]
     fn present_uploaded_frame_bgra(&self, frame: &RenderFrame) -> Result<(), RenderError> {
         use mrd_render::RenderFrameData;
+        use windows::Win32::Graphics::Direct3D11::D3D11_BOX;
         let Some(surface) = self.surface.as_ref() else {
             return Ok(());
         };
@@ -321,23 +322,53 @@ impl D3d11Renderer {
             )));
         }
 
-        let row_pitch = frame
-            .width
+        let surface_width = surface.width as usize;
+        let surface_height = surface.height as usize;
+        let upload_data;
+        let (data, upload_width, upload_height) =
+            if frame.width == surface_width && frame.height == surface_height {
+                (data.as_slice(), frame.width, frame.height)
+            } else {
+                upload_data = Self::scale_bgra_to_fit(
+                    data,
+                    frame.width,
+                    frame.height,
+                    surface_width,
+                    surface_height,
+                )?;
+                (upload_data.as_slice(), surface_width, surface_height)
+            };
+        let row_pitch = upload_width
             .checked_mul(4)
             .ok_or_else(|| RenderError::Message("row pitch overflow".into()))?
             as u32;
+        let copy_width = upload_width.min(surface_width);
+        let copy_height = upload_height.min(surface_height);
+        if copy_width == 0 || copy_height == 0 {
+            return Ok(());
+        }
+        let copy_box = D3D11_BOX {
+            left: 0,
+            top: 0,
+            front: 0,
+            right: copy_width as u32,
+            bottom: copy_height as u32,
+            back: 1,
+        };
 
         unsafe {
+            self.context
+                .OMSetRenderTargets(Some(&[Some(surface.render_target_view.clone())]), None);
+            self.context
+                .ClearRenderTargetView(&surface.render_target_view, &[0.0, 0.0, 0.0, 1.0]);
             self.context.UpdateSubresource(
                 &surface.back_buffer,
                 0,
-                None,
+                Some(&copy_box as *const D3D11_BOX),
                 data.as_ptr() as *const core::ffi::c_void,
                 row_pitch,
                 0,
             );
-            self.context
-                .OMSetRenderTargets(Some(&[Some(surface.render_target_view.clone())]), None);
             surface
                 .swap_chain
                 .Present(0, 0)
@@ -373,29 +404,115 @@ impl D3d11Renderer {
     }
 
     #[cfg(windows)]
+    fn scale_bgra_to_fit(
+        source: &[u8],
+        source_width: usize,
+        source_height: usize,
+        target_width: usize,
+        target_height: usize,
+    ) -> Result<Vec<u8>, RenderError> {
+        if source_width == 0 || source_height == 0 || target_width == 0 || target_height == 0 {
+            return Ok(Vec::new());
+        }
+
+        let source_len = source_width
+            .checked_mul(source_height)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| RenderError::Message("source frame size overflow".into()))?;
+        if source.len() != source_len {
+            return Err(RenderError::Message(format!(
+                "BGRA source bytes mismatch: expected {source_len}, got {}",
+                source.len()
+            )));
+        }
+
+        let target_len = target_width
+            .checked_mul(target_height)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| RenderError::Message("target frame size overflow".into()))?;
+        let mut target = vec![0_u8; target_len];
+
+        let width_limited_height =
+            ((target_width as u128 * source_height as u128) / source_width as u128) as usize;
+        let (draw_width, draw_height) = if width_limited_height <= target_height {
+            (target_width, width_limited_height.max(1))
+        } else {
+            let height_limited_width =
+                ((target_height as u128 * source_width as u128) / source_height as u128) as usize;
+            (height_limited_width.max(1), target_height)
+        };
+        let offset_x = (target_width - draw_width) / 2;
+        let offset_y = (target_height - draw_height) / 2;
+
+        for y in 0..draw_height {
+            let source_y = (y * source_height / draw_height).min(source_height - 1);
+            for x in 0..draw_width {
+                let source_x = (x * source_width / draw_width).min(source_width - 1);
+                let source_idx = (source_y * source_width + source_x) * 4;
+                let target_idx = ((offset_y + y) * target_width + offset_x + x) * 4;
+                target[target_idx..target_idx + 4]
+                    .copy_from_slice(&source[source_idx..source_idx + 4]);
+            }
+        }
+
+        Ok(target)
+    }
+
+    #[cfg(windows)]
     fn present_uploaded_frame(&self, frame: &RenderFrame) -> Result<(), RenderError> {
+        use windows::Win32::Graphics::Direct3D11::D3D11_BOX;
         let Some(surface) = self.surface.as_ref() else {
             return Ok(());
         };
 
         let bgra = Self::rgb24_to_bgra(frame)?;
-        let row_pitch = frame
-            .width
+        let surface_width = surface.width as usize;
+        let surface_height = surface.height as usize;
+        let upload_data;
+        let (data, upload_width, upload_height) =
+            if frame.width == surface_width && frame.height == surface_height {
+                (bgra.as_slice(), frame.width, frame.height)
+            } else {
+                upload_data = Self::scale_bgra_to_fit(
+                    &bgra,
+                    frame.width,
+                    frame.height,
+                    surface_width,
+                    surface_height,
+                )?;
+                (upload_data.as_slice(), surface_width, surface_height)
+            };
+        let row_pitch = upload_width
             .checked_mul(4)
             .ok_or_else(|| RenderError::Message("row pitch overflow".into()))?
             as u32;
+        let copy_width = upload_width.min(surface_width);
+        let copy_height = upload_height.min(surface_height);
+        if copy_width == 0 || copy_height == 0 {
+            return Ok(());
+        }
+        let copy_box = D3D11_BOX {
+            left: 0,
+            top: 0,
+            front: 0,
+            right: copy_width as u32,
+            bottom: copy_height as u32,
+            back: 1,
+        };
 
         unsafe {
+            self.context
+                .OMSetRenderTargets(Some(&[Some(surface.render_target_view.clone())]), None);
+            self.context
+                .ClearRenderTargetView(&surface.render_target_view, &[0.0, 0.0, 0.0, 1.0]);
             self.context.UpdateSubresource(
                 &surface.back_buffer,
                 0,
-                None,
-                bgra.as_ptr() as *const core::ffi::c_void,
+                Some(&copy_box as *const D3D11_BOX),
+                data.as_ptr() as *const core::ffi::c_void,
                 row_pitch,
                 0,
             );
-            self.context
-                .OMSetRenderTargets(Some(&[Some(surface.render_target_view.clone())]), None);
             surface
                 .swap_chain
                 .Present(0, 0)

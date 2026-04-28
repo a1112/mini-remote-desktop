@@ -6,9 +6,9 @@
 
 #![warn(missing_docs)]
 
-use mrd_proto::{SessionId, DeviceId};
-use mrd_signal_proto::{SignalMessage, IceCandidate};
 use anyhow::Result;
+use mrd_proto::{DeviceId, SessionId};
+use mrd_signal_proto::{IceCandidate, SignalMessage};
 
 /// Abstract ports for external dependencies
 ///
@@ -59,7 +59,11 @@ pub mod ports {
         fn apply_remote_answer(&mut self, session_id: SessionId, sdp: String) -> Result<()>;
 
         /// Apply a remote ICE candidate
-        fn apply_remote_ice_candidate(&mut self, session_id: SessionId, candidate: IceCandidate) -> Result<()>;
+        fn apply_remote_ice_candidate(
+            &mut self,
+            session_id: SessionId,
+            candidate: IceCandidate,
+        ) -> Result<()>;
 
         /// Get a snapshot of session state
         fn snapshot(&self, session_id: &SessionId) -> Option<SessionSnapshot>;
@@ -155,7 +159,8 @@ pub mod usecases {
                 }
                 SignalMessage::IceCandidate(candidate) => {
                     last_session_id = Some(candidate.session_id.clone());
-                    webrtc_sessions.apply_remote_ice_candidate(candidate.session_id.clone(), candidate)?;
+                    webrtc_sessions
+                        .apply_remote_ice_candidate(candidate.session_id.clone(), candidate)?;
                 }
                 _ => {}
             }
@@ -176,7 +181,9 @@ pub mod usecases {
     ) -> Result<()> {
         let snapshot = quic_sessions.snapshot(session_id);
         if let Some(snapshot) = snapshot {
-            quic_host.sync_from_session_snapshot(local_device_id, session_id, &snapshot).await?;
+            quic_host
+                .sync_from_session_snapshot(local_device_id, session_id, &snapshot)
+                .await?;
         }
         Ok(())
     }

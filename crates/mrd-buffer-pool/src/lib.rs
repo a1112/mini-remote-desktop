@@ -42,9 +42,8 @@ impl BufferPool {
         let buffer_size = config.buffer_size;
 
         // Pre-allocate minimum buffers
-        let available: VecDeque<Vec<u8>> = (0..min_buffers)
-            .map(|_| vec![0u8; buffer_size])
-            .collect();
+        let available: VecDeque<Vec<u8>> =
+            (0..min_buffers).map(|_| vec![0u8; buffer_size]).collect();
 
         Self {
             config,
@@ -127,9 +126,7 @@ impl BufferPool {
         }
 
         // Only reuse if size is <= pool size (can be resized) and we haven't exceeded total pooled buffers
-        if buffer.len() <= self.config.buffer_size
-            && self.available.len() < self.total_allocated
-        {
+        if buffer.len() <= self.config.buffer_size && self.available.len() < self.total_allocated {
             self.available.push_back(buffer);
         }
         // Otherwise, buffer is dropped

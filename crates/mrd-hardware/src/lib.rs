@@ -16,13 +16,15 @@
 
 use std::fmt;
 
-pub mod gpu;
-pub mod encoder;
 pub mod decoder;
+pub mod encoder;
+pub mod gpu;
 
-pub use gpu::{detect_gpu_caps, GpuCaps};
-pub use encoder::{choose_encoder_backend, create_encoder, EncoderDescriptor, EncoderSelectorConfig};
 pub use decoder::{choose_decoder_backend, create_decoder, DecoderDescriptor};
+pub use encoder::{
+    choose_encoder_backend, create_encoder, EncoderDescriptor, EncoderSelectorConfig,
+};
+pub use gpu::{detect_gpu_caps, GpuCaps};
 
 /// Video encoder backend types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -140,9 +142,18 @@ mod tests {
 
     #[test]
     fn encoder_backend_from_str_works() {
-        assert_eq!(VideoEncoderBackend::from_str("nvenc"), Some(VideoEncoderBackend::Nvenc));
-        assert_eq!(VideoEncoderBackend::from_str("NVENC"), Some(VideoEncoderBackend::Nvenc));
-        assert_eq!(VideoEncoderBackend::from_str("openh264"), Some(VideoEncoderBackend::OpenH264));
+        assert_eq!(
+            VideoEncoderBackend::from_str("nvenc"),
+            Some(VideoEncoderBackend::Nvenc)
+        );
+        assert_eq!(
+            VideoEncoderBackend::from_str("NVENC"),
+            Some(VideoEncoderBackend::Nvenc)
+        );
+        assert_eq!(
+            VideoEncoderBackend::from_str("openh264"),
+            Some(VideoEncoderBackend::OpenH264)
+        );
         assert_eq!(VideoEncoderBackend::from_str("unknown"), None);
     }
 
@@ -154,8 +165,14 @@ mod tests {
 
     #[test]
     fn decoder_backend_from_str_works() {
-        assert_eq!(VideoDecoderBackend::from_str("nvdec"), Some(VideoDecoderBackend::Nvdec));
-        assert_eq!(VideoDecoderBackend::from_str("software"), Some(VideoDecoderBackend::Software));
+        assert_eq!(
+            VideoDecoderBackend::from_str("nvdec"),
+            Some(VideoDecoderBackend::Nvdec)
+        );
+        assert_eq!(
+            VideoDecoderBackend::from_str("software"),
+            Some(VideoDecoderBackend::Software)
+        );
         assert_eq!(VideoDecoderBackend::from_str("unknown"), None);
     }
 

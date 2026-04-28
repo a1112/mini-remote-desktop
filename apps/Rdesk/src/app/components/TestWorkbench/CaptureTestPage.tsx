@@ -1,5 +1,15 @@
 import { useState, useEffect } from "react";
-import { Play, Square, Monitor, Activity, Gauge } from "lucide-react";
+import {
+  Play,
+  Square,
+  Monitor,
+  Activity,
+  Gauge,
+  Search,
+  X,
+  RefreshCw,
+  ImageOff,
+} from "lucide-react";
 import * as commands from "../../adapters/tauri/commands";
 import type { Artifact, WindowCaptureTarget } from "../../adapters/tauri/types";
 
@@ -122,8 +132,26 @@ export function CaptureTestPage() {
   const [windowTargetsLoading, setWindowTargetsLoading] = useState(false);
   const [windowTargetsError, setWindowTargetsError] = useState<string | null>(null);
   const [singleWindowProbeResult, setSingleWindowProbeResult] = useState<string | null>(null);
+  const [windowPickerOpen, setWindowPickerOpen] = useState(false);
+  const [windowPickerTargets, setWindowPickerTargets] = useState<WindowCaptureTarget[]>([]);
+  const [windowPickerLoading, setWindowPickerLoading] = useState(false);
+  const [windowPickerError, setWindowPickerError] = useState<string | null>(null);
+  const [windowPickerQuery, setWindowPickerQuery] = useState("");
 
   const selectedOption = CAPTURE_OPTIONS.find((o) => o.id === selectedCapture);
+  const selectedWindow =
+    windowTargets.find((target) => target.hwnd === selectedWindowHwnd) ??
+    windowPickerTargets.find((target) => target.hwnd === selectedWindowHwnd);
+
+  const applyWindowTargets = (targets: WindowCaptureTarget[]) => {
+    setWindowTargets(targets);
+    setSelectedWindowHwnd((current) => {
+      if (current && targets.some((target) => target.hwnd === current)) {
+        return current;
+      }
+      return targets[0]?.hwnd ?? null;
+    });
+  };
 
   useEffect(() => {
     if (!isRunning) return;
@@ -161,13 +189,7 @@ export function CaptureTestPage() {
       .then((result) => {
         if (cancelled) return;
         if (result.ok) {
-          setWindowTargets(result.value);
-          setSelectedWindowHwnd((current) => {
-            if (current && result.value.some((target) => target.hwnd === current)) {
-              return current;
-            }
-            return result.value[0]?.hwnd ?? null;
-          });
+          applyWindowTargets(result.value);
         } else {
           setWindowTargets([]);
           setSelectedWindowHwnd(null);
@@ -182,6 +204,45 @@ export function CaptureTestPage() {
       cancelled = true;
     };
   }, [selectedCapture]);
+
+  const refreshWindowTargets = async () => {
+    setWindowTargetsLoading(true);
+    setWindowTargetsError(null);
+
+    const result = await commands.testListWindowCaptureTargets();
+    if (result.ok) {
+      applyWindowTargets(result.value);
+    } else {
+      setWindowTargets([]);
+      setSelectedWindowHwnd(null);
+      setWindowTargetsError(result.error.message);
+    }
+
+    setWindowTargetsLoading(false);
+  };
+
+  const loadWindowPickerTargets = async () => {
+    setWindowPickerLoading(true);
+    setWindowPickerError(null);
+
+    const result = await commands.testListWindowCaptureTargetsWithPreviews(24);
+    if (result.ok) {
+      setWindowPickerTargets(result.value);
+      applyWindowTargets(result.value);
+    } else {
+      setWindowPickerTargets((current) => (current.length > 0 ? current : windowTargets));
+      setWindowPickerError(result.error.message);
+    }
+
+    setWindowPickerLoading(false);
+  };
+
+  const openWindowPicker = () => {
+    setWindowPickerOpen(true);
+    setWindowPickerQuery("");
+    setWindowPickerTargets(windowTargets);
+    void loadWindowPickerTargets();
+  };
 
   const handleStart = async () => {
     setIsRunning(true);
@@ -311,17 +372,30 @@ export function CaptureTestPage() {
       {selectedCapture === "winrt" && (
         <div className="bg-card rounded-lg border p-4 mb-6">
           <div className="flex items-center justify-between mb-3">
-            <h3 className="font-medium">WinRT window targets</h3>
-            <button
-              onClick={() => {
-                setSelectedCapture("dxgi");
-                setTimeout(() => setSelectedCapture("winrt"), 0);
-              }}
-              disabled={windowTargetsLoading || isRunning}
-              className="text-sm px-3 py-1 rounded border hover:bg-muted disabled:opacity-50"
-            >
-              Refresh
-            </button>
+            <div>
+              <h3 className="font-medium">Single window capture</h3>
+              <p className="text-sm text-muted-foreground">
+                Enumerate foreground windows and pick a WinRT capture target.
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={refreshWindowTargets}
+                disabled={windowTargetsLoading || isRunning}
+                className="inline-flex items-center gap-2 text-sm px-3 py-1.5 rounded border hover:bg-muted disabled:opacity-50"
+              >
+                <RefreshCw className="h-4 w-4" />
+                Refresh
+              </button>
+              <button
+                onClick={openWindowPicker}
+                disabled={windowTargetsLoading || isRunning}
+                className="inline-flex items-center gap-2 text-sm px-3 py-1.5 rounded bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+              >
+                <Monitor className="h-4 w-4" />
+                Choose window
+              </button>
+            </div>
           </div>
 
           {windowTargetsLoading && (
@@ -330,22 +404,36 @@ export function CaptureTestPage() {
           {windowTargetsError && (
             <p className="text-sm text-red-600">{windowTargetsError}</p>
           )}
-          {!windowTargetsLoading && !windowTargetsError && (
-            <div className="space-y-3">
-              <select
-                value={selectedWindowHwnd ?? ""}
-                onChange={(event) => setSelectedWindowHwnd(event.target.value || null)}
-                className="w-full rounded border bg-background px-3 py-2 text-sm"
-              >
-                {windowTargets.map((target) => (
-                  <option key={target.hwnd} value={target.hwnd}>
-                    {target.title} ({target.width}x{target.height})
-                  </option>
-                ))}
-              </select>
-              <div className="text-xs text-muted-foreground">
-                {windowTargets.length} targets
+          {!windowTargetsLoading && !windowTargetsError && selectedWindow && (
+            <div className="grid gap-4 md:grid-cols-[220px_1fr]">
+              <WindowPreviewThumb target={selectedWindow} />
+              <div className="min-w-0 space-y-2">
+                <div>
+                  <div className="truncate text-base font-medium">{selectedWindow.title}</div>
+                  <div className="text-sm text-muted-foreground">
+                    {selectedWindow.width}x{selectedWindow.height} / PID{" "}
+                    {selectedWindow.process_id}
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-3 text-sm">
+                  <div>
+                    <div className="text-muted-foreground">Class</div>
+                    <div className="truncate font-mono">{selectedWindow.class_name}</div>
+                  </div>
+                  <div>
+                    <div className="text-muted-foreground">HWND</div>
+                    <div className="truncate font-mono">{selectedWindow.hwnd}</div>
+                  </div>
+                </div>
+                <div className="text-xs text-muted-foreground">
+                  {windowTargets.length} windows available. Open the picker to refresh screenshots.
+                </div>
               </div>
+            </div>
+          )}
+          {!windowTargetsLoading && !windowTargetsError && !selectedWindow && (
+            <div className="rounded border border-dashed p-4 text-sm text-muted-foreground">
+              No capturable window selected.
             </div>
           )}
           {singleWindowProbeResult && (
@@ -354,6 +442,28 @@ export function CaptureTestPage() {
             </div>
           )}
         </div>
+      )}
+
+      {windowPickerOpen && (
+        <WindowPickerDialog
+          targets={windowPickerTargets}
+          selectedHwnd={selectedWindowHwnd}
+          loading={windowPickerLoading}
+          error={windowPickerError}
+          query={windowPickerQuery}
+          onQueryChange={setWindowPickerQuery}
+          onRefresh={loadWindowPickerTargets}
+          onClose={() => setWindowPickerOpen(false)}
+          onSelect={(target) => {
+            applyWindowTargets(
+              windowPickerTargets.some((item) => item.hwnd === target.hwnd)
+                ? windowPickerTargets
+                : [target, ...windowPickerTargets]
+            );
+            setSelectedWindowHwnd(target.hwnd);
+            setWindowPickerOpen(false);
+          }}
+        />
       )}
 
       {/* Control */}
@@ -424,6 +534,157 @@ export function CaptureTestPage() {
             </div>
           </div>
         </>
+      )}
+    </div>
+  );
+}
+
+function WindowPickerDialog({
+  targets,
+  selectedHwnd,
+  loading,
+  error,
+  query,
+  onQueryChange,
+  onRefresh,
+  onClose,
+  onSelect,
+}: {
+  targets: WindowCaptureTarget[];
+  selectedHwnd: string | null;
+  loading: boolean;
+  error: string | null;
+  query: string;
+  onQueryChange: (query: string) => void;
+  onRefresh: () => void;
+  onClose: () => void;
+  onSelect: (target: WindowCaptureTarget) => void;
+}) {
+  const normalizedQuery = query.trim().toLowerCase();
+  const filteredTargets = normalizedQuery
+    ? targets.filter((target) =>
+        `${target.title} ${target.class_name} ${target.process_id}`
+          .toLowerCase()
+          .includes(normalizedQuery)
+      )
+    : targets;
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-6"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="window-picker-title"
+      onClick={onClose}
+    >
+      <div
+        className="flex max-h-[86vh] w-full max-w-5xl flex-col overflow-hidden rounded-lg border bg-background shadow-xl"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="flex items-center justify-between border-b p-4">
+          <div>
+            <h2 id="window-picker-title" className="text-lg font-semibold">
+              Window picker
+            </h2>
+            <p className="text-sm text-muted-foreground">
+              Select a foreground window using live WinRT preview frames.
+            </p>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={onRefresh}
+              disabled={loading}
+              className="inline-flex items-center gap-2 rounded border px-3 py-1.5 text-sm hover:bg-muted disabled:opacity-50"
+            >
+              <RefreshCw className="h-4 w-4" />
+              Refresh
+            </button>
+            <button
+              onClick={onClose}
+              className="inline-flex h-9 w-9 items-center justify-center rounded border hover:bg-muted"
+              aria-label="Close window picker"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+        </div>
+
+        <div className="border-b p-4">
+          <label className="relative block">
+            <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+            <input
+              value={query}
+              onChange={(event) => onQueryChange(event.target.value)}
+              className="w-full rounded border bg-background py-2 pl-9 pr-3 text-sm"
+              placeholder="Filter by title, class, or PID"
+              aria-label="Filter windows"
+            />
+          </label>
+          {error && <div className="mt-2 text-sm text-red-600">{error}</div>}
+        </div>
+
+        <div className="min-h-[280px] overflow-y-auto p-4">
+          {loading && targets.length === 0 && (
+            <div className="flex h-48 items-center justify-center text-sm text-muted-foreground">
+              Loading window previews...
+            </div>
+          )}
+
+          {!loading && filteredTargets.length === 0 && (
+            <div className="flex h-48 items-center justify-center text-sm text-muted-foreground">
+              No matching windows.
+            </div>
+          )}
+
+          {filteredTargets.length > 0 && (
+            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+              {filteredTargets.map((target) => {
+                const selected = target.hwnd === selectedHwnd;
+                return (
+                  <button
+                    key={target.hwnd}
+                    onClick={() => onSelect(target)}
+                    className={`rounded-lg border p-3 text-left transition hover:border-primary hover:bg-primary/5 ${
+                      selected ? "border-primary bg-primary/10" : ""
+                    }`}
+                    aria-label={`Select ${target.title}`}
+                  >
+                    <WindowPreviewThumb target={target} />
+                    <div className="mt-3 min-w-0">
+                      <div className="truncate font-medium">{target.title}</div>
+                      <div className="mt-1 text-xs text-muted-foreground">
+                        {target.width}x{target.height} / PID {target.process_id}
+                      </div>
+                      <div className="mt-1 truncate font-mono text-xs text-muted-foreground">
+                        {target.class_name}
+                      </div>
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function WindowPreviewThumb({ target }: { target: WindowCaptureTarget }) {
+  return (
+    <div className="flex aspect-video w-full items-center justify-center overflow-hidden rounded border bg-muted">
+      {target.preview_data_url ? (
+        <img
+          src={target.preview_data_url}
+          alt=""
+          className="h-full w-full object-contain"
+          draggable={false}
+        />
+      ) : (
+        <div className="flex flex-col items-center gap-2 text-muted-foreground">
+          <ImageOff className="h-5 w-5" />
+          <span className="text-xs">No preview</span>
+        </div>
       )}
     </div>
   );

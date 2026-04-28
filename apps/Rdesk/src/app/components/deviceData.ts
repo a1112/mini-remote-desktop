@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Laptop, Monitor, Server, Smartphone } from "lucide-react";
+import { ipcLanDiscoverySnapshot, ipcRefreshLanDiscovery, type LanPeerInfo } from "../adapters/tauri";
 import { deviceService } from "../services/deviceService";
+import { isTauriRuntime } from "../utils/runtime";
 import { useAuth } from "./AuthContext";
 
 export interface Device {
@@ -67,6 +69,55 @@ const toDevice = (item: DeviceApi): Device => ({
   favorite: item.favorite,
 });
 
+const formatLanLastSeen = (ageMs: number) => {
+  if (ageMs < 1000) return "just now";
+  const seconds = Math.round(ageMs / 1000);
+  if (seconds < 60) return `${seconds}s ago`;
+  return `${Math.round(seconds / 60)}m ago`;
+};
+
+const lanPeerToDevice = (peer: LanPeerInfo): Device => ({
+  id: peer.device_id,
+  name: peer.device_name,
+  deviceId: peer.device_id,
+  os: `LAN P2P / ${peer.transports.join(", ") || "direct"}`,
+  icon: Monitor,
+  status: peer.p2p_available ? "online" : "offline",
+  location: `LAN ${peer.p2p_control_addr}`,
+  ping: peer.age_ms < 5000 ? Math.max(1, Math.round(peer.age_ms / 100)) : null,
+  lastSeen: formatLanLastSeen(peer.age_ms),
+  cpu: null,
+  ram: null,
+  disk: null,
+  ip: peer.ip,
+  group: "LAN",
+  favorite: false,
+});
+
+async function fetchLanDevices(triggerProbe: boolean): Promise<Device[]> {
+  if (!isTauriRuntime()) return [];
+  const result = triggerProbe
+    ? await ipcRefreshLanDiscovery()
+    : await ipcLanDiscoverySnapshot();
+  if (!result.ok) return [];
+  return result.value.peers.map(lanPeerToDevice);
+}
+
+function mergeDevices(serverDevices: Device[], lanDevices: Device[]): Device[] {
+  const byDeviceId = new Map<string, Device>();
+  for (const device of serverDevices) {
+    byDeviceId.set(device.deviceId, device);
+  }
+  for (const device of lanDevices) {
+    const existing = byDeviceId.get(device.deviceId);
+    byDeviceId.set(
+      device.deviceId,
+      existing ? { ...existing, ...device, favorite: existing.favorite } : device
+    );
+  }
+  return Array.from(byDeviceId.values());
+}
+
 export interface UseDevicesOptions {
   pollInterval?: number;      // 轮询间隔（毫秒），默认 30000
   enabled?: boolean;          // 是否启用轮询，默认 true
@@ -86,11 +137,13 @@ export function useDevices(options?: UseDevicesOptions) {
   } = options || {};
 
   const fetchDevices = useCallback(async () => {
+    const lanDevices = await fetchLanDevices(true);
     // 只有登录后才加载设备列表
     if (!isLoggedIn || !token) {
-      setDevices([]);
+      setDevices(lanDevices);
       setLoading(false);
       setError(null);
+      setLastUpdated(new Date());
       return;
     }
 
@@ -104,9 +157,15 @@ export function useDevices(options?: UseDevicesOptions) {
       });
       if (!resp.ok) throw new Error(`Request failed: ${resp.status}`);
       const data = (await resp.json()) as DeviceApi[];
-      setDevices(data.map(toDevice));
+      setDevices(mergeDevices(data.map(toDevice), lanDevices));
       setLastUpdated(new Date());
     } catch (e) {
+      if (lanDevices.length > 0) {
+        setDevices(lanDevices);
+        setLastUpdated(new Date());
+        setError(null);
+        return;
+      }
       setError(e instanceof Error ? e.message : "加载设备失败");
     } finally {
       setLoading(false);
@@ -124,8 +183,11 @@ export function useDevices(options?: UseDevicesOptions) {
     if (isLoggedIn && token) {
       fetchDevices();
     } else {
-      setDevices([]);
-      setLoading(false);
+      void fetchLanDevices(false).then((lanDevices) => {
+        setDevices(lanDevices);
+        setLastUpdated(new Date());
+        setLoading(false);
+      });
     }
   }, [fetchDevices, isLoggedIn, token]);
 

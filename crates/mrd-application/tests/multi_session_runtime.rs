@@ -3,8 +3,8 @@
 // These tests verify that multiple sessions can be orchestrated
 // correctly without state being collapsed or lost.
 
+use mrd_proto::{DeviceId, SessionId};
 use mrd_session::QuicSessionCoordinator;
-use mrd_proto::{SessionId, DeviceId};
 
 #[test]
 fn multiple_sessions_can_be_tracked_independently() {
@@ -102,8 +102,8 @@ fn session_not_found_returns_none() {
 
 #[test]
 fn multiple_realtime_events_in_one_drain_cycle() {
-    use mrd_application::ports::{SignalingPort, SessionCoordinatorPort, SessionSnapshot};
-    use mrd_signal_proto::{SignalMessage, SessionRequest, SessionAccept};
+    use mrd_application::ports::{SessionCoordinatorPort, SessionSnapshot, SignalingPort};
+    use mrd_signal_proto::{SessionAccept, SessionRequest, SignalMessage};
     use std::sync::{Arc, Mutex};
 
     // Mock signaling port that returns multiple events
@@ -192,11 +192,19 @@ fn multiple_realtime_events_in_one_drain_cycle() {
             Ok(())
         }
 
-        fn apply_remote_offer(&mut self, _session_id: mrd_proto::SessionId, _sdp: String) -> anyhow::Result<()> {
+        fn apply_remote_offer(
+            &mut self,
+            _session_id: mrd_proto::SessionId,
+            _sdp: String,
+        ) -> anyhow::Result<()> {
             Ok(())
         }
 
-        fn apply_remote_answer(&mut self, _session_id: mrd_proto::SessionId, _sdp: String) -> anyhow::Result<()> {
+        fn apply_remote_answer(
+            &mut self,
+            _session_id: mrd_proto::SessionId,
+            _sdp: String,
+        ) -> anyhow::Result<()> {
             Ok(())
         }
 
@@ -246,23 +254,21 @@ fn multiple_realtime_events_in_one_drain_cycle() {
     };
 
     // Process multiple events
-    tokio::runtime::Runtime::new()
-        .unwrap()
-        .block_on(async {
-            let result = mrd_application::usecases::apply_realtime_events(
-                &signaling,
-                &mut webrtc_sessions,
-                &mut quic_sessions,
-                0,
-            )
-            .await;
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let result = mrd_application::usecases::apply_realtime_events(
+            &signaling,
+            &mut webrtc_sessions,
+            &mut quic_sessions,
+            0,
+        )
+        .await;
 
-            assert!(result.is_ok());
+        assert!(result.is_ok());
 
-            // Both sessions should have been processed
-            let sessions = quic_sessions.sessions.lock().unwrap();
-            assert_eq!(sessions.len(), 2);
-            assert!(sessions.contains_key(&session1));
-            assert!(sessions.contains_key(&session2));
-        });
+        // Both sessions should have been processed
+        let sessions = quic_sessions.sessions.lock().unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions.contains_key(&session1));
+        assert!(sessions.contains_key(&session2));
+    });
 }

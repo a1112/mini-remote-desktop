@@ -5,6 +5,7 @@
 
 use anyhow::Result;
 use base64::Engine;
+use image::{codecs::png::PngEncoder, ColorType, ImageEncoder};
 use mrd_pipeline_core::{
     CapturedFrame, DecodedFrame, DecodedFrameData, EncodedAccessUnit, FramePixelFormat,
     VideoEncoder,
@@ -84,6 +85,7 @@ pub struct TestConfigData {
     pub decoder_type: Option<String>,
     pub renderer_type: Option<String>,
     pub render_display: Option<bool>,
+    pub renderer_target_hwnd: Option<isize>,
     pub zero_copy: Option<bool>,
     pub transport_kind: Option<String>,
     pub resolution: Option<[usize; 2]>,
@@ -208,6 +210,12 @@ pub struct WindowCaptureTarget {
     pub width: u32,
     pub height: u32,
     pub process_id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_data_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_height: Option<u32>,
 }
 
 struct WindowCaptureItemProbe {
@@ -432,6 +440,9 @@ impl TestOrchestrator {
         // Try to detect NVENC
         if mrd_encode_nvenc::NvencH264Encoder::new_max_speed(1920, 1080, 60).is_ok() {
             available_encoders.push("nvenc_h264".to_string());
+        }
+        if mrd_encode_nvenc_av1::NvencAv1Encoder::probe_av1_available().is_ok() {
+            available_encoders.push("nvenc_av1".to_string());
         }
 
         // Detect available decoders
@@ -1490,6 +1501,33 @@ pub fn list_window_capture_targets() -> Result<Vec<WindowCaptureTarget>> {
     list_window_capture_targets_impl()
 }
 
+pub fn list_window_capture_targets_with_previews(
+    limit: Option<usize>,
+) -> Result<Vec<WindowCaptureTarget>> {
+    let mut targets = list_window_capture_targets_impl()?;
+    let limit = limit.unwrap_or(24).min(32);
+
+    for target in targets.iter_mut().take(limit) {
+        let Ok(hwnd) = parse_hwnd(&target.hwnd) else {
+            continue;
+        };
+        let Ok(probe) = probe_window_first_frame(hwnd, Duration::from_millis(250)) else {
+            continue;
+        };
+        let Ok((preview_data_url, preview_width, preview_height)) =
+            window_preview_data_url(&probe.frame, 320, 180)
+        else {
+            continue;
+        };
+
+        target.preview_data_url = Some(preview_data_url);
+        target.preview_width = Some(preview_width);
+        target.preview_height = Some(preview_height);
+    }
+
+    Ok(targets)
+}
+
 fn parse_hwnd(input: &str) -> Result<isize> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -1525,6 +1563,9 @@ fn list_window_capture_targets_impl() -> Result<Vec<WindowCaptureTarget>> {
             width: target.width,
             height: target.height,
             process_id: target.process_id,
+            preview_data_url: None,
+            preview_width: None,
+            preview_height: None,
         })
         .collect())
 }
@@ -1575,6 +1616,86 @@ fn probe_window_first_frame(_hwnd: isize, _timeout: Duration) -> Result<WindowCa
     anyhow::bail!("WinRT window capture is only available on Windows")
 }
 
+fn window_preview_data_url(
+    frame: &CapturedFrame,
+    max_width: usize,
+    max_height: usize,
+) -> Result<(String, u32, u32)> {
+    if frame.width == 0 || frame.height == 0 || max_width == 0 || max_height == 0 {
+        anyhow::bail!("window preview frame has invalid dimensions");
+    }
+
+    let bytes_per_pixel = match frame.pixel_format {
+        FramePixelFormat::Bgra32 | FramePixelFormat::Rgba32 => 4,
+        FramePixelFormat::Rgb24 => 3,
+    };
+    let source_stride = frame
+        .width
+        .checked_mul(bytes_per_pixel)
+        .ok_or_else(|| anyhow::anyhow!("window preview stride overflow"))?;
+    let required_len = source_stride
+        .checked_mul(frame.height)
+        .ok_or_else(|| anyhow::anyhow!("window preview byte size overflow"))?;
+    if frame.data.len() < required_len {
+        anyhow::bail!(
+            "window preview frame is truncated: {} < {}",
+            frame.data.len(),
+            required_len
+        );
+    }
+
+    let scale = (max_width as f64 / frame.width as f64)
+        .min(max_height as f64 / frame.height as f64)
+        .min(1.0);
+    let preview_width = ((frame.width as f64 * scale).round() as usize)
+        .max(1)
+        .min(max_width);
+    let preview_height = ((frame.height as f64 * scale).round() as usize)
+        .max(1)
+        .min(max_height);
+
+    let mut rgba = Vec::with_capacity(preview_width * preview_height * 4);
+    for y in 0..preview_height {
+        let source_y = y * frame.height / preview_height;
+        for x in 0..preview_width {
+            let source_x = x * frame.width / preview_width;
+            let source_index = source_y * source_stride + source_x * bytes_per_pixel;
+            match frame.pixel_format {
+                FramePixelFormat::Bgra32 => {
+                    rgba.push(frame.data[source_index + 2]);
+                    rgba.push(frame.data[source_index + 1]);
+                    rgba.push(frame.data[source_index]);
+                    rgba.push(frame.data[source_index + 3]);
+                }
+                FramePixelFormat::Rgba32 => {
+                    rgba.extend_from_slice(&frame.data[source_index..source_index + 4]);
+                }
+                FramePixelFormat::Rgb24 => {
+                    rgba.push(frame.data[source_index]);
+                    rgba.push(frame.data[source_index + 1]);
+                    rgba.push(frame.data[source_index + 2]);
+                    rgba.push(255);
+                }
+            }
+        }
+    }
+
+    let mut png = Vec::new();
+    PngEncoder::new(&mut png).write_image(
+        &rgba,
+        preview_width as u32,
+        preview_height as u32,
+        ColorType::Rgba8.into(),
+    )?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(png);
+
+    Ok((
+        format!("data:image/png;base64,{encoded}"),
+        preview_width as u32,
+        preview_height as u32,
+    ))
+}
+
 impl Default for TestRunSummary {
     fn default() -> Self {
         Self {
@@ -1623,6 +1744,7 @@ fn harness_config_from_data(config: &TestConfigData) -> HarnessConfig {
             (Some(true), Some("d3d11")) => Some(RendererType::D3d11),
             _ => None,
         },
+        renderer_target_hwnd: config.renderer_target_hwnd,
         zero_copy: config.zero_copy,
         transport: match config.transport_kind.as_deref() {
             Some("webrtc") | Some("webrtc_rtp") => Some(TransportKind::WebrtcRtp),
@@ -1788,6 +1910,24 @@ mod tests {
     }
 
     #[test]
+    fn window_preview_data_url_downscales_and_encodes_png() {
+        let frame = CapturedFrame::from_cpu(
+            2,
+            2,
+            FramePixelFormat::Bgra32,
+            0,
+            vec![
+                0, 0, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255, 255, 255, 255, 255,
+            ],
+        );
+
+        let (data_url, width, height) = window_preview_data_url(&frame, 1, 1).unwrap();
+
+        assert_eq!((width, height), (1, 1));
+        assert!(data_url.starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
     fn matrix_dispatch_maps_explicit_encoder_decoder_pairs() {
         let orchestrator = TestOrchestrator::default();
         let openh264_config = TestConfigData {
@@ -1864,6 +2004,20 @@ mod tests {
             harness_config_from_data(&enabled_config).renderer,
             Some(RendererType::D3d11)
         );
+    }
+
+    #[test]
+    fn harness_config_passes_d3d11_renderer_target_hwnd() {
+        let config = TestConfigData {
+            renderer_type: Some("d3d11".to_string()),
+            render_display: Some(true),
+            renderer_target_hwnd: Some(1234),
+            ..Default::default()
+        };
+        let harness_config = harness_config_from_data(&config);
+
+        assert_eq!(harness_config.renderer, Some(RendererType::D3d11));
+        assert_eq!(harness_config.renderer_target_hwnd, Some(1234));
     }
 
     #[test]

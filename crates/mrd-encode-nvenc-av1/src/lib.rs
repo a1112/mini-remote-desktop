@@ -52,7 +52,11 @@ mod imp {
             Self::new_with_profile(width, height, fps, NV_ENC_AV1_PROFILE_MAIN_GUID)
         }
 
-        pub fn new_low_latency(width: usize, height: usize, fps: u32) -> Result<Self, PipelineError> {
+        pub fn new_low_latency(
+            width: usize,
+            height: usize,
+            fps: u32,
+        ) -> Result<Self, PipelineError> {
             Self::new(width, height, fps)
         }
 
@@ -83,6 +87,8 @@ mod imp {
             let session: Session<NeedsConfig> = Session::open_dx(&device).map_err(|error| {
                 PipelineError::message(format!("nvenc open_dx failed: {error:?}"))
             })?;
+            ensure_av1_codec_supported(&session)?;
+            ensure_av1_preset_supported(&session, NV_ENC_PRESET_P6_GUID)?;
             let (session, mut preset) = session
                 .get_encode_preset_config_ex(
                     NV_ENC_CODEC_AV1_GUID,
@@ -166,6 +172,8 @@ mod imp {
             let session: Session<NeedsConfig> = Session::open_dx(&device).map_err(|error| {
                 PipelineError::message(format!("nvenc open_dx failed: {error:?}"))
             })?;
+            ensure_av1_codec_supported(&session)?;
+            ensure_av1_preset_supported(&session, NV_ENC_PRESET_P3_GUID)?;
             let (session, mut preset) = session
                 .get_encode_preset_config_ex(
                     NV_ENC_CODEC_AV1_GUID,
@@ -239,6 +247,8 @@ mod imp {
             let session: Session<NeedsConfig> = Session::open_dx(&device).map_err(|error| {
                 PipelineError::message(format!("nvenc open_dx failed: {error:?}"))
             })?;
+            ensure_av1_codec_supported(&session)?;
+            ensure_av1_preset_supported(&session, NV_ENC_PRESET_P6_GUID)?;
             let (session, mut preset) = session
                 .get_encode_preset_config_ex(
                     NV_ENC_CODEC_AV1_GUID,
@@ -305,16 +315,19 @@ mod imp {
             let session: Session<NeedsConfig> = Session::open_dx(&device).map_err(|error| {
                 PipelineError::message(format!("nvenc open_dx failed: {error:?}"))
             })?;
+            ensure_av1_codec_supported(&session)?;
+            ensure_av1_preset_supported(&session, NV_ENC_PRESET_P3_GUID)?;
 
             // Try to get preset config for AV1 - this will fail if AV1 is not supported
-            let _ = session.get_encode_preset_config_ex(
-                NV_ENC_CODEC_AV1_GUID,
-                NV_ENC_PRESET_P3_GUID,
-                NVencTuningInfo::LowLatency,
-            )
-            .map_err(|error| {
-                PipelineError::message(format!("AV1 codec not supported: {error:?}"))
-            })?;
+            let _ = session
+                .get_encode_preset_config_ex(
+                    NV_ENC_CODEC_AV1_GUID,
+                    NV_ENC_PRESET_P3_GUID,
+                    NVencTuningInfo::LowLatency,
+                )
+                .map_err(|error| {
+                    PipelineError::message(format!("AV1 codec not supported: {error:?}"))
+                })?;
 
             Ok(())
         }
@@ -350,7 +363,8 @@ mod imp {
             }
 
             // AV1 uses key frames instead of IDR frames
-            let force_key = self.frame_index == 0 || self.frame_index % (self.fps as usize * 2) == 0;
+            let force_key =
+                self.frame_index == 0 || self.frame_index % (self.fps as usize * 2) == 0;
             let bytes = encode_picture(
                 &mut self.encoder,
                 &self.bitstream,
@@ -368,6 +382,39 @@ mod imp {
                 bytes, // AV1 uses OBUs, no Annex-B conversion needed
             }])
         }
+    }
+
+    fn ensure_av1_codec_supported(session: &Session<NeedsConfig>) -> Result<(), PipelineError> {
+        let codecs = session.get_encode_codecs().map_err(|error| {
+            PipelineError::message(format!("NVENC codec capability query failed: {error:?}"))
+        })?;
+
+        if codecs.iter().any(|codec| codec == &NV_ENC_CODEC_AV1_GUID) {
+            return Ok(());
+        }
+
+        Err(PipelineError::message(
+            "NVENC AV1 unavailable: current GPU/driver does not expose AV1 encode support",
+        ))
+    }
+
+    fn ensure_av1_preset_supported(
+        session: &Session<NeedsConfig>,
+        preset_guid: Guid,
+    ) -> Result<(), PipelineError> {
+        let presets = session
+            .get_encode_presets(NV_ENC_CODEC_AV1_GUID)
+            .map_err(|error| {
+                PipelineError::message(format!("NVENC AV1 preset query failed: {error:?}"))
+            })?;
+
+        if presets.iter().any(|preset| preset == &preset_guid) {
+            return Ok(());
+        }
+
+        Err(PipelineError::message(
+            "NVENC AV1 unavailable: required AV1 preset is not supported by this GPU/driver",
+        ))
     }
 
     fn create_d3d11_device() -> anyhow::Result<(ID3D11Device, ID3D11DeviceContext)> {
@@ -506,10 +553,7 @@ pub struct NvencAv1Encoder;
 
 #[cfg(not(windows))]
 impl VideoEncoder for NvencAv1Encoder {
-    fn encode(
-        &mut self,
-        _frame: &CapturedFrame,
-    ) -> Result<Vec<EncodedAccessUnit>, PipelineError> {
+    fn encode(&mut self, _frame: &CapturedFrame) -> Result<Vec<EncodedAccessUnit>, PipelineError> {
         Err(PipelineError::message(
             "NVENC AV1 encoder is only supported on Windows",
         ))

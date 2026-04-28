@@ -5,6 +5,7 @@
 pub mod app_state;
 pub mod handlers;
 pub mod ipc_server;
+pub mod lan_discovery;
 pub mod shell;
 
 pub use app_state::{AppState, DeviceRegistry, SessionRegistry};

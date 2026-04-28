@@ -89,6 +89,7 @@ export interface TestConfig {
   decoder_type?: "none" | "nvdec" | "software";
   renderer_type?: "d3d11";
   render_display?: boolean;
+  renderer_target_hwnd?: number;
   zero_copy?: boolean;
   transport_kind?: "loopback" | "quic" | "webrtc";
 
@@ -143,6 +144,37 @@ export interface WindowCaptureTarget {
   width: number;
   height: number;
   process_id: number;
+  preview_data_url?: string | null;
+  preview_width?: number | null;
+  preview_height?: number | null;
+}
+
+export interface RemoteDisplayWindowContext {
+  label: string;
+  session_id: string;
+  surface_id: string;
+  role: string;
+  renderer_attached: boolean;
+  render_mode: "web" | "d3d11_native" | string;
+  native_surface_attached: boolean;
+  session_window_count: number;
+}
+
+export interface NativeSurfaceRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface NativeRenderSurfaceSnapshot {
+  label: string;
+  backend: "web" | "d3d11" | string;
+  attached: boolean;
+  visible: boolean;
+  parent_hwnd?: number | null;
+  hwnd?: number | null;
+  rect: NativeSurfaceRect;
 }
 
 /**
@@ -336,6 +368,28 @@ export interface DeviceInfo {
   is_online: boolean;
 }
 
+export interface LanPeerInfo {
+  device_id: string;
+  device_name: string;
+  device_type: string;
+  ip: string;
+  discovery_port: number;
+  p2p_control_addr: string;
+  transports: string[];
+  protocol_version: number;
+  age_ms: number;
+  p2p_available: boolean;
+}
+
+export interface LanDiscoverySnapshot {
+  enabled: boolean;
+  running: boolean;
+  discovery_port: number;
+  instance_id: string;
+  last_probe_ms?: number | null;
+  peers: LanPeerInfo[];
+}
+
 export interface DeviceRegistrationResponse {
   device_id: string;
   device_name: string;
@@ -427,9 +481,11 @@ export interface SystemResourceSnapshot {
   gpu_memory_used_mb?: number | null;
   gpu_memory_total_mb?: number | null;
   gpu_metrics_available: boolean;
+  gpu_metrics_scope?: "process" | "system" | "unavailable" | string;
   network_rx_bps: number;
   network_tx_bps: number;
   network_metrics_available: boolean;
+  network_metrics_scope?: "process" | "system" | "unavailable" | string;
   sampled_at_ms: number;
 }
 

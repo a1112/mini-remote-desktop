@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, Semaphore, OwnedSemaphorePermit};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 use crate::{SessionId, SessionLifecycleState};
 
@@ -127,14 +127,21 @@ impl SessionScheduler {
         if sessions.contains_key(&session_id) {
             return Err(SessionSchedulerError::SessionAlreadyExists);
         }
-        sessions.insert(session_id.clone(), ScheduledSession::new(session_id, priority, limits));
+        sessions.insert(
+            session_id.clone(),
+            ScheduledSession::new(session_id, priority, limits),
+        );
         Ok(())
     }
 
     /// Unregister a session
-    pub async fn unregister_session(&self, session_id: &SessionId) -> Result<(), SessionSchedulerError> {
+    pub async fn unregister_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), SessionSchedulerError> {
         let mut sessions = self.sessions.lock().await;
-        sessions.remove(session_id)
+        sessions
+            .remove(session_id)
             .ok_or(SessionSchedulerError::SessionNotFound)?;
         Ok(())
     }
@@ -150,14 +157,19 @@ impl SessionScheduler {
         // Check session exists and update activity
         {
             let mut sessions = self.sessions.lock().await;
-            let session = sessions.get_mut(session_id)
+            let session = sessions
+                .get_mut(session_id)
                 .ok_or(SessionSchedulerError::SessionNotFound)?;
             session.touch();
         }
 
         // Acquire semaphore permit (this waits if max concurrent reached)
         // Convert to owned permit for storage
-        let permit = self.streaming_semaphore.clone().acquire_owned().await
+        let permit = self
+            .streaming_semaphore
+            .clone()
+            .acquire_owned()
+            .await
             .map_err(|_| SessionSchedulerError::SchedulerClosed)?;
 
         // Mark session as active
@@ -183,7 +195,8 @@ impl SessionScheduler {
         state: SessionLifecycleState,
     ) -> Result<(), SessionSchedulerError> {
         let mut sessions = self.sessions.lock().await;
-        let session = sessions.get_mut(session_id)
+        let session = sessions
+            .get_mut(session_id)
             .ok_or(SessionSchedulerError::SessionNotFound)?;
         session.state = state.clone();
         session.touch();
@@ -207,14 +220,18 @@ impl SessionScheduler {
         priority: SessionPriority,
     ) -> Result<(), SessionSchedulerError> {
         let mut sessions = self.sessions.lock().await;
-        let session = sessions.get_mut(session_id)
+        let session = sessions
+            .get_mut(session_id)
             .ok_or(SessionSchedulerError::SessionNotFound)?;
         session.priority = priority;
         Ok(())
     }
 
     /// Get session resource limits
-    pub async fn get_session_limits(&self, session_id: &SessionId) -> Option<SessionResourceLimits> {
+    pub async fn get_session_limits(
+        &self,
+        session_id: &SessionId,
+    ) -> Option<SessionResourceLimits> {
         let sessions = self.sessions.lock().await;
         sessions.get(session_id).map(|s| s.limits.clone())
     }
@@ -226,7 +243,8 @@ impl SessionScheduler {
         limits: SessionResourceLimits,
     ) -> Result<(), SessionSchedulerError> {
         let mut sessions = self.sessions.lock().await;
-        let session = sessions.get_mut(session_id)
+        let session = sessions
+            .get_mut(session_id)
             .ok_or(SessionSchedulerError::SessionNotFound)?;
         session.limits = limits;
         Ok(())
@@ -235,7 +253,8 @@ impl SessionScheduler {
     /// Get all active session IDs
     pub async fn active_sessions(&self) -> Vec<SessionId> {
         let sessions = self.sessions.lock().await;
-            sessions.iter()
+        sessions
+            .iter()
             .filter(|(_, s)| s.is_active)
             .map(|(id, _)| id.clone())
             .collect()
@@ -243,7 +262,9 @@ impl SessionScheduler {
 
     /// Get count of currently streaming sessions
     pub async fn streaming_count(&self) -> usize {
-        self.sessions.lock().await
+        self.sessions
+            .lock()
+            .await
             .values()
             .filter(|s| s.is_active)
             .count()
@@ -361,11 +382,14 @@ mod tests {
         let scheduler = SessionScheduler::new(2, Duration::from_secs(30));
 
         let session_id = SessionId("test-session-1".to_string());
-        scheduler.register_session(
-            session_id.clone(),
-            SessionPriority::Normal,
-            SessionResourceLimits::default(),
-        ).await.unwrap();
+        scheduler
+            .register_session(
+                session_id.clone(),
+                SessionPriority::Normal,
+                SessionResourceLimits::default(),
+            )
+            .await
+            .unwrap();
 
         let priority = scheduler.get_session_priority(&session_id).await;
         assert_eq!(priority, Some(SessionPriority::Normal));
@@ -376,17 +400,22 @@ mod tests {
         let scheduler = SessionScheduler::new(2, Duration::from_secs(30));
 
         let session_id = SessionId("test-session-dup".to_string());
-        scheduler.register_session(
-            session_id.clone(),
-            SessionPriority::Normal,
-            SessionResourceLimits::default(),
-        ).await.unwrap();
+        scheduler
+            .register_session(
+                session_id.clone(),
+                SessionPriority::Normal,
+                SessionResourceLimits::default(),
+            )
+            .await
+            .unwrap();
 
-        let result = scheduler.register_session(
-            session_id,
-            SessionPriority::High,
-            SessionResourceLimits::default(),
-        ).await;
+        let result = scheduler
+            .register_session(
+                session_id,
+                SessionPriority::High,
+                SessionResourceLimits::default(),
+            )
+            .await;
 
         assert_eq!(result, Err(SessionSchedulerError::SessionAlreadyExists));
     }
@@ -396,13 +425,19 @@ mod tests {
         let scheduler = SessionScheduler::new(2, Duration::from_secs(30));
 
         let session_id = SessionId("test-session-permit".to_string());
-        scheduler.register_session(
-            session_id.clone(),
-            SessionPriority::Normal,
-            SessionResourceLimits::default(),
-        ).await.unwrap();
+        scheduler
+            .register_session(
+                session_id.clone(),
+                SessionPriority::Normal,
+                SessionResourceLimits::default(),
+            )
+            .await
+            .unwrap();
 
-        let permit = scheduler.acquire_streaming_permit(&session_id).await.unwrap();
+        let permit = scheduler
+            .acquire_streaming_permit(&session_id)
+            .await
+            .unwrap();
         assert_eq!(permit.session_id(), &session_id);
 
         // Permit is held while in scope
@@ -423,11 +458,14 @@ mod tests {
         let session3 = SessionId("session-3".to_string());
 
         for session in [&session1, &session2, &session3] {
-            scheduler.register_session(
-                session.clone(),
-                SessionPriority::Normal,
-                SessionResourceLimits::default(),
-            ).await.unwrap();
+            scheduler
+                .register_session(
+                    session.clone(),
+                    SessionPriority::Normal,
+                    SessionResourceLimits::default(),
+                )
+                .await
+                .unwrap();
         }
 
         // Acquire permits for session 1 and 2
@@ -437,8 +475,9 @@ mod tests {
         // Session 3 should still be able to acquire (semaphore waits, not errors)
         let permit3 = tokio::time::timeout(
             Duration::from_millis(100),
-            scheduler.acquire_streaming_permit(&session3)
-        ).await;
+            scheduler.acquire_streaming_permit(&session3),
+        )
+        .await;
 
         // Should timeout because max concurrent reached
         assert!(permit3.is_err());
@@ -457,16 +496,25 @@ mod tests {
         let scheduler = SessionScheduler::new(2, Duration::from_secs(30));
 
         let session_id = SessionId("test-state".to_string());
-        scheduler.register_session(
-            session_id.clone(),
-            SessionPriority::Normal,
-            SessionResourceLimits::default(),
-        ).await.unwrap();
+        scheduler
+            .register_session(
+                session_id.clone(),
+                SessionPriority::Normal,
+                SessionResourceLimits::default(),
+            )
+            .await
+            .unwrap();
 
-        scheduler.update_session_state(&session_id, SessionLifecycleState::Connected).await.unwrap();
+        scheduler
+            .update_session_state(&session_id, SessionLifecycleState::Connected)
+            .await
+            .unwrap();
 
         let sessions = scheduler.sessions.lock().await;
-        assert_eq!(sessions[&session_id].state, SessionLifecycleState::Connected);
+        assert_eq!(
+            sessions[&session_id].state,
+            SessionLifecycleState::Connected
+        );
     }
 
     #[tokio::test]
@@ -474,13 +522,19 @@ mod tests {
         let scheduler = SessionScheduler::new(2, Duration::from_secs(30));
 
         let session_id = SessionId("test-priority".to_string());
-        scheduler.register_session(
-            session_id.clone(),
-            SessionPriority::Normal,
-            SessionResourceLimits::default(),
-        ).await.unwrap();
+        scheduler
+            .register_session(
+                session_id.clone(),
+                SessionPriority::Normal,
+                SessionResourceLimits::default(),
+            )
+            .await
+            .unwrap();
 
-        scheduler.set_session_priority(&session_id, SessionPriority::High).await.unwrap();
+        scheduler
+            .set_session_priority(&session_id, SessionPriority::High)
+            .await
+            .unwrap();
 
         let priority = scheduler.get_session_priority(&session_id).await;
         assert_eq!(priority, Some(SessionPriority::High));
@@ -491,11 +545,14 @@ mod tests {
         let scheduler = SessionScheduler::new(2, Duration::from_secs(30));
 
         let session_id = SessionId("test-limits".to_string());
-        scheduler.register_session(
-            session_id.clone(),
-            SessionPriority::Normal,
-            SessionResourceLimits::default(),
-        ).await.unwrap();
+        scheduler
+            .register_session(
+                session_id.clone(),
+                SessionPriority::Normal,
+                SessionResourceLimits::default(),
+            )
+            .await
+            .unwrap();
 
         let limits = SessionResourceLimits {
             max_bitrate_mbps: Some(10.0),
@@ -504,7 +561,10 @@ mod tests {
             cpu_budget_percent: Some(50),
         };
 
-        scheduler.set_session_limits(&session_id, limits.clone()).await.unwrap();
+        scheduler
+            .set_session_limits(&session_id, limits.clone())
+            .await
+            .unwrap();
 
         let retrieved = scheduler.get_session_limits(&session_id).await.unwrap();
         assert_eq!(retrieved.max_bitrate_mbps, limits.max_bitrate_mbps);
@@ -520,17 +580,23 @@ mod tests {
         let session1 = SessionId("idle-session-1".to_string());
         let session2 = SessionId("idle-session-2".to_string());
 
-        scheduler.register_session(
-            session1.clone(),
-            SessionPriority::Normal,
-            SessionResourceLimits::default(),
-        ).await.unwrap();
+        scheduler
+            .register_session(
+                session1.clone(),
+                SessionPriority::Normal,
+                SessionResourceLimits::default(),
+            )
+            .await
+            .unwrap();
 
-        scheduler.register_session(
-            session2.clone(),
-            SessionPriority::Normal,
-            SessionResourceLimits::default(),
-        ).await.unwrap();
+        scheduler
+            .register_session(
+                session2.clone(),
+                SessionPriority::Normal,
+                SessionResourceLimits::default(),
+            )
+            .await
+            .unwrap();
 
         // Acquire and immediately release permit for session 1 (makes it active then inactive)
         {
@@ -559,17 +625,23 @@ mod tests {
         let session1 = SessionId("stats-1".to_string());
         let session2 = SessionId("stats-2".to_string());
 
-        scheduler.register_session(
-            session1.clone(),
-            SessionPriority::Normal,
-            SessionResourceLimits::default(),
-        ).await.unwrap();
+        scheduler
+            .register_session(
+                session1.clone(),
+                SessionPriority::Normal,
+                SessionResourceLimits::default(),
+            )
+            .await
+            .unwrap();
 
-        scheduler.register_session(
-            session2.clone(),
-            SessionPriority::Normal,
-            SessionResourceLimits::default(),
-        ).await.unwrap();
+        scheduler
+            .register_session(
+                session2.clone(),
+                SessionPriority::Normal,
+                SessionResourceLimits::default(),
+            )
+            .await
+            .unwrap();
 
         let stats = scheduler.stats().await;
         assert_eq!(stats.total_sessions, 2);
@@ -589,11 +661,14 @@ mod tests {
         let scheduler = SessionScheduler::new(2, Duration::from_secs(30));
 
         let session_id = SessionId("unregister-me".to_string());
-        scheduler.register_session(
-            session_id.clone(),
-            SessionPriority::Normal,
-            SessionResourceLimits::default(),
-        ).await.unwrap();
+        scheduler
+            .register_session(
+                session_id.clone(),
+                SessionPriority::Normal,
+                SessionResourceLimits::default(),
+            )
+            .await
+            .unwrap();
 
         scheduler.unregister_session(&session_id).await.unwrap();
 
@@ -610,11 +685,14 @@ mod tests {
         let session3 = SessionId("active-3".to_string());
 
         for session in [&session1, &session2, &session3] {
-            scheduler.register_session(
-                session.clone(),
-                SessionPriority::Normal,
-                SessionResourceLimits::default(),
-            ).await.unwrap();
+            scheduler
+                .register_session(
+                    session.clone(),
+                    SessionPriority::Normal,
+                    SessionResourceLimits::default(),
+                )
+                .await
+                .unwrap();
         }
 
         let _permit1 = scheduler.acquire_streaming_permit(&session1).await.unwrap();

@@ -6,8 +6,8 @@
 // - ROI (Region of Interest) encoding
 // - Quality presets
 
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Video codec type with feature support
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -33,9 +33,9 @@ impl EnhancedCodec {
     /// Check if codec requires specific hardware generation
     pub fn min_gpu_architecture(&self) -> GPUArchitecture {
         match self {
-            Self::H264 => GPUArchitecture::Maxwell,  // GTX 900 series
-            Self::HEVC => GPUArchitecture::Pascal,   // GTX 1000 series
-            Self::AV1 => GPUArchitecture::Ampere,    // RTX 3000 series
+            Self::H264 => GPUArchitecture::Maxwell, // GTX 900 series
+            Self::HEVC => GPUArchitecture::Pascal,  // GTX 1000 series
+            Self::AV1 => GPUArchitecture::Ampere,   // RTX 3000 series
         }
     }
 }
@@ -43,11 +43,11 @@ impl EnhancedCodec {
 /// Minimum GPU architecture for codec support
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum GPUArchitecture {
-    Maxwell,   // GTX 900 series (GM2xx)
-    Pascal,    // GTX 1000 series (GP1xx)
-    Turing,    // RTX 2000 series (TU1xx)
-    Ampere,    // RTX 3000 series (GA1xx)
-    Ada,       // RTX 4000 series (AD1xx)
+    Maxwell, // GTX 900 series (GM2xx)
+    Pascal,  // GTX 1000 series (GP1xx)
+    Turing,  // RTX 2000 series (TU1xx)
+    Ampere,  // RTX 3000 series (GA1xx)
+    Ada,     // RTX 4000 series (AD1xx)
 }
 
 /// Encoding quality preset
@@ -248,7 +248,8 @@ impl RegionOfInterest {
 
     /// Check if ROI is valid
     pub fn is_valid(&self) -> bool {
-        self.width > 0.0 && self.height > 0.0
+        self.width > 0.0
+            && self.height > 0.0
             && self.x + self.width <= 1.0
             && self.y + self.height <= 1.0
             && self.priority > 0.0
@@ -292,8 +293,7 @@ impl AdaptiveBitrateConfig {
         if packet_loss_pct < self.target_packet_loss_pct / 2.0
             && latency_ms < self.target_latency_ms / 2
         {
-            target = (target * (1.0 + self.adjustment_step_pct / 100.0))
-                .min(self.max_bitrate_mbps);
+            target = (target * (1.0 + self.adjustment_step_pct / 100.0)).min(self.max_bitrate_mbps);
         }
         // Decrease bitrate if conditions are poor
         else if packet_loss_pct > self.target_packet_loss_pct
@@ -419,7 +419,8 @@ impl EnhancedEncoderConfig {
 
     /// Add center ROI for screen sharing focus
     pub fn with_center_roi(mut self, size: f32, priority: f32) -> Self {
-        self.regions_of_interest.push(RegionOfInterest::center(size, priority));
+        self.regions_of_interest
+            .push(RegionOfInterest::center(size, priority));
         self
     }
 
@@ -559,8 +560,7 @@ mod tests {
 
     #[test]
     fn config_with_roi_adds_region() {
-        let config = EnhancedEncoderConfig::low_latency(1920, 1080, 30)
-            .with_center_roi(0.3, 2.0);
+        let config = EnhancedEncoderConfig::low_latency(1920, 1080, 30).with_center_roi(0.3, 2.0);
         assert_eq!(config.regions_of_interest.len(), 1);
         assert!(config.validate().is_ok());
     }
@@ -576,7 +576,12 @@ mod tests {
 
     #[test]
     fn codec_min_architecture_is_correct() {
-        assert!(EnhancedCodec::H264.min_gpu_architecture() <= EnhancedCodec::HEVC.min_gpu_architecture());
-        assert!(EnhancedCodec::HEVC.min_gpu_architecture() <= EnhancedCodec::AV1.min_gpu_architecture());
+        assert!(
+            EnhancedCodec::H264.min_gpu_architecture()
+                <= EnhancedCodec::HEVC.min_gpu_architecture()
+        );
+        assert!(
+            EnhancedCodec::HEVC.min_gpu_architecture() <= EnhancedCodec::AV1.min_gpu_architecture()
+        );
     }
 }

@@ -11,6 +11,10 @@ use axum::{
 };
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
+use mrd_pipeline_core::{CapturedFrame, FrameCapture, FramePixelFormat, VideoEncoder};
+use mrd_proto::{DeviceId, SessionId};
+use mrd_signal_client::{decode_message, encode_message};
+use mrd_signal_proto::{IceCandidate, SessionDescription, SignalMessage};
 use rdesk_legacy_harness::test_helpers::*;
 use rdesk_legacy_harness::{
     app_settings::{load_settings, DecodePolicy},
@@ -24,12 +28,8 @@ use rdesk_legacy_harness::{
     webrtc_host::WebrtcHost,
     webrtc_session::WebrtcSessionCoordinator,
 };
-use mrd_pipeline_core::{CapturedFrame, FrameCapture, FramePixelFormat, VideoEncoder};
-use mrd_proto::{DeviceId, SessionId};
-use mrd_signal_client::{decode_message, encode_message};
-use mrd_signal_proto::{SignalMessage, IceCandidate, SessionDescription};
-use std::{collections::HashMap, sync::Arc, sync::Once};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::{collections::HashMap, sync::Arc, sync::Once};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Mutex};
 
@@ -281,10 +281,9 @@ async fn syncing_realtime_events_applies_offer_answer_and_ice() {
         .await
         .expect("send ice");
 
-    let snapshot =
-        webrtc_sync_realtime_events_with(&runtime, &coordinator, registration.handle)
-            .await
-            .expect("sync realtime events");
+    let snapshot = webrtc_sync_realtime_events_with(&runtime, &coordinator, registration.handle)
+        .await
+        .expect("sync realtime events");
 
     assert_eq!(snapshot.remote_offer.as_deref(), Some("offer-sdp"));
     assert_eq!(snapshot.local_offer, None);
@@ -349,10 +348,10 @@ fn render_host_snapshot_reports_attachment_and_preview() {
         mrd_pipeline_core::DecodedFrame::from_cpu_rgb24(2, 2, 0, vec![255; 12]),
     );
     let mut render_host = RenderHost::with_frame_sink(sink);
-    let _ =
-        render_host.attach_session(SessionId("session-render".into()), "surface-1".into(), 0);
+    let _ = render_host.attach_session(SessionId("session-render".into()), "surface-1".into(), 0);
 
-    let snapshot = render_host.snapshot(&SessionId("session-render".into()))
+    let snapshot = render_host
+        .snapshot(&SessionId("session-render".into()))
         .expect("render host snapshot");
     let response = render_host_snapshot_response(snapshot);
 

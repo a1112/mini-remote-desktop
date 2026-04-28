@@ -121,6 +121,52 @@ describe("MatrixTestPage failure handling", () => {
     });
   });
 
+  it("accepts the slower software decoder performance tier", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_start_run") {
+        return Promise.resolve("run-1");
+      }
+      if (command === "test_get_run") {
+        return Promise.resolve({
+          run_id: "run-1",
+          scenario_id: "matrix",
+          run_mode: "matrix",
+          status: "completed",
+          started_at: Date.now(),
+          config_snapshot: {},
+          environment_snapshot: {
+            cpu_brand: "",
+            cpu_cores: 8,
+            memory_gb: 32,
+            gpu_info: "",
+            available_encoders: [],
+            available_decoders: [],
+          },
+          summary: {
+            total_duration_ms: 5000,
+            capture_fps: 29,
+            total_latency_p95: 40,
+            dropped_frames: 0,
+            frame_count: 145,
+          },
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    render(<MatrixTestPage runDelayMs={0} />);
+    selectSingleSupportedCombination();
+    fireEvent.click(screen.getByLabelText("NVDEC"));
+    fireEvent.click(screen.getByLabelText("软件"));
+    fireEvent.click(screen.getByRole("button", { name: /启动矩阵测试/ }));
+
+    await waitFor(() => {
+      expect(within(resultRow()).getByText("完成")).toBeInTheDocument();
+      expect(within(resultRow()).getByText("29.0")).toBeInTheDocument();
+    });
+  });
+
   it("passes the DX11 renderer flag when render display is enabled", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {
@@ -146,6 +192,38 @@ describe("MatrixTestPage failure handling", () => {
           config: expect.objectContaining({
             renderer_type: "d3d11",
             render_display: true,
+          }),
+        })
+      );
+    });
+  });
+
+  it("auto-enables DX11 popup for D3D11 shared texture matrix runs", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_start_run") {
+        return Promise.resolve("run-1");
+      }
+      if (command === "test_get_run") {
+        return Promise.resolve(null);
+      }
+      return Promise.resolve(null);
+    });
+
+    render(<MatrixTestPage runDelayMs={0} />);
+    selectSingleSupportedCombination();
+    fireEvent.click(screen.getByLabelText("CPU"));
+    fireEvent.click(screen.getByLabelText("D3D11 shared texture"));
+    fireEvent.click(screen.getByRole("button", { name: /启动矩阵测试/ }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_start_run",
+        expect.objectContaining({
+          config: expect.objectContaining({
+            renderer_type: "d3d11",
+            render_display: true,
+            zero_copy: true,
           }),
         })
       );

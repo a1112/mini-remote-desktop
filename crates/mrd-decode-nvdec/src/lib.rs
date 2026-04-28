@@ -105,6 +105,12 @@ pub enum NvdecOutputMode {
     CpuNv12,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NvdecCodecKind {
+    H264,
+    Av1,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NvdecRuntimeProbe {
     pub backend: &'static str,
@@ -184,9 +190,20 @@ impl NvdecDecoder {
     }
 
     pub fn new_with_output_mode(output_mode: NvdecOutputMode) -> Result<Self, String> {
+        Self::new_for_codec_with_output_mode(NvdecCodecKind::H264, output_mode)
+    }
+
+    pub fn new_av1_with_output_mode(output_mode: NvdecOutputMode) -> Result<Self, String> {
+        Self::new_for_codec_with_output_mode(NvdecCodecKind::Av1, output_mode)
+    }
+
+    pub fn new_for_codec_with_output_mode(
+        codec: NvdecCodecKind,
+        output_mode: NvdecOutputMode,
+    ) -> Result<Self, String> {
         #[cfg(windows)]
         {
-            let session = imp::NvdecSession::new(output_mode)?;
+            let session = imp::NvdecSession::new_for_codec(codec, output_mode)?;
             let runtime = NvdecRuntimeProbe {
                 backend: "windows-nvdec",
                 summary: "nvdec runtime libraries and core exports are present".to_string(),
@@ -212,7 +229,7 @@ impl NvdecDecoder {
 
         #[cfg(not(windows))]
         {
-            let _ = output_mode;
+            let _ = (codec, output_mode);
             Err("Windows-only nvdec backend is unavailable on this platform".to_string())
         }
     }
@@ -924,6 +941,7 @@ mod imp {
         _cuvid: CuvidApi,
         context: CUcontext,
         parser: CUvideoparser,
+        parser_codec: i32,
         callback_state: Box<CallbackState>,
         shared_texture: Option<D3D11SharedTexture>,
         enable_shared_texture: bool,
@@ -1035,7 +1053,15 @@ mod imp {
     }
 
     impl NvdecSession {
-        pub fn new(output_mode: NvdecOutputMode) -> Result<Self, String> {
+        pub fn new_for_codec(
+            codec: super::NvdecCodecKind,
+            output_mode: NvdecOutputMode,
+        ) -> Result<Self, String> {
+            let parser_codec = match codec {
+                super::NvdecCodecKind::H264 => CUDA_VIDEO_CODEC_H264,
+                super::NvdecCodecKind::Av1 => CUDA_VIDEO_CODEC_AV1,
+            };
+
             let cuda = CudaApi::load()?;
             let cuvid = CuvidApi::load()?;
 
@@ -1131,7 +1157,7 @@ mod imp {
 
             let mut parser = ptr::null_mut();
             let mut params = CUVIDPARSERPARAMS {
-                CodecType: CUDA_VIDEO_CODEC_H264,
+                CodecType: parser_codec,
                 ulMaxNumDecodeSurfaces: 8,
                 ulClockRate: 10_000_000,
                 ulErrorThreshold: 0,
@@ -1160,6 +1186,7 @@ mod imp {
                 _cuvid: cuvid,
                 context,
                 parser,
+                parser_codec,
                 callback_state,
                 shared_texture: None,
                 enable_shared_texture: false, // Disabled by default
@@ -1180,7 +1207,18 @@ mod imp {
         }
 
         pub fn push_access_unit(&mut self, access_unit: &[u8]) -> Result<(), String> {
-            if !looks_like_annexb(access_unit) {
+            if access_unit.is_empty() {
+                self.callback_state.clear_access_unit_state();
+                let message = "nvdec input validation failed: empty access unit".to_string();
+                self.callback_state.last_error = Some(message.clone());
+                self.callback_state.diagnostics.last_stage = Some("input".to_string());
+                self.callback_state.diagnostics.last_api = Some("push_access_unit".to_string());
+                self.callback_state.diagnostics.last_error_description =
+                    Some("empty access unit".to_string());
+                return Err(message);
+            }
+
+            if self.parser_codec == CUDA_VIDEO_CODEC_H264 && !looks_like_annexb(access_unit) {
                 self.callback_state.clear_access_unit_state();
                 let message =
                     "nvdec input validation failed: expected H264 Annex-B access unit".to_string();
@@ -2435,6 +2473,7 @@ mod imp {
         match codec {
             CUDA_VIDEO_CODEC_H264 => "h264",
             CUDA_VIDEO_CODEC_HEVC => "hevc",
+            CUDA_VIDEO_CODEC_AV1 => "av1",
             _ => "unknown",
         }
     }
@@ -2530,6 +2569,17 @@ mod imp {
         fn support_matrix_accepts_h264_8bit_420() {
             let request = NvdecSupportRequest {
                 codec: NvdecCodec::H264,
+                bit_depth_minus8: 0,
+                chroma_format: CUDA_VIDEO_CHROMA_420,
+            };
+
+            assert_eq!(evaluate_support(request), NvdecSupportDecision::Supported);
+        }
+
+        #[test]
+        fn support_matrix_accepts_av1_8bit_420() {
+            let request = NvdecSupportRequest {
+                codec: NvdecCodec::Av1,
                 bit_depth_minus8: 0,
                 chroma_format: CUDA_VIDEO_CHROMA_420,
             };

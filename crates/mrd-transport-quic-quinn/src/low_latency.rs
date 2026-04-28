@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify};
 
-use bytes::Bytes;
 use crate::QuinnDatagramEndpoint;
+use bytes::Bytes;
 
 /// Pacing configuration for transmission rate control
 #[derive(Debug, Clone)]
@@ -45,9 +45,8 @@ impl PacingConfig {
         }
 
         // Time to transmit this packet at target bitrate
-        let tx_time = Duration::from_secs_f64(
-            packet_size as f64 * 8.0 / self.target_bitrate_bps as f64
-        );
+        let tx_time =
+            Duration::from_secs_f64(packet_size as f64 * 8.0 / self.target_bitrate_bps as f64);
 
         tx_time.max(self.min_packet_interval)
     }
@@ -124,12 +123,15 @@ impl FecEncoder {
         let parity = self.generate_parity();
         self.buffer.clear();
 
-        parity.into_iter().map(|p| FecPacket {
-            base_sequence: seq.wrapping_sub(self.config.block_size as u32),
-            block_size: self.config.block_size as u16,
-            parity_index: p.index,
-            data: p.data,
-        }).collect()
+        parity
+            .into_iter()
+            .map(|p| FecPacket {
+                base_sequence: seq.wrapping_sub(self.config.block_size as u32),
+                block_size: self.config.block_size as u16,
+                parity_index: p.index,
+                data: p.data,
+            })
+            .collect()
     }
 
     /// Flush remaining data with partial FEC
@@ -142,12 +144,15 @@ impl FecEncoder {
         let parity = self.generate_parity();
         self.buffer.clear();
 
-        parity.into_iter().map(|p| FecPacket {
-            base_sequence: seq,
-            block_size: self.buffer.len() as u16,
-            parity_index: p.index,
-            data: p.data,
-        }).collect()
+        parity
+            .into_iter()
+            .map(|p| FecPacket {
+                base_sequence: seq,
+                block_size: self.buffer.len() as u16,
+                parity_index: p.index,
+                data: p.data,
+            })
+            .collect()
     }
 
     /// Generate parity packets based on scheme
@@ -261,9 +266,7 @@ impl FecDecoder {
         // Check if all packets received
         let all_received = missing_count == 0;
         if all_received {
-            let recovered = self.buffer.drain(..)
-                .map(|p| p.unwrap())
-                .collect();
+            let recovered = self.buffer.drain(..).map(|p| p.unwrap()).collect();
             self.reset();
             return recovered;
         }
@@ -276,9 +279,7 @@ impl FecDecoder {
                 self.recover_with_xor_internal(&parity_data);
 
                 // Return all packets in order
-                let recovered = self.buffer.drain(..)
-                    .map(|p| p.unwrap())
-                    .collect();
+                let recovered = self.buffer.drain(..).map(|p| p.unwrap()).collect();
                 self.reset();
                 return recovered;
             }
@@ -381,7 +382,8 @@ impl NackReceiver {
 
         // Check for gap
         let seq_delta = seq.wrapping_sub(self.expected_sequence);
-        if seq_delta > 0 && seq_delta < 1000 { // Reasonable gap
+        if seq_delta > 0 && seq_delta < 1000 {
+            // Reasonable gap
             // Mark missing packets
             for missing in self.expected_sequence..seq {
                 self.missing_sequences.insert(missing);
@@ -392,10 +394,8 @@ impl NackReceiver {
         self.expected_sequence = seq.wrapping_add(1);
 
         // Generate NACK if needed
-        self.should_send_nack().then(|| {
-            NackMessage {
-                sequence_numbers: self.missing_sequences.iter().copied().collect(),
-            }
+        self.should_send_nack().then(|| NackMessage {
+            sequence_numbers: self.missing_sequences.iter().copied().collect(),
         })
     }
 
@@ -429,9 +429,7 @@ impl NackReceiver {
     /// Check if sequence has exceeded retry limit
     #[allow(dead_code)]
     fn is_retry_exhausted(&self, seq: u32) -> bool {
-        self.nack_retries.get(&seq)
-            .copied()
-            .unwrap_or(0) >= self.config.max_nack_retries
+        self.nack_retries.get(&seq).copied().unwrap_or(0) >= self.config.max_nack_retries
     }
 }
 
@@ -458,9 +456,19 @@ pub struct LowLatencyTx {
 /// Task for transmission
 #[derive(Debug)]
 enum TransmissionTask {
-    Data { #[allow(dead_code)] sequence: u32, data: Vec<u8> },
-    Fec { packet: FecPacket },
-    Retransmit { #[allow(dead_code)] sequence: u32, data: Vec<u8> },
+    Data {
+        #[allow(dead_code)]
+        sequence: u32,
+        data: Vec<u8>,
+    },
+    Fec {
+        packet: FecPacket,
+    },
+    Retransmit {
+        #[allow(dead_code)]
+        sequence: u32,
+        data: Vec<u8>,
+    },
 }
 
 impl LowLatencyTx {
@@ -508,8 +516,8 @@ impl LowLatencyTx {
                     }
 
                     let data = match task {
-                        TransmissionTask::Data { data, .. } |
-                        TransmissionTask::Retransmit { data, .. } => data,
+                        TransmissionTask::Data { data, .. }
+                        | TransmissionTask::Retransmit { data, .. } => data,
                         TransmissionTask::Fec { packet } => {
                             // Encode FEC packet
                             Self::encode_fec_packet(&packet)
@@ -638,7 +646,10 @@ impl LowLatencyRx {
     /// Receive and process packets
     pub async fn recv(&mut self) -> Result<Vec<Bytes>, RxError> {
         loop {
-            let datagram = self.endpoint.read_datagram().await
+            let datagram = self
+                .endpoint
+                .read_datagram()
+                .await
                 .map_err(|e| RxError::ReceiveFailed(e.to_string()))?;
 
             // Try to parse as FEC packet first
@@ -679,7 +690,8 @@ impl LowLatencyRx {
             return Err(());
         }
 
-        let base_sequence = u32::from_le_bytes([datagram[0], datagram[1], datagram[2], datagram[3]]);
+        let base_sequence =
+            u32::from_le_bytes([datagram[0], datagram[1], datagram[2], datagram[3]]);
         let block_size = u16::from_le_bytes([datagram[4], datagram[5]]);
         let parity_index = u16::from_le_bytes([datagram[6], datagram[7]]);
         let data = datagram[8..].to_vec();

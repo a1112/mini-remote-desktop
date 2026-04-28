@@ -4,11 +4,11 @@
 
 use std::time::Duration;
 
+use bytes::Bytes;
 use mrd_transport_quic_quinn::recovery::{
     ConnectionHealth, HealthMonitor, ReconnectConfig, ReconnectableEndpoint,
 };
 use mrd_transport_quic_quinn::QuinnServerListener;
-use bytes::Bytes;
 
 /// Test basic endpoint connection
 #[tokio::test]
@@ -88,7 +88,8 @@ async fn endpoint_tracks_last_activity() {
     endpoint.connect().await.expect("Failed to connect");
 
     // Send datagram to update activity
-    endpoint.send_datagram(Bytes::from(&b"test"[..]))
+    endpoint
+        .send_datagram(Bytes::from(&b"test"[..]))
         .await
         .expect("Failed to send");
 
@@ -186,7 +187,8 @@ async fn send_and_receive_with_reconnectable_endpoint() {
     endpoint.connect().await.expect("Failed to connect");
 
     // Send should succeed
-    endpoint.send_datagram(Bytes::from(&b"hello"[..]))
+    endpoint
+        .send_datagram(Bytes::from(&b"hello"[..]))
         .await
         .expect("Failed to send");
 

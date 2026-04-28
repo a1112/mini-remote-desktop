@@ -125,38 +125,112 @@ interface MatrixTest {
   status: "pending" | "running" | "completed" | "failed" | "skipped";
   result?: TestRunSummary;
   duration?: number;
+  skipReason?: string;
+  failureReason?: string;
 }
 
-function isMatrixRunAcceptable(config: TestConfig, summary?: TestRunSummary): boolean {
+interface MatrixAcceptanceResult {
+  acceptable: boolean;
+  reason?: string;
+}
+
+function evaluateMatrixRun(
+  config: TestConfig,
+  summary?: TestRunSummary
+): MatrixAcceptanceResult {
   if (!summary || summary.frame_count <= 0 || summary.error_message) {
-    return false;
+    return {
+      acceptable: false,
+      reason: summary?.error_message ?? "No frames were produced",
+    };
   }
 
   const targetFps = Math.max(1, config.fps ?? 60);
-  const minFps = targetFps * 0.6;
+  const minFps = minimumExpectedFps(config, targetFps);
   const captureFps = summary.capture_fps ?? 0;
   if (captureFps < minFps) {
-    return false;
+    return {
+      acceptable: false,
+      reason: `Pipeline FPS ${captureFps.toFixed(1)} < ${minFps.toFixed(1)} expected`,
+    };
   }
 
-  const frameBudgetMs = 1000 / targetFps;
-  const maxTotalP95Ms = Math.max(100, frameBudgetMs * 4);
+  const maxTotalP95Ms = maximumExpectedLatencyMs(config, targetFps);
   const totalLatencyP95 = summary.total_latency_p95 ?? Number.POSITIVE_INFINITY;
-  return totalLatencyP95 <= maxTotalP95Ms;
+  if (totalLatencyP95 > maxTotalP95Ms) {
+    const [slowestStage, slowestStageMs] = slowestPipelineStage(summary);
+    return {
+      acceptable: false,
+      reason: `${slowestStage} P95 ${slowestStageMs.toFixed(
+        2
+      )} ms; total P95 ${totalLatencyP95.toFixed(2)} ms > ${maxTotalP95Ms.toFixed(2)} ms budget`,
+    };
+  }
+
+  return { acceptable: true };
+}
+
+function minimumExpectedFps(config: TestConfig, targetFps: number): number {
+  if (config.encoder_type === "openh264") {
+    return targetFps * 0.35;
+  }
+  if (config.decoder_type === "software") {
+    return targetFps * 0.45;
+  }
+  return targetFps * 0.6;
+}
+
+function maximumExpectedLatencyMs(config: TestConfig, targetFps: number): number {
+  const frameBudgetMs = 1000 / targetFps;
+  if (config.encoder_type === "openh264") {
+    return Math.max(120, frameBudgetMs * 8);
+  }
+  if (config.decoder_type === "software") {
+    return Math.max(80, frameBudgetMs * 5);
+  }
+  return Math.max(100, frameBudgetMs * 4);
+}
+
+function slowestPipelineStage(summary: TestRunSummary): readonly [string, number] {
+  const stages = [
+    ["encode", summary.encode_latency_p95 ?? 0],
+    ["transport", summary.transport_latency_p95 ?? 0],
+    ["decode", summary.decode_latency_p95 ?? 0],
+  ] as const;
+
+  return stages.reduce((slowest, current) =>
+    current[1] > slowest[1] ? current : slowest
+  );
 }
 
 function unsupportedMatrixReason(config: TestConfig): string | null {
-  if (config.encoder_type === "nvenc_av1" && config.decoder_type !== "none") {
-    return "NVENC AV1 currently supports encode-only matrix runs";
+  if (config.zero_copy && config.capture_type !== "dxgi") {
+    return "D3D11 shared texture path requires DXGI capture";
   }
-  if (config.encoder_type === "nvenc_av1" && config.transport_kind === "webrtc") {
-    return "WebRTC RTP matrix transport currently supports H.264 only";
+  if (config.zero_copy && config.encoder_type !== "nvenc_h264") {
+    return "D3D11 shared texture input currently requires NVENC H.264";
+  }
+  if (config.encoder_type === "nvenc_av1" && config.zero_copy) {
+    return "NVENC AV1 D3D11 shared input path is not implemented yet";
+  }
+  if (config.encoder_type === "nvenc_av1" && config.decoder_type === "software") {
+    return "NVENC AV1 currently requires NVDEC or encode-only matrix runs";
   }
   if (config.zero_copy && config.decoder_type !== "nvdec") {
     return "D3D11 shared texture path requires NVDEC";
   }
   if (config.zero_copy && (config.renderer_type !== "d3d11" || !config.render_display)) {
     return "D3D11 shared texture path requires DX11 popup renderer";
+  }
+  return null;
+}
+
+function capabilitySkipReason(config: TestConfig, message: string): string | null {
+  if (
+    config.encoder_type === "nvenc_av1" &&
+    /NVENC AV1 unavailable|AV1 codec not supported|NVENC AV1 preset query failed/i.test(message)
+  ) {
+    return message;
   }
   return null;
 }
@@ -169,8 +243,59 @@ const STATUS_LABELS: Record<MatrixTest["status"], string> = {
   skipped: "跳过",
 };
 
+function formatMs(value: number | null | undefined): string {
+  return value != null && Number.isFinite(value) ? `${value.toFixed(2)} ms` : "-";
+}
+
 interface MatrixTestPageProps {
   runDelayMs?: number;
+}
+
+function setOptionEnabled(
+  dimensions: MatrixDimension[],
+  dimensionId: string,
+  optionId: string,
+  enabled: boolean
+): MatrixDimension[] {
+  return dimensions.map((dim) =>
+    dim.id === dimensionId
+      ? {
+          ...dim,
+          options: dim.options.map((opt) =>
+            opt.id === optionId ? { ...opt, enabled } : opt
+          ),
+        }
+      : dim
+  );
+}
+
+function isOptionEnabled(
+  dimensions: MatrixDimension[],
+  dimensionId: string,
+  optionId: string
+): boolean {
+  return (
+    dimensions
+      .find((dim) => dim.id === dimensionId)
+      ?.options.some((opt) => opt.id === optionId && opt.enabled) ?? false
+  );
+}
+
+function matrixConfigKey(config: TestConfig): string {
+  return JSON.stringify({
+    capture_type: config.capture_type,
+    encoder_type: config.encoder_type,
+    decoder_type: config.decoder_type,
+    transport_kind: config.transport_kind,
+    renderer_type: config.renderer_type,
+    render_display: config.render_display,
+    zero_copy: config.zero_copy,
+    resolution: config.resolution,
+    fps: config.fps,
+    bitrate: config.bitrate,
+    duration_ms: config.duration_ms,
+    warmup_ms: config.warmup_ms,
+  });
 }
 
 export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) {
@@ -183,8 +308,8 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
   const [skippedCount, setSkippedCount] = useState(0);
 
   const toggleOption = (dimensionId: string, optionId: string) => {
-    setDimensions(
-      dimensions.map((dim) =>
+    setDimensions((current) => {
+      let next = current.map((dim) =>
         dim.id === dimensionId
           ? {
               ...dim,
@@ -193,8 +318,26 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
               ),
             }
           : dim
-      )
-    );
+      );
+
+      if (
+        dimensionId === "memory" &&
+        optionId === "d3d11_shared" &&
+        isOptionEnabled(next, "memory", "d3d11_shared")
+      ) {
+        next = setOptionEnabled(next, "renderer", "d3d11", true);
+      }
+
+      if (
+        dimensionId === "renderer" &&
+        optionId === "d3d11" &&
+        !isOptionEnabled(next, "renderer", "d3d11")
+      ) {
+        next = setOptionEnabled(next, "memory", "d3d11_shared", false);
+      }
+
+      return next;
+    });
   };
 
   const generateMatrix = () => {
@@ -205,11 +348,23 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
     if (enabledOptions.length === 0) return [];
 
     const combinations: MatrixTest[] = [];
+    const seenConfigs = new Set<string>();
     const generate = (index: number, current: MatrixOption[]) => {
       if (index >= enabledOptions.length) {
+        const config = buildConfig(current);
+        if (unsupportedMatrixReason(config)) {
+          return;
+        }
+
+        const configKey = matrixConfigKey(config);
+        if (seenConfigs.has(configKey)) {
+          return;
+        }
+        seenConfigs.add(configKey);
+
         combinations.push({
           id: `matrix_${combinations.length}`,
-          config: buildConfig(current),
+          config,
           status: "pending",
         });
         return;
@@ -336,11 +491,12 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
       const test = matrixTests[i];
       if (!test) continue;
 
-      if (unsupportedMatrixReason(test.config)) {
+      const staticSkipReason = unsupportedMatrixReason(test.config);
+      if (staticSkipReason) {
         setSkippedCount((count) => count + 1);
         setTests((prev) =>
           prev.map((t, idx) =>
-            idx === i ? { ...t, status: "skipped" as const } : t
+            idx === i ? { ...t, status: "skipped" as const, skipReason: staticSkipReason } : t
           )
         );
         continue;
@@ -353,11 +509,31 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
       );
 
       const startTime = Date.now();
-      const markFailed = (duration = Date.now() - startTime, result?: TestRunSummary) => {
+      const markFailed = (
+        duration = Date.now() - startTime,
+        result?: TestRunSummary,
+        failureReason?: string
+      ) => {
         setFailedCount((f) => f + 1);
         setTests((prev) =>
           prev.map((t, idx) =>
-            idx === i ? { ...t, status: "failed" as const, result, duration } : t
+            idx === i
+              ? {
+                  ...t,
+                  status: "failed" as const,
+                  result,
+                  duration,
+                  failureReason,
+                }
+              : t
+          )
+        );
+      };
+      const markSkipped = (skipReason: string, duration = Date.now() - startTime) => {
+        setSkippedCount((count) => count + 1);
+        setTests((prev) =>
+          prev.map((t, idx) =>
+            idx === i ? { ...t, status: "skipped" as const, skipReason, duration } : t
           )
         );
       };
@@ -370,6 +546,11 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
         });
 
         if (!result.ok) {
+          const skipReason = capabilitySkipReason(test.config, result.error.message);
+          if (skipReason) {
+            markSkipped(skipReason);
+            continue;
+          }
           markFailed();
           continue;
         }
@@ -384,7 +565,8 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
 
         const duration = Date.now() - startTime;
 
-        if (run.status === "completed" && isMatrixRunAcceptable(test.config, run.summary)) {
+        const acceptance = evaluateMatrixRun(test.config, run.summary);
+        if (run.status === "completed" && acceptance.acceptable) {
           setCompletedCount((c) => c + 1);
           setTests((prev) =>
             prev.map((t, idx) =>
@@ -399,11 +581,21 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
             )
           );
         } else {
-          markFailed(duration, run.summary);
+          markFailed(
+            duration,
+            run.summary,
+            run.summary?.error_message ?? acceptance.reason ?? run.status
+          );
         }
 
         await commands.testStopRun(activeRunId);
-      } catch {
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const skipReason = capabilitySkipReason(test.config, message);
+        if (skipReason) {
+          markSkipped(skipReason);
+          continue;
+        }
         markFailed();
         if (activeRunId) {
           await commands.testStopRun(activeRunId);
@@ -463,11 +655,7 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
                       type="checkbox"
                       checked={opt.enabled}
                       onChange={() => toggleOption(dim.id, opt.id)}
-                      disabled={
-                        isRunning ||
-                        opt.id === "winrt" ||
-                        opt.id === "synthetic"
-                      }
+                      disabled={isRunning}
                       className="rounded"
                     />
                     <span className="text-sm">{opt.name}</span>
@@ -539,7 +727,7 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
       {/* Test Results Grid */}
       {tests.length > 0 && (
         <div className="bg-card rounded-lg border overflow-x-auto">
-          <table className="w-full min-w-[1440px]">
+          <table className="w-full min-w-[1660px]">
             <thead className="bg-muted">
               <tr>
                 <th className="px-4 py-2 text-left text-sm font-medium">状态</th>
@@ -553,7 +741,9 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
                 <th className="px-4 py-2 text-left text-sm font-medium">码率</th>
                 <th className="px-4 py-2 text-left text-sm font-medium">Pipeline FPS</th>
                 <th className="px-4 py-2 text-left text-sm font-medium">Memory</th>
+                <th className="px-4 py-2 text-left text-sm font-medium">Encode P95</th>
                 <th className="px-4 py-2 text-left text-sm font-medium">Transport P95</th>
+                <th className="px-4 py-2 text-left text-sm font-medium">Decode P95</th>
                 <th className="px-4 py-2 text-left text-sm font-medium">延迟 P95</th>
                 <th className="px-4 py-2 text-left text-sm font-medium">时长</th>
               </tr>
@@ -570,9 +760,27 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
                 >
                   <td className="px-4 py-2 flex items-center gap-2">
                     {getStatusIcon(test.status)}
-                    <span className="text-xs text-muted-foreground">
-                      {STATUS_LABELS[test.status]}
-                    </span>
+                    <div className="min-w-0">
+                      <span className="text-xs text-muted-foreground">
+                        {STATUS_LABELS[test.status]}
+                      </span>
+                      {test.skipReason && (
+                        <div
+                          className="max-w-[220px] truncate text-[11px] text-muted-foreground"
+                          title={test.skipReason}
+                        >
+                          {test.skipReason}
+                        </div>
+                      )}
+                      {test.failureReason && (
+                        <div
+                          className="max-w-[260px] truncate text-[11px] text-destructive"
+                          title={test.failureReason}
+                        >
+                          {test.failureReason}
+                        </div>
+                      )}
+                    </div>
                   </td>
                   <td className="px-4 py-2 text-sm">{test.config.capture_type}</td>
                   <td className="px-4 py-2 text-sm">{test.config.encoder_type}</td>
@@ -595,14 +803,16 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
                     {test.config.zero_copy ? "d3d11_shared" : "cpu"}
                   </td>
                   <td className="px-4 py-2 text-sm">
-                    {test.result?.transport_latency_p95
-                      ? `${test.result.transport_latency_p95.toFixed(2)} ms`
-                      : "-"}
+                    {formatMs(test.result?.encode_latency_p95)}
                   </td>
                   <td className="px-4 py-2 text-sm">
-                    {test.result?.total_latency_p95
-                      ? `${test.result.total_latency_p95.toFixed(2)} ms`
-                      : "-"}
+                    {formatMs(test.result?.transport_latency_p95)}
+                  </td>
+                  <td className="px-4 py-2 text-sm">
+                    {formatMs(test.result?.decode_latency_p95)}
+                  </td>
+                  <td className="px-4 py-2 text-sm">
+                    {formatMs(test.result?.total_latency_p95)}
                   </td>
                   <td className="px-4 py-2 text-sm">
                     {test.duration ? `${(test.duration / 1000).toFixed(1)}s` : "-"}

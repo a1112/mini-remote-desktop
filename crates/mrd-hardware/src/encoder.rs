@@ -173,10 +173,7 @@ pub fn choose_encoder_backend(config: EncoderSelectorConfig) -> EncoderSelection
         );
 
         if !descriptor.is_available() {
-            logs.push(format!(
-                "Encoder '{}' is not available",
-                backend
-            ));
+            logs.push(format!("Encoder '{}' is not available", backend));
 
             // If this was explicitly requested and not available, check fallback
             if config.requested_backend == Some(backend) {
@@ -211,9 +208,7 @@ pub fn choose_encoder_backend(config: EncoderSelectorConfig) -> EncoderSelection
             #[cfg(feature = "openh264")]
             VideoEncoderBackend::OpenH264 => Ok(()),
             #[cfg(not(feature = "nvenc"))]
-            VideoEncoderBackend::Nvenc => {
-                Err(PipelineError::message("nvenc feature not enabled"))
-            }
+            VideoEncoderBackend::Nvenc => Err(PipelineError::message("nvenc feature not enabled")),
             #[cfg(not(feature = "openh264"))]
             VideoEncoderBackend::OpenH264 => {
                 Err(PipelineError::message("openh264 feature not enabled"))
@@ -230,10 +225,7 @@ pub fn choose_encoder_backend(config: EncoderSelectorConfig) -> EncoderSelection
                 };
             }
             Err(e) => {
-                logs.push(format!(
-                    "Encoder '{}' probe failed: {}",
-                    backend, e
-                ));
+                logs.push(format!("Encoder '{}' probe failed: {}", backend, e));
 
                 // If this was explicitly requested, check fallback
                 if config.requested_backend == Some(backend) {
@@ -315,8 +307,8 @@ mod tests {
 
     #[test]
     fn encoder_selector_config_with_backend_sets_backend() {
-        let config = EncoderSelectorConfig::new(1280, 720, 30)
-            .with_backend(VideoEncoderBackend::OpenH264);
+        let config =
+            EncoderSelectorConfig::new(1280, 720, 30).with_backend(VideoEncoderBackend::OpenH264);
         assert_eq!(
             config.requested_backend,
             Some(VideoEncoderBackend::OpenH264)
@@ -332,8 +324,8 @@ mod tests {
 
     #[test]
     fn choose_encoder_backend_returns_selection() {
-        let config = EncoderSelectorConfig::new(1920, 1080, 30)
-            .with_backend(VideoEncoderBackend::OpenH264);
+        let config =
+            EncoderSelectorConfig::new(1920, 1080, 30).with_backend(VideoEncoderBackend::OpenH264);
         let selection = choose_encoder_backend(config);
         assert_eq!(selection.backend, VideoEncoderBackend::OpenH264);
         assert!(!selection.using_hardware);

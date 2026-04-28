@@ -9,6 +9,7 @@ use openh264::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodecKind {
     H264,
+    Av1,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,14 +43,26 @@ const NVDEC_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
     output_formats: RGB24_OUTPUTS,
 };
 
+const NVDEC_AV1_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
+    id: "nvdec_av1",
+    codec: CodecKind::Av1,
+    runtime_status: RuntimeStatus::RuntimeBacked,
+    output_formats: RGB24_OUTPUTS,
+};
+
 pub fn available_decoder_descriptors() -> Vec<DecoderDescriptor> {
-    vec![H264_SOFTWARE_DESCRIPTOR.clone(), NVDEC_DESCRIPTOR.clone()]
+    vec![
+        H264_SOFTWARE_DESCRIPTOR.clone(),
+        NVDEC_DESCRIPTOR.clone(),
+        NVDEC_AV1_DESCRIPTOR.clone(),
+    ]
 }
 
 pub fn create_decoder(id: &str) -> Result<Box<dyn VideoDecoder>, PipelineError> {
     match id {
         "h264_software" => Ok(Box::new(H264SoftwareDecoder::new()?)),
         "nvdec" => Ok(Box::new(NvdecVideoDecoder::new()?)),
+        "nvdec_av1" => Ok(Box::new(NvdecVideoDecoder::new_av1()?)),
         other => Err(PipelineError::Message(format!(
             "unknown decoder backend: {other}"
         ))),
@@ -69,6 +82,14 @@ impl NvdecVideoDecoder {
     pub fn new() -> Result<Self, PipelineError> {
         let decoder = mrd_decode_nvdec::NvdecDecoder::new()
             .map_err(|e| PipelineError::Message(format!("nvdec create failed: {e}")))?;
+        Ok(Self { decoder })
+    }
+
+    pub fn new_av1() -> Result<Self, PipelineError> {
+        let decoder = mrd_decode_nvdec::NvdecDecoder::new_av1_with_output_mode(
+            mrd_decode_nvdec::NvdecOutputMode::CpuRgb24,
+        )
+        .map_err(|e| PipelineError::Message(format!("nvdec av1 create failed: {e}")))?;
         Ok(Self { decoder })
     }
 }

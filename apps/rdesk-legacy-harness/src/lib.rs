@@ -28,10 +28,10 @@ pub mod render_host;
 pub mod render_surface_catalog;
 pub mod session_lifecycle;
 pub mod session_runtime;
+pub mod test_helpers;
 pub mod webrtc_host;
 pub mod webrtc_media;
 pub mod webrtc_session;
-pub mod test_helpers;
 
 // Re-export commonly used types from legacy modules
 pub use app_settings::*;
@@ -42,6 +42,8 @@ pub use quic_session::{QuicSessionCoordinator, QuicSessionSnapshot};
 pub use realtime_runtime::{RealtimeRegistration, RealtimeRuntime};
 pub use render_host::{RenderHost, RenderHostSnapshot};
 pub use render_surface_catalog::{RenderSurfaceCatalog, RenderSurfaceDescriptor};
-pub use session_lifecycle::{SessionLifecycleCoordinator, SessionLifecycleSnapshot, SurfaceSourceBinding};
+pub use session_lifecycle::{
+    SessionLifecycleCoordinator, SessionLifecycleSnapshot, SurfaceSourceBinding,
+};
 pub use webrtc_host::{WebrtcHost, WebrtcHostSnapshot};
 pub use webrtc_session::{WebrtcSessionCoordinator, WebrtcSessionSnapshot};

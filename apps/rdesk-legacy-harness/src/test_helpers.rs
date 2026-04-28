@@ -5,14 +5,11 @@
 
 use crate::app_settings::{save_settings, AppSettings, DecodePolicy};
 use crate::{
-    DecodedFrameSink, DecodedFrameSnapshot,
-    QuicHost, QuicHostSnapshot,
-    QuicSessionCoordinator, QuicSessionSnapshot,
-    RealtimeRegistration, RealtimeRuntime,
-    RenderHost, RenderHostSnapshot, RenderSurfaceDescriptor,
-    SessionLifecycleCoordinator, SessionLifecycleSnapshot, SurfaceSourceBinding,
-    WebrtcHost, WebrtcHostSnapshot,
-    WebrtcSessionCoordinator, WebrtcSessionSnapshot,
+    DecodedFrameSink, DecodedFrameSnapshot, QuicHost, QuicHostSnapshot, QuicSessionCoordinator,
+    QuicSessionSnapshot, RealtimeRegistration, RealtimeRuntime, RenderHost, RenderHostSnapshot,
+    RenderSurfaceDescriptor, SessionLifecycleCoordinator, SessionLifecycleSnapshot,
+    SurfaceSourceBinding, WebrtcHost, WebrtcHostSnapshot, WebrtcSessionCoordinator,
+    WebrtcSessionSnapshot,
 };
 
 use image::{codecs::png::PngEncoder, ColorType, ImageEncoder};
@@ -254,7 +251,11 @@ pub fn webrtc_host_snapshot_response(snapshot: &WebrtcHostSnapshot) -> WebrtcHos
         last_decoded_width: snapshot.last_decoded_width,
         last_decoded_height: snapshot.last_decoded_height,
         last_decoded_pixel_format: snapshot.last_decoded_pixel_format.clone(),
-        decode_policy: snapshot.decode_policy.as_deref().unwrap_or("auto").to_string(),
+        decode_policy: snapshot
+            .decode_policy
+            .as_deref()
+            .unwrap_or("auto")
+            .to_string(),
         preferred_decode_backend: snapshot.preferred_decode_backend.clone(),
         active_decode_backend: snapshot.active_decode_backend.clone(),
         decode_backend_reason: snapshot.decode_backend_reason.clone(),
@@ -309,7 +310,9 @@ pub fn decoded_frame_snapshot_response(
     }
 }
 
-pub fn render_host_snapshot_response(snapshot: crate::render_host::RenderHostSnapshot) -> RenderHostSnapshotResponse {
+pub fn render_host_snapshot_response(
+    snapshot: crate::render_host::RenderHostSnapshot,
+) -> RenderHostSnapshotResponse {
     RenderHostSnapshotResponse {
         attached: snapshot.attached,
         surface_count: snapshot.surface_count,
@@ -524,10 +527,10 @@ pub async fn apply_realtime_events_to_session_coordinators(
                         request.quic_cert_der_b64.clone(),
                     )?;
                 } else {
-                    webrtc_sessions.lock().await.create_local_offer(
-                        request.session_id.clone(),
-                        String::new(),
-                    )?;
+                    webrtc_sessions
+                        .lock()
+                        .await
+                        .create_local_offer(request.session_id.clone(), String::new())?;
                 }
                 last_session_id = Some(request.session_id);
             }
@@ -543,25 +546,25 @@ pub async fn apply_realtime_events_to_session_coordinators(
                         accept.quic_cert_der_b64.clone(),
                     )?;
                 } else {
-                    webrtc_sessions.lock().await.apply_remote_offer(
-                        accept.session_id.clone(),
-                        String::new(),
-                    )?;
+                    webrtc_sessions
+                        .lock()
+                        .await
+                        .apply_remote_offer(accept.session_id.clone(), String::new())?;
                 }
                 last_session_id = Some(accept.session_id);
             }
             SignalMessage::WebrtcOffer(offer) => {
-                webrtc_sessions.lock().await.apply_remote_offer(
-                    offer.session_id.clone(),
-                    offer.sdp,
-                )?;
+                webrtc_sessions
+                    .lock()
+                    .await
+                    .apply_remote_offer(offer.session_id.clone(), offer.sdp)?;
                 last_session_id = Some(offer.session_id);
             }
             SignalMessage::WebrtcAnswer(answer) => {
-                webrtc_sessions.lock().await.apply_remote_answer(
-                    answer.session_id.clone(),
-                    answer.sdp,
-                )?;
+                webrtc_sessions
+                    .lock()
+                    .await
+                    .apply_remote_answer(answer.session_id.clone(), answer.sdp)?;
                 last_session_id = Some(answer.session_id);
             }
             SignalMessage::IceCandidate(candidate) => {
@@ -620,7 +623,10 @@ pub async fn prepare_quic_accept_with(
     ))
 }
 
-pub fn spawn_quic_accept_completion(quic_host: std::sync::Arc<Mutex<QuicHost>>, session_id: SessionId) {
+pub fn spawn_quic_accept_completion(
+    quic_host: std::sync::Arc<Mutex<QuicHost>>,
+    session_id: SessionId,
+) {
     tokio::spawn(async move {
         let _ = quic_host.lock().await.accept_peer(session_id).await;
     });

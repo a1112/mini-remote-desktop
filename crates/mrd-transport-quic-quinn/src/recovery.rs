@@ -122,13 +122,7 @@ impl ReconnectableEndpoint {
             let notify = self.notify.clone();
 
             tokio::spawn(async move {
-                Self::reconnection_task(
-                    state,
-                    endpoint,
-                    bootstrap,
-                    config,
-                    notify,
-                ).await;
+                Self::reconnection_task(state, endpoint, bootstrap, config, notify).await;
             });
         }
 
@@ -140,7 +134,7 @@ impl ReconnectableEndpoint {
         let bind_addr = "127.0.0.1:0";
         let endpoint = tokio::time::timeout(
             self.config.connection_timeout,
-            QuinnDatagramEndpoint::connect_client(bind_addr, &self.bootstrap)
+            QuinnDatagramEndpoint::connect_client(bind_addr, &self.bootstrap),
         )
         .await
         .map_err(|_| ReconnectError::Timeout)?
@@ -238,7 +232,7 @@ impl ReconnectableEndpoint {
         let bind_addr = "127.0.0.1:0";
         let new_endpoint = tokio::time::timeout(
             config.connection_timeout,
-            QuinnDatagramEndpoint::connect_client(bind_addr, bootstrap)
+            QuinnDatagramEndpoint::connect_client(bind_addr, bootstrap),
         )
         .await
         .map_err(|_| ReconnectError::Timeout)?
@@ -255,7 +249,11 @@ impl ReconnectableEndpoint {
     /// Calculate exponential backoff duration
     fn calculate_backoff(config: &ReconnectConfig, attempt: u32) -> Duration {
         let base_ms = config.initial_backoff.as_millis() as f64;
-        let multiplier = f64::from(config.backoff_multiplier.powi(attempt.saturating_sub(1) as i32));
+        let multiplier = f64::from(
+            config
+                .backoff_multiplier
+                .powi(attempt.saturating_sub(1) as i32),
+        );
         let backoff_ms = (base_ms * multiplier).min(config.max_backoff.as_millis() as f64);
         Duration::from_millis(backoff_ms as u64)
     }
@@ -440,7 +438,11 @@ pub struct HealthMonitor {
 
 impl HealthMonitor {
     /// Create a new health monitor
-    pub fn new(endpoint: Arc<ReconnectableEndpoint>, check_interval: Duration, idle_timeout: Duration) -> Self {
+    pub fn new(
+        endpoint: Arc<ReconnectableEndpoint>,
+        check_interval: Duration,
+        idle_timeout: Duration,
+    ) -> Self {
         Self {
             endpoint,
             check_interval,

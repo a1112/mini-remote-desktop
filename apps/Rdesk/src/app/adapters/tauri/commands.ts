@@ -13,6 +13,7 @@ import type {
   AdapterResult,
   ClientDiagnostics,
   DeviceInfo,
+  LanDiscoverySnapshot,
   DeviceRegistrationResponse,
   DecodePolicy,
   DecodePolicyResponse,
@@ -37,6 +38,9 @@ import type {
   TestPreset,
   EnvironmentSnapshot,
   WindowCaptureTarget,
+  RemoteDisplayWindowContext,
+  NativeSurfaceRect,
+  NativeRenderSurfaceSnapshot,
   TestMatrixConfig,
 } from './types';
 
@@ -96,6 +100,53 @@ export async function setWindowDecorations(
 
 export async function applyNativeChrome(): Promise<AdapterResult<NativeBackdropStatus>> {
   return invokeAdapter<NativeBackdropStatus>('apply_native_chrome');
+}
+
+export async function openRemoteDisplayWindow(params: {
+  sessionId: string;
+  surfaceId?: string | null;
+}): Promise<AdapterResult<RemoteDisplayWindowContext>> {
+  return invokeAdapter<RemoteDisplayWindowContext>('open_remote_display_window', {
+    sessionId: params.sessionId,
+    surfaceId: params.surfaceId ?? null,
+  });
+}
+
+export async function listRemoteDisplayWindows(
+  sessionId: string
+): Promise<AdapterResult<RemoteDisplayWindowContext[]>> {
+  return invokeAdapter<RemoteDisplayWindowContext[]>('list_remote_display_windows', {
+    sessionId,
+  });
+}
+
+export async function currentRemoteDisplayWindowContext(): Promise<
+  AdapterResult<RemoteDisplayWindowContext | null>
+> {
+  return invokeAdapter<RemoteDisplayWindowContext | null>(
+    'current_remote_display_window_context'
+  );
+}
+
+export async function closeRemoteDisplayWindow(
+  label: string
+): Promise<AdapterResult<void>> {
+  return invokeAdapter<void>('close_remote_display_window', { label });
+}
+
+export async function configureRemoteDisplayNativeSurface(params: {
+  rect: NativeSurfaceRect;
+  enabled: boolean;
+  visible?: boolean;
+}): Promise<AdapterResult<NativeRenderSurfaceSnapshot>> {
+  return invokeAdapter<NativeRenderSurfaceSnapshot>(
+    'configure_remote_display_native_surface',
+    params
+  );
+}
+
+export async function presentTestHarnessFrameOnNativeSurface(): Promise<AdapterResult<boolean>> {
+  return invokeAdapter<boolean>('present_test_harness_frame_on_native_surface');
 }
 
 export async function getClientDiagnostics(): Promise<AdapterResult<ClientDiagnostics>> {
@@ -223,6 +274,20 @@ export async function ipcRegisterDevice(
  */
 export async function ipcListDevices(): Promise<AdapterResult<DeviceInfo[]>> {
   return invokeAdapter<DeviceInfo[]>('ipc_list_devices');
+}
+
+/**
+ * Get LAN P2P discovery snapshot via IPC.
+ */
+export async function ipcLanDiscoverySnapshot(): Promise<AdapterResult<LanDiscoverySnapshot>> {
+  return invokeAdapter<LanDiscoverySnapshot>('ipc_lan_discovery_snapshot');
+}
+
+/**
+ * Trigger immediate LAN P2P discovery probe via IPC.
+ */
+export async function ipcRefreshLanDiscovery(): Promise<AdapterResult<LanDiscoverySnapshot>> {
+  return invokeAdapter<LanDiscoverySnapshot>('ipc_refresh_lan_discovery');
 }
 
 // ============================================================================
@@ -464,6 +529,17 @@ export async function testGetCapabilities(): Promise<AdapterResult<EnvironmentSn
  */
 export async function testListWindowCaptureTargets(): Promise<AdapterResult<WindowCaptureTarget[]>> {
   return invokeAdapter<WindowCaptureTarget[]>('test_list_window_capture_targets');
+}
+
+/**
+ * List WinRT window capture targets with best-effort screenshot previews.
+ */
+export async function testListWindowCaptureTargetsWithPreviews(
+  limit = 24
+): Promise<AdapterResult<WindowCaptureTarget[]>> {
+  return invokeAdapter<WindowCaptureTarget[]>('test_list_window_capture_targets_with_previews', {
+    limit,
+  });
 }
 
 /**

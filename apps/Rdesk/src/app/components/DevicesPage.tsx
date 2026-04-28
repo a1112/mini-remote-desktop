@@ -4,6 +4,7 @@ import {
   Plus,
   Search,
   MoreVertical,
+  Monitor,
   Star,
   Trash2,
   Edit2,
@@ -25,6 +26,10 @@ import { NetworkGroupSelector } from "./NetworkGroupSelector";
 import { NetworkGroupEditModal } from "./NetworkGroupEditModal";
 import { useNetworkGroups } from "../hooks/useNetworkGroups";
 import { networkGroupService } from "../services/networkGroupService";
+import {
+  launchLocalRemoteDisplayTest,
+  launchRemoteDisplayForDevice,
+} from "../services/remoteDisplayLauncher";
 
 export function DevicesPage() {
   const { isDark } = useTheme();
@@ -45,6 +50,7 @@ export function DevicesPage() {
   const [createGroupModalOpen, setCreateGroupModalOpen] = useState(false);
   const [newGroupName, setNewGroupName] = useState("");
   const [newGroupDescription, setNewGroupDescription] = useState("");
+  const [launchingDeviceId, setLaunchingDeviceId] = useState<string | null>(null);
 
   // 右键菜单状态
   const [contextMenu, setContextMenu] = useState<{
@@ -163,6 +169,36 @@ export function DevicesPage() {
     setCreateGroupModalOpen(true);
   };
 
+  const handleOpenRemoteWindow = async (device: Device) => {
+    setLaunchingDeviceId(device.id);
+    try {
+      const result = await launchRemoteDisplayForDevice(device.deviceId, {
+        transportKind: device.os.toLowerCase().includes("quic") ? "quic" : "webrtc",
+        targetDeviceName: device.name,
+        targetOs: device.os,
+        targetIp: device.ip,
+      });
+      if (result.mode === "route") navigate(`/session/${result.sessionId}`);
+    } catch (error) {
+      alert(error instanceof Error ? error.message : "Open remote display failed");
+    } finally {
+      setLaunchingDeviceId(null);
+      setContextMenu(null);
+    }
+  };
+
+  const handleOpenLocalTestWindow = async () => {
+    setLaunchingDeviceId("__local_test__");
+    try {
+      const result = await launchLocalRemoteDisplayTest();
+      if (result.mode === "route") navigate(`/session/${result.sessionId}`);
+    } catch (error) {
+      alert(error instanceof Error ? error.message : "Open local test display failed");
+    } finally {
+      setLaunchingDeviceId(null);
+    }
+  };
+
   if (loading) {
     return (
       <div className={`flex items-center justify-center h-full ${textPrimary}`}>
@@ -254,6 +290,19 @@ export function DevicesPage() {
             title="刷新"
           >
             <RefreshCw className="w-5 h-5" />
+          </button>
+          <button
+            onClick={handleOpenLocalTestWindow}
+            disabled={launchingDeviceId === "__local_test__"}
+            className={`flex items-center gap-2 px-3.5 py-1.5 rounded-lg border transition-colors ${
+              isDark
+                ? "bg-[#232323] border-gray-600 text-gray-200 hover:border-gray-500"
+                : "bg-white border-gray-200 text-gray-700 hover:border-gray-300"
+            } disabled:cursor-not-allowed disabled:opacity-60`}
+            style={{ fontSize: 13 }}
+          >
+            <Monitor className="w-3.5 h-3.5" />
+            {launchingDeviceId === "__local_test__" ? "Opening..." : "本机测试窗口"}
           </button>
           <button
             className="flex items-center gap-2 px-3.5 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white transition-colors shadow-sm"
@@ -439,6 +488,23 @@ export function DevicesPage() {
                 )}
 
                 {device.status === "online" ? (
+                  <>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        void handleOpenRemoteWindow(device);
+                      }}
+                      disabled={launchingDeviceId === device.id}
+                      className={`w-full mb-2 py-2 rounded-lg transition-colors flex items-center justify-center gap-1.5 ${
+                        isDark
+                          ? "bg-emerald-900/30 hover:bg-emerald-900/50 text-emerald-300"
+                          : "bg-emerald-50 hover:bg-emerald-100 text-emerald-700"
+                      } disabled:cursor-not-allowed disabled:opacity-60`}
+                      style={{ fontSize: 13 }}
+                    >
+                      <Monitor className="w-3.5 h-3.5" />
+                      {launchingDeviceId === device.id ? "Opening..." : "P2P 连接"}
+                    </button>
                   <button
                     onClick={(e) => {
                       e.stopPropagation();
@@ -454,6 +520,7 @@ export function DevicesPage() {
                     <ExternalLink className="w-3.5 h-3.5" />
                     查看详情
                   </button>
+                  </>
                 ) : (
                   <div
                     className={`w-full py-2 rounded-lg text-center flex items-center justify-center gap-1.5 ${
@@ -486,8 +553,7 @@ export function DevicesPage() {
             <>
               <button
                 onClick={() => {
-                  navigate(`/devices/${contextMenu.deviceId}`);
-                  setContextMenu(null);
+                  void handleOpenRemoteWindow(contextMenuDevice);
                 }}
                 className={`w-full flex items-center gap-2.5 px-3 py-1.5 text-left transition-colors ${
                   isDark ? "text-gray-300 hover:bg-gray-700" : "text-gray-600 hover:bg-gray-50"

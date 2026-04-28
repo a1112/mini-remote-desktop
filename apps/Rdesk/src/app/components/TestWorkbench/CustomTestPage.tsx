@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useNavigate } from "react-router";
 import { Play, Settings, Monitor, Cpu, Zap } from "lucide-react";
 import * as commands from "../../adapters/tauri/commands";
@@ -39,6 +39,12 @@ const CAPTURE_OPTIONS: CaptureOption[] = [
     id: "winrt",
     name: "WinRT",
     description: "Windows Runtime - 现代化屏幕捕获 API",
+    icon: <Monitor className="h-5 w-5" />,
+  },
+  {
+    id: "synthetic",
+    name: "Synthetic",
+    description: "Synthetic frame generator - baseline pipeline input",
     icon: <Monitor className="h-5 w-5" />,
   },
 ];
@@ -103,9 +109,52 @@ export function CustomTestPage() {
   const [selectedFps, setSelectedFps] = useState(60);
   const [selectedBitrate, setSelectedBitrate] = useState("5000");
   const [starting, setStarting] = useState(false);
+  const [availableEncoders, setAvailableEncoders] = useState<string[] | null>(null);
+  const [startError, setStartError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    commands.testGetCapabilities().then((result) => {
+      if (!cancelled && result.ok) {
+        setAvailableEncoders(result.value.available_encoders);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const isEncoderAvailable = (encoder: EncoderId) => {
+    if (availableEncoders === null) {
+      return encoder !== "nvenc_av1";
+    }
+    return availableEncoders.includes(encoder);
+  };
+
+  const blockedReason = () => {
+    if (!isEncoderAvailable(selectedEncoder)) {
+      if (selectedEncoder === "nvenc_av1") {
+        return "当前 GPU/驱动未暴露 NVENC AV1 编码能力。RTX 30 系通常支持 AV1 解码，但不支持 AV1 NVENC 编码。";
+      }
+      return "当前环境未暴露所选编码器能力。";
+    }
+    if (selectedEncoder === "nvenc_av1" && selectedDecoder === "software") {
+      return "NVENC AV1 当前只支持 NVDEC 或 encode-only 链路，软件 AV1 解码链路尚未接入。";
+    }
+    return null;
+  };
 
   const handleStart = async () => {
+    const reason = blockedReason();
+    if (reason) {
+      setStartError(reason);
+      return;
+    }
+
     setStarting(true);
+    setStartError(null);
 
     const config: TestConfig = {
       capture_type: selectedCapture,
@@ -129,17 +178,15 @@ export function CustomTestPage() {
 
     if (result.ok) {
       navigate(`/test/run/${result.value}`);
+    } else {
+      setStartError(result.error.message);
     }
 
     setStarting(false);
   };
 
   const canStart = () => {
-    // Check for incompatible combinations
-    if (selectedEncoder === "nvenc_av1") {
-      return false; // AV1 not yet implemented
-    }
-    return true;
+    return blockedReason() === null;
   };
 
   return (
@@ -223,14 +270,18 @@ export function CustomTestPage() {
         <div className="bg-card rounded-lg border p-4">
           <h3 className="font-medium mb-3">编码器</h3>
           <div className="space-y-2">
-            {ENCODER_OPTIONS.map((option) => (
+            {ENCODER_OPTIONS.map((option) => {
+              const available = isEncoderAvailable(option.id);
+              const isAv1Unavailable = option.id === "nvenc_av1" && !available;
+
+              return (
               <label
                 key={option.id}
                 className={`flex items-start gap-3 p-3 rounded cursor-pointer border transition-colors ${
                   selectedEncoder === option.id
                     ? "bg-primary/10 border-primary"
                     : "bg-background hover:bg-muted"
-                } ${option.id === "nvenc_av1" ? "opacity-50" : ""}`}
+                } ${!available ? "opacity-50" : ""}`}
               >
                 <input
                   type="radio"
@@ -239,22 +290,28 @@ export function CustomTestPage() {
                   checked={selectedEncoder === option.id}
                   onChange={(e) => setSelectedEncoder(e.target.value as EncoderId)}
                   className="mt-1"
-                  disabled={option.id === "nvenc_av1"}
+                  disabled={!available}
                 />
                 <div className="flex-1">
                   <div className="flex items-center gap-2 font-medium text-sm">
                     {option.icon}
                     {option.name}
-                    {option.id === "nvenc_av1" && (
+                    {isAv1Unavailable && (
                       <span className="text-xs bg-yellow-100 text-yellow-800 px-1 rounded">
-                        即将推出
+                        GPU 不支持
                       </span>
                     )}
                   </div>
                   <p className="text-xs text-muted-foreground mt-1">{option.description}</p>
+                  {isAv1Unavailable && (
+                    <p className="text-xs text-yellow-700 mt-1">
+                      当前机器没有 AV1 NVENC 编码能力
+                    </p>
+                  )}
                 </div>
               </label>
-            ))}
+              );
+            })}
           </div>
         </div>
 
@@ -357,7 +414,12 @@ export function CustomTestPage() {
 
       {!canStart() && (
         <p className="text-center text-sm text-yellow-600 mt-4">
-          当前配置暂不支持（AV1 编码器即将推出）
+          {blockedReason()}
+        </p>
+      )}
+      {startError && (
+        <p className="text-center text-sm text-red-600 mt-4">
+          {startError}
         </p>
       )}
     </div>

@@ -129,8 +129,8 @@ impl DecodedFrameSink {
 
 #[cfg(test)]
 mod tests {
-    use mrd_pipeline_core::DecodedFrame;
     use mrd_decode::PixelFormat;
+    use mrd_pipeline_core::DecodedFrame;
     use mrd_proto::SessionId;
 
     use super::DecodedFrameSink;

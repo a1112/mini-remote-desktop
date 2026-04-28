@@ -45,8 +45,8 @@ unsafe fn rgb24_to_bgra_sse2_impl(src: &[u8], dst: &mut [u8], pixels: usize) {
         // Pixel 1: R1 G1 B1 -> B1 G1 R1 A
         // Pixel 2: R2 G2 B2 -> B2 G2 R2 A
         let bgra = [
-            rgb[2], rgb[1], rgb[0], 0xFF,  // Pixel 1
-            rgb[5], rgb[4], rgb[3], 0xFF,  // Pixel 2
+            rgb[2], rgb[1], rgb[0], 0xFF, // Pixel 1
+            rgb[5], rgb[4], rgb[3], 0xFF, // Pixel 2
         ];
 
         *(dst_ptr.add(dst_offset) as *mut [u8; 8]) = bgra;
@@ -95,10 +95,10 @@ mod tests {
     #[test]
     fn test_rgb24_to_bgra_correctness() {
         let src = vec![
-            255, 0, 0,    // Red
-            0, 255, 0,    // Green
-            0, 0, 255,    // Blue
-            255, 255, 0,  // Yellow
+            255, 0, 0, // Red
+            0, 255, 0, // Green
+            0, 0, 255, // Blue
+            255, 255, 0, // Yellow
         ];
         let mut dst = vec![0_u8; 16];
 
@@ -116,7 +116,7 @@ mod tests {
 
     #[test]
     fn test_rgb24_to_bgra_odd_pixels() {
-        let src = vec![100, 150, 200];  // 1 pixel
+        let src = vec![100, 150, 200]; // 1 pixel
         let mut dst = vec![0_u8; 4];
 
         rgb24_to_bgra(&src, &mut dst, 1, 1);

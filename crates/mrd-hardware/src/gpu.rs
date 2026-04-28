@@ -118,19 +118,29 @@ fn detect_gpu_caps_windows() -> GpuCaps {
         let name_lower = name.to_lowercase();
 
         // Check for NVIDIA
-        if name_lower.contains("nvidia") || name_lower.contains("geforce") || name_lower.contains("quadro") || name_lower.contains("tesla") || name_lower.contains("rtx") {
+        if name_lower.contains("nvidia")
+            || name_lower.contains("geforce")
+            || name_lower.contains("quadro")
+            || name_lower.contains("tesla")
+            || name_lower.contains("rtx")
+        {
             caps.has_nvidia = true;
             log::debug!("Detected NVIDIA GPU: {}", name.trim());
         }
 
         // Check for Intel
-        if name_lower.contains("intel") && (name_lower.contains("graphics") || name_lower.contains("iris") || name_lower.contains("arc")) {
+        if name_lower.contains("intel")
+            && (name_lower.contains("graphics")
+                || name_lower.contains("iris")
+                || name_lower.contains("arc"))
+        {
             caps.has_intel = true;
             log::debug!("Detected Intel GPU: {}", name.trim());
         }
 
         // Check for AMD
-        if name_lower.contains("amd") || name_lower.contains("radeon") || name_lower.contains("ati") {
+        if name_lower.contains("amd") || name_lower.contains("radeon") || name_lower.contains("ati")
+        {
             caps.has_amd = true;
             log::debug!("Detected AMD GPU: {}", name.trim());
         }

@@ -27,7 +27,7 @@ const ENCODER_OPTIONS: EncoderOption[] = [
     name: "NVENC AV1",
     description: "新一代 AV1 编码器，更高压缩效率",
     type: "hardware",
-    available: false,
+    available: true,
     icon: <Zap className="h-5 w-5 text-blue-500" />,
   },
   {
@@ -58,8 +58,32 @@ export function EncodeTestPage() {
   const [selectedPreset, setSelectedPreset] = useState("p1");
   const [isRunning, setIsRunning] = useState(false);
   const [metrics, setMetrics] = useState<EncoderMetrics | null>(null);
+  const [availableEncoders, setAvailableEncoders] = useState<string[] | null>(null);
+  const [startError, setStartError] = useState<string | null>(null);
 
   const selectedOption = ENCODER_OPTIONS.find((o) => o.id === selectedEncoder);
+  const isEncoderAvailable = (option: EncoderOption) => {
+    if (!option.available) return false;
+    if (availableEncoders === null) {
+      return option.id !== "nvenc_av1";
+    }
+    return availableEncoders.includes(option.id);
+  };
+  const selectedAvailable = selectedOption ? isEncoderAvailable(selectedOption) : false;
+
+  useEffect(() => {
+    let cancelled = false;
+
+    commands.testGetCapabilities().then((result) => {
+      if (!cancelled && result.ok) {
+        setAvailableEncoders(result.value.available_encoders);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     if (!isRunning) return;
@@ -85,19 +109,50 @@ export function EncodeTestPage() {
   }, [isRunning]);
 
   const handleStart = async () => {
-    if (!selectedOption?.available) return;
+    if (!selectedOption || !selectedAvailable) {
+      setStartError(
+        selectedEncoder === "nvenc_av1"
+          ? "当前 GPU/驱动未暴露 NVENC AV1 编码能力。RTX 30 系通常支持 AV1 解码，但不支持 AV1 NVENC 编码。"
+          : "当前环境未暴露所选编码器能力。"
+      );
+      return;
+    }
 
     setIsRunning(true);
     setMetrics(null);
+    setStartError(null);
+
+    if (selectedEncoder === "nvenc_av1") {
+      const customResult = await commands.testHarnessSetCustom({
+        capture: "dxgi",
+        encoder: "nvenc_av1",
+        decoder: "nvdec",
+      });
+      if (!customResult.ok) {
+        setIsRunning(false);
+        setStartError(customResult.error.message);
+        return;
+      }
+
+      const startResult = await commands.testHarnessStart();
+      if (!startResult.ok) {
+        setIsRunning(false);
+        setStartError(startResult.error.message);
+      }
+      return;
+    }
 
     // Map encoder to test chain
-    const chainMap: Record<EncoderType, "nvenc_nvdec" | "nvenc_only" | "openh264"> = {
+    const chainMap: Record<Exclude<EncoderType, "nvenc_av1">, "nvenc_only" | "openh264"> = {
       nvenc_h264: "nvenc_only",
-      nvenc_av1: "nvenc_only",
       openh264: "openh264",
     };
 
-    await commands.testHarnessStart(chainMap[selectedEncoder]);
+    const startResult = await commands.testHarnessStart(chainMap[selectedEncoder]);
+    if (!startResult.ok) {
+      setIsRunning(false);
+      setStartError(startResult.error.message);
+    }
   };
 
   const handleStop = async () => {
@@ -130,16 +185,19 @@ export function EncodeTestPage() {
       <div className="bg-card rounded-lg border p-4 mb-6">
         <h2 className="text-lg font-semibold mb-4">选择编码器</h2>
         <div className="grid md:grid-cols-3 gap-4">
-          {ENCODER_OPTIONS.map((option) => (
+          {ENCODER_OPTIONS.map((option) => {
+            const available = isEncoderAvailable(option);
+            const isAv1Unavailable = option.id === "nvenc_av1" && !available;
+            return (
             <button
               key={option.id}
               onClick={() => setSelectedEncoder(option.id)}
-              disabled={isRunning || !option.available}
+              disabled={isRunning || !available}
               className={`p-4 rounded-lg border-2 text-left transition-all ${
                 selectedEncoder === option.id
                   ? "border-primary bg-primary/10"
                   : "border-transparent bg-muted/30 hover:bg-muted/50"
-              } ${!option.available ? "opacity-50 cursor-not-allowed" : ""}`}
+              } ${!available ? "opacity-50 cursor-not-allowed" : ""}`}
             >
               <div className="flex items-center gap-2 mb-2">
                 {option.icon}
@@ -149,13 +207,14 @@ export function EncodeTestPage() {
               <span className="inline-block mt-2 text-xs bg-muted px-2 py-0.5 rounded">
                 {option.type === "hardware" ? "硬件加速" : "软件"}
               </span>
-              {!option.available && (
+              {isAv1Unavailable && (
                 <span className="inline-block mt-2 ml-2 text-xs bg-yellow-100 text-yellow-800 px-2 py-0.5 rounded">
-                  即将推出
+                  GPU 不支持
                 </span>
               )}
             </button>
-          ))}
+            );
+          })}
         </div>
       </div>
 
@@ -232,7 +291,7 @@ export function EncodeTestPage() {
         {!isRunning ? (
           <button
             onClick={handleStart}
-            disabled={!selectedOption?.available}
+            disabled={!selectedAvailable}
             className="flex items-center gap-2 px-6 py-3 bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 transition-colors disabled:opacity-50"
           >
             <Play className="h-5 w-5" />
@@ -248,6 +307,9 @@ export function EncodeTestPage() {
           </button>
         )}
       </div>
+      {startError && (
+        <p className="text-sm text-red-600 mb-6">{startError}</p>
+      )}
 
       {/* Metrics */}
       {metrics && (

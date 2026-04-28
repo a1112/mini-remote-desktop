@@ -7,9 +7,9 @@
 
 pub mod scheduler;
 
-use std::collections::HashMap;
 use mrd_proto::{BackendRole, DeviceId, SessionId};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Session lifecycle state - explicit state machine for session progression
 ///
@@ -37,7 +37,10 @@ pub enum SessionLifecycleState {
 impl SessionLifecycleState {
     /// Check if this is an active state (can transition to streaming)
     pub fn is_active(&self) -> bool {
-        matches!(self, Self::Listening | Self::Connecting | Self::Connected | Self::Streaming)
+        matches!(
+            self,
+            Self::Listening | Self::Connecting | Self::Connected | Self::Streaming
+        )
     }
 
     /// Check if this is a terminal state
@@ -176,7 +179,9 @@ impl QuicSessionCoordinator {
 
     /// Transition session to connected state
     pub fn set_connected(&mut self, session_id: &SessionId) -> Result<(), String> {
-        let snapshot = self.sessions.get_mut(session_id)
+        let snapshot = self
+            .sessions
+            .get_mut(session_id)
             .ok_or_else(|| format!("Session not found: {}", session_id.0))?;
         snapshot.lifecycle_state = SessionLifecycleState::Connected;
         Ok(())
@@ -184,7 +189,9 @@ impl QuicSessionCoordinator {
 
     /// Transition session to streaming state
     pub fn set_streaming(&mut self, session_id: &SessionId) -> Result<(), String> {
-        let snapshot = self.sessions.get_mut(session_id)
+        let snapshot = self
+            .sessions
+            .get_mut(session_id)
             .ok_or_else(|| format!("Session not found: {}", session_id.0))?;
         snapshot.lifecycle_state = SessionLifecycleState::Streaming;
         Ok(())
@@ -192,16 +199,22 @@ impl QuicSessionCoordinator {
 
     /// Mark session as failed
     pub fn set_failed(&mut self, session_id: &SessionId, message: String) -> Result<(), String> {
-        let snapshot = self.sessions.get_mut(session_id)
+        let snapshot = self
+            .sessions
+            .get_mut(session_id)
             .ok_or_else(|| format!("Session not found: {}", session_id.0))?;
-        snapshot.lifecycle_state = SessionLifecycleState::Failed { message: message.clone() };
+        snapshot.lifecycle_state = SessionLifecycleState::Failed {
+            message: message.clone(),
+        };
         snapshot.last_error = Some(message);
         Ok(())
     }
 
     /// Close session
     pub fn close(&mut self, session_id: &SessionId) -> Result<(), String> {
-        let snapshot = self.sessions.get_mut(session_id)
+        let snapshot = self
+            .sessions
+            .get_mut(session_id)
             .ok_or_else(|| format!("Session not found: {}", session_id.0))?;
         snapshot.lifecycle_state = SessionLifecycleState::Closed;
         Ok(())
@@ -240,7 +253,10 @@ mod tests {
         assert_eq!(snapshot.transport, "quic_quinn");
         assert_eq!(snapshot.source_device_id.as_deref(), Some("controller-1"));
         assert_eq!(snapshot.target_device_id.as_deref(), Some("agent-1"));
-        assert_eq!(snapshot.local_listen_addr.as_deref(), Some("127.0.0.1:5000"));
+        assert_eq!(
+            snapshot.local_listen_addr.as_deref(),
+            Some("127.0.0.1:5000")
+        );
         assert_eq!(snapshot.local_server_name.as_deref(), Some("localhost"));
         assert_eq!(snapshot.local_cert_der_b64.as_deref(), Some("AQID"));
         assert_eq!(snapshot.remote_listen_addr, None);
@@ -265,7 +281,10 @@ mod tests {
             .expect("quic accept snapshot");
 
         assert_eq!(snapshot.transport, "quic_quinn");
-        assert_eq!(snapshot.remote_listen_addr.as_deref(), Some("127.0.0.1:6000"));
+        assert_eq!(
+            snapshot.remote_listen_addr.as_deref(),
+            Some("127.0.0.1:6000")
+        );
         assert_eq!(snapshot.remote_server_name.as_deref(), Some("localhost"));
         assert_eq!(snapshot.remote_cert_der_b64.as_deref(), Some("BAUG"));
     }

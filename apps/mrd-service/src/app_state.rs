@@ -98,6 +98,8 @@ pub struct AppState {
     pub shell: Arc<Mutex<ShellState>>,
     /// Tray port (Phase 4)
     pub tray: TrayPortRef,
+    /// Peer-to-peer LAN discovery state.
+    pub lan_discovery: Arc<crate::lan_discovery::LanDiscoveryState>,
 }
 
 impl AppState {
@@ -113,6 +115,7 @@ impl AppState {
             devices: Arc::new(Mutex::new(DeviceRegistry::default())),
             shell: Arc::new(Mutex::new(ShellState::default())),
             tray,
+            lan_discovery: Arc::new(crate::lan_discovery::LanDiscoveryState::default()),
         }
     }
 
@@ -134,6 +137,11 @@ impl AppState {
     /// Get a clone of the tray Arc for injection into handlers
     pub fn tray(&self) -> TrayPortRef {
         self.tray.clone()
+    }
+
+    /// Get a clone of the LAN discovery state.
+    pub fn lan_discovery(&self) -> Arc<crate::lan_discovery::LanDiscoveryState> {
+        self.lan_discovery.clone()
     }
 }
 

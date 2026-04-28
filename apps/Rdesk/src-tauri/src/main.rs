@@ -5,6 +5,7 @@ mod app_settings;
 mod device_info;
 mod ipc_client;
 mod platform;
+mod remote_display_surface;
 mod render_window_registry;
 mod resource_monitor;
 mod service_manager;
@@ -16,13 +17,21 @@ use app_settings::{
 };
 use device_info::HardwareInfo;
 use mrd_ipc;
+use mrd_proto::SessionId;
+use remote_display_surface::{
+    NativeRenderSurfaceSnapshot, NativeSurfaceRect, RemoteDisplaySurfaceManager,
+};
+use render_window_registry::{PendingRenderWindow, RenderWindowContext, RenderWindowRegistry};
 use resource_monitor::{ResourceMonitor, SystemResourceSnapshot};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::Write;
+use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Manager, WebviewWindow,
+    AppHandle, Manager, WebviewWindow, WebviewWindowBuilder,
 };
 
 const TRAY_ICON_ID: &str = "rdesk-tray";
@@ -30,6 +39,9 @@ const TRAY_MENU_SHOW_ID: &str = "rdesk-tray-show";
 const TRAY_MENU_HIDE_ID: &str = "rdesk-tray-hide";
 const TRAY_MENU_CENTER_ID: &str = "rdesk-tray-center";
 const TRAY_MENU_QUIT_ID: &str = "rdesk-tray-quit";
+const SINGLE_INSTANCE_ADDR: &str = "127.0.0.1:47631";
+
+static APP_IS_QUITTING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TrayAction {
@@ -50,6 +62,9 @@ struct AppState {
     test_orchestrator: std::sync::Arc<test_orchestrator::TestOrchestrator>,
     // Lightweight resource sampler for the test workbench title bar
     resource_monitor: std::sync::Arc<std::sync::Mutex<ResourceMonitor>>,
+    // Remote display windows: frameless web chrome plus optional native DX11 surface.
+    render_window_registry: std::sync::Arc<std::sync::Mutex<RenderWindowRegistry>>,
+    remote_display_surfaces: std::sync::Arc<std::sync::Mutex<RemoteDisplaySurfaceManager>>,
 }
 
 /// 设备注册响应
@@ -86,12 +101,21 @@ fn get_hardware_info() -> Result<HardwareInfo, String> {
 async fn get_system_resource_snapshot(
     state: tauri::State<'_, AppState>,
 ) -> Result<SystemResourceSnapshot, String> {
-    let target_pid = query_service_pid().await;
+    let service_pid = query_service_pid().await;
+    let harness_running = state.test_harness.lock().unwrap().get_metrics().is_running;
+    let (target_pid, target_name) = if harness_running {
+        (Some(std::process::id()), "Rdesk Workbench")
+    } else if service_pid.is_some() {
+        (service_pid, "mrd-service")
+    } else {
+        (Some(std::process::id()), "Rdesk Workbench")
+    };
+
     Ok(state
         .resource_monitor
         .lock()
         .unwrap()
-        .snapshot_for_process(target_pid, "mrd-service"))
+        .snapshot_for_process(target_pid, target_name))
 }
 
 async fn query_service_pid() -> Option<u32> {
@@ -155,6 +179,167 @@ fn set_window_decorations(window: WebviewWindow, decorated: bool) -> Result<(), 
 #[tauri::command]
 fn apply_native_chrome(window: WebviewWindow) -> platform::NativeBackdropStatus {
     platform::configure_main_window(&window)
+}
+
+#[tauri::command]
+fn open_remote_display_window(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+    surface_id: Option<String>,
+) -> Result<RenderWindowContext, String> {
+    let spec = {
+        let mut registry = state.render_window_registry.lock().unwrap();
+        registry.reserve_window(SessionId(session_id), surface_id)?
+    };
+
+    let context = {
+        let mut registry = state.render_window_registry.lock().unwrap();
+        let session_window_count = registry.register_window(
+            spec.session_id.clone(),
+            spec.label.clone(),
+            spec.surface_id.clone(),
+        );
+        RenderWindowContext {
+            label: spec.label.clone(),
+            session_id: spec.session_id.0.clone(),
+            surface_id: spec.surface_id.clone(),
+            role: "controller".to_string(),
+            renderer_attached: false,
+            render_mode: "web".to_string(),
+            native_surface_attached: false,
+            session_window_count,
+        }
+    };
+
+    let app_for_window = app.clone();
+    std::thread::spawn(move || {
+        let build_app = app_for_window.clone();
+        if let Err(error) = app_for_window.run_on_main_thread(move || {
+            if let Err(error) = build_remote_display_window(&build_app, spec) {
+                eprintln!("{error}");
+            }
+        }) {
+            eprintln!("schedule remote display window failed: {error}");
+        }
+    });
+
+    Ok(context)
+}
+
+fn build_remote_display_window<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    spec: PendingRenderWindow,
+) -> Result<(), String> {
+    let window = WebviewWindowBuilder::new(app, spec.label.clone(), spec.url)
+        .title(format!("Rdesk Display {}", spec.session_id.0))
+        .decorations(false)
+        .resizable(true)
+        .inner_size(1280.0, 800.0)
+        .min_inner_size(720.0, 420.0)
+        .visible(false)
+        .build()
+        .map_err(|error| format!("create remote display window failed: {error}"))?;
+
+    window
+        .show()
+        .map_err(|error| format!("show remote display window failed: {error}"))?;
+    let _ = window.set_focus();
+    Ok(())
+}
+
+#[tauri::command]
+fn list_remote_display_windows(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+) -> Vec<RenderWindowContext> {
+    state
+        .render_window_registry
+        .lock()
+        .unwrap()
+        .list_window_contexts(&app, &SessionId(session_id))
+}
+
+#[tauri::command]
+fn current_remote_display_window_context(
+    window: WebviewWindow,
+    state: tauri::State<'_, AppState>,
+) -> Option<RenderWindowContext> {
+    state
+        .render_window_registry
+        .lock()
+        .unwrap()
+        .context_for_label(window.app_handle(), window.label())
+}
+
+#[tauri::command]
+fn close_remote_display_window(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    label: String,
+) -> Result<(), String> {
+    state.remote_display_surfaces.lock().unwrap().configure(
+        app.get_webview_window(&label)
+            .as_ref()
+            .ok_or_else(|| format!("remote display window not found: {label}"))?,
+        NativeSurfaceRect {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        },
+        false,
+        false,
+    )?;
+
+    state
+        .render_window_registry
+        .lock()
+        .unwrap()
+        .close_window(&app, &label)
+}
+
+#[tauri::command]
+fn configure_remote_display_native_surface(
+    window: WebviewWindow,
+    state: tauri::State<'_, AppState>,
+    rect: NativeSurfaceRect,
+    enabled: bool,
+    visible: Option<bool>,
+) -> Result<NativeRenderSurfaceSnapshot, String> {
+    let snapshot = state.remote_display_surfaces.lock().unwrap().configure(
+        &window,
+        rect,
+        enabled,
+        visible.unwrap_or(enabled),
+    )?;
+
+    let render_mode = if snapshot.attached {
+        "d3d11_native"
+    } else {
+        "web"
+    };
+    let _ = state
+        .render_window_registry
+        .lock()
+        .unwrap()
+        .set_render_mode(
+            window.app_handle(),
+            window.label(),
+            render_mode.to_string(),
+            snapshot.attached,
+        );
+
+    Ok(snapshot)
+}
+
+#[tauri::command]
+fn present_test_harness_frame_on_native_surface(
+    _window: WebviewWindow,
+    _state: tauri::State<'_, AppState>,
+) -> Result<bool, String> {
+    Ok(false)
 }
 
 #[tauri::command]
@@ -436,7 +621,7 @@ async fn shell_quit_ui_and_stop_service(app_handle: tauri::AppHandle) -> Result<
         .await;
 
     // Exit the UI application
-    app_handle.exit(0);
+    request_app_exit(&app_handle, "user_quit");
     Ok(())
 }
 
@@ -479,6 +664,42 @@ async fn ipc_list_devices() -> Result<Vec<mrd_ipc::DeviceInfo>, String> {
 
     match response {
         IpcResponse::DeviceList { devices } => Ok(devices),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+/// Get LAN peer discovery snapshot via IPC.
+#[tauri::command]
+async fn ipc_lan_discovery_snapshot() -> Result<mrd_ipc::LanDiscoverySnapshot, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::LanDiscoverySnapshot)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::LanDiscoverySnapshot { snapshot } => Ok(snapshot),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+/// Trigger a LAN discovery probe via IPC.
+#[tauri::command]
+async fn ipc_refresh_lan_discovery() -> Result<mrd_ipc::LanDiscoverySnapshot, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::RefreshLanDiscovery)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::LanDiscoverySnapshot { snapshot } => Ok(snapshot),
         IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
         _ => Err("Unexpected response".to_string()),
     }
@@ -1025,6 +1246,14 @@ fn test_list_window_capture_targets() -> Result<Vec<test_orchestrator::WindowCap
     test_orchestrator::list_window_capture_targets().map_err(|e| e.to_string())
 }
 
+/// List WinRT window capture targets and attach best-effort screenshot previews.
+#[tauri::command]
+fn test_list_window_capture_targets_with_previews(
+    limit: Option<usize>,
+) -> Result<Vec<test_orchestrator::WindowCaptureTarget>, String> {
+    test_orchestrator::list_window_capture_targets_with_previews(limit).map_err(|e| e.to_string())
+}
+
 /// Start a test run
 #[tauri::command]
 fn test_start_run(
@@ -1153,6 +1382,51 @@ fn detach_ui_async(reason: &'static str) {
     });
 }
 
+fn claim_single_instance() -> Option<TcpListener> {
+    match TcpListener::bind(SINGLE_INSTANCE_ADDR) {
+        Ok(listener) => Some(listener),
+        Err(_) => {
+            if let Ok(mut stream) = TcpStream::connect(SINGLE_INSTANCE_ADDR) {
+                let _ = stream.write_all(b"show\n");
+            }
+            None
+        }
+    }
+}
+
+fn spawn_single_instance_listener(listener: TcpListener, app: AppHandle) {
+    std::thread::spawn(move || {
+        for incoming in listener.incoming() {
+            if incoming.is_err() {
+                continue;
+            }
+            if APP_IS_QUITTING.load(Ordering::SeqCst) {
+                break;
+            }
+            if let Err(error) = show_main_window(&app) {
+                eprintln!("failed to show existing Rdesk instance: {error}");
+            }
+        }
+    });
+}
+
+fn request_app_exit(app: &AppHandle, reason: &'static str) {
+    if APP_IS_QUITTING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    detach_ui_async(reason);
+    for window in app.webview_windows().into_values() {
+        let _ = window.close();
+    }
+    app.exit(0);
+
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(750));
+        std::process::exit(0);
+    });
+}
+
 fn setup_system_tray(app: &AppHandle) -> tauri::Result<()> {
     let show_item = MenuItem::with_id(app, TRAY_MENU_SHOW_ID, "Show Rdesk", true, None::<&str>)?;
     let hide_item = MenuItem::with_id(app, TRAY_MENU_HIDE_ID, "Hide to Tray", true, None::<&str>)?;
@@ -1218,8 +1492,7 @@ fn apply_tray_action(app: &AppHandle, action: TrayAction) -> Result<(), String> 
         TrayAction::HideWindow => hide_main_window(app),
         TrayAction::CenterWindow => main_window(app)?.center().map_err(|err| err.to_string()),
         TrayAction::QuitUi => {
-            detach_ui_async("user_quit");
-            app.exit(0);
+            request_app_exit(app, "user_quit");
             Ok(())
         }
     }
@@ -1273,6 +1546,14 @@ fn main() {
         test_harness.clone(),
     ));
     let resource_monitor = std::sync::Arc::new(std::sync::Mutex::new(ResourceMonitor::new()));
+    let render_window_registry =
+        std::sync::Arc::new(std::sync::Mutex::new(RenderWindowRegistry::default()));
+    let remote_display_surfaces =
+        std::sync::Arc::new(std::sync::Mutex::new(RemoteDisplaySurfaceManager::default()));
+
+    let Some(single_instance_listener) = claim_single_instance() else {
+        return;
+    };
 
     // Build the app
     tauri::Builder::default()
@@ -1282,6 +1563,8 @@ fn main() {
             test_harness,
             test_orchestrator,
             resource_monitor,
+            render_window_registry,
+            remote_display_surfaces,
         })
         .on_menu_event(|app, event| {
             if let Some(action) = tray_action_from_menu_id(event.id().as_ref()) {
@@ -1301,7 +1584,8 @@ fn main() {
                 }
             }
         })
-        .setup(|app| {
+        .setup(move |app| {
+            spawn_single_instance_listener(single_instance_listener, app.handle().clone());
             setup_system_tray(app.handle())?;
 
             if let Some(main_window) = app.get_webview_window("main") {
@@ -1316,6 +1600,9 @@ fn main() {
                 let app_handle_for_close = app.handle().clone();
                 main_window.on_window_event(move |event| {
                     if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        if APP_IS_QUITTING.load(Ordering::SeqCst) {
+                            return;
+                        }
                         api.prevent_close();
                         if let Err(error) = hide_main_window(&app_handle_for_close) {
                             eprintln!("failed to hide Rdesk window: {error}");
@@ -1379,6 +1666,12 @@ fn main() {
             close_window,
             set_window_decorations,
             apply_native_chrome,
+            open_remote_display_window,
+            list_remote_display_windows,
+            current_remote_display_window_context,
+            close_remote_display_window,
+            configure_remote_display_native_surface,
+            present_test_harness_frame_on_native_surface,
             get_client_diagnostics,
             open_diagnostics_folder,
             nvdec_runtime_probe,
@@ -1391,6 +1684,8 @@ fn main() {
             // IPC-based commands (all session control goes through mrd-service)
             ipc_register_device,
             ipc_list_devices,
+            ipc_lan_discovery_snapshot,
+            ipc_refresh_lan_discovery,
             ipc_list_sessions,
             ipc_start_session,
             ipc_accept_session,
@@ -1425,6 +1720,7 @@ fn main() {
             test_list_scenarios,
             test_get_capabilities,
             test_list_window_capture_targets,
+            test_list_window_capture_targets_with_previews,
             test_start_run,
             test_stop_run,
             test_list_runs,

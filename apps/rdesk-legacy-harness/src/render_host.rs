@@ -215,7 +215,9 @@ impl RenderHost {
                     mrd_render::RenderFrameData::Rgb24(data) => data.len(),
                     mrd_render::RenderFrameData::Bgra32(data) => data.len(),
                     #[cfg(windows)]
-                    mrd_render::RenderFrameData::D3D11SharedNv12 { .. } => render_frame.width * render_frame.height * 3 / 2, // NV12 size
+                    mrd_render::RenderFrameData::D3D11SharedNv12 { .. } => {
+                        render_frame.width * render_frame.height * 3 / 2
+                    } // NV12 size
                 };
                 let started_at = std::time::Instant::now();
                 renderer
@@ -346,7 +348,7 @@ fn decoded_frame_to_render_frame(frame: &DecodedFrame) -> RenderFrame {
             width: frame.width,
             height: frame.height,
             pixel_format: RenderPixelFormat::Rgb24, // Will be updated to D3D11SharedNv12
-            data: RenderFrameData::Rgb24(vec![]), // Fallback for now
+            data: RenderFrameData::Rgb24(vec![]),   // Fallback for now
         },
     }
 }
@@ -370,8 +372,8 @@ fn renderer_snapshot_response(snapshot: RendererSnapshot) -> RendererSnapshotRes
 mod tests {
     use super::{RenderHost, SurfaceSourceBindingResponse};
     use crate::frame_sink::{DecodedFrameSink, DEFAULT_SOURCE_ID};
-    use mrd_pipeline_core::DecodedFrame;
     use mrd_decode::PixelFormat;
+    use mrd_pipeline_core::DecodedFrame;
     use mrd_proto::SessionId;
 
     #[test]

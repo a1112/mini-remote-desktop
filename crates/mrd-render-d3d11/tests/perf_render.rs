@@ -107,8 +107,7 @@ fn perf_d3d11_render_bgra32_vs_rgb24() {
     let rgb_total = rgb_started.elapsed();
 
     // Test BGRA32
-    let bgra_frame =
-        RenderFrame::from_bgra32(width, height, synthetic_bgra32_frame(width, height));
+    let bgra_frame = RenderFrame::from_bgra32(width, height, synthetic_bgra32_frame(width, height));
 
     let mut bgra_latencies = Vec::with_capacity(sample_count);
     let bgra_started = Instant::now();
@@ -144,14 +143,22 @@ fn perf_d3d11_render_bgra32_vs_rgb24() {
     let bgra_avg: f64 = bgra_latencies.iter().sum::<f64>() / sample_count as f64;
 
     println!("RGB24 Results:");
-    println!("  Total:  {:.2}s ({:.2} FPS)", rgb_total.as_secs_f64(), sample_count as f64 / rgb_total.as_secs_f64());
+    println!(
+        "  Total:  {:.2}s ({:.2} FPS)",
+        rgb_total.as_secs_f64(),
+        sample_count as f64 / rgb_total.as_secs_f64()
+    );
     println!("  Avg:    {:.3}ms", rgb_avg);
     println!("  P50:    {:.3}ms", rgb_p50);
     println!("  P95:    {:.3}ms", rgb_p95);
     println!("  P99:    {:.3}ms", rgb_p99);
 
     println!("\nBGRA32 Results:");
-    println!("  Total:  {:.2}s ({:.2} FPS)", bgra_total.as_secs_f64(), sample_count as f64 / bgra_total.as_secs_f64());
+    println!(
+        "  Total:  {:.2}s ({:.2} FPS)",
+        bgra_total.as_secs_f64(),
+        sample_count as f64 / bgra_total.as_secs_f64()
+    );
     println!("  Avg:    {:.3}ms", bgra_avg);
     println!("  P50:    {:.3}ms", bgra_p50);
     println!("  P95:    {:.3}ms", bgra_p95);
@@ -162,7 +169,14 @@ fn perf_d3d11_render_bgra32_vs_rgb24() {
     println!("  P50:  {:.2}%", ((rgb_p50 - bgra_p50) / rgb_p50) * 100.0);
     println!("  P95:  {:.2}%", ((rgb_p95 - bgra_p95) / rgb_p95) * 100.0);
     println!("  P99:  {:.2}%", ((rgb_p99 - bgra_p99) / rgb_p99) * 100.0);
-    println!("  FPS:  +{:.1}%", (sample_count as f64 / bgra_total.as_secs_f64() / (sample_count as f64 / rgb_total.as_secs_f64()) - 1.0) * 100.0);
+    println!(
+        "  FPS:  +{:.1}%",
+        (sample_count as f64
+            / bgra_total.as_secs_f64()
+            / (sample_count as f64 / rgb_total.as_secs_f64())
+            - 1.0)
+            * 100.0
+    );
 }
 
 #[test]
@@ -200,7 +214,11 @@ fn perf_d3d11_render_rgb24_optimized() {
     let p99 = sorted[(sample_count * 99) / 100];
 
     println!("RGB24 Optimized (SIMD) Performance: {width}x{height}, {sample_count} samples");
-    println!("  Total:  {:.2}s ({:.2} FPS)", total.as_secs_f64(), sample_count as f64 / total.as_secs_f64());
+    println!(
+        "  Total:  {:.2}s ({:.2} FPS)",
+        total.as_secs_f64(),
+        sample_count as f64 / total.as_secs_f64()
+    );
     println!("  Avg:    {:.3}ms", avg);
     println!("  P50:    {:.3}ms", p50);
     println!("  P95:    {:.3}ms", p95);
@@ -217,7 +235,9 @@ fn perf_rgb24_to_bgra_conversion() {
 
     let src: Vec<u8> = (0..pixels * 3).map(|i| (i % 256) as u8).collect();
 
-    println!("RGB24->BGRA Conversion Performance Test: {width}x{height}, {sample_count} iterations\n");
+    println!(
+        "RGB24->BGRA Conversion Performance Test: {width}x{height}, {sample_count} iterations\n"
+    );
 
     // Test scalar version
     let mut scalar_dst = vec![0_u8; pixels * 4];
@@ -257,7 +277,10 @@ fn perf_rgb24_to_bgra_conversion() {
 
     println!("\nImprovement:");
     println!("  Speedup: {:.2}x", scalar_ms / simd_ms);
-    println!("  Time saved: {:.3}ms per frame", (scalar_ms - simd_ms) / sample_count as f64);
+    println!(
+        "  Time saved: {:.3}ms per frame",
+        (scalar_ms - simd_ms) / sample_count as f64
+    );
 }
 
 fn synthetic_rgb24_frame(width: usize, height: usize) -> Vec<u8> {
@@ -275,8 +298,8 @@ fn synthetic_bgra32_frame(width: usize, height: usize) -> Vec<u8> {
     for (index, chunk) in data.chunks_exact_mut(4).enumerate() {
         chunk[0] = ((index / 3) % 255) as u8; // B
         chunk[1] = ((index / 2) % 255) as u8; // G
-        chunk[2] = (index % 255) as u8;       // R
-        chunk[3] = 255;                       // A
+        chunk[2] = (index % 255) as u8; // R
+        chunk[3] = 255; // A
     }
     data
 }
