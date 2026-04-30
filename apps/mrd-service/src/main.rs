@@ -33,13 +33,7 @@ async fn main() -> Result<()> {
     info!("mrd-service starting...");
 
     // Initialize tray (Phase 4)
-    #[cfg(windows)]
-    let tray: Arc<std::sync::Mutex<dyn shell::TrayPort + Send + Sync>> =
-        Arc::new(std::sync::Mutex::new(shell::windows::WindowsTray::new()));
-    #[cfg(not(windows))]
-    let tray: Arc<std::sync::Mutex<dyn shell::TrayPort + Send + Sync>> = Arc::new(
-        std::sync::Mutex::new(shell::NoOpTray::with_availability(false)),
-    );
+    let tray: Arc<std::sync::Mutex<dyn shell::TrayPort + Send + Sync>> = shell::default_tray();
 
     // Initialize application state with tray
     let app_state = Arc::new(AppState::with_tray(tray.clone()));

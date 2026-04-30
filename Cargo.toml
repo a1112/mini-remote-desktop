@@ -6,7 +6,9 @@ members = [
   "apps/mrd-service",
   "common-control-proto",
   "crates/mrd-capture-dxgi",
+  "crates/mrd-capture-macos",
   "crates/mrd-capture-winrt",
+  "crates/mrd-codec-videotoolbox",
   "crates/mrd-decode",
   "crates/mrd-decode-nvdec",
   "crates/mrd-encode-nvenc",
@@ -19,6 +21,7 @@ members = [
   "crates/mrd-proto",
   "crates/mrd-render",
   "crates/mrd-render-d3d11",
+  "crates/mrd-render-macos",
   "crates/mrd-session",
   "crates/mrd-signal-client",
   "crates/mrd-signal-proto",
@@ -28,6 +31,7 @@ members = [
   "crates/mrd-buffer-pool",
   "crates/mrd-hardware",
   "heartbeat-rs",
+  "tests/capture-render-demo",
   "tests/integration",
 ]
 resolver = "2"
@@ -55,8 +59,20 @@ opt-level = 2
 [profile.dev.package.mrd-encode-openh264]
 opt-level = 3
 
+[profile.dev.package.mrd-capture-macos]
+opt-level = 3
+
+[profile.dev.package.mrd-codec-videotoolbox]
+opt-level = 3
+
+[profile.dev.package.mrd-render-macos]
+opt-level = 3
+
 [profile.dev.package.openh264]
 opt-level = 3
 
 [profile.dev.package.openh264-sys2]
+opt-level = 3
+
+[profile.dev.package.shiguredo_video_toolbox]
 opt-level = 3

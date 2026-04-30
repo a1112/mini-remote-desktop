@@ -11,15 +11,15 @@ import {
   ImageOff,
 } from "lucide-react";
 import * as commands from "../../adapters/tauri/commands";
-import type { Artifact, WindowCaptureTarget } from "../../adapters/tauri/types";
+import type { Artifact, EnvironmentSnapshot, WindowCaptureTarget } from "../../adapters/tauri/types";
+import { capabilityAvailable, capabilityTag, unavailableText } from "./capabilityMeta";
 
-type CaptureType = "dxgi" | "winrt" | "synthetic";
+type CaptureType = "dxgi" | "winrt" | "macos" | "synthetic";
 
 interface CaptureOption {
   id: CaptureType;
   name: string;
   description: string;
-  available: boolean;
 }
 
 const CAPTURE_OPTIONS: CaptureOption[] = [
@@ -27,19 +27,21 @@ const CAPTURE_OPTIONS: CaptureOption[] = [
     id: "dxgi",
     name: "DXGI Desktop Duplication",
     description: "高性能桌面捕获，支持 Windows 8+",
-    available: true,
   },
   {
     id: "winrt",
     name: "Windows Runtime Capture",
     description: "现代化屏幕捕获 API，支持窗口捕获",
-    available: true,
+  },
+  {
+    id: "macos",
+    name: "macOS Capture",
+    description: "macOS 屏幕捕获，需要 Screen Recording 权限",
   },
   {
     id: "synthetic",
     name: "合成测试模式",
     description: "生成合成测试图案，用于基准测试",
-    available: true,
   },
 ];
 
@@ -123,6 +125,18 @@ function summarizeWindowProbeArtifacts(artifacts: Artifact[]): string | null {
   }
 }
 
+function windowTargetKey(target: WindowCaptureTarget): string {
+  return target.id ?? target.hwnd;
+}
+
+function supportsWindowCapture(capture: CaptureType): boolean {
+  return capture === "winrt" || capture === "macos";
+}
+
+function windowCaptureApiName(capture: CaptureType): string {
+  return capture === "macos" ? "ScreenCaptureKit" : "WinRT";
+}
+
 export function CaptureTestPage() {
   const [selectedCapture, setSelectedCapture] = useState<CaptureType>("dxgi");
   const [isRunning, setIsRunning] = useState(false);
@@ -137,21 +151,46 @@ export function CaptureTestPage() {
   const [windowPickerLoading, setWindowPickerLoading] = useState(false);
   const [windowPickerError, setWindowPickerError] = useState<string | null>(null);
   const [windowPickerQuery, setWindowPickerQuery] = useState("");
+  const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
+  const [startError, setStartError] = useState<string | null>(null);
 
   const selectedOption = CAPTURE_OPTIONS.find((o) => o.id === selectedCapture);
+  const selectedWindowCapture = supportsWindowCapture(selectedCapture);
+  const captureAvailable = (capture: CaptureType) =>
+    capabilityAvailable(capabilities, "available_captures", capture, capture === "synthetic");
   const selectedWindow =
-    windowTargets.find((target) => target.hwnd === selectedWindowHwnd) ??
-    windowPickerTargets.find((target) => target.hwnd === selectedWindowHwnd);
+    windowTargets.find((target) => windowTargetKey(target) === selectedWindowHwnd) ??
+    windowPickerTargets.find((target) => windowTargetKey(target) === selectedWindowHwnd);
 
   const applyWindowTargets = (targets: WindowCaptureTarget[]) => {
     setWindowTargets(targets);
     setSelectedWindowHwnd((current) => {
-      if (current && targets.some((target) => target.hwnd === current)) {
+      if (current && targets.some((target) => windowTargetKey(target) === current)) {
         return current;
       }
-      return targets[0]?.hwnd ?? null;
+      return targets[0] ? windowTargetKey(targets[0]) : null;
     });
   };
+
+  useEffect(() => {
+    let cancelled = false;
+
+    commands.testGetCapabilities().then((result) => {
+      if (!cancelled && result.ok) {
+        setCapabilities(result.value);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!capabilities || captureAvailable(selectedCapture)) return;
+    const nextCapture = CAPTURE_OPTIONS.find((option) => captureAvailable(option.id));
+    if (nextCapture) setSelectedCapture(nextCapture.id);
+  }, [capabilities, selectedCapture]);
 
   useEffect(() => {
     if (!isRunning) return;
@@ -179,7 +218,7 @@ export function CaptureTestPage() {
   }, [isRunning]);
 
   useEffect(() => {
-    if (selectedCapture !== "winrt") return;
+    if (!supportsWindowCapture(selectedCapture)) return;
 
     let cancelled = false;
     setWindowTargetsLoading(true);
@@ -245,22 +284,31 @@ export function CaptureTestPage() {
   };
 
   const handleStart = async () => {
+    if (!captureAvailable(selectedCapture)) {
+      setStartError("当前平台未暴露所选采集能力。");
+      return;
+    }
+
     setIsRunning(true);
     setMetrics(null);
+    setStartError(null);
     setSingleWindowProbeResult(null);
 
-    if (selectedCapture === "winrt") {
-      const selectedWindow = windowTargets.find((target) => target.hwnd === selectedWindowHwnd);
+    if (supportsWindowCapture(selectedCapture)) {
+      const selectedWindow =
+        windowTargets.find((target) => windowTargetKey(target) === selectedWindowHwnd) ??
+        windowPickerTargets.find((target) => windowTargetKey(target) === selectedWindowHwnd);
+      const isMacos = selectedCapture === "macos";
       const result = await commands.testStartRun({
         scenarioId: "single_window.local",
         config: {
-          capture_type: "winrt",
+          capture_type: selectedCapture,
           input_source: "window",
           window_hwnd: selectedWindow?.hwnd,
           window_title: selectedWindow?.title,
           encoder_type: "openh264",
           decoder_type: "software",
-          renderer_type: "d3d11",
+          renderer_type: isMacos ? "macos" : "d3d11",
           transport_kind: "webrtc",
           duration_ms: 1000,
         },
@@ -319,26 +367,33 @@ export function CaptureTestPage() {
       <div className="bg-card rounded-lg border p-4 mb-6">
         <h2 className="text-lg font-semibold mb-4">选择捕获源</h2>
         <div className="grid md:grid-cols-3 gap-4">
-          {CAPTURE_OPTIONS.map((option) => (
+          {CAPTURE_OPTIONS.map((option) => {
+            const available = captureAvailable(option.id);
+            const disabledLabel = unavailableText(capabilities, "available_captures", option.id);
+            return (
             <button
               key={option.id}
               onClick={() => setSelectedCapture(option.id)}
-              disabled={isRunning || !option.available}
+              disabled={isRunning || !available}
               className={`p-4 rounded-lg border-2 text-left transition-all ${
                 selectedCapture === option.id
                   ? "border-primary bg-primary/10"
                   : "border-transparent bg-muted/30 hover:bg-muted/50"
-              } ${!option.available ? "opacity-50 cursor-not-allowed" : ""}`}
+              } ${!available ? "opacity-50 cursor-not-allowed" : ""}`}
             >
               <h3 className="font-medium">{option.name}</h3>
               <p className="text-sm text-muted-foreground mt-1">{option.description}</p>
-              {!option.available && (
+              <span className="inline-block mt-2 text-xs bg-muted px-2 py-0.5 rounded">
+                {capabilityTag(option.id)}
+              </span>
+              {disabledLabel && (
                 <span className="inline-block mt-2 text-xs bg-yellow-100 text-yellow-800 px-2 py-0.5 rounded">
-                  即将推出
+                  {disabledLabel}
                 </span>
               )}
             </button>
-          ))}
+            );
+          })}
         </div>
       </div>
 
@@ -369,13 +424,13 @@ export function CaptureTestPage() {
         </div>
       )}
 
-      {selectedCapture === "winrt" && (
+      {selectedWindowCapture && (
         <div className="bg-card rounded-lg border p-4 mb-6">
           <div className="flex items-center justify-between mb-3">
             <div>
               <h3 className="font-medium">Single window capture</h3>
               <p className="text-sm text-muted-foreground">
-                Enumerate foreground windows and pick a WinRT capture target.
+                Enumerate foreground windows and pick a {windowCaptureApiName(selectedCapture)} capture target.
               </p>
             </div>
             <div className="flex items-center gap-2">
@@ -417,11 +472,15 @@ export function CaptureTestPage() {
                 </div>
                 <div className="grid grid-cols-2 gap-3 text-sm">
                   <div>
-                    <div className="text-muted-foreground">Class</div>
+                    <div className="text-muted-foreground">
+                      {selectedCapture === "macos" ? "Bundle" : "Class"}
+                    </div>
                     <div className="truncate font-mono">{selectedWindow.class_name}</div>
                   </div>
                   <div>
-                    <div className="text-muted-foreground">HWND</div>
+                    <div className="text-muted-foreground">
+                      {selectedCapture === "macos" ? "Window ID" : "HWND"}
+                    </div>
                     <div className="truncate font-mono">{selectedWindow.hwnd}</div>
                   </div>
                 </div>
@@ -447,7 +506,8 @@ export function CaptureTestPage() {
       {windowPickerOpen && (
         <WindowPickerDialog
           targets={windowPickerTargets}
-          selectedHwnd={selectedWindowHwnd}
+            selectedHwnd={selectedWindowHwnd}
+          captureApiName={windowCaptureApiName(selectedCapture)}
           loading={windowPickerLoading}
           error={windowPickerError}
           query={windowPickerQuery}
@@ -456,11 +516,11 @@ export function CaptureTestPage() {
           onClose={() => setWindowPickerOpen(false)}
           onSelect={(target) => {
             applyWindowTargets(
-              windowPickerTargets.some((item) => item.hwnd === target.hwnd)
+              windowPickerTargets.some((item) => windowTargetKey(item) === windowTargetKey(target))
                 ? windowPickerTargets
                 : [target, ...windowPickerTargets]
             );
-            setSelectedWindowHwnd(target.hwnd);
+            setSelectedWindowHwnd(windowTargetKey(target));
             setWindowPickerOpen(false);
           }}
         />
@@ -471,7 +531,10 @@ export function CaptureTestPage() {
         {!isRunning ? (
           <button
             onClick={handleStart}
-            disabled={selectedCapture === "winrt" && (!selectedWindowHwnd || windowTargetsLoading)}
+            disabled={
+              !captureAvailable(selectedCapture) ||
+              (selectedWindowCapture && (!selectedWindowHwnd || windowTargetsLoading))
+            }
             className="flex items-center gap-2 px-6 py-3 bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 transition-colors disabled:opacity-50"
           >
             <Play className="h-5 w-5" />
@@ -487,6 +550,7 @@ export function CaptureTestPage() {
           </button>
         )}
       </div>
+      {startError && <p className="text-sm text-red-600 mb-6">{startError}</p>}
 
       {/* Metrics */}
       {metrics && (
@@ -542,6 +606,7 @@ export function CaptureTestPage() {
 function WindowPickerDialog({
   targets,
   selectedHwnd,
+  captureApiName,
   loading,
   error,
   query,
@@ -552,6 +617,7 @@ function WindowPickerDialog({
 }: {
   targets: WindowCaptureTarget[];
   selectedHwnd: string | null;
+  captureApiName: string;
   loading: boolean;
   error: string | null;
   query: string;
@@ -563,7 +629,9 @@ function WindowPickerDialog({
   const normalizedQuery = query.trim().toLowerCase();
   const filteredTargets = normalizedQuery
     ? targets.filter((target) =>
-        `${target.title} ${target.class_name} ${target.process_id}`
+        `${target.title} ${target.class_name} ${target.app_name ?? ""} ${
+          target.bundle_identifier ?? ""
+        } ${target.process_id}`
           .toLowerCase()
           .includes(normalizedQuery)
       )
@@ -587,7 +655,7 @@ function WindowPickerDialog({
               Window picker
             </h2>
             <p className="text-sm text-muted-foreground">
-              Select a foreground window using live WinRT preview frames.
+              Select a foreground window using live {captureApiName} preview frames.
             </p>
           </div>
           <div className="flex items-center gap-2">
@@ -639,10 +707,10 @@ function WindowPickerDialog({
           {filteredTargets.length > 0 && (
             <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
               {filteredTargets.map((target) => {
-                const selected = target.hwnd === selectedHwnd;
+                const selected = windowTargetKey(target) === selectedHwnd;
                 return (
                   <button
-                    key={target.hwnd}
+                    key={windowTargetKey(target)}
                     onClick={() => onSelect(target)}
                     className={`rounded-lg border p-3 text-left transition hover:border-primary hover:bg-primary/5 ${
                       selected ? "border-primary bg-primary/10" : ""
@@ -658,6 +726,11 @@ function WindowPickerDialog({
                       <div className="mt-1 truncate font-mono text-xs text-muted-foreground">
                         {target.class_name}
                       </div>
+                      {target.app_name && target.app_name !== target.title && (
+                        <div className="mt-1 truncate text-xs text-muted-foreground">
+                          {target.app_name}
+                        </div>
+                      )}
                     </div>
                   </button>
                 );

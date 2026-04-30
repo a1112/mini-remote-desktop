@@ -1,15 +1,21 @@
 import { useState, useEffect } from "react";
 import { Play, Square, Cpu, Monitor, Clock } from "lucide-react";
 import * as commands from "../../adapters/tauri/commands";
+import type { EnvironmentSnapshot } from "../../adapters/tauri/types";
+import {
+  capabilityAvailable,
+  capabilityTag,
+  chooseCapability,
+  unavailableText,
+} from "./capabilityMeta";
 
-type DecoderType = "nvdec" | "software";
+type DecoderType = "nvdec" | "software" | "videotoolbox";
 
 interface DecoderOption {
   id: DecoderType;
   name: string;
   description: string;
   type: "hardware" | "software";
-  available: boolean;
   icon: React.ReactNode;
 }
 
@@ -19,7 +25,6 @@ const DECODER_OPTIONS: DecoderOption[] = [
     name: "NVDEC",
     description: "NVIDIA 硬件解码器，GPU 加速解码",
     type: "hardware",
-    available: true,
     icon: <Monitor className="h-5 w-5 text-green-500" />,
   },
   {
@@ -27,8 +32,14 @@ const DECODER_OPTIONS: DecoderOption[] = [
     name: "软件解码 (FFmpeg)",
     description: "CPU 软件解码，跨平台兼容",
     type: "software",
-    available: true,
     icon: <Cpu className="h-5 w-5 text-orange-500" />,
+  },
+  {
+    id: "videotoolbox",
+    name: "VideoToolbox",
+    description: "macOS Apple 硬件 H.264 解码器，当前为实验路径",
+    type: "hardware",
+    icon: <Monitor className="h-5 w-5 text-blue-500" />,
   },
 ];
 
@@ -46,10 +57,36 @@ interface DecodeMetrics {
 }
 
 export function DecodeTestPage() {
-  const [selectedDecoder, setSelectedDecoder] = useState<DecoderType>("nvdec");
+  const [selectedDecoder, setSelectedDecoder] = useState<DecoderType>("software");
   const [testStream, setTestStream] = useState("h264_1080p_60fps");
   const [isRunning, setIsRunning] = useState(false);
   const [metrics, setMetrics] = useState<DecodeMetrics | null>(null);
+  const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
+  const [startError, setStartError] = useState<string | null>(null);
+
+  const decoderAvailable = (decoder: DecoderType) =>
+    capabilityAvailable(capabilities, "available_decoders", decoder, decoder === "software");
+  const selectedAvailable = decoderAvailable(selectedDecoder);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    commands.testGetCapabilities().then((result) => {
+      if (!cancelled && result.ok) {
+        setCapabilities(result.value);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!capabilities || decoderAvailable(selectedDecoder)) return;
+    const nextDecoder = DECODER_OPTIONS.find((option) => decoderAvailable(option.id));
+    if (nextDecoder) setSelectedDecoder(nextDecoder.id);
+  }, [capabilities, selectedDecoder]);
 
   const TEST_STREAMS = [
     { id: "h264_720p_30fps", name: "H.264 720p @ 30fps" },
@@ -73,7 +110,10 @@ export function DecodeTestPage() {
           dropped_frames: result.value.dropped_frames,
           resolution: result.value.resolution,
           cpu_usage: selectedDecoder === "software" ? 45 + Math.random() * 20 : 5,
-          gpu_usage: selectedDecoder === "nvdec" ? 30 + Math.random() * 15 : 2,
+          gpu_usage:
+            selectedDecoder === "nvdec" || selectedDecoder === "videotoolbox"
+              ? 30 + Math.random() * 15
+              : 2,
         });
       }
     }, 200);
@@ -82,15 +122,46 @@ export function DecodeTestPage() {
   }, [isRunning, selectedDecoder]);
 
   const handleStart = async () => {
+    if (!selectedAvailable) {
+      setStartError("当前环境未暴露所选解码器能力。");
+      return;
+    }
+
     setIsRunning(true);
     setMetrics(null);
+    setStartError(null);
 
-    await commands.testHarnessSetCustom({
-      capture: "dxgi",
-      encoder: "nvenc_h264",
+    const capture = chooseCapability(
+      selectedDecoder === "nvdec" ? ["dxgi", "synthetic"] : ["macos", "dxgi", "synthetic"],
+      capabilities,
+      "available_captures",
+      "synthetic"
+    );
+    const encoder = chooseCapability(
+      selectedDecoder === "nvdec"
+        ? ["nvenc_h264", "openh264"]
+        : ["videotoolbox_h264", "nvenc_h264", "openh264"],
+      capabilities,
+      "available_encoders",
+      "openh264"
+    );
+
+    const customResult = await commands.testHarnessSetCustom({
+      capture,
+      encoder,
       decoder: selectedDecoder,
     });
-    await commands.testHarnessStart();
+    if (!customResult.ok) {
+      setIsRunning(false);
+      setStartError(customResult.error.message);
+      return;
+    }
+
+    const startResult = await commands.testHarnessStart();
+    if (!startResult.ok) {
+      setIsRunning(false);
+      setStartError(startResult.error.message);
+    }
   };
 
   const handleStop = async () => {
@@ -115,16 +186,19 @@ export function DecodeTestPage() {
       <div className="bg-card rounded-lg border p-4 mb-6">
         <h2 className="text-lg font-semibold mb-4">选择解码器</h2>
         <div className="grid md:grid-cols-2 gap-4">
-          {DECODER_OPTIONS.map((option) => (
+          {DECODER_OPTIONS.map((option) => {
+            const available = decoderAvailable(option.id);
+            const disabledLabel = unavailableText(capabilities, "available_decoders", option.id);
+            return (
             <button
               key={option.id}
               onClick={() => setSelectedDecoder(option.id)}
-              disabled={isRunning}
+              disabled={isRunning || !available}
               className={`p-4 rounded-lg border-2 text-left transition-all ${
                 selectedDecoder === option.id
                   ? "border-primary bg-primary/10"
                   : "border-transparent bg-muted/30 hover:bg-muted/50"
-              }`}
+              } ${!available ? "opacity-50 cursor-not-allowed" : ""}`}
             >
               <div className="flex items-center gap-2 mb-2">
                 {option.icon}
@@ -134,8 +208,17 @@ export function DecodeTestPage() {
               <span className="inline-block mt-2 text-xs bg-muted px-2 py-0.5 rounded">
                 {option.type === "hardware" ? "硬件加速" : "软件"}
               </span>
+              <span className="inline-block mt-2 ml-2 text-xs bg-muted px-2 py-0.5 rounded">
+                {capabilityTag(option.id)}
+              </span>
+              {disabledLabel && (
+                <span className="inline-block mt-2 ml-2 text-xs bg-yellow-100 text-yellow-800 px-2 py-0.5 rounded">
+                  {disabledLabel}
+                </span>
+              )}
             </button>
-          ))}
+            );
+          })}
         </div>
       </div>
 
@@ -165,7 +248,8 @@ export function DecodeTestPage() {
         {!isRunning ? (
           <button
             onClick={handleStart}
-            className="flex items-center gap-2 px-6 py-3 bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 transition-colors"
+            disabled={!selectedAvailable}
+            className="flex items-center gap-2 px-6 py-3 bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 transition-colors disabled:opacity-50"
           >
             <Play className="h-5 w-5" />
             启动测试
@@ -180,6 +264,9 @@ export function DecodeTestPage() {
           </button>
         )}
       </div>
+      {startError && (
+        <p className="text-sm text-red-600 mb-6">{startError}</p>
+      )}
 
       {/* Metrics */}
       {metrics && (
@@ -251,62 +338,40 @@ export function DecodeTestPage() {
                 </tr>
               </thead>
               <tbody>
-                <tr className="border-b">
-                  <td className="py-2">
-                    <span className="flex items-center gap-2">
-                      <Monitor className="h-4 w-4 text-green-500" />
-                      NVDEC
-                    </span>
-                  </td>
-                  <td className="text-right font-mono">
-                    {selectedDecoder === "nvdec" && metrics
-                      ? `${metrics.decode_fps.toFixed(1)}`
-                      : "-"}
-                  </td>
-                  <td className="text-right font-mono">
-                    {selectedDecoder === "nvdec" && metrics
-                      ? `${metrics.decode_latency_p95_ms.toFixed(2)} ms`
-                      : "-"}
-                  </td>
-                  <td className="text-right font-mono">
-                    {selectedDecoder === "nvdec" && metrics
-                      ? `${metrics.cpu_usage.toFixed(1)}%`
-                      : "~5%"}
-                  </td>
-                  <td className="text-right font-mono">
-                    {selectedDecoder === "nvdec" && metrics
-                      ? `${metrics.gpu_usage.toFixed(1)}%`
-                      : "~30%"}
-                  </td>
-                </tr>
-                <tr>
-                  <td className="py-2">
-                    <span className="flex items-center gap-2">
-                      <Cpu className="h-4 w-4 text-orange-500" />
-                      软件解码
-                    </span>
-                  </td>
-                  <td className="text-right font-mono">
-                    {selectedDecoder === "software" && metrics
-                      ? `${metrics.decode_fps.toFixed(1)}`
-                      : "-"}
-                  </td>
-                  <td className="text-right font-mono">
-                    {selectedDecoder === "software" && metrics
-                      ? `${metrics.decode_latency_p95_ms.toFixed(2)} ms`
-                      : "-"}
-                  </td>
-                  <td className="text-right font-mono">
-                    {selectedDecoder === "software" && metrics
-                      ? `${metrics.cpu_usage.toFixed(1)}%`
-                      : "~50%"}
-                  </td>
-                  <td className="text-right font-mono">
-                    {selectedDecoder === "software" && metrics
-                      ? `${metrics.gpu_usage.toFixed(1)}%`
-                      : "~2%"}
-                  </td>
-                </tr>
+                {DECODER_OPTIONS.map((option) => (
+                  <tr key={option.id} className="border-b last:border-0">
+                    <td className="py-2">
+                      <span className="flex items-center gap-2">
+                        {option.id === "software" ? (
+                          <Cpu className="h-4 w-4 text-orange-500" />
+                        ) : (
+                          <Monitor className="h-4 w-4 text-green-500" />
+                        )}
+                        {option.name}
+                      </span>
+                    </td>
+                    <td className="text-right font-mono">
+                      {selectedDecoder === option.id && metrics
+                        ? `${metrics.decode_fps.toFixed(1)}`
+                        : "-"}
+                    </td>
+                    <td className="text-right font-mono">
+                      {selectedDecoder === option.id && metrics
+                        ? `${metrics.decode_latency_p95_ms.toFixed(2)} ms`
+                        : "-"}
+                    </td>
+                    <td className="text-right font-mono">
+                      {selectedDecoder === option.id && metrics
+                        ? `${metrics.cpu_usage.toFixed(1)}%`
+                        : option.id === "software" ? "~50%" : "~5%"}
+                    </td>
+                    <td className="text-right font-mono">
+                      {selectedDecoder === option.id && metrics
+                        ? `${metrics.gpu_usage.toFixed(1)}%`
+                        : option.id === "software" ? "~2%" : "~30%"}
+                    </td>
+                  </tr>
+                ))}
               </tbody>
             </table>
           </div>

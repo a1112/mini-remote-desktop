@@ -1,3 +1,5 @@
+#![allow(unexpected_cfgs)]
+
 use serde::{Deserialize, Serialize};
 use tauri::WebviewWindow;
 
@@ -15,14 +17,14 @@ pub struct NativeRenderSurfaceSnapshot {
     pub backend: String,
     pub attached: bool,
     pub visible: bool,
-    pub parent_hwnd: Option<isize>,
-    pub hwnd: Option<isize>,
+    pub parent_hwnd: Option<String>,
+    pub hwnd: Option<String>,
     pub rect: NativeSurfaceRect,
 }
 
 #[derive(Default)]
 pub struct RemoteDisplaySurfaceManager {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     surfaces: std::collections::HashMap<String, NativeRenderSurface>,
 }
 
@@ -67,7 +69,49 @@ impl RemoteDisplaySurfaceManager {
         Ok(snapshot)
     }
 
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    pub fn configure(
+        &mut self,
+        window: &WebviewWindow,
+        rect: NativeSurfaceRect,
+        enabled: bool,
+        visible: bool,
+    ) -> Result<NativeRenderSurfaceSnapshot, String> {
+        let label = window.label().to_string();
+        let rect = normalize_rect(rect);
+
+        if !enabled {
+            if let Some(surface) = self.surfaces.remove(&label) {
+                surface.remove(window)?;
+            }
+            return Ok(NativeRenderSurfaceSnapshot {
+                label,
+                backend: "web".to_string(),
+                attached: false,
+                visible: false,
+                parent_hwnd: None,
+                hwnd: None,
+                rect,
+            });
+        }
+
+        let parent_ns_window = window
+            .ns_window()
+            .map_err(|error| format!("get remote display NSWindow failed: {error}"))?
+            as isize;
+
+        if let Some(surface) = self.surfaces.get_mut(&label) {
+            surface.move_to(window, rect, visible)?;
+            return Ok(surface.snapshot(label, rect));
+        }
+
+        let surface = NativeRenderSurface::create(window, parent_ns_window, rect, visible)?;
+        let snapshot = surface.snapshot(label.clone(), rect);
+        self.surfaces.insert(label, surface);
+        Ok(snapshot)
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
     pub fn configure(
         &mut self,
         window: &WebviewWindow,
@@ -98,6 +142,10 @@ fn normalize_rect(rect: NativeSurfaceRect) -> NativeSurfaceRect {
         width: rect.width.max(1),
         height: rect.height.max(1),
     }
+}
+
+fn handle_hex(handle: isize) -> String {
+    format!("0x{:X}", handle as usize)
 }
 
 #[cfg(windows)]
@@ -241,8 +289,8 @@ impl NativeRenderSurface {
             backend: "d3d11".to_string(),
             attached: true,
             visible: self.visible,
-            parent_hwnd: Some(self.parent_hwnd),
-            hwnd: Some(self.hwnd.0),
+            parent_hwnd: Some(handle_hex(self.parent_hwnd)),
+            hwnd: Some(handle_hex(self.hwnd.0)),
             rect,
         }
     }
@@ -255,6 +303,197 @@ impl Drop for NativeRenderSurface {
             let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(self.hwnd);
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+struct NativeRenderSurface {
+    parent_ns_window: isize,
+    ns_view: isize,
+    visible: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl NativeRenderSurface {
+    fn create(
+        window: &WebviewWindow,
+        parent_ns_window: isize,
+        rect: NativeSurfaceRect,
+        visible: bool,
+    ) -> Result<Self, String> {
+        let ns_view = run_on_main_thread(window, move || unsafe {
+            create_macos_native_surface(parent_ns_window, rect, visible)
+        })?;
+
+        Ok(Self {
+            parent_ns_window,
+            ns_view,
+            visible,
+        })
+    }
+
+    fn move_to(
+        &mut self,
+        window: &WebviewWindow,
+        rect: NativeSurfaceRect,
+        visible: bool,
+    ) -> Result<(), String> {
+        let ns_view = self.ns_view;
+        let parent_ns_window = self.parent_ns_window;
+        run_on_main_thread(window, move || unsafe {
+            move_macos_native_surface(parent_ns_window, ns_view, rect, visible)
+        })?;
+        self.visible = visible;
+        Ok(())
+    }
+
+    fn remove(self, window: &WebviewWindow) -> Result<(), String> {
+        let ns_view = self.ns_view;
+        run_on_main_thread(window, move || unsafe {
+            remove_macos_native_surface(ns_view);
+            Ok(())
+        })
+    }
+
+    fn snapshot(&self, label: String, rect: NativeSurfaceRect) -> NativeRenderSurfaceSnapshot {
+        NativeRenderSurfaceSnapshot {
+            label,
+            backend: "macos".to_string(),
+            attached: true,
+            visible: self.visible,
+            parent_hwnd: Some(handle_hex(self.parent_ns_window)),
+            hwnd: Some(handle_hex(self.ns_view)),
+            rect,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn run_on_main_thread<T, F>(window: &WebviewWindow, f: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    let (sender, receiver) = std::sync::mpsc::channel();
+    window
+        .run_on_main_thread(move || {
+            let _ = sender.send(f());
+        })
+        .map_err(|error| format!("schedule macOS native surface update failed: {error}"))?;
+
+    receiver
+        .recv()
+        .map_err(|error| format!("macOS native surface update failed: {error}"))?
+}
+
+#[cfg(target_os = "macos")]
+#[allow(deprecated, unexpected_cfgs)]
+unsafe fn create_macos_native_surface(
+    parent_ns_window: isize,
+    rect: NativeSurfaceRect,
+    visible: bool,
+) -> Result<isize, String> {
+    use cocoa::{
+        appkit::{NSView, NSWindowOrderingMode},
+        base::{id, nil, NO, YES},
+        foundation::NSRect,
+    };
+    use objc::{msg_send, sel, sel_impl};
+
+    let ns_window = parent_ns_window as id;
+    if ns_window == nil {
+        return Err("remote display NSWindow pointer is null".to_string());
+    }
+
+    let content_view: id = msg_send![ns_window, contentView];
+    if content_view == nil {
+        return Err("remote display NSWindow has no contentView".to_string());
+    }
+
+    let content_frame: NSRect = NSView::frame(content_view);
+    let frame = rect_to_macos_frame(rect, content_frame.size.height);
+    let view: id = NSView::alloc(nil).initWithFrame_(frame);
+    if view == nil {
+        return Err("create macOS native render NSView failed".to_string());
+    }
+
+    view.setWantsLayer(YES);
+    view.setAutoresizingMask_(0);
+    let _: () = msg_send![view, setHidden: if visible { NO } else { YES }];
+    let _: () = msg_send![view, setPostsFrameChangedNotifications: YES];
+    let _: () = msg_send![
+        content_view,
+        addSubview: view
+        positioned: NSWindowOrderingMode::NSWindowAbove
+        relativeTo: nil
+    ];
+
+    // Keep one retain count owned by the surface manager until remove().
+    let _: id = msg_send![view, retain];
+    Ok(view as isize)
+}
+
+#[cfg(target_os = "macos")]
+#[allow(deprecated, unexpected_cfgs)]
+unsafe fn move_macos_native_surface(
+    parent_ns_window: isize,
+    ns_view: isize,
+    rect: NativeSurfaceRect,
+    visible: bool,
+) -> Result<(), String> {
+    use cocoa::{
+        appkit::{NSView, NSWindowOrderingMode},
+        base::{id, nil, NO, YES},
+        foundation::NSRect,
+    };
+    use objc::{msg_send, sel, sel_impl};
+
+    let ns_window = parent_ns_window as id;
+    let view = ns_view as id;
+    if ns_window == nil || view == nil {
+        return Err("macOS native surface pointer is null".to_string());
+    }
+
+    let content_view: id = msg_send![ns_window, contentView];
+    if content_view == nil {
+        return Err("remote display NSWindow has no contentView".to_string());
+    }
+
+    let content_frame: NSRect = NSView::frame(content_view);
+    view.setFrameOrigin(rect_to_macos_frame(rect, content_frame.size.height).origin);
+    view.setFrameSize(rect_to_macos_frame(rect, content_frame.size.height).size);
+    let _: () = msg_send![view, setHidden: if visible { NO } else { YES }];
+    let _: () = msg_send![
+        content_view,
+        addSubview: view
+        positioned: NSWindowOrderingMode::NSWindowAbove
+        relativeTo: nil
+    ];
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[allow(deprecated, unexpected_cfgs)]
+unsafe fn remove_macos_native_surface(ns_view: isize) {
+    use cocoa::{appkit::NSView, base::id};
+    use objc::{msg_send, sel, sel_impl};
+
+    let view = ns_view as id;
+    if !view.is_null() {
+        view.removeFromSuperview();
+        let _: () = msg_send![view, release];
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[allow(deprecated)]
+fn rect_to_macos_frame(rect: NativeSurfaceRect, content_height: f64) -> cocoa::foundation::NSRect {
+    use cocoa::foundation::{NSPoint, NSRect, NSSize};
+
+    let y = (content_height - rect.y as f64 - rect.height as f64).max(0.0);
+    NSRect::new(
+        NSPoint::new(rect.x as f64, y),
+        NSSize::new(rect.width as f64, rect.height as f64),
+    )
 }
 
 #[cfg(test)]

@@ -25,11 +25,14 @@ export type ScenarioKind =
 export type ComponentScope =
   | "dxgi"
   | "winrt"
+  | "macos_capture"
   | "nvenc"
   | "openh264"
+  | "videotoolbox"
   | "nvdec"
   | "software_decode"
   | "d3d11_render"
+  | "metal_render"
   | "quic"
   | "webrtc";
 
@@ -84,12 +87,12 @@ export type TestStage =
  */
 export interface TestConfig {
   // Component selection
-  capture_type?: "dxgi" | "winrt" | "synthetic";
-  encoder_type?: "nvenc_h264" | "nvenc_av1" | "openh264";
-  decoder_type?: "none" | "nvdec" | "software";
-  renderer_type?: "d3d11";
+  capture_type?: "dxgi" | "winrt" | "macos" | "synthetic";
+  encoder_type?: "none" | "nvenc_h264" | "nvenc_av1" | "openh264" | "videotoolbox_h264";
+  decoder_type?: "none" | "nvdec" | "software" | "videotoolbox";
+  renderer_type?: "d3d11" | "macos";
   render_display?: boolean;
-  renderer_target_hwnd?: number;
+  renderer_target_hwnd?: string;
   zero_copy?: boolean;
   transport_kind?: "loopback" | "quic" | "webrtc";
 
@@ -129,21 +132,31 @@ export interface TestRun {
  * Environment snapshot
  */
 export interface EnvironmentSnapshot {
+  os_type?: string;
   cpu_brand: string;
   cpu_cores: number;
   memory_gb: number;
   gpu_info: string;
+  available_captures?: string[];
   available_encoders: string[];
   available_decoders: string[];
+  available_renderers?: string[];
+  available_memory_modes?: string[];
 }
 
 export interface WindowCaptureTarget {
+  id?: string;
+  platform?: "windows" | "macos" | string;
+  source_kind?: "window" | string;
   hwnd: string;
   title: string;
   class_name: string;
   width: number;
   height: number;
   process_id: number;
+  app_name?: string | null;
+  bundle_identifier?: string | null;
+  window_layer?: number | null;
   preview_data_url?: string | null;
   preview_width?: number | null;
   preview_height?: number | null;
@@ -155,7 +168,7 @@ export interface RemoteDisplayWindowContext {
   surface_id: string;
   role: string;
   renderer_attached: boolean;
-  render_mode: "web" | "d3d11_native" | string;
+  render_mode: "web" | "d3d11_native" | "macos_native" | string;
   native_surface_attached: boolean;
   session_window_count: number;
 }
@@ -172,8 +185,8 @@ export interface NativeRenderSurfaceSnapshot {
   backend: "web" | "d3d11" | string;
   attached: boolean;
   visible: boolean;
-  parent_hwnd?: number | null;
-  hwnd?: number | null;
+  parent_hwnd?: string | null;
+  hwnd?: string | null;
   rect: NativeSurfaceRect;
 }
 
@@ -512,16 +525,16 @@ export interface TestChainOption {
 /**
  * Test matrix configuration for custom pipeline setups
  */
-export type CaptureType = 'dxgi' | 'winrt' | 'synthetic';
-export type EncoderType = 'nvenc_h264' | 'nvenc_av1' | 'openh264';
-export type DecoderType = 'none' | 'nvdec' | 'software';
+export type CaptureType = 'dxgi' | 'winrt' | 'macos' | 'synthetic';
+export type EncoderType = 'none' | 'nvenc_h264' | 'nvenc_av1' | 'openh264' | 'videotoolbox_h264';
+export type DecoderType = 'none' | 'nvdec' | 'software' | 'videotoolbox';
 
 export interface TestMatrixConfig {
   capture: CaptureType;
   encoder: EncoderType;
   decoder: DecoderType;
   transport?: "loopback" | "quic" | "webrtc";
-  renderer?: "none" | "d3d11";
+  renderer?: "none" | "d3d11" | "macos";
   zero_copy?: boolean;
   resolution?: [number, number];
   fps?: number;
@@ -535,6 +548,8 @@ export interface HarnessMetrics {
   capture_latency_p95_ms: number;
   encode_latency_p50_ms: number;
   encode_latency_p95_ms: number;
+  transport_latency_p50_ms: number;
+  transport_latency_p95_ms: number;
   decode_latency_p50_ms: number;
   decode_latency_p95_ms: number;
   total_latency_p50_ms: number;

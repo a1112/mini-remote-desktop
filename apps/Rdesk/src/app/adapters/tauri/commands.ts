@@ -60,6 +60,43 @@ async function invokeAdapter<T>(
   }
 }
 
+function isLocalBrowserFallbackAllowed(): boolean {
+  if (typeof window === 'undefined') return false;
+  if ('__TAURI_INTERNALS__' in window) return false;
+  const host = window.location.hostname;
+  return host === 'localhost' || host === '127.0.0.1' || host === '::1';
+}
+
+function browserDevCapabilities(): EnvironmentSnapshot | null {
+  if (!isLocalBrowserFallbackAllowed()) return null;
+
+  const userAgent = navigator.userAgent.toLowerCase();
+  const platform = navigator.platform.toLowerCase();
+  const isMac = platform.includes('mac') || userAgent.includes('mac os x');
+  const isWindows = platform.includes('win') || userAgent.includes('windows');
+
+  return {
+    os_type: isMac ? 'macos' : isWindows ? 'windows' : 'browser',
+    cpu_brand: 'Browser dev fallback',
+    cpu_cores: navigator.hardwareConcurrency || 1,
+    memory_gb: 0,
+    gpu_info: 'Unavailable outside Tauri shell',
+    available_captures: isMac
+      ? ['macos', 'synthetic']
+      : isWindows
+        ? ['dxgi', 'winrt', 'synthetic']
+        : ['synthetic'],
+    available_encoders: isMac
+      ? ['videotoolbox_h264', 'openh264']
+      : isWindows
+        ? ['openh264']
+        : ['openh264'],
+    available_decoders: isMac ? ['software', 'videotoolbox'] : ['software'],
+    available_renderers: isMac ? ['macos'] : isWindows ? ['d3d11'] : [],
+    available_memory_modes: isWindows ? ['cpu', 'd3d11_shared'] : ['cpu'],
+  };
+}
+
 // ============================================================================
 // Window / Tray Commands
 // ============================================================================
@@ -536,18 +573,24 @@ export async function testListScenarios(): Promise<AdapterResult<TestScenario[]>
  * Get current environment capabilities
  */
 export async function testGetCapabilities(): Promise<AdapterResult<EnvironmentSnapshot>> {
-  return invokeAdapter<EnvironmentSnapshot>('test_get_capabilities');
+  const result = await invokeAdapter<EnvironmentSnapshot>('test_get_capabilities');
+  if (result.ok) return result;
+
+  const fallback = browserDevCapabilities();
+  if (fallback) return { ok: true, value: fallback };
+
+  return result;
 }
 
 /**
- * List visible top-level windows available to the WinRT window-capture path.
+ * List visible top-level windows available to the platform window-capture path.
  */
 export async function testListWindowCaptureTargets(): Promise<AdapterResult<WindowCaptureTarget[]>> {
   return invokeAdapter<WindowCaptureTarget[]>('test_list_window_capture_targets');
 }
 
 /**
- * List WinRT window capture targets with best-effort screenshot previews.
+ * List platform window capture targets with best-effort screenshot previews.
  */
 export async function testListWindowCaptureTargetsWithPreviews(
   limit = 24
@@ -707,10 +750,17 @@ export async function testHarnessGetMetrics(): Promise<AdapterResult<HarnessMetr
 /**
  * Get latest captured and rendered frames as base64
  */
-export async function testHarnessGetFrames(): Promise<
+export async function testHarnessGetFrames(params?: {
+  includeCaptured?: boolean;
+  includeRendered?: boolean;
+}): Promise<
   AdapterResult<[FrameData | null, FrameData | null]>
 > {
   return invokeAdapter<[FrameData | null, FrameData | null]>(
-    'test_harness_get_frames'
+    'test_harness_get_frames',
+    {
+      includeCaptured: params?.includeCaptured ?? true,
+      includeRendered: params?.includeRendered ?? true,
+    }
   );
 }

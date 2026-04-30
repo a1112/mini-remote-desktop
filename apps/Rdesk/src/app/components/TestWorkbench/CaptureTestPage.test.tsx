@@ -34,6 +34,20 @@ describe("CaptureTestPage window picker", () => {
   it("opens an Alt-Tab style picker and selects a WinRT window target", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve({
+          os_type: "windows",
+          cpu_brand: "test",
+          cpu_cores: 8,
+          memory_gb: 16,
+          gpu_info: "test",
+          available_captures: ["dxgi", "winrt", "synthetic"],
+          available_encoders: ["openh264"],
+          available_decoders: ["software"],
+          available_renderers: ["d3d11"],
+          available_memory_modes: ["cpu"],
+        });
+      }
       if (command === "test_list_window_capture_targets") {
         return Promise.resolve(baseTargets);
       }
@@ -44,7 +58,9 @@ describe("CaptureTestPage window picker", () => {
     });
 
     render(<CaptureTestPage />);
-    fireEvent.click(screen.getByRole("button", { name: /Windows Runtime Capture/ }));
+    const winrtButton = screen.getByRole("button", { name: /Windows Runtime Capture/ });
+    await waitFor(() => expect(winrtButton).not.toBeDisabled());
+    fireEvent.click(winrtButton);
 
     await screen.findByText("Single window capture");
     fireEvent.click(screen.getByRole("button", { name: /Choose window/ }));

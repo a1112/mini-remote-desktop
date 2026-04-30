@@ -8,6 +8,8 @@
 use std::path::PathBuf;
 
 // Platform-specific modules
+#[cfg(target_os = "macos")]
+pub mod macos;
 #[cfg(windows)]
 pub mod windows;
 
@@ -122,6 +124,20 @@ impl UiLauncherPort for InMemoryUiLauncher {
 
     fn get_ui_path(&self) -> anyhow::Result<Option<PathBuf>> {
         Ok(self.ui_path.lock().unwrap().clone())
+    }
+}
+
+pub type UiLauncherPortRef = std::sync::Arc<std::sync::Mutex<dyn UiLauncherPort + Send + Sync>>;
+
+pub fn default_ui_launcher() -> UiLauncherPortRef {
+    #[cfg(target_os = "macos")]
+    {
+        return std::sync::Arc::new(std::sync::Mutex::new(macos::MacosUiLauncher::new("Rdesk")));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::sync::Arc::new(std::sync::Mutex::new(InMemoryUiLauncher::new()))
     }
 }
 
@@ -291,6 +307,23 @@ impl TrayPort for NoOpTray {
 
     fn is_available(&self) -> bool {
         self.available
+    }
+}
+
+pub fn default_tray() -> std::sync::Arc<std::sync::Mutex<dyn TrayPort + Send + Sync>> {
+    #[cfg(windows)]
+    {
+        return std::sync::Arc::new(std::sync::Mutex::new(windows::WindowsTray::new()));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        return std::sync::Arc::new(std::sync::Mutex::new(macos::MacosTray::new()));
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        std::sync::Arc::new(std::sync::Mutex::new(NoOpTray::with_availability(false)))
     }
 }
 
@@ -467,6 +500,29 @@ impl AutostartPort for NoOpAutostart {
 
     fn get_entry_name(&self) -> &str {
         &self.entry_name
+    }
+}
+
+pub type AutostartPortRef = std::sync::Arc<std::sync::Mutex<dyn AutostartPort + Send + Sync>>;
+
+pub fn default_autostart(entry_name: impl Into<String>) -> AutostartPortRef {
+    let entry_name = entry_name.into();
+
+    #[cfg(windows)]
+    {
+        return std::sync::Arc::new(std::sync::Mutex::new(WindowsAutostart::new(entry_name)));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        return std::sync::Arc::new(std::sync::Mutex::new(
+            macos::MacosAutostart::for_current_exe(entry_name),
+        ));
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        std::sync::Arc::new(std::sync::Mutex::new(NoOpAutostart::new(entry_name)))
     }
 }
 

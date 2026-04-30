@@ -2,7 +2,8 @@ import { useEffect, useState } from "react";
 import { useNavigate } from "react-router";
 import { Play, Settings, Monitor, Cpu, Zap } from "lucide-react";
 import * as commands from "../../adapters/tauri/commands";
-import type { TestConfig } from "../../adapters/tauri/types";
+import type { EnvironmentSnapshot, TestConfig } from "../../adapters/tauri/types";
+import { capabilityAvailable, capabilityTag, unavailableText } from "./capabilityMeta";
 
 type CaptureId = NonNullable<TestConfig["capture_type"]>;
 type EncoderId = NonNullable<TestConfig["encoder_type"]>;
@@ -42,6 +43,12 @@ const CAPTURE_OPTIONS: CaptureOption[] = [
     icon: <Monitor className="h-5 w-5" />,
   },
   {
+    id: "macos",
+    name: "macOS",
+    description: "macOS display capture - Screen Recording permission may be required",
+    icon: <Monitor className="h-5 w-5" />,
+  },
+  {
     id: "synthetic",
     name: "Synthetic",
     description: "Synthetic frame generator - baseline pipeline input",
@@ -68,6 +75,12 @@ const ENCODER_OPTIONS: EncoderOption[] = [
     description: "软件编码器 - 跨平台兼容",
     icon: <Cpu className="h-5 w-5" />,
   },
+  {
+    id: "videotoolbox_h264",
+    name: "VideoToolbox H.264",
+    description: "macOS VideoToolbox - Apple 硬件 H.264 编码",
+    icon: <Zap className="h-5 w-5" />,
+  },
 ];
 
 const DECODER_OPTIONS: DecoderOption[] = [
@@ -80,6 +93,11 @@ const DECODER_OPTIONS: DecoderOption[] = [
     id: "software",
     name: "软件解码",
     description: "FFmpeg 软件解码 - CPU 解码",
+  },
+  {
+    id: "videotoolbox",
+    name: "VideoToolbox",
+    description: "macOS VideoToolbox - Apple 硬件 H.264 解码",
   },
 ];
 
@@ -109,7 +127,7 @@ export function CustomTestPage() {
   const [selectedFps, setSelectedFps] = useState(60);
   const [selectedBitrate, setSelectedBitrate] = useState("5000");
   const [starting, setStarting] = useState(false);
-  const [availableEncoders, setAvailableEncoders] = useState<string[] | null>(null);
+  const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
   const [startError, setStartError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -117,7 +135,7 @@ export function CustomTestPage() {
 
     commands.testGetCapabilities().then((result) => {
       if (!cancelled && result.ok) {
-        setAvailableEncoders(result.value.available_encoders);
+        setCapabilities(result.value);
       }
     });
 
@@ -126,22 +144,54 @@ export function CustomTestPage() {
     };
   }, []);
 
-  const isEncoderAvailable = (encoder: EncoderId) => {
-    if (availableEncoders === null) {
-      return encoder !== "nvenc_av1";
+  const isCaptureAvailable = (capture: CaptureId) =>
+    capabilityAvailable(capabilities, "available_captures", capture, capture === "synthetic");
+  const isEncoderAvailable = (encoder: EncoderId) =>
+    capabilityAvailable(capabilities, "available_encoders", encoder, encoder === "openh264");
+  const isDecoderAvailable = (decoder: DecoderId) =>
+    decoder === "none" ||
+    capabilityAvailable(capabilities, "available_decoders", decoder, decoder === "software");
+
+  useEffect(() => {
+    if (!capabilities) return;
+
+    if (!isCaptureAvailable(selectedCapture)) {
+      const nextCapture = CAPTURE_OPTIONS.find((option) => isCaptureAvailable(option.id));
+      if (nextCapture) setSelectedCapture(nextCapture.id);
     }
-    return availableEncoders.includes(encoder);
-  };
+    if (!isEncoderAvailable(selectedEncoder)) {
+      const nextEncoder = ENCODER_OPTIONS.find((option) => isEncoderAvailable(option.id));
+      if (nextEncoder) setSelectedEncoder(nextEncoder.id);
+    }
+    if (!isDecoderAvailable(selectedDecoder)) {
+      const nextDecoder = DECODER_OPTIONS.find((option) => isDecoderAvailable(option.id));
+      if (nextDecoder) setSelectedDecoder(nextDecoder.id);
+    }
+  }, [capabilities, selectedCapture, selectedDecoder, selectedEncoder]);
 
   const blockedReason = () => {
+    if (!isCaptureAvailable(selectedCapture)) {
+      return "当前平台未暴露所选采集能力。";
+    }
     if (!isEncoderAvailable(selectedEncoder)) {
       if (selectedEncoder === "nvenc_av1") {
         return "当前 GPU/驱动未暴露 NVENC AV1 编码能力。RTX 30 系通常支持 AV1 解码，但不支持 AV1 NVENC 编码。";
       }
       return "当前环境未暴露所选编码器能力。";
     }
+    if (!isDecoderAvailable(selectedDecoder)) {
+      return selectedDecoder === "videotoolbox"
+        ? "VideoToolbox 解码当前为实验路径，需显式启用后才可测试。"
+        : "当前平台未暴露所选解码能力。";
+    }
     if (selectedEncoder === "nvenc_av1" && selectedDecoder === "software") {
       return "NVENC AV1 当前只支持 NVDEC 或 encode-only 链路，软件 AV1 解码链路尚未接入。";
+    }
+    if (selectedEncoder === "videotoolbox_h264" && selectedDecoder === "nvdec") {
+      return "VideoToolbox H.264 是 macOS 原生路径，请选择 VideoToolbox、软件解码或 encode-only。";
+    }
+    if (selectedEncoder === "nvenc_av1" && selectedDecoder === "videotoolbox") {
+      return "VideoToolbox H.264 解码器不能解码 NVENC AV1 输出。";
     }
     return null;
   };
@@ -155,12 +205,17 @@ export function CustomTestPage() {
 
     setStarting(true);
     setStartError(null);
+    const useMacosRenderer =
+      selectedCapture === "macos" ||
+      selectedEncoder === "videotoolbox_h264" ||
+      selectedDecoder === "videotoolbox";
 
     const config: TestConfig = {
       capture_type: selectedCapture,
       encoder_type: selectedEncoder,
       decoder_type: selectedDecoder,
-      renderer_type: "d3d11",
+      renderer_type: useMacosRenderer ? "macos" : "d3d11",
+      render_display: useMacosRenderer ? true : undefined,
       resolution: (() => {
         const resolution = RESOLUTIONS.find((r) => r.id === selectedResolution)!;
         return [resolution.width, resolution.height] as [number, number];
@@ -237,14 +292,17 @@ export function CustomTestPage() {
         <div className="bg-card rounded-lg border p-4">
           <h3 className="font-medium mb-3">捕获源</h3>
           <div className="space-y-2">
-            {CAPTURE_OPTIONS.map((option) => (
+            {CAPTURE_OPTIONS.map((option) => {
+              const available = isCaptureAvailable(option.id);
+              const disabledLabel = unavailableText(capabilities, "available_captures", option.id);
+              return (
               <label
                 key={option.id}
                 className={`flex items-start gap-3 p-3 rounded cursor-pointer border transition-colors ${
                   selectedCapture === option.id
                     ? "bg-primary/10 border-primary"
                     : "bg-background hover:bg-muted"
-                }`}
+                } ${!available ? "opacity-50 cursor-not-allowed" : ""}`}
               >
                 <input
                   type="radio"
@@ -253,16 +311,26 @@ export function CustomTestPage() {
                   checked={selectedCapture === option.id}
                   onChange={(e) => setSelectedCapture(e.target.value as CaptureId)}
                   className="mt-1"
+                  disabled={!available}
                 />
                 <div className="flex-1">
                   <div className="flex items-center gap-2 font-medium text-sm">
                     {option.icon}
                     {option.name}
+                    <span className="text-xs bg-muted px-1 rounded">
+                      {capabilityTag(option.id)}
+                    </span>
+                    {disabledLabel && (
+                      <span className="text-xs bg-yellow-100 text-yellow-800 px-1 rounded">
+                        {disabledLabel}
+                      </span>
+                    )}
                   </div>
                   <p className="text-xs text-muted-foreground mt-1">{option.description}</p>
                 </div>
               </label>
-            ))}
+              );
+            })}
           </div>
         </div>
 
@@ -296,6 +364,9 @@ export function CustomTestPage() {
                   <div className="flex items-center gap-2 font-medium text-sm">
                     {option.icon}
                     {option.name}
+                    <span className="text-xs bg-muted px-1 rounded">
+                      {capabilityTag(option.id)}
+                    </span>
                     {isAv1Unavailable && (
                       <span className="text-xs bg-yellow-100 text-yellow-800 px-1 rounded">
                         GPU 不支持
@@ -319,14 +390,20 @@ export function CustomTestPage() {
         <div className="bg-card rounded-lg border p-4">
           <h3 className="font-medium mb-3">解码器</h3>
           <div className="space-y-2">
-            {DECODER_OPTIONS.map((option) => (
+            {DECODER_OPTIONS.map((option) => {
+              const available = isDecoderAvailable(option.id);
+              const disabledLabel =
+                option.id === "none"
+                  ? null
+                  : unavailableText(capabilities, "available_decoders", option.id);
+              return (
               <label
                 key={option.id}
                 className={`flex items-start gap-3 p-3 rounded cursor-pointer border transition-colors ${
                   selectedDecoder === option.id
                     ? "bg-primary/10 border-primary"
                     : "bg-background hover:bg-muted"
-                }`}
+                } ${!available ? "opacity-50 cursor-not-allowed" : ""}`}
               >
                 <input
                   type="radio"
@@ -335,13 +412,25 @@ export function CustomTestPage() {
                   checked={selectedDecoder === option.id}
                   onChange={(e) => setSelectedDecoder(e.target.value as DecoderId)}
                   className="mt-1"
+                  disabled={!available}
                 />
                 <div className="flex-1">
-                  <div className="font-medium text-sm">{option.name}</div>
+                  <div className="flex items-center gap-2 font-medium text-sm">
+                    {option.name}
+                    <span className="text-xs bg-muted px-1 rounded">
+                      {capabilityTag(option.id)}
+                    </span>
+                    {disabledLabel && (
+                      <span className="text-xs bg-yellow-100 text-yellow-800 px-1 rounded">
+                        {disabledLabel}
+                      </span>
+                    )}
+                  </div>
                   <p className="text-xs text-muted-foreground mt-1">{option.description}</p>
                 </div>
               </label>
-            ))}
+              );
+            })}
           </div>
         </div>
       </div>

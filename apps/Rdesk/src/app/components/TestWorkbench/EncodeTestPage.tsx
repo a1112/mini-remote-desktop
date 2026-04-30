@@ -1,8 +1,10 @@
 import { useState, useEffect } from "react";
 import { Play, Square, Zap, Cpu, Gauge, Video } from "lucide-react";
 import * as commands from "../../adapters/tauri/commands";
+import type { EnvironmentSnapshot } from "../../adapters/tauri/types";
+import { capabilityAvailable, capabilityTag, unavailableText } from "./capabilityMeta";
 
-type EncoderType = "nvenc_h264" | "nvenc_av1" | "openh264";
+type EncoderType = "nvenc_h264" | "nvenc_av1" | "openh264" | "videotoolbox_h264";
 
 interface EncoderOption {
   id: EncoderType;
@@ -38,6 +40,14 @@ const ENCODER_OPTIONS: EncoderOption[] = [
     available: true,
     icon: <Cpu className="h-5 w-5 text-orange-500" />,
   },
+  {
+    id: "videotoolbox_h264",
+    name: "VideoToolbox H.264",
+    description: "macOS Apple 硬件 H.264 编码器",
+    type: "hardware",
+    available: true,
+    icon: <Zap className="h-5 w-5 text-blue-500" />,
+  },
 ];
 
 interface EncoderMetrics {
@@ -58,16 +68,13 @@ export function EncodeTestPage() {
   const [selectedPreset, setSelectedPreset] = useState("p1");
   const [isRunning, setIsRunning] = useState(false);
   const [metrics, setMetrics] = useState<EncoderMetrics | null>(null);
-  const [availableEncoders, setAvailableEncoders] = useState<string[] | null>(null);
+  const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
   const [startError, setStartError] = useState<string | null>(null);
 
   const selectedOption = ENCODER_OPTIONS.find((o) => o.id === selectedEncoder);
   const isEncoderAvailable = (option: EncoderOption) => {
     if (!option.available) return false;
-    if (availableEncoders === null) {
-      return option.id !== "nvenc_av1";
-    }
-    return availableEncoders.includes(option.id);
+    return capabilityAvailable(capabilities, "available_encoders", option.id, option.id === "openh264");
   };
   const selectedAvailable = selectedOption ? isEncoderAvailable(selectedOption) : false;
 
@@ -76,7 +83,7 @@ export function EncodeTestPage() {
 
     commands.testGetCapabilities().then((result) => {
       if (!cancelled && result.ok) {
-        setAvailableEncoders(result.value.available_encoders);
+        setCapabilities(result.value);
       }
     });
 
@@ -84,6 +91,12 @@ export function EncodeTestPage() {
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    if (!capabilities || selectedAvailable) return;
+    const nextEncoder = ENCODER_OPTIONS.find((option) => isEncoderAvailable(option));
+    if (nextEncoder) setSelectedEncoder(nextEncoder.id);
+  }, [capabilities, selectedAvailable]);
 
   useEffect(() => {
     if (!isRunning) return;
@@ -142,8 +155,31 @@ export function EncodeTestPage() {
       return;
     }
 
+    if (selectedEncoder === "videotoolbox_h264") {
+      const customResult = await commands.testHarnessSetCustom({
+        capture: "synthetic",
+        encoder: "videotoolbox_h264",
+        decoder: "none",
+      });
+      if (!customResult.ok) {
+        setIsRunning(false);
+        setStartError(customResult.error.message);
+        return;
+      }
+
+      const startResult = await commands.testHarnessStart();
+      if (!startResult.ok) {
+        setIsRunning(false);
+        setStartError(startResult.error.message);
+      }
+      return;
+    }
+
     // Map encoder to test chain
-    const chainMap: Record<Exclude<EncoderType, "nvenc_av1">, "nvenc_only" | "openh264"> = {
+    const chainMap: Record<
+      Exclude<EncoderType, "nvenc_av1" | "videotoolbox_h264">,
+      "nvenc_only" | "openh264"
+    > = {
       nvenc_h264: "nvenc_only",
       openh264: "openh264",
     };
@@ -188,6 +224,7 @@ export function EncodeTestPage() {
           {ENCODER_OPTIONS.map((option) => {
             const available = isEncoderAvailable(option);
             const isAv1Unavailable = option.id === "nvenc_av1" && !available;
+            const disabledLabel = unavailableText(capabilities, "available_encoders", option.id);
             return (
             <button
               key={option.id}
@@ -207,9 +244,12 @@ export function EncodeTestPage() {
               <span className="inline-block mt-2 text-xs bg-muted px-2 py-0.5 rounded">
                 {option.type === "hardware" ? "硬件加速" : "软件"}
               </span>
-              {isAv1Unavailable && (
+              <span className="inline-block mt-2 ml-2 text-xs bg-muted px-2 py-0.5 rounded">
+                {capabilityTag(option.id)}
+              </span>
+              {(isAv1Unavailable || disabledLabel) && (
                 <span className="inline-block mt-2 ml-2 text-xs bg-yellow-100 text-yellow-800 px-2 py-0.5 rounded">
-                  GPU 不支持
+                  {isAv1Unavailable ? "GPU 不支持" : disabledLabel}
                 </span>
               )}
             </button>

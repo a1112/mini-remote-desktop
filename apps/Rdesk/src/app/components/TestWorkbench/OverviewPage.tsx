@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useNavigate } from "react-router";
 import {
   Activity,
   CheckCircle2,
@@ -12,6 +13,7 @@ import * as commands from "../../adapters/tauri/commands";
 import type { TestScenario, TestRun, EnvironmentSnapshot } from "../../adapters/tauri/types";
 
 export function OverviewPage() {
+  const navigate = useNavigate();
   const [scenarios, setScenarios] = useState<TestScenario[]>([]);
   const [recentRuns, setRecentRuns] = useState<TestRun[]>([]);
   const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
@@ -124,21 +126,33 @@ export function OverviewPage() {
               快速入口
             </h2>
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-              <button className="flex items-center justify-between rounded-lg border p-4 hover:bg-muted transition-colors text-left">
+              <button
+                type="button"
+                onClick={() => navigate("/test/e2e")}
+                className="flex items-center justify-between rounded-lg border p-4 hover:bg-muted transition-colors text-left"
+              >
                 <div>
                   <div className="font-medium">端到端本地测试</div>
                   <div className="text-sm text-muted-foreground">测试完整采集到渲染流程</div>
                 </div>
                 <ArrowRight className="h-5 w-5 text-muted-foreground" />
               </button>
-              <button className="flex items-center justify-between rounded-lg border p-4 hover:bg-muted transition-colors text-left">
+              <button
+                type="button"
+                onClick={() => navigate("/test/matrix")}
+                className="flex items-center justify-between rounded-lg border p-4 hover:bg-muted transition-colors text-left"
+              >
                 <div>
                   <div className="font-medium">矩阵性能测试</div>
                   <div className="text-sm text-muted-foreground">批量测试多组参数组合</div>
                 </div>
                 <ArrowRight className="h-5 w-5 text-muted-foreground" />
               </button>
-              <button className="flex items-center justify-between rounded-lg border p-4 hover:bg-muted transition-colors text-left">
+              <button
+                type="button"
+                onClick={() => navigate("/test/custom")}
+                className="flex items-center justify-between rounded-lg border p-4 hover:bg-muted transition-colors text-left"
+              >
                 <div>
                   <div className="font-medium">自由组合测试</div>
                   <div className="text-sm text-muted-foreground">自定义测试配置</div>
@@ -179,7 +193,11 @@ export function OverviewPage() {
                           {run.summary.frame_count} 帧 · {run.summary.dropped_frames} 丢帧
                         </div>
                       )}
-                      <button className="text-sm text-primary hover:underline">
+                      <button
+                        type="button"
+                        onClick={() => navigate(`/test/run/${run.run_id}`)}
+                        className="text-sm text-primary hover:underline"
+                      >
                         查看详情
                       </button>
                     </div>

@@ -1,6 +1,8 @@
 import { useState, useEffect } from "react";
 import { Play, Square, Network, Gauge } from "lucide-react";
 import * as commands from "../../adapters/tauri/commands";
+import type { EnvironmentSnapshot, TestConfig } from "../../adapters/tauri/types";
+import { capabilityAvailable, chooseCapability } from "./capabilityMeta";
 
 type TransportType = "quic" | "webrtc";
 type TestProfile = "latency" | "throughput" | "stability";
@@ -25,7 +27,7 @@ const TRANSPORT_OPTIONS: TransportOption[] = [
     id: "webrtc",
     name: "WebRTC",
     description: "实时通信传输协议",
-    available: false,
+    available: true,
     icon: <Network className="h-5 w-5 text-green-500" />,
   },
 ];
@@ -46,8 +48,11 @@ export function TransportTestPage() {
   const [testProfile, setTestProfile] = useState<TestProfile>("latency");
   const [selectedServer, setSelectedServer] = useState("localhost");
   const [isRunning, setIsRunning] = useState(false);
+  const [currentRunId, setCurrentRunId] = useState<string | null>(null);
   const [metrics, setMetrics] = useState<TransportMetrics | null>(null);
   const [throughputHistory, setThroughputHistory] = useState<number[]>([]);
+  const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
+  const [startError, setStartError] = useState<string | null>(null);
 
   const selectedOption = TRANSPORT_OPTIONS.find((o) => o.id === selectedTransport);
 
@@ -62,6 +67,20 @@ export function TransportTestPage() {
     { id: "lan", name: "局域网服务器" },
     { id: "wan", name: "公网服务器" },
   ];
+
+  useEffect(() => {
+    let cancelled = false;
+
+    commands.testGetCapabilities().then((result) => {
+      if (!cancelled && result.ok) {
+        setCapabilities(result.value);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     if (!isRunning) return;
@@ -94,17 +113,59 @@ export function TransportTestPage() {
   const handleStart = async () => {
     if (!selectedOption?.available) return;
 
-    setIsRunning(true);
     setMetrics(null);
     setThroughputHistory([]);
+    setStartError(null);
+    setCurrentRunId(null);
 
-    // Start test harness for baseline
-    await commands.testHarnessStart("nvenc_nvdec");
+    const capture = chooseCapability(
+      ["macos", "dxgi", "synthetic"],
+      capabilities,
+      "available_captures",
+      "synthetic"
+    );
+    const encoder = chooseCapability(
+      capture === "macos" ? ["videotoolbox_h264", "openh264"] : ["nvenc_h264", "openh264"],
+      capabilities,
+      "available_encoders",
+      "openh264"
+    );
+    const decoder = capabilityAvailable(capabilities, "available_decoders", "software", true)
+      ? "software"
+      : "none";
+    const config: TestConfig = {
+      capture_type: capture,
+      encoder_type: encoder,
+      decoder_type: decoder,
+      transport_kind: selectedTransport,
+      resolution: [1280, 720],
+      fps: testProfile === "throughput" ? 60 : 30,
+      bitrate: testProfile === "throughput" ? 20_000_000 : 5_000_000,
+      duration_ms: 10_000,
+      warmup_ms: 500,
+      input_source: capture === "synthetic" ? "synthetic" : "screen",
+    };
+
+    const result = await commands.testStartRun({
+      scenarioId: "custom",
+      config,
+    });
+    if (result.ok) {
+      setCurrentRunId(result.value);
+      setIsRunning(true);
+    } else {
+      setStartError(result.error.message);
+    }
   };
 
   const handleStop = async () => {
-    await commands.testHarnessStop();
+    if (currentRunId) {
+      await commands.testStopRun(currentRunId);
+    } else {
+      await commands.testHarnessStop();
+    }
     setIsRunning(false);
+    setCurrentRunId(null);
   };
 
   return (
@@ -229,6 +290,7 @@ export function TransportTestPage() {
           </button>
         )}
       </div>
+      {startError && <p className="text-sm text-red-600 mb-6">{startError}</p>}
 
       {/* Metrics */}
       {metrics && (

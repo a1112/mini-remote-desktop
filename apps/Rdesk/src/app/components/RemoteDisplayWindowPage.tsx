@@ -19,6 +19,7 @@ import {
   closeRemoteDisplayWindow,
   configureRemoteDisplayNativeSurface,
   currentRemoteDisplayWindowContext,
+  testGetCapabilities,
   testGetRun,
   testHarnessGetFrames,
   testHarnessGetMetrics,
@@ -28,6 +29,7 @@ import {
   type CaptureType,
   type DecoderType,
   type EncoderType,
+  type EnvironmentSnapshot,
   type FrameData,
   type HarnessMetrics,
   type NativeRenderSurfaceSnapshot,
@@ -45,7 +47,7 @@ import {
 import { isTauriRuntime } from "../utils/runtime";
 import { withTauriWindow } from "../utils/tauriWindow";
 
-type RenderMode = "web" | "d3d11_native";
+type RenderMode = "web" | "d3d11_native" | "metal_native";
 type TransportKind = NonNullable<TestMatrixConfig["transport"]>;
 type ResolutionKey = "1280x720" | "1920x1080" | "2560x1440" | "2560x1600" | "3440x1440";
 type FpsKey = "30" | "60" | "120" | "144";
@@ -60,17 +62,20 @@ type Option<T extends string> = {
 const captureOptions: Option<CaptureType>[] = [
   { value: "dxgi", label: "DXGI" },
   { value: "winrt", label: "WinRT" },
+  { value: "macos", label: "macOS" },
   { value: "synthetic", label: "Synthetic" },
 ];
 
 const encoderOptions: Option<EncoderType>[] = [
   { value: "nvenc_h264", label: "NVENC H.264" },
+  { value: "videotoolbox_h264", label: "VideoToolbox H.264" },
   { value: "openh264", label: "OpenH264" },
   { value: "nvenc_av1", label: "NVENC AV1" },
 ];
 
 const decoderOptions: Option<DecoderType>[] = [
   { value: "nvdec", label: "NVDEC" },
+  { value: "videotoolbox", label: "VideoToolbox" },
   { value: "software", label: "Software" },
   { value: "none", label: "Encode only" },
 ];
@@ -105,6 +110,35 @@ const bitrateOptions: Option<BitrateKey>[] = [
 
 function optionLabel<T extends string>(options: Option<T>[], value: T) {
   return options.find((option) => option.value === value)?.label ?? value;
+}
+
+function browserLooksLikeMacos(): boolean {
+  if (typeof navigator === "undefined") return false;
+  const platform = navigator.platform.toLowerCase();
+  const userAgent = navigator.userAgent.toLowerCase();
+  return platform.includes("mac") || userAgent.includes("mac os x");
+}
+
+function defaultNativeRenderMode(): RenderMode {
+  return browserLooksLikeMacos() ? "metal_native" : "d3d11_native";
+}
+
+function normalizeOs(osType?: string): "macos" | "windows" | "other" {
+  const os = osType?.toLowerCase() ?? "";
+  if (os.includes("mac")) return "macos";
+  if (os.includes("win")) return "windows";
+  return "other";
+}
+
+function pickAvailable<T extends string>(
+  current: T,
+  available: readonly string[] | undefined,
+  preferred: readonly T[],
+  fallback: T
+): T {
+  if (!available || available.length === 0) return current;
+  if (available.includes(current)) return current;
+  return preferred.find((value) => available.includes(value)) ?? fallback;
 }
 
 export function isLocalPipelinePreviewSession(sessionId: string): boolean {
@@ -154,10 +188,11 @@ export function RemoteDisplayWindowPage() {
   const syncTimerIdsRef = useRef<number[]>([]);
 
   const [context, setContext] = useState<RemoteDisplayWindowContext | null>(null);
+  const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
   const [nativeSurface, setNativeSurface] =
     useState<NativeRenderSurfaceSnapshot | null>(null);
   const [renderMode, setRenderMode] = useState<RenderMode>(() =>
-    isTauriRuntime() ? "d3d11_native" : "web"
+    isTauriRuntime() ? defaultNativeRenderMode() : "web"
   );
   const [capture, setCapture] = useState<CaptureType>("dxgi");
   const [encoder, setEncoder] = useState<EncoderType>("nvenc_h264");
@@ -182,9 +217,53 @@ export function RemoteDisplayWindowPage() {
   const sessionId = id ?? context?.session_id ?? "local-preview";
   const activeSurfaceId = context?.surface_id ?? surfaceId;
   const isLocalPipelinePreview = isLocalPipelinePreviewSession(sessionId);
-  const isNative = renderMode === "d3d11_native";
+  const hostOs = normalizeOs(capabilities?.os_type);
+  const nativeRenderMode: RenderMode = hostOs === "macos" ? "metal_native" : "d3d11_native";
+  const nativeRendererType =
+    renderMode === "metal_native" ? "macos" : renderMode === "d3d11_native" ? "d3d11" : null;
+  const isNative = nativeRendererType !== null;
+  const nativeRenderAvailable =
+    isTauriRuntime() &&
+    (!capabilities
+      ? true
+      : nativeRendererType === "macos"
+        ? capabilities.available_renderers?.includes("macos") ?? false
+        : nativeRendererType === "d3d11"
+          ? capabilities.available_renderers?.includes("d3d11") ?? false
+          : false);
   const usesNativeSharedTexture =
-    isNative && capture === "dxgi" && encoder === "nvenc_h264" && decoder === "nvdec";
+    nativeRendererType === "d3d11" &&
+    capture === "dxgi" &&
+    encoder === "nvenc_h264" &&
+    decoder === "nvdec";
+  const visibleCaptureOptions = useMemo(
+    () =>
+      capabilities?.available_captures?.length
+        ? captureOptions.filter((option) => capabilities.available_captures?.includes(option.value))
+        : captureOptions,
+    [capabilities]
+  );
+  const visibleEncoderOptions = useMemo(
+    () =>
+      capabilities?.available_encoders?.length
+        ? encoderOptions.filter((option) => capabilities.available_encoders.includes(option.value))
+        : encoderOptions,
+    [capabilities]
+  );
+  const visibleDecoderOptions = useMemo(
+    () =>
+      capabilities?.available_decoders?.length
+        ? decoderOptions.filter((option) => capabilities.available_decoders.includes(option.value))
+        : decoderOptions,
+    [capabilities]
+  );
+  const renderModeLabel =
+    renderMode === "metal_native"
+      ? "Metal native"
+      : renderMode === "d3d11_native"
+        ? "D3D11 native"
+        : "Web preview";
+  const nativeRenderLabel = hostOs === "macos" ? "Metal native" : "DX11 native";
   const remoteFramesReceived = probeSnapshot?.frames_received ?? 0;
   const remoteFramesDecoded = probeSnapshot?.frames_decoded ?? 0;
   const hasRemoteFrames = remoteFramesReceived > 0 || remoteFramesDecoded > 0;
@@ -208,7 +287,7 @@ export function RemoteDisplayWindowPage() {
       )} / ${optionLabel(bitrateOptions, bitrate)}`,
     [bitrate, capture, decoder, encoder, fps, resolution, transport]
   );
-  const buildTestConfig = useCallback((rendererTargetHwnd?: number | null) => {
+  const buildTestConfig = useCallback((rendererTargetHwnd?: string | null) => {
     const [width, height] = resolution.split("x").map(Number) as [number, number];
     return {
       capture_type: capture,
@@ -224,10 +303,21 @@ export function RemoteDisplayWindowPage() {
       output_validation: true,
       render_display: Boolean(isNative && rendererTargetHwnd),
       zero_copy: usesNativeSharedTexture,
-      ...(isNative ? { renderer_type: "d3d11" as const } : {}),
+      ...(nativeRendererType ? { renderer_type: nativeRendererType } : {}),
       ...(isNative && rendererTargetHwnd ? { renderer_target_hwnd: rendererTargetHwnd } : {}),
     } satisfies TestConfig;
-  }, [bitrate, capture, decoder, encoder, fps, isNative, resolution, transport, usesNativeSharedTexture]);
+  }, [
+    bitrate,
+    capture,
+    decoder,
+    encoder,
+    fps,
+    isNative,
+    nativeRendererType,
+    resolution,
+    transport,
+    usesNativeSharedTexture,
+  ]);
   const testConfig = useMemo(
     () => buildTestConfig(nativeSurface?.hwnd),
     [buildTestConfig, nativeSurface?.hwnd]
@@ -241,11 +331,19 @@ export function RemoteDisplayWindowPage() {
   }, []);
 
   useEffect(() => {
+    void testGetCapabilities().then((result) => {
+      if (result.ok) setCapabilities(result.value);
+    });
+  }, []);
+
+  useEffect(() => {
     if (!isTauriRuntime()) return;
     void currentRemoteDisplayWindowContext().then((result) => {
       if (result.ok) {
         setContext(result.value);
-        if (result.value?.render_mode === "d3d11_native") {
+        if (result.value?.render_mode === "macos_native") {
+          setRenderMode("metal_native");
+        } else if (result.value?.render_mode === "d3d11_native") {
           setRenderMode("d3d11_native");
         }
       }
@@ -256,6 +354,58 @@ export function RemoteDisplayWindowPage() {
     });
   }, []);
 
+  useEffect(() => {
+    if (!capabilities) return;
+
+    const os = normalizeOs(capabilities.os_type);
+    if (os === "macos") {
+      setCapture((value) =>
+        pickAvailable(value, capabilities.available_captures, ["macos", "synthetic"], "macos")
+      );
+      setEncoder((value) =>
+        pickAvailable(
+          value,
+          capabilities.available_encoders,
+          ["videotoolbox_h264", "openh264"],
+          "videotoolbox_h264"
+        )
+      );
+      setDecoder((value) =>
+        pickAvailable(
+          value,
+          capabilities.available_decoders,
+          ["videotoolbox", "software", "none"],
+          "videotoolbox"
+        )
+      );
+      setFps((value) => (value === "120" || value === "144" ? "60" : value));
+      setRenderMode((value) => (value === "d3d11_native" ? "metal_native" : value));
+      return;
+    }
+
+    if (os === "windows") {
+      setCapture((value) =>
+        pickAvailable(value, capabilities.available_captures, ["dxgi", "winrt", "synthetic"], "dxgi")
+      );
+      setEncoder((value) =>
+        pickAvailable(value, capabilities.available_encoders, ["nvenc_h264", "openh264"], "nvenc_h264")
+      );
+      setDecoder((value) =>
+        pickAvailable(value, capabilities.available_decoders, ["nvdec", "software", "none"], "nvdec")
+      );
+      setRenderMode((value) => (value === "metal_native" ? "d3d11_native" : value));
+      return;
+    }
+
+    setRenderMode("web");
+  }, [capabilities]);
+
+  useEffect(() => {
+    if (isNative && capabilities && !nativeRenderAvailable) {
+      setRenderMode("web");
+    }
+  }, [capabilities, isNative, nativeRenderAvailable]);
+
   const syncNativeSurface = useCallback(async (options?: { visible?: boolean }) => {
     if (!isTauriRuntime()) return null;
     const element = renderAreaRef.current;
@@ -265,10 +415,10 @@ export function RemoteDisplayWindowPage() {
     if (isNative && (rect.width <= 0 || rect.height <= 0)) return null;
 
     const visible = options?.visible ?? !testSettingsOpen;
-    const scale = window.devicePixelRatio || 1;
+    const scale = nativeRendererType === "macos" ? 1 : window.devicePixelRatio || 1;
     const result = await configureRemoteDisplayNativeSurface({
-      enabled: isNative,
-      visible: isNative && visible,
+      enabled: isNative && nativeRenderAvailable,
+      visible: isNative && nativeRenderAvailable && visible,
       rect: {
         x: Math.round(rect.left * scale),
         y: Math.round(rect.top * scale),
@@ -286,7 +436,7 @@ export function RemoteDisplayWindowPage() {
       if (isNative) setRenderMode("web");
       return null;
     }
-  }, [isNative, testSettingsOpen]);
+  }, [isNative, nativeRenderAvailable, testSettingsOpen]);
 
   const openTestSettings = useCallback(() => {
     if (!isLocalPipelinePreview) return;
@@ -401,10 +551,14 @@ export function RemoteDisplayWindowPage() {
 
     let cancelled = false;
     const poll = async () => {
-      const framesResult = await testHarnessGetFrames();
+      const framesResult = await testHarnessGetFrames({
+        includeCaptured: false,
+        includeRendered: true,
+      });
       if (cancelled) return;
-      if (framesResult.ok && framesResult.value[0]) {
-        setCapturedFrame(framesResult.value[0]);
+      if (framesResult.ok) {
+        const renderedFrame = framesResult.value[1] ?? framesResult.value[0];
+        if (renderedFrame) setCapturedFrame(renderedFrame);
       }
     };
 
@@ -492,6 +646,22 @@ export function RemoteDisplayWindowPage() {
   };
 
   const applyLowLatencyProfile = useCallback(() => {
+    if (hostOs === "macos") {
+      setCapture("macos");
+      setEncoder("videotoolbox_h264");
+      setDecoder(capabilities?.available_decoders.includes("videotoolbox") ? "videotoolbox" : "software");
+      setTransport("quic");
+      setResolution("1920x1080");
+      setFps("60");
+      setBitrate("20");
+      setRenderMode(
+        isTauriRuntime() && capabilities?.available_renderers?.includes("macos")
+          ? "metal_native"
+          : "web"
+      );
+      return;
+    }
+
     setCapture("dxgi");
     setEncoder("nvenc_h264");
     setDecoder("nvdec");
@@ -500,7 +670,7 @@ export function RemoteDisplayWindowPage() {
     setFps("144");
     setBitrate("20");
     setRenderMode("d3d11_native");
-  }, []);
+  }, [capabilities, hostOs]);
 
   const handleStartRemoteReceiver = useCallback(async () => {
     setTestSettingsOpen(false);
@@ -574,7 +744,7 @@ export function RemoteDisplayWindowPage() {
       const snapshot = await syncNativeSurface({ visible: true });
       const rendererTargetHwnd = snapshot?.hwnd ?? nativeSurface?.hwnd;
       if (!rendererTargetHwnd) {
-        const message = "DX11 native render surface is not attached";
+        const message = `${nativeRenderLabel} render surface is not attached`;
         setTestStatus("failed");
         setTestMessage(message);
         setLastError(message);
@@ -732,13 +902,18 @@ export function RemoteDisplayWindowPage() {
             </button>
             <button
               className={`px-2.5 py-1 text-[11px] ${
-                renderMode === "d3d11_native"
+                renderMode === nativeRenderMode
                   ? "bg-cyan-500/25 text-cyan-100"
-                  : "text-slate-400 hover:bg-white/8"
+                  : nativeRenderAvailable
+                    ? "text-slate-400 hover:bg-white/8"
+                    : "cursor-not-allowed text-slate-600"
               }`}
-              onClick={() => setRenderMode("d3d11_native")}
+              onClick={() => {
+                if (nativeRenderAvailable) setRenderMode(nativeRenderMode);
+              }}
+              disabled={!nativeRenderAvailable}
             >
-              DX11 native
+              {nativeRenderLabel}
             </button>
           </div>
           <button
@@ -786,9 +961,24 @@ export function RemoteDisplayWindowPage() {
             </div>
 
             <div className="grid min-h-0 gap-3 overflow-y-auto px-4 py-4 sm:grid-cols-2 lg:grid-cols-3">
-              <TitleSelect label="CAP" value={capture} options={captureOptions} onChange={setCapture} />
-              <TitleSelect label="ENC" value={encoder} options={encoderOptions} onChange={setEncoder} />
-              <TitleSelect label="DEC" value={decoder} options={decoderOptions} onChange={setDecoder} />
+              <TitleSelect
+                label="CAP"
+                value={capture}
+                options={visibleCaptureOptions}
+                onChange={setCapture}
+              />
+              <TitleSelect
+                label="ENC"
+                value={encoder}
+                options={visibleEncoderOptions}
+                onChange={setEncoder}
+              />
+              <TitleSelect
+                label="DEC"
+                value={decoder}
+                options={visibleDecoderOptions}
+                onChange={setDecoder}
+              />
               <TitleSelect
                 label="NET"
                 value={transport}
@@ -856,7 +1046,7 @@ export function RemoteDisplayWindowPage() {
         {isLocalPipelinePreview && !isNative && capturedFrame && (
           <img
             src={`data:image/png;base64,${capturedFrame[0]}`}
-            alt="Captured frame"
+            alt="Rendered frame"
             className="absolute inset-0 h-full w-full object-contain"
           />
         )}
@@ -865,7 +1055,7 @@ export function RemoteDisplayWindowPage() {
             <div className="text-center">
               <PanelTop className="mx-auto mb-3 h-9 w-9 text-slate-500" />
               <div className="text-sm font-medium text-slate-300">
-                {isTestBusy ? "等待捕获帧" : "点击开始测试显示捕获内容"}
+                {isTestBusy ? "等待渲染帧" : "点击开始测试显示渲染内容"}
               </div>
               <div className="mt-1 text-xs text-slate-500">
                 {testDescription}
@@ -916,7 +1106,7 @@ export function RemoteDisplayWindowPage() {
             <Circle className="h-2 w-2 fill-emerald-400 text-emerald-400" />
             {statusLabel}
           </span>
-          <span>render: {renderMode === "d3d11_native" ? "D3D11 native" : "Web preview"}</span>
+          <span>render: {renderModeLabel}</span>
           <span className="hidden min-w-0 truncate md:inline">
             {isLocalPipelinePreview
               ? `test: ${testDescription}`
@@ -930,11 +1120,11 @@ export function RemoteDisplayWindowPage() {
             </span>
           )}
           <span className="hidden xl:inline">
-            memory: {usesNativeSharedTexture ? "D3D11 shared" : "CPU preview"}
+            memory: {usesNativeSharedTexture ? "D3D11 shared" : nativeRendererType === "macos" ? "Metal upload" : "CPU preview"}
           </span>
           {isNative && nativeSurface?.attached && (
             <span className="hidden xl:inline">
-              surface: {activeSurfaceId} / hwnd {nativeSurface.hwnd}
+              surface: {activeSurfaceId} / handle {nativeSurface.hwnd}
             </span>
           )}
         </div>

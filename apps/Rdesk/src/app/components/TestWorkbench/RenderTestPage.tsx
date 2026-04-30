@@ -1,14 +1,15 @@
 import { useState, useEffect } from "react";
-import { Play, Square, Monitor, Palette, Layers } from "lucide-react";
+import { Play, Square, Monitor, Palette, Layers, ImageOff } from "lucide-react";
 import * as commands from "../../adapters/tauri/commands";
+import type { EnvironmentSnapshot, FrameData, TestConfig } from "../../adapters/tauri/types";
+import { capabilityAvailable, capabilityTag, chooseCapability, unavailableText } from "./capabilityMeta";
 
-type RendererType = "d3d11" | "d3d12" | "opengl";
+type RendererType = "d3d11" | "macos" | "d3d12" | "opengl";
 
 interface RendererOption {
   id: RendererType;
   name: string;
   description: string;
-  available: boolean;
 }
 
 const RENDERER_OPTIONS: RendererOption[] = [
@@ -16,19 +17,21 @@ const RENDERER_OPTIONS: RendererOption[] = [
     id: "d3d11",
     name: "Direct3D 11",
     description: "Windows 标准渲染 API，兼容性最佳",
-    available: true,
+  },
+  {
+    id: "macos",
+    name: "Metal",
+    description: "macOS 原生 Metal 渲染器",
   },
   {
     id: "d3d12",
     name: "Direct3D 12",
     description: "低级 API，更低 CPU 开销",
-    available: false,
   },
   {
     id: "opengl",
     name: "OpenGL",
     description: "跨平台渲染 API",
-    available: false,
   },
 ];
 
@@ -37,6 +40,9 @@ interface RenderMetrics {
   render_fps: number;
   frame_time_ms: number;
   gpu_frame_time_ms: number;
+  capture_latency_p95_ms: number;
+  transport_latency_p95_ms: number;
+  decode_latency_p95_ms: number;
   draw_calls: number;
   triangles: number;
   textures: number;
@@ -46,10 +52,18 @@ interface RenderMetrics {
 export function RenderTestPage() {
   const [selectedRenderer, setSelectedRenderer] = useState<RendererType>("d3d11");
   const [selectedMode, setSelectedMode] = useState<"video" | "animation" | "static">("video");
+  const [selectedResolution, setSelectedResolution] = useState("1920x1080");
   const [isRunning, setIsRunning] = useState(false);
+  const [currentRunId, setCurrentRunId] = useState<string | null>(null);
   const [metrics, setMetrics] = useState<RenderMetrics | null>(null);
+  const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
+  const [startError, setStartError] = useState<string | null>(null);
+  const [previewFrame, setPreviewFrame] = useState<FrameData | null>(null);
 
   const selectedOption = RENDERER_OPTIONS.find((o) => o.id === selectedRenderer);
+  const rendererAvailable = (renderer: RendererType) =>
+    capabilityAvailable(capabilities, "available_renderers", renderer);
+  const selectedAvailable = selectedOption ? rendererAvailable(selectedOption.id) : false;
 
   const RENDER_MODES = [
     { id: "video", name: "视频流", desc: "连续帧渲染" },
@@ -58,40 +72,133 @@ export function RenderTestPage() {
   ];
 
   useEffect(() => {
+    let cancelled = false;
+
+    commands.testGetCapabilities().then((result) => {
+      if (!cancelled && result.ok) {
+        setCapabilities(result.value);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!capabilities || rendererAvailable(selectedRenderer)) return;
+    const nextRenderer = RENDERER_OPTIONS.find((option) => rendererAvailable(option.id));
+    if (nextRenderer) setSelectedRenderer(nextRenderer.id);
+  }, [capabilities, selectedRenderer]);
+
+  useEffect(() => {
     if (!isRunning) return;
 
     const interval = setInterval(async () => {
       const result = await commands.testHarnessGetMetrics();
-      if (result.ok) {
+      if (result.ok && result.value) {
+        const fps = result.value.capture_fps;
         setMetrics({
           is_running: result.value.is_running,
-          render_fps: result.value.capture_fps,
-          frame_time_ms: 1000 / result.value.capture_fps,
-          gpu_frame_time_ms: result.value.encode_latency_p95_ms,
+          render_fps: fps,
+          frame_time_ms: fps > 0 ? 1000 / fps : 0,
+          gpu_frame_time_ms: result.value.total_latency_p95_ms,
+          capture_latency_p95_ms: result.value.capture_latency_p95_ms,
+          transport_latency_p95_ms: result.value.transport_latency_p95_ms,
+          decode_latency_p95_ms: result.value.decode_latency_p95_ms,
           draw_calls: Math.floor(1000 + Math.random() * 100),
           triangles: Math.floor(50000 + Math.random() * 10000),
           textures: 4,
           resolution: result.value.resolution,
         });
       }
+
+      const framesResult = await commands.testHarnessGetFrames({
+        includeCaptured: false,
+        includeRendered: true,
+      });
+      if (framesResult.ok) {
+        setPreviewFrame(framesResult.value[1] ?? framesResult.value[0] ?? null);
+      }
+
+      if (currentRunId) {
+        const runResult = await commands.testGetRun(currentRunId);
+        if (
+          runResult.ok &&
+          runResult.value &&
+          runResult.value.status !== "queued" &&
+          runResult.value.status !== "preparing" &&
+          runResult.value.status !== "running"
+        ) {
+          setIsRunning(false);
+        }
+      }
     }, 200);
 
     return () => clearInterval(interval);
-  }, [isRunning]);
+  }, [currentRunId, isRunning]);
 
   const handleStart = async () => {
-    if (!selectedOption?.available) return;
+    if (!selectedOption || !selectedAvailable) {
+      setStartError("当前平台未暴露所选渲染器能力。");
+      return;
+    }
 
-    setIsRunning(true);
     setMetrics(null);
+    setPreviewFrame(null);
+    setStartError(null);
+    setCurrentRunId(null);
 
-    // Start test harness for pipeline
-    await commands.testHarnessStart("nvenc_nvdec");
+    const [width, height] = selectedResolution.split("x").map(Number) as [number, number];
+    const directCaptureCandidates: Array<NonNullable<TestConfig["capture_type"]>> =
+      selectedRenderer === "macos" ? ["macos", "synthetic"] : ["dxgi", "synthetic"];
+    const syntheticCaptureCandidates: Array<NonNullable<TestConfig["capture_type"]>> = [
+      "synthetic",
+      ...directCaptureCandidates,
+    ];
+    const capture = chooseCapability(
+      selectedMode === "video" ? directCaptureCandidates : syntheticCaptureCandidates,
+      capabilities,
+      "available_captures",
+      "synthetic"
+    );
+    const config: TestConfig = {
+      capture_type: capture,
+      encoder_type: "none",
+      decoder_type: "none",
+      renderer_type: selectedRenderer === "macos" ? "macos" : "d3d11",
+      render_display: true,
+      transport_kind: "loopback",
+      resolution: [width, height],
+      fps: selectedMode === "static" ? 30 : 60,
+      bitrate: 8_000_000,
+      duration_ms: selectedMode === "static" ? 3_000 : selectedMode === "animation" ? 15_000 : 30_000,
+      warmup_ms: 500,
+      input_source: capture === "synthetic" ? "synthetic" : "screen",
+      output_validation: true,
+    };
+
+    const result = await commands.testStartRun({
+      scenarioId: "custom",
+      config,
+    });
+
+    if (result.ok) {
+      setCurrentRunId(result.value);
+      setIsRunning(true);
+    } else {
+      setStartError(result.error.message);
+    }
   };
 
   const handleStop = async () => {
-    await commands.testHarnessStop();
+    if (currentRunId) {
+      await commands.testStopRun(currentRunId);
+    } else {
+      await commands.testHarnessStop();
+    }
     setIsRunning(false);
+    setCurrentRunId(null);
   };
 
   return (
@@ -103,7 +210,7 @@ export function RenderTestPage() {
           渲染测试
         </h1>
         <p className="text-muted-foreground">
-          测试 D3D11/D3D12 渲染性能和帧率
+          测试当前平台可用的原生渲染器性能和帧率
         </p>
       </div>
 
@@ -111,29 +218,36 @@ export function RenderTestPage() {
       <div className="bg-card rounded-lg border p-4 mb-6">
         <h2 className="text-lg font-semibold mb-4">选择渲染器</h2>
         <div className="grid md:grid-cols-3 gap-4">
-          {RENDERER_OPTIONS.map((option) => (
+          {RENDERER_OPTIONS.map((option) => {
+            const available = rendererAvailable(option.id);
+            const disabledLabel = unavailableText(capabilities, "available_renderers", option.id);
+            return (
             <button
               key={option.id}
               onClick={() => setSelectedRenderer(option.id)}
-              disabled={isRunning || !option.available}
+              disabled={isRunning || !available}
               className={`p-4 rounded-lg border-2 text-left transition-all ${
                 selectedRenderer === option.id
                   ? "border-primary bg-primary/10"
                   : "border-transparent bg-muted/30 hover:bg-muted/50"
-              } ${!option.available ? "opacity-50 cursor-not-allowed" : ""}`}
+              } ${!available ? "opacity-50 cursor-not-allowed" : ""}`}
             >
               <div className="flex items-center gap-2 mb-2">
                 <Monitor className="h-5 w-5 text-blue-500" />
                 <span className="font-medium">{option.name}</span>
               </div>
               <p className="text-sm text-muted-foreground">{option.description}</p>
-              {!option.available && (
+              <span className="inline-block mt-2 text-xs bg-muted px-2 py-0.5 rounded">
+                {capabilityTag(option.id)}
+              </span>
+              {disabledLabel && (
                 <span className="inline-block mt-2 text-xs bg-yellow-100 text-yellow-800 px-2 py-0.5 rounded">
-                  即将推出
+                  {disabledLabel}
                 </span>
               )}
             </button>
-          ))}
+            );
+          })}
         </div>
       </div>
 
@@ -166,9 +280,10 @@ export function RenderTestPage() {
           {["1280x720", "1920x1080", "2560x1440", "3840x2160"].map((res) => (
             <button
               key={res}
+              onClick={() => setSelectedResolution(res)}
               disabled={isRunning}
               className={`px-3 py-1 rounded border text-sm ${
-                metrics?.resolution.join("x") === res
+                selectedResolution === res
                   ? "bg-primary text-primary-foreground border-primary"
                   : "bg-background hover:bg-muted"
               }`}
@@ -190,7 +305,7 @@ export function RenderTestPage() {
         {!isRunning ? (
           <button
             onClick={handleStart}
-            disabled={!selectedOption?.available}
+            disabled={!selectedAvailable}
             className="flex items-center gap-2 px-6 py-3 bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 transition-colors disabled:opacity-50"
           >
             <Play className="h-5 w-5" />
@@ -205,6 +320,30 @@ export function RenderTestPage() {
             停止测试
           </button>
         )}
+      </div>
+      {startError && (
+        <p className="text-sm text-red-600 mb-6">{startError}</p>
+      )}
+
+      <div className="bg-card rounded-lg border p-4 mb-6">
+        <h3 className="font-medium mb-4">实时画面</h3>
+        <div className="aspect-video rounded bg-black flex items-center justify-center overflow-hidden">
+          {previewFrame ? (
+            <img
+              src={`data:image/png;base64,${previewFrame[0]}`}
+              alt="Render preview"
+              className="h-full w-full object-contain"
+            />
+          ) : (
+            <div className="text-center text-sm text-muted-foreground">
+              <ImageOff className="mx-auto mb-2 h-8 w-8" />
+              {isRunning ? "等待渲染帧..." : "启动测试后显示渲染输入帧"}
+            </div>
+          )}
+        </div>
+        <p className="mt-2 text-xs text-muted-foreground">
+          预览来自测试 harness 的最新渲染输入帧；原生渲染器仍按所选后端执行上传/呈现链路。
+        </p>
       </div>
 
       {/* Metrics */}
@@ -238,7 +377,7 @@ export function RenderTestPage() {
             <div className="space-y-2">
               <FrameTimeBar label="16.6ms (60 FPS)" value={metrics.frame_time_ms} target={16.6} />
               <FrameTimeBar label="8.3ms (120 FPS)" value={metrics.frame_time_ms} target={8.3} />
-              <FrameTimeBar label="GPU 时间" value={metrics.gpu_frame_time_ms} target={10} />
+              <FrameTimeBar label="Pipeline P95" value={metrics.gpu_frame_time_ms} target={16.6} />
             </div>
           </div>
 
@@ -259,7 +398,19 @@ export function RenderTestPage() {
                 <p className="font-mono">{metrics.frame_time_ms.toFixed(2)} ms</p>
               </div>
               <div>
-                <p className="text-muted-foreground">GPU 帧时间</p>
+                <p className="text-muted-foreground">采集 P95</p>
+                <p className="font-mono">{metrics.capture_latency_p95_ms.toFixed(2)} ms</p>
+              </div>
+              <div>
+                <p className="text-muted-foreground">传输 P95</p>
+                <p className="font-mono">{metrics.transport_latency_p95_ms.toFixed(2)} ms</p>
+              </div>
+              <div>
+                <p className="text-muted-foreground">解码 P95</p>
+                <p className="font-mono">{metrics.decode_latency_p95_ms.toFixed(2)} ms</p>
+              </div>
+              <div>
+                <p className="text-muted-foreground">Pipeline P95</p>
                 <p className="font-mono">{metrics.gpu_frame_time_ms.toFixed(2)} ms</p>
               </div>
             </div>

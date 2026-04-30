@@ -208,7 +208,15 @@ impl DecodedFrame {
 
     /// Check if this frame uses shared texture (zero-copy)
     pub fn is_shared_texture(&self) -> bool {
-        matches!(self.data, DecodedFrameData::D3D11SharedNv12 { .. })
+        #[cfg(windows)]
+        {
+            matches!(self.data, DecodedFrameData::D3D11SharedNv12 { .. })
+        }
+
+        #[cfg(not(windows))]
+        {
+            false
+        }
     }
 
     /// Get the CPU RGB24 data if available
@@ -309,4 +317,16 @@ pub trait VideoDecoder: Send {
 
     /// Drain all decoded frames
     fn drain_decoded_frames(&mut self) -> Vec<DecodedFrame>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cpu_decoded_frames_are_not_shared_textures() {
+        let frame = DecodedFrame::from_cpu_rgb24(2, 2, 0, vec![0; 12]);
+
+        assert!(!frame.is_shared_texture());
+    }
 }

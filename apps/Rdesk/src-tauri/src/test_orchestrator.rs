@@ -10,8 +10,8 @@ use mrd_pipeline_core::{
     CapturedFrame, DecodedFrame, DecodedFrameData, EncodedAccessUnit, FramePixelFormat,
     VideoEncoder,
 };
-use mrd_render::{RenderFrame, RenderTarget, RendererFactory};
-use serde::{Deserialize, Serialize};
+use mrd_render::{RenderFrame, RendererFactory};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -85,6 +85,11 @@ pub struct TestConfigData {
     pub decoder_type: Option<String>,
     pub renderer_type: Option<String>,
     pub render_display: Option<bool>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_hwnd",
+        serialize_with = "serialize_optional_hwnd"
+    )]
     pub renderer_target_hwnd: Option<isize>,
     pub zero_copy: Option<bool>,
     pub transport_kind: Option<String>,
@@ -98,6 +103,50 @@ pub struct TestConfigData {
     pub window_hwnd: Option<String>,
     pub window_title: Option<String>,
     pub output_validation: Option<bool>,
+}
+
+fn deserialize_optional_hwnd<'de, D>(deserializer: D) -> Result<Option<isize>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(value) = Option::<serde_json::Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+
+    match value {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Number(number) => {
+            if let Some(value) = number.as_i64() {
+                isize::try_from(value)
+                    .map(Some)
+                    .map_err(serde::de::Error::custom)
+            } else if let Some(value) = number.as_u64() {
+                isize::try_from(value)
+                    .map(Some)
+                    .map_err(serde::de::Error::custom)
+            } else {
+                Err(serde::de::Error::custom(
+                    "renderer_target_hwnd must be an integer handle",
+                ))
+            }
+        }
+        serde_json::Value::String(value) => parse_hwnd(&value)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+        _ => Err(serde::de::Error::custom(
+            "renderer_target_hwnd must be a string or integer handle",
+        )),
+    }
+}
+
+fn serialize_optional_hwnd<S>(value: &Option<isize>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match value {
+        Some(handle) => serializer.serialize_some(&format!("0x{:X}", *handle as usize)),
+        None => serializer.serialize_none(),
+    }
 }
 
 /// Test run record
@@ -117,12 +166,16 @@ pub struct TestRun {
 /// Environment snapshot
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnvironmentSnapshot {
+    pub os_type: String,
     pub cpu_brand: String,
     pub cpu_cores: u32,
     pub memory_gb: u32,
     pub gpu_info: String,
+    pub available_captures: Vec<String>,
     pub available_encoders: Vec<String>,
     pub available_decoders: Vec<String>,
+    pub available_renderers: Vec<String>,
+    pub available_memory_modes: Vec<String>,
 }
 
 /// Test run summary
@@ -201,15 +254,28 @@ pub struct ArtifactMetadata {
     pub size_bytes: Option<usize>,
 }
 
-/// A visible top-level window that can be used as a WinRT capture target.
+/// A visible top-level window that can be used as a platform capture target.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WindowCaptureTarget {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub platform: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_kind: String,
+    /// Backward-compatible handle field used by the existing UI and Windows path.
     pub hwnd: String,
     pub title: String,
     pub class_name: String,
     pub width: u32,
     pub height: u32,
     pub process_id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_identifier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_layer: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview_data_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -220,14 +286,20 @@ pub struct WindowCaptureTarget {
 
 struct WindowCaptureItemProbe {
     hwnd: isize,
+    id: String,
+    platform: String,
     title: String,
     class_name: String,
     width: u32,
     height: u32,
+    app_name: Option<String>,
+    bundle_identifier: Option<String>,
 }
 
 struct WindowCaptureFrameProbe {
     hwnd: isize,
+    id: String,
+    platform: String,
     title: String,
     class_name: String,
     width: u32,
@@ -235,6 +307,8 @@ struct WindowCaptureFrameProbe {
     byte_len: usize,
     pixel_format: String,
     frame: mrd_pipeline_core::CapturedFrame,
+    app_name: Option<String>,
+    bundle_identifier: Option<String>,
 }
 
 struct SingleWindowMediaProbe {
@@ -303,21 +377,50 @@ impl TestOrchestrator {
 
     /// Convert scenario_id to TestChain
     fn scenario_to_chain(&self, scenario_id: &str, config: &TestConfigData) -> Result<TestChain> {
+        validate_scenario_for_current_platform(scenario_id, config)?;
+
         match scenario_id {
+            "capture.dxgi" => Ok(TestChain::CaptureOnly),
+            "capture.macos" => Ok(TestChain::Custom {
+                capture: CaptureType::Macos,
+                encoder: EncoderType::None,
+                decoder: DecoderType::None,
+            }),
             "e2e.local" => Ok(TestChain::NvencNvdec),
+            "e2e.macos_local" => Ok(TestChain::Custom {
+                capture: CaptureType::Macos,
+                encoder: EncoderType::VideoToolboxH264,
+                decoder: DecoderType::Software,
+            }),
             "encode.nvenc_h264" => Ok(TestChain::NvencOnly),
             "encode.openh264" => Ok(TestChain::OpenH264),
+            "decode.nvdec_h264" => Ok(TestChain::NvencNvdec),
+            "encode.videotoolbox_h264" => Ok(TestChain::Custom {
+                capture: CaptureType::Synthetic,
+                encoder: EncoderType::VideoToolboxH264,
+                decoder: DecoderType::None,
+            }),
+            "decode.videotoolbox_h264" => Ok(TestChain::Custom {
+                capture: CaptureType::Synthetic,
+                encoder: EncoderType::VideoToolboxH264,
+                decoder: DecoderType::VideoToolbox,
+            }),
             "custom" | "matrix" => Ok(TestChain::Custom {
                 capture: match config.capture_type.as_deref().unwrap_or("dxgi") {
                     "dxgi" => CaptureType::Dxgi,
                     "winrt" => CaptureType::Winrt,
+                    "macos" => CaptureType::Macos,
                     "synthetic" => CaptureType::Synthetic,
                     other => anyhow::bail!("Unsupported capture for {}: {}", scenario_id, other),
                 },
                 encoder: match config.encoder_type.as_deref() {
+                    Some("none") => EncoderType::None,
                     Some("nvenc_h264") => EncoderType::NvencH264,
                     Some("openh264") => EncoderType::OpenH264,
                     Some("nvenc_av1") => EncoderType::NvencAv1,
+                    Some("videotoolbox_h264") | Some("videotoolbox") => {
+                        EncoderType::VideoToolboxH264
+                    }
                     Some(other) => {
                         anyhow::bail!("Unsupported encoder for {}: {}", scenario_id, other)
                     }
@@ -327,6 +430,7 @@ impl TestOrchestrator {
                     "none" => DecoderType::None,
                     "nvdec" => DecoderType::Nvdec,
                     "software" => DecoderType::Software,
+                    "videotoolbox" => DecoderType::VideoToolbox,
                     other => anyhow::bail!("Unsupported decoder for {}: {}", scenario_id, other),
                 },
             }),
@@ -336,6 +440,29 @@ impl TestOrchestrator {
 
     /// List all available test scenarios
     pub fn list_scenarios(&self) -> Vec<TestScenario> {
+        let window_capture_type = if cfg!(target_os = "macos") {
+            "macos"
+        } else {
+            "winrt"
+        };
+        let window_capture_scope = if cfg!(target_os = "macos") {
+            vec![
+                "screencapturekit_window".to_string(),
+                "openh264".to_string(),
+                "webrtc".to_string(),
+                "software_decode".to_string(),
+                "metal_render".to_string(),
+            ]
+        } else {
+            vec![
+                "winrt".to_string(),
+                "openh264".to_string(),
+                "webrtc".to_string(),
+                "software_decode".to_string(),
+                "d3d11_render".to_string(),
+            ]
+        };
+
         vec![
             TestScenario {
                 scenario_id: "capture.dxgi".to_string(),
@@ -346,6 +473,20 @@ impl TestOrchestrator {
                 supports_matrix: true,
                 default_config: TestConfigData {
                     capture_type: Some("dxgi".to_string()),
+                    ..Default::default()
+                },
+            },
+            TestScenario {
+                scenario_id: "capture.macos".to_string(),
+                scenario_kind: ScenarioKind::Capture,
+                component_scope: vec!["macos_capture".to_string()],
+                display_name: "macOS 屏幕捕获测试".to_string(),
+                description: "测试 macOS 屏幕捕获性能和稳定性".to_string(),
+                supports_matrix: true,
+                default_config: TestConfigData {
+                    capture_type: Some("macos".to_string()),
+                    encoder_type: Some("none".to_string()),
+                    decoder_type: Some("none".to_string()),
                     ..Default::default()
                 },
             },
@@ -374,6 +515,18 @@ impl TestOrchestrator {
                 },
             },
             TestScenario {
+                scenario_id: "encode.videotoolbox_h264".to_string(),
+                scenario_kind: ScenarioKind::Encode,
+                component_scope: vec!["videotoolbox".to_string()],
+                display_name: "VideoToolbox H.264 编码测试".to_string(),
+                description: "测试 macOS VideoToolbox H.264 硬件编码器性能".to_string(),
+                supports_matrix: true,
+                default_config: TestConfigData {
+                    encoder_type: Some("videotoolbox_h264".to_string()),
+                    ..Default::default()
+                },
+            },
+            TestScenario {
                 scenario_id: "decode.nvdec_h264".to_string(),
                 scenario_kind: ScenarioKind::Decode,
                 component_scope: vec!["nvdec".to_string()],
@@ -382,6 +535,18 @@ impl TestOrchestrator {
                 supports_matrix: true,
                 default_config: TestConfigData {
                     decoder_type: Some("nvdec".to_string()),
+                    ..Default::default()
+                },
+            },
+            TestScenario {
+                scenario_id: "decode.videotoolbox_h264".to_string(),
+                scenario_kind: ScenarioKind::Decode,
+                component_scope: vec!["videotoolbox".to_string()],
+                display_name: "VideoToolbox H.264 解码测试".to_string(),
+                description: "测试 macOS VideoToolbox H.264 硬件解码器性能".to_string(),
+                supports_matrix: true,
+                default_config: TestConfigData {
+                    decoder_type: Some("videotoolbox".to_string()),
                     ..Default::default()
                 },
             },
@@ -403,22 +568,39 @@ impl TestOrchestrator {
                 },
             },
             TestScenario {
-                scenario_id: "single_window.local".to_string(),
+                scenario_id: "e2e.macos_local".to_string(),
                 scenario_kind: ScenarioKind::E2eLocal,
                 component_scope: vec![
-                    "winrt".to_string(),
-                    "openh264".to_string(),
-                    "webrtc".to_string(),
-                    "software_decode".to_string(),
-                    "d3d11_render".to_string(),
+                    "macos_capture".to_string(),
+                    "videotoolbox".to_string(),
+                    "metal_render".to_string(),
                 ],
+                display_name: "macOS 本地端到端测试".to_string(),
+                description: "测试 macOS 采集→VideoToolbox 编码→软件解码→Metal 渲染流程"
+                    .to_string(),
+                supports_matrix: true,
+                default_config: TestConfigData {
+                    capture_type: Some("macos".to_string()),
+                    encoder_type: Some("videotoolbox_h264".to_string()),
+                    decoder_type: Some("software".to_string()),
+                    renderer_type: Some("macos".to_string()),
+                    render_display: Some(true),
+                    resolution: Some([1920, 1080]),
+                    fps: Some(60),
+                    bitrate: Some(5_000_000),
+                    ..Default::default()
+                },
+            },
+            TestScenario {
+                scenario_id: "single_window.local".to_string(),
+                scenario_kind: ScenarioKind::E2eLocal,
+                component_scope: window_capture_scope,
                 display_name: "Single window local probe".to_string(),
-                description:
-                    "Captures one WinRT window frame and runs it through encode, WebRTC RTP, decode, and render."
-                        .to_string(),
+                description: "Captures one platform window frame and runs it through encode, WebRTC RTP, decode, and render."
+                    .to_string(),
                 supports_matrix: false,
                 default_config: TestConfigData {
-                    capture_type: Some("winrt".to_string()),
+                    capture_type: Some(window_capture_type.to_string()),
                     encoder_type: Some("openh264".to_string()),
                     decoder_type: Some("software".to_string()),
                     transport_kind: Some("webrtc".to_string()),
@@ -428,6 +610,9 @@ impl TestOrchestrator {
                 },
             },
         ]
+        .into_iter()
+        .filter(|scenario| scenario_supported_on_current_platform(&scenario.scenario_id))
+        .collect()
     }
 
     /// Get environment capabilities
@@ -438,17 +623,37 @@ impl TestOrchestrator {
         let mut available_encoders = vec!["openh264".to_string()];
 
         // Try to detect NVENC
-        if mrd_encode_nvenc::NvencH264Encoder::new_max_speed(1920, 1080, 60).is_ok() {
-            available_encoders.push("nvenc_h264".to_string());
+        #[cfg(windows)]
+        {
+            if mrd_encode_nvenc::NvencH264Encoder::new_max_speed(1920, 1080, 60).is_ok() {
+                available_encoders.push("nvenc_h264".to_string());
+            }
+            if mrd_encode_nvenc_av1::NvencAv1Encoder::probe_av1_available().is_ok() {
+                available_encoders.push("nvenc_av1".to_string());
+            }
         }
-        if mrd_encode_nvenc_av1::NvencAv1Encoder::probe_av1_available().is_ok() {
-            available_encoders.push("nvenc_av1".to_string());
+        #[cfg(target_os = "macos")]
+        {
+            if mrd_codec_videotoolbox::VideoToolboxH264Encoder::new(640, 480, 30).is_ok() {
+                available_encoders.push("videotoolbox_h264".to_string());
+            }
         }
 
         // Detect available decoders
         let mut available_decoders = vec!["software".to_string()];
-        if mrd_decode_nvdec::NvdecDecoder::new().is_ok() {
-            available_decoders.push("nvdec".to_string());
+        #[cfg(windows)]
+        {
+            if mrd_decode_nvdec::NvdecDecoder::new().is_ok() {
+                available_decoders.push("nvdec".to_string());
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if videotoolbox_decoder_enabled()
+                && mrd_codec_videotoolbox::VideoToolboxH264Decoder::new().is_ok()
+            {
+                available_decoders.push("videotoolbox".to_string());
+            }
         }
 
         // Get GPU info string
@@ -460,6 +665,7 @@ impl TestOrchestrator {
             .join(", ");
 
         Ok(EnvironmentSnapshot {
+            os_type: std::env::consts::OS.to_string(),
             cpu_brand: hw_info.cpu_info.name,
             cpu_cores: hw_info.cpu_info.cores,
             memory_gb: (hw_info.total_memory_mb / 1024) as u32,
@@ -468,13 +674,27 @@ impl TestOrchestrator {
             } else {
                 gpu_info
             },
+            available_captures: current_platform_captures()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
             available_encoders,
             available_decoders,
+            available_renderers: current_platform_renderers()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            available_memory_modes: current_platform_memory_modes()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
         })
     }
 
     /// Start a new test run
     pub fn start_run(&self, scenario_id: String, config: TestConfigData) -> Result<RunId> {
+        validate_scenario_for_current_platform(&scenario_id, &config)?;
+
         if scenario_id == "single_window.local" {
             return self.start_single_window_probe(scenario_id, config);
         }
@@ -738,9 +958,13 @@ impl TestOrchestrator {
                         Ok(probe) => {
                             selected_window = serde_json::json!({
                                 "requested_hwnd": hwnd_text,
+                                "id": probe.id,
+                                "platform": probe.platform,
                                 "hwnd": format!("0x{:X}", probe.hwnd as usize),
                                 "title": probe.title,
                                 "class_name": probe.class_name,
+                                "app_name": probe.app_name,
+                                "bundle_identifier": probe.bundle_identifier,
                                 "width": probe.width,
                                 "height": probe.height,
                                 "capture_item_created": true,
@@ -789,9 +1013,13 @@ impl TestOrchestrator {
                                 self.run_single_window_media_probe(&run_id, &probe.frame, &config);
 
                             first_frame = serde_json::json!({
+                                "id": probe.id,
+                                "platform": probe.platform,
                                 "hwnd": format!("0x{:X}", probe.hwnd as usize),
                                 "title": probe.title,
                                 "class_name": probe.class_name,
+                                "app_name": probe.app_name,
+                                "bundle_identifier": probe.bundle_identifier,
                                 "width": probe.width,
                                 "height": probe.height,
                                 "byte_len": probe.byte_len,
@@ -1073,22 +1301,59 @@ impl TestOrchestrator {
         } else {
             self.record_stage_event(run_id.to_string(), "render", "started", None, None);
             let render_started = std::time::Instant::now();
-            let factory = mrd_render_d3d11::D3d11RendererFactory;
-            let mut renderer = factory
-                .create()
-                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-            renderer
-                .attach_target(RenderTarget::WindowHandle(0))
-                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-            for frame in &decoded_frames {
-                renderer
-                    .upload_frame(Self::decoded_frame_to_render_frame(frame))
+
+            #[cfg(windows)]
+            let (render_backend, uploaded) = {
+                let factory = mrd_render_d3d11::D3d11RendererFactory;
+                let mut renderer = factory
+                    .create()
                     .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-            }
+                renderer
+                    .attach_target(mrd_render::RenderTarget::WindowHandle(0))
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                for frame in &decoded_frames {
+                    renderer
+                        .upload_frame(Self::decoded_frame_to_render_frame(frame))
+                        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                }
+                (
+                    Some("d3d11".to_string()),
+                    renderer.snapshot().uploaded_frame_count as usize,
+                )
+            };
+
+            #[cfg(target_os = "macos")]
+            let (render_backend, uploaded) = {
+                let factory = mrd_render_macos::MacosRendererFactory;
+                let mut renderer = factory
+                    .create()
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                for frame in &decoded_frames {
+                    renderer
+                        .upload_frame(Self::decoded_frame_to_render_frame(frame))
+                        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                }
+                (
+                    Some("metal".to_string()),
+                    renderer.snapshot().uploaded_frame_count as usize,
+                )
+            };
+
+            #[cfg(not(any(windows, target_os = "macos")))]
+            let (render_backend, uploaded) = {
+                self.record_stage_event(
+                    run_id.to_string(),
+                    "render",
+                    "skipped_unsupported_platform",
+                    None,
+                    None,
+                );
+                (None, 0)
+            };
+
             let render_latency = render_started.elapsed().as_secs_f64() * 1000.0;
-            let uploaded = renderer.snapshot().uploaded_frame_count as usize;
             self.record_stage_event(run_id.to_string(), "render", "completed", None, None);
-            (Some("d3d11".to_string()), Some(render_latency), uploaded)
+            (render_backend, Some(render_latency), uploaded)
         };
 
         Ok(SingleWindowMediaProbe {
@@ -1482,6 +1747,161 @@ impl Default for TestOrchestrator {
     }
 }
 
+fn current_platform_captures() -> Vec<&'static str> {
+    #[cfg(windows)]
+    {
+        return vec!["dxgi", "winrt", "synthetic"];
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        return vec!["macos", "synthetic"];
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        vec!["synthetic"]
+    }
+}
+
+fn current_platform_renderers() -> Vec<&'static str> {
+    #[cfg(windows)]
+    {
+        return vec!["none", "d3d11"];
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        return vec!["none", "macos"];
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        vec!["none"]
+    }
+}
+
+fn current_platform_memory_modes() -> Vec<&'static str> {
+    #[cfg(windows)]
+    {
+        return vec!["cpu", "d3d11_shared"];
+    }
+
+    #[cfg(not(windows))]
+    {
+        vec!["cpu"]
+    }
+}
+
+fn scenario_supported_on_current_platform(scenario_id: &str) -> bool {
+    match scenario_id {
+        "capture.dxgi" | "encode.nvenc_h264" | "decode.nvdec_h264" | "e2e.local" => cfg!(windows),
+        "single_window.local" => cfg!(windows) || cfg!(target_os = "macos"),
+        "capture.macos" | "encode.videotoolbox_h264" | "e2e.macos_local" => {
+            cfg!(target_os = "macos")
+        }
+        "decode.videotoolbox_h264" => cfg!(target_os = "macos") && videotoolbox_decoder_enabled(),
+        "encode.openh264" | "custom" | "matrix" => true,
+        _ => true,
+    }
+}
+
+fn capture_supported_on_current_platform(capture_type: &str) -> bool {
+    matches!(capture_type, "synthetic")
+        || matches!(capture_type, "dxgi" | "winrt") && cfg!(windows)
+        || matches!(capture_type, "macos") && cfg!(target_os = "macos")
+}
+
+fn encoder_supported_on_current_platform(encoder_type: &str) -> bool {
+    matches!(encoder_type, "none" | "openh264")
+        || matches!(encoder_type, "nvenc_h264" | "nvenc_av1") && cfg!(windows)
+        || matches!(encoder_type, "videotoolbox_h264" | "videotoolbox") && cfg!(target_os = "macos")
+}
+
+fn decoder_supported_on_current_platform(decoder_type: &str) -> bool {
+    matches!(decoder_type, "none" | "software")
+        || matches!(decoder_type, "nvdec") && cfg!(windows)
+        || matches!(decoder_type, "videotoolbox")
+            && cfg!(target_os = "macos")
+            && videotoolbox_decoder_enabled()
+}
+
+fn renderer_supported_on_current_platform(renderer_type: &str) -> bool {
+    matches!(renderer_type, "none")
+        || matches!(renderer_type, "d3d11") && cfg!(windows)
+        || matches!(renderer_type, "macos" | "metal") && cfg!(target_os = "macos")
+}
+
+fn validate_scenario_for_current_platform(
+    scenario_id: &str,
+    config: &TestConfigData,
+) -> Result<()> {
+    let os_type = std::env::consts::OS;
+    if !scenario_supported_on_current_platform(scenario_id) {
+        anyhow::bail!("Scenario {} is not supported on {}", scenario_id, os_type);
+    }
+
+    if !matches!(scenario_id, "custom" | "matrix") {
+        return Ok(());
+    }
+
+    let capture_type = config.capture_type.as_deref().unwrap_or("dxgi");
+    if !capture_supported_on_current_platform(capture_type) {
+        anyhow::bail!(
+            "Capture type {} is not supported on {}",
+            capture_type,
+            os_type
+        );
+    }
+
+    let encoder_type = config
+        .encoder_type
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("Missing encoder_type for {}", scenario_id))?;
+    if !encoder_supported_on_current_platform(encoder_type) {
+        anyhow::bail!(
+            "Encoder type {} is not supported on {}",
+            encoder_type,
+            os_type
+        );
+    }
+
+    let decoder_type = config.decoder_type.as_deref().unwrap_or("software");
+    if !decoder_supported_on_current_platform(decoder_type) {
+        anyhow::bail!(
+            "Decoder type {} is not supported on {}",
+            decoder_type,
+            os_type
+        );
+    }
+
+    let renderer_type = config.renderer_type.as_deref().unwrap_or("none");
+    if !renderer_supported_on_current_platform(renderer_type) {
+        anyhow::bail!(
+            "Renderer type {} is not supported on {}",
+            renderer_type,
+            os_type
+        );
+    }
+
+    if config.zero_copy == Some(true) && !current_platform_memory_modes().contains(&"d3d11_shared")
+    {
+        anyhow::bail!(
+            "D3D11 shared texture memory mode is not supported on {}",
+            os_type
+        );
+    }
+
+    Ok(())
+}
+
+fn videotoolbox_decoder_enabled() -> bool {
+    !matches!(
+        std::env::var("MRD_DISABLE_VIDEOTOOLBOX_DECODER").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    )
+}
+
 fn generate_run_id() -> String {
     format!("run_{}", now_ms())
 }
@@ -1529,21 +1949,22 @@ pub fn list_window_capture_targets_with_previews(
 }
 
 fn parse_hwnd(input: &str) -> Result<isize> {
-    let trimmed = input.trim();
+    let trimmed = input.trim().rsplit(':').next().unwrap_or(input).trim();
     if trimmed.is_empty() {
-        anyhow::bail!("window hwnd is empty");
+        anyhow::bail!("window capture handle is empty");
     }
 
     let value = if let Some(hex) = trimmed
         .strip_prefix("0x")
         .or_else(|| trimmed.strip_prefix("0X"))
     {
-        usize::from_str_radix(hex, 16)
-            .map_err(|error| anyhow::anyhow!("invalid window hwnd '{trimmed}': {error}"))?
+        usize::from_str_radix(hex, 16).map_err(|error| {
+            anyhow::anyhow!("invalid window capture handle '{trimmed}': {error}")
+        })?
     } else {
-        trimmed
-            .parse::<usize>()
-            .map_err(|error| anyhow::anyhow!("invalid window hwnd '{trimmed}': {error}"))?
+        trimmed.parse::<usize>().map_err(|error| {
+            anyhow::anyhow!("invalid window capture handle '{trimmed}': {error}")
+        })?
     };
 
     Ok(value as isize)
@@ -1557,12 +1978,18 @@ fn list_window_capture_targets_impl() -> Result<Vec<WindowCaptureTarget>> {
     Ok(targets
         .into_iter()
         .map(|target| WindowCaptureTarget {
+            id: format!("windows:window:0x{:X}", target.hwnd as usize),
+            platform: "windows".to_string(),
+            source_kind: "window".to_string(),
             hwnd: format!("0x{:X}", target.hwnd as usize),
             title: target.title,
             class_name: target.class_name,
             width: target.width,
             height: target.height,
             process_id: target.process_id,
+            app_name: None,
+            bundle_identifier: None,
+            window_layer: None,
             preview_data_url: None,
             preview_width: None,
             preview_height: None,
@@ -1570,9 +1997,40 @@ fn list_window_capture_targets_impl() -> Result<Vec<WindowCaptureTarget>> {
         .collect())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 fn list_window_capture_targets_impl() -> Result<Vec<WindowCaptureTarget>> {
-    anyhow::bail!("WinRT window capture is only available on Windows")
+    let targets = mrd_capture_macos::enumerate_window_capture_targets()
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+
+    Ok(targets
+        .into_iter()
+        .map(|target| WindowCaptureTarget {
+            id: format!("macos:window:0x{:X}", target.window_id),
+            platform: "macos".to_string(),
+            source_kind: "window".to_string(),
+            hwnd: format!("0x{:X}", target.window_id),
+            title: target.title,
+            class_name: if target.bundle_identifier.is_empty() {
+                target.app_name.clone()
+            } else {
+                target.bundle_identifier.clone()
+            },
+            width: target.width,
+            height: target.height,
+            process_id: target.process_id,
+            app_name: Some(target.app_name),
+            bundle_identifier: Some(target.bundle_identifier),
+            window_layer: Some(target.window_layer),
+            preview_data_url: None,
+            preview_width: None,
+            preview_height: None,
+        })
+        .collect())
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn list_window_capture_targets_impl() -> Result<Vec<WindowCaptureTarget>> {
+    anyhow::bail!("window capture is only available on Windows and macOS")
 }
 
 #[cfg(windows)]
@@ -1582,16 +2040,44 @@ fn probe_window_capture_item(hwnd: isize) -> Result<WindowCaptureItemProbe> {
 
     Ok(WindowCaptureItemProbe {
         hwnd: probe.hwnd,
+        id: format!("windows:window:0x{:X}", probe.hwnd as usize),
+        platform: "windows".to_string(),
         title: probe.title,
         class_name: probe.class_name,
         width: probe.width,
         height: probe.height,
+        app_name: None,
+        bundle_identifier: None,
     })
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn probe_window_capture_item(hwnd: isize) -> Result<WindowCaptureItemProbe> {
+    let window_id =
+        u32::try_from(hwnd).map_err(|_| anyhow::anyhow!("macOS window id out of range: {hwnd}"))?;
+    let probe = mrd_capture_macos::probe_window_capture_item(window_id)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+
+    Ok(WindowCaptureItemProbe {
+        hwnd: probe.window_id as isize,
+        id: format!("macos:window:0x{:X}", probe.window_id),
+        platform: "macos".to_string(),
+        title: probe.title,
+        class_name: if probe.bundle_identifier.is_empty() {
+            probe.app_name.clone()
+        } else {
+            probe.bundle_identifier.clone()
+        },
+        width: probe.width,
+        height: probe.height,
+        app_name: Some(probe.app_name),
+        bundle_identifier: Some(probe.bundle_identifier),
+    })
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn probe_window_capture_item(_hwnd: isize) -> Result<WindowCaptureItemProbe> {
-    anyhow::bail!("WinRT window capture is only available on Windows")
+    anyhow::bail!("window capture is only available on Windows and macOS")
 }
 
 #[cfg(windows)]
@@ -1601,6 +2087,8 @@ fn probe_window_first_frame(hwnd: isize, timeout: Duration) -> Result<WindowCapt
 
     Ok(WindowCaptureFrameProbe {
         hwnd: probe.hwnd,
+        id: format!("windows:window:0x{:X}", probe.hwnd as usize),
+        platform: "windows".to_string(),
         title: probe.title,
         class_name: probe.class_name,
         width: probe.width,
@@ -1608,12 +2096,41 @@ fn probe_window_first_frame(hwnd: isize, timeout: Duration) -> Result<WindowCapt
         byte_len: probe.byte_len,
         pixel_format: format!("{:?}", probe.pixel_format),
         frame: probe.frame,
+        app_name: None,
+        bundle_identifier: None,
     })
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn probe_window_first_frame(hwnd: isize, timeout: Duration) -> Result<WindowCaptureFrameProbe> {
+    let window_id =
+        u32::try_from(hwnd).map_err(|_| anyhow::anyhow!("macOS window id out of range: {hwnd}"))?;
+    let probe = mrd_capture_macos::probe_window_first_frame(window_id, timeout)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+
+    Ok(WindowCaptureFrameProbe {
+        hwnd: probe.window_id as isize,
+        id: format!("macos:window:0x{:X}", probe.window_id),
+        platform: "macos".to_string(),
+        title: probe.title,
+        class_name: if probe.bundle_identifier.is_empty() {
+            probe.app_name.clone()
+        } else {
+            probe.bundle_identifier.clone()
+        },
+        width: probe.width,
+        height: probe.height,
+        byte_len: probe.byte_len,
+        pixel_format: format!("{:?}", probe.pixel_format),
+        frame: probe.frame,
+        app_name: Some(probe.app_name),
+        bundle_identifier: Some(probe.bundle_identifier),
+    })
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn probe_window_first_frame(_hwnd: isize, _timeout: Duration) -> Result<WindowCaptureFrameProbe> {
-    anyhow::bail!("WinRT window capture is only available on Windows")
+    anyhow::bail!("window capture is only available on Windows and macOS")
 }
 
 fn window_preview_data_url(
@@ -1742,10 +2259,13 @@ fn harness_config_from_data(config: &TestConfigData) -> HarnessConfig {
         bitrate: config.bitrate,
         renderer: match (config.render_display, config.renderer_type.as_deref()) {
             (Some(true), Some("d3d11")) => Some(RendererType::D3d11),
+            (Some(true), Some("macos")) | (Some(true), Some("metal")) => Some(RendererType::Macos),
             _ => None,
         },
         renderer_target_hwnd: config.renderer_target_hwnd,
         zero_copy: config.zero_copy,
+        input_source: config.input_source.clone(),
+        window_handle: config.window_hwnd.clone(),
         transport: match config.transport_kind.as_deref() {
             Some("webrtc") | Some("webrtc_rtp") => Some(TransportKind::WebrtcRtp),
             Some("quic") | Some("quic_datagram") => Some(TransportKind::QuicDatagram),
@@ -1851,12 +2371,16 @@ mod tests {
 
     fn test_env() -> EnvironmentSnapshot {
         EnvironmentSnapshot {
+            os_type: "test".to_string(),
             cpu_brand: "test-cpu".to_string(),
             cpu_cores: 8,
             memory_gb: 16,
             gpu_info: "test-gpu".to_string(),
+            available_captures: vec!["synthetic".to_string()],
             available_encoders: vec!["openh264".to_string()],
             available_decoders: vec!["software".to_string()],
+            available_renderers: vec!["none".to_string()],
+            available_memory_modes: vec!["cpu".to_string()],
         }
     }
 
@@ -1864,12 +2388,13 @@ mod tests {
     fn scenario_dispatch_rejects_unsupported_scenarios() {
         let orchestrator = TestOrchestrator::default();
         let error = orchestrator
-            .scenario_to_chain("capture.dxgi", &TestConfigData::default())
+            .scenario_to_chain("unknown.scenario", &TestConfigData::default())
             .unwrap_err();
 
         assert!(error.to_string().contains("Unsupported test scenario"));
     }
 
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn list_scenarios_includes_single_window_local_probe() {
         let orchestrator = TestOrchestrator::default();
@@ -1881,9 +2406,19 @@ mod tests {
 
         assert_eq!(scenario.scenario_kind, ScenarioKind::E2eLocal);
         assert!(!scenario.supports_matrix);
+        let expected_capture = if cfg!(target_os = "macos") {
+            "macos"
+        } else {
+            "winrt"
+        };
+        let expected_scope = if cfg!(target_os = "macos") {
+            "screencapturekit_window"
+        } else {
+            "winrt"
+        };
         assert_eq!(
             scenario.default_config.capture_type.as_deref(),
-            Some("winrt")
+            Some(expected_capture)
         );
         assert_eq!(
             scenario.default_config.input_source.as_deref(),
@@ -1896,17 +2431,50 @@ mod tests {
         assert!(scenario
             .component_scope
             .iter()
-            .any(|scope| scope == "winrt"));
+            .any(|scope| scope == expected_scope));
         assert!(scenario
             .component_scope
             .iter()
             .any(|scope| scope == "webrtc"));
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn list_scenarios_uses_macos_platform_entries() {
+        let scenarios = TestOrchestrator::default().list_scenarios();
+
+        assert!(scenarios
+            .iter()
+            .any(|scenario| scenario.scenario_id == "capture.macos"));
+        assert!(scenarios
+            .iter()
+            .any(|scenario| scenario.scenario_id == "e2e.macos_local"));
+        assert!(scenarios
+            .iter()
+            .any(|scenario| scenario.scenario_id == "decode.videotoolbox_h264"));
+        assert!(!scenarios
+            .iter()
+            .any(|scenario| scenario.scenario_id == "capture.dxgi"));
+        assert!(!scenarios
+            .iter()
+            .any(|scenario| scenario.scenario_id == "e2e.local"));
+    }
+
     #[test]
     fn parse_hwnd_accepts_hex_and_decimal() {
         assert_eq!(parse_hwnd("0x2A").unwrap(), 42);
         assert_eq!(parse_hwnd("42").unwrap(), 42);
+    }
+
+    #[test]
+    fn renderer_target_hwnd_accepts_string_and_number_json() {
+        let from_string: TestConfigData =
+            serde_json::from_str(r#"{"renderer_target_hwnd":"0x2A"}"#).unwrap();
+        let from_number: TestConfigData =
+            serde_json::from_str(r#"{"renderer_target_hwnd":42}"#).unwrap();
+
+        assert_eq!(from_string.renderer_target_hwnd, Some(42));
+        assert_eq!(from_number.renderer_target_hwnd, Some(42));
     }
 
     #[test]
@@ -1931,20 +2499,8 @@ mod tests {
     fn matrix_dispatch_maps_explicit_encoder_decoder_pairs() {
         let orchestrator = TestOrchestrator::default();
         let openh264_config = TestConfigData {
-            capture_type: Some("dxgi".to_string()),
+            capture_type: Some("synthetic".to_string()),
             encoder_type: Some("openh264".to_string()),
-            decoder_type: Some("software".to_string()),
-            ..Default::default()
-        };
-        let nvenc_decode_config = TestConfigData {
-            capture_type: Some("dxgi".to_string()),
-            encoder_type: Some("nvenc_h264".to_string()),
-            decoder_type: Some("nvdec".to_string()),
-            ..Default::default()
-        };
-        let nvenc_encode_config = TestConfigData {
-            capture_type: Some("dxgi".to_string()),
-            encoder_type: Some("nvenc_h264".to_string()),
             decoder_type: Some("software".to_string()),
             ..Default::default()
         };
@@ -1954,31 +2510,69 @@ mod tests {
                 .scenario_to_chain("matrix", &openh264_config)
                 .unwrap(),
             TestChain::Custom {
-                capture: CaptureType::Dxgi,
+                capture: CaptureType::Synthetic,
                 encoder: EncoderType::OpenH264,
                 decoder: DecoderType::Software,
             }
         );
-        assert_eq!(
-            orchestrator
-                .scenario_to_chain("matrix", &nvenc_decode_config)
-                .unwrap(),
-            TestChain::Custom {
-                capture: CaptureType::Dxgi,
-                encoder: EncoderType::NvencH264,
-                decoder: DecoderType::Nvdec,
-            }
-        );
-        assert_eq!(
-            orchestrator
-                .scenario_to_chain("matrix", &nvenc_encode_config)
-                .unwrap(),
-            TestChain::Custom {
-                capture: CaptureType::Dxgi,
-                encoder: EncoderType::NvencH264,
-                decoder: DecoderType::Software,
-            }
-        );
+
+        #[cfg(windows)]
+        {
+            let nvenc_decode_config = TestConfigData {
+                capture_type: Some("dxgi".to_string()),
+                encoder_type: Some("nvenc_h264".to_string()),
+                decoder_type: Some("nvdec".to_string()),
+                ..Default::default()
+            };
+            let nvenc_encode_config = TestConfigData {
+                capture_type: Some("dxgi".to_string()),
+                encoder_type: Some("nvenc_h264".to_string()),
+                decoder_type: Some("software".to_string()),
+                ..Default::default()
+            };
+
+            assert_eq!(
+                orchestrator
+                    .scenario_to_chain("matrix", &nvenc_decode_config)
+                    .unwrap(),
+                TestChain::Custom {
+                    capture: CaptureType::Dxgi,
+                    encoder: EncoderType::NvencH264,
+                    decoder: DecoderType::Nvdec,
+                }
+            );
+            assert_eq!(
+                orchestrator
+                    .scenario_to_chain("matrix", &nvenc_encode_config)
+                    .unwrap(),
+                TestChain::Custom {
+                    capture: CaptureType::Dxgi,
+                    encoder: EncoderType::NvencH264,
+                    decoder: DecoderType::Software,
+                }
+            );
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let videotoolbox_config = TestConfigData {
+                capture_type: Some("macos".to_string()),
+                encoder_type: Some("videotoolbox_h264".to_string()),
+                decoder_type: Some("software".to_string()),
+                ..Default::default()
+            };
+
+            assert_eq!(
+                orchestrator
+                    .scenario_to_chain("matrix", &videotoolbox_config)
+                    .unwrap(),
+                TestChain::Custom {
+                    capture: CaptureType::Macos,
+                    encoder: EncoderType::VideoToolboxH264,
+                    decoder: DecoderType::Software,
+                }
+            );
+        }
     }
 
     #[test]
@@ -2091,9 +2685,9 @@ mod tests {
             .any(|event| { event.stage == "running" && event.status == "failed" }));
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
-    #[ignore = "manual smoke test: requires a visible capturable window and WinRT capture access"]
+    #[ignore = "manual smoke test: requires a visible capturable window and screen capture access"]
     fn single_window_local_probe_smoke() {
         let targets = list_window_capture_targets().expect("failed to list capture targets");
         let target = targets
@@ -2109,17 +2703,27 @@ mod tests {
         );
 
         let orchestrator = TestOrchestrator::default();
+        let capture_type = if cfg!(target_os = "macos") {
+            "macos"
+        } else {
+            "winrt"
+        };
+        let renderer_type = if cfg!(target_os = "macos") {
+            "macos"
+        } else {
+            "d3d11"
+        };
         let run_id = orchestrator
             .start_run(
                 "single_window.local".to_string(),
                 TestConfigData {
-                    capture_type: Some("winrt".to_string()),
+                    capture_type: Some(capture_type.to_string()),
                     input_source: Some("window".to_string()),
                     window_hwnd: Some(target.hwnd.clone()),
                     window_title: Some(target.title.clone()),
                     encoder_type: Some("openh264".to_string()),
                     decoder_type: Some("software".to_string()),
-                    renderer_type: Some("d3d11".to_string()),
+                    renderer_type: Some(renderer_type.to_string()),
                     transport_kind: Some("webrtc".to_string()),
                     duration_ms: Some(1_000),
                     fps: Some(30),

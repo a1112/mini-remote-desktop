@@ -1,7 +1,12 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Play, Grid3x3, CheckCircle2, XCircle, Clock, Loader2 } from "lucide-react";
 import * as commands from "../../adapters/tauri/commands";
-import type { TestConfig, TestRun, TestRunSummary } from "../../adapters/tauri/types";
+import type {
+  EnvironmentSnapshot,
+  TestConfig,
+  TestRun,
+  TestRunSummary,
+} from "../../adapters/tauri/types";
 
 interface MatrixDimension {
   id: string;
@@ -13,7 +18,10 @@ interface MatrixOption {
   id: string;
   name: string;
   enabled: boolean;
+  defaultEnabledOn?: HostOs[];
 }
+
+type HostOs = "windows" | "macos" | "linux" | "other";
 
 const MATRIX_DIMENSIONS: MatrixDimension[] = [
   {
@@ -22,6 +30,7 @@ const MATRIX_DIMENSIONS: MatrixDimension[] = [
     options: [
       { id: "dxgi", name: "DXGI", enabled: true },
       { id: "winrt", name: "WinRT", enabled: false },
+      { id: "macos", name: "macOS", enabled: false, defaultEnabledOn: ["macos"] },
       { id: "synthetic", name: "Synthetic", enabled: false },
     ],
   },
@@ -32,6 +41,12 @@ const MATRIX_DIMENSIONS: MatrixDimension[] = [
       { id: "nvenc_h264", name: "NVENC H.264", enabled: true },
       { id: "openh264", name: "OpenH264", enabled: true },
       { id: "nvenc_av1", name: "NVENC AV1", enabled: false },
+      {
+        id: "videotoolbox_h264",
+        name: "VideoToolbox H.264",
+        enabled: false,
+        defaultEnabledOn: ["macos"],
+      },
     ],
   },
   {
@@ -41,6 +56,12 @@ const MATRIX_DIMENSIONS: MatrixDimension[] = [
       { id: "none", name: "None / encode only", enabled: false },
       { id: "nvdec", name: "NVDEC", enabled: true },
       { id: "software", name: "软件", enabled: true },
+      {
+        id: "videotoolbox",
+        name: "VideoToolbox",
+        enabled: false,
+        defaultEnabledOn: ["macos"],
+      },
     ],
   },
   {
@@ -58,6 +79,7 @@ const MATRIX_DIMENSIONS: MatrixDimension[] = [
     options: [
       { id: "renderer_none", name: "No display", enabled: true },
       { id: "d3d11", name: "DX11 popup", enabled: false },
+      { id: "macos", name: "Metal", enabled: false },
     ],
   },
   {
@@ -119,6 +141,88 @@ const MATRIX_DIMENSIONS: MatrixDimension[] = [
   },
 ];
 
+function normalizeHostOs(osType?: string): HostOs {
+  const normalized = osType?.toLowerCase() ?? "";
+  if (normalized.includes("windows") || normalized === "win32") return "windows";
+  if (normalized.includes("mac") || normalized === "darwin") return "macos";
+  if (normalized.includes("linux")) return "linux";
+  return "other";
+}
+
+function defaultCapturesForOs(os: HostOs): string[] {
+  if (os === "windows") return ["dxgi", "winrt", "synthetic"];
+  if (os === "macos") return ["macos", "synthetic"];
+  return ["synthetic"];
+}
+
+function defaultEncodersForOs(os: HostOs): string[] {
+  if (os === "windows") return ["nvenc_h264", "openh264", "nvenc_av1"];
+  if (os === "macos") return ["videotoolbox_h264", "openh264"];
+  return ["openh264"];
+}
+
+function defaultDecodersForOs(os: HostOs): string[] {
+  if (os === "windows") return ["nvdec", "software", "none"];
+  if (os === "macos") return ["software", "none"];
+  return ["software", "none"];
+}
+
+function defaultRenderersForOs(os: HostOs): string[] {
+  if (os === "windows") return ["none", "d3d11"];
+  if (os === "macos") return ["none", "macos"];
+  return ["none"];
+}
+
+function defaultMemoryModesForOs(os: HostOs): string[] {
+  return os === "windows" ? ["cpu", "d3d11_shared"] : ["cpu"];
+}
+
+function optionEnabledForOs(option: MatrixOption, os: HostOs): boolean {
+  return option.defaultEnabledOn ? option.defaultEnabledOn.includes(os) : option.enabled;
+}
+
+function createMatrixDimensions(capabilities?: EnvironmentSnapshot | null): MatrixDimension[] {
+  const os = normalizeHostOs(capabilities?.os_type ?? "windows");
+  const availableCaptures = capabilities?.available_captures ?? defaultCapturesForOs(os);
+  const availableEncoders = capabilities?.available_encoders ?? defaultEncodersForOs(os);
+  const availableDecoders = [
+    "none",
+    ...(capabilities?.available_decoders ?? defaultDecodersForOs(os)),
+  ].filter((value, index, values) => values.indexOf(value) === index);
+  const availableRenderers = capabilities?.available_renderers ?? defaultRenderersForOs(os);
+  const availableMemoryModes =
+    capabilities?.available_memory_modes ?? defaultMemoryModesForOs(os);
+
+  const optionAvailable = (dimensionId: string, optionId: string): boolean => {
+    switch (dimensionId) {
+      case "capture":
+        return availableCaptures.includes(optionId);
+      case "encoder":
+        return availableEncoders.includes(optionId);
+      case "decoder":
+        return availableDecoders.includes(optionId);
+      case "renderer":
+        return optionId === "renderer_none"
+          ? availableRenderers.includes("none")
+          : availableRenderers.includes(optionId);
+      case "memory":
+        return availableMemoryModes.includes(optionId);
+      default:
+        return true;
+    }
+  };
+
+  return MATRIX_DIMENSIONS.map((dimension) => ({
+    ...dimension,
+    options: dimension.options
+      .filter((option) => optionAvailable(dimension.id, option.id))
+      .map((option) => ({
+        ...option,
+        enabled: optionEnabledForOs(option, os),
+      })),
+  })).filter((dimension) => dimension.options.length > 0);
+}
+
 interface MatrixTest {
   id: string;
   config: TestConfig;
@@ -127,6 +231,11 @@ interface MatrixTest {
   duration?: number;
   skipReason?: string;
   failureReason?: string;
+}
+
+interface SelectedMatrixOption {
+  dimensionId: string;
+  option: MatrixOption;
 }
 
 interface MatrixAcceptanceResult {
@@ -171,6 +280,14 @@ function evaluateMatrixRun(
 }
 
 function minimumExpectedFps(config: TestConfig, targetFps: number): number {
+  if (config.capture_type === "macos") {
+    if (config.encoder_type === "openh264") {
+      return targetFps * 0.3;
+    }
+    if (config.encoder_type === "videotoolbox_h264") {
+      return targetFps * 0.35;
+    }
+  }
   if (config.encoder_type === "openh264") {
     return targetFps * 0.35;
   }
@@ -222,10 +339,25 @@ function unsupportedMatrixReason(config: TestConfig): string | null {
   if (config.zero_copy && (config.renderer_type !== "d3d11" || !config.render_display)) {
     return "D3D11 shared texture path requires DX11 popup renderer";
   }
+  if (config.renderer_type === "d3d11" && config.capture_type === "macos") {
+    return "DX11 popup renderer is Windows-only";
+  }
+  if (config.renderer_type === "macos" && config.zero_copy) {
+    return "Metal renderer does not accept D3D11 shared texture input";
+  }
+  if (config.encoder_type === "videotoolbox_h264" && config.decoder_type === "nvdec") {
+    return "VideoToolbox H.264 output should use VideoToolbox, software, or encode-only decode modes";
+  }
+  if (config.encoder_type === "nvenc_av1" && config.decoder_type === "videotoolbox") {
+    return "VideoToolbox decoder path is H.264-only in this matrix";
+  }
   return null;
 }
 
 function capabilitySkipReason(config: TestConfig, message: string): string | null {
+  if (/not supported on/i.test(message)) {
+    return message;
+  }
   if (
     config.encoder_type === "nvenc_av1" &&
     /NVENC AV1 unavailable|AV1 codec not supported|NVENC AV1 preset query failed/i.test(message)
@@ -299,13 +431,34 @@ function matrixConfigKey(config: TestConfig): string {
 }
 
 export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) {
-  const [dimensions, setDimensions] = useState<MatrixDimension[]>(MATRIX_DIMENSIONS);
+  const [dimensions, setDimensions] = useState<MatrixDimension[]>(() =>
+    createMatrixDimensions(null)
+  );
+  const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
   const [isRunning, setIsRunning] = useState(false);
   const [tests, setTests] = useState<MatrixTest[]>([]);
   const [currentTestIndex, setCurrentTestIndex] = useState(0);
   const [completedCount, setCompletedCount] = useState(0);
   const [failedCount, setFailedCount] = useState(0);
   const [skippedCount, setSkippedCount] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadCapabilities() {
+      const result = await commands.testGetCapabilities();
+      if (!cancelled && result.ok && result.value) {
+        setCapabilities(result.value);
+        setDimensions(createMatrixDimensions(result.value));
+      }
+    }
+
+    void loadCapabilities();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const toggleOption = (dimensionId: string, optionId: string) => {
     setDimensions((current) => {
@@ -336,20 +489,45 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
         next = setOptionEnabled(next, "memory", "d3d11_shared", false);
       }
 
+      if (
+        dimensionId === "renderer" &&
+        optionId !== "renderer_none" &&
+        isOptionEnabled(next, "renderer", optionId)
+      ) {
+        next = setOptionEnabled(next, "renderer", "renderer_none", false);
+      }
+
+      if (
+        dimensionId === "renderer" &&
+        optionId === "renderer_none" &&
+        isOptionEnabled(next, "renderer", "renderer_none")
+      ) {
+        next = setOptionEnabled(next, "renderer", "d3d11", false);
+        next = setOptionEnabled(next, "renderer", "macos", false);
+        next = setOptionEnabled(next, "memory", "d3d11_shared", false);
+      }
+
       return next;
     });
   };
 
   const generateMatrix = () => {
     const enabledOptions = dimensions
-      .map((dim) => dim.options.filter((o) => o.enabled))
+      .map((dim) =>
+        dim.options
+          .filter((o) => o.enabled)
+          .map((option) => ({
+            dimensionId: dim.id,
+            option,
+          }))
+      )
       .filter((opts) => opts.length > 0);
 
     if (enabledOptions.length === 0) return [];
 
     const combinations: MatrixTest[] = [];
     const seenConfigs = new Set<string>();
-    const generate = (index: number, current: MatrixOption[]) => {
+    const generate = (index: number, current: SelectedMatrixOption[]) => {
       if (index >= enabledOptions.length) {
         const config = buildConfig(current);
         if (unsupportedMatrixReason(config)) {
@@ -382,51 +560,51 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
     return combinations;
   };
 
-  const buildConfig = (options: MatrixOption[]): TestConfig => {
+  const buildConfig = (options: SelectedMatrixOption[]): TestConfig => {
     const config: TestConfig = {};
-    options.forEach((opt) => {
-      const dim = dimensions.find((d) => d.options.some((o) => o.id === opt.id));
-      if (!dim) return;
-
-      switch (dim.id) {
+    options.forEach(({ dimensionId, option }) => {
+      switch (dimensionId) {
         case "capture":
-          config.capture_type = opt.id as TestConfig["capture_type"];
+          config.capture_type = option.id as TestConfig["capture_type"];
           break;
         case "encoder":
-          config.encoder_type = opt.id as TestConfig["encoder_type"];
+          config.encoder_type = option.id as TestConfig["encoder_type"];
           break;
         case "decoder":
-          config.decoder_type = opt.id as TestConfig["decoder_type"];
+          config.decoder_type = option.id as TestConfig["decoder_type"];
           break;
         case "transport":
-          config.transport_kind = opt.id as TestConfig["transport_kind"];
+          config.transport_kind = option.id as TestConfig["transport_kind"];
           break;
         case "renderer":
-          if (opt.id === "d3d11") {
+          if (option.id === "d3d11") {
             config.renderer_type = "d3d11";
+            config.render_display = true;
+          } else if (option.id === "macos") {
+            config.renderer_type = "macos";
             config.render_display = true;
           } else {
             config.render_display = false;
           }
           break;
         case "memory":
-          config.zero_copy = opt.id === "d3d11_shared";
+          config.zero_copy = option.id === "d3d11_shared";
           break;
         case "resolution": {
-          const [w, h] = opt.id.split("x").map(Number);
+          const [w, h] = option.id.split("x").map(Number);
           if (w && h) {
             config.resolution = [w, h];
           }
           break;
         }
         case "fps":
-          config.fps = Number(opt.id);
+          config.fps = Number(option.id);
           break;
         case "bitrate":
-          config.bitrate = Number(opt.id);
+          config.bitrate = Number(option.id);
           break;
         case "duration":
-          config.duration_ms = Number(opt.id);
+          config.duration_ms = Number(option.id);
           break;
       }
     });
@@ -609,6 +787,7 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
   const totalTests = generateMatrix().length;
   const finishedCount = completedCount + failedCount + skippedCount;
   const progress = totalTests > 0 ? (finishedCount / totalTests) * 100 : 0;
+  const platformLabel = capabilities?.os_type ?? "windows";
 
   const getStatusIcon = (status: MatrixTest["status"]) => {
     switch (status) {
@@ -634,7 +813,7 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
           矩阵测试
         </h1>
         <p className="text-muted-foreground">
-          批量参数组合测试，验证不同配置下的性能表现
+          批量参数组合测试，当前平台矩阵：{platformLabel}
         </p>
       </div>
 
@@ -787,7 +966,7 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
                   <td className="px-4 py-2 text-sm">{test.config.decoder_type}</td>
                   <td className="px-4 py-2 text-sm">{test.config.transport_kind}</td>
                   <td className="px-4 py-2 text-sm">
-                    {test.config.renderer_type === "d3d11" && test.config.render_display ? "d3d11" : "none"}
+                    {test.config.render_display ? test.config.renderer_type ?? "native" : "none"}
                   </td>
                   <td className="px-4 py-2 text-sm">
                     {test.config.resolution?.join("x")}

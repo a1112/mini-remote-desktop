@@ -6,7 +6,7 @@
 use crate::{
     app_state::AppState,
     handlers::{session, transport as transport_handlers},
-    shell::{AutostartPort, UiLauncherPort},
+    shell::{AutostartPortRef, UiLauncherPortRef},
 };
 use mrd_application::ports::SessionSnapshot;
 use mrd_ipc::{transport, IpcRequest, IpcResponse};
@@ -18,8 +18,8 @@ const LAN_DISCOVERY_REFRESH_WAIT_MS: u64 = 450;
 pub struct IpcServer {
     app_state: Arc<AppState>,
     endpoint: transport::IpcEndpoint,
-    ui_launcher: Arc<std::sync::Mutex<crate::shell::InMemoryUiLauncher>>,
-    autostart: Arc<std::sync::Mutex<dyn AutostartPort + Send + Sync>>,
+    ui_launcher: UiLauncherPortRef,
+    autostart: AutostartPortRef,
 }
 
 impl IpcServer {
@@ -28,46 +28,24 @@ impl IpcServer {
     }
 
     pub fn new_with_endpoint(app_state: Arc<AppState>, endpoint: transport::IpcEndpoint) -> Self {
-        let autostart: Arc<std::sync::Mutex<dyn AutostartPort + Send + Sync>> = if cfg!(windows) {
-            Arc::new(std::sync::Mutex::new(crate::shell::WindowsAutostart::new(
-                "mrd-service",
-            )))
-        } else {
-            Arc::new(std::sync::Mutex::new(crate::shell::NoOpAutostart::new(
-                "mrd-service",
-            )))
-        };
-
         Self {
             app_state,
             endpoint,
-            ui_launcher: Arc::new(std::sync::Mutex::new(
-                crate::shell::InMemoryUiLauncher::new(),
-            )),
-            autostart,
+            ui_launcher: crate::shell::default_ui_launcher(),
+            autostart: crate::shell::default_autostart("mrd-service"),
         }
     }
 
     pub fn new_with_launcher(
         app_state: Arc<AppState>,
         endpoint: transport::IpcEndpoint,
-        ui_launcher: Arc<std::sync::Mutex<crate::shell::InMemoryUiLauncher>>,
+        ui_launcher: UiLauncherPortRef,
     ) -> Self {
-        let autostart: Arc<std::sync::Mutex<dyn AutostartPort + Send + Sync>> = if cfg!(windows) {
-            Arc::new(std::sync::Mutex::new(crate::shell::WindowsAutostart::new(
-                "mrd-service",
-            )))
-        } else {
-            Arc::new(std::sync::Mutex::new(crate::shell::NoOpAutostart::new(
-                "mrd-service",
-            )))
-        };
-
         Self {
             app_state,
             endpoint,
             ui_launcher,
-            autostart,
+            autostart: crate::shell::default_autostart("mrd-service"),
         }
     }
 
@@ -127,17 +105,13 @@ impl IpcServer {
                 snapshot: self.app_state.lan_discovery.snapshot().await,
             },
 
-            IpcRequest::RefreshLanDiscovery => {
-                IpcResponse::LanDiscoverySnapshot {
-                    snapshot: self
-                        .app_state
-                        .lan_discovery
-                        .request_probe_and_wait(Duration::from_millis(
-                            LAN_DISCOVERY_REFRESH_WAIT_MS,
-                        ))
-                        .await,
-                }
-            }
+            IpcRequest::RefreshLanDiscovery => IpcResponse::LanDiscoverySnapshot {
+                snapshot: self
+                    .app_state
+                    .lan_discovery
+                    .request_probe_and_wait(Duration::from_millis(LAN_DISCOVERY_REFRESH_WAIT_MS))
+                    .await,
+            },
 
             IpcRequest::ListSessions => {
                 let sessions = self.app_state.sessions.lock().await;
@@ -500,24 +474,11 @@ impl IpcServer {
         loop {
             match server.accept().await {
                 Ok(stream) => {
-                    // Create a new server instance for this connection
-                    // Note: For simplicity, we're creating a new autostart instance each time
-                    let new_autostart: Arc<std::sync::Mutex<dyn AutostartPort + Send + Sync>> =
-                        if cfg!(windows) {
-                            Arc::new(std::sync::Mutex::new(crate::shell::WindowsAutostart::new(
-                                "mrd-service",
-                            )))
-                        } else {
-                            Arc::new(std::sync::Mutex::new(crate::shell::NoOpAutostart::new(
-                                "mrd-service",
-                            )))
-                        };
-
                     let server_clone = IpcServer {
                         app_state: app_state.clone(),
                         endpoint: self.endpoint.clone(),
                         ui_launcher: ui_launcher.clone(),
-                        autostart: new_autostart,
+                        autostart: crate::shell::default_autostart("mrd-service"),
                     };
                     tokio::spawn(async move {
                         if let Err(e) = server_clone.handle_connection(stream).await {

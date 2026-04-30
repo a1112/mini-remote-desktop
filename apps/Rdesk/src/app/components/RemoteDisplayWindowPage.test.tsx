@@ -57,8 +57,8 @@ describe("RemoteDisplayWindowPage", () => {
           backend: "d3d11",
           attached: true,
           visible: true,
-          parent_hwnd: 10,
-          hwnd: 20,
+          parent_hwnd: "0xA",
+          hwnd: "0x14",
           rect: { x: 0, y: 0, width: 1280, height: 720 },
         });
       }

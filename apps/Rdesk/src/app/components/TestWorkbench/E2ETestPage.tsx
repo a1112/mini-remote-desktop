@@ -2,19 +2,47 @@ import { useState, useEffect } from "react";
 import { useNavigate } from "react-router";
 import { Play, Square, Monitor, Clock, Zap, Activity, Video } from "lucide-react";
 import * as commands from "../../adapters/tauri/commands";
-import type { TestConfig, HarnessMetrics } from "../../adapters/tauri/types";
+import type { EnvironmentSnapshot, TestConfig, HarnessMetrics } from "../../adapters/tauri/types";
+import { capabilityAvailable, chooseCapability } from "./capabilityMeta";
 
-const DEFAULT_CONFIG: TestConfig = {
-  capture_type: "dxgi",
-  encoder_type: "nvenc_h264",
-  decoder_type: "nvdec",
-  renderer_type: "d3d11",
-  resolution: [1920, 1080],
-  fps: 60,
-  bitrate: 5000000,
-  duration_ms: 10000,
-  warmup_ms: 2000,
-};
+function buildDefaultConfig(capabilities: EnvironmentSnapshot | null): TestConfig {
+  const capture = chooseCapability(
+    ["macos", "dxgi", "synthetic"],
+    capabilities,
+    "available_captures",
+    "synthetic"
+  );
+  const encoder = chooseCapability(
+    capture === "macos" ? ["videotoolbox_h264", "openh264"] : ["nvenc_h264", "openh264"],
+    capabilities,
+    "available_encoders",
+    "openh264"
+  );
+  const decoder = capabilityAvailable(capabilities, "available_decoders", "nvdec")
+    ? "nvdec"
+    : capabilityAvailable(capabilities, "available_decoders", "software", true)
+      ? "software"
+      : "none";
+  const renderer = capabilityAvailable(capabilities, "available_renderers", "macos")
+    ? "macos"
+    : capabilityAvailable(capabilities, "available_renderers", "d3d11")
+      ? "d3d11"
+      : undefined;
+
+  return {
+    capture_type: capture,
+    encoder_type: encoder,
+    decoder_type: decoder,
+    renderer_type: renderer,
+    render_display: renderer ? true : undefined,
+    resolution: [1920, 1080],
+    fps: 60,
+    bitrate: 5000000,
+    duration_ms: 10000,
+    warmup_ms: 2000,
+    input_source: capture === "synthetic" ? "synthetic" : "screen",
+  };
+}
 
 export function E2ETestPage() {
   const navigate = useNavigate();
@@ -22,6 +50,22 @@ export function E2ETestPage() {
   const [currentRunId, setCurrentRunId] = useState<string | null>(null);
   const [metrics, setMetrics] = useState<HarnessMetrics | null>(null);
   const [capturedFrame, setCapturedFrame] = useState<string | null>(null);
+  const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
+  const currentConfig = buildDefaultConfig(capabilities);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    commands.testGetCapabilities().then((result) => {
+      if (!cancelled && result.ok) {
+        setCapabilities(result.value);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Poll for run status
   useEffect(() => {
@@ -63,7 +107,7 @@ export function E2ETestPage() {
   const handleStart = async () => {
     const result = await commands.testStartRun({
       scenarioId: "e2e.local",
-      config: DEFAULT_CONFIG,
+      config: currentConfig,
     });
 
     if (result.ok) {
@@ -99,16 +143,16 @@ export function E2ETestPage() {
         <h2 className="text-lg font-semibold mb-4">测试配置</h2>
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
           <div>
-            <span className="text-muted-foreground">采集:</span> DXGI
+            <span className="text-muted-foreground">采集:</span> {currentConfig.capture_type}
           </div>
           <div>
-            <span className="text-muted-foreground">编码:</span> NVENC H.264
+            <span className="text-muted-foreground">编码:</span> {currentConfig.encoder_type}
           </div>
           <div>
-            <span className="text-muted-foreground">解码:</span> NVDEC
+            <span className="text-muted-foreground">解码:</span> {currentConfig.decoder_type}
           </div>
           <div>
-            <span className="text-muted-foreground">渲染:</span> D3D11
+            <span className="text-muted-foreground">渲染:</span> {currentConfig.renderer_type ?? "none"}
           </div>
           <div>
             <span className="text-muted-foreground">分辨率:</span> 1920x1080

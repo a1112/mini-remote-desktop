@@ -7,8 +7,12 @@ use anyhow::Result;
 use mrd_capture_dxgi::DxgiDesktopCapture;
 #[cfg(windows)]
 use mrd_capture_dxgi::DxgiSharedTextureCapture;
+#[cfg(target_os = "macos")]
+use mrd_capture_macos::MacosScreenCapture;
 #[cfg(windows)]
 use mrd_capture_winrt::WinrtCapture;
+#[cfg(target_os = "macos")]
+use mrd_codec_videotoolbox::{VideoToolboxH264Decoder, VideoToolboxH264Encoder};
 use mrd_decode_nvdec::{NvdecDecoder, NvdecOutputMode};
 use mrd_encode_nvenc::NvencH264Encoder;
 #[cfg(windows)]
@@ -18,7 +22,9 @@ use mrd_pipeline_core::{
     CapturedFrame, DecodedFrame, DecodedFrameData, EncodedAccessUnit, FrameCapture,
     FramePixelFormat, VideoCodec, VideoDecoder, VideoEncoder,
 };
-use mrd_render::{RenderFrame, RenderTarget, RendererFactory, RendererInstance};
+use mrd_render::{RenderFrame, RenderFrameData, RenderTarget, RendererFactory, RendererInstance};
+#[cfg(target_os = "macos")]
+use mrd_render_macos::MacosRendererFactory;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -64,6 +70,7 @@ pub enum TestChain {
 pub enum CaptureType {
     Dxgi,
     Winrt,
+    Macos,
     Synthetic,
 }
 
@@ -71,9 +78,11 @@ pub enum CaptureType {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum EncoderType {
+    None,
     NvencH264,
     NvencAv1,
     OpenH264,
+    VideoToolboxH264,
 }
 
 /// Available decoder types
@@ -83,6 +92,7 @@ pub enum DecoderType {
     None,
     Nvdec,
     Software,
+    VideoToolbox,
 }
 
 /// Available renderer types for live test display.
@@ -90,6 +100,7 @@ pub enum DecoderType {
 #[serde(rename_all = "snake_case")]
 pub enum RendererType {
     D3d11,
+    Macos,
 }
 
 /// Available transport test paths for encoded access units.
@@ -111,6 +122,8 @@ pub struct TestConfig {
     pub renderer_target_hwnd: Option<isize>,
     pub transport: Option<TransportKind>,
     pub zero_copy: Option<bool>,
+    pub input_source: Option<String>,
+    pub window_handle: Option<String>,
 }
 
 impl Default for TestConfig {
@@ -123,6 +136,8 @@ impl Default for TestConfig {
             renderer_target_hwnd: None,
             transport: None,
             zero_copy: None,
+            input_source: None,
+            window_handle: None,
         }
     }
 }
@@ -161,7 +176,8 @@ impl TestChain {
 
     pub fn encoder_type(&self) -> EncoderType {
         match self {
-            Self::CaptureOnly | Self::NvencNvdec | Self::NvencOnly => EncoderType::NvencH264,
+            Self::CaptureOnly => EncoderType::None,
+            Self::NvencNvdec | Self::NvencOnly => EncoderType::NvencH264,
             Self::OpenH264 => EncoderType::OpenH264,
             Self::Custom { encoder, .. } => encoder.clone(),
         }
@@ -227,8 +243,11 @@ impl Default for HarnessMetrics {
 
 struct FrameBuffer {
     captured: Option<Vec<u8>>,
-    width: usize,
-    height: usize,
+    captured_width: usize,
+    captured_height: usize,
+    rendered: Option<Vec<u8>>,
+    rendered_width: usize,
+    rendered_height: usize,
 }
 
 // Pipeline state - defined outside impl
@@ -247,6 +266,7 @@ struct PipelineState {
 enum PipelineDecoder {
     Nvdec(NvdecDecoder),
     Software(Box<dyn VideoDecoder>),
+    VideoToolbox(Box<dyn VideoDecoder>),
 }
 
 enum WebrtcRtpSender {
@@ -392,6 +412,9 @@ impl PipelineDecoder {
             Self::Software(decoder) => decoder
                 .push_access_unit(bytes)
                 .map_err(|error| anyhow::anyhow!(error)),
+            Self::VideoToolbox(decoder) => decoder
+                .push_access_unit(bytes)
+                .map_err(|error| anyhow::anyhow!(error)),
         }
     }
 
@@ -403,6 +426,7 @@ impl PipelineDecoder {
                 .map(nvdec_frame_to_decoded_frame)
                 .collect(),
             Self::Software(decoder) => decoder.drain_decoded_frames(),
+            Self::VideoToolbox(decoder) => decoder.drain_decoded_frames(),
         }
     }
 }
@@ -437,7 +461,7 @@ impl PipelineRenderer {
         let renderer_type = renderer_type.clone();
 
         let render_thread = thread::Builder::new()
-            .name("mrd-dx11-test-render".to_string())
+            .name("mrd-test-render".to_string())
             .spawn(move || {
                 if let Err(error) =
                     run_renderer_thread(renderer_type, width, height, target_hwnd, receiver)
@@ -447,7 +471,7 @@ impl PipelineRenderer {
                     }
                 }
             })
-            .map_err(|error| anyhow::anyhow!("spawn D3D11 render thread failed: {error}"))?;
+            .map_err(|error| anyhow::anyhow!("spawn render thread failed: {error}"))?;
 
         Ok(Self {
             sender,
@@ -458,7 +482,7 @@ impl PipelineRenderer {
 
     fn submit_frame(&mut self, input: RenderInput) -> Result<()> {
         if let Some(error) = self.last_error.lock().unwrap().clone() {
-            anyhow::bail!("D3D11 render thread failed: {error}");
+            anyhow::bail!("native render thread failed: {error}");
         }
 
         match self.sender.try_send(RenderCommand::Frame(input)) {
@@ -466,7 +490,7 @@ impl PipelineRenderer {
             Err(mpsc::TrySendError::Full(RenderCommand::Frame(_))) => Ok(()),
             Err(mpsc::TrySendError::Full(RenderCommand::Stop)) => Ok(()),
             Err(mpsc::TrySendError::Disconnected(_)) => {
-                anyhow::bail!("D3D11 render thread stopped")
+                anyhow::bail!("native render thread stopped")
             }
         }
     }
@@ -519,7 +543,72 @@ fn run_renderer_thread(
                 anyhow::bail!("D3D11 render display is only available on Windows");
             }
         }
+        RendererType::Macos => {
+            #[cfg(target_os = "macos")]
+            {
+                let window = match target_hwnd {
+                    Some(_) => None,
+                    None => Some(MacosTestWindow::new(width, height)?),
+                };
+                let target_hwnd = target_hwnd.unwrap_or_else(|| {
+                    window
+                        .as_ref()
+                        .expect("macOS test window exists")
+                        .ns_view_value()
+                });
+                let factory = MacosRendererFactory;
+                let mut renderer = factory
+                    .create()
+                    .map_err(|error| anyhow::anyhow!("create Metal renderer failed: {error}"))?;
+                renderer
+                    .attach_target(RenderTarget::WindowHandle(target_hwnd))
+                    .map_err(|error| anyhow::anyhow!("attach Metal renderer failed: {error}"))?;
+
+                run_macos_render_loop(window, renderer, receiver)
+            }
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = (width, height, target_hwnd, receiver);
+                anyhow::bail!("Metal render display is only available on macOS");
+            }
+        }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn run_macos_render_loop(
+    window: Option<MacosTestWindow>,
+    mut renderer: Box<dyn RendererInstance>,
+    receiver: mpsc::Receiver<RenderCommand>,
+) -> Result<()> {
+    loop {
+        match receiver.recv_timeout(Duration::from_millis(8)) {
+            Ok(RenderCommand::Frame(input)) => upload_render_input(&mut *renderer, input)?,
+            Ok(RenderCommand::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+
+        if let Some(window) = window.as_ref() {
+            window.pump_events()?;
+        }
+    }
+
+    Ok(())
+}
+
+fn run_renderer_upload_loop(
+    mut renderer: Box<dyn RendererInstance>,
+    receiver: mpsc::Receiver<RenderCommand>,
+) -> Result<()> {
+    loop {
+        match receiver.recv() {
+            Ok(RenderCommand::Frame(input)) => upload_render_input(&mut *renderer, input)?,
+            Ok(RenderCommand::Stop) | Err(_) => break,
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -552,12 +641,154 @@ fn run_d3d11_render_loop(
     Ok(())
 }
 
-#[cfg(windows)]
 fn upload_render_input(renderer: &mut dyn RendererInstance, input: RenderInput) -> Result<()> {
     let frame = render_input_to_frame(input);
     renderer
         .upload_frame(frame)
-        .map_err(|error| anyhow::anyhow!("upload frame to D3D11 renderer failed: {error}"))
+        .map_err(|error| anyhow::anyhow!("upload frame to renderer failed: {error}"))
+}
+
+#[cfg(target_os = "macos")]
+#[allow(deprecated, unexpected_cfgs)]
+struct MacosTestWindow {
+    ns_window: isize,
+    ns_view: isize,
+}
+
+#[cfg(target_os = "macos")]
+#[allow(deprecated, unexpected_cfgs)]
+impl MacosTestWindow {
+    fn new(frame_width: usize, frame_height: usize) -> Result<Self> {
+        run_on_macos_main_thread(move || unsafe {
+            use cocoa::{
+                appkit::{NSBackingStoreBuffered, NSView, NSWindow, NSWindowStyleMask},
+                base::{id, nil, NO, YES},
+                foundation::{NSPoint, NSRect, NSSize, NSString},
+            };
+            use objc::{msg_send, sel, sel_impl};
+
+            let width = frame_width.clamp(320, 1280) as f64;
+            let height = frame_height.clamp(240, 800) as f64;
+            let frame = NSRect::new(NSPoint::new(80.0, 80.0), NSSize::new(width, height));
+            let style = NSWindowStyleMask::NSTitledWindowMask
+                | NSWindowStyleMask::NSClosableWindowMask
+                | NSWindowStyleMask::NSResizableWindowMask;
+            let window: id = NSWindow::alloc(nil).initWithContentRect_styleMask_backing_defer_(
+                frame,
+                style,
+                NSBackingStoreBuffered,
+                NO,
+            );
+            if window == nil {
+                anyhow::bail!("create macOS Metal test window failed");
+            }
+
+            let content_frame = NSRect::new(NSPoint::new(0.0, 0.0), frame.size);
+            let view: id = NSView::alloc(nil).initWithFrame_(content_frame);
+            if view == nil {
+                let _: () = msg_send![window, release];
+                anyhow::bail!("create macOS Metal test NSView failed");
+            }
+
+            let _: () = msg_send![window, setReleasedWhenClosed: NO];
+            view.setWantsLayer(YES);
+            window.setContentView_(view);
+            let title = NSString::alloc(nil).init_str("Rdesk Metal Render Test");
+            window.setTitle_(title);
+            let _: () = msg_send![title, release];
+            window.center();
+            window.makeKeyAndOrderFront_(nil);
+
+            Ok(Self {
+                ns_window: window as isize,
+                ns_view: view as isize,
+            })
+        })
+    }
+
+    fn ns_view_value(&self) -> isize {
+        self.ns_view
+    }
+
+    fn pump_events(&self) -> Result<()> {
+        let ns_window = self.ns_window;
+        run_on_macos_main_thread(move || unsafe {
+            use cocoa::{
+                appkit::{NSApp, NSApplication},
+                base::{id, nil, YES},
+                foundation::{NSAutoreleasePool, NSDefaultRunLoopMode, NSUInteger},
+            };
+            use objc::{msg_send, sel, sel_impl};
+
+            let app = NSApp();
+            let pool = NSAutoreleasePool::new(nil);
+            loop {
+                let event: id = app.nextEventMatchingMask_untilDate_inMode_dequeue_(
+                    usize::MAX as NSUInteger,
+                    nil,
+                    NSDefaultRunLoopMode,
+                    YES,
+                );
+                if event == nil {
+                    break;
+                }
+                app.sendEvent_(event);
+            }
+            let _: () = msg_send![app, updateWindows];
+            let window = ns_window as id;
+            if window != nil {
+                let _: () = msg_send![window, displayIfNeeded];
+            }
+            pool.drain();
+            Ok(())
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MacosTestWindow {
+    fn drop(&mut self) {
+        let ns_window = self.ns_window;
+        let ns_view = self.ns_view;
+        let _ = run_on_macos_main_thread(move || unsafe {
+            use cocoa::base::{id, nil};
+            use objc::{msg_send, sel, sel_impl};
+
+            let window = ns_window as id;
+            let view = ns_view as id;
+            if window != nil {
+                let _: () = msg_send![window, orderOut: nil];
+                let _: () = msg_send![window, close];
+                let _: () = msg_send![window, release];
+            }
+            if view != nil {
+                let _: () = msg_send![view, release];
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn run_on_macos_main_thread<T, F>(f: F) -> Result<T>
+where
+    T: Send,
+    F: FnOnce() -> Result<T> + Send,
+{
+    if unsafe { pthread_main_np() } != 0 {
+        return f();
+    }
+
+    let mut result = None;
+    dispatch2::DispatchQueue::main().exec_sync(|| {
+        result = Some(f());
+    });
+    result.unwrap_or_else(|| anyhow::bail!("macOS main-thread task did not return"))
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn pthread_main_np() -> std::ffi::c_int;
 }
 
 #[cfg(windows)]
@@ -694,8 +925,11 @@ impl TestHarness {
     pub fn new() -> Result<Self> {
         let frame_buffer = Arc::new(Mutex::new(FrameBuffer {
             captured: None,
-            width: 0,
-            height: 0,
+            captured_width: 0,
+            captured_height: 0,
+            rendered: None,
+            rendered_width: 0,
+            rendered_height: 0,
         }));
 
         let metrics = Arc::new(Mutex::new(HarnessMetrics::default()));
@@ -739,8 +973,11 @@ impl TestHarness {
         {
             let mut buf = self.frame_buffer.lock().unwrap();
             buf.captured = None;
-            buf.width = 0;
-            buf.height = 0;
+            buf.captured_width = 0;
+            buf.captured_height = 0;
+            buf.rendered = None;
+            buf.rendered_width = 0;
+            buf.rendered_height = 0;
         }
 
         running.store(true, Ordering::Relaxed);
@@ -849,7 +1086,14 @@ impl TestHarness {
                     CaptureType::Winrt => {
                         #[cfg(windows)]
                         {
-                            let capture = WinrtMonitorCapture::new_primary()?;
+                            let capture = if config.input_source.as_deref() == Some("window") {
+                                let hwnd = parse_window_handle(config.window_handle.as_deref())?;
+                                WinrtMonitorCapture::new_window(windows::Win32::Foundation::HWND(
+                                    hwnd as *mut std::ffi::c_void,
+                                ))?
+                            } else {
+                                WinrtMonitorCapture::new_primary()?
+                            };
                             let (width, height) = select_pipeline_dimensions(
                                 capture.width(),
                                 capture.height(),
@@ -861,6 +1105,38 @@ impl TestHarness {
                         {
                             return Err(anyhow::anyhow!(
                                 "WinRT capture is only available on Windows"
+                            ));
+                        }
+                    }
+                    CaptureType::Macos => {
+                        #[cfg(target_os = "macos")]
+                        {
+                            let mut capture = if config.input_source.as_deref() == Some("window") {
+                                let window_id =
+                                    parse_window_handle(config.window_handle.as_deref())?;
+                                let window_id = u32::try_from(window_id).map_err(|_| {
+                                    anyhow::anyhow!("macOS window id out of range: {window_id}")
+                                })?;
+                                MacosScreenCapture::new_window(window_id).map_err(|e| {
+                                    anyhow::anyhow!("macOS window capture init failed: {:?}", e)
+                                })?
+                            } else {
+                                MacosScreenCapture::new_primary().map_err(|e| {
+                                    anyhow::anyhow!("macOS capture init failed: {:?}", e)
+                                })?
+                            };
+                            let (width, height) = select_pipeline_dimensions(
+                                capture.width(),
+                                capture.height(),
+                                config,
+                            );
+                            capture.set_target_dimensions(width, height);
+                            (Box::new(capture) as Box<dyn FrameCapture>, width, height)
+                        }
+                        #[cfg(not(target_os = "macos"))]
+                        {
+                            return Err(anyhow::anyhow!(
+                                "macOS capture is only available on macOS"
                             ));
                         }
                     }
@@ -896,7 +1172,7 @@ impl TestHarness {
                 let mut decoder = NvdecDecoder::new_with_output_mode(NvdecOutputMode::CpuNv12)
                     .map_err(|e| anyhow::anyhow!("NVDEC 解码器初始化失败: {:?}", e))?;
                 if use_shared_texture_decode {
-                    decoder.enable_shared_texture(true);
+                    enable_nvdec_shared_texture(&mut decoder);
                 }
                 (
                     Some(Box::new(encoder) as Box<dyn VideoEncoder>),
@@ -931,6 +1207,15 @@ impl TestHarness {
                 encoder,
                 decoder,
             } => match encoder {
+                EncoderType::None => {
+                    if *decoder != DecoderType::None {
+                        return Err(anyhow::anyhow!(
+                            "decoder {:?} requires an encoder; use decoder=none for direct capture-render",
+                            decoder
+                        ));
+                    }
+                    (None, None, false)
+                }
                 EncoderType::NvencH264 => match decoder {
                     DecoderType::None => {
                         let enc = NvencH264Encoder::new_max_speed_with_bitrate(
@@ -953,7 +1238,7 @@ impl TestHarness {
                         let mut dec = NvdecDecoder::new_with_output_mode(NvdecOutputMode::CpuNv12)
                             .map_err(|e| anyhow::anyhow!("NVDEC 解码器初始化失败: {:?}", e))?;
                         if use_shared_texture_decode {
-                            dec.enable_shared_texture(true);
+                            enable_nvdec_shared_texture(&mut dec);
                         }
                         (
                             Some(Box::new(enc) as Box<dyn VideoEncoder>),
@@ -978,6 +1263,20 @@ impl TestHarness {
                             true,
                         )
                     }
+                    DecoderType::VideoToolbox => {
+                        let enc = NvencH264Encoder::new_max_speed_with_bitrate(
+                            width,
+                            height,
+                            fps,
+                            speed_bitrate,
+                        )
+                        .map_err(|e| anyhow::anyhow!("NVENC 编码器初始化失败: {:?}", e))?;
+                        (
+                            Some(Box::new(enc) as Box<dyn VideoEncoder>),
+                            Some(create_videotoolbox_h264_decoder()?),
+                            true,
+                        )
+                    }
                 },
                 EncoderType::OpenH264 => {
                     let enc = match config.bitrate {
@@ -998,7 +1297,7 @@ impl TestHarness {
                                         anyhow::anyhow!("NVDEC decoder init failed: {:?}", e)
                                     })?;
                             if use_shared_texture_decode {
-                                dec.enable_shared_texture(true);
+                                enable_nvdec_shared_texture(&mut dec);
                             }
                             (
                                 Some(Box::new(enc) as Box<dyn VideoEncoder>),
@@ -1015,6 +1314,36 @@ impl TestHarness {
                                 Some(PipelineDecoder::Software(dec)),
                                 true,
                             )
+                        }
+                        DecoderType::VideoToolbox => (
+                            Some(Box::new(enc) as Box<dyn VideoEncoder>),
+                            Some(create_videotoolbox_h264_decoder()?),
+                            true,
+                        ),
+                    }
+                }
+                EncoderType::VideoToolboxH264 => {
+                    let enc = create_videotoolbox_h264_encoder(
+                        width,
+                        height,
+                        fps,
+                        config.bitrate.unwrap_or(low_latency_bitrate),
+                    )?;
+                    match decoder {
+                        DecoderType::None => (Some(enc), None, false),
+                        DecoderType::Software => {
+                            let dec = mrd_decode::create_decoder("h264_software").map_err(|e| {
+                                anyhow::anyhow!("software decoder init failed: {:?}", e)
+                            })?;
+                            (Some(enc), Some(PipelineDecoder::Software(dec)), true)
+                        }
+                        DecoderType::VideoToolbox => {
+                            (Some(enc), Some(create_videotoolbox_h264_decoder()?), true)
+                        }
+                        DecoderType::Nvdec => {
+                            return Err(anyhow::anyhow!(
+                                "VideoToolbox encoder with NVDEC decoder is not a macOS-native path"
+                            ));
                         }
                     }
                 }
@@ -1050,6 +1379,11 @@ impl TestHarness {
                             DecoderType::Software => {
                                 return Err(anyhow::anyhow!(
                                     "AV1 software decoder path is not implemented"
+                                ));
+                            }
+                            DecoderType::VideoToolbox => {
+                                return Err(anyhow::anyhow!(
+                                    "VideoToolbox H.264 decoder cannot decode NVENC AV1 output"
                                 ));
                             }
                         }
@@ -1198,6 +1532,7 @@ impl TestHarness {
                 .or_else(|| {
                     (!state.use_decoder).then(|| RenderInput::Captured(captured_frame.clone()))
                 });
+            let render_preview_input = render_input.clone();
 
             if let (Some(renderer), Some(input)) = (state.renderer.as_mut(), render_input) {
                 if let Err(error) = renderer.submit_frame(input) {
@@ -1238,8 +1573,20 @@ impl TestHarness {
                 {
                     let mut buf = frame_buffer.lock().unwrap();
                     buf.captured = Some(captured_ds);
-                    buf.width = ds_width;
-                    buf.height = ds_height;
+                    buf.captured_width = ds_width;
+                    buf.captured_height = ds_height;
+                }
+            }
+            if frame_count % WEB_PREVIEW_FRAME_UPDATE_INTERVAL == 0 {
+                if let Some(input) = render_preview_input {
+                    if let Ok((rendered_ds, ds_width, ds_height)) =
+                        render_input_to_preview_bgra(input, WEB_PREVIEW_MAX_WIDTH)
+                    {
+                        let mut buf = frame_buffer.lock().unwrap();
+                        buf.rendered = Some(rendered_ds);
+                        buf.rendered_width = ds_width;
+                        buf.rendered_height = ds_height;
+                    }
                 }
             }
 
@@ -1378,8 +1725,12 @@ impl TestHarness {
         let captured = buf
             .captured
             .as_ref()
-            .map(|data| (data.clone(), buf.width, buf.height));
-        (captured, None)
+            .map(|data| (data.clone(), buf.captured_width, buf.captured_height));
+        let rendered = buf
+            .rendered
+            .as_ref()
+            .map(|data| (data.clone(), buf.rendered_width, buf.rendered_height));
+        (captured, rendered)
     }
 }
 
@@ -1387,6 +1738,59 @@ impl Drop for TestHarness {
     fn drop(&mut self) {
         let _ = self.stop();
     }
+}
+
+#[cfg(windows)]
+fn enable_nvdec_shared_texture(decoder: &mut NvdecDecoder) {
+    decoder.enable_shared_texture(true);
+}
+
+#[cfg(not(windows))]
+fn enable_nvdec_shared_texture(_decoder: &mut NvdecDecoder) {}
+
+fn create_videotoolbox_h264_encoder(
+    width: usize,
+    height: usize,
+    fps: u32,
+    bitrate: u32,
+) -> Result<Box<dyn VideoEncoder>> {
+    #[cfg(target_os = "macos")]
+    {
+        let encoder = VideoToolboxH264Encoder::new_with_bitrate(width, height, fps, bitrate)
+            .map_err(|e| anyhow::anyhow!("VideoToolbox H.264 encoder init failed: {:?}", e))?;
+        Ok(Box::new(encoder) as Box<dyn VideoEncoder>)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (width, height, fps, bitrate);
+        anyhow::bail!("VideoToolbox H.264 encoder is only available on macOS")
+    }
+}
+
+fn create_videotoolbox_h264_decoder() -> Result<PipelineDecoder> {
+    #[cfg(target_os = "macos")]
+    {
+        if !videotoolbox_decoder_enabled() {
+            anyhow::bail!("VideoToolbox decoder is disabled by MRD_DISABLE_VIDEOTOOLBOX_DECODER");
+        }
+
+        let decoder = VideoToolboxH264Decoder::new()
+            .map_err(|e| anyhow::anyhow!("VideoToolbox H.264 decoder init failed: {:?}", e))?;
+        Ok(PipelineDecoder::VideoToolbox(Box::new(decoder)))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        anyhow::bail!("VideoToolbox H.264 decoder is only available on macOS")
+    }
+}
+
+fn videotoolbox_decoder_enabled() -> bool {
+    !matches!(
+        std::env::var("MRD_DISABLE_VIDEOTOOLBOX_DECODER").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    )
 }
 
 fn nvdec_frame_to_decoded_frame(frame: mrd_decode_nvdec::NvdecDecodedFrame) -> DecodedFrame {
@@ -1418,6 +1822,26 @@ fn render_input_to_frame(input: RenderInput) -> RenderFrame {
         RenderInput::Decoded(frame) => decoded_frame_to_render_frame(&frame),
         RenderInput::Captured(frame) => captured_frame_to_render_frame(&frame),
     }
+}
+
+fn render_input_to_preview_bgra(
+    input: RenderInput,
+    max_width: usize,
+) -> Result<(Vec<u8>, usize, usize)> {
+    let frame = render_input_to_frame(input);
+    let (bgra, width, height) = match frame.data {
+        RenderFrameData::Bgra32(data) => (data, frame.width, frame.height),
+        RenderFrameData::Rgb24(data) => (
+            rgb24_to_bgra32(&data, frame.width, frame.height),
+            frame.width,
+            frame.height,
+        ),
+        #[cfg(windows)]
+        RenderFrameData::D3D11SharedNv12 { .. } => {
+            anyhow::bail!("D3D11 shared texture preview is not CPU-readable")
+        }
+    };
+    downsample_bgra(&bgra, width, height, max_width)
 }
 
 fn decoded_frame_to_render_frame(frame: &DecodedFrame) -> RenderFrame {
@@ -1474,6 +1898,17 @@ fn rgba32_to_bgra32(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
     bgra
 }
 
+fn rgb24_to_bgra32(rgb: &[u8], width: usize, height: usize) -> Vec<u8> {
+    let mut bgra = vec![0_u8; width * height * 4];
+    for (src, dst) in rgb.chunks_exact(3).zip(bgra.chunks_exact_mut(4)) {
+        dst[0] = src[2];
+        dst[1] = src[1];
+        dst[2] = src[0];
+        dst[3] = 255;
+    }
+    bgra
+}
+
 fn cpu_nv12_to_rgb24(nv12: &[u8], width: usize, height: usize, pitch: usize) -> Vec<u8> {
     let mut rgb = vec![0_u8; width * height * 3];
     let uv_base = pitch * height;
@@ -1509,7 +1944,15 @@ fn cpu_nv12_to_rgb24(nv12: &[u8], width: usize, height: usize, pitch: usize) -> 
 }
 
 fn downsample_frame(frame: &CapturedFrame, max_width: usize) -> Result<(Vec<u8>, usize, usize)> {
-    let (width, height) = (frame.width, frame.height);
+    downsample_bgra(&frame.data, frame.width, frame.height, max_width)
+}
+
+fn downsample_bgra(
+    bgra: &[u8],
+    width: usize,
+    height: usize,
+    max_width: usize,
+) -> Result<(Vec<u8>, usize, usize)> {
     let scale = if width > max_width {
         max_width as f32 / width as f32
     } else {
@@ -1517,7 +1960,7 @@ fn downsample_frame(frame: &CapturedFrame, max_width: usize) -> Result<(Vec<u8>,
     };
 
     if scale >= 1.0 {
-        return Ok((frame.data.clone(), width, height));
+        return Ok((bgra.to_vec(), width, height));
     }
 
     let new_width = (width as f32 * scale) as usize;
@@ -1532,8 +1975,8 @@ fn downsample_frame(frame: &CapturedFrame, max_width: usize) -> Result<(Vec<u8>,
             let src_idx = (src_y * width + src_x) * 4;
             let dst_idx = (y * new_width + x) * 4;
 
-            if src_idx + 3 < frame.data.len() && dst_idx + 3 < result.len() {
-                result[dst_idx..dst_idx + 4].copy_from_slice(&frame.data[src_idx..src_idx + 4]);
+            if src_idx + 3 < bgra.len() && dst_idx + 3 < result.len() {
+                result[dst_idx..dst_idx + 4].copy_from_slice(&bgra[src_idx..src_idx + 4]);
             }
         }
     }
@@ -1601,13 +2044,23 @@ struct WinrtMonitorCapture {
 #[cfg(windows)]
 impl WinrtMonitorCapture {
     fn new_primary() -> Result<Self> {
-        let mut inner = WinrtCapture::from_monitor_index(0)
+        let inner = WinrtCapture::from_monitor_index(0)
             .map_err(|error| anyhow::anyhow!("WinRT capture init failed: {error}"))?;
+        Self::from_inner(inner, "WinRT capture")
+    }
+
+    fn new_window(hwnd: windows::Win32::Foundation::HWND) -> Result<Self> {
+        let inner = WinrtCapture::from_window(hwnd)
+            .map_err(|error| anyhow::anyhow!("WinRT window capture init failed: {error}"))?;
+        Self::from_inner(inner, "WinRT window capture")
+    }
+
+    fn from_inner(mut inner: WinrtCapture, label: &str) -> Result<Self> {
         let width = inner.width();
         let height = inner.height();
         inner
             .start()
-            .map_err(|error| anyhow::anyhow!("WinRT capture start failed: {error}"))?;
+            .map_err(|error| anyhow::anyhow!("{label} start failed: {error}"))?;
         Ok(Self {
             inner,
             width,
@@ -1639,6 +2092,29 @@ fn select_pipeline_dimensions(
     let (width, height) = config.resolution.unwrap_or((capture_width, capture_height));
 
     (even_dimension(width), even_dimension(height))
+}
+
+fn parse_window_handle(input: Option<&str>) -> Result<isize> {
+    let input = input.ok_or_else(|| anyhow::anyhow!("window capture requires a window handle"))?;
+    let trimmed = input.trim().rsplit(':').next().unwrap_or(input).trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("window capture handle is empty");
+    }
+
+    let value = if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        usize::from_str_radix(hex, 16).map_err(|error| {
+            anyhow::anyhow!("invalid window capture handle '{trimmed}': {error}")
+        })?
+    } else {
+        trimmed.parse::<usize>().map_err(|error| {
+            anyhow::anyhow!("invalid window capture handle '{trimmed}': {error}")
+        })?
+    };
+
+    Ok(value as isize)
 }
 
 fn even_dimension(value: usize) -> usize {
@@ -1997,6 +2473,7 @@ mod tests {
     fn env_capture_type() -> CaptureType {
         match std::env::var("MRD_HARNESS_CAPTURE").as_deref() {
             Ok("winrt") => CaptureType::Winrt,
+            Ok("macos") => CaptureType::Macos,
             Ok("synthetic") => CaptureType::Synthetic,
             _ => CaptureType::Dxgi,
         }
@@ -2004,15 +2481,19 @@ mod tests {
 
     fn env_encoder_type() -> EncoderType {
         match std::env::var("MRD_HARNESS_ENCODER").as_deref() {
+            Ok("none") => EncoderType::None,
             Ok("openh264") => EncoderType::OpenH264,
             Ok("nvenc_av1") => EncoderType::NvencAv1,
+            Ok("videotoolbox_h264") | Ok("videotoolbox") => EncoderType::VideoToolboxH264,
             _ => EncoderType::NvencH264,
         }
     }
 
     fn env_decoder_type() -> DecoderType {
         match std::env::var("MRD_HARNESS_DECODER").as_deref() {
+            Ok("none") => DecoderType::None,
             Ok("software") => DecoderType::Software,
+            Ok("videotoolbox") => DecoderType::VideoToolbox,
             _ => DecoderType::Nvdec,
         }
     }
@@ -2057,6 +2538,7 @@ mod tests {
                 .and_then(|value| value.parse::<u32>().ok()),
             renderer: match std::env::var("MRD_HARNESS_RENDERER").as_deref() {
                 Ok("d3d11") => Some(RendererType::D3d11),
+                Ok("macos") | Ok("metal") => Some(RendererType::Macos),
                 _ => None,
             },
             renderer_target_hwnd: None,
@@ -2071,6 +2553,8 @@ mod tests {
                 Ok("0") | Ok("false") | Ok("cpu") => Some(false),
                 _ => None,
             },
+            input_source: std::env::var("MRD_HARNESS_INPUT_SOURCE").ok(),
+            window_handle: std::env::var("MRD_HARNESS_WINDOW_HANDLE").ok(),
         });
         harness.start().expect("start harness");
         thread::sleep(Duration::from_secs(seconds));

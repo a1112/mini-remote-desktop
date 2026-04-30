@@ -13,11 +13,24 @@ name = "resolution_test"
 path = "resolution_test.rs"
 
 [dependencies]
+anyhow = "1.0"
 mrd-pipeline-core = { path = "../../crates/mrd-pipeline-core" }
+mrd-encode-openh264 = { path = "../../crates/mrd-encode-openh264" }
+mrd-decode = { path = "../../crates/mrd-decode" }
+mrd-render = { path = "../../crates/mrd-render" }
+mrd-transport-quic-quinn = { path = "../../crates/mrd-transport-quic-quinn" }
+mrd-observability = { path = "../../crates/mrd-observability" }
+
+[[test]]
+name = "automated_e2e_pipeline"
+path = "automated_e2e_pipeline.rs"
+
+[target.'cfg(windows)'.dependencies]
+mrd-capture-winrt = { path = "../../crates/mrd-capture-winrt" }
+mrd-decode-nvdec = { path = "../../crates/mrd-decode-nvdec" }
 mrd-encode-nvenc = { path = "../../crates/mrd-encode-nvenc" }
 mrd-encode-nvenc-av1 = { path = "../../crates/mrd-encode-nvenc-av1" }
-mrd-decode-nvdec = { path = "../../crates/mrd-decode-nvdec" }
-mrd-decode = { path = "../../crates/mrd-decode" }
-mrd-transport-quic-quinn = { path = "../../crates/mrd-transport-quic-quinn" }
-mrd-capture-winrt = { path = "../../crates/mrd-capture-winrt" }
-mrd-observability = { path = "../../crates/mrd-observability" }
+mrd-render-d3d11 = { path = "../../crates/mrd-render-d3d11" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mrd-render-macos = { path = "../../crates/mrd-render-macos" }

@@ -41,7 +41,6 @@ mrd-transport-webrtc = { path = "../../../crates/mrd-transport-webrtc" }
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 tauri = { version = "2", features = ["macos-private-api", "tray-icon"] }
-winreg = "0.52"
 sysinfo = "0.30"
 reqwest = { version = "0.12", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
@@ -64,6 +63,7 @@ mrd-service = { path = "../../mrd-service" }
 [target.'cfg(windows)'.dependencies]
 mrd-capture-winrt = { path = "../../../crates/mrd-capture-winrt" }
 mrd-encode-nvenc-av1 = { path = "../../../crates/mrd-encode-nvenc-av1" }
+winreg = "0.52"
 winapi = { version = "0.3", features = ["sysinfoapi", "minwindef"] }
 windows = { version = "0.52", features = [
   "Win32_Foundation",
@@ -71,6 +71,14 @@ windows = { version = "0.52", features = [
   "Win32_System_LibraryLoader",
   "Win32_UI_WindowsAndMessaging",
 ] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cocoa = "0.26"
+dispatch2 = "0.3"
+mrd-capture-macos = { path = "../../../crates/mrd-capture-macos" }
+mrd-codec-videotoolbox = { path = "../../../crates/mrd-codec-videotoolbox" }
+mrd-render-macos = { path = "../../../crates/mrd-render-macos" }
+objc = "0.2"
 
 [features]
 # this feature is used for production builds or when `devPath` points to the filesystem and the built-in dev server is disabled.

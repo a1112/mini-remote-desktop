@@ -1,6 +1,5 @@
 fn main() {
     add_macos_swift_runtime_rpaths();
-    tauri_build::build()
 }
 
 fn add_macos_swift_runtime_rpaths() {

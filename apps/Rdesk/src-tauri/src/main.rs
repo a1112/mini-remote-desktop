@@ -1,5 +1,6 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![allow(unexpected_cfgs)]
 
 mod app_settings;
 mod device_info;
@@ -315,10 +316,10 @@ fn configure_remote_display_native_surface(
         visible.unwrap_or(enabled),
     )?;
 
-    let render_mode = if snapshot.attached {
-        "d3d11_native"
-    } else {
-        "web"
+    let render_mode = match (snapshot.attached, snapshot.backend.as_str()) {
+        (true, "macos") => "macos_native",
+        (true, _) => "d3d11_native",
+        (false, _) => "web",
     };
     let _ = state
         .render_window_registry
@@ -1143,18 +1144,23 @@ fn test_harness_set_custom(
     let capture = match capture.as_str() {
         "dxgi" => CaptureType::Dxgi,
         "winrt" => CaptureType::Winrt,
+        "macos" => CaptureType::Macos,
         "synthetic" => CaptureType::Synthetic,
         _ => return Err(format!("Unsupported capture type: {}", capture)),
     };
     let encoder = match encoder.as_str() {
+        "none" => EncoderType::None,
         "nvenc_h264" => EncoderType::NvencH264,
         "nvenc_av1" => EncoderType::NvencAv1,
         "openh264" => EncoderType::OpenH264,
+        "videotoolbox_h264" | "videotoolbox" => EncoderType::VideoToolboxH264,
         _ => return Err(format!("Unsupported encoder type: {}", encoder)),
     };
     let decoder = match decoder.as_str() {
+        "none" => DecoderType::None,
         "nvdec" => DecoderType::Nvdec,
         "software" => DecoderType::Software,
+        "videotoolbox" => DecoderType::VideoToolbox,
         _ => return Err(format!("Unsupported decoder type: {}", decoder)),
     };
 
@@ -1190,19 +1196,31 @@ fn test_harness_get_metrics(state: tauri::State<'_, AppState>) -> test_harness::
 #[tauri::command]
 fn test_harness_get_frames(
     state: tauri::State<'_, AppState>,
+    include_captured: Option<bool>,
+    include_rendered: Option<bool>,
 ) -> (
     Option<(String, usize, usize)>,
     Option<(String, usize, usize)>,
 ) {
     let (captured, rendered) = state.test_harness.lock().unwrap().get_latest_frames();
+    let include_captured = include_captured.unwrap_or(true);
+    let include_rendered = include_rendered.unwrap_or(true);
 
-    let captured_base64 = captured.and_then(|(data, width, height)| {
-        encode_bgra_png_base64(&data, width, height).map(|png| (png, width, height))
-    });
+    let captured_base64 = if include_captured {
+        captured.and_then(|(data, width, height)| {
+            encode_bgra_png_base64(&data, width, height).map(|png| (png, width, height))
+        })
+    } else {
+        None
+    };
 
-    let rendered_base64 = rendered.and_then(|(data, width, height)| {
-        encode_bgra_png_base64(&data, width, height).map(|png| (png, width, height))
-    });
+    let rendered_base64 = if include_rendered {
+        rendered.and_then(|(data, width, height)| {
+            encode_bgra_png_base64(&data, width, height).map(|png| (png, width, height))
+        })
+    } else {
+        None
+    };
 
     (captured_base64, rendered_base64)
 }
@@ -1266,14 +1284,14 @@ fn test_get_capabilities(
         .map_err(|e| e.to_string())
 }
 
-/// List visible top-level windows that can be used as WinRT capture targets.
+/// List visible top-level windows that can be used as platform capture targets.
 #[tauri::command]
 fn test_list_window_capture_targets() -> Result<Vec<test_orchestrator::WindowCaptureTarget>, String>
 {
     test_orchestrator::list_window_capture_targets().map_err(|e| e.to_string())
 }
 
-/// List WinRT window capture targets and attach best-effort screenshot previews.
+/// List platform window capture targets and attach best-effort screenshot previews.
 #[tauri::command]
 fn test_list_window_capture_targets_with_previews(
     limit: Option<usize>,
