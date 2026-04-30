@@ -337,10 +337,68 @@ fn configure_remote_display_native_surface(
 
 #[tauri::command]
 fn present_test_harness_frame_on_native_surface(
-    _window: WebviewWindow,
-    _state: tauri::State<'_, AppState>,
+    window: WebviewWindow,
+    state: tauri::State<'_, AppState>,
 ) -> Result<bool, String> {
+    let label = window.label().to_string();
+    let target = state
+        .remote_display_surfaces
+        .lock()
+        .unwrap()
+        .render_target_handle(&label);
+    let Some(target) = target else {
+        return Ok(false);
+    };
+
+    present_native_probe_frame(target)
+}
+
+#[cfg(target_os = "macos")]
+fn present_native_probe_frame(target: isize) -> Result<bool, String> {
+    use mrd_render::{RenderTarget, RendererFactory};
+
+    let factory = mrd_render_macos::MacosRendererFactory;
+    let mut renderer = factory
+        .create()
+        .map_err(|error| format!("create Metal probe renderer failed: {error}"))?;
+    renderer
+        .attach_target(RenderTarget::WindowHandle(target))
+        .map_err(|error| format!("attach Metal probe renderer failed: {error}"))?;
+    renderer
+        .upload_frame(build_native_probe_frame(640, 360))
+        .map_err(|error| format!("present Metal probe frame failed: {error}"))?;
+
+    let snapshot = renderer.snapshot();
+    Ok(snapshot.attached_to_target && snapshot.uploaded_frame_count > 0)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn present_native_probe_frame(_target: isize) -> Result<bool, String> {
     Ok(false)
+}
+
+fn build_native_probe_frame(width: usize, height: usize) -> mrd_render::RenderFrame {
+    let mut bgra = vec![0_u8; width * height * 4];
+    for y in 0..height {
+        for x in 0..width {
+            let offset = (y * width + x) * 4;
+            let checker = ((x / 40) + (y / 40)) % 2 == 0;
+            let edge = x < 12 || y < 12 || x + 12 >= width || y + 12 >= height;
+            let (r, g, b) = if edge {
+                (255, 255, 255)
+            } else if checker {
+                (20, 210, 255)
+            } else {
+                (240, 70, 120)
+            };
+            bgra[offset] = b;
+            bgra[offset + 1] = g;
+            bgra[offset + 2] = r;
+            bgra[offset + 3] = 255;
+        }
+    }
+
+    mrd_render::RenderFrame::from_bgra32(width, height, bgra)
 }
 
 #[tauri::command]
@@ -1260,6 +1318,16 @@ mod frame_encoding_tests {
             .unwrap();
 
         assert_eq!(&decoded[..8], b"\x89PNG\r\n\x1a\n");
+    }
+
+    #[test]
+    fn native_probe_frame_is_bgra_and_non_empty() {
+        let frame = build_native_probe_frame(64, 48);
+
+        assert_eq!(frame.width, 64);
+        assert_eq!(frame.height, 48);
+        assert_eq!(frame.pixel_format, mrd_render::RenderPixelFormat::Bgra32);
+        assert_eq!(frame.as_bgra32().unwrap().len(), 64 * 48 * 4);
     }
 }
 

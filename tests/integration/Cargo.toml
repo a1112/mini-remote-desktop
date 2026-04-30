@@ -25,6 +25,10 @@ mrd-observability = { path = "../../crates/mrd-observability" }
 name = "automated_e2e_pipeline"
 path = "automated_e2e_pipeline.rs"
 
+[[test]]
+name = "automated_e2e_matrix"
+path = "automated_e2e_matrix.rs"
+
 [target.'cfg(windows)'.dependencies]
 mrd-capture-winrt = { path = "../../crates/mrd-capture-winrt" }
 mrd-decode-nvdec = { path = "../../crates/mrd-decode-nvdec" }

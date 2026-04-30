@@ -99,16 +99,33 @@ impl RemoteDisplaySurfaceManager {
             .ns_window()
             .map_err(|error| format!("get remote display NSWindow failed: {error}"))?
             as isize;
+        let webview_ns_view = window
+            .ns_view()
+            .map_err(|error| format!("get remote display WebView NSView failed: {error}"))?
+            as isize;
 
         if let Some(surface) = self.surfaces.get_mut(&label) {
             surface.move_to(window, rect, visible)?;
             return Ok(surface.snapshot(label, rect));
         }
 
-        let surface = NativeRenderSurface::create(window, parent_ns_window, rect, visible)?;
+        let surface =
+            NativeRenderSurface::create(window, parent_ns_window, webview_ns_view, rect, visible)?;
         let snapshot = surface.snapshot(label.clone(), rect);
         self.surfaces.insert(label, surface);
         Ok(snapshot)
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    pub fn render_target_handle(&self, label: &str) -> Option<isize> {
+        self.surfaces
+            .get(label)
+            .map(NativeRenderSurface::render_target_handle)
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    pub fn render_target_handle(&self, _label: &str) -> Option<isize> {
+        None
     }
 
     #[cfg(not(any(windows, target_os = "macos")))]
@@ -294,6 +311,10 @@ impl NativeRenderSurface {
             rect,
         }
     }
+
+    fn render_target_handle(&self) -> isize {
+        self.hwnd.0
+    }
 }
 
 #[cfg(windows)]
@@ -308,6 +329,7 @@ impl Drop for NativeRenderSurface {
 #[cfg(target_os = "macos")]
 struct NativeRenderSurface {
     parent_ns_window: isize,
+    webview_ns_view: isize,
     ns_view: isize,
     visible: bool,
 }
@@ -317,15 +339,17 @@ impl NativeRenderSurface {
     fn create(
         window: &WebviewWindow,
         parent_ns_window: isize,
+        webview_ns_view: isize,
         rect: NativeSurfaceRect,
         visible: bool,
     ) -> Result<Self, String> {
         let ns_view = run_on_main_thread(window, move || unsafe {
-            create_macos_native_surface(parent_ns_window, rect, visible)
+            create_macos_native_surface(parent_ns_window, webview_ns_view, rect, visible)
         })?;
 
         Ok(Self {
             parent_ns_window,
+            webview_ns_view,
             ns_view,
             visible,
         })
@@ -339,8 +363,9 @@ impl NativeRenderSurface {
     ) -> Result<(), String> {
         let ns_view = self.ns_view;
         let parent_ns_window = self.parent_ns_window;
+        let webview_ns_view = self.webview_ns_view;
         run_on_main_thread(window, move || unsafe {
-            move_macos_native_surface(parent_ns_window, ns_view, rect, visible)
+            move_macos_native_surface(parent_ns_window, webview_ns_view, ns_view, rect, visible)
         })?;
         self.visible = visible;
         Ok(())
@@ -364,6 +389,10 @@ impl NativeRenderSurface {
             hwnd: Some(handle_hex(self.ns_view)),
             rect,
         }
+    }
+
+    fn render_target_handle(&self) -> isize {
+        self.ns_view
     }
 }
 
@@ -389,19 +418,20 @@ where
 #[allow(deprecated, unexpected_cfgs)]
 unsafe fn create_macos_native_surface(
     parent_ns_window: isize,
+    webview_ns_view: isize,
     rect: NativeSurfaceRect,
     visible: bool,
 ) -> Result<isize, String> {
     use cocoa::{
         appkit::{NSView, NSWindowOrderingMode},
         base::{id, nil, NO, YES},
-        foundation::NSRect,
     };
     use objc::{msg_send, sel, sel_impl};
 
     let ns_window = parent_ns_window as id;
-    if ns_window == nil {
-        return Err("remote display NSWindow pointer is null".to_string());
+    let webview = webview_ns_view as id;
+    if ns_window == nil || webview == nil {
+        return Err("remote display macOS parent pointer is null".to_string());
     }
 
     let content_view: id = msg_send![ns_window, contentView];
@@ -409,8 +439,7 @@ unsafe fn create_macos_native_surface(
         return Err("remote display NSWindow has no contentView".to_string());
     }
 
-    let content_frame: NSRect = NSView::frame(content_view);
-    let frame = rect_to_macos_frame(rect, content_frame.size.height);
+    let frame = rect_to_content_view_frame(content_view, webview, rect);
     let view: id = NSView::alloc(nil).initWithFrame_(frame);
     if view == nil {
         return Err("create macOS native render NSView failed".to_string());
@@ -436,6 +465,7 @@ unsafe fn create_macos_native_surface(
 #[allow(deprecated, unexpected_cfgs)]
 unsafe fn move_macos_native_surface(
     parent_ns_window: isize,
+    webview_ns_view: isize,
     ns_view: isize,
     rect: NativeSurfaceRect,
     visible: bool,
@@ -443,13 +473,13 @@ unsafe fn move_macos_native_surface(
     use cocoa::{
         appkit::{NSView, NSWindowOrderingMode},
         base::{id, nil, NO, YES},
-        foundation::NSRect,
     };
     use objc::{msg_send, sel, sel_impl};
 
     let ns_window = parent_ns_window as id;
+    let webview = webview_ns_view as id;
     let view = ns_view as id;
-    if ns_window == nil || view == nil {
+    if ns_window == nil || webview == nil || view == nil {
         return Err("macOS native surface pointer is null".to_string());
     }
 
@@ -458,10 +488,11 @@ unsafe fn move_macos_native_surface(
         return Err("remote display NSWindow has no contentView".to_string());
     }
 
-    let content_frame: NSRect = NSView::frame(content_view);
-    view.setFrameOrigin(rect_to_macos_frame(rect, content_frame.size.height).origin);
-    view.setFrameSize(rect_to_macos_frame(rect, content_frame.size.height).size);
+    let frame = rect_to_content_view_frame(content_view, webview, rect);
+    view.setFrameOrigin(frame.origin);
+    view.setFrameSize(frame.size);
     let _: () = msg_send![view, setHidden: if visible { NO } else { YES }];
+    sync_macos_surface_layer_frame(view);
     let _: () = msg_send![
         content_view,
         addSubview: view
@@ -486,14 +517,54 @@ unsafe fn remove_macos_native_surface(ns_view: isize) {
 
 #[cfg(target_os = "macos")]
 #[allow(deprecated)]
-fn rect_to_macos_frame(rect: NativeSurfaceRect, content_height: f64) -> cocoa::foundation::NSRect {
+unsafe fn rect_to_content_view_frame(
+    content_view: cocoa::base::id,
+    webview: cocoa::base::id,
+    rect: NativeSurfaceRect,
+) -> cocoa::foundation::NSRect {
+    use cocoa::{appkit::NSView, foundation::NSRect};
+    use objc::{msg_send, sel, sel_impl};
+
+    let webview_bounds: NSRect = NSView::bounds(webview);
+    let webview_frame = rect_to_bottom_left_frame(rect, webview_bounds.size.height);
+    msg_send![content_view, convertRect: webview_frame fromView: webview]
+}
+
+#[cfg(target_os = "macos")]
+#[allow(deprecated)]
+fn rect_to_bottom_left_frame(
+    rect: NativeSurfaceRect,
+    parent_height: f64,
+) -> cocoa::foundation::NSRect {
     use cocoa::foundation::{NSPoint, NSRect, NSSize};
 
-    let y = (content_height - rect.y as f64 - rect.height as f64).max(0.0);
+    let y = (parent_height - rect.y as f64 - rect.height as f64).max(0.0);
     NSRect::new(
         NSPoint::new(rect.x as f64, y),
         NSSize::new(rect.width as f64, rect.height as f64),
     )
+}
+
+#[cfg(target_os = "macos")]
+#[allow(deprecated)]
+unsafe fn sync_macos_surface_layer_frame(view: cocoa::base::id) {
+    use cocoa::appkit::NSView;
+    use objc::{msg_send, runtime::Object, sel, sel_impl};
+
+    let layer: *mut Object = msg_send![view, layer];
+    if layer.is_null() {
+        return;
+    }
+
+    let bounds = NSView::bounds(view);
+    let window: *mut Object = msg_send![view, window];
+    let contents_scale = if window.is_null() {
+        1.0
+    } else {
+        msg_send![window, backingScaleFactor]
+    };
+    let _: () = msg_send![layer, setFrame: bounds];
+    let _: () = msg_send![layer, setContentsScale: contents_scale];
 }
 
 #[cfg(test)]
@@ -513,5 +584,25 @@ mod tests {
         assert_eq!(rect.y, 0);
         assert_eq!(rect.width, 1);
         assert_eq!(rect.height, 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[allow(deprecated)]
+    #[test]
+    fn macos_rect_is_converted_from_web_top_left_to_appkit_bottom_left() {
+        let frame = super::rect_to_bottom_left_frame(
+            NativeSurfaceRect {
+                x: 20,
+                y: 56,
+                width: 800,
+                height: 400,
+            },
+            900.0,
+        );
+
+        assert_eq!(frame.origin.x, 20.0);
+        assert_eq!(frame.origin.y, 444.0);
+        assert_eq!(frame.size.width, 800.0);
+        assert_eq!(frame.size.height, 400.0);
     }
 }

@@ -87,7 +87,7 @@ impl MacosMetalRenderer {
         descriptor.set_width(width as u64);
         descriptor.set_height(height as u64);
         descriptor.set_storage_mode(metal::MTLStorageMode::Shared);
-        descriptor.set_usage(metal::MTLTextureUsage::ShaderRead);
+        descriptor.set_usage(metal::MTLTextureUsage::Unknown);
 
         self.texture = Some(self.device.new_texture(&descriptor));
         self.texture_width = width;
@@ -157,6 +157,7 @@ impl MacosMetalRenderer {
             let _: () = msg_send![layer_object, setFrame: bounds];
             let _: () = msg_send![layer_object, setContentsScale: contents_scale];
             let _: () = msg_send![layer_object, setNeedsDisplayOnBoundsChange: YES];
+            let _: () = msg_send![layer_object, setZPosition: 1000.0_f64];
             let _: () = msg_send![view, setLayer: layer_object];
             let _: () = msg_send![view, setNeedsDisplay: YES];
             Ok(())

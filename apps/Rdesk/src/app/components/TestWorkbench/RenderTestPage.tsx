@@ -35,6 +35,15 @@ const RENDERER_OPTIONS: RendererOption[] = [
   },
 ];
 
+const RENDER_TEST_POLL_MS = 500;
+
+function isRendererAvailable(
+  capabilities: EnvironmentSnapshot | null,
+  renderer: RendererType
+) {
+  return capabilityAvailable(capabilities, "available_renderers", renderer);
+}
+
 interface RenderMetrics {
   is_running: boolean;
   render_fps: number;
@@ -61,9 +70,9 @@ export function RenderTestPage() {
   const [previewFrame, setPreviewFrame] = useState<FrameData | null>(null);
 
   const selectedOption = RENDERER_OPTIONS.find((o) => o.id === selectedRenderer);
-  const rendererAvailable = (renderer: RendererType) =>
-    capabilityAvailable(capabilities, "available_renderers", renderer);
-  const selectedAvailable = selectedOption ? rendererAvailable(selectedOption.id) : false;
+  const selectedAvailable = selectedOption
+    ? isRendererAvailable(capabilities, selectedOption.id)
+    : false;
 
   const RENDER_MODES = [
     { id: "video", name: "视频流", desc: "连续帧渲染" },
@@ -86,8 +95,10 @@ export function RenderTestPage() {
   }, []);
 
   useEffect(() => {
-    if (!capabilities || rendererAvailable(selectedRenderer)) return;
-    const nextRenderer = RENDERER_OPTIONS.find((option) => rendererAvailable(option.id));
+    if (!capabilities || isRendererAvailable(capabilities, selectedRenderer)) return;
+    const nextRenderer = RENDERER_OPTIONS.find((option) =>
+      isRendererAvailable(capabilities, option.id)
+    );
     if (nextRenderer) setSelectedRenderer(nextRenderer.id);
   }, [capabilities, selectedRenderer]);
 
@@ -133,7 +144,7 @@ export function RenderTestPage() {
           setIsRunning(false);
         }
       }
-    }, 200);
+    }, RENDER_TEST_POLL_MS);
 
     return () => clearInterval(interval);
   }, [currentRunId, isRunning]);
@@ -219,13 +230,14 @@ export function RenderTestPage() {
         <h2 className="text-lg font-semibold mb-4">选择渲染器</h2>
         <div className="grid md:grid-cols-3 gap-4">
           {RENDERER_OPTIONS.map((option) => {
-            const available = rendererAvailable(option.id);
+            const available = isRendererAvailable(capabilities, option.id);
             const disabledLabel = unavailableText(capabilities, "available_renderers", option.id);
             return (
             <button
               key={option.id}
               onClick={() => setSelectedRenderer(option.id)}
               disabled={isRunning || !available}
+              aria-pressed={selectedRenderer === option.id}
               className={`p-4 rounded-lg border-2 text-left transition-all ${
                 selectedRenderer === option.id
                   ? "border-primary bg-primary/10"

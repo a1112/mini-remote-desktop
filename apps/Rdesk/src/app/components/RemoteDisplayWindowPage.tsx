@@ -19,6 +19,7 @@ import {
   closeRemoteDisplayWindow,
   configureRemoteDisplayNativeSurface,
   currentRemoteDisplayWindowContext,
+  presentTestHarnessFrameOnNativeSurface,
   testGetCapabilities,
   testGetRun,
   testHarnessGetFrames,
@@ -53,6 +54,9 @@ type ResolutionKey = "1280x720" | "1920x1080" | "2560x1440" | "2560x1600" | "344
 type FpsKey = "30" | "60" | "120" | "144";
 type BitrateKey = "8" | "20" | "50" | "80";
 type TestStatus = "idle" | "starting" | "running" | "stopping" | "completed" | "failed";
+
+const METRICS_POLL_MS = 500;
+const WEB_PREVIEW_FRAME_POLL_MS = 500;
 
 type Option<T extends string> = {
   value: T;
@@ -222,15 +226,22 @@ export function RemoteDisplayWindowPage() {
   const nativeRendererType =
     renderMode === "metal_native" ? "macos" : renderMode === "d3d11_native" ? "d3d11" : null;
   const isNative = nativeRendererType !== null;
-  const nativeRenderAvailable =
+  const nativeRendererTypeForHost = hostOs === "macos" ? "macos" : "d3d11";
+  const currentNativeRendererAvailable =
     isTauriRuntime() &&
     (!capabilities
       ? true
-      : nativeRendererType === "macos"
-        ? capabilities.available_renderers?.includes("macos") ?? false
-        : nativeRendererType === "d3d11"
-          ? capabilities.available_renderers?.includes("d3d11") ?? false
-          : false);
+      : nativeRendererType
+        ? capabilities.available_renderers?.includes(nativeRendererType) ?? false
+        : false);
+  const nativeRendererAvailableForHost =
+    isTauriRuntime() &&
+    (!capabilities
+      ? true
+      : capabilities.available_renderers?.includes(nativeRendererTypeForHost) ?? false);
+  const nativeRenderAvailable = isNative
+    ? currentNativeRendererAvailable
+    : nativeRendererAvailableForHost;
   const usesNativeSharedTexture =
     nativeRendererType === "d3d11" &&
     capture === "dxgi" &&
@@ -436,7 +447,7 @@ export function RemoteDisplayWindowPage() {
       if (isNative) setRenderMode("web");
       return null;
     }
-  }, [isNative, nativeRenderAvailable, testSettingsOpen]);
+  }, [isNative, nativeRenderAvailable, nativeRendererType, testSettingsOpen]);
 
   const openTestSettings = useCallback(() => {
     if (!isLocalPipelinePreview) return;
@@ -448,6 +459,12 @@ export function RemoteDisplayWindowPage() {
     setTestSettingsOpen(false);
     void syncNativeSurface({ visible: true });
   }, [syncNativeSurface]);
+
+  const switchToNativeRender = useCallback(() => {
+    if (!nativeRendererAvailableForHost) return;
+    setCapturedFrame(null);
+    setRenderMode(nativeRenderMode);
+  }, [nativeRenderMode, nativeRendererAvailableForHost]);
 
   const clearNativeSurfaceSyncSchedule = useCallback(() => {
     if (syncAnimationFrameRef.current !== null) {
@@ -538,7 +555,7 @@ export function RemoteDisplayWindowPage() {
     void poll();
     const interval = window.setInterval(() => {
       void poll();
-    }, 250);
+    }, METRICS_POLL_MS);
 
     return () => {
       cancelled = true;
@@ -565,7 +582,7 @@ export function RemoteDisplayWindowPage() {
     void poll();
     const interval = window.setInterval(() => {
       void poll();
-    }, 100);
+    }, WEB_PREVIEW_FRAME_POLL_MS);
 
     return () => {
       cancelled = true;
@@ -739,6 +756,8 @@ export function RemoteDisplayWindowPage() {
     setMetrics(null);
     setCapturedFrame(null);
 
+    await testHarnessStop();
+
     let configForRun = testConfig;
     if (isNative) {
       const snapshot = await syncNativeSurface({ visible: true });
@@ -750,10 +769,21 @@ export function RemoteDisplayWindowPage() {
         setLastError(message);
         return;
       }
+      if (nativeRendererType === "macos") {
+        const probe = await presentTestHarnessFrameOnNativeSurface();
+        if (!probe.ok || !probe.value) {
+          const message = probe.ok
+            ? "Metal native render probe did not present a frame"
+            : probe.error.message;
+          setTestStatus("failed");
+          setTestMessage(message);
+          setLastError(message);
+          return;
+        }
+      }
       configForRun = buildTestConfig(rendererTargetHwnd);
     }
 
-    await testHarnessStop();
     const result = await testStartRun({
       scenarioId: "custom",
       config: configForRun,
@@ -904,14 +934,12 @@ export function RemoteDisplayWindowPage() {
               className={`px-2.5 py-1 text-[11px] ${
                 renderMode === nativeRenderMode
                   ? "bg-cyan-500/25 text-cyan-100"
-                  : nativeRenderAvailable
+                  : nativeRendererAvailableForHost
                     ? "text-slate-400 hover:bg-white/8"
                     : "cursor-not-allowed text-slate-600"
               }`}
-              onClick={() => {
-                if (nativeRenderAvailable) setRenderMode(nativeRenderMode);
-              }}
-              disabled={!nativeRenderAvailable}
+              onClick={switchToNativeRender}
+              disabled={!nativeRendererAvailableForHost}
             >
               {nativeRenderLabel}
             </button>

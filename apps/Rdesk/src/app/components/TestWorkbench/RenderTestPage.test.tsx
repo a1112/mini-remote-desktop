@@ -29,6 +29,7 @@ describe("RenderTestPage platform capabilities", () => {
     const metalButton = screen.getByRole("button", { name: /Metal/ });
     await waitFor(() => expect(metalButton).toBeEnabled());
 
+    await waitFor(() => expect(metalButton).toHaveAttribute("aria-pressed", "true"));
     expect(screen.getByRole("button", { name: /Direct3D 11/ })).toBeDisabled();
     expect(screen.getByRole("button", { name: /Direct3D 12/ })).toBeDisabled();
     expect(screen.getByText("实时画面")).toBeInTheDocument();
