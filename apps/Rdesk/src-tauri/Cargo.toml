@@ -47,6 +47,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.24"
 num_cpus = "1.16"
 webrtc = "0.12"
+rustls = "0.23.5"
 tauri-plugin-shell = { git = "https://github.com/tauri-apps/plugins-workspace", version = "2.3.5" }
 tauri-plugin-dialog = { git = "https://github.com/tauri-apps/plugins-workspace", version = "2.7.0" }
 tauri-plugin-fs = { git = "https://github.com/tauri-apps/plugins-workspace", version = "2.5.0" }
@@ -57,7 +58,6 @@ nix = { version = "0.29", features = ["signal", "process"] }
 
 [dev-dependencies]
 openh264 = "0.8"
-rustls = "0.23.5"
 mrd-service = { path = "../../mrd-service" }
 
 [target.'cfg(windows)'.dependencies]

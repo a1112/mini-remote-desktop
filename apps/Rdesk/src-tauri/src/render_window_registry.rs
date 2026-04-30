@@ -147,11 +147,25 @@ impl RenderWindowRegistry {
             let _ = window.close();
         }
 
-        for entries in self.windows_by_session.values_mut() {
-            entries.retain(|candidate| candidate.label != label);
-        }
+        self.remove_window_entry(label);
 
         Ok(())
+    }
+
+    pub fn remove_window_entry(&mut self, label: &str) -> Option<(SessionId, usize)> {
+        let mut removed = None;
+
+        for (session_id, entries) in self.windows_by_session.iter_mut() {
+            let before = entries.len();
+            entries.retain(|candidate| candidate.label != label);
+            if entries.len() != before {
+                removed = Some((session_id.clone(), entries.len()));
+            }
+        }
+
+        self.windows_by_session
+            .retain(|_session_id, entries| !entries.is_empty());
+        removed
     }
 
     pub fn set_renderer_attached<R: tauri::Runtime>(
@@ -426,5 +440,40 @@ mod tests {
             .count();
 
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn remove_window_entry_returns_session_and_remaining_count() {
+        let mut registry = RenderWindowRegistry::default();
+        let session = SessionId("session-a".into());
+        registry.windows_by_session.insert(
+            session.clone(),
+            vec![
+                RenderWindowEntry {
+                    label: "render-session-a-1".into(),
+                    surface_id: "surface-1".into(),
+                    role: "controller".into(),
+                    renderer_attached: true,
+                    render_mode: "d3d11_native".into(),
+                    native_surface_attached: true,
+                },
+                RenderWindowEntry {
+                    label: "render-session-a-2".into(),
+                    surface_id: "surface-2".into(),
+                    role: "controller".into(),
+                    renderer_attached: false,
+                    render_mode: "web".into(),
+                    native_surface_attached: false,
+                },
+            ],
+        );
+
+        let removed = registry.remove_window_entry("render-session-a-1");
+        assert_eq!(removed, Some((session.clone(), 1)));
+        assert_eq!(
+            registry.remove_window_entry("render-session-a-2"),
+            Some((session, 0))
+        );
+        assert!(registry.windows_by_session.is_empty());
     }
 }

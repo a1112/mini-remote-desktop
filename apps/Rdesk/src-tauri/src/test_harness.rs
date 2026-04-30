@@ -32,8 +32,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const WEB_PREVIEW_MAX_WIDTH: usize = 1280;
-const WEB_PREVIEW_FRAME_UPDATE_INTERVAL: usize = 3;
+const WEB_PREVIEW_MAX_WIDTH: usize = 960;
+const WEB_PREVIEW_FRAME_UPDATE_INTERVAL: usize = 2;
+const ENCODED_ACCESS_UNIT_SUBSCRIBER_QUEUE_DEPTH: usize = 1;
 
 /// Test chain configuration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -245,9 +246,11 @@ struct FrameBuffer {
     captured: Option<Vec<u8>>,
     captured_width: usize,
     captured_height: usize,
+    captured_generation: u64,
     rendered: Option<Vec<u8>>,
     rendered_width: usize,
     rendered_height: usize,
+    rendered_generation: u64,
 }
 
 // Pipeline state - defined outside impl
@@ -916,6 +919,7 @@ pub struct TestHarness {
     config: TestConfig,
     metrics: Arc<Mutex<HarnessMetrics>>,
     frame_buffer: Arc<Mutex<FrameBuffer>>,
+    encoded_subscribers: Arc<Mutex<Vec<mpsc::SyncSender<Vec<EncodedAccessUnit>>>>>,
     thread_handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -927,9 +931,11 @@ impl TestHarness {
             captured: None,
             captured_width: 0,
             captured_height: 0,
+            captured_generation: 0,
             rendered: None,
             rendered_width: 0,
             rendered_height: 0,
+            rendered_generation: 0,
         }));
 
         let metrics = Arc::new(Mutex::new(HarnessMetrics::default()));
@@ -941,6 +947,7 @@ impl TestHarness {
             config: TestConfig::default(),
             metrics,
             frame_buffer,
+            encoded_subscribers: Arc::new(Mutex::new(Vec::new())),
             thread_handle: None,
         })
     }
@@ -957,6 +964,12 @@ impl TestHarness {
         self.chain.clone()
     }
 
+    pub fn subscribe_encoded_access_units(&self) -> mpsc::Receiver<Vec<EncodedAccessUnit>> {
+        let (sender, receiver) = mpsc::sync_channel(ENCODED_ACCESS_UNIT_SUBSCRIBER_QUEUE_DEPTH);
+        self.encoded_subscribers.lock().unwrap().push(sender);
+        receiver
+    }
+
     pub fn start(&mut self) -> Result<()> {
         if self.running.load(Ordering::Relaxed) {
             anyhow::bail!("test harness is already running");
@@ -966,6 +979,7 @@ impl TestHarness {
         let config = self.config.clone();
         let frame_buffer = self.frame_buffer.clone();
         let metrics = self.metrics.clone();
+        let encoded_subscribers = self.encoded_subscribers.clone();
         let running = self.running.clone();
         let running_for_thread = running.clone();
         let (init_tx, init_rx) = mpsc::channel();
@@ -975,9 +989,11 @@ impl TestHarness {
             buf.captured = None;
             buf.captured_width = 0;
             buf.captured_height = 0;
+            buf.captured_generation = 0;
             buf.rendered = None;
             buf.rendered_width = 0;
             buf.rendered_height = 0;
+            buf.rendered_generation = 0;
         }
 
         running.store(true, Ordering::Relaxed);
@@ -986,6 +1002,7 @@ impl TestHarness {
             Self::run_pipeline(
                 frame_buffer,
                 metrics,
+                encoded_subscribers,
                 running_for_thread,
                 chain,
                 config,
@@ -1013,6 +1030,7 @@ impl TestHarness {
     fn run_pipeline(
         frame_buffer: Arc<Mutex<FrameBuffer>>,
         metrics: Arc<Mutex<HarnessMetrics>>,
+        encoded_subscribers: Arc<Mutex<Vec<mpsc::SyncSender<Vec<EncodedAccessUnit>>>>>,
         running: Arc<AtomicBool>,
         chain: TestChain,
         config: TestConfig,
@@ -1042,7 +1060,7 @@ impl TestHarness {
 
         let _ = init_tx.send(Ok(()));
 
-        Self::process_loop(state, frame_buffer, metrics, running);
+        Self::process_loop(state, frame_buffer, metrics, encoded_subscribers, running);
     }
 
     fn initialize_components(chain: &TestChain, config: &TestConfig) -> Result<PipelineState> {
@@ -1053,20 +1071,60 @@ impl TestHarness {
         };
         let (capture, capture_width, capture_height): (Box<dyn FrameCapture>, usize, usize) =
             if use_shared_texture_decode {
-                if *capture_type != CaptureType::Dxgi {
+                if !matches!(capture_type, CaptureType::Dxgi | CaptureType::Winrt) {
                     return Err(anyhow::anyhow!(
-                        "D3D11 shared texture capture requires DXGI capture"
+                        "D3D11 shared texture capture requires DXGI or WinRT capture"
                     ));
                 }
                 #[cfg(windows)]
                 {
-                    let mut capture = DxgiSharedTextureCapture::new_primary().map_err(|e| {
-                        anyhow::anyhow!("DXGI shared texture capture init failed: {:?}", e)
-                    })?;
-                    let (width, height) =
-                        select_pipeline_dimensions(capture.width(), capture.height(), config);
-                    capture.set_target_dimensions(width, height);
-                    (Box::new(capture) as Box<dyn FrameCapture>, width, height)
+                    match capture_type {
+                        CaptureType::Dxgi => {
+                            let mut capture =
+                                DxgiSharedTextureCapture::new_primary().map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "DXGI shared texture capture init failed: {:?}",
+                                        e
+                                    )
+                                })?;
+                            let (width, height) = select_pipeline_dimensions(
+                                capture.width(),
+                                capture.height(),
+                                config,
+                            );
+                            capture.set_target_dimensions(width, height);
+                            (Box::new(capture) as Box<dyn FrameCapture>, width, height)
+                        }
+                        CaptureType::Winrt => {
+                            let mut capture = if config.input_source.as_deref() == Some("window") {
+                                let hwnd = parse_window_handle(config.window_handle.as_deref())?;
+                                WinrtCapture::from_window_handle_shared_texture(hwnd).map_err(
+                                    |error| {
+                                        anyhow::anyhow!(
+                                            "WinRT shared window capture init failed: {error}"
+                                        )
+                                    },
+                                )?
+                            } else {
+                                WinrtCapture::from_monitor_index_shared_texture(0).map_err(
+                                    |error| {
+                                        anyhow::anyhow!("WinRT shared capture init failed: {error}")
+                                    },
+                                )?
+                            };
+                            let (width, height) = select_pipeline_dimensions(
+                                capture.width(),
+                                capture.height(),
+                                config,
+                            );
+                            capture.set_target_dimensions(width, height);
+                            capture.start().map_err(|error| {
+                                anyhow::anyhow!("WinRT shared capture start failed: {error}")
+                            })?;
+                            (Box::new(capture) as Box<dyn FrameCapture>, width, height)
+                        }
+                        _ => unreachable!("shared texture capture type validated above"),
+                    }
                 }
                 #[cfg(not(windows))]
                 {
@@ -1088,9 +1146,7 @@ impl TestHarness {
                         {
                             let capture = if config.input_source.as_deref() == Some("window") {
                                 let hwnd = parse_window_handle(config.window_handle.as_deref())?;
-                                WinrtMonitorCapture::new_window(windows::Win32::Foundation::HWND(
-                                    hwnd as *mut std::ffi::c_void,
-                                ))?
+                                WinrtMonitorCapture::new_window(hwnd)?
                             } else {
                                 WinrtMonitorCapture::new_primary()?
                             };
@@ -1425,6 +1481,7 @@ impl TestHarness {
         mut state: PipelineState,
         frame_buffer: Arc<Mutex<FrameBuffer>>,
         metrics: Arc<Mutex<HarnessMetrics>>,
+        encoded_subscribers: Arc<Mutex<Vec<mpsc::SyncSender<Vec<EncodedAccessUnit>>>>>,
         running: Arc<AtomicBool>,
     ) {
         let start_time = Instant::now();
@@ -1435,6 +1492,7 @@ impl TestHarness {
         let mut total_latencies = Vec::with_capacity(1000);
         let mut frame_count = 0_usize;
         let mut dropped_frames = 0_usize;
+        let update_web_preview = state.renderer.is_none();
 
         while running.load(Ordering::Relaxed) {
             let pipeline_start = Instant::now();
@@ -1474,6 +1532,7 @@ impl TestHarness {
             let (transported_units, transport_latency) = if encoded_units.is_empty() {
                 (encoded_units, None)
             } else {
+                Self::broadcast_encoded_access_units(&encoded_subscribers, &encoded_units);
                 let transport_start = Instant::now();
                 match state.transport.transmit(encoded_units) {
                     Ok(units) => (units, Some(transport_start.elapsed())),
@@ -1532,7 +1591,11 @@ impl TestHarness {
                 .or_else(|| {
                     (!state.use_decoder).then(|| RenderInput::Captured(captured_frame.clone()))
                 });
-            let render_preview_input = render_input.clone();
+            let render_preview_input = if update_web_preview {
+                render_input.clone()
+            } else {
+                None
+            };
 
             if let (Some(renderer), Some(input)) = (state.renderer.as_mut(), render_input) {
                 if let Err(error) = renderer.submit_frame(input) {
@@ -1565,7 +1628,8 @@ impl TestHarness {
 
             frame_count += 1;
 
-            if frame_count % WEB_PREVIEW_FRAME_UPDATE_INTERVAL == 0
+            if update_web_preview
+                && frame_count % WEB_PREVIEW_FRAME_UPDATE_INTERVAL == 0
                 && !captured_frame.data.is_empty()
             {
                 if let Ok((captured_ds, ds_width, ds_height)) =
@@ -1575,9 +1639,10 @@ impl TestHarness {
                     buf.captured = Some(captured_ds);
                     buf.captured_width = ds_width;
                     buf.captured_height = ds_height;
+                    buf.captured_generation = buf.captured_generation.saturating_add(1);
                 }
             }
-            if frame_count % WEB_PREVIEW_FRAME_UPDATE_INTERVAL == 0 {
+            if update_web_preview && frame_count % WEB_PREVIEW_FRAME_UPDATE_INTERVAL == 0 {
                 if let Some(input) = render_preview_input {
                     if let Ok((rendered_ds, ds_width, ds_height)) =
                         render_input_to_preview_bgra(input, WEB_PREVIEW_MAX_WIDTH)
@@ -1586,6 +1651,7 @@ impl TestHarness {
                         buf.rendered = Some(rendered_ds);
                         buf.rendered_width = ds_width;
                         buf.rendered_height = ds_height;
+                        buf.rendered_generation = buf.rendered_generation.saturating_add(1);
                     }
                 }
             }
@@ -1661,6 +1727,23 @@ impl TestHarness {
         m.total_latency_p95_ms = p95_total.as_secs_f64() * 1000.0;
     }
 
+    fn broadcast_encoded_access_units(
+        subscribers: &Arc<Mutex<Vec<mpsc::SyncSender<Vec<EncodedAccessUnit>>>>>,
+        encoded_units: &[EncodedAccessUnit],
+    ) {
+        if encoded_units.is_empty() {
+            return;
+        }
+
+        let mut subscribers = subscribers.lock().unwrap();
+        subscribers.retain(
+            |subscriber| match subscriber.try_send(encoded_units.to_vec()) {
+                Ok(()) | Err(mpsc::TrySendError::Full(_)) => true,
+                Err(mpsc::TrySendError::Disconnected(_)) => false,
+            },
+        );
+    }
+
     fn compute_percentiles(latencies: &[Duration]) -> (Duration, Duration) {
         if latencies.is_empty() {
             return (Duration::ZERO, Duration::ZERO);
@@ -1715,21 +1798,47 @@ impl TestHarness {
         self.metrics.lock().unwrap().clone()
     }
 
-    pub fn get_latest_frames(
+    pub fn get_latest_frames_since(
         &self,
+        include_captured: bool,
+        include_rendered: bool,
+        last_captured_generation: Option<u64>,
+        last_rendered_generation: Option<u64>,
     ) -> (
-        Option<(Vec<u8>, usize, usize)>,
-        Option<(Vec<u8>, usize, usize)>,
+        Option<(Vec<u8>, usize, usize, u64)>,
+        Option<(Vec<u8>, usize, usize, u64)>,
     ) {
         let buf = self.frame_buffer.lock().unwrap();
-        let captured = buf
-            .captured
-            .as_ref()
-            .map(|data| (data.clone(), buf.captured_width, buf.captured_height));
-        let rendered = buf
-            .rendered
-            .as_ref()
-            .map(|data| (data.clone(), buf.rendered_width, buf.rendered_height));
+        let captured = include_captured
+            .then(|| {
+                buf.captured
+                    .as_ref()
+                    .filter(|_| last_captured_generation != Some(buf.captured_generation))
+                    .map(|data| {
+                        (
+                            data.clone(),
+                            buf.captured_width,
+                            buf.captured_height,
+                            buf.captured_generation,
+                        )
+                    })
+            })
+            .flatten();
+        let rendered = include_rendered
+            .then(|| {
+                buf.rendered
+                    .as_ref()
+                    .filter(|_| last_rendered_generation != Some(buf.rendered_generation))
+                    .map(|data| {
+                        (
+                            data.clone(),
+                            buf.rendered_width,
+                            buf.rendered_height,
+                            buf.rendered_generation,
+                        )
+                    })
+            })
+            .flatten();
         (captured, rendered)
     }
 }
@@ -2049,8 +2158,8 @@ impl WinrtMonitorCapture {
         Self::from_inner(inner, "WinRT capture")
     }
 
-    fn new_window(hwnd: windows::Win32::Foundation::HWND) -> Result<Self> {
-        let inner = WinrtCapture::from_window(hwnd)
+    fn new_window(hwnd: isize) -> Result<Self> {
+        let inner = WinrtCapture::from_window_handle(hwnd)
             .map_err(|error| anyhow::anyhow!("WinRT window capture init failed: {error}"))?;
         Self::from_inner(inner, "WinRT window capture")
     }
@@ -2407,6 +2516,59 @@ mod tests {
         assert!(!metrics.is_running);
         assert_eq!(metrics.capture_fps, 12.5);
         assert_eq!(metrics.frame_count, 7);
+    }
+
+    #[test]
+    fn latest_frames_since_filters_unchanged_preview_frames() {
+        let harness = TestHarness::new().expect("create harness");
+        {
+            let mut frame_buffer = harness.frame_buffer.lock().unwrap();
+            frame_buffer.rendered = Some(vec![0, 0, 0, 255]);
+            frame_buffer.rendered_width = 1;
+            frame_buffer.rendered_height = 1;
+            frame_buffer.rendered_generation = 3;
+        }
+
+        let (_, rendered) = harness.get_latest_frames_since(false, true, None, None);
+        let (_, unchanged) = harness.get_latest_frames_since(false, true, None, Some(3));
+        let (captured, _) = harness.get_latest_frames_since(false, false, None, None);
+
+        assert_eq!(rendered.expect("rendered frame").3, 3);
+        assert!(unchanged.is_none());
+        assert!(captured.is_none());
+    }
+
+    #[test]
+    fn encoded_access_unit_subscriber_receives_latest_harness_output() {
+        let harness = TestHarness::new().expect("create harness");
+        let receiver = harness.subscribe_encoded_access_units();
+        let units = vec![EncodedAccessUnit {
+            codec: VideoCodec::H264,
+            timestamp_us: 1,
+            is_keyframe: true,
+            bytes: vec![0, 0, 1, 0x65],
+        }];
+
+        TestHarness::broadcast_encoded_access_units(&harness.encoded_subscribers, &units);
+
+        assert_eq!(receiver.try_recv().expect("encoded access unit"), units);
+    }
+
+    #[test]
+    fn encoded_access_unit_broadcast_removes_disconnected_subscribers() {
+        let harness = TestHarness::new().expect("create harness");
+        let receiver = harness.subscribe_encoded_access_units();
+        drop(receiver);
+        let units = vec![EncodedAccessUnit {
+            codec: VideoCodec::H264,
+            timestamp_us: 1,
+            is_keyframe: false,
+            bytes: vec![0, 0, 1, 0x41],
+        }];
+
+        TestHarness::broadcast_encoded_access_units(&harness.encoded_subscribers, &units);
+
+        assert!(harness.encoded_subscribers.lock().unwrap().is_empty());
     }
 
     #[test]

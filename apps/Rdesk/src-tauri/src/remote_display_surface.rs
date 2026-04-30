@@ -123,9 +123,36 @@ impl RemoteDisplaySurfaceManager {
             .map(NativeRenderSurface::render_target_handle)
     }
 
+    #[cfg(windows)]
+    pub fn detach(&mut self, label: &str, _window: Option<&WebviewWindow>) -> Result<bool, String> {
+        Ok(self.surfaces.remove(label).is_some())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn detach(&mut self, label: &str, window: Option<&WebviewWindow>) -> Result<bool, String> {
+        let Some(surface) = self.surfaces.remove(label) else {
+            return Ok(false);
+        };
+
+        if let Some(window) = window {
+            surface.remove(window)?;
+        }
+
+        Ok(true)
+    }
+
     #[cfg(not(any(windows, target_os = "macos")))]
     pub fn render_target_handle(&self, _label: &str) -> Option<isize> {
         None
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    pub fn detach(
+        &mut self,
+        _label: &str,
+        _window: Option<&WebviewWindow>,
+    ) -> Result<bool, String> {
+        Ok(false)
     }
 
     #[cfg(not(any(windows, target_os = "macos")))]

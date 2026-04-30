@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { getMockInvoke } from "../../test/mocks/tauri";
 import { RemoteDisplayWindowPage } from "./RemoteDisplayWindowPage";
 
@@ -35,7 +35,54 @@ function renderRemoteDisplay(sessionId = "p2p-quic-123") {
   );
 }
 
+function mockRenderAreaRect() {
+  vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({
+    x: 0,
+    y: 56,
+    left: 0,
+    top: 56,
+    right: 1280,
+    bottom: 776,
+    width: 1280,
+    height: 720,
+    toJSON: () => ({}),
+  } as DOMRect);
+}
+
+function mockResizeObserver() {
+  vi.stubGlobal(
+    "ResizeObserver",
+    class {
+      observe = vi.fn();
+      unobserve = vi.fn();
+      disconnect = vi.fn();
+    }
+  );
+}
+
+function windowsCapabilities() {
+  return {
+    os_type: "windows",
+    cpu_brand: "Intel",
+    cpu_cores: 16,
+    memory_gb: 32,
+    gpu_info: "NVIDIA",
+    available_captures: ["dxgi", "winrt", "synthetic"],
+    available_encoders: ["nvenc_h264", "openh264"],
+    available_decoders: ["nvdec", "software"],
+    available_renderers: ["d3d11"],
+    available_memory_modes: ["cpu", "d3d11_shared"],
+  };
+}
+
 describe("RemoteDisplayWindowPage", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    getMockInvoke().mockReset();
+    mockRenderAreaRect();
+    mockResizeObserver();
+  });
+
   it("allows switching back to Metal after selecting Web preview on macOS", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
@@ -93,9 +140,102 @@ describe("RemoteDisplayWindowPage", () => {
     });
   });
 
+  it("probes the D3D11 native surface before starting a local pipeline test", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(windowsCapabilities());
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-local-display-test-1",
+          session_id: "local-display-test-1",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: false,
+          render_mode: "d3d11_native",
+          native_surface_attached: true,
+          session_window_count: 1,
+        });
+      }
+      if (command === "configure_remote_display_native_surface") {
+        return Promise.resolve({
+          label: "render-local-display-test-1",
+          backend: args?.enabled ? "d3d11" : "web",
+          attached: Boolean(args?.enabled),
+          visible: Boolean(args?.visible),
+          parent_hwnd: "0xA",
+          hwnd: args?.enabled ? "0x14" : null,
+          rect: { x: 0, y: 56, width: 1280, height: 720 },
+        });
+      }
+      if (command === "present_test_harness_frame_on_native_surface") {
+        return Promise.resolve(true);
+      }
+      if (command === "test_harness_stop") {
+        return Promise.resolve(null);
+      }
+      if (command === "test_start_run") {
+        return Promise.resolve("run-1");
+      }
+      if (command === "test_harness_get_metrics") {
+        return Promise.resolve({
+          is_running: true,
+          capture_fps: 120,
+          frame_count: 12,
+          total_latency_p95_ms: 8,
+          error_message: null,
+        });
+      }
+      if (command === "test_get_run") {
+        return Promise.resolve({
+          run_id: "run-1",
+          status: "running",
+          summary: null,
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay("local-display-test-1");
+
+    const startButton = await screen.findByRole("button", {
+      name: "Start local pipeline test",
+    });
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "configure_remote_display_native_surface",
+        expect.objectContaining({ enabled: true })
+      );
+    });
+    fireEvent.click(startButton);
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "present_test_harness_frame_on_native_surface",
+        undefined
+      );
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_start_run",
+        expect.objectContaining({
+          scenarioId: "custom",
+          config: expect.objectContaining({
+            renderer_type: "d3d11",
+            render_display: true,
+            renderer_target_hwnd: "0x14",
+            zero_copy: true,
+          }),
+        })
+      );
+    });
+  });
+
   it("does not start the local test harness for LAN remote sessions", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(windowsCapabilities());
+      }
       if (command === "current_remote_display_window_context") {
         return Promise.resolve({
           label: "render-p2p-quic-123-1",
@@ -148,7 +288,7 @@ describe("RemoteDisplayWindowPage", () => {
 
     renderRemoteDisplay();
 
-    fireEvent.click(screen.getByRole("button", { name: /开始接收|开始测试/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Start remote receiver" }));
 
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("ipc_start_receiver", {
@@ -159,5 +299,48 @@ describe("RemoteDisplayWindowPage", () => {
       "test_start_run",
       expect.anything()
     );
+  });
+
+  it("routes the title bar close button through the remote display cleanup command", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(windowsCapabilities());
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-p2p-quic-123-1",
+          session_id: "p2p-quic-123",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: false,
+          render_mode: "d3d11_native",
+          native_surface_attached: false,
+          session_window_count: 1,
+        });
+      }
+      if (command === "configure_remote_display_native_surface") {
+        return Promise.resolve({
+          label: "render-p2p-quic-123-1",
+          backend: "d3d11",
+          attached: true,
+          visible: true,
+          parent_hwnd: "0xA",
+          hwnd: "0x14",
+          rect: { x: 0, y: 56, width: 1280, height: 720 },
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay();
+
+    fireEvent.click(await screen.findByTitle("Close"));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("close_remote_display_window", {
+        label: "render-p2p-quic-123-1",
+      });
+    });
   });
 });

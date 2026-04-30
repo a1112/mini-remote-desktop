@@ -16,6 +16,8 @@ import {
   X,
 } from "lucide-react";
 import {
+  browserWebrtcPreviewStart,
+  browserWebrtcPreviewStop,
   closeRemoteDisplayWindow,
   configureRemoteDisplayNativeSurface,
   currentRemoteDisplayWindowContext,
@@ -54,9 +56,10 @@ type ResolutionKey = "1280x720" | "1920x1080" | "2560x1440" | "2560x1600" | "344
 type FpsKey = "30" | "60" | "120" | "144";
 type BitrateKey = "8" | "20" | "50" | "80";
 type TestStatus = "idle" | "starting" | "running" | "stopping" | "completed" | "failed";
+type WebPreviewMode = "idle" | "connecting" | "webrtc" | "fallback" | "failed";
 
 const METRICS_POLL_MS = 500;
-const WEB_PREVIEW_FRAME_POLL_MS = 500;
+const WEB_PREVIEW_FRAME_POLL_MS = 80;
 
 type Option<T extends string> = {
   value: T;
@@ -149,6 +152,30 @@ export function isLocalPipelinePreviewSession(sessionId: string): boolean {
   return sessionId === "local-preview" || sessionId.startsWith("local-display-test");
 }
 
+function waitForIceGatheringComplete(peer: RTCPeerConnection): Promise<void> {
+  if (peer.iceGatheringState === "complete") {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve) => {
+    const timeout = window.setTimeout(done, 1500);
+
+    function done() {
+      window.clearTimeout(timeout);
+      peer.removeEventListener("icegatheringstatechange", onChange);
+      resolve();
+    }
+
+    function onChange() {
+      if (peer.iceGatheringState === "complete") {
+        done();
+      }
+    }
+
+    peer.addEventListener("icegatheringstatechange", onChange);
+  });
+}
+
 function TitleSelect<T extends string>({
   label,
   value,
@@ -190,6 +217,10 @@ export function RemoteDisplayWindowPage() {
   const renderAreaRef = useRef<HTMLDivElement | null>(null);
   const syncAnimationFrameRef = useRef<number | null>(null);
   const syncTimerIdsRef = useRef<number[]>([]);
+  const webPreviewRenderedGenerationRef = useRef<number | null>(null);
+  const webPreviewVideoRef = useRef<HTMLVideoElement | null>(null);
+  const webPreviewPeerRef = useRef<RTCPeerConnection | null>(null);
+  const webPreviewSessionRef = useRef<string | null>(null);
 
   const [context, setContext] = useState<RemoteDisplayWindowContext | null>(null);
   const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
@@ -213,6 +244,8 @@ export function RemoteDisplayWindowPage() {
   const [currentRunId, setCurrentRunId] = useState<string | null>(null);
   const [metrics, setMetrics] = useState<HarnessMetrics | null>(null);
   const [capturedFrame, setCapturedFrame] = useState<FrameData | null>(null);
+  const [webPreviewMode, setWebPreviewMode] = useState<WebPreviewMode>("idle");
+  const [webPreviewError, setWebPreviewError] = useState<string | null>(null);
   const [testMessage, setTestMessage] = useState<string | null>(null);
   const [sessionSnapshot, setSessionSnapshot] =
     useState<SessionRuntimeSnapshot | null>(null);
@@ -460,11 +493,37 @@ export function RemoteDisplayWindowPage() {
     void syncNativeSurface({ visible: true });
   }, [syncNativeSurface]);
 
+  const closeWebPreviewPeer = useCallback((stopHost = true) => {
+    const peer = webPreviewPeerRef.current;
+    webPreviewPeerRef.current = null;
+    if (peer) {
+      peer.ontrack = null;
+      peer.onconnectionstatechange = null;
+      peer.close();
+    }
+
+    const video = webPreviewVideoRef.current;
+    if (video) {
+      const stream = video.srcObject instanceof MediaStream ? video.srcObject : null;
+      stream?.getTracks().forEach((track) => track.stop());
+      video.srcObject = null;
+    }
+
+    const previewSessionId = webPreviewSessionRef.current;
+    webPreviewSessionRef.current = null;
+    if (stopHost && previewSessionId && isTauriRuntime()) {
+      void browserWebrtcPreviewStop(previewSessionId);
+    }
+  }, []);
+
   const switchToNativeRender = useCallback(() => {
     if (!nativeRendererAvailableForHost) return;
+    closeWebPreviewPeer();
+    setWebPreviewMode("idle");
+    webPreviewRenderedGenerationRef.current = null;
     setCapturedFrame(null);
     setRenderMode(nativeRenderMode);
-  }, [nativeRenderMode, nativeRendererAvailableForHost]);
+  }, [closeWebPreviewPeer, nativeRenderMode, nativeRendererAvailableForHost]);
 
   const clearNativeSurfaceSyncSchedule = useCallback(() => {
     if (syncAnimationFrameRef.current !== null) {
@@ -564,31 +623,158 @@ export function RemoteDisplayWindowPage() {
   }, [currentRunId, isLocalPipelinePreview, isTestBusy, testStatus]);
 
   useEffect(() => {
-    if (!isLocalPipelinePreview || !isTestBusy || isNative) return;
+    if (!isLocalPipelinePreview || !isTestBusy || isNative) {
+      closeWebPreviewPeer();
+      setWebPreviewMode("idle");
+      setWebPreviewError(null);
+      return;
+    }
+
+    if (!isTauriRuntime() || typeof RTCPeerConnection === "undefined") {
+      setWebPreviewMode("fallback");
+      setWebPreviewError("WebRTC is unavailable in this runtime");
+      return;
+    }
+
+    if (encoder === "nvenc_av1") {
+      setWebPreviewMode("fallback");
+      setWebPreviewError("Browser WebRTC preview currently supports H.264 output");
+      return;
+    }
 
     let cancelled = false;
-    const poll = async () => {
-      const framesResult = await testHarnessGetFrames({
-        includeCaptured: false,
-        includeRendered: true,
-      });
+    const peer = new RTCPeerConnection({ iceServers: [] });
+    webPreviewPeerRef.current = peer;
+    webPreviewSessionRef.current = sessionId;
+    setWebPreviewMode("connecting");
+    setWebPreviewError(null);
+    setCapturedFrame(null);
+
+    peer.addTransceiver("video", { direction: "recvonly" });
+    peer.ontrack = (event) => {
       if (cancelled) return;
-      if (framesResult.ok) {
-        const renderedFrame = framesResult.value[1] ?? framesResult.value[0];
-        if (renderedFrame) setCapturedFrame(renderedFrame);
+      const video = webPreviewVideoRef.current;
+      if (!video) return;
+      const stream = event.streams[0] ?? new MediaStream([event.track]);
+      video.srcObject = stream;
+      video.muted = true;
+      video.playsInline = true;
+      void video.play().catch(() => {});
+      setWebPreviewMode("webrtc");
+      setWebPreviewError(null);
+    };
+    peer.onconnectionstatechange = () => {
+      if (cancelled) return;
+      if (peer.connectionState === "failed" || peer.connectionState === "disconnected") {
+        setWebPreviewMode("fallback");
+        setWebPreviewError(`WebRTC preview ${peer.connectionState}`);
+      }
+    };
+
+    const startPreview = async () => {
+      try {
+        const offer = await peer.createOffer();
+        await peer.setLocalDescription(offer);
+        await waitForIceGatheringComplete(peer);
+        const offerSdp = peer.localDescription?.sdp;
+        if (!offerSdp) {
+          throw new Error("WebRTC preview offer SDP is empty");
+        }
+
+        const answer = await browserWebrtcPreviewStart({
+          sessionId,
+          offerSdp,
+          fps: Number(fps),
+          h264Profile: encoder === "nvenc_h264" && decoder === "nvdec" ? "high" : "baseline",
+        });
+        if (cancelled) return;
+        if (!answer.ok) {
+          throw new Error(answer.error.message);
+        }
+
+        await peer.setRemoteDescription({
+          type: "answer",
+          sdp: answer.value.answer_sdp,
+        });
+      } catch (error) {
+        if (cancelled) return;
+        const message = error instanceof Error ? error.message : String(error);
+        closeWebPreviewPeer();
+        setWebPreviewMode("fallback");
+        setWebPreviewError(message);
+      }
+    };
+
+    void startPreview();
+
+    return () => {
+      cancelled = true;
+      closeWebPreviewPeer();
+    };
+  }, [
+    closeWebPreviewPeer,
+    decoder,
+    encoder,
+    fps,
+    isLocalPipelinePreview,
+    isNative,
+    isTestBusy,
+    sessionId,
+  ]);
+
+  useEffect(() => {
+    if (
+      !isLocalPipelinePreview ||
+      !isTestBusy ||
+      isNative ||
+      (webPreviewMode !== "fallback" && webPreviewMode !== "failed")
+    ) {
+      return;
+    }
+
+    let cancelled = false;
+    let timeoutId: number | null = null;
+    webPreviewRenderedGenerationRef.current = null;
+
+    const poll = async () => {
+      try {
+        const framesResult = await testHarnessGetFrames({
+          includeCaptured: false,
+          includeRendered: true,
+          lastRenderedGeneration:
+            webPreviewRenderedGenerationRef.current ?? undefined,
+        });
+        if (cancelled) return;
+        if (framesResult.ok) {
+          const renderedFrame = framesResult.value[1] ?? framesResult.value[0];
+          if (renderedFrame) {
+            const generation = renderedFrame[3];
+            if (typeof generation === "number") {
+              webPreviewRenderedGenerationRef.current = generation;
+            }
+            setCapturedFrame((current) =>
+              typeof generation === "number" && current?.[3] === generation
+                ? current
+                : renderedFrame
+            );
+          }
+        }
+      } finally {
+        if (!cancelled) {
+          timeoutId = window.setTimeout(poll, WEB_PREVIEW_FRAME_POLL_MS);
+        }
       }
     };
 
     void poll();
-    const interval = window.setInterval(() => {
-      void poll();
-    }, WEB_PREVIEW_FRAME_POLL_MS);
 
     return () => {
       cancelled = true;
-      window.clearInterval(interval);
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+      }
     };
-  }, [isLocalPipelinePreview, isNative, isTestBusy]);
+  }, [isLocalPipelinePreview, isNative, isTestBusy, webPreviewMode]);
 
   useEffect(() => {
     if (isLocalPipelinePreview || !isTauriRuntime()) return;
@@ -696,6 +882,7 @@ export function RemoteDisplayWindowPage() {
     setTestStatus("starting");
     setCurrentRunId(null);
     setMetrics(null);
+    webPreviewRenderedGenerationRef.current = null;
     setCapturedFrame(null);
 
     try {
@@ -754,7 +941,10 @@ export function RemoteDisplayWindowPage() {
     setTestStatus("starting");
     setCurrentRunId(null);
     setMetrics(null);
+    webPreviewRenderedGenerationRef.current = null;
     setCapturedFrame(null);
+    setWebPreviewMode("idle");
+    setWebPreviewError(null);
 
     await testHarnessStop();
 
@@ -769,17 +959,15 @@ export function RemoteDisplayWindowPage() {
         setLastError(message);
         return;
       }
-      if (nativeRendererType === "macos") {
-        const probe = await presentTestHarnessFrameOnNativeSurface();
-        if (!probe.ok || !probe.value) {
-          const message = probe.ok
-            ? "Metal native render probe did not present a frame"
-            : probe.error.message;
-          setTestStatus("failed");
-          setTestMessage(message);
-          setLastError(message);
-          return;
-        }
+      const probe = await presentTestHarnessFrameOnNativeSurface();
+      if (!probe.ok || !probe.value) {
+        const message = probe.ok
+          ? `${nativeRenderLabel} render probe did not present a frame`
+          : probe.error.message;
+        setTestStatus("failed");
+        setTestMessage(message);
+        setLastError(message);
+        return;
       }
       configForRun = buildTestConfig(rendererTargetHwnd);
     }
@@ -809,6 +997,8 @@ export function RemoteDisplayWindowPage() {
     }
 
     setTestStatus("stopping");
+    closeWebPreviewPeer();
+    setWebPreviewMode("idle");
     const result = currentRunId
       ? await testStopRun(currentRunId)
       : await testHarnessStop();
@@ -855,6 +1045,18 @@ export function RemoteDisplayWindowPage() {
   const statusLabel = isLocalPipelinePreview
     ? "connected"
     : sessionSnapshot?.state ?? "loading";
+  const webPreviewUsesVideo =
+    isLocalPipelinePreview &&
+    !isNative &&
+    (webPreviewMode === "connecting" || webPreviewMode === "webrtc");
+  const effectiveRenderLabel =
+    isLocalPipelinePreview && !isNative
+      ? webPreviewMode === "webrtc"
+        ? "WebRTC video"
+        : webPreviewMode === "connecting"
+          ? "WebRTC connecting"
+          : "Web preview"
+      : renderModeLabel;
 
   return (
     <div className="flex h-screen w-screen flex-col overflow-hidden bg-[#080a0f] text-slate-100">
@@ -1071,23 +1273,41 @@ export function RemoteDisplayWindowPage() {
         className="relative min-h-0 flex-1 overflow-hidden bg-black"
       >
         <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,#172033_0,#05070a_58%,#000_100%)]" />
-        {isLocalPipelinePreview && !isNative && capturedFrame && (
+        {webPreviewUsesVideo && (
+          <video
+            ref={webPreviewVideoRef}
+            className="absolute inset-0 h-full w-full bg-black object-contain"
+            autoPlay
+            muted
+            playsInline
+          />
+        )}
+        {isLocalPipelinePreview && !isNative && !webPreviewUsesVideo && capturedFrame && (
           <img
             src={`data:image/png;base64,${capturedFrame[0]}`}
             alt="Rendered frame"
             className="absolute inset-0 h-full w-full object-contain"
           />
         )}
-        {isLocalPipelinePreview && !isNative && !capturedFrame && (
+        {isLocalPipelinePreview && !isNative && !webPreviewUsesVideo && !capturedFrame && (
           <div className="absolute inset-0 flex items-center justify-center">
             <div className="text-center">
               <PanelTop className="mx-auto mb-3 h-9 w-9 text-slate-500" />
               <div className="text-sm font-medium text-slate-300">
-                {isTestBusy ? "等待渲染帧" : "点击开始测试显示渲染内容"}
+                {isTestBusy ? "Waiting for preview frames" : "Click start to show captured output"}
               </div>
               <div className="mt-1 text-xs text-slate-500">
-                {testDescription}
+                {webPreviewError ?? testDescription}
               </div>
+            </div>
+          </div>
+        )}
+        {isLocalPipelinePreview && !isNative && webPreviewMode === "connecting" && (
+          <div className="absolute inset-0 flex items-center justify-center">
+            <div className="rounded-md border border-cyan-400/20 bg-black/55 px-4 py-3 text-center backdrop-blur">
+              <Loader2 className="mx-auto mb-2 h-5 w-5 animate-spin text-cyan-300" />
+              <div className="text-xs font-medium text-slate-200">Starting WebRTC video</div>
+              <div className="mt-1 text-[11px] text-slate-500">{testDescription}</div>
             </div>
           </div>
         )}
@@ -1134,7 +1354,7 @@ export function RemoteDisplayWindowPage() {
             <Circle className="h-2 w-2 fill-emerald-400 text-emerald-400" />
             {statusLabel}
           </span>
-          <span>render: {renderModeLabel}</span>
+          <span>render: {effectiveRenderLabel}</span>
           <span className="hidden min-w-0 truncate md:inline">
             {isLocalPipelinePreview
               ? `test: ${testDescription}`
@@ -1173,6 +1393,13 @@ export function RemoteDisplayWindowPage() {
                 ? "bg-red-500/90 text-white hover:bg-red-400"
                 : "bg-cyan-500 text-white hover:bg-cyan-400"
             }`}
+            aria-label={
+              isLocalPipelinePreview && isTestBusy
+                ? "Stop local pipeline test"
+                : isLocalPipelinePreview
+                  ? "Start local pipeline test"
+                  : "Start remote receiver"
+            }
             onClick={() =>
               void (isLocalPipelinePreview && isTestBusy
                 ? handleStopTest()

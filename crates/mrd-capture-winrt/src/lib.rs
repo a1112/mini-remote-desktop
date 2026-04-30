@@ -21,24 +21,37 @@
 compile_error!("mrd-capture-winrt is only supported on Windows");
 
 use anyhow::{anyhow, Context, Result};
-use mrd_pipeline_core::{CapturedFrame, FramePixelFormat, PipelineError};
-use std::thread;
+use mrd_pipeline_core::{
+    CapturedFrame, FrameCapture, FrameMemoryKind, FramePixelFormat, PipelineError,
+};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc::{sync_channel, Receiver},
+    Arc,
+};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows::core::*;
+use windows::Foundation::Metadata::ApiInformation;
+use windows::Foundation::TypedEventHandler;
+use windows::Graphics::SizeInt32;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D11::*;
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Graphics::Gdi::HMONITOR;
 use windows::Win32::System::Com::*;
+use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::System::WinRT::Direct3D11::{
     CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
 };
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
 use windows::Win32::System::WinRT::*;
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClassNameW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, IsWindow, IsWindowVisible,
+    EnumWindows, GetClassNameW, GetClientRect, GetWindowLongPtrW, GetWindowRect,
+    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindow, IsWindowVisible,
+    GWL_EXSTYLE, GWL_STYLE, WS_CHILD, WS_EX_TOOLWINDOW,
 };
 
 // WinRT imports - use Graphics namespace not Win32
@@ -50,14 +63,30 @@ use windows::Graphics::DirectX::*;
 pub struct WinrtCapture {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
+    direct3d_device: Option<IDirect3DDevice>,
     item: Option<GraphicsCaptureItem>,
     frame_pool: Option<Direct3D11CaptureFramePool>,
     session: Option<GraphicsCaptureSession>,
+    frame_event_rx: Option<Receiver<()>>,
+    frame_arrived_token: Option<i64>,
+    closed_token: Option<i64>,
+    closed: Arc<AtomicBool>,
+    output_memory_kind: FrameMemoryKind,
+    shared_texture: Option<SharedBgraTexture>,
+    source_width: usize,
+    source_height: usize,
     width: usize,
     height: usize,
 }
 
 unsafe impl Send for WinrtCapture {}
+
+struct SharedBgraTexture {
+    texture: ID3D11Texture2D,
+    shared_handle: isize,
+    width: u32,
+    height: u32,
+}
 
 /// Visible top-level window that can be used as a WinRT capture target.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,11 +130,41 @@ impl WinrtCapture {
         Self::from_item(item)
     }
 
+    /// Create a new D3D11 shared-texture capture from a monitor index.
+    pub fn from_monitor_index_shared_texture(monitor_index: u32) -> Result<Self, PipelineError> {
+        Self::from_monitor_index(monitor_index).map(Self::with_shared_texture_output)
+    }
+
     /// Create a new capture from a window handle (HWND)
     pub fn from_window(hwnd: HWND) -> Result<Self, PipelineError> {
         let item = Self::create_item_for_window(hwnd)
             .map_err(|e| PipelineError::message(format!("create window item failed: {e}")))?;
         Self::from_item(item)
+    }
+
+    /// Create a new D3D11 shared-texture capture from a window handle.
+    pub fn from_window_shared_texture(hwnd: HWND) -> Result<Self, PipelineError> {
+        Self::from_window(hwnd).map(Self::with_shared_texture_output)
+    }
+
+    /// Create a new capture from a raw native window handle.
+    ///
+    /// This keeps callers that use a different `windows` crate version from
+    /// exposing incompatible `HWND` types across crate boundaries.
+    pub fn from_window_handle(hwnd: isize) -> Result<Self, PipelineError> {
+        Self::from_window(HWND(hwnd as *mut core::ffi::c_void))
+    }
+
+    /// Create a new D3D11 shared-texture capture from a raw native window handle.
+    pub fn from_window_handle_shared_texture(hwnd: isize) -> Result<Self, PipelineError> {
+        Self::from_window_handle(hwnd).map(Self::with_shared_texture_output)
+    }
+
+    /// Switch the capture output to a D3D11 shared BGRA texture.
+    pub fn with_shared_texture_output(mut self) -> Self {
+        self.output_memory_kind = FrameMemoryKind::D3D11SharedBgra;
+        self.shared_texture = None;
+        self
     }
 
     /// Create a new capture from a capture item
@@ -124,9 +183,18 @@ impl WinrtCapture {
         Ok(Self {
             device,
             context,
+            direct3d_device: None,
             item: Some(item),
             frame_pool: None,
             session: None,
+            frame_event_rx: None,
+            frame_arrived_token: None,
+            closed_token: None,
+            closed: Arc::new(AtomicBool::new(false)),
+            output_memory_kind: FrameMemoryKind::Cpu,
+            shared_texture: None,
+            source_width: width,
+            source_height: height,
             width,
             height,
         })
@@ -247,11 +315,23 @@ impl WinrtCapture {
         self.height
     }
 
+    /// Set target output dimensions for D3D11 shared-texture output.
+    pub fn set_target_dimensions(&mut self, width: usize, height: usize) {
+        self.width = width.clamp(2, self.source_width.max(2));
+        self.height = height.clamp(2, self.source_height.max(2));
+        self.shared_texture = None;
+    }
+
     /// Start the capture session
     pub fn start(&mut self) -> Result<(), PipelineError> {
-        let item = self.item.take().ok_or_else(|| {
+        if self.session.is_some() {
+            return Err(PipelineError::message("WinRT capture is already started"));
+        }
+
+        let item = self.item.as_ref().cloned().ok_or_else(|| {
             PipelineError::message("Cannot start capture: no capture item available")
         })?;
+        self.closed.store(false, Ordering::Relaxed);
 
         // Create Direct3D device for WinRT
         let dxgi_device: IDXGIDevice = self
@@ -267,6 +347,7 @@ impl WinrtCapture {
                 "CreateDirect3D11DeviceFromDXGIDevice failed: {e:?}"
             ))
         })?;
+        self.direct3d_device = Some(d3d_device.clone());
 
         // Create frame pool with BGRA8 format
         let size = item
@@ -286,8 +367,33 @@ impl WinrtCapture {
             .CreateCaptureSession(&item)
             .map_err(|e| PipelineError::message(format!("CreateCaptureSession failed: {e:?}")))?;
 
+        configure_capture_session(&session)?;
+
+        let (frame_event_tx, frame_event_rx) = sync_channel::<()>(1);
+        let frame_arrived_token = frame_pool
+            .FrameArrived(
+                &TypedEventHandler::<Direct3D11CaptureFramePool, IInspectable>::new(move |_, _| {
+                    let _ = frame_event_tx.try_send(());
+                    Ok(())
+                }),
+            )
+            .map_err(|e| PipelineError::message(format!("register FrameArrived failed: {e:?}")))?;
+
+        let closed = self.closed.clone();
+        let closed_token = item
+            .Closed(
+                &TypedEventHandler::<GraphicsCaptureItem, IInspectable>::new(move |_, _| {
+                    closed.store(true, Ordering::Relaxed);
+                    Ok(())
+                }),
+            )
+            .map_err(|e| PipelineError::message(format!("register Closed failed: {e:?}")))?;
+
         self.frame_pool = Some(frame_pool);
         self.session = Some(session);
+        self.frame_event_rx = Some(frame_event_rx);
+        self.frame_arrived_token = Some(frame_arrived_token);
+        self.closed_token = Some(closed_token);
 
         // Start capture
         if let Some(session) = &self.session {
@@ -301,16 +407,35 @@ impl WinrtCapture {
 
     /// Stop the capture session
     pub fn stop(&mut self) -> Result<(), PipelineError> {
-        if let Some(_session) = self.session.take() {
-            // Session will be dropped, which stops capture
+        self.closed.store(true, Ordering::Relaxed);
+
+        if let Some(frame_pool) = self.frame_pool.as_ref() {
+            if let Some(token) = self.frame_arrived_token.take() {
+                let _ = frame_pool.RemoveFrameArrived(token);
+            }
+            let _ = frame_pool.Close();
         }
+
+        if let Some(session) = self.session.take() {
+            let _ = session.Close();
+        }
+
+        if let Some(item) = self.item.as_ref() {
+            if let Some(token) = self.closed_token.take() {
+                let _ = item.RemoveClosed(token);
+            }
+        }
+
         self.frame_pool = None;
+        self.frame_event_rx = None;
+        self.direct3d_device = None;
+        self.shared_texture = None;
         Ok(())
     }
 
     /// Try to get the latest captured frame
     pub fn try_get_frame(&mut self) -> Option<CapturedFrame> {
-        let frame_pool = self.frame_pool.as_ref()?;
+        let frame_pool = self.frame_pool.clone()?;
         let frame = frame_pool.TryGetNextFrame().ok()?;
         self.frame_to_captured_frame(&frame).ok()
     }
@@ -327,19 +452,24 @@ impl WinrtCapture {
     ) -> Result<CapturedFrame, PipelineError> {
         let frame_pool = self
             .frame_pool
-            .as_ref()
+            .clone()
             .ok_or_else(|| PipelineError::message("Capture not started - call start() first"))?;
 
         let deadline = Instant::now() + timeout;
         let mut last_error: Option<String>;
 
         loop {
+            if self.closed.load(Ordering::Relaxed) {
+                return Err(PipelineError::message("WinRT capture item was closed"));
+            }
+
             match frame_pool.TryGetNextFrame() {
                 Ok(frame) => return self.frame_to_captured_frame(&frame),
                 Err(error) => last_error = Some(format!("{error:?}")),
             }
 
-            if Instant::now() >= deadline {
+            let now = Instant::now();
+            if now >= deadline {
                 let suffix = last_error
                     .map(|error| format!("; last TryGetNextFrame error: {error}"))
                     .unwrap_or_default();
@@ -350,12 +480,28 @@ impl WinrtCapture {
                 )));
             }
 
-            thread::sleep(Duration::from_millis(10));
+            let remaining = deadline.saturating_duration_since(now);
+            let wait_for = remaining.min(Duration::from_millis(250));
+            let recv_result = self
+                .frame_event_rx
+                .as_ref()
+                .ok_or_else(|| PipelineError::message("Capture event receiver is not initialized"))?
+                .recv_timeout(wait_for);
+
+            match recv_result {
+                Ok(()) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(PipelineError::message(
+                        "WinRT capture event receiver disconnected",
+                    ));
+                }
+            }
         }
     }
 
     fn frame_to_captured_frame(
-        &self,
+        &mut self,
         frame: &Direct3D11CaptureFrame,
     ) -> Result<CapturedFrame, PipelineError> {
         let content_size = frame
@@ -387,11 +533,17 @@ impl WinrtCapture {
             texture.GetDesc(&mut desc);
         }
 
+        self.recreate_frame_pool_if_needed(content_size, width, height)?;
+
         if desc.SampleDesc.Count > 1 {
             return Err(PipelineError::message(format!(
                 "unsupported multisampled WinRT frame texture: {} samples",
                 desc.SampleDesc.Count
             )));
+        }
+
+        if self.output_memory_kind == FrameMemoryKind::D3D11SharedBgra {
+            return self.frame_to_shared_texture_frame(&texture, width, height);
         }
 
         let mut staging_desc = desc;
@@ -443,6 +595,128 @@ impl WinrtCapture {
         ))
     }
 
+    fn frame_to_shared_texture_frame(
+        &mut self,
+        texture: &ID3D11Texture2D,
+        source_width: usize,
+        source_height: usize,
+    ) -> Result<CapturedFrame, PipelineError> {
+        let source_resource: ID3D11Resource = texture.cast().map_err(|e| {
+            PipelineError::message(format!("cast source texture to resource failed: {e:?}"))
+        })?;
+
+        let width = self.width.clamp(2, source_width.max(2));
+        let height = self.height.clamp(2, source_height.max(2));
+        self.ensure_shared_texture(width, height)?;
+        let shared = self
+            .shared_texture
+            .as_ref()
+            .ok_or_else(|| PipelineError::message("shared texture not initialized"))?;
+        let shared_handle = shared.shared_handle;
+        let shared_texture = shared.texture.clone();
+        let target_resource: ID3D11Resource = shared_texture.cast().map_err(|e| {
+            PipelineError::message(format!("cast shared texture to resource failed: {e:?}"))
+        })?;
+
+        unsafe {
+            if width == source_width && height == source_height {
+                self.context
+                    .CopyResource(&target_resource, &source_resource);
+            } else {
+                let left = source_width.saturating_sub(width) as u32 / 2;
+                let top = source_height.saturating_sub(height) as u32 / 2;
+                let source_box = D3D11_BOX {
+                    left,
+                    top,
+                    front: 0,
+                    right: left + width as u32,
+                    bottom: top + height as u32,
+                    back: 1,
+                };
+                self.context.CopySubresourceRegion(
+                    &target_resource,
+                    0,
+                    0,
+                    0,
+                    0,
+                    &source_resource,
+                    0,
+                    Some(&source_box),
+                );
+            }
+            self.context.Flush();
+        }
+
+        Ok(CapturedFrame::from_d3d11_shared_bgra(
+            width,
+            height,
+            now_us(),
+            shared_handle,
+            width.saturating_mul(4) as u32,
+        ))
+    }
+
+    fn ensure_shared_texture(&mut self, width: usize, height: usize) -> Result<(), PipelineError> {
+        let width = width as u32;
+        let height = height as u32;
+        let needs_new = self
+            .shared_texture
+            .as_ref()
+            .map(|texture| texture.width != width || texture.height != height)
+            .unwrap_or(true);
+
+        if needs_new {
+            self.shared_texture = Some(
+                SharedBgraTexture::new(&self.device, width, height).map_err(|error| {
+                    PipelineError::message(format!("create WinRT shared texture failed: {error}"))
+                })?,
+            );
+        }
+
+        Ok(())
+    }
+
+    fn recreate_frame_pool_if_needed(
+        &mut self,
+        content_size: SizeInt32,
+        width: usize,
+        height: usize,
+    ) -> Result<(), PipelineError> {
+        if self.source_width == width && self.source_height == height {
+            return Ok(());
+        }
+
+        let frame_pool = self
+            .frame_pool
+            .as_ref()
+            .ok_or_else(|| PipelineError::message("Capture frame pool is not initialized"))?;
+        let d3d_device = self
+            .direct3d_device
+            .as_ref()
+            .ok_or_else(|| PipelineError::message("Capture D3D device is not initialized"))?;
+
+        frame_pool
+            .Recreate(
+                d3d_device,
+                DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                2,
+                content_size,
+            )
+            .map_err(|e| PipelineError::message(format!("recreate frame pool failed: {e:?}")))?;
+
+        let was_native_size = self.width == self.source_width && self.height == self.source_height;
+        self.source_width = width;
+        self.source_height = height;
+        if was_native_size {
+            self.width = width;
+            self.height = height;
+        } else {
+            self.set_target_dimensions(self.width, self.height);
+        }
+        self.shared_texture = None;
+        Ok(())
+    }
+
     /// Check if capture is available
     pub fn probe_available() -> Result<(), PipelineError> {
         // Try to get monitor count to test availability
@@ -456,6 +730,56 @@ impl Drop for WinrtCapture {
     fn drop(&mut self) {
         // Ensure capture is stopped
         let _ = self.stop();
+    }
+}
+
+impl FrameCapture for WinrtCapture {
+    fn output_memory_kind(&self) -> FrameMemoryKind {
+        self.output_memory_kind
+    }
+
+    fn capture_frame(&mut self) -> Result<CapturedFrame, PipelineError> {
+        WinrtCapture::capture_frame(self)
+    }
+}
+
+impl SharedBgraTexture {
+    fn new(device: &ID3D11Device, width: u32, height: u32) -> anyhow::Result<Self> {
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: D3D11_RESOURCE_MISC_SHARED.0 as u32,
+        };
+
+        let mut texture = None::<ID3D11Texture2D>;
+        unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture)) }
+            .context("CreateTexture2D failed")?;
+        let texture = texture.ok_or_else(|| anyhow!("CreateTexture2D returned none"))?;
+        let dxgi_resource: IDXGIResource =
+            texture.cast().context("cast to IDXGIResource failed")?;
+        let shared_handle =
+            unsafe { dxgi_resource.GetSharedHandle() }.context("GetSharedHandle failed")?;
+
+        if shared_handle == HANDLE::default() {
+            return Err(anyhow!("GetSharedHandle returned null handle"));
+        }
+
+        Ok(Self {
+            texture,
+            shared_handle: shared_handle.0 as isize,
+            width,
+            height,
+        })
     }
 }
 
@@ -496,6 +820,36 @@ fn create_d3d11_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
         device.ok_or_else(|| anyhow!("missing d3d11 device"))?,
         context.ok_or_else(|| anyhow!("missing d3d11 context"))?,
     ))
+}
+
+fn configure_capture_session(session: &GraphicsCaptureSession) -> Result<(), PipelineError> {
+    if graphics_capture_session_property_supported("IsCursorCaptureEnabled") {
+        session.SetIsCursorCaptureEnabled(true).map_err(|e| {
+            PipelineError::message(format!("set WinRT cursor capture failed: {e:?}"))
+        })?;
+    }
+
+    if graphics_capture_session_property_supported("IsBorderRequired") {
+        session.SetIsBorderRequired(false).map_err(|e| {
+            PipelineError::message(format!("disable WinRT capture border failed: {e:?}"))
+        })?;
+    }
+
+    if graphics_capture_session_property_supported("IncludeSecondaryWindows") {
+        session.SetIncludeSecondaryWindows(true).map_err(|e| {
+            PipelineError::message(format!("set WinRT secondary window capture failed: {e:?}"))
+        })?;
+    }
+
+    Ok(())
+}
+
+fn graphics_capture_session_property_supported(property_name: &str) -> bool {
+    ApiInformation::IsPropertyPresent(
+        &HSTRING::from("Windows.Graphics.Capture.GraphicsCaptureSession"),
+        &HSTRING::from(property_name),
+    )
+    .unwrap_or(false)
 }
 
 /// Probe WinRT capture availability
@@ -651,19 +1005,19 @@ fn now_us() -> u64 {
 }
 
 unsafe extern "system" fn enum_window_capture_target(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    if !IsWindowVisible(hwnd).as_bool() {
+    if !is_window_capture_candidate(hwnd) {
         return true.into();
     }
 
     let title = read_window_text(hwnd);
-    if title.trim().is_empty() {
+    let title = title.trim().to_string();
+    if title.is_empty() {
         return true.into();
     }
 
-    let mut rect = RECT::default();
-    if GetWindowRect(hwnd, &mut rect).is_err() {
+    let Some(rect) = read_window_capture_bounds(hwnd) else {
         return true.into();
-    }
+    };
 
     let width = rect.right.saturating_sub(rect.left);
     let height = rect.bottom.saturating_sub(rect.top);
@@ -685,6 +1039,59 @@ unsafe extern "system" fn enum_window_capture_target(hwnd: HWND, lparam: LPARAM)
     });
 
     true.into()
+}
+
+unsafe fn is_window_capture_candidate(hwnd: HWND) -> bool {
+    if !IsWindowVisible(hwnd).as_bool() {
+        return false;
+    }
+
+    let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+    if style & WS_CHILD.0 != 0 {
+        return false;
+    }
+
+    let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+    if ex_style & WS_EX_TOOLWINDOW.0 != 0 {
+        return false;
+    }
+
+    let mut client_rect = RECT::default();
+    if GetClientRect(hwnd, &mut client_rect).is_err() {
+        return false;
+    }
+    if client_rect.right.saturating_sub(client_rect.left) <= 0
+        || client_rect.bottom.saturating_sub(client_rect.top) <= 0
+    {
+        return false;
+    }
+
+    let mut process_id = 0u32;
+    let _ = GetWindowThreadProcessId(hwnd, Some(&mut process_id));
+    process_id != 0 && process_id != GetCurrentProcessId()
+}
+
+unsafe fn read_window_capture_bounds(hwnd: HWND) -> Option<RECT> {
+    let mut rect = RECT::default();
+    if DwmGetWindowAttribute(
+        hwnd,
+        DWMWA_EXTENDED_FRAME_BOUNDS,
+        &mut rect as *mut RECT as *mut std::ffi::c_void,
+        std::mem::size_of::<RECT>() as u32,
+    )
+    .is_ok()
+        && rect.right > rect.left
+        && rect.bottom > rect.top
+    {
+        return Some(rect);
+    }
+
+    let mut rect = RECT::default();
+    if GetWindowRect(hwnd, &mut rect).is_ok() && rect.right > rect.left && rect.bottom > rect.top {
+        Some(rect)
+    } else {
+        None
+    }
 }
 
 unsafe fn read_window_text(hwnd: HWND) -> String {

@@ -9,13 +9,17 @@ anyhow.workspace = true
 mrd-pipeline-core = { path = "../mrd-pipeline-core" }
 mrd-observability = { path = "../mrd-observability" }
 windows = { version = "0.62", features = [
+    "Foundation",
+    "Foundation_Metadata",
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dwm",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
     "Win32_System_Com",
+    "Win32_System_Threading",
     "Win32_System_WinRT",
     "Win32_System_WinRT_Direct3D11",
     "Win32_System_WinRT_Graphics_Capture",
@@ -28,3 +32,4 @@ windows = { version = "0.62", features = [
 
 [dev-dependencies]
 mrd-observability = { path = "../mrd-observability" }
+serde_json = { workspace = true }

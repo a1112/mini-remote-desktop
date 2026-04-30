@@ -1892,6 +1892,15 @@ fn validate_scenario_for_current_platform(
         );
     }
 
+    if config.zero_copy == Some(true) {
+        if !matches!(capture_type, "dxgi" | "winrt") {
+            anyhow::bail!("D3D11 shared texture capture requires DXGI or WinRT capture");
+        }
+        if !matches!(encoder_type, "nvenc_h264") {
+            anyhow::bail!("D3D11 shared texture input requires NVENC H.264 encoder");
+        }
+    }
+
     Ok(())
 }
 

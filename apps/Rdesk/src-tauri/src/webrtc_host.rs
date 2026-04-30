@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex,
+        mpsc, Arc, Mutex,
     },
     time::Duration,
 };
@@ -11,12 +11,14 @@ use crate::app_settings::DecodePolicy;
 use crate::frame_sink::DecodedFrameSink;
 use crate::webrtc_media::H264AccessUnitAssembler;
 use mrd_capture_dxgi::DxgiDesktopCapture;
-use mrd_decode::{DecodedFrame, PixelFormat, VideoDecoder};
+use mrd_decode::VideoDecoder;
 use mrd_encode_openh264::OpenH264Encoder;
 use mrd_observability::{
     MediaProbeEvent, PipelineProbeSnapshot, ProbeRegistry, ProbeSessionHandle, StageId,
 };
-use mrd_pipeline_core::{FrameCapture, VideoEncoder};
+use mrd_pipeline_core::{
+    DecodedFrame, DecodedFrameData, EncodedAccessUnit, FrameCapture, VideoCodec, VideoEncoder,
+};
 use mrd_proto::SessionId;
 use mrd_signal_proto::{IceCandidate, SessionDescription};
 use mrd_transport_webrtc::{annex_b_contains_keyframe, H264Profile, H264RtpSender};
@@ -322,7 +324,7 @@ impl WebrtcHost {
         }
 
         let sample_sender =
-            ensure_sample_sender(&pc, &session_id, session, H264Profile::Baseline).await?;
+            ensure_sample_sender(&pc, &session_id, session, fps, H264Profile::Baseline).await?;
         let probe = self
             .probe_registry
             .session_handle(session_id.clone(), crate::frame_sink::DEFAULT_SOURCE_ID);
@@ -359,6 +361,95 @@ impl WebrtcHost {
                 &mut capture,
                 &mut encoder,
                 frame_interval,
+                sample_sender,
+                snapshot,
+                probe,
+                running,
+                handle,
+            );
+        });
+        session.sender_task = Some(task);
+        Ok(())
+    }
+
+    pub async fn prepare_embedded_desktop_sender(
+        &mut self,
+        session_id: SessionId,
+    ) -> Result<(), String> {
+        let pc = self.get_or_create_peer(&session_id).await?;
+        let session = self
+            .sessions
+            .get_mut(&session_id)
+            .ok_or_else(|| format!("鏈壘鍒?webrtc host 浼氳瘽: {}", session_id.0))?;
+        let _ = ensure_sample_sender(&pc, &session_id, session, 60, H264Profile::Baseline).await?;
+        Ok(())
+    }
+
+    pub async fn prepare_browser_h264_sender(
+        &mut self,
+        session_id: SessionId,
+        fps: u32,
+        h264_profile: &str,
+    ) -> Result<(), String> {
+        let pc = self.get_or_create_peer(&session_id).await?;
+        let session = self
+            .sessions
+            .get_mut(&session_id)
+            .ok_or_else(|| format!("未找到 webrtc host 会话: {}", session_id.0))?;
+        let _ = ensure_sample_sender(
+            &pc,
+            &session_id,
+            session,
+            fps,
+            h264_profile_from_label(h264_profile),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn start_encoded_access_unit_sender(
+        &mut self,
+        session_id: SessionId,
+        fps: u32,
+        h264_profile: &str,
+        receiver: mpsc::Receiver<Vec<EncodedAccessUnit>>,
+    ) -> Result<(), String> {
+        let pc = self.get_or_create_peer(&session_id).await?;
+        let session = self
+            .sessions
+            .get_mut(&session_id)
+            .ok_or_else(|| format!("未找到 webrtc host 会话: {}", session_id.0))?;
+
+        if session.sender_running.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        let sample_sender = ensure_sample_sender(
+            &pc,
+            &session_id,
+            session,
+            fps,
+            h264_profile_from_label(h264_profile),
+        )
+        .await?;
+        let probe = self
+            .probe_registry
+            .session_handle(session_id.clone(), crate::frame_sink::DEFAULT_SOURCE_ID);
+        probe.set_backend("harness");
+        probe.set_codec("h264");
+        probe.set_transport("webrtc");
+
+        session.sender_running.store(true, Ordering::Relaxed);
+        {
+            let mut snapshot = session.snapshot.lock().expect("lock host snapshot");
+            snapshot.sender_running = true;
+        }
+        let running = session.sender_running.clone();
+        let snapshot = session.snapshot.clone();
+        let handle = tokio::runtime::Handle::current();
+        let task = tokio::task::spawn_blocking(move || {
+            run_blocking_encoded_access_unit_sender_loop(
+                receiver,
                 sample_sender,
                 snapshot,
                 probe,
@@ -435,7 +526,8 @@ impl WebrtcHost {
         let sample_sender = if let Some(sender) = session.sample_sender.as_ref() {
             sender.clone()
         } else {
-            ensure_sample_sender(&pc, &session_id, session, H264Profile::Baseline).await?
+            let fps = fps_from_frame_interval(frame_interval);
+            ensure_sample_sender(&pc, &session_id, session, fps, H264Profile::Baseline).await?
         };
         let probe = self
             .probe_registry
@@ -480,7 +572,7 @@ impl WebrtcHost {
             "nvenc" => H264Profile::High,
             _ => H264Profile::Baseline,
         };
-        let _ = ensure_sample_sender(&pc, &session_id, session, profile).await?;
+        let _ = ensure_sample_sender(&pc, &session_id, session, 60, profile).await?;
         Ok(())
     }
 
@@ -540,6 +632,7 @@ async fn ensure_sample_sender(
     pc: &Arc<RTCPeerConnection>,
     session_id: &SessionId,
     session: &mut HostedPeer,
+    fps: u32,
     profile: H264Profile,
 ) -> Result<Arc<tokio::sync::Mutex<H264RtpSender>>, String> {
     if let Some(sender) = session.sample_sender.as_ref() {
@@ -549,7 +642,7 @@ async fn ensure_sample_sender(
     let sender = Arc::new(tokio::sync::Mutex::new(H264RtpSender::new_with_profile(
         "video",
         format!("{}-embedded", session_id.0),
-        30,
+        fps.max(1),
         1200,
         profile,
     )));
@@ -566,6 +659,21 @@ async fn ensure_sample_sender(
         .expect("lock host snapshot")
         .local_video_track_count = 1;
     Ok(sender)
+}
+
+fn h264_profile_from_label(label: &str) -> H264Profile {
+    match label {
+        "high" | "nvenc" | "nvenc_h264" => H264Profile::High,
+        _ => H264Profile::Baseline,
+    }
+}
+
+fn fps_from_frame_interval(frame_interval: Duration) -> u32 {
+    let millis = frame_interval.as_millis();
+    if millis == 0 {
+        return 60;
+    }
+    ((1000 / millis) as u32).clamp(1, 240)
 }
 
 async fn wait_for_peer_connection_connected(
@@ -1005,13 +1113,9 @@ fn apply_decoded_frames_to_snapshot(
         snapshot.decoded_frame_count += 1;
         snapshot.last_decoded_width = frame.width;
         snapshot.last_decoded_height = frame.height;
-        snapshot.last_decoded_pixel_format = Some(match frame.pixel_format {
-            PixelFormat::Rgb24 => "Rgb24".to_string(),
-            PixelFormat::Bgra32 => "Bgra32".to_string(),
-            PixelFormat::D3d11Texture => "D3d11Texture".to_string(),
-        });
+        snapshot.last_decoded_pixel_format = Some(decoded_frame_data_kind(&frame).to_string());
         if let Some(frame_sink) = frame_sink.as_ref() {
-            let bytes = frame.data.len();
+            let bytes = frame.cpu_bytes().map_or(0, |data| data.len());
             let started_at = std::time::Instant::now();
             frame_sink
                 .lock()
@@ -1020,6 +1124,85 @@ fn apply_decoded_frames_to_snapshot(
             probe.record_stage(StageId::FrameSinkIngest, started_at.elapsed(), bytes, false);
         }
     }
+}
+
+fn decoded_frame_data_kind(frame: &DecodedFrame) -> &'static str {
+    match &frame.data {
+        DecodedFrameData::CpuRgb24(_) => "Rgb24",
+        DecodedFrameData::CpuBgra32(_) => "Bgra32",
+        DecodedFrameData::CpuNv12 { .. } => "Nv12",
+        #[cfg(windows)]
+        DecodedFrameData::D3D11SharedNv12 { .. } => "D3d11SharedNv12",
+    }
+}
+
+fn run_blocking_encoded_access_unit_sender_loop(
+    receiver: mpsc::Receiver<Vec<EncodedAccessUnit>>,
+    sample_sender: Arc<tokio::sync::Mutex<H264RtpSender>>,
+    snapshot: Arc<Mutex<WebrtcHostSnapshot>>,
+    probe: ProbeSessionHandle,
+    running: Arc<AtomicBool>,
+    handle: tokio::runtime::Handle,
+) {
+    while running.load(Ordering::Relaxed) {
+        let access_units = match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(access_units) => access_units,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+
+        for access_unit in access_units {
+            if access_unit.codec != VideoCodec::H264 {
+                continue;
+            }
+
+            let send_started_at = std::time::Instant::now();
+            match handle.block_on(async {
+                sample_sender
+                    .lock()
+                    .await
+                    .send_access_unit(&access_unit)
+                    .await
+            }) {
+                Ok(written) => {
+                    probe.record_stage(
+                        StageId::SendPacketize,
+                        Duration::from_micros(1),
+                        access_unit.bytes.len(),
+                        access_unit.is_keyframe,
+                    );
+                    probe.record_stage(
+                        StageId::SendWrite,
+                        send_started_at.elapsed(),
+                        written,
+                        access_unit.is_keyframe,
+                    );
+                    let mut guard = snapshot.lock().expect("lock host snapshot");
+                    guard.sent_access_unit_count += 1;
+                    guard.sent_rtp_bytes += written as u64;
+                    guard.sender_running = true;
+                    if written == 0 {
+                        guard.zero_write_access_unit_count += 1;
+                    }
+                }
+                Err(_) => {
+                    probe.record_stage(
+                        StageId::SendWrite,
+                        send_started_at.elapsed(),
+                        0,
+                        access_unit.is_keyframe,
+                    );
+                    snapshot
+                        .lock()
+                        .expect("lock host snapshot")
+                        .zero_write_access_unit_count += 1;
+                }
+            }
+        }
+    }
+
+    running.store(false, Ordering::Relaxed);
+    snapshot.lock().expect("lock host snapshot").sender_running = false;
 }
 
 async fn run_embedded_sender_loop<C, E>(

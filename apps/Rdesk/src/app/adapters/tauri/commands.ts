@@ -41,6 +41,7 @@ import type {
   RemoteDisplayWindowContext,
   NativeSurfaceRect,
   NativeRenderSurfaceSnapshot,
+  BrowserWebrtcPreviewAnswer,
   TestMatrixConfig,
 } from './types';
 
@@ -184,6 +185,26 @@ export async function configureRemoteDisplayNativeSurface(params: {
 
 export async function presentTestHarnessFrameOnNativeSurface(): Promise<AdapterResult<boolean>> {
   return invokeAdapter<boolean>('present_test_harness_frame_on_native_surface');
+}
+
+export async function browserWebrtcPreviewStart(params: {
+  sessionId: string;
+  offerSdp: string;
+  fps?: number;
+  h264Profile?: "baseline" | "high";
+}): Promise<AdapterResult<BrowserWebrtcPreviewAnswer>> {
+  return invokeAdapter<BrowserWebrtcPreviewAnswer>('browser_webrtc_preview_start', {
+    sessionId: params.sessionId,
+    offerSdp: params.offerSdp,
+    fps: params.fps ?? null,
+    h264Profile: params.h264Profile ?? null,
+  });
+}
+
+export async function browserWebrtcPreviewStop(
+  sessionId: string
+): Promise<AdapterResult<void>> {
+  return invokeAdapter<void>('browser_webrtc_preview_stop', { sessionId });
 }
 
 export async function getClientDiagnostics(): Promise<AdapterResult<ClientDiagnostics>> {
@@ -753,6 +774,8 @@ export async function testHarnessGetMetrics(): Promise<AdapterResult<HarnessMetr
 export async function testHarnessGetFrames(params?: {
   includeCaptured?: boolean;
   includeRendered?: boolean;
+  lastCapturedGeneration?: number;
+  lastRenderedGeneration?: number;
 }): Promise<
   AdapterResult<[FrameData | null, FrameData | null]>
 > {
@@ -761,6 +784,8 @@ export async function testHarnessGetFrames(params?: {
     {
       includeCaptured: params?.includeCaptured ?? true,
       includeRendered: params?.includeRendered ?? true,
+      lastCapturedGeneration: params?.lastCapturedGeneration,
+      lastRenderedGeneration: params?.lastRenderedGeneration,
     }
   );
 }

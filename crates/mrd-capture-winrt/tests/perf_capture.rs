@@ -2,25 +2,61 @@
 
 use std::{fs, path::Path, time::Instant};
 
-use mrd_capture_dxgi::DxgiDesktopCapture;
+use mrd_capture_winrt::WinrtCapture;
 use mrd_observability::{ComponentKind, ComponentResult};
 use mrd_pipeline_core::{FrameCapture, FrameMemoryKind};
 
-#[cfg(windows)]
-use mrd_capture_dxgi::DxgiSharedTextureCapture;
-
 #[test]
 #[ignore]
-fn perf_dxgi_capture_reports_latency_distribution() {
-    let capture = DxgiDesktopCapture::new_primary().expect("create primary capture");
-    run_capture_perf("dxgi", capture, false);
+fn perf_winrt_monitor_capture_reports_latency_distribution() {
+    let mut capture = WinrtCapture::from_monitor_index(0).expect("create primary WinRT capture");
+    capture.start().expect("start WinRT monitor capture");
+    run_capture_perf("winrt_monitor", capture, false);
 }
 
 #[test]
 #[ignore]
-fn perf_dxgi_shared_texture_capture_reports_latency_distribution() {
-    let capture = DxgiSharedTextureCapture::new_primary().expect("create primary shared capture");
-    run_capture_perf("dxgi_shared", capture, true);
+fn perf_winrt_monitor_shared_texture_capture_reports_latency_distribution() {
+    let mut capture = WinrtCapture::from_monitor_index_shared_texture(0)
+        .expect("create primary WinRT shared capture");
+    capture.start().expect("start WinRT shared monitor capture");
+    run_capture_perf("winrt_monitor_shared", capture, true);
+}
+
+#[test]
+#[ignore]
+fn perf_winrt_window_capture_reports_latency_distribution() {
+    let hwnd = std::env::var("MRD_CAPTURE_WINDOW_HWND")
+        .ok()
+        .and_then(|value| parse_hwnd(&value).ok());
+
+    let Some(hwnd) = hwnd else {
+        println!("MRD_CAPTURE_WINDOW_HWND is not set; skipping window capture perf sample");
+        return;
+    };
+
+    let mut capture =
+        WinrtCapture::from_window_handle(hwnd).expect("create selected WinRT window capture");
+    capture.start().expect("start WinRT window capture");
+    run_capture_perf("winrt_window", capture, false);
+}
+
+#[test]
+#[ignore]
+fn perf_winrt_window_shared_texture_capture_reports_latency_distribution() {
+    let hwnd = std::env::var("MRD_CAPTURE_WINDOW_HWND")
+        .ok()
+        .and_then(|value| parse_hwnd(&value).ok());
+
+    let Some(hwnd) = hwnd else {
+        println!("MRD_CAPTURE_WINDOW_HWND is not set; skipping window shared capture perf sample");
+        return;
+    };
+
+    let mut capture = WinrtCapture::from_window_handle_shared_texture(hwnd)
+        .expect("create selected WinRT shared window capture");
+    capture.start().expect("start WinRT shared window capture");
+    run_capture_perf("winrt_window_shared", capture, true);
 }
 
 fn run_capture_perf(default_backend: &str, mut capture: impl FrameCapture, expect_zero_copy: bool) {
@@ -56,7 +92,8 @@ fn run_capture_perf(default_backend: &str, mut capture: impl FrameCapture, expec
                 }
                 success_count += 1;
             }
-            Err(_) => {
+            Err(error) => {
+                eprintln!("WinRT capture sample failed: {error}");
                 failure_count += 1;
             }
         }
@@ -90,9 +127,9 @@ fn run_capture_perf(default_backend: &str, mut capture: impl FrameCapture, expec
     if let Ok(result_path) = std::env::var("MRD_COMPONENT_RESULT_PATH") {
         fs::write(
             Path::new(&result_path),
-            serde_json::to_string_pretty(&result).expect("serialize capture perf result"),
+            serde_json::to_string_pretty(&result).expect("serialize WinRT capture perf result"),
         )
-        .expect("write capture perf result");
+        .expect("write WinRT capture perf result");
     }
 
     println!(
@@ -113,5 +150,17 @@ fn run_capture_perf(default_backend: &str, mut capture: impl FrameCapture, expec
     assert!(result.success_ratio.unwrap_or_default() > 0.0);
     if expect_zero_copy {
         assert!(result.zero_copy_hit_ratio.unwrap_or_default() >= 0.99);
+    }
+}
+
+fn parse_hwnd(input: &str) -> Result<isize, std::num::ParseIntError> {
+    let trimmed = input.trim().rsplit(':').next().unwrap_or(input).trim();
+    if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        isize::from_str_radix(hex, 16)
+    } else {
+        trimmed.parse::<isize>()
     }
 }

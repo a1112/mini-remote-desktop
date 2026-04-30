@@ -4,6 +4,7 @@
 
 mod app_settings;
 mod device_info;
+mod frame_sink;
 mod ipc_client;
 mod platform;
 mod remote_display_surface;
@@ -12,6 +13,8 @@ mod resource_monitor;
 mod service_manager;
 mod test_harness;
 mod test_orchestrator;
+mod webrtc_host;
+mod webrtc_media;
 
 use app_settings::{
     default_settings_path, load_settings, save_settings, AppSettings, DecodePolicy,
@@ -66,6 +69,8 @@ struct AppState {
     // Remote display windows: frameless web chrome plus optional native DX11 surface.
     render_window_registry: std::sync::Arc<std::sync::Mutex<RenderWindowRegistry>>,
     remote_display_surfaces: std::sync::Arc<std::sync::Mutex<RemoteDisplaySurfaceManager>>,
+    // Local browser WebRTC preview host for the remote display window Web mode.
+    webrtc_host: std::sync::Arc<tokio::sync::Mutex<webrtc_host::WebrtcHost>>,
 }
 
 /// 设备注册响应
@@ -90,6 +95,19 @@ struct ClientDiagnostics {
     service_exe_path: String,
     service_stdout_log: String,
     service_stderr_log: String,
+}
+
+#[derive(Debug, Serialize)]
+struct BrowserWebrtcPreviewAnswer {
+    session_id: String,
+    answer_sdp: String,
+}
+
+fn ensure_rustls_crypto_provider() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
 }
 
 /// Tauri 命令：获取硬件信息
@@ -214,10 +232,11 @@ fn open_remote_display_window(
     };
 
     let app_for_window = app.clone();
+    let state_for_window = state.inner().clone();
     std::thread::spawn(move || {
         let build_app = app_for_window.clone();
         if let Err(error) = app_for_window.run_on_main_thread(move || {
-            if let Err(error) = build_remote_display_window(&build_app, spec) {
+            if let Err(error) = build_remote_display_window(&build_app, state_for_window, spec) {
                 eprintln!("{error}");
             }
         }) {
@@ -228,10 +247,13 @@ fn open_remote_display_window(
     Ok(context)
 }
 
-fn build_remote_display_window<R: tauri::Runtime>(
-    app: &AppHandle<R>,
+fn build_remote_display_window(
+    app: &AppHandle,
+    state: AppState,
     spec: PendingRenderWindow,
 ) -> Result<(), String> {
+    let label = spec.label.clone();
+    let session_id = spec.session_id.0.clone();
     let window = WebviewWindowBuilder::new(app, spec.label.clone(), spec.url)
         .title(format!("Rdesk Display {}", spec.session_id.0))
         .decorations(false)
@@ -242,11 +264,140 @@ fn build_remote_display_window<R: tauri::Runtime>(
         .build()
         .map_err(|error| format!("create remote display window failed: {error}"))?;
 
+    let cleanup_app = app.clone();
+    let cleanup_state = state.clone();
+    window.on_window_event(move |event| {
+        if matches!(
+            event,
+            tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed
+        ) {
+            cleanup_remote_display_window(
+                &cleanup_app,
+                &cleanup_state,
+                &label,
+                Some(session_id.clone()),
+                "window_close",
+            );
+        }
+    });
+
     window
         .show()
         .map_err(|error| format!("show remote display window failed: {error}"))?;
     let _ = window.set_focus();
     Ok(())
+}
+
+fn cleanup_remote_display_window(
+    app: &AppHandle,
+    state: &AppState,
+    label: &str,
+    _session_id_hint: Option<String>,
+    reason: &'static str,
+) {
+    let window = app.get_webview_window(label);
+    if let Err(error) = state
+        .remote_display_surfaces
+        .lock()
+        .unwrap()
+        .detach(label, window.as_ref())
+    {
+        eprintln!("remote display surface cleanup failed for {label}: {error}");
+    }
+
+    let removed = state
+        .render_window_registry
+        .lock()
+        .unwrap()
+        .remove_window_entry(label);
+
+    let Some((session_id, remaining_windows)) = removed else {
+        return;
+    };
+    let session_id = session_id.0;
+
+    if remaining_windows == 0 {
+        if is_local_pipeline_preview_session(&session_id) {
+            stop_test_harness_async(state.test_harness.clone(), label.to_string());
+        }
+        stop_browser_webrtc_preview_async(state.webrtc_host.clone(), session_id.clone());
+        stop_session_async(session_id, reason);
+    }
+}
+
+fn is_local_pipeline_preview_session(session_id: &str) -> bool {
+    session_id == "local-preview" || session_id.starts_with("local-display-test")
+}
+
+fn stop_test_harness_async(
+    harness: std::sync::Arc<std::sync::Mutex<test_harness::TestHarness>>,
+    label: String,
+) {
+    std::thread::spawn(move || {
+        if let Err(error) = harness.lock().unwrap().stop() {
+            eprintln!("test harness cleanup failed for {label}: {error}");
+        }
+    });
+}
+
+fn stop_browser_webrtc_preview_async(
+    host: std::sync::Arc<tokio::sync::Mutex<webrtc_host::WebrtcHost>>,
+    session_id: String,
+) {
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Runtime::new() else {
+            eprintln!("create runtime for browser webrtc preview cleanup failed: {session_id}");
+            return;
+        };
+
+        rt.block_on(async move {
+            let session_id = SessionId(session_id);
+            let mut host = host.lock().await;
+            if host.snapshot(&session_id).is_some() {
+                if let Err(error) = host.close_session(&session_id).await {
+                    eprintln!(
+                        "browser webrtc preview cleanup failed for {}: {error}",
+                        session_id.0
+                    );
+                }
+            }
+        });
+    });
+}
+
+fn stop_session_async(session_id: String, reason: &'static str) {
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Runtime::new() else {
+            eprintln!("create runtime for session cleanup failed: {session_id}");
+            return;
+        };
+
+        rt.block_on(async move {
+            use mrd_ipc::{IpcRequest, IpcResponse};
+            let mut client = mrd_ipc::client::IpcClient::new();
+            match client
+                .send_request(IpcRequest::StopSession {
+                    session_id: SessionId(session_id.clone()),
+                })
+                .await
+            {
+                Ok(IpcResponse::SessionStopped { .. }) => {}
+                Ok(IpcResponse::Error { code, message }) => {
+                    eprintln!(
+                        "stop session on {reason} failed for {session_id}: {code}: {message}"
+                    );
+                }
+                Ok(_) => {
+                    eprintln!(
+                        "stop session on {reason} returned unexpected response for {session_id}"
+                    );
+                }
+                Err(error) => {
+                    eprintln!("stop session on {reason} failed for {session_id}: {error}");
+                }
+            }
+        });
+    });
 }
 
 #[tauri::command]
@@ -280,25 +431,59 @@ fn close_remote_display_window(
     state: tauri::State<'_, AppState>,
     label: String,
 ) -> Result<(), String> {
-    state.remote_display_surfaces.lock().unwrap().configure(
-        app.get_webview_window(&label)
-            .as_ref()
-            .ok_or_else(|| format!("remote display window not found: {label}"))?,
-        NativeSurfaceRect {
-            x: 0,
-            y: 0,
-            width: 1,
-            height: 1,
-        },
-        false,
-        false,
-    )?;
+    let window = app
+        .get_webview_window(&label)
+        .ok_or_else(|| format!("remote display window not found: {label}"))?;
+    cleanup_remote_display_window(&app, state.inner(), &label, None, "window_close_command");
+    window
+        .close()
+        .map_err(|error| format!("close remote display window failed: {error}"))
+}
 
-    state
-        .render_window_registry
+#[tauri::command]
+async fn browser_webrtc_preview_start(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+    offer_sdp: String,
+    fps: Option<u32>,
+    h264_profile: Option<String>,
+) -> Result<BrowserWebrtcPreviewAnswer, String> {
+    ensure_rustls_crypto_provider();
+
+    let session_id = SessionId(session_id);
+    let fps = fps.unwrap_or(60).clamp(1, 144);
+    let h264_profile = h264_profile.unwrap_or_else(|| "baseline".to_string());
+    let encoded_access_units = state
+        .test_harness
         .lock()
         .unwrap()
-        .close_window(&app, &label)
+        .subscribe_encoded_access_units();
+    let mut host = state.webrtc_host.lock().await;
+    host.apply_remote_offer(session_id.clone(), offer_sdp)
+        .await?;
+    host.prepare_browser_h264_sender(session_id.clone(), fps, &h264_profile)
+        .await?;
+    let answer = host.create_answer(session_id.clone()).await?;
+    host.start_encoded_access_unit_sender(session_id, fps, &h264_profile, encoded_access_units)
+        .await?;
+
+    Ok(BrowserWebrtcPreviewAnswer {
+        session_id: answer.session_id.0,
+        answer_sdp: answer.sdp,
+    })
+}
+
+#[tauri::command]
+async fn browser_webrtc_preview_stop(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+) -> Result<(), String> {
+    let session_id = SessionId(session_id);
+    let mut host = state.webrtc_host.lock().await;
+    if host.snapshot(&session_id).is_some() {
+        host.close_session(&session_id).await?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -372,7 +557,26 @@ fn present_native_probe_frame(target: isize) -> Result<bool, String> {
     Ok(snapshot.attached_to_target && snapshot.uploaded_frame_count > 0)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
+fn present_native_probe_frame(target: isize) -> Result<bool, String> {
+    use mrd_render::{RenderTarget, RendererFactory};
+
+    let factory = mrd_render_d3d11::D3d11RendererFactory;
+    let mut renderer = factory
+        .create()
+        .map_err(|error| format!("create D3D11 probe renderer failed: {error}"))?;
+    renderer
+        .attach_target(RenderTarget::WindowHandle(target))
+        .map_err(|error| format!("attach D3D11 probe renderer failed: {error}"))?;
+    renderer
+        .upload_frame(build_native_probe_frame(640, 360))
+        .map_err(|error| format!("present D3D11 probe frame failed: {error}"))?;
+
+    let snapshot = renderer.snapshot();
+    Ok(snapshot.attached_to_target && snapshot.uploaded_frame_count > 0)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn present_native_probe_frame(_target: isize) -> Result<bool, String> {
     Ok(false)
 }
@@ -1256,25 +1460,32 @@ fn test_harness_get_frames(
     state: tauri::State<'_, AppState>,
     include_captured: Option<bool>,
     include_rendered: Option<bool>,
+    last_captured_generation: Option<u64>,
+    last_rendered_generation: Option<u64>,
 ) -> (
-    Option<(String, usize, usize)>,
-    Option<(String, usize, usize)>,
+    Option<(String, usize, usize, u64)>,
+    Option<(String, usize, usize, u64)>,
 ) {
-    let (captured, rendered) = state.test_harness.lock().unwrap().get_latest_frames();
     let include_captured = include_captured.unwrap_or(true);
     let include_rendered = include_rendered.unwrap_or(true);
+    let (captured, rendered) = state.test_harness.lock().unwrap().get_latest_frames_since(
+        include_captured,
+        include_rendered,
+        last_captured_generation,
+        last_rendered_generation,
+    );
 
     let captured_base64 = if include_captured {
-        captured.and_then(|(data, width, height)| {
-            encode_bgra_png_base64(&data, width, height).map(|png| (png, width, height))
+        captured.and_then(|(data, width, height, generation)| {
+            encode_bgra_png_base64(&data, width, height).map(|png| (png, width, height, generation))
         })
     } else {
         None
     };
 
     let rendered_base64 = if include_rendered {
-        rendered.and_then(|(data, width, height)| {
-            encode_bgra_png_base64(&data, width, height).map(|png| (png, width, height))
+        rendered.and_then(|(data, width, height, generation)| {
+            encode_bgra_png_base64(&data, width, height).map(|png| (png, width, height, generation))
         })
     } else {
         None
@@ -1663,6 +1874,8 @@ fn main() {
         std::sync::Arc::new(std::sync::Mutex::new(RenderWindowRegistry::default()));
     let remote_display_surfaces =
         std::sync::Arc::new(std::sync::Mutex::new(RemoteDisplaySurfaceManager::default()));
+    let webrtc_host =
+        std::sync::Arc::new(tokio::sync::Mutex::new(webrtc_host::WebrtcHost::default()));
 
     let Some(single_instance_listener) = claim_single_instance() else {
         return;
@@ -1678,6 +1891,7 @@ fn main() {
             resource_monitor,
             render_window_registry,
             remote_display_surfaces,
+            webrtc_host,
         })
         .on_menu_event(|app, event| {
             if let Some(action) = tray_action_from_menu_id(event.id().as_ref()) {
@@ -1783,6 +1997,8 @@ fn main() {
             list_remote_display_windows,
             current_remote_display_window_context,
             close_remote_display_window,
+            browser_webrtc_preview_start,
+            browser_webrtc_preview_stop,
             configure_remote_display_native_surface,
             present_test_harness_frame_on_native_surface,
             get_client_diagnostics,

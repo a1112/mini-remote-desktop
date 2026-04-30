@@ -190,6 +190,11 @@ export interface NativeRenderSurfaceSnapshot {
   rect: NativeSurfaceRect;
 }
 
+export interface BrowserWebrtcPreviewAnswer {
+  session_id: string;
+  answer_sdp: string;
+}
+
 /**
  * Test run summary
  */
@@ -560,7 +565,7 @@ export interface HarnessMetrics {
   error_message?: string;
 }
 
-export type FrameData = [string, number, number]; // [base64_data, width, height]
+export type FrameData = [string, number, number, number?]; // [base64_data, width, height, generation]
 
 /**
  * Error response shape from Tauri commands
