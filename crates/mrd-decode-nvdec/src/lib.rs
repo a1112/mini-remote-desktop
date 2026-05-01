@@ -431,13 +431,14 @@ mod imp {
     const CUDA_SUCCESS: CUresult = 0;
     const CUDA_ERROR_NO_DEVICE: CUresult = 100;
     const CUDA_VIDEO_CODEC_H264: i32 = 4;
-    const CUDA_VIDEO_CODEC_HEVC: i32 = 6;
-    const CUDA_VIDEO_CODEC_AV1: i32 = 9; // AV1 decode support (requires Ada Lovelace or newer)
+    const CUDA_VIDEO_CODEC_HEVC: i32 = 8;
+    const CUDA_VIDEO_CODEC_AV1: i32 = 11; // AV1 decode support (requires Ada Lovelace or newer)
     const CUDA_VIDEO_CHROMA_420: i32 = 1;
     const CUDA_VIDEO_CREATE_PREFER_CUVID: u32 = 0x04;
     const CUDA_VIDEO_SURFACE_NV12: i32 = 0;
     const CUDA_VIDEO_DEINTERLACE_WEAVE: i32 = 0;
     const CUVID_PKT_ENDOFPICTURE: u32 = 0x08;
+    const CUVID_PARSER_ANNEXB: u32 = 0x01;
 
     type CuInitFn = unsafe extern "system" fn(u32) -> CUresult;
     type CuDeviceGetCountFn = unsafe extern "system" fn(*mut c_int) -> CUresult;
@@ -1084,14 +1085,17 @@ mod imp {
 
             if let Some(get_caps) = cuvid.cuvid_get_decoder_caps {
                 let mut caps = CUVIDDECODECAPS {
-                    eCodecType: CUDA_VIDEO_CODEC_H264,
+                    eCodecType: parser_codec,
                     eChromaFormat: CUDA_VIDEO_CHROMA_420,
                     nBitDepthMinus8: 0,
                     ..Default::default()
                 };
                 let caps_result = unsafe { get_caps(&mut caps) };
                 if caps_result == CUDA_SUCCESS && caps.bIsSupported == 0 {
-                    return Err("cuvidGetDecoderCaps reported H264 NVDEC unsupported".to_string());
+                    return Err(format!(
+                        "cuvidGetDecoderCaps reported {} NVDEC unsupported",
+                        describe_codec(parser_codec)
+                    ));
                 }
             }
 
@@ -1162,13 +1166,13 @@ mod imp {
                 ulClockRate: 10_000_000,
                 ulErrorThreshold: 0,
                 ulMaxDisplayDelay: 0,
-                bitfields: 0,
+                bitfields: parser_flags(parser_codec),
                 uReserved1: [0; 4],
                 pUserData: callback_state.as_mut() as *mut CallbackState as *mut c_void,
                 pfnSequenceCallback: Some(sequence_callback),
                 pfnDecodePicture: Some(decode_callback),
                 pfnDisplayPicture: Some(display_callback),
-                pfnGetOperatingPoint: None,
+                pfnGetOperatingPoint: operating_point_callback_for(parser_codec),
                 pvReserved2: [ptr::null_mut(); 6],
                 pExtVideoInfo: ptr::null_mut(),
             };
@@ -1232,12 +1236,19 @@ mod imp {
 
             self.callback_state.clear_access_unit_state();
 
-            let payload_size = u32::try_from(access_unit.len())
+            let converted_access_unit = if self.parser_codec == CUDA_VIDEO_CODEC_AV1 {
+                av1_low_overhead_obu_to_annexb(access_unit)
+            } else {
+                None
+            };
+            let packet_payload = converted_access_unit.as_deref().unwrap_or(access_unit);
+
+            let payload_size = u32::try_from(packet_payload.len())
                 .map_err(|_| "access unit too large for NVDEC packet".to_string())?;
             let mut packet = CUVIDSOURCEDATAPACKET {
                 flags: CUVID_PKT_ENDOFPICTURE,
                 payload_size,
-                payload: access_unit.as_ptr(),
+                payload: packet_payload.as_ptr(),
                 timestamp: 0,
             };
 
@@ -1816,6 +1827,19 @@ mod imp {
         }
 
         next_sequence.min_decode_surfaces.max(1) as c_int
+    }
+
+    unsafe extern "system" fn av1_operating_point_callback(
+        _user_data: *mut c_void,
+        _operating_point_info: *mut c_void,
+    ) -> c_int {
+        0
+    }
+
+    fn operating_point_callback_for(
+        codec: i32,
+    ) -> Option<unsafe extern "system" fn(*mut c_void, *mut c_void) -> c_int> {
+        (codec == CUDA_VIDEO_CODEC_AV1).then_some(av1_operating_point_callback)
     }
 
     unsafe extern "system" fn decode_callback(
@@ -2478,6 +2502,92 @@ mod imp {
         }
     }
 
+    fn parser_flags(codec: i32) -> u32 {
+        if codec == CUDA_VIDEO_CODEC_AV1 {
+            CUVID_PARSER_ANNEXB
+        } else {
+            0
+        }
+    }
+
+    fn av1_low_overhead_obu_to_annexb(buf: &[u8]) -> Option<Vec<u8>> {
+        let mut offset = 0_usize;
+        let mut frame_unit = Vec::with_capacity(buf.len() + 16);
+        while offset < buf.len() {
+            let header_offset = offset;
+            let header = *buf.get(offset)?;
+            if header & 0x80 != 0 || header & 0x01 != 0 {
+                return None;
+            }
+            offset += 1;
+
+            let has_extension = header & 0x04 != 0;
+            if has_extension {
+                buf.get(offset)?;
+                offset += 1;
+            }
+
+            if header & 0x02 == 0 {
+                return None;
+            }
+
+            let (payload_len, size_len) = read_leb128(&buf[offset..])?;
+            offset = offset.checked_add(size_len)?;
+            let payload_len = usize::try_from(payload_len).ok()?;
+            let payload_end = offset.checked_add(payload_len)?;
+            if payload_end > buf.len() {
+                return None;
+            }
+
+            let header_len = 1 + usize::from(has_extension);
+            write_leb128((header_len + payload_len) as u64, &mut frame_unit);
+            frame_unit.push(header & !0x02);
+            if has_extension {
+                frame_unit.push(buf[header_offset + 1]);
+            }
+            frame_unit.extend_from_slice(&buf[offset..payload_end]);
+            offset = payload_end;
+        }
+
+        if frame_unit.is_empty() {
+            return None;
+        }
+
+        let mut temporal_unit = Vec::with_capacity(frame_unit.len() + 8);
+        write_leb128(frame_unit.len() as u64, &mut temporal_unit);
+        temporal_unit.extend_from_slice(&frame_unit);
+
+        let mut out = Vec::with_capacity(temporal_unit.len() + 8);
+        write_leb128(temporal_unit.len() as u64, &mut out);
+        out.extend_from_slice(&temporal_unit);
+        Some(out)
+    }
+
+    fn read_leb128(buf: &[u8]) -> Option<(u64, usize)> {
+        let mut value = 0_u64;
+        for (i, byte) in buf.iter().take(8).enumerate() {
+            value |= u64::from(byte & 0x7f) << (i * 7);
+            if byte & 0x80 == 0 {
+                return Some((value, i + 1));
+            }
+        }
+        None
+    }
+
+    fn write_leb128(mut value: u64, out: &mut Vec<u8>) {
+        loop {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if value == 0 {
+                break;
+            }
+        }
+    }
+
     fn looks_like_annexb(buf: &[u8]) -> bool {
         buf.len() >= 4
             && ((buf[0] == 0 && buf[1] == 0 && buf[2] == 1)
@@ -2526,7 +2636,8 @@ mod imp {
         use super::{
             decoder_output_dimensions, evaluate_support, DecoderConfig, NvdecCapabilityRequest,
             NvdecCodec, NvdecSupportDecision, NvdecSupportRequest, SequenceChangeDecision,
-            SequenceFormat, CUDA_VIDEO_CHROMA_420, CUDA_VIDEO_CODEC_H264,
+            SequenceFormat, CUDA_VIDEO_CHROMA_420, CUDA_VIDEO_CODEC_AV1, CUDA_VIDEO_CODEC_H264,
+            CUDA_VIDEO_CODEC_HEVC, CUVID_PARSER_ANNEXB,
         };
 
         fn baseline_sequence() -> SequenceFormat {
@@ -2574,6 +2685,31 @@ mod imp {
             };
 
             assert_eq!(evaluate_support(request), NvdecSupportDecision::Supported);
+        }
+
+        #[test]
+        fn av1_parser_uses_annex_b_and_operating_point_callback() {
+            assert_eq!(
+                super::parser_flags(CUDA_VIDEO_CODEC_AV1),
+                CUVID_PARSER_ANNEXB
+            );
+            assert!(super::operating_point_callback_for(CUDA_VIDEO_CODEC_AV1).is_some());
+            assert_eq!(super::parser_flags(CUDA_VIDEO_CODEC_H264), 0);
+            assert!(super::operating_point_callback_for(CUDA_VIDEO_CODEC_H264).is_none());
+        }
+
+        #[test]
+        fn nvdecode_codec_constants_match_sdk_enum_order() {
+            assert_eq!(CUDA_VIDEO_CODEC_H264, 4);
+            assert_eq!(CUDA_VIDEO_CODEC_HEVC, 8);
+            assert_eq!(CUDA_VIDEO_CODEC_AV1, 11);
+        }
+
+        #[test]
+        fn av1_low_overhead_obu_converts_to_annex_b_temporal_unit() {
+            let low_overhead = [0x12, 0x00, 0x0a, 0x01, 0xaa];
+            let annexb = super::av1_low_overhead_obu_to_annexb(&low_overhead).unwrap();
+            assert_eq!(annexb, vec![0x06, 0x05, 0x01, 0x10, 0x02, 0x08, 0xaa]);
         }
 
         #[test]

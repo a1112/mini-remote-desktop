@@ -243,6 +243,10 @@ impl D3d11Renderer {
             RenderFrameData::Rgb24(data) => data,
             RenderFrameData::Bgra32(data) => data,
             #[cfg(windows)]
+            RenderFrameData::D3D11SharedBgra { .. } => {
+                return [0.05, 0.05, 0.05, 1.0];
+            }
+            #[cfg(windows)]
             RenderFrameData::D3D11SharedNv12 { .. } => {
                 return [0.05, 0.05, 0.05, 1.0];
             }
@@ -644,14 +648,12 @@ impl D3d11Renderer {
     }
 
     #[cfg(windows)]
-    fn open_shared_texture_srv(
+    fn open_shared_texture(
         &self,
         shared_handle: isize,
-    ) -> Result<windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView, RenderError> {
+    ) -> Result<windows::Win32::Graphics::Direct3D11::ID3D11Texture2D, RenderError> {
         use windows::Win32::Foundation::HANDLE;
-        use windows::Win32::Graphics::Direct3D11::{
-            ID3D11Resource, ID3D11ShaderResourceView, ID3D11Texture2D,
-        };
+        use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 
         if shared_handle == 0 {
             return Err(RenderError::Message("shared texture handle is zero".into()));
@@ -665,8 +667,17 @@ impl D3d11Renderer {
                     RenderError::Message(format!("open shared D3D11 texture failed: {error}"))
                 })?;
         }
-        let texture =
-            texture.ok_or_else(|| RenderError::Message("missing shared texture".into()))?;
+        texture.ok_or_else(|| RenderError::Message("missing shared texture".into()))
+    }
+
+    #[cfg(windows)]
+    fn open_shared_texture_srv(
+        &self,
+        shared_handle: isize,
+    ) -> Result<windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView, RenderError> {
+        use windows::Win32::Graphics::Direct3D11::{ID3D11Resource, ID3D11ShaderResourceView};
+
+        let texture = self.open_shared_texture(shared_handle)?;
         let resource: ID3D11Resource = texture.cast().map_err(|error| {
             RenderError::Message(format!("cast shared texture to resource failed: {error}"))
         })?;
@@ -680,6 +691,75 @@ impl D3d11Renderer {
                 })?;
         }
         srv.ok_or_else(|| RenderError::Message("missing shared texture SRV".into()))
+    }
+
+    #[cfg(windows)]
+    fn present_shared_bgra_frame(&self, frame: &RenderFrame) -> Result<(), RenderError> {
+        use mrd_render::RenderFrameData;
+        use windows::Win32::Graphics::Direct3D11::{ID3D11Resource, D3D11_BOX};
+
+        let Some(surface) = self.surface.as_ref() else {
+            return Ok(());
+        };
+
+        let shared_handle = match &frame.data {
+            RenderFrameData::D3D11SharedBgra { shared_handle, .. } => *shared_handle,
+            _ => {
+                return Err(RenderError::Message(
+                    "Expected D3D11SharedBgra frame data".into(),
+                ))
+            }
+        };
+
+        let source_texture = self.open_shared_texture(shared_handle)?;
+        let source_resource: ID3D11Resource = source_texture.cast().map_err(|error| {
+            RenderError::Message(format!(
+                "cast shared BGRA texture to resource failed: {error}"
+            ))
+        })?;
+        let target_resource: ID3D11Resource = surface.back_buffer.cast().map_err(|error| {
+            RenderError::Message(format!("cast back buffer to resource failed: {error}"))
+        })?;
+
+        let copy_width = frame.width.min(surface.width as usize);
+        let copy_height = frame.height.min(surface.height as usize);
+        if copy_width == 0 || copy_height == 0 {
+            return Ok(());
+        }
+
+        unsafe {
+            self.context
+                .OMSetRenderTargets(Some(&[Some(surface.render_target_view.clone())]), None);
+            if frame.width == surface.width as usize && frame.height == surface.height as usize {
+                self.context
+                    .CopyResource(&target_resource, &source_resource);
+            } else {
+                let source_box = D3D11_BOX {
+                    left: 0,
+                    top: 0,
+                    front: 0,
+                    right: copy_width as u32,
+                    bottom: copy_height as u32,
+                    back: 1,
+                };
+                self.context.CopySubresourceRegion(
+                    &target_resource,
+                    0,
+                    0,
+                    0,
+                    0,
+                    &source_resource,
+                    0,
+                    Some(&source_box),
+                );
+            }
+            surface
+                .swap_chain
+                .Present(0, 0)
+                .ok()
+                .map_err(|error| RenderError::Message(format!("present 失败: {error}")))?;
+        }
+        Ok(())
     }
 
     #[cfg(windows)]
@@ -791,6 +871,16 @@ impl RendererInstance for D3d11Renderer {
                 }
             }
             #[cfg(windows)]
+            RenderFrameData::D3D11SharedBgra { .. } =>
+            {
+                #[cfg(windows)]
+                if self.surface.is_some() {
+                    self.present_shared_bgra_frame(&frame)?;
+                } else {
+                    self.present_clear_frame(&frame)?;
+                }
+            }
+            #[cfg(windows)]
             RenderFrameData::D3D11SharedNv12 { .. } =>
             {
                 #[cfg(windows)]
@@ -844,6 +934,24 @@ mod tests {
         assert_eq!(snapshot.last_width, 16);
         assert_eq!(snapshot.last_height, 16);
         assert_eq!(snapshot.last_pixel_format, Some(RenderPixelFormat::Rgb24));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn d3d11_renderer_tracks_shared_bgra_upload_without_cpu_readback() {
+        let factory = D3d11RendererFactory;
+        let mut renderer = factory.create().expect("d3d11 renderer");
+
+        renderer
+            .upload_frame(RenderFrame::from_d3d11_shared_bgra(16, 16, 42, 16 * 4))
+            .expect("upload shared bgra frame");
+
+        let snapshot = renderer.snapshot();
+        assert_eq!(snapshot.uploaded_frame_count, 1);
+        assert_eq!(
+            snapshot.last_pixel_format,
+            Some(RenderPixelFormat::D3D11SharedBgra)
+        );
     }
 
     #[cfg(not(windows))]

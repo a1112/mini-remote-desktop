@@ -58,6 +58,12 @@ const CAPTURE_OPTIONS: CaptureOption[] = [
 
 const ENCODER_OPTIONS: EncoderOption[] = [
   {
+    id: "none",
+    name: "直连渲染",
+    description: "跳过编码 - 采集帧直接进入渲染器",
+    icon: <Monitor className="h-5 w-5" />,
+  },
+  {
     id: "nvenc_h264",
     name: "NVENC H.264",
     description: "NVIDIA 硬件编码器 - 低延迟高质量",
@@ -84,6 +90,11 @@ const ENCODER_OPTIONS: EncoderOption[] = [
 ];
 
 const DECODER_OPTIONS: DecoderOption[] = [
+  {
+    id: "none",
+    name: "无解码",
+    description: "encode-only 或直接渲染链路",
+  },
   {
     id: "nvdec",
     name: "NVDEC",
@@ -147,6 +158,7 @@ export function CustomTestPage() {
   const isCaptureAvailable = (capture: CaptureId) =>
     capabilityAvailable(capabilities, "available_captures", capture, capture === "synthetic");
   const isEncoderAvailable = (encoder: EncoderId) =>
+    encoder === "none" ||
     capabilityAvailable(capabilities, "available_encoders", encoder, encoder === "openh264");
   const isDecoderAvailable = (decoder: DecoderId) =>
     decoder === "none" ||
@@ -162,6 +174,9 @@ export function CustomTestPage() {
     if (!isEncoderAvailable(selectedEncoder)) {
       const nextEncoder = ENCODER_OPTIONS.find((option) => isEncoderAvailable(option.id));
       if (nextEncoder) setSelectedEncoder(nextEncoder.id);
+    }
+    if (selectedEncoder === "none" && selectedDecoder !== "none") {
+      setSelectedDecoder("none");
     }
     if (!isDecoderAvailable(selectedDecoder)) {
       const nextDecoder = DECODER_OPTIONS.find((option) => isDecoderAvailable(option.id));
@@ -183,6 +198,9 @@ export function CustomTestPage() {
       return selectedDecoder === "videotoolbox"
         ? "VideoToolbox 解码当前为实验路径，需显式启用后才可测试。"
         : "当前平台未暴露所选解码能力。";
+    }
+    if (selectedEncoder === "none" && selectedDecoder !== "none") {
+      return "直接渲染链路不经过码流，请选择无解码。";
     }
     if (selectedEncoder === "nvenc_av1" && selectedDecoder === "software") {
       return "NVENC AV1 当前只支持 NVDEC 或 encode-only 链路，软件 AV1 解码链路尚未接入。";
@@ -215,7 +233,13 @@ export function CustomTestPage() {
       encoder_type: selectedEncoder,
       decoder_type: selectedDecoder,
       renderer_type: useMacosRenderer ? "macos" : "d3d11",
-      render_display: useMacosRenderer ? true : undefined,
+      render_display: true,
+      zero_copy:
+        !useMacosRenderer &&
+        selectedCapture !== "synthetic" &&
+        (selectedEncoder === "none" || selectedEncoder.startsWith("nvenc"))
+          ? true
+          : undefined,
       resolution: (() => {
         const resolution = RESOLUTIONS.find((r) => r.id === selectedResolution)!;
         return [resolution.width, resolution.height] as [number, number];

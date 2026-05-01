@@ -4,6 +4,9 @@ pub use mrd_pipeline_core::RuntimeStatus;
 pub enum RenderPixelFormat {
     Rgb24,
     Bgra32,
+    /// D3D11 shared BGRA texture (zero-copy direct capture-render path)
+    #[cfg(windows)]
+    D3D11SharedBgra,
     /// D3D11 shared NV12 texture (zero-copy path)
     #[cfg(windows)]
     D3D11SharedNv12,
@@ -18,6 +21,14 @@ pub enum RenderFrameData {
     Rgb24(Vec<u8>),
     /// CPU BGRA32 data
     Bgra32(Vec<u8>),
+    /// D3D11 shared texture handle (zero-copy path)
+    #[cfg(windows)]
+    D3D11SharedBgra {
+        shared_handle: isize,
+        width: u32,
+        height: u32,
+        row_pitch: u32,
+    },
     /// D3D11 shared texture handle (zero-copy path)
     #[cfg(windows)]
     D3D11SharedNv12 {
@@ -54,6 +65,27 @@ impl RenderFrame {
             height,
             pixel_format: RenderPixelFormat::Bgra32,
             data: RenderFrameData::Bgra32(data),
+        }
+    }
+
+    /// Create a frame from a D3D11 shared BGRA texture
+    #[cfg(windows)]
+    pub fn from_d3d11_shared_bgra(
+        width: usize,
+        height: usize,
+        shared_handle: isize,
+        row_pitch: u32,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            pixel_format: RenderPixelFormat::D3D11SharedBgra,
+            data: RenderFrameData::D3D11SharedBgra {
+                shared_handle,
+                width: width as u32,
+                height: height as u32,
+                row_pitch,
+            },
         }
     }
 
@@ -98,9 +130,28 @@ impl RenderFrame {
     #[cfg(windows)]
     pub fn shared_handle(&self) -> Option<isize> {
         match &self.data {
+            RenderFrameData::D3D11SharedBgra { shared_handle, .. } => Some(*shared_handle),
             RenderFrameData::D3D11SharedNv12 {
                 shared_handle_y, ..
             } => Some(*shared_handle_y),
+            _ => None,
+        }
+    }
+
+    /// Get the shared BGRA texture handle if available.
+    #[cfg(windows)]
+    pub fn shared_bgra_handle(&self) -> Option<isize> {
+        match &self.data {
+            RenderFrameData::D3D11SharedBgra { shared_handle, .. } => Some(*shared_handle),
+            _ => None,
+        }
+    }
+
+    /// Get the shared BGRA texture row pitch if available.
+    #[cfg(windows)]
+    pub fn shared_bgra_row_pitch(&self) -> Option<u32> {
+        match &self.data {
+            RenderFrameData::D3D11SharedBgra { row_pitch, .. } => Some(*row_pitch),
             _ => None,
         }
     }
@@ -121,6 +172,8 @@ impl RenderFrame {
     /// Check if this frame uses shared texture (zero-copy)
     pub fn is_shared_texture(&self) -> bool {
         match &self.data {
+            #[cfg(windows)]
+            RenderFrameData::D3D11SharedBgra { .. } => true,
             #[cfg(windows)]
             RenderFrameData::D3D11SharedNv12 { .. } => true,
             _ => false,
@@ -172,6 +225,8 @@ const SUPPORTED_FORMATS: &[RenderPixelFormat] = &[
     RenderPixelFormat::Rgb24,
     RenderPixelFormat::Bgra32,
     #[cfg(windows)]
+    RenderPixelFormat::D3D11SharedBgra,
+    #[cfg(windows)]
     RenderPixelFormat::D3D11SharedNv12,
 ];
 
@@ -203,5 +258,20 @@ mod tests {
         assert!(descriptor
             .supported_formats
             .contains(&RenderPixelFormat::D3D11SharedNv12));
+        #[cfg(windows)]
+        assert!(descriptor
+            .supported_formats
+            .contains(&RenderPixelFormat::D3D11SharedBgra));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn d3d11_shared_bgra_frame_is_zero_copy_render_data() {
+        let frame = super::RenderFrame::from_d3d11_shared_bgra(1280, 720, 42, 1280 * 4);
+
+        assert_eq!(frame.pixel_format, RenderPixelFormat::D3D11SharedBgra);
+        assert!(frame.is_shared_texture());
+        assert_eq!(frame.shared_handle(), Some(42));
+        assert_eq!(frame.shared_bgra_handle(), Some(42));
     }
 }

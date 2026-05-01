@@ -18,6 +18,7 @@ use mrd_encode_nvenc::NvencH264Encoder;
 #[cfg(windows)]
 use mrd_encode_nvenc_av1::NvencAv1Encoder;
 use mrd_encode_openh264::OpenH264Encoder;
+use mrd_observability::PipelineComparisonResult;
 use mrd_pipeline_core::{
     CapturedFrame, DecodedFrame, DecodedFrameData, EncodedAccessUnit, FrameCapture,
     FramePixelFormat, VideoCodec, VideoDecoder, VideoEncoder,
@@ -203,20 +204,59 @@ impl Default for TestChain {
 pub struct HarnessMetrics {
     pub is_running: bool,
     pub capture_fps: f64,
+    pub capture_latency_avg_ms: f64,
     pub capture_latency_p50_ms: f64,
     pub capture_latency_p95_ms: f64,
+    pub encode_latency_avg_ms: f64,
     pub encode_latency_p50_ms: f64,
     pub encode_latency_p95_ms: f64,
+    pub transport_latency_avg_ms: f64,
     pub transport_latency_p50_ms: f64,
     pub transport_latency_p95_ms: f64,
+    pub decode_latency_avg_ms: f64,
     pub decode_latency_p50_ms: f64,
     pub decode_latency_p95_ms: f64,
+    pub render_latency_avg_ms: f64,
+    pub present_latency_avg_ms: f64,
+    pub total_latency_avg_ms: f64,
     pub total_latency_p50_ms: f64,
     pub total_latency_p95_ms: f64,
     pub frame_count: usize,
+    pub encoded_units: usize,
+    pub decoded_frames: usize,
+    pub encode_failures: usize,
+    pub decode_failures: usize,
+    pub total_bitstream_bytes: usize,
     pub dropped_frames: usize,
     pub resolution: (usize, usize),
     pub error_message: Option<String>,
+}
+
+impl HarnessMetrics {
+    pub fn to_pipeline_comparison_result(
+        &self,
+        pipeline: impl Into<String>,
+        codec: impl Into<String>,
+        memory_path: impl Into<String>,
+    ) -> PipelineComparisonResult {
+        PipelineComparisonResult::new(pipeline, codec)
+            .with_memory_path(memory_path)
+            .with_counts(
+                self.frame_count as u64,
+                self.encoded_units as u64,
+                self.decoded_frames as u64,
+                self.encode_failures as u64,
+                self.decode_failures as u64,
+            )
+            .with_average_stage_ms(
+                nonzero_ms(self.capture_latency_avg_ms),
+                nonzero_ms(self.encode_latency_avg_ms),
+                nonzero_ms(self.decode_latency_avg_ms),
+                nonzero_ms(self.render_latency_avg_ms),
+                nonzero_ms(self.present_latency_avg_ms),
+            )
+            .with_total_bitstream_bytes(self.total_bitstream_bytes as u64)
+    }
 }
 
 impl Default for HarnessMetrics {
@@ -224,17 +264,29 @@ impl Default for HarnessMetrics {
         Self {
             is_running: false,
             capture_fps: 0.0,
+            capture_latency_avg_ms: 0.0,
             capture_latency_p50_ms: 0.0,
             capture_latency_p95_ms: 0.0,
+            encode_latency_avg_ms: 0.0,
             encode_latency_p50_ms: 0.0,
             encode_latency_p95_ms: 0.0,
+            transport_latency_avg_ms: 0.0,
             transport_latency_p50_ms: 0.0,
             transport_latency_p95_ms: 0.0,
+            decode_latency_avg_ms: 0.0,
             decode_latency_p50_ms: 0.0,
             decode_latency_p95_ms: 0.0,
+            render_latency_avg_ms: 0.0,
+            present_latency_avg_ms: 0.0,
+            total_latency_avg_ms: 0.0,
             total_latency_p50_ms: 0.0,
             total_latency_p95_ms: 0.0,
             frame_count: 0,
+            encoded_units: 0,
+            decoded_frames: 0,
+            encode_failures: 0,
+            decode_failures: 0,
+            total_bitstream_bytes: 0,
             dropped_frames: 0,
             resolution: (0, 0),
             error_message: None,
@@ -409,9 +461,9 @@ impl PipelineTransport {
 impl PipelineDecoder {
     fn push_access_unit(&mut self, bytes: &[u8]) -> Result<()> {
         match self {
-            Self::Nvdec(decoder) => decoder
-                .push_access_unit(bytes)
-                .map_err(|error| anyhow::anyhow!(error)),
+            Self::Nvdec(decoder) => decoder.push_access_unit(bytes).map_err(|error| {
+                anyhow::anyhow!("{}; diagnostics={:?}", error, decoder.diagnostics())
+            }),
             Self::Software(decoder) => decoder
                 .push_access_unit(bytes)
                 .map_err(|error| anyhow::anyhow!(error)),
@@ -1404,11 +1456,6 @@ impl TestHarness {
                     }
                 }
                 EncoderType::NvencAv1 => {
-                    if use_shared_texture_decode {
-                        return Err(anyhow::anyhow!(
-                            "NVENC AV1 D3D11 shared input path is not implemented"
-                        ));
-                    }
                     #[cfg(windows)]
                     {
                         let enc =
@@ -1420,12 +1467,15 @@ impl TestHarness {
                                 (Some(Box::new(enc) as Box<dyn VideoEncoder>), None, false)
                             }
                             DecoderType::Nvdec => {
-                                let dec = NvdecDecoder::new_av1_with_output_mode(
+                                let mut dec = NvdecDecoder::new_av1_with_output_mode(
                                     NvdecOutputMode::CpuNv12,
                                 )
                                 .map_err(|e| {
                                     anyhow::anyhow!("NVDEC AV1 decoder init failed: {:?}", e)
                                 })?;
+                                if use_shared_texture_decode {
+                                    enable_nvdec_shared_texture(&mut dec);
+                                }
                                 (
                                     Some(Box::new(enc) as Box<dyn VideoEncoder>),
                                     Some(PipelineDecoder::Nvdec(dec)),
@@ -1489,9 +1539,18 @@ impl TestHarness {
         let mut encode_latencies = Vec::with_capacity(1000);
         let mut transport_latencies = Vec::with_capacity(1000);
         let mut decode_latencies = Vec::with_capacity(1000);
+        let mut render_latencies = Vec::with_capacity(1000);
         let mut total_latencies = Vec::with_capacity(1000);
         let mut frame_count = 0_usize;
         let mut dropped_frames = 0_usize;
+        let mut encoded_units_total = 0_usize;
+        let mut decoded_frames_total = 0_usize;
+        let mut encode_failures = 0_usize;
+        let mut decode_failures = 0_usize;
+        let mut total_bitstream_bytes = 0_usize;
+        let mut last_decode_error = None::<String>;
+        let dump_first_access_unit_path = std::env::var("MRD_HARNESS_DUMP_FIRST_ACCESS_UNIT").ok();
+        let mut dumped_first_access_unit = false;
         let update_web_preview = state.renderer.is_none();
 
         while running.load(Ordering::Relaxed) {
@@ -1518,12 +1577,30 @@ impl TestHarness {
                 let encode_start = Instant::now();
                 let encoded_units = match encoder.encode(frame_for_encode) {
                     Ok(units) => units,
-                    Err(_) => {
+                    Err(error) => {
+                        encode_failures += 1;
                         dropped_frames += 1;
+                        {
+                            let mut m = metrics.lock().unwrap();
+                            m.error_message = Some(format!("encode failed: {error}"));
+                        }
                         thread::sleep(Duration::from_millis(1));
                         continue;
                     }
                 };
+                encoded_units_total += encoded_units.len();
+                total_bitstream_bytes += encoded_units
+                    .iter()
+                    .map(|unit| unit.bytes.len())
+                    .sum::<usize>();
+                if !dumped_first_access_unit {
+                    if let (Some(path), Some(unit)) =
+                        (dump_first_access_unit_path.as_ref(), encoded_units.first())
+                    {
+                        let _ = std::fs::write(path, &unit.bytes);
+                        dumped_first_access_unit = true;
+                    }
+                }
                 (encoded_units, Some(encode_start.elapsed()))
             } else {
                 (Vec::new(), None)
@@ -1557,15 +1634,23 @@ impl TestHarness {
                             Ok(()) => {
                                 pushed_any = true;
                                 decoded_frames = decoder.drain_decoded_frames();
+                                decoded_frames_total += decoded_frames.len();
                                 if !decoded_frames.is_empty() {
                                     break;
                                 }
                             }
-                            Err(_) => {
+                            Err(error) => {
+                                let message = error.to_string();
+                                if last_decode_error.as_deref() != Some(message.as_str()) {
+                                    last_decode_error = Some(message.clone());
+                                    let mut m = metrics.lock().unwrap();
+                                    m.error_message = Some(format!("decode failed: {message}"));
+                                }
                                 failed_units += 1;
                             }
                         }
                     }
+                    decode_failures += failed_units;
 
                     if !pushed_any {
                         if failed_units > 0 {
@@ -1597,14 +1682,19 @@ impl TestHarness {
                 None
             };
 
-            if let (Some(renderer), Some(input)) = (state.renderer.as_mut(), render_input) {
-                if let Err(error) = renderer.submit_frame(input) {
-                    let mut m = metrics.lock().unwrap();
-                    m.error_message = Some(error.to_string());
-                    running.store(false, Ordering::Relaxed);
-                    break;
-                }
-            }
+            let render_latency =
+                if let (Some(renderer), Some(input)) = (state.renderer.as_mut(), render_input) {
+                    let render_start = Instant::now();
+                    if let Err(error) = renderer.submit_frame(input) {
+                        let mut m = metrics.lock().unwrap();
+                        m.error_message = Some(error.to_string());
+                        running.store(false, Ordering::Relaxed);
+                        break;
+                    }
+                    Some(render_start.elapsed())
+                } else {
+                    None
+                };
 
             capture_latencies.push(capture_latency);
             if let Some(latency) = encode_latency {
@@ -1616,6 +1706,9 @@ impl TestHarness {
             if let Some(latency) = decode_latency {
                 decode_latencies.push(latency);
             }
+            if let Some(latency) = render_latency {
+                render_latencies.push(latency);
+            }
             total_latencies.push(pipeline_start.elapsed());
 
             Self::trim_latency_buffers(
@@ -1623,6 +1716,7 @@ impl TestHarness {
                 &mut encode_latencies,
                 &mut transport_latencies,
                 &mut decode_latencies,
+                &mut render_latencies,
                 &mut total_latencies,
             );
 
@@ -1661,11 +1755,17 @@ impl TestHarness {
                     &metrics,
                     frame_count,
                     dropped_frames,
+                    encoded_units_total,
+                    decoded_frames_total,
+                    encode_failures,
+                    decode_failures,
+                    total_bitstream_bytes,
                     &start_time,
                     &capture_latencies,
                     &encode_latencies,
                     &transport_latencies,
                     &decode_latencies,
+                    &render_latencies,
                     &total_latencies,
                 );
             }
@@ -1675,11 +1775,17 @@ impl TestHarness {
             &metrics,
             frame_count,
             dropped_frames,
+            encoded_units_total,
+            decoded_frames_total,
+            encode_failures,
+            decode_failures,
+            total_bitstream_bytes,
             &start_time,
             &capture_latencies,
             &encode_latencies,
             &transport_latencies,
             &decode_latencies,
+            &render_latencies,
             &total_latencies,
         );
 
@@ -1691,11 +1797,17 @@ impl TestHarness {
         metrics: &Arc<Mutex<HarnessMetrics>>,
         frame_count: usize,
         dropped_frames: usize,
+        encoded_units: usize,
+        decoded_frames: usize,
+        encode_failures: usize,
+        decode_failures: usize,
+        total_bitstream_bytes: usize,
         start_time: &Instant,
         capture_latencies: &[Duration],
         encode_latencies: &[Duration],
         transport_latencies: &[Duration],
         decode_latencies: &[Duration],
+        render_latencies: &[Duration],
         total_latencies: &[Duration],
     ) {
         let elapsed = start_time.elapsed().as_secs_f64();
@@ -1705,24 +1817,41 @@ impl TestHarness {
             0.0
         };
 
+        let avg_cap = Self::compute_average(capture_latencies);
         let (p50_cap, p95_cap) = Self::compute_percentiles(capture_latencies);
+        let avg_enc = Self::compute_average(encode_latencies);
         let (p50_enc, p95_enc) = Self::compute_percentiles(encode_latencies);
+        let avg_transport = Self::compute_average(transport_latencies);
         let (p50_transport, p95_transport) = Self::compute_percentiles(transport_latencies);
+        let avg_dec = Self::compute_average(decode_latencies);
         let (p50_dec, p95_dec) = Self::compute_percentiles(decode_latencies);
+        let avg_render = Self::compute_average(render_latencies);
+        let avg_total = Self::compute_average(total_latencies);
         let (p50_total, p95_total) = Self::compute_percentiles(total_latencies);
 
         let mut m = metrics.lock().unwrap();
         m.capture_fps = fps;
         m.frame_count = frame_count;
+        m.encoded_units = encoded_units;
+        m.decoded_frames = decoded_frames;
+        m.encode_failures = encode_failures;
+        m.decode_failures = decode_failures;
+        m.total_bitstream_bytes = total_bitstream_bytes;
         m.dropped_frames = dropped_frames;
+        m.capture_latency_avg_ms = avg_cap.as_secs_f64() * 1000.0;
         m.capture_latency_p50_ms = p50_cap.as_secs_f64() * 1000.0;
         m.capture_latency_p95_ms = p95_cap.as_secs_f64() * 1000.0;
+        m.encode_latency_avg_ms = avg_enc.as_secs_f64() * 1000.0;
         m.encode_latency_p50_ms = p50_enc.as_secs_f64() * 1000.0;
         m.encode_latency_p95_ms = p95_enc.as_secs_f64() * 1000.0;
+        m.transport_latency_avg_ms = avg_transport.as_secs_f64() * 1000.0;
         m.transport_latency_p50_ms = p50_transport.as_secs_f64() * 1000.0;
         m.transport_latency_p95_ms = p95_transport.as_secs_f64() * 1000.0;
+        m.decode_latency_avg_ms = avg_dec.as_secs_f64() * 1000.0;
         m.decode_latency_p50_ms = p50_dec.as_secs_f64() * 1000.0;
         m.decode_latency_p95_ms = p95_dec.as_secs_f64() * 1000.0;
+        m.render_latency_avg_ms = avg_render.as_secs_f64() * 1000.0;
+        m.total_latency_avg_ms = avg_total.as_secs_f64() * 1000.0;
         m.total_latency_p50_ms = p50_total.as_secs_f64() * 1000.0;
         m.total_latency_p95_ms = p95_total.as_secs_f64() * 1000.0;
     }
@@ -1755,11 +1884,20 @@ impl TestHarness {
         (sorted[p50_idx], sorted[p95_idx])
     }
 
+    fn compute_average(latencies: &[Duration]) -> Duration {
+        if latencies.is_empty() {
+            return Duration::ZERO;
+        }
+        let total_nanos = latencies.iter().map(Duration::as_nanos).sum::<u128>();
+        Duration::from_nanos((total_nanos / latencies.len() as u128).min(u64::MAX as u128) as u64)
+    }
+
     fn trim_latency_buffers(
         capture_latencies: &mut Vec<Duration>,
         encode_latencies: &mut Vec<Duration>,
         transport_latencies: &mut Vec<Duration>,
         decode_latencies: &mut Vec<Duration>,
+        render_latencies: &mut Vec<Duration>,
         total_latencies: &mut Vec<Duration>,
     ) {
         if capture_latencies.len() > 1000 {
@@ -1773,6 +1911,9 @@ impl TestHarness {
         }
         if decode_latencies.len() > 1000 {
             decode_latencies.remove(0);
+        }
+        if render_latencies.len() > 1000 {
+            render_latencies.remove(0);
         }
         if total_latencies.len() > 1000 {
             total_latencies.remove(0);
@@ -1796,6 +1937,17 @@ impl TestHarness {
 
     pub fn get_metrics(&self) -> HarnessMetrics {
         self.metrics.lock().unwrap().clone()
+    }
+
+    pub fn get_pipeline_comparison_result(&self) -> PipelineComparisonResult {
+        let metrics = self.get_metrics();
+        let (pipeline, codec) = comparison_labels(&self.chain);
+        let memory_path = if self.config.zero_copy.unwrap_or(false) {
+            "d3d11-shared"
+        } else {
+            "cpu"
+        };
+        metrics.to_pipeline_comparison_result(pipeline, codec, memory_path)
     }
 
     pub fn get_latest_frames_since(
@@ -1902,6 +2054,44 @@ fn videotoolbox_decoder_enabled() -> bool {
     )
 }
 
+fn nonzero_ms(value: f64) -> Option<f64> {
+    (value > 0.0).then_some(value)
+}
+
+fn comparison_labels(chain: &TestChain) -> (&'static str, &'static str) {
+    match chain {
+        TestChain::CaptureOnly => ("capture-render", "none"),
+        TestChain::NvencOnly => ("capture-encode", "h264"),
+        TestChain::NvencNvdec => ("capture-encode-decode-render", "h264"),
+        TestChain::OpenH264 => ("capture-encode", "h264"),
+        TestChain::Custom {
+            encoder, decoder, ..
+        } => {
+            let pipeline = match (encoder, decoder) {
+                (EncoderType::None, _) => "capture-render",
+                (_, DecoderType::None) => "capture-encode",
+                _ => "capture-encode-decode-render",
+            };
+            let codec = match encoder {
+                EncoderType::None => "none",
+                EncoderType::NvencAv1 => "av1",
+                EncoderType::NvencH264 | EncoderType::OpenH264 | EncoderType::VideoToolboxH264 => {
+                    "h264"
+                }
+            };
+            (pipeline, codec)
+        }
+    }
+}
+
+#[cfg(test)]
+fn encoder_allows_zero_copy(encoder: &EncoderType) -> bool {
+    matches!(
+        encoder,
+        EncoderType::None | EncoderType::NvencH264 | EncoderType::NvencAv1
+    )
+}
+
 fn nvdec_frame_to_decoded_frame(frame: mrd_decode_nvdec::NvdecDecodedFrame) -> DecodedFrame {
     match frame.data {
         mrd_decode_nvdec::NvdecDecodedFrameData::CpuRgb24(data) => {
@@ -1946,6 +2136,10 @@ fn render_input_to_preview_bgra(
             frame.height,
         ),
         #[cfg(windows)]
+        RenderFrameData::D3D11SharedBgra { .. } => {
+            anyhow::bail!("D3D11 shared texture preview is not CPU-readable")
+        }
+        #[cfg(windows)]
         RenderFrameData::D3D11SharedNv12 { .. } => {
             anyhow::bail!("D3D11 shared texture preview is not CPU-readable")
         }
@@ -1981,6 +2175,16 @@ fn decoded_frame_to_render_frame(frame: &DecodedFrame) -> RenderFrame {
 }
 
 fn captured_frame_to_render_frame(frame: &CapturedFrame) -> RenderFrame {
+    #[cfg(windows)]
+    if let Some(shared) = frame.d3d11_shared_bgra() {
+        return RenderFrame::from_d3d11_shared_bgra(
+            frame.width,
+            frame.height,
+            shared.shared_handle,
+            shared.row_pitch,
+        );
+    }
+
     match frame.pixel_format {
         FramePixelFormat::Bgra32 => {
             RenderFrame::from_bgra32(frame.width, frame.height, frame.data.clone())
@@ -2448,12 +2652,67 @@ fn bytes_per_pixel(format: FramePixelFormat) -> usize {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    fn shared_bgra_capture_maps_to_shared_render_frame() {
+        let frame = CapturedFrame::from_d3d11_shared_bgra(1280, 720, 123, 77, 1280 * 4);
+        let render_frame = captured_frame_to_render_frame(&frame);
+
+        assert!(render_frame.is_shared_texture());
+        assert_eq!(render_frame.shared_bgra_handle(), Some(77));
+    }
+
+    #[test]
+    fn nvenc_av1_allows_zero_copy_policy() {
+        assert!(encoder_allows_zero_copy(&EncoderType::NvencAv1));
+    }
+
+    #[test]
+    fn harness_metrics_export_captest_compatible_comparison_result() {
+        let metrics = HarnessMetrics {
+            capture_latency_avg_ms: 0.4,
+            encode_latency_avg_ms: 2.1,
+            decode_latency_avg_ms: 1.7,
+            render_latency_avg_ms: 0.8,
+            present_latency_avg_ms: 0.2,
+            frame_count: 120,
+            encoded_units: 120,
+            decoded_frames: 118,
+            encode_failures: 1,
+            decode_failures: 2,
+            total_bitstream_bytes: 5_000_000,
+            ..HarnessMetrics::default()
+        };
+
+        let result = metrics.to_pipeline_comparison_result(
+            "capture-encode-decode-render",
+            "av1",
+            "d3d11-shared",
+        );
+
+        assert_eq!(result.pipeline, "capture-encode-decode-render");
+        assert_eq!(result.codec, "av1");
+        assert_eq!(result.memory_path, "d3d11-shared");
+        assert_eq!(result.frames, 120);
+        assert_eq!(result.encoded_units, 120);
+        assert_eq!(result.decoded_frames, 118);
+        assert_eq!(result.encode_failures, 1);
+        assert_eq!(result.decode_failures, 2);
+        assert_eq!(result.avg_capture_time_ms, Some(0.4));
+        assert_eq!(result.avg_encode_time_ms, Some(2.1));
+        assert_eq!(result.avg_decode_time_ms, Some(1.7));
+        assert_eq!(result.avg_render_time_ms, Some(0.8));
+        assert_eq!(result.avg_present_time_ms, Some(0.2));
+        assert_eq!(result.total_bitstream_bytes, 5_000_000);
+    }
+
     #[test]
     fn trim_latency_buffers_handles_encode_only_samples() {
         let mut capture_latencies = Vec::new();
         let mut encode_latencies = (0..=1000).map(Duration::from_millis).collect::<Vec<_>>();
         let mut transport_latencies = Vec::new();
         let mut decode_latencies = Vec::new();
+        let mut render_latencies = Vec::new();
         let mut total_latencies = Vec::new();
 
         TestHarness::trim_latency_buffers(
@@ -2461,6 +2720,7 @@ mod tests {
             &mut encode_latencies,
             &mut transport_latencies,
             &mut decode_latencies,
+            &mut render_latencies,
             &mut total_latencies,
         );
 
@@ -2469,6 +2729,7 @@ mod tests {
         assert_eq!(encode_latencies[0], Duration::from_millis(1));
         assert!(transport_latencies.is_empty());
         assert!(decode_latencies.is_empty());
+        assert!(render_latencies.is_empty());
         assert!(total_latencies.is_empty());
     }
 
@@ -2478,6 +2739,7 @@ mod tests {
         let mut encode_latencies = (0..=1000).map(Duration::from_millis).collect::<Vec<_>>();
         let mut transport_latencies = (0..=1000).map(Duration::from_millis).collect::<Vec<_>>();
         let mut decode_latencies = (0..=1000).map(Duration::from_millis).collect::<Vec<_>>();
+        let mut render_latencies = (0..=1000).map(Duration::from_millis).collect::<Vec<_>>();
         let mut total_latencies = (0..=1000).map(Duration::from_millis).collect::<Vec<_>>();
 
         TestHarness::trim_latency_buffers(
@@ -2485,6 +2747,7 @@ mod tests {
             &mut encode_latencies,
             &mut transport_latencies,
             &mut decode_latencies,
+            &mut render_latencies,
             &mut total_latencies,
         );
 
@@ -2492,11 +2755,13 @@ mod tests {
         assert_eq!(encode_latencies.len(), 1000);
         assert_eq!(transport_latencies.len(), 1000);
         assert_eq!(decode_latencies.len(), 1000);
+        assert_eq!(render_latencies.len(), 1000);
         assert_eq!(total_latencies.len(), 1000);
         assert_eq!(capture_latencies[0], Duration::from_millis(1));
         assert_eq!(encode_latencies[0], Duration::from_millis(1));
         assert_eq!(transport_latencies[0], Duration::from_millis(1));
         assert_eq!(decode_latencies[0], Duration::from_millis(1));
+        assert_eq!(render_latencies[0], Duration::from_millis(1));
         assert_eq!(total_latencies[0], Duration::from_millis(1));
     }
 
@@ -2678,6 +2943,14 @@ mod tests {
             },
             _ => TestChain::NvencNvdec,
         };
+        let require_decode_success = matches!(
+            std::env::var("MRD_HARNESS_REQUIRE_DECODE").as_deref(),
+            Ok("1") | Ok("true")
+        ) && match &chain {
+            TestChain::NvencNvdec => true,
+            TestChain::Custom { decoder, .. } => !matches!(decoder, DecoderType::None),
+            _ => false,
+        };
         let mut harness = TestHarness::new().expect("create harness");
         harness.set_chain(chain);
         harness.set_config(TestConfig {
@@ -2722,7 +2995,31 @@ mod tests {
         thread::sleep(Duration::from_secs(seconds));
         harness.stop().expect("stop harness");
         let metrics = harness.get_metrics();
+        let comparison = harness.get_pipeline_comparison_result();
         println!("{metrics:#?}");
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&comparison).expect("serialize comparison result")
+        );
+        if let Ok(path) = std::env::var("MRD_HARNESS_RESULT_PATH") {
+            std::fs::write(
+                path,
+                serde_json::to_string_pretty(&comparison).expect("serialize comparison result"),
+            )
+            .expect("write comparison result");
+        }
         assert!(metrics.frame_count > 0);
+        if require_decode_success {
+            assert_eq!(
+                metrics.decode_failures, 0,
+                "decoder reported failures: {:?}",
+                metrics.error_message
+            );
+            assert!(
+                metrics.decoded_frames > 0,
+                "decoder produced no frames: {:?}",
+                metrics.error_message
+            );
+        }
     }
 }

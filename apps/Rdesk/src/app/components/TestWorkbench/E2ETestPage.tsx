@@ -35,6 +35,7 @@ function buildDefaultConfig(capabilities: EnvironmentSnapshot | null): TestConfi
     decoder_type: decoder,
     renderer_type: renderer,
     render_display: renderer ? true : undefined,
+    zero_copy: renderer === "d3d11" && encoder.startsWith("nvenc") ? true : undefined,
     resolution: [1920, 1080],
     fps: 60,
     bitrate: 5000000,
@@ -153,6 +154,10 @@ export function E2ETestPage() {
           </div>
           <div>
             <span className="text-muted-foreground">渲染:</span> {currentConfig.renderer_type ?? "none"}
+          </div>
+          <div>
+            <span className="text-muted-foreground">内存路径:</span>{" "}
+            {currentConfig.zero_copy ? "D3D11 Shared" : "CPU"}
           </div>
           <div>
             <span className="text-muted-foreground">分辨率:</span> 1920x1080

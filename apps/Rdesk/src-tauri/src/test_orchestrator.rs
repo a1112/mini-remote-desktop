@@ -561,6 +561,9 @@ impl TestOrchestrator {
                     capture_type: Some("dxgi".to_string()),
                     encoder_type: Some("nvenc_h264".to_string()),
                     decoder_type: Some("nvdec".to_string()),
+                    renderer_type: Some("d3d11".to_string()),
+                    render_display: Some(true),
+                    zero_copy: Some(true),
                     resolution: Some([1920, 1080]),
                     fps: Some(60),
                     bitrate: Some(5000000),
@@ -620,7 +623,7 @@ impl TestOrchestrator {
         let hw_info = crate::device_info::get_hardware_info();
 
         // Detect available encoders
-        let mut available_encoders = vec!["openh264".to_string()];
+        let mut available_encoders = vec!["none".to_string(), "openh264".to_string()];
 
         // Try to detect NVENC
         #[cfg(windows)]
@@ -640,7 +643,7 @@ impl TestOrchestrator {
         }
 
         // Detect available decoders
-        let mut available_decoders = vec!["software".to_string()];
+        let mut available_decoders = vec!["none".to_string(), "software".to_string()];
         #[cfg(windows)]
         {
             if mrd_decode_nvdec::NvdecDecoder::new().is_ok() {
@@ -1896,8 +1899,10 @@ fn validate_scenario_for_current_platform(
         if !matches!(capture_type, "dxgi" | "winrt") {
             anyhow::bail!("D3D11 shared texture capture requires DXGI or WinRT capture");
         }
-        if !matches!(encoder_type, "nvenc_h264") {
-            anyhow::bail!("D3D11 shared texture input requires NVENC H.264 encoder");
+        if !matches!(encoder_type, "none" | "nvenc_h264" | "nvenc_av1") {
+            anyhow::bail!(
+                "D3D11 shared texture input requires direct render, NVENC H.264, or NVENC AV1"
+            );
         }
     }
 
@@ -2642,6 +2647,57 @@ mod tests {
             harness_config_from_data(&disabled_config).zero_copy,
             Some(false)
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn zero_copy_validation_allows_nvenc_av1_shared_input() {
+        let config = TestConfigData {
+            capture_type: Some("dxgi".to_string()),
+            encoder_type: Some("nvenc_av1".to_string()),
+            decoder_type: Some("nvdec".to_string()),
+            renderer_type: Some("d3d11".to_string()),
+            render_display: Some(true),
+            zero_copy: Some(true),
+            ..Default::default()
+        };
+
+        validate_scenario_for_current_platform("matrix", &config)
+            .expect("NVENC AV1 should accept D3D11 shared input");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn zero_copy_validation_allows_direct_capture_render() {
+        let config = TestConfigData {
+            capture_type: Some("dxgi".to_string()),
+            encoder_type: Some("none".to_string()),
+            decoder_type: Some("none".to_string()),
+            renderer_type: Some("d3d11".to_string()),
+            render_display: Some(true),
+            zero_copy: Some(true),
+            ..Default::default()
+        };
+
+        validate_scenario_for_current_platform("matrix", &config)
+            .expect("direct capture to D3D11 render should accept D3D11 shared input");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn e2e_local_defaults_to_d3d11_zero_copy_display() {
+        let scenario = TestOrchestrator::default()
+            .list_scenarios()
+            .into_iter()
+            .find(|scenario| scenario.scenario_id == "e2e.local")
+            .expect("e2e.local scenario");
+
+        assert_eq!(
+            scenario.default_config.renderer_type.as_deref(),
+            Some("d3d11")
+        );
+        assert_eq!(scenario.default_config.render_display, Some(true));
+        assert_eq!(scenario.default_config.zero_copy, Some(true));
     }
 
     #[test]

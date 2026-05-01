@@ -640,6 +640,18 @@ describe('Tauri Adapter Contract', () => {
       });
     });
 
+    it('test_harness_get_comparison_result calls comparison command', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue({});
+
+      await adapter.testHarnessGetComparisonResult();
+
+      expect(mockInvoke).toHaveBeenCalledWith(
+        'test_harness_get_comparison_result',
+        undefined
+      );
+    });
+
     it('test_get_run_metrics calls correct command with run id', async () => {
       const mockInvoke = getMockInvoke();
       mockInvoke.mockResolvedValue({});

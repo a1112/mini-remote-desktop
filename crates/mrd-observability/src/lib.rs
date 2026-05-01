@@ -199,6 +199,87 @@ pub struct ComponentResult {
     pub decoded_frame_bytes: Option<usize>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PipelineComparisonResult {
+    pub pipeline: String,
+    pub codec: String,
+    pub memory_path: String,
+    pub frames: u64,
+    pub encoded_units: u64,
+    pub decoded_frames: u64,
+    pub encode_failures: u64,
+    pub decode_failures: u64,
+    pub avg_capture_time_ms: Option<f64>,
+    pub avg_encode_time_ms: Option<f64>,
+    pub avg_decode_time_ms: Option<f64>,
+    pub avg_render_time_ms: Option<f64>,
+    pub avg_present_time_ms: Option<f64>,
+    pub total_bitstream_bytes: u64,
+}
+
+impl PipelineComparisonResult {
+    pub fn new(pipeline: impl Into<String>, codec: impl Into<String>) -> Self {
+        Self {
+            pipeline: pipeline.into(),
+            codec: codec.into(),
+            memory_path: "unknown".into(),
+            frames: 0,
+            encoded_units: 0,
+            decoded_frames: 0,
+            encode_failures: 0,
+            decode_failures: 0,
+            avg_capture_time_ms: None,
+            avg_encode_time_ms: None,
+            avg_decode_time_ms: None,
+            avg_render_time_ms: None,
+            avg_present_time_ms: None,
+            total_bitstream_bytes: 0,
+        }
+    }
+
+    pub fn with_memory_path(mut self, memory_path: impl Into<String>) -> Self {
+        self.memory_path = memory_path.into();
+        self
+    }
+
+    pub fn with_counts(
+        mut self,
+        frames: u64,
+        encoded_units: u64,
+        decoded_frames: u64,
+        encode_failures: u64,
+        decode_failures: u64,
+    ) -> Self {
+        self.frames = frames;
+        self.encoded_units = encoded_units;
+        self.decoded_frames = decoded_frames;
+        self.encode_failures = encode_failures;
+        self.decode_failures = decode_failures;
+        self
+    }
+
+    pub fn with_average_stage_ms(
+        mut self,
+        capture: Option<f64>,
+        encode: Option<f64>,
+        decode: Option<f64>,
+        render: Option<f64>,
+        present: Option<f64>,
+    ) -> Self {
+        self.avg_capture_time_ms = capture;
+        self.avg_encode_time_ms = encode;
+        self.avg_decode_time_ms = decode;
+        self.avg_render_time_ms = render;
+        self.avg_present_time_ms = present;
+        self
+    }
+
+    pub fn with_total_bitstream_bytes(mut self, total_bitstream_bytes: u64) -> Self {
+        self.total_bitstream_bytes = total_bitstream_bytes;
+        self
+    }
+}
+
 impl ValueStatsSnapshot {
     pub fn from_values(values: &[f64]) -> Self {
         if values.is_empty() {
@@ -573,8 +654,8 @@ mod tests {
     use mrd_proto::SessionId;
 
     use super::{
-        ComponentKind, ComponentResult, MediaProbeEvent, PipelineProbeSnapshot, ProbeRegistry,
-        StageId, StageStatsSnapshot, ValueStatsSnapshot,
+        ComponentKind, ComponentResult, MediaProbeEvent, PipelineComparisonResult,
+        PipelineProbeSnapshot, ProbeRegistry, StageId, StageStatsSnapshot, ValueStatsSnapshot,
     };
 
     #[test]
@@ -636,6 +717,32 @@ mod tests {
         assert!(snapshot.counters.is_empty());
         assert_eq!(snapshot.stages.len(), 1);
         assert_eq!(snapshot.stages[0].0, StageId::EncodeTotal);
+    }
+
+    #[test]
+    fn pipeline_comparison_result_serializes_captest_compatible_fields() {
+        let result = PipelineComparisonResult::new("capture-encode-decode-render", "av1")
+            .with_memory_path("d3d11-shared")
+            .with_counts(120, 120, 118, 0, 2)
+            .with_average_stage_ms(Some(0.4), Some(2.1), Some(1.7), Some(0.8), Some(0.2))
+            .with_total_bitstream_bytes(5_000_000);
+
+        let value = serde_json::to_value(result).expect("serialize comparison result");
+
+        assert_eq!(value["pipeline"], "capture-encode-decode-render");
+        assert_eq!(value["codec"], "av1");
+        assert_eq!(value["memory_path"], "d3d11-shared");
+        assert_eq!(value["frames"], 120);
+        assert_eq!(value["encoded_units"], 120);
+        assert_eq!(value["decoded_frames"], 118);
+        assert_eq!(value["encode_failures"], 0);
+        assert_eq!(value["decode_failures"], 2);
+        assert_eq!(value["avg_capture_time_ms"], 0.4);
+        assert_eq!(value["avg_encode_time_ms"], 2.1);
+        assert_eq!(value["avg_decode_time_ms"], 1.7);
+        assert_eq!(value["avg_render_time_ms"], 0.8);
+        assert_eq!(value["avg_present_time_ms"], 0.2);
+        assert_eq!(value["total_bitstream_bytes"], 5_000_000);
     }
 
     #[test]

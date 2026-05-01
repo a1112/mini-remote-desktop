@@ -1456,6 +1456,17 @@ fn test_harness_get_metrics(state: tauri::State<'_, AppState>) -> test_harness::
 }
 
 #[tauri::command]
+fn test_harness_get_comparison_result(
+    state: tauri::State<'_, AppState>,
+) -> mrd_observability::PipelineComparisonResult {
+    state
+        .test_harness
+        .lock()
+        .unwrap()
+        .get_pipeline_comparison_result()
+}
+
+#[tauri::command]
 fn test_harness_get_frames(
     state: tauri::State<'_, AppState>,
     include_captured: Option<bool>,
@@ -2045,6 +2056,7 @@ fn main() {
             test_harness_set_custom,
             test_harness_get_chain,
             test_harness_get_metrics,
+            test_harness_get_comparison_result,
             test_harness_get_frames,
             // Test Workbench commands (new unified test API)
             test_list_scenarios,
