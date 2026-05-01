@@ -366,6 +366,42 @@ describe("MatrixTestPage failure handling", () => {
     });
   });
 
+  it("allows NVENC AV1 with D3D11 shared texture matrix runs", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_start_run") {
+        return Promise.resolve("run-1");
+      }
+      if (command === "test_get_run") {
+        return Promise.resolve(null);
+      }
+      return Promise.resolve(null);
+    });
+
+    render(<MatrixTestPage runDelayMs={0} />);
+    selectSingleSupportedCombination();
+    fireEvent.click(screen.getByLabelText("NVENC H.264"));
+    fireEvent.click(screen.getByLabelText(/NVENC AV1/));
+    fireEvent.click(screen.getByLabelText("CPU"));
+    fireEvent.click(screen.getByLabelText("D3D11 shared texture"));
+    fireEvent.click(screen.getByRole("button", { name: /启动矩阵测试/ }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_start_run",
+        expect.objectContaining({
+          config: expect.objectContaining({
+            encoder_type: "nvenc_av1",
+            decoder_type: "nvdec",
+            renderer_type: "d3d11",
+            render_display: true,
+            zero_copy: true,
+          }),
+        })
+      );
+    });
+  });
+
   it("passes selected transport matrix value", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {

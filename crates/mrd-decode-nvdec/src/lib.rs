@@ -234,6 +234,87 @@ impl NvdecDecoder {
         }
     }
 
+    #[cfg(windows)]
+    pub unsafe fn new_with_output_mode_and_d3d11_device_ptr(
+        output_mode: NvdecOutputMode,
+        d3d11_device_ptr: *mut c_void,
+    ) -> Result<Self, String> {
+        unsafe {
+            Self::new_for_codec_with_output_mode_and_d3d11_device_ptr(
+                NvdecCodecKind::H264,
+                output_mode,
+                d3d11_device_ptr,
+            )
+        }
+    }
+
+    #[cfg(windows)]
+    pub unsafe fn new_av1_with_output_mode_and_d3d11_device_ptr(
+        output_mode: NvdecOutputMode,
+        d3d11_device_ptr: *mut c_void,
+    ) -> Result<Self, String> {
+        unsafe {
+            Self::new_for_codec_with_output_mode_and_d3d11_device_ptr(
+                NvdecCodecKind::Av1,
+                output_mode,
+                d3d11_device_ptr,
+            )
+        }
+    }
+
+    #[cfg(windows)]
+    pub unsafe fn new_for_codec_with_output_mode_and_d3d11_device_ptr(
+        codec: NvdecCodecKind,
+        output_mode: NvdecOutputMode,
+        d3d11_device_ptr: *mut c_void,
+    ) -> Result<Self, String> {
+        if d3d11_device_ptr.is_null() {
+            return Err("D3D11 device pointer is null".to_string());
+        }
+
+        let mut decoder = Self::new_for_codec_with_optional_d3d11_device_ptr(
+            codec,
+            output_mode,
+            Some(d3d11_device_ptr),
+        )?;
+        decoder.enable_shared_texture(true);
+        Ok(decoder)
+    }
+
+    #[cfg(windows)]
+    fn new_for_codec_with_optional_d3d11_device_ptr(
+        codec: NvdecCodecKind,
+        output_mode: NvdecOutputMode,
+        d3d11_device_ptr: Option<*mut c_void>,
+    ) -> Result<Self, String> {
+        let session = imp::NvdecSession::new_for_codec_with_d3d11_device_ptr(
+            codec,
+            output_mode,
+            d3d11_device_ptr,
+        )?;
+        let runtime = NvdecRuntimeProbe {
+            backend: "windows-nvdec",
+            summary: "nvdec runtime libraries and core exports are present".to_string(),
+            checked_items: vec![
+                "nvcuda.dll",
+                "nvcuvid.dll",
+                "cuInit",
+                "cuDeviceGetCount",
+                "cuvidGetDecoderCaps",
+                "cuvidCreateDecoder",
+                "cuvidDestroyDecoder",
+                "cuvidCreateVideoParser",
+                "cuvidParseVideoData",
+            ],
+            capability_probes: Vec::new(),
+        };
+        Ok(Self {
+            runtime,
+            session,
+            enable_shared_texture: false,
+        })
+    }
+
     /// Enable D3D11 shared texture output (zero-copy path)
     ///
     /// When enabled, the decoder will attempt to create D3D11 shared textures
@@ -241,6 +322,7 @@ impl NvdecDecoder {
     #[cfg(windows)]
     pub fn enable_shared_texture(&mut self, enable: bool) {
         self.enable_shared_texture = enable;
+        self.session.enable_shared_texture(enable);
     }
 
     pub fn runtime(&self) -> &NvdecRuntimeProbe {
@@ -421,10 +503,12 @@ mod imp {
     type CUresult = i32;
     type CUdevice = c_int;
     type CUcontext = *mut c_void;
+    type CUstream = *mut c_void;
     type CUvideodecoder = *mut c_void;
     type CUvideoparser = *mut c_void;
     type CUvideoctxlock = *mut c_void;
     type CUdeviceptr = u64;
+    type CUarray = *mut c_void;
     type CUvideotimestamp = i64;
     type CUgraphicsResource = *mut c_void;
 
@@ -439,6 +523,8 @@ mod imp {
     const CUDA_VIDEO_DEINTERLACE_WEAVE: i32 = 0;
     const CUVID_PKT_ENDOFPICTURE: u32 = 0x08;
     const CUVID_PARSER_ANNEXB: u32 = 0x01;
+    const CU_MEMORYTYPE_DEVICE: u32 = 2;
+    const CU_MEMORYTYPE_ARRAY: u32 = 3;
 
     type CuInitFn = unsafe extern "system" fn(u32) -> CUresult;
     type CuDeviceGetCountFn = unsafe extern "system" fn(*mut c_int) -> CUresult;
@@ -474,16 +560,36 @@ mod imp {
 
     // CUDA-D3D11 interop functions
     type CuGraphicsD3D11RegisterResourceFn =
-        unsafe extern "system" fn(*mut c_void, *mut c_void, u32) -> CUresult;
-    type CuGraphicsUnregisterResourceFn = unsafe extern "system" fn(*mut c_void) -> CUresult;
+        unsafe extern "system" fn(*mut CUgraphicsResource, *mut c_void, u32) -> CUresult;
+    type CuGraphicsUnregisterResourceFn = unsafe extern "system" fn(CUgraphicsResource) -> CUresult;
     type CuGraphicsMapResourcesFn =
-        unsafe extern "system" fn(c_int, *mut c_void, CUcontext) -> CUresult;
+        unsafe extern "system" fn(c_int, *mut CUgraphicsResource, CUstream) -> CUresult;
     type CuGraphicsUnmapResourcesFn =
-        unsafe extern "system" fn(c_int, *mut c_void, CUcontext) -> CUresult;
-    type CuGraphicsResourceGetMappedPointerFn =
-        unsafe extern "system" fn(*mut CUdeviceptr, *mut usize, *mut c_void) -> CUresult;
-    type CuMemcpyDtoDAsyncFn =
-        unsafe extern "system" fn(CUdeviceptr, CUdeviceptr, usize, CUcontext) -> CUresult;
+        unsafe extern "system" fn(c_int, *mut CUgraphicsResource, CUstream) -> CUresult;
+    type CuGraphicsSubResourceGetMappedArrayFn =
+        unsafe extern "system" fn(*mut CUarray, CUgraphicsResource, u32, u32) -> CUresult;
+    type CuMemcpy2DFn = unsafe extern "system" fn(*const CUDA_MEMCPY2D) -> CUresult;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CUDA_MEMCPY2D {
+        srcXInBytes: usize,
+        srcY: usize,
+        srcMemoryType: u32,
+        srcHost: *const c_void,
+        srcDevice: CUdeviceptr,
+        srcArray: CUarray,
+        srcPitch: usize,
+        dstXInBytes: usize,
+        dstY: usize,
+        dstMemoryType: u32,
+        dstHost: *mut c_void,
+        dstDevice: CUdeviceptr,
+        dstArray: CUarray,
+        dstPitch: usize,
+        WidthInBytes: usize,
+        Height: usize,
+    }
 
     // CUDA graphics register flags for D3D11
     const CU_GRAPHICS_REGISTER_FLAGS_NONE: u32 = 0x00;
@@ -522,91 +628,118 @@ mod imp {
 
                 let device = device.ok_or("缺少 D3D11 device")?;
                 let context = context.ok_or("缺少 D3D11 context")?;
+                Self::from_device(device, context, width, height)
+            }
+        }
 
-                // Create Y plane texture (R8, single channel, shared)
-                let y_desc = D3D11_TEXTURE2D_DESC {
-                    Width: width,
-                    Height: height,
-                    MipLevels: 1,
-                    ArraySize: 1,
-                    Format: DXGI_FORMAT_R8_UNORM,
-                    SampleDesc: DXGI_SAMPLE_DESC {
-                        Count: 1,
-                        Quality: 0,
-                    },
-                    Usage: D3D11_USAGE_DEFAULT,
-                    BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
-                    CPUAccessFlags: 0,
-                    MiscFlags: D3D11_RESOURCE_MISC_SHARED.0 as u32,
-                };
+        unsafe fn new_with_device_ptr(
+            width: u32,
+            height: u32,
+            device_ptr: *mut c_void,
+        ) -> Result<Self, String> {
+            if device_ptr.is_null() {
+                return Err("D3D11 device pointer is null".to_string());
+            }
 
-                let mut y_texture = None::<ID3D11Texture2D>;
+            let device = unsafe {
+                ID3D11Device::from_raw_borrowed(&device_ptr)
+                    .ok_or("D3D11 device pointer is invalid")?
+                    .clone()
+            };
+            let context = unsafe { device.GetImmediateContext() }
+                .map_err(|e| format!("获取外部 D3D11 immediate context 失败: {e}"))?;
+            Self::from_device(device, context, width, height)
+        }
+
+        fn from_device(
+            device: ID3D11Device,
+            context: ID3D11DeviceContext,
+            width: u32,
+            height: u32,
+        ) -> Result<Self, String> {
+            // Create Y plane texture (R8, single channel, shared)
+            let y_desc = D3D11_TEXTURE2D_DESC {
+                Width: width,
+                Height: height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_R8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: D3D11_RESOURCE_MISC_SHARED.0 as u32,
+            };
+
+            let mut y_texture = None::<ID3D11Texture2D>;
+            unsafe {
                 device
                     .CreateTexture2D(&y_desc, None, Some(&mut y_texture))
                     .map_err(|e| format!("创建 Y 纹理失败: {}", e))?;
-                let y_texture = y_texture.ok_or("缺少 Y 纹理")?;
+            }
+            let y_texture = y_texture.ok_or("缺少 Y 纹理")?;
 
-                // Create UV plane texture (R8G8, two channels, shared)
-                let uv_desc = D3D11_TEXTURE2D_DESC {
-                    Width: width / 2,
-                    Height: height / 2,
-                    MipLevels: 1,
-                    ArraySize: 1,
-                    Format: DXGI_FORMAT_R8G8_UNORM,
-                    SampleDesc: DXGI_SAMPLE_DESC {
-                        Count: 1,
-                        Quality: 0,
-                    },
-                    Usage: D3D11_USAGE_DEFAULT,
-                    BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
-                    CPUAccessFlags: 0,
-                    MiscFlags: D3D11_RESOURCE_MISC_SHARED.0 as u32,
-                };
+            // Create UV plane texture (R8G8, two channels, shared)
+            let uv_desc = D3D11_TEXTURE2D_DESC {
+                Width: width / 2,
+                Height: height / 2,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_R8G8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: D3D11_RESOURCE_MISC_SHARED.0 as u32,
+            };
 
-                let mut uv_texture = None::<ID3D11Texture2D>;
+            let mut uv_texture = None::<ID3D11Texture2D>;
+            unsafe {
                 device
                     .CreateTexture2D(&uv_desc, None, Some(&mut uv_texture))
                     .map_err(|e| format!("创建 UV 纹理失败: {}", e))?;
-                let uv_texture = uv_texture.ok_or("缺少 UV 纹理")?;
-
-                // Get shared handles using IDXGIResource::GetSharedHandle
-                let y_resource: IDXGIResource = y_texture
-                    .cast()
-                    .map_err(|e| format!("转换 Y 纹理到 IDXGIResource 失败: {}", e))?;
-                let shared_handle_y = y_resource
-                    .GetSharedHandle()
-                    .map_err(|e| format!("获取 Y 共享句柄失败: {}", e))?;
-
-                let uv_resource: IDXGIResource = uv_texture
-                    .cast()
-                    .map_err(|e| format!("转换 UV 纹理到 IDXGIResource 失败: {}", e))?;
-                let shared_handle_uv = uv_resource
-                    .GetSharedHandle()
-                    .map_err(|e| format!("获取 UV 共享句柄失败: {}", e))?;
-
-                Ok(Self {
-                    device,
-                    context,
-                    y_texture,
-                    uv_texture,
-                    shared_handle_y: shared_handle_y.0 as isize,
-                    shared_handle_uv: shared_handle_uv.0 as isize,
-                    width,
-                    height,
-                })
             }
+            let uv_texture = uv_texture.ok_or("缺少 UV 纹理")?;
+
+            // Get shared handles using IDXGIResource::GetSharedHandle
+            let y_resource: IDXGIResource = y_texture
+                .cast()
+                .map_err(|e| format!("转换 Y 纹理到 IDXGIResource 失败: {}", e))?;
+            let shared_handle_y = unsafe { y_resource.GetSharedHandle() }
+                .map_err(|e| format!("获取 Y 共享句柄失败: {}", e))?;
+
+            let uv_resource: IDXGIResource = uv_texture
+                .cast()
+                .map_err(|e| format!("转换 UV 纹理到 IDXGIResource 失败: {}", e))?;
+            let shared_handle_uv = unsafe { uv_resource.GetSharedHandle() }
+                .map_err(|e| format!("获取 UV 共享句柄失败: {}", e))?;
+
+            Ok(Self {
+                device,
+                context,
+                y_texture,
+                uv_texture,
+                shared_handle_y: shared_handle_y.0 as isize,
+                shared_handle_uv: shared_handle_uv.0 as isize,
+                width,
+                height,
+            })
         }
 
         /// Get raw pointer to Y texture for CUDA-D3D11 interop
         fn y_texture_ptr(&self) -> *mut c_void {
-            let com_ptr: *const ID3D11Texture2D = &self.y_texture;
-            com_ptr as *const c_void as *mut c_void
+            self.y_texture.as_raw()
         }
 
         /// Get raw pointer to UV texture for CUDA-D3D11 interop
         fn uv_texture_ptr(&self) -> *mut c_void {
-            let com_ptr: *const ID3D11Texture2D = &self.uv_texture;
-            com_ptr as *const c_void as *mut c_void
+            self.uv_texture.as_raw()
         }
     }
 
@@ -857,8 +990,8 @@ mod imp {
         cu_graphics_unregister_resource: Option<CuGraphicsUnregisterResourceFn>,
         cu_graphics_map_resources: Option<CuGraphicsMapResourcesFn>,
         cu_graphics_unmap_resources: Option<CuGraphicsUnmapResourcesFn>,
-        cu_graphics_resource_get_mapped_pointer: Option<CuGraphicsResourceGetMappedPointerFn>,
-        cu_memcpy_dto_d_async: Option<CuMemcpyDtoDAsyncFn>,
+        cu_graphics_sub_resource_get_mapped_array: Option<CuGraphicsSubResourceGetMappedArrayFn>,
+        cu_memcpy_2d: Option<CuMemcpy2DFn>,
     }
 
     impl CudaApi {
@@ -886,10 +1019,10 @@ mod imp {
                 cu_graphics_unmap_resources: module
                     .load_symbol(b"cuGraphicsUnmapResources\0".as_ref())
                     .ok(),
-                cu_graphics_resource_get_mapped_pointer: module
-                    .load_symbol(b"cuGraphicsResourceGetMappedPointer_v2\0".as_ref())
+                cu_graphics_sub_resource_get_mapped_array: module
+                    .load_symbol(b"cuGraphicsSubResourceGetMappedArray\0".as_ref())
                     .ok(),
-                cu_memcpy_dto_d_async: module.load_symbol(b"cuMemcpyDtoDAsync_v2\0".as_ref()).ok(),
+                cu_memcpy_2d: module.load_symbol(b"cuMemcpy2D_v2\0".as_ref()).ok(),
                 _module: module,
             })
         }
@@ -945,6 +1078,7 @@ mod imp {
         parser_codec: i32,
         callback_state: Box<CallbackState>,
         shared_texture: Option<D3D11SharedTexture>,
+        external_d3d11_device_ptr: Option<*mut c_void>,
         enable_shared_texture: bool,
     }
 
@@ -1029,8 +1163,8 @@ mod imp {
         cu_graphics_unregister_resource: Option<CuGraphicsUnregisterResourceFn>,
         cu_graphics_map_resources: Option<CuGraphicsMapResourcesFn>,
         cu_graphics_unmap_resources: Option<CuGraphicsUnmapResourcesFn>,
-        cu_graphics_resource_get_mapped_pointer: Option<CuGraphicsResourceGetMappedPointerFn>,
-        cu_memcpy_dto_d_async: Option<CuMemcpyDtoDAsyncFn>,
+        cu_graphics_sub_resource_get_mapped_array: Option<CuGraphicsSubResourceGetMappedArrayFn>,
+        cu_memcpy_2d: Option<CuMemcpy2DFn>,
         // Registered CUDA graphics resources for D3D11 textures
         cuda_resource_y: Option<CUgraphicsResource>,
         cuda_resource_uv: Option<CUgraphicsResource>,
@@ -1057,6 +1191,14 @@ mod imp {
         pub fn new_for_codec(
             codec: super::NvdecCodecKind,
             output_mode: NvdecOutputMode,
+        ) -> Result<Self, String> {
+            Self::new_for_codec_with_d3d11_device_ptr(codec, output_mode, None)
+        }
+
+        pub fn new_for_codec_with_d3d11_device_ptr(
+            codec: super::NvdecCodecKind,
+            output_mode: NvdecOutputMode,
+            external_d3d11_device_ptr: Option<*mut c_void>,
         ) -> Result<Self, String> {
             let parser_codec = match codec {
                 super::NvdecCodecKind::H264 => CUDA_VIDEO_CODEC_H264,
@@ -1135,9 +1277,9 @@ mod imp {
                 cu_graphics_unregister_resource: cuda.cu_graphics_unregister_resource,
                 cu_graphics_map_resources: cuda.cu_graphics_map_resources,
                 cu_graphics_unmap_resources: cuda.cu_graphics_unmap_resources,
-                cu_graphics_resource_get_mapped_pointer: cuda
-                    .cu_graphics_resource_get_mapped_pointer,
-                cu_memcpy_dto_d_async: cuda.cu_memcpy_dto_d_async,
+                cu_graphics_sub_resource_get_mapped_array: cuda
+                    .cu_graphics_sub_resource_get_mapped_array,
+                cu_memcpy_2d: cuda.cu_memcpy_2d,
                 // Registered CUDA resources (initialized when shared texture is created)
                 cuda_resource_y: None,
                 cuda_resource_uv: None,
@@ -1193,6 +1335,7 @@ mod imp {
                 parser_codec,
                 callback_state,
                 shared_texture: None,
+                external_d3d11_device_ptr,
                 enable_shared_texture: false, // Disabled by default
             })
         }
@@ -1283,7 +1426,14 @@ mod imp {
             if self.enable_shared_texture && self.shared_texture.is_none() {
                 let (width, height) = self.callback_state.output_dimensions_u32();
                 if width > 0 && height > 0 {
-                    match D3D11SharedTexture::new(width, height) {
+                    let texture_result = if let Some(device_ptr) = self.external_d3d11_device_ptr {
+                        unsafe {
+                            D3D11SharedTexture::new_with_device_ptr(width, height, device_ptr)
+                        }
+                    } else {
+                        D3D11SharedTexture::new(width, height)
+                    };
+                    match texture_result {
                         Ok(texture) => {
                             self.callback_state.shared_texture_y = Some(texture.shared_handle_y);
                             self.callback_state.shared_texture_uv = Some(texture.shared_handle_uv);
@@ -1469,12 +1619,12 @@ mod imp {
         #[allow(clippy::too_many_arguments)]
         fn try_gpu_zero_copy(
             &mut self,
-            cuda_context: CUcontext,
+            _cuda_context: CUcontext,
             d3d11_y_texture: *mut c_void,
             d3d11_uv_texture: *mut c_void,
             cuda_src_ptr: CUdeviceptr,
             y_pitch: u32,
-            _width: usize,
+            width: usize,
             height: usize,
         ) -> bool {
             // Check if all required CUDA-D3D11 interop functions are available
@@ -1494,11 +1644,11 @@ mod imp {
                 Some(f) => f,
                 None => return false,
             };
-            let get_ptr_fn = match self.cu_graphics_resource_get_mapped_pointer {
+            let get_array_fn = match self.cu_graphics_sub_resource_get_mapped_array {
                 Some(f) => f,
                 None => return false,
             };
-            let copy_fn = match self.cu_memcpy_dto_d_async {
+            let copy_fn = match self.cu_memcpy_2d {
                 Some(f) => f,
                 None => return false,
             };
@@ -1508,7 +1658,7 @@ mod imp {
                 let mut resource_y: CUgraphicsResource = ptr::null_mut();
                 let result = unsafe {
                     register_fn(
-                        &mut resource_y as *mut _ as *mut c_void,
+                        &mut resource_y,
                         d3d11_y_texture,
                         CU_GRAPHICS_REGISTER_FLAGS_NONE,
                     )
@@ -1523,7 +1673,7 @@ mod imp {
                 let mut resource_uv: CUgraphicsResource = ptr::null_mut();
                 let result = unsafe {
                     register_fn(
-                        &mut resource_uv as *mut _ as *mut c_void,
+                        &mut resource_uv,
                         d3d11_uv_texture,
                         CU_GRAPHICS_REGISTER_FLAGS_NONE,
                     )
@@ -1538,93 +1688,84 @@ mod imp {
                 self.cuda_resource_uv = Some(resource_uv);
             }
 
-            let resources_y = [self.cuda_resource_y.unwrap()];
-            let resources_uv = [self.cuda_resource_uv.unwrap()];
+            let mut resources = [
+                self.cuda_resource_y.unwrap(),
+                self.cuda_resource_uv.unwrap(),
+            ];
 
             // Map resources for CUDA access
-            let map_result = unsafe { map_fn(1, resources_y.as_ptr() as *mut _, cuda_context) };
+            let map_result = unsafe { map_fn(2, resources.as_mut_ptr(), ptr::null_mut()) };
             if map_result != CUDA_SUCCESS {
                 return false;
             }
 
-            let map_result_uv = unsafe { map_fn(1, resources_uv.as_ptr() as *mut _, cuda_context) };
-            if map_result_uv != CUDA_SUCCESS {
-                unsafe { unmap_fn(1, resources_y.as_ptr() as *mut _, cuda_context) };
+            let mut y_array: CUarray = ptr::null_mut();
+            let y_array_result =
+                unsafe { get_array_fn(&mut y_array, self.cuda_resource_y.unwrap(), 0, 0) };
+            if y_array_result != CUDA_SUCCESS {
+                unsafe { unmap_fn(2, resources.as_mut_ptr(), ptr::null_mut()) };
                 return false;
             }
 
-            // Get mapped pointers for D3D11 textures
-            let mut d3d_y_ptr: CUdeviceptr = 0;
-            let mut d3d_y_size: usize = 0;
-            let ptr_result = unsafe {
-                get_ptr_fn(
-                    &mut d3d_y_ptr,
-                    &mut d3d_y_size,
-                    self.cuda_resource_y.unwrap(),
-                )
+            let mut uv_array: CUarray = ptr::null_mut();
+            let uv_array_result =
+                unsafe { get_array_fn(&mut uv_array, self.cuda_resource_uv.unwrap(), 0, 0) };
+            if uv_array_result != CUDA_SUCCESS {
+                unsafe { unmap_fn(2, resources.as_mut_ptr(), ptr::null_mut()) };
+                return false;
+            }
+
+            let copy_y = CUDA_MEMCPY2D {
+                srcXInBytes: 0,
+                srcY: 0,
+                srcMemoryType: CU_MEMORYTYPE_DEVICE,
+                srcHost: ptr::null(),
+                srcDevice: cuda_src_ptr,
+                srcArray: ptr::null_mut(),
+                srcPitch: y_pitch as usize,
+                dstXInBytes: 0,
+                dstY: 0,
+                dstMemoryType: CU_MEMORYTYPE_ARRAY,
+                dstHost: ptr::null_mut(),
+                dstDevice: 0,
+                dstArray: y_array,
+                dstPitch: 0,
+                WidthInBytes: width,
+                Height: height,
             };
-            if ptr_result != CUDA_SUCCESS {
-                unsafe {
-                    unmap_fn(1, resources_uv.as_ptr() as *mut _, cuda_context);
-                    unmap_fn(1, resources_y.as_ptr() as *mut _, cuda_context);
-                };
-                return false;
-            }
-
-            let mut d3d_uv_ptr: CUdeviceptr = 0;
-            let mut d3d_uv_size: usize = 0;
-            let ptr_result_uv = unsafe {
-                get_ptr_fn(
-                    &mut d3d_uv_ptr,
-                    &mut d3d_uv_size,
-                    self.cuda_resource_uv.unwrap(),
-                )
-            };
-            if ptr_result_uv != CUDA_SUCCESS {
-                unsafe {
-                    unmap_fn(1, resources_uv.as_ptr() as *mut _, cuda_context);
-                    unmap_fn(1, resources_y.as_ptr() as *mut _, cuda_context);
-                };
-                return false;
-            }
-
-            // Calculate sizes
-            let y_plane_bytes = y_pitch as usize * height;
-            let uv_plane_bytes = y_pitch as usize * (height / 2);
-
-            // GPU→GPU copy: Y plane
-            let copy_result =
-                unsafe { copy_fn(d3d_y_ptr, cuda_src_ptr, y_plane_bytes, cuda_context) };
+            let copy_result = unsafe { copy_fn(&copy_y) };
             if copy_result != CUDA_SUCCESS {
-                unsafe {
-                    unmap_fn(1, resources_uv.as_ptr() as *mut _, cuda_context);
-                    unmap_fn(1, resources_y.as_ptr() as *mut _, cuda_context);
-                };
+                unsafe { unmap_fn(2, resources.as_mut_ptr(), ptr::null_mut()) };
                 return false;
             }
 
-            // GPU→GPU copy: UV plane (offset from Y plane in source)
-            let uv_src_offset = y_plane_bytes as CUdeviceptr;
-            let copy_result_uv = unsafe {
-                copy_fn(
-                    d3d_uv_ptr,
-                    cuda_src_ptr + uv_src_offset,
-                    uv_plane_bytes,
-                    cuda_context,
-                )
+            let copy_uv = CUDA_MEMCPY2D {
+                srcXInBytes: 0,
+                srcY: 0,
+                srcMemoryType: CU_MEMORYTYPE_DEVICE,
+                srcHost: ptr::null(),
+                srcDevice: cuda_src_ptr + (y_pitch as CUdeviceptr * height as CUdeviceptr),
+                srcArray: ptr::null_mut(),
+                srcPitch: y_pitch as usize,
+                dstXInBytes: 0,
+                dstY: 0,
+                dstMemoryType: CU_MEMORYTYPE_ARRAY,
+                dstHost: ptr::null_mut(),
+                dstDevice: 0,
+                dstArray: uv_array,
+                dstPitch: 0,
+                WidthInBytes: width,
+                Height: height / 2,
             };
+            let copy_result_uv = unsafe { copy_fn(&copy_uv) };
             if copy_result_uv != CUDA_SUCCESS {
-                unsafe {
-                    unmap_fn(1, resources_uv.as_ptr() as *mut _, cuda_context);
-                    unmap_fn(1, resources_y.as_ptr() as *mut _, cuda_context);
-                };
+                unsafe { unmap_fn(2, resources.as_mut_ptr(), ptr::null_mut()) };
                 return false;
             }
 
             // Unmap resources
             unsafe {
-                unmap_fn(1, resources_uv.as_ptr() as *mut _, cuda_context);
-                unmap_fn(1, resources_y.as_ptr() as *mut _, cuda_context);
+                unmap_fn(2, resources.as_mut_ptr(), ptr::null_mut());
             };
 
             true
@@ -2975,6 +3116,44 @@ mod imp {
                     );
                 }
             }
+        }
+
+        #[test]
+        #[cfg(windows)]
+        fn d3d11_shared_texture_can_use_external_device_pointer() {
+            use super::{D3D11CreateDevice, D3D11SharedTexture, ID3D11Device, ID3D11DeviceContext};
+            use windows::core::Interface;
+            use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+            use windows::Win32::Graphics::Direct3D11::{
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
+            };
+
+            let mut device = None::<ID3D11Device>;
+            let mut context = None::<ID3D11DeviceContext>;
+            unsafe {
+                D3D11CreateDevice(
+                    None,
+                    D3D_DRIVER_TYPE_HARDWARE,
+                    windows::Win32::Foundation::HMODULE::default(),
+                    D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                    None,
+                    D3D11_SDK_VERSION,
+                    Some(&mut device),
+                    None,
+                    Some(&mut context),
+                )
+            }
+            .expect("create test d3d11 device");
+            let device = device.expect("test d3d11 device");
+
+            let texture =
+                unsafe { D3D11SharedTexture::new_with_device_ptr(640, 360, device.as_raw()) }
+                    .expect("create shared texture from external device");
+
+            assert_eq!(texture.width, 640);
+            assert_eq!(texture.height, 360);
+            assert_ne!(texture.shared_handle_y, 0);
+            assert_ne!(texture.shared_handle_uv, 0);
         }
     }
 }

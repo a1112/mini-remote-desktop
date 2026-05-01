@@ -278,7 +278,7 @@ export function RemoteDisplayWindowPage() {
   const usesNativeSharedTexture =
     nativeRendererType === "d3d11" &&
     capture === "dxgi" &&
-    encoder === "nvenc_h264" &&
+    (encoder === "nvenc_h264" || encoder === "nvenc_av1") &&
     decoder === "nvdec";
   const visibleCaptureOptions = useMemo(
     () =>
@@ -432,7 +432,12 @@ export function RemoteDisplayWindowPage() {
         pickAvailable(value, capabilities.available_captures, ["dxgi", "winrt", "synthetic"], "dxgi")
       );
       setEncoder((value) =>
-        pickAvailable(value, capabilities.available_encoders, ["nvenc_h264", "openh264"], "nvenc_h264")
+        pickAvailable(
+          value,
+          capabilities.available_encoders,
+          ["nvenc_h264", "nvenc_av1", "openh264"],
+          "nvenc_h264"
+        )
       );
       setDecoder((value) =>
         pickAvailable(value, capabilities.available_decoders, ["nvdec", "software", "none"], "nvdec")

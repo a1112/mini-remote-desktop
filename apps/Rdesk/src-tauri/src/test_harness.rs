@@ -238,9 +238,11 @@ impl HarnessMetrics {
         pipeline: impl Into<String>,
         codec: impl Into<String>,
         memory_path: impl Into<String>,
+        transport: impl Into<String>,
     ) -> PipelineComparisonResult {
         PipelineComparisonResult::new(pipeline, codec)
             .with_memory_path(memory_path)
+            .with_transport(transport)
             .with_counts(
                 self.frame_count as u64,
                 self.encoded_units as u64,
@@ -255,6 +257,9 @@ impl HarnessMetrics {
                 nonzero_ms(self.render_latency_avg_ms),
                 nonzero_ms(self.present_latency_avg_ms),
             )
+            .with_transport_stage_ms(nonzero_ms(self.transport_latency_avg_ms))
+            .with_total_time_ms(nonzero_ms(self.total_latency_avg_ms))
+            .with_avg_fps(nonzero_ms(self.capture_fps))
             .with_total_bitstream_bytes(self.total_bitstream_bytes as u64)
     }
 }
@@ -492,8 +497,13 @@ enum RenderInput {
     Captured(CapturedFrame),
 }
 
+struct RenderJob {
+    input: RenderInput,
+    completion: mpsc::SyncSender<std::result::Result<(), String>>,
+}
+
 enum RenderCommand {
-    Frame(RenderInput),
+    Frame(RenderJob),
     Stop,
 }
 
@@ -501,6 +511,7 @@ struct PipelineRenderer {
     sender: mpsc::SyncSender<RenderCommand>,
     render_thread: Option<thread::JoinHandle<()>>,
     last_error: Arc<Mutex<Option<String>>>,
+    d3d11_device_ptr: Option<usize>,
 }
 
 impl PipelineRenderer {
@@ -514,6 +525,32 @@ impl PipelineRenderer {
         let last_error = Arc::new(Mutex::new(None));
         let thread_error = Arc::clone(&last_error);
         let renderer_type = renderer_type.clone();
+
+        #[cfg(windows)]
+        if renderer_type == RendererType::D3d11 {
+            let renderer = mrd_render_d3d11::D3d11Renderer::new()
+                .map_err(|error| anyhow::anyhow!("create D3D11 renderer failed: {error}"))?;
+            let d3d11_device_ptr = renderer.device_ptr() as usize;
+            let render_thread = thread::Builder::new()
+                .name("mrd-test-render".to_string())
+                .spawn(move || {
+                    if let Err(error) =
+                        run_d3d11_renderer_thread(renderer, width, height, target_hwnd, receiver)
+                    {
+                        if let Ok(mut last_error) = thread_error.lock() {
+                            *last_error = Some(error.to_string());
+                        }
+                    }
+                })
+                .map_err(|error| anyhow::anyhow!("spawn render thread failed: {error}"))?;
+
+            return Ok(Self {
+                sender,
+                render_thread: Some(render_thread),
+                last_error,
+                d3d11_device_ptr: Some(d3d11_device_ptr),
+            });
+        }
 
         let render_thread = thread::Builder::new()
             .name("mrd-test-render".to_string())
@@ -532,7 +569,19 @@ impl PipelineRenderer {
             sender,
             render_thread: Some(render_thread),
             last_error,
+            d3d11_device_ptr: None,
         })
+    }
+
+    #[cfg(windows)]
+    fn d3d11_device_ptr(&self) -> Option<*mut core::ffi::c_void> {
+        self.d3d11_device_ptr
+            .map(|ptr| ptr as *mut core::ffi::c_void)
+    }
+
+    #[cfg(not(windows))]
+    fn d3d11_device_ptr(&self) -> Option<*mut core::ffi::c_void> {
+        None
     }
 
     fn submit_frame(&mut self, input: RenderInput) -> Result<()> {
@@ -540,13 +589,14 @@ impl PipelineRenderer {
             anyhow::bail!("native render thread failed: {error}");
         }
 
-        match self.sender.try_send(RenderCommand::Frame(input)) {
-            Ok(()) => Ok(()),
-            Err(mpsc::TrySendError::Full(RenderCommand::Frame(_))) => Ok(()),
-            Err(mpsc::TrySendError::Full(RenderCommand::Stop)) => Ok(()),
-            Err(mpsc::TrySendError::Disconnected(_)) => {
-                anyhow::bail!("native render thread stopped")
-            }
+        let (completion, done) = mpsc::sync_channel(1);
+        self.sender
+            .send(RenderCommand::Frame(RenderJob { input, completion }))
+            .map_err(|_| anyhow::anyhow!("native render thread stopped"))?;
+        match done.recv() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => anyhow::bail!("native render thread failed: {error}"),
+            Err(_) => anyhow::bail!("native render thread stopped before completing frame"),
         }
     }
 }
@@ -631,6 +681,31 @@ fn run_renderer_thread(
     }
 }
 
+#[cfg(windows)]
+fn run_d3d11_renderer_thread(
+    mut renderer: mrd_render_d3d11::D3d11Renderer,
+    width: usize,
+    height: usize,
+    target_hwnd: Option<isize>,
+    receiver: mpsc::Receiver<RenderCommand>,
+) -> Result<()> {
+    let window = match target_hwnd {
+        Some(_) => None,
+        None => Some(D3d11TestWindow::new(width, height)?),
+    };
+    let hwnd = target_hwnd.unwrap_or_else(|| {
+        window
+            .as_ref()
+            .expect("D3D11 test window exists")
+            .hwnd_value()
+    });
+    renderer
+        .attach_target(RenderTarget::WindowHandle(hwnd))
+        .map_err(|error| anyhow::anyhow!("attach D3D11 renderer failed: {error}"))?;
+
+    run_d3d11_render_loop(window, Box::new(renderer), receiver)
+}
+
 #[cfg(target_os = "macos")]
 fn run_macos_render_loop(
     window: Option<MacosTestWindow>,
@@ -639,7 +714,7 @@ fn run_macos_render_loop(
 ) -> Result<()> {
     loop {
         match receiver.recv_timeout(Duration::from_millis(8)) {
-            Ok(RenderCommand::Frame(input)) => upload_render_input(&mut *renderer, input)?,
+            Ok(RenderCommand::Frame(job)) => complete_render_job(&mut *renderer, job)?,
             Ok(RenderCommand::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
@@ -658,7 +733,7 @@ fn run_renderer_upload_loop(
 ) -> Result<()> {
     loop {
         match receiver.recv() {
-            Ok(RenderCommand::Frame(input)) => upload_render_input(&mut *renderer, input)?,
+            Ok(RenderCommand::Frame(job)) => complete_render_job(&mut *renderer, job)?,
             Ok(RenderCommand::Stop) | Err(_) => break,
         }
     }
@@ -676,8 +751,8 @@ fn run_d3d11_render_loop(
         Some(window) => loop {
             window.pump_messages();
             match receiver.recv_timeout(Duration::from_millis(8)) {
-                Ok(RenderCommand::Frame(input)) => {
-                    upload_render_input(&mut *renderer, input)?;
+                Ok(RenderCommand::Frame(job)) => {
+                    complete_render_job(&mut *renderer, job)?;
                 }
                 Ok(RenderCommand::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -685,8 +760,8 @@ fn run_d3d11_render_loop(
         },
         None => loop {
             match receiver.recv() {
-                Ok(RenderCommand::Frame(input)) => {
-                    upload_render_input(&mut *renderer, input)?;
+                Ok(RenderCommand::Frame(job)) => {
+                    complete_render_job(&mut *renderer, job)?;
                 }
                 Ok(RenderCommand::Stop) | Err(_) => break,
             }
@@ -701,6 +776,16 @@ fn upload_render_input(renderer: &mut dyn RendererInstance, input: RenderInput) 
     renderer
         .upload_frame(frame)
         .map_err(|error| anyhow::anyhow!("upload frame to renderer failed: {error}"))
+}
+
+fn complete_render_job(renderer: &mut dyn RendererInstance, job: RenderJob) -> Result<()> {
+    let result = upload_render_input(renderer, job.input);
+    let completion = result
+        .as_ref()
+        .map(|_| ())
+        .map_err(|error| error.to_string());
+    let _ = job.completion.send(completion);
+    result
 }
 
 #[cfg(target_os = "macos")]
@@ -1271,17 +1356,26 @@ impl TestHarness {
             _ => VideoCodec::H264,
         };
 
+        let renderer = config
+            .renderer
+            .as_ref()
+            .map(|renderer_type| {
+                PipelineRenderer::new(renderer_type, width, height, config.renderer_target_hwnd)
+            })
+            .transpose()?;
+        let renderer_d3d11_device_ptr = renderer
+            .as_ref()
+            .and_then(PipelineRenderer::d3d11_device_ptr);
+
         let (encoder, decoder, use_decoder) = match chain {
             TestChain::CaptureOnly => (None, None, false),
             TestChain::NvencNvdec => {
                 let encoder =
                     NvencH264Encoder::new_with_bitrate(width, height, fps, low_latency_bitrate)
                         .map_err(|e| anyhow::anyhow!("NVENC 编码器初始化失败: {:?}", e))?;
-                let mut decoder = NvdecDecoder::new_with_output_mode(NvdecOutputMode::CpuNv12)
-                    .map_err(|e| anyhow::anyhow!("NVDEC 解码器初始化失败: {:?}", e))?;
-                if use_shared_texture_decode {
-                    enable_nvdec_shared_texture(&mut decoder);
-                }
+                let decoder =
+                    create_h264_nvdec_decoder(use_shared_texture_decode, renderer_d3d11_device_ptr)
+                        .map_err(|e| anyhow::anyhow!("NVDEC 解码器初始化失败: {e}"))?;
                 (
                     Some(Box::new(encoder) as Box<dyn VideoEncoder>),
                     Some(PipelineDecoder::Nvdec(decoder)),
@@ -1343,11 +1437,11 @@ impl TestHarness {
                             low_latency_bitrate,
                         )
                         .map_err(|e| anyhow::anyhow!("NVENC 编码器初始化失败: {:?}", e))?;
-                        let mut dec = NvdecDecoder::new_with_output_mode(NvdecOutputMode::CpuNv12)
-                            .map_err(|e| anyhow::anyhow!("NVDEC 解码器初始化失败: {:?}", e))?;
-                        if use_shared_texture_decode {
-                            enable_nvdec_shared_texture(&mut dec);
-                        }
+                        let dec = create_h264_nvdec_decoder(
+                            use_shared_texture_decode,
+                            renderer_d3d11_device_ptr,
+                        )
+                        .map_err(|e| anyhow::anyhow!("NVDEC 解码器初始化失败: {e}"))?;
                         (
                             Some(Box::new(enc) as Box<dyn VideoEncoder>),
                             Some(PipelineDecoder::Nvdec(dec)),
@@ -1399,14 +1493,11 @@ impl TestHarness {
                             (Some(Box::new(enc) as Box<dyn VideoEncoder>), None, false)
                         }
                         DecoderType::Nvdec => {
-                            let mut dec =
-                                NvdecDecoder::new_with_output_mode(NvdecOutputMode::CpuNv12)
-                                    .map_err(|e| {
-                                        anyhow::anyhow!("NVDEC decoder init failed: {:?}", e)
-                                    })?;
-                            if use_shared_texture_decode {
-                                enable_nvdec_shared_texture(&mut dec);
-                            }
+                            let dec = create_h264_nvdec_decoder(
+                                use_shared_texture_decode,
+                                renderer_d3d11_device_ptr,
+                            )
+                            .map_err(|e| anyhow::anyhow!("NVDEC decoder init failed: {e}"))?;
                             (
                                 Some(Box::new(enc) as Box<dyn VideoEncoder>),
                                 Some(PipelineDecoder::Nvdec(dec)),
@@ -1467,15 +1558,13 @@ impl TestHarness {
                                 (Some(Box::new(enc) as Box<dyn VideoEncoder>), None, false)
                             }
                             DecoderType::Nvdec => {
-                                let mut dec = NvdecDecoder::new_av1_with_output_mode(
-                                    NvdecOutputMode::CpuNv12,
+                                let dec = create_av1_nvdec_decoder(
+                                    use_shared_texture_decode,
+                                    renderer_d3d11_device_ptr,
                                 )
                                 .map_err(|e| {
-                                    anyhow::anyhow!("NVDEC AV1 decoder init failed: {:?}", e)
+                                    anyhow::anyhow!("NVDEC AV1 decoder init failed: {e}")
                                 })?;
-                                if use_shared_texture_decode {
-                                    enable_nvdec_shared_texture(&mut dec);
-                                }
                                 (
                                     Some(Box::new(enc) as Box<dyn VideoEncoder>),
                                     Some(PipelineDecoder::Nvdec(dec)),
@@ -1505,14 +1594,6 @@ impl TestHarness {
         };
 
         let transport = PipelineTransport::new(config.transport.as_ref(), fps, encoded_codec);
-
-        let renderer = config
-            .renderer
-            .as_ref()
-            .map(|renderer_type| {
-                PipelineRenderer::new(renderer_type, width, height, config.renderer_target_hwnd)
-            })
-            .transpose()?;
 
         Ok(PipelineState {
             capture,
@@ -1942,12 +2023,13 @@ impl TestHarness {
     pub fn get_pipeline_comparison_result(&self) -> PipelineComparisonResult {
         let metrics = self.get_metrics();
         let (pipeline, codec) = comparison_labels(&self.chain);
+        let transport = comparison_transport_label(&self.chain, self.config.transport.as_ref());
         let memory_path = if self.config.zero_copy.unwrap_or(false) {
             "d3d11-shared"
         } else {
             "cpu"
         };
-        metrics.to_pipeline_comparison_result(pipeline, codec, memory_path)
+        metrics.to_pipeline_comparison_result(pipeline, codec, memory_path, transport)
     }
 
     pub fn get_latest_frames_since(
@@ -2008,6 +2090,71 @@ fn enable_nvdec_shared_texture(decoder: &mut NvdecDecoder) {
 
 #[cfg(not(windows))]
 fn enable_nvdec_shared_texture(_decoder: &mut NvdecDecoder) {}
+
+fn create_h264_nvdec_decoder(
+    use_shared_texture_decode: bool,
+    d3d11_device_ptr: Option<*mut core::ffi::c_void>,
+) -> Result<NvdecDecoder> {
+    #[cfg(windows)]
+    {
+        if use_shared_texture_decode {
+            if let Some(d3d11_device_ptr) = d3d11_device_ptr {
+                return unsafe {
+                    NvdecDecoder::new_with_output_mode_and_d3d11_device_ptr(
+                        NvdecOutputMode::CpuNv12,
+                        d3d11_device_ptr,
+                    )
+                }
+                .map_err(|e| anyhow::anyhow!("{e}"));
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = d3d11_device_ptr;
+    }
+
+    let mut decoder = NvdecDecoder::new_with_output_mode(NvdecOutputMode::CpuNv12)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if use_shared_texture_decode {
+        enable_nvdec_shared_texture(&mut decoder);
+    }
+    Ok(decoder)
+}
+
+fn create_av1_nvdec_decoder(
+    use_shared_texture_decode: bool,
+    d3d11_device_ptr: Option<*mut core::ffi::c_void>,
+) -> Result<NvdecDecoder> {
+    #[cfg(windows)]
+    {
+        if use_shared_texture_decode {
+            if let Some(d3d11_device_ptr) = d3d11_device_ptr {
+                return unsafe {
+                    NvdecDecoder::new_av1_with_output_mode_and_d3d11_device_ptr(
+                        NvdecOutputMode::CpuNv12,
+                        d3d11_device_ptr,
+                    )
+                }
+                .map_err(|e| anyhow::anyhow!("{e}"));
+            }
+        }
+
+        let mut decoder = NvdecDecoder::new_av1_with_output_mode(NvdecOutputMode::CpuNv12)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if use_shared_texture_decode {
+            enable_nvdec_shared_texture(&mut decoder);
+        }
+        return Ok(decoder);
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = (use_shared_texture_decode, d3d11_device_ptr);
+        anyhow::bail!("NVDEC AV1 decoder is only available on Windows")
+    }
+}
 
 fn create_videotoolbox_h264_encoder(
     width: usize,
@@ -2081,6 +2228,25 @@ fn comparison_labels(chain: &TestChain) -> (&'static str, &'static str) {
             };
             (pipeline, codec)
         }
+    }
+}
+
+fn comparison_transport_label(
+    chain: &TestChain,
+    transport: Option<&TransportKind>,
+) -> &'static str {
+    let uses_encoded_transport = match chain {
+        TestChain::CaptureOnly => false,
+        TestChain::Custom { encoder, .. } => !matches!(encoder, EncoderType::None),
+        _ => true,
+    };
+    if !uses_encoded_transport {
+        return "none";
+    }
+    match transport.unwrap_or(&TransportKind::Loopback) {
+        TransportKind::Loopback => "loopback",
+        TransportKind::WebrtcRtp => "webrtc-rtp",
+        TransportKind::QuicDatagram => "quic-datagram",
     }
 }
 
@@ -2651,6 +2817,61 @@ fn bytes_per_pixel(format: FramePixelFormat) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mrd_render::{
+        RenderError, RenderFrame, RenderPixelFormat, RenderTarget, RendererInstance,
+        RendererSnapshot,
+    };
+
+    #[derive(Default)]
+    struct RecordingRenderer {
+        uploaded: usize,
+    }
+
+    impl RendererInstance for RecordingRenderer {
+        fn attach_target(&mut self, _target: RenderTarget) -> Result<(), RenderError> {
+            Ok(())
+        }
+
+        fn upload_frame(&mut self, _frame: RenderFrame) -> Result<(), RenderError> {
+            self.uploaded += 1;
+            Ok(())
+        }
+
+        fn snapshot(&self) -> RendererSnapshot {
+            RendererSnapshot {
+                attached_to_target: true,
+                uploaded_frame_count: self.uploaded as u64,
+                last_width: 1,
+                last_height: 1,
+                last_pixel_format: Some(RenderPixelFormat::Bgra32),
+            }
+        }
+    }
+
+    #[test]
+    fn render_job_sends_completion_after_upload() {
+        let mut renderer = RecordingRenderer::default();
+        let (completion_tx, completion_rx) = mpsc::sync_channel(1);
+        let input = RenderInput::Captured(CapturedFrame::from_cpu(
+            1,
+            1,
+            FramePixelFormat::Bgra32,
+            1,
+            vec![0, 0, 0, 255],
+        ));
+
+        complete_render_job(
+            &mut renderer,
+            RenderJob {
+                input,
+                completion: completion_tx,
+            },
+        )
+        .expect("render job");
+
+        assert_eq!(completion_rx.recv().expect("completion"), Ok(()));
+        assert_eq!(renderer.uploaded, 1);
+    }
 
     #[cfg(windows)]
     #[test]
@@ -2670,11 +2891,14 @@ mod tests {
     #[test]
     fn harness_metrics_export_captest_compatible_comparison_result() {
         let metrics = HarnessMetrics {
+            capture_fps: 228.0,
             capture_latency_avg_ms: 0.4,
             encode_latency_avg_ms: 2.1,
+            transport_latency_avg_ms: 0.05,
             decode_latency_avg_ms: 1.7,
             render_latency_avg_ms: 0.8,
             present_latency_avg_ms: 0.2,
+            total_latency_avg_ms: 5.25,
             frame_count: 120,
             encoded_units: 120,
             decoded_frames: 118,
@@ -2688,11 +2912,13 @@ mod tests {
             "capture-encode-decode-render",
             "av1",
             "d3d11-shared",
+            "quic-datagram",
         );
 
         assert_eq!(result.pipeline, "capture-encode-decode-render");
         assert_eq!(result.codec, "av1");
         assert_eq!(result.memory_path, "d3d11-shared");
+        assert_eq!(result.transport, "quic-datagram");
         assert_eq!(result.frames, 120);
         assert_eq!(result.encoded_units, 120);
         assert_eq!(result.decoded_frames, 118);
@@ -2703,6 +2929,9 @@ mod tests {
         assert_eq!(result.avg_decode_time_ms, Some(1.7));
         assert_eq!(result.avg_render_time_ms, Some(0.8));
         assert_eq!(result.avg_present_time_ms, Some(0.2));
+        assert_eq!(result.avg_transport_time_ms, Some(0.05));
+        assert_eq!(result.avg_total_time_ms, Some(5.25));
+        assert_eq!(result.avg_fps, Some(228.0));
         assert_eq!(result.total_bitstream_bytes, 5_000_000);
     }
 

@@ -132,6 +132,26 @@ fn nvdec_decoder_new_returns_structured_result() {
 }
 
 #[test]
+#[cfg(windows)]
+fn nvdec_decoder_rejects_null_external_d3d11_device() {
+    let result = unsafe {
+        NvdecDecoder::new_with_output_mode_and_d3d11_device_ptr(
+            NvdecOutputMode::CpuNv12,
+            core::ptr::null_mut(),
+        )
+    };
+    let error = match result {
+        Ok(_) => panic!("null external D3D11 device must be rejected"),
+        Err(error) => error,
+    };
+
+    assert!(
+        error.contains("D3D11") && error.contains("null"),
+        "expected D3D11 null-device error, got: {error}"
+    );
+}
+
+#[test]
 fn nvdec_push_access_unit_returns_structured_result() {
     let runtime = probe_runtime();
     let mut decoder = match NvdecDecoder::new() {
@@ -227,6 +247,40 @@ fn nvdec_decoder_can_emit_nv12_frame() {
     assert!(pitch >= 128);
     assert!(nv12.len() >= pitch * 128 * 3 / 2);
     assert!(frames[0].cpu_rgb24().is_none());
+}
+
+#[test]
+#[cfg(windows)]
+fn nvdec_decoder_shared_texture_flag_emits_shared_frame() {
+    let mut decoder = match NvdecDecoder::new_with_output_mode(NvdecOutputMode::CpuNv12) {
+        Ok(decoder) => decoder,
+        Err(error) => {
+            assert!(
+                error.contains("nvdec")
+                    || error.contains("cuda")
+                    || error.contains("cu")
+                    || error.contains("failed"),
+                "unexpected constructor error: {error}"
+            );
+            return;
+        }
+    };
+    decoder.enable_shared_texture(true);
+
+    let access_unit = encoded_access_unit();
+    decoder
+        .push_access_unit(access_unit.as_slice())
+        .expect("first access unit should initialize shared output textures");
+    let _ = decoder.drain_decoded_frames();
+    decoder
+        .push_access_unit(access_unit.as_slice())
+        .expect("second access unit should traverse shared texture path");
+
+    let frames = decoder.drain_decoded_frames();
+    assert!(
+        frames.iter().any(|frame| frame.is_shared_texture()),
+        "shared texture flag should emit D3D11 shared frames, got: {frames:?}"
+    );
 }
 
 #[test]

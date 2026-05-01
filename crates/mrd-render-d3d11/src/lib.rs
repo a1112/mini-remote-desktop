@@ -37,6 +37,14 @@ struct SharedNv12Pipeline {
 }
 
 #[cfg(windows)]
+struct SharedNv12SrvCache {
+    y_handle: isize,
+    uv_handle: isize,
+    y_srv: windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView,
+    uv_srv: windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView,
+}
+
+#[cfg(windows)]
 const SHARED_NV12_VERTEX_SHADER: &str = r#"
 struct VsOut {
     float4 position : SV_POSITION;
@@ -93,6 +101,8 @@ pub struct D3d11Renderer {
     surface: Option<RenderSurface>,
     #[cfg(windows)]
     shared_nv12_pipeline: Option<SharedNv12Pipeline>,
+    #[cfg(windows)]
+    shared_nv12_srv_cache: Option<SharedNv12SrvCache>,
     attached_to_target: bool,
     uploaded_frame_count: u64,
     last_width: usize,
@@ -137,6 +147,7 @@ impl D3d11Renderer {
                 context,
                 surface: None,
                 shared_nv12_pipeline: None,
+                shared_nv12_srv_cache: None,
                 attached_to_target: false,
                 uploaded_frame_count: 0,
                 last_width: 0,
@@ -151,6 +162,17 @@ impl D3d11Renderer {
                 "d3d11 renderer 仅支持 Windows".to_string(),
             ))
         }
+    }
+
+    #[cfg(windows)]
+    pub fn device_ptr(&self) -> *mut core::ffi::c_void {
+        use windows::core::Interface;
+        self.device.as_raw()
+    }
+
+    #[cfg(not(windows))]
+    pub fn device_ptr(&self) -> *mut core::ffi::c_void {
+        core::ptr::null_mut()
     }
 
     #[cfg(windows)]
@@ -694,6 +716,36 @@ impl D3d11Renderer {
     }
 
     #[cfg(windows)]
+    fn shared_nv12_srvs(
+        &mut self,
+        y_handle: isize,
+        uv_handle: isize,
+    ) -> Result<
+        (
+            windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView,
+            windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView,
+        ),
+        RenderError,
+    > {
+        if let Some(cache) = self.shared_nv12_srv_cache.as_ref() {
+            if cache.y_handle == y_handle && cache.uv_handle == uv_handle {
+                return Ok((cache.y_srv.clone(), cache.uv_srv.clone()));
+            }
+        }
+
+        let y_srv = self.open_shared_texture_srv(y_handle)?;
+        let uv_srv = self.open_shared_texture_srv(uv_handle)?;
+        self.shared_nv12_srv_cache = Some(SharedNv12SrvCache {
+            y_handle,
+            uv_handle,
+            y_srv: y_srv.clone(),
+            uv_srv: uv_srv.clone(),
+        });
+
+        Ok((y_srv, uv_srv))
+    }
+
+    #[cfg(windows)]
     fn present_shared_bgra_frame(&self, frame: &RenderFrame) -> Result<(), RenderError> {
         use mrd_render::RenderFrameData;
         use windows::Win32::Graphics::Direct3D11::{ID3D11Resource, D3D11_BOX};
@@ -790,8 +842,7 @@ impl D3d11Renderer {
         let surface_height = surface.height;
         let render_target_view = surface.render_target_view.clone();
         let swap_chain = surface.swap_chain.clone();
-        let y_srv = self.open_shared_texture_srv(shared_handle_y)?;
-        let uv_srv = self.open_shared_texture_srv(shared_handle_uv)?;
+        let (y_srv, uv_srv) = self.shared_nv12_srvs(shared_handle_y, shared_handle_uv)?;
         let (vertex_shader, pixel_shader, sampler) = {
             let pipeline = self.ensure_shared_nv12_pipeline()?;
             (
@@ -912,7 +963,7 @@ impl RendererInstance for D3d11Renderer {
 
 #[cfg(test)]
 mod tests {
-    use super::D3d11RendererFactory;
+    use super::{D3d11Renderer, D3d11RendererFactory};
     use mrd_render::{RenderFrame, RenderPixelFormat, RenderTarget, RendererFactory};
 
     #[cfg(windows)]
@@ -952,6 +1003,14 @@ mod tests {
             snapshot.last_pixel_format,
             Some(RenderPixelFormat::D3D11SharedBgra)
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn d3d11_renderer_exposes_device_pointer_for_same_device_decode() {
+        let renderer = D3d11Renderer::new().expect("d3d11 renderer");
+
+        assert_ne!(renderer.device_ptr(), core::ptr::null_mut());
     }
 
     #[cfg(not(windows))]

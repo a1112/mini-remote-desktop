@@ -324,19 +324,30 @@ function unsupportedMatrixReason(config: TestConfig): string | null {
   if (config.zero_copy && config.capture_type !== "dxgi") {
     return "D3D11 shared texture path requires DXGI capture";
   }
-  if (config.zero_copy && config.encoder_type !== "nvenc_h264") {
-    return "D3D11 shared texture input currently requires NVENC H.264";
-  }
-  if (config.encoder_type === "nvenc_av1" && config.zero_copy) {
-    return "NVENC AV1 D3D11 shared input path is not implemented yet";
+  if (
+    config.zero_copy &&
+    config.encoder_type !== "none" &&
+    config.encoder_type !== "nvenc_h264" &&
+    config.encoder_type !== "nvenc_av1"
+  ) {
+    return "D3D11 shared texture input requires direct render, NVENC H.264, or NVENC AV1";
   }
   if (config.encoder_type === "nvenc_av1" && config.decoder_type === "software") {
     return "NVENC AV1 currently requires NVDEC or encode-only matrix runs";
   }
-  if (config.zero_copy && config.decoder_type !== "nvdec") {
+  if (
+    config.zero_copy &&
+    config.encoder_type !== "none" &&
+    config.decoder_type !== "nvdec" &&
+    config.decoder_type !== "none"
+  ) {
     return "D3D11 shared texture path requires NVDEC";
   }
-  if (config.zero_copy && (config.renderer_type !== "d3d11" || !config.render_display)) {
+  if (
+    config.zero_copy &&
+    config.decoder_type !== "none" &&
+    (config.renderer_type !== "d3d11" || !config.render_display)
+  ) {
     return "D3D11 shared texture path requires DX11 popup renderer";
   }
   if (config.renderer_type === "d3d11" && config.capture_type === "macos") {
@@ -840,7 +851,7 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
                     <span className="text-sm">{opt.name}</span>
                     {opt.id === "nvenc_av1" && (
                       <span className="text-xs bg-yellow-100 text-yellow-800 px-1 rounded">
-                        encode only
+                        NVDEC
                       </span>
                     )}
                   </label>

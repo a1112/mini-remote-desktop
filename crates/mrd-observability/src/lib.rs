@@ -204,6 +204,8 @@ pub struct PipelineComparisonResult {
     pub pipeline: String,
     pub codec: String,
     pub memory_path: String,
+    #[serde(default = "default_pipeline_transport")]
+    pub transport: String,
     pub frames: u64,
     pub encoded_units: u64,
     pub decoded_frames: u64,
@@ -214,7 +216,17 @@ pub struct PipelineComparisonResult {
     pub avg_decode_time_ms: Option<f64>,
     pub avg_render_time_ms: Option<f64>,
     pub avg_present_time_ms: Option<f64>,
+    #[serde(default)]
+    pub avg_transport_time_ms: Option<f64>,
+    #[serde(default)]
+    pub avg_total_time_ms: Option<f64>,
+    #[serde(default)]
+    pub avg_fps: Option<f64>,
     pub total_bitstream_bytes: u64,
+}
+
+fn default_pipeline_transport() -> String {
+    "loopback".into()
 }
 
 impl PipelineComparisonResult {
@@ -223,6 +235,7 @@ impl PipelineComparisonResult {
             pipeline: pipeline.into(),
             codec: codec.into(),
             memory_path: "unknown".into(),
+            transport: default_pipeline_transport(),
             frames: 0,
             encoded_units: 0,
             decoded_frames: 0,
@@ -233,12 +246,20 @@ impl PipelineComparisonResult {
             avg_decode_time_ms: None,
             avg_render_time_ms: None,
             avg_present_time_ms: None,
+            avg_transport_time_ms: None,
+            avg_total_time_ms: None,
+            avg_fps: None,
             total_bitstream_bytes: 0,
         }
     }
 
     pub fn with_memory_path(mut self, memory_path: impl Into<String>) -> Self {
         self.memory_path = memory_path.into();
+        self
+    }
+
+    pub fn with_transport(mut self, transport: impl Into<String>) -> Self {
+        self.transport = transport.into();
         self
     }
 
@@ -271,6 +292,21 @@ impl PipelineComparisonResult {
         self.avg_decode_time_ms = decode;
         self.avg_render_time_ms = render;
         self.avg_present_time_ms = present;
+        self
+    }
+
+    pub fn with_transport_stage_ms(mut self, transport: Option<f64>) -> Self {
+        self.avg_transport_time_ms = transport;
+        self
+    }
+
+    pub fn with_total_time_ms(mut self, total: Option<f64>) -> Self {
+        self.avg_total_time_ms = total;
+        self
+    }
+
+    pub fn with_avg_fps(mut self, fps: Option<f64>) -> Self {
+        self.avg_fps = fps;
         self
     }
 
@@ -723,8 +759,12 @@ mod tests {
     fn pipeline_comparison_result_serializes_captest_compatible_fields() {
         let result = PipelineComparisonResult::new("capture-encode-decode-render", "av1")
             .with_memory_path("d3d11-shared")
+            .with_transport("quic-datagram")
             .with_counts(120, 120, 118, 0, 2)
             .with_average_stage_ms(Some(0.4), Some(2.1), Some(1.7), Some(0.8), Some(0.2))
+            .with_transport_stage_ms(Some(0.05))
+            .with_total_time_ms(Some(5.25))
+            .with_avg_fps(Some(228.0))
             .with_total_bitstream_bytes(5_000_000);
 
         let value = serde_json::to_value(result).expect("serialize comparison result");
@@ -732,6 +772,7 @@ mod tests {
         assert_eq!(value["pipeline"], "capture-encode-decode-render");
         assert_eq!(value["codec"], "av1");
         assert_eq!(value["memory_path"], "d3d11-shared");
+        assert_eq!(value["transport"], "quic-datagram");
         assert_eq!(value["frames"], 120);
         assert_eq!(value["encoded_units"], 120);
         assert_eq!(value["decoded_frames"], 118);
@@ -742,6 +783,9 @@ mod tests {
         assert_eq!(value["avg_decode_time_ms"], 1.7);
         assert_eq!(value["avg_render_time_ms"], 0.8);
         assert_eq!(value["avg_present_time_ms"], 0.2);
+        assert_eq!(value["avg_transport_time_ms"], 0.05);
+        assert_eq!(value["avg_total_time_ms"], 5.25);
+        assert_eq!(value["avg_fps"], 228.0);
         assert_eq!(value["total_bitstream_bytes"], 5_000_000);
     }
 
