@@ -418,6 +418,10 @@ impl TestOrchestrator {
                     Some("nvenc_h264") => EncoderType::NvencH264,
                     Some("openh264") => EncoderType::OpenH264,
                     Some("nvenc_av1") => EncoderType::NvencAv1,
+                    Some("nvenc_hevc") | Some("hevc") => EncoderType::NvencHevc,
+                    Some("nvenc_hevc_main10") | Some("hevc_main10") | Some("hevc-main10") => {
+                        EncoderType::NvencHevcMain10
+                    }
                     Some("videotoolbox_h264") | Some("videotoolbox") => {
                         EncoderType::VideoToolboxH264
                     }
@@ -1499,8 +1503,11 @@ impl TestOrchestrator {
             DecodedFrameData::CpuRgb24(_) => "Rgb24".to_string(),
             DecodedFrameData::CpuBgra32(_) => "Bgra32".to_string(),
             DecodedFrameData::CpuNv12 { .. } => "Nv12".to_string(),
+            DecodedFrameData::CpuP010 { .. } => "P010".to_string(),
             #[cfg(windows)]
             DecodedFrameData::D3D11SharedNv12 { .. } => "D3D11SharedNv12".to_string(),
+            #[cfg(windows)]
+            DecodedFrameData::D3D11SharedP010 { .. } => "D3D11SharedP010".to_string(),
         }
     }
 
@@ -1517,12 +1524,28 @@ impl TestOrchestrator {
                 frame.height,
                 Self::cpu_nv12_to_rgb24(data, frame.width, frame.height, *pitch),
             ),
+            DecodedFrameData::CpuP010 { data, pitch } => RenderFrame::from_rgb24(
+                frame.width,
+                frame.height,
+                Self::cpu_p010_to_rgb24(data, frame.width, frame.height, *pitch),
+            ),
             #[cfg(windows)]
             DecodedFrameData::D3D11SharedNv12 {
                 shared_handle_y,
                 shared_handle_uv,
                 ..
             } => RenderFrame::from_d3d11_shared_nv12(
+                frame.width,
+                frame.height,
+                *shared_handle_y,
+                *shared_handle_uv,
+            ),
+            #[cfg(windows)]
+            DecodedFrameData::D3D11SharedP010 {
+                shared_handle_y,
+                shared_handle_uv,
+                ..
+            } => RenderFrame::from_d3d11_shared_p010(
                 frame.width,
                 frame.height,
                 *shared_handle_y,
@@ -1556,6 +1579,48 @@ impl TestOrchestrator {
         }
 
         rgb
+    }
+
+    fn cpu_p010_to_rgb24(p010: &[u8], width: usize, height: usize, pitch: usize) -> Vec<u8> {
+        let mut rgb = vec![0_u8; width * height * 3];
+        let uv_base = pitch * height;
+        let mut out_idx = 0;
+
+        for y in 0..height {
+            let uv_row_start = uv_base + (y / 2) * pitch;
+            for x in 0..width {
+                let y_offset = y * pitch + x * 2;
+                let uv_offset = uv_row_start + (x / 2) * 4;
+                if y_offset + 1 >= p010.len() || uv_offset + 3 >= p010.len() {
+                    out_idx += 3;
+                    continue;
+                }
+
+                let y_sample =
+                    (u16::from_le_bytes([p010[y_offset], p010[y_offset + 1]]) >> 6) as i32;
+                let u =
+                    (u16::from_le_bytes([p010[uv_offset], p010[uv_offset + 1]]) >> 6) as i32 - 512;
+                let v = (u16::from_le_bytes([p010[uv_offset + 2], p010[uv_offset + 3]]) >> 6)
+                    as i32
+                    - 512;
+
+                let r = y_sample + ((1436 * v) >> 10);
+                let g = y_sample - ((352 * u + 731 * v) >> 10);
+                let b = y_sample + ((1815 * u) >> 10);
+
+                rgb[out_idx] = Self::clamp_10bit_to_8bit(r);
+                rgb[out_idx + 1] = Self::clamp_10bit_to_8bit(g);
+                rgb[out_idx + 2] = Self::clamp_10bit_to_8bit(b);
+                out_idx += 3;
+            }
+        }
+
+        rgb
+    }
+
+    #[inline]
+    fn clamp_10bit_to_8bit(value: i32) -> u8 {
+        ((value.clamp(0, 1023) + 2) >> 2) as u8
     }
 
     /// Stop a running test

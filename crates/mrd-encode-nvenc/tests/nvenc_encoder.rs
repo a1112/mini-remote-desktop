@@ -1,4 +1,4 @@
-use mrd_encode_nvenc::NvencH264Encoder;
+use mrd_encode_nvenc::{NvencH264Encoder, NvencHevcEncoder};
 use mrd_pipeline_core::{CapturedFrame, FramePixelFormat, VideoCodec, VideoEncoder};
 
 #[test]
@@ -73,6 +73,46 @@ fn nvenc_h264_access_unit_can_use_baseline_profile() {
         profile_idc, 0x42,
         "baseline constructor should emit H264 baseline profile for webrtc compatibility"
     );
+}
+
+#[test]
+fn nvenc_hevc_encoder_prefers_d3d11_shared_bgra_input() {
+    assert_eq!(
+        NvencHevcEncoder::preferred_input_memory_kind(),
+        mrd_pipeline_core::FrameMemoryKind::D3D11SharedBgra
+    );
+}
+
+#[test]
+fn nvenc_hevc_main10_encoder_prefers_d3d11_shared_bgra_input() {
+    assert_eq!(
+        NvencHevcEncoder::preferred_main10_input_memory_kind(),
+        mrd_pipeline_core::FrameMemoryKind::D3D11SharedBgra
+    );
+}
+
+#[test]
+fn nvenc_hevc_encoder_emits_hevc_access_unit_when_available() {
+    let Ok(mut encoder) = NvencHevcEncoder::new_main(16, 16, 30) else {
+        return;
+    };
+
+    let frame = CapturedFrame::from_cpu(
+        16,
+        16,
+        FramePixelFormat::Bgra32,
+        33_000,
+        vec![0x7f; 16 * 16 * 4],
+    );
+    let access_unit = encoder
+        .encode(&frame)
+        .expect("nvenc hevc encode frame")
+        .into_iter()
+        .next()
+        .expect("single access unit");
+
+    assert_eq!(access_unit.codec, VideoCodec::Hevc);
+    assert!(!access_unit.bytes.is_empty());
 }
 
 fn extract_sps_profile_idc(access_unit: &[u8]) -> Option<u8> {

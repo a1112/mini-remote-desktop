@@ -138,8 +138,12 @@ try {
         $encoder = "nvenc_av1"
     } elseif ($codecName -eq "h264") {
         $encoder = "nvenc_h264"
+    } elseif ($codecName -eq "hevc") {
+        $encoder = "nvenc_hevc"
+    } elseif ($codecName -eq "hevc-main10" -or $codecName -eq "hevc_main10" -or $codecName -eq "main10") {
+        $encoder = "nvenc_hevc_main10"
     } else {
-        throw "Unsupported codec '$Codec'. Supported values: av1, h264"
+        throw "Unsupported codec '$Codec'. Supported values: av1, h264, hevc, hevc-main10"
     }
 
     $compareInputs += Invoke-RdeskPipeline -Pipeline "capture-encode" -Encoder $encoder -Decoder "none"

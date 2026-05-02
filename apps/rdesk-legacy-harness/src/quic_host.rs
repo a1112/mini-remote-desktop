@@ -653,8 +653,12 @@ fn apply_decoded_frames_to_snapshot(
         snapshot_guard.last_decoded_pixel_format = Some(match &frame.data {
             DecodedFrameData::CpuRgb24(_) => "Rgb24".to_string(),
             DecodedFrameData::CpuBgra32(_) => "Bgra32".to_string(),
+            DecodedFrameData::CpuNv12 { .. } => "Nv12".to_string(),
+            DecodedFrameData::CpuP010 { .. } => "P010".to_string(),
             #[cfg(windows)]
             DecodedFrameData::D3D11SharedNv12 { .. } => "D3d11Texture".to_string(),
+            #[cfg(windows)]
+            DecodedFrameData::D3D11SharedP010 { .. } => "D3d11Texture".to_string(),
         });
         if let Some(frame_sink) = frame_sink.as_ref() {
             let bytes = frame.cpu_bytes().map(|b| b.len()).unwrap_or(0);

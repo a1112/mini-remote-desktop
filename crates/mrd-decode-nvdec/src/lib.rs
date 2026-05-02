@@ -9,9 +9,19 @@ pub enum NvdecDecodedFrameData {
     CpuRgb24(Vec<u8>),
     /// CPU NV12 data with decoder pitch.
     CpuNv12 { data: Vec<u8>, pitch: usize },
+    /// CPU P010/P016 data with decoder pitch.
+    CpuP010 { data: Vec<u8>, pitch: usize },
     /// D3D11 shared texture handle (zero-copy path)
     #[cfg(windows)]
     D3D11SharedNv12 {
+        shared_handle_y: isize,
+        shared_handle_uv: isize,
+        width: u32,
+        height: u32,
+    },
+    /// D3D11 shared P010/P016 texture handles (zero-copy Main10 path)
+    #[cfg(windows)]
+    D3D11SharedP010 {
         shared_handle_y: isize,
         shared_handle_uv: isize,
         width: u32,
@@ -45,12 +55,24 @@ impl NvdecDecodedFrame {
         }
     }
 
+    /// Create a decoded frame from CPU P010/P016 data.
+    pub fn from_cpu_p010(width: usize, height: usize, pitch: usize, data: Vec<u8>) -> Self {
+        Self {
+            width,
+            height,
+            data: NvdecDecodedFrameData::CpuP010 { data, pitch },
+        }
+    }
+
     /// Check if this frame uses shared texture (zero-copy)
     pub fn is_shared_texture(&self) -> bool {
         match &self.data {
-            NvdecDecodedFrameData::CpuRgb24(_) | NvdecDecodedFrameData::CpuNv12 { .. } => false,
+            NvdecDecodedFrameData::CpuRgb24(_)
+            | NvdecDecodedFrameData::CpuNv12 { .. }
+            | NvdecDecodedFrameData::CpuP010 { .. } => false,
             #[cfg(windows)]
-            NvdecDecodedFrameData::D3D11SharedNv12 { .. } => true,
+            NvdecDecodedFrameData::D3D11SharedNv12 { .. }
+            | NvdecDecodedFrameData::D3D11SharedP010 { .. } => true,
         }
     }
 
@@ -58,9 +80,10 @@ impl NvdecDecodedFrame {
     pub fn cpu_rgb24(&self) -> Option<&[u8]> {
         match &self.data {
             NvdecDecodedFrameData::CpuRgb24(data) => Some(data.as_slice()),
-            NvdecDecodedFrameData::CpuNv12 { .. } => None,
+            NvdecDecodedFrameData::CpuNv12 { .. } | NvdecDecodedFrameData::CpuP010 { .. } => None,
             #[cfg(windows)]
-            NvdecDecodedFrameData::D3D11SharedNv12 { .. } => None,
+            NvdecDecodedFrameData::D3D11SharedNv12 { .. }
+            | NvdecDecodedFrameData::D3D11SharedP010 { .. } => None,
         }
     }
 
@@ -68,9 +91,21 @@ impl NvdecDecodedFrame {
     pub fn cpu_nv12(&self) -> Option<(&[u8], usize)> {
         match &self.data {
             NvdecDecodedFrameData::CpuNv12 { data, pitch } => Some((data.as_slice(), *pitch)),
-            NvdecDecodedFrameData::CpuRgb24(_) => None,
+            NvdecDecodedFrameData::CpuRgb24(_) | NvdecDecodedFrameData::CpuP010 { .. } => None,
             #[cfg(windows)]
-            NvdecDecodedFrameData::D3D11SharedNv12 { .. } => None,
+            NvdecDecodedFrameData::D3D11SharedNv12 { .. }
+            | NvdecDecodedFrameData::D3D11SharedP010 { .. } => None,
+        }
+    }
+
+    /// Get the CPU P010/P016 data and pitch if available.
+    pub fn cpu_p010(&self) -> Option<(&[u8], usize)> {
+        match &self.data {
+            NvdecDecodedFrameData::CpuP010 { data, pitch } => Some((data.as_slice(), *pitch)),
+            NvdecDecodedFrameData::CpuRgb24(_) | NvdecDecodedFrameData::CpuNv12 { .. } => None,
+            #[cfg(windows)]
+            NvdecDecodedFrameData::D3D11SharedNv12 { .. }
+            | NvdecDecodedFrameData::D3D11SharedP010 { .. } => None,
         }
     }
 
@@ -78,8 +113,13 @@ impl NvdecDecodedFrame {
     #[cfg(windows)]
     pub fn d3d11_shared_handle(&self) -> Option<isize> {
         match &self.data {
-            NvdecDecodedFrameData::CpuRgb24(_) | NvdecDecodedFrameData::CpuNv12 { .. } => None,
+            NvdecDecodedFrameData::CpuRgb24(_)
+            | NvdecDecodedFrameData::CpuNv12 { .. }
+            | NvdecDecodedFrameData::CpuP010 { .. } => None,
             NvdecDecodedFrameData::D3D11SharedNv12 {
+                shared_handle_y, ..
+            }
+            | NvdecDecodedFrameData::D3D11SharedP010 {
                 shared_handle_y, ..
             } => Some(*shared_handle_y),
         }
@@ -89,8 +129,15 @@ impl NvdecDecodedFrame {
     #[cfg(windows)]
     pub fn d3d11_shared_handles(&self) -> Option<(isize, isize)> {
         match &self.data {
-            NvdecDecodedFrameData::CpuRgb24(_) | NvdecDecodedFrameData::CpuNv12 { .. } => None,
+            NvdecDecodedFrameData::CpuRgb24(_)
+            | NvdecDecodedFrameData::CpuNv12 { .. }
+            | NvdecDecodedFrameData::CpuP010 { .. } => None,
             NvdecDecodedFrameData::D3D11SharedNv12 {
+                shared_handle_y,
+                shared_handle_uv,
+                ..
+            }
+            | NvdecDecodedFrameData::D3D11SharedP010 {
                 shared_handle_y,
                 shared_handle_uv,
                 ..
@@ -108,6 +155,8 @@ pub enum NvdecOutputMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NvdecCodecKind {
     H264,
+    Hevc,
+    HevcMain10,
     Av1,
 }
 
@@ -197,6 +246,14 @@ impl NvdecDecoder {
         Self::new_for_codec_with_output_mode(NvdecCodecKind::Av1, output_mode)
     }
 
+    pub fn new_hevc_with_output_mode(output_mode: NvdecOutputMode) -> Result<Self, String> {
+        Self::new_for_codec_with_output_mode(NvdecCodecKind::Hevc, output_mode)
+    }
+
+    pub fn new_hevc_main10_with_output_mode(output_mode: NvdecOutputMode) -> Result<Self, String> {
+        Self::new_for_codec_with_output_mode(NvdecCodecKind::HevcMain10, output_mode)
+    }
+
     pub fn new_for_codec_with_output_mode(
         codec: NvdecCodecKind,
         output_mode: NvdecOutputMode,
@@ -256,6 +313,34 @@ impl NvdecDecoder {
         unsafe {
             Self::new_for_codec_with_output_mode_and_d3d11_device_ptr(
                 NvdecCodecKind::Av1,
+                output_mode,
+                d3d11_device_ptr,
+            )
+        }
+    }
+
+    #[cfg(windows)]
+    pub unsafe fn new_hevc_with_output_mode_and_d3d11_device_ptr(
+        output_mode: NvdecOutputMode,
+        d3d11_device_ptr: *mut c_void,
+    ) -> Result<Self, String> {
+        unsafe {
+            Self::new_for_codec_with_output_mode_and_d3d11_device_ptr(
+                NvdecCodecKind::Hevc,
+                output_mode,
+                d3d11_device_ptr,
+            )
+        }
+    }
+
+    #[cfg(windows)]
+    pub unsafe fn new_hevc_main10_with_output_mode_and_d3d11_device_ptr(
+        output_mode: NvdecOutputMode,
+        d3d11_device_ptr: *mut c_void,
+    ) -> Result<Self, String> {
+        unsafe {
+            Self::new_for_codec_with_output_mode_and_d3d11_device_ptr(
+                NvdecCodecKind::HevcMain10,
                 output_mode,
                 d3d11_device_ptr,
             )
@@ -430,8 +515,8 @@ pub fn probe_runtime() -> NvdecRuntimeProbe {
 fn runtime_capability_probes() -> Vec<NvdecCapabilityProbe> {
     [
         ("h264", 0, 1, "H264 decode path wired"),
-        ("hevc", 0, 1, "HEVC decode path not wired yet"),
-        ("hevc", 2, 1, "HEVC Main10 decode path not wired yet"),
+        ("hevc", 0, 1, "HEVC Main decode path wired"),
+        ("hevc", 2, 1, "HEVC Main10 decode path wired"),
         (
             "av1",
             0,
@@ -495,7 +580,8 @@ mod imp {
         D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
     };
     use windows::Win32::Graphics::Dxgi::Common::{
-        DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC,
+        DXGI_FORMAT_R16G16_UNORM, DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R8G8_UNORM,
+        DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC,
     };
     use windows::Win32::Graphics::Dxgi::IDXGIResource;
     use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
@@ -520,6 +606,7 @@ mod imp {
     const CUDA_VIDEO_CHROMA_420: i32 = 1;
     const CUDA_VIDEO_CREATE_PREFER_CUVID: u32 = 0x04;
     const CUDA_VIDEO_SURFACE_NV12: i32 = 0;
+    const CUDA_VIDEO_SURFACE_P016: i32 = 1;
     const CUDA_VIDEO_DEINTERLACE_WEAVE: i32 = 0;
     const CUVID_PKT_ENDOFPICTURE: u32 = 0x08;
     const CUVID_PARSER_ANNEXB: u32 = 0x01;
@@ -594,6 +681,36 @@ mod imp {
     // CUDA graphics register flags for D3D11
     const CU_GRAPHICS_REGISTER_FLAGS_NONE: u32 = 0x00;
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum DecodedSurfaceKind {
+        Nv12,
+        P010,
+    }
+
+    impl DecodedSurfaceKind {
+        fn from_bit_depth(bit_depth_minus8: u8) -> Self {
+            if bit_depth_minus8 > 0 {
+                Self::P010
+            } else {
+                Self::Nv12
+            }
+        }
+
+        fn bytes_per_sample(self) -> usize {
+            match self {
+                Self::Nv12 => 1,
+                Self::P010 => 2,
+            }
+        }
+
+        fn cuda_output_format(self) -> i32 {
+            match self {
+                Self::Nv12 => CUDA_VIDEO_SURFACE_NV12,
+                Self::P010 => CUDA_VIDEO_SURFACE_P016,
+            }
+        }
+    }
+
     // D3D11 shared texture for CUDA-D3D11 interop
     #[allow(dead_code)]
     struct D3D11SharedTexture {
@@ -605,10 +722,11 @@ mod imp {
         shared_handle_uv: isize,
         width: u32,
         height: u32,
+        surface_kind: DecodedSurfaceKind,
     }
 
     impl D3D11SharedTexture {
-        fn new(width: u32, height: u32) -> Result<Self, String> {
+        fn new(width: u32, height: u32, surface_kind: DecodedSurfaceKind) -> Result<Self, String> {
             unsafe {
                 // Create D3D11 device
                 let mut device = None::<ID3D11Device>;
@@ -628,13 +746,14 @@ mod imp {
 
                 let device = device.ok_or("缺少 D3D11 device")?;
                 let context = context.ok_or("缺少 D3D11 context")?;
-                Self::from_device(device, context, width, height)
+                Self::from_device(device, context, width, height, surface_kind)
             }
         }
 
         unsafe fn new_with_device_ptr(
             width: u32,
             height: u32,
+            surface_kind: DecodedSurfaceKind,
             device_ptr: *mut c_void,
         ) -> Result<Self, String> {
             if device_ptr.is_null() {
@@ -648,7 +767,7 @@ mod imp {
             };
             let context = unsafe { device.GetImmediateContext() }
                 .map_err(|e| format!("获取外部 D3D11 immediate context 失败: {e}"))?;
-            Self::from_device(device, context, width, height)
+            Self::from_device(device, context, width, height, surface_kind)
         }
 
         fn from_device(
@@ -656,14 +775,19 @@ mod imp {
             context: ID3D11DeviceContext,
             width: u32,
             height: u32,
+            surface_kind: DecodedSurfaceKind,
         ) -> Result<Self, String> {
+            let (y_format, uv_format) = match surface_kind {
+                DecodedSurfaceKind::Nv12 => (DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM),
+                DecodedSurfaceKind::P010 => (DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R16G16_UNORM),
+            };
             // Create Y plane texture (R8, single channel, shared)
             let y_desc = D3D11_TEXTURE2D_DESC {
                 Width: width,
                 Height: height,
                 MipLevels: 1,
                 ArraySize: 1,
-                Format: DXGI_FORMAT_R8_UNORM,
+                Format: y_format,
                 SampleDesc: DXGI_SAMPLE_DESC {
                     Count: 1,
                     Quality: 0,
@@ -688,7 +812,7 @@ mod imp {
                 Height: height / 2,
                 MipLevels: 1,
                 ArraySize: 1,
-                Format: DXGI_FORMAT_R8G8_UNORM,
+                Format: uv_format,
                 SampleDesc: DXGI_SAMPLE_DESC {
                     Count: 1,
                     Quality: 0,
@@ -729,6 +853,7 @@ mod imp {
                 shared_handle_uv: shared_handle_uv.0 as isize,
                 width,
                 height,
+                surface_kind,
             })
         }
 
@@ -1202,7 +1327,14 @@ mod imp {
         ) -> Result<Self, String> {
             let parser_codec = match codec {
                 super::NvdecCodecKind::H264 => CUDA_VIDEO_CODEC_H264,
+                super::NvdecCodecKind::Hevc | super::NvdecCodecKind::HevcMain10 => {
+                    CUDA_VIDEO_CODEC_HEVC
+                }
                 super::NvdecCodecKind::Av1 => CUDA_VIDEO_CODEC_AV1,
+            };
+            let initial_probe_bit_depth = match codec {
+                super::NvdecCodecKind::HevcMain10 => 2,
+                _ => 0,
             };
 
             let cuda = CudaApi::load()?;
@@ -1229,7 +1361,7 @@ mod imp {
                 let mut caps = CUVIDDECODECAPS {
                     eCodecType: parser_codec,
                     eChromaFormat: CUDA_VIDEO_CHROMA_420,
-                    nBitDepthMinus8: 0,
+                    nBitDepthMinus8: initial_probe_bit_depth,
                     ..Default::default()
                 };
                 let caps_result = unsafe { get_caps(&mut caps) };
@@ -1365,15 +1497,23 @@ mod imp {
                 return Err(message);
             }
 
-            if self.parser_codec == CUDA_VIDEO_CODEC_H264 && !looks_like_annexb(access_unit) {
+            if matches!(
+                self.parser_codec,
+                CUDA_VIDEO_CODEC_H264 | CUDA_VIDEO_CODEC_HEVC
+            ) && !looks_like_annexb(access_unit)
+            {
                 self.callback_state.clear_access_unit_state();
-                let message =
-                    "nvdec input validation failed: expected H264 Annex-B access unit".to_string();
+                let message = format!(
+                    "nvdec input validation failed: expected {} Annex-B access unit",
+                    describe_codec(self.parser_codec)
+                );
                 self.callback_state.last_error = Some(message.clone());
                 self.callback_state.diagnostics.last_stage = Some("input".to_string());
                 self.callback_state.diagnostics.last_api = Some("push_access_unit".to_string());
-                self.callback_state.diagnostics.last_error_description =
-                    Some("expected H264 Annex-B start code".to_string());
+                self.callback_state.diagnostics.last_error_description = Some(format!(
+                    "expected {} Annex-B start code",
+                    describe_codec(self.parser_codec)
+                ));
                 return Err(message);
             }
 
@@ -1426,12 +1566,23 @@ mod imp {
             if self.enable_shared_texture && self.shared_texture.is_none() {
                 let (width, height) = self.callback_state.output_dimensions_u32();
                 if width > 0 && height > 0 {
+                    let surface_kind = self
+                        .callback_state
+                        .decoder_config
+                        .as_ref()
+                        .map(|config| DecodedSurfaceKind::from_bit_depth(config.bit_depth_minus8))
+                        .unwrap_or(DecodedSurfaceKind::Nv12);
                     let texture_result = if let Some(device_ptr) = self.external_d3d11_device_ptr {
                         unsafe {
-                            D3D11SharedTexture::new_with_device_ptr(width, height, device_ptr)
+                            D3D11SharedTexture::new_with_device_ptr(
+                                width,
+                                height,
+                                surface_kind,
+                                device_ptr,
+                            )
                         }
                     } else {
-                        D3D11SharedTexture::new(width, height)
+                        D3D11SharedTexture::new(width, height, surface_kind)
                     };
                     match texture_result {
                         Ok(texture) => {
@@ -1626,6 +1777,7 @@ mod imp {
             y_pitch: u32,
             width: usize,
             height: usize,
+            surface_kind: DecodedSurfaceKind,
         ) -> bool {
             // Check if all required CUDA-D3D11 interop functions are available
             let register_fn = match self.cu_graphics_d3d11_register_resource {
@@ -1730,7 +1882,7 @@ mod imp {
                 dstDevice: 0,
                 dstArray: y_array,
                 dstPitch: 0,
-                WidthInBytes: width,
+                WidthInBytes: width * surface_kind.bytes_per_sample(),
                 Height: height,
             };
             let copy_result = unsafe { copy_fn(&copy_y) };
@@ -1754,7 +1906,7 @@ mod imp {
                 dstDevice: 0,
                 dstArray: uv_array,
                 dstPitch: 0,
-                WidthInBytes: width,
+                WidthInBytes: width * surface_kind.bytes_per_sample(),
                 Height: height / 2,
             };
             let copy_result_uv = unsafe { copy_fn(&copy_uv) };
@@ -1807,8 +1959,8 @@ mod imp {
                 return SequenceChangeDecision::Unsupported("chroma format change");
             }
 
-            if next.bit_depth_minus8 != 0 {
-                return SequenceChangeDecision::Unsupported("bit depth change");
+            if self.bit_depth_minus8 != next.bit_depth_minus8 {
+                return SequenceChangeDecision::Recreate("bit depth changed");
             }
 
             if self.coded_width != next.coded_width || self.coded_height != next.coded_height {
@@ -1829,7 +1981,9 @@ mod imp {
         }
 
         fn evaluate_reconfigure(&self, next: &SequenceFormat) -> ReconfigureDecision {
-            if next.chroma_format != CUDA_VIDEO_CHROMA_420 || next.bit_depth_minus8 != 0 {
+            if next.chroma_format != CUDA_VIDEO_CHROMA_420
+                || self.bit_depth_minus8 != next.bit_depth_minus8
+            {
                 return ReconfigureDecision::SkipUnsupported;
             }
 
@@ -2060,6 +2214,11 @@ mod imp {
         }
 
         let (width, height) = state.output_dimensions();
+        let surface_kind = state
+            .decoder_config
+            .as_ref()
+            .map(|config| DecodedSurfaceKind::from_bit_depth(config.bit_depth_minus8))
+            .unwrap_or(DecodedSurfaceKind::Nv12);
 
         // Try GPU zero-copy if shared texture mode is enabled
         let gpu_copy_success = if state.use_shared_texture {
@@ -2075,6 +2234,7 @@ mod imp {
                     pitch,
                     width,
                     height,
+                    surface_kind,
                 )
             } else {
                 false
@@ -2089,27 +2249,43 @@ mod imp {
             if let (Some(shared_y), Some(shared_uv)) =
                 (state.shared_texture_y, state.shared_texture_uv)
             {
-                state.frames.push(NvdecDecodedFrame {
-                    width,
-                    height,
-                    data: NvdecDecodedFrameData::D3D11SharedNv12 {
+                let data = match surface_kind {
+                    DecodedSurfaceKind::Nv12 => NvdecDecodedFrameData::D3D11SharedNv12 {
                         shared_handle_y: shared_y,
                         shared_handle_uv: shared_uv,
                         width: width as u32,
                         height: height as u32,
                     },
+                    DecodedSurfaceKind::P010 => NvdecDecodedFrameData::D3D11SharedP010 {
+                        shared_handle_y: shared_y,
+                        shared_handle_uv: shared_uv,
+                        width: width as u32,
+                        height: height as u32,
+                    },
+                };
+                state.frames.push(NvdecDecodedFrame {
+                    width,
+                    height,
+                    data,
                 });
             } else {
                 // Shouldn't happen, but fallback to CPU path
                 let y_plane_bytes = pitch as usize * height;
                 let uv_plane_bytes = pitch as usize * (height / 2);
                 let total = y_plane_bytes + uv_plane_bytes;
-                let mut nv12 = vec![0_u8; total];
+                let mut surface = vec![0_u8; total];
                 let copy_result = unsafe {
-                    (state.cu_memcpy_dtoh)(nv12.as_mut_ptr() as *mut c_void, dev_ptr, total)
+                    (state.cu_memcpy_dtoh)(surface.as_mut_ptr() as *mut c_void, dev_ptr, total)
                 };
                 if copy_result == CUDA_SUCCESS {
-                    push_cpu_decoded_frame(state, width, height, pitch as usize, nv12);
+                    push_cpu_decoded_frame(
+                        state,
+                        width,
+                        height,
+                        pitch as usize,
+                        surface,
+                        surface_kind,
+                    );
                 }
             }
         } else {
@@ -2117,16 +2293,17 @@ mod imp {
             let y_plane_bytes = pitch as usize * height;
             let uv_plane_bytes = pitch as usize * (height / 2);
             let total = y_plane_bytes + uv_plane_bytes;
-            let mut nv12 = vec![0_u8; total];
-            let copy_result =
-                unsafe { (state.cu_memcpy_dtoh)(nv12.as_mut_ptr() as *mut c_void, dev_ptr, total) };
+            let mut surface = vec![0_u8; total];
+            let copy_result = unsafe {
+                (state.cu_memcpy_dtoh)(surface.as_mut_ptr() as *mut c_void, dev_ptr, total)
+            };
             if copy_result != CUDA_SUCCESS {
                 state.record_failure("copy", "cuMemcpyDtoH_v2", copy_result, None);
                 let _ = unsafe { (state.cuvid_unmap_video_frame)(state.decoder, dev_ptr) };
                 return 0;
             }
 
-            push_cpu_decoded_frame(state, width, height, pitch as usize, nv12);
+            push_cpu_decoded_frame(state, width, height, pitch as usize, surface, surface_kind);
         }
 
         let unmap_result = unsafe { (state.cuvid_unmap_video_frame)(state.decoder, dev_ptr) };
@@ -2142,19 +2319,31 @@ mod imp {
         width: usize,
         height: usize,
         pitch: usize,
-        nv12: Vec<u8>,
+        surface: Vec<u8>,
+        surface_kind: DecodedSurfaceKind,
     ) {
-        match state.output_mode {
-            NvdecOutputMode::CpuRgb24 => {
-                let rgb = nv12_to_rgb(&nv12, width, height, pitch);
+        match (state.output_mode, surface_kind) {
+            (NvdecOutputMode::CpuRgb24, DecodedSurfaceKind::Nv12) => {
+                let rgb = nv12_to_rgb(&surface, width, height, pitch);
                 state
                     .frames
                     .push(NvdecDecodedFrame::from_cpu_rgb24(width, height, rgb));
             }
-            NvdecOutputMode::CpuNv12 => {
+            (NvdecOutputMode::CpuRgb24, DecodedSurfaceKind::P010) => {
+                let rgb = p010_to_rgb(&surface, width, height, pitch);
                 state
                     .frames
-                    .push(NvdecDecodedFrame::from_cpu_nv12(width, height, pitch, nv12));
+                    .push(NvdecDecodedFrame::from_cpu_rgb24(width, height, rgb));
+            }
+            (NvdecOutputMode::CpuNv12, DecodedSurfaceKind::Nv12) => {
+                state.frames.push(NvdecDecodedFrame::from_cpu_nv12(
+                    width, height, pitch, surface,
+                ));
+            }
+            (NvdecOutputMode::CpuNv12, DecodedSurfaceKind::P010) => {
+                state.frames.push(NvdecDecodedFrame::from_cpu_p010(
+                    width, height, pitch, surface,
+                ));
             }
         }
     }
@@ -2342,7 +2531,8 @@ mod imp {
                 right: config.display_width as i16,
                 bottom: config.display_height as i16,
             },
-            OutputFormat: CUDA_VIDEO_SURFACE_NV12,
+            OutputFormat: DecodedSurfaceKind::from_bit_depth(config.bit_depth_minus8)
+                .cuda_output_format(),
             DeinterlaceMode: CUDA_VIDEO_DEINTERLACE_WEAVE,
             ulTargetWidth: config.display_width,
             ulTargetHeight: config.display_height,
@@ -2517,29 +2707,31 @@ mod imp {
     }
 
     fn evaluate_support(request: NvdecSupportRequest) -> NvdecSupportDecision {
+        if request.chroma_format != CUDA_VIDEO_CHROMA_420 {
+            return NvdecSupportDecision::Unsupported("unsupported chroma format");
+        }
+
         match request.codec {
-            NvdecCodec::H264 => {}
-            NvdecCodec::Hevc => {
+            NvdecCodec::H264 => {
                 if request.bit_depth_minus8 > 0 {
-                    return NvdecSupportDecision::Unsupported("HEVC Main10 not wired yet");
+                    return NvdecSupportDecision::Unsupported("10-bit not wired yet");
                 }
-                return NvdecSupportDecision::Unsupported("HEVC not wired yet");
+            }
+            NvdecCodec::Hevc => {
+                if !matches!(request.bit_depth_minus8, 0 | 2) {
+                    return NvdecSupportDecision::Unsupported("unsupported HEVC bit depth");
+                }
             }
             NvdecCodec::Av1 => {
                 // AV1 decode support requires Ada Lovelace or newer GPU
                 // Let capability probing determine if it's available
+                if request.bit_depth_minus8 > 0 {
+                    return NvdecSupportDecision::Unsupported("10-bit not wired yet");
+                }
             }
             NvdecCodec::Unknown(_) => {
                 return NvdecSupportDecision::Unsupported("unknown codec");
             }
-        }
-
-        if request.bit_depth_minus8 > 0 {
-            return NvdecSupportDecision::Unsupported("10-bit not wired yet");
-        }
-
-        if request.chroma_format != CUDA_VIDEO_CHROMA_420 {
-            return NvdecSupportDecision::Unsupported("unsupported chroma format");
         }
 
         NvdecSupportDecision::Supported
@@ -2767,6 +2959,46 @@ mod imp {
         rgb
     }
 
+    fn p010_to_rgb(p010: &[u8], width: usize, height: usize, pitch: usize) -> Vec<u8> {
+        let mut rgb = vec![0_u8; width * height * 3];
+        let uv_base = pitch * height;
+
+        for y in 0..height {
+            let y_row = y * pitch;
+            let uv_row = uv_base + (y / 2) * pitch;
+            for x in 0..width {
+                let y_idx = y_row + x * 2;
+                let uv_idx = uv_row + (x / 2) * 4;
+                if y_idx + 1 >= p010.len() || uv_idx + 3 >= p010.len() {
+                    continue;
+                }
+
+                let y10 = u16::from_le_bytes([p010[y_idx], p010[y_idx + 1]]) >> 6;
+                let u10 = u16::from_le_bytes([p010[uv_idx], p010[uv_idx + 1]]) >> 6;
+                let v10 = u16::from_le_bytes([p010[uv_idx + 2], p010[uv_idx + 3]]) >> 6;
+
+                let y_val = y10 as i32;
+                let u = u10 as i32 - 512;
+                let v = v10 as i32 - 512;
+
+                let r = y_val + ((1436 * v) >> 10);
+                let g = y_val - ((352 * u + 731 * v) >> 10);
+                let b = y_val + ((1815 * u) >> 10);
+                let out_idx = (y * width + x) * 3;
+                rgb[out_idx] = clamp_10bit_to_8bit(r);
+                rgb[out_idx + 1] = clamp_10bit_to_8bit(g);
+                rgb[out_idx + 2] = clamp_10bit_to_8bit(b);
+            }
+        }
+
+        rgb
+    }
+
+    #[inline]
+    fn clamp_10bit_to_8bit(value: i32) -> u8 {
+        ((value.clamp(0, 1023) + 2) >> 2) as u8
+    }
+
     #[inline]
     fn clamp_i32(value: i32) -> u8 {
         value.clamp(0, 255) as u8
@@ -2775,10 +3007,11 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::{
-            decoder_output_dimensions, evaluate_support, DecoderConfig, NvdecCapabilityRequest,
-            NvdecCodec, NvdecSupportDecision, NvdecSupportRequest, SequenceChangeDecision,
-            SequenceFormat, CUDA_VIDEO_CHROMA_420, CUDA_VIDEO_CODEC_AV1, CUDA_VIDEO_CODEC_H264,
-            CUDA_VIDEO_CODEC_HEVC, CUVID_PARSER_ANNEXB,
+            decoder_output_dimensions, evaluate_support, DecodedSurfaceKind, DecoderConfig,
+            NvdecCapabilityRequest, NvdecCodec, NvdecSupportDecision, NvdecSupportRequest,
+            SequenceChangeDecision, SequenceFormat, CUDA_VIDEO_CHROMA_420, CUDA_VIDEO_CODEC_AV1,
+            CUDA_VIDEO_CODEC_H264, CUDA_VIDEO_CODEC_HEVC, CUDA_VIDEO_SURFACE_P016,
+            CUVID_PARSER_ANNEXB,
         };
 
         fn baseline_sequence() -> SequenceFormat {
@@ -2865,16 +3098,32 @@ mod imp {
         }
 
         #[test]
-        fn support_matrix_rejects_hevc() {
+        fn support_matrix_accepts_hevc_8bit_420() {
             let request = NvdecSupportRequest {
                 codec: NvdecCodec::Hevc,
                 bit_depth_minus8: 0,
                 chroma_format: CUDA_VIDEO_CHROMA_420,
             };
 
+            assert_eq!(evaluate_support(request), NvdecSupportDecision::Supported);
+        }
+
+        #[test]
+        fn support_matrix_accepts_hevc_main10_420() {
+            let request = NvdecSupportRequest {
+                codec: NvdecCodec::Hevc,
+                bit_depth_minus8: 2,
+                chroma_format: CUDA_VIDEO_CHROMA_420,
+            };
+
+            assert_eq!(evaluate_support(request), NvdecSupportDecision::Supported);
+        }
+
+        #[test]
+        fn hevc_main10_uses_p016_decode_surface() {
             assert_eq!(
-                evaluate_support(request),
-                NvdecSupportDecision::Unsupported("HEVC not wired yet")
+                DecodedSurfaceKind::from_bit_depth(2).cuda_output_format(),
+                CUDA_VIDEO_SURFACE_P016
             );
         }
 
@@ -2907,25 +3156,19 @@ mod imp {
         }
 
         #[test]
-        fn capability_probe_reports_hevc_as_not_wired() {
+        fn capability_probe_reports_hevc_as_wired() {
             let request = NvdecCapabilityRequest::new("hevc", 0, CUDA_VIDEO_CHROMA_420);
             let wired = evaluate_support(request.to_support_request());
 
-            assert_eq!(
-                wired,
-                NvdecSupportDecision::Unsupported("HEVC not wired yet")
-            );
+            assert_eq!(wired, NvdecSupportDecision::Supported);
         }
 
         #[test]
-        fn capability_probe_reports_hevc_main10_as_not_wired() {
+        fn capability_probe_reports_hevc_main10_as_wired() {
             let request = NvdecCapabilityRequest::new("hevc", 2, CUDA_VIDEO_CHROMA_420);
             let wired = evaluate_support(request.to_support_request());
 
-            assert_eq!(
-                wired,
-                NvdecSupportDecision::Unsupported("HEVC Main10 not wired yet")
-            );
+            assert_eq!(wired, NvdecSupportDecision::Supported);
         }
 
         #[test]
@@ -2959,14 +3202,14 @@ mod imp {
         }
 
         #[test]
-        fn recreate_decision_rejects_bit_depth_change() {
+        fn recreate_decision_recreates_on_bit_depth_change() {
             let mut next = baseline_sequence();
             next.bit_depth_minus8 = 2;
 
             let decision = baseline_config().evaluate_sequence_change(&next);
             assert_eq!(
                 decision,
-                SequenceChangeDecision::Unsupported("bit depth change")
+                SequenceChangeDecision::Recreate("bit depth changed")
             );
         }
 
@@ -3097,12 +3340,12 @@ mod imp {
         #[test]
         #[cfg(windows)]
         fn d3d11_shared_texture_creation() {
-            use super::D3D11SharedTexture;
+            use super::{D3D11SharedTexture, DecodedSurfaceKind};
 
             let width = 1280u32;
             let height = 720u32;
 
-            match D3D11SharedTexture::new(width, height) {
+            match D3D11SharedTexture::new(width, height, DecodedSurfaceKind::Nv12) {
                 Ok(texture) => {
                     assert_eq!(texture.width, width);
                     assert_eq!(texture.height, height);
@@ -3121,7 +3364,10 @@ mod imp {
         #[test]
         #[cfg(windows)]
         fn d3d11_shared_texture_can_use_external_device_pointer() {
-            use super::{D3D11CreateDevice, D3D11SharedTexture, ID3D11Device, ID3D11DeviceContext};
+            use super::{
+                D3D11CreateDevice, D3D11SharedTexture, DecodedSurfaceKind, ID3D11Device,
+                ID3D11DeviceContext,
+            };
             use windows::core::Interface;
             use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
             use windows::Win32::Graphics::Direct3D11::{
@@ -3146,9 +3392,15 @@ mod imp {
             .expect("create test d3d11 device");
             let device = device.expect("test d3d11 device");
 
-            let texture =
-                unsafe { D3D11SharedTexture::new_with_device_ptr(640, 360, device.as_raw()) }
-                    .expect("create shared texture from external device");
+            let texture = unsafe {
+                D3D11SharedTexture::new_with_device_ptr(
+                    640,
+                    360,
+                    DecodedSurfaceKind::Nv12,
+                    device.as_raw(),
+                )
+            }
+            .expect("create shared texture from external device");
 
             assert_eq!(texture.width, 640);
             assert_eq!(texture.height, 360);

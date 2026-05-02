@@ -272,6 +272,10 @@ impl D3d11Renderer {
             RenderFrameData::D3D11SharedNv12 { .. } => {
                 return [0.05, 0.05, 0.05, 1.0];
             }
+            #[cfg(windows)]
+            RenderFrameData::D3D11SharedP010 { .. } => {
+                return [0.05, 0.05, 0.05, 1.0];
+            }
         };
 
         if data.is_empty() {
@@ -830,10 +834,16 @@ impl D3d11Renderer {
                 shared_handle_uv,
                 width: _,
                 height: _,
+            }
+            | RenderFrameData::D3D11SharedP010 {
+                shared_handle_y,
+                shared_handle_uv,
+                width: _,
+                height: _,
             } => (*shared_handle_y, *shared_handle_uv),
             _ => {
                 return Err(RenderError::Message(
-                    "Expected D3D11SharedNv12 frame data".into(),
+                    "Expected D3D11SharedNv12 or D3D11SharedP010 frame data".into(),
                 ))
             }
         };
@@ -932,7 +942,7 @@ impl RendererInstance for D3d11Renderer {
                 }
             }
             #[cfg(windows)]
-            RenderFrameData::D3D11SharedNv12 { .. } =>
+            RenderFrameData::D3D11SharedNv12 { .. } | RenderFrameData::D3D11SharedP010 { .. } =>
             {
                 #[cfg(windows)]
                 if self.surface.is_some() {

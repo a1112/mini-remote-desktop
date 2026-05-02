@@ -14,7 +14,7 @@ use mrd_capture_winrt::WinrtCapture;
 #[cfg(target_os = "macos")]
 use mrd_codec_videotoolbox::{VideoToolboxH264Decoder, VideoToolboxH264Encoder};
 use mrd_decode_nvdec::{NvdecDecoder, NvdecOutputMode};
-use mrd_encode_nvenc::NvencH264Encoder;
+use mrd_encode_nvenc::{NvencH264Encoder, NvencHevcEncoder};
 #[cfg(windows)]
 use mrd_encode_nvenc_av1::NvencAv1Encoder;
 use mrd_encode_openh264::OpenH264Encoder;
@@ -82,6 +82,8 @@ pub enum CaptureType {
 pub enum EncoderType {
     None,
     NvencH264,
+    NvencHevc,
+    NvencHevcMain10,
     NvencAv1,
     OpenH264,
     VideoToolboxH264,
@@ -353,8 +355,8 @@ enum PipelineTransport {
 }
 
 impl PipelineTransport {
-    fn new(kind: Option<&TransportKind>, fps: u32, codec: VideoCodec) -> Self {
-        match kind.unwrap_or(&TransportKind::Loopback) {
+    fn new(kind: Option<&TransportKind>, fps: u32, codec: VideoCodec) -> Result<Self> {
+        Ok(match kind.unwrap_or(&TransportKind::Loopback) {
             TransportKind::Loopback => Self::Loopback,
             TransportKind::WebrtcRtp => match codec {
                 VideoCodec::H264 => Self::WebrtcRtp {
@@ -375,13 +377,18 @@ impl PipelineTransport {
                     )),
                     ingress: WebrtcRtpIngress::Av1(mrd_transport_webrtc::Av1RtpIngress::default()),
                 },
+                VideoCodec::Hevc => {
+                    anyhow::bail!(
+                        "WebRTC RTP HEVC packetizer is not implemented; use loopback or QUIC datagram"
+                    )
+                }
             },
             TransportKind::QuicDatagram => Self::QuicDatagram {
                 reassembler: mrd_transport_quic_quinn::QuicAuReassembler::default(),
                 next_frame_id: 0,
                 max_datagram_size: 1200,
             },
-        }
+        })
     }
 
     fn transmit(&mut self, access_units: Vec<EncodedAccessUnit>) -> Result<Vec<EncodedAccessUnit>> {
@@ -1353,6 +1360,10 @@ impl TestHarness {
                 encoder: EncoderType::NvencAv1,
                 ..
             } => VideoCodec::Av1,
+            TestChain::Custom {
+                encoder: EncoderType::NvencHevc | EncoderType::NvencHevcMain10,
+                ..
+            } => VideoCodec::Hevc,
             _ => VideoCodec::H264,
         };
 
@@ -1480,6 +1491,54 @@ impl TestHarness {
                         )
                     }
                 },
+                EncoderType::NvencHevc | EncoderType::NvencHevcMain10 => {
+                    let main10 = matches!(encoder, EncoderType::NvencHevcMain10);
+                    #[cfg(windows)]
+                    {
+                        match decoder {
+                            DecoderType::None => {
+                                let enc =
+                                    create_hevc_encoder(width, height, fps, speed_bitrate, main10)?;
+                                (Some(enc), None, false)
+                            }
+                            DecoderType::Nvdec => {
+                                let enc = create_hevc_encoder(
+                                    width,
+                                    height,
+                                    fps,
+                                    low_latency_bitrate,
+                                    main10,
+                                )?;
+                                let dec = create_hevc_nvdec_decoder(
+                                    use_shared_texture_decode,
+                                    renderer_d3d11_device_ptr,
+                                    main10,
+                                )
+                                .map_err(|e| {
+                                    anyhow::anyhow!("NVDEC HEVC decoder init failed: {e}")
+                                })?;
+                                (Some(enc), Some(PipelineDecoder::Nvdec(dec)), true)
+                            }
+                            DecoderType::Software => {
+                                return Err(anyhow::anyhow!(
+                                    "HEVC software decoder path is not implemented"
+                                ));
+                            }
+                            DecoderType::VideoToolbox => {
+                                return Err(anyhow::anyhow!(
+                                    "VideoToolbox H.264 decoder cannot decode NVENC HEVC output"
+                                ));
+                            }
+                        }
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        let _ = main10;
+                        return Err(anyhow::anyhow!(
+                            "NVENC HEVC encoder is only available on Windows"
+                        ));
+                    }
+                }
                 EncoderType::OpenH264 => {
                     let enc = match config.bitrate {
                         Some(bitrate) => {
@@ -1593,7 +1652,7 @@ impl TestHarness {
             },
         };
 
-        let transport = PipelineTransport::new(config.transport.as_ref(), fps, encoded_codec);
+        let transport = PipelineTransport::new(config.transport.as_ref(), fps, encoded_codec)?;
 
         Ok(PipelineState {
             capture,
@@ -2123,6 +2182,76 @@ fn create_h264_nvdec_decoder(
     Ok(decoder)
 }
 
+fn create_hevc_encoder(
+    width: usize,
+    height: usize,
+    fps: u32,
+    bitrate: u32,
+    main10: bool,
+) -> Result<Box<dyn VideoEncoder>> {
+    #[cfg(windows)]
+    {
+        let encoder = if main10 {
+            NvencHevcEncoder::new_main10_with_bitrate(width, height, fps, bitrate)
+        } else {
+            NvencHevcEncoder::new_main_with_bitrate(width, height, fps, bitrate)
+        }
+        .map_err(|e| anyhow::anyhow!("NVENC HEVC encoder init failed: {:?}", e))?;
+        Ok(Box::new(encoder) as Box<dyn VideoEncoder>)
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = (width, height, fps, bitrate, main10);
+        anyhow::bail!("NVENC HEVC encoder is only available on Windows")
+    }
+}
+
+fn create_hevc_nvdec_decoder(
+    use_shared_texture_decode: bool,
+    d3d11_device_ptr: Option<*mut core::ffi::c_void>,
+    main10: bool,
+) -> Result<NvdecDecoder> {
+    #[cfg(windows)]
+    {
+        if use_shared_texture_decode {
+            if let Some(d3d11_device_ptr) = d3d11_device_ptr {
+                return unsafe {
+                    if main10 {
+                        NvdecDecoder::new_hevc_main10_with_output_mode_and_d3d11_device_ptr(
+                            NvdecOutputMode::CpuNv12,
+                            d3d11_device_ptr,
+                        )
+                    } else {
+                        NvdecDecoder::new_hevc_with_output_mode_and_d3d11_device_ptr(
+                            NvdecOutputMode::CpuNv12,
+                            d3d11_device_ptr,
+                        )
+                    }
+                }
+                .map_err(|e| anyhow::anyhow!("{e}"));
+            }
+        }
+
+        let mut decoder = if main10 {
+            NvdecDecoder::new_hevc_main10_with_output_mode(NvdecOutputMode::CpuNv12)
+        } else {
+            NvdecDecoder::new_hevc_with_output_mode(NvdecOutputMode::CpuNv12)
+        }
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if use_shared_texture_decode {
+            enable_nvdec_shared_texture(&mut decoder);
+        }
+        return Ok(decoder);
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = (use_shared_texture_decode, d3d11_device_ptr, main10);
+        anyhow::bail!("NVDEC HEVC decoder is only available on Windows")
+    }
+}
+
 fn create_av1_nvdec_decoder(
     use_shared_texture_decode: bool,
     d3d11_device_ptr: Option<*mut core::ffi::c_void>,
@@ -2222,6 +2351,8 @@ fn comparison_labels(chain: &TestChain) -> (&'static str, &'static str) {
             let codec = match encoder {
                 EncoderType::None => "none",
                 EncoderType::NvencAv1 => "av1",
+                EncoderType::NvencHevc => "hevc",
+                EncoderType::NvencHevcMain10 => "hevc-main10",
                 EncoderType::NvencH264 | EncoderType::OpenH264 | EncoderType::VideoToolboxH264 => {
                     "h264"
                 }
@@ -2254,7 +2385,11 @@ fn comparison_transport_label(
 fn encoder_allows_zero_copy(encoder: &EncoderType) -> bool {
     matches!(
         encoder,
-        EncoderType::None | EncoderType::NvencH264 | EncoderType::NvencAv1
+        EncoderType::None
+            | EncoderType::NvencH264
+            | EncoderType::NvencHevc
+            | EncoderType::NvencHevcMain10
+            | EncoderType::NvencAv1
     )
 }
 
@@ -2266,6 +2401,9 @@ fn nvdec_frame_to_decoded_frame(frame: mrd_decode_nvdec::NvdecDecodedFrame) -> D
         mrd_decode_nvdec::NvdecDecodedFrameData::CpuNv12 { data, pitch } => {
             DecodedFrame::from_cpu_nv12(frame.width, frame.height, 0, pitch, data)
         }
+        mrd_decode_nvdec::NvdecDecodedFrameData::CpuP010 { data, pitch } => {
+            DecodedFrame::from_cpu_p010(frame.width, frame.height, 0, pitch, data)
+        }
         #[cfg(windows)]
         mrd_decode_nvdec::NvdecDecodedFrameData::D3D11SharedNv12 {
             shared_handle_y,
@@ -2273,6 +2411,19 @@ fn nvdec_frame_to_decoded_frame(frame: mrd_decode_nvdec::NvdecDecodedFrame) -> D
             width: _,
             height: _,
         } => DecodedFrame::from_d3d11_shared_nv12(
+            frame.width,
+            frame.height,
+            0,
+            shared_handle_y,
+            shared_handle_uv,
+        ),
+        #[cfg(windows)]
+        mrd_decode_nvdec::NvdecDecodedFrameData::D3D11SharedP010 {
+            shared_handle_y,
+            shared_handle_uv,
+            width: _,
+            height: _,
+        } => DecodedFrame::from_d3d11_shared_p010(
             frame.width,
             frame.height,
             0,
@@ -2309,6 +2460,10 @@ fn render_input_to_preview_bgra(
         RenderFrameData::D3D11SharedNv12 { .. } => {
             anyhow::bail!("D3D11 shared texture preview is not CPU-readable")
         }
+        #[cfg(windows)]
+        RenderFrameData::D3D11SharedP010 { .. } => {
+            anyhow::bail!("D3D11 shared texture preview is not CPU-readable")
+        }
     };
     downsample_bgra(&bgra, width, height, max_width)
 }
@@ -2326,12 +2481,28 @@ fn decoded_frame_to_render_frame(frame: &DecodedFrame) -> RenderFrame {
             frame.height,
             cpu_nv12_to_rgb24(data, frame.width, frame.height, *pitch),
         ),
+        DecodedFrameData::CpuP010 { data, pitch } => RenderFrame::from_rgb24(
+            frame.width,
+            frame.height,
+            cpu_p010_to_rgb24(data, frame.width, frame.height, *pitch),
+        ),
         #[cfg(windows)]
         DecodedFrameData::D3D11SharedNv12 {
             shared_handle_y,
             shared_handle_uv,
             ..
         } => RenderFrame::from_d3d11_shared_nv12(
+            frame.width,
+            frame.height,
+            *shared_handle_y,
+            *shared_handle_uv,
+        ),
+        #[cfg(windows)]
+        DecodedFrameData::D3D11SharedP010 {
+            shared_handle_y,
+            shared_handle_uv,
+            ..
+        } => RenderFrame::from_d3d11_shared_p010(
             frame.width,
             frame.height,
             *shared_handle_y,
@@ -2420,6 +2591,48 @@ fn cpu_nv12_to_rgb24(nv12: &[u8], width: usize, height: usize, pitch: usize) -> 
     }
 
     rgb
+}
+
+fn cpu_p010_to_rgb24(p010: &[u8], width: usize, height: usize, pitch: usize) -> Vec<u8> {
+    let mut rgb = vec![0_u8; width * height * 3];
+    let uv_base = pitch * height;
+    let mut out_idx = 0;
+
+    for y in 0..height {
+        let y_row_start = y * pitch;
+        let uv_row_start = uv_base + (y / 2) * pitch;
+        for x in 0..width {
+            let y_offset = y_row_start + x * 2;
+            let uv_offset = uv_row_start + (x / 2) * 4;
+            if y_offset + 1 >= p010.len() || uv_offset + 3 >= p010.len() {
+                out_idx += 3;
+                continue;
+            }
+
+            let y10 = u16::from_le_bytes([p010[y_offset], p010[y_offset + 1]]) >> 6;
+            let u10 = u16::from_le_bytes([p010[uv_offset], p010[uv_offset + 1]]) >> 6;
+            let v10 = u16::from_le_bytes([p010[uv_offset + 2], p010[uv_offset + 3]]) >> 6;
+            let y_sample = y10 as i32;
+            let u = u10 as i32 - 512;
+            let v = v10 as i32 - 512;
+
+            let r = y_sample + ((1436 * v) >> 10);
+            let g = y_sample - ((352 * u + 731 * v) >> 10);
+            let b = y_sample + ((1815 * u) >> 10);
+
+            rgb[out_idx] = clamp_10bit_to_8bit(r);
+            rgb[out_idx + 1] = clamp_10bit_to_8bit(g);
+            rgb[out_idx + 2] = clamp_10bit_to_8bit(b);
+            out_idx += 3;
+        }
+    }
+
+    rgb
+}
+
+#[inline]
+fn clamp_10bit_to_8bit(value: i32) -> u8 {
+    ((value.clamp(0, 1023) + 2) >> 2) as u8
 }
 
 fn downsample_frame(frame: &CapturedFrame, max_width: usize) -> Result<(Vec<u8>, usize, usize)> {
@@ -2889,6 +3102,35 @@ mod tests {
     }
 
     #[test]
+    fn nvenc_hevc_allows_zero_copy_policy() {
+        assert!(encoder_allows_zero_copy(&EncoderType::NvencHevc));
+        assert!(encoder_allows_zero_copy(&EncoderType::NvencHevcMain10));
+    }
+
+    #[test]
+    fn hevc_custom_chains_export_captest_comparison_labels() {
+        let hevc = TestChain::Custom {
+            capture: CaptureType::Dxgi,
+            encoder: EncoderType::NvencHevc,
+            decoder: DecoderType::Nvdec,
+        };
+        let hevc_main10 = TestChain::Custom {
+            capture: CaptureType::Dxgi,
+            encoder: EncoderType::NvencHevcMain10,
+            decoder: DecoderType::Nvdec,
+        };
+
+        assert_eq!(
+            comparison_labels(&hevc),
+            ("capture-encode-decode-render", "hevc")
+        );
+        assert_eq!(
+            comparison_labels(&hevc_main10),
+            ("capture-encode-decode-render", "hevc-main10")
+        );
+    }
+
+    #[test]
     fn harness_metrics_export_captest_compatible_comparison_result() {
         let metrics = HarnessMetrics {
             capture_fps: 228.0,
@@ -3140,6 +3382,10 @@ mod tests {
             Ok("none") => EncoderType::None,
             Ok("openh264") => EncoderType::OpenH264,
             Ok("nvenc_av1") => EncoderType::NvencAv1,
+            Ok("nvenc_hevc") | Ok("hevc") => EncoderType::NvencHevc,
+            Ok("nvenc_hevc_main10") | Ok("hevc_main10") | Ok("hevc-main10") => {
+                EncoderType::NvencHevcMain10
+            }
             Ok("videotoolbox_h264") | Ok("videotoolbox") => EncoderType::VideoToolboxH264,
             _ => EncoderType::NvencH264,
         }

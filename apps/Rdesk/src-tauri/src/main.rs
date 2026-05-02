@@ -1414,6 +1414,8 @@ fn test_harness_set_custom(
         "none" => EncoderType::None,
         "nvenc_h264" => EncoderType::NvencH264,
         "nvenc_av1" => EncoderType::NvencAv1,
+        "nvenc_hevc" | "hevc" => EncoderType::NvencHevc,
+        "nvenc_hevc_main10" | "hevc_main10" | "hevc-main10" => EncoderType::NvencHevcMain10,
         "openh264" => EncoderType::OpenH264,
         "videotoolbox_h264" | "videotoolbox" => EncoderType::VideoToolboxH264,
         _ => return Err(format!("Unsupported encoder type: {}", encoder)),

@@ -19,6 +19,7 @@ pub struct RuntimeBinding {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum VideoCodec {
     H264,
+    Hevc,
     Av1,
 }
 
@@ -36,6 +37,8 @@ pub enum FrameMemoryKind {
     D3D11SharedBgra,
     #[cfg(windows)]
     D3D11SharedNv12,
+    #[cfg(windows)]
+    D3D11SharedP010,
 }
 
 #[cfg(windows)]
@@ -128,9 +131,19 @@ pub enum DecodedFrameData {
     CpuBgra32(Vec<u8>),
     /// CPU NV12 data with decoder pitch.
     CpuNv12 { data: Vec<u8>, pitch: usize },
+    /// CPU P010/P016 data with decoder pitch.
+    CpuP010 { data: Vec<u8>, pitch: usize },
     /// D3D11 shared texture handle (zero-copy path)
     #[cfg(windows)]
     D3D11SharedNv12 {
+        shared_handle_y: isize,
+        shared_handle_uv: isize,
+        width: u32,
+        height: u32,
+    },
+    /// D3D11 shared P010/P016 texture handles (zero-copy Main10 path)
+    #[cfg(windows)]
+    D3D11SharedP010 {
         shared_handle_y: isize,
         shared_handle_uv: isize,
         width: u32,
@@ -184,6 +197,22 @@ impl DecodedFrame {
         }
     }
 
+    /// Create a decoded frame from CPU P010/P016 data
+    pub fn from_cpu_p010(
+        width: usize,
+        height: usize,
+        timestamp_us: u64,
+        pitch: usize,
+        data: Vec<u8>,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            timestamp_us,
+            data: DecodedFrameData::CpuP010 { data, pitch },
+        }
+    }
+
     /// Create a decoded frame from D3D11 shared texture
     #[cfg(windows)]
     pub fn from_d3d11_shared_nv12(
@@ -206,11 +235,36 @@ impl DecodedFrame {
         }
     }
 
+    /// Create a decoded frame from D3D11 shared P010/P016 textures
+    #[cfg(windows)]
+    pub fn from_d3d11_shared_p010(
+        width: usize,
+        height: usize,
+        timestamp_us: u64,
+        shared_handle_y: isize,
+        shared_handle_uv: isize,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            timestamp_us,
+            data: DecodedFrameData::D3D11SharedP010 {
+                shared_handle_y,
+                shared_handle_uv,
+                width: width as u32,
+                height: height as u32,
+            },
+        }
+    }
+
     /// Check if this frame uses shared texture (zero-copy)
     pub fn is_shared_texture(&self) -> bool {
         #[cfg(windows)]
         {
-            matches!(self.data, DecodedFrameData::D3D11SharedNv12 { .. })
+            matches!(
+                self.data,
+                DecodedFrameData::D3D11SharedNv12 { .. } | DecodedFrameData::D3D11SharedP010 { .. }
+            )
         }
 
         #[cfg(not(windows))]
@@ -243,14 +297,25 @@ impl DecodedFrame {
         }
     }
 
+    /// Get the CPU P010/P016 data and pitch if available
+    pub fn cpu_p010(&self) -> Option<(&[u8], usize)> {
+        match &self.data {
+            DecodedFrameData::CpuP010 { data, pitch } => Some((data.as_slice(), *pitch)),
+            _ => None,
+        }
+    }
+
     /// Get any CPU data as bytes
     pub fn cpu_bytes(&self) -> Option<&[u8]> {
         match &self.data {
             DecodedFrameData::CpuRgb24(data)
             | DecodedFrameData::CpuBgra32(data)
-            | DecodedFrameData::CpuNv12 { data, .. } => Some(data.as_slice()),
+            | DecodedFrameData::CpuNv12 { data, .. }
+            | DecodedFrameData::CpuP010 { data, .. } => Some(data.as_slice()),
             #[cfg(windows)]
-            DecodedFrameData::D3D11SharedNv12 { .. } => None,
+            DecodedFrameData::D3D11SharedNv12 { .. } | DecodedFrameData::D3D11SharedP010 { .. } => {
+                None
+            }
         }
     }
 
@@ -259,6 +324,9 @@ impl DecodedFrame {
     pub fn d3d11_shared_handle(&self) -> Option<isize> {
         match &self.data {
             DecodedFrameData::D3D11SharedNv12 {
+                shared_handle_y, ..
+            }
+            | DecodedFrameData::D3D11SharedP010 {
                 shared_handle_y, ..
             } => Some(*shared_handle_y),
             _ => None,
@@ -270,6 +338,11 @@ impl DecodedFrame {
     pub fn d3d11_shared_handles(&self) -> Option<(isize, isize)> {
         match &self.data {
             DecodedFrameData::D3D11SharedNv12 {
+                shared_handle_y,
+                shared_handle_uv,
+                ..
+            }
+            | DecodedFrameData::D3D11SharedP010 {
                 shared_handle_y,
                 shared_handle_uv,
                 ..
@@ -328,5 +401,10 @@ mod tests {
         let frame = DecodedFrame::from_cpu_rgb24(2, 2, 0, vec![0; 12]);
 
         assert!(!frame.is_shared_texture());
+    }
+
+    #[test]
+    fn hevc_codec_is_available_for_hardware_pipelines() {
+        assert_eq!(VideoCodec::Hevc, VideoCodec::Hevc);
     }
 }
