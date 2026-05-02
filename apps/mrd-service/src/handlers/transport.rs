@@ -56,19 +56,10 @@ pub async fn start_receiver(app_state: &Arc<AppState>, session_id: SessionId) ->
 }
 
 /// Handle probe snapshot request
-pub async fn probe_snapshot(_app_state: &Arc<AppState>, session_id: SessionId) -> IpcResponse {
-    // TODO: Implement real probe snapshot
-    // This requires access to the actual media telemetry
+pub async fn probe_snapshot(app_state: &Arc<AppState>, session_id: SessionId) -> IpcResponse {
+    let snapshot = app_state.probes.lock().await.snapshot(&session_id);
     IpcResponse::ProbeSnapshot {
-        snapshot: mrd_ipc::ProbeSnapshot {
-            session_id,
-            frames_received: 0,
-            frames_decoded: 0,
-            frames_dropped: 0,
-            current_fps: None,
-            bitrate_mbps: None,
-            last_error: None,
-        },
+        snapshot,
     }
 }
 
@@ -165,6 +156,28 @@ mod tests {
                 assert!(message.contains(&session_id.0));
             }
             _ => panic!("Expected Error response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_snapshot_returns_recorded_lan_probe_frames() {
+        let app_state = Arc::new(AppState::new());
+        let session_id = SessionId("probe-session".to_string());
+        app_state
+            .probes
+            .lock()
+            .await
+            .record_probe_frame(&session_id, 1200, 1_000);
+
+        let response = probe_snapshot(&app_state, session_id.clone()).await;
+
+        match response {
+            IpcResponse::ProbeSnapshot { snapshot } => {
+                assert_eq!(snapshot.session_id, session_id);
+                assert_eq!(snapshot.frames_received, 1);
+                assert_eq!(snapshot.frames_decoded, 1);
+            }
+            _ => panic!("Expected ProbeSnapshot response"),
         }
     }
 }

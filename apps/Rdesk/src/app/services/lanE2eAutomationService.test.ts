@@ -25,6 +25,22 @@ function createCommands(
         sessions: [],
       })
     ),
+    getHardwareInfo: vi.fn().mockResolvedValue(
+      ok({
+        motherboard_serial: "MB-LOCAL-1234",
+        hostname: "Controller PC",
+        os_type: "windows",
+        os_version: "Windows",
+        cpu_info: {
+          name: "CPU",
+          vendor_id: "GenuineIntel",
+          cores: 8,
+        },
+        total_memory_mb: 16384,
+        gpu_info: [],
+      })
+    ),
+    ipcRegisterDevice: vi.fn().mockResolvedValue(ok("lan-MBLOCAL1234")),
     ipcRefreshLanDiscovery: vi.fn().mockResolvedValue(
       ok({
         enabled: true,
@@ -118,6 +134,56 @@ describe("runLanE2EAutomation", () => {
     expect(commands.ipcStopSession).toHaveBeenCalledWith("lan-e2e-test-session");
     expect(result.stages.map((stage) => `${stage.stage}:${stage.status}`)).toContain(
       "assert:completed"
+    );
+  });
+
+  it("registers the local device before LAN session startup when the service runtime is unregistered", async () => {
+    const commands = createCommands({
+      ipcRuntimeSnapshot: vi.fn().mockResolvedValue(
+        ok({
+          device_id: null,
+          is_registered: false,
+          sessions: [],
+        })
+      ),
+      getHardwareInfo: vi.fn().mockResolvedValue(
+        ok({
+          motherboard_serial: "MB-1234/5678",
+          hostname: "Controller PC",
+          os_type: "windows",
+          os_version: "Windows",
+          cpu_info: {
+            name: "CPU",
+            vendor_id: "GenuineIntel",
+            cores: 8,
+          },
+          total_memory_mb: 16384,
+          gpu_info: [],
+        })
+      ),
+      ipcRegisterDevice: vi.fn().mockResolvedValue(ok("lan-MB12345678")),
+    });
+
+    const result = await runLanE2EAutomation(commands, {
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => "lan-e2e-test-session",
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.controllerDeviceId).toBe("lan-MB12345678");
+    expect(commands.ipcRegisterDevice).toHaveBeenCalledWith(
+      "lan-MB12345678",
+      "Controller PC"
+    );
+    expect(commands.ipcStartLanRemoteSession).toHaveBeenCalledWith(
+      "lan-e2e-test-session",
+      "agent-device",
+      "quic"
     );
   });
 

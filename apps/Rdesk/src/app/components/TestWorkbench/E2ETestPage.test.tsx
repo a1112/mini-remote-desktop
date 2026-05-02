@@ -101,6 +101,22 @@ function installSuccessfulLanAutomationMock() {
         sessions: [],
       });
     }
+    if (command === "get_hardware_info") {
+      return Promise.resolve({
+        motherboard_serial: "MB-LOCAL-1234",
+        hostname: "Controller PC",
+        os_type: "windows",
+        os_version: "Windows",
+        cpu_info: {
+          name: "CPU",
+          vendor_id: "GenuineIntel",
+          cores: 8,
+        },
+        total_memory_mb: 16384,
+        gpu_info: [],
+      });
+    }
+    if (command === "ipc_register_device") return Promise.resolve("lan-MBLOCAL1234");
     if (command === "ipc_refresh_lan_discovery") {
       return Promise.resolve({
         enabled: true,

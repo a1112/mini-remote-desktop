@@ -12,6 +12,7 @@ export type LanE2EStatus = "running" | "completed" | "failed" | "skipped";
 
 export type LanE2EFailureReason =
   | "service_unhealthy"
+  | "local_device_registration_failed"
   | "peer_not_found"
   | "peer_not_ready"
   | "session_start_failed"
@@ -60,6 +61,8 @@ export interface LanE2EAutomationCommands {
   serviceBootstrapIfNeeded(): Promise<AdapterResult<boolean>>;
   serviceWaitForHealthy(timeoutSecs?: number): Promise<AdapterResult<boolean>>;
   ipcRuntimeSnapshot(): Promise<AdapterResult<RuntimeSnapshot>>;
+  getHardwareInfo(): Promise<AdapterResult<LanE2EHardwareInfo>>;
+  ipcRegisterDevice(deviceId: string, deviceName: string): Promise<AdapterResult<string>>;
   ipcRefreshLanDiscovery(): Promise<AdapterResult<LanDiscoverySnapshot>>;
   ipcStartLanRemoteSession(
     sessionId: string,
@@ -73,6 +76,25 @@ export interface LanE2EAutomationCommands {
   ipcSessionSnapshot(sessionId: string): Promise<AdapterResult<SessionRuntimeSnapshot>>;
   ipcProbeSnapshot(sessionId: string): Promise<AdapterResult<ProbeSnapshot>>;
   ipcStopSession(sessionId: string): Promise<AdapterResult<string>>;
+}
+
+export interface LanE2EHardwareInfo {
+  motherboard_serial: string;
+  hostname: string;
+  os_type: string;
+  os_version: string;
+  cpu_info: {
+    name: string;
+    vendor_id: string;
+    cores: number;
+    max_frequency_mhz?: number | null;
+  };
+  total_memory_mb: number;
+  gpu_info: Array<{
+    name: string;
+    vendor: string;
+    memory_mb?: number | null;
+  }>;
 }
 
 const DEFAULT_TIMEOUT_MS = 10_000;
@@ -134,7 +156,7 @@ export async function runLanE2EAutomation(
     await unwrap(commands.serviceBootstrapIfNeeded(), "service_unhealthy");
     await unwrap(commands.serviceWaitForHealthy(10), "service_unhealthy");
     const runtime = await unwrap(commands.ipcRuntimeSnapshot(), "service_unhealthy");
-    controllerDeviceId = runtime.device_id ?? null;
+    controllerDeviceId = await ensureLocalDeviceRegistered(commands, runtime, now);
     const discovery = await unwrap(commands.ipcRefreshLanDiscovery(), "peer_not_found");
     const peerSelection = selectPeer(discovery, options.targetDeviceId, transportKind);
     const selectedPeer = peerSelection.peer;
@@ -282,6 +304,32 @@ function createDefaultSessionId(peerDeviceId: string, now: number): string {
   return `lan-e2e-${safePeer}-${now}`;
 }
 
+async function ensureLocalDeviceRegistered(
+  commands: LanE2EAutomationCommands,
+  runtime: RuntimeSnapshot,
+  now: () => number
+): Promise<string | null> {
+  if (runtime.is_registered && runtime.device_id) {
+    return runtime.device_id;
+  }
+
+  const hardwareInfo = await unwrap(
+    commands.getHardwareInfo(),
+    "local_device_registration_failed"
+  );
+  const deviceId = buildLocalLanDeviceId(hardwareInfo.motherboard_serial, now);
+  const deviceName = hardwareInfo.hostname?.trim() || "Rdesk LAN Device";
+  return await unwrap(
+    commands.ipcRegisterDevice(deviceId, deviceName),
+    "local_device_registration_failed"
+  );
+}
+
+function buildLocalLanDeviceId(hardwareSerial: string, now: () => number): string {
+  const sanitized = hardwareSerial.replace(/[^a-zA-Z0-9]/g, "").slice(-16);
+  return sanitized ? `lan-${sanitized}` : `lan-local-${now()}`;
+}
+
 async function unwrap<T>(
   resultPromise: Promise<AdapterResult<T>>,
   reason: LanE2EFailureReason
@@ -304,6 +352,7 @@ class LanE2ECommandError extends Error {
 function stageForFailure(reason: LanE2EFailureReason): LanE2EStageEvent["stage"] {
   switch (reason) {
     case "service_unhealthy":
+    case "local_device_registration_failed":
     case "peer_not_found":
     case "peer_not_ready":
       return "preflight";

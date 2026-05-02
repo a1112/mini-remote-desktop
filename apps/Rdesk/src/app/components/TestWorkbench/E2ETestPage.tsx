@@ -56,6 +56,8 @@ const lanAutomationCommands: LanE2EAutomationCommands = {
   serviceBootstrapIfNeeded: commands.serviceBootstrapIfNeeded,
   serviceWaitForHealthy: (timeoutSecs = 10) => commands.serviceWaitForHealthy(timeoutSecs),
   ipcRuntimeSnapshot: commands.ipcRuntimeSnapshot,
+  getHardwareInfo: commands.getHardwareInfo,
+  ipcRegisterDevice: commands.ipcRegisterDevice,
   ipcRefreshLanDiscovery: commands.ipcRefreshLanDiscovery,
   ipcStartLanRemoteSession: commands.ipcStartLanRemoteSession,
   ipcStartReceiver: commands.ipcStartReceiver,

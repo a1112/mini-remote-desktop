@@ -488,10 +488,22 @@ export interface ProbeSnapshot {
  * Hardware info
  */
 export interface HardwareInfo {
-  cpu_brand: string;
-  cpu_cores: number;
-  memory_gb: number;
-  gpu_info: string;
+  motherboard_serial: string;
+  hostname: string;
+  os_type: string;
+  os_version: string;
+  cpu_info: {
+    name: string;
+    vendor_id: string;
+    cores: number;
+    max_frequency_mhz?: number | null;
+  };
+  total_memory_mb: number;
+  gpu_info: Array<{
+    name: string;
+    vendor: string;
+    memory_mb?: number | null;
+  }>;
 }
 
 export interface SystemResourceSnapshot {

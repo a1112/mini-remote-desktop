@@ -38,6 +38,74 @@ impl SessionRegistry {
     }
 }
 
+/// Probe telemetry accumulated from LAN data-plane probe frames.
+#[derive(Debug, Default)]
+pub struct ProbeRegistry {
+    probes: std::collections::HashMap<SessionId, SessionProbeStats>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SessionProbeStats {
+    frames_received: u64,
+    frames_decoded: u64,
+    frames_dropped: u64,
+    bytes_received: u64,
+    first_seen_ms: Option<u64>,
+    last_seen_ms: Option<u64>,
+    last_error: Option<String>,
+}
+
+impl ProbeRegistry {
+    pub fn record_probe_frame(&mut self, session_id: &SessionId, bytes_received: u64, now_ms: u64) {
+        let stats = self.probes.entry(session_id.clone()).or_default();
+        stats.frames_received = stats.frames_received.saturating_add(1);
+        stats.frames_decoded = stats.frames_decoded.saturating_add(1);
+        stats.bytes_received = stats.bytes_received.saturating_add(bytes_received);
+        stats.first_seen_ms.get_or_insert(now_ms);
+        stats.last_seen_ms = Some(now_ms);
+        stats.last_error = None;
+    }
+
+    pub fn snapshot(&self, session_id: &SessionId) -> mrd_ipc::ProbeSnapshot {
+        let Some(stats) = self.probes.get(session_id) else {
+            return mrd_ipc::ProbeSnapshot {
+                session_id: session_id.clone(),
+                frames_received: 0,
+                frames_decoded: 0,
+                frames_dropped: 0,
+                current_fps: None,
+                bitrate_mbps: None,
+                last_error: None,
+            };
+        };
+
+        let elapsed_ms = match (stats.first_seen_ms, stats.last_seen_ms) {
+            (Some(first), Some(last)) => last.saturating_sub(first),
+            _ => 0,
+        };
+        let current_fps = if elapsed_ms > 0 {
+            Some((stats.frames_decoded as f32 * 1000.0) / elapsed_ms as f32)
+        } else {
+            Some(0.0)
+        };
+        let bitrate_mbps = if elapsed_ms > 0 {
+            Some((stats.bytes_received as f32 * 8.0) / elapsed_ms as f32 / 1000.0)
+        } else {
+            Some(0.0)
+        };
+
+        mrd_ipc::ProbeSnapshot {
+            session_id: session_id.clone(),
+            frames_received: stats.frames_received,
+            frames_decoded: stats.frames_decoded,
+            frames_dropped: stats.frames_dropped,
+            current_fps,
+            bitrate_mbps,
+            last_error: stats.last_error.clone(),
+        }
+    }
+}
+
 /// Shell state - tracks UI presence and service lifecycle
 #[derive(Debug, Default)]
 pub struct ShellState {
@@ -100,6 +168,8 @@ pub struct AppState {
     pub tray: TrayPortRef,
     /// Peer-to-peer LAN discovery state.
     pub lan_discovery: Arc<crate::lan_discovery::LanDiscoveryState>,
+    /// LAN probe telemetry keyed by session.
+    pub probes: Arc<Mutex<ProbeRegistry>>,
 }
 
 impl AppState {
@@ -116,6 +186,7 @@ impl AppState {
             shell: Arc::new(Mutex::new(ShellState::default())),
             tray,
             lan_discovery: Arc::new(crate::lan_discovery::LanDiscoveryState::default()),
+            probes: Arc::new(Mutex::new(ProbeRegistry::default())),
         }
     }
 
@@ -142,6 +213,11 @@ impl AppState {
     /// Get a clone of the LAN discovery state.
     pub fn lan_discovery(&self) -> Arc<crate::lan_discovery::LanDiscoveryState> {
         self.lan_discovery.clone()
+    }
+
+    /// Get a clone of the probe telemetry registry.
+    pub fn probes(&self) -> Arc<Mutex<ProbeRegistry>> {
+        self.probes.clone()
     }
 }
 
@@ -196,5 +272,20 @@ mod tests {
         let retrieved = registry.get_local_device();
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().0, device_id);
+    }
+
+    #[test]
+    fn probe_registry_tracks_received_probe_frames() {
+        let mut registry = ProbeRegistry::default();
+        let session_id = SessionId("probe-session".to_string());
+
+        registry.record_probe_frame(&session_id, 1200, 1_000);
+        registry.record_probe_frame(&session_id, 1200, 1_250);
+
+        let snapshot = registry.snapshot(&session_id);
+        assert_eq!(snapshot.frames_received, 2);
+        assert_eq!(snapshot.frames_decoded, 2);
+        assert!(snapshot.current_fps.unwrap_or_default() > 0.0);
+        assert!(snapshot.bitrate_mbps.unwrap_or_default() > 0.0);
     }
 }

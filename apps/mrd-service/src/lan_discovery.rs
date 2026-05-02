@@ -19,6 +19,9 @@ const ANNOUNCE_INTERVAL_SECS: u64 = 3;
 const PEER_TTL_SECS: u64 = 12;
 const DISCOVERY_MAGIC: &str = "mrd-lan-discovery-v1";
 const DISCOVERY_APP_ID: &str = "rdesk";
+const SESSION_PROBE_INTERVAL_MS: u64 = 250;
+const SESSION_PROBE_MAX_FRAMES: u64 = 240;
+const SESSION_PROBE_PAYLOAD_BYTES: u64 = 1200;
 
 #[derive(Debug, Clone)]
 pub struct LanDiscoveryConfig {
@@ -200,6 +203,8 @@ enum LanDiscoveryPacket {
         source_device_id: String,
         source_device_name: String,
         transport_kind: String,
+        #[serde(default)]
+        source_discovery_port: Option<u16>,
         timestamp_ms: u64,
     },
     RemoteSessionAck {
@@ -211,6 +216,16 @@ enum LanDiscoveryPacket {
         accepted: bool,
         message: Option<String>,
         timestamp_ms: u64,
+    },
+    SessionProbeFrame {
+        magic: String,
+        #[serde(default = "default_app_id")]
+        app_id: String,
+        instance_id: String,
+        session_id: String,
+        sequence: u64,
+        timestamp_ms: u64,
+        payload_bytes: u64,
     },
 }
 
@@ -318,6 +333,7 @@ pub async fn request_lan_remote_session(
         source_device_id,
         source_device_name,
         transport_kind: transport_kind.to_string(),
+        source_discovery_port: Some(app_state.lan_discovery.discovery_port()),
         timestamp_ms: now_ms(),
     };
     send_packet(&socket, &packet, target).await?;
@@ -431,6 +447,7 @@ async fn handle_packet(
             session_id,
             source_device_id,
             transport_kind,
+            source_discovery_port,
             ..
         } => {
             if !is_valid_discovery_packet(&magic, &app_id)
@@ -451,14 +468,41 @@ async fn handle_packet(
                 magic: DISCOVERY_MAGIC.to_string(),
                 app_id: DISCOVERY_APP_ID.to_string(),
                 instance_id: app_state.lan_discovery.instance_id.clone(),
-                session_id,
+                session_id: session_id.clone(),
                 accepted,
                 message,
                 timestamp_ms: now_ms(),
             };
             send_packet(socket, &ack, addr).await?;
+            if accepted {
+                let probe_target =
+                    SocketAddr::new(addr.ip(), source_discovery_port.unwrap_or(addr.port()));
+                spawn_session_probe_sender(
+                    app_state.lan_discovery.instance_id.clone(),
+                    SessionId(session_id),
+                    probe_target,
+                );
+            }
         }
         LanDiscoveryPacket::RemoteSessionAck { .. } => {}
+        LanDiscoveryPacket::SessionProbeFrame {
+            magic,
+            app_id,
+            instance_id,
+            session_id,
+            ..
+        } => {
+            if !is_valid_discovery_packet(&magic, &app_id)
+                || instance_id == app_state.lan_discovery.instance_id()
+            {
+                return Ok(());
+            }
+            app_state
+                .probes
+                .lock()
+                .await
+                .record_probe_frame(&SessionId(session_id), bytes.len() as u64, now_ms());
+        }
     }
 
     Ok(())
@@ -535,6 +579,41 @@ async fn send_packet(
 ) -> Result<()> {
     let bytes = serde_json::to_vec(packet)?;
     socket.send_to(&bytes, target).await?;
+    Ok(())
+}
+
+fn spawn_session_probe_sender(instance_id: String, session_id: SessionId, target: SocketAddr) {
+    tokio::spawn(async move {
+        if let Err(error) = send_session_probe_loop(instance_id, session_id, target).await {
+            tracing::warn!(%error, %target, "LAN session probe sender stopped");
+        }
+    });
+}
+
+async fn send_session_probe_loop(
+    instance_id: String,
+    session_id: SessionId,
+    target: SocketAddr,
+) -> Result<()> {
+    let socket = UdpSocket::bind(("0.0.0.0", 0))
+        .await
+        .context("failed to bind LAN session probe UDP socket")?;
+    let mut ticker = interval(Duration::from_millis(SESSION_PROBE_INTERVAL_MS));
+
+    for sequence in 1..=SESSION_PROBE_MAX_FRAMES {
+        ticker.tick().await;
+        let packet = LanDiscoveryPacket::SessionProbeFrame {
+            magic: DISCOVERY_MAGIC.to_string(),
+            app_id: DISCOVERY_APP_ID.to_string(),
+            instance_id: instance_id.clone(),
+            session_id: session_id.0.clone(),
+            sequence,
+            timestamp_ms: now_ms(),
+            payload_bytes: SESSION_PROBE_PAYLOAD_BYTES,
+        };
+        send_packet(&socket, &packet, target).await?;
+    }
+
     Ok(())
 }
 
@@ -636,6 +715,7 @@ mod tests {
             source_device_id: "controller-device".to_string(),
             source_device_name: "Controller".to_string(),
             transport_kind: "quic".to_string(),
+            source_discovery_port: Some(21116),
             timestamp_ms: now_ms(),
         };
         let bytes = serde_json::to_vec(&request).unwrap();
@@ -678,6 +758,40 @@ mod tests {
         assert_eq!(snapshot.transport, "quic");
         assert_eq!(snapshot.lifecycle_state, "listening");
         assert!(snapshot.sender_active);
+    }
+
+    #[tokio::test]
+    async fn session_probe_frame_updates_probe_snapshot() {
+        let app_state = Arc::new(AppState::new());
+        let service_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let probe = LanDiscoveryPacket::SessionProbeFrame {
+            magic: DISCOVERY_MAGIC.to_string(),
+            app_id: DISCOVERY_APP_ID.to_string(),
+            instance_id: "remote-instance".to_string(),
+            session_id: "session-1".to_string(),
+            sequence: 1,
+            timestamp_ms: now_ms(),
+            payload_bytes: 1200,
+        };
+        let bytes = serde_json::to_vec(&probe).unwrap();
+
+        handle_packet(
+            &service_socket,
+            &app_state,
+            &bytes,
+            "127.0.0.1:21116".parse().unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let snapshot = app_state
+            .probes
+            .lock()
+            .await
+            .snapshot(&SessionId("session-1".to_string()));
+        assert_eq!(snapshot.frames_received, 1);
+        assert_eq!(snapshot.frames_decoded, 1);
+        assert_eq!(snapshot.bitrate_mbps, Some(0.0));
     }
 
     #[tokio::test]
