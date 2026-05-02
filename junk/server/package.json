@@ -6,7 +6,7 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "ws": "^8.18.0",
+    "ws": "^8.20.0",
     "uuid": "^14.0.0"
   }
 }
