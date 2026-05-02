@@ -1819,7 +1819,17 @@ impl TestHarness {
                 .cloned()
                 .map(RenderInput::Decoded)
                 .or_else(|| {
-                    (!state.use_decoder).then(|| RenderInput::Captured(captured_frame.clone()))
+                    if state.use_decoder {
+                        None
+                    } else {
+                        let frame_for_render = prepare_captured_frame_for_direct_render(
+                            &captured_frame,
+                            state.width,
+                            state.height,
+                            &mut state.adapted_frame,
+                        );
+                        Some(RenderInput::Captured(frame_for_render.clone()))
+                    }
                 });
             let render_preview_input = if update_web_preview {
                 render_input.clone()
@@ -2845,6 +2855,31 @@ fn prepare_frame_for_encode<'a>(
         .expect("adapt_frame_dimensions_into must initialize scratch")
 }
 
+fn prepare_captured_frame_for_direct_render<'a>(
+    frame: &'a CapturedFrame,
+    target_width: usize,
+    target_height: usize,
+    scratch: &'a mut Option<CapturedFrame>,
+) -> &'a CapturedFrame {
+    if frame.width == target_width && frame.height == target_height {
+        return frame;
+    }
+
+    #[cfg(windows)]
+    if frame.d3d11_shared_bgra().is_some() {
+        return frame;
+    }
+
+    if frame.data.is_empty() {
+        return frame;
+    }
+
+    adapt_frame_dimensions_into(frame, target_width, target_height, scratch);
+    scratch
+        .as_ref()
+        .expect("adapt_frame_dimensions_into must initialize scratch")
+}
+
 fn adapt_frame_dimensions_into(
     frame: &CapturedFrame,
     target_width: usize,
@@ -3397,6 +3432,22 @@ mod tests {
         assert_eq!(cropped.data[4], 3);
         assert_eq!(cropped.data[8], 6);
         assert_eq!(cropped.data[12], 7);
+    }
+
+    #[test]
+    fn direct_render_uses_configured_pipeline_dimensions_for_cpu_frames() {
+        let pixels = (1_u8..=16)
+            .flat_map(|value| [value, 0, 0, 255])
+            .collect::<Vec<_>>();
+        let frame = CapturedFrame::from_cpu(4, 4, FramePixelFormat::Bgra32, 123, pixels);
+        let mut scratch = None;
+
+        let render_frame = prepare_captured_frame_for_direct_render(&frame, 2, 2, &mut scratch);
+
+        assert_eq!(render_frame.width, 2);
+        assert_eq!(render_frame.height, 2);
+        assert_eq!(render_frame.timestamp_us, 123);
+        assert_eq!(render_frame.data.len(), 2 * 2 * 4);
     }
 
     fn env_capture_type() -> CaptureType {

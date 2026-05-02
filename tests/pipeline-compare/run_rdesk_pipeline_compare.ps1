@@ -4,7 +4,11 @@ param(
     [string]$Capture = "dxgi",
     [string]$Codec = "av1",
     [string]$Transport = "quic",
+    [int]$Width = 0,
+    [int]$Height = 0,
     [switch]$Software,
+    [switch]$NativeRender,
+    [switch]$NoNativeRender,
     [switch]$SkipDecode
 )
 
@@ -14,6 +18,14 @@ $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 $resultsPath = Join-Path $repoRoot $ResultsDir
 New-Item -ItemType Directory -Force -Path $resultsPath | Out-Null
 
+if ($NativeRender -and $NoNativeRender) {
+    throw "-NativeRender and -NoNativeRender are mutually exclusive"
+}
+
+if (($Width -gt 0 -and $Height -le 0) -or ($Height -gt 0 -and $Width -le 0)) {
+    throw "-Width and -Height must be provided together"
+}
+
 function Test-SoftwareCodecRequest {
     $codecName = $Codec.ToLowerInvariant()
     return $Software `
@@ -22,6 +34,39 @@ function Test-SoftwareCodecRequest {
         -or $codecName -eq "software-h264" `
         -or $codecName -eq "h264_software" `
         -or $codecName -eq "h264-software"
+}
+
+function Get-EffectiveDimensions {
+    if ($Width -gt 0 -and $Height -gt 0) {
+        return [pscustomobject]@{ Width = $Width; Height = $Height; Source = "explicit" }
+    }
+
+    if (Test-SoftwareCodecRequest) {
+        return [pscustomobject]@{ Width = 1280; Height = 720; Source = "software-default" }
+    }
+
+    return [pscustomobject]@{ Width = 0; Height = 0; Source = "capture-native" }
+}
+
+function Use-NativeRenderer {
+    param([string]$Pipeline)
+
+    if ($Pipeline -eq "capture-encode") {
+        return $false
+    }
+    if ($NoNativeRender) {
+        return $false
+    }
+    if ($NativeRender) {
+        return $true
+    }
+
+    return -not (Test-SoftwareCodecRequest)
+}
+
+$effectiveDimensions = Get-EffectiveDimensions
+if ($effectiveDimensions.Source -eq "software-default") {
+    Write-Host "Software codec target defaults to 1280x720; pass -Width/-Height to override."
 }
 
 function Set-HarnessEnv {
@@ -46,6 +91,13 @@ function Set-HarnessEnv {
     $env:MRD_HARNESS_RESULT_PATH = $ResultPath
     $env:MRD_HARNESS_PIPELINE = $Pipeline
     $env:MRD_HARNESS_REQUIRE_DECODE = if ($RequireDecode) { "1" } else { "0" }
+    if ($effectiveDimensions.Width -gt 0 -and $effectiveDimensions.Height -gt 0) {
+        $env:MRD_HARNESS_WIDTH = "$($effectiveDimensions.Width)"
+        $env:MRD_HARNESS_HEIGHT = "$($effectiveDimensions.Height)"
+    } else {
+        Remove-Item "Env:\MRD_HARNESS_WIDTH" -ErrorAction SilentlyContinue
+        Remove-Item "Env:\MRD_HARNESS_HEIGHT" -ErrorAction SilentlyContinue
+    }
 }
 
 function Clear-HarnessEnv {
@@ -59,7 +111,9 @@ function Clear-HarnessEnv {
     "MRD_HARNESS_PROBE_SECONDS",
     "MRD_HARNESS_RESULT_PATH",
     "MRD_HARNESS_PIPELINE",
-    "MRD_HARNESS_REQUIRE_DECODE" | ForEach-Object {
+    "MRD_HARNESS_REQUIRE_DECODE",
+    "MRD_HARNESS_WIDTH",
+    "MRD_HARNESS_HEIGHT" | ForEach-Object {
         Remove-Item "Env:\$_" -ErrorAction SilentlyContinue
     }
 }
@@ -82,7 +136,7 @@ function Invoke-RdeskPipeline {
         -Encoder $Encoder `
         -Decoder $Decoder `
         -ResultPath $resultPath `
-        -NativeRender ($Pipeline -ne "capture-encode") `
+        -NativeRender (Use-NativeRenderer -Pipeline $Pipeline) `
         -RequireDecode $RequireDecode `
         -ZeroCopy $zeroCopy
 
