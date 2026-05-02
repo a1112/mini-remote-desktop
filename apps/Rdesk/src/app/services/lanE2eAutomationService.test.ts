@@ -56,7 +56,7 @@ function createCommands(
             ip: "192.168.1.24",
             discovery_port: 37777,
             p2p_control_addr: "192.168.1.24:37778",
-            transports: ["quic", "quic_datagram"],
+            transports: ["quic", "quic_datagram", "quic_datagram_2k144"],
             protocol_version: 1,
             age_ms: 20,
             p2p_available: true,
@@ -94,12 +94,15 @@ function createCommands(
         frames_received: 4,
         frames_decoded: 3,
         frames_dropped: 0,
-        current_fps: 24,
-        bitrate_mbps: 8,
+        current_fps: 144,
+        bitrate_mbps: 64,
         media_probe_valid: true,
-        media_probe_format: "rgba8_test_pattern",
-        media_probe_width: 32,
-        media_probe_height: 18,
+        media_probe_format: "compressed_2k144_test_pattern",
+        media_probe_width: 2560,
+        media_probe_height: 1440,
+        media_probe_target_fps: 144,
+        media_probe_target_bitrate_mbps: 64,
+        media_probe_payload_bytes: 55555,
         last_media_sequence: 3,
         last_media_timestamp_us: 123456,
         last_media_payload_hash: "fnv1a64:abc123",
@@ -175,7 +178,7 @@ describe("runLanE2EAutomation", () => {
               ip: "192.168.1.24",
               discovery_port: 37777,
               p2p_control_addr: "192.168.1.24:37778",
-              transports: ["quic", "quic_datagram"],
+              transports: ["quic", "quic_datagram", "quic_datagram_2k144"],
               protocol_version: 1,
               age_ms: 10,
               p2p_available: true,
@@ -243,6 +246,48 @@ describe("runLanE2EAutomation", () => {
     expect(result.status).toBe("failed");
     expect(result.failureReason).toBe("peer_not_ready");
     expect(result.errorMessage).toContain("quic_datagram");
+    expect(result.errorMessage).toContain("Rebuild and restart");
+    expect(commands.ipcStartLanRemoteSession).not.toHaveBeenCalled();
+  });
+
+  it("treats QUIC datagram peers without the 2K144 media profile as not ready", async () => {
+    const commands = createCommands({
+      ipcRefreshLanDiscovery: vi.fn().mockResolvedValue(
+        ok({
+          enabled: true,
+          running: true,
+          discovery_port: 37777,
+          instance_id: "controller-instance",
+          last_probe_ms: 10,
+          peers: [
+            {
+              device_id: "agent-device",
+              device_name: "Agent PC",
+              device_type: "desktop",
+              ip: "192.168.1.24",
+              discovery_port: 37777,
+              p2p_control_addr: "192.168.1.24:37778",
+              transports: ["quic", "quic_datagram"],
+              protocol_version: 1,
+              age_ms: 20,
+              p2p_available: true,
+            },
+          ],
+        })
+      ),
+    });
+
+    const result = await runLanE2EAutomation(commands, {
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      createSessionId: () => "lan-e2e-test-session",
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.failureReason).toBe("peer_not_ready");
+    expect(result.errorMessage).toContain("quic_datagram_2k144");
     expect(result.errorMessage).toContain("Rebuild and restart");
     expect(commands.ipcStartLanRemoteSession).not.toHaveBeenCalled();
   });

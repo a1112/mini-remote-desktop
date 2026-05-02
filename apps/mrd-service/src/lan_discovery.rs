@@ -24,17 +24,21 @@ const PEER_TTL_SECS: u64 = 12;
 const DISCOVERY_MAGIC: &str = "mrd-lan-discovery-v1";
 const DISCOVERY_APP_ID: &str = "rdesk";
 const DISCOVERY_PACKET_BUFFER_BYTES: usize = 65_535;
-const LAN_MEDIA_FRAME_INTERVAL_MS: u64 = 16;
-const LAN_MEDIA_MAX_FRAMES: u64 = 3_600;
-const LAN_MEDIA_PAYLOAD_BYTES: usize = 4_096;
+const LAN_MEDIA_TARGET_WIDTH: u32 = 2560;
+const LAN_MEDIA_TARGET_HEIGHT: u32 = 1440;
+const LAN_MEDIA_TARGET_FPS: u32 = 144;
+const LAN_MEDIA_TARGET_BITRATE_MBPS: u32 = 64;
+const LAN_MEDIA_FRAME_INTERVAL_US: u64 = 1_000_000 / LAN_MEDIA_TARGET_FPS as u64;
+const LAN_MEDIA_MAX_FRAMES: u64 = LAN_MEDIA_TARGET_FPS as u64 * 60;
+const LAN_MEDIA_PAYLOAD_BYTES: usize =
+    (LAN_MEDIA_TARGET_BITRATE_MBPS as usize * 1_000_000 / 8) / LAN_MEDIA_TARGET_FPS as usize;
 const LAN_QUIC_FALLBACK_DATAGRAM_BYTES: usize = 1_200;
 const LAN_QUIC_MEDIA_TRANSPORT: &str = "quic_datagram";
+const LAN_QUIC_MEDIA_PROFILE_TRANSPORT: &str = "quic_datagram_2k144";
 const LAN_MEDIA_PROBE_MAGIC: &[u8; 8] = b"MRDMPF01";
 const LAN_MEDIA_PROBE_HEADER_BYTES: usize = 48;
-const LAN_MEDIA_PROBE_FORMAT: &str = "rgba8_test_pattern";
-const LAN_MEDIA_PROBE_FORMAT_CODE: u32 = 1;
-const LAN_MEDIA_PROBE_WIDTH: u32 = 32;
-const LAN_MEDIA_PROBE_HEIGHT: u32 = 32;
+const LAN_MEDIA_PROBE_FORMAT: &str = "compressed_2k144_test_pattern";
+const LAN_MEDIA_PROBE_FORMAT_CODE: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub struct LanDiscoveryConfig {
@@ -634,7 +638,11 @@ async fn build_announcement(app_state: &Arc<AppState>) -> Option<LanAnnouncement
         device_type: "rdesk".to_string(),
         protocol_version: PROTOCOL_VERSION,
         discovery_port: app_state.lan_discovery.discovery_port(),
-        transports: vec!["quic".to_string(), LAN_QUIC_MEDIA_TRANSPORT.to_string()],
+        transports: vec![
+            "quic".to_string(),
+            LAN_QUIC_MEDIA_TRANSPORT.to_string(),
+            LAN_QUIC_MEDIA_PROFILE_TRANSPORT.to_string(),
+        ],
         timestamp_ms: now_ms(),
     })
 }
@@ -720,16 +728,20 @@ fn ensure_peer_supports_requested_media(
     peer_transports: &[String],
 ) -> Result<()> {
     let transport = normalize_transport_kind(transport_kind);
-    if transport == "quic"
-        && !peer_transports
+    if transport == "quic" {
+        let has_datagram = peer_transports
             .iter()
-            .any(|peer_transport| peer_transport.eq_ignore_ascii_case(LAN_QUIC_MEDIA_TRANSPORT))
-    {
-        anyhow::bail!(
-            "LAN peer advertises legacy quic but not {LAN_QUIC_MEDIA_TRANSPORT} media capability: {} supports {}. Rebuild and restart the peer mrd-service/Rdesk from the latest main branch",
-            target_device_id.0,
-            format_peer_transports(peer_transports)
-        );
+            .any(|peer_transport| peer_transport.eq_ignore_ascii_case(LAN_QUIC_MEDIA_TRANSPORT));
+        let has_profile = peer_transports.iter().any(|peer_transport| {
+            peer_transport.eq_ignore_ascii_case(LAN_QUIC_MEDIA_PROFILE_TRANSPORT)
+        });
+        if !has_datagram || !has_profile {
+            anyhow::bail!(
+                "LAN peer does not advertise {LAN_QUIC_MEDIA_PROFILE_TRANSPORT} media profile: {} supports {}. Rebuild and restart the peer mrd-service/Rdesk from the latest main branch",
+                target_device_id.0,
+                format_peer_transports(peer_transports)
+            );
+        }
     }
     Ok(())
 }
@@ -763,7 +775,7 @@ async fn send_quic_media_loop(
     endpoint: QuinnDatagramEndpoint,
     session_id: SessionId,
 ) -> Result<()> {
-    let mut ticker = interval(Duration::from_millis(LAN_MEDIA_FRAME_INTERVAL_MS));
+    let mut ticker = interval(Duration::from_micros(LAN_MEDIA_FRAME_INTERVAL_US));
     let max_datagram_size = endpoint
         .max_datagram_size()
         .unwrap_or(LAN_QUIC_FALLBACK_DATAGRAM_BYTES)
@@ -819,11 +831,11 @@ async fn receive_quic_media_loop(
         {
             match decode_media_probe_frame(&frame.payload) {
                 Ok(stats) => {
-                    app_state
-                        .probes
-                        .lock()
-                        .await
-                        .record_media_probe_frame(&session_id, stats, now_ms());
+                    app_state.probes.lock().await.record_media_probe_frame(
+                        &session_id,
+                        stats,
+                        now_ms(),
+                    );
                 }
                 Err(error) => {
                     app_state.probes.lock().await.record_probe_drop(
@@ -839,14 +851,14 @@ async fn receive_quic_media_loop(
 }
 
 fn build_media_probe_frame(sequence: u64, timestamp_us: u64) -> Vec<u8> {
-    let media_payload = build_probe_rgba_pattern(sequence);
+    let media_payload = build_probe_compressed_pattern(sequence);
     let payload_hash = fnv1a64(&media_payload);
     let mut frame = Vec::with_capacity(LAN_MEDIA_PROBE_HEADER_BYTES + media_payload.len());
     frame.extend_from_slice(LAN_MEDIA_PROBE_MAGIC);
     frame.extend_from_slice(&sequence.to_le_bytes());
     frame.extend_from_slice(&timestamp_us.to_le_bytes());
-    frame.extend_from_slice(&LAN_MEDIA_PROBE_WIDTH.to_le_bytes());
-    frame.extend_from_slice(&LAN_MEDIA_PROBE_HEIGHT.to_le_bytes());
+    frame.extend_from_slice(&LAN_MEDIA_TARGET_WIDTH.to_le_bytes());
+    frame.extend_from_slice(&LAN_MEDIA_TARGET_HEIGHT.to_le_bytes());
     frame.extend_from_slice(&LAN_MEDIA_PROBE_FORMAT_CODE.to_le_bytes());
     frame.extend_from_slice(&(media_payload.len() as u32).to_le_bytes());
     frame.extend_from_slice(&payload_hash.to_le_bytes());
@@ -896,21 +908,21 @@ fn decode_media_probe_frame(frame: &[u8]) -> Result<MediaProbeFrameStats> {
         timestamp_us,
         width,
         height,
+        target_fps: LAN_MEDIA_TARGET_FPS,
+        target_bitrate_mbps: LAN_MEDIA_TARGET_BITRATE_MBPS,
+        payload_bytes: payload_len as u32,
         format: LAN_MEDIA_PROBE_FORMAT.to_string(),
         payload_hash: format!("fnv1a64:{actual_hash:016x}"),
     })
 }
 
-fn build_probe_rgba_pattern(sequence: u64) -> Vec<u8> {
+fn build_probe_compressed_pattern(sequence: u64) -> Vec<u8> {
     let mut payload = vec![0_u8; LAN_MEDIA_PAYLOAD_BYTES];
-    for y in 0..LAN_MEDIA_PROBE_HEIGHT {
-        for x in 0..LAN_MEDIA_PROBE_WIDTH {
-            let offset = ((y * LAN_MEDIA_PROBE_WIDTH + x) * 4) as usize;
-            payload[offset] = x.wrapping_add(sequence as u32) as u8;
-            payload[offset + 1] = y.wrapping_mul(3).wrapping_add(sequence as u32) as u8;
-            payload[offset + 2] = x.wrapping_add(y).wrapping_add(sequence as u32) as u8;
-            payload[offset + 3] = 255;
-        }
+    for (offset, byte) in payload.iter_mut().enumerate() {
+        let lane = (offset as u64).wrapping_mul(31);
+        *byte = lane
+            .wrapping_add(sequence.wrapping_mul(17))
+            .wrapping_add((offset as u64 >> 8) * 13) as u8;
     }
     payload
 }
@@ -1174,7 +1186,11 @@ mod tests {
                     device_type: "rdesk".to_string(),
                     protocol_version: 1,
                     discovery_port: service_addr.port(),
-                    transports: vec!["quic".to_string(), LAN_QUIC_MEDIA_TRANSPORT.to_string()],
+                    transports: vec![
+                        "quic".to_string(),
+                        LAN_QUIC_MEDIA_TRANSPORT.to_string(),
+                        LAN_QUIC_MEDIA_PROFILE_TRANSPORT.to_string(),
+                    ],
                     timestamp_ms: now_ms(),
                 },
                 service_addr,
@@ -1208,14 +1224,17 @@ mod tests {
             snapshot.media_probe_format.as_deref(),
             Some(LAN_MEDIA_PROBE_FORMAT)
         );
-        assert_eq!(snapshot.media_probe_width, Some(LAN_MEDIA_PROBE_WIDTH));
-        assert_eq!(snapshot.media_probe_height, Some(LAN_MEDIA_PROBE_HEIGHT));
+        assert_eq!(snapshot.media_probe_width, Some(LAN_MEDIA_TARGET_WIDTH));
+        assert_eq!(snapshot.media_probe_height, Some(LAN_MEDIA_TARGET_HEIGHT));
         assert!(snapshot.last_media_sequence.unwrap_or_default() > 0);
         assert!(snapshot
             .last_media_payload_hash
             .as_deref()
             .unwrap_or_default()
             .starts_with("fnv1a64:"));
+        assert_eq!(snapshot.media_probe_target_fps, Some(144));
+        assert_eq!(snapshot.media_probe_target_bitrate_mbps, Some(64));
+        assert!(snapshot.media_probe_payload_bytes.unwrap_or_default() > 0);
     }
 
     #[tokio::test]
@@ -1256,6 +1275,47 @@ mod tests {
         .expect_err("legacy QUIC peer should fail before session request");
 
         assert!(error.to_string().contains("quic_datagram"));
+        assert!(error.to_string().contains("Rebuild and restart"));
+    }
+
+    #[tokio::test]
+    async fn request_lan_remote_session_rejects_peer_without_2k144_media_profile() {
+        let controller_state = Arc::new(AppState::new());
+        controller_state.devices.lock().await.register(
+            DeviceId("controller-device".to_string()),
+            "Controller Device".to_string(),
+        );
+
+        let peer_addr: SocketAddr = "127.0.0.1:32217".parse().unwrap();
+        controller_state
+            .lan_discovery
+            .upsert_peer(
+                LanAnnouncement {
+                    magic: DISCOVERY_MAGIC.to_string(),
+                    app_id: DISCOVERY_APP_ID.to_string(),
+                    instance_id: "stale-target-instance".to_string(),
+                    device_id: "stale-target-device".to_string(),
+                    device_name: "Stale Target Device".to_string(),
+                    device_type: "rdesk".to_string(),
+                    protocol_version: 1,
+                    discovery_port: peer_addr.port(),
+                    transports: vec!["quic".to_string(), LAN_QUIC_MEDIA_TRANSPORT.to_string()],
+                    timestamp_ms: now_ms(),
+                },
+                peer_addr,
+            )
+            .await;
+
+        let error = request_lan_remote_session(
+            &controller_state,
+            &DeviceId("stale-target-device".to_string()),
+            &SessionId("session-stale-peer".to_string()),
+            "quic",
+        )
+        .await
+        .expect_err("stale QUIC datagram peer should fail before session request");
+
+        assert!(error.to_string().contains("quic_datagram_2k144"));
         assert!(error.to_string().contains("Rebuild and restart"));
     }
 
@@ -1320,5 +1380,20 @@ mod tests {
     fn discovery_packet_requires_rdesk_namespace() {
         assert!(is_valid_discovery_packet(DISCOVERY_MAGIC, DISCOVERY_APP_ID));
         assert!(!is_valid_discovery_packet(DISCOVERY_MAGIC, "rsharemouse"));
+    }
+
+    #[test]
+    fn media_probe_frame_uses_2k144_compressed_profile() {
+        let frame = build_media_probe_frame(42, 123_456);
+        let stats = decode_media_probe_frame(&frame).unwrap();
+
+        assert_eq!(stats.sequence, 42);
+        assert_eq!(stats.width, 2560);
+        assert_eq!(stats.height, 1440);
+        assert_eq!(stats.target_fps, 144);
+        assert_eq!(stats.target_bitrate_mbps, 64);
+        assert_eq!(stats.format, "compressed_2k144_test_pattern");
+        assert!(stats.bytes_received < (2560_u64 * 1440 * 4));
+        assert!(stats.payload_hash.starts_with("fnv1a64:"));
     }
 }

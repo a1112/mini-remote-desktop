@@ -336,6 +336,12 @@ export function RemoteDisplayWindowPage() {
   const remoteFramesReceived = probeSnapshot?.frames_received ?? 0;
   const remoteFramesDecoded = probeSnapshot?.frames_decoded ?? 0;
   const hasRemoteFrames = remoteFramesReceived > 0 || remoteFramesDecoded > 0;
+  const remoteProbeTarget =
+    probeSnapshot?.media_probe_width &&
+    probeSnapshot?.media_probe_height &&
+    probeSnapshot?.media_probe_target_fps
+      ? `${probeSnapshot.media_probe_width}x${probeSnapshot.media_probe_height}@${probeSnapshot.media_probe_target_fps}`
+      : null;
 
   const title = useMemo(() => {
     if (context?.label) return context.label;
@@ -1369,6 +1375,7 @@ export function RemoteDisplayWindowPage() {
         {!isLocalPipelinePreview && hasRemoteFrames && (
           <div className="absolute right-3 top-3 rounded-md border border-cyan-400/20 bg-black/45 px-3 py-2 text-[11px] text-cyan-100 backdrop-blur">
             remote rx {remoteFramesReceived} / decoded {remoteFramesDecoded}
+            {remoteProbeTarget ? ` / ${remoteProbeTarget}` : ""}
           </div>
         )}
         {lastError && (

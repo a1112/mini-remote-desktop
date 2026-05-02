@@ -113,6 +113,7 @@ const DEFAULT_MIN_DECODED_FRAMES = 1;
 const DEFAULT_MIN_FPS = 1;
 const DEFAULT_MIN_SAMPLE_DURATION_MS = 0;
 const QUIC_DATAGRAM_MEDIA_CAPABILITY = "quic_datagram";
+const QUIC_2K144_MEDIA_CAPABILITY = "quic_datagram_2k144";
 
 export async function runLanE2EAutomation(
   commands: LanE2EAutomationCommands,
@@ -355,7 +356,10 @@ function peerSupportsTransport(peer: LanPeerInfo, transportKind: string): boolea
   const transports = peer.transports.map((transport) => transport.toLowerCase());
   const requestedTransport = transportKind.toLowerCase();
   if (requestedTransport === "quic") {
-    return transports.includes(QUIC_DATAGRAM_MEDIA_CAPABILITY);
+    return (
+      transports.includes(QUIC_DATAGRAM_MEDIA_CAPABILITY) &&
+      transports.includes(QUIC_2K144_MEDIA_CAPABILITY)
+    );
   }
   return transports.includes(requestedTransport);
 }
@@ -366,10 +370,17 @@ function buildPeerNotReadyMessage(peer: LanPeerInfo, transportKind: string): str
     return `LAN peer is discovered but not P2P available: ${peer.device_id}`;
   }
   if (transportKind.toLowerCase() === "quic") {
+    if (
+      peer.transports.some(
+        (transport) => transport.toLowerCase() === QUIC_DATAGRAM_MEDIA_CAPABILITY
+      )
+    ) {
+      return `LAN peer supports ${QUIC_DATAGRAM_MEDIA_CAPABILITY} but not ${QUIC_2K144_MEDIA_CAPABILITY}: ${peer.device_id} supports ${transportList}. Rebuild and restart the peer mrd-service/Rdesk from the latest main branch.`;
+    }
     if (peer.transports.some((transport) => transport.toLowerCase() === "quic")) {
       return `LAN peer advertises legacy quic but not ${QUIC_DATAGRAM_MEDIA_CAPABILITY}: ${peer.device_id} supports ${transportList}. Rebuild and restart the peer mrd-service/Rdesk from the latest main branch.`;
     }
-    return `LAN peer does not support ${QUIC_DATAGRAM_MEDIA_CAPABILITY}: ${peer.device_id} supports ${transportList}`;
+    return `LAN peer does not support ${QUIC_2K144_MEDIA_CAPABILITY}: ${peer.device_id} supports ${transportList}`;
   }
   return `LAN peer does not support ${transportKind}: ${peer.device_id} supports ${transportList}`;
 }

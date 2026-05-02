@@ -448,9 +448,25 @@ function formatProbeSummary(report: LanE2EAutomationReport | null): string {
   const fps = probe.current_fps ?? 0;
   const seconds = ((report.sampleDurationMs ?? 0) / 1000).toFixed(1);
   const mediaProbe = probe.media_probe_valid
-    ? `, media ${probe.media_probe_format ?? "unknown"} #${probe.last_media_sequence ?? "-"} ${probe.last_media_payload_hash ?? ""}`
+    ? `, media ${formatMediaProbeTarget(probe)} ${probe.media_probe_format ?? "unknown"} #${probe.last_media_sequence ?? "-"} ${
+        probe.last_media_payload_hash ?? ""
+      }`
     : "";
   return `${formatValidationMode(report.validationMode)} decoded ${probe.frames_decoded}, received ${probe.frames_received}, fps ${fps}, ${seconds}s${mediaProbe}`;
+}
+
+function formatMediaProbeTarget(
+  probe: NonNullable<LanE2EAutomationReport["probeSnapshot"]>
+): string {
+  const width = probe.media_probe_width ?? 0;
+  const height = probe.media_probe_height ?? 0;
+  const targetFps = probe.media_probe_target_fps ?? 0;
+  const targetBitrate = probe.media_probe_target_bitrate_mbps ?? 0;
+  if (width > 0 && height > 0 && targetFps > 0) {
+    const bitrate = targetBitrate > 0 ? ` target ${targetBitrate}Mbps` : "";
+    return `${width}x${height}@${targetFps}${bitrate}`;
+  }
+  return "unknown-target";
 }
 
 function formatValidationMode(mode: LanE2EAutomationReport["validationMode"]): string {

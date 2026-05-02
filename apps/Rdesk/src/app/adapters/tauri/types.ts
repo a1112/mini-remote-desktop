@@ -485,6 +485,9 @@ export interface ProbeSnapshot {
   media_probe_format?: string | null;
   media_probe_width?: number | null;
   media_probe_height?: number | null;
+  media_probe_target_fps?: number | null;
+  media_probe_target_bitrate_mbps?: number | null;
+  media_probe_payload_bytes?: number | null;
   last_media_sequence?: number | null;
   last_media_timestamp_us?: number | null;
   last_media_payload_hash?: string | null;

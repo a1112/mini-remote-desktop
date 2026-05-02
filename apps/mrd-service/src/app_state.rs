@@ -56,6 +56,9 @@ struct SessionProbeStats {
     media_probe_format: Option<String>,
     media_probe_width: Option<u32>,
     media_probe_height: Option<u32>,
+    media_probe_target_fps: Option<u32>,
+    media_probe_target_bitrate_mbps: Option<u32>,
+    media_probe_payload_bytes: Option<u32>,
     last_media_sequence: Option<u64>,
     last_media_timestamp_us: Option<u64>,
     last_media_payload_hash: Option<String>,
@@ -69,6 +72,9 @@ pub struct MediaProbeFrameStats {
     pub timestamp_us: u64,
     pub width: u32,
     pub height: u32,
+    pub target_fps: u32,
+    pub target_bitrate_mbps: u32,
+    pub payload_bytes: u32,
     pub format: String,
     pub payload_hash: String,
 }
@@ -108,6 +114,9 @@ impl ProbeRegistry {
         stats.media_probe_format = Some(frame.format);
         stats.media_probe_width = Some(frame.width);
         stats.media_probe_height = Some(frame.height);
+        stats.media_probe_target_fps = Some(frame.target_fps);
+        stats.media_probe_target_bitrate_mbps = Some(frame.target_bitrate_mbps);
+        stats.media_probe_payload_bytes = Some(frame.payload_bytes);
         stats.last_media_sequence = Some(frame.sequence);
         stats.last_media_timestamp_us = Some(frame.timestamp_us);
         stats.last_media_payload_hash = Some(frame.payload_hash);
@@ -143,6 +152,9 @@ impl ProbeRegistry {
                 media_probe_format: None,
                 media_probe_width: None,
                 media_probe_height: None,
+                media_probe_target_fps: None,
+                media_probe_target_bitrate_mbps: None,
+                media_probe_payload_bytes: None,
                 last_media_sequence: None,
                 last_media_timestamp_us: None,
                 last_media_payload_hash: None,
@@ -176,6 +188,9 @@ impl ProbeRegistry {
             media_probe_format: stats.media_probe_format.clone(),
             media_probe_width: stats.media_probe_width,
             media_probe_height: stats.media_probe_height,
+            media_probe_target_fps: stats.media_probe_target_fps,
+            media_probe_target_bitrate_mbps: stats.media_probe_target_bitrate_mbps,
+            media_probe_payload_bytes: stats.media_probe_payload_bytes,
             last_media_sequence: stats.last_media_sequence,
             last_media_timestamp_us: stats.last_media_timestamp_us,
             last_media_payload_hash: stats.last_media_payload_hash.clone(),
@@ -380,6 +395,9 @@ mod tests {
                 timestamp_us: 123_456,
                 width: 32,
                 height: 18,
+                target_fps: 144,
+                target_bitrate_mbps: 64,
+                payload_bytes: 2400,
                 format: "rgba8_test_pattern".to_string(),
                 payload_hash: "fnv1a64:abc123".to_string(),
             },
@@ -390,11 +408,20 @@ mod tests {
         assert_eq!(snapshot.frames_received, 1);
         assert_eq!(snapshot.frames_decoded, 1);
         assert!(snapshot.media_probe_valid);
-        assert_eq!(snapshot.media_probe_format.as_deref(), Some("rgba8_test_pattern"));
+        assert_eq!(
+            snapshot.media_probe_format.as_deref(),
+            Some("rgba8_test_pattern")
+        );
         assert_eq!(snapshot.media_probe_width, Some(32));
         assert_eq!(snapshot.media_probe_height, Some(18));
+        assert_eq!(snapshot.media_probe_target_fps, Some(144));
+        assert_eq!(snapshot.media_probe_target_bitrate_mbps, Some(64));
+        assert_eq!(snapshot.media_probe_payload_bytes, Some(2400));
         assert_eq!(snapshot.last_media_sequence, Some(7));
         assert_eq!(snapshot.last_media_timestamp_us, Some(123_456));
-        assert_eq!(snapshot.last_media_payload_hash.as_deref(), Some("fnv1a64:abc123"));
+        assert_eq!(
+            snapshot.last_media_payload_hash.as_deref(),
+            Some("fnv1a64:abc123")
+        );
     }
 }
