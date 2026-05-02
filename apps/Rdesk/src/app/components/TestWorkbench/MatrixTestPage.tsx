@@ -329,8 +329,12 @@ function slowestPipelineStage(summary: TestRunSummary): readonly [string, number
 }
 
 function unsupportedMatrixReason(config: TestConfig): string | null {
-  if (config.zero_copy && config.capture_type !== "dxgi") {
-    return "D3D11 shared texture path requires DXGI capture";
+  if (
+    config.zero_copy &&
+    config.capture_type !== "dxgi" &&
+    config.capture_type !== "winrt"
+  ) {
+    return "D3D11 shared texture path requires DXGI or WinRT capture";
   }
   if (
     config.zero_copy &&

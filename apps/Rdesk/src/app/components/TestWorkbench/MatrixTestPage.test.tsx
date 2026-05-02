@@ -450,6 +450,56 @@ describe("MatrixTestPage failure handling", () => {
     });
   });
 
+  it("allows WinRT D3D11 shared texture matrix runs", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve({
+          os_type: "windows",
+          cpu_brand: "",
+          cpu_cores: 16,
+          memory_gb: 32,
+          gpu_info: "NVIDIA",
+          available_captures: ["dxgi", "winrt", "synthetic"],
+          available_encoders: ["nvenc_h264", "openh264"],
+          available_decoders: ["nvdec", "software"],
+          available_renderers: ["none", "d3d11"],
+          available_memory_modes: ["cpu", "d3d11_shared"],
+        });
+      }
+      if (command === "test_start_run") {
+        return Promise.resolve("run-1");
+      }
+      if (command === "test_get_run") {
+        return Promise.resolve(null);
+      }
+      return Promise.resolve(null);
+    });
+
+    render(<MatrixTestPage runDelayMs={0} />);
+    await screen.findByLabelText("WinRT");
+    selectSingleSupportedCombination();
+    fireEvent.click(screen.getByLabelText("DXGI"));
+    fireEvent.click(screen.getByLabelText("WinRT"));
+    fireEvent.click(screen.getByLabelText("CPU"));
+    fireEvent.click(screen.getByLabelText("D3D11 shared texture"));
+    fireEvent.click(screen.getByRole("button", { name: /启动矩阵测试/ }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_start_run",
+        expect.objectContaining({
+          config: expect.objectContaining({
+            capture_type: "winrt",
+            renderer_type: "d3d11",
+            render_display: true,
+            zero_copy: true,
+          }),
+        })
+      );
+    });
+  });
+
   it("allows NVENC AV1 with D3D11 shared texture matrix runs", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {
