@@ -243,6 +243,7 @@ describe("runLanE2EAutomation", () => {
     expect(result.status).toBe("failed");
     expect(result.failureReason).toBe("peer_not_ready");
     expect(result.errorMessage).toContain("quic_datagram");
+    expect(result.errorMessage).toContain("Rebuild and restart");
     expect(commands.ipcStartLanRemoteSession).not.toHaveBeenCalled();
   });
 

@@ -726,7 +726,7 @@ fn ensure_peer_supports_requested_media(
             .any(|peer_transport| peer_transport.eq_ignore_ascii_case(LAN_QUIC_MEDIA_TRANSPORT))
     {
         anyhow::bail!(
-            "LAN peer does not advertise {LAN_QUIC_MEDIA_TRANSPORT} media capability: {} supports {}",
+            "LAN peer advertises legacy quic but not {LAN_QUIC_MEDIA_TRANSPORT} media capability: {} supports {}. Rebuild and restart the peer mrd-service/Rdesk from the latest main branch",
             target_device_id.0,
             format_peer_transports(peer_transports)
         );
@@ -1256,6 +1256,7 @@ mod tests {
         .expect_err("legacy QUIC peer should fail before session request");
 
         assert!(error.to_string().contains("quic_datagram"));
+        assert!(error.to_string().contains("Rebuild and restart"));
     }
 
     #[tokio::test]

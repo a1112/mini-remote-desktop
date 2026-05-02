@@ -366,6 +366,9 @@ function buildPeerNotReadyMessage(peer: LanPeerInfo, transportKind: string): str
     return `LAN peer is discovered but not P2P available: ${peer.device_id}`;
   }
   if (transportKind.toLowerCase() === "quic") {
+    if (peer.transports.some((transport) => transport.toLowerCase() === "quic")) {
+      return `LAN peer advertises legacy quic but not ${QUIC_DATAGRAM_MEDIA_CAPABILITY}: ${peer.device_id} supports ${transportList}. Rebuild and restart the peer mrd-service/Rdesk from the latest main branch.`;
+    }
     return `LAN peer does not support ${QUIC_DATAGRAM_MEDIA_CAPABILITY}: ${peer.device_id} supports ${transportList}`;
   }
   return `LAN peer does not support ${transportKind}: ${peer.device_id} supports ${transportList}`;
