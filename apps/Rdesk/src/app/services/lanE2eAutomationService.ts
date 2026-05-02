@@ -2,6 +2,7 @@ import type {
   AdapterResult,
   LanDiscoverySnapshot,
   LanPeerInfo,
+  MediaProfile,
   ProbeSnapshot,
   RemoteDisplayWindowContext,
   RuntimeSnapshot,
@@ -38,6 +39,7 @@ export interface LanE2EAutomationOptions {
   minDecodedFrames?: number;
   minFps?: number;
   stopOnComplete?: boolean;
+  requestedProfile?: MediaProfile;
   createSessionId?: () => string;
   now?: () => number;
 }
@@ -51,6 +53,7 @@ export interface LanE2EAutomationReport {
   displayWindow?: RemoteDisplayWindowContext;
   sessionSnapshot?: SessionRuntimeSnapshot;
   probeSnapshot?: ProbeSnapshot;
+  requestedProfile?: MediaProfile;
   validationMode: "quic_datagram" | "webrtc_rtp";
   dataPlaneVerified: boolean;
   mediaVerified: boolean;
@@ -77,7 +80,8 @@ export interface LanE2EAutomationCommands {
   ipcStartLanRemoteSession(
     sessionId: string,
     targetDeviceId: string,
-    transportKind: string
+    transportKind: string,
+    requestedProfile?: MediaProfile
   ): Promise<AdapterResult<string>>;
   ipcStartReceiver(sessionId: string): Promise<AdapterResult<string>>;
   openRemoteDisplayWindow(params: {
@@ -114,6 +118,14 @@ const DEFAULT_MIN_FPS = 1;
 const DEFAULT_MIN_SAMPLE_DURATION_MS = 0;
 const QUIC_DATAGRAM_MEDIA_CAPABILITY = "quic_datagram";
 const QUIC_2K144_MEDIA_CAPABILITY = "quic_datagram_2k144";
+const MEDIA_PROFILE_CONTROL_CAPABILITY = "media_profile_control_v1";
+const DEFAULT_LAN_MEDIA_PROFILE: MediaProfile = {
+  width: 2560,
+  height: 1440,
+  fps: 144,
+  bitrate_mbps: 64,
+  codec: "h264",
+};
 
 export async function runLanE2EAutomation(
   commands: LanE2EAutomationCommands,
@@ -129,6 +141,10 @@ export async function runLanE2EAutomation(
   const minFps = options.minFps ?? DEFAULT_MIN_FPS;
   const stopOnComplete = options.stopOnComplete ?? true;
   const transportKind = options.transportKind ?? "quic";
+  const requestedProfile =
+    transportKind === "quic"
+      ? options.requestedProfile ?? DEFAULT_LAN_MEDIA_PROFILE
+      : options.requestedProfile;
   const validationMode = transportKind === "webrtc" ? "webrtc_rtp" : "quic_datagram";
   let sessionId: string | undefined;
   let peer: LanPeerInfo | undefined;
@@ -160,6 +176,7 @@ export async function runLanE2EAutomation(
     displayWindow,
     sessionSnapshot,
     probeSnapshot,
+    requestedProfile,
     validationMode,
     dataPlaneVerified: status === "completed",
     mediaVerified:
@@ -206,7 +223,12 @@ export async function runLanE2EAutomation(
     stage("pairing", "started");
     sessionId = options.createSessionId?.() ?? createDefaultSessionId(selectedPeer.device_id, now());
     await unwrap(
-      commands.ipcStartLanRemoteSession(sessionId, selectedPeer.device_id, transportKind),
+      commands.ipcStartLanRemoteSession(
+        sessionId,
+        selectedPeer.device_id,
+        transportKind,
+        requestedProfile
+      ),
       "session_start_failed"
     );
     sessionStarted = true;
@@ -358,7 +380,8 @@ function peerSupportsTransport(peer: LanPeerInfo, transportKind: string): boolea
   if (requestedTransport === "quic") {
     return (
       transports.includes(QUIC_DATAGRAM_MEDIA_CAPABILITY) &&
-      transports.includes(QUIC_2K144_MEDIA_CAPABILITY)
+      transports.includes(QUIC_2K144_MEDIA_CAPABILITY) &&
+      transports.includes(MEDIA_PROFILE_CONTROL_CAPABILITY)
     );
   }
   return transports.includes(requestedTransport);
@@ -370,14 +393,14 @@ function buildPeerNotReadyMessage(peer: LanPeerInfo, transportKind: string): str
     return `LAN peer is discovered but not P2P available: ${peer.device_id}`;
   }
   if (transportKind.toLowerCase() === "quic") {
-    if (
-      peer.transports.some(
-        (transport) => transport.toLowerCase() === QUIC_DATAGRAM_MEDIA_CAPABILITY
-      )
-    ) {
-      return `LAN peer supports ${QUIC_DATAGRAM_MEDIA_CAPABILITY} but not ${QUIC_2K144_MEDIA_CAPABILITY}: ${peer.device_id} supports ${transportList}. Rebuild and restart the peer mrd-service/Rdesk from the latest main branch.`;
+    const lower = peer.transports.map((transport) => transport.toLowerCase());
+    if (lower.includes(QUIC_DATAGRAM_MEDIA_CAPABILITY)) {
+      const missing = [QUIC_2K144_MEDIA_CAPABILITY, MEDIA_PROFILE_CONTROL_CAPABILITY]
+        .filter((capability) => !lower.includes(capability))
+        .join(", ");
+      return `LAN peer supports ${QUIC_DATAGRAM_MEDIA_CAPABILITY} but not required media controls [${missing}]: ${peer.device_id} supports ${transportList}. Rebuild and restart the peer mrd-service/Rdesk from the latest main branch.`;
     }
-    if (peer.transports.some((transport) => transport.toLowerCase() === "quic")) {
+    if (lower.includes("quic")) {
       return `LAN peer advertises legacy quic but not ${QUIC_DATAGRAM_MEDIA_CAPABILITY}: ${peer.device_id} supports ${transportList}. Rebuild and restart the peer mrd-service/Rdesk from the latest main branch.`;
     }
     return `LAN peer does not support ${QUIC_2K144_MEDIA_CAPABILITY}: ${peer.device_id} supports ${transportList}`;

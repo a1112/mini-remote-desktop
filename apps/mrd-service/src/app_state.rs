@@ -6,6 +6,7 @@
 // and media control.
 
 use mrd_application::ports::SessionSnapshot;
+use mrd_ipc::MediaProfileNegotiation;
 use mrd_proto::{DeviceId, SessionId};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -42,6 +43,26 @@ impl SessionRegistry {
 #[derive(Debug, Default)]
 pub struct ProbeRegistry {
     probes: std::collections::HashMap<SessionId, SessionProbeStats>,
+}
+
+/// Runtime media profile negotiation state keyed by session.
+#[derive(Debug, Default)]
+pub struct MediaProfileRegistry {
+    profiles: std::collections::HashMap<SessionId, MediaProfileNegotiation>,
+}
+
+impl MediaProfileRegistry {
+    pub fn set(&mut self, session_id: SessionId, negotiation: MediaProfileNegotiation) {
+        self.profiles.insert(session_id, negotiation);
+    }
+
+    pub fn get(&self, session_id: &SessionId) -> Option<MediaProfileNegotiation> {
+        self.profiles.get(session_id).cloned()
+    }
+
+    pub fn remove(&mut self, session_id: &SessionId) -> Option<MediaProfileNegotiation> {
+        self.profiles.remove(session_id)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -263,6 +284,8 @@ pub struct AppState {
     pub lan_discovery: Arc<crate::lan_discovery::LanDiscoveryState>,
     /// LAN probe telemetry keyed by session.
     pub probes: Arc<Mutex<ProbeRegistry>>,
+    /// Negotiated media profile keyed by session.
+    pub media_profiles: Arc<Mutex<MediaProfileRegistry>>,
 }
 
 impl AppState {
@@ -280,6 +303,7 @@ impl AppState {
             tray,
             lan_discovery: Arc::new(crate::lan_discovery::LanDiscoveryState::default()),
             probes: Arc::new(Mutex::new(ProbeRegistry::default())),
+            media_profiles: Arc::new(Mutex::new(MediaProfileRegistry::default())),
         }
     }
 
@@ -311,6 +335,11 @@ impl AppState {
     /// Get a clone of the probe telemetry registry.
     pub fn probes(&self) -> Arc<Mutex<ProbeRegistry>> {
         self.probes.clone()
+    }
+
+    /// Get a clone of the media profile registry.
+    pub fn media_profiles(&self) -> Arc<Mutex<MediaProfileRegistry>> {
+        self.media_profiles.clone()
     }
 }
 
@@ -423,5 +452,30 @@ mod tests {
             snapshot.last_media_payload_hash.as_deref(),
             Some("fnv1a64:abc123")
         );
+    }
+
+    #[test]
+    fn media_profile_registry_tracks_negotiated_profile() {
+        let mut registry = MediaProfileRegistry::default();
+        let session_id = SessionId("profile-session".to_string());
+        let profile = mrd_ipc::MediaProfile {
+            width: 2560,
+            height: 1440,
+            fps: 144,
+            bitrate_mbps: 64,
+            codec: "h264".to_string(),
+        };
+        let negotiation = MediaProfileNegotiation {
+            requested: profile.clone(),
+            selected: profile,
+            status: "accepted".to_string(),
+            reason: None,
+        };
+
+        registry.set(session_id.clone(), negotiation.clone());
+
+        assert_eq!(registry.get(&session_id), Some(negotiation));
+        assert!(registry.remove(&session_id).is_some());
+        assert!(registry.get(&session_id).is_none());
     }
 }

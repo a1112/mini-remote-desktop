@@ -67,6 +67,9 @@ export interface RuntimeSnapshot {
   is_registered: boolean;
 }
 
+export type MediaProfile = tauriAdapter.MediaProfile;
+export type MediaProfileNegotiation = tauriAdapter.MediaProfileNegotiation;
+
 export interface ProbeSnapshot {
   session_id: string;
   frames_received: number;
@@ -156,12 +159,14 @@ export const startSession = async (
 export const startLanRemoteSession = async (
   sessionId: string,
   targetDeviceId: string,
-  transportKind: TransportKind = "webrtc"
+  transportKind: TransportKind = "webrtc",
+  requestedProfile?: MediaProfile
 ): Promise<string> => {
   const result = await tauriAdapter.ipcStartLanRemoteSession(
     sessionId,
     targetDeviceId,
-    transportKind
+    transportKind,
+    requestedProfile
   );
   return unwrapAdapterResult(result);
 };
@@ -221,6 +226,17 @@ export const startSender = async (sessionId: string): Promise<string> => {
  */
 export const startReceiver = async (sessionId: string): Promise<string> => {
   const result = await tauriAdapter.ipcStartReceiver(sessionId);
+  return unwrapAdapterResult(result);
+};
+
+/**
+ * Request a runtime media profile switch for an active LAN session.
+ */
+export const updateMediaProfile = async (
+  sessionId: string,
+  requestedProfile: MediaProfile
+): Promise<MediaProfileNegotiation> => {
+  const result = await tauriAdapter.ipcUpdateMediaProfile(sessionId, requestedProfile);
   return unwrapAdapterResult(result);
 };
 

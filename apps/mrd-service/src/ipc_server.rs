@@ -157,14 +157,23 @@ impl IpcServer {
                 session_id,
                 target_device_id,
                 transport_kind,
+                requested_profile,
             } => {
                 session::start_lan_remote_session(
                     &self.app_state,
                     session_id,
                     target_device_id,
                     transport_kind,
+                    requested_profile,
                 )
                 .await
+            }
+
+            IpcRequest::UpdateMediaProfile {
+                session_id,
+                requested_profile,
+            } => {
+                session::update_media_profile(&self.app_state, session_id, requested_profile).await
             }
 
             IpcRequest::AcceptSession {

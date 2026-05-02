@@ -1,7 +1,10 @@
 // IPC contract tests
 // Verify serialization/deserialization of all IPC messages
 
-use mrd_ipc::{DeviceInfo, IpcRequest, IpcResponse, SessionBootstrap, SessionRuntimeSnapshot};
+use mrd_ipc::{
+    DeviceInfo, IpcRequest, IpcResponse, MediaProfile, MediaProfileNegotiation, SessionBootstrap,
+    SessionRuntimeSnapshot,
+};
 use mrd_proto::{DeviceId, SessionId};
 
 fn test_device_id() -> DeviceId {
@@ -10,6 +13,16 @@ fn test_device_id() -> DeviceId {
 
 fn test_session_id() -> SessionId {
     SessionId("test-session-123".to_string())
+}
+
+fn test_media_profile() -> MediaProfile {
+    MediaProfile {
+        width: 2560,
+        height: 1440,
+        fps: 144,
+        bitrate_mbps: 64,
+        codec: "h264".to_string(),
+    }
 }
 
 #[test]
@@ -41,6 +54,35 @@ fn serialize_deserialize_start_session() {
         session_id: test_session_id(),
         target_device_id: test_device_id(),
         transport_kind: "quic".to_string(),
+    };
+
+    let json = serde_json::to_string(&request).unwrap();
+    let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(request, deserialized);
+}
+
+#[test]
+fn serialize_deserialize_start_lan_remote_session_with_media_profile() {
+    let request = IpcRequest::StartLanRemoteSession {
+        session_id: test_session_id(),
+        target_device_id: test_device_id(),
+        transport_kind: "quic".to_string(),
+        requested_profile: Some(test_media_profile()),
+    };
+
+    let json = serde_json::to_string(&request).unwrap();
+    assert!(json.contains("requested_profile"));
+    let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(request, deserialized);
+}
+
+#[test]
+fn serialize_deserialize_update_media_profile() {
+    let request = IpcRequest::UpdateMediaProfile {
+        session_id: test_session_id(),
+        requested_profile: test_media_profile(),
     };
 
     let json = serde_json::to_string(&request).unwrap();
@@ -178,6 +220,31 @@ fn serialize_deserialize_error_response() {
 }
 
 #[test]
+fn serialize_deserialize_media_profile_updated_response() {
+    let negotiation = MediaProfileNegotiation {
+        requested: MediaProfile {
+            width: 3840,
+            height: 2160,
+            fps: 240,
+            bitrate_mbps: 120,
+            codec: "h264".to_string(),
+        },
+        selected: test_media_profile(),
+        status: "downgraded".to_string(),
+        reason: Some("clamped to LAN QUIC profile capability".to_string()),
+    };
+    let response = IpcResponse::MediaProfileUpdated {
+        session_id: test_session_id(),
+        negotiation: negotiation.clone(),
+    };
+
+    let json = serde_json::to_string(&response).unwrap();
+    let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(deserialized, response);
+}
+
+#[test]
 fn serialize_deserialize_all_request_types() {
     let requests = vec![
         IpcRequest::RegisterDevice {
@@ -189,6 +256,16 @@ fn serialize_deserialize_all_request_types() {
             session_id: test_session_id(),
             target_device_id: test_device_id(),
             transport_kind: "webrtc".to_string(),
+        },
+        IpcRequest::StartLanRemoteSession {
+            session_id: test_session_id(),
+            target_device_id: test_device_id(),
+            transport_kind: "quic".to_string(),
+            requested_profile: Some(test_media_profile()),
+        },
+        IpcRequest::UpdateMediaProfile {
+            session_id: test_session_id(),
+            requested_profile: test_media_profile(),
         },
         IpcRequest::AcceptSession {
             session_id: test_session_id(),

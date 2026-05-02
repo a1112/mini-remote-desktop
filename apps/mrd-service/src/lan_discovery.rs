@@ -1,7 +1,7 @@
 use crate::app_state::{AppState, MediaProbeFrameStats};
 use anyhow::{Context, Result};
 use mrd_application::ports::SessionSnapshot;
-use mrd_ipc::{LanDiscoverySnapshot, LanPeerInfo};
+use mrd_ipc::{LanDiscoverySnapshot, LanPeerInfo, MediaProfile, MediaProfileNegotiation};
 use mrd_proto::{DeviceId, SessionId};
 use mrd_transport_quic_quinn::{
     fragment_access_unit, QuicAuReassembler, QuicAuReassemblerConfig, QuinnDatagramEndpoint,
@@ -28,16 +28,14 @@ const LAN_MEDIA_TARGET_WIDTH: u32 = 2560;
 const LAN_MEDIA_TARGET_HEIGHT: u32 = 1440;
 const LAN_MEDIA_TARGET_FPS: u32 = 144;
 const LAN_MEDIA_TARGET_BITRATE_MBPS: u32 = 64;
-const LAN_MEDIA_FRAME_INTERVAL_US: u64 = 1_000_000 / LAN_MEDIA_TARGET_FPS as u64;
-const LAN_MEDIA_MAX_FRAMES: u64 = LAN_MEDIA_TARGET_FPS as u64 * 60;
-const LAN_MEDIA_PAYLOAD_BYTES: usize =
-    (LAN_MEDIA_TARGET_BITRATE_MBPS as usize * 1_000_000 / 8) / LAN_MEDIA_TARGET_FPS as usize;
 const LAN_QUIC_FALLBACK_DATAGRAM_BYTES: usize = 1_200;
 const LAN_QUIC_MEDIA_TRANSPORT: &str = "quic_datagram";
 const LAN_QUIC_MEDIA_PROFILE_TRANSPORT: &str = "quic_datagram_2k144";
+const LAN_MEDIA_PROFILE_CONTROL_TRANSPORT: &str = "media_profile_control_v1";
 const LAN_MEDIA_PROBE_MAGIC: &[u8; 8] = b"MRDMPF01";
-const LAN_MEDIA_PROBE_HEADER_BYTES: usize = 48;
-const LAN_MEDIA_PROBE_FORMAT: &str = "compressed_2k144_test_pattern";
+const LAN_MEDIA_PROBE_HEADER_BYTES: usize = 56;
+const LAN_MEDIA_PROBE_2K144_FORMAT: &str = "compressed_2k144_test_pattern";
+const LAN_MEDIA_PROBE_DYNAMIC_FORMAT: &str = "compressed_h264_test_pattern";
 const LAN_MEDIA_PROBE_FORMAT_CODE: u32 = 2;
 
 #[derive(Debug, Clone)]
@@ -231,6 +229,8 @@ enum LanDiscoveryPacket {
         transport_kind: String,
         #[serde(default)]
         source_discovery_port: Option<u16>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        requested_media_profile: Option<MediaProfile>,
         timestamp_ms: u64,
     },
     RemoteSessionAck {
@@ -243,6 +243,30 @@ enum LanDiscoveryPacket {
         message: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         media: Option<LanMediaBootstrap>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        media_profile: Option<MediaProfileNegotiation>,
+        timestamp_ms: u64,
+    },
+    MediaProfileUpdate {
+        magic: String,
+        #[serde(default = "default_app_id")]
+        app_id: String,
+        instance_id: String,
+        session_id: String,
+        source_device_id: String,
+        requested_media_profile: MediaProfile,
+        timestamp_ms: u64,
+    },
+    MediaProfileUpdateAck {
+        magic: String,
+        #[serde(default = "default_app_id")]
+        app_id: String,
+        instance_id: String,
+        session_id: String,
+        accepted: bool,
+        message: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        media_profile: Option<MediaProfileNegotiation>,
         timestamp_ms: u64,
     },
 }
@@ -280,6 +304,7 @@ struct LanRemoteAcceptResult {
     accepted: bool,
     message: Option<String>,
     media: Option<LanMediaBootstrap>,
+    media_profile: Option<MediaProfileNegotiation>,
 }
 
 impl LanRemoteAcceptResult {
@@ -288,6 +313,7 @@ impl LanRemoteAcceptResult {
             accepted: false,
             message: Some(message.into()),
             media: None,
+            media_profile: None,
         }
     }
 }
@@ -355,7 +381,8 @@ pub async fn request_lan_remote_session(
     target_device_id: &DeviceId,
     session_id: &SessionId,
     transport_kind: &str,
-) -> Result<()> {
+    requested_profile: Option<MediaProfile>,
+) -> Result<MediaProfileNegotiation> {
     let target = app_state
         .lan_discovery
         .peer_control_addr(target_device_id)
@@ -388,6 +415,7 @@ pub async fn request_lan_remote_session(
         source_device_name,
         transport_kind: transport_kind.to_string(),
         source_discovery_port: Some(app_state.lan_discovery.discovery_port()),
+        requested_media_profile: requested_profile,
         timestamp_ms: now_ms(),
     };
     send_packet(&socket, &packet, target).await?;
@@ -405,9 +433,16 @@ pub async fn request_lan_remote_session(
             accepted,
             message,
             media,
+            media_profile,
             ..
         } if is_valid_discovery_packet(&magic, &app_id) && ack_session_id == session_id.0 => {
             if accepted {
+                let negotiation = media_profile.unwrap_or_else(default_media_profile_negotiation);
+                app_state
+                    .media_profiles
+                    .lock()
+                    .await
+                    .set(session_id.clone(), negotiation.clone());
                 start_lan_media_receiver(
                     app_state.clone(),
                     session_id.clone(),
@@ -416,7 +451,7 @@ pub async fn request_lan_remote_session(
                     ack_addr.ip(),
                 )
                 .await?;
-                Ok(())
+                Ok(negotiation)
             } else {
                 anyhow::bail!(
                     "LAN peer rejected remote session: {}",
@@ -425,6 +460,92 @@ pub async fn request_lan_remote_session(
             }
         }
         _ => anyhow::bail!("unexpected LAN remote session response"),
+    }
+}
+
+pub async fn request_lan_media_profile_update(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+    requested_profile: MediaProfile,
+) -> Result<MediaProfileNegotiation> {
+    validate_media_profile(&requested_profile)?;
+    let peer_device_id = {
+        let sessions = app_state.sessions.lock().await;
+        let snapshot = sessions
+            .get(session_id)
+            .with_context(|| format!("session not found: {}", session_id.0))?;
+        snapshot
+            .target_device_id
+            .clone()
+            .or_else(|| snapshot.source_device_id.clone())
+            .with_context(|| format!("session has no remote peer: {}", session_id.0))?
+    };
+    let target = app_state
+        .lan_discovery
+        .peer_control_addr(&peer_device_id)
+        .await
+        .with_context(|| format!("LAN peer not found: {}", peer_device_id.0))?;
+    let peer_transports = app_state
+        .lan_discovery
+        .peer_transports(&peer_device_id)
+        .await
+        .with_context(|| format!("LAN peer not found: {}", peer_device_id.0))?;
+    ensure_peer_supports_requested_media(&peer_device_id, "quic", &peer_transports)?;
+
+    let source_device_id = {
+        let devices = app_state.devices.lock().await;
+        devices
+            .get_local_device()
+            .map(|(id, _)| id.0.clone())
+            .context("local device is not registered")?
+    };
+
+    let socket = UdpSocket::bind(("0.0.0.0", 0))
+        .await
+        .context("failed to bind LAN media profile update UDP socket")?;
+    let packet = LanDiscoveryPacket::MediaProfileUpdate {
+        magic: DISCOVERY_MAGIC.to_string(),
+        app_id: DISCOVERY_APP_ID.to_string(),
+        instance_id: app_state.lan_discovery.instance_id.clone(),
+        session_id: session_id.0.clone(),
+        source_device_id,
+        requested_media_profile: requested_profile,
+        timestamp_ms: now_ms(),
+    };
+    send_packet(&socket, &packet, target).await?;
+
+    let mut buffer = vec![0_u8; DISCOVERY_PACKET_BUFFER_BYTES];
+    let (len, _) = timeout(Duration::from_secs(2), socket.recv_from(&mut buffer))
+        .await
+        .context("LAN media profile update timed out")??;
+    let ack: LanDiscoveryPacket = serde_json::from_slice(&buffer[..len])?;
+    match ack {
+        LanDiscoveryPacket::MediaProfileUpdateAck {
+            magic,
+            app_id,
+            session_id: ack_session_id,
+            accepted,
+            message,
+            media_profile,
+            ..
+        } if is_valid_discovery_packet(&magic, &app_id) && ack_session_id == session_id.0 => {
+            if accepted {
+                let negotiation =
+                    media_profile.context("LAN peer accepted profile update without result")?;
+                app_state
+                    .media_profiles
+                    .lock()
+                    .await
+                    .set(session_id.clone(), negotiation.clone());
+                Ok(negotiation)
+            } else {
+                anyhow::bail!(
+                    "LAN peer rejected media profile update: {}",
+                    message.unwrap_or_else(|| "unknown reason".to_string())
+                );
+            }
+        }
+        _ => anyhow::bail!("unexpected LAN media profile update response"),
     }
 }
 
@@ -510,6 +631,7 @@ async fn handle_packet(
             session_id,
             source_device_id,
             transport_kind,
+            requested_media_profile,
             ..
         } => {
             if !is_valid_discovery_packet(&magic, &app_id)
@@ -523,6 +645,7 @@ async fn handle_packet(
                 SessionId(session_id.clone()),
                 DeviceId(source_device_id),
                 transport_kind,
+                requested_media_profile,
             )
             .await;
 
@@ -534,11 +657,54 @@ async fn handle_packet(
                 accepted: accept_result.accepted,
                 message: accept_result.message,
                 media: accept_result.media,
+                media_profile: accept_result.media_profile,
                 timestamp_ms: now_ms(),
             };
             send_packet(socket, &ack, addr).await?;
         }
         LanDiscoveryPacket::RemoteSessionAck { .. } => {}
+        LanDiscoveryPacket::MediaProfileUpdate {
+            magic,
+            app_id,
+            instance_id,
+            session_id,
+            source_device_id,
+            requested_media_profile,
+            ..
+        } => {
+            if !is_valid_discovery_packet(&magic, &app_id)
+                || instance_id == app_state.lan_discovery.instance_id()
+            {
+                return Ok(());
+            }
+
+            let session_id = SessionId(session_id);
+            let update_result =
+                accept_lan_media_profile_update(app_state, &session_id, requested_media_profile)
+                    .await;
+            let (accepted, message, media_profile) = match update_result {
+                Ok(negotiation) => (true, Some("updated".to_string()), Some(negotiation)),
+                Err(error) => (false, Some(error.to_string()), None),
+            };
+            tracing::info!(
+                session_id = %session_id.0,
+                source_device_id = %source_device_id,
+                accepted,
+                "handled LAN media profile update"
+            );
+            let ack = LanDiscoveryPacket::MediaProfileUpdateAck {
+                magic: DISCOVERY_MAGIC.to_string(),
+                app_id: DISCOVERY_APP_ID.to_string(),
+                instance_id: app_state.lan_discovery.instance_id.clone(),
+                session_id: session_id.0,
+                accepted,
+                message,
+                media_profile,
+                timestamp_ms: now_ms(),
+            };
+            send_packet(socket, &ack, addr).await?;
+        }
+        LanDiscoveryPacket::MediaProfileUpdateAck { .. } => {}
     }
 
     Ok(())
@@ -549,6 +715,7 @@ async fn accept_lan_remote_session(
     session_id: SessionId,
     source_device_id: DeviceId,
     transport_kind: String,
+    requested_profile: Option<MediaProfile>,
 ) -> LanRemoteAcceptResult {
     let is_registered = {
         let devices = app_state.devices.lock().await;
@@ -569,6 +736,10 @@ async fn accept_lan_remote_session(
             "unsupported LAN media transport: {transport}"
         ));
     }
+    let negotiation = match negotiate_media_profile(requested_profile) {
+        Ok(value) => value,
+        Err(error) => return LanRemoteAcceptResult::rejected(error.to_string()),
+    };
 
     let (listener, bootstrap) = match QuinnServerListener::bind("0.0.0.0:0").await {
         Ok(value) => value,
@@ -587,7 +758,12 @@ async fn accept_lan_remote_session(
             cert_der: bootstrap.cert_der.clone(),
         }),
     };
-    spawn_quic_media_sender(session_id.clone(), listener);
+    app_state
+        .media_profiles
+        .lock()
+        .await
+        .set(session_id.clone(), negotiation.clone());
+    spawn_quic_media_sender(app_state.clone(), session_id.clone(), listener);
 
     let local_listen_addr = bootstrap.listen_addr.to_string();
     let local_server_name = bootstrap.server_name.clone();
@@ -618,7 +794,42 @@ async fn accept_lan_remote_session(
         accepted: true,
         message: Some("accepted".to_string()),
         media: Some(local_media),
+        media_profile: Some(negotiation),
     }
+}
+
+async fn accept_lan_media_profile_update(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+    requested_profile: MediaProfile,
+) -> Result<MediaProfileNegotiation> {
+    validate_media_profile(&requested_profile)?;
+    {
+        let sessions = app_state.sessions.lock().await;
+        let snapshot = sessions
+            .get(session_id)
+            .with_context(|| format!("session not found: {}", session_id.0))?;
+        if normalize_transport_kind(&snapshot.transport) != "quic" {
+            anyhow::bail!(
+                "media profile update is only supported for LAN QUIC sessions, got {}",
+                snapshot.transport
+            );
+        }
+        if snapshot.lifecycle_state == "closed" || snapshot.lifecycle_state == "failed" {
+            anyhow::bail!(
+                "media profile update rejected for {} session",
+                snapshot.lifecycle_state
+            );
+        }
+    }
+
+    let negotiation = negotiate_media_profile(Some(requested_profile))?;
+    app_state
+        .media_profiles
+        .lock()
+        .await
+        .set(session_id.clone(), negotiation.clone());
+    Ok(negotiation)
 }
 
 async fn build_announcement(app_state: &Arc<AppState>) -> Option<LanAnnouncement> {
@@ -642,6 +853,7 @@ async fn build_announcement(app_state: &Arc<AppState>) -> Option<LanAnnouncement
             "quic".to_string(),
             LAN_QUIC_MEDIA_TRANSPORT.to_string(),
             LAN_QUIC_MEDIA_PROFILE_TRANSPORT.to_string(),
+            LAN_MEDIA_PROFILE_CONTROL_TRANSPORT.to_string(),
         ],
         timestamp_ms: now_ms(),
     })
@@ -729,15 +941,24 @@ fn ensure_peer_supports_requested_media(
 ) -> Result<()> {
     let transport = normalize_transport_kind(transport_kind);
     if transport == "quic" {
-        let has_datagram = peer_transports
+        let required = [
+            LAN_QUIC_MEDIA_TRANSPORT,
+            LAN_QUIC_MEDIA_PROFILE_TRANSPORT,
+            LAN_MEDIA_PROFILE_CONTROL_TRANSPORT,
+        ];
+        let missing = required
             .iter()
-            .any(|peer_transport| peer_transport.eq_ignore_ascii_case(LAN_QUIC_MEDIA_TRANSPORT));
-        let has_profile = peer_transports.iter().any(|peer_transport| {
-            peer_transport.eq_ignore_ascii_case(LAN_QUIC_MEDIA_PROFILE_TRANSPORT)
-        });
-        if !has_datagram || !has_profile {
+            .filter(|required_transport| {
+                !peer_transports
+                    .iter()
+                    .any(|peer_transport| peer_transport.eq_ignore_ascii_case(required_transport))
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
             anyhow::bail!(
-                "LAN peer does not advertise {LAN_QUIC_MEDIA_PROFILE_TRANSPORT} media profile: {} supports {}. Rebuild and restart the peer mrd-service/Rdesk from the latest main branch",
+                "LAN peer does not advertise required media controls [{}]: {} supports {}. Rebuild and restart the peer mrd-service/Rdesk from the latest main branch",
+                missing.join(", "),
                 target_device_id.0,
                 format_peer_transports(peer_transports)
             );
@@ -754,7 +975,11 @@ fn format_peer_transports(peer_transports: &[String]) -> String {
     }
 }
 
-fn spawn_quic_media_sender(session_id: SessionId, listener: QuinnServerListener) {
+fn spawn_quic_media_sender(
+    app_state: Arc<AppState>,
+    session_id: SessionId,
+    listener: QuinnServerListener,
+) {
     tokio::spawn(async move {
         let local_addr = listener.local_addr();
         let result = async move {
@@ -762,7 +987,7 @@ fn spawn_quic_media_sender(session_id: SessionId, listener: QuinnServerListener)
                 .accept()
                 .await
                 .context("LAN QUIC media listener failed to accept receiver")?;
-            send_quic_media_loop(endpoint, session_id).await
+            send_quic_media_loop(app_state, endpoint, session_id).await
         }
         .await;
         if let Err(error) = result {
@@ -772,19 +997,21 @@ fn spawn_quic_media_sender(session_id: SessionId, listener: QuinnServerListener)
 }
 
 async fn send_quic_media_loop(
+    app_state: Arc<AppState>,
     endpoint: QuinnDatagramEndpoint,
     session_id: SessionId,
 ) -> Result<()> {
-    let mut ticker = interval(Duration::from_micros(LAN_MEDIA_FRAME_INTERVAL_US));
     let max_datagram_size = endpoint
         .max_datagram_size()
         .unwrap_or(LAN_QUIC_FALLBACK_DATAGRAM_BYTES)
         .min(LAN_QUIC_FALLBACK_DATAGRAM_BYTES)
         .max(QUIC_AU_FRAGMENT_HEADER_LEN + 1);
 
-    for frame_id in 1..=LAN_MEDIA_MAX_FRAMES {
-        ticker.tick().await;
-        let payload = build_media_probe_frame(frame_id, now_ms().saturating_mul(1_000));
+    let mut frame_id = 1_u64;
+    loop {
+        let profile = selected_media_profile(&app_state, &session_id).await;
+        tokio::time::sleep(media_frame_interval(&profile)).await;
+        let payload = build_media_probe_frame(frame_id, now_ms().saturating_mul(1_000), &profile);
         let fragments = fragment_access_unit(
             frame_id as u32,
             now_ms().saturating_mul(1_000),
@@ -799,10 +1026,8 @@ async fn send_quic_media_loop(
                 .send_datagram(fragment)
                 .with_context(|| format!("failed to send LAN QUIC media frame {}", frame_id))?;
         }
+        frame_id = frame_id.wrapping_add(1).max(1);
     }
-
-    tracing::debug!(session_id = %session_id.0, "LAN QUIC media sender completed");
-    Ok(())
 }
 
 fn spawn_quic_media_receiver(
@@ -850,18 +1075,20 @@ async fn receive_quic_media_loop(
     }
 }
 
-fn build_media_probe_frame(sequence: u64, timestamp_us: u64) -> Vec<u8> {
-    let media_payload = build_probe_compressed_pattern(sequence);
+fn build_media_probe_frame(sequence: u64, timestamp_us: u64, profile: &MediaProfile) -> Vec<u8> {
+    let media_payload = build_probe_compressed_pattern(sequence, profile);
     let payload_hash = fnv1a64(&media_payload);
     let mut frame = Vec::with_capacity(LAN_MEDIA_PROBE_HEADER_BYTES + media_payload.len());
     frame.extend_from_slice(LAN_MEDIA_PROBE_MAGIC);
     frame.extend_from_slice(&sequence.to_le_bytes());
     frame.extend_from_slice(&timestamp_us.to_le_bytes());
-    frame.extend_from_slice(&LAN_MEDIA_TARGET_WIDTH.to_le_bytes());
-    frame.extend_from_slice(&LAN_MEDIA_TARGET_HEIGHT.to_le_bytes());
+    frame.extend_from_slice(&profile.width.to_le_bytes());
+    frame.extend_from_slice(&profile.height.to_le_bytes());
     frame.extend_from_slice(&LAN_MEDIA_PROBE_FORMAT_CODE.to_le_bytes());
     frame.extend_from_slice(&(media_payload.len() as u32).to_le_bytes());
     frame.extend_from_slice(&payload_hash.to_le_bytes());
+    frame.extend_from_slice(&profile.fps.to_le_bytes());
+    frame.extend_from_slice(&profile.bitrate_mbps.to_le_bytes());
     frame.extend_from_slice(&media_payload);
     frame
 }
@@ -881,6 +1108,8 @@ fn decode_media_probe_frame(frame: &[u8]) -> Result<MediaProbeFrameStats> {
     let format_code = u32::from_le_bytes(frame[32..36].try_into().unwrap());
     let payload_len = u32::from_le_bytes(frame[36..40].try_into().unwrap()) as usize;
     let expected_hash = u64::from_le_bytes(frame[40..48].try_into().unwrap());
+    let target_fps = u32::from_le_bytes(frame[48..52].try_into().unwrap());
+    let target_bitrate_mbps = u32::from_le_bytes(frame[52..56].try_into().unwrap());
 
     let Some(expected_len) = LAN_MEDIA_PROBE_HEADER_BYTES.checked_add(payload_len) else {
         anyhow::bail!("media probe frame payload length overflow");
@@ -908,16 +1137,16 @@ fn decode_media_probe_frame(frame: &[u8]) -> Result<MediaProbeFrameStats> {
         timestamp_us,
         width,
         height,
-        target_fps: LAN_MEDIA_TARGET_FPS,
-        target_bitrate_mbps: LAN_MEDIA_TARGET_BITRATE_MBPS,
+        target_fps,
+        target_bitrate_mbps,
         payload_bytes: payload_len as u32,
-        format: LAN_MEDIA_PROBE_FORMAT.to_string(),
+        format: media_probe_format(width, height, target_fps, target_bitrate_mbps).to_string(),
         payload_hash: format!("fnv1a64:{actual_hash:016x}"),
     })
 }
 
-fn build_probe_compressed_pattern(sequence: u64) -> Vec<u8> {
-    let mut payload = vec![0_u8; LAN_MEDIA_PAYLOAD_BYTES];
+fn build_probe_compressed_pattern(sequence: u64, profile: &MediaProfile) -> Vec<u8> {
+    let mut payload = vec![0_u8; media_payload_bytes(profile)];
     for (offset, byte) in payload.iter_mut().enumerate() {
         let lane = (offset as u64).wrapping_mul(31);
         *byte = lane
@@ -925,6 +1154,94 @@ fn build_probe_compressed_pattern(sequence: u64) -> Vec<u8> {
             .wrapping_add((offset as u64 >> 8) * 13) as u8;
     }
     payload
+}
+
+async fn selected_media_profile(app_state: &Arc<AppState>, session_id: &SessionId) -> MediaProfile {
+    app_state
+        .media_profiles
+        .lock()
+        .await
+        .get(session_id)
+        .map(|negotiation| negotiation.selected)
+        .unwrap_or_else(default_media_profile)
+}
+
+fn default_media_profile() -> MediaProfile {
+    MediaProfile {
+        width: LAN_MEDIA_TARGET_WIDTH,
+        height: LAN_MEDIA_TARGET_HEIGHT,
+        fps: LAN_MEDIA_TARGET_FPS,
+        bitrate_mbps: LAN_MEDIA_TARGET_BITRATE_MBPS,
+        codec: "h264".to_string(),
+    }
+}
+
+fn default_media_profile_negotiation() -> MediaProfileNegotiation {
+    let profile = default_media_profile();
+    MediaProfileNegotiation {
+        requested: profile.clone(),
+        selected: profile,
+        status: "accepted".to_string(),
+        reason: None,
+    }
+}
+
+fn negotiate_media_profile(
+    requested_profile: Option<MediaProfile>,
+) -> Result<MediaProfileNegotiation> {
+    let requested = requested_profile.unwrap_or_else(default_media_profile);
+    validate_media_profile(&requested)?;
+
+    let mut selected = requested.clone();
+    selected.width = selected.width.min(LAN_MEDIA_TARGET_WIDTH);
+    selected.height = selected.height.min(LAN_MEDIA_TARGET_HEIGHT);
+    selected.fps = selected.fps.min(LAN_MEDIA_TARGET_FPS);
+    selected.bitrate_mbps = selected.bitrate_mbps.min(LAN_MEDIA_TARGET_BITRATE_MBPS);
+    selected.codec = "h264".to_string();
+
+    let changed = selected != requested;
+    Ok(MediaProfileNegotiation {
+        requested,
+        selected,
+        status: if changed { "downgraded" } else { "accepted" }.to_string(),
+        reason: if changed {
+            Some("clamped to LAN QUIC media capability".to_string())
+        } else {
+            None
+        },
+    })
+}
+
+fn validate_media_profile(profile: &MediaProfile) -> Result<()> {
+    if profile.width == 0 || profile.height == 0 || profile.fps == 0 || profile.bitrate_mbps == 0 {
+        anyhow::bail!("media profile width, height, fps and bitrate must be greater than zero");
+    }
+    Ok(())
+}
+
+fn media_frame_interval(profile: &MediaProfile) -> Duration {
+    Duration::from_micros((1_000_000 / u64::from(profile.fps.max(1))).max(1))
+}
+
+fn media_payload_bytes(profile: &MediaProfile) -> usize {
+    ((profile.bitrate_mbps as usize * 1_000_000 / 8) / profile.fps.max(1) as usize).max(1)
+}
+
+fn media_probe_format(
+    width: u32,
+    height: u32,
+    target_fps: u32,
+    target_bitrate_mbps: u32,
+) -> &'static str {
+    if width == LAN_MEDIA_TARGET_WIDTH
+        && height == LAN_MEDIA_TARGET_HEIGHT
+        && target_fps == LAN_MEDIA_TARGET_FPS
+        && target_bitrate_mbps == LAN_MEDIA_TARGET_BITRATE_MBPS
+    {
+        LAN_MEDIA_PROBE_2K144_FORMAT
+    } else {
+        LAN_MEDIA_PROBE_DYNAMIC_FORMAT
+    }
 }
 
 fn fnv1a64(bytes: &[u8]) -> u64 {
@@ -1044,6 +1361,13 @@ mod tests {
             source_device_name: "Controller".to_string(),
             transport_kind: "quic".to_string(),
             source_discovery_port: Some(21116),
+            requested_media_profile: Some(MediaProfile {
+                width: 3840,
+                height: 2160,
+                fps: 240,
+                bitrate_mbps: 120,
+                codec: "hevc".to_string(),
+            }),
             timestamp_ms: now_ms(),
         };
         let bytes = serde_json::to_vec(&request).unwrap();
@@ -1068,6 +1392,7 @@ mod tests {
                 session_id,
                 accepted,
                 media,
+                media_profile,
                 ..
             } => {
                 assert_eq!(session_id, "session-1");
@@ -1078,6 +1403,16 @@ mod tests {
                 assert!(quic.listen_addr.ends_with(":0") == false);
                 assert!(!quic.server_name.is_empty());
                 assert!(!quic.cert_der.is_empty());
+                let negotiation = media_profile.expect("media profile negotiation");
+                assert_eq!(negotiation.status, "downgraded");
+                assert_eq!(negotiation.selected.width, LAN_MEDIA_TARGET_WIDTH);
+                assert_eq!(negotiation.selected.height, LAN_MEDIA_TARGET_HEIGHT);
+                assert_eq!(negotiation.selected.fps, LAN_MEDIA_TARGET_FPS);
+                assert_eq!(
+                    negotiation.selected.bitrate_mbps,
+                    LAN_MEDIA_TARGET_BITRATE_MBPS
+                );
+                assert_eq!(negotiation.selected.codec, "h264");
             }
             _ => panic!("expected remote session ack"),
         }
@@ -1115,6 +1450,7 @@ mod tests {
             source_device_name: "Controller".to_string(),
             transport_kind: "webrtc".to_string(),
             source_discovery_port: None,
+            requested_media_profile: None,
             timestamp_ms: now_ms(),
         };
         let bytes = serde_json::to_vec(&request).unwrap();
@@ -1190,6 +1526,7 @@ mod tests {
                         "quic".to_string(),
                         LAN_QUIC_MEDIA_TRANSPORT.to_string(),
                         LAN_QUIC_MEDIA_PROFILE_TRANSPORT.to_string(),
+                        LAN_MEDIA_PROFILE_CONTROL_TRANSPORT.to_string(),
                     ],
                     timestamp_ms: now_ms(),
                 },
@@ -1203,6 +1540,7 @@ mod tests {
             &DeviceId("target-device".to_string()),
             &session_id,
             "quic",
+            None,
         )
         .await
         .unwrap();
@@ -1222,7 +1560,7 @@ mod tests {
         assert!(snapshot.media_probe_valid);
         assert_eq!(
             snapshot.media_probe_format.as_deref(),
-            Some(LAN_MEDIA_PROBE_FORMAT)
+            Some(LAN_MEDIA_PROBE_2K144_FORMAT)
         );
         assert_eq!(snapshot.media_probe_width, Some(LAN_MEDIA_TARGET_WIDTH));
         assert_eq!(snapshot.media_probe_height, Some(LAN_MEDIA_TARGET_HEIGHT));
@@ -1270,6 +1608,7 @@ mod tests {
             &DeviceId("legacy-target-device".to_string()),
             &SessionId("session-legacy-peer".to_string()),
             "quic",
+            None,
         )
         .await
         .expect_err("legacy QUIC peer should fail before session request");
@@ -1311,6 +1650,7 @@ mod tests {
             &DeviceId("stale-target-device".to_string()),
             &SessionId("session-stale-peer".to_string()),
             "quic",
+            None,
         )
         .await
         .expect_err("stale QUIC datagram peer should fail before session request");
@@ -1384,7 +1724,8 @@ mod tests {
 
     #[test]
     fn media_probe_frame_uses_2k144_compressed_profile() {
-        let frame = build_media_probe_frame(42, 123_456);
+        let profile = default_media_profile();
+        let frame = build_media_probe_frame(42, 123_456, &profile);
         let stats = decode_media_probe_frame(&frame).unwrap();
 
         assert_eq!(stats.sequence, 42);
@@ -1395,5 +1736,97 @@ mod tests {
         assert_eq!(stats.format, "compressed_2k144_test_pattern");
         assert!(stats.bytes_received < (2560_u64 * 1440 * 4));
         assert!(stats.payload_hash.starts_with("fnv1a64:"));
+    }
+
+    #[test]
+    fn media_profile_negotiation_clamps_to_lan_capability() {
+        let negotiation = negotiate_media_profile(Some(MediaProfile {
+            width: 3840,
+            height: 2160,
+            fps: 240,
+            bitrate_mbps: 120,
+            codec: "hevc".to_string(),
+        }))
+        .unwrap();
+
+        assert_eq!(negotiation.status, "downgraded");
+        assert_eq!(negotiation.selected.width, 2560);
+        assert_eq!(negotiation.selected.height, 1440);
+        assert_eq!(negotiation.selected.fps, 144);
+        assert_eq!(negotiation.selected.bitrate_mbps, 64);
+        assert_eq!(negotiation.selected.codec, "h264");
+    }
+
+    #[test]
+    fn dynamic_media_probe_frame_preserves_selected_profile() {
+        let profile = MediaProfile {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            bitrate_mbps: 20,
+            codec: "h264".to_string(),
+        };
+        let frame = build_media_probe_frame(7, 99_000, &profile);
+        let stats = decode_media_probe_frame(&frame).unwrap();
+
+        assert_eq!(stats.width, 1920);
+        assert_eq!(stats.height, 1080);
+        assert_eq!(stats.target_fps, 60);
+        assert_eq!(stats.target_bitrate_mbps, 20);
+        assert_eq!(stats.payload_bytes, media_payload_bytes(&profile) as u32);
+        assert_eq!(stats.format, "compressed_h264_test_pattern");
+    }
+
+    #[tokio::test]
+    async fn media_profile_update_changes_active_quic_session_profile() {
+        let app_state = Arc::new(AppState::new());
+        let session_id = SessionId("profile-update-session".to_string());
+        app_state.sessions.lock().await.insert(
+            session_id.clone(),
+            SessionSnapshot {
+                session_id: session_id.clone(),
+                transport: "quic".to_string(),
+                source_device_id: Some(DeviceId("controller-device".to_string())),
+                target_device_id: None,
+                local_listen_addr: None,
+                local_server_name: None,
+                local_cert_der_b64: None,
+                remote_listen_addr: None,
+                remote_server_name: None,
+                remote_cert_der_b64: None,
+                lifecycle_state: "listening".to_string(),
+                last_error: None,
+                sender_active: true,
+                receiver_active: false,
+            },
+        );
+
+        let negotiation = accept_lan_media_profile_update(
+            &app_state,
+            &session_id,
+            MediaProfile {
+                width: 1280,
+                height: 720,
+                fps: 60,
+                bitrate_mbps: 8,
+                codec: "h264".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(negotiation.status, "accepted");
+        assert_eq!(negotiation.selected.width, 1280);
+        assert_eq!(
+            app_state
+                .media_profiles
+                .lock()
+                .await
+                .get(&session_id)
+                .expect("profile update result")
+                .selected
+                .height,
+            720
+        );
     }
 }

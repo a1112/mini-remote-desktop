@@ -25,6 +25,8 @@ import type {
   SessionInfo,
   SessionRuntimeSnapshot,
   RuntimeSnapshot,
+  MediaProfile,
+  MediaProfileNegotiation,
   ProbeSnapshot,
   HarnessMetrics,
   FrameData,
@@ -380,12 +382,27 @@ export async function ipcStartSession(
 export async function ipcStartLanRemoteSession(
   sessionId: string,
   targetDeviceId: string,
-  transportKind: string
+  transportKind: string,
+  requestedProfile?: MediaProfile
 ): Promise<AdapterResult<string>> {
   return invokeAdapter<string>('ipc_start_lan_remote_session', {
     sessionId,
     targetDeviceId,
     transportKind,
+    ...(requestedProfile ? { requestedProfile } : {}),
+  });
+}
+
+/**
+ * Request a runtime media profile switch for an active LAN session.
+ */
+export async function ipcUpdateMediaProfile(
+  sessionId: string,
+  requestedProfile: MediaProfile
+): Promise<AdapterResult<MediaProfileNegotiation>> {
+  return invokeAdapter<MediaProfileNegotiation>('ipc_update_media_profile', {
+    sessionId,
+    requestedProfile,
   });
 }
 

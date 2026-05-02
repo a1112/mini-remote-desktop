@@ -131,7 +131,12 @@ function installSuccessfulLanAutomationMock() {
             ip: "192.168.1.24",
             discovery_port: 37777,
             p2p_control_addr: "192.168.1.24:37778",
-            transports: ["quic", "quic_datagram", "quic_datagram_2k144"],
+            transports: [
+              "quic",
+              "quic_datagram",
+              "quic_datagram_2k144",
+              "media_profile_control_v1",
+            ],
             protocol_version: 1,
             age_ms: 25,
             p2p_available: true,

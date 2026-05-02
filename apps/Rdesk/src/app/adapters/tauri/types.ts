@@ -474,6 +474,21 @@ export interface RuntimeSnapshot {
   is_registered: boolean;
 }
 
+export interface MediaProfile {
+  width: number;
+  height: number;
+  fps: number;
+  bitrate_mbps: number;
+  codec: string;
+}
+
+export interface MediaProfileNegotiation {
+  requested: MediaProfile;
+  selected: MediaProfile;
+  status: "accepted" | "downgraded" | "rejected" | string;
+  reason?: string | null;
+}
+
 export interface ProbeSnapshot {
   session_id: string;
   frames_received: number;

@@ -44,6 +44,8 @@ import {
   getProbeSnapshot,
   getSessionSnapshot,
   startReceiver,
+  updateMediaProfile,
+  type MediaProfileNegotiation,
   type ProbeSnapshot,
   type SessionRuntimeSnapshot,
 } from "../services/ipcSessionService";
@@ -265,6 +267,8 @@ export function RemoteDisplayWindowPage() {
   const [sessionSnapshot, setSessionSnapshot] =
     useState<SessionRuntimeSnapshot | null>(null);
   const [probeSnapshot, setProbeSnapshot] = useState<ProbeSnapshot | null>(null);
+  const [mediaProfileNegotiation, setMediaProfileNegotiation] =
+    useState<MediaProfileNegotiation | null>(null);
 
   const sessionId = id ?? context?.session_id ?? "local-preview";
   const activeSurfaceId = context?.surface_id ?? surfaceId;
@@ -397,6 +401,16 @@ export function RemoteDisplayWindowPage() {
     () => buildTestConfig(nativeSurface?.hwnd),
     [buildTestConfig, nativeSurface?.hwnd]
   );
+  const buildRemoteMediaProfile = useCallback(() => {
+    const [width, height] = resolution.split("x").map(Number) as [number, number];
+    return {
+      width,
+      height,
+      fps: Number(fps),
+      bitrate_mbps: Number(bitrate),
+      codec: isHevcEncoder(encoder) ? "hevc" : "h264",
+    };
+  }, [bitrate, encoder, fps, resolution]);
   const isTestBusy =
     testStatus === "starting" || testStatus === "running" || testStatus === "stopping";
 
@@ -519,10 +533,9 @@ export function RemoteDisplayWindowPage() {
   }, [isNative, nativeRenderAvailable, nativeRendererType, testSettingsOpen]);
 
   const openTestSettings = useCallback(() => {
-    if (!isLocalPipelinePreview) return;
     setTestSettingsOpen(true);
     void syncNativeSurface({ visible: false });
-  }, [isLocalPipelinePreview, syncNativeSurface]);
+  }, [syncNativeSurface]);
 
   const closeTestSettings = useCallback(() => {
     setTestSettingsOpen(false);
@@ -965,6 +978,33 @@ export function RemoteDisplayWindowPage() {
     }
   }, [sessionId]);
 
+  const handleApplyRemoteMediaProfile = useCallback(async () => {
+    if (isLocalPipelinePreview) return;
+    if (transport !== "quic") {
+      const message = "远端媒体参数切换当前仅支持 LAN QUIC 会话";
+      setLastError(message);
+      setTestMessage(message);
+      return;
+    }
+
+    setLastError(null);
+    setTestMessage("正在协商远端媒体参数");
+    try {
+      const negotiation = await updateMediaProfile(sessionId, buildRemoteMediaProfile());
+      setMediaProfileNegotiation(negotiation);
+      const selected = negotiation.selected;
+      setTestMessage(
+        `远端已切换 ${selected.width}x${selected.height}@${selected.fps} / ${selected.bitrate_mbps} Mbps (${negotiation.status})`
+      );
+      const probe = await getProbeSnapshot(sessionId);
+      setProbeSnapshot(probe);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setLastError(message);
+      setTestMessage(message);
+    }
+  }, [buildRemoteMediaProfile, isLocalPipelinePreview, sessionId, transport]);
+
   const handleStartTest = async () => {
     if (!isLocalPipelinePreview) {
       await handleStartRemoteReceiver();
@@ -1268,9 +1308,13 @@ export function RemoteDisplayWindowPage() {
 
             <div className="flex items-center justify-between border-t border-white/10 px-4 py-3">
               <div className="text-[11px] text-slate-500">
-                {metrics
-                  ? `${metrics.capture_fps.toFixed(1)} FPS / ${metrics.frame_count} frames`
-                  : "等待开始测试"}
+                {isLocalPipelinePreview
+                  ? metrics
+                    ? `${metrics.capture_fps.toFixed(1)} FPS / ${metrics.frame_count} frames`
+                    : "等待开始测试"
+                  : mediaProfileNegotiation
+                    ? `远端 ${mediaProfileNegotiation.selected.width}x${mediaProfileNegotiation.selected.height}@${mediaProfileNegotiation.selected.fps} / ${mediaProfileNegotiation.selected.bitrate_mbps} Mbps`
+                    : "远程参数将通过协商层下发"}
               </div>
               <div className="flex items-center gap-2">
                 <button
@@ -1279,6 +1323,14 @@ export function RemoteDisplayWindowPage() {
                 >
                   Low latency
                 </button>
+                {!isLocalPipelinePreview && (
+                  <button
+                    className="rounded-md border border-emerald-400/30 px-3 py-1.5 text-[11px] font-medium text-emerald-100 hover:bg-emerald-500/15"
+                    onClick={() => void handleApplyRemoteMediaProfile()}
+                  >
+                    应用远端
+                  </button>
+                )}
                 <button
                   className="rounded-md px-3 py-1.5 text-[11px] text-slate-300 hover:bg-white/10"
                   onClick={closeTestSettings}
@@ -1415,15 +1467,13 @@ export function RemoteDisplayWindowPage() {
         </div>
         <div className="flex shrink-0 items-center gap-2">
           {testMessage && <span className="hidden max-w-[220px] truncate md:inline">{testMessage}</span>}
-          {isLocalPipelinePreview && (
-            <button
-              className="inline-flex h-7 items-center gap-1.5 rounded-md border border-white/10 px-2 text-slate-300 hover:bg-white/10"
-              onClick={openTestSettings}
-            >
-              <SlidersHorizontal className="h-3.5 w-3.5" />
-              配置
-            </button>
-          )}
+          <button
+            className="inline-flex h-7 items-center gap-1.5 rounded-md border border-white/10 px-2 text-slate-300 hover:bg-white/10"
+            onClick={openTestSettings}
+          >
+            <SlidersHorizontal className="h-3.5 w-3.5" />
+            配置
+          </button>
           <button
             className={`inline-flex h-7 items-center gap-1.5 rounded-md px-2 font-medium ${
               isLocalPipelinePreview && isTestBusy

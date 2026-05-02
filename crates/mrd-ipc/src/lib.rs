@@ -78,6 +78,25 @@ pub struct ShellStatusSnapshot {
     pub last_error: Option<String>,
 }
 
+/// Requested or selected media stream profile.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MediaProfile {
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub bitrate_mbps: u32,
+    pub codec: String,
+}
+
+/// Result of media profile negotiation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MediaProfileNegotiation {
+    pub requested: MediaProfile,
+    pub selected: MediaProfile,
+    pub status: String,
+    pub reason: Option<String>,
+}
+
 // === Core IPC Types ===
 
 /// IPC request from Rdesk to mrd-service
@@ -108,6 +127,13 @@ pub enum IpcRequest {
         session_id: SessionId,
         target_device_id: DeviceId,
         transport_kind: String, // "quic" or "webrtc"
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        requested_profile: Option<MediaProfile>,
+    },
+    /// Request a runtime media profile switch for an existing session.
+    UpdateMediaProfile {
+        session_id: SessionId,
+        requested_profile: MediaProfile,
     },
     /// Accept an incoming session as agent
     AcceptSession {
@@ -189,6 +215,11 @@ pub enum IpcResponse {
     SessionFailed { session_id: SessionId },
     /// Session recovered
     SessionRecovered { session_id: SessionId },
+    /// Media profile switch completed.
+    MediaProfileUpdated {
+        session_id: SessionId,
+        negotiation: MediaProfileNegotiation,
+    },
     /// Session runtime snapshot
     SessionSnapshot { snapshot: SessionRuntimeSnapshot },
     /// Aggregated runtime snapshot

@@ -4,7 +4,7 @@
 
 use crate::app_state::AppState;
 use mrd_application::ports::SessionSnapshot;
-use mrd_ipc::IpcResponse;
+use mrd_ipc::{IpcResponse, MediaProfile};
 use mrd_proto::{DeviceId, SessionId};
 use std::sync::Arc;
 
@@ -52,6 +52,7 @@ pub async fn start_lan_remote_session(
     session_id: SessionId,
     target_device_id: DeviceId,
     transport_kind: String,
+    requested_profile: Option<MediaProfile>,
 ) -> IpcResponse {
     tracing::info!(
         "Starting LAN remote session: {} -> {} via {}",
@@ -88,10 +89,11 @@ pub async fn start_lan_remote_session(
         &target_device_id,
         &session_id,
         &transport_kind,
+        requested_profile,
     )
     .await
     {
-        Ok(()) => {
+        Ok(_negotiation) => {
             let mut sessions = app_state.sessions.lock().await;
             if let Some(snapshot) = sessions.get(&session_id).cloned() {
                 sessions.insert(
@@ -123,6 +125,40 @@ pub async fn start_lan_remote_session(
                 message,
             }
         }
+    }
+}
+
+/// Handle a runtime media profile switch request.
+pub async fn update_media_profile(
+    app_state: &Arc<AppState>,
+    session_id: SessionId,
+    requested_profile: MediaProfile,
+) -> IpcResponse {
+    tracing::info!(
+        "Updating media profile: {} -> {}x{}@{} {}Mbps {}",
+        session_id.0,
+        requested_profile.width,
+        requested_profile.height,
+        requested_profile.fps,
+        requested_profile.bitrate_mbps,
+        requested_profile.codec
+    );
+
+    match crate::lan_discovery::request_lan_media_profile_update(
+        app_state,
+        &session_id,
+        requested_profile,
+    )
+    .await
+    {
+        Ok(negotiation) => IpcResponse::MediaProfileUpdated {
+            session_id,
+            negotiation,
+        },
+        Err(error) => IpcResponse::Error {
+            code: "E_MEDIA_PROFILE".to_string(),
+            message: error.to_string(),
+        },
     }
 }
 
@@ -190,6 +226,7 @@ pub async fn stop_session(app_state: &Arc<AppState>, session_id: SessionId) -> I
                 ..snapshot
             },
         );
+        app_state.media_profiles.lock().await.remove(&session_id);
         return IpcResponse::SessionStopped { session_id };
     }
 
@@ -381,6 +418,7 @@ mod tests {
             session_id.clone(),
             DeviceId("missing-peer".to_string()),
             "webrtc".to_string(),
+            None,
         )
         .await;
 

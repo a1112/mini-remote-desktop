@@ -685,9 +685,8 @@ fn automation_write_report(report: serde_json::Value) -> Result<Option<String>, 
     let path = std::path::PathBuf::from(path);
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).map_err(|error| {
-                format!("create automation report directory failed: {error}")
-            })?;
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("create automation report directory failed: {error}"))?;
         }
     }
 
@@ -1035,6 +1034,7 @@ async fn ipc_start_lan_remote_session(
     session_id: String,
     target_device_id: String,
     transport_kind: String,
+    requested_profile: Option<mrd_ipc::MediaProfile>,
 ) -> Result<String, String> {
     use mrd_ipc::{IpcRequest, IpcResponse};
     use mrd_proto::{DeviceId, SessionId};
@@ -1045,12 +1045,38 @@ async fn ipc_start_lan_remote_session(
             session_id: SessionId(session_id),
             target_device_id: DeviceId(target_device_id),
             transport_kind,
+            requested_profile,
         })
         .await
         .map_err(|e| e.to_string())?;
 
     match response {
         IpcResponse::SessionStarted { session_id } => Ok(session_id.0),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+/// Request runtime media profile switch via IPC.
+#[tauri::command]
+async fn ipc_update_media_profile(
+    session_id: String,
+    requested_profile: mrd_ipc::MediaProfile,
+) -> Result<mrd_ipc::MediaProfileNegotiation, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+    use mrd_proto::SessionId;
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::UpdateMediaProfile {
+            session_id: SessionId(session_id),
+            requested_profile,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::MediaProfileUpdated { negotiation, .. } => Ok(negotiation),
         IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
         _ => Err("Unexpected response".to_string()),
     }
@@ -1910,11 +1936,7 @@ fn build_lan_e2e_autorun_route(config: LanE2eAutorunLaunchConfig) -> String {
     push_query_param(&mut params, "targetDeviceId", config.target_device_id);
     push_query_param(&mut params, "transport", config.transport);
     push_query_param(&mut params, "timeoutMs", config.timeout_ms);
-    push_query_param(
-        &mut params,
-        "minDecodedFrames",
-        config.min_decoded_frames,
-    );
+    push_query_param(&mut params, "minDecodedFrames", config.min_decoded_frames);
     push_query_param(&mut params, "minFps", config.min_fps);
     push_query_param(&mut params, "stopOnComplete", config.stop_on_complete);
 
@@ -2206,6 +2228,7 @@ fn main() {
             ipc_list_sessions,
             ipc_start_session,
             ipc_start_lan_remote_session,
+            ipc_update_media_profile,
             ipc_accept_session,
             ipc_stop_session,
             ipc_fail_session,

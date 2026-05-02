@@ -322,6 +322,56 @@ describe('Tauri Adapter Contract', () => {
       });
     });
 
+    it('ipc_start_lan_remote_session passes requested media profile', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue('session-123');
+      const requestedProfile = {
+        width: 2560,
+        height: 1440,
+        fps: 144,
+        bitrate_mbps: 64,
+        codec: 'h264',
+      };
+
+      await adapter.ipcStartLanRemoteSession(
+        'session-123',
+        'device-456',
+        'quic',
+        requestedProfile
+      );
+
+      expect(mockInvoke).toHaveBeenCalledWith('ipc_start_lan_remote_session', {
+        sessionId: 'session-123',
+        targetDeviceId: 'device-456',
+        transportKind: 'quic',
+        requestedProfile,
+      });
+    });
+
+    it('ipc_update_media_profile calls correct command with args', async () => {
+      const mockInvoke = getMockInvoke();
+      const requestedProfile = {
+        width: 1920,
+        height: 1080,
+        fps: 60,
+        bitrate_mbps: 20,
+        codec: 'h264',
+      };
+      mockInvoke.mockResolvedValue({
+        requested: requestedProfile,
+        selected: requestedProfile,
+        status: 'accepted',
+        reason: null,
+      });
+
+      await adapter.ipcUpdateMediaProfile('session-123', requestedProfile);
+
+      expect(mockInvoke).toHaveBeenCalledWith('ipc_update_media_profile', {
+        sessionId: 'session-123',
+        requestedProfile,
+      });
+    });
+
     it('ipc_accept_session calls correct command with args', async () => {
       const mockInvoke = getMockInvoke();
       mockInvoke.mockResolvedValue('session-123');

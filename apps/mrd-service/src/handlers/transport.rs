@@ -58,9 +58,7 @@ pub async fn start_receiver(app_state: &Arc<AppState>, session_id: SessionId) ->
 /// Handle probe snapshot request
 pub async fn probe_snapshot(app_state: &Arc<AppState>, session_id: SessionId) -> IpcResponse {
     let snapshot = app_state.probes.lock().await.snapshot(&session_id);
-    IpcResponse::ProbeSnapshot {
-        snapshot,
-    }
+    IpcResponse::ProbeSnapshot { snapshot }
 }
 
 #[cfg(test)]

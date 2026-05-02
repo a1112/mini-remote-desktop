@@ -12,6 +12,14 @@ function err(message: string) {
   return { ok: false as const, error: { message } };
 }
 
+const DEFAULT_REQUESTED_PROFILE = {
+  width: 2560,
+  height: 1440,
+  fps: 144,
+  bitrate_mbps: 64,
+  codec: "h264",
+};
+
 function createCommands(
   overrides: Partial<LanE2EAutomationCommands> = {}
 ): LanE2EAutomationCommands {
@@ -56,7 +64,7 @@ function createCommands(
             ip: "192.168.1.24",
             discovery_port: 37777,
             p2p_control_addr: "192.168.1.24:37778",
-            transports: ["quic", "quic_datagram", "quic_datagram_2k144"],
+            transports: ["quic", "quic_datagram", "quic_datagram_2k144", "media_profile_control_v1"],
             protocol_version: 1,
             age_ms: 20,
             p2p_available: true,
@@ -138,8 +146,10 @@ describe("runLanE2EAutomation", () => {
     expect(commands.ipcStartLanRemoteSession).toHaveBeenCalledWith(
       "lan-e2e-test-session",
       "agent-device",
-      "quic"
+      "quic",
+      DEFAULT_REQUESTED_PROFILE
     );
+    expect(result.requestedProfile).toEqual(DEFAULT_REQUESTED_PROFILE);
     expect(commands.ipcStartReceiver).toHaveBeenCalledWith("lan-e2e-test-session");
     expect(commands.openRemoteDisplayWindow).toHaveBeenCalledWith({
       sessionId: "lan-e2e-test-session",
@@ -178,7 +188,7 @@ describe("runLanE2EAutomation", () => {
               ip: "192.168.1.24",
               discovery_port: 37777,
               p2p_control_addr: "192.168.1.24:37778",
-              transports: ["quic", "quic_datagram", "quic_datagram_2k144"],
+              transports: ["quic", "quic_datagram", "quic_datagram_2k144", "media_profile_control_v1"],
               protocol_version: 1,
               age_ms: 10,
               p2p_available: true,
@@ -204,7 +214,8 @@ describe("runLanE2EAutomation", () => {
     expect(commands.ipcStartLanRemoteSession).toHaveBeenCalledWith(
       "lan-e2e-test-session",
       "agent-device",
-      "quic"
+      "quic",
+      DEFAULT_REQUESTED_PROFILE
     );
   });
 
@@ -338,7 +349,8 @@ describe("runLanE2EAutomation", () => {
     expect(commands.ipcStartLanRemoteSession).toHaveBeenCalledWith(
       "lan-e2e-test-session",
       "agent-device",
-      "quic"
+      "quic",
+      DEFAULT_REQUESTED_PROFILE
     );
   });
 
