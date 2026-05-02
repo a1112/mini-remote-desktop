@@ -1,4 +1,4 @@
-use crate::app_state::AppState;
+use crate::app_state::{AppState, MediaProbeFrameStats};
 use anyhow::{Context, Result};
 use mrd_application::ports::SessionSnapshot;
 use mrd_ipc::{LanDiscoverySnapshot, LanPeerInfo};
@@ -29,6 +29,12 @@ const LAN_MEDIA_MAX_FRAMES: u64 = 3_600;
 const LAN_MEDIA_PAYLOAD_BYTES: usize = 4_096;
 const LAN_QUIC_FALLBACK_DATAGRAM_BYTES: usize = 1_200;
 const LAN_QUIC_MEDIA_TRANSPORT: &str = "quic_datagram";
+const LAN_MEDIA_PROBE_MAGIC: &[u8; 8] = b"MRDMPF01";
+const LAN_MEDIA_PROBE_HEADER_BYTES: usize = 48;
+const LAN_MEDIA_PROBE_FORMAT: &str = "rgba8_test_pattern";
+const LAN_MEDIA_PROBE_FORMAT_CODE: u32 = 1;
+const LAN_MEDIA_PROBE_WIDTH: u32 = 32;
+const LAN_MEDIA_PROBE_HEIGHT: u32 = 32;
 
 #[derive(Debug, Clone)]
 pub struct LanDiscoveryConfig {
@@ -766,8 +772,7 @@ async fn send_quic_media_loop(
 
     for frame_id in 1..=LAN_MEDIA_MAX_FRAMES {
         ticker.tick().await;
-        let mut payload = vec![0_u8; LAN_MEDIA_PAYLOAD_BYTES];
-        payload[..8].copy_from_slice(&frame_id.to_le_bytes());
+        let payload = build_media_probe_frame(frame_id, now_ms().saturating_mul(1_000));
         let fragments = fragment_access_unit(
             frame_id as u32,
             now_ms().saturating_mul(1_000),
@@ -812,13 +817,111 @@ async fn receive_quic_media_loop(
             .push_datagram(&datagram)
             .context("failed to reassemble LAN QUIC media frame")?
         {
-            app_state.probes.lock().await.record_probe_frame(
-                &session_id,
-                frame.payload.len() as u64,
-                now_ms(),
-            );
+            match decode_media_probe_frame(&frame.payload) {
+                Ok(stats) => {
+                    app_state
+                        .probes
+                        .lock()
+                        .await
+                        .record_media_probe_frame(&session_id, stats, now_ms());
+                }
+                Err(error) => {
+                    app_state.probes.lock().await.record_probe_drop(
+                        &session_id,
+                        frame.payload.len() as u64,
+                        now_ms(),
+                        error.to_string(),
+                    );
+                }
+            }
         }
     }
+}
+
+fn build_media_probe_frame(sequence: u64, timestamp_us: u64) -> Vec<u8> {
+    let media_payload = build_probe_rgba_pattern(sequence);
+    let payload_hash = fnv1a64(&media_payload);
+    let mut frame = Vec::with_capacity(LAN_MEDIA_PROBE_HEADER_BYTES + media_payload.len());
+    frame.extend_from_slice(LAN_MEDIA_PROBE_MAGIC);
+    frame.extend_from_slice(&sequence.to_le_bytes());
+    frame.extend_from_slice(&timestamp_us.to_le_bytes());
+    frame.extend_from_slice(&LAN_MEDIA_PROBE_WIDTH.to_le_bytes());
+    frame.extend_from_slice(&LAN_MEDIA_PROBE_HEIGHT.to_le_bytes());
+    frame.extend_from_slice(&LAN_MEDIA_PROBE_FORMAT_CODE.to_le_bytes());
+    frame.extend_from_slice(&(media_payload.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&payload_hash.to_le_bytes());
+    frame.extend_from_slice(&media_payload);
+    frame
+}
+
+fn decode_media_probe_frame(frame: &[u8]) -> Result<MediaProbeFrameStats> {
+    if frame.len() < LAN_MEDIA_PROBE_HEADER_BYTES {
+        anyhow::bail!("media probe frame is too small");
+    }
+    if &frame[..LAN_MEDIA_PROBE_MAGIC.len()] != LAN_MEDIA_PROBE_MAGIC {
+        anyhow::bail!("media probe frame has invalid magic");
+    }
+
+    let sequence = u64::from_le_bytes(frame[8..16].try_into().unwrap());
+    let timestamp_us = u64::from_le_bytes(frame[16..24].try_into().unwrap());
+    let width = u32::from_le_bytes(frame[24..28].try_into().unwrap());
+    let height = u32::from_le_bytes(frame[28..32].try_into().unwrap());
+    let format_code = u32::from_le_bytes(frame[32..36].try_into().unwrap());
+    let payload_len = u32::from_le_bytes(frame[36..40].try_into().unwrap()) as usize;
+    let expected_hash = u64::from_le_bytes(frame[40..48].try_into().unwrap());
+
+    let Some(expected_len) = LAN_MEDIA_PROBE_HEADER_BYTES.checked_add(payload_len) else {
+        anyhow::bail!("media probe frame payload length overflow");
+    };
+    if frame.len() != expected_len {
+        anyhow::bail!(
+            "media probe frame payload length mismatch: expected {}, got {}",
+            expected_len,
+            frame.len()
+        );
+    }
+    if format_code != LAN_MEDIA_PROBE_FORMAT_CODE {
+        anyhow::bail!("unsupported media probe format code: {format_code}");
+    }
+
+    let media_payload = &frame[LAN_MEDIA_PROBE_HEADER_BYTES..];
+    let actual_hash = fnv1a64(media_payload);
+    if actual_hash != expected_hash {
+        anyhow::bail!("media probe payload hash mismatch");
+    }
+
+    Ok(MediaProbeFrameStats {
+        bytes_received: frame.len() as u64,
+        sequence,
+        timestamp_us,
+        width,
+        height,
+        format: LAN_MEDIA_PROBE_FORMAT.to_string(),
+        payload_hash: format!("fnv1a64:{actual_hash:016x}"),
+    })
+}
+
+fn build_probe_rgba_pattern(sequence: u64) -> Vec<u8> {
+    let mut payload = vec![0_u8; LAN_MEDIA_PAYLOAD_BYTES];
+    for y in 0..LAN_MEDIA_PROBE_HEIGHT {
+        for x in 0..LAN_MEDIA_PROBE_WIDTH {
+            let offset = ((y * LAN_MEDIA_PROBE_WIDTH + x) * 4) as usize;
+            payload[offset] = x.wrapping_add(sequence as u32) as u8;
+            payload[offset + 1] = y.wrapping_mul(3).wrapping_add(sequence as u32) as u8;
+            payload[offset + 2] = x.wrapping_add(y).wrapping_add(sequence as u32) as u8;
+            payload[offset + 3] = 255;
+        }
+    }
+    payload
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 fn normalize_transport_kind(value: &str) -> String {
@@ -1100,6 +1203,19 @@ mod tests {
 
         assert!(snapshot.frames_received > 0);
         assert!(snapshot.frames_decoded > 0);
+        assert!(snapshot.media_probe_valid);
+        assert_eq!(
+            snapshot.media_probe_format.as_deref(),
+            Some(LAN_MEDIA_PROBE_FORMAT)
+        );
+        assert_eq!(snapshot.media_probe_width, Some(LAN_MEDIA_PROBE_WIDTH));
+        assert_eq!(snapshot.media_probe_height, Some(LAN_MEDIA_PROBE_HEIGHT));
+        assert!(snapshot.last_media_sequence.unwrap_or_default() > 0);
+        assert!(snapshot
+            .last_media_payload_hash
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("fnv1a64:"));
     }
 
     #[tokio::test]

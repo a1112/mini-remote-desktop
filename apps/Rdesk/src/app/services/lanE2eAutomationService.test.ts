@@ -96,6 +96,13 @@ function createCommands(
         frames_dropped: 0,
         current_fps: 24,
         bitrate_mbps: 8,
+        media_probe_valid: true,
+        media_probe_format: "rgba8_test_pattern",
+        media_probe_width: 32,
+        media_probe_height: 18,
+        last_media_sequence: 3,
+        last_media_timestamp_us: 123456,
+        last_media_payload_hash: "fnv1a64:abc123",
         last_error: null,
       })
     ),
@@ -122,6 +129,9 @@ describe("runLanE2EAutomation", () => {
     expect(result.sessionId).toBe("lan-e2e-test-session");
     expect(result.peer?.device_id).toBe("agent-device");
     expect(result.probeSnapshot?.frames_decoded).toBe(3);
+    expect(result.mediaVerified).toBe(true);
+    expect(result.probeSnapshot?.media_probe_valid).toBe(true);
+    expect(result.probeSnapshot?.last_media_payload_hash).toBe("fnv1a64:abc123");
     expect(commands.ipcStartLanRemoteSession).toHaveBeenCalledWith(
       "lan-e2e-test-session",
       "agent-device",

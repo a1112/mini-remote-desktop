@@ -131,7 +131,7 @@ function installSuccessfulLanAutomationMock() {
             ip: "192.168.1.24",
             discovery_port: 37777,
             p2p_control_addr: "192.168.1.24:37778",
-            transports: ["quic"],
+            transports: ["quic", "quic_datagram"],
             protocol_version: 1,
             age_ms: 25,
             p2p_available: true,
@@ -171,6 +171,13 @@ function installSuccessfulLanAutomationMock() {
         frames_dropped: 0,
         current_fps: 6.1,
         bitrate_mbps: 0.011,
+        media_probe_valid: true,
+        media_probe_format: "rgba8_test_pattern",
+        media_probe_width: 32,
+        media_probe_height: 32,
+        last_media_sequence: 25,
+        last_media_timestamp_us: 123456,
+        last_media_payload_hash: "fnv1a64:abc123",
         last_error: null,
       });
     }

@@ -447,7 +447,10 @@ function formatProbeSummary(report: LanE2EAutomationReport | null): string {
   if (!probe) return "等待采样";
   const fps = probe.current_fps ?? 0;
   const seconds = ((report.sampleDurationMs ?? 0) / 1000).toFixed(1);
-  return `${formatValidationMode(report.validationMode)} decoded ${probe.frames_decoded}, received ${probe.frames_received}, fps ${fps}, ${seconds}s`;
+  const mediaProbe = probe.media_probe_valid
+    ? `, media ${probe.media_probe_format ?? "unknown"} #${probe.last_media_sequence ?? "-"} ${probe.last_media_payload_hash ?? ""}`
+    : "";
+  return `${formatValidationMode(report.validationMode)} decoded ${probe.frames_decoded}, received ${probe.frames_received}, fps ${fps}, ${seconds}s${mediaProbe}`;
 }
 
 function formatValidationMode(mode: LanE2EAutomationReport["validationMode"]): string {

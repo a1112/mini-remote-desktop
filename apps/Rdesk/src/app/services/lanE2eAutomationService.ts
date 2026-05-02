@@ -161,7 +161,9 @@ export async function runLanE2EAutomation(
     probeSnapshot,
     validationMode,
     dataPlaneVerified: status === "completed",
-    mediaVerified: validationMode === "webrtc_rtp" && status === "completed",
+    mediaVerified:
+      status === "completed" &&
+      (validationMode === "webrtc_rtp" || probeSnapshot?.media_probe_valid === true),
     sampleDurationMs,
     thresholds: {
       minSampleDurationMs,
@@ -243,6 +245,7 @@ export async function runLanE2EAutomation(
       if (
         sessionSnapshot.receiver_active &&
         probeSnapshot.frames_decoded >= minDecodedFrames &&
+        (validationMode !== "quic_datagram" || probeSnapshot.media_probe_valid === true) &&
         (probeSnapshot.current_fps ?? 0) >= minFps &&
         sampleDurationMs >= minSampleDurationMs
       ) {

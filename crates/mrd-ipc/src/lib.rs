@@ -322,6 +322,13 @@ pub struct ProbeSnapshot {
     pub frames_dropped: u64,
     pub current_fps: Option<f32>,
     pub bitrate_mbps: Option<f32>,
+    pub media_probe_valid: bool,
+    pub media_probe_format: Option<String>,
+    pub media_probe_width: Option<u32>,
+    pub media_probe_height: Option<u32>,
+    pub last_media_sequence: Option<u64>,
+    pub last_media_timestamp_us: Option<u64>,
+    pub last_media_payload_hash: Option<String>,
     pub last_error: Option<String>,
 }
 

@@ -481,6 +481,13 @@ export interface ProbeSnapshot {
   frames_dropped: number;
   current_fps?: number | null;
   bitrate_mbps?: number | null;
+  media_probe_valid?: boolean;
+  media_probe_format?: string | null;
+  media_probe_width?: number | null;
+  media_probe_height?: number | null;
+  last_media_sequence?: number | null;
+  last_media_timestamp_us?: number | null;
+  last_media_payload_hash?: string | null;
   last_error?: string | null;
 }
 
