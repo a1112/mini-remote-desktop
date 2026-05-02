@@ -34,7 +34,7 @@ describe("E2ETestPage LAN automation", () => {
     );
     expect(await screen.findByText(/LAN E2E 完成/)).toBeInTheDocument();
     expect(screen.getAllByText(/Agent PC/).length).toBeGreaterThan(0);
-    expect(screen.getByText(/decoded 4/)).toBeInTheDocument();
+    expect(screen.getByText(/QUIC datagram decoded 25/)).toBeInTheDocument();
   });
 
   it("autoruns LAN remote display automation from URL query parameters", async () => {
@@ -60,7 +60,7 @@ describe("E2ETestPage LAN automation", () => {
       );
     });
     expect(await screen.findByText(/LAN E2E 完成/)).toBeInTheDocument();
-    expect(screen.getByText(/decoded 4/)).toBeInTheDocument();
+    expect(screen.getByText(/QUIC datagram decoded 25/)).toBeInTheDocument();
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith(
         "automation_write_report",
@@ -166,11 +166,11 @@ function installSuccessfulLanAutomationMock() {
     if (command === "ipc_probe_snapshot") {
       return Promise.resolve({
         session_id: "lan-e2e-agent-device-1000",
-        frames_received: 5,
-        frames_decoded: 4,
+        frames_received: 25,
+        frames_decoded: 25,
         frames_dropped: 0,
-        current_fps: 20,
-        bitrate_mbps: 8,
+        current_fps: 6.1,
+        bitrate_mbps: 0.011,
         last_error: null,
       });
     }

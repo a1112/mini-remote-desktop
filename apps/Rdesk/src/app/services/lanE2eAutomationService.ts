@@ -34,6 +34,7 @@ export interface LanE2EAutomationOptions {
   transportKind?: "quic" | "webrtc";
   timeoutMs?: number;
   sampleIntervalMs?: number;
+  minSampleDurationMs?: number;
   minDecodedFrames?: number;
   minFps?: number;
   stopOnComplete?: boolean;
@@ -50,6 +51,15 @@ export interface LanE2EAutomationReport {
   displayWindow?: RemoteDisplayWindowContext;
   sessionSnapshot?: SessionRuntimeSnapshot;
   probeSnapshot?: ProbeSnapshot;
+  validationMode: "quic_datagram" | "webrtc_rtp";
+  dataPlaneVerified: boolean;
+  mediaVerified: boolean;
+  sampleDurationMs: number;
+  thresholds: {
+    minSampleDurationMs: number;
+    minDecodedFrames: number;
+    minFps: number;
+  };
   failureReason?: LanE2EFailureReason;
   errorMessage?: string;
   startedAt: number;
@@ -101,6 +111,7 @@ const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_SAMPLE_INTERVAL_MS = 500;
 const DEFAULT_MIN_DECODED_FRAMES = 1;
 const DEFAULT_MIN_FPS = 1;
+const DEFAULT_MIN_SAMPLE_DURATION_MS = 0;
 
 export async function runLanE2EAutomation(
   commands: LanE2EAutomationCommands,
@@ -111,10 +122,12 @@ export async function runLanE2EAutomation(
   const stages: LanE2EStageEvent[] = [];
   const sampleIntervalMs = options.sampleIntervalMs ?? DEFAULT_SAMPLE_INTERVAL_MS;
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const minSampleDurationMs = options.minSampleDurationMs ?? DEFAULT_MIN_SAMPLE_DURATION_MS;
   const minDecodedFrames = options.minDecodedFrames ?? DEFAULT_MIN_DECODED_FRAMES;
   const minFps = options.minFps ?? DEFAULT_MIN_FPS;
   const stopOnComplete = options.stopOnComplete ?? true;
   const transportKind = options.transportKind ?? "quic";
+  const validationMode = transportKind === "webrtc" ? "webrtc_rtp" : "quic_datagram";
   let sessionId: string | undefined;
   let peer: LanPeerInfo | undefined;
   let displayWindow: RemoteDisplayWindowContext | undefined;
@@ -122,6 +135,7 @@ export async function runLanE2EAutomation(
   let probeSnapshot: ProbeSnapshot | undefined;
   let controllerDeviceId: string | null | undefined;
   let sessionStarted = false;
+  let sampleDurationMs = 0;
 
   const stage = (
     event: LanE2EStageEvent["stage"],
@@ -144,6 +158,15 @@ export async function runLanE2EAutomation(
     displayWindow,
     sessionSnapshot,
     probeSnapshot,
+    validationMode,
+    dataPlaneVerified: status === "completed",
+    mediaVerified: validationMode === "webrtc_rtp" && status === "completed",
+    sampleDurationMs,
+    thresholds: {
+      minSampleDurationMs,
+      minDecodedFrames,
+      minFps,
+    },
     failureReason,
     errorMessage,
     startedAt,
@@ -193,12 +216,14 @@ export async function runLanE2EAutomation(
 
     stage("sample", "started");
     const deadline = Date.now() + timeoutMs;
+    const sampleStartedAt = Date.now();
     while (Date.now() <= deadline) {
       sessionSnapshot = await unwrap(
         commands.ipcSessionSnapshot(sessionId),
         "runtime_error"
       );
       probeSnapshot = await unwrap(commands.ipcProbeSnapshot(sessionId), "runtime_error");
+      sampleDurationMs = Date.now() - sampleStartedAt;
 
       if (sessionSnapshot.state === "failed" || sessionSnapshot.last_error) {
         const message = sessionSnapshot.last_error ?? "LAN session entered failed state";
@@ -212,7 +237,8 @@ export async function runLanE2EAutomation(
       if (
         sessionSnapshot.receiver_active &&
         probeSnapshot.frames_decoded >= minDecodedFrames &&
-        (probeSnapshot.current_fps ?? 0) >= minFps
+        (probeSnapshot.current_fps ?? 0) >= minFps &&
+        sampleDurationMs >= minSampleDurationMs
       ) {
         stage("sample", "completed");
         stage("assert", "completed");
@@ -222,7 +248,7 @@ export async function runLanE2EAutomation(
       await sleep(sampleIntervalMs);
     }
 
-    const message = `No remote frames reached threshold: decoded ${probeSnapshot?.frames_decoded ?? 0}/${minDecodedFrames}, fps ${probeSnapshot?.current_fps ?? 0}/${minFps}`;
+    const message = `LAN ${formatValidationMode(validationMode)} did not reach threshold: decoded ${probeSnapshot?.frames_decoded ?? 0}/${minDecodedFrames}, fps ${probeSnapshot?.current_fps ?? 0}/${minFps}, sample ${sampleDurationMs}/${minSampleDurationMs} ms`;
     stage("assert", "failed", message);
     return finish("failed", "no_remote_frames", message);
   } catch (error) {
@@ -297,6 +323,10 @@ function buildPeerNotReadyMessage(peer: LanPeerInfo, transportKind: string): str
     return `LAN peer is discovered but not P2P available: ${peer.device_id}`;
   }
   return `LAN peer does not support ${transportKind}: ${peer.device_id} supports ${transportList}`;
+}
+
+function formatValidationMode(mode: LanE2EAutomationReport["validationMode"]): string {
+  return mode === "webrtc_rtp" ? "WebRTC RTP data plane" : "QUIC datagram data plane";
 }
 
 function createDefaultSessionId(peerDeviceId: string, now: number): string {

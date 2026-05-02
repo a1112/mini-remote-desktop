@@ -159,8 +159,8 @@ export function E2ETestPage() {
       transportKind: "quic",
       timeoutMs: 15_000,
       sampleIntervalMs: 500,
-      minDecodedFrames: 1,
-      minFps: 1,
+      minDecodedFrames: 20,
+      minFps: 2,
       ...optionOverrides,
     });
 
@@ -446,7 +446,12 @@ function formatProbeSummary(report: LanE2EAutomationReport | null): string {
   const probe = report?.probeSnapshot;
   if (!probe) return "等待采样";
   const fps = probe.current_fps ?? 0;
-  return `decoded ${probe.frames_decoded}, received ${probe.frames_received}, fps ${fps}`;
+  const seconds = ((report.sampleDurationMs ?? 0) / 1000).toFixed(1);
+  return `${formatValidationMode(report.validationMode)} decoded ${probe.frames_decoded}, received ${probe.frames_received}, fps ${fps}, ${seconds}s`;
+}
+
+function formatValidationMode(mode: LanE2EAutomationReport["validationMode"]): string {
+  return mode === "webrtc_rtp" ? "WebRTC RTP" : "QUIC datagram";
 }
 
 function buildLanAutomationOptionsFromSearchParams(
@@ -456,6 +461,7 @@ function buildLanAutomationOptionsFromSearchParams(
     targetDeviceId: searchParams.get("targetDeviceId") ?? searchParams.get("target") ?? undefined,
     transportKind: parseTransportKind(searchParams.get("transport")),
     timeoutMs: parsePositiveNumber(searchParams.get("timeoutMs")),
+    minSampleDurationMs: parsePositiveNumber(searchParams.get("minSampleDurationMs")),
     minDecodedFrames: parsePositiveNumber(searchParams.get("minDecodedFrames")),
     minFps: parsePositiveNumber(searchParams.get("minFps")),
     stopOnComplete: parseOptionalBoolean(searchParams.get("stopOnComplete")),
