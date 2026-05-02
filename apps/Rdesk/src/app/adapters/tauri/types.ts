@@ -88,7 +88,14 @@ export type TestStage =
 export interface TestConfig {
   // Component selection
   capture_type?: "dxgi" | "winrt" | "macos" | "synthetic";
-  encoder_type?: "none" | "nvenc_h264" | "nvenc_av1" | "openh264" | "videotoolbox_h264";
+  encoder_type?:
+    | "none"
+    | "nvenc_h264"
+    | "nvenc_hevc"
+    | "nvenc_hevc_main10"
+    | "nvenc_av1"
+    | "openh264"
+    | "videotoolbox_h264";
   decoder_type?: "none" | "nvdec" | "software" | "videotoolbox";
   renderer_type?: "d3d11" | "macos";
   render_display?: boolean;
@@ -531,7 +538,14 @@ export interface TestChainOption {
  * Test matrix configuration for custom pipeline setups
  */
 export type CaptureType = 'dxgi' | 'winrt' | 'macos' | 'synthetic';
-export type EncoderType = 'none' | 'nvenc_h264' | 'nvenc_av1' | 'openh264' | 'videotoolbox_h264';
+export type EncoderType =
+  | 'none'
+  | 'nvenc_h264'
+  | 'nvenc_hevc'
+  | 'nvenc_hevc_main10'
+  | 'nvenc_av1'
+  | 'openh264'
+  | 'videotoolbox_h264';
 export type DecoderType = 'none' | 'nvdec' | 'software' | 'videotoolbox';
 
 export interface TestMatrixConfig {
@@ -549,20 +563,53 @@ export interface TestMatrixConfig {
 export interface HarnessMetrics {
   is_running: boolean;
   capture_fps: number;
+  capture_latency_avg_ms: number;
   capture_latency_p50_ms: number;
   capture_latency_p95_ms: number;
+  encode_latency_avg_ms: number;
   encode_latency_p50_ms: number;
   encode_latency_p95_ms: number;
+  transport_latency_avg_ms: number;
   transport_latency_p50_ms: number;
   transport_latency_p95_ms: number;
+  decode_latency_avg_ms: number;
   decode_latency_p50_ms: number;
   decode_latency_p95_ms: number;
+  render_latency_avg_ms: number;
+  present_latency_avg_ms: number;
+  total_latency_avg_ms: number;
   total_latency_p50_ms: number;
   total_latency_p95_ms: number;
   frame_count: number;
+  encoded_units: number;
+  decoded_frames: number;
+  encode_failures: number;
+  decode_failures: number;
+  total_bitstream_bytes: number;
   dropped_frames: number;
   resolution: [number, number];
   error_message?: string;
+}
+
+export interface PipelineComparisonResult {
+  pipeline: string;
+  codec: string;
+  transport?: string | null;
+  memory_path: string;
+  frames: number;
+  encoded_units: number;
+  decoded_frames: number;
+  encode_failures: number;
+  decode_failures: number;
+  avg_capture_time_ms?: number | null;
+  avg_encode_time_ms?: number | null;
+  avg_transport_time_ms?: number | null;
+  avg_decode_time_ms?: number | null;
+  avg_render_time_ms?: number | null;
+  avg_present_time_ms?: number | null;
+  avg_total_time_ms?: number | null;
+  avg_fps?: number | null;
+  total_bitstream_bytes: number;
 }
 
 export type FrameData = [string, number, number, number?]; // [base64_data, width, height, generation]

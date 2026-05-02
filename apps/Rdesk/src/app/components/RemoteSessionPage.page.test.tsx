@@ -312,8 +312,7 @@ describe('RemoteSessionPage - Page Level Tests', () => {
         expect(screen.getByText('Test PC')).toBeInTheDocument();
       });
 
-      // Verify placeholder values are used
-      expect(screen.queryByText('renderer idle')).toBeInTheDocument();
+      expect(screen.getByText('原生显示窗口承载画面')).toBeInTheDocument();
     });
   });
 });

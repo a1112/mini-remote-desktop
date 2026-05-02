@@ -1414,14 +1414,18 @@ fn test_harness_set_custom(
         "none" => EncoderType::None,
         "nvenc_h264" => EncoderType::NvencH264,
         "nvenc_av1" => EncoderType::NvencAv1,
-        "openh264" => EncoderType::OpenH264,
+        "nvenc_hevc" | "hevc" => EncoderType::NvencHevc,
+        "nvenc_hevc_main10" | "hevc_main10" | "hevc-main10" => EncoderType::NvencHevcMain10,
+        "openh264" | "software_h264" | "h264_software" | "software-h264" | "h264-software"
+        | "sw_h264" => EncoderType::OpenH264,
         "videotoolbox_h264" | "videotoolbox" => EncoderType::VideoToolboxH264,
         _ => return Err(format!("Unsupported encoder type: {}", encoder)),
     };
     let decoder = match decoder.as_str() {
         "none" => DecoderType::None,
         "nvdec" => DecoderType::Nvdec,
-        "software" => DecoderType::Software,
+        "software" | "software_h264" | "h264_software" | "software-h264" | "h264-software"
+        | "openh264" => DecoderType::Software,
         "videotoolbox" => DecoderType::VideoToolbox,
         _ => return Err(format!("Unsupported decoder type: {}", decoder)),
     };
@@ -1453,6 +1457,17 @@ fn test_harness_get_chain(state: tauri::State<'_, AppState>) -> String {
 #[tauri::command]
 fn test_harness_get_metrics(state: tauri::State<'_, AppState>) -> test_harness::HarnessMetrics {
     state.test_harness.lock().unwrap().get_metrics()
+}
+
+#[tauri::command]
+fn test_harness_get_comparison_result(
+    state: tauri::State<'_, AppState>,
+) -> mrd_observability::PipelineComparisonResult {
+    state
+        .test_harness
+        .lock()
+        .unwrap()
+        .get_pipeline_comparison_result()
 }
 
 #[tauri::command]
@@ -2045,6 +2060,7 @@ fn main() {
             test_harness_set_custom,
             test_harness_get_chain,
             test_harness_get_metrics,
+            test_harness_get_comparison_result,
             test_harness_get_frames,
             // Test Workbench commands (new unified test API)
             test_list_scenarios,

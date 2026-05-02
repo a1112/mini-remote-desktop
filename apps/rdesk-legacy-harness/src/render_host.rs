@@ -215,9 +215,17 @@ impl RenderHost {
                     mrd_render::RenderFrameData::Rgb24(data) => data.len(),
                     mrd_render::RenderFrameData::Bgra32(data) => data.len(),
                     #[cfg(windows)]
+                    mrd_render::RenderFrameData::D3D11SharedBgra { .. } => {
+                        render_frame.width * render_frame.height * 4
+                    }
+                    #[cfg(windows)]
                     mrd_render::RenderFrameData::D3D11SharedNv12 { .. } => {
                         render_frame.width * render_frame.height * 3 / 2
                     } // NV12 size
+                    #[cfg(windows)]
+                    mrd_render::RenderFrameData::D3D11SharedP010 { .. } => {
+                        render_frame.width * render_frame.height * 3
+                    }
                 };
                 let started_at = std::time::Instant::now();
                 renderer
@@ -339,17 +347,34 @@ fn decoded_frame_to_render_frame(frame: &DecodedFrame) -> RenderFrame {
             pixel_format: RenderPixelFormat::Bgra32,
             data: RenderFrameData::Bgra32(data.clone()),
         },
-        #[cfg(windows)]
-        DecodedFrameData::D3D11SharedNv12 {
-            shared_handle: _,
-            width: _,
-            height: _,
-        } => RenderFrame {
+        DecodedFrameData::CpuNv12 { .. } | DecodedFrameData::CpuP010 { .. } => RenderFrame {
             width: frame.width,
             height: frame.height,
-            pixel_format: RenderPixelFormat::Rgb24, // Will be updated to D3D11SharedNv12
-            data: RenderFrameData::Rgb24(vec![]),   // Fallback for now
+            pixel_format: RenderPixelFormat::Rgb24,
+            data: RenderFrameData::Rgb24(vec![]),
         },
+        #[cfg(windows)]
+        DecodedFrameData::D3D11SharedNv12 {
+            shared_handle_y,
+            shared_handle_uv,
+            ..
+        } => RenderFrame::from_d3d11_shared_nv12(
+            frame.width,
+            frame.height,
+            *shared_handle_y,
+            *shared_handle_uv,
+        ),
+        #[cfg(windows)]
+        DecodedFrameData::D3D11SharedP010 {
+            shared_handle_y,
+            shared_handle_uv,
+            ..
+        } => RenderFrame::from_d3d11_shared_p010(
+            frame.width,
+            frame.height,
+            *shared_handle_y,
+            *shared_handle_uv,
+        ),
     }
 }
 
@@ -364,6 +389,10 @@ fn renderer_snapshot_response(snapshot: RendererSnapshot) -> RendererSnapshotRes
             RenderPixelFormat::Bgra32 => "Bgra32".to_string(),
             #[cfg(windows)]
             RenderPixelFormat::D3D11SharedNv12 => "D3D11SharedNv12".to_string(),
+            #[cfg(windows)]
+            RenderPixelFormat::D3D11SharedP010 => "D3D11SharedP010".to_string(),
+            #[cfg(windows)]
+            RenderPixelFormat::D3D11SharedBgra => "D3D11SharedBgra".to_string(),
         }),
     }
 }

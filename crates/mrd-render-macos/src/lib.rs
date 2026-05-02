@@ -273,7 +273,7 @@ impl RendererInstance for MacosMetalRenderer {
                 self.scratch_bgra = bgra;
             }
             #[cfg(windows)]
-            RenderFrameData::D3D11SharedNv12 { .. } => {
+            RenderFrameData::D3D11SharedNv12 { .. } | RenderFrameData::D3D11SharedP010 { .. } => {
                 return Err(RenderError::Message(
                     "Metal renderer does not accept D3D11 shared textures".to_string(),
                 ));

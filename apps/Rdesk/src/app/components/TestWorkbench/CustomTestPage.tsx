@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router";
-import { Play, Settings, Monitor, Cpu, Zap } from "lucide-react";
+import { Play, Settings, Monitor, Cpu, Zap, Network } from "lucide-react";
 import * as commands from "../../adapters/tauri/commands";
 import type { EnvironmentSnapshot, TestConfig } from "../../adapters/tauri/types";
 import { capabilityAvailable, capabilityTag, unavailableText } from "./capabilityMeta";
@@ -8,6 +8,7 @@ import { capabilityAvailable, capabilityTag, unavailableText } from "./capabilit
 type CaptureId = NonNullable<TestConfig["capture_type"]>;
 type EncoderId = NonNullable<TestConfig["encoder_type"]>;
 type DecoderId = NonNullable<TestConfig["decoder_type"]>;
+type TransportId = NonNullable<TestConfig["transport_kind"]>;
 
 interface CaptureOption {
   id: CaptureId;
@@ -25,6 +26,12 @@ interface EncoderOption {
 
 interface DecoderOption {
   id: DecoderId;
+  name: string;
+  description: string;
+}
+
+interface TransportOption {
+  id: TransportId;
   name: string;
   description: string;
 }
@@ -58,9 +65,27 @@ const CAPTURE_OPTIONS: CaptureOption[] = [
 
 const ENCODER_OPTIONS: EncoderOption[] = [
   {
+    id: "none",
+    name: "直连渲染",
+    description: "跳过编码 - 采集帧直接进入渲染器",
+    icon: <Monitor className="h-5 w-5" />,
+  },
+  {
     id: "nvenc_h264",
     name: "NVENC H.264",
     description: "NVIDIA 硬件编码器 - 低延迟高质量",
+    icon: <Zap className="h-5 w-5" />,
+  },
+  {
+    id: "nvenc_hevc",
+    name: "NVENC HEVC Main",
+    description: "NVIDIA HEVC Main - QUIC/loopback + NVDEC 全 GPU 链路",
+    icon: <Zap className="h-5 w-5" />,
+  },
+  {
+    id: "nvenc_hevc_main10",
+    name: "NVENC HEVC Main10",
+    description: "NVIDIA HEVC Main10 - 10-bit 编码能力与 NVDEC 对照",
     icon: <Zap className="h-5 w-5" />,
   },
   {
@@ -84,6 +109,11 @@ const ENCODER_OPTIONS: EncoderOption[] = [
 ];
 
 const DECODER_OPTIONS: DecoderOption[] = [
+  {
+    id: "none",
+    name: "无解码",
+    description: "encode-only 或直接渲染链路",
+  },
   {
     id: "nvdec",
     name: "NVDEC",
@@ -118,11 +148,34 @@ const BITRATE_OPTIONS = [
   { id: "20000", name: "20 Mbps", value: 20000000 },
 ];
 
+const TRANSPORT_OPTIONS: TransportOption[] = [
+  {
+    id: "loopback",
+    name: "Loopback",
+    description: "本机链路基线，测编解码和渲染开销",
+  },
+  {
+    id: "quic",
+    name: "QUIC Datagram",
+    description: "远程性能对齐链路，支持 H.264/HEVC/AV1",
+  },
+  {
+    id: "webrtc",
+    name: "WebRTC RTP",
+    description: "浏览器 RTP 路径，当前仅 H.264/AV1",
+  },
+];
+
+function isHevcEncoder(encoder: EncoderId): boolean {
+  return encoder === "nvenc_hevc" || encoder === "nvenc_hevc_main10";
+}
+
 export function CustomTestPage() {
   const navigate = useNavigate();
   const [selectedCapture, setSelectedCapture] = useState<CaptureId>("dxgi");
   const [selectedEncoder, setSelectedEncoder] = useState<EncoderId>("nvenc_h264");
   const [selectedDecoder, setSelectedDecoder] = useState<DecoderId>("nvdec");
+  const [selectedTransport, setSelectedTransport] = useState<TransportId>("quic");
   const [selectedResolution, setSelectedResolution] = useState("1920x1080");
   const [selectedFps, setSelectedFps] = useState(60);
   const [selectedBitrate, setSelectedBitrate] = useState("5000");
@@ -147,6 +200,7 @@ export function CustomTestPage() {
   const isCaptureAvailable = (capture: CaptureId) =>
     capabilityAvailable(capabilities, "available_captures", capture, capture === "synthetic");
   const isEncoderAvailable = (encoder: EncoderId) =>
+    encoder === "none" ||
     capabilityAvailable(capabilities, "available_encoders", encoder, encoder === "openh264");
   const isDecoderAvailable = (decoder: DecoderId) =>
     decoder === "none" ||
@@ -163,11 +217,17 @@ export function CustomTestPage() {
       const nextEncoder = ENCODER_OPTIONS.find((option) => isEncoderAvailable(option.id));
       if (nextEncoder) setSelectedEncoder(nextEncoder.id);
     }
+    if (selectedEncoder === "none" && selectedDecoder !== "none") {
+      setSelectedDecoder("none");
+    }
+    if (isHevcEncoder(selectedEncoder) && selectedTransport === "webrtc") {
+      setSelectedTransport("quic");
+    }
     if (!isDecoderAvailable(selectedDecoder)) {
       const nextDecoder = DECODER_OPTIONS.find((option) => isDecoderAvailable(option.id));
       if (nextDecoder) setSelectedDecoder(nextDecoder.id);
     }
-  }, [capabilities, selectedCapture, selectedDecoder, selectedEncoder]);
+  }, [capabilities, selectedCapture, selectedDecoder, selectedEncoder, selectedTransport]);
 
   const blockedReason = () => {
     if (!isCaptureAvailable(selectedCapture)) {
@@ -177,6 +237,9 @@ export function CustomTestPage() {
       if (selectedEncoder === "nvenc_av1") {
         return "当前 GPU/驱动未暴露 NVENC AV1 编码能力。RTX 30 系通常支持 AV1 解码，但不支持 AV1 NVENC 编码。";
       }
+      if (isHevcEncoder(selectedEncoder)) {
+        return "当前 GPU/驱动未暴露 NVENC HEVC 编码能力。";
+      }
       return "当前环境未暴露所选编码器能力。";
     }
     if (!isDecoderAvailable(selectedDecoder)) {
@@ -184,14 +247,26 @@ export function CustomTestPage() {
         ? "VideoToolbox 解码当前为实验路径，需显式启用后才可测试。"
         : "当前平台未暴露所选解码能力。";
     }
+    if (selectedEncoder === "none" && selectedDecoder !== "none") {
+      return "直接渲染链路不经过码流，请选择无解码。";
+    }
     if (selectedEncoder === "nvenc_av1" && selectedDecoder === "software") {
       return "NVENC AV1 当前只支持 NVDEC 或 encode-only 链路，软件 AV1 解码链路尚未接入。";
+    }
+    if (isHevcEncoder(selectedEncoder) && selectedDecoder === "software") {
+      return "NVENC HEVC 当前只支持 NVDEC 或 encode-only 链路，软件 HEVC 解码链路尚未接入。";
+    }
+    if (isHevcEncoder(selectedEncoder) && selectedTransport === "webrtc") {
+      return "HEVC WebRTC RTP 打包尚未接入，请使用 QUIC Datagram 或 Loopback。";
     }
     if (selectedEncoder === "videotoolbox_h264" && selectedDecoder === "nvdec") {
       return "VideoToolbox H.264 是 macOS 原生路径，请选择 VideoToolbox、软件解码或 encode-only。";
     }
-    if (selectedEncoder === "nvenc_av1" && selectedDecoder === "videotoolbox") {
-      return "VideoToolbox H.264 解码器不能解码 NVENC AV1 输出。";
+    if (
+      (selectedEncoder === "nvenc_av1" || isHevcEncoder(selectedEncoder)) &&
+      selectedDecoder === "videotoolbox"
+    ) {
+      return "VideoToolbox H.264 解码器不能解码 NVENC AV1/HEVC 输出。";
     }
     return null;
   };
@@ -214,8 +289,15 @@ export function CustomTestPage() {
       capture_type: selectedCapture,
       encoder_type: selectedEncoder,
       decoder_type: selectedDecoder,
+      transport_kind: selectedTransport,
       renderer_type: useMacosRenderer ? "macos" : "d3d11",
-      render_display: useMacosRenderer ? true : undefined,
+      render_display: true,
+      zero_copy:
+        !useMacosRenderer &&
+        selectedCapture !== "synthetic" &&
+        (selectedEncoder === "none" || selectedEncoder.startsWith("nvenc"))
+          ? true
+          : undefined,
       resolution: (() => {
         const resolution = RESOLUTIONS.find((r) => r.id === selectedResolution)!;
         return [resolution.width, resolution.height] as [number, number];
@@ -277,6 +359,13 @@ export function CustomTestPage() {
             }
           />
           <Arrow />
+          {/* Transport */}
+          <PipelineStage
+            label="传输"
+            value={TRANSPORT_OPTIONS.find((t) => t.id === selectedTransport)?.name || "-"}
+            icon={<Network className="h-5 w-5" />}
+          />
+          <Arrow />
           {/* Decoder */}
           <PipelineStage
             label="解码"
@@ -287,7 +376,7 @@ export function CustomTestPage() {
       </div>
 
       {/* Component Selection */}
-      <div className="grid md:grid-cols-3 gap-6 mb-6">
+      <div className="grid md:grid-cols-2 xl:grid-cols-4 gap-6 mb-6">
         {/* Capture Selection */}
         <div className="bg-card rounded-lg border p-4">
           <h3 className="font-medium mb-3">捕获源</h3>
@@ -429,6 +518,50 @@ export function CustomTestPage() {
                   <p className="text-xs text-muted-foreground mt-1">{option.description}</p>
                 </div>
               </label>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Transport Selection */}
+        <div className="bg-card rounded-lg border p-4">
+          <h3 className="font-medium mb-3">传输层</h3>
+          <div className="space-y-2">
+            {TRANSPORT_OPTIONS.map((option) => {
+              const hevcWebrtcBlocked = isHevcEncoder(selectedEncoder) && option.id === "webrtc";
+              return (
+                <label
+                  key={option.id}
+                  className={`flex items-start gap-3 p-3 rounded cursor-pointer border transition-colors ${
+                    selectedTransport === option.id
+                      ? "bg-primary/10 border-primary"
+                      : "bg-background hover:bg-muted"
+                  } ${hevcWebrtcBlocked ? "opacity-50 cursor-not-allowed" : ""}`}
+                >
+                  <input
+                    type="radio"
+                    name="transport"
+                    value={option.id}
+                    checked={selectedTransport === option.id}
+                    onChange={(e) => setSelectedTransport(e.target.value as TransportId)}
+                    className="mt-1"
+                    disabled={hevcWebrtcBlocked}
+                  />
+                  <div className="flex-1">
+                    <div className="flex items-center gap-2 font-medium text-sm">
+                      {option.name}
+                      <span className="text-xs bg-muted px-1 rounded">
+                        {capabilityTag(option.id)}
+                      </span>
+                      {hevcWebrtcBlocked && (
+                        <span className="text-xs bg-yellow-100 text-yellow-800 px-1 rounded">
+                          HEVC 未接入
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-xs text-muted-foreground mt-1">{option.description}</p>
+                  </div>
+                </label>
               );
             })}
           </div>

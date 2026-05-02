@@ -277,8 +277,11 @@ fn decoded_frame_to_render_frame(frame: &DecodedFrame) -> RenderFrame {
             frame.height,
             cpu_nv12_to_rgb24(data, frame.width, frame.height, *pitch),
         ),
+        DecodedFrameData::CpuP010 { .. } => {
+            unreachable!("automated OpenH264 software decode path should not emit P010 frames")
+        }
         #[cfg(windows)]
-        DecodedFrameData::D3D11SharedNv12 { .. } => {
+        DecodedFrameData::D3D11SharedNv12 { .. } | DecodedFrameData::D3D11SharedP010 { .. } => {
             unreachable!("automated OpenH264 software decode path should not emit D3D11 frames")
         }
     }

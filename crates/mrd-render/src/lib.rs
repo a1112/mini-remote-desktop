@@ -4,9 +4,15 @@ pub use mrd_pipeline_core::RuntimeStatus;
 pub enum RenderPixelFormat {
     Rgb24,
     Bgra32,
+    /// D3D11 shared BGRA texture (zero-copy direct capture-render path)
+    #[cfg(windows)]
+    D3D11SharedBgra,
     /// D3D11 shared NV12 texture (zero-copy path)
     #[cfg(windows)]
     D3D11SharedNv12,
+    /// D3D11 shared P010/P016 texture (zero-copy Main10 path)
+    #[cfg(windows)]
+    D3D11SharedP010,
 }
 
 /// Frame data for rendering
@@ -20,7 +26,23 @@ pub enum RenderFrameData {
     Bgra32(Vec<u8>),
     /// D3D11 shared texture handle (zero-copy path)
     #[cfg(windows)]
+    D3D11SharedBgra {
+        shared_handle: isize,
+        width: u32,
+        height: u32,
+        row_pitch: u32,
+    },
+    /// D3D11 shared texture handle (zero-copy path)
+    #[cfg(windows)]
     D3D11SharedNv12 {
+        shared_handle_y: isize,
+        shared_handle_uv: isize,
+        width: u32,
+        height: u32,
+    },
+    /// D3D11 shared P010/P016 texture handle (zero-copy Main10 path)
+    #[cfg(windows)]
+    D3D11SharedP010 {
         shared_handle_y: isize,
         shared_handle_uv: isize,
         width: u32,
@@ -57,6 +79,27 @@ impl RenderFrame {
         }
     }
 
+    /// Create a frame from a D3D11 shared BGRA texture
+    #[cfg(windows)]
+    pub fn from_d3d11_shared_bgra(
+        width: usize,
+        height: usize,
+        shared_handle: isize,
+        row_pitch: u32,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            pixel_format: RenderPixelFormat::D3D11SharedBgra,
+            data: RenderFrameData::D3D11SharedBgra {
+                shared_handle,
+                width: width as u32,
+                height: height as u32,
+                row_pitch,
+            },
+        }
+    }
+
     /// Create a frame from D3D11 shared NV12 texture
     #[cfg(windows)]
     pub fn from_d3d11_shared_nv12(
@@ -70,6 +113,27 @@ impl RenderFrame {
             height,
             pixel_format: RenderPixelFormat::D3D11SharedNv12,
             data: RenderFrameData::D3D11SharedNv12 {
+                shared_handle_y,
+                shared_handle_uv,
+                width: width as u32,
+                height: height as u32,
+            },
+        }
+    }
+
+    /// Create a frame from D3D11 shared P010/P016 texture
+    #[cfg(windows)]
+    pub fn from_d3d11_shared_p010(
+        width: usize,
+        height: usize,
+        shared_handle_y: isize,
+        shared_handle_uv: isize,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            pixel_format: RenderPixelFormat::D3D11SharedP010,
+            data: RenderFrameData::D3D11SharedP010 {
                 shared_handle_y,
                 shared_handle_uv,
                 width: width as u32,
@@ -98,9 +162,31 @@ impl RenderFrame {
     #[cfg(windows)]
     pub fn shared_handle(&self) -> Option<isize> {
         match &self.data {
+            RenderFrameData::D3D11SharedBgra { shared_handle, .. } => Some(*shared_handle),
             RenderFrameData::D3D11SharedNv12 {
                 shared_handle_y, ..
+            }
+            | RenderFrameData::D3D11SharedP010 {
+                shared_handle_y, ..
             } => Some(*shared_handle_y),
+            _ => None,
+        }
+    }
+
+    /// Get the shared BGRA texture handle if available.
+    #[cfg(windows)]
+    pub fn shared_bgra_handle(&self) -> Option<isize> {
+        match &self.data {
+            RenderFrameData::D3D11SharedBgra { shared_handle, .. } => Some(*shared_handle),
+            _ => None,
+        }
+    }
+
+    /// Get the shared BGRA texture row pitch if available.
+    #[cfg(windows)]
+    pub fn shared_bgra_row_pitch(&self) -> Option<u32> {
+        match &self.data {
+            RenderFrameData::D3D11SharedBgra { row_pitch, .. } => Some(*row_pitch),
             _ => None,
         }
     }
@@ -113,6 +199,11 @@ impl RenderFrame {
                 shared_handle_y,
                 shared_handle_uv,
                 ..
+            }
+            | RenderFrameData::D3D11SharedP010 {
+                shared_handle_y,
+                shared_handle_uv,
+                ..
             } => Some((*shared_handle_y, *shared_handle_uv)),
             _ => None,
         }
@@ -122,7 +213,11 @@ impl RenderFrame {
     pub fn is_shared_texture(&self) -> bool {
         match &self.data {
             #[cfg(windows)]
-            RenderFrameData::D3D11SharedNv12 { .. } => true,
+            RenderFrameData::D3D11SharedBgra { .. } => true,
+            #[cfg(windows)]
+            RenderFrameData::D3D11SharedNv12 { .. } | RenderFrameData::D3D11SharedP010 { .. } => {
+                true
+            }
             _ => false,
         }
     }
@@ -172,7 +267,11 @@ const SUPPORTED_FORMATS: &[RenderPixelFormat] = &[
     RenderPixelFormat::Rgb24,
     RenderPixelFormat::Bgra32,
     #[cfg(windows)]
+    RenderPixelFormat::D3D11SharedBgra,
+    #[cfg(windows)]
     RenderPixelFormat::D3D11SharedNv12,
+    #[cfg(windows)]
+    RenderPixelFormat::D3D11SharedP010,
 ];
 
 pub fn d3d11_descriptor() -> RendererDescriptor {
@@ -203,5 +302,34 @@ mod tests {
         assert!(descriptor
             .supported_formats
             .contains(&RenderPixelFormat::D3D11SharedNv12));
+        #[cfg(windows)]
+        assert!(descriptor
+            .supported_formats
+            .contains(&RenderPixelFormat::D3D11SharedBgra));
+        #[cfg(windows)]
+        assert!(descriptor
+            .supported_formats
+            .contains(&RenderPixelFormat::D3D11SharedP010));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn d3d11_shared_bgra_frame_is_zero_copy_render_data() {
+        let frame = super::RenderFrame::from_d3d11_shared_bgra(1280, 720, 42, 1280 * 4);
+
+        assert_eq!(frame.pixel_format, RenderPixelFormat::D3D11SharedBgra);
+        assert!(frame.is_shared_texture());
+        assert_eq!(frame.shared_handle(), Some(42));
+        assert_eq!(frame.shared_bgra_handle(), Some(42));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn d3d11_shared_p010_frame_is_zero_copy_render_data() {
+        let frame = super::RenderFrame::from_d3d11_shared_p010(1280, 720, 42, 43);
+
+        assert_eq!(frame.pixel_format, RenderPixelFormat::D3D11SharedP010);
+        assert!(frame.is_shared_texture());
+        assert_eq!(frame.shared_handles(), Some((42, 43)));
     }
 }

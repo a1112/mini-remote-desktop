@@ -43,6 +43,7 @@ import type {
   NativeRenderSurfaceSnapshot,
   BrowserWebrtcPreviewAnswer,
   TestMatrixConfig,
+  PipelineComparisonResult,
 } from './types';
 
 /**
@@ -88,11 +89,11 @@ function browserDevCapabilities(): EnvironmentSnapshot | null {
         ? ['dxgi', 'winrt', 'synthetic']
         : ['synthetic'],
     available_encoders: isMac
-      ? ['videotoolbox_h264', 'openh264']
+      ? ['none', 'videotoolbox_h264', 'openh264']
       : isWindows
-        ? ['openh264']
-        : ['openh264'],
-    available_decoders: isMac ? ['software', 'videotoolbox'] : ['software'],
+        ? ['none', 'openh264']
+        : ['none', 'openh264'],
+    available_decoders: isMac ? ['none', 'software', 'videotoolbox'] : ['none', 'software'],
     available_renderers: isMac ? ['macos'] : isWindows ? ['d3d11'] : [],
     available_memory_modes: isWindows ? ['cpu', 'd3d11_shared'] : ['cpu'],
   };
@@ -766,6 +767,13 @@ export async function testHarnessGetChain(): Promise<AdapterResult<string>> {
  */
 export async function testHarnessGetMetrics(): Promise<AdapterResult<HarnessMetrics>> {
   return invokeAdapter<HarnessMetrics>('test_harness_get_metrics');
+}
+
+/**
+ * Get CapTest-compatible comparison metrics for the current harness run.
+ */
+export async function testHarnessGetComparisonResult(): Promise<AdapterResult<PipelineComparisonResult>> {
+  return invokeAdapter<PipelineComparisonResult>('test_harness_get_comparison_result');
 }
 
 /**

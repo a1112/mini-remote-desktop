@@ -53,6 +53,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 bytes = "1"
 
+[patch.crates-io]
+nvenc = { path = "vendor/nvenc" }
+
 [profile.dev.package.app]
 opt-level = 2
 

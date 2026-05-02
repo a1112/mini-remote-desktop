@@ -33,6 +33,90 @@ function mockMacCapabilities(command: string) {
 }
 
 describe("MatrixTestPage failure handling", () => {
+  it("exposes HEVC encoders when Windows capabilities report NVENC HEVC support", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve({
+          os_type: "windows",
+          cpu_brand: "",
+          cpu_cores: 16,
+          memory_gb: 32,
+          gpu_info: "NVIDIA",
+          available_captures: ["dxgi", "winrt", "synthetic"],
+          available_encoders: ["nvenc_h264", "nvenc_hevc", "nvenc_hevc_main10", "nvenc_av1", "openh264"],
+          available_decoders: ["nvdec", "software"],
+          available_renderers: ["none", "d3d11"],
+          available_memory_modes: ["cpu", "d3d11_shared"],
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    render(<MatrixTestPage />);
+
+    expect(await screen.findByLabelText("NVENC HEVC Main")).toBeInTheDocument();
+    expect(screen.getByLabelText("NVENC HEVC Main10")).toBeInTheDocument();
+  });
+
+  it("passes HEVC Main10 D3D11 shared texture matrix runs", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve({
+          os_type: "windows",
+          cpu_brand: "",
+          cpu_cores: 16,
+          memory_gb: 32,
+          gpu_info: "NVIDIA",
+          available_captures: ["dxgi", "synthetic"],
+          available_encoders: ["nvenc_h264", "nvenc_hevc_main10", "openh264"],
+          available_decoders: ["nvdec", "software"],
+          available_renderers: ["none", "d3d11"],
+          available_memory_modes: ["cpu", "d3d11_shared"],
+        });
+      }
+      if (command === "test_start_run") {
+        return Promise.resolve("run-1");
+      }
+      if (command === "test_get_run") {
+        return Promise.resolve(null);
+      }
+      return Promise.resolve(null);
+    });
+
+    render(<MatrixTestPage runDelayMs={0} />);
+
+    await screen.findByLabelText("NVENC HEVC Main10");
+    fireEvent.click(screen.getByLabelText("OpenH264"));
+    fireEvent.click(screen.getByLabelText("NVENC H.264"));
+    fireEvent.click(screen.getByLabelText("NVENC HEVC Main10"));
+    fireEvent.click(screen.getByLabelText("软件"));
+    fireEvent.click(screen.getByLabelText("CPU"));
+    fireEvent.click(screen.getByLabelText("D3D11 shared texture"));
+    fireEvent.click(screen.getByLabelText("Loopback"));
+    fireEvent.click(screen.getByLabelText("QUIC Datagram"));
+    fireEvent.click(screen.getByLabelText("720p"));
+    fireEvent.click(screen.getByLabelText("30 FPS"));
+    fireEvent.click(screen.getByRole("button", { name: /启动矩阵测试/ }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_start_run",
+        expect.objectContaining({
+          config: expect.objectContaining({
+            encoder_type: "nvenc_hevc_main10",
+            decoder_type: "nvdec",
+            transport_kind: "quic",
+            renderer_type: "d3d11",
+            render_display: true,
+            zero_copy: true,
+          }),
+        })
+      );
+    });
+  });
+
   it("loads macOS-specific matrix dimensions from environment capabilities", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {
@@ -357,6 +441,42 @@ describe("MatrixTestPage failure handling", () => {
         "test_start_run",
         expect.objectContaining({
           config: expect.objectContaining({
+            renderer_type: "d3d11",
+            render_display: true,
+            zero_copy: true,
+          }),
+        })
+      );
+    });
+  });
+
+  it("allows NVENC AV1 with D3D11 shared texture matrix runs", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_start_run") {
+        return Promise.resolve("run-1");
+      }
+      if (command === "test_get_run") {
+        return Promise.resolve(null);
+      }
+      return Promise.resolve(null);
+    });
+
+    render(<MatrixTestPage runDelayMs={0} />);
+    selectSingleSupportedCombination();
+    fireEvent.click(screen.getByLabelText("NVENC H.264"));
+    fireEvent.click(screen.getByLabelText(/NVENC AV1/));
+    fireEvent.click(screen.getByLabelText("CPU"));
+    fireEvent.click(screen.getByLabelText("D3D11 shared texture"));
+    fireEvent.click(screen.getByRole("button", { name: /启动矩阵测试/ }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_start_run",
+        expect.objectContaining({
+          config: expect.objectContaining({
+            encoder_type: "nvenc_av1",
+            decoder_type: "nvdec",
             renderer_type: "d3d11",
             render_display: true,
             zero_copy: true,

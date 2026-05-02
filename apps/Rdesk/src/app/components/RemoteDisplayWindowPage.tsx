@@ -75,6 +75,8 @@ const captureOptions: Option<CaptureType>[] = [
 
 const encoderOptions: Option<EncoderType>[] = [
   { value: "nvenc_h264", label: "NVENC H.264" },
+  { value: "nvenc_hevc", label: "NVENC HEVC Main" },
+  { value: "nvenc_hevc_main10", label: "NVENC HEVC Main10" },
   { value: "videotoolbox_h264", label: "VideoToolbox H.264" },
   { value: "openh264", label: "OpenH264" },
   { value: "nvenc_av1", label: "NVENC AV1" },
@@ -117,6 +119,19 @@ const bitrateOptions: Option<BitrateKey>[] = [
 
 function optionLabel<T extends string>(options: Option<T>[], value: T) {
   return options.find((option) => option.value === value)?.label ?? value;
+}
+
+function isNvencSharedTextureEncoder(encoder: EncoderType) {
+  return (
+    encoder === "nvenc_h264" ||
+    encoder === "nvenc_hevc" ||
+    encoder === "nvenc_hevc_main10" ||
+    encoder === "nvenc_av1"
+  );
+}
+
+function isHevcEncoder(encoder: EncoderType) {
+  return encoder === "nvenc_hevc" || encoder === "nvenc_hevc_main10";
 }
 
 function browserLooksLikeMacos(): boolean {
@@ -278,7 +293,7 @@ export function RemoteDisplayWindowPage() {
   const usesNativeSharedTexture =
     nativeRendererType === "d3d11" &&
     capture === "dxgi" &&
-    encoder === "nvenc_h264" &&
+    isNvencSharedTextureEncoder(encoder) &&
     decoder === "nvdec";
   const visibleCaptureOptions = useMemo(
     () =>
@@ -301,6 +316,16 @@ export function RemoteDisplayWindowPage() {
         : decoderOptions,
     [capabilities]
   );
+
+  useEffect(() => {
+    if (isHevcEncoder(encoder) && transport === "webrtc") {
+      setTransport("quic");
+    }
+    if (isHevcEncoder(encoder) && decoder === "software") {
+      setDecoder(capabilities?.available_decoders.includes("nvdec") ? "nvdec" : "none");
+    }
+  }, [capabilities?.available_decoders, decoder, encoder, transport]);
+
   const renderModeLabel =
     renderMode === "metal_native"
       ? "Metal native"
@@ -432,7 +457,12 @@ export function RemoteDisplayWindowPage() {
         pickAvailable(value, capabilities.available_captures, ["dxgi", "winrt", "synthetic"], "dxgi")
       );
       setEncoder((value) =>
-        pickAvailable(value, capabilities.available_encoders, ["nvenc_h264", "openh264"], "nvenc_h264")
+        pickAvailable(
+          value,
+          capabilities.available_encoders,
+          ["nvenc_h264", "nvenc_av1", "openh264"],
+          "nvenc_h264"
+        )
       );
       setDecoder((value) =>
         pickAvailable(value, capabilities.available_decoders, ["nvdec", "software", "none"], "nvdec")

@@ -9,6 +9,8 @@ use openh264::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodecKind {
     H264,
+    Hevc,
+    HevcMain10,
     Av1,
 }
 
@@ -50,10 +52,26 @@ const NVDEC_AV1_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
     output_formats: RGB24_OUTPUTS,
 };
 
+const NVDEC_HEVC_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
+    id: "nvdec_hevc",
+    codec: CodecKind::Hevc,
+    runtime_status: RuntimeStatus::RuntimeBacked,
+    output_formats: RGB24_OUTPUTS,
+};
+
+const NVDEC_HEVC_MAIN10_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
+    id: "nvdec_hevc_main10",
+    codec: CodecKind::HevcMain10,
+    runtime_status: RuntimeStatus::RuntimeBacked,
+    output_formats: RGB24_OUTPUTS,
+};
+
 pub fn available_decoder_descriptors() -> Vec<DecoderDescriptor> {
     vec![
         H264_SOFTWARE_DESCRIPTOR.clone(),
         NVDEC_DESCRIPTOR.clone(),
+        NVDEC_HEVC_DESCRIPTOR.clone(),
+        NVDEC_HEVC_MAIN10_DESCRIPTOR.clone(),
         NVDEC_AV1_DESCRIPTOR.clone(),
     ]
 }
@@ -62,6 +80,8 @@ pub fn create_decoder(id: &str) -> Result<Box<dyn VideoDecoder>, PipelineError> 
     match id {
         "h264_software" => Ok(Box::new(H264SoftwareDecoder::new()?)),
         "nvdec" => Ok(Box::new(NvdecVideoDecoder::new()?)),
+        "nvdec_hevc" => Ok(Box::new(NvdecVideoDecoder::new_hevc()?)),
+        "nvdec_hevc_main10" => Ok(Box::new(NvdecVideoDecoder::new_hevc_main10()?)),
         "nvdec_av1" => Ok(Box::new(NvdecVideoDecoder::new_av1()?)),
         other => Err(PipelineError::Message(format!(
             "unknown decoder backend: {other}"
@@ -90,6 +110,22 @@ impl NvdecVideoDecoder {
             mrd_decode_nvdec::NvdecOutputMode::CpuRgb24,
         )
         .map_err(|e| PipelineError::Message(format!("nvdec av1 create failed: {e}")))?;
+        Ok(Self { decoder })
+    }
+
+    pub fn new_hevc() -> Result<Self, PipelineError> {
+        let decoder = mrd_decode_nvdec::NvdecDecoder::new_hevc_with_output_mode(
+            mrd_decode_nvdec::NvdecOutputMode::CpuRgb24,
+        )
+        .map_err(|e| PipelineError::Message(format!("nvdec hevc create failed: {e}")))?;
+        Ok(Self { decoder })
+    }
+
+    pub fn new_hevc_main10() -> Result<Self, PipelineError> {
+        let decoder = mrd_decode_nvdec::NvdecDecoder::new_hevc_main10_with_output_mode(
+            mrd_decode_nvdec::NvdecOutputMode::CpuRgb24,
+        )
+        .map_err(|e| PipelineError::Message(format!("nvdec hevc main10 create failed: {e}")))?;
         Ok(Self { decoder })
     }
 }
@@ -154,6 +190,9 @@ impl VideoDecoder for NvdecVideoDecoder {
                 NvdecDecodedFrameData::CpuNv12 { data, pitch } => {
                     CoreDecodedFrame::from_cpu_nv12(frame.width, frame.height, 0, pitch, data)
                 }
+                NvdecDecodedFrameData::CpuP010 { data, pitch } => {
+                    CoreDecodedFrame::from_cpu_p010(frame.width, frame.height, 0, pitch, data)
+                }
                 #[cfg(windows)]
                 NvdecDecodedFrameData::D3D11SharedNv12 {
                     shared_handle_y,
@@ -161,6 +200,19 @@ impl VideoDecoder for NvdecVideoDecoder {
                     width: _,
                     height: _,
                 } => CoreDecodedFrame::from_d3d11_shared_nv12(
+                    frame.width,
+                    frame.height,
+                    0,
+                    shared_handle_y,
+                    shared_handle_uv,
+                ),
+                #[cfg(windows)]
+                NvdecDecodedFrameData::D3D11SharedP010 {
+                    shared_handle_y,
+                    shared_handle_uv,
+                    width: _,
+                    height: _,
+                } => CoreDecodedFrame::from_d3d11_shared_p010(
                     frame.width,
                     frame.height,
                     0,

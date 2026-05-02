@@ -13,6 +13,8 @@ const PLATFORM_TAGS: Record<string, string> = {
   d3d11: "Windows",
   d3d11_shared: "Windows",
   nvenc_h264: "Windows/NVIDIA",
+  nvenc_hevc: "Windows/NVIDIA",
+  nvenc_hevc_main10: "Windows/NVIDIA",
   nvenc_av1: "Windows/NVIDIA",
   nvdec: "Windows/NVIDIA",
   macos: "macOS",

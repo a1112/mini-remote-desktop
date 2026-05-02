@@ -1131,8 +1131,11 @@ fn decoded_frame_data_kind(frame: &DecodedFrame) -> &'static str {
         DecodedFrameData::CpuRgb24(_) => "Rgb24",
         DecodedFrameData::CpuBgra32(_) => "Bgra32",
         DecodedFrameData::CpuNv12 { .. } => "Nv12",
+        DecodedFrameData::CpuP010 { .. } => "P010",
         #[cfg(windows)]
         DecodedFrameData::D3D11SharedNv12 { .. } => "D3d11SharedNv12",
+        #[cfg(windows)]
+        DecodedFrameData::D3D11SharedP010 { .. } => "D3d11SharedP010",
     }
 }
 

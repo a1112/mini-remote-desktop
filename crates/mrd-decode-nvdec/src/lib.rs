@@ -9,9 +9,19 @@ pub enum NvdecDecodedFrameData {
     CpuRgb24(Vec<u8>),
     /// CPU NV12 data with decoder pitch.
     CpuNv12 { data: Vec<u8>, pitch: usize },
+    /// CPU P010/P016 data with decoder pitch.
+    CpuP010 { data: Vec<u8>, pitch: usize },
     /// D3D11 shared texture handle (zero-copy path)
     #[cfg(windows)]
     D3D11SharedNv12 {
+        shared_handle_y: isize,
+        shared_handle_uv: isize,
+        width: u32,
+        height: u32,
+    },
+    /// D3D11 shared P010/P016 texture handles (zero-copy Main10 path)
+    #[cfg(windows)]
+    D3D11SharedP010 {
         shared_handle_y: isize,
         shared_handle_uv: isize,
         width: u32,
@@ -45,12 +55,24 @@ impl NvdecDecodedFrame {
         }
     }
 
+    /// Create a decoded frame from CPU P010/P016 data.
+    pub fn from_cpu_p010(width: usize, height: usize, pitch: usize, data: Vec<u8>) -> Self {
+        Self {
+            width,
+            height,
+            data: NvdecDecodedFrameData::CpuP010 { data, pitch },
+        }
+    }
+
     /// Check if this frame uses shared texture (zero-copy)
     pub fn is_shared_texture(&self) -> bool {
         match &self.data {
-            NvdecDecodedFrameData::CpuRgb24(_) | NvdecDecodedFrameData::CpuNv12 { .. } => false,
+            NvdecDecodedFrameData::CpuRgb24(_)
+            | NvdecDecodedFrameData::CpuNv12 { .. }
+            | NvdecDecodedFrameData::CpuP010 { .. } => false,
             #[cfg(windows)]
-            NvdecDecodedFrameData::D3D11SharedNv12 { .. } => true,
+            NvdecDecodedFrameData::D3D11SharedNv12 { .. }
+            | NvdecDecodedFrameData::D3D11SharedP010 { .. } => true,
         }
     }
 
@@ -58,9 +80,10 @@ impl NvdecDecodedFrame {
     pub fn cpu_rgb24(&self) -> Option<&[u8]> {
         match &self.data {
             NvdecDecodedFrameData::CpuRgb24(data) => Some(data.as_slice()),
-            NvdecDecodedFrameData::CpuNv12 { .. } => None,
+            NvdecDecodedFrameData::CpuNv12 { .. } | NvdecDecodedFrameData::CpuP010 { .. } => None,
             #[cfg(windows)]
-            NvdecDecodedFrameData::D3D11SharedNv12 { .. } => None,
+            NvdecDecodedFrameData::D3D11SharedNv12 { .. }
+            | NvdecDecodedFrameData::D3D11SharedP010 { .. } => None,
         }
     }
 
@@ -68,9 +91,21 @@ impl NvdecDecodedFrame {
     pub fn cpu_nv12(&self) -> Option<(&[u8], usize)> {
         match &self.data {
             NvdecDecodedFrameData::CpuNv12 { data, pitch } => Some((data.as_slice(), *pitch)),
-            NvdecDecodedFrameData::CpuRgb24(_) => None,
+            NvdecDecodedFrameData::CpuRgb24(_) | NvdecDecodedFrameData::CpuP010 { .. } => None,
             #[cfg(windows)]
-            NvdecDecodedFrameData::D3D11SharedNv12 { .. } => None,
+            NvdecDecodedFrameData::D3D11SharedNv12 { .. }
+            | NvdecDecodedFrameData::D3D11SharedP010 { .. } => None,
+        }
+    }
+
+    /// Get the CPU P010/P016 data and pitch if available.
+    pub fn cpu_p010(&self) -> Option<(&[u8], usize)> {
+        match &self.data {
+            NvdecDecodedFrameData::CpuP010 { data, pitch } => Some((data.as_slice(), *pitch)),
+            NvdecDecodedFrameData::CpuRgb24(_) | NvdecDecodedFrameData::CpuNv12 { .. } => None,
+            #[cfg(windows)]
+            NvdecDecodedFrameData::D3D11SharedNv12 { .. }
+            | NvdecDecodedFrameData::D3D11SharedP010 { .. } => None,
         }
     }
 
@@ -78,8 +113,13 @@ impl NvdecDecodedFrame {
     #[cfg(windows)]
     pub fn d3d11_shared_handle(&self) -> Option<isize> {
         match &self.data {
-            NvdecDecodedFrameData::CpuRgb24(_) | NvdecDecodedFrameData::CpuNv12 { .. } => None,
+            NvdecDecodedFrameData::CpuRgb24(_)
+            | NvdecDecodedFrameData::CpuNv12 { .. }
+            | NvdecDecodedFrameData::CpuP010 { .. } => None,
             NvdecDecodedFrameData::D3D11SharedNv12 {
+                shared_handle_y, ..
+            }
+            | NvdecDecodedFrameData::D3D11SharedP010 {
                 shared_handle_y, ..
             } => Some(*shared_handle_y),
         }
@@ -89,8 +129,15 @@ impl NvdecDecodedFrame {
     #[cfg(windows)]
     pub fn d3d11_shared_handles(&self) -> Option<(isize, isize)> {
         match &self.data {
-            NvdecDecodedFrameData::CpuRgb24(_) | NvdecDecodedFrameData::CpuNv12 { .. } => None,
+            NvdecDecodedFrameData::CpuRgb24(_)
+            | NvdecDecodedFrameData::CpuNv12 { .. }
+            | NvdecDecodedFrameData::CpuP010 { .. } => None,
             NvdecDecodedFrameData::D3D11SharedNv12 {
+                shared_handle_y,
+                shared_handle_uv,
+                ..
+            }
+            | NvdecDecodedFrameData::D3D11SharedP010 {
                 shared_handle_y,
                 shared_handle_uv,
                 ..
@@ -108,6 +155,8 @@ pub enum NvdecOutputMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NvdecCodecKind {
     H264,
+    Hevc,
+    HevcMain10,
     Av1,
 }
 
@@ -197,6 +246,14 @@ impl NvdecDecoder {
         Self::new_for_codec_with_output_mode(NvdecCodecKind::Av1, output_mode)
     }
 
+    pub fn new_hevc_with_output_mode(output_mode: NvdecOutputMode) -> Result<Self, String> {
+        Self::new_for_codec_with_output_mode(NvdecCodecKind::Hevc, output_mode)
+    }
+
+    pub fn new_hevc_main10_with_output_mode(output_mode: NvdecOutputMode) -> Result<Self, String> {
+        Self::new_for_codec_with_output_mode(NvdecCodecKind::HevcMain10, output_mode)
+    }
+
     pub fn new_for_codec_with_output_mode(
         codec: NvdecCodecKind,
         output_mode: NvdecOutputMode,
@@ -234,6 +291,115 @@ impl NvdecDecoder {
         }
     }
 
+    #[cfg(windows)]
+    pub unsafe fn new_with_output_mode_and_d3d11_device_ptr(
+        output_mode: NvdecOutputMode,
+        d3d11_device_ptr: *mut c_void,
+    ) -> Result<Self, String> {
+        unsafe {
+            Self::new_for_codec_with_output_mode_and_d3d11_device_ptr(
+                NvdecCodecKind::H264,
+                output_mode,
+                d3d11_device_ptr,
+            )
+        }
+    }
+
+    #[cfg(windows)]
+    pub unsafe fn new_av1_with_output_mode_and_d3d11_device_ptr(
+        output_mode: NvdecOutputMode,
+        d3d11_device_ptr: *mut c_void,
+    ) -> Result<Self, String> {
+        unsafe {
+            Self::new_for_codec_with_output_mode_and_d3d11_device_ptr(
+                NvdecCodecKind::Av1,
+                output_mode,
+                d3d11_device_ptr,
+            )
+        }
+    }
+
+    #[cfg(windows)]
+    pub unsafe fn new_hevc_with_output_mode_and_d3d11_device_ptr(
+        output_mode: NvdecOutputMode,
+        d3d11_device_ptr: *mut c_void,
+    ) -> Result<Self, String> {
+        unsafe {
+            Self::new_for_codec_with_output_mode_and_d3d11_device_ptr(
+                NvdecCodecKind::Hevc,
+                output_mode,
+                d3d11_device_ptr,
+            )
+        }
+    }
+
+    #[cfg(windows)]
+    pub unsafe fn new_hevc_main10_with_output_mode_and_d3d11_device_ptr(
+        output_mode: NvdecOutputMode,
+        d3d11_device_ptr: *mut c_void,
+    ) -> Result<Self, String> {
+        unsafe {
+            Self::new_for_codec_with_output_mode_and_d3d11_device_ptr(
+                NvdecCodecKind::HevcMain10,
+                output_mode,
+                d3d11_device_ptr,
+            )
+        }
+    }
+
+    #[cfg(windows)]
+    pub unsafe fn new_for_codec_with_output_mode_and_d3d11_device_ptr(
+        codec: NvdecCodecKind,
+        output_mode: NvdecOutputMode,
+        d3d11_device_ptr: *mut c_void,
+    ) -> Result<Self, String> {
+        if d3d11_device_ptr.is_null() {
+            return Err("D3D11 device pointer is null".to_string());
+        }
+
+        let mut decoder = Self::new_for_codec_with_optional_d3d11_device_ptr(
+            codec,
+            output_mode,
+            Some(d3d11_device_ptr),
+        )?;
+        decoder.enable_shared_texture(true);
+        Ok(decoder)
+    }
+
+    #[cfg(windows)]
+    fn new_for_codec_with_optional_d3d11_device_ptr(
+        codec: NvdecCodecKind,
+        output_mode: NvdecOutputMode,
+        d3d11_device_ptr: Option<*mut c_void>,
+    ) -> Result<Self, String> {
+        let session = imp::NvdecSession::new_for_codec_with_d3d11_device_ptr(
+            codec,
+            output_mode,
+            d3d11_device_ptr,
+        )?;
+        let runtime = NvdecRuntimeProbe {
+            backend: "windows-nvdec",
+            summary: "nvdec runtime libraries and core exports are present".to_string(),
+            checked_items: vec![
+                "nvcuda.dll",
+                "nvcuvid.dll",
+                "cuInit",
+                "cuDeviceGetCount",
+                "cuvidGetDecoderCaps",
+                "cuvidCreateDecoder",
+                "cuvidDestroyDecoder",
+                "cuvidCreateVideoParser",
+                "cuvidParseVideoData",
+            ],
+            capability_probes: Vec::new(),
+        };
+        Ok(Self {
+            runtime,
+            session,
+            enable_shared_texture: false,
+        })
+    }
+
     /// Enable D3D11 shared texture output (zero-copy path)
     ///
     /// When enabled, the decoder will attempt to create D3D11 shared textures
@@ -241,6 +407,7 @@ impl NvdecDecoder {
     #[cfg(windows)]
     pub fn enable_shared_texture(&mut self, enable: bool) {
         self.enable_shared_texture = enable;
+        self.session.enable_shared_texture(enable);
     }
 
     pub fn runtime(&self) -> &NvdecRuntimeProbe {
@@ -348,8 +515,8 @@ pub fn probe_runtime() -> NvdecRuntimeProbe {
 fn runtime_capability_probes() -> Vec<NvdecCapabilityProbe> {
     [
         ("h264", 0, 1, "H264 decode path wired"),
-        ("hevc", 0, 1, "HEVC decode path not wired yet"),
-        ("hevc", 2, 1, "HEVC Main10 decode path not wired yet"),
+        ("hevc", 0, 1, "HEVC Main decode path wired"),
+        ("hevc", 2, 1, "HEVC Main10 decode path wired"),
         (
             "av1",
             0,
@@ -413,7 +580,8 @@ mod imp {
         D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
     };
     use windows::Win32::Graphics::Dxgi::Common::{
-        DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC,
+        DXGI_FORMAT_R16G16_UNORM, DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R8G8_UNORM,
+        DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC,
     };
     use windows::Win32::Graphics::Dxgi::IDXGIResource;
     use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
@@ -421,23 +589,29 @@ mod imp {
     type CUresult = i32;
     type CUdevice = c_int;
     type CUcontext = *mut c_void;
+    type CUstream = *mut c_void;
     type CUvideodecoder = *mut c_void;
     type CUvideoparser = *mut c_void;
     type CUvideoctxlock = *mut c_void;
     type CUdeviceptr = u64;
+    type CUarray = *mut c_void;
     type CUvideotimestamp = i64;
     type CUgraphicsResource = *mut c_void;
 
     const CUDA_SUCCESS: CUresult = 0;
     const CUDA_ERROR_NO_DEVICE: CUresult = 100;
     const CUDA_VIDEO_CODEC_H264: i32 = 4;
-    const CUDA_VIDEO_CODEC_HEVC: i32 = 6;
-    const CUDA_VIDEO_CODEC_AV1: i32 = 9; // AV1 decode support (requires Ada Lovelace or newer)
+    const CUDA_VIDEO_CODEC_HEVC: i32 = 8;
+    const CUDA_VIDEO_CODEC_AV1: i32 = 11; // AV1 decode support (requires Ada Lovelace or newer)
     const CUDA_VIDEO_CHROMA_420: i32 = 1;
     const CUDA_VIDEO_CREATE_PREFER_CUVID: u32 = 0x04;
     const CUDA_VIDEO_SURFACE_NV12: i32 = 0;
+    const CUDA_VIDEO_SURFACE_P016: i32 = 1;
     const CUDA_VIDEO_DEINTERLACE_WEAVE: i32 = 0;
     const CUVID_PKT_ENDOFPICTURE: u32 = 0x08;
+    const CUVID_PARSER_ANNEXB: u32 = 0x01;
+    const CU_MEMORYTYPE_DEVICE: u32 = 2;
+    const CU_MEMORYTYPE_ARRAY: u32 = 3;
 
     type CuInitFn = unsafe extern "system" fn(u32) -> CUresult;
     type CuDeviceGetCountFn = unsafe extern "system" fn(*mut c_int) -> CUresult;
@@ -473,19 +647,69 @@ mod imp {
 
     // CUDA-D3D11 interop functions
     type CuGraphicsD3D11RegisterResourceFn =
-        unsafe extern "system" fn(*mut c_void, *mut c_void, u32) -> CUresult;
-    type CuGraphicsUnregisterResourceFn = unsafe extern "system" fn(*mut c_void) -> CUresult;
+        unsafe extern "system" fn(*mut CUgraphicsResource, *mut c_void, u32) -> CUresult;
+    type CuGraphicsUnregisterResourceFn = unsafe extern "system" fn(CUgraphicsResource) -> CUresult;
     type CuGraphicsMapResourcesFn =
-        unsafe extern "system" fn(c_int, *mut c_void, CUcontext) -> CUresult;
+        unsafe extern "system" fn(c_int, *mut CUgraphicsResource, CUstream) -> CUresult;
     type CuGraphicsUnmapResourcesFn =
-        unsafe extern "system" fn(c_int, *mut c_void, CUcontext) -> CUresult;
-    type CuGraphicsResourceGetMappedPointerFn =
-        unsafe extern "system" fn(*mut CUdeviceptr, *mut usize, *mut c_void) -> CUresult;
-    type CuMemcpyDtoDAsyncFn =
-        unsafe extern "system" fn(CUdeviceptr, CUdeviceptr, usize, CUcontext) -> CUresult;
+        unsafe extern "system" fn(c_int, *mut CUgraphicsResource, CUstream) -> CUresult;
+    type CuGraphicsSubResourceGetMappedArrayFn =
+        unsafe extern "system" fn(*mut CUarray, CUgraphicsResource, u32, u32) -> CUresult;
+    type CuMemcpy2DFn = unsafe extern "system" fn(*const CUDA_MEMCPY2D) -> CUresult;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CUDA_MEMCPY2D {
+        srcXInBytes: usize,
+        srcY: usize,
+        srcMemoryType: u32,
+        srcHost: *const c_void,
+        srcDevice: CUdeviceptr,
+        srcArray: CUarray,
+        srcPitch: usize,
+        dstXInBytes: usize,
+        dstY: usize,
+        dstMemoryType: u32,
+        dstHost: *mut c_void,
+        dstDevice: CUdeviceptr,
+        dstArray: CUarray,
+        dstPitch: usize,
+        WidthInBytes: usize,
+        Height: usize,
+    }
 
     // CUDA graphics register flags for D3D11
     const CU_GRAPHICS_REGISTER_FLAGS_NONE: u32 = 0x00;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum DecodedSurfaceKind {
+        Nv12,
+        P010,
+    }
+
+    impl DecodedSurfaceKind {
+        fn from_bit_depth(bit_depth_minus8: u8) -> Self {
+            if bit_depth_minus8 > 0 {
+                Self::P010
+            } else {
+                Self::Nv12
+            }
+        }
+
+        fn bytes_per_sample(self) -> usize {
+            match self {
+                Self::Nv12 => 1,
+                Self::P010 => 2,
+            }
+        }
+
+        fn cuda_output_format(self) -> i32 {
+            match self {
+                Self::Nv12 => CUDA_VIDEO_SURFACE_NV12,
+                Self::P010 => CUDA_VIDEO_SURFACE_P016,
+            }
+        }
+    }
 
     // D3D11 shared texture for CUDA-D3D11 interop
     #[allow(dead_code)]
@@ -498,10 +722,11 @@ mod imp {
         shared_handle_uv: isize,
         width: u32,
         height: u32,
+        surface_kind: DecodedSurfaceKind,
     }
 
     impl D3D11SharedTexture {
-        fn new(width: u32, height: u32) -> Result<Self, String> {
+        fn new(width: u32, height: u32, surface_kind: DecodedSurfaceKind) -> Result<Self, String> {
             unsafe {
                 // Create D3D11 device
                 let mut device = None::<ID3D11Device>;
@@ -521,91 +746,125 @@ mod imp {
 
                 let device = device.ok_or("缺少 D3D11 device")?;
                 let context = context.ok_or("缺少 D3D11 context")?;
+                Self::from_device(device, context, width, height, surface_kind)
+            }
+        }
 
-                // Create Y plane texture (R8, single channel, shared)
-                let y_desc = D3D11_TEXTURE2D_DESC {
-                    Width: width,
-                    Height: height,
-                    MipLevels: 1,
-                    ArraySize: 1,
-                    Format: DXGI_FORMAT_R8_UNORM,
-                    SampleDesc: DXGI_SAMPLE_DESC {
-                        Count: 1,
-                        Quality: 0,
-                    },
-                    Usage: D3D11_USAGE_DEFAULT,
-                    BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
-                    CPUAccessFlags: 0,
-                    MiscFlags: D3D11_RESOURCE_MISC_SHARED.0 as u32,
-                };
+        unsafe fn new_with_device_ptr(
+            width: u32,
+            height: u32,
+            surface_kind: DecodedSurfaceKind,
+            device_ptr: *mut c_void,
+        ) -> Result<Self, String> {
+            if device_ptr.is_null() {
+                return Err("D3D11 device pointer is null".to_string());
+            }
 
-                let mut y_texture = None::<ID3D11Texture2D>;
+            let device = unsafe {
+                ID3D11Device::from_raw_borrowed(&device_ptr)
+                    .ok_or("D3D11 device pointer is invalid")?
+                    .clone()
+            };
+            let context = unsafe { device.GetImmediateContext() }
+                .map_err(|e| format!("获取外部 D3D11 immediate context 失败: {e}"))?;
+            Self::from_device(device, context, width, height, surface_kind)
+        }
+
+        fn from_device(
+            device: ID3D11Device,
+            context: ID3D11DeviceContext,
+            width: u32,
+            height: u32,
+            surface_kind: DecodedSurfaceKind,
+        ) -> Result<Self, String> {
+            let (y_format, uv_format) = match surface_kind {
+                DecodedSurfaceKind::Nv12 => (DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM),
+                DecodedSurfaceKind::P010 => (DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R16G16_UNORM),
+            };
+            // Create Y plane texture (R8, single channel, shared)
+            let y_desc = D3D11_TEXTURE2D_DESC {
+                Width: width,
+                Height: height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: y_format,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: D3D11_RESOURCE_MISC_SHARED.0 as u32,
+            };
+
+            let mut y_texture = None::<ID3D11Texture2D>;
+            unsafe {
                 device
                     .CreateTexture2D(&y_desc, None, Some(&mut y_texture))
                     .map_err(|e| format!("创建 Y 纹理失败: {}", e))?;
-                let y_texture = y_texture.ok_or("缺少 Y 纹理")?;
+            }
+            let y_texture = y_texture.ok_or("缺少 Y 纹理")?;
 
-                // Create UV plane texture (R8G8, two channels, shared)
-                let uv_desc = D3D11_TEXTURE2D_DESC {
-                    Width: width / 2,
-                    Height: height / 2,
-                    MipLevels: 1,
-                    ArraySize: 1,
-                    Format: DXGI_FORMAT_R8G8_UNORM,
-                    SampleDesc: DXGI_SAMPLE_DESC {
-                        Count: 1,
-                        Quality: 0,
-                    },
-                    Usage: D3D11_USAGE_DEFAULT,
-                    BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
-                    CPUAccessFlags: 0,
-                    MiscFlags: D3D11_RESOURCE_MISC_SHARED.0 as u32,
-                };
+            // Create UV plane texture (R8G8, two channels, shared)
+            let uv_desc = D3D11_TEXTURE2D_DESC {
+                Width: width / 2,
+                Height: height / 2,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: uv_format,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: D3D11_RESOURCE_MISC_SHARED.0 as u32,
+            };
 
-                let mut uv_texture = None::<ID3D11Texture2D>;
+            let mut uv_texture = None::<ID3D11Texture2D>;
+            unsafe {
                 device
                     .CreateTexture2D(&uv_desc, None, Some(&mut uv_texture))
                     .map_err(|e| format!("创建 UV 纹理失败: {}", e))?;
-                let uv_texture = uv_texture.ok_or("缺少 UV 纹理")?;
-
-                // Get shared handles using IDXGIResource::GetSharedHandle
-                let y_resource: IDXGIResource = y_texture
-                    .cast()
-                    .map_err(|e| format!("转换 Y 纹理到 IDXGIResource 失败: {}", e))?;
-                let shared_handle_y = y_resource
-                    .GetSharedHandle()
-                    .map_err(|e| format!("获取 Y 共享句柄失败: {}", e))?;
-
-                let uv_resource: IDXGIResource = uv_texture
-                    .cast()
-                    .map_err(|e| format!("转换 UV 纹理到 IDXGIResource 失败: {}", e))?;
-                let shared_handle_uv = uv_resource
-                    .GetSharedHandle()
-                    .map_err(|e| format!("获取 UV 共享句柄失败: {}", e))?;
-
-                Ok(Self {
-                    device,
-                    context,
-                    y_texture,
-                    uv_texture,
-                    shared_handle_y: shared_handle_y.0 as isize,
-                    shared_handle_uv: shared_handle_uv.0 as isize,
-                    width,
-                    height,
-                })
             }
+            let uv_texture = uv_texture.ok_or("缺少 UV 纹理")?;
+
+            // Get shared handles using IDXGIResource::GetSharedHandle
+            let y_resource: IDXGIResource = y_texture
+                .cast()
+                .map_err(|e| format!("转换 Y 纹理到 IDXGIResource 失败: {}", e))?;
+            let shared_handle_y = unsafe { y_resource.GetSharedHandle() }
+                .map_err(|e| format!("获取 Y 共享句柄失败: {}", e))?;
+
+            let uv_resource: IDXGIResource = uv_texture
+                .cast()
+                .map_err(|e| format!("转换 UV 纹理到 IDXGIResource 失败: {}", e))?;
+            let shared_handle_uv = unsafe { uv_resource.GetSharedHandle() }
+                .map_err(|e| format!("获取 UV 共享句柄失败: {}", e))?;
+
+            Ok(Self {
+                device,
+                context,
+                y_texture,
+                uv_texture,
+                shared_handle_y: shared_handle_y.0 as isize,
+                shared_handle_uv: shared_handle_uv.0 as isize,
+                width,
+                height,
+                surface_kind,
+            })
         }
 
         /// Get raw pointer to Y texture for CUDA-D3D11 interop
         fn y_texture_ptr(&self) -> *mut c_void {
-            let com_ptr: *const ID3D11Texture2D = &self.y_texture;
-            com_ptr as *const c_void as *mut c_void
+            self.y_texture.as_raw()
         }
 
         /// Get raw pointer to UV texture for CUDA-D3D11 interop
         fn uv_texture_ptr(&self) -> *mut c_void {
-            let com_ptr: *const ID3D11Texture2D = &self.uv_texture;
-            com_ptr as *const c_void as *mut c_void
+            self.uv_texture.as_raw()
         }
     }
 
@@ -856,8 +1115,8 @@ mod imp {
         cu_graphics_unregister_resource: Option<CuGraphicsUnregisterResourceFn>,
         cu_graphics_map_resources: Option<CuGraphicsMapResourcesFn>,
         cu_graphics_unmap_resources: Option<CuGraphicsUnmapResourcesFn>,
-        cu_graphics_resource_get_mapped_pointer: Option<CuGraphicsResourceGetMappedPointerFn>,
-        cu_memcpy_dto_d_async: Option<CuMemcpyDtoDAsyncFn>,
+        cu_graphics_sub_resource_get_mapped_array: Option<CuGraphicsSubResourceGetMappedArrayFn>,
+        cu_memcpy_2d: Option<CuMemcpy2DFn>,
     }
 
     impl CudaApi {
@@ -885,10 +1144,10 @@ mod imp {
                 cu_graphics_unmap_resources: module
                     .load_symbol(b"cuGraphicsUnmapResources\0".as_ref())
                     .ok(),
-                cu_graphics_resource_get_mapped_pointer: module
-                    .load_symbol(b"cuGraphicsResourceGetMappedPointer_v2\0".as_ref())
+                cu_graphics_sub_resource_get_mapped_array: module
+                    .load_symbol(b"cuGraphicsSubResourceGetMappedArray\0".as_ref())
                     .ok(),
-                cu_memcpy_dto_d_async: module.load_symbol(b"cuMemcpyDtoDAsync_v2\0".as_ref()).ok(),
+                cu_memcpy_2d: module.load_symbol(b"cuMemcpy2D_v2\0".as_ref()).ok(),
                 _module: module,
             })
         }
@@ -944,6 +1203,7 @@ mod imp {
         parser_codec: i32,
         callback_state: Box<CallbackState>,
         shared_texture: Option<D3D11SharedTexture>,
+        external_d3d11_device_ptr: Option<*mut c_void>,
         enable_shared_texture: bool,
     }
 
@@ -1028,8 +1288,8 @@ mod imp {
         cu_graphics_unregister_resource: Option<CuGraphicsUnregisterResourceFn>,
         cu_graphics_map_resources: Option<CuGraphicsMapResourcesFn>,
         cu_graphics_unmap_resources: Option<CuGraphicsUnmapResourcesFn>,
-        cu_graphics_resource_get_mapped_pointer: Option<CuGraphicsResourceGetMappedPointerFn>,
-        cu_memcpy_dto_d_async: Option<CuMemcpyDtoDAsyncFn>,
+        cu_graphics_sub_resource_get_mapped_array: Option<CuGraphicsSubResourceGetMappedArrayFn>,
+        cu_memcpy_2d: Option<CuMemcpy2DFn>,
         // Registered CUDA graphics resources for D3D11 textures
         cuda_resource_y: Option<CUgraphicsResource>,
         cuda_resource_uv: Option<CUgraphicsResource>,
@@ -1057,9 +1317,24 @@ mod imp {
             codec: super::NvdecCodecKind,
             output_mode: NvdecOutputMode,
         ) -> Result<Self, String> {
+            Self::new_for_codec_with_d3d11_device_ptr(codec, output_mode, None)
+        }
+
+        pub fn new_for_codec_with_d3d11_device_ptr(
+            codec: super::NvdecCodecKind,
+            output_mode: NvdecOutputMode,
+            external_d3d11_device_ptr: Option<*mut c_void>,
+        ) -> Result<Self, String> {
             let parser_codec = match codec {
                 super::NvdecCodecKind::H264 => CUDA_VIDEO_CODEC_H264,
+                super::NvdecCodecKind::Hevc | super::NvdecCodecKind::HevcMain10 => {
+                    CUDA_VIDEO_CODEC_HEVC
+                }
                 super::NvdecCodecKind::Av1 => CUDA_VIDEO_CODEC_AV1,
+            };
+            let initial_probe_bit_depth = match codec {
+                super::NvdecCodecKind::HevcMain10 => 2,
+                _ => 0,
             };
 
             let cuda = CudaApi::load()?;
@@ -1084,14 +1359,17 @@ mod imp {
 
             if let Some(get_caps) = cuvid.cuvid_get_decoder_caps {
                 let mut caps = CUVIDDECODECAPS {
-                    eCodecType: CUDA_VIDEO_CODEC_H264,
+                    eCodecType: parser_codec,
                     eChromaFormat: CUDA_VIDEO_CHROMA_420,
-                    nBitDepthMinus8: 0,
+                    nBitDepthMinus8: initial_probe_bit_depth,
                     ..Default::default()
                 };
                 let caps_result = unsafe { get_caps(&mut caps) };
                 if caps_result == CUDA_SUCCESS && caps.bIsSupported == 0 {
-                    return Err("cuvidGetDecoderCaps reported H264 NVDEC unsupported".to_string());
+                    return Err(format!(
+                        "cuvidGetDecoderCaps reported {} NVDEC unsupported",
+                        describe_codec(parser_codec)
+                    ));
                 }
             }
 
@@ -1131,9 +1409,9 @@ mod imp {
                 cu_graphics_unregister_resource: cuda.cu_graphics_unregister_resource,
                 cu_graphics_map_resources: cuda.cu_graphics_map_resources,
                 cu_graphics_unmap_resources: cuda.cu_graphics_unmap_resources,
-                cu_graphics_resource_get_mapped_pointer: cuda
-                    .cu_graphics_resource_get_mapped_pointer,
-                cu_memcpy_dto_d_async: cuda.cu_memcpy_dto_d_async,
+                cu_graphics_sub_resource_get_mapped_array: cuda
+                    .cu_graphics_sub_resource_get_mapped_array,
+                cu_memcpy_2d: cuda.cu_memcpy_2d,
                 // Registered CUDA resources (initialized when shared texture is created)
                 cuda_resource_y: None,
                 cuda_resource_uv: None,
@@ -1162,13 +1440,13 @@ mod imp {
                 ulClockRate: 10_000_000,
                 ulErrorThreshold: 0,
                 ulMaxDisplayDelay: 0,
-                bitfields: 0,
+                bitfields: parser_flags(parser_codec),
                 uReserved1: [0; 4],
                 pUserData: callback_state.as_mut() as *mut CallbackState as *mut c_void,
                 pfnSequenceCallback: Some(sequence_callback),
                 pfnDecodePicture: Some(decode_callback),
                 pfnDisplayPicture: Some(display_callback),
-                pfnGetOperatingPoint: None,
+                pfnGetOperatingPoint: operating_point_callback_for(parser_codec),
                 pvReserved2: [ptr::null_mut(); 6],
                 pExtVideoInfo: ptr::null_mut(),
             };
@@ -1189,6 +1467,7 @@ mod imp {
                 parser_codec,
                 callback_state,
                 shared_texture: None,
+                external_d3d11_device_ptr,
                 enable_shared_texture: false, // Disabled by default
             })
         }
@@ -1218,26 +1497,41 @@ mod imp {
                 return Err(message);
             }
 
-            if self.parser_codec == CUDA_VIDEO_CODEC_H264 && !looks_like_annexb(access_unit) {
+            if matches!(
+                self.parser_codec,
+                CUDA_VIDEO_CODEC_H264 | CUDA_VIDEO_CODEC_HEVC
+            ) && !looks_like_annexb(access_unit)
+            {
                 self.callback_state.clear_access_unit_state();
-                let message =
-                    "nvdec input validation failed: expected H264 Annex-B access unit".to_string();
+                let message = format!(
+                    "nvdec input validation failed: expected {} Annex-B access unit",
+                    describe_codec(self.parser_codec)
+                );
                 self.callback_state.last_error = Some(message.clone());
                 self.callback_state.diagnostics.last_stage = Some("input".to_string());
                 self.callback_state.diagnostics.last_api = Some("push_access_unit".to_string());
-                self.callback_state.diagnostics.last_error_description =
-                    Some("expected H264 Annex-B start code".to_string());
+                self.callback_state.diagnostics.last_error_description = Some(format!(
+                    "expected {} Annex-B start code",
+                    describe_codec(self.parser_codec)
+                ));
                 return Err(message);
             }
 
             self.callback_state.clear_access_unit_state();
 
-            let payload_size = u32::try_from(access_unit.len())
+            let converted_access_unit = if self.parser_codec == CUDA_VIDEO_CODEC_AV1 {
+                av1_low_overhead_obu_to_annexb(access_unit)
+            } else {
+                None
+            };
+            let packet_payload = converted_access_unit.as_deref().unwrap_or(access_unit);
+
+            let payload_size = u32::try_from(packet_payload.len())
                 .map_err(|_| "access unit too large for NVDEC packet".to_string())?;
             let mut packet = CUVIDSOURCEDATAPACKET {
                 flags: CUVID_PKT_ENDOFPICTURE,
                 payload_size,
-                payload: access_unit.as_ptr(),
+                payload: packet_payload.as_ptr(),
                 timestamp: 0,
             };
 
@@ -1272,7 +1566,25 @@ mod imp {
             if self.enable_shared_texture && self.shared_texture.is_none() {
                 let (width, height) = self.callback_state.output_dimensions_u32();
                 if width > 0 && height > 0 {
-                    match D3D11SharedTexture::new(width, height) {
+                    let surface_kind = self
+                        .callback_state
+                        .decoder_config
+                        .as_ref()
+                        .map(|config| DecodedSurfaceKind::from_bit_depth(config.bit_depth_minus8))
+                        .unwrap_or(DecodedSurfaceKind::Nv12);
+                    let texture_result = if let Some(device_ptr) = self.external_d3d11_device_ptr {
+                        unsafe {
+                            D3D11SharedTexture::new_with_device_ptr(
+                                width,
+                                height,
+                                surface_kind,
+                                device_ptr,
+                            )
+                        }
+                    } else {
+                        D3D11SharedTexture::new(width, height, surface_kind)
+                    };
+                    match texture_result {
                         Ok(texture) => {
                             self.callback_state.shared_texture_y = Some(texture.shared_handle_y);
                             self.callback_state.shared_texture_uv = Some(texture.shared_handle_uv);
@@ -1458,13 +1770,14 @@ mod imp {
         #[allow(clippy::too_many_arguments)]
         fn try_gpu_zero_copy(
             &mut self,
-            cuda_context: CUcontext,
+            _cuda_context: CUcontext,
             d3d11_y_texture: *mut c_void,
             d3d11_uv_texture: *mut c_void,
             cuda_src_ptr: CUdeviceptr,
             y_pitch: u32,
-            _width: usize,
+            width: usize,
             height: usize,
+            surface_kind: DecodedSurfaceKind,
         ) -> bool {
             // Check if all required CUDA-D3D11 interop functions are available
             let register_fn = match self.cu_graphics_d3d11_register_resource {
@@ -1483,11 +1796,11 @@ mod imp {
                 Some(f) => f,
                 None => return false,
             };
-            let get_ptr_fn = match self.cu_graphics_resource_get_mapped_pointer {
+            let get_array_fn = match self.cu_graphics_sub_resource_get_mapped_array {
                 Some(f) => f,
                 None => return false,
             };
-            let copy_fn = match self.cu_memcpy_dto_d_async {
+            let copy_fn = match self.cu_memcpy_2d {
                 Some(f) => f,
                 None => return false,
             };
@@ -1497,7 +1810,7 @@ mod imp {
                 let mut resource_y: CUgraphicsResource = ptr::null_mut();
                 let result = unsafe {
                     register_fn(
-                        &mut resource_y as *mut _ as *mut c_void,
+                        &mut resource_y,
                         d3d11_y_texture,
                         CU_GRAPHICS_REGISTER_FLAGS_NONE,
                     )
@@ -1512,7 +1825,7 @@ mod imp {
                 let mut resource_uv: CUgraphicsResource = ptr::null_mut();
                 let result = unsafe {
                     register_fn(
-                        &mut resource_uv as *mut _ as *mut c_void,
+                        &mut resource_uv,
                         d3d11_uv_texture,
                         CU_GRAPHICS_REGISTER_FLAGS_NONE,
                     )
@@ -1527,93 +1840,84 @@ mod imp {
                 self.cuda_resource_uv = Some(resource_uv);
             }
 
-            let resources_y = [self.cuda_resource_y.unwrap()];
-            let resources_uv = [self.cuda_resource_uv.unwrap()];
+            let mut resources = [
+                self.cuda_resource_y.unwrap(),
+                self.cuda_resource_uv.unwrap(),
+            ];
 
             // Map resources for CUDA access
-            let map_result = unsafe { map_fn(1, resources_y.as_ptr() as *mut _, cuda_context) };
+            let map_result = unsafe { map_fn(2, resources.as_mut_ptr(), ptr::null_mut()) };
             if map_result != CUDA_SUCCESS {
                 return false;
             }
 
-            let map_result_uv = unsafe { map_fn(1, resources_uv.as_ptr() as *mut _, cuda_context) };
-            if map_result_uv != CUDA_SUCCESS {
-                unsafe { unmap_fn(1, resources_y.as_ptr() as *mut _, cuda_context) };
+            let mut y_array: CUarray = ptr::null_mut();
+            let y_array_result =
+                unsafe { get_array_fn(&mut y_array, self.cuda_resource_y.unwrap(), 0, 0) };
+            if y_array_result != CUDA_SUCCESS {
+                unsafe { unmap_fn(2, resources.as_mut_ptr(), ptr::null_mut()) };
                 return false;
             }
 
-            // Get mapped pointers for D3D11 textures
-            let mut d3d_y_ptr: CUdeviceptr = 0;
-            let mut d3d_y_size: usize = 0;
-            let ptr_result = unsafe {
-                get_ptr_fn(
-                    &mut d3d_y_ptr,
-                    &mut d3d_y_size,
-                    self.cuda_resource_y.unwrap(),
-                )
+            let mut uv_array: CUarray = ptr::null_mut();
+            let uv_array_result =
+                unsafe { get_array_fn(&mut uv_array, self.cuda_resource_uv.unwrap(), 0, 0) };
+            if uv_array_result != CUDA_SUCCESS {
+                unsafe { unmap_fn(2, resources.as_mut_ptr(), ptr::null_mut()) };
+                return false;
+            }
+
+            let copy_y = CUDA_MEMCPY2D {
+                srcXInBytes: 0,
+                srcY: 0,
+                srcMemoryType: CU_MEMORYTYPE_DEVICE,
+                srcHost: ptr::null(),
+                srcDevice: cuda_src_ptr,
+                srcArray: ptr::null_mut(),
+                srcPitch: y_pitch as usize,
+                dstXInBytes: 0,
+                dstY: 0,
+                dstMemoryType: CU_MEMORYTYPE_ARRAY,
+                dstHost: ptr::null_mut(),
+                dstDevice: 0,
+                dstArray: y_array,
+                dstPitch: 0,
+                WidthInBytes: width * surface_kind.bytes_per_sample(),
+                Height: height,
             };
-            if ptr_result != CUDA_SUCCESS {
-                unsafe {
-                    unmap_fn(1, resources_uv.as_ptr() as *mut _, cuda_context);
-                    unmap_fn(1, resources_y.as_ptr() as *mut _, cuda_context);
-                };
-                return false;
-            }
-
-            let mut d3d_uv_ptr: CUdeviceptr = 0;
-            let mut d3d_uv_size: usize = 0;
-            let ptr_result_uv = unsafe {
-                get_ptr_fn(
-                    &mut d3d_uv_ptr,
-                    &mut d3d_uv_size,
-                    self.cuda_resource_uv.unwrap(),
-                )
-            };
-            if ptr_result_uv != CUDA_SUCCESS {
-                unsafe {
-                    unmap_fn(1, resources_uv.as_ptr() as *mut _, cuda_context);
-                    unmap_fn(1, resources_y.as_ptr() as *mut _, cuda_context);
-                };
-                return false;
-            }
-
-            // Calculate sizes
-            let y_plane_bytes = y_pitch as usize * height;
-            let uv_plane_bytes = y_pitch as usize * (height / 2);
-
-            // GPU→GPU copy: Y plane
-            let copy_result =
-                unsafe { copy_fn(d3d_y_ptr, cuda_src_ptr, y_plane_bytes, cuda_context) };
+            let copy_result = unsafe { copy_fn(&copy_y) };
             if copy_result != CUDA_SUCCESS {
-                unsafe {
-                    unmap_fn(1, resources_uv.as_ptr() as *mut _, cuda_context);
-                    unmap_fn(1, resources_y.as_ptr() as *mut _, cuda_context);
-                };
+                unsafe { unmap_fn(2, resources.as_mut_ptr(), ptr::null_mut()) };
                 return false;
             }
 
-            // GPU→GPU copy: UV plane (offset from Y plane in source)
-            let uv_src_offset = y_plane_bytes as CUdeviceptr;
-            let copy_result_uv = unsafe {
-                copy_fn(
-                    d3d_uv_ptr,
-                    cuda_src_ptr + uv_src_offset,
-                    uv_plane_bytes,
-                    cuda_context,
-                )
+            let copy_uv = CUDA_MEMCPY2D {
+                srcXInBytes: 0,
+                srcY: 0,
+                srcMemoryType: CU_MEMORYTYPE_DEVICE,
+                srcHost: ptr::null(),
+                srcDevice: cuda_src_ptr + (y_pitch as CUdeviceptr * height as CUdeviceptr),
+                srcArray: ptr::null_mut(),
+                srcPitch: y_pitch as usize,
+                dstXInBytes: 0,
+                dstY: 0,
+                dstMemoryType: CU_MEMORYTYPE_ARRAY,
+                dstHost: ptr::null_mut(),
+                dstDevice: 0,
+                dstArray: uv_array,
+                dstPitch: 0,
+                WidthInBytes: width * surface_kind.bytes_per_sample(),
+                Height: height / 2,
             };
+            let copy_result_uv = unsafe { copy_fn(&copy_uv) };
             if copy_result_uv != CUDA_SUCCESS {
-                unsafe {
-                    unmap_fn(1, resources_uv.as_ptr() as *mut _, cuda_context);
-                    unmap_fn(1, resources_y.as_ptr() as *mut _, cuda_context);
-                };
+                unsafe { unmap_fn(2, resources.as_mut_ptr(), ptr::null_mut()) };
                 return false;
             }
 
             // Unmap resources
             unsafe {
-                unmap_fn(1, resources_uv.as_ptr() as *mut _, cuda_context);
-                unmap_fn(1, resources_y.as_ptr() as *mut _, cuda_context);
+                unmap_fn(2, resources.as_mut_ptr(), ptr::null_mut());
             };
 
             true
@@ -1655,8 +1959,8 @@ mod imp {
                 return SequenceChangeDecision::Unsupported("chroma format change");
             }
 
-            if next.bit_depth_minus8 != 0 {
-                return SequenceChangeDecision::Unsupported("bit depth change");
+            if self.bit_depth_minus8 != next.bit_depth_minus8 {
+                return SequenceChangeDecision::Recreate("bit depth changed");
             }
 
             if self.coded_width != next.coded_width || self.coded_height != next.coded_height {
@@ -1677,7 +1981,9 @@ mod imp {
         }
 
         fn evaluate_reconfigure(&self, next: &SequenceFormat) -> ReconfigureDecision {
-            if next.chroma_format != CUDA_VIDEO_CHROMA_420 || next.bit_depth_minus8 != 0 {
+            if next.chroma_format != CUDA_VIDEO_CHROMA_420
+                || self.bit_depth_minus8 != next.bit_depth_minus8
+            {
                 return ReconfigureDecision::SkipUnsupported;
             }
 
@@ -1818,6 +2124,19 @@ mod imp {
         next_sequence.min_decode_surfaces.max(1) as c_int
     }
 
+    unsafe extern "system" fn av1_operating_point_callback(
+        _user_data: *mut c_void,
+        _operating_point_info: *mut c_void,
+    ) -> c_int {
+        0
+    }
+
+    fn operating_point_callback_for(
+        codec: i32,
+    ) -> Option<unsafe extern "system" fn(*mut c_void, *mut c_void) -> c_int> {
+        (codec == CUDA_VIDEO_CODEC_AV1).then_some(av1_operating_point_callback)
+    }
+
     unsafe extern "system" fn decode_callback(
         user_data: *mut c_void,
         pic_params: *mut CUVIDPICPARAMS,
@@ -1895,6 +2214,11 @@ mod imp {
         }
 
         let (width, height) = state.output_dimensions();
+        let surface_kind = state
+            .decoder_config
+            .as_ref()
+            .map(|config| DecodedSurfaceKind::from_bit_depth(config.bit_depth_minus8))
+            .unwrap_or(DecodedSurfaceKind::Nv12);
 
         // Try GPU zero-copy if shared texture mode is enabled
         let gpu_copy_success = if state.use_shared_texture {
@@ -1910,6 +2234,7 @@ mod imp {
                     pitch,
                     width,
                     height,
+                    surface_kind,
                 )
             } else {
                 false
@@ -1924,27 +2249,43 @@ mod imp {
             if let (Some(shared_y), Some(shared_uv)) =
                 (state.shared_texture_y, state.shared_texture_uv)
             {
-                state.frames.push(NvdecDecodedFrame {
-                    width,
-                    height,
-                    data: NvdecDecodedFrameData::D3D11SharedNv12 {
+                let data = match surface_kind {
+                    DecodedSurfaceKind::Nv12 => NvdecDecodedFrameData::D3D11SharedNv12 {
                         shared_handle_y: shared_y,
                         shared_handle_uv: shared_uv,
                         width: width as u32,
                         height: height as u32,
                     },
+                    DecodedSurfaceKind::P010 => NvdecDecodedFrameData::D3D11SharedP010 {
+                        shared_handle_y: shared_y,
+                        shared_handle_uv: shared_uv,
+                        width: width as u32,
+                        height: height as u32,
+                    },
+                };
+                state.frames.push(NvdecDecodedFrame {
+                    width,
+                    height,
+                    data,
                 });
             } else {
                 // Shouldn't happen, but fallback to CPU path
                 let y_plane_bytes = pitch as usize * height;
                 let uv_plane_bytes = pitch as usize * (height / 2);
                 let total = y_plane_bytes + uv_plane_bytes;
-                let mut nv12 = vec![0_u8; total];
+                let mut surface = vec![0_u8; total];
                 let copy_result = unsafe {
-                    (state.cu_memcpy_dtoh)(nv12.as_mut_ptr() as *mut c_void, dev_ptr, total)
+                    (state.cu_memcpy_dtoh)(surface.as_mut_ptr() as *mut c_void, dev_ptr, total)
                 };
                 if copy_result == CUDA_SUCCESS {
-                    push_cpu_decoded_frame(state, width, height, pitch as usize, nv12);
+                    push_cpu_decoded_frame(
+                        state,
+                        width,
+                        height,
+                        pitch as usize,
+                        surface,
+                        surface_kind,
+                    );
                 }
             }
         } else {
@@ -1952,16 +2293,17 @@ mod imp {
             let y_plane_bytes = pitch as usize * height;
             let uv_plane_bytes = pitch as usize * (height / 2);
             let total = y_plane_bytes + uv_plane_bytes;
-            let mut nv12 = vec![0_u8; total];
-            let copy_result =
-                unsafe { (state.cu_memcpy_dtoh)(nv12.as_mut_ptr() as *mut c_void, dev_ptr, total) };
+            let mut surface = vec![0_u8; total];
+            let copy_result = unsafe {
+                (state.cu_memcpy_dtoh)(surface.as_mut_ptr() as *mut c_void, dev_ptr, total)
+            };
             if copy_result != CUDA_SUCCESS {
                 state.record_failure("copy", "cuMemcpyDtoH_v2", copy_result, None);
                 let _ = unsafe { (state.cuvid_unmap_video_frame)(state.decoder, dev_ptr) };
                 return 0;
             }
 
-            push_cpu_decoded_frame(state, width, height, pitch as usize, nv12);
+            push_cpu_decoded_frame(state, width, height, pitch as usize, surface, surface_kind);
         }
 
         let unmap_result = unsafe { (state.cuvid_unmap_video_frame)(state.decoder, dev_ptr) };
@@ -1977,19 +2319,31 @@ mod imp {
         width: usize,
         height: usize,
         pitch: usize,
-        nv12: Vec<u8>,
+        surface: Vec<u8>,
+        surface_kind: DecodedSurfaceKind,
     ) {
-        match state.output_mode {
-            NvdecOutputMode::CpuRgb24 => {
-                let rgb = nv12_to_rgb(&nv12, width, height, pitch);
+        match (state.output_mode, surface_kind) {
+            (NvdecOutputMode::CpuRgb24, DecodedSurfaceKind::Nv12) => {
+                let rgb = nv12_to_rgb(&surface, width, height, pitch);
                 state
                     .frames
                     .push(NvdecDecodedFrame::from_cpu_rgb24(width, height, rgb));
             }
-            NvdecOutputMode::CpuNv12 => {
+            (NvdecOutputMode::CpuRgb24, DecodedSurfaceKind::P010) => {
+                let rgb = p010_to_rgb(&surface, width, height, pitch);
                 state
                     .frames
-                    .push(NvdecDecodedFrame::from_cpu_nv12(width, height, pitch, nv12));
+                    .push(NvdecDecodedFrame::from_cpu_rgb24(width, height, rgb));
+            }
+            (NvdecOutputMode::CpuNv12, DecodedSurfaceKind::Nv12) => {
+                state.frames.push(NvdecDecodedFrame::from_cpu_nv12(
+                    width, height, pitch, surface,
+                ));
+            }
+            (NvdecOutputMode::CpuNv12, DecodedSurfaceKind::P010) => {
+                state.frames.push(NvdecDecodedFrame::from_cpu_p010(
+                    width, height, pitch, surface,
+                ));
             }
         }
     }
@@ -2177,7 +2531,8 @@ mod imp {
                 right: config.display_width as i16,
                 bottom: config.display_height as i16,
             },
-            OutputFormat: CUDA_VIDEO_SURFACE_NV12,
+            OutputFormat: DecodedSurfaceKind::from_bit_depth(config.bit_depth_minus8)
+                .cuda_output_format(),
             DeinterlaceMode: CUDA_VIDEO_DEINTERLACE_WEAVE,
             ulTargetWidth: config.display_width,
             ulTargetHeight: config.display_height,
@@ -2352,29 +2707,31 @@ mod imp {
     }
 
     fn evaluate_support(request: NvdecSupportRequest) -> NvdecSupportDecision {
+        if request.chroma_format != CUDA_VIDEO_CHROMA_420 {
+            return NvdecSupportDecision::Unsupported("unsupported chroma format");
+        }
+
         match request.codec {
-            NvdecCodec::H264 => {}
-            NvdecCodec::Hevc => {
+            NvdecCodec::H264 => {
                 if request.bit_depth_minus8 > 0 {
-                    return NvdecSupportDecision::Unsupported("HEVC Main10 not wired yet");
+                    return NvdecSupportDecision::Unsupported("10-bit not wired yet");
                 }
-                return NvdecSupportDecision::Unsupported("HEVC not wired yet");
+            }
+            NvdecCodec::Hevc => {
+                if !matches!(request.bit_depth_minus8, 0 | 2) {
+                    return NvdecSupportDecision::Unsupported("unsupported HEVC bit depth");
+                }
             }
             NvdecCodec::Av1 => {
                 // AV1 decode support requires Ada Lovelace or newer GPU
                 // Let capability probing determine if it's available
+                if request.bit_depth_minus8 > 0 {
+                    return NvdecSupportDecision::Unsupported("10-bit not wired yet");
+                }
             }
             NvdecCodec::Unknown(_) => {
                 return NvdecSupportDecision::Unsupported("unknown codec");
             }
-        }
-
-        if request.bit_depth_minus8 > 0 {
-            return NvdecSupportDecision::Unsupported("10-bit not wired yet");
-        }
-
-        if request.chroma_format != CUDA_VIDEO_CHROMA_420 {
-            return NvdecSupportDecision::Unsupported("unsupported chroma format");
         }
 
         NvdecSupportDecision::Supported
@@ -2478,6 +2835,92 @@ mod imp {
         }
     }
 
+    fn parser_flags(codec: i32) -> u32 {
+        if codec == CUDA_VIDEO_CODEC_AV1 {
+            CUVID_PARSER_ANNEXB
+        } else {
+            0
+        }
+    }
+
+    fn av1_low_overhead_obu_to_annexb(buf: &[u8]) -> Option<Vec<u8>> {
+        let mut offset = 0_usize;
+        let mut frame_unit = Vec::with_capacity(buf.len() + 16);
+        while offset < buf.len() {
+            let header_offset = offset;
+            let header = *buf.get(offset)?;
+            if header & 0x80 != 0 || header & 0x01 != 0 {
+                return None;
+            }
+            offset += 1;
+
+            let has_extension = header & 0x04 != 0;
+            if has_extension {
+                buf.get(offset)?;
+                offset += 1;
+            }
+
+            if header & 0x02 == 0 {
+                return None;
+            }
+
+            let (payload_len, size_len) = read_leb128(&buf[offset..])?;
+            offset = offset.checked_add(size_len)?;
+            let payload_len = usize::try_from(payload_len).ok()?;
+            let payload_end = offset.checked_add(payload_len)?;
+            if payload_end > buf.len() {
+                return None;
+            }
+
+            let header_len = 1 + usize::from(has_extension);
+            write_leb128((header_len + payload_len) as u64, &mut frame_unit);
+            frame_unit.push(header & !0x02);
+            if has_extension {
+                frame_unit.push(buf[header_offset + 1]);
+            }
+            frame_unit.extend_from_slice(&buf[offset..payload_end]);
+            offset = payload_end;
+        }
+
+        if frame_unit.is_empty() {
+            return None;
+        }
+
+        let mut temporal_unit = Vec::with_capacity(frame_unit.len() + 8);
+        write_leb128(frame_unit.len() as u64, &mut temporal_unit);
+        temporal_unit.extend_from_slice(&frame_unit);
+
+        let mut out = Vec::with_capacity(temporal_unit.len() + 8);
+        write_leb128(temporal_unit.len() as u64, &mut out);
+        out.extend_from_slice(&temporal_unit);
+        Some(out)
+    }
+
+    fn read_leb128(buf: &[u8]) -> Option<(u64, usize)> {
+        let mut value = 0_u64;
+        for (i, byte) in buf.iter().take(8).enumerate() {
+            value |= u64::from(byte & 0x7f) << (i * 7);
+            if byte & 0x80 == 0 {
+                return Some((value, i + 1));
+            }
+        }
+        None
+    }
+
+    fn write_leb128(mut value: u64, out: &mut Vec<u8>) {
+        loop {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if value == 0 {
+                break;
+            }
+        }
+    }
+
     fn looks_like_annexb(buf: &[u8]) -> bool {
         buf.len() >= 4
             && ((buf[0] == 0 && buf[1] == 0 && buf[2] == 1)
@@ -2516,6 +2959,46 @@ mod imp {
         rgb
     }
 
+    fn p010_to_rgb(p010: &[u8], width: usize, height: usize, pitch: usize) -> Vec<u8> {
+        let mut rgb = vec![0_u8; width * height * 3];
+        let uv_base = pitch * height;
+
+        for y in 0..height {
+            let y_row = y * pitch;
+            let uv_row = uv_base + (y / 2) * pitch;
+            for x in 0..width {
+                let y_idx = y_row + x * 2;
+                let uv_idx = uv_row + (x / 2) * 4;
+                if y_idx + 1 >= p010.len() || uv_idx + 3 >= p010.len() {
+                    continue;
+                }
+
+                let y10 = u16::from_le_bytes([p010[y_idx], p010[y_idx + 1]]) >> 6;
+                let u10 = u16::from_le_bytes([p010[uv_idx], p010[uv_idx + 1]]) >> 6;
+                let v10 = u16::from_le_bytes([p010[uv_idx + 2], p010[uv_idx + 3]]) >> 6;
+
+                let y_val = y10 as i32;
+                let u = u10 as i32 - 512;
+                let v = v10 as i32 - 512;
+
+                let r = y_val + ((1436 * v) >> 10);
+                let g = y_val - ((352 * u + 731 * v) >> 10);
+                let b = y_val + ((1815 * u) >> 10);
+                let out_idx = (y * width + x) * 3;
+                rgb[out_idx] = clamp_10bit_to_8bit(r);
+                rgb[out_idx + 1] = clamp_10bit_to_8bit(g);
+                rgb[out_idx + 2] = clamp_10bit_to_8bit(b);
+            }
+        }
+
+        rgb
+    }
+
+    #[inline]
+    fn clamp_10bit_to_8bit(value: i32) -> u8 {
+        ((value.clamp(0, 1023) + 2) >> 2) as u8
+    }
+
     #[inline]
     fn clamp_i32(value: i32) -> u8 {
         value.clamp(0, 255) as u8
@@ -2524,9 +3007,11 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::{
-            decoder_output_dimensions, evaluate_support, DecoderConfig, NvdecCapabilityRequest,
-            NvdecCodec, NvdecSupportDecision, NvdecSupportRequest, SequenceChangeDecision,
-            SequenceFormat, CUDA_VIDEO_CHROMA_420, CUDA_VIDEO_CODEC_H264,
+            decoder_output_dimensions, evaluate_support, DecodedSurfaceKind, DecoderConfig,
+            NvdecCapabilityRequest, NvdecCodec, NvdecSupportDecision, NvdecSupportRequest,
+            SequenceChangeDecision, SequenceFormat, CUDA_VIDEO_CHROMA_420, CUDA_VIDEO_CODEC_AV1,
+            CUDA_VIDEO_CODEC_H264, CUDA_VIDEO_CODEC_HEVC, CUDA_VIDEO_SURFACE_P016,
+            CUVID_PARSER_ANNEXB,
         };
 
         fn baseline_sequence() -> SequenceFormat {
@@ -2577,6 +3062,31 @@ mod imp {
         }
 
         #[test]
+        fn av1_parser_uses_annex_b_and_operating_point_callback() {
+            assert_eq!(
+                super::parser_flags(CUDA_VIDEO_CODEC_AV1),
+                CUVID_PARSER_ANNEXB
+            );
+            assert!(super::operating_point_callback_for(CUDA_VIDEO_CODEC_AV1).is_some());
+            assert_eq!(super::parser_flags(CUDA_VIDEO_CODEC_H264), 0);
+            assert!(super::operating_point_callback_for(CUDA_VIDEO_CODEC_H264).is_none());
+        }
+
+        #[test]
+        fn nvdecode_codec_constants_match_sdk_enum_order() {
+            assert_eq!(CUDA_VIDEO_CODEC_H264, 4);
+            assert_eq!(CUDA_VIDEO_CODEC_HEVC, 8);
+            assert_eq!(CUDA_VIDEO_CODEC_AV1, 11);
+        }
+
+        #[test]
+        fn av1_low_overhead_obu_converts_to_annex_b_temporal_unit() {
+            let low_overhead = [0x12, 0x00, 0x0a, 0x01, 0xaa];
+            let annexb = super::av1_low_overhead_obu_to_annexb(&low_overhead).unwrap();
+            assert_eq!(annexb, vec![0x06, 0x05, 0x01, 0x10, 0x02, 0x08, 0xaa]);
+        }
+
+        #[test]
         fn support_matrix_accepts_av1_8bit_420() {
             let request = NvdecSupportRequest {
                 codec: NvdecCodec::Av1,
@@ -2588,16 +3098,32 @@ mod imp {
         }
 
         #[test]
-        fn support_matrix_rejects_hevc() {
+        fn support_matrix_accepts_hevc_8bit_420() {
             let request = NvdecSupportRequest {
                 codec: NvdecCodec::Hevc,
                 bit_depth_minus8: 0,
                 chroma_format: CUDA_VIDEO_CHROMA_420,
             };
 
+            assert_eq!(evaluate_support(request), NvdecSupportDecision::Supported);
+        }
+
+        #[test]
+        fn support_matrix_accepts_hevc_main10_420() {
+            let request = NvdecSupportRequest {
+                codec: NvdecCodec::Hevc,
+                bit_depth_minus8: 2,
+                chroma_format: CUDA_VIDEO_CHROMA_420,
+            };
+
+            assert_eq!(evaluate_support(request), NvdecSupportDecision::Supported);
+        }
+
+        #[test]
+        fn hevc_main10_uses_p016_decode_surface() {
             assert_eq!(
-                evaluate_support(request),
-                NvdecSupportDecision::Unsupported("HEVC not wired yet")
+                DecodedSurfaceKind::from_bit_depth(2).cuda_output_format(),
+                CUDA_VIDEO_SURFACE_P016
             );
         }
 
@@ -2630,25 +3156,19 @@ mod imp {
         }
 
         #[test]
-        fn capability_probe_reports_hevc_as_not_wired() {
+        fn capability_probe_reports_hevc_as_wired() {
             let request = NvdecCapabilityRequest::new("hevc", 0, CUDA_VIDEO_CHROMA_420);
             let wired = evaluate_support(request.to_support_request());
 
-            assert_eq!(
-                wired,
-                NvdecSupportDecision::Unsupported("HEVC not wired yet")
-            );
+            assert_eq!(wired, NvdecSupportDecision::Supported);
         }
 
         #[test]
-        fn capability_probe_reports_hevc_main10_as_not_wired() {
+        fn capability_probe_reports_hevc_main10_as_wired() {
             let request = NvdecCapabilityRequest::new("hevc", 2, CUDA_VIDEO_CHROMA_420);
             let wired = evaluate_support(request.to_support_request());
 
-            assert_eq!(
-                wired,
-                NvdecSupportDecision::Unsupported("HEVC Main10 not wired yet")
-            );
+            assert_eq!(wired, NvdecSupportDecision::Supported);
         }
 
         #[test]
@@ -2682,14 +3202,14 @@ mod imp {
         }
 
         #[test]
-        fn recreate_decision_rejects_bit_depth_change() {
+        fn recreate_decision_recreates_on_bit_depth_change() {
             let mut next = baseline_sequence();
             next.bit_depth_minus8 = 2;
 
             let decision = baseline_config().evaluate_sequence_change(&next);
             assert_eq!(
                 decision,
-                SequenceChangeDecision::Unsupported("bit depth change")
+                SequenceChangeDecision::Recreate("bit depth changed")
             );
         }
 
@@ -2820,12 +3340,12 @@ mod imp {
         #[test]
         #[cfg(windows)]
         fn d3d11_shared_texture_creation() {
-            use super::D3D11SharedTexture;
+            use super::{D3D11SharedTexture, DecodedSurfaceKind};
 
             let width = 1280u32;
             let height = 720u32;
 
-            match D3D11SharedTexture::new(width, height) {
+            match D3D11SharedTexture::new(width, height, DecodedSurfaceKind::Nv12) {
                 Ok(texture) => {
                     assert_eq!(texture.width, width);
                     assert_eq!(texture.height, height);
@@ -2839,6 +3359,53 @@ mod imp {
                     );
                 }
             }
+        }
+
+        #[test]
+        #[cfg(windows)]
+        fn d3d11_shared_texture_can_use_external_device_pointer() {
+            use super::{
+                D3D11CreateDevice, D3D11SharedTexture, DecodedSurfaceKind, ID3D11Device,
+                ID3D11DeviceContext,
+            };
+            use windows::core::Interface;
+            use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+            use windows::Win32::Graphics::Direct3D11::{
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
+            };
+
+            let mut device = None::<ID3D11Device>;
+            let mut context = None::<ID3D11DeviceContext>;
+            unsafe {
+                D3D11CreateDevice(
+                    None,
+                    D3D_DRIVER_TYPE_HARDWARE,
+                    windows::Win32::Foundation::HMODULE::default(),
+                    D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                    None,
+                    D3D11_SDK_VERSION,
+                    Some(&mut device),
+                    None,
+                    Some(&mut context),
+                )
+            }
+            .expect("create test d3d11 device");
+            let device = device.expect("test d3d11 device");
+
+            let texture = unsafe {
+                D3D11SharedTexture::new_with_device_ptr(
+                    640,
+                    360,
+                    DecodedSurfaceKind::Nv12,
+                    device.as_raw(),
+                )
+            }
+            .expect("create shared texture from external device");
+
+            assert_eq!(texture.width, 640);
+            assert_eq!(texture.height, 360);
+            assert_ne!(texture.shared_handle_y, 0);
+            assert_ne!(texture.shared_handle_uv, 0);
         }
     }
 }

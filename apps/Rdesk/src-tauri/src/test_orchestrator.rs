@@ -416,8 +416,17 @@ impl TestOrchestrator {
                 encoder: match config.encoder_type.as_deref() {
                     Some("none") => EncoderType::None,
                     Some("nvenc_h264") => EncoderType::NvencH264,
-                    Some("openh264") => EncoderType::OpenH264,
+                    Some("openh264")
+                    | Some("software_h264")
+                    | Some("h264_software")
+                    | Some("software-h264")
+                    | Some("h264-software")
+                    | Some("sw_h264") => EncoderType::OpenH264,
                     Some("nvenc_av1") => EncoderType::NvencAv1,
+                    Some("nvenc_hevc") | Some("hevc") => EncoderType::NvencHevc,
+                    Some("nvenc_hevc_main10") | Some("hevc_main10") | Some("hevc-main10") => {
+                        EncoderType::NvencHevcMain10
+                    }
                     Some("videotoolbox_h264") | Some("videotoolbox") => {
                         EncoderType::VideoToolboxH264
                     }
@@ -429,7 +438,8 @@ impl TestOrchestrator {
                 decoder: match config.decoder_type.as_deref().unwrap_or("software") {
                     "none" => DecoderType::None,
                     "nvdec" => DecoderType::Nvdec,
-                    "software" => DecoderType::Software,
+                    "software" | "software_h264" | "h264_software" | "software-h264"
+                    | "h264-software" | "openh264" => DecoderType::Software,
                     "videotoolbox" => DecoderType::VideoToolbox,
                     other => anyhow::bail!("Unsupported decoder for {}: {}", scenario_id, other),
                 },
@@ -561,6 +571,9 @@ impl TestOrchestrator {
                     capture_type: Some("dxgi".to_string()),
                     encoder_type: Some("nvenc_h264".to_string()),
                     decoder_type: Some("nvdec".to_string()),
+                    renderer_type: Some("d3d11".to_string()),
+                    render_display: Some(true),
+                    zero_copy: Some(true),
                     resolution: Some([1920, 1080]),
                     fps: Some(60),
                     bitrate: Some(5000000),
@@ -620,13 +633,19 @@ impl TestOrchestrator {
         let hw_info = crate::device_info::get_hardware_info();
 
         // Detect available encoders
-        let mut available_encoders = vec!["openh264".to_string()];
+        let mut available_encoders = vec!["none".to_string(), "openh264".to_string()];
 
         // Try to detect NVENC
         #[cfg(windows)]
         {
             if mrd_encode_nvenc::NvencH264Encoder::new_max_speed(1920, 1080, 60).is_ok() {
                 available_encoders.push("nvenc_h264".to_string());
+            }
+            if mrd_encode_nvenc::NvencHevcEncoder::probe_hevc_available().is_ok() {
+                available_encoders.push("nvenc_hevc".to_string());
+            }
+            if mrd_encode_nvenc::NvencHevcEncoder::probe_hevc_main10_available().is_ok() {
+                available_encoders.push("nvenc_hevc_main10".to_string());
             }
             if mrd_encode_nvenc_av1::NvencAv1Encoder::probe_av1_available().is_ok() {
                 available_encoders.push("nvenc_av1".to_string());
@@ -640,7 +659,7 @@ impl TestOrchestrator {
         }
 
         // Detect available decoders
-        let mut available_decoders = vec!["software".to_string()];
+        let mut available_decoders = vec!["none".to_string(), "software".to_string()];
         #[cfg(windows)]
         {
             if mrd_decode_nvdec::NvdecDecoder::new().is_ok() {
@@ -1496,8 +1515,11 @@ impl TestOrchestrator {
             DecodedFrameData::CpuRgb24(_) => "Rgb24".to_string(),
             DecodedFrameData::CpuBgra32(_) => "Bgra32".to_string(),
             DecodedFrameData::CpuNv12 { .. } => "Nv12".to_string(),
+            DecodedFrameData::CpuP010 { .. } => "P010".to_string(),
             #[cfg(windows)]
             DecodedFrameData::D3D11SharedNv12 { .. } => "D3D11SharedNv12".to_string(),
+            #[cfg(windows)]
+            DecodedFrameData::D3D11SharedP010 { .. } => "D3D11SharedP010".to_string(),
         }
     }
 
@@ -1514,12 +1536,28 @@ impl TestOrchestrator {
                 frame.height,
                 Self::cpu_nv12_to_rgb24(data, frame.width, frame.height, *pitch),
             ),
+            DecodedFrameData::CpuP010 { data, pitch } => RenderFrame::from_rgb24(
+                frame.width,
+                frame.height,
+                Self::cpu_p010_to_rgb24(data, frame.width, frame.height, *pitch),
+            ),
             #[cfg(windows)]
             DecodedFrameData::D3D11SharedNv12 {
                 shared_handle_y,
                 shared_handle_uv,
                 ..
             } => RenderFrame::from_d3d11_shared_nv12(
+                frame.width,
+                frame.height,
+                *shared_handle_y,
+                *shared_handle_uv,
+            ),
+            #[cfg(windows)]
+            DecodedFrameData::D3D11SharedP010 {
+                shared_handle_y,
+                shared_handle_uv,
+                ..
+            } => RenderFrame::from_d3d11_shared_p010(
                 frame.width,
                 frame.height,
                 *shared_handle_y,
@@ -1553,6 +1591,48 @@ impl TestOrchestrator {
         }
 
         rgb
+    }
+
+    fn cpu_p010_to_rgb24(p010: &[u8], width: usize, height: usize, pitch: usize) -> Vec<u8> {
+        let mut rgb = vec![0_u8; width * height * 3];
+        let uv_base = pitch * height;
+        let mut out_idx = 0;
+
+        for y in 0..height {
+            let uv_row_start = uv_base + (y / 2) * pitch;
+            for x in 0..width {
+                let y_offset = y * pitch + x * 2;
+                let uv_offset = uv_row_start + (x / 2) * 4;
+                if y_offset + 1 >= p010.len() || uv_offset + 3 >= p010.len() {
+                    out_idx += 3;
+                    continue;
+                }
+
+                let y_sample =
+                    (u16::from_le_bytes([p010[y_offset], p010[y_offset + 1]]) >> 6) as i32;
+                let u =
+                    (u16::from_le_bytes([p010[uv_offset], p010[uv_offset + 1]]) >> 6) as i32 - 512;
+                let v = (u16::from_le_bytes([p010[uv_offset + 2], p010[uv_offset + 3]]) >> 6)
+                    as i32
+                    - 512;
+
+                let r = y_sample + ((1436 * v) >> 10);
+                let g = y_sample - ((352 * u + 731 * v) >> 10);
+                let b = y_sample + ((1815 * u) >> 10);
+
+                rgb[out_idx] = Self::clamp_10bit_to_8bit(r);
+                rgb[out_idx + 1] = Self::clamp_10bit_to_8bit(g);
+                rgb[out_idx + 2] = Self::clamp_10bit_to_8bit(b);
+                out_idx += 3;
+            }
+        }
+
+        rgb
+    }
+
+    #[inline]
+    fn clamp_10bit_to_8bit(value: i32) -> u8 {
+        ((value.clamp(0, 1023) + 2) >> 2) as u8
     }
 
     /// Stop a running test
@@ -1813,14 +1893,39 @@ fn capture_supported_on_current_platform(capture_type: &str) -> bool {
 }
 
 fn encoder_supported_on_current_platform(encoder_type: &str) -> bool {
-    matches!(encoder_type, "none" | "openh264")
-        || matches!(encoder_type, "nvenc_h264" | "nvenc_av1") && cfg!(windows)
+    matches!(
+        encoder_type,
+        "none"
+            | "openh264"
+            | "software_h264"
+            | "h264_software"
+            | "software-h264"
+            | "h264-software"
+            | "sw_h264"
+    ) || matches!(
+        encoder_type,
+        "nvenc_h264"
+            | "nvenc_av1"
+            | "nvenc_hevc"
+            | "nvenc_hevc_main10"
+            | "hevc"
+            | "hevc_main10"
+            | "hevc-main10"
+    ) && cfg!(windows)
         || matches!(encoder_type, "videotoolbox_h264" | "videotoolbox") && cfg!(target_os = "macos")
 }
 
 fn decoder_supported_on_current_platform(decoder_type: &str) -> bool {
-    matches!(decoder_type, "none" | "software")
-        || matches!(decoder_type, "nvdec") && cfg!(windows)
+    matches!(
+        decoder_type,
+        "none"
+            | "software"
+            | "software_h264"
+            | "h264_software"
+            | "software-h264"
+            | "h264-software"
+            | "openh264"
+    ) || matches!(decoder_type, "nvdec") && cfg!(windows)
         || matches!(decoder_type, "videotoolbox")
             && cfg!(target_os = "macos")
             && videotoolbox_decoder_enabled()
@@ -1896,8 +2001,18 @@ fn validate_scenario_for_current_platform(
         if !matches!(capture_type, "dxgi" | "winrt") {
             anyhow::bail!("D3D11 shared texture capture requires DXGI or WinRT capture");
         }
-        if !matches!(encoder_type, "nvenc_h264") {
-            anyhow::bail!("D3D11 shared texture input requires NVENC H.264 encoder");
+        if !matches!(
+            encoder_type,
+            "none"
+                | "nvenc_h264"
+                | "nvenc_av1"
+                | "nvenc_hevc"
+                | "nvenc_hevc_main10"
+                | "hevc"
+                | "hevc_main10"
+                | "hevc-main10"
+        ) {
+            anyhow::bail!("D3D11 shared texture input requires direct render or an NVENC encoder");
         }
     }
 
@@ -2525,6 +2640,24 @@ mod tests {
             }
         );
 
+        let software_h264_config = TestConfigData {
+            capture_type: Some("synthetic".to_string()),
+            encoder_type: Some("software_h264".to_string()),
+            decoder_type: Some("h264_software".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            orchestrator
+                .scenario_to_chain("matrix", &software_h264_config)
+                .unwrap(),
+            TestChain::Custom {
+                capture: CaptureType::Synthetic,
+                encoder: EncoderType::OpenH264,
+                decoder: DecoderType::Software,
+            }
+        );
+
         #[cfg(windows)]
         {
             let nvenc_decode_config = TestConfigData {
@@ -2642,6 +2775,57 @@ mod tests {
             harness_config_from_data(&disabled_config).zero_copy,
             Some(false)
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn zero_copy_validation_allows_nvenc_av1_shared_input() {
+        let config = TestConfigData {
+            capture_type: Some("dxgi".to_string()),
+            encoder_type: Some("nvenc_av1".to_string()),
+            decoder_type: Some("nvdec".to_string()),
+            renderer_type: Some("d3d11".to_string()),
+            render_display: Some(true),
+            zero_copy: Some(true),
+            ..Default::default()
+        };
+
+        validate_scenario_for_current_platform("matrix", &config)
+            .expect("NVENC AV1 should accept D3D11 shared input");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn zero_copy_validation_allows_direct_capture_render() {
+        let config = TestConfigData {
+            capture_type: Some("dxgi".to_string()),
+            encoder_type: Some("none".to_string()),
+            decoder_type: Some("none".to_string()),
+            renderer_type: Some("d3d11".to_string()),
+            render_display: Some(true),
+            zero_copy: Some(true),
+            ..Default::default()
+        };
+
+        validate_scenario_for_current_platform("matrix", &config)
+            .expect("direct capture to D3D11 render should accept D3D11 shared input");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn e2e_local_defaults_to_d3d11_zero_copy_display() {
+        let scenario = TestOrchestrator::default()
+            .list_scenarios()
+            .into_iter()
+            .find(|scenario| scenario.scenario_id == "e2e.local")
+            .expect("e2e.local scenario");
+
+        assert_eq!(
+            scenario.default_config.renderer_type.as_deref(),
+            Some("d3d11")
+        );
+        assert_eq!(scenario.default_config.render_display, Some(true));
+        assert_eq!(scenario.default_config.zero_copy, Some(true));
     }
 
     #[test]
