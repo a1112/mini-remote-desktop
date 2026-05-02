@@ -28,6 +28,7 @@ const LAN_MEDIA_FRAME_INTERVAL_MS: u64 = 16;
 const LAN_MEDIA_MAX_FRAMES: u64 = 3_600;
 const LAN_MEDIA_PAYLOAD_BYTES: usize = 4_096;
 const LAN_QUIC_FALLBACK_DATAGRAM_BYTES: usize = 1_200;
+const LAN_QUIC_MEDIA_TRANSPORT: &str = "quic_datagram";
 
 #[derive(Debug, Clone)]
 pub struct LanDiscoveryConfig {
@@ -167,6 +168,15 @@ impl LanDiscoveryState {
             .await
             .get(&device_id.0)
             .map(|peer| SocketAddr::new(peer.ip, peer.discovery_port))
+    }
+
+    pub async fn peer_transports(&self, device_id: &DeviceId) -> Option<Vec<String>> {
+        self.prune_stale_peers().await;
+        self.peers
+            .lock()
+            .await
+            .get(&device_id.0)
+            .map(|peer| peer.transports.clone())
     }
 }
 
@@ -341,6 +351,12 @@ pub async fn request_lan_remote_session(
         .peer_control_addr(target_device_id)
         .await
         .with_context(|| format!("LAN peer not found: {}", target_device_id.0))?;
+    let peer_transports = app_state
+        .lan_discovery
+        .peer_transports(target_device_id)
+        .await
+        .with_context(|| format!("LAN peer not found: {}", target_device_id.0))?;
+    ensure_peer_supports_requested_media(target_device_id, transport_kind, &peer_transports)?;
 
     let (source_device_id, source_device_name) = {
         let devices = app_state.devices.lock().await;
@@ -612,7 +628,7 @@ async fn build_announcement(app_state: &Arc<AppState>) -> Option<LanAnnouncement
         device_type: "rdesk".to_string(),
         protocol_version: PROTOCOL_VERSION,
         discovery_port: app_state.lan_discovery.discovery_port(),
-        transports: vec!["quic".to_string()],
+        transports: vec!["quic".to_string(), LAN_QUIC_MEDIA_TRANSPORT.to_string()],
         timestamp_ms: now_ms(),
     })
 }
@@ -690,6 +706,34 @@ fn quic_bootstrap_for_peer(
         server_name: quic.server_name,
         cert_der: quic.cert_der,
     })
+}
+
+fn ensure_peer_supports_requested_media(
+    target_device_id: &DeviceId,
+    transport_kind: &str,
+    peer_transports: &[String],
+) -> Result<()> {
+    let transport = normalize_transport_kind(transport_kind);
+    if transport == "quic"
+        && !peer_transports
+            .iter()
+            .any(|peer_transport| peer_transport.eq_ignore_ascii_case(LAN_QUIC_MEDIA_TRANSPORT))
+    {
+        anyhow::bail!(
+            "LAN peer does not advertise {LAN_QUIC_MEDIA_TRANSPORT} media capability: {} supports {}",
+            target_device_id.0,
+            format_peer_transports(peer_transports)
+        );
+    }
+    Ok(())
+}
+
+fn format_peer_transports(peer_transports: &[String]) -> String {
+    if peer_transports.is_empty() {
+        "none".to_string()
+    } else {
+        peer_transports.join(", ")
+    }
 }
 
 fn spawn_quic_media_sender(session_id: SessionId, listener: QuinnServerListener) {
@@ -1027,7 +1071,7 @@ mod tests {
                     device_type: "rdesk".to_string(),
                     protocol_version: 1,
                     discovery_port: service_addr.port(),
-                    transports: vec!["quic".to_string()],
+                    transports: vec!["quic".to_string(), LAN_QUIC_MEDIA_TRANSPORT.to_string()],
                     timestamp_ms: now_ms(),
                 },
                 service_addr,
@@ -1056,6 +1100,46 @@ mod tests {
 
         assert!(snapshot.frames_received > 0);
         assert!(snapshot.frames_decoded > 0);
+    }
+
+    #[tokio::test]
+    async fn request_lan_remote_session_rejects_legacy_quic_peer_without_media_capability() {
+        let controller_state = Arc::new(AppState::new());
+        controller_state.devices.lock().await.register(
+            DeviceId("controller-device".to_string()),
+            "Controller Device".to_string(),
+        );
+
+        let peer_addr: SocketAddr = "127.0.0.1:32216".parse().unwrap();
+        controller_state
+            .lan_discovery
+            .upsert_peer(
+                LanAnnouncement {
+                    magic: DISCOVERY_MAGIC.to_string(),
+                    app_id: DISCOVERY_APP_ID.to_string(),
+                    instance_id: "legacy-target-instance".to_string(),
+                    device_id: "legacy-target-device".to_string(),
+                    device_name: "Legacy Target Device".to_string(),
+                    device_type: "rdesk".to_string(),
+                    protocol_version: 1,
+                    discovery_port: peer_addr.port(),
+                    transports: vec!["quic".to_string()],
+                    timestamp_ms: now_ms(),
+                },
+                peer_addr,
+            )
+            .await;
+
+        let error = request_lan_remote_session(
+            &controller_state,
+            &DeviceId("legacy-target-device".to_string()),
+            &SessionId("session-legacy-peer".to_string()),
+            "quic",
+        )
+        .await
+        .expect_err("legacy QUIC peer should fail before session request");
+
+        assert!(error.to_string().contains("quic_datagram"));
     }
 
     #[tokio::test]

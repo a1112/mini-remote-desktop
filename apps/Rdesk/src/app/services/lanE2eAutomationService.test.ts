@@ -56,7 +56,7 @@ function createCommands(
             ip: "192.168.1.24",
             discovery_port: 37777,
             p2p_control_addr: "192.168.1.24:37778",
-            transports: ["quic"],
+            transports: ["quic", "quic_datagram"],
             protocol_version: 1,
             age_ms: 20,
             p2p_available: true,
@@ -135,6 +135,105 @@ describe("runLanE2EAutomation", () => {
     expect(result.stages.map((stage) => `${stage.stage}:${stage.status}`)).toContain(
       "assert:completed"
     );
+  });
+
+  it("retries LAN discovery during preflight until the target peer appears", async () => {
+    const ipcRefreshLanDiscovery = vi
+      .fn()
+      .mockResolvedValueOnce(
+        ok({
+          enabled: true,
+          running: true,
+          discovery_port: 37777,
+          instance_id: "controller-instance",
+          last_probe_ms: 10,
+          peers: [],
+        })
+      )
+      .mockResolvedValueOnce(
+        ok({
+          enabled: true,
+          running: true,
+          discovery_port: 37777,
+          instance_id: "controller-instance",
+          last_probe_ms: 20,
+          peers: [
+            {
+              device_id: "agent-device",
+              device_name: "Agent PC",
+              device_type: "desktop",
+              ip: "192.168.1.24",
+              discovery_port: 37777,
+              p2p_control_addr: "192.168.1.24:37778",
+              transports: ["quic", "quic_datagram"],
+              protocol_version: 1,
+              age_ms: 10,
+              p2p_available: true,
+            },
+          ],
+        })
+      );
+    const commands = createCommands({ ipcRefreshLanDiscovery });
+
+    const result = await runLanE2EAutomation(commands, {
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => "lan-e2e-test-session",
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.peer?.device_id).toBe("agent-device");
+    expect(ipcRefreshLanDiscovery).toHaveBeenCalledTimes(2);
+    expect(commands.ipcStartLanRemoteSession).toHaveBeenCalledWith(
+      "lan-e2e-test-session",
+      "agent-device",
+      "quic"
+    );
+  });
+
+  it("treats legacy QUIC peers without datagram media capability as not ready", async () => {
+    const commands = createCommands({
+      ipcRefreshLanDiscovery: vi.fn().mockResolvedValue(
+        ok({
+          enabled: true,
+          running: true,
+          discovery_port: 37777,
+          instance_id: "controller-instance",
+          last_probe_ms: 10,
+          peers: [
+            {
+              device_id: "agent-device",
+              device_name: "Agent PC",
+              device_type: "desktop",
+              ip: "192.168.1.24",
+              discovery_port: 37777,
+              p2p_control_addr: "192.168.1.24:37778",
+              transports: ["quic"],
+              protocol_version: 1,
+              age_ms: 20,
+              p2p_available: true,
+            },
+          ],
+        })
+      ),
+    });
+
+    const result = await runLanE2EAutomation(commands, {
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      createSessionId: () => "lan-e2e-test-session",
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.failureReason).toBe("peer_not_ready");
+    expect(result.errorMessage).toContain("quic_datagram");
+    expect(commands.ipcStartLanRemoteSession).not.toHaveBeenCalled();
   });
 
   it("registers the local device before LAN session startup when the service runtime is unregistered", async () => {

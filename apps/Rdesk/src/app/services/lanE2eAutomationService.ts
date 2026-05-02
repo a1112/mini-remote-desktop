@@ -112,6 +112,7 @@ const DEFAULT_SAMPLE_INTERVAL_MS = 500;
 const DEFAULT_MIN_DECODED_FRAMES = 1;
 const DEFAULT_MIN_FPS = 1;
 const DEFAULT_MIN_SAMPLE_DURATION_MS = 0;
+const QUIC_DATAGRAM_MEDIA_CAPABILITY = "quic_datagram";
 
 export async function runLanE2EAutomation(
   commands: LanE2EAutomationCommands,
@@ -180,8 +181,13 @@ export async function runLanE2EAutomation(
     await unwrap(commands.serviceWaitForHealthy(10), "service_unhealthy");
     const runtime = await unwrap(commands.ipcRuntimeSnapshot(), "service_unhealthy");
     controllerDeviceId = await ensureLocalDeviceRegistered(commands, runtime, now);
-    const discovery = await unwrap(commands.ipcRefreshLanDiscovery(), "peer_not_found");
-    const peerSelection = selectPeer(discovery, options.targetDeviceId, transportKind);
+    const peerSelection = await waitForLanPeer(
+      commands,
+      options.targetDeviceId,
+      transportKind,
+      timeoutMs,
+      sampleIntervalMs
+    );
     const selectedPeer = peerSelection.peer;
     peer = selectedPeer;
     if (peerSelection.failureReason) {
@@ -269,6 +275,31 @@ export async function runLanE2EAutomation(
   }
 }
 
+async function waitForLanPeer(
+  commands: LanE2EAutomationCommands,
+  targetDeviceId: string | undefined,
+  transportKind: string,
+  timeoutMs: number,
+  pollIntervalMs: number
+): Promise<ReturnType<typeof selectPeer>> {
+  const deadline = Date.now() + timeoutMs;
+  let lastSelection: ReturnType<typeof selectPeer> | undefined;
+
+  while (true) {
+    const discovery = await unwrap(commands.ipcRefreshLanDiscovery(), "peer_not_found");
+    lastSelection = selectPeer(discovery, targetDeviceId, transportKind);
+
+    if (lastSelection.failureReason !== "peer_not_found") {
+      return lastSelection;
+    }
+    if (Date.now() >= deadline) {
+      return lastSelection;
+    }
+
+    await sleep(pollIntervalMs);
+  }
+}
+
 function selectPeer(
   snapshot: LanDiscoverySnapshot,
   targetDeviceId: string | undefined,
@@ -314,13 +345,25 @@ function selectPeer(
 }
 
 function isPeerReady(peer: LanPeerInfo, transportKind: string): boolean {
-  return peer.p2p_available && peer.transports.includes(transportKind);
+  return peer.p2p_available && peerSupportsTransport(peer, transportKind);
+}
+
+function peerSupportsTransport(peer: LanPeerInfo, transportKind: string): boolean {
+  const transports = peer.transports.map((transport) => transport.toLowerCase());
+  const requestedTransport = transportKind.toLowerCase();
+  if (requestedTransport === "quic") {
+    return transports.includes(QUIC_DATAGRAM_MEDIA_CAPABILITY);
+  }
+  return transports.includes(requestedTransport);
 }
 
 function buildPeerNotReadyMessage(peer: LanPeerInfo, transportKind: string): string {
   const transportList = peer.transports.length > 0 ? peer.transports.join(", ") : "none";
   if (!peer.p2p_available) {
     return `LAN peer is discovered but not P2P available: ${peer.device_id}`;
+  }
+  if (transportKind.toLowerCase() === "quic") {
+    return `LAN peer does not support ${QUIC_DATAGRAM_MEDIA_CAPABILITY}: ${peer.device_id} supports ${transportList}`;
   }
   return `LAN peer does not support ${transportKind}: ${peer.device_id} supports ${transportList}`;
 }
