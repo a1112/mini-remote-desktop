@@ -1209,6 +1209,11 @@ impl TestHarness {
 
     fn initialize_components(chain: &TestChain, config: &TestConfig) -> Result<PipelineState> {
         let use_shared_texture_decode = config.zero_copy.unwrap_or(false);
+        if use_shared_texture_decode && !chain_allows_zero_copy_capture(chain) {
+            return Err(anyhow::anyhow!(
+                "software H.264 encoding requires CPU-backed capture; disable zero_copy for OpenH264/software_h264"
+            ));
+        }
         let capture_type = match chain {
             TestChain::Custom { capture, .. } => capture,
             _ => &CaptureType::Dxgi,
@@ -2339,7 +2344,7 @@ fn comparison_labels(chain: &TestChain) -> (&'static str, &'static str) {
         TestChain::CaptureOnly => ("capture-render", "none"),
         TestChain::NvencOnly => ("capture-encode", "h264"),
         TestChain::NvencNvdec => ("capture-encode-decode-render", "h264"),
-        TestChain::OpenH264 => ("capture-encode", "h264"),
+        TestChain::OpenH264 => ("capture-encode", "h264-software"),
         TestChain::Custom {
             encoder, decoder, ..
         } => {
@@ -2353,9 +2358,8 @@ fn comparison_labels(chain: &TestChain) -> (&'static str, &'static str) {
                 EncoderType::NvencAv1 => "av1",
                 EncoderType::NvencHevc => "hevc",
                 EncoderType::NvencHevcMain10 => "hevc-main10",
-                EncoderType::NvencH264 | EncoderType::OpenH264 | EncoderType::VideoToolboxH264 => {
-                    "h264"
-                }
+                EncoderType::OpenH264 => "h264-software",
+                EncoderType::NvencH264 | EncoderType::VideoToolboxH264 => "h264",
             };
             (pipeline, codec)
         }
@@ -2381,7 +2385,6 @@ fn comparison_transport_label(
     }
 }
 
-#[cfg(test)]
 fn encoder_allows_zero_copy(encoder: &EncoderType) -> bool {
     matches!(
         encoder,
@@ -2391,6 +2394,14 @@ fn encoder_allows_zero_copy(encoder: &EncoderType) -> bool {
             | EncoderType::NvencHevcMain10
             | EncoderType::NvencAv1
     )
+}
+
+fn chain_allows_zero_copy_capture(chain: &TestChain) -> bool {
+    match chain {
+        TestChain::CaptureOnly | TestChain::NvencNvdec | TestChain::NvencOnly => true,
+        TestChain::OpenH264 => false,
+        TestChain::Custom { encoder, .. } => encoder_allows_zero_copy(encoder),
+    }
 }
 
 fn nvdec_frame_to_decoded_frame(frame: mrd_decode_nvdec::NvdecDecodedFrame) -> DecodedFrame {
@@ -3108,6 +3119,26 @@ mod tests {
     }
 
     #[test]
+    fn software_h264_encoder_aliases_map_to_openh264() {
+        fn with_encoder_env(value: &str) -> EncoderType {
+            std::env::set_var("MRD_HARNESS_ENCODER", value);
+            let encoder = env_encoder_type();
+            std::env::remove_var("MRD_HARNESS_ENCODER");
+            encoder
+        }
+
+        assert_eq!(with_encoder_env("openh264"), EncoderType::OpenH264);
+        assert_eq!(with_encoder_env("software_h264"), EncoderType::OpenH264);
+        assert_eq!(with_encoder_env("h264_software"), EncoderType::OpenH264);
+        assert_eq!(with_encoder_env("software-h264"), EncoderType::OpenH264);
+        assert!(!encoder_allows_zero_copy(&EncoderType::OpenH264));
+        assert_eq!(
+            comparison_labels(&TestChain::OpenH264),
+            ("capture-encode", "h264-software")
+        );
+    }
+
+    #[test]
     fn hevc_custom_chains_export_captest_comparison_labels() {
         let hevc = TestChain::Custom {
             capture: CaptureType::Dxgi,
@@ -3380,7 +3411,8 @@ mod tests {
     fn env_encoder_type() -> EncoderType {
         match std::env::var("MRD_HARNESS_ENCODER").as_deref() {
             Ok("none") => EncoderType::None,
-            Ok("openh264") => EncoderType::OpenH264,
+            Ok("openh264") | Ok("software_h264") | Ok("h264_software") | Ok("software-h264")
+            | Ok("h264-software") | Ok("sw_h264") => EncoderType::OpenH264,
             Ok("nvenc_av1") => EncoderType::NvencAv1,
             Ok("nvenc_hevc") | Ok("hevc") => EncoderType::NvencHevc,
             Ok("nvenc_hevc_main10") | Ok("hevc_main10") | Ok("hevc-main10") => {
@@ -3394,7 +3426,8 @@ mod tests {
     fn env_decoder_type() -> DecoderType {
         match std::env::var("MRD_HARNESS_DECODER").as_deref() {
             Ok("none") => DecoderType::None,
-            Ok("software") => DecoderType::Software,
+            Ok("software") | Ok("software_h264") | Ok("h264_software") | Ok("software-h264")
+            | Ok("h264-software") | Ok("openh264") => DecoderType::Software,
             Ok("videotoolbox") => DecoderType::VideoToolbox,
             _ => DecoderType::Nvdec,
         }

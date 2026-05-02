@@ -48,7 +48,8 @@ impl VideoEncoderBackend {
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "nvenc" | "nvidia" => Some(Self::Nvenc),
-            "openh264" | "software" | "sw" => Some(Self::OpenH264),
+            "openh264" | "software" | "sw" | "software_h264" | "h264_software"
+            | "software-h264" | "h264-software" | "sw_h264" => Some(Self::OpenH264),
             _ => None,
         }
     }
@@ -92,7 +93,8 @@ impl VideoDecoderBackend {
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "nvdec" | "nvidia" => Some(Self::Nvdec),
-            "software" | "sw" => Some(Self::Software),
+            "software" | "sw" | "software_h264" | "h264_software" | "software-h264"
+            | "h264-software" | "openh264" => Some(Self::Software),
             _ => None,
         }
     }
@@ -154,6 +156,14 @@ mod tests {
             VideoEncoderBackend::from_str("openh264"),
             Some(VideoEncoderBackend::OpenH264)
         );
+        assert_eq!(
+            VideoEncoderBackend::from_str("software_h264"),
+            Some(VideoEncoderBackend::OpenH264)
+        );
+        assert_eq!(
+            VideoEncoderBackend::from_str("h264-software"),
+            Some(VideoEncoderBackend::OpenH264)
+        );
         assert_eq!(VideoEncoderBackend::from_str("unknown"), None);
     }
 
@@ -171,6 +181,14 @@ mod tests {
         );
         assert_eq!(
             VideoDecoderBackend::from_str("software"),
+            Some(VideoDecoderBackend::Software)
+        );
+        assert_eq!(
+            VideoDecoderBackend::from_str("h264_software"),
+            Some(VideoDecoderBackend::Software)
+        );
+        assert_eq!(
+            VideoDecoderBackend::from_str("software-h264"),
             Some(VideoDecoderBackend::Software)
         );
         assert_eq!(VideoDecoderBackend::from_str("unknown"), None);

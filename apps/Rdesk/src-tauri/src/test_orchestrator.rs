@@ -416,7 +416,12 @@ impl TestOrchestrator {
                 encoder: match config.encoder_type.as_deref() {
                     Some("none") => EncoderType::None,
                     Some("nvenc_h264") => EncoderType::NvencH264,
-                    Some("openh264") => EncoderType::OpenH264,
+                    Some("openh264")
+                    | Some("software_h264")
+                    | Some("h264_software")
+                    | Some("software-h264")
+                    | Some("h264-software")
+                    | Some("sw_h264") => EncoderType::OpenH264,
                     Some("nvenc_av1") => EncoderType::NvencAv1,
                     Some("nvenc_hevc") | Some("hevc") => EncoderType::NvencHevc,
                     Some("nvenc_hevc_main10") | Some("hevc_main10") | Some("hevc-main10") => {
@@ -433,7 +438,8 @@ impl TestOrchestrator {
                 decoder: match config.decoder_type.as_deref().unwrap_or("software") {
                     "none" => DecoderType::None,
                     "nvdec" => DecoderType::Nvdec,
-                    "software" => DecoderType::Software,
+                    "software" | "software_h264" | "h264_software" | "software-h264"
+                    | "h264-software" | "openh264" => DecoderType::Software,
                     "videotoolbox" => DecoderType::VideoToolbox,
                     other => anyhow::bail!("Unsupported decoder for {}: {}", scenario_id, other),
                 },
@@ -1881,14 +1887,39 @@ fn capture_supported_on_current_platform(capture_type: &str) -> bool {
 }
 
 fn encoder_supported_on_current_platform(encoder_type: &str) -> bool {
-    matches!(encoder_type, "none" | "openh264")
-        || matches!(encoder_type, "nvenc_h264" | "nvenc_av1") && cfg!(windows)
+    matches!(
+        encoder_type,
+        "none"
+            | "openh264"
+            | "software_h264"
+            | "h264_software"
+            | "software-h264"
+            | "h264-software"
+            | "sw_h264"
+    ) || matches!(
+        encoder_type,
+        "nvenc_h264"
+            | "nvenc_av1"
+            | "nvenc_hevc"
+            | "nvenc_hevc_main10"
+            | "hevc"
+            | "hevc_main10"
+            | "hevc-main10"
+    ) && cfg!(windows)
         || matches!(encoder_type, "videotoolbox_h264" | "videotoolbox") && cfg!(target_os = "macos")
 }
 
 fn decoder_supported_on_current_platform(decoder_type: &str) -> bool {
-    matches!(decoder_type, "none" | "software")
-        || matches!(decoder_type, "nvdec") && cfg!(windows)
+    matches!(
+        decoder_type,
+        "none"
+            | "software"
+            | "software_h264"
+            | "h264_software"
+            | "software-h264"
+            | "h264-software"
+            | "openh264"
+    ) || matches!(decoder_type, "nvdec") && cfg!(windows)
         || matches!(decoder_type, "videotoolbox")
             && cfg!(target_os = "macos")
             && videotoolbox_decoder_enabled()
@@ -1964,10 +1995,18 @@ fn validate_scenario_for_current_platform(
         if !matches!(capture_type, "dxgi" | "winrt") {
             anyhow::bail!("D3D11 shared texture capture requires DXGI or WinRT capture");
         }
-        if !matches!(encoder_type, "none" | "nvenc_h264" | "nvenc_av1") {
-            anyhow::bail!(
-                "D3D11 shared texture input requires direct render, NVENC H.264, or NVENC AV1"
-            );
+        if !matches!(
+            encoder_type,
+            "none"
+                | "nvenc_h264"
+                | "nvenc_av1"
+                | "nvenc_hevc"
+                | "nvenc_hevc_main10"
+                | "hevc"
+                | "hevc_main10"
+                | "hevc-main10"
+        ) {
+            anyhow::bail!("D3D11 shared texture input requires direct render or an NVENC encoder");
         }
     }
 
@@ -2587,6 +2626,24 @@ mod tests {
         assert_eq!(
             orchestrator
                 .scenario_to_chain("matrix", &openh264_config)
+                .unwrap(),
+            TestChain::Custom {
+                capture: CaptureType::Synthetic,
+                encoder: EncoderType::OpenH264,
+                decoder: DecoderType::Software,
+            }
+        );
+
+        let software_h264_config = TestConfigData {
+            capture_type: Some("synthetic".to_string()),
+            encoder_type: Some("software_h264".to_string()),
+            decoder_type: Some("h264_software".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            orchestrator
+                .scenario_to_chain("matrix", &software_h264_config)
                 .unwrap(),
             TestChain::Custom {
                 capture: CaptureType::Synthetic,

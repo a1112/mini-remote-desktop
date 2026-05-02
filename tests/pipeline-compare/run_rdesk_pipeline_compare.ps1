@@ -4,6 +4,7 @@ param(
     [string]$Capture = "dxgi",
     [string]$Codec = "av1",
     [string]$Transport = "quic",
+    [switch]$Software,
     [switch]$SkipDecode
 )
 
@@ -13,6 +14,16 @@ $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 $resultsPath = Join-Path $repoRoot $ResultsDir
 New-Item -ItemType Directory -Force -Path $resultsPath | Out-Null
 
+function Test-SoftwareCodecRequest {
+    $codecName = $Codec.ToLowerInvariant()
+    return $Software `
+        -or $codecName -eq "openh264" `
+        -or $codecName -eq "software_h264" `
+        -or $codecName -eq "software-h264" `
+        -or $codecName -eq "h264_software" `
+        -or $codecName -eq "h264-software"
+}
+
 function Set-HarnessEnv {
     param(
         [string]$Pipeline,
@@ -20,7 +31,8 @@ function Set-HarnessEnv {
         [string]$Decoder,
         [string]$ResultPath,
         [bool]$NativeRender = $true,
-        [bool]$RequireDecode = $false
+        [bool]$RequireDecode = $false,
+        [bool]$ZeroCopy = $true
     )
 
     $env:MRD_HARNESS_CHAIN = "custom"
@@ -28,7 +40,7 @@ function Set-HarnessEnv {
     $env:MRD_HARNESS_ENCODER = $Encoder
     $env:MRD_HARNESS_DECODER = $Decoder
     $env:MRD_HARNESS_RENDERER = if ($NativeRender) { "d3d11" } else { "none" }
-    $env:MRD_HARNESS_ZERO_COPY = "1"
+    $env:MRD_HARNESS_ZERO_COPY = if ($ZeroCopy) { "1" } else { "0" }
     $env:MRD_HARNESS_TRANSPORT = $Transport
     $env:MRD_HARNESS_PROBE_SECONDS = "$Duration"
     $env:MRD_HARNESS_RESULT_PATH = $ResultPath
@@ -64,13 +76,15 @@ function Invoke-RdeskPipeline {
     $resultPath = Join-Path $resultsPath ("rdesk_{0}_{1}.json" -f $Pipeline, $stamp)
     $stdoutPath = Join-Path $resultsPath ("rdesk_{0}_{1}.stdout.log" -f $Pipeline, $stamp)
     $stderrPath = Join-Path $resultsPath ("rdesk_{0}_{1}.stderr.log" -f $Pipeline, $stamp)
+    $zeroCopy = -not (Test-SoftwareCodecRequest)
     Set-HarnessEnv `
         -Pipeline $Pipeline `
         -Encoder $Encoder `
         -Decoder $Decoder `
         -ResultPath $resultPath `
         -NativeRender ($Pipeline -ne "capture-encode") `
-        -RequireDecode $RequireDecode
+        -RequireDecode $RequireDecode `
+        -ZeroCopy $zeroCopy
 
     Write-Host "Running $Pipeline..."
     $process = Start-Process `
@@ -134,16 +148,23 @@ try {
     $compareInputs += Invoke-RdeskPipeline -Pipeline "capture-render" -Encoder "none" -Decoder "none"
 
     $codecName = $Codec.ToLowerInvariant()
-    if ($codecName -eq "av1") {
+    if ($Software -or $codecName -eq "openh264" -or $codecName -eq "software_h264" -or $codecName -eq "software-h264" -or $codecName -eq "h264_software" -or $codecName -eq "h264-software") {
+        $encoder = "openh264"
+        $decoder = "software"
+    } elseif ($codecName -eq "av1") {
         $encoder = "nvenc_av1"
+        $decoder = "nvdec"
     } elseif ($codecName -eq "h264") {
         $encoder = "nvenc_h264"
+        $decoder = "nvdec"
     } elseif ($codecName -eq "hevc") {
         $encoder = "nvenc_hevc"
+        $decoder = "nvdec"
     } elseif ($codecName -eq "hevc-main10" -or $codecName -eq "hevc_main10" -or $codecName -eq "main10") {
         $encoder = "nvenc_hevc_main10"
+        $decoder = "nvdec"
     } else {
-        throw "Unsupported codec '$Codec'. Supported values: av1, h264, hevc, hevc-main10"
+        throw "Unsupported codec '$Codec'. Supported values: av1, h264, hevc, hevc-main10, openh264, software-h264"
     }
 
     $compareInputs += Invoke-RdeskPipeline -Pipeline "capture-encode" -Encoder $encoder -Decoder "none"
@@ -152,7 +173,7 @@ try {
         $compareInputs += Invoke-RdeskPipeline `
             -Pipeline "capture-encode-decode-render" `
             -Encoder $encoder `
-            -Decoder "nvdec" `
+            -Decoder $decoder `
             -RequireDecode $true
     }
 
