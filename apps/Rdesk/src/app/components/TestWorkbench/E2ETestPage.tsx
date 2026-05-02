@@ -1,8 +1,15 @@
-import { useState, useEffect } from "react";
-import { useNavigate } from "react-router";
+import { useState, useEffect, useRef, type ReactNode } from "react";
+import { useNavigate, useSearchParams } from "react-router";
 import { Play, Square, Monitor, Clock, Zap, Activity, Video } from "lucide-react";
 import * as commands from "../../adapters/tauri/commands";
 import type { EnvironmentSnapshot, TestConfig, HarnessMetrics } from "../../adapters/tauri/types";
+import {
+  runLanE2EAutomation,
+  type LanE2EAutomationCommands,
+  type LanE2EAutomationOptions,
+  type LanE2EAutomationReport,
+  type LanE2EStatus,
+} from "../../services/lanE2eAutomationService";
 import { capabilityAvailable, chooseCapability } from "./capabilityMeta";
 
 function buildDefaultConfig(capabilities: EnvironmentSnapshot | null): TestConfig {
@@ -45,13 +52,30 @@ function buildDefaultConfig(capabilities: EnvironmentSnapshot | null): TestConfi
   };
 }
 
+const lanAutomationCommands: LanE2EAutomationCommands = {
+  serviceBootstrapIfNeeded: commands.serviceBootstrapIfNeeded,
+  serviceWaitForHealthy: (timeoutSecs = 10) => commands.serviceWaitForHealthy(timeoutSecs),
+  ipcRuntimeSnapshot: commands.ipcRuntimeSnapshot,
+  ipcRefreshLanDiscovery: commands.ipcRefreshLanDiscovery,
+  ipcStartLanRemoteSession: commands.ipcStartLanRemoteSession,
+  ipcStartReceiver: commands.ipcStartReceiver,
+  openRemoteDisplayWindow: commands.openRemoteDisplayWindow,
+  ipcSessionSnapshot: commands.ipcSessionSnapshot,
+  ipcProbeSnapshot: commands.ipcProbeSnapshot,
+  ipcStopSession: commands.ipcStopSession,
+};
+
 export function E2ETestPage() {
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const autorunStartedRef = useRef(false);
   const [isRunning, setIsRunning] = useState(false);
   const [currentRunId, setCurrentRunId] = useState<string | null>(null);
   const [metrics, setMetrics] = useState<HarnessMetrics | null>(null);
   const [capturedFrame, setCapturedFrame] = useState<string | null>(null);
   const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
+  const [lanRunState, setLanRunState] = useState<LanE2EStatus | "idle">("idle");
+  const [lanReport, setLanReport] = useState<LanE2EAutomationReport | null>(null);
   const currentConfig = buildDefaultConfig(capabilities);
 
   useEffect(() => {
@@ -124,6 +148,40 @@ export function E2ETestPage() {
     }
   };
 
+  const startLanE2E = async (optionOverrides: LanE2EAutomationOptions = {}) => {
+    setLanRunState("running");
+    setLanReport(null);
+    publishLanAutomationStatus("running");
+
+    const report = await runLanE2EAutomation(lanAutomationCommands, {
+      transportKind: "quic",
+      timeoutMs: 15_000,
+      sampleIntervalMs: 500,
+      minDecodedFrames: 1,
+      minFps: 1,
+      ...optionOverrides,
+    });
+
+    setLanReport(report);
+    setLanRunState(report.status);
+    publishLanAutomationReport(report);
+    void commands.automationWriteReport(report).then((result) => {
+      if (!result.ok) {
+        console.error("Failed to write LAN E2E automation report", result.error);
+      }
+    });
+  };
+
+  const handleStartLanE2E = async () => {
+    await startLanE2E();
+  };
+
+  useEffect(() => {
+    if (autorunStartedRef.current || searchParams.get("autorun") !== "lan-e2e") return;
+    autorunStartedRef.current = true;
+    void startLanE2E(buildLanAutomationOptionsFromSearchParams(searchParams));
+  }, [searchParams]);
+
   return (
     <div className="p-6">
       {/* Header */}
@@ -195,6 +253,71 @@ export function E2ETestPage() {
         )}
       </section>
 
+      {/* LAN E2E Automation */}
+      <section
+        className="bg-card rounded-lg border p-4 mb-6"
+        data-lan-e2e-status={lanRunState}
+      >
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+          <div>
+            <h2 className="text-lg font-semibold mb-2">LAN E2E 自动化</h2>
+            <p className="text-sm text-muted-foreground max-w-3xl">
+              两端打开同款 Rdesk 后，自动拉起/检查 mrd-service，刷新局域网发现，
+              选择可 P2P 的对端，启动远程会话与接收端窗口，并采样运行时探针确认真实画面流。
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={handleStartLanE2E}
+            disabled={lanRunState === "running"}
+            className="flex items-center justify-center gap-2 px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-60 transition-colors"
+          >
+            <Play className="h-4 w-4" />
+            {lanRunState === "running" ? "LAN E2E 运行中" : "开始 LAN E2E"}
+          </button>
+        </div>
+
+        <div className="mt-4 grid gap-3 md:grid-cols-3">
+          <AutomationStatusCard
+            label="状态"
+            value={formatLanStatus(lanRunState)}
+            tone={lanRunState === "completed" ? "success" : lanRunState === "failed" ? "danger" : "default"}
+          />
+          <AutomationStatusCard
+            label="目标设备"
+            value={lanReport?.peer?.device_name ?? lanReport?.peer?.device_id ?? "等待发现"}
+          />
+          <AutomationStatusCard
+            label="探针反馈"
+            value={formatProbeSummary(lanReport)}
+          />
+        </div>
+
+        {lanReport && (
+          <div className="mt-4 rounded-lg border bg-muted/30 p-3 text-sm">
+            <div className="flex flex-wrap gap-x-6 gap-y-2">
+              <span>
+                <span className="text-muted-foreground">Session:</span>{" "}
+                {lanReport.sessionId ?? "n/a"}
+              </span>
+              <span>
+                <span className="text-muted-foreground">Peer:</span>{" "}
+                {lanReport.peer?.device_name ?? lanReport.peer?.device_id ?? "n/a"}
+              </span>
+              <span>
+                <span className="text-muted-foreground">Window:</span>{" "}
+                {lanReport.displayWindow?.label ?? "n/a"}
+              </span>
+            </div>
+            {lanReport.status === "failed" && (
+              <p className="mt-2 text-red-500">
+                {lanReport.failureReason}: {lanReport.errorMessage ?? "未知错误"}
+              </p>
+            )}
+          </div>
+        )}
+      </section>
+
       {/* Real-time Metrics */}
       {metrics && (
         <section className="mb-6 grid grid-cols-2 md:grid-cols-4 gap-4">
@@ -254,7 +377,7 @@ function MetricCard({
   value,
   color = "text-foreground",
 }: {
-  icon: React.ReactNode;
+  icon: ReactNode;
   label: string;
   value: string;
   color?: string;
@@ -280,4 +403,91 @@ function getLatencyColor(ms: number, good: number, warning: number): string {
   if (ms <= good) return "text-green-500";
   if (ms <= warning) return "text-yellow-500";
   return "text-red-500";
+}
+
+function AutomationStatusCard({
+  label,
+  value,
+  tone = "default",
+}: {
+  label: string;
+  value: string;
+  tone?: "default" | "success" | "danger";
+}) {
+  const color =
+    tone === "success" ? "text-green-500" : tone === "danger" ? "text-red-500" : "text-foreground";
+
+  return (
+    <div className="rounded-lg border bg-background/60 p-3">
+      <div className="text-xs text-muted-foreground">{label}</div>
+      <div className={`mt-1 text-sm font-semibold ${color}`}>{value}</div>
+    </div>
+  );
+}
+
+function formatLanStatus(status: LanE2EStatus | "idle"): string {
+  switch (status) {
+    case "running":
+      return "LAN E2E 运行中";
+    case "completed":
+      return "LAN E2E 完成";
+    case "failed":
+      return "LAN E2E 失败";
+    case "skipped":
+      return "LAN E2E 跳过";
+    default:
+      return "等待启动";
+  }
+}
+
+function formatProbeSummary(report: LanE2EAutomationReport | null): string {
+  const probe = report?.probeSnapshot;
+  if (!probe) return "等待采样";
+  const fps = probe.current_fps ?? 0;
+  return `decoded ${probe.frames_decoded}, received ${probe.frames_received}, fps ${fps}`;
+}
+
+function buildLanAutomationOptionsFromSearchParams(
+  searchParams: URLSearchParams
+): LanE2EAutomationOptions {
+  return {
+    targetDeviceId: searchParams.get("targetDeviceId") ?? searchParams.get("target") ?? undefined,
+    transportKind: parseTransportKind(searchParams.get("transport")),
+    timeoutMs: parsePositiveNumber(searchParams.get("timeoutMs")),
+    minDecodedFrames: parsePositiveNumber(searchParams.get("minDecodedFrames")),
+    minFps: parsePositiveNumber(searchParams.get("minFps")),
+    stopOnComplete: parseOptionalBoolean(searchParams.get("stopOnComplete")),
+  };
+}
+
+function parseTransportKind(value: string | null): LanE2EAutomationOptions["transportKind"] {
+  return value === "webrtc" ? "webrtc" : value === "quic" ? "quic" : undefined;
+}
+
+function parsePositiveNumber(value: string | null): number | undefined {
+  if (!value) return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+function parseOptionalBoolean(value: string | null): boolean | undefined {
+  if (value === "true") return true;
+  if (value === "false") return false;
+  return undefined;
+}
+
+function publishLanAutomationStatus(status: LanE2EStatus): void {
+  if (typeof document === "undefined") return;
+  document.documentElement.dataset.lanE2eStatus = status;
+}
+
+function publishLanAutomationReport(report: LanE2EAutomationReport): void {
+  if (typeof window === "undefined") return;
+
+  const automationWindow = window as Window & {
+    __MRD_LAN_E2E_REPORT__?: LanE2EAutomationReport;
+  };
+  automationWindow.__MRD_LAN_E2E_REPORT__ = report;
+  document.documentElement.dataset.lanE2eStatus = report.status;
+  window.dispatchEvent(new CustomEvent("mrd:lan-e2e-report", { detail: report }));
 }

@@ -216,6 +216,12 @@ export async function openDiagnosticsFolder(): Promise<AdapterResult<void>> {
   return invokeAdapter<void>('open_diagnostics_folder');
 }
 
+export async function automationWriteReport(
+  report: unknown
+): Promise<AdapterResult<string | null>> {
+  return invokeAdapter<string | null>('automation_write_report', { report });
+}
+
 // ============================================================================
 // Bootstrap Commands (Phase 6: bootstrap-only behavior)
 // ============================================================================
