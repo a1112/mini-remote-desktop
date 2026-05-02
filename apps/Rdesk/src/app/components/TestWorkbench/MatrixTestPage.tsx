@@ -23,6 +23,10 @@ interface MatrixOption {
 
 type HostOs = "windows" | "macos" | "linux" | "other";
 
+function isHevcEncoder(encoder?: TestConfig["encoder_type"]): boolean {
+  return encoder === "nvenc_hevc" || encoder === "nvenc_hevc_main10";
+}
+
 const MATRIX_DIMENSIONS: MatrixDimension[] = [
   {
     id: "capture",
@@ -39,6 +43,8 @@ const MATRIX_DIMENSIONS: MatrixDimension[] = [
     name: "编码器",
     options: [
       { id: "nvenc_h264", name: "NVENC H.264", enabled: true },
+      { id: "nvenc_hevc", name: "NVENC HEVC Main", enabled: false },
+      { id: "nvenc_hevc_main10", name: "NVENC HEVC Main10", enabled: false },
       { id: "openh264", name: "OpenH264", enabled: true },
       { id: "nvenc_av1", name: "NVENC AV1", enabled: false },
       {
@@ -156,7 +162,9 @@ function defaultCapturesForOs(os: HostOs): string[] {
 }
 
 function defaultEncodersForOs(os: HostOs): string[] {
-  if (os === "windows") return ["nvenc_h264", "openh264", "nvenc_av1"];
+  if (os === "windows") {
+    return ["nvenc_h264", "nvenc_hevc", "nvenc_hevc_main10", "openh264", "nvenc_av1"];
+  }
   if (os === "macos") return ["videotoolbox_h264", "openh264"];
   return ["openh264"];
 }
@@ -328,9 +336,17 @@ function unsupportedMatrixReason(config: TestConfig): string | null {
     config.zero_copy &&
     config.encoder_type !== "none" &&
     config.encoder_type !== "nvenc_h264" &&
+    config.encoder_type !== "nvenc_hevc" &&
+    config.encoder_type !== "nvenc_hevc_main10" &&
     config.encoder_type !== "nvenc_av1"
   ) {
-    return "D3D11 shared texture input requires direct render, NVENC H.264, or NVENC AV1";
+    return "D3D11 shared texture input requires direct render or NVENC GPU encoders";
+  }
+  if (isHevcEncoder(config.encoder_type) && config.decoder_type === "software") {
+    return "NVENC HEVC currently requires NVDEC or encode-only matrix runs";
+  }
+  if (isHevcEncoder(config.encoder_type) && config.transport_kind === "webrtc") {
+    return "HEVC WebRTC RTP packetizer is not implemented; use QUIC or loopback";
   }
   if (config.encoder_type === "nvenc_av1" && config.decoder_type === "software") {
     return "NVENC AV1 currently requires NVDEC or encode-only matrix runs";
@@ -359,7 +375,10 @@ function unsupportedMatrixReason(config: TestConfig): string | null {
   if (config.encoder_type === "videotoolbox_h264" && config.decoder_type === "nvdec") {
     return "VideoToolbox H.264 output should use VideoToolbox, software, or encode-only decode modes";
   }
-  if (config.encoder_type === "nvenc_av1" && config.decoder_type === "videotoolbox") {
+  if (
+    (config.encoder_type === "nvenc_av1" || isHevcEncoder(config.encoder_type)) &&
+    config.decoder_type === "videotoolbox"
+  ) {
     return "VideoToolbox decoder path is H.264-only in this matrix";
   }
   return null;
@@ -372,6 +391,12 @@ function capabilitySkipReason(config: TestConfig, message: string): string | nul
   if (
     config.encoder_type === "nvenc_av1" &&
     /NVENC AV1 unavailable|AV1 codec not supported|NVENC AV1 preset query failed/i.test(message)
+  ) {
+    return message;
+  }
+  if (
+    isHevcEncoder(config.encoder_type) &&
+    /NVENC HEVC unavailable|HEVC codec not supported|NVENC HEVC preset query failed/i.test(message)
   ) {
     return message;
   }

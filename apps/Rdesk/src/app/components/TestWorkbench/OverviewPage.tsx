@@ -50,7 +50,7 @@ export function OverviewPage() {
       {/* Header */}
       <div className="mb-6">
         <h1 className="text-2xl font-bold text-foreground">测试工作台总览</h1>
-        <p className="text-muted-foreground">查看测试环境状态和最近运行结果</p>
+        <p className="text-muted-foreground">查看 CapTest 同口径链路、环境能力和最近运行结果</p>
       </div>
 
       {loading ? (
@@ -133,7 +133,7 @@ export function OverviewPage() {
               >
                 <div>
                   <div className="font-medium">端到端本地测试</div>
-                  <div className="text-sm text-muted-foreground">测试完整采集到渲染流程</div>
+                  <div className="text-sm text-muted-foreground">采集到渲染的直接性能基线</div>
                 </div>
                 <ArrowRight className="h-5 w-5 text-muted-foreground" />
               </button>
@@ -144,7 +144,7 @@ export function OverviewPage() {
               >
                 <div>
                   <div className="font-medium">矩阵性能测试</div>
-                  <div className="text-sm text-muted-foreground">批量测试多组参数组合</div>
+                  <div className="text-sm text-muted-foreground">DXGI/WGC、NVENC、NVDEC、QUIC 同口径组合</div>
                 </div>
                 <ArrowRight className="h-5 w-5 text-muted-foreground" />
               </button>
@@ -155,7 +155,7 @@ export function OverviewPage() {
               >
                 <div>
                   <div className="font-medium">自由组合测试</div>
-                  <div className="text-sm text-muted-foreground">自定义测试配置</div>
+                  <div className="text-sm text-muted-foreground">H.264/HEVC/Main10/AV1 单链路调试</div>
                 </div>
                 <ArrowRight className="h-5 w-5 text-muted-foreground" />
               </button>

@@ -32,7 +32,17 @@ import {
   getWebrtcHostSnapshot,
   type WebrtcHostSnapshot,
 } from "../services/realtimeSessionService";
-import { openRemoteDisplayWindow } from "../adapters/tauri";
+import {
+  listRemoteDisplayWindows,
+  openRemoteDisplayWindow,
+  type RemoteDisplayWindowContext,
+} from "../adapters/tauri";
+import {
+  getProbeSnapshot,
+  getSessionSnapshot,
+  type ProbeSnapshot,
+  type SessionRuntimeSnapshot,
+} from "../services/ipcSessionService";
 import { withTauriWindow } from "../utils/tauriWindow";
 import { isTauriRuntime } from "../utils/runtime";
 import {
@@ -146,6 +156,13 @@ export function RemoteSessionPage() {
   const [webrtcHostSnapshot, setWebrtcHostSnapshot] = useState<WebrtcHostSnapshot | null>(null);
   const [webRtcState, setWebRtcState] = useState<"idle" | "connecting" | "connected" | "failed">("idle");
   const [webRtcMessage, setWebRtcMessage] = useState("WebRTC waiting");
+  const [displayWindows, setDisplayWindows] = useState<RemoteDisplayWindowContext[]>([]);
+  const [sessionSnapshot, setSessionSnapshot] = useState<SessionRuntimeSnapshot | null>(null);
+  const [probeSnapshot, setProbeSnapshot] = useState<ProbeSnapshot | null>(null);
+  const [displayLaunchState, setDisplayLaunchState] =
+    useState<"idle" | "opening" | "open" | "failed">("idle");
+  const [displayLaunchMessage, setDisplayLaunchMessage] =
+    useState("原生显示窗口将承载远程画面");
 
   const noDragSelector =
     'button, a, input, select, textarea, [role="button"], [role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"], [data-radix-collection-item], [data-no-drag="true"]';
@@ -237,6 +254,78 @@ export function RemoteSessionPage() {
     });
   }, []);
 
+  useEffect(() => {
+    if (!id || !isTauriRuntime()) return;
+
+    let cancelled = false;
+    const refreshNativeDisplayState = async () => {
+      const windowsResult = await listRemoteDisplayWindows(id);
+      if (!cancelled && windowsResult.ok) {
+        setDisplayWindows(windowsResult.value);
+        if (windowsResult.value.length > 0) {
+          setDisplayLaunchState("open");
+          setDisplayLaunchMessage("原生显示窗口已接管画面输出");
+        }
+      }
+
+      try {
+        const snapshot = await getSessionSnapshot(id);
+        if (!cancelled) setSessionSnapshot(snapshot);
+      } catch {
+        if (!cancelled) setSessionSnapshot(null);
+      }
+
+      try {
+        const snapshot = await getProbeSnapshot(id);
+        if (!cancelled) setProbeSnapshot(snapshot);
+      } catch {
+        if (!cancelled) setProbeSnapshot(null);
+      }
+    };
+
+    void refreshNativeDisplayState();
+    const timer = window.setInterval(() => void refreshNativeDisplayState(), 1000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [id]);
+
+  useEffect(() => {
+    if (!id || !isTauriRuntime() || isWebRemoteSession) return;
+
+    let cancelled = false;
+    const openNativeDisplay = async () => {
+      setDisplayLaunchState("opening");
+      setDisplayLaunchMessage("正在打开原生显示窗口");
+
+      const existing = await listRemoteDisplayWindows(id);
+      if (cancelled) return;
+      if (existing.ok && existing.value.length > 0) {
+        setDisplayWindows(existing.value);
+        setDisplayLaunchState("open");
+        setDisplayLaunchMessage("原生显示窗口已接管画面输出");
+        return;
+      }
+
+      const result = await openRemoteDisplayWindow({ sessionId: id });
+      if (cancelled) return;
+      if (result.ok) {
+        setDisplayWindows([result.value]);
+        setDisplayLaunchState("open");
+        setDisplayLaunchMessage("原生显示窗口已接管画面输出");
+      } else {
+        setDisplayLaunchState("failed");
+        setDisplayLaunchMessage(result.error.message);
+      }
+    };
+
+    void openNativeDisplay();
+    return () => {
+      cancelled = true;
+    };
+  }, [id, isWebRemoteSession]);
+
   // Render host attachment disabled - now managed by mrd-service internally
   // useEffect(() => {
   //   if (!id || !isTauriRuntime()) return;
@@ -296,10 +385,21 @@ export function RemoteSessionPage() {
       navigate(`/session/${id}`);
       return;
     }
+    setDisplayLaunchState("opening");
+    setDisplayLaunchMessage("正在打开原生显示窗口");
     const result = await openRemoteDisplayWindow({ sessionId: id });
     if (!result.ok) {
+      setDisplayLaunchState("failed");
+      setDisplayLaunchMessage(result.error.message);
       alert(result.error.message);
+      return;
     }
+    setDisplayWindows((windows) => {
+      const rest = windows.filter((window) => window.label !== result.value.label);
+      return [result.value, ...rest];
+    });
+    setDisplayLaunchState("open");
+    setDisplayLaunchMessage("原生显示窗口已接管画面输出");
   };
 
   const handleOpenCurrentSurfaceWindow = async () => {
@@ -334,14 +434,18 @@ export function RemoteSessionPage() {
   const [newSurfaceName, setNewSurfaceName] = useState("");
   const [selectedSourceId, setSelectedSourceId] = useState<string | null>(null);
   const [selectedSessionSurfaceId, setSelectedSessionSurfaceId] = useState<string | null>(null);
-  const renderWindows: RenderWindowContext[] = [];
-  const currentSurfaceId: string | null = null;
-  const rendererAttached = false;
-  const currentRenderWindowCount = 0;
+  const renderWindows: RenderWindowContext[] = displayWindows;
+  const activeDisplayWindow = displayWindows[0] ?? null;
+  const currentSurfaceId: string | null = activeDisplayWindow?.surface_id ?? null;
+  const rendererAttached = activeDisplayWindow?.renderer_attached ?? false;
+  const currentRenderWindowCount = displayWindows.length;
   const renderSurfaces: RenderSurfaceDescriptor[] = [];
   const renderSnapshot = null as RenderHostSnapshot | null;
-  const currentRenderWindowLabel: string | null = null;
-  const currentWindowRole: string | null = null;
+  const currentRenderWindowLabel: string | null = activeDisplayWindow?.label ?? null;
+  const currentWindowRole: string | null = activeDisplayWindow?.role ?? null;
+  const nativeDisplayMode = activeDisplayWindow?.render_mode ?? "d3d11_native";
+  const remoteFps = probeSnapshot?.current_fps ?? null;
+  const transportLabel = sessionSnapshot?.transport_kind ?? (isWebRemoteSession ? "webrtc" : "quic");
 
   const handleTauriDragStart = (event: React.MouseEvent<HTMLDivElement>) => {
     if (event.button !== 0) return;
@@ -522,12 +626,44 @@ export function RemoteSessionPage() {
             draggable={false}
           />
         ) : (
-          <img
-            src="https://images.unsplash.com/photo-1651832710372-a2b0da73a98f?crop=entropy&cs=tinysrgb&fit=max&fm=jpg&ixid=M3w3Nzg4Nzd8MHwxfHNlYXJjaHwxfHxyZW1vdGUlMjBkZXNrdG9wJTIwY29tcHV0ZXIlMjBzY3JlZW58ZW58MXx8fHwxNzcyNjE5MDE0fDA&ixlib=rb-4.1.0&q=80&w=1080"
-            alt="Remote desktop"
-            className="w-full h-full object-cover opacity-90"
-            draggable={false}
-          />
+          <div className="flex h-full w-full items-center justify-center bg-[#090d14] px-6">
+            <div className="w-full max-w-3xl rounded-xl border border-white/10 bg-black/35 p-5 text-gray-200 shadow-2xl backdrop-blur-sm">
+              <div className="flex items-center justify-between gap-4 border-b border-white/10 pb-4">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 text-sm font-semibold text-white">
+                    <Monitor className="h-4 w-4 text-blue-300" />
+                    原生显示窗口承载画面
+                  </div>
+                  <div className="mt-1 text-xs text-gray-400">
+                    Rdesk 前端保留管理和状态，远程帧由后台原生窗口走 D3D11/Metal 渲染链路。
+                  </div>
+                </div>
+                <button
+                  onClick={() => void handlePopOutWindow()}
+                  className="shrink-0 rounded-md bg-blue-500/20 px-3 py-1.5 text-xs text-blue-100 hover:bg-blue-500/30"
+                >
+                  打开显示窗口
+                </button>
+              </div>
+              <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                <DisplayMetric label="窗口" value={`${currentRenderWindowCount}`} />
+                <DisplayMetric label="渲染" value={nativeDisplayMode} />
+                <DisplayMetric
+                  label="接收 FPS"
+                  value={remoteFps === null ? "-" : remoteFps.toFixed(1)}
+                />
+                <DisplayMetric label="解码帧" value={`${probeSnapshot?.frames_decoded ?? 0}`} />
+              </div>
+              <div className="mt-4 rounded-md bg-white/6 px-3 py-2 text-xs text-gray-300">
+                {displayLaunchMessage}
+                {activeDisplayWindow ? (
+                  <span className="ml-2 text-gray-500">
+                    {activeDisplayWindow.label} · {activeDisplayWindow.surface_id}
+                  </span>
+                ) : null}
+              </div>
+            </div>
+          </div>
         )}
 
         {/* Connection quality overlay */}
@@ -879,7 +1015,7 @@ export function RemoteSessionPage() {
         <div className="absolute bottom-3 right-3 px-2.5 py-1.5 rounded-lg bg-black/60 backdrop-blur-sm border border-white/10 text-gray-400" style={{ fontSize: 11 }}>
           {renderSnapshot?.renderer_backend
             ? `${renderSnapshot.renderer_backend} · ${renderSnapshot.surface_count} surfaces · ${renderSnapshot.renderer_snapshot?.uploaded_frame_count ?? 0} uploads`
-            : "renderer idle"}
+            : `${displayLaunchState} · ${transportLabel} · ${currentRenderWindowCount} native windows`}
         </div>
       </div>
 
@@ -890,10 +1026,13 @@ export function RemoteSessionPage() {
             label="分辨率"
             value={renderSnapshot?.frame ? `${renderSnapshot.frame.width}×${renderSnapshot.frame.height}` : "1920×1080"}
           />
-          <StatusItem label="帧率" value="60 fps" />
           <StatusItem
-            label="帧缓冲"
-            value={renderSnapshot?.frame ? `${Math.round(renderSnapshot.frame.bytes / 1024)} KB` : "-"}
+            label="帧率"
+            value={remoteFps === null ? "等待探测" : `${remoteFps.toFixed(1)} fps`}
+          />
+          <StatusItem
+            label="解码"
+            value={`${probeSnapshot?.frames_decoded ?? 0} frames`}
           />
         </div>
         <div className="flex items-center gap-1 text-green-400" style={{ fontSize: 11 }}>
@@ -925,6 +1064,15 @@ function CtrlBtn({
       {icon}
       <span style={{ fontSize: 11 }}>{label}</span>
     </button>
+  );
+}
+
+function DisplayMetric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-md bg-white/6 px-3 py-2">
+      <div className="text-[10px] uppercase tracking-wide text-gray-500">{label}</div>
+      <div className="mt-1 truncate text-sm text-gray-100">{value}</div>
+    </div>
   );
 }
 

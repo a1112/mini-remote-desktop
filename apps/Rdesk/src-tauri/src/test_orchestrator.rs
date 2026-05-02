@@ -641,6 +641,12 @@ impl TestOrchestrator {
             if mrd_encode_nvenc::NvencH264Encoder::new_max_speed(1920, 1080, 60).is_ok() {
                 available_encoders.push("nvenc_h264".to_string());
             }
+            if mrd_encode_nvenc::NvencHevcEncoder::probe_hevc_available().is_ok() {
+                available_encoders.push("nvenc_hevc".to_string());
+            }
+            if mrd_encode_nvenc::NvencHevcEncoder::probe_hevc_main10_available().is_ok() {
+                available_encoders.push("nvenc_hevc_main10".to_string());
+            }
             if mrd_encode_nvenc_av1::NvencAv1Encoder::probe_av1_available().is_ok() {
                 available_encoders.push("nvenc_av1".to_string());
             }
