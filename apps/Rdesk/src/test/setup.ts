@@ -8,11 +8,18 @@ import { expect, afterEach, vi } from "vitest";
 import * as matchers from "@testing-library/jest-dom/matchers";
 import { resetTauriMock } from "./mocks/tauri";
 
+const animationFrameTimers = new Map<number, ReturnType<typeof setTimeout>>();
+let nextAnimationFrameId = 1;
+
 // Extend Vitest's expect with jest-dom matchers
 expect.extend(matchers);
 
 // Cleanup after each test
 afterEach(() => {
+  for (const timeout of animationFrameTimers.values()) {
+    clearTimeout(timeout);
+  }
+  animationFrameTimers.clear();
   vi.clearAllMocks();
   resetTauriMock();
 });
@@ -41,5 +48,19 @@ globalThis.ResizeObserver = vi.fn().mockImplementation(() => ({
 }));
 
 // Mock requestAnimationFrame
-globalThis.requestAnimationFrame = vi.fn((cb) => setTimeout(cb, 0));
-globalThis.cancelAnimationFrame = vi.fn();
+globalThis.requestAnimationFrame = vi.fn((cb: FrameRequestCallback): number => {
+  const frameId = nextAnimationFrameId++;
+  const timeout = setTimeout(() => {
+    animationFrameTimers.delete(frameId);
+    cb(performance.now());
+  }, 0);
+  animationFrameTimers.set(frameId, timeout);
+  return frameId;
+});
+globalThis.cancelAnimationFrame = vi.fn((frameId: number): void => {
+  const timeout = animationFrameTimers.get(frameId);
+  if (timeout) {
+    clearTimeout(timeout);
+    animationFrameTimers.delete(frameId);
+  }
+});
