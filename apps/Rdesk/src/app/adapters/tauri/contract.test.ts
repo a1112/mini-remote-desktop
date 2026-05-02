@@ -133,6 +133,23 @@ describe('Tauri Adapter Contract', () => {
       expect(mockInvoke).toHaveBeenNthCalledWith(1, 'get_client_diagnostics', undefined);
       expect(mockInvoke).toHaveBeenNthCalledWith(2, 'open_diagnostics_folder', undefined);
     });
+
+    it('automation report command calls registered command name', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue('C:/tmp/lan-e2e-report.json');
+
+      await adapter.automationWriteReport({
+        scenarioId: 'lan.e2e.remote_display',
+        status: 'completed',
+      });
+
+      expect(mockInvoke).toHaveBeenCalledWith('automation_write_report', {
+        report: {
+          scenarioId: 'lan.e2e.remote_display',
+          status: 'completed',
+        },
+      });
+    });
   });
 
   /**

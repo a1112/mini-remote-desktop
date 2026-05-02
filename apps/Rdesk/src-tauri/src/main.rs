@@ -44,6 +44,14 @@ const TRAY_MENU_HIDE_ID: &str = "rdesk-tray-hide";
 const TRAY_MENU_CENTER_ID: &str = "rdesk-tray-center";
 const TRAY_MENU_QUIT_ID: &str = "rdesk-tray-quit";
 const SINGLE_INSTANCE_ADDR: &str = "127.0.0.1:47631";
+const LAN_E2E_AUTORUN_ENV: &str = "MRD_LAN_E2E_AUTORUN";
+const LAN_E2E_TARGET_DEVICE_ID_ENV: &str = "MRD_LAN_E2E_TARGET_DEVICE_ID";
+const LAN_E2E_TRANSPORT_ENV: &str = "MRD_LAN_E2E_TRANSPORT";
+const LAN_E2E_TIMEOUT_MS_ENV: &str = "MRD_LAN_E2E_TIMEOUT_MS";
+const LAN_E2E_MIN_DECODED_FRAMES_ENV: &str = "MRD_LAN_E2E_MIN_DECODED_FRAMES";
+const LAN_E2E_MIN_FPS_ENV: &str = "MRD_LAN_E2E_MIN_FPS";
+const LAN_E2E_STOP_ON_COMPLETE_ENV: &str = "MRD_LAN_E2E_STOP_ON_COMPLETE";
+const LAN_E2E_REPORT_PATH_ENV: &str = "MRD_LAN_E2E_REPORT_PATH";
 
 static APP_IS_QUITTING: AtomicBool = AtomicBool::new(false);
 
@@ -662,6 +670,32 @@ fn open_diagnostics_folder() -> Result<(), String> {
 
     command.spawn().map_err(|error| error.to_string())?;
     Ok(())
+}
+
+#[tauri::command]
+fn automation_write_report(report: serde_json::Value) -> Result<Option<String>, String> {
+    let Ok(path) = std::env::var(LAN_E2E_REPORT_PATH_ENV) else {
+        return Ok(None);
+    };
+    let path = path.trim();
+    if path.is_empty() {
+        return Ok(None);
+    }
+
+    let path = std::path::PathBuf::from(path);
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                format!("create automation report directory failed: {error}")
+            })?;
+        }
+    }
+
+    let content = serde_json::to_vec_pretty(&report)
+        .map_err(|error| format!("serialize automation report failed: {error}"))?;
+    std::fs::write(&path, content)
+        .map_err(|error| format!("write automation report failed: {error}"))?;
+    Ok(Some(path.display().to_string()))
 }
 
 // nvdec_runtime_probe - moved to rdesk-legacy-harness package
@@ -1837,6 +1871,106 @@ fn apply_tray_action(app: &AppHandle, action: TrayAction) -> Result<(), String> 
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct LanE2eAutorunLaunchConfig {
+    target_device_id: Option<String>,
+    transport: Option<String>,
+    timeout_ms: Option<String>,
+    min_decoded_frames: Option<String>,
+    min_fps: Option<String>,
+    stop_on_complete: Option<String>,
+}
+
+fn lan_e2e_autorun_config_from_env() -> Option<LanE2eAutorunLaunchConfig> {
+    lan_e2e_autorun_config_from_env_lookup(|key| std::env::var(key).ok())
+}
+
+fn lan_e2e_autorun_config_from_env_lookup<F>(env: F) -> Option<LanE2eAutorunLaunchConfig>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let enabled = env(LAN_E2E_AUTORUN_ENV)?;
+    if !is_truthy_env_value(&enabled) {
+        return None;
+    }
+
+    Some(LanE2eAutorunLaunchConfig {
+        target_device_id: non_empty_env(env(LAN_E2E_TARGET_DEVICE_ID_ENV)),
+        transport: non_empty_env(env(LAN_E2E_TRANSPORT_ENV)),
+        timeout_ms: non_empty_env(env(LAN_E2E_TIMEOUT_MS_ENV)),
+        min_decoded_frames: non_empty_env(env(LAN_E2E_MIN_DECODED_FRAMES_ENV)),
+        min_fps: non_empty_env(env(LAN_E2E_MIN_FPS_ENV)),
+        stop_on_complete: non_empty_env(env(LAN_E2E_STOP_ON_COMPLETE_ENV)),
+    })
+}
+
+fn build_lan_e2e_autorun_route(config: LanE2eAutorunLaunchConfig) -> String {
+    let mut params = vec![("autorun".to_string(), "lan-e2e".to_string())];
+
+    push_query_param(&mut params, "targetDeviceId", config.target_device_id);
+    push_query_param(&mut params, "transport", config.transport);
+    push_query_param(&mut params, "timeoutMs", config.timeout_ms);
+    push_query_param(
+        &mut params,
+        "minDecodedFrames",
+        config.min_decoded_frames,
+    );
+    push_query_param(&mut params, "minFps", config.min_fps);
+    push_query_param(&mut params, "stopOnComplete", config.stop_on_complete);
+
+    let query = params
+        .into_iter()
+        .map(|(key, value)| format!("{}={}", key, url_query_escape(&value)))
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("/test/e2e?{query}")
+}
+
+fn navigate_main_window_to_route(window: &WebviewWindow, route: &str) -> Result<(), String> {
+    let route_json = serde_json::to_string(route).map_err(|error| error.to_string())?;
+    let script = format!(
+        "window.history.replaceState(null, '', {route_json}); window.dispatchEvent(new PopStateEvent('popstate'));"
+    );
+    window.eval(&script).map_err(|error| error.to_string())
+}
+
+fn is_truthy_env_value(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn non_empty_env(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn push_query_param(params: &mut Vec<(String, String)>, key: &str, value: Option<String>) {
+    if let Some(value) = value {
+        params.push((key.to_string(), value));
+    }
+}
+
+fn url_query_escape(value: &str) -> String {
+    let mut output = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                output.push(byte as char)
+            }
+            _ => output.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    output
+}
+
 #[cfg(test)]
 mod tray_tests {
     use super::*;
@@ -1860,6 +1994,38 @@ mod tray_tests {
             Some(TrayAction::QuitUi)
         );
         assert_eq!(tray_action_from_menu_id("unknown"), None);
+    }
+
+    #[test]
+    fn lan_e2e_autorun_route_uses_env_configuration() {
+        let route = build_lan_e2e_autorun_route(LanE2eAutorunLaunchConfig {
+            target_device_id: Some("agent device/1".to_string()),
+            transport: Some("quic".to_string()),
+            timeout_ms: Some("2500".to_string()),
+            min_decoded_frames: Some("2".to_string()),
+            min_fps: Some("5".to_string()),
+            stop_on_complete: Some("false".to_string()),
+        });
+
+        assert_eq!(
+            route,
+            "/test/e2e?autorun=lan-e2e&targetDeviceId=agent%20device%2F1&transport=quic&timeoutMs=2500&minDecodedFrames=2&minFps=5&stopOnComplete=false"
+        );
+    }
+
+    #[test]
+    fn lan_e2e_autorun_requires_enabled_flag() {
+        let disabled = lan_e2e_autorun_config_from_env_lookup(|_| None);
+        assert!(disabled.is_none());
+
+        let enabled = lan_e2e_autorun_config_from_env_lookup(|key| {
+            if key == LAN_E2E_AUTORUN_ENV {
+                Some("true".to_string())
+            } else {
+                None
+            }
+        });
+        assert!(enabled.is_some());
     }
 }
 
@@ -1937,6 +2103,12 @@ fn main() {
                         "failed to apply native backdrop: {}",
                         backdrop_status.detail
                     );
+                }
+                if let Some(config) = lan_e2e_autorun_config_from_env() {
+                    let route = build_lan_e2e_autorun_route(config);
+                    if let Err(error) = navigate_main_window_to_route(&main_window, &route) {
+                        eprintln!("failed to navigate to LAN E2E autorun route: {error}");
+                    }
                 }
 
                 let app_handle_for_close = app.handle().clone();
@@ -2018,6 +2190,7 @@ fn main() {
             present_test_harness_frame_on_native_surface,
             get_client_diagnostics,
             open_diagnostics_folder,
+            automation_write_report,
             nvdec_runtime_probe,
             decode_policy,
             set_decode_policy,
