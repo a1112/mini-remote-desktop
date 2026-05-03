@@ -1,4 +1,5 @@
 import { useDevices } from "./deviceData";
+import { AppVersionBadge } from "./AppVersionBadge";
 import { useState, useEffect, useRef } from "react";
 import { deviceService } from "../services/deviceService";
 import { useTheme } from "./ThemeContext";
@@ -563,6 +564,8 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
           })}
         </div>
       )}
+
+      <AppVersionBadge collapsed={collapsed} isDark={isDark} />
 
       {/* Context menu */}
       {contextMenu && contextMenuDevice && (

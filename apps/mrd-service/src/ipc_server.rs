@@ -13,8 +13,11 @@ use mrd_ipc::{transport, IpcRequest, IpcResponse};
 use std::{io::ErrorKind, sync::Arc, time::Duration};
 
 const LAN_DISCOVERY_REFRESH_WAIT_MS: u64 = 450;
+#[cfg(windows)]
+const WINDOWS_IPC_ACCEPT_BACKLOG: usize = 32;
 
 /// IPC server - handles requests from Rdesk shell
+#[derive(Clone)]
 pub struct IpcServer {
     app_state: Arc<AppState>,
     endpoint: transport::IpcEndpoint,
@@ -496,9 +499,46 @@ impl IpcServer {
 
     /// Run the IPC server (accepts connections in a loop)
     pub async fn run(&self) -> anyhow::Result<()> {
+        #[cfg(windows)]
+        let server = Arc::new(transport::IpcServer::bind_with_endpoint(self.endpoint.clone()).await?);
+
+        #[cfg(not(windows))]
         let server = transport::IpcServer::bind_with_endpoint(self.endpoint.clone()).await?;
+
         tracing::info!("IPC server listening");
 
+        #[cfg(windows)]
+        {
+            for _ in 0..WINDOWS_IPC_ACCEPT_BACKLOG {
+                let pipe_server = server.clone();
+                let connection_server = self.clone();
+                tokio::spawn(async move {
+                    loop {
+                        match pipe_server.accept().await {
+                            Ok(stream) => {
+                                let server_clone = connection_server.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = server_clone.handle_connection(stream).await {
+                                        eprintln!("IPC connection error: {}", e);
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                eprintln!("IPC accept error: {}", e);
+                                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                            }
+                        }
+                    }
+                });
+            }
+
+            std::future::pending::<()>().await;
+            #[allow(unreachable_code)]
+            return Ok(());
+        }
+
+        #[cfg(not(windows))]
+        {
         let app_state = self.app_state.clone();
         let ui_launcher = self.ui_launcher.clone();
         loop {
@@ -521,6 +561,7 @@ impl IpcServer {
                     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                 }
             }
+        }
         }
     }
 }

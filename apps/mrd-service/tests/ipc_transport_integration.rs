@@ -10,6 +10,7 @@ use mrd_ipc::{client::IpcClient, transport::IpcEndpoint, IpcRequest, IpcResponse
 use mrd_proto::{DeviceId, SessionId};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Barrier;
 use tokio::time::sleep;
 
 fn test_endpoint(test_name: &str) -> IpcEndpoint {
@@ -80,6 +81,55 @@ async fn ipc_transport_health_check_works() {
         Ok(other) => panic!("Expected ServiceHealth response, got {:?}", other),
         Err(e) => panic!("Failed to get response: {}", e),
     }
+}
+
+#[tokio::test]
+async fn ipc_transport_handles_startup_connection_bursts() {
+    let endpoint = test_endpoint("startup-burst");
+
+    let server_endpoint = endpoint.clone();
+    let server_handle = tokio::spawn(async {
+        let app_state = Arc::new(mrd_service::app_state::AppState::new());
+        let server =
+            mrd_service::ipc_server::IpcServer::new_with_endpoint(app_state, server_endpoint);
+        let _ = server.run().await;
+    });
+
+    sleep(Duration::from_millis(200)).await;
+
+    let client_count = 24;
+    let barrier = Arc::new(Barrier::new(client_count));
+    let mut handles = Vec::with_capacity(client_count);
+
+    for _ in 0..client_count {
+        let endpoint = endpoint.clone();
+        let barrier = barrier.clone();
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let mut client = IpcClient::with_endpoint(endpoint);
+            client.send_request(IpcRequest::ServiceHealth).await
+        }));
+    }
+
+    let mut errors = Vec::new();
+    for handle in handles {
+        match handle.await.expect("client task panicked") {
+            Ok(IpcResponse::ServiceHealth { status }) => {
+                assert!(status.running);
+                assert!(status.healthy);
+            }
+            Ok(other) => errors.push(format!("unexpected response: {other:?}")),
+            Err(error) => errors.push(error.to_string()),
+        }
+    }
+
+    server_handle.abort();
+
+    assert!(
+        errors.is_empty(),
+        "startup IPC burst produced errors: {}",
+        errors.join("; ")
+    );
 }
 
 #[tokio::test]
