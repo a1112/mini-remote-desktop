@@ -542,6 +542,98 @@ describe("RemoteDisplayWindowPage", () => {
     });
   });
 
+  it("lists remote window capture sources and selects one", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(windowsCapabilities());
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-p2p-quic-123-1",
+          session_id: "p2p-quic-123",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: false,
+          render_mode: "d3d11_native",
+          native_surface_attached: false,
+          session_window_count: 1,
+        });
+      }
+      if (command === "configure_remote_display_native_surface") {
+        return Promise.resolve({
+          label: "render-p2p-quic-123-1",
+          backend: "d3d11",
+          attached: true,
+          visible: true,
+          parent_hwnd: "0xA",
+          hwnd: "0x14",
+          rect: { x: 0, y: 0, width: 1280, height: 720 },
+        });
+      }
+      if (command === "ipc_list_remote_capture_sources") {
+        return Promise.resolve([
+          {
+            id: "windows:window:0x1234",
+            platform: "windows",
+            source_kind: "window",
+            title: "Target App",
+            class_name: "ApplicationFrameWindow",
+            width: 1280,
+            height: 720,
+            process_id: 4242,
+            app_name: "Target App",
+            bundle_identifier: null,
+            preview_data_url: "data:image/png;base64,AAAA",
+            preview_width: 240,
+            preview_height: 135,
+          },
+        ]);
+      }
+      if (command === "ipc_select_remote_capture_source") {
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          source: {
+            id: "windows:window:0x1234",
+            platform: "windows",
+            source_kind: "window",
+            title: "Target App",
+            class_name: "ApplicationFrameWindow",
+            width: 1280,
+            height: 720,
+            process_id: 4242,
+            app_name: "Target App",
+            bundle_identifier: null,
+            preview_data_url: null,
+            preview_width: null,
+            preview_height: null,
+          },
+          status: "selected",
+          reason: null,
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay();
+
+    fireEvent.click(await screen.findByRole("button", { name: "配置" }));
+    fireEvent.click(await screen.findByRole("button", { name: "刷新窗口源" }));
+    fireEvent.click(await screen.findByRole("button", { name: /选择 Target App/ }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("ipc_list_remote_capture_sources", {
+        sessionId: "p2p-quic-123",
+        includePreviews: true,
+        limit: 24,
+      });
+      expect(mockInvoke).toHaveBeenCalledWith("ipc_select_remote_capture_source", {
+        sessionId: "p2p-quic-123",
+        sourceId: "windows:window:0x1234",
+      });
+    });
+  });
+
   it("routes the title bar close button through the remote display cleanup command", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {

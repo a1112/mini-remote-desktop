@@ -372,6 +372,66 @@ describe('Tauri Adapter Contract', () => {
       });
     });
 
+    it('ipc_list_remote_capture_sources calls correct command with preview options', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue([
+        {
+          id: 'windows:window:0x1234',
+          platform: 'windows',
+          source_kind: 'window',
+          title: 'Target App',
+          class_name: 'ApplicationFrameWindow',
+          width: 1280,
+          height: 720,
+          process_id: 4242,
+          app_name: 'Target App',
+          bundle_identifier: null,
+          preview_data_url: 'data:image/png;base64,AAAA',
+          preview_width: 240,
+          preview_height: 135,
+        },
+      ]);
+
+      await adapter.ipcListRemoteCaptureSources('session-123', true, 24);
+
+      expect(mockInvoke).toHaveBeenCalledWith('ipc_list_remote_capture_sources', {
+        sessionId: 'session-123',
+        includePreviews: true,
+        limit: 24,
+      });
+    });
+
+    it('ipc_select_remote_capture_source calls correct command with args', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue({
+        session_id: 'session-123',
+        source: {
+          id: 'windows:window:0x1234',
+          platform: 'windows',
+          source_kind: 'window',
+          title: 'Target App',
+          class_name: 'ApplicationFrameWindow',
+          width: 1280,
+          height: 720,
+          process_id: 4242,
+          app_name: 'Target App',
+          bundle_identifier: null,
+          preview_data_url: null,
+          preview_width: null,
+          preview_height: null,
+        },
+        status: 'selected',
+        reason: null,
+      });
+
+      await adapter.ipcSelectRemoteCaptureSource('session-123', 'windows:window:0x1234');
+
+      expect(mockInvoke).toHaveBeenCalledWith('ipc_select_remote_capture_source', {
+        sessionId: 'session-123',
+        sourceId: 'windows:window:0x1234',
+      });
+    });
+
     it('ipc_accept_session calls correct command with args', async () => {
       const mockInvoke = getMockInvoke();
       mockInvoke.mockResolvedValue('session-123');

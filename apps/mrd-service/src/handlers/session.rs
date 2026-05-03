@@ -162,6 +162,52 @@ pub async fn update_media_profile(
     }
 }
 
+/// Handle a remote capture source listing request.
+pub async fn list_remote_capture_sources(
+    app_state: &Arc<AppState>,
+    session_id: SessionId,
+    include_previews: bool,
+    limit: Option<u32>,
+) -> IpcResponse {
+    match crate::lan_discovery::request_lan_capture_sources(
+        app_state,
+        &session_id,
+        include_previews,
+        limit,
+    )
+    .await
+    {
+        Ok(sources) => IpcResponse::CaptureSourceList {
+            session_id,
+            sources,
+        },
+        Err(error) => IpcResponse::Error {
+            code: "E_CAPTURE_SOURCES".to_string(),
+            message: error.to_string(),
+        },
+    }
+}
+
+/// Handle a remote capture source selection request.
+pub async fn select_remote_capture_source(
+    app_state: &Arc<AppState>,
+    session_id: SessionId,
+    source_id: String,
+) -> IpcResponse {
+    match crate::lan_discovery::request_lan_capture_source_select(app_state, &session_id, source_id)
+        .await
+    {
+        Ok(selection) => IpcResponse::CaptureSourceSelected {
+            session_id,
+            selection,
+        },
+        Err(error) => IpcResponse::Error {
+            code: "E_CAPTURE_SOURCE_SELECT".to_string(),
+            message: error.to_string(),
+        },
+    }
+}
+
 /// Handle session accept request
 pub async fn accept_session(
     app_state: &Arc<AppState>,
@@ -227,6 +273,7 @@ pub async fn stop_session(app_state: &Arc<AppState>, session_id: SessionId) -> I
             },
         );
         app_state.media_profiles.lock().await.remove(&session_id);
+        app_state.capture_sources.lock().await.remove(&session_id);
         return IpcResponse::SessionStopped { session_id };
     }
 

@@ -97,6 +97,33 @@ pub struct MediaProfileNegotiation {
     pub reason: Option<String>,
 }
 
+/// A capture source that can be selected for a remote session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CaptureSource {
+    pub id: String,
+    pub platform: String,
+    pub source_kind: String,
+    pub title: String,
+    pub class_name: String,
+    pub width: u32,
+    pub height: u32,
+    pub process_id: u32,
+    pub app_name: Option<String>,
+    pub bundle_identifier: Option<String>,
+    pub preview_data_url: Option<String>,
+    pub preview_width: Option<u32>,
+    pub preview_height: Option<u32>,
+}
+
+/// Result of selecting a capture source on the remote peer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CaptureSourceSelection {
+    pub session_id: SessionId,
+    pub source: CaptureSource,
+    pub status: String,
+    pub reason: Option<String>,
+}
+
 // === Core IPC Types ===
 
 /// IPC request from Rdesk to mrd-service
@@ -134,6 +161,17 @@ pub enum IpcRequest {
     UpdateMediaProfile {
         session_id: SessionId,
         requested_profile: MediaProfile,
+    },
+    /// List selectable capture sources from the remote peer for a session.
+    ListRemoteCaptureSources {
+        session_id: SessionId,
+        include_previews: bool,
+        limit: Option<u32>,
+    },
+    /// Select one remote capture source for a session.
+    SelectRemoteCaptureSource {
+        session_id: SessionId,
+        source_id: String,
     },
     /// Accept an incoming session as agent
     AcceptSession {
@@ -219,6 +257,16 @@ pub enum IpcResponse {
     MediaProfileUpdated {
         session_id: SessionId,
         negotiation: MediaProfileNegotiation,
+    },
+    /// Selectable capture sources returned by the remote peer.
+    CaptureSourceList {
+        session_id: SessionId,
+        sources: Vec<CaptureSource>,
+    },
+    /// Capture source selection result returned by the remote peer.
+    CaptureSourceSelected {
+        session_id: SessionId,
+        selection: CaptureSourceSelection,
     },
     /// Session runtime snapshot
     SessionSnapshot { snapshot: SessionRuntimeSnapshot },

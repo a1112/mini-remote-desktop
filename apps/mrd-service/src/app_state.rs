@@ -6,7 +6,7 @@
 // and media control.
 
 use mrd_application::ports::SessionSnapshot;
-use mrd_ipc::MediaProfileNegotiation;
+use mrd_ipc::{CaptureSourceSelection, MediaProfileNegotiation};
 use mrd_proto::{DeviceId, SessionId};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -62,6 +62,26 @@ impl MediaProfileRegistry {
 
     pub fn remove(&mut self, session_id: &SessionId) -> Option<MediaProfileNegotiation> {
         self.profiles.remove(session_id)
+    }
+}
+
+/// Runtime capture source selection state keyed by session.
+#[derive(Debug, Default)]
+pub struct CaptureSourceRegistry {
+    selections: std::collections::HashMap<SessionId, CaptureSourceSelection>,
+}
+
+impl CaptureSourceRegistry {
+    pub fn set(&mut self, session_id: SessionId, selection: CaptureSourceSelection) {
+        self.selections.insert(session_id, selection);
+    }
+
+    pub fn get(&self, session_id: &SessionId) -> Option<CaptureSourceSelection> {
+        self.selections.get(session_id).cloned()
+    }
+
+    pub fn remove(&mut self, session_id: &SessionId) -> Option<CaptureSourceSelection> {
+        self.selections.remove(session_id)
     }
 }
 
@@ -286,6 +306,8 @@ pub struct AppState {
     pub probes: Arc<Mutex<ProbeRegistry>>,
     /// Negotiated media profile keyed by session.
     pub media_profiles: Arc<Mutex<MediaProfileRegistry>>,
+    /// Selected capture source keyed by session.
+    pub capture_sources: Arc<Mutex<CaptureSourceRegistry>>,
 }
 
 impl AppState {
@@ -304,6 +326,7 @@ impl AppState {
             lan_discovery: Arc::new(crate::lan_discovery::LanDiscoveryState::default()),
             probes: Arc::new(Mutex::new(ProbeRegistry::default())),
             media_profiles: Arc::new(Mutex::new(MediaProfileRegistry::default())),
+            capture_sources: Arc::new(Mutex::new(CaptureSourceRegistry::default())),
         }
     }
 
@@ -340,6 +363,11 @@ impl AppState {
     /// Get a clone of the media profile registry.
     pub fn media_profiles(&self) -> Arc<Mutex<MediaProfileRegistry>> {
         self.media_profiles.clone()
+    }
+
+    /// Get a clone of the capture source registry.
+    pub fn capture_sources(&self) -> Arc<Mutex<CaptureSourceRegistry>> {
+        self.capture_sources.clone()
     }
 }
 
@@ -475,6 +503,42 @@ mod tests {
         registry.set(session_id.clone(), negotiation.clone());
 
         assert_eq!(registry.get(&session_id), Some(negotiation));
+        assert!(registry.remove(&session_id).is_some());
+        assert!(registry.get(&session_id).is_none());
+    }
+
+    #[test]
+    fn capture_source_registry_tracks_selected_source() {
+        let mut registry = CaptureSourceRegistry::default();
+        let session_id = SessionId("capture-source-session".to_string());
+        let source = mrd_ipc::CaptureSource {
+            id: "windows:window:0x1234".to_string(),
+            platform: "windows".to_string(),
+            source_kind: "window".to_string(),
+            title: "Target App".to_string(),
+            class_name: "ApplicationFrameWindow".to_string(),
+            width: 1280,
+            height: 720,
+            process_id: 4242,
+            app_name: Some("Target App".to_string()),
+            bundle_identifier: None,
+            preview_data_url: Some("data:image/png;base64,AAAA".to_string()),
+            preview_width: Some(320),
+            preview_height: Some(180),
+        };
+        let selection = mrd_ipc::CaptureSourceSelection {
+            session_id: session_id.clone(),
+            source: source.clone(),
+            status: "selected".to_string(),
+            reason: None,
+        };
+
+        registry.set(session_id.clone(), selection);
+
+        assert_eq!(
+            registry.get(&session_id).expect("selection").source.id,
+            source.id
+        );
         assert!(registry.remove(&session_id).is_some());
         assert!(registry.get(&session_id).is_none());
     }

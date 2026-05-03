@@ -69,6 +69,8 @@ export interface RuntimeSnapshot {
 
 export type MediaProfile = tauriAdapter.MediaProfile;
 export type MediaProfileNegotiation = tauriAdapter.MediaProfileNegotiation;
+export type CaptureSource = tauriAdapter.CaptureSource;
+export type CaptureSourceSelection = tauriAdapter.CaptureSourceSelection;
 
 export interface ProbeSnapshot {
   session_id: string;
@@ -237,6 +239,33 @@ export const updateMediaProfile = async (
   requestedProfile: MediaProfile
 ): Promise<MediaProfileNegotiation> => {
   const result = await tauriAdapter.ipcUpdateMediaProfile(sessionId, requestedProfile);
+  return unwrapAdapterResult(result);
+};
+
+/**
+ * List remote capture sources with best-effort screenshot previews.
+ */
+export const listRemoteCaptureSources = async (
+  sessionId: string,
+  includePreviews = true,
+  limit?: number
+): Promise<CaptureSource[]> => {
+  const result = await tauriAdapter.ipcListRemoteCaptureSources(
+    sessionId,
+    includePreviews,
+    limit
+  );
+  return unwrapAdapterResult(result);
+};
+
+/**
+ * Select one remote capture source for the session.
+ */
+export const selectRemoteCaptureSource = async (
+  sessionId: string,
+  sourceId: string
+): Promise<CaptureSourceSelection> => {
+  const result = await tauriAdapter.ipcSelectRemoteCaptureSource(sessionId, sourceId);
   return unwrapAdapterResult(result);
 };
 

@@ -489,6 +489,29 @@ export interface MediaProfileNegotiation {
   reason?: string | null;
 }
 
+export interface CaptureSource {
+  id: string;
+  platform: string;
+  source_kind: string;
+  title: string;
+  class_name: string;
+  width: number;
+  height: number;
+  process_id: number;
+  app_name?: string | null;
+  bundle_identifier?: string | null;
+  preview_data_url?: string | null;
+  preview_width?: number | null;
+  preview_height?: number | null;
+}
+
+export interface CaptureSourceSelection {
+  session_id: string;
+  source: CaptureSource;
+  status: "selected" | "rejected" | string;
+  reason?: string | null;
+}
+
 export interface ProbeSnapshot {
   session_id: string;
   frames_received: number;

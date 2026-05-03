@@ -2,8 +2,8 @@
 // Verify serialization/deserialization of all IPC messages
 
 use mrd_ipc::{
-    DeviceInfo, IpcRequest, IpcResponse, MediaProfile, MediaProfileNegotiation, SessionBootstrap,
-    SessionRuntimeSnapshot,
+    CaptureSource, CaptureSourceSelection, DeviceInfo, IpcRequest, IpcResponse, MediaProfile,
+    MediaProfileNegotiation, SessionBootstrap, SessionRuntimeSnapshot,
 };
 use mrd_proto::{DeviceId, SessionId};
 
@@ -22,6 +22,24 @@ fn test_media_profile() -> MediaProfile {
         fps: 144,
         bitrate_mbps: 64,
         codec: "h264".to_string(),
+    }
+}
+
+fn test_capture_source() -> CaptureSource {
+    CaptureSource {
+        id: "windows:window:0x1234".to_string(),
+        platform: "windows".to_string(),
+        source_kind: "window".to_string(),
+        title: "Target App".to_string(),
+        class_name: "ApplicationFrameWindow".to_string(),
+        width: 1280,
+        height: 720,
+        process_id: 4242,
+        app_name: Some("Target App".to_string()),
+        bundle_identifier: None,
+        preview_data_url: Some("data:image/png;base64,AAAA".to_string()),
+        preview_width: Some(320),
+        preview_height: Some(180),
     }
 }
 
@@ -83,6 +101,34 @@ fn serialize_deserialize_update_media_profile() {
     let request = IpcRequest::UpdateMediaProfile {
         session_id: test_session_id(),
         requested_profile: test_media_profile(),
+    };
+
+    let json = serde_json::to_string(&request).unwrap();
+    let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(request, deserialized);
+}
+
+#[test]
+fn serialize_deserialize_list_remote_capture_sources() {
+    let request = IpcRequest::ListRemoteCaptureSources {
+        session_id: test_session_id(),
+        include_previews: true,
+        limit: Some(32),
+    };
+
+    let json = serde_json::to_string(&request).unwrap();
+    assert!(json.contains("ListRemoteCaptureSources"));
+    let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(request, deserialized);
+}
+
+#[test]
+fn serialize_deserialize_select_remote_capture_source() {
+    let request = IpcRequest::SelectRemoteCaptureSource {
+        session_id: test_session_id(),
+        source_id: "windows:window:0x1234".to_string(),
     };
 
     let json = serde_json::to_string(&request).unwrap();
@@ -245,6 +291,39 @@ fn serialize_deserialize_media_profile_updated_response() {
 }
 
 #[test]
+fn serialize_deserialize_capture_source_list_response() {
+    let response = IpcResponse::CaptureSourceList {
+        session_id: test_session_id(),
+        sources: vec![test_capture_source()],
+    };
+
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("preview_data_url"));
+    let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(deserialized, response);
+}
+
+#[test]
+fn serialize_deserialize_capture_source_selected_response() {
+    let selection = CaptureSourceSelection {
+        session_id: test_session_id(),
+        source: test_capture_source(),
+        status: "selected".to_string(),
+        reason: None,
+    };
+    let response = IpcResponse::CaptureSourceSelected {
+        session_id: test_session_id(),
+        selection,
+    };
+
+    let json = serde_json::to_string(&response).unwrap();
+    let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(deserialized, response);
+}
+
+#[test]
 fn serialize_deserialize_all_request_types() {
     let requests = vec![
         IpcRequest::RegisterDevice {
@@ -266,6 +345,15 @@ fn serialize_deserialize_all_request_types() {
         IpcRequest::UpdateMediaProfile {
             session_id: test_session_id(),
             requested_profile: test_media_profile(),
+        },
+        IpcRequest::ListRemoteCaptureSources {
+            session_id: test_session_id(),
+            include_previews: true,
+            limit: Some(16),
+        },
+        IpcRequest::SelectRemoteCaptureSource {
+            session_id: test_session_id(),
+            source_id: "windows:window:0x1234".to_string(),
         },
         IpcRequest::AcceptSession {
             session_id: test_session_id(),

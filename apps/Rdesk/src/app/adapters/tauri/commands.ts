@@ -25,6 +25,8 @@ import type {
   SessionInfo,
   SessionRuntimeSnapshot,
   RuntimeSnapshot,
+  CaptureSource,
+  CaptureSourceSelection,
   MediaProfile,
   MediaProfileNegotiation,
   ProbeSnapshot,
@@ -403,6 +405,34 @@ export async function ipcUpdateMediaProfile(
   return invokeAdapter<MediaProfileNegotiation>('ipc_update_media_profile', {
     sessionId,
     requestedProfile,
+  });
+}
+
+/**
+ * List remote capture sources for an active LAN session.
+ */
+export async function ipcListRemoteCaptureSources(
+  sessionId: string,
+  includePreviews = true,
+  limit?: number
+): Promise<AdapterResult<CaptureSource[]>> {
+  return invokeAdapter<CaptureSource[]>('ipc_list_remote_capture_sources', {
+    sessionId,
+    includePreviews,
+    ...(limit === undefined ? {} : { limit }),
+  });
+}
+
+/**
+ * Select the remote capture source for an active LAN session.
+ */
+export async function ipcSelectRemoteCaptureSource(
+  sessionId: string,
+  sourceId: string
+): Promise<AdapterResult<CaptureSourceSelection>> {
+  return invokeAdapter<CaptureSourceSelection>('ipc_select_remote_capture_source', {
+    sessionId,
+    sourceId,
   });
 }
 

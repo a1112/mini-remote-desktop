@@ -1,7 +1,10 @@
 use crate::app_state::{AppState, MediaProbeFrameStats};
 use anyhow::{Context, Result};
 use mrd_application::ports::SessionSnapshot;
-use mrd_ipc::{LanDiscoverySnapshot, LanPeerInfo, MediaProfile, MediaProfileNegotiation};
+use mrd_ipc::{
+    CaptureSource, CaptureSourceSelection, LanDiscoverySnapshot, LanPeerInfo, MediaProfile,
+    MediaProfileNegotiation,
+};
 use mrd_proto::{DeviceId, SessionId};
 use mrd_transport_quic_quinn::{
     fragment_access_unit, QuicAuReassembler, QuicAuReassemblerConfig, QuinnDatagramEndpoint,
@@ -24,6 +27,7 @@ const PEER_TTL_SECS: u64 = 12;
 const DISCOVERY_MAGIC: &str = "mrd-lan-discovery-v1";
 const DISCOVERY_APP_ID: &str = "rdesk";
 const DISCOVERY_PACKET_BUFFER_BYTES: usize = 65_535;
+const DISCOVERY_SAFE_UDP_PAYLOAD_BYTES: usize = 60_000;
 const LAN_MEDIA_TARGET_WIDTH: u32 = 2560;
 const LAN_MEDIA_TARGET_HEIGHT: u32 = 1440;
 const LAN_MEDIA_TARGET_FPS: u32 = 144;
@@ -32,6 +36,7 @@ const LAN_QUIC_FALLBACK_DATAGRAM_BYTES: usize = 1_200;
 const LAN_QUIC_MEDIA_TRANSPORT: &str = "quic_datagram";
 const LAN_QUIC_MEDIA_PROFILE_TRANSPORT: &str = "quic_datagram_2k144";
 const LAN_MEDIA_PROFILE_CONTROL_TRANSPORT: &str = "media_profile_control_v1";
+const LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT: &str = "capture_source_control_v1";
 const LAN_MEDIA_PROBE_MAGIC: &[u8; 8] = b"MRDMPF01";
 const LAN_MEDIA_PROBE_HEADER_BYTES: usize = 56;
 const LAN_MEDIA_PROBE_2K144_FORMAT: &str = "compressed_2k144_test_pattern";
@@ -267,6 +272,50 @@ enum LanDiscoveryPacket {
         message: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         media_profile: Option<MediaProfileNegotiation>,
+        timestamp_ms: u64,
+    },
+    CaptureSourcesRequest {
+        magic: String,
+        #[serde(default = "default_app_id")]
+        app_id: String,
+        instance_id: String,
+        session_id: String,
+        source_device_id: String,
+        include_previews: bool,
+        limit: Option<u32>,
+        timestamp_ms: u64,
+    },
+    CaptureSourcesAck {
+        magic: String,
+        #[serde(default = "default_app_id")]
+        app_id: String,
+        instance_id: String,
+        session_id: String,
+        accepted: bool,
+        message: Option<String>,
+        sources: Vec<CaptureSource>,
+        timestamp_ms: u64,
+    },
+    CaptureSourceSelect {
+        magic: String,
+        #[serde(default = "default_app_id")]
+        app_id: String,
+        instance_id: String,
+        session_id: String,
+        source_device_id: String,
+        source_id: String,
+        timestamp_ms: u64,
+    },
+    CaptureSourceSelectAck {
+        magic: String,
+        #[serde(default = "default_app_id")]
+        app_id: String,
+        instance_id: String,
+        session_id: String,
+        accepted: bool,
+        message: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selection: Option<CaptureSourceSelection>,
         timestamp_ms: u64,
     },
 }
@@ -549,6 +598,119 @@ pub async fn request_lan_media_profile_update(
     }
 }
 
+pub async fn request_lan_capture_sources(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+    include_previews: bool,
+    limit: Option<u32>,
+) -> Result<Vec<CaptureSource>> {
+    let peer_device_id = session_remote_peer(app_state, session_id).await?;
+    let target =
+        peer_control_addr_with_capture_source_capability(app_state, &peer_device_id).await?;
+    let source_device_id = local_device_id(app_state).await?;
+
+    let socket = UdpSocket::bind(("0.0.0.0", 0))
+        .await
+        .context("failed to bind LAN capture sources request UDP socket")?;
+    let packet = LanDiscoveryPacket::CaptureSourcesRequest {
+        magic: DISCOVERY_MAGIC.to_string(),
+        app_id: DISCOVERY_APP_ID.to_string(),
+        instance_id: app_state.lan_discovery.instance_id.clone(),
+        session_id: session_id.0.clone(),
+        source_device_id,
+        include_previews,
+        limit,
+        timestamp_ms: now_ms(),
+    };
+    send_packet(&socket, &packet, target).await?;
+
+    let mut buffer = vec![0_u8; DISCOVERY_PACKET_BUFFER_BYTES];
+    let (len, _) = timeout(Duration::from_secs(3), socket.recv_from(&mut buffer))
+        .await
+        .context("LAN capture sources request timed out")??;
+    let ack: LanDiscoveryPacket = serde_json::from_slice(&buffer[..len])?;
+    match ack {
+        LanDiscoveryPacket::CaptureSourcesAck {
+            magic,
+            app_id,
+            session_id: ack_session_id,
+            accepted,
+            message,
+            sources,
+            ..
+        } if is_valid_discovery_packet(&magic, &app_id) && ack_session_id == session_id.0 => {
+            if accepted {
+                Ok(sources)
+            } else {
+                anyhow::bail!(
+                    "LAN peer rejected capture source listing: {}",
+                    message.unwrap_or_else(|| "unknown reason".to_string())
+                );
+            }
+        }
+        _ => anyhow::bail!("unexpected LAN capture sources response"),
+    }
+}
+
+pub async fn request_lan_capture_source_select(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+    source_id: String,
+) -> Result<CaptureSourceSelection> {
+    let peer_device_id = session_remote_peer(app_state, session_id).await?;
+    let target =
+        peer_control_addr_with_capture_source_capability(app_state, &peer_device_id).await?;
+    let source_device_id = local_device_id(app_state).await?;
+
+    let socket = UdpSocket::bind(("0.0.0.0", 0))
+        .await
+        .context("failed to bind LAN capture source select UDP socket")?;
+    let packet = LanDiscoveryPacket::CaptureSourceSelect {
+        magic: DISCOVERY_MAGIC.to_string(),
+        app_id: DISCOVERY_APP_ID.to_string(),
+        instance_id: app_state.lan_discovery.instance_id.clone(),
+        session_id: session_id.0.clone(),
+        source_device_id,
+        source_id,
+        timestamp_ms: now_ms(),
+    };
+    send_packet(&socket, &packet, target).await?;
+
+    let mut buffer = vec![0_u8; DISCOVERY_PACKET_BUFFER_BYTES];
+    let (len, _) = timeout(Duration::from_secs(2), socket.recv_from(&mut buffer))
+        .await
+        .context("LAN capture source select timed out")??;
+    let ack: LanDiscoveryPacket = serde_json::from_slice(&buffer[..len])?;
+    match ack {
+        LanDiscoveryPacket::CaptureSourceSelectAck {
+            magic,
+            app_id,
+            session_id: ack_session_id,
+            accepted,
+            message,
+            selection,
+            ..
+        } if is_valid_discovery_packet(&magic, &app_id) && ack_session_id == session_id.0 => {
+            if accepted {
+                let selection =
+                    selection.context("LAN peer accepted capture source without selection")?;
+                app_state
+                    .capture_sources
+                    .lock()
+                    .await
+                    .set(session_id.clone(), selection.clone());
+                Ok(selection)
+            } else {
+                anyhow::bail!(
+                    "LAN peer rejected capture source select: {}",
+                    message.unwrap_or_else(|| "unknown reason".to_string())
+                );
+            }
+        }
+        _ => anyhow::bail!("unexpected LAN capture source select response"),
+    }
+}
+
 async fn announce_loop(socket: Arc<UdpSocket>, app_state: Arc<AppState>) {
     let mut ticker = interval(app_state.lan_discovery.config.announce_interval);
     loop {
@@ -705,6 +867,90 @@ async fn handle_packet(
             send_packet(socket, &ack, addr).await?;
         }
         LanDiscoveryPacket::MediaProfileUpdateAck { .. } => {}
+        LanDiscoveryPacket::CaptureSourcesRequest {
+            magic,
+            app_id,
+            instance_id,
+            session_id,
+            source_device_id,
+            include_previews,
+            limit,
+            ..
+        } => {
+            if !is_valid_discovery_packet(&magic, &app_id)
+                || instance_id == app_state.lan_discovery.instance_id()
+            {
+                return Ok(());
+            }
+
+            let sources_result = accept_lan_capture_sources_request(
+                app_state,
+                &SessionId(session_id.clone()),
+                include_previews,
+                limit,
+            )
+            .await;
+            let (accepted, message, sources) = match sources_result {
+                Ok(sources) => (true, Some("listed".to_string()), sources),
+                Err(error) => (false, Some(error.to_string()), Vec::new()),
+            };
+            tracing::info!(
+                session_id = %session_id,
+                source_device_id = %source_device_id,
+                accepted,
+                "handled LAN capture sources request"
+            );
+            let ack = fit_capture_sources_ack_packet(
+                app_state.lan_discovery.instance_id.clone(),
+                session_id,
+                accepted,
+                message,
+                sources,
+            );
+            send_packet(socket, &ack, addr).await?;
+        }
+        LanDiscoveryPacket::CaptureSourcesAck { .. } => {}
+        LanDiscoveryPacket::CaptureSourceSelect {
+            magic,
+            app_id,
+            instance_id,
+            session_id,
+            source_device_id,
+            source_id,
+            ..
+        } => {
+            if !is_valid_discovery_packet(&magic, &app_id)
+                || instance_id == app_state.lan_discovery.instance_id()
+            {
+                return Ok(());
+            }
+
+            let session_id = SessionId(session_id);
+            let select_result =
+                accept_lan_capture_source_select(app_state, &session_id, &source_id).await;
+            let (accepted, message, selection) = match select_result {
+                Ok(selection) => (true, Some("selected".to_string()), Some(selection)),
+                Err(error) => (false, Some(error.to_string()), None),
+            };
+            tracing::info!(
+                session_id = %session_id.0,
+                source_device_id = %source_device_id,
+                accepted,
+                "handled LAN capture source select"
+            );
+            let ack = LanDiscoveryPacket::CaptureSourceSelectAck {
+                magic: DISCOVERY_MAGIC.to_string(),
+                app_id: DISCOVERY_APP_ID.to_string(),
+                instance_id: app_state.lan_discovery.instance_id.clone(),
+                session_id: session_id.0,
+                accepted,
+                message,
+                selection,
+                timestamp_ms: now_ms(),
+            };
+            send_packet(socket, &ack, addr).await?;
+        }
+        LanDiscoveryPacket::CaptureSourceSelectAck { .. } => {}
     }
 
     Ok(())
@@ -832,6 +1078,75 @@ async fn accept_lan_media_profile_update(
     Ok(negotiation)
 }
 
+async fn accept_lan_capture_sources_request(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+    include_previews: bool,
+    limit: Option<u32>,
+) -> Result<Vec<CaptureSource>> {
+    ensure_active_sender_session(app_state, session_id, "capture source listing").await?;
+    crate::capture_source::list_capture_sources(include_previews, limit)
+}
+
+async fn accept_lan_capture_source_select(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+    source_id: &str,
+) -> Result<CaptureSourceSelection> {
+    let source = crate::capture_source::find_capture_source(source_id)?;
+    accept_lan_capture_source_select_from_sources(app_state, session_id, source_id, vec![source])
+        .await
+}
+
+async fn accept_lan_capture_source_select_from_sources(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+    source_id: &str,
+    sources: Vec<CaptureSource>,
+) -> Result<CaptureSourceSelection> {
+    ensure_active_sender_session(app_state, session_id, "capture source selection").await?;
+    let source = sources
+        .into_iter()
+        .find(|source| source.id.eq_ignore_ascii_case(source_id))
+        .with_context(|| format!("capture source not found: {source_id}"))?;
+    let selection = CaptureSourceSelection {
+        session_id: session_id.clone(),
+        source,
+        status: "selected".to_string(),
+        reason: None,
+    };
+    app_state
+        .capture_sources
+        .lock()
+        .await
+        .set(session_id.clone(), selection.clone());
+    Ok(selection)
+}
+
+async fn ensure_active_sender_session(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+    operation: &str,
+) -> Result<()> {
+    let sessions = app_state.sessions.lock().await;
+    let snapshot = sessions
+        .get(session_id)
+        .with_context(|| format!("session not found: {}", session_id.0))?;
+    if normalize_transport_kind(&snapshot.transport) != "quic" {
+        anyhow::bail!("{operation} is only supported for LAN QUIC sessions");
+    }
+    if !snapshot.sender_active {
+        anyhow::bail!("{operation} requires an active target sender session");
+    }
+    if snapshot.lifecycle_state == "closed" || snapshot.lifecycle_state == "failed" {
+        anyhow::bail!(
+            "{operation} rejected for {} session",
+            snapshot.lifecycle_state
+        );
+    }
+    Ok(())
+}
+
 async fn build_announcement(app_state: &Arc<AppState>) -> Option<LanAnnouncement> {
     let (device_id, device_name) = {
         let devices = app_state.devices.lock().await;
@@ -854,6 +1169,7 @@ async fn build_announcement(app_state: &Arc<AppState>) -> Option<LanAnnouncement
             LAN_QUIC_MEDIA_TRANSPORT.to_string(),
             LAN_QUIC_MEDIA_PROFILE_TRANSPORT.to_string(),
             LAN_MEDIA_PROFILE_CONTROL_TRANSPORT.to_string(),
+            LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT.to_string(),
         ],
         timestamp_ms: now_ms(),
     })
@@ -967,12 +1283,124 @@ fn ensure_peer_supports_requested_media(
     Ok(())
 }
 
+async fn peer_control_addr_with_capture_source_capability(
+    app_state: &Arc<AppState>,
+    peer_device_id: &DeviceId,
+) -> Result<SocketAddr> {
+    let target = app_state
+        .lan_discovery
+        .peer_control_addr(peer_device_id)
+        .await
+        .with_context(|| format!("LAN peer not found: {}", peer_device_id.0))?;
+    let peer_transports = app_state
+        .lan_discovery
+        .peer_transports(peer_device_id)
+        .await
+        .with_context(|| format!("LAN peer not found: {}", peer_device_id.0))?;
+    if !peer_transports
+        .iter()
+        .any(|transport| transport.eq_ignore_ascii_case(LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT))
+    {
+        anyhow::bail!(
+            "LAN peer does not advertise required capture source control [{}]: {} supports {}. Rebuild and restart the peer mrd-service/Rdesk from the latest main branch",
+            LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT,
+            peer_device_id.0,
+            format_peer_transports(&peer_transports)
+        );
+    }
+    Ok(target)
+}
+
+async fn session_remote_peer(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+) -> Result<DeviceId> {
+    let sessions = app_state.sessions.lock().await;
+    let snapshot = sessions
+        .get(session_id)
+        .with_context(|| format!("session not found: {}", session_id.0))?;
+    snapshot
+        .target_device_id
+        .clone()
+        .or_else(|| snapshot.source_device_id.clone())
+        .with_context(|| format!("session has no remote peer: {}", session_id.0))
+}
+
+async fn local_device_id(app_state: &Arc<AppState>) -> Result<String> {
+    let devices = app_state.devices.lock().await;
+    devices
+        .get_local_device()
+        .map(|(id, _)| id.0.clone())
+        .context("local device is not registered")
+}
+
 fn format_peer_transports(peer_transports: &[String]) -> String {
     if peer_transports.is_empty() {
         "none".to_string()
     } else {
         peer_transports.join(", ")
     }
+}
+
+fn fit_capture_sources_ack_packet(
+    instance_id: String,
+    session_id: String,
+    accepted: bool,
+    message: Option<String>,
+    sources: Vec<CaptureSource>,
+) -> LanDiscoveryPacket {
+    let mut packet = LanDiscoveryPacket::CaptureSourcesAck {
+        magic: DISCOVERY_MAGIC.to_string(),
+        app_id: DISCOVERY_APP_ID.to_string(),
+        instance_id,
+        session_id,
+        accepted,
+        message,
+        sources,
+        timestamp_ms: now_ms(),
+    };
+
+    while serialized_packet_len(&packet) > DISCOVERY_SAFE_UDP_PAYLOAD_BYTES {
+        let LanDiscoveryPacket::CaptureSourcesAck { sources, .. } = &mut packet else {
+            break;
+        };
+
+        if let Some(index) = largest_preview_source_index(sources) {
+            sources[index].preview_data_url = None;
+            sources[index].preview_width = None;
+            sources[index].preview_height = None;
+            continue;
+        }
+
+        if sources.len() > 1 {
+            sources.pop();
+            continue;
+        }
+
+        break;
+    }
+
+    packet
+}
+
+fn serialized_packet_len(packet: &LanDiscoveryPacket) -> usize {
+    serde_json::to_vec(packet)
+        .map(|bytes| bytes.len())
+        .unwrap_or(usize::MAX)
+}
+
+fn largest_preview_source_index(sources: &[CaptureSource]) -> Option<usize> {
+    sources
+        .iter()
+        .enumerate()
+        .filter_map(|(index, source)| {
+            source
+                .preview_data_url
+                .as_ref()
+                .map(|preview| (index, preview.len()))
+        })
+        .max_by_key(|(_, preview_len)| *preview_len)
+        .map(|(index, _)| index)
 }
 
 fn spawn_quic_media_sender(
@@ -1755,6 +2183,109 @@ mod tests {
         assert_eq!(negotiation.selected.fps, 144);
         assert_eq!(negotiation.selected.bitrate_mbps, 64);
         assert_eq!(negotiation.selected.codec, "h264");
+    }
+
+    #[tokio::test]
+    async fn capture_source_selection_changes_active_sender_session() {
+        let app_state = Arc::new(AppState::new());
+        let session_id = SessionId("capture-source-session".to_string());
+        app_state.sessions.lock().await.insert(
+            session_id.clone(),
+            SessionSnapshot {
+                session_id: session_id.clone(),
+                transport: "quic".to_string(),
+                source_device_id: Some(DeviceId("controller-device".to_string())),
+                target_device_id: None,
+                local_listen_addr: None,
+                local_server_name: None,
+                local_cert_der_b64: None,
+                remote_listen_addr: None,
+                remote_server_name: None,
+                remote_cert_der_b64: None,
+                lifecycle_state: "listening".to_string(),
+                last_error: None,
+                sender_active: true,
+                receiver_active: false,
+            },
+        );
+
+        let source = mrd_ipc::CaptureSource {
+            id: "windows:window:0x1234".to_string(),
+            platform: "windows".to_string(),
+            source_kind: "window".to_string(),
+            title: "Target App".to_string(),
+            class_name: "ApplicationFrameWindow".to_string(),
+            width: 1280,
+            height: 720,
+            process_id: 4242,
+            app_name: Some("Target App".to_string()),
+            bundle_identifier: None,
+            preview_data_url: None,
+            preview_width: None,
+            preview_height: None,
+        };
+        let selection = accept_lan_capture_source_select_from_sources(
+            &app_state,
+            &session_id,
+            "windows:window:0x1234",
+            vec![source],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(selection.status, "selected");
+        assert_eq!(selection.source.id, "windows:window:0x1234");
+        assert_eq!(
+            app_state
+                .capture_sources
+                .lock()
+                .await
+                .get(&session_id)
+                .expect("selected capture source")
+                .source
+                .source_kind,
+            "window"
+        );
+    }
+
+    #[test]
+    fn capture_sources_ack_trims_preview_payload_to_udp_budget() {
+        let sources = (0..24)
+            .map(|index| mrd_ipc::CaptureSource {
+                id: format!("windows:window:0x{:X}", index + 0x1000),
+                platform: "windows".to_string(),
+                source_kind: "window".to_string(),
+                title: format!("Target App {index}"),
+                class_name: "ApplicationFrameWindow".to_string(),
+                width: 1280,
+                height: 720,
+                process_id: 4242 + index,
+                app_name: Some(format!("Target App {index}")),
+                bundle_identifier: None,
+                preview_data_url: Some(format!("data:image/png;base64,{}", "A".repeat(8_000))),
+                preview_width: Some(240),
+                preview_height: Some(135),
+            })
+            .collect();
+
+        let packet = fit_capture_sources_ack_packet(
+            "target-instance".to_string(),
+            "capture-source-session".to_string(),
+            true,
+            Some("listed".to_string()),
+            sources,
+        );
+
+        assert!(serialized_packet_len(&packet) <= DISCOVERY_SAFE_UDP_PAYLOAD_BYTES);
+        let LanDiscoveryPacket::CaptureSourcesAck { sources, .. } = packet else {
+            panic!("expected capture sources ack");
+        };
+        assert!(sources
+            .iter()
+            .any(|source| source.preview_data_url.is_some()));
+        assert!(sources
+            .iter()
+            .any(|source| source.preview_data_url.is_none()));
     }
 
     #[test]

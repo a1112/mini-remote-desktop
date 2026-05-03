@@ -43,8 +43,12 @@ import {
 import {
   getProbeSnapshot,
   getSessionSnapshot,
+  listRemoteCaptureSources,
+  selectRemoteCaptureSource,
   startReceiver,
   updateMediaProfile,
+  type CaptureSource,
+  type CaptureSourceSelection,
   type MediaProfileNegotiation,
   type ProbeSnapshot,
   type SessionRuntimeSnapshot,
@@ -269,6 +273,10 @@ export function RemoteDisplayWindowPage() {
   const [probeSnapshot, setProbeSnapshot] = useState<ProbeSnapshot | null>(null);
   const [mediaProfileNegotiation, setMediaProfileNegotiation] =
     useState<MediaProfileNegotiation | null>(null);
+  const [captureSources, setCaptureSources] = useState<CaptureSource[]>([]);
+  const [captureSourcesLoading, setCaptureSourcesLoading] = useState(false);
+  const [captureSourceSelection, setCaptureSourceSelection] =
+    useState<CaptureSourceSelection | null>(null);
 
   const sessionId = id ?? context?.session_id ?? "local-preview";
   const activeSurfaceId = context?.surface_id ?? surfaceId;
@@ -1005,6 +1013,49 @@ export function RemoteDisplayWindowPage() {
     }
   }, [buildRemoteMediaProfile, isLocalPipelinePreview, sessionId, transport]);
 
+  const handleRefreshRemoteCaptureSources = useCallback(async () => {
+    if (isLocalPipelinePreview) return;
+
+    setCaptureSourcesLoading(true);
+    setLastError(null);
+    setTestMessage("正在枚举远端窗口源");
+    try {
+      const sources = await listRemoteCaptureSources(sessionId, true, 24);
+      setCaptureSources(sources);
+      setTestMessage(
+        sources.length > 0
+          ? `已获取 ${sources.length} 个远端窗口源`
+          : "未发现可捕获的远端窗口"
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setCaptureSources([]);
+      setLastError(message);
+      setTestMessage(message);
+    } finally {
+      setCaptureSourcesLoading(false);
+    }
+  }, [isLocalPipelinePreview, sessionId]);
+
+  const handleSelectRemoteCaptureSource = useCallback(
+    async (source: CaptureSource) => {
+      if (isLocalPipelinePreview) return;
+
+      setLastError(null);
+      setTestMessage(`正在切换远端窗口源: ${source.title}`);
+      try {
+        const selection = await selectRemoteCaptureSource(sessionId, source.id);
+        setCaptureSourceSelection(selection);
+        setTestMessage(`远端窗口源已切换: ${selection.source.title}`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        setLastError(message);
+        setTestMessage(message);
+      }
+    },
+    [isLocalPipelinePreview, sessionId]
+  );
+
   const handleStartTest = async () => {
     if (!isLocalPipelinePreview) {
       await handleStartRemoteReceiver();
@@ -1252,7 +1303,7 @@ export function RemoteDisplayWindowPage() {
           style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}
           data-no-drag="true"
         >
-          <div className="flex max-h-[calc(100vh-2rem)] w-full max-w-3xl flex-col rounded-lg border border-white/10 bg-[#0f1724] shadow-2xl">
+          <div className="flex max-h-[calc(100vh-2rem)] w-full max-w-5xl flex-col rounded-lg border border-white/10 bg-[#0f1724] shadow-2xl">
             <div className="flex items-center justify-between border-b border-white/10 px-4 py-3">
               <div>
                 <div className="text-sm font-semibold text-slate-100">测试配置</div>
@@ -1305,6 +1356,88 @@ export function RemoteDisplayWindowPage() {
                 onChange={setBitrate}
               />
             </div>
+
+            {!isLocalPipelinePreview && (
+              <div className="border-t border-white/10 px-4 py-4">
+                <div className="mb-3 flex items-center justify-between gap-3">
+                  <div>
+                    <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.18em] text-slate-300">
+                      <PanelTop className="h-3.5 w-3.5 text-cyan-300" />
+                      远端窗口源
+                    </div>
+                    <div className="mt-1 text-[11px] text-slate-500">
+                      枚举远端可捕获窗口，带截图预览，选中后只采集该窗口。
+                    </div>
+                  </div>
+                  <button
+                    className="inline-flex items-center gap-2 rounded-md border border-cyan-400/30 px-3 py-1.5 text-[11px] font-medium text-cyan-100 hover:bg-cyan-500/15 disabled:opacity-50"
+                    onClick={() => void handleRefreshRemoteCaptureSources()}
+                    disabled={captureSourcesLoading}
+                  >
+                    {captureSourcesLoading && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                    刷新窗口源
+                  </button>
+                </div>
+
+                {captureSources.length === 0 ? (
+                  <div className="rounded-lg border border-white/10 bg-black/20 px-3 py-4 text-center text-[11px] text-slate-500">
+                    暂无窗口源。点击刷新从远端设备获取当前窗口列表。
+                  </div>
+                ) : (
+                  <div className="grid max-h-80 gap-3 overflow-y-auto pr-1 sm:grid-cols-2 lg:grid-cols-3">
+                    {captureSources.map((source) => {
+                      const selected = captureSourceSelection?.source.id === source.id;
+                      return (
+                        <button
+                          key={source.id}
+                          type="button"
+                          aria-label={`选择 ${source.title}`}
+                          onClick={() => void handleSelectRemoteCaptureSource(source)}
+                          className={[
+                            "overflow-hidden rounded-lg border bg-black/25 text-left transition",
+                            selected
+                              ? "border-emerald-300/70 shadow-[0_0_0_1px_rgba(110,231,183,0.35)]"
+                              : "border-white/10 hover:border-cyan-300/60 hover:bg-cyan-500/10",
+                          ].join(" ")}
+                        >
+                          <div className="aspect-video bg-slate-950">
+                            {source.preview_data_url ? (
+                              <img
+                                src={source.preview_data_url}
+                                alt=""
+                                className="h-full w-full object-cover"
+                              />
+                            ) : (
+                              <div className="flex h-full w-full items-center justify-center text-[10px] text-slate-600">
+                                无预览
+                              </div>
+                            )}
+                          </div>
+                          <div className="space-y-1 px-3 py-2">
+                            <div className="truncate text-xs font-medium text-slate-100">
+                              {source.title}
+                            </div>
+                            <div className="flex items-center justify-between gap-2 text-[10px] text-slate-500">
+                              <span className="truncate">
+                                {source.app_name ?? source.class_name ?? source.platform}
+                              </span>
+                              <span className="shrink-0">
+                                {source.width}x{source.height}
+                              </span>
+                            </div>
+                            {selected && (
+                              <div className="text-[10px] font-medium text-emerald-300">
+                                已选中
+                              </div>
+                            )}
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
 
             <div className="flex items-center justify-between border-t border-white/10 px-4 py-3">
               <div className="text-[11px] text-slate-500">

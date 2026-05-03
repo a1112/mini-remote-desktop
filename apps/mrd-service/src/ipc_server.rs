@@ -176,6 +176,27 @@ impl IpcServer {
                 session::update_media_profile(&self.app_state, session_id, requested_profile).await
             }
 
+            IpcRequest::ListRemoteCaptureSources {
+                session_id,
+                include_previews,
+                limit,
+            } => {
+                session::list_remote_capture_sources(
+                    &self.app_state,
+                    session_id,
+                    include_previews,
+                    limit,
+                )
+                .await
+            }
+
+            IpcRequest::SelectRemoteCaptureSource {
+                session_id,
+                source_id,
+            } => {
+                session::select_remote_capture_source(&self.app_state, session_id, source_id).await
+            }
+
             IpcRequest::AcceptSession {
                 session_id,
                 source_device_id,

@@ -1082,6 +1082,58 @@ async fn ipc_update_media_profile(
     }
 }
 
+/// List remote capture sources through mrd-service IPC.
+#[tauri::command]
+async fn ipc_list_remote_capture_sources(
+    session_id: String,
+    include_previews: bool,
+    limit: Option<u32>,
+) -> Result<Vec<mrd_ipc::CaptureSource>, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+    use mrd_proto::SessionId;
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::ListRemoteCaptureSources {
+            session_id: SessionId(session_id),
+            include_previews,
+            limit,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::CaptureSourceList { sources, .. } => Ok(sources),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+/// Select a remote capture source through mrd-service IPC.
+#[tauri::command]
+async fn ipc_select_remote_capture_source(
+    session_id: String,
+    source_id: String,
+) -> Result<mrd_ipc::CaptureSourceSelection, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+    use mrd_proto::SessionId;
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::SelectRemoteCaptureSource {
+            session_id: SessionId(session_id),
+            source_id,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::CaptureSourceSelected { selection, .. } => Ok(selection),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
 /// Accept session via IPC (migrated version)
 #[tauri::command]
 async fn ipc_accept_session(
@@ -2229,6 +2281,8 @@ fn main() {
             ipc_start_session,
             ipc_start_lan_remote_session,
             ipc_update_media_profile,
+            ipc_list_remote_capture_sources,
+            ipc_select_remote_capture_source,
             ipc_accept_session,
             ipc_stop_session,
             ipc_fail_session,
