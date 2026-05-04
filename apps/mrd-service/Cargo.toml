@@ -31,3 +31,6 @@ tracing-subscriber.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 mrd-capture-winrt = { path = "../../crates/mrd-capture-winrt" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mrd-capture-macos = { path = "../../crates/mrd-capture-macos" }

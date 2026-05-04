@@ -232,4 +232,71 @@ describe("RenderTestPage platform capabilities", () => {
       )
     );
   });
+
+  it("displays rendered preview frames while the native Metal run is active", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve({
+          os_type: "macos",
+          cpu_brand: "test",
+          cpu_cores: 8,
+          memory_gb: 16,
+          gpu_info: "Apple GPU",
+          available_captures: ["macos", "synthetic"],
+          available_encoders: ["videotoolbox_h264", "openh264"],
+          available_decoders: ["software", "none"],
+          available_renderers: ["macos"],
+          available_memory_modes: ["cpu"],
+        });
+      }
+      if (command === "test_start_run") return Promise.resolve("run-metal");
+      if (command === "test_harness_get_metrics") {
+        return Promise.resolve({
+          is_running: true,
+          capture_fps: 60,
+          capture_latency_p50_ms: 8,
+          capture_latency_p95_ms: 12,
+          encode_latency_p50_ms: 0,
+          encode_latency_p95_ms: 0,
+          transport_latency_p50_ms: 0,
+          transport_latency_p95_ms: 0,
+          decode_latency_p50_ms: 0,
+          decode_latency_p95_ms: 0,
+          total_latency_p50_ms: 11,
+          total_latency_p95_ms: 16,
+          frame_count: 60,
+          dropped_frames: 0,
+          resolution: [1920, 1080],
+        });
+      }
+      if (command === "test_harness_get_frames") {
+        return Promise.resolve([null, ["AAAA", 2, 2, 7]]);
+      }
+      if (command === "test_get_run") {
+        return Promise.resolve({
+          run_id: "run-metal",
+          scenario_id: "custom",
+          run_mode: "manual",
+          status: "running",
+          started_at: Date.now(),
+          finished_at: null,
+          config_snapshot: {},
+          environment_snapshot: {},
+          summary: null,
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    render(<RenderTestPage />);
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /Metal/ })).toBeEnabled()
+    );
+    fireEvent.click(screen.getByRole("button", { name: /启动测试/ }));
+
+    const image = await screen.findByRole("img", { name: "Render preview" });
+    expect(image).toHaveAttribute("src", "data:image/png;base64,AAAA");
+  });
 });

@@ -904,7 +904,14 @@ impl TestOrchestrator {
                 let metrics = harness.lock().unwrap().get_metrics();
 
                 if let Some(error) = metrics.error_message.clone() {
-                    let _ = harness.lock().unwrap().stop();
+                    {
+                        let harness = harness.lock().unwrap();
+                        harness.request_stop();
+                    }
+                    let harness_for_stop = Arc::clone(&harness);
+                    thread::spawn(move || {
+                        let _ = harness_for_stop.lock().unwrap().stop();
+                    });
                     mark_run_failed(
                         &orchestrator_runs,
                         &orchestrator_events,
@@ -963,16 +970,22 @@ impl TestOrchestrator {
 
                 if now_ms().saturating_sub(started_at) >= duration_ms {
                     let metrics = {
-                        let mut harness = harness.lock().unwrap();
-                        let _ = harness.stop();
+                        let harness = harness.lock().unwrap();
+                        harness.request_stop();
                         harness.get_metrics()
                     };
-                    let mut runs = orchestrator_runs.lock().unwrap();
-                    if let Some(run) = runs.get_mut(&run_id_clone) {
-                        run.status = RunStatus::Completed;
-                        run.finished_at = Some(now_ms());
-                        run.summary = Some(summary_from_metrics(run.started_at, &metrics));
+                    {
+                        let mut runs = orchestrator_runs.lock().unwrap();
+                        if let Some(run) = runs.get_mut(&run_id_clone) {
+                            run.status = RunStatus::Completed;
+                            run.finished_at = Some(now_ms());
+                            run.summary = Some(summary_from_metrics(run.started_at, &metrics));
+                        }
                     }
+                    let harness_for_stop = Arc::clone(&harness);
+                    thread::spawn(move || {
+                        let _ = harness_for_stop.lock().unwrap().stop();
+                    });
                     break;
                 }
             }
@@ -1932,18 +1945,29 @@ impl TestOrchestrator {
 
     /// Stop a running test
     pub fn stop_run(&self, run_id: &str) -> Result<()> {
-        let mut runs = self.runs.lock().unwrap();
-        if let Some(run) = runs.get_mut(run_id) {
-            if run.status == RunStatus::Running {
-                let metrics = {
-                    let mut harness = self.harness.lock().unwrap();
-                    let _ = harness.stop();
-                    harness.get_metrics()
-                };
-                run.status = RunStatus::Cancelled;
-                run.finished_at = Some(now_ms());
-                run.summary = Some(summary_from_metrics(run.started_at, &metrics));
+        let mut should_stop_harness = false;
+        {
+            let mut runs = self.runs.lock().unwrap();
+            if let Some(run) = runs.get_mut(run_id) {
+                if run.status == RunStatus::Running {
+                    let metrics = {
+                        let harness = self.harness.lock().unwrap();
+                        harness.request_stop();
+                        harness.get_metrics()
+                    };
+                    run.status = RunStatus::Cancelled;
+                    run.finished_at = Some(now_ms());
+                    run.summary = Some(summary_from_metrics(run.started_at, &metrics));
+                    should_stop_harness = true;
+                }
             }
+        }
+
+        if should_stop_harness {
+            let harness = Arc::clone(&self.harness);
+            thread::spawn(move || {
+                let _ = harness.lock().unwrap().stop();
+            });
         }
         Ok(())
     }
@@ -3048,6 +3072,34 @@ mod tests {
     }
 
     #[test]
+    fn harness_config_requires_explicit_render_display_for_macos_metal() {
+        let legacy_config = TestConfigData {
+            renderer_type: Some("macos".to_string()),
+            ..Default::default()
+        };
+        let metal_config = TestConfigData {
+            renderer_type: Some("metal".to_string()),
+            render_display: Some(true),
+            ..Default::default()
+        };
+        let macos_config = TestConfigData {
+            renderer_type: Some("macos".to_string()),
+            render_display: Some(true),
+            ..Default::default()
+        };
+
+        assert_eq!(harness_config_from_data(&legacy_config).renderer, None);
+        assert_eq!(
+            harness_config_from_data(&metal_config).renderer,
+            Some(RendererType::Macos)
+        );
+        assert_eq!(
+            harness_config_from_data(&macos_config).renderer,
+            Some(RendererType::Macos)
+        );
+    }
+
+    #[test]
     fn harness_config_passes_d3d11_renderer_target_hwnd() {
         let config = TestConfigData {
             renderer_type: Some("d3d11".to_string()),
@@ -3093,6 +3145,40 @@ mod tests {
             harness_config_from_data(&config).visual_preview,
             Some(false)
         );
+    }
+
+    #[test]
+    fn stop_run_marks_run_cancelled_before_harness_join_completes() {
+        let orchestrator = TestOrchestrator::default();
+        let run_id = "run-stop-smoke".to_string();
+        let started_at = now_ms();
+        orchestrator.runs.lock().unwrap().insert(
+            run_id.clone(),
+            TestRun {
+                run_id: run_id.clone(),
+                scenario_id: "custom".to_string(),
+                run_mode: RunMode::Manual,
+                status: RunStatus::Running,
+                started_at,
+                finished_at: None,
+                config_snapshot: TestConfigData::default(),
+                environment_snapshot: test_env(),
+                summary: None,
+            },
+        );
+
+        orchestrator.stop_run(&run_id).expect("stop run");
+
+        let run = orchestrator
+            .runs
+            .lock()
+            .unwrap()
+            .get(&run_id)
+            .cloned()
+            .expect("run should remain recorded");
+        assert_eq!(run.status, RunStatus::Cancelled);
+        assert!(run.finished_at.is_some());
+        assert!(run.summary.is_some());
     }
 
     #[cfg(windows)]

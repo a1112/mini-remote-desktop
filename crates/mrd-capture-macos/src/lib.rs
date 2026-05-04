@@ -38,6 +38,15 @@ enum MacosCaptureBackend {
 }
 
 #[derive(Debug, Clone)]
+pub struct MacosDisplayCaptureTarget {
+    pub display_id: u32,
+    pub title: String,
+    pub width: u32,
+    pub height: u32,
+    pub is_main: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct MacosWindowCaptureTarget {
     pub window_id: u32,
     pub title: String,
@@ -86,6 +95,10 @@ impl MacosScreenCapture {
     pub fn new_primary() -> Result<Self, PipelineError> {
         let display = CGDisplay::main();
         Self::new(display)
+    }
+
+    pub fn new_display_id(display_id: u32) -> Result<Self, PipelineError> {
+        Self::new(CGDisplay::new(display_id))
     }
 
     pub fn new(display: CGDisplay) -> Result<Self, PipelineError> {
@@ -221,6 +234,43 @@ impl FrameCapture for MacosScreenCapture {
             .ok_or_else(|| PipelineError::message("macOS capture has no fallback backend"))?
             .capture_frame()
     }
+}
+
+pub fn enumerate_display_capture_targets() -> Result<Vec<MacosDisplayCaptureTarget>, PipelineError>
+{
+    let display_ids = CGDisplay::active_displays().map_err(|error| {
+        PipelineError::message(format!("CoreGraphics active display query failed: {error}"))
+    })?;
+    let main_display_id = CGDisplay::main().id;
+    let mut targets = Vec::with_capacity(display_ids.len());
+
+    for (index, display_id) in display_ids.into_iter().enumerate() {
+        let display = CGDisplay::new(display_id);
+        let width = u32::try_from(display.pixels_wide())
+            .map_err(|_| PipelineError::message("macOS display width is too large"))?;
+        let height = u32::try_from(display.pixels_high())
+            .map_err(|_| PipelineError::message("macOS display height is too large"))?;
+        if width == 0 || height == 0 {
+            continue;
+        }
+
+        let display_number = index + 1;
+        let is_main = display_id == main_display_id;
+        let title = if is_main {
+            format!("Main Display ({display_number})")
+        } else {
+            format!("Display {display_number}")
+        };
+        targets.push(MacosDisplayCaptureTarget {
+            display_id,
+            title,
+            width,
+            height,
+            is_main,
+        });
+    }
+
+    Ok(targets)
 }
 
 pub fn enumerate_window_capture_targets() -> Result<Vec<MacosWindowCaptureTarget>, PipelineError> {

@@ -84,9 +84,23 @@ pub fn create_frame_capture(source_id: &str) -> Result<mrd_capture_winrt::WinrtC
     Ok(capture)
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+pub fn create_frame_capture(source_id: &str) -> Result<mrd_capture_macos::MacosScreenCapture> {
+    let capture = match parse_macos_capture_source_ref(source_id)? {
+        MacosCaptureSourceRef::Display { display_id } => {
+            mrd_capture_macos::MacosScreenCapture::new_display_id(display_id)
+        }
+        MacosCaptureSourceRef::Window { window_id } => {
+            mrd_capture_macos::MacosScreenCapture::new_window(window_id)
+        }
+    }
+    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    Ok(capture)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn create_frame_capture(_source_id: &str) -> Result<()> {
-    anyhow::bail!("remote desktop capture is currently only available on Windows")
+    anyhow::bail!("remote desktop capture is currently only available on Windows and macOS")
 }
 
 #[cfg(windows)]
@@ -95,6 +109,13 @@ enum WindowsCaptureSourceRef {
     Window(isize),
     Display { index: u32 },
     DisplayShared { index: u32 },
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MacosCaptureSourceRef {
+    Display { display_id: u32 },
+    Window { window_id: u32 },
 }
 
 #[cfg(windows)]
@@ -171,9 +192,75 @@ fn list_windows_display_capture_sources() -> Vec<CaptureSource> {
     sources
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 fn list_capture_sources_impl() -> Result<Vec<CaptureSource>> {
-    anyhow::bail!("remote window capture source enumeration is currently only available on Windows")
+    let mut sources = list_macos_display_capture_sources()?;
+    match mrd_capture_macos::enumerate_window_capture_targets() {
+        Ok(targets) => {
+            sources.extend(targets.into_iter().map(|target| CaptureSource {
+                id: format!("macos:window:0x{:X}", target.window_id),
+                platform: "macos".to_string(),
+                source_kind: "window".to_string(),
+                title: target.title,
+                class_name: "ScreenCaptureKitWindow".to_string(),
+                width: target.width,
+                height: target.height,
+                process_id: target.process_id,
+                app_name: non_empty_string(target.app_name),
+                bundle_identifier: non_empty_string(target.bundle_identifier),
+                preview_data_url: None,
+                preview_width: None,
+                preview_height: None,
+            }));
+        }
+        Err(error) if sources.is_empty() => {
+            return Err(anyhow::anyhow!(error.to_string()));
+        }
+        Err(_) => {}
+    }
+
+    Ok(sources)
+}
+
+#[cfg(target_os = "macos")]
+fn list_macos_display_capture_sources() -> Result<Vec<CaptureSource>> {
+    let targets = mrd_capture_macos::enumerate_display_capture_targets()
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    Ok(targets
+        .into_iter()
+        .map(|target| CaptureSource {
+            id: format!("macos:display:0x{:X}", target.display_id),
+            platform: "macos".to_string(),
+            source_kind: "display".to_string(),
+            title: target.title,
+            class_name: "ScreenCaptureKitDisplay".to_string(),
+            width: target.width,
+            height: target.height,
+            process_id: 0,
+            app_name: Some("Display".to_string()),
+            bundle_identifier: None,
+            preview_data_url: None,
+            preview_width: None,
+            preview_height: None,
+        })
+        .collect())
+}
+
+#[cfg(target_os = "macos")]
+fn non_empty_string(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn list_capture_sources_impl() -> Result<Vec<CaptureSource>> {
+    anyhow::bail!(
+        "remote window capture source enumeration is currently only available on Windows and macOS"
+    )
 }
 
 fn attach_capture_source_previews(sources: &mut [CaptureSource]) {
@@ -224,15 +311,37 @@ fn capture_source_preview_data_url(
         .capture_frame_with_timeout(frame_timeout)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let _ = capture.stop();
-    window_preview_data_url(&frame, PREVIEW_MAX_WIDTH, PREVIEW_MAX_HEIGHT)
+    frame_preview_data_url(&frame, PREVIEW_MAX_WIDTH, PREVIEW_MAX_HEIGHT)
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn capture_source_preview_data_url(
+    source_id: &str,
+    frame_timeout: Duration,
+) -> Result<(String, u32, u32)> {
+    let mut capture = match parse_macos_capture_source_ref(source_id)? {
+        MacosCaptureSourceRef::Display { display_id } => {
+            mrd_capture_macos::MacosScreenCapture::new_display_id(display_id)
+        }
+        MacosCaptureSourceRef::Window { window_id } => {
+            mrd_capture_macos::MacosScreenCapture::new_window(window_id)
+        }
+    }
+    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let frame = capture
+        .capture_frame_with_timeout(frame_timeout)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    frame_preview_data_url(&frame, PREVIEW_MAX_WIDTH, PREVIEW_MAX_HEIGHT)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn capture_source_preview_data_url(
     _source_id: &str,
     _frame_timeout: Duration,
 ) -> Result<(String, u32, u32)> {
-    anyhow::bail!("remote window capture previews are currently only available on Windows")
+    anyhow::bail!(
+        "remote window capture previews are currently only available on Windows and macOS"
+    )
 }
 
 #[cfg(windows)]
@@ -259,6 +368,40 @@ fn parse_windows_capture_source_ref(source_id: &str) -> Result<WindowsCaptureSou
     )?))
 }
 
+#[cfg(target_os = "macos")]
+fn parse_macos_capture_source_ref(source_id: &str) -> Result<MacosCaptureSourceRef> {
+    let trimmed = source_id.trim();
+    if let Some(value) = trimmed.strip_prefix("macos:display:") {
+        return Ok(MacosCaptureSourceRef::Display {
+            display_id: parse_macos_u32_value(source_id, value)?,
+        });
+    }
+    if let Some(value) = trimmed.strip_prefix("macos:window:") {
+        return Ok(MacosCaptureSourceRef::Window {
+            window_id: parse_macos_u32_value(source_id, value)?,
+        });
+    }
+
+    Ok(MacosCaptureSourceRef::Window {
+        window_id: parse_macos_u32_value(source_id, trimmed)?,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn parse_macos_u32_value(source_id: &str, value: &str) -> Result<u32> {
+    let value = value.trim();
+    let parsed = if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        u32::from_str_radix(hex, 16)
+    } else {
+        value.parse::<u32>()
+    };
+    parsed
+        .map_err(|error| anyhow::anyhow!("invalid macOS capture source id '{source_id}': {error}"))
+}
+
 #[cfg(windows)]
 fn parse_windows_display_index(source_id: &str, value: &str) -> Result<u32> {
     value.trim().parse::<u32>().map_err(|error| {
@@ -281,8 +424,8 @@ fn parse_windows_hwnd_value(source_id: &str, value: &str) -> Result<isize> {
         })
 }
 
-#[cfg(windows)]
-fn window_preview_data_url(
+#[cfg(any(windows, target_os = "macos"))]
+fn frame_preview_data_url(
     frame: &mrd_pipeline_core::CapturedFrame,
     max_width: usize,
     max_height: usize,
@@ -292,7 +435,7 @@ fn window_preview_data_url(
     use mrd_pipeline_core::FramePixelFormat;
 
     if frame.width == 0 || frame.height == 0 || max_width == 0 || max_height == 0 {
-        anyhow::bail!("window preview frame has invalid dimensions");
+        anyhow::bail!("capture preview frame has invalid dimensions");
     }
 
     let bytes_per_pixel = match frame.pixel_format {
@@ -302,13 +445,13 @@ fn window_preview_data_url(
     let source_stride = frame
         .width
         .checked_mul(bytes_per_pixel)
-        .ok_or_else(|| anyhow::anyhow!("window preview stride overflow"))?;
+        .ok_or_else(|| anyhow::anyhow!("capture preview stride overflow"))?;
     let required_len = source_stride
         .checked_mul(frame.height)
-        .ok_or_else(|| anyhow::anyhow!("window preview byte size overflow"))?;
+        .ok_or_else(|| anyhow::anyhow!("capture preview byte size overflow"))?;
     if frame.data.len() < required_len {
         anyhow::bail!(
-            "window preview frame is truncated: {} < {}",
+            "capture preview frame is truncated: {} < {}",
             frame.data.len(),
             required_len
         );
@@ -451,6 +594,37 @@ mod tests {
         assert_eq!(
             super::parse_windows_capture_source_ref("windows:window:0x1234").unwrap(),
             super::WindowsCaptureSourceRef::Window(0x1234)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_capture_source_refs_parse_display_and_window_ids() {
+        assert_eq!(
+            super::parse_macos_capture_source_ref("macos:display:0x1A2B").unwrap(),
+            super::MacosCaptureSourceRef::Display { display_id: 0x1A2B }
+        );
+        assert_eq!(
+            super::parse_macos_capture_source_ref("macos:window:0x1234").unwrap(),
+            super::MacosCaptureSourceRef::Window { window_id: 0x1234 }
+        );
+        assert_eq!(
+            super::parse_macos_capture_source_ref("5678").unwrap(),
+            super::MacosCaptureSourceRef::Window { window_id: 5678 }
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "queries live macOS WindowServer state"]
+    fn macos_lists_display_capture_sources() {
+        let sources = super::list_capture_sources(false, Some(8)).expect("list capture sources");
+
+        assert!(
+            sources
+                .iter()
+                .any(|source| source.platform == "macos" && source.source_kind == "display"),
+            "expected at least one macOS display capture source: {sources:?}"
         );
     }
 }

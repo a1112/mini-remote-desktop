@@ -7,7 +7,7 @@ use mrd_ipc::{
     CaptureSource, CaptureSourceSelection, LanDiscoverySnapshot, LanPeerInfo, MediaProfile,
     MediaProfileNegotiation,
 };
-#[cfg(test)]
+#[cfg(any(test, target_os = "macos"))]
 use mrd_pipeline_core::FrameCapture;
 use mrd_pipeline_core::{
     CapturedFrame, DecodedFrame, DecodedFrameData, FramePixelFormat, VideoDecoder, VideoEncoder,
@@ -1709,6 +1709,8 @@ async fn mark_session_failed(app_state: &Arc<AppState>, session_id: &SessionId, 
 enum LanFrameCapture {
     #[cfg(windows)]
     Winrt(mrd_capture_winrt::WinrtCapture),
+    #[cfg(target_os = "macos")]
+    Macos(mrd_capture_macos::MacosScreenCapture),
     #[cfg(test)]
     Synthetic(SyntheticFrameCapture),
 }
@@ -1718,6 +1720,10 @@ impl LanFrameCapture {
         match self {
             #[cfg(windows)]
             LanFrameCapture::Winrt(capture) => capture
+                .capture_frame()
+                .map_err(|error| anyhow::anyhow!(error.to_string())),
+            #[cfg(target_os = "macos")]
+            LanFrameCapture::Macos(capture) => capture
                 .capture_frame()
                 .map_err(|error| anyhow::anyhow!(error.to_string())),
             #[cfg(test)]
@@ -1837,9 +1843,16 @@ fn create_lan_frame_capture(source_id: &str, _profile: &MediaProfile) -> Result<
         ));
     }
 
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
     {
-        anyhow::bail!("remote desktop capture is currently only available on Windows")
+        return Ok(LanFrameCapture::Macos(
+            crate::capture_source::create_frame_capture(source_id)?,
+        ));
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        anyhow::bail!("remote desktop capture is currently only available on Windows and macOS")
     }
 }
 

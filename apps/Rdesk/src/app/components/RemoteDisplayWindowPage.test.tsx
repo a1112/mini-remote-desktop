@@ -99,7 +99,7 @@ describe("RemoteDisplayWindowPage", () => {
     mockResizeObserver();
   });
 
-  it("allows switching back to Metal after selecting Web preview on macOS", async () => {
+  it("allows switching back to Metal after selecting Web View on macOS", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
       if (command === "test_get_capabilities") {
@@ -144,7 +144,7 @@ describe("RemoteDisplayWindowPage", () => {
 
     renderRemoteDisplay("local-display-test-1");
 
-    const webButton = await screen.findByRole("button", { name: "Web preview" });
+    const webButton = await screen.findByRole("button", { name: "Web View" });
     fireEvent.click(webButton);
 
     const metalButton = await screen.findByRole("button", { name: "Metal native" });
@@ -246,7 +246,7 @@ describe("RemoteDisplayWindowPage", () => {
     });
   });
 
-  it("blocks unsafe Web preview hardware pipeline before starting a local test", async () => {
+  it("auto-selects a Web View compatible local pipeline before starting a local test", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
       if (command === "test_get_capabilities") {
@@ -275,6 +275,28 @@ describe("RemoteDisplayWindowPage", () => {
           rect: { x: 0, y: 56, width: 1280, height: 720 },
         });
       }
+      if (command === "test_harness_stop") {
+        return Promise.resolve(null);
+      }
+      if (command === "test_start_run") {
+        return Promise.resolve("run-web");
+      }
+      if (command === "test_harness_get_metrics") {
+        return Promise.resolve({
+          is_running: true,
+          capture_fps: 60,
+          frame_count: 12,
+          total_latency_p95_ms: 16,
+          error_message: null,
+        });
+      }
+      if (command === "test_get_run") {
+        return Promise.resolve({
+          run_id: "run-web",
+          status: "running",
+          summary: null,
+        });
+      }
       return Promise.resolve(null);
     });
 
@@ -284,14 +306,27 @@ describe("RemoteDisplayWindowPage", () => {
       name: "Start local pipeline test",
     });
 
-    await waitFor(() => expect(startButton).toBeDisabled());
-    expect(
-      screen.getByText(/Web preview 仅支持 OpenH264 \+ Software decode/)
-    ).toBeInTheDocument();
-
+    await waitFor(() => expect(startButton).toBeEnabled());
     fireEvent.click(startButton);
 
-    expect(mockInvoke).not.toHaveBeenCalledWith("test_start_run", expect.anything());
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_start_run",
+        expect.objectContaining({
+          scenarioId: "custom",
+          config: expect.objectContaining({
+            capture_type: "dxgi",
+            encoder_type: "openh264",
+            decoder_type: "software",
+            transport_kind: "webrtc",
+            fps: 60,
+            render_display: false,
+            visual_preview: true,
+            zero_copy: false,
+          }),
+        })
+      );
+    });
   });
 
   it("starts the local native pipeline with AV1 zero-copy when selected", async () => {

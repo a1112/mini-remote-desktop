@@ -36,6 +36,8 @@ use std::time::{Duration, Instant};
 const WEB_PREVIEW_MAX_WIDTH: usize = 960;
 const WEB_PREVIEW_FRAME_UPDATE_INTERVAL: usize = 2;
 const ENCODED_ACCESS_UNIT_SUBSCRIBER_QUEUE_DEPTH: usize = 1;
+const NATIVE_RENDER_FRAME_TIMEOUT_MS: u64 = 2_000;
+const NATIVE_RENDER_THREAD_STOP_TIMEOUT_MS: u64 = 750;
 
 /// Test chain configuration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -536,6 +538,7 @@ enum RenderCommand {
 struct PipelineRenderer {
     sender: mpsc::SyncSender<RenderCommand>,
     render_thread: Option<thread::JoinHandle<()>>,
+    render_done: Option<mpsc::Receiver<()>>,
     last_error: Arc<Mutex<Option<String>>>,
     d3d11_device_ptr: Option<usize>,
 }
@@ -557,6 +560,7 @@ impl PipelineRenderer {
             let renderer = mrd_render_d3d11::D3d11Renderer::new()
                 .map_err(|error| anyhow::anyhow!("create D3D11 renderer failed: {error}"))?;
             let d3d11_device_ptr = renderer.device_ptr() as usize;
+            let (render_done_tx, render_done_rx) = mpsc::channel();
             let render_thread = thread::Builder::new()
                 .name("mrd-test-render".to_string())
                 .spawn(move || {
@@ -567,17 +571,20 @@ impl PipelineRenderer {
                             *last_error = Some(error.to_string());
                         }
                     }
+                    let _ = render_done_tx.send(());
                 })
                 .map_err(|error| anyhow::anyhow!("spawn render thread failed: {error}"))?;
 
             return Ok(Self {
                 sender,
                 render_thread: Some(render_thread),
+                render_done: Some(render_done_rx),
                 last_error,
                 d3d11_device_ptr: Some(d3d11_device_ptr),
             });
         }
 
+        let (render_done_tx, render_done_rx) = mpsc::channel();
         let render_thread = thread::Builder::new()
             .name("mrd-test-render".to_string())
             .spawn(move || {
@@ -588,12 +595,14 @@ impl PipelineRenderer {
                         *last_error = Some(error.to_string());
                     }
                 }
+                let _ = render_done_tx.send(());
             })
             .map_err(|error| anyhow::anyhow!("spawn render thread failed: {error}"))?;
 
         Ok(Self {
             sender,
             render_thread: Some(render_thread),
+            render_done: Some(render_done_rx),
             last_error,
             d3d11_device_ptr: None,
         })
@@ -619,19 +628,42 @@ impl PipelineRenderer {
         self.sender
             .send(RenderCommand::Frame(RenderJob { input, completion }))
             .map_err(|_| anyhow::anyhow!("native render thread stopped"))?;
-        match done.recv() {
+        match done.recv_timeout(Duration::from_millis(NATIVE_RENDER_FRAME_TIMEOUT_MS)) {
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) => anyhow::bail!("native render thread failed: {error}"),
-            Err(_) => anyhow::bail!("native render thread stopped before completing frame"),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let message = format!(
+                    "native render frame timed out after {NATIVE_RENDER_FRAME_TIMEOUT_MS} ms"
+                );
+                if let Ok(mut last_error) = self.last_error.lock() {
+                    *last_error = Some(message.clone());
+                }
+                anyhow::bail!(message)
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                anyhow::bail!("native render thread stopped before completing frame")
+            }
         }
     }
 }
 
 impl Drop for PipelineRenderer {
     fn drop(&mut self) {
-        let _ = self.sender.send(RenderCommand::Stop);
+        let _ = self.sender.try_send(RenderCommand::Stop);
+        let render_finished = match self.render_done.take() {
+            Some(done) => match done
+                .recv_timeout(Duration::from_millis(NATIVE_RENDER_THREAD_STOP_TIMEOUT_MS))
+            {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => true,
+                Err(mpsc::RecvTimeoutError::Timeout) => false,
+            },
+            None => true,
+        };
+
         if let Some(render_thread) = self.render_thread.take() {
-            let _ = render_thread.join();
+            if render_finished {
+                let _ = render_thread.join();
+            }
         }
     }
 }
@@ -1078,6 +1110,7 @@ impl Drop for D3d11TestWindow {
 
 pub struct TestHarness {
     running: Arc<AtomicBool>,
+    stopping: Arc<AtomicBool>,
     chain: TestChain,
     config: TestConfig,
     metrics: Arc<Mutex<HarnessMetrics>>,
@@ -1103,9 +1136,11 @@ impl TestHarness {
 
         let metrics = Arc::new(Mutex::new(HarnessMetrics::default()));
         let running = Arc::new(AtomicBool::new(false));
+        let stopping = Arc::new(AtomicBool::new(false));
 
         Ok(Self {
             running,
+            stopping,
             chain: TestChain::default(),
             config: TestConfig::default(),
             metrics,
@@ -1136,6 +1171,9 @@ impl TestHarness {
     pub fn start(&mut self) -> Result<()> {
         if self.running.load(Ordering::Relaxed) {
             anyhow::bail!("test harness is already running");
+        }
+        if self.thread_handle.is_some() || self.stopping.load(Ordering::Relaxed) {
+            anyhow::bail!("test harness is stopping");
         }
 
         let chain = self.chain.clone();
@@ -1717,7 +1755,7 @@ impl TestHarness {
         let mut last_decode_error = None::<String>;
         let dump_first_access_unit_path = std::env::var("MRD_HARNESS_DUMP_FIRST_ACCESS_UNIT").ok();
         let mut dumped_first_access_unit = false;
-        let update_web_preview = state.renderer.is_none() && state.visual_preview;
+        let update_web_preview = state.visual_preview;
 
         while running.load(Ordering::Relaxed) {
             let pipeline_start = Instant::now();
@@ -2136,7 +2174,12 @@ impl TestHarness {
         self.running.store(false, Ordering::Relaxed);
 
         if let Some(handle) = self.thread_handle.take() {
-            let _ = handle.join();
+            self.stopping.store(true, Ordering::Relaxed);
+            let stopping = Arc::clone(&self.stopping);
+            thread::spawn(move || {
+                let _ = handle.join();
+                stopping.store(false, Ordering::Relaxed);
+            });
         }
 
         {
@@ -2145,6 +2188,10 @@ impl TestHarness {
         }
 
         Ok(())
+    }
+
+    pub fn request_stop(&self) {
+        self.running.store(false, Ordering::Relaxed);
     }
 
     pub fn get_metrics(&self) -> HarnessMetrics {
@@ -3382,6 +3429,40 @@ mod tests {
         assert!(!metrics.is_running);
         assert_eq!(metrics.capture_fps, 12.5);
         assert_eq!(metrics.frame_count, 7);
+    }
+
+    #[test]
+    fn stop_does_not_hold_harness_while_join_waits() {
+        let mut harness = TestHarness::new().expect("create harness");
+        let (release_join_tx, release_join_rx) = mpsc::channel();
+        let stopping = Arc::clone(&harness.stopping);
+        harness.running.store(true, Ordering::Relaxed);
+        harness.thread_handle = Some(thread::spawn(move || {
+            let _ = release_join_rx.recv();
+        }));
+
+        let started = Instant::now();
+        harness.stop().expect("stop harness");
+
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "stop should not wait for pipeline thread join"
+        );
+        assert!(!harness.get_metrics().is_running);
+        assert!(harness
+            .start()
+            .unwrap_err()
+            .to_string()
+            .contains("stopping"));
+
+        release_join_tx.send(()).expect("release join");
+        for _ in 0..50 {
+            if !stopping.load(Ordering::Relaxed) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!stopping.load(Ordering::Relaxed));
     }
 
     #[test]

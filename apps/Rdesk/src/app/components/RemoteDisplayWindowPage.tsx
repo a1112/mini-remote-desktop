@@ -67,6 +67,8 @@ type CaptureSourcePickerMode = "dropdown" | "modal";
 
 const METRICS_POLL_MS = 500;
 const WEB_PREVIEW_FRAME_POLL_MS = 80;
+const WEB_PREVIEW_CONNECT_TIMEOUT_MS = 3_000;
+const WEB_VIEW_MAX_FPS = 60;
 
 type Option<T extends string> = {
   value: T;
@@ -198,31 +200,154 @@ function pickAvailable<T extends string>(
   return preferred.find((value) => available.includes(value)) ?? fallback;
 }
 
-function localWebPreviewBlockReason({
-  renderMode,
+function uniqueValues<T extends string>(values: readonly T[]): T[] {
+  return values.filter((value, index) => values.indexOf(value) === index);
+}
+
+function pickCapability<T extends string>(
+  candidates: readonly T[],
+  available: readonly string[] | undefined
+): T | null {
+  if (!available || available.length === 0) return candidates[0] ?? null;
+  return candidates.find((value) => available.includes(value)) ?? null;
+}
+
+function isH264PreviewEncoder(encoder: EncoderType) {
+  return (
+    encoder === "openh264" ||
+    encoder === "videotoolbox_h264" ||
+    encoder === "nvenc_h264"
+  );
+}
+
+function fpsForWebView(fps: FpsKey): FpsKey {
+  return Number(fps) > WEB_VIEW_MAX_FPS ? "60" : fps;
+}
+
+type LocalWebViewProfile = {
+  capture: CaptureType;
+  encoder: EncoderType;
+  decoder: DecoderType;
+  transport: TransportKind;
+  fps: FpsKey;
+};
+
+type LocalWebViewPlan = {
+  profile: LocalWebViewProfile | null;
+  reason: string | null;
+  changed: boolean;
+  message: string | null;
+};
+
+function resolveLocalWebViewPlan({
+  capabilities,
+  hostOs,
+  capture,
   encoder,
   decoder,
   transport,
   fps,
 }: {
-  renderMode: RenderMode;
+  capabilities: EnvironmentSnapshot | null;
+  hostOs: "macos" | "windows" | "other";
+  capture: CaptureType;
   encoder: EncoderType;
   decoder: DecoderType;
   transport: TransportKind;
   fps: FpsKey;
-}): string | null {
-  if (renderMode !== "web") return null;
+}): LocalWebViewPlan {
+  const captureDefaults: CaptureType[] =
+    hostOs === "macos"
+      ? ["macos", "synthetic"]
+      : hostOs === "windows"
+        ? ["dxgi", "winrt", "synthetic"]
+        : ["synthetic"];
+  const nextCapture = pickCapability(
+    uniqueValues([capture, ...captureDefaults]),
+    capabilities?.available_captures
+  );
 
-  const fpsValue = Number(fps);
-  const isSafeWebPreview =
-    encoder === "openh264" &&
-    decoder === "software" &&
-    transport === "webrtc" &&
-    fpsValue <= 60;
+  if (!nextCapture) {
+    return {
+      profile: null,
+      reason: "Web View 未找到可用采集源",
+      changed: false,
+      message: null,
+    };
+  }
 
-  if (isSafeWebPreview) return null;
+  const preferredEncoders: EncoderType[] =
+    hostOs === "macos"
+      ? ["openh264", "videotoolbox_h264"]
+      : hostOs === "windows"
+        ? ["openh264", "nvenc_h264"]
+        : ["openh264"];
+  const encoderCandidates = uniqueValues([
+    ...preferredEncoders,
+    ...(isH264PreviewEncoder(encoder) ? [encoder] : []),
+  ]);
+  const nextEncoder = pickCapability(
+    encoderCandidates,
+    capabilities?.available_encoders
+  );
 
-  return "Web preview 仅支持 OpenH264 + Software decode + WebRTC transport + <=60 FPS；当前链路请切到 DX11 native 或调整测试配置。";
+  if (!nextEncoder) {
+    return {
+      profile: null,
+      reason: "Web View 需要可输出 H.264 的编码器",
+      changed: false,
+      message: null,
+    };
+  }
+
+  const decoderCandidates: DecoderType[] =
+    nextEncoder === "videotoolbox_h264"
+      ? ["videotoolbox", "software", "none"]
+      : nextEncoder === "nvenc_h264"
+        ? ["software", "nvdec", "none"]
+        : ["software", "none"];
+  const nextDecoder = pickCapability(
+    decoderCandidates,
+    capabilities?.available_decoders
+  );
+
+  if (!nextDecoder) {
+    return {
+      profile: null,
+      reason: "Web View 未找到可用解码链路",
+      changed: false,
+      message: null,
+    };
+  }
+
+  const profile: LocalWebViewProfile = {
+    capture: nextCapture,
+    encoder: nextEncoder,
+    decoder: nextDecoder,
+    transport: "webrtc",
+    fps: fpsForWebView(fps),
+  };
+  const changed =
+    profile.capture !== capture ||
+    profile.encoder !== encoder ||
+    profile.decoder !== decoder ||
+    profile.transport !== transport ||
+    profile.fps !== fps;
+
+  return {
+    profile,
+    reason: null,
+    changed,
+    message: changed
+      ? `Web View 已切换到 ${optionLabel(captureOptions, profile.capture)} / ${optionLabel(
+          encoderOptions,
+          profile.encoder
+        )} / ${optionLabel(decoderOptions, profile.decoder)} / ${optionLabel(
+          transportOptions,
+          profile.transport
+        )} / ${optionLabel(fpsOptions, profile.fps)}`
+      : null,
+  };
 }
 
 export function isLocalPipelinePreviewSession(sessionId: string): boolean {
@@ -342,6 +467,19 @@ export function RemoteDisplayWindowPage() {
   const activeSurfaceId = context?.surface_id ?? surfaceId;
   const isLocalPipelinePreview = isLocalPipelinePreviewSession(sessionId);
   const hostOs = normalizeOs(capabilities?.os_type);
+  const localWebViewPlan = useMemo(
+    () =>
+      resolveLocalWebViewPlan({
+        capabilities,
+        hostOs,
+        capture,
+        encoder,
+        decoder,
+        transport,
+        fps,
+      }),
+    [capabilities, capture, decoder, encoder, fps, hostOs, transport]
+  );
   const nativeRenderMode: RenderMode = hostOs === "macos" ? "metal_native" : "d3d11_native";
   const nativeRendererType =
     renderMode === "metal_native"
@@ -412,7 +550,7 @@ export function RemoteDisplayWindowPage() {
         ? "DX12 native"
       : renderMode === "d3d11_native"
         ? "D3D11 native"
-        : "Web preview";
+        : "Web View";
   const nativeRenderLabel = hostOs === "macos" ? "Metal native" : "DX11 native";
   const remoteFramesReceived = probeSnapshot?.frames_received ?? 0;
   const remoteFramesDecoded = probeSnapshot?.frames_decoded ?? 0;
@@ -444,22 +582,34 @@ export function RemoteDisplayWindowPage() {
       )} / ${optionLabel(bitrateOptions, bitrate)}`,
     [bitrate, capture, decoder, encoder, fps, resolution, transport]
   );
-  const buildTestConfig = useCallback((rendererTargetHwnd?: string | null) => {
+  const buildTestConfig = useCallback((rendererTargetHwnd?: string | null, selection?: Partial<LocalWebViewProfile>) => {
+    const selectedCapture = selection?.capture ?? capture;
+    const selectedEncoder = selection?.encoder ?? encoder;
+    const selectedDecoder = selection?.decoder ?? decoder;
+    const selectedTransport = selection?.transport ?? transport;
+    const selectedFps = selection?.fps ?? fps;
     const [width, height] = resolution.split("x").map(Number) as [number, number];
+    const selectedUsesNativeSharedTexture =
+      nativeRendererType === "d3d11" &&
+      selectedCapture === "dxgi" &&
+      isNvencSharedTextureEncoder(selectedEncoder) &&
+      selectedDecoder === "nvdec";
+
     return {
-      capture_type: capture,
-      encoder_type: encoder,
-      decoder_type: decoder,
-      transport_kind: transport,
+      capture_type: selectedCapture,
+      encoder_type: selectedEncoder,
+      decoder_type: selectedDecoder,
+      transport_kind: selectedTransport,
       resolution: [width, height],
-      fps: Number(fps),
+      fps: Number(selectedFps),
       bitrate: Number(bitrate) * 1_000_000,
       duration_ms: 30_000,
       warmup_ms: 500,
-      input_source: capture === "synthetic" ? "synthetic" : "screen",
+      input_source: selectedCapture === "synthetic" ? "synthetic" : "screen",
       output_validation: true,
+      visual_preview: true,
       render_display: Boolean(isNative && rendererTargetHwnd),
-      zero_copy: usesNativeSharedTexture,
+      zero_copy: selectedUsesNativeSharedTexture,
       ...(nativeRendererType ? { renderer_type: nativeRendererType } : {}),
       ...(isNative && rendererTargetHwnd ? { renderer_target_hwnd: rendererTargetHwnd } : {}),
     } satisfies TestConfig;
@@ -473,21 +623,13 @@ export function RemoteDisplayWindowPage() {
     nativeRendererType,
     resolution,
     transport,
-    usesNativeSharedTexture,
   ]);
   const testConfig = useMemo(
     () => buildTestConfig(nativeSurface?.hwnd),
     [buildTestConfig, nativeSurface?.hwnd]
   );
-  const localStartBlockReason = isLocalPipelinePreview
-    ? localWebPreviewBlockReason({
-        renderMode,
-        encoder,
-        decoder,
-        transport,
-        fps,
-      })
-    : null;
+  const localStartBlockReason =
+    isLocalPipelinePreview && renderMode === "web" ? localWebViewPlan.reason : null;
   const buildRemoteMediaProfile = useCallback(() => {
     const [width, height] = resolution.split("x").map(Number) as [number, number];
     return {
@@ -587,6 +729,26 @@ export function RemoteDisplayWindowPage() {
   }, [capabilities]);
 
   useEffect(() => {
+    if (
+      !isLocalPipelinePreview ||
+      renderMode !== "web" ||
+      isTestBusy ||
+      !localWebViewPlan.profile ||
+      !localWebViewPlan.changed
+    ) {
+      return;
+    }
+
+    setCapture(localWebViewPlan.profile.capture);
+    setEncoder(localWebViewPlan.profile.encoder);
+    setDecoder(localWebViewPlan.profile.decoder);
+    setTransport(localWebViewPlan.profile.transport);
+    setFps(localWebViewPlan.profile.fps);
+    setLastError(null);
+    if (localWebViewPlan.message) setTestMessage(localWebViewPlan.message);
+  }, [isLocalPipelinePreview, isTestBusy, localWebViewPlan, renderMode]);
+
+  useEffect(() => {
     if (isNative && capabilities && !nativeRenderAvailable) {
       setRenderMode("web");
     }
@@ -677,7 +839,7 @@ export function RemoteDisplayWindowPage() {
 
   const switchToWebRender = useCallback(() => {
     if (isLocalPipelinePreview && isTestBusy) {
-      setTestMessage("请先停止测试再切换 Web preview");
+      setTestMessage("请先停止测试再切换 Web View");
       return;
     }
 
@@ -813,6 +975,8 @@ export function RemoteDisplayWindowPage() {
     }
 
     let cancelled = false;
+    let receivedTrack = false;
+    let connectTimeoutId: number | null = null;
     const peer = new RTCPeerConnection({ iceServers: [] });
     webPreviewPeerRef.current = peer;
     webPreviewSessionRef.current = sessionId;
@@ -823,6 +987,11 @@ export function RemoteDisplayWindowPage() {
     peer.addTransceiver("video", { direction: "recvonly" });
     peer.ontrack = (event) => {
       if (cancelled) return;
+      receivedTrack = true;
+      if (connectTimeoutId !== null) {
+        window.clearTimeout(connectTimeoutId);
+        connectTimeoutId = null;
+      }
       const video = webPreviewVideoRef.current;
       if (!video) return;
       const stream = event.streams[0] ?? new MediaStream([event.track]);
@@ -840,6 +1009,13 @@ export function RemoteDisplayWindowPage() {
         setWebPreviewError(`WebRTC preview ${peer.connectionState}`);
       }
     };
+
+    connectTimeoutId = window.setTimeout(() => {
+      if (cancelled || receivedTrack) return;
+      closeWebPreviewPeer();
+      setWebPreviewMode("fallback");
+      setWebPreviewError("WebRTC 视频未及时接入，已回退到帧轮询");
+    }, WEB_PREVIEW_CONNECT_TIMEOUT_MS);
 
     const startPreview = async () => {
       try {
@@ -879,6 +1055,9 @@ export function RemoteDisplayWindowPage() {
 
     return () => {
       cancelled = true;
+      if (connectTimeoutId !== null) {
+        window.clearTimeout(connectTimeoutId);
+      }
       closeWebPreviewPeer();
     };
   }, [
@@ -918,7 +1097,9 @@ export function RemoteDisplayWindowPage() {
         });
         if (cancelled) return;
         if (framesResult.ok) {
-          const renderedFrame = framesResult.value[1] ?? framesResult.value[0];
+          const renderedFrame = Array.isArray(framesResult.value)
+            ? framesResult.value[1] ?? framesResult.value[0]
+            : null;
           if (renderedFrame) {
             const generation = renderedFrame[3];
             if (typeof generation === "number") {
@@ -1300,6 +1481,18 @@ export function RemoteDisplayWindowPage() {
     await testHarnessStop();
 
     let configForRun = testConfig;
+    if (!isNative && localWebViewPlan.profile) {
+      if (localWebViewPlan.changed) {
+        setCapture(localWebViewPlan.profile.capture);
+        setEncoder(localWebViewPlan.profile.encoder);
+        setDecoder(localWebViewPlan.profile.decoder);
+        setTransport(localWebViewPlan.profile.transport);
+        setFps(localWebViewPlan.profile.fps);
+        if (localWebViewPlan.message) setTestMessage(localWebViewPlan.message);
+      }
+      configForRun = buildTestConfig(null, localWebViewPlan.profile);
+    }
+
     if (isNative) {
       const snapshot = await syncNativeSurface({ visible: true });
       const rendererTargetHwnd = snapshot?.hwnd ?? nativeSurface?.hwnd;
@@ -1406,7 +1599,7 @@ export function RemoteDisplayWindowPage() {
         ? "WebRTC video"
         : webPreviewMode === "connecting"
           ? "WebRTC connecting"
-          : "Web preview"
+          : "Web View"
       : renderModeLabel;
   const renderSwitchLockedTitle = localRenderSwitchLocked
     ? "请先停止测试再切换渲染模式"
@@ -1559,7 +1752,7 @@ export function RemoteDisplayWindowPage() {
               disabled={localRenderSwitchLocked}
               title={renderSwitchLockedTitle}
             >
-              Web preview
+              Web View
             </button>
             <button
               className={`px-2.5 py-1 text-[11px] ${
@@ -1877,7 +2070,7 @@ export function RemoteDisplayWindowPage() {
             <div className="text-center">
               <PanelTop className="mx-auto mb-3 h-9 w-9 text-slate-500" />
               <div className="text-sm font-medium text-slate-300">
-                {isTestBusy ? "Waiting for preview frames" : "Click start to show captured output"}
+                {isTestBusy ? "等待 Web View 帧" : "点击开始显示本机测试画面"}
               </div>
               <div className="mt-1 text-xs text-slate-500">
                 {localStartBlockReason ?? webPreviewError ?? testDescription}
@@ -1896,7 +2089,7 @@ export function RemoteDisplayWindowPage() {
           <div className="absolute inset-0 flex items-center justify-center">
             <div className="rounded-md border border-cyan-400/20 bg-black/55 px-4 py-3 text-center backdrop-blur">
               <Loader2 className="mx-auto mb-2 h-5 w-5 animate-spin text-cyan-300" />
-              <div className="text-xs font-medium text-slate-200">Starting WebRTC video</div>
+              <div className="text-xs font-medium text-slate-200">正在启动 WebRTC 视频</div>
               <div className="mt-1 text-[11px] text-slate-500">{testDescription}</div>
             </div>
           </div>
