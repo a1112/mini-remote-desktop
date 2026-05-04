@@ -89,6 +89,23 @@ export interface ProfileProbeResult {
   error?: string;
 }
 
+export interface CapabilityCombinationRequest {
+  capture?: string;
+  captureSourceKind?: string;
+  encoder?: string;
+  decoder?: string;
+  renderer?: string;
+  memory?: string;
+  transport?: string;
+  allowCpuCopy?: boolean;
+}
+
+export interface CapabilityEvaluation {
+  status: "ready" | "blocked" | "degraded" | "skipped";
+  reasons: string[];
+  requiredFallbacks: string[];
+}
+
 export interface CapabilitySnapshot {
   schema_version: 1;
   platform: CapabilityPlatform;
@@ -192,6 +209,70 @@ export function buildCapabilitySnapshotFromEnvironment(
     profiles: [],
     recent_profile_results: [],
   };
+}
+
+export function evaluateCapabilityCombination(
+  request: CapabilityCombinationRequest,
+  snapshot: CapabilitySnapshot
+): CapabilityEvaluation {
+  const reasons: string[] = [];
+  const requiredFallbacks: string[] = [];
+  let status: CapabilityEvaluation["status"] = "ready";
+
+  if (
+    request.encoder === "openh264" &&
+    request.memory === "d3d11_shared" &&
+    request.allowCpuCopy !== true
+  ) {
+    status = "blocked";
+    reasons.push("OpenH264 requires CPU-backed input; insert a CPU copy step before using it.");
+    requiredFallbacks.push("memory.cpu");
+  }
+
+  if (request.renderer === "d3d12_native") {
+    status = "blocked";
+    reasons.push("D3D12 native renderer is probe-only and is not wired into mainline remote display.");
+    requiredFallbacks.push("render.d3d11");
+  }
+
+  if (request.renderer === "webview" && hasCapability(snapshot, "render.webview")) {
+    if (status !== "blocked") {
+      status = "degraded";
+    }
+    reasons.push("WebView render is a visual fallback, not native renderer parity.");
+    requiredFallbacks.push("render.d3d11");
+  }
+
+  return { status, reasons, requiredFallbacks };
+}
+
+export function pickPreferredCaptureSourceKind(items: CapabilityItem[]): string | undefined {
+  const candidates = items.filter(
+    (item) => item.domain === "capture_source" && isSelectableCapability(item)
+  );
+  return (
+    findCaptureSourceKind(candidates, "display_shared") ??
+    findCaptureSourceKind(candidates, "display") ??
+    findCaptureSourceKind(candidates, "window")
+  );
+}
+
+function hasCapability(snapshot: CapabilitySnapshot, id: string): boolean {
+  return snapshot.capabilities.some((capability) => capability.id === id);
+}
+
+function findCaptureSourceKind(items: CapabilityItem[], kind: string): string | undefined {
+  return items.some((item) => item.id === `capture_source.${kind}`) ? kind : undefined;
+}
+
+function isSelectableCapability(item: CapabilityItem): boolean {
+  return ![
+    "permission_missing",
+    "driver_missing",
+    "hardware_missing",
+    "unimplemented",
+    "unsupported",
+  ].includes(item.status);
 }
 
 function buildLegacyCapabilities(

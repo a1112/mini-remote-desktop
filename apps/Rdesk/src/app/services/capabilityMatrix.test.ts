@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { EnvironmentSnapshot } from "../adapters/tauri";
-import { buildCapabilitySnapshotFromEnvironment } from "./capabilityMatrix";
+import {
+  buildCapabilitySnapshotFromEnvironment,
+  evaluateCapabilityCombination,
+  pickPreferredCaptureSourceKind,
+  type CapabilityItem,
+} from "./capabilityMatrix";
 
 const windowsEnvironment: EnvironmentSnapshot = {
   os_type: "windows",
@@ -75,5 +80,78 @@ describe("buildCapabilitySnapshotFromEnvironment", () => {
       status: "unknown",
       reason: "Unknown legacy capability",
     });
+  });
+});
+
+describe("evaluateCapabilityCombination", () => {
+  it("blocks OpenH264 with D3D11 shared memory unless a CPU copy step is declared", () => {
+    const snapshot = buildCapabilitySnapshotFromEnvironment(windowsEnvironment);
+
+    const result = evaluateCapabilityCombination(
+      {
+        encoder: "openh264",
+        memory: "d3d11_shared",
+      },
+      snapshot
+    );
+
+    expect(result.status).toBe("blocked");
+    expect(result.reasons.join(" ")).toContain("CPU-backed input");
+  });
+
+  it("blocks D3D12 native as a mainline remote display renderer until it is wired", () => {
+    const snapshot = buildCapabilitySnapshotFromEnvironment(windowsEnvironment);
+
+    const result = evaluateCapabilityCombination(
+      {
+        renderer: "d3d12_native",
+      },
+      snapshot
+    );
+
+    expect(result.status).toBe("blocked");
+    expect(result.reasons.join(" ")).toContain("D3D12 native renderer is probe-only");
+  });
+
+  it("marks WebView rendering as degraded instead of native renderer parity", () => {
+    const snapshot = buildCapabilitySnapshotFromEnvironment(windowsEnvironment);
+
+    const result = evaluateCapabilityCombination(
+      {
+        renderer: "webview",
+      },
+      snapshot
+    );
+
+    expect(result.status).toBe("degraded");
+    expect(result.reasons.join(" ")).toContain("WebView render is a visual fallback");
+  });
+
+  it("prefers shared display capture source over copy display and window", () => {
+    const sources: CapabilityItem[] = [
+      {
+        id: "capture_source.window",
+        domain: "capture_source",
+        label: "Window",
+        status: "available",
+        platform: "windows",
+      },
+      {
+        id: "capture_source.display",
+        domain: "capture_source",
+        label: "Display copy",
+        status: "available",
+        platform: "windows",
+      },
+      {
+        id: "capture_source.display_shared",
+        domain: "capture_source",
+        label: "Display shared",
+        status: "available",
+        platform: "windows",
+      },
+    ];
+
+    expect(pickPreferredCaptureSourceKind(sources)).toBe("display_shared");
   });
 });
