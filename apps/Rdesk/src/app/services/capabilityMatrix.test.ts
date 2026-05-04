@@ -1,10 +1,14 @@
 import { describe, expect, it } from "vitest";
-import type { EnvironmentSnapshot } from "../adapters/tauri";
+import type { EnvironmentSnapshot, ProbeSnapshot } from "../adapters/tauri";
 import {
   buildCapabilitySnapshotFromEnvironment,
   evaluateCapabilityCombination,
+  evaluateProfileProbe,
+  evaluateProfileSupport,
+  getCapabilityProfile,
   pickPreferredCaptureSourceKind,
   type CapabilityItem,
+  type CapabilitySnapshot,
 } from "./capabilityMatrix";
 
 const windowsEnvironment: EnvironmentSnapshot = {
@@ -155,3 +159,91 @@ describe("evaluateCapabilityCombination", () => {
     expect(pickPreferredCaptureSourceKind(sources)).toBe("display_shared");
   });
 });
+
+describe("capability profiles", () => {
+  it("exposes a LAN 2K144 profile with required media capabilities", () => {
+    const profile = getCapabilityProfile("lan.2k144");
+
+    expect(profile).toMatchObject({
+      id: "lan.2k144",
+      width: 2560,
+      height: 1440,
+      fps: 144,
+      bitrate_mbps: 64,
+      codec: "h264",
+    });
+    expect(profile?.required_capabilities).toContain("transport.quic_datagram");
+    expect(profile?.required_capabilities).toContain("transport.media_profile_control_v1");
+  });
+
+  it("marks a profile ready only when all required capabilities are available", () => {
+    const snapshot = withAvailableCapabilities(
+      buildCapabilitySnapshotFromEnvironment(windowsEnvironment),
+      ["transport.quic_datagram", "transport.media_profile_control_v1"]
+    );
+
+    const result = evaluateProfileSupport("lan.2k144", snapshot);
+
+    expect(result.status).toBe("ready");
+    expect(result.reasons).toEqual([]);
+  });
+
+  it("blocks a profile when a required capability is missing or not usable", () => {
+    const snapshot = buildCapabilitySnapshotFromEnvironment(windowsEnvironment);
+
+    const result = evaluateProfileSupport("lan.2k144", snapshot);
+
+    expect(result.status).toBe("blocked");
+    expect(result.reasons.join(" ")).toContain("transport.media_profile_control_v1");
+  });
+
+  it("fails runtime profile probe when negotiated media does not match the requested profile", () => {
+    const profile = getCapabilityProfile("lan.2k144");
+    const probe: ProbeSnapshot = {
+      session_id: "session-1",
+      frames_received: 30,
+      frames_decoded: 30,
+      frames_dropped: 0,
+      current_fps: 144,
+      bitrate_mbps: 64,
+      media_probe_valid: true,
+      media_probe_format: "compressed_test_pattern",
+      media_probe_width: 1920,
+      media_probe_height: 1080,
+      media_probe_target_fps: 60,
+      media_probe_target_bitrate_mbps: 20,
+      media_probe_payload_bytes: 1000,
+      last_error: null,
+    };
+
+    const result = evaluateProfileProbe(profile!, probe);
+
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain("expected 2560x1440 @ 144 FPS / 64 Mbps");
+  });
+});
+
+function withAvailableCapabilities(
+  snapshot: CapabilitySnapshot,
+  ids: string[]
+): CapabilitySnapshot {
+  const capabilities = snapshot.capabilities.map((capability) =>
+    ids.includes(capability.id)
+      ? { ...capability, status: "available" as const, reason: undefined }
+      : capability
+  );
+
+  for (const id of ids) {
+    if (capabilities.some((capability) => capability.id === id)) continue;
+    const [domain] = id.split(".");
+    capabilities.push({
+      id,
+      domain: domain as CapabilityItem["domain"],
+      label: id,
+      status: "available",
+      platform: snapshot.platform,
+    });
+  }
+
+  return { ...snapshot, capabilities };
+}

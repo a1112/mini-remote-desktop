@@ -1,4 +1,4 @@
-import type { EnvironmentSnapshot } from "../adapters/tauri";
+import type { EnvironmentSnapshot, ProbeSnapshot } from "../adapters/tauri";
 
 export type CapabilityStatus =
   | "supported"
@@ -165,6 +165,13 @@ const DOMAIN_BASELINE_ITEMS: Array<Omit<CapabilityItem, "platform">> = [
     reason: "Requires service or peer probe",
   },
   {
+    id: "transport.media_profile_control_v1",
+    domain: "transport",
+    label: "Remote media profile control",
+    status: "unknown",
+    reason: "Requires service or peer probe",
+  },
+  {
     id: "control.keyboard_mouse",
     domain: "control",
     label: "Keyboard and mouse input",
@@ -194,6 +201,68 @@ const DOMAIN_BASELINE_ITEMS: Array<Omit<CapabilityItem, "platform">> = [
   },
 ];
 
+export const BUILTIN_CAPABILITY_PROFILES: CapabilityProfile[] = [
+  {
+    id: "smoke.720p30",
+    width: 1280,
+    height: 720,
+    fps: 30,
+    bitrate_mbps: 8,
+    codec: "h264",
+    min_stable_fps_ratio: 0.4,
+    required_capabilities: ["encode.openh264", "decode.software", "transport.quic_datagram"],
+  },
+  {
+    id: "interactive.1080p60",
+    width: 1920,
+    height: 1080,
+    fps: 60,
+    bitrate_mbps: 20,
+    codec: "h264",
+    latency_budget_ms: 50,
+    min_stable_fps_ratio: 0.6,
+    required_capabilities: ["encode.nvenc_h264", "decode.nvdec", "render.d3d11"],
+  },
+  {
+    id: "lan.2k144",
+    width: 2560,
+    height: 1440,
+    fps: 144,
+    bitrate_mbps: 64,
+    codec: "h264",
+    latency_budget_ms: 35,
+    min_stable_fps_ratio: 0.4,
+    max_drop_ratio: 0.05,
+    required_capabilities: [
+      "encode.nvenc_h264",
+      "decode.nvdec",
+      "render.d3d11",
+      "memory.d3d11_shared",
+      "transport.quic_datagram",
+      "transport.media_profile_control_v1",
+    ],
+  },
+  {
+    id: "quality.4k60",
+    width: 3840,
+    height: 2160,
+    fps: 60,
+    bitrate_mbps: 80,
+    codec: "hevc",
+    latency_budget_ms: 50,
+    required_capabilities: ["encode.nvenc_hevc", "decode.nvdec", "render.d3d11"],
+  },
+  {
+    id: "diagnostic.software",
+    width: 1280,
+    height: 720,
+    fps: 30,
+    bitrate_mbps: 6,
+    codec: "h264",
+    required_capabilities: ["encode.openh264", "decode.software", "render.webview"],
+  },
+];
+
 export function buildCapabilitySnapshotFromEnvironment(
   environment: EnvironmentSnapshot
 ): CapabilitySnapshot {
@@ -206,7 +275,7 @@ export function buildCapabilitySnapshotFromEnvironment(
       ...DOMAIN_BASELINE_ITEMS.map((item) => ({ ...item, platform })),
     ],
     constraints: [],
-    profiles: [],
+    profiles: BUILTIN_CAPABILITY_PROFILES,
     recent_profile_results: [],
   };
 }
@@ -257,6 +326,78 @@ export function pickPreferredCaptureSourceKind(items: CapabilityItem[]): string 
   );
 }
 
+export function getCapabilityProfile(profileId: string): CapabilityProfile | undefined {
+  return BUILTIN_CAPABILITY_PROFILES.find((profile) => profile.id === profileId);
+}
+
+export function evaluateProfileSupport(
+  profileId: string,
+  snapshot: CapabilitySnapshot
+): CapabilityEvaluation {
+  const profile = getCapabilityProfile(profileId);
+  if (!profile) {
+    return {
+      status: "blocked",
+      reasons: [`Unknown capability profile: ${profileId}`],
+      requiredFallbacks: [],
+    };
+  }
+
+  const reasons = profile.required_capabilities.flatMap((capabilityId) => {
+    const capability = snapshot.capabilities.find((item) => item.id === capabilityId);
+    if (capability && isProfileCapabilityUsable(capability)) return [];
+    const suffix = capability?.status ? ` (${capability.status})` : "";
+    return [`Missing required capability: ${capabilityId}${suffix}`];
+  });
+
+  return {
+    status: reasons.length > 0 ? "blocked" : "ready",
+    reasons,
+    requiredFallbacks: [],
+  };
+}
+
+export function evaluateProfileProbe(
+  profile: CapabilityProfile,
+  probe: ProbeSnapshot
+): ProfileProbeResult {
+  if (probe.media_probe_valid !== true) {
+    return {
+      profile_id: profile.id,
+      status: "failed",
+      error: "Runtime media probe is not valid",
+    };
+  }
+
+  const actual = {
+    width: probe.media_probe_width ?? 0,
+    height: probe.media_probe_height ?? 0,
+    fps: probe.media_probe_target_fps ?? 0,
+    bitrate_mbps: probe.media_probe_target_bitrate_mbps ?? 0,
+  };
+  const matches =
+    actual.width === profile.width &&
+    actual.height === profile.height &&
+    actual.fps === profile.fps &&
+    actual.bitrate_mbps === profile.bitrate_mbps;
+
+  if (!matches) {
+    return {
+      profile_id: profile.id,
+      status: "failed",
+      error: `Runtime media profile mismatch: expected ${formatProfile(profile)}, got ${actual.width}x${actual.height} @ ${actual.fps} FPS / ${actual.bitrate_mbps} Mbps`,
+    };
+  }
+
+  return {
+    profile_id: profile.id,
+    status: "passed",
+    stable_fps: probe.current_fps ?? undefined,
+    drop_ratio:
+      probe.frames_received > 0 ? probe.frames_dropped / probe.frames_received : undefined,
+  };
+}
+
 function hasCapability(snapshot: CapabilitySnapshot, id: string): boolean {
   return snapshot.capabilities.some((capability) => capability.id === id);
 }
@@ -273,6 +414,14 @@ function isSelectableCapability(item: CapabilityItem): boolean {
     "unimplemented",
     "unsupported",
   ].includes(item.status);
+}
+
+function isProfileCapabilityUsable(item: CapabilityItem): boolean {
+  return item.status === "available" || item.status === "usable";
+}
+
+function formatProfile(profile: CapabilityProfile): string {
+  return `${profile.width}x${profile.height} @ ${profile.fps} FPS / ${profile.bitrate_mbps} Mbps`;
 }
 
 function buildLegacyCapabilities(
