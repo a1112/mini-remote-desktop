@@ -316,6 +316,7 @@ describe("runLanE2EAutomation", () => {
 
     expect(result.status).toBe("failed");
     expect(result.failureReason).toBe("media_profile_mismatch");
+    expect(result.errorMessage).toContain("Runtime media profile mismatch");
     expect(result.errorMessage).toContain("2560x1440 @ 144 FPS / 64 Mbps");
   });
 

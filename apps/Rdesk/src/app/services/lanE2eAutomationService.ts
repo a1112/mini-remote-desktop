@@ -10,6 +10,11 @@ import type {
   RuntimeSnapshot,
   SessionRuntimeSnapshot,
 } from "../adapters/tauri";
+import {
+  evaluateProfileProbe,
+  type CapabilityProfile,
+  type ProfileProbeResult,
+} from "./capabilityMatrix";
 
 export type LanE2EStatus = "running" | "completed" | "failed" | "skipped";
 
@@ -59,6 +64,7 @@ export interface LanE2EAutomationReport {
   captureSourceSelection?: CaptureSourceSelection;
   sessionSnapshot?: SessionRuntimeSnapshot;
   probeSnapshot?: ProbeSnapshot;
+  profileProbeResult?: ProfileProbeResult;
   requestedProfile?: MediaProfile;
   validationMode: "quic_datagram" | "webrtc_rtp";
   dataPlaneVerified: boolean;
@@ -168,6 +174,7 @@ export async function runLanE2EAutomation(
   let captureSourceSelection: CaptureSourceSelection | undefined;
   let sessionSnapshot: SessionRuntimeSnapshot | undefined;
   let probeSnapshot: ProbeSnapshot | undefined;
+  let profileProbeResult: ProfileProbeResult | undefined;
   let controllerDeviceId: string | null | undefined;
   let sessionStarted = false;
   let sampleDurationMs = 0;
@@ -195,12 +202,13 @@ export async function runLanE2EAutomation(
     captureSourceSelection,
     sessionSnapshot,
     probeSnapshot,
+    profileProbeResult,
     requestedProfile,
     validationMode,
     dataPlaneVerified: status === "completed",
     mediaVerified:
       status === "completed" &&
-      (validationMode === "webrtc_rtp" || probeSnapshot?.media_probe_valid === true),
+      (validationMode === "webrtc_rtp" || profileProbeResult?.status === "passed"),
     sampleDurationMs,
     thresholds: {
       minSampleDurationMs,
@@ -289,11 +297,12 @@ export async function runLanE2EAutomation(
         stage("sample", "failed", probeSnapshot.last_error);
         return finish("failed", "runtime_error", probeSnapshot.last_error);
       }
-      const profileMismatch = describeMediaProfileMismatch(
+      profileProbeResult = evaluateMediaProfileProbe(
         probeSnapshot,
         requestedProfile,
         validationMode
       );
+      const profileMismatch = describeProfileProbeFailure(profileProbeResult);
       if (profileMismatch) {
         stage("assert", "failed", profileMismatch);
         return finish("failed", "media_profile_mismatch", profileMismatch);
@@ -483,35 +492,43 @@ function formatValidationMode(mode: LanE2EAutomationReport["validationMode"]): s
   return mode === "webrtc_rtp" ? "WebRTC RTP data plane" : "QUIC datagram data plane";
 }
 
-function describeMediaProfileMismatch(
+function evaluateMediaProfileProbe(
   probe: ProbeSnapshot,
   requestedProfile: MediaProfile | undefined,
   validationMode: LanE2EAutomationReport["validationMode"]
-): string | null {
+): ProfileProbeResult | undefined {
   if (validationMode !== "quic_datagram" || !requestedProfile || probe.media_probe_valid !== true) {
-    return null;
+    return undefined;
   }
 
-  const actual = {
-    width: probe.media_probe_width ?? 0,
-    height: probe.media_probe_height ?? 0,
-    fps: probe.media_probe_target_fps ?? 0,
-    bitrate_mbps: probe.media_probe_target_bitrate_mbps ?? 0,
-  };
-  if (
-    actual.width === requestedProfile.width &&
-    actual.height === requestedProfile.height &&
-    actual.fps === requestedProfile.fps &&
-    actual.bitrate_mbps === requestedProfile.bitrate_mbps
-  ) {
-    return null;
-  }
-
-  return `Negotiated media profile mismatch: expected ${formatMediaProfile(requestedProfile)}, got ${actual.width}x${actual.height} @ ${actual.fps} FPS / ${actual.bitrate_mbps} Mbps`;
+  return evaluateProfileProbe(toCapabilityProfile(requestedProfile), probe);
 }
 
-function formatMediaProfile(profile: MediaProfile): string {
-  return `${profile.width}x${profile.height} @ ${profile.fps} FPS / ${profile.bitrate_mbps} Mbps`;
+function describeProfileProbeFailure(result: ProfileProbeResult | undefined): string | null {
+  if (!result || result.status === "passed") {
+    return null;
+  }
+
+  return result.error ?? `Runtime media profile probe failed: ${result.status}`;
+}
+
+function toCapabilityProfile(profile: MediaProfile): CapabilityProfile {
+  return {
+    id: "runtime.requested_media_profile",
+    width: profile.width,
+    height: profile.height,
+    fps: profile.fps,
+    bitrate_mbps: profile.bitrate_mbps,
+    codec: normalizeMediaCodec(profile.codec),
+    required_capabilities: [],
+  };
+}
+
+function normalizeMediaCodec(codec: string): CapabilityProfile["codec"] {
+  const normalized = codec.toLowerCase();
+  if (normalized === "hevc" || normalized === "h265") return "hevc";
+  if (normalized === "av1") return "av1";
+  return "h264";
 }
 
 function createDefaultSessionId(peerDeviceId: string, now: number): string {
