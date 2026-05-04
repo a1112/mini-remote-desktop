@@ -11,6 +11,27 @@ import {
 } from "lucide-react";
 import * as commands from "../../adapters/tauri/commands";
 import type { TestScenario, TestRun, EnvironmentSnapshot } from "../../adapters/tauri/types";
+import {
+  buildCapabilitySnapshotFromEnvironment,
+  evaluateProfileSupport,
+  type CapabilityDomain,
+  type CapabilityItem,
+  type CapabilityStatus,
+} from "../../services/capabilityMatrix";
+
+const CAPABILITY_DOMAIN_ORDER: CapabilityDomain[] = [
+  "capture",
+  "capture_source",
+  "encode",
+  "decode",
+  "render",
+  "memory",
+  "transport",
+  "control",
+  "audio",
+  "service",
+  "security",
+];
 
 export function OverviewPage() {
   const navigate = useNavigate();
@@ -44,6 +65,15 @@ export function OverviewPage() {
 
   const successfulRuns = recentRuns.filter((r) => r.status === "completed").length;
   const failedRuns = recentRuns.filter((r) => r.status === "failed").length;
+  const capabilitySnapshot = capabilities
+    ? buildCapabilitySnapshotFromEnvironment(capabilities)
+    : null;
+  const capabilityGroups = capabilitySnapshot
+    ? groupCapabilitiesByDomain(capabilitySnapshot.capabilities)
+    : [];
+  const lan2k144Evaluation = capabilitySnapshot
+    ? evaluateProfileSupport("lan.2k144", capabilitySnapshot)
+    : null;
 
   return (
     <div className="p-6">
@@ -86,6 +116,59 @@ export function OverviewPage() {
               </div>
             )}
           </section>
+
+          {/* Structured Capability Matrix */}
+          {capabilitySnapshot && (
+            <section className="bg-card rounded-lg border p-6">
+              <div className="mb-4 flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
+                <div>
+                  <h2 className="text-lg font-semibold">结构化能力矩阵</h2>
+                  <p className="text-sm text-muted-foreground">
+                    按 domain 展示当前机器能力、降级路径和不可用原因。
+                  </p>
+                </div>
+                <div className="rounded-lg border bg-background/70 px-3 py-2 text-sm">
+                  <div className="text-xs text-muted-foreground">Profile readiness</div>
+                  <div className="mt-1 flex flex-wrap items-center gap-2">
+                    <span className="font-medium">lan.2k144</span>
+                    <StatusBadge status={lan2k144Evaluation?.status ?? "blocked"} />
+                  </div>
+                </div>
+              </div>
+
+              {lan2k144Evaluation && lan2k144Evaluation.reasons.length > 0 && (
+                <div className="mb-4 rounded-lg border border-yellow-500/30 bg-yellow-500/10 p-3 text-xs text-yellow-700 dark:text-yellow-200">
+                  {lan2k144Evaluation.reasons.join("; ")}
+                </div>
+              )}
+
+              <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                {capabilityGroups.map(({ domain, items }) => (
+                  <div key={domain} className="rounded-lg border bg-background/60 p-3">
+                    <div className="mb-2 flex items-center justify-between">
+                      <h3 className="text-sm font-semibold">{domain}</h3>
+                      <span className="text-xs text-muted-foreground">{items.length}</span>
+                    </div>
+                    <div className="space-y-2">
+                      {items.slice(0, 4).map((item) => (
+                        <div key={item.id} className="rounded border bg-card/60 px-2 py-1.5">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="truncate text-xs font-medium">{item.id}</span>
+                            <StatusBadge status={item.status} />
+                          </div>
+                          {item.reason && (
+                            <div className="mt-1 line-clamp-2 text-[11px] text-muted-foreground">
+                              {item.reason}
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </section>
+          )}
 
           {/* Quick Stats */}
           <section className="grid grid-cols-1 md:grid-cols-4 gap-4">
@@ -210,4 +293,49 @@ export function OverviewPage() {
       )}
     </div>
   );
+}
+
+function groupCapabilitiesByDomain(capabilities: CapabilityItem[]): Array<{
+  domain: CapabilityDomain;
+  items: CapabilityItem[];
+}> {
+  return CAPABILITY_DOMAIN_ORDER.map((domain) => ({
+    domain,
+    items: capabilities.filter((capability) => capability.domain === domain),
+  })).filter((group) => group.items.length > 0);
+}
+
+function StatusBadge({ status }: { status: CapabilityStatus | "ready" | "blocked" | "skipped" }) {
+  return (
+    <span
+      className={[
+        "rounded-full px-2 py-0.5 text-[10px] font-semibold",
+        statusClassName(status),
+      ].join(" ")}
+    >
+      {status}
+    </span>
+  );
+}
+
+function statusClassName(status: CapabilityStatus | "ready" | "blocked" | "skipped"): string {
+  switch (status) {
+    case "available":
+    case "usable":
+    case "ready":
+      return "bg-green-500/12 text-green-600 dark:text-green-300";
+    case "degraded":
+      return "bg-yellow-500/12 text-yellow-700 dark:text-yellow-300";
+    case "blocked":
+    case "permission_missing":
+    case "driver_missing":
+    case "hardware_missing":
+      return "bg-red-500/12 text-red-600 dark:text-red-300";
+    case "unimplemented":
+    case "unsupported":
+    case "skipped":
+      return "bg-slate-500/12 text-slate-600 dark:text-slate-300";
+    default:
+      return "bg-muted text-muted-foreground";
+  }
 }

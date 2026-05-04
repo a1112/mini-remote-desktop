@@ -51,12 +51,16 @@ function mockOverviewData() {
 
     if (command === "test_get_capabilities") {
       return Promise.resolve({
-        cpu_brand: "Apple M",
-        cpu_cores: 8,
+        os_type: "windows",
+        cpu_brand: "Intel",
+        cpu_cores: 16,
         memory_gb: 32,
-        gpu_info: "Apple GPU",
-        available_encoders: [],
-        available_decoders: [],
+        gpu_info: "NVIDIA RTX",
+        available_captures: ["dxgi", "winrt", "synthetic"],
+        available_encoders: ["nvenc_h264", "openh264"],
+        available_decoders: ["nvdec", "software"],
+        available_renderers: ["d3d11", "webview"],
+        available_memory_modes: ["cpu", "d3d11_shared"],
       });
     }
 
@@ -92,5 +96,20 @@ describe("OverviewPage", () => {
 
     await user.click(screen.getByRole("button", { name: "查看详情" }));
     expect(mockNavigate).toHaveBeenLastCalledWith("/test/run/run-1");
+  });
+
+  it("shows structured capability domains, statuses, and 2K144 readiness", async () => {
+    mockOverviewData();
+
+    render(<OverviewPage />);
+
+    expect(await screen.findByText("结构化能力矩阵")).toBeInTheDocument();
+    expect(screen.getByText("capture")).toBeInTheDocument();
+    expect(screen.getAllByText("available").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("degraded").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("unimplemented").length).toBeGreaterThan(0);
+    expect(screen.getByText("lan.2k144")).toBeInTheDocument();
+    expect(screen.getByText("blocked")).toBeInTheDocument();
+    expect(screen.getAllByText(/transport.media_profile_control_v1/).length).toBeGreaterThan(0);
   });
 });

@@ -172,6 +172,13 @@ const DOMAIN_BASELINE_ITEMS: Array<Omit<CapabilityItem, "platform">> = [
     reason: "Requires service or peer probe",
   },
   {
+    id: "render.d3d12_native",
+    domain: "render",
+    label: "D3D12 native renderer",
+    status: "unimplemented",
+    reason: "D3D12 is currently probe-only and not wired into mainline remote display",
+  },
+  {
     id: "control.keyboard_mouse",
     domain: "control",
     label: "Keyboard and mouse input",
