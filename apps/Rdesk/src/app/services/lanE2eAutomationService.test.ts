@@ -20,6 +20,31 @@ const DEFAULT_REQUESTED_PROFILE = {
   codec: "h264",
 };
 
+const DEFAULT_CAPTURE_SOURCES = [
+  {
+    id: "window-codex",
+    platform: "windows",
+    source_kind: "window",
+    title: "Codex",
+    class_name: "Chrome_WidgetWin_1",
+    width: 1280,
+    height: 720,
+    process_id: 100,
+    app_name: "Codex",
+  },
+  {
+    id: "display-shared",
+    platform: "windows",
+    source_kind: "display_shared",
+    title: "DISPLAY1",
+    class_name: "Monitor",
+    width: 2560,
+    height: 1440,
+    process_id: 0,
+    app_name: null,
+  },
+];
+
 function createCommands(
   overrides: Partial<LanE2EAutomationCommands> = {}
 ): LanE2EAutomationCommands {
@@ -73,6 +98,15 @@ function createCommands(
       })
     ),
     ipcStartLanRemoteSession: vi.fn().mockResolvedValue(ok("session-started")),
+    ipcListRemoteCaptureSources: vi.fn().mockResolvedValue(ok(DEFAULT_CAPTURE_SOURCES)),
+    ipcSelectRemoteCaptureSource: vi.fn().mockResolvedValue(
+      ok({
+        session_id: "lan-e2e-test-session",
+        source: DEFAULT_CAPTURE_SOURCES[1],
+        status: "selected",
+        reason: null,
+      })
+    ),
     ipcStartReceiver: vi.fn().mockResolvedValue(ok("receiver-started")),
     openRemoteDisplayWindow: vi.fn().mockResolvedValue(
       ok({
@@ -122,6 +156,32 @@ function createCommands(
   };
 }
 
+function withCaptureSourceCommands(
+  commands: LanE2EAutomationCommands,
+  sources = DEFAULT_CAPTURE_SOURCES
+) {
+  const ipcListRemoteCaptureSources = vi.fn().mockResolvedValue(ok(sources));
+  const selectedSource = sources.find((source) => source.id === "display-shared") ?? sources[0];
+  const ipcSelectRemoteCaptureSource = vi.fn().mockResolvedValue(
+    ok({
+      session_id: "lan-e2e-test-session",
+      source: selectedSource,
+      status: "selected",
+      reason: null,
+    })
+  );
+
+  Object.assign(commands, {
+    ipcListRemoteCaptureSources,
+    ipcSelectRemoteCaptureSource,
+  });
+
+  return commands as LanE2EAutomationCommands & {
+    ipcListRemoteCaptureSources: typeof ipcListRemoteCaptureSources;
+    ipcSelectRemoteCaptureSource: typeof ipcSelectRemoteCaptureSource;
+  };
+}
+
 describe("runLanE2EAutomation", () => {
   it("discovers a LAN peer, starts remote display, validates frames, and stops the session", async () => {
     const commands = createCommands();
@@ -158,6 +218,105 @@ describe("runLanE2EAutomation", () => {
     expect(result.stages.map((stage) => `${stage.stage}:${stage.status}`)).toContain(
       "assert:completed"
     );
+  });
+
+  it("selects the preferred remote capture source before starting the receiver", async () => {
+    const commands = withCaptureSourceCommands(createCommands());
+
+    const result = await runLanE2EAutomation(commands, {
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => "lan-e2e-test-session",
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.captureSource?.id).toBe("display-shared");
+    expect(result.captureSourceSelection?.status).toBe("selected");
+    expect(commands.ipcListRemoteCaptureSources).toHaveBeenCalledWith(
+      "lan-e2e-test-session",
+      false,
+      24
+    );
+    expect(commands.ipcSelectRemoteCaptureSource).toHaveBeenCalledWith(
+      "lan-e2e-test-session",
+      "display-shared"
+    );
+    const receiverCallOrder = vi.mocked(commands.ipcStartReceiver).mock.invocationCallOrder[0];
+    const captureSourceCallOrder =
+      commands.ipcSelectRemoteCaptureSource.mock.invocationCallOrder[0];
+    expect(receiverCallOrder).toBeDefined();
+    expect(captureSourceCallOrder).toBeDefined();
+    expect(receiverCallOrder!).toBeGreaterThan(captureSourceCallOrder!);
+    expect(result.stages.map((stage) => `${stage.stage}:${stage.status}`)).toContain(
+      "capture_source:completed"
+    );
+  });
+
+  it("fails before receiver startup when the remote has no capture sources", async () => {
+    const commands = withCaptureSourceCommands(createCommands(), []);
+
+    const result = await runLanE2EAutomation(commands, {
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => "lan-e2e-test-session",
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.failureReason).toBe("capture_source_failed");
+    expect(result.errorMessage).toContain("No remote capture source available");
+    expect(commands.ipcStartReceiver).not.toHaveBeenCalled();
+    expect(commands.openRemoteDisplayWindow).not.toHaveBeenCalled();
+    expect(commands.ipcStopSession).toHaveBeenCalledWith("lan-e2e-test-session");
+  });
+
+  it("fails when the QUIC media probe target does not match the requested profile", async () => {
+    const commands = withCaptureSourceCommands(
+      createCommands({
+        ipcProbeSnapshot: vi.fn().mockResolvedValue(
+          ok({
+            session_id: "unused",
+            frames_received: 4,
+            frames_decoded: 3,
+            frames_dropped: 0,
+            current_fps: 144,
+            bitrate_mbps: 64,
+            media_probe_valid: true,
+            media_probe_format: "compressed_test_pattern",
+            media_probe_width: 1920,
+            media_probe_height: 1080,
+            media_probe_target_fps: 60,
+            media_probe_target_bitrate_mbps: 20,
+            media_probe_payload_bytes: 55555,
+            last_media_sequence: 3,
+            last_media_timestamp_us: 123456,
+            last_media_payload_hash: "fnv1a64:abc123",
+            last_error: null,
+          })
+        ),
+      })
+    );
+
+    const result = await runLanE2EAutomation(commands, {
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => "lan-e2e-test-session",
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.failureReason).toBe("media_profile_mismatch");
+    expect(result.errorMessage).toContain("2560x1440 @ 144 FPS / 64 Mbps");
   });
 
   it("retries LAN discovery during preflight until the target peer appears", async () => {

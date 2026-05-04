@@ -60,6 +60,8 @@ const lanAutomationCommands: LanE2EAutomationCommands = {
   ipcRegisterDevice: commands.ipcRegisterDevice,
   ipcRefreshLanDiscovery: commands.ipcRefreshLanDiscovery,
   ipcStartLanRemoteSession: commands.ipcStartLanRemoteSession,
+  ipcListRemoteCaptureSources: commands.ipcListRemoteCaptureSources,
+  ipcSelectRemoteCaptureSource: commands.ipcSelectRemoteCaptureSource,
   ipcStartReceiver: commands.ipcStartReceiver,
   openRemoteDisplayWindow: commands.openRemoteDisplayWindow,
   ipcSessionSnapshot: commands.ipcSessionSnapshot,
@@ -279,7 +281,7 @@ export function E2ETestPage() {
           </button>
         </div>
 
-        <div className="mt-4 grid gap-3 md:grid-cols-3">
+        <div className="mt-4 grid gap-3 md:grid-cols-4">
           <AutomationStatusCard
             label="状态"
             value={formatLanStatus(lanRunState)}
@@ -288,6 +290,10 @@ export function E2ETestPage() {
           <AutomationStatusCard
             label="目标设备"
             value={lanReport?.peer?.device_name ?? lanReport?.peer?.device_id ?? "等待发现"}
+          />
+          <AutomationStatusCard
+            label="捕获源"
+            value={formatCaptureSourceSummary(lanReport)}
           />
           <AutomationStatusCard
             label="探针反馈"
@@ -309,6 +315,14 @@ export function E2ETestPage() {
               <span>
                 <span className="text-muted-foreground">Window:</span>{" "}
                 {lanReport.displayWindow?.label ?? "n/a"}
+              </span>
+              <span>
+                <span className="text-muted-foreground">Capture:</span>{" "}
+                {formatCaptureSourceSummary(lanReport)}
+              </span>
+              <span>
+                <span className="text-muted-foreground">Requested:</span>{" "}
+                {formatRequestedProfile(lanReport)}
               </span>
             </div>
             {lanReport.status === "failed" && (
@@ -453,6 +467,31 @@ function formatProbeSummary(report: LanE2EAutomationReport | null): string {
       }`
     : "";
   return `${formatValidationMode(report.validationMode)} decoded ${probe.frames_decoded}, received ${probe.frames_received}, fps ${fps}, ${seconds}s${mediaProbe}`;
+}
+
+function formatCaptureSourceSummary(report: LanE2EAutomationReport | null): string {
+  const source = report?.captureSourceSelection?.source ?? report?.captureSource;
+  if (!source) return "等待选择";
+  return `${formatCaptureSourceKind(source.source_kind)} / ${source.title} / ${source.width}x${source.height}`;
+}
+
+function formatCaptureSourceKind(kind: string): string {
+  switch (kind) {
+    case "display_shared":
+      return "全屏 shared";
+    case "display":
+      return "全屏 copy";
+    case "window":
+      return "窗口";
+    default:
+      return kind;
+  }
+}
+
+function formatRequestedProfile(report: LanE2EAutomationReport | null): string {
+  const profile = report?.requestedProfile;
+  if (!profile) return "n/a";
+  return `${profile.width}x${profile.height} @ ${profile.fps} FPS / ${profile.bitrate_mbps} Mbps`;
 }
 
 function formatMediaProbeTarget(

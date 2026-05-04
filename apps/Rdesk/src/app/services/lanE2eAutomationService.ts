@@ -1,5 +1,7 @@
 import type {
   AdapterResult,
+  CaptureSource,
+  CaptureSourceSelection,
   LanDiscoverySnapshot,
   LanPeerInfo,
   MediaProfile,
@@ -17,14 +19,16 @@ export type LanE2EFailureReason =
   | "peer_not_found"
   | "peer_not_ready"
   | "session_start_failed"
+  | "capture_source_failed"
   | "receiver_start_failed"
   | "display_window_failed"
   | "no_remote_frames"
+  | "media_profile_mismatch"
   | "runtime_error"
   | "stop_failed";
 
 export interface LanE2EStageEvent {
-  stage: "preflight" | "pairing" | "session" | "receiver" | "display" | "sample" | "assert" | "cleanup";
+  stage: "preflight" | "pairing" | "session" | "capture_source" | "receiver" | "display" | "sample" | "assert" | "cleanup";
   status: "started" | "completed" | "failed";
   timestamp: number;
   error?: string;
@@ -51,6 +55,8 @@ export interface LanE2EAutomationReport {
   controllerDeviceId?: string | null;
   peer?: LanPeerInfo;
   displayWindow?: RemoteDisplayWindowContext;
+  captureSource?: CaptureSource;
+  captureSourceSelection?: CaptureSourceSelection;
   sessionSnapshot?: SessionRuntimeSnapshot;
   probeSnapshot?: ProbeSnapshot;
   requestedProfile?: MediaProfile;
@@ -83,6 +89,15 @@ export interface LanE2EAutomationCommands {
     transportKind: string,
     requestedProfile?: MediaProfile
   ): Promise<AdapterResult<string>>;
+  ipcListRemoteCaptureSources(
+    sessionId: string,
+    includePreviews: boolean,
+    limit?: number
+  ): Promise<AdapterResult<CaptureSource[]>>;
+  ipcSelectRemoteCaptureSource(
+    sessionId: string,
+    sourceId: string
+  ): Promise<AdapterResult<CaptureSourceSelection>>;
   ipcStartReceiver(sessionId: string): Promise<AdapterResult<string>>;
   openRemoteDisplayWindow(params: {
     sessionId: string;
@@ -149,6 +164,8 @@ export async function runLanE2EAutomation(
   let sessionId: string | undefined;
   let peer: LanPeerInfo | undefined;
   let displayWindow: RemoteDisplayWindowContext | undefined;
+  let captureSource: CaptureSource | undefined;
+  let captureSourceSelection: CaptureSourceSelection | undefined;
   let sessionSnapshot: SessionRuntimeSnapshot | undefined;
   let probeSnapshot: ProbeSnapshot | undefined;
   let controllerDeviceId: string | null | undefined;
@@ -174,6 +191,8 @@ export async function runLanE2EAutomation(
     controllerDeviceId,
     peer,
     displayWindow,
+    captureSource,
+    captureSourceSelection,
     sessionSnapshot,
     probeSnapshot,
     requestedProfile,
@@ -234,6 +253,11 @@ export async function runLanE2EAutomation(
     sessionStarted = true;
     stage("pairing", "completed");
 
+    stage("capture_source", "started");
+    captureSourceSelection = await selectRemoteCaptureSourceForSession(commands, sessionId);
+    captureSource = captureSourceSelection.source;
+    stage("capture_source", "completed");
+
     stage("receiver", "started");
     await unwrap(commands.ipcStartReceiver(sessionId), "receiver_start_failed");
     stage("receiver", "completed");
@@ -264,6 +288,15 @@ export async function runLanE2EAutomation(
       if (probeSnapshot.last_error) {
         stage("sample", "failed", probeSnapshot.last_error);
         return finish("failed", "runtime_error", probeSnapshot.last_error);
+      }
+      const profileMismatch = describeMediaProfileMismatch(
+        probeSnapshot,
+        requestedProfile,
+        validationMode
+      );
+      if (profileMismatch) {
+        stage("assert", "failed", profileMismatch);
+        return finish("failed", "media_profile_mismatch", profileMismatch);
       }
       if (
         sessionSnapshot.receiver_active &&
@@ -299,6 +332,44 @@ export async function runLanE2EAutomation(
       }
     }
   }
+}
+
+async function selectRemoteCaptureSourceForSession(
+  commands: LanE2EAutomationCommands,
+  sessionId: string
+): Promise<CaptureSourceSelection> {
+  const sources = await unwrap(
+    commands.ipcListRemoteCaptureSources(sessionId, false, 24),
+    "capture_source_failed"
+  );
+  const preferredSource = pickPreferredCaptureSource(sources);
+  if (!preferredSource) {
+    throw new LanE2ECommandError(
+      "capture_source_failed",
+      "No remote capture source available for LAN E2E"
+    );
+  }
+
+  const selection = await unwrap(
+    commands.ipcSelectRemoteCaptureSource(sessionId, preferredSource.id),
+    "capture_source_failed"
+  );
+  if (selection.status.toLowerCase() !== "selected") {
+    throw new LanE2ECommandError(
+      "capture_source_failed",
+      selection.reason ?? `Remote capture source rejected: ${preferredSource.id}`
+    );
+  }
+  return selection;
+}
+
+function pickPreferredCaptureSource(sources: CaptureSource[]): CaptureSource | undefined {
+  return (
+    sources.find((source) => source.source_kind === "display_shared") ??
+    sources.find((source) => source.source_kind === "display") ??
+    sources.find((source) => source.source_kind === "window") ??
+    sources[0]
+  );
 }
 
 async function waitForLanPeer(
@@ -412,6 +483,37 @@ function formatValidationMode(mode: LanE2EAutomationReport["validationMode"]): s
   return mode === "webrtc_rtp" ? "WebRTC RTP data plane" : "QUIC datagram data plane";
 }
 
+function describeMediaProfileMismatch(
+  probe: ProbeSnapshot,
+  requestedProfile: MediaProfile | undefined,
+  validationMode: LanE2EAutomationReport["validationMode"]
+): string | null {
+  if (validationMode !== "quic_datagram" || !requestedProfile || probe.media_probe_valid !== true) {
+    return null;
+  }
+
+  const actual = {
+    width: probe.media_probe_width ?? 0,
+    height: probe.media_probe_height ?? 0,
+    fps: probe.media_probe_target_fps ?? 0,
+    bitrate_mbps: probe.media_probe_target_bitrate_mbps ?? 0,
+  };
+  if (
+    actual.width === requestedProfile.width &&
+    actual.height === requestedProfile.height &&
+    actual.fps === requestedProfile.fps &&
+    actual.bitrate_mbps === requestedProfile.bitrate_mbps
+  ) {
+    return null;
+  }
+
+  return `Negotiated media profile mismatch: expected ${formatMediaProfile(requestedProfile)}, got ${actual.width}x${actual.height} @ ${actual.fps} FPS / ${actual.bitrate_mbps} Mbps`;
+}
+
+function formatMediaProfile(profile: MediaProfile): string {
+  return `${profile.width}x${profile.height} @ ${profile.fps} FPS / ${profile.bitrate_mbps} Mbps`;
+}
+
 function createDefaultSessionId(peerDeviceId: string, now: number): string {
   const safePeer = peerDeviceId.replace(/[^a-zA-Z0-9_-]/g, "-");
   return `lan-e2e-${safePeer}-${now}`;
@@ -471,6 +573,8 @@ function stageForFailure(reason: LanE2EFailureReason): LanE2EStageEvent["stage"]
       return "preflight";
     case "session_start_failed":
       return "pairing";
+    case "capture_source_failed":
+      return "capture_source";
     case "receiver_start_failed":
       return "receiver";
     case "display_window_failed":

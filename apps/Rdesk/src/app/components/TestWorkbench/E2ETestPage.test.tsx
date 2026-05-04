@@ -35,6 +35,7 @@ describe("E2ETestPage LAN automation", () => {
     expect(await screen.findByText(/LAN E2E 完成/)).toBeInTheDocument();
     expect(screen.getAllByText(/Agent PC/).length).toBeGreaterThan(0);
     expect(screen.getByText(/QUIC datagram decoded 25/)).toBeInTheDocument();
+    expect(screen.getAllByText(/全屏 shared \/ DISPLAY1 \/ 2560x1440/).length).toBeGreaterThan(0);
   });
 
   it("autoruns LAN remote display automation from URL query parameters", async () => {
@@ -145,6 +146,39 @@ function installSuccessfulLanAutomationMock() {
       });
     }
     if (command === "ipc_start_lan_remote_session") return Promise.resolve("started");
+    if (command === "ipc_list_remote_capture_sources") {
+      return Promise.resolve([
+        {
+          id: "display-shared",
+          platform: "windows",
+          source_kind: "display_shared",
+          title: "DISPLAY1",
+          class_name: "Monitor",
+          width: 2560,
+          height: 1440,
+          process_id: 0,
+          app_name: null,
+        },
+      ]);
+    }
+    if (command === "ipc_select_remote_capture_source") {
+      return Promise.resolve({
+        session_id: "lan-e2e-agent-device-1000",
+        source: {
+          id: "display-shared",
+          platform: "windows",
+          source_kind: "display_shared",
+          title: "DISPLAY1",
+          class_name: "Monitor",
+          width: 2560,
+          height: 1440,
+          process_id: 0,
+          app_name: null,
+        },
+        status: "selected",
+        reason: null,
+      });
+    }
     if (command === "ipc_start_receiver") return Promise.resolve("receiver-started");
     if (command === "open_remote_display_window") {
       return Promise.resolve({
