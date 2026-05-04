@@ -97,7 +97,7 @@ export interface TestConfig {
     | "openh264"
     | "videotoolbox_h264";
   decoder_type?: "none" | "nvdec" | "software" | "videotoolbox";
-  renderer_type?: "d3d11" | "macos";
+  renderer_type?: "d3d11" | "d3d12" | "opengl" | "macos" | "webview";
   render_display?: boolean;
   renderer_target_hwnd?: string;
   zero_copy?: boolean;
@@ -117,6 +117,7 @@ export interface TestConfig {
   input_source?: "screen" | "window" | "synthetic";
   window_hwnd?: string;
   window_title?: string;
+  visual_preview?: boolean;
   output_validation?: boolean;
 }
 
@@ -529,6 +530,10 @@ export interface ProbeSnapshot {
   last_media_sequence?: number | null;
   last_media_timestamp_us?: number | null;
   last_media_payload_hash?: string | null;
+  latest_frame_data_url?: string | null;
+  latest_frame_width?: number | null;
+  latest_frame_height?: number | null;
+  latest_frame_pixel_format?: string | null;
   last_error?: string | null;
 }
 
@@ -623,9 +628,17 @@ export interface TestMatrixConfig {
 export interface HarnessMetrics {
   is_running: boolean;
   capture_fps: number;
+  encoded_fps?: number;
+  decoded_fps?: number;
   capture_latency_avg_ms: number;
   capture_latency_p50_ms: number;
   capture_latency_p95_ms: number;
+  source_wait_latency_avg_ms?: number;
+  source_wait_latency_p50_ms?: number;
+  source_wait_latency_p95_ms?: number;
+  interactive_latency_avg_ms?: number;
+  interactive_latency_p50_ms?: number;
+  interactive_latency_p95_ms?: number;
   encode_latency_avg_ms: number;
   encode_latency_p50_ms: number;
   encode_latency_p95_ms: number;

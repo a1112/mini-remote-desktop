@@ -98,7 +98,11 @@ function browserDevCapabilities(): EnvironmentSnapshot | null {
         ? ['none', 'openh264']
         : ['none', 'openh264'],
     available_decoders: isMac ? ['none', 'software', 'videotoolbox'] : ['none', 'software'],
-    available_renderers: isMac ? ['macos'] : isWindows ? ['d3d11'] : [],
+    available_renderers: isMac
+      ? ['macos', 'webview']
+      : isWindows
+      ? ['d3d11', 'd3d12', 'opengl', 'webview']
+      : ['webview'],
     available_memory_modes: isWindows ? ['cpu', 'd3d11_shared'] : ['cpu'],
   };
 }

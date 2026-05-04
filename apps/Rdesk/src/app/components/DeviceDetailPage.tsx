@@ -375,7 +375,11 @@ function RemoteTab({ device }: { device: Device }) {
   const [launching, setLaunching] = useState(false);
   const isOnline = device.status === "online";
   const isLanP2PRemote = device.p2pAvailable && !device.isLocal;
-  const preferredTransport = device.os.toLowerCase().includes("quic") ? "quic" : "webrtc";
+  const preferredTransport = device.p2pAvailable
+    ? "quic"
+    : device.os.toLowerCase().includes("quic")
+      ? "quic"
+      : "webrtc";
 
   useEffect(() => {
     if (!connected) return;

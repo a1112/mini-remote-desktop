@@ -89,6 +89,10 @@ export interface ProbeSnapshot {
   last_media_sequence?: number | null;
   last_media_timestamp_us?: number | null;
   last_media_payload_hash?: string | null;
+  latest_frame_data_url?: string | null;
+  latest_frame_width?: number | null;
+  latest_frame_height?: number | null;
+  latest_frame_pixel_format?: string | null;
   last_error?: string | null;
 }
 

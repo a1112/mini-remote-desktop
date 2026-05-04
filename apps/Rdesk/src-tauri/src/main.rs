@@ -8,6 +8,7 @@ mod frame_sink;
 mod ipc_client;
 mod platform;
 mod remote_display_surface;
+mod render_probe;
 mod render_window_registry;
 mod resource_monitor;
 mod service_manager;

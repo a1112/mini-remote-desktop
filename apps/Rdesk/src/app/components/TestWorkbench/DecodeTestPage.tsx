@@ -1,47 +1,35 @@
-import { useState, useEffect } from "react";
-import { Play, Square, Cpu, Monitor, Clock } from "lucide-react";
+import { useEffect, useState, type ReactNode } from "react";
+import { Play, Square, Cpu, Monitor, Clock, Gauge } from "lucide-react";
 import * as commands from "../../adapters/tauri/commands";
-import type { EnvironmentSnapshot } from "../../adapters/tauri/types";
-import {
-  capabilityAvailable,
-  capabilityTag,
-  chooseCapability,
-  unavailableText,
-} from "./capabilityMeta";
+import type { EnvironmentSnapshot, TestConfig } from "../../adapters/tauri/types";
+import { capabilityAvailable, capabilityTag, unavailableText } from "./capabilityMeta";
 
 type DecoderType = "nvdec" | "software" | "videotoolbox";
+type DecodeCodec = "h264" | "hevc" | "hevc_main10" | "av1";
 
 interface DecoderOption {
   id: DecoderType;
   name: string;
   description: string;
   type: "hardware" | "software";
-  icon: React.ReactNode;
+  icon: ReactNode;
 }
 
-const DECODER_OPTIONS: DecoderOption[] = [
-  {
-    id: "nvdec",
-    name: "NVDEC",
-    description: "NVIDIA 硬件解码器，GPU 加速解码",
-    type: "hardware",
-    icon: <Monitor className="h-5 w-5 text-green-500" />,
-  },
-  {
-    id: "software",
-    name: "软件解码 (FFmpeg)",
-    description: "CPU 软件解码，跨平台兼容",
-    type: "software",
-    icon: <Cpu className="h-5 w-5 text-orange-500" />,
-  },
-  {
-    id: "videotoolbox",
-    name: "VideoToolbox",
-    description: "macOS Apple 硬件 H.264 解码器，当前为实验路径",
-    type: "hardware",
-    icon: <Monitor className="h-5 w-5 text-blue-500" />,
-  },
-];
+interface CodecOption {
+  id: DecodeCodec;
+  name: string;
+  description: string;
+  supportedDecoders: DecoderType[];
+}
+
+interface DecodeProfile {
+  id: string;
+  name: string;
+  resolution: [number, number];
+  fps: number;
+  bitrate: number;
+  description: string;
+}
 
 interface DecodeMetrics {
   is_running: boolean;
@@ -49,24 +37,231 @@ interface DecodeMetrics {
   decode_latency_p50_ms: number;
   decode_latency_p95_ms: number;
   decode_latency_p99_ms: number;
-  frame_count: number;
+  decoded_frames: number;
+  decode_failures: number;
   dropped_frames: number;
   resolution: [number, number];
-  cpu_usage: number;
-  gpu_usage: number;
+}
+
+const DECODER_OPTIONS: DecoderOption[] = [
+  {
+    id: "nvdec",
+    name: "NVDEC",
+    description: "NVIDIA 硬件解码器，支持 H.264 / HEVC / HEVC Main10 / AV1 的当前 harness 组合",
+    type: "hardware",
+    icon: <Monitor className="h-5 w-5 text-green-500" />,
+  },
+  {
+    id: "software",
+    name: "软件解码 (H.264)",
+    description: "CPU H.264 软件解码，跨平台 fallback 基线",
+    type: "software",
+    icon: <Cpu className="h-5 w-5 text-orange-500" />,
+  },
+  {
+    id: "videotoolbox",
+    name: "VideoToolbox",
+    description: "macOS Apple H.264 硬件解码器，当前为实验路径",
+    type: "hardware",
+    icon: <Monitor className="h-5 w-5 text-blue-500" />,
+  },
+];
+
+const CODEC_OPTIONS: CodecOption[] = [
+  {
+    id: "h264",
+    name: "H.264",
+    description: "主流远程桌面基础路径，所有当前解码器都可参与。",
+    supportedDecoders: ["nvdec", "software", "videotoolbox"],
+  },
+  {
+    id: "hevc",
+    name: "HEVC",
+    description: "NVENC HEVC -> NVDEC，Windows/NVIDIA 高压路径。",
+    supportedDecoders: ["nvdec"],
+  },
+  {
+    id: "hevc_main10",
+    name: "HEVC Main10",
+    description: "10-bit HEVC -> NVDEC，验证 Main10 能力。",
+    supportedDecoders: ["nvdec"],
+  },
+  {
+    id: "av1",
+    name: "AV1",
+    description: "NVENC AV1 -> NVDEC，取决于 GPU 代际能力。",
+    supportedDecoders: ["nvdec"],
+  },
+];
+
+const DEFAULT_DECODE_PROFILE: DecodeProfile = {
+  id: "1080p60",
+  name: "1080p 60",
+  resolution: [1920, 1080],
+  fps: 60,
+  bitrate: 8_000_000,
+  description: "基准实时桌面。",
+};
+
+const DECODE_PROFILES: DecodeProfile[] = [
+  DEFAULT_DECODE_PROFILE,
+  {
+    id: "1080p144",
+    name: "1080p 144",
+    resolution: [1920, 1080],
+    fps: 144,
+    bitrate: 16_000_000,
+    description: "高刷新桌面压力。",
+  },
+  {
+    id: "2k60",
+    name: "2K 60",
+    resolution: [2560, 1440],
+    fps: 60,
+    bitrate: 16_000_000,
+    description: "2K 常规高质量。",
+  },
+  {
+    id: "2k144",
+    name: "2K 144",
+    resolution: [2560, 1440],
+    fps: 144,
+    bitrate: 30_000_000,
+    description: "目标 2K144 高压档。",
+  },
+  {
+    id: "4k60",
+    name: "4K 60",
+    resolution: [3840, 2160],
+    fps: 60,
+    bitrate: 45_000_000,
+    description: "4K 解码压力。",
+  },
+  {
+    id: "max240",
+    name: "最大吞吐 240",
+    resolution: [1920, 1080],
+    fps: 240,
+    bitrate: 40_000_000,
+    description: "移除 60fps UI 限制的吞吐压力档。",
+  },
+];
+
+function codecSupportedByDecoder(codec: DecodeCodec, decoder: DecoderType): boolean {
+  return CODEC_OPTIONS.some((option) => option.id === codec && option.supportedDecoders.includes(decoder));
+}
+
+function hasCapability(
+  capabilities: EnvironmentSnapshot | null,
+  key: "available_captures" | "available_encoders" | "available_decoders",
+  value: string
+): boolean {
+  if (!capabilities) return false;
+  return capabilities[key]?.includes(value) ?? false;
+}
+
+function buildDecodeRun(
+  decoder: DecoderType,
+  codec: DecodeCodec,
+  profile: DecodeProfile
+): {
+  scenarioId: string;
+  config: TestConfig;
+} {
+  const common = {
+    resolution: profile.resolution,
+    fps: profile.fps,
+    bitrate: profile.bitrate,
+    duration_ms: 30_000,
+    transport_kind: "loopback" as const,
+    renderer_type: "d3d11" as const,
+    render_display: false,
+    visual_preview: false,
+  };
+
+  if (decoder === "software") {
+    return {
+      scenarioId: "custom",
+      config: {
+        ...common,
+        capture_type: "synthetic",
+        encoder_type: "openh264",
+        decoder_type: "software",
+        renderer_type: "d3d11",
+        zero_copy: false,
+      },
+    };
+  }
+
+  if (decoder === "videotoolbox") {
+    return {
+      scenarioId: "custom",
+      config: {
+        ...common,
+        capture_type: "macos",
+        encoder_type: "videotoolbox_h264",
+        decoder_type: "videotoolbox",
+        renderer_type: "macos",
+        zero_copy: false,
+      },
+    };
+  }
+
+  const encoderByCodec: Record<DecodeCodec, NonNullable<TestConfig["encoder_type"]>> = {
+    h264: "nvenc_h264",
+    hevc: "nvenc_hevc",
+    hevc_main10: "nvenc_hevc_main10",
+    av1: "nvenc_av1",
+  };
+
+  return {
+    scenarioId: "custom",
+    config: {
+      ...common,
+      capture_type: "dxgi",
+      encoder_type: encoderByCodec[codec],
+      decoder_type: "nvdec",
+      renderer_type: "d3d11",
+      zero_copy: true,
+    },
+  };
+}
+
+function missingChainCapability(
+  capabilities: EnvironmentSnapshot | null,
+  config: TestConfig
+): string | null {
+  if (!capabilities) return "capabilities";
+  if (config.capture_type && !hasCapability(capabilities, "available_captures", config.capture_type)) {
+    return config.capture_type;
+  }
+  if (config.encoder_type && !hasCapability(capabilities, "available_encoders", config.encoder_type)) {
+    return config.encoder_type;
+  }
+  if (config.decoder_type && !hasCapability(capabilities, "available_decoders", config.decoder_type)) {
+    return config.decoder_type;
+  }
+  return null;
 }
 
 export function DecodeTestPage() {
   const [selectedDecoder, setSelectedDecoder] = useState<DecoderType>("software");
-  const [testStream, setTestStream] = useState("h264_1080p_60fps");
+  const [selectedCodec, setSelectedCodec] = useState<DecodeCodec>("h264");
+  const [selectedProfileId, setSelectedProfileId] = useState("1080p60");
   const [isRunning, setIsRunning] = useState(false);
   const [metrics, setMetrics] = useState<DecodeMetrics | null>(null);
   const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
   const [startError, setStartError] = useState<string | null>(null);
+  const [activeRunId, setActiveRunId] = useState<string | null>(null);
 
-  const decoderAvailable = (decoder: DecoderType) =>
-    capabilityAvailable(capabilities, "available_decoders", decoder, decoder === "software");
-  const selectedAvailable = decoderAvailable(selectedDecoder);
+  const selectedProfile =
+    DECODE_PROFILES.find((profile) => profile.id === selectedProfileId) ?? DEFAULT_DECODE_PROFILE;
+  const selectedOption = DECODER_OPTIONS.find((option) => option.id === selectedDecoder);
+  const selectedRun = buildDecodeRun(selectedDecoder, selectedCodec, selectedProfile);
+  const selectedAvailable =
+    capabilityAvailable(capabilities, "available_decoders", selectedDecoder, selectedDecoder === "software") &&
+    codecSupportedByDecoder(selectedCodec, selectedDecoder) &&
+    !missingChainCapability(capabilities, selectedRun.config);
 
   useEffect(() => {
     let cancelled = false;
@@ -83,16 +278,18 @@ export function DecodeTestPage() {
   }, []);
 
   useEffect(() => {
-    if (!capabilities || decoderAvailable(selectedDecoder)) return;
-    const nextDecoder = DECODER_OPTIONS.find((option) => decoderAvailable(option.id));
+    if (!codecSupportedByDecoder(selectedCodec, selectedDecoder)) {
+      setSelectedCodec("h264");
+    }
+  }, [selectedCodec, selectedDecoder]);
+
+  useEffect(() => {
+    if (!capabilities || capabilityAvailable(capabilities, "available_decoders", selectedDecoder, false)) return;
+    const nextDecoder = DECODER_OPTIONS.find((option) =>
+      capabilityAvailable(capabilities, "available_decoders", option.id, option.id === "software")
+    );
     if (nextDecoder) setSelectedDecoder(nextDecoder.id);
   }, [capabilities, selectedDecoder]);
-
-  const TEST_STREAMS = [
-    { id: "h264_720p_30fps", name: "H.264 720p @ 30fps" },
-    { id: "h264_1080p_60fps", name: "H.264 1080p @ 60fps" },
-    { id: "h264_4k_30fps", name: "H.264 4K @ 30fps" },
-  ];
 
   useEffect(() => {
     if (!isRunning) return;
@@ -100,30 +297,36 @@ export function DecodeTestPage() {
     const interval = setInterval(async () => {
       const result = await commands.testHarnessGetMetrics();
       if (result.ok) {
+        if (!result.value.is_running) {
+          setIsRunning(false);
+          setActiveRunId(null);
+        }
         setMetrics({
           is_running: result.value.is_running,
-          decode_fps: result.value.capture_fps,
+          decode_fps: result.value.decoded_fps ?? result.value.capture_fps,
           decode_latency_p50_ms: result.value.decode_latency_p50_ms || 0,
           decode_latency_p95_ms: result.value.decode_latency_p95_ms || 0,
           decode_latency_p99_ms: (result.value.decode_latency_p95_ms || 0) * 1.2,
-          frame_count: result.value.frame_count,
+          decoded_frames: result.value.decoded_frames ?? result.value.frame_count,
+          decode_failures: result.value.decode_failures ?? 0,
           dropped_frames: result.value.dropped_frames,
           resolution: result.value.resolution,
-          cpu_usage: selectedDecoder === "software" ? 45 + Math.random() * 20 : 5,
-          gpu_usage:
-            selectedDecoder === "nvdec" || selectedDecoder === "videotoolbox"
-              ? 30 + Math.random() * 15
-              : 2,
         });
       }
     }, 200);
 
     return () => clearInterval(interval);
-  }, [isRunning, selectedDecoder]);
+  }, [isRunning]);
 
   const handleStart = async () => {
-    if (!selectedAvailable) {
-      setStartError("当前环境未暴露所选解码器能力。");
+    const run = buildDecodeRun(selectedDecoder, selectedCodec, selectedProfile);
+    const missing = missingChainCapability(capabilities, run.config);
+    if (missing) {
+      setStartError(`当前环境缺少解码测试链路能力：${missing}`);
+      return;
+    }
+    if (!codecSupportedByDecoder(selectedCodec, selectedDecoder)) {
+      setStartError("当前解码器不支持所选 codec。");
       return;
     }
 
@@ -131,119 +334,145 @@ export function DecodeTestPage() {
     setMetrics(null);
     setStartError(null);
 
-    const capture = chooseCapability(
-      selectedDecoder === "nvdec" ? ["dxgi", "synthetic"] : ["macos", "dxgi", "synthetic"],
-      capabilities,
-      "available_captures",
-      "synthetic"
-    );
-    const encoder = chooseCapability(
-      selectedDecoder === "nvdec"
-        ? ["nvenc_h264", "openh264"]
-        : ["videotoolbox_h264", "nvenc_h264", "openh264"],
-      capabilities,
-      "available_encoders",
-      "openh264"
-    );
-
-    const customResult = await commands.testHarnessSetCustom({
-      capture,
-      encoder,
-      decoder: selectedDecoder,
-    });
-    if (!customResult.ok) {
-      setIsRunning(false);
-      setStartError(customResult.error.message);
-      return;
-    }
-
-    const startResult = await commands.testHarnessStart();
+    const startResult = await commands.testStartRun(run);
     if (!startResult.ok) {
       setIsRunning(false);
       setStartError(startResult.error.message);
+      return;
     }
+    setActiveRunId(startResult.value);
   };
 
   const handleStop = async () => {
-    await commands.testHarnessStop();
+    if (activeRunId) {
+      await commands.testStopRun(activeRunId);
+      setActiveRunId(null);
+    } else {
+      await commands.testHarnessStop();
+    }
     setIsRunning(false);
   };
 
   return (
-    <div className="p-6 max-w-4xl mx-auto">
-      {/* Header */}
+    <div className="p-6 max-w-5xl mx-auto">
       <div className="mb-6">
         <h1 className="text-2xl font-bold text-foreground flex items-center gap-2">
           <Monitor className="h-6 w-6" />
           解码测试
         </h1>
         <p className="text-muted-foreground">
-          测试不同解码器的性能和资源占用
+          测试不同解码器的真实解码吞吐、延迟和失败计数
         </p>
       </div>
 
-      {/* Decoder Selection */}
       <div className="bg-card rounded-lg border p-4 mb-6">
         <h2 className="text-lg font-semibold mb-4">选择解码器</h2>
-        <div className="grid md:grid-cols-2 gap-4">
+        <div className="grid md:grid-cols-3 gap-4">
           {DECODER_OPTIONS.map((option) => {
-            const available = decoderAvailable(option.id);
+            const available = capabilityAvailable(
+              capabilities,
+              "available_decoders",
+              option.id,
+              option.id === "software"
+            );
             const disabledLabel = unavailableText(capabilities, "available_decoders", option.id);
             return (
-            <button
-              key={option.id}
-              onClick={() => setSelectedDecoder(option.id)}
-              disabled={isRunning || !available}
-              className={`p-4 rounded-lg border-2 text-left transition-all ${
-                selectedDecoder === option.id
-                  ? "border-primary bg-primary/10"
-                  : "border-transparent bg-muted/30 hover:bg-muted/50"
-              } ${!available ? "opacity-50 cursor-not-allowed" : ""}`}
-            >
-              <div className="flex items-center gap-2 mb-2">
-                {option.icon}
-                <span className="font-medium">{option.name}</span>
-              </div>
-              <p className="text-sm text-muted-foreground">{option.description}</p>
-              <span className="inline-block mt-2 text-xs bg-muted px-2 py-0.5 rounded">
-                {option.type === "hardware" ? "硬件加速" : "软件"}
-              </span>
-              <span className="inline-block mt-2 ml-2 text-xs bg-muted px-2 py-0.5 rounded">
-                {capabilityTag(option.id)}
-              </span>
-              {disabledLabel && (
-                <span className="inline-block mt-2 ml-2 text-xs bg-yellow-100 text-yellow-800 px-2 py-0.5 rounded">
-                  {disabledLabel}
+              <button
+                key={option.id}
+                aria-label={`选择解码器 ${option.name}`}
+                onClick={() => setSelectedDecoder(option.id)}
+                disabled={isRunning || !available}
+                className={`p-4 rounded-lg border-2 text-left transition-all ${
+                  selectedDecoder === option.id
+                    ? "border-primary bg-primary/10"
+                    : "border-transparent bg-muted/30 hover:bg-muted/50"
+                } ${!available ? "opacity-50 cursor-not-allowed" : ""}`}
+              >
+                <div className="flex items-center gap-2 mb-2">
+                  {option.icon}
+                  <span className="font-medium">{option.name}</span>
+                </div>
+                <p className="text-sm text-muted-foreground">{option.description}</p>
+                <span className="inline-block mt-2 text-xs bg-muted px-2 py-0.5 rounded">
+                  {option.type === "hardware" ? "硬件加速" : "软件"}
                 </span>
-              )}
-            </button>
+                <span className="inline-block mt-2 ml-2 text-xs bg-muted px-2 py-0.5 rounded">
+                  {capabilityTag(option.id)}
+                </span>
+                {disabledLabel && (
+                  <span className="inline-block mt-2 ml-2 text-xs bg-yellow-100 text-yellow-800 px-2 py-0.5 rounded">
+                    {disabledLabel}
+                  </span>
+                )}
+              </button>
             );
           })}
         </div>
       </div>
 
-      {/* Test Stream Selection */}
-      <div className="bg-card rounded-lg border p-4 mb-6">
-        <h3 className="font-medium mb-4">测试流</h3>
-        <div className="grid md:grid-cols-3 gap-3">
-          {TEST_STREAMS.map((stream) => (
-            <button
-              key={stream.id}
-              onClick={() => setTestStream(stream.id)}
-              disabled={isRunning}
-              className={`px-4 py-3 rounded-lg border text-sm transition-all ${
-                testStream === stream.id
-                  ? "bg-primary text-primary-foreground border-primary"
-                  : "bg-background hover:bg-muted"
-              }`}
-            >
-              {stream.name}
-            </button>
-          ))}
+      <div className="grid lg:grid-cols-2 gap-6 mb-6">
+        <div className="bg-card rounded-lg border p-4">
+          <h3 className="font-medium mb-4">Codec</h3>
+          <div className="grid sm:grid-cols-2 gap-3">
+            {CODEC_OPTIONS.map((codec) => {
+              const supported = codec.supportedDecoders.includes(selectedDecoder);
+              return (
+                <button
+                  key={codec.id}
+                  onClick={() => setSelectedCodec(codec.id)}
+                  disabled={isRunning || !supported}
+                  className={`px-4 py-3 rounded-lg border text-left text-sm transition-all ${
+                    selectedCodec === codec.id
+                      ? "bg-primary text-primary-foreground border-primary"
+                      : "bg-background hover:bg-muted"
+                  } ${!supported ? "opacity-50 cursor-not-allowed" : ""}`}
+                >
+                  <span className="block font-medium">{codec.name}</span>
+                  <span className="block text-xs opacity-80">{codec.description}</span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        <div className="bg-card rounded-lg border p-4">
+          <h3 className="font-medium mb-4">测试档位</h3>
+          <div className="grid sm:grid-cols-2 gap-3">
+            {DECODE_PROFILES.map((profile) => (
+              <button
+                key={profile.id}
+                onClick={() => setSelectedProfileId(profile.id)}
+                disabled={isRunning}
+                className={`px-4 py-3 rounded-lg border text-left text-sm transition-all ${
+                  selectedProfileId === profile.id
+                    ? "bg-primary text-primary-foreground border-primary"
+                    : "bg-background hover:bg-muted"
+                }`}
+              >
+                <span className="block font-medium">{profile.name}</span>
+                <span className="block text-xs opacity-80">
+                  {profile.resolution[0]}x{profile.resolution[1]} @ {profile.fps}fps
+                </span>
+                <span className="block text-xs opacity-80">{profile.description}</span>
+              </button>
+            ))}
+          </div>
         </div>
       </div>
 
-      {/* Control */}
+      <div className="bg-card rounded-lg border p-4 mb-6">
+        <h3 className="font-medium mb-3">当前链路</h3>
+        <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-3 text-sm">
+          <InfoPill label="解码器" value={selectedOption?.name ?? selectedDecoder} />
+          <InfoPill label="Codec" value={CODEC_OPTIONS.find((codec) => codec.id === selectedCodec)?.name ?? selectedCodec} />
+          <InfoPill label="编码输入" value={selectedRun.config.encoder_type ?? "none"} />
+          <InfoPill label="目标档位" value={`${selectedProfile.resolution[0]}x${selectedProfile.resolution[1]} @ ${selectedProfile.fps}fps`} />
+        </div>
+        <p className="mt-3 text-xs text-muted-foreground">
+          软件解码只跑 H.264 CPU fallback；NVDEC 可切换 H.264 / HEVC / HEVC Main10 / AV1。页面不再限制在 60fps 档位，实际吞吐以 decoded FPS 为准。
+        </p>
+      </div>
+
       <div className="mb-6">
         {!isRunning ? (
           <button
@@ -264,56 +493,36 @@ export function DecodeTestPage() {
           </button>
         )}
       </div>
-      {startError && (
-        <p className="text-sm text-red-600 mb-6">{startError}</p>
-      )}
+      {startError && <p className="text-sm text-red-600 mb-6">{startError}</p>}
 
-      {/* Metrics */}
       {metrics && (
         <>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
             <MetricCard
               icon={<Monitor className="h-4 w-4" />}
-              label="Pipeline FPS"
+              label="解码 FPS"
               value={`${metrics.decode_fps.toFixed(1)} FPS`}
               color={getFpsColor(metrics.decode_fps)}
             />
             <MetricCard
               icon={<Clock className="h-4 w-4" />}
-              label="P95 延迟"
+              label="P95 解码延迟"
               value={`${metrics.decode_latency_p95_ms.toFixed(2)} ms`}
               color={getLatencyColor(metrics.decode_latency_p95_ms, 5, 15)}
             />
             <MetricCard
-              icon={<Cpu className="h-4 w-4" />}
-              label="总帧数"
-              value={metrics.frame_count.toLocaleString()}
+              icon={<Gauge className="h-4 w-4" />}
+              label="解码帧数"
+              value={metrics.decoded_frames.toLocaleString()}
             />
             <MetricCard
-              label="丢帧"
-              value={metrics.dropped_frames.toLocaleString()}
-              highlight={metrics.dropped_frames > 0}
+              label="失败解码"
+              value={metrics.decode_failures.toLocaleString()}
+              highlight={metrics.decode_failures > 0 || metrics.dropped_frames > 0}
             />
           </div>
 
-          {/* Resource Usage */}
           <div className="grid md:grid-cols-2 gap-6 mb-6">
-            <div className="bg-card rounded-lg border p-4">
-              <h3 className="font-medium mb-4">资源占用</h3>
-              <div className="space-y-4">
-                <ResourceBar
-                  label="CPU"
-                  value={metrics.cpu_usage}
-                  color="bg-orange-500"
-                />
-                <ResourceBar
-                  label="GPU"
-                  value={metrics.gpu_usage}
-                  color="bg-green-500"
-                />
-              </div>
-            </div>
-
             <div className="bg-card rounded-lg border p-4">
               <h3 className="font-medium mb-4">解码延迟</h3>
               <div className="space-y-3">
@@ -322,61 +531,61 @@ export function DecodeTestPage() {
                 <PercentileBar label="P99" value={metrics.decode_latency_p99_ms} />
               </div>
             </div>
+
+            <div className="bg-card rounded-lg border p-4">
+              <h3 className="font-medium mb-4">采样状态</h3>
+              <div className="space-y-2 text-sm">
+                <InfoRow label="运行中" value={metrics.is_running ? "是" : "否"} />
+                <InfoRow label="输出分辨率" value={`${metrics.resolution[0]}x${metrics.resolution[1]}`} />
+                <InfoRow label="丢帧" value={metrics.dropped_frames.toLocaleString()} />
+                <InfoRow label="资源占用" value="未采集，后续接系统指标" />
+              </div>
+            </div>
           </div>
 
-          {/* Comparison */}
           <div className="bg-card rounded-lg border p-4">
-            <h3 className="font-medium mb-4">解码器对比</h3>
+            <h3 className="font-medium mb-4">当前结果</h3>
             <table className="w-full text-sm">
               <thead>
                 <tr className="border-b">
                   <th className="text-left py-2">解码器</th>
-                  <th className="text-right py-2">帧率</th>
+                  <th className="text-right py-2">Codec</th>
+                  <th className="text-right py-2">解码 FPS</th>
                   <th className="text-right py-2">P95 延迟</th>
-                  <th className="text-right py-2">CPU 占用</th>
-                  <th className="text-right py-2">GPU 占用</th>
+                  <th className="text-right py-2">解码帧数</th>
                 </tr>
               </thead>
               <tbody>
-                {DECODER_OPTIONS.map((option) => (
-                  <tr key={option.id} className="border-b last:border-0">
-                    <td className="py-2">
-                      <span className="flex items-center gap-2">
-                        {option.id === "software" ? (
-                          <Cpu className="h-4 w-4 text-orange-500" />
-                        ) : (
-                          <Monitor className="h-4 w-4 text-green-500" />
-                        )}
-                        {option.name}
-                      </span>
-                    </td>
-                    <td className="text-right font-mono">
-                      {selectedDecoder === option.id && metrics
-                        ? `${metrics.decode_fps.toFixed(1)}`
-                        : "-"}
-                    </td>
-                    <td className="text-right font-mono">
-                      {selectedDecoder === option.id && metrics
-                        ? `${metrics.decode_latency_p95_ms.toFixed(2)} ms`
-                        : "-"}
-                    </td>
-                    <td className="text-right font-mono">
-                      {selectedDecoder === option.id && metrics
-                        ? `${metrics.cpu_usage.toFixed(1)}%`
-                        : option.id === "software" ? "~50%" : "~5%"}
-                    </td>
-                    <td className="text-right font-mono">
-                      {selectedDecoder === option.id && metrics
-                        ? `${metrics.gpu_usage.toFixed(1)}%`
-                        : option.id === "software" ? "~2%" : "~30%"}
-                    </td>
-                  </tr>
-                ))}
+                <tr className="border-b last:border-0">
+                  <td className="py-2">{selectedOption?.name ?? selectedDecoder}</td>
+                  <td className="text-right font-mono">{selectedCodec}</td>
+                  <td className="text-right font-mono">{metrics.decode_fps.toFixed(1)}</td>
+                  <td className="text-right font-mono">{metrics.decode_latency_p95_ms.toFixed(2)} ms</td>
+                  <td className="text-right font-mono">{metrics.decoded_frames.toLocaleString()}</td>
+                </tr>
               </tbody>
             </table>
           </div>
         </>
       )}
+    </div>
+  );
+}
+
+function InfoPill({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-lg bg-muted/40 px-3 py-2">
+      <div className="text-xs text-muted-foreground">{label}</div>
+      <div className="font-mono text-sm">{value}</div>
+    </div>
+  );
+}
+
+function InfoRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex justify-between gap-4">
+      <span className="text-muted-foreground">{label}</span>
+      <span className="font-mono text-right">{value}</span>
     </div>
   );
 }
@@ -388,7 +597,7 @@ function MetricCard({
   color = "text-foreground",
   highlight = false,
 }: {
-  icon?: React.ReactNode;
+  icon?: ReactNode;
   label: string;
   value: string | number;
   color?: string;
@@ -405,31 +614,6 @@ function MetricCard({
         <span>{label}</span>
       </div>
       <div className={`text-xl font-semibold ${color}`}>{value}</div>
-    </div>
-  );
-}
-
-function ResourceBar({
-  label,
-  value,
-  color,
-}: {
-  label: string;
-  value: number;
-  color: string;
-}) {
-  return (
-    <div>
-      <div className="flex justify-between text-sm mb-1">
-        <span className="text-muted-foreground">{label}</span>
-        <span className="font-mono">{value.toFixed(1)}%</span>
-      </div>
-      <div className="h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
-        <div
-          className={`h-full ${color} transition-all duration-300`}
-          style={{ width: `${Math.min(value, 100)}%` }}
-        />
-      </div>
     </div>
   );
 }
@@ -456,8 +640,8 @@ function PercentileBar({ label, value }: { label: string; value: number }) {
 }
 
 function getFpsColor(fps: number): string {
-  if (fps >= 55) return "text-green-500";
-  if (fps >= 30) return "text-yellow-500";
+  if (fps >= 120) return "text-green-500";
+  if (fps >= 60) return "text-yellow-500";
   return "text-red-500";
 }
 

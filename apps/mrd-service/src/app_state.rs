@@ -5,11 +5,13 @@
 // of truth for all session orchestration, transport runtime,
 // and media control.
 
+use base64::{engine::general_purpose, Engine as _};
+use image::{codecs::png::PngEncoder, ColorType, ImageEncoder};
 use mrd_application::ports::SessionSnapshot;
 use mrd_ipc::{CaptureSourceSelection, MediaProfileNegotiation};
 use mrd_proto::{DeviceId, SessionId};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::{sync::Mutex, task::AbortHandle};
 
 /// Session registry tracking all active sessions
 #[derive(Debug, Default)]
@@ -85,6 +87,31 @@ impl CaptureSourceRegistry {
     }
 }
 
+/// Runtime media tasks keyed by session.
+#[derive(Default)]
+pub struct MediaTaskRegistry {
+    tasks: std::collections::HashMap<SessionId, Vec<AbortHandle>>,
+}
+
+impl MediaTaskRegistry {
+    pub fn register(&mut self, session_id: SessionId, abort_handle: AbortHandle) {
+        self.tasks.entry(session_id).or_default().push(abort_handle);
+    }
+
+    pub fn abort_session(&mut self, session_id: &SessionId) -> usize {
+        let handles = self.tasks.remove(session_id).unwrap_or_default();
+        let count = handles.len();
+        for handle in handles {
+            handle.abort();
+        }
+        count
+    }
+
+    pub fn active_count(&self, session_id: &SessionId) -> usize {
+        self.tasks.get(session_id).map_or(0, Vec::len)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct SessionProbeStats {
     frames_received: u64,
@@ -103,7 +130,16 @@ struct SessionProbeStats {
     last_media_sequence: Option<u64>,
     last_media_timestamp_us: Option<u64>,
     last_media_payload_hash: Option<String>,
+    latest_frame: Option<DecodedPreviewFrame>,
     last_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct DecodedPreviewFrame {
+    width: u32,
+    height: u32,
+    pixel_format: String,
+    rgb24: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -118,6 +154,20 @@ pub struct MediaProbeFrameStats {
     pub payload_bytes: u32,
     pub format: String,
     pub payload_hash: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct DecodedVideoFrameStats {
+    pub bytes_received: u64,
+    pub sequence: u64,
+    pub timestamp_us: u64,
+    pub width: u32,
+    pub height: u32,
+    pub target_fps: u32,
+    pub target_bitrate_mbps: u32,
+    pub encoded_bytes: u32,
+    pub pixel_format: String,
+    pub rgb24: Vec<u8>,
 }
 
 impl ProbeRegistry {
@@ -164,6 +214,45 @@ impl ProbeRegistry {
         stats.last_error = None;
     }
 
+    pub fn record_decoded_video_frame(
+        &mut self,
+        session_id: &SessionId,
+        frame: DecodedVideoFrameStats,
+        now_ms: u64,
+    ) {
+        let stats = self.probes.entry(session_id.clone()).or_default();
+        if let Some(last_sequence) = stats.last_media_sequence {
+            if frame.sequence > last_sequence.saturating_add(1) {
+                stats.frames_dropped = stats
+                    .frames_dropped
+                    .saturating_add(frame.sequence.saturating_sub(last_sequence + 1));
+            }
+        }
+
+        stats.frames_received = stats.frames_received.saturating_add(1);
+        stats.frames_decoded = stats.frames_decoded.saturating_add(1);
+        stats.bytes_received = stats.bytes_received.saturating_add(frame.bytes_received);
+        stats.first_seen_ms.get_or_insert(now_ms);
+        stats.last_seen_ms = Some(now_ms);
+        stats.media_probe_valid = true;
+        stats.media_probe_format = Some("h264_desktop_frame".to_string());
+        stats.media_probe_width = Some(frame.width);
+        stats.media_probe_height = Some(frame.height);
+        stats.media_probe_target_fps = Some(frame.target_fps);
+        stats.media_probe_target_bitrate_mbps = Some(frame.target_bitrate_mbps);
+        stats.media_probe_payload_bytes = Some(frame.encoded_bytes);
+        stats.last_media_sequence = Some(frame.sequence);
+        stats.last_media_timestamp_us = Some(frame.timestamp_us);
+        stats.last_media_payload_hash = Some(format!("fnv1a64:{:016x}", fnv1a64(&frame.rgb24)));
+        stats.latest_frame = Some(DecodedPreviewFrame {
+            width: frame.width,
+            height: frame.height,
+            pixel_format: frame.pixel_format,
+            rgb24: frame.rgb24,
+        });
+        stats.last_error = None;
+    }
+
     pub fn record_probe_drop(
         &mut self,
         session_id: &SessionId,
@@ -199,6 +288,10 @@ impl ProbeRegistry {
                 last_media_sequence: None,
                 last_media_timestamp_us: None,
                 last_media_payload_hash: None,
+                latest_frame_data_url: None,
+                latest_frame_width: None,
+                latest_frame_height: None,
+                latest_frame_pixel_format: None,
                 last_error: None,
             };
         };
@@ -235,9 +328,45 @@ impl ProbeRegistry {
             last_media_sequence: stats.last_media_sequence,
             last_media_timestamp_us: stats.last_media_timestamp_us,
             last_media_payload_hash: stats.last_media_payload_hash.clone(),
+            latest_frame_data_url: stats.latest_frame.as_ref().and_then(|frame| {
+                encode_rgb24_png_data_url(frame.width, frame.height, &frame.rgb24)
+            }),
+            latest_frame_width: stats.latest_frame.as_ref().map(|frame| frame.width),
+            latest_frame_height: stats.latest_frame.as_ref().map(|frame| frame.height),
+            latest_frame_pixel_format: stats
+                .latest_frame
+                .as_ref()
+                .map(|frame| frame.pixel_format.clone()),
             last_error: stats.last_error.clone(),
         }
     }
+}
+
+fn encode_rgb24_png_data_url(width: u32, height: u32, rgb24: &[u8]) -> Option<String> {
+    let expected_len = (width as usize)
+        .checked_mul(height as usize)?
+        .checked_mul(3)?;
+    if width == 0 || height == 0 || rgb24.len() != expected_len {
+        return None;
+    }
+
+    let mut png = Vec::new();
+    PngEncoder::new(&mut png)
+        .write_image(rgb24, width, height, ColorType::Rgb8.into())
+        .ok()?;
+    Some(format!(
+        "data:image/png;base64,{}",
+        general_purpose::STANDARD.encode(png)
+    ))
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 /// Shell state - tracks UI presence and service lifecycle
@@ -308,6 +437,8 @@ pub struct AppState {
     pub media_profiles: Arc<Mutex<MediaProfileRegistry>>,
     /// Selected capture source keyed by session.
     pub capture_sources: Arc<Mutex<CaptureSourceRegistry>>,
+    /// Abort handles for active media tasks keyed by session.
+    pub media_tasks: Arc<Mutex<MediaTaskRegistry>>,
 }
 
 impl AppState {
@@ -327,6 +458,7 @@ impl AppState {
             probes: Arc::new(Mutex::new(ProbeRegistry::default())),
             media_profiles: Arc::new(Mutex::new(MediaProfileRegistry::default())),
             capture_sources: Arc::new(Mutex::new(CaptureSourceRegistry::default())),
+            media_tasks: Arc::new(Mutex::new(MediaTaskRegistry::default())),
         }
     }
 
@@ -368,6 +500,11 @@ impl AppState {
     /// Get a clone of the capture source registry.
     pub fn capture_sources(&self) -> Arc<Mutex<CaptureSourceRegistry>> {
         self.capture_sources.clone()
+    }
+
+    /// Get a clone of the media task registry.
+    pub fn media_tasks(&self) -> Arc<Mutex<MediaTaskRegistry>> {
+        self.media_tasks.clone()
     }
 }
 
@@ -480,6 +617,45 @@ mod tests {
             snapshot.last_media_payload_hash.as_deref(),
             Some("fnv1a64:abc123")
         );
+    }
+
+    #[test]
+    fn probe_registry_exposes_latest_decoded_video_preview() {
+        let mut registry = ProbeRegistry::default();
+        let session_id = SessionId("decoded-video-session".to_string());
+
+        registry.record_decoded_video_frame(
+            &session_id,
+            DecodedVideoFrameStats {
+                bytes_received: 4096,
+                sequence: 11,
+                timestamp_us: 987_654,
+                width: 2,
+                height: 2,
+                target_fps: 144,
+                target_bitrate_mbps: 64,
+                encoded_bytes: 1024,
+                pixel_format: "rgb24".to_string(),
+                rgb24: vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255],
+            },
+            3_000,
+        );
+
+        let snapshot = registry.snapshot(&session_id);
+
+        assert_eq!(snapshot.frames_received, 1);
+        assert_eq!(snapshot.frames_decoded, 1);
+        assert_eq!(
+            snapshot.media_probe_format.as_deref(),
+            Some("h264_desktop_frame")
+        );
+        assert_eq!(snapshot.latest_frame_width, Some(2));
+        assert_eq!(snapshot.latest_frame_height, Some(2));
+        assert_eq!(snapshot.latest_frame_pixel_format.as_deref(), Some("rgb24"));
+        assert!(snapshot
+            .latest_frame_data_url
+            .as_deref()
+            .is_some_and(|value| value.starts_with("data:image/png;base64,")));
     }
 
     #[test]

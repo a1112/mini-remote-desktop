@@ -1,7 +1,12 @@
 import { openRemoteDisplayWindow } from "../adapters/tauri";
 import { isTauriRuntime } from "../utils/runtime";
 import { deviceService } from "./deviceService";
-import { startLanRemoteSession, startSession, type TransportKind } from "./ipcSessionService";
+import {
+  startLanRemoteSession,
+  startSession,
+  type MediaProfile,
+  type TransportKind,
+} from "./ipcSessionService";
 import { saveWebRemoteSession } from "./webRemoteSessionService";
 
 export type RemoteDisplayLaunchResult = {
@@ -11,6 +16,14 @@ export type RemoteDisplayLaunchResult = {
 };
 
 const randomToken = () => Math.random().toString(36).slice(2, 8);
+
+const DEFAULT_REMOTE_MEDIA_PROFILE: MediaProfile = {
+  width: 2560,
+  height: 1440,
+  fps: 144,
+  bitrate_mbps: 64,
+  codec: "h264",
+};
 
 export function createSessionId(prefix: string): string {
   return `${prefix}-${Date.now()}-${randomToken()}`;
@@ -27,12 +40,25 @@ export async function launchRemoteDisplayForDevice(
     targetIp?: string;
     localTest?: boolean;
     lanP2P?: boolean;
+    requestedProfile?: MediaProfile;
   }
 ): Promise<RemoteDisplayLaunchResult> {
-  const transportKind = isTauriRuntime() ? (options?.transportKind ?? "webrtc") : "webrtc";
-  const sessionId = options?.sessionId ?? createSessionId(`p2p-${transportKind}`);
+  const tauriRuntime = isTauriRuntime();
+  const transportKind = tauriRuntime
+    ? (options?.transportKind ?? (options?.lanP2P ? "quic" : "webrtc"))
+    : "webrtc";
+  const localDeviceInfo = tauriRuntime
+    ? deviceService.getDeviceInfo() ?? (await deviceService.initialize())
+    : null;
+  const targetIsLocal = Boolean(
+    options?.localTest ||
+      (localDeviceInfo?.device_id && localDeviceInfo.device_id === targetDeviceId)
+  );
+  const sessionId =
+    options?.sessionId ??
+    createSessionId(targetIsLocal ? "local-display-test" : `p2p-${transportKind}`);
 
-  if (!isTauriRuntime()) {
+  if (!tauriRuntime) {
     saveWebRemoteSession({
       sessionId,
       targetDeviceId,
@@ -46,8 +72,15 @@ export async function launchRemoteDisplayForDevice(
     return { sessionId, windowLabel: null, mode: "route" };
   }
 
-  const startedSessionId = options?.lanP2P
-    ? await startLanRemoteSession(sessionId, targetDeviceId, transportKind)
+  const startedSessionId = targetIsLocal
+    ? sessionId
+    : options?.lanP2P
+      ? await startLanRemoteSession(
+          sessionId,
+          targetDeviceId,
+          transportKind,
+          options?.requestedProfile ?? DEFAULT_REMOTE_MEDIA_PROFILE
+        )
     : await startSession(sessionId, targetDeviceId, transportKind);
 
   if (options?.openWindow === false) {

@@ -28,8 +28,9 @@ const PLATFORM_TAGS: Record<string, string> = {
   loopback: "通用",
   quic: "通用",
   webrtc: "通用",
-  d3d12: "未接入",
-  opengl: "未接入",
+  d3d12: "Windows",
+  opengl: "Windows",
+  webview: "通用",
 };
 
 export function capabilityTag(id: string): string {
@@ -42,7 +43,6 @@ export function capabilityAvailable(
   id: string,
   fallback = false
 ): boolean {
-  if (id === "d3d12" || id === "opengl") return false;
   const values = capabilities?.[key];
   if (!values) return fallback;
   return values.includes(id);
@@ -55,7 +55,6 @@ export function unavailableText(
 ): string | null {
   if (capabilityAvailable(capabilities, key, id)) return null;
   if (!capabilities) return "检测中";
-  if (id === "d3d12" || id === "opengl") return "未接入";
   return "当前平台不可用";
 }
 

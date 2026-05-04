@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { Play, Square, Zap, Cpu, Gauge, Video } from "lucide-react";
 import * as commands from "../../adapters/tauri/commands";
-import type { EnvironmentSnapshot } from "../../adapters/tauri/types";
+import type { EnvironmentSnapshot, TestConfig } from "../../adapters/tauri/types";
 import { capabilityAvailable, capabilityTag, unavailableText } from "./capabilityMeta";
 
 type EncoderType = "nvenc_h264" | "nvenc_av1" | "openh264" | "videotoolbox_h264";
@@ -56,10 +56,59 @@ interface EncoderMetrics {
   encode_latency_p50_ms: number;
   encode_latency_p95_ms: number;
   encode_latency_p99_ms: number;
-  frame_count: number;
+  encoded_units: number;
   dropped_frames: number;
   resolution: [number, number];
   bitrate_kbps: number;
+}
+
+function buildEncodeRun(encoder: EncoderType, bitrateKbps: number): {
+  scenarioId: string;
+  config: TestConfig;
+} {
+  const bitrate = bitrateKbps * 1000;
+  if (encoder === "openh264") {
+    return {
+      scenarioId: "encode.openh264",
+      config: {
+        capture_type: "synthetic",
+        encoder_type: "openh264",
+        decoder_type: "none",
+        zero_copy: false,
+        bitrate,
+        duration_ms: 30_000,
+        visual_preview: false,
+      },
+    };
+  }
+
+  if (encoder === "videotoolbox_h264") {
+    return {
+      scenarioId: "encode.videotoolbox_h264",
+      config: {
+        capture_type: "synthetic",
+        encoder_type: "videotoolbox_h264",
+        decoder_type: "none",
+        zero_copy: false,
+        bitrate,
+        duration_ms: 30_000,
+        visual_preview: false,
+      },
+    };
+  }
+
+  return {
+    scenarioId: encoder === "nvenc_av1" ? "custom" : "encode.nvenc_h264",
+    config: {
+      capture_type: "dxgi",
+      encoder_type: encoder,
+      decoder_type: "none",
+      zero_copy: true,
+      bitrate,
+      duration_ms: 30_000,
+      visual_preview: false,
+    },
+  };
 }
 
 export function EncodeTestPage() {
@@ -70,8 +119,13 @@ export function EncodeTestPage() {
   const [metrics, setMetrics] = useState<EncoderMetrics | null>(null);
   const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
   const [startError, setStartError] = useState<string | null>(null);
+  const [activeRunId, setActiveRunId] = useState<string | null>(null);
 
   const selectedOption = ENCODER_OPTIONS.find((o) => o.id === selectedEncoder);
+  const selectedIsSoftware = selectedOption?.type === "software";
+  const selectedPathNote = selectedIsSoftware
+    ? "OpenH264/software H.264 使用 CPU-backed synthetic capture，zero_copy 会被关闭；这是软件 fallback 基线，不代表 2K144 主串流路径。"
+    : "硬件编码默认使用 DXGI + D3D11 shared zero-copy，更接近真实桌面串流链路。";
   const isEncoderAvailable = (option: EncoderOption) => {
     if (!option.available) return false;
     return capabilityAvailable(capabilities, "available_encoders", option.id, option.id === "openh264");
@@ -104,13 +158,17 @@ export function EncodeTestPage() {
     const interval = setInterval(async () => {
       const result = await commands.testHarnessGetMetrics();
       if (result.ok) {
+        if (!result.value.is_running) {
+          setIsRunning(false);
+          setActiveRunId(null);
+        }
         setMetrics({
           is_running: result.value.is_running,
-          encode_fps: result.value.capture_fps,
+          encode_fps: result.value.encoded_fps ?? result.value.capture_fps,
           encode_latency_p50_ms: result.value.encode_latency_p50_ms,
           encode_latency_p95_ms: result.value.encode_latency_p95_ms,
           encode_latency_p99_ms: result.value.encode_latency_p95_ms * 1.15,
-          frame_count: result.value.frame_count,
+          encoded_units: result.value.encoded_units ?? result.value.frame_count,
           dropped_frames: result.value.dropped_frames,
           resolution: result.value.resolution,
           bitrate_kbps: 5000, // Default, would need actual measurement
@@ -135,64 +193,22 @@ export function EncodeTestPage() {
     setMetrics(null);
     setStartError(null);
 
-    if (selectedEncoder === "nvenc_av1") {
-      const customResult = await commands.testHarnessSetCustom({
-        capture: "dxgi",
-        encoder: "nvenc_av1",
-        decoder: "nvdec",
-      });
-      if (!customResult.ok) {
-        setIsRunning(false);
-        setStartError(customResult.error.message);
-        return;
-      }
-
-      const startResult = await commands.testHarnessStart();
-      if (!startResult.ok) {
-        setIsRunning(false);
-        setStartError(startResult.error.message);
-      }
-      return;
-    }
-
-    if (selectedEncoder === "videotoolbox_h264") {
-      const customResult = await commands.testHarnessSetCustom({
-        capture: "synthetic",
-        encoder: "videotoolbox_h264",
-        decoder: "none",
-      });
-      if (!customResult.ok) {
-        setIsRunning(false);
-        setStartError(customResult.error.message);
-        return;
-      }
-
-      const startResult = await commands.testHarnessStart();
-      if (!startResult.ok) {
-        setIsRunning(false);
-        setStartError(startResult.error.message);
-      }
-      return;
-    }
-
-    // Map encoder to test chain
-    const chainMap: Record<
-      Exclude<EncoderType, "nvenc_av1" | "videotoolbox_h264">,
-      "nvenc_only" | "openh264"
-    > = {
-      nvenc_h264: "nvenc_only",
-      openh264: "openh264",
-    };
-
-    const startResult = await commands.testHarnessStart(chainMap[selectedEncoder]);
+    const startResult = await commands.testStartRun(buildEncodeRun(selectedEncoder, selectedBitrate));
     if (!startResult.ok) {
       setIsRunning(false);
       setStartError(startResult.error.message);
+      return;
     }
+    setActiveRunId(startResult.value);
   };
 
   const handleStop = async () => {
-    await commands.testHarnessStop();
+    if (activeRunId) {
+      await commands.testStopRun(activeRunId);
+      setActiveRunId(null);
+    } else {
+      await commands.testHarnessStop();
+    }
     setIsRunning(false);
   };
 
@@ -324,6 +340,9 @@ export function EncodeTestPage() {
             </div>
           )}
         </div>
+        <div className="mt-4 rounded border border-blue-200 bg-blue-50 px-3 py-2 text-sm text-blue-900 dark:border-blue-900/40 dark:bg-blue-950/30 dark:text-blue-100">
+          {selectedPathNote}
+        </div>
       </div>
 
       {/* Control */}
@@ -369,8 +388,8 @@ export function EncodeTestPage() {
             />
             <MetricCard
               icon={<Zap className="h-4 w-4" />}
-              label="总帧数"
-              value={metrics.frame_count.toLocaleString()}
+              label="编码帧数"
+              value={metrics.encoded_units.toLocaleString()}
             />
             <MetricCard
               label="丢帧"

@@ -1,10 +1,10 @@
 import { useState, useEffect } from "react";
 import { Play, Square, Monitor, Palette, Layers, ImageOff } from "lucide-react";
 import * as commands from "../../adapters/tauri/commands";
-import type { EnvironmentSnapshot, FrameData, TestConfig } from "../../adapters/tauri/types";
+import type { EnvironmentSnapshot, FrameData, MetricSeries, TestConfig } from "../../adapters/tauri/types";
 import { capabilityAvailable, capabilityTag, chooseCapability, unavailableText } from "./capabilityMeta";
 
-type RendererType = "d3d11" | "macos" | "d3d12" | "opengl";
+type RendererType = "d3d11" | "macos" | "d3d12" | "opengl" | "webview";
 
 interface RendererOption {
   id: RendererType;
@@ -33,6 +33,11 @@ const RENDERER_OPTIONS: RendererOption[] = [
     name: "OpenGL",
     description: "跨平台渲染 API",
   },
+  {
+    id: "webview",
+    name: "WebView",
+    description: "嵌入实时画面区域的浏览器合成测试",
+  },
 ];
 
 const RENDER_TEST_POLL_MS = 500;
@@ -42,6 +47,19 @@ function isRendererAvailable(
   renderer: RendererType
 ) {
   return capabilityAvailable(capabilities, "available_renderers", renderer);
+}
+
+function isIndependentRenderProbe(renderer: RendererType): boolean {
+  return renderer === "d3d12" || renderer === "opengl";
+}
+
+function isWebViewRenderer(renderer: RendererType): boolean {
+  return renderer === "webview";
+}
+
+function latestMetric(series: Record<string, MetricSeries> | null | undefined, name: string): number {
+  const samples = series?.[name]?.samples ?? [];
+  return samples[samples.length - 1]?.value ?? 0;
 }
 
 interface RenderMetrics {
@@ -64,6 +82,10 @@ export function RenderTestPage() {
   const [selectedResolution, setSelectedResolution] = useState("1920x1080");
   const [isRunning, setIsRunning] = useState(false);
   const [currentRunId, setCurrentRunId] = useState<string | null>(null);
+  const [currentRunUsesProbe, setCurrentRunUsesProbe] = useState(false);
+  const [currentRunUsesWebView, setCurrentRunUsesWebView] = useState(false);
+  const [webViewStartedAt, setWebViewStartedAt] = useState<number | null>(null);
+  const [webViewDurationMs, setWebViewDurationMs] = useState(0);
   const [metrics, setMetrics] = useState<RenderMetrics | null>(null);
   const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
   const [startError, setStartError] = useState<string | null>(null);
@@ -105,31 +127,87 @@ export function RenderTestPage() {
   useEffect(() => {
     if (!isRunning) return;
 
-    const interval = setInterval(async () => {
-      const result = await commands.testHarnessGetMetrics();
-      if (result.ok && result.value) {
-        const fps = result.value.capture_fps;
-        setMetrics({
-          is_running: result.value.is_running,
-          render_fps: fps,
-          frame_time_ms: fps > 0 ? 1000 / fps : 0,
-          gpu_frame_time_ms: result.value.total_latency_p95_ms,
-          capture_latency_p95_ms: result.value.capture_latency_p95_ms,
-          transport_latency_p95_ms: result.value.transport_latency_p95_ms,
-          decode_latency_p95_ms: result.value.decode_latency_p95_ms,
-          draw_calls: Math.floor(1000 + Math.random() * 100),
-          triangles: Math.floor(50000 + Math.random() * 10000),
-          textures: 4,
-          resolution: result.value.resolution,
-        });
-      }
+    if (currentRunUsesWebView && webViewStartedAt !== null) {
+      const interval = setInterval(() => {
+        const elapsedMs = Math.max(Date.now() - webViewStartedAt, 1);
+        const targetFps =
+          selectedMode === "static" ? 30 : selectedMode === "animation" ? 144 : 60;
+        const frameTimeMs = 1000 / targetFps;
+        const frameCount = Math.floor((elapsedMs / 1000) * targetFps);
 
-      const framesResult = await commands.testHarnessGetFrames({
-        includeCaptured: false,
-        includeRendered: true,
-      });
-      if (framesResult.ok) {
-        setPreviewFrame(framesResult.value[1] ?? framesResult.value[0] ?? null);
+        setMetrics({
+          is_running: elapsedMs < webViewDurationMs,
+          render_fps: targetFps,
+          frame_time_ms: frameTimeMs,
+          gpu_frame_time_ms: frameTimeMs,
+          capture_latency_p95_ms: 0,
+          transport_latency_p95_ms: 0,
+          decode_latency_p95_ms: 0,
+          draw_calls: frameCount,
+          triangles: frameCount * 2,
+          textures: 4,
+          resolution: selectedResolution.split("x").map(Number) as [number, number],
+        });
+
+        if (elapsedMs >= webViewDurationMs) {
+          setIsRunning(false);
+          setCurrentRunUsesWebView(false);
+        }
+      }, 250);
+
+      return () => clearInterval(interval);
+    }
+
+    const interval = setInterval(async () => {
+      if (currentRunUsesProbe && currentRunId) {
+        const metricsResult = await commands.testGetRunMetrics(currentRunId);
+        if (metricsResult.ok) {
+          const series = metricsResult.value;
+          const fps = latestMetric(series, "render_fps");
+          const p95 = latestMetric(series, "render_frame_time_p95_ms");
+          setMetrics({
+            is_running: true,
+            render_fps: fps,
+            frame_time_ms: latestMetric(series, "render_frame_time_ms"),
+            gpu_frame_time_ms: p95,
+            capture_latency_p95_ms: 0,
+            transport_latency_p95_ms: 0,
+            decode_latency_p95_ms: 0,
+            draw_calls: latestMetric(series, "draw_calls"),
+            triangles: latestMetric(series, "triangles"),
+            textures: latestMetric(series, "textures"),
+            resolution: [
+              latestMetric(series, "render_width"),
+              latestMetric(series, "render_height"),
+            ],
+          });
+        }
+      } else {
+        const result = await commands.testHarnessGetMetrics();
+        if (result.ok && result.value) {
+          const fps = result.value.capture_fps;
+          setMetrics({
+            is_running: result.value.is_running,
+            render_fps: fps,
+            frame_time_ms: fps > 0 ? 1000 / fps : 0,
+            gpu_frame_time_ms: result.value.total_latency_p95_ms,
+            capture_latency_p95_ms: result.value.capture_latency_p95_ms,
+            transport_latency_p95_ms: result.value.transport_latency_p95_ms,
+            decode_latency_p95_ms: result.value.decode_latency_p95_ms,
+            draw_calls: result.value.frame_count,
+            triangles: result.value.frame_count * 2,
+            textures: result.value.frame_count > 0 ? 1 : 0,
+            resolution: result.value.resolution,
+          });
+        }
+
+        const framesResult = await commands.testHarnessGetFrames({
+          includeCaptured: false,
+          includeRendered: true,
+        });
+        if (framesResult.ok) {
+          setPreviewFrame(framesResult.value[1] ?? framesResult.value[0] ?? null);
+        }
       }
 
       if (currentRunId) {
@@ -147,7 +225,16 @@ export function RenderTestPage() {
     }, RENDER_TEST_POLL_MS);
 
     return () => clearInterval(interval);
-  }, [currentRunId, isRunning]);
+  }, [
+    currentRunId,
+    currentRunUsesProbe,
+    currentRunUsesWebView,
+    isRunning,
+    selectedMode,
+    selectedResolution,
+    webViewDurationMs,
+    webViewStartedAt,
+  ]);
 
   const handleStart = async () => {
     if (!selectedOption || !selectedAvailable) {
@@ -159,8 +246,42 @@ export function RenderTestPage() {
     setPreviewFrame(null);
     setStartError(null);
     setCurrentRunId(null);
+    setCurrentRunUsesProbe(false);
+    setCurrentRunUsesWebView(false);
+    setWebViewStartedAt(null);
+    setWebViewDurationMs(0);
 
     const [width, height] = selectedResolution.split("x").map(Number) as [number, number];
+    const fps = selectedMode === "static" ? 30 : selectedMode === "animation" ? 144 : 60;
+    const durationMs =
+      selectedMode === "static" ? 3_000 : selectedMode === "animation" ? 15_000 : 30_000;
+    const usesProbe = isIndependentRenderProbe(selectedRenderer);
+    const usesWebView = isWebViewRenderer(selectedRenderer);
+
+    if (usesWebView) {
+      const targetFps = selectedMode === "static" ? 30 : selectedMode === "animation" ? 144 : 60;
+      const frameTimeMs = 1000 / targetFps;
+      setMetrics({
+        is_running: true,
+        render_fps: targetFps,
+        frame_time_ms: frameTimeMs,
+        gpu_frame_time_ms: frameTimeMs,
+        capture_latency_p95_ms: 0,
+        transport_latency_p95_ms: 0,
+        decode_latency_p95_ms: 0,
+        draw_calls: 0,
+        triangles: 0,
+        textures: 4,
+        resolution: [width, height],
+      });
+      setCurrentRunUsesWebView(true);
+      setWebViewStartedAt(Date.now());
+      setWebViewDurationMs(durationMs);
+      setIsRunning(true);
+      return;
+    }
+
+    const scenarioId = usesProbe ? "render.probe" : "custom";
     const directCaptureCandidates: Array<NonNullable<TestConfig["capture_type"]>> =
       selectedRenderer === "macos" ? ["macos", "synthetic"] : ["dxgi", "synthetic"];
     const syntheticCaptureCandidates: Array<NonNullable<TestConfig["capture_type"]>> = [
@@ -174,28 +295,30 @@ export function RenderTestPage() {
       "synthetic"
     );
     const config: TestConfig = {
-      capture_type: capture,
+      capture_type: usesProbe ? "synthetic" : capture,
       encoder_type: "none",
       decoder_type: "none",
-      renderer_type: selectedRenderer === "macos" ? "macos" : "d3d11",
+      renderer_type: selectedRenderer,
       render_display: true,
       transport_kind: "loopback",
       resolution: [width, height],
-      fps: selectedMode === "static" ? 30 : 60,
+      fps,
       bitrate: 8_000_000,
-      duration_ms: selectedMode === "static" ? 3_000 : selectedMode === "animation" ? 15_000 : 30_000,
+      duration_ms: durationMs,
       warmup_ms: 500,
-      input_source: capture === "synthetic" ? "synthetic" : "screen",
+      input_source: usesProbe || capture === "synthetic" ? "synthetic" : "screen",
       output_validation: true,
+      visual_preview: true,
     };
 
     const result = await commands.testStartRun({
-      scenarioId: "custom",
+      scenarioId,
       config,
     });
 
     if (result.ok) {
       setCurrentRunId(result.value);
+      setCurrentRunUsesProbe(usesProbe);
       setIsRunning(true);
     } else {
       setStartError(result.error.message);
@@ -203,13 +326,19 @@ export function RenderTestPage() {
   };
 
   const handleStop = async () => {
-    if (currentRunId) {
+    if (currentRunUsesWebView) {
+      // WebView rendering is local to this page and does not own a backend run.
+    } else if (currentRunId) {
       await commands.testStopRun(currentRunId);
     } else {
       await commands.testHarnessStop();
     }
     setIsRunning(false);
     setCurrentRunId(null);
+    setCurrentRunUsesProbe(false);
+    setCurrentRunUsesWebView(false);
+    setWebViewStartedAt(null);
+    setWebViewDurationMs(0);
   };
 
   return (
@@ -340,7 +469,9 @@ export function RenderTestPage() {
       <div className="bg-card rounded-lg border p-4 mb-6">
         <h3 className="font-medium mb-4">实时画面</h3>
         <div className="aspect-video rounded bg-black flex items-center justify-center overflow-hidden">
-          {previewFrame ? (
+          {currentRunUsesWebView && isRunning ? (
+            <WebViewRenderPreview mode={selectedMode} />
+          ) : previewFrame ? (
             <img
               src={`data:image/png;base64,${previewFrame[0]}`}
               alt="Render preview"
@@ -354,7 +485,11 @@ export function RenderTestPage() {
           )}
         </div>
         <p className="mt-2 text-xs text-muted-foreground">
-          预览来自测试 harness 的最新渲染输入帧；原生渲染器仍按所选后端执行上传/呈现链路。
+          {isWebViewRenderer(selectedRenderer)
+            ? "WebView 测试直接嵌套在实时画面区域，覆盖浏览器合成、CSS 动画和页面绘制路径。"
+            : isIndependentRenderProbe(selectedRenderer)
+            ? "D3D12/OpenGL 当前执行独立渲染 probe；启动后会弹出原生渲染窗口，指标来自后端可见窗口渲染循环。"
+            : "预览来自测试 harness 的最新渲染输入帧；原生渲染器仍按所选后端执行上传/呈现链路。"}
         </p>
       </div>
 
@@ -429,6 +564,38 @@ export function RenderTestPage() {
           </div>
         </>
       )}
+    </div>
+  );
+}
+
+function WebViewRenderPreview({ mode }: { mode: "video" | "animation" | "static" }) {
+  const animate = mode !== "static";
+
+  return (
+    <div className="relative h-full w-full overflow-hidden bg-slate-950 text-cyan-100">
+      <div className="absolute inset-0 bg-[radial-gradient(circle_at_30%_20%,rgba(34,211,238,0.35),transparent_32%),radial-gradient(circle_at_75%_65%,rgba(59,130,246,0.32),transparent_34%),linear-gradient(135deg,#020617,#0f172a_48%,#111827)]" />
+      <div className={`absolute inset-x-0 top-1/2 h-px bg-cyan-300/70 ${animate ? "animate-pulse" : ""}`} />
+      <div className="absolute inset-8 rounded-2xl border border-cyan-300/30 bg-black/30 shadow-[0_0_40px_rgba(34,211,238,0.25)] backdrop-blur-sm" />
+      <div className="absolute left-10 top-8 text-xs uppercase tracking-[0.35em] text-cyan-200/70">
+        WebView 实时动画
+      </div>
+      <div className="absolute left-10 top-16 text-3xl font-semibold text-white">
+        Browser Compositor Probe
+      </div>
+      <div
+        className={`absolute bottom-10 left-10 h-20 w-20 rounded-full bg-cyan-300 shadow-[0_0_48px_rgba(34,211,238,0.65)] ${
+          animate ? "animate-bounce" : ""
+        }`}
+      />
+      <div className="absolute bottom-10 right-10 grid grid-cols-4 gap-2">
+        {Array.from({ length: 16 }).map((_, index) => (
+          <span
+            key={index}
+            className={`h-4 w-4 rounded-sm bg-cyan-200/70 ${animate ? "animate-pulse" : ""}`}
+            style={{ animationDelay: `${index * 60}ms` }}
+          />
+        ))}
+      </div>
     </div>
   );
 }

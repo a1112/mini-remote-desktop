@@ -75,6 +75,22 @@ function windowsCapabilities() {
   };
 }
 
+const remoteDisplaySource = {
+  id: "windows:display-shared:0",
+  platform: "windows",
+  source_kind: "display_shared",
+  title: "Display 1 (D3D11 shared copy)",
+  class_name: "WinRTMonitorShared",
+  width: 2560,
+  height: 1440,
+  process_id: 0,
+  app_name: "Display",
+  bundle_identifier: null,
+  preview_data_url: "data:image/png;base64,BBBB",
+  preview_width: 240,
+  preview_height: 135,
+};
+
 describe("RemoteDisplayWindowPage", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
@@ -228,6 +244,54 @@ describe("RemoteDisplayWindowPage", () => {
         })
       );
     });
+  });
+
+  it("blocks unsafe Web preview hardware pipeline before starting a local test", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(windowsCapabilities());
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-local-display-test-1",
+          session_id: "local-display-test-1",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: false,
+          render_mode: "web",
+          native_surface_attached: false,
+          session_window_count: 1,
+        });
+      }
+      if (command === "configure_remote_display_native_surface") {
+        return Promise.resolve({
+          label: "render-local-display-test-1",
+          backend: args?.enabled ? "d3d11" : "web",
+          attached: Boolean(args?.enabled),
+          visible: Boolean(args?.visible),
+          parent_hwnd: "0xA",
+          hwnd: args?.enabled ? "0x14" : null,
+          rect: { x: 0, y: 56, width: 1280, height: 720 },
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay("local-display-test-1");
+
+    const startButton = await screen.findByRole("button", {
+      name: "Start local pipeline test",
+    });
+
+    await waitFor(() => expect(startButton).toBeDisabled());
+    expect(
+      screen.getByText(/Web preview 仅支持 OpenH264 \+ Software decode/)
+    ).toBeInTheDocument();
+
+    fireEvent.click(startButton);
+
+    expect(mockInvoke).not.toHaveBeenCalledWith("test_start_run", expect.anything());
   });
 
   it("starts the local native pipeline with AV1 zero-copy when selected", async () => {
@@ -434,6 +498,17 @@ describe("RemoteDisplayWindowPage", () => {
           last_error: null,
         });
       }
+      if (command === "ipc_list_remote_capture_sources") {
+        return Promise.resolve([remoteDisplaySource]);
+      }
+      if (command === "ipc_select_remote_capture_source") {
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          source: remoteDisplaySource,
+          status: "selected",
+          reason: null,
+        });
+      }
       if (command === "ipc_start_receiver") {
         return Promise.resolve("p2p-quic-123");
       }
@@ -618,8 +693,10 @@ describe("RemoteDisplayWindowPage", () => {
     renderRemoteDisplay();
 
     fireEvent.click(await screen.findByRole("button", { name: "配置" }));
-    fireEvent.click(await screen.findByRole("button", { name: "刷新窗口源" }));
-    fireEvent.click(await screen.findByRole("button", { name: /选择 Target App/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "刷新捕获源" }));
+    fireEvent.change(await screen.findByLabelText("远端捕获源下拉"), {
+      target: { value: "windows:window:0x1234" },
+    });
 
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("ipc_list_remote_capture_sources", {
@@ -632,6 +709,363 @@ describe("RemoteDisplayWindowPage", () => {
         sourceId: "windows:window:0x1234",
       });
     });
+  });
+
+  it("auto-selects the best fullscreen shared capture source for LAN remote sessions", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(windowsCapabilities());
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-p2p-quic-123-1",
+          session_id: "p2p-quic-123",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: false,
+          render_mode: "d3d11_native",
+          native_surface_attached: false,
+          session_window_count: 1,
+        });
+      }
+      if (command === "configure_remote_display_native_surface") {
+        return Promise.resolve({
+          label: "render-p2p-quic-123-1",
+          backend: "d3d11",
+          attached: true,
+          visible: true,
+          parent_hwnd: "0xA",
+          hwnd: "0x14",
+          rect: { x: 0, y: 0, width: 1280, height: 720 },
+        });
+      }
+      if (command === "ipc_session_snapshot") {
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          role: "controller",
+          state: "connected",
+          transport_kind: "quic",
+          sender_active: false,
+          receiver_active: false,
+        });
+      }
+      if (command === "ipc_probe_snapshot") {
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          frames_received: 0,
+          frames_decoded: 0,
+          frames_dropped: 0,
+          current_fps: null,
+          bitrate_mbps: null,
+          last_error: null,
+        });
+      }
+      if (command === "ipc_list_remote_capture_sources") {
+        return Promise.resolve([
+          {
+            id: "windows:window:0x1234",
+            platform: "windows",
+            source_kind: "window",
+            title: "Target App",
+            class_name: "ApplicationFrameWindow",
+            width: 1280,
+            height: 720,
+            process_id: 4242,
+            app_name: "Target App",
+            bundle_identifier: null,
+            preview_data_url: null,
+            preview_width: null,
+            preview_height: null,
+          },
+          remoteDisplaySource,
+        ]);
+      }
+      if (command === "ipc_select_remote_capture_source") {
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          source: remoteDisplaySource,
+          status: "selected",
+          reason: null,
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay();
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("ipc_list_remote_capture_sources", {
+        sessionId: "p2p-quic-123",
+        includePreviews: false,
+        limit: 24,
+      });
+      expect(mockInvoke).toHaveBeenCalledWith("ipc_select_remote_capture_source", {
+        sessionId: "p2p-quic-123",
+        sourceId: "windows:display-shared:0",
+      });
+    });
+  });
+
+  it("renders the latest decoded remote desktop preview frame", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(windowsCapabilities());
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-p2p-quic-123-1",
+          session_id: "p2p-quic-123",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: true,
+          render_mode: "d3d11_native",
+          native_surface_attached: true,
+          session_window_count: 1,
+        });
+      }
+      if (command === "configure_remote_display_native_surface") {
+        return Promise.resolve({
+          label: "render-p2p-quic-123-1",
+          backend: "d3d11",
+          attached: true,
+          visible: true,
+          parent_hwnd: "0xA",
+          hwnd: "0x14",
+          rect: { x: 0, y: 56, width: 1280, height: 720 },
+        });
+      }
+      if (command === "ipc_session_snapshot") {
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          role: "controller",
+          state: "streaming",
+          transport_kind: "quic",
+          sender_active: false,
+          receiver_active: true,
+        });
+      }
+      if (command === "ipc_probe_snapshot") {
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          frames_received: 3,
+          frames_decoded: 3,
+          frames_dropped: 0,
+          current_fps: 30,
+          bitrate_mbps: 4,
+          media_probe_valid: true,
+          media_probe_format: "h264_desktop_frame",
+          media_probe_width: 1280,
+          media_probe_height: 720,
+          media_probe_target_fps: 144,
+          media_probe_target_bitrate_mbps: 64,
+          media_probe_payload_bytes: 2048,
+          last_media_sequence: 3,
+          last_media_timestamp_us: 3000,
+          last_media_payload_hash: "fnv1a64:abc123",
+          latest_frame_data_url: "data:image/png;base64,REMOTE",
+          latest_frame_width: 1280,
+          latest_frame_height: 720,
+          latest_frame_pixel_format: "rgb24",
+          last_error: null,
+        });
+      }
+      if (command === "ipc_list_remote_capture_sources") {
+        return Promise.resolve([remoteDisplaySource]);
+      }
+      if (command === "ipc_select_remote_capture_source") {
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          source: remoteDisplaySource,
+          status: "selected",
+          reason: null,
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay();
+
+    const frame = await screen.findByAltText("Remote desktop frame");
+    expect(frame).toHaveAttribute("src", "data:image/png;base64,REMOTE");
+  });
+
+  it("blocks remote receiver start when no remote capture source is available", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(windowsCapabilities());
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-p2p-quic-123-1",
+          session_id: "p2p-quic-123",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: true,
+          render_mode: "d3d11_native",
+          native_surface_attached: true,
+          session_window_count: 1,
+        });
+      }
+      if (command === "configure_remote_display_native_surface") {
+        return Promise.resolve({
+          label: "render-p2p-quic-123-1",
+          backend: "d3d11",
+          attached: true,
+          visible: true,
+          parent_hwnd: "0xA",
+          hwnd: "0x14",
+          rect: { x: 0, y: 56, width: 1280, height: 720 },
+        });
+      }
+      if (command === "ipc_session_snapshot") {
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          role: "controller",
+          state: "connected",
+          transport_kind: "quic",
+          sender_active: false,
+          receiver_active: false,
+        });
+      }
+      if (command === "ipc_probe_snapshot") {
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          frames_received: 0,
+          frames_decoded: 0,
+          frames_dropped: 0,
+          last_error: null,
+        });
+      }
+      if (command === "ipc_list_remote_capture_sources") {
+        return Promise.resolve([]);
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Start remote receiver" }));
+
+    await screen.findByText("远端未发现可捕获的全屏/窗口源，无法启动接收");
+    expect(mockInvoke).not.toHaveBeenCalledWith("ipc_start_receiver", expect.anything());
+  });
+
+  it("offers dropdown and modal remote capture source picker modes", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(windowsCapabilities());
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-p2p-quic-123-1",
+          session_id: "p2p-quic-123",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: false,
+          render_mode: "d3d11_native",
+          native_surface_attached: false,
+          session_window_count: 1,
+        });
+      }
+      if (command === "configure_remote_display_native_surface") {
+        return Promise.resolve({
+          label: "render-p2p-quic-123-1",
+          backend: "d3d11",
+          attached: true,
+          visible: true,
+          parent_hwnd: "0xA",
+          hwnd: "0x14",
+          rect: { x: 0, y: 0, width: 1280, height: 720 },
+        });
+      }
+      if (command === "ipc_session_snapshot") {
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          role: "controller",
+          state: "connected",
+          transport_kind: "quic",
+          sender_active: false,
+          receiver_active: false,
+        });
+      }
+      if (command === "ipc_probe_snapshot") {
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          frames_received: 0,
+          frames_decoded: 0,
+          frames_dropped: 0,
+          current_fps: null,
+          bitrate_mbps: null,
+          last_error: null,
+        });
+      }
+      if (command === "ipc_list_remote_capture_sources") {
+        return Promise.resolve([remoteDisplaySource]);
+      }
+      if (command === "ipc_select_remote_capture_source") {
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          source: remoteDisplaySource,
+          status: "selected",
+          reason: null,
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay();
+
+    fireEvent.click(await screen.findByRole("button", { name: "配置" }));
+    await screen.findByLabelText("PICK");
+    await waitFor(() => expect(screen.getByLabelText("远端捕获源下拉")).toBeInTheDocument());
+
+    fireEvent.change(screen.getByLabelText("PICK"), { target: { value: "modal" } });
+    fireEvent.click(screen.getByRole("button", { name: "打开捕获源弹窗" }));
+
+    expect(await screen.findByText("远端捕获源选择")).toBeInTheDocument();
+  });
+
+  it("shows DX12 as unavailable until a D3D12 native renderer is available", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(windowsCapabilities());
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-local-display-test-1",
+          session_id: "local-display-test-1",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: false,
+          render_mode: "d3d11_native",
+          native_surface_attached: true,
+          session_window_count: 1,
+        });
+      }
+      if (command === "configure_remote_display_native_surface") {
+        return Promise.resolve({
+          label: "render-local-display-test-1",
+          backend: "d3d11",
+          attached: true,
+          visible: true,
+          parent_hwnd: "0xA",
+          hwnd: "0x14",
+          rect: { x: 0, y: 56, width: 1280, height: 720 },
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay("local-display-test-1");
+
+    const dx12Button = await screen.findByRole("button", { name: "DX12 native" });
+    expect(dx12Button).toBeDisabled();
+    expect(dx12Button).toHaveAttribute("title", expect.stringContaining("D3D12"));
   });
 
   it("routes the title bar close button through the remote display cleanup command", async () => {

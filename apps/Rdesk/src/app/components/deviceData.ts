@@ -227,7 +227,7 @@ function mergeDevice(existing: Device, incoming: Device): Device {
   return {
     ...existing,
     id: serverSide?.id ?? localSide?.id ?? p2pSide?.id ?? existing.id,
-    name: serverSide?.name ?? localSide?.name ?? p2pSide?.name ?? incoming.name,
+    name: localSide?.name ?? p2pSide?.name ?? serverSide?.name ?? incoming.name,
     os: serverSide?.os ?? localSide?.os ?? p2pSide?.os ?? incoming.os,
     icon: serverSide?.icon ?? localSide?.icon ?? p2pSide?.icon ?? incoming.icon,
     status,
@@ -249,7 +249,7 @@ function mergeDevice(existing: Device, incoming: Device): Device {
   };
 }
 
-function mergeDevices(
+export function mergeDevices(
   serverDevices: Device[],
   lanDevices: Device[],
   localDevice: Device | null

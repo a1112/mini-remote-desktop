@@ -43,29 +43,129 @@ pub fn find_capture_source(source_id: &str) -> Result<CaptureSource> {
         .ok_or_else(|| anyhow::anyhow!("capture source not found: {source_id}"))
 }
 
+pub fn preferred_capture_source(sources: &[CaptureSource]) -> Option<CaptureSource> {
+    sources
+        .iter()
+        .find(|source| source.source_kind == "display_shared")
+        .or_else(|| {
+            sources
+                .iter()
+                .find(|source| source.source_kind == "display")
+        })
+        .or_else(|| sources.iter().find(|source| source.source_kind == "window"))
+        .or_else(|| sources.first())
+        .cloned()
+}
+
+pub fn default_capture_source(include_previews: bool) -> Result<CaptureSource> {
+    let sources = list_capture_sources(include_previews, Some(MAX_CAPTURE_SOURCE_LIMIT as u32))?;
+    preferred_capture_source(&sources)
+        .ok_or_else(|| anyhow::anyhow!("no capture sources are available"))
+}
+
+#[cfg(windows)]
+pub fn create_frame_capture(source_id: &str) -> Result<mrd_capture_winrt::WinrtCapture> {
+    let mut capture = match parse_windows_capture_source_ref(source_id)? {
+        WindowsCaptureSourceRef::Window(hwnd) => {
+            mrd_capture_winrt::WinrtCapture::from_window_handle(hwnd)
+        }
+        WindowsCaptureSourceRef::Display { index }
+        | WindowsCaptureSourceRef::DisplayShared { index } => {
+            mrd_capture_winrt::WinrtCapture::from_monitor_index(index)
+        }
+    }
+    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    capture
+        .start()
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    Ok(capture)
+}
+
+#[cfg(not(windows))]
+pub fn create_frame_capture(_source_id: &str) -> Result<()> {
+    anyhow::bail!("remote desktop capture is currently only available on Windows")
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsCaptureSourceRef {
+    Window(isize),
+    Display { index: u32 },
+    DisplayShared { index: u32 },
+}
+
 #[cfg(windows)]
 fn list_capture_sources_impl() -> Result<Vec<CaptureSource>> {
+    let mut sources = list_windows_display_capture_sources();
     let targets = mrd_capture_winrt::enumerate_window_capture_targets()
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
 
-    Ok(targets
-        .into_iter()
-        .map(|target| CaptureSource {
-            id: format!("windows:window:0x{:X}", target.hwnd as usize),
+    sources.extend(targets.into_iter().map(|target| CaptureSource {
+        id: format!("windows:window:0x{:X}", target.hwnd as usize),
+        platform: "windows".to_string(),
+        source_kind: "window".to_string(),
+        title: target.title,
+        class_name: target.class_name,
+        width: target.width,
+        height: target.height,
+        process_id: target.process_id,
+        app_name: None,
+        bundle_identifier: None,
+        preview_data_url: None,
+        preview_width: None,
+        preview_height: None,
+    }));
+
+    Ok(sources)
+}
+
+#[cfg(windows)]
+fn list_windows_display_capture_sources() -> Vec<CaptureSource> {
+    let Ok(count) = mrd_capture_winrt::get_monitor_count() else {
+        return Vec::new();
+    };
+
+    let mut sources = Vec::with_capacity(count.saturating_mul(2));
+    for index in 0..count {
+        let Ok(capture) = mrd_capture_winrt::WinrtCapture::from_monitor_index(index as u32) else {
+            continue;
+        };
+        let width = capture.width() as u32;
+        let height = capture.height() as u32;
+        let display_number = index + 1;
+        sources.push(CaptureSource {
+            id: format!("windows:display-shared:{index}"),
             platform: "windows".to_string(),
-            source_kind: "window".to_string(),
-            title: target.title,
-            class_name: target.class_name,
-            width: target.width,
-            height: target.height,
-            process_id: target.process_id,
-            app_name: None,
+            source_kind: "display_shared".to_string(),
+            title: format!("Display {display_number} (D3D11 shared copy)"),
+            class_name: "WinRTMonitorShared".to_string(),
+            width,
+            height,
+            process_id: 0,
+            app_name: Some("Display".to_string()),
             bundle_identifier: None,
             preview_data_url: None,
             preview_width: None,
             preview_height: None,
-        })
-        .collect())
+        });
+        sources.push(CaptureSource {
+            id: format!("windows:display:{index}"),
+            platform: "windows".to_string(),
+            source_kind: "display".to_string(),
+            title: format!("Display {display_number} (full screen copy)"),
+            class_name: "WinRTMonitor".to_string(),
+            width,
+            height,
+            process_id: 0,
+            app_name: Some("Display".to_string()),
+            bundle_identifier: None,
+            preview_data_url: None,
+            preview_width: None,
+            preview_height: None,
+        });
+    }
+
+    sources
 }
 
 #[cfg(not(windows))]
@@ -88,9 +188,16 @@ fn attach_capture_source_previews(sources: &mut [CaptureSource]) {
 
 #[cfg(windows)]
 fn capture_source_preview_data_url(source_id: &str) -> Result<(String, u32, u32)> {
-    let hwnd = parse_windows_capture_source_hwnd(source_id)?;
-    let mut capture = mrd_capture_winrt::WinrtCapture::from_window_handle(hwnd)
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let mut capture = match parse_windows_capture_source_ref(source_id)? {
+        WindowsCaptureSourceRef::Window(hwnd) => {
+            mrd_capture_winrt::WinrtCapture::from_window_handle(hwnd)
+        }
+        WindowsCaptureSourceRef::Display { index }
+        | WindowsCaptureSourceRef::DisplayShared { index } => {
+            mrd_capture_winrt::WinrtCapture::from_monitor_index(index)
+        }
+    }
+    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     capture
         .start()
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
@@ -107,13 +214,39 @@ fn capture_source_preview_data_url(_source_id: &str) -> Result<(String, u32, u32
 }
 
 #[cfg(windows)]
-fn parse_windows_capture_source_hwnd(source_id: &str) -> Result<isize> {
-    let value = source_id
-        .trim()
-        .rsplit(':')
-        .next()
-        .unwrap_or(source_id)
-        .trim();
+fn parse_windows_capture_source_ref(source_id: &str) -> Result<WindowsCaptureSourceRef> {
+    let trimmed = source_id.trim();
+    if let Some(value) = trimmed.strip_prefix("windows:display-shared:") {
+        return Ok(WindowsCaptureSourceRef::DisplayShared {
+            index: parse_windows_display_index(source_id, value)?,
+        });
+    }
+    if let Some(value) = trimmed.strip_prefix("windows:display:") {
+        return Ok(WindowsCaptureSourceRef::Display {
+            index: parse_windows_display_index(source_id, value)?,
+        });
+    }
+    if let Some(value) = trimmed.strip_prefix("windows:window:") {
+        return Ok(WindowsCaptureSourceRef::Window(parse_windows_hwnd_value(
+            source_id, value,
+        )?));
+    }
+
+    Ok(WindowsCaptureSourceRef::Window(parse_windows_hwnd_value(
+        source_id, trimmed,
+    )?))
+}
+
+#[cfg(windows)]
+fn parse_windows_display_index(source_id: &str, value: &str) -> Result<u32> {
+    value.trim().parse::<u32>().map_err(|error| {
+        anyhow::anyhow!("invalid Windows display source id '{source_id}': {error}")
+    })
+}
+
+#[cfg(windows)]
+fn parse_windows_hwnd_value(source_id: &str, value: &str) -> Result<isize> {
+    let value = value.trim();
     let value = value
         .strip_prefix("0x")
         .or_else(|| value.strip_prefix("0X"))
@@ -213,9 +346,71 @@ fn window_preview_data_url(
 
 #[cfg(test)]
 mod tests {
+    use mrd_ipc::CaptureSource;
+
+    fn source(id: &str, source_kind: &str) -> CaptureSource {
+        CaptureSource {
+            id: id.to_string(),
+            platform: "windows".to_string(),
+            source_kind: source_kind.to_string(),
+            title: id.to_string(),
+            class_name: "Test".to_string(),
+            width: 1280,
+            height: 720,
+            process_id: 0,
+            app_name: None,
+            bundle_identifier: None,
+            preview_data_url: None,
+            preview_width: None,
+            preview_height: None,
+        }
+    }
+
     #[test]
     fn source_lookup_rejects_empty_id() {
         let error = super::find_capture_source(" ").expect_err("empty id should fail");
         assert!(error.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn preferred_capture_source_picks_fullscreen_shared_before_window() {
+        let sources = vec![
+            source("windows:window:0x1234", "window"),
+            source("windows:display:0", "display"),
+            source("windows:display-shared:0", "display_shared"),
+        ];
+
+        let selected = super::preferred_capture_source(&sources).expect("selected source");
+
+        assert_eq!(selected.id, "windows:display-shared:0");
+    }
+
+    #[test]
+    fn preferred_capture_source_falls_back_to_display_before_window() {
+        let sources = vec![
+            source("windows:window:0x1234", "window"),
+            source("windows:display:0", "display"),
+        ];
+
+        let selected = super::preferred_capture_source(&sources).expect("selected source");
+
+        assert_eq!(selected.id, "windows:display:0");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_capture_source_refs_parse_display_and_window_ids() {
+        assert_eq!(
+            super::parse_windows_capture_source_ref("windows:display-shared:2").unwrap(),
+            super::WindowsCaptureSourceRef::DisplayShared { index: 2 }
+        );
+        assert_eq!(
+            super::parse_windows_capture_source_ref("windows:display:1").unwrap(),
+            super::WindowsCaptureSourceRef::Display { index: 1 }
+        );
+        assert_eq!(
+            super::parse_windows_capture_source_ref("windows:window:0x1234").unwrap(),
+            super::WindowsCaptureSourceRef::Window(0x1234)
+        );
     }
 }

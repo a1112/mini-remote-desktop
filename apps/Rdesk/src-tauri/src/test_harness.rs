@@ -128,6 +128,7 @@ pub struct TestConfig {
     pub zero_copy: Option<bool>,
     pub input_source: Option<String>,
     pub window_handle: Option<String>,
+    pub visual_preview: Option<bool>,
 }
 
 impl Default for TestConfig {
@@ -142,6 +143,7 @@ impl Default for TestConfig {
             zero_copy: None,
             input_source: None,
             window_handle: None,
+            visual_preview: None,
         }
     }
 }
@@ -206,9 +208,17 @@ impl Default for TestChain {
 pub struct HarnessMetrics {
     pub is_running: bool,
     pub capture_fps: f64,
+    pub encoded_fps: f64,
+    pub decoded_fps: f64,
     pub capture_latency_avg_ms: f64,
     pub capture_latency_p50_ms: f64,
     pub capture_latency_p95_ms: f64,
+    pub source_wait_latency_avg_ms: f64,
+    pub source_wait_latency_p50_ms: f64,
+    pub source_wait_latency_p95_ms: f64,
+    pub interactive_latency_avg_ms: f64,
+    pub interactive_latency_p50_ms: f64,
+    pub interactive_latency_p95_ms: f64,
     pub encode_latency_avg_ms: f64,
     pub encode_latency_p50_ms: f64,
     pub encode_latency_p95_ms: f64,
@@ -271,9 +281,17 @@ impl Default for HarnessMetrics {
         Self {
             is_running: false,
             capture_fps: 0.0,
+            encoded_fps: 0.0,
+            decoded_fps: 0.0,
             capture_latency_avg_ms: 0.0,
             capture_latency_p50_ms: 0.0,
             capture_latency_p95_ms: 0.0,
+            source_wait_latency_avg_ms: 0.0,
+            source_wait_latency_p50_ms: 0.0,
+            source_wait_latency_p95_ms: 0.0,
+            interactive_latency_avg_ms: 0.0,
+            interactive_latency_p50_ms: 0.0,
+            interactive_latency_p95_ms: 0.0,
             encode_latency_avg_ms: 0.0,
             encode_latency_p50_ms: 0.0,
             encode_latency_p95_ms: 0.0,
@@ -320,6 +338,7 @@ struct PipelineState {
     decoder: Option<PipelineDecoder>,
     renderer: Option<PipelineRenderer>,
     use_decoder: bool,
+    visual_preview: bool,
     width: usize,
     height: usize,
     adapted_frame: Option<CapturedFrame>,
@@ -1666,6 +1685,7 @@ impl TestHarness {
             decoder,
             renderer,
             use_decoder,
+            visual_preview: config.visual_preview.unwrap_or(true),
             width,
             height,
             adapted_frame: None,
@@ -1681,6 +1701,7 @@ impl TestHarness {
     ) {
         let start_time = Instant::now();
         let mut capture_latencies = Vec::with_capacity(1000);
+        let mut interactive_latencies = Vec::with_capacity(1000);
         let mut encode_latencies = Vec::with_capacity(1000);
         let mut transport_latencies = Vec::with_capacity(1000);
         let mut decode_latencies = Vec::with_capacity(1000);
@@ -1696,7 +1717,7 @@ impl TestHarness {
         let mut last_decode_error = None::<String>;
         let dump_first_access_unit_path = std::env::var("MRD_HARNESS_DUMP_FIRST_ACCESS_UNIT").ok();
         let mut dumped_first_access_unit = false;
-        let update_web_preview = state.renderer.is_none();
+        let update_web_preview = state.renderer.is_none() && state.visual_preview;
 
         while running.load(Ordering::Relaxed) {
             let pipeline_start = Instant::now();
@@ -1711,6 +1732,7 @@ impl TestHarness {
                 }
             };
             let capture_latency = capture_start.elapsed();
+            let interactive_start = Instant::now();
 
             let (encoded_units, encode_latency) = if let Some(encoder) = state.encoder.as_mut() {
                 let frame_for_encode = prepare_frame_for_encode(
@@ -1814,23 +1836,28 @@ impl TestHarness {
                 None
             };
 
-            let render_input = decoded_frames
-                .last()
-                .cloned()
-                .map(RenderInput::Decoded)
-                .or_else(|| {
-                    if state.use_decoder {
-                        None
-                    } else {
-                        let frame_for_render = prepare_captured_frame_for_direct_render(
-                            &captured_frame,
-                            state.width,
-                            state.height,
-                            &mut state.adapted_frame,
-                        );
-                        Some(RenderInput::Captured(frame_for_render.clone()))
-                    }
-                });
+            let should_prepare_render_input = state.renderer.is_some() || update_web_preview;
+            let render_input = if should_prepare_render_input {
+                decoded_frames
+                    .last()
+                    .cloned()
+                    .map(RenderInput::Decoded)
+                    .or_else(|| {
+                        if state.use_decoder {
+                            None
+                        } else {
+                            let frame_for_render = prepare_captured_frame_for_direct_render(
+                                &captured_frame,
+                                state.width,
+                                state.height,
+                                &mut state.adapted_frame,
+                            );
+                            Some(RenderInput::Captured(frame_for_render.clone()))
+                        }
+                    })
+            } else {
+                None
+            };
             let render_preview_input = if update_web_preview {
                 render_input.clone()
             } else {
@@ -1850,8 +1877,10 @@ impl TestHarness {
                 } else {
                     None
                 };
+            let interactive_latency = interactive_start.elapsed();
 
             capture_latencies.push(capture_latency);
+            interactive_latencies.push(interactive_latency);
             if let Some(latency) = encode_latency {
                 encode_latencies.push(latency);
             }
@@ -1868,6 +1897,7 @@ impl TestHarness {
 
             Self::trim_latency_buffers(
                 &mut capture_latencies,
+                &mut interactive_latencies,
                 &mut encode_latencies,
                 &mut transport_latencies,
                 &mut decode_latencies,
@@ -1917,6 +1947,7 @@ impl TestHarness {
                     total_bitstream_bytes,
                     &start_time,
                     &capture_latencies,
+                    &interactive_latencies,
                     &encode_latencies,
                     &transport_latencies,
                     &decode_latencies,
@@ -1937,6 +1968,7 @@ impl TestHarness {
             total_bitstream_bytes,
             &start_time,
             &capture_latencies,
+            &interactive_latencies,
             &encode_latencies,
             &transport_latencies,
             &decode_latencies,
@@ -1959,6 +1991,7 @@ impl TestHarness {
         total_bitstream_bytes: usize,
         start_time: &Instant,
         capture_latencies: &[Duration],
+        interactive_latencies: &[Duration],
         encode_latencies: &[Duration],
         transport_latencies: &[Duration],
         decode_latencies: &[Duration],
@@ -1971,9 +2004,21 @@ impl TestHarness {
         } else {
             0.0
         };
+        let encoded_fps = if elapsed > 0.0 {
+            encoded_units as f64 / elapsed
+        } else {
+            0.0
+        };
+        let decoded_fps = if elapsed > 0.0 {
+            decoded_frames as f64 / elapsed
+        } else {
+            0.0
+        };
 
         let avg_cap = Self::compute_average(capture_latencies);
         let (p50_cap, p95_cap) = Self::compute_percentiles(capture_latencies);
+        let avg_interactive = Self::compute_average(interactive_latencies);
+        let (p50_interactive, p95_interactive) = Self::compute_percentiles(interactive_latencies);
         let avg_enc = Self::compute_average(encode_latencies);
         let (p50_enc, p95_enc) = Self::compute_percentiles(encode_latencies);
         let avg_transport = Self::compute_average(transport_latencies);
@@ -1986,6 +2031,8 @@ impl TestHarness {
 
         let mut m = metrics.lock().unwrap();
         m.capture_fps = fps;
+        m.encoded_fps = encoded_fps;
+        m.decoded_fps = decoded_fps;
         m.frame_count = frame_count;
         m.encoded_units = encoded_units;
         m.decoded_frames = decoded_frames;
@@ -1996,6 +2043,12 @@ impl TestHarness {
         m.capture_latency_avg_ms = avg_cap.as_secs_f64() * 1000.0;
         m.capture_latency_p50_ms = p50_cap.as_secs_f64() * 1000.0;
         m.capture_latency_p95_ms = p95_cap.as_secs_f64() * 1000.0;
+        m.source_wait_latency_avg_ms = m.capture_latency_avg_ms;
+        m.source_wait_latency_p50_ms = m.capture_latency_p50_ms;
+        m.source_wait_latency_p95_ms = m.capture_latency_p95_ms;
+        m.interactive_latency_avg_ms = avg_interactive.as_secs_f64() * 1000.0;
+        m.interactive_latency_p50_ms = p50_interactive.as_secs_f64() * 1000.0;
+        m.interactive_latency_p95_ms = p95_interactive.as_secs_f64() * 1000.0;
         m.encode_latency_avg_ms = avg_enc.as_secs_f64() * 1000.0;
         m.encode_latency_p50_ms = p50_enc.as_secs_f64() * 1000.0;
         m.encode_latency_p95_ms = p95_enc.as_secs_f64() * 1000.0;
@@ -2049,6 +2102,7 @@ impl TestHarness {
 
     fn trim_latency_buffers(
         capture_latencies: &mut Vec<Duration>,
+        interactive_latencies: &mut Vec<Duration>,
         encode_latencies: &mut Vec<Duration>,
         transport_latencies: &mut Vec<Duration>,
         decode_latencies: &mut Vec<Duration>,
@@ -2057,6 +2111,9 @@ impl TestHarness {
     ) {
         if capture_latencies.len() > 1000 {
             capture_latencies.remove(0);
+        }
+        if interactive_latencies.len() > 1000 {
+            interactive_latencies.remove(0);
         }
         if encode_latencies.len() > 1000 {
             encode_latencies.remove(0);
@@ -3246,6 +3303,7 @@ mod tests {
     #[test]
     fn trim_latency_buffers_handles_encode_only_samples() {
         let mut capture_latencies = Vec::new();
+        let mut interactive_latencies = Vec::new();
         let mut encode_latencies = (0..=1000).map(Duration::from_millis).collect::<Vec<_>>();
         let mut transport_latencies = Vec::new();
         let mut decode_latencies = Vec::new();
@@ -3254,6 +3312,7 @@ mod tests {
 
         TestHarness::trim_latency_buffers(
             &mut capture_latencies,
+            &mut interactive_latencies,
             &mut encode_latencies,
             &mut transport_latencies,
             &mut decode_latencies,
@@ -3262,6 +3321,7 @@ mod tests {
         );
 
         assert!(capture_latencies.is_empty());
+        assert!(interactive_latencies.is_empty());
         assert_eq!(encode_latencies.len(), 1000);
         assert_eq!(encode_latencies[0], Duration::from_millis(1));
         assert!(transport_latencies.is_empty());
@@ -3273,6 +3333,7 @@ mod tests {
     #[test]
     fn trim_latency_buffers_trims_each_populated_series_independently() {
         let mut capture_latencies = (0..=1000).map(Duration::from_millis).collect::<Vec<_>>();
+        let mut interactive_latencies = (0..=1000).map(Duration::from_millis).collect::<Vec<_>>();
         let mut encode_latencies = (0..=1000).map(Duration::from_millis).collect::<Vec<_>>();
         let mut transport_latencies = (0..=1000).map(Duration::from_millis).collect::<Vec<_>>();
         let mut decode_latencies = (0..=1000).map(Duration::from_millis).collect::<Vec<_>>();
@@ -3281,6 +3342,7 @@ mod tests {
 
         TestHarness::trim_latency_buffers(
             &mut capture_latencies,
+            &mut interactive_latencies,
             &mut encode_latencies,
             &mut transport_latencies,
             &mut decode_latencies,
@@ -3289,12 +3351,14 @@ mod tests {
         );
 
         assert_eq!(capture_latencies.len(), 1000);
+        assert_eq!(interactive_latencies.len(), 1000);
         assert_eq!(encode_latencies.len(), 1000);
         assert_eq!(transport_latencies.len(), 1000);
         assert_eq!(decode_latencies.len(), 1000);
         assert_eq!(render_latencies.len(), 1000);
         assert_eq!(total_latencies.len(), 1000);
         assert_eq!(capture_latencies[0], Duration::from_millis(1));
+        assert_eq!(interactive_latencies[0], Duration::from_millis(1));
         assert_eq!(encode_latencies[0], Duration::from_millis(1));
         assert_eq!(transport_latencies[0], Duration::from_millis(1));
         assert_eq!(decode_latencies[0], Duration::from_millis(1));
@@ -3318,6 +3382,97 @@ mod tests {
         assert!(!metrics.is_running);
         assert_eq!(metrics.capture_fps, 12.5);
         assert_eq!(metrics.frame_count, 7);
+    }
+
+    #[test]
+    fn update_metrics_splits_source_wait_from_interactive_latency() {
+        let metrics = Arc::new(Mutex::new(HarnessMetrics::default()));
+        let start_time = Instant::now() - Duration::from_secs(1);
+        let source_wait_latencies = vec![Duration::from_millis(8), Duration::from_millis(20)];
+        let interactive_latencies = vec![Duration::from_millis(2), Duration::from_millis(4)];
+        let total_latencies = vec![Duration::from_millis(10), Duration::from_millis(24)];
+
+        TestHarness::update_metrics(
+            &metrics,
+            2,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            &start_time,
+            &source_wait_latencies,
+            &interactive_latencies,
+            &[],
+            &[],
+            &[],
+            &[],
+            &total_latencies,
+        );
+
+        let snapshot = metrics.lock().unwrap();
+        assert_eq!(snapshot.source_wait_latency_p95_ms, 20.0);
+        assert_eq!(snapshot.interactive_latency_p95_ms, 4.0);
+        assert_eq!(snapshot.total_latency_p95_ms, 24.0);
+    }
+
+    #[test]
+    fn update_metrics_reports_encoded_unit_throughput() {
+        let metrics = Arc::new(Mutex::new(HarnessMetrics::default()));
+        let start_time = Instant::now() - Duration::from_secs(2);
+
+        TestHarness::update_metrics(
+            &metrics,
+            100,
+            0,
+            50,
+            0,
+            0,
+            0,
+            0,
+            &start_time,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+
+        let snapshot = metrics.lock().unwrap();
+        assert!(snapshot.capture_fps > 49.0 && snapshot.capture_fps <= 50.0);
+        assert!(snapshot.encoded_fps > 24.0 && snapshot.encoded_fps <= 25.0);
+    }
+
+    #[test]
+    fn update_metrics_reports_decoded_frame_throughput() {
+        let metrics = Arc::new(Mutex::new(HarnessMetrics::default()));
+        let start_time = Instant::now() - Duration::from_secs(4);
+
+        TestHarness::update_metrics(
+            &metrics,
+            240,
+            0,
+            200,
+            100,
+            0,
+            0,
+            0,
+            &start_time,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+
+        let snapshot = metrics.lock().unwrap();
+        assert!(snapshot.capture_fps > 59.0 && snapshot.capture_fps <= 60.0);
+        assert!(snapshot.decoded_fps > 24.0 && snapshot.decoded_fps <= 25.0);
     }
 
     #[test]
@@ -3549,6 +3704,11 @@ mod tests {
             },
             input_source: std::env::var("MRD_HARNESS_INPUT_SOURCE").ok(),
             window_handle: std::env::var("MRD_HARNESS_WINDOW_HANDLE").ok(),
+            visual_preview: match std::env::var("MRD_HARNESS_VISUAL_PREVIEW").as_deref() {
+                Ok("1") | Ok("true") | Ok("yes") => Some(true),
+                Ok("0") | Ok("false") | Ok("no") => Some(false),
+                _ => None,
+            },
         });
         harness.start().expect("start harness");
         thread::sleep(Duration::from_secs(seconds));

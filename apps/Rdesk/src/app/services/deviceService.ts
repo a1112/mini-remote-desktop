@@ -7,6 +7,7 @@
  * 3. 后续启动时验证设备状态
  */
 
+import { useEffect, useState } from "react";
 import { ipcRegisterDevice } from "../adapters/tauri";
 import { isTauriRuntime } from "../utils/runtime";
 
@@ -87,12 +88,16 @@ class DeviceRegistrationService {
     const stored = this.getStoredDeviceInfo();
     if (stored) {
       console.log("[DeviceService] 找到本地设备信息:", stored.device_id);
-      this.deviceInfo = stored;
-      void this.syncWithLocalService(stored);
 
       if (!useServerRegistration || this.isLocalOnlyDevice(stored)) {
-        return stored;
+        const refreshed = await this.refreshStoredLocalDeviceInfo(stored);
+        this.deviceInfo = refreshed;
+        void this.syncWithLocalService(refreshed);
+        return refreshed;
       }
+
+      this.deviceInfo = stored;
+      void this.syncWithLocalService(stored);
 
       // 验证设备是否仍然有效
       try {
@@ -162,6 +167,35 @@ class DeviceRegistrationService {
     this.deviceInfo = localInfo;
     void this.syncWithLocalService(localInfo);
     return localInfo;
+  }
+
+  private async refreshStoredLocalDeviceInfo(
+    stored: StoredDeviceInfo
+  ): Promise<StoredDeviceInfo> {
+    const hardwareInfo = await this.getHardwareInfo();
+    const hostname = hardwareInfo.hostname.trim();
+    if (!hostname || !this.shouldReplaceStoredLocalDeviceName(stored.device_name)) {
+      return stored;
+    }
+
+    const refreshed: StoredDeviceInfo = {
+      ...stored,
+      device_name: hostname,
+      motherboard_serial: stored.motherboard_serial || hardwareInfo.motherboard_serial,
+    };
+    this.saveDeviceInfo(refreshed);
+    return refreshed;
+  }
+
+  private shouldReplaceStoredLocalDeviceName(deviceName: string): boolean {
+    const value = deviceName.trim();
+    return (
+      value.length === 0 ||
+      value === "开发测试机" ||
+      value === "开发服务器" ||
+      value === "Rdesk LAN Device" ||
+      value === "This device"
+    );
   }
 
   /**
@@ -478,7 +512,7 @@ class DeviceRegistrationService {
 
     return {
       motherboard_serial: mockSerial,
-      hostname: "开发测试机",
+      hostname: this.getBrowserFallbackHostname(),
       os_type: "windows",
       os_version: "Windows 11 Pro 23H2 Build 22631",
       cpu_info: {
@@ -496,6 +530,15 @@ class DeviceRegistrationService {
         },
       ],
     };
+  }
+
+  private getBrowserFallbackHostname(): string {
+    const platform =
+      typeof navigator === "undefined"
+        ? ""
+        : ((navigator as any).userAgentData?.platform ?? navigator.platform ?? "");
+    const normalized = String(platform).trim();
+    return normalized ? `${normalized} device` : "Rdesk local device";
   }
 }
 
@@ -529,5 +572,3 @@ export function useDeviceRegistration() {
     reregister: () => deviceService.reregister(),
   };
 }
-
-import { useState, useEffect } from "react";

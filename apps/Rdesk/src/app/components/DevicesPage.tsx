@@ -190,7 +190,11 @@ export function DevicesPage() {
     setLaunchingDeviceId(device.id);
     try {
       const result = await launchRemoteDisplayForDevice(device.deviceId, {
-        transportKind: device.os.toLowerCase().includes("quic") ? "quic" : "webrtc",
+        transportKind: device.p2pAvailable
+          ? "quic"
+          : device.os.toLowerCase().includes("quic")
+            ? "quic"
+            : "webrtc",
         targetDeviceName: device.name,
         targetOs: device.os,
         targetIp: device.ip,

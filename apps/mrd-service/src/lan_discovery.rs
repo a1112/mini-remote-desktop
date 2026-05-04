@@ -1,9 +1,16 @@
-use crate::app_state::{AppState, MediaProbeFrameStats};
+use crate::app_state::{AppState, DecodedVideoFrameStats, MediaProbeFrameStats};
 use anyhow::{Context, Result};
 use mrd_application::ports::SessionSnapshot;
+use mrd_decode::H264SoftwareDecoder;
+use mrd_encode_openh264::OpenH264Encoder;
 use mrd_ipc::{
     CaptureSource, CaptureSourceSelection, LanDiscoverySnapshot, LanPeerInfo, MediaProfile,
     MediaProfileNegotiation,
+};
+#[cfg(test)]
+use mrd_pipeline_core::FrameCapture;
+use mrd_pipeline_core::{
+    CapturedFrame, DecodedFrame, DecodedFrameData, FramePixelFormat, VideoDecoder, VideoEncoder,
 };
 use mrd_proto::{DeviceId, SessionId};
 use mrd_transport_quic_quinn::{
@@ -492,6 +499,30 @@ pub async fn request_lan_remote_session(
                     .lock()
                     .await
                     .set(session_id.clone(), negotiation.clone());
+                {
+                    let mut sessions = app_state.sessions.lock().await;
+                    if sessions.get(session_id).is_none() {
+                        sessions.insert(
+                            session_id.clone(),
+                            SessionSnapshot {
+                                session_id: session_id.clone(),
+                                transport: normalize_transport_kind(transport_kind),
+                                source_device_id: None,
+                                target_device_id: Some(target_device_id.clone()),
+                                local_listen_addr: None,
+                                local_server_name: None,
+                                local_cert_der_b64: None,
+                                remote_listen_addr: None,
+                                remote_server_name: None,
+                                remote_cert_der_b64: None,
+                                lifecycle_state: "connecting".to_string(),
+                                last_error: None,
+                                sender_active: false,
+                                receiver_active: false,
+                            },
+                        );
+                    }
+                }
                 start_lan_media_receiver(
                     app_state.clone(),
                     session_id.clone(),
@@ -1009,7 +1040,6 @@ async fn accept_lan_remote_session(
         .lock()
         .await
         .set(session_id.clone(), negotiation.clone());
-    spawn_quic_media_sender(app_state.clone(), session_id.clone(), listener);
 
     let local_listen_addr = bootstrap.listen_addr.to_string();
     let local_server_name = bootstrap.server_name.clone();
@@ -1018,7 +1048,7 @@ async fn accept_lan_remote_session(
         sessions.insert(
             session_id.clone(),
             SessionSnapshot {
-                session_id,
+                session_id: session_id.clone(),
                 transport,
                 source_device_id: Some(source_device_id),
                 target_device_id: None,
@@ -1035,6 +1065,33 @@ async fn accept_lan_remote_session(
             },
         );
     }
+    #[cfg(test)]
+    {
+        app_state.capture_sources.lock().await.set(
+            session_id.clone(),
+            CaptureSourceSelection {
+                session_id: session_id.clone(),
+                source: synthetic_capture_source(),
+                status: "selected".to_string(),
+                reason: Some("test synthetic capture source".to_string()),
+            },
+        );
+    }
+    #[cfg(not(test))]
+    {
+        if let Ok(source) = crate::capture_source::default_capture_source(false) {
+            app_state.capture_sources.lock().await.set(
+                session_id.clone(),
+                CaptureSourceSelection {
+                    session_id: session_id.clone(),
+                    source,
+                    status: "selected".to_string(),
+                    reason: Some("default fullscreen capture source".to_string()),
+                },
+            );
+        }
+    }
+    spawn_quic_media_sender(app_state.clone(), session_id.clone(), listener).await;
 
     LanRemoteAcceptResult {
         accepted: true,
@@ -1230,7 +1287,7 @@ async fn start_lan_media_receiver(
         }
     }
 
-    spawn_quic_media_receiver(app_state, session_id, endpoint);
+    spawn_quic_media_receiver(app_state, session_id, endpoint).await;
     Ok(())
 }
 
@@ -1403,25 +1460,39 @@ fn largest_preview_source_index(sources: &[CaptureSource]) -> Option<usize> {
         .map(|(index, _)| index)
 }
 
-fn spawn_quic_media_sender(
+async fn spawn_quic_media_sender(
     app_state: Arc<AppState>,
     session_id: SessionId,
     listener: QuinnServerListener,
 ) {
-    tokio::spawn(async move {
+    let registry = app_state.media_tasks.clone();
+    let task_app_state = app_state;
+    let failure_app_state = task_app_state.clone();
+    let task_session_id = session_id.clone();
+    let failure_session_id = task_session_id.clone();
+    let handle = tokio::spawn(async move {
         let local_addr = listener.local_addr();
         let result = async move {
             let endpoint = listener
                 .accept()
                 .await
                 .context("LAN QUIC media listener failed to accept receiver")?;
-            send_quic_media_loop(app_state, endpoint, session_id).await
+            send_quic_media_loop(task_app_state, endpoint, task_session_id).await
         }
         .await;
         if let Err(error) = result {
             tracing::warn!(%error, %local_addr, "LAN QUIC media sender stopped");
+            mark_session_failed(
+                &failure_app_state,
+                &failure_session_id,
+                format!("LAN QUIC media sender failed: {error}"),
+            )
+            .await;
         }
     });
+    let abort_handle = handle.abort_handle();
+    drop(handle);
+    registry.lock().await.register(session_id, abort_handle);
 }
 
 async fn send_quic_media_loop(
@@ -1436,38 +1507,98 @@ async fn send_quic_media_loop(
         .max(QUIC_AU_FRAGMENT_HEADER_LEN + 1);
 
     let mut frame_id = 1_u64;
+    let mut active_source_id: Option<String> = None;
+    let mut capture: Option<LanFrameCapture> = None;
+    let mut encoder: Option<OpenH264Encoder> = None;
+    let mut encoder_config: Option<(usize, usize, u32, u32)> = None;
     loop {
+        if !session_allows_media(&app_state, &session_id).await {
+            return Ok(());
+        }
         let profile = selected_media_profile(&app_state, &session_id).await;
         tokio::time::sleep(media_frame_interval(&profile)).await;
-        let payload = build_media_probe_frame(frame_id, now_ms().saturating_mul(1_000), &profile);
-        let fragments = fragment_access_unit(
-            frame_id as u32,
-            now_ms().saturating_mul(1_000),
-            frame_id == 1,
-            &payload,
-            max_datagram_size,
-        )
-        .context("failed to fragment LAN QUIC media frame")?;
 
-        for fragment in fragments {
-            endpoint
-                .send_datagram(fragment)
-                .with_context(|| format!("failed to send LAN QUIC media frame {}", frame_id))?;
+        let source_id = selected_capture_source_id(&app_state, &session_id).await?;
+        if active_source_id.as_deref() != Some(source_id.as_str()) {
+            capture = Some(create_lan_frame_capture(&source_id, &profile)?);
+            encoder = None;
+            encoder_config = None;
+            active_source_id = Some(source_id);
         }
-        frame_id = frame_id.wrapping_add(1).max(1);
+
+        let raw_frame = capture
+            .as_mut()
+            .context("LAN media capture was not initialized")?
+            .capture_frame()
+            .context("failed to capture LAN desktop frame")?;
+        let frame = prepare_frame_for_h264(raw_frame, &profile)
+            .context("failed to prepare captured frame for H.264")?;
+        let expected_encoder_config =
+            (frame.width, frame.height, profile.fps, profile.bitrate_mbps);
+        if encoder_config != Some(expected_encoder_config) {
+            encoder = Some(
+                OpenH264Encoder::new_with_bitrate(
+                    frame.width,
+                    frame.height,
+                    profile.fps,
+                    profile.bitrate_mbps.saturating_mul(1_000_000).max(1),
+                )
+                .context("failed to create LAN H.264 encoder")?,
+            );
+            encoder_config = Some(expected_encoder_config);
+        }
+
+        let access_units = encoder
+            .as_mut()
+            .context("LAN H.264 encoder was not initialized")?
+            .encode(&frame)
+            .context("failed to encode LAN desktop frame")?;
+
+        for access_unit in access_units {
+            let fragments = fragment_access_unit(
+                frame_id as u32,
+                access_unit.timestamp_us,
+                access_unit.is_keyframe,
+                &access_unit.bytes,
+                max_datagram_size,
+            )
+            .context("failed to fragment LAN QUIC media frame")?;
+
+            for fragment in fragments {
+                endpoint
+                    .send_datagram(fragment)
+                    .with_context(|| format!("failed to send LAN QUIC media frame {}", frame_id))?;
+            }
+            frame_id = frame_id.wrapping_add(1).max(1);
+        }
     }
 }
 
-fn spawn_quic_media_receiver(
+async fn spawn_quic_media_receiver(
     app_state: Arc<AppState>,
     session_id: SessionId,
     endpoint: QuinnDatagramEndpoint,
 ) {
-    tokio::spawn(async move {
-        if let Err(error) = receive_quic_media_loop(app_state, session_id.clone(), endpoint).await {
-            tracing::warn!(%error, session_id = %session_id.0, "LAN QUIC media receiver stopped");
+    let registry = app_state.media_tasks.clone();
+    let failure_app_state = app_state.clone();
+    let task_session_id = session_id.clone();
+    let failure_session_id = task_session_id.clone();
+    let handle = tokio::spawn(async move {
+        if let Err(error) =
+            receive_quic_media_loop(app_state, task_session_id.clone(), endpoint).await
+        {
+            tracing::warn!(%error, session_id = %task_session_id.0, "LAN QUIC media receiver stopped");
+            mark_session_failed(
+                &failure_app_state,
+                &failure_session_id,
+                format!("LAN QUIC media receiver failed: {error}"),
+            )
+            .await;
         }
     });
+    let abort_handle = handle.abort_handle();
+    drop(handle);
+    registry.lock().await.register(session_id, abort_handle);
 }
 
 async fn receive_quic_media_loop(
@@ -1476,33 +1607,381 @@ async fn receive_quic_media_loop(
     endpoint: QuinnDatagramEndpoint,
 ) -> Result<()> {
     let mut reassembler = QuicAuReassembler::new(QuicAuReassemblerConfig::default());
+    let mut decoder =
+        H264SoftwareDecoder::new().context("failed to create LAN H.264 software decoder")?;
     loop {
+        if !session_allows_media(&app_state, &session_id).await {
+            return Ok(());
+        }
         let datagram = endpoint.read_datagram().await?;
+        if !session_allows_media(&app_state, &session_id).await {
+            return Ok(());
+        }
         if let Some(frame) = reassembler
             .push_datagram(&datagram)
             .context("failed to reassemble LAN QUIC media frame")?
         {
-            match decode_media_probe_frame(&frame.payload) {
-                Ok(stats) => {
-                    app_state.probes.lock().await.record_media_probe_frame(
-                        &session_id,
-                        stats,
-                        now_ms(),
-                    );
+            match decode_h264_desktop_frame(&mut decoder, &frame.payload) {
+                Ok(decoded_frames) if !decoded_frames.is_empty() => {
+                    let profile = selected_media_profile(&app_state, &session_id).await;
+                    for decoded_frame in decoded_frames {
+                        match decoded_frame_to_rgb24(decoded_frame) {
+                            Ok((width, height, rgb24)) => {
+                                app_state.probes.lock().await.record_decoded_video_frame(
+                                    &session_id,
+                                    DecodedVideoFrameStats {
+                                        bytes_received: frame.payload.len() as u64,
+                                        sequence: u64::from(frame.frame_id),
+                                        timestamp_us: frame.timestamp_us,
+                                        width,
+                                        height,
+                                        target_fps: profile.fps,
+                                        target_bitrate_mbps: profile.bitrate_mbps,
+                                        encoded_bytes: frame.payload.len() as u32,
+                                        pixel_format: "rgb24".to_string(),
+                                        rgb24,
+                                    },
+                                    now_ms(),
+                                );
+                            }
+                            Err(error) => {
+                                app_state.probes.lock().await.record_probe_drop(
+                                    &session_id,
+                                    frame.payload.len() as u64,
+                                    now_ms(),
+                                    error.to_string(),
+                                );
+                            }
+                        }
+                    }
                 }
-                Err(error) => {
-                    app_state.probes.lock().await.record_probe_drop(
-                        &session_id,
-                        frame.payload.len() as u64,
-                        now_ms(),
-                        error.to_string(),
-                    );
-                }
+                Ok(_) => {}
+                Err(h264_error) => match decode_media_probe_frame(&frame.payload) {
+                    Ok(stats) => {
+                        app_state.probes.lock().await.record_media_probe_frame(
+                            &session_id,
+                            stats,
+                            now_ms(),
+                        );
+                    }
+                    Err(error) => {
+                        app_state.probes.lock().await.record_probe_drop(
+                            &session_id,
+                            frame.payload.len() as u64,
+                            now_ms(),
+                            format!("{h264_error}; legacy probe fallback failed: {error}"),
+                        );
+                    }
+                },
             }
         }
     }
 }
 
+async fn session_allows_media(app_state: &Arc<AppState>, session_id: &SessionId) -> bool {
+    let sessions = app_state.sessions.lock().await;
+    let Some(snapshot) = sessions.get(session_id) else {
+        return false;
+    };
+    !matches!(snapshot.lifecycle_state.as_str(), "closed" | "failed")
+}
+
+async fn mark_session_failed(app_state: &Arc<AppState>, session_id: &SessionId, reason: String) {
+    let mut sessions = app_state.sessions.lock().await;
+    let Some(snapshot) = sessions.get(session_id).cloned() else {
+        return;
+    };
+    if snapshot.lifecycle_state == "closed" {
+        return;
+    }
+    sessions.insert(
+        session_id.clone(),
+        SessionSnapshot {
+            lifecycle_state: "failed".to_string(),
+            last_error: Some(reason),
+            sender_active: false,
+            receiver_active: false,
+            ..snapshot
+        },
+    );
+}
+
+enum LanFrameCapture {
+    #[cfg(windows)]
+    Winrt(mrd_capture_winrt::WinrtCapture),
+    #[cfg(test)]
+    Synthetic(SyntheticFrameCapture),
+}
+
+impl LanFrameCapture {
+    fn capture_frame(&mut self) -> Result<CapturedFrame> {
+        match self {
+            #[cfg(windows)]
+            LanFrameCapture::Winrt(capture) => capture
+                .capture_frame()
+                .map_err(|error| anyhow::anyhow!(error.to_string())),
+            #[cfg(test)]
+            LanFrameCapture::Synthetic(capture) => Ok(capture.capture_frame()?),
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct SyntheticFrameCapture {
+    width: usize,
+    height: usize,
+    frame_index: u64,
+}
+
+#[cfg(test)]
+impl SyntheticFrameCapture {
+    fn new(profile: &MediaProfile) -> Self {
+        let width = even_dimension(profile.width as usize).clamp(2, 640);
+        let height = even_dimension(profile.height as usize).clamp(2, 360);
+        Self {
+            width,
+            height,
+            frame_index: 0,
+        }
+    }
+}
+
+#[cfg(test)]
+impl FrameCapture for SyntheticFrameCapture {
+    fn capture_frame(&mut self) -> Result<CapturedFrame, mrd_pipeline_core::PipelineError> {
+        let mut rgb = vec![0_u8; self.width * self.height * 3];
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let index = (y * self.width + x) * 3;
+                rgb[index] = ((x + self.frame_index as usize * 3) % 256) as u8;
+                rgb[index + 1] = ((y + self.frame_index as usize * 5) % 256) as u8;
+                rgb[index + 2] = (((x ^ y) + self.frame_index as usize * 7) % 256) as u8;
+            }
+        }
+        self.frame_index = self.frame_index.wrapping_add(1);
+        Ok(CapturedFrame::from_cpu(
+            self.width,
+            self.height,
+            FramePixelFormat::Rgb24,
+            now_ms().saturating_mul(1_000),
+            rgb,
+        ))
+    }
+}
+
+#[cfg(test)]
+const TEST_SYNTHETIC_CAPTURE_SOURCE_ID: &str = "test:synthetic";
+
+#[cfg(test)]
+fn synthetic_capture_source() -> CaptureSource {
+    CaptureSource {
+        id: TEST_SYNTHETIC_CAPTURE_SOURCE_ID.to_string(),
+        platform: "test".to_string(),
+        source_kind: "display".to_string(),
+        title: "Synthetic desktop frame source".to_string(),
+        class_name: "SyntheticCapture".to_string(),
+        width: 640,
+        height: 360,
+        process_id: 0,
+        app_name: Some("mrd-service test source".to_string()),
+        bundle_identifier: None,
+        preview_data_url: None,
+        preview_width: None,
+        preview_height: None,
+    }
+}
+
+async fn selected_capture_source_id(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+) -> Result<String> {
+    if let Some(selection) = app_state.capture_sources.lock().await.get(session_id) {
+        return Ok(selection.source.id);
+    }
+
+    #[cfg(test)]
+    {
+        return Ok(TEST_SYNTHETIC_CAPTURE_SOURCE_ID.to_string());
+    }
+
+    #[cfg(not(test))]
+    {
+        let source = crate::capture_source::default_capture_source(false)
+            .context("no default capture source is available for LAN media sender")?;
+        app_state.capture_sources.lock().await.set(
+            session_id.clone(),
+            CaptureSourceSelection {
+                session_id: session_id.clone(),
+                source: source.clone(),
+                status: "selected".to_string(),
+                reason: Some("default fullscreen capture source".to_string()),
+            },
+        );
+        Ok(source.id)
+    }
+}
+
+fn create_lan_frame_capture(source_id: &str, _profile: &MediaProfile) -> Result<LanFrameCapture> {
+    #[cfg(test)]
+    if source_id == TEST_SYNTHETIC_CAPTURE_SOURCE_ID {
+        return Ok(LanFrameCapture::Synthetic(SyntheticFrameCapture::new(
+            _profile,
+        )));
+    }
+
+    #[cfg(windows)]
+    {
+        return Ok(LanFrameCapture::Winrt(
+            crate::capture_source::create_frame_capture(source_id)?,
+        ));
+    }
+
+    #[cfg(not(windows))]
+    {
+        anyhow::bail!("remote desktop capture is currently only available on Windows")
+    }
+}
+
+fn prepare_frame_for_h264(frame: CapturedFrame, profile: &MediaProfile) -> Result<CapturedFrame> {
+    if frame.width < 2 || frame.height < 2 {
+        anyhow::bail!(
+            "captured frame is too small: {}x{}",
+            frame.width,
+            frame.height
+        );
+    }
+
+    let (target_width, target_height) = h264_target_dimensions(frame.width, frame.height, profile);
+    let bytes_per_pixel = frame_bytes_per_pixel(frame.pixel_format);
+    let source_stride = frame
+        .width
+        .checked_mul(bytes_per_pixel)
+        .ok_or_else(|| anyhow::anyhow!("captured frame stride overflow"))?;
+    let required_len = source_stride
+        .checked_mul(frame.height)
+        .ok_or_else(|| anyhow::anyhow!("captured frame byte size overflow"))?;
+    if frame.data.len() < required_len {
+        anyhow::bail!(
+            "captured frame is truncated: {} < {}",
+            frame.data.len(),
+            required_len
+        );
+    }
+
+    let mut rgb = Vec::with_capacity(target_width * target_height * 3);
+    for y in 0..target_height {
+        let source_y = y * frame.height / target_height;
+        for x in 0..target_width {
+            let source_x = x * frame.width / target_width;
+            let (r, g, b) = read_captured_rgb(&frame, source_x, source_y, source_stride);
+            rgb.extend_from_slice(&[r, g, b]);
+        }
+    }
+
+    Ok(CapturedFrame::from_cpu(
+        target_width,
+        target_height,
+        FramePixelFormat::Rgb24,
+        frame.timestamp_us,
+        rgb,
+    ))
+}
+
+fn h264_target_dimensions(width: usize, height: usize, profile: &MediaProfile) -> (usize, usize) {
+    let max_width = profile.width.max(2) as f64;
+    let max_height = profile.height.max(2) as f64;
+    let scale = (max_width / width as f64)
+        .min(max_height / height as f64)
+        .min(1.0);
+    let target_width = even_dimension(((width as f64 * scale).round() as usize).max(2));
+    let target_height = even_dimension(((height as f64 * scale).round() as usize).max(2));
+    (target_width.max(2), target_height.max(2))
+}
+
+fn even_dimension(value: usize) -> usize {
+    value & !1
+}
+
+fn frame_bytes_per_pixel(pixel_format: FramePixelFormat) -> usize {
+    match pixel_format {
+        FramePixelFormat::Bgra32 | FramePixelFormat::Rgba32 => 4,
+        FramePixelFormat::Rgb24 => 3,
+    }
+}
+
+fn read_captured_rgb(
+    frame: &CapturedFrame,
+    x: usize,
+    y: usize,
+    source_stride: usize,
+) -> (u8, u8, u8) {
+    let bytes_per_pixel = frame_bytes_per_pixel(frame.pixel_format);
+    let index = y * source_stride + x * bytes_per_pixel;
+    match frame.pixel_format {
+        FramePixelFormat::Bgra32 => (
+            frame.data[index + 2],
+            frame.data[index + 1],
+            frame.data[index],
+        ),
+        FramePixelFormat::Rgba32 => (
+            frame.data[index],
+            frame.data[index + 1],
+            frame.data[index + 2],
+        ),
+        FramePixelFormat::Rgb24 => (
+            frame.data[index],
+            frame.data[index + 1],
+            frame.data[index + 2],
+        ),
+    }
+}
+
+fn decode_h264_desktop_frame(
+    decoder: &mut H264SoftwareDecoder,
+    payload: &[u8],
+) -> Result<Vec<DecodedFrame>> {
+    decoder
+        .push_access_unit(payload)
+        .context("failed to decode LAN H.264 access unit")?;
+    Ok(decoder.drain_decoded_frames())
+}
+
+fn decoded_frame_to_rgb24(frame: DecodedFrame) -> Result<(u32, u32, Vec<u8>)> {
+    let expected_pixels = frame
+        .width
+        .checked_mul(frame.height)
+        .ok_or_else(|| anyhow::anyhow!("decoded frame dimensions overflow"))?;
+    let rgb = match frame.data {
+        DecodedFrameData::CpuRgb24(data) => {
+            let expected_len = expected_pixels
+                .checked_mul(3)
+                .ok_or_else(|| anyhow::anyhow!("decoded RGB frame byte size overflow"))?;
+            if data.len() != expected_len {
+                anyhow::bail!("decoded RGB frame has invalid byte length");
+            }
+            data
+        }
+        DecodedFrameData::CpuBgra32(data) => {
+            let expected_len = expected_pixels
+                .checked_mul(4)
+                .ok_or_else(|| anyhow::anyhow!("decoded BGRA frame byte size overflow"))?;
+            if data.len() != expected_len {
+                anyhow::bail!("decoded BGRA frame has invalid byte length");
+            }
+            let mut rgb = Vec::with_capacity(expected_pixels * 3);
+            for pixel in data.chunks_exact(4) {
+                rgb.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
+            }
+            rgb
+        }
+        _ => anyhow::bail!("decoded frame is not CPU RGB/BGRA backed"),
+    };
+
+    Ok((frame.width as u32, frame.height as u32, rgb))
+}
+
+#[cfg(test)]
 fn build_media_probe_frame(sequence: u64, timestamp_us: u64, profile: &MediaProfile) -> Vec<u8> {
     let media_payload = build_probe_compressed_pattern(sequence, profile);
     let payload_hash = fnv1a64(&media_payload);
@@ -1573,6 +2052,7 @@ fn decode_media_probe_frame(frame: &[u8]) -> Result<MediaProbeFrameStats> {
     })
 }
 
+#[cfg(test)]
 fn build_probe_compressed_pattern(sequence: u64, profile: &MediaProfile) -> Vec<u8> {
     let mut payload = vec![0_u8; media_payload_bytes(profile)];
     for (offset, byte) in payload.iter_mut().enumerate() {
@@ -1651,6 +2131,7 @@ fn media_frame_interval(profile: &MediaProfile) -> Duration {
     Duration::from_micros((1_000_000 / u64::from(profile.fps.max(1))).max(1))
 }
 
+#[cfg(test)]
 fn media_payload_bytes(profile: &MediaProfile) -> usize {
     ((profile.bitrate_mbps as usize * 1_000_000 / 8) / profile.fps.max(1) as usize).max(1)
 }
@@ -1988,10 +2469,10 @@ mod tests {
         assert!(snapshot.media_probe_valid);
         assert_eq!(
             snapshot.media_probe_format.as_deref(),
-            Some(LAN_MEDIA_PROBE_2K144_FORMAT)
+            Some("h264_desktop_frame")
         );
-        assert_eq!(snapshot.media_probe_width, Some(LAN_MEDIA_TARGET_WIDTH));
-        assert_eq!(snapshot.media_probe_height, Some(LAN_MEDIA_TARGET_HEIGHT));
+        assert_eq!(snapshot.media_probe_width, Some(640));
+        assert_eq!(snapshot.media_probe_height, Some(360));
         assert!(snapshot.last_media_sequence.unwrap_or_default() > 0);
         assert!(snapshot
             .last_media_payload_hash
@@ -2001,6 +2482,28 @@ mod tests {
         assert_eq!(snapshot.media_probe_target_fps, Some(144));
         assert_eq!(snapshot.media_probe_target_bitrate_mbps, Some(64));
         assert!(snapshot.media_probe_payload_bytes.unwrap_or_default() > 0);
+        assert!(snapshot
+            .latest_frame_data_url
+            .as_deref()
+            .is_some_and(|value| value.starts_with("data:image/png;base64,")));
+        assert!(
+            controller_state
+                .media_tasks
+                .lock()
+                .await
+                .active_count(&session_id)
+                > 0,
+            "controller should register the LAN receiver media task"
+        );
+
+        crate::handlers::session::stop_session(&controller_state, session_id.clone()).await;
+        let stopped_snapshot = controller_state.probes.lock().await.snapshot(&session_id);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let after_stop_snapshot = controller_state.probes.lock().await.snapshot(&session_id);
+        assert_eq!(
+            after_stop_snapshot.frames_decoded, stopped_snapshot.frames_decoded,
+            "stopped LAN receiver must not keep recording probe frames"
+        );
     }
 
     #[tokio::test]

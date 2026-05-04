@@ -15,6 +15,8 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 mrd-application = { path = "../../crates/mrd-application" }
+mrd-decode = { path = "../../crates/mrd-decode" }
+mrd-encode-openh264 = { path = "../../crates/mrd-encode-openh264" }
 mrd-ipc = { path = "../../crates/mrd-ipc" }
 mrd-pipeline-core = { path = "../../crates/mrd-pipeline-core" }
 mrd-proto = { path = "../../crates/mrd-proto" }

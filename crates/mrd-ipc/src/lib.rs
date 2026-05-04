@@ -411,6 +411,14 @@ pub struct ProbeSnapshot {
     pub last_media_sequence: Option<u64>,
     pub last_media_timestamp_us: Option<u64>,
     pub last_media_payload_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_frame_data_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_frame_width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_frame_height: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_frame_pixel_format: Option<String>,
     pub last_error: Option<String>,
 }
 

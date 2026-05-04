@@ -4,6 +4,115 @@ import { getMockInvoke } from "../../../test/mocks/tauri";
 import { RenderTestPage } from "./RenderTestPage";
 
 describe("RenderTestPage platform capabilities", () => {
+  function mockWindowsRenderCapabilities() {
+    return {
+      os_type: "windows",
+      cpu_brand: "test",
+      cpu_cores: 16,
+      memory_gb: 32,
+      gpu_info: "NVIDIA",
+      available_captures: ["dxgi", "winrt", "synthetic"],
+      available_encoders: ["none", "openh264"],
+      available_decoders: ["none", "software"],
+      available_renderers: ["none", "d3d11", "d3d12", "opengl", "webview"],
+      available_memory_modes: ["cpu", "d3d11_shared"],
+    };
+  }
+
+  it("starts Direct3D 12 through the independent render probe without downgrading to D3D11", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(mockWindowsRenderCapabilities());
+      }
+      if (command === "test_start_run") return Promise.resolve("run-d3d12");
+      return Promise.resolve(null);
+    });
+
+    render(<RenderTestPage />);
+
+    const d3d12Button = await screen.findByRole("button", { name: /Direct3D 12/ });
+    await waitFor(() => expect(d3d12Button).toBeEnabled());
+
+    fireEvent.click(d3d12Button);
+    fireEvent.click(screen.getByRole("button", { name: /启动测试/ }));
+
+    await waitFor(() =>
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_start_run",
+        expect.objectContaining({
+          scenarioId: "render.probe",
+          config: expect.objectContaining({
+            renderer_type: "d3d12",
+            capture_type: "synthetic",
+            encoder_type: "none",
+            decoder_type: "none",
+            render_display: true,
+          }),
+        })
+      )
+    );
+  });
+
+  it("starts OpenGL through the independent render probe", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(mockWindowsRenderCapabilities());
+      }
+      if (command === "test_start_run") return Promise.resolve("run-opengl");
+      return Promise.resolve(null);
+    });
+
+    render(<RenderTestPage />);
+
+    const openglButton = await screen.findByRole("button", { name: /OpenGL/ });
+    await waitFor(() => expect(openglButton).toBeEnabled());
+
+    fireEvent.click(openglButton);
+    fireEvent.click(screen.getByRole("button", { name: /启动测试/ }));
+
+    await waitFor(() =>
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_start_run",
+        expect.objectContaining({
+          scenarioId: "render.probe",
+          config: expect.objectContaining({
+            renderer_type: "opengl",
+            capture_type: "synthetic",
+            encoder_type: "none",
+            decoder_type: "none",
+            render_display: true,
+          }),
+        })
+      )
+    );
+  });
+
+  it("runs WebView rendering inside the realtime preview without backend probe", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(mockWindowsRenderCapabilities());
+      }
+      return Promise.resolve(null);
+    });
+
+    render(<RenderTestPage />);
+
+    const webviewButton = await screen.findByRole("button", { name: /WebView/ });
+    await waitFor(() => expect(webviewButton).toBeEnabled());
+
+    fireEvent.click(webviewButton);
+    fireEvent.click(screen.getByRole("button", { name: /启动测试/ }));
+
+    expect(await screen.findByText("WebView 实时动画")).toBeInTheDocument();
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      "test_start_run",
+      expect.anything()
+    );
+  });
+
   it("enables Metal and disables Windows-only renderers on macOS", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {

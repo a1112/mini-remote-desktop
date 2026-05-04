@@ -11,10 +11,16 @@ import {
   ImageOff,
 } from "lucide-react";
 import * as commands from "../../adapters/tauri/commands";
-import type { Artifact, EnvironmentSnapshot, WindowCaptureTarget } from "../../adapters/tauri/types";
+import type {
+  Artifact,
+  EnvironmentSnapshot,
+  TestConfig,
+  WindowCaptureTarget,
+} from "../../adapters/tauri/types";
 import { capabilityAvailable, capabilityTag, unavailableText } from "./capabilityMeta";
 
 type CaptureType = "dxgi" | "winrt" | "macos" | "synthetic";
+type CaptureScope = "screen" | "window_perf" | "window_probe";
 
 interface CaptureOption {
   id: CaptureType;
@@ -45,6 +51,8 @@ const CAPTURE_OPTIONS: CaptureOption[] = [
   },
 ];
 
+const CAPTURE_PERF_DURATION_MS = 30_000;
+
 interface CaptureMetrics {
   is_running: boolean;
   capture_fps: number;
@@ -52,6 +60,8 @@ interface CaptureMetrics {
   dropped_frames: number;
   resolution: [number, number];
   avg_latency_ms: number;
+  source_wait_latency_p95_ms: number;
+  interactive_latency_p95_ms: number;
   capture_latency_p95_ms: number;
   encode_latency_p95_ms: number;
   decode_latency_p95_ms: number;
@@ -137,8 +147,28 @@ function windowCaptureApiName(capture: CaptureType): string {
   return capture === "macos" ? "ScreenCaptureKit" : "WinRT";
 }
 
+function capturePerformanceNote(capture: CaptureType, scope: CaptureScope): string | null {
+  if (capture === "winrt" && scope === "screen") {
+    return "WinRT 屏幕捕获通常受 DWM/显示刷新节拍影响，适合作为兼容与窗口捕获路径；2K/144Hz 高性能全屏采集优先使用 DXGI 零拷贝。";
+  }
+  if (capture === "winrt" && scope === "window_perf") {
+    return "单窗口性能统计的是目标窗口新帧到达率；静态窗口或低刷新应用不会稳定产生 144 FPS，即使采集链路本身未限速。";
+  }
+  if (capture === "winrt" && scope === "window_probe") {
+    return "单窗口验证只采集首帧并跑媒体探针，不代表持续采集 FPS。";
+  }
+  return null;
+}
+
+function captureModeLabel(scope: CaptureScope): string {
+  if (scope === "window_perf") return "单窗口持续性能";
+  if (scope === "window_probe") return "单窗口首帧验证";
+  return "屏幕持续性能";
+}
+
 export function CaptureTestPage() {
   const [selectedCapture, setSelectedCapture] = useState<CaptureType>("dxgi");
+  const [captureScope, setCaptureScope] = useState<CaptureScope>("screen");
   const [isRunning, setIsRunning] = useState(false);
   const [metrics, setMetrics] = useState<CaptureMetrics | null>(null);
   const [windowTargets, setWindowTargets] = useState<WindowCaptureTarget[]>([]);
@@ -153,14 +183,19 @@ export function CaptureTestPage() {
   const [windowPickerQuery, setWindowPickerQuery] = useState("");
   const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
   const [startError, setStartError] = useState<string | null>(null);
+  const [activeRunId, setActiveRunId] = useState<string | null>(null);
 
   const selectedOption = CAPTURE_OPTIONS.find((o) => o.id === selectedCapture);
   const selectedWindowCapture = supportsWindowCapture(selectedCapture);
+  const isWindowPerfMode = selectedWindowCapture && captureScope === "window_perf";
+  const isWindowProbeMode = selectedWindowCapture && captureScope === "window_probe";
+  const isWindowMode = isWindowPerfMode || isWindowProbeMode;
   const captureAvailable = (capture: CaptureType) =>
     capabilityAvailable(capabilities, "available_captures", capture, capture === "synthetic");
   const selectedWindow =
     windowTargets.find((target) => windowTargetKey(target) === selectedWindowHwnd) ??
     windowPickerTargets.find((target) => windowTargetKey(target) === selectedWindowHwnd);
+  const performanceNote = capturePerformanceNote(selectedCapture, captureScope);
 
   const applyWindowTargets = (targets: WindowCaptureTarget[]) => {
     setWindowTargets(targets);
@@ -193,19 +228,37 @@ export function CaptureTestPage() {
   }, [capabilities, selectedCapture]);
 
   useEffect(() => {
+    if (!selectedWindowCapture && captureScope !== "screen") {
+      setCaptureScope("screen");
+    }
+  }, [captureScope, selectedWindowCapture]);
+
+  useEffect(() => {
     if (!isRunning) return;
 
     const interval = setInterval(async () => {
       // Get metrics from test harness
       const result = await commands.testHarnessGetMetrics();
       if (result.ok) {
+        if (!result.value.is_running) {
+          setIsRunning(false);
+          setActiveRunId(null);
+        }
+        const sourceWaitLatencyP95 =
+          result.value.source_wait_latency_p95_ms ?? result.value.capture_latency_p95_ms;
+        const interactiveLatencyAvg =
+          result.value.interactive_latency_avg_ms ?? result.value.capture_latency_avg_ms;
+        const interactiveLatencyP95 =
+          result.value.interactive_latency_p95_ms ?? result.value.total_latency_p95_ms;
         setMetrics({
           is_running: result.value.is_running,
           capture_fps: result.value.capture_fps,
           frame_count: result.value.frame_count,
           dropped_frames: result.value.dropped_frames,
           resolution: result.value.resolution,
-          avg_latency_ms: result.value.total_latency_p50_ms,
+          avg_latency_ms: interactiveLatencyAvg,
+          source_wait_latency_p95_ms: sourceWaitLatencyP95,
+          interactive_latency_p95_ms: interactiveLatencyP95,
           capture_latency_p95_ms: result.value.capture_latency_p95_ms,
           encode_latency_p95_ms: result.value.encode_latency_p95_ms,
           decode_latency_p95_ms: result.value.decode_latency_p95_ms,
@@ -218,7 +271,7 @@ export function CaptureTestPage() {
   }, [isRunning]);
 
   useEffect(() => {
-    if (!supportsWindowCapture(selectedCapture)) return;
+    if (!isWindowMode) return;
 
     let cancelled = false;
     setWindowTargetsLoading(true);
@@ -242,7 +295,7 @@ export function CaptureTestPage() {
     return () => {
       cancelled = true;
     };
-  }, [selectedCapture]);
+  }, [isWindowMode]);
 
   const refreshWindowTargets = async () => {
     setWindowTargetsLoading(true);
@@ -294,10 +347,13 @@ export function CaptureTestPage() {
     setStartError(null);
     setSingleWindowProbeResult(null);
 
-    if (supportsWindowCapture(selectedCapture)) {
-      const selectedWindow =
-        windowTargets.find((target) => windowTargetKey(target) === selectedWindowHwnd) ??
-        windowPickerTargets.find((target) => windowTargetKey(target) === selectedWindowHwnd);
+    if (isWindowMode && !selectedWindow) {
+      setStartError("请先选择一个可捕获窗口。");
+      setIsRunning(false);
+      return;
+    }
+
+    if (isWindowProbeMode) {
       const isMacos = selectedCapture === "macos";
       const result = await commands.testStartRun({
         scenarioId: "single_window.local",
@@ -340,13 +396,69 @@ export function CaptureTestPage() {
       return;
     }
 
-    // Start with appropriate chain
-    const chain = selectedCapture === "synthetic" ? "nvenc_only" : "capture_only";
-    await commands.testHarnessStart(chain);
+    if (isWindowPerfMode) {
+      const config: TestConfig = {
+        capture_type: selectedCapture,
+        encoder_type: "none",
+        decoder_type: "none",
+        duration_ms: CAPTURE_PERF_DURATION_MS,
+        input_source: "window",
+        window_hwnd: selectedWindow?.hwnd,
+        window_title: selectedWindow?.title,
+        zero_copy: selectedCapture === "winrt",
+        visual_preview: false,
+      };
+      const result = await commands.testStartRun({
+        scenarioId: "custom",
+        config,
+      });
+
+      if (result.ok) {
+        setActiveRunId(result.value);
+      } else {
+        setStartError(result.error.message);
+        setIsRunning(false);
+      }
+      return;
+    }
+
+    const config: TestConfig = {
+      capture_type: selectedCapture,
+      encoder_type: "none",
+      decoder_type: "none",
+      duration_ms: CAPTURE_PERF_DURATION_MS,
+      input_source: "screen",
+      zero_copy: selectedCapture === "dxgi" || selectedCapture === "winrt",
+      visual_preview: false,
+    };
+    const scenarioId =
+      selectedCapture === "dxgi"
+        ? "capture.dxgi"
+        : selectedCapture === "winrt"
+        ? "capture.winrt"
+        : selectedCapture === "macos"
+        ? "capture.macos"
+        : "custom";
+    const result = await commands.testStartRun({
+      scenarioId,
+      config,
+    });
+
+    if (result.ok) {
+      setActiveRunId(result.value);
+    } else {
+      setStartError(result.error.message);
+      setIsRunning(false);
+    }
   };
 
   const handleStop = async () => {
-    await commands.testHarnessStop();
+    if (activeRunId) {
+      await commands.testStopRun(activeRunId);
+      setActiveRunId(null);
+    } else {
+      await commands.testHarnessStop();
+    }
     setIsRunning(false);
   };
 
@@ -373,7 +485,10 @@ export function CaptureTestPage() {
             return (
             <button
               key={option.id}
-              onClick={() => setSelectedCapture(option.id)}
+              onClick={() => {
+                setSelectedCapture(option.id);
+                setCaptureScope("screen");
+              }}
               disabled={isRunning || !available}
               className={`p-4 rounded-lg border-2 text-left transition-all ${
                 selectedCapture === option.id
@@ -407,8 +522,8 @@ export function CaptureTestPage() {
               <dd className="font-medium">{selectedOption.name}</dd>
             </div>
             <div>
-              <dt className="text-muted-foreground">测试时长</dt>
-              <dd className="font-medium">30 秒</dd>
+              <dt className="text-muted-foreground">测试模式</dt>
+              <dd className="font-medium">{captureModeLabel(captureScope)} / 无 FPS 限制</dd>
             </div>
             <div>
               <dt className="text-muted-foreground">分辨率</dt>
@@ -417,10 +532,17 @@ export function CaptureTestPage() {
               </dd>
             </div>
             <div>
-              <dt className="text-muted-foreground">目标帧率</dt>
-              <dd className="font-medium">60 FPS</dd>
+              <dt className="text-muted-foreground">内存路径</dt>
+              <dd className="font-medium">
+                {selectedCapture === "dxgi" || selectedCapture === "winrt" ? "D3D11 零拷贝" : "CPU"}
+              </dd>
             </div>
           </dl>
+          {performanceNote && (
+            <div className="mt-4 rounded border border-yellow-200 bg-yellow-50 px-3 py-2 text-sm text-yellow-900 dark:border-yellow-900/40 dark:bg-yellow-950/30 dark:text-yellow-100">
+              {performanceNote}
+            </div>
+          )}
         </div>
       )}
 
@@ -428,76 +550,114 @@ export function CaptureTestPage() {
         <div className="bg-card rounded-lg border p-4 mb-6">
           <div className="flex items-center justify-between mb-3">
             <div>
-              <h3 className="font-medium">Single window capture</h3>
+              <h3 className="font-medium">采集范围</h3>
               <p className="text-sm text-muted-foreground">
-                Enumerate foreground windows and pick a {windowCaptureApiName(selectedCapture)} capture target.
+                屏幕和单窗口性能都会持续采集；单窗口验证只检查选中窗口的首帧和媒体链路。
               </p>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 rounded-lg border bg-muted/30 p-1">
               <button
-                onClick={refreshWindowTargets}
-                disabled={windowTargetsLoading || isRunning}
-                className="inline-flex items-center gap-2 text-sm px-3 py-1.5 rounded border hover:bg-muted disabled:opacity-50"
+                onClick={() => setCaptureScope("screen")}
+                disabled={isRunning}
+                className={`text-sm px-3 py-1.5 rounded disabled:opacity-50 ${
+                  captureScope === "screen" ? "bg-background shadow-sm" : "hover:bg-muted"
+                }`}
               >
-                <RefreshCw className="h-4 w-4" />
-                Refresh
+                屏幕性能
               </button>
               <button
-                onClick={openWindowPicker}
-                disabled={windowTargetsLoading || isRunning}
-                className="inline-flex items-center gap-2 text-sm px-3 py-1.5 rounded bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+                onClick={() => setCaptureScope("window_perf")}
+                disabled={isRunning}
+                className={`text-sm px-3 py-1.5 rounded disabled:opacity-50 ${
+                  captureScope === "window_perf" ? "bg-background shadow-sm" : "hover:bg-muted"
+                }`}
               >
-                <Monitor className="h-4 w-4" />
-                Choose window
+                单窗口性能
+              </button>
+              <button
+                onClick={() => setCaptureScope("window_probe")}
+                disabled={isRunning}
+                className={`text-sm px-3 py-1.5 rounded disabled:opacity-50 ${
+                  captureScope === "window_probe" ? "bg-background shadow-sm" : "hover:bg-muted"
+                }`}
+              >
+                单窗口验证
               </button>
             </div>
           </div>
 
-          {windowTargetsLoading && (
-            <p className="text-sm text-muted-foreground">Loading windows...</p>
-          )}
-          {windowTargetsError && (
-            <p className="text-sm text-red-600">{windowTargetsError}</p>
-          )}
-          {!windowTargetsLoading && !windowTargetsError && selectedWindow && (
-            <div className="grid gap-4 md:grid-cols-[220px_1fr]">
-              <WindowPreviewThumb target={selectedWindow} />
-              <div className="min-w-0 space-y-2">
-                <div>
-                  <div className="truncate text-base font-medium">{selectedWindow.title}</div>
-                  <div className="text-sm text-muted-foreground">
-                    {selectedWindow.width}x{selectedWindow.height} / PID{" "}
-                    {selectedWindow.process_id}
-                  </div>
-                </div>
-                <div className="grid grid-cols-2 gap-3 text-sm">
-                  <div>
-                    <div className="text-muted-foreground">
-                      {selectedCapture === "macos" ? "Bundle" : "Class"}
-                    </div>
-                    <div className="truncate font-mono">{selectedWindow.class_name}</div>
-                  </div>
-                  <div>
-                    <div className="text-muted-foreground">
-                      {selectedCapture === "macos" ? "Window ID" : "HWND"}
-                    </div>
-                    <div className="truncate font-mono">{selectedWindow.hwnd}</div>
-                  </div>
-                </div>
-                <div className="text-xs text-muted-foreground">
-                  {windowTargets.length} windows available. Open the picker to refresh screenshots.
-                </div>
+          {isWindowMode ? (
+            <>
+              <div className="mb-3 flex items-center gap-2">
+                <button
+                  onClick={refreshWindowTargets}
+                  disabled={windowTargetsLoading || isRunning}
+                  className="inline-flex items-center gap-2 text-sm px-3 py-1.5 rounded border hover:bg-muted disabled:opacity-50"
+                >
+                  <RefreshCw className="h-4 w-4" />
+                  Refresh
+                </button>
+                <button
+                  onClick={openWindowPicker}
+                  disabled={windowTargetsLoading || isRunning}
+                  className="inline-flex items-center gap-2 text-sm px-3 py-1.5 rounded bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+                >
+                  <Monitor className="h-4 w-4" />
+                  Choose window
+                </button>
               </div>
-            </div>
-          )}
-          {!windowTargetsLoading && !windowTargetsError && !selectedWindow && (
+
+              {windowTargetsLoading && (
+                <p className="text-sm text-muted-foreground">Loading windows...</p>
+              )}
+              {windowTargetsError && (
+                <p className="text-sm text-red-600">{windowTargetsError}</p>
+              )}
+              {!windowTargetsLoading && !windowTargetsError && selectedWindow && (
+                <div className="grid gap-4 md:grid-cols-[220px_1fr]">
+                  <WindowPreviewThumb target={selectedWindow} />
+                  <div className="min-w-0 space-y-2">
+                    <div>
+                      <div className="truncate text-base font-medium">{selectedWindow.title}</div>
+                      <div className="text-sm text-muted-foreground">
+                        {selectedWindow.width}x{selectedWindow.height} / PID{" "}
+                        {selectedWindow.process_id}
+                      </div>
+                    </div>
+                    <div className="grid grid-cols-2 gap-3 text-sm">
+                      <div>
+                        <div className="text-muted-foreground">
+                          {selectedCapture === "macos" ? "Bundle" : "Class"}
+                        </div>
+                        <div className="truncate font-mono">{selectedWindow.class_name}</div>
+                      </div>
+                      <div>
+                        <div className="text-muted-foreground">
+                          {selectedCapture === "macos" ? "Window ID" : "HWND"}
+                        </div>
+                        <div className="truncate font-mono">{selectedWindow.hwnd}</div>
+                      </div>
+                    </div>
+                    <div className="text-xs text-muted-foreground">
+                      {windowTargets.length} windows available. Open the picker to refresh screenshots.
+                    </div>
+                  </div>
+                </div>
+              )}
+              {!windowTargetsLoading && !windowTargetsError && !selectedWindow && (
+                <div className="rounded border border-dashed p-4 text-sm text-muted-foreground">
+                  No capturable window selected.
+                </div>
+              )}
+              {isWindowProbeMode && singleWindowProbeResult && (
+                <div className="mt-3 text-sm text-muted-foreground">
+                  {singleWindowProbeResult}
+                </div>
+              )}
+            </>
+          ) : (
             <div className="rounded border border-dashed p-4 text-sm text-muted-foreground">
-              No capturable window selected.
-            </div>
-          )}
-          {singleWindowProbeResult && (
-            <div className="mt-3 text-sm text-muted-foreground">
-              {singleWindowProbeResult}
+              {windowCaptureApiName(selectedCapture)} 将按屏幕采集性能测试运行，不会枚举或验证单窗口。
             </div>
           )}
         </div>
@@ -533,7 +693,7 @@ export function CaptureTestPage() {
             onClick={handleStart}
             disabled={
               !captureAvailable(selectedCapture) ||
-              (selectedWindowCapture && (!selectedWindowHwnd || windowTargetsLoading))
+              (isWindowMode && (!selectedWindowHwnd || windowTargetsLoading))
             }
             className="flex items-center gap-2 px-6 py-3 bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 transition-colors disabled:opacity-50"
           >
@@ -555,7 +715,7 @@ export function CaptureTestPage() {
       {/* Metrics */}
       {metrics && (
         <>
-          <div className="grid grid-cols-2 md:grid-cols-5 gap-4 mb-6">
+          <div className="grid grid-cols-2 md:grid-cols-6 gap-4 mb-6">
             <MetricCard
               icon={<Activity className="h-4 w-4" />}
               label="捕获帧率"
@@ -564,15 +724,21 @@ export function CaptureTestPage() {
             />
             <MetricCard
               icon={<Gauge className="h-4 w-4" />}
-              label="平均延迟"
+              label="感知平均"
               value={`${metrics.avg_latency_ms.toFixed(2)} ms`}
               color={getLatencyColor(metrics.avg_latency_ms, 16, 33)}
             />
             <MetricCard
               icon={<Gauge className="h-4 w-4" />}
-              label="Pipeline P95"
-              value={`${metrics.total_latency_p95_ms.toFixed(2)} ms`}
-              color={getLatencyColor(metrics.total_latency_p95_ms, 16, 33)}
+              label="感知 P95"
+              value={`${metrics.interactive_latency_p95_ms.toFixed(2)} ms`}
+              color={getLatencyColor(metrics.interactive_latency_p95_ms, 16, 33)}
+            />
+            <MetricCard
+              icon={<Gauge className="h-4 w-4" />}
+              label="源等待 P95"
+              value={`${metrics.source_wait_latency_p95_ms.toFixed(2)} ms`}
+              color={getLatencyColor(metrics.source_wait_latency_p95_ms, 16, 33)}
             />
             <MetricCard
               icon={<Monitor className="h-4 w-4" />}
@@ -591,7 +757,8 @@ export function CaptureTestPage() {
           <div className="bg-card rounded-lg border p-4">
             <h3 className="font-medium mb-4">延迟分布</h3>
             <div className="space-y-2">
-              <LatencyBar label="Capture" value={metrics.capture_latency_p95_ms} max={100} />
+              <LatencyBar label="Source wait" value={metrics.source_wait_latency_p95_ms} max={100} />
+              <LatencyBar label="Interactive" value={metrics.interactive_latency_p95_ms} max={100} />
               <LatencyBar label="Encode" value={metrics.encode_latency_p95_ms} max={100} />
               <LatencyBar label="Decode" value={metrics.decode_latency_p95_ms} max={100} />
               <LatencyBar label="Total" value={metrics.total_latency_p95_ms} max={100} />

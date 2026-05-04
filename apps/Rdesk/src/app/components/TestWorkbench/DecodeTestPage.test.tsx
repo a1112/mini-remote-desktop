@@ -1,0 +1,83 @@
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { describe, expect, it } from "vitest";
+import { getMockInvoke } from "../../../test/mocks/tauri";
+import { DecodeTestPage } from "./DecodeTestPage";
+
+function mockCapabilities() {
+  return {
+    os_type: "windows",
+    cpu_brand: "test",
+    cpu_cores: 16,
+    memory_gb: 32,
+    gpu_info: "NVIDIA",
+    available_captures: ["dxgi", "synthetic"],
+    available_encoders: ["none", "nvenc_h264", "openh264"],
+    available_decoders: ["none", "software", "nvdec"],
+    available_renderers: ["none", "d3d11"],
+    available_memory_modes: ["cpu", "d3d11_shared"],
+  };
+}
+
+describe("DecodeTestPage backend contract", () => {
+  it("starts NVDEC with an explicit 2K 144Hz decode profile", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") return Promise.resolve(mockCapabilities());
+      if (command === "test_start_run") return Promise.resolve("run-nvdec-2k144");
+      return Promise.resolve(null);
+    });
+
+    render(<DecodeTestPage />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /^选择解码器 NVDEC$/ }));
+    fireEvent.click(screen.getByRole("button", { name: /2K 144/ }));
+    fireEvent.click(screen.getByRole("button", { name: /启动测试/ }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("test_start_run", {
+        scenarioId: "custom",
+        config: expect.objectContaining({
+          capture_type: "dxgi",
+          encoder_type: "nvenc_h264",
+          decoder_type: "nvdec",
+          resolution: [2560, 1440],
+          fps: 144,
+          zero_copy: true,
+          visual_preview: false,
+        }),
+      });
+    });
+  });
+
+  it("shows decoded throughput and decoded frames instead of capture loop counters", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") return Promise.resolve(mockCapabilities());
+      if (command === "test_start_run") return Promise.resolve("run-software-decode");
+      if (command === "test_harness_get_metrics") {
+        return Promise.resolve({
+          is_running: true,
+          capture_fps: 60,
+          decoded_fps: 37,
+          decode_latency_p50_ms: 8,
+          decode_latency_p95_ms: 17,
+          frame_count: 120,
+          decoded_frames: 74,
+          dropped_frames: 0,
+          resolution: [1920, 1080],
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    render(<DecodeTestPage />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /启动测试/ }));
+
+    expect(await screen.findByText("37.0 FPS")).toBeInTheDocument();
+    expect(screen.getAllByText("解码帧数").length).toBeGreaterThanOrEqual(2);
+    expect(screen.getAllByText("74").length).toBeGreaterThanOrEqual(2);
+    expect(screen.queryByText("60.0 FPS")).not.toBeInTheDocument();
+    expect(screen.queryByText("120")).not.toBeInTheDocument();
+  });
+});

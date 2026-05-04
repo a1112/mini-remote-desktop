@@ -272,6 +272,12 @@ pub async fn stop_session(app_state: &Arc<AppState>, session_id: SessionId) -> I
                 ..snapshot
             },
         );
+        drop(sessions);
+        app_state
+            .media_tasks
+            .lock()
+            .await
+            .abort_session(&session_id);
         app_state.media_profiles.lock().await.remove(&session_id);
         app_state.capture_sources.lock().await.remove(&session_id);
         return IpcResponse::SessionStopped { session_id };
@@ -304,6 +310,11 @@ pub async fn fail_session(
             },
         );
         drop(sessions);
+        app_state
+            .media_tasks
+            .lock()
+            .await
+            .abort_session(&session_id);
 
         let mut shell = app_state.shell.lock().await;
         shell.last_error = Some(reason);
@@ -513,6 +524,37 @@ mod tests {
         assert_eq!(stored.lifecycle_state, "closed");
         assert!(!stored.sender_active);
         assert!(!stored.receiver_active);
+    }
+
+    #[tokio::test]
+    async fn stop_session_aborts_registered_media_tasks() {
+        let app_state = Arc::new(AppState::new());
+        let session_id = SessionId("test-session".to_string());
+
+        let _ = start_session(
+            &app_state,
+            session_id.clone(),
+            DeviceId("agent".to_string()),
+            "quic".to_string(),
+        )
+        .await;
+
+        let task = tokio::spawn(async { std::future::pending::<()>().await });
+        app_state
+            .media_tasks
+            .lock()
+            .await
+            .register(session_id.clone(), task.abort_handle());
+
+        let response = stop_session(&app_state, session_id.clone()).await;
+
+        assert!(matches!(response, IpcResponse::SessionStopped { .. }));
+        tokio::task::yield_now().await;
+        assert!(task.is_finished(), "media task should be aborted on stop");
+        assert_eq!(
+            app_state.media_tasks.lock().await.active_count(&session_id),
+            0
+        );
     }
 
     #[tokio::test]

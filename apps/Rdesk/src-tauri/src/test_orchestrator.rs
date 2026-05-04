@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::render_probe::{render_backend_supported, run_render_probe, RenderProbeConfig};
 use crate::test_harness::{
     CaptureType, DecoderType, EncoderType, HarnessMetrics, RendererType, TestChain,
     TestConfig as HarnessConfig, TestHarness, TransportKind,
@@ -102,6 +103,7 @@ pub struct TestConfigData {
     pub input_source: Option<String>,
     pub window_hwnd: Option<String>,
     pub window_title: Option<String>,
+    pub visual_preview: Option<bool>,
     pub output_validation: Option<bool>,
 }
 
@@ -381,6 +383,11 @@ impl TestOrchestrator {
 
         match scenario_id {
             "capture.dxgi" => Ok(TestChain::CaptureOnly),
+            "capture.winrt" => Ok(TestChain::Custom {
+                capture: CaptureType::Winrt,
+                encoder: EncoderType::None,
+                decoder: DecoderType::None,
+            }),
             "capture.macos" => Ok(TestChain::Custom {
                 capture: CaptureType::Macos,
                 encoder: EncoderType::None,
@@ -483,6 +490,28 @@ impl TestOrchestrator {
                 supports_matrix: true,
                 default_config: TestConfigData {
                     capture_type: Some("dxgi".to_string()),
+                    encoder_type: Some("none".to_string()),
+                    decoder_type: Some("none".to_string()),
+                    zero_copy: Some(true),
+                    duration_ms: Some(30_000),
+                    visual_preview: Some(false),
+                    ..Default::default()
+                },
+            },
+            TestScenario {
+                scenario_id: "capture.winrt".to_string(),
+                scenario_kind: ScenarioKind::Capture,
+                component_scope: vec!["winrt".to_string(), "d3d11_shared".to_string()],
+                display_name: "WinRT 屏幕捕获测试".to_string(),
+                description: "测试 Windows Runtime Graphics Capture 屏幕捕获性能和稳定性".to_string(),
+                supports_matrix: true,
+                default_config: TestConfigData {
+                    capture_type: Some("winrt".to_string()),
+                    encoder_type: Some("none".to_string()),
+                    decoder_type: Some("none".to_string()),
+                    zero_copy: Some(true),
+                    duration_ms: Some(30_000),
+                    visual_preview: Some(false),
                     ..Default::default()
                 },
             },
@@ -605,6 +634,52 @@ impl TestOrchestrator {
                 },
             },
             TestScenario {
+                scenario_id: "render.d3d12".to_string(),
+                scenario_kind: ScenarioKind::Render,
+                component_scope: vec!["d3d12_render".to_string(), "window_probe".to_string()],
+                display_name: "Direct3D 12 渲染 Probe".to_string(),
+                description: "参考 CapTest 路径执行独立 D3D12 可见窗口 clear/present 渲染测试，不接主线渲染窗口。".to_string(),
+                supports_matrix: true,
+                default_config: TestConfigData {
+                    capture_type: Some("synthetic".to_string()),
+                    encoder_type: Some("none".to_string()),
+                    decoder_type: Some("none".to_string()),
+                    renderer_type: Some("d3d12".to_string()),
+                    render_display: Some(true),
+                    transport_kind: Some("loopback".to_string()),
+                    resolution: Some([1920, 1080]),
+                    fps: Some(144),
+                    duration_ms: Some(5_000),
+                    input_source: Some("synthetic".to_string()),
+                    visual_preview: Some(true),
+                    output_validation: Some(true),
+                    ..Default::default()
+                },
+            },
+            TestScenario {
+                scenario_id: "render.opengl".to_string(),
+                scenario_kind: ScenarioKind::Render,
+                component_scope: vec!["opengl_render".to_string(), "window_probe".to_string()],
+                display_name: "OpenGL 渲染 Probe".to_string(),
+                description: "执行独立 OpenGL/WGL 可见窗口 clear + SwapBuffers 渲染测试，不接主线渲染窗口。".to_string(),
+                supports_matrix: true,
+                default_config: TestConfigData {
+                    capture_type: Some("synthetic".to_string()),
+                    encoder_type: Some("none".to_string()),
+                    decoder_type: Some("none".to_string()),
+                    renderer_type: Some("opengl".to_string()),
+                    render_display: Some(true),
+                    transport_kind: Some("loopback".to_string()),
+                    resolution: Some([1920, 1080]),
+                    fps: Some(144),
+                    duration_ms: Some(5_000),
+                    input_source: Some("synthetic".to_string()),
+                    visual_preview: Some(true),
+                    output_validation: Some(true),
+                    ..Default::default()
+                },
+            },
+            TestScenario {
                 scenario_id: "single_window.local".to_string(),
                 scenario_kind: ScenarioKind::E2eLocal,
                 component_scope: window_capture_scope,
@@ -716,6 +791,12 @@ impl TestOrchestrator {
 
         if scenario_id == "single_window.local" {
             return self.start_single_window_probe(scenario_id, config);
+        }
+        if matches!(
+            scenario_id.as_str(),
+            "render.probe" | "render.d3d12" | "render.opengl"
+        ) {
+            return self.start_render_probe(scenario_id, config);
         }
 
         // Resolve the scenario before recording a run. Unsupported scenarios must
@@ -893,6 +974,220 @@ impl TestOrchestrator {
                         run.summary = Some(summary_from_metrics(run.started_at, &metrics));
                     }
                     break;
+                }
+            }
+        });
+
+        Ok(run_id)
+    }
+
+    fn start_render_probe(&self, scenario_id: String, config: TestConfigData) -> Result<RunId> {
+        let backend = match scenario_id.as_str() {
+            "render.d3d12" => "d3d12".to_string(),
+            "render.opengl" => "opengl".to_string(),
+            _ => config
+                .renderer_type
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("render.probe requires renderer_type"))?,
+        };
+        if !render_backend_supported(&backend) {
+            anyhow::bail!(
+                "Render backend {} is not supported on this platform",
+                backend
+            );
+        }
+        if !matches!(backend.as_str(), "d3d12" | "opengl") {
+            anyhow::bail!("Unsupported render probe backend: {}", backend);
+        }
+
+        let [width, height] = config.resolution.unwrap_or([1920, 1080]);
+        let fps = config.fps.unwrap_or(144).max(1);
+        let duration_ms = config.duration_ms.unwrap_or(5_000).max(1);
+        let requested_frames = ((duration_ms as u128 * fps as u128) / 1_000).clamp(1, 600) as usize;
+        let run_id = generate_run_id();
+        let started_at = now_ms();
+        let env_snapshot = self.get_capabilities()?;
+
+        let run = TestRun {
+            run_id: run_id.clone(),
+            scenario_id,
+            run_mode: RunMode::Manual,
+            status: RunStatus::Running,
+            started_at,
+            finished_at: None,
+            config_snapshot: config.clone(),
+            environment_snapshot: env_snapshot,
+            summary: None,
+        };
+
+        self.runs.lock().unwrap().insert(run_id.clone(), run);
+        self.record_stage_event(run_id.clone(), "prepare", "started", None, None);
+        self.record_stage_event(run_id.clone(), "initialize", "started", None, None);
+
+        let runs = Arc::clone(&self.runs);
+        let events = Arc::clone(&self.run_events);
+        let metrics = Arc::clone(&self.run_metrics);
+        let artifacts = Arc::clone(&self.run_artifacts);
+        let run_id_clone = run_id.clone();
+        thread::spawn(move || {
+            events
+                .lock()
+                .unwrap()
+                .entry(run_id_clone.clone())
+                .or_insert_with(Vec::new)
+                .push(TestStageEvent {
+                    stage: "initialize".to_string(),
+                    status: "completed".to_string(),
+                    timestamp: now_ms(),
+                    duration_ms: None,
+                    error: None,
+                });
+            events
+                .lock()
+                .unwrap()
+                .entry(run_id_clone.clone())
+                .or_insert_with(Vec::new)
+                .push(TestStageEvent {
+                    stage: "render".to_string(),
+                    status: "started".to_string(),
+                    timestamp: now_ms(),
+                    duration_ms: None,
+                    error: None,
+                });
+
+            let result = run_render_probe(RenderProbeConfig {
+                backend,
+                width,
+                height,
+                frames: requested_frames,
+                show_window: config.render_display.unwrap_or(true),
+            });
+
+            match result {
+                Ok(result) => {
+                    {
+                        let mut all_series = metrics.lock().unwrap();
+                        let run_series = all_series
+                            .entry(run_id_clone.clone())
+                            .or_insert_with(HashMap::new);
+                        push_metric_sample(run_series, "render_fps", "fps", result.fps);
+                        push_metric_sample(
+                            run_series,
+                            "render_frame_time_ms",
+                            "ms",
+                            result.avg_frame_time_ms,
+                        );
+                        push_metric_sample(
+                            run_series,
+                            "render_frame_time_p50_ms",
+                            "ms",
+                            result.p50_frame_time_ms,
+                        );
+                        push_metric_sample(
+                            run_series,
+                            "render_frame_time_p95_ms",
+                            "ms",
+                            result.p95_frame_time_ms,
+                        );
+                        push_metric_sample(
+                            run_series,
+                            "draw_calls",
+                            "count",
+                            result.draw_calls as f64,
+                        );
+                        push_metric_sample(
+                            run_series,
+                            "triangles",
+                            "count",
+                            result.triangles as f64,
+                        );
+                        push_metric_sample(run_series, "textures", "count", result.textures as f64);
+                        push_metric_sample(run_series, "render_width", "px", result.width as f64);
+                        push_metric_sample(run_series, "render_height", "px", result.height as f64);
+                    }
+
+                    let data =
+                        serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
+                    let size_bytes = data.len();
+                    artifacts
+                        .lock()
+                        .unwrap()
+                        .entry(run_id_clone.clone())
+                        .or_insert_with(Vec::new)
+                        .push(Artifact {
+                            artifact_id: format!("render_probe_{}", now_ms()),
+                            kind: "structured_log".to_string(),
+                            run_id: run_id_clone.clone(),
+                            created_at: now_ms(),
+                            data,
+                            metadata: Some(ArtifactMetadata {
+                                width: Some(result.width),
+                                height: Some(result.height),
+                                format: Some("json".to_string()),
+                                size_bytes: Some(size_bytes),
+                            }),
+                        });
+
+                    if let Some(run) = runs.lock().unwrap().get_mut(&run_id_clone) {
+                        run.status = RunStatus::Completed;
+                        run.finished_at = Some(now_ms());
+                        run.summary = Some(TestRunSummary {
+                            total_duration_ms: now_ms().saturating_sub(run.started_at),
+                            capture_fps: Some(result.fps),
+                            total_latency_p95: Some(result.p95_frame_time_ms),
+                            frame_count: result.frames_presented,
+                            ..Default::default()
+                        });
+                    }
+                    events
+                        .lock()
+                        .unwrap()
+                        .entry(run_id_clone.clone())
+                        .or_insert_with(Vec::new)
+                        .push(TestStageEvent {
+                            stage: "render".to_string(),
+                            status: "completed".to_string(),
+                            timestamp: now_ms(),
+                            duration_ms: None,
+                            error: None,
+                        });
+                    events
+                        .lock()
+                        .unwrap()
+                        .entry(run_id_clone)
+                        .or_insert_with(Vec::new)
+                        .push(TestStageEvent {
+                            stage: "summarize".to_string(),
+                            status: "completed".to_string(),
+                            timestamp: now_ms(),
+                            duration_ms: None,
+                            error: None,
+                        });
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    if let Some(run) = runs.lock().unwrap().get_mut(&run_id_clone) {
+                        run.status = RunStatus::Failed;
+                        run.finished_at = Some(now_ms());
+                        run.summary = Some(TestRunSummary {
+                            total_duration_ms: now_ms().saturating_sub(run.started_at),
+                            error_message: Some(message.clone()),
+                            failure_reason: Some("runtime_failure".to_string()),
+                            ..Default::default()
+                        });
+                    }
+                    events
+                        .lock()
+                        .unwrap()
+                        .entry(run_id_clone)
+                        .or_insert_with(Vec::new)
+                        .push(TestStageEvent {
+                            stage: "render".to_string(),
+                            status: "failed".to_string(),
+                            timestamp: now_ms(),
+                            duration_ms: None,
+                            error: Some(message),
+                        });
                 }
             }
         });
@@ -1847,17 +2142,17 @@ fn current_platform_captures() -> Vec<&'static str> {
 fn current_platform_renderers() -> Vec<&'static str> {
     #[cfg(windows)]
     {
-        return vec!["none", "d3d11"];
+        return vec!["none", "d3d11", "d3d12", "opengl", "webview"];
     }
 
     #[cfg(target_os = "macos")]
     {
-        return vec!["none", "macos"];
+        return vec!["none", "macos", "webview"];
     }
 
     #[cfg(not(any(windows, target_os = "macos")))]
     {
-        vec!["none"]
+        vec!["none", "webview"]
     }
 }
 
@@ -1875,7 +2170,9 @@ fn current_platform_memory_modes() -> Vec<&'static str> {
 
 fn scenario_supported_on_current_platform(scenario_id: &str) -> bool {
     match scenario_id {
-        "capture.dxgi" | "encode.nvenc_h264" | "decode.nvdec_h264" | "e2e.local" => cfg!(windows),
+        "capture.dxgi" | "capture.winrt" | "encode.nvenc_h264" | "decode.nvdec_h264"
+        | "e2e.local" => cfg!(windows),
+        "render.probe" | "render.d3d12" | "render.opengl" => cfg!(windows),
         "single_window.local" => cfg!(windows) || cfg!(target_os = "macos"),
         "capture.macos" | "encode.videotoolbox_h264" | "e2e.macos_local" => {
             cfg!(target_os = "macos")
@@ -1934,6 +2231,7 @@ fn decoder_supported_on_current_platform(decoder_type: &str) -> bool {
 fn renderer_supported_on_current_platform(renderer_type: &str) -> bool {
     matches!(renderer_type, "none")
         || matches!(renderer_type, "d3d11") && cfg!(windows)
+        || matches!(renderer_type, "d3d12" | "opengl") && cfg!(windows)
         || matches!(renderer_type, "macos" | "metal") && cfg!(target_os = "macos")
 }
 
@@ -1986,6 +2284,12 @@ fn validate_scenario_for_current_platform(
             "Renderer type {} is not supported on {}",
             renderer_type,
             os_type
+        );
+    }
+    if matches!(renderer_type, "d3d12" | "opengl") {
+        anyhow::bail!(
+            "Renderer type {} uses the independent render.probe path and is not supported by custom/matrix harness runs",
+            renderer_type
         );
     }
 
@@ -2390,6 +2694,7 @@ fn harness_config_from_data(config: &TestConfigData) -> HarnessConfig {
         zero_copy: config.zero_copy,
         input_source: config.input_source.clone(),
         window_handle: config.window_hwnd.clone(),
+        visual_preview: config.visual_preview,
         transport: match config.transport_kind.as_deref() {
             Some("webrtc") | Some("webrtc_rtp") => Some(TransportKind::WebrtcRtp),
             Some("quic") | Some("quic_datagram") => Some(TransportKind::QuicDatagram),
@@ -2775,6 +3080,115 @@ mod tests {
             harness_config_from_data(&disabled_config).zero_copy,
             Some(false)
         );
+    }
+
+    #[test]
+    fn harness_config_passes_visual_preview_flag() {
+        let config = TestConfigData {
+            visual_preview: Some(false),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            harness_config_from_data(&config).visual_preview,
+            Some(false)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn render_probe_scenarios_are_registered_on_windows() {
+        let scenarios = TestOrchestrator::default().list_scenarios();
+
+        assert!(scenarios
+            .iter()
+            .any(|scenario| scenario.scenario_id == "render.d3d12"));
+        assert_eq!(
+            scenarios
+                .iter()
+                .find(|scenario| scenario.scenario_id == "render.d3d12")
+                .expect("render.d3d12 scenario")
+                .default_config
+                .render_display,
+            Some(true)
+        );
+        assert!(scenarios
+            .iter()
+            .any(|scenario| scenario.scenario_id == "render.opengl"));
+        assert_eq!(
+            scenarios
+                .iter()
+                .find(|scenario| scenario.scenario_id == "render.opengl")
+                .expect("render.opengl scenario")
+                .default_config
+                .render_display,
+            Some(true)
+        );
+        assert!(current_platform_renderers().contains(&"d3d12"));
+        assert!(current_platform_renderers().contains(&"opengl"));
+        assert!(current_platform_renderers().contains(&"webview"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn custom_harness_rejects_independent_render_probe_backends() {
+        let config = TestConfigData {
+            capture_type: Some("synthetic".to_string()),
+            encoder_type: Some("none".to_string()),
+            decoder_type: Some("none".to_string()),
+            renderer_type: Some("d3d12".to_string()),
+            render_display: Some(false),
+            ..Default::default()
+        };
+
+        let error = validate_scenario_for_current_platform("custom", &config).unwrap_err();
+        assert!(error.to_string().contains("render.probe"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn capture_dxgi_defaults_to_unthrottled_zero_copy_perf_mode() {
+        let scenario = TestOrchestrator::default()
+            .list_scenarios()
+            .into_iter()
+            .find(|scenario| scenario.scenario_id == "capture.dxgi")
+            .expect("capture.dxgi scenario");
+
+        assert_eq!(
+            scenario.default_config.encoder_type.as_deref(),
+            Some("none")
+        );
+        assert_eq!(
+            scenario.default_config.decoder_type.as_deref(),
+            Some("none")
+        );
+        assert_eq!(scenario.default_config.zero_copy, Some(true));
+        assert_eq!(scenario.default_config.visual_preview, Some(false));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn capture_winrt_defaults_to_screen_perf_mode() {
+        let scenario = TestOrchestrator::default()
+            .list_scenarios()
+            .into_iter()
+            .find(|scenario| scenario.scenario_id == "capture.winrt")
+            .expect("capture.winrt scenario");
+
+        assert_eq!(
+            scenario.default_config.capture_type.as_deref(),
+            Some("winrt")
+        );
+        assert_eq!(
+            scenario.default_config.encoder_type.as_deref(),
+            Some("none")
+        );
+        assert_eq!(
+            scenario.default_config.decoder_type.as_deref(),
+            Some("none")
+        );
+        assert_eq!(scenario.default_config.zero_copy, Some(true));
+        assert_eq!(scenario.default_config.visual_preview, Some(false));
     }
 
     #[cfg(windows)]
