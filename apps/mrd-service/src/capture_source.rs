@@ -1,10 +1,13 @@
 use anyhow::Result;
 use mrd_ipc::CaptureSource;
+use std::time::{Duration, Instant};
 
 const DEFAULT_CAPTURE_SOURCE_LIMIT: usize = 24;
 const MAX_CAPTURE_SOURCE_LIMIT: usize = 48;
 const PREVIEW_MAX_WIDTH: usize = 240;
 const PREVIEW_MAX_HEIGHT: usize = 135;
+const PREVIEW_FRAME_TIMEOUT_MS: u64 = 90;
+const PREVIEW_TOTAL_BUDGET_MS: u64 = 1_800;
 
 pub fn list_capture_sources(
     include_previews: bool,
@@ -174,9 +177,13 @@ fn list_capture_sources_impl() -> Result<Vec<CaptureSource>> {
 }
 
 fn attach_capture_source_previews(sources: &mut [CaptureSource]) {
+    let started_at = Instant::now();
     for source in sources.iter_mut() {
+        let Some(frame_timeout) = preview_frame_timeout_for_elapsed(started_at.elapsed()) else {
+            break;
+        };
         let Ok((preview_data_url, preview_width, preview_height)) =
-            capture_source_preview_data_url(&source.id)
+            capture_source_preview_data_url(&source.id, frame_timeout)
         else {
             continue;
         };
@@ -186,8 +193,20 @@ fn attach_capture_source_previews(sources: &mut [CaptureSource]) {
     }
 }
 
+fn preview_frame_timeout_for_elapsed(elapsed: Duration) -> Option<Duration> {
+    let budget = Duration::from_millis(PREVIEW_TOTAL_BUDGET_MS);
+    let remaining = budget.checked_sub(elapsed)?;
+    if remaining.is_zero() {
+        return None;
+    }
+    Some(remaining.min(Duration::from_millis(PREVIEW_FRAME_TIMEOUT_MS)))
+}
+
 #[cfg(windows)]
-fn capture_source_preview_data_url(source_id: &str) -> Result<(String, u32, u32)> {
+fn capture_source_preview_data_url(
+    source_id: &str,
+    frame_timeout: Duration,
+) -> Result<(String, u32, u32)> {
     let mut capture = match parse_windows_capture_source_ref(source_id)? {
         WindowsCaptureSourceRef::Window(hwnd) => {
             mrd_capture_winrt::WinrtCapture::from_window_handle(hwnd)
@@ -202,14 +221,17 @@ fn capture_source_preview_data_url(source_id: &str) -> Result<(String, u32, u32)
         .start()
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let frame = capture
-        .capture_frame_with_timeout(std::time::Duration::from_millis(250))
+        .capture_frame_with_timeout(frame_timeout)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let _ = capture.stop();
     window_preview_data_url(&frame, PREVIEW_MAX_WIDTH, PREVIEW_MAX_HEIGHT)
 }
 
 #[cfg(not(windows))]
-fn capture_source_preview_data_url(_source_id: &str) -> Result<(String, u32, u32)> {
+fn capture_source_preview_data_url(
+    _source_id: &str,
+    _frame_timeout: Duration,
+) -> Result<(String, u32, u32)> {
     anyhow::bail!("remote window capture previews are currently only available on Windows")
 }
 
@@ -346,6 +368,8 @@ fn window_preview_data_url(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use mrd_ipc::CaptureSource;
 
     fn source(id: &str, source_kind: &str) -> CaptureSource {
@@ -395,6 +419,22 @@ mod tests {
         let selected = super::preferred_capture_source(&sources).expect("selected source");
 
         assert_eq!(selected.id, "windows:display:0");
+    }
+
+    #[test]
+    fn preview_timeout_stays_inside_lan_request_budget() {
+        assert_eq!(
+            super::preview_frame_timeout_for_elapsed(Duration::from_millis(0)),
+            Some(Duration::from_millis(90))
+        );
+        assert_eq!(
+            super::preview_frame_timeout_for_elapsed(Duration::from_millis(1_750)),
+            Some(Duration::from_millis(50))
+        );
+        assert_eq!(
+            super::preview_frame_timeout_for_elapsed(Duration::from_millis(1_800)),
+            None
+        );
     }
 
     #[cfg(windows)]

@@ -113,6 +113,29 @@ describe("RenderTestPage platform capabilities", () => {
     );
   });
 
+  it("waits for measured animation frames before reporting WebView FPS", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(mockWindowsRenderCapabilities());
+      }
+      return Promise.resolve(null);
+    });
+
+    render(<RenderTestPage />);
+
+    const webviewButton = await screen.findByRole("button", { name: /WebView/ });
+    fireEvent.click(webviewButton);
+    fireEvent.click(screen.getByRole("button", { name: /启动测试/ }));
+
+    expect(await screen.findByText("0.0 FPS")).toBeInTheDocument();
+    expect(screen.getByText("WebView 实时动画")).toBeInTheDocument();
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      "test_start_run",
+      expect.anything()
+    );
+  });
+
   it("enables Metal and disables Windows-only renderers on macOS", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {

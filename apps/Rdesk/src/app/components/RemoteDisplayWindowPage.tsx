@@ -348,9 +348,7 @@ export function RemoteDisplayWindowPage() {
       ? "macos"
       : renderMode === "d3d11_native"
         ? "d3d11"
-        : renderMode === "d3d12_native"
-          ? "d3d12"
-          : null;
+        : null;
   const isNative = nativeRendererType !== null;
   const nativeRendererTypeForHost = hostOs === "macos" ? "macos" : "d3d11";
   const currentNativeRendererAvailable =
@@ -365,8 +363,9 @@ export function RemoteDisplayWindowPage() {
     (!capabilities
       ? true
       : capabilities.available_renderers?.includes(nativeRendererTypeForHost) ?? false);
-  const d3d12RendererAvailable =
-    isTauriRuntime() && Boolean(capabilities?.available_renderers?.includes("d3d12"));
+  const d3d12RendererAvailable = false;
+  const d3d12UnavailableTitle =
+    "D3D12 目前仅接入渲染测试页的独立 probe，尚未接入远程显示主链路。";
   const nativeRenderAvailable = isNative
     ? currentNativeRendererAvailable
     : nativeRendererAvailableForHost;
@@ -524,7 +523,7 @@ export function RemoteDisplayWindowPage() {
         } else if (result.value?.render_mode === "d3d11_native") {
           setRenderMode("d3d11_native");
         } else if (result.value?.render_mode === "d3d12_native") {
-          setRenderMode("d3d12_native");
+          setRenderMode("d3d11_native");
         } else if (result.value?.render_mode === "web") {
           setRenderMode("web");
         }
@@ -1155,6 +1154,33 @@ export function RemoteDisplayWindowPage() {
     }
   }, [buildRemoteMediaProfile, isLocalPipelinePreview, sessionId, transport]);
 
+  const hydrateRemoteCaptureSourcePreviews = useCallback(async (sources: CaptureSource[]) => {
+    if (isLocalPipelinePreview || sources.length === 0) return;
+
+    try {
+      const previewSources = await listRemoteCaptureSources(
+        sessionId,
+        true,
+        Math.min(sources.length, 8)
+      );
+      const previewById = new Map(previewSources.map((source) => [source.id, source]));
+      setCaptureSources((currentSources) =>
+        currentSources.map((source) => {
+          const preview = previewById.get(source.id);
+          if (!preview?.preview_data_url) return source;
+          return {
+            ...source,
+            preview_data_url: preview.preview_data_url,
+            preview_width: preview.preview_width,
+            preview_height: preview.preview_height,
+          };
+        })
+      );
+    } catch {
+      // Keep source selection usable when preview capture is slow or unsupported.
+    }
+  }, [isLocalPipelinePreview, sessionId]);
+
   const handleRefreshRemoteCaptureSources = useCallback(async () => {
     if (isLocalPipelinePreview) return;
 
@@ -1162,9 +1188,10 @@ export function RemoteDisplayWindowPage() {
     setLastError(null);
     setTestMessage("正在枚举远端捕获源");
     try {
-      const sources = await listRemoteCaptureSources(sessionId, true, 24);
+      const sources = await listRemoteCaptureSources(sessionId, false, 24);
       const nextSources = Array.isArray(sources) ? sources : [];
       setCaptureSources(nextSources);
+      void hydrateRemoteCaptureSourcePreviews(nextSources);
       setTestMessage(
         nextSources.length > 0
           ? `已获取 ${nextSources.length} 个远端捕获源`
@@ -1178,7 +1205,7 @@ export function RemoteDisplayWindowPage() {
     } finally {
       setCaptureSourcesLoading(false);
     }
-  }, [isLocalPipelinePreview, sessionId]);
+  }, [hydrateRemoteCaptureSourcePreviews, isLocalPipelinePreview, sessionId]);
 
   const handleSelectRemoteCaptureSource = useCallback(
     async (source: CaptureSource) => {
@@ -1563,7 +1590,7 @@ export function RemoteDisplayWindowPage() {
                   ? renderSwitchLockedTitle
                   : d3d12RendererAvailable
                     ? undefined
-                    : "D3D12 renderer is not available in this build"
+                    : d3d12UnavailableTitle
               }
             >
               DX12 native

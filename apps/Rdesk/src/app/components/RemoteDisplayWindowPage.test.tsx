@@ -701,8 +701,13 @@ describe("RemoteDisplayWindowPage", () => {
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("ipc_list_remote_capture_sources", {
         sessionId: "p2p-quic-123",
-        includePreviews: true,
+        includePreviews: false,
         limit: 24,
+      });
+      expect(mockInvoke).toHaveBeenCalledWith("ipc_list_remote_capture_sources", {
+        sessionId: "p2p-quic-123",
+        includePreviews: true,
+        limit: 1,
       });
       expect(mockInvoke).toHaveBeenCalledWith("ipc_select_remote_capture_source", {
         sessionId: "p2p-quic-123",
@@ -1066,6 +1071,48 @@ describe("RemoteDisplayWindowPage", () => {
     const dx12Button = await screen.findByRole("button", { name: "DX12 native" });
     expect(dx12Button).toBeDisabled();
     expect(dx12Button).toHaveAttribute("title", expect.stringContaining("D3D12"));
+  });
+
+  it("keeps DX12 native disabled when only the independent D3D12 probe is available", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve({
+          ...windowsCapabilities(),
+          available_renderers: ["d3d11", "d3d12"],
+        });
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-local-display-test-1",
+          session_id: "local-display-test-1",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: false,
+          render_mode: "d3d11_native",
+          native_surface_attached: true,
+          session_window_count: 1,
+        });
+      }
+      if (command === "configure_remote_display_native_surface") {
+        return Promise.resolve({
+          label: "render-local-display-test-1",
+          backend: args?.enabled ? "d3d11" : "web",
+          attached: Boolean(args?.enabled),
+          visible: Boolean(args?.visible),
+          parent_hwnd: "0xA",
+          hwnd: args?.enabled ? "0x14" : null,
+          rect: { x: 0, y: 56, width: 1280, height: 720 },
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay("local-display-test-1");
+
+    const dx12Button = await screen.findByRole("button", { name: "DX12 native" });
+    expect(dx12Button).toBeDisabled();
+    expect(dx12Button).toHaveAttribute("title", expect.stringContaining("渲染测试"));
   });
 
   it("routes the title bar close button through the remote display cleanup command", async () => {

@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Play, Square, Monitor, Palette, Layers, ImageOff } from "lucide-react";
 import * as commands from "../../adapters/tauri/commands";
 import type { EnvironmentSnapshot, FrameData, MetricSeries, TestConfig } from "../../adapters/tauri/types";
@@ -76,6 +76,13 @@ interface RenderMetrics {
   resolution: [number, number];
 }
 
+interface WebViewRenderSample {
+  fps: number;
+  averageFrameTimeMs: number;
+  p95FrameTimeMs: number;
+  frameCount: number;
+}
+
 export function RenderTestPage() {
   const [selectedRenderer, setSelectedRenderer] = useState<RendererType>("d3d11");
   const [selectedMode, setSelectedMode] = useState<"video" | "animation" | "static">("video");
@@ -128,34 +135,14 @@ export function RenderTestPage() {
     if (!isRunning) return;
 
     if (currentRunUsesWebView && webViewStartedAt !== null) {
-      const interval = setInterval(() => {
-        const elapsedMs = Math.max(Date.now() - webViewStartedAt, 1);
-        const targetFps =
-          selectedMode === "static" ? 30 : selectedMode === "animation" ? 144 : 60;
-        const frameTimeMs = 1000 / targetFps;
-        const frameCount = Math.floor((elapsedMs / 1000) * targetFps);
+      const elapsedMs = Math.max(Date.now() - webViewStartedAt, 0);
+      const remainingMs = Math.max(webViewDurationMs - elapsedMs, 0);
+      const timeout = window.setTimeout(() => {
+        setIsRunning(false);
+        setCurrentRunUsesWebView(false);
+      }, remainingMs);
 
-        setMetrics({
-          is_running: elapsedMs < webViewDurationMs,
-          render_fps: targetFps,
-          frame_time_ms: frameTimeMs,
-          gpu_frame_time_ms: frameTimeMs,
-          capture_latency_p95_ms: 0,
-          transport_latency_p95_ms: 0,
-          decode_latency_p95_ms: 0,
-          draw_calls: frameCount,
-          triangles: frameCount * 2,
-          textures: 4,
-          resolution: selectedResolution.split("x").map(Number) as [number, number],
-        });
-
-        if (elapsedMs >= webViewDurationMs) {
-          setIsRunning(false);
-          setCurrentRunUsesWebView(false);
-        }
-      }, 250);
-
-      return () => clearInterval(interval);
+      return () => window.clearTimeout(timeout);
     }
 
     const interval = setInterval(async () => {
@@ -236,6 +223,22 @@ export function RenderTestPage() {
     webViewStartedAt,
   ]);
 
+  const handleWebViewRenderSample = useCallback((sample: WebViewRenderSample) => {
+    setMetrics({
+      is_running: true,
+      render_fps: sample.fps,
+      frame_time_ms: sample.averageFrameTimeMs,
+      gpu_frame_time_ms: sample.p95FrameTimeMs,
+      capture_latency_p95_ms: 0,
+      transport_latency_p95_ms: 0,
+      decode_latency_p95_ms: 0,
+      draw_calls: sample.frameCount,
+      triangles: sample.frameCount * 2,
+      textures: 4,
+      resolution: selectedResolution.split("x").map(Number) as [number, number],
+    });
+  }, [selectedResolution]);
+
   const handleStart = async () => {
     if (!selectedOption || !selectedAvailable) {
       setStartError("当前平台未暴露所选渲染器能力。");
@@ -259,13 +262,11 @@ export function RenderTestPage() {
     const usesWebView = isWebViewRenderer(selectedRenderer);
 
     if (usesWebView) {
-      const targetFps = selectedMode === "static" ? 30 : selectedMode === "animation" ? 144 : 60;
-      const frameTimeMs = 1000 / targetFps;
       setMetrics({
         is_running: true,
-        render_fps: targetFps,
-        frame_time_ms: frameTimeMs,
-        gpu_frame_time_ms: frameTimeMs,
+        render_fps: 0,
+        frame_time_ms: 0,
+        gpu_frame_time_ms: 0,
         capture_latency_p95_ms: 0,
         transport_latency_p95_ms: 0,
         decode_latency_p95_ms: 0,
@@ -470,7 +471,7 @@ export function RenderTestPage() {
         <h3 className="font-medium mb-4">实时画面</h3>
         <div className="aspect-video rounded bg-black flex items-center justify-center overflow-hidden">
           {currentRunUsesWebView && isRunning ? (
-            <WebViewRenderPreview mode={selectedMode} />
+            <WebViewRenderPreview mode={selectedMode} onSample={handleWebViewRenderSample} />
           ) : previewFrame ? (
             <img
               src={`data:image/png;base64,${previewFrame[0]}`}
@@ -568,8 +569,51 @@ export function RenderTestPage() {
   );
 }
 
-function WebViewRenderPreview({ mode }: { mode: "video" | "animation" | "static" }) {
+function WebViewRenderPreview({
+  mode,
+  onSample,
+}: {
+  mode: "video" | "animation" | "static";
+  onSample: (sample: WebViewRenderSample) => void;
+}) {
   const animate = mode !== "static";
+
+  useEffect(() => {
+    let animationFrame = 0;
+    let lastFrameAt: number | null = null;
+    let lastEmitAt: number | null = null;
+    let frameCount = 0;
+    const frameTimes: number[] = [];
+
+    const tick = (now: number) => {
+      if (lastFrameAt !== null) {
+        const delta = now - lastFrameAt;
+        if (delta > 0 && delta < 1000) {
+          frameTimes.push(delta);
+          if (frameTimes.length > 240) frameTimes.shift();
+        }
+      }
+      lastFrameAt = now;
+      frameCount += 1;
+
+      if (lastEmitAt === null || now - lastEmitAt >= 250) {
+        lastEmitAt = now;
+        const averageFrameTimeMs = average(frameTimes);
+        const p95FrameTimeMs = percentile(frameTimes, 0.95);
+        onSample({
+          fps: averageFrameTimeMs > 0 ? 1000 / averageFrameTimeMs : 0,
+          averageFrameTimeMs,
+          p95FrameTimeMs,
+          frameCount,
+        });
+      }
+
+      animationFrame = window.requestAnimationFrame(tick);
+    };
+
+    animationFrame = window.requestAnimationFrame(tick);
+    return () => window.cancelAnimationFrame(animationFrame);
+  }, [onSample]);
 
   return (
     <div className="relative h-full w-full overflow-hidden bg-slate-950 text-cyan-100">
@@ -598,6 +642,21 @@ function WebViewRenderPreview({ mode }: { mode: "video" | "animation" | "static"
       </div>
     </div>
   );
+}
+
+function average(values: number[]): number {
+  if (values.length === 0) return 0;
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function percentile(values: number[], quantile: number): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const index = Math.min(
+    sorted.length - 1,
+    Math.max(0, Math.ceil(sorted.length * quantile) - 1)
+  );
+  return sorted[index] ?? 0;
 }
 
 function MetricCard({
