@@ -32,6 +32,22 @@ function mockMacCapabilities(command: string) {
   return undefined;
 }
 
+function windowsCapabilities(overrides: Record<string, unknown> = {}) {
+  return {
+    os_type: "windows",
+    cpu_brand: "",
+    cpu_cores: 16,
+    memory_gb: 32,
+    gpu_info: "NVIDIA",
+    available_captures: ["dxgi", "winrt", "synthetic"],
+    available_encoders: ["nvenc_h264", "openh264"],
+    available_decoders: ["nvdec", "software"],
+    available_renderers: ["none", "d3d11"],
+    available_memory_modes: ["cpu", "d3d11_shared"],
+    ...overrides,
+  };
+}
+
 describe("MatrixTestPage failure handling", () => {
   it("exposes HEVC encoders when Windows capabilities report NVENC HEVC support", async () => {
     const mockInvoke = getMockInvoke();
@@ -448,6 +464,70 @@ describe("MatrixTestPage failure handling", () => {
         })
       );
     });
+  });
+
+  it("skips OpenH264 D3D11 shared texture rows without calling the backend", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(windowsCapabilities());
+      }
+      return Promise.resolve(null);
+    });
+
+    render(<MatrixTestPage runDelayMs={0} />);
+
+    await screen.findByLabelText("D3D11 shared texture");
+    fireEvent.click(screen.getByLabelText("NVENC H.264"));
+    fireEvent.click(screen.getByLabelText("软件"));
+    fireEvent.click(screen.getByLabelText("1080p"));
+    fireEvent.click(screen.getByLabelText("60 FPS"));
+    fireEvent.click(screen.getByLabelText("CPU"));
+    fireEvent.click(screen.getByLabelText("D3D11 shared texture"));
+    fireEvent.click(screen.getByLabelText("No display"));
+    fireEvent.click(screen.getByRole("button", { name: /启动矩阵测试/ }));
+
+    await waitFor(() => {
+      expect(within(resultRow()).getByText("跳过")).toBeInTheDocument();
+      expect(
+        within(resultRow()).getByText(/OpenH264 requires CPU-backed input/)
+      ).toBeInTheDocument();
+    });
+    expect(mockInvoke.mock.calls.some(([command]) => command === "test_start_run")).toBe(false);
+  });
+
+  it("skips DX12 native renderer rows as unimplemented without calling the backend", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(
+          windowsCapabilities({
+            available_renderers: ["none", "d3d12"],
+            available_memory_modes: ["cpu"],
+          })
+        );
+      }
+      return Promise.resolve(null);
+    });
+
+    render(<MatrixTestPage runDelayMs={0} />);
+
+    await screen.findByLabelText("DX12 native");
+    fireEvent.click(screen.getByLabelText("OpenH264"));
+    fireEvent.click(screen.getByLabelText("软件"));
+    fireEvent.click(screen.getByLabelText("1080p"));
+    fireEvent.click(screen.getByLabelText("60 FPS"));
+    fireEvent.click(screen.getByLabelText("No display"));
+    fireEvent.click(screen.getByLabelText("DX12 native"));
+    fireEvent.click(screen.getByRole("button", { name: /启动矩阵测试/ }));
+
+    await waitFor(() => {
+      expect(within(resultRow()).getByText("跳过")).toBeInTheDocument();
+      expect(
+        within(resultRow()).getByText(/D3D12 native renderer is probe-only/)
+      ).toBeInTheDocument();
+    });
+    expect(mockInvoke.mock.calls.some(([command]) => command === "test_start_run")).toBe(false);
   });
 
   it("allows WinRT D3D11 shared texture matrix runs", async () => {

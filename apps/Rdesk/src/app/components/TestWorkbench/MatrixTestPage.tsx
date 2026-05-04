@@ -7,6 +7,11 @@ import type {
   TestRun,
   TestRunSummary,
 } from "../../adapters/tauri/types";
+import {
+  buildCapabilitySnapshotFromEnvironment,
+  evaluateCapabilityCombination,
+  type CapabilitySnapshot,
+} from "../../services/capabilityMatrix";
 
 interface MatrixDimension {
   id: string;
@@ -85,6 +90,7 @@ const MATRIX_DIMENSIONS: MatrixDimension[] = [
     options: [
       { id: "renderer_none", name: "No display", enabled: true },
       { id: "d3d11", name: "DX11 popup", enabled: false },
+      { id: "d3d12_native", name: "DX12 native", enabled: false },
       { id: "macos", name: "Metal", enabled: false },
     ],
   },
@@ -210,9 +216,16 @@ function createMatrixDimensions(capabilities?: EnvironmentSnapshot | null): Matr
       case "decoder":
         return availableDecoders.includes(optionId);
       case "renderer":
-        return optionId === "renderer_none"
-          ? availableRenderers.includes("none")
-          : availableRenderers.includes(optionId);
+        if (optionId === "renderer_none") {
+          return availableRenderers.includes("none");
+        }
+        if (optionId === "d3d12_native") {
+          return (
+            availableRenderers.includes("d3d12") ||
+            availableRenderers.includes("d3d12_native")
+          );
+        }
+        return availableRenderers.includes(optionId);
       case "memory":
         return availableMemoryModes.includes(optionId);
       default:
@@ -388,6 +401,44 @@ function unsupportedMatrixReason(config: TestConfig): string | null {
   return null;
 }
 
+function matrixCapabilitySkipReason(
+  config: TestConfig,
+  capabilitySnapshot: CapabilitySnapshot | null
+): string | null {
+  if (!capabilitySnapshot) return null;
+
+  const evaluation = evaluateCapabilityCombination(
+    {
+      capture: config.capture_type,
+      encoder: config.encoder_type,
+      decoder: config.decoder_type,
+      renderer:
+        config.render_display && config.renderer_type === "d3d12"
+          ? "d3d12_native"
+          : config.render_display
+            ? config.renderer_type
+            : undefined,
+      memory: config.zero_copy ? "d3d11_shared" : "cpu",
+      transport: config.transport_kind,
+      allowCpuCopy: false,
+    },
+    capabilitySnapshot
+  );
+
+  if (evaluation.status !== "blocked" && evaluation.status !== "skipped") {
+    return null;
+  }
+
+  return evaluation.reasons.join("; ") || "Capability combination is not runnable";
+}
+
+function staticMatrixSkipReason(
+  config: TestConfig,
+  capabilitySnapshot: CapabilitySnapshot | null
+): string | null {
+  return matrixCapabilitySkipReason(config, capabilitySnapshot) ?? unsupportedMatrixReason(config);
+}
+
 function capabilitySkipReason(config: TestConfig, message: string): string | null {
   if (/not supported on/i.test(message)) {
     return message;
@@ -481,6 +532,9 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
   const [completedCount, setCompletedCount] = useState(0);
   const [failedCount, setFailedCount] = useState(0);
   const [skippedCount, setSkippedCount] = useState(0);
+  const capabilitySnapshot = capabilities
+    ? buildCapabilitySnapshotFromEnvironment(capabilities)
+    : null;
 
   useEffect(() => {
     let cancelled = false;
@@ -543,6 +597,7 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
         isOptionEnabled(next, "renderer", "renderer_none")
       ) {
         next = setOptionEnabled(next, "renderer", "d3d11", false);
+        next = setOptionEnabled(next, "renderer", "d3d12_native", false);
         next = setOptionEnabled(next, "renderer", "macos", false);
         next = setOptionEnabled(next, "memory", "d3d11_shared", false);
       }
@@ -570,9 +625,6 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
     const generate = (index: number, current: SelectedMatrixOption[]) => {
       if (index >= enabledOptions.length) {
         const config = buildConfig(current);
-        if (unsupportedMatrixReason(config)) {
-          return;
-        }
 
         const configKey = matrixConfigKey(config);
         if (seenConfigs.has(configKey)) {
@@ -584,6 +636,7 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
           id: `matrix_${combinations.length}`,
           config,
           status: "pending",
+          skipReason: staticMatrixSkipReason(config, capabilitySnapshot) ?? undefined,
         });
         return;
       }
@@ -619,6 +672,9 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
         case "renderer":
           if (option.id === "d3d11") {
             config.renderer_type = "d3d11";
+            config.render_display = true;
+          } else if (option.id === "d3d12_native") {
+            config.renderer_type = "d3d12";
             config.render_display = true;
           } else if (option.id === "macos") {
             config.renderer_type = "macos";
@@ -709,7 +765,8 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
       const test = matrixTests[i];
       if (!test) continue;
 
-      const staticSkipReason = unsupportedMatrixReason(test.config);
+      const staticSkipReason =
+        test.skipReason ?? staticMatrixSkipReason(test.config, capabilitySnapshot);
       if (staticSkipReason) {
         setSkippedCount((count) => count + 1);
         setTests((prev) =>
