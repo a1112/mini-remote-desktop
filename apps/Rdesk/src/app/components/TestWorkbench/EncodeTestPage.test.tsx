@@ -89,4 +89,43 @@ describe("EncodeTestPage backend contract", () => {
     expect(screen.queryByText("48.5 FPS")).not.toBeInTheDocument();
     expect(screen.queryByText("120")).not.toBeInTheDocument();
   });
+
+  it("starts Linux NVENC through the custom PipeWire capture path", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve({
+          os_type: "linux",
+          cpu_brand: "test",
+          cpu_cores: 8,
+          memory_gb: 16,
+          gpu_info: "NVIDIA",
+          available_captures: ["linux", "synthetic"],
+          available_encoders: ["none", "nvenc_h264", "nvenc_hevc", "openh264"],
+          available_decoders: ["none", "software"],
+          available_renderers: ["linux"],
+          available_memory_modes: ["cpu"],
+        });
+      }
+      if (command === "test_start_run") return Promise.resolve("run-linux-nvenc");
+      return Promise.resolve(null);
+    });
+
+    render(<EncodeTestPage />);
+
+    expect(await screen.findByText(/PipeWire\/Linux capture/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /启动测试/ }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("test_start_run", {
+        scenarioId: "custom",
+        config: expect.objectContaining({
+          capture_type: "linux",
+          encoder_type: "nvenc_h264",
+          decoder_type: "none",
+          zero_copy: false,
+        }),
+      });
+    });
+  });
 });

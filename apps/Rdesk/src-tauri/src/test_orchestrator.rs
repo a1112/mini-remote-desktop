@@ -393,10 +393,22 @@ impl TestOrchestrator {
                 encoder: EncoderType::None,
                 decoder: DecoderType::None,
             }),
+            #[cfg(target_os = "linux")]
+            "capture.linux" => Ok(TestChain::Custom {
+                capture: CaptureType::Linux,
+                encoder: EncoderType::None,
+                decoder: DecoderType::None,
+            }),
             "e2e.local" => Ok(TestChain::NvencNvdec),
             "e2e.macos_local" => Ok(TestChain::Custom {
                 capture: CaptureType::Macos,
                 encoder: EncoderType::VideoToolboxH264,
+                decoder: DecoderType::Software,
+            }),
+            #[cfg(target_os = "linux")]
+            "e2e.linux_local" => Ok(TestChain::Custom {
+                capture: CaptureType::Linux,
+                encoder: EncoderType::OpenH264,
                 decoder: DecoderType::Software,
             }),
             "encode.nvenc_h264" => Ok(TestChain::NvencOnly),
@@ -417,6 +429,8 @@ impl TestOrchestrator {
                     "dxgi" => CaptureType::Dxgi,
                     "winrt" => CaptureType::Winrt,
                     "macos" => CaptureType::Macos,
+                    #[cfg(target_os = "linux")]
+                    "linux" => CaptureType::Linux,
                     "synthetic" => CaptureType::Synthetic,
                     other => anyhow::bail!("Unsupported capture for {}: {}", scenario_id, other),
                 },
@@ -529,6 +543,21 @@ impl TestOrchestrator {
                     ..Default::default()
                 },
             },
+            #[cfg(target_os = "linux")]
+            TestScenario {
+                scenario_id: "capture.linux".to_string(),
+                scenario_kind: ScenarioKind::Capture,
+                component_scope: vec!["linux_capture".to_string()],
+                display_name: "Linux 屏幕捕获测试".to_string(),
+                description: "测试 Linux 屏幕捕获性能和稳定性".to_string(),
+                supports_matrix: true,
+                default_config: TestConfigData {
+                    capture_type: Some("linux".to_string()),
+                    encoder_type: Some("none".to_string()),
+                    decoder_type: Some("none".to_string()),
+                    ..Default::default()
+                },
+            },
             TestScenario {
                 scenario_id: "encode.nvenc_h264".to_string(),
                 scenario_kind: ScenarioKind::Encode,
@@ -633,6 +662,31 @@ impl TestOrchestrator {
                     ..Default::default()
                 },
             },
+            #[cfg(target_os = "linux")]
+            TestScenario {
+                scenario_id: "e2e.linux_local".to_string(),
+                scenario_kind: ScenarioKind::E2eLocal,
+                component_scope: vec![
+                    "linux_capture".to_string(),
+                    "openh264".to_string(),
+                    "linux_render".to_string(),
+                ],
+                display_name: "Linux 本地端到端测试".to_string(),
+                description: "测试 Linux 采集→OpenH264 编码→软件解码→Linux 渲染流程"
+                    .to_string(),
+                supports_matrix: true,
+                default_config: TestConfigData {
+                    capture_type: Some("linux".to_string()),
+                    encoder_type: Some("openh264".to_string()),
+                    decoder_type: Some("software".to_string()),
+                    renderer_type: Some("linux".to_string()),
+                    render_display: Some(true),
+                    resolution: Some([1920, 1080]),
+                    fps: Some(60),
+                    bitrate: Some(5_000_000),
+                    ..Default::default()
+                },
+            },
             TestScenario {
                 scenario_id: "render.d3d12".to_string(),
                 scenario_kind: ScenarioKind::Render,
@@ -714,6 +768,21 @@ impl TestOrchestrator {
         #[cfg(windows)]
         {
             if mrd_encode_nvenc::NvencH264Encoder::new_max_speed(1920, 1080, 60).is_ok() {
+                available_encoders.push("nvenc_h264".to_string());
+            }
+            if mrd_encode_nvenc::NvencHevcEncoder::probe_hevc_available().is_ok() {
+                available_encoders.push("nvenc_hevc".to_string());
+            }
+            if mrd_encode_nvenc::NvencHevcEncoder::probe_hevc_main10_available().is_ok() {
+                available_encoders.push("nvenc_hevc_main10".to_string());
+            }
+            if mrd_encode_nvenc_av1::NvencAv1Encoder::probe_av1_available().is_ok() {
+                available_encoders.push("nvenc_av1".to_string());
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if mrd_encode_nvenc::NvencH264Encoder::probe_h264_available().is_ok() {
                 available_encoders.push("nvenc_h264".to_string());
             }
             if mrd_encode_nvenc::NvencHevcEncoder::probe_hevc_available().is_ok() {
@@ -2157,7 +2226,12 @@ fn current_platform_captures() -> Vec<&'static str> {
         return vec!["macos", "synthetic"];
     }
 
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        return vec!["linux", "synthetic"];
+    }
+
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         vec!["synthetic"]
     }
@@ -2174,7 +2248,12 @@ fn current_platform_renderers() -> Vec<&'static str> {
         return vec!["none", "macos", "webview"];
     }
 
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        return vec!["none", "linux", "webview"];
+    }
+
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         vec!["none", "webview"]
     }
@@ -2201,6 +2280,7 @@ fn scenario_supported_on_current_platform(scenario_id: &str) -> bool {
         "capture.macos" | "encode.videotoolbox_h264" | "e2e.macos_local" => {
             cfg!(target_os = "macos")
         }
+        "capture.linux" | "e2e.linux_local" => cfg!(target_os = "linux"),
         "decode.videotoolbox_h264" => cfg!(target_os = "macos") && videotoolbox_decoder_enabled(),
         "encode.openh264" | "custom" | "matrix" => true,
         _ => true,
@@ -2211,6 +2291,7 @@ fn capture_supported_on_current_platform(capture_type: &str) -> bool {
     matches!(capture_type, "synthetic")
         || matches!(capture_type, "dxgi" | "winrt") && cfg!(windows)
         || matches!(capture_type, "macos") && cfg!(target_os = "macos")
+        || matches!(capture_type, "linux") && cfg!(target_os = "linux")
 }
 
 fn encoder_supported_on_current_platform(encoder_type: &str) -> bool {
@@ -2232,7 +2313,7 @@ fn encoder_supported_on_current_platform(encoder_type: &str) -> bool {
             | "hevc"
             | "hevc_main10"
             | "hevc-main10"
-    ) && cfg!(windows)
+    ) && (cfg!(windows) || cfg!(target_os = "linux"))
         || matches!(encoder_type, "videotoolbox_h264" | "videotoolbox") && cfg!(target_os = "macos")
 }
 
@@ -2257,6 +2338,7 @@ fn renderer_supported_on_current_platform(renderer_type: &str) -> bool {
         || matches!(renderer_type, "d3d11") && cfg!(windows)
         || matches!(renderer_type, "d3d12" | "opengl") && cfg!(windows)
         || matches!(renderer_type, "macos" | "metal") && cfg!(target_os = "macos")
+        || matches!(renderer_type, "linux") && cfg!(target_os = "linux")
 }
 
 fn validate_scenario_for_current_platform(
@@ -2712,6 +2794,8 @@ fn harness_config_from_data(config: &TestConfigData) -> HarnessConfig {
         renderer: match (config.render_display, config.renderer_type.as_deref()) {
             (Some(true), Some("d3d11")) => Some(RendererType::D3d11),
             (Some(true), Some("macos")) | (Some(true), Some("metal")) => Some(RendererType::Macos),
+            #[cfg(target_os = "linux")]
+            (Some(true), Some("linux")) => Some(RendererType::Linux),
             _ => None,
         },
         renderer_target_hwnd: config.renderer_target_hwnd,

@@ -14,13 +14,17 @@ import { capabilityAvailable, chooseCapability } from "./capabilityMeta";
 
 function buildDefaultConfig(capabilities: EnvironmentSnapshot | null): TestConfig {
   const capture = chooseCapability(
-    ["macos", "dxgi", "synthetic"],
+    ["macos", "linux", "dxgi", "synthetic"],
     capabilities,
     "available_captures",
     "synthetic"
   );
   const encoder = chooseCapability(
-    capture === "macos" ? ["videotoolbox_h264", "openh264"] : ["nvenc_h264", "openh264"],
+    capture === "macos"
+      ? ["videotoolbox_h264", "openh264"]
+      : capture === "linux"
+        ? ["openh264"]
+        : ["nvenc_h264", "openh264"],
     capabilities,
     "available_encoders",
     "openh264"
@@ -32,7 +36,9 @@ function buildDefaultConfig(capabilities: EnvironmentSnapshot | null): TestConfi
       : "none";
   const renderer = capabilityAvailable(capabilities, "available_renderers", "macos")
     ? "macos"
-    : capabilityAvailable(capabilities, "available_renderers", "d3d11")
+    : capabilityAvailable(capabilities, "available_renderers", "linux")
+      ? "linux"
+      : capabilityAvailable(capabilities, "available_renderers", "d3d11")
       ? "d3d11"
       : undefined;
 
@@ -134,8 +140,14 @@ export function E2ETestPage() {
   }, [isRunning]);
 
   const handleStart = async () => {
+    const scenarioId =
+      currentConfig.capture_type === "linux"
+        ? "e2e.linux_local"
+        : currentConfig.capture_type === "macos"
+          ? "e2e.macos_local"
+          : "e2e.local";
     const result = await commands.testStartRun({
-      scenarioId: "e2e.local",
+      scenarioId,
       config: currentConfig,
     });
 

@@ -7,10 +7,9 @@ use mrd_ipc::{
     CaptureSource, CaptureSourceSelection, LanDiscoverySnapshot, LanPeerInfo, MediaProfile,
     MediaProfileNegotiation,
 };
-#[cfg(any(test, target_os = "macos"))]
-use mrd_pipeline_core::FrameCapture;
 use mrd_pipeline_core::{
-    CapturedFrame, DecodedFrame, DecodedFrameData, FramePixelFormat, VideoDecoder, VideoEncoder,
+    CapturedFrame, DecodedFrame, DecodedFrameData, FrameCapture, FramePixelFormat, VideoDecoder,
+    VideoEncoder,
 };
 use mrd_proto::{DeviceId, SessionId};
 use mrd_transport_quic_quinn::{
@@ -1520,7 +1519,7 @@ async fn send_quic_media_loop(
 
         let source_id = selected_capture_source_id(&app_state, &session_id).await?;
         if active_source_id.as_deref() != Some(source_id.as_str()) {
-            capture = Some(create_lan_frame_capture(&source_id, &profile)?);
+            capture = Some(create_lan_frame_capture(&source_id, &profile).await?);
             encoder = None;
             encoder_config = None;
             active_source_id = Some(source_id);
@@ -1711,6 +1710,8 @@ enum LanFrameCapture {
     Winrt(mrd_capture_winrt::WinrtCapture),
     #[cfg(target_os = "macos")]
     Macos(mrd_capture_macos::MacosScreenCapture),
+    #[cfg(target_os = "linux")]
+    Pipewire(mrd_capture_pipewire::PipewireScreenCapture),
     #[cfg(test)]
     Synthetic(SyntheticFrameCapture),
 }
@@ -1726,8 +1727,14 @@ impl LanFrameCapture {
             LanFrameCapture::Macos(capture) => capture
                 .capture_frame()
                 .map_err(|error| anyhow::anyhow!(error.to_string())),
+            #[cfg(target_os = "linux")]
+            LanFrameCapture::Pipewire(capture) => capture
+                .capture_frame()
+                .map_err(|error| anyhow::anyhow!(error.to_string())),
             #[cfg(test)]
             LanFrameCapture::Synthetic(capture) => Ok(capture.capture_frame()?),
+            #[cfg(not(any(windows, target_os = "macos", target_os = "linux", test)))]
+            _ => anyhow::bail!("Frame capture not supported on this platform"),
         }
     }
 }
@@ -1828,9 +1835,12 @@ async fn selected_capture_source_id(
     }
 }
 
-fn create_lan_frame_capture(source_id: &str, _profile: &MediaProfile) -> Result<LanFrameCapture> {
+async fn create_lan_frame_capture(
+    _source_id: &str,
+    _profile: &MediaProfile,
+) -> Result<LanFrameCapture> {
     #[cfg(test)]
-    if source_id == TEST_SYNTHETIC_CAPTURE_SOURCE_ID {
+    if _source_id == TEST_SYNTHETIC_CAPTURE_SOURCE_ID {
         return Ok(LanFrameCapture::Synthetic(SyntheticFrameCapture::new(
             _profile,
         )));
@@ -1850,9 +1860,18 @@ fn create_lan_frame_capture(source_id: &str, _profile: &MediaProfile) -> Result<
         ));
     }
 
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(target_os = "linux")]
     {
-        anyhow::bail!("remote desktop capture is currently only available on Windows and macOS")
+        return Ok(LanFrameCapture::Pipewire(
+            crate::capture_source::create_frame_capture_async(_source_id).await?,
+        ));
+    }
+
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    {
+        anyhow::bail!(
+            "remote desktop capture is currently only available on Windows, macOS, and Linux"
+        )
     }
 }
 

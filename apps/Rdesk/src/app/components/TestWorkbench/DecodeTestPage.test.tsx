@@ -19,6 +19,61 @@ function mockCapabilities() {
 }
 
 describe("DecodeTestPage backend contract", () => {
+  it("uses a Linux-compatible rendererless software decode path on Linux", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve({
+          os_type: "linux",
+          cpu_brand: "test",
+          cpu_cores: 12,
+          memory_gb: 32,
+          gpu_info: "Mesa",
+          available_captures: ["synthetic", "linux"],
+          available_encoders: ["openh264"],
+          available_decoders: ["software"],
+          available_renderers: ["linux"],
+          available_memory_modes: ["cpu"],
+        });
+      }
+      if (command === "test_start_run") return Promise.resolve("run-linux-software");
+      return Promise.resolve(null);
+    });
+
+    render(<DecodeTestPage />);
+
+    const startButton = await screen.findByRole("button", { name: /启动测试/ });
+    await waitFor(() => expect(startButton).not.toBeDisabled());
+    fireEvent.click(startButton);
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_start_run",
+        expect.objectContaining({
+          scenarioId: "custom",
+          config: expect.objectContaining({
+            capture_type: "synthetic",
+            encoder_type: "openh264",
+            decoder_type: "software",
+            render_display: false,
+          }),
+        })
+      );
+    });
+
+    const startCall = mockInvoke.mock.calls.find(([command]) => command === "test_start_run");
+    expect(startCall?.[1]).toMatchObject({
+      scenarioId: "custom",
+      config: expect.objectContaining({
+        capture_type: "synthetic",
+        encoder_type: "openh264",
+        decoder_type: "software",
+        render_display: false,
+      }),
+    });
+    expect((startCall?.[1] as { config?: { renderer_type?: string } } | undefined)?.config?.renderer_type).toBeUndefined();
+  });
+
   it("starts NVDEC with an explicit 2K 144Hz decode profile", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {

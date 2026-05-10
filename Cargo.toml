@@ -7,6 +7,7 @@ members = [
   "common-control-proto",
   "crates/mrd-capture-dxgi",
   "crates/mrd-capture-macos",
+  "crates/mrd-capture-pipewire",
   "crates/mrd-capture-winrt",
   "crates/mrd-codec-videotoolbox",
   "crates/mrd-decode",
@@ -21,6 +22,7 @@ members = [
   "crates/mrd-proto",
   "crates/mrd-render",
   "crates/mrd-render-d3d11",
+  "crates/mrd-render-linux",
   "crates/mrd-render-macos",
   "crates/mrd-session",
   "crates/mrd-signal-client",
@@ -69,6 +71,9 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package.mrd-render-macos]
+opt-level = 3
+
+[profile.dev.package.mrd-render-linux]
 opt-level = 3
 
 [profile.dev.package.openh264]

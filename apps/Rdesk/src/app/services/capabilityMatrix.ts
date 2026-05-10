@@ -1,4 +1,8 @@
-import type { EnvironmentSnapshot, ProbeSnapshot } from "../adapters/tauri";
+import type {
+  CapabilitySnapshot as IpcCapabilitySnapshot,
+  EnvironmentSnapshot,
+  ProbeSnapshot,
+} from "../adapters/tauri";
 
 export type CapabilityStatus =
   | "supported"
@@ -34,11 +38,6 @@ export type CapabilityPlatform =
   | "web"
   | "unknown";
 
-export interface CapabilityRequirement {
-  id: string;
-  reason?: string;
-}
-
 export interface CapabilityItem {
   id: string;
   domain: CapabilityDomain;
@@ -47,7 +46,7 @@ export interface CapabilityItem {
   platform: CapabilityPlatform;
   reason?: string;
   detail?: string;
-  requires?: CapabilityRequirement[];
+  requires?: string[];
   conflicts_with?: string[];
   depends_on?: string[];
   fallback_ids?: string[];
@@ -68,7 +67,7 @@ export interface CapabilityProfile {
   height: number;
   fps: number;
   bitrate_mbps: number;
-  codec: "h264" | "hevc" | "av1";
+  codec: string;
   latency_budget_ms?: number;
   min_stable_fps_ratio?: number;
   max_drop_ratio?: number;
@@ -109,10 +108,12 @@ export interface CapabilityEvaluation {
 export interface CapabilitySnapshot {
   schema_version: 1;
   platform: CapabilityPlatform;
+  service_version?: string;
   capabilities: CapabilityItem[];
   constraints: CapabilityConstraint[];
   profiles: CapabilityProfile[];
   recent_profile_results: ProfileProbeResult[];
+  updated_at_ms?: number;
 }
 
 type LegacyCapabilityKey =
@@ -133,16 +134,20 @@ const LEGACY_DOMAIN_BY_KEY: Record<LegacyCapabilityKey, CapabilityDomain> = {
 const KNOWN_STATUS_BY_ID: Record<string, CapabilityStatus> = {
   "capture.dxgi": "available",
   "capture.winrt": "available",
+  "capture.macos": "available",
+  "capture.linux": "available",
   "capture.synthetic": "available",
   "encode.nvenc_h264": "available",
   "encode.nvenc_hevc": "available",
   "encode.nvenc_hevc_main10": "available",
   "encode.nvenc_av1": "available",
   "encode.openh264": "degraded",
+  "encode.videotoolbox_h264": "available",
   "decode.nvdec": "available",
   "decode.software": "degraded",
   "decode.videotoolbox": "available",
   "render.d3d11": "available",
+  "render.linux": "available",
   "render.macos": "available",
   "render.webview": "degraded",
   "memory.cpu": "available",
@@ -156,6 +161,27 @@ const DOMAIN_BASELINE_ITEMS: Array<Omit<CapabilityItem, "platform">> = [
     label: "Shared display capture source",
     status: "unknown",
     reason: "Requires remote source enumeration",
+  },
+  {
+    id: "transport.loopback",
+    domain: "transport",
+    label: "In-process loopback transport",
+    status: "available",
+    reason: "Local harness transport is available without peer discovery",
+  },
+  {
+    id: "transport.webrtc",
+    domain: "transport",
+    label: "WebRTC RTP media transport",
+    status: "available",
+    reason: "Local harness WebRTC RTP path is available",
+  },
+  {
+    id: "transport.quic",
+    domain: "transport",
+    label: "QUIC media transport",
+    status: "available",
+    reason: "Local harness QUIC path is available",
   },
   {
     id: "transport.quic_datagram",
@@ -287,6 +313,55 @@ export function buildCapabilitySnapshotFromEnvironment(
   };
 }
 
+export function buildCapabilitySnapshotFromIpc(snapshot: IpcCapabilitySnapshot): CapabilitySnapshot {
+  const platform = normalizePlatformValue(snapshot.platform);
+  return {
+    schema_version: 1,
+    platform,
+    service_version: snapshot.service_version,
+    capabilities: snapshot.capabilities.map((item) => ({
+      id: item.id,
+      domain: normalizeDomainValue(item.domain),
+      label: item.label,
+      status: normalizeStatusValue(item.status),
+      platform: normalizePlatformValue(item.platform),
+      ...(item.reason ? { reason: item.reason } : {}),
+      ...(item.detail ? { detail: item.detail } : {}),
+      ...(item.requires?.length ? { requires: item.requires } : {}),
+      ...(item.conflicts_with?.length ? { conflicts_with: item.conflicts_with } : {}),
+      ...(item.depends_on?.length ? { depends_on: item.depends_on } : {}),
+      ...(item.fallback_ids?.length ? { fallback_ids: item.fallback_ids } : {}),
+      ...(item.last_probe_time_ms ? { last_probe_time_ms: item.last_probe_time_ms } : {}),
+    })),
+    constraints: snapshot.constraints.map((constraint) => ({
+      id: constraint.id,
+      applies_to: constraint.applies_to,
+      status: normalizeConstraintStatusValue(constraint.status),
+      reason: constraint.reason,
+      ...(constraint.fallback_ids?.length ? { fallback_ids: constraint.fallback_ids } : {}),
+    })),
+    profiles:
+      snapshot.profiles.length > 0
+        ? snapshot.profiles.map((profile) => ({
+            id: profile.id,
+            width: profile.width,
+            height: profile.height,
+            fps: profile.fps,
+            bitrate_mbps: profile.bitrate_mbps,
+            codec: profile.codec,
+            ...(profile.latency_budget_ms ? { latency_budget_ms: profile.latency_budget_ms } : {}),
+            ...(profile.min_stable_fps_ratio
+              ? { min_stable_fps_ratio: profile.min_stable_fps_ratio }
+              : {}),
+            ...(profile.max_drop_ratio ? { max_drop_ratio: profile.max_drop_ratio } : {}),
+            required_capabilities: profile.required_capabilities,
+          }))
+        : BUILTIN_CAPABILITY_PROFILES,
+    recent_profile_results: [],
+    updated_at_ms: snapshot.updated_at_ms,
+  };
+}
+
 export function evaluateCapabilityCombination(
   request: CapabilityCombinationRequest,
   snapshot: CapabilitySnapshot
@@ -294,6 +369,28 @@ export function evaluateCapabilityCombination(
   const reasons: string[] = [];
   const requiredFallbacks: string[] = [];
   let status: CapabilityEvaluation["status"] = "ready";
+
+  for (const capabilityId of requestedCapabilityIds(request)) {
+    const capability = snapshot.capabilities.find((item) => item.id === capabilityId);
+    if (!capability) {
+      status = "blocked";
+      reasons.push(`Requested capability not exposed: ${capabilityId}`);
+      continue;
+    }
+
+    if (capability.status === "degraded") {
+      if (status !== "blocked") {
+        status = "degraded";
+      }
+      reasons.push(`Requested capability ${capabilityId} is degraded on this platform.`);
+      continue;
+    }
+
+    if (!isProfileCapabilityUsable(capability)) {
+      status = "blocked";
+      reasons.push(`Requested capability ${capabilityId} is ${capability.status}.`);
+    }
+  }
 
   if (
     request.encoder === "openh264" &&
@@ -341,7 +438,9 @@ export function evaluateProfileSupport(
   profileId: string,
   snapshot: CapabilitySnapshot
 ): CapabilityEvaluation {
-  const profile = getCapabilityProfile(profileId);
+  const profile =
+    snapshot.profiles.find((candidate) => candidate.id === profileId) ??
+    getCapabilityProfile(profileId);
   if (!profile) {
     return {
       status: "blocked",
@@ -350,15 +449,33 @@ export function evaluateProfileSupport(
     };
   }
 
-  const reasons = profile.required_capabilities.flatMap((capabilityId) => {
+  const reasons: string[] = [];
+  let status: CapabilityEvaluation["status"] = "ready";
+
+  for (const capabilityId of profile.required_capabilities) {
     const capability = snapshot.capabilities.find((item) => item.id === capabilityId);
-    if (capability && isProfileCapabilityUsable(capability)) return [];
-    const suffix = capability?.status ? ` (${capability.status})` : "";
-    return [`Missing required capability: ${capabilityId}${suffix}`];
-  });
+    if (!capability) {
+      status = "blocked";
+      reasons.push(`Missing required capability: ${capabilityId}`);
+      continue;
+    }
+
+    if (capability.status === "degraded") {
+      if (status !== "blocked") {
+        status = "degraded";
+      }
+      reasons.push(`Required capability ${capabilityId} is degraded on this platform.`);
+      continue;
+    }
+
+    if (!isProfileCapabilityUsable(capability)) {
+      status = "blocked";
+      reasons.push(`Missing required capability: ${capabilityId} (${capability.status})`);
+    }
+  }
 
   return {
-    status: reasons.length > 0 ? "blocked" : "ready",
+    status,
     reasons,
     requiredFallbacks: [],
   };
@@ -431,6 +548,23 @@ function formatProfile(profile: CapabilityProfile): string {
   return `${profile.width}x${profile.height} @ ${profile.fps} FPS / ${profile.bitrate_mbps} Mbps`;
 }
 
+function requestedCapabilityIds(request: CapabilityCombinationRequest): string[] {
+  const ids: string[] = [];
+
+  if (request.capture) ids.push(`capture.${request.capture}`);
+  if (request.encoder) ids.push(`encode.${request.encoder}`);
+  if (request.decoder && request.decoder !== "none") ids.push(`decode.${request.decoder}`);
+  if (request.renderer && request.renderer !== "none") {
+    ids.push(
+      request.renderer === "d3d12_native" ? "render.d3d12_native" : `render.${request.renderer}`
+    );
+  }
+  if (request.memory) ids.push(`memory.${request.memory}`);
+  if (request.transport) ids.push(`transport.${request.transport}`);
+
+  return ids;
+}
+
 function buildLegacyCapabilities(
   environment: EnvironmentSnapshot,
   platform: CapabilityPlatform
@@ -474,4 +608,55 @@ function normalizePlatform(osType: string | undefined): CapabilityPlatform {
   if (normalized.includes("ios")) return "ios";
   if (normalized.includes("web")) return "web";
   return "unknown";
+}
+
+function normalizePlatformValue(value: string | undefined): CapabilityPlatform {
+  return normalizePlatform(value);
+}
+
+function normalizeDomainValue(value: string): CapabilityDomain {
+  return isCapabilityDomain(value) ? value : "service";
+}
+
+function normalizeStatusValue(value: string): CapabilityStatus {
+  return isCapabilityStatus(value) ? value : "unknown";
+}
+
+function normalizeConstraintStatusValue(value: string): CapabilityConstraint["status"] {
+  return isCapabilityConstraintStatus(value) ? value : "requires_probe";
+}
+
+function isCapabilityDomain(value: string): value is CapabilityDomain {
+  return [
+    "capture",
+    "capture_source",
+    "encode",
+    "decode",
+    "render",
+    "memory",
+    "transport",
+    "control",
+    "audio",
+    "service",
+    "security",
+  ].includes(value);
+}
+
+function isCapabilityStatus(value: string): value is CapabilityStatus {
+  return [
+    "supported",
+    "available",
+    "usable",
+    "degraded",
+    "permission_missing",
+    "driver_missing",
+    "hardware_missing",
+    "unimplemented",
+    "unsupported",
+    "unknown",
+  ].includes(value);
+}
+
+function isCapabilityConstraintStatus(value: string): value is CapabilityConstraint["status"] {
+  return ["allow", "block", "degrade", "requires_copy", "requires_probe"].includes(value);
 }

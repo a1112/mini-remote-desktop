@@ -2,7 +2,9 @@
 // Verify serialization/deserialization of all IPC messages
 
 use mrd_ipc::{
-    CaptureSource, CaptureSourceSelection, DeviceInfo, IpcRequest, IpcResponse, MediaProfile,
+    CapabilityConstraint, CapabilityConstraintStatus, CapabilityDomain, CapabilityItem,
+    CapabilityPlatform, CapabilityProfile, CapabilitySnapshot, CapabilityStatus, CaptureSource,
+    CaptureSourceSelection, DeviceInfo, IpcRequest, IpcResponse, MediaProfile,
     MediaProfileNegotiation, SessionBootstrap, SessionRuntimeSnapshot,
 };
 use mrd_proto::{DeviceId, SessionId};
@@ -40,6 +42,54 @@ fn test_capture_source() -> CaptureSource {
         preview_data_url: Some("data:image/png;base64,AAAA".to_string()),
         preview_width: Some(320),
         preview_height: Some(180),
+    }
+}
+
+fn test_capability_snapshot() -> CapabilitySnapshot {
+    CapabilitySnapshot {
+        schema_version: 1,
+        platform: CapabilityPlatform::Windows,
+        service_version: "0.1.0".to_string(),
+        capabilities: vec![CapabilityItem {
+            id: "transport.quic_datagram".to_string(),
+            domain: CapabilityDomain::Transport,
+            label: "QUIC datagram media".to_string(),
+            status: CapabilityStatus::Available,
+            platform: CapabilityPlatform::Windows,
+            reason: None,
+            detail: None,
+            requires: Vec::new(),
+            conflicts_with: Vec::new(),
+            depends_on: Vec::new(),
+            fallback_ids: Vec::new(),
+            last_probe_time_ms: Some(1_700_000_000_000),
+        }],
+        constraints: vec![CapabilityConstraint {
+            id: "openh264_requires_cpu_input".to_string(),
+            applies_to: vec![
+                "encode.openh264".to_string(),
+                "memory.d3d11_shared".to_string(),
+            ],
+            status: CapabilityConstraintStatus::Block,
+            reason: "OpenH264 requires CPU-backed input".to_string(),
+            fallback_ids: vec!["memory.cpu".to_string()],
+        }],
+        profiles: vec![CapabilityProfile {
+            id: "lan.2k144".to_string(),
+            width: 2560,
+            height: 1440,
+            fps: 144,
+            bitrate_mbps: 64,
+            codec: "h264".to_string(),
+            latency_budget_ms: None,
+            min_stable_fps_ratio: Some(0.8),
+            max_drop_ratio: Some(0.02),
+            required_capabilities: vec![
+                "transport.quic_datagram".to_string(),
+                "transport.media_profile_control_v1".to_string(),
+            ],
+        }],
+        updated_at_ms: 1_700_000_000_000,
     }
 }
 
@@ -199,6 +249,17 @@ fn serialize_deserialize_session_runtime_snapshot_request() {
 }
 
 #[test]
+fn serialize_deserialize_capability_snapshot_request() {
+    let request = IpcRequest::CapabilitySnapshot;
+
+    let json = serde_json::to_string(&request).unwrap();
+    assert!(json.contains("CapabilitySnapshot"));
+    let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(request, deserialized);
+}
+
+#[test]
 fn serialize_deserialize_device_registered_response() {
     let response = IpcResponse::DeviceRegistered {
         device_id: test_device_id(),
@@ -247,6 +308,21 @@ fn serialize_deserialize_session_snapshot_response() {
     };
 
     let json = serde_json::to_string(&response).unwrap();
+    let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(response, deserialized);
+}
+
+#[test]
+fn serialize_deserialize_capability_snapshot_response() {
+    let response = IpcResponse::CapabilitySnapshot {
+        snapshot: test_capability_snapshot(),
+    };
+
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("lan.2k144"));
+    assert!(json.contains("transport.quic_datagram"));
+    assert!(json.contains("\"platform\":\"windows\""));
     let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
 
     assert_eq!(response, deserialized);

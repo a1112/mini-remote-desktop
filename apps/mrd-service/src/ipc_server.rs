@@ -250,6 +250,10 @@ impl IpcServer {
                 }
             }
 
+            IpcRequest::CapabilitySnapshot => IpcResponse::CapabilitySnapshot {
+                snapshot: crate::capabilities::local_capability_snapshot(),
+            },
+
             IpcRequest::ServiceHealth => IpcResponse::ServiceHealth {
                 status: mrd_ipc::ServiceStatus {
                     running: true,
@@ -703,6 +707,29 @@ mod tests {
                 assert_eq!(snapshot.device_id, Some(device_id));
             }
             _ => panic!("Expected RuntimeSnapshot response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn capability_snapshot_reports_structured_capabilities() {
+        let app_state = Arc::new(AppState::new());
+        let server = IpcServer::new(app_state);
+
+        let response = server.handle_request(IpcRequest::CapabilitySnapshot).await;
+
+        match response {
+            IpcResponse::CapabilitySnapshot { snapshot } => {
+                assert_eq!(snapshot.schema_version, 1);
+                assert!(snapshot
+                    .capabilities
+                    .iter()
+                    .any(|item| item.id == "transport.quic_datagram"));
+                assert!(snapshot
+                    .profiles
+                    .iter()
+                    .any(|profile| profile.id == "lan.2k144"));
+            }
+            _ => panic!("Expected CapabilitySnapshot response"),
         }
     }
 }

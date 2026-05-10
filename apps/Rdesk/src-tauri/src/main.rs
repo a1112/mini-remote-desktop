@@ -1325,6 +1325,24 @@ async fn ipc_runtime_snapshot() -> Result<mrd_ipc::RuntimeSnapshot, String> {
     }
 }
 
+/// Get structured local capability snapshot via IPC.
+#[tauri::command]
+async fn ipc_capability_snapshot() -> Result<mrd_ipc::CapabilitySnapshot, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::CapabilitySnapshot)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::CapabilitySnapshot { snapshot } => Ok(snapshot),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
 /// Service health check via IPC (migrated version)
 #[tauri::command]
 async fn ipc_service_health() -> Result<mrd_ipc::ServiceStatus, String> {
@@ -1520,6 +1538,8 @@ fn test_harness_set_custom(
         "dxgi" => CaptureType::Dxgi,
         "winrt" => CaptureType::Winrt,
         "macos" => CaptureType::Macos,
+        #[cfg(target_os = "linux")]
+        "linux" => CaptureType::Linux,
         "synthetic" => CaptureType::Synthetic,
         _ => return Err(format!("Unsupported capture type: {}", capture)),
     };
@@ -1563,6 +1583,8 @@ fn test_harness_get_chain(state: tauri::State<'_, AppState>) -> String {
         TestChain::NvencNvdec => "nvenc_nvdec".to_string(),
         TestChain::NvencOnly => "nvenc_only".to_string(),
         TestChain::OpenH264 => "openh264".to_string(),
+        #[cfg(target_os = "linux")]
+        TestChain::LinuxOpenh264 => "linux_openh264".to_string(),
         TestChain::Custom { .. } => "custom".to_string(),
     }
 }
@@ -1880,17 +1902,11 @@ fn request_app_exit(app: &AppHandle, reason: &'static str) {
 }
 
 fn setup_system_tray(app: &AppHandle) -> tauri::Result<()> {
-    let show_item = MenuItem::with_id(app, TRAY_MENU_SHOW_ID, "Show Rdesk", true, None::<&str>)?;
-    let hide_item = MenuItem::with_id(app, TRAY_MENU_HIDE_ID, "Hide to Tray", true, None::<&str>)?;
-    let center_item = MenuItem::with_id(
-        app,
-        TRAY_MENU_CENTER_ID,
-        "Center Window",
-        true,
-        None::<&str>,
-    )?;
+    let show_item = MenuItem::with_id(app, TRAY_MENU_SHOW_ID, "显示主窗口", true, None::<&str>)?;
+    let hide_item = MenuItem::with_id(app, TRAY_MENU_HIDE_ID, "隐藏到托盘", true, None::<&str>)?;
+    let center_item = MenuItem::with_id(app, TRAY_MENU_CENTER_ID, "居中窗口", true, None::<&str>)?;
     let separator = PredefinedMenuItem::separator(app)?;
-    let quit_item = MenuItem::with_id(app, TRAY_MENU_QUIT_ID, "Quit Rdesk", true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, TRAY_MENU_QUIT_ID, "退出 Rdesk", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
         &[&show_item, &hide_item, &center_item, &separator, &quit_item],
@@ -1907,7 +1923,7 @@ fn setup_system_tray(app: &AppHandle) -> tauri::Result<()> {
         .icon(icon)
         .tooltip("Rdesk")
         .menu(&menu)
-        .show_menu_on_left_click(false)
+        .show_menu_on_left_click(true)
         .build(app)?;
 
     Ok(())
@@ -2290,6 +2306,7 @@ fn main() {
             ipc_recover_session,
             ipc_session_snapshot,
             ipc_runtime_snapshot,
+            ipc_capability_snapshot,
             ipc_service_health,
             ipc_probe_snapshot,
             ipc_start_sender,

@@ -7,6 +7,8 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 mrd-pipeline-core = { path = "../mrd-pipeline-core" }
+
+[target.'cfg(windows)'.dependencies]
 nvenc = "0.1"
 windows = { version = "0.62", features = [
   "Win32_Foundation",

@@ -26,6 +26,7 @@ export type ComponentScope =
   | "dxgi"
   | "winrt"
   | "macos_capture"
+  | "linux_capture"
   | "nvenc"
   | "openh264"
   | "videotoolbox"
@@ -33,6 +34,7 @@ export type ComponentScope =
   | "software_decode"
   | "d3d11_render"
   | "metal_render"
+  | "linux_render"
   | "quic"
   | "webrtc";
 
@@ -87,7 +89,7 @@ export type TestStage =
  */
 export interface TestConfig {
   // Component selection
-  capture_type?: "dxgi" | "winrt" | "macos" | "synthetic";
+  capture_type?: "dxgi" | "winrt" | "macos" | "linux" | "synthetic";
   encoder_type?:
     | "none"
     | "nvenc_h264"
@@ -97,7 +99,7 @@ export interface TestConfig {
     | "openh264"
     | "videotoolbox_h264";
   decoder_type?: "none" | "nvdec" | "software" | "videotoolbox";
-  renderer_type?: "d3d11" | "d3d12" | "opengl" | "macos" | "webview";
+  renderer_type?: "d3d11" | "d3d12" | "opengl" | "macos" | "linux" | "webview";
   render_display?: boolean;
   renderer_target_hwnd?: string;
   zero_copy?: boolean;
@@ -416,6 +418,93 @@ export interface LanDiscoverySnapshot {
   peers: LanPeerInfo[];
 }
 
+export type CapabilityPlatform =
+  | "windows"
+  | "macos"
+  | "linux"
+  | "android"
+  | "ios"
+  | "web"
+  | "unknown";
+
+export type CapabilityDomain =
+  | "capture"
+  | "capture_source"
+  | "encode"
+  | "decode"
+  | "render"
+  | "memory"
+  | "transport"
+  | "control"
+  | "audio"
+  | "service"
+  | "security";
+
+export type CapabilityStatus =
+  | "supported"
+  | "available"
+  | "usable"
+  | "degraded"
+  | "permission_missing"
+  | "driver_missing"
+  | "hardware_missing"
+  | "unimplemented"
+  | "unsupported"
+  | "unknown";
+
+export interface CapabilityItem {
+  id: string;
+  domain: CapabilityDomain;
+  label: string;
+  status: CapabilityStatus;
+  platform: CapabilityPlatform;
+  reason?: string | null;
+  detail?: string | null;
+  requires?: string[];
+  conflicts_with?: string[];
+  depends_on?: string[];
+  fallback_ids?: string[];
+  last_probe_time_ms?: number | null;
+}
+
+export type CapabilityConstraintStatus =
+  | "allow"
+  | "block"
+  | "degrade"
+  | "requires_copy"
+  | "requires_probe";
+
+export interface CapabilityConstraint {
+  id: string;
+  applies_to: string[];
+  status: CapabilityConstraintStatus;
+  reason: string;
+  fallback_ids?: string[];
+}
+
+export interface CapabilityProfile {
+  id: string;
+  width: number;
+  height: number;
+  fps: number;
+  bitrate_mbps: number;
+  codec: "h264" | "hevc" | "av1" | string;
+  latency_budget_ms?: number | null;
+  min_stable_fps_ratio?: number | null;
+  max_drop_ratio?: number | null;
+  required_capabilities: string[];
+}
+
+export interface CapabilitySnapshot {
+  schema_version: number;
+  platform: CapabilityPlatform;
+  service_version: string;
+  capabilities: CapabilityItem[];
+  constraints: CapabilityConstraint[];
+  profiles: CapabilityProfile[];
+  updated_at_ms: number;
+}
+
 export interface DeviceRegistrationResponse {
   device_id: string;
   device_name: string;
@@ -591,7 +680,7 @@ export interface DecodePolicyResponse {
 /**
  * Test harness types - end-to-end pipeline visualization
  */
-export type TestChain = "capture_only" | "nvenc_nvdec" | "nvenc_only" | "openh264" | "custom";
+export type TestChain = "capture_only" | "nvenc_nvdec" | "nvenc_only" | "openh264" | "linux_openh264" | "custom";
 
 export interface TestChainOption {
   value: TestChain;
@@ -602,7 +691,7 @@ export interface TestChainOption {
 /**
  * Test matrix configuration for custom pipeline setups
  */
-export type CaptureType = 'dxgi' | 'winrt' | 'macos' | 'synthetic';
+export type CaptureType = 'dxgi' | 'winrt' | 'macos' | 'linux' | 'synthetic';
 export type EncoderType =
   | 'none'
   | 'nvenc_h264'
@@ -618,7 +707,7 @@ export interface TestMatrixConfig {
   encoder: EncoderType;
   decoder: DecoderType;
   transport?: "loopback" | "quic" | "webrtc";
-  renderer?: "none" | "d3d11" | "macos";
+  renderer?: "none" | "d3d11" | "macos" | "linux";
   zero_copy?: boolean;
   resolution?: [number, number];
   fps?: number;

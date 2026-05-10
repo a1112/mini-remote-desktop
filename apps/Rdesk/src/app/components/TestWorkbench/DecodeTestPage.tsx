@@ -153,7 +153,11 @@ function codecSupportedByDecoder(codec: DecodeCodec, decoder: DecoderType): bool
 
 function hasCapability(
   capabilities: EnvironmentSnapshot | null,
-  key: "available_captures" | "available_encoders" | "available_decoders",
+  key:
+    | "available_captures"
+    | "available_encoders"
+    | "available_decoders"
+    | "available_renderers",
   value: string
 ): boolean {
   if (!capabilities) return false;
@@ -174,7 +178,6 @@ function buildDecodeRun(
     bitrate: profile.bitrate,
     duration_ms: 30_000,
     transport_kind: "loopback" as const,
-    renderer_type: "d3d11" as const,
     render_display: false,
     visual_preview: false,
   };
@@ -187,7 +190,6 @@ function buildDecodeRun(
         capture_type: "synthetic",
         encoder_type: "openh264",
         decoder_type: "software",
-        renderer_type: "d3d11",
         zero_copy: false,
       },
     };
@@ -240,6 +242,9 @@ function missingChainCapability(
   }
   if (config.decoder_type && !hasCapability(capabilities, "available_decoders", config.decoder_type)) {
     return config.decoder_type;
+  }
+  if (config.renderer_type && !hasCapability(capabilities, "available_renderers", config.renderer_type)) {
+    return config.renderer_type;
   }
   return null;
 }

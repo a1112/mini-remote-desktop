@@ -57,6 +57,7 @@ import { isTauriRuntime } from "../utils/runtime";
 import { withTauriWindow } from "../utils/tauriWindow";
 
 type RenderMode = "web" | "d3d11_native" | "d3d12_native" | "metal_native";
+type HostOs = "macos" | "windows" | "linux" | "other";
 type TransportKind = NonNullable<TestMatrixConfig["transport"]>;
 type ResolutionKey = "1280x720" | "1920x1080" | "2560x1440" | "2560x1600" | "3440x1440";
 type FpsKey = "30" | "60" | "120" | "144";
@@ -79,6 +80,7 @@ const captureOptions: Option<CaptureType>[] = [
   { value: "dxgi", label: "DXGI" },
   { value: "winrt", label: "WinRT" },
   { value: "macos", label: "macOS" },
+  { value: "linux", label: "Linux" },
   { value: "synthetic", label: "Synthetic" },
 ];
 
@@ -182,10 +184,11 @@ function defaultNativeRenderMode(): RenderMode {
   return browserLooksLikeMacos() ? "metal_native" : "d3d11_native";
 }
 
-function normalizeOs(osType?: string): "macos" | "windows" | "other" {
+function normalizeOs(osType?: string): HostOs {
   const os = osType?.toLowerCase() ?? "";
   if (os.includes("mac")) return "macos";
   if (os.includes("win")) return "windows";
+  if (os.includes("linux")) return "linux";
   return "other";
 }
 
@@ -249,7 +252,7 @@ function resolveLocalWebViewPlan({
   fps,
 }: {
   capabilities: EnvironmentSnapshot | null;
-  hostOs: "macos" | "windows" | "other";
+  hostOs: HostOs;
   capture: CaptureType;
   encoder: EncoderType;
   decoder: DecoderType;
@@ -261,6 +264,8 @@ function resolveLocalWebViewPlan({
       ? ["macos", "synthetic"]
       : hostOs === "windows"
         ? ["dxgi", "winrt", "synthetic"]
+        : hostOs === "linux"
+          ? ["linux", "synthetic"]
         : ["synthetic"];
   const nextCapture = pickCapability(
     uniqueValues([capture, ...captureDefaults]),
@@ -488,7 +493,8 @@ export function RemoteDisplayWindowPage() {
         ? "d3d11"
         : null;
   const isNative = nativeRendererType !== null;
-  const nativeRendererTypeForHost = hostOs === "macos" ? "macos" : "d3d11";
+  const nativeRendererTypeForHost =
+    hostOs === "macos" ? "macos" : hostOs === "linux" ? "linux" : "d3d11";
   const currentNativeRendererAvailable =
     isTauriRuntime() &&
     (!capabilities
@@ -548,10 +554,17 @@ export function RemoteDisplayWindowPage() {
       ? "Metal native"
       : renderMode === "d3d12_native"
         ? "DX12 native"
-      : renderMode === "d3d11_native"
-        ? "D3D11 native"
-        : "Web View";
-  const nativeRenderLabel = hostOs === "macos" ? "Metal native" : "DX11 native";
+        : renderMode === "d3d11_native"
+          ? hostOs === "linux"
+            ? "Linux native"
+            : "D3D11 native"
+          : "Web View";
+  const nativeRenderLabel =
+    hostOs === "macos"
+      ? "Metal native"
+      : hostOs === "linux"
+        ? "Linux native"
+        : "DX11 native";
   const remoteFramesReceived = probeSnapshot?.frames_received ?? 0;
   const remoteFramesDecoded = probeSnapshot?.frames_decoded ?? 0;
   const remoteFrameDataUrl = probeSnapshot?.latest_frame_data_url ?? null;
@@ -722,6 +735,20 @@ export function RemoteDisplayWindowPage() {
         pickAvailable(value, capabilities.available_decoders, ["nvdec", "software", "none"], "nvdec")
       );
       setRenderMode((value) => (value === "metal_native" ? "d3d11_native" : value));
+      return;
+    }
+
+    if (os === "linux") {
+      setCapture((value) =>
+        pickAvailable(value, capabilities.available_captures, ["linux", "synthetic"], "linux")
+      );
+      setEncoder((value) =>
+        pickAvailable(value, capabilities.available_encoders, ["openh264"], "openh264")
+      );
+      setDecoder((value) =>
+        pickAvailable(value, capabilities.available_decoders, ["software", "none"], "software")
+      );
+      setRenderMode("web");
       return;
     }
 
@@ -1215,6 +1242,18 @@ export function RemoteDisplayWindowPage() {
           ? "metal_native"
           : "web"
       );
+      return;
+    }
+
+    if (hostOs === "linux") {
+      setCapture("linux");
+      setEncoder("openh264");
+      setDecoder("software");
+      setTransport("quic");
+      setResolution("1920x1080");
+      setFps("60");
+      setBitrate("20");
+      setRenderMode("web");
       return;
     }
 

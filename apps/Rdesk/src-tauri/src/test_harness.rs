@@ -9,13 +9,15 @@ use mrd_capture_dxgi::DxgiDesktopCapture;
 use mrd_capture_dxgi::DxgiSharedTextureCapture;
 #[cfg(target_os = "macos")]
 use mrd_capture_macos::MacosScreenCapture;
+#[cfg(target_os = "linux")]
+use mrd_capture_pipewire::PipewireScreenCapture;
 #[cfg(windows)]
 use mrd_capture_winrt::WinrtCapture;
 #[cfg(target_os = "macos")]
 use mrd_codec_videotoolbox::{VideoToolboxH264Decoder, VideoToolboxH264Encoder};
 use mrd_decode_nvdec::{NvdecDecoder, NvdecOutputMode};
 use mrd_encode_nvenc::{NvencH264Encoder, NvencHevcEncoder};
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 use mrd_encode_nvenc_av1::NvencAv1Encoder;
 use mrd_encode_openh264::OpenH264Encoder;
 use mrd_observability::PipelineComparisonResult;
@@ -59,6 +61,11 @@ pub enum TestChain {
     #[serde(rename = "openh264")]
     OpenH264,
 
+    /// Linux capture + OpenH264 encode (Linux test)
+    #[cfg(target_os = "linux")]
+    #[serde(rename = "linux_openh264")]
+    LinuxOpenh264,
+
     /// Custom configuration with explicit parameters
     #[serde(rename = "custom")]
     Custom {
@@ -75,6 +82,8 @@ pub enum CaptureType {
     Dxgi,
     Winrt,
     Macos,
+    #[cfg(target_os = "linux")]
+    Linux,
     Synthetic,
 }
 
@@ -107,6 +116,8 @@ pub enum DecoderType {
 pub enum RendererType {
     D3d11,
     Macos,
+    #[cfg(target_os = "linux")]
+    Linux,
 }
 
 /// Available transport test paths for encoded access units.
@@ -157,6 +168,8 @@ impl TestChain {
             Self::NvencNvdec => "NVENC H.264 + NVDEC (全硬件加速)",
             Self::NvencOnly => "NVENC H.264 编码器测试",
             Self::OpenH264 => "OpenH264 编码器测试 (软件)",
+            #[cfg(target_os = "linux")]
+            Self::LinuxOpenh264 => "Linux 屏幕捕获 + OpenH264",
             Self::Custom { .. } => {
                 // Build a descriptive name
                 "自定义配置"
@@ -165,19 +178,38 @@ impl TestChain {
     }
 
     pub fn all() -> Vec<TestChain> {
-        vec![
-            Self::CaptureOnly,
-            Self::NvencNvdec,
-            Self::NvencOnly,
-            Self::OpenH264,
-        ]
+        #[cfg(windows)]
+        {
+            return vec![
+                Self::CaptureOnly,
+                Self::NvencNvdec,
+                Self::NvencOnly,
+                Self::OpenH264,
+            ];
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            return vec![Self::CaptureOnly, Self::LinuxOpenh264, Self::OpenH264];
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            return vec![Self::CaptureOnly, Self::OpenH264];
+        }
+
+        #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+        {
+            vec![Self::OpenH264]
+        }
     }
 
     pub fn capture_type(&self) -> CaptureType {
         match self {
-            Self::CaptureOnly | Self::NvencNvdec | Self::NvencOnly | Self::OpenH264 => {
-                CaptureType::Dxgi
-            }
+            Self::CaptureOnly | Self::OpenH264 => default_screen_capture_type(),
+            Self::NvencNvdec | Self::NvencOnly => CaptureType::Dxgi,
+            #[cfg(target_os = "linux")]
+            Self::LinuxOpenh264 => CaptureType::Linux,
             Self::Custom { capture, .. } => capture.clone(),
         }
     }
@@ -187,6 +219,8 @@ impl TestChain {
             Self::CaptureOnly => EncoderType::None,
             Self::NvencNvdec | Self::NvencOnly => EncoderType::NvencH264,
             Self::OpenH264 => EncoderType::OpenH264,
+            #[cfg(target_os = "linux")]
+            Self::LinuxOpenh264 => EncoderType::OpenH264,
             Self::Custom { encoder, .. } => encoder.clone(),
         }
     }
@@ -195,6 +229,8 @@ impl TestChain {
         match self {
             Self::NvencNvdec => DecoderType::Nvdec,
             Self::CaptureOnly | Self::NvencOnly | Self::OpenH264 => DecoderType::None,
+            #[cfg(target_os = "linux")]
+            Self::LinuxOpenh264 => DecoderType::None,
             Self::Custom { decoder, .. } => decoder.clone(),
         }
     }
@@ -202,8 +238,52 @@ impl TestChain {
 
 impl Default for TestChain {
     fn default() -> Self {
-        Self::NvencNvdec
+        #[cfg(windows)]
+        {
+            Self::NvencNvdec
+        }
+        #[cfg(target_os = "linux")]
+        {
+            Self::LinuxOpenh264
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
+        {
+            Self::OpenH264
+        }
     }
+}
+
+fn default_screen_capture_type() -> CaptureType {
+    #[cfg(windows)]
+    {
+        return CaptureType::Dxgi;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        return CaptureType::Macos;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        return CaptureType::Linux;
+    }
+
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    {
+        CaptureType::Synthetic
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn start_linux_capture_session(capture: &mut PipewireScreenCapture) -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| anyhow::anyhow!("create Linux capture runtime failed: {error}"))?;
+    runtime
+        .block_on(capture.start_session())
+        .map_err(|error| anyhow::anyhow!("start Linux capture session failed: {error}"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -735,6 +815,45 @@ fn run_renderer_thread(
                 let _ = (width, height, target_hwnd, receiver);
                 anyhow::bail!("Metal render display is only available on macOS");
             }
+        }
+        #[cfg(target_os = "linux")]
+        RendererType::Linux => {
+            use mrd_render::RendererInstance;
+            use mrd_render_linux::LinuxRenderer;
+
+            let _ = (width, height);
+            let mut renderer = LinuxRenderer::new()
+                .map_err(|error| anyhow::anyhow!("create Linux renderer failed: {error}"))?;
+            if let Some(target) = target_hwnd {
+                renderer
+                    .attach_target(RenderTarget::WindowHandle(target))
+                    .map_err(|error| anyhow::anyhow!("attach Linux renderer failed: {error}"))?;
+            } else {
+                renderer
+                    .create_window_with_size("MRD Linux Render Probe", width, height)
+                    .map_err(|error| {
+                        anyhow::anyhow!("create Linux render window failed: {error}")
+                    })?;
+            }
+
+            for cmd in receiver {
+                match cmd {
+                    RenderCommand::Frame(job) => {
+                        let result = {
+                            let frame = render_input_to_frame(job.input);
+                            renderer
+                                .upload_frame(frame)
+                                .map_err(|error| {
+                                    anyhow::anyhow!("upload Linux render frame failed: {error}")
+                                })
+                                .map_err(|error| error.to_string())
+                        };
+                        let _ = job.completion.send(result);
+                    }
+                    RenderCommand::Stop => break,
+                }
+            }
+            Ok(())
         }
     }
 }
@@ -1402,6 +1521,18 @@ impl TestHarness {
                             ));
                         }
                     }
+                    #[cfg(target_os = "linux")]
+                    CaptureType::Linux => {
+                        let mut capture = PipewireScreenCapture::new()
+                            .map_err(|e| anyhow::anyhow!("Linux capture init failed: {:?}", e))?;
+                        start_linux_capture_session(&mut capture)?;
+                        let capture_dimensions = {
+                            let (width, height) = capture.dimensions();
+                            (width as usize, height as usize)
+                        };
+                        let (width, height) = config.resolution.unwrap_or(capture_dimensions);
+                        (Box::new(capture) as Box<dyn FrameCapture>, width, height)
+                    }
                     CaptureType::Synthetic => {
                         let (width, height) = config.resolution.unwrap_or((1280, 720));
                         (
@@ -1466,6 +1597,19 @@ impl TestHarness {
                 )
             }
             TestChain::OpenH264 => {
+                let encoder = match config.bitrate {
+                    Some(bitrate) => OpenH264Encoder::new_with_bitrate(width, height, fps, bitrate),
+                    None => OpenH264Encoder::new(width, height, fps),
+                }
+                .map_err(|e| anyhow::anyhow!("OpenH264 编码器初始化失败: {:?}", e))?;
+                (
+                    Some(Box::new(encoder) as Box<dyn VideoEncoder>),
+                    None,
+                    false,
+                )
+            }
+            #[cfg(target_os = "linux")]
+            TestChain::LinuxOpenh264 => {
                 let encoder = match config.bitrate {
                     Some(bitrate) => OpenH264Encoder::new_with_bitrate(width, height, fps, bitrate),
                     None => OpenH264Encoder::new(width, height, fps),
@@ -1555,7 +1699,7 @@ impl TestHarness {
                 },
                 EncoderType::NvencHevc | EncoderType::NvencHevcMain10 => {
                     let main10 = matches!(encoder, EncoderType::NvencHevcMain10);
-                    #[cfg(windows)]
+                    #[cfg(any(windows, target_os = "linux"))]
                     {
                         match decoder {
                             DecoderType::None => {
@@ -1564,22 +1708,31 @@ impl TestHarness {
                                 (Some(enc), None, false)
                             }
                             DecoderType::Nvdec => {
-                                let enc = create_hevc_encoder(
-                                    width,
-                                    height,
-                                    fps,
-                                    low_latency_bitrate,
-                                    main10,
-                                )?;
-                                let dec = create_hevc_nvdec_decoder(
-                                    use_shared_texture_decode,
-                                    renderer_d3d11_device_ptr,
-                                    main10,
-                                )
-                                .map_err(|e| {
-                                    anyhow::anyhow!("NVDEC HEVC decoder init failed: {e}")
-                                })?;
-                                (Some(enc), Some(PipelineDecoder::Nvdec(dec)), true)
+                                #[cfg(not(windows))]
+                                {
+                                    return Err(anyhow::anyhow!(
+                                        "NVDEC HEVC decoder is not implemented on Linux yet"
+                                    ));
+                                }
+                                #[cfg(windows)]
+                                {
+                                    let enc = create_hevc_encoder(
+                                        width,
+                                        height,
+                                        fps,
+                                        low_latency_bitrate,
+                                        main10,
+                                    )?;
+                                    let dec = create_hevc_nvdec_decoder(
+                                        use_shared_texture_decode,
+                                        renderer_d3d11_device_ptr,
+                                        main10,
+                                    )
+                                    .map_err(|e| {
+                                        anyhow::anyhow!("NVDEC HEVC decoder init failed: {e}")
+                                    })?;
+                                    (Some(enc), Some(PipelineDecoder::Nvdec(dec)), true)
+                                }
                             }
                             DecoderType::Software => {
                                 return Err(anyhow::anyhow!(
@@ -1593,7 +1746,7 @@ impl TestHarness {
                             }
                         }
                     }
-                    #[cfg(not(windows))]
+                    #[cfg(not(any(windows, target_os = "linux")))]
                     {
                         let _ = main10;
                         return Err(anyhow::anyhow!(
@@ -1668,7 +1821,7 @@ impl TestHarness {
                     }
                 }
                 EncoderType::NvencAv1 => {
-                    #[cfg(windows)]
+                    #[cfg(any(windows, target_os = "linux"))]
                     {
                         let enc =
                             NvencAv1Encoder::new_low_latency(width, height, fps).map_err(|e| {
@@ -1679,18 +1832,27 @@ impl TestHarness {
                                 (Some(Box::new(enc) as Box<dyn VideoEncoder>), None, false)
                             }
                             DecoderType::Nvdec => {
-                                let dec = create_av1_nvdec_decoder(
-                                    use_shared_texture_decode,
-                                    renderer_d3d11_device_ptr,
-                                )
-                                .map_err(|e| {
-                                    anyhow::anyhow!("NVDEC AV1 decoder init failed: {e}")
-                                })?;
-                                (
-                                    Some(Box::new(enc) as Box<dyn VideoEncoder>),
-                                    Some(PipelineDecoder::Nvdec(dec)),
-                                    true,
-                                )
+                                #[cfg(not(windows))]
+                                {
+                                    return Err(anyhow::anyhow!(
+                                        "NVDEC AV1 decoder is not implemented on Linux yet"
+                                    ));
+                                }
+                                #[cfg(windows)]
+                                {
+                                    let dec = create_av1_nvdec_decoder(
+                                        use_shared_texture_decode,
+                                        renderer_d3d11_device_ptr,
+                                    )
+                                    .map_err(|e| {
+                                        anyhow::anyhow!("NVDEC AV1 decoder init failed: {e}")
+                                    })?;
+                                    (
+                                        Some(Box::new(enc) as Box<dyn VideoEncoder>),
+                                        Some(PipelineDecoder::Nvdec(dec)),
+                                        true,
+                                    )
+                                }
                             }
                             DecoderType::Software => {
                                 return Err(anyhow::anyhow!(
@@ -1704,7 +1866,7 @@ impl TestHarness {
                             }
                         }
                     }
-                    #[cfg(not(windows))]
+                    #[cfg(not(any(windows, target_os = "linux")))]
                     {
                         return Err(anyhow::anyhow!(
                             "NVENC AV1 encoder is only available on Windows"
@@ -2308,7 +2470,7 @@ fn create_hevc_encoder(
     bitrate: u32,
     main10: bool,
 ) -> Result<Box<dyn VideoEncoder>> {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     {
         let encoder = if main10 {
             NvencHevcEncoder::new_main10_with_bitrate(width, height, fps, bitrate)
@@ -2319,7 +2481,7 @@ fn create_hevc_encoder(
         Ok(Box::new(encoder) as Box<dyn VideoEncoder>)
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         let _ = (width, height, fps, bitrate, main10);
         anyhow::bail!("NVENC HEVC encoder is only available on Windows")
@@ -2459,6 +2621,8 @@ fn comparison_labels(chain: &TestChain) -> (&'static str, &'static str) {
         TestChain::NvencOnly => ("capture-encode", "h264"),
         TestChain::NvencNvdec => ("capture-encode-decode-render", "h264"),
         TestChain::OpenH264 => ("capture-encode", "h264-software"),
+        #[cfg(target_os = "linux")]
+        TestChain::LinuxOpenh264 => ("capture-encode", "h264-software"),
         TestChain::Custom {
             encoder, decoder, ..
         } => {
@@ -2514,6 +2678,8 @@ fn chain_allows_zero_copy_capture(chain: &TestChain) -> bool {
     match chain {
         TestChain::CaptureOnly | TestChain::NvencNvdec | TestChain::NvencOnly => true,
         TestChain::OpenH264 => false,
+        #[cfg(target_os = "linux")]
+        TestChain::LinuxOpenh264 => false,
         TestChain::Custom { encoder, .. } => encoder_allows_zero_copy(encoder),
     }
 }
@@ -3690,6 +3856,8 @@ mod tests {
         match std::env::var("MRD_HARNESS_CAPTURE").as_deref() {
             Ok("winrt") => CaptureType::Winrt,
             Ok("macos") => CaptureType::Macos,
+            #[cfg(target_os = "linux")]
+            Ok("linux") => CaptureType::Linux,
             Ok("synthetic") => CaptureType::Synthetic,
             _ => CaptureType::Dxgi,
         }
@@ -3769,6 +3937,8 @@ mod tests {
             renderer: match std::env::var("MRD_HARNESS_RENDERER").as_deref() {
                 Ok("d3d11") => Some(RendererType::D3d11),
                 Ok("macos") | Ok("metal") => Some(RendererType::Macos),
+                #[cfg(target_os = "linux")]
+                Ok("linux") => Some(RendererType::Linux),
                 _ => None,
             },
             renderer_target_hwnd: None,

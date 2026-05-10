@@ -9,6 +9,7 @@
 // - Shell lifecycle (UI launcher, tray, autostart)
 
 mod app_state;
+mod capabilities;
 mod capture_source;
 mod handlers;
 mod ipc_server;

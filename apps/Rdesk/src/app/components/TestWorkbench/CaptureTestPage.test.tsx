@@ -31,6 +31,54 @@ const previewTargets = baseTargets.map((target) => ({
 }));
 
 describe("CaptureTestPage window picker", () => {
+  it("starts Linux capture through the dedicated Linux scenario", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve({
+          os_type: "linux",
+          cpu_brand: "test",
+          cpu_cores: 12,
+          memory_gb: 32,
+          gpu_info: "Mesa",
+          available_captures: ["linux", "synthetic"],
+          available_encoders: ["openh264"],
+          available_decoders: ["software"],
+          available_renderers: ["linux"],
+          available_memory_modes: ["cpu"],
+        });
+      }
+      if (command === "test_start_run") {
+        return Promise.resolve("run-linux");
+      }
+      return Promise.resolve(null);
+    });
+
+    render(<CaptureTestPage />);
+
+    const linuxButton = await screen.findByRole("button", { name: /Linux Capture/ });
+    await waitFor(() => expect(linuxButton).not.toBeDisabled());
+    fireEvent.click(linuxButton);
+    fireEvent.click(screen.getByRole("button", { name: /启动测试/ }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_start_run",
+        expect.objectContaining({
+          scenarioId: "capture.linux",
+          config: expect.objectContaining({
+            capture_type: "linux",
+            encoder_type: "none",
+            decoder_type: "none",
+            input_source: "screen",
+            zero_copy: false,
+            visual_preview: false,
+          }),
+        })
+      );
+    });
+  });
+
   it("starts DXGI desktop capture through the unthrottled zero-copy run path", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {

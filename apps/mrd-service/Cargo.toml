@@ -34,3 +34,6 @@ mrd-capture-winrt = { path = "../../crates/mrd-capture-winrt" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mrd-capture-macos = { path = "../../crates/mrd-capture-macos" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+mrd-capture-pipewire = { path = "../../crates/mrd-capture-pipewire", features = ["portal"] }

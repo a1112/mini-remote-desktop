@@ -4,7 +4,13 @@ import * as commands from "../../adapters/tauri/commands";
 import type { EnvironmentSnapshot, TestConfig } from "../../adapters/tauri/types";
 import { capabilityAvailable, capabilityTag, unavailableText } from "./capabilityMeta";
 
-type EncoderType = "nvenc_h264" | "nvenc_av1" | "openh264" | "videotoolbox_h264";
+type EncoderType =
+  | "nvenc_h264"
+  | "nvenc_hevc"
+  | "nvenc_hevc_main10"
+  | "nvenc_av1"
+  | "openh264"
+  | "videotoolbox_h264";
 
 interface EncoderOption {
   id: EncoderType;
@@ -31,6 +37,22 @@ const ENCODER_OPTIONS: EncoderOption[] = [
     type: "hardware",
     available: true,
     icon: <Zap className="h-5 w-5 text-blue-500" />,
+  },
+  {
+    id: "nvenc_hevc",
+    name: "NVENC HEVC",
+    description: "NVIDIA HEVC Main 硬件编码器，适合高分辨率",
+    type: "hardware",
+    available: true,
+    icon: <Zap className="h-5 w-5 text-emerald-500" />,
+  },
+  {
+    id: "nvenc_hevc_main10",
+    name: "NVENC HEVC Main10",
+    description: "NVIDIA 10-bit HEVC 硬件编码路径",
+    type: "hardware",
+    available: true,
+    icon: <Zap className="h-5 w-5 text-cyan-500" />,
   },
   {
     id: "openh264",
@@ -62,11 +84,17 @@ interface EncoderMetrics {
   bitrate_kbps: number;
 }
 
-function buildEncodeRun(encoder: EncoderType, bitrateKbps: number): {
+function buildEncodeRun(
+  encoder: EncoderType,
+  bitrateKbps: number,
+  capabilities: EnvironmentSnapshot | null
+): {
   scenarioId: string;
   config: TestConfig;
 } {
   const bitrate = bitrateKbps * 1000;
+  const isLinux = capabilities?.os_type === "linux";
+  const nativeCapture = isLinux ? "linux" : "dxgi";
   if (encoder === "openh264") {
     return {
       scenarioId: "encode.openh264",
@@ -98,12 +126,12 @@ function buildEncodeRun(encoder: EncoderType, bitrateKbps: number): {
   }
 
   return {
-    scenarioId: encoder === "nvenc_av1" ? "custom" : "encode.nvenc_h264",
+    scenarioId: isLinux || encoder !== "nvenc_h264" ? "custom" : "encode.nvenc_h264",
     config: {
-      capture_type: "dxgi",
+      capture_type: nativeCapture,
       encoder_type: encoder,
       decoder_type: "none",
-      zero_copy: true,
+      zero_copy: !isLinux,
       bitrate,
       duration_ms: 30_000,
       visual_preview: false,
@@ -123,9 +151,12 @@ export function EncodeTestPage() {
 
   const selectedOption = ENCODER_OPTIONS.find((o) => o.id === selectedEncoder);
   const selectedIsSoftware = selectedOption?.type === "software";
+  const isLinux = capabilities?.os_type === "linux";
   const selectedPathNote = selectedIsSoftware
     ? "OpenH264/software H.264 使用 CPU-backed synthetic capture，zero_copy 会被关闭；这是软件 fallback 基线，不代表 2K144 主串流路径。"
-    : "硬件编码默认使用 DXGI + D3D11 shared zero-copy，更接近真实桌面串流链路。";
+    : isLinux
+      ? "Linux 硬件编码使用 PipeWire/Linux capture + GStreamer NVENC。当前路径是 CPU-backed 输入，后续可继续收敛到 DMA-BUF/CUDA 零拷贝。"
+      : "硬件编码默认使用 DXGI + D3D11 shared zero-copy，更接近真实桌面串流链路。";
   const isEncoderAvailable = (option: EncoderOption) => {
     if (!option.available) return false;
     return capabilityAvailable(capabilities, "available_encoders", option.id, option.id === "openh264");
@@ -193,7 +224,9 @@ export function EncodeTestPage() {
     setMetrics(null);
     setStartError(null);
 
-    const startResult = await commands.testStartRun(buildEncodeRun(selectedEncoder, selectedBitrate));
+    const startResult = await commands.testStartRun(
+      buildEncodeRun(selectedEncoder, selectedBitrate, capabilities)
+    );
     if (!startResult.ok) {
       setIsRunning(false);
       setStartError(startResult.error.message);

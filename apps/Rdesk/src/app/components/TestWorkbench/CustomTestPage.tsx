@@ -9,6 +9,7 @@ type CaptureId = NonNullable<TestConfig["capture_type"]>;
 type EncoderId = NonNullable<TestConfig["encoder_type"]>;
 type DecoderId = NonNullable<TestConfig["decoder_type"]>;
 type TransportId = NonNullable<TestConfig["transport_kind"]>;
+type RendererId = NonNullable<TestConfig["renderer_type"]>;
 
 interface CaptureOption {
   id: CaptureId;
@@ -53,6 +54,12 @@ const CAPTURE_OPTIONS: CaptureOption[] = [
     id: "macos",
     name: "macOS",
     description: "macOS display capture - Screen Recording permission may be required",
+    icon: <Monitor className="h-5 w-5" />,
+  },
+  {
+    id: "linux",
+    name: "Linux",
+    description: "Linux display capture - PipeWire/Portal path",
     icon: <Monitor className="h-5 w-5" />,
   },
   {
@@ -170,6 +177,30 @@ function isHevcEncoder(encoder: EncoderId): boolean {
   return encoder === "nvenc_hevc" || encoder === "nvenc_hevc_main10";
 }
 
+function resolveRendererType(
+  capture: CaptureId,
+  encoder: EncoderId,
+  decoder: DecoderId,
+  capabilities: EnvironmentSnapshot | null
+): RendererId {
+  if (capture === "macos" || encoder === "videotoolbox_h264" || decoder === "videotoolbox") {
+    return "macos";
+  }
+  if (capture === "linux") {
+    return "linux";
+  }
+  if (capabilityAvailable(capabilities, "available_renderers", "d3d11")) {
+    return "d3d11";
+  }
+  if (capabilityAvailable(capabilities, "available_renderers", "linux")) {
+    return "linux";
+  }
+  if (capabilityAvailable(capabilities, "available_renderers", "macos")) {
+    return "macos";
+  }
+  return "d3d11";
+}
+
 export function CustomTestPage() {
   const navigate = useNavigate();
   const [selectedCapture, setSelectedCapture] = useState<CaptureId>("dxgi");
@@ -205,6 +236,17 @@ export function CustomTestPage() {
   const isDecoderAvailable = (decoder: DecoderId) =>
     decoder === "none" ||
     capabilityAvailable(capabilities, "available_decoders", decoder, decoder === "software");
+  const selectedRenderer = resolveRendererType(
+    selectedCapture,
+    selectedEncoder,
+    selectedDecoder,
+    capabilities
+  );
+  const isRendererAvailable = capabilityAvailable(
+    capabilities,
+    "available_renderers",
+    selectedRenderer
+  );
 
   useEffect(() => {
     if (!capabilities) return;
@@ -247,6 +289,9 @@ export function CustomTestPage() {
         ? "VideoToolbox 解码当前为实验路径，需显式启用后才可测试。"
         : "当前平台未暴露所选解码能力。";
     }
+    if (!isRendererAvailable) {
+      return "当前平台未暴露所选渲染能力。";
+    }
     if (selectedEncoder === "none" && selectedDecoder !== "none") {
       return "直接渲染链路不经过码流，请选择无解码。";
     }
@@ -280,20 +325,15 @@ export function CustomTestPage() {
 
     setStarting(true);
     setStartError(null);
-    const useMacosRenderer =
-      selectedCapture === "macos" ||
-      selectedEncoder === "videotoolbox_h264" ||
-      selectedDecoder === "videotoolbox";
-
     const config: TestConfig = {
       capture_type: selectedCapture,
       encoder_type: selectedEncoder,
       decoder_type: selectedDecoder,
       transport_kind: selectedTransport,
-      renderer_type: useMacosRenderer ? "macos" : "d3d11",
+      renderer_type: selectedRenderer,
       render_display: true,
       zero_copy:
-        !useMacosRenderer &&
+        selectedRenderer === "d3d11" &&
         selectedCapture !== "synthetic" &&
         (selectedEncoder === "none" || selectedEncoder.startsWith("nvenc"))
           ? true

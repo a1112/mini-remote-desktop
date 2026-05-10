@@ -124,6 +124,195 @@ pub struct CaptureSourceSelection {
     pub reason: Option<String>,
 }
 
+/// Platform identifier used by structured capability snapshots.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityPlatform {
+    /// Microsoft Windows desktop.
+    Windows,
+    /// Apple macOS desktop.
+    Macos,
+    /// Linux desktop.
+    Linux,
+    /// Android client/host.
+    Android,
+    /// iOS client.
+    Ios,
+    /// Browser/web runtime.
+    Web,
+    /// Unknown or unsupported platform.
+    Unknown,
+}
+
+/// Product capability domain.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityDomain {
+    /// Screen/window capture.
+    Capture,
+    /// Selectable capture sources.
+    CaptureSource,
+    /// Video encoding.
+    Encode,
+    /// Video decoding.
+    Decode,
+    /// Frame rendering.
+    Render,
+    /// Frame memory/interoperability path.
+    Memory,
+    /// Media or control transport.
+    Transport,
+    /// Keyboard/mouse/control-plane input.
+    Control,
+    /// Audio capture/playback/media path.
+    Audio,
+    /// Local service lifecycle features.
+    Service,
+    /// Pairing, consent, and encryption features.
+    Security,
+}
+
+/// Runtime support state for one capability.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityStatus {
+    /// Product code exists but runtime validation has not proven usability.
+    Supported,
+    /// Runtime probe found required APIs, drivers, or permissions.
+    Available,
+    /// Lightweight validation succeeded.
+    Usable,
+    /// Usable fallback path below preferred parity.
+    Degraded,
+    /// Blocked by an OS permission.
+    PermissionMissing,
+    /// Driver/runtime library is missing.
+    DriverMissing,
+    /// Required hardware is absent.
+    HardwareMissing,
+    /// Matrix concept exists but no runner is wired.
+    Unimplemented,
+    /// Unsupported on this platform or product mode.
+    Unsupported,
+    /// Not yet probed or not recognized.
+    Unknown,
+}
+
+/// Structured capability item shared by service, UI, and LAN discovery.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapabilityItem {
+    /// Stable capability id, for example `capture.dxgi`.
+    pub id: String,
+    /// Product domain for grouping and evaluation.
+    pub domain: CapabilityDomain,
+    /// Human-readable short label.
+    pub label: String,
+    /// Current support state.
+    pub status: CapabilityStatus,
+    /// Platform that produced the capability.
+    pub platform: CapabilityPlatform,
+    /// Short reason when the status is not plainly available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Optional diagnostic detail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// Capability ids required by this item.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires: Vec<String>,
+    /// Capability ids that conflict with this item.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts_with: Vec<String>,
+    /// Capability ids this item depends on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
+    /// Lower-parity fallback capability ids.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_ids: Vec<String>,
+    /// Last probe timestamp in milliseconds since Unix epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_probe_time_ms: Option<u64>,
+}
+
+/// Compatibility status for a cross-capability constraint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityConstraintStatus {
+    /// Combination is allowed.
+    Allow,
+    /// Combination must not run.
+    Block,
+    /// Combination runs below preferred parity.
+    Degrade,
+    /// Combination needs a copy/conversion step.
+    RequiresCopy,
+    /// Combination requires runtime probe validation.
+    RequiresProbe,
+}
+
+/// Rule describing whether multiple capabilities can be combined.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapabilityConstraint {
+    /// Stable constraint id.
+    pub id: String,
+    /// Capability ids or prefixes this rule applies to.
+    pub applies_to: Vec<String>,
+    /// Constraint result.
+    pub status: CapabilityConstraintStatus,
+    /// Deterministic explanation for UI and automation.
+    pub reason: String,
+    /// Fallback capability ids when applicable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_ids: Vec<String>,
+}
+
+/// Named performance profile used by static and runtime validation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CapabilityProfile {
+    /// Stable profile id.
+    pub id: String,
+    /// Target frame width.
+    pub width: u32,
+    /// Target frame height.
+    pub height: u32,
+    /// Target frame rate.
+    pub fps: u32,
+    /// Target bitrate in Mbps.
+    pub bitrate_mbps: u32,
+    /// Requested codec, for example `h264`.
+    pub codec: String,
+    /// Optional latency budget in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_budget_ms: Option<u32>,
+    /// Optional minimum stable FPS ratio.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_stable_fps_ratio: Option<f32>,
+    /// Optional maximum frame drop ratio.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_drop_ratio: Option<f32>,
+    /// Capabilities required for static support.
+    pub required_capabilities: Vec<String>,
+}
+
+/// Structured local or peer capability snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CapabilitySnapshot {
+    /// Schema version for forward-compatible readers.
+    pub schema_version: u32,
+    /// Platform that produced the snapshot.
+    pub platform: CapabilityPlatform,
+    /// Service or application version that produced the snapshot.
+    pub service_version: String,
+    /// Capability items.
+    pub capabilities: Vec<CapabilityItem>,
+    /// Cross-capability constraints.
+    pub constraints: Vec<CapabilityConstraint>,
+    /// Built-in performance profiles known by the producer.
+    pub profiles: Vec<CapabilityProfile>,
+    /// Snapshot timestamp in milliseconds since Unix epoch.
+    pub updated_at_ms: u64,
+}
+
 // === Core IPC Types ===
 
 /// IPC request from Rdesk to mrd-service
@@ -195,6 +384,8 @@ pub enum IpcRequest {
     SessionRuntimeSnapshot { session_id: SessionId },
     /// Get aggregated runtime snapshot
     RuntimeSnapshot,
+    /// Get structured local capability snapshot.
+    CapabilitySnapshot,
     /// Get probe snapshot data
     ProbeSnapshot { session_id: SessionId },
     /// Stream probe events
@@ -272,6 +463,11 @@ pub enum IpcResponse {
     SessionSnapshot { snapshot: SessionRuntimeSnapshot },
     /// Aggregated runtime snapshot
     RuntimeSnapshot { snapshot: RuntimeSnapshot },
+    /// Structured local capability snapshot.
+    CapabilitySnapshot {
+        /// Current local capability snapshot.
+        snapshot: CapabilitySnapshot,
+    },
     /// Probe snapshot data
     ProbeSnapshot { snapshot: ProbeSnapshot },
     /// Probe event data

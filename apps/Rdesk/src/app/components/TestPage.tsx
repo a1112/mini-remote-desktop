@@ -18,48 +18,43 @@ const METRICS_UPDATE_INTERVAL_MS = 200;
 
 const TEST_CHAINS: TestChainOption[] = [
   {
-    value: "nvenc_nvdec",
-    label: "NVENC H.264 + NVDEC",
-    description: "全硬件加速，最低延迟",
-  },
-  {
-    value: "nvenc_only",
-    label: "NVENC 编码器测试",
-    description: "仅测试编码性能",
+    value: "linux_openh264",
+    label: "Linux 屏幕捕获 + OpenH264",
+    description: "Linux 平台屏幕捕获与软件编码",
   },
   {
     value: "openh264",
     label: "OpenH264 软件编码",
     description: "CPU 软件编码测试",
   },
+  {
+    value: "capture_only",
+    label: "仅捕获测试",
+    description: "测试捕获功能，无编码",
+  },
 ];
 
 const TEST_PRESETS: TestChainOption[] = [
   {
-    value: "nvenc_nvdec",
-    label: "1080p@60 硬件加速",
-    description: "标准全硬件加速配置",
-  },
-  {
-    value: "nvenc_nvdec",
-    label: "2K@60 高性能",
-    description: "2K 分辨率硬件加速",
-  },
-  {
-    value: "nvenc_only",
-    label: "编码性能测试",
-    description: "纯编码器压力测试",
+    value: "linux_openh264",
+    label: "Linux 屏幕捕获",
+    description: "Linux 平台屏幕捕获 + OpenH264 编码",
   },
   {
     value: "openh264",
     label: "软件编码基准",
     description: "CPU 编码性能参考",
   },
+  {
+    value: "capture_only",
+    label: "仅捕获测试",
+    description: "测试屏幕捕获功能",
+  },
 ];
 
 export function TestPage() {
   const [isRunning, setIsRunning] = useState(false);
-  const [selectedChain, setSelectedChain] = useState<TestChain>("nvenc_nvdec");
+  const [selectedChain, setSelectedChain] = useState<TestChain>("linux_openh264");
   const [metrics, setMetrics] = useState<HarnessMetrics | null>(null);
   const [capturedFrame, setCapturedFrame] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);

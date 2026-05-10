@@ -168,6 +168,73 @@ describe("RenderTestPage platform capabilities", () => {
     expect(screen.getByText("启动测试后显示渲染输入帧")).toBeInTheDocument();
   });
 
+  it("uses Linux capture and the Linux renderer when running on Linux", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve({
+          os_type: "linux",
+          cpu_brand: "test",
+          cpu_cores: 12,
+          memory_gb: 32,
+          gpu_info: "Mesa",
+          available_captures: ["linux", "synthetic"],
+          available_encoders: ["openh264"],
+          available_decoders: ["software", "none"],
+          available_renderers: ["linux"],
+          available_memory_modes: ["cpu"],
+        });
+      }
+      if (command === "test_start_run") return Promise.resolve("run-linux");
+      if (command === "test_harness_get_metrics") {
+        return Promise.resolve({
+          is_running: true,
+          capture_fps: 48,
+          capture_latency_p50_ms: 12,
+          capture_latency_p95_ms: 18,
+          encode_latency_p50_ms: 0,
+          encode_latency_p95_ms: 0,
+          transport_latency_p50_ms: 0,
+          transport_latency_p95_ms: 0,
+          decode_latency_p50_ms: 0,
+          decode_latency_p95_ms: 0,
+          total_latency_p50_ms: 14,
+          total_latency_p95_ms: 21,
+          frame_count: 45,
+          dropped_frames: 0,
+          resolution: [1920, 1080],
+        });
+      }
+      if (command === "test_harness_get_frames") {
+        return Promise.resolve([null, ["AAAA", 2, 2, 7]]);
+      }
+      return Promise.resolve(null);
+    });
+
+    render(<RenderTestPage />);
+
+    const linuxButton = await screen.findByRole("button", { name: /Linux/ });
+    await waitFor(() => expect(linuxButton).toBeEnabled());
+    fireEvent.click(linuxButton);
+    fireEvent.click(screen.getByRole("button", { name: /启动测试/ }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_start_run",
+        expect.objectContaining({
+          config: expect.objectContaining({
+            capture_type: "linux",
+            encoder_type: "none",
+            decoder_type: "none",
+            renderer_type: "linux",
+            render_display: true,
+            input_source: "screen",
+          }),
+        })
+      );
+    });
+  });
+
   it("uses direct macOS capture to Metal render without encode/decode", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {

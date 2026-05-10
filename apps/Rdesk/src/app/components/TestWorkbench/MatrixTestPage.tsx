@@ -8,6 +8,7 @@ import type {
   TestRunSummary,
 } from "../../adapters/tauri/types";
 import {
+  buildCapabilitySnapshotFromIpc,
   buildCapabilitySnapshotFromEnvironment,
   evaluateCapabilityCombination,
   type CapabilitySnapshot,
@@ -40,6 +41,7 @@ const MATRIX_DIMENSIONS: MatrixDimension[] = [
       { id: "dxgi", name: "DXGI", enabled: true },
       { id: "winrt", name: "WinRT", enabled: false },
       { id: "macos", name: "macOS", enabled: false, defaultEnabledOn: ["macos"] },
+      { id: "linux", name: "Linux", enabled: false, defaultEnabledOn: ["linux"] },
       { id: "synthetic", name: "Synthetic", enabled: false },
     ],
   },
@@ -92,6 +94,7 @@ const MATRIX_DIMENSIONS: MatrixDimension[] = [
       { id: "d3d11", name: "DX11 popup", enabled: false },
       { id: "d3d12_native", name: "DX12 native", enabled: false },
       { id: "macos", name: "Metal", enabled: false },
+      { id: "linux", name: "Linux", enabled: false, defaultEnabledOn: ["linux"] },
     ],
   },
   {
@@ -164,6 +167,7 @@ function normalizeHostOs(osType?: string): HostOs {
 function defaultCapturesForOs(os: HostOs): string[] {
   if (os === "windows") return ["dxgi", "winrt", "synthetic"];
   if (os === "macos") return ["macos", "synthetic"];
+  if (os === "linux") return ["linux", "synthetic"];
   return ["synthetic"];
 }
 
@@ -184,6 +188,7 @@ function defaultDecodersForOs(os: HostOs): string[] {
 function defaultRenderersForOs(os: HostOs): string[] {
   if (os === "windows") return ["none", "d3d11"];
   if (os === "macos") return ["none", "macos"];
+  if (os === "linux") return ["none", "linux"];
   return ["none"];
 }
 
@@ -526,24 +531,38 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
     createMatrixDimensions(null)
   );
   const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
+  const [serviceCapabilitySnapshot, setServiceCapabilitySnapshot] =
+    useState<CapabilitySnapshot | null>(null);
   const [isRunning, setIsRunning] = useState(false);
   const [tests, setTests] = useState<MatrixTest[]>([]);
   const [currentTestIndex, setCurrentTestIndex] = useState(0);
   const [completedCount, setCompletedCount] = useState(0);
   const [failedCount, setFailedCount] = useState(0);
   const [skippedCount, setSkippedCount] = useState(0);
-  const capabilitySnapshot = capabilities
-    ? buildCapabilitySnapshotFromEnvironment(capabilities)
-    : null;
+  const capabilitySnapshot =
+    serviceCapabilitySnapshot ??
+    (capabilities ? buildCapabilitySnapshotFromEnvironment(capabilities) : null);
 
   useEffect(() => {
     let cancelled = false;
 
     async function loadCapabilities() {
-      const result = await commands.testGetCapabilities();
-      if (!cancelled && result.ok && result.value) {
-        setCapabilities(result.value);
-        setDimensions(createMatrixDimensions(result.value));
+      const [legacyResult, serviceResult] = await Promise.all([
+        commands.testGetCapabilities(),
+        commands.ipcCapabilitySnapshot(),
+      ]);
+
+      if (cancelled) {
+        return;
+      }
+
+      if (legacyResult.ok && legacyResult.value) {
+        setCapabilities(legacyResult.value);
+        setDimensions(createMatrixDimensions(legacyResult.value));
+      }
+
+      if (serviceResult.ok) {
+        setServiceCapabilitySnapshot(buildCapabilitySnapshotFromIpc(serviceResult.value));
       }
     }
 
@@ -678,6 +697,9 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
             config.render_display = true;
           } else if (option.id === "macos") {
             config.renderer_type = "macos";
+            config.render_display = true;
+          } else if (option.id === "linux") {
+            config.renderer_type = "linux";
             config.render_display = true;
           } else {
             config.render_display = false;

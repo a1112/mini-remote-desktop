@@ -19,7 +19,7 @@ import type {
 } from "../../adapters/tauri/types";
 import { capabilityAvailable, capabilityTag, unavailableText } from "./capabilityMeta";
 
-type CaptureType = "dxgi" | "winrt" | "macos" | "synthetic";
+type CaptureType = "dxgi" | "winrt" | "macos" | "linux" | "synthetic";
 type CaptureScope = "screen" | "window_perf" | "window_probe";
 
 interface CaptureOption {
@@ -43,6 +43,11 @@ const CAPTURE_OPTIONS: CaptureOption[] = [
     id: "macos",
     name: "macOS Capture",
     description: "macOS 屏幕捕获，需要 Screen Recording 权限",
+  },
+  {
+    id: "linux",
+    name: "Linux Capture",
+    description: "Linux 屏幕捕获，优先 PipeWire/Portal 路径",
   },
   {
     id: "synthetic",
@@ -438,6 +443,8 @@ export function CaptureTestPage() {
         ? "capture.winrt"
         : selectedCapture === "macos"
         ? "capture.macos"
+        : selectedCapture === "linux"
+        ? "capture.linux"
         : "custom";
     const result = await commands.testStartRun({
       scenarioId,

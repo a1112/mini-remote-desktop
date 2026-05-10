@@ -1,5 +1,7 @@
 #[cfg(not(windows))]
 use mrd_pipeline_core::{CapturedFrame, EncodedAccessUnit, PipelineError, VideoEncoder};
+#[cfg(not(windows))]
+use mrd_pipeline_core::{FramePixelFormat, VideoCodec};
 
 #[cfg(windows)]
 mod imp {
@@ -1182,77 +1184,252 @@ mod imp {
 pub use imp::{NvencH264Encoder, NvencHevcEncoder};
 
 #[cfg(not(windows))]
-pub struct NvencH264Encoder;
+pub struct NvencHevcEncoder {
+    encoder: GstreamerNvencEncoder,
+    main10: bool,
+}
 
 #[cfg(not(windows))]
-pub struct NvencHevcEncoder;
+struct GstreamerNvencEncoder {
+    codec: VideoCodec,
+    element: &'static str,
+    parser: &'static str,
+    caps: &'static str,
+    width: usize,
+    height: usize,
+    fps: u32,
+    bitrate_kbps: u32,
+    frame_index: usize,
+}
+
+#[cfg(not(windows))]
+impl GstreamerNvencEncoder {
+    fn new(
+        codec: VideoCodec,
+        element: &'static str,
+        parser: &'static str,
+        caps: &'static str,
+        width: usize,
+        height: usize,
+        fps: u32,
+        bitrate: u32,
+    ) -> Result<Self, PipelineError> {
+        require_gst_element(element)?;
+        require_gst_element(parser)?;
+        Ok(Self {
+            codec,
+            element,
+            parser,
+            caps,
+            width: width.max(2),
+            height: height.max(2),
+            fps: fps.max(1),
+            bitrate_kbps: (bitrate / 1000).max(1),
+            frame_index: 0,
+        })
+    }
+
+    fn encode(&mut self, frame: &CapturedFrame) -> Result<Vec<EncodedAccessUnit>, PipelineError> {
+        if frame.pixel_format != FramePixelFormat::Bgra32 {
+            return Err(PipelineError::message(format!(
+                "Linux NVENC GStreamer path expects BGRA32 frames, got {:?}",
+                frame.pixel_format
+            )));
+        }
+        if frame.width != self.width || frame.height != self.height {
+            return Err(PipelineError::message(format!(
+                "Linux NVENC GStreamer path was initialized for {}x{}, got {}x{}",
+                self.width, self.height, frame.width, frame.height
+            )));
+        }
+
+        let output = std::process::Command::new("gst-launch-1.0")
+            .arg("-q")
+            .arg("fdsrc")
+            .arg("fd=0")
+            .arg(format!("blocksize={}", frame.data.len()))
+            .arg("num-buffers=1")
+            .arg("!")
+            .arg(format!(
+                "video/x-raw,format=BGRA,width={},height={},framerate={}/1",
+                self.width, self.height, self.fps
+            ))
+            .arg("!")
+            .arg("videoconvert")
+            .arg("!")
+            .arg("video/x-raw,format=BGRA")
+            .arg("!")
+            .arg(self.element)
+            .arg("preset=p1")
+            .arg("tune=ultra-low-latency")
+            .arg("zerolatency=true")
+            .arg("bframes=0")
+            .arg(format!("gop-size={}", self.fps.min(60)))
+            .arg("repeat-sequence-header=true")
+            .arg(format!("bitrate={}", self.bitrate_kbps))
+            .arg("!")
+            .arg(self.parser)
+            .arg("config-interval=-1")
+            .arg("!")
+            .arg(self.caps)
+            .arg("!")
+            .arg("fdsink")
+            .arg("fd=1")
+            .arg("sync=false")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                if let Some(mut stdin) = child.stdin.take() {
+                    use std::io::Write;
+                    stdin.write_all(&frame.data)?;
+                }
+                child.wait_with_output()
+            })
+            .map_err(|error| {
+                PipelineError::message(format!("launch Linux GStreamer NVENC failed: {error}"))
+            })?;
+
+        if !output.status.success() {
+            return Err(PipelineError::message(format!(
+                "Linux GStreamer NVENC failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+        if output.stdout.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let force_idr = self.frame_index == 0 || self.frame_index % self.fps as usize == 0;
+        self.frame_index += 1;
+        Ok(vec![EncodedAccessUnit {
+            codec: self.codec,
+            timestamp_us: frame.timestamp_us,
+            is_keyframe: force_idr || annex_b_contains_keyframe(self.codec, &output.stdout),
+            bytes: output.stdout,
+        }])
+    }
+}
+
+#[cfg(not(windows))]
+pub struct NvencH264Encoder {
+    encoder: GstreamerNvencEncoder,
+}
+
+#[cfg(not(windows))]
+fn require_gst_element(element: &str) -> Result<(), PipelineError> {
+    let status = std::process::Command::new("gst-inspect-1.0")
+        .arg(element)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|error| {
+            PipelineError::message(format!("gst-inspect-1.0 is not available: {error}"))
+        })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(PipelineError::message(format!(
+            "GStreamer element `{element}` is not available"
+        )))
+    }
+}
+
+#[cfg(not(windows))]
+fn annex_b_contains_keyframe(codec: VideoCodec, bytes: &[u8]) -> bool {
+    let mut index = 0;
+    while index + 5 < bytes.len() {
+        let start_len = if bytes[index..].starts_with(&[0, 0, 1]) {
+            3
+        } else if bytes[index..].starts_with(&[0, 0, 0, 1]) {
+            4
+        } else {
+            index += 1;
+            continue;
+        };
+        let nal = bytes[index + start_len];
+        match codec {
+            VideoCodec::H264 => {
+                let nal_type = nal & 0x1f;
+                if nal_type == 5 || nal_type == 7 {
+                    return true;
+                }
+            }
+            VideoCodec::Hevc => {
+                let nal_type = (nal >> 1) & 0x3f;
+                if nal_type == 19 || nal_type == 20 || nal_type == 32 || nal_type == 33 {
+                    return true;
+                }
+            }
+            VideoCodec::Av1 => {}
+        }
+        index += start_len;
+    }
+    false
+}
 
 #[cfg(not(windows))]
 impl NvencH264Encoder {
-    pub fn new(_width: usize, _height: usize, _fps: u32) -> Result<Self, PipelineError> {
-        Err(PipelineError::message(
-            "nvenc encoder only supports Windows",
-        ))
+    pub fn new(width: usize, height: usize, fps: u32) -> Result<Self, PipelineError> {
+        Self::new_with_bitrate(width, height, fps, 8_000_000)
     }
 
     pub fn new_with_bitrate(
-        _width: usize,
-        _height: usize,
-        _fps: u32,
-        _bitrate: u32,
+        width: usize,
+        height: usize,
+        fps: u32,
+        bitrate: u32,
     ) -> Result<Self, PipelineError> {
-        Err(PipelineError::message(
-            "nvenc encoder only supports Windows",
-        ))
+        Self::new_max_speed_with_bitrate(width, height, fps, bitrate)
     }
 
-    pub fn new_baseline(_width: usize, _height: usize, _fps: u32) -> Result<Self, PipelineError> {
-        Err(PipelineError::message(
-            "nvenc encoder only supports Windows",
-        ))
+    pub fn new_baseline(width: usize, height: usize, fps: u32) -> Result<Self, PipelineError> {
+        Self::new_max_speed_with_bitrate(width, height, fps, 5_000_000)
     }
 
-    pub fn new_max_speed(_width: usize, _height: usize, _fps: u32) -> Result<Self, PipelineError> {
-        Err(PipelineError::message(
-            "nvenc encoder only supports Windows",
-        ))
+    pub fn new_max_speed(width: usize, height: usize, fps: u32) -> Result<Self, PipelineError> {
+        Self::new_max_speed_with_bitrate(width, height, fps, 5_000_000)
     }
 
     pub fn new_max_speed_with_bitrate(
-        _width: usize,
-        _height: usize,
-        _fps: u32,
-        _bitrate: u32,
+        width: usize,
+        height: usize,
+        fps: u32,
+        bitrate: u32,
     ) -> Result<Self, PipelineError> {
-        Err(PipelineError::message(
-            "nvenc encoder only supports Windows",
-        ))
+        Ok(Self {
+            encoder: GstreamerNvencEncoder::new(
+                VideoCodec::H264,
+                "nvh264enc",
+                "h264parse",
+                "video/x-h264,stream-format=byte-stream,alignment=au",
+                width,
+                height,
+                fps,
+                bitrate,
+            )?,
+        })
     }
 
     pub fn new_low_latency_p1(
-        _width: usize,
-        _height: usize,
-        _fps: u32,
+        width: usize,
+        height: usize,
+        fps: u32,
     ) -> Result<Self, PipelineError> {
-        Err(PipelineError::message(
-            "nvenc encoder only supports Windows",
-        ))
+        Self::new_max_speed(width, height, fps)
     }
 
     pub fn new_high_quality_p5(
-        _width: usize,
-        _height: usize,
-        _fps: u32,
+        width: usize,
+        height: usize,
+        fps: u32,
     ) -> Result<Self, PipelineError> {
-        Err(PipelineError::message(
-            "nvenc encoder only supports Windows",
-        ))
+        Self::new_with_bitrate(width, height, fps, 12_000_000)
     }
 
     pub fn probe_h264_available() -> Result<(), PipelineError> {
-        Err(PipelineError::message(
-            "nvenc encoder only supports Windows",
-        ))
+        require_gst_element("nvh264enc")
     }
 }
 
@@ -1266,73 +1443,69 @@ impl NvencHevcEncoder {
         mrd_pipeline_core::FrameMemoryKind::Cpu
     }
 
-    pub fn new(_width: usize, _height: usize, _fps: u32) -> Result<Self, PipelineError> {
-        Err(PipelineError::message(
-            "nvenc HEVC encoder only supports Windows",
-        ))
+    pub fn new(width: usize, height: usize, fps: u32) -> Result<Self, PipelineError> {
+        Self::new_main_with_bitrate(width, height, fps, 8_000_000)
     }
 
-    pub fn new_main(_width: usize, _height: usize, _fps: u32) -> Result<Self, PipelineError> {
-        Err(PipelineError::message(
-            "nvenc HEVC encoder only supports Windows",
-        ))
+    pub fn new_main(width: usize, height: usize, fps: u32) -> Result<Self, PipelineError> {
+        Self::new_main_with_bitrate(width, height, fps, 8_000_000)
     }
 
-    pub fn new_main10(_width: usize, _height: usize, _fps: u32) -> Result<Self, PipelineError> {
-        Err(PipelineError::message(
-            "nvenc HEVC encoder only supports Windows",
-        ))
+    pub fn new_main10(width: usize, height: usize, fps: u32) -> Result<Self, PipelineError> {
+        Self::new_main10_with_bitrate(width, height, fps, 10_000_000)
     }
 
     pub fn new_main_with_bitrate(
-        _width: usize,
-        _height: usize,
-        _fps: u32,
-        _bitrate: u32,
+        width: usize,
+        height: usize,
+        fps: u32,
+        bitrate: u32,
     ) -> Result<Self, PipelineError> {
-        Err(PipelineError::message(
-            "nvenc HEVC encoder only supports Windows",
-        ))
+        Ok(Self {
+            encoder: GstreamerNvencEncoder::new(
+                VideoCodec::Hevc,
+                "nvh265enc",
+                "h265parse",
+                "video/x-h265,stream-format=byte-stream,alignment=au",
+                width,
+                height,
+                fps,
+                bitrate,
+            )?,
+            main10: false,
+        })
     }
 
     pub fn new_main10_with_bitrate(
-        _width: usize,
-        _height: usize,
-        _fps: u32,
-        _bitrate: u32,
+        width: usize,
+        height: usize,
+        fps: u32,
+        bitrate: u32,
     ) -> Result<Self, PipelineError> {
-        Err(PipelineError::message(
-            "nvenc HEVC encoder only supports Windows",
-        ))
+        let mut encoder = Self::new_main_with_bitrate(width, height, fps, bitrate)?;
+        encoder.main10 = true;
+        Ok(encoder)
     }
 
     pub fn probe_hevc_available() -> Result<(), PipelineError> {
-        Err(PipelineError::message(
-            "nvenc HEVC encoder only supports Windows",
-        ))
+        require_gst_element("nvh265enc")
     }
 
     pub fn probe_hevc_main10_available() -> Result<(), PipelineError> {
-        Err(PipelineError::message(
-            "nvenc HEVC encoder only supports Windows",
-        ))
+        require_gst_element("nvh265enc")
     }
 }
 
 #[cfg(not(windows))]
 impl VideoEncoder for NvencH264Encoder {
-    fn encode(&mut self, _frame: &CapturedFrame) -> Result<Vec<EncodedAccessUnit>, PipelineError> {
-        Err(PipelineError::message(
-            "nvenc encoder only supports Windows",
-        ))
+    fn encode(&mut self, frame: &CapturedFrame) -> Result<Vec<EncodedAccessUnit>, PipelineError> {
+        self.encoder.encode(frame)
     }
 }
 
 #[cfg(not(windows))]
 impl VideoEncoder for NvencHevcEncoder {
-    fn encode(&mut self, _frame: &CapturedFrame) -> Result<Vec<EncodedAccessUnit>, PipelineError> {
-        Err(PipelineError::message(
-            "nvenc HEVC encoder only supports Windows",
-        ))
+    fn encode(&mut self, frame: &CapturedFrame) -> Result<Vec<EncodedAccessUnit>, PipelineError> {
+        self.encoder.encode(frame)
     }
 }

@@ -32,6 +32,24 @@ function mockMacCapabilities(command: string) {
   return undefined;
 }
 
+function mockLinuxCapabilities(command: string) {
+  if (command === "test_get_capabilities") {
+    return Promise.resolve({
+      os_type: "linux",
+      cpu_brand: "",
+      cpu_cores: 12,
+      memory_gb: 32,
+      gpu_info: "Mesa",
+      available_captures: ["linux", "synthetic"],
+      available_encoders: ["openh264"],
+      available_decoders: ["software"],
+      available_renderers: ["none", "linux"],
+      available_memory_modes: ["cpu"],
+    });
+  }
+  return undefined;
+}
+
 function windowsCapabilities(overrides: Record<string, unknown> = {}) {
   return {
     os_type: "windows",
@@ -147,6 +165,28 @@ describe("MatrixTestPage failure handling", () => {
       expect(screen.getByLabelText("macOS")).toBeInTheDocument();
       expect(screen.getByLabelText("VideoToolbox H.264")).toBeInTheDocument();
       expect(screen.getByLabelText("Metal")).toBeInTheDocument();
+    });
+
+    expect(screen.queryByLabelText("DXGI")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("NVENC H.264")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("DX11 popup")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("D3D11 shared texture")).not.toBeInTheDocument();
+  });
+
+  it("loads Linux-specific matrix dimensions from environment capabilities", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      const linuxCapabilities = mockLinuxCapabilities(command);
+      if (linuxCapabilities) return linuxCapabilities;
+      return Promise.resolve(null);
+    });
+
+    render(<MatrixTestPage />);
+
+    await waitFor(() => {
+      expect(screen.getAllByLabelText("Linux")).toHaveLength(2);
+      expect(screen.getByLabelText("OpenH264")).toBeInTheDocument();
+      expect(screen.getByLabelText("软件")).toBeInTheDocument();
     });
 
     expect(screen.queryByLabelText("DXGI")).not.toBeInTheDocument();
@@ -432,6 +472,43 @@ describe("MatrixTestPage failure handling", () => {
         }),
       })
     );
+  });
+
+  it("passes the Linux renderer flag for Linux matrix runs", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      const linuxCapabilities = mockLinuxCapabilities(command);
+      if (linuxCapabilities) return linuxCapabilities;
+      if (command === "test_start_run") {
+        return Promise.resolve("run-1");
+      }
+      if (command === "test_get_run") {
+        return Promise.resolve(null);
+      }
+      return Promise.resolve(null);
+    });
+
+    render(<MatrixTestPage runDelayMs={0} />);
+
+    await screen.findAllByLabelText("Linux");
+    fireEvent.click(screen.getByLabelText("No display"));
+    fireEvent.click(screen.getByRole("button", { name: /启动矩阵测试/ }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_start_run",
+        expect.objectContaining({
+          config: expect.objectContaining({
+            capture_type: "linux",
+            encoder_type: "openh264",
+            decoder_type: "software",
+            renderer_type: "linux",
+            render_display: true,
+            zero_copy: false,
+          }),
+        })
+      );
+    });
   });
 
   it("auto-enables DX11 popup for D3D11 shared texture matrix runs", async () => {

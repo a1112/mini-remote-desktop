@@ -4,7 +4,9 @@
 //! AV1 provides better compression efficiency than H.264 at the same quality.
 
 #[cfg(not(windows))]
-compile_error!("mrd-encode-nvenc-av1 is only supported on Windows");
+use mrd_pipeline_core::{
+    CapturedFrame, EncodedAccessUnit, FramePixelFormat, PipelineError, VideoCodec, VideoEncoder,
+};
 
 #[cfg(windows)]
 mod imp {
@@ -674,6 +676,7 @@ mod imp {
     }
 }
 
+#[cfg(windows)]
 pub use imp::NvencAv1Encoder;
 
 #[cfg(all(test, windows))]
@@ -691,13 +694,150 @@ mod tests {
 }
 
 #[cfg(not(windows))]
-pub struct NvencAv1Encoder;
+pub struct NvencAv1Encoder {
+    width: usize,
+    height: usize,
+    fps: u32,
+    frame_index: usize,
+}
+
+#[cfg(not(windows))]
+impl NvencAv1Encoder {
+    pub fn new(width: usize, height: usize, fps: u32) -> Result<Self, PipelineError> {
+        Self::new_low_latency(width, height, fps)
+    }
+
+    pub fn new_low_latency(width: usize, height: usize, fps: u32) -> Result<Self, PipelineError> {
+        require_gst_element("nvav1enc")?;
+        require_gst_element("av1parse")?;
+        Ok(Self {
+            width: width.max(2),
+            height: height.max(2),
+            fps: fps.max(1),
+            frame_index: 0,
+        })
+    }
+
+    pub fn new_ultra_low_latency(
+        width: usize,
+        height: usize,
+        fps: u32,
+    ) -> Result<Self, PipelineError> {
+        Self::new_low_latency(width, height, fps)
+    }
+
+    pub fn new_high_refresh_rate(
+        width: usize,
+        height: usize,
+        fps: u32,
+    ) -> Result<Self, PipelineError> {
+        Self::new_low_latency(width, height, fps)
+    }
+
+    pub fn preferred_input_memory_kind() -> mrd_pipeline_core::FrameMemoryKind {
+        mrd_pipeline_core::FrameMemoryKind::Cpu
+    }
+
+    pub fn probe_av1_available() -> Result<(), PipelineError> {
+        require_gst_element("nvav1enc")
+    }
+}
+
+#[cfg(not(windows))]
+fn require_gst_element(element: &str) -> Result<(), PipelineError> {
+    let status = std::process::Command::new("gst-inspect-1.0")
+        .arg(element)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|error| {
+            PipelineError::message(format!("gst-inspect-1.0 is not available: {error}"))
+        })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(PipelineError::message(format!(
+            "GStreamer element `{element}` is not available"
+        )))
+    }
+}
 
 #[cfg(not(windows))]
 impl VideoEncoder for NvencAv1Encoder {
-    fn encode(&mut self, _frame: &CapturedFrame) -> Result<Vec<EncodedAccessUnit>, PipelineError> {
-        Err(PipelineError::message(
-            "NVENC AV1 encoder is only supported on Windows",
-        ))
+    fn encode(&mut self, frame: &CapturedFrame) -> Result<Vec<EncodedAccessUnit>, PipelineError> {
+        if frame.pixel_format != FramePixelFormat::Bgra32 {
+            return Err(PipelineError::message(format!(
+                "Linux NVENC AV1 GStreamer path expects BGRA32 frames, got {:?}",
+                frame.pixel_format
+            )));
+        }
+        if frame.width != self.width || frame.height != self.height {
+            return Err(PipelineError::message(format!(
+                "Linux NVENC AV1 GStreamer path was initialized for {}x{}, got {}x{}",
+                self.width, self.height, frame.width, frame.height
+            )));
+        }
+
+        let output = std::process::Command::new("gst-launch-1.0")
+            .arg("-q")
+            .arg("fdsrc")
+            .arg("fd=0")
+            .arg(format!("blocksize={}", frame.data.len()))
+            .arg("num-buffers=1")
+            .arg("!")
+            .arg(format!(
+                "video/x-raw,format=BGRA,width={},height={},framerate={}/1",
+                self.width, self.height, self.fps
+            ))
+            .arg("!")
+            .arg("videoconvert")
+            .arg("!")
+            .arg("video/x-raw,format=BGRA")
+            .arg("!")
+            .arg("nvav1enc")
+            .arg("preset=p1")
+            .arg("tune=ultra-low-latency")
+            .arg("zerolatency=true")
+            .arg("bframes=0")
+            .arg(format!("gop-size={}", self.fps.min(60)))
+            .arg("!")
+            .arg("av1parse")
+            .arg("!")
+            .arg("fdsink")
+            .arg("fd=1")
+            .arg("sync=false")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                if let Some(mut stdin) = child.stdin.take() {
+                    use std::io::Write;
+                    stdin.write_all(&frame.data)?;
+                }
+                child.wait_with_output()
+            })
+            .map_err(|error| {
+                PipelineError::message(format!("launch Linux GStreamer NVENC AV1 failed: {error}"))
+            })?;
+
+        if !output.status.success() {
+            return Err(PipelineError::message(format!(
+                "Linux GStreamer NVENC AV1 failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+        if output.stdout.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let force_idr = self.frame_index == 0 || self.frame_index % self.fps as usize == 0;
+        self.frame_index += 1;
+        Ok(vec![EncodedAccessUnit {
+            codec: VideoCodec::Av1,
+            timestamp_us: frame.timestamp_us,
+            is_keyframe: force_idr,
+            bytes: output.stdout,
+        }])
     }
 }

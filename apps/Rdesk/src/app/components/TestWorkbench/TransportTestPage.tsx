@@ -119,13 +119,17 @@ export function TransportTestPage() {
     setCurrentRunId(null);
 
     const capture = chooseCapability(
-      ["macos", "dxgi", "synthetic"],
+      ["macos", "linux", "dxgi", "synthetic"],
       capabilities,
       "available_captures",
       "synthetic"
     );
     const encoder = chooseCapability(
-      capture === "macos" ? ["videotoolbox_h264", "openh264"] : ["nvenc_h264", "openh264"],
+      capture === "macos"
+        ? ["videotoolbox_h264", "openh264"]
+        : capture === "linux"
+          ? ["openh264"]
+          : ["nvenc_h264", "openh264"],
       capabilities,
       "available_encoders",
       "openh264"

@@ -4,7 +4,9 @@ use std::time::{Duration, Instant};
 
 const DEFAULT_CAPTURE_SOURCE_LIMIT: usize = 24;
 const MAX_CAPTURE_SOURCE_LIMIT: usize = 48;
+#[cfg(any(windows, target_os = "macos"))]
 const PREVIEW_MAX_WIDTH: usize = 240;
+#[cfg(any(windows, target_os = "macos"))]
 const PREVIEW_MAX_HEIGHT: usize = 135;
 const PREVIEW_FRAME_TIMEOUT_MS: u64 = 90;
 const PREVIEW_TOTAL_BUDGET_MS: u64 = 1_800;
@@ -98,9 +100,41 @@ pub fn create_frame_capture(source_id: &str) -> Result<mrd_capture_macos::MacosS
     Ok(capture)
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(target_os = "linux")]
+pub fn create_frame_capture(
+    source_id: &str,
+) -> Result<mrd_capture_pipewire::PipewireScreenCapture> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        anyhow::bail!(
+            "Linux capture creation from an async runtime must use create_frame_capture_async"
+        )
+    }
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| anyhow::anyhow!("create Linux capture runtime failed: {error}"))?;
+    runtime.block_on(create_frame_capture_async(source_id))
+}
+
+#[cfg(target_os = "linux")]
+pub async fn create_frame_capture_async(
+    source_id: &str,
+) -> Result<mrd_capture_pipewire::PipewireScreenCapture> {
+    validate_linux_capture_source_ref(source_id)?;
+
+    let mut capture = mrd_capture_pipewire::PipewireScreenCapture::new()
+        .map_err(|error| anyhow::anyhow!("Linux capture init failed: {error}"))?;
+    capture
+        .start_session()
+        .await
+        .map_err(|error| anyhow::anyhow!("Linux capture session start failed: {error}"))?;
+    Ok(capture)
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 pub fn create_frame_capture(_source_id: &str) -> Result<()> {
-    anyhow::bail!("remote desktop capture is currently only available on Windows and macOS")
+    anyhow::bail!("remote desktop capture is currently only available on Windows, macOS, and Linux")
 }
 
 #[cfg(windows)]
@@ -256,11 +290,62 @@ fn non_empty_string(value: String) -> Option<String> {
     }
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(target_os = "linux")]
 fn list_capture_sources_impl() -> Result<Vec<CaptureSource>> {
-    anyhow::bail!(
-        "remote window capture source enumeration is currently only available on Windows and macOS"
-    )
+    let mut sources = Vec::new();
+    let display_targets = mrd_capture_pipewire::PipewireScreenCapture::get_display_targets()
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    sources.extend(display_targets.into_iter().map(|target| CaptureSource {
+        id: format!("linux:display:{}", target.id),
+        platform: "linux".to_string(),
+        source_kind: "display".to_string(),
+        title: target.name,
+        class_name: linux_capture_backend_label().to_string(),
+        width: target.width,
+        height: target.height,
+        process_id: 0,
+        app_name: Some("Display".to_string()),
+        bundle_identifier: None,
+        preview_data_url: None,
+        preview_width: None,
+        preview_height: None,
+    }));
+
+    if let Ok(window_targets) = mrd_capture_pipewire::PipewireScreenCapture::get_window_targets() {
+        sources.extend(window_targets.into_iter().map(|target| CaptureSource {
+            id: format!("linux:window:{}", target.id),
+            platform: "linux".to_string(),
+            source_kind: "window".to_string(),
+            title: target.title,
+            class_name: linux_capture_backend_label().to_string(),
+            width: target.width,
+            height: target.height,
+            process_id: 0,
+            app_name: Some(target.app_name),
+            bundle_identifier: None,
+            preview_data_url: None,
+            preview_width: None,
+            preview_height: None,
+        }));
+    }
+
+    Ok(sources)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_capture_backend_label() -> &'static str {
+    if mrd_capture_pipewire::PipewireScreenCapture::is_wayland_available() {
+        "PipeWirePortal"
+    } else if mrd_capture_pipewire::PipewireScreenCapture::is_x11_available() {
+        "X11ScreenCapture"
+    } else {
+        "LinuxFallbackCapture"
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+fn list_capture_sources_impl() -> Result<Vec<CaptureSource>> {
+    anyhow::bail!("remote window capture source enumeration is currently only available on Windows, macOS, and Linux")
 }
 
 fn attach_capture_source_previews(sources: &mut [CaptureSource]) {
@@ -334,13 +419,21 @@ fn capture_source_preview_data_url(
     frame_preview_data_url(&frame, PREVIEW_MAX_WIDTH, PREVIEW_MAX_HEIGHT)
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(target_os = "linux")]
+fn capture_source_preview_data_url(
+    _source_id: &str,
+    _frame_timeout: Duration,
+) -> Result<(String, u32, u32)> {
+    anyhow::bail!("Linux capture previews require the async capture path and are not wired yet")
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 fn capture_source_preview_data_url(
     _source_id: &str,
     _frame_timeout: Duration,
 ) -> Result<(String, u32, u32)> {
     anyhow::bail!(
-        "remote window capture previews are currently only available on Windows and macOS"
+        "remote window capture previews are currently only available on Windows, macOS, and Linux"
     )
 }
 
@@ -400,6 +493,38 @@ fn parse_macos_u32_value(source_id: &str, value: &str) -> Result<u32> {
     };
     parsed
         .map_err(|error| anyhow::anyhow!("invalid macOS capture source id '{source_id}': {error}"))
+}
+
+#[cfg(target_os = "linux")]
+fn validate_linux_capture_source_ref(source_id: &str) -> Result<()> {
+    let trimmed = source_id.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("Linux capture source id is empty");
+    }
+
+    if let Some(value) = trimmed.strip_prefix("linux:display:") {
+        parse_linux_u32_value(source_id, value)?;
+        return Ok(());
+    }
+
+    if let Some(value) = trimmed.strip_prefix("linux:window:") {
+        parse_linux_u32_value(source_id, value)?;
+        return Ok(());
+    }
+
+    if trimmed == "linux" {
+        return Ok(());
+    }
+
+    anyhow::bail!("invalid Linux capture source id '{source_id}'")
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_u32_value(source_id: &str, value: &str) -> Result<u32> {
+    value
+        .trim()
+        .parse::<u32>()
+        .map_err(|error| anyhow::anyhow!("invalid Linux capture source id '{source_id}': {error}"))
 }
 
 #[cfg(windows)]
@@ -625,6 +750,30 @@ mod tests {
                 .iter()
                 .any(|source| source.platform == "macos" && source.source_kind == "display"),
             "expected at least one macOS display capture source: {sources:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_capture_source_refs_parse_display_and_window_ids() {
+        super::validate_linux_capture_source_ref("linux").unwrap();
+        super::validate_linux_capture_source_ref("linux:display:0").unwrap();
+        super::validate_linux_capture_source_ref("linux:window:42").unwrap();
+
+        assert!(super::validate_linux_capture_source_ref("linux:display:not-a-number").is_err());
+        assert!(super::validate_linux_capture_source_ref("windows:display:0").is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_lists_display_capture_sources_with_fallback() {
+        let sources = super::list_capture_sources(false, Some(8)).expect("list capture sources");
+
+        assert!(
+            sources
+                .iter()
+                .any(|source| source.platform == "linux" && source.source_kind == "display"),
+            "expected at least one Linux display capture source: {sources:?}"
         );
     }
 }

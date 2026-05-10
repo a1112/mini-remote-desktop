@@ -5,6 +5,56 @@ import { getMockInvoke } from "../../../test/mocks/tauri";
 import { E2ETestPage } from "./E2ETestPage";
 
 describe("E2ETestPage LAN automation", () => {
+  it("starts the Linux local end-to-end scenario with Linux capture and render", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve({
+          os_type: "linux",
+          cpu_brand: "test",
+          cpu_cores: 12,
+          memory_gb: 32,
+          gpu_info: "Mesa",
+          available_captures: ["linux", "synthetic"],
+          available_encoders: ["openh264"],
+          available_decoders: ["software"],
+          available_renderers: ["linux"],
+          available_memory_modes: ["cpu"],
+        });
+      }
+      if (command === "test_start_run") return Promise.resolve("run-linux-e2e");
+      if (command === "test_get_run") return Promise.resolve(null);
+      return Promise.resolve(null);
+    });
+
+    render(
+      <MemoryRouter>
+        <E2ETestPage />
+      </MemoryRouter>
+    );
+
+    await waitFor(() => {
+      expect(screen.getAllByText("linux").length).toBeGreaterThanOrEqual(2);
+    });
+    fireEvent.click(screen.getByRole("button", { name: /启动测试/ }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_start_run",
+        expect.objectContaining({
+          scenarioId: "e2e.linux_local",
+          config: expect.objectContaining({
+            capture_type: "linux",
+            encoder_type: "openh264",
+            decoder_type: "software",
+            renderer_type: "linux",
+            render_display: true,
+          }),
+        })
+      );
+    });
+  });
+
   it("runs LAN remote display automation through IPC commands", async () => {
     const mockInvoke = installSuccessfulLanAutomationMock();
 

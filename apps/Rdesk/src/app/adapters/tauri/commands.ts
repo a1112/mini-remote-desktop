@@ -25,6 +25,7 @@ import type {
   SessionInfo,
   SessionRuntimeSnapshot,
   RuntimeSnapshot,
+  CapabilitySnapshot,
   CaptureSource,
   CaptureSourceSelection,
   MediaProfile,
@@ -511,6 +512,13 @@ export async function ipcListSessions(): Promise<AdapterResult<SessionInfo[]>> {
  */
 export async function ipcRuntimeSnapshot(): Promise<AdapterResult<RuntimeSnapshot>> {
   return invokeAdapter<RuntimeSnapshot>('ipc_runtime_snapshot');
+}
+
+/**
+ * Get structured local capability snapshot from mrd-service.
+ */
+export async function ipcCapabilitySnapshot(): Promise<AdapterResult<CapabilitySnapshot>> {
+  return invokeAdapter<CapabilitySnapshot>('ipc_capability_snapshot');
 }
 
 /**

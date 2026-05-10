@@ -4,7 +4,7 @@ import * as commands from "../../adapters/tauri/commands";
 import type { EnvironmentSnapshot, FrameData, MetricSeries, TestConfig } from "../../adapters/tauri/types";
 import { capabilityAvailable, capabilityTag, chooseCapability, unavailableText } from "./capabilityMeta";
 
-type RendererType = "d3d11" | "macos" | "d3d12" | "opengl" | "webview";
+type RendererType = "d3d11" | "macos" | "linux" | "d3d12" | "opengl" | "webview";
 
 interface RendererOption {
   id: RendererType;
@@ -22,6 +22,11 @@ const RENDERER_OPTIONS: RendererOption[] = [
     id: "macos",
     name: "Metal",
     description: "macOS 原生 Metal 渲染器",
+  },
+  {
+    id: "linux",
+    name: "Linux",
+    description: "Linux 原生窗口渲染器",
   },
   {
     id: "d3d12",
@@ -284,7 +289,11 @@ export function RenderTestPage() {
 
     const scenarioId = usesProbe ? "render.probe" : "custom";
     const directCaptureCandidates: Array<NonNullable<TestConfig["capture_type"]>> =
-      selectedRenderer === "macos" ? ["macos", "synthetic"] : ["dxgi", "synthetic"];
+      selectedRenderer === "macos"
+        ? ["macos", "synthetic"]
+        : selectedRenderer === "linux"
+          ? ["linux", "synthetic"]
+          : ["dxgi", "synthetic"];
     const syntheticCaptureCandidates: Array<NonNullable<TestConfig["capture_type"]>> = [
       "synthetic",
       ...directCaptureCandidates,

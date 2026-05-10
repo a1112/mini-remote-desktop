@@ -3,6 +3,7 @@
 // This library is used by tests to access the service's internal modules.
 
 pub mod app_state;
+pub mod capabilities;
 pub mod capture_source;
 pub mod handlers;
 pub mod ipc_server;

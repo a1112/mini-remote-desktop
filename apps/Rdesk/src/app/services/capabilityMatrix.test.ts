@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
-import type { EnvironmentSnapshot, ProbeSnapshot } from "../adapters/tauri";
+import type {
+  CapabilitySnapshot as IpcCapabilitySnapshot,
+  EnvironmentSnapshot,
+  ProbeSnapshot,
+} from "../adapters/tauri";
 import {
+  buildCapabilitySnapshotFromIpc,
   buildCapabilitySnapshotFromEnvironment,
   evaluateCapabilityCombination,
   evaluateProfileProbe,
@@ -24,6 +29,19 @@ const windowsEnvironment: EnvironmentSnapshot = {
   available_memory_modes: ["cpu", "d3d11_shared"],
 };
 
+const linuxEnvironment: EnvironmentSnapshot = {
+  os_type: "linux",
+  cpu_brand: "AMD",
+  cpu_cores: 12,
+  memory_gb: 32,
+  gpu_info: "Mesa",
+  available_captures: ["linux", "synthetic"],
+  available_encoders: ["openh264"],
+  available_decoders: ["software"],
+  available_renderers: ["linux", "webview"],
+  available_memory_modes: ["cpu"],
+};
+
 function statusOf(snapshot: ReturnType<typeof buildCapabilitySnapshotFromEnvironment>, id: string) {
   return snapshot.capabilities.find((capability) => capability.id === id)?.status;
 }
@@ -35,6 +53,7 @@ describe("buildCapabilitySnapshotFromEnvironment", () => {
     expect(snapshot.schema_version).toBe(1);
     expect(snapshot.platform).toBe("windows");
     expect(statusOf(snapshot, "capture.dxgi")).toBe("available");
+    expect(statusOf(snapshot, "capture.linux")).toBeUndefined();
     expect(statusOf(snapshot, "encode.nvenc_h264")).toBe("available");
     expect(statusOf(snapshot, "decode.nvdec")).toBe("available");
     expect(statusOf(snapshot, "render.d3d11")).toBe("available");
@@ -70,6 +89,14 @@ describe("buildCapabilitySnapshotFromEnvironment", () => {
     expect(statusOf(snapshot, "render.webview")).toBe("degraded");
   });
 
+  it("classifies Linux legacy capabilities as available on Linux", () => {
+    const snapshot = buildCapabilitySnapshotFromEnvironment(linuxEnvironment);
+
+    expect(snapshot.platform).toBe("linux");
+    expect(statusOf(snapshot, "capture.linux")).toBe("available");
+    expect(statusOf(snapshot, "render.linux")).toBe("available");
+  });
+
   it("preserves unknown legacy values instead of dropping them", () => {
     const snapshot = buildCapabilitySnapshotFromEnvironment({
       ...windowsEnvironment,
@@ -87,7 +114,128 @@ describe("buildCapabilitySnapshotFromEnvironment", () => {
   });
 });
 
+describe("buildCapabilitySnapshotFromIpc", () => {
+  it("preserves service-owned structured snapshot fields for UI evaluation", () => {
+    const ipcSnapshot: IpcCapabilitySnapshot = {
+      schema_version: 1,
+      platform: "linux",
+      service_version: "0.1.0",
+      capabilities: [
+        {
+          id: "capture.pipewire",
+          domain: "capture",
+          label: "PipeWire capture",
+          status: "available",
+          platform: "linux",
+        },
+        {
+          id: "transport.quic_datagram",
+          domain: "transport",
+          label: "QUIC datagram media",
+          status: "usable",
+          platform: "linux",
+          fallback_ids: ["transport.webrtc"],
+        },
+      ],
+      constraints: [
+        {
+          id: "openh264_requires_cpu_input",
+          applies_to: ["encode.openh264", "memory.d3d11_shared"],
+          status: "block",
+          reason: "OpenH264 requires CPU-backed input",
+          fallback_ids: ["memory.cpu"],
+        },
+      ],
+      profiles: [
+        {
+          id: "smoke.720p30",
+          width: 1280,
+          height: 720,
+          fps: 30,
+          bitrate_mbps: 8,
+          codec: "h264",
+          required_capabilities: ["capture.pipewire", "transport.quic_datagram"],
+        },
+      ],
+      updated_at_ms: 1_700_000_000_000,
+    };
+
+    const snapshot = buildCapabilitySnapshotFromIpc(ipcSnapshot);
+
+    expect(snapshot.platform).toBe("linux");
+    expect(snapshot.service_version).toBe("0.1.0");
+    expect(snapshot.updated_at_ms).toBe(1_700_000_000_000);
+    expect(statusOf(snapshot, "capture.pipewire")).toBe("available");
+    expect(snapshot.constraints[0]?.status).toBe("block");
+    expect(snapshot.profiles[0]?.required_capabilities).toEqual([
+      "capture.pipewire",
+      "transport.quic_datagram",
+    ]);
+    expect(snapshot.recent_profile_results).toEqual([]);
+
+    const support = evaluateProfileSupport("smoke.720p30", snapshot);
+    expect(support.status).toBe("ready");
+  });
+});
+
 describe("evaluateCapabilityCombination", () => {
+  it("accepts a Windows hardware capture-to-render path when every stage is exposed", () => {
+    const snapshot = buildCapabilitySnapshotFromEnvironment(windowsEnvironment);
+
+    const result = evaluateCapabilityCombination(
+      {
+        capture: "dxgi",
+        encoder: "nvenc_h264",
+        decoder: "nvdec",
+        renderer: "d3d11",
+        memory: "d3d11_shared",
+      },
+      snapshot
+    );
+
+    expect(result.status).toBe("ready");
+    expect(result.reasons).toEqual([]);
+  });
+
+  it("marks the Linux OpenH264 path runnable but degraded", () => {
+    const snapshot = buildCapabilitySnapshotFromEnvironment(linuxEnvironment);
+
+    const result = evaluateCapabilityCombination(
+      {
+        capture: "linux",
+        encoder: "openh264",
+        decoder: "software",
+        renderer: "linux",
+        memory: "cpu",
+      },
+      snapshot
+    );
+
+    expect(result.status).toBe("degraded");
+    expect(result.reasons.join(" ")).toContain("encode.openh264");
+    expect(result.reasons.join(" ")).toContain("decode.software");
+  });
+
+  it("blocks a Linux request for Windows-only NVIDIA hardware stages", () => {
+    const snapshot = buildCapabilitySnapshotFromEnvironment(linuxEnvironment);
+
+    const result = evaluateCapabilityCombination(
+      {
+        capture: "linux",
+        encoder: "nvenc_h264",
+        decoder: "nvdec",
+        renderer: "d3d11",
+        memory: "d3d11_shared",
+      },
+      snapshot
+    );
+
+    expect(result.status).toBe("blocked");
+    expect(result.reasons.join(" ")).toContain("encode.nvenc_h264");
+    expect(result.reasons.join(" ")).toContain("decode.nvdec");
+    expect(result.reasons.join(" ")).toContain("render.d3d11");
+  });
+
   it("blocks OpenH264 with D3D11 shared memory unless a CPU copy step is declared", () => {
     const snapshot = buildCapabilitySnapshotFromEnvironment(windowsEnvironment);
 
@@ -195,6 +343,17 @@ describe("capability profiles", () => {
 
     expect(result.status).toBe("blocked");
     expect(result.reasons.join(" ")).toContain("transport.media_profile_control_v1");
+  });
+
+  it("marks software fallback profiles as degraded instead of unavailable", () => {
+    const snapshot = buildCapabilitySnapshotFromEnvironment(linuxEnvironment);
+
+    const result = evaluateProfileSupport("diagnostic.software", snapshot);
+
+    expect(result.status).toBe("degraded");
+    expect(result.reasons.join(" ")).toContain("encode.openh264");
+    expect(result.reasons.join(" ")).toContain("decode.software");
+    expect(result.reasons.join(" ")).toContain("render.webview");
   });
 
   it("fails runtime profile probe when negotiated media does not match the requested profile", () => {

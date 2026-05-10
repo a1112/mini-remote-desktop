@@ -12,10 +12,12 @@ import {
 import * as commands from "../../adapters/tauri/commands";
 import type { TestScenario, TestRun, EnvironmentSnapshot } from "../../adapters/tauri/types";
 import {
+  buildCapabilitySnapshotFromIpc,
   buildCapabilitySnapshotFromEnvironment,
   evaluateProfileSupport,
   type CapabilityDomain,
   type CapabilityItem,
+  type CapabilitySnapshot,
   type CapabilityStatus,
 } from "../../services/capabilityMatrix";
 
@@ -38,6 +40,8 @@ export function OverviewPage() {
   const [scenarios, setScenarios] = useState<TestScenario[]>([]);
   const [recentRuns, setRecentRuns] = useState<TestRun[]>([]);
   const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
+  const [serviceCapabilitySnapshot, setServiceCapabilitySnapshot] =
+    useState<CapabilitySnapshot | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -47,15 +51,19 @@ export function OverviewPage() {
   async function loadOverviewData() {
     setLoading(true);
     try {
-      const [scenariosResult, runsResult, capsResult] = await Promise.all([
+      const [scenariosResult, runsResult, capsResult, serviceCapsResult] = await Promise.all([
         commands.testListScenarios(),
         commands.testListRuns({ limit: 5 }),
         commands.testGetCapabilities(),
+        commands.ipcCapabilitySnapshot(),
       ]);
 
       if (scenariosResult.ok) setScenarios(scenariosResult.value);
       if (runsResult.ok) setRecentRuns(runsResult.value);
       if (capsResult.ok) setCapabilities(capsResult.value);
+      if (serviceCapsResult.ok) {
+        setServiceCapabilitySnapshot(buildCapabilitySnapshotFromIpc(serviceCapsResult.value));
+      }
     } catch (error) {
       console.error("Failed to load overview data:", error);
     } finally {
@@ -65,9 +73,9 @@ export function OverviewPage() {
 
   const successfulRuns = recentRuns.filter((r) => r.status === "completed").length;
   const failedRuns = recentRuns.filter((r) => r.status === "failed").length;
-  const capabilitySnapshot = capabilities
-    ? buildCapabilitySnapshotFromEnvironment(capabilities)
-    : null;
+  const capabilitySnapshot =
+    serviceCapabilitySnapshot ??
+    (capabilities ? buildCapabilitySnapshotFromEnvironment(capabilities) : null);
   const capabilityGroups = capabilitySnapshot
     ? groupCapabilitiesByDomain(capabilitySnapshot.capabilities)
     : [];
