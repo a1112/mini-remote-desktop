@@ -1606,42 +1606,53 @@ fn test_harness_get_comparison_result(
 }
 
 #[tauri::command]
-fn test_harness_get_frames(
+async fn test_harness_get_frames(
     state: tauri::State<'_, AppState>,
     include_captured: Option<bool>,
     include_rendered: Option<bool>,
     last_captured_generation: Option<u64>,
     last_rendered_generation: Option<u64>,
-) -> (
-    Option<(String, usize, usize, u64)>,
-    Option<(String, usize, usize, u64)>,
-) {
+) -> Result<
+    (
+        Option<(String, usize, usize, u64)>,
+        Option<(String, usize, usize, u64)>,
+    ),
+    String,
+> {
     let include_captured = include_captured.unwrap_or(true);
     let include_rendered = include_rendered.unwrap_or(true);
-    let (captured, rendered) = state.test_harness.lock().unwrap().get_latest_frames_since(
-        include_captured,
-        include_rendered,
-        last_captured_generation,
-        last_rendered_generation,
-    );
+    let test_harness = state.test_harness.clone();
 
-    let captured_base64 = if include_captured {
-        captured.and_then(|(data, width, height, generation)| {
-            encode_bgra_png_base64(&data, width, height).map(|png| (png, width, height, generation))
-        })
-    } else {
-        None
-    };
+    tokio::task::spawn_blocking(move || {
+        let (captured, rendered) = test_harness.lock().unwrap().get_latest_frames_since(
+            include_captured,
+            include_rendered,
+            last_captured_generation,
+            last_rendered_generation,
+        );
 
-    let rendered_base64 = if include_rendered {
-        rendered.and_then(|(data, width, height, generation)| {
-            encode_bgra_png_base64(&data, width, height).map(|png| (png, width, height, generation))
-        })
-    } else {
-        None
-    };
+        let captured_base64 = if include_captured {
+            captured.and_then(|(data, width, height, generation)| {
+                encode_bgra_png_base64(&data, width, height)
+                    .map(|png| (png, width, height, generation))
+            })
+        } else {
+            None
+        };
 
-    (captured_base64, rendered_base64)
+        let rendered_base64 = if include_rendered {
+            rendered.and_then(|(data, width, height, generation)| {
+                encode_bgra_png_base64(&data, width, height)
+                    .map(|png| (png, width, height, generation))
+            })
+        } else {
+            None
+        };
+
+        (captured_base64, rendered_base64)
+    })
+    .await
+    .map_err(|error| error.to_string())
 }
 
 fn encode_bgra_png_base64(bgra: &[u8], width: usize, height: usize) -> Option<String> {

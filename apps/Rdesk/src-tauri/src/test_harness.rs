@@ -35,8 +35,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const WEB_PREVIEW_MAX_WIDTH: usize = 960;
-const WEB_PREVIEW_FRAME_UPDATE_INTERVAL: usize = 2;
+const WEB_PREVIEW_MAX_WIDTH: usize = 640;
+const WEB_PREVIEW_FRAME_UPDATE_INTERVAL: usize = 8;
 const ENCODED_ACCESS_UNIT_SUBSCRIBER_QUEUE_DEPTH: usize = 1;
 const NATIVE_RENDER_FRAME_TIMEOUT_MS: u64 = 2_000;
 const NATIVE_RENDER_THREAD_STOP_TIMEOUT_MS: u64 = 750;

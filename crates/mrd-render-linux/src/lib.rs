@@ -247,6 +247,7 @@ impl X11Renderer {
         use x11::xlib;
 
         unsafe {
+            init_x11_threads();
             let display = (xlib::XOpenDisplay)(ptr::null());
 
             if display.is_null() {
@@ -478,6 +479,14 @@ impl Drop for X11Renderer {
 fn atom(display: *mut x11::xlib::Display, name: &str) -> x11::xlib::Atom {
     let name = std::ffi::CString::new(name).expect("X11 atom names must not contain NUL");
     unsafe { (x11::xlib::XInternAtom)(display, name.as_ptr(), x11::xlib::False) }
+}
+
+#[cfg(feature = "x11")]
+fn init_x11_threads() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| unsafe {
+        let _ = x11::xlib::XInitThreads();
+    });
 }
 
 #[cfg(feature = "x11")]

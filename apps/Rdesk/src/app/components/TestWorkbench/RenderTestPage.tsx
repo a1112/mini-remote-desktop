@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Play, Square, Monitor, Palette, Layers, ImageOff } from "lucide-react";
 import * as commands from "../../adapters/tauri/commands";
 import type { EnvironmentSnapshot, FrameData, MetricSeries, TestConfig } from "../../adapters/tauri/types";
@@ -102,6 +102,9 @@ export function RenderTestPage() {
   const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
   const [startError, setStartError] = useState<string | null>(null);
   const [previewFrame, setPreviewFrame] = useState<FrameData | null>(null);
+  const lastCapturedGenerationRef = useRef<number | undefined>(undefined);
+  const lastRenderedGenerationRef = useRef<number | undefined>(undefined);
+  const frameRequestInFlightRef = useRef(false);
 
   const selectedOption = RENDERER_OPTIONS.find((o) => o.id === selectedRenderer);
   const selectedAvailable = selectedOption
@@ -193,12 +196,23 @@ export function RenderTestPage() {
           });
         }
 
-        const framesResult = await commands.testHarnessGetFrames({
-          includeCaptured: false,
-          includeRendered: true,
-        });
-        if (framesResult.ok) {
-          setPreviewFrame(framesResult.value[1] ?? framesResult.value[0] ?? null);
+        if (!frameRequestInFlightRef.current) {
+          frameRequestInFlightRef.current = true;
+          const framesResult = await commands.testHarnessGetFrames({
+            includeCaptured: false,
+            includeRendered: true,
+            lastCapturedGeneration: lastCapturedGenerationRef.current,
+            lastRenderedGeneration: lastRenderedGenerationRef.current,
+          });
+          frameRequestInFlightRef.current = false;
+
+          if (framesResult.ok) {
+            const [capturedFrame, renderedFrame] = framesResult.value;
+            const nextFrame = renderedFrame ?? capturedFrame ?? null;
+            if (renderedFrame) lastRenderedGenerationRef.current = renderedFrame[3];
+            if (capturedFrame) lastCapturedGenerationRef.current = capturedFrame[3];
+            if (nextFrame) setPreviewFrame(nextFrame);
+          }
         }
       }
 
@@ -252,6 +266,9 @@ export function RenderTestPage() {
 
     setMetrics(null);
     setPreviewFrame(null);
+    lastCapturedGenerationRef.current = undefined;
+    lastRenderedGenerationRef.current = undefined;
+    frameRequestInFlightRef.current = false;
     setStartError(null);
     setCurrentRunId(null);
     setCurrentRunUsesProbe(false);
