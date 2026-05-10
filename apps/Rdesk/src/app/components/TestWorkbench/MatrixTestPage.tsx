@@ -13,6 +13,10 @@ import {
   evaluateCapabilityCombination,
   type CapabilitySnapshot,
 } from "../../services/capabilityMatrix";
+import {
+  readShowUnavailableCapabilities,
+  useShowUnavailableCapabilities,
+} from "./useCapabilityVisibility";
 
 interface MatrixDimension {
   id: string;
@@ -24,6 +28,7 @@ interface MatrixOption {
   id: string;
   name: string;
   enabled: boolean;
+  available?: boolean;
   defaultEnabledOn?: HostOs[];
 }
 
@@ -200,7 +205,10 @@ function optionEnabledForOs(option: MatrixOption, os: HostOs): boolean {
   return option.defaultEnabledOn ? option.defaultEnabledOn.includes(os) : option.enabled;
 }
 
-function createMatrixDimensions(capabilities?: EnvironmentSnapshot | null): MatrixDimension[] {
+function createMatrixDimensions(
+  capabilities?: EnvironmentSnapshot | null,
+  showUnavailable = false
+): MatrixDimension[] {
   const os = normalizeHostOs(capabilities?.os_type ?? "windows");
   const availableCaptures = capabilities?.available_captures ?? defaultCapturesForOs(os);
   const availableEncoders = capabilities?.available_encoders ?? defaultEncodersForOs(os);
@@ -241,11 +249,12 @@ function createMatrixDimensions(capabilities?: EnvironmentSnapshot | null): Matr
   return MATRIX_DIMENSIONS.map((dimension) => ({
     ...dimension,
     options: dimension.options
-      .filter((option) => optionAvailable(dimension.id, option.id))
       .map((option) => ({
         ...option,
-        enabled: optionEnabledForOs(option, os),
-      })),
+        available: optionAvailable(dimension.id, option.id),
+        enabled: optionAvailable(dimension.id, option.id) && optionEnabledForOs(option, os),
+      }))
+      .filter((option) => showUnavailable || option.available),
   })).filter((dimension) => dimension.options.length > 0);
 }
 
@@ -527,8 +536,9 @@ function matrixConfigKey(config: TestConfig): string {
 }
 
 export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) {
+  const [showUnavailable] = useShowUnavailableCapabilities();
   const [dimensions, setDimensions] = useState<MatrixDimension[]>(() =>
-    createMatrixDimensions(null)
+    createMatrixDimensions(null, readShowUnavailableCapabilities())
   );
   const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
   const [serviceCapabilitySnapshot, setServiceCapabilitySnapshot] =
@@ -558,10 +568,10 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
 
       if (legacyResult.ok && legacyResult.value) {
         setCapabilities(legacyResult.value);
-        setDimensions(createMatrixDimensions(legacyResult.value));
+        setDimensions(createMatrixDimensions(legacyResult.value, showUnavailable));
       }
 
-      if (serviceResult.ok) {
+      if (serviceResult.ok && serviceResult.value) {
         setServiceCapabilitySnapshot(buildCapabilitySnapshotFromIpc(serviceResult.value));
       }
     }
@@ -571,10 +581,15 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [showUnavailable]);
 
   const toggleOption = (dimensionId: string, optionId: string) => {
     setDimensions((current) => {
+      const option = current
+        .find((dim) => dim.id === dimensionId)
+        ?.options.find((opt) => opt.id === optionId);
+      if (option?.available === false) return current;
+
       let next = current.map((dim) =>
         dim.id === dimensionId
           ? {
@@ -947,16 +962,23 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
                 {dim.options.map((opt) => (
                   <label
                     key={opt.id}
-                    className="flex items-center gap-2 p-2 rounded hover:bg-muted cursor-pointer"
+                    className={`flex items-center gap-2 p-2 rounded hover:bg-muted ${
+                      opt.available === false ? "cursor-not-allowed opacity-50" : "cursor-pointer"
+                    }`}
                   >
                     <input
                       type="checkbox"
                       checked={opt.enabled}
                       onChange={() => toggleOption(dim.id, opt.id)}
-                      disabled={isRunning}
+                      disabled={isRunning || opt.available === false}
                       className="rounded"
                     />
                     <span className="text-sm">{opt.name}</span>
+                    {opt.available === false && (
+                      <span className="text-xs bg-yellow-100 text-yellow-800 px-1 rounded">
+                        不可用
+                      </span>
+                    )}
                     {opt.id === "nvenc_av1" && (
                       <span className="text-xs bg-yellow-100 text-yellow-800 px-1 rounded">
                         NVDEC

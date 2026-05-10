@@ -25,6 +25,7 @@ import {
 } from "lucide-react";
 import * as commands from "../../adapters/tauri/commands";
 import type { SystemResourceSnapshot } from "../../adapters/tauri/types";
+import { useShowUnavailableCapabilities } from "./useCapabilityVisibility";
 
 const navigation = [
   { name: "Overview", href: "/test", icon: LayoutDashboard },
@@ -44,6 +45,7 @@ export function WorkbenchLayout() {
   const navigate = useNavigate();
   const [resourceSnapshot, setResourceSnapshot] =
     useState<SystemResourceSnapshot | null>(null);
+  const [showUnavailable, setShowUnavailable] = useShowUnavailableCapabilities();
 
   const noDragSelector =
     'button, a, input, select, textarea, [role="button"], [data-no-drag="true"]';
@@ -179,8 +181,17 @@ export function WorkbenchLayout() {
             })}
           </nav>
 
-          <div className="mt-auto border-t pt-4 text-xs text-muted-foreground dark:border-white/10">
-            WebRTC capture display path
+          <div className="mt-auto space-y-3 border-t pt-4 text-xs text-muted-foreground dark:border-white/10">
+            <label className="flex cursor-pointer items-center gap-2 rounded-md border bg-background/50 px-3 py-2 text-foreground transition-colors hover:bg-muted dark:border-white/10 dark:bg-white/5 dark:hover:bg-white/10">
+              <input
+                type="checkbox"
+                checked={showUnavailable}
+                onChange={(event) => setShowUnavailable(event.target.checked)}
+                className="h-4 w-4 accent-primary"
+              />
+              <span>显示不可用能力</span>
+            </label>
+            <div>WebRTC capture display path</div>
           </div>
         </aside>
 

@@ -18,6 +18,10 @@ import type {
   WindowCaptureTarget,
 } from "../../adapters/tauri/types";
 import { capabilityAvailable, capabilityTag, unavailableText } from "./capabilityMeta";
+import {
+  shouldShowCapabilityOption,
+  useShowUnavailableCapabilities,
+} from "./useCapabilityVisibility";
 
 type CaptureType = "dxgi" | "winrt" | "macos" | "linux" | "synthetic";
 type CaptureScope = "screen" | "window_perf" | "window_probe";
@@ -189,6 +193,7 @@ export function CaptureTestPage() {
   const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
   const [startError, setStartError] = useState<string | null>(null);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
+  const [showUnavailable] = useShowUnavailableCapabilities();
 
   const selectedOption = CAPTURE_OPTIONS.find((o) => o.id === selectedCapture);
   const selectedWindowCapture = supportsWindowCapture(selectedCapture);
@@ -197,6 +202,9 @@ export function CaptureTestPage() {
   const isWindowMode = isWindowPerfMode || isWindowProbeMode;
   const captureAvailable = (capture: CaptureType) =>
     capabilityAvailable(capabilities, "available_captures", capture, capture === "synthetic");
+  const visibleCaptureOptions = CAPTURE_OPTIONS.filter((option) =>
+    !capabilities || shouldShowCapabilityOption(captureAvailable(option.id), showUnavailable)
+  );
   const selectedWindow =
     windowTargets.find((target) => windowTargetKey(target) === selectedWindowHwnd) ??
     windowPickerTargets.find((target) => windowTargetKey(target) === selectedWindowHwnd);
@@ -486,7 +494,7 @@ export function CaptureTestPage() {
       <div className="bg-card rounded-lg border p-4 mb-6">
         <h2 className="text-lg font-semibold mb-4">选择捕获源</h2>
         <div className="grid md:grid-cols-3 gap-4">
-          {CAPTURE_OPTIONS.map((option) => {
+          {visibleCaptureOptions.map((option) => {
             const available = captureAvailable(option.id);
             const disabledLabel = unavailableText(capabilities, "available_captures", option.id);
             return (

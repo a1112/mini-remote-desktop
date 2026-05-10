@@ -3,6 +3,10 @@ import { Play, Square, Cpu, Monitor, Clock, Gauge } from "lucide-react";
 import * as commands from "../../adapters/tauri/commands";
 import type { EnvironmentSnapshot, TestConfig } from "../../adapters/tauri/types";
 import { capabilityAvailable, capabilityTag, unavailableText } from "./capabilityMeta";
+import {
+  shouldShowCapabilityOption,
+  useShowUnavailableCapabilities,
+} from "./useCapabilityVisibility";
 
 type DecoderType = "nvdec" | "software" | "videotoolbox";
 type DecodeCodec = "h264" | "hevc" | "hevc_main10" | "av1";
@@ -258,6 +262,7 @@ export function DecodeTestPage() {
   const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
   const [startError, setStartError] = useState<string | null>(null);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
+  const [showUnavailable] = useShowUnavailableCapabilities();
 
   const selectedProfile =
     DECODE_PROFILES.find((profile) => profile.id === selectedProfileId) ?? DEFAULT_DECODE_PROFILE;
@@ -267,6 +272,11 @@ export function DecodeTestPage() {
     capabilityAvailable(capabilities, "available_decoders", selectedDecoder, selectedDecoder === "software") &&
     codecSupportedByDecoder(selectedCodec, selectedDecoder) &&
     !missingChainCapability(capabilities, selectedRun.config);
+  const decoderAvailable = (decoder: DecoderType) =>
+    capabilityAvailable(capabilities, "available_decoders", decoder, decoder === "software");
+  const visibleDecoderOptions = DECODER_OPTIONS.filter((option) =>
+    !capabilities || shouldShowCapabilityOption(decoderAvailable(option.id), showUnavailable)
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -289,10 +299,8 @@ export function DecodeTestPage() {
   }, [selectedCodec, selectedDecoder]);
 
   useEffect(() => {
-    if (!capabilities || capabilityAvailable(capabilities, "available_decoders", selectedDecoder, false)) return;
-    const nextDecoder = DECODER_OPTIONS.find((option) =>
-      capabilityAvailable(capabilities, "available_decoders", option.id, option.id === "software")
-    );
+    if (!capabilities || decoderAvailable(selectedDecoder)) return;
+    const nextDecoder = DECODER_OPTIONS.find((option) => decoderAvailable(option.id));
     if (nextDecoder) setSelectedDecoder(nextDecoder.id);
   }, [capabilities, selectedDecoder]);
 
@@ -373,13 +381,8 @@ export function DecodeTestPage() {
       <div className="bg-card rounded-lg border p-4 mb-6">
         <h2 className="text-lg font-semibold mb-4">选择解码器</h2>
         <div className="grid md:grid-cols-3 gap-4">
-          {DECODER_OPTIONS.map((option) => {
-            const available = capabilityAvailable(
-              capabilities,
-              "available_decoders",
-              option.id,
-              option.id === "software"
-            );
+          {visibleDecoderOptions.map((option) => {
+            const available = decoderAvailable(option.id);
             const disabledLabel = unavailableText(capabilities, "available_decoders", option.id);
             return (
               <button

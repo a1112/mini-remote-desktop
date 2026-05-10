@@ -20,6 +20,10 @@ import {
   type CapabilitySnapshot,
   type CapabilityStatus,
 } from "../../services/capabilityMatrix";
+import {
+  shouldShowCapabilityStatus,
+  useShowUnavailableCapabilities,
+} from "./useCapabilityVisibility";
 
 const CAPABILITY_DOMAIN_ORDER: CapabilityDomain[] = [
   "capture",
@@ -43,6 +47,7 @@ export function OverviewPage() {
   const [serviceCapabilitySnapshot, setServiceCapabilitySnapshot] =
     useState<CapabilitySnapshot | null>(null);
   const [loading, setLoading] = useState(true);
+  const [showUnavailable, setShowUnavailable] = useShowUnavailableCapabilities();
 
   useEffect(() => {
     loadOverviewData();
@@ -61,7 +66,7 @@ export function OverviewPage() {
       if (scenariosResult.ok) setScenarios(scenariosResult.value);
       if (runsResult.ok) setRecentRuns(runsResult.value);
       if (capsResult.ok) setCapabilities(capsResult.value);
-      if (serviceCapsResult.ok) {
+      if (serviceCapsResult.ok && serviceCapsResult.value) {
         setServiceCapabilitySnapshot(buildCapabilitySnapshotFromIpc(serviceCapsResult.value));
       }
     } catch (error) {
@@ -77,8 +82,13 @@ export function OverviewPage() {
     serviceCapabilitySnapshot ??
     (capabilities ? buildCapabilitySnapshotFromEnvironment(capabilities) : null);
   const capabilityGroups = capabilitySnapshot
-    ? groupCapabilitiesByDomain(capabilitySnapshot.capabilities)
+    ? groupCapabilitiesByDomain(capabilitySnapshot.capabilities, showUnavailable)
     : [];
+  const hiddenCapabilityCount = capabilitySnapshot
+    ? capabilitySnapshot.capabilities.filter(
+        (capability) => !shouldShowCapabilityStatus(capability.status, false)
+      ).length
+    : 0;
   const lan2k144Evaluation = capabilitySnapshot
     ? evaluateProfileSupport("lan.2k144", capabilitySnapshot)
     : null;
@@ -132,14 +142,30 @@ export function OverviewPage() {
                 <div>
                   <h2 className="text-lg font-semibold">结构化能力矩阵</h2>
                   <p className="text-sm text-muted-foreground">
-                    按 domain 展示当前机器能力、降级路径和不可用原因。
+                    默认只显示可用或可降级能力；勾选后显示所有平台能力。
                   </p>
                 </div>
-                <div className="rounded-lg border bg-background/70 px-3 py-2 text-sm">
-                  <div className="text-xs text-muted-foreground">Profile readiness</div>
-                  <div className="mt-1 flex flex-wrap items-center gap-2">
-                    <span className="font-medium">lan.2k144</span>
-                    <StatusBadge status={lan2k144Evaluation?.status ?? "blocked"} />
+                <div className="flex flex-col gap-2 md:items-end">
+                  <label className="flex cursor-pointer items-center gap-2 rounded-lg border bg-background/70 px-3 py-2 text-sm">
+                    <input
+                      type="checkbox"
+                      checked={showUnavailable}
+                      onChange={(event) => setShowUnavailable(event.target.checked)}
+                      className="h-4 w-4 accent-primary"
+                    />
+                    <span>显示不可用能力</span>
+                    {!showUnavailable && hiddenCapabilityCount > 0 && (
+                      <span className="text-xs text-muted-foreground">
+                        已隐藏 {hiddenCapabilityCount}
+                      </span>
+                    )}
+                  </label>
+                  <div className="rounded-lg border bg-background/70 px-3 py-2 text-sm">
+                    <div className="text-xs text-muted-foreground">Profile readiness</div>
+                    <div className="mt-1 flex flex-wrap items-center gap-2">
+                      <span className="font-medium">lan.2k144</span>
+                      <StatusBadge status={lan2k144Evaluation?.status ?? "blocked"} />
+                    </div>
                   </div>
                 </div>
               </div>
@@ -303,13 +329,20 @@ export function OverviewPage() {
   );
 }
 
-function groupCapabilitiesByDomain(capabilities: CapabilityItem[]): Array<{
+function groupCapabilitiesByDomain(
+  capabilities: CapabilityItem[],
+  showUnavailable: boolean
+): Array<{
   domain: CapabilityDomain;
   items: CapabilityItem[];
 }> {
   return CAPABILITY_DOMAIN_ORDER.map((domain) => ({
     domain,
-    items: capabilities.filter((capability) => capability.domain === domain),
+    items: capabilities.filter(
+      (capability) =>
+        capability.domain === domain &&
+        shouldShowCapabilityStatus(capability.status, showUnavailable)
+    ),
   })).filter((group) => group.items.length > 0);
 }
 

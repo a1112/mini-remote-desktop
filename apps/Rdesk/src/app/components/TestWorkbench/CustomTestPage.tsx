@@ -4,6 +4,10 @@ import { Play, Settings, Monitor, Cpu, Zap, Network } from "lucide-react";
 import * as commands from "../../adapters/tauri/commands";
 import type { EnvironmentSnapshot, TestConfig } from "../../adapters/tauri/types";
 import { capabilityAvailable, capabilityTag, unavailableText } from "./capabilityMeta";
+import {
+  shouldShowCapabilityOption,
+  useShowUnavailableCapabilities,
+} from "./useCapabilityVisibility";
 
 type CaptureId = NonNullable<TestConfig["capture_type"]>;
 type EncoderId = NonNullable<TestConfig["encoder_type"]>;
@@ -213,6 +217,7 @@ export function CustomTestPage() {
   const [starting, setStarting] = useState(false);
   const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
   const [startError, setStartError] = useState<string | null>(null);
+  const [showUnavailable] = useShowUnavailableCapabilities();
 
   useEffect(() => {
     let cancelled = false;
@@ -246,6 +251,15 @@ export function CustomTestPage() {
     capabilities,
     "available_renderers",
     selectedRenderer
+  );
+  const visibleCaptureOptions = CAPTURE_OPTIONS.filter((option) =>
+    !capabilities || shouldShowCapabilityOption(isCaptureAvailable(option.id), showUnavailable)
+  );
+  const visibleEncoderOptions = ENCODER_OPTIONS.filter((option) =>
+    !capabilities || shouldShowCapabilityOption(isEncoderAvailable(option.id), showUnavailable)
+  );
+  const visibleDecoderOptions = DECODER_OPTIONS.filter((option) =>
+    !capabilities || shouldShowCapabilityOption(isDecoderAvailable(option.id), showUnavailable)
   );
 
   useEffect(() => {
@@ -421,7 +435,7 @@ export function CustomTestPage() {
         <div className="bg-card rounded-lg border p-4">
           <h3 className="font-medium mb-3">捕获源</h3>
           <div className="space-y-2">
-            {CAPTURE_OPTIONS.map((option) => {
+            {visibleCaptureOptions.map((option) => {
               const available = isCaptureAvailable(option.id);
               const disabledLabel = unavailableText(capabilities, "available_captures", option.id);
               return (
@@ -467,7 +481,7 @@ export function CustomTestPage() {
         <div className="bg-card rounded-lg border p-4">
           <h3 className="font-medium mb-3">编码器</h3>
           <div className="space-y-2">
-            {ENCODER_OPTIONS.map((option) => {
+            {visibleEncoderOptions.map((option) => {
               const available = isEncoderAvailable(option.id);
               const isAv1Unavailable = option.id === "nvenc_av1" && !available;
 
@@ -519,7 +533,7 @@ export function CustomTestPage() {
         <div className="bg-card rounded-lg border p-4">
           <h3 className="font-medium mb-3">解码器</h3>
           <div className="space-y-2">
-            {DECODER_OPTIONS.map((option) => {
+            {visibleDecoderOptions.map((option) => {
               const available = isDecoderAvailable(option.id);
               const disabledLabel =
                 option.id === "none"

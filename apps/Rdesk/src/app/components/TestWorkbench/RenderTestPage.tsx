@@ -3,6 +3,10 @@ import { Play, Square, Monitor, Palette, Layers, ImageOff } from "lucide-react";
 import * as commands from "../../adapters/tauri/commands";
 import type { EnvironmentSnapshot, FrameData, MetricSeries, TestConfig } from "../../adapters/tauri/types";
 import { capabilityAvailable, capabilityTag, chooseCapability, unavailableText } from "./capabilityMeta";
+import {
+  shouldShowCapabilityOption,
+  useShowUnavailableCapabilities,
+} from "./useCapabilityVisibility";
 
 type RendererType = "d3d11" | "macos" | "linux" | "d3d12" | "opengl" | "webview";
 
@@ -105,11 +109,16 @@ export function RenderTestPage() {
   const lastCapturedGenerationRef = useRef<number | undefined>(undefined);
   const lastRenderedGenerationRef = useRef<number | undefined>(undefined);
   const frameRequestInFlightRef = useRef(false);
+  const [showUnavailable] = useShowUnavailableCapabilities();
 
   const selectedOption = RENDERER_OPTIONS.find((o) => o.id === selectedRenderer);
   const selectedAvailable = selectedOption
     ? isRendererAvailable(capabilities, selectedOption.id)
     : false;
+  const visibleRendererOptions = RENDERER_OPTIONS.filter((option) =>
+    !capabilities ||
+    shouldShowCapabilityOption(isRendererAvailable(capabilities, option.id), showUnavailable)
+  );
 
   const RENDER_MODES = [
     { id: "video", name: "视频流", desc: "连续帧渲染" },
@@ -385,7 +394,7 @@ export function RenderTestPage() {
       <div className="bg-card rounded-lg border p-4 mb-6">
         <h2 className="text-lg font-semibold mb-4">选择渲染器</h2>
         <div className="grid md:grid-cols-3 gap-4">
-          {RENDERER_OPTIONS.map((option) => {
+          {visibleRendererOptions.map((option) => {
             const available = isRendererAvailable(capabilities, option.id);
             const disabledLabel = unavailableText(capabilities, "available_renderers", option.id);
             return (

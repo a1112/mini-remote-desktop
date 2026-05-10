@@ -3,6 +3,10 @@ import { Play, Square, Network, Gauge } from "lucide-react";
 import * as commands from "../../adapters/tauri/commands";
 import type { EnvironmentSnapshot, TestConfig } from "../../adapters/tauri/types";
 import { capabilityAvailable, chooseCapability } from "./capabilityMeta";
+import {
+  shouldShowCapabilityOption,
+  useShowUnavailableCapabilities,
+} from "./useCapabilityVisibility";
 
 type TransportType = "quic" | "webrtc";
 type TestProfile = "latency" | "throughput" | "stability";
@@ -53,8 +57,12 @@ export function TransportTestPage() {
   const [throughputHistory, setThroughputHistory] = useState<number[]>([]);
   const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
   const [startError, setStartError] = useState<string | null>(null);
+  const [showUnavailable] = useShowUnavailableCapabilities();
 
   const selectedOption = TRANSPORT_OPTIONS.find((o) => o.id === selectedTransport);
+  const visibleTransportOptions = TRANSPORT_OPTIONS.filter((option) =>
+    shouldShowCapabilityOption(option.available, showUnavailable)
+  );
 
   const TEST_PROFILES = [
     { id: "latency", name: "延迟优先", desc: "优化低延迟传输" },
@@ -119,7 +127,7 @@ export function TransportTestPage() {
     setCurrentRunId(null);
 
     const capture = chooseCapability(
-      ["macos", "linux", "dxgi", "synthetic"],
+      ["synthetic", "macos", "linux", "dxgi"],
       capabilities,
       "available_captures",
       "synthetic"
@@ -189,7 +197,7 @@ export function TransportTestPage() {
       <div className="bg-card rounded-lg border p-4 mb-6">
         <h2 className="text-lg font-semibold mb-4">选择传输协议</h2>
         <div className="grid md:grid-cols-2 gap-4">
-          {TRANSPORT_OPTIONS.map((option) => (
+          {visibleTransportOptions.map((option) => (
             <button
               key={option.id}
               onClick={() => setSelectedTransport(option.id)}

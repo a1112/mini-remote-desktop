@@ -90,7 +90,7 @@ describe("EncodeTestPage backend contract", () => {
     expect(screen.queryByText("120")).not.toBeInTheDocument();
   });
 
-  it("starts Linux NVENC through the custom PipeWire capture path", async () => {
+  it("starts Linux NVENC with synthetic input to avoid desktop capture startup", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {
       if (command === "test_get_capabilities") {
@@ -113,14 +113,14 @@ describe("EncodeTestPage backend contract", () => {
 
     render(<EncodeTestPage />);
 
-    expect(await screen.findByText(/PipeWire\/Linux capture/)).toBeInTheDocument();
+    expect(await screen.findByText(/synthetic 输入/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /启动测试/ }));
 
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("test_start_run", {
         scenarioId: "custom",
         config: expect.objectContaining({
-          capture_type: "linux",
+          capture_type: "synthetic",
           encoder_type: "nvenc_h264",
           decoder_type: "none",
           zero_copy: false,

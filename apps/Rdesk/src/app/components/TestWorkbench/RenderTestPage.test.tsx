@@ -162,8 +162,8 @@ describe("RenderTestPage platform capabilities", () => {
     await waitFor(() => expect(metalButton).toBeEnabled());
 
     await waitFor(() => expect(metalButton).toHaveAttribute("aria-pressed", "true"));
-    expect(screen.getByRole("button", { name: /Direct3D 11/ })).toBeDisabled();
-    expect(screen.getByRole("button", { name: /Direct3D 12/ })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: /Direct3D 11/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Direct3D 12/ })).not.toBeInTheDocument();
     expect(screen.getByText("实时画面")).toBeInTheDocument();
     expect(screen.getByText("启动测试后显示渲染输入帧")).toBeInTheDocument();
   });

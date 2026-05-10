@@ -1,8 +1,12 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { Play, Square, Zap, Cpu, Gauge, Video } from "lucide-react";
 import * as commands from "../../adapters/tauri/commands";
 import type { EnvironmentSnapshot, TestConfig } from "../../adapters/tauri/types";
 import { capabilityAvailable, capabilityTag, unavailableText } from "./capabilityMeta";
+import {
+  shouldShowCapabilityOption,
+  useShowUnavailableCapabilities,
+} from "./useCapabilityVisibility";
 
 type EncoderType =
   | "nvenc_h264"
@@ -94,7 +98,7 @@ function buildEncodeRun(
 } {
   const bitrate = bitrateKbps * 1000;
   const isLinux = capabilities?.os_type === "linux";
-  const nativeCapture = isLinux ? "linux" : "dxgi";
+  const nativeCapture = isLinux ? "synthetic" : "dxgi";
   if (encoder === "openh264") {
     return {
       scenarioId: "encode.openh264",
@@ -131,7 +135,7 @@ function buildEncodeRun(
       capture_type: nativeCapture,
       encoder_type: encoder,
       decoder_type: "none",
-      zero_copy: !isLinux,
+      zero_copy: !isLinux && nativeCapture !== "synthetic",
       bitrate,
       duration_ms: 30_000,
       visual_preview: false,
@@ -148,6 +152,8 @@ export function EncodeTestPage() {
   const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
   const [startError, setStartError] = useState<string | null>(null);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
+  const metricsRequestInFlightRef = useRef(false);
+  const [showUnavailable] = useShowUnavailableCapabilities();
 
   const selectedOption = ENCODER_OPTIONS.find((o) => o.id === selectedEncoder);
   const selectedIsSoftware = selectedOption?.type === "software";
@@ -155,13 +161,16 @@ export function EncodeTestPage() {
   const selectedPathNote = selectedIsSoftware
     ? "OpenH264/software H.264 使用 CPU-backed synthetic capture，zero_copy 会被关闭；这是软件 fallback 基线，不代表 2K144 主串流路径。"
     : isLinux
-      ? "Linux 硬件编码使用 PipeWire/Linux capture + GStreamer NVENC。当前路径是 CPU-backed 输入，后续可继续收敛到 DMA-BUF/CUDA 零拷贝。"
+      ? "Linux 硬件编码基准使用 synthetic 输入 + GStreamer NVENC，避免编码页触发桌面采集/Portal；端到端页面再验证真实采集链路。"
       : "硬件编码默认使用 DXGI + D3D11 shared zero-copy，更接近真实桌面串流链路。";
   const isEncoderAvailable = (option: EncoderOption) => {
     if (!option.available) return false;
     return capabilityAvailable(capabilities, "available_encoders", option.id, option.id === "openh264");
   };
   const selectedAvailable = selectedOption ? isEncoderAvailable(selectedOption) : false;
+  const visibleEncoderOptions = ENCODER_OPTIONS.filter((option) =>
+    !capabilities || shouldShowCapabilityOption(isEncoderAvailable(option), showUnavailable)
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -187,27 +196,36 @@ export function EncodeTestPage() {
     if (!isRunning) return;
 
     const interval = setInterval(async () => {
-      const result = await commands.testHarnessGetMetrics();
-      if (result.ok) {
-        if (!result.value.is_running) {
-          setIsRunning(false);
-          setActiveRunId(null);
+      if (metricsRequestInFlightRef.current) return;
+      metricsRequestInFlightRef.current = true;
+      try {
+        const result = await commands.testHarnessGetMetrics();
+        if (result.ok) {
+          if (!result.value.is_running) {
+            setIsRunning(false);
+            setActiveRunId(null);
+          }
+          setMetrics({
+            is_running: result.value.is_running,
+            encode_fps: result.value.encoded_fps ?? result.value.capture_fps,
+            encode_latency_p50_ms: result.value.encode_latency_p50_ms,
+            encode_latency_p95_ms: result.value.encode_latency_p95_ms,
+            encode_latency_p99_ms: result.value.encode_latency_p95_ms * 1.15,
+            encoded_units: result.value.encoded_units ?? result.value.frame_count,
+            dropped_frames: result.value.dropped_frames,
+            resolution: result.value.resolution,
+            bitrate_kbps: 5000, // Default, would need actual measurement
+          });
         }
-        setMetrics({
-          is_running: result.value.is_running,
-          encode_fps: result.value.encoded_fps ?? result.value.capture_fps,
-          encode_latency_p50_ms: result.value.encode_latency_p50_ms,
-          encode_latency_p95_ms: result.value.encode_latency_p95_ms,
-          encode_latency_p99_ms: result.value.encode_latency_p95_ms * 1.15,
-          encoded_units: result.value.encoded_units ?? result.value.frame_count,
-          dropped_frames: result.value.dropped_frames,
-          resolution: result.value.resolution,
-          bitrate_kbps: 5000, // Default, would need actual measurement
-        });
+      } finally {
+        metricsRequestInFlightRef.current = false;
       }
-    }, 200);
+    }, 500);
 
-    return () => clearInterval(interval);
+    return () => {
+      metricsRequestInFlightRef.current = false;
+      clearInterval(interval);
+    };
   }, [isRunning]);
 
   const handleStart = async () => {
@@ -270,7 +288,7 @@ export function EncodeTestPage() {
       <div className="bg-card rounded-lg border p-4 mb-6">
         <h2 className="text-lg font-semibold mb-4">选择编码器</h2>
         <div className="grid md:grid-cols-3 gap-4">
-          {ENCODER_OPTIONS.map((option) => {
+          {visibleEncoderOptions.map((option) => {
             const available = isEncoderAvailable(option);
             const isAv1Unavailable = option.id === "nvenc_av1" && !available;
             const disabledLabel = unavailableText(capabilities, "available_encoders", option.id);

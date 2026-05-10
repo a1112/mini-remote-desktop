@@ -71,6 +71,7 @@ function mockOverviewData() {
 describe("OverviewPage", () => {
   beforeEach(() => {
     mockNavigate.mockReset();
+    window.localStorage?.clear();
   });
 
   it("navigates from quick entry buttons and recent run detail", async () => {
@@ -107,6 +108,8 @@ describe("OverviewPage", () => {
     expect(screen.getByText("capture")).toBeInTheDocument();
     expect(screen.getAllByText("available").length).toBeGreaterThan(0);
     expect(screen.getAllByText("degraded").length).toBeGreaterThan(0);
+    expect(screen.queryByText("unimplemented")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("checkbox", { name: /显示不可用能力/ }));
     expect(screen.getAllByText("unimplemented").length).toBeGreaterThan(0);
     expect(screen.getByText("lan.2k144")).toBeInTheDocument();
     expect(screen.getByText("blocked")).toBeInTheDocument();
