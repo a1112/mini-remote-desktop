@@ -42,6 +42,11 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
 
   const isDark = theme === "dark" || (theme === "system" && systemDark);
 
+  useEffect(() => {
+    document.documentElement.classList.toggle("dark", isDark);
+    document.documentElement.style.colorScheme = isDark ? "dark" : "light";
+  }, [isDark]);
+
   return (
     <ThemeContext.Provider value={{ theme, setTheme, isDark }}>
       {children}

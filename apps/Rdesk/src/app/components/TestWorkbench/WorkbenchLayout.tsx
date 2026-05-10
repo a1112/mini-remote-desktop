@@ -84,12 +84,12 @@ export function WorkbenchLayout() {
   };
 
   const iconButton =
-    "flex h-9 w-9 items-center justify-center text-muted-foreground transition-colors hover:bg-muted hover:text-foreground";
+    "flex h-9 w-9 items-center justify-center text-muted-foreground transition-colors hover:bg-muted hover:text-foreground dark:hover:bg-white/10 dark:hover:text-white";
 
   return (
-    <div className="flex h-screen flex-col bg-background text-foreground">
+    <div className="flex h-screen flex-col bg-background text-foreground dark:bg-[#070a10]">
       <header
-        className="flex h-11 shrink-0 select-none items-center border-b bg-card"
+        className="flex h-11 shrink-0 select-none items-center border-b bg-card/95 dark:border-white/10 dark:bg-[#0d1118]/95"
         style={{ WebkitAppRegion: "drag" } as CSSProperties}
         onMouseDown={handleDragStart}
       >
@@ -141,7 +141,7 @@ export function WorkbenchLayout() {
           </button>
           <button
             type="button"
-            className="flex h-9 w-11 items-center justify-center text-muted-foreground transition-colors hover:bg-destructive hover:text-destructive-foreground"
+            className="flex h-9 w-11 items-center justify-center text-muted-foreground transition-colors hover:bg-destructive hover:text-destructive-foreground dark:hover:bg-red-500 dark:hover:text-white"
             onClick={() => void commands.closeWindow()}
             title="Close"
           >
@@ -151,7 +151,7 @@ export function WorkbenchLayout() {
       </header>
 
       <div className="flex min-h-0 flex-1">
-        <aside className="flex w-64 shrink-0 flex-col border-r bg-card p-4">
+        <aside className="flex w-64 shrink-0 flex-col border-r bg-card p-4 dark:border-white/10 dark:bg-[#0a0e15]">
           <div className="mb-6">
             <h1 className="text-xl font-bold text-foreground">Test Workbench</h1>
             <p className="text-sm text-muted-foreground">Rdesk media pipeline</p>
@@ -168,8 +168,8 @@ export function WorkbenchLayout() {
                   to={item.href}
                   className={`flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors ${
                     isActive
-                      ? "bg-primary text-primary-foreground"
-                      : "text-muted-foreground hover:bg-muted hover:text-foreground"
+                      ? "bg-primary text-primary-foreground dark:bg-white dark:text-black"
+                      : "text-muted-foreground hover:bg-muted hover:text-foreground dark:hover:bg-white/10 dark:hover:text-white"
                   }`}
                 >
                   <item.icon className="h-4 w-4" />
@@ -179,12 +179,12 @@ export function WorkbenchLayout() {
             })}
           </nav>
 
-          <div className="mt-auto border-t pt-4 text-xs text-muted-foreground">
+          <div className="mt-auto border-t pt-4 text-xs text-muted-foreground dark:border-white/10">
             WebRTC capture display path
           </div>
         </aside>
 
-        <main className="min-w-0 flex-1 overflow-auto">
+        <main className="min-w-0 flex-1 overflow-auto dark:bg-[#070a10]">
           <Outlet />
         </main>
       </div>
