@@ -226,6 +226,9 @@ impl RendererInstance for SoftwareRenderer {
 pub struct X11Renderer {
     display: *mut x11::xlib::Display,
     window: Option<x11::xlib::Window>,
+    owns_window: bool,
+    wm_protocols: x11::xlib::Atom,
+    wm_delete_window: x11::xlib::Atom,
     visual: *mut x11::xlib::Visual,
     gc: x11::xlib::GC,
     width: u32,
@@ -257,6 +260,8 @@ impl X11Renderer {
             let root = (xlib::XRootWindow)(display, screen);
             let width = (xlib::XDisplayWidth)(display, screen) as u32;
             let height = (xlib::XDisplayHeight)(display, screen) as u32;
+            let wm_protocols = atom(display, "WM_PROTOCOLS");
+            let wm_delete_window = atom(display, "WM_DELETE_WINDOW");
 
             // Create graphics context
             let mut gc_values: x11::xlib::XGCValues = std::mem::zeroed();
@@ -272,6 +277,9 @@ impl X11Renderer {
             Ok(Self {
                 display,
                 window: None,
+                owns_window: false,
+                wm_protocols,
+                wm_delete_window,
                 visual,
                 gc,
                 width,
@@ -300,9 +308,8 @@ impl X11Renderer {
 
             let mut attrs: x11::xlib::XSetWindowAttributes = std::mem::zeroed();
             attrs.background_pixel = (xlib::XWhitePixel)(self.display, screen);
-            attrs.event_mask = x11::xlib::ExposureMask
-                | x11::xlib::StructureNotifyMask
-                | x11::xlib::KeyPressMask;
+            attrs.event_mask =
+                x11::xlib::ExposureMask | x11::xlib::StructureNotifyMask | x11::xlib::KeyPressMask;
             self.width = width.max(1);
             self.height = height.max(1);
 
@@ -330,12 +337,20 @@ impl X11Renderer {
             // Set window title
             let title_cstr = std::ffi::CString::new(title).unwrap();
             (xlib::XStoreName)(self.display, window, title_cstr.as_ptr());
+            let mut protocols = [self.wm_delete_window];
+            (xlib::XSetWMProtocols)(
+                self.display,
+                window,
+                protocols.as_mut_ptr(),
+                protocols.len() as std::os::raw::c_int,
+            );
 
             // Map window
             (xlib::XMapWindow)(self.display, window);
             (xlib::XFlush)(self.display);
 
             self.window = Some(window);
+            self.owns_window = true;
             Ok(())
         }
     }
@@ -347,12 +362,36 @@ impl X11Renderer {
             while (xlib::XPending)(self.display) > 0 {
                 let mut event: x11::xlib::XEvent = std::mem::zeroed();
                 (xlib::XNextEvent)(self.display, &mut event);
-                if event.get_type() == xlib::ConfigureNotify {
-                    let configure = event.configure;
-                    if configure.width > 0 && configure.height > 0 {
-                        self.width = configure.width as u32;
-                        self.height = configure.height as u32;
+                match event.get_type() {
+                    xlib::ClientMessage => {
+                        let client = x11::xlib::XClientMessageEvent::from(event);
+                        if self.owns_window
+                            && client.message_type == self.wm_protocols
+                            && client.format == 32
+                            && client.data.get_long(0) as x11::xlib::Atom == self.wm_delete_window
+                        {
+                            if let Some(window) = self.window.take() {
+                                (xlib::XDestroyWindow)(self.display, window);
+                                (xlib::XFlush)(self.display);
+                            }
+                            self.owns_window = false;
+                        }
                     }
+                    xlib::DestroyNotify => {
+                        let destroyed = event.destroy_window.window;
+                        if self.window == Some(destroyed) {
+                            self.window = None;
+                            self.owns_window = false;
+                        }
+                    }
+                    xlib::ConfigureNotify => {
+                        let configure = event.configure;
+                        if configure.width > 0 && configure.height > 0 {
+                            self.width = configure.width as u32;
+                            self.height = configure.height as u32;
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -422,8 +461,10 @@ impl Drop for X11Renderer {
         use x11::xlib;
 
         unsafe {
-            if let Some(window) = self.window {
-                (xlib::XDestroyWindow)(self.display, window);
+            if self.owns_window {
+                if let Some(window) = self.window {
+                    (xlib::XDestroyWindow)(self.display, window);
+                }
             }
             if !self.gc.is_null() {
                 (xlib::XFreeGC)(self.display, self.gc);
@@ -434,13 +475,27 @@ impl Drop for X11Renderer {
 }
 
 #[cfg(feature = "x11")]
+fn atom(display: *mut x11::xlib::Display, name: &str) -> x11::xlib::Atom {
+    let name = std::ffi::CString::new(name).expect("X11 atom names must not contain NUL");
+    unsafe { (x11::xlib::XInternAtom)(display, name.as_ptr(), x11::xlib::False) }
+}
+
+#[cfg(feature = "x11")]
 impl RendererInstance for X11Renderer {
     fn attach_target(&mut self, target: RenderTarget) -> Result<(), mrd_render::RenderError> {
         use mrd_render::RenderTarget;
 
         match target {
             RenderTarget::WindowHandle(handle) => {
+                if self.owns_window {
+                    if let Some(window) = self.window.take() {
+                        unsafe {
+                            (x11::xlib::XDestroyWindow)(self.display, window);
+                        }
+                    }
+                }
                 self.window = Some(handle as x11::xlib::Window);
+                self.owns_window = false;
                 Ok(())
             }
         }
