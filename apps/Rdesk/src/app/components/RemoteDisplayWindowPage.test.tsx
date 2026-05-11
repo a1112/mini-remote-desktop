@@ -75,6 +75,21 @@ function windowsCapabilities() {
   };
 }
 
+function linuxCapabilities() {
+  return {
+    os_type: "linux",
+    cpu_brand: "AMD",
+    cpu_cores: 16,
+    memory_gb: 32,
+    gpu_info: "NVIDIA",
+    available_captures: ["linux", "synthetic"],
+    available_encoders: ["openh264", "nvenc_h264"],
+    available_decoders: ["none", "software", "linux_h264"],
+    available_renderers: ["none", "linux", "webview"],
+    available_memory_modes: ["cpu"],
+  };
+}
+
 const remoteDisplaySource = {
   id: "windows:display-shared:0",
   platform: "windows",
@@ -325,6 +340,162 @@ describe("RemoteDisplayWindowPage", () => {
             zero_copy: false,
           }),
         })
+      );
+    });
+  });
+
+  it("uses synthetic capture for Linux local Web View tests", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(linuxCapabilities());
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-local-display-test-1",
+          session_id: "local-display-test-1",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: false,
+          render_mode: "web",
+          native_surface_attached: false,
+          session_window_count: 1,
+        });
+      }
+      if (command === "configure_remote_display_native_surface") {
+        return Promise.resolve({
+          label: "render-local-display-test-1",
+          backend: "web",
+          attached: false,
+          visible: false,
+          parent_hwnd: null,
+          hwnd: null,
+          rect: { x: 0, y: 56, width: 1280, height: 720 },
+        });
+      }
+      if (command === "test_harness_stop") {
+        return Promise.resolve(null);
+      }
+      if (command === "test_start_run") {
+        return Promise.resolve("run-linux-web");
+      }
+      if (command === "test_harness_get_metrics") {
+        return Promise.resolve({
+          is_running: true,
+          capture_fps: 30,
+          frame_count: 12,
+          total_latency_p95_ms: 20,
+          error_message: null,
+        });
+      }
+      if (command === "test_get_run") {
+        return Promise.resolve({ run_id: "run-linux-web", status: "running", summary: null });
+      }
+      return Promise.resolve(args ?? null);
+    });
+
+    renderRemoteDisplay("local-display-test-1");
+
+    const startButton = await screen.findByRole("button", {
+      name: "Start local pipeline test",
+    });
+    await waitFor(() => expect(startButton).toBeEnabled());
+    fireEvent.click(startButton);
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_start_run",
+        expect.objectContaining({
+          scenarioId: "custom",
+          config: expect.objectContaining({
+            capture_type: "synthetic",
+            encoder_type: "openh264",
+            decoder_type: "software",
+            transport_kind: "webrtc",
+            render_display: false,
+            zero_copy: false,
+          }),
+        })
+      );
+    });
+  });
+
+  it("starts Linux native rendering without an embedded native surface", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(linuxCapabilities());
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-local-display-test-1",
+          session_id: "local-display-test-1",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: false,
+          render_mode: "web",
+          native_surface_attached: false,
+          session_window_count: 1,
+        });
+      }
+      if (command === "configure_remote_display_native_surface") {
+        return Promise.resolve({
+          label: "render-local-display-test-1",
+          backend: "web",
+          attached: false,
+          visible: false,
+          parent_hwnd: null,
+          hwnd: null,
+          rect: { x: 0, y: 56, width: 1280, height: 720 },
+        });
+      }
+      if (command === "present_test_harness_frame_on_native_surface") {
+        return Promise.resolve(false);
+      }
+      if (command === "test_harness_stop") {
+        return Promise.resolve(null);
+      }
+      if (command === "test_start_run") {
+        return Promise.resolve("run-linux-native");
+      }
+      if (command === "test_harness_get_metrics") {
+        return Promise.resolve({
+          is_running: true,
+          capture_fps: 30,
+          frame_count: 12,
+          total_latency_p95_ms: 20,
+          error_message: null,
+        });
+      }
+      if (command === "test_get_run") {
+        return Promise.resolve({ run_id: "run-linux-native", status: "running", summary: null });
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay("local-display-test-1");
+
+    const linuxNativeButton = await screen.findByRole("button", { name: "Linux native" });
+    await waitFor(() => expect(linuxNativeButton).toBeEnabled());
+    fireEvent.click(linuxNativeButton);
+    fireEvent.click(await screen.findByRole("button", { name: "Start local pipeline test" }));
+
+    await waitFor(() => {
+      const startCall = mockInvoke.mock.calls.find(([command]) => command === "test_start_run");
+      expect(startCall).toBeTruthy();
+      const config = (startCall?.[1] as { config?: Record<string, unknown> } | undefined)?.config;
+      expect(config).toEqual(
+        expect.objectContaining({
+          capture_type: "synthetic",
+          renderer_type: "linux",
+          render_display: true,
+          zero_copy: false,
+        })
+      );
+      expect(config?.renderer_target_hwnd).toBeUndefined();
+      expect(mockInvoke).not.toHaveBeenCalledWith(
+        "present_test_harness_frame_on_native_surface",
+        undefined
       );
     });
   });

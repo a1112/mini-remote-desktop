@@ -56,7 +56,7 @@ import {
 import { isTauriRuntime } from "../utils/runtime";
 import { withTauriWindow } from "../utils/tauriWindow";
 
-type RenderMode = "web" | "d3d11_native" | "d3d12_native" | "metal_native";
+type RenderMode = "web" | "d3d11_native" | "d3d12_native" | "metal_native" | "linux_native";
 type HostOs = "macos" | "windows" | "linux" | "other";
 type TransportKind = NonNullable<TestMatrixConfig["transport"]>;
 type ResolutionKey = "1280x720" | "1920x1080" | "2560x1440" | "2560x1600" | "3440x1440";
@@ -268,7 +268,7 @@ function resolveLocalWebViewPlan({
       : hostOs === "windows"
         ? ["dxgi", "winrt", "synthetic"]
         : hostOs === "linux"
-          ? ["linux", "synthetic"]
+          ? ["synthetic", "linux"]
         : ["synthetic"];
   const nextCapture = pickCapability(
     uniqueValues([capture, ...captureDefaults]),
@@ -314,7 +314,7 @@ function resolveLocalWebViewPlan({
       : nextEncoder === "nvenc_h264"
         ? ["software", "nvdec", "none"]
         : hostOs === "linux"
-          ? ["linux_h264", "software", "none"]
+          ? ["software", "linux_h264", "none"]
         : ["software", "none"];
   const nextDecoder = pickCapability(
     decoderCandidates,
@@ -490,14 +490,23 @@ export function RemoteDisplayWindowPage() {
       }),
     [capabilities, capture, decoder, encoder, fps, hostOs, transport]
   );
-  const nativeRenderMode: RenderMode = hostOs === "macos" ? "metal_native" : "d3d11_native";
+  const nativeRenderMode: RenderMode =
+    hostOs === "macos"
+      ? "metal_native"
+      : hostOs === "linux"
+        ? "linux_native"
+        : "d3d11_native";
   const nativeRendererType =
     renderMode === "metal_native"
       ? "macos"
+      : renderMode === "linux_native"
+        ? "linux"
       : renderMode === "d3d11_native"
         ? "d3d11"
         : null;
   const isNative = nativeRendererType !== null;
+  const requiresEmbeddedNativeSurface =
+    nativeRendererType === "d3d11" || nativeRendererType === "macos";
   const nativeRendererTypeForHost =
     hostOs === "macos" ? "macos" : hostOs === "linux" ? "linux" : "d3d11";
   const currentNativeRendererAvailable =
@@ -578,6 +587,8 @@ export function RemoteDisplayWindowPage() {
       ? "Metal native"
       : renderMode === "d3d12_native"
         ? "DX12 native"
+        : renderMode === "linux_native"
+          ? "Linux native"
         : renderMode === "d3d11_native"
           ? hostOs === "linux"
             ? "Linux native"
@@ -645,7 +656,9 @@ export function RemoteDisplayWindowPage() {
       input_source: selectedCapture === "synthetic" ? "synthetic" : "screen",
       output_validation: true,
       visual_preview: true,
-      render_display: Boolean(isNative && rendererTargetHwnd),
+      render_display: Boolean(
+        isNative && (rendererTargetHwnd || nativeRendererType === "linux")
+      ),
       zero_copy: selectedUsesNativeSharedTexture,
       ...(nativeRendererType ? { renderer_type: nativeRendererType } : {}),
       ...(isNative && rendererTargetHwnd ? { renderer_target_hwnd: rendererTargetHwnd } : {}),
@@ -699,6 +712,8 @@ export function RemoteDisplayWindowPage() {
         setContext(result.value);
         if (result.value?.render_mode === "macos_native") {
           setRenderMode("metal_native");
+        } else if (result.value?.render_mode === "linux_native") {
+          setRenderMode("linux_native");
         } else if (result.value?.render_mode === "d3d11_native") {
           setRenderMode("d3d11_native");
         } else if (result.value?.render_mode === "d3d12_native") {
@@ -763,16 +778,29 @@ export function RemoteDisplayWindowPage() {
     }
 
     if (os === "linux") {
+      const localCapturePreference: CaptureType[] = isLocalPipelinePreview
+        ? ["synthetic", "linux"]
+        : ["linux", "synthetic"];
+      const localDecoderPreference: DecoderType[] = isLocalPipelinePreview
+        ? ["software", "linux_h264", "none"]
+        : ["linux_h264", "software", "none"];
+      const fallbackCapture = localCapturePreference[0] ?? "synthetic";
+      const fallbackDecoder = localDecoderPreference[0] ?? "software";
       setCapture((value) =>
-        pickAvailable(value, capabilities.available_captures, ["linux", "synthetic"], "linux")
+        pickAvailable(value, capabilities.available_captures, localCapturePreference, fallbackCapture)
       );
       setEncoder((value) =>
         pickAvailable(value, capabilities.available_encoders, ["openh264"], "openh264")
       );
       setDecoder((value) =>
-        pickAvailable(value, capabilities.available_decoders, ["linux_h264", "software", "none"], "linux_h264")
+        pickAvailable(
+          value,
+          capabilities.available_decoders,
+          localDecoderPreference,
+          fallbackDecoder
+        )
       );
-      setRenderMode("web");
+      setRenderMode((value) => (value === "linux_native" ? value : "web"));
       return;
     }
 
@@ -807,6 +835,10 @@ export function RemoteDisplayWindowPage() {
 
   const syncNativeSurface = useCallback(async (options?: { visible?: boolean }) => {
     if (!isTauriRuntime()) return null;
+    if (nativeRendererType === "linux") {
+      setNativeSurface(null);
+      return null;
+    }
     const element = renderAreaRef.current;
     if (!element) return null;
 
@@ -1556,7 +1588,7 @@ export function RemoteDisplayWindowPage() {
       configForRun = buildTestConfig(null, localWebViewPlan.profile);
     }
 
-    if (isNative) {
+    if (isNative && requiresEmbeddedNativeSurface) {
       const snapshot = await syncNativeSurface({ visible: true });
       const rendererTargetHwnd = snapshot?.hwnd ?? nativeSurface?.hwnd;
       if (!rendererTargetHwnd) {
@@ -1577,6 +1609,8 @@ export function RemoteDisplayWindowPage() {
         return;
       }
       configForRun = buildTestConfig(rendererTargetHwnd);
+    } else if (isNative) {
+      configForRun = buildTestConfig(null);
     }
 
     const result = await testStartRun({

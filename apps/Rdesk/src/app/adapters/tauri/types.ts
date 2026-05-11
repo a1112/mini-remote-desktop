@@ -178,7 +178,7 @@ export interface RemoteDisplayWindowContext {
   surface_id: string;
   role: string;
   renderer_attached: boolean;
-  render_mode: "web" | "d3d11_native" | "macos_native" | string;
+  render_mode: "web" | "d3d11_native" | "macos_native" | "linux_native" | string;
   native_surface_attached: boolean;
   session_window_count: number;
 }

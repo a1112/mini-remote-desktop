@@ -1096,7 +1096,23 @@ impl TestOrchestrator {
                         harness.request_stop();
                         harness.get_metrics()
                     };
-                    {
+                    if let Some(message) = metrics.error_message.clone().or_else(|| {
+                        (metrics.frame_count == 0).then(|| "No frames were produced".to_string())
+                    }) {
+                        let failure_reason = if metrics.frame_count == 0 {
+                            "no_frames"
+                        } else {
+                            "runtime_failure"
+                        };
+                        mark_run_failed(
+                            &orchestrator_runs,
+                            &orchestrator_events,
+                            &run_id_clone,
+                            &metrics,
+                            failure_reason,
+                            message,
+                        );
+                    } else {
                         let mut runs = orchestrator_runs.lock().unwrap();
                         if let Some(run) = runs.get_mut(&run_id_clone) {
                             run.status = RunStatus::Completed;
