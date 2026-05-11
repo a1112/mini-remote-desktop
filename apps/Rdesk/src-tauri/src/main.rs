@@ -512,6 +512,7 @@ fn configure_remote_display_native_surface(
 
     let render_mode = match (snapshot.attached, snapshot.backend.as_str()) {
         (true, "macos") => "macos_native",
+        (true, "linux") => "linux_native",
         (true, _) => "d3d11_native",
         (false, _) => "web",
     };

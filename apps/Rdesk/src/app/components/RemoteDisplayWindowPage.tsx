@@ -183,8 +183,32 @@ function browserLooksLikeMacos(): boolean {
   return platform.includes("mac") || userAgent.includes("mac os x");
 }
 
+function browserHostOs(): HostOs {
+  if (browserLooksLikeMacos()) return "macos";
+  if (typeof navigator === "undefined") return "other";
+  const platform = navigator.platform.toLowerCase();
+  const userAgent = navigator.userAgent.toLowerCase();
+  if (platform.includes("linux") || userAgent.includes("linux")) return "linux";
+  if (platform.includes("win") || userAgent.includes("windows")) return "windows";
+  return "other";
+}
+
+function nativeRenderModeForHost(hostOs: HostOs): RenderMode {
+  if (hostOs === "macos") return "metal_native";
+  if (hostOs === "linux") return "linux_native";
+  if (hostOs === "windows") return "d3d11_native";
+  return "web";
+}
+
+function nativeRendererForHost(hostOs: HostOs): NonNullable<TestConfig["renderer_type"]> | null {
+  if (hostOs === "macos") return "macos";
+  if (hostOs === "linux") return "linux";
+  if (hostOs === "windows") return "d3d11";
+  return null;
+}
+
 function defaultNativeRenderMode(): RenderMode {
-  return browserLooksLikeMacos() ? "metal_native" : "d3d11_native";
+  return nativeRenderModeForHost(browserHostOs());
 }
 
 function normalizeOs(osType?: string): HostOs {
@@ -490,12 +514,7 @@ export function RemoteDisplayWindowPage() {
       }),
     [capabilities, capture, decoder, encoder, fps, hostOs, transport]
   );
-  const nativeRenderMode: RenderMode =
-    hostOs === "macos"
-      ? "metal_native"
-      : hostOs === "linux"
-        ? "linux_native"
-        : "d3d11_native";
+  const nativeRenderMode = nativeRenderModeForHost(hostOs);
   const nativeRendererType =
     renderMode === "metal_native"
       ? "macos"
@@ -507,8 +526,7 @@ export function RemoteDisplayWindowPage() {
   const isNative = nativeRendererType !== null;
   const requiresEmbeddedNativeSurface =
     nativeRendererType === "d3d11" || nativeRendererType === "macos";
-  const nativeRendererTypeForHost =
-    hostOs === "macos" ? "macos" : hostOs === "linux" ? "linux" : "d3d11";
+  const nativeRendererTypeForHost = nativeRendererForHost(hostOs);
   const currentNativeRendererAvailable =
     isTauriRuntime() &&
     (!capabilities
@@ -518,6 +536,7 @@ export function RemoteDisplayWindowPage() {
         : false);
   const nativeRendererAvailableForHost =
     isTauriRuntime() &&
+    nativeRendererTypeForHost !== null &&
     (!capabilities
       ? true
       : capabilities.available_renderers?.includes(nativeRendererTypeForHost) ?? false);
@@ -599,7 +618,9 @@ export function RemoteDisplayWindowPage() {
       ? "Metal native"
       : hostOs === "linux"
         ? "Linux native"
-        : "DX11 native";
+        : hostOs === "windows"
+          ? "DX11 native"
+          : "Native";
   const remoteFramesReceived = probeSnapshot?.frames_received ?? 0;
   const remoteFramesDecoded = probeSnapshot?.frames_decoded ?? 0;
   const remoteFrameDataUrl = probeSnapshot?.latest_frame_data_url ?? null;
@@ -1309,7 +1330,11 @@ export function RemoteDisplayWindowPage() {
       setResolution("1920x1080");
       setFps("60");
       setBitrate("20");
-      setRenderMode("web");
+      setRenderMode(
+        isTauriRuntime() && capabilities?.available_renderers?.includes("linux")
+          ? "linux_native"
+          : "web"
+      );
       return;
     }
 
@@ -1320,7 +1345,11 @@ export function RemoteDisplayWindowPage() {
     setResolution("1920x1080");
     setFps("144");
     setBitrate("20");
-    setRenderMode("d3d11_native");
+    setRenderMode(
+      isTauriRuntime() && capabilities?.available_renderers?.includes("d3d11")
+        ? "d3d11_native"
+        : "web"
+    );
   }, [capabilities, hostOs]);
 
   const ensureRemoteCaptureSourceSelected = useCallback(async () => {
@@ -2249,7 +2278,7 @@ export function RemoteDisplayWindowPage() {
             </span>
           )}
           <span className="hidden xl:inline">
-            memory: {usesNativeSharedTexture ? "D3D11 shared" : nativeRendererType === "macos" ? "Metal upload" : "CPU preview"}
+            memory: {usesNativeSharedTexture ? "D3D11 shared" : nativeRendererType === "macos" ? "Metal upload" : nativeRendererType === "linux" ? "Linux upload" : "CPU preview"}
           </span>
           {isNative && nativeSurface?.attached && (
             <span className="hidden xl:inline">

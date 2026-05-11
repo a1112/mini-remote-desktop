@@ -164,7 +164,19 @@ impl RemoteDisplaySurfaceManager {
         _visible: bool,
     ) -> Result<NativeRenderSurfaceSnapshot, String> {
         if enabled {
-            return Err("DX11 native render surface is only available on Windows".to_string());
+            #[cfg(target_os = "linux")]
+            {
+                return Err(
+                    "embedded native render surface is not available on Linux; Linux native render uses a platform-owned test window".to_string(),
+                );
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                return Err(
+                    "embedded native render surface is only available on Windows and macOS"
+                        .to_string(),
+                );
+            }
         }
 
         Ok(NativeRenderSurfaceSnapshot {

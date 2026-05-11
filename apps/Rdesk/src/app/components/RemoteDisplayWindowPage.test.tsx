@@ -500,6 +500,82 @@ describe("RemoteDisplayWindowPage", () => {
     });
   });
 
+  it("uses the Linux platform path for the low latency local profile", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(linuxCapabilities());
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-local-display-test-1",
+          session_id: "local-display-test-1",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: false,
+          render_mode: "web",
+          native_surface_attached: false,
+          session_window_count: 1,
+        });
+      }
+      if (command === "configure_remote_display_native_surface") {
+        return Promise.resolve({
+          label: "render-local-display-test-1",
+          backend: "web",
+          attached: false,
+          visible: false,
+          parent_hwnd: null,
+          hwnd: null,
+          rect: { x: 0, y: 56, width: 1280, height: 720 },
+        });
+      }
+      if (command === "test_harness_stop") {
+        return Promise.resolve(null);
+      }
+      if (command === "test_start_run") {
+        return Promise.resolve("run-linux-low-latency");
+      }
+      if (command === "test_harness_get_metrics") {
+        return Promise.resolve({
+          is_running: true,
+          capture_fps: 30,
+          frame_count: 12,
+          total_latency_p95_ms: 20,
+          error_message: null,
+        });
+      }
+      if (command === "test_get_run") {
+        return Promise.resolve({
+          run_id: "run-linux-low-latency",
+          status: "running",
+          summary: null,
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay("local-display-test-1");
+
+    fireEvent.click(await screen.findByRole("button", { name: "配置" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Low latency" }));
+    fireEvent.click(screen.getByRole("button", { name: "Start local pipeline test" }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_start_run",
+        expect.objectContaining({
+          scenarioId: "custom",
+          config: expect.objectContaining({
+            capture_type: "linux",
+            renderer_type: "linux",
+            render_display: true,
+            transport_kind: "quic",
+          }),
+        })
+      );
+    });
+  });
+
   it("starts the local native pipeline with AV1 zero-copy when selected", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
