@@ -1720,13 +1720,13 @@ fn test_list_scenarios(state: tauri::State<'_, AppState>) -> Vec<test_orchestrat
 
 /// Get environment capabilities
 #[tauri::command]
-fn test_get_capabilities(
+async fn test_get_capabilities(
     state: tauri::State<'_, AppState>,
 ) -> Result<test_orchestrator::EnvironmentSnapshot, String> {
-    state
-        .test_orchestrator
-        .get_capabilities()
-        .map_err(|e| e.to_string())
+    let orchestrator = state.test_orchestrator.clone();
+    tokio::task::spawn_blocking(move || orchestrator.get_capabilities().map_err(|e| e.to_string()))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// List visible top-level windows that can be used as platform capture targets.
@@ -1746,24 +1746,28 @@ fn test_list_window_capture_targets_with_previews(
 
 /// Start a test run
 #[tauri::command]
-fn test_start_run(
+async fn test_start_run(
     state: tauri::State<'_, AppState>,
     scenario_id: String,
     config: test_orchestrator::TestConfigData,
 ) -> Result<String, String> {
-    state
-        .test_orchestrator
-        .start_run(scenario_id, config)
-        .map_err(|e| e.to_string())
+    let orchestrator = state.test_orchestrator.clone();
+    tokio::task::spawn_blocking(move || {
+        orchestrator
+            .start_run(scenario_id, config)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Stop a test run
 #[tauri::command]
-fn test_stop_run(state: tauri::State<'_, AppState>, run_id: String) -> Result<(), String> {
-    state
-        .test_orchestrator
-        .stop_run(&run_id)
-        .map_err(|e| e.to_string())
+async fn test_stop_run(state: tauri::State<'_, AppState>, run_id: String) -> Result<(), String> {
+    let orchestrator = state.test_orchestrator.clone();
+    tokio::task::spawn_blocking(move || orchestrator.stop_run(&run_id).map_err(|e| e.to_string()))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// List test runs

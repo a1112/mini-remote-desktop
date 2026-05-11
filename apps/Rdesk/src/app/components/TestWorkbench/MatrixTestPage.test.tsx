@@ -307,6 +307,49 @@ describe("MatrixTestPage failure handling", () => {
     expect(mockInvoke).toHaveBeenCalledWith("test_stop_run", { runId: "run-1" });
   });
 
+  it("lets an in-flight matrix run be stopped from the UI", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_start_run") {
+        return Promise.resolve("run-1");
+      }
+      if (command === "test_get_run") {
+        return Promise.resolve({
+          run_id: "run-1",
+          scenario_id: "matrix",
+          run_mode: "matrix",
+          status: "running",
+          started_at: Date.now(),
+          config_snapshot: {},
+          environment_snapshot: {
+            cpu_brand: "",
+            cpu_cores: 8,
+            memory_gb: 32,
+            gpu_info: "",
+            available_encoders: [],
+            available_decoders: [],
+          },
+          summary: undefined,
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    render(<MatrixTestPage runDelayMs={10_000} />);
+    selectSingleSupportedCombination();
+    fireEvent.click(screen.getByRole("button", { name: /启动矩阵测试/ }));
+
+    await waitFor(() => {
+      expect(mockInvoke.mock.calls.some(([command]) => command === "test_get_run")).toBe(true);
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /停止/ }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("test_stop_run", { runId: "run-1" });
+    });
+  });
+
   it("marks a completed run failed when performance is below the matrix threshold", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {

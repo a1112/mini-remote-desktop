@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { Play, Grid3x3, CheckCircle2, XCircle, Clock, Loader2 } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Play, Grid3x3, CheckCircle2, XCircle, Clock, Loader2, Square } from "lucide-react";
 import * as commands from "../../adapters/tauri/commands";
 import type {
   EnvironmentSnapshot,
@@ -290,6 +290,76 @@ interface SelectedMatrixOption {
   option: MatrixOption;
 }
 
+interface MatrixGenerationResult {
+  tests: MatrixTest[];
+  truncated: boolean;
+}
+
+function buildConfig(options: SelectedMatrixOption[]): TestConfig {
+  const config: TestConfig = {};
+  options.forEach(({ dimensionId, option }) => {
+    switch (dimensionId) {
+      case "capture":
+        config.capture_type = option.id as TestConfig["capture_type"];
+        break;
+      case "encoder":
+        config.encoder_type = option.id as TestConfig["encoder_type"];
+        break;
+      case "decoder":
+        config.decoder_type = option.id as TestConfig["decoder_type"];
+        break;
+      case "transport":
+        config.transport_kind = option.id as TestConfig["transport_kind"];
+        break;
+      case "renderer":
+        if (option.id === "d3d11") {
+          config.renderer_type = "d3d11";
+          config.render_display = true;
+        } else if (option.id === "d3d12_native") {
+          config.renderer_type = "d3d12";
+          config.render_display = true;
+        } else if (option.id === "macos") {
+          config.renderer_type = "macos";
+          config.render_display = true;
+        } else if (option.id === "linux") {
+          config.renderer_type = "linux";
+          config.render_display = true;
+        } else {
+          config.render_display = false;
+        }
+        break;
+      case "memory":
+        config.zero_copy = option.id === "d3d11_shared";
+        break;
+      case "resolution": {
+        const [w, h] = option.id.split("x").map(Number);
+        if (w && h) {
+          config.resolution = [w, h];
+        }
+        break;
+      }
+      case "fps":
+        config.fps = Number(option.id);
+        break;
+      case "bitrate":
+        config.bitrate = Number(option.id);
+        break;
+      case "duration":
+        config.duration_ms = Number(option.id);
+        break;
+    }
+  });
+
+  config.transport_kind ??= "loopback";
+  config.render_display ??= false;
+  config.zero_copy ??= false;
+  config.bitrate ??= 5000000;
+  config.duration_ms ??= 5000;
+  config.warmup_ms = 1000;
+
+  return config;
+}
+
 interface MatrixAcceptanceResult {
   acceptable: boolean;
   reason?: string;
@@ -520,6 +590,14 @@ const STATUS_LABELS: Record<MatrixTest["status"], string> = {
   skipped: "跳过",
 };
 
+const MAX_MATRIX_RUNS = 300;
+const MAX_MATRIX_RENDER_ROWS = 250;
+const SKIP_YIELD_BATCH_SIZE = 20;
+
+function yieldToUi(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
 function formatMs(value: number | null | undefined): string {
   return value != null && Number.isFinite(value) ? `${value.toFixed(2)} ms` : "-";
 }
@@ -589,9 +667,15 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
   const [completedCount, setCompletedCount] = useState(0);
   const [failedCount, setFailedCount] = useState(0);
   const [skippedCount, setSkippedCount] = useState(0);
+  const [matrixNotice, setMatrixNotice] = useState<string | null>(null);
+  const stopRequestedRef = useRef(false);
+  const activeRunIdRef = useRef<string | null>(null);
+  const environmentCapabilitySnapshot = useMemo(
+    () => (capabilities ? buildCapabilitySnapshotFromEnvironment(capabilities) : null),
+    [capabilities]
+  );
   const capabilitySnapshot =
-    serviceCapabilitySnapshot ??
-    (capabilities ? buildCapabilitySnapshotFromEnvironment(capabilities) : null);
+    serviceCapabilitySnapshot ?? environmentCapabilitySnapshot;
 
   useEffect(() => {
     let cancelled = false;
@@ -624,6 +708,7 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
   }, [showUnavailable]);
 
   const toggleOption = (dimensionId: string, optionId: string) => {
+    setMatrixNotice(null);
     setDimensions((current) => {
       const option = current
         .find((dim) => dim.id === dimensionId)
@@ -680,7 +765,7 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
     });
   };
 
-  const generateMatrix = () => {
+  const generateMatrix = useCallback((): MatrixGenerationResult => {
     const enabledOptions = dimensions
       .map((dim) =>
         dim.options
@@ -692,11 +777,16 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
       )
       .filter((opts) => opts.length > 0);
 
-    if (enabledOptions.length === 0) return [];
+    if (enabledOptions.length === 0) {
+      return { tests: [], truncated: false };
+    }
 
     const combinations: MatrixTest[] = [];
     const seenConfigs = new Set<string>();
+    let truncated = false;
     const generate = (index: number, current: SelectedMatrixOption[]) => {
+      if (truncated) return;
+
       if (index >= enabledOptions.length) {
         const config = buildConfig(current);
 
@@ -705,6 +795,11 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
           return;
         }
         seenConfigs.add(configKey);
+
+        if (combinations.length >= MAX_MATRIX_RUNS) {
+          truncated = true;
+          return;
+        }
 
         combinations.push({
           id: `matrix_${combinations.length}`,
@@ -719,78 +814,14 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
       if (!options) return;
 
       for (const option of options) {
+        if (truncated) break;
         generate(index + 1, [...current, option]);
       }
     };
 
     generate(0, []);
-    return combinations;
-  };
-
-  const buildConfig = (options: SelectedMatrixOption[]): TestConfig => {
-    const config: TestConfig = {};
-    options.forEach(({ dimensionId, option }) => {
-      switch (dimensionId) {
-        case "capture":
-          config.capture_type = option.id as TestConfig["capture_type"];
-          break;
-        case "encoder":
-          config.encoder_type = option.id as TestConfig["encoder_type"];
-          break;
-        case "decoder":
-          config.decoder_type = option.id as TestConfig["decoder_type"];
-          break;
-        case "transport":
-          config.transport_kind = option.id as TestConfig["transport_kind"];
-          break;
-        case "renderer":
-          if (option.id === "d3d11") {
-            config.renderer_type = "d3d11";
-            config.render_display = true;
-          } else if (option.id === "d3d12_native") {
-            config.renderer_type = "d3d12";
-            config.render_display = true;
-          } else if (option.id === "macos") {
-            config.renderer_type = "macos";
-            config.render_display = true;
-          } else if (option.id === "linux") {
-            config.renderer_type = "linux";
-            config.render_display = true;
-          } else {
-            config.render_display = false;
-          }
-          break;
-        case "memory":
-          config.zero_copy = option.id === "d3d11_shared";
-          break;
-        case "resolution": {
-          const [w, h] = option.id.split("x").map(Number);
-          if (w && h) {
-            config.resolution = [w, h];
-          }
-          break;
-        }
-        case "fps":
-          config.fps = Number(option.id);
-          break;
-        case "bitrate":
-          config.bitrate = Number(option.id);
-          break;
-        case "duration":
-          config.duration_ms = Number(option.id);
-          break;
-      }
-    });
-
-    config.transport_kind ??= "loopback";
-    config.render_display ??= false;
-    config.zero_copy ??= false;
-    config.bitrate ??= 5000000;
-    config.duration_ms ??= 5000; // Short duration for matrix tests
-    config.warmup_ms = 1000;
-
-    return config;
-  };
+    return { tests: combinations, truncated };
+  }, [capabilitySnapshot, dimensions]);
 
   const waitForRunCompletion = async (runId: string, config: TestConfig): Promise<TestRun | null> => {
     const timeoutMs = Math.max(
@@ -801,6 +832,10 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
     let lastRun: TestRun | null = null;
 
     while (Date.now() - startedAt <= timeoutMs) {
+      if (stopRequestedRef.current) {
+        return lastRun;
+      }
+
       const runResult = await commands.testGetRun(runId);
       if (!runResult.ok) {
         throw new Error(runResult.error.message);
@@ -824,10 +859,32 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
     return lastRun;
   };
 
+  const handleStop = useCallback(async () => {
+    stopRequestedRef.current = true;
+    setMatrixNotice("正在停止当前矩阵测试...");
+
+    const activeRunId = activeRunIdRef.current;
+    if (activeRunId) {
+      await commands.testStopRun(activeRunId);
+    }
+  }, []);
+
   const handleStart = async () => {
-    const matrixTests = generateMatrix();
+    const matrixGeneration = generateMatrix();
+    if (matrixGeneration.truncated) {
+      setTests(matrixGeneration.tests);
+      setMatrixNotice(
+        `当前选择超过 ${MAX_MATRIX_RUNS} 个组合。请减少勾选项后再启动，避免 UI 和测试管线被一次性压满。`
+      );
+      return;
+    }
+
+    const matrixTests = matrixGeneration.tests;
     if (matrixTests.length === 0) return;
 
+    stopRequestedRef.current = false;
+    activeRunIdRef.current = null;
+    setMatrixNotice(null);
     setTests(matrixTests);
     setIsRunning(true);
     setCurrentTestIndex(0);
@@ -835,8 +892,13 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
     setFailedCount(0);
     setSkippedCount(0);
 
-    // Run tests sequentially (for now - could be parallelized)
+    await yieldToUi();
+
     for (let i = 0; i < matrixTests.length; i++) {
+      if (stopRequestedRef.current) {
+        break;
+      }
+
       setCurrentTestIndex(i);
 
       const test = matrixTests[i];
@@ -851,6 +913,9 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
             idx === i ? { ...t, status: "skipped" as const, skipReason: staticSkipReason } : t
           )
         );
+        if ((i + 1) % SKIP_YIELD_BATCH_SIZE === 0) {
+          await yieldToUi();
+        }
         continue;
       }
 
@@ -903,12 +968,19 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
             markSkipped(skipReason);
             continue;
           }
-          markFailed();
+          markFailed(undefined, undefined, result.error.message);
           continue;
         }
 
         activeRunId = result.value;
+        activeRunIdRef.current = activeRunId;
+
         const run = await waitForRunCompletion(activeRunId, test.config);
+        if (stopRequestedRef.current) {
+          markSkipped("用户停止矩阵测试");
+          await commands.testStopRun(activeRunId);
+          break;
+        }
         if (!run) {
           markFailed();
           await commands.testStopRun(activeRunId);
@@ -943,25 +1015,46 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
         await commands.testStopRun(activeRunId);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        if (stopRequestedRef.current) {
+          markSkipped("用户停止矩阵测试");
+          if (activeRunId) {
+            await commands.testStopRun(activeRunId);
+          }
+          break;
+        }
         const skipReason = capabilitySkipReason(test.config, message);
         if (skipReason) {
           markSkipped(skipReason);
           continue;
         }
-        markFailed();
+        markFailed(undefined, undefined, message);
         if (activeRunId) {
           await commands.testStopRun(activeRunId);
         }
+      } finally {
+        if (activeRunIdRef.current === activeRunId) {
+          activeRunIdRef.current = null;
+        }
       }
+
+      await yieldToUi();
     }
 
+    activeRunIdRef.current = null;
     setIsRunning(false);
+    if (stopRequestedRef.current) {
+      setMatrixNotice("矩阵测试已停止。");
+    }
   };
 
-  const totalTests = generateMatrix().length;
+  const matrixGeneration = useMemo(() => generateMatrix(), [generateMatrix]);
+  const plannedTotalTests = matrixGeneration.tests.length;
+  const totalTests = tests.length > 0 ? tests.length : plannedTotalTests;
   const finishedCount = completedCount + failedCount + skippedCount;
   const progress = totalTests > 0 ? (finishedCount / totalTests) * 100 : 0;
   const platformLabel = capabilities?.os_type ?? "windows";
+  const visibleTests = tests.slice(0, MAX_MATRIX_RENDER_ROWS);
+  const hiddenResultRows = tests.length - visibleTests.length;
 
   const getStatusIcon = (status: MatrixTest["status"]) => {
     switch (status) {
@@ -1039,26 +1132,46 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
           {!isRunning ? (
             <button
               onClick={handleStart}
-              disabled={totalTests === 0}
+              disabled={plannedTotalTests === 0 || matrixGeneration.truncated}
               className="flex items-center gap-2 px-4 py-2 bg-primary text-primary-foreground rounded hover:bg-primary/90 disabled:opacity-50"
             >
               <Play className="h-4 w-4" />
-              启动矩阵测试 ({totalTests} 个组合)
+              启动矩阵测试 ({plannedTotalTests}
+              {matrixGeneration.truncated ? "+" : ""} 个组合)
             </button>
           ) : (
             <div className="flex items-center gap-4">
               <span className="text-sm text-muted-foreground">
                 {currentTestIndex + 1} / {totalTests}
               </span>
-              <div className="w-32 h-2 bg-gray-200 rounded-full overflow-hidden">
+              <div className="w-32 h-2 bg-muted rounded-full overflow-hidden">
                 <div
-                  className="h-full bg-blue-500 transition-all"
+                  className="h-full bg-primary transition-all"
                   style={{ width: `${progress}%` }}
                 />
               </div>
+              <button
+                onClick={handleStop}
+                className="flex items-center gap-2 px-3 py-2 bg-destructive text-destructive-foreground rounded hover:bg-destructive/90"
+              >
+                <Square className="h-4 w-4" />
+                停止
+              </button>
             </div>
           )}
         </div>
+
+        {matrixGeneration.truncated && !isRunning && (
+          <div className="mb-4 rounded border border-yellow-500/40 bg-yellow-500/10 px-3 py-2 text-sm text-yellow-700 dark:text-yellow-300">
+            当前选择超过 {MAX_MATRIX_RUNS} 个组合。减少勾选项后再启动，避免矩阵一次性生成和跳过过多用例导致界面无响应。
+          </div>
+        )}
+
+        {matrixNotice && (
+          <div className="mb-4 rounded border border-border bg-muted px-3 py-2 text-sm text-muted-foreground">
+            {matrixNotice}
+          </div>
+        )}
 
         {tests.length > 0 && (
           <div className="grid grid-cols-4 gap-4 text-center">
@@ -1109,7 +1222,7 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
               </tr>
             </thead>
             <tbody className="divide-y">
-              {tests.map((test) => (
+              {visibleTests.map((test) => (
                 <tr
                   key={test.id}
                   className={
@@ -1179,6 +1292,13 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
                   </td>
                 </tr>
               ))}
+              {hiddenResultRows > 0 && (
+                <tr>
+                  <td colSpan={16} className="px-4 py-3 text-center text-sm text-muted-foreground">
+                    仅显示前 {MAX_MATRIX_RENDER_ROWS} 条结果，剩余 {hiddenResultRows} 条仍会按顺序执行。
+                  </td>
+                </tr>
+              )}
             </tbody>
           </table>
         </div>
