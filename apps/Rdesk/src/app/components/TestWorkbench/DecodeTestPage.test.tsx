@@ -159,6 +159,7 @@ describe("DecodeTestPage backend contract", () => {
         return Promise.resolve({
           is_running: true,
           capture_fps: 60,
+          encoded_fps: 38,
           decoded_fps: 37,
           decode_latency_p50_ms: 8,
           decode_latency_p95_ms: 17,
@@ -176,9 +177,42 @@ describe("DecodeTestPage backend contract", () => {
     fireEvent.click(await screen.findByRole("button", { name: /启动测试/ }));
 
     expect(await screen.findByText("37.0 FPS")).toBeInTheDocument();
+    expect(screen.getByText("60.0 FPS")).toBeInTheDocument();
+    expect(screen.getByText("38.0 FPS")).toBeInTheDocument();
     expect(screen.getAllByText("解码帧数").length).toBeGreaterThanOrEqual(2);
     expect(screen.getAllByText("74").length).toBeGreaterThanOrEqual(2);
-    expect(screen.queryByText("60.0 FPS")).not.toBeInTheDocument();
     expect(screen.queryByText("120")).not.toBeInTheDocument();
+  });
+
+  it("classifies low FPS with tiny decode latency as upstream limited", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") return Promise.resolve(mockCapabilities());
+      if (command === "test_start_run") return Promise.resolve("run-upstream-limited");
+      if (command === "test_harness_get_metrics") {
+        return Promise.resolve({
+          is_running: true,
+          capture_fps: 24.1,
+          encoded_fps: 23.9,
+          decoded_fps: 23.7,
+          decode_latency_p50_ms: 0.08,
+          decode_latency_p95_ms: 0.15,
+          frame_count: 650,
+          decoded_frames: 642,
+          decode_failures: 0,
+          dropped_frames: 0,
+          resolution: [1920, 1080],
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    render(<DecodeTestPage />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /启动测试/ }));
+
+    expect(await screen.findByText("解码器余量充足，当前受上游限制")).toBeInTheDocument();
+    expect(screen.getByText("23.7 FPS")).toBeInTheDocument();
+    expect(screen.getAllByText("642").length).toBeGreaterThanOrEqual(2);
   });
 });

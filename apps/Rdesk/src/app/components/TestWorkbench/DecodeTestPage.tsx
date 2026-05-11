@@ -37,6 +37,8 @@ interface DecodeProfile {
 
 interface DecodeMetrics {
   is_running: boolean;
+  capture_fps: number;
+  encode_fps: number;
   decode_fps: number;
   decode_latency_p50_ms: number;
   decode_latency_p95_ms: number;
@@ -45,6 +47,12 @@ interface DecodeMetrics {
   decode_failures: number;
   dropped_frames: number;
   resolution: [number, number];
+}
+
+interface DecodeCapabilityAssessment {
+  label: string;
+  detail: string;
+  color: string;
 }
 
 const DECODER_OPTIONS: DecoderOption[] = [
@@ -307,6 +315,73 @@ function missingChainCapability(
   return null;
 }
 
+function minPositive(values: number[]): number {
+  const positives = values.filter((value) => value > 0);
+  return positives.length > 0 ? Math.min(...positives) : 0;
+}
+
+function assessDecodeCapability(metrics: DecodeMetrics, targetFps: number): DecodeCapabilityAssessment {
+  const target = Math.max(targetFps, 1);
+  const frameBudgetMs = 1000 / target;
+  const upstreamFps = minPositive([metrics.capture_fps, metrics.encode_fps]);
+  const latencyRatio = metrics.decode_latency_p95_ms / frameBudgetMs;
+
+  if (metrics.decode_failures > 0) {
+    return {
+      label: "解码存在失败",
+      detail: `已出现 ${metrics.decode_failures} 次解码失败，需要优先看错误日志和输入码流。`,
+      color: "text-red-500",
+    };
+  }
+
+  if (metrics.decoded_frames === 0) {
+    return {
+      label: "尚未产出解码帧",
+      detail: "当前还没有 decoded frame，可能正在等待首个关键帧或上游尚未产出 access unit。",
+      color: "text-yellow-500",
+    };
+  }
+
+  if (latencyRatio <= 0.25 && metrics.decode_fps < target * 0.75) {
+    const upstreamText = upstreamFps > 0 ? `上游当前约 ${upstreamFps.toFixed(1)} FPS` : "上游 FPS 尚未稳定";
+    return {
+      label: "解码器余量充足，当前受上游限制",
+      detail: `${upstreamText}，P95 解码延迟仅占 ${target} FPS 帧预算的 ${(latencyRatio * 100).toFixed(1)}%。需要继续优化采集/编码供帧，不能把 ${metrics.decode_fps.toFixed(1)} FPS 直接判定为 decoder 上限。`,
+      color: "text-green-500",
+    };
+  }
+
+  if (metrics.decode_fps >= target * 0.9 && latencyRatio <= 0.5) {
+    return {
+      label: "解码能力达标",
+      detail: `当前 decoded FPS 接近目标 ${target} FPS，且 P95 解码延迟低于半帧预算。`,
+      color: "text-green-500",
+    };
+  }
+
+  if (latencyRatio > 1) {
+    return {
+      label: "解码延迟超过帧预算",
+      detail: `目标 ${target} FPS 的单帧预算约 ${frameBudgetMs.toFixed(2)} ms，当前 P95 为 ${metrics.decode_latency_p95_ms.toFixed(2)} ms，decoder 已经是主要风险。`,
+      color: "text-red-500",
+    };
+  }
+
+  if (latencyRatio > 0.5) {
+    return {
+      label: "解码接近瓶颈",
+      detail: `P95 解码延迟已占 ${target} FPS 帧预算的 ${(latencyRatio * 100).toFixed(1)}%，需要降低分辨率/码率或换硬解路径验证。`,
+      color: "text-yellow-500",
+    };
+  }
+
+  return {
+    label: "解码正常，继续观察上游",
+    detail: `解码失败为 0，P95 延迟低于半帧预算；如果 FPS 仍低，优先看采集 FPS 和编码 FPS。`,
+    color: "text-green-500",
+  };
+}
+
 export function DecodeTestPage() {
   const [selectedDecoder, setSelectedDecoder] = useState<DecoderType>("software");
   const [selectedCodec, setSelectedCodec] = useState<DecodeCodec>("h264");
@@ -322,6 +397,9 @@ export function DecodeTestPage() {
     DECODE_PROFILES.find((profile) => profile.id === selectedProfileId) ?? DEFAULT_DECODE_PROFILE;
   const selectedOption = DECODER_OPTIONS.find((option) => option.id === selectedDecoder);
   const selectedRun = buildDecodeRun(selectedDecoder, selectedCodec, selectedProfile, capabilities);
+  const capabilityAssessment = metrics
+    ? assessDecodeCapability(metrics, selectedProfile.fps)
+    : null;
   const selectedAvailable =
     capabilityAvailable(capabilities, "available_decoders", selectedDecoder, selectedDecoder === "software") &&
     codecSupportedByDecoder(selectedCodec, selectedDecoder) &&
@@ -380,6 +458,8 @@ export function DecodeTestPage() {
         }
         setMetrics({
           is_running: result.value.is_running,
+          capture_fps: result.value.capture_fps,
+          encode_fps: result.value.encoded_fps ?? result.value.capture_fps,
           decode_fps: result.value.decoded_fps ?? result.value.capture_fps,
           decode_latency_p50_ms: result.value.decode_latency_p50_ms || 0,
           decode_latency_p95_ms: result.value.decode_latency_p95_ms || 0,
@@ -569,7 +649,19 @@ export function DecodeTestPage() {
 
       {metrics && (
         <>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+          <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-4 mb-6">
+            <MetricCard
+              icon={<Gauge className="h-4 w-4" />}
+              label="采集 FPS"
+              value={`${metrics.capture_fps.toFixed(1)} FPS`}
+              color={getFpsColor(metrics.capture_fps)}
+            />
+            <MetricCard
+              icon={<Cpu className="h-4 w-4" />}
+              label="编码 FPS"
+              value={`${metrics.encode_fps.toFixed(1)} FPS`}
+              color={getFpsColor(metrics.encode_fps)}
+            />
             <MetricCard
               icon={<Monitor className="h-4 w-4" />}
               label="解码 FPS"
@@ -594,6 +686,23 @@ export function DecodeTestPage() {
             />
           </div>
 
+          {capabilityAssessment && (
+            <div className="bg-card rounded-lg border p-4 mb-6">
+              <h3 className="font-medium mb-3">解码能力判断</h3>
+              <div className={`text-lg font-semibold ${capabilityAssessment.color}`}>
+                {capabilityAssessment.label}
+              </div>
+              <p className="mt-2 text-sm text-muted-foreground leading-6">
+                {capabilityAssessment.detail}
+              </p>
+              <div className="mt-4 grid sm:grid-cols-3 gap-3 text-sm">
+                <InfoPill label="目标帧率" value={`${selectedProfile.fps} FPS`} />
+                <InfoPill label="帧预算" value={`${(1000 / selectedProfile.fps).toFixed(2)} ms`} />
+                <InfoPill label="解码占预算" value={`${((metrics.decode_latency_p95_ms / (1000 / selectedProfile.fps)) * 100).toFixed(1)}%`} />
+              </div>
+            </div>
+          )}
+
           <div className="grid md:grid-cols-2 gap-6 mb-6">
             <div className="bg-card rounded-lg border p-4">
               <h3 className="font-medium mb-4">解码延迟</h3>
@@ -609,6 +718,8 @@ export function DecodeTestPage() {
               <div className="space-y-2 text-sm">
                 <InfoRow label="运行中" value={metrics.is_running ? "是" : "否"} />
                 <InfoRow label="输出分辨率" value={`${metrics.resolution[0]}x${metrics.resolution[1]}`} />
+                <InfoRow label="采集 FPS" value={metrics.capture_fps.toFixed(1)} />
+                <InfoRow label="编码 FPS" value={metrics.encode_fps.toFixed(1)} />
                 <InfoRow label="丢帧" value={metrics.dropped_frames.toLocaleString()} />
                 <InfoRow label="资源占用" value="未采集，后续接系统指标" />
               </div>
