@@ -85,6 +85,7 @@ const captureOptions: Option<CaptureType>[] = [
 ];
 
 const encoderOptions: Option<EncoderType>[] = [
+  { value: "none", label: "Direct" },
   { value: "nvenc_h264", label: "NVENC H.264" },
   { value: "nvenc_hevc", label: "NVENC HEVC Main" },
   { value: "nvenc_hevc_main10", label: "NVENC HEVC Main10" },
@@ -100,7 +101,7 @@ const decoderOptions: Option<DecoderType>[] = [
   { value: "linux_hevc_main10", label: "Linux HEVC Main10 HW" },
   { value: "videotoolbox", label: "VideoToolbox" },
   { value: "software", label: "Software" },
-  { value: "none", label: "Encode only" },
+  { value: "none", label: "No decode" },
 ];
 
 const transportOptions: Option<TransportKind>[] = [
@@ -108,6 +109,9 @@ const transportOptions: Option<TransportKind>[] = [
   { value: "webrtc", label: "WebRTC" },
   { value: "quic", label: "QUIC" },
 ];
+
+const linuxNativeEncoderPreference: EncoderType[] = ["none", "nvenc_h264", "openh264"];
+const linuxNativeDecoderPreference: DecoderType[] = ["none", "linux_h264", "software"];
 
 const resolutionOptions: Option<ResolutionKey>[] = [
   { value: "1280x720", label: "720p" },
@@ -458,6 +462,7 @@ export function RemoteDisplayWindowPage() {
   const webPreviewPeerRef = useRef<RTCPeerConnection | null>(null);
   const webPreviewSessionRef = useRef<string | null>(null);
   const autoCaptureSourceRequestedRef = useRef<string | null>(null);
+  const linuxNativeProfileAppliedRef = useRef(false);
 
   const [context, setContext] = useState<RemoteDisplayWindowContext | null>(null);
   const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
@@ -678,7 +683,7 @@ export function RemoteDisplayWindowPage() {
       warmup_ms: 500,
       input_source: selectedCapture === "synthetic" ? "synthetic" : "screen",
       output_validation: true,
-      visual_preview: true,
+      visual_preview: !isNative,
       render_display: Boolean(
         isNative && (rendererTargetHwnd || nativeRendererType === "linux")
       ),
@@ -867,7 +872,26 @@ export function RemoteDisplayWindowPage() {
         pickAvailable(value, availableCaptures, ["synthetic"], "synthetic")
       );
     }
+
+    if (!linuxNativeProfileAppliedRef.current) {
+      const availableEncoders = capabilities.available_encoders ?? [];
+      const availableDecoders = capabilities.available_decoders ?? [];
+      setEncoder(
+        pickCapability(linuxNativeEncoderPreference, availableEncoders) ?? "openh264"
+      );
+      setDecoder(
+        pickCapability(linuxNativeDecoderPreference, availableDecoders) ?? "none"
+      );
+      setTransport("loopback");
+      linuxNativeProfileAppliedRef.current = true;
+    }
   }, [capabilities, hostOs, isLocalPipelinePreview, isTestBusy, renderMode]);
+
+  useEffect(() => {
+    if (renderMode !== "linux_native") {
+      linuxNativeProfileAppliedRef.current = false;
+    }
+  }, [renderMode]);
 
   useEffect(() => {
     if (isNative && capabilities && !nativeRenderAvailable) {
@@ -1340,10 +1364,16 @@ export function RemoteDisplayWindowPage() {
     }
 
     if (hostOs === "linux") {
+      const availableEncoders = capabilities?.available_encoders ?? [];
+      const availableDecoders = capabilities?.available_decoders ?? [];
       setCapture("linux");
-      setEncoder("openh264");
-      setDecoder("software");
-      setTransport("quic");
+      setEncoder(
+        pickCapability(linuxNativeEncoderPreference, availableEncoders) ?? "openh264"
+      );
+      setDecoder(
+        pickCapability(linuxNativeDecoderPreference, availableDecoders) ?? "none"
+      );
+      setTransport("loopback");
       setResolution("1920x1080");
       setFps("60");
       setBitrate("20");

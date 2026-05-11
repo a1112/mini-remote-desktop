@@ -83,7 +83,7 @@ function linuxCapabilities() {
     memory_gb: 32,
     gpu_info: "NVIDIA",
     available_captures: ["linux", "synthetic"],
-    available_encoders: ["openh264", "nvenc_h264"],
+    available_encoders: ["none", "openh264", "nvenc_h264"],
     available_decoders: ["none", "software", "linux_h264"],
     available_renderers: ["none", "linux", "webview"],
     available_memory_modes: ["cpu"],
@@ -487,9 +487,13 @@ describe("RemoteDisplayWindowPage", () => {
       expect(config).toEqual(
         expect.objectContaining({
           capture_type: "linux",
+          encoder_type: "none",
+          decoder_type: "none",
+          transport_kind: "loopback",
           renderer_type: "linux",
           render_display: true,
           renderer_target_hwnd: "0x14",
+          visual_preview: false,
           zero_copy: false,
         })
       );
@@ -570,10 +574,13 @@ describe("RemoteDisplayWindowPage", () => {
           scenarioId: "custom",
           config: expect.objectContaining({
             capture_type: "linux",
+            encoder_type: "none",
+            decoder_type: "none",
             renderer_type: "linux",
             render_display: true,
             renderer_target_hwnd: "0x14",
-            transport_kind: "quic",
+            transport_kind: "loopback",
+            visual_preview: false,
           }),
         })
       );

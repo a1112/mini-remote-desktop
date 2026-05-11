@@ -235,6 +235,7 @@ pub struct X11Renderer {
     height: u32,
     frame_count: u64,
     last_pixel_format: Option<RenderPixelFormat>,
+    scaled_buffer: Vec<u8>,
 }
 
 #[cfg(feature = "x11")]
@@ -287,6 +288,7 @@ impl X11Renderer {
                 height,
                 frame_count: 0,
                 last_pixel_format: None,
+                scaled_buffer: Vec::new(),
             })
         }
     }
@@ -412,17 +414,23 @@ impl X11Renderer {
                 Some(w) => w,
                 None => return Ok(()), // No window to render to
             };
+            let display = self.display;
+            let visual = self.visual;
+            let gc = self.gc;
+            let (target_width, target_height) =
+                self.target_window_dimensions(window, width, height);
+            let (image_data, image_width, image_height) =
+                self.prepare_image_data(data, width, height, target_width, target_height);
 
-            // Create XImage from data
             let image = (xlib::XCreateImage)(
-                self.display,
-                self.visual,
+                display,
+                visual,
                 24, // depth
                 x11::xlib::ZPixmap,
                 0,
-                data.as_ptr() as *mut i8,
-                width as u32,
-                height as u32,
+                image_data.as_ptr() as *mut i8,
+                image_width as u32,
+                image_height as u32,
                 32, // bitmap_pad
                 0,  // bytes_per_line (0 = auto)
             );
@@ -433,25 +441,101 @@ impl X11Renderer {
                 ));
             }
 
-            // Put image to window
             (xlib::XPutImage)(
-                self.display,
+                display,
                 window,
-                self.gc,
+                gc,
                 image,
                 0,
                 0,
                 0,
                 0,
-                width as u32,
-                height as u32,
+                image_width as u32,
+                image_height as u32,
             );
 
             (*image).data = std::ptr::null_mut();
             (xlib::XDestroyImage)(image);
 
-            (xlib::XFlush)(self.display);
+            (xlib::XFlush)(display);
             Ok(())
+        }
+    }
+
+    fn target_window_dimensions(
+        &mut self,
+        window: x11::xlib::Window,
+        fallback_width: usize,
+        fallback_height: usize,
+    ) -> (usize, usize) {
+        use x11::xlib;
+
+        unsafe {
+            let mut attrs: x11::xlib::XWindowAttributes = std::mem::zeroed();
+            if (xlib::XGetWindowAttributes)(self.display, window, &mut attrs) != 0
+                && attrs.width > 0
+                && attrs.height > 0
+            {
+                self.width = attrs.width as u32;
+                self.height = attrs.height as u32;
+                return (attrs.width as usize, attrs.height as usize);
+            }
+        }
+
+        (fallback_width.max(1), fallback_height.max(1))
+    }
+
+    fn prepare_image_data<'a>(
+        &'a mut self,
+        data: &'a [u8],
+        width: usize,
+        height: usize,
+        target_width: usize,
+        target_height: usize,
+    ) -> (&'a [u8], usize, usize) {
+        if width == target_width && height == target_height {
+            return (data, width, height);
+        }
+
+        let target_len = target_width.saturating_mul(target_height).saturating_mul(4);
+        if target_len == 0 || data.len() < width.saturating_mul(height).saturating_mul(4) {
+            return (data, width, height);
+        }
+
+        self.scaled_buffer.resize(target_len, 0);
+        scale_bgra_nearest(
+            data,
+            width,
+            height,
+            &mut self.scaled_buffer,
+            target_width,
+            target_height,
+        );
+        (&self.scaled_buffer, target_width, target_height)
+    }
+}
+
+#[cfg(feature = "x11")]
+fn scale_bgra_nearest(
+    src: &[u8],
+    src_width: usize,
+    src_height: usize,
+    dst: &mut [u8],
+    dst_width: usize,
+    dst_height: usize,
+) {
+    if src_width == 0 || src_height == 0 || dst_width == 0 || dst_height == 0 {
+        return;
+    }
+
+    for y in 0..dst_height {
+        let src_y = y.saturating_mul(src_height) / dst_height;
+        let src_row = src_y.saturating_mul(src_width).saturating_mul(4);
+        let dst_row = y.saturating_mul(dst_width).saturating_mul(4);
+        for x in 0..dst_width {
+            let src_offset = src_row + (x.saturating_mul(src_width) / dst_width) * 4;
+            let dst_offset = dst_row + x * 4;
+            dst[dst_offset..dst_offset + 4].copy_from_slice(&src[src_offset..src_offset + 4]);
         }
     }
 }
