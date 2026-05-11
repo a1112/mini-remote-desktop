@@ -42,7 +42,7 @@ const NATIVE_RENDER_FRAME_TIMEOUT_MS: u64 = 2_000;
 const NATIVE_RENDER_THREAD_STOP_TIMEOUT_MS: u64 = 750;
 const HARNESS_STOP_JOIN_TIMEOUT_MS: u64 = 2_000;
 #[cfg(target_os = "linux")]
-const LINUX_CAPTURE_START_TIMEOUT_MS: u64 = 5_000;
+const DEFAULT_LINUX_CAPTURE_START_TIMEOUT_MS: u64 = 30_000;
 const CAPTURE_NO_FRAME_TIMEOUT_MS: u64 = 2_500;
 
 /// Test chain configuration
@@ -284,24 +284,24 @@ fn default_screen_capture_type() -> CaptureType {
 
 #[cfg(target_os = "linux")]
 fn start_linux_capture_session(capture: &mut PipewireScreenCapture) -> Result<()> {
+    let timeout_ms = std::env::var("MRD_LINUX_CAPTURE_START_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_LINUX_CAPTURE_START_TIMEOUT_MS);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|error| anyhow::anyhow!("create Linux capture runtime failed: {error}"))?;
     match runtime.block_on(async {
-        tokio::time::timeout(
-            Duration::from_millis(LINUX_CAPTURE_START_TIMEOUT_MS),
-            capture.start_session(),
-        )
-        .await
+        tokio::time::timeout(Duration::from_millis(timeout_ms), capture.start_session()).await
     }) {
         Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => Err(anyhow::anyhow!(
             "start Linux capture session failed: {error}"
         )),
         Err(_) => Err(anyhow::anyhow!(
-            "start Linux capture session timed out after {} ms",
-            LINUX_CAPTURE_START_TIMEOUT_MS
+            "start Linux capture session timed out after {timeout_ms} ms; select a screen/window in the system sharing prompt or set MRD_LINUX_CAPTURE_START_TIMEOUT_MS to a larger value"
         )),
     }
 }

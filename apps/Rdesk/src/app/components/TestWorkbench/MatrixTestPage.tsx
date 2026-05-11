@@ -680,6 +680,91 @@ function matrixConfigKey(config: TestConfig): string {
   });
 }
 
+function localRendererForOs(
+  os: HostOs,
+  availableRenderers: string[]
+): TestConfig["renderer_type"] | null {
+  if (os === "linux" && availableRenderers.includes("linux")) return "linux";
+  if (os === "macos" && availableRenderers.includes("macos")) return "macos";
+  if (os === "windows" && availableRenderers.includes("d3d11")) return "d3d11";
+  return null;
+}
+
+function createLocalUiDebugMatrixTests(
+  capabilities: EnvironmentSnapshot | null,
+  capabilitySnapshot: CapabilitySnapshot | null
+): MatrixTest[] {
+  const os = normalizeHostOs(capabilities?.os_type ?? "windows");
+  const availableCaptures = capabilities?.available_captures ?? defaultCapturesForOs(os);
+  const availableEncoders = capabilities?.available_encoders ?? defaultEncodersForOs(os);
+  const availableDecoders = [
+    "none",
+    ...(capabilities?.available_decoders ?? defaultDecodersForOs(os)),
+  ];
+  const availableRenderers = capabilities?.available_renderers ?? defaultRenderersForOs(os);
+
+  if (!availableCaptures.includes("synthetic") || !availableEncoders.includes("openh264")) {
+    return [];
+  }
+
+  const baseConfig = {
+    capture_type: "synthetic",
+    encoder_type: "openh264",
+    transport_kind: "loopback",
+    resolution: [1280, 720],
+    fps: 30,
+    bitrate: 3_000_000,
+    duration_ms: 3_000,
+    warmup_ms: 250,
+    zero_copy: false,
+    visual_preview: true,
+    input_source: "synthetic",
+  } satisfies TestConfig;
+
+  const configs: TestConfig[] = [
+    {
+      ...baseConfig,
+      decoder_type: "none",
+      render_display: false,
+    },
+  ];
+
+  if (availableDecoders.includes("software")) {
+    configs.push({
+      ...baseConfig,
+      decoder_type: "software",
+      render_display: false,
+    });
+  }
+
+  const localRenderer = localRendererForOs(os, availableRenderers);
+  if (localRenderer) {
+    configs.push({
+      ...baseConfig,
+      decoder_type: "none",
+      renderer_type: localRenderer,
+      render_display: true,
+    });
+  }
+
+  if (availableEncoders.includes("nvenc_h264")) {
+    configs.push({
+      ...baseConfig,
+      encoder_type: "nvenc_h264",
+      decoder_type: "none",
+      bitrate: 5_000_000,
+      render_display: false,
+    });
+  }
+
+  return configs.map((config, index) => ({
+    id: `local_ui_debug_${index}`,
+    config,
+    status: "pending",
+    skipReason: staticMatrixSkipReason(config, capabilitySnapshot) ?? undefined,
+  }));
+}
+
 export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) {
   const [showUnavailable] = useShowUnavailableCapabilities();
   const [dimensions, setDimensions] = useState<MatrixDimension[]>(() =>
@@ -898,22 +983,12 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
     }
   }, []);
 
-  const handleStart = async () => {
-    const matrixGeneration = generateMatrix();
-    if (matrixGeneration.truncated) {
-      setTests(matrixGeneration.tests);
-      setMatrixNotice(
-        `当前选择超过 ${MAX_MATRIX_RUNS} 个组合。请减少勾选项后再启动，避免 UI 和测试管线被一次性压满。`
-      );
-      return;
-    }
-
-    const matrixTests = matrixGeneration.tests;
+  const runMatrixTests = async (matrixTests: MatrixTest[], initialNotice: string | null) => {
     if (matrixTests.length === 0) return;
 
     stopRequestedRef.current = false;
     activeRunIdRef.current = null;
-    setMatrixNotice(null);
+    setMatrixNotice(initialNotice);
     setTests(matrixTests);
     setIsRunning(true);
     setCurrentTestIndex(0);
@@ -1073,7 +1148,36 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
     setIsRunning(false);
     if (stopRequestedRef.current) {
       setMatrixNotice("矩阵测试已停止。");
+    } else if (initialNotice) {
+      setMatrixNotice("本地 UI 调试矩阵已结束。");
     }
+  };
+
+  const handleStart = async () => {
+    const matrixGeneration = generateMatrix();
+    if (matrixGeneration.truncated) {
+      setTests(matrixGeneration.tests);
+      setMatrixNotice(
+        `当前选择超过 ${MAX_MATRIX_RUNS} 个组合。请减少勾选项后再启动，避免 UI 和测试管线被一次性压满。`
+      );
+      return;
+    }
+
+    await runMatrixTests(matrixGeneration.tests, null);
+  };
+
+  const handleStartLocalUiDebug = async () => {
+    const localTests = createLocalUiDebugMatrixTests(capabilities, capabilitySnapshot);
+    if (localTests.length === 0) {
+      setTests([]);
+      setMatrixNotice("本地 UI 调试矩阵不可用：当前能力快照没有 synthetic capture 或 OpenH264。");
+      return;
+    }
+
+    await runMatrixTests(
+      localTests,
+      "正在运行本地 UI 调试矩阵：使用 Synthetic capture，不触发 Linux 屏幕共享授权弹窗。"
+    );
   };
 
   const matrixGeneration = useMemo(() => generateMatrix(), [generateMatrix]);
@@ -1159,15 +1263,24 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-lg font-semibold">测试概览</h2>
           {!isRunning ? (
-            <button
-              onClick={handleStart}
-              disabled={plannedTotalTests === 0 || matrixGeneration.truncated}
-              className="flex items-center gap-2 px-4 py-2 bg-primary text-primary-foreground rounded hover:bg-primary/90 disabled:opacity-50"
-            >
-              <Play className="h-4 w-4" />
-              启动矩阵测试 ({plannedTotalTests}
-              {matrixGeneration.truncated ? "+" : ""} 个组合)
-            </button>
+            <div className="flex flex-wrap justify-end gap-2">
+              <button
+                onClick={handleStartLocalUiDebug}
+                className="flex items-center gap-2 px-4 py-2 rounded border border-border bg-secondary text-secondary-foreground hover:bg-secondary/80"
+              >
+                <Play className="h-4 w-4" />
+                本地 UI 调试矩阵
+              </button>
+              <button
+                onClick={handleStart}
+                disabled={plannedTotalTests === 0 || matrixGeneration.truncated}
+                className="flex items-center gap-2 px-4 py-2 bg-primary text-primary-foreground rounded hover:bg-primary/90 disabled:opacity-50"
+              >
+                <Play className="h-4 w-4" />
+                启动矩阵测试 ({plannedTotalTests}
+                {matrixGeneration.truncated ? "+" : ""} 个组合)
+              </button>
+            </div>
           ) : (
             <div className="flex items-center gap-4">
               <span className="text-sm text-muted-foreground">

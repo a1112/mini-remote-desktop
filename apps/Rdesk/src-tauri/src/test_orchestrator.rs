@@ -2996,6 +2996,49 @@ mod tests {
         assert!(error.to_string().contains("Unsupported test scenario"));
     }
 
+    #[test]
+    fn matrix_synthetic_smoke_run_completes_without_platform_capture() {
+        let orchestrator = TestOrchestrator::default();
+        let run_id = orchestrator
+            .start_run(
+                "matrix".to_string(),
+                TestConfigData {
+                    capture_type: Some("synthetic".to_string()),
+                    encoder_type: Some("openh264".to_string()),
+                    decoder_type: Some("none".to_string()),
+                    transport_kind: Some("loopback".to_string()),
+                    resolution: Some([64, 64]),
+                    fps: Some(30),
+                    bitrate: Some(1_000_000),
+                    duration_ms: Some(250),
+                    warmup_ms: Some(0),
+                    visual_preview: Some(false),
+                    ..Default::default()
+                },
+            )
+            .expect("start synthetic matrix smoke run");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let run = loop {
+            let run = orchestrator
+                .get_run(&run_id)
+                .expect("synthetic matrix run should exist");
+            if !matches!(run.status, RunStatus::Running) {
+                break run;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "synthetic matrix smoke run timed out"
+            );
+            thread::sleep(Duration::from_millis(50));
+        };
+
+        assert_eq!(run.status, RunStatus::Completed);
+        let summary = run.summary.expect("completed run should include summary");
+        assert!(summary.frame_count > 0);
+        assert!(summary.capture_fps.unwrap_or_default() > 0.0);
+    }
+
     #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn list_scenarios_includes_single_window_local_probe() {

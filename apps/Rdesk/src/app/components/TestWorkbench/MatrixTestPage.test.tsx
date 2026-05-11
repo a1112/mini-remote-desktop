@@ -253,6 +253,39 @@ describe("MatrixTestPage failure handling", () => {
     });
   });
 
+  it("runs a local UI debug matrix with synthetic capture on Linux", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      const linuxCapabilities = mockLinuxCapabilities(command);
+      if (linuxCapabilities) return linuxCapabilities;
+      if (command === "test_start_run") {
+        return Promise.resolve("run-local-ui");
+      }
+      if (command === "test_get_run") {
+        return Promise.resolve(null);
+      }
+      return Promise.resolve(null);
+    });
+
+    render(<MatrixTestPage runDelayMs={0} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /本地 UI 调试矩阵/ }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_start_run",
+        expect.objectContaining({
+          config: expect.objectContaining({
+            capture_type: "synthetic",
+            encoder_type: "openh264",
+            transport_kind: "loopback",
+            duration_ms: 3000,
+          }),
+        })
+      );
+    });
+  });
+
   it("accepts the macOS OpenH264 CPU fallback performance tier", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {
@@ -444,7 +477,7 @@ describe("MatrixTestPage failure handling", () => {
 
     render(<MatrixTestPage runDelayMs={0} />);
     selectSingleSupportedCombination();
-    fireEvent.click(screen.getByRole("button"));
+    fireEvent.click(screen.getByRole("button", { name: /启动矩阵测试/ }));
 
     await waitFor(() => {
       expect(within(resultRow()).getByText("失败")).toBeInTheDocument();
