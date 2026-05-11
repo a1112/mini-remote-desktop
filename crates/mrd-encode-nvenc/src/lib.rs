@@ -1216,6 +1216,7 @@ impl GstreamerNvencEncoder {
     ) -> Result<Self, PipelineError> {
         require_gst_element(element)?;
         require_gst_element(parser)?;
+        require_gst_element("rawvideoparse")?;
         Ok(Self {
             codec,
             element,
@@ -1243,53 +1244,9 @@ impl GstreamerNvencEncoder {
             )));
         }
 
-        let output = std::process::Command::new("gst-launch-1.0")
-            .arg("-q")
-            .arg("fdsrc")
-            .arg("fd=0")
-            .arg(format!("blocksize={}", frame.data.len()))
-            .arg("num-buffers=1")
-            .arg("!")
-            .arg(format!(
-                "video/x-raw,format=BGRA,width={},height={},framerate={}/1",
-                self.width, self.height, self.fps
-            ))
-            .arg("!")
-            .arg("videoconvert")
-            .arg("!")
-            .arg("video/x-raw,format=BGRA")
-            .arg("!")
-            .arg(self.element)
-            .arg("preset=p1")
-            .arg("tune=ultra-low-latency")
-            .arg("zerolatency=true")
-            .arg("bframes=0")
-            .arg(format!("gop-size={}", self.fps.min(60)))
-            .arg("repeat-sequence-header=true")
-            .arg(format!("bitrate={}", self.bitrate_kbps))
-            .arg("!")
-            .arg(self.parser)
-            .arg("config-interval=-1")
-            .arg("!")
-            .arg(self.caps)
-            .arg("!")
-            .arg("fdsink")
-            .arg("fd=1")
-            .arg("sync=false")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .and_then(|mut child| {
-                if let Some(mut stdin) = child.stdin.take() {
-                    use std::io::Write;
-                    stdin.write_all(&frame.data)?;
-                }
-                child.wait_with_output()
-            })
-            .map_err(|error| {
-                PipelineError::message(format!("launch Linux GStreamer NVENC failed: {error}"))
-            })?;
+        let mut command = self.gstreamer_command();
+        let output =
+            run_gstreamer_encoder_command(&mut command, &frame.data, "Linux GStreamer NVENC")?;
 
         if !output.status.success() {
             return Err(PipelineError::message(format!(
@@ -1309,6 +1266,47 @@ impl GstreamerNvencEncoder {
             is_keyframe: force_idr || annex_b_contains_keyframe(self.codec, &output.stdout),
             bytes: output.stdout,
         }])
+    }
+
+    fn gstreamer_command(&self) -> std::process::Command {
+        let mut command = std::process::Command::new("gst-launch-1.0");
+        command
+            .arg("-q")
+            .arg("fdsrc")
+            .arg("fd=0")
+            .arg("blocksize=65536")
+            .arg("!")
+            .arg("rawvideoparse")
+            .arg("format=bgra")
+            .arg(format!("width={}", self.width))
+            .arg(format!("height={}", self.height))
+            .arg(format!("framerate={}/1", self.fps))
+            .arg("!")
+            .arg("videoconvert")
+            .arg("!")
+            .arg("video/x-raw,format=BGRA")
+            .arg("!")
+            .arg(self.element)
+            .arg("preset=p1")
+            .arg("tune=low-latency")
+            .arg("zerolatency=true")
+            .arg("bframes=0")
+            .arg(format!("gop-size={}", self.fps.min(60)))
+            .arg("repeat-sequence-header=true")
+            .arg(format!("bitrate={}", self.bitrate_kbps))
+            .arg("!")
+            .arg(self.parser)
+            .arg("config-interval=-1")
+            .arg("!")
+            .arg(self.caps)
+            .arg("!")
+            .arg("fdsink")
+            .arg("fd=1")
+            .arg("sync=false")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        command
     }
 }
 
@@ -1332,6 +1330,79 @@ fn require_gst_element(element: &str) -> Result<(), PipelineError> {
     } else {
         Err(PipelineError::message(format!(
             "GStreamer element `{element}` is not available"
+        )))
+    }
+}
+
+#[cfg(not(windows))]
+fn run_gstreamer_encoder_command(
+    command: &mut std::process::Command,
+    input: &[u8],
+    label: &str,
+) -> Result<std::process::Output, PipelineError> {
+    let mut child = command
+        .spawn()
+        .map_err(|error| PipelineError::message(format!("launch {label} failed: {error}")))?;
+
+    let write_error = if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        stdin.write_all(input).err()
+    } else {
+        Some(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "GStreamer stdin pipe is unavailable",
+        ))
+    };
+
+    let output = child
+        .wait_with_output()
+        .map_err(|error| PipelineError::message(format!("wait for {label} failed: {error}")))?;
+
+    if let Some(error) = write_error {
+        return Err(PipelineError::message(format!(
+            "{label} failed while writing raw frame input: {error}; stderr: {}",
+            stderr_text(&output)
+        )));
+    }
+
+    Ok(output)
+}
+
+#[cfg(not(windows))]
+fn stderr_text(output: &std::process::Output) -> String {
+    let text = String::from_utf8_lossy(&output.stderr);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        format!("process exited with {}", output.status)
+    } else {
+        trimmed.to_string()
+    }
+}
+
+#[cfg(not(windows))]
+fn probe_gstreamer_nvenc(
+    codec: VideoCodec,
+    element: &'static str,
+    parser: &'static str,
+    caps: &'static str,
+    width: usize,
+    height: usize,
+) -> Result<(), PipelineError> {
+    let mut encoder =
+        GstreamerNvencEncoder::new(codec, element, parser, caps, width, height, 30, 1_000_000)?;
+    let frame = CapturedFrame::from_cpu(
+        width,
+        height,
+        FramePixelFormat::Bgra32,
+        0,
+        vec![0; width * height * 4],
+    );
+    let units = encoder.encode(&frame)?;
+    if units.iter().any(|unit| !unit.bytes.is_empty()) {
+        Ok(())
+    } else {
+        Err(PipelineError::message(format!(
+            "Linux GStreamer NVENC probe for `{element}` produced no encoded output"
         )))
     }
 }
@@ -1429,7 +1500,14 @@ impl NvencH264Encoder {
     }
 
     pub fn probe_h264_available() -> Result<(), PipelineError> {
-        require_gst_element("nvh264enc")
+        probe_gstreamer_nvenc(
+            VideoCodec::H264,
+            "nvh264enc",
+            "h264parse",
+            "video/x-h264,stream-format=byte-stream,alignment=au",
+            160,
+            64,
+        )
     }
 }
 
@@ -1488,11 +1566,18 @@ impl NvencHevcEncoder {
     }
 
     pub fn probe_hevc_available() -> Result<(), PipelineError> {
-        require_gst_element("nvh265enc")
+        probe_gstreamer_nvenc(
+            VideoCodec::Hevc,
+            "nvh265enc",
+            "h265parse",
+            "video/x-h265,stream-format=byte-stream,alignment=au",
+            160,
+            64,
+        )
     }
 
     pub fn probe_hevc_main10_available() -> Result<(), PipelineError> {
-        require_gst_element("nvh265enc")
+        Self::probe_hevc_available()
     }
 }
 
@@ -1507,5 +1592,39 @@ impl VideoEncoder for NvencH264Encoder {
 impl VideoEncoder for NvencHevcEncoder {
     fn encode(&mut self, frame: &CapturedFrame) -> Result<Vec<EncodedAccessUnit>, PipelineError> {
         self.encoder.encode(frame)
+    }
+}
+
+#[cfg(all(test, not(windows)))]
+mod linux_tests {
+    use super::*;
+
+    #[test]
+    fn gstreamer_command_reassembles_large_raw_frames_before_nvenc() {
+        let encoder = GstreamerNvencEncoder {
+            codec: VideoCodec::H264,
+            element: "nvh264enc",
+            parser: "h264parse",
+            caps: "video/x-h264,stream-format=byte-stream,alignment=au",
+            width: 1280,
+            height: 720,
+            fps: 30,
+            bitrate_kbps: 5_000,
+            frame_index: 0,
+        };
+
+        let command = encoder.gstreamer_command();
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert!(args.iter().any(|arg| arg == "rawvideoparse"));
+        assert!(args.iter().any(|arg| arg == "format=bgra"));
+        assert!(args.iter().any(|arg| arg == "width=1280"));
+        assert!(args.iter().any(|arg| arg == "height=720"));
+        assert!(args.iter().any(|arg| arg == "framerate=30/1"));
+        assert!(args.iter().any(|arg| arg == "tune=low-latency"));
+        assert!(!args.iter().any(|arg| arg == "num-buffers=1"));
     }
 }
