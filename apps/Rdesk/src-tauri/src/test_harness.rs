@@ -1333,8 +1333,6 @@ impl TestHarness {
         let encoded_subscribers = self.encoded_subscribers.clone();
         let running = self.running.clone();
         let running_for_thread = running.clone();
-        let (init_tx, init_rx) = mpsc::channel();
-
         {
             let mut buf = self.frame_buffer.lock().unwrap();
             buf.captured = None;
@@ -1349,6 +1347,7 @@ impl TestHarness {
         {
             let mut m = metrics.lock().unwrap();
             *m = HarnessMetrics::default();
+            m.is_running = true;
         }
 
         running.store(true, Ordering::Relaxed);
@@ -1361,25 +1360,11 @@ impl TestHarness {
                 running_for_thread,
                 chain,
                 config,
-                init_tx,
             );
         });
 
-        match init_rx.recv() {
-            Ok(Ok(())) => {
-                self.thread_handle = Some(handle);
-                Ok(())
-            }
-            Ok(Err(error)) => {
-                let _ = handle.join();
-                Err(error)
-            }
-            Err(error) => {
-                running.store(false, Ordering::Relaxed);
-                let _ = handle.join();
-                anyhow::bail!("test harness initialization channel closed: {}", error);
-            }
-        }
+        self.thread_handle = Some(handle);
+        Ok(())
     }
 
     pub fn start_replacing_existing(&mut self) -> Result<()> {
@@ -1411,7 +1396,6 @@ impl TestHarness {
         running: Arc<AtomicBool>,
         chain: TestChain,
         config: TestConfig,
-        init_tx: mpsc::Sender<Result<()>>,
     ) {
         let state = match Self::initialize_components(&chain, &config) {
             Ok(s) => s,
@@ -1421,7 +1405,6 @@ impl TestHarness {
                 m.is_running = false;
                 m.error_message = Some(message.clone());
                 running.store(false, Ordering::Relaxed);
-                let _ = init_tx.send(Err(anyhow::anyhow!(message)));
                 return;
             }
         };
@@ -1434,8 +1417,6 @@ impl TestHarness {
             m.resolution = (width, height);
             m.error_message = None;
         }
-
-        let _ = init_tx.send(Ok(()));
 
         Self::process_loop(state, frame_buffer, metrics, encoded_subscribers, running);
     }
@@ -3825,6 +3806,39 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(!stopping.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn start_returns_before_initialization_errors_are_reported() {
+        let mut harness = TestHarness::new().expect("create harness");
+        harness.set_chain(TestChain::Custom {
+            capture: CaptureType::Synthetic,
+            encoder: EncoderType::OpenH264,
+            decoder: DecoderType::None,
+        });
+        harness.set_config(TestConfig {
+            zero_copy: Some(true),
+            ..Default::default()
+        });
+
+        harness.start().expect("start harness worker");
+
+        let mut last_metrics = harness.get_metrics();
+        for _ in 0..50 {
+            last_metrics = harness.get_metrics();
+            if last_metrics.error_message.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(!last_metrics.is_running);
+        assert!(last_metrics
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("software H.264 encoding requires CPU-backed capture"));
+        harness.stop().expect("stop failed harness");
     }
 
     #[test]
