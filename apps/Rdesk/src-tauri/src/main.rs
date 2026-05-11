@@ -586,7 +586,26 @@ fn present_native_probe_frame(target: isize) -> Result<bool, String> {
     Ok(snapshot.attached_to_target && snapshot.uploaded_frame_count > 0)
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(target_os = "linux")]
+fn present_native_probe_frame(target: isize) -> Result<bool, String> {
+    use mrd_render::{RenderTarget, RendererFactory};
+
+    let factory = mrd_render_linux::LinuxRendererFactory;
+    let mut renderer = factory
+        .create()
+        .map_err(|error| format!("create Linux probe renderer failed: {error}"))?;
+    renderer
+        .attach_target(RenderTarget::WindowHandle(target))
+        .map_err(|error| format!("attach Linux probe renderer failed: {error}"))?;
+    renderer
+        .upload_frame(build_native_probe_frame(640, 360))
+        .map_err(|error| format!("present Linux probe frame failed: {error}"))?;
+
+    let snapshot = renderer.snapshot();
+    Ok(snapshot.attached_to_target && snapshot.uploaded_frame_count > 0)
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 fn present_native_probe_frame(_target: isize) -> Result<bool, String> {
     Ok(false)
 }
@@ -2156,7 +2175,17 @@ mod tray_tests {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn prefer_x11_backend_for_linux_native_render() {
+    if std::env::var_os("GDK_BACKEND").is_none() && std::env::var_os("DISPLAY").is_some() {
+        std::env::set_var("GDK_BACKEND", "x11,wayland");
+    }
+}
+
 fn main() {
+    #[cfg(target_os = "linux")]
+    prefer_x11_backend_for_linux_native_render();
+
     let settings_path = default_settings_path();
     let _settings = load_settings(&settings_path).unwrap_or_else(|error| {
         eprintln!("failed to load app settings: {error}");

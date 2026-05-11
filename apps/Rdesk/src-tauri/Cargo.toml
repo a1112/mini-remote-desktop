@@ -89,6 +89,8 @@ objc = "0.2"
 mrd-capture-pipewire = { path = "../../../crates/mrd-capture-pipewire", features = ["portal"] }
 mrd-render-linux = { path = "../../../crates/mrd-render-linux" }
 mrd-encode-nvenc-av1 = { path = "../../../crates/mrd-encode-nvenc-av1" }
+raw-window-handle = "0.6"
+x11 = { version = "2.21", features = ["xlib"] }
 
 [features]
 # this feature is used for production builds or when `devPath` points to the filesystem and the built-in dev server is disabled.

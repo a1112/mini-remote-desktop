@@ -420,9 +420,9 @@ describe("RemoteDisplayWindowPage", () => {
     });
   });
 
-  it("starts Linux native rendering without an embedded native surface", async () => {
+  it("starts Linux native rendering with an embedded native surface", async () => {
     const mockInvoke = getMockInvoke();
-    mockInvoke.mockImplementation((command: string) => {
+    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
       if (command === "test_get_capabilities") {
         return Promise.resolve(linuxCapabilities());
       }
@@ -441,16 +441,16 @@ describe("RemoteDisplayWindowPage", () => {
       if (command === "configure_remote_display_native_surface") {
         return Promise.resolve({
           label: "render-local-display-test-1",
-          backend: "web",
-          attached: false,
-          visible: false,
-          parent_hwnd: null,
-          hwnd: null,
+          backend: args?.enabled ? "linux" : "web",
+          attached: Boolean(args?.enabled),
+          visible: Boolean(args?.visible),
+          parent_hwnd: args?.enabled ? "0xA" : null,
+          hwnd: args?.enabled ? "0x14" : null,
           rect: { x: 0, y: 56, width: 1280, height: 720 },
         });
       }
       if (command === "present_test_harness_frame_on_native_surface") {
-        return Promise.resolve(false);
+        return Promise.resolve(true);
       }
       if (command === "test_harness_stop") {
         return Promise.resolve(null);
@@ -486,14 +486,14 @@ describe("RemoteDisplayWindowPage", () => {
       const config = (startCall?.[1] as { config?: Record<string, unknown> } | undefined)?.config;
       expect(config).toEqual(
         expect.objectContaining({
-          capture_type: "synthetic",
+          capture_type: "linux",
           renderer_type: "linux",
           render_display: true,
+          renderer_target_hwnd: "0x14",
           zero_copy: false,
         })
       );
-      expect(config?.renderer_target_hwnd).toBeUndefined();
-      expect(mockInvoke).not.toHaveBeenCalledWith(
+      expect(mockInvoke).toHaveBeenCalledWith(
         "present_test_harness_frame_on_native_surface",
         undefined
       );
@@ -502,7 +502,7 @@ describe("RemoteDisplayWindowPage", () => {
 
   it("uses the Linux platform path for the low latency local profile", async () => {
     const mockInvoke = getMockInvoke();
-    mockInvoke.mockImplementation((command: string) => {
+    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
       if (command === "test_get_capabilities") {
         return Promise.resolve(linuxCapabilities());
       }
@@ -521,13 +521,16 @@ describe("RemoteDisplayWindowPage", () => {
       if (command === "configure_remote_display_native_surface") {
         return Promise.resolve({
           label: "render-local-display-test-1",
-          backend: "web",
-          attached: false,
-          visible: false,
-          parent_hwnd: null,
-          hwnd: null,
+          backend: args?.enabled ? "linux" : "web",
+          attached: Boolean(args?.enabled),
+          visible: Boolean(args?.visible),
+          parent_hwnd: args?.enabled ? "0xA" : null,
+          hwnd: args?.enabled ? "0x14" : null,
           rect: { x: 0, y: 56, width: 1280, height: 720 },
         });
+      }
+      if (command === "present_test_harness_frame_on_native_surface") {
+        return Promise.resolve(true);
       }
       if (command === "test_harness_stop") {
         return Promise.resolve(null);
@@ -569,6 +572,7 @@ describe("RemoteDisplayWindowPage", () => {
             capture_type: "linux",
             renderer_type: "linux",
             render_display: true,
+            renderer_target_hwnd: "0x14",
             transport_kind: "quic",
           }),
         })

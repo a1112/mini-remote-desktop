@@ -24,7 +24,7 @@ pub struct NativeRenderSurfaceSnapshot {
 
 #[derive(Default)]
 pub struct RemoteDisplaySurfaceManager {
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     surfaces: std::collections::HashMap<String, NativeRenderSurface>,
 }
 
@@ -116,7 +116,43 @@ impl RemoteDisplaySurfaceManager {
         Ok(snapshot)
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    pub fn configure(
+        &mut self,
+        window: &WebviewWindow,
+        rect: NativeSurfaceRect,
+        enabled: bool,
+        visible: bool,
+    ) -> Result<NativeRenderSurfaceSnapshot, String> {
+        let label = window.label().to_string();
+        let rect = normalize_rect(rect);
+
+        if !enabled {
+            self.surfaces.remove(&label);
+            return Ok(NativeRenderSurfaceSnapshot {
+                label,
+                backend: "web".to_string(),
+                attached: false,
+                visible: false,
+                parent_hwnd: None,
+                hwnd: None,
+                rect,
+            });
+        }
+
+        let parent_hwnd = linux_parent_x11_window(window)?;
+        if let Some(surface) = self.surfaces.get_mut(&label) {
+            surface.move_to(rect, visible)?;
+            return Ok(surface.snapshot(label, rect));
+        }
+
+        let surface = NativeRenderSurface::create(parent_hwnd, rect, visible)?;
+        let snapshot = surface.snapshot(label.clone(), rect);
+        self.surfaces.insert(label, surface);
+        Ok(snapshot)
+    }
+
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     pub fn render_target_handle(&self, label: &str) -> Option<isize> {
         self.surfaces
             .get(label)
@@ -141,12 +177,17 @@ impl RemoteDisplaySurfaceManager {
         Ok(true)
     }
 
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    pub fn detach(&mut self, label: &str, _window: Option<&WebviewWindow>) -> Result<bool, String> {
+        Ok(self.surfaces.remove(label).is_some())
+    }
+
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     pub fn render_target_handle(&self, _label: &str) -> Option<isize> {
         None
     }
 
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     pub fn detach(
         &mut self,
         _label: &str,
@@ -155,7 +196,7 @@ impl RemoteDisplaySurfaceManager {
         Ok(false)
     }
 
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     pub fn configure(
         &mut self,
         window: &WebviewWindow,
@@ -164,19 +205,10 @@ impl RemoteDisplaySurfaceManager {
         _visible: bool,
     ) -> Result<NativeRenderSurfaceSnapshot, String> {
         if enabled {
-            #[cfg(target_os = "linux")]
-            {
-                return Err(
-                    "embedded native render surface is not available on Linux; Linux native render uses a platform-owned test window".to_string(),
-                );
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                return Err(
-                    "embedded native render surface is only available on Windows and macOS"
-                        .to_string(),
-                );
-            }
+            return Err(
+                "embedded native render surface is only available on Windows, macOS, and Linux/X11"
+                    .to_string(),
+            );
         }
 
         Ok(NativeRenderSurfaceSnapshot {
@@ -363,6 +395,172 @@ impl Drop for NativeRenderSurface {
             let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(self.hwnd);
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+struct NativeRenderSurface {
+    parent_hwnd: isize,
+    display: *mut x11::xlib::Display,
+    window: x11::xlib::Window,
+    visible: bool,
+}
+
+#[cfg(target_os = "linux")]
+unsafe impl Send for NativeRenderSurface {}
+
+#[cfg(target_os = "linux")]
+impl NativeRenderSurface {
+    fn create(parent_hwnd: isize, rect: NativeSurfaceRect, visible: bool) -> Result<Self, String> {
+        use std::ptr;
+        use x11::xlib;
+
+        if parent_hwnd == 0 {
+            return Err("remote display Linux parent X11 window is null".to_string());
+        }
+
+        unsafe {
+            init_x11_threads();
+            let display = (xlib::XOpenDisplay)(ptr::null());
+            if display.is_null() {
+                return Err(
+                    "open X11 display failed; embedded Linux native render requires X11/XWayland"
+                        .to_string(),
+                );
+            }
+
+            let screen = (xlib::XDefaultScreen)(display);
+            let black = (xlib::XBlackPixel)(display, screen);
+            let window = (xlib::XCreateSimpleWindow)(
+                display,
+                parent_hwnd as xlib::Window,
+                rect.x,
+                rect.y,
+                rect.width as u32,
+                rect.height as u32,
+                0,
+                black,
+                black,
+            );
+            if window == 0 {
+                (xlib::XCloseDisplay)(display);
+                return Err("create Linux native render child window failed".to_string());
+            }
+
+            (xlib::XSelectInput)(
+                display,
+                window,
+                xlib::ExposureMask | xlib::StructureNotifyMask,
+            );
+            if visible {
+                (xlib::XMapRaised)(display, window);
+                (xlib::XRaiseWindow)(display, window);
+            }
+            (xlib::XFlush)(display);
+
+            Ok(Self {
+                parent_hwnd,
+                display,
+                window,
+                visible,
+            })
+        }
+    }
+
+    fn move_to(&mut self, rect: NativeSurfaceRect, visible: bool) -> Result<(), String> {
+        use x11::xlib;
+
+        unsafe {
+            if self.display.is_null() || self.window == 0 {
+                return Err("Linux native render surface is detached".to_string());
+            }
+            (xlib::XMoveResizeWindow)(
+                self.display,
+                self.window,
+                rect.x,
+                rect.y,
+                rect.width as u32,
+                rect.height as u32,
+            );
+            if visible {
+                (xlib::XMapRaised)(self.display, self.window);
+                (xlib::XRaiseWindow)(self.display, self.window);
+            } else {
+                (xlib::XUnmapWindow)(self.display, self.window);
+            }
+            (xlib::XFlush)(self.display);
+        }
+
+        self.visible = visible;
+        Ok(())
+    }
+
+    fn snapshot(&self, label: String, rect: NativeSurfaceRect) -> NativeRenderSurfaceSnapshot {
+        NativeRenderSurfaceSnapshot {
+            label,
+            backend: "linux".to_string(),
+            attached: true,
+            visible: self.visible,
+            parent_hwnd: Some(handle_hex(self.parent_hwnd)),
+            hwnd: Some(handle_hex(self.window as isize)),
+            rect,
+        }
+    }
+
+    fn render_target_handle(&self) -> isize {
+        self.window as isize
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for NativeRenderSurface {
+    fn drop(&mut self) {
+        use x11::xlib;
+
+        unsafe {
+            if !self.display.is_null() {
+                if self.window != 0 {
+                    (xlib::XDestroyWindow)(self.display, self.window);
+                    (xlib::XFlush)(self.display);
+                }
+                (xlib::XCloseDisplay)(self.display);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_parent_x11_window(window: &WebviewWindow) -> Result<isize, String> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let handle = window
+        .window_handle()
+        .map_err(|error| format!("get remote display native window handle failed: {error}"))?;
+
+    match handle.as_raw() {
+        RawWindowHandle::Xlib(handle) => {
+            if handle.window == 0 {
+                Err("remote display Linux Xlib window handle is null".to_string())
+            } else {
+                Ok(handle.window as isize)
+            }
+        }
+        RawWindowHandle::Xcb(handle) => Ok(handle.window.get() as isize),
+        RawWindowHandle::Wayland(_) => Err(
+            "embedded Linux native render currently requires X11/XWayland; switch the session to X11 or use Web View on Wayland"
+                .to_string(),
+        ),
+        other => Err(format!(
+            "embedded Linux native render requires an X11 window handle, got {other:?}"
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn init_x11_threads() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| unsafe {
+        let _ = x11::xlib::XInitThreads();
+    });
 }
 
 #[cfg(target_os = "macos")]

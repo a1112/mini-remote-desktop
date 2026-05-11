@@ -525,7 +525,9 @@ export function RemoteDisplayWindowPage() {
         : null;
   const isNative = nativeRendererType !== null;
   const requiresEmbeddedNativeSurface =
-    nativeRendererType === "d3d11" || nativeRendererType === "macos";
+    nativeRendererType === "d3d11" ||
+    nativeRendererType === "macos" ||
+    nativeRendererType === "linux";
   const nativeRendererTypeForHost = nativeRendererForHost(hostOs);
   const currentNativeRendererAvailable =
     isTauriRuntime() &&
@@ -799,9 +801,7 @@ export function RemoteDisplayWindowPage() {
     }
 
     if (os === "linux") {
-      const localCapturePreference: CaptureType[] = isLocalPipelinePreview
-        ? ["synthetic", "linux"]
-        : ["linux", "synthetic"];
+      const localCapturePreference: CaptureType[] = ["linux", "synthetic"];
       const localDecoderPreference: DecoderType[] = isLocalPipelinePreview
         ? ["software", "linux_h264", "none"]
         : ["linux_h264", "software", "none"];
@@ -849,6 +849,27 @@ export function RemoteDisplayWindowPage() {
   }, [isLocalPipelinePreview, isTestBusy, localWebViewPlan, renderMode]);
 
   useEffect(() => {
+    if (
+      !isLocalPipelinePreview ||
+      hostOs !== "linux" ||
+      renderMode !== "linux_native" ||
+      isTestBusy ||
+      !capabilities
+    ) {
+      return;
+    }
+
+    const availableCaptures = capabilities.available_captures ?? [];
+    if (availableCaptures.includes("linux")) {
+      setCapture("linux");
+    } else {
+      setCapture((value) =>
+        pickAvailable(value, availableCaptures, ["synthetic"], "synthetic")
+      );
+    }
+  }, [capabilities, hostOs, isLocalPipelinePreview, isTestBusy, renderMode]);
+
+  useEffect(() => {
     if (isNative && capabilities && !nativeRenderAvailable) {
       setRenderMode("web");
     }
@@ -856,10 +877,6 @@ export function RemoteDisplayWindowPage() {
 
   const syncNativeSurface = useCallback(async (options?: { visible?: boolean }) => {
     if (!isTauriRuntime()) return null;
-    if (nativeRendererType === "linux") {
-      setNativeSurface(null);
-      return null;
-    }
     const element = renderAreaRef.current;
     if (!element) return null;
 
