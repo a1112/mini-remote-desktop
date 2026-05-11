@@ -222,6 +222,31 @@ function optionEnabledForOs(option: MatrixOption, os: HostOs): boolean {
   return option.defaultEnabledOn ? option.defaultEnabledOn.includes(os) : option.enabled;
 }
 
+function hasLinuxHardwareDecoder(availableDecoders: string[]): boolean {
+  return availableDecoders.some((decoder) =>
+    decoder === "linux_h264" ||
+    decoder === "linux_hevc" ||
+    decoder === "linux_hevc_main10"
+  );
+}
+
+function shouldEnableOptionByDefault(
+  dimensionId: string,
+  option: MatrixOption,
+  os: HostOs,
+  availableDecoders: string[]
+): boolean {
+  if (
+    os === "linux" &&
+    dimensionId === "decoder" &&
+    option.id === "software" &&
+    hasLinuxHardwareDecoder(availableDecoders)
+  ) {
+    return false;
+  }
+  return optionEnabledForOs(option, os);
+}
+
 function createMatrixDimensions(
   capabilities?: EnvironmentSnapshot | null,
   showUnavailable = false
@@ -269,7 +294,9 @@ function createMatrixDimensions(
       .map((option) => ({
         ...option,
         available: optionAvailable(dimension.id, option.id),
-        enabled: optionAvailable(dimension.id, option.id) && optionEnabledForOs(option, os),
+        enabled:
+          optionAvailable(dimension.id, option.id) &&
+          shouldEnableOptionByDefault(dimension.id, option, os, availableDecoders),
       }))
       .filter((option) => showUnavailable || option.available),
   })).filter((dimension) => dimension.options.length > 0);

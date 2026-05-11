@@ -408,12 +408,29 @@ impl TestOrchestrator {
             #[cfg(target_os = "linux")]
             "e2e.linux_local" => Ok(TestChain::Custom {
                 capture: CaptureType::Linux,
-                encoder: EncoderType::OpenH264,
-                decoder: DecoderType::Software,
+                encoder: match config.encoder_type.as_deref().unwrap_or("nvenc_h264") {
+                    "nvenc_h264" => EncoderType::NvencH264,
+                    "openh264" | "software_h264" | "h264_software" | "software-h264"
+                    | "h264-software" | "sw_h264" => EncoderType::OpenH264,
+                    other => anyhow::bail!("Unsupported Linux E2E encoder: {}", other),
+                },
+                decoder: match config.decoder_type.as_deref().unwrap_or("linux_h264") {
+                    "linux_h264" | "gstreamer_h264" | "vaapi_h264" => DecoderType::LinuxH264,
+                    "software" | "software_h264" | "h264_software" | "software-h264"
+                    | "h264-software" | "openh264" => DecoderType::Software,
+                    "none" => DecoderType::None,
+                    other => anyhow::bail!("Unsupported Linux E2E decoder: {}", other),
+                },
             }),
             "encode.nvenc_h264" => Ok(TestChain::NvencOnly),
             "encode.openh264" => Ok(TestChain::OpenH264),
             "decode.nvdec_h264" => Ok(TestChain::NvencNvdec),
+            #[cfg(target_os = "linux")]
+            "decode.linux_h264" => Ok(TestChain::Custom {
+                capture: CaptureType::Synthetic,
+                encoder: EncoderType::NvencH264,
+                decoder: DecoderType::LinuxH264,
+            }),
             "encode.videotoolbox_h264" => Ok(TestChain::Custom {
                 capture: CaptureType::Synthetic,
                 encoder: EncoderType::VideoToolboxH264,
@@ -611,6 +628,24 @@ impl TestOrchestrator {
                     ..Default::default()
                 },
             },
+            #[cfg(target_os = "linux")]
+            TestScenario {
+                scenario_id: "decode.linux_h264".to_string(),
+                scenario_kind: ScenarioKind::Decode,
+                component_scope: vec!["linux_decode".to_string()],
+                display_name: "Linux H.264 硬件解码测试".to_string(),
+                description: "测试 Linux GStreamer H.264 硬件解码路径".to_string(),
+                supports_matrix: true,
+                default_config: TestConfigData {
+                    capture_type: Some("synthetic".to_string()),
+                    encoder_type: Some("nvenc_h264".to_string()),
+                    decoder_type: Some("linux_h264".to_string()),
+                    transport_kind: Some("loopback".to_string()),
+                    render_display: Some(false),
+                    zero_copy: Some(false),
+                    ..Default::default()
+                },
+            },
             TestScenario {
                 scenario_id: "decode.videotoolbox_h264".to_string(),
                 scenario_kind: ScenarioKind::Decode,
@@ -673,22 +708,23 @@ impl TestOrchestrator {
                 scenario_kind: ScenarioKind::E2eLocal,
                 component_scope: vec![
                     "linux_capture".to_string(),
-                    "openh264".to_string(),
+                    "nvenc".to_string(),
+                    "linux_decode".to_string(),
                     "linux_render".to_string(),
                 ],
                 display_name: "Linux 本地端到端测试".to_string(),
-                description: "测试 Linux 采集→OpenH264 编码→软件解码→Linux 渲染流程"
+                description: "测试 Linux 采集→NVENC 编码→Linux 硬件解码→Linux 渲染流程"
                     .to_string(),
                 supports_matrix: true,
                 default_config: TestConfigData {
                     capture_type: Some("linux".to_string()),
-                    encoder_type: Some("openh264".to_string()),
-                    decoder_type: Some("software".to_string()),
+                    encoder_type: Some("nvenc_h264".to_string()),
+                    decoder_type: Some("linux_h264".to_string()),
                     renderer_type: Some("linux".to_string()),
                     render_display: Some(true),
                     resolution: Some([1920, 1080]),
                     fps: Some(60),
-                    bitrate: Some(5_000_000),
+                    bitrate: Some(20_000_000),
                     ..Default::default()
                 },
             },
@@ -2297,7 +2333,7 @@ fn scenario_supported_on_current_platform(scenario_id: &str) -> bool {
         "capture.macos" | "encode.videotoolbox_h264" | "e2e.macos_local" => {
             cfg!(target_os = "macos")
         }
-        "capture.linux" | "e2e.linux_local" => cfg!(target_os = "linux"),
+        "capture.linux" | "decode.linux_h264" | "e2e.linux_local" => cfg!(target_os = "linux"),
         "decode.videotoolbox_h264" => cfg!(target_os = "macos") && videotoolbox_decoder_enabled(),
         "encode.openh264" | "custom" | "matrix" => true,
         _ => true,
@@ -3154,6 +3190,37 @@ mod tests {
                     capture: CaptureType::Macos,
                     encoder: EncoderType::VideoToolboxH264,
                     decoder: DecoderType::Software,
+                }
+            );
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let linux_hw_config = TestConfigData {
+                capture_type: Some("linux".to_string()),
+                encoder_type: Some("nvenc_h264".to_string()),
+                decoder_type: Some("linux_h264".to_string()),
+                ..Default::default()
+            };
+
+            assert_eq!(
+                orchestrator
+                    .scenario_to_chain("e2e.linux_local", &linux_hw_config)
+                    .unwrap(),
+                TestChain::Custom {
+                    capture: CaptureType::Linux,
+                    encoder: EncoderType::NvencH264,
+                    decoder: DecoderType::LinuxH264,
+                }
+            );
+            assert_eq!(
+                orchestrator
+                    .scenario_to_chain("decode.linux_h264", &TestConfigData::default())
+                    .unwrap(),
+                TestChain::Custom {
+                    capture: CaptureType::Synthetic,
+                    encoder: EncoderType::NvencH264,
+                    decoder: DecoderType::LinuxH264,
                 }
             );
         }

@@ -2,7 +2,7 @@ import { useEffect, useState, type ReactNode } from "react";
 import { Play, Square, Cpu, Monitor, Clock, Gauge } from "lucide-react";
 import * as commands from "../../adapters/tauri/commands";
 import type { EnvironmentSnapshot, TestConfig } from "../../adapters/tauri/types";
-import { capabilityAvailable, capabilityTag, unavailableText } from "./capabilityMeta";
+import { capabilityAvailable, capabilityTag, chooseCapability, unavailableText } from "./capabilityMeta";
 import {
   shouldShowCapabilityOption,
   useShowUnavailableCapabilities,
@@ -192,7 +192,8 @@ function hasCapability(
 function buildDecodeRun(
   decoder: DecoderType,
   codec: DecodeCodec,
-  profile: DecodeProfile
+  profile: DecodeProfile,
+  capabilities?: EnvironmentSnapshot | null
 ): {
   scenarioId: string;
   config: TestConfig;
@@ -235,12 +236,18 @@ function buildDecodeRun(
   }
 
   if (decoder === "linux_h264") {
+    const encoder = chooseCapability(
+      ["nvenc_h264", "openh264"],
+      capabilities ?? null,
+      "available_encoders",
+      "openh264"
+    );
     return {
       scenarioId: "custom",
       config: {
         ...common,
         capture_type: "synthetic",
-        encoder_type: "openh264",
+        encoder_type: encoder,
         decoder_type: "linux_h264",
         zero_copy: false,
       },
@@ -314,7 +321,7 @@ export function DecodeTestPage() {
   const selectedProfile =
     DECODE_PROFILES.find((profile) => profile.id === selectedProfileId) ?? DEFAULT_DECODE_PROFILE;
   const selectedOption = DECODER_OPTIONS.find((option) => option.id === selectedDecoder);
-  const selectedRun = buildDecodeRun(selectedDecoder, selectedCodec, selectedProfile);
+  const selectedRun = buildDecodeRun(selectedDecoder, selectedCodec, selectedProfile, capabilities);
   const selectedAvailable =
     capabilityAvailable(capabilities, "available_decoders", selectedDecoder, selectedDecoder === "software") &&
     codecSupportedByDecoder(selectedCodec, selectedDecoder) &&
@@ -346,10 +353,20 @@ export function DecodeTestPage() {
   }, [selectedCodec, selectedDecoder]);
 
   useEffect(() => {
-    if (!capabilities || decoderAvailable(selectedDecoder)) return;
-    const nextDecoder = DECODER_OPTIONS.find((option) => decoderAvailable(option.id));
+    if (!capabilities) return;
+    const decoderIsAvailable = (decoder: DecoderType) =>
+      capabilityAvailable(capabilities, "available_decoders", decoder, decoder === "software");
+    const preferredHardware = DECODER_OPTIONS.find(
+      (option) => option.type === "hardware" && decoderIsAvailable(option.id)
+    );
+    if (selectedDecoder === "software" && preferredHardware) {
+      setSelectedDecoder(preferredHardware.id);
+      return;
+    }
+    if (decoderIsAvailable(selectedDecoder)) return;
+    const nextDecoder = DECODER_OPTIONS.find((option) => decoderIsAvailable(option.id));
     if (nextDecoder) setSelectedDecoder(nextDecoder.id);
-  }, [capabilities, selectedDecoder]);
+  }, [capabilities]);
 
   useEffect(() => {
     if (!isRunning) return;
@@ -379,7 +396,7 @@ export function DecodeTestPage() {
   }, [isRunning]);
 
   const handleStart = async () => {
-    const run = buildDecodeRun(selectedDecoder, selectedCodec, selectedProfile);
+    const run = buildDecodeRun(selectedDecoder, selectedCodec, selectedProfile, capabilities);
     const missing = missingChainCapability(capabilities, run.config);
     if (missing) {
       setStartError(`当前环境缺少解码测试链路能力：${missing}`);

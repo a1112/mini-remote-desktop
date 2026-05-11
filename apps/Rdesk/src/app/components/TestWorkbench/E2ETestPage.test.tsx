@@ -55,6 +55,58 @@ describe("E2ETestPage LAN automation", () => {
     });
   });
 
+  it("uses the Linux NVENC to hardware decode path when available", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve({
+          os_type: "linux",
+          cpu_brand: "test",
+          cpu_cores: 12,
+          memory_gb: 32,
+          gpu_info: "NVIDIA",
+          available_captures: ["linux", "synthetic"],
+          available_encoders: ["nvenc_h264", "openh264"],
+          available_decoders: ["linux_h264", "software"],
+          available_renderers: ["linux"],
+          available_memory_modes: ["cpu"],
+        });
+      }
+      if (command === "test_start_run") return Promise.resolve("run-linux-hw-e2e");
+      if (command === "test_get_run") return Promise.resolve(null);
+      return Promise.resolve(null);
+    });
+
+    render(
+      <MemoryRouter>
+        <E2ETestPage />
+      </MemoryRouter>
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("nvenc_h264")).toBeInTheDocument();
+      expect(screen.getByText("linux_h264")).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByRole("button", { name: /启动测试/ }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_start_run",
+        expect.objectContaining({
+          scenarioId: "e2e.linux_local",
+          config: expect.objectContaining({
+            capture_type: "linux",
+            encoder_type: "nvenc_h264",
+            decoder_type: "linux_h264",
+            renderer_type: "linux",
+            render_display: true,
+            zero_copy: undefined,
+          }),
+        })
+      );
+    });
+  });
+
   it("runs LAN remote display automation through IPC commands", async () => {
     const mockInvoke = installSuccessfulLanAutomationMock();
 

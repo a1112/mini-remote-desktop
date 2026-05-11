@@ -10,6 +10,17 @@ function selectSingleSupportedCombination() {
   fireEvent.click(screen.getByLabelText("30 FPS"));
 }
 
+function setCheckbox(checkbox: HTMLElement, checked: boolean) {
+  const input = checkbox as HTMLInputElement;
+  if (input.checked !== checked) {
+    fireEvent.click(input);
+  }
+}
+
+function setLabeledCheckbox(label: string | RegExp, checked: boolean) {
+  setCheckbox(screen.getByLabelText(label), checked);
+}
+
 function resultRow() {
   return screen.getAllByRole("row")[1]!;
 }
@@ -193,6 +204,53 @@ describe("MatrixTestPage failure handling", () => {
     expect(screen.queryByLabelText("NVENC H.264")).not.toBeInTheDocument();
     expect(screen.queryByLabelText("DX11 popup")).not.toBeInTheDocument();
     expect(screen.queryByLabelText("D3D11 shared texture")).not.toBeInTheDocument();
+  });
+
+  it("prefers Linux hardware decode over software fallback in the default matrix", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve({
+          os_type: "linux",
+          cpu_brand: "",
+          cpu_cores: 12,
+          memory_gb: 32,
+          gpu_info: "NVIDIA",
+          available_captures: ["synthetic"],
+          available_encoders: ["nvenc_h264", "openh264"],
+          available_decoders: ["linux_h264", "software"],
+          available_renderers: ["none"],
+          available_memory_modes: ["cpu"],
+        });
+      }
+      if (command === "test_start_run") {
+        return Promise.resolve("run-linux-hw");
+      }
+      if (command === "test_get_run") {
+        return Promise.resolve(null);
+      }
+      return Promise.resolve(null);
+    });
+
+    render(<MatrixTestPage runDelayMs={0} />);
+
+    await screen.findByLabelText("Linux H.264 HW");
+    expect(screen.getByLabelText("Linux H.264 HW")).toBeChecked();
+    expect(screen.getByLabelText("软件")).not.toBeChecked();
+
+    fireEvent.click(screen.getByRole("button", { name: /启动矩阵测试/ }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_start_run",
+        expect.objectContaining({
+          config: expect.objectContaining({
+            encoder_type: "nvenc_h264",
+            decoder_type: "linux_h264",
+          }),
+        })
+      );
+    });
   });
 
   it("accepts the macOS OpenH264 CPU fallback performance tier", async () => {
@@ -533,8 +591,10 @@ describe("MatrixTestPage failure handling", () => {
 
     render(<MatrixTestPage runDelayMs={0} />);
 
-    await screen.findAllByLabelText("Linux");
-    fireEvent.click(screen.getByLabelText("No display"));
+    const linuxOptions = await screen.findAllByLabelText("Linux");
+    setCheckbox(linuxOptions[0]!, true);
+    setCheckbox(linuxOptions[1]!, true);
+    setLabeledCheckbox("Synthetic", false);
     fireEvent.click(screen.getByRole("button", { name: /启动矩阵测试/ }));
 
     await waitFor(() => {
@@ -598,13 +658,16 @@ describe("MatrixTestPage failure handling", () => {
     render(<MatrixTestPage runDelayMs={0} />);
 
     await screen.findByLabelText("D3D11 shared texture");
-    fireEvent.click(screen.getByLabelText("NVENC H.264"));
-    fireEvent.click(screen.getByLabelText("软件"));
-    fireEvent.click(screen.getByLabelText("1080p"));
-    fireEvent.click(screen.getByLabelText("60 FPS"));
-    fireEvent.click(screen.getByLabelText("CPU"));
-    fireEvent.click(screen.getByLabelText("D3D11 shared texture"));
-    fireEvent.click(screen.getByLabelText("No display"));
+    setLabeledCheckbox("NVENC H.264", false);
+    setLabeledCheckbox("OpenH264", true);
+    setLabeledCheckbox("NVDEC", false);
+    setLabeledCheckbox("软件", true);
+    setLabeledCheckbox("720p", true);
+    setLabeledCheckbox("1080p", false);
+    setLabeledCheckbox("30 FPS", true);
+    setLabeledCheckbox("60 FPS", false);
+    setLabeledCheckbox("CPU", false);
+    setLabeledCheckbox("D3D11 shared texture", true);
     fireEvent.click(screen.getByRole("button", { name: /启动矩阵测试/ }));
 
     await waitFor(() => {

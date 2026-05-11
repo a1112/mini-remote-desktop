@@ -74,6 +74,52 @@ describe("DecodeTestPage backend contract", () => {
     expect((startCall?.[1] as { config?: { renderer_type?: string } } | undefined)?.config?.renderer_type).toBeUndefined();
   });
 
+  it("prefers Linux hardware decode and NVENC when both are available", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve({
+          os_type: "linux",
+          cpu_brand: "test",
+          cpu_cores: 12,
+          memory_gb: 32,
+          gpu_info: "NVIDIA",
+          available_captures: ["synthetic", "linux"],
+          available_encoders: ["nvenc_h264", "openh264"],
+          available_decoders: ["linux_h264", "software"],
+          available_renderers: ["linux"],
+          available_memory_modes: ["cpu"],
+        });
+      }
+      if (command === "test_start_run") return Promise.resolve("run-linux-hw-decode");
+      return Promise.resolve(null);
+    });
+
+    render(<DecodeTestPage />);
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /^选择解码器 Linux H\.264 HW$/ })).toHaveClass(
+        "border-primary"
+      )
+    );
+    fireEvent.click(screen.getByRole("button", { name: /启动测试/ }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_start_run",
+        expect.objectContaining({
+          scenarioId: "custom",
+          config: expect.objectContaining({
+            capture_type: "synthetic",
+            encoder_type: "nvenc_h264",
+            decoder_type: "linux_h264",
+            render_display: false,
+          }),
+        })
+      );
+    });
+  });
+
   it("starts NVDEC with an explicit 2K 144Hz decode profile", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {

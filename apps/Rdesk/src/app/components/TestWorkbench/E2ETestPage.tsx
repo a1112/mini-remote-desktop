@@ -23,17 +23,22 @@ function buildDefaultConfig(capabilities: EnvironmentSnapshot | null): TestConfi
     capture === "macos"
       ? ["videotoolbox_h264", "openh264"]
       : capture === "linux"
-        ? ["openh264"]
+        ? ["nvenc_h264", "openh264"]
         : ["nvenc_h264", "openh264"],
     capabilities,
     "available_encoders",
     "openh264"
   );
-  const decoder = capabilityAvailable(capabilities, "available_decoders", "nvdec")
-    ? "nvdec"
-    : capabilityAvailable(capabilities, "available_decoders", "software", true)
-      ? "software"
-      : "none";
+  const decoder = chooseCapability(
+    capture === "linux"
+      ? ["linux_h264", "software", "none"]
+      : capture === "macos"
+        ? ["videotoolbox", "software", "none"]
+        : ["nvdec", "software", "none"],
+    capabilities,
+    "available_decoders",
+    "none"
+  );
   const renderer = capabilityAvailable(capabilities, "available_renderers", "macos")
     ? "macos"
     : capabilityAvailable(capabilities, "available_renderers", "linux")
