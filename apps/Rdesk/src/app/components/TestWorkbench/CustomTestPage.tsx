@@ -136,6 +136,11 @@ const DECODER_OPTIONS: DecoderOption[] = [
     description: "FFmpeg 软件解码 - CPU 解码",
   },
   {
+    id: "linux_h264",
+    name: "Linux H.264 HW",
+    description: "Linux GStreamer H.264 硬件解码 - 当前输出 CPU RGB 帧",
+  },
+  {
     id: "videotoolbox",
     name: "VideoToolbox",
     description: "macOS VideoToolbox - Apple 硬件 H.264 解码",
@@ -312,8 +317,14 @@ export function CustomTestPage() {
     if (selectedEncoder === "nvenc_av1" && selectedDecoder === "software") {
       return "NVENC AV1 当前只支持 NVDEC 或 encode-only 链路，软件 AV1 解码链路尚未接入。";
     }
+    if (selectedEncoder === "nvenc_av1" && selectedDecoder === "linux_h264") {
+      return "Linux H.264 硬解当前只接入 H.264，不能解码 NVENC AV1 输出。";
+    }
     if (isHevcEncoder(selectedEncoder) && selectedDecoder === "software") {
       return "NVENC HEVC 当前只支持 NVDEC 或 encode-only 链路，软件 HEVC 解码链路尚未接入。";
+    }
+    if (isHevcEncoder(selectedEncoder) && selectedDecoder === "linux_h264") {
+      return "Linux H.264 硬解当前只接入 H.264，不能解码 NVENC HEVC 输出。";
     }
     if (isHevcEncoder(selectedEncoder) && selectedTransport === "webrtc") {
       return "HEVC WebRTC RTP 打包尚未接入，请使用 QUIC Datagram 或 Loopback。";

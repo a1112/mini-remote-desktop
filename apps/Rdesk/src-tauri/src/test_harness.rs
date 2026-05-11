@@ -107,6 +107,7 @@ pub enum DecoderType {
     None,
     Nvdec,
     Software,
+    LinuxH264,
     VideoToolbox,
 }
 
@@ -429,6 +430,7 @@ struct PipelineState {
 enum PipelineDecoder {
     Nvdec(NvdecDecoder),
     Software(Box<dyn VideoDecoder>),
+    LinuxH264(Box<dyn VideoDecoder>),
     VideoToolbox(Box<dyn VideoDecoder>),
 }
 
@@ -580,6 +582,9 @@ impl PipelineDecoder {
             Self::Software(decoder) => decoder
                 .push_access_unit(bytes)
                 .map_err(|error| anyhow::anyhow!(error)),
+            Self::LinuxH264(decoder) => decoder
+                .push_access_unit(bytes)
+                .map_err(|error| anyhow::anyhow!(error)),
             Self::VideoToolbox(decoder) => decoder
                 .push_access_unit(bytes)
                 .map_err(|error| anyhow::anyhow!(error)),
@@ -594,6 +599,7 @@ impl PipelineDecoder {
                 .map(nvdec_frame_to_decoded_frame)
                 .collect(),
             Self::Software(decoder) => decoder.drain_decoded_frames(),
+            Self::LinuxH264(decoder) => decoder.drain_decoded_frames(),
             Self::VideoToolbox(decoder) => decoder.drain_decoded_frames(),
         }
     }
@@ -1682,6 +1688,20 @@ impl TestHarness {
                             true,
                         )
                     }
+                    DecoderType::LinuxH264 => {
+                        let enc = NvencH264Encoder::new_max_speed_with_bitrate(
+                            width,
+                            height,
+                            fps,
+                            speed_bitrate,
+                        )
+                        .map_err(|e| anyhow::anyhow!("NVENC 编码器初始化失败: {:?}", e))?;
+                        (
+                            Some(Box::new(enc) as Box<dyn VideoEncoder>),
+                            Some(create_linux_h264_decoder()?),
+                            true,
+                        )
+                    }
                     DecoderType::VideoToolbox => {
                         let enc = NvencH264Encoder::new_max_speed_with_bitrate(
                             width,
@@ -1739,6 +1759,11 @@ impl TestHarness {
                                     "HEVC software decoder path is not implemented"
                                 ));
                             }
+                            DecoderType::LinuxH264 => {
+                                return Err(anyhow::anyhow!(
+                                    "Linux H.264 hardware decoder cannot decode NVENC HEVC output"
+                                ));
+                            }
                             DecoderType::VideoToolbox => {
                                 return Err(anyhow::anyhow!(
                                     "VideoToolbox H.264 decoder cannot decode NVENC HEVC output"
@@ -1788,6 +1813,11 @@ impl TestHarness {
                                 true,
                             )
                         }
+                        DecoderType::LinuxH264 => (
+                            Some(Box::new(enc) as Box<dyn VideoEncoder>),
+                            Some(create_linux_h264_decoder()?),
+                            true,
+                        ),
                         DecoderType::VideoToolbox => (
                             Some(Box::new(enc) as Box<dyn VideoEncoder>),
                             Some(create_videotoolbox_h264_decoder()?),
@@ -1812,6 +1842,9 @@ impl TestHarness {
                         }
                         DecoderType::VideoToolbox => {
                             (Some(enc), Some(create_videotoolbox_h264_decoder()?), true)
+                        }
+                        DecoderType::LinuxH264 => {
+                            (Some(enc), Some(create_linux_h264_decoder()?), true)
                         }
                         DecoderType::Nvdec => {
                             return Err(anyhow::anyhow!(
@@ -1857,6 +1890,11 @@ impl TestHarness {
                             DecoderType::Software => {
                                 return Err(anyhow::anyhow!(
                                     "AV1 software decoder path is not implemented"
+                                ));
+                            }
+                            DecoderType::LinuxH264 => {
+                                return Err(anyhow::anyhow!(
+                                    "Linux H.264 hardware decoder cannot decode NVENC AV1 output"
                                 ));
                             }
                             DecoderType::VideoToolbox => {
@@ -2461,6 +2499,20 @@ fn create_h264_nvdec_decoder(
         enable_nvdec_shared_texture(&mut decoder);
     }
     Ok(decoder)
+}
+
+fn create_linux_h264_decoder() -> Result<PipelineDecoder> {
+    #[cfg(target_os = "linux")]
+    {
+        let decoder = mrd_decode::create_decoder("linux_h264")
+            .map_err(|e| anyhow::anyhow!("Linux H.264 hardware decoder init failed: {e}"))?;
+        Ok(PipelineDecoder::LinuxH264(decoder))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        anyhow::bail!("Linux H.264 hardware decoder is only available on Linux")
+    }
 }
 
 fn create_hevc_encoder(
@@ -3883,6 +3935,7 @@ mod tests {
             Ok("none") => DecoderType::None,
             Ok("software") | Ok("software_h264") | Ok("h264_software") | Ok("software-h264")
             | Ok("h264-software") | Ok("openh264") => DecoderType::Software,
+            Ok("linux_h264") | Ok("gstreamer_h264") | Ok("vaapi_h264") => DecoderType::LinuxH264,
             Ok("videotoolbox") => DecoderType::VideoToolbox,
             _ => DecoderType::Nvdec,
         }

@@ -461,6 +461,7 @@ impl TestOrchestrator {
                     "nvdec" => DecoderType::Nvdec,
                     "software" | "software_h264" | "h264_software" | "software-h264"
                     | "h264-software" | "openh264" => DecoderType::Software,
+                    "linux_h264" | "gstreamer_h264" | "vaapi_h264" => DecoderType::LinuxH264,
                     "videotoolbox" => DecoderType::VideoToolbox,
                     other => anyhow::bail!("Unsupported decoder for {}: {}", scenario_id, other),
                 },
@@ -816,6 +817,12 @@ impl TestOrchestrator {
                 && mrd_codec_videotoolbox::VideoToolboxH264Decoder::new().is_ok()
             {
                 available_decoders.push("videotoolbox".to_string());
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if mrd_decode::probe_linux_h264_hardware_available().is_ok() {
+                available_decoders.push("linux_h264".to_string());
             }
         }
 
@@ -2328,6 +2335,8 @@ fn decoder_supported_on_current_platform(decoder_type: &str) -> bool {
             | "h264-software"
             | "openh264"
     ) || matches!(decoder_type, "nvdec") && cfg!(windows)
+        || matches!(decoder_type, "linux_h264" | "gstreamer_h264" | "vaapi_h264")
+            && cfg!(target_os = "linux")
         || matches!(decoder_type, "videotoolbox")
             && cfg!(target_os = "macos")
             && videotoolbox_decoder_enabled()

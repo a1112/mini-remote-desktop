@@ -145,6 +145,7 @@ const KNOWN_STATUS_BY_ID: Record<string, CapabilityStatus> = {
   "encode.videotoolbox_h264": "available",
   "decode.nvdec": "available",
   "decode.software": "degraded",
+  "decode.linux_h264": "available",
   "decode.videotoolbox": "available",
   "render.d3d11": "available",
   "render.linux": "available",

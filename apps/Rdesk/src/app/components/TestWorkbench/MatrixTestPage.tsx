@@ -75,6 +75,12 @@ const MATRIX_DIMENSIONS: MatrixDimension[] = [
       { id: "nvdec", name: "NVDEC", enabled: true },
       { id: "software", name: "软件", enabled: true },
       {
+        id: "linux_h264",
+        name: "Linux H.264 HW",
+        enabled: false,
+        defaultEnabledOn: ["linux"],
+      },
+      {
         id: "videotoolbox",
         name: "VideoToolbox",
         enabled: false,
@@ -187,6 +193,7 @@ function defaultEncodersForOs(os: HostOs): string[] {
 function defaultDecodersForOs(os: HostOs): string[] {
   if (os === "windows") return ["nvdec", "software", "none"];
   if (os === "macos") return ["software", "none"];
+  if (os === "linux") return ["linux_h264", "software", "none"];
   return ["software", "none"];
 }
 
@@ -376,11 +383,17 @@ function unsupportedMatrixReason(config: TestConfig): string | null {
   if (isHevcEncoder(config.encoder_type) && config.decoder_type === "software") {
     return "NVENC HEVC currently requires NVDEC or encode-only matrix runs";
   }
+  if (isHevcEncoder(config.encoder_type) && config.decoder_type === "linux_h264") {
+    return "Linux H.264 hardware decoder cannot decode NVENC HEVC output";
+  }
   if (isHevcEncoder(config.encoder_type) && config.transport_kind === "webrtc") {
     return "HEVC WebRTC RTP packetizer is not implemented; use QUIC or loopback";
   }
   if (config.encoder_type === "nvenc_av1" && config.decoder_type === "software") {
     return "NVENC AV1 currently requires NVDEC or encode-only matrix runs";
+  }
+  if (config.encoder_type === "nvenc_av1" && config.decoder_type === "linux_h264") {
+    return "Linux H.264 hardware decoder cannot decode NVENC AV1 output";
   }
   if (
     config.zero_copy &&

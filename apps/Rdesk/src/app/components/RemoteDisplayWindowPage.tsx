@@ -95,6 +95,7 @@ const encoderOptions: Option<EncoderType>[] = [
 
 const decoderOptions: Option<DecoderType>[] = [
   { value: "nvdec", label: "NVDEC" },
+  { value: "linux_h264", label: "Linux H.264 HW" },
   { value: "videotoolbox", label: "VideoToolbox" },
   { value: "software", label: "Software" },
   { value: "none", label: "Encode only" },
@@ -310,6 +311,8 @@ function resolveLocalWebViewPlan({
       ? ["videotoolbox", "software", "none"]
       : nextEncoder === "nvenc_h264"
         ? ["software", "nvdec", "none"]
+        : hostOs === "linux"
+          ? ["linux_h264", "software", "none"]
         : ["software", "none"];
   const nextDecoder = pickCapability(
     decoderCandidates,
@@ -544,7 +547,10 @@ export function RemoteDisplayWindowPage() {
     if (isHevcEncoder(encoder) && transport === "webrtc") {
       setTransport("quic");
     }
-    if (isHevcEncoder(encoder) && decoder === "software") {
+    if (isHevcEncoder(encoder) && (decoder === "software" || decoder === "linux_h264")) {
+      setDecoder(capabilities?.available_decoders.includes("nvdec") ? "nvdec" : "none");
+    }
+    if (encoder === "nvenc_av1" && decoder === "linux_h264") {
       setDecoder(capabilities?.available_decoders.includes("nvdec") ? "nvdec" : "none");
     }
   }, [capabilities?.available_decoders, decoder, encoder, transport]);
@@ -746,7 +752,7 @@ export function RemoteDisplayWindowPage() {
         pickAvailable(value, capabilities.available_encoders, ["openh264"], "openh264")
       );
       setDecoder((value) =>
-        pickAvailable(value, capabilities.available_decoders, ["software", "none"], "software")
+        pickAvailable(value, capabilities.available_decoders, ["linux_h264", "software", "none"], "linux_h264")
       );
       setRenderMode("web");
       return;

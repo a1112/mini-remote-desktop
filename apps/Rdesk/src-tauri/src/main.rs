@@ -1559,6 +1559,7 @@ fn test_harness_set_custom(
         "nvdec" => DecoderType::Nvdec,
         "software" | "software_h264" | "h264_software" | "software-h264" | "h264-software"
         | "openh264" => DecoderType::Software,
+        "linux_h264" | "gstreamer_h264" | "vaapi_h264" => DecoderType::LinuxH264,
         "videotoolbox" => DecoderType::VideoToolbox,
         _ => return Err(format!("Unsupported decoder type: {}", decoder)),
     };

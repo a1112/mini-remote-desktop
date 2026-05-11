@@ -8,7 +8,7 @@ import {
   useShowUnavailableCapabilities,
 } from "./useCapabilityVisibility";
 
-type DecoderType = "nvdec" | "software" | "videotoolbox";
+type DecoderType = "nvdec" | "software" | "linux_h264" | "videotoolbox";
 type DecodeCodec = "h264" | "hevc" | "hevc_main10" | "av1";
 
 interface DecoderOption {
@@ -63,6 +63,13 @@ const DECODER_OPTIONS: DecoderOption[] = [
     icon: <Cpu className="h-5 w-5 text-orange-500" />,
   },
   {
+    id: "linux_h264",
+    name: "Linux H.264 HW",
+    description: "Linux GStreamer H.264 硬件解码，当前输出 CPU RGB 帧用于闭环验证",
+    type: "hardware",
+    icon: <Monitor className="h-5 w-5 text-emerald-500" />,
+  },
+  {
     id: "videotoolbox",
     name: "VideoToolbox",
     description: "macOS Apple H.264 硬件解码器，当前为实验路径",
@@ -76,7 +83,7 @@ const CODEC_OPTIONS: CodecOption[] = [
     id: "h264",
     name: "H.264",
     description: "主流远程桌面基础路径，所有当前解码器都可参与。",
-    supportedDecoders: ["nvdec", "software", "videotoolbox"],
+    supportedDecoders: ["nvdec", "software", "linux_h264", "videotoolbox"],
   },
   {
     id: "hevc",
@@ -208,6 +215,19 @@ function buildDecodeRun(
         encoder_type: "videotoolbox_h264",
         decoder_type: "videotoolbox",
         renderer_type: "macos",
+        zero_copy: false,
+      },
+    };
+  }
+
+  if (decoder === "linux_h264") {
+    return {
+      scenarioId: "custom",
+      config: {
+        ...common,
+        capture_type: "synthetic",
+        encoder_type: "openh264",
+        decoder_type: "linux_h264",
         zero_copy: false,
       },
     };

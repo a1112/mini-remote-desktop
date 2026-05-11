@@ -232,6 +232,38 @@ fn add_decode_capabilities(items: &mut Vec<CapabilityItem>, platform: &Capabilit
         Some("NVDEC runtime probing is owned by the Rdesk harness for this phase."),
     );
 
+    if matches!(platform, CapabilityPlatform::Linux) {
+        #[cfg(target_os = "linux")]
+        let (status, reason) = match mrd_decode::probe_linux_h264_hardware_available() {
+            Ok(label) => (
+                CapabilityStatus::Supported,
+                format!("{label} is available through the Linux GStreamer decode path."),
+            ),
+            Err(error) => (
+                CapabilityStatus::DriverMissing,
+                format!(
+                    "Linux H.264 hardware decode requires GStreamer plus a VA/NVIDIA H.264 decoder element: {error}"
+                ),
+            ),
+        };
+
+        #[cfg(not(target_os = "linux"))]
+        let (status, reason) = (
+            CapabilityStatus::Unsupported,
+            "Linux H.264 hardware decode is only compiled on Linux.".to_string(),
+        );
+
+        push_item(
+            items,
+            platform,
+            CapabilityDomain::Decode,
+            "decode.linux_h264",
+            "Linux H.264 hardware decode",
+            status,
+            Some(reason.as_str()),
+        );
+    }
+
     if matches!(platform, CapabilityPlatform::Macos) {
         push_supported(
             items,

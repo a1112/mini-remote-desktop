@@ -5,6 +5,13 @@ use openh264::{
     decoder::{DecodedYUV, Decoder as OpenH264Decoder},
     formats::YUVSource,
 };
+#[cfg(target_os = "linux")]
+use std::{
+    io::{Read, Write},
+    process::{Child, ChildStdin, Command, Stdio},
+    sync::mpsc,
+    thread,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodecKind {
@@ -66,19 +73,33 @@ const NVDEC_HEVC_MAIN10_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
     output_formats: RGB24_OUTPUTS,
 };
 
+#[cfg(target_os = "linux")]
+const LINUX_H264_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
+    id: "linux_h264",
+    codec: CodecKind::H264,
+    runtime_status: RuntimeStatus::RuntimeBacked,
+    output_formats: RGB24_OUTPUTS,
+};
+
 pub fn available_decoder_descriptors() -> Vec<DecoderDescriptor> {
-    vec![
+    let mut descriptors = vec![
         H264_SOFTWARE_DESCRIPTOR.clone(),
         NVDEC_DESCRIPTOR.clone(),
         NVDEC_HEVC_DESCRIPTOR.clone(),
         NVDEC_HEVC_MAIN10_DESCRIPTOR.clone(),
         NVDEC_AV1_DESCRIPTOR.clone(),
-    ]
+    ];
+
+    #[cfg(target_os = "linux")]
+    descriptors.push(LINUX_H264_DESCRIPTOR.clone());
+
+    descriptors
 }
 
 pub fn create_decoder(id: &str) -> Result<Box<dyn VideoDecoder>, PipelineError> {
     match id {
         "h264_software" => Ok(Box::new(H264SoftwareDecoder::new()?)),
+        "linux_h264" | "gstreamer_h264" | "vaapi_h264" => create_linux_h264_decoder(),
         "nvdec" => Ok(Box::new(NvdecVideoDecoder::new()?)),
         "nvdec_hevc" => Ok(Box::new(NvdecVideoDecoder::new_hevc()?)),
         "nvdec_hevc_main10" => Ok(Box::new(NvdecVideoDecoder::new_hevc_main10()?)),
@@ -87,6 +108,31 @@ pub fn create_decoder(id: &str) -> Result<Box<dyn VideoDecoder>, PipelineError> 
             "unknown decoder backend: {other}"
         ))),
     }
+}
+
+#[cfg(target_os = "linux")]
+pub fn probe_linux_h264_hardware_available() -> Result<String, PipelineError> {
+    let backend = select_linux_gst_h264_backend()?;
+    Ok(backend.label.to_string())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn probe_linux_h264_hardware_available() -> Result<String, PipelineError> {
+    Err(PipelineError::Message(
+        "Linux H.264 hardware decode is only available on Linux".to_string(),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn create_linux_h264_decoder() -> Result<Box<dyn VideoDecoder>, PipelineError> {
+    Ok(Box::new(LinuxGstH264Decoder::new()?))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn create_linux_h264_decoder() -> Result<Box<dyn VideoDecoder>, PipelineError> {
+    Err(PipelineError::Message(
+        "Linux H.264 hardware decode is only available on Linux".to_string(),
+    ))
 }
 
 pub struct H264SoftwareDecoder {
@@ -130,6 +176,263 @@ impl NvdecVideoDecoder {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy)]
+struct LinuxGstH264Backend {
+    label: &'static str,
+    required_elements: &'static [&'static str],
+    pipeline_elements: &'static [&'static str],
+}
+
+#[cfg(target_os = "linux")]
+const LINUX_GST_H264_BACKENDS: &[LinuxGstH264Backend] = &[
+    LinuxGstH264Backend {
+        label: "GStreamer VA H.264 decoder",
+        required_elements: &["vah264dec", "vapostproc"],
+        pipeline_elements: &["vah264dec", "!", "vapostproc"],
+    },
+    LinuxGstH264Backend {
+        label: "GStreamer VA-API H.264 decoder",
+        required_elements: &["vaapih264dec", "vaapipostproc"],
+        pipeline_elements: &["vaapih264dec", "!", "vaapipostproc"],
+    },
+    LinuxGstH264Backend {
+        label: "GStreamer NVIDIA H.264 decoder",
+        required_elements: &["nvh264dec", "cudadownload"],
+        pipeline_elements: &["nvh264dec", "!", "cudadownload"],
+    },
+];
+
+#[cfg(target_os = "linux")]
+fn select_linux_gst_h264_backend() -> Result<LinuxGstH264Backend, PipelineError> {
+    if Command::new("gst-inspect-1.0")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_err()
+    {
+        return Err(PipelineError::Message(
+            "GStreamer runtime is missing: gst-inspect-1.0 was not found".to_string(),
+        ));
+    }
+
+    LINUX_GST_H264_BACKENDS
+        .iter()
+        .copied()
+        .find(|backend| {
+            backend
+                .required_elements
+                .iter()
+                .all(|element| gst_element_available(element))
+        })
+        .ok_or_else(|| {
+            PipelineError::Message(
+                "No GStreamer hardware H.264 decoder was found; expected vah264dec/vapostproc, vaapih264dec/vaapipostproc, or nvh264dec/cudadownload".to_string(),
+            )
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn gst_element_available(element: &str) -> bool {
+    Command::new("gst-inspect-1.0")
+        .arg(element)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+pub struct LinuxGstH264Decoder {
+    backend: LinuxGstH264Backend,
+    child: Option<Child>,
+    stdin: Option<ChildStdin>,
+    frame_rx: Option<mpsc::Receiver<Vec<u8>>>,
+    dimensions: Option<(usize, usize)>,
+    pending_stream: Vec<u8>,
+    decoded_frames: Vec<CoreDecodedFrame>,
+    frame_index: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxGstH264Decoder {
+    pub fn new() -> Result<Self, PipelineError> {
+        Ok(Self {
+            backend: select_linux_gst_h264_backend()?,
+            child: None,
+            stdin: None,
+            frame_rx: None,
+            dimensions: None,
+            pending_stream: Vec::new(),
+            decoded_frames: Vec::new(),
+            frame_index: 0,
+        })
+    }
+
+    fn start_pipeline(&mut self, width: usize, height: usize) -> Result<(), PipelineError> {
+        if self.child.is_some() {
+            return Ok(());
+        }
+
+        let frame_size = width
+            .checked_mul(height)
+            .and_then(|pixels| pixels.checked_mul(3))
+            .ok_or_else(|| PipelineError::Message("decoded RGB frame size overflow".to_string()))?;
+
+        let mut args = vec!["-q", "fdsrc", "fd=0", "!", "h264parse", "!"];
+        args.extend_from_slice(self.backend.pipeline_elements);
+        args.extend_from_slice(&[
+            "!",
+            "videoconvert",
+            "!",
+            "video/x-raw,format=RGB",
+            "!",
+            "fdsink",
+            "fd=1",
+            "sync=false",
+        ]);
+
+        let mut child = Command::new("gst-launch-1.0")
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| {
+                PipelineError::Message(format!(
+                    "spawn GStreamer H.264 decoder failed ({}): {error}",
+                    self.backend.label
+                ))
+            })?;
+
+        let stdout = child.stdout.take().ok_or_else(|| {
+            PipelineError::Message("GStreamer decoder stdout pipe was not created".to_string())
+        })?;
+        let stdin = child.stdin.take().ok_or_else(|| {
+            PipelineError::Message("GStreamer decoder stdin pipe was not created".to_string())
+        })?;
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || read_raw_rgb_frames(stdout, frame_size, tx));
+
+        self.stdin = Some(stdin);
+        self.frame_rx = Some(rx);
+        self.child = Some(child);
+
+        Ok(())
+    }
+
+    fn write_access_unit(&mut self, access_unit: &[u8]) -> Result<(), PipelineError> {
+        let stdin = self.stdin.as_mut().ok_or_else(|| {
+            PipelineError::Message("GStreamer decoder stdin is not available".to_string())
+        })?;
+        stdin
+            .write_all(access_unit)
+            .and_then(|()| stdin.flush())
+            .map_err(|error| {
+                PipelineError::Message(format!(
+                    "write H.264 access unit to GStreamer decoder failed: {error}"
+                ))
+            })
+    }
+
+    fn collect_frames(&mut self) {
+        let Some((width, height)) = self.dimensions else {
+            return;
+        };
+        let Some(rx) = self.frame_rx.as_ref() else {
+            return;
+        };
+
+        while let Ok(rgb) = rx.try_recv() {
+            let timestamp_us = self.frame_index.saturating_mul(16_667);
+            self.frame_index = self.frame_index.saturating_add(1);
+            self.decoded_frames.push(CoreDecodedFrame::from_cpu_rgb24(
+                width,
+                height,
+                timestamp_us,
+                rgb,
+            ));
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LinuxGstH264Decoder {
+    fn drop(&mut self) {
+        drop(self.stdin.take());
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl VideoDecoder for LinuxGstH264Decoder {
+    fn push_access_unit(&mut self, access_unit: &[u8]) -> Result<(), PipelineError> {
+        if access_unit.is_empty() {
+            return Ok(());
+        }
+
+        if let Some((width, height)) = parse_h264_dimensions(access_unit)? {
+            if let Some((current_width, current_height)) = self.dimensions {
+                if (width, height) != (current_width, current_height) {
+                    return Err(PipelineError::Message(format!(
+                        "Linux H.264 decoder does not support stream size changes yet: {current_width}x{current_height} -> {width}x{height}"
+                    )));
+                }
+            } else {
+                self.dimensions = Some((width, height));
+            }
+        }
+
+        if self.child.is_none() {
+            self.pending_stream.extend_from_slice(access_unit);
+            if let Some((width, height)) = self.dimensions {
+                self.start_pipeline(width, height)?;
+                let pending = std::mem::take(&mut self.pending_stream);
+                self.write_access_unit(&pending)?;
+            } else if self.pending_stream.len() > 8 * 1024 * 1024 {
+                return Err(PipelineError::Message(
+                    "Linux H.264 decoder is waiting for an SPS NAL to discover stream dimensions"
+                        .to_string(),
+                ));
+            }
+        } else {
+            self.write_access_unit(access_unit)?;
+        }
+
+        self.collect_frames();
+        Ok(())
+    }
+
+    fn drain_decoded_frames(&mut self) -> Vec<CoreDecodedFrame> {
+        self.collect_frames();
+        std::mem::take(&mut self.decoded_frames)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_raw_rgb_frames(
+    mut stdout: std::process::ChildStdout,
+    frame_size: usize,
+    tx: mpsc::Sender<Vec<u8>>,
+) {
+    loop {
+        let mut frame = vec![0_u8; frame_size];
+        match stdout.read_exact(&mut frame) {
+            Ok(()) => {
+                if tx.send(frame).is_err() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+}
+
 impl H264SoftwareDecoder {
     pub fn new() -> Result<Self, PipelineError> {
         Ok(Self {
@@ -169,6 +472,322 @@ fn decoded_yuv_to_rgb_frame(decoded: &DecodedYUV<'_>, timestamp_us: u64) -> Core
     let mut rgb = vec![0_u8; width * height * 3];
     decoded.write_rgb8(&mut rgb);
     CoreDecodedFrame::from_cpu_rgb24(width, height, timestamp_us, rgb)
+}
+
+fn parse_h264_dimensions(access_unit: &[u8]) -> Result<Option<(usize, usize)>, PipelineError> {
+    for nal in annex_b_nals(access_unit) {
+        if nal.is_empty() {
+            continue;
+        }
+        if nal[0] & 0x1f == 7 {
+            return parse_sps_dimensions(&nal[1..]).map(Some);
+        }
+    }
+
+    Ok(None)
+}
+
+fn annex_b_nals(bytes: &[u8]) -> Vec<&[u8]> {
+    let mut nals = Vec::new();
+    let mut offset = 0;
+
+    while let Some((start, start_code_len)) = find_start_code(bytes, offset) {
+        let nal_start = start + start_code_len;
+        let next_start = find_start_code(bytes, nal_start)
+            .map(|(next, _)| next)
+            .unwrap_or(bytes.len());
+        if nal_start < next_start {
+            let mut nal_end = next_start;
+            while nal_end > nal_start && bytes[nal_end - 1] == 0 {
+                nal_end -= 1;
+            }
+            nals.push(&bytes[nal_start..nal_end]);
+        }
+        offset = next_start;
+    }
+
+    nals
+}
+
+fn find_start_code(bytes: &[u8], from: usize) -> Option<(usize, usize)> {
+    let mut i = from;
+    while i + 3 <= bytes.len() {
+        if bytes[i] == 0 && bytes[i + 1] == 0 {
+            if bytes[i + 2] == 1 {
+                return Some((i, 3));
+            }
+            if i + 4 <= bytes.len() && bytes[i + 2] == 0 && bytes[i + 3] == 1 {
+                return Some((i, 4));
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn parse_sps_dimensions(sps: &[u8]) -> Result<(usize, usize), PipelineError> {
+    let rbsp = remove_emulation_prevention_bytes(sps);
+    let mut bits = BitReader::new(&rbsp);
+
+    let profile_idc = bits
+        .read_bits(8)
+        .ok_or_else(|| PipelineError::Message("invalid H.264 SPS: missing profile".to_string()))?;
+    bits.read_bits(8).ok_or_else(|| {
+        PipelineError::Message("invalid H.264 SPS: missing constraint flags".to_string())
+    })?;
+    bits.read_bits(8)
+        .ok_or_else(|| PipelineError::Message("invalid H.264 SPS: missing level".to_string()))?;
+    bits.read_ue().ok_or_else(|| {
+        PipelineError::Message("invalid H.264 SPS: missing sequence id".to_string())
+    })?;
+
+    let mut chroma_format_idc = 1_u32;
+    if matches!(
+        profile_idc,
+        100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
+    ) {
+        chroma_format_idc = bits.read_ue().ok_or_else(|| {
+            PipelineError::Message("invalid H.264 SPS: missing chroma format".to_string())
+        })?;
+        if chroma_format_idc == 3 {
+            bits.read_bit().ok_or_else(|| {
+                PipelineError::Message(
+                    "invalid H.264 SPS: missing separate colour plane flag".to_string(),
+                )
+            })?;
+        }
+        bits.read_ue().ok_or_else(|| {
+            PipelineError::Message("invalid H.264 SPS: missing bit depth luma".to_string())
+        })?;
+        bits.read_ue().ok_or_else(|| {
+            PipelineError::Message("invalid H.264 SPS: missing bit depth chroma".to_string())
+        })?;
+        bits.read_bit().ok_or_else(|| {
+            PipelineError::Message("invalid H.264 SPS: missing qpprime flag".to_string())
+        })?;
+        if bits.read_bit().ok_or_else(|| {
+            PipelineError::Message("invalid H.264 SPS: missing scaling matrix flag".to_string())
+        })? {
+            let scaling_list_count = if chroma_format_idc != 3 { 8 } else { 12 };
+            for index in 0..scaling_list_count {
+                if bits.read_bit().ok_or_else(|| {
+                    PipelineError::Message(
+                        "invalid H.264 SPS: missing scaling list flag".to_string(),
+                    )
+                })? {
+                    skip_scaling_list(&mut bits, if index < 6 { 16 } else { 64 })?;
+                }
+            }
+        }
+    }
+
+    bits.read_ue().ok_or_else(|| {
+        PipelineError::Message("invalid H.264 SPS: missing max frame num".to_string())
+    })?;
+    let pic_order_cnt_type = bits.read_ue().ok_or_else(|| {
+        PipelineError::Message("invalid H.264 SPS: missing pic order count type".to_string())
+    })?;
+    if pic_order_cnt_type == 0 {
+        bits.read_ue().ok_or_else(|| {
+            PipelineError::Message("invalid H.264 SPS: missing pic order cnt lsb".to_string())
+        })?;
+    } else if pic_order_cnt_type == 1 {
+        bits.read_bit().ok_or_else(|| {
+            PipelineError::Message("invalid H.264 SPS: missing delta pic order flag".to_string())
+        })?;
+        bits.read_se().ok_or_else(|| {
+            PipelineError::Message("invalid H.264 SPS: missing offset non-ref".to_string())
+        })?;
+        bits.read_se().ok_or_else(|| {
+            PipelineError::Message("invalid H.264 SPS: missing offset top-bottom".to_string())
+        })?;
+        let cycle_count = bits.read_ue().ok_or_else(|| {
+            PipelineError::Message("invalid H.264 SPS: missing ref frame cycle count".to_string())
+        })?;
+        for _ in 0..cycle_count {
+            bits.read_se().ok_or_else(|| {
+                PipelineError::Message("invalid H.264 SPS: missing ref frame offset".to_string())
+            })?;
+        }
+    }
+
+    bits.read_ue().ok_or_else(|| {
+        PipelineError::Message("invalid H.264 SPS: missing max ref frames".to_string())
+    })?;
+    bits.read_bit().ok_or_else(|| {
+        PipelineError::Message("invalid H.264 SPS: missing gaps flag".to_string())
+    })?;
+    let pic_width_in_mbs_minus1 = bits
+        .read_ue()
+        .ok_or_else(|| PipelineError::Message("invalid H.264 SPS: missing width".to_string()))?;
+    let pic_height_in_map_units_minus1 = bits
+        .read_ue()
+        .ok_or_else(|| PipelineError::Message("invalid H.264 SPS: missing height".to_string()))?;
+    let frame_mbs_only_flag = bits.read_bit().ok_or_else(|| {
+        PipelineError::Message("invalid H.264 SPS: missing frame mbs flag".to_string())
+    })?;
+    if !frame_mbs_only_flag {
+        bits.read_bit().ok_or_else(|| {
+            PipelineError::Message("invalid H.264 SPS: missing mb adaptive flag".to_string())
+        })?;
+    }
+    bits.read_bit().ok_or_else(|| {
+        PipelineError::Message("invalid H.264 SPS: missing direct 8x8 flag".to_string())
+    })?;
+
+    let mut crop_left = 0_u32;
+    let mut crop_right = 0_u32;
+    let mut crop_top = 0_u32;
+    let mut crop_bottom = 0_u32;
+    if bits
+        .read_bit()
+        .ok_or_else(|| PipelineError::Message("invalid H.264 SPS: missing crop flag".to_string()))?
+    {
+        crop_left = bits
+            .read_ue()
+            .ok_or_else(|| PipelineError::Message("invalid H.264 SPS: crop left".to_string()))?;
+        crop_right = bits
+            .read_ue()
+            .ok_or_else(|| PipelineError::Message("invalid H.264 SPS: crop right".to_string()))?;
+        crop_top = bits
+            .read_ue()
+            .ok_or_else(|| PipelineError::Message("invalid H.264 SPS: crop top".to_string()))?;
+        crop_bottom = bits
+            .read_ue()
+            .ok_or_else(|| PipelineError::Message("invalid H.264 SPS: crop bottom".to_string()))?;
+    }
+
+    let frame_mbs_factor = if frame_mbs_only_flag { 1 } else { 2 };
+    let width = (pic_width_in_mbs_minus1 + 1)
+        .checked_mul(16)
+        .ok_or_else(|| PipelineError::Message("invalid H.264 SPS: width overflow".to_string()))?;
+    let height = (pic_height_in_map_units_minus1 + 1)
+        .checked_mul(16)
+        .and_then(|value| value.checked_mul(frame_mbs_factor))
+        .ok_or_else(|| PipelineError::Message("invalid H.264 SPS: height overflow".to_string()))?;
+
+    let (crop_unit_x, crop_unit_y) = crop_units(chroma_format_idc, frame_mbs_only_flag);
+    let crop_width = (crop_left + crop_right)
+        .checked_mul(crop_unit_x)
+        .ok_or_else(|| {
+            PipelineError::Message("invalid H.264 SPS: crop width overflow".to_string())
+        })?;
+    let crop_height = (crop_top + crop_bottom)
+        .checked_mul(crop_unit_y)
+        .ok_or_else(|| {
+            PipelineError::Message("invalid H.264 SPS: crop height overflow".to_string())
+        })?;
+    let display_width = width.checked_sub(crop_width).ok_or_else(|| {
+        PipelineError::Message("invalid H.264 SPS: crop exceeds width".to_string())
+    })?;
+    let display_height = height.checked_sub(crop_height).ok_or_else(|| {
+        PipelineError::Message("invalid H.264 SPS: crop exceeds height".to_string())
+    })?;
+
+    if display_width == 0 || display_height == 0 {
+        return Err(PipelineError::Message(
+            "invalid H.264 SPS: zero-sized frame".to_string(),
+        ));
+    }
+
+    Ok((display_width as usize, display_height as usize))
+}
+
+fn remove_emulation_prevention_bytes(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut zero_count = 0_u8;
+    for &byte in bytes {
+        if zero_count == 2 && byte == 0x03 {
+            zero_count = 0;
+            continue;
+        }
+        out.push(byte);
+        if byte == 0 {
+            zero_count = zero_count.saturating_add(1).min(2);
+        } else {
+            zero_count = 0;
+        }
+    }
+    out
+}
+
+fn crop_units(chroma_format_idc: u32, frame_mbs_only_flag: bool) -> (u32, u32) {
+    let frame_factor = if frame_mbs_only_flag { 1 } else { 2 };
+    match chroma_format_idc {
+        0 => (1, frame_factor),
+        1 => (2, 2 * frame_factor),
+        2 => (2, frame_factor),
+        3 => (1, frame_factor),
+        _ => (1, frame_factor),
+    }
+}
+
+fn skip_scaling_list(bits: &mut BitReader<'_>, size: usize) -> Result<(), PipelineError> {
+    let mut last_scale = 8_i32;
+    let mut next_scale = 8_i32;
+    for _ in 0..size {
+        if next_scale != 0 {
+            let delta_scale = bits.read_se().ok_or_else(|| {
+                PipelineError::Message("invalid H.264 SPS: scaling list delta".to_string())
+            })?;
+            next_scale = (last_scale + delta_scale + 256) % 256;
+        }
+        if next_scale != 0 {
+            last_scale = next_scale;
+        }
+    }
+    Ok(())
+}
+
+struct BitReader<'a> {
+    bytes: &'a [u8],
+    bit_pos: usize,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, bit_pos: 0 }
+    }
+
+    fn read_bit(&mut self) -> Option<bool> {
+        let byte = *self.bytes.get(self.bit_pos / 8)?;
+        let shift = 7 - (self.bit_pos % 8);
+        self.bit_pos += 1;
+        Some(((byte >> shift) & 1) != 0)
+    }
+
+    fn read_bits(&mut self, count: usize) -> Option<u32> {
+        let mut value = 0_u32;
+        for _ in 0..count {
+            value = (value << 1) | u32::from(self.read_bit()?);
+        }
+        Some(value)
+    }
+
+    fn read_ue(&mut self) -> Option<u32> {
+        let mut leading_zero_bits = 0_u32;
+        while !self.read_bit()? {
+            leading_zero_bits += 1;
+            if leading_zero_bits > 31 {
+                return None;
+            }
+        }
+        if leading_zero_bits == 0 {
+            return Some(0);
+        }
+        let suffix = self.read_bits(leading_zero_bits as usize)?;
+        Some((1_u32 << leading_zero_bits) - 1 + suffix)
+    }
+
+    fn read_se(&mut self) -> Option<i32> {
+        let code_num = self.read_ue()? as i32;
+        let magnitude = (code_num + 1) / 2;
+        if code_num % 2 == 0 {
+            Some(-magnitude)
+        } else {
+            Some(magnitude)
+        }
+    }
 }
 
 impl VideoDecoder for NvdecVideoDecoder {
@@ -221,5 +840,43 @@ impl VideoDecoder for NvdecVideoDecoder {
                 ),
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mrd_encode_openh264::OpenH264Encoder;
+    use mrd_pipeline_core::{CapturedFrame, FramePixelFormat, VideoEncoder};
+
+    #[test]
+    fn parses_openh264_sps_dimensions() {
+        let width = 64;
+        let height = 48;
+        let mut encoder = OpenH264Encoder::new(width, height, 30).expect("create encoder");
+        let frame = CapturedFrame::from_cpu(
+            width,
+            height,
+            FramePixelFormat::Bgra32,
+            0,
+            vec![127; width * height * 4],
+        );
+
+        let access_units = encoder.encode(&frame).expect("encode frame");
+        let dimensions =
+            parse_h264_dimensions(&access_units[0].bytes).expect("parse H.264 dimensions");
+
+        assert_eq!(dimensions, Some((width, height)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exposes_linux_h264_descriptor_on_linux() {
+        let ids = available_decoder_descriptors()
+            .into_iter()
+            .map(|descriptor| descriptor.id)
+            .collect::<Vec<_>>();
+
+        assert!(ids.contains(&"linux_h264"));
     }
 }

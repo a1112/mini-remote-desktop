@@ -17,6 +17,7 @@ const PLATFORM_TAGS: Record<string, string> = {
   nvenc_hevc_main10: "NVIDIA",
   nvenc_av1: "NVIDIA",
   nvdec: "NVIDIA",
+  linux_h264: "Linux",
   macos: "macOS",
   metal: "macOS",
   videotoolbox_h264: "macOS",
