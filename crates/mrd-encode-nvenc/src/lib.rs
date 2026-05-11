@@ -2,6 +2,14 @@
 use mrd_pipeline_core::{CapturedFrame, EncodedAccessUnit, PipelineError, VideoEncoder};
 #[cfg(not(windows))]
 use mrd_pipeline_core::{FramePixelFormat, VideoCodec};
+#[cfg(not(windows))]
+use std::io::{Read, Write};
+#[cfg(not(windows))]
+use std::process::{Child, ChildStdin};
+#[cfg(not(windows))]
+use std::sync::{mpsc, Arc, Mutex};
+#[cfg(not(windows))]
+use std::time::{Duration, Instant};
 
 #[cfg(windows)]
 mod imp {
@@ -1200,7 +1208,28 @@ struct GstreamerNvencEncoder {
     fps: u32,
     bitrate_kbps: u32,
     frame_index: usize,
+    process: Option<GstreamerNvencProcess>,
 }
+
+#[cfg(not(windows))]
+struct GstreamerNvencProcess {
+    child: Child,
+    stdin: ChildStdin,
+    stdout_rx: mpsc::Receiver<GstreamerReadResult>,
+    stderr_tail: Arc<Mutex<Vec<u8>>>,
+}
+
+#[cfg(not(windows))]
+type GstreamerReadResult = Result<Vec<u8>, String>;
+
+#[cfg(not(windows))]
+const GST_STDIO_CHUNK_SIZE: usize = 64 * 1024;
+#[cfg(not(windows))]
+const GST_STDERR_TAIL_LIMIT: usize = 16 * 1024;
+#[cfg(not(windows))]
+const GST_OUTPUT_TIMEOUT: Duration = Duration::from_millis(1_500);
+#[cfg(not(windows))]
+const GST_OUTPUT_IDLE: Duration = Duration::from_millis(8);
 
 #[cfg(not(windows))]
 impl GstreamerNvencEncoder {
@@ -1227,6 +1256,7 @@ impl GstreamerNvencEncoder {
             fps: fps.max(1),
             bitrate_kbps: (bitrate / 1000).max(1),
             frame_index: 0,
+            process: None,
         })
     }
 
@@ -1244,28 +1274,57 @@ impl GstreamerNvencEncoder {
             )));
         }
 
-        let mut command = self.gstreamer_command();
-        let output =
-            run_gstreamer_encoder_command(&mut command, &frame.data, "Linux GStreamer NVENC")?;
-
-        if !output.status.success() {
-            return Err(PipelineError::message(format!(
-                "Linux GStreamer NVENC failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )));
-        }
-        if output.stdout.is_empty() {
-            return Ok(vec![]);
-        }
-
         let force_idr = self.frame_index == 0 || self.frame_index % self.fps as usize == 0;
+        let timestamp_us = frame.timestamp_us;
+        let codec = self.codec;
+        let output = self.encode_with_process(&frame.data)?;
         self.frame_index += 1;
         Ok(vec![EncodedAccessUnit {
-            codec: self.codec,
-            timestamp_us: frame.timestamp_us,
-            is_keyframe: force_idr || annex_b_contains_keyframe(self.codec, &output.stdout),
-            bytes: output.stdout,
+            codec,
+            timestamp_us,
+            is_keyframe: force_idr || annex_b_contains_keyframe(codec, &output),
+            bytes: output,
         }])
+    }
+
+    fn encode_with_process(&mut self, frame_data: &[u8]) -> Result<Vec<u8>, PipelineError> {
+        let label = "Linux GStreamer NVENC";
+        let result = {
+            let process = self.ensure_process()?;
+            process.write_frame(frame_data, label)?;
+            process.read_encoded_output(label)
+        };
+        if result.is_err() {
+            self.process.take();
+        }
+        result
+    }
+
+    fn ensure_process(&mut self) -> Result<&mut GstreamerNvencProcess, PipelineError> {
+        if let Some(process) = self.process.as_mut() {
+            if let Some(status) = process.child.try_wait().map_err(|error| {
+                PipelineError::message(format!(
+                    "poll Linux GStreamer NVENC process failed: {error}"
+                ))
+            })? {
+                let stderr = process.stderr_tail_text();
+                self.process.take();
+                return Err(PipelineError::message(format!(
+                    "Linux GStreamer NVENC exited before encode with {status}; stderr: {stderr}"
+                )));
+            }
+        }
+
+        if self.process.is_none() {
+            self.process = Some(GstreamerNvencProcess::spawn(
+                self.gstreamer_command(),
+                "Linux GStreamer NVENC",
+            )?);
+        }
+
+        self.process
+            .as_mut()
+            .ok_or_else(|| PipelineError::message("Linux GStreamer NVENC process is unavailable"))
     }
 
     fn gstreamer_command(&self) -> std::process::Command {
@@ -1316,6 +1375,230 @@ pub struct NvencH264Encoder {
 }
 
 #[cfg(not(windows))]
+impl GstreamerNvencProcess {
+    fn spawn(mut command: std::process::Command, label: &str) -> Result<Self, PipelineError> {
+        let mut child = command
+            .spawn()
+            .map_err(|error| PipelineError::message(format!("launch {label} failed: {error}")))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| PipelineError::message(format!("{label} stdin pipe is unavailable")))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| PipelineError::message(format!("{label} stdout pipe is unavailable")))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| PipelineError::message(format!("{label} stderr pipe is unavailable")))?;
+        let (stdout_tx, stdout_rx) = mpsc::channel();
+        std::thread::spawn(move || read_gstreamer_stdout(stdout, stdout_tx));
+
+        let stderr_tail = Arc::new(Mutex::new(Vec::new()));
+        let stderr_tail_reader = Arc::clone(&stderr_tail);
+        std::thread::spawn(move || read_gstreamer_stderr(stderr, stderr_tail_reader));
+
+        Ok(Self {
+            child,
+            stdin,
+            stdout_rx,
+            stderr_tail,
+        })
+    }
+
+    fn write_frame(&mut self, frame_data: &[u8], label: &str) -> Result<(), PipelineError> {
+        if let Err(error) = self.stdin.write_all(frame_data) {
+            return Err(self.io_error(label, "writing raw frame input", error));
+        }
+        if let Err(error) = self.stdin.flush() {
+            return Err(self.io_error(label, "flushing raw frame input", error));
+        }
+        Ok(())
+    }
+
+    fn read_encoded_output(&mut self, label: &str) -> Result<Vec<u8>, PipelineError> {
+        let deadline = Instant::now() + GST_OUTPUT_TIMEOUT;
+        let mut output = Vec::new();
+
+        loop {
+            let timeout = if output.is_empty() {
+                deadline.saturating_duration_since(Instant::now())
+            } else {
+                GST_OUTPUT_IDLE
+            };
+
+            match self.stdout_rx.recv_timeout(timeout) {
+                Ok(Ok(chunk)) => {
+                    output.extend_from_slice(&chunk);
+                    if let Some(done) = self.drain_ready_stdout(label, &mut output)? {
+                        return Ok(done);
+                    }
+                }
+                Ok(Err(error)) => {
+                    if output.is_empty() {
+                        return Err(PipelineError::message(format!(
+                            "{label} stdout closed before encoded output: {error}; stderr: {}",
+                            self.stderr_tail_text()
+                        )));
+                    }
+                    return Ok(output);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) if output.is_empty() => {
+                    if let Some(status) = self.child.try_wait().map_err(|error| {
+                        PipelineError::message(format!("poll {label} process failed: {error}"))
+                    })? {
+                        return Err(PipelineError::message(format!(
+                            "{label} exited with {status} before producing encoded output; stderr: {}",
+                            self.stderr_tail_text()
+                        )));
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(PipelineError::message(format!(
+                            "{label} produced no encoded output within {} ms; stderr: {}",
+                            GST_OUTPUT_TIMEOUT.as_millis(),
+                            self.stderr_tail_text()
+                        )));
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => return Ok(output),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    if output.is_empty() {
+                        return Err(PipelineError::message(format!(
+                            "{label} stdout reader stopped before encoded output; stderr: {}",
+                            self.stderr_tail_text()
+                        )));
+                    }
+                    return Ok(output);
+                }
+            }
+        }
+    }
+
+    fn drain_ready_stdout(
+        &mut self,
+        label: &str,
+        output: &mut Vec<u8>,
+    ) -> Result<Option<Vec<u8>>, PipelineError> {
+        loop {
+            match self.stdout_rx.try_recv() {
+                Ok(Ok(chunk)) => output.extend_from_slice(&chunk),
+                Ok(Err(error)) => {
+                    if output.is_empty() {
+                        return Err(PipelineError::message(format!(
+                            "{label} stdout closed before encoded output: {error}; stderr: {}",
+                            self.stderr_tail_text()
+                        )));
+                    }
+                    return Ok(Some(std::mem::take(output)));
+                }
+                Err(mpsc::TryRecvError::Empty) => return Ok(None),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    if output.is_empty() {
+                        return Err(PipelineError::message(format!(
+                            "{label} stdout reader stopped before encoded output; stderr: {}",
+                            self.stderr_tail_text()
+                        )));
+                    }
+                    return Ok(Some(std::mem::take(output)));
+                }
+            }
+        }
+    }
+
+    fn io_error(&mut self, label: &str, operation: &str, error: std::io::Error) -> PipelineError {
+        let exit = match self.child.try_wait() {
+            Ok(Some(status)) => format!("; process exited with {status}"),
+            Ok(None) => String::new(),
+            Err(wait_error) => format!("; process status unavailable: {wait_error}"),
+        };
+        PipelineError::message(format!(
+            "{label} failed while {operation}: {error}{exit}; stderr: {}",
+            self.stderr_tail_text()
+        ))
+    }
+
+    fn stderr_tail_text(&self) -> String {
+        let bytes = self
+            .stderr_tail
+            .lock()
+            .map(|tail| tail.clone())
+            .unwrap_or_default();
+        let text = String::from_utf8_lossy(&bytes);
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            "(empty)".to_string()
+        } else {
+            trimmed.to_string()
+        }
+    }
+}
+
+#[cfg(not(windows))]
+impl Drop for GstreamerNvencProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[cfg(not(windows))]
+fn read_gstreamer_stdout<R>(mut stdout: R, stdout_tx: mpsc::Sender<GstreamerReadResult>)
+where
+    R: Read,
+{
+    let mut buffer = vec![0; GST_STDIO_CHUNK_SIZE];
+    loop {
+        match stdout.read(&mut buffer) {
+            Ok(0) => {
+                let _ = stdout_tx.send(Err("stdout reached EOF".to_string()));
+                break;
+            }
+            Ok(bytes_read) => {
+                if stdout_tx.send(Ok(buffer[..bytes_read].to_vec())).is_err() {
+                    break;
+                }
+            }
+            Err(error) => {
+                let _ = stdout_tx.send(Err(error.to_string()));
+                break;
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn read_gstreamer_stderr<R>(mut stderr: R, stderr_tail: Arc<Mutex<Vec<u8>>>)
+where
+    R: Read,
+{
+    let mut buffer = vec![0; GST_STDIO_CHUNK_SIZE];
+    loop {
+        match stderr.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(bytes_read) => append_gstreamer_stderr_tail(&stderr_tail, &buffer[..bytes_read]),
+            Err(_) => break,
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn append_gstreamer_stderr_tail(stderr_tail: &Arc<Mutex<Vec<u8>>>, bytes: &[u8]) {
+    if let Ok(mut tail) = stderr_tail.lock() {
+        if bytes.len() >= GST_STDERR_TAIL_LIMIT {
+            tail.clear();
+            tail.extend_from_slice(&bytes[bytes.len() - GST_STDERR_TAIL_LIMIT..]);
+            return;
+        }
+        let overflow = tail.len().saturating_add(bytes.len());
+        if overflow > GST_STDERR_TAIL_LIMIT {
+            tail.drain(..overflow - GST_STDERR_TAIL_LIMIT);
+        }
+        tail.extend_from_slice(bytes);
+    }
+}
+
+#[cfg(not(windows))]
 fn require_gst_element(element: &str) -> Result<(), PipelineError> {
     let status = std::process::Command::new("gst-inspect-1.0")
         .arg(element)
@@ -1331,59 +1614,6 @@ fn require_gst_element(element: &str) -> Result<(), PipelineError> {
         Err(PipelineError::message(format!(
             "GStreamer element `{element}` is not available"
         )))
-    }
-}
-
-#[cfg(not(windows))]
-fn run_gstreamer_encoder_command(
-    command: &mut std::process::Command,
-    input: &[u8],
-    label: &str,
-) -> Result<std::process::Output, PipelineError> {
-    let mut child = command
-        .spawn()
-        .map_err(|error| PipelineError::message(format!("launch {label} failed: {error}")))?;
-
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| PipelineError::message(format!("{label} stdin pipe is unavailable")))?;
-    let input = input.to_vec();
-    let writer = std::thread::spawn(move || {
-        use std::io::Write;
-        stdin.write_all(&input)
-    });
-
-    let output = child
-        .wait_with_output()
-        .map_err(|error| PipelineError::message(format!("wait for {label} failed: {error}")))?;
-
-    let write_error = match writer.join() {
-        Ok(result) => result.err(),
-        Err(_) => Some(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "GStreamer stdin writer thread panicked",
-        )),
-    };
-
-    if let Some(error) = write_error {
-        return Err(PipelineError::message(format!(
-            "{label} failed while writing raw frame input: {error}; stderr: {}",
-            stderr_text(&output)
-        )));
-    }
-
-    Ok(output)
-}
-
-#[cfg(not(windows))]
-fn stderr_text(output: &std::process::Output) -> String {
-    let text = String::from_utf8_lossy(&output.stderr);
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        format!("process exited with {}", output.status)
-    } else {
-        trimmed.to_string()
     }
 }
 
@@ -1619,6 +1849,7 @@ mod linux_tests {
             fps: 30,
             bitrate_kbps: 5_000,
             frame_index: 0,
+            process: None,
         };
 
         let command = encoder.gstreamer_command();
