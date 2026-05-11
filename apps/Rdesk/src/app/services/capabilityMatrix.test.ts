@@ -197,6 +197,67 @@ describe("evaluateCapabilityCombination", () => {
     expect(result.reasons).toEqual([]);
   });
 
+  it("treats service-owned supported capabilities as runnable", () => {
+    const snapshot: CapabilitySnapshot = {
+      schema_version: 1,
+      platform: "linux",
+      capabilities: [
+        {
+          id: "capture.linux",
+          domain: "capture",
+          label: "Linux capture",
+          status: "supported",
+          platform: "linux",
+        },
+        {
+          id: "encode.nvenc_h264",
+          domain: "encode",
+          label: "NVENC H.264",
+          status: "supported",
+          platform: "linux",
+        },
+        {
+          id: "render.linux",
+          domain: "render",
+          label: "Linux renderer",
+          status: "supported",
+          platform: "linux",
+        },
+        {
+          id: "memory.cpu",
+          domain: "memory",
+          label: "CPU memory",
+          status: "supported",
+          platform: "linux",
+        },
+        {
+          id: "transport.webrtc",
+          domain: "transport",
+          label: "WebRTC",
+          status: "supported",
+          platform: "linux",
+        },
+      ],
+      constraints: [],
+      profiles: [],
+      recent_profile_results: [],
+    };
+
+    const result = evaluateCapabilityCombination(
+      {
+        capture: "linux",
+        encoder: "nvenc_h264",
+        renderer: "linux",
+        memory: "cpu",
+        transport: "webrtc",
+      },
+      snapshot
+    );
+
+    expect(result.status).toBe("ready");
+    expect(result.reasons).toEqual([]);
+  });
+
   it("marks the Linux OpenH264 path runnable but degraded", () => {
     const snapshot = buildCapabilitySnapshotFromEnvironment(linuxEnvironment);
 

@@ -541,7 +541,7 @@ function isSelectableCapability(item: CapabilityItem): boolean {
 }
 
 function isProfileCapabilityUsable(item: CapabilityItem): boolean {
-  return item.status === "available" || item.status === "usable";
+  return item.status === "supported" || item.status === "available" || item.status === "usable";
 }
 
 function formatProfile(profile: CapabilityProfile): string {

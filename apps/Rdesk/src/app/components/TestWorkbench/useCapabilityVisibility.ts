@@ -54,5 +54,10 @@ export function shouldShowCapabilityStatus(
   showUnavailable: boolean
 ): boolean {
   if (showUnavailable) return true;
-  return status === "available" || status === "usable" || status === "degraded";
+  return (
+    status === "supported" ||
+    status === "available" ||
+    status === "usable" ||
+    status === "degraded"
+  );
 }
