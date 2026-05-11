@@ -101,6 +101,9 @@ pub struct TestConfigData {
     pub warmup_ms: Option<u64>,
     pub repeat_count: Option<u32>,
     pub input_source: Option<String>,
+    pub source_id: Option<String>,
+    pub source_kind: Option<String>,
+    pub display_id: Option<String>,
     pub window_hwnd: Option<String>,
     pub window_title: Option<String>,
     pub visual_preview: Option<bool>,
@@ -272,6 +275,40 @@ pub struct WindowCaptureTarget {
     pub width: u32,
     pub height: u32,
     pub process_id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_identifier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_layer: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_data_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_height: Option<u32>,
+}
+
+/// A cross-platform screen sharing source that can be selected before capture starts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaptureShareSourceTarget {
+    pub id: String,
+    pub platform: String,
+    /// "screen", "window", or "portal" when the OS permission UI owns final selection.
+    pub source_kind: String,
+    pub native_id: String,
+    pub title: String,
+    pub subtitle: String,
+    pub width: u32,
+    pub height: u32,
+    pub is_primary: bool,
+    pub requires_system_picker: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hwnd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_id: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2563,6 +2600,263 @@ pub fn list_window_capture_targets_with_previews(
     Ok(targets)
 }
 
+pub fn list_capture_share_sources() -> Result<Vec<CaptureShareSourceTarget>> {
+    list_capture_share_sources_impl(false, None)
+}
+
+pub fn list_capture_share_sources_with_previews(
+    limit: Option<usize>,
+) -> Result<Vec<CaptureShareSourceTarget>> {
+    list_capture_share_sources_impl(true, limit)
+}
+
+fn list_capture_share_sources_impl(
+    include_previews: bool,
+    limit: Option<usize>,
+) -> Result<Vec<CaptureShareSourceTarget>> {
+    let mut sources = list_display_share_sources_impl()?;
+
+    match list_window_capture_targets_impl() {
+        Ok(window_targets) => sources.extend(
+            window_targets
+                .into_iter()
+                .map(window_target_to_share_source_target),
+        ),
+        Err(error) => {
+            if sources.is_empty() {
+                return Err(error);
+            }
+        }
+    }
+
+    if include_previews {
+        let limit = limit.unwrap_or(24).min(32);
+        for source in sources
+            .iter_mut()
+            .filter(|source| source.source_kind == "window")
+            .take(limit)
+        {
+            let Some(hwnd) = source.hwnd.as_deref() else {
+                continue;
+            };
+            let Ok(hwnd) = parse_hwnd(hwnd) else {
+                continue;
+            };
+            let Ok(probe) = probe_window_first_frame(hwnd, Duration::from_millis(250)) else {
+                continue;
+            };
+            let Ok((preview_data_url, preview_width, preview_height)) =
+                window_preview_data_url(&probe.frame, 320, 180)
+            else {
+                continue;
+            };
+
+            source.preview_data_url = Some(preview_data_url);
+            source.preview_width = Some(preview_width);
+            source.preview_height = Some(preview_height);
+        }
+    }
+
+    Ok(sources)
+}
+
+fn window_target_to_share_source_target(target: WindowCaptureTarget) -> CaptureShareSourceTarget {
+    let platform = if target.platform.is_empty() {
+        current_platform_id().to_string()
+    } else {
+        target.platform.clone()
+    };
+    let id = if target.id.is_empty() {
+        format!("{platform}:window:{}", target.hwnd)
+    } else {
+        target.id.clone()
+    };
+    let class_name = (!target.class_name.is_empty()).then_some(target.class_name.clone());
+    let subtitle = if let Some(app_name) = target.app_name.as_deref() {
+        format!(
+            "{app_name} / {}x{} / PID {}",
+            target.width, target.height, target.process_id
+        )
+    } else if target.width > 0 && target.height > 0 {
+        format!(
+            "{}x{} / PID {}",
+            target.width, target.height, target.process_id
+        )
+    } else {
+        format!("PID {}", target.process_id)
+    };
+
+    CaptureShareSourceTarget {
+        id,
+        platform,
+        source_kind: "window".to_string(),
+        native_id: target.hwnd.clone(),
+        title: target.title,
+        subtitle,
+        width: target.width,
+        height: target.height,
+        is_primary: false,
+        requires_system_picker: false,
+        hwnd: Some(target.hwnd),
+        class_name,
+        process_id: Some(target.process_id),
+        app_name: target.app_name,
+        bundle_identifier: target.bundle_identifier,
+        window_layer: target.window_layer,
+        preview_data_url: target.preview_data_url,
+        preview_width: target.preview_width,
+        preview_height: target.preview_height,
+    }
+}
+
+fn current_platform_id() -> &'static str {
+    if cfg!(windows) {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else {
+        "other"
+    }
+}
+
+#[cfg(windows)]
+fn list_display_share_sources_impl() -> Result<Vec<CaptureShareSourceTarget>> {
+    let monitor_count = mrd_capture_winrt::get_monitor_count()
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+
+    Ok((0..monitor_count)
+        .map(|index| {
+            let native_id = index.to_string();
+            let display_number = index + 1;
+            CaptureShareSourceTarget {
+                id: format!("windows:screen:{native_id}"),
+                platform: "windows".to_string(),
+                source_kind: "screen".to_string(),
+                native_id,
+                title: if index == 0 {
+                    "Primary display".to_string()
+                } else {
+                    format!("Display {display_number}")
+                },
+                subtitle: "Windows.Graphics.Capture monitor source".to_string(),
+                width: 0,
+                height: 0,
+                is_primary: index == 0,
+                requires_system_picker: false,
+                hwnd: None,
+                class_name: None,
+                process_id: None,
+                app_name: None,
+                bundle_identifier: None,
+                window_layer: None,
+                preview_data_url: None,
+                preview_width: None,
+                preview_height: None,
+            }
+        })
+        .collect())
+}
+
+#[cfg(target_os = "macos")]
+fn list_display_share_sources_impl() -> Result<Vec<CaptureShareSourceTarget>> {
+    let targets = mrd_capture_macos::enumerate_display_capture_targets()
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+
+    Ok(targets
+        .into_iter()
+        .map(|target| {
+            let native_id = format!("0x{:X}", target.display_id);
+            CaptureShareSourceTarget {
+                id: format!("macos:screen:{native_id}"),
+                platform: "macos".to_string(),
+                source_kind: "screen".to_string(),
+                native_id,
+                title: target.title,
+                subtitle: format!("{}x{} display", target.width, target.height),
+                width: target.width,
+                height: target.height,
+                is_primary: target.is_main,
+                requires_system_picker: false,
+                hwnd: None,
+                class_name: None,
+                process_id: None,
+                app_name: None,
+                bundle_identifier: None,
+                window_layer: None,
+                preview_data_url: None,
+                preview_width: None,
+                preview_height: None,
+            }
+        })
+        .collect())
+}
+
+#[cfg(target_os = "linux")]
+fn list_display_share_sources_impl() -> Result<Vec<CaptureShareSourceTarget>> {
+    if mrd_capture_pipewire::PipewireScreenCapture::is_wayland_available() {
+        return Ok(vec![CaptureShareSourceTarget {
+            id: "linux:portal:system-picker".to_string(),
+            platform: "linux".to_string(),
+            source_kind: "portal".to_string(),
+            native_id: "portal".to_string(),
+            title: "System sharing picker".to_string(),
+            subtitle: "Wayland requires the desktop portal to approve the final screen/window"
+                .to_string(),
+            width: 0,
+            height: 0,
+            is_primary: true,
+            requires_system_picker: true,
+            hwnd: None,
+            class_name: None,
+            process_id: None,
+            app_name: None,
+            bundle_identifier: None,
+            window_layer: None,
+            preview_data_url: None,
+            preview_width: None,
+            preview_height: None,
+        }]);
+    }
+
+    let targets = mrd_capture_pipewire::PipewireScreenCapture::get_display_targets()
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+
+    Ok(targets
+        .into_iter()
+        .map(|target| {
+            let native_id = target.id.to_string();
+            CaptureShareSourceTarget {
+                id: format!("linux:screen:{native_id}"),
+                platform: "linux".to_string(),
+                source_kind: "screen".to_string(),
+                native_id,
+                title: target.name,
+                subtitle: format!("{}x{} display", target.width, target.height),
+                width: target.width,
+                height: target.height,
+                is_primary: target.is_primary,
+                requires_system_picker: false,
+                hwnd: None,
+                class_name: None,
+                process_id: None,
+                app_name: None,
+                bundle_identifier: None,
+                window_layer: None,
+                preview_data_url: None,
+                preview_width: None,
+                preview_height: None,
+            }
+        })
+        .collect())
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+fn list_display_share_sources_impl() -> Result<Vec<CaptureShareSourceTarget>> {
+    Ok(vec![])
+}
+
 fn parse_hwnd(input: &str) -> Result<isize> {
     let trimmed = input.trim().rsplit(':').next().unwrap_or(input).trim();
     if trimmed.is_empty() {
@@ -2882,6 +3176,7 @@ fn harness_config_from_data(config: &TestConfigData) -> HarnessConfig {
         renderer_target_hwnd: config.renderer_target_hwnd,
         zero_copy: config.zero_copy,
         input_source: config.input_source.clone(),
+        display_id: config.display_id.clone(),
         window_handle: config.window_hwnd.clone(),
         visual_preview: config.visual_preview,
         transport: match config.transport_kind.as_deref() {

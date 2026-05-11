@@ -43,6 +43,7 @@ import type {
   TestPreset,
   EnvironmentSnapshot,
   WindowCaptureTarget,
+  CaptureShareSourceTarget,
   RemoteDisplayWindowContext,
   NativeSurfaceRect,
   NativeRenderSurfaceSnapshot,
@@ -685,6 +686,27 @@ export async function testListWindowCaptureTargetsWithPreviews(
   return invokeAdapter<WindowCaptureTarget[]>('test_list_window_capture_targets_with_previews', {
     limit,
   });
+}
+
+/**
+ * List screen/window sharing sources exposed by the current platform.
+ */
+export async function testListCaptureShareSources(): Promise<
+  AdapterResult<CaptureShareSourceTarget[]>
+> {
+  return invokeAdapter<CaptureShareSourceTarget[]>('test_list_capture_share_sources');
+}
+
+/**
+ * List screen/window sharing sources with best-effort preview frames where supported.
+ */
+export async function testListCaptureShareSourcesWithPreviews(
+  limit = 24
+): Promise<AdapterResult<CaptureShareSourceTarget[]>> {
+  return invokeAdapter<CaptureShareSourceTarget[]>(
+    'test_list_capture_share_sources_with_previews',
+    { limit }
+  );
 }
 
 /**

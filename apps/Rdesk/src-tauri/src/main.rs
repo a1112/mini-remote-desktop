@@ -1745,6 +1745,21 @@ fn test_list_window_capture_targets_with_previews(
     test_orchestrator::list_window_capture_targets_with_previews(limit).map_err(|e| e.to_string())
 }
 
+/// List cross-platform screen sharing sources.
+#[tauri::command]
+fn test_list_capture_share_sources(
+) -> Result<Vec<test_orchestrator::CaptureShareSourceTarget>, String> {
+    test_orchestrator::list_capture_share_sources().map_err(|e| e.to_string())
+}
+
+/// List cross-platform screen sharing sources and attach best-effort window previews.
+#[tauri::command]
+fn test_list_capture_share_sources_with_previews(
+    limit: Option<usize>,
+) -> Result<Vec<test_orchestrator::CaptureShareSourceTarget>, String> {
+    test_orchestrator::list_capture_share_sources_with_previews(limit).map_err(|e| e.to_string())
+}
+
 /// Start a test run
 #[tauri::command]
 async fn test_start_run(
@@ -2356,6 +2371,8 @@ fn main() {
             test_get_capabilities,
             test_list_window_capture_targets,
             test_list_window_capture_targets_with_previews,
+            test_list_capture_share_sources,
+            test_list_capture_share_sources_with_previews,
             test_start_run,
             test_stop_run,
             test_list_runs,

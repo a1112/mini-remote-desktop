@@ -117,6 +117,9 @@ export interface TestConfig {
 
   // I/O
   input_source?: "screen" | "window" | "synthetic";
+  source_id?: string;
+  source_kind?: "screen" | "window" | "portal" | string;
+  display_id?: string;
   window_hwnd?: string;
   window_title?: string;
   visual_preview?: boolean;
@@ -164,6 +167,28 @@ export interface WindowCaptureTarget {
   width: number;
   height: number;
   process_id: number;
+  app_name?: string | null;
+  bundle_identifier?: string | null;
+  window_layer?: number | null;
+  preview_data_url?: string | null;
+  preview_width?: number | null;
+  preview_height?: number | null;
+}
+
+export interface CaptureShareSourceTarget {
+  id: string;
+  platform: "windows" | "macos" | "linux" | string;
+  source_kind: "screen" | "window" | "portal" | string;
+  native_id: string;
+  title: string;
+  subtitle: string;
+  width: number;
+  height: number;
+  is_primary: boolean;
+  requires_system_picker: boolean;
+  hwnd?: string | null;
+  class_name?: string | null;
+  process_id?: number | null;
   app_name?: string | null;
   bundle_identifier?: string | null;
   window_layer?: number | null;

@@ -13,6 +13,7 @@ import {
 import * as commands from "../../adapters/tauri/commands";
 import type {
   Artifact,
+  CaptureShareSourceTarget,
   EnvironmentSnapshot,
   TestConfig,
   WindowCaptureTarget,
@@ -148,6 +149,48 @@ function windowTargetKey(target: WindowCaptureTarget): string {
   return target.id ?? target.hwnd;
 }
 
+function shareSourceKey(source: CaptureShareSourceTarget): string {
+  return source.id || source.native_id || source.hwnd || source.title;
+}
+
+function shareSourceToWindowTarget(source: CaptureShareSourceTarget): WindowCaptureTarget {
+  return {
+    id: source.id,
+    platform: source.platform,
+    source_kind: source.source_kind,
+    hwnd: source.hwnd ?? source.native_id,
+    title: source.title,
+    class_name: source.class_name ?? source.app_name ?? source.platform,
+    width: source.width,
+    height: source.height,
+    process_id: source.process_id ?? 0,
+    app_name: source.app_name,
+    bundle_identifier: source.bundle_identifier,
+    window_layer: source.window_layer,
+    preview_data_url: source.preview_data_url,
+    preview_width: source.preview_width,
+    preview_height: source.preview_height,
+  };
+}
+
+function shareSourceCompatibleWithCapture(
+  source: CaptureShareSourceTarget,
+  capture: CaptureType
+): boolean {
+  if (capture === "synthetic") return false;
+  if (capture === "dxgi") return source.platform === "windows" && source.source_kind === "screen";
+  if (capture === "winrt") return source.platform === "windows";
+  if (capture === "macos") return source.platform === "macos";
+  if (capture === "linux") return source.platform === "linux";
+  return false;
+}
+
+function shareSourceKindLabel(source: CaptureShareSourceTarget): string {
+  if (source.source_kind === "window") return "Window";
+  if (source.source_kind === "portal") return "System picker";
+  return "Screen";
+}
+
 function supportsWindowCapture(capture: CaptureType): boolean {
   return capture === "winrt" || capture === "macos";
 }
@@ -185,11 +228,14 @@ export function CaptureTestPage() {
   const [windowTargetsLoading, setWindowTargetsLoading] = useState(false);
   const [windowTargetsError, setWindowTargetsError] = useState<string | null>(null);
   const [singleWindowProbeResult, setSingleWindowProbeResult] = useState<string | null>(null);
-  const [windowPickerOpen, setWindowPickerOpen] = useState(false);
-  const [windowPickerTargets, setWindowPickerTargets] = useState<WindowCaptureTarget[]>([]);
-  const [windowPickerLoading, setWindowPickerLoading] = useState(false);
-  const [windowPickerError, setWindowPickerError] = useState<string | null>(null);
-  const [windowPickerQuery, setWindowPickerQuery] = useState("");
+  const [shareSources, setShareSources] = useState<CaptureShareSourceTarget[]>([]);
+  const [selectedShareSourceId, setSelectedShareSourceId] = useState<string | null>(null);
+  const [sourcePickerOpen, setSourcePickerOpen] = useState(false);
+  const [sourcePickerSources, setSourcePickerSources] = useState<CaptureShareSourceTarget[]>([]);
+  const [sourcePickerLoading, setSourcePickerLoading] = useState(false);
+  const [sourcePickerError, setSourcePickerError] = useState<string | null>(null);
+  const [sourcePickerQuery, setSourcePickerQuery] = useState("");
+  const [startAfterSourcePick, setStartAfterSourcePick] = useState(false);
   const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
   const [startError, setStartError] = useState<string | null>(null);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
@@ -205,9 +251,28 @@ export function CaptureTestPage() {
   const visibleCaptureOptions = CAPTURE_OPTIONS.filter((option) =>
     !capabilities || shouldShowCapabilityOption(captureAvailable(option.id), showUnavailable)
   );
+  const compatibleShareSources = shareSources.filter((source) =>
+    shareSourceCompatibleWithCapture(source, selectedCapture)
+  );
+  const sourcePickerCompatibleSources = sourcePickerSources.filter((source) =>
+    shareSourceCompatibleWithCapture(source, selectedCapture)
+  );
+  const visibleSourcePickerSources =
+    sourcePickerCompatibleSources.length > 0 ? sourcePickerCompatibleSources : compatibleShareSources;
+  const selectedShareSource =
+    compatibleShareSources.find((source) => shareSourceKey(source) === selectedShareSourceId) ??
+    sourcePickerSources.find((source) => shareSourceKey(source) === selectedShareSourceId);
+  const selectedWindowFromShareSource =
+    selectedShareSource?.source_kind === "window"
+      ? shareSourceToWindowTarget(selectedShareSource)
+      : null;
   const selectedWindow =
+    selectedWindowFromShareSource ??
     windowTargets.find((target) => windowTargetKey(target) === selectedWindowHwnd) ??
-    windowPickerTargets.find((target) => windowTargetKey(target) === selectedWindowHwnd);
+    sourcePickerSources
+      .filter((source) => source.source_kind === "window")
+      .map(shareSourceToWindowTarget)
+      .find((target) => windowTargetKey(target) === selectedWindowHwnd);
   const performanceNote = capturePerformanceNote(selectedCapture, captureScope);
 
   const applyWindowTargets = (targets: WindowCaptureTarget[]) => {
@@ -218,6 +283,20 @@ export function CaptureTestPage() {
       }
       return targets[0] ? windowTargetKey(targets[0]) : null;
     });
+  };
+
+  const applyShareSource = (source: CaptureShareSourceTarget) => {
+    setSelectedShareSourceId(shareSourceKey(source));
+    if (source.source_kind === "window") {
+      const target = shareSourceToWindowTarget(source);
+      applyWindowTargets([target, ...windowTargets.filter((item) => windowTargetKey(item) !== windowTargetKey(target))]);
+      setSelectedWindowHwnd(windowTargetKey(target));
+      if (captureScope === "screen") setCaptureScope("window_perf");
+      return;
+    }
+
+    setSelectedWindowHwnd(null);
+    if (captureScope !== "screen") setCaptureScope("screen");
   };
 
   useEffect(() => {
@@ -235,10 +314,35 @@ export function CaptureTestPage() {
   }, []);
 
   useEffect(() => {
+    let cancelled = false;
+
+    commands.testListCaptureShareSources().then((result) => {
+      if (cancelled) return;
+      if (result.ok && Array.isArray(result.value)) setShareSources(result.value);
+      else setShareSources([]);
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
     if (!capabilities || captureAvailable(selectedCapture)) return;
     const nextCapture = CAPTURE_OPTIONS.find((option) => captureAvailable(option.id));
     if (nextCapture) setSelectedCapture(nextCapture.id);
   }, [capabilities, selectedCapture]);
+
+  useEffect(() => {
+    if (!selectedShareSourceId) return;
+    const stillCompatible = compatibleShareSources.some(
+      (source) => shareSourceKey(source) === selectedShareSourceId
+    );
+    if (!stillCompatible) {
+      setSelectedShareSourceId(null);
+      setSelectedWindowHwnd(null);
+    }
+  }, [compatibleShareSources, selectedShareSourceId]);
 
   useEffect(() => {
     if (!selectedWindowCapture && captureScope !== "screen") {
@@ -324,55 +428,82 @@ export function CaptureTestPage() {
     setWindowTargetsLoading(false);
   };
 
-  const loadWindowPickerTargets = async () => {
-    setWindowPickerLoading(true);
-    setWindowPickerError(null);
+  const loadSourcePickerSources = async () => {
+    setSourcePickerLoading(true);
+    setSourcePickerError(null);
 
-    const result = await commands.testListWindowCaptureTargetsWithPreviews(24);
-    if (result.ok) {
-      setWindowPickerTargets(result.value);
-      applyWindowTargets(result.value);
+    const result = await commands.testListCaptureShareSourcesWithPreviews(24);
+    if (result.ok && Array.isArray(result.value)) {
+      setSourcePickerSources(result.value);
+      setShareSources(result.value);
+      const windowSources = result.value
+        .filter((source) => source.source_kind === "window")
+        .map(shareSourceToWindowTarget);
+      if (windowSources.length > 0) applyWindowTargets(windowSources);
     } else {
-      setWindowPickerTargets((current) => (current.length > 0 ? current : windowTargets));
-      setWindowPickerError(result.error.message);
+      setSourcePickerSources((current) => (current.length > 0 ? current : shareSources));
+      setSourcePickerError(result.ok ? "Invalid share source response" : result.error.message);
     }
 
-    setWindowPickerLoading(false);
+    setSourcePickerLoading(false);
   };
 
-  const openWindowPicker = () => {
-    setWindowPickerOpen(true);
-    setWindowPickerQuery("");
-    setWindowPickerTargets(windowTargets);
-    void loadWindowPickerTargets();
+  const openSourcePicker = (startAfterPick = false) => {
+    setSourcePickerOpen(true);
+    setStartAfterSourcePick(startAfterPick);
+    setSourcePickerQuery("");
+    setSourcePickerSources(shareSources);
+    void loadSourcePickerSources();
   };
 
-  const handleStart = async () => {
+  const startCaptureRun = async (sourceOverride?: CaptureShareSourceTarget | null) => {
     if (!captureAvailable(selectedCapture)) {
       setStartError("当前平台未暴露所选采集能力。");
       return;
     }
+
+    const sourceForRun = sourceOverride ?? selectedShareSource;
+    const runWindowProbeMode = isWindowProbeMode && sourceForRun?.source_kind === "window";
+    const runWindowPerfMode =
+      isWindowPerfMode || (sourceForRun?.source_kind === "window" && !runWindowProbeMode);
+    const runWindowMode = runWindowProbeMode || runWindowPerfMode;
+    const selectedWindowForRun =
+      sourceForRun?.source_kind === "window"
+        ? shareSourceToWindowTarget(sourceForRun)
+        : selectedWindow;
+    const sourceConfig: Pick<TestConfig, "source_id" | "source_kind" | "display_id"> =
+      sourceForRun
+        ? {
+            source_id: shareSourceKey(sourceForRun),
+            source_kind: sourceForRun.source_kind,
+            display_id:
+              sourceForRun.source_kind === "screen" || sourceForRun.source_kind === "portal"
+                ? sourceForRun.native_id
+                : undefined,
+          }
+        : {};
 
     setIsRunning(true);
     setMetrics(null);
     setStartError(null);
     setSingleWindowProbeResult(null);
 
-    if (isWindowMode && !selectedWindow) {
+    if (runWindowMode && !selectedWindowForRun) {
       setStartError("请先选择一个可捕获窗口。");
       setIsRunning(false);
       return;
     }
 
-    if (isWindowProbeMode) {
+    if (runWindowProbeMode) {
       const isMacos = selectedCapture === "macos";
       const result = await commands.testStartRun({
         scenarioId: "single_window.local",
         config: {
           capture_type: selectedCapture,
           input_source: "window",
-          window_hwnd: selectedWindow?.hwnd,
-          window_title: selectedWindow?.title,
+          window_hwnd: selectedWindowForRun?.hwnd,
+          window_title: selectedWindowForRun?.title,
+          ...sourceConfig,
           encoder_type: "openh264",
           decoder_type: "software",
           renderer_type: isMacos ? "macos" : "d3d11",
@@ -407,15 +538,16 @@ export function CaptureTestPage() {
       return;
     }
 
-    if (isWindowPerfMode) {
+    if (runWindowPerfMode) {
       const config: TestConfig = {
         capture_type: selectedCapture,
         encoder_type: "none",
         decoder_type: "none",
         duration_ms: CAPTURE_PERF_DURATION_MS,
         input_source: "window",
-        window_hwnd: selectedWindow?.hwnd,
-        window_title: selectedWindow?.title,
+        window_hwnd: selectedWindowForRun?.hwnd,
+        window_title: selectedWindowForRun?.title,
+        ...sourceConfig,
         zero_copy: selectedCapture === "winrt",
         visual_preview: false,
       };
@@ -439,6 +571,7 @@ export function CaptureTestPage() {
       decoder_type: "none",
       duration_ms: CAPTURE_PERF_DURATION_MS,
       input_source: "screen",
+      ...sourceConfig,
       zero_copy: selectedCapture === "dxgi" || selectedCapture === "winrt",
       visual_preview: false,
     };
@@ -463,6 +596,21 @@ export function CaptureTestPage() {
       setStartError(result.error.message);
       setIsRunning(false);
     }
+  };
+
+  const handleStart = async () => {
+    if (!captureAvailable(selectedCapture)) {
+      setStartError("当前平台未暴露所选采集能力。");
+      return;
+    }
+
+    if (selectedCapture !== "synthetic" && !selectedShareSource && !(isWindowMode && selectedWindow)) {
+      setStartError(null);
+      openSourcePicker(true);
+      return;
+    }
+
+    await startCaptureRun(selectedShareSource);
   };
 
   const handleStop = async () => {
@@ -501,6 +649,8 @@ export function CaptureTestPage() {
               onClick={() => {
                 setSelectedCapture(option.id);
                 setCaptureScope("screen");
+                setSelectedShareSourceId(null);
+                setSelectedWindowHwnd(null);
               }}
               disabled={isRunning || !available}
               className={`p-4 rounded-lg border-2 text-left transition-all ${
@@ -535,6 +685,16 @@ export function CaptureTestPage() {
               <dd className="font-medium">{selectedOption.name}</dd>
             </div>
             <div>
+              <dt className="text-muted-foreground">共享源</dt>
+              <dd className="font-medium">
+                {selectedShareSource
+                  ? `${shareSourceKindLabel(selectedShareSource)} / ${selectedShareSource.title}`
+                  : selectedCapture === "synthetic"
+                  ? "合成帧"
+                  : "未选择"}
+              </dd>
+            </div>
+            <div>
               <dt className="text-muted-foreground">测试模式</dt>
               <dd className="font-medium">{captureModeLabel(captureScope)} / 无 FPS 限制</dd>
             </div>
@@ -554,6 +714,56 @@ export function CaptureTestPage() {
           {performanceNote && (
             <div className="mt-4 rounded border border-yellow-200 bg-yellow-50 px-3 py-2 text-sm text-yellow-900 dark:border-yellow-900/40 dark:bg-yellow-950/30 dark:text-yellow-100">
               {performanceNote}
+            </div>
+          )}
+        </div>
+      )}
+
+      {selectedCapture !== "synthetic" && captureAvailable(selectedCapture) && (
+        <div className="bg-card rounded-lg border p-4 mb-6">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <h3 className="font-medium">共享源</h3>
+              <p className="text-sm text-muted-foreground">
+                {selectedShareSource
+                  ? selectedShareSource.subtitle
+                  : "选择屏幕、窗口或平台授权入口。"}
+              </p>
+            </div>
+            <button
+              onClick={() => openSourcePicker(false)}
+              disabled={isRunning}
+              className="inline-flex items-center gap-2 rounded border px-3 py-1.5 text-sm hover:bg-muted disabled:opacity-50"
+            >
+              <Monitor className="h-4 w-4" />
+              选择共享源
+            </button>
+          </div>
+          {selectedShareSource && (
+            <div className="mt-4 grid gap-4 md:grid-cols-[220px_1fr]">
+              <ShareSourcePreviewThumb source={selectedShareSource} />
+              <div className="min-w-0 space-y-2">
+                <div>
+                  <div className="truncate text-base font-medium">{selectedShareSource.title}</div>
+                  <div className="text-sm text-muted-foreground">
+                    {shareSourceKindLabel(selectedShareSource)}
+                    {selectedShareSource.width > 0 && selectedShareSource.height > 0
+                      ? ` / ${selectedShareSource.width}x${selectedShareSource.height}`
+                      : ""}
+                    {selectedShareSource.requires_system_picker ? " / requires OS approval" : ""}
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-3 text-sm">
+                  <div>
+                    <div className="text-muted-foreground">Platform</div>
+                    <div className="truncate font-mono">{selectedShareSource.platform}</div>
+                  </div>
+                  <div>
+                    <div className="text-muted-foreground">Source ID</div>
+                    <div className="truncate font-mono">{selectedShareSource.native_id}</div>
+                  </div>
+                </div>
+              </div>
             </div>
           )}
         </div>
@@ -611,7 +821,7 @@ export function CaptureTestPage() {
                   Refresh
                 </button>
                 <button
-                  onClick={openWindowPicker}
+                  onClick={() => openSourcePicker(false)}
                   disabled={windowTargetsLoading || isRunning}
                   className="inline-flex items-center gap-2 text-sm px-3 py-1.5 rounded bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
                 >
@@ -676,25 +886,27 @@ export function CaptureTestPage() {
         </div>
       )}
 
-      {windowPickerOpen && (
-        <WindowPickerDialog
-          targets={windowPickerTargets}
-            selectedHwnd={selectedWindowHwnd}
+      {sourcePickerOpen && (
+        <ShareSourcePickerDialog
+          sources={visibleSourcePickerSources}
+          selectedSourceId={selectedShareSourceId}
           captureApiName={windowCaptureApiName(selectedCapture)}
-          loading={windowPickerLoading}
-          error={windowPickerError}
-          query={windowPickerQuery}
-          onQueryChange={setWindowPickerQuery}
-          onRefresh={loadWindowPickerTargets}
-          onClose={() => setWindowPickerOpen(false)}
-          onSelect={(target) => {
-            applyWindowTargets(
-              windowPickerTargets.some((item) => windowTargetKey(item) === windowTargetKey(target))
-                ? windowPickerTargets
-                : [target, ...windowPickerTargets]
-            );
-            setSelectedWindowHwnd(windowTargetKey(target));
-            setWindowPickerOpen(false);
+          loading={sourcePickerLoading}
+          error={sourcePickerError}
+          query={sourcePickerQuery}
+          onQueryChange={setSourcePickerQuery}
+          onRefresh={loadSourcePickerSources}
+          onClose={() => {
+            setSourcePickerOpen(false);
+            setStartAfterSourcePick(false);
+          }}
+          onSelect={(source) => {
+            applyShareSource(source);
+            setSourcePickerOpen(false);
+            if (startAfterSourcePick) {
+              setStartAfterSourcePick(false);
+              void startCaptureRun(source);
+            }
           }}
         />
       )}
@@ -704,10 +916,7 @@ export function CaptureTestPage() {
         {!isRunning ? (
           <button
             onClick={handleStart}
-            disabled={
-              !captureAvailable(selectedCapture) ||
-              (isWindowMode && (!selectedWindowHwnd || windowTargetsLoading))
-            }
+            disabled={!captureAvailable(selectedCapture)}
             className="flex items-center gap-2 px-6 py-3 bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 transition-colors disabled:opacity-50"
           >
             <Play className="h-5 w-5" />
@@ -783,9 +992,9 @@ export function CaptureTestPage() {
   );
 }
 
-function WindowPickerDialog({
-  targets,
-  selectedHwnd,
+function ShareSourcePickerDialog({
+  sources,
+  selectedSourceId,
   captureApiName,
   loading,
   error,
@@ -795,8 +1004,8 @@ function WindowPickerDialog({
   onClose,
   onSelect,
 }: {
-  targets: WindowCaptureTarget[];
-  selectedHwnd: string | null;
+  sources: CaptureShareSourceTarget[];
+  selectedSourceId: string | null;
   captureApiName: string;
   loading: boolean;
   error: string | null;
@@ -804,25 +1013,25 @@ function WindowPickerDialog({
   onQueryChange: (query: string) => void;
   onRefresh: () => void;
   onClose: () => void;
-  onSelect: (target: WindowCaptureTarget) => void;
+  onSelect: (source: CaptureShareSourceTarget) => void;
 }) {
   const normalizedQuery = query.trim().toLowerCase();
-  const filteredTargets = normalizedQuery
-    ? targets.filter((target) =>
-        `${target.title} ${target.class_name} ${target.app_name ?? ""} ${
-          target.bundle_identifier ?? ""
-        } ${target.process_id}`
+  const filteredSources = normalizedQuery
+    ? sources.filter((source) =>
+        `${source.title} ${source.subtitle} ${source.class_name ?? ""} ${source.app_name ?? ""} ${
+          source.bundle_identifier ?? ""
+        } ${source.process_id ?? ""} ${source.native_id}`
           .toLowerCase()
           .includes(normalizedQuery)
       )
-    : targets;
+    : sources;
 
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-6"
       role="dialog"
       aria-modal="true"
-      aria-labelledby="window-picker-title"
+      aria-labelledby="share-source-picker-title"
       onClick={onClose}
     >
       <div
@@ -831,11 +1040,11 @@ function WindowPickerDialog({
       >
         <div className="flex items-center justify-between border-b p-4">
           <div>
-            <h2 id="window-picker-title" className="text-lg font-semibold">
-              Window picker
+            <h2 id="share-source-picker-title" className="text-lg font-semibold">
+              Share source picker
             </h2>
             <p className="text-sm text-muted-foreground">
-              Select a foreground window using live {captureApiName} preview frames.
+              Select a screen, window, or platform permission entry for {captureApiName}.
             </p>
           </div>
           <div className="flex items-center gap-2">
@@ -850,7 +1059,7 @@ function WindowPickerDialog({
             <button
               onClick={onClose}
               className="inline-flex h-9 w-9 items-center justify-center rounded border hover:bg-muted"
-              aria-label="Close window picker"
+              aria-label="Close share source picker"
             >
               <X className="h-4 w-4" />
             </button>
@@ -864,51 +1073,58 @@ function WindowPickerDialog({
               value={query}
               onChange={(event) => onQueryChange(event.target.value)}
               className="w-full rounded border bg-background py-2 pl-9 pr-3 text-sm"
-              placeholder="Filter by title, class, or PID"
-              aria-label="Filter windows"
+              placeholder="Filter by title, app, source, or PID"
+              aria-label="Filter share sources"
             />
           </label>
           {error && <div className="mt-2 text-sm text-red-600">{error}</div>}
         </div>
 
         <div className="min-h-[280px] overflow-y-auto p-4">
-          {loading && targets.length === 0 && (
+          {loading && sources.length === 0 && (
             <div className="flex h-48 items-center justify-center text-sm text-muted-foreground">
-              Loading window previews...
+              Loading share sources...
             </div>
           )}
 
-          {!loading && filteredTargets.length === 0 && (
+          {!loading && filteredSources.length === 0 && (
             <div className="flex h-48 items-center justify-center text-sm text-muted-foreground">
-              No matching windows.
+              No matching sources.
             </div>
           )}
 
-          {filteredTargets.length > 0 && (
+          {filteredSources.length > 0 && (
             <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-              {filteredTargets.map((target) => {
-                const selected = windowTargetKey(target) === selectedHwnd;
+              {filteredSources.map((source) => {
+                const selected = shareSourceKey(source) === selectedSourceId;
                 return (
                   <button
-                    key={windowTargetKey(target)}
-                    onClick={() => onSelect(target)}
+                    key={shareSourceKey(source)}
+                    onClick={() => onSelect(source)}
                     className={`rounded-lg border p-3 text-left transition hover:border-primary hover:bg-primary/5 ${
                       selected ? "border-primary bg-primary/10" : ""
                     }`}
-                    aria-label={`Select ${target.title}`}
+                    aria-label={`Select ${source.title}`}
                   >
-                    <WindowPreviewThumb target={target} />
+                    <ShareSourcePreviewThumb source={source} />
                     <div className="mt-3 min-w-0">
-                      <div className="truncate font-medium">{target.title}</div>
+                      <div className="flex items-center gap-2">
+                        <span className="truncate font-medium">{source.title}</span>
+                        <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
+                          {shareSourceKindLabel(source)}
+                        </span>
+                      </div>
                       <div className="mt-1 text-xs text-muted-foreground">
-                        {target.width}x{target.height} / PID {target.process_id}
+                        {source.subtitle}
                       </div>
-                      <div className="mt-1 truncate font-mono text-xs text-muted-foreground">
-                        {target.class_name}
-                      </div>
-                      {target.app_name && target.app_name !== target.title && (
+                      {source.class_name && (
+                        <div className="mt-1 truncate font-mono text-xs text-muted-foreground">
+                          {source.class_name}
+                        </div>
+                      )}
+                      {source.app_name && source.app_name !== source.title && (
                         <div className="mt-1 truncate text-xs text-muted-foreground">
-                          {target.app_name}
+                          {source.app_name}
                         </div>
                       )}
                     </div>
@@ -919,6 +1135,30 @@ function WindowPickerDialog({
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+function ShareSourcePreviewThumb({ source }: { source: CaptureShareSourceTarget }) {
+  return (
+    <div className="flex aspect-video w-full items-center justify-center overflow-hidden rounded border bg-muted">
+      {source.preview_data_url ? (
+        <img
+          src={source.preview_data_url}
+          alt=""
+          className="h-full w-full object-contain"
+          draggable={false}
+        />
+      ) : (
+        <div className="flex flex-col items-center gap-2 text-muted-foreground">
+          {source.source_kind === "screen" || source.source_kind === "portal" ? (
+            <Monitor className="h-5 w-5" />
+          ) : (
+            <ImageOff className="h-5 w-5" />
+          )}
+          <span className="text-xs">{shareSourceKindLabel(source)}</span>
+        </div>
+      )}
     </div>
   );
 }

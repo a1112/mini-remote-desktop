@@ -30,6 +30,54 @@ const previewTargets = baseTargets.map((target) => ({
   preview_height: 1,
 }));
 
+const windowsShareSources = [
+  {
+    id: "windows:screen:0",
+    platform: "windows",
+    source_kind: "screen",
+    native_id: "0",
+    title: "Primary display",
+    subtitle: "Windows.Graphics.Capture monitor source",
+    width: 1920,
+    height: 1080,
+    is_primary: true,
+    requires_system_picker: false,
+  },
+  ...previewTargets.map((target) => ({
+    id: `windows:window:${target.hwnd}`,
+    platform: "windows",
+    source_kind: "window",
+    native_id: target.hwnd,
+    title: target.title,
+    subtitle: `${target.width}x${target.height} / PID ${target.process_id}`,
+    width: target.width,
+    height: target.height,
+    is_primary: false,
+    requires_system_picker: false,
+    hwnd: target.hwnd,
+    class_name: target.class_name,
+    process_id: target.process_id,
+    preview_data_url: target.preview_data_url,
+    preview_width: target.preview_width,
+    preview_height: target.preview_height,
+  })),
+];
+
+const linuxShareSources = [
+  {
+    id: "linux:portal:system-picker",
+    platform: "linux",
+    source_kind: "portal",
+    native_id: "portal",
+    title: "System sharing picker",
+    subtitle: "Wayland requires the desktop portal to approve the final screen/window",
+    width: 0,
+    height: 0,
+    is_primary: true,
+    requires_system_picker: true,
+  },
+];
+
 describe("CaptureTestPage window picker", () => {
   it("starts Linux capture through the dedicated Linux scenario", async () => {
     const mockInvoke = getMockInvoke();
@@ -48,6 +96,12 @@ describe("CaptureTestPage window picker", () => {
           available_memory_modes: ["cpu"],
         });
       }
+      if (command === "test_list_capture_share_sources") {
+        return Promise.resolve(linuxShareSources);
+      }
+      if (command === "test_list_capture_share_sources_with_previews") {
+        return Promise.resolve(linuxShareSources);
+      }
       if (command === "test_start_run") {
         return Promise.resolve("run-linux");
       }
@@ -60,6 +114,8 @@ describe("CaptureTestPage window picker", () => {
     await waitFor(() => expect(linuxButton).not.toBeDisabled());
     fireEvent.click(linuxButton);
     fireEvent.click(screen.getByRole("button", { name: /启动测试/ }));
+    const dialog = await screen.findByRole("dialog", { name: /Share source picker/ });
+    fireEvent.click(within(dialog).getByRole("button", { name: /Select System sharing picker/ }));
 
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith(
@@ -71,6 +127,8 @@ describe("CaptureTestPage window picker", () => {
             encoder_type: "none",
             decoder_type: "none",
             input_source: "screen",
+            source_id: "linux:portal:system-picker",
+            source_kind: "portal",
             zero_copy: false,
             visual_preview: false,
           }),
@@ -95,6 +153,12 @@ describe("CaptureTestPage window picker", () => {
           available_renderers: ["d3d11"],
           available_memory_modes: ["cpu", "d3d11_shared"],
         });
+      }
+      if (command === "test_list_capture_share_sources") {
+        return Promise.resolve(windowsShareSources);
+      }
+      if (command === "test_list_capture_share_sources_with_previews") {
+        return Promise.resolve(windowsShareSources);
       }
       if (command === "test_start_run") {
         return Promise.resolve("run-1");
@@ -122,6 +186,8 @@ describe("CaptureTestPage window picker", () => {
     const startButton = await screen.findByRole("button", { name: /启动测试/ });
     await waitFor(() => expect(startButton).not.toBeDisabled());
     fireEvent.click(startButton);
+    const dialog = await screen.findByRole("dialog", { name: /Share source picker/ });
+    fireEvent.click(within(dialog).getByRole("button", { name: /Select Primary display/ }));
 
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("test_start_run", {
@@ -132,6 +198,8 @@ describe("CaptureTestPage window picker", () => {
           decoder_type: "none",
           duration_ms: 30_000,
           input_source: "screen",
+          source_id: "windows:screen:0",
+          source_kind: "screen",
           zero_copy: true,
           visual_preview: false,
         }),
@@ -155,6 +223,12 @@ describe("CaptureTestPage window picker", () => {
           available_renderers: ["d3d11"],
           available_memory_modes: ["cpu", "d3d11_shared"],
         });
+      }
+      if (command === "test_list_capture_share_sources") {
+        return Promise.resolve(windowsShareSources);
+      }
+      if (command === "test_list_capture_share_sources_with_previews") {
+        return Promise.resolve(windowsShareSources);
       }
       if (command === "test_start_run") {
         return Promise.resolve("run-1");
@@ -185,6 +259,8 @@ describe("CaptureTestPage window picker", () => {
     const startButton = await screen.findByRole("button", { name: /启动测试/ });
     await waitFor(() => expect(startButton).not.toBeDisabled());
     fireEvent.click(startButton);
+    const dialog = await screen.findByRole("dialog", { name: /Share source picker/ });
+    fireEvent.click(within(dialog).getByRole("button", { name: /Select Primary display/ }));
 
     expect(await screen.findByText("采集 P95")).toBeInTheDocument();
     expect(screen.getByText("源等待 P95")).toBeInTheDocument();
@@ -210,6 +286,12 @@ describe("CaptureTestPage window picker", () => {
           available_memory_modes: ["cpu", "d3d11_shared"],
         });
       }
+      if (command === "test_list_capture_share_sources") {
+        return Promise.resolve(windowsShareSources);
+      }
+      if (command === "test_list_capture_share_sources_with_previews") {
+        return Promise.resolve(windowsShareSources);
+      }
       if (command === "test_start_run") {
         return Promise.resolve("run-winrt");
       }
@@ -222,6 +304,8 @@ describe("CaptureTestPage window picker", () => {
     await waitFor(() => expect(winrtButton).not.toBeDisabled());
     fireEvent.click(winrtButton);
     fireEvent.click(screen.getByRole("button", { name: /启动测试/ }));
+    const dialog = await screen.findByRole("dialog", { name: /Share source picker/ });
+    fireEvent.click(within(dialog).getByRole("button", { name: /Select Primary display/ }));
 
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("test_start_run", {
@@ -232,6 +316,8 @@ describe("CaptureTestPage window picker", () => {
           decoder_type: "none",
           duration_ms: 30_000,
           input_source: "screen",
+          source_id: "windows:screen:0",
+          source_kind: "screen",
           zero_copy: true,
           visual_preview: false,
         }),
@@ -314,8 +400,11 @@ describe("CaptureTestPage window picker", () => {
       if (command === "test_list_window_capture_targets") {
         return Promise.resolve(baseTargets);
       }
-      if (command === "test_list_window_capture_targets_with_previews") {
-        return Promise.resolve(previewTargets);
+      if (command === "test_list_capture_share_sources") {
+        return Promise.resolve(windowsShareSources);
+      }
+      if (command === "test_list_capture_share_sources_with_previews") {
+        return Promise.resolve(windowsShareSources);
       }
       return Promise.resolve(null);
     });
@@ -331,10 +420,10 @@ describe("CaptureTestPage window picker", () => {
     await waitFor(() => expect(chooseWindowButton).not.toBeDisabled());
     fireEvent.click(chooseWindowButton);
 
-    const dialog = await screen.findByRole("dialog", { name: /Window picker/ });
+    const dialog = await screen.findByRole("dialog", { name: /Share source picker/ });
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith(
-        "test_list_window_capture_targets_with_previews",
+        "test_list_capture_share_sources_with_previews",
         { limit: 24 }
       );
     });
@@ -345,7 +434,7 @@ describe("CaptureTestPage window picker", () => {
     await waitFor(() => {
       expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     });
-    expect(screen.getByText("Editor")).toBeInTheDocument();
-    expect(screen.getByText(/1600x900/)).toBeInTheDocument();
+    expect(screen.getAllByText("Editor").length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/1600x900/).length).toBeGreaterThan(0);
   });
 });

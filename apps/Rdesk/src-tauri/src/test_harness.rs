@@ -147,6 +147,7 @@ pub struct TestConfig {
     pub transport: Option<TransportKind>,
     pub zero_copy: Option<bool>,
     pub input_source: Option<String>,
+    pub display_id: Option<String>,
     pub window_handle: Option<String>,
     pub visual_preview: Option<bool>,
 }
@@ -162,6 +163,7 @@ impl Default for TestConfig {
             transport: None,
             zero_copy: None,
             input_source: None,
+            display_id: None,
             window_handle: None,
             visual_preview: None,
         }
@@ -1469,11 +1471,12 @@ impl TestHarness {
                                     },
                                 )?
                             } else {
-                                WinrtCapture::from_monitor_index_shared_texture(0).map_err(
-                                    |error| {
+                                let monitor_index =
+                                    parse_display_index(config.display_id.as_deref())?;
+                                WinrtCapture::from_monitor_index_shared_texture(monitor_index)
+                                    .map_err(|error| {
                                         anyhow::anyhow!("WinRT shared capture init failed: {error}")
-                                    },
-                                )?
+                                    })?
                             };
                             let (width, height) = select_pipeline_dimensions(
                                 capture.width(),
@@ -1511,7 +1514,9 @@ impl TestHarness {
                                 let hwnd = parse_window_handle(config.window_handle.as_deref())?;
                                 WinrtMonitorCapture::new_window(hwnd)?
                             } else {
-                                WinrtMonitorCapture::new_primary()?
+                                WinrtMonitorCapture::new_monitor(parse_display_index(
+                                    config.display_id.as_deref(),
+                                )?)?
                             };
                             let (width, height) = select_pipeline_dimensions(
                                 capture.width(),
@@ -1538,6 +1543,11 @@ impl TestHarness {
                                 })?;
                                 MacosScreenCapture::new_window(window_id).map_err(|e| {
                                     anyhow::anyhow!("macOS window capture init failed: {:?}", e)
+                                })?
+                            } else if let Some(display_id) = config.display_id.as_deref() {
+                                let display_id = parse_display_id(display_id)?;
+                                MacosScreenCapture::new_display_id(display_id).map_err(|e| {
+                                    anyhow::anyhow!("macOS display capture init failed: {:?}", e)
                                 })?
                             } else {
                                 MacosScreenCapture::new_primary().map_err(|e| {
@@ -3204,7 +3214,11 @@ struct WinrtMonitorCapture {
 #[cfg(windows)]
 impl WinrtMonitorCapture {
     fn new_primary() -> Result<Self> {
-        let inner = WinrtCapture::from_monitor_index(0)
+        Self::new_monitor(0)
+    }
+
+    fn new_monitor(monitor_index: u32) -> Result<Self> {
+        let inner = WinrtCapture::from_monitor_index(monitor_index)
             .map_err(|error| anyhow::anyhow!("WinRT capture init failed: {error}"))?;
         Self::from_inner(inner, "WinRT capture")
     }
@@ -3275,6 +3289,38 @@ fn parse_window_handle(input: Option<&str>) -> Result<isize> {
     };
 
     Ok(value as isize)
+}
+
+fn parse_display_index(input: Option<&str>) -> Result<u32> {
+    let Some(input) = input else {
+        return Ok(0);
+    };
+    let value = parse_numeric_capture_source_id(input, "display index")?;
+    u32::try_from(value).map_err(|_| anyhow::anyhow!("display index out of range: {value}"))
+}
+
+fn parse_display_id(input: &str) -> Result<u32> {
+    let value = parse_numeric_capture_source_id(input, "display id")?;
+    u32::try_from(value).map_err(|_| anyhow::anyhow!("display id out of range: {value}"))
+}
+
+fn parse_numeric_capture_source_id(input: &str, label: &str) -> Result<usize> {
+    let trimmed = input.trim().rsplit(':').next().unwrap_or(input).trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("{label} is empty");
+    }
+
+    if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        return usize::from_str_radix(hex, 16)
+            .map_err(|error| anyhow::anyhow!("invalid {label} '{trimmed}': {error}"));
+    }
+
+    trimmed
+        .parse::<usize>()
+        .map_err(|error| anyhow::anyhow!("invalid {label} '{trimmed}': {error}"))
 }
 
 fn even_dimension(value: usize) -> usize {

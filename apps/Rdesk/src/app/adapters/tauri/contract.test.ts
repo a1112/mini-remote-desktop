@@ -750,6 +750,27 @@ describe('Tauri Adapter Contract', () => {
       );
     });
 
+    it('test_list_capture_share_sources calls correct command', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue([]);
+
+      await adapter.testListCaptureShareSources();
+
+      expect(mockInvoke).toHaveBeenCalledWith('test_list_capture_share_sources', undefined);
+    });
+
+    it('test_list_capture_share_sources_with_previews passes preview limit', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue([]);
+
+      await adapter.testListCaptureShareSourcesWithPreviews(12);
+
+      expect(mockInvoke).toHaveBeenCalledWith(
+        'test_list_capture_share_sources_with_previews',
+        { limit: 12 }
+      );
+    });
+
     it('test_harness_set_custom calls custom harness command', async () => {
       const mockInvoke = getMockInvoke();
       mockInvoke.mockResolvedValue(null);
