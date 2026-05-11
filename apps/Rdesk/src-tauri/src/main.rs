@@ -1560,6 +1560,10 @@ fn test_harness_set_custom(
         "software" | "software_h264" | "h264_software" | "software-h264" | "h264-software"
         | "openh264" => DecoderType::Software,
         "linux_h264" | "gstreamer_h264" | "vaapi_h264" => DecoderType::LinuxH264,
+        "linux_hevc" | "gstreamer_hevc" | "vaapi_hevc" => DecoderType::LinuxHevc,
+        "linux_hevc_main10" | "gstreamer_hevc_main10" | "vaapi_hevc_main10" => {
+            DecoderType::LinuxHevcMain10
+        }
         "videotoolbox" => DecoderType::VideoToolbox,
         _ => return Err(format!("Unsupported decoder type: {}", decoder)),
     };

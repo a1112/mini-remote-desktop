@@ -96,6 +96,8 @@ const encoderOptions: Option<EncoderType>[] = [
 const decoderOptions: Option<DecoderType>[] = [
   { value: "nvdec", label: "NVDEC" },
   { value: "linux_h264", label: "Linux H.264 HW" },
+  { value: "linux_hevc", label: "Linux HEVC HW" },
+  { value: "linux_hevc_main10", label: "Linux HEVC Main10 HW" },
   { value: "videotoolbox", label: "VideoToolbox" },
   { value: "software", label: "Software" },
   { value: "none", label: "Encode only" },
@@ -548,10 +550,26 @@ export function RemoteDisplayWindowPage() {
       setTransport("quic");
     }
     if (isHevcEncoder(encoder) && (decoder === "software" || decoder === "linux_h264")) {
+      const preferredLinuxDecoder = encoder === "nvenc_hevc_main10" ? "linux_hevc_main10" : "linux_hevc";
+      setDecoder(
+        capabilities?.available_decoders.includes("nvdec")
+          ? "nvdec"
+          : capabilities?.available_decoders.includes(preferredLinuxDecoder)
+            ? preferredLinuxDecoder
+            : "none"
+      );
+    }
+    if (
+      encoder === "nvenc_av1" &&
+      (decoder === "linux_h264" || decoder === "linux_hevc" || decoder === "linux_hevc_main10")
+    ) {
       setDecoder(capabilities?.available_decoders.includes("nvdec") ? "nvdec" : "none");
     }
-    if (encoder === "nvenc_av1" && decoder === "linux_h264") {
-      setDecoder(capabilities?.available_decoders.includes("nvdec") ? "nvdec" : "none");
+    if (
+      (encoder === "nvenc_h264" || encoder === "openh264" || encoder === "videotoolbox_h264") &&
+      (decoder === "linux_hevc" || decoder === "linux_hevc_main10")
+    ) {
+      setDecoder(capabilities?.available_decoders.includes("linux_h264") ? "linux_h264" : "software");
     }
   }, [capabilities?.available_decoders, decoder, encoder, transport]);
 

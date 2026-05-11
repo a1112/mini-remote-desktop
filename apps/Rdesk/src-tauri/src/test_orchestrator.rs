@@ -462,6 +462,10 @@ impl TestOrchestrator {
                     "software" | "software_h264" | "h264_software" | "software-h264"
                     | "h264-software" | "openh264" => DecoderType::Software,
                     "linux_h264" | "gstreamer_h264" | "vaapi_h264" => DecoderType::LinuxH264,
+                    "linux_hevc" | "gstreamer_hevc" | "vaapi_hevc" => DecoderType::LinuxHevc,
+                    "linux_hevc_main10" | "gstreamer_hevc_main10" | "vaapi_hevc_main10" => {
+                        DecoderType::LinuxHevcMain10
+                    }
                     "videotoolbox" => DecoderType::VideoToolbox,
                     other => anyhow::bail!("Unsupported decoder for {}: {}", scenario_id, other),
                 },
@@ -823,6 +827,12 @@ impl TestOrchestrator {
         {
             if mrd_decode::probe_linux_h264_hardware_available().is_ok() {
                 available_decoders.push("linux_h264".to_string());
+            }
+            if mrd_decode::probe_linux_hevc_hardware_available().is_ok() {
+                available_decoders.push("linux_hevc".to_string());
+            }
+            if mrd_decode::probe_linux_hevc_main10_hardware_available().is_ok() {
+                available_decoders.push("linux_hevc_main10".to_string());
             }
         }
 
@@ -2335,8 +2345,18 @@ fn decoder_supported_on_current_platform(decoder_type: &str) -> bool {
             | "h264-software"
             | "openh264"
     ) || matches!(decoder_type, "nvdec") && cfg!(windows)
-        || matches!(decoder_type, "linux_h264" | "gstreamer_h264" | "vaapi_h264")
-            && cfg!(target_os = "linux")
+        || matches!(
+            decoder_type,
+            "linux_h264"
+                | "gstreamer_h264"
+                | "vaapi_h264"
+                | "linux_hevc"
+                | "gstreamer_hevc"
+                | "vaapi_hevc"
+                | "linux_hevc_main10"
+                | "gstreamer_hevc_main10"
+                | "vaapi_hevc_main10"
+        ) && cfg!(target_os = "linux")
         || matches!(decoder_type, "videotoolbox")
             && cfg!(target_os = "macos")
             && videotoolbox_decoder_enabled()

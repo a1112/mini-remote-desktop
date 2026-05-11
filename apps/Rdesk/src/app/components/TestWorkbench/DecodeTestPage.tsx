@@ -8,7 +8,7 @@ import {
   useShowUnavailableCapabilities,
 } from "./useCapabilityVisibility";
 
-type DecoderType = "nvdec" | "software" | "linux_h264" | "videotoolbox";
+type DecoderType = "nvdec" | "software" | "linux_h264" | "linux_hevc" | "linux_hevc_main10" | "videotoolbox";
 type DecodeCodec = "h264" | "hevc" | "hevc_main10" | "av1";
 
 interface DecoderOption {
@@ -70,6 +70,20 @@ const DECODER_OPTIONS: DecoderOption[] = [
     icon: <Monitor className="h-5 w-5 text-emerald-500" />,
   },
   {
+    id: "linux_hevc",
+    name: "Linux HEVC HW",
+    description: "Linux GStreamer HEVC 硬件解码，当前输出 CPU RGB 帧用于闭环验证",
+    type: "hardware",
+    icon: <Monitor className="h-5 w-5 text-emerald-500" />,
+  },
+  {
+    id: "linux_hevc_main10",
+    name: "Linux HEVC Main10 HW",
+    description: "Linux GStreamer HEVC Main10 硬件解码，当前输出 CPU RGB 帧用于闭环验证",
+    type: "hardware",
+    icon: <Monitor className="h-5 w-5 text-emerald-500" />,
+  },
+  {
     id: "videotoolbox",
     name: "VideoToolbox",
     description: "macOS Apple H.264 硬件解码器，当前为实验路径",
@@ -88,14 +102,14 @@ const CODEC_OPTIONS: CodecOption[] = [
   {
     id: "hevc",
     name: "HEVC",
-    description: "NVENC HEVC -> NVDEC，Windows/NVIDIA 高压路径。",
-    supportedDecoders: ["nvdec"],
+    description: "NVENC HEVC -> 硬件解码，Windows/NVIDIA 与 Linux GStreamer 路径。",
+    supportedDecoders: ["nvdec", "linux_hevc", "linux_hevc_main10"],
   },
   {
     id: "hevc_main10",
     name: "HEVC Main10",
-    description: "10-bit HEVC -> NVDEC，验证 Main10 能力。",
-    supportedDecoders: ["nvdec"],
+    description: "10-bit HEVC -> 硬件解码，验证 Main10 能力。",
+    supportedDecoders: ["nvdec", "linux_hevc_main10"],
   },
   {
     id: "av1",
@@ -228,6 +242,19 @@ function buildDecodeRun(
         capture_type: "synthetic",
         encoder_type: "openh264",
         decoder_type: "linux_h264",
+        zero_copy: false,
+      },
+    };
+  }
+
+  if (decoder === "linux_hevc" || decoder === "linux_hevc_main10") {
+    return {
+      scenarioId: "custom",
+      config: {
+        ...common,
+        capture_type: "synthetic",
+        encoder_type: codec === "hevc_main10" ? "nvenc_hevc_main10" : "nvenc_hevc",
+        decoder_type: decoder,
         zero_copy: false,
       },
     };

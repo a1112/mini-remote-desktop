@@ -81,6 +81,22 @@ const LINUX_H264_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
     output_formats: RGB24_OUTPUTS,
 };
 
+#[cfg(target_os = "linux")]
+const LINUX_HEVC_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
+    id: "linux_hevc",
+    codec: CodecKind::Hevc,
+    runtime_status: RuntimeStatus::RuntimeBacked,
+    output_formats: RGB24_OUTPUTS,
+};
+
+#[cfg(target_os = "linux")]
+const LINUX_HEVC_MAIN10_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
+    id: "linux_hevc_main10",
+    codec: CodecKind::HevcMain10,
+    runtime_status: RuntimeStatus::RuntimeBacked,
+    output_formats: RGB24_OUTPUTS,
+};
+
 pub fn available_decoder_descriptors() -> Vec<DecoderDescriptor> {
     let mut descriptors = vec![
         H264_SOFTWARE_DESCRIPTOR.clone(),
@@ -91,7 +107,11 @@ pub fn available_decoder_descriptors() -> Vec<DecoderDescriptor> {
     ];
 
     #[cfg(target_os = "linux")]
-    descriptors.push(LINUX_H264_DESCRIPTOR.clone());
+    descriptors.extend([
+        LINUX_H264_DESCRIPTOR.clone(),
+        LINUX_HEVC_DESCRIPTOR.clone(),
+        LINUX_HEVC_MAIN10_DESCRIPTOR.clone(),
+    ]);
 
     descriptors
 }
@@ -100,6 +120,10 @@ pub fn create_decoder(id: &str) -> Result<Box<dyn VideoDecoder>, PipelineError> 
     match id {
         "h264_software" => Ok(Box::new(H264SoftwareDecoder::new()?)),
         "linux_h264" | "gstreamer_h264" | "vaapi_h264" => create_linux_h264_decoder(),
+        "linux_hevc" | "gstreamer_hevc" | "vaapi_hevc" => create_linux_hevc_decoder(),
+        "linux_hevc_main10" | "gstreamer_hevc_main10" | "vaapi_hevc_main10" => {
+            create_linux_hevc_main10_decoder()
+        }
         "nvdec" => Ok(Box::new(NvdecVideoDecoder::new()?)),
         "nvdec_hevc" => Ok(Box::new(NvdecVideoDecoder::new_hevc()?)),
         "nvdec_hevc_main10" => Ok(Box::new(NvdecVideoDecoder::new_hevc_main10()?)),
@@ -112,7 +136,7 @@ pub fn create_decoder(id: &str) -> Result<Box<dyn VideoDecoder>, PipelineError> 
 
 #[cfg(target_os = "linux")]
 pub fn probe_linux_h264_hardware_available() -> Result<String, PipelineError> {
-    let backend = select_linux_gst_h264_backend()?;
+    let backend = select_linux_gst_backend(LinuxGstCodec::H264)?;
     Ok(backend.label.to_string())
 }
 
@@ -124,14 +148,64 @@ pub fn probe_linux_h264_hardware_available() -> Result<String, PipelineError> {
 }
 
 #[cfg(target_os = "linux")]
+pub fn probe_linux_hevc_hardware_available() -> Result<String, PipelineError> {
+    let backend = select_linux_gst_backend(LinuxGstCodec::Hevc)?;
+    Ok(backend.label.to_string())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn probe_linux_hevc_hardware_available() -> Result<String, PipelineError> {
+    Err(PipelineError::Message(
+        "Linux HEVC hardware decode is only available on Linux".to_string(),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+pub fn probe_linux_hevc_main10_hardware_available() -> Result<String, PipelineError> {
+    let backend = select_linux_gst_backend(LinuxGstCodec::HevcMain10)?;
+    Ok(backend.label.to_string())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn probe_linux_hevc_main10_hardware_available() -> Result<String, PipelineError> {
+    Err(PipelineError::Message(
+        "Linux HEVC Main10 hardware decode is only available on Linux".to_string(),
+    ))
+}
+
+#[cfg(target_os = "linux")]
 fn create_linux_h264_decoder() -> Result<Box<dyn VideoDecoder>, PipelineError> {
-    Ok(Box::new(LinuxGstH264Decoder::new()?))
+    Ok(Box::new(LinuxGstDecoder::new(LinuxGstCodec::H264)?))
 }
 
 #[cfg(not(target_os = "linux"))]
 fn create_linux_h264_decoder() -> Result<Box<dyn VideoDecoder>, PipelineError> {
     Err(PipelineError::Message(
         "Linux H.264 hardware decode is only available on Linux".to_string(),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn create_linux_hevc_decoder() -> Result<Box<dyn VideoDecoder>, PipelineError> {
+    Ok(Box::new(LinuxGstDecoder::new(LinuxGstCodec::Hevc)?))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn create_linux_hevc_decoder() -> Result<Box<dyn VideoDecoder>, PipelineError> {
+    Err(PipelineError::Message(
+        "Linux HEVC hardware decode is only available on Linux".to_string(),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn create_linux_hevc_main10_decoder() -> Result<Box<dyn VideoDecoder>, PipelineError> {
+    Ok(Box::new(LinuxGstDecoder::new(LinuxGstCodec::HevcMain10)?))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn create_linux_hevc_main10_decoder() -> Result<Box<dyn VideoDecoder>, PipelineError> {
+    Err(PipelineError::Message(
+        "Linux HEVC Main10 hardware decode is only available on Linux".to_string(),
     ))
 }
 
@@ -178,25 +252,58 @@ impl NvdecVideoDecoder {
 
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy)]
-struct LinuxGstH264Backend {
+enum LinuxGstCodec {
+    H264,
+    Hevc,
+    HevcMain10,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxGstCodec {
+    fn parser_element(self) -> &'static str {
+        match self {
+            Self::H264 => "h264parse",
+            Self::Hevc | Self::HevcMain10 => "h265parse",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::H264 => "H.264",
+            Self::Hevc => "HEVC",
+            Self::HevcMain10 => "HEVC Main10",
+        }
+    }
+
+    fn parse_dimensions(self, access_unit: &[u8]) -> Result<Option<(usize, usize)>, PipelineError> {
+        match self {
+            Self::H264 => parse_h264_dimensions(access_unit),
+            Self::Hevc | Self::HevcMain10 => parse_hevc_dimensions(access_unit),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy)]
+struct LinuxGstBackend {
     label: &'static str,
     required_elements: &'static [&'static str],
     pipeline_elements: &'static [&'static str],
 }
 
 #[cfg(target_os = "linux")]
-const LINUX_GST_H264_BACKENDS: &[LinuxGstH264Backend] = &[
-    LinuxGstH264Backend {
+const LINUX_GST_H264_BACKENDS: &[LinuxGstBackend] = &[
+    LinuxGstBackend {
         label: "GStreamer VA H.264 decoder",
         required_elements: &["vah264dec", "vapostproc"],
         pipeline_elements: &["vah264dec", "!", "vapostproc"],
     },
-    LinuxGstH264Backend {
+    LinuxGstBackend {
         label: "GStreamer VA-API H.264 decoder",
         required_elements: &["vaapih264dec", "vaapipostproc"],
         pipeline_elements: &["vaapih264dec", "!", "vaapipostproc"],
     },
-    LinuxGstH264Backend {
+    LinuxGstBackend {
         label: "GStreamer NVIDIA H.264 decoder",
         required_elements: &["nvh264dec", "cudadownload"],
         pipeline_elements: &["nvh264dec", "!", "cudadownload"],
@@ -204,7 +311,26 @@ const LINUX_GST_H264_BACKENDS: &[LinuxGstH264Backend] = &[
 ];
 
 #[cfg(target_os = "linux")]
-fn select_linux_gst_h264_backend() -> Result<LinuxGstH264Backend, PipelineError> {
+const LINUX_GST_HEVC_BACKENDS: &[LinuxGstBackend] = &[
+    LinuxGstBackend {
+        label: "GStreamer VA HEVC decoder",
+        required_elements: &["vah265dec", "vapostproc"],
+        pipeline_elements: &["vah265dec", "!", "vapostproc"],
+    },
+    LinuxGstBackend {
+        label: "GStreamer VA-API HEVC decoder",
+        required_elements: &["vaapih265dec", "vaapipostproc"],
+        pipeline_elements: &["vaapih265dec", "!", "vaapipostproc"],
+    },
+    LinuxGstBackend {
+        label: "GStreamer NVIDIA HEVC decoder",
+        required_elements: &["nvh265dec", "cudadownload"],
+        pipeline_elements: &["nvh265dec", "!", "cudadownload"],
+    },
+];
+
+#[cfg(target_os = "linux")]
+fn select_linux_gst_backend(codec: LinuxGstCodec) -> Result<LinuxGstBackend, PipelineError> {
     if Command::new("gst-inspect-1.0")
         .arg("--version")
         .stdout(Stdio::null())
@@ -217,7 +343,12 @@ fn select_linux_gst_h264_backend() -> Result<LinuxGstH264Backend, PipelineError>
         ));
     }
 
-    LINUX_GST_H264_BACKENDS
+    let backends = match codec {
+        LinuxGstCodec::H264 => LINUX_GST_H264_BACKENDS,
+        LinuxGstCodec::Hevc | LinuxGstCodec::HevcMain10 => LINUX_GST_HEVC_BACKENDS,
+    };
+
+    backends
         .iter()
         .copied()
         .find(|backend| {
@@ -227,9 +358,10 @@ fn select_linux_gst_h264_backend() -> Result<LinuxGstH264Backend, PipelineError>
                 .all(|element| gst_element_available(element))
         })
         .ok_or_else(|| {
-            PipelineError::Message(
-                "No GStreamer hardware H.264 decoder was found; expected vah264dec/vapostproc, vaapih264dec/vaapipostproc, or nvh264dec/cudadownload".to_string(),
-            )
+            PipelineError::Message(format!(
+                "No GStreamer hardware {} decoder was found",
+                codec.label()
+            ))
         })
 }
 
@@ -245,8 +377,9 @@ fn gst_element_available(element: &str) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-pub struct LinuxGstH264Decoder {
-    backend: LinuxGstH264Backend,
+pub struct LinuxGstDecoder {
+    codec: LinuxGstCodec,
+    backend: LinuxGstBackend,
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     frame_rx: Option<mpsc::Receiver<Vec<u8>>>,
@@ -257,10 +390,11 @@ pub struct LinuxGstH264Decoder {
 }
 
 #[cfg(target_os = "linux")]
-impl LinuxGstH264Decoder {
-    pub fn new() -> Result<Self, PipelineError> {
+impl LinuxGstDecoder {
+    fn new(codec: LinuxGstCodec) -> Result<Self, PipelineError> {
         Ok(Self {
-            backend: select_linux_gst_h264_backend()?,
+            codec,
+            backend: select_linux_gst_backend(codec)?,
             child: None,
             stdin: None,
             frame_rx: None,
@@ -281,7 +415,7 @@ impl LinuxGstH264Decoder {
             .and_then(|pixels| pixels.checked_mul(3))
             .ok_or_else(|| PipelineError::Message("decoded RGB frame size overflow".to_string()))?;
 
-        let mut args = vec!["-q", "fdsrc", "fd=0", "!", "h264parse", "!"];
+        let mut args = vec!["-q", "fdsrc", "fd=0", "!", self.codec.parser_element(), "!"];
         args.extend_from_slice(self.backend.pipeline_elements);
         args.extend_from_slice(&[
             "!",
@@ -302,7 +436,8 @@ impl LinuxGstH264Decoder {
             .spawn()
             .map_err(|error| {
                 PipelineError::Message(format!(
-                    "spawn GStreamer H.264 decoder failed ({}): {error}",
+                    "spawn GStreamer {} decoder failed ({}): {error}",
+                    self.codec.label(),
                     self.backend.label
                 ))
             })?;
@@ -332,7 +467,8 @@ impl LinuxGstH264Decoder {
             .and_then(|()| stdin.flush())
             .map_err(|error| {
                 PipelineError::Message(format!(
-                    "write H.264 access unit to GStreamer decoder failed: {error}"
+                    "write {} access unit to GStreamer decoder failed: {error}",
+                    self.codec.label()
                 ))
             })
     }
@@ -359,7 +495,7 @@ impl LinuxGstH264Decoder {
 }
 
 #[cfg(target_os = "linux")]
-impl Drop for LinuxGstH264Decoder {
+impl Drop for LinuxGstDecoder {
     fn drop(&mut self) {
         drop(self.stdin.take());
         if let Some(mut child) = self.child.take() {
@@ -370,17 +506,18 @@ impl Drop for LinuxGstH264Decoder {
 }
 
 #[cfg(target_os = "linux")]
-impl VideoDecoder for LinuxGstH264Decoder {
+impl VideoDecoder for LinuxGstDecoder {
     fn push_access_unit(&mut self, access_unit: &[u8]) -> Result<(), PipelineError> {
         if access_unit.is_empty() {
             return Ok(());
         }
 
-        if let Some((width, height)) = parse_h264_dimensions(access_unit)? {
+        if let Some((width, height)) = self.codec.parse_dimensions(access_unit)? {
             if let Some((current_width, current_height)) = self.dimensions {
                 if (width, height) != (current_width, current_height) {
                     return Err(PipelineError::Message(format!(
-                        "Linux H.264 decoder does not support stream size changes yet: {current_width}x{current_height} -> {width}x{height}"
+                        "Linux {} decoder does not support stream size changes yet: {current_width}x{current_height} -> {width}x{height}",
+                        self.codec.label()
                     )));
                 }
             } else {
@@ -395,10 +532,10 @@ impl VideoDecoder for LinuxGstH264Decoder {
                 let pending = std::mem::take(&mut self.pending_stream);
                 self.write_access_unit(&pending)?;
             } else if self.pending_stream.len() > 8 * 1024 * 1024 {
-                return Err(PipelineError::Message(
-                    "Linux H.264 decoder is waiting for an SPS NAL to discover stream dimensions"
-                        .to_string(),
-                ));
+                return Err(PipelineError::Message(format!(
+                    "Linux {} decoder is waiting for an SPS NAL to discover stream dimensions",
+                    self.codec.label()
+                )));
             }
         } else {
             self.write_access_unit(access_unit)?;
@@ -481,6 +618,21 @@ fn parse_h264_dimensions(access_unit: &[u8]) -> Result<Option<(usize, usize)>, P
         }
         if nal[0] & 0x1f == 7 {
             return parse_sps_dimensions(&nal[1..]).map(Some);
+        }
+    }
+
+    Ok(None)
+}
+
+fn parse_hevc_dimensions(access_unit: &[u8]) -> Result<Option<(usize, usize)>, PipelineError> {
+    for nal in annex_b_nals(access_unit) {
+        if nal.len() < 3 {
+            continue;
+        }
+
+        let nal_unit_type = (nal[0] >> 1) & 0x3f;
+        if nal_unit_type == 33 {
+            return parse_hevc_sps_dimensions(&nal[2..]).map(Some);
         }
     }
 
@@ -693,6 +845,155 @@ fn parse_sps_dimensions(sps: &[u8]) -> Result<(usize, usize), PipelineError> {
     Ok((display_width as usize, display_height as usize))
 }
 
+fn parse_hevc_sps_dimensions(sps: &[u8]) -> Result<(usize, usize), PipelineError> {
+    let rbsp = remove_emulation_prevention_bytes(sps);
+    let mut bits = BitReader::new(&rbsp);
+
+    bits.read_bits(4)
+        .ok_or_else(|| PipelineError::Message("invalid HEVC SPS: missing VPS id".to_string()))?;
+    let max_sub_layers_minus1 = bits.read_bits(3).ok_or_else(|| {
+        PipelineError::Message("invalid HEVC SPS: missing sub-layer count".to_string())
+    })? as usize;
+    bits.read_bit().ok_or_else(|| {
+        PipelineError::Message("invalid HEVC SPS: missing temporal nesting flag".to_string())
+    })?;
+
+    skip_hevc_profile_tier_level(&mut bits, max_sub_layers_minus1)?;
+
+    bits.read_ue().ok_or_else(|| {
+        PipelineError::Message("invalid HEVC SPS: missing sequence id".to_string())
+    })?;
+    let chroma_format_idc = bits.read_ue().ok_or_else(|| {
+        PipelineError::Message("invalid HEVC SPS: missing chroma format".to_string())
+    })?;
+    let separate_colour_plane = if chroma_format_idc == 3 {
+        bits.read_bit().ok_or_else(|| {
+            PipelineError::Message(
+                "invalid HEVC SPS: missing separate colour plane flag".to_string(),
+            )
+        })?
+    } else {
+        false
+    };
+    let pic_width_in_luma_samples = bits
+        .read_ue()
+        .ok_or_else(|| PipelineError::Message("invalid HEVC SPS: missing width".to_string()))?;
+    let pic_height_in_luma_samples = bits
+        .read_ue()
+        .ok_or_else(|| PipelineError::Message("invalid HEVC SPS: missing height".to_string()))?;
+
+    let mut crop_left = 0_u32;
+    let mut crop_right = 0_u32;
+    let mut crop_top = 0_u32;
+    let mut crop_bottom = 0_u32;
+    if bits.read_bit().ok_or_else(|| {
+        PipelineError::Message("invalid HEVC SPS: missing conformance window flag".to_string())
+    })? {
+        crop_left = bits
+            .read_ue()
+            .ok_or_else(|| PipelineError::Message("invalid HEVC SPS: crop left".to_string()))?;
+        crop_right = bits
+            .read_ue()
+            .ok_or_else(|| PipelineError::Message("invalid HEVC SPS: crop right".to_string()))?;
+        crop_top = bits
+            .read_ue()
+            .ok_or_else(|| PipelineError::Message("invalid HEVC SPS: crop top".to_string()))?;
+        crop_bottom = bits
+            .read_ue()
+            .ok_or_else(|| PipelineError::Message("invalid HEVC SPS: crop bottom".to_string()))?;
+    }
+
+    let (crop_unit_x, crop_unit_y) = hevc_crop_units(chroma_format_idc, separate_colour_plane);
+    let crop_width = (crop_left + crop_right)
+        .checked_mul(crop_unit_x)
+        .ok_or_else(|| {
+            PipelineError::Message("invalid HEVC SPS: crop width overflow".to_string())
+        })?;
+    let crop_height = (crop_top + crop_bottom)
+        .checked_mul(crop_unit_y)
+        .ok_or_else(|| {
+            PipelineError::Message("invalid HEVC SPS: crop height overflow".to_string())
+        })?;
+    let display_width = pic_width_in_luma_samples
+        .checked_sub(crop_width)
+        .ok_or_else(|| {
+            PipelineError::Message("invalid HEVC SPS: crop exceeds width".to_string())
+        })?;
+    let display_height = pic_height_in_luma_samples
+        .checked_sub(crop_height)
+        .ok_or_else(|| {
+            PipelineError::Message("invalid HEVC SPS: crop exceeds height".to_string())
+        })?;
+
+    if display_width == 0 || display_height == 0 {
+        return Err(PipelineError::Message(
+            "invalid HEVC SPS: zero-sized frame".to_string(),
+        ));
+    }
+
+    Ok((display_width as usize, display_height as usize))
+}
+
+fn skip_hevc_profile_tier_level(
+    bits: &mut BitReader<'_>,
+    max_sub_layers_minus1: usize,
+) -> Result<(), PipelineError> {
+    skip_hevc_profile_info(bits)?;
+    bits.skip_bits(8).ok_or_else(|| {
+        PipelineError::Message("invalid HEVC SPS: missing general level".to_string())
+    })?;
+
+    let mut sub_layer_profile_present = vec![false; max_sub_layers_minus1];
+    let mut sub_layer_level_present = vec![false; max_sub_layers_minus1];
+    for index in 0..max_sub_layers_minus1 {
+        sub_layer_profile_present[index] = bits.read_bit().ok_or_else(|| {
+            PipelineError::Message("invalid HEVC SPS: sub-layer profile flag".to_string())
+        })?;
+        sub_layer_level_present[index] = bits.read_bit().ok_or_else(|| {
+            PipelineError::Message("invalid HEVC SPS: sub-layer level flag".to_string())
+        })?;
+    }
+
+    if max_sub_layers_minus1 > 0 {
+        for _ in max_sub_layers_minus1..8 {
+            bits.skip_bits(2).ok_or_else(|| {
+                PipelineError::Message("invalid HEVC SPS: reserved sub-layer bits".to_string())
+            })?;
+        }
+    }
+
+    for index in 0..max_sub_layers_minus1 {
+        if sub_layer_profile_present[index] {
+            skip_hevc_profile_info(bits)?;
+        }
+        if sub_layer_level_present[index] {
+            bits.skip_bits(8).ok_or_else(|| {
+                PipelineError::Message("invalid HEVC SPS: sub-layer level".to_string())
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
+fn skip_hevc_profile_info(bits: &mut BitReader<'_>) -> Result<(), PipelineError> {
+    bits.skip_bits(2 + 1 + 5 + 32 + 4 + 44)
+        .ok_or_else(|| PipelineError::Message("invalid HEVC SPS: profile tier".to_string()))
+}
+
+fn hevc_crop_units(chroma_format_idc: u32, separate_colour_plane: bool) -> (u32, u32) {
+    let chroma_array_type = if separate_colour_plane {
+        0
+    } else {
+        chroma_format_idc
+    };
+    match chroma_array_type {
+        1 => (2, 2),
+        2 => (2, 1),
+        _ => (1, 1),
+    }
+}
+
 fn remove_emulation_prevention_bytes(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len());
     let mut zero_count = 0_u8;
@@ -762,6 +1063,13 @@ impl<'a> BitReader<'a> {
             value = (value << 1) | u32::from(self.read_bit()?);
         }
         Some(value)
+    }
+
+    fn skip_bits(&mut self, count: usize) -> Option<()> {
+        for _ in 0..count {
+            self.read_bit()?;
+        }
+        Some(())
     }
 
     fn read_ue(&mut self) -> Option<u32> {
@@ -871,12 +1179,14 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn exposes_linux_h264_descriptor_on_linux() {
+    fn exposes_linux_hardware_decode_descriptors_on_linux() {
         let ids = available_decoder_descriptors()
             .into_iter()
             .map(|descriptor| descriptor.id)
             .collect::<Vec<_>>();
 
         assert!(ids.contains(&"linux_h264"));
+        assert!(ids.contains(&"linux_hevc"));
+        assert!(ids.contains(&"linux_hevc_main10"));
     }
 }

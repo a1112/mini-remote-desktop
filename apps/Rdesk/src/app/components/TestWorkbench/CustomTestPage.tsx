@@ -141,6 +141,16 @@ const DECODER_OPTIONS: DecoderOption[] = [
     description: "Linux GStreamer H.264 硬件解码 - 当前输出 CPU RGB 帧",
   },
   {
+    id: "linux_hevc",
+    name: "Linux HEVC HW",
+    description: "Linux GStreamer HEVC 硬件解码 - 当前输出 CPU RGB 帧",
+  },
+  {
+    id: "linux_hevc_main10",
+    name: "Linux HEVC Main10 HW",
+    description: "Linux GStreamer HEVC Main10 硬件解码 - 当前输出 CPU RGB 帧",
+  },
+  {
     id: "videotoolbox",
     name: "VideoToolbox",
     description: "macOS VideoToolbox - Apple 硬件 H.264 解码",
@@ -320,11 +330,28 @@ export function CustomTestPage() {
     if (selectedEncoder === "nvenc_av1" && selectedDecoder === "linux_h264") {
       return "Linux H.264 硬解当前只接入 H.264，不能解码 NVENC AV1 输出。";
     }
+    if (
+      selectedEncoder === "nvenc_av1" &&
+      (selectedDecoder === "linux_hevc" || selectedDecoder === "linux_hevc_main10")
+    ) {
+      return "Linux HEVC 硬解不能解码 NVENC AV1 输出。";
+    }
     if (isHevcEncoder(selectedEncoder) && selectedDecoder === "software") {
       return "NVENC HEVC 当前只支持 NVDEC 或 encode-only 链路，软件 HEVC 解码链路尚未接入。";
     }
     if (isHevcEncoder(selectedEncoder) && selectedDecoder === "linux_h264") {
       return "Linux H.264 硬解当前只接入 H.264，不能解码 NVENC HEVC 输出。";
+    }
+    if (selectedEncoder === "nvenc_hevc_main10" && selectedDecoder === "linux_hevc") {
+      return "NVENC HEVC Main10 请使用 Linux HEVC Main10 硬解路径。";
+    }
+    if (
+      (selectedEncoder === "nvenc_h264" ||
+        selectedEncoder === "openh264" ||
+        selectedEncoder === "videotoolbox_h264") &&
+      (selectedDecoder === "linux_hevc" || selectedDecoder === "linux_hevc_main10")
+    ) {
+      return "Linux HEVC 硬解不能解码 H.264 输出。";
     }
     if (isHevcEncoder(selectedEncoder) && selectedTransport === "webrtc") {
       return "HEVC WebRTC RTP 打包尚未接入，请使用 QUIC Datagram 或 Loopback。";

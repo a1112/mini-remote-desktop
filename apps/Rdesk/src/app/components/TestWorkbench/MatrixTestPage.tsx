@@ -81,6 +81,16 @@ const MATRIX_DIMENSIONS: MatrixDimension[] = [
         defaultEnabledOn: ["linux"],
       },
       {
+        id: "linux_hevc",
+        name: "Linux HEVC HW",
+        enabled: false,
+      },
+      {
+        id: "linux_hevc_main10",
+        name: "Linux HEVC Main10 HW",
+        enabled: false,
+      },
+      {
         id: "videotoolbox",
         name: "VideoToolbox",
         enabled: false,
@@ -193,7 +203,7 @@ function defaultEncodersForOs(os: HostOs): string[] {
 function defaultDecodersForOs(os: HostOs): string[] {
   if (os === "windows") return ["nvdec", "software", "none"];
   if (os === "macos") return ["software", "none"];
-  if (os === "linux") return ["linux_h264", "software", "none"];
+  if (os === "linux") return ["linux_h264", "linux_hevc", "linux_hevc_main10", "software", "none"];
   return ["software", "none"];
 }
 
@@ -386,6 +396,9 @@ function unsupportedMatrixReason(config: TestConfig): string | null {
   if (isHevcEncoder(config.encoder_type) && config.decoder_type === "linux_h264") {
     return "Linux H.264 hardware decoder cannot decode NVENC HEVC output";
   }
+  if (config.encoder_type === "nvenc_hevc_main10" && config.decoder_type === "linux_hevc") {
+    return "NVENC HEVC Main10 requires the Linux HEVC Main10 decoder path";
+  }
   if (isHevcEncoder(config.encoder_type) && config.transport_kind === "webrtc") {
     return "HEVC WebRTC RTP packetizer is not implemented; use QUIC or loopback";
   }
@@ -394,6 +407,20 @@ function unsupportedMatrixReason(config: TestConfig): string | null {
   }
   if (config.encoder_type === "nvenc_av1" && config.decoder_type === "linux_h264") {
     return "Linux H.264 hardware decoder cannot decode NVENC AV1 output";
+  }
+  if (
+    config.encoder_type === "nvenc_av1" &&
+    (config.decoder_type === "linux_hevc" || config.decoder_type === "linux_hevc_main10")
+  ) {
+    return "Linux HEVC hardware decoder cannot decode NVENC AV1 output";
+  }
+  if (
+    (config.encoder_type === "nvenc_h264" ||
+      config.encoder_type === "openh264" ||
+      config.encoder_type === "videotoolbox_h264") &&
+    (config.decoder_type === "linux_hevc" || config.decoder_type === "linux_hevc_main10")
+  ) {
+    return "Linux HEVC hardware decoder cannot decode H.264 output";
   }
   if (
     config.zero_copy &&
