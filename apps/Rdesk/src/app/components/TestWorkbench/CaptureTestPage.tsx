@@ -76,6 +76,7 @@ interface CaptureMetrics {
   encode_latency_p95_ms: number;
   decode_latency_p95_ms: number;
   total_latency_p95_ms: number;
+  error_message?: string | null;
 }
 
 function summarizeWindowProbeArtifacts(artifacts: Artifact[]): string | null {
@@ -274,6 +275,11 @@ export function CaptureTestPage() {
       .map(shareSourceToWindowTarget)
       .find((target) => windowTargetKey(target) === selectedWindowHwnd);
   const performanceNote = capturePerformanceNote(selectedCapture, captureScope);
+  const waitingForPortalFrame =
+    isRunning &&
+    selectedShareSource?.requires_system_picker &&
+    !startError &&
+    (metrics?.frame_count ?? 0) === 0;
 
   const applyWindowTargets = (targets: WindowCaptureTarget[]) => {
     setWindowTargets(targets);
@@ -354,12 +360,17 @@ export function CaptureTestPage() {
     if (!isRunning) return;
 
     const interval = setInterval(async () => {
-      // Get metrics from test harness
-      const result = await commands.testHarnessGetMetrics();
+      const [result, runResult] = await Promise.all([
+        commands.testHarnessGetMetrics(),
+        activeRunId ? commands.testGetRun(activeRunId) : Promise.resolve(null),
+      ]);
       if (result.ok) {
         if (!result.value.is_running) {
           setIsRunning(false);
           setActiveRunId(null);
+        }
+        if (result.value.error_message) {
+          setStartError(result.value.error_message);
         }
         const sourceWaitLatencyP95 =
           result.value.source_wait_latency_p95_ms ?? result.value.capture_latency_p95_ms;
@@ -378,12 +389,27 @@ export function CaptureTestPage() {
           encode_latency_p95_ms: result.value.encode_latency_p95_ms,
           decode_latency_p95_ms: result.value.decode_latency_p95_ms,
           total_latency_p95_ms: result.value.total_latency_p95_ms,
+          error_message: result.value.error_message ?? null,
         });
+      }
+
+      if (runResult?.ok && runResult.value) {
+        const run = runResult.value;
+        if (run.status !== "running" && run.status !== "preparing" && run.status !== "queued") {
+          setIsRunning(false);
+          setActiveRunId(null);
+          const errorMessage =
+            run.summary?.error_message ??
+            (run.status === "failed" ? "采集测试失败" : null);
+          if (errorMessage) setStartError(errorMessage);
+        }
+      } else if (runResult && !runResult.ok) {
+        setStartError(runResult.error.message);
       }
     }, 200);
 
     return () => clearInterval(interval);
-  }, [isRunning]);
+  }, [activeRunId, isRunning]);
 
   useEffect(() => {
     if (!isWindowMode) return;
@@ -749,6 +775,8 @@ export function CaptureTestPage() {
                     {shareSourceKindLabel(selectedShareSource)}
                     {selectedShareSource.width > 0 && selectedShareSource.height > 0
                       ? ` / ${selectedShareSource.width}x${selectedShareSource.height}`
+                      : selectedShareSource.requires_system_picker
+                      ? " / 等待系统选择"
                       : ""}
                     {selectedShareSource.requires_system_picker ? " / requires OS approval" : ""}
                   </div>
@@ -933,6 +961,11 @@ export function CaptureTestPage() {
         )}
       </div>
       {startError && <p className="text-sm text-red-600 mb-6">{startError}</p>}
+      {waitingForPortalFrame && (
+        <div className="mb-6 rounded border border-cyan-200 bg-cyan-50 px-3 py-2 text-sm text-cyan-900 dark:border-cyan-900/40 dark:bg-cyan-950/30 dark:text-cyan-100">
+          正在等待系统屏幕共享授权或第一帧。请在系统弹窗中选择屏幕/窗口并点击共享；授权完成前 FPS 和分辨率会保持 0。
+        </div>
+      )}
 
       {/* Metrics */}
       {metrics && (

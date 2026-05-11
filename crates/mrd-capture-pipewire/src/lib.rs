@@ -15,7 +15,7 @@ use std::io::Read;
 #[cfg(feature = "pipewire")]
 use std::os::fd::{AsRawFd, OwnedFd};
 #[cfg(feature = "pipewire")]
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
 const DEFAULT_WIDTH: u32 = 1920;
@@ -545,6 +545,7 @@ pub struct PipeWireScreenCapture {
     portal_node_id: Option<u32>,
     gst_child: Option<Child>,
     gst_stdout: Option<ChildStdout>,
+    gst_stderr: Option<ChildStderr>,
 }
 
 #[cfg(feature = "pipewire")]
@@ -558,6 +559,7 @@ impl PipeWireScreenCapture {
             portal_node_id: None,
             gst_child: None,
             gst_stdout: None,
+            gst_stderr: None,
         })
     }
 
@@ -603,6 +605,7 @@ impl PipeWireScreenCapture {
             &mut data,
             Duration::from_millis(1_500),
             self.gst_child.as_mut(),
+            self.gst_stderr.as_mut(),
         )?;
 
         let timestamp = SystemTime::now()
@@ -680,7 +683,7 @@ impl PipeWireScreenCapture {
             .arg("sync=false")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
 
         unsafe {
             command.pre_exec(move || {
@@ -703,8 +706,12 @@ impl PipeWireScreenCapture {
         let stdout = child.stdout.take().ok_or_else(|| {
             PipewireCaptureError::PipeWireError("gst-launch stdout unavailable".to_string())
         })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            PipewireCaptureError::PipeWireError("gst-launch stderr unavailable".to_string())
+        })?;
 
         self.gst_stdout = Some(stdout);
+        self.gst_stderr = Some(stderr);
         self.gst_child = Some(child);
         Ok(())
     }
@@ -716,6 +723,7 @@ fn read_exact_with_timeout(
     data: &mut [u8],
     timeout: Duration,
     mut child: Option<&mut Child>,
+    mut stderr: Option<&mut ChildStderr>,
 ) -> Result<(), PipelineError> {
     let fd = stdout.as_raw_fd();
     let start = Instant::now();
@@ -732,8 +740,9 @@ fn read_exact_with_timeout(
             if let Some(status) = process.try_wait().map_err(|error| {
                 PipelineError::message(format!("check PipeWire GStreamer process failed: {error}"))
             })? {
+                let stderr_preview = read_gstreamer_stderr(stderr.as_deref_mut());
                 return Err(PipelineError::message(format!(
-                    "PipeWire GStreamer process exited before a full frame: {status}"
+                    "PipeWire GStreamer process exited before a full frame: {status}{stderr_preview}"
                 )));
             }
         }
@@ -760,9 +769,10 @@ fn read_exact_with_timeout(
             continue;
         }
         if poll_fd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            let stderr_preview = read_gstreamer_stderr(stderr.as_deref_mut());
             return Err(PipelineError::message(format!(
-                "PipeWire frame pipe closed or errored: revents={}",
-                poll_fd.revents
+                "PipeWire frame pipe closed or errored: revents={}{}",
+                poll_fd.revents, stderr_preview
             )));
         }
 
@@ -778,6 +788,49 @@ fn read_exact_with_timeout(
     }
 
     Ok(())
+}
+
+#[cfg(feature = "pipewire")]
+fn read_gstreamer_stderr(stderr: Option<&mut ChildStderr>) -> String {
+    let Some(stderr) = stderr else {
+        return String::new();
+    };
+
+    let fd = stderr.as_raw_fd();
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            let _ = libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+
+    let mut bytes = Vec::new();
+    let mut buffer = [0u8; 4096];
+    loop {
+        match stderr.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                bytes.extend_from_slice(&buffer[..count]);
+                if bytes.len() >= 8192 {
+                    break;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => return format!("; read gst stderr failed: {error}"),
+        }
+    }
+
+    let text = String::from_utf8_lossy(&bytes);
+    let text = text.trim();
+    if text.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; gst stderr: {}",
+            text.lines().take(12).collect::<Vec<_>>().join(" | ")
+        )
+    }
 }
 
 #[cfg(feature = "pipewire")]
