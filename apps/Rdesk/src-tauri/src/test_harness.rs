@@ -40,6 +40,9 @@ const WEB_PREVIEW_FRAME_UPDATE_INTERVAL: usize = 8;
 const ENCODED_ACCESS_UNIT_SUBSCRIBER_QUEUE_DEPTH: usize = 1;
 const NATIVE_RENDER_FRAME_TIMEOUT_MS: u64 = 2_000;
 const NATIVE_RENDER_THREAD_STOP_TIMEOUT_MS: u64 = 750;
+#[cfg(target_os = "linux")]
+const LINUX_CAPTURE_START_TIMEOUT_MS: u64 = 5_000;
+const CAPTURE_NO_FRAME_TIMEOUT_MS: u64 = 2_500;
 
 /// Test chain configuration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -284,9 +287,19 @@ fn start_linux_capture_session(capture: &mut PipewireScreenCapture) -> Result<()
         .enable_all()
         .build()
         .map_err(|error| anyhow::anyhow!("create Linux capture runtime failed: {error}"))?;
-    runtime
-        .block_on(capture.start_session())
-        .map_err(|error| anyhow::anyhow!("start Linux capture session failed: {error}"))
+    match runtime.block_on(tokio::time::timeout(
+        Duration::from_millis(LINUX_CAPTURE_START_TIMEOUT_MS),
+        capture.start_session(),
+    )) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(anyhow::anyhow!(
+            "start Linux capture session failed: {error}"
+        )),
+        Err(_) => Err(anyhow::anyhow!(
+            "start Linux capture session timed out after {} ms",
+            LINUX_CAPTURE_START_TIMEOUT_MS
+        )),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2008,6 +2021,7 @@ impl TestHarness {
         let mut decode_failures = 0_usize;
         let mut total_bitstream_bytes = 0_usize;
         let mut last_decode_error = None::<String>;
+        let mut last_capture_success = Instant::now();
         let dump_first_access_unit_path = std::env::var("MRD_HARNESS_DUMP_FIRST_ACCESS_UNIT").ok();
         let mut dumped_first_access_unit = false;
         let update_web_preview = state.visual_preview;
@@ -2018,12 +2032,25 @@ impl TestHarness {
             let capture_start = Instant::now();
             let captured_frame = match state.capture.capture_frame() {
                 Ok(frame) => frame,
-                Err(_) => {
+                Err(error) => {
                     dropped_frames += 1;
+                    if last_capture_success.elapsed()
+                        >= Duration::from_millis(CAPTURE_NO_FRAME_TIMEOUT_MS)
+                    {
+                        let message = format!(
+                            "capture failed: {error}; no frames produced for {:.1}s",
+                            last_capture_success.elapsed().as_secs_f64()
+                        );
+                        let mut m = metrics.lock().unwrap();
+                        m.error_message = Some(message);
+                        running.store(false, Ordering::Relaxed);
+                        break;
+                    }
                     thread::sleep(Duration::from_millis(1));
                     continue;
                 }
             };
+            last_capture_success = Instant::now();
             let capture_latency = capture_start.elapsed();
             let interactive_start = Instant::now();
 
