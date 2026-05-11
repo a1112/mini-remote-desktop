@@ -24,7 +24,6 @@ import {
   presentTestHarnessFrameOnNativeSurface,
   testGetCapabilities,
   testGetRun,
-  testHarnessGetFrames,
   testHarnessGetMetrics,
   testHarnessStop,
   testStartRun,
@@ -33,7 +32,6 @@ import {
   type DecoderType,
   type EncoderType,
   type EnvironmentSnapshot,
-  type FrameData,
   type HarnessMetrics,
   type NativeRenderSurfaceSnapshot,
   type RemoteDisplayWindowContext,
@@ -63,11 +61,10 @@ type ResolutionKey = "1280x720" | "1920x1080" | "2560x1440" | "2560x1600" | "344
 type FpsKey = "30" | "60" | "120" | "144";
 type BitrateKey = "8" | "20" | "50" | "80";
 type TestStatus = "idle" | "starting" | "running" | "stopping" | "completed" | "failed";
-type WebPreviewMode = "idle" | "connecting" | "webrtc" | "fallback" | "failed";
+type WebPreviewMode = "idle" | "connecting" | "webrtc" | "failed";
 type CaptureSourcePickerMode = "dropdown" | "modal";
 
 const METRICS_POLL_MS = 500;
-const WEB_PREVIEW_FRAME_POLL_MS = 80;
 const WEB_PREVIEW_CONNECT_TIMEOUT_MS = 3_000;
 const WEB_VIEW_MAX_FPS = 60;
 
@@ -254,6 +251,15 @@ function isH264PreviewEncoder(encoder: EncoderType) {
   );
 }
 
+function browserSupportsH264WebrtcVideo(): boolean {
+  if (typeof RTCRtpReceiver === "undefined") return true;
+  const capabilities = RTCRtpReceiver.getCapabilities?.("video");
+  if (!capabilities?.codecs?.length) return true;
+  return capabilities.codecs.some(
+    (codec) => codec.mimeType.toLowerCase() === "video/h264"
+  );
+}
+
 function fpsForWebView(fps: FpsKey): FpsKey {
   return Number(fps) > WEB_VIEW_MAX_FPS ? "60" : fps;
 }
@@ -296,7 +302,7 @@ function resolveLocalWebViewPlan({
       : hostOs === "windows"
         ? ["dxgi", "winrt", "synthetic"]
         : hostOs === "linux"
-          ? ["synthetic", "linux"]
+          ? ["linux", "synthetic"]
         : ["synthetic"];
   const nextCapture = pickCapability(
     uniqueValues([capture, ...captureDefaults]),
@@ -336,27 +342,7 @@ function resolveLocalWebViewPlan({
     };
   }
 
-  const decoderCandidates: DecoderType[] =
-    nextEncoder === "videotoolbox_h264"
-      ? ["videotoolbox", "software", "none"]
-      : nextEncoder === "nvenc_h264"
-        ? ["software", "nvdec", "none"]
-        : hostOs === "linux"
-          ? ["software", "linux_h264", "none"]
-        : ["software", "none"];
-  const nextDecoder = pickCapability(
-    decoderCandidates,
-    capabilities?.available_decoders
-  );
-
-  if (!nextDecoder) {
-    return {
-      profile: null,
-      reason: "Web View 未找到可用解码链路",
-      changed: false,
-      message: null,
-    };
-  }
+  const nextDecoder: DecoderType = "none";
 
   const profile: LocalWebViewProfile = {
     capture: nextCapture,
@@ -457,7 +443,6 @@ export function RemoteDisplayWindowPage() {
   const renderAreaRef = useRef<HTMLDivElement | null>(null);
   const syncAnimationFrameRef = useRef<number | null>(null);
   const syncTimerIdsRef = useRef<number[]>([]);
-  const webPreviewRenderedGenerationRef = useRef<number | null>(null);
   const webPreviewVideoRef = useRef<HTMLVideoElement | null>(null);
   const webPreviewPeerRef = useRef<RTCPeerConnection | null>(null);
   const webPreviewSessionRef = useRef<string | null>(null);
@@ -485,7 +470,6 @@ export function RemoteDisplayWindowPage() {
   const [testStatus, setTestStatus] = useState<TestStatus>("idle");
   const [currentRunId, setCurrentRunId] = useState<string | null>(null);
   const [metrics, setMetrics] = useState<HarnessMetrics | null>(null);
-  const [capturedFrame, setCapturedFrame] = useState<FrameData | null>(null);
   const [webPreviewMode, setWebPreviewMode] = useState<WebPreviewMode>("idle");
   const [webPreviewError, setWebPreviewError] = useState<string | null>(null);
   const [testMessage, setTestMessage] = useState<string | null>(null);
@@ -683,7 +667,7 @@ export function RemoteDisplayWindowPage() {
       warmup_ms: 500,
       input_source: selectedCapture === "synthetic" ? "synthetic" : "screen",
       output_validation: true,
-      visual_preview: !isNative,
+      visual_preview: false,
       render_display: Boolean(
         isNative && (rendererTargetHwnd || nativeRendererType === "linux")
       ),
@@ -968,8 +952,6 @@ export function RemoteDisplayWindowPage() {
     if (!nativeRendererAvailableForHost) return;
     closeWebPreviewPeer();
     setWebPreviewMode("idle");
-    webPreviewRenderedGenerationRef.current = null;
-    setCapturedFrame(null);
     setRenderMode(nativeRenderMode);
   }, [closeWebPreviewPeer, nativeRenderMode, nativeRendererAvailableForHost]);
 
@@ -977,8 +959,6 @@ export function RemoteDisplayWindowPage() {
     if (!d3d12RendererAvailable || localRenderSwitchLocked) return;
     closeWebPreviewPeer();
     setWebPreviewMode("idle");
-    webPreviewRenderedGenerationRef.current = null;
-    setCapturedFrame(null);
     setRenderMode("d3d12_native");
   }, [closeWebPreviewPeer, d3d12RendererAvailable, localRenderSwitchLocked]);
 
@@ -989,8 +969,6 @@ export function RemoteDisplayWindowPage() {
     }
 
     closeWebPreviewPeer();
-    webPreviewRenderedGenerationRef.current = null;
-    setCapturedFrame(null);
     setWebPreviewMode("idle");
     setRenderMode("web");
   }, [closeWebPreviewPeer, isLocalPipelinePreview, isTestBusy]);
@@ -1108,58 +1086,86 @@ export function RemoteDisplayWindowPage() {
     }
 
     if (!isTauriRuntime() || typeof RTCPeerConnection === "undefined") {
-      setWebPreviewMode("fallback");
+      setWebPreviewMode("failed");
       setWebPreviewError("WebRTC is unavailable in this runtime");
       return;
     }
 
     if (encoder === "nvenc_av1") {
-      setWebPreviewMode("fallback");
+      setWebPreviewMode("failed");
       setWebPreviewError("Browser WebRTC preview currently supports H.264 output");
       return;
     }
 
+    if (!browserSupportsH264WebrtcVideo()) {
+      setWebPreviewMode("failed");
+      setWebPreviewError("Browser WebRTC video renderer does not advertise H.264 receive support");
+      return;
+    }
+
     let cancelled = false;
-    let receivedTrack = false;
+    let renderedVideoFrame = false;
     let connectTimeoutId: number | null = null;
     const peer = new RTCPeerConnection({ iceServers: [] });
     webPreviewPeerRef.current = peer;
     webPreviewSessionRef.current = sessionId;
     setWebPreviewMode("connecting");
     setWebPreviewError(null);
-    setCapturedFrame(null);
 
-    peer.addTransceiver("video", { direction: "recvonly" });
-    peer.ontrack = (event) => {
-      if (cancelled) return;
-      receivedTrack = true;
+    const markVideoRendered = () => {
+      if (cancelled || renderedVideoFrame) return;
+      renderedVideoFrame = true;
       if (connectTimeoutId !== null) {
         window.clearTimeout(connectTimeoutId);
         connectTimeoutId = null;
       }
-      const video = webPreviewVideoRef.current;
-      if (!video) return;
-      const stream = event.streams[0] ?? new MediaStream([event.track]);
-      video.srcObject = stream;
-      video.muted = true;
-      video.playsInline = true;
-      void video.play().catch(() => {});
       setWebPreviewMode("webrtc");
       setWebPreviewError(null);
+    };
+
+    peer.addTransceiver("video", { direction: "recvonly" });
+    peer.ontrack = (event) => {
+      if (cancelled) return;
+      const stream = event.streams[0] ?? new MediaStream([event.track]);
+
+      const bindStreamToVideo = () => {
+        if (cancelled) return;
+        const video = webPreviewVideoRef.current;
+        if (!video) {
+          window.requestAnimationFrame(bindStreamToVideo);
+          return;
+        }
+
+        video.srcObject = stream;
+        video.muted = true;
+        video.playsInline = true;
+        const videoWithFrameCallback = video as HTMLVideoElement & {
+          requestVideoFrameCallback?: (callback: () => void) => number;
+        };
+        videoWithFrameCallback.requestVideoFrameCallback?.(() => markVideoRendered());
+        video.addEventListener("loadeddata", markVideoRendered, { once: true });
+        video.addEventListener("playing", markVideoRendered, { once: true });
+        void video.play().catch((error) => {
+          if (cancelled) return;
+          setWebPreviewError(error instanceof Error ? error.message : String(error));
+        });
+      };
+
+      bindStreamToVideo();
     };
     peer.onconnectionstatechange = () => {
       if (cancelled) return;
       if (peer.connectionState === "failed" || peer.connectionState === "disconnected") {
-        setWebPreviewMode("fallback");
+        setWebPreviewMode("failed");
         setWebPreviewError(`WebRTC preview ${peer.connectionState}`);
       }
     };
 
     connectTimeoutId = window.setTimeout(() => {
-      if (cancelled || receivedTrack) return;
+      if (cancelled || renderedVideoFrame) return;
       closeWebPreviewPeer();
-      setWebPreviewMode("fallback");
-      setWebPreviewError("WebRTC 视频未及时接入，已回退到帧轮询");
+      setWebPreviewMode("failed");
+      setWebPreviewError("WebRTC 视频未在超时内解码出第一帧，未使用图片回退");
     }, WEB_PREVIEW_CONNECT_TIMEOUT_MS);
 
     const startPreview = async () => {
@@ -1191,7 +1197,7 @@ export function RemoteDisplayWindowPage() {
         if (cancelled) return;
         const message = error instanceof Error ? error.message : String(error);
         closeWebPreviewPeer();
-        setWebPreviewMode("fallback");
+        setWebPreviewMode("failed");
         setWebPreviewError(message);
       }
     };
@@ -1216,63 +1222,6 @@ export function RemoteDisplayWindowPage() {
     localStartBlockReason,
     sessionId,
   ]);
-
-  useEffect(() => {
-    if (
-      !isLocalPipelinePreview ||
-      !isTestBusy ||
-      isNative ||
-      localStartBlockReason ||
-      (webPreviewMode !== "fallback" && webPreviewMode !== "failed")
-    ) {
-      return;
-    }
-
-    let cancelled = false;
-    let timeoutId: number | null = null;
-    webPreviewRenderedGenerationRef.current = null;
-
-    const poll = async () => {
-      try {
-        const framesResult = await testHarnessGetFrames({
-          includeCaptured: false,
-          includeRendered: true,
-          lastRenderedGeneration:
-            webPreviewRenderedGenerationRef.current ?? undefined,
-        });
-        if (cancelled) return;
-        if (framesResult.ok) {
-          const renderedFrame = Array.isArray(framesResult.value)
-            ? framesResult.value[1] ?? framesResult.value[0]
-            : null;
-          if (renderedFrame) {
-            const generation = renderedFrame[3];
-            if (typeof generation === "number") {
-              webPreviewRenderedGenerationRef.current = generation;
-            }
-            setCapturedFrame((current) =>
-              typeof generation === "number" && current?.[3] === generation
-                ? current
-                : renderedFrame
-            );
-          }
-        }
-      } finally {
-        if (!cancelled) {
-          timeoutId = window.setTimeout(poll, WEB_PREVIEW_FRAME_POLL_MS);
-        }
-      }
-    };
-
-    void poll();
-
-    return () => {
-      cancelled = true;
-      if (timeoutId !== null) {
-        window.clearTimeout(timeoutId);
-      }
-    };
-  }, [isLocalPipelinePreview, isNative, isTestBusy, localStartBlockReason, webPreviewMode]);
 
   useEffect(() => {
     if (isLocalPipelinePreview || !isTauriRuntime()) return;
@@ -1430,8 +1379,6 @@ export function RemoteDisplayWindowPage() {
     setTestStatus("starting");
     setCurrentRunId(null);
     setMetrics(null);
-    webPreviewRenderedGenerationRef.current = null;
-    setCapturedFrame(null);
 
     try {
       const snapshot = await getSessionSnapshot(sessionId);
@@ -1644,8 +1591,6 @@ export function RemoteDisplayWindowPage() {
     setTestStatus("starting");
     setCurrentRunId(null);
     setMetrics(null);
-    webPreviewRenderedGenerationRef.current = null;
-    setCapturedFrame(null);
     setWebPreviewMode("idle");
     setWebPreviewError(null);
 
@@ -1772,7 +1717,9 @@ export function RemoteDisplayWindowPage() {
         ? "WebRTC video"
         : webPreviewMode === "connecting"
           ? "WebRTC connecting"
-          : "Web View"
+          : webPreviewMode === "failed"
+            ? "WebRTC failed"
+            : "WebRTC video"
       : renderModeLabel;
   const renderSwitchLockedTitle = localRenderSwitchLocked
     ? "请先停止测试再切换渲染模式"
@@ -2231,19 +2178,12 @@ export function RemoteDisplayWindowPage() {
             playsInline
           />
         )}
-        {isLocalPipelinePreview && !isNative && !webPreviewUsesVideo && capturedFrame && (
-          <img
-            src={`data:image/png;base64,${capturedFrame[0]}`}
-            alt="Rendered frame"
-            className="absolute inset-0 h-full w-full object-contain"
-          />
-        )}
-        {isLocalPipelinePreview && !isNative && !webPreviewUsesVideo && !capturedFrame && (
+        {isLocalPipelinePreview && !isNative && !webPreviewUsesVideo && (
           <div className="absolute inset-0 flex items-center justify-center">
             <div className="text-center">
               <PanelTop className="mx-auto mb-3 h-9 w-9 text-slate-500" />
               <div className="text-sm font-medium text-slate-300">
-                {isTestBusy ? "等待 Web View 帧" : "点击开始显示本机测试画面"}
+                {isTestBusy ? "等待 WebRTC 视频帧" : "点击开始显示本机 WebRTC 画面"}
               </div>
               <div className="mt-1 text-xs text-slate-500">
                 {localStartBlockReason ?? webPreviewError ?? testDescription}
@@ -2325,7 +2265,7 @@ export function RemoteDisplayWindowPage() {
             </span>
           )}
           <span className="hidden xl:inline">
-            memory: {usesNativeSharedTexture ? "D3D11 shared" : nativeRendererType === "macos" ? "Metal upload" : nativeRendererType === "linux" ? "Linux upload" : "CPU preview"}
+            memory: {usesNativeSharedTexture ? "D3D11 shared" : nativeRendererType === "macos" ? "Metal upload" : nativeRendererType === "linux" ? "Linux upload" : isLocalPipelinePreview && !isNative ? "WebRTC MediaStream" : "CPU preview"}
           </span>
           {isNative && nativeSurface?.attached && (
             <span className="hidden xl:inline">

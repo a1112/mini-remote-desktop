@@ -332,11 +332,11 @@ describe("RemoteDisplayWindowPage", () => {
           config: expect.objectContaining({
             capture_type: "dxgi",
             encoder_type: "openh264",
-            decoder_type: "software",
+            decoder_type: "none",
             transport_kind: "webrtc",
             fps: 60,
             render_display: false,
-            visual_preview: true,
+            visual_preview: false,
             zero_copy: false,
           }),
         })
@@ -344,7 +344,7 @@ describe("RemoteDisplayWindowPage", () => {
     });
   });
 
-  it("uses synthetic capture for Linux local Web View tests", async () => {
+  it("uses actual Linux capture for Linux local WebRTC video tests", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
       if (command === "test_get_capabilities") {
@@ -408,11 +408,12 @@ describe("RemoteDisplayWindowPage", () => {
         expect.objectContaining({
           scenarioId: "custom",
           config: expect.objectContaining({
-            capture_type: "synthetic",
+            capture_type: "linux",
             encoder_type: "openh264",
-            decoder_type: "software",
+            decoder_type: "none",
             transport_kind: "webrtc",
             render_display: false,
+            visual_preview: false,
             zero_copy: false,
           }),
         })
