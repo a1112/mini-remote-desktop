@@ -40,6 +40,7 @@ const WEB_PREVIEW_FRAME_UPDATE_INTERVAL: usize = 8;
 const ENCODED_ACCESS_UNIT_SUBSCRIBER_QUEUE_DEPTH: usize = 1;
 const NATIVE_RENDER_FRAME_TIMEOUT_MS: u64 = 2_000;
 const NATIVE_RENDER_THREAD_STOP_TIMEOUT_MS: u64 = 750;
+const HARNESS_STOP_JOIN_TIMEOUT_MS: u64 = 2_000;
 #[cfg(target_os = "linux")]
 const LINUX_CAPTURE_START_TIMEOUT_MS: u64 = 5_000;
 const CAPTURE_NO_FRAME_TIMEOUT_MS: u64 = 2_500;
@@ -287,10 +288,13 @@ fn start_linux_capture_session(capture: &mut PipewireScreenCapture) -> Result<()
         .enable_all()
         .build()
         .map_err(|error| anyhow::anyhow!("create Linux capture runtime failed: {error}"))?;
-    match runtime.block_on(tokio::time::timeout(
-        Duration::from_millis(LINUX_CAPTURE_START_TIMEOUT_MS),
-        capture.start_session(),
-    )) {
+    match runtime.block_on(async {
+        tokio::time::timeout(
+            Duration::from_millis(LINUX_CAPTURE_START_TIMEOUT_MS),
+            capture.start_session(),
+        )
+        .await
+    }) {
         Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => Err(anyhow::anyhow!(
             "start Linux capture session failed: {error}"
@@ -2458,10 +2462,35 @@ impl TestHarness {
         if let Some(handle) = self.thread_handle.take() {
             self.stopping.store(true, Ordering::Relaxed);
             let stopping = Arc::clone(&self.stopping);
+            let metrics = Arc::clone(&self.metrics);
+            let (join_tx, join_rx) = mpsc::channel();
             thread::spawn(move || {
-                let _ = handle.join();
+                let join_result = handle
+                    .join()
+                    .map_err(|_| "test harness worker thread panicked".to_string());
                 stopping.store(false, Ordering::Relaxed);
+                let _ = join_tx.send(join_result);
             });
+
+            match join_rx.recv_timeout(Duration::from_millis(HARNESS_STOP_JOIN_TIMEOUT_MS)) {
+                Ok(Ok(())) => {}
+                Ok(Err(message)) => {
+                    let mut m = metrics.lock().unwrap();
+                    m.error_message = Some(message.clone());
+                    anyhow::bail!(message);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let mut m = metrics.lock().unwrap();
+                    m.error_message = Some(format!(
+                        "test harness worker did not stop within {} ms",
+                        HARNESS_STOP_JOIN_TIMEOUT_MS
+                    ));
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    let mut m = metrics.lock().unwrap();
+                    m.error_message = Some("test harness stop join channel closed".to_string());
+                }
+            }
         }
 
         {

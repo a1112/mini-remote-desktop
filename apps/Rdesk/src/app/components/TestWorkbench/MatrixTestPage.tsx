@@ -46,8 +46,8 @@ const MATRIX_DIMENSIONS: MatrixDimension[] = [
       { id: "dxgi", name: "DXGI", enabled: true },
       { id: "winrt", name: "WinRT", enabled: false },
       { id: "macos", name: "macOS", enabled: false, defaultEnabledOn: ["macos"] },
-      { id: "linux", name: "Linux", enabled: false, defaultEnabledOn: ["linux"] },
-      { id: "synthetic", name: "Synthetic", enabled: false },
+      { id: "linux", name: "Linux", enabled: false },
+      { id: "synthetic", name: "Synthetic", enabled: false, defaultEnabledOn: ["linux"] },
     ],
   },
   {
@@ -115,7 +115,7 @@ const MATRIX_DIMENSIONS: MatrixDimension[] = [
       { id: "d3d11", name: "DX11 popup", enabled: false },
       { id: "d3d12_native", name: "DX12 native", enabled: false },
       { id: "macos", name: "Metal", enabled: false },
-      { id: "linux", name: "Linux", enabled: false, defaultEnabledOn: ["linux"] },
+      { id: "linux", name: "Linux", enabled: false },
     ],
   },
   {
@@ -732,6 +732,7 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
         isOptionEnabled(next, "memory", "d3d11_shared")
       ) {
         next = setOptionEnabled(next, "renderer", "d3d11", true);
+        next = setOptionEnabled(next, "renderer", "renderer_none", false);
       }
 
       if (
@@ -758,6 +759,7 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
         next = setOptionEnabled(next, "renderer", "d3d11", false);
         next = setOptionEnabled(next, "renderer", "d3d12_native", false);
         next = setOptionEnabled(next, "renderer", "macos", false);
+        next = setOptionEnabled(next, "renderer", "linux", false);
         next = setOptionEnabled(next, "memory", "d3d11_shared", false);
       }
 

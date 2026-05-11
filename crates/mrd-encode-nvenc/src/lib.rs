@@ -1344,19 +1344,27 @@ fn run_gstreamer_encoder_command(
         .spawn()
         .map_err(|error| PipelineError::message(format!("launch {label} failed: {error}")))?;
 
-    let write_error = if let Some(mut stdin) = child.stdin.take() {
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| PipelineError::message(format!("{label} stdin pipe is unavailable")))?;
+    let input = input.to_vec();
+    let writer = std::thread::spawn(move || {
         use std::io::Write;
-        stdin.write_all(input).err()
-    } else {
-        Some(std::io::Error::new(
-            std::io::ErrorKind::BrokenPipe,
-            "GStreamer stdin pipe is unavailable",
-        ))
-    };
+        stdin.write_all(&input)
+    });
 
     let output = child
         .wait_with_output()
         .map_err(|error| PipelineError::message(format!("wait for {label} failed: {error}")))?;
+
+    let write_error = match writer.join() {
+        Ok(result) => result.err(),
+        Err(_) => Some(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "GStreamer stdin writer thread panicked",
+        )),
+    };
 
     if let Some(error) = write_error {
         return Err(PipelineError::message(format!(
