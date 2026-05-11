@@ -954,7 +954,7 @@ impl TestOrchestrator {
         let mut harness = self.harness.lock().unwrap();
         harness.set_chain(chain.clone());
         harness.set_config(harness_config_from_data(&config));
-        if let Err(error) = harness.start() {
+        if let Err(error) = harness.start_replacing_existing() {
             let message = format!("Failed to start test harness: {}", error);
             drop(harness);
 

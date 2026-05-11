@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::collections::HashSet;
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::{Networks, Pid, System};
@@ -62,7 +63,7 @@ pub struct ResourceMonitor {
     system: System,
     networks: Networks,
     nvidia_smi_available: Option<bool>,
-    last_gpu_pid: Option<u32>,
+    last_gpu_pids: Vec<u32>,
     last_gpu_sample: GpuSample,
     last_gpu_refresh: Option<Instant>,
     last_network_refresh: Option<Instant>,
@@ -80,7 +81,7 @@ impl ResourceMonitor {
             system,
             networks,
             nvidia_smi_available: None,
-            last_gpu_pid: None,
+            last_gpu_pids: Vec::new(),
             last_gpu_sample: GpuSample::default(),
             last_gpu_refresh: None,
             last_network_refresh: Some(Instant::now()),
@@ -93,26 +94,27 @@ impl ResourceMonitor {
         target_name: impl Into<String>,
     ) -> SystemResourceSnapshot {
         self.system.refresh_memory();
+        self.system.refresh_processes();
 
         let target_name = target_name.into();
         let memory_total = self.system.total_memory();
-        let mut target_found = false;
-        let mut cpu_usage_percent = 0.0;
-        let mut memory_used = 0;
+        let target_pids = target_pid
+            .map(|pid| collect_process_tree_pids(&self.system, pid))
+            .unwrap_or_default();
+        let target_found = !target_pids.is_empty();
+        let mut raw_cpu_usage = 0.0;
+        let mut memory_used = 0u64;
 
-        if let Some(pid) = target_pid {
-            let sysinfo_pid = Pid::from_u32(pid);
-            target_found = self.system.refresh_process(sysinfo_pid);
-
-            if let Some(process) = self.system.process(sysinfo_pid) {
-                target_found = true;
-                cpu_usage_percent =
-                    normalize_process_cpu(process.cpu_usage(), self.system.cpus().len().max(1));
-                memory_used = process.memory();
+        for pid in &target_pids {
+            if let Some(process) = self.system.process(Pid::from_u32(*pid)) {
+                raw_cpu_usage += process.cpu_usage();
+                memory_used = memory_used.saturating_add(process.memory());
             }
         }
 
-        let gpu = self.gpu_sample_for_pid(target_pid);
+        let cpu_usage_percent =
+            normalize_process_cpu(raw_cpu_usage, self.system.cpus().len().max(1));
+        let gpu = self.gpu_sample_for_pids(&target_pids);
         let network = self.network_sample();
 
         SystemResourceSnapshot {
@@ -140,19 +142,22 @@ impl ResourceMonitor {
         }
     }
 
-    fn gpu_sample_for_pid(&mut self, target_pid: Option<u32>) -> GpuSample {
+    fn gpu_sample_for_pids(&mut self, target_pids: &[u32]) -> GpuSample {
+        let mut sorted_pids = target_pids.to_vec();
+        sorted_pids.sort_unstable();
+
         if self
             .last_gpu_refresh
             .map(|updated_at| {
-                updated_at.elapsed() < Duration::from_secs(2) && self.last_gpu_pid == target_pid
+                updated_at.elapsed() < Duration::from_secs(2) && self.last_gpu_pids == sorted_pids
             })
             .unwrap_or(false)
         {
             return self.last_gpu_sample.clone();
         }
 
-        let sample = sample_nvidia_gpu_for_pid(&mut self.nvidia_smi_available, target_pid);
-        self.last_gpu_pid = target_pid;
+        let sample = sample_nvidia_gpu_for_pids(&mut self.nvidia_smi_available, &sorted_pids);
+        self.last_gpu_pids = sorted_pids;
         self.last_gpu_sample = sample.clone();
         self.last_gpu_refresh = Some(Instant::now());
         sample
@@ -191,6 +196,39 @@ impl ResourceMonitor {
     }
 }
 
+fn collect_process_tree_pids(system: &System, root_pid: u32) -> Vec<u32> {
+    let root = Pid::from_u32(root_pid);
+    if system.process(root).is_none() {
+        return Vec::new();
+    }
+
+    let mut seen = HashSet::from([root]);
+    let mut ordered = vec![root_pid];
+
+    loop {
+        let mut changed = false;
+        for (pid, process) in system.processes() {
+            if seen.contains(pid) {
+                continue;
+            }
+            if process
+                .parent()
+                .is_some_and(|parent| seen.contains(&parent))
+            {
+                seen.insert(*pid);
+                ordered.push(pid.as_u32());
+                changed = true;
+            }
+        }
+
+        if !changed {
+            break;
+        }
+    }
+
+    ordered
+}
+
 fn bytes_to_mb(bytes: u64) -> u64 {
     bytes / 1024 / 1024
 }
@@ -222,27 +260,35 @@ fn unix_epoch_ms() -> u64 {
         .unwrap_or_default()
 }
 
-fn sample_nvidia_gpu_for_pid(
+fn sample_nvidia_gpu_for_pids(
     nvidia_smi_available: &mut Option<bool>,
-    target_pid: Option<u32>,
+    target_pids: &[u32],
 ) -> GpuSample {
     if matches!(nvidia_smi_available, Some(false)) {
         return GpuSample::default();
     }
 
-    if let Some(process_sample) =
-        target_pid.and_then(|pid| sample_nvidia_process_gpu(nvidia_smi_available, pid))
-    {
-        return process_sample;
+    let system_sample = sample_nvidia_system_gpu(nvidia_smi_available);
+    if let Some(process_sample) = sample_nvidia_process_gpu(nvidia_smi_available, target_pids) {
+        return GpuSample {
+            usage_percent: system_sample.usage_percent,
+            memory_used_mb: process_sample.memory_used_mb,
+            memory_total_mb: system_sample.memory_total_mb,
+            scope: MetricScope::Process,
+        };
     }
 
-    sample_nvidia_system_gpu(nvidia_smi_available)
+    system_sample
 }
 
 fn sample_nvidia_process_gpu(
     nvidia_smi_available: &mut Option<bool>,
-    target_pid: u32,
+    target_pids: &[u32],
 ) -> Option<GpuSample> {
+    if target_pids.is_empty() {
+        return None;
+    }
+
     run_nvidia_smi(
         nvidia_smi_available,
         &[
@@ -250,7 +296,7 @@ fn sample_nvidia_process_gpu(
             "--format=csv,noheader,nounits",
         ],
     )
-    .and_then(|text| parse_nvidia_smi_process_sample(&text, target_pid))
+    .and_then(|text| parse_nvidia_smi_process_sample(&text, target_pids))
 }
 
 fn sample_nvidia_system_gpu(nvidia_smi_available: &mut Option<bool>) -> GpuSample {
@@ -305,23 +351,30 @@ fn nvidia_smi_candidates() -> &'static [&'static str] {
     &["nvidia-smi"]
 }
 
-fn parse_nvidia_smi_process_sample(text: &str, target_pid: u32) -> Option<GpuSample> {
+fn parse_nvidia_smi_process_sample(text: &str, target_pids: &[u32]) -> Option<GpuSample> {
+    let targets = target_pids.iter().copied().collect::<HashSet<_>>();
+    let mut memory_used_mb = 0u64;
+    let mut matched = false;
+
     for line in text.lines().filter(|line| !line.trim().is_empty()) {
         let mut parts = line.split(',').map(str::trim);
         let pid = parts.next().and_then(|value| value.parse::<u32>().ok());
-        if pid != Some(target_pid) {
+        if !pid.is_some_and(|pid| targets.contains(&pid)) {
             continue;
         }
 
-        return Some(GpuSample {
-            usage_percent: None,
-            memory_used_mb: parts.next().and_then(|value| value.parse::<u64>().ok()),
-            memory_total_mb: None,
-            scope: MetricScope::Process,
-        });
+        matched = true;
+        if let Some(value) = parts.next().and_then(|value| value.parse::<u64>().ok()) {
+            memory_used_mb = memory_used_mb.saturating_add(value);
+        }
     }
 
-    None
+    matched.then_some(GpuSample {
+        usage_percent: None,
+        memory_used_mb: Some(memory_used_mb),
+        memory_total_mb: None,
+        scope: MetricScope::Process,
+    })
 }
 
 fn parse_nvidia_smi_system_sample(text: &str) -> Option<GpuSample> {
@@ -342,7 +395,7 @@ mod tests {
 
     #[test]
     fn nvidia_smi_process_output_is_parsed_for_target_pid() {
-        let sample = parse_nvidia_smi_process_sample("100, 256\n200, 1024\n", 200).unwrap();
+        let sample = parse_nvidia_smi_process_sample("100, 256\n200, 1024\n", &[200]).unwrap();
 
         assert_eq!(sample.usage_percent, None);
         assert_eq!(sample.memory_used_mb, Some(1024));
@@ -351,8 +404,18 @@ mod tests {
     }
 
     #[test]
+    fn nvidia_smi_process_output_sums_target_process_tree() {
+        let sample =
+            parse_nvidia_smi_process_sample("100, 256\n200, 1024\n300, 512\n", &[100, 300])
+                .unwrap();
+
+        assert_eq!(sample.memory_used_mb, Some(768));
+        assert_eq!(sample.scope, MetricScope::Process);
+    }
+
+    #[test]
     fn nvidia_smi_process_output_ignores_other_pids() {
-        let sample = parse_nvidia_smi_process_sample("100, 256\n", 200);
+        let sample = parse_nvidia_smi_process_sample("100, 256\n", &[200]);
 
         assert!(sample.is_none());
     }

@@ -1497,7 +1497,7 @@ fn test_harness_start(state: tauri::State<'_, AppState>) -> Result<(), String> {
         .test_harness
         .lock()
         .unwrap()
-        .start()
+        .start_replacing_existing()
         .map_err(|e| e.to_string())
 }
 

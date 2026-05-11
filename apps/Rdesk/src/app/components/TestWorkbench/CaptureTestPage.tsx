@@ -68,9 +68,9 @@ interface CaptureMetrics {
   frame_count: number;
   dropped_frames: number;
   resolution: [number, number];
-  avg_latency_ms: number;
+  capture_latency_avg_ms: number;
   source_wait_latency_p95_ms: number;
-  interactive_latency_p95_ms: number;
+  processing_latency_p95_ms: number;
   capture_latency_p95_ms: number;
   encode_latency_p95_ms: number;
   decode_latency_p95_ms: number;
@@ -259,8 +259,6 @@ export function CaptureTestPage() {
         }
         const sourceWaitLatencyP95 =
           result.value.source_wait_latency_p95_ms ?? result.value.capture_latency_p95_ms;
-        const interactiveLatencyAvg =
-          result.value.interactive_latency_avg_ms ?? result.value.capture_latency_avg_ms;
         const interactiveLatencyP95 =
           result.value.interactive_latency_p95_ms ?? result.value.total_latency_p95_ms;
         setMetrics({
@@ -269,9 +267,9 @@ export function CaptureTestPage() {
           frame_count: result.value.frame_count,
           dropped_frames: result.value.dropped_frames,
           resolution: result.value.resolution,
-          avg_latency_ms: interactiveLatencyAvg,
+          capture_latency_avg_ms: result.value.capture_latency_avg_ms,
           source_wait_latency_p95_ms: sourceWaitLatencyP95,
-          interactive_latency_p95_ms: interactiveLatencyP95,
+          processing_latency_p95_ms: interactiveLatencyP95,
           capture_latency_p95_ms: result.value.capture_latency_p95_ms,
           encode_latency_p95_ms: result.value.encode_latency_p95_ms,
           decode_latency_p95_ms: result.value.decode_latency_p95_ms,
@@ -739,15 +737,15 @@ export function CaptureTestPage() {
             />
             <MetricCard
               icon={<Gauge className="h-4 w-4" />}
-              label="感知平均"
-              value={`${metrics.avg_latency_ms.toFixed(2)} ms`}
-              color={getLatencyColor(metrics.avg_latency_ms, 16, 33)}
+              label="采集平均"
+              value={`${metrics.capture_latency_avg_ms.toFixed(2)} ms`}
+              color={getLatencyColor(metrics.capture_latency_avg_ms, 16, 33)}
             />
             <MetricCard
               icon={<Gauge className="h-4 w-4" />}
-              label="感知 P95"
-              value={`${metrics.interactive_latency_p95_ms.toFixed(2)} ms`}
-              color={getLatencyColor(metrics.interactive_latency_p95_ms, 16, 33)}
+              label="采集 P95"
+              value={`${metrics.capture_latency_p95_ms.toFixed(2)} ms`}
+              color={getLatencyColor(metrics.capture_latency_p95_ms, 16, 33)}
             />
             <MetricCard
               icon={<Gauge className="h-4 w-4" />}
@@ -773,7 +771,7 @@ export function CaptureTestPage() {
             <h3 className="font-medium mb-4">延迟分布</h3>
             <div className="space-y-2">
               <LatencyBar label="Source wait" value={metrics.source_wait_latency_p95_ms} max={100} />
-              <LatencyBar label="Interactive" value={metrics.interactive_latency_p95_ms} max={100} />
+              <LatencyBar label="Processing" value={metrics.processing_latency_p95_ms} max={100} />
               <LatencyBar label="Encode" value={metrics.encode_latency_p95_ms} max={100} />
               <LatencyBar label="Decode" value={metrics.decode_latency_p95_ms} max={100} />
               <LatencyBar label="Total" value={metrics.total_latency_p95_ms} max={100} />

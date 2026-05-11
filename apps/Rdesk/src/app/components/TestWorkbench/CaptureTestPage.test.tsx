@@ -139,7 +139,7 @@ describe("CaptureTestPage window picker", () => {
     });
   });
 
-  it("shows interactive P95 separately from source wait P95", async () => {
+  it("shows capture P95 separately from source wait and processing P95", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {
       if (command === "test_get_capabilities") {
@@ -186,8 +186,9 @@ describe("CaptureTestPage window picker", () => {
     await waitFor(() => expect(startButton).not.toBeDisabled());
     fireEvent.click(startButton);
 
-    expect(await screen.findByText("感知 P95")).toBeInTheDocument();
+    expect(await screen.findByText("采集 P95")).toBeInTheDocument();
     expect(screen.getByText("源等待 P95")).toBeInTheDocument();
+    expect(screen.getByText("Processing")).toBeInTheDocument();
     expect(screen.getAllByText("3.40 ms").length).toBeGreaterThan(0);
     expect(screen.getAllByText("24.20 ms").length).toBeGreaterThan(0);
   });

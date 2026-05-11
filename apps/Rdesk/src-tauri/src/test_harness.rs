@@ -1346,6 +1346,10 @@ impl TestHarness {
             buf.rendered_height = 0;
             buf.rendered_generation = 0;
         }
+        {
+            let mut m = metrics.lock().unwrap();
+            *m = HarnessMetrics::default();
+        }
 
         running.store(true, Ordering::Relaxed);
 
@@ -1376,6 +1380,28 @@ impl TestHarness {
                 anyhow::bail!("test harness initialization channel closed: {}", error);
             }
         }
+    }
+
+    pub fn start_replacing_existing(&mut self) -> Result<()> {
+        if self.running.load(Ordering::Relaxed)
+            || self.thread_handle.is_some()
+            || self.stopping.load(Ordering::Relaxed)
+        {
+            self.stop()?;
+
+            let started = Instant::now();
+            while self.stopping.load(Ordering::Relaxed) {
+                if started.elapsed() >= Duration::from_millis(HARNESS_STOP_JOIN_TIMEOUT_MS) {
+                    anyhow::bail!(
+                        "test harness is still stopping after {} ms",
+                        HARNESS_STOP_JOIN_TIMEOUT_MS
+                    );
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        self.start()
     }
 
     fn run_pipeline(
@@ -2463,34 +2489,16 @@ impl TestHarness {
             self.stopping.store(true, Ordering::Relaxed);
             let stopping = Arc::clone(&self.stopping);
             let metrics = Arc::clone(&self.metrics);
-            let (join_tx, join_rx) = mpsc::channel();
             thread::spawn(move || {
                 let join_result = handle
                     .join()
                     .map_err(|_| "test harness worker thread panicked".to_string());
+                if let Err(message) = join_result {
+                    let mut m = metrics.lock().unwrap();
+                    m.error_message = Some(message);
+                }
                 stopping.store(false, Ordering::Relaxed);
-                let _ = join_tx.send(join_result);
             });
-
-            match join_rx.recv_timeout(Duration::from_millis(HARNESS_STOP_JOIN_TIMEOUT_MS)) {
-                Ok(Ok(())) => {}
-                Ok(Err(message)) => {
-                    let mut m = metrics.lock().unwrap();
-                    m.error_message = Some(message.clone());
-                    anyhow::bail!(message);
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    let mut m = metrics.lock().unwrap();
-                    m.error_message = Some(format!(
-                        "test harness worker did not stop within {} ms",
-                        HARNESS_STOP_JOIN_TIMEOUT_MS
-                    ));
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    let mut m = metrics.lock().unwrap();
-                    m.error_message = Some("test harness stop join channel closed".to_string());
-                }
-            }
         }
 
         {
