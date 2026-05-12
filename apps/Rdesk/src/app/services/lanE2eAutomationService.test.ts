@@ -183,6 +183,88 @@ function withCaptureSourceCommands(
 }
 
 describe("runLanE2EAutomation", () => {
+  it("runs cross-device discovery without starting a session", async () => {
+    const commands = createCommands();
+
+    const result = await runLanE2EAutomation(commands, {
+      scenarioId: "cross.e2e.discovery",
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.scenarioId).toBe("cross.e2e.discovery");
+    expect(result.peer?.device_id).toBe("agent-device");
+    expect(result.dataPlaneVerified).toBe(false);
+    expect(result.mediaVerified).toBe(false);
+    expect(commands.ipcStartLanRemoteSession).not.toHaveBeenCalled();
+    expect(commands.ipcListRemoteCaptureSources).not.toHaveBeenCalled();
+    expect(commands.ipcStartReceiver).not.toHaveBeenCalled();
+    expect(commands.openRemoteDisplayWindow).not.toHaveBeenCalled();
+    expect(commands.ipcStopSession).not.toHaveBeenCalled();
+    expect(result.stages.map((stage) => `${stage.stage}:${stage.status}`)).toContain(
+      "assert:completed"
+    );
+  });
+
+  it("skips cross-device fault recovery when service fault injection is unavailable", async () => {
+    const commands = createCommands();
+
+    const result = await runLanE2EAutomation(commands, {
+      scenarioId: "cross.fault.recovery",
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      faultPlan: { type: "network.pause_peer", durationMs: 500 },
+    });
+
+    expect(result.status).toBe("skipped");
+    expect(result.failureReason).toBe("fault_injection_unsupported");
+    expect(result.faultEvents).toEqual([
+      expect.objectContaining({
+        type: "network.pause_peer",
+        status: "unsupported",
+      }),
+    ]);
+    expect(commands.ipcStartLanRemoteSession).not.toHaveBeenCalled();
+    expect(commands.ipcStopSession).not.toHaveBeenCalled();
+  });
+
+  it("injects a cross-device fault before sampling when the service supports it", async () => {
+    const crossE2EInjectFault = vi.fn().mockResolvedValue(ok("pause-peer injected"));
+    const commands = createCommands({ crossE2EInjectFault });
+
+    const result = await runLanE2EAutomation(commands, {
+      scenarioId: "cross.fault.recovery",
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => "lan-e2e-test-session",
+      faultPlan: { type: "network.pause_peer", durationMs: 500 },
+    });
+
+    expect(result.status).toBe("completed");
+    expect(crossE2EInjectFault).toHaveBeenCalledWith("lan-e2e-test-session", {
+      type: "network.pause_peer",
+      durationMs: 500,
+    });
+    expect(result.faultEvents).toEqual([
+      expect.objectContaining({
+        type: "network.pause_peer",
+        status: "injected",
+      }),
+    ]);
+    expect(result.stages.map((stage) => `${stage.stage}:${stage.status}`)).toContain(
+      "fault:completed"
+    );
+  });
+
   it("discovers a LAN peer, starts remote display, validates frames, and stops the session", async () => {
     const commands = createCommands();
 

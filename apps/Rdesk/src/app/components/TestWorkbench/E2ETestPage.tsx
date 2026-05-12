@@ -5,6 +5,7 @@ import * as commands from "../../adapters/tauri/commands";
 import type { EnvironmentSnapshot, TestConfig, HarnessMetrics } from "../../adapters/tauri/types";
 import {
   runLanE2EAutomation,
+  type CrossDeviceScenarioId,
   type LanE2EAutomationCommands,
   type LanE2EAutomationOptions,
   type LanE2EAutomationReport,
@@ -91,6 +92,8 @@ export function E2ETestPage() {
   const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
   const [lanRunState, setLanRunState] = useState<LanE2EStatus | "idle">("idle");
   const [lanReport, setLanReport] = useState<LanE2EAutomationReport | null>(null);
+  const [lanScenarioId, setLanScenarioId] =
+    useState<CrossDeviceScenarioId>("cross.e2e.remote_display_smoke");
   const currentConfig = buildDefaultConfig(capabilities);
 
   useEffect(() => {
@@ -175,12 +178,13 @@ export function E2ETestPage() {
     publishLanAutomationStatus("running");
 
     const report = await runLanE2EAutomation(lanAutomationCommands, {
-      transportKind: "quic",
-      timeoutMs: 15_000,
-      sampleIntervalMs: 500,
-      minDecodedFrames: 20,
-      minFps: 2,
       ...optionOverrides,
+      scenarioId: optionOverrides.scenarioId ?? lanScenarioId,
+      transportKind: optionOverrides.transportKind ?? "quic",
+      timeoutMs: optionOverrides.timeoutMs ?? 15_000,
+      sampleIntervalMs: optionOverrides.sampleIntervalMs ?? 500,
+      minDecodedFrames: optionOverrides.minDecodedFrames ?? 20,
+      minFps: optionOverrides.minFps ?? 2,
     });
 
     setLanReport(report);
@@ -283,26 +287,50 @@ export function E2ETestPage() {
           <div>
             <h2 className="text-lg font-semibold mb-2">LAN E2E 自动化</h2>
             <p className="text-sm text-muted-foreground max-w-3xl">
-              两端打开同款 Rdesk 后，自动拉起/检查 mrd-service，刷新局域网发现，
-              选择可 P2P 的对端，启动远程会话与接收端窗口，并采样运行时探针确认真实画面流。
+              两端打开同款 Rdesk 后，自动拉起/检查 mrd-service，刷新局域网发现，按跨设备场景执行
+              discovery、远程显示 smoke、媒体画像或故障恢复预检，并输出结构化报告。
             </p>
           </div>
-          <button
-            type="button"
-            onClick={handleStartLanE2E}
-            disabled={lanRunState === "running"}
-            className="flex items-center justify-center gap-2 px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-60 transition-colors"
-          >
-            <Play className="h-4 w-4" />
-            {lanRunState === "running" ? "LAN E2E 运行中" : "开始 LAN E2E"}
-          </button>
+          <div className="flex flex-col gap-2 sm:min-w-72">
+            <label className="text-xs font-medium text-muted-foreground" htmlFor="lan-e2e-scenario">
+              跨设备场景
+            </label>
+            <select
+              id="lan-e2e-scenario"
+              aria-label="跨设备场景"
+              value={lanScenarioId}
+              disabled={lanRunState === "running"}
+              onChange={(event) => {
+                setLanScenarioId(parseCrossDeviceScenarioId(event.target.value) ?? "cross.e2e.remote_display_smoke");
+              }}
+              className="rounded-lg border bg-background px-3 py-2 text-sm"
+            >
+              <option value="cross.e2e.discovery">发现/配对预检</option>
+              <option value="cross.e2e.remote_display_smoke">远程显示 Smoke</option>
+              <option value="cross.e2e.media_profile">媒体画像校验</option>
+              <option value="cross.fault.recovery">故障恢复预检</option>
+            </select>
+            <button
+              type="button"
+              onClick={handleStartLanE2E}
+              disabled={lanRunState === "running"}
+              className="flex items-center justify-center gap-2 px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-60 transition-colors"
+            >
+              <Play className="h-4 w-4" />
+              {lanRunState === "running" ? "跨设备 E2E 运行中" : "开始跨设备 E2E"}
+            </button>
+          </div>
         </div>
 
-        <div className="mt-4 grid gap-3 md:grid-cols-4">
+        <div className="mt-4 grid gap-3 md:grid-cols-5">
           <AutomationStatusCard
             label="状态"
             value={formatLanStatus(lanRunState)}
-            tone={lanRunState === "completed" ? "success" : lanRunState === "failed" ? "danger" : "default"}
+            tone={lanRunState === "completed" ? "success" : lanRunState === "failed" ? "danger" : lanRunState === "skipped" ? "warning" : "default"}
+          />
+          <AutomationStatusCard
+            label="场景"
+            value={formatCrossDeviceScenario(lanReport?.scenarioId ?? lanScenarioId)}
           />
           <AutomationStatusCard
             label="目标设备"
@@ -321,6 +349,10 @@ export function E2ETestPage() {
         {lanReport && (
           <div className="mt-4 rounded-lg border bg-muted/30 p-3 text-sm">
             <div className="flex flex-wrap gap-x-6 gap-y-2">
+              <span>
+                <span className="text-muted-foreground">Scenario:</span>{" "}
+                {formatCrossDeviceScenario(lanReport.scenarioId)}
+              </span>
               <span>
                 <span className="text-muted-foreground">Session:</span>{" "}
                 {lanReport.sessionId ?? "n/a"}
@@ -342,8 +374,8 @@ export function E2ETestPage() {
                 {formatRequestedProfile(lanReport)}
               </span>
             </div>
-            {lanReport.status === "failed" && (
-              <p className="mt-2 text-red-500">
+            {(lanReport.status === "failed" || lanReport.status === "skipped") && (
+              <p className={`mt-2 ${lanReport.status === "skipped" ? "text-yellow-500" : "text-red-500"}`}>
                 {lanReport.failureReason}: {lanReport.errorMessage ?? "未知错误"}
               </p>
             )}
@@ -445,10 +477,16 @@ function AutomationStatusCard({
 }: {
   label: string;
   value: string;
-  tone?: "default" | "success" | "danger";
+  tone?: "default" | "success" | "danger" | "warning";
 }) {
   const color =
-    tone === "success" ? "text-green-500" : tone === "danger" ? "text-red-500" : "text-foreground";
+    tone === "success"
+      ? "text-green-500"
+      : tone === "danger"
+        ? "text-red-500"
+        : tone === "warning"
+          ? "text-yellow-500"
+          : "text-foreground";
 
   return (
     <div className="rounded-lg border bg-background/60 p-3">
@@ -470,6 +508,21 @@ function formatLanStatus(status: LanE2EStatus | "idle"): string {
       return "LAN E2E 跳过";
     default:
       return "等待启动";
+  }
+}
+
+function formatCrossDeviceScenario(scenarioId: CrossDeviceScenarioId): string {
+  switch (scenarioId) {
+    case "cross.e2e.discovery":
+      return "发现/配对预检";
+    case "cross.e2e.remote_display_smoke":
+      return "远程显示 Smoke";
+    case "cross.e2e.media_profile":
+      return "媒体画像校验";
+    case "cross.fault.recovery":
+      return "故障恢复预检";
+    default:
+      return "LAN 远程显示";
   }
 }
 
@@ -533,6 +586,7 @@ function buildLanAutomationOptionsFromSearchParams(
   searchParams: URLSearchParams
 ): LanE2EAutomationOptions {
   return {
+    scenarioId: parseCrossDeviceScenarioId(searchParams.get("scenarioId") ?? searchParams.get("scenario")),
     targetDeviceId: searchParams.get("targetDeviceId") ?? searchParams.get("target") ?? undefined,
     transportKind: parseTransportKind(searchParams.get("transport")),
     timeoutMs: parsePositiveNumber(searchParams.get("timeoutMs")),
@@ -541,6 +595,19 @@ function buildLanAutomationOptionsFromSearchParams(
     minFps: parsePositiveNumber(searchParams.get("minFps")),
     stopOnComplete: parseOptionalBoolean(searchParams.get("stopOnComplete")),
   };
+}
+
+function parseCrossDeviceScenarioId(value: string | null): CrossDeviceScenarioId | undefined {
+  if (
+    value === "lan.e2e.remote_display" ||
+    value === "cross.e2e.discovery" ||
+    value === "cross.e2e.remote_display_smoke" ||
+    value === "cross.e2e.media_profile" ||
+    value === "cross.fault.recovery"
+  ) {
+    return value;
+  }
+  return undefined;
 }
 
 function parseTransportKind(value: string | null): LanE2EAutomationOptions["transportKind"] {

@@ -18,6 +18,30 @@ import {
 
 export type LanE2EStatus = "running" | "completed" | "failed" | "skipped";
 
+export type CrossDeviceScenarioId =
+  | "lan.e2e.remote_display"
+  | "cross.e2e.discovery"
+  | "cross.e2e.remote_display_smoke"
+  | "cross.e2e.media_profile"
+  | "cross.fault.recovery";
+
+export type CrossDeviceFaultType =
+  | "network.pause_peer"
+  | "renderer.detach_surface";
+
+export interface CrossDeviceFaultPlan {
+  type: CrossDeviceFaultType;
+  durationMs?: number;
+  note?: string;
+}
+
+export interface CrossDeviceFaultEvent {
+  type: CrossDeviceFaultType;
+  status: "injected" | "unsupported" | "failed";
+  timestamp: number;
+  message?: string;
+}
+
 export type LanE2EFailureReason =
   | "service_unhealthy"
   | "local_device_registration_failed"
@@ -27,19 +51,22 @@ export type LanE2EFailureReason =
   | "capture_source_failed"
   | "receiver_start_failed"
   | "display_window_failed"
+  | "fault_injection_unsupported"
+  | "fault_injection_failed"
   | "no_remote_frames"
   | "media_profile_mismatch"
   | "runtime_error"
   | "stop_failed";
 
 export interface LanE2EStageEvent {
-  stage: "preflight" | "pairing" | "session" | "capture_source" | "receiver" | "display" | "sample" | "assert" | "cleanup";
-  status: "started" | "completed" | "failed";
+  stage: "preflight" | "pairing" | "session" | "capture_source" | "receiver" | "display" | "fault" | "sample" | "assert" | "cleanup";
+  status: "started" | "completed" | "failed" | "skipped";
   timestamp: number;
   error?: string;
 }
 
 export interface LanE2EAutomationOptions {
+  scenarioId?: CrossDeviceScenarioId;
   targetDeviceId?: string;
   transportKind?: "quic" | "webrtc";
   timeoutMs?: number;
@@ -49,13 +76,14 @@ export interface LanE2EAutomationOptions {
   minFps?: number;
   stopOnComplete?: boolean;
   requestedProfile?: MediaProfile;
+  faultPlan?: CrossDeviceFaultPlan;
   createSessionId?: () => string;
   now?: () => number;
 }
 
 export interface LanE2EAutomationReport {
   status: LanE2EStatus;
-  scenarioId: "lan.e2e.remote_display";
+  scenarioId: CrossDeviceScenarioId;
   sessionId?: string;
   controllerDeviceId?: string | null;
   peer?: LanPeerInfo;
@@ -66,6 +94,8 @@ export interface LanE2EAutomationReport {
   probeSnapshot?: ProbeSnapshot;
   profileProbeResult?: ProfileProbeResult;
   requestedProfile?: MediaProfile;
+  faultPlan?: CrossDeviceFaultPlan;
+  faultEvents: CrossDeviceFaultEvent[];
   validationMode: "quic_datagram" | "webrtc_rtp";
   dataPlaneVerified: boolean;
   mediaVerified: boolean;
@@ -110,6 +140,10 @@ export interface LanE2EAutomationCommands {
   }): Promise<AdapterResult<RemoteDisplayWindowContext>>;
   ipcSessionSnapshot(sessionId: string): Promise<AdapterResult<SessionRuntimeSnapshot>>;
   ipcProbeSnapshot(sessionId: string): Promise<AdapterResult<ProbeSnapshot>>;
+  crossE2EInjectFault?(
+    sessionId: string,
+    faultPlan: CrossDeviceFaultPlan
+  ): Promise<AdapterResult<string>>;
   ipcStopSession(sessionId: string): Promise<AdapterResult<string>>;
 }
 
@@ -155,6 +189,8 @@ export async function runLanE2EAutomation(
   const now = options.now ?? Date.now;
   const startedAt = now();
   const stages: LanE2EStageEvent[] = [];
+  const scenarioId = options.scenarioId ?? "lan.e2e.remote_display";
+  const faultEvents: CrossDeviceFaultEvent[] = [];
   const sampleIntervalMs = options.sampleIntervalMs ?? DEFAULT_SAMPLE_INTERVAL_MS;
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const minSampleDurationMs = options.minSampleDurationMs ?? DEFAULT_MIN_SAMPLE_DURATION_MS;
@@ -163,7 +199,7 @@ export async function runLanE2EAutomation(
   const stopOnComplete = options.stopOnComplete ?? true;
   const transportKind = options.transportKind ?? "quic";
   const requestedProfile =
-    transportKind === "quic"
+    shouldRequestMediaProfile(scenarioId, transportKind)
       ? options.requestedProfile ?? DEFAULT_LAN_MEDIA_PROFILE
       : options.requestedProfile;
   const validationMode = transportKind === "webrtc" ? "webrtc_rtp" : "quic_datagram";
@@ -193,7 +229,7 @@ export async function runLanE2EAutomation(
     errorMessage?: string
   ): LanE2EAutomationReport => ({
     status,
-    scenarioId: "lan.e2e.remote_display",
+    scenarioId,
     sessionId,
     controllerDeviceId,
     peer,
@@ -204,10 +240,13 @@ export async function runLanE2EAutomation(
     probeSnapshot,
     profileProbeResult,
     requestedProfile,
+    faultPlan: options.faultPlan,
+    faultEvents,
     validationMode,
-    dataPlaneVerified: status === "completed",
+    dataPlaneVerified: status === "completed" && scenarioRequiresMediaPipeline(scenarioId),
     mediaVerified:
       status === "completed" &&
+      scenarioRequiresMediaPipeline(scenarioId) &&
       (validationMode === "webrtc_rtp" || profileProbeResult?.status === "passed"),
     sampleDurationMs,
     thresholds: {
@@ -233,7 +272,8 @@ export async function runLanE2EAutomation(
       options.targetDeviceId,
       transportKind,
       timeoutMs,
-      sampleIntervalMs
+      sampleIntervalMs,
+      scenarioRequiresReadyPeer(scenarioId)
     );
     const selectedPeer = peerSelection.peer;
     peer = selectedPeer;
@@ -246,6 +286,23 @@ export async function runLanE2EAutomation(
       return finish("failed", "peer_not_found", "No LAN peer available");
     }
     stage("preflight", "completed");
+
+    if (scenarioId === "cross.e2e.discovery") {
+      stage("assert", "completed");
+      return finish("completed");
+    }
+
+    if (scenarioId === "cross.fault.recovery" && !commands.crossE2EInjectFault) {
+      const message = "Cross-device fault recovery requires mrd-service fault injection support";
+      faultEvents.push({
+        type: options.faultPlan?.type ?? "network.pause_peer",
+        status: "unsupported",
+        timestamp: now(),
+        message,
+      });
+      stage("fault", "skipped", message);
+      return finish("skipped", "fault_injection_unsupported", message);
+    }
 
     stage("pairing", "started");
     sessionId = options.createSessionId?.() ?? createDefaultSessionId(selectedPeer.device_id, now());
@@ -276,6 +333,41 @@ export async function runLanE2EAutomation(
       "display_window_failed"
     );
     stage("display", "completed");
+
+    if (scenarioId === "cross.fault.recovery") {
+      const faultPlan = options.faultPlan ?? { type: "network.pause_peer" as const, durationMs: 1000 };
+      stage("fault", "started");
+      const faultResult = await commands.crossE2EInjectFault?.(sessionId, faultPlan);
+      if (!faultResult) {
+        const message = "Cross-device fault injection command is unavailable";
+        faultEvents.push({
+          type: faultPlan.type,
+          status: "unsupported",
+          timestamp: now(),
+          message,
+        });
+        stage("fault", "skipped", message);
+        return finish("skipped", "fault_injection_unsupported", message);
+      }
+      if (!faultResult.ok) {
+        const message = faultResult.error.message;
+        faultEvents.push({
+          type: faultPlan.type,
+          status: "failed",
+          timestamp: now(),
+          message,
+        });
+        stage("fault", "failed", message);
+        return finish("failed", "fault_injection_failed", message);
+      }
+      faultEvents.push({
+        type: faultPlan.type,
+        status: "injected",
+        timestamp: now(),
+        message: faultResult.value,
+      });
+      stage("fault", "completed");
+    }
 
     stage("sample", "started");
     const deadline = Date.now() + timeoutMs;
@@ -386,14 +478,15 @@ async function waitForLanPeer(
   targetDeviceId: string | undefined,
   transportKind: string,
   timeoutMs: number,
-  pollIntervalMs: number
+  pollIntervalMs: number,
+  requireReadyPeer: boolean
 ): Promise<ReturnType<typeof selectPeer>> {
   const deadline = Date.now() + timeoutMs;
   let lastSelection: ReturnType<typeof selectPeer> | undefined;
 
   while (true) {
     const discovery = await unwrap(commands.ipcRefreshLanDiscovery(), "peer_not_found");
-    lastSelection = selectPeer(discovery, targetDeviceId, transportKind);
+    lastSelection = selectPeer(discovery, targetDeviceId, transportKind, requireReadyPeer);
 
     if (lastSelection.failureReason !== "peer_not_found") {
       return lastSelection;
@@ -409,7 +502,8 @@ async function waitForLanPeer(
 function selectPeer(
   snapshot: LanDiscoverySnapshot,
   targetDeviceId: string | undefined,
-  transportKind: string
+  transportKind: string,
+  requireReadyPeer: boolean
 ): {
   peer?: LanPeerInfo;
   failureReason?: "peer_not_found" | "peer_not_ready";
@@ -424,6 +518,7 @@ function selectPeer(
         message: `LAN peer not found: ${targetDeviceId}`,
       };
     }
+    if (!requireReadyPeer) return { peer: targetPeer };
     if (!isPeerReady(targetPeer, transportKind)) {
       return {
         peer: targetPeer,
@@ -433,6 +528,8 @@ function selectPeer(
     }
     return { peer: targetPeer };
   }
+
+  if (!requireReadyPeer && peers[0]) return { peer: peers[0] };
 
   const readyPeer = peers.find((peer) => isPeerReady(peer, transportKind));
   if (readyPeer) return { peer: readyPeer };
@@ -452,6 +549,21 @@ function selectPeer(
 
 function isPeerReady(peer: LanPeerInfo, transportKind: string): boolean {
   return peer.p2p_available && peerSupportsTransport(peer, transportKind);
+}
+
+function scenarioRequiresReadyPeer(scenarioId: CrossDeviceScenarioId): boolean {
+  return scenarioId !== "cross.e2e.discovery";
+}
+
+function scenarioRequiresMediaPipeline(scenarioId: CrossDeviceScenarioId): boolean {
+  return scenarioId !== "cross.e2e.discovery";
+}
+
+function shouldRequestMediaProfile(
+  scenarioId: CrossDeviceScenarioId,
+  transportKind: string
+): boolean {
+  return scenarioRequiresMediaPipeline(scenarioId) && transportKind === "quic";
 }
 
 function peerSupportsTransport(peer: LanPeerInfo, transportKind: string): boolean {
@@ -596,6 +708,9 @@ function stageForFailure(reason: LanE2EFailureReason): LanE2EStageEvent["stage"]
       return "receiver";
     case "display_window_failed":
       return "display";
+    case "fault_injection_unsupported":
+    case "fault_injection_failed":
+      return "fault";
     case "stop_failed":
       return "cleanup";
     default:

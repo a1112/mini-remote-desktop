@@ -116,7 +116,7 @@ describe("E2ETestPage LAN automation", () => {
       </MemoryRouter>
     );
 
-    fireEvent.click(await screen.findByRole("button", { name: /开始 LAN E2E/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /开始跨设备 E2E/ }));
 
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith(
@@ -138,6 +138,37 @@ describe("E2ETestPage LAN automation", () => {
     expect(screen.getAllByText(/Agent PC/).length).toBeGreaterThan(0);
     expect(screen.getByText(/QUIC datagram decoded 25/)).toBeInTheDocument();
     expect(screen.getAllByText(/全屏 shared \/ DISPLAY1 \/ 2560x1440/).length).toBeGreaterThan(0);
+  });
+
+  it("runs the cross-device discovery scenario without starting a LAN session", async () => {
+    const mockInvoke = installSuccessfulLanAutomationMock();
+
+    render(
+      <MemoryRouter>
+        <E2ETestPage />
+      </MemoryRouter>
+    );
+
+    fireEvent.change(await screen.findByLabelText("跨设备场景"), {
+      target: { value: "cross.e2e.discovery" },
+    });
+    fireEvent.click(await screen.findByRole("button", { name: /开始跨设备 E2E/ }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "automation_write_report",
+        expect.objectContaining({
+          report: expect.objectContaining({
+            status: "completed",
+            scenarioId: "cross.e2e.discovery",
+            dataPlaneVerified: false,
+            mediaVerified: false,
+          }),
+        })
+      );
+    });
+    expect(mockInvoke.mock.calls.some(([command]) => command === "ipc_start_lan_remote_session")).toBe(false);
+    expect(await screen.findByText(/LAN E2E 完成/)).toBeInTheDocument();
   });
 
   it("autoruns LAN remote display automation from URL query parameters", async () => {
@@ -170,7 +201,7 @@ describe("E2ETestPage LAN automation", () => {
         expect.objectContaining({
           report: expect.objectContaining({
             status: "completed",
-            scenarioId: "lan.e2e.remote_display",
+            scenarioId: "cross.e2e.remote_display_smoke",
           }),
         })
       );

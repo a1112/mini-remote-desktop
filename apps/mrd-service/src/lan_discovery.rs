@@ -1836,11 +1836,11 @@ async fn selected_capture_source_id(
 }
 
 async fn create_lan_frame_capture(
-    _source_id: &str,
+    source_id: &str,
     _profile: &MediaProfile,
 ) -> Result<LanFrameCapture> {
     #[cfg(test)]
-    if _source_id == TEST_SYNTHETIC_CAPTURE_SOURCE_ID {
+    if source_id == TEST_SYNTHETIC_CAPTURE_SOURCE_ID {
         return Ok(LanFrameCapture::Synthetic(SyntheticFrameCapture::new(
             _profile,
         )));
@@ -1863,7 +1863,7 @@ async fn create_lan_frame_capture(
     #[cfg(target_os = "linux")]
     {
         return Ok(LanFrameCapture::Pipewire(
-            crate::capture_source::create_frame_capture_async(_source_id).await?,
+            crate::capture_source::create_frame_capture_async(source_id).await?,
         ));
     }
 
