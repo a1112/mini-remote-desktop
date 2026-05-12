@@ -12,7 +12,7 @@ use mrd_encode_nvenc::NvencH264Encoder;
 use mrd_encode_openh264::OpenH264Encoder;
 use mrd_observability::{PipelineProbeSnapshot, ProbeRegistry, StageId};
 use mrd_pipeline_core::{
-    CapturedFrame, FrameCapture, FramePixelFormat, PipelineError, VideoEncoder,
+    CapturedFrame, DecodedFrameData, FrameCapture, FramePixelFormat, PipelineError, VideoEncoder,
 };
 use mrd_proto::SessionId;
 use mrd_transport_quic_quinn::{
@@ -370,7 +370,7 @@ impl QuicHostedPairHarness {
                     frame.is_keyframe,
                 );
                 for frame in frames {
-                    let bytes = frame.data.len();
+                    let bytes = decoded_frame_data_len(&frame.data);
                     sink.lock().expect("lock sink").ingest_frame_for_source(
                         session_id.clone(),
                         DEFAULT_SOURCE_ID.to_string(),
@@ -489,6 +489,19 @@ fn sync_reassembly_probe(
         .saturating_add(stats.rejected_fragments);
     receiver_probe.set_counter("quic_receiver_reassembly_drops", dropped);
     dropped
+}
+
+fn decoded_frame_data_len(data: &DecodedFrameData) -> usize {
+    match data {
+        DecodedFrameData::CpuRgb24(bytes) | DecodedFrameData::CpuBgra32(bytes) => bytes.len(),
+        DecodedFrameData::CpuNv12 { data, .. } | DecodedFrameData::CpuP010 { data, .. } => {
+            data.len()
+        }
+        #[cfg(windows)]
+        DecodedFrameData::D3D11SharedNv12 { .. } => 0,
+        #[cfg(windows)]
+        DecodedFrameData::D3D11SharedP010 { .. } => 0,
+    }
 }
 
 pub(crate) async fn run_quic_benchmark_pipeline(

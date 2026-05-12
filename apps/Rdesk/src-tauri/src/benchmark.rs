@@ -588,12 +588,367 @@ Duration: `{duration}s`\n\n\
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{
+        path::{Path, PathBuf},
+        thread,
+        time::{Duration, Instant},
+    };
 
     use mrd_observability::{PipelineProbeSnapshot, StageId, StageStatsSnapshot};
     use mrd_proto::SessionId;
 
+    use crate::test_harness::{
+        CaptureType, DecoderType, EncoderType, RendererType, TestChain, TestConfig, TestHarness,
+        TransportKind,
+    };
+
     use super::{BenchmarkManifest, BenchmarkPaths, BenchmarkSummary};
+
+    #[tokio::test]
+    async fn benchmark_run_writes_requested_artifacts() {
+        let Some(run_id) = env_string("MRD_BENCH_RUN_ID") else {
+            return;
+        };
+        let repo_root = env_string("MRD_BENCH_ARTIFACT_ROOT").unwrap_or_else(|| ".".to_string());
+        let profile =
+            env_string("MRD_BENCH_PROFILE").unwrap_or_else(|| "transport-webrtc-baseline".into());
+        let date = env_string("MRD_BENCH_DATE").unwrap_or_else(|| "manual".into());
+        let transport = env_string("MRD_BENCH_TRANSPORT").unwrap_or_else(|| "webrtc".into());
+        let encode_backend =
+            env_string("MRD_BENCH_ENCODE_BACKEND").unwrap_or_else(|| "openh264".into());
+        let decode_backend =
+            env_string("MRD_BENCH_DECODE_BACKEND").unwrap_or_else(|| "h264_software".into());
+        let capture_backend =
+            env_string("MRD_BENCH_CAPTURE_BACKEND").unwrap_or_else(|| "dxgi".into());
+        let renderer_backend =
+            env_string("MRD_BENCH_RENDERER_BACKEND").unwrap_or_else(|| "d3d11".into());
+        let width = env_u32("MRD_BENCH_WIDTH", 1280);
+        let height = env_u32("MRD_BENCH_HEIGHT", 720);
+        let fps = env_u32("MRD_BENCH_FPS", 30);
+        let duration_secs = env_u64("MRD_BENCH_DURATION_SECS", 20);
+        let session_id = SessionId(format!("session-{run_id}"));
+        let manifest = BenchmarkManifest {
+            run_id: run_id.clone(),
+            scenario: env_string("MRD_BENCH_SCENARIO").unwrap_or_else(|| "quick.transport".into()),
+            transport: transport.clone(),
+            capture_backend,
+            encode_backend: encode_backend.clone(),
+            decode_backend: decode_backend.clone(),
+            renderer_backend,
+            width,
+            height,
+            fps,
+            duration_secs,
+            git_commit: env_string("MRD_BENCH_GIT_COMMIT").unwrap_or_else(|| "unknown".into()),
+        };
+        let paths = BenchmarkPaths::new(Path::new(&repo_root), date, profile, run_id);
+
+        if transport == "quic_quinn" || transport == "quic" {
+            let outcome = crate::quic_transport_harness::run_quic_benchmark_pipeline(
+                session_id.clone(),
+                width as usize,
+                height as usize,
+                fps,
+                duration_secs,
+                &encode_backend,
+                &decode_backend,
+            )
+            .await
+            .expect("run quic benchmark pipeline");
+            let summary = BenchmarkSummary::from_transport_probes(
+                &manifest,
+                &outcome.sender_probe,
+                &outcome.receiver_probe,
+                true,
+                outcome.sink_snapshot.frame_count > 0,
+                outcome.first_frame_time_ms,
+                0,
+            );
+            super::write_benchmark_artifacts(
+                &paths,
+                &manifest,
+                &summary,
+                &session_id.0,
+                &outcome.receiver_probe,
+            )
+            .expect("write quic benchmark artifacts");
+        } else {
+            let (summary, probe) = run_harness_benchmark(&manifest, &session_id);
+            super::write_benchmark_artifacts(
+                &paths,
+                &manifest,
+                &summary,
+                &session_id.0,
+                &probe,
+            )
+            .expect("write webrtc benchmark artifacts");
+        }
+
+        assert!(paths.manifest_json.exists());
+        assert!(paths.summary_json.exists());
+        assert!(paths.summary_csv.exists());
+    }
+
+    fn run_harness_benchmark(
+        manifest: &BenchmarkManifest,
+        session_id: &SessionId,
+    ) -> (BenchmarkSummary, PipelineProbeSnapshot) {
+        let mut harness = TestHarness::new().expect("create benchmark harness");
+        harness.set_chain(TestChain::Custom {
+            capture: parse_capture_backend(&manifest.capture_backend),
+            encoder: parse_encoder_backend(&manifest.encode_backend),
+            decoder: parse_decoder_backend(&manifest.decode_backend),
+        });
+        harness.set_config(TestConfig {
+            resolution: Some((manifest.width as usize, manifest.height as usize)),
+            fps: Some(manifest.fps),
+            renderer: Some(parse_renderer_backend(&manifest.renderer_backend)),
+            transport: Some(TransportKind::WebrtcRtp),
+            ..Default::default()
+        });
+
+        let started = Instant::now();
+        harness.start().expect("start benchmark harness");
+        let first_frame_time_ms = wait_for_first_decoded_frame(&harness, Duration::from_secs(8));
+        thread::sleep(Duration::from_secs(manifest.duration_secs));
+        harness.stop().expect("stop benchmark harness");
+        let metrics = harness.get_metrics();
+        let elapsed_secs = started.elapsed().as_secs_f64().max(0.001);
+        let bitrate_kbps = (metrics.total_bitstream_bytes as f64 * 8.0) / elapsed_secs / 1000.0;
+        let first_frame_seen = first_frame_time_ms.is_some()
+            || metrics.decoded_frames > 0
+            || metrics.frame_count > 0;
+        let probe = probe_from_metrics(manifest, session_id, &metrics, bitrate_kbps);
+        let probe_complete = metrics.encoded_units > 0
+            && metrics.decoded_frames > 0
+            && metrics.encode_latency_p95_ms > 0.0
+            && metrics.decode_latency_p95_ms > 0.0;
+        let run_passed = first_frame_seen
+            && probe_complete
+            && metrics.encode_failures == 0
+            && metrics.decode_failures == 0
+            && metrics.error_message.is_none();
+
+        let summary = BenchmarkSummary {
+            run_id: manifest.run_id.clone(),
+            scenario: manifest.scenario.clone(),
+            transport: manifest.transport.clone(),
+            capture_backend: manifest.capture_backend.clone(),
+            encode_backend: manifest.encode_backend.clone(),
+            decode_backend: manifest.decode_backend.clone(),
+            renderer_backend: manifest.renderer_backend.clone(),
+            width: manifest.width,
+            height: manifest.height,
+            fps_target: manifest.fps,
+            duration_secs: manifest.duration_secs,
+            session_established: metrics.error_message.is_none(),
+            first_frame_seen,
+            first_frame_time_ms,
+            probe_complete,
+            fps_observed: metrics.decoded_fps.max(metrics.capture_fps),
+            bitrate_kbps,
+            keyframes: 0,
+            dropped_frames: metrics.dropped_frames as u64,
+            quic_receiver_completed_frames: None,
+            quic_receiver_expired_frames: None,
+            quic_receiver_evicted_frames: None,
+            quic_receiver_duplicate_fragments: None,
+            quic_receiver_rejected_fragments: None,
+            quic_receiver_pending_frames: None,
+            quic_receiver_reassembly_drops: None,
+            zero_write_access_unit_count: 0,
+            warning_count: 0,
+            error_count: u64::from(metrics.error_message.is_some()),
+            restart_count: 0,
+            encode_total_p95_ms: nonzero_option(metrics.encode_latency_p95_ms),
+            send_write_p95_ms: nonzero_option(metrics.transport_latency_p95_ms),
+            decode_total_p95_ms: nonzero_option(metrics.decode_latency_p95_ms),
+            frame_sink_ingest_p95_ms: nonzero_option(metrics.interactive_latency_p95_ms),
+            render_upload_p95_ms: nonzero_option(metrics.render_latency_avg_ms),
+            render_present_p95_ms: nonzero_option(metrics.present_latency_avg_ms),
+            nvdec_runtime_summary: String::new(),
+            nvdec_h264_capability: String::new(),
+            nvdec_hevc_capability: String::new(),
+            nvdec_hevc_main10_capability: String::new(),
+            run_passed,
+        };
+
+        (summary, probe)
+    }
+
+    fn wait_for_first_decoded_frame(harness: &TestHarness, timeout: Duration) -> Option<f64> {
+        let started = Instant::now();
+        while started.elapsed() < timeout {
+            let metrics = harness.get_metrics();
+            if metrics.decoded_frames > 0 || metrics.frame_count > 0 {
+                return Some(started.elapsed().as_secs_f64() * 1000.0);
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        None
+    }
+
+    fn probe_from_metrics(
+        manifest: &BenchmarkManifest,
+        session_id: &SessionId,
+        metrics: &crate::test_harness::HarnessMetrics,
+        bitrate_kbps: f64,
+    ) -> PipelineProbeSnapshot {
+        PipelineProbeSnapshot::from_parts(
+            session_id.clone(),
+            "session-primary".into(),
+            Some(manifest.capture_backend.clone()),
+            Some(manifest.encode_backend.clone()),
+            Some(manifest.transport.clone()),
+            metrics.decoded_fps.max(metrics.capture_fps),
+            bitrate_kbps,
+            metrics.dropped_frames as u64,
+            0,
+            vec![],
+            vec![
+                (
+                    StageId::EncodeTotal,
+                    stats_from_metrics(
+                        metrics.encode_latency_avg_ms,
+                        metrics.encode_latency_p50_ms,
+                        metrics.encode_latency_p95_ms,
+                        metrics.total_bitstream_bytes as u64,
+                    ),
+                ),
+                (
+                    StageId::SendWrite,
+                    stats_from_metrics(
+                        metrics.transport_latency_avg_ms,
+                        metrics.transport_latency_p50_ms,
+                        metrics.transport_latency_p95_ms,
+                        metrics.total_bitstream_bytes as u64,
+                    ),
+                ),
+                (
+                    StageId::DecodeTotal,
+                    stats_from_metrics(
+                        metrics.decode_latency_avg_ms,
+                        metrics.decode_latency_p50_ms,
+                        metrics.decode_latency_p95_ms,
+                        0,
+                    ),
+                ),
+                (
+                    StageId::FrameSinkIngest,
+                    stats_from_metrics(
+                        metrics.interactive_latency_avg_ms,
+                        metrics.interactive_latency_p50_ms,
+                        metrics.interactive_latency_p95_ms,
+                        0,
+                    ),
+                ),
+                (
+                    StageId::RenderUpload,
+                    stats_from_metrics(
+                        metrics.render_latency_avg_ms,
+                        metrics.render_latency_avg_ms,
+                        metrics.render_latency_avg_ms,
+                        0,
+                    ),
+                ),
+                (
+                    StageId::RenderPresent,
+                    stats_from_metrics(
+                        metrics.present_latency_avg_ms,
+                        metrics.present_latency_avg_ms,
+                        metrics.present_latency_avg_ms,
+                        0,
+                    ),
+                ),
+            ],
+        )
+    }
+
+    fn stats_from_metrics(avg: f64, p50: f64, p95: f64, bytes: u64) -> StageStatsSnapshot {
+        let mut samples = Vec::new();
+        for value in [avg, p50, p95] {
+            if value.is_finite() && value > 0.0 {
+                samples.push(value);
+            }
+        }
+        if samples.is_empty() {
+            samples.push(0.0);
+        }
+        StageStatsSnapshot::from_durations_ms(&samples, bytes)
+    }
+
+    fn parse_capture_backend(value: &str) -> CaptureType {
+        match value {
+            "synthetic" => CaptureType::Synthetic,
+            "winrt" => CaptureType::Winrt,
+            #[cfg(target_os = "linux")]
+            "linux" | "pipewire" => CaptureType::Linux,
+            "macos" => CaptureType::Macos,
+            _ => CaptureType::Dxgi,
+        }
+    }
+
+    fn parse_encoder_backend(value: &str) -> EncoderType {
+        match value {
+            "none" => EncoderType::None,
+            "openh264" | "openh264_speed" => EncoderType::OpenH264,
+            "videotoolbox" | "videotoolbox_h264" => EncoderType::VideoToolboxH264,
+            "nvenc_hevc" => EncoderType::NvencHevc,
+            "nvenc_hevc_main10" => EncoderType::NvencHevcMain10,
+            "nvenc_av1" => EncoderType::NvencAv1,
+            _ => EncoderType::NvencH264,
+        }
+    }
+
+    fn parse_decoder_backend(value: &str) -> DecoderType {
+        match value {
+            "none" => DecoderType::None,
+            "software" | "h264_software" | "openh264" => DecoderType::Software,
+            #[cfg(target_os = "linux")]
+            "linux_h264" => DecoderType::LinuxH264,
+            #[cfg(target_os = "linux")]
+            "linux_hevc" => DecoderType::LinuxHevc,
+            #[cfg(target_os = "linux")]
+            "linux_hevc_main10" => DecoderType::LinuxHevcMain10,
+            "videotoolbox" => DecoderType::VideoToolbox,
+            _ => DecoderType::Nvdec,
+        }
+    }
+
+    fn parse_renderer_backend(value: &str) -> RendererType {
+        match value {
+            "macos" | "metal" => RendererType::Macos,
+            #[cfg(target_os = "linux")]
+            "linux" => RendererType::Linux,
+            _ => RendererType::D3d11,
+        }
+    }
+
+    fn nonzero_option(value: f64) -> Option<f64> {
+        if value.is_finite() && value > 0.0 {
+            Some(value)
+        } else {
+            None
+        }
+    }
+
+    fn env_string(key: &str) -> Option<String> {
+        std::env::var(key).ok().filter(|value| !value.is_empty())
+    }
+
+    fn env_u32(key: &str, default: u32) -> u32 {
+        std::env::var(key)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    }
+
+    fn env_u64(key: &str, default: u64) -> u64 {
+        std::env::var(key)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    }
 
     #[test]
     fn benchmark_summary_extracts_key_metrics_from_probe() {

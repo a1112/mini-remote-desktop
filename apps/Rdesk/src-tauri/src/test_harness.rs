@@ -4215,6 +4215,7 @@ mod tests {
                 _ => None,
             },
             input_source: std::env::var("MRD_HARNESS_INPUT_SOURCE").ok(),
+            display_id: std::env::var("MRD_HARNESS_DISPLAY_ID").ok(),
             window_handle: std::env::var("MRD_HARNESS_WINDOW_HANDLE").ok(),
             visual_preview: match std::env::var("MRD_HARNESS_VISUAL_PREVIEW").as_deref() {
                 Ok("1") | Ok("true") | Ok("yes") => Some(true),

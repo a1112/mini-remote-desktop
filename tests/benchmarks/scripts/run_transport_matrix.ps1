@@ -25,36 +25,31 @@ $hostStdout = Join-Path $logsDir 'host.stdout.log'
 $hostStderr = Join-Path $logsDir 'host.stderr.log'
 $thresholdPath = Join-Path $repo ("tests/benchmarks/thresholds/{0}" -f $scenario.threshold_file)
 
-$psi = New-Object System.Diagnostics.ProcessStartInfo
-$psi.FileName = "cargo"
-$psi.WorkingDirectory = $repo
-$psi.RedirectStandardOutput = $true
-$psi.RedirectStandardError = $true
-$psi.UseShellExecute = $false
-$psi.Arguments = "test -p app benchmark_run_writes_requested_artifacts -- --nocapture"
-$psi.Environment["MRD_BENCH_ARTIFACT_ROOT"] = $repo
-$psi.Environment["MRD_BENCH_SCENARIO"] = $scenario.scenario
-$psi.Environment["MRD_BENCH_PROFILE"] = $scenario.profile
-$psi.Environment["MRD_BENCH_RUN_ID"] = $runId
-$psi.Environment["MRD_BENCH_DATE"] = $date
-$psi.Environment["MRD_BENCH_WIDTH"] = [string]$scenario.width
-$psi.Environment["MRD_BENCH_HEIGHT"] = [string]$scenario.height
-$psi.Environment["MRD_BENCH_FPS"] = [string]$scenario.fps
-$psi.Environment["MRD_BENCH_DURATION_SECS"] = [string]$scenario.duration_secs
-$psi.Environment["MRD_BENCH_GIT_COMMIT"] = $gitCommit
-$psi.Environment["MRD_BENCH_TRANSPORT"] = $scenario.transport
-$psi.Environment["MRD_BENCH_ENCODE_BACKEND"] = $scenario.encode_backend
-$psi.Environment["MRD_BENCH_DECODE_BACKEND"] = $scenario.decode_backend
+$env:MRD_BENCH_ARTIFACT_ROOT = $repo
+$env:MRD_BENCH_SCENARIO = $scenario.scenario
+$env:MRD_BENCH_PROFILE = $scenario.profile
+$env:MRD_BENCH_RUN_ID = $runId
+$env:MRD_BENCH_DATE = $date
+$env:MRD_BENCH_WIDTH = [string]$scenario.width
+$env:MRD_BENCH_HEIGHT = [string]$scenario.height
+$env:MRD_BENCH_FPS = [string]$scenario.fps
+$env:MRD_BENCH_DURATION_SECS = [string]$scenario.duration_secs
+$env:MRD_BENCH_GIT_COMMIT = $gitCommit
+$env:MRD_BENCH_TRANSPORT = $scenario.transport
+$env:MRD_BENCH_CAPTURE_BACKEND = $scenario.capture_backend
+$env:MRD_BENCH_ENCODE_BACKEND = $scenario.encode_backend
+$env:MRD_BENCH_DECODE_BACKEND = $scenario.decode_backend
+$env:MRD_BENCH_RENDERER_BACKEND = $scenario.renderer_backend
 
-$process = New-Object System.Diagnostics.Process
-$process.StartInfo = $psi
-$null = $process.Start()
-$stdout = $process.StandardOutput.ReadToEnd()
-$stderr = $process.StandardError.ReadToEnd()
-$process.WaitForExit()
-
-Set-Content -Path $hostStdout -Value $stdout -Encoding Ascii
-Set-Content -Path $hostStderr -Value $stderr -Encoding Ascii
+$process = Start-Process `
+  -FilePath "cargo" `
+  -ArgumentList @("test", "-p", "app", "benchmark_run_writes_requested_artifacts", "--", "--nocapture") `
+  -WorkingDirectory $repo `
+  -RedirectStandardOutput $hostStdout `
+  -RedirectStandardError $hostStderr `
+  -WindowStyle Hidden `
+  -Wait `
+  -PassThru
 
 if ($process.ExitCode -ne 0) {
   throw "benchmark cargo test failed with exit code $($process.ExitCode). See $hostStderr"

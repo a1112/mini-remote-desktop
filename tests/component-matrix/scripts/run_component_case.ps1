@@ -35,27 +35,20 @@ $manifest = [pscustomobject]@{
 }
 $manifest | ConvertTo-Json -Depth 6 | Set-Content $manifestPath -Encoding Ascii
 
-$psi = New-Object System.Diagnostics.ProcessStartInfo
-$psi.FileName = "cargo"
-$psi.WorkingDirectory = $repo
-$psi.RedirectStandardOutput = $true
-$psi.RedirectStandardError = $true
-$psi.UseShellExecute = $false
-$psi.Arguments = "test -p $($case.crate) $($case.test_name) -- --ignored --nocapture"
-$psi.Environment["MRD_COMPONENT_CASE_NAME"] = $case.case_name
-$psi.Environment["MRD_COMPONENT_SAMPLES"] = [string]$case.sample_count
-$psi.Environment["MRD_COMPONENT_RESULT_PATH"] = $resultPath
-$psi.Environment["MRD_COMPONENT_BACKEND"] = $case.backend
+$env:MRD_COMPONENT_CASE_NAME = $case.case_name
+$env:MRD_COMPONENT_SAMPLES = [string]$case.sample_count
+$env:MRD_COMPONENT_RESULT_PATH = $resultPath
+$env:MRD_COMPONENT_BACKEND = $case.backend
 
-$process = New-Object System.Diagnostics.Process
-$process.StartInfo = $psi
-$null = $process.Start()
-$stdout = $process.StandardOutput.ReadToEnd()
-$stderr = $process.StandardError.ReadToEnd()
-$process.WaitForExit()
-
-Set-Content -Path $stdoutPath -Value $stdout -Encoding Ascii
-Set-Content -Path $stderrPath -Value $stderr -Encoding Ascii
+$process = Start-Process `
+  -FilePath "cargo" `
+  -ArgumentList @("test", "-p", $case.crate, $case.test_name, "--", "--ignored", "--nocapture") `
+  -WorkingDirectory $repo `
+  -RedirectStandardOutput $stdoutPath `
+  -RedirectStandardError $stderrPath `
+  -WindowStyle Hidden `
+  -Wait `
+  -PassThru
 
 if ($process.ExitCode -ne 0) {
   throw "component test failed with exit code $($process.ExitCode). See $stderrPath"
