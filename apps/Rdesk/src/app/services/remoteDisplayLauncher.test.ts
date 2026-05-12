@@ -104,7 +104,7 @@ describe("launchRemoteDisplayForDevice", () => {
     });
   });
 
-  it("requests the default 2K144 QUIC media profile for LAN P2P remote display", async () => {
+  it("requests the default 1080p60 QUIC media profile for LAN P2P remote display", async () => {
     await launchRemoteDisplayForDevice("remote-device", {
       sessionId: "p2p-quic-session",
       transportKind: "quic",
@@ -116,10 +116,10 @@ describe("launchRemoteDisplayForDevice", () => {
       "remote-device",
       "quic",
       {
-        width: 2560,
-        height: 1440,
-        fps: 144,
-        bitrate_mbps: 64,
+        width: 1920,
+        height: 1080,
+        fps: 60,
+        bitrate_mbps: 20,
         codec: "h264",
       }
     );

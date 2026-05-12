@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Play, Grid3x3, CheckCircle2, XCircle, Clock, Loader2, Square } from "lucide-react";
+import { Play, Grid3x3, CheckCircle2, XCircle, Clock, Loader2, Square, RefreshCw } from "lucide-react";
 import * as commands from "../../adapters/tauri/commands";
 import type {
   EnvironmentSnapshot,
+  LanPeerInfo,
+  MediaProfile,
   TestConfig,
   TestRun,
   TestRunSummary,
@@ -13,6 +15,11 @@ import {
   evaluateCapabilityCombination,
   type CapabilitySnapshot,
 } from "../../services/capabilityMatrix";
+import {
+  runLanE2EAutomation,
+  type LanE2EAutomationCommands,
+  type LanE2EAutomationReport,
+} from "../../services/lanE2eAutomationService";
 import {
   readShowUnavailableCapabilities,
   useShowUnavailableCapabilities,
@@ -620,6 +627,27 @@ const STATUS_LABELS: Record<MatrixTest["status"], string> = {
 const MAX_MATRIX_RUNS = 300;
 const MAX_MATRIX_RENDER_ROWS = 250;
 const SKIP_YIELD_BATCH_SIZE = 20;
+const LOCAL_LAN_TARGET_ID = "__local__";
+
+type MatrixRunScope = "local" | "cross-device";
+
+const lanAutomationCommands: LanE2EAutomationCommands = {
+  serviceBootstrapIfNeeded: commands.serviceBootstrapIfNeeded,
+  serviceWaitForHealthy: (timeoutSecs = 10) =>
+    commands.serviceWaitForHealthy(timeoutSecs),
+  ipcRuntimeSnapshot: commands.ipcRuntimeSnapshot,
+  getHardwareInfo: commands.getHardwareInfo,
+  ipcRegisterDevice: commands.ipcRegisterDevice,
+  ipcRefreshLanDiscovery: commands.ipcRefreshLanDiscovery,
+  ipcStartLanRemoteSession: commands.ipcStartLanRemoteSession,
+  ipcListRemoteCaptureSources: commands.ipcListRemoteCaptureSources,
+  ipcSelectRemoteCaptureSource: commands.ipcSelectRemoteCaptureSource,
+  ipcStartReceiver: commands.ipcStartReceiver,
+  openRemoteDisplayWindow: commands.openRemoteDisplayWindow,
+  ipcSessionSnapshot: commands.ipcSessionSnapshot,
+  ipcProbeSnapshot: commands.ipcProbeSnapshot,
+  ipcStopSession: commands.ipcStopSession,
+};
 
 function yieldToUi(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
@@ -678,6 +706,69 @@ function matrixConfigKey(config: TestConfig): string {
     duration_ms: config.duration_ms,
     warmup_ms: config.warmup_ms,
   });
+}
+
+function crossDeviceMatrixKey(config: TestConfig): string {
+  return JSON.stringify({
+    transport_kind: crossDeviceTransportFromConfig(config),
+    resolution: config.resolution,
+    fps: config.fps,
+    bitrate: config.bitrate,
+    duration_ms: config.duration_ms,
+  });
+}
+
+function createCrossDeviceMatrixTests(matrixTests: MatrixTest[]): MatrixTest[] {
+  const seen = new Set<string>();
+  const tests: MatrixTest[] = [];
+
+  for (const test of matrixTests) {
+    const key = crossDeviceMatrixKey(test.config);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    tests.push({
+      ...test,
+      id: `cross_device_${tests.length}`,
+      status: "pending",
+      skipReason: undefined,
+      failureReason: undefined,
+      result: undefined,
+      duration: undefined,
+    });
+  }
+
+  return tests;
+}
+
+function crossDeviceTransportFromConfig(config: TestConfig): "quic" | "webrtc" {
+  return config.transport_kind === "webrtc" ? "webrtc" : "quic";
+}
+
+function mediaProfileFromConfig(config: TestConfig): MediaProfile {
+  const [width, height] = config.resolution ?? [1920, 1080];
+  return {
+    width,
+    height,
+    fps: config.fps ?? 60,
+    bitrate_mbps: Math.max(1, Math.round((config.bitrate ?? 20_000_000) / 1_000_000)),
+    codec: "h264",
+  };
+}
+
+function summaryFromLanReport(report: LanE2EAutomationReport): TestRunSummary {
+  const probe = report.probeSnapshot;
+  return {
+    total_duration_ms: Math.max(0, report.finishedAt - report.startedAt),
+    capture_fps: probe?.current_fps ?? undefined,
+    dropped_frames: probe?.frames_dropped ?? 0,
+    frame_count: probe?.frames_decoded ?? 0,
+    error_message: report.errorMessage,
+    failure_reason: report.failureReason ? "validation_failure" : undefined,
+  };
+}
+
+function sanitizeSessionPart(value: string): string {
+  return value.replace(/[^a-zA-Z0-9_-]/g, "-");
 }
 
 function localRendererForOs(
@@ -780,6 +871,11 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
   const [failedCount, setFailedCount] = useState(0);
   const [skippedCount, setSkippedCount] = useState(0);
   const [matrixNotice, setMatrixNotice] = useState<string | null>(null);
+  const [runScope, setRunScope] = useState<MatrixRunScope>("local");
+  const [lanPeers, setLanPeers] = useState<LanPeerInfo[]>([]);
+  const [selectedLanTargetId, setSelectedLanTargetId] =
+    useState(LOCAL_LAN_TARGET_ID);
+  const [isRefreshingLanPeers, setIsRefreshingLanPeers] = useState(false);
   const stopRequestedRef = useRef(false);
   const activeRunIdRef = useRef<string | null>(null);
   const environmentCapabilitySnapshot = useMemo(
@@ -818,6 +914,29 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
       cancelled = true;
     };
   }, [showUnavailable]);
+
+  const refreshLanPeers = useCallback(async () => {
+    setIsRefreshingLanPeers(true);
+    const result = await commands.ipcRefreshLanDiscovery();
+    if (result.ok) {
+      const peers = result.value.peers ?? [];
+      setLanPeers(peers);
+      setSelectedLanTargetId((current) =>
+        current === LOCAL_LAN_TARGET_ID ||
+        peers.some((peer) => peer.device_id === current)
+          ? current
+          : LOCAL_LAN_TARGET_ID
+      );
+    } else {
+      setMatrixNotice(`刷新 LAN 发现失败：${result.error.message}`);
+    }
+    setIsRefreshingLanPeers(false);
+  }, []);
+
+  useEffect(() => {
+    if (runScope !== "cross-device") return;
+    void refreshLanPeers();
+  }, [refreshLanPeers, runScope]);
 
   const toggleOption = (dimensionId: string, optionId: string) => {
     setMatrixNotice(null);
@@ -1153,6 +1272,168 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
     }
   };
 
+  const runCrossDeviceMatrixTests = async (
+    matrixTests: MatrixTest[],
+    targetPeer: LanPeerInfo
+  ) => {
+    const crossDeviceTests = createCrossDeviceMatrixTests(matrixTests);
+    if (crossDeviceTests.length === 0) return;
+
+    stopRequestedRef.current = false;
+    activeRunIdRef.current = null;
+    setMatrixNotice(
+      `正在运行跨设备矩阵：目标 ${targetPeer.device_name} (${targetPeer.ip})。`
+    );
+    setTests(crossDeviceTests);
+    setIsRunning(true);
+    setCurrentTestIndex(0);
+    setCompletedCount(0);
+    setFailedCount(0);
+    setSkippedCount(0);
+
+    await yieldToUi();
+
+    for (let i = 0; i < crossDeviceTests.length; i++) {
+      if (stopRequestedRef.current) break;
+
+      setCurrentTestIndex(i);
+      const test = crossDeviceTests[i];
+      if (!test) continue;
+
+      setTests((prev) =>
+        prev.map((t, idx) =>
+          idx === i ? { ...t, status: "running" as const } : t
+        )
+      );
+
+      const startTime = Date.now();
+      const markFailed = (
+        duration = Date.now() - startTime,
+        result?: TestRunSummary,
+        failureReason?: string
+      ) => {
+        setFailedCount((f) => f + 1);
+        setTests((prev) =>
+          prev.map((t, idx) =>
+            idx === i
+              ? {
+                  ...t,
+                  status: "failed" as const,
+                  result,
+                  duration,
+                  failureReason,
+                }
+              : t
+          )
+        );
+      };
+
+      try {
+        const profile = mediaProfileFromConfig(test.config);
+        const durationMs = test.config.duration_ms ?? 5000;
+        const report = await runLanE2EAutomation(lanAutomationCommands, {
+          scenarioId: "cross.e2e.remote_display_smoke",
+          targetDeviceId: targetPeer.device_id,
+          transportKind: crossDeviceTransportFromConfig(test.config),
+          requestedProfile: profile,
+          timeoutMs: Math.max(10_000, durationMs + (test.config.warmup_ms ?? 0) + 5000),
+          sampleIntervalMs: 500,
+          minSampleDurationMs: Math.min(1000, durationMs),
+          minDecodedFrames: 1,
+          minFps: 1,
+          createSessionId: () =>
+            `matrix-lan-${sanitizeSessionPart(targetPeer.device_id)}-${Date.now()}-${i}`,
+        });
+
+        const summary = summaryFromLanReport(report);
+        const duration = Date.now() - startTime;
+
+        if (stopRequestedRef.current) {
+          setSkippedCount((count) => count + 1);
+          setTests((prev) =>
+            prev.map((t, idx) =>
+              idx === i
+                ? {
+                    ...t,
+                    status: "skipped" as const,
+                    skipReason: "用户停止矩阵测试",
+                    duration,
+                  }
+                : t
+            )
+          );
+          break;
+        }
+
+        if (report.status === "completed") {
+          setCompletedCount((count) => count + 1);
+          setTests((prev) =>
+            prev.map((t, idx) =>
+              idx === i
+                ? {
+                    ...t,
+                    status: "completed" as const,
+                    result: summary,
+                    duration,
+                  }
+                : t
+            )
+          );
+        } else if (report.status === "skipped") {
+          setSkippedCount((count) => count + 1);
+          setTests((prev) =>
+            prev.map((t, idx) =>
+              idx === i
+                ? {
+                    ...t,
+                    status: "skipped" as const,
+                    result: summary,
+                    skipReason: report.errorMessage ?? report.failureReason ?? "跨设备用例跳过",
+                    duration,
+                  }
+                : t
+            )
+          );
+        } else {
+          markFailed(
+            duration,
+            summary,
+            report.errorMessage ?? report.failureReason ?? "跨设备矩阵用例失败"
+          );
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (stopRequestedRef.current) {
+          setSkippedCount((count) => count + 1);
+          setTests((prev) =>
+            prev.map((t, idx) =>
+              idx === i
+                ? {
+                    ...t,
+                    status: "skipped" as const,
+                    skipReason: "用户停止矩阵测试",
+                    duration: Date.now() - startTime,
+                  }
+                : t
+            )
+          );
+          break;
+        }
+        markFailed(undefined, undefined, message);
+      }
+
+      await yieldToUi();
+    }
+
+    activeRunIdRef.current = null;
+    setIsRunning(false);
+    setMatrixNotice(
+      stopRequestedRef.current
+        ? "跨设备矩阵测试已停止。"
+        : "跨设备矩阵测试已结束。"
+    );
+  };
+
   const handleStart = async () => {
     const matrixGeneration = generateMatrix();
     if (matrixGeneration.truncated) {
@@ -1160,6 +1441,18 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
       setMatrixNotice(
         `当前选择超过 ${MAX_MATRIX_RUNS} 个组合。请减少勾选项后再启动，避免 UI 和测试管线被一次性压满。`
       );
+      return;
+    }
+
+    if (runScope === "cross-device" && selectedLanTargetId !== LOCAL_LAN_TARGET_ID) {
+      const selectedPeer = lanPeers.find(
+        (peer) => peer.device_id === selectedLanTargetId
+      );
+      if (!selectedPeer) {
+        setMatrixNotice("未找到选中的跨设备目标，请刷新发现设备后重试。");
+        return;
+      }
+      await runCrossDeviceMatrixTests(matrixGeneration.tests, selectedPeer);
       return;
     }
 
@@ -1181,7 +1474,16 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
   };
 
   const matrixGeneration = useMemo(() => generateMatrix(), [generateMatrix]);
-  const plannedTotalTests = matrixGeneration.tests.length;
+  const isRemoteCrossDeviceRun =
+    runScope === "cross-device" && selectedLanTargetId !== LOCAL_LAN_TARGET_ID;
+  const plannedMatrixTests = useMemo(
+    () =>
+      isRemoteCrossDeviceRun
+        ? createCrossDeviceMatrixTests(matrixGeneration.tests)
+        : matrixGeneration.tests,
+    [isRemoteCrossDeviceRun, matrixGeneration.tests]
+  );
+  const plannedTotalTests = plannedMatrixTests.length;
   const totalTests = tests.length > 0 ? tests.length : plannedTotalTests;
   const finishedCount = completedCount + failedCount + skippedCount;
   const progress = totalTests > 0 ? (finishedCount / totalTests) * 100 : 0;
@@ -1215,6 +1517,63 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
         <p className="text-muted-foreground">
           批量参数组合测试，当前平台矩阵：{platformLabel}
         </p>
+      </div>
+
+      {/* Execution Scope */}
+      <div className="bg-card rounded-lg border p-4 mb-6">
+        <h2 className="text-lg font-semibold mb-4">执行目标</h2>
+        <div className="grid gap-4 md:grid-cols-[220px_minmax(0,1fr)]">
+          <label className="block">
+            <span className="mb-2 block text-sm font-medium">执行范围</span>
+            <select
+              aria-label="执行范围"
+              value={runScope}
+              disabled={isRunning}
+              onChange={(event) => {
+                const nextScope = event.target.value as MatrixRunScope;
+                setRunScope(nextScope);
+                setMatrixNotice(null);
+              }}
+              className="w-full rounded border border-border bg-background px-3 py-2 text-sm"
+            >
+              <option value="local">本机</option>
+              <option value="cross-device">跨设备</option>
+            </select>
+          </label>
+
+          {runScope === "cross-device" && (
+            <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_auto] md:items-end">
+              <label className="block">
+                <span className="mb-2 block text-sm font-medium">跨设备目标设备</span>
+                <select
+                  aria-label="跨设备目标设备"
+                  value={selectedLanTargetId}
+                  disabled={isRunning}
+                  onChange={(event) => setSelectedLanTargetId(event.target.value)}
+                  className="w-full rounded border border-border bg-background px-3 py-2 text-sm"
+                >
+                  <option value={LOCAL_LAN_TARGET_ID}>本机</option>
+                  {lanPeers.map((peer) => (
+                    <option key={peer.device_id} value={peer.device_id}>
+                      {peer.device_name} ({peer.ip})
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <button
+                type="button"
+                onClick={() => void refreshLanPeers()}
+                disabled={isRunning || isRefreshingLanPeers}
+                className="flex items-center justify-center gap-2 rounded border border-border bg-secondary px-3 py-2 text-sm text-secondary-foreground hover:bg-secondary/80 disabled:opacity-50"
+              >
+                <RefreshCw
+                  className={`h-4 w-4 ${isRefreshingLanPeers ? "animate-spin" : ""}`}
+                />
+                刷新发现设备
+              </button>
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Dimension Selection */}

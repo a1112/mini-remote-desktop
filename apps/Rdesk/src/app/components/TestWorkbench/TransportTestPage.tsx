@@ -1,7 +1,17 @@
-import { useState, useEffect } from "react";
-import { Play, Square, Network, Gauge } from "lucide-react";
+import { useState, useEffect, useCallback } from "react";
+import { Play, Square, Network, Gauge, RefreshCw } from "lucide-react";
 import * as commands from "../../adapters/tauri/commands";
-import type { EnvironmentSnapshot, TestConfig } from "../../adapters/tauri/types";
+import type {
+  EnvironmentSnapshot,
+  LanPeerInfo,
+  MediaProfile,
+  TestConfig,
+} from "../../adapters/tauri/types";
+import {
+  runLanE2EAutomation,
+  type LanE2EAutomationCommands,
+  type LanE2EAutomationReport,
+} from "../../services/lanE2eAutomationService";
 import { chooseCapability } from "./capabilityMeta";
 import {
   shouldShowCapabilityOption,
@@ -10,6 +20,27 @@ import {
 
 type TransportType = "quic" | "webrtc";
 type TestProfile = "latency" | "throughput" | "stability";
+type TransportRunScope = "local" | "cross-device";
+
+const LOCAL_LAN_TARGET_ID = "__local__";
+
+const lanAutomationCommands: LanE2EAutomationCommands = {
+  serviceBootstrapIfNeeded: commands.serviceBootstrapIfNeeded,
+  serviceWaitForHealthy: (timeoutSecs = 10) =>
+    commands.serviceWaitForHealthy(timeoutSecs),
+  ipcRuntimeSnapshot: commands.ipcRuntimeSnapshot,
+  getHardwareInfo: commands.getHardwareInfo,
+  ipcRegisterDevice: commands.ipcRegisterDevice,
+  ipcRefreshLanDiscovery: commands.ipcRefreshLanDiscovery,
+  ipcStartLanRemoteSession: commands.ipcStartLanRemoteSession,
+  ipcListRemoteCaptureSources: commands.ipcListRemoteCaptureSources,
+  ipcSelectRemoteCaptureSource: commands.ipcSelectRemoteCaptureSource,
+  ipcStartReceiver: commands.ipcStartReceiver,
+  openRemoteDisplayWindow: commands.openRemoteDisplayWindow,
+  ipcSessionSnapshot: commands.ipcSessionSnapshot,
+  ipcProbeSnapshot: commands.ipcProbeSnapshot,
+  ipcStopSession: commands.ipcStopSession,
+};
 
 interface TransportOption {
   id: TransportType;
@@ -45,12 +76,19 @@ interface TransportMetrics {
   bytes_sent: number;
   bytes_received: number;
   connection_count: number;
+  frames_received: number;
+  frames_decoded: number;
 }
 
 export function TransportTestPage() {
   const [selectedTransport, setSelectedTransport] = useState<TransportType>("quic");
   const [testProfile, setTestProfile] = useState<TestProfile>("latency");
   const [selectedServer, setSelectedServer] = useState("localhost");
+  const [runScope, setRunScope] = useState<TransportRunScope>("local");
+  const [lanPeers, setLanPeers] = useState<LanPeerInfo[]>([]);
+  const [selectedLanTargetId, setSelectedLanTargetId] =
+    useState(LOCAL_LAN_TARGET_ID);
+  const [isRefreshingLanPeers, setIsRefreshingLanPeers] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
   const [currentRunId, setCurrentRunId] = useState<string | null>(null);
   const [metrics, setMetrics] = useState<TransportMetrics | null>(null);
@@ -90,6 +128,29 @@ export function TransportTestPage() {
     };
   }, []);
 
+  const refreshLanPeers = useCallback(async () => {
+    setIsRefreshingLanPeers(true);
+    const result = await commands.ipcRefreshLanDiscovery();
+    if (result.ok) {
+      const peers = result.value.peers ?? [];
+      setLanPeers(peers);
+      setSelectedLanTargetId((current) =>
+        current === LOCAL_LAN_TARGET_ID ||
+        peers.some((peer) => peer.device_id === current)
+          ? current
+          : LOCAL_LAN_TARGET_ID
+      );
+    } else {
+      setStartError(`刷新 LAN 发现失败：${result.error.message}`);
+    }
+    setIsRefreshingLanPeers(false);
+  }, []);
+
+  useEffect(() => {
+    if (runScope !== "cross-device") return;
+    void refreshLanPeers();
+  }, [refreshLanPeers, runScope]);
+
   useEffect(() => {
     if (!isRunning) return;
 
@@ -104,6 +165,8 @@ export function TransportTestPage() {
         bytes_sent: Math.floor(Math.random() * 10000000),
         bytes_received: Math.floor(Math.random() * 5000000),
         connection_count: 1,
+        frames_received: 0,
+        frames_decoded: 0,
       };
 
       setMetrics(simulatedMetrics);
@@ -125,6 +188,44 @@ export function TransportTestPage() {
     setThroughputHistory([]);
     setStartError(null);
     setCurrentRunId(null);
+
+    if (runScope === "cross-device" && selectedLanTargetId !== LOCAL_LAN_TARGET_ID) {
+      const selectedPeer = lanPeers.find(
+        (peer) => peer.device_id === selectedLanTargetId
+      );
+      if (!selectedPeer) {
+        setStartError("未找到选中的跨设备目标，请刷新发现设备后重试。");
+        return;
+      }
+
+      setIsRunning(true);
+      const requestedProfile = mediaProfileForTestProfile(testProfile);
+      const report = await runLanE2EAutomation(lanAutomationCommands, {
+        scenarioId: "cross.e2e.remote_display_smoke",
+        targetDeviceId: selectedPeer.device_id,
+        transportKind: selectedTransport,
+        requestedProfile,
+        timeoutMs: 15_000,
+        sampleIntervalMs: 500,
+        minSampleDurationMs: 500,
+        minDecodedFrames: 1,
+        minFps: 1,
+        createSessionId: () =>
+          `transport-lan-${sanitizeSessionPart(selectedPeer.device_id)}-${Date.now()}`,
+      });
+      setMetrics(transportMetricsFromLanReport(report, requestedProfile));
+      setThroughputHistory([
+        report.probeSnapshot?.bitrate_mbps ?? requestedProfile.bitrate_mbps,
+      ]);
+      setIsRunning(false);
+
+      if (report.status !== "completed") {
+        setStartError(
+          report.errorMessage ?? report.failureReason ?? "跨设备传输测试失败"
+        );
+      }
+      return;
+    }
 
     const capture = chooseCapability(
       ["synthetic", "macos", "linux", "dxgi"],
@@ -198,6 +299,62 @@ export function TransportTestPage() {
         <p className="text-muted-foreground">
           测试 QUIC/WebRTC 传输性能和延迟
         </p>
+      </div>
+
+      {/* Execution Target */}
+      <div className="bg-card rounded-lg border p-4 mb-6">
+        <h2 className="text-lg font-semibold mb-4">执行目标</h2>
+        <div className="grid gap-4 md:grid-cols-[220px_minmax(0,1fr)]">
+          <label className="block">
+            <span className="mb-2 block text-sm font-medium">执行范围</span>
+            <select
+              aria-label="执行范围"
+              value={runScope}
+              disabled={isRunning}
+              onChange={(event) => {
+                setRunScope(event.target.value as TransportRunScope);
+                setStartError(null);
+              }}
+              className="w-full rounded border border-border bg-background px-3 py-2 text-sm"
+            >
+              <option value="local">本机</option>
+              <option value="cross-device">跨设备</option>
+            </select>
+          </label>
+
+          {runScope === "cross-device" && (
+            <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_auto] md:items-end">
+              <label className="block">
+                <span className="mb-2 block text-sm font-medium">跨设备目标设备</span>
+                <select
+                  aria-label="跨设备目标设备"
+                  value={selectedLanTargetId}
+                  disabled={isRunning}
+                  onChange={(event) => setSelectedLanTargetId(event.target.value)}
+                  className="w-full rounded border border-border bg-background px-3 py-2 text-sm"
+                >
+                  <option value={LOCAL_LAN_TARGET_ID}>本机</option>
+                  {lanPeers.map((peer) => (
+                    <option key={peer.device_id} value={peer.device_id}>
+                      {peer.device_name} ({peer.ip})
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <button
+                type="button"
+                onClick={() => void refreshLanPeers()}
+                disabled={isRunning || isRefreshingLanPeers}
+                className="flex items-center justify-center gap-2 rounded border border-border bg-secondary px-3 py-2 text-sm text-secondary-foreground hover:bg-secondary/80 disabled:opacity-50"
+              >
+                <RefreshCw
+                  className={`h-4 w-4 ${isRefreshingLanPeers ? "animate-spin" : ""}`}
+                />
+                刷新发现设备
+              </button>
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Transport Selection */}
@@ -374,6 +531,14 @@ export function TransportTestPage() {
                 <p className="font-mono">{metrics.connection_count}</p>
               </div>
               <div>
+                <p className="text-muted-foreground">解码帧</p>
+                <p className="font-mono">{metrics.frames_decoded}</p>
+              </div>
+              <div>
+                <p className="text-muted-foreground">接收帧</p>
+                <p className="font-mono">{metrics.frames_received}</p>
+              </div>
+              <div>
                 <p className="text-muted-foreground">协议</p>
                 <p className="font-mono uppercase">{selectedTransport}</p>
               </div>
@@ -455,6 +620,47 @@ function formatBytes(bytes: number): string {
     return `${(bytes / 1000).toFixed(2)} KB`;
   }
   return `${bytes} B`;
+}
+
+function mediaProfileForTestProfile(testProfile: TestProfile): MediaProfile {
+  return {
+    width: 1280,
+    height: 720,
+    fps: testProfile === "throughput" ? 60 : 30,
+    bitrate_mbps: testProfile === "throughput" ? 20 : 5,
+    codec: "h264",
+  };
+}
+
+function transportMetricsFromLanReport(
+  report: LanE2EAutomationReport,
+  requestedProfile: MediaProfile
+): TransportMetrics {
+  const probe = report.probeSnapshot;
+  const framesReceived = probe?.frames_received ?? 0;
+  const framesDropped = probe?.frames_dropped ?? 0;
+  const packetLossPercent =
+    framesReceived > 0 ? (framesDropped / framesReceived) * 100 : 0;
+  const throughputMbps = probe?.bitrate_mbps ?? requestedProfile.bitrate_mbps;
+  const sampleSeconds = Math.max(report.sampleDurationMs / 1000, 1);
+  const estimatedBytes = Math.round((throughputMbps * 1_000_000 * sampleSeconds) / 8);
+
+  return {
+    is_running: false,
+    throughput_mbps: throughputMbps,
+    latency_ms: 0,
+    jitter_ms: 0,
+    packet_loss_percent: packetLossPercent,
+    bytes_sent: estimatedBytes,
+    bytes_received: estimatedBytes,
+    connection_count: report.peer ? 1 : 0,
+    frames_received: framesReceived,
+    frames_decoded: probe?.frames_decoded ?? 0,
+  };
+}
+
+function sanitizeSessionPart(value: string): string {
+  return value.replace(/[^a-zA-Z0-9_-]/g, "-");
 }
 
 function getThroughputColor(mbps: number): string {

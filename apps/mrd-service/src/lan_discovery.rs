@@ -1282,6 +1282,9 @@ async fn start_lan_media_receiver(
                     remote_listen_addr: Some(bootstrap.listen_addr.to_string()),
                     remote_server_name: Some(bootstrap.server_name.clone()),
                     remote_cert_der_b64: None,
+                    lifecycle_state: "streaming".to_string(),
+                    last_error: None,
+                    receiver_active: true,
                     ..snapshot
                 },
             );
@@ -1826,23 +1829,28 @@ async fn receive_quic_media_loop(
                     }
                 }
                 Ok(_) => {}
-                Err(h264_error) => match decode_media_probe_frame(&frame.payload) {
-                    Ok(stats) => {
-                        app_state.probes.lock().await.record_media_probe_frame(
-                            &session_id,
-                            stats,
-                            now_ms(),
-                        );
+                Err(h264_error) => {
+                    let h264_error = h264_error.to_string();
+                    match decode_media_probe_frame(&frame.payload) {
+                        Ok(stats) => {
+                            app_state.probes.lock().await.record_media_probe_frame(
+                                &session_id,
+                                stats,
+                                now_ms(),
+                            );
+                        }
+                        Err(error) => {
+                            app_state.probes.lock().await.record_probe_drop(
+                                &session_id,
+                                frame.payload.len() as u64,
+                                now_ms(),
+                                format!("{h264_error}; legacy probe fallback failed: {error}"),
+                            );
+                        }
                     }
-                    Err(error) => {
-                        app_state.probes.lock().await.record_probe_drop(
-                            &session_id,
-                            frame.payload.len() as u64,
-                            now_ms(),
-                            format!("{h264_error}; legacy probe fallback failed: {error}"),
-                        );
-                    }
-                },
+                    decoder = H264SoftwareDecoder::new()
+                        .context("failed to reset LAN H.264 software decoder after decode error")?;
+                }
             }
         }
     }
@@ -2689,6 +2697,18 @@ mod tests {
             .latest_frame_data_url
             .as_deref()
             .is_some_and(|value| value.starts_with("data:image/png;base64,")));
+        let session_snapshot = controller_state
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
+            .expect("controller session snapshot");
+        assert!(
+            session_snapshot.receiver_active,
+            "controller should mark the LAN QUIC receiver active after connecting"
+        );
+        assert_eq!(session_snapshot.lifecycle_state, "streaming");
         assert!(
             controller_state
                 .media_tasks
