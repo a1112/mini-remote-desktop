@@ -2,8 +2,13 @@ import { openRemoteDisplayWindow } from "../adapters/tauri";
 import { isTauriRuntime } from "../utils/runtime";
 import { deviceService } from "./deviceService";
 import {
+  listRemoteCaptureSources,
+  selectRemoteCaptureSource,
   startLanRemoteSession,
   startSession,
+  stopSession,
+  type CaptureSource,
+  type CaptureSourceSelection,
   type MediaProfile,
   type TransportKind,
 } from "./ipcSessionService";
@@ -13,6 +18,14 @@ export type RemoteDisplayLaunchResult = {
   sessionId: string;
   windowLabel: string | null;
   mode: "native_window" | "route";
+  captureSourceSelection?: CaptureSourceSelection | null;
+};
+
+export type RemoteApplicationCatalogResult = {
+  sessionId: string;
+  sources: CaptureSource[];
+  windows: CaptureSource[];
+  displays: CaptureSource[];
 };
 
 const randomToken = () => Math.random().toString(36).slice(2, 8);
@@ -25,23 +38,50 @@ const DEFAULT_REMOTE_MEDIA_PROFILE: MediaProfile = {
   codec: "h264",
 };
 
+const DEFAULT_REMOTE_APPLICATION_MEDIA_PROFILE: MediaProfile = {
+  width: 1920,
+  height: 1080,
+  fps: 60,
+  bitrate_mbps: 20,
+  codec: "h264",
+};
+
+type RemoteDisplayLaunchOptions = {
+  transportKind?: TransportKind;
+  sessionId?: string;
+  openWindow?: boolean;
+  targetDeviceName?: string;
+  targetOs?: string;
+  targetIp?: string;
+  localTest?: boolean;
+  lanP2P?: boolean;
+  requestedProfile?: MediaProfile;
+  captureSourceId?: string;
+};
+
+type RemoteApplicationCatalogOptions = Omit<
+  RemoteDisplayLaunchOptions,
+  "openWindow" | "captureSourceId" | "localTest"
+> & {
+  sessionAlreadyStarted?: boolean;
+  includePreviews?: boolean;
+  limit?: number;
+};
+
+type RemoteApplicationLaunchOptions = Omit<
+  RemoteDisplayLaunchOptions,
+  "openWindow" | "captureSourceId" | "localTest"
+> & {
+  sessionAlreadyStarted?: boolean;
+};
+
 export function createSessionId(prefix: string): string {
   return `${prefix}-${Date.now()}-${randomToken()}`;
 }
 
 export async function launchRemoteDisplayForDevice(
   targetDeviceId: string,
-  options?: {
-    transportKind?: TransportKind;
-    sessionId?: string;
-    openWindow?: boolean;
-    targetDeviceName?: string;
-    targetOs?: string;
-    targetIp?: string;
-    localTest?: boolean;
-    lanP2P?: boolean;
-    requestedProfile?: MediaProfile;
-  }
+  options?: RemoteDisplayLaunchOptions
 ): Promise<RemoteDisplayLaunchResult> {
   const tauriRuntime = isTauriRuntime();
   const transportKind = tauriRuntime
@@ -81,10 +121,24 @@ export async function launchRemoteDisplayForDevice(
           transportKind,
           options?.requestedProfile ?? DEFAULT_REMOTE_MEDIA_PROFILE
         )
-    : await startSession(sessionId, targetDeviceId, transportKind);
+      : await startSession(sessionId, targetDeviceId, transportKind);
+
+  let captureSourceSelection: CaptureSourceSelection | null = null;
+  if (options?.captureSourceId) {
+    captureSourceSelection = await selectRemoteCaptureSource(
+      startedSessionId,
+      options.captureSourceId
+    );
+  }
 
   if (options?.openWindow === false) {
-    return { sessionId: startedSessionId, windowLabel: null, mode: "route" };
+    const result: RemoteDisplayLaunchResult = {
+      sessionId: startedSessionId,
+      windowLabel: null,
+      mode: "route",
+    };
+    if (captureSourceSelection) result.captureSourceSelection = captureSourceSelection;
+    return result;
   }
 
   const windowResult = await openRemoteDisplayWindow({ sessionId: startedSessionId });
@@ -92,10 +146,121 @@ export async function launchRemoteDisplayForDevice(
     throw new Error(windowResult.error.message);
   }
 
-  return {
+  const result: RemoteDisplayLaunchResult = {
     sessionId: startedSessionId,
     windowLabel: windowResult.value.label,
     mode: "native_window",
+  };
+  if (captureSourceSelection) result.captureSourceSelection = captureSourceSelection;
+  return result;
+}
+
+export async function prepareRemoteApplicationCatalogForDevice(
+  targetDeviceId: string,
+  options?: RemoteApplicationCatalogOptions
+): Promise<RemoteApplicationCatalogResult> {
+  if (!isTauriRuntime()) {
+    throw new Error("远程应用列表需要在桌面端运行");
+  }
+
+  if (!options?.lanP2P) {
+    throw new Error("远程应用当前需要 LAN P2P 会话");
+  }
+
+  const usingExistingSession = Boolean(
+    options?.sessionAlreadyStarted && options.sessionId
+  );
+  const sessionId = usingExistingSession
+    ? options!.sessionId!
+    : (
+        await launchRemoteDisplayForDevice(targetDeviceId, {
+          ...options,
+          openWindow: false,
+          requestedProfile:
+            options?.requestedProfile ?? DEFAULT_REMOTE_APPLICATION_MEDIA_PROFILE,
+        })
+      ).sessionId;
+
+  let sources: CaptureSource[];
+  try {
+    sources = await listRemoteCaptureSources(
+      sessionId,
+      options?.includePreviews ?? false,
+      options?.limit ?? 48
+    );
+  } catch (error) {
+    if (!usingExistingSession) {
+      await stopSession(sessionId).catch(() => undefined);
+    }
+    throw error;
+  }
+
+  return buildRemoteApplicationCatalog(sessionId, sources);
+}
+
+export async function launchRemoteApplicationForDevice(
+  targetDeviceId: string,
+  sourceId: string,
+  options?: RemoteApplicationLaunchOptions
+): Promise<RemoteDisplayLaunchResult> {
+  if (!isTauriRuntime()) {
+    throw new Error("远程应用需要在桌面端运行");
+  }
+
+  if (!options?.lanP2P) {
+    throw new Error("远程应用当前需要 LAN P2P 会话");
+  }
+
+  const usingExistingSession = Boolean(
+    options?.sessionAlreadyStarted && options.sessionId
+  );
+  const sessionId = usingExistingSession
+    ? options!.sessionId!
+    : (
+        await launchRemoteDisplayForDevice(targetDeviceId, {
+          ...options,
+          openWindow: false,
+          requestedProfile:
+            options?.requestedProfile ?? DEFAULT_REMOTE_APPLICATION_MEDIA_PROFILE,
+        })
+      ).sessionId;
+
+  let captureSourceSelection: CaptureSourceSelection;
+  let windowResult: Awaited<ReturnType<typeof openRemoteDisplayWindow>>;
+  try {
+    captureSourceSelection = await selectRemoteCaptureSource(sessionId, sourceId);
+    windowResult = await openRemoteDisplayWindow({ sessionId });
+    if (!windowResult.ok) {
+      throw new Error(windowResult.error.message);
+    }
+  } catch (error) {
+    if (!usingExistingSession) {
+      await stopSession(sessionId).catch(() => undefined);
+    }
+    throw error;
+  }
+
+  return {
+    sessionId,
+    windowLabel: windowResult.value.label,
+    mode: "native_window",
+    captureSourceSelection,
+  };
+}
+
+function buildRemoteApplicationCatalog(
+  sessionId: string,
+  sources: CaptureSource[]
+): RemoteApplicationCatalogResult {
+  const normalizedSources = Array.isArray(sources) ? sources : [];
+  return {
+    sessionId,
+    sources: normalizedSources,
+    windows: normalizedSources.filter((source) => source.source_kind === "window"),
+    displays: normalizedSources.filter(
+      (source) =>
+        source.source_kind === "display" || source.source_kind === "display_shared"
+    ),
   };
 }
 

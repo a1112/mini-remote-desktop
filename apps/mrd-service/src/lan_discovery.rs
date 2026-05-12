@@ -43,6 +43,8 @@ const LAN_QUIC_MEDIA_TRANSPORT: &str = "quic_datagram";
 const LAN_QUIC_MEDIA_PROFILE_TRANSPORT: &str = "quic_datagram_2k144";
 const LAN_MEDIA_PROFILE_CONTROL_TRANSPORT: &str = "media_profile_control_v1";
 const LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT: &str = "capture_source_control_v1";
+const LAN_MEDIA_SENDER_MAX_CONSECUTIVE_FRAME_ERRORS: u32 = 8;
+const LAN_MEDIA_SENDER_ERROR_LOG_INTERVAL: u32 = 3;
 const LAN_MEDIA_PROBE_MAGIC: &[u8; 8] = b"MRDMPF01";
 const LAN_MEDIA_PROBE_HEADER_BYTES: usize = 56;
 const LAN_MEDIA_PROBE_2K144_FORMAT: &str = "compressed_2k144_test_pattern";
@@ -1510,6 +1512,7 @@ async fn send_quic_media_loop(
     let mut capture: Option<LanFrameCapture> = None;
     let mut encoder: Option<OpenH264Encoder> = None;
     let mut encoder_config: Option<(usize, usize, u32, u32)> = None;
+    let mut consecutive_frame_errors = 0_u32;
     loop {
         if !session_allows_media(&app_state, &session_id).await {
             return Ok(());
@@ -1519,39 +1522,130 @@ async fn send_quic_media_loop(
 
         let source_id = selected_capture_source_id(&app_state, &session_id).await?;
         if active_source_id.as_deref() != Some(source_id.as_str()) {
-            capture = Some(create_lan_frame_capture(&source_id, &profile).await?);
-            encoder = None;
-            encoder_config = None;
-            active_source_id = Some(source_id);
+            match create_lan_frame_capture(&source_id, &profile).await {
+                Ok(next_capture) => {
+                    capture = Some(next_capture);
+                    encoder = None;
+                    encoder_config = None;
+                    active_source_id = Some(source_id);
+                    consecutive_frame_errors = 0;
+                    set_session_last_error(&app_state, &session_id, None).await;
+                }
+                Err(error) => {
+                    capture = None;
+                    encoder = None;
+                    encoder_config = None;
+                    active_source_id = None;
+                    handle_media_sender_frame_error(
+                        &app_state,
+                        &session_id,
+                        &source_id,
+                        &mut consecutive_frame_errors,
+                        format!("failed to create LAN capture source: {error:#}"),
+                    )
+                    .await?;
+                    continue;
+                }
+            }
         }
 
-        let raw_frame = capture
+        let raw_frame = match capture
             .as_mut()
-            .context("LAN media capture was not initialized")?
-            .capture_frame()
-            .context("failed to capture LAN desktop frame")?;
-        let frame = prepare_frame_for_h264(raw_frame, &profile)
-            .context("failed to prepare captured frame for H.264")?;
+            .context("LAN media capture was not initialized")
+            .and_then(|capture| {
+                capture
+                    .capture_frame()
+                    .context("failed to capture LAN desktop frame")
+            }) {
+            Ok(frame) => frame,
+            Err(error) => {
+                let error_source_id = active_source_id
+                    .as_deref()
+                    .unwrap_or("<unknown>")
+                    .to_string();
+                capture = None;
+                encoder = None;
+                encoder_config = None;
+                active_source_id = None;
+                handle_media_sender_frame_error(
+                    &app_state,
+                    &session_id,
+                    &error_source_id,
+                    &mut consecutive_frame_errors,
+                    format!("{error:#}"),
+                )
+                .await?;
+                continue;
+            }
+        };
+        let frame = match prepare_frame_for_h264(raw_frame, &profile) {
+            Ok(frame) => frame,
+            Err(error) => {
+                handle_media_sender_frame_error(
+                    &app_state,
+                    &session_id,
+                    active_source_id.as_deref().unwrap_or("<unknown>"),
+                    &mut consecutive_frame_errors,
+                    format!("failed to prepare captured frame for H.264: {error:#}"),
+                )
+                .await?;
+                continue;
+            }
+        };
         let expected_encoder_config =
             (frame.width, frame.height, profile.fps, profile.bitrate_mbps);
         if encoder_config != Some(expected_encoder_config) {
-            encoder = Some(
-                OpenH264Encoder::new_with_bitrate(
-                    frame.width,
-                    frame.height,
-                    profile.fps,
-                    profile.bitrate_mbps.saturating_mul(1_000_000).max(1),
-                )
-                .context("failed to create LAN H.264 encoder")?,
-            );
-            encoder_config = Some(expected_encoder_config);
+            match OpenH264Encoder::new_with_bitrate(
+                frame.width,
+                frame.height,
+                profile.fps,
+                profile.bitrate_mbps.saturating_mul(1_000_000).max(1),
+            )
+            .context("failed to create LAN H.264 encoder")
+            {
+                Ok(next_encoder) => {
+                    encoder = Some(next_encoder);
+                    encoder_config = Some(expected_encoder_config);
+                }
+                Err(error) => {
+                    encoder = None;
+                    encoder_config = None;
+                    handle_media_sender_frame_error(
+                        &app_state,
+                        &session_id,
+                        active_source_id.as_deref().unwrap_or("<unknown>"),
+                        &mut consecutive_frame_errors,
+                        format!("{error:#}"),
+                    )
+                    .await?;
+                    continue;
+                }
+            }
         }
 
-        let access_units = encoder
+        let access_units = match encoder
             .as_mut()
-            .context("LAN H.264 encoder was not initialized")?
-            .encode(&frame)
-            .context("failed to encode LAN desktop frame")?;
+            .context("LAN H.264 encoder was not initialized")
+            .and_then(|encoder| {
+                encoder
+                    .encode(&frame)
+                    .context("failed to encode LAN desktop frame")
+            }) {
+            Ok(access_units) => access_units,
+            Err(error) => {
+                encoder = None;
+                encoder_config = None;
+                handle_media_sender_frame_error(
+                    &app_state,
+                    &session_id,
+                    active_source_id.as_deref().unwrap_or("<unknown>"),
+                    &mut consecutive_frame_errors,
+                    format!("{error:#}"),
+                )
+                .await?;
+                continue;
+            }
+        };
 
         for access_unit in access_units {
             let fragments = fragment_access_unit(
@@ -1564,13 +1658,90 @@ async fn send_quic_media_loop(
             .context("failed to fragment LAN QUIC media frame")?;
 
             for fragment in fragments {
-                endpoint
+                if let Err(error) = endpoint
                     .send_datagram(fragment)
-                    .with_context(|| format!("failed to send LAN QUIC media frame {}", frame_id))?;
+                    .with_context(|| format!("failed to send LAN QUIC media frame {}", frame_id))
+                {
+                    handle_media_sender_frame_error(
+                        &app_state,
+                        &session_id,
+                        active_source_id.as_deref().unwrap_or("<unknown>"),
+                        &mut consecutive_frame_errors,
+                        format!("{error:#}"),
+                    )
+                    .await?;
+                    continue;
+                }
             }
             frame_id = frame_id.wrapping_add(1).max(1);
         }
+
+        if consecutive_frame_errors > 0 {
+            consecutive_frame_errors = 0;
+            set_session_last_error(&app_state, &session_id, None).await;
+        }
     }
+}
+
+async fn handle_media_sender_frame_error(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+    source_id: &str,
+    consecutive_frame_errors: &mut u32,
+    message: String,
+) -> Result<()> {
+    *consecutive_frame_errors = consecutive_frame_errors.saturating_add(1);
+    let decorated_message = format!(
+        "LAN media sender transient frame error {}/{} for source '{}': {}",
+        *consecutive_frame_errors,
+        LAN_MEDIA_SENDER_MAX_CONSECUTIVE_FRAME_ERRORS,
+        source_id,
+        message
+    );
+
+    if should_log_media_sender_frame_error(*consecutive_frame_errors) {
+        tracing::warn!(
+            session_id = %session_id.0,
+            source_id,
+            consecutive_frame_errors = *consecutive_frame_errors,
+            error = %message,
+            "LAN media sender skipped a frame"
+        );
+    }
+    set_session_last_error(app_state, session_id, Some(decorated_message.clone())).await;
+
+    if *consecutive_frame_errors >= LAN_MEDIA_SENDER_MAX_CONSECUTIVE_FRAME_ERRORS {
+        anyhow::bail!("{decorated_message}");
+    }
+
+    Ok(())
+}
+
+fn should_log_media_sender_frame_error(consecutive_frame_errors: u32) -> bool {
+    consecutive_frame_errors == 1
+        || consecutive_frame_errors >= LAN_MEDIA_SENDER_MAX_CONSECUTIVE_FRAME_ERRORS
+        || consecutive_frame_errors % LAN_MEDIA_SENDER_ERROR_LOG_INTERVAL == 0
+}
+
+async fn set_session_last_error(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+    last_error: Option<String>,
+) {
+    let mut sessions = app_state.sessions.lock().await;
+    let Some(snapshot) = sessions.get(session_id).cloned() else {
+        return;
+    };
+    if matches!(snapshot.lifecycle_state.as_str(), "closed" | "failed") {
+        return;
+    }
+    sessions.insert(
+        session_id.clone(),
+        SessionSnapshot {
+            last_error,
+            ..snapshot
+        },
+    );
 }
 
 async fn spawn_quic_media_receiver(

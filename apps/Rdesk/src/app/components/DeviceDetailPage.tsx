@@ -1,7 +1,18 @@
-import { useState, useEffect, useRef } from "react";
+import { useCallback, useState, useEffect, useRef } from "react";
 import { useParams, useNavigate } from "react-router";
 import { type Device, useDeviceById, useDevices } from "./deviceData";
-import { launchRemoteDisplayForDevice } from "../services/remoteDisplayLauncher";
+import {
+  launchRemoteApplicationForDevice,
+  launchRemoteDisplayForDevice,
+  prepareRemoteApplicationCatalogForDevice,
+  type RemoteApplicationCatalogResult,
+} from "../services/remoteDisplayLauncher";
+import {
+  stopSession,
+  type CaptureSource,
+  type CaptureSourceSelection,
+} from "../services/ipcSessionService";
+import { isTauriRuntime } from "../utils/runtime";
 import {
   ArrowLeft,
   Monitor,
@@ -27,7 +38,6 @@ import {
   Clipboard,
   Maximize2,
   Minimize2,
-  X,
   Send,
   Pause,
   Play,
@@ -36,16 +46,11 @@ import {
   File,
   Folder,
   ChevronRight,
-  Minus,
-  Square,
   Globe,
   FileText,
   Image,
   Music,
   Terminal,
-  Calculator,
-  Mail,
-  MessageSquare,
   Presentation,
   Database,
   Code,
@@ -68,86 +73,13 @@ import {
   Info,
   ArrowRightLeft,
   ChevronUp,
+  Loader2,
+  AlertCircle,
 } from "lucide-react";
 import { useTheme } from "./ThemeContext";
 import { useDetailBar } from "./DetailBarContext";
 
 type TabType = "remote" | "files" | "apps";
-
-const remoteApps = [
-  {
-    id: "vscode",
-    name: "Visual Studio Code",
-    icon: Code,
-    color: "bg-blue-500",
-    running: true,
-    description: "代码编辑器",
-    screenshot: "https://images.unsplash.com/photo-1753998943228-73470750c597?crop=entropy&cs=tinysrgb&fit=max&fm=jpg&ixid=M3w3Nzg4Nzd8MHwxfHNlYXJjaHwxfHxjb2RlJTIwZWRpdG9yJTIwSURFJTIwZGFyayUyMHRoZW1lfGVufDF8fHx8MTc3MjYyMTQ0OXww&ixlib=rb-4.1.0&q=80&w=1080",
-  },
-  {
-    id: "excel",
-    name: "Microsoft Excel",
-    icon: FileText,
-    color: "bg-green-600",
-    running: true,
-    description: "电子表格",
-    screenshot: "https://images.unsplash.com/photo-1584472666879-7d92db132958?crop=entropy&cs=tinysrgb&fit=max&fm=jpg&ixid=M3w3Nzg4Nzd8MHwxfHNlYXJjaHwxfHxzcHJlYWRzaGVldCUyMGRhdGElMjB0YWJsZSUyMGFwcGxpY2F0aW9ufGVufDF8fHx8MTc3MjYyMTQ1MHww&ixlib=rb-4.1.0&q=80&w=1080",
-  },
-  {
-    id: "browser",
-    name: "Google Chrome",
-    icon: Globe,
-    color: "bg-yellow-500",
-    running: true,
-    description: "网页浏览器",
-    screenshot: "https://images.unsplash.com/photo-1762330918012-5f2c1d31c521?crop=entropy&cs=tinysrgb&fit=max&fm=jpg&ixid=M3w3Nzg4Nzd8MHwxfHNlYXJjaHwxfHx3ZWIlMjBicm93c2VyJTIwY2hyb21lJTIwaW50ZXJmYWNlfGVufDF8fHx8MTc3MjYyMTQ1MXww&ixlib=rb-4.1.0&q=80&w=1080",
-  },
-  {
-    id: "terminal",
-    name: "Windows Terminal",
-    icon: Terminal,
-    color: "bg-gray-800",
-    running: false,
-    description: "命令行终端",
-    screenshot: null,
-  },
-  {
-    id: "calculator",
-    name: "计算器",
-    icon: Calculator,
-    color: "bg-indigo-500",
-    running: false,
-    description: "系统计算器",
-    screenshot: null,
-  },
-  {
-    id: "mail",
-    name: "Outlook",
-    icon: Mail,
-    color: "bg-blue-700",
-    running: false,
-    description: "邮件客户端",
-    screenshot: null,
-  },
-  {
-    id: "chat",
-    name: "微信",
-    icon: MessageSquare,
-    color: "bg-green-500",
-    running: false,
-    description: "即时通讯",
-    screenshot: null,
-  },
-  {
-    id: "ppt",
-    name: "PowerPoint",
-    icon: Presentation,
-    color: "bg-orange-600",
-    running: false,
-    description: "演示文稿",
-    screenshot: null,
-  },
-];
 
 const remoteFiles = [
   { name: "Documents", type: "folder" as const, size: "—", modified: "2026-03-03" },
@@ -926,25 +858,137 @@ function CtxItem({ icon, label, onClick, isDark, danger }: { icon: React.ReactNo
 /* ======================== Remote Apps Tab ======================== */
 function AppsTab({ device }: { device: Device }) {
   const { isDark } = useTheme();
-  const [launchedApp, setLaunchedApp] = useState<typeof remoteApps[0] | null>(null);
-  const [appLatency, setAppLatency] = useState(18);
-  const [appElapsed, setAppElapsed] = useState(0);
+  const navigate = useNavigate();
+  const [catalog, setCatalog] = useState<RemoteApplicationCatalogResult | null>(null);
+  const [sourcesLoading, setSourcesLoading] = useState(false);
+  const [openingSourceId, setOpeningSourceId] = useState<string | null>(null);
+  const [openingDesktop, setOpeningDesktop] = useState(false);
+  const [activeSelection, setActiveSelection] =
+    useState<CaptureSourceSelection | null>(null);
+  const [appsError, setAppsError] = useState<string | null>(null);
+  const appSessionIdRef = useRef<string | null>(null);
+  const sessionHandedOffRef = useRef(false);
   const isOnline = device.status === "online";
+  const desktopRuntime = isTauriRuntime();
+  const isLanP2PRemote = device.p2pAvailable && !device.isLocal;
+  const canUseRemoteApplications = desktopRuntime && isLanP2PRemote;
 
   useEffect(() => {
-    if (!launchedApp) return;
-    setAppElapsed(0);
-    const timer = setInterval(() => {
-      setAppElapsed((e) => e + 1);
-      setAppLatency((l) => Math.max(8, Math.min(45, l + Math.floor(Math.random() * 5) - 2)));
-    }, 1000);
-    return () => clearInterval(timer);
-  }, [launchedApp]);
+    return () => {
+      const sessionId = appSessionIdRef.current;
+      if (!sessionId || sessionHandedOffRef.current) return;
+      void stopSession(sessionId).catch(() => undefined);
+    };
+  }, []);
 
-  const formatTime = (s: number) => {
-    const m = Math.floor(s / 60);
-    const sec = s % 60;
-    return `${m.toString().padStart(2, "0")}:${sec.toString().padStart(2, "0")}`;
+  const loadRemoteApplications = useCallback(async () => {
+    if (!canUseRemoteApplications || sourcesLoading) return;
+
+    setSourcesLoading(true);
+    setAppsError(null);
+    try {
+      const existingSessionId = appSessionIdRef.current;
+      const nextCatalog = await prepareRemoteApplicationCatalogForDevice(
+        device.deviceId,
+        {
+          sessionId: existingSessionId ?? undefined,
+          sessionAlreadyStarted: Boolean(existingSessionId),
+          transportKind: "quic",
+          targetDeviceName: device.name,
+          targetOs: device.os,
+          targetIp: device.ip,
+          lanP2P: true,
+          includePreviews: false,
+          limit: 48,
+        }
+      );
+      appSessionIdRef.current = nextCatalog.sessionId;
+      setCatalog(nextCatalog);
+    } catch (error) {
+      setAppsError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSourcesLoading(false);
+    }
+  }, [
+    canUseRemoteApplications,
+    device.deviceId,
+    device.ip,
+    device.name,
+    device.os,
+    sourcesLoading,
+  ]);
+
+  useEffect(() => {
+    if (!isOnline || !canUseRemoteApplications || catalog || sourcesLoading || appsError) return;
+    void loadRemoteApplications();
+  }, [
+    appsError,
+    canUseRemoteApplications,
+    catalog,
+    isOnline,
+    loadRemoteApplications,
+    sourcesLoading,
+  ]);
+
+  const handleOpenDesktop = async () => {
+    setOpeningDesktop(true);
+    setAppsError(null);
+    try {
+      const result = await launchRemoteDisplayForDevice(device.deviceId, {
+        transportKind: device.p2pAvailable ? "quic" : "webrtc",
+        targetDeviceName: device.name,
+        targetOs: device.os,
+        targetIp: device.ip,
+        lanP2P: isLanP2PRemote,
+      });
+      if (result.mode === "route") navigate(`/session/${result.sessionId}`);
+    } catch (error) {
+      setAppsError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setOpeningDesktop(false);
+    }
+  };
+
+  const handleOpenApplication = async (source: CaptureSource) => {
+    setOpeningSourceId(source.id);
+    setAppsError(null);
+    try {
+      let sessionId = appSessionIdRef.current;
+      if (!sessionId) {
+        const nextCatalog = await prepareRemoteApplicationCatalogForDevice(
+          device.deviceId,
+          {
+            transportKind: "quic",
+            targetDeviceName: device.name,
+            targetOs: device.os,
+            targetIp: device.ip,
+            lanP2P: true,
+            includePreviews: false,
+            limit: 48,
+          }
+        );
+        sessionId = nextCatalog.sessionId;
+        appSessionIdRef.current = nextCatalog.sessionId;
+        setCatalog(nextCatalog);
+      }
+
+      const result = await launchRemoteApplicationForDevice(device.deviceId, source.id, {
+        sessionId,
+        sessionAlreadyStarted: true,
+        transportKind: "quic",
+        targetDeviceName: device.name,
+        targetOs: device.os,
+        targetIp: device.ip,
+        lanP2P: true,
+      });
+      sessionHandedOffRef.current = true;
+      setActiveSelection(result.captureSourceSelection ?? null);
+      if (result.mode === "route") navigate(`/session/${result.sessionId}`);
+    } catch (error) {
+      setAppsError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setOpeningSourceId(null);
+    }
   };
 
   if (!isOnline) {
@@ -958,91 +1002,41 @@ function AppsTab({ device }: { device: Device }) {
     );
   }
 
-  // Launched app full view — looks like a local app window
-  if (launchedApp) {
-    const AppIcon = launchedApp.icon;
+  const unavailableReason = !desktopRuntime
+    ? "远程应用需要桌面端运行"
+    : device.isLocal
+      ? "本机设备请使用本地测试工作台"
+      : !device.p2pAvailable
+        ? "当前设备未建立 LAN P2P 通道"
+        : null;
+  const remoteWindows = catalog?.windows ?? [];
+  const displaySources = catalog?.displays ?? [];
+
+  if (!canUseRemoteApplications) {
     return (
-      <div className="flex flex-col h-full bg-[#1e1e2e]">
-        {/* App-style title bar — looks local */}
-        <div className="flex items-center h-9 bg-[#2d2d3f] border-b border-white/5 shrink-0 select-none">
-          {/* App icon + name */}
-          <div className="flex items-center gap-2 px-3">
-            <div className={`w-4 h-4 rounded ${launchedApp.color} flex items-center justify-center`}>
-              <AppIcon className="w-2.5 h-2.5 text-white" />
-            </div>
-            <span className="text-gray-300" style={{ fontSize: 12 }}>{launchedApp.name}</span>
-            <span className="text-gray-600 ml-1" style={{ fontSize: 10 }}>— {device.name} (远程)</span>
+      <div className={`flex items-center justify-center h-full p-6 ${isDark ? "bg-[#1a1a1a]" : "bg-[#f0f2f5]"}`}>
+        <div className={`w-full max-w-[560px] rounded-xl border p-6 shadow-sm ${isDark ? "bg-[#202020] border-gray-700" : "bg-white border-gray-200"}`}>
+          <div className={`w-12 h-12 rounded-2xl flex items-center justify-center mb-4 ${isDark ? "bg-cyan-900/30" : "bg-cyan-50"}`}>
+            <AppWindow className="w-6 h-6 text-cyan-500" />
           </div>
-
-          <div className="flex-1" />
-
-          {/* Remote indicator pill */}
-          <div className="flex items-center gap-2 mr-3">
-            <div className="flex items-center gap-1 px-2 py-0.5 rounded-full bg-blue-500/20 border border-blue-500/30" style={{ fontSize: 9 }}>
-              <div className="w-1 h-1 rounded-full bg-blue-400 animate-pulse" />
-              <span className="text-blue-300">远程 · {appLatency}ms</span>
-            </div>
-            <span className="text-gray-500" style={{ fontSize: 10 }}>{formatTime(appElapsed)}</span>
+          <div className={isDark ? "text-gray-100" : "text-gray-900"} style={{ fontSize: 18 }}>远程应用不可用</div>
+          <div className={`mt-1 ${isDark ? "text-gray-500" : "text-gray-500"}`} style={{ fontSize: 13 }}>
+            {unavailableReason}
           </div>
-
-          {/* Window controls */}
-          <div className="flex items-center h-full">
-            <button className="flex items-center justify-center w-10 h-full text-gray-500 hover:bg-white/5 transition-colors">
-              <Minus className="w-3.5 h-3.5" />
-            </button>
-            <button className="flex items-center justify-center w-10 h-full text-gray-500 hover:bg-white/5 transition-colors">
-              <Square className="w-3 h-3" />
-            </button>
-            <button
-              onClick={() => setLaunchedApp(null)}
-              className="flex items-center justify-center w-10 h-full text-gray-500 hover:bg-red-500 hover:text-white transition-colors"
-            >
-              <X className="w-3.5 h-3.5" />
-            </button>
-          </div>
-        </div>
-
-        {/* App content */}
-        <div className="flex-1 relative overflow-hidden select-none">
-          {launchedApp.screenshot ? (
-            <img
-              src={launchedApp.screenshot}
-              alt={launchedApp.name}
-              className="w-full h-full object-cover"
-              draggable={false}
-            />
-          ) : (
-            <div className="flex items-center justify-center h-full bg-[#1e1e2e]">
-              <div className="text-center">
-                <div className={`w-16 h-16 rounded-2xl ${launchedApp.color} flex items-center justify-center mx-auto mb-4 shadow-lg`}>
-                  <AppIcon className="w-8 h-8 text-white" />
-                </div>
-                <div className="text-gray-300 mb-1" style={{ fontSize: 15 }}>{launchedApp.name}</div>
-                <div className="text-gray-500" style={{ fontSize: 12 }}>正在启动远程应用...</div>
-                <div className="mt-4 flex items-center justify-center gap-1">
-                  <div className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-bounce" style={{ animationDelay: "0ms" }} />
-                  <div className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-bounce" style={{ animationDelay: "150ms" }} />
-                  <div className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-bounce" style={{ animationDelay: "300ms" }} />
-                </div>
-              </div>
+          {appsError && (
+            <div className={`mt-4 rounded-lg border px-3 py-2 ${isDark ? "border-red-900/60 bg-red-950/20 text-red-300" : "border-red-100 bg-red-50 text-red-600"}`} style={{ fontSize: 12 }}>
+              {appsError}
             </div>
           )}
-
-          {/* Bottom floating bar */}
-          <div className="absolute bottom-3 left-1/2 -translate-x-1/2 flex items-center gap-2 px-3 py-1.5 rounded-lg bg-black/70 backdrop-blur-sm border border-white/10">
-            <div className="flex items-center gap-1 text-green-400" style={{ fontSize: 10 }}>
-              <div className="w-1 h-1 rounded-full bg-green-400" />
-              远程应用模式
-            </div>
-            <div className="w-px h-3 bg-white/20" />
-            <span className="text-gray-400" style={{ fontSize: 10 }}>{device.name}</span>
-            <div className="w-px h-3 bg-white/20" />
+          <div className="mt-5 flex items-center gap-2">
             <button
-              onClick={() => setLaunchedApp(null)}
-              className="text-gray-400 hover:text-red-400 transition-colors"
-              style={{ fontSize: 10 }}
+              onClick={() => void handleOpenDesktop()}
+              disabled={!desktopRuntime || openingDesktop}
+              className="inline-flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-white transition-colors hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-60"
+              style={{ fontSize: 13 }}
             >
-              关闭
+              {openingDesktop ? <Loader2 className="h-4 w-4 animate-spin" /> : <Monitor className="h-4 w-4" />}
+              打开远程桌面
             </button>
           </div>
         </div>
@@ -1050,108 +1044,186 @@ function AppsTab({ device }: { device: Device }) {
     );
   }
 
-  // App grid list
-  const runningApps = remoteApps.filter((a) => a.running);
-  const availableApps = remoteApps.filter((a) => !a.running);
-
   return (
     <div className={`h-full overflow-y-auto p-5 ${isDark ? "bg-[#1a1a1a]" : "bg-[#f0f2f5]"}`}>
-      <div className="max-w-4xl mx-auto">
-        {/* Explain */}
-        <div className={`flex items-start gap-3 p-3.5 rounded-lg border mb-5 ${isDark ? "bg-blue-900/20 border-blue-800" : "bg-blue-50 border-blue-100"}`}>
-          <AppWindow className="w-4 h-4 text-blue-600 shrink-0 mt-0.5" />
-          <div>
-            <div className={isDark ? "text-blue-400" : "text-blue-700"} style={{ fontSize: 13 }}>远程应用模式</div>
-            <div className={isDark ? "text-gray-400 mt-0.5" : "text-gray-500 mt-0.5"} style={{ fontSize: 12 }}>
-              仅显示远程设备上的单个应用窗口，看起来就像本地运行的程序。无需查看整个远程桌面，延迟更低，体验更流畅。
+      <div className="mx-auto max-w-6xl">
+        <div className={`mb-5 rounded-xl border p-4 shadow-sm ${isDark ? "bg-[#202020] border-gray-700" : "bg-white border-gray-200"}`}>
+          <div className="flex flex-wrap items-center gap-3">
+            <div className={`flex h-11 w-11 items-center justify-center rounded-xl ${isDark ? "bg-cyan-900/30" : "bg-cyan-50"}`}>
+              <AppWindow className="h-5 w-5 text-cyan-500" />
             </div>
+            <div className="min-w-0 flex-1">
+              <div className={`font-semibold ${isDark ? "text-gray-100" : "text-gray-900"}`} style={{ fontSize: 16 }}>远程应用</div>
+              <div className={`mt-0.5 truncate ${isDark ? "text-gray-500" : "text-gray-500"}`} style={{ fontSize: 12 }}>
+                {device.name} · {device.ip} · LAN QUIC 窗口流
+              </div>
+            </div>
+            <div className={`rounded-lg border px-3 py-1.5 ${isDark ? "border-gray-700 bg-[#181818] text-gray-400" : "border-gray-200 bg-gray-50 text-gray-600"}`} style={{ fontSize: 12 }}>
+              {catalog ? `${remoteWindows.length} 个窗口 / ${displaySources.length} 个屏幕` : "等待枚举"}
+            </div>
+            <button
+              onClick={() => void loadRemoteApplications()}
+              disabled={sourcesLoading}
+              className={`inline-flex items-center gap-2 rounded-lg border px-3 py-2 transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${isDark ? "border-gray-700 bg-[#1b1b1b] text-gray-300 hover:border-cyan-600" : "border-gray-200 bg-white text-gray-700 hover:border-cyan-300"}`}
+              style={{ fontSize: 12 }}
+            >
+              {sourcesLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+              刷新
+            </button>
           </div>
         </div>
 
-        {/* Running apps */}
-        {runningApps.length > 0 && (
-          <div className="mb-6">
-            <div className="flex items-center gap-2 mb-3">
-              <div className="w-1.5 h-1.5 rounded-full bg-green-500" />
-              <span className={isDark ? "text-gray-400" : "text-gray-600"} style={{ fontSize: 13 }}>正在运行 ({runningApps.length})</span>
-            </div>
-            <div className="grid grid-cols-3 gap-3">
-              {runningApps.map((app) => {
-                const AppIcon = app.icon;
-                return (
-                  <div
-                    key={app.id}
-                    onClick={() => setLaunchedApp(app)}
-                    className={`group relative p-4 rounded-xl border shadow-xs cursor-pointer transition-all ${isDark ? "bg-[#232323] border-gray-700 hover:border-blue-500 hover:shadow-md" : "bg-white border-gray-200 hover:border-blue-300 hover:shadow-md"}`}
-                  >
-                    {/* Thumbnail preview */}
-                    {app.screenshot && (
-                      <div className={`w-full h-24 rounded-lg overflow-hidden mb-3 border ${isDark ? "border-gray-700 bg-[#1a1a1a]" : "border-gray-100 bg-gray-50"}`}>
-                        <img
-                          src={app.screenshot}
-                          alt={app.name}
-                          className="w-full h-full object-cover opacity-90 group-hover:opacity-100 transition-opacity"
-                          draggable={false}
-                        />
-                      </div>
-                    )}
-                    <div className="flex items-center gap-3">
-                      <div className={`w-8 h-8 rounded-lg ${app.color} flex items-center justify-center shrink-0 shadow-sm`}>
-                        <AppIcon className="w-4 h-4 text-white" />
-                      </div>
-                      <div className="flex-1 min-w-0">
-                        <div className={`font-medium truncate ${isDark ? "text-gray-200" : "text-gray-800"}`} style={{ fontSize: 13 }}>{app.name}</div>
-                        <div className={isDark ? "text-gray-500" : "text-gray-400"} style={{ fontSize: 11 }}>{app.description}</div>
-                      </div>
-                    </div>
-                    {/* Running indicator */}
-                    <div className={`absolute top-2.5 right-2.5 flex items-center gap-1 px-1.5 py-0.5 rounded-full border ${isDark ? "bg-green-900/30 border-green-700" : "bg-green-50 border-green-200"}`} style={{ fontSize: 9 }}>
-                      <div className="w-1 h-1 rounded-full bg-green-500" />
-                      <span className="text-green-600">运行中</span>
-                    </div>
-                    {/* Hover overlay */}
-                    <div className="absolute inset-0 flex items-center justify-center rounded-xl bg-blue-600/0 group-hover:bg-blue-600/5 transition-colors">
-                      <div className="opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-blue-600 text-white shadow-lg" style={{ fontSize: 12 }}>
-                        <ExternalLink className="w-3 h-3" />
-                        打开应用
-                      </div>
-                    </div>
-                  </div>
-                );
-              })}
+        {activeSelection && (
+          <div className={`mb-5 flex items-center gap-3 rounded-xl border p-3 ${isDark ? "border-green-900/60 bg-green-950/20" : "border-green-100 bg-green-50"}`}>
+            <div className="h-2 w-2 rounded-full bg-green-500" />
+            <div className="min-w-0 flex-1">
+              <div className={isDark ? "text-green-300" : "text-green-700"} style={{ fontSize: 13 }}>
+                已打开 {remoteCaptureSourceTitle(activeSelection.source)}
+              </div>
+              <div className={isDark ? "text-green-500" : "text-green-600"} style={{ fontSize: 11 }}>
+                {activeSelection.session_id} · {remoteCaptureSourceMeta(activeSelection.source)}
+              </div>
             </div>
           </div>
         )}
 
-        {/* Available apps */}
-        <div>
-          <div className="flex items-center gap-2 mb-3">
-            <span className={isDark ? "text-gray-400" : "text-gray-500"} style={{ fontSize: 13 }}>可启动 ({availableApps.length})</span>
+        {appsError && (
+          <div className={`mb-5 flex items-start gap-3 rounded-xl border p-3 ${isDark ? "border-red-900/60 bg-red-950/20" : "border-red-100 bg-red-50"}`}>
+            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-red-500" />
+            <div className={isDark ? "text-red-300" : "text-red-600"} style={{ fontSize: 12 }}>{appsError}</div>
           </div>
-          <div className="grid grid-cols-4 gap-2.5">
-            {availableApps.map((app) => {
-              const AppIcon = app.icon;
+        )}
+
+        {sourcesLoading && !catalog && (
+          <div className={`rounded-xl border p-10 text-center ${isDark ? "border-gray-700 bg-[#202020]" : "border-gray-200 bg-white"}`}>
+            <Loader2 className="mx-auto mb-3 h-7 w-7 animate-spin text-cyan-500" />
+            <div className={isDark ? "text-gray-300" : "text-gray-700"} style={{ fontSize: 14 }}>正在枚举远端窗口</div>
+          </div>
+        )}
+
+        {!sourcesLoading && catalog && remoteWindows.length === 0 && (
+          <div className={`rounded-xl border p-6 text-center ${isDark ? "border-gray-700 bg-[#202020]" : "border-gray-200 bg-white"}`}>
+            <AppWindow className={`mx-auto mb-3 h-10 w-10 ${isDark ? "text-gray-600" : "text-gray-300"}`} />
+            <div className={isDark ? "text-gray-300" : "text-gray-700"} style={{ fontSize: 15 }}>未发现可独立捕获的窗口</div>
+            <div className={`mt-1 ${isDark ? "text-gray-500" : "text-gray-500"}`} style={{ fontSize: 12 }}>
+              已发现 {catalog.sources.length} 个采集源，可先打开远程桌面或在远端启动目标应用后刷新。
+            </div>
+            <button
+              onClick={() => void handleOpenDesktop()}
+              disabled={openingDesktop}
+              className="mt-5 inline-flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-white transition-colors hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-60"
+              style={{ fontSize: 13 }}
+            >
+              {openingDesktop ? <Loader2 className="h-4 w-4 animate-spin" /> : <Monitor className="h-4 w-4" />}
+              打开远程桌面
+            </button>
+          </div>
+        )}
+
+        {remoteWindows.length > 0 && (
+          <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
+            {remoteWindows.map((source) => {
+              const SourceIcon = remoteCaptureSourceIcon(source);
+              const opening = openingSourceId === source.id;
               return (
                 <div
-                  key={app.id}
-                  onClick={() => setLaunchedApp(app)}
-                  className={`flex items-center gap-2.5 p-3 rounded-lg border cursor-pointer transition-all group ${isDark ? "bg-[#232323] border-gray-700 hover:border-gray-600 hover:shadow-sm" : "bg-white border-gray-200 hover:border-gray-300 hover:shadow-sm"}`}
+                  key={source.id}
+                  className={`group overflow-hidden rounded-xl border shadow-sm transition-colors ${isDark ? "border-gray-700 bg-[#202020] hover:border-cyan-700" : "border-gray-200 bg-white hover:border-cyan-300"}`}
                 >
-                  <div className={`w-8 h-8 rounded-lg ${app.color} flex items-center justify-center shrink-0 opacity-80 group-hover:opacity-100 transition-opacity`}>
-                    <AppIcon className="w-4 h-4 text-white" />
+                  <div className={`flex h-28 items-center justify-center border-b ${isDark ? "border-gray-700 bg-[#151515]" : "border-gray-100 bg-gray-50"}`}>
+                    {source.preview_data_url ? (
+                      <img
+                        src={source.preview_data_url}
+                        alt={remoteCaptureSourceTitle(source)}
+                        className="h-full w-full object-cover"
+                        draggable={false}
+                      />
+                    ) : (
+                      <div className={`flex h-14 w-14 items-center justify-center rounded-2xl ${remoteCaptureSourceAccent(source)}`}>
+                        <SourceIcon className="h-7 w-7 text-white" />
+                      </div>
+                    )}
                   </div>
-                  <div className="flex-1 min-w-0">
-                    <div className={`truncate ${isDark ? "text-gray-300" : "text-gray-700"}`} style={{ fontSize: 12 }}>{app.name}</div>
-                    <div className={isDark ? "text-gray-500" : "text-gray-400"} style={{ fontSize: 10 }}>{app.description}</div>
+                  <div className="p-4">
+                    <div className="flex items-start gap-3">
+                      <div className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg ${remoteCaptureSourceAccent(source)}`}>
+                        <SourceIcon className="h-4 w-4 text-white" />
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <div className={`truncate font-medium ${isDark ? "text-gray-100" : "text-gray-900"}`} style={{ fontSize: 13 }}>
+                          {remoteCaptureSourceTitle(source)}
+                        </div>
+                        <div className={`mt-0.5 truncate ${isDark ? "text-gray-500" : "text-gray-500"}`} style={{ fontSize: 11 }}>
+                          {remoteCaptureSourceMeta(source)}
+                        </div>
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => void handleOpenApplication(source)}
+                      disabled={openingSourceId !== null}
+                      className="mt-4 inline-flex w-full items-center justify-center gap-2 rounded-lg bg-cyan-600 px-3 py-2 text-white transition-colors hover:bg-cyan-500 disabled:cursor-not-allowed disabled:opacity-60"
+                      style={{ fontSize: 12 }}
+                    >
+                      {opening ? <Loader2 className="h-4 w-4 animate-spin" /> : <ExternalLink className="h-4 w-4" />}
+                      {opening ? "正在打开" : "打开应用"}
+                    </button>
                   </div>
                 </div>
               );
             })}
           </div>
-        </div>
+        )}
       </div>
     </div>
   );
+}
+
+function remoteCaptureSourceTitle(source: CaptureSource): string {
+  return source.app_name?.trim() || source.title?.trim() || "Remote window";
+}
+
+function remoteCaptureSourceMeta(source: CaptureSource): string {
+  const details = [
+    source.title && source.title !== source.app_name ? source.title : null,
+    remoteCaptureSourceResolution(source),
+    source.process_id > 0 ? `PID ${source.process_id}` : null,
+  ].filter(Boolean);
+  return details.join(" · ") || remoteCaptureSourceKindLabel(source.source_kind);
+}
+
+function remoteCaptureSourceResolution(source: CaptureSource): string | null {
+  if (source.width > 0 && source.height > 0) {
+    return `${source.width}x${source.height}`;
+  }
+  return null;
+}
+
+function remoteCaptureSourceKindLabel(kind: string): string {
+  if (kind === "window") return "窗口";
+  if (kind === "display_shared") return "共享屏幕";
+  if (kind === "display") return "屏幕";
+  return kind;
+}
+
+function remoteCaptureSourceIcon(source: CaptureSource): typeof AppWindow {
+  const text = `${source.app_name ?? ""} ${source.title ?? ""} ${source.class_name ?? ""}`.toLowerCase();
+  if (text.includes("terminal") || text.includes("powershell") || text.includes("cmd")) return Terminal;
+  if (text.includes("chrome") || text.includes("edge") || text.includes("firefox") || text.includes("browser")) return Globe;
+  if (text.includes("code") || text.includes("visual studio") || text.includes("ide")) return Code;
+  if (text.includes("powerpoint") || text.includes("presentation")) return Presentation;
+  if (text.includes("excel") || text.includes("word") || text.includes("office") || text.includes("pdf")) return FileText;
+  return AppWindow;
+}
+
+function remoteCaptureSourceAccent(source: CaptureSource): string {
+  const text = `${source.app_name ?? ""} ${source.title ?? ""} ${source.class_name ?? ""}`.toLowerCase();
+  if (text.includes("terminal") || text.includes("powershell") || text.includes("cmd")) return "bg-gray-700";
+  if (text.includes("chrome") || text.includes("edge") || text.includes("firefox") || text.includes("browser")) return "bg-amber-500";
+  if (text.includes("code") || text.includes("visual studio") || text.includes("ide")) return "bg-blue-600";
+  if (text.includes("powerpoint") || text.includes("presentation")) return "bg-orange-600";
+  if (text.includes("excel")) return "bg-green-600";
+  if (text.includes("word") || text.includes("office") || text.includes("pdf")) return "bg-indigo-600";
+  return "bg-cyan-600";
 }
 
 /* ======================== Performance Monitoring Footer ======================== */
