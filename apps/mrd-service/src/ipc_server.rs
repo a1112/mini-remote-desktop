@@ -200,6 +200,30 @@ impl IpcServer {
                 session::select_remote_capture_source(&self.app_state, session_id, source_id).await
             }
 
+            IpcRequest::AttachRenderSurface {
+                session_id,
+                surface_id,
+                backend,
+                window_handle,
+            } => {
+                transport_handlers::attach_render_surface(
+                    &self.app_state,
+                    session_id,
+                    surface_id,
+                    backend,
+                    window_handle,
+                )
+                .await
+            }
+
+            IpcRequest::DetachRenderSurface {
+                session_id,
+                surface_id,
+            } => {
+                transport_handlers::detach_render_surface(&self.app_state, session_id, surface_id)
+                    .await
+            }
+
             IpcRequest::AcceptSession {
                 session_id,
                 source_device_id,
@@ -253,6 +277,10 @@ impl IpcServer {
             IpcRequest::CapabilitySnapshot => IpcResponse::CapabilitySnapshot {
                 snapshot: crate::capabilities::local_capability_snapshot(),
             },
+
+            IpcRequest::MediaPipelineSnapshot { session_id } => {
+                transport_handlers::media_pipeline_snapshot(&self.app_state, session_id).await
+            }
 
             IpcRequest::ServiceHealth => IpcResponse::ServiceHealth {
                 status: mrd_ipc::ServiceStatus {

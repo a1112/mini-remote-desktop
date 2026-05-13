@@ -516,7 +516,7 @@ fn configure_remote_display_native_surface(
         (true, _) => "d3d11_native",
         (false, _) => "web",
     };
-    let _ = state
+    let context = state
         .render_window_registry
         .lock()
         .unwrap()
@@ -525,9 +525,96 @@ fn configure_remote_display_native_surface(
             window.label(),
             render_mode.to_string(),
             snapshot.attached,
-        );
+        )
+        .ok();
+
+    if let Some(context) = context {
+        notify_remote_render_surface_configured(context, snapshot.clone());
+    }
 
     Ok(snapshot)
+}
+
+fn notify_remote_render_surface_configured(
+    context: RenderWindowContext,
+    snapshot: NativeRenderSurfaceSnapshot,
+) {
+    tauri::async_runtime::spawn(async move {
+        let result = if snapshot.attached {
+            send_attach_render_surface(
+                context.session_id,
+                context.surface_id,
+                snapshot.backend,
+                snapshot.hwnd.and_then(|value| parse_native_handle(&value)),
+            )
+            .await
+        } else {
+            send_detach_render_surface(context.session_id, context.surface_id).await
+        };
+
+        if let Err(error) = result {
+            tracing::warn!(%error, "failed to notify mrd-service about native render surface");
+        }
+    });
+}
+
+fn parse_native_handle(value: &str) -> Option<i64> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let hex = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"));
+    match hex {
+        Some(hex) => i64::from_str_radix(hex, 16).ok(),
+        None => trimmed.parse::<i64>().ok(),
+    }
+}
+
+async fn send_attach_render_surface(
+    session_id: String,
+    surface_id: String,
+    backend: String,
+    window_handle: Option<i64>,
+) -> Result<(), String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::AttachRenderSurface {
+            session_id: SessionId(session_id),
+            surface_id,
+            backend,
+            window_handle,
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+
+    match response {
+        IpcResponse::RenderSurfaceAttached { .. } => Ok(()),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+async fn send_detach_render_surface(session_id: String, surface_id: String) -> Result<(), String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::DetachRenderSurface {
+            session_id: SessionId(session_id),
+            surface_id,
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+
+    match response {
+        IpcResponse::RenderSurfaceDetached { .. } => Ok(()),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
 }
 
 #[tauri::command]
@@ -1397,6 +1484,29 @@ async fn ipc_probe_snapshot(session_id: String) -> Result<mrd_ipc::ProbeSnapshot
 
     match response {
         IpcResponse::ProbeSnapshot { snapshot } => Ok(snapshot),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+/// Get receiver media pipeline snapshot via IPC.
+#[tauri::command]
+async fn ipc_media_pipeline_snapshot(
+    session_id: String,
+) -> Result<mrd_ipc::MediaPipelineSnapshot, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+    use mrd_proto::SessionId;
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::MediaPipelineSnapshot {
+            session_id: SessionId(session_id),
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::MediaPipelineSnapshot { snapshot } => Ok(snapshot),
         IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
         _ => Err("Unexpected response".to_string()),
     }
@@ -2374,6 +2484,7 @@ fn main() {
             ipc_capability_snapshot,
             ipc_service_health,
             ipc_probe_snapshot,
+            ipc_media_pipeline_snapshot,
             ipc_start_sender,
             ipc_start_receiver,
             // Legacy commands

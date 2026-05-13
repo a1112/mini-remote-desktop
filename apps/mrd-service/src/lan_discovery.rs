@@ -1,15 +1,13 @@
 use crate::app_state::{AppState, DecodedVideoFrameStats, MediaProbeFrameStats};
 use anyhow::{Context, Result};
 use mrd_application::ports::SessionSnapshot;
-use mrd_decode::H264SoftwareDecoder;
 use mrd_encode_openh264::OpenH264Encoder;
 use mrd_ipc::{
     CaptureSource, CaptureSourceSelection, LanDiscoverySnapshot, LanPeerInfo, MediaProfile,
     MediaProfileNegotiation,
 };
 use mrd_pipeline_core::{
-    CapturedFrame, DecodedFrame, DecodedFrameData, FrameCapture, FramePixelFormat, VideoDecoder,
-    VideoEncoder,
+    CapturedFrame, DecodedFrame, DecodedFrameData, FramePixelFormat, VideoDecoder, VideoEncoder,
 };
 use mrd_proto::{DeviceId, SessionId};
 use mrd_transport_quic_quinn::{
@@ -1173,12 +1171,46 @@ async fn accept_lan_capture_source_select_from_sources(
         status: "selected".to_string(),
         reason: None,
     };
+    reconcile_media_profile_to_capture_source(app_state, session_id, &selection.source).await;
     app_state
         .capture_sources
         .lock()
         .await
         .set(session_id.clone(), selection.clone());
     Ok(selection)
+}
+
+async fn reconcile_media_profile_to_capture_source(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+    source: &CaptureSource,
+) {
+    let mut profiles = app_state.media_profiles.lock().await;
+    let mut negotiation = profiles
+        .get(session_id)
+        .unwrap_or_else(default_media_profile_negotiation);
+    let before = negotiation.selected.clone();
+
+    if source.width > 0 {
+        negotiation.selected.width = negotiation.selected.width.min(source.width);
+    }
+    if source.height > 0 {
+        negotiation.selected.height = negotiation.selected.height.min(source.height);
+    }
+    negotiation.selected_source_id = Some(source.id.clone());
+    negotiation.selected_width = Some(negotiation.selected.width);
+    negotiation.selected_height = Some(negotiation.selected.height);
+
+    if negotiation.selected != before {
+        negotiation.status = "downgraded".to_string();
+        negotiation.reason = Some("clamped to selected capture source dimensions".to_string());
+        negotiation.downgrade_reason =
+            Some("clamped to selected capture source dimensions".to_string());
+    } else if negotiation.downgrade_reason.is_none() {
+        negotiation.downgrade_reason = negotiation.reason.clone();
+    }
+
+    profiles.set(session_id.clone(), negotiation);
 }
 
 async fn ensure_active_sender_session(
@@ -1780,8 +1812,9 @@ async fn receive_quic_media_loop(
     endpoint: QuinnDatagramEndpoint,
 ) -> Result<()> {
     let mut reassembler = QuicAuReassembler::new(QuicAuReassemblerConfig::default());
-    let mut decoder =
-        H264SoftwareDecoder::new().context("failed to create LAN H.264 software decoder")?;
+    let mut decoder = create_lan_receiver_decoder(&app_state, &session_id)
+        .await
+        .context("failed to create LAN media receiver decoder")?;
     loop {
         if !session_allows_media(&app_state, &session_id).await {
             return Ok(());
@@ -1794,7 +1827,7 @@ async fn receive_quic_media_loop(
             .push_datagram(&datagram)
             .context("failed to reassemble LAN QUIC media frame")?
         {
-            match decode_h264_desktop_frame(&mut decoder, &frame.payload) {
+            match decode_h264_desktop_frame(decoder.as_mut(), &frame.payload) {
                 Ok(decoded_frames) if !decoded_frames.is_empty() => {
                     let profile = selected_media_profile(&app_state, &session_id).await;
                     for decoded_frame in decoded_frames {
@@ -1848,12 +1881,57 @@ async fn receive_quic_media_loop(
                             );
                         }
                     }
-                    decoder = H264SoftwareDecoder::new()
-                        .context("failed to reset LAN H.264 software decoder after decode error")?;
+                    decoder = create_lan_receiver_decoder(&app_state, &session_id)
+                        .await
+                        .context("failed to reset LAN media receiver decoder after decode error")?;
                 }
             }
         }
     }
+}
+
+async fn create_lan_receiver_decoder(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+) -> Result<Box<dyn VideoDecoder>> {
+    let mut last_error = None;
+    for backend in lan_receiver_decoder_candidates() {
+        match mrd_decode::create_decoder(backend) {
+            Ok(decoder) => {
+                app_state
+                    .media_pipelines
+                    .lock()
+                    .await
+                    .set_active_decoder(session_id.clone(), *backend);
+                return Ok(decoder);
+            }
+            Err(error) => {
+                last_error = Some(format!("{backend}: {error}"));
+            }
+        }
+    }
+
+    anyhow::bail!(
+        "no LAN receiver decoder available{}",
+        last_error
+            .map(|error| format!("; last error: {error}"))
+            .unwrap_or_default()
+    )
+}
+
+#[cfg(windows)]
+fn lan_receiver_decoder_candidates() -> &'static [&'static str] {
+    &["nvdec", "h264_software"]
+}
+
+#[cfg(target_os = "linux")]
+fn lan_receiver_decoder_candidates() -> &'static [&'static str] {
+    &["linux_h264", "h264_software"]
+}
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
+fn lan_receiver_decoder_candidates() -> &'static [&'static str] {
+    &["h264_software"]
 }
 
 async fn session_allows_media(app_state: &Arc<AppState>, session_id: &SessionId) -> bool {
@@ -1911,7 +1989,9 @@ impl LanFrameCapture {
                 .capture_frame()
                 .map_err(|error| anyhow::anyhow!(error.to_string())),
             #[cfg(test)]
-            LanFrameCapture::Synthetic(capture) => Ok(capture.capture_frame()?),
+            LanFrameCapture::Synthetic(capture) => {
+                Ok(mrd_pipeline_core::FrameCapture::capture_frame(capture)?)
+            }
             #[cfg(not(any(windows, target_os = "macos", target_os = "linux", test)))]
             _ => anyhow::bail!("Frame capture not supported on this platform"),
         }
@@ -1940,7 +2020,7 @@ impl SyntheticFrameCapture {
 }
 
 #[cfg(test)]
-impl FrameCapture for SyntheticFrameCapture {
+impl mrd_pipeline_core::FrameCapture for SyntheticFrameCapture {
     fn capture_frame(&mut self) -> Result<CapturedFrame, mrd_pipeline_core::PipelineError> {
         let mut rgb = vec![0_u8; self.width * self.height * 3];
         for y in 0..self.height {
@@ -2149,7 +2229,7 @@ fn read_captured_rgb(
 }
 
 fn decode_h264_desktop_frame(
-    decoder: &mut H264SoftwareDecoder,
+    decoder: &mut dyn VideoDecoder,
     payload: &[u8],
 ) -> Result<Vec<DecodedFrame>> {
     decoder
@@ -2302,6 +2382,10 @@ fn default_media_profile_negotiation() -> MediaProfileNegotiation {
         selected: profile,
         status: "accepted".to_string(),
         reason: None,
+        selected_source_id: None,
+        selected_width: None,
+        selected_height: None,
+        downgrade_reason: None,
     }
 }
 
@@ -2321,9 +2405,17 @@ fn negotiate_media_profile(
     let changed = selected != requested;
     Ok(MediaProfileNegotiation {
         requested,
-        selected,
+        selected: selected.clone(),
         status: if changed { "downgraded" } else { "accepted" }.to_string(),
         reason: if changed {
+            Some("clamped to LAN QUIC media capability".to_string())
+        } else {
+            None
+        },
+        selected_source_id: None,
+        selected_width: Some(selected.width),
+        selected_height: Some(selected.height),
+        downgrade_reason: if changed {
             Some("clamped to LAN QUIC media capability".to_string())
         } else {
             None
@@ -2971,6 +3063,87 @@ mod tests {
                 .source
                 .source_kind,
             "window"
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_source_selection_reconciles_media_profile_to_source_dimensions() {
+        let app_state = Arc::new(AppState::new());
+        let session_id = SessionId("capture-source-profile-session".to_string());
+        app_state.sessions.lock().await.insert(
+            session_id.clone(),
+            SessionSnapshot {
+                session_id: session_id.clone(),
+                transport: "quic".to_string(),
+                source_device_id: Some(DeviceId("controller-device".to_string())),
+                target_device_id: None,
+                local_listen_addr: None,
+                local_server_name: None,
+                local_cert_der_b64: None,
+                remote_listen_addr: None,
+                remote_server_name: None,
+                remote_cert_der_b64: None,
+                lifecycle_state: "listening".to_string(),
+                last_error: None,
+                sender_active: true,
+                receiver_active: false,
+            },
+        );
+        app_state.media_profiles.lock().await.set(
+            session_id.clone(),
+            negotiate_media_profile(Some(MediaProfile {
+                width: 1920,
+                height: 1080,
+                fps: 120,
+                bitrate_mbps: 20,
+                codec: "h264".to_string(),
+            }))
+            .unwrap(),
+        );
+
+        let source = mrd_ipc::CaptureSource {
+            id: "linux:display:1".to_string(),
+            platform: "linux".to_string(),
+            source_kind: "display".to_string(),
+            title: "Linux Display".to_string(),
+            class_name: "PipeWirePortal".to_string(),
+            width: 1728,
+            height: 1080,
+            process_id: 0,
+            app_name: Some("Display".to_string()),
+            bundle_identifier: None,
+            preview_data_url: None,
+            preview_width: None,
+            preview_height: None,
+        };
+
+        accept_lan_capture_source_select_from_sources(
+            &app_state,
+            &session_id,
+            "linux:display:1",
+            vec![source],
+        )
+        .await
+        .unwrap();
+
+        let negotiation = app_state
+            .media_profiles
+            .lock()
+            .await
+            .get(&session_id)
+            .expect("reconciled media profile");
+        assert_eq!(
+            negotiation.selected_source_id.as_deref(),
+            Some("linux:display:1")
+        );
+        assert_eq!(negotiation.selected.width, 1728);
+        assert_eq!(negotiation.selected.height, 1080);
+        assert_eq!(negotiation.selected_width, Some(1728));
+        assert_eq!(negotiation.selected_height, Some(1080));
+        assert_eq!(negotiation.status, "downgraded");
+        assert_eq!(
+            negotiation.downgrade_reason.as_deref(),
+            Some("clamped to selected capture source dimensions")
         );
     }
 

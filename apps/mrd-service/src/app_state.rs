@@ -8,7 +8,9 @@
 use base64::{engine::general_purpose, Engine as _};
 use image::{codecs::png::PngEncoder, ColorType, ImageEncoder};
 use mrd_application::ports::SessionSnapshot;
-use mrd_ipc::{CaptureSourceSelection, MediaProfileNegotiation};
+use mrd_ipc::{
+    AttachedRenderSurface, CaptureSourceSelection, MediaPipelineSnapshot, MediaProfileNegotiation,
+};
 use mrd_proto::{DeviceId, SessionId};
 use std::sync::Arc;
 use tokio::{sync::Mutex, task::AbortHandle};
@@ -84,6 +86,76 @@ impl CaptureSourceRegistry {
 
     pub fn remove(&mut self, session_id: &SessionId) -> Option<CaptureSourceSelection> {
         self.selections.remove(session_id)
+    }
+}
+
+/// Runtime receiver media pipeline state keyed by session.
+#[derive(Debug, Default)]
+pub struct MediaPipelineRegistry {
+    pipelines: std::collections::HashMap<SessionId, MediaPipelineState>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct MediaPipelineState {
+    attached_surfaces: std::collections::HashMap<String, AttachedRenderSurface>,
+    active_decoder: Option<String>,
+    active_renderer: Option<String>,
+    queue_depth: u32,
+    dropped_frames: u64,
+}
+
+impl MediaPipelineRegistry {
+    pub fn attach_surface(&mut self, session_id: SessionId, surface: AttachedRenderSurface) {
+        let state = self.pipelines.entry(session_id).or_default();
+        if state.active_renderer.is_none() {
+            state.active_renderer = Some(surface.backend.clone());
+        }
+        state
+            .attached_surfaces
+            .insert(surface.surface_id.clone(), surface);
+    }
+
+    pub fn detach_surface(&mut self, session_id: &SessionId, surface_id: &str) -> bool {
+        let Some(state) = self.pipelines.get_mut(session_id) else {
+            return false;
+        };
+        let removed = state.attached_surfaces.remove(surface_id).is_some();
+        if state.attached_surfaces.is_empty() {
+            state.active_renderer = None;
+        }
+        removed
+    }
+
+    pub fn set_active_decoder(&mut self, session_id: SessionId, decoder: impl Into<String>) {
+        self.pipelines.entry(session_id).or_default().active_decoder = Some(decoder.into());
+    }
+
+    pub fn record_queue_depth(&mut self, session_id: SessionId, queue_depth: u32) {
+        self.pipelines.entry(session_id).or_default().queue_depth = queue_depth;
+    }
+
+    pub fn increment_dropped_frames(&mut self, session_id: SessionId, count: u64) {
+        let state = self.pipelines.entry(session_id).or_default();
+        state.dropped_frames = state.dropped_frames.saturating_add(count);
+    }
+
+    pub fn snapshot(&self, session_id: &SessionId) -> MediaPipelineSnapshot {
+        let state = self.pipelines.get(session_id);
+        MediaPipelineSnapshot {
+            session_id: session_id.clone(),
+            attached_surfaces: state
+                .map(|state| state.attached_surfaces.values().cloned().collect())
+                .unwrap_or_default(),
+            active_decoder: state.and_then(|state| state.active_decoder.clone()),
+            active_renderer: state.and_then(|state| state.active_renderer.clone()),
+            queue_depth: state.map_or(0, |state| state.queue_depth),
+            dropped_frames: state.map_or(0, |state| state.dropped_frames),
+            stage_metrics: Vec::new(),
+        }
+    }
+
+    pub fn remove(&mut self, session_id: &SessionId) {
+        self.pipelines.remove(session_id);
     }
 }
 
@@ -437,6 +509,8 @@ pub struct AppState {
     pub media_profiles: Arc<Mutex<MediaProfileRegistry>>,
     /// Selected capture source keyed by session.
     pub capture_sources: Arc<Mutex<CaptureSourceRegistry>>,
+    /// Receiver pipeline state keyed by session.
+    pub media_pipelines: Arc<Mutex<MediaPipelineRegistry>>,
     /// Abort handles for active media tasks keyed by session.
     pub media_tasks: Arc<Mutex<MediaTaskRegistry>>,
 }
@@ -458,6 +532,7 @@ impl AppState {
             probes: Arc::new(Mutex::new(ProbeRegistry::default())),
             media_profiles: Arc::new(Mutex::new(MediaProfileRegistry::default())),
             capture_sources: Arc::new(Mutex::new(CaptureSourceRegistry::default())),
+            media_pipelines: Arc::new(Mutex::new(MediaPipelineRegistry::default())),
             media_tasks: Arc::new(Mutex::new(MediaTaskRegistry::default())),
         }
     }
@@ -500,6 +575,11 @@ impl AppState {
     /// Get a clone of the capture source registry.
     pub fn capture_sources(&self) -> Arc<Mutex<CaptureSourceRegistry>> {
         self.capture_sources.clone()
+    }
+
+    /// Get a clone of the receiver media pipeline registry.
+    pub fn media_pipelines(&self) -> Arc<Mutex<MediaPipelineRegistry>> {
+        self.media_pipelines.clone()
     }
 
     /// Get a clone of the media task registry.
@@ -674,6 +754,10 @@ mod tests {
             selected: profile,
             status: "accepted".to_string(),
             reason: None,
+            selected_source_id: None,
+            selected_width: None,
+            selected_height: None,
+            downgrade_reason: None,
         };
 
         registry.set(session_id.clone(), negotiation.clone());

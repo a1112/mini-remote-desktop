@@ -602,6 +602,32 @@ export interface MediaProfileNegotiation {
   selected: MediaProfile;
   status: "accepted" | "downgraded" | "rejected" | string;
   reason?: string | null;
+  selected_source_id?: string | null;
+  selected_width?: number | null;
+  selected_height?: number | null;
+  downgrade_reason?: string | null;
+}
+
+export interface AttachedRenderSurface {
+  surface_id: string;
+  backend: string;
+  window_handle?: number | null;
+}
+
+export interface MediaStageMetrics {
+  stage: string;
+  p50_ms?: number | null;
+  p95_ms?: number | null;
+}
+
+export interface MediaPipelineSnapshot {
+  session_id: string;
+  attached_surfaces: AttachedRenderSurface[];
+  active_decoder?: string | null;
+  active_renderer?: string | null;
+  queue_depth: number;
+  dropped_frames: number;
+  stage_metrics: MediaStageMetrics[];
 }
 
 export interface CaptureSource {

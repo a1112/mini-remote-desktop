@@ -95,6 +95,47 @@ pub struct MediaProfileNegotiation {
     pub selected: MediaProfile,
     pub status: String,
     pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_source_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_height: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub downgrade_reason: Option<String>,
+}
+
+/// A native render surface attached to a media pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachedRenderSurface {
+    pub surface_id: String,
+    pub backend: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_handle: Option<i64>,
+}
+
+/// Aggregated latency metrics for one media pipeline stage.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MediaStageMetrics {
+    pub stage: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p50_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p95_ms: Option<f64>,
+}
+
+/// Runtime state for a session media pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MediaPipelineSnapshot {
+    pub session_id: SessionId,
+    pub attached_surfaces: Vec<AttachedRenderSurface>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_decoder: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_renderer: Option<String>,
+    pub queue_depth: u32,
+    pub dropped_frames: u64,
+    pub stage_metrics: Vec<MediaStageMetrics>,
 }
 
 /// A capture source that can be selected for a remote session.
@@ -362,6 +403,19 @@ pub enum IpcRequest {
         session_id: SessionId,
         source_id: String,
     },
+    /// Attach a native render surface to a session media pipeline.
+    AttachRenderSurface {
+        session_id: SessionId,
+        surface_id: String,
+        backend: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        window_handle: Option<i64>,
+    },
+    /// Detach a native render surface from a session media pipeline.
+    DetachRenderSurface {
+        session_id: SessionId,
+        surface_id: String,
+    },
     /// Accept an incoming session as agent
     AcceptSession {
         session_id: SessionId,
@@ -388,6 +442,8 @@ pub enum IpcRequest {
     CapabilitySnapshot,
     /// Get probe snapshot data
     ProbeSnapshot { session_id: SessionId },
+    /// Get media pipeline snapshot data.
+    MediaPipelineSnapshot { session_id: SessionId },
     /// Stream probe events
     StreamProbeEvents,
     /// Health check for service
@@ -459,6 +515,16 @@ pub enum IpcResponse {
         session_id: SessionId,
         selection: CaptureSourceSelection,
     },
+    /// Native render surface attached.
+    RenderSurfaceAttached {
+        session_id: SessionId,
+        surface_id: String,
+    },
+    /// Native render surface detached.
+    RenderSurfaceDetached {
+        session_id: SessionId,
+        surface_id: String,
+    },
     /// Session runtime snapshot
     SessionSnapshot { snapshot: SessionRuntimeSnapshot },
     /// Aggregated runtime snapshot
@@ -470,6 +536,8 @@ pub enum IpcResponse {
     },
     /// Probe snapshot data
     ProbeSnapshot { snapshot: ProbeSnapshot },
+    /// Media pipeline snapshot data.
+    MediaPipelineSnapshot { snapshot: MediaPipelineSnapshot },
     /// Probe event data
     ProbeEvent {
         event: Vec<u8>, // Serialized probe event

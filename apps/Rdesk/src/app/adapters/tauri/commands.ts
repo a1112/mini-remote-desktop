@@ -30,6 +30,7 @@ import type {
   CaptureSourceSelection,
   MediaProfile,
   MediaProfileNegotiation,
+  MediaPipelineSnapshot,
   ProbeSnapshot,
   HarnessMetrics,
   FrameData,
@@ -529,6 +530,17 @@ export async function ipcProbeSnapshot(
   sessionId: string
 ): Promise<AdapterResult<ProbeSnapshot>> {
   return invokeAdapter<ProbeSnapshot>('ipc_probe_snapshot', {
+    sessionId,
+  });
+}
+
+/**
+ * Get receiver media pipeline snapshot.
+ */
+export async function ipcMediaPipelineSnapshot(
+  sessionId: string
+): Promise<AdapterResult<MediaPipelineSnapshot>> {
+  return invokeAdapter<MediaPipelineSnapshot>('ipc_media_pipeline_snapshot', {
     sessionId,
   });
 }

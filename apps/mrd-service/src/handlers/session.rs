@@ -280,6 +280,7 @@ pub async fn stop_session(app_state: &Arc<AppState>, session_id: SessionId) -> I
             .abort_session(&session_id);
         app_state.media_profiles.lock().await.remove(&session_id);
         app_state.capture_sources.lock().await.remove(&session_id);
+        app_state.media_pipelines.lock().await.remove(&session_id);
         return IpcResponse::SessionStopped { session_id };
     }
 
@@ -315,6 +316,7 @@ pub async fn fail_session(
             .lock()
             .await
             .abort_session(&session_id);
+        app_state.media_pipelines.lock().await.remove(&session_id);
 
         let mut shell = app_state.shell.lock().await;
         shell.last_error = Some(reason);

@@ -3,7 +3,7 @@
 // These handlers implement media control (sender/receiver) logic.
 
 use crate::app_state::AppState;
-use mrd_ipc::IpcResponse;
+use mrd_ipc::{AttachedRenderSurface, IpcResponse};
 use mrd_proto::SessionId;
 use std::sync::Arc;
 
@@ -59,6 +59,65 @@ pub async fn start_receiver(app_state: &Arc<AppState>, session_id: SessionId) ->
 pub async fn probe_snapshot(app_state: &Arc<AppState>, session_id: SessionId) -> IpcResponse {
     let snapshot = app_state.probes.lock().await.snapshot(&session_id);
     IpcResponse::ProbeSnapshot { snapshot }
+}
+
+/// Attach a native render surface to a receiver media pipeline.
+pub async fn attach_render_surface(
+    app_state: &Arc<AppState>,
+    session_id: SessionId,
+    surface_id: String,
+    backend: String,
+    window_handle: Option<i64>,
+) -> IpcResponse {
+    let sessions = app_state.sessions.lock().await;
+    if sessions.get(&session_id).is_none() {
+        return IpcResponse::Error {
+            code: "E404".to_string(),
+            message: format!("Session not found: {}", session_id.0),
+        };
+    }
+    drop(sessions);
+
+    app_state.media_pipelines.lock().await.attach_surface(
+        session_id.clone(),
+        AttachedRenderSurface {
+            surface_id: surface_id.clone(),
+            backend,
+            window_handle,
+        },
+    );
+
+    IpcResponse::RenderSurfaceAttached {
+        session_id,
+        surface_id,
+    }
+}
+
+/// Detach a native render surface from a receiver media pipeline.
+pub async fn detach_render_surface(
+    app_state: &Arc<AppState>,
+    session_id: SessionId,
+    surface_id: String,
+) -> IpcResponse {
+    app_state
+        .media_pipelines
+        .lock()
+        .await
+        .detach_surface(&session_id, &surface_id);
+
+    IpcResponse::RenderSurfaceDetached {
+        session_id,
+        surface_id,
+    }
+}
+
+/// Return the current receiver media pipeline state.
+pub async fn media_pipeline_snapshot(
+    app_state: &Arc<AppState>,
+    session_id: SessionId,
+) -> IpcResponse {
+    let snapshot = app_state.media_pipelines.lock().await.snapshot(&session_id);
+    IpcResponse::MediaPipelineSnapshot { snapshot }
 }
 
 #[cfg(test)]
@@ -177,5 +236,47 @@ mod tests {
             }
             _ => panic!("Expected ProbeSnapshot response"),
         }
+    }
+
+    #[tokio::test]
+    async fn render_surface_attach_detach_updates_pipeline_snapshot() {
+        let app_state = Arc::new(AppState::new());
+        let session_id = SessionId("surface-session".to_string());
+
+        let _ = session::start_session(
+            &app_state,
+            session_id.clone(),
+            DeviceId("agent".to_string()),
+            "quic".to_string(),
+        )
+        .await;
+
+        let attached = attach_render_surface(
+            &app_state,
+            session_id.clone(),
+            "surface-1".to_string(),
+            "d3d11".to_string(),
+            Some(0x1234),
+        )
+        .await;
+        assert!(matches!(
+            attached,
+            IpcResponse::RenderSurfaceAttached { .. }
+        ));
+
+        let snapshot = app_state.media_pipelines.lock().await.snapshot(&session_id);
+        assert_eq!(snapshot.attached_surfaces.len(), 1);
+        assert_eq!(snapshot.active_renderer.as_deref(), Some("d3d11"));
+
+        let detached =
+            detach_render_surface(&app_state, session_id.clone(), "surface-1".to_string()).await;
+        assert!(matches!(
+            detached,
+            IpcResponse::RenderSurfaceDetached { .. }
+        ));
+
+        let snapshot = app_state.media_pipelines.lock().await.snapshot(&session_id);
+        assert!(snapshot.attached_surfaces.is_empty());
+        assert_eq!(snapshot.active_renderer, None);
     }
 }
