@@ -11,11 +11,11 @@ use mrd_pipeline_core::{
 };
 use mrd_proto::{DeviceId, SessionId};
 use mrd_transport_quic_quinn::{
-    fragment_access_unit, QuicAuFragment, QuicAuReassembler, QuicAuReassemblerConfig,
+    fragment_access_unit, QuicAuFragment, QuicAuFrame, QuicAuReassembler, QuicAuReassemblerConfig,
     QuinnDatagramEndpoint, QuinnServerBootstrap, QuinnServerListener, QUIC_AU_FRAGMENT_HEADER_LEN,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -57,6 +57,7 @@ const LAN_MEDIA_RECEIVER_MAX_CONSECUTIVE_DECODE_ERRORS: u32 = 8;
 const LAN_MEDIA_RECEIVER_DECODE_ERROR_LOG_INTERVAL: u32 = 3;
 const LAN_MEDIA_REASSEMBLER_FRAME_TIMEOUT_MS: u64 = 1_500;
 const LAN_MEDIA_REASSEMBLER_MAX_PENDING_FRAMES: usize = 256;
+const LAN_MEDIA_RECEIVER_REORDER_MAX_PENDING_FRAMES: usize = 8;
 const LAN_MEDIA_PROBE_MAGIC: &[u8; 8] = b"MRDMPF01";
 const LAN_MEDIA_PROBE_HEADER_BYTES: usize = 56;
 const LAN_MEDIA_PROBE_2K144_FORMAT: &str = "compressed_2k144_test_pattern";
@@ -2058,6 +2059,55 @@ fn should_log_media_receiver_decode_error(consecutive_decode_errors: u32) -> boo
         || consecutive_decode_errors % LAN_MEDIA_RECEIVER_DECODE_ERROR_LOG_INTERVAL == 0
 }
 
+struct LanMediaFrameOrderer {
+    next_frame_id: Option<u32>,
+    max_pending_frames: usize,
+    pending: BTreeMap<u32, QuicAuFrame>,
+}
+
+impl LanMediaFrameOrderer {
+    fn new(max_pending_frames: usize) -> Self {
+        Self {
+            next_frame_id: None,
+            max_pending_frames: max_pending_frames.max(1),
+            pending: BTreeMap::new(),
+        }
+    }
+
+    fn push(&mut self, frame: QuicAuFrame) -> Vec<QuicAuFrame> {
+        if self
+            .next_frame_id
+            .is_some_and(|next_frame_id| frame.frame_id < next_frame_id)
+        {
+            return Vec::new();
+        }
+
+        self.next_frame_id.get_or_insert(frame.frame_id);
+        self.pending.entry(frame.frame_id).or_insert(frame);
+
+        let mut ready = self.drain_contiguous();
+        if ready.is_empty() && self.pending.len() > self.max_pending_frames {
+            if let Some(next_frame_id) = self.pending.keys().next().copied() {
+                self.next_frame_id = Some(next_frame_id);
+                ready = self.drain_contiguous();
+            }
+        }
+        ready
+    }
+
+    fn drain_contiguous(&mut self) -> Vec<QuicAuFrame> {
+        let mut ready = Vec::new();
+        while let Some(next_frame_id) = self.next_frame_id {
+            let Some(frame) = self.pending.remove(&next_frame_id) else {
+                break;
+            };
+            self.next_frame_id = Some(next_frame_id.wrapping_add(1));
+            ready.push(frame);
+        }
+        ready
+    }
+}
+
 fn lan_media_reassembler_config() -> QuicAuReassemblerConfig {
     QuicAuReassemblerConfig {
         frame_timeout: Duration::from_millis(LAN_MEDIA_REASSEMBLER_FRAME_TIMEOUT_MS),
@@ -2130,10 +2180,13 @@ async fn receive_quic_media_loop(
     endpoint: QuinnDatagramEndpoint,
 ) -> Result<()> {
     let mut reassembler = QuicAuReassembler::new(lan_media_reassembler_config());
+    let mut frame_orderer =
+        LanMediaFrameOrderer::new(LAN_MEDIA_RECEIVER_REORDER_MAX_PENDING_FRAMES);
     let mut decoder = create_lan_receiver_decoder(&app_state, &session_id)
         .await
         .context("failed to create LAN media receiver decoder")?;
     let mut consecutive_decode_errors = 0_u32;
+    let mut decoder_waits_for_keyframe = true;
     loop {
         if !session_allows_media(&app_state, &session_id).await {
             return Ok(());
@@ -2155,74 +2208,89 @@ async fn receive_quic_media_loop(
             .push_datagram(&media_message)
             .context("failed to reassemble LAN QUIC media frame")?
         {
-            let envelope = match decode_lan_media_envelope(&frame.payload) {
-                Ok(envelope) => envelope,
-                Err(error) => {
-                    app_state.probes.lock().await.record_probe_drop(
-                        &session_id,
-                        frame.payload.len() as u64,
-                        now_ms(),
-                        format!("invalid LAN media v2 envelope: {error}"),
-                    );
-                    continue;
-                }
-            };
+            let ready_frames = frame_orderer.push(frame);
+            for frame in ready_frames {
+                let envelope = match decode_lan_media_envelope(&frame.payload) {
+                    Ok(envelope) => envelope,
+                    Err(error) => {
+                        app_state.probes.lock().await.record_probe_drop(
+                            &session_id,
+                            frame.payload.len() as u64,
+                            now_ms(),
+                            format!("invalid LAN media v2 envelope: {error}"),
+                        );
+                        continue;
+                    }
+                };
 
-            match envelope.payload_type {
-                LAN_MEDIA_PAYLOAD_H264_ACCESS_UNIT => {
-                    match decode_h264_desktop_frame(decoder.decoder.as_mut(), &envelope.payload) {
-                        Ok(decoded_frames) if !decoded_frames.is_empty() => {
-                            consecutive_decode_errors = 0;
-                            record_lan_decoded_frames(
-                                &app_state,
+                match envelope.payload_type {
+                    LAN_MEDIA_PAYLOAD_H264_ACCESS_UNIT => {
+                        if decoder_waits_for_keyframe && !frame.is_keyframe {
+                            app_state.probes.lock().await.record_transient_frame_drop(
                                 &session_id,
-                                decoded_frames,
                                 frame.payload.len() as u64,
-                                envelope.sequence,
-                                envelope.timestamp_us,
-                                &envelope.profile,
-                                &envelope.payload,
-                            )
-                            .await;
+                                now_ms(),
+                            );
+                            continue;
                         }
-                        Ok(_) => {}
-                        Err(error) => {
-                            let error = if frame.is_keyframe {
-                                match try_decode_h264_keyframe_with_fallback(
+
+                        match decode_h264_desktop_frame(decoder.decoder.as_mut(), &envelope.payload)
+                        {
+                            Ok(decoded_frames) if !decoded_frames.is_empty() => {
+                                consecutive_decode_errors = 0;
+                                decoder_waits_for_keyframe = false;
+                                record_lan_decoded_frames(
                                     &app_state,
                                     &session_id,
-                                    decoder.backend,
+                                    decoded_frames,
+                                    frame.payload.len() as u64,
+                                    envelope.sequence,
+                                    envelope.timestamp_us,
+                                    &envelope.profile,
                                     &envelope.payload,
-                                    &error,
                                 )
-                                .await
-                                {
-                                    Ok((next_decoder, decoded_frames)) => {
-                                        decoder = next_decoder;
-                                        consecutive_decode_errors = 0;
-                                        record_lan_decoded_frames(
-                                            &app_state,
-                                            &session_id,
-                                            decoded_frames,
-                                            frame.payload.len() as u64,
-                                            envelope.sequence,
-                                            envelope.timestamp_us,
-                                            &envelope.profile,
-                                            &envelope.payload,
-                                        )
-                                        .await;
-                                        continue;
+                                .await;
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                let error = if frame.is_keyframe {
+                                    match try_decode_h264_keyframe_with_fallback(
+                                        &app_state,
+                                        &session_id,
+                                        decoder.backend,
+                                        &envelope.payload,
+                                        &error,
+                                    )
+                                    .await
+                                    {
+                                        Ok((next_decoder, decoded_frames)) => {
+                                            decoder = next_decoder;
+                                            consecutive_decode_errors = 0;
+                                            decoder_waits_for_keyframe = false;
+                                            record_lan_decoded_frames(
+                                                &app_state,
+                                                &session_id,
+                                                decoded_frames,
+                                                frame.payload.len() as u64,
+                                                envelope.sequence,
+                                                envelope.timestamp_us,
+                                                &envelope.profile,
+                                                &envelope.payload,
+                                            )
+                                            .await;
+                                            continue;
+                                        }
+                                        Err(fallback_error) => fallback_error,
                                     }
-                                    Err(fallback_error) => fallback_error,
-                                }
-                            } else {
-                                error
-                            };
-                            consecutive_decode_errors = consecutive_decode_errors.saturating_add(1);
-                            let reassembler_stats = reassembler.stats();
-                            let payload_hash =
-                                format!("fnv1a64:{:016x}", fnv1a64(&envelope.payload));
-                            let message = format!(
+                                } else {
+                                    error
+                                };
+                                consecutive_decode_errors =
+                                    consecutive_decode_errors.saturating_add(1);
+                                let reassembler_stats = reassembler.stats();
+                                let payload_hash =
+                                    format!("fnv1a64:{:016x}", fnv1a64(&envelope.payload));
+                                let message = format!(
                                 "failed to decode LAN H.264 media v2 access unit: sequence={}, keyframe={}, bytes={}, hash={}, reassembler={{completed:{}, expired:{}, evicted:{}, duplicate:{}, rejected:{}, pending:{}}}: {error}",
                                 envelope.sequence,
                                 frame.is_keyframe,
@@ -2235,80 +2303,93 @@ async fn receive_quic_media_loop(
                                 reassembler_stats.rejected_fragments,
                                 reassembler_stats.pending_frames
                             );
-                            if should_log_media_receiver_decode_error(consecutive_decode_errors) {
-                                tracing::warn!(
-                                    session_id = %session_id.0,
-                                    sequence = envelope.sequence,
-                                    is_keyframe = frame.is_keyframe,
-                                    consecutive_decode_errors,
-                                    error = %error,
-                                    "LAN media receiver dropped a decoded frame"
-                                );
-                            }
+                                if should_log_media_receiver_decode_error(consecutive_decode_errors)
+                                {
+                                    tracing::warn!(
+                                        session_id = %session_id.0,
+                                        sequence = envelope.sequence,
+                                        is_keyframe = frame.is_keyframe,
+                                        consecutive_decode_errors,
+                                        error = %error,
+                                        "LAN media receiver dropped a decoded frame"
+                                    );
+                                }
 
-                            if frame.is_keyframe {
-                                app_state.probes.lock().await.record_probe_drop(
+                                if frame.is_keyframe {
+                                    app_state.probes.lock().await.record_probe_drop(
+                                        &session_id,
+                                        frame.payload.len() as u64,
+                                        now_ms(),
+                                        message,
+                                    );
+                                    decoder_waits_for_keyframe = true;
+                                    decoder = create_lan_receiver_decoder_with_preference(
+                                    &app_state,
                                     &session_id,
-                                    frame.payload.len() as u64,
-                                    now_ms(),
-                                    message,
-                                );
-                                decoder = create_lan_receiver_decoder(&app_state, &session_id)
+                                    Some(decoder.backend),
+                                )
                                     .await
                                     .context(
                                         "failed to reset LAN media receiver decoder after decode error",
                                     )?;
-                                consecutive_decode_errors = 0;
-                            } else {
-                                app_state.probes.lock().await.record_transient_frame_drop(
-                                    &session_id,
-                                    frame.payload.len() as u64,
-                                    now_ms(),
-                                );
-                                if consecutive_decode_errors
-                                    >= LAN_MEDIA_RECEIVER_MAX_CONSECUTIVE_DECODE_ERRORS
-                                {
-                                    tracing::warn!(
-                                        session_id = %session_id.0,
-                                        consecutive_decode_errors,
-                                        "LAN media receiver reset decoder after non-keyframe decode loss"
+                                    consecutive_decode_errors = 0;
+                                } else {
+                                    app_state.probes.lock().await.record_transient_frame_drop(
+                                        &session_id,
+                                        frame.payload.len() as u64,
+                                        now_ms(),
                                     );
-                                    decoder = create_lan_receiver_decoder(&app_state, &session_id)
+                                    if consecutive_decode_errors
+                                        >= LAN_MEDIA_RECEIVER_MAX_CONSECUTIVE_DECODE_ERRORS
+                                    {
+                                        tracing::warn!(
+                                            session_id = %session_id.0,
+                                            consecutive_decode_errors,
+                                            backend = decoder.backend,
+                                            "LAN media receiver reset decoder after non-keyframe decode loss"
+                                        );
+                                        decoder_waits_for_keyframe = true;
+                                        decoder = create_lan_receiver_decoder_with_preference(
+                                        &app_state,
+                                        &session_id,
+                                        Some(decoder.backend),
+                                    )
                                         .await
                                         .context(
                                             "failed to reset LAN media receiver decoder after decode loss",
                                         )?;
-                                    consecutive_decode_errors = 0;
+                                        consecutive_decode_errors = 0;
+                                    }
                                 }
                             }
                         }
                     }
-                }
-                LAN_MEDIA_PAYLOAD_PROBE_FRAME => {
-                    match decode_media_probe_frame(&envelope.payload) {
-                        Ok(stats) => {
-                            app_state.probes.lock().await.record_media_probe_frame(
-                                &session_id,
-                                stats,
-                                now_ms(),
-                            );
-                        }
-                        Err(error) => {
-                            app_state.probes.lock().await.record_probe_drop(
-                                &session_id,
-                                frame.payload.len() as u64,
-                                now_ms(),
-                                format!("failed to decode LAN media v2 probe frame: {error}"),
-                            );
+                    LAN_MEDIA_PAYLOAD_PROBE_FRAME => {
+                        match decode_media_probe_frame(&envelope.payload) {
+                            Ok(stats) => {
+                                app_state.probes.lock().await.record_media_probe_frame(
+                                    &session_id,
+                                    stats,
+                                    now_ms(),
+                                );
+                            }
+                            Err(error) => {
+                                app_state.probes.lock().await.record_probe_drop(
+                                    &session_id,
+                                    frame.payload.len() as u64,
+                                    now_ms(),
+                                    format!("failed to decode LAN media v2 probe frame: {error}"),
+                                );
+                            }
                         }
                     }
+                    payload_type => app_state.probes.lock().await.record_probe_drop(
+                        &session_id,
+                        frame.payload.len() as u64,
+                        now_ms(),
+                        format!("unsupported LAN media v2 payload type: {payload_type}"),
+                    ),
                 }
-                payload_type => app_state.probes.lock().await.record_probe_drop(
-                    &session_id,
-                    frame.payload.len() as u64,
-                    now_ms(),
-                    format!("unsupported LAN media v2 payload type: {payload_type}"),
-                ),
             }
         }
     }
@@ -2378,8 +2459,16 @@ async fn create_lan_receiver_decoder(
     app_state: &Arc<AppState>,
     session_id: &SessionId,
 ) -> Result<LanReceiverDecoder> {
+    create_lan_receiver_decoder_with_preference(app_state, session_id, None).await
+}
+
+async fn create_lan_receiver_decoder_with_preference(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+    preferred_backend: Option<&'static str>,
+) -> Result<LanReceiverDecoder> {
     let mut last_error = None;
-    for backend in preferred_lan_receiver_decoder_candidates() {
+    for backend in lan_receiver_decoder_candidates(preferred_backend) {
         match mrd_decode::create_decoder(backend) {
             Ok(decoder) => {
                 app_state
@@ -2459,6 +2548,33 @@ fn preferred_lan_receiver_decoder_candidates() -> Vec<&'static str> {
         "nvdec" => vec!["nvdec"],
         _ => default_lan_receiver_decoder_candidates().to_vec(),
     }
+}
+
+fn lan_receiver_decoder_candidates(preferred_backend: Option<&'static str>) -> Vec<&'static str> {
+    prioritize_lan_receiver_decoder_candidates(
+        preferred_lan_receiver_decoder_candidates(),
+        preferred_backend,
+    )
+}
+
+fn prioritize_lan_receiver_decoder_candidates(
+    candidates: Vec<&'static str>,
+    preferred_backend: Option<&'static str>,
+) -> Vec<&'static str> {
+    let Some(preferred_backend) = preferred_backend else {
+        return candidates;
+    };
+    if !candidates.contains(&preferred_backend) {
+        return candidates;
+    }
+
+    let mut prioritized = vec![preferred_backend];
+    prioritized.extend(
+        candidates
+            .into_iter()
+            .filter(|backend| *backend != preferred_backend),
+    );
+    prioritized
 }
 
 #[cfg(windows)]
@@ -3931,6 +4047,60 @@ mod tests {
 
         assert!(config.frame_timeout >= Duration::from_millis(1_000));
         assert!(config.max_pending_frames >= 128);
+    }
+
+    #[test]
+    fn lan_media_frame_orderer_holds_late_frames_until_gap_arrives() {
+        let mut orderer = LanMediaFrameOrderer::new(8);
+
+        let first = orderer.push(test_quic_au_frame(1, false));
+        let third = orderer.push(test_quic_au_frame(3, false));
+        let ready = orderer.push(test_quic_au_frame(2, false));
+
+        assert_eq!(frame_ids(&first), vec![1]);
+        assert!(third.is_empty());
+        assert_eq!(frame_ids(&ready), vec![2, 3]);
+    }
+
+    #[test]
+    fn lan_media_frame_orderer_skips_gap_when_pending_limit_is_reached() {
+        let mut orderer = LanMediaFrameOrderer::new(2);
+
+        assert_eq!(
+            frame_ids(&orderer.push(test_quic_au_frame(10, true))),
+            vec![10]
+        );
+        assert!(orderer.push(test_quic_au_frame(12, false)).is_empty());
+        assert!(orderer.push(test_quic_au_frame(13, false)).is_empty());
+        let ready = orderer.push(test_quic_au_frame(14, false));
+
+        assert_eq!(frame_ids(&ready), vec![12, 13, 14]);
+    }
+
+    #[test]
+    fn decoder_candidate_preference_keeps_fallback_backend_first() {
+        let candidates = prioritize_lan_receiver_decoder_candidates(
+            vec!["nvdec", "h264_software"],
+            Some("h264_software"),
+        );
+
+        assert_eq!(candidates, vec!["h264_software", "nvdec"]);
+    }
+
+    fn test_quic_au_frame(frame_id: u32, is_keyframe: bool) -> QuicAuFrame {
+        let payload = [frame_id as u8, u8::from(is_keyframe)];
+        let datagrams =
+            fragment_access_unit(frame_id, u64::from(frame_id), is_keyframe, &payload, 1200)
+                .expect("fragmented frame");
+        let mut reassembler = QuicAuReassembler::new(QuicAuReassemblerConfig::default());
+        reassembler
+            .push_datagram(&datagrams[0])
+            .expect("reassembled frame")
+            .expect("complete frame")
+    }
+
+    fn frame_ids(frames: &[QuicAuFrame]) -> Vec<u32> {
+        frames.iter().map(|frame| frame.frame_id).collect()
     }
 
     #[tokio::test]
