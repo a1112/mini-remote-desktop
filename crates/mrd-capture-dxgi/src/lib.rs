@@ -31,6 +31,9 @@ use windows::Win32::Graphics::Dxgi::{
     IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
 };
 
+#[cfg(windows)]
+const DXGI_SHARED_ACQUIRE_TIMEOUT_MS: u32 = 1;
+
 pub struct DxgiDesktopCapture {
     capturer: Capturer,
     width: usize,
@@ -240,8 +243,11 @@ impl FrameCapture for DxgiSharedTextureCapture {
             let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
             let mut desktop_resource = None::<IDXGIResource>;
             let acquire = unsafe {
-                self.duplication
-                    .AcquireNextFrame(16, &mut frame_info, &mut desktop_resource)
+                self.duplication.AcquireNextFrame(
+                    DXGI_SHARED_ACQUIRE_TIMEOUT_MS,
+                    &mut frame_info,
+                    &mut desktop_resource,
+                )
             };
 
             match acquire {
@@ -251,6 +257,9 @@ impl FrameCapture for DxgiSharedTextureCapture {
                     return result;
                 }
                 Err(error) if error.code() == DXGI_ERROR_WAIT_TIMEOUT => {
+                    if let Some(frame) = self.last_shared_frame()? {
+                        return Ok(frame);
+                    }
                     thread::sleep(Duration::from_millis(1));
                 }
                 Err(error) if error.code() == DXGI_ERROR_ACCESS_LOST => {
@@ -268,6 +277,20 @@ impl FrameCapture for DxgiSharedTextureCapture {
 
 #[cfg(windows)]
 impl DxgiSharedTextureCapture {
+    fn last_shared_frame(&self) -> Result<Option<CapturedFrame>, PipelineError> {
+        let Some(shared) = self.shared_texture.as_ref() else {
+            return Ok(None);
+        };
+
+        Ok(Some(CapturedFrame::from_d3d11_shared_bgra(
+            self.width,
+            self.height,
+            now_us()?,
+            shared.shared_handle,
+            self.width.saturating_mul(4) as u32,
+        )))
+    }
+
     fn copy_acquired_frame_to_shared(
         &mut self,
         desktop_resource: Option<IDXGIResource>,
