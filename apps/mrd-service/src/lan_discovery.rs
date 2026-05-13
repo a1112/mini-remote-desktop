@@ -35,6 +35,7 @@ const DISCOVERY_SAFE_UDP_PAYLOAD_BYTES: usize = 60_000;
 const LAN_MEDIA_TARGET_WIDTH: u32 = 2560;
 const LAN_MEDIA_TARGET_HEIGHT: u32 = 1440;
 const LAN_MEDIA_TARGET_FPS: u32 = 144;
+const LAN_MEDIA_MAX_FPS: u32 = 249;
 const LAN_MEDIA_TARGET_BITRATE_MBPS: u32 = 64;
 const LAN_QUIC_FALLBACK_DATAGRAM_BYTES: usize = 1_200;
 const LAN_QUIC_MEDIA_TRANSPORT: &str = "quic_datagram";
@@ -49,6 +50,8 @@ const LAN_DECODE_NVDEC_CAPABILITY: &str = "nvdec";
 const LAN_RENDER_D3D11_NATIVE_CAPABILITY: &str = "d3d11_native_render";
 const LAN_MEDIA_SENDER_MAX_CONSECUTIVE_FRAME_ERRORS: u32 = 8;
 const LAN_MEDIA_SENDER_ERROR_LOG_INTERVAL: u32 = 3;
+const LAN_MEDIA_RECEIVER_MAX_CONSECUTIVE_DECODE_ERRORS: u32 = 8;
+const LAN_MEDIA_RECEIVER_DECODE_ERROR_LOG_INTERVAL: u32 = 3;
 const LAN_MEDIA_PROBE_MAGIC: &[u8; 8] = b"MRDMPF01";
 const LAN_MEDIA_PROBE_HEADER_BYTES: usize = 56;
 const LAN_MEDIA_PROBE_2K144_FORMAT: &str = "compressed_2k144_test_pattern";
@@ -1651,6 +1654,7 @@ async fn send_quic_media_loop(
                         &source_id,
                         &mut consecutive_frame_errors,
                         format!("failed to create LAN capture source: {error:#}"),
+                        false,
                     )
                     .await?;
                     continue;
@@ -1682,6 +1686,7 @@ async fn send_quic_media_loop(
                     &error_source_id,
                     &mut consecutive_frame_errors,
                     format!("{error:#}"),
+                    false,
                 )
                 .await?;
                 continue;
@@ -1696,6 +1701,7 @@ async fn send_quic_media_loop(
                     active_source_id.as_deref().unwrap_or("<unknown>"),
                     &mut consecutive_frame_errors,
                     format!("failed to prepare captured frame for H.264: {error:#}"),
+                    false,
                 )
                 .await?;
                 continue;
@@ -1725,6 +1731,7 @@ async fn send_quic_media_loop(
                         active_source_id.as_deref().unwrap_or("<unknown>"),
                         &mut consecutive_frame_errors,
                         format!("{error:#}"),
+                        false,
                     )
                     .await?;
                     continue;
@@ -1750,6 +1757,7 @@ async fn send_quic_media_loop(
                     active_source_id.as_deref().unwrap_or("<unknown>"),
                     &mut consecutive_frame_errors,
                     format!("{error:#}"),
+                    false,
                 )
                 .await?;
                 continue;
@@ -1785,6 +1793,7 @@ async fn send_quic_media_loop(
                         active_source_id.as_deref().unwrap_or("<unknown>"),
                         &mut consecutive_frame_errors,
                         format!("{error:#}"),
+                        true,
                     )
                     .await?;
                     continue;
@@ -1852,15 +1861,23 @@ async fn handle_media_sender_frame_error(
     source_id: &str,
     consecutive_frame_errors: &mut u32,
     message: String,
+    fail_after_limit: bool,
 ) -> Result<()> {
     *consecutive_frame_errors = consecutive_frame_errors.saturating_add(1);
-    let decorated_message = format!(
-        "LAN media sender transient frame error {}/{} for source '{}': {}",
-        *consecutive_frame_errors,
-        LAN_MEDIA_SENDER_MAX_CONSECUTIVE_FRAME_ERRORS,
-        source_id,
-        message
-    );
+    let decorated_message = if fail_after_limit {
+        format!(
+            "LAN media sender transient frame error {}/{} for source '{}': {}",
+            *consecutive_frame_errors,
+            LAN_MEDIA_SENDER_MAX_CONSECUTIVE_FRAME_ERRORS,
+            source_id,
+            message
+        )
+    } else {
+        format!(
+            "LAN media sender recoverable frame error {} for source '{}': {}",
+            *consecutive_frame_errors, source_id, message
+        )
+    };
 
     if should_log_media_sender_frame_error(*consecutive_frame_errors) {
         tracing::warn!(
@@ -1873,7 +1890,9 @@ async fn handle_media_sender_frame_error(
     }
     set_session_last_error(app_state, session_id, Some(decorated_message.clone())).await;
 
-    if *consecutive_frame_errors >= LAN_MEDIA_SENDER_MAX_CONSECUTIVE_FRAME_ERRORS {
+    if fail_after_limit
+        && *consecutive_frame_errors >= LAN_MEDIA_SENDER_MAX_CONSECUTIVE_FRAME_ERRORS
+    {
         anyhow::bail!("{decorated_message}");
     }
 
@@ -1884,6 +1903,12 @@ fn should_log_media_sender_frame_error(consecutive_frame_errors: u32) -> bool {
     consecutive_frame_errors == 1
         || consecutive_frame_errors >= LAN_MEDIA_SENDER_MAX_CONSECUTIVE_FRAME_ERRORS
         || consecutive_frame_errors % LAN_MEDIA_SENDER_ERROR_LOG_INTERVAL == 0
+}
+
+fn should_log_media_receiver_decode_error(consecutive_decode_errors: u32) -> bool {
+    consecutive_decode_errors == 1
+        || consecutive_decode_errors >= LAN_MEDIA_RECEIVER_MAX_CONSECUTIVE_DECODE_ERRORS
+        || consecutive_decode_errors % LAN_MEDIA_RECEIVER_DECODE_ERROR_LOG_INTERVAL == 0
 }
 
 async fn set_session_last_error(
@@ -1943,6 +1968,7 @@ async fn receive_quic_media_loop(
     let mut decoder = create_lan_receiver_decoder(&app_state, &session_id)
         .await
         .context("failed to create LAN media receiver decoder")?;
+    let mut consecutive_decode_errors = 0_u32;
     loop {
         if !session_allows_media(&app_state, &session_id).await {
             return Ok(());
@@ -1972,6 +1998,7 @@ async fn receive_quic_media_loop(
                 LAN_MEDIA_PAYLOAD_H264_ACCESS_UNIT => {
                     match decode_h264_desktop_frame(decoder.as_mut(), &envelope.payload) {
                         Ok(decoded_frames) if !decoded_frames.is_empty() => {
+                            consecutive_decode_errors = 0;
                             for decoded_frame in decoded_frames {
                                 let width = decoded_frame.width as u32;
                                 let height = decoded_frame.height as u32;
@@ -2021,17 +2048,56 @@ async fn receive_quic_media_loop(
                         }
                         Ok(_) => {}
                         Err(error) => {
-                            app_state.probes.lock().await.record_probe_drop(
-                                &session_id,
-                                frame.payload.len() as u64,
-                                now_ms(),
-                                format!("failed to decode LAN H.264 media v2 access unit: {error}"),
+                            consecutive_decode_errors = consecutive_decode_errors.saturating_add(1);
+                            let reassembler_stats = reassembler.stats();
+                            let payload_hash =
+                                format!("fnv1a64:{:016x}", fnv1a64(&envelope.payload));
+                            let message = format!(
+                                "failed to decode LAN H.264 media v2 access unit: sequence={}, keyframe={}, bytes={}, hash={}, reassembler={{completed:{}, expired:{}, evicted:{}, duplicate:{}, rejected:{}, pending:{}}}: {error}",
+                                envelope.sequence,
+                                frame.is_keyframe,
+                                envelope.payload.len(),
+                                payload_hash,
+                                reassembler_stats.completed_frames,
+                                reassembler_stats.expired_frames,
+                                reassembler_stats.evicted_frames,
+                                reassembler_stats.duplicate_fragments,
+                                reassembler_stats.rejected_fragments,
+                                reassembler_stats.pending_frames
                             );
-                            decoder = create_lan_receiver_decoder(&app_state, &session_id)
-                                .await
-                                .context(
-                                    "failed to reset LAN media receiver decoder after decode error",
-                                )?;
+                            if should_log_media_receiver_decode_error(consecutive_decode_errors) {
+                                tracing::warn!(
+                                    session_id = %session_id.0,
+                                    sequence = envelope.sequence,
+                                    is_keyframe = frame.is_keyframe,
+                                    consecutive_decode_errors,
+                                    error = %error,
+                                    "LAN media receiver dropped a decoded frame"
+                                );
+                            }
+
+                            if frame.is_keyframe
+                                || consecutive_decode_errors
+                                    >= LAN_MEDIA_RECEIVER_MAX_CONSECUTIVE_DECODE_ERRORS
+                            {
+                                app_state.probes.lock().await.record_probe_drop(
+                                    &session_id,
+                                    frame.payload.len() as u64,
+                                    now_ms(),
+                                    message,
+                                );
+                                decoder = create_lan_receiver_decoder(&app_state, &session_id)
+                                    .await
+                                    .context(
+                                        "failed to reset LAN media receiver decoder after decode error",
+                                    )?;
+                            } else {
+                                app_state.probes.lock().await.record_transient_frame_drop(
+                                    &session_id,
+                                    frame.payload.len() as u64,
+                                    now_ms(),
+                                );
+                            }
                         }
                     }
                 }
@@ -2785,7 +2851,7 @@ fn negotiate_media_profile(
     let mut selected = requested.clone();
     selected.width = selected.width.min(LAN_MEDIA_TARGET_WIDTH);
     selected.height = selected.height.min(LAN_MEDIA_TARGET_HEIGHT);
-    selected.fps = selected.fps.min(LAN_MEDIA_TARGET_FPS);
+    selected.fps = selected.fps.min(LAN_MEDIA_MAX_FPS);
     selected.bitrate_mbps = selected.bitrate_mbps.min(LAN_MEDIA_TARGET_BITRATE_MBPS);
     selected.codec = "h264".to_string();
 
@@ -3062,7 +3128,7 @@ mod tests {
                 assert_eq!(negotiation.status, "downgraded");
                 assert_eq!(negotiation.selected.width, LAN_MEDIA_TARGET_WIDTH);
                 assert_eq!(negotiation.selected.height, LAN_MEDIA_TARGET_HEIGHT);
-                assert_eq!(negotiation.selected.fps, LAN_MEDIA_TARGET_FPS);
+                assert_eq!(negotiation.selected.fps, 240);
                 assert_eq!(
                     negotiation.selected.bitrate_mbps,
                     LAN_MEDIA_TARGET_BITRATE_MBPS
@@ -3448,7 +3514,7 @@ mod tests {
         let negotiation = negotiate_media_profile(Some(MediaProfile {
             width: 3840,
             height: 2160,
-            fps: 240,
+            fps: 300,
             bitrate_mbps: 120,
             codec: "hevc".to_string(),
         }))
@@ -3457,9 +3523,27 @@ mod tests {
         assert_eq!(negotiation.status, "downgraded");
         assert_eq!(negotiation.selected.width, 2560);
         assert_eq!(negotiation.selected.height, 1440);
-        assert_eq!(negotiation.selected.fps, 144);
+        assert_eq!(negotiation.selected.fps, 249);
         assert_eq!(negotiation.selected.bitrate_mbps, 64);
         assert_eq!(negotiation.selected.codec, "h264");
+    }
+
+    #[test]
+    fn media_profile_negotiation_allows_high_refresh_canary_profiles() {
+        let negotiation = negotiate_media_profile(Some(MediaProfile {
+            width: 1920,
+            height: 1080,
+            fps: 249,
+            bitrate_mbps: 20,
+            codec: "h264".to_string(),
+        }))
+        .unwrap();
+
+        assert_eq!(negotiation.status, "accepted");
+        assert_eq!(negotiation.selected.width, 1920);
+        assert_eq!(negotiation.selected.height, 1080);
+        assert_eq!(negotiation.selected.fps, 249);
+        assert_eq!(negotiation.selected.bitrate_mbps, 20);
     }
 
     #[tokio::test]

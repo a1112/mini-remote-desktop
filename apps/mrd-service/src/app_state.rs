@@ -344,6 +344,20 @@ impl ProbeRegistry {
         stats.last_error = Some(error.into());
     }
 
+    pub fn record_transient_frame_drop(
+        &mut self,
+        session_id: &SessionId,
+        bytes_received: u64,
+        now_ms: u64,
+    ) {
+        let stats = self.probes.entry(session_id.clone()).or_default();
+        stats.frames_received = stats.frames_received.saturating_add(1);
+        stats.frames_dropped = stats.frames_dropped.saturating_add(1);
+        stats.bytes_received = stats.bytes_received.saturating_add(bytes_received);
+        stats.first_seen_ms.get_or_insert(now_ms);
+        stats.last_seen_ms = Some(now_ms);
+    }
+
     pub fn snapshot(&self, session_id: &SessionId) -> mrd_ipc::ProbeSnapshot {
         let Some(stats) = self.probes.get(session_id) else {
             return mrd_ipc::ProbeSnapshot {
@@ -767,6 +781,20 @@ mod tests {
             Some("fnv1a64:encoded")
         );
         assert!(snapshot.latest_frame_data_url.is_none());
+    }
+
+    #[test]
+    fn probe_registry_counts_transient_drop_without_latching_error() {
+        let mut registry = ProbeRegistry::default();
+        let session_id = SessionId("transient-drop-session".to_string());
+
+        registry.record_transient_frame_drop(&session_id, 512, 1_000);
+
+        let snapshot = registry.snapshot(&session_id);
+        assert_eq!(snapshot.frames_received, 1);
+        assert_eq!(snapshot.frames_decoded, 0);
+        assert_eq!(snapshot.frames_dropped, 1);
+        assert_eq!(snapshot.last_error, None);
     }
 
     #[test]
