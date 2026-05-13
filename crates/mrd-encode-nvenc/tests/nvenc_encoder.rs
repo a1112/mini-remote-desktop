@@ -59,6 +59,35 @@ fn linux_nvenc_h264_encodes_720p_frames_when_runtime_probe_passes() {
 
 #[cfg(windows)]
 #[test]
+fn nvenc_h264_max_speed_idr_includes_parameter_sets() {
+    let Ok(mut encoder) = NvencH264Encoder::new_max_speed_with_bitrate(1280, 720, 60, 20_000_000)
+    else {
+        return;
+    };
+
+    let frame = CapturedFrame::from_cpu(
+        1280,
+        720,
+        FramePixelFormat::Bgra32,
+        33_000,
+        vec![0x44; 1280 * 720 * 4],
+    );
+    let access_unit = encoder
+        .encode(&frame)
+        .expect("nvenc max-speed encode frame")
+        .into_iter()
+        .next()
+        .expect("single access unit");
+    let nal_types = extract_h264_nal_types(&access_unit.bytes);
+
+    assert!(
+        nal_types.contains(&7) && nal_types.contains(&8),
+        "max-speed IDR should carry SPS/PPS for cross-device decoder startup, got {nal_types:?}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
 fn nvenc_h264_access_unit_uses_high_profile() {
     let Ok(mut encoder) = NvencH264Encoder::new(1280, 720, 30) else {
         return;
@@ -171,16 +200,43 @@ fn nvenc_hevc_encoder_emits_hevc_access_unit_when_available() {
 #[cfg(windows)]
 fn extract_sps_profile_idc(access_unit: &[u8]) -> Option<u8> {
     let mut offset = 0usize;
-    while offset + 6 <= access_unit.len() {
-        if access_unit[offset..].starts_with(&[0, 0, 0, 1]) {
-            let nal_type = access_unit[offset + 4] & 0x1f;
-            if nal_type == 7 {
-                return access_unit.get(offset + 5).copied();
+    while let Some((start, start_len)) = find_h264_start_code(access_unit, offset) {
+        let nal_header = start + start_len;
+        if let Some(&header) = access_unit.get(nal_header) {
+            if header & 0x1f == 7 {
+                return access_unit.get(nal_header + 1).copied();
             }
-            offset += 4;
-        } else {
-            offset += 1;
         }
+        offset = nal_header.saturating_add(1);
+    }
+    None
+}
+
+#[cfg(windows)]
+fn extract_h264_nal_types(access_unit: &[u8]) -> Vec<u8> {
+    let mut types = Vec::new();
+    let mut offset = 0usize;
+    while let Some((start, start_len)) = find_h264_start_code(access_unit, offset) {
+        let nal_header = start + start_len;
+        if let Some(&header) = access_unit.get(nal_header) {
+            types.push(header & 0x1f);
+        }
+        offset = nal_header.saturating_add(1);
+    }
+    types
+}
+
+#[cfg(windows)]
+fn find_h264_start_code(bytes: &[u8], from: usize) -> Option<(usize, usize)> {
+    let mut index = from;
+    while index + 3 <= bytes.len() {
+        if bytes[index..].starts_with(&[0, 0, 1]) {
+            return Some((index, 3));
+        }
+        if index + 4 <= bytes.len() && bytes[index..].starts_with(&[0, 0, 0, 1]) {
+            return Some((index, 4));
+        }
+        index += 1;
     }
     None
 }

@@ -500,7 +500,7 @@ mod imp {
                 .shared_input
                 .as_ref()
                 .ok_or_else(|| PipelineError::message("missing shared input resource"))?;
-            let bytes = encode_picture(
+            let bytes = encode_picture_with_sps_pps(
                 &mut self.encoder,
                 &self.bitstream,
                 &shared_input.registered,
@@ -861,7 +861,7 @@ mod imp {
             }
 
             let force_idr = self.frame_index == 0 || self.frame_index % self.fps as usize == 0;
-            let bytes = encode_picture(
+            let bytes = encode_picture_with_sps_pps(
                 &mut self.encoder,
                 &self.bitstream,
                 &self.registered,
@@ -1031,35 +1031,6 @@ mod imp {
         unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture)) }
             .context("CreateTexture2D failed")?;
         texture.ok_or_else(|| anyhow!("CreateTexture2D returned none"))
-    }
-
-    fn encode_picture(
-        encoder: &mut Encoder,
-        bitstream: &BitStream,
-        registered: &RegisteredResource,
-        frame_index: usize,
-        force_idr: bool,
-    ) -> anyhow::Result<Vec<u8>> {
-        encoder
-            .encode_picture(
-                registered,
-                bitstream,
-                frame_index,
-                frame_index as u64,
-                NVencBufferFormat::ARGB,
-                NVencPicStruct::Frame,
-                if force_idr {
-                    NVencPicType::IDR
-                } else {
-                    NVencPicType::P
-                },
-                None,
-            )
-            .map_err(|error| anyhow!("NVENC encode_picture failed: {error:?}"))?;
-        let lock = bitstream
-            .try_lock(true)
-            .map_err(|error| anyhow!("NVENC bitstream lock failed: {error:?}"))?;
-        Ok(lock.as_slice().to_vec())
     }
 
     fn encode_picture_with_sps_pps(
