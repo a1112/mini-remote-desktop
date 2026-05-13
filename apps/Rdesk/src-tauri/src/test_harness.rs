@@ -2049,6 +2049,9 @@ impl TestHarness {
 
         while running.load(Ordering::Relaxed) {
             let pipeline_start = Instant::now();
+            let next_frame_count = frame_count + 1;
+            let preview_due =
+                update_web_preview && next_frame_count % WEB_PREVIEW_FRAME_UPDATE_INTERVAL == 0;
 
             let capture_start = Instant::now();
             let captured_frame = match state.capture.capture_frame() {
@@ -2083,7 +2086,7 @@ impl TestHarness {
                     &mut state.adapted_frame,
                 );
                 let encode_start = Instant::now();
-                let encoded_units = match encoder.encode(frame_for_encode) {
+                let mut encoded_units = match encoder.encode(frame_for_encode) {
                     Ok(units) => units,
                     Err(error) => {
                         encode_failures += 1;
@@ -2096,6 +2099,9 @@ impl TestHarness {
                         continue;
                     }
                 };
+                let encoded_unit_count = encoded_units.len();
+                encoded_units.retain(|unit| !unit.bytes.is_empty());
+                dropped_frames += encoded_unit_count.saturating_sub(encoded_units.len());
                 encoded_units_total += encoded_units.len();
                 total_bitstream_bytes += encoded_units
                     .iter()
@@ -2177,7 +2183,7 @@ impl TestHarness {
                 None
             };
 
-            let should_prepare_render_input = state.renderer.is_some() || update_web_preview;
+            let should_prepare_render_input = state.renderer.is_some() || preview_due;
             let render_input = if should_prepare_render_input {
                 decoded_frames
                     .last()
@@ -2248,10 +2254,7 @@ impl TestHarness {
 
             frame_count += 1;
 
-            if update_web_preview
-                && frame_count % WEB_PREVIEW_FRAME_UPDATE_INTERVAL == 0
-                && !captured_frame.data.is_empty()
-            {
+            if preview_due && !captured_frame.data.is_empty() {
                 if let Ok((captured_ds, ds_width, ds_height)) =
                     downsample_frame(&captured_frame, WEB_PREVIEW_MAX_WIDTH)
                 {
@@ -2262,7 +2265,7 @@ impl TestHarness {
                     buf.captured_generation = buf.captured_generation.saturating_add(1);
                 }
             }
-            if update_web_preview && frame_count % WEB_PREVIEW_FRAME_UPDATE_INTERVAL == 0 {
+            if preview_due {
                 if let Some(input) = render_preview_input {
                     if let Ok((rendered_ds, ds_width, ds_height)) =
                         render_input_to_preview_bgra(input, WEB_PREVIEW_MAX_WIDTH)
@@ -4215,6 +4218,7 @@ mod tests {
                 _ => None,
             },
             input_source: std::env::var("MRD_HARNESS_INPUT_SOURCE").ok(),
+            display_id: std::env::var("MRD_HARNESS_DISPLAY_ID").ok(),
             window_handle: std::env::var("MRD_HARNESS_WINDOW_HANDLE").ok(),
             visual_preview: match std::env::var("MRD_HARNESS_VISUAL_PREVIEW").as_deref() {
                 Ok("1") | Ok("true") | Ok("yes") => Some(true),

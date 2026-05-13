@@ -70,6 +70,30 @@ fn openh264_encoder_forces_recovery_keyframe_after_one_second() {
 }
 
 #[test]
+fn openh264_encoder_does_not_emit_empty_access_units_with_bitrate_control() {
+    let width = 2560;
+    let height = 1440;
+    let mut encoder =
+        OpenH264Encoder::new_with_bitrate(width, height, 60, 5_000_000).expect("create encoder");
+
+    for index in 0..8 {
+        let frame = CapturedFrame::from_cpu(
+            width,
+            height,
+            FramePixelFormat::Bgra32,
+            index * 16_666,
+            vec![index as u8; width * height * 4],
+        );
+        let access_units = encoder.encode(&frame).expect("encode frame");
+
+        assert!(
+            access_units.iter().all(|unit| !unit.bytes.is_empty()),
+            "bitrate-controlled OpenH264 output must not pass empty access units downstream"
+        );
+    }
+}
+
+#[test]
 fn openh264_encoder_rejects_odd_dimensions_without_panicking() {
     let error = match OpenH264Encoder::new(17, 15, 30) {
         Ok(_) => panic!("odd dimensions should fail"),

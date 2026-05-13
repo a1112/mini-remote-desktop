@@ -122,12 +122,11 @@ impl VideoEncoder for OpenH264Encoder {
         self.frame_index += 1;
 
         let bytes = normalize_h264_bitstream(bitstream.to_vec());
-        Ok(vec![EncodedAccessUnit {
-            codec: VideoCodec::H264,
-            timestamp_us: frame.timestamp_us,
-            is_keyframe: annex_b_contains_h264_idr(&bytes),
+        Ok(encoded_access_units_from_bytes(
+            VideoCodec::H264,
+            frame.timestamp_us,
             bytes,
-        }])
+        ))
     }
 }
 
@@ -187,6 +186,23 @@ fn normalize_h264_bitstream(bytes: Vec<u8>) -> Vec<u8> {
     }
 
     bytes
+}
+
+fn encoded_access_units_from_bytes(
+    codec: VideoCodec,
+    timestamp_us: u64,
+    bytes: Vec<u8>,
+) -> Vec<EncodedAccessUnit> {
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+
+    vec![EncodedAccessUnit {
+        codec,
+        timestamp_us,
+        is_keyframe: codec == VideoCodec::H264 && annex_b_contains_h264_idr(&bytes),
+        bytes,
+    }]
 }
 
 fn looks_like_annex_b(bytes: &[u8]) -> bool {
@@ -425,7 +441,11 @@ mod conversion_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{avcc_to_annex_b, looks_like_annex_b, normalize_h264_bitstream};
+    use super::{
+        avcc_to_annex_b, encoded_access_units_from_bytes, looks_like_annex_b,
+        normalize_h264_bitstream,
+    };
+    use mrd_pipeline_core::VideoCodec;
 
     #[test]
     fn avcc_bitstream_is_converted_to_annex_b() {
@@ -438,5 +458,12 @@ mod tests {
         );
         assert!(looks_like_annex_b(&annex_b));
         assert_eq!(normalize_h264_bitstream(avcc), annex_b);
+    }
+
+    #[test]
+    fn empty_bitstream_produces_no_access_units() {
+        let access_units = encoded_access_units_from_bytes(VideoCodec::H264, 123, Vec::new());
+
+        assert!(access_units.is_empty());
     }
 }

@@ -390,6 +390,7 @@ function buildConfig(options: SelectedMatrixOption[]): TestConfig {
   config.bitrate ??= 5000000;
   config.duration_ms ??= 5000;
   config.warmup_ms = 1000;
+  config.visual_preview = false;
 
   return config;
 }
@@ -765,6 +766,48 @@ function summaryFromLanReport(report: LanE2EAutomationReport): TestRunSummary {
     error_message: report.errorMessage,
     failure_reason: report.failureReason ? "validation_failure" : undefined,
   };
+}
+
+function crossDevicePeerSkipReason(
+  peer: LanPeerInfo,
+  transportKind: "quic" | "webrtc"
+): string | null {
+  const transports = peer.transports.map((transport) => transport.toLowerCase());
+  const transportList = peer.transports.length > 0 ? peer.transports.join(", ") : "none";
+
+  if (!peer.p2p_available) {
+    return `LAN peer is discovered but not P2P available: ${peer.device_id}`;
+  }
+
+  if (transportKind === "webrtc") {
+    return transports.includes("webrtc")
+      ? null
+      : `LAN peer does not support webrtc: ${peer.device_id} supports ${transportList}`;
+  }
+
+  const requiredQuicCapabilities = [
+    "quic_datagram",
+    "quic_datagram_2k144",
+    "media_profile_control_v1",
+  ];
+  const missing = requiredQuicCapabilities.filter(
+    (capability) => !transports.includes(capability)
+  );
+  return missing.length === 0
+    ? null
+    : `LAN peer does not support required QUIC media capabilities [${missing.join(
+        ", "
+      )}]: ${peer.device_id} supports ${transportList}`;
+}
+
+function crossDeviceReportSkipReason(report: LanE2EAutomationReport): string | null {
+  if (
+    report.failureReason === "peer_not_ready" ||
+    report.failureReason === "media_profile_mismatch"
+  ) {
+    return report.errorMessage ?? report.failureReason;
+  }
+  return null;
 }
 
 function sanitizeSessionPart(value: string): string {
@@ -1327,14 +1370,42 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
           )
         );
       };
+      const markSkipped = (
+        skipReason: string,
+        duration = Date.now() - startTime,
+        result?: TestRunSummary
+      ) => {
+        setSkippedCount((count) => count + 1);
+        setTests((prev) =>
+          prev.map((t, idx) =>
+            idx === i
+              ? {
+                  ...t,
+                  status: "skipped" as const,
+                  result,
+                  skipReason,
+                  duration,
+                }
+              : t
+          )
+        );
+      };
 
       try {
         const profile = mediaProfileFromConfig(test.config);
+        const transportKind = crossDeviceTransportFromConfig(test.config);
+        const peerSkipReason = crossDevicePeerSkipReason(targetPeer, transportKind);
+        if (peerSkipReason) {
+          markSkipped(peerSkipReason);
+          await yieldToUi();
+          continue;
+        }
+
         const durationMs = test.config.duration_ms ?? 5000;
         const report = await runLanE2EAutomation(lanAutomationCommands, {
           scenarioId: "cross.e2e.remote_display_smoke",
           targetDeviceId: targetPeer.device_id,
-          transportKind: crossDeviceTransportFromConfig(test.config),
+          transportKind,
           requestedProfile: profile,
           timeoutMs: Math.max(10_000, durationMs + (test.config.warmup_ms ?? 0) + 5000),
           sampleIntervalMs: 500,
@@ -1349,19 +1420,7 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
         const duration = Date.now() - startTime;
 
         if (stopRequestedRef.current) {
-          setSkippedCount((count) => count + 1);
-          setTests((prev) =>
-            prev.map((t, idx) =>
-              idx === i
-                ? {
-                    ...t,
-                    status: "skipped" as const,
-                    skipReason: "用户停止矩阵测试",
-                    duration,
-                  }
-                : t
-            )
-          );
+          markSkipped("用户停止矩阵测试", duration);
           break;
         }
 
@@ -1380,43 +1439,27 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
             )
           );
         } else if (report.status === "skipped") {
-          setSkippedCount((count) => count + 1);
-          setTests((prev) =>
-            prev.map((t, idx) =>
-              idx === i
-                ? {
-                    ...t,
-                    status: "skipped" as const,
-                    result: summary,
-                    skipReason: report.errorMessage ?? report.failureReason ?? "跨设备用例跳过",
-                    duration,
-                  }
-                : t
-            )
+          markSkipped(
+            report.errorMessage ?? report.failureReason ?? "跨设备用例跳过",
+            duration,
+            summary
           );
         } else {
-          markFailed(
-            duration,
-            summary,
-            report.errorMessage ?? report.failureReason ?? "跨设备矩阵用例失败"
-          );
+          const skipReason = crossDeviceReportSkipReason(report);
+          if (skipReason) {
+            markSkipped(skipReason, duration, summary);
+          } else {
+            markFailed(
+              duration,
+              summary,
+              report.errorMessage ?? report.failureReason ?? "跨设备矩阵用例失败"
+            );
+          }
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         if (stopRequestedRef.current) {
-          setSkippedCount((count) => count + 1);
-          setTests((prev) =>
-            prev.map((t, idx) =>
-              idx === i
-                ? {
-                    ...t,
-                    status: "skipped" as const,
-                    skipReason: "用户停止矩阵测试",
-                    duration: Date.now() - startTime,
-                  }
-                : t
-            )
-          );
+          markSkipped("用户停止矩阵测试");
           break;
         }
         markFailed(undefined, undefined, message);
