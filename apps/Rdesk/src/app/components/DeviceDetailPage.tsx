@@ -8,9 +8,13 @@ import {
   type RemoteApplicationCatalogResult,
 } from "../services/remoteDisplayLauncher";
 import {
+  getProbeSnapshot,
+  getSessionSnapshot,
   stopSession,
   type CaptureSource,
   type CaptureSourceSelection,
+  type ProbeSnapshot,
+  type SessionRuntimeSnapshot,
 } from "../services/ipcSessionService";
 import { isTauriRuntime } from "../utils/runtime";
 import {
@@ -300,11 +304,16 @@ function RemoteTab({ device }: { device: Device }) {
   const { isDark } = useTheme();
   const navigate = useNavigate();
   const [muted, setMuted] = useState(false);
-  const [latency, setLatency] = useState(device.ping ?? 24);
-  const [quality, setQuality] = useState(87);
+  const latency = device.ping ?? 0;
   const [elapsed, setElapsed] = useState(0);
   const [connected, setConnected] = useState(false);
   const [launching, setLaunching] = useState(false);
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const activeSessionIdRef = useRef<string | null>(null);
+  const [remoteWindowLabel, setRemoteWindowLabel] = useState<string | null>(null);
+  const [sessionSnapshot, setSessionSnapshot] = useState<SessionRuntimeSnapshot | null>(null);
+  const [probeSnapshot, setProbeSnapshot] = useState<ProbeSnapshot | null>(null);
+  const [connectionError, setConnectionError] = useState<string | null>(null);
   const isOnline = device.status === "online";
   const isLanP2PRemote = device.p2pAvailable && !device.isLocal;
   const preferredTransport = device.p2pAvailable
@@ -317,11 +326,42 @@ function RemoteTab({ device }: { device: Device }) {
     if (!connected) return;
     const timer = setInterval(() => {
       setElapsed((e) => e + 1);
-      setLatency((l) => Math.max(10, Math.min(60, l + Math.floor(Math.random() * 7) - 3)));
-      setQuality((q) => Math.max(70, Math.min(98, q + Math.floor(Math.random() * 5) - 2)));
     }, 1000);
     return () => clearInterval(timer);
   }, [connected]);
+
+  useEffect(() => {
+    if (!activeSessionId) return;
+    let cancelled = false;
+
+    const refresh = async () => {
+      const [sessionResult, probeResult] = await Promise.allSettled([
+        getSessionSnapshot(activeSessionId),
+        getProbeSnapshot(activeSessionId),
+      ]);
+
+      if (cancelled) return;
+
+      if (sessionResult.status === "fulfilled") {
+        setSessionSnapshot(sessionResult.value);
+        if (sessionResult.value.last_error) setConnectionError(sessionResult.value.last_error);
+      } else {
+        setConnectionError(sessionResult.reason instanceof Error ? sessionResult.reason.message : "Failed to read session state");
+      }
+
+      if (probeResult.status === "fulfilled") {
+        setProbeSnapshot(probeResult.value);
+        if (probeResult.value.last_error) setConnectionError(probeResult.value.last_error);
+      }
+    };
+
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 1000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [activeSessionId]);
 
   const formatTime = (s: number) => {
     const m = Math.floor(s / 60);
@@ -331,6 +371,7 @@ function RemoteTab({ device }: { device: Device }) {
 
   const handleStartRemote = async () => {
     setLaunching(true);
+    setConnectionError(null);
     try {
       const result = await launchRemoteDisplayForDevice(device.deviceId, {
         transportKind: preferredTransport,
@@ -339,13 +380,50 @@ function RemoteTab({ device }: { device: Device }) {
         targetIp: device.ip,
         lanP2P: isLanP2PRemote,
       });
+      activeSessionIdRef.current = result.sessionId;
+      setActiveSessionId(result.sessionId);
+      setRemoteWindowLabel(result.windowLabel);
+      setSessionSnapshot(null);
+      setProbeSnapshot(null);
+      setElapsed(0);
+      setConnected(true);
       if (result.mode === "route") navigate(`/session/${result.sessionId}`);
     } catch (error) {
-      alert(error instanceof Error ? error.message : "Open remote display failed");
+      const message = error instanceof Error ? error.message : "Open remote display failed";
+      setConnectionError(message);
+      alert(message);
     } finally {
       setLaunching(false);
     }
   };
+
+  const handleDisconnect = async () => {
+    const sessionId = activeSessionIdRef.current ?? activeSessionId;
+    activeSessionIdRef.current = null;
+    setConnected(false);
+    setActiveSessionId(null);
+    setRemoteWindowLabel(null);
+    setSessionSnapshot(null);
+    setProbeSnapshot(null);
+    setElapsed(0);
+    if (!sessionId) return;
+    try {
+      await stopSession(sessionId);
+    } catch (error) {
+      setConnectionError(error instanceof Error ? error.message : "Stop session failed");
+    }
+  };
+
+  const fpsLabel = probeSnapshot?.current_fps == null ? "probing" : `${probeSnapshot.current_fps.toFixed(1)} fps`;
+  const bitrateLabel = probeSnapshot?.bitrate_mbps == null ? "-" : `${probeSnapshot.bitrate_mbps.toFixed(2)} Mbps`;
+  const frameSizeLabel =
+    probeSnapshot?.latest_frame_width && probeSnapshot?.latest_frame_height
+      ? `${probeSnapshot.latest_frame_width}x${probeSnapshot.latest_frame_height}`
+      : probeSnapshot?.media_probe_width && probeSnapshot?.media_probe_height
+        ? `${probeSnapshot.media_probe_width}x${probeSnapshot.media_probe_height}`
+        : "-";
+  const sessionStateLabel = sessionSnapshot?.state ?? (connected ? "connecting" : "idle");
+  const decodedFrames = probeSnapshot?.frames_decoded ?? 0;
 
   if (!isOnline) {
     return (
@@ -417,7 +495,7 @@ function RemoteTab({ device }: { device: Device }) {
           </div>
           <div className="flex items-center gap-1.5 px-2 py-1 rounded-md bg-white/8 text-gray-300" style={{ fontSize: 11 }}>
             <Monitor className="w-3 h-3 text-blue-400" />
-            <span>{quality}%</span>
+            <span>{fpsLabel}</span>
           </div>
           <div className="px-2 py-1 rounded-md bg-white/8 text-gray-300" style={{ fontSize: 11 }}>
             {formatTime(elapsed)}
@@ -425,7 +503,7 @@ function RemoteTab({ device }: { device: Device }) {
         </div>
 
         <button
-          onClick={() => setConnected(false)}
+          onClick={() => void handleDisconnect()}
           className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-red-500/20 text-red-400 hover:bg-red-500/30 transition-colors"
           style={{ fontSize: 11 }}
         >
@@ -442,9 +520,45 @@ function RemoteTab({ device }: { device: Device }) {
           className="w-full h-full object-cover opacity-90"
           draggable={false}
         />
+        <div className="absolute inset-0 bg-[#070b14]" />
+        <div className="absolute inset-0 flex items-center justify-center px-6">
+          <div className="w-full max-w-3xl rounded-xl border border-white/10 bg-white/[0.03] p-5 text-gray-200 shadow-2xl">
+            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 pb-4">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2 text-sm font-semibold text-white">
+                  <Monitor className="h-4 w-4 text-blue-300" />
+                  Native remote window active
+                </div>
+                <div className="mt-1 truncate text-xs text-gray-400">
+                  {remoteWindowLabel ?? activeSessionId ?? "session pending"}
+                </div>
+              </div>
+              <button
+                onClick={() => activeSessionId && navigate(`/session/${activeSessionId}`)}
+                disabled={!activeSessionId}
+                className="rounded-md bg-blue-500/20 px-3 py-1.5 text-xs text-blue-100 hover:bg-blue-500/30 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                Open session view
+              </button>
+            </div>
+            <div className="grid grid-cols-2 gap-3 pt-4 md:grid-cols-5">
+              <StatusPanel label="State" value={sessionStateLabel} />
+              <StatusPanel label="FPS" value={fpsLabel} />
+              <StatusPanel label="Size" value={frameSizeLabel} />
+              <StatusPanel label="Bitrate" value={bitrateLabel} />
+              <StatusPanel label="Frames" value={`${decodedFrames}`} />
+            </div>
+            {connectionError ? (
+              <div className="mt-4 flex items-start gap-2 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs text-red-200">
+                <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                <span>{connectionError}</span>
+              </div>
+            ) : null}
+          </div>
+        </div>
         <div className="absolute top-3 right-3 flex items-center gap-2 px-2.5 py-1.5 rounded-lg bg-black/60 backdrop-blur-sm border border-white/10 text-gray-300" style={{ fontSize: 11 }}>
           <div className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />
-          连接稳定
+          {sessionStateLabel}
         </div>
         <div className="absolute bottom-3 left-3 px-2.5 py-1.5 rounded-lg bg-black/60 backdrop-blur-sm border border-white/10 text-gray-400" style={{ fontSize: 11 }}>
           {device.name} · {device.os} · 1920×1080
@@ -454,6 +568,11 @@ function RemoteTab({ device }: { device: Device }) {
       {/* Status bar */}
       <div className="flex items-center justify-between px-4 py-1.5 bg-[#232340] border-t border-white/10 shrink-0">
         <div className="flex items-center gap-4">
+          <StatusItem label="Size" value={frameSizeLabel} />
+          <StatusItem label="FPS" value={fpsLabel} />
+          <StatusItem label="Bitrate" value={bitrateLabel} />
+        </div>
+        <div className="hidden">
           <StatusItem label="分辨率" value="1920×1080" />
           <StatusItem label="帧率" value="60 fps" />
           <StatusItem label="带宽" value="4.2 MB/s" />
@@ -1374,6 +1493,15 @@ function StatusItem({ label, value }: { label: string; value: string }) {
     <div className="flex items-center gap-1.5" style={{ fontSize: 11 }}>
       <span className="text-gray-500">{label}</span>
       <span className="text-gray-300">{value}</span>
+    </div>
+  );
+}
+
+function StatusPanel({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-lg border border-white/10 bg-black/25 px-3 py-2">
+      <div className="text-[11px] uppercase tracking-wide text-gray-500">{label}</div>
+      <div className="mt-1 truncate text-sm font-semibold text-gray-100">{value}</div>
     </div>
   );
 }

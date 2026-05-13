@@ -40,6 +40,7 @@ import {
 import {
   getProbeSnapshot,
   getSessionSnapshot,
+  stopSession,
   type ProbeSnapshot,
   type SessionRuntimeSnapshot,
 } from "../services/ipcSessionService";
@@ -369,13 +370,23 @@ export function RemoteSessionPage() {
     return `${m.toString().padStart(2, "0")}:${sec.toString().padStart(2, "0")}`;
   };
 
+  const stopActiveSession = async () => {
+    if (!id || isWebRemoteSession) return;
+    await stopSession(id).catch((error) => {
+      console.warn("[RemoteSessionPage] failed to stop session", error);
+    });
+  };
+
   const handleDisconnect = () => {
     if (isWebRemoteSession) {
       navigate("/devices");
       return;
     }
-    if (device) navigate(`/devices/${device.id}`);
-    else navigate("/");
+    void (async () => {
+      await stopActiveSession();
+      if (device) navigate(`/devices/${device.id}`);
+      else navigate("/");
+    })();
   };
 
   // Rendering functions disabled - features now managed by mrd-service
@@ -476,7 +487,10 @@ export function RemoteSessionPage() {
   };
 
   const handleCloseWindow = () => {
-    void withTauriWindow((appWindow) => appWindow.close());
+    void (async () => {
+      await stopActiveSession();
+      await withTauriWindow((appWindow) => appWindow.close());
+    })();
   };
 
   if (loading && !webRemoteSession) {
