@@ -43,6 +43,17 @@ const DEFAULT_CAPTURE_SOURCES = [
     process_id: 0,
     app_name: null,
   },
+  {
+    id: "display",
+    platform: "windows",
+    source_kind: "display",
+    title: "DISPLAY1",
+    class_name: "Monitor",
+    width: 2560,
+    height: 1440,
+    process_id: 0,
+    app_name: null,
+  },
 ];
 
 function createCommands(
@@ -116,7 +127,7 @@ function createCommands(
     ipcSelectRemoteCaptureSource: vi.fn().mockResolvedValue(
       ok({
         session_id: "lan-e2e-test-session",
-        source: DEFAULT_CAPTURE_SOURCES[1],
+        source: DEFAULT_CAPTURE_SOURCES[2],
         status: "selected",
         reason: null,
       })
@@ -175,7 +186,7 @@ function withCaptureSourceCommands(
   sources = DEFAULT_CAPTURE_SOURCES
 ) {
   const ipcListRemoteCaptureSources = vi.fn().mockResolvedValue(ok(sources));
-  const selectedSource = sources.find((source) => source.id === "display-shared") ?? sources[0];
+  const selectedSource = sources.find((source) => source.id === "display") ?? sources[0];
   const ipcSelectRemoteCaptureSource = vi.fn().mockResolvedValue(
     ok({
       session_id: "lan-e2e-test-session",
@@ -330,7 +341,7 @@ describe("runLanE2EAutomation", () => {
     });
 
     expect(result.status).toBe("completed");
-    expect(result.captureSource?.id).toBe("display-shared");
+    expect(result.captureSource?.id).toBe("display");
     expect(result.captureSourceSelection?.status).toBe("selected");
     expect(commands.ipcListRemoteCaptureSources).toHaveBeenCalledWith(
       "lan-e2e-test-session",
@@ -339,7 +350,7 @@ describe("runLanE2EAutomation", () => {
     );
     expect(commands.ipcSelectRemoteCaptureSource).toHaveBeenCalledWith(
       "lan-e2e-test-session",
-      "display-shared"
+      "display"
     );
     const receiverCallOrder = vi.mocked(commands.ipcStartReceiver).mock.invocationCallOrder[0];
     const captureSourceCallOrder =
@@ -414,6 +425,70 @@ describe("runLanE2EAutomation", () => {
     expect(result.failureReason).toBe("media_profile_mismatch");
     expect(result.errorMessage).toContain("Runtime media profile mismatch");
     expect(result.errorMessage).toContain("2560x1440 @ 144 FPS / 64 Mbps");
+  });
+
+  it("skips comparison when the remote capture source downgrades the selected profile", async () => {
+    const commands = withCaptureSourceCommands(
+      createCommands({
+        ipcProbeSnapshot: vi.fn().mockResolvedValue(
+          ok({
+            session_id: "unused",
+            frames_received: 4,
+            frames_decoded: 3,
+            frames_dropped: 0,
+            current_fps: 60,
+            bitrate_mbps: 20,
+            media_probe_valid: true,
+            media_probe_format: "h264",
+            media_probe_width: 1728,
+            media_probe_height: 1080,
+            media_probe_target_fps: 60,
+            media_probe_target_bitrate_mbps: 20,
+            media_probe_payload_bytes: 55555,
+            last_media_sequence: 3,
+            last_media_timestamp_us: 123456,
+            last_media_payload_hash: "fnv1a64:abc123",
+            last_error: null,
+          })
+        ),
+      }),
+      [
+        {
+          id: "display",
+          platform: "windows",
+          source_kind: "display",
+          title: "DISPLAY1",
+          class_name: "Monitor",
+          width: 2560,
+          height: 1600,
+          process_id: 0,
+          app_name: null,
+        },
+      ]
+    );
+
+    const result = await runLanE2EAutomation(commands, {
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      requestedProfile: {
+        width: 1920,
+        height: 1080,
+        fps: 60,
+        bitrate_mbps: 20,
+        codec: "h264",
+      },
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => "lan-e2e-test-session",
+    });
+
+    expect(result.status).toBe("skipped");
+    expect(result.failureReason).toBe("profile_downgraded");
+    expect(result.profileProbeResult?.status).toBe("degraded");
+    expect(result.errorMessage).toContain("Runtime media profile downgraded");
+    expect(result.errorMessage).toContain("1728x1080 @ 60 FPS / 20 Mbps");
   });
 
   it("retries LAN discovery during preflight until the target peer appears", async () => {

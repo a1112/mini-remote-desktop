@@ -51,11 +51,11 @@ pub fn find_capture_source(source_id: &str) -> Result<CaptureSource> {
 pub fn preferred_capture_source(sources: &[CaptureSource]) -> Option<CaptureSource> {
     sources
         .iter()
-        .find(|source| source.source_kind == "display_shared")
+        .find(|source| source.source_kind == "display")
         .or_else(|| {
             sources
                 .iter()
-                .find(|source| source.source_kind == "display")
+                .find(|source| source.source_kind == "display_shared")
         })
         .or_else(|| sources.iter().find(|source| source.source_kind == "window"))
         .or_else(|| sources.first())
@@ -665,7 +665,7 @@ mod tests {
     }
 
     #[test]
-    fn preferred_capture_source_picks_fullscreen_shared_before_window() {
+    fn preferred_capture_source_picks_cpu_display_before_shared_sender_path() {
         let sources = vec![
             source("windows:window:0x1234", "window"),
             source("windows:display:0", "display"),
@@ -674,7 +674,7 @@ mod tests {
 
         let selected = super::preferred_capture_source(&sources).expect("selected source");
 
-        assert_eq!(selected.id, "windows:display-shared:0");
+        assert_eq!(selected.id, "windows:display:0");
     }
 
     #[test]

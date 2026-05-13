@@ -834,7 +834,8 @@ function crossDevicePeerSkipReason(
 function crossDeviceReportSkipReason(report: LanE2EAutomationReport): string | null {
   if (
     report.failureReason === "peer_not_ready" ||
-    report.failureReason === "media_profile_mismatch"
+    report.failureReason === "media_profile_mismatch" ||
+    report.failureReason === "profile_downgraded"
   ) {
     return report.errorMessage ?? report.failureReason;
   }

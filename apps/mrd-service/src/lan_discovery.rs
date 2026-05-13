@@ -1227,11 +1227,14 @@ async fn reconcile_media_profile_to_capture_source(
         .unwrap_or_else(default_media_profile_negotiation);
     let before = negotiation.selected.clone();
 
-    if source.width > 0 {
-        negotiation.selected.width = negotiation.selected.width.min(source.width);
-    }
-    if source.height > 0 {
-        negotiation.selected.height = negotiation.selected.height.min(source.height);
+    if source.width > 0 && source.height > 0 {
+        let (selected_width, selected_height) = h264_target_dimensions(
+            source.width as usize,
+            source.height as usize,
+            &negotiation.selected,
+        );
+        negotiation.selected.width = selected_width as u32;
+        negotiation.selected.height = selected_height as u32;
     }
     negotiation.selected_source_id = Some(source.id.clone());
     negotiation.selected_width = Some(negotiation.selected.width);
@@ -1239,9 +1242,10 @@ async fn reconcile_media_profile_to_capture_source(
 
     if negotiation.selected != before {
         negotiation.status = "downgraded".to_string();
-        negotiation.reason = Some("clamped to selected capture source dimensions".to_string());
+        negotiation.reason =
+            Some("matched selected capture source dimensions and aspect ratio".to_string());
         negotiation.downgrade_reason =
-            Some("clamped to selected capture source dimensions".to_string());
+            Some("matched selected capture source dimensions and aspect ratio".to_string());
     } else if negotiation.downgrade_reason.is_none() {
         negotiation.downgrade_reason = negotiation.reason.clone();
     }
@@ -2066,14 +2070,14 @@ async fn create_lan_receiver_decoder(
     session_id: &SessionId,
 ) -> Result<Box<dyn VideoDecoder>> {
     let mut last_error = None;
-    for backend in lan_receiver_decoder_candidates() {
+    for backend in preferred_lan_receiver_decoder_candidates() {
         match mrd_decode::create_decoder(backend) {
             Ok(decoder) => {
                 app_state
                     .media_pipelines
                     .lock()
                     .await
-                    .set_active_decoder(session_id.clone(), *backend);
+                    .set_active_decoder(session_id.clone(), backend);
                 return Ok(decoder);
             }
             Err(error) => {
@@ -2090,18 +2094,31 @@ async fn create_lan_receiver_decoder(
     )
 }
 
+fn preferred_lan_receiver_decoder_candidates() -> Vec<&'static str> {
+    match std::env::var("MRD_LAN_RECEIVER_DECODER")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "software" | "h264_software" | "openh264" => vec!["h264_software"],
+        "nvdec" => vec!["nvdec"],
+        _ => default_lan_receiver_decoder_candidates().to_vec(),
+    }
+}
+
 #[cfg(windows)]
-fn lan_receiver_decoder_candidates() -> &'static [&'static str] {
+fn default_lan_receiver_decoder_candidates() -> &'static [&'static str] {
     &["nvdec", "h264_software"]
 }
 
 #[cfg(target_os = "linux")]
-fn lan_receiver_decoder_candidates() -> &'static [&'static str] {
+fn default_lan_receiver_decoder_candidates() -> &'static [&'static str] {
     &["linux_h264", "h264_software"]
 }
 
 #[cfg(all(not(windows), not(target_os = "linux")))]
-fn lan_receiver_decoder_candidates() -> &'static [&'static str] {
+fn default_lan_receiver_decoder_candidates() -> &'static [&'static str] {
     &["h264_software"]
 }
 
@@ -2364,6 +2381,21 @@ fn prepare_frame_for_h264(frame: CapturedFrame, profile: &MediaProfile) -> Resul
     }
 
     let (target_width, target_height) = h264_target_dimensions(frame.width, frame.height, profile);
+
+    #[cfg(windows)]
+    if frame.d3d11_shared_bgra().is_some() {
+        if target_width == frame.width && target_height == frame.height {
+            return Ok(frame);
+        }
+        anyhow::bail!(
+            "D3D11 shared capture requires exact selected profile dimensions: source {}x{}, selected {}x{}",
+            frame.width,
+            frame.height,
+            target_width,
+            target_height
+        );
+    }
+
     let bytes_per_pixel = frame_bytes_per_pixel(frame.pixel_format);
     let source_stride = frame
         .width
@@ -2378,6 +2410,10 @@ fn prepare_frame_for_h264(frame: CapturedFrame, profile: &MediaProfile) -> Resul
             frame.data.len(),
             required_len
         );
+    }
+
+    if target_width == frame.width && target_height == frame.height {
+        return Ok(frame);
     }
 
     let mut rgb = Vec::with_capacity(target_width * target_height * 3);
@@ -3566,8 +3602,148 @@ mod tests {
         assert_eq!(negotiation.status, "downgraded");
         assert_eq!(
             negotiation.downgrade_reason.as_deref(),
-            Some("clamped to selected capture source dimensions")
+            Some("matched selected capture source dimensions and aspect ratio")
         );
+    }
+
+    #[tokio::test]
+    async fn capture_source_selection_preserves_source_aspect_ratio() {
+        let app_state = Arc::new(AppState::new());
+        let session_id = SessionId("capture-source-aspect-session".to_string());
+        app_state.sessions.lock().await.insert(
+            session_id.clone(),
+            SessionSnapshot {
+                session_id: session_id.clone(),
+                transport: "quic".to_string(),
+                source_device_id: Some(DeviceId("controller-device".to_string())),
+                target_device_id: None,
+                local_listen_addr: None,
+                local_server_name: None,
+                local_cert_der_b64: None,
+                remote_listen_addr: None,
+                remote_server_name: None,
+                remote_cert_der_b64: None,
+                lifecycle_state: "listening".to_string(),
+                last_error: None,
+                sender_active: true,
+                receiver_active: false,
+            },
+        );
+        app_state.media_profiles.lock().await.set(
+            session_id.clone(),
+            negotiate_media_profile(Some(MediaProfile {
+                width: 1920,
+                height: 1080,
+                fps: 60,
+                bitrate_mbps: 20,
+                codec: "h264".to_string(),
+            }))
+            .unwrap(),
+        );
+
+        let source = mrd_ipc::CaptureSource {
+            id: "windows:display:0".to_string(),
+            platform: "windows".to_string(),
+            source_kind: "display".to_string(),
+            title: "Display 1".to_string(),
+            class_name: "Monitor".to_string(),
+            width: 2560,
+            height: 1600,
+            process_id: 0,
+            app_name: Some("Display".to_string()),
+            bundle_identifier: None,
+            preview_data_url: None,
+            preview_width: None,
+            preview_height: None,
+        };
+
+        accept_lan_capture_source_select_from_sources(
+            &app_state,
+            &session_id,
+            "windows:display:0",
+            vec![source],
+        )
+        .await
+        .unwrap();
+
+        let negotiation = app_state
+            .media_profiles
+            .lock()
+            .await
+            .get(&session_id)
+            .expect("reconciled media profile");
+        assert_eq!(
+            negotiation.selected_source_id.as_deref(),
+            Some("windows:display:0")
+        );
+        assert_eq!(negotiation.selected.width, 1728);
+        assert_eq!(negotiation.selected.height, 1080);
+        assert_eq!(negotiation.selected_width, Some(1728));
+        assert_eq!(negotiation.selected_height, Some(1080));
+        assert_eq!(negotiation.status, "downgraded");
+        assert_eq!(
+            negotiation.downgrade_reason.as_deref(),
+            Some("matched selected capture source dimensions and aspect ratio")
+        );
+    }
+
+    #[test]
+    fn prepare_frame_for_h264_keeps_cpu_frame_when_dimensions_match() {
+        let data = vec![7_u8; 64 * 32 * 4];
+        let frame = CapturedFrame::from_cpu(64, 32, FramePixelFormat::Bgra32, 1234, data.clone());
+        let profile = MediaProfile {
+            width: 64,
+            height: 32,
+            fps: 60,
+            bitrate_mbps: 20,
+            codec: "h264".to_string(),
+        };
+
+        let prepared = prepare_frame_for_h264(frame, &profile).expect("prepared frame");
+
+        assert_eq!(prepared.width, 64);
+        assert_eq!(prepared.height, 32);
+        assert_eq!(prepared.pixel_format, FramePixelFormat::Bgra32);
+        assert_eq!(prepared.data, data);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn prepare_frame_for_h264_accepts_exact_d3d11_shared_frame() {
+        let frame = CapturedFrame::from_d3d11_shared_bgra(64, 32, 1234, 0x1234, 64 * 4);
+        let profile = MediaProfile {
+            width: 64,
+            height: 32,
+            fps: 60,
+            bitrate_mbps: 20,
+            codec: "h264".to_string(),
+        };
+
+        let prepared = prepare_frame_for_h264(frame, &profile).expect("prepared shared frame");
+
+        assert_eq!(prepared.width, 64);
+        assert_eq!(prepared.height, 32);
+        assert!(prepared.data.is_empty());
+        assert!(prepared.d3d11_shared_bgra().is_some());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn prepare_frame_for_h264_rejects_scaled_d3d11_shared_frame() {
+        let frame = CapturedFrame::from_d3d11_shared_bgra(128, 64, 1234, 0x1234, 128 * 4);
+        let profile = MediaProfile {
+            width: 64,
+            height: 32,
+            fps: 60,
+            bitrate_mbps: 20,
+            codec: "h264".to_string(),
+        };
+
+        let error = prepare_frame_for_h264(frame, &profile).expect_err("shared scale rejected");
+
+        assert!(error
+            .to_string()
+            .contains("requires exact selected profile"));
     }
 
     #[test]
