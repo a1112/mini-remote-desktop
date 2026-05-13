@@ -159,6 +159,8 @@ const MATRIX_DIMENSIONS: MatrixDimension[] = [
       { id: "90", name: "90 FPS", enabled: false },
       { id: "120", name: "120 FPS", enabled: false },
       { id: "144", name: "144 FPS", enabled: false },
+      { id: "180", name: "180 FPS", enabled: false },
+      { id: "249", name: "249 FPS", enabled: false },
     ],
   },
   {
@@ -756,6 +758,10 @@ function mediaProfileFromConfig(config: TestConfig): MediaProfile {
   };
 }
 
+function crossDeviceMinimumExpectedFps(profile: MediaProfile): number {
+  return Math.max(1, Math.floor(Math.max(1, profile.fps) * 0.8));
+}
+
 function summaryFromLanReport(report: LanE2EAutomationReport): TestRunSummary {
   const probe = report.probeSnapshot;
   return {
@@ -788,16 +794,41 @@ function crossDevicePeerSkipReason(
   const requiredQuicCapabilities = [
     "quic_datagram",
     "quic_datagram_2k144",
+    "quic_datagram_media_v2",
     "media_profile_control_v1",
   ];
   const missing = requiredQuicCapabilities.filter(
     (capability) => !transports.includes(capability)
   );
-  return missing.length === 0
+  if (missing.length > 0) {
+    return `LAN peer does not support required QUIC media capabilities [${missing.join(
+      ", "
+    )}]: ${peer.device_id} supports ${transportList}`;
+  }
+
+  const mediaProtocolVersion = peer.media_protocol_version ?? 0;
+  const mediaCapabilities = (peer.media_capabilities ?? []).map((capability) =>
+    capability.toLowerCase()
+  );
+  const requiredMediaCapabilities = [
+    "dxgi_capture",
+    "nvenc_h264",
+    "nvdec",
+    "d3d11_native_render",
+  ];
+  const missingMediaCapabilities = requiredMediaCapabilities.filter(
+    (capability) => !mediaCapabilities.includes(capability)
+  );
+  if (mediaProtocolVersion < 2) {
+    return `LAN peer is not on required QUIC media v2 protocol: ${peer.device_id} reports media protocol ${
+      mediaProtocolVersion || "unknown"
+    }`;
+  }
+  return missingMediaCapabilities.length === 0
     ? null
-    : `LAN peer does not support required QUIC media capabilities [${missing.join(
+    : `LAN peer is missing required Windows media capabilities [${missingMediaCapabilities.join(
         ", "
-      )}]: ${peer.device_id} supports ${transportList}`;
+      )}]: ${peer.device_id}`;
 }
 
 function crossDeviceReportSkipReason(report: LanE2EAutomationReport): string | null {
@@ -1411,7 +1442,7 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
           sampleIntervalMs: 500,
           minSampleDurationMs: Math.min(1000, durationMs),
           minDecodedFrames: 1,
-          minFps: 1,
+          minFps: crossDeviceMinimumExpectedFps(profile),
           createSessionId: () =>
             `matrix-lan-${sanitizeSessionPart(targetPeer.device_id)}-${Date.now()}-${i}`,
         });

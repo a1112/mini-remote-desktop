@@ -588,6 +588,15 @@ pub struct LanPeerInfo {
     pub transports: Vec<String>,
     /// Protocol version advertised by the peer.
     pub protocol_version: u32,
+    /// Service build identifier advertised by the peer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_build_id: Option<String>,
+    /// LAN media protocol version advertised by the peer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_protocol_version: Option<u32>,
+    /// Structured media capabilities advertised by the peer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub media_capabilities: Vec<String>,
     /// Milliseconds since this peer was last observed.
     pub age_ms: u64,
     /// Whether this peer was discovered through the local P2P LAN path.

@@ -58,7 +58,7 @@ type RenderMode = "web" | "d3d11_native" | "d3d12_native" | "metal_native" | "li
 type HostOs = "macos" | "windows" | "linux" | "other";
 type TransportKind = NonNullable<TestMatrixConfig["transport"]>;
 type ResolutionKey = "1280x720" | "1920x1080" | "2560x1440" | "2560x1600" | "3440x1440";
-type FpsKey = "30" | "60" | "120" | "144";
+type FpsKey = "30" | "60" | "120" | "144" | "180" | "249";
 type BitrateKey = "8" | "20" | "50" | "80";
 type TestStatus = "idle" | "starting" | "running" | "stopping" | "completed" | "failed";
 type WebPreviewMode = "idle" | "connecting" | "webrtc" | "failed";
@@ -123,6 +123,8 @@ const fpsOptions: Option<FpsKey>[] = [
   { value: "60", label: "60 FPS" },
   { value: "120", label: "120 FPS" },
   { value: "144", label: "144 FPS" },
+  { value: "180", label: "180 FPS" },
+  { value: "249", label: "249 FPS" },
 ];
 
 const bitrateOptions: Option<BitrateKey>[] = [

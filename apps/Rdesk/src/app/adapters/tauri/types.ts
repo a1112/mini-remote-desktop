@@ -430,6 +430,9 @@ export interface LanPeerInfo {
   p2p_control_addr: string;
   transports: string[];
   protocol_version: number;
+  service_build_id?: string | null;
+  media_protocol_version?: number | null;
+  media_capabilities?: string[];
   age_ms: number;
   p2p_available: boolean;
 }

@@ -220,14 +220,16 @@ pub struct NvdecVideoDecoder {
 
 impl NvdecVideoDecoder {
     pub fn new() -> Result<Self, PipelineError> {
-        let decoder = mrd_decode_nvdec::NvdecDecoder::new()
-            .map_err(|e| PipelineError::Message(format!("nvdec create failed: {e}")))?;
+        let decoder = mrd_decode_nvdec::NvdecDecoder::new_with_output_mode(
+            mrd_decode_nvdec::NvdecOutputMode::CpuNv12,
+        )
+        .map_err(|e| PipelineError::Message(format!("nvdec create failed: {e}")))?;
         Ok(Self { decoder })
     }
 
     pub fn new_av1() -> Result<Self, PipelineError> {
         let decoder = mrd_decode_nvdec::NvdecDecoder::new_av1_with_output_mode(
-            mrd_decode_nvdec::NvdecOutputMode::CpuRgb24,
+            mrd_decode_nvdec::NvdecOutputMode::CpuNv12,
         )
         .map_err(|e| PipelineError::Message(format!("nvdec av1 create failed: {e}")))?;
         Ok(Self { decoder })
@@ -235,7 +237,7 @@ impl NvdecVideoDecoder {
 
     pub fn new_hevc() -> Result<Self, PipelineError> {
         let decoder = mrd_decode_nvdec::NvdecDecoder::new_hevc_with_output_mode(
-            mrd_decode_nvdec::NvdecOutputMode::CpuRgb24,
+            mrd_decode_nvdec::NvdecOutputMode::CpuNv12,
         )
         .map_err(|e| PipelineError::Message(format!("nvdec hevc create failed: {e}")))?;
         Ok(Self { decoder })
@@ -243,7 +245,7 @@ impl NvdecVideoDecoder {
 
     pub fn new_hevc_main10() -> Result<Self, PipelineError> {
         let decoder = mrd_decode_nvdec::NvdecDecoder::new_hevc_main10_with_output_mode(
-            mrd_decode_nvdec::NvdecOutputMode::CpuRgb24,
+            mrd_decode_nvdec::NvdecOutputMode::CpuNv12,
         )
         .map_err(|e| PipelineError::Message(format!("nvdec hevc main10 create failed: {e}")))?;
         Ok(Self { decoder })

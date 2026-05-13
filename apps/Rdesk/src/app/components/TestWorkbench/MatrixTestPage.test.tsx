@@ -78,6 +78,21 @@ function windowsCapabilities(overrides: Record<string, unknown> = {}) {
 }
 
 describe("MatrixTestPage failure handling", () => {
+  it("exposes 180 and 249 FPS high-refresh matrix options", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(windowsCapabilities());
+      }
+      return Promise.resolve(null);
+    });
+
+    render(<MatrixTestPage />);
+
+    expect(await screen.findByLabelText("180 FPS")).toBeInTheDocument();
+    expect(screen.getByLabelText("249 FPS")).toBeInTheDocument();
+  });
+
   it("exposes HEVC encoders when Windows capabilities report NVENC HEVC support", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {
@@ -909,10 +924,19 @@ describe("MatrixTestPage failure handling", () => {
         "quic",
         "quic_datagram",
         "quic_datagram_2k144",
+        "quic_datagram_media_v2",
         "media_profile_control_v1",
         "capture_source_control_v1",
       ],
       protocol_version: 1,
+      service_build_id: "test-build",
+      media_protocol_version: 2,
+      media_capabilities: [
+        "dxgi_capture",
+        "nvenc_h264",
+        "nvdec",
+        "d3d11_native_render",
+      ],
       age_ms: 120,
       p2p_available: true,
     };
@@ -1117,10 +1141,19 @@ describe("MatrixTestPage failure handling", () => {
         "quic",
         "quic_datagram",
         "quic_datagram_2k144",
+        "quic_datagram_media_v2",
         "media_profile_control_v1",
         "capture_source_control_v1",
       ],
       protocol_version: 1,
+      service_build_id: "test-build",
+      media_protocol_version: 2,
+      media_capabilities: [
+        "dxgi_capture",
+        "nvenc_h264",
+        "nvdec",
+        "d3d11_native_render",
+      ],
       age_ms: 120,
       p2p_available: true,
     };

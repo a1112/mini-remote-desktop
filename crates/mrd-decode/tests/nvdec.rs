@@ -57,12 +57,14 @@ fn nvdec_decoder_roundtrips_valid_access_unit_when_supported() {
     assert!(!frames.is_empty(), "nvdec should emit at least one frame");
     assert_eq!(frames[0].width, 128);
     assert_eq!(frames[0].height, 128);
-    // Check the data is in CPU RGB24 format
+    // The generic NVDEC adapter is used by scripted QUIC benchmarks and should
+    // avoid the expensive GPU->CPU RGB conversion by default.
     match &frames[0].data {
-        DecodedFrameData::CpuRgb24(data) => {
-            assert_eq!(data.len(), 128 * 128 * 3);
+        DecodedFrameData::CpuNv12 { data, pitch } => {
+            assert!(*pitch >= 128);
+            assert!(data.len() >= pitch * 128 + pitch * 64);
         }
-        _ => panic!("Expected CpuRgb24 data"),
+        other => panic!("expected CpuNv12 data, got {other:?}"),
     }
 }
 

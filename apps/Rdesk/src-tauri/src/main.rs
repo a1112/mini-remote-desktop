@@ -3,10 +3,16 @@
 #![allow(unexpected_cfgs)]
 
 mod app_settings;
+#[cfg(test)]
+mod benchmark;
 mod device_info;
 mod frame_sink;
 mod ipc_client;
 mod platform;
+#[cfg(test)]
+mod quic_host;
+#[cfg(test)]
+mod quic_transport_harness;
 mod remote_display_surface;
 mod render_probe;
 mod render_window_registry;
@@ -16,12 +22,6 @@ mod test_harness;
 mod test_orchestrator;
 mod webrtc_host;
 mod webrtc_media;
-#[cfg(test)]
-mod benchmark;
-#[cfg(test)]
-mod quic_host;
-#[cfg(test)]
-mod quic_transport_harness;
 
 use app_settings::{
     default_settings_path, load_settings, save_settings, AppSettings, DecodePolicy,

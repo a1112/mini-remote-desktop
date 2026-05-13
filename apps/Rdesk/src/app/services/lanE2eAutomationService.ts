@@ -173,7 +173,14 @@ const DEFAULT_MIN_FPS = 1;
 const DEFAULT_MIN_SAMPLE_DURATION_MS = 0;
 const QUIC_DATAGRAM_MEDIA_CAPABILITY = "quic_datagram";
 const QUIC_2K144_MEDIA_CAPABILITY = "quic_datagram_2k144";
+const QUIC_DATAGRAM_MEDIA_V2_CAPABILITY = "quic_datagram_media_v2";
 const MEDIA_PROFILE_CONTROL_CAPABILITY = "media_profile_control_v1";
+const REQUIRED_WINDOWS_MEDIA_CAPABILITIES = [
+  "dxgi_capture",
+  "nvenc_h264",
+  "nvdec",
+  "d3d11_native_render",
+];
 const DEFAULT_LAN_MEDIA_PROFILE: MediaProfile = {
   width: 2560,
   height: 1440,
@@ -570,10 +577,19 @@ function peerSupportsTransport(peer: LanPeerInfo, transportKind: string): boolea
   const transports = peer.transports.map((transport) => transport.toLowerCase());
   const requestedTransport = transportKind.toLowerCase();
   if (requestedTransport === "quic") {
+    const mediaProtocolVersion = peer.media_protocol_version ?? 0;
+    const mediaCapabilities = (peer.media_capabilities ?? []).map((capability) =>
+      capability.toLowerCase()
+    );
     return (
       transports.includes(QUIC_DATAGRAM_MEDIA_CAPABILITY) &&
       transports.includes(QUIC_2K144_MEDIA_CAPABILITY) &&
-      transports.includes(MEDIA_PROFILE_CONTROL_CAPABILITY)
+      transports.includes(QUIC_DATAGRAM_MEDIA_V2_CAPABILITY) &&
+      transports.includes(MEDIA_PROFILE_CONTROL_CAPABILITY) &&
+      mediaProtocolVersion >= 2 &&
+      REQUIRED_WINDOWS_MEDIA_CAPABILITIES.every((capability) =>
+        mediaCapabilities.includes(capability)
+      )
     );
   }
   return transports.includes(requestedTransport);
@@ -586,14 +602,32 @@ function buildPeerNotReadyMessage(peer: LanPeerInfo, transportKind: string): str
   }
   if (transportKind.toLowerCase() === "quic") {
     const lower = peer.transports.map((transport) => transport.toLowerCase());
+    const mediaCapabilities = (peer.media_capabilities ?? []).map((capability) =>
+      capability.toLowerCase()
+    );
+    const mediaProtocolVersion = peer.media_protocol_version ?? 0;
     if (lower.includes(QUIC_DATAGRAM_MEDIA_CAPABILITY)) {
-      const missing = [QUIC_2K144_MEDIA_CAPABILITY, MEDIA_PROFILE_CONTROL_CAPABILITY]
+      const missing = [
+        QUIC_2K144_MEDIA_CAPABILITY,
+        QUIC_DATAGRAM_MEDIA_V2_CAPABILITY,
+        MEDIA_PROFILE_CONTROL_CAPABILITY,
+      ]
         .filter((capability) => !lower.includes(capability))
-        .join(", ");
-      return `LAN peer supports ${QUIC_DATAGRAM_MEDIA_CAPABILITY} but not required media controls [${missing}]: ${peer.device_id} supports ${transportList}. Rebuild and restart the peer mrd-service/Rdesk from the latest main branch.`;
+      if (missing.length > 0) {
+        return `LAN peer supports ${QUIC_DATAGRAM_MEDIA_CAPABILITY} but not required media controls [${missing.join(", ")}]: ${peer.device_id} supports ${transportList}. Rebuild and restart the peer mrd-service/Rdesk from the latest main branch.`;
+      }
     }
     if (lower.includes("quic")) {
       return `LAN peer advertises legacy quic but not ${QUIC_DATAGRAM_MEDIA_CAPABILITY}: ${peer.device_id} supports ${transportList}. Rebuild and restart the peer mrd-service/Rdesk from the latest main branch.`;
+    }
+    if (!lower.includes(QUIC_DATAGRAM_MEDIA_V2_CAPABILITY) || mediaProtocolVersion < 2) {
+      return `LAN peer is not on the required QUIC media v2 protocol: ${peer.device_id} supports ${transportList}, media protocol ${mediaProtocolVersion || "unknown"}. Rebuild and restart the peer mrd-service/Rdesk from the same branch.`;
+    }
+    const missingMediaCapabilities = REQUIRED_WINDOWS_MEDIA_CAPABILITIES.filter(
+      (capability) => !mediaCapabilities.includes(capability)
+    );
+    if (missingMediaCapabilities.length > 0) {
+      return `LAN peer is missing required Windows media capabilities [${missingMediaCapabilities.join(", ")}]: ${peer.device_id}. Rebuild/restart the peer and verify DXGI/NVENC/NVDEC/D3D11 native support.`;
     }
     return `LAN peer does not support ${QUIC_2K144_MEDIA_CAPABILITY}: ${peer.device_id} supports ${transportList}`;
   }

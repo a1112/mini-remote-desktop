@@ -239,7 +239,8 @@ pub struct DecodedVideoFrameStats {
     pub target_bitrate_mbps: u32,
     pub encoded_bytes: u32,
     pub pixel_format: String,
-    pub rgb24: Vec<u8>,
+    pub payload_hash: String,
+    pub rgb24: Option<Vec<u8>>,
 }
 
 impl ProbeRegistry {
@@ -315,13 +316,15 @@ impl ProbeRegistry {
         stats.media_probe_payload_bytes = Some(frame.encoded_bytes);
         stats.last_media_sequence = Some(frame.sequence);
         stats.last_media_timestamp_us = Some(frame.timestamp_us);
-        stats.last_media_payload_hash = Some(format!("fnv1a64:{:016x}", fnv1a64(&frame.rgb24)));
-        stats.latest_frame = Some(DecodedPreviewFrame {
-            width: frame.width,
-            height: frame.height,
-            pixel_format: frame.pixel_format,
-            rgb24: frame.rgb24,
-        });
+        stats.last_media_payload_hash = Some(frame.payload_hash);
+        if let Some(rgb24) = frame.rgb24 {
+            stats.latest_frame = Some(DecodedPreviewFrame {
+                width: frame.width,
+                height: frame.height,
+                pixel_format: frame.pixel_format,
+                rgb24,
+            });
+        }
         stats.last_error = None;
     }
 
@@ -430,15 +433,6 @@ fn encode_rgb24_png_data_url(width: u32, height: u32, rgb24: &[u8]) -> Option<St
         "data:image/png;base64,{}",
         general_purpose::STANDARD.encode(png)
     ))
-}
-
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
 }
 
 /// Shell state - tracks UI presence and service lifecycle
@@ -716,7 +710,8 @@ mod tests {
                 target_bitrate_mbps: 64,
                 encoded_bytes: 1024,
                 pixel_format: "rgb24".to_string(),
-                rgb24: vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255],
+                payload_hash: "fnv1a64:preview".to_string(),
+                rgb24: Some(vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255]),
             },
             3_000,
         );
@@ -736,6 +731,42 @@ mod tests {
             .latest_frame_data_url
             .as_deref()
             .is_some_and(|value| value.starts_with("data:image/png;base64,")));
+    }
+
+    #[test]
+    fn probe_registry_counts_decoded_video_without_preview_copy() {
+        let mut registry = ProbeRegistry::default();
+        let session_id = SessionId("decoded-video-metadata-session".to_string());
+
+        registry.record_decoded_video_frame(
+            &session_id,
+            DecodedVideoFrameStats {
+                bytes_received: 2048,
+                sequence: 12,
+                timestamp_us: 1_111_111,
+                width: 1920,
+                height: 1080,
+                target_fps: 144,
+                target_bitrate_mbps: 20,
+                encoded_bytes: 2048,
+                pixel_format: "cpu_nv12".to_string(),
+                payload_hash: "fnv1a64:encoded".to_string(),
+                rgb24: None,
+            },
+            4_000,
+        );
+
+        let snapshot = registry.snapshot(&session_id);
+
+        assert_eq!(snapshot.frames_received, 1);
+        assert_eq!(snapshot.frames_decoded, 1);
+        assert_eq!(snapshot.media_probe_width, Some(1920));
+        assert_eq!(snapshot.media_probe_height, Some(1080));
+        assert_eq!(
+            snapshot.last_media_payload_hash.as_deref(),
+            Some("fnv1a64:encoded")
+        );
+        assert!(snapshot.latest_frame_data_url.is_none());
     }
 
     #[test]
