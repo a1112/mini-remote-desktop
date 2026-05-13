@@ -495,6 +495,7 @@ pub async fn request_lan_remote_session(
         .await
         .with_context(|| format!("LAN peer not found: {}", target_device_id.0))?;
     ensure_peer_supports_requested_media(target_device_id, transport_kind, &peer_transports)?;
+    close_existing_lan_receiver_sessions_for_target(app_state, target_device_id, session_id).await;
 
     let (source_device_id, source_device_name) = {
         let devices = app_state.devices.lock().await;
@@ -1066,6 +1067,7 @@ async fn accept_lan_remote_session(
         Ok(value) => value,
         Err(error) => return LanRemoteAcceptResult::rejected(error.to_string()),
     };
+    close_existing_lan_sender_sessions_for_source(app_state, &source_device_id, &session_id).await;
 
     let (listener, bootstrap) = match QuinnServerListener::bind("0.0.0.0:0").await {
         Ok(value) => value,
@@ -1437,6 +1439,98 @@ fn quic_bootstrap_for_peer(
         server_name: quic.server_name,
         cert_der: quic.cert_der,
     })
+}
+
+async fn close_existing_lan_receiver_sessions_for_target(
+    app_state: &Arc<AppState>,
+    target_device_id: &DeviceId,
+    next_session_id: &SessionId,
+) {
+    let stale_sessions = {
+        let sessions = app_state.sessions.lock().await;
+        sessions
+            .list_all()
+            .into_iter()
+            .filter(|snapshot| {
+                snapshot.session_id != *next_session_id
+                    && snapshot.target_device_id.as_ref() == Some(target_device_id)
+                    && snapshot.receiver_active
+                    && !matches!(snapshot.lifecycle_state.as_str(), "closed" | "failed")
+            })
+            .map(|snapshot| snapshot.session_id)
+            .collect::<Vec<_>>()
+    };
+    close_lan_media_sessions(
+        app_state,
+        stale_sessions,
+        "replaced by newer receiver session",
+    )
+    .await;
+}
+
+async fn close_existing_lan_sender_sessions_for_source(
+    app_state: &Arc<AppState>,
+    source_device_id: &DeviceId,
+    next_session_id: &SessionId,
+) {
+    let stale_sessions = {
+        let sessions = app_state.sessions.lock().await;
+        sessions
+            .list_all()
+            .into_iter()
+            .filter(|snapshot| {
+                snapshot.session_id != *next_session_id
+                    && snapshot.source_device_id.as_ref() == Some(source_device_id)
+                    && snapshot.sender_active
+                    && !matches!(snapshot.lifecycle_state.as_str(), "closed" | "failed")
+            })
+            .map(|snapshot| snapshot.session_id)
+            .collect::<Vec<_>>()
+    };
+    close_lan_media_sessions(
+        app_state,
+        stale_sessions,
+        "replaced by newer sender session",
+    )
+    .await;
+}
+
+async fn close_lan_media_sessions(
+    app_state: &Arc<AppState>,
+    session_ids: Vec<SessionId>,
+    reason: &'static str,
+) {
+    for session_id in session_ids {
+        tracing::info!(session_id = %session_id.0, reason, "closing stale LAN media session");
+        {
+            let mut sessions = app_state.sessions.lock().await;
+            if let Some(snapshot) = sessions.get(&session_id).cloned() {
+                sessions.insert(
+                    session_id.clone(),
+                    SessionSnapshot {
+                        lifecycle_state: "closed".to_string(),
+                        last_error: None,
+                        sender_active: false,
+                        receiver_active: false,
+                        ..snapshot
+                    },
+                );
+            }
+        }
+        app_state
+            .media_tasks
+            .lock()
+            .await
+            .abort_session(&session_id);
+        app_state.media_profiles.lock().await.remove(&session_id);
+        app_state.capture_sources.lock().await.remove(&session_id);
+        app_state
+            .peer_media_capabilities
+            .lock()
+            .await
+            .remove(&session_id);
+        app_state.media_pipelines.lock().await.remove(&session_id);
+    }
 }
 
 fn ensure_peer_supports_requested_media(
@@ -2076,58 +2170,54 @@ async fn receive_quic_media_loop(
 
             match envelope.payload_type {
                 LAN_MEDIA_PAYLOAD_H264_ACCESS_UNIT => {
-                    match decode_h264_desktop_frame(decoder.as_mut(), &envelope.payload) {
+                    match decode_h264_desktop_frame(decoder.decoder.as_mut(), &envelope.payload) {
                         Ok(decoded_frames) if !decoded_frames.is_empty() => {
                             consecutive_decode_errors = 0;
-                            for decoded_frame in decoded_frames {
-                                let width = decoded_frame.width as u32;
-                                let height = decoded_frame.height as u32;
-                                let decoded_pixel_format =
-                                    decoded_frame_pixel_format(&decoded_frame);
-                                let payload_hash =
-                                    format!("fnv1a64:{:016x}", fnv1a64(&envelope.payload));
-                                let preview_rgb24 = if should_update_lan_preview(envelope.sequence)
-                                {
-                                    match decoded_frame_to_rgb24(decoded_frame) {
-                                        Ok((_width, _height, rgb24)) => Some(rgb24),
-                                        Err(error) => {
-                                            app_state.probes.lock().await.record_probe_drop(
-                                                &session_id,
-                                                frame.payload.len() as u64,
-                                                now_ms(),
-                                                error.to_string(),
-                                            );
-                                            continue;
-                                        }
-                                    }
-                                } else {
-                                    None
-                                };
-
-                                app_state.probes.lock().await.record_decoded_video_frame(
-                                    &session_id,
-                                    DecodedVideoFrameStats {
-                                        bytes_received: frame.payload.len() as u64,
-                                        sequence: envelope.sequence,
-                                        timestamp_us: envelope.timestamp_us,
-                                        width,
-                                        height,
-                                        target_fps: envelope.profile.fps,
-                                        target_bitrate_mbps: envelope.profile.bitrate_mbps,
-                                        encoded_bytes: envelope.payload.len() as u32,
-                                        pixel_format: preview_rgb24
-                                            .as_ref()
-                                            .map(|_| "rgb24".to_string())
-                                            .unwrap_or(decoded_pixel_format),
-                                        payload_hash,
-                                        rgb24: preview_rgb24,
-                                    },
-                                    now_ms(),
-                                );
-                            }
+                            record_lan_decoded_frames(
+                                &app_state,
+                                &session_id,
+                                decoded_frames,
+                                frame.payload.len() as u64,
+                                envelope.sequence,
+                                envelope.timestamp_us,
+                                &envelope.profile,
+                                &envelope.payload,
+                            )
+                            .await;
                         }
                         Ok(_) => {}
                         Err(error) => {
+                            let error = if frame.is_keyframe {
+                                match try_decode_h264_keyframe_with_fallback(
+                                    &app_state,
+                                    &session_id,
+                                    decoder.backend,
+                                    &envelope.payload,
+                                    &error,
+                                )
+                                .await
+                                {
+                                    Ok((next_decoder, decoded_frames)) => {
+                                        decoder = next_decoder;
+                                        consecutive_decode_errors = 0;
+                                        record_lan_decoded_frames(
+                                            &app_state,
+                                            &session_id,
+                                            decoded_frames,
+                                            frame.payload.len() as u64,
+                                            envelope.sequence,
+                                            envelope.timestamp_us,
+                                            &envelope.profile,
+                                            &envelope.payload,
+                                        )
+                                        .await;
+                                        continue;
+                                    }
+                                    Err(fallback_error) => fallback_error,
+                                }
+                            } else {
+                                error
+                            };
                             consecutive_decode_errors = consecutive_decode_errors.saturating_add(1);
                             let reassembler_stats = reassembler.stats();
                             let payload_hash =
@@ -2224,10 +2314,70 @@ async fn receive_quic_media_loop(
     }
 }
 
+async fn record_lan_decoded_frames(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+    decoded_frames: Vec<DecodedFrame>,
+    bytes_received: u64,
+    sequence: u64,
+    timestamp_us: u64,
+    profile: &MediaProfile,
+    encoded_payload: &[u8],
+) {
+    for decoded_frame in decoded_frames {
+        let width = decoded_frame.width as u32;
+        let height = decoded_frame.height as u32;
+        let decoded_pixel_format = decoded_frame_pixel_format(&decoded_frame);
+        let payload_hash = format!("fnv1a64:{:016x}", fnv1a64(encoded_payload));
+        let preview_rgb24 = if should_update_lan_preview(sequence) {
+            match decoded_frame_to_rgb24(decoded_frame) {
+                Ok((_width, _height, rgb24)) => Some(rgb24),
+                Err(error) => {
+                    app_state.probes.lock().await.record_probe_drop(
+                        session_id,
+                        bytes_received,
+                        now_ms(),
+                        error.to_string(),
+                    );
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+
+        app_state.probes.lock().await.record_decoded_video_frame(
+            session_id,
+            DecodedVideoFrameStats {
+                bytes_received,
+                sequence,
+                timestamp_us,
+                width,
+                height,
+                target_fps: profile.fps,
+                target_bitrate_mbps: profile.bitrate_mbps,
+                encoded_bytes: encoded_payload.len() as u32,
+                pixel_format: preview_rgb24
+                    .as_ref()
+                    .map(|_| "rgb24".to_string())
+                    .unwrap_or(decoded_pixel_format),
+                payload_hash,
+                rgb24: preview_rgb24,
+            },
+            now_ms(),
+        );
+    }
+}
+
+struct LanReceiverDecoder {
+    backend: &'static str,
+    decoder: Box<dyn VideoDecoder>,
+}
+
 async fn create_lan_receiver_decoder(
     app_state: &Arc<AppState>,
     session_id: &SessionId,
-) -> Result<Box<dyn VideoDecoder>> {
+) -> Result<LanReceiverDecoder> {
     let mut last_error = None;
     for backend in preferred_lan_receiver_decoder_candidates() {
         match mrd_decode::create_decoder(backend) {
@@ -2237,7 +2387,7 @@ async fn create_lan_receiver_decoder(
                     .lock()
                     .await
                     .set_active_decoder(session_id.clone(), backend);
-                return Ok(decoder);
+                return Ok(LanReceiverDecoder { backend, decoder });
             }
             Err(error) => {
                 last_error = Some(format!("{backend}: {error}"));
@@ -2250,6 +2400,51 @@ async fn create_lan_receiver_decoder(
         last_error
             .map(|error| format!("; last error: {error}"))
             .unwrap_or_default()
+    )
+}
+
+async fn try_decode_h264_keyframe_with_fallback(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+    failed_backend: &'static str,
+    payload: &[u8],
+    primary_error: &anyhow::Error,
+) -> Result<(LanReceiverDecoder, Vec<DecodedFrame>)> {
+    let mut errors = vec![format!("{failed_backend}: {primary_error:#}")];
+    for backend in preferred_lan_receiver_decoder_candidates()
+        .into_iter()
+        .filter(|backend| *backend != failed_backend)
+    {
+        let mut decoder = match mrd_decode::create_decoder(backend) {
+            Ok(decoder) => decoder,
+            Err(error) => {
+                errors.push(format!("{backend}: create failed: {error}"));
+                continue;
+            }
+        };
+        match decode_h264_desktop_frame(decoder.as_mut(), payload) {
+            Ok(decoded_frames) if !decoded_frames.is_empty() => {
+                app_state
+                    .media_pipelines
+                    .lock()
+                    .await
+                    .set_active_decoder(session_id.clone(), backend);
+                tracing::warn!(
+                    session_id = %session_id.0,
+                    failed_backend,
+                    fallback_backend = backend,
+                    "LAN media receiver switched decoder after keyframe decode failure"
+                );
+                return Ok((LanReceiverDecoder { backend, decoder }, decoded_frames));
+            }
+            Ok(_) => errors.push(format!("{backend}: decoded no frames")),
+            Err(error) => errors.push(format!("{backend}: {error:#}")),
+        }
+    }
+
+    anyhow::bail!(
+        "all LAN H.264 receiver decoders failed for keyframe: {}",
+        errors.join(" | ")
     )
 }
 
@@ -2647,10 +2842,95 @@ fn decode_h264_desktop_frame(
     decoder: &mut dyn VideoDecoder,
     payload: &[u8],
 ) -> Result<Vec<DecodedFrame>> {
-    decoder
-        .push_access_unit(payload)
-        .context("failed to decode LAN H.264 access unit")?;
+    if let Err(error) = decoder.push_access_unit(payload) {
+        anyhow::bail!(
+            "failed to decode LAN H.264 access unit: {error}; {}",
+            describe_h264_access_unit(payload)
+        );
+    }
     Ok(decoder.drain_decoded_frames())
+}
+
+fn describe_h264_access_unit(payload: &[u8]) -> String {
+    let prefix_hex = payload
+        .iter()
+        .take(16)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let annexb_nals = h264_annexb_nal_types(payload);
+    let avcc_nals = if annexb_nals.is_empty() {
+        h264_avcc_nal_types(payload)
+    } else {
+        Vec::new()
+    };
+
+    format!(
+        "payload_bytes={}, prefix_hex=[{}], annexb_nals=[{}], avcc_nals=[{}]",
+        payload.len(),
+        prefix_hex,
+        annexb_nals
+            .iter()
+            .map(|nal| nal.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+        avcc_nals
+            .iter()
+            .map(|nal| nal.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn h264_annexb_nal_types(payload: &[u8]) -> Vec<u8> {
+    let mut types = Vec::new();
+    let mut offset = 0usize;
+    while let Some((start, start_len)) = find_h264_start_code(payload, offset) {
+        let nal_header = start + start_len;
+        if let Some(&header) = payload.get(nal_header) {
+            types.push(header & 0x1f);
+        }
+        offset = nal_header.saturating_add(1);
+    }
+    types
+}
+
+fn h264_avcc_nal_types(payload: &[u8]) -> Vec<u8> {
+    let mut types = Vec::new();
+    let mut offset = 0usize;
+    while offset + 4 <= payload.len() {
+        let nal_len = u32::from_be_bytes([
+            payload[offset],
+            payload[offset + 1],
+            payload[offset + 2],
+            payload[offset + 3],
+        ]) as usize;
+        offset += 4;
+        if nal_len == 0 || offset + nal_len > payload.len() {
+            return Vec::new();
+        }
+        types.push(payload[offset] & 0x1f);
+        offset += nal_len;
+    }
+    if offset == payload.len() {
+        types
+    } else {
+        Vec::new()
+    }
+}
+
+fn find_h264_start_code(payload: &[u8], from: usize) -> Option<(usize, usize)> {
+    let mut index = from;
+    while index + 3 <= payload.len() {
+        if payload[index..].starts_with(&[0, 0, 1]) {
+            return Some((index, 3));
+        }
+        if index + 4 <= payload.len() && payload[index..].starts_with(&[0, 0, 0, 1]) {
+            return Some((index, 4));
+        }
+        index += 1;
+    }
+    None
 }
 
 fn should_update_lan_preview(sequence: u64) -> bool {
