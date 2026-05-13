@@ -37,6 +37,26 @@ async fn quinn_loopback_pair_roundtrips_single_datagram() {
 }
 
 #[tokio::test]
+async fn quinn_loopback_pair_roundtrips_reliable_message() {
+    let pair = QuinnDatagramPair::loopback()
+        .await
+        .expect("initialize quinn loopback pair");
+    let payload = Bytes::from(vec![0x5a; 256 * 1024]);
+
+    pair.client
+        .send_reliable_message(payload.clone())
+        .await
+        .expect("send reliable client message");
+    let received = pair
+        .server
+        .read_reliable_message(512 * 1024)
+        .await
+        .expect("read reliable server message");
+
+    assert_eq!(received, payload);
+}
+
+#[tokio::test]
 async fn quinn_loopback_pair_roundtrips_fragmented_access_unit() {
     let pair = QuinnDatagramPair::loopback()
         .await

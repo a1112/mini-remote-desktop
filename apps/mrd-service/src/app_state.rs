@@ -89,6 +89,29 @@ impl CaptureSourceRegistry {
     }
 }
 
+/// Peer media capabilities observed for each active session.
+#[derive(Debug, Default)]
+pub struct SessionPeerMediaCapabilityRegistry {
+    capabilities: std::collections::HashMap<SessionId, Vec<String>>,
+}
+
+impl SessionPeerMediaCapabilityRegistry {
+    pub fn set(&mut self, session_id: SessionId, capabilities: Vec<String>) {
+        self.capabilities.insert(session_id, capabilities);
+    }
+
+    pub fn supports(&self, session_id: &SessionId, capability: &str) -> bool {
+        self.capabilities
+            .get(session_id)
+            .map(|capabilities| capabilities.iter().any(|value| value == capability))
+            .unwrap_or(false)
+    }
+
+    pub fn remove(&mut self, session_id: &SessionId) -> Option<Vec<String>> {
+        self.capabilities.remove(session_id)
+    }
+}
+
 /// Runtime receiver media pipeline state keyed by session.
 #[derive(Debug, Default)]
 pub struct MediaPipelineRegistry {
@@ -517,6 +540,8 @@ pub struct AppState {
     pub media_profiles: Arc<Mutex<MediaProfileRegistry>>,
     /// Selected capture source keyed by session.
     pub capture_sources: Arc<Mutex<CaptureSourceRegistry>>,
+    /// Peer media capabilities keyed by session.
+    pub peer_media_capabilities: Arc<Mutex<SessionPeerMediaCapabilityRegistry>>,
     /// Receiver pipeline state keyed by session.
     pub media_pipelines: Arc<Mutex<MediaPipelineRegistry>>,
     /// Abort handles for active media tasks keyed by session.
@@ -540,6 +565,9 @@ impl AppState {
             probes: Arc::new(Mutex::new(ProbeRegistry::default())),
             media_profiles: Arc::new(Mutex::new(MediaProfileRegistry::default())),
             capture_sources: Arc::new(Mutex::new(CaptureSourceRegistry::default())),
+            peer_media_capabilities: Arc::new(Mutex::new(
+                SessionPeerMediaCapabilityRegistry::default(),
+            )),
             media_pipelines: Arc::new(Mutex::new(MediaPipelineRegistry::default())),
             media_tasks: Arc::new(Mutex::new(MediaTaskRegistry::default())),
         }
@@ -583,6 +611,11 @@ impl AppState {
     /// Get a clone of the capture source registry.
     pub fn capture_sources(&self) -> Arc<Mutex<CaptureSourceRegistry>> {
         self.capture_sources.clone()
+    }
+
+    /// Get a clone of the peer media capability registry.
+    pub fn peer_media_capabilities(&self) -> Arc<Mutex<SessionPeerMediaCapabilityRegistry>> {
+        self.peer_media_capabilities.clone()
     }
 
     /// Get a clone of the receiver media pipeline registry.

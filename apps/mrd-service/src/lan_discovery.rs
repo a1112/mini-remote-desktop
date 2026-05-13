@@ -11,8 +11,8 @@ use mrd_pipeline_core::{
 };
 use mrd_proto::{DeviceId, SessionId};
 use mrd_transport_quic_quinn::{
-    fragment_access_unit, QuicAuReassembler, QuicAuReassemblerConfig, QuinnDatagramEndpoint,
-    QuinnServerBootstrap, QuinnServerListener, QUIC_AU_FRAGMENT_HEADER_LEN,
+    fragment_access_unit, QuicAuFragment, QuicAuReassembler, QuicAuReassemblerConfig,
+    QuinnDatagramEndpoint, QuinnServerBootstrap, QuinnServerListener, QUIC_AU_FRAGMENT_HEADER_LEN,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -38,9 +38,12 @@ const LAN_MEDIA_TARGET_FPS: u32 = 144;
 const LAN_MEDIA_MAX_FPS: u32 = 249;
 const LAN_MEDIA_TARGET_BITRATE_MBPS: u32 = 64;
 const LAN_QUIC_FALLBACK_DATAGRAM_BYTES: usize = 1_200;
+const LAN_QUIC_RELIABLE_MEDIA_THRESHOLD_BYTES: usize = 8 * 1024;
+const LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES: usize = 4 * 1024 * 1024;
 const LAN_QUIC_MEDIA_TRANSPORT: &str = "quic_datagram";
 const LAN_QUIC_MEDIA_PROFILE_TRANSPORT: &str = "quic_datagram_2k144";
 const LAN_QUIC_MEDIA_V2_TRANSPORT: &str = "quic_datagram_media_v2";
+const LAN_QUIC_RELIABLE_MEDIA_TRANSPORT: &str = "quic_stream_media_v2";
 const LAN_MEDIA_PROFILE_CONTROL_TRANSPORT: &str = "media_profile_control_v1";
 const LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT: &str = "capture_source_control_v1";
 const LAN_MEDIA_PROTOCOL_VERSION: u32 = 2;
@@ -52,6 +55,8 @@ const LAN_MEDIA_SENDER_MAX_CONSECUTIVE_FRAME_ERRORS: u32 = 8;
 const LAN_MEDIA_SENDER_ERROR_LOG_INTERVAL: u32 = 3;
 const LAN_MEDIA_RECEIVER_MAX_CONSECUTIVE_DECODE_ERRORS: u32 = 8;
 const LAN_MEDIA_RECEIVER_DECODE_ERROR_LOG_INTERVAL: u32 = 3;
+const LAN_MEDIA_REASSEMBLER_FRAME_TIMEOUT_MS: u64 = 1_500;
+const LAN_MEDIA_REASSEMBLER_MAX_PENDING_FRAMES: usize = 256;
 const LAN_MEDIA_PROBE_MAGIC: &[u8; 8] = b"MRDMPF01";
 const LAN_MEDIA_PROBE_HEADER_BYTES: usize = 56;
 const LAN_MEDIA_PROBE_2K144_FORMAT: &str = "compressed_2k144_test_pattern";
@@ -263,6 +268,8 @@ enum LanDiscoveryPacket {
         transport_kind: String,
         #[serde(default)]
         source_discovery_port: Option<u16>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        source_media_capabilities: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         requested_media_profile: Option<MediaProfile>,
         timestamp_ms: u64,
@@ -509,6 +516,7 @@ pub async fn request_lan_remote_session(
         source_device_name,
         transport_kind: transport_kind.to_string(),
         source_discovery_port: Some(app_state.lan_discovery.discovery_port()),
+        source_media_capabilities: lan_media_capabilities(),
         requested_media_profile: requested_profile,
         timestamp_ms: now_ms(),
     };
@@ -862,6 +870,7 @@ async fn handle_packet(
             session_id,
             source_device_id,
             transport_kind,
+            source_media_capabilities,
             requested_media_profile,
             ..
         } => {
@@ -876,6 +885,7 @@ async fn handle_packet(
                 SessionId(session_id.clone()),
                 DeviceId(source_device_id),
                 transport_kind,
+                source_media_capabilities,
                 requested_media_profile,
             )
             .await;
@@ -1030,6 +1040,7 @@ async fn accept_lan_remote_session(
     session_id: SessionId,
     source_device_id: DeviceId,
     transport_kind: String,
+    source_media_capabilities: Vec<String>,
     requested_profile: Option<MediaProfile>,
 ) -> LanRemoteAcceptResult {
     let is_registered = {
@@ -1078,6 +1089,11 @@ async fn accept_lan_remote_session(
         .lock()
         .await
         .set(session_id.clone(), negotiation.clone());
+    app_state
+        .peer_media_capabilities
+        .lock()
+        .await
+        .set(session_id.clone(), source_media_capabilities);
 
     let local_listen_addr = bootstrap.listen_addr.to_string();
     let local_server_name = bootstrap.server_name.clone();
@@ -1302,6 +1318,7 @@ async fn build_announcement(app_state: &Arc<AppState>) -> Option<LanAnnouncement
             LAN_QUIC_MEDIA_TRANSPORT.to_string(),
             LAN_QUIC_MEDIA_PROFILE_TRANSPORT.to_string(),
             LAN_QUIC_MEDIA_V2_TRANSPORT.to_string(),
+            LAN_QUIC_RELIABLE_MEDIA_TRANSPORT.to_string(),
             LAN_MEDIA_PROFILE_CONTROL_TRANSPORT.to_string(),
             LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT.to_string(),
         ],
@@ -1320,7 +1337,10 @@ fn service_build_id() -> String {
 }
 
 fn lan_media_capabilities() -> Vec<String> {
-    let mut capabilities = vec![LAN_QUIC_MEDIA_V2_TRANSPORT.to_string()];
+    let mut capabilities = vec![
+        LAN_QUIC_MEDIA_V2_TRANSPORT.to_string(),
+        LAN_QUIC_RELIABLE_MEDIA_TRANSPORT.to_string(),
+    ];
     #[cfg(windows)]
     {
         capabilities.extend([
@@ -1625,6 +1645,11 @@ async fn send_quic_media_loop(
     let mut encoder: Option<Box<dyn VideoEncoder + Send>> = None;
     let mut encoder_config: Option<(usize, usize, u32, u32)> = None;
     let mut consecutive_frame_errors = 0_u32;
+    let reliable_media_supported = app_state
+        .peer_media_capabilities
+        .lock()
+        .await
+        .supports(&session_id, LAN_QUIC_RELIABLE_MEDIA_TRANSPORT);
     loop {
         if !session_allows_media(&app_state, &session_id).await {
             return Ok(());
@@ -1773,31 +1798,59 @@ async fn send_quic_media_loop(
                 profile: profile.clone(),
                 payload: access_unit.bytes.clone(),
             })?;
-            let fragments = fragment_access_unit(
-                frame_id as u32,
-                access_unit.timestamp_us,
+            let send_result = if should_send_access_unit_reliably(
+                reliable_media_supported,
                 access_unit.is_keyframe,
-                &media_payload,
+                media_payload.len(),
                 max_datagram_size,
-            )
-            .context("failed to fragment LAN QUIC media frame")?;
-
-            for fragment in fragments {
-                if let Err(error) = endpoint
-                    .send_datagram(fragment)
-                    .with_context(|| format!("failed to send LAN QUIC media frame {}", frame_id))
-                {
-                    handle_media_sender_frame_error(
-                        &app_state,
-                        &session_id,
-                        active_source_id.as_deref().unwrap_or("<unknown>"),
-                        &mut consecutive_frame_errors,
-                        format!("{error:#}"),
-                        true,
-                    )
-                    .await?;
-                    continue;
+            ) {
+                let reliable_message = QuicAuFragment {
+                    frame_id: frame_id as u32,
+                    timestamp_us: access_unit.timestamp_us,
+                    is_keyframe: access_unit.is_keyframe,
+                    fragment_index: 0,
+                    fragment_count: 1,
+                    payload: media_payload.into(),
                 }
+                .encode();
+                endpoint
+                    .send_reliable_message(reliable_message)
+                    .await
+                    .with_context(|| {
+                        format!("failed to send LAN QUIC reliable media frame {}", frame_id)
+                    })
+            } else {
+                (|| -> Result<()> {
+                    let fragments = fragment_access_unit(
+                        frame_id as u32,
+                        access_unit.timestamp_us,
+                        access_unit.is_keyframe,
+                        &media_payload,
+                        max_datagram_size,
+                    )
+                    .context("failed to fragment LAN QUIC media frame")?;
+
+                    for fragment in fragments {
+                        endpoint.send_datagram(fragment).with_context(|| {
+                            format!("failed to send LAN QUIC media frame {}", frame_id)
+                        })?;
+                    }
+                    Ok(())
+                })()
+            };
+
+            if let Err(error) = send_result {
+                handle_media_sender_frame_error(
+                    &app_state,
+                    &session_id,
+                    active_source_id.as_deref().unwrap_or("<unknown>"),
+                    &mut consecutive_frame_errors,
+                    format!("{error:#}"),
+                    true,
+                )
+                .await?;
+                frame_id = frame_id.wrapping_add(1).max(1);
+                continue;
             }
             frame_id = frame_id.wrapping_add(1).max(1);
         }
@@ -1907,8 +1960,26 @@ fn should_log_media_sender_frame_error(consecutive_frame_errors: u32) -> bool {
 
 fn should_log_media_receiver_decode_error(consecutive_decode_errors: u32) -> bool {
     consecutive_decode_errors == 1
-        || consecutive_decode_errors >= LAN_MEDIA_RECEIVER_MAX_CONSECUTIVE_DECODE_ERRORS
+        || consecutive_decode_errors == LAN_MEDIA_RECEIVER_MAX_CONSECUTIVE_DECODE_ERRORS
         || consecutive_decode_errors % LAN_MEDIA_RECEIVER_DECODE_ERROR_LOG_INTERVAL == 0
+}
+
+fn lan_media_reassembler_config() -> QuicAuReassemblerConfig {
+    QuicAuReassemblerConfig {
+        frame_timeout: Duration::from_millis(LAN_MEDIA_REASSEMBLER_FRAME_TIMEOUT_MS),
+        max_pending_frames: LAN_MEDIA_REASSEMBLER_MAX_PENDING_FRAMES,
+    }
+}
+
+fn should_send_access_unit_reliably(
+    reliable_media_supported: bool,
+    is_keyframe: bool,
+    payload_len: usize,
+    max_datagram_size: usize,
+) -> bool {
+    reliable_media_supported
+        && (is_keyframe
+            || payload_len > LAN_QUIC_RELIABLE_MEDIA_THRESHOLD_BYTES.max(max_datagram_size))
 }
 
 async fn set_session_last_error(
@@ -1964,7 +2035,7 @@ async fn receive_quic_media_loop(
     session_id: SessionId,
     endpoint: QuinnDatagramEndpoint,
 ) -> Result<()> {
-    let mut reassembler = QuicAuReassembler::new(QuicAuReassemblerConfig::default());
+    let mut reassembler = QuicAuReassembler::new(lan_media_reassembler_config());
     let mut decoder = create_lan_receiver_decoder(&app_state, &session_id)
         .await
         .context("failed to create LAN media receiver decoder")?;
@@ -1973,12 +2044,21 @@ async fn receive_quic_media_loop(
         if !session_allows_media(&app_state, &session_id).await {
             return Ok(());
         }
-        let datagram = endpoint.read_datagram().await?;
+        let datagram_endpoint = endpoint.clone();
+        let reliable_endpoint = endpoint.clone();
+        let media_message = tokio::select! {
+            result = datagram_endpoint.read_datagram() => {
+                result.context("failed to read LAN QUIC media datagram")?
+            }
+            result = reliable_endpoint.read_reliable_message(LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES) => {
+                result.context("failed to read LAN QUIC reliable media frame")?
+            }
+        };
         if !session_allows_media(&app_state, &session_id).await {
             return Ok(());
         }
         if let Some(frame) = reassembler
-            .push_datagram(&datagram)
+            .push_datagram(&media_message)
             .context("failed to reassemble LAN QUIC media frame")?
         {
             let envelope = match decode_lan_media_envelope(&frame.payload) {
@@ -2076,10 +2156,7 @@ async fn receive_quic_media_loop(
                                 );
                             }
 
-                            if frame.is_keyframe
-                                || consecutive_decode_errors
-                                    >= LAN_MEDIA_RECEIVER_MAX_CONSECUTIVE_DECODE_ERRORS
-                            {
+                            if frame.is_keyframe {
                                 app_state.probes.lock().await.record_probe_drop(
                                     &session_id,
                                     frame.payload.len() as u64,
@@ -2091,12 +2168,28 @@ async fn receive_quic_media_loop(
                                     .context(
                                         "failed to reset LAN media receiver decoder after decode error",
                                     )?;
+                                consecutive_decode_errors = 0;
                             } else {
                                 app_state.probes.lock().await.record_transient_frame_drop(
                                     &session_id,
                                     frame.payload.len() as u64,
                                     now_ms(),
                                 );
+                                if consecutive_decode_errors
+                                    >= LAN_MEDIA_RECEIVER_MAX_CONSECUTIVE_DECODE_ERRORS
+                                {
+                                    tracing::warn!(
+                                        session_id = %session_id.0,
+                                        consecutive_decode_errors,
+                                        "LAN media receiver reset decoder after non-keyframe decode loss"
+                                    );
+                                    decoder = create_lan_receiver_decoder(&app_state, &session_id)
+                                        .await
+                                        .context(
+                                            "failed to reset LAN media receiver decoder after decode loss",
+                                        )?;
+                                    consecutive_decode_errors = 0;
+                                }
                             }
                         }
                     }
@@ -3082,6 +3175,7 @@ mod tests {
             source_device_name: "Controller".to_string(),
             transport_kind: "quic".to_string(),
             source_discovery_port: Some(21116),
+            source_media_capabilities: vec![LAN_QUIC_RELIABLE_MEDIA_TRANSPORT.to_string()],
             requested_media_profile: Some(MediaProfile {
                 width: 3840,
                 height: 2160,
@@ -3150,6 +3244,10 @@ mod tests {
         assert_eq!(snapshot.lifecycle_state, "listening");
         assert!(snapshot.sender_active);
         assert!(snapshot.local_listen_addr.is_some());
+        assert!(app_state.peer_media_capabilities.lock().await.supports(
+            &SessionId("session-1".to_string()),
+            LAN_QUIC_RELIABLE_MEDIA_TRANSPORT
+        ));
     }
 
     #[tokio::test]
@@ -3171,6 +3269,7 @@ mod tests {
             source_device_name: "Controller".to_string(),
             transport_kind: "webrtc".to_string(),
             source_discovery_port: None,
+            source_media_capabilities: Vec::new(),
             requested_media_profile: None,
             timestamp_ms: now_ms(),
         };
@@ -3544,6 +3643,14 @@ mod tests {
         assert_eq!(negotiation.selected.height, 1080);
         assert_eq!(negotiation.selected.fps, 249);
         assert_eq!(negotiation.selected.bitrate_mbps, 20);
+    }
+
+    #[test]
+    fn lan_media_reassembler_config_allows_decode_backpressure() {
+        let config = lan_media_reassembler_config();
+
+        assert!(config.frame_timeout >= Duration::from_millis(1_000));
+        assert!(config.max_pending_frames >= 128);
     }
 
     #[tokio::test]
@@ -3957,6 +4064,29 @@ mod tests {
         assert_eq!(backends, ["nvenc_h264", "openh264"]);
         #[cfg(not(windows))]
         assert_eq!(backends, ["openh264"]);
+    }
+
+    #[test]
+    fn lan_quic_media_uses_reliable_transport_for_keyframes_and_large_units() {
+        assert!(should_send_access_unit_reliably(true, true, 1024, 1_200));
+        assert!(should_send_access_unit_reliably(
+            true,
+            false,
+            32 * 1024 + 1,
+            1_200
+        ));
+        assert!(!should_send_access_unit_reliably(
+            true,
+            false,
+            4 * 1024,
+            1_200
+        ));
+        assert!(!should_send_access_unit_reliably(
+            false,
+            true,
+            32 * 1024 + 1,
+            1_200
+        ));
     }
 
     #[test]
