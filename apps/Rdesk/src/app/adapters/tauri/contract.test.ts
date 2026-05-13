@@ -532,6 +532,25 @@ describe('Tauri Adapter Contract', () => {
         sessionId: 'session-123',
       });
     });
+
+    it('ipc_media_pipeline_snapshot calls correct command with args', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue({
+        session_id: 'session-123',
+        attached_surfaces: [],
+        active_decoder: 'nvdec',
+        active_renderer: 'd3d11',
+        queue_depth: 0,
+        dropped_frames: 0,
+        stage_metrics: [],
+      });
+
+      await adapter.ipcMediaPipelineSnapshot('session-123');
+
+      expect(mockInvoke).toHaveBeenCalledWith('ipc_media_pipeline_snapshot', {
+        sessionId: 'session-123',
+      });
+    });
   });
 
   /**

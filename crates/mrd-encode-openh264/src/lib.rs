@@ -16,8 +16,11 @@ pub struct OpenH264Encoder {
     height: usize,
     fps: u32,
     frame_index: u64,
+    last_forced_intra_timestamp_us: Option<u64>,
     i420: Vec<u8>,
 }
+
+const RECOVERY_KEYFRAME_INTERVAL_US: u64 = 1_000_000;
 
 impl OpenH264Encoder {
     pub fn new(width: usize, height: usize, fps: u32) -> Result<Self, PipelineError> {
@@ -74,6 +77,7 @@ impl OpenH264Encoder {
             height,
             fps: fps.max(1),
             frame_index: 0,
+            last_forced_intra_timestamp_us: None,
             i420: vec![0; i420_len(width, height)?],
         })
     }
@@ -94,7 +98,8 @@ impl VideoEncoder for OpenH264Encoder {
             )));
         }
 
-        if self.frame_index == 0 || self.frame_index % self.fps as u64 == 0 {
+        let force_intra = self.should_force_intra(frame.timestamp_us);
+        if force_intra {
             self.encoder.force_intra_frame();
         }
 
@@ -116,12 +121,28 @@ impl VideoEncoder for OpenH264Encoder {
             .map_err(|error| PipelineError::message(format!("openh264 encode failed: {error}")))?;
         self.frame_index += 1;
 
-        Ok(vec![EncodedAccessUnit {
-            codec: VideoCodec::H264,
-            timestamp_us: frame.timestamp_us,
-            is_keyframe: true,
-            bytes: normalize_h264_bitstream(bitstream.to_vec()),
-        }])
+        let bytes = normalize_h264_bitstream(bitstream.to_vec());
+        Ok(encoded_access_units_from_bytes(
+            VideoCodec::H264,
+            frame.timestamp_us,
+            bytes,
+        ))
+    }
+}
+
+impl OpenH264Encoder {
+    fn should_force_intra(&mut self, timestamp_us: u64) -> bool {
+        let frame_interval_due = self.frame_index == 0 || self.frame_index % self.fps as u64 == 0;
+        let recovery_interval_due = self
+            .last_forced_intra_timestamp_us
+            .is_some_and(|last| timestamp_us.saturating_sub(last) >= RECOVERY_KEYFRAME_INTERVAL_US);
+
+        if frame_interval_due || recovery_interval_due {
+            self.last_forced_intra_timestamp_us = Some(timestamp_us);
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -167,6 +188,23 @@ fn normalize_h264_bitstream(bytes: Vec<u8>) -> Vec<u8> {
     bytes
 }
 
+fn encoded_access_units_from_bytes(
+    codec: VideoCodec,
+    timestamp_us: u64,
+    bytes: Vec<u8>,
+) -> Vec<EncodedAccessUnit> {
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+
+    vec![EncodedAccessUnit {
+        codec,
+        timestamp_us,
+        is_keyframe: codec == VideoCodec::H264 && annex_b_contains_h264_idr(&bytes),
+        bytes,
+    }]
+}
+
 fn looks_like_annex_b(bytes: &[u8]) -> bool {
     bytes.windows(4).any(|window| window == [0, 0, 0, 1])
         || bytes.windows(3).any(|window| window == [0, 0, 1])
@@ -199,6 +237,39 @@ fn avcc_to_annex_b(bytes: &[u8]) -> Option<Vec<u8>> {
     } else {
         None
     }
+}
+
+fn annex_b_contains_h264_idr(access_unit: &[u8]) -> bool {
+    let mut offset = 0usize;
+    while offset < access_unit.len() {
+        let Some((nal_offset, start_code_len)) = find_annex_b_start_code(access_unit, offset)
+        else {
+            break;
+        };
+        let nal_header_offset = nal_offset + start_code_len;
+        if nal_header_offset >= access_unit.len() {
+            break;
+        }
+        if access_unit[nal_header_offset] & 0x1f == 5 {
+            return true;
+        }
+        offset = nal_header_offset + 1;
+    }
+    false
+}
+
+fn find_annex_b_start_code(bytes: &[u8], from: usize) -> Option<(usize, usize)> {
+    let mut index = from;
+    while index + 3 <= bytes.len() {
+        if bytes[index..].starts_with(&[0, 0, 1]) {
+            return Some((index, 3));
+        }
+        if index + 4 <= bytes.len() && bytes[index..].starts_with(&[0, 0, 0, 1]) {
+            return Some((index, 4));
+        }
+        index += 1;
+    }
+    None
 }
 
 fn write_i420(frame: &CapturedFrame, out: &mut [u8]) -> Result<(), PipelineError> {
@@ -370,7 +441,11 @@ mod conversion_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{avcc_to_annex_b, looks_like_annex_b, normalize_h264_bitstream};
+    use super::{
+        avcc_to_annex_b, encoded_access_units_from_bytes, looks_like_annex_b,
+        normalize_h264_bitstream,
+    };
+    use mrd_pipeline_core::VideoCodec;
 
     #[test]
     fn avcc_bitstream_is_converted_to_annex_b() {
@@ -383,5 +458,12 @@ mod tests {
         );
         assert!(looks_like_annex_b(&annex_b));
         assert_eq!(normalize_h264_bitstream(avcc), annex_b);
+    }
+
+    #[test]
+    fn empty_bitstream_produces_no_access_units() {
+        let access_units = encoded_access_units_from_bytes(VideoCodec::H264, 123, Vec::new());
+
+        assert!(access_units.is_empty());
     }
 }

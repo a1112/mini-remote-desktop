@@ -2,10 +2,11 @@
 // Verify serialization/deserialization of all IPC messages
 
 use mrd_ipc::{
-    CapabilityConstraint, CapabilityConstraintStatus, CapabilityDomain, CapabilityItem,
-    CapabilityPlatform, CapabilityProfile, CapabilitySnapshot, CapabilityStatus, CaptureSource,
-    CaptureSourceSelection, DeviceInfo, IpcRequest, IpcResponse, MediaProfile,
-    MediaProfileNegotiation, SessionBootstrap, SessionRuntimeSnapshot,
+    AttachedRenderSurface, CapabilityConstraint, CapabilityConstraintStatus, CapabilityDomain,
+    CapabilityItem, CapabilityPlatform, CapabilityProfile, CapabilitySnapshot, CapabilityStatus,
+    CaptureSource, CaptureSourceSelection, DeviceInfo, IpcRequest, IpcResponse,
+    MediaPipelineSnapshot, MediaProfile, MediaProfileNegotiation, MediaStageMetrics,
+    SessionBootstrap, SessionRuntimeSnapshot,
 };
 use mrd_proto::{DeviceId, SessionId};
 
@@ -354,6 +355,10 @@ fn serialize_deserialize_media_profile_updated_response() {
         selected: test_media_profile(),
         status: "downgraded".to_string(),
         reason: Some("clamped to LAN QUIC profile capability".to_string()),
+        selected_source_id: Some("windows:display:0".to_string()),
+        selected_width: Some(2560),
+        selected_height: Some(1440),
+        downgrade_reason: Some("clamped to LAN QUIC profile capability".to_string()),
     };
     let response = IpcResponse::MediaProfileUpdated {
         session_id: test_session_id(),
@@ -364,6 +369,62 @@ fn serialize_deserialize_media_profile_updated_response() {
     let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
 
     assert_eq!(deserialized, response);
+}
+
+#[test]
+fn serialize_deserialize_render_surface_control_contracts() {
+    let attach = IpcRequest::AttachRenderSurface {
+        session_id: test_session_id(),
+        surface_id: "surface-1".to_string(),
+        backend: "d3d11".to_string(),
+        window_handle: Some(0x1234),
+    };
+    let json = serde_json::to_string(&attach).unwrap();
+    let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(attach, deserialized);
+
+    let detach = IpcRequest::DetachRenderSurface {
+        session_id: test_session_id(),
+        surface_id: "surface-1".to_string(),
+    };
+    let json = serde_json::to_string(&detach).unwrap();
+    let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(detach, deserialized);
+
+    let response = IpcResponse::RenderSurfaceAttached {
+        session_id: test_session_id(),
+        surface_id: "surface-1".to_string(),
+    };
+    let json = serde_json::to_string(&response).unwrap();
+    let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(response, deserialized);
+}
+
+#[test]
+fn serialize_deserialize_media_pipeline_snapshot_contract() {
+    let response = IpcResponse::MediaPipelineSnapshot {
+        snapshot: MediaPipelineSnapshot {
+            session_id: test_session_id(),
+            attached_surfaces: vec![AttachedRenderSurface {
+                surface_id: "surface-1".to_string(),
+                backend: "d3d11".to_string(),
+                window_handle: Some(0x1234),
+            }],
+            active_decoder: Some("nvdec".to_string()),
+            active_renderer: Some("d3d11".to_string()),
+            queue_depth: 1,
+            dropped_frames: 2,
+            stage_metrics: vec![MediaStageMetrics {
+                stage: "decode".to_string(),
+                p50_ms: Some(1.0),
+                p95_ms: Some(2.0),
+            }],
+        },
+    };
+
+    let json = serde_json::to_string(&response).unwrap();
+    let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(response, deserialized);
 }
 
 #[test]

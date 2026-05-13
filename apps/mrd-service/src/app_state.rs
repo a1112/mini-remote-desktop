@@ -8,7 +8,9 @@
 use base64::{engine::general_purpose, Engine as _};
 use image::{codecs::png::PngEncoder, ColorType, ImageEncoder};
 use mrd_application::ports::SessionSnapshot;
-use mrd_ipc::{CaptureSourceSelection, MediaProfileNegotiation};
+use mrd_ipc::{
+    AttachedRenderSurface, CaptureSourceSelection, MediaPipelineSnapshot, MediaProfileNegotiation,
+};
 use mrd_proto::{DeviceId, SessionId};
 use std::sync::Arc;
 use tokio::{sync::Mutex, task::AbortHandle};
@@ -84,6 +86,76 @@ impl CaptureSourceRegistry {
 
     pub fn remove(&mut self, session_id: &SessionId) -> Option<CaptureSourceSelection> {
         self.selections.remove(session_id)
+    }
+}
+
+/// Runtime receiver media pipeline state keyed by session.
+#[derive(Debug, Default)]
+pub struct MediaPipelineRegistry {
+    pipelines: std::collections::HashMap<SessionId, MediaPipelineState>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct MediaPipelineState {
+    attached_surfaces: std::collections::HashMap<String, AttachedRenderSurface>,
+    active_decoder: Option<String>,
+    active_renderer: Option<String>,
+    queue_depth: u32,
+    dropped_frames: u64,
+}
+
+impl MediaPipelineRegistry {
+    pub fn attach_surface(&mut self, session_id: SessionId, surface: AttachedRenderSurface) {
+        let state = self.pipelines.entry(session_id).or_default();
+        if state.active_renderer.is_none() {
+            state.active_renderer = Some(surface.backend.clone());
+        }
+        state
+            .attached_surfaces
+            .insert(surface.surface_id.clone(), surface);
+    }
+
+    pub fn detach_surface(&mut self, session_id: &SessionId, surface_id: &str) -> bool {
+        let Some(state) = self.pipelines.get_mut(session_id) else {
+            return false;
+        };
+        let removed = state.attached_surfaces.remove(surface_id).is_some();
+        if state.attached_surfaces.is_empty() {
+            state.active_renderer = None;
+        }
+        removed
+    }
+
+    pub fn set_active_decoder(&mut self, session_id: SessionId, decoder: impl Into<String>) {
+        self.pipelines.entry(session_id).or_default().active_decoder = Some(decoder.into());
+    }
+
+    pub fn record_queue_depth(&mut self, session_id: SessionId, queue_depth: u32) {
+        self.pipelines.entry(session_id).or_default().queue_depth = queue_depth;
+    }
+
+    pub fn increment_dropped_frames(&mut self, session_id: SessionId, count: u64) {
+        let state = self.pipelines.entry(session_id).or_default();
+        state.dropped_frames = state.dropped_frames.saturating_add(count);
+    }
+
+    pub fn snapshot(&self, session_id: &SessionId) -> MediaPipelineSnapshot {
+        let state = self.pipelines.get(session_id);
+        MediaPipelineSnapshot {
+            session_id: session_id.clone(),
+            attached_surfaces: state
+                .map(|state| state.attached_surfaces.values().cloned().collect())
+                .unwrap_or_default(),
+            active_decoder: state.and_then(|state| state.active_decoder.clone()),
+            active_renderer: state.and_then(|state| state.active_renderer.clone()),
+            queue_depth: state.map_or(0, |state| state.queue_depth),
+            dropped_frames: state.map_or(0, |state| state.dropped_frames),
+            stage_metrics: Vec::new(),
+        }
+    }
+
+    pub fn remove(&mut self, session_id: &SessionId) {
+        self.pipelines.remove(session_id);
     }
 }
 
@@ -167,7 +239,8 @@ pub struct DecodedVideoFrameStats {
     pub target_bitrate_mbps: u32,
     pub encoded_bytes: u32,
     pub pixel_format: String,
-    pub rgb24: Vec<u8>,
+    pub payload_hash: String,
+    pub rgb24: Option<Vec<u8>>,
 }
 
 impl ProbeRegistry {
@@ -243,13 +316,15 @@ impl ProbeRegistry {
         stats.media_probe_payload_bytes = Some(frame.encoded_bytes);
         stats.last_media_sequence = Some(frame.sequence);
         stats.last_media_timestamp_us = Some(frame.timestamp_us);
-        stats.last_media_payload_hash = Some(format!("fnv1a64:{:016x}", fnv1a64(&frame.rgb24)));
-        stats.latest_frame = Some(DecodedPreviewFrame {
-            width: frame.width,
-            height: frame.height,
-            pixel_format: frame.pixel_format,
-            rgb24: frame.rgb24,
-        });
+        stats.last_media_payload_hash = Some(frame.payload_hash);
+        if let Some(rgb24) = frame.rgb24 {
+            stats.latest_frame = Some(DecodedPreviewFrame {
+                width: frame.width,
+                height: frame.height,
+                pixel_format: frame.pixel_format,
+                rgb24,
+            });
+        }
         stats.last_error = None;
     }
 
@@ -360,15 +435,6 @@ fn encode_rgb24_png_data_url(width: u32, height: u32, rgb24: &[u8]) -> Option<St
     ))
 }
 
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
-
 /// Shell state - tracks UI presence and service lifecycle
 #[derive(Debug, Default)]
 pub struct ShellState {
@@ -437,6 +503,8 @@ pub struct AppState {
     pub media_profiles: Arc<Mutex<MediaProfileRegistry>>,
     /// Selected capture source keyed by session.
     pub capture_sources: Arc<Mutex<CaptureSourceRegistry>>,
+    /// Receiver pipeline state keyed by session.
+    pub media_pipelines: Arc<Mutex<MediaPipelineRegistry>>,
     /// Abort handles for active media tasks keyed by session.
     pub media_tasks: Arc<Mutex<MediaTaskRegistry>>,
 }
@@ -458,6 +526,7 @@ impl AppState {
             probes: Arc::new(Mutex::new(ProbeRegistry::default())),
             media_profiles: Arc::new(Mutex::new(MediaProfileRegistry::default())),
             capture_sources: Arc::new(Mutex::new(CaptureSourceRegistry::default())),
+            media_pipelines: Arc::new(Mutex::new(MediaPipelineRegistry::default())),
             media_tasks: Arc::new(Mutex::new(MediaTaskRegistry::default())),
         }
     }
@@ -500,6 +569,11 @@ impl AppState {
     /// Get a clone of the capture source registry.
     pub fn capture_sources(&self) -> Arc<Mutex<CaptureSourceRegistry>> {
         self.capture_sources.clone()
+    }
+
+    /// Get a clone of the receiver media pipeline registry.
+    pub fn media_pipelines(&self) -> Arc<Mutex<MediaPipelineRegistry>> {
+        self.media_pipelines.clone()
     }
 
     /// Get a clone of the media task registry.
@@ -636,7 +710,8 @@ mod tests {
                 target_bitrate_mbps: 64,
                 encoded_bytes: 1024,
                 pixel_format: "rgb24".to_string(),
-                rgb24: vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255],
+                payload_hash: "fnv1a64:preview".to_string(),
+                rgb24: Some(vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255]),
             },
             3_000,
         );
@@ -659,6 +734,42 @@ mod tests {
     }
 
     #[test]
+    fn probe_registry_counts_decoded_video_without_preview_copy() {
+        let mut registry = ProbeRegistry::default();
+        let session_id = SessionId("decoded-video-metadata-session".to_string());
+
+        registry.record_decoded_video_frame(
+            &session_id,
+            DecodedVideoFrameStats {
+                bytes_received: 2048,
+                sequence: 12,
+                timestamp_us: 1_111_111,
+                width: 1920,
+                height: 1080,
+                target_fps: 144,
+                target_bitrate_mbps: 20,
+                encoded_bytes: 2048,
+                pixel_format: "cpu_nv12".to_string(),
+                payload_hash: "fnv1a64:encoded".to_string(),
+                rgb24: None,
+            },
+            4_000,
+        );
+
+        let snapshot = registry.snapshot(&session_id);
+
+        assert_eq!(snapshot.frames_received, 1);
+        assert_eq!(snapshot.frames_decoded, 1);
+        assert_eq!(snapshot.media_probe_width, Some(1920));
+        assert_eq!(snapshot.media_probe_height, Some(1080));
+        assert_eq!(
+            snapshot.last_media_payload_hash.as_deref(),
+            Some("fnv1a64:encoded")
+        );
+        assert!(snapshot.latest_frame_data_url.is_none());
+    }
+
+    #[test]
     fn media_profile_registry_tracks_negotiated_profile() {
         let mut registry = MediaProfileRegistry::default();
         let session_id = SessionId("profile-session".to_string());
@@ -674,6 +785,10 @@ mod tests {
             selected: profile,
             status: "accepted".to_string(),
             reason: None,
+            selected_source_id: None,
+            selected_width: None,
+            selected_height: None,
+            downgrade_reason: None,
         };
 
         registry.set(session_id.clone(), negotiation.clone());

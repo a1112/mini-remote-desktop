@@ -194,6 +194,7 @@ impl BenchmarkSummary {
         first_frame_seen: bool,
         first_frame_time_ms: f64,
         zero_write_access_unit_count: u64,
+        observed_decoded_frames: Option<u64>,
     ) -> Self {
         let (
             nvdec_runtime_summary,
@@ -216,6 +217,10 @@ impl BenchmarkSummary {
         ]
         .iter()
         .all(Option::is_some);
+        let fps_observed = observed_decoded_frames
+            .filter(|_| manifest.duration_secs > 0)
+            .map(|frames| frames as f64 / manifest.duration_secs as f64)
+            .unwrap_or(receiver_probe.fps);
 
         Self {
             run_id: manifest.run_id.clone(),
@@ -233,7 +238,7 @@ impl BenchmarkSummary {
             first_frame_seen,
             first_frame_time_ms: Some(first_frame_time_ms),
             probe_complete,
-            fps_observed: receiver_probe.fps,
+            fps_observed,
             bitrate_kbps: sender_probe.bitrate_kbps,
             keyframes: sender_probe.keyframes.max(receiver_probe.keyframes),
             dropped_frames: sender_probe
@@ -643,7 +648,7 @@ mod tests {
         };
         let paths = BenchmarkPaths::new(Path::new(&repo_root), date, profile, run_id);
 
-        if transport == "quic_quinn" || transport == "quic" {
+        if transport == "quic_quinn" {
             let outcome = crate::quic_transport_harness::run_quic_benchmark_pipeline(
                 session_id.clone(),
                 width as usize,
@@ -663,6 +668,7 @@ mod tests {
                 outcome.sink_snapshot.frame_count > 0,
                 outcome.first_frame_time_ms,
                 0,
+                Some(outcome.sink_snapshot.frame_count),
             );
             super::write_benchmark_artifacts(
                 &paths,
@@ -674,14 +680,8 @@ mod tests {
             .expect("write quic benchmark artifacts");
         } else {
             let (summary, probe) = run_harness_benchmark(&manifest, &session_id);
-            super::write_benchmark_artifacts(
-                &paths,
-                &manifest,
-                &summary,
-                &session_id.0,
-                &probe,
-            )
-            .expect("write webrtc benchmark artifacts");
+            super::write_benchmark_artifacts(&paths, &manifest, &summary, &session_id.0, &probe)
+                .expect("write webrtc benchmark artifacts");
         }
 
         assert!(paths.manifest_json.exists());
@@ -703,7 +703,9 @@ mod tests {
             resolution: Some((manifest.width as usize, manifest.height as usize)),
             fps: Some(manifest.fps),
             renderer: Some(parse_renderer_backend(&manifest.renderer_backend)),
-            transport: Some(TransportKind::WebrtcRtp),
+            transport: Some(parse_transport_backend(&manifest.transport)),
+            zero_copy: Some(benchmark_zero_copy_enabled(manifest)),
+            visual_preview: Some(false),
             ..Default::default()
         });
 
@@ -715,9 +717,8 @@ mod tests {
         let metrics = harness.get_metrics();
         let elapsed_secs = started.elapsed().as_secs_f64().max(0.001);
         let bitrate_kbps = (metrics.total_bitstream_bytes as f64 * 8.0) / elapsed_secs / 1000.0;
-        let first_frame_seen = first_frame_time_ms.is_some()
-            || metrics.decoded_frames > 0
-            || metrics.frame_count > 0;
+        let first_frame_seen =
+            first_frame_time_ms.is_some() || metrics.decoded_frames > 0 || metrics.frame_count > 0;
         let probe = probe_from_metrics(manifest, session_id, &metrics, bitrate_kbps);
         let probe_complete = metrics.encoded_units > 0
             && metrics.decoded_frames > 0
@@ -915,6 +916,22 @@ mod tests {
         }
     }
 
+    fn parse_transport_backend(value: &str) -> TransportKind {
+        match value {
+            "quic" | "quic_datagram" | "quic-datagram" => TransportKind::QuicDatagram,
+            "loopback" => TransportKind::Loopback,
+            _ => TransportKind::WebrtcRtp,
+        }
+    }
+
+    fn benchmark_zero_copy_enabled(manifest: &BenchmarkManifest) -> bool {
+        matches!(
+            manifest.decode_backend.as_str(),
+            "nvdec" | "nvdec_av1" | "nvdec_hevc" | "nvdec_hevc_main10"
+        ) && matches!(manifest.renderer_backend.as_str(), "d3d11" | "d3d11_shared")
+            && matches!(manifest.capture_backend.as_str(), "dxgi" | "winrt")
+    }
+
     fn parse_renderer_backend(value: &str) -> RendererType {
         match value {
             "macos" | "metal" => RendererType::Macos,
@@ -1017,6 +1034,111 @@ mod tests {
         assert!(!summary.nvdec_h264_capability.is_empty());
         assert!(!summary.nvdec_hevc_capability.is_empty());
         assert!(!summary.nvdec_hevc_main10_capability.is_empty());
+    }
+
+    #[test]
+    fn transport_summary_uses_decoded_frame_count_for_observed_fps() {
+        let manifest = BenchmarkManifest {
+            run_id: "quick-quic-20260308-abc123".into(),
+            scenario: "quick.transport".into(),
+            transport: "quic_quinn".into(),
+            capture_backend: "dxgi".into(),
+            encode_backend: "nvenc".into(),
+            decode_backend: "nvdec".into(),
+            renderer_backend: "d3d11".into(),
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            duration_secs: 10,
+            git_commit: "abc123".into(),
+        };
+        let sender_probe = PipelineProbeSnapshot::from_parts(
+            SessionId("session-bench".into()),
+            "session-primary-sender".into(),
+            Some("synthetic+nvenc".into()),
+            Some("h264".into()),
+            Some("quic_quinn".into()),
+            10.0,
+            1000.0,
+            0,
+            1,
+            vec![],
+            vec![
+                (
+                    StageId::EncodeTotal,
+                    StageStatsSnapshot::from_durations_ms(&[2.0, 4.0], 3000),
+                ),
+                (
+                    StageId::SendWrite,
+                    StageStatsSnapshot::from_durations_ms(&[0.1, 0.2], 3000),
+                ),
+            ],
+        );
+        let receiver_probe = PipelineProbeSnapshot::from_parts(
+            SessionId("session-bench".into()),
+            "session-primary".into(),
+            Some("nvdec".into()),
+            Some("h264".into()),
+            Some("quic_quinn".into()),
+            10.0,
+            1000.0,
+            0,
+            1,
+            vec![],
+            vec![
+                (
+                    StageId::DecodeTotal,
+                    StageStatsSnapshot::from_durations_ms(&[1.0, 2.0], 3000),
+                ),
+                (
+                    StageId::FrameSinkIngest,
+                    StageStatsSnapshot::from_durations_ms(&[0.1, 0.2], 3000),
+                ),
+            ],
+        );
+
+        let summary = BenchmarkSummary::from_transport_probes(
+            &manifest,
+            &sender_probe,
+            &receiver_probe,
+            true,
+            true,
+            50.0,
+            0,
+            Some(327),
+        );
+
+        assert_eq!(summary.fps_observed, 32.7);
+    }
+
+    #[test]
+    fn benchmark_transport_parser_maps_quic_to_ui_datagram_harness() {
+        assert_eq!(parse_transport_backend("quic"), TransportKind::QuicDatagram);
+        assert_eq!(
+            parse_transport_backend("quic_datagram"),
+            TransportKind::QuicDatagram
+        );
+        assert_eq!(parse_transport_backend("webrtc"), TransportKind::WebrtcRtp);
+    }
+
+    #[test]
+    fn benchmark_enables_zero_copy_for_nvdec_d3d11_runs() {
+        let manifest = BenchmarkManifest {
+            run_id: "quick-quic-20260308-abc123".into(),
+            scenario: "quick.transport".into(),
+            transport: "quic".into(),
+            capture_backend: "dxgi".into(),
+            encode_backend: "nvenc".into(),
+            decode_backend: "nvdec".into(),
+            renderer_backend: "d3d11".into(),
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            duration_secs: 10,
+            git_commit: "abc123".into(),
+        };
+
+        assert!(benchmark_zero_copy_enabled(&manifest));
     }
 
     #[test]

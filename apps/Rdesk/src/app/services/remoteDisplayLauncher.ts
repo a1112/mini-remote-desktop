@@ -31,10 +31,10 @@ export type RemoteApplicationCatalogResult = {
 const randomToken = () => Math.random().toString(36).slice(2, 8);
 
 const DEFAULT_REMOTE_MEDIA_PROFILE: MediaProfile = {
-  width: 2560,
-  height: 1440,
-  fps: 144,
-  bitrate_mbps: 64,
+  width: 1920,
+  height: 1080,
+  fps: 60,
+  bitrate_mbps: 20,
   codec: "h264",
 };
 
