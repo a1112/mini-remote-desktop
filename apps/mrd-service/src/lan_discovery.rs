@@ -2522,6 +2522,7 @@ async fn try_decode_h264_keyframe_with_fallback(
                     session_id = %session_id.0,
                     failed_backend,
                     fallback_backend = backend,
+                    primary_error = %primary_error,
                     "LAN media receiver switched decoder after keyframe decode failure"
                 );
                 return Ok((LanReceiverDecoder { backend, decoder }, decoded_frames));
