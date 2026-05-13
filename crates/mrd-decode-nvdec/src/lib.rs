@@ -618,6 +618,8 @@ mod imp {
     type CuDeviceGetFn = unsafe extern "system" fn(*mut CUdevice, c_int) -> CUresult;
     type CuCtxCreateFn = unsafe extern "system" fn(*mut CUcontext, u32, CUdevice) -> CUresult;
     type CuCtxDestroyFn = unsafe extern "system" fn(CUcontext) -> CUresult;
+    type CuCtxPushCurrentFn = unsafe extern "system" fn(CUcontext) -> CUresult;
+    type CuCtxPopCurrentFn = unsafe extern "system" fn(*mut CUcontext) -> CUresult;
     type CuGetErrorNameFn = unsafe extern "system" fn(CUresult, *mut *const i8) -> CUresult;
     type CuGetErrorStringFn = unsafe extern "system" fn(CUresult, *mut *const i8) -> CUresult;
     type CuMemcpyDtoHFn = unsafe extern "system" fn(*mut c_void, CUdeviceptr, usize) -> CUresult;
@@ -1107,6 +1109,8 @@ mod imp {
         cu_device_get: CuDeviceGetFn,
         cu_ctx_create: CuCtxCreateFn,
         cu_ctx_destroy: CuCtxDestroyFn,
+        cu_ctx_push_current: CuCtxPushCurrentFn,
+        cu_ctx_pop_current: CuCtxPopCurrentFn,
         cu_get_error_name: Option<CuGetErrorNameFn>,
         cu_get_error_string: Option<CuGetErrorStringFn>,
         cu_memcpy_dtoh: CuMemcpyDtoHFn,
@@ -1128,6 +1132,8 @@ mod imp {
                 cu_device_get: module.load_symbol(b"cuDeviceGet\0".as_ref())?,
                 cu_ctx_create: module.load_symbol(b"cuCtxCreate_v2\0".as_ref())?,
                 cu_ctx_destroy: module.load_symbol(b"cuCtxDestroy_v2\0".as_ref())?,
+                cu_ctx_push_current: module.load_symbol(b"cuCtxPushCurrent_v2\0".as_ref())?,
+                cu_ctx_pop_current: module.load_symbol(b"cuCtxPopCurrent_v2\0".as_ref())?,
                 cu_get_error_name: module.load_symbol(b"cuGetErrorName\0".as_ref()).ok(),
                 cu_get_error_string: module.load_symbol(b"cuGetErrorString\0".as_ref()).ok(),
                 cu_memcpy_dtoh: module.load_symbol(b"cuMemcpyDtoH_v2\0".as_ref())?,
@@ -1150,6 +1156,38 @@ mod imp {
                 cu_memcpy_2d: module.load_symbol(b"cuMemcpy2D_v2\0".as_ref()).ok(),
                 _module: module,
             })
+        }
+    }
+
+    struct CudaContextGuard<'a> {
+        cuda: &'a CudaApi,
+        active: bool,
+    }
+
+    impl<'a> CudaContextGuard<'a> {
+        fn push(cuda: &'a CudaApi, context: CUcontext) -> Result<Self, String> {
+            unsafe {
+                cuda_ok(
+                    cuda,
+                    (cuda.cu_ctx_push_current)(context),
+                    "context",
+                    "cuCtxPushCurrent_v2",
+                )?;
+            }
+            Ok(Self { cuda, active: true })
+        }
+    }
+
+    impl Drop for CudaContextGuard<'_> {
+        fn drop(&mut self) {
+            if !self.active {
+                return;
+            }
+            let mut previous = ptr::null_mut();
+            unsafe {
+                let _ = (self.cuda.cu_ctx_pop_current)(&mut previous);
+            }
+            self.active = false;
         }
     }
 
@@ -1535,6 +1573,8 @@ mod imp {
                 timestamp: 0,
             };
 
+            let _context_guard = CudaContextGuard::push(&self._cuda, self.context)?;
+
             unsafe {
                 cuda_ok(
                     &self._cuda,
@@ -1621,12 +1661,18 @@ mod imp {
     impl Drop for NvdecSession {
         fn drop(&mut self) {
             unsafe {
+                let context_guard = if !self.context.is_null() {
+                    CudaContextGuard::push(&self._cuda, self.context).ok()
+                } else {
+                    None
+                };
                 if !self.parser.is_null() {
                     let _ = (self._cuvid.cuvid_destroy_video_parser)(self.parser);
                 }
                 if !self.callback_state.decoder.is_null() {
                     let _ = (self._cuvid.cuvid_destroy_decoder)(self.callback_state.decoder);
                 }
+                drop(context_guard);
                 if !self.context.is_null() {
                     let _ = (self._cuda.cu_ctx_destroy)(self.context);
                 }

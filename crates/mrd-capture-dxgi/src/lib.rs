@@ -3,8 +3,9 @@ use mrd_pipeline_core::{
 };
 use scrap::{Capturer, Display};
 use std::{
+    ffi::c_void,
     io::ErrorKind,
-    thread,
+    mem, thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -29,6 +30,11 @@ use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SA
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication,
     IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
+};
+#[cfg(windows)]
+use windows::Win32::Graphics::Gdi::{
+    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
+    ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, SRCCOPY,
 };
 
 #[cfg(windows)]
@@ -111,6 +117,8 @@ pub struct DxgiSharedTextureCapture {
     context: ID3D11DeviceContext,
     duplication: IDXGIOutputDuplication,
     shared_texture: Option<SharedBgraTexture>,
+    source_left: i32,
+    source_top: i32,
     source_width: usize,
     source_height: usize,
     width: usize,
@@ -183,6 +191,8 @@ impl DxgiSharedTextureCapture {
                     context,
                     duplication,
                     shared_texture: None,
+                    source_left: rect.left,
+                    source_top: rect.top,
                     source_width: width,
                     source_height: height,
                     width,
@@ -260,7 +270,7 @@ impl FrameCapture for DxgiSharedTextureCapture {
                     if let Some(frame) = self.last_shared_frame()? {
                         return Ok(frame);
                     }
-                    thread::sleep(Duration::from_millis(1));
+                    return self.seed_shared_texture_from_gdi();
                 }
                 Err(error) if error.code() == DXGI_ERROR_ACCESS_LOST => {
                     return Err(PipelineError::message("DXGI duplication access lost"));
@@ -277,6 +287,51 @@ impl FrameCapture for DxgiSharedTextureCapture {
 
 #[cfg(windows)]
 impl DxgiSharedTextureCapture {
+    fn seed_shared_texture_from_gdi(&mut self) -> Result<CapturedFrame, PipelineError> {
+        let width = self.width;
+        let height = self.height;
+        let bgra = capture_gdi_bgra_region(
+            self.source_left,
+            self.source_top,
+            self.source_width,
+            self.source_height,
+            width,
+            height,
+        )?;
+        let (shared_handle, shared_texture) = {
+            let shared = self.ensure_shared_texture()?;
+            (shared.shared_handle, shared.texture.clone())
+        };
+        let target_resource: ID3D11Resource = shared_texture.cast().map_err(|error| {
+            PipelineError::message(format!(
+                "cast seeded shared texture to resource failed: {error}"
+            ))
+        })?;
+        let row_pitch = width
+            .checked_mul(4)
+            .ok_or_else(|| PipelineError::message("seeded frame row pitch overflow"))?
+            as u32;
+        unsafe {
+            self.context.UpdateSubresource(
+                &target_resource,
+                0,
+                None,
+                bgra.as_ptr() as *const c_void,
+                row_pitch,
+                0,
+            );
+            self.context.Flush();
+        }
+
+        Ok(CapturedFrame::from_d3d11_shared_bgra(
+            width,
+            height,
+            now_us()?,
+            shared_handle,
+            row_pitch,
+        ))
+    }
+
     fn last_shared_frame(&self) -> Result<Option<CapturedFrame>, PipelineError> {
         let Some(shared) = self.shared_texture.as_ref() else {
             return Ok(None);
@@ -356,6 +411,110 @@ impl DxgiSharedTextureCapture {
             shared_handle,
             width.saturating_mul(4) as u32,
         ))
+    }
+}
+
+#[cfg(windows)]
+fn capture_gdi_bgra_region(
+    source_left: i32,
+    source_top: i32,
+    source_width: usize,
+    source_height: usize,
+    target_width: usize,
+    target_height: usize,
+) -> Result<Vec<u8>, PipelineError> {
+    let target_width_i32 = i32::try_from(target_width)
+        .map_err(|_| PipelineError::message("GDI target width exceeds i32"))?;
+    let target_height_i32 = i32::try_from(target_height)
+        .map_err(|_| PipelineError::message("GDI target height exceeds i32"))?;
+    let (source_x, source_y) =
+        centered_crop_origin(source_width, source_height, target_width, target_height);
+    let source_x = source_left.saturating_add(source_x);
+    let source_y = source_top.saturating_add(source_y);
+
+    unsafe {
+        let screen_dc = GetDC(None);
+        if screen_dc.is_invalid() {
+            return Err(PipelineError::message("GetDC returned invalid screen DC"));
+        }
+
+        let memory_dc = CreateCompatibleDC(Some(screen_dc));
+        if memory_dc.is_invalid() {
+            let _ = ReleaseDC(None, screen_dc);
+            return Err(PipelineError::message(
+                "CreateCompatibleDC returned invalid memory DC",
+            ));
+        }
+
+        let bitmap = CreateCompatibleBitmap(screen_dc, target_width_i32, target_height_i32);
+        if bitmap.is_invalid() {
+            let _ = DeleteDC(memory_dc);
+            let _ = ReleaseDC(None, screen_dc);
+            return Err(PipelineError::message(
+                "CreateCompatibleBitmap returned invalid bitmap",
+            ));
+        }
+
+        let previous_object = SelectObject(memory_dc, bitmap.into());
+        if previous_object.is_invalid() {
+            let _ = DeleteObject(bitmap.into());
+            let _ = DeleteDC(memory_dc);
+            let _ = ReleaseDC(None, screen_dc);
+            return Err(PipelineError::message("SelectObject failed for GDI bitmap"));
+        }
+
+        let blit_result = BitBlt(
+            memory_dc,
+            0,
+            0,
+            target_width_i32,
+            target_height_i32,
+            Some(screen_dc),
+            source_x,
+            source_y,
+            SRCCOPY,
+        );
+
+        let mut pixels = vec![0_u8; target_width * target_height * 4];
+        let mut bitmap_info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: target_width_i32,
+                biHeight: -target_height_i32,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                biSizeImage: pixels.len() as u32,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let read_lines = if blit_result.is_ok() {
+            GetDIBits(
+                memory_dc,
+                bitmap,
+                0,
+                target_height as u32,
+                Some(pixels.as_mut_ptr() as *mut c_void),
+                &mut bitmap_info,
+                DIB_RGB_COLORS,
+            )
+        } else {
+            0
+        };
+
+        let _ = SelectObject(memory_dc, previous_object);
+        let _ = DeleteObject(bitmap.into());
+        let _ = DeleteDC(memory_dc);
+        let _ = ReleaseDC(None, screen_dc);
+
+        blit_result.map_err(|error| PipelineError::message(format!("BitBlt failed: {error}")))?;
+        if read_lines == 0 {
+            return Err(PipelineError::message("GetDIBits returned no scanlines"));
+        }
+
+        Ok(pixels)
     }
 }
 
@@ -448,6 +607,20 @@ fn repack_bgra(frame: &[u8], width: usize, height: usize) -> Result<Vec<u8>, Pip
     Ok(packed)
 }
 
+fn centered_crop_origin(
+    source_width: usize,
+    source_height: usize,
+    target_width: usize,
+    target_height: usize,
+) -> (i32, i32) {
+    let x = source_width.saturating_sub(target_width) / 2;
+    let y = source_height.saturating_sub(target_height) / 2;
+    (
+        i32::try_from(x).unwrap_or(i32::MAX),
+        i32::try_from(y).unwrap_or(i32::MAX),
+    )
+}
+
 fn now_us() -> Result<u64, PipelineError> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -457,7 +630,7 @@ fn now_us() -> Result<u64, PipelineError> {
 
 #[cfg(test)]
 mod tests {
-    use super::repack_bgra;
+    use super::{centered_crop_origin, repack_bgra};
 
     #[test]
     fn repack_bgra_strips_padding_stride() {
@@ -471,5 +644,12 @@ mod tests {
             packed,
             vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
         );
+    }
+
+    #[test]
+    fn centered_crop_origin_uses_middle_of_larger_source() {
+        assert_eq!(centered_crop_origin(2560, 1600, 1920, 1080), (320, 260));
+        assert_eq!(centered_crop_origin(1920, 1080, 1920, 1080), (0, 0));
+        assert_eq!(centered_crop_origin(1280, 720, 1920, 1080), (0, 0));
     }
 }
