@@ -8,14 +8,15 @@ use std::{
 };
 
 use mrd_capture_dxgi::DxgiDesktopCapture;
-use mrd_decode::{DecodedFrame, PixelFormat, VideoDecoder};
+use mrd_decode::VideoDecoder;
 use mrd_encode_nvenc::NvencH264Encoder;
 use mrd_encode_openh264::OpenH264Encoder;
 use mrd_observability::{
     MediaProbeEvent, PipelineProbeSnapshot, ProbeRegistry, ProbeSessionHandle, StageId,
 };
 use mrd_pipeline_core::{
-    CapturedFrame, FrameCapture, FramePixelFormat, PipelineError, VideoEncoder,
+    CapturedFrame, DecodedFrame, DecodedFrameData, FrameCapture, FramePixelFormat, PipelineError,
+    VideoEncoder,
 };
 use mrd_proto::SessionId;
 use mrd_transport_quic_quinn::{
@@ -649,13 +650,10 @@ fn apply_decoded_frames_to_snapshot(
         snapshot_guard.decoded_frame_count += 1;
         snapshot_guard.last_decoded_width = frame.width;
         snapshot_guard.last_decoded_height = frame.height;
-        snapshot_guard.last_decoded_pixel_format = Some(match frame.pixel_format {
-            PixelFormat::Rgb24 => "Rgb24".to_string(),
-            PixelFormat::Bgra32 => "Bgra32".to_string(),
-            PixelFormat::D3d11Texture => "D3d11Texture".to_string(),
-        });
+        snapshot_guard.last_decoded_pixel_format =
+            Some(decoded_frame_pixel_format_label(&frame.data).to_string());
         if let Some(frame_sink) = frame_sink.as_ref() {
-            let bytes = frame.data.len();
+            let bytes = decoded_frame_data_len(&frame.data);
             let started_at = std::time::Instant::now();
             frame_sink
                 .lock()
@@ -663,6 +661,32 @@ fn apply_decoded_frames_to_snapshot(
                 .ingest_frame_for_source(session_id.clone(), DEFAULT_SOURCE_ID.to_string(), frame);
             probe.record_stage(StageId::FrameSinkIngest, started_at.elapsed(), bytes, false);
         }
+    }
+}
+
+fn decoded_frame_pixel_format_label(data: &DecodedFrameData) -> &'static str {
+    match data {
+        DecodedFrameData::CpuRgb24(_) => "Rgb24",
+        DecodedFrameData::CpuBgra32(_) => "Bgra32",
+        DecodedFrameData::CpuNv12 { .. } => "Nv12",
+        DecodedFrameData::CpuP010 { .. } => "P010",
+        #[cfg(windows)]
+        DecodedFrameData::D3D11SharedNv12 { .. } => "D3d11SharedNv12",
+        #[cfg(windows)]
+        DecodedFrameData::D3D11SharedP010 { .. } => "D3d11SharedP010",
+    }
+}
+
+fn decoded_frame_data_len(data: &DecodedFrameData) -> usize {
+    match data {
+        DecodedFrameData::CpuRgb24(bytes) | DecodedFrameData::CpuBgra32(bytes) => bytes.len(),
+        DecodedFrameData::CpuNv12 { data, .. } | DecodedFrameData::CpuP010 { data, .. } => {
+            data.len()
+        }
+        #[cfg(windows)]
+        DecodedFrameData::D3D11SharedNv12 { .. } => 0,
+        #[cfg(windows)]
+        DecodedFrameData::D3D11SharedP010 { .. } => 0,
     }
 }
 

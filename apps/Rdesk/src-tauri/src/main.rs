@@ -16,6 +16,12 @@ mod test_harness;
 mod test_orchestrator;
 mod webrtc_host;
 mod webrtc_media;
+#[cfg(test)]
+mod benchmark;
+#[cfg(test)]
+mod quic_host;
+#[cfg(test)]
+mod quic_transport_harness;
 
 use app_settings::{
     default_settings_path, load_settings, save_settings, AppSettings, DecodePolicy,
