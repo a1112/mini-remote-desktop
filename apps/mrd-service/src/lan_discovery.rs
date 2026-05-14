@@ -4,7 +4,7 @@ use mrd_application::ports::SessionSnapshot;
 use mrd_encode_openh264::OpenH264Encoder;
 use mrd_ipc::{
     CaptureSource, CaptureSourceSelection, LanDiscoverySnapshot, LanPeerInfo, MediaProfile,
-    MediaProfileNegotiation,
+    MediaProfileNegotiation, MediaStageMetrics,
 };
 use mrd_pipeline_core::{
     CapturedFrame, DecodedFrame, DecodedFrameData, FramePixelFormat, VideoDecoder, VideoEncoder,
@@ -15,7 +15,7 @@ use mrd_transport_quic_quinn::{
     QuinnDatagramEndpoint, QuinnServerBootstrap, QuinnServerListener, QUIC_AU_FRAGMENT_HEADER_LEN,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -66,6 +66,10 @@ const LAN_MEDIA_ENVELOPE_MAGIC: &[u8; 8] = b"MRDMV2F1";
 const LAN_MEDIA_ENVELOPE_HEADER_BYTES: usize = 48;
 const LAN_MEDIA_PAYLOAD_H264_ACCESS_UNIT: u8 = 1;
 const LAN_MEDIA_PAYLOAD_PROBE_FRAME: u8 = 2;
+const LAN_MEDIA_SENDER_STATS_MAGIC: &[u8; 8] = b"MRDMSTG1";
+const LAN_MEDIA_SENDER_STATS_HEADER_BYTES: usize = 12;
+const LAN_MEDIA_SENDER_STATS_INTERVAL: Duration = Duration::from_secs(1);
+const LAN_MEDIA_SENDER_STATS_SAMPLE_LIMIT: usize = 240;
 const LAN_MEDIA_CODEC_H264: u8 = 1;
 const LAN_PREVIEW_FRAME_INTERVAL: u64 = 120;
 const LAN_PREVIEW_MAX_WIDTH: u32 = 480;
@@ -411,6 +415,23 @@ struct LanMediaEnvelope {
     payload: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct LanSenderStatsPayload {
+    sequence: u64,
+    frame_count: u64,
+    source_id: Option<String>,
+    target_fps: u32,
+    target_bitrate_mbps: u32,
+    metrics: Vec<MediaStageMetrics>,
+}
+
+#[derive(Debug)]
+struct LanSenderStatsTracker {
+    samples: HashMap<&'static str, VecDeque<f64>>,
+    frame_count: u64,
+    last_emit: Instant,
+}
+
 impl LanRemoteAcceptResult {
     fn rejected(message: impl Into<String>) -> Self {
         Self {
@@ -420,6 +441,77 @@ impl LanRemoteAcceptResult {
             media_profile: None,
         }
     }
+}
+
+impl LanSenderStatsTracker {
+    fn new(now: Instant) -> Self {
+        Self {
+            samples: HashMap::new(),
+            frame_count: 0,
+            last_emit: now,
+        }
+    }
+
+    fn record_elapsed(&mut self, stage: &'static str, start: Instant) {
+        self.record_ms(stage, start.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    fn record_ms(&mut self, stage: &'static str, duration_ms: f64) {
+        if !duration_ms.is_finite() || duration_ms < 0.0 {
+            return;
+        }
+        let samples = self.samples.entry(stage).or_default();
+        samples.push_back(duration_ms);
+        while samples.len() > LAN_MEDIA_SENDER_STATS_SAMPLE_LIMIT {
+            samples.pop_front();
+        }
+    }
+
+    fn frame_completed(&mut self) {
+        self.frame_count = self.frame_count.saturating_add(1);
+    }
+
+    fn take_payload(
+        &mut self,
+        now: Instant,
+        sequence: u64,
+        source_id: Option<String>,
+        profile: &MediaProfile,
+    ) -> Option<LanSenderStatsPayload> {
+        if now.duration_since(self.last_emit) < LAN_MEDIA_SENDER_STATS_INTERVAL {
+            return None;
+        }
+        self.last_emit = now;
+        let mut metrics = self
+            .samples
+            .iter()
+            .map(|(stage, samples)| MediaStageMetrics {
+                stage: (*stage).to_string(),
+                p50_ms: sender_stats_percentile(samples, 0.50),
+                p95_ms: sender_stats_percentile(samples, 0.95),
+            })
+            .collect::<Vec<_>>();
+        metrics.sort_by(|left, right| left.stage.cmp(&right.stage));
+        Some(LanSenderStatsPayload {
+            sequence,
+            frame_count: self.frame_count,
+            source_id,
+            target_fps: profile.fps,
+            target_bitrate_mbps: profile.bitrate_mbps,
+            metrics,
+        })
+    }
+}
+
+fn sender_stats_percentile(samples: &VecDeque<f64>, quantile: f64) -> Option<f64> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut sorted = samples.iter().copied().collect::<Vec<_>>();
+    sorted.sort_by(|left, right| left.total_cmp(right));
+    let last = sorted.len().saturating_sub(1);
+    let index = ((last as f64) * quantile.clamp(0.0, 1.0)).round() as usize;
+    sorted.get(index).copied()
 }
 
 pub async fn send_probe(
@@ -1743,12 +1835,14 @@ async fn send_quic_media_loop(
     let mut consecutive_frame_errors = 0_u32;
     let mut next_frame_at = Instant::now();
     let mut active_frame_interval = Duration::ZERO;
+    let mut sender_stats = LanSenderStatsTracker::new(Instant::now());
     let reliable_media_supported = app_state
         .peer_media_capabilities
         .lock()
         .await
         .supports(&session_id, LAN_QUIC_RELIABLE_MEDIA_TRANSPORT);
     loop {
+        let loop_started = Instant::now();
         if !session_allows_media(&app_state, &session_id).await {
             return Ok(());
         }
@@ -1794,14 +1888,17 @@ async fn send_quic_media_loop(
             }
         }
 
-        let raw_frame = match capture
+        let capture_started = Instant::now();
+        let raw_frame_result = capture
             .as_mut()
             .context("LAN media capture was not initialized")
             .and_then(|capture| {
                 capture
                     .capture_frame()
                     .context("failed to capture LAN desktop frame")
-            }) {
+            });
+        sender_stats.record_elapsed("sender.capture", capture_started);
+        let raw_frame = match raw_frame_result {
             Ok(frame) => frame,
             Err(error) => {
                 let error_source_id = active_source_id
@@ -1824,7 +1921,10 @@ async fn send_quic_media_loop(
                 continue;
             }
         };
-        let frame = match prepare_frame_for_h264(raw_frame, &profile) {
+        let prepare_started = Instant::now();
+        let frame_result = prepare_frame_for_h264(raw_frame, &profile);
+        sender_stats.record_elapsed("sender.prepare", prepare_started);
+        let frame = match frame_result {
             Ok(frame) => frame,
             Err(error) => {
                 handle_media_sender_frame_error(
@@ -1842,6 +1942,7 @@ async fn send_quic_media_loop(
         let expected_encoder_config =
             (frame.width, frame.height, profile.fps, profile.bitrate_mbps);
         if encoder_config != Some(expected_encoder_config) {
+            let encoder_create_started = Instant::now();
             match create_lan_h264_encoder(
                 frame.width,
                 frame.height,
@@ -1851,10 +1952,12 @@ async fn send_quic_media_loop(
             .context("failed to create LAN H.264 encoder")
             {
                 Ok(next_encoder) => {
+                    sender_stats.record_elapsed("sender.encoder_create", encoder_create_started);
                     encoder = Some(next_encoder);
                     encoder_config = Some(expected_encoder_config);
                 }
                 Err(error) => {
+                    sender_stats.record_elapsed("sender.encoder_create", encoder_create_started);
                     encoder = None;
                     encoder_config = None;
                     handle_media_sender_frame_error(
@@ -1871,14 +1974,17 @@ async fn send_quic_media_loop(
             }
         }
 
-        let access_units = match encoder
+        let encode_started = Instant::now();
+        let encode_result = encoder
             .as_mut()
             .context("LAN H.264 encoder was not initialized")
             .and_then(|encoder| {
                 encoder
                     .encode(&frame)
                     .context("failed to encode LAN desktop frame")
-            }) {
+            });
+        sender_stats.record_elapsed("sender.encode", encode_started);
+        let access_units = match encode_result {
             Ok(access_units) => access_units,
             Err(error) => {
                 encoder = None;
@@ -1909,6 +2015,7 @@ async fn send_quic_media_loop(
             })?;
             let mut reliable_fragments = None;
             let send_result = (|| -> Result<()> {
+                let fragment_started = Instant::now();
                 let fragments = fragment_access_unit(
                     frame_id as u32,
                     access_unit.timestamp_us,
@@ -1917,12 +2024,15 @@ async fn send_quic_media_loop(
                     max_datagram_size,
                 )
                 .context("failed to fragment LAN QUIC media frame")?;
+                sender_stats.record_elapsed("sender.fragment", fragment_started);
 
+                let datagram_send_started = Instant::now();
                 for fragment in &fragments {
                     endpoint.send_datagram(fragment.clone()).with_context(|| {
                         format!("failed to send LAN QUIC media frame {}", frame_id)
                     })?;
                 }
+                sender_stats.record_elapsed("sender.send_datagram", datagram_send_started);
 
                 if should_send_access_unit_reliably(
                     reliable_media_supported,
@@ -1972,8 +2082,29 @@ async fn send_quic_media_loop(
                 frame_id = frame_id.wrapping_add(1).max(1);
                 continue;
             }
+            sender_stats.frame_completed();
+            if let Some(stats_payload) = sender_stats.take_payload(
+                Instant::now(),
+                frame_id,
+                active_source_id.clone(),
+                &profile,
+            ) {
+                let stats_send_started = Instant::now();
+                if let Err(error) =
+                    send_lan_sender_stats_datagram(&endpoint, max_datagram_size, &stats_payload)
+                {
+                    tracing::debug!(
+                        %error,
+                        session_id = %session_id.0,
+                        frame_id,
+                        "LAN sender stats datagram was dropped"
+                    );
+                }
+                sender_stats.record_elapsed("sender.stats_send", stats_send_started);
+            }
             frame_id = frame_id.wrapping_add(1).max(1);
         }
+        sender_stats.record_elapsed("sender.loop", loop_started);
 
         if consecutive_frame_errors > 0 {
             consecutive_frame_errors = 0;
@@ -2252,6 +2383,26 @@ async fn receive_quic_media_loop(
         };
         if !session_allows_media(&app_state, &session_id).await {
             return Ok(());
+        }
+        match decode_lan_sender_stats_datagram(&media_message) {
+            Ok(Some(stats)) => {
+                app_state
+                    .media_pipelines
+                    .lock()
+                    .await
+                    .set_stage_metrics(session_id.clone(), stats.metrics);
+                continue;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                app_state.probes.lock().await.record_probe_drop(
+                    &session_id,
+                    media_message.len() as u64,
+                    now_ms(),
+                    format!("failed to decode LAN sender stats datagram: {error}"),
+                );
+                continue;
+            }
         }
         if let Some(frame) = reassembler
             .push_datagram(&media_message)
@@ -3312,6 +3463,58 @@ fn decode_media_probe_frame(frame: &[u8]) -> Result<MediaProbeFrameStats> {
         format: media_probe_format(width, height, target_fps, target_bitrate_mbps).to_string(),
         payload_hash: format!("fnv1a64:{actual_hash:016x}"),
     })
+}
+
+fn send_lan_sender_stats_datagram(
+    endpoint: &QuinnDatagramEndpoint,
+    max_datagram_size: usize,
+    payload: &LanSenderStatsPayload,
+) -> Result<()> {
+    let datagram = encode_lan_sender_stats_datagram(payload)?;
+    if datagram.len() > max_datagram_size {
+        anyhow::bail!(
+            "LAN sender stats datagram too large: {} > {}",
+            datagram.len(),
+            max_datagram_size
+        );
+    }
+    endpoint
+        .send_datagram(datagram.into())
+        .context("failed to send LAN sender stats datagram")
+}
+
+fn encode_lan_sender_stats_datagram(payload: &LanSenderStatsPayload) -> Result<Vec<u8>> {
+    let json = serde_json::to_vec(payload).context("failed to encode LAN sender stats payload")?;
+    let payload_len =
+        u32::try_from(json.len()).context("LAN sender stats payload exceeds u32 length")?;
+    let mut frame = Vec::with_capacity(LAN_MEDIA_SENDER_STATS_HEADER_BYTES + json.len());
+    frame.extend_from_slice(LAN_MEDIA_SENDER_STATS_MAGIC);
+    frame.extend_from_slice(&payload_len.to_le_bytes());
+    frame.extend_from_slice(&json);
+    Ok(frame)
+}
+
+fn decode_lan_sender_stats_datagram(frame: &[u8]) -> Result<Option<LanSenderStatsPayload>> {
+    if !frame.starts_with(LAN_MEDIA_SENDER_STATS_MAGIC) {
+        return Ok(None);
+    }
+    if frame.len() < LAN_MEDIA_SENDER_STATS_HEADER_BYTES {
+        anyhow::bail!("LAN sender stats datagram is too small");
+    }
+    let payload_len = u32::from_le_bytes(frame[8..12].try_into().unwrap()) as usize;
+    let Some(expected_len) = LAN_MEDIA_SENDER_STATS_HEADER_BYTES.checked_add(payload_len) else {
+        anyhow::bail!("LAN sender stats datagram payload length overflow");
+    };
+    if frame.len() != expected_len {
+        anyhow::bail!(
+            "LAN sender stats datagram payload length mismatch: expected {}, got {}",
+            expected_len,
+            frame.len()
+        );
+    }
+    let payload = serde_json::from_slice(&frame[LAN_MEDIA_SENDER_STATS_HEADER_BYTES..])
+        .context("failed to decode LAN sender stats payload")?;
+    Ok(Some(payload))
 }
 
 fn encode_lan_media_envelope(envelope: LanMediaEnvelope) -> Result<Vec<u8>> {
@@ -4611,6 +4814,31 @@ mod tests {
 
         assert!(error.to_string().contains("invalid magic"));
         assert!(!error.to_string().contains("legacy probe fallback"));
+    }
+
+    #[test]
+    fn lan_sender_stats_datagram_round_trips_without_media_sequence() {
+        let payload = LanSenderStatsPayload {
+            sequence: 123,
+            frame_count: 122,
+            source_id: Some("windows:display-shared:0".to_string()),
+            target_fps: 144,
+            target_bitrate_mbps: 20,
+            metrics: vec![MediaStageMetrics {
+                stage: "sender.encode".to_string(),
+                p50_ms: Some(1.2),
+                p95_ms: Some(2.4),
+            }],
+        };
+
+        let encoded = encode_lan_sender_stats_datagram(&payload).unwrap();
+        let decoded = decode_lan_sender_stats_datagram(&encoded).unwrap();
+
+        assert_eq!(decoded, Some(payload));
+        assert_eq!(
+            decode_lan_sender_stats_datagram(b"not-stats").unwrap(),
+            None
+        );
     }
 
     #[cfg(windows)]

@@ -10,15 +10,19 @@ use image::{codecs::png::PngEncoder, ColorType, ImageEncoder};
 use mrd_application::ports::SessionSnapshot;
 use mrd_ipc::{
     AttachedRenderSurface, CaptureSourceSelection, MediaPipelineSnapshot, MediaProfileNegotiation,
+    MediaStageMetrics,
 };
 use mrd_proto::{DeviceId, SessionId};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::{sync::Mutex, task::AbortHandle};
+
+const MEDIA_STAGE_SAMPLE_LIMIT: usize = 240;
 
 /// Session registry tracking all active sessions
 #[derive(Debug, Default)]
 pub struct SessionRegistry {
-    sessions: std::collections::HashMap<SessionId, SessionSnapshot>,
+    sessions: HashMap<SessionId, SessionSnapshot>,
 }
 
 impl SessionRegistry {
@@ -46,13 +50,13 @@ impl SessionRegistry {
 /// Probe telemetry accumulated from LAN data-plane probe frames.
 #[derive(Debug, Default)]
 pub struct ProbeRegistry {
-    probes: std::collections::HashMap<SessionId, SessionProbeStats>,
+    probes: HashMap<SessionId, SessionProbeStats>,
 }
 
 /// Runtime media profile negotiation state keyed by session.
 #[derive(Debug, Default)]
 pub struct MediaProfileRegistry {
-    profiles: std::collections::HashMap<SessionId, MediaProfileNegotiation>,
+    profiles: HashMap<SessionId, MediaProfileNegotiation>,
 }
 
 impl MediaProfileRegistry {
@@ -72,7 +76,7 @@ impl MediaProfileRegistry {
 /// Runtime capture source selection state keyed by session.
 #[derive(Debug, Default)]
 pub struct CaptureSourceRegistry {
-    selections: std::collections::HashMap<SessionId, CaptureSourceSelection>,
+    selections: HashMap<SessionId, CaptureSourceSelection>,
 }
 
 impl CaptureSourceRegistry {
@@ -92,7 +96,7 @@ impl CaptureSourceRegistry {
 /// Peer media capabilities observed for each active session.
 #[derive(Debug, Default)]
 pub struct SessionPeerMediaCapabilityRegistry {
-    capabilities: std::collections::HashMap<SessionId, Vec<String>>,
+    capabilities: HashMap<SessionId, Vec<String>>,
 }
 
 impl SessionPeerMediaCapabilityRegistry {
@@ -115,16 +119,18 @@ impl SessionPeerMediaCapabilityRegistry {
 /// Runtime receiver media pipeline state keyed by session.
 #[derive(Debug, Default)]
 pub struct MediaPipelineRegistry {
-    pipelines: std::collections::HashMap<SessionId, MediaPipelineState>,
+    pipelines: HashMap<SessionId, MediaPipelineState>,
 }
 
 #[derive(Debug, Clone, Default)]
 struct MediaPipelineState {
-    attached_surfaces: std::collections::HashMap<String, AttachedRenderSurface>,
+    attached_surfaces: HashMap<String, AttachedRenderSurface>,
     active_decoder: Option<String>,
     active_renderer: Option<String>,
     queue_depth: u32,
     dropped_frames: u64,
+    stage_samples: HashMap<String, VecDeque<f64>>,
+    stage_summaries: HashMap<String, MediaStageMetrics>,
 }
 
 impl MediaPipelineRegistry {
@@ -162,8 +168,42 @@ impl MediaPipelineRegistry {
         state.dropped_frames = state.dropped_frames.saturating_add(count);
     }
 
+    pub fn record_stage_duration_ms(
+        &mut self,
+        session_id: SessionId,
+        stage: impl Into<String>,
+        duration_ms: f64,
+    ) {
+        if !duration_ms.is_finite() || duration_ms < 0.0 {
+            return;
+        }
+        let samples = self
+            .pipelines
+            .entry(session_id)
+            .or_default()
+            .stage_samples
+            .entry(stage.into())
+            .or_default();
+        samples.push_back(duration_ms);
+        while samples.len() > MEDIA_STAGE_SAMPLE_LIMIT {
+            samples.pop_front();
+        }
+    }
+
+    pub fn set_stage_metrics(
+        &mut self,
+        session_id: SessionId,
+        metrics: impl IntoIterator<Item = MediaStageMetrics>,
+    ) {
+        let state = self.pipelines.entry(session_id).or_default();
+        for metric in metrics {
+            state.stage_summaries.insert(metric.stage.clone(), metric);
+        }
+    }
+
     pub fn snapshot(&self, session_id: &SessionId) -> MediaPipelineSnapshot {
         let state = self.pipelines.get(session_id);
+        let stage_metrics = state.map(media_pipeline_stage_metrics).unwrap_or_default();
         MediaPipelineSnapshot {
             session_id: session_id.clone(),
             attached_surfaces: state
@@ -173,7 +213,7 @@ impl MediaPipelineRegistry {
             active_renderer: state.and_then(|state| state.active_renderer.clone()),
             queue_depth: state.map_or(0, |state| state.queue_depth),
             dropped_frames: state.map_or(0, |state| state.dropped_frames),
-            stage_metrics: Vec::new(),
+            stage_metrics,
         }
     }
 
@@ -182,10 +222,39 @@ impl MediaPipelineRegistry {
     }
 }
 
+fn media_pipeline_stage_metrics(state: &MediaPipelineState) -> Vec<MediaStageMetrics> {
+    let mut metrics = state.stage_summaries.clone();
+    for (stage, samples) in &state.stage_samples {
+        metrics.insert(
+            stage.clone(),
+            MediaStageMetrics {
+                stage: stage.clone(),
+                p50_ms: percentile(samples, 0.50),
+                p95_ms: percentile(samples, 0.95),
+            },
+        );
+    }
+
+    let mut metrics = metrics.into_values().collect::<Vec<_>>();
+    metrics.sort_by(|left, right| left.stage.cmp(&right.stage));
+    metrics
+}
+
+fn percentile(samples: &VecDeque<f64>, quantile: f64) -> Option<f64> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut sorted = samples.iter().copied().collect::<Vec<_>>();
+    sorted.sort_by(|left, right| left.total_cmp(right));
+    let last = sorted.len().saturating_sub(1);
+    let index = ((last as f64) * quantile.clamp(0.0, 1.0)).round() as usize;
+    sorted.get(index).copied()
+}
+
 /// Runtime media tasks keyed by session.
 #[derive(Default)]
 pub struct MediaTaskRegistry {
-    tasks: std::collections::HashMap<SessionId, Vec<AbortHandle>>,
+    tasks: HashMap<SessionId, Vec<AbortHandle>>,
 }
 
 impl MediaTaskRegistry {
@@ -838,6 +907,36 @@ mod tests {
         assert_eq!(snapshot.frames_decoded, 0);
         assert_eq!(snapshot.frames_dropped, 1);
         assert_eq!(snapshot.last_error, None);
+    }
+
+    #[test]
+    fn media_pipeline_registry_exposes_stage_metrics() {
+        let mut registry = MediaPipelineRegistry::default();
+        let session_id = SessionId("metrics-session".to_string());
+
+        registry.record_stage_duration_ms(session_id.clone(), "sender.capture", 1.0);
+        registry.record_stage_duration_ms(session_id.clone(), "sender.capture", 3.0);
+        registry.set_stage_metrics(
+            session_id.clone(),
+            [MediaStageMetrics {
+                stage: "sender.encode".to_string(),
+                p50_ms: Some(2.5),
+                p95_ms: Some(4.5),
+            }],
+        );
+
+        let snapshot = registry.snapshot(&session_id);
+
+        assert!(snapshot.stage_metrics.iter().any(|metric| {
+            metric.stage == "sender.capture"
+                && metric.p50_ms == Some(3.0)
+                && metric.p95_ms == Some(3.0)
+        }));
+        assert!(snapshot.stage_metrics.iter().any(|metric| {
+            metric.stage == "sender.encode"
+                && metric.p50_ms == Some(2.5)
+                && metric.p95_ms == Some(4.5)
+        }));
     }
 
     #[test]
