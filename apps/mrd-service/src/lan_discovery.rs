@@ -11,7 +11,7 @@ use mrd_pipeline_core::{
 };
 use mrd_proto::{DeviceId, SessionId};
 use mrd_transport_quic_quinn::{
-    fragment_access_unit, QuicAuFragment, QuicAuFrame, QuicAuReassembler, QuicAuReassemblerConfig,
+    fragment_access_unit, QuicAuFrame, QuicAuReassembler, QuicAuReassemblerConfig,
     QuinnDatagramEndpoint, QuinnServerBootstrap, QuinnServerListener, QUIC_AU_FRAGMENT_HEADER_LEN,
 };
 use serde::{Deserialize, Serialize};
@@ -1907,6 +1907,7 @@ async fn send_quic_media_loop(
                 profile: profile.clone(),
                 payload: access_unit.bytes.clone(),
             })?;
+            let mut reliable_fragments = None;
             let send_result = (|| -> Result<()> {
                 let fragments = fragment_access_unit(
                     frame_id as u32,
@@ -1917,47 +1918,45 @@ async fn send_quic_media_loop(
                 )
                 .context("failed to fragment LAN QUIC media frame")?;
 
-                for fragment in fragments {
-                    endpoint.send_datagram(fragment).with_context(|| {
+                for fragment in &fragments {
+                    endpoint.send_datagram(fragment.clone()).with_context(|| {
                         format!("failed to send LAN QUIC media frame {}", frame_id)
                     })?;
                 }
-                Ok(())
-            })();
 
-            if send_result.is_ok()
-                && should_send_access_unit_reliably(
+                if should_send_access_unit_reliably(
                     reliable_media_supported,
                     is_keyframe,
                     media_payload.len(),
                     max_datagram_size,
-                )
-            {
-                let reliable_message = QuicAuFragment {
-                    frame_id: frame_id as u32,
-                    timestamp_us: access_unit.timestamp_us,
-                    is_keyframe,
-                    fragment_index: 0,
-                    fragment_count: 1,
-                    payload: media_payload.into(),
+                ) {
+                    reliable_fragments = Some(fragments);
                 }
-                .encode();
-                let reliable_endpoint = endpoint.clone();
-                let reliable_session_id = session_id.clone();
-                let reliable_frame_id = frame_id;
-                tokio::spawn(async move {
-                    if let Err(error) = reliable_endpoint
-                        .send_reliable_message(reliable_message)
-                        .await
-                    {
-                        tracing::warn!(
-                            %error,
-                            session_id = %reliable_session_id.0,
-                            frame_id = reliable_frame_id,
-                            "LAN QUIC reliable keyframe send failed"
-                        );
-                    }
-                });
+                Ok(())
+            })();
+
+            if send_result.is_ok() {
+                if let Some(reliable_fragments) = reliable_fragments {
+                    let reliable_endpoint = endpoint.clone();
+                    let reliable_session_id = session_id.clone();
+                    let reliable_frame_id = frame_id;
+                    tokio::spawn(async move {
+                        for reliable_fragment in reliable_fragments {
+                            if let Err(error) = reliable_endpoint
+                                .send_reliable_message(reliable_fragment)
+                                .await
+                            {
+                                tracing::warn!(
+                                    %error,
+                                    session_id = %reliable_session_id.0,
+                                    frame_id = reliable_frame_id,
+                                    "LAN QUIC reliable keyframe fragment send failed"
+                                );
+                                break;
+                            }
+                        }
+                    });
+                }
             }
 
             if let Err(error) = send_result {
@@ -4654,6 +4653,32 @@ mod tests {
             32 * 1024 + 1,
             1_200
         ));
+    }
+
+    #[test]
+    fn lan_quic_reliable_keyframe_fragments_match_datagram_fragments() {
+        let payload = vec![0x33; 4096];
+        let fragments = fragment_access_unit(42, 12_345, true, &payload, 1_200).unwrap();
+        assert!(fragments.len() > 1);
+
+        let mut reassembler = QuicAuReassembler::new(QuicAuReassemblerConfig {
+            frame_timeout: Duration::from_secs(1),
+            max_pending_frames: 8,
+        });
+
+        assert!(reassembler.push_datagram(&fragments[0]).unwrap().is_none());
+        assert!(reassembler.push_datagram(&fragments[0]).unwrap().is_none());
+
+        let mut completed = None;
+        for fragment in fragments.iter().skip(1) {
+            completed = reassembler.push_datagram(fragment).unwrap();
+        }
+
+        let frame = completed.expect("keyframe should complete after all fragments");
+        assert_eq!(frame.frame_id, 42);
+        assert!(frame.is_keyframe);
+        assert_eq!(frame.payload.as_ref(), payload.as_slice());
+        assert_eq!(reassembler.stats().duplicate_fragments, 1);
     }
 
     #[test]
