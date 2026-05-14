@@ -410,8 +410,7 @@ export async function runLanE2EAutomation(
       }
       if (
         profileProbeResult?.status === "degraded" &&
-        probeSnapshot.frames_decoded >= minDecodedFrames &&
-        sampleDurationMs >= minSampleDurationMs
+        probeSnapshot.frames_decoded >= minDecodedFrames
       ) {
         const message =
           profileProbeResult.error ?? "Runtime media profile was downgraded by the remote source";
