@@ -1884,6 +1884,8 @@ async fn send_quic_media_loop(
         };
 
         for access_unit in access_units {
+            let is_keyframe =
+                h264_access_unit_is_keyframe(access_unit.is_keyframe, &access_unit.bytes);
             let media_payload = encode_lan_media_envelope(LanMediaEnvelope {
                 payload_type: LAN_MEDIA_PAYLOAD_H264_ACCESS_UNIT,
                 codec: LAN_MEDIA_CODEC_H264,
@@ -1894,14 +1896,14 @@ async fn send_quic_media_loop(
             })?;
             let send_result = if should_send_access_unit_reliably(
                 reliable_media_supported,
-                access_unit.is_keyframe,
+                is_keyframe,
                 media_payload.len(),
                 max_datagram_size,
             ) {
                 let reliable_message = QuicAuFragment {
                     frame_id: frame_id as u32,
                     timestamp_us: access_unit.timestamp_us,
-                    is_keyframe: access_unit.is_keyframe,
+                    is_keyframe,
                     fragment_index: 0,
                     fragment_count: 1,
                     payload: media_payload.into(),
@@ -1929,7 +1931,7 @@ async fn send_quic_media_loop(
                     let fragments = fragment_access_unit(
                         frame_id as u32,
                         access_unit.timestamp_us,
-                        access_unit.is_keyframe,
+                        is_keyframe,
                         &media_payload,
                         max_datagram_size,
                     )
@@ -2132,6 +2134,16 @@ fn should_send_access_unit_reliably(
     _max_datagram_size: usize,
 ) -> bool {
     reliable_media_supported && is_keyframe
+}
+
+fn h264_access_unit_is_keyframe(metadata_is_keyframe: bool, payload: &[u8]) -> bool {
+    metadata_is_keyframe
+        || h264_annexb_nal_types(payload)
+            .into_iter()
+            .any(|nal_type| nal_type == 5)
+        || h264_avcc_nal_types(payload)
+            .into_iter()
+            .any(|nal_type| nal_type == 5)
 }
 
 async fn set_session_last_error(
@@ -4561,6 +4573,18 @@ mod tests {
             32 * 1024 + 1,
             1_200
         ));
+    }
+
+    #[test]
+    fn lan_sender_treats_h264_idr_payload_as_keyframe() {
+        let idr_annexb = [0, 0, 0, 1, 0x65, 0x88, 0x84];
+        let p_slice_annexb = [0, 0, 1, 0x41, 0x9a];
+        let idr_avcc = [0, 0, 0, 3, 0x65, 0x88, 0x84];
+
+        assert!(h264_access_unit_is_keyframe(false, &idr_annexb));
+        assert!(h264_access_unit_is_keyframe(false, &idr_avcc));
+        assert!(!h264_access_unit_is_keyframe(false, &p_slice_annexb));
+        assert!(h264_access_unit_is_keyframe(true, &p_slice_annexb));
     }
 
     #[test]
