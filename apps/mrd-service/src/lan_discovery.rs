@@ -1907,12 +1907,32 @@ async fn send_quic_media_loop(
                 profile: profile.clone(),
                 payload: access_unit.bytes.clone(),
             })?;
-            let send_result = if should_send_access_unit_reliably(
-                reliable_media_supported,
-                is_keyframe,
-                media_payload.len(),
-                max_datagram_size,
-            ) {
+            let send_result = (|| -> Result<()> {
+                let fragments = fragment_access_unit(
+                    frame_id as u32,
+                    access_unit.timestamp_us,
+                    is_keyframe,
+                    &media_payload,
+                    max_datagram_size,
+                )
+                .context("failed to fragment LAN QUIC media frame")?;
+
+                for fragment in fragments {
+                    endpoint.send_datagram(fragment).with_context(|| {
+                        format!("failed to send LAN QUIC media frame {}", frame_id)
+                    })?;
+                }
+                Ok(())
+            })();
+
+            if send_result.is_ok()
+                && should_send_access_unit_reliably(
+                    reliable_media_supported,
+                    is_keyframe,
+                    media_payload.len(),
+                    max_datagram_size,
+                )
+            {
                 let reliable_message = QuicAuFragment {
                     frame_id: frame_id as u32,
                     timestamp_us: access_unit.timestamp_us,
@@ -1922,31 +1942,23 @@ async fn send_quic_media_loop(
                     payload: media_payload.into(),
                 }
                 .encode();
-                endpoint
-                    .send_reliable_message(reliable_message)
-                    .await
-                    .with_context(|| {
-                        format!("failed to send LAN QUIC reliable media frame {frame_id}")
-                    })
-            } else {
-                (|| -> Result<()> {
-                    let fragments = fragment_access_unit(
-                        frame_id as u32,
-                        access_unit.timestamp_us,
-                        is_keyframe,
-                        &media_payload,
-                        max_datagram_size,
-                    )
-                    .context("failed to fragment LAN QUIC media frame")?;
-
-                    for fragment in fragments {
-                        endpoint.send_datagram(fragment).with_context(|| {
-                            format!("failed to send LAN QUIC media frame {}", frame_id)
-                        })?;
+                let reliable_endpoint = endpoint.clone();
+                let reliable_session_id = session_id.clone();
+                let reliable_frame_id = frame_id;
+                tokio::spawn(async move {
+                    if let Err(error) = reliable_endpoint
+                        .send_reliable_message(reliable_message)
+                        .await
+                    {
+                        tracing::warn!(
+                            %error,
+                            session_id = %reliable_session_id.0,
+                            frame_id = reliable_frame_id,
+                            "LAN QUIC reliable keyframe send failed"
+                        );
                     }
-                    Ok(())
-                })()
-            };
+                });
+            }
 
             if let Err(error) = send_result {
                 handle_media_sender_frame_error(
@@ -2132,15 +2144,14 @@ fn lan_media_reassembler_config() -> QuicAuReassemblerConfig {
 fn should_send_access_unit_reliably(
     reliable_media_supported: bool,
     is_keyframe: bool,
-    payload_len: usize,
-    max_datagram_size: usize,
+    _payload_len: usize,
+    _max_datagram_size: usize,
 ) -> bool {
     if !reliable_media_supported {
         return false;
     }
 
-    let max_single_datagram_payload = max_datagram_size.saturating_sub(QUIC_AU_FRAGMENT_HEADER_LEN);
-    is_keyframe || payload_len > max_single_datagram_payload
+    is_keyframe
 }
 
 fn h264_access_unit_is_keyframe(metadata_is_keyframe: bool, payload: &[u8]) -> bool {
@@ -3864,7 +3875,13 @@ mod tests {
             &DeviceId("target-device".to_string()),
             &session_id,
             "quic",
-            None,
+            Some(MediaProfile {
+                width: 640,
+                height: 360,
+                fps: 60,
+                bitrate_mbps: 5,
+                codec: "h264".to_string(),
+            }),
         )
         .await
         .unwrap();
@@ -3894,8 +3911,8 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .starts_with("fnv1a64:"));
-        assert_eq!(snapshot.media_probe_target_fps, Some(144));
-        assert_eq!(snapshot.media_probe_target_bitrate_mbps, Some(64));
+        assert_eq!(snapshot.media_probe_target_fps, Some(60));
+        assert_eq!(snapshot.media_probe_target_bitrate_mbps, Some(5));
         assert!(snapshot.media_probe_payload_bytes.unwrap_or_default() > 0);
         assert!(snapshot
             .latest_frame_data_url
@@ -4621,15 +4638,15 @@ mod tests {
     }
 
     #[test]
-    fn lan_quic_media_routes_keyframes_and_fragmented_units_reliably() {
+    fn lan_quic_media_routes_only_keyframes_reliably() {
         assert!(should_send_access_unit_reliably(true, true, 1024, 1_200));
-        assert!(should_send_access_unit_reliably(
+        assert!(!should_send_access_unit_reliably(
             true,
             false,
             32 * 1024 + 1,
             1_200
         ));
-        assert!(should_send_access_unit_reliably(true, false, 1_200, 1_200));
+        assert!(!should_send_access_unit_reliably(true, false, 1_200, 1_200));
         assert!(!should_send_access_unit_reliably(true, false, 512, 1_200));
         assert!(!should_send_access_unit_reliably(
             false,
