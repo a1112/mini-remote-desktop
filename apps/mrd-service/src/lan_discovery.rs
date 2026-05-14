@@ -2130,10 +2130,15 @@ fn lan_media_reassembler_config() -> QuicAuReassemblerConfig {
 fn should_send_access_unit_reliably(
     reliable_media_supported: bool,
     is_keyframe: bool,
-    _payload_len: usize,
-    _max_datagram_size: usize,
+    payload_len: usize,
+    max_datagram_size: usize,
 ) -> bool {
-    reliable_media_supported && is_keyframe
+    if !reliable_media_supported {
+        return false;
+    }
+
+    let max_single_datagram_payload = max_datagram_size.saturating_sub(QUIC_AU_FRAGMENT_HEADER_LEN);
+    is_keyframe || payload_len > max_single_datagram_payload
 }
 
 fn h264_access_unit_is_keyframe(metadata_is_keyframe: bool, payload: &[u8]) -> bool {
@@ -4553,20 +4558,16 @@ mod tests {
     }
 
     #[test]
-    fn lan_quic_media_keeps_access_units_on_datagram_path() {
+    fn lan_quic_media_routes_keyframes_and_fragmented_units_reliably() {
         assert!(should_send_access_unit_reliably(true, true, 1024, 1_200));
-        assert!(!should_send_access_unit_reliably(
+        assert!(should_send_access_unit_reliably(
             true,
             false,
             32 * 1024 + 1,
             1_200
         ));
-        assert!(!should_send_access_unit_reliably(
-            true,
-            false,
-            4 * 1024,
-            1_200
-        ));
+        assert!(should_send_access_unit_reliably(true, false, 1_200, 1_200));
+        assert!(!should_send_access_unit_reliably(true, false, 512, 1_200));
         assert!(!should_send_access_unit_reliably(
             false,
             true,
