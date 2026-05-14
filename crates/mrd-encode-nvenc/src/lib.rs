@@ -31,12 +31,13 @@ mod imp {
         NV_ENC_PRESET_P6_GUID,
     };
     use nvenc::sys::structs::Guid;
+    use windows::core::Interface;
     use windows::Win32::Foundation::{HANDLE, HMODULE};
     use windows::Win32::Graphics::Direct3D::{
         D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0,
     };
     use windows::Win32::Graphics::Direct3D11::{
-        D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+        D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D,
         D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
         D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
     };
@@ -493,17 +494,13 @@ mod imp {
                 )));
             }
 
-            self.ensure_shared_input(shared)?;
+            self.copy_shared_bgra_to_registered_texture(shared)?;
 
             let force_idr = self.frame_index == 0 || self.frame_index % self.fps as usize == 0;
-            let shared_input = self
-                .shared_input
-                .as_ref()
-                .ok_or_else(|| PipelineError::message("missing shared input resource"))?;
             let bytes = encode_picture_with_sps_pps(
                 &mut self.encoder,
                 &self.bitstream,
-                &shared_input.registered,
+                &self.registered,
                 self.frame_index,
                 force_idr,
             )
@@ -516,6 +513,36 @@ mod imp {
                 is_keyframe: force_idr,
                 bytes: normalize_annexb_au(bytes),
             }])
+        }
+
+        fn copy_shared_bgra_to_registered_texture(
+            &mut self,
+            shared: &D3D11SharedBgraFrame,
+        ) -> Result<(), PipelineError> {
+            self.ensure_shared_input(shared)?;
+            let source_texture = self
+                .shared_input
+                .as_ref()
+                .ok_or_else(|| PipelineError::message("missing shared input resource"))?
+                ._texture
+                .clone();
+            let source_resource: ID3D11Resource = source_texture.cast().map_err(|error| {
+                PipelineError::message(format!(
+                    "cast shared texture to NVENC copy source failed: {error}"
+                ))
+            })?;
+            let target_resource: ID3D11Resource = self.texture.cast().map_err(|error| {
+                PipelineError::message(format!(
+                    "cast registered NVENC texture to copy target failed: {error}"
+                ))
+            })?;
+
+            unsafe {
+                self.context
+                    .CopyResource(&target_resource, &source_resource);
+            }
+
+            Ok(())
         }
 
         fn ensure_shared_input(
