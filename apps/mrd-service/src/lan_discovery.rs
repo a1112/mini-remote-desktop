@@ -1320,7 +1320,6 @@ async fn build_announcement(app_state: &Arc<AppState>) -> Option<LanAnnouncement
             LAN_QUIC_MEDIA_TRANSPORT.to_string(),
             LAN_QUIC_MEDIA_PROFILE_TRANSPORT.to_string(),
             LAN_QUIC_MEDIA_V2_TRANSPORT.to_string(),
-            LAN_QUIC_RELIABLE_MEDIA_TRANSPORT.to_string(),
             LAN_MEDIA_PROFILE_CONTROL_TRANSPORT.to_string(),
             LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT.to_string(),
         ],
@@ -1339,10 +1338,7 @@ fn service_build_id() -> String {
 }
 
 fn lan_media_capabilities() -> Vec<String> {
-    let mut capabilities = vec![
-        LAN_QUIC_MEDIA_V2_TRANSPORT.to_string(),
-        LAN_QUIC_RELIABLE_MEDIA_TRANSPORT.to_string(),
-    ];
+    let mut capabilities = vec![LAN_QUIC_MEDIA_V2_TRANSPORT.to_string()];
     #[cfg(windows)]
     {
         capabilities.extend([
@@ -2115,12 +2111,12 @@ fn lan_media_reassembler_config() -> QuicAuReassemblerConfig {
 }
 
 fn should_send_access_unit_reliably(
-    reliable_media_supported: bool,
-    is_keyframe: bool,
+    _reliable_media_supported: bool,
+    _is_keyframe: bool,
     _payload_len: usize,
     _max_datagram_size: usize,
 ) -> bool {
-    reliable_media_supported && is_keyframe
+    false
 }
 
 async fn set_session_last_error(
@@ -3516,6 +3512,9 @@ mod tests {
         assert!(peer
             .media_capabilities
             .contains(&LAN_RENDER_D3D11_NATIVE_CAPABILITY.to_string()));
+        assert!(!peer
+            .media_capabilities
+            .contains(&LAN_QUIC_RELIABLE_MEDIA_TRANSPORT.to_string()));
     }
 
     #[tokio::test]
@@ -3569,7 +3568,7 @@ mod tests {
             source_device_name: "Controller".to_string(),
             transport_kind: "quic".to_string(),
             source_discovery_port: Some(21116),
-            source_media_capabilities: vec![LAN_QUIC_RELIABLE_MEDIA_TRANSPORT.to_string()],
+            source_media_capabilities: lan_media_capabilities(),
             requested_media_profile: Some(MediaProfile {
                 width: 3840,
                 height: 2160,
@@ -3638,7 +3637,7 @@ mod tests {
         assert_eq!(snapshot.lifecycle_state, "listening");
         assert!(snapshot.sender_active);
         assert!(snapshot.local_listen_addr.is_some());
-        assert!(app_state.peer_media_capabilities.lock().await.supports(
+        assert!(!app_state.peer_media_capabilities.lock().await.supports(
             &SessionId("session-1".to_string()),
             LAN_QUIC_RELIABLE_MEDIA_TRANSPORT
         ));
@@ -4515,8 +4514,8 @@ mod tests {
     }
 
     #[test]
-    fn lan_quic_media_uses_reliable_transport_for_keyframes_only() {
-        assert!(should_send_access_unit_reliably(true, true, 1024, 1_200));
+    fn lan_quic_media_keeps_access_units_on_datagram_path() {
+        assert!(!should_send_access_unit_reliably(true, true, 1024, 1_200));
         assert!(!should_send_access_unit_reliably(
             true,
             false,
