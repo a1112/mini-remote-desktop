@@ -1277,7 +1277,11 @@ async fn accept_lan_media_profile_update(
         }
     }
 
-    let negotiation = negotiate_media_profile(Some(requested_profile))?;
+    let mut negotiation = negotiate_media_profile(Some(requested_profile))?;
+    let selected_source = app_state.capture_sources.lock().await.get(session_id);
+    if let Some(selection) = selected_source.as_ref() {
+        reconcile_negotiation_to_capture_source(&mut negotiation, &selection.source);
+    }
     app_state
         .media_profiles
         .lock()
@@ -1341,6 +1345,15 @@ async fn reconcile_media_profile_to_capture_source(
     let mut negotiation = profiles
         .get(session_id)
         .unwrap_or_else(default_media_profile_negotiation);
+    reconcile_negotiation_to_capture_source(&mut negotiation, source);
+
+    profiles.set(session_id.clone(), negotiation);
+}
+
+fn reconcile_negotiation_to_capture_source(
+    negotiation: &mut MediaProfileNegotiation,
+    source: &CaptureSource,
+) {
     let before = negotiation.selected.clone();
 
     if source.width > 0 && source.height > 0 {
@@ -1365,8 +1378,6 @@ async fn reconcile_media_profile_to_capture_source(
     } else if negotiation.downgrade_reason.is_none() {
         negotiation.downgrade_reason = negotiation.reason.clone();
     }
-
-    profiles.set(session_id.clone(), negotiation);
 }
 
 async fn ensure_active_sender_session(
@@ -5042,6 +5053,83 @@ mod tests {
                 .selected
                 .height,
             720
+        );
+    }
+
+    #[tokio::test]
+    async fn media_profile_update_preserves_selected_capture_source_aspect_ratio() {
+        let app_state = Arc::new(AppState::new());
+        let session_id = SessionId("profile-update-aspect-session".to_string());
+        app_state.sessions.lock().await.insert(
+            session_id.clone(),
+            SessionSnapshot {
+                session_id: session_id.clone(),
+                transport: "quic".to_string(),
+                source_device_id: Some(DeviceId("controller-device".to_string())),
+                target_device_id: None,
+                local_listen_addr: None,
+                local_server_name: None,
+                local_cert_der_b64: None,
+                remote_listen_addr: None,
+                remote_server_name: None,
+                remote_cert_der_b64: None,
+                lifecycle_state: "listening".to_string(),
+                last_error: None,
+                sender_active: true,
+                receiver_active: false,
+            },
+        );
+        app_state.capture_sources.lock().await.set(
+            session_id.clone(),
+            CaptureSourceSelection {
+                session_id: session_id.clone(),
+                source: mrd_ipc::CaptureSource {
+                    id: "windows:display-shared:0".to_string(),
+                    platform: "windows".to_string(),
+                    source_kind: "display_shared".to_string(),
+                    title: "Display 1".to_string(),
+                    class_name: "WinRTMonitorShared".to_string(),
+                    width: 2560,
+                    height: 1600,
+                    process_id: 0,
+                    app_name: Some("Display".to_string()),
+                    bundle_identifier: None,
+                    preview_data_url: None,
+                    preview_width: None,
+                    preview_height: None,
+                },
+                status: "selected".to_string(),
+                reason: None,
+            },
+        );
+
+        let negotiation = accept_lan_media_profile_update(
+            &app_state,
+            &session_id,
+            MediaProfile {
+                width: 1920,
+                height: 1080,
+                fps: 144,
+                bitrate_mbps: 20,
+                codec: "h264".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            negotiation.selected_source_id.as_deref(),
+            Some("windows:display-shared:0")
+        );
+        assert_eq!(negotiation.selected.width, 1728);
+        assert_eq!(negotiation.selected.height, 1080);
+        assert_eq!(negotiation.selected.fps, 144);
+        assert_eq!(negotiation.selected_width, Some(1728));
+        assert_eq!(negotiation.selected_height, Some(1080));
+        assert_eq!(negotiation.status, "downgraded");
+        assert_eq!(
+            negotiation.downgrade_reason.as_deref(),
+            Some("matched selected capture source dimensions and aspect ratio")
         );
     }
 }
