@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, Notify};
-use tokio::time::{interval, timeout};
+use tokio::time::{interval, sleep_until, timeout, Instant};
 
 const DEFAULT_DISCOVERY_PORT: u16 = 21116;
 const PROTOCOL_VERSION: u32 = 1;
@@ -1741,6 +1741,8 @@ async fn send_quic_media_loop(
     let mut encoder: Option<Box<dyn VideoEncoder + Send>> = None;
     let mut encoder_config: Option<(usize, usize, u32, u32)> = None;
     let mut consecutive_frame_errors = 0_u32;
+    let mut next_frame_at = Instant::now();
+    let mut active_frame_interval = Duration::ZERO;
     let reliable_media_supported = app_state
         .peer_media_capabilities
         .lock()
@@ -1751,7 +1753,16 @@ async fn send_quic_media_loop(
             return Ok(());
         }
         let profile = selected_media_profile(&app_state, &session_id).await;
-        tokio::time::sleep(media_frame_interval(&profile)).await;
+        let frame_interval = media_frame_interval(&profile);
+        if active_frame_interval != frame_interval {
+            active_frame_interval = frame_interval;
+            next_frame_at = Instant::now() + frame_interval;
+        }
+        if let Some(delay_until) =
+            schedule_next_media_frame(Instant::now(), &mut next_frame_at, frame_interval)
+        {
+            sleep_until(delay_until).await;
+        }
 
         let source_id = selected_capture_source_id(&app_state, &session_id).await?;
         if active_source_id.as_deref() != Some(source_id.as_str()) {
@@ -1911,23 +1922,12 @@ async fn send_quic_media_loop(
                     payload: media_payload.into(),
                 }
                 .encode();
-                let reliable_endpoint = endpoint.clone();
-                let reliable_session_id = session_id.clone();
-                let reliable_frame_id = frame_id;
-                tokio::spawn(async move {
-                    if let Err(error) = reliable_endpoint
-                        .send_reliable_message(reliable_message)
-                        .await
-                    {
-                        tracing::warn!(
-                            %error,
-                            session_id = %reliable_session_id.0,
-                            frame_id = reliable_frame_id,
-                            "LAN QUIC reliable keyframe send failed"
-                        );
-                    }
-                });
-                Ok(())
+                endpoint
+                    .send_reliable_message(reliable_message)
+                    .await
+                    .with_context(|| {
+                        format!("failed to send LAN QUIC reliable media frame {frame_id}")
+                    })
             } else {
                 (|| -> Result<()> {
                     let fragments = fragment_access_unit(
@@ -3463,6 +3463,20 @@ fn media_frame_interval(profile: &MediaProfile) -> Duration {
     Duration::from_micros((1_000_000 / u64::from(profile.fps.max(1))).max(1))
 }
 
+fn schedule_next_media_frame(
+    now: Instant,
+    next_frame_at: &mut Instant,
+    frame_interval: Duration,
+) -> Option<Instant> {
+    if now >= *next_frame_at && now.duration_since(*next_frame_at) > frame_interval {
+        *next_frame_at = now;
+    }
+
+    let delay_until = (*next_frame_at > now).then_some(*next_frame_at);
+    *next_frame_at += frame_interval;
+    delay_until
+}
+
 #[cfg(test)]
 fn media_payload_bytes(profile: &MediaProfile) -> usize {
     ((profile.bitrate_mbps as usize * 1_000_000 / 8) / profile.fps.max(1) as usize).max(1)
@@ -4669,6 +4683,43 @@ mod tests {
 
         assert_eq!((width, height), (480, 270));
         assert_eq!(rgb.len(), 480 * 270 * 3);
+    }
+
+    #[test]
+    fn media_frame_scheduler_does_not_add_processing_time_to_interval() {
+        let start = Instant::now();
+        let interval = Duration::from_millis(16);
+        let mut next_frame_at = start;
+
+        assert_eq!(
+            schedule_next_media_frame(start, &mut next_frame_at, interval),
+            None
+        );
+        assert_eq!(next_frame_at, start + interval);
+
+        assert_eq!(
+            schedule_next_media_frame(
+                start + Duration::from_millis(15),
+                &mut next_frame_at,
+                interval
+            ),
+            Some(start + interval)
+        );
+        assert_eq!(next_frame_at, start + interval + interval);
+    }
+
+    #[test]
+    fn media_frame_scheduler_resets_after_large_stall() {
+        let start = Instant::now();
+        let interval = Duration::from_millis(16);
+        let mut next_frame_at = start + interval;
+        let now = start + Duration::from_millis(80);
+
+        assert_eq!(
+            schedule_next_media_frame(now, &mut next_frame_at, interval),
+            None
+        );
+        assert_eq!(next_frame_at, now + interval);
     }
 
     #[tokio::test]
