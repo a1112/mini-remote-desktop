@@ -234,7 +234,7 @@ struct DecodedPreviewFrame {
     width: u32,
     height: u32,
     pixel_format: String,
-    rgb24: Vec<u8>,
+    data_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -263,6 +263,8 @@ pub struct DecodedVideoFrameStats {
     pub encoded_bytes: u32,
     pub pixel_format: String,
     pub payload_hash: String,
+    pub preview_width: Option<u32>,
+    pub preview_height: Option<u32>,
     pub rgb24: Option<Vec<u8>>,
 }
 
@@ -341,11 +343,14 @@ impl ProbeRegistry {
         stats.last_media_timestamp_us = Some(frame.timestamp_us);
         stats.last_media_payload_hash = Some(frame.payload_hash);
         if let Some(rgb24) = frame.rgb24 {
+            let preview_width = frame.preview_width.unwrap_or(frame.width);
+            let preview_height = frame.preview_height.unwrap_or(frame.height);
+            let data_url = encode_rgb24_png_data_url(preview_width, preview_height, &rgb24);
             stats.latest_frame = Some(DecodedPreviewFrame {
-                width: frame.width,
-                height: frame.height,
+                width: preview_width,
+                height: preview_height,
                 pixel_format: frame.pixel_format,
-                rgb24,
+                data_url,
             });
         }
         stats.last_error = None;
@@ -440,9 +445,10 @@ impl ProbeRegistry {
             last_media_sequence: stats.last_media_sequence,
             last_media_timestamp_us: stats.last_media_timestamp_us,
             last_media_payload_hash: stats.last_media_payload_hash.clone(),
-            latest_frame_data_url: stats.latest_frame.as_ref().and_then(|frame| {
-                encode_rgb24_png_data_url(frame.width, frame.height, &frame.rgb24)
-            }),
+            latest_frame_data_url: stats
+                .latest_frame
+                .as_ref()
+                .and_then(|frame| frame.data_url.clone()),
             latest_frame_width: stats.latest_frame.as_ref().map(|frame| frame.width),
             latest_frame_height: stats.latest_frame.as_ref().map(|frame| frame.height),
             latest_frame_pixel_format: stats
@@ -758,6 +764,8 @@ mod tests {
                 encoded_bytes: 1024,
                 pixel_format: "rgb24".to_string(),
                 payload_hash: "fnv1a64:preview".to_string(),
+                preview_width: Some(2),
+                preview_height: Some(2),
                 rgb24: Some(vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255]),
             },
             3_000,
@@ -798,6 +806,8 @@ mod tests {
                 encoded_bytes: 2048,
                 pixel_format: "cpu_nv12".to_string(),
                 payload_hash: "fnv1a64:encoded".to_string(),
+                preview_width: None,
+                preview_height: None,
                 rgb24: None,
             },
             4_000,

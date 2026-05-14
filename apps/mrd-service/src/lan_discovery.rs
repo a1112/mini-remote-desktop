@@ -67,6 +67,9 @@ const LAN_MEDIA_ENVELOPE_HEADER_BYTES: usize = 48;
 const LAN_MEDIA_PAYLOAD_H264_ACCESS_UNIT: u8 = 1;
 const LAN_MEDIA_PAYLOAD_PROBE_FRAME: u8 = 2;
 const LAN_MEDIA_CODEC_H264: u8 = 1;
+const LAN_PREVIEW_FRAME_INTERVAL: u64 = 120;
+const LAN_PREVIEW_MAX_WIDTH: u32 = 480;
+const LAN_PREVIEW_MAX_HEIGHT: u32 = 270;
 
 #[derive(Debug, Clone)]
 pub struct LanDiscoveryConfig {
@@ -1067,7 +1070,7 @@ async fn accept_lan_remote_session(
         Ok(value) => value,
         Err(error) => return LanRemoteAcceptResult::rejected(error.to_string()),
     };
-    close_existing_lan_sender_sessions_for_source(app_state, &source_device_id, &session_id).await;
+    close_existing_lan_sender_sessions(app_state, &session_id).await;
 
     let (listener, bootstrap) = match QuinnServerListener::bind("0.0.0.0:0").await {
         Ok(value) => value,
@@ -1468,9 +1471,8 @@ async fn close_existing_lan_receiver_sessions_for_target(
     .await;
 }
 
-async fn close_existing_lan_sender_sessions_for_source(
+async fn close_existing_lan_sender_sessions(
     app_state: &Arc<AppState>,
-    source_device_id: &DeviceId,
     next_session_id: &SessionId,
 ) {
     let stale_sessions = {
@@ -1480,8 +1482,8 @@ async fn close_existing_lan_sender_sessions_for_source(
             .into_iter()
             .filter(|snapshot| {
                 snapshot.session_id != *next_session_id
-                    && snapshot.source_device_id.as_ref() == Some(source_device_id)
                     && snapshot.sender_active
+                    && normalize_transport_kind(&snapshot.transport) == "quic"
                     && !matches!(snapshot.lifecycle_state.as_str(), "closed" | "failed")
             })
             .map(|snapshot| snapshot.session_id)
@@ -2447,9 +2449,9 @@ async fn record_lan_decoded_frames(
         let height = decoded_frame.height as u32;
         let decoded_pixel_format = decoded_frame_pixel_format(&decoded_frame);
         let payload_hash = format!("fnv1a64:{:016x}", fnv1a64(encoded_payload));
-        let preview_rgb24 = if should_update_lan_preview(sequence) {
-            match decoded_frame_to_rgb24(decoded_frame) {
-                Ok((_width, _height, rgb24)) => Some(rgb24),
+        let preview_frame = if should_update_lan_preview(sequence) {
+            match decoded_frame_to_preview_rgb24(decoded_frame) {
+                Ok(preview_frame) => Some(preview_frame),
                 Err(error) => {
                     app_state.probes.lock().await.record_probe_drop(
                         session_id,
@@ -2463,6 +2465,9 @@ async fn record_lan_decoded_frames(
         } else {
             None
         };
+        let (preview_width, preview_height, preview_rgb24) = preview_frame
+            .map(|(width, height, rgb24)| (Some(width), Some(height), Some(rgb24)))
+            .unwrap_or((None, None, None));
 
         app_state.probes.lock().await.record_decoded_video_frame(
             session_id,
@@ -2480,6 +2485,8 @@ async fn record_lan_decoded_frames(
                     .map(|_| "rgb24".to_string())
                     .unwrap_or(decoded_pixel_format),
                 payload_hash,
+                preview_width,
+                preview_height,
                 rgb24: preview_rgb24,
             },
             now_ms(),
@@ -3088,7 +3095,7 @@ fn find_h264_start_code(payload: &[u8], from: usize) -> Option<(usize, usize)> {
 }
 
 fn should_update_lan_preview(sequence: u64) -> bool {
-    sequence <= 1 || sequence % 30 == 0
+    sequence <= 1 || sequence % LAN_PREVIEW_FRAME_INTERVAL == 0
 }
 
 fn decoded_frame_pixel_format(frame: &DecodedFrame) -> String {
@@ -3140,6 +3147,48 @@ fn decoded_frame_to_rgb24(frame: DecodedFrame) -> Result<(u32, u32, Vec<u8>)> {
     };
 
     Ok((frame.width as u32, frame.height as u32, rgb))
+}
+
+fn decoded_frame_to_preview_rgb24(frame: DecodedFrame) -> Result<(u32, u32, Vec<u8>)> {
+    let (width, height, rgb) = decoded_frame_to_rgb24(frame)?;
+    let (target_width, target_height) =
+        preview_dimensions(width, height, LAN_PREVIEW_MAX_WIDTH, LAN_PREVIEW_MAX_HEIGHT);
+    if target_width == width && target_height == height {
+        return Ok((width, height, rgb));
+    }
+
+    let source_width = width as usize;
+    let source_height = height as usize;
+    let target_width = target_width as usize;
+    let target_height = target_height as usize;
+    let mut scaled = Vec::with_capacity(target_width * target_height * 3);
+    for y in 0..target_height {
+        let source_y = y * source_height / target_height;
+        for x in 0..target_width {
+            let source_x = x * source_width / target_width;
+            let offset = (source_y * source_width + source_x) * 3;
+            scaled.extend_from_slice(&rgb[offset..offset + 3]);
+        }
+    }
+
+    Ok((target_width as u32, target_height as u32, scaled))
+}
+
+fn preview_dimensions(width: u32, height: u32, max_width: u32, max_height: u32) -> (u32, u32) {
+    if width == 0 || height == 0 {
+        return (1, 1);
+    }
+    if width <= max_width && height <= max_height {
+        return (width, height);
+    }
+
+    let scale = (max_width.max(1) as f64 / width as f64)
+        .min(max_height.max(1) as f64 / height as f64)
+        .min(1.0);
+    (
+        ((width as f64 * scale).round() as u32).max(1),
+        ((height as f64 * scale).round() as u32).max(1),
+    )
 }
 
 fn nv12_to_rgb24(data: &[u8], pitch: usize, width: usize, height: usize) -> Result<Vec<u8>> {
@@ -4605,6 +4654,21 @@ mod tests {
         assert_eq!((width, height), (2, 2));
         assert_eq!(rgb.len(), 2 * 2 * 3);
         assert!(rgb.iter().all(|channel| *channel >= 250));
+    }
+
+    #[test]
+    fn decoded_preview_downscales_large_frames() {
+        let frame = DecodedFrame {
+            width: 1920,
+            height: 1080,
+            timestamp_us: 0,
+            data: DecodedFrameData::CpuRgb24(vec![128; 1920 * 1080 * 3]),
+        };
+
+        let (width, height, rgb) = decoded_frame_to_preview_rgb24(frame).unwrap();
+
+        assert_eq!((width, height), (480, 270));
+        assert_eq!(rgb.len(), 480 * 270 * 3);
     }
 
     #[tokio::test]
