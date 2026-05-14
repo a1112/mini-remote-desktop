@@ -1320,6 +1320,7 @@ async fn build_announcement(app_state: &Arc<AppState>) -> Option<LanAnnouncement
             LAN_QUIC_MEDIA_TRANSPORT.to_string(),
             LAN_QUIC_MEDIA_PROFILE_TRANSPORT.to_string(),
             LAN_QUIC_MEDIA_V2_TRANSPORT.to_string(),
+            LAN_QUIC_RELIABLE_MEDIA_TRANSPORT.to_string(),
             LAN_MEDIA_PROFILE_CONTROL_TRANSPORT.to_string(),
             LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT.to_string(),
         ],
@@ -1338,7 +1339,10 @@ fn service_build_id() -> String {
 }
 
 fn lan_media_capabilities() -> Vec<String> {
-    let mut capabilities = vec![LAN_QUIC_MEDIA_V2_TRANSPORT.to_string()];
+    let mut capabilities = vec![
+        LAN_QUIC_MEDIA_V2_TRANSPORT.to_string(),
+        LAN_QUIC_RELIABLE_MEDIA_TRANSPORT.to_string(),
+    ];
     #[cfg(windows)]
     {
         capabilities.extend([
@@ -1903,12 +1907,23 @@ async fn send_quic_media_loop(
                     payload: media_payload.into(),
                 }
                 .encode();
-                endpoint
-                    .send_reliable_message(reliable_message)
-                    .await
-                    .with_context(|| {
-                        format!("failed to send LAN QUIC reliable media frame {}", frame_id)
-                    })
+                let reliable_endpoint = endpoint.clone();
+                let reliable_session_id = session_id.clone();
+                let reliable_frame_id = frame_id;
+                tokio::spawn(async move {
+                    if let Err(error) = reliable_endpoint
+                        .send_reliable_message(reliable_message)
+                        .await
+                    {
+                        tracing::warn!(
+                            %error,
+                            session_id = %reliable_session_id.0,
+                            frame_id = reliable_frame_id,
+                            "LAN QUIC reliable keyframe send failed"
+                        );
+                    }
+                });
+                Ok(())
             } else {
                 (|| -> Result<()> {
                     let fragments = fragment_access_unit(
@@ -2111,12 +2126,12 @@ fn lan_media_reassembler_config() -> QuicAuReassemblerConfig {
 }
 
 fn should_send_access_unit_reliably(
-    _reliable_media_supported: bool,
-    _is_keyframe: bool,
+    reliable_media_supported: bool,
+    is_keyframe: bool,
     _payload_len: usize,
     _max_datagram_size: usize,
 ) -> bool {
-    false
+    reliable_media_supported && is_keyframe
 }
 
 async fn set_session_last_error(
@@ -2180,6 +2195,7 @@ async fn receive_quic_media_loop(
         .context("failed to create LAN media receiver decoder")?;
     let mut consecutive_decode_errors = 0_u32;
     let mut decoder_waits_for_keyframe = true;
+    let mut reliable_media_enabled = true;
     loop {
         if !session_allows_media(&app_state, &session_id).await {
             return Ok(());
@@ -2190,8 +2206,19 @@ async fn receive_quic_media_loop(
             result = datagram_endpoint.read_datagram() => {
                 result.context("failed to read LAN QUIC media datagram")?
             }
-            result = reliable_endpoint.read_reliable_message(LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES) => {
-                result.context("failed to read LAN QUIC reliable media frame")?
+            result = reliable_endpoint.read_reliable_message(LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES), if reliable_media_enabled => {
+                match result {
+                    Ok(message) => message,
+                    Err(error) => {
+                        reliable_media_enabled = false;
+                        tracing::warn!(
+                            %error,
+                            session_id = %session_id.0,
+                            "LAN QUIC reliable media reader disabled"
+                        );
+                        continue;
+                    }
+                }
             }
         };
         if !session_allows_media(&app_state, &session_id).await {
@@ -3512,7 +3539,7 @@ mod tests {
         assert!(peer
             .media_capabilities
             .contains(&LAN_RENDER_D3D11_NATIVE_CAPABILITY.to_string()));
-        assert!(!peer
+        assert!(peer
             .media_capabilities
             .contains(&LAN_QUIC_RELIABLE_MEDIA_TRANSPORT.to_string()));
     }
@@ -3637,7 +3664,7 @@ mod tests {
         assert_eq!(snapshot.lifecycle_state, "listening");
         assert!(snapshot.sender_active);
         assert!(snapshot.local_listen_addr.is_some());
-        assert!(!app_state.peer_media_capabilities.lock().await.supports(
+        assert!(app_state.peer_media_capabilities.lock().await.supports(
             &SessionId("session-1".to_string()),
             LAN_QUIC_RELIABLE_MEDIA_TRANSPORT
         ));
@@ -4515,7 +4542,7 @@ mod tests {
 
     #[test]
     fn lan_quic_media_keeps_access_units_on_datagram_path() {
-        assert!(!should_send_access_unit_reliably(true, true, 1024, 1_200));
+        assert!(should_send_access_unit_reliably(true, true, 1024, 1_200));
         assert!(!should_send_access_unit_reliably(
             true,
             false,
