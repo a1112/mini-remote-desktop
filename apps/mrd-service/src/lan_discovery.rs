@@ -38,7 +38,6 @@ const LAN_MEDIA_TARGET_FPS: u32 = 144;
 const LAN_MEDIA_MAX_FPS: u32 = 249;
 const LAN_MEDIA_TARGET_BITRATE_MBPS: u32 = 64;
 const LAN_QUIC_FALLBACK_DATAGRAM_BYTES: usize = 1_200;
-const LAN_QUIC_RELIABLE_MEDIA_THRESHOLD_BYTES: usize = 8 * 1024;
 const LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES: usize = 4 * 1024 * 1024;
 const LAN_QUIC_MEDIA_TRANSPORT: &str = "quic_datagram";
 const LAN_QUIC_MEDIA_PROFILE_TRANSPORT: &str = "quic_datagram_2k144";
@@ -2118,12 +2117,10 @@ fn lan_media_reassembler_config() -> QuicAuReassemblerConfig {
 fn should_send_access_unit_reliably(
     reliable_media_supported: bool,
     is_keyframe: bool,
-    payload_len: usize,
-    max_datagram_size: usize,
+    _payload_len: usize,
+    _max_datagram_size: usize,
 ) -> bool {
-    reliable_media_supported
-        && (is_keyframe
-            || payload_len > LAN_QUIC_RELIABLE_MEDIA_THRESHOLD_BYTES.max(max_datagram_size))
+    reliable_media_supported && is_keyframe
 }
 
 async fn set_session_last_error(
@@ -4518,9 +4515,9 @@ mod tests {
     }
 
     #[test]
-    fn lan_quic_media_uses_reliable_transport_for_keyframes_and_large_units() {
+    fn lan_quic_media_uses_reliable_transport_for_keyframes_only() {
         assert!(should_send_access_unit_reliably(true, true, 1024, 1_200));
-        assert!(should_send_access_unit_reliably(
+        assert!(!should_send_access_unit_reliably(
             true,
             false,
             32 * 1024 + 1,
