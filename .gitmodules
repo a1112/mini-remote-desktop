@@ -10,3 +10,33 @@
 [submodule "subprojects/P2P_Test"]
 	path = subprojects/P2P_Test
 	url = https://github.com/a1112/P2P_Test
+[submodule "refs/projects/rustdesk"]
+	path = refs/projects/rustdesk
+	url = https://github.com/rustdesk/rustdesk.git
+[submodule "refs/projects/obs-studio"]
+	path = refs/projects/obs-studio
+	url = https://github.com/obsproject/obs-studio.git
+[submodule "refs/projects/scrcpy"]
+	path = refs/projects/scrcpy
+	url = https://github.com/Genymobile/scrcpy.git
+[submodule "refs/projects/syncthing"]
+	path = refs/projects/syncthing
+	url = https://github.com/syncthing/syncthing.git
+[submodule "refs/projects/guacamole-client"]
+	path = refs/projects/guacamole-client
+	url = https://github.com/apache/guacamole-client.git
+[submodule "refs/projects/guacamole-server"]
+	path = refs/projects/guacamole-server
+	url = https://github.com/apache/guacamole-server.git
+[submodule "refs/projects/xrdp"]
+	path = refs/projects/xrdp
+	url = https://github.com/neutrinolabs/xrdp.git
+[submodule "refs/projects/srt"]
+	path = refs/projects/srt
+	url = https://github.com/Haivision/srt.git
+[submodule "refs/projects/pipewire"]
+	path = refs/projects/pipewire
+	url = https://gitlab.freedesktop.org/pipewire/pipewire.git
+[submodule "refs/projects/kdeconnect-kde"]
+	path = refs/projects/kdeconnect-kde
+	url = https://invent.kde.org/network/kdeconnect-kde.git

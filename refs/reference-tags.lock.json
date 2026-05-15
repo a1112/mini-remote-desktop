@@ -1,0 +1,112 @@
+[
+  {
+    "id": "rustdesk",
+    "path": "refs/projects/rustdesk",
+    "url": "https://github.com/rustdesk/rustdesk.git",
+    "tag": "1.4.6",
+    "commit": "1abc897c451c8b5bbff3792509a7fef9d12f2ce3",
+    "category": "self-hosted-relay-product",
+    "license": "AGPL-3.0",
+    "priority": "P1",
+    "usage": "Self-hosting, relay, packaging, and product operations reference."
+  },
+  {
+    "id": "obs-studio",
+    "path": "refs/projects/obs-studio",
+    "url": "https://github.com/obsproject/obs-studio.git",
+    "tag": "32.1.2",
+    "commit": "fb4d98bf88fae5fc85cb11fc57f7c5e309282194",
+    "category": "capture-encode",
+    "license": "GPL-2.0-or-later",
+    "priority": "P0",
+    "usage": "Capture abstraction, source graph, encoder selection, and platform capability probing reference."
+  },
+  {
+    "id": "scrcpy",
+    "path": "refs/projects/scrcpy",
+    "url": "https://github.com/Genymobile/scrcpy.git",
+    "tag": "v3.3.4",
+    "commit": "fb6381f5b9bb96f3fa823d899f4c32de2ec84ab3",
+    "category": "low-latency-display",
+    "license": "Apache-2.0",
+    "priority": "P0",
+    "usage": "Low-latency display, input closure, queueing, and end-to-end test discipline reference."
+  },
+  {
+    "id": "syncthing",
+    "path": "refs/projects/syncthing",
+    "url": "https://github.com/syncthing/syncthing.git",
+    "tag": "v2.1.0",
+    "commit": "c0c401efebf27af58b91309b381d7d3eae870a64",
+    "category": "device-identity-pairing",
+    "license": "MPL-2.0",
+    "priority": "P0",
+    "usage": "Device identity, discovery, certificate trust, approval, revocation, and reconnect state reference."
+  },
+  {
+    "id": "guacamole-client",
+    "path": "refs/projects/guacamole-client",
+    "url": "https://github.com/apache/guacamole-client.git",
+    "tag": "1.6.0",
+    "commit": "0537c89cd783681b986ff8f8c4e0b97ec6873371",
+    "category": "browser-gateway",
+    "license": "Apache-2.0",
+    "priority": "P1",
+    "usage": "Browser gateway UI, session boundary, and gateway product shape reference."
+  },
+  {
+    "id": "guacamole-server",
+    "path": "refs/projects/guacamole-server",
+    "url": "https://github.com/apache/guacamole-server.git",
+    "tag": "1.6.0",
+    "commit": "1f664e08feae6e7d15d8146b78acab2e6fb470ae",
+    "category": "browser-gateway",
+    "license": "Apache-2.0",
+    "priority": "P1",
+    "usage": "guacd, libguac, and gateway-side protocol boundary reference."
+  },
+  {
+    "id": "xrdp",
+    "path": "refs/projects/xrdp",
+    "url": "https://github.com/neutrinolabs/xrdp.git",
+    "tag": "v0.10.6",
+    "commit": "440a538149561ec8e8e57552ab8f2e0e3f273cd5",
+    "category": "rdp-linux-session",
+    "license": "Apache-2.0",
+    "priority": "P1",
+    "usage": "RDP compatibility and Linux session management reference."
+  },
+  {
+    "id": "srt",
+    "path": "refs/projects/srt",
+    "url": "https://github.com/Haivision/srt.git",
+    "tag": "v1.5.5",
+    "commit": "b6b4ae990daa8193625a4ddeaeaed03023b23125",
+    "category": "degraded-network-video",
+    "license": "MPL-2.0",
+    "priority": "P0",
+    "usage": "Degraded-network video transport, latency/loss tradeoff, and benchmark scenario reference."
+  },
+  {
+    "id": "pipewire",
+    "path": "refs/projects/pipewire",
+    "url": "https://gitlab.freedesktop.org/pipewire/pipewire.git",
+    "tag": "1.6.5",
+    "commit": "55848f4260a2d2302f9f6bd304d82616976ef9af",
+    "category": "linux-wayland-capture",
+    "license": "MIT/LGPL-2.1-or-later",
+    "priority": "P0",
+    "usage": "Linux and Wayland capture graph, format negotiation, and source handling reference."
+  },
+  {
+    "id": "kdeconnect-kde",
+    "path": "refs/projects/kdeconnect-kde",
+    "url": "https://invent.kde.org/network/kdeconnect-kde.git",
+    "tag": "v26.04.1",
+    "commit": "479f73f93ed3e5c3c88588590219970224ff4a77",
+    "category": "pairing-device-capabilities",
+    "license": "GPL-2.0-or-later",
+    "priority": "P0",
+    "usage": "Pairing, device capability plugins, permissions, and virtual input reference."
+  }
+]
