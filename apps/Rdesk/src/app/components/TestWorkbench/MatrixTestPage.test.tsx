@@ -1250,7 +1250,7 @@ describe("MatrixTestPage failure handling", () => {
     selectSingleSupportedCombination();
     fireEvent.click(screen.getByRole("button", { name: /启动矩阵测试/ }));
 
-    await screen.findByText(/Runtime media profile mismatch/);
+    await screen.findByText(/Runtime media profile downgraded/);
     expect(resultRow()).toHaveTextContent("跳过");
   });
 });

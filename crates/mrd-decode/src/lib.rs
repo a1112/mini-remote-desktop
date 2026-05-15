@@ -1102,9 +1102,12 @@ impl<'a> BitReader<'a> {
 
 impl VideoDecoder for NvdecVideoDecoder {
     fn push_access_unit(&mut self, access_unit: &[u8]) -> Result<(), PipelineError> {
-        self.decoder
-            .push_access_unit(access_unit)
-            .map_err(|e| PipelineError::Message(format!("nvdec decode failed: {e}")))
+        self.decoder.push_access_unit(access_unit).map_err(|e| {
+            PipelineError::Message(format!(
+                "nvdec decode failed: {e}; diagnostics={:?}",
+                self.decoder.diagnostics()
+            ))
+        })
     }
 
     fn drain_decoded_frames(&mut self) -> Vec<CoreDecodedFrame> {

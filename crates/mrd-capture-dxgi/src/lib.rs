@@ -3,8 +3,9 @@ use mrd_pipeline_core::{
 };
 use scrap::{Capturer, Display};
 use std::{
+    ffi::c_void,
     io::ErrorKind,
-    thread,
+    mem, thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -30,6 +31,18 @@ use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication,
     IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
 };
+#[cfg(windows)]
+use windows::Win32::Graphics::Gdi::{
+    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
+    ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, SRCCOPY,
+};
+
+#[cfg(windows)]
+// Keep the media sender paced by the requested profile. When Desktop Duplication
+// has no new desktop update, capture_frame reuses the last shared texture.
+const DXGI_SHARED_ACQUIRE_TIMEOUT_MS: u32 = 0;
+#[cfg(windows)]
+const DXGI_SHARED_TEXTURE_RING_SIZE: usize = 3;
 
 pub struct DxgiDesktopCapture {
     capturer: Capturer,
@@ -107,7 +120,11 @@ pub struct DxgiSharedTextureCapture {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     duplication: IDXGIOutputDuplication,
-    shared_texture: Option<SharedBgraTexture>,
+    shared_textures: Vec<SharedBgraTexture>,
+    next_shared_texture_index: usize,
+    last_shared_texture_index: Option<usize>,
+    source_left: i32,
+    source_top: i32,
     source_width: usize,
     source_height: usize,
     width: usize,
@@ -179,7 +196,11 @@ impl DxgiSharedTextureCapture {
                     device,
                     context,
                     duplication,
-                    shared_texture: None,
+                    shared_textures: Vec::new(),
+                    next_shared_texture_index: 0,
+                    last_shared_texture_index: None,
+                    source_left: rect.left,
+                    source_top: rect.top,
                     source_width: width,
                     source_height: height,
                     width,
@@ -202,30 +223,49 @@ impl DxgiSharedTextureCapture {
     pub fn set_target_dimensions(&mut self, width: usize, height: usize) {
         self.width = width.clamp(2, self.source_width.max(2));
         self.height = height.clamp(2, self.source_height.max(2));
-        self.shared_texture = None;
+        self.shared_textures.clear();
+        self.next_shared_texture_index = 0;
+        self.last_shared_texture_index = None;
     }
 
-    fn ensure_shared_texture(&mut self) -> Result<&SharedBgraTexture, PipelineError> {
+    fn ensure_shared_textures(&mut self) -> Result<(), PipelineError> {
         let width = self.width as u32;
         let height = self.height as u32;
         let needs_new = self
-            .shared_texture
-            .as_ref()
-            .map(|texture| texture.width != width || texture.height != height)
-            .unwrap_or(true);
+            .shared_textures
+            .iter()
+            .any(|texture| texture.width != width || texture.height != height)
+            || self.shared_textures.len() != DXGI_SHARED_TEXTURE_RING_SIZE;
 
         if needs_new {
-            self.shared_texture = Some(
-                SharedBgraTexture::new(&self.device, width, height).map_err(|error| {
-                    PipelineError::message(format!("create shared BGRA texture failed: {error}"))
-                })?,
-            );
+            self.shared_textures.clear();
+            for _ in 0..DXGI_SHARED_TEXTURE_RING_SIZE {
+                self.shared_textures.push(
+                    SharedBgraTexture::new(&self.device, width, height).map_err(|error| {
+                        PipelineError::message(format!(
+                            "create shared BGRA texture failed: {error}"
+                        ))
+                    })?,
+                );
+            }
+            self.next_shared_texture_index = 0;
+            self.last_shared_texture_index = None;
         }
 
-        Ok(self
-            .shared_texture
-            .as_ref()
-            .expect("shared texture initialized"))
+        Ok(())
+    }
+
+    fn next_shared_texture(&mut self) -> Result<(isize, ID3D11Texture2D), PipelineError> {
+        self.ensure_shared_textures()?;
+        let len = self.shared_textures.len();
+        if len == 0 {
+            return Err(PipelineError::message("shared texture ring is empty"));
+        }
+        let index = self.next_shared_texture_index % len;
+        self.next_shared_texture_index = (index + 1) % len;
+        self.last_shared_texture_index = Some(index);
+        let shared = &self.shared_textures[index];
+        Ok((shared.shared_handle, shared.texture.clone()))
     }
 }
 
@@ -240,8 +280,11 @@ impl FrameCapture for DxgiSharedTextureCapture {
             let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
             let mut desktop_resource = None::<IDXGIResource>;
             let acquire = unsafe {
-                self.duplication
-                    .AcquireNextFrame(16, &mut frame_info, &mut desktop_resource)
+                self.duplication.AcquireNextFrame(
+                    DXGI_SHARED_ACQUIRE_TIMEOUT_MS,
+                    &mut frame_info,
+                    &mut desktop_resource,
+                )
             };
 
             match acquire {
@@ -251,7 +294,10 @@ impl FrameCapture for DxgiSharedTextureCapture {
                     return result;
                 }
                 Err(error) if error.code() == DXGI_ERROR_WAIT_TIMEOUT => {
-                    thread::sleep(Duration::from_millis(1));
+                    if let Some(frame) = self.last_shared_frame()? {
+                        return Ok(frame);
+                    }
+                    return self.seed_shared_texture_from_gdi();
                 }
                 Err(error) if error.code() == DXGI_ERROR_ACCESS_LOST => {
                     return Err(PipelineError::message("DXGI duplication access lost"));
@@ -268,6 +314,65 @@ impl FrameCapture for DxgiSharedTextureCapture {
 
 #[cfg(windows)]
 impl DxgiSharedTextureCapture {
+    fn seed_shared_texture_from_gdi(&mut self) -> Result<CapturedFrame, PipelineError> {
+        let width = self.width;
+        let height = self.height;
+        let bgra = capture_gdi_bgra_region(
+            self.source_left,
+            self.source_top,
+            self.source_width,
+            self.source_height,
+            width,
+            height,
+        )?;
+        let (shared_handle, shared_texture) = self.next_shared_texture()?;
+        let target_resource: ID3D11Resource = shared_texture.cast().map_err(|error| {
+            PipelineError::message(format!(
+                "cast seeded shared texture to resource failed: {error}"
+            ))
+        })?;
+        let row_pitch = width
+            .checked_mul(4)
+            .ok_or_else(|| PipelineError::message("seeded frame row pitch overflow"))?
+            as u32;
+        unsafe {
+            self.context.UpdateSubresource(
+                &target_resource,
+                0,
+                None,
+                bgra.as_ptr() as *const c_void,
+                row_pitch,
+                0,
+            );
+            self.context.Flush();
+        }
+
+        Ok(CapturedFrame::from_d3d11_shared_bgra(
+            width,
+            height,
+            now_us()?,
+            shared_handle,
+            row_pitch,
+        ))
+    }
+
+    fn last_shared_frame(&self) -> Result<Option<CapturedFrame>, PipelineError> {
+        let Some(index) = self.last_shared_texture_index else {
+            return Ok(None);
+        };
+        let Some(shared) = self.shared_textures.get(index) else {
+            return Ok(None);
+        };
+
+        Ok(Some(CapturedFrame::from_d3d11_shared_bgra(
+            self.width,
+            self.height,
+            now_us()?,
+            shared.shared_handle,
+            self.width.saturating_mul(4) as u32,
+        )))
+    }
+
     fn copy_acquired_frame_to_shared(
         &mut self,
         desktop_resource: Option<IDXGIResource>,
@@ -285,13 +390,7 @@ impl DxgiSharedTextureCapture {
         let height = self.height;
         let source_width = self.source_width;
         let source_height = self.source_height;
-        self.ensure_shared_texture()?;
-        let shared = self
-            .shared_texture
-            .as_ref()
-            .ok_or_else(|| PipelineError::message("shared texture not initialized"))?;
-        let shared_handle = shared.shared_handle;
-        let shared_texture = shared.texture.clone();
+        let (shared_handle, shared_texture) = self.next_shared_texture()?;
         let target_resource: ID3D11Resource = shared_texture.cast().map_err(|error| {
             PipelineError::message(format!("cast shared texture to resource failed: {error}"))
         })?;
@@ -333,6 +432,110 @@ impl DxgiSharedTextureCapture {
             shared_handle,
             width.saturating_mul(4) as u32,
         ))
+    }
+}
+
+#[cfg(windows)]
+fn capture_gdi_bgra_region(
+    source_left: i32,
+    source_top: i32,
+    source_width: usize,
+    source_height: usize,
+    target_width: usize,
+    target_height: usize,
+) -> Result<Vec<u8>, PipelineError> {
+    let target_width_i32 = i32::try_from(target_width)
+        .map_err(|_| PipelineError::message("GDI target width exceeds i32"))?;
+    let target_height_i32 = i32::try_from(target_height)
+        .map_err(|_| PipelineError::message("GDI target height exceeds i32"))?;
+    let (source_x, source_y) =
+        centered_crop_origin(source_width, source_height, target_width, target_height);
+    let source_x = source_left.saturating_add(source_x);
+    let source_y = source_top.saturating_add(source_y);
+
+    unsafe {
+        let screen_dc = GetDC(None);
+        if screen_dc.is_invalid() {
+            return Err(PipelineError::message("GetDC returned invalid screen DC"));
+        }
+
+        let memory_dc = CreateCompatibleDC(Some(screen_dc));
+        if memory_dc.is_invalid() {
+            let _ = ReleaseDC(None, screen_dc);
+            return Err(PipelineError::message(
+                "CreateCompatibleDC returned invalid memory DC",
+            ));
+        }
+
+        let bitmap = CreateCompatibleBitmap(screen_dc, target_width_i32, target_height_i32);
+        if bitmap.is_invalid() {
+            let _ = DeleteDC(memory_dc);
+            let _ = ReleaseDC(None, screen_dc);
+            return Err(PipelineError::message(
+                "CreateCompatibleBitmap returned invalid bitmap",
+            ));
+        }
+
+        let previous_object = SelectObject(memory_dc, bitmap.into());
+        if previous_object.is_invalid() {
+            let _ = DeleteObject(bitmap.into());
+            let _ = DeleteDC(memory_dc);
+            let _ = ReleaseDC(None, screen_dc);
+            return Err(PipelineError::message("SelectObject failed for GDI bitmap"));
+        }
+
+        let blit_result = BitBlt(
+            memory_dc,
+            0,
+            0,
+            target_width_i32,
+            target_height_i32,
+            Some(screen_dc),
+            source_x,
+            source_y,
+            SRCCOPY,
+        );
+
+        let mut pixels = vec![0_u8; target_width * target_height * 4];
+        let mut bitmap_info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: target_width_i32,
+                biHeight: -target_height_i32,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                biSizeImage: pixels.len() as u32,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let read_lines = if blit_result.is_ok() {
+            GetDIBits(
+                memory_dc,
+                bitmap,
+                0,
+                target_height as u32,
+                Some(pixels.as_mut_ptr() as *mut c_void),
+                &mut bitmap_info,
+                DIB_RGB_COLORS,
+            )
+        } else {
+            0
+        };
+
+        let _ = SelectObject(memory_dc, previous_object);
+        let _ = DeleteObject(bitmap.into());
+        let _ = DeleteDC(memory_dc);
+        let _ = ReleaseDC(None, screen_dc);
+
+        blit_result.map_err(|error| PipelineError::message(format!("BitBlt failed: {error}")))?;
+        if read_lines == 0 {
+            return Err(PipelineError::message("GetDIBits returned no scanlines"));
+        }
+
+        Ok(pixels)
     }
 }
 
@@ -425,6 +628,20 @@ fn repack_bgra(frame: &[u8], width: usize, height: usize) -> Result<Vec<u8>, Pip
     Ok(packed)
 }
 
+fn centered_crop_origin(
+    source_width: usize,
+    source_height: usize,
+    target_width: usize,
+    target_height: usize,
+) -> (i32, i32) {
+    let x = source_width.saturating_sub(target_width) / 2;
+    let y = source_height.saturating_sub(target_height) / 2;
+    (
+        i32::try_from(x).unwrap_or(i32::MAX),
+        i32::try_from(y).unwrap_or(i32::MAX),
+    )
+}
+
 fn now_us() -> Result<u64, PipelineError> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -434,7 +651,7 @@ fn now_us() -> Result<u64, PipelineError> {
 
 #[cfg(test)]
 mod tests {
-    use super::repack_bgra;
+    use super::{centered_crop_origin, repack_bgra};
 
     #[test]
     fn repack_bgra_strips_padding_stride() {
@@ -448,5 +665,12 @@ mod tests {
             packed,
             vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
         );
+    }
+
+    #[test]
+    fn centered_crop_origin_uses_middle_of_larger_source() {
+        assert_eq!(centered_crop_origin(2560, 1600, 1920, 1080), (320, 260));
+        assert_eq!(centered_crop_origin(1920, 1080, 1920, 1080), (0, 0));
+        assert_eq!(centered_crop_origin(1280, 720, 1920, 1080), (0, 0));
     }
 }

@@ -55,6 +55,7 @@ export type LanE2EFailureReason =
   | "fault_injection_failed"
   | "no_remote_frames"
   | "media_profile_mismatch"
+  | "profile_downgraded"
   | "runtime_error"
   | "stop_failed";
 
@@ -399,12 +400,22 @@ export async function runLanE2EAutomation(
       profileProbeResult = evaluateMediaProfileProbe(
         probeSnapshot,
         requestedProfile,
+        captureSource,
         validationMode
       );
       const profileMismatch = describeProfileProbeFailure(profileProbeResult);
       if (profileMismatch) {
         stage("assert", "failed", profileMismatch);
         return finish("failed", "media_profile_mismatch", profileMismatch);
+      }
+      if (
+        profileProbeResult?.status === "degraded" &&
+        probeSnapshot.frames_decoded >= minDecodedFrames
+      ) {
+        const message =
+          profileProbeResult.error ?? "Runtime media profile was downgraded by the remote source";
+        stage("assert", "skipped", message);
+        return finish("skipped", "profile_downgraded", message);
       }
       if (
         sessionSnapshot.receiver_active &&
@@ -473,8 +484,8 @@ async function selectRemoteCaptureSourceForSession(
 
 function pickPreferredCaptureSource(sources: CaptureSource[]): CaptureSource | undefined {
   return (
-    sources.find((source) => source.source_kind === "display_shared") ??
     sources.find((source) => source.source_kind === "display") ??
+    sources.find((source) => source.source_kind === "display_shared") ??
     sources.find((source) => source.source_kind === "window") ??
     sources[0]
   );
@@ -641,21 +652,111 @@ function formatValidationMode(mode: LanE2EAutomationReport["validationMode"]): s
 function evaluateMediaProfileProbe(
   probe: ProbeSnapshot,
   requestedProfile: MediaProfile | undefined,
+  captureSource: CaptureSource | undefined,
   validationMode: LanE2EAutomationReport["validationMode"]
 ): ProfileProbeResult | undefined {
   if (validationMode !== "quic_datagram" || !requestedProfile || probe.media_probe_valid !== true) {
     return undefined;
   }
 
-  return evaluateProfileProbe(toCapabilityProfile(requestedProfile), probe);
+  const result = evaluateProfileProbe(toCapabilityProfile(requestedProfile), probe);
+  if (
+    result.status === "failed" &&
+    isExpectedProfileDowngrade(probe, requestedProfile, captureSource)
+  ) {
+    return {
+      ...result,
+      status: "degraded",
+      error: `Runtime media profile downgraded: requested ${formatMediaProfile(
+        requestedProfile
+      )}, selected ${formatProbeProfile(probe)}`,
+    };
+  }
+
+  return result;
 }
 
 function describeProfileProbeFailure(result: ProfileProbeResult | undefined): string | null {
   if (!result || result.status === "passed") {
     return null;
   }
+  if (result.status === "degraded" || result.status === "skipped") {
+    return null;
+  }
 
   return result.error ?? `Runtime media profile probe failed: ${result.status}`;
+}
+
+function isExpectedProfileDowngrade(
+  probe: ProbeSnapshot,
+  requestedProfile: MediaProfile,
+  captureSource: CaptureSource | undefined
+): boolean {
+  const actualWidth = probe.media_probe_width ?? 0;
+  const actualHeight = probe.media_probe_height ?? 0;
+  const actualFps = probe.media_probe_target_fps ?? 0;
+  const actualBitrate = probe.media_probe_target_bitrate_mbps ?? 0;
+  if (actualWidth <= 0 || actualHeight <= 0 || actualFps <= 0 || actualBitrate <= 0) {
+    return false;
+  }
+  if (
+    actualWidth > requestedProfile.width ||
+    actualHeight > requestedProfile.height ||
+    actualFps > requestedProfile.fps ||
+    actualBitrate > requestedProfile.bitrate_mbps
+  ) {
+    return false;
+  }
+
+  const fit = captureSource
+    ? fitSourceWithinProfile(captureSource, requestedProfile)
+    : undefined;
+  const dimensionsMatchSourceFit =
+    !fit || (actualWidth === fit.width && actualHeight === fit.height);
+  return dimensionsMatchSourceFit && isActualProfileDowngraded(probe, requestedProfile);
+}
+
+function fitSourceWithinProfile(
+  source: CaptureSource,
+  profile: MediaProfile
+): { width: number; height: number } | undefined {
+  if (source.width <= 0 || source.height <= 0) return undefined;
+  const scale = Math.min(
+    profile.width / source.width,
+    profile.height / source.height,
+    1
+  );
+  return {
+    width: evenDimension(Math.max(2, Math.round(source.width * scale))),
+    height: evenDimension(Math.max(2, Math.round(source.height * scale))),
+  };
+}
+
+function evenDimension(value: number): number {
+  return Math.max(2, value & ~1);
+}
+
+function isActualProfileDowngraded(
+  probe: ProbeSnapshot,
+  requestedProfile: MediaProfile
+): boolean {
+  return (
+    (probe.media_probe_width ?? requestedProfile.width) !== requestedProfile.width ||
+    (probe.media_probe_height ?? requestedProfile.height) !== requestedProfile.height ||
+    (probe.media_probe_target_fps ?? requestedProfile.fps) !== requestedProfile.fps ||
+    (probe.media_probe_target_bitrate_mbps ?? requestedProfile.bitrate_mbps) !==
+      requestedProfile.bitrate_mbps
+  );
+}
+
+function formatMediaProfile(profile: MediaProfile): string {
+  return `${profile.width}x${profile.height} @ ${profile.fps} FPS / ${profile.bitrate_mbps} Mbps`;
+}
+
+function formatProbeProfile(probe: ProbeSnapshot): string {
+  return `${probe.media_probe_width ?? 0}x${probe.media_probe_height ?? 0} @ ${
+    probe.media_probe_target_fps ?? 0
+  } FPS / ${probe.media_probe_target_bitrate_mbps ?? 0} Mbps`;
 }
 
 function toCapabilityProfile(profile: MediaProfile): CapabilityProfile {

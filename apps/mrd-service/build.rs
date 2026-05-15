@@ -1,5 +1,25 @@
 fn main() {
+    emit_git_commit_env();
     add_macos_swift_runtime_rpaths();
+}
+
+fn emit_git_commit_env() {
+    println!("cargo:rerun-if-changed=.git/HEAD");
+
+    let Ok(output) = std::process::Command::new("git")
+        .args(["rev-parse", "--short=12", "HEAD"])
+        .output()
+    else {
+        return;
+    };
+    if !output.status.success() {
+        return;
+    }
+
+    let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !commit.is_empty() {
+        println!("cargo:rustc-env=GIT_COMMIT={commit}");
+    }
 }
 
 fn add_macos_swift_runtime_rpaths() {

@@ -251,6 +251,39 @@ fn nvdec_decoder_can_emit_nv12_frame() {
 
 #[test]
 #[cfg(windows)]
+fn nvdec_decoder_can_decode_after_thread_handoff() {
+    let decoder = match NvdecDecoder::new_with_output_mode(NvdecOutputMode::CpuNv12) {
+        Ok(decoder) => decoder,
+        Err(error) => {
+            assert!(
+                error.contains("nvdec")
+                    || error.contains("cuda")
+                    || error.contains("cu")
+                    || error.contains("failed"),
+                "unexpected constructor error: {error}"
+            );
+            return;
+        }
+    };
+
+    let access_unit = encoded_access_unit();
+    let result = std::thread::spawn(move || {
+        let mut decoder = decoder;
+        decoder.push_access_unit(access_unit.as_slice())?;
+        Ok::<usize, String>(decoder.drain_decoded_frames().len())
+    })
+    .join()
+    .expect("nvdec worker thread should not panic");
+
+    let frame_count = result.expect("valid h264 access unit should decode after thread handoff");
+    assert!(
+        frame_count > 0,
+        "nvdec should emit at least one frame after thread handoff"
+    );
+}
+
+#[test]
+#[cfg(windows)]
 fn nvdec_decoder_shared_texture_flag_emits_shared_frame() {
     let mut decoder = match NvdecDecoder::new_with_output_mode(NvdecOutputMode::CpuNv12) {
         Ok(decoder) => decoder,

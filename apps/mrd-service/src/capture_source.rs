@@ -665,7 +665,7 @@ mod tests {
     }
 
     #[test]
-    fn preferred_capture_source_picks_fullscreen_shared_before_window() {
+    fn preferred_capture_source_picks_shared_display_before_cpu_sender_path() {
         let sources = vec![
             source("windows:window:0x1234", "window"),
             source("windows:display:0", "display"),

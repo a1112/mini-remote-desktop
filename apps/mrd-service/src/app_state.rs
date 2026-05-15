@@ -10,15 +10,19 @@ use image::{codecs::png::PngEncoder, ColorType, ImageEncoder};
 use mrd_application::ports::SessionSnapshot;
 use mrd_ipc::{
     AttachedRenderSurface, CaptureSourceSelection, MediaPipelineSnapshot, MediaProfileNegotiation,
+    MediaStageMetrics,
 };
 use mrd_proto::{DeviceId, SessionId};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::{sync::Mutex, task::AbortHandle};
+
+const MEDIA_STAGE_SAMPLE_LIMIT: usize = 240;
 
 /// Session registry tracking all active sessions
 #[derive(Debug, Default)]
 pub struct SessionRegistry {
-    sessions: std::collections::HashMap<SessionId, SessionSnapshot>,
+    sessions: HashMap<SessionId, SessionSnapshot>,
 }
 
 impl SessionRegistry {
@@ -46,13 +50,13 @@ impl SessionRegistry {
 /// Probe telemetry accumulated from LAN data-plane probe frames.
 #[derive(Debug, Default)]
 pub struct ProbeRegistry {
-    probes: std::collections::HashMap<SessionId, SessionProbeStats>,
+    probes: HashMap<SessionId, SessionProbeStats>,
 }
 
 /// Runtime media profile negotiation state keyed by session.
 #[derive(Debug, Default)]
 pub struct MediaProfileRegistry {
-    profiles: std::collections::HashMap<SessionId, MediaProfileNegotiation>,
+    profiles: HashMap<SessionId, MediaProfileNegotiation>,
 }
 
 impl MediaProfileRegistry {
@@ -72,7 +76,7 @@ impl MediaProfileRegistry {
 /// Runtime capture source selection state keyed by session.
 #[derive(Debug, Default)]
 pub struct CaptureSourceRegistry {
-    selections: std::collections::HashMap<SessionId, CaptureSourceSelection>,
+    selections: HashMap<SessionId, CaptureSourceSelection>,
 }
 
 impl CaptureSourceRegistry {
@@ -89,19 +93,44 @@ impl CaptureSourceRegistry {
     }
 }
 
+/// Peer media capabilities observed for each active session.
+#[derive(Debug, Default)]
+pub struct SessionPeerMediaCapabilityRegistry {
+    capabilities: HashMap<SessionId, Vec<String>>,
+}
+
+impl SessionPeerMediaCapabilityRegistry {
+    pub fn set(&mut self, session_id: SessionId, capabilities: Vec<String>) {
+        self.capabilities.insert(session_id, capabilities);
+    }
+
+    pub fn supports(&self, session_id: &SessionId, capability: &str) -> bool {
+        self.capabilities
+            .get(session_id)
+            .map(|capabilities| capabilities.iter().any(|value| value == capability))
+            .unwrap_or(false)
+    }
+
+    pub fn remove(&mut self, session_id: &SessionId) -> Option<Vec<String>> {
+        self.capabilities.remove(session_id)
+    }
+}
+
 /// Runtime receiver media pipeline state keyed by session.
 #[derive(Debug, Default)]
 pub struct MediaPipelineRegistry {
-    pipelines: std::collections::HashMap<SessionId, MediaPipelineState>,
+    pipelines: HashMap<SessionId, MediaPipelineState>,
 }
 
 #[derive(Debug, Clone, Default)]
 struct MediaPipelineState {
-    attached_surfaces: std::collections::HashMap<String, AttachedRenderSurface>,
+    attached_surfaces: HashMap<String, AttachedRenderSurface>,
     active_decoder: Option<String>,
     active_renderer: Option<String>,
     queue_depth: u32,
     dropped_frames: u64,
+    stage_samples: HashMap<String, VecDeque<f64>>,
+    stage_summaries: HashMap<String, MediaStageMetrics>,
 }
 
 impl MediaPipelineRegistry {
@@ -139,8 +168,42 @@ impl MediaPipelineRegistry {
         state.dropped_frames = state.dropped_frames.saturating_add(count);
     }
 
+    pub fn record_stage_duration_ms(
+        &mut self,
+        session_id: SessionId,
+        stage: impl Into<String>,
+        duration_ms: f64,
+    ) {
+        if !duration_ms.is_finite() || duration_ms < 0.0 {
+            return;
+        }
+        let samples = self
+            .pipelines
+            .entry(session_id)
+            .or_default()
+            .stage_samples
+            .entry(stage.into())
+            .or_default();
+        samples.push_back(duration_ms);
+        while samples.len() > MEDIA_STAGE_SAMPLE_LIMIT {
+            samples.pop_front();
+        }
+    }
+
+    pub fn set_stage_metrics(
+        &mut self,
+        session_id: SessionId,
+        metrics: impl IntoIterator<Item = MediaStageMetrics>,
+    ) {
+        let state = self.pipelines.entry(session_id).or_default();
+        for metric in metrics {
+            state.stage_summaries.insert(metric.stage.clone(), metric);
+        }
+    }
+
     pub fn snapshot(&self, session_id: &SessionId) -> MediaPipelineSnapshot {
         let state = self.pipelines.get(session_id);
+        let stage_metrics = state.map(media_pipeline_stage_metrics).unwrap_or_default();
         MediaPipelineSnapshot {
             session_id: session_id.clone(),
             attached_surfaces: state
@@ -150,7 +213,7 @@ impl MediaPipelineRegistry {
             active_renderer: state.and_then(|state| state.active_renderer.clone()),
             queue_depth: state.map_or(0, |state| state.queue_depth),
             dropped_frames: state.map_or(0, |state| state.dropped_frames),
-            stage_metrics: Vec::new(),
+            stage_metrics,
         }
     }
 
@@ -159,10 +222,39 @@ impl MediaPipelineRegistry {
     }
 }
 
+fn media_pipeline_stage_metrics(state: &MediaPipelineState) -> Vec<MediaStageMetrics> {
+    let mut metrics = state.stage_summaries.clone();
+    for (stage, samples) in &state.stage_samples {
+        metrics.insert(
+            stage.clone(),
+            MediaStageMetrics {
+                stage: stage.clone(),
+                p50_ms: percentile(samples, 0.50),
+                p95_ms: percentile(samples, 0.95),
+            },
+        );
+    }
+
+    let mut metrics = metrics.into_values().collect::<Vec<_>>();
+    metrics.sort_by(|left, right| left.stage.cmp(&right.stage));
+    metrics
+}
+
+fn percentile(samples: &VecDeque<f64>, quantile: f64) -> Option<f64> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut sorted = samples.iter().copied().collect::<Vec<_>>();
+    sorted.sort_by(|left, right| left.total_cmp(right));
+    let last = sorted.len().saturating_sub(1);
+    let index = ((last as f64) * quantile.clamp(0.0, 1.0)).round() as usize;
+    sorted.get(index).copied()
+}
+
 /// Runtime media tasks keyed by session.
 #[derive(Default)]
 pub struct MediaTaskRegistry {
-    tasks: std::collections::HashMap<SessionId, Vec<AbortHandle>>,
+    tasks: HashMap<SessionId, Vec<AbortHandle>>,
 }
 
 impl MediaTaskRegistry {
@@ -211,7 +303,7 @@ struct DecodedPreviewFrame {
     width: u32,
     height: u32,
     pixel_format: String,
-    rgb24: Vec<u8>,
+    data_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -240,6 +332,8 @@ pub struct DecodedVideoFrameStats {
     pub encoded_bytes: u32,
     pub pixel_format: String,
     pub payload_hash: String,
+    pub preview_width: Option<u32>,
+    pub preview_height: Option<u32>,
     pub rgb24: Option<Vec<u8>>,
 }
 
@@ -318,11 +412,14 @@ impl ProbeRegistry {
         stats.last_media_timestamp_us = Some(frame.timestamp_us);
         stats.last_media_payload_hash = Some(frame.payload_hash);
         if let Some(rgb24) = frame.rgb24 {
+            let preview_width = frame.preview_width.unwrap_or(frame.width);
+            let preview_height = frame.preview_height.unwrap_or(frame.height);
+            let data_url = encode_rgb24_png_data_url(preview_width, preview_height, &rgb24);
             stats.latest_frame = Some(DecodedPreviewFrame {
-                width: frame.width,
-                height: frame.height,
+                width: preview_width,
+                height: preview_height,
                 pixel_format: frame.pixel_format,
-                rgb24,
+                data_url,
             });
         }
         stats.last_error = None;
@@ -342,6 +439,20 @@ impl ProbeRegistry {
         stats.first_seen_ms.get_or_insert(now_ms);
         stats.last_seen_ms = Some(now_ms);
         stats.last_error = Some(error.into());
+    }
+
+    pub fn record_transient_frame_drop(
+        &mut self,
+        session_id: &SessionId,
+        bytes_received: u64,
+        now_ms: u64,
+    ) {
+        let stats = self.probes.entry(session_id.clone()).or_default();
+        stats.frames_received = stats.frames_received.saturating_add(1);
+        stats.frames_dropped = stats.frames_dropped.saturating_add(1);
+        stats.bytes_received = stats.bytes_received.saturating_add(bytes_received);
+        stats.first_seen_ms.get_or_insert(now_ms);
+        stats.last_seen_ms = Some(now_ms);
     }
 
     pub fn snapshot(&self, session_id: &SessionId) -> mrd_ipc::ProbeSnapshot {
@@ -403,9 +514,10 @@ impl ProbeRegistry {
             last_media_sequence: stats.last_media_sequence,
             last_media_timestamp_us: stats.last_media_timestamp_us,
             last_media_payload_hash: stats.last_media_payload_hash.clone(),
-            latest_frame_data_url: stats.latest_frame.as_ref().and_then(|frame| {
-                encode_rgb24_png_data_url(frame.width, frame.height, &frame.rgb24)
-            }),
+            latest_frame_data_url: stats
+                .latest_frame
+                .as_ref()
+                .and_then(|frame| frame.data_url.clone()),
             latest_frame_width: stats.latest_frame.as_ref().map(|frame| frame.width),
             latest_frame_height: stats.latest_frame.as_ref().map(|frame| frame.height),
             latest_frame_pixel_format: stats
@@ -503,6 +615,8 @@ pub struct AppState {
     pub media_profiles: Arc<Mutex<MediaProfileRegistry>>,
     /// Selected capture source keyed by session.
     pub capture_sources: Arc<Mutex<CaptureSourceRegistry>>,
+    /// Peer media capabilities keyed by session.
+    pub peer_media_capabilities: Arc<Mutex<SessionPeerMediaCapabilityRegistry>>,
     /// Receiver pipeline state keyed by session.
     pub media_pipelines: Arc<Mutex<MediaPipelineRegistry>>,
     /// Abort handles for active media tasks keyed by session.
@@ -526,6 +640,9 @@ impl AppState {
             probes: Arc::new(Mutex::new(ProbeRegistry::default())),
             media_profiles: Arc::new(Mutex::new(MediaProfileRegistry::default())),
             capture_sources: Arc::new(Mutex::new(CaptureSourceRegistry::default())),
+            peer_media_capabilities: Arc::new(Mutex::new(
+                SessionPeerMediaCapabilityRegistry::default(),
+            )),
             media_pipelines: Arc::new(Mutex::new(MediaPipelineRegistry::default())),
             media_tasks: Arc::new(Mutex::new(MediaTaskRegistry::default())),
         }
@@ -569,6 +686,11 @@ impl AppState {
     /// Get a clone of the capture source registry.
     pub fn capture_sources(&self) -> Arc<Mutex<CaptureSourceRegistry>> {
         self.capture_sources.clone()
+    }
+
+    /// Get a clone of the peer media capability registry.
+    pub fn peer_media_capabilities(&self) -> Arc<Mutex<SessionPeerMediaCapabilityRegistry>> {
+        self.peer_media_capabilities.clone()
     }
 
     /// Get a clone of the receiver media pipeline registry.
@@ -711,6 +833,8 @@ mod tests {
                 encoded_bytes: 1024,
                 pixel_format: "rgb24".to_string(),
                 payload_hash: "fnv1a64:preview".to_string(),
+                preview_width: Some(2),
+                preview_height: Some(2),
                 rgb24: Some(vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255]),
             },
             3_000,
@@ -751,6 +875,8 @@ mod tests {
                 encoded_bytes: 2048,
                 pixel_format: "cpu_nv12".to_string(),
                 payload_hash: "fnv1a64:encoded".to_string(),
+                preview_width: None,
+                preview_height: None,
                 rgb24: None,
             },
             4_000,
@@ -767,6 +893,50 @@ mod tests {
             Some("fnv1a64:encoded")
         );
         assert!(snapshot.latest_frame_data_url.is_none());
+    }
+
+    #[test]
+    fn probe_registry_counts_transient_drop_without_latching_error() {
+        let mut registry = ProbeRegistry::default();
+        let session_id = SessionId("transient-drop-session".to_string());
+
+        registry.record_transient_frame_drop(&session_id, 512, 1_000);
+
+        let snapshot = registry.snapshot(&session_id);
+        assert_eq!(snapshot.frames_received, 1);
+        assert_eq!(snapshot.frames_decoded, 0);
+        assert_eq!(snapshot.frames_dropped, 1);
+        assert_eq!(snapshot.last_error, None);
+    }
+
+    #[test]
+    fn media_pipeline_registry_exposes_stage_metrics() {
+        let mut registry = MediaPipelineRegistry::default();
+        let session_id = SessionId("metrics-session".to_string());
+
+        registry.record_stage_duration_ms(session_id.clone(), "sender.capture", 1.0);
+        registry.record_stage_duration_ms(session_id.clone(), "sender.capture", 3.0);
+        registry.set_stage_metrics(
+            session_id.clone(),
+            [MediaStageMetrics {
+                stage: "sender.encode".to_string(),
+                p50_ms: Some(2.5),
+                p95_ms: Some(4.5),
+            }],
+        );
+
+        let snapshot = registry.snapshot(&session_id);
+
+        assert!(snapshot.stage_metrics.iter().any(|metric| {
+            metric.stage == "sender.capture"
+                && metric.p50_ms == Some(3.0)
+                && metric.p95_ms == Some(3.0)
+        }));
+        assert!(snapshot.stage_metrics.iter().any(|metric| {
+            metric.stage == "sender.encode"
+                && metric.p50_ms == Some(2.5)
+                && metric.p95_ms == Some(4.5)
+        }));
     }
 
     #[test]

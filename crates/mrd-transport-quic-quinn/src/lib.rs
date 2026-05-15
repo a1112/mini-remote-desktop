@@ -146,6 +146,33 @@ impl QuinnDatagramEndpoint {
             .map_err(|error| QuinnTransportError::Message(format!("read_datagram failed: {error}")))
     }
 
+    pub async fn send_reliable_message(&self, payload: Bytes) -> Result<(), QuinnTransportError> {
+        let mut stream =
+            self.inner.connection.open_uni().await.map_err(|error| {
+                QuinnTransportError::Message(format!("open_uni failed: {error}"))
+            })?;
+        stream.write_all(payload.as_ref()).await.map_err(|error| {
+            QuinnTransportError::Message(format!("reliable stream write failed: {error}"))
+        })?;
+        stream.finish().map_err(|error| {
+            QuinnTransportError::Message(format!("reliable stream finish failed: {error}"))
+        })
+    }
+
+    pub async fn read_reliable_message(
+        &self,
+        max_len: usize,
+    ) -> Result<Bytes, QuinnTransportError> {
+        let mut stream =
+            self.inner.connection.accept_uni().await.map_err(|error| {
+                QuinnTransportError::Message(format!("accept_uni failed: {error}"))
+            })?;
+        let payload = stream.read_to_end(max_len).await.map_err(|error| {
+            QuinnTransportError::Message(format!("reliable stream read failed: {error}"))
+        })?;
+        Ok(Bytes::from(payload))
+    }
+
     pub async fn connect_client(
         bind_addr: &str,
         bootstrap: &QuinnServerBootstrap,
