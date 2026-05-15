@@ -38,7 +38,9 @@ use windows::Win32::Graphics::Gdi::{
 };
 
 #[cfg(windows)]
-const DXGI_SHARED_ACQUIRE_TIMEOUT_MS: u32 = 1;
+// Keep the media sender paced by the requested profile. When Desktop Duplication
+// has no new desktop update, capture_frame reuses the last shared texture.
+const DXGI_SHARED_ACQUIRE_TIMEOUT_MS: u32 = 0;
 #[cfg(windows)]
 const DXGI_SHARED_TEXTURE_RING_SIZE: usize = 3;
 
