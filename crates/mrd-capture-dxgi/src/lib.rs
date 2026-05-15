@@ -39,6 +39,8 @@ use windows::Win32::Graphics::Gdi::{
 
 #[cfg(windows)]
 const DXGI_SHARED_ACQUIRE_TIMEOUT_MS: u32 = 1;
+#[cfg(windows)]
+const DXGI_SHARED_TEXTURE_RING_SIZE: usize = 3;
 
 pub struct DxgiDesktopCapture {
     capturer: Capturer,
@@ -116,7 +118,9 @@ pub struct DxgiSharedTextureCapture {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     duplication: IDXGIOutputDuplication,
-    shared_texture: Option<SharedBgraTexture>,
+    shared_textures: Vec<SharedBgraTexture>,
+    next_shared_texture_index: usize,
+    last_shared_texture_index: Option<usize>,
     source_left: i32,
     source_top: i32,
     source_width: usize,
@@ -190,7 +194,9 @@ impl DxgiSharedTextureCapture {
                     device,
                     context,
                     duplication,
-                    shared_texture: None,
+                    shared_textures: Vec::new(),
+                    next_shared_texture_index: 0,
+                    last_shared_texture_index: None,
                     source_left: rect.left,
                     source_top: rect.top,
                     source_width: width,
@@ -215,30 +221,49 @@ impl DxgiSharedTextureCapture {
     pub fn set_target_dimensions(&mut self, width: usize, height: usize) {
         self.width = width.clamp(2, self.source_width.max(2));
         self.height = height.clamp(2, self.source_height.max(2));
-        self.shared_texture = None;
+        self.shared_textures.clear();
+        self.next_shared_texture_index = 0;
+        self.last_shared_texture_index = None;
     }
 
-    fn ensure_shared_texture(&mut self) -> Result<&SharedBgraTexture, PipelineError> {
+    fn ensure_shared_textures(&mut self) -> Result<(), PipelineError> {
         let width = self.width as u32;
         let height = self.height as u32;
         let needs_new = self
-            .shared_texture
-            .as_ref()
-            .map(|texture| texture.width != width || texture.height != height)
-            .unwrap_or(true);
+            .shared_textures
+            .iter()
+            .any(|texture| texture.width != width || texture.height != height)
+            || self.shared_textures.len() != DXGI_SHARED_TEXTURE_RING_SIZE;
 
         if needs_new {
-            self.shared_texture = Some(
-                SharedBgraTexture::new(&self.device, width, height).map_err(|error| {
-                    PipelineError::message(format!("create shared BGRA texture failed: {error}"))
-                })?,
-            );
+            self.shared_textures.clear();
+            for _ in 0..DXGI_SHARED_TEXTURE_RING_SIZE {
+                self.shared_textures.push(
+                    SharedBgraTexture::new(&self.device, width, height).map_err(|error| {
+                        PipelineError::message(format!(
+                            "create shared BGRA texture failed: {error}"
+                        ))
+                    })?,
+                );
+            }
+            self.next_shared_texture_index = 0;
+            self.last_shared_texture_index = None;
         }
 
-        Ok(self
-            .shared_texture
-            .as_ref()
-            .expect("shared texture initialized"))
+        Ok(())
+    }
+
+    fn next_shared_texture(&mut self) -> Result<(isize, ID3D11Texture2D), PipelineError> {
+        self.ensure_shared_textures()?;
+        let len = self.shared_textures.len();
+        if len == 0 {
+            return Err(PipelineError::message("shared texture ring is empty"));
+        }
+        let index = self.next_shared_texture_index % len;
+        self.next_shared_texture_index = (index + 1) % len;
+        self.last_shared_texture_index = Some(index);
+        let shared = &self.shared_textures[index];
+        Ok((shared.shared_handle, shared.texture.clone()))
     }
 }
 
@@ -298,10 +323,7 @@ impl DxgiSharedTextureCapture {
             width,
             height,
         )?;
-        let (shared_handle, shared_texture) = {
-            let shared = self.ensure_shared_texture()?;
-            (shared.shared_handle, shared.texture.clone())
-        };
+        let (shared_handle, shared_texture) = self.next_shared_texture()?;
         let target_resource: ID3D11Resource = shared_texture.cast().map_err(|error| {
             PipelineError::message(format!(
                 "cast seeded shared texture to resource failed: {error}"
@@ -333,7 +355,10 @@ impl DxgiSharedTextureCapture {
     }
 
     fn last_shared_frame(&self) -> Result<Option<CapturedFrame>, PipelineError> {
-        let Some(shared) = self.shared_texture.as_ref() else {
+        let Some(index) = self.last_shared_texture_index else {
+            return Ok(None);
+        };
+        let Some(shared) = self.shared_textures.get(index) else {
             return Ok(None);
         };
 
@@ -363,13 +388,7 @@ impl DxgiSharedTextureCapture {
         let height = self.height;
         let source_width = self.source_width;
         let source_height = self.source_height;
-        self.ensure_shared_texture()?;
-        let shared = self
-            .shared_texture
-            .as_ref()
-            .ok_or_else(|| PipelineError::message("shared texture not initialized"))?;
-        let shared_handle = shared.shared_handle;
-        let shared_texture = shared.texture.clone();
+        let (shared_handle, shared_texture) = self.next_shared_texture()?;
         let target_resource: ID3D11Resource = shared_texture.cast().map_err(|error| {
             PipelineError::message(format!("cast shared texture to resource failed: {error}"))
         })?;

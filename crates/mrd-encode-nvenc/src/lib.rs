@@ -45,6 +45,7 @@ mod imp {
     use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 
     const H264_SHARED_ASYNC_SLOT_COUNT: usize = 2;
+    const H264_SHARED_INPUT_CACHE_LIMIT: usize = 8;
 
     pub struct NvencH264Encoder {
         _device: ID3D11Device,
@@ -52,7 +53,7 @@ mod imp {
         texture: ID3D11Texture2D,
         encoder: Encoder,
         registered: RegisteredResource,
-        shared_input: Option<SharedInputResource>,
+        shared_inputs: Vec<SharedInputResource>,
         shared_encode_slots: Vec<SharedEncodeSlot>,
         pending_shared_encodes: VecDeque<PendingSharedEncode>,
         bitstream: BitStream,
@@ -229,7 +230,7 @@ mod imp {
                 texture,
                 encoder,
                 registered,
-                shared_input: None,
+                shared_inputs: Vec::new(),
                 shared_encode_slots: Vec::new(),
                 pending_shared_encodes: VecDeque::new(),
                 bitstream,
@@ -310,7 +311,7 @@ mod imp {
                 texture,
                 encoder,
                 registered,
-                shared_input: None,
+                shared_inputs: Vec::new(),
                 shared_encode_slots: Vec::new(),
                 pending_shared_encodes: VecDeque::new(),
                 bitstream,
@@ -416,7 +417,7 @@ mod imp {
                 texture,
                 encoder,
                 registered,
-                shared_input: None,
+                shared_inputs: Vec::new(),
                 shared_encode_slots: Vec::new(),
                 pending_shared_encodes: VecDeque::new(),
                 bitstream,
@@ -491,7 +492,7 @@ mod imp {
                 texture,
                 encoder,
                 registered,
-                shared_input: None,
+                shared_inputs: Vec::new(),
                 shared_encode_slots: Vec::new(),
                 pending_shared_encodes: VecDeque::new(),
                 bitstream,
@@ -519,13 +520,7 @@ mod imp {
                 )));
             }
 
-            self.ensure_shared_input(shared)?;
-            let source_texture = self
-                .shared_input
-                .as_ref()
-                .ok_or_else(|| PipelineError::message("missing shared input resource"))?
-                ._texture
-                .clone();
+            let source_texture = self.ensure_shared_input(shared)?;
             self.ensure_shared_encode_slots()?;
 
             let mut output = Vec::new();
@@ -645,19 +640,13 @@ mod imp {
         fn ensure_shared_input(
             &mut self,
             shared: &D3D11SharedBgraFrame,
-        ) -> Result<(), PipelineError> {
-            let needs_new = self
-                .shared_input
-                .as_ref()
-                .map(|input| {
-                    input.shared_handle != shared.shared_handle
-                        || input.width != shared.width
-                        || input.height != shared.height
-                })
-                .unwrap_or(true);
-
-            if !needs_new {
-                return Ok(());
+        ) -> Result<ID3D11Texture2D, PipelineError> {
+            if let Some(input) = self.shared_inputs.iter().find(|input| {
+                input.shared_handle == shared.shared_handle
+                    && input.width == shared.width
+                    && input.height == shared.height
+            }) {
+                return Ok(input._texture.clone());
             }
 
             if shared.shared_handle == 0 {
@@ -688,7 +677,10 @@ mod imp {
                     ))
                 })?;
 
-            self.shared_input = Some(SharedInputResource {
+            if self.shared_inputs.len() >= H264_SHARED_INPUT_CACHE_LIMIT {
+                self.shared_inputs.remove(0);
+            }
+            self.shared_inputs.push(SharedInputResource {
                 shared_handle: shared.shared_handle,
                 width: shared.width,
                 height: shared.height,
@@ -696,7 +688,12 @@ mod imp {
                 registered,
             });
 
-            Ok(())
+            Ok(self
+                .shared_inputs
+                .last()
+                .expect("shared input resource was just inserted")
+                ._texture
+                .clone())
         }
     }
 
