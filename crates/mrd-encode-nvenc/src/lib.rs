@@ -31,6 +31,7 @@ mod imp {
         NV_ENC_PRESET_P6_GUID,
     };
     use nvenc::sys::structs::Guid;
+    use std::collections::VecDeque;
     use windows::core::Interface;
     use windows::Win32::Foundation::{HANDLE, HMODULE};
     use windows::Win32::Graphics::Direct3D::{
@@ -43,6 +44,8 @@ mod imp {
     };
     use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 
+    const H264_SHARED_ASYNC_SLOT_COUNT: usize = 2;
+
     pub struct NvencH264Encoder {
         _device: ID3D11Device,
         context: ID3D11DeviceContext,
@@ -50,6 +53,8 @@ mod imp {
         encoder: Encoder,
         registered: RegisteredResource,
         shared_input: Option<SharedInputResource>,
+        shared_encode_slots: Vec<SharedEncodeSlot>,
+        pending_shared_encodes: VecDeque<PendingSharedEncode>,
         bitstream: BitStream,
         width: usize,
         height: usize,
@@ -81,6 +86,18 @@ mod imp {
         height: u32,
         _texture: ID3D11Texture2D,
         registered: RegisteredResource,
+    }
+
+    struct SharedEncodeSlot {
+        texture: ID3D11Texture2D,
+        registered: RegisteredResource,
+        bitstream: BitStream,
+    }
+
+    struct PendingSharedEncode {
+        slot: SharedEncodeSlot,
+        timestamp_us: u64,
+        is_keyframe: bool,
     }
 
     impl NvencH264Encoder {
@@ -213,6 +230,8 @@ mod imp {
                 encoder,
                 registered,
                 shared_input: None,
+                shared_encode_slots: Vec::new(),
+                pending_shared_encodes: VecDeque::new(),
                 bitstream,
                 width,
                 height,
@@ -292,6 +311,8 @@ mod imp {
                 encoder,
                 registered,
                 shared_input: None,
+                shared_encode_slots: Vec::new(),
+                pending_shared_encodes: VecDeque::new(),
                 bitstream,
                 width,
                 height,
@@ -396,6 +417,8 @@ mod imp {
                 encoder,
                 registered,
                 shared_input: None,
+                shared_encode_slots: Vec::new(),
+                pending_shared_encodes: VecDeque::new(),
                 bitstream,
                 width,
                 height,
@@ -469,6 +492,8 @@ mod imp {
                 encoder,
                 registered,
                 shared_input: None,
+                shared_encode_slots: Vec::new(),
+                pending_shared_encodes: VecDeque::new(),
                 bitstream,
                 width,
                 height,
@@ -494,31 +519,6 @@ mod imp {
                 )));
             }
 
-            self.copy_shared_bgra_to_registered_texture(shared)?;
-
-            let force_idr = self.frame_index == 0 || self.frame_index % self.fps as usize == 0;
-            let bytes = encode_picture_with_sps_pps(
-                &mut self.encoder,
-                &self.bitstream,
-                &self.registered,
-                self.frame_index,
-                force_idr,
-            )
-            .map_err(|error| PipelineError::message(error.to_string()))?;
-            self.frame_index += 1;
-
-            Ok(vec![EncodedAccessUnit {
-                codec: VideoCodec::H264,
-                timestamp_us: frame.timestamp_us,
-                is_keyframe: force_idr,
-                bytes: normalize_annexb_au(bytes),
-            }])
-        }
-
-        fn copy_shared_bgra_to_registered_texture(
-            &mut self,
-            shared: &D3D11SharedBgraFrame,
-        ) -> Result<(), PipelineError> {
             self.ensure_shared_input(shared)?;
             let source_texture = self
                 .shared_input
@@ -526,12 +526,109 @@ mod imp {
                 .ok_or_else(|| PipelineError::message("missing shared input resource"))?
                 ._texture
                 .clone();
+            self.ensure_shared_encode_slots()?;
+
+            let mut output = Vec::new();
+            if self.shared_encode_slots.is_empty() {
+                if let Some(access_unit) = self.complete_oldest_shared_encode()? {
+                    output.push(access_unit);
+                }
+            }
+
+            let slot = self
+                .shared_encode_slots
+                .pop()
+                .ok_or_else(|| PipelineError::message("missing shared NVENC encode slot"))?;
+            self.copy_shared_bgra_to_texture(&source_texture, &slot.texture)?;
+
+            let force_idr = self.frame_index == 0 || self.frame_index % self.fps as usize == 0;
+            submit_encode_picture(
+                &mut self.encoder,
+                &slot.bitstream,
+                &slot.registered,
+                self.frame_index,
+                force_idr,
+            )
+            .map_err(|error| PipelineError::message(error.to_string()))?;
+            self.frame_index += 1;
+            self.pending_shared_encodes.push_back(PendingSharedEncode {
+                slot,
+                timestamp_us: frame.timestamp_us,
+                is_keyframe: force_idr,
+            });
+
+            if self.pending_shared_encodes.len() >= H264_SHARED_ASYNC_SLOT_COUNT {
+                if let Some(access_unit) = self.complete_oldest_shared_encode()? {
+                    output.push(access_unit);
+                }
+            }
+
+            Ok(output)
+        }
+
+        fn ensure_shared_encode_slots(&mut self) -> Result<(), PipelineError> {
+            while self.shared_encode_slots.len() + self.pending_shared_encodes.len()
+                < H264_SHARED_ASYNC_SLOT_COUNT
+            {
+                let texture =
+                    create_encode_texture(&self._device, self.width as u32, self.height as u32)
+                        .map_err(|error| {
+                            PipelineError::message(format!(
+                                "create shared NVENC slot texture failed: {error}"
+                            ))
+                        })?;
+                let registered = self
+                    .encoder
+                    .register_resource_dx11(&texture, NVencBufferFormat::ARGB, 0)
+                    .map_err(|error| {
+                        PipelineError::message(format!(
+                            "nvenc register shared slot resource failed: {error:?}"
+                        ))
+                    })?;
+                let bitstream = self.encoder.create_bitstream_buffer().map_err(|error| {
+                    PipelineError::message(format!(
+                        "nvenc shared slot bitstream buffer failed: {error:?}"
+                    ))
+                })?;
+                self.shared_encode_slots.push(SharedEncodeSlot {
+                    texture,
+                    registered,
+                    bitstream,
+                });
+            }
+
+            Ok(())
+        }
+
+        fn complete_oldest_shared_encode(
+            &mut self,
+        ) -> Result<Option<EncodedAccessUnit>, PipelineError> {
+            let Some(pending) = self.pending_shared_encodes.pop_front() else {
+                return Ok(None);
+            };
+            let bytes = lock_bitstream_bytes(&pending.slot.bitstream)
+                .map_err(|error| PipelineError::message(error.to_string()))?;
+            let access_unit = EncodedAccessUnit {
+                codec: VideoCodec::H264,
+                timestamp_us: pending.timestamp_us,
+                is_keyframe: pending.is_keyframe,
+                bytes: normalize_annexb_au(bytes),
+            };
+            self.shared_encode_slots.push(pending.slot);
+            Ok(Some(access_unit))
+        }
+
+        fn copy_shared_bgra_to_texture(
+            &self,
+            source_texture: &ID3D11Texture2D,
+            target_texture: &ID3D11Texture2D,
+        ) -> Result<(), PipelineError> {
             let source_resource: ID3D11Resource = source_texture.cast().map_err(|error| {
                 PipelineError::message(format!(
                     "cast shared texture to NVENC copy source failed: {error}"
                 ))
             })?;
-            let target_resource: ID3D11Resource = self.texture.cast().map_err(|error| {
+            let target_resource: ID3D11Resource = target_texture.cast().map_err(|error| {
                 PipelineError::message(format!(
                     "cast registered NVENC texture to copy target failed: {error}"
                 ))
@@ -1067,6 +1164,17 @@ mod imp {
         frame_index: usize,
         force_idr: bool,
     ) -> anyhow::Result<Vec<u8>> {
+        submit_encode_picture(encoder, bitstream, registered, frame_index, force_idr)?;
+        lock_bitstream_bytes(bitstream)
+    }
+
+    fn submit_encode_picture(
+        encoder: &mut Encoder,
+        bitstream: &BitStream,
+        registered: &RegisteredResource,
+        frame_index: usize,
+        force_idr: bool,
+    ) -> anyhow::Result<()> {
         let flags = if force_idr {
             NVencPicFlags::ForceIDR as u32 | NVencPicFlags::OutputSpspps as u32
         } else {
@@ -1089,6 +1197,10 @@ mod imp {
                 None,
             )
             .map_err(|error| anyhow!("NVENC encode_picture failed: {error:?}"))?;
+        Ok(())
+    }
+
+    fn lock_bitstream_bytes(bitstream: &BitStream) -> anyhow::Result<Vec<u8>> {
         let lock = bitstream
             .try_lock(true)
             .map_err(|error| anyhow!("NVENC bitstream lock failed: {error:?}"))?;
