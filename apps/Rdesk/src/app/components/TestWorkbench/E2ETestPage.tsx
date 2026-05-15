@@ -78,6 +78,7 @@ const lanAutomationCommands: LanE2EAutomationCommands = {
   openRemoteDisplayWindow: commands.openRemoteDisplayWindow,
   ipcSessionSnapshot: commands.ipcSessionSnapshot,
   ipcProbeSnapshot: commands.ipcProbeSnapshot,
+  ipcMediaPipelineSnapshot: commands.ipcMediaPipelineSnapshot,
   ipcStopSession: commands.ipcStopSession,
 };
 
@@ -594,6 +595,24 @@ function buildLanAutomationOptionsFromSearchParams(
     minDecodedFrames: parsePositiveNumber(searchParams.get("minDecodedFrames")),
     minFps: parsePositiveNumber(searchParams.get("minFps")),
     stopOnComplete: parseOptionalBoolean(searchParams.get("stopOnComplete")),
+    requestedProfile: parseRequestedProfile(searchParams),
+  };
+}
+
+function parseRequestedProfile(searchParams: URLSearchParams): LanE2EAutomationOptions["requestedProfile"] {
+  const width = parsePositiveNumber(searchParams.get("width") ?? searchParams.get("profileWidth"));
+  const height = parsePositiveNumber(searchParams.get("height") ?? searchParams.get("profileHeight"));
+  const fps = parsePositiveNumber(searchParams.get("fps") ?? searchParams.get("profileFps"));
+  const bitrate = parsePositiveNumber(
+    searchParams.get("bitrateMbps") ?? searchParams.get("profileBitrateMbps")
+  );
+  if (!width || !height || !fps || !bitrate) return undefined;
+  return {
+    width,
+    height,
+    fps,
+    bitrate_mbps: bitrate,
+    codec: "h264",
   };
 }
 

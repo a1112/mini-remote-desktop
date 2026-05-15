@@ -17,10 +17,18 @@ describe("TransportTestPage execution targets", () => {
         "quic",
         "quic_datagram",
         "quic_datagram_2k144",
+        "quic_datagram_media_v2",
         "media_profile_control_v1",
         "capture_source_control_v1",
       ],
       protocol_version: 1,
+      media_protocol_version: 2,
+      media_capabilities: [
+        "dxgi_capture",
+        "nvenc_h264",
+        "nvdec",
+        "d3d11_native_render",
+      ],
       age_ms: 80,
       p2p_available: true,
     };
@@ -113,6 +121,20 @@ describe("TransportTestPage execution targets", () => {
           media_probe_height: 720,
           media_probe_target_fps: 30,
           media_probe_target_bitrate_mbps: 5,
+        });
+      }
+      if (command === "ipc_media_pipeline_snapshot") {
+        return Promise.resolve({
+          session_id: args?.sessionId,
+          attached_surfaces: [],
+          active_decoder: "nvdec",
+          active_renderer: "d3d11_native",
+          queue_depth: 0,
+          dropped_frames: 2,
+          stage_metrics: [
+            { stage: "decode", p50_ms: 0.8, p95_ms: 1.4 },
+            { stage: "present", p50_ms: 4.0, p95_ms: 7.0 },
+          ],
         });
       }
       if (command === "ipc_stop_session") return Promise.resolve(args?.sessionId);

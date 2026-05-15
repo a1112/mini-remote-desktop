@@ -177,7 +177,7 @@ describe("E2ETestPage LAN automation", () => {
     render(
       <MemoryRouter
         initialEntries={[
-          "/test/e2e?autorun=lan-e2e&targetDeviceId=agent-device&transport=quic&timeoutMs=2500&minDecodedFrames=2&minFps=5",
+          "/test/e2e?autorun=lan-e2e&targetDeviceId=agent-device&transport=quic&timeoutMs=2500&minDecodedFrames=2&minFps=5&width=1920&height=1080&fps=180&bitrateMbps=20",
         ]}
       >
         <E2ETestPage />
@@ -190,6 +190,13 @@ describe("E2ETestPage LAN automation", () => {
         expect.objectContaining({
           targetDeviceId: "agent-device",
           transportKind: "quic",
+          requestedProfile: {
+            width: 1920,
+            height: 1080,
+            fps: 180,
+            bitrate_mbps: 20,
+            codec: "h264",
+          },
         })
       );
     });
@@ -211,7 +218,14 @@ describe("E2ETestPage LAN automation", () => {
 
 function installSuccessfulLanAutomationMock() {
   const mockInvoke = getMockInvoke();
-  mockInvoke.mockImplementation((command: string) => {
+  let activeProfile = {
+    width: 2560,
+    height: 1440,
+    fps: 144,
+    bitrate_mbps: 64,
+    codec: "h264",
+  };
+  mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
     if (command === "test_get_capabilities") {
       return Promise.resolve({
         os_type: "windows",
@@ -269,16 +283,31 @@ function installSuccessfulLanAutomationMock() {
               "quic",
               "quic_datagram",
               "quic_datagram_2k144",
+              "quic_datagram_media_v2",
               "media_profile_control_v1",
             ],
             protocol_version: 1,
+            service_build_id: "test-build",
+            media_protocol_version: 2,
+            media_capabilities: [
+              "dxgi_capture",
+              "nvenc_h264",
+              "nvdec",
+              "d3d11_native_render",
+            ],
             age_ms: 25,
             p2p_available: true,
           },
         ],
       });
     }
-    if (command === "ipc_start_lan_remote_session") return Promise.resolve("started");
+    if (command === "ipc_start_lan_remote_session") {
+      const requestedProfile = args?.requestedProfile as typeof activeProfile | undefined;
+      if (requestedProfile) {
+        activeProfile = requestedProfile;
+      }
+      return Promise.resolve("started");
+    }
     if (command === "ipc_list_remote_capture_sources") {
       return Promise.resolve([
         {
@@ -341,19 +370,33 @@ function installSuccessfulLanAutomationMock() {
         frames_received: 25,
         frames_decoded: 25,
         frames_dropped: 0,
-        current_fps: 144,
-        bitrate_mbps: 64,
+        current_fps: activeProfile.fps,
+        bitrate_mbps: activeProfile.bitrate_mbps,
         media_probe_valid: true,
-        media_probe_format: "compressed_2k144_test_pattern",
-        media_probe_width: 2560,
-        media_probe_height: 1440,
-        media_probe_target_fps: 144,
-        media_probe_target_bitrate_mbps: 64,
+        media_probe_format: "compressed_h264_test_pattern",
+        media_probe_width: activeProfile.width,
+        media_probe_height: activeProfile.height,
+        media_probe_target_fps: activeProfile.fps,
+        media_probe_target_bitrate_mbps: activeProfile.bitrate_mbps,
         media_probe_payload_bytes: 55555,
         last_media_sequence: 25,
         last_media_timestamp_us: 123456,
         last_media_payload_hash: "fnv1a64:abc123",
         last_error: null,
+      });
+    }
+    if (command === "ipc_media_pipeline_snapshot") {
+      return Promise.resolve({
+        session_id: "lan-e2e-agent-device-1000",
+        attached_surfaces: [],
+        active_decoder: "nvdec",
+        active_renderer: "d3d11",
+        queue_depth: 1,
+        dropped_frames: 0,
+        stage_metrics: [
+          { stage: "decode", p50_ms: 0.8, p95_ms: 1.2 },
+          { stage: "render_present", p50_ms: 5, p95_ms: 7 },
+        ],
       });
     }
     if (command === "ipc_stop_session") return Promise.resolve("stopped");

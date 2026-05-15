@@ -24,6 +24,25 @@ powershell -ExecutionPolicy Bypass -File tests/benchmarks/scripts/run_transport_
   -ScenarioPath tests/benchmarks/scenarios/quick.transport.quic.nvenc.json
 ```
 
+Paired LAN canary comparison:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tests/benchmarks/scripts/run_paired_lan_canary.ps1 `
+  -TargetDeviceId lan-PEER-ID
+```
+
+This runs the fixed `dxgi / nvenc_h264 / quic_datagram / nvdec / d3d11_shared`
+local baseline and the LAN QUIC media v2 cross-device autorun for
+`1080p60`, `2K60`, `1080p144`, `1080p180`, and `1080p249`.
+Reports are written to `target/codex-matrix-compare/`:
+
+- `local-canary-report.json` and `.md`
+- `cross-device-canary-report.json` and `.md`
+- `matrix-comparison-report.json` and `.md`
+
+Use `-SkipLocal` or `-SkipCross` when collecting only one side, and `-NoBuild`
+when the app and service binaries have already been built.
+
 Steady baseline:
 
 ```powershell

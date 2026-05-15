@@ -176,6 +176,20 @@ function createCommands(
         last_error: null,
       })
     ),
+    ipcMediaPipelineSnapshot: vi.fn().mockResolvedValue(
+      ok({
+        session_id: "unused",
+        attached_surfaces: [],
+        active_decoder: "nvdec",
+        active_renderer: "d3d11",
+        queue_depth: 1,
+        dropped_frames: 0,
+        stage_metrics: [
+          { stage: "decode", p50_ms: 0.8, p95_ms: 1.2 },
+          { stage: "render_present", p50_ms: 5.0, p95_ms: 7.0 },
+        ],
+      })
+    ),
     ipcStopSession: vi.fn().mockResolvedValue(ok("stopped")),
     ...overrides,
   };
@@ -307,6 +321,8 @@ describe("runLanE2EAutomation", () => {
     expect(result.sessionId).toBe("lan-e2e-test-session");
     expect(result.peer?.device_id).toBe("agent-device");
     expect(result.probeSnapshot?.frames_decoded).toBe(3);
+    expect(result.mediaPipelineSnapshot?.active_decoder).toBe("nvdec");
+    expect(result.mediaPipelineSnapshot?.queue_depth).toBe(1);
     expect(result.mediaVerified).toBe(true);
     expect(result.probeSnapshot?.media_probe_valid).toBe(true);
     expect(result.probeSnapshot?.last_media_payload_hash).toBe("fnv1a64:abc123");

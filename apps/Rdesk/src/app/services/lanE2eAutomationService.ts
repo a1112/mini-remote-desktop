@@ -4,6 +4,7 @@ import type {
   CaptureSourceSelection,
   LanDiscoverySnapshot,
   LanPeerInfo,
+  MediaPipelineSnapshot,
   MediaProfile,
   ProbeSnapshot,
   RemoteDisplayWindowContext,
@@ -93,6 +94,7 @@ export interface LanE2EAutomationReport {
   captureSourceSelection?: CaptureSourceSelection;
   sessionSnapshot?: SessionRuntimeSnapshot;
   probeSnapshot?: ProbeSnapshot;
+  mediaPipelineSnapshot?: MediaPipelineSnapshot;
   profileProbeResult?: ProfileProbeResult;
   requestedProfile?: MediaProfile;
   faultPlan?: CrossDeviceFaultPlan;
@@ -141,6 +143,7 @@ export interface LanE2EAutomationCommands {
   }): Promise<AdapterResult<RemoteDisplayWindowContext>>;
   ipcSessionSnapshot(sessionId: string): Promise<AdapterResult<SessionRuntimeSnapshot>>;
   ipcProbeSnapshot(sessionId: string): Promise<AdapterResult<ProbeSnapshot>>;
+  ipcMediaPipelineSnapshot(sessionId: string): Promise<AdapterResult<MediaPipelineSnapshot>>;
   crossE2EInjectFault?(
     sessionId: string,
     faultPlan: CrossDeviceFaultPlan
@@ -218,6 +221,7 @@ export async function runLanE2EAutomation(
   let captureSourceSelection: CaptureSourceSelection | undefined;
   let sessionSnapshot: SessionRuntimeSnapshot | undefined;
   let probeSnapshot: ProbeSnapshot | undefined;
+  let mediaPipelineSnapshot: MediaPipelineSnapshot | undefined;
   let profileProbeResult: ProfileProbeResult | undefined;
   let controllerDeviceId: string | null | undefined;
   let sessionStarted = false;
@@ -246,6 +250,7 @@ export async function runLanE2EAutomation(
     captureSourceSelection,
     sessionSnapshot,
     probeSnapshot,
+    mediaPipelineSnapshot,
     profileProbeResult,
     requestedProfile,
     faultPlan: options.faultPlan,
@@ -386,6 +391,10 @@ export async function runLanE2EAutomation(
         "runtime_error"
       );
       probeSnapshot = await unwrap(commands.ipcProbeSnapshot(sessionId), "runtime_error");
+      mediaPipelineSnapshot = await unwrap(
+        commands.ipcMediaPipelineSnapshot(sessionId),
+        "runtime_error"
+      );
       sampleDurationMs = Date.now() - sampleStartedAt;
 
       if (sessionSnapshot.state === "failed" || sessionSnapshot.last_error) {
