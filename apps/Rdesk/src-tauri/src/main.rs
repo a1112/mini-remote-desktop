@@ -55,6 +55,7 @@ const LAN_E2E_AUTORUN_ENV: &str = "MRD_LAN_E2E_AUTORUN";
 const LAN_E2E_TARGET_DEVICE_ID_ENV: &str = "MRD_LAN_E2E_TARGET_DEVICE_ID";
 const LAN_E2E_TRANSPORT_ENV: &str = "MRD_LAN_E2E_TRANSPORT";
 const LAN_E2E_TIMEOUT_MS_ENV: &str = "MRD_LAN_E2E_TIMEOUT_MS";
+const LAN_E2E_MIN_SAMPLE_DURATION_MS_ENV: &str = "MRD_LAN_E2E_MIN_SAMPLE_DURATION_MS";
 const LAN_E2E_MIN_DECODED_FRAMES_ENV: &str = "MRD_LAN_E2E_MIN_DECODED_FRAMES";
 const LAN_E2E_MIN_FPS_ENV: &str = "MRD_LAN_E2E_MIN_FPS";
 const LAN_E2E_STOP_ON_COMPLETE_ENV: &str = "MRD_LAN_E2E_STOP_ON_COMPLETE";
@@ -2146,6 +2147,7 @@ struct LanE2eAutorunLaunchConfig {
     target_device_id: Option<String>,
     transport: Option<String>,
     timeout_ms: Option<String>,
+    min_sample_duration_ms: Option<String>,
     min_decoded_frames: Option<String>,
     min_fps: Option<String>,
     stop_on_complete: Option<String>,
@@ -2172,6 +2174,7 @@ where
         target_device_id: non_empty_env(env(LAN_E2E_TARGET_DEVICE_ID_ENV)),
         transport: non_empty_env(env(LAN_E2E_TRANSPORT_ENV)),
         timeout_ms: non_empty_env(env(LAN_E2E_TIMEOUT_MS_ENV)),
+        min_sample_duration_ms: non_empty_env(env(LAN_E2E_MIN_SAMPLE_DURATION_MS_ENV)),
         min_decoded_frames: non_empty_env(env(LAN_E2E_MIN_DECODED_FRAMES_ENV)),
         min_fps: non_empty_env(env(LAN_E2E_MIN_FPS_ENV)),
         stop_on_complete: non_empty_env(env(LAN_E2E_STOP_ON_COMPLETE_ENV)),
@@ -2188,6 +2191,11 @@ fn build_lan_e2e_autorun_route(config: LanE2eAutorunLaunchConfig) -> String {
     push_query_param(&mut params, "targetDeviceId", config.target_device_id);
     push_query_param(&mut params, "transport", config.transport);
     push_query_param(&mut params, "timeoutMs", config.timeout_ms);
+    push_query_param(
+        &mut params,
+        "minSampleDurationMs",
+        config.min_sample_duration_ms,
+    );
     push_query_param(&mut params, "minDecodedFrames", config.min_decoded_frames);
     push_query_param(&mut params, "minFps", config.min_fps);
     push_query_param(&mut params, "stopOnComplete", config.stop_on_complete);
@@ -2280,6 +2288,7 @@ mod tray_tests {
             target_device_id: Some("agent device/1".to_string()),
             transport: Some("quic".to_string()),
             timeout_ms: Some("2500".to_string()),
+            min_sample_duration_ms: Some("1500".to_string()),
             min_decoded_frames: Some("2".to_string()),
             min_fps: Some("5".to_string()),
             stop_on_complete: Some("false".to_string()),
@@ -2291,7 +2300,7 @@ mod tray_tests {
 
         assert_eq!(
             route,
-            "/test/e2e?autorun=lan-e2e&targetDeviceId=agent%20device%2F1&transport=quic&timeoutMs=2500&minDecodedFrames=2&minFps=5&stopOnComplete=false&width=1920&height=1080&fps=180&bitrateMbps=20"
+            "/test/e2e?autorun=lan-e2e&targetDeviceId=agent%20device%2F1&transport=quic&timeoutMs=2500&minSampleDurationMs=1500&minDecodedFrames=2&minFps=5&stopOnComplete=false&width=1920&height=1080&fps=180&bitrateMbps=20"
         );
     }
 

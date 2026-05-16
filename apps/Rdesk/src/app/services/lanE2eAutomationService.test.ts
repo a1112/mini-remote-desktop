@@ -509,6 +509,72 @@ describe("runLanE2EAutomation", () => {
     expect(result.errorMessage).toContain("1728x1080 @ 60 FPS / 20 Mbps");
   });
 
+  it("keeps sampling downgraded profiles until the minimum sample duration", async () => {
+    let currentTime = 0;
+    const ipcProbeSnapshot = vi.fn().mockImplementation(() => {
+      currentTime += currentTime === 0 ? 10 : 60;
+      return Promise.resolve(
+        ok({
+          session_id: "unused",
+          frames_received: 24,
+          frames_decoded: 24,
+          frames_dropped: 0,
+          current_fps: 60,
+          bitrate_mbps: 20,
+          media_probe_valid: true,
+          media_probe_format: "h264",
+          media_probe_width: 1728,
+          media_probe_height: 1080,
+          media_probe_target_fps: 60,
+          media_probe_target_bitrate_mbps: 20,
+          media_probe_payload_bytes: 55555,
+          last_media_sequence: 24,
+          last_media_timestamp_us: 123456,
+          last_media_payload_hash: "fnv1a64:abc123",
+          last_error: null,
+        })
+      );
+    });
+    const commands = withCaptureSourceCommands(createCommands({ ipcProbeSnapshot }), [
+      {
+        id: "display",
+        platform: "windows",
+        source_kind: "display",
+        title: "DISPLAY1",
+        class_name: "Monitor",
+        width: 2560,
+        height: 1600,
+        process_id: 0,
+        app_name: null,
+      },
+    ]);
+
+    const result = await runLanE2EAutomation(commands, {
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      requestedProfile: {
+        width: 1920,
+        height: 1080,
+        fps: 60,
+        bitrate_mbps: 20,
+        codec: "h264",
+      },
+      sampleIntervalMs: 0,
+      timeoutMs: 500,
+      minSampleDurationMs: 50,
+      minDecodedFrames: 1,
+      minFps: 1,
+      now: () => currentTime,
+      createSessionId: () => "lan-e2e-test-session",
+    });
+
+    expect(result.status).toBe("skipped");
+    expect(result.failureReason).toBe("profile_downgraded");
+    expect(result.thresholds.minSampleDurationMs).toBe(50);
+    expect(result.sampleDurationMs).toBeGreaterThanOrEqual(50);
+    expect(ipcProbeSnapshot).toHaveBeenCalledTimes(2);
+  });
+
   it("retries LAN discovery during preflight until the target peer appears", async () => {
     const ipcRefreshLanDiscovery = vi
       .fn()

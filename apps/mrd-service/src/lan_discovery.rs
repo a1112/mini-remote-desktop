@@ -871,11 +871,7 @@ pub async fn request_lan_capture_source_select(
             if accepted {
                 let selection =
                     selection.context("LAN peer accepted capture source without selection")?;
-                app_state
-                    .capture_sources
-                    .lock()
-                    .await
-                    .set(session_id.clone(), selection.clone());
+                store_capture_source_selection(app_state, session_id, selection.clone()).await;
                 Ok(selection)
             } else {
                 anyhow::bail!(
@@ -1331,13 +1327,21 @@ async fn accept_lan_capture_source_select_from_sources(
         status: "selected".to_string(),
         reason: None,
     };
+    store_capture_source_selection(app_state, session_id, selection.clone()).await;
+    Ok(selection)
+}
+
+async fn store_capture_source_selection(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+    selection: CaptureSourceSelection,
+) {
     reconcile_media_profile_to_capture_source(app_state, session_id, &selection.source).await;
     app_state
         .capture_sources
         .lock()
         .await
-        .set(session_id.clone(), selection.clone());
-    Ok(selection)
+        .set(session_id.clone(), selection);
 }
 
 async fn reconcile_media_profile_to_capture_source(
@@ -2660,22 +2664,23 @@ async fn quic_media_v3_frame_to_legacy_frame(
     let profile = selected_media_profile(app_state, session_id).await;
     let expected_profile_id = lan_media_profile_id(&profile);
     if frame.profile_id != expected_profile_id {
-        app_state.probes.lock().await.record_probe_drop(
+        tracing::debug!(
+            session_id = %session_id.0,
+            frame_id = frame.frame_id,
+            expected_profile_id,
+            received_profile_id = frame.profile_id,
+            completed = reassembler_stats.completed_frames,
+            expired = reassembler_stats.expired_frames,
+            evicted = reassembler_stats.evicted_frames,
+            duplicate = reassembler_stats.duplicate_fragments,
+            rejected = reassembler_stats.rejected_fragments,
+            pending = reassembler_stats.pending_frames,
+            "LAN media receiver dropped stale v3 profile frame"
+        );
+        app_state.probes.lock().await.record_transient_frame_drop(
             session_id,
             frame.payload.len() as u64,
             now_ms(),
-            format!(
-                "LAN media v3 profile id mismatch: frame={}, expected={}, got={}, reassembler={{completed:{}, expired:{}, evicted:{}, duplicate:{}, rejected:{}, pending:{}}}",
-                frame.frame_id,
-                expected_profile_id,
-                frame.profile_id,
-                reassembler_stats.completed_frames,
-                reassembler_stats.expired_frames,
-                reassembler_stats.evicted_frames,
-                reassembler_stats.duplicate_fragments,
-                reassembler_stats.rejected_fragments,
-                reassembler_stats.pending_frames
-            ),
         );
         return Ok(None);
     }
@@ -4782,6 +4787,93 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn remote_capture_source_selection_reconciles_controller_profile() {
+        let app_state = Arc::new(AppState::new());
+        let session_id = SessionId("controller-capture-source-profile-session".to_string());
+        app_state.sessions.lock().await.insert(
+            session_id.clone(),
+            SessionSnapshot {
+                session_id: session_id.clone(),
+                transport: "quic".to_string(),
+                source_device_id: None,
+                target_device_id: Some(DeviceId("target-device".to_string())),
+                local_listen_addr: None,
+                local_server_name: None,
+                local_cert_der_b64: None,
+                remote_listen_addr: None,
+                remote_server_name: None,
+                remote_cert_der_b64: None,
+                lifecycle_state: "streaming".to_string(),
+                last_error: None,
+                sender_active: false,
+                receiver_active: true,
+            },
+        );
+        app_state.media_profiles.lock().await.set(
+            session_id.clone(),
+            negotiate_media_profile(Some(MediaProfile {
+                width: 1920,
+                height: 1080,
+                fps: 60,
+                bitrate_mbps: 20,
+                codec: "h264".to_string(),
+            }))
+            .unwrap(),
+        );
+
+        store_capture_source_selection(
+            &app_state,
+            &session_id,
+            CaptureSourceSelection {
+                session_id: session_id.clone(),
+                source: mrd_ipc::CaptureSource {
+                    id: "windows:display:0".to_string(),
+                    platform: "windows".to_string(),
+                    source_kind: "display".to_string(),
+                    title: "Display 1".to_string(),
+                    class_name: "Monitor".to_string(),
+                    width: 2560,
+                    height: 1600,
+                    process_id: 0,
+                    app_name: Some("Display".to_string()),
+                    bundle_identifier: None,
+                    preview_data_url: None,
+                    preview_width: None,
+                    preview_height: None,
+                },
+                status: "selected".to_string(),
+                reason: None,
+            },
+        )
+        .await;
+
+        let negotiation = app_state
+            .media_profiles
+            .lock()
+            .await
+            .get(&session_id)
+            .expect("controller profile reconciled to remote source");
+        assert_eq!(negotiation.selected.width, 1728);
+        assert_eq!(negotiation.selected.height, 1080);
+        assert_eq!(
+            negotiation.selected_source_id.as_deref(),
+            Some("windows:display:0")
+        );
+        assert_eq!(negotiation.status, "downgraded");
+        assert_eq!(
+            app_state
+                .capture_sources
+                .lock()
+                .await
+                .get(&session_id)
+                .expect("stored remote capture source")
+                .source
+                .id,
+            "windows:display:0"
+        );
+    }
+
     #[test]
     fn prepare_frame_for_h264_keeps_cpu_frame_when_dimensions_match() {
         let data = vec![7_u8; 64 * 32 * 4];
@@ -4998,6 +5090,60 @@ mod tests {
         assert_eq!(envelope.sequence, 42);
         assert_eq!(envelope.profile, profile);
         assert_eq!(envelope.payload, vec![0, 0, 0, 1, 0x65]);
+    }
+
+    #[tokio::test]
+    async fn lan_media_v3_profile_mismatch_is_transient_drop() {
+        let app_state = Arc::new(AppState::new());
+        let session_id = SessionId("media-v3-mismatch-session".to_string());
+        let profile = MediaProfile {
+            width: 1920,
+            height: 1080,
+            fps: 144,
+            bitrate_mbps: 20,
+            codec: "h264".to_string(),
+        };
+        let stale_profile = MediaProfile {
+            fps: 60,
+            ..profile.clone()
+        };
+        app_state.media_profiles.lock().await.set(
+            session_id.clone(),
+            MediaProfileNegotiation {
+                requested: profile.clone(),
+                selected: profile,
+                status: "accepted".to_string(),
+                reason: None,
+                selected_source_id: None,
+                selected_width: Some(1920),
+                selected_height: Some(1080),
+                downgrade_reason: None,
+            },
+        );
+
+        let converted = quic_media_v3_frame_to_legacy_frame(
+            &app_state,
+            &session_id,
+            QuicMediaFrame {
+                payload_type: QuicMediaPayloadType::AccessUnit,
+                codec: QuicMediaCodec::H264,
+                profile_id: lan_media_profile_id(&stale_profile),
+                frame_id: 7,
+                timestamp_us: 123_456,
+                flags: 1,
+                payload: vec![0, 0, 0, 1, 0x65].into(),
+            },
+            QuicAuReassemblerStats::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(converted.is_none());
+        let snapshot = app_state.probes.lock().await.snapshot(&session_id);
+        assert_eq!(snapshot.frames_received, 1);
+        assert_eq!(snapshot.frames_decoded, 0);
+        assert_eq!(snapshot.frames_dropped, 1);
+        assert_eq!(snapshot.last_error, None);
     }
 
     #[test]

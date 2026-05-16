@@ -384,9 +384,9 @@ export async function runLanE2EAutomation(
     }
 
     stage("sample", "started");
-    const deadline = Date.now() + timeoutMs;
-    const sampleStartedAt = Date.now();
-    while (Date.now() <= deadline) {
+    const deadline = now() + timeoutMs;
+    const sampleStartedAt = now();
+    while (now() <= deadline) {
       sessionSnapshot = await unwrap(
         commands.ipcSessionSnapshot(sessionId),
         "runtime_error"
@@ -396,7 +396,7 @@ export async function runLanE2EAutomation(
         commands.ipcMediaPipelineSnapshot(sessionId),
         "runtime_error"
       );
-      sampleDurationMs = Date.now() - sampleStartedAt;
+      sampleDurationMs = now() - sampleStartedAt;
 
       if (sessionSnapshot.state === "failed" || sessionSnapshot.last_error) {
         const message = sessionSnapshot.last_error ?? "LAN session entered failed state";
@@ -420,7 +420,8 @@ export async function runLanE2EAutomation(
       }
       if (
         profileProbeResult?.status === "degraded" &&
-        probeSnapshot.frames_decoded >= minDecodedFrames
+        probeSnapshot.frames_decoded >= minDecodedFrames &&
+        sampleDurationMs >= minSampleDurationMs
       ) {
         const message =
           profileProbeResult.error ?? "Runtime media profile was downgraded by the remote source";
