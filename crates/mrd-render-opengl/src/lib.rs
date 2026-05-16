@@ -763,11 +763,15 @@ impl InteropNv12Textures {
     ) -> Result<Self, RenderError> {
         let y_texture = bridge.open_shared_texture(key.y_handle)?;
         let uv_texture = bridge.open_shared_texture(key.uv_handle)?;
-        Ok(Self {
-            key,
-            y: InteropRegisteredTexture::register(interop, y_texture)?,
-            uv: InteropRegisteredTexture::register(interop, uv_texture)?,
-        })
+        let mut y = InteropRegisteredTexture::register(interop, y_texture)?;
+        let uv = match InteropRegisteredTexture::register(interop, uv_texture) {
+            Ok(uv) => uv,
+            Err(error) => {
+                y.unregister(interop);
+                return Err(error);
+            }
+        };
+        Ok(Self { key, y, uv })
     }
 
     fn unregister(&mut self, interop: &WglDxInteropDevice) {
@@ -1556,6 +1560,7 @@ impl WindowsGlSurface {
 impl Drop for WindowsGlSurface {
     fn drop(&mut self) {
         unsafe {
+            let _ = windows::Win32::Graphics::OpenGL::wglMakeCurrent(self.hdc, self.context);
             if let Some(mut textures) = self.interop_nv12.take() {
                 if let Some(interop) = self.interop.as_ref() {
                     textures.unregister(interop);
@@ -1564,7 +1569,6 @@ impl Drop for WindowsGlSurface {
             self.nv12_program = None;
             self.interop = None;
             if self.texture_id != 0 {
-                let _ = windows::Win32::Graphics::OpenGL::wglMakeCurrent(self.hdc, self.context);
                 windows::Win32::Graphics::OpenGL::glDeleteTextures(1, &self.texture_id);
             }
             let _ = windows::Win32::Graphics::OpenGL::wglMakeCurrent(
