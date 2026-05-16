@@ -150,6 +150,7 @@ const KNOWN_STATUS_BY_ID: Record<string, CapabilityStatus> = {
   "decode.linux_hevc_main10": "available",
   "decode.videotoolbox": "available",
   "render.d3d11": "available",
+  "render.opengl": "supported",
   "render.linux": "available",
   "render.macos": "available",
   "render.webview": "degraded",
@@ -206,6 +207,13 @@ const DOMAIN_BASELINE_ITEMS: Array<Omit<CapabilityItem, "platform">> = [
     label: "D3D12 native renderer",
     status: "unimplemented",
     reason: "D3D12 is currently probe-only and not wired into mainline remote display",
+  },
+  {
+    id: "render.opengl",
+    domain: "render",
+    label: "OpenGL renderer",
+    status: "unknown",
+    reason: "Requires platform renderer probe or service capability snapshot",
   },
   {
     id: "control.keyboard_mouse",
@@ -409,6 +417,12 @@ export function evaluateCapabilityCombination(
     status = "blocked";
     reasons.push("D3D12 native renderer is probe-only and is not wired into mainline remote display.");
     requiredFallbacks.push("render.d3d11");
+  }
+
+  if (request.renderer === "opengl" && request.memory === "d3d11_shared") {
+    status = "blocked";
+    reasons.push("OpenGL renderer requires CPU-backed frames; D3D11 shared texture input is unsupported.");
+    requiredFallbacks.push("memory.cpu");
   }
 
   if (request.renderer === "webview" && hasCapability(snapshot, "render.webview")) {

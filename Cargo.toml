@@ -24,6 +24,7 @@ members = [
   "crates/mrd-render-d3d11",
   "crates/mrd-render-linux",
   "crates/mrd-render-macos",
+  "crates/mrd-render-opengl",
   "crates/mrd-session",
   "crates/mrd-signal-client",
   "crates/mrd-signal-proto",
@@ -74,6 +75,9 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package.mrd-render-linux]
+opt-level = 3
+
+[profile.dev.package.mrd-render-opengl]
 opt-level = 3
 
 [profile.dev.package.openh264]

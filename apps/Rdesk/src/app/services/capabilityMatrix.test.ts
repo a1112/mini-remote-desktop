@@ -340,6 +340,25 @@ describe("evaluateCapabilityCombination", () => {
     expect(result.reasons.join(" ")).toContain("WebView render is a visual fallback");
   });
 
+  it("blocks OpenGL renderer with D3D11 shared memory and suggests CPU memory", () => {
+    const snapshot = buildCapabilitySnapshotFromEnvironment({
+      ...windowsEnvironment,
+      available_renderers: ["d3d11", "opengl", "webview"],
+    });
+
+    const result = evaluateCapabilityCombination(
+      {
+        renderer: "opengl",
+        memory: "d3d11_shared",
+      },
+      snapshot
+    );
+
+    expect(result.status).toBe("blocked");
+    expect(result.reasons.join(" ")).toContain("OpenGL renderer requires CPU-backed frames");
+    expect(result.requiredFallbacks).toContain("memory.cpu");
+  });
+
   it("prefers shared display capture source over copy display and window", () => {
     const sources: CapabilityItem[] = [
       {

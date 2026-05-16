@@ -355,6 +355,14 @@ fn add_render_capabilities(items: &mut Vec<CapabilityItem>, platform: &Capabilit
                 CapabilityStatus::Unimplemented,
                 Some("D3D12 renderer is probe-only and not wired as mainline display."),
             );
+            push_supported(
+                items,
+                platform,
+                CapabilityDomain::Render,
+                "render.opengl",
+                "OpenGL",
+                "OpenGL renderer is wired as a CPU-backed fallback; D3D11 remains the Windows high-performance path.",
+            );
         }
         CapabilityPlatform::Macos => push_supported(
             items,
@@ -532,6 +540,17 @@ fn default_constraints() -> Vec<CapabilityConstraint> {
             reason: "D3D12 native renderer is probe-only and not wired as mainline display."
                 .to_string(),
             fallback_ids: vec!["render.d3d11".to_string(), "render.webview".to_string()],
+        },
+        CapabilityConstraint {
+            id: "opengl_requires_cpu_input".to_string(),
+            applies_to: vec![
+                "render.opengl".to_string(),
+                "memory.d3d11_shared".to_string(),
+            ],
+            status: CapabilityConstraintStatus::Block,
+            reason: "OpenGL renderer requires CPU-backed frames; D3D11 shared texture interop is not wired."
+                .to_string(),
+            fallback_ids: vec!["memory.cpu".to_string()],
         },
         CapabilityConstraint {
             id: "webview_degraded_render".to_string(),
@@ -754,5 +773,14 @@ mod tests {
             .constraints
             .iter()
             .any(|constraint| constraint.id == "openh264_requires_cpu_input"));
+        assert!(snapshot
+            .constraints
+            .iter()
+            .any(|constraint| constraint.id == "opengl_requires_cpu_input"));
+        #[cfg(windows)]
+        assert!(snapshot
+            .capabilities
+            .iter()
+            .any(|item| item.id == "render.opengl"));
     }
 }

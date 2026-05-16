@@ -123,6 +123,7 @@ pub enum DecoderType {
 pub enum RendererType {
     D3d11,
     Macos,
+    Opengl,
     #[cfg(target_os = "linux")]
     Linux,
 }
@@ -848,6 +849,17 @@ fn run_renderer_thread(
                 let _ = (width, height, target_hwnd, receiver);
                 anyhow::bail!("Metal render display is only available on macOS");
             }
+        }
+        RendererType::Opengl => {
+            let factory = mrd_render_opengl::OpenglRendererFactory;
+            let mut renderer = factory
+                .create()
+                .map_err(|error| anyhow::anyhow!("create OpenGL renderer failed: {error}"))?;
+            renderer
+                .attach_target(RenderTarget::WindowHandle(target_hwnd.unwrap_or(0)))
+                .map_err(|error| anyhow::anyhow!("attach OpenGL renderer failed: {error}"))?;
+
+            run_renderer_upload_loop(renderer, receiver)
         }
         #[cfg(target_os = "linux")]
         RendererType::Linux => {
@@ -4201,6 +4213,7 @@ mod tests {
             renderer: match std::env::var("MRD_HARNESS_RENDERER").as_deref() {
                 Ok("d3d11") => Some(RendererType::D3d11),
                 Ok("macos") | Ok("metal") => Some(RendererType::Macos),
+                Ok("opengl") => Some(RendererType::Opengl),
                 #[cfg(target_os = "linux")]
                 Ok("linux") => Some(RendererType::Linux),
                 _ => None,
