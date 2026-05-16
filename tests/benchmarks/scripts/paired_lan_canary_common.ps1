@@ -92,6 +92,7 @@ function Convert-CrossReportToCanaryRow {
     New-CanarySelectedProfile -Width $Profile.width -Height $Profile.height -Fps $Profile.fps -BitrateMbps $Profile.bitrate_mbps
   }
   $classification = Get-CrossCanaryClassification -Report $Report -Profile $Profile -SelectedProfile $selected
+  $status = Get-CrossCanaryStatus -Report $Report -Classification $classification
 
   [pscustomobject]@{
     id = $Profile.id
@@ -100,8 +101,8 @@ function Convert-CrossReportToCanaryRow {
     fps = [int]$Profile.fps
     bitrate_mbps = [int]$Profile.bitrate_mbps
     duration_secs = [int]$Profile.duration_secs
-    chain = "dxgi/nvenc_h264/quic_datagram_media_v2/nvdec/d3d11_shared"
-    status = [string]$Report.status
+    chain = "dxgi/nvenc_h264/quic_datagram_media_v3_or_v2/nvdec/d3d11_shared"
+    status = $status
     classification = $classification
     fps_observed = [double](Select-CanaryValue $probe.current_fps 0)
     selected_profile = $selected
@@ -115,6 +116,20 @@ function Convert-CrossReportToCanaryRow {
     raw_report_path = $ReportPath
     error_message = $Report.errorMessage
   }
+}
+
+function Get-CrossCanaryStatus {
+  param(
+    [Parameter(Mandatory = $true)]$Report,
+    [Parameter(Mandatory = $true)][string]$Classification
+  )
+
+  if ($Report.status -eq "completed") { return "completed" }
+  if ($Report.status -eq "skipped") { return "skipped" }
+  if ($Classification -in @("unsupported", "profile_downgraded", "peer_version_mismatch")) {
+    return "skipped"
+  }
+  return [string]$Report.status
 }
 
 function Get-CrossCanaryClassification {
@@ -260,7 +275,7 @@ function New-PairedLanCanaryReport {
     mode = $Mode
     generated_at = $GeneratedAt
     git_commit = $GitCommit
-    chain = if ($Mode -eq "cross") { "dxgi/nvenc_h264/quic_datagram_media_v2/nvdec/d3d11_shared" } else { "dxgi/nvenc_h264/quic_datagram/nvdec/d3d11_shared" }
+    chain = if ($Mode -eq "cross") { "dxgi/nvenc_h264/quic_datagram_media_v3_or_v2/nvdec/d3d11_shared" } else { "dxgi/nvenc_h264/quic_datagram/nvdec/d3d11_shared" }
     completed = @($Rows | Where-Object { $_.status -eq "completed" }).Count
     skipped = @($Rows | Where-Object { $_.status -eq "skipped" }).Count
     failed = @($Rows | Where-Object { $_.status -ne "completed" -and $_.status -ne "skipped" }).Count

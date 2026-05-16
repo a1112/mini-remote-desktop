@@ -59,4 +59,16 @@ $downgradeComparison = Compare-PairedLanCanaryRows -LocalRows @($localRow) -Cros
 Assert-Equal $downgradeComparison[0].status "profile_downgraded" "Profile mismatch is classified as downgrade"
 Assert-True (-not $downgradeComparison[0].comparable) "Profile downgraded rows are not comparable"
 
+$peerMissingReport = [pscustomobject]@{
+  status = "failed"
+  failureReason = "peer_not_found"
+  errorMessage = "No LAN peer available"
+  probeSnapshot = $null
+  mediaPipelineSnapshot = $null
+  sessionSnapshot = $null
+}
+$peerMissingRow = Convert-CrossReportToCanaryRow -Profile $profiles[0] -Report $peerMissingReport -ReportPath "raw/cross-1080p60.json"
+Assert-Equal $peerMissingRow.status "skipped" "Missing LAN peer is an environment skip"
+Assert-Equal $peerMissingRow.classification "unsupported" "Missing LAN peer is classified as unsupported"
+
 Write-Host "paired LAN canary common tests passed"
