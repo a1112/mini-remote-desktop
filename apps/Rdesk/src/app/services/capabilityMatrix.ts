@@ -420,9 +420,12 @@ export function evaluateCapabilityCombination(
   }
 
   if (request.renderer === "opengl" && request.memory === "d3d11_shared") {
-    status = "blocked";
-    reasons.push("OpenGL renderer requires CPU-backed frames; D3D11 shared texture input is unsupported.");
-    requiredFallbacks.push("memory.cpu");
+    if (status !== "blocked") {
+      status = "degraded";
+    }
+    reasons.push(
+      "OpenGL uses WGL/DX interop when available, with D3D11 readback fallback; use D3D11 native for highest throughput."
+    );
   }
 
   if (request.renderer === "webview" && hasCapability(snapshot, "render.webview")) {

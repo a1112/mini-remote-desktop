@@ -361,7 +361,7 @@ fn add_render_capabilities(items: &mut Vec<CapabilityItem>, platform: &Capabilit
                 CapabilityDomain::Render,
                 "render.opengl",
                 "OpenGL",
-                "OpenGL renderer is wired as a CPU-backed fallback; D3D11 remains the Windows high-performance path.",
+                "OpenGL renderer supports CPU-backed frames and WGL/DX interop for D3D11 shared NV12 when available; D3D11 remains the Windows high-performance path.",
             );
         }
         CapabilityPlatform::Macos => push_supported(
@@ -542,15 +542,15 @@ fn default_constraints() -> Vec<CapabilityConstraint> {
             fallback_ids: vec!["render.d3d11".to_string(), "render.webview".to_string()],
         },
         CapabilityConstraint {
-            id: "opengl_requires_cpu_input".to_string(),
+            id: "opengl_d3d11_shared_interop_hybrid".to_string(),
             applies_to: vec![
                 "render.opengl".to_string(),
                 "memory.d3d11_shared".to_string(),
             ],
-            status: CapabilityConstraintStatus::Block,
-            reason: "OpenGL renderer requires CPU-backed frames; D3D11 shared texture interop is not wired."
+            status: CapabilityConstraintStatus::Degrade,
+            reason: "OpenGL accepts D3D11 shared NV12 through WGL/DX interop when available and readback fallback otherwise; D3D11 native remains preferred for parity."
                 .to_string(),
-            fallback_ids: vec!["memory.cpu".to_string()],
+            fallback_ids: vec!["render.d3d11".to_string()],
         },
         CapabilityConstraint {
             id: "webview_degraded_render".to_string(),
@@ -776,7 +776,7 @@ mod tests {
         assert!(snapshot
             .constraints
             .iter()
-            .any(|constraint| constraint.id == "opengl_requires_cpu_input"));
+            .any(|constraint| constraint.id == "opengl_d3d11_shared_interop_hybrid"));
         #[cfg(windows)]
         assert!(snapshot
             .capabilities

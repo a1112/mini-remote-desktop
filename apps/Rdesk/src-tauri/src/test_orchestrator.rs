@@ -2516,10 +2516,6 @@ fn validate_scenario_for_current_platform(
             renderer_type
         );
     }
-    if renderer_type == "opengl" && config.zero_copy == Some(true) {
-        anyhow::bail!("OpenGL renderer requires CPU memory input");
-    }
-
     if config.zero_copy == Some(true) && !current_platform_memory_modes().contains(&"d3d11_shared")
     {
         anyhow::bail!(
@@ -3721,7 +3717,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_custom_matrix_rejects_opengl_with_d3d11_shared_memory() {
+    fn validate_custom_matrix_allows_opengl_with_d3d11_shared_hybrid_memory() {
         let config = TestConfigData {
             capture_type: Some("dxgi".to_string()),
             encoder_type: Some("nvenc_h264".to_string()),
@@ -3732,11 +3728,8 @@ mod tests {
             ..Default::default()
         };
 
-        let error = validate_scenario_for_current_platform("matrix", &config)
-            .expect_err("OpenGL should reject D3D11 shared texture memory");
-        assert!(error
-            .to_string()
-            .contains("OpenGL renderer requires CPU memory input"));
+        validate_scenario_for_current_platform("matrix", &config)
+            .expect("OpenGL hybrid should accept D3D11 shared texture memory");
     }
 
     #[test]
