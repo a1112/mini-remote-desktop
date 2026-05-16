@@ -40,6 +40,18 @@ async fn main() -> Result<()> {
     // Initialize application state with tray
     let app_state = Arc::new(AppState::with_tray(tray.clone()));
     {
+        let (device_id, device_name) = app_state::default_lan_device_identity();
+        let mut devices = app_state.devices.lock().await;
+        if let Some((registered_id, registered_name)) =
+            devices.register_if_unregistered(device_id, device_name)
+        {
+            info!(
+                "Default LAN device registered: {} ({})",
+                registered_id.0, registered_name
+            );
+        }
+    }
+    {
         let tray_available = tray.lock().unwrap().is_available();
         let mut shell = app_state.shell.lock().await;
         shell.tray_available = tray_available;
