@@ -2,8 +2,9 @@ use bytes::Bytes;
 use std::time::Duration;
 
 use mrd_transport_quic_quinn::{
-    fragment_access_unit, QuicAuReassembler, QuicAuReassemblerConfig, QuinnDatagramEndpoint,
-    QuinnDatagramPair, QuinnServerListener,
+    fragment_access_unit, fragment_media_payload_v3, is_quic_media_v3_datagram, QuicAuReassembler,
+    QuicAuReassemblerConfig, QuicMediaCodec, QuicMediaPayloadType, QuicMediaReassembler,
+    QuinnDatagramEndpoint, QuinnDatagramPair, QuinnServerListener,
 };
 
 #[tokio::test]
@@ -128,6 +129,68 @@ async fn quinn_reassembler_tracks_duplicate_fragments() {
 
     assert!(completed.is_none());
     assert_eq!(reassembler.stats().duplicate_fragments, 1);
+}
+
+#[test]
+fn quic_media_v3_reassembles_typed_h264_access_unit() {
+    let payload = vec![0x65; 4096];
+    let datagrams = fragment_media_payload_v3(
+        QuicMediaPayloadType::AccessUnit,
+        QuicMediaCodec::H264,
+        3,
+        77,
+        123_456,
+        true,
+        &payload,
+        512,
+    )
+    .expect("fragment v3 media payload");
+
+    assert!(datagrams.len() > 1);
+    assert!(is_quic_media_v3_datagram(&datagrams[0]));
+
+    let mut reassembler = QuicMediaReassembler::default();
+    let mut completed = None;
+    for datagram in datagrams.iter().rev() {
+        completed = reassembler
+            .push_datagram(datagram)
+            .expect("reassemble v3 media payload")
+            .or(completed);
+    }
+
+    let frame = completed.expect("completed v3 media frame");
+    assert_eq!(frame.payload_type, QuicMediaPayloadType::AccessUnit);
+    assert_eq!(frame.codec, QuicMediaCodec::H264);
+    assert_eq!(frame.profile_id, 3);
+    assert_eq!(frame.frame_id, 77);
+    assert_eq!(frame.timestamp_us, 123_456);
+    assert!(frame.is_keyframe());
+    assert_eq!(frame.payload, Bytes::from(payload));
+}
+
+#[test]
+fn quic_media_v3_rejects_invalid_magic() {
+    let datagrams = fragment_media_payload_v3(
+        QuicMediaPayloadType::AccessUnit,
+        QuicMediaCodec::H264,
+        1,
+        10,
+        20,
+        false,
+        b"payload",
+        1200,
+    )
+    .expect("fragment v3 media payload");
+    let mut corrupted = datagrams[0].to_vec();
+    corrupted[0] = b'X';
+    assert!(!is_quic_media_v3_datagram(&corrupted));
+
+    let mut reassembler = QuicMediaReassembler::default();
+    let error = reassembler
+        .push_datagram(&corrupted)
+        .expect_err("invalid magic should fail");
+
+    assert!(error.to_string().contains("invalid media v3 magic"));
 }
 
 #[tokio::test]

@@ -802,7 +802,6 @@ function crossDevicePeerSkipReason(
   const requiredQuicCapabilities = [
     "quic_datagram",
     "quic_datagram_2k144",
-    "quic_datagram_media_v2",
     "media_profile_control_v1",
   ];
   const missing = requiredQuicCapabilities.filter(
@@ -818,6 +817,14 @@ function crossDevicePeerSkipReason(
   const mediaCapabilities = (peer.media_capabilities ?? []).map((capability) =>
     capability.toLowerCase()
   );
+  const hasMediaV3 =
+    mediaProtocolVersion >= 3 &&
+    (transports.includes("quic_datagram_media_v3") ||
+      mediaCapabilities.includes("quic_datagram_media_v3"));
+  const hasMediaV2 =
+    mediaProtocolVersion >= 2 &&
+    (transports.includes("quic_datagram_media_v2") ||
+      mediaCapabilities.includes("quic_datagram_media_v2"));
   const requiredMediaCapabilities = [
     "dxgi_capture",
     "nvenc_h264",
@@ -827,8 +834,8 @@ function crossDevicePeerSkipReason(
   const missingMediaCapabilities = requiredMediaCapabilities.filter(
     (capability) => !mediaCapabilities.includes(capability)
   );
-  if (mediaProtocolVersion < 2) {
-    return `LAN peer is not on required QUIC media v2 protocol: ${peer.device_id} reports media protocol ${
+  if (!hasMediaV3 && !hasMediaV2) {
+    return `LAN peer is not on a compatible QUIC media protocol: ${peer.device_id} reports media protocol ${
       mediaProtocolVersion || "unknown"
     }`;
   }

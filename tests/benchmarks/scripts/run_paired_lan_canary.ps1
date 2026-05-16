@@ -131,6 +131,14 @@ function Invoke-CrossCanaryProfile($Repo, $Profile, $OutputRoot, $TargetDeviceId
       Start-Sleep -Seconds 1
     }
 
+    if (-not $report -and (Test-Path $reportPath)) {
+      try {
+        $report = Get-Content $reportPath -Raw | ConvertFrom-Json
+      } catch {
+        $report = $null
+      }
+    }
+
     if (-not $report) {
       $report = [pscustomobject]@{
         status = "failed"

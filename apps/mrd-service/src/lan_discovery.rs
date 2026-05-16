@@ -11,8 +11,11 @@ use mrd_pipeline_core::{
 };
 use mrd_proto::{DeviceId, SessionId};
 use mrd_transport_quic_quinn::{
-    fragment_access_unit, QuicAuFrame, QuicAuReassembler, QuicAuReassemblerConfig,
-    QuinnDatagramEndpoint, QuinnServerBootstrap, QuinnServerListener, QUIC_AU_FRAGMENT_HEADER_LEN,
+    fragment_access_unit, fragment_media_payload_v3, is_quic_media_v3_datagram, QuicAuFrame,
+    QuicAuReassembler, QuicAuReassemblerConfig, QuicAuReassemblerStats, QuicMediaCodec,
+    QuicMediaFrame, QuicMediaPayloadType, QuicMediaReassembler, QuinnDatagramEndpoint,
+    QuinnServerBootstrap, QuinnServerListener, QUIC_AU_FRAGMENT_HEADER_LEN,
+    QUIC_MEDIA_V3_FRAGMENT_HEADER_LEN,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -42,10 +45,11 @@ const LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES: usize = 4 * 1024 * 1024;
 const LAN_QUIC_MEDIA_TRANSPORT: &str = "quic_datagram";
 const LAN_QUIC_MEDIA_PROFILE_TRANSPORT: &str = "quic_datagram_2k144";
 const LAN_QUIC_MEDIA_V2_TRANSPORT: &str = "quic_datagram_media_v2";
+const LAN_QUIC_MEDIA_V3_TRANSPORT: &str = "quic_datagram_media_v3";
 const LAN_QUIC_RELIABLE_MEDIA_TRANSPORT: &str = "quic_stream_media_v2";
 const LAN_MEDIA_PROFILE_CONTROL_TRANSPORT: &str = "media_profile_control_v1";
 const LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT: &str = "capture_source_control_v1";
-const LAN_MEDIA_PROTOCOL_VERSION: u32 = 2;
+const LAN_MEDIA_PROTOCOL_VERSION: u32 = 3;
 const LAN_CAPTURE_DXGI_CAPABILITY: &str = "dxgi_capture";
 const LAN_ENCODE_NVENC_H264_CAPABILITY: &str = "nvenc_h264";
 const LAN_DECODE_NVDEC_CAPABILITY: &str = "nvdec";
@@ -1426,6 +1430,7 @@ async fn build_announcement(app_state: &Arc<AppState>) -> Option<LanAnnouncement
             LAN_QUIC_MEDIA_TRANSPORT.to_string(),
             LAN_QUIC_MEDIA_PROFILE_TRANSPORT.to_string(),
             LAN_QUIC_MEDIA_V2_TRANSPORT.to_string(),
+            LAN_QUIC_MEDIA_V3_TRANSPORT.to_string(),
             LAN_QUIC_RELIABLE_MEDIA_TRANSPORT.to_string(),
             LAN_MEDIA_PROFILE_CONTROL_TRANSPORT.to_string(),
             LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT.to_string(),
@@ -1447,6 +1452,7 @@ fn service_build_id() -> String {
 fn lan_media_capabilities() -> Vec<String> {
     let mut capabilities = vec![
         LAN_QUIC_MEDIA_V2_TRANSPORT.to_string(),
+        LAN_QUIC_MEDIA_V3_TRANSPORT.to_string(),
         LAN_QUIC_RELIABLE_MEDIA_TRANSPORT.to_string(),
     ];
     #[cfg(windows)]
@@ -1836,7 +1842,7 @@ async fn send_quic_media_loop(
         .max_datagram_size()
         .unwrap_or(LAN_QUIC_FALLBACK_DATAGRAM_BYTES)
         .min(LAN_QUIC_FALLBACK_DATAGRAM_BYTES)
-        .max(QUIC_AU_FRAGMENT_HEADER_LEN + 1);
+        .max(QUIC_MEDIA_V3_FRAGMENT_HEADER_LEN.max(QUIC_AU_FRAGMENT_HEADER_LEN) + 1);
 
     let mut frame_id = 1_u64;
     let mut active_source_id: Option<String> = None;
@@ -1852,6 +1858,11 @@ async fn send_quic_media_loop(
         .lock()
         .await
         .supports(&session_id, LAN_QUIC_RELIABLE_MEDIA_TRANSPORT);
+    let media_v3_supported = app_state
+        .peer_media_capabilities
+        .lock()
+        .await
+        .supports(&session_id, LAN_QUIC_MEDIA_V3_TRANSPORT);
     loop {
         let loop_started = Instant::now();
         if !session_allows_media(&app_state, &session_id).await {
@@ -2016,25 +2027,39 @@ async fn send_quic_media_loop(
         for access_unit in access_units {
             let is_keyframe =
                 h264_access_unit_is_keyframe(access_unit.is_keyframe, &access_unit.bytes);
-            let media_payload = encode_lan_media_envelope(LanMediaEnvelope {
-                payload_type: LAN_MEDIA_PAYLOAD_H264_ACCESS_UNIT,
-                codec: LAN_MEDIA_CODEC_H264,
-                sequence: frame_id,
-                timestamp_us: access_unit.timestamp_us,
-                profile: profile.clone(),
-                payload: access_unit.bytes.clone(),
-            })?;
             let mut reliable_fragments = None;
             let send_result = (|| -> Result<()> {
                 let fragment_started = Instant::now();
-                let fragments = fragment_access_unit(
-                    frame_id as u32,
-                    access_unit.timestamp_us,
-                    is_keyframe,
-                    &media_payload,
-                    max_datagram_size,
-                )
-                .context("failed to fragment LAN QUIC media frame")?;
+                let fragments = if media_v3_supported {
+                    fragment_media_payload_v3(
+                        QuicMediaPayloadType::AccessUnit,
+                        QuicMediaCodec::H264,
+                        lan_media_profile_id(&profile),
+                        frame_id as u32,
+                        access_unit.timestamp_us,
+                        is_keyframe,
+                        &access_unit.bytes,
+                        max_datagram_size,
+                    )
+                    .context("failed to fragment LAN QUIC media v3 frame")?
+                } else {
+                    let media_payload = encode_lan_media_envelope(LanMediaEnvelope {
+                        payload_type: LAN_MEDIA_PAYLOAD_H264_ACCESS_UNIT,
+                        codec: LAN_MEDIA_CODEC_H264,
+                        sequence: frame_id,
+                        timestamp_us: access_unit.timestamp_us,
+                        profile: profile.clone(),
+                        payload: access_unit.bytes.clone(),
+                    })?;
+                    fragment_access_unit(
+                        frame_id as u32,
+                        access_unit.timestamp_us,
+                        is_keyframe,
+                        &media_payload,
+                        max_datagram_size,
+                    )
+                    .context("failed to fragment LAN QUIC media v2 frame")?
+                };
                 sender_stats.record_elapsed("sender.fragment", fragment_started);
 
                 let datagram_send_started = Instant::now();
@@ -2048,7 +2073,7 @@ async fn send_quic_media_loop(
                 if should_send_access_unit_reliably(
                     reliable_media_supported,
                     is_keyframe,
-                    media_payload.len(),
+                    access_unit.bytes.len(),
                     max_datagram_size,
                 ) {
                     reliable_fragments = Some(fragments);
@@ -2359,6 +2384,7 @@ async fn receive_quic_media_loop(
     endpoint: QuinnDatagramEndpoint,
 ) -> Result<()> {
     let mut reassembler = QuicAuReassembler::new(lan_media_reassembler_config());
+    let mut media_v3_reassembler = QuicMediaReassembler::new(lan_media_reassembler_config());
     let mut frame_orderer =
         LanMediaFrameOrderer::new(LAN_MEDIA_RECEIVER_REORDER_MAX_PENDING_FRAMES);
     let mut decoder = create_lan_receiver_decoder(&app_state, &session_id)
@@ -2415,10 +2441,29 @@ async fn receive_quic_media_loop(
                 continue;
             }
         }
-        if let Some(frame) = reassembler
-            .push_datagram(&media_message)
-            .context("failed to reassemble LAN QUIC media frame")?
-        {
+        let reassembled_frame = if is_quic_media_v3_datagram(&media_message) {
+            match media_v3_reassembler
+                .push_datagram(&media_message)
+                .context("failed to reassemble LAN QUIC media v3 frame")?
+            {
+                Some(frame) => {
+                    quic_media_v3_frame_to_legacy_frame(
+                        &app_state,
+                        &session_id,
+                        frame,
+                        media_v3_reassembler.stats(),
+                    )
+                    .await?
+                }
+                None => None,
+            }
+        } else {
+            reassembler
+                .push_datagram(&media_message)
+                .context("failed to reassemble LAN QUIC media v2 frame")?
+        };
+
+        if let Some(frame) = reassembled_frame {
             let ready_frames = frame_orderer.push(frame);
             for frame in ready_frames {
                 let envelope = match decode_lan_media_envelope(&frame.payload) {
@@ -2604,6 +2649,68 @@ async fn receive_quic_media_loop(
             }
         }
     }
+}
+
+async fn quic_media_v3_frame_to_legacy_frame(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+    frame: QuicMediaFrame,
+    reassembler_stats: QuicAuReassemblerStats,
+) -> Result<Option<QuicAuFrame>> {
+    let profile = selected_media_profile(app_state, session_id).await;
+    let expected_profile_id = lan_media_profile_id(&profile);
+    if frame.profile_id != expected_profile_id {
+        app_state.probes.lock().await.record_probe_drop(
+            session_id,
+            frame.payload.len() as u64,
+            now_ms(),
+            format!(
+                "LAN media v3 profile id mismatch: frame={}, expected={}, got={}, reassembler={{completed:{}, expired:{}, evicted:{}, duplicate:{}, rejected:{}, pending:{}}}",
+                frame.frame_id,
+                expected_profile_id,
+                frame.profile_id,
+                reassembler_stats.completed_frames,
+                reassembler_stats.expired_frames,
+                reassembler_stats.evicted_frames,
+                reassembler_stats.duplicate_fragments,
+                reassembler_stats.rejected_fragments,
+                reassembler_stats.pending_frames
+            ),
+        );
+        return Ok(None);
+    }
+
+    let payload_type = match frame.payload_type {
+        QuicMediaPayloadType::AccessUnit => LAN_MEDIA_PAYLOAD_H264_ACCESS_UNIT,
+        QuicMediaPayloadType::Probe => LAN_MEDIA_PAYLOAD_PROBE_FRAME,
+        QuicMediaPayloadType::Control => 3,
+    };
+    let codec = match frame.codec {
+        QuicMediaCodec::None => 0,
+        QuicMediaCodec::H264 => LAN_MEDIA_CODEC_H264,
+        unsupported => {
+            anyhow::bail!("unsupported LAN media v3 codec: {unsupported:?}");
+        }
+    };
+    if frame.payload_type == QuicMediaPayloadType::AccessUnit && codec != LAN_MEDIA_CODEC_H264 {
+        anyhow::bail!("LAN media v3 access unit is not H.264");
+    }
+
+    let envelope_payload = encode_lan_media_envelope(LanMediaEnvelope {
+        payload_type,
+        codec,
+        sequence: u64::from(frame.frame_id),
+        timestamp_us: frame.timestamp_us,
+        profile,
+        payload: frame.payload.to_vec(),
+    })?;
+
+    Ok(Some(QuicAuFrame {
+        frame_id: frame.frame_id,
+        timestamp_us: frame.timestamp_us,
+        is_keyframe: frame.is_keyframe(),
+        payload: envelope_payload.into(),
+    }))
 }
 
 async fn record_lan_decoded_frames(
@@ -3596,6 +3703,16 @@ fn decode_lan_media_envelope(frame: &[u8]) -> Result<LanMediaEnvelope> {
     })
 }
 
+fn lan_media_profile_id(profile: &MediaProfile) -> u32 {
+    let mut bytes = Vec::with_capacity(20 + profile.codec.len());
+    bytes.extend_from_slice(&profile.width.to_le_bytes());
+    bytes.extend_from_slice(&profile.height.to_le_bytes());
+    bytes.extend_from_slice(&profile.fps.to_le_bytes());
+    bytes.extend_from_slice(&profile.bitrate_mbps.to_le_bytes());
+    bytes.extend_from_slice(profile.codec.as_bytes());
+    fnv1a64(&bytes) as u32
+}
+
 #[cfg(test)]
 fn build_probe_compressed_pattern(sequence: u64, profile: &MediaProfile) -> Vec<u8> {
     let mut payload = vec![0_u8; media_payload_bytes(profile)];
@@ -3797,7 +3914,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_exposes_lan_media_v2_peer_capabilities() {
+    async fn snapshot_exposes_lan_media_v3_peer_capabilities_with_v2_rollout_compatibility() {
         let state = LanDiscoveryState::default();
         state
             .upsert_peer(
@@ -3827,10 +3944,7 @@ mod tests {
         let peer = state.snapshot().await.peers.pop().expect("peer");
 
         assert_eq!(peer.service_build_id.as_deref(), Some("build-a"));
-        assert_eq!(
-            peer.media_protocol_version,
-            Some(LAN_MEDIA_PROTOCOL_VERSION)
-        );
+        assert_eq!(peer.media_protocol_version, Some(3));
         assert!(peer
             .media_capabilities
             .contains(&LAN_CAPTURE_DXGI_CAPABILITY.to_string()));
@@ -3846,6 +3960,12 @@ mod tests {
         assert!(peer
             .media_capabilities
             .contains(&LAN_QUIC_RELIABLE_MEDIA_TRANSPORT.to_string()));
+        assert!(peer
+            .media_capabilities
+            .contains(&LAN_QUIC_MEDIA_V2_TRANSPORT.to_string()));
+        assert!(peer
+            .media_capabilities
+            .contains(&LAN_QUIC_MEDIA_V3_TRANSPORT.to_string()));
     }
 
     #[tokio::test]
@@ -4825,6 +4945,59 @@ mod tests {
 
         assert!(error.to_string().contains("invalid magic"));
         assert!(!error.to_string().contains("legacy probe fallback"));
+    }
+
+    #[tokio::test]
+    async fn lan_media_v3_frame_converts_to_receiver_envelope() {
+        let app_state = Arc::new(AppState::new());
+        let session_id = SessionId("media-v3-session".to_string());
+        let profile = MediaProfile {
+            width: 1920,
+            height: 1080,
+            fps: 144,
+            bitrate_mbps: 20,
+            codec: "h264".to_string(),
+        };
+        app_state.media_profiles.lock().await.set(
+            session_id.clone(),
+            MediaProfileNegotiation {
+                requested: profile.clone(),
+                selected: profile.clone(),
+                status: "accepted".to_string(),
+                reason: None,
+                selected_source_id: None,
+                selected_width: Some(profile.width),
+                selected_height: Some(profile.height),
+                downgrade_reason: None,
+            },
+        );
+
+        let converted = quic_media_v3_frame_to_legacy_frame(
+            &app_state,
+            &session_id,
+            QuicMediaFrame {
+                payload_type: QuicMediaPayloadType::AccessUnit,
+                codec: QuicMediaCodec::H264,
+                profile_id: lan_media_profile_id(&profile),
+                frame_id: 42,
+                timestamp_us: 123_456,
+                flags: 1,
+                payload: vec![0, 0, 0, 1, 0x65].into(),
+            },
+            QuicAuReassemblerStats::default(),
+        )
+        .await
+        .unwrap()
+        .expect("converted frame");
+
+        assert_eq!(converted.frame_id, 42);
+        assert!(converted.is_keyframe);
+        let envelope = decode_lan_media_envelope(&converted.payload).unwrap();
+        assert_eq!(envelope.payload_type, LAN_MEDIA_PAYLOAD_H264_ACCESS_UNIT);
+        assert_eq!(envelope.codec, LAN_MEDIA_CODEC_H264);
+        assert_eq!(envelope.sequence, 42);
+        assert_eq!(envelope.profile, profile);
+        assert_eq!(envelope.payload, vec![0, 0, 0, 1, 0x65]);
     }
 
     #[test]
