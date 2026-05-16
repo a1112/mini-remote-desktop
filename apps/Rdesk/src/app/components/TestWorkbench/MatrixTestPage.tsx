@@ -649,6 +649,7 @@ const lanAutomationCommands: LanE2EAutomationCommands = {
   openRemoteDisplayWindow: commands.openRemoteDisplayWindow,
   ipcSessionSnapshot: commands.ipcSessionSnapshot,
   ipcProbeSnapshot: commands.ipcProbeSnapshot,
+  ipcMediaPipelineSnapshot: commands.ipcMediaPipelineSnapshot,
   ipcStopSession: commands.ipcStopSession,
 };
 

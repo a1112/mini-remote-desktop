@@ -59,6 +59,10 @@ const LAN_E2E_MIN_DECODED_FRAMES_ENV: &str = "MRD_LAN_E2E_MIN_DECODED_FRAMES";
 const LAN_E2E_MIN_FPS_ENV: &str = "MRD_LAN_E2E_MIN_FPS";
 const LAN_E2E_STOP_ON_COMPLETE_ENV: &str = "MRD_LAN_E2E_STOP_ON_COMPLETE";
 const LAN_E2E_REPORT_PATH_ENV: &str = "MRD_LAN_E2E_REPORT_PATH";
+const LAN_E2E_PROFILE_WIDTH_ENV: &str = "MRD_LAN_E2E_PROFILE_WIDTH";
+const LAN_E2E_PROFILE_HEIGHT_ENV: &str = "MRD_LAN_E2E_PROFILE_HEIGHT";
+const LAN_E2E_PROFILE_FPS_ENV: &str = "MRD_LAN_E2E_PROFILE_FPS";
+const LAN_E2E_PROFILE_BITRATE_MBPS_ENV: &str = "MRD_LAN_E2E_PROFILE_BITRATE_MBPS";
 
 static APP_IS_QUITTING: AtomicBool = AtomicBool::new(false);
 
@@ -2145,6 +2149,10 @@ struct LanE2eAutorunLaunchConfig {
     min_decoded_frames: Option<String>,
     min_fps: Option<String>,
     stop_on_complete: Option<String>,
+    profile_width: Option<String>,
+    profile_height: Option<String>,
+    profile_fps: Option<String>,
+    profile_bitrate_mbps: Option<String>,
 }
 
 fn lan_e2e_autorun_config_from_env() -> Option<LanE2eAutorunLaunchConfig> {
@@ -2167,6 +2175,10 @@ where
         min_decoded_frames: non_empty_env(env(LAN_E2E_MIN_DECODED_FRAMES_ENV)),
         min_fps: non_empty_env(env(LAN_E2E_MIN_FPS_ENV)),
         stop_on_complete: non_empty_env(env(LAN_E2E_STOP_ON_COMPLETE_ENV)),
+        profile_width: non_empty_env(env(LAN_E2E_PROFILE_WIDTH_ENV)),
+        profile_height: non_empty_env(env(LAN_E2E_PROFILE_HEIGHT_ENV)),
+        profile_fps: non_empty_env(env(LAN_E2E_PROFILE_FPS_ENV)),
+        profile_bitrate_mbps: non_empty_env(env(LAN_E2E_PROFILE_BITRATE_MBPS_ENV)),
     })
 }
 
@@ -2179,6 +2191,10 @@ fn build_lan_e2e_autorun_route(config: LanE2eAutorunLaunchConfig) -> String {
     push_query_param(&mut params, "minDecodedFrames", config.min_decoded_frames);
     push_query_param(&mut params, "minFps", config.min_fps);
     push_query_param(&mut params, "stopOnComplete", config.stop_on_complete);
+    push_query_param(&mut params, "width", config.profile_width);
+    push_query_param(&mut params, "height", config.profile_height);
+    push_query_param(&mut params, "fps", config.profile_fps);
+    push_query_param(&mut params, "bitrateMbps", config.profile_bitrate_mbps);
 
     let query = params
         .into_iter()
@@ -2267,11 +2283,15 @@ mod tray_tests {
             min_decoded_frames: Some("2".to_string()),
             min_fps: Some("5".to_string()),
             stop_on_complete: Some("false".to_string()),
+            profile_width: Some("1920".to_string()),
+            profile_height: Some("1080".to_string()),
+            profile_fps: Some("180".to_string()),
+            profile_bitrate_mbps: Some("20".to_string()),
         });
 
         assert_eq!(
             route,
-            "/test/e2e?autorun=lan-e2e&targetDeviceId=agent%20device%2F1&transport=quic&timeoutMs=2500&minDecodedFrames=2&minFps=5&stopOnComplete=false"
+            "/test/e2e?autorun=lan-e2e&targetDeviceId=agent%20device%2F1&transport=quic&timeoutMs=2500&minDecodedFrames=2&minFps=5&stopOnComplete=false&width=1920&height=1080&fps=180&bitrateMbps=20"
         );
     }
 
