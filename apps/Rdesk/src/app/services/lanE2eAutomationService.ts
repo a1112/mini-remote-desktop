@@ -178,6 +178,7 @@ const DEFAULT_MIN_SAMPLE_DURATION_MS = 0;
 const QUIC_DATAGRAM_MEDIA_CAPABILITY = "quic_datagram";
 const QUIC_2K144_MEDIA_CAPABILITY = "quic_datagram_2k144";
 const QUIC_DATAGRAM_MEDIA_V2_CAPABILITY = "quic_datagram_media_v2";
+const QUIC_DATAGRAM_MEDIA_V3_CAPABILITY = "quic_datagram_media_v3";
 const MEDIA_PROFILE_CONTROL_CAPABILITY = "media_profile_control_v1";
 const REQUIRED_WINDOWS_MEDIA_CAPABILITIES = [
   "dxgi_capture",
@@ -601,12 +602,19 @@ function peerSupportsTransport(peer: LanPeerInfo, transportKind: string): boolea
     const mediaCapabilities = (peer.media_capabilities ?? []).map((capability) =>
       capability.toLowerCase()
     );
+    const supportsMediaV3 =
+      mediaProtocolVersion >= 3 &&
+      (transports.includes(QUIC_DATAGRAM_MEDIA_V3_CAPABILITY) ||
+        mediaCapabilities.includes(QUIC_DATAGRAM_MEDIA_V3_CAPABILITY));
+    const supportsMediaV2 =
+      mediaProtocolVersion >= 2 &&
+      (transports.includes(QUIC_DATAGRAM_MEDIA_V2_CAPABILITY) ||
+        mediaCapabilities.includes(QUIC_DATAGRAM_MEDIA_V2_CAPABILITY));
     return (
       transports.includes(QUIC_DATAGRAM_MEDIA_CAPABILITY) &&
       transports.includes(QUIC_2K144_MEDIA_CAPABILITY) &&
-      transports.includes(QUIC_DATAGRAM_MEDIA_V2_CAPABILITY) &&
       transports.includes(MEDIA_PROFILE_CONTROL_CAPABILITY) &&
-      mediaProtocolVersion >= 2 &&
+      (supportsMediaV3 || supportsMediaV2) &&
       REQUIRED_WINDOWS_MEDIA_CAPABILITIES.every((capability) =>
         mediaCapabilities.includes(capability)
       )
@@ -629,19 +637,27 @@ function buildPeerNotReadyMessage(peer: LanPeerInfo, transportKind: string): str
     if (lower.includes(QUIC_DATAGRAM_MEDIA_CAPABILITY)) {
       const missing = [
         QUIC_2K144_MEDIA_CAPABILITY,
-        QUIC_DATAGRAM_MEDIA_V2_CAPABILITY,
         MEDIA_PROFILE_CONTROL_CAPABILITY,
       ]
-        .filter((capability) => !lower.includes(capability))
+        .filter((capability) => !lower.includes(capability));
       if (missing.length > 0) {
         return `LAN peer supports ${QUIC_DATAGRAM_MEDIA_CAPABILITY} but not required media controls [${missing.join(", ")}]: ${peer.device_id} supports ${transportList}. Rebuild and restart the peer mrd-service/Rdesk from the latest main branch.`;
       }
     }
-    if (lower.includes("quic")) {
+    if (lower.includes("quic") && !lower.includes(QUIC_DATAGRAM_MEDIA_CAPABILITY)) {
       return `LAN peer advertises legacy quic but not ${QUIC_DATAGRAM_MEDIA_CAPABILITY}: ${peer.device_id} supports ${transportList}. Rebuild and restart the peer mrd-service/Rdesk from the latest main branch.`;
     }
-    if (!lower.includes(QUIC_DATAGRAM_MEDIA_V2_CAPABILITY) || mediaProtocolVersion < 2) {
-      return `LAN peer is not on the required QUIC media v2 protocol: ${peer.device_id} supports ${transportList}, media protocol ${mediaProtocolVersion || "unknown"}. Rebuild and restart the peer mrd-service/Rdesk from the same branch.`;
+    const hasMediaV3 =
+      lower.includes(QUIC_DATAGRAM_MEDIA_V3_CAPABILITY) ||
+      mediaCapabilities.includes(QUIC_DATAGRAM_MEDIA_V3_CAPABILITY);
+    const hasMediaV2 =
+      lower.includes(QUIC_DATAGRAM_MEDIA_V2_CAPABILITY) ||
+      mediaCapabilities.includes(QUIC_DATAGRAM_MEDIA_V2_CAPABILITY);
+    const supportsMediaProtocol =
+      (mediaProtocolVersion >= 3 && hasMediaV3) ||
+      (mediaProtocolVersion >= 2 && hasMediaV2);
+    if (!supportsMediaProtocol) {
+      return `LAN peer is not on a compatible QUIC media protocol: ${peer.device_id} supports ${transportList}, media protocol ${mediaProtocolVersion || "unknown"}. Rebuild and restart the peer mrd-service/Rdesk from the same branch.`;
     }
     const missingMediaCapabilities = REQUIRED_WINDOWS_MEDIA_CAPABILITIES.filter(
       (capability) => !mediaCapabilities.includes(capability)
