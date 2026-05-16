@@ -2,6 +2,7 @@ param(
   [string]$RepoRoot = ".",
   [string]$OutputDir = "target/codex-matrix-compare",
   [string]$TargetDeviceId,
+  [string]$TargetAddress,
   [int]$DurationSecs = 30,
   [int]$BitrateMbps = 20,
   [double]$RatioThreshold = 0.8,
@@ -39,6 +40,142 @@ function Stop-ProcessTree([int]$ProcessId) {
     Stop-ProcessTree -ProcessId $child.ProcessId
   }
   Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+}
+
+function Invoke-LanDiscoveryDiagnostics($OutputRoot, [string]$TargetAddress) {
+  $targets = @("255.255.255.255")
+  if ($TargetAddress) {
+    $targets = @($TargetAddress) + $targets
+  }
+  try {
+    $targets += Get-NetIPAddress -AddressFamily IPv4 |
+      Where-Object { $_.IPAddress -notlike "127.*" -and $_.IPAddress -notlike "169.254*" -and $_.PrefixLength -lt 32 } |
+      ForEach-Object { Get-IPv4BroadcastAddress -IPAddress $_.IPAddress -PrefixLength $_.PrefixLength }
+  } catch {
+    $targets += @()
+  }
+  $targets = @($targets | Where-Object { $_ } | Select-Object -Unique)
+
+  $ping = $null
+  if ($TargetAddress) {
+    try {
+      $pingSamples = @(Test-Connection -ComputerName $TargetAddress -Count 2 -ErrorAction Stop)
+      $ping = [pscustomobject]@{
+        target = $TargetAddress
+        succeeded = $true
+        response_time_ms = @($pingSamples | ForEach-Object { $_.ResponseTime })
+      }
+    } catch {
+      $ping = [pscustomobject]@{
+        target = $TargetAddress
+        succeeded = $false
+        error = $_.Exception.Message
+      }
+    }
+  }
+
+  $udpResponses = @()
+  $sentTargets = @()
+  $udpError = $null
+  try {
+    $udp = [System.Net.Sockets.UdpClient]::new(0)
+    $udp.EnableBroadcast = $true
+    $udp.Client.ReceiveTimeout = 1000
+    $packet = @{
+      type = "probe"
+      magic = "mrd-lan-discovery-v1"
+      app_id = "rdesk"
+      instance_id = "paired-canary-probe-$([guid]::NewGuid().ToString("N"))"
+      device_id = $null
+      timestamp_ms = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    } | ConvertTo-Json -Compress
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($packet)
+    foreach ($target in $targets) {
+      try {
+        [void]$udp.Send($bytes, $bytes.Length, $target, 21116)
+        $sentTargets += $target
+      } catch {
+        $udpResponses += [pscustomobject]@{
+          target = $target
+          error = $_.Exception.Message
+        }
+      }
+    }
+
+    $deadline = (Get-Date).AddSeconds(5)
+    while ((Get-Date) -lt $deadline) {
+      try {
+        $remote = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
+        $data = $udp.Receive([ref]$remote)
+        $udpResponses += [pscustomobject]@{
+          remote = $remote.ToString()
+          payload = [System.Text.Encoding]::UTF8.GetString($data)
+        }
+      } catch [System.Net.Sockets.SocketException] {
+      }
+    }
+    $udp.Close()
+  } catch {
+    $udpError = $_.Exception.Message
+  }
+
+  $diagnostics = [pscustomobject]@{
+    generated_at = (Get-Date).ToUniversalTime().ToString("o")
+    target_device_id = $TargetDeviceId
+    target_address = $TargetAddress
+    udp_port = 21116
+    probe_targets = $targets
+    sent_targets = $sentTargets
+    ping = $ping
+    udp_response_count = @($udpResponses | Where-Object { $_.remote }).Count
+    udp_responses = $udpResponses
+    udp_error = $udpError
+  }
+
+  $jsonPath = Join-Path $OutputRoot "lan-discovery-diagnostics.json"
+  $markdownPath = Join-Path $OutputRoot "lan-discovery-diagnostics.md"
+  ConvertTo-Json -InputObject $diagnostics -Depth 16 | Set-Content -Path $jsonPath -Encoding Ascii
+  $pingStatus = if ($ping -and $ping.succeeded) { "reachable" } elseif ($ping) { "failed" } else { "not tested" }
+  $lines = @(
+    "# LAN Discovery Diagnostics",
+    "",
+    "- Target device: $TargetDeviceId",
+    "- Target address: $TargetAddress",
+    "- UDP port: 21116",
+    "- Ping: $pingStatus",
+    "- UDP responses: $($diagnostics.udp_response_count)",
+    "- Probe targets: $($targets -join ', ')",
+    ""
+  )
+  if ($udpResponses.Count -gt 0) {
+    $lines += "| Remote | Target | Error |"
+    $lines += "| --- | --- | --- |"
+    foreach ($response in $udpResponses) {
+      $lines += "| $($response.remote) | $($response.target) | $($response.error) |"
+    }
+  }
+  $lines -join "`n" | Set-Content -Path $markdownPath -Encoding Ascii
+  $diagnostics
+}
+
+function Get-IPv4BroadcastAddress([string]$IPAddress, [int]$PrefixLength) {
+  $bytes = [System.Net.IPAddress]::Parse($IPAddress).GetAddressBytes()
+  $mask = [byte[]]@(0, 0, 0, 0)
+  for ($i = 0; $i -lt 4; $i++) {
+    $remaining = $PrefixLength - ($i * 8)
+    if ($remaining -ge 8) {
+      $mask[$i] = 255
+    } elseif ($remaining -gt 0) {
+      $mask[$i] = [byte](256 - (1 -shl (8 - $remaining)))
+    } else {
+      $mask[$i] = 0
+    }
+  }
+  $broadcast = [byte[]]@(0, 0, 0, 0)
+  for ($i = 0; $i -lt 4; $i++) {
+    $broadcast[$i] = [byte]($bytes[$i] -bor ((-bnot $mask[$i]) -band 255))
+  }
+  [System.Net.IPAddress]::new($broadcast).ToString()
 }
 
 function Invoke-LocalCanaryProfile($Repo, $Profile, $GitCommit) {
@@ -179,6 +316,7 @@ if (-not $SkipLocal) {
 
 $crossRows = @()
 if (-not $SkipCross) {
+  Invoke-LanDiscoveryDiagnostics -OutputRoot $outputRoot -TargetAddress $TargetAddress | Out-Null
   $timeoutMs = ($DurationSecs * 1000) + 30000
   foreach ($profile in $profiles) {
     Write-Host "Running cross-device canary $($profile.id)"
