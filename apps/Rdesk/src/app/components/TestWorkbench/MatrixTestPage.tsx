@@ -120,6 +120,7 @@ const MATRIX_DIMENSIONS: MatrixDimension[] = [
     options: [
       { id: "renderer_none", name: "No display", enabled: true },
       { id: "d3d11", name: "DX11 popup", enabled: false },
+      { id: "opengl", name: "OpenGL", enabled: false },
       { id: "d3d12_native", name: "DX12 native", enabled: false },
       { id: "macos", name: "Metal", enabled: false },
       { id: "linux", name: "Linux", enabled: false },
@@ -217,7 +218,7 @@ function defaultDecodersForOs(os: HostOs): string[] {
 }
 
 function defaultRenderersForOs(os: HostOs): string[] {
-  if (os === "windows") return ["none", "d3d11"];
+  if (os === "windows") return ["none", "d3d11", "opengl"];
   if (os === "macos") return ["none", "macos"];
   if (os === "linux") return ["none", "linux"];
   return ["none"];
@@ -353,6 +354,9 @@ function buildConfig(options: SelectedMatrixOption[]): TestConfig {
           config.render_display = true;
         } else if (option.id === "d3d12_native") {
           config.renderer_type = "d3d12";
+          config.render_display = true;
+        } else if (option.id === "opengl") {
+          config.renderer_type = "opengl";
           config.render_display = true;
         } else if (option.id === "macos") {
           config.renderer_type = "macos";
@@ -549,6 +553,9 @@ function unsupportedMatrixReason(config: TestConfig): string | null {
   }
   if (config.renderer_type === "macos" && config.zero_copy) {
     return "Metal renderer does not accept D3D11 shared texture input";
+  }
+  if (config.renderer_type === "opengl" && config.zero_copy) {
+    return "OpenGL renderer requires CPU memory input";
   }
   if (config.encoder_type === "videotoolbox_h264" && config.decoder_type === "nvdec") {
     return "VideoToolbox H.264 output should use VideoToolbox, software, or encode-only decode modes";
@@ -1039,6 +1046,7 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
         isOptionEnabled(next, "memory", "d3d11_shared")
       ) {
         next = setOptionEnabled(next, "renderer", "d3d11", true);
+        next = setOptionEnabled(next, "renderer", "opengl", false);
         next = setOptionEnabled(next, "renderer", "renderer_none", false);
       }
 
@@ -1046,6 +1054,14 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
         dimensionId === "renderer" &&
         optionId === "d3d11" &&
         !isOptionEnabled(next, "renderer", "d3d11")
+      ) {
+        next = setOptionEnabled(next, "memory", "d3d11_shared", false);
+      }
+
+      if (
+        dimensionId === "renderer" &&
+        optionId === "opengl" &&
+        isOptionEnabled(next, "renderer", "opengl")
       ) {
         next = setOptionEnabled(next, "memory", "d3d11_shared", false);
       }
@@ -1064,6 +1080,7 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
         isOptionEnabled(next, "renderer", "renderer_none")
       ) {
         next = setOptionEnabled(next, "renderer", "d3d11", false);
+        next = setOptionEnabled(next, "renderer", "opengl", false);
         next = setOptionEnabled(next, "renderer", "d3d12_native", false);
         next = setOptionEnabled(next, "renderer", "macos", false);
         next = setOptionEnabled(next, "renderer", "linux", false);

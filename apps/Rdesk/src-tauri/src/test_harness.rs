@@ -123,6 +123,7 @@ pub enum DecoderType {
 pub enum RendererType {
     D3d11,
     Macos,
+    Opengl,
     #[cfg(target_os = "linux")]
     Linux,
 }
@@ -662,6 +663,7 @@ impl PipelineRenderer {
         width: usize,
         height: usize,
         target_hwnd: Option<isize>,
+        use_shared_texture_decode: bool,
     ) -> Result<Self> {
         let (sender, receiver) = mpsc::sync_channel(1);
         let last_error = Arc::new(Mutex::new(None));
@@ -694,6 +696,40 @@ impl PipelineRenderer {
                 render_done: Some(render_done_rx),
                 last_error,
                 d3d11_device_ptr: Some(d3d11_device_ptr),
+            });
+        }
+
+        #[cfg(windows)]
+        if renderer_type == RendererType::Opengl && use_shared_texture_decode {
+            let renderer = mrd_render_opengl::OpenglRenderer::new_hybrid().map_err(|error| {
+                anyhow::anyhow!("create OpenGL hybrid renderer failed: {error}")
+            })?;
+            let d3d11_device_ptr = renderer.d3d11_device_ptr().map(|ptr| ptr as usize);
+            let (render_done_tx, render_done_rx) = mpsc::channel();
+            let render_thread = thread::Builder::new()
+                .name("mrd-test-render".to_string())
+                .spawn(move || {
+                    if let Err(error) = run_opengl_hybrid_renderer_thread(
+                        renderer,
+                        width,
+                        height,
+                        target_hwnd,
+                        receiver,
+                    ) {
+                        if let Ok(mut last_error) = thread_error.lock() {
+                            *last_error = Some(error.to_string());
+                        }
+                    }
+                    let _ = render_done_tx.send(());
+                })
+                .map_err(|error| anyhow::anyhow!("spawn render thread failed: {error}"))?;
+
+            return Ok(Self {
+                sender,
+                render_thread: Some(render_thread),
+                render_done: Some(render_done_rx),
+                last_error,
+                d3d11_device_ptr,
             });
         }
 
@@ -849,6 +885,44 @@ fn run_renderer_thread(
                 anyhow::bail!("Metal render display is only available on macOS");
             }
         }
+        RendererType::Opengl => {
+            #[cfg(windows)]
+            {
+                let window = match target_hwnd {
+                    Some(_) => None,
+                    None => Some(D3d11TestWindow::new(width, height)?),
+                };
+                let hwnd = target_hwnd.unwrap_or_else(|| {
+                    window
+                        .as_ref()
+                        .expect("OpenGL test window exists")
+                        .hwnd_value()
+                });
+                let factory = mrd_render_opengl::OpenglRendererFactory;
+                let mut renderer = factory
+                    .create()
+                    .map_err(|error| anyhow::anyhow!("create OpenGL renderer failed: {error}"))?;
+                renderer
+                    .attach_target(RenderTarget::WindowHandle(hwnd))
+                    .map_err(|error| anyhow::anyhow!("attach OpenGL renderer failed: {error}"))?;
+
+                run_d3d11_render_loop(window, renderer, receiver)
+            }
+
+            #[cfg(not(windows))]
+            {
+                let _ = (width, height);
+                let factory = mrd_render_opengl::OpenglRendererFactory;
+                let mut renderer = factory
+                    .create()
+                    .map_err(|error| anyhow::anyhow!("create OpenGL renderer failed: {error}"))?;
+                renderer
+                    .attach_target(RenderTarget::WindowHandle(target_hwnd.unwrap_or(0)))
+                    .map_err(|error| anyhow::anyhow!("attach OpenGL renderer failed: {error}"))?;
+
+                run_renderer_upload_loop(renderer, receiver)
+            }
+        }
         #[cfg(target_os = "linux")]
         RendererType::Linux => {
             use mrd_render::RendererInstance;
@@ -912,6 +986,31 @@ fn run_d3d11_renderer_thread(
     renderer
         .attach_target(RenderTarget::WindowHandle(hwnd))
         .map_err(|error| anyhow::anyhow!("attach D3D11 renderer failed: {error}"))?;
+
+    run_d3d11_render_loop(window, Box::new(renderer), receiver)
+}
+
+#[cfg(windows)]
+fn run_opengl_hybrid_renderer_thread(
+    mut renderer: mrd_render_opengl::OpenglRenderer,
+    width: usize,
+    height: usize,
+    target_hwnd: Option<isize>,
+    receiver: mpsc::Receiver<RenderCommand>,
+) -> Result<()> {
+    let window = match target_hwnd {
+        Some(_) => None,
+        None => Some(D3d11TestWindow::new(width, height)?),
+    };
+    let hwnd = target_hwnd.unwrap_or_else(|| {
+        window
+            .as_ref()
+            .expect("OpenGL hybrid test window exists")
+            .hwnd_value()
+    });
+    renderer
+        .attach_target(RenderTarget::WindowHandle(hwnd))
+        .map_err(|error| anyhow::anyhow!("attach OpenGL hybrid renderer failed: {error}"))?;
 
     run_d3d11_render_loop(window, Box::new(renderer), receiver)
 }
@@ -1156,8 +1255,8 @@ impl D3d11TestWindow {
         use windows::Win32::System::LibraryLoader::GetModuleHandleW;
         use windows::Win32::UI::WindowsAndMessaging::{
             CreateWindowExW, DefWindowProcW, LoadCursorW, RegisterClassW, ShowWindow, CS_HREDRAW,
-            CS_VREDRAW, CW_USEDEFAULT, HMENU, IDC_ARROW, SW_SHOW, WINDOW_EX_STYLE, WM_CLOSE,
-            WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+            CS_OWNDC, CS_VREDRAW, CW_USEDEFAULT, HMENU, IDC_ARROW, SW_SHOW, WINDOW_EX_STYLE,
+            WM_CLOSE, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
         };
 
         unsafe extern "system" fn wnd_proc(
@@ -1190,7 +1289,7 @@ impl D3d11TestWindow {
             .map_err(|error| anyhow::anyhow!("load cursor failed: {error}"))?;
 
         let window_class = WNDCLASSW {
-            style: CS_HREDRAW | CS_VREDRAW,
+            style: CS_HREDRAW | CS_VREDRAW | CS_OWNDC,
             lpfnWndProc: Some(wnd_proc),
             hInstance: hinstance,
             hCursor: cursor,
@@ -1612,7 +1711,13 @@ impl TestHarness {
             .renderer
             .as_ref()
             .map(|renderer_type| {
-                PipelineRenderer::new(renderer_type, width, height, config.renderer_target_hwnd)
+                PipelineRenderer::new(
+                    renderer_type,
+                    width,
+                    height,
+                    config.renderer_target_hwnd,
+                    use_shared_texture_decode,
+                )
             })
             .transpose()?;
         let renderer_d3d11_device_ptr = renderer
@@ -4201,6 +4306,7 @@ mod tests {
             renderer: match std::env::var("MRD_HARNESS_RENDERER").as_deref() {
                 Ok("d3d11") => Some(RendererType::D3d11),
                 Ok("macos") | Ok("metal") => Some(RendererType::Macos),
+                Ok("opengl") => Some(RendererType::Opengl),
                 #[cfg(target_os = "linux")]
                 Ok("linux") => Some(RendererType::Linux),
                 _ => None,

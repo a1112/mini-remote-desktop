@@ -2510,13 +2510,12 @@ fn validate_scenario_for_current_platform(
             os_type
         );
     }
-    if matches!(renderer_type, "d3d12" | "opengl") {
+    if renderer_type == "d3d12" {
         anyhow::bail!(
             "Renderer type {} uses the independent render.probe path and is not supported by custom/matrix harness runs",
             renderer_type
         );
     }
-
     if config.zero_copy == Some(true) && !current_platform_memory_modes().contains(&"d3d11_shared")
     {
         anyhow::bail!(
@@ -3169,6 +3168,7 @@ fn harness_config_from_data(config: &TestConfigData) -> HarnessConfig {
         renderer: match (config.render_display, config.renderer_type.as_deref()) {
             (Some(true), Some("d3d11")) => Some(RendererType::D3d11),
             (Some(true), Some("macos")) | (Some(true), Some("metal")) => Some(RendererType::Macos),
+            (Some(true), Some("opengl")) => Some(RendererType::Opengl),
             #[cfg(target_os = "linux")]
             (Some(true), Some("linux")) => Some(RendererType::Linux),
             _ => None,
@@ -3634,6 +3634,25 @@ mod tests {
     }
 
     #[test]
+    fn harness_config_requires_explicit_render_display_for_opengl() {
+        let legacy_config = TestConfigData {
+            renderer_type: Some("opengl".to_string()),
+            ..Default::default()
+        };
+        let enabled_config = TestConfigData {
+            renderer_type: Some("opengl".to_string()),
+            render_display: Some(true),
+            ..Default::default()
+        };
+
+        assert_eq!(harness_config_from_data(&legacy_config).renderer, None);
+        assert_eq!(
+            harness_config_from_data(&enabled_config).renderer,
+            Some(RendererType::Opengl)
+        );
+    }
+
+    #[test]
     fn harness_config_passes_d3d11_renderer_target_hwnd() {
         let config = TestConfigData {
             renderer_type: Some("d3d11".to_string()),
@@ -3679,6 +3698,38 @@ mod tests {
             harness_config_from_data(&config).visual_preview,
             Some(false)
         );
+    }
+
+    #[test]
+    fn validate_custom_matrix_allows_opengl_with_cpu_memory() {
+        let config = TestConfigData {
+            capture_type: Some("synthetic".to_string()),
+            encoder_type: Some("openh264".to_string()),
+            decoder_type: Some("software".to_string()),
+            renderer_type: Some("opengl".to_string()),
+            render_display: Some(true),
+            zero_copy: Some(false),
+            ..Default::default()
+        };
+
+        validate_scenario_for_current_platform("matrix", &config)
+            .expect("OpenGL CPU-backed matrix run should be supported");
+    }
+
+    #[test]
+    fn validate_custom_matrix_allows_opengl_with_d3d11_shared_hybrid_memory() {
+        let config = TestConfigData {
+            capture_type: Some("dxgi".to_string()),
+            encoder_type: Some("nvenc_h264".to_string()),
+            decoder_type: Some("nvdec".to_string()),
+            renderer_type: Some("opengl".to_string()),
+            render_display: Some(true),
+            zero_copy: Some(true),
+            ..Default::default()
+        };
+
+        validate_scenario_for_current_platform("matrix", &config)
+            .expect("OpenGL hybrid should accept D3D11 shared texture memory");
     }
 
     #[test]

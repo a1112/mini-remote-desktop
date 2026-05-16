@@ -340,6 +340,24 @@ describe("evaluateCapabilityCombination", () => {
     expect(result.reasons.join(" ")).toContain("WebView render is a visual fallback");
   });
 
+  it("allows OpenGL hybrid renderer with D3D11 shared memory", () => {
+    const snapshot = buildCapabilitySnapshotFromEnvironment({
+      ...windowsEnvironment,
+      available_renderers: ["d3d11", "opengl", "webview"],
+    });
+
+    const result = evaluateCapabilityCombination(
+      {
+        renderer: "opengl",
+        memory: "d3d11_shared",
+      },
+      snapshot
+    );
+
+    expect(result.status).not.toBe("blocked");
+    expect(result.requiredFallbacks).not.toContain("memory.cpu");
+  });
+
   it("prefers shared display capture source over copy display and window", () => {
     const sources: CapabilityItem[] = [
       {

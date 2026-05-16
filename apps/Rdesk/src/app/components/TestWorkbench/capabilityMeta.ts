@@ -35,7 +35,7 @@ const PLATFORM_TAGS: Record<string, string> = {
   quic: "通用",
   webrtc: "通用",
   d3d12: "Windows",
-  opengl: "Windows",
+  opengl: "通用",
   webview: "通用",
 };
 

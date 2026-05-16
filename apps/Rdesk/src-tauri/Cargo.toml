@@ -32,6 +32,7 @@ mrd-encode-openh264 = { path = "../../../crates/mrd-encode-openh264" }
 mrd-observability = { path = "../../../crates/mrd-observability" }
 mrd-render = { path = "../../../crates/mrd-render" }
 mrd-render-d3d11 = { path = "../../../crates/mrd-render-d3d11" }
+mrd-render-opengl = { path = "../../../crates/mrd-render-opengl" }
 mrd-signal-client = { path = "../../../crates/mrd-signal-client" }
 mrd-signal-proto = { path = "../../../crates/mrd-signal-proto" }
 mrd-transport-quic-quinn = { path = "../../../crates/mrd-transport-quic-quinn" }
