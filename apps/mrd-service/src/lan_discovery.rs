@@ -55,6 +55,7 @@ const LAN_MEDIA_MAX_FPS: u32 = 249;
 const LAN_MEDIA_TARGET_BITRATE_MBPS: u32 = 64;
 const LAN_QUIC_FALLBACK_DATAGRAM_BYTES: usize = 1_200;
 const LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES: usize = 4 * 1024 * 1024;
+const LAN_QUIC_RELIABLE_WHOLE_FRAME_MIN_PIXELS: u32 = 2560 * 1440;
 const LAN_QUIC_MEDIA_TRANSPORT: &str = "quic_datagram";
 const LAN_QUIC_MEDIA_PROFILE_TRANSPORT: &str = "quic_datagram_2k144";
 const LAN_QUIC_MEDIA_V2_TRANSPORT: &str = "quic_datagram_media_v2";
@@ -2952,7 +2953,8 @@ async fn send_quic_media_loop(
                 reliable_media_supported || persistent_media_supported,
                 media_v3_supported,
                 fragments.len(),
-                reliable_whole_frame_media_enabled(),
+                &profile,
+                reliable_whole_frame_media_override(),
             );
             let reliable_fragments = if send_as_reliable_frame {
                 let reliable_fragment_started = Instant::now();
@@ -3307,23 +3309,31 @@ fn should_send_access_unit_as_reliable_frame(
     reliable_media_supported: bool,
     media_v3_supported: bool,
     fragment_count: usize,
-    reliable_whole_frame_enabled: bool,
+    profile: &MediaProfile,
+    reliable_whole_frame_override: Option<bool>,
 ) -> bool {
-    reliable_whole_frame_enabled
-        && reliable_media_supported
-        && media_v3_supported
-        && fragment_count > 1
+    if !reliable_media_supported || !media_v3_supported || fragment_count <= 1 {
+        return false;
+    }
+    if let Some(enabled) = reliable_whole_frame_override {
+        return enabled;
+    }
+    profile.width.saturating_mul(profile.height) >= LAN_QUIC_RELIABLE_WHOLE_FRAME_MIN_PIXELS
 }
 
-fn reliable_whole_frame_media_enabled() -> bool {
-    matches!(
-        std::env::var(LAN_RELIABLE_WHOLE_FRAME_ENV)
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str(),
-        "1" | "true" | "yes" | "on"
+fn reliable_whole_frame_media_override() -> Option<bool> {
+    reliable_whole_frame_media_override_from_env_value(
+        std::env::var(LAN_RELIABLE_WHOLE_FRAME_ENV).ok().as_deref(),
     )
+}
+
+fn reliable_whole_frame_media_override_from_env_value(value: Option<&str>) -> Option<bool> {
+    match value?.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        "" => None,
+        _ => None,
+    }
 }
 
 fn h264_access_unit_is_keyframe(metadata_is_keyframe: bool, payload: &[u8]) -> bool {
@@ -6679,22 +6689,99 @@ mod tests {
     }
 
     #[test]
-    fn lan_quic_media_routes_fragmented_v3_frames_over_datagrams_by_default() {
+    fn lan_quic_media_routes_large_fragmented_v3_frames_over_reliable_stream_by_default() {
+        let profile_1080p = MediaProfile {
+            width: 1920,
+            height: 1080,
+            fps: 144,
+            bitrate_mbps: 20,
+            codec: "h264".to_string(),
+        };
+        let profile_2k = MediaProfile {
+            width: 2560,
+            height: 1440,
+            fps: 60,
+            bitrate_mbps: 20,
+            codec: "h264".to_string(),
+        };
+
         assert!(!should_send_access_unit_as_reliable_frame(
-            true, true, 2, false
+            true,
+            true,
+            2,
+            &profile_1080p,
+            None
         ));
         assert!(should_send_access_unit_as_reliable_frame(
-            true, true, 2, true
+            true,
+            true,
+            2,
+            &profile_2k,
+            None
         ));
         assert!(!should_send_access_unit_as_reliable_frame(
-            true, true, 1, true
+            true,
+            true,
+            1,
+            &profile_2k,
+            None
         ));
         assert!(!should_send_access_unit_as_reliable_frame(
-            true, false, 2, true
+            true,
+            false,
+            2,
+            &profile_2k,
+            None
         ));
         assert!(!should_send_access_unit_as_reliable_frame(
-            false, true, 2, true
+            false,
+            true,
+            2,
+            &profile_2k,
+            None
         ));
+        assert!(should_send_access_unit_as_reliable_frame(
+            true,
+            true,
+            2,
+            &profile_1080p,
+            Some(true)
+        ));
+        assert!(!should_send_access_unit_as_reliable_frame(
+            true,
+            true,
+            2,
+            &profile_2k,
+            Some(false)
+        ));
+    }
+
+    #[test]
+    fn reliable_whole_frame_media_env_override_parses_truthy_and_falsey_values() {
+        assert_eq!(
+            reliable_whole_frame_media_override_from_env_value(Some("1")),
+            Some(true)
+        );
+        assert_eq!(
+            reliable_whole_frame_media_override_from_env_value(Some("true")),
+            Some(true)
+        );
+        assert_eq!(
+            reliable_whole_frame_media_override_from_env_value(Some("0")),
+            Some(false)
+        );
+        assert_eq!(
+            reliable_whole_frame_media_override_from_env_value(Some("off")),
+            Some(false)
+        );
+        assert_eq!(
+            reliable_whole_frame_media_override_from_env_value(Some("")),
+            None
+        );
+        assert_eq!(
+            reliable_whole_frame_media_override_from_env_value(None),
+            None
+        );
     }
 
     #[test]

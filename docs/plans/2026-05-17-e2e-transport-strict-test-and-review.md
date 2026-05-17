@@ -6,7 +6,9 @@ Source archive: `docs/research/2026-05-17-end-to-end-remote-desktop-transport-re
 
 The archived review is intentionally strict: the current project should not claim production-grade WAN E2E remote desktop until the test evidence covers NAT, relay fallback, device trust, reliable control semantics, and long-running failure recovery. The current strongest implementation remains the native LAN media path:
 
-`DXGI shared -> NVENC H.264 -> QUIC datagram media v3 -> NVDEC D3D11 shared -> D3D11 native render`
+`DXGI shared -> NVENC H.264 -> QUIC media v3 hybrid -> NVDEC D3D11 shared -> D3D11 native render`
+
+The default LAN transport remains datagram-first for 1080p high-refresh frames. Large 2K-and-above multi-fragment access units use the persistent reliable media stream by default when both peers advertise `quic_stream_media_v3`, because packet-sized datagram fragmentation can under-deliver whole H.264 access units on real LAN peers. `MRD_LAN_RELIABLE_WHOLE_FRAME=0|1` remains an override for A/B testing.
 
 The local dual-process LAN test bed added on this branch is the right next evidence layer because it runs two separate `mrd-service` processes, distinct IPC endpoints, real LAN discovery, real QUIC media transport, native render attach, and optional media datagram impairment. It does not prove WAN product readiness by itself.
 
@@ -18,6 +20,7 @@ The local dual-process LAN test bed added on this branch is the right next evide
 | Display refresh | 180/249 FPS rows can be selected in the runtime request but are environment-limited if the active display mode is only 144 Hz. | P0 | Report `display_refresh_limited` and mark the row non-comparable instead of passing or failing performance. |
 | Test impairment | Delay/jitter must not sleep the capture/encode loop; impairment must act like network delivery delay. | P0 | `sender.send_datagram` p95 must stay sub-millisecond when only synthetic delay/jitter is enabled. |
 | QUIC media envelope | H.264 access units must route by v3 media envelope and never fall back to legacy probe parsing. | P0 | No report may contain `invalid magic` or `legacy probe fallback` for accepted media rows. |
+| Hybrid media transport | 1080p high-refresh frames should stay on datagrams; 2K-and-above multi-fragment access units should use persistent reliable media when available. | P0 | 2K rows must report `sender.send_reliable` or equivalent stream metrics, while 1080p144 keeps low `sender.send_datagram` p95. |
 | Cross-device parity | Cross-device Windows peer must be compared only when local and peer selected profiles match. | P0 | Paired comparison uses selected profile equality and `>=80%` of local baseline FPS. |
 | WAN readiness | TURN/relay, NAT traversal, and identity pinning are not proven by this branch. | P0 product gap | WAN rows remain out of acceptance until a separate relay/WebRTC/TURN plan lands. |
 
@@ -103,6 +106,7 @@ Required peer capabilities:
 - `dxgi_capture`
 - `nvenc_h264`
 - `quic_datagram_media_v3`
+- `quic_stream_media_v3`
 - `nvdec`
 - `d3d11_native_render`
 - `display_mode_control_v1`
