@@ -97,4 +97,28 @@ $peerMissingRow = Convert-CrossReportToCanaryRow -Profile $profiles[0] -Report $
 Assert-Equal $peerMissingRow.status "skipped" "Missing LAN peer is an environment skip"
 Assert-Equal $peerMissingRow.classification "unsupported" "Missing LAN peer is classified as unsupported"
 
+$sampleFpsReport = [pscustomobject]@{
+  status = "completed"
+  failureReason = $null
+  errorMessage = $null
+  sampleObservedFps = 57.0
+  probeSnapshot = [pscustomobject]@{
+    current_fps = 44.0
+    frames_decoded = 484
+    frames_dropped = 0
+    media_probe_width = 1920
+    media_probe_height = 1080
+    media_probe_target_fps = 60
+    media_probe_target_bitrate_mbps = 20
+  }
+  mediaPipelineSnapshot = [pscustomobject]@{
+    dropped_frames = 0
+    queue_depth = 0
+    stage_metrics = @()
+  }
+  sessionSnapshot = [pscustomobject]@{ state = "streaming" }
+}
+$sampleFpsRow = Convert-CrossReportToCanaryRow -Profile $profiles[0] -Report $sampleFpsReport -ReportPath "raw/cross-1080p60.json"
+Assert-Equal $sampleFpsRow.fps_observed 57.0 "Cross report prefers sample-window FPS over cumulative probe FPS"
+
 Write-Host "paired LAN canary common tests passed"

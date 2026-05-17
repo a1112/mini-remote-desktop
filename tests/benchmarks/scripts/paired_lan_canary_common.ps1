@@ -104,7 +104,7 @@ function Convert-CrossReportToCanaryRow {
     chain = "dxgi/nvenc_h264/quic_datagram_media_v3_or_v2/nvdec/d3d11_shared"
     status = $status
     classification = $classification
-    fps_observed = [double](Select-CanaryValue $probe.current_fps 0)
+    fps_observed = [double](Select-CanaryValue (Select-CanaryValue $Report.sampleObservedFps $probe.current_fps) 0)
     selected_profile = $selected
     session_established = [bool]($Report.sessionSnapshot -and $Report.sessionSnapshot.state -ne "failed")
     first_frame_seen = [bool]($probe -and $probe.frames_decoded -gt 0)

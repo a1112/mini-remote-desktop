@@ -618,6 +618,62 @@ describe("runLanE2EAutomation", () => {
     expect(ipcProbeSnapshot).toHaveBeenCalledTimes(2);
   });
 
+  it("uses sample-window FPS when cumulative probe FPS includes startup delay", async () => {
+    let currentTime = 0;
+    let probeIndex = 0;
+    const decodedFrames = [10, 16, 17, 18];
+    const ipcProbeSnapshot = vi.fn().mockImplementation(() => {
+      const frameCount = decodedFrames[Math.min(probeIndex, decodedFrames.length - 1)];
+      probeIndex += 1;
+      currentTime += currentTime === 0 ? 10 : 100;
+      return Promise.resolve(
+        ok({
+          session_id: "unused",
+          frames_received: frameCount,
+          frames_decoded: frameCount,
+          frames_dropped: 0,
+          current_fps: 10,
+          bitrate_mbps: 20,
+          media_probe_valid: true,
+          media_probe_format: "h264",
+          media_probe_width: 1920,
+          media_probe_height: 1080,
+          media_probe_target_fps: 60,
+          media_probe_target_bitrate_mbps: 20,
+          media_probe_payload_bytes: 55555,
+          last_media_sequence: frameCount,
+          last_media_timestamp_us: 123456,
+          last_media_payload_hash: "fnv1a64:abc123",
+          last_error: null,
+        })
+      );
+    });
+    const commands = withCaptureSourceCommands(createCommands({ ipcProbeSnapshot }));
+
+    const result = await runLanE2EAutomation(commands, {
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      requestedProfile: {
+        width: 1920,
+        height: 1080,
+        fps: 60,
+        bitrate_mbps: 20,
+        codec: "h264",
+      },
+      sampleIntervalMs: 0,
+      timeoutMs: 200,
+      minSampleDurationMs: 100,
+      minDecodedFrames: 1,
+      minFps: 50,
+      now: () => currentTime,
+      createSessionId: () => "lan-e2e-test-session",
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.sampleFramesDecoded).toBe(6);
+    expect(result.sampleObservedFps).toBeGreaterThanOrEqual(50);
+  });
+
   it("skips comparison when the remote capture source downgrades the selected profile", async () => {
     const commands = withCaptureSourceCommands(
       createCommands({
