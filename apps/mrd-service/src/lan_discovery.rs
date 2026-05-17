@@ -10,6 +10,8 @@ use mrd_pipeline_core::{
     CapturedFrame, DecodedFrame, DecodedFrameData, FramePixelFormat, VideoDecoder, VideoEncoder,
 };
 use mrd_proto::{DeviceId, SessionId};
+#[cfg(windows)]
+use mrd_render::RenderFrame;
 use mrd_transport_quic_quinn::{
     fragment_access_unit, fragment_media_payload_v3, is_quic_media_v3_datagram, QuicAuFrame,
     QuicAuReassembler, QuicAuReassemblerConfig, QuicAuReassemblerStats, QuicMediaCodec,
@@ -2110,6 +2112,12 @@ async fn close_lan_media_sessions(
             .lock()
             .await
             .remove(&session_id);
+        #[cfg(windows)]
+        app_state
+            .media_surface_renderers
+            .lock()
+            .await
+            .detach_session(&session_id);
         app_state.media_pipelines.lock().await.remove(&session_id);
     }
 }
@@ -3267,6 +3275,16 @@ async fn record_lan_decoded_frames(
     encoded_payload: &[u8],
 ) {
     for decoded_frame in decoded_frames {
+        #[cfg(windows)]
+        if let Err(error) = render_lan_decoded_frame(app_state, session_id, &decoded_frame).await {
+            tracing::warn!(
+                %error,
+                session_id = %session_id.0,
+                sequence,
+                "LAN media receiver failed to present decoded frame"
+            );
+        }
+
         let width = decoded_frame.width as u32;
         let height = decoded_frame.height as u32;
         let decoded_pixel_format = decoded_frame_pixel_format(&decoded_frame);
@@ -3313,6 +3331,105 @@ async fn record_lan_decoded_frames(
             },
             now_ms(),
         );
+    }
+}
+
+#[cfg(windows)]
+async fn render_lan_decoded_frame(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+    decoded_frame: &DecodedFrame,
+) -> Result<()> {
+    let has_surface = app_state
+        .media_surface_renderers
+        .lock()
+        .await
+        .session_surface_count(session_id)
+        > 0;
+    if !has_surface {
+        return Ok(());
+    }
+
+    let render_frame = decoded_frame_to_render_frame(decoded_frame.clone())?;
+    let started = Instant::now();
+    let rendered = app_state
+        .media_surface_renderers
+        .lock()
+        .await
+        .render_frame(session_id, &render_frame)
+        .map_err(anyhow::Error::msg)?;
+    if rendered > 0 {
+        app_state
+            .media_pipelines
+            .lock()
+            .await
+            .record_stage_duration_ms(
+                session_id.clone(),
+                "render_present",
+                started.elapsed().as_secs_f64() * 1000.0,
+            );
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn decoded_frame_to_render_frame(frame: DecodedFrame) -> Result<RenderFrame> {
+    match frame.data {
+        DecodedFrameData::CpuRgb24(data) => {
+            let expected_len = frame
+                .width
+                .checked_mul(frame.height)
+                .and_then(|pixels| pixels.checked_mul(3))
+                .ok_or_else(|| anyhow::anyhow!("decoded RGB render frame byte size overflow"))?;
+            if data.len() != expected_len {
+                anyhow::bail!("decoded RGB render frame has invalid byte length");
+            }
+            Ok(RenderFrame::from_rgb24(frame.width, frame.height, data))
+        }
+        DecodedFrameData::CpuBgra32(data) => {
+            let expected_len = frame
+                .width
+                .checked_mul(frame.height)
+                .and_then(|pixels| pixels.checked_mul(4))
+                .ok_or_else(|| anyhow::anyhow!("decoded BGRA render frame byte size overflow"))?;
+            if data.len() != expected_len {
+                anyhow::bail!("decoded BGRA render frame has invalid byte length");
+            }
+            Ok(RenderFrame::from_bgra32(frame.width, frame.height, data))
+        }
+        DecodedFrameData::CpuNv12 { .. } => {
+            let (width, height, rgb24) = decoded_frame_to_rgb24(frame)?;
+            Ok(RenderFrame::from_rgb24(
+                width as usize,
+                height as usize,
+                rgb24,
+            ))
+        }
+        DecodedFrameData::CpuP010 { .. } => {
+            anyhow::bail!("CPU P010 decoded frames are not supported by the D3D11 renderer yet")
+        }
+        #[cfg(windows)]
+        DecodedFrameData::D3D11SharedNv12 {
+            shared_handle_y,
+            shared_handle_uv,
+            ..
+        } => Ok(RenderFrame::from_d3d11_shared_nv12(
+            frame.width,
+            frame.height,
+            shared_handle_y,
+            shared_handle_uv,
+        )),
+        #[cfg(windows)]
+        DecodedFrameData::D3D11SharedP010 {
+            shared_handle_y,
+            shared_handle_uv,
+            ..
+        } => Ok(RenderFrame::from_d3d11_shared_p010(
+            frame.width,
+            frame.height,
+            shared_handle_y,
+            shared_handle_uv,
+        )),
     }
 }
 

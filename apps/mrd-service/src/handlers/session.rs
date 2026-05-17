@@ -342,6 +342,12 @@ pub async fn stop_session(app_state: &Arc<AppState>, session_id: SessionId) -> I
             .lock()
             .await
             .remove(&session_id);
+        #[cfg(windows)]
+        app_state
+            .media_surface_renderers
+            .lock()
+            .await
+            .detach_session(&session_id);
         app_state.media_pipelines.lock().await.remove(&session_id);
         return IpcResponse::SessionStopped { session_id };
     }
@@ -378,6 +384,12 @@ pub async fn fail_session(
             .lock()
             .await
             .abort_session(&session_id);
+        #[cfg(windows)]
+        app_state
+            .media_surface_renderers
+            .lock()
+            .await
+            .detach_session(&session_id);
         app_state.media_pipelines.lock().await.remove(&session_id);
 
         let mut shell = app_state.shell.lock().await;

@@ -1157,6 +1157,91 @@ describe("RemoteDisplayWindowPage", () => {
           session_id: "p2p-quic-123",
           surface_id: "surface-1",
           role: "controller",
+          renderer_attached: false,
+          render_mode: "web",
+          native_surface_attached: false,
+          session_window_count: 1,
+        });
+      }
+      if (command === "configure_remote_display_native_surface") {
+        return Promise.resolve({
+          label: "render-p2p-quic-123-1",
+          backend: "web",
+          attached: false,
+          visible: false,
+          parent_hwnd: "0xA",
+          hwnd: null,
+          rect: { x: 0, y: 56, width: 1280, height: 720 },
+        });
+      }
+      if (command === "ipc_session_snapshot") {
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          role: "controller",
+          state: "streaming",
+          transport_kind: "quic",
+          sender_active: false,
+          receiver_active: true,
+        });
+      }
+      if (command === "ipc_probe_snapshot") {
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          frames_received: 3,
+          frames_decoded: 3,
+          frames_dropped: 0,
+          current_fps: 30,
+          bitrate_mbps: 4,
+          media_probe_valid: true,
+          media_probe_format: "h264_desktop_frame",
+          media_probe_width: 1280,
+          media_probe_height: 720,
+          media_probe_target_fps: 144,
+          media_probe_target_bitrate_mbps: 64,
+          media_probe_payload_bytes: 2048,
+          last_media_sequence: 3,
+          last_media_timestamp_us: 3000,
+          last_media_payload_hash: "fnv1a64:abc123",
+          latest_frame_data_url: "data:image/png;base64,REMOTE",
+          latest_frame_width: 1280,
+          latest_frame_height: 720,
+          latest_frame_pixel_format: "rgb24",
+          last_error: null,
+        });
+      }
+      if (command === "ipc_list_remote_capture_sources") {
+        return Promise.resolve([remoteDisplaySource]);
+      }
+      if (command === "ipc_select_remote_capture_source") {
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          source: remoteDisplaySource,
+          status: "selected",
+          reason: null,
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay();
+
+    const frame = await screen.findByAltText("Remote desktop frame");
+    expect(frame).toHaveAttribute("src", "data:image/png;base64,REMOTE");
+    expect(frame).toHaveStyle({ aspectRatio: "1280 / 720" });
+  });
+
+  it("does not cover an attached native remote surface with the low-frequency preview frame", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(windowsCapabilities());
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-p2p-quic-123-1",
+          session_id: "p2p-quic-123",
+          surface_id: "surface-1",
+          role: "controller",
           renderer_attached: true,
           render_mode: "d3d11_native",
           native_surface_attached: true,
@@ -1225,9 +1310,8 @@ describe("RemoteDisplayWindowPage", () => {
 
     renderRemoteDisplay();
 
-    const frame = await screen.findByAltText("Remote desktop frame");
-    expect(frame).toHaveAttribute("src", "data:image/png;base64,REMOTE");
-    expect(frame).toHaveStyle({ aspectRatio: "1280 / 720" });
+    await screen.findByText(/remote rx 3/);
+    expect(screen.queryByAltText("Remote desktop frame")).toBeNull();
   });
 
   it("blocks remote receiver start when no remote capture source is available", async () => {

@@ -13,6 +13,10 @@ use mrd_ipc::{
     MediaStageMetrics,
 };
 use mrd_proto::{DeviceId, SessionId};
+#[cfg(windows)]
+use mrd_render::{BoxedRenderer, RenderFrame, RenderTarget, RendererFactory};
+#[cfg(windows)]
+use mrd_render_d3d11::D3d11RendererFactory;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::{sync::Mutex, task::AbortHandle};
@@ -303,6 +307,73 @@ impl MediaPipelineRegistry {
 
     pub fn remove(&mut self, session_id: &SessionId) {
         self.pipelines.remove(session_id);
+    }
+}
+
+/// Native renderer instances owned by mrd-service for receiver sessions.
+#[cfg(windows)]
+#[derive(Default)]
+pub struct MediaSurfaceRendererRegistry {
+    renderers: HashMap<(SessionId, String), BoxedRenderer>,
+}
+
+#[cfg(windows)]
+impl MediaSurfaceRendererRegistry {
+    pub fn attach_surface(
+        &mut self,
+        session_id: &SessionId,
+        surface: &AttachedRenderSurface,
+    ) -> Result<(), String> {
+        if surface.backend != "d3d11" {
+            return Ok(());
+        }
+        let window_handle = surface
+            .window_handle
+            .ok_or_else(|| format!("render surface {} is missing HWND", surface.surface_id))?;
+        let key = (session_id.clone(), surface.surface_id.clone());
+        let mut renderer = D3d11RendererFactory
+            .create()
+            .map_err(|error| format!("create D3D11 renderer failed: {error}"))?;
+        renderer
+            .attach_target(RenderTarget::WindowHandle(window_handle as isize))
+            .map_err(|error| format!("attach D3D11 renderer target failed: {error}"))?;
+        self.renderers.insert(key, renderer);
+        Ok(())
+    }
+
+    pub fn detach_surface(&mut self, session_id: &SessionId, surface_id: &str) {
+        self.renderers
+            .remove(&(session_id.clone(), surface_id.to_string()));
+    }
+
+    pub fn detach_session(&mut self, session_id: &SessionId) {
+        self.renderers
+            .retain(|(renderer_session_id, _), _| renderer_session_id != session_id);
+    }
+
+    pub fn render_frame(
+        &mut self,
+        session_id: &SessionId,
+        frame: &RenderFrame,
+    ) -> Result<usize, String> {
+        let mut rendered = 0;
+        for ((renderer_session_id, _), renderer) in self.renderers.iter_mut() {
+            if renderer_session_id != session_id {
+                continue;
+            }
+            renderer
+                .upload_frame(frame.clone())
+                .map_err(|error| format!("upload frame to D3D11 renderer failed: {error}"))?;
+            rendered += 1;
+        }
+        Ok(rendered)
+    }
+
+    pub fn session_surface_count(&self, session_id: &SessionId) -> usize {
+        self.renderers
+            .keys()
+            .filter(|(renderer_session_id, _)| renderer_session_id == session_id)
+            .count()
     }
 }
 
@@ -768,6 +839,9 @@ pub struct AppState {
     pub peer_media_capabilities: Arc<Mutex<SessionPeerMediaCapabilityRegistry>>,
     /// Receiver pipeline state keyed by session.
     pub media_pipelines: Arc<Mutex<MediaPipelineRegistry>>,
+    /// Native renderer instances keyed by receiver session/surface.
+    #[cfg(windows)]
+    pub media_surface_renderers: Arc<Mutex<MediaSurfaceRendererRegistry>>,
     /// Abort handles for active media tasks keyed by session.
     pub media_tasks: Arc<Mutex<MediaTaskRegistry>>,
 }
@@ -794,6 +868,8 @@ impl AppState {
                 SessionPeerMediaCapabilityRegistry::default(),
             )),
             media_pipelines: Arc::new(Mutex::new(MediaPipelineRegistry::default())),
+            #[cfg(windows)]
+            media_surface_renderers: Arc::new(Mutex::new(MediaSurfaceRendererRegistry::default())),
             media_tasks: Arc::new(Mutex::new(MediaTaskRegistry::default())),
         }
     }
@@ -851,6 +927,12 @@ impl AppState {
     /// Get a clone of the receiver media pipeline registry.
     pub fn media_pipelines(&self) -> Arc<Mutex<MediaPipelineRegistry>> {
         self.media_pipelines.clone()
+    }
+
+    /// Get a clone of the native receiver renderer registry.
+    #[cfg(windows)]
+    pub fn media_surface_renderers(&self) -> Arc<Mutex<MediaSurfaceRendererRegistry>> {
+        self.media_surface_renderers.clone()
     }
 
     /// Get a clone of the media task registry.

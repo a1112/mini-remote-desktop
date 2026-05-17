@@ -508,56 +508,47 @@ async fn browser_webrtc_preview_stop(
 }
 
 #[tauri::command]
-fn configure_remote_display_native_surface(
+async fn configure_remote_display_native_surface(
     window: WebviewWindow,
     state: tauri::State<'_, AppState>,
     rect: NativeSurfaceRect,
     enabled: bool,
     visible: Option<bool>,
 ) -> Result<NativeRenderSurfaceSnapshot, String> {
-    let snapshot = state.remote_display_surfaces.lock().unwrap().configure(
-        &window,
-        rect,
-        enabled,
-        visible.unwrap_or(enabled),
-    )?;
-
-    let render_mode = match (snapshot.attached, snapshot.backend.as_str()) {
-        (true, "macos") => "macos_native",
-        (true, "linux") => "linux_native",
-        (true, _) => "d3d11_native",
-        (false, _) => "web",
+    let label = window.label().to_string();
+    let app_handle = window.app_handle().clone();
+    let snapshot = {
+        state.remote_display_surfaces.lock().unwrap().configure(
+            &window,
+            rect,
+            enabled,
+            visible.unwrap_or(enabled),
+        )?
     };
+    drop(window);
+
     let context = state
         .render_window_registry
         .lock()
         .unwrap()
-        .set_render_mode(
-            window.app_handle(),
-            window.label(),
-            render_mode.to_string(),
-            snapshot.attached,
-        )
-        .ok();
+        .context_for_label(&app_handle, &label);
 
-    if let Some(context) = context {
-        notify_remote_render_surface_configured(context, snapshot.clone());
+    if snapshot.attached && context.is_none() {
+        let _ = state
+            .remote_display_surfaces
+            .lock()
+            .unwrap()
+            .detach(&label, None);
+        return Err("remote display window context is not registered".to_string());
     }
 
-    Ok(snapshot)
-}
-
-fn notify_remote_render_surface_configured(
-    context: RenderWindowContext,
-    snapshot: NativeRenderSurfaceSnapshot,
-) {
-    tauri::async_runtime::spawn(async move {
+    if let Some(context) = context.clone() {
         let result = if snapshot.attached {
             send_attach_render_surface(
                 context.session_id,
                 context.surface_id,
-                snapshot.backend,
-                snapshot.hwnd.and_then(|value| parse_native_handle(&value)),
+                snapshot.backend.clone(),
+                snapshot.hwnd.as_deref().and_then(parse_native_handle),
             )
             .await
         } else {
@@ -565,9 +556,58 @@ fn notify_remote_render_surface_configured(
         };
 
         if let Err(error) = result {
-            tracing::warn!(%error, "failed to notify mrd-service about native render surface");
+            if snapshot.attached {
+                let _ = state
+                    .remote_display_surfaces
+                    .lock()
+                    .unwrap()
+                    .detach(&label, None);
+                if let Ok(context) = state
+                    .render_window_registry
+                    .lock()
+                    .unwrap()
+                    .set_render_mode(&app_handle, &label, "web".to_string(), false)
+                {
+                    notify_remote_render_surface_configured(context, snapshot.clone());
+                }
+                return Err(error);
+            }
+            tracing::warn!(%error, "failed to notify mrd-service about detached native render surface");
         }
-    });
+    }
+
+    let render_mode = render_mode_for_native_surface(&snapshot);
+    if let Ok(context) = state
+        .render_window_registry
+        .lock()
+        .unwrap()
+        .set_render_mode(
+            &app_handle,
+            &label,
+            render_mode.to_string(),
+            snapshot.attached,
+        )
+    {
+        notify_remote_render_surface_configured(context, snapshot.clone());
+    }
+
+    Ok(snapshot)
+}
+
+fn render_mode_for_native_surface(snapshot: &NativeRenderSurfaceSnapshot) -> &'static str {
+    match (snapshot.attached, snapshot.backend.as_str()) {
+        (true, "macos") => "macos_native",
+        (true, "linux") => "linux_native",
+        (true, _) => "d3d11_native",
+        (false, _) => "web",
+    }
+}
+
+fn notify_remote_render_surface_configured(
+    context: RenderWindowContext,
+    snapshot: NativeRenderSurfaceSnapshot,
+) {
+    let _ = (context, snapshot);
 }
 
 fn parse_native_handle(value: &str) -> Option<i64> {
