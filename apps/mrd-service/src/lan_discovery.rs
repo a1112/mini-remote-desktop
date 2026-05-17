@@ -1806,29 +1806,49 @@ fn reconcile_negotiation_to_capture_source(
     negotiation: &mut MediaProfileNegotiation,
     source: &CaptureSource,
 ) {
-    let before = negotiation.selected.clone();
+    let capability_limited = negotiate_media_profile(Some(negotiation.requested.clone()))
+        .unwrap_or_else(|_| MediaProfileNegotiation {
+            requested: negotiation.requested.clone(),
+            selected: negotiation.selected.clone(),
+            status: negotiation.status.clone(),
+            reason: negotiation.reason.clone(),
+            selected_source_id: None,
+            selected_width: None,
+            selected_height: None,
+            downgrade_reason: negotiation.downgrade_reason.clone(),
+        });
+
+    let mut selected = capability_limited.selected.clone();
+    let mut downgrade_reason = capability_limited.downgrade_reason.clone();
 
     if source.width > 0 && source.height > 0 {
         let (selected_width, selected_height) = h264_target_dimensions(
             source.width as usize,
             source.height as usize,
-            &negotiation.selected,
+            &capability_limited.selected,
         );
-        negotiation.selected.width = selected_width as u32;
-        negotiation.selected.height = selected_height as u32;
+        if selected_width as u32 != selected.width || selected_height as u32 != selected.height {
+            downgrade_reason =
+                Some("matched selected capture source dimensions and aspect ratio".to_string());
+        }
+        selected.width = selected_width as u32;
+        selected.height = selected_height as u32;
     }
+    negotiation.selected = selected.clone();
     negotiation.selected_source_id = Some(source.id.clone());
     negotiation.selected_width = Some(negotiation.selected.width);
     negotiation.selected_height = Some(negotiation.selected.height);
 
-    if negotiation.selected != before {
+    if negotiation.selected != negotiation.requested {
         negotiation.status = "downgraded".to_string();
-        negotiation.reason =
-            Some("matched selected capture source dimensions and aspect ratio".to_string());
-        negotiation.downgrade_reason =
-            Some("matched selected capture source dimensions and aspect ratio".to_string());
-    } else if negotiation.downgrade_reason.is_none() {
-        negotiation.downgrade_reason = negotiation.reason.clone();
+        negotiation.reason = downgrade_reason
+            .clone()
+            .or(capability_limited.reason.clone());
+        negotiation.downgrade_reason = downgrade_reason.or(capability_limited.downgrade_reason);
+    } else {
+        negotiation.status = "accepted".to_string();
+        negotiation.reason = None;
+        negotiation.downgrade_reason = None;
     }
 }
 
@@ -6009,6 +6029,100 @@ mod tests {
             negotiation.downgrade_reason.as_deref(),
             Some("matched selected capture source dimensions and aspect ratio")
         );
+    }
+
+    #[tokio::test]
+    async fn capture_source_reselection_can_restore_requested_profile_after_display_mode_change() {
+        let app_state = Arc::new(AppState::new());
+        let session_id = SessionId("capture-source-restore-session".to_string());
+        app_state
+            .sessions
+            .lock()
+            .await
+            .insert(session_id.clone(), sender_snapshot(&session_id));
+        app_state.media_profiles.lock().await.set(
+            session_id.clone(),
+            negotiate_media_profile(Some(MediaProfile {
+                width: 1920,
+                height: 1080,
+                fps: 60,
+                bitrate_mbps: 20,
+                codec: "h264".to_string(),
+            }))
+            .unwrap(),
+        );
+
+        let source_before_mode_change = mrd_ipc::CaptureSource {
+            id: "windows:display-shared:0".to_string(),
+            platform: "windows".to_string(),
+            source_kind: "display_shared".to_string(),
+            title: "Display 1".to_string(),
+            class_name: "WinRTMonitorShared".to_string(),
+            width: 2560,
+            height: 1600,
+            process_id: 0,
+            app_name: Some("Display".to_string()),
+            bundle_identifier: None,
+            preview_data_url: None,
+            preview_width: None,
+            preview_height: None,
+        };
+        accept_lan_capture_source_select_from_sources(
+            &app_state,
+            &session_id,
+            "windows:display-shared:0",
+            vec![source_before_mode_change],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            app_state
+                .media_profiles
+                .lock()
+                .await
+                .get(&session_id)
+                .expect("profile after first source")
+                .selected
+                .width,
+            1728
+        );
+
+        let source_after_mode_change = mrd_ipc::CaptureSource {
+            id: "windows:display-shared:0".to_string(),
+            platform: "windows".to_string(),
+            source_kind: "display_shared".to_string(),
+            title: "Display 1".to_string(),
+            class_name: "WinRTMonitorShared".to_string(),
+            width: 1920,
+            height: 1080,
+            process_id: 0,
+            app_name: Some("Display".to_string()),
+            bundle_identifier: None,
+            preview_data_url: None,
+            preview_width: None,
+            preview_height: None,
+        };
+        accept_lan_capture_source_select_from_sources(
+            &app_state,
+            &session_id,
+            "windows:display-shared:0",
+            vec![source_after_mode_change],
+        )
+        .await
+        .unwrap();
+
+        let negotiation = app_state
+            .media_profiles
+            .lock()
+            .await
+            .get(&session_id)
+            .expect("profile after source refresh");
+        assert_eq!(negotiation.selected.width, 1920);
+        assert_eq!(negotiation.selected.height, 1080);
+        assert_eq!(negotiation.selected_width, Some(1920));
+        assert_eq!(negotiation.selected_height, Some(1080));
+        assert_eq!(negotiation.status, "accepted");
+        assert_eq!(negotiation.downgrade_reason, None);
     }
 
     fn sender_snapshot(session_id: &SessionId) -> SessionSnapshot {

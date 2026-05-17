@@ -372,6 +372,16 @@ export async function runLanE2EAutomation(
       } else {
         displayModeChange = modeResult.change;
         stage("display_mode", "completed");
+        if (captureSource) {
+          stage("capture_source", "started");
+          captureSourceSelection = await selectRemoteCaptureSourceForSession(
+            commands,
+            sessionId,
+            captureSource.id
+          );
+          captureSource = captureSourceSelection.source;
+          stage("capture_source", "completed");
+        }
       }
     }
 
@@ -597,13 +607,15 @@ function displayModeScore(
 
 async function selectRemoteCaptureSourceForSession(
   commands: LanE2EAutomationCommands,
-  sessionId: string
+  sessionId: string,
+  preferredSourceId?: string
 ): Promise<CaptureSourceSelection> {
   const sources = await unwrap(
     commands.ipcListRemoteCaptureSources(sessionId, false, 24),
     "capture_source_failed"
   );
-  const preferredSource = pickPreferredCaptureSource(sources);
+  const preferredSource =
+    sources.find((source) => source.id === preferredSourceId) ?? pickPreferredCaptureSource(sources);
   if (!preferredSource) {
     throw new LanE2ECommandError(
       "capture_source_failed",
@@ -626,8 +638,8 @@ async function selectRemoteCaptureSourceForSession(
 
 function pickPreferredCaptureSource(sources: CaptureSource[]): CaptureSource | undefined {
   return (
-    sources.find((source) => source.source_kind === "display") ??
     sources.find((source) => source.source_kind === "display_shared") ??
+    sources.find((source) => source.source_kind === "display") ??
     sources.find((source) => source.source_kind === "window") ??
     sources[0]
   );

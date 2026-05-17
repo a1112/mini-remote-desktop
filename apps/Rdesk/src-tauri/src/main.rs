@@ -2290,11 +2290,13 @@ fn build_lan_e2e_autorun_route(config: LanE2eAutorunLaunchConfig) -> String {
 }
 
 fn navigate_main_window_to_route(window: &WebviewWindow, route: &str) -> Result<(), String> {
-    let route_json = serde_json::to_string(route).map_err(|error| error.to_string())?;
-    let script = format!(
-        "window.history.replaceState(null, '', {route_json}); window.dispatchEvent(new PopStateEvent('popstate'));"
-    );
+    let script = build_main_window_route_navigation_script(route)?;
     window.eval(&script).map_err(|error| error.to_string())
+}
+
+fn build_main_window_route_navigation_script(route: &str) -> Result<String, String> {
+    let route_json = serde_json::to_string(route).map_err(|error| error.to_string())?;
+    Ok(format!("window.location.replace({route_json});"))
 }
 
 fn is_truthy_env_value(value: &str) -> bool {
@@ -2395,6 +2397,19 @@ mod tray_tests {
             }
         });
         assert!(enabled.is_some());
+    }
+
+    #[test]
+    fn lan_e2e_autorun_navigation_forces_route_load() {
+        let script = build_main_window_route_navigation_script(
+            "/test/e2e?autorun=lan-e2e&displayModePolicy=temporary",
+        )
+        .expect("script should be valid");
+
+        assert_eq!(
+            script,
+            "window.location.replace(\"/test/e2e?autorun=lan-e2e&displayModePolicy=temporary\");"
+        );
     }
 }
 
