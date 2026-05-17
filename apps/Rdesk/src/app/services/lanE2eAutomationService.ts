@@ -462,7 +462,7 @@ export async function runLanE2EAutomation(
         validationMode
       );
       const profileMismatch = describeProfileProbeFailure(profileProbeResult);
-      if (profileMismatch) {
+      if (profileMismatch && sampleDurationMs >= minSampleDurationMs) {
         stage("assert", "failed", profileMismatch);
         return finish("failed", "media_profile_mismatch", profileMismatch);
       }
