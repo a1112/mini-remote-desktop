@@ -2664,6 +2664,7 @@ async fn send_quic_media_loop(
             let send_as_reliable_frame = should_send_access_unit_as_reliable_frame(
                 reliable_media_supported,
                 media_v3_supported,
+                is_keyframe,
                 fragments.len(),
             );
             let reliable_fragments = if send_as_reliable_frame {
@@ -2982,9 +2983,10 @@ fn should_send_access_unit_reliably(
 fn should_send_access_unit_as_reliable_frame(
     reliable_media_supported: bool,
     media_v3_supported: bool,
+    is_keyframe: bool,
     fragment_count: usize,
 ) -> bool {
-    reliable_media_supported && media_v3_supported && fragment_count > 1
+    reliable_media_supported && media_v3_supported && is_keyframe && fragment_count > 1
 }
 
 fn h264_access_unit_is_keyframe(metadata_is_keyframe: bool, payload: &[u8]) -> bool {
@@ -3410,13 +3412,13 @@ async fn record_lan_decoded_frames(
             match decoded_frame_to_preview_rgb24(decoded_frame) {
                 Ok(preview_frame) => Some(preview_frame),
                 Err(error) => {
-                    app_state.probes.lock().await.record_probe_drop(
-                        session_id,
-                        bytes_received,
-                        now_ms(),
-                        error.to_string(),
+                    tracing::debug!(
+                        %error,
+                        session_id = %session_id.0,
+                        sequence,
+                        "LAN media preview frame was not CPU-readable"
                     );
-                    continue;
+                    None
                 }
             }
         } else {
@@ -6093,11 +6095,22 @@ mod tests {
     }
 
     #[test]
-    fn lan_quic_media_routes_fragmented_v3_frames_over_reliable_stream() {
-        assert!(should_send_access_unit_as_reliable_frame(true, true, 2));
-        assert!(!should_send_access_unit_as_reliable_frame(true, true, 1));
-        assert!(!should_send_access_unit_as_reliable_frame(true, false, 2));
-        assert!(!should_send_access_unit_as_reliable_frame(false, true, 2));
+    fn lan_quic_media_routes_only_fragmented_v3_keyframes_over_reliable_stream() {
+        assert!(should_send_access_unit_as_reliable_frame(
+            true, true, true, 2
+        ));
+        assert!(!should_send_access_unit_as_reliable_frame(
+            true, true, false, 2
+        ));
+        assert!(!should_send_access_unit_as_reliable_frame(
+            true, true, true, 1
+        ));
+        assert!(!should_send_access_unit_as_reliable_frame(
+            true, false, true, 2
+        ));
+        assert!(!should_send_access_unit_as_reliable_frame(
+            false, true, true, 2
+        ));
     }
 
     #[test]
@@ -6260,6 +6273,42 @@ mod tests {
                 .height,
             720
         );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn d3d11_shared_preview_failure_still_counts_decoded_frame() {
+        let app_state = Arc::new(AppState::new());
+        let session_id = SessionId("d3d11-shared-preview-session".to_string());
+        let frame = DecodedFrame::from_d3d11_shared_nv12(1920, 1080, 123_456, 1, 2);
+        let profile = MediaProfile {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            bitrate_mbps: 20,
+            codec: "h264".to_string(),
+        };
+
+        record_lan_decoded_frames(
+            &app_state,
+            &session_id,
+            vec![frame],
+            1024,
+            LAN_PREVIEW_FRAME_INTERVAL,
+            123_456,
+            &profile,
+            &[1, 2, 3, 4],
+        )
+        .await;
+
+        let snapshot = app_state.probes.lock().await.snapshot(&session_id);
+
+        assert_eq!(snapshot.frames_decoded, 1);
+        assert_eq!(
+            snapshot.last_media_sequence,
+            Some(LAN_PREVIEW_FRAME_INTERVAL)
+        );
+        assert!(snapshot.latest_frame_data_url.is_none());
     }
 
     #[tokio::test]
