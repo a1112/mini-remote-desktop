@@ -93,6 +93,90 @@ impl CaptureSourceRegistry {
     }
 }
 
+/// Runtime display mode changes keyed by session.
+#[derive(Debug, Default)]
+pub struct DisplayModeRegistry {
+    modes: HashMap<SessionId, DisplayModeState>,
+}
+
+#[derive(Debug, Clone)]
+struct DisplayModeState {
+    original: Option<mrd_ipc::DisplayMode>,
+    active: Option<mrd_ipc::DisplayMode>,
+    restore_required: bool,
+}
+
+impl DisplayModeRegistry {
+    pub fn record_change(
+        &mut self,
+        session_id: SessionId,
+        requested: mrd_ipc::DisplayMode,
+        previous: Option<mrd_ipc::DisplayMode>,
+        active: mrd_ipc::DisplayMode,
+        restore_required: bool,
+    ) -> mrd_ipc::DisplayModeChange {
+        let original = previous.clone().or_else(|| {
+            self.modes
+                .get(&session_id)
+                .and_then(|state| state.original.clone())
+        });
+        self.modes.insert(
+            session_id.clone(),
+            DisplayModeState {
+                original: original.clone(),
+                active: Some(active.clone()),
+                restore_required,
+            },
+        );
+        mrd_ipc::DisplayModeChange {
+            session_id,
+            requested: Some(requested),
+            previous,
+            active: Some(active),
+            status: "changed".to_string(),
+            reason: None,
+            restore_required,
+        }
+    }
+
+    pub fn record_restore(
+        &mut self,
+        session_id: SessionId,
+        previous: mrd_ipc::DisplayMode,
+        active: mrd_ipc::DisplayMode,
+    ) -> mrd_ipc::DisplayModeChange {
+        self.modes.remove(&session_id);
+        mrd_ipc::DisplayModeChange {
+            session_id,
+            requested: None,
+            previous: Some(previous),
+            active: Some(active),
+            status: "restored".to_string(),
+            reason: None,
+            restore_required: false,
+        }
+    }
+
+    pub fn restore_mode(&self, session_id: &SessionId) -> Option<mrd_ipc::DisplayMode> {
+        self.modes
+            .get(session_id)
+            .filter(|state| state.restore_required)
+            .and_then(|state| state.original.clone())
+    }
+
+    pub fn active_mode(&self, session_id: &SessionId) -> Option<mrd_ipc::DisplayMode> {
+        self.modes
+            .get(session_id)
+            .and_then(|state| state.active.clone())
+    }
+
+    pub fn remove(&mut self, session_id: &SessionId) -> Option<mrd_ipc::DisplayMode> {
+        self.modes
+            .remove(session_id)
+            .and_then(|state| state.original)
+    }
+}
+
 /// Peer media capabilities observed for each active session.
 #[derive(Debug, Default)]
 pub struct SessionPeerMediaCapabilityRegistry {
@@ -678,6 +762,8 @@ pub struct AppState {
     pub media_profiles: Arc<Mutex<MediaProfileRegistry>>,
     /// Selected capture source keyed by session.
     pub capture_sources: Arc<Mutex<CaptureSourceRegistry>>,
+    /// Temporary display mode state keyed by session.
+    pub display_modes: Arc<Mutex<DisplayModeRegistry>>,
     /// Peer media capabilities keyed by session.
     pub peer_media_capabilities: Arc<Mutex<SessionPeerMediaCapabilityRegistry>>,
     /// Receiver pipeline state keyed by session.
@@ -703,6 +789,7 @@ impl AppState {
             probes: Arc::new(Mutex::new(ProbeRegistry::default())),
             media_profiles: Arc::new(Mutex::new(MediaProfileRegistry::default())),
             capture_sources: Arc::new(Mutex::new(CaptureSourceRegistry::default())),
+            display_modes: Arc::new(Mutex::new(DisplayModeRegistry::default())),
             peer_media_capabilities: Arc::new(Mutex::new(
                 SessionPeerMediaCapabilityRegistry::default(),
             )),
@@ -749,6 +836,11 @@ impl AppState {
     /// Get a clone of the capture source registry.
     pub fn capture_sources(&self) -> Arc<Mutex<CaptureSourceRegistry>> {
         self.capture_sources.clone()
+    }
+
+    /// Get a clone of the display mode registry.
+    pub fn display_modes(&self) -> Arc<Mutex<DisplayModeRegistry>> {
+        self.display_modes.clone()
     }
 
     /// Get a clone of the peer media capability registry.
@@ -1105,5 +1197,47 @@ mod tests {
         );
         assert!(registry.remove(&session_id).is_some());
         assert!(registry.get(&session_id).is_none());
+    }
+
+    #[test]
+    fn display_mode_registry_tracks_temporary_mode_for_restore() {
+        let mut registry = DisplayModeRegistry::default();
+        let session_id = SessionId("display-mode-session".to_string());
+        let original = mrd_ipc::DisplayMode {
+            id: "windows:display:0:2560x1600@60".to_string(),
+            source_id: Some("windows:display:0".to_string()),
+            width: 2560,
+            height: 1600,
+            refresh_hz: 60,
+            bit_depth: Some(32),
+            is_current: true,
+        };
+        let requested = mrd_ipc::DisplayMode {
+            id: "windows:display:0:1920x1080@60".to_string(),
+            source_id: Some("windows:display:0".to_string()),
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60,
+            bit_depth: Some(32),
+            is_current: false,
+        };
+
+        let change = registry.record_change(
+            session_id.clone(),
+            requested.clone(),
+            Some(original.clone()),
+            requested.clone(),
+            true,
+        );
+
+        assert_eq!(change.status, "changed");
+        assert!(change.restore_required);
+        assert_eq!(registry.restore_mode(&session_id), Some(original.clone()));
+
+        let restored = registry.record_restore(session_id.clone(), requested, original.clone());
+        assert_eq!(restored.status, "restored");
+        assert!(!restored.restore_required);
+        assert_eq!(restored.active, Some(original));
+        assert!(registry.restore_mode(&session_id).is_none());
     }
 }

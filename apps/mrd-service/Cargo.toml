@@ -33,6 +33,7 @@ tracing-subscriber.workspace = true
 mrd-capture-dxgi = { path = "../../crates/mrd-capture-dxgi" }
 mrd-capture-winrt = { path = "../../crates/mrd-capture-winrt" }
 mrd-encode-nvenc = { path = "../../crates/mrd-encode-nvenc" }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Gdi"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mrd-capture-macos = { path = "../../crates/mrd-capture-macos" }

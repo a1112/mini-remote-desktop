@@ -64,6 +64,7 @@ const LAN_E2E_PROFILE_WIDTH_ENV: &str = "MRD_LAN_E2E_PROFILE_WIDTH";
 const LAN_E2E_PROFILE_HEIGHT_ENV: &str = "MRD_LAN_E2E_PROFILE_HEIGHT";
 const LAN_E2E_PROFILE_FPS_ENV: &str = "MRD_LAN_E2E_PROFILE_FPS";
 const LAN_E2E_PROFILE_BITRATE_MBPS_ENV: &str = "MRD_LAN_E2E_PROFILE_BITRATE_MBPS";
+const LAN_E2E_DISPLAY_MODE_POLICY_ENV: &str = "MRD_LAN_E2E_DISPLAY_MODE_POLICY";
 
 static APP_IS_QUITTING: AtomicBool = AtomicBool::new(false);
 
@@ -1253,6 +1254,79 @@ async fn ipc_select_remote_capture_source(
     }
 }
 
+/// List remote display modes through mrd-service IPC.
+#[tauri::command]
+async fn ipc_list_remote_display_modes(
+    session_id: String,
+) -> Result<Vec<mrd_ipc::DisplayMode>, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+    use mrd_proto::SessionId;
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::ListRemoteDisplayModes {
+            session_id: SessionId(session_id),
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::DisplayModeList { modes, .. } => Ok(modes),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+/// Set remote display mode through mrd-service IPC.
+#[tauri::command]
+async fn ipc_set_remote_display_mode(
+    session_id: String,
+    mode: mrd_ipc::DisplayMode,
+    restore_after_session: bool,
+) -> Result<mrd_ipc::DisplayModeChange, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+    use mrd_proto::SessionId;
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::SetRemoteDisplayMode {
+            session_id: SessionId(session_id),
+            mode,
+            restore_after_session,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::DisplayModeChanged { change, .. } => Ok(change),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+/// Restore remote display mode through mrd-service IPC.
+#[tauri::command]
+async fn ipc_restore_remote_display_mode(
+    session_id: String,
+) -> Result<mrd_ipc::DisplayModeChange, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+    use mrd_proto::SessionId;
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::RestoreRemoteDisplayMode {
+            session_id: SessionId(session_id),
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::DisplayModeChanged { change, .. } => Ok(change),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
 /// Accept session via IPC (migrated version)
 #[tauri::command]
 async fn ipc_accept_session(
@@ -2155,6 +2229,7 @@ struct LanE2eAutorunLaunchConfig {
     profile_height: Option<String>,
     profile_fps: Option<String>,
     profile_bitrate_mbps: Option<String>,
+    display_mode_policy: Option<String>,
 }
 
 fn lan_e2e_autorun_config_from_env() -> Option<LanE2eAutorunLaunchConfig> {
@@ -2182,6 +2257,7 @@ where
         profile_height: non_empty_env(env(LAN_E2E_PROFILE_HEIGHT_ENV)),
         profile_fps: non_empty_env(env(LAN_E2E_PROFILE_FPS_ENV)),
         profile_bitrate_mbps: non_empty_env(env(LAN_E2E_PROFILE_BITRATE_MBPS_ENV)),
+        display_mode_policy: non_empty_env(env(LAN_E2E_DISPLAY_MODE_POLICY_ENV)),
     })
 }
 
@@ -2203,6 +2279,7 @@ fn build_lan_e2e_autorun_route(config: LanE2eAutorunLaunchConfig) -> String {
     push_query_param(&mut params, "height", config.profile_height);
     push_query_param(&mut params, "fps", config.profile_fps);
     push_query_param(&mut params, "bitrateMbps", config.profile_bitrate_mbps);
+    push_query_param(&mut params, "displayModePolicy", config.display_mode_policy);
 
     let query = params
         .into_iter()
@@ -2296,11 +2373,12 @@ mod tray_tests {
             profile_height: Some("1080".to_string()),
             profile_fps: Some("180".to_string()),
             profile_bitrate_mbps: Some("20".to_string()),
+            display_mode_policy: Some("temporary".to_string()),
         });
 
         assert_eq!(
             route,
-            "/test/e2e?autorun=lan-e2e&targetDeviceId=agent%20device%2F1&transport=quic&timeoutMs=2500&minSampleDurationMs=1500&minDecodedFrames=2&minFps=5&stopOnComplete=false&width=1920&height=1080&fps=180&bitrateMbps=20"
+            "/test/e2e?autorun=lan-e2e&targetDeviceId=agent%20device%2F1&transport=quic&timeoutMs=2500&minSampleDurationMs=1500&minDecodedFrames=2&minFps=5&stopOnComplete=false&width=1920&height=1080&fps=180&bitrateMbps=20&displayModePolicy=temporary"
         );
     }
 
@@ -2510,6 +2588,9 @@ fn main() {
             ipc_update_media_profile,
             ipc_list_remote_capture_sources,
             ipc_select_remote_capture_source,
+            ipc_list_remote_display_modes,
+            ipc_set_remote_display_mode,
+            ipc_restore_remote_display_mode,
             ipc_accept_session,
             ipc_stop_session,
             ipc_fail_session,

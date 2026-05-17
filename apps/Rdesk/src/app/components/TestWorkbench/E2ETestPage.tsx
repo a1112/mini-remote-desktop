@@ -74,6 +74,9 @@ const lanAutomationCommands: LanE2EAutomationCommands = {
   ipcStartLanRemoteSession: commands.ipcStartLanRemoteSession,
   ipcListRemoteCaptureSources: commands.ipcListRemoteCaptureSources,
   ipcSelectRemoteCaptureSource: commands.ipcSelectRemoteCaptureSource,
+  ipcListRemoteDisplayModes: commands.ipcListRemoteDisplayModes,
+  ipcSetRemoteDisplayMode: commands.ipcSetRemoteDisplayMode,
+  ipcRestoreRemoteDisplayMode: commands.ipcRestoreRemoteDisplayMode,
   ipcStartReceiver: commands.ipcStartReceiver,
   openRemoteDisplayWindow: commands.openRemoteDisplayWindow,
   ipcSessionSnapshot: commands.ipcSessionSnapshot,
@@ -595,6 +598,7 @@ function buildLanAutomationOptionsFromSearchParams(
     minDecodedFrames: parsePositiveNumber(searchParams.get("minDecodedFrames")),
     minFps: parsePositiveNumber(searchParams.get("minFps")),
     stopOnComplete: parseOptionalBoolean(searchParams.get("stopOnComplete")),
+    displayModePolicy: parseDisplayModePolicy(searchParams.get("displayModePolicy")),
     requestedProfile: parseRequestedProfile(searchParams),
   };
 }
@@ -631,6 +635,10 @@ function parseCrossDeviceScenarioId(value: string | null): CrossDeviceScenarioId
 
 function parseTransportKind(value: string | null): LanE2EAutomationOptions["transportKind"] {
   return value === "webrtc" ? "webrtc" : value === "quic" ? "quic" : undefined;
+}
+
+function parseDisplayModePolicy(value: string | null): LanE2EAutomationOptions["displayModePolicy"] {
+  return value === "temporary" || value === "required" || value === "none" ? value : undefined;
 }
 
 function parsePositiveNumber(value: string | null): number | undefined {

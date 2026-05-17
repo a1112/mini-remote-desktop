@@ -200,6 +200,28 @@ impl IpcServer {
                 session::select_remote_capture_source(&self.app_state, session_id, source_id).await
             }
 
+            IpcRequest::ListRemoteDisplayModes { session_id } => {
+                session::list_remote_display_modes(&self.app_state, session_id).await
+            }
+
+            IpcRequest::SetRemoteDisplayMode {
+                session_id,
+                mode,
+                restore_after_session,
+            } => {
+                session::set_remote_display_mode(
+                    &self.app_state,
+                    session_id,
+                    mode,
+                    restore_after_session,
+                )
+                .await
+            }
+
+            IpcRequest::RestoreRemoteDisplayMode { session_id } => {
+                session::restore_remote_display_mode(&self.app_state, session_id).await
+            }
+
             IpcRequest::AttachRenderSurface {
                 session_id,
                 surface_id,

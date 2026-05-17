@@ -71,6 +71,8 @@ export type MediaProfile = tauriAdapter.MediaProfile;
 export type MediaProfileNegotiation = tauriAdapter.MediaProfileNegotiation;
 export type CaptureSource = tauriAdapter.CaptureSource;
 export type CaptureSourceSelection = tauriAdapter.CaptureSourceSelection;
+export type DisplayMode = tauriAdapter.DisplayMode;
+export type DisplayModeChange = tauriAdapter.DisplayModeChange;
 
 export interface ProbeSnapshot {
   session_id: string;
@@ -270,6 +272,42 @@ export const selectRemoteCaptureSource = async (
   sourceId: string
 ): Promise<CaptureSourceSelection> => {
   const result = await tauriAdapter.ipcSelectRemoteCaptureSource(sessionId, sourceId);
+  return unwrapAdapterResult(result);
+};
+
+/**
+ * List remote display modes for the selected remote display source.
+ */
+export const listRemoteDisplayModes = async (
+  sessionId: string
+): Promise<DisplayMode[]> => {
+  const result = await tauriAdapter.ipcListRemoteDisplayModes(sessionId);
+  return unwrapAdapterResult(result);
+};
+
+/**
+ * Set the remote display mode for the session.
+ */
+export const setRemoteDisplayMode = async (
+  sessionId: string,
+  mode: DisplayMode,
+  restoreAfterSession = true
+): Promise<DisplayModeChange> => {
+  const result = await tauriAdapter.ipcSetRemoteDisplayMode(
+    sessionId,
+    mode,
+    restoreAfterSession
+  );
+  return unwrapAdapterResult(result);
+};
+
+/**
+ * Restore a remote display mode previously changed for the session.
+ */
+export const restoreRemoteDisplayMode = async (
+  sessionId: string
+): Promise<DisplayModeChange> => {
+  const result = await tauriAdapter.ipcRestoreRemoteDisplayMode(sessionId);
   return unwrapAdapterResult(result);
 };
 

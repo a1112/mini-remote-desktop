@@ -134,6 +134,74 @@ function createCommands(
         reason: null,
       })
     ),
+    ipcListRemoteDisplayModes: vi.fn().mockResolvedValue(
+      ok([
+        {
+          id: "mode-current",
+          source_id: "display-shared",
+          width: 2560,
+          height: 1440,
+          refresh_hz: 60,
+          bit_depth: 32,
+          is_current: true,
+        },
+        {
+          id: "mode-target",
+          source_id: "display-shared",
+          width: 2560,
+          height: 1440,
+          refresh_hz: 144,
+          bit_depth: 32,
+          is_current: false,
+        },
+      ])
+    ),
+    ipcSetRemoteDisplayMode: vi.fn().mockResolvedValue(
+      ok({
+        session_id: "lan-e2e-test-session",
+        requested: {
+          id: "mode-target",
+          source_id: "display-shared",
+          width: 2560,
+          height: 1440,
+          refresh_hz: 144,
+          bit_depth: 32,
+          is_current: false,
+        },
+        previous: {
+          id: "mode-current",
+          source_id: "display-shared",
+          width: 2560,
+          height: 1440,
+          refresh_hz: 60,
+          bit_depth: 32,
+          is_current: true,
+        },
+        active: {
+          id: "mode-target",
+          source_id: "display-shared",
+          width: 2560,
+          height: 1440,
+          refresh_hz: 144,
+          bit_depth: 32,
+          is_current: true,
+        },
+        status: "changed",
+        reason: null,
+        restore_required: true,
+      })
+    ),
+    ipcRestoreRemoteDisplayMode: vi.fn().mockResolvedValue(
+      ok({
+        session_id: "lan-e2e-test-session",
+        requested: null,
+        previous: null,
+        active: null,
+        status: "restored",
+        reason: null,
+        restore_required: false,
+      })
+    ),
     ipcStartReceiver: vi.fn().mockResolvedValue(ok("receiver-started")),
     openRemoteDisplayWindow: vi.fn().mockResolvedValue(
       ok({
@@ -379,6 +447,43 @@ describe("runLanE2EAutomation", () => {
     expect(result.stages.map((stage) => `${stage.stage}:${stage.status}`)).toContain(
       "capture_source:completed"
     );
+  });
+
+  it("sets temporary remote display mode before receiver startup and restores during cleanup", async () => {
+    const commands = createCommands();
+
+    const result = await runLanE2EAutomation(commands, {
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      displayModePolicy: "temporary",
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => "lan-e2e-test-session",
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.displayModeChange?.status).toBe("changed");
+    const setRemoteDisplayMode = commands.ipcSetRemoteDisplayMode;
+    const restoreRemoteDisplayMode = commands.ipcRestoreRemoteDisplayMode;
+    if (!setRemoteDisplayMode || !restoreRemoteDisplayMode) {
+      throw new Error("Expected display mode commands to be configured");
+    }
+    expect(commands.ipcListRemoteDisplayModes).toHaveBeenCalledWith("lan-e2e-test-session");
+    expect(setRemoteDisplayMode).toHaveBeenCalledWith(
+      "lan-e2e-test-session",
+      expect.objectContaining({ id: "mode-target" }),
+      true
+    );
+    const receiverCallOrder = vi.mocked(commands.ipcStartReceiver).mock.invocationCallOrder[0];
+    const displayModeCallOrder = vi.mocked(setRemoteDisplayMode).mock
+      .invocationCallOrder[0];
+    if (receiverCallOrder === undefined || displayModeCallOrder === undefined) {
+      throw new Error("Expected display mode and receiver commands to be invoked");
+    }
+    expect(receiverCallOrder).toBeGreaterThan(displayModeCallOrder);
+    expect(restoreRemoteDisplayMode).toHaveBeenCalledWith("lan-e2e-test-session");
   });
 
   it("fails before receiver startup when the remote has no capture sources", async () => {

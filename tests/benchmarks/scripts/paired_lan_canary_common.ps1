@@ -155,6 +155,7 @@ function Get-CrossCanaryClassification {
     "peer_not_found" { return "unsupported" }
     "media_profile_mismatch" { return "profile_downgraded" }
     "profile_downgraded" { return "profile_downgraded" }
+    "display_mode_failed" { return "display_mode_failed" }
     "no_remote_frames" { return "threshold_miss" }
     "session_start_failed" { return "transport_loss" }
     "runtime_error" {

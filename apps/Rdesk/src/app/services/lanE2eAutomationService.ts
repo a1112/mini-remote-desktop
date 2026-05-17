@@ -2,6 +2,8 @@ import type {
   AdapterResult,
   CaptureSource,
   CaptureSourceSelection,
+  DisplayMode,
+  DisplayModeChange,
   LanDiscoverySnapshot,
   LanPeerInfo,
   MediaPipelineSnapshot,
@@ -50,6 +52,7 @@ export type LanE2EFailureReason =
   | "peer_not_ready"
   | "session_start_failed"
   | "capture_source_failed"
+  | "display_mode_failed"
   | "receiver_start_failed"
   | "display_window_failed"
   | "fault_injection_unsupported"
@@ -61,7 +64,7 @@ export type LanE2EFailureReason =
   | "stop_failed";
 
 export interface LanE2EStageEvent {
-  stage: "preflight" | "pairing" | "session" | "capture_source" | "receiver" | "display" | "fault" | "sample" | "assert" | "cleanup";
+  stage: "preflight" | "pairing" | "session" | "capture_source" | "display_mode" | "receiver" | "display" | "fault" | "sample" | "assert" | "cleanup";
   status: "started" | "completed" | "failed" | "skipped";
   timestamp: number;
   error?: string;
@@ -78,6 +81,7 @@ export interface LanE2EAutomationOptions {
   minFps?: number;
   stopOnComplete?: boolean;
   requestedProfile?: MediaProfile;
+  displayModePolicy?: "none" | "temporary" | "required";
   faultPlan?: CrossDeviceFaultPlan;
   createSessionId?: () => string;
   now?: () => number;
@@ -92,6 +96,7 @@ export interface LanE2EAutomationReport {
   displayWindow?: RemoteDisplayWindowContext;
   captureSource?: CaptureSource;
   captureSourceSelection?: CaptureSourceSelection;
+  displayModeChange?: DisplayModeChange;
   sessionSnapshot?: SessionRuntimeSnapshot;
   probeSnapshot?: ProbeSnapshot;
   mediaPipelineSnapshot?: MediaPipelineSnapshot;
@@ -137,6 +142,13 @@ export interface LanE2EAutomationCommands {
     sessionId: string,
     sourceId: string
   ): Promise<AdapterResult<CaptureSourceSelection>>;
+  ipcListRemoteDisplayModes?(sessionId: string): Promise<AdapterResult<DisplayMode[]>>;
+  ipcSetRemoteDisplayMode?(
+    sessionId: string,
+    mode: DisplayMode,
+    restoreAfterSession: boolean
+  ): Promise<AdapterResult<DisplayModeChange>>;
+  ipcRestoreRemoteDisplayMode?(sessionId: string): Promise<AdapterResult<DisplayModeChange>>;
   ipcStartReceiver(sessionId: string): Promise<AdapterResult<string>>;
   openRemoteDisplayWindow(params: {
     sessionId: string;
@@ -210,6 +222,7 @@ export async function runLanE2EAutomation(
   const minFps = options.minFps ?? DEFAULT_MIN_FPS;
   const stopOnComplete = options.stopOnComplete ?? true;
   const transportKind = options.transportKind ?? "quic";
+  const displayModePolicy = options.displayModePolicy ?? "none";
   const requestedProfile =
     shouldRequestMediaProfile(scenarioId, transportKind)
       ? options.requestedProfile ?? DEFAULT_LAN_MEDIA_PROFILE
@@ -220,6 +233,7 @@ export async function runLanE2EAutomation(
   let displayWindow: RemoteDisplayWindowContext | undefined;
   let captureSource: CaptureSource | undefined;
   let captureSourceSelection: CaptureSourceSelection | undefined;
+  let displayModeChange: DisplayModeChange | undefined;
   let sessionSnapshot: SessionRuntimeSnapshot | undefined;
   let probeSnapshot: ProbeSnapshot | undefined;
   let mediaPipelineSnapshot: MediaPipelineSnapshot | undefined;
@@ -249,6 +263,7 @@ export async function runLanE2EAutomation(
     displayWindow,
     captureSource,
     captureSourceSelection,
+    displayModeChange,
     sessionSnapshot,
     probeSnapshot,
     mediaPipelineSnapshot,
@@ -336,6 +351,29 @@ export async function runLanE2EAutomation(
     captureSourceSelection = await selectRemoteCaptureSourceForSession(commands, sessionId);
     captureSource = captureSourceSelection.source;
     stage("capture_source", "completed");
+
+    if (displayModePolicy !== "none" && requestedProfile) {
+      stage("display_mode", "started");
+      const modeResult = await maybeApplyRemoteDisplayMode(
+        commands,
+        sessionId,
+        requestedProfile,
+        displayModePolicy
+      );
+      if (modeResult.status === "failed") {
+        stage("display_mode", "failed", modeResult.error);
+        return finish("failed", "display_mode_failed", modeResult.error);
+      }
+      if (modeResult.status === "skipped") {
+        stage("display_mode", displayModePolicy === "required" ? "failed" : "skipped", modeResult.error);
+        if (displayModePolicy === "required") {
+          return finish("failed", "display_mode_failed", modeResult.error);
+        }
+      } else {
+        displayModeChange = modeResult.change;
+        stage("display_mode", "completed");
+      }
+    }
 
     stage("receiver", "started");
     await unwrap(commands.ipcStartReceiver(sessionId), "receiver_start_failed");
@@ -454,6 +492,15 @@ export async function runLanE2EAutomation(
   } finally {
     if (stopOnComplete && sessionStarted && sessionId) {
       stage("cleanup", "started");
+      if (
+        displayModeChange?.restore_required &&
+        commands.ipcRestoreRemoteDisplayMode
+      ) {
+        const restoreResult = await commands.ipcRestoreRemoteDisplayMode(sessionId);
+        if (!restoreResult.ok) {
+          stage("cleanup", "failed", restoreResult.error.message);
+        }
+      }
       const stopResult = await commands.ipcStopSession(sessionId);
       if (stopResult.ok) {
         stage("cleanup", "completed");
@@ -462,6 +509,90 @@ export async function runLanE2EAutomation(
       }
     }
   }
+}
+
+async function maybeApplyRemoteDisplayMode(
+  commands: LanE2EAutomationCommands,
+  sessionId: string,
+  requestedProfile: MediaProfile,
+  policy: "temporary" | "required"
+): Promise<
+  | { status: "changed"; change: DisplayModeChange }
+  | { status: "skipped"; error: string }
+  | { status: "failed"; error: string }
+> {
+  if (!commands.ipcListRemoteDisplayModes || !commands.ipcSetRemoteDisplayMode) {
+    return {
+      status: policy === "required" ? "failed" : "skipped",
+      error: "Remote display mode control commands are unavailable",
+    };
+  }
+
+  const modesResult = await commands.ipcListRemoteDisplayModes(sessionId);
+  if (!modesResult.ok) {
+    return {
+      status: policy === "required" ? "failed" : "skipped",
+      error: modesResult.error.message,
+    };
+  }
+
+  const mode = chooseRemoteDisplayMode(
+    modesResult.value,
+    requestedProfile.width,
+    requestedProfile.height,
+    requestedProfile.fps
+  );
+  if (!mode) {
+    return {
+      status: policy === "required" ? "failed" : "skipped",
+      error: `No remote display mode matches ${formatMediaProfile(requestedProfile)}`,
+    };
+  }
+
+  const setResult = await commands.ipcSetRemoteDisplayMode(sessionId, mode, true);
+  if (!setResult.ok) {
+    return {
+      status: policy === "required" ? "failed" : "skipped",
+      error: setResult.error.message,
+    };
+  }
+
+  return { status: "changed", change: setResult.value };
+}
+
+function chooseRemoteDisplayMode(
+  modes: DisplayMode[],
+  width: number,
+  height: number,
+  refreshHz: number
+): DisplayMode | undefined {
+  return [...modes]
+    .filter((mode) => mode.width > 0 && mode.height > 0 && mode.refresh_hz > 0)
+    .sort((left, right) => {
+      const leftScore = displayModeScore(left, width, height, refreshHz);
+      const rightScore = displayModeScore(right, width, height, refreshHz);
+      for (let index = 0; index < leftScore.length; index += 1) {
+        const delta = (leftScore[index] ?? 0) - (rightScore[index] ?? 0);
+        if (delta !== 0) return delta;
+      }
+      return right.refresh_hz - left.refresh_hz || right.width * right.height - left.width * left.height;
+    })[0];
+}
+
+function displayModeScore(
+  mode: DisplayMode,
+  width: number,
+  height: number,
+  refreshHz: number
+): [number, number, number, number] {
+  const targetAspect = width / height;
+  const modeAspect = mode.width / mode.height;
+  return [
+    Math.round(Math.abs(modeAspect - targetAspect) * 10_000),
+    Math.abs(mode.height - height),
+    Math.abs(mode.width - width),
+    Math.abs(mode.refresh_hz - refreshHz),
+  ];
 }
 
 async function selectRemoteCaptureSourceForSession(
@@ -865,6 +996,8 @@ function stageForFailure(reason: LanE2EFailureReason): LanE2EStageEvent["stage"]
       return "pairing";
     case "capture_source_failed":
       return "capture_source";
+    case "display_mode_failed":
+      return "display_mode";
     case "receiver_start_failed":
       return "receiver";
     case "display_window_failed":

@@ -11,6 +11,7 @@
 mod app_state;
 mod capabilities;
 mod capture_source;
+mod display_mode;
 mod handlers;
 mod ipc_server;
 mod lan_discovery;

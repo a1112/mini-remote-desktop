@@ -1227,6 +1227,7 @@ describe("RemoteDisplayWindowPage", () => {
 
     const frame = await screen.findByAltText("Remote desktop frame");
     expect(frame).toHaveAttribute("src", "data:image/png;base64,REMOTE");
+    expect(frame).toHaveStyle({ aspectRatio: "1280 / 720" });
   });
 
   it("blocks remote receiver start when no remote capture source is available", async () => {

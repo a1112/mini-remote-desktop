@@ -656,6 +656,26 @@ export interface CaptureSourceSelection {
   reason?: string | null;
 }
 
+export interface DisplayMode {
+  id: string;
+  source_id?: string | null;
+  width: number;
+  height: number;
+  refresh_hz: number;
+  bit_depth?: number | null;
+  is_current: boolean;
+}
+
+export interface DisplayModeChange {
+  session_id: string;
+  requested?: DisplayMode | null;
+  previous?: DisplayMode | null;
+  active?: DisplayMode | null;
+  status: "changed" | "restored" | "rejected" | string;
+  reason?: string | null;
+  restore_required: boolean;
+}
+
 export interface ProbeSnapshot {
   session_id: string;
   frames_received: number;

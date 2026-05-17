@@ -4,7 +4,7 @@
 
 use crate::app_state::AppState;
 use mrd_application::ports::SessionSnapshot;
-use mrd_ipc::{IpcResponse, MediaProfile};
+use mrd_ipc::{DisplayMode, IpcResponse, MediaProfile};
 use mrd_proto::{DeviceId, SessionId};
 use std::sync::Arc;
 
@@ -203,6 +203,63 @@ pub async fn select_remote_capture_source(
         },
         Err(error) => IpcResponse::Error {
             code: "E_CAPTURE_SOURCE_SELECT".to_string(),
+            message: error.to_string(),
+        },
+    }
+}
+
+/// Handle a remote display mode listing request.
+pub async fn list_remote_display_modes(
+    app_state: &Arc<AppState>,
+    session_id: SessionId,
+) -> IpcResponse {
+    let source_id = app_state
+        .capture_sources
+        .lock()
+        .await
+        .get(&session_id)
+        .map(|selection| selection.source.id);
+    match crate::lan_discovery::request_lan_display_modes(app_state, &session_id, source_id).await {
+        Ok(modes) => IpcResponse::DisplayModeList { session_id, modes },
+        Err(error) => IpcResponse::Error {
+            code: "E_DISPLAY_MODES".to_string(),
+            message: error.to_string(),
+        },
+    }
+}
+
+/// Handle a remote display mode set request.
+pub async fn set_remote_display_mode(
+    app_state: &Arc<AppState>,
+    session_id: SessionId,
+    mode: DisplayMode,
+    restore_after_session: bool,
+) -> IpcResponse {
+    match crate::lan_discovery::request_lan_display_mode_set(
+        app_state,
+        &session_id,
+        mode,
+        restore_after_session,
+    )
+    .await
+    {
+        Ok(change) => IpcResponse::DisplayModeChanged { session_id, change },
+        Err(error) => IpcResponse::Error {
+            code: "E_DISPLAY_MODE_SET".to_string(),
+            message: error.to_string(),
+        },
+    }
+}
+
+/// Handle a remote display mode restore request.
+pub async fn restore_remote_display_mode(
+    app_state: &Arc<AppState>,
+    session_id: SessionId,
+) -> IpcResponse {
+    match crate::lan_discovery::request_lan_display_mode_restore(app_state, &session_id).await {
+        Ok(change) => IpcResponse::DisplayModeChanged { session_id, change },
+        Err(error) => IpcResponse::Error {
+            code: "E_DISPLAY_MODE_RESTORE".to_string(),
             message: error.to_string(),
         },
     }

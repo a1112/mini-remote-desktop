@@ -3,8 +3,8 @@ use anyhow::{Context, Result};
 use mrd_application::ports::SessionSnapshot;
 use mrd_encode_openh264::OpenH264Encoder;
 use mrd_ipc::{
-    CaptureSource, CaptureSourceSelection, LanDiscoverySnapshot, LanPeerInfo, MediaProfile,
-    MediaProfileNegotiation, MediaStageMetrics,
+    CaptureSource, CaptureSourceSelection, DisplayMode, DisplayModeChange, LanDiscoverySnapshot,
+    LanPeerInfo, MediaProfile, MediaProfileNegotiation, MediaStageMetrics,
 };
 use mrd_pipeline_core::{
     CapturedFrame, DecodedFrame, DecodedFrameData, FramePixelFormat, VideoDecoder, VideoEncoder,
@@ -49,6 +49,7 @@ const LAN_QUIC_MEDIA_V3_TRANSPORT: &str = "quic_datagram_media_v3";
 const LAN_QUIC_RELIABLE_MEDIA_TRANSPORT: &str = "quic_stream_media_v2";
 const LAN_MEDIA_PROFILE_CONTROL_TRANSPORT: &str = "media_profile_control_v1";
 const LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT: &str = "capture_source_control_v1";
+const LAN_DISPLAY_MODE_CONTROL_TRANSPORT: &str = "display_mode_control_v1";
 const LAN_MEDIA_PROTOCOL_VERSION: u32 = 3;
 const LAN_CAPTURE_DXGI_CAPABILITY: &str = "dxgi_capture";
 const LAN_ENCODE_NVENC_H264_CAPABILITY: &str = "nvenc_h264";
@@ -363,6 +364,71 @@ enum LanDiscoveryPacket {
         message: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         selection: Option<CaptureSourceSelection>,
+        timestamp_ms: u64,
+    },
+    DisplayModesRequest {
+        magic: String,
+        #[serde(default = "default_app_id")]
+        app_id: String,
+        instance_id: String,
+        session_id: String,
+        source_device_id: String,
+        source_id: Option<String>,
+        timestamp_ms: u64,
+    },
+    DisplayModesAck {
+        magic: String,
+        #[serde(default = "default_app_id")]
+        app_id: String,
+        instance_id: String,
+        session_id: String,
+        accepted: bool,
+        message: Option<String>,
+        modes: Vec<DisplayMode>,
+        timestamp_ms: u64,
+    },
+    DisplayModeSet {
+        magic: String,
+        #[serde(default = "default_app_id")]
+        app_id: String,
+        instance_id: String,
+        session_id: String,
+        source_device_id: String,
+        mode: DisplayMode,
+        restore_after_session: bool,
+        timestamp_ms: u64,
+    },
+    DisplayModeSetAck {
+        magic: String,
+        #[serde(default = "default_app_id")]
+        app_id: String,
+        instance_id: String,
+        session_id: String,
+        accepted: bool,
+        message: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        change: Option<DisplayModeChange>,
+        timestamp_ms: u64,
+    },
+    DisplayModeRestore {
+        magic: String,
+        #[serde(default = "default_app_id")]
+        app_id: String,
+        instance_id: String,
+        session_id: String,
+        source_device_id: String,
+        timestamp_ms: u64,
+    },
+    DisplayModeRestoreAck {
+        magic: String,
+        #[serde(default = "default_app_id")]
+        app_id: String,
+        instance_id: String,
+        session_id: String,
+        accepted: bool,
+        message: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        change: Option<DisplayModeChange>,
         timestamp_ms: u64,
     },
 }
@@ -884,6 +950,159 @@ pub async fn request_lan_capture_source_select(
     }
 }
 
+pub async fn request_lan_display_modes(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+    source_id: Option<String>,
+) -> Result<Vec<DisplayMode>> {
+    let peer_device_id = session_remote_peer(app_state, session_id).await?;
+    let target = peer_control_addr_with_display_mode_capability(app_state, &peer_device_id).await?;
+    let source_device_id = local_device_id(app_state).await?;
+
+    let socket = UdpSocket::bind(("0.0.0.0", 0))
+        .await
+        .context("failed to bind LAN display modes request UDP socket")?;
+    let packet = LanDiscoveryPacket::DisplayModesRequest {
+        magic: DISCOVERY_MAGIC.to_string(),
+        app_id: DISCOVERY_APP_ID.to_string(),
+        instance_id: app_state.lan_discovery.instance_id.clone(),
+        session_id: session_id.0.clone(),
+        source_device_id,
+        source_id,
+        timestamp_ms: now_ms(),
+    };
+    send_packet(&socket, &packet, target).await?;
+
+    let mut buffer = vec![0_u8; DISCOVERY_PACKET_BUFFER_BYTES];
+    let (len, _) = timeout(Duration::from_secs(3), socket.recv_from(&mut buffer))
+        .await
+        .context("LAN display modes request timed out")??;
+    let ack: LanDiscoveryPacket = serde_json::from_slice(&buffer[..len])?;
+    match ack {
+        LanDiscoveryPacket::DisplayModesAck {
+            magic,
+            app_id,
+            session_id: ack_session_id,
+            accepted,
+            message,
+            modes,
+            ..
+        } if is_valid_discovery_packet(&magic, &app_id) && ack_session_id == session_id.0 => {
+            if accepted {
+                Ok(modes)
+            } else {
+                anyhow::bail!(
+                    "LAN peer rejected display mode listing: {}",
+                    message.unwrap_or_else(|| "unknown reason".to_string())
+                );
+            }
+        }
+        _ => anyhow::bail!("unexpected LAN display modes response"),
+    }
+}
+
+pub async fn request_lan_display_mode_set(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+    mode: DisplayMode,
+    restore_after_session: bool,
+) -> Result<DisplayModeChange> {
+    let peer_device_id = session_remote_peer(app_state, session_id).await?;
+    let target = peer_control_addr_with_display_mode_capability(app_state, &peer_device_id).await?;
+    let source_device_id = local_device_id(app_state).await?;
+
+    let socket = UdpSocket::bind(("0.0.0.0", 0))
+        .await
+        .context("failed to bind LAN display mode set UDP socket")?;
+    let packet = LanDiscoveryPacket::DisplayModeSet {
+        magic: DISCOVERY_MAGIC.to_string(),
+        app_id: DISCOVERY_APP_ID.to_string(),
+        instance_id: app_state.lan_discovery.instance_id.clone(),
+        session_id: session_id.0.clone(),
+        source_device_id,
+        mode,
+        restore_after_session,
+        timestamp_ms: now_ms(),
+    };
+    send_packet(&socket, &packet, target).await?;
+
+    let mut buffer = vec![0_u8; DISCOVERY_PACKET_BUFFER_BYTES];
+    let (len, _) = timeout(Duration::from_secs(4), socket.recv_from(&mut buffer))
+        .await
+        .context("LAN display mode set timed out")??;
+    let ack: LanDiscoveryPacket = serde_json::from_slice(&buffer[..len])?;
+    match ack {
+        LanDiscoveryPacket::DisplayModeSetAck {
+            magic,
+            app_id,
+            session_id: ack_session_id,
+            accepted,
+            message,
+            change,
+            ..
+        } if is_valid_discovery_packet(&magic, &app_id) && ack_session_id == session_id.0 => {
+            if accepted {
+                change.context("LAN peer accepted display mode set without change")
+            } else {
+                anyhow::bail!(
+                    "LAN peer rejected display mode set: {}",
+                    message.unwrap_or_else(|| "unknown reason".to_string())
+                );
+            }
+        }
+        _ => anyhow::bail!("unexpected LAN display mode set response"),
+    }
+}
+
+pub async fn request_lan_display_mode_restore(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+) -> Result<DisplayModeChange> {
+    let peer_device_id = session_remote_peer(app_state, session_id).await?;
+    let target = peer_control_addr_with_display_mode_capability(app_state, &peer_device_id).await?;
+    let source_device_id = local_device_id(app_state).await?;
+
+    let socket = UdpSocket::bind(("0.0.0.0", 0))
+        .await
+        .context("failed to bind LAN display mode restore UDP socket")?;
+    let packet = LanDiscoveryPacket::DisplayModeRestore {
+        magic: DISCOVERY_MAGIC.to_string(),
+        app_id: DISCOVERY_APP_ID.to_string(),
+        instance_id: app_state.lan_discovery.instance_id.clone(),
+        session_id: session_id.0.clone(),
+        source_device_id,
+        timestamp_ms: now_ms(),
+    };
+    send_packet(&socket, &packet, target).await?;
+
+    let mut buffer = vec![0_u8; DISCOVERY_PACKET_BUFFER_BYTES];
+    let (len, _) = timeout(Duration::from_secs(4), socket.recv_from(&mut buffer))
+        .await
+        .context("LAN display mode restore timed out")??;
+    let ack: LanDiscoveryPacket = serde_json::from_slice(&buffer[..len])?;
+    match ack {
+        LanDiscoveryPacket::DisplayModeRestoreAck {
+            magic,
+            app_id,
+            session_id: ack_session_id,
+            accepted,
+            message,
+            change,
+            ..
+        } if is_valid_discovery_packet(&magic, &app_id) && ack_session_id == session_id.0 => {
+            if accepted {
+                change.context("LAN peer accepted display mode restore without change")
+            } else {
+                anyhow::bail!(
+                    "LAN peer rejected display mode restore: {}",
+                    message.unwrap_or_else(|| "unknown reason".to_string())
+                );
+            }
+        }
+        _ => anyhow::bail!("unexpected LAN display mode restore response"),
+    }
+}
+
 async fn announce_loop(socket: Arc<UdpSocket>, app_state: Arc<AppState>) {
     let mut ticker = interval(app_state.lan_discovery.config.announce_interval);
     loop {
@@ -1126,6 +1345,134 @@ async fn handle_packet(
             send_packet(socket, &ack, addr).await?;
         }
         LanDiscoveryPacket::CaptureSourceSelectAck { .. } => {}
+        LanDiscoveryPacket::DisplayModesRequest {
+            magic,
+            app_id,
+            instance_id,
+            session_id,
+            source_device_id,
+            source_id,
+            ..
+        } => {
+            if !is_valid_discovery_packet(&magic, &app_id)
+                || instance_id == app_state.lan_discovery.instance_id()
+            {
+                return Ok(());
+            }
+
+            let session_id_value = SessionId(session_id.clone());
+            let modes_result =
+                accept_lan_display_modes_request(app_state, &session_id_value, source_id).await;
+            let (accepted, message, modes) = match modes_result {
+                Ok(modes) => (true, Some("listed".to_string()), modes),
+                Err(error) => (false, Some(error.to_string()), Vec::new()),
+            };
+            tracing::info!(
+                session_id = %session_id,
+                source_device_id = %source_device_id,
+                accepted,
+                "handled LAN display modes request"
+            );
+            let ack = LanDiscoveryPacket::DisplayModesAck {
+                magic: DISCOVERY_MAGIC.to_string(),
+                app_id: DISCOVERY_APP_ID.to_string(),
+                instance_id: app_state.lan_discovery.instance_id.clone(),
+                session_id,
+                accepted,
+                message,
+                modes,
+                timestamp_ms: now_ms(),
+            };
+            send_packet(socket, &ack, addr).await?;
+        }
+        LanDiscoveryPacket::DisplayModesAck { .. } => {}
+        LanDiscoveryPacket::DisplayModeSet {
+            magic,
+            app_id,
+            instance_id,
+            session_id,
+            source_device_id,
+            mode,
+            restore_after_session,
+            ..
+        } => {
+            if !is_valid_discovery_packet(&magic, &app_id)
+                || instance_id == app_state.lan_discovery.instance_id()
+            {
+                return Ok(());
+            }
+
+            let session_id_value = SessionId(session_id.clone());
+            let set_result = accept_lan_display_mode_set(
+                app_state,
+                &session_id_value,
+                mode,
+                restore_after_session,
+            )
+            .await;
+            let (accepted, message, change) = match set_result {
+                Ok(change) => (true, Some("changed".to_string()), Some(change)),
+                Err(error) => (false, Some(error.to_string()), None),
+            };
+            tracing::info!(
+                session_id = %session_id,
+                source_device_id = %source_device_id,
+                accepted,
+                "handled LAN display mode set"
+            );
+            let ack = LanDiscoveryPacket::DisplayModeSetAck {
+                magic: DISCOVERY_MAGIC.to_string(),
+                app_id: DISCOVERY_APP_ID.to_string(),
+                instance_id: app_state.lan_discovery.instance_id.clone(),
+                session_id,
+                accepted,
+                message,
+                change,
+                timestamp_ms: now_ms(),
+            };
+            send_packet(socket, &ack, addr).await?;
+        }
+        LanDiscoveryPacket::DisplayModeSetAck { .. } => {}
+        LanDiscoveryPacket::DisplayModeRestore {
+            magic,
+            app_id,
+            instance_id,
+            session_id,
+            source_device_id,
+            ..
+        } => {
+            if !is_valid_discovery_packet(&magic, &app_id)
+                || instance_id == app_state.lan_discovery.instance_id()
+            {
+                return Ok(());
+            }
+
+            let session_id_value = SessionId(session_id.clone());
+            let restore_result =
+                accept_lan_display_mode_restore(app_state, &session_id_value).await;
+            let (accepted, message, change) = match restore_result {
+                Ok(change) => (true, Some("restored".to_string()), Some(change)),
+                Err(error) => (false, Some(error.to_string()), None),
+            };
+            tracing::info!(
+                session_id = %session_id,
+                source_device_id = %source_device_id,
+                accepted,
+                "handled LAN display mode restore"
+            );
+            let ack = LanDiscoveryPacket::DisplayModeRestoreAck {
+                magic: DISCOVERY_MAGIC.to_string(),
+                app_id: DISCOVERY_APP_ID.to_string(),
+                instance_id: app_state.lan_discovery.instance_id.clone(),
+                session_id,
+                accepted,
+                message,
+                change,
+                timestamp_ms: now_ms(),
+            };
+            send_packet(socket, &ack, addr).await?;
+        }
+        LanDiscoveryPacket::DisplayModeRestoreAck { .. } => {}
     }
 
     Ok(())
@@ -1331,6 +1678,103 @@ async fn accept_lan_capture_source_select_from_sources(
     Ok(selection)
 }
 
+async fn accept_lan_display_modes_request(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+    source_id: Option<String>,
+) -> Result<Vec<DisplayMode>> {
+    ensure_active_sender_session(app_state, session_id, "display mode listing").await?;
+    crate::display_mode::list_display_modes(source_id.as_deref())
+}
+
+async fn accept_lan_display_mode_set(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+    mode: DisplayMode,
+    restore_after_session: bool,
+) -> Result<DisplayModeChange> {
+    ensure_active_sender_session(app_state, session_id, "display mode set").await?;
+    let (previous, active) = crate::display_mode::set_display_mode(&mode)?;
+    Ok(app_state.display_modes.lock().await.record_change(
+        session_id.clone(),
+        mode,
+        previous,
+        active,
+        restore_after_session,
+    ))
+}
+
+#[cfg(test)]
+async fn accept_lan_display_mode_set_from_modes(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+    requested: DisplayMode,
+    restore_after_session: bool,
+    modes: Vec<DisplayMode>,
+) -> Result<DisplayModeChange> {
+    ensure_active_sender_session(app_state, session_id, "display mode set").await?;
+    let previous = modes.iter().find(|mode| mode.is_current).cloned();
+    let active = crate::display_mode::choose_display_mode(
+        &modes,
+        requested.width,
+        requested.height,
+        requested.refresh_hz,
+    )
+    .with_context(|| {
+        format!(
+            "no display mode matches {}x{}@{}",
+            requested.width, requested.height, requested.refresh_hz
+        )
+    })?;
+    Ok(app_state.display_modes.lock().await.record_change(
+        session_id.clone(),
+        requested,
+        previous,
+        active,
+        restore_after_session,
+    ))
+}
+
+async fn accept_lan_display_mode_restore(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+) -> Result<DisplayModeChange> {
+    ensure_active_sender_session(app_state, session_id, "display mode restore").await?;
+    let restore_mode = app_state
+        .display_modes
+        .lock()
+        .await
+        .restore_mode(session_id)
+        .with_context(|| format!("no temporary display mode recorded for {}", session_id.0))?;
+    let (previous, active) = crate::display_mode::set_display_mode(&restore_mode)
+        .unwrap_or_else(|_| (None, restore_mode.clone()));
+    Ok(app_state.display_modes.lock().await.record_restore(
+        session_id.clone(),
+        previous.unwrap_or_else(|| restore_mode.clone()),
+        active,
+    ))
+}
+
+#[cfg(test)]
+async fn accept_lan_display_mode_restore_with_mode(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+    restored_mode: DisplayMode,
+) -> Result<DisplayModeChange> {
+    ensure_active_sender_session(app_state, session_id, "display mode restore").await?;
+    let previous = app_state
+        .display_modes
+        .lock()
+        .await
+        .active_mode(session_id)
+        .with_context(|| format!("no temporary display mode recorded for {}", session_id.0))?;
+    Ok(app_state.display_modes.lock().await.record_restore(
+        session_id.clone(),
+        previous,
+        restored_mode,
+    ))
+}
+
 async fn store_capture_source_selection(
     app_state: &Arc<AppState>,
     session_id: &SessionId,
@@ -1438,6 +1882,7 @@ async fn build_announcement(app_state: &Arc<AppState>) -> Option<LanAnnouncement
             LAN_QUIC_RELIABLE_MEDIA_TRANSPORT.to_string(),
             LAN_MEDIA_PROFILE_CONTROL_TRANSPORT.to_string(),
             LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT.to_string(),
+            LAN_DISPLAY_MODE_CONTROL_TRANSPORT.to_string(),
         ],
         service_build_id: Some(service_build_id()),
         media_protocol_version: Some(LAN_MEDIA_PROTOCOL_VERSION),
@@ -1466,6 +1911,7 @@ fn lan_media_capabilities() -> Vec<String> {
             LAN_ENCODE_NVENC_H264_CAPABILITY.to_string(),
             LAN_DECODE_NVDEC_CAPABILITY.to_string(),
             LAN_RENDER_D3D11_NATIVE_CAPABILITY.to_string(),
+            crate::display_mode::capability_name().to_string(),
         ]);
     }
     #[cfg(not(windows))]
@@ -1703,6 +2149,34 @@ async fn peer_control_addr_with_capture_source_capability(
         anyhow::bail!(
             "LAN peer does not advertise required capture source control [{}]: {} supports {}. Rebuild and restart the peer mrd-service/Rdesk from the latest main branch",
             LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT,
+            peer_device_id.0,
+            format_peer_transports(&peer_transports)
+        );
+    }
+    Ok(target)
+}
+
+async fn peer_control_addr_with_display_mode_capability(
+    app_state: &Arc<AppState>,
+    peer_device_id: &DeviceId,
+) -> Result<SocketAddr> {
+    let target = app_state
+        .lan_discovery
+        .peer_control_addr(peer_device_id)
+        .await
+        .with_context(|| format!("LAN peer not found: {}", peer_device_id.0))?;
+    let peer_transports = app_state
+        .lan_discovery
+        .peer_transports(peer_device_id)
+        .await
+        .with_context(|| format!("LAN peer not found: {}", peer_device_id.0))?;
+    if !peer_transports
+        .iter()
+        .any(|transport| transport.eq_ignore_ascii_case(LAN_DISPLAY_MODE_CONTROL_TRANSPORT))
+    {
+        anyhow::bail!(
+            "LAN peer does not advertise required display mode control [{}]: {} supports {}. Rebuild and restart the peer mrd-service/Rdesk from the latest main branch",
+            LAN_DISPLAY_MODE_CONTROL_TRANSPORT,
             peer_device_id.0,
             format_peer_transports(&peer_transports)
         );
@@ -4788,6 +5262,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn display_mode_set_chooses_matching_mode_and_records_restore() {
+        let app_state = Arc::new(AppState::new());
+        let session_id = SessionId("display-mode-session".to_string());
+        app_state
+            .sessions
+            .lock()
+            .await
+            .insert(session_id.clone(), sender_snapshot(&session_id));
+        let modes = vec![
+            display_mode("current", 2560, 1600, 60, true),
+            display_mode("target", 1920, 1080, 144, false),
+        ];
+
+        let change = accept_lan_display_mode_set_from_modes(
+            &app_state,
+            &session_id,
+            display_mode("requested", 1920, 1080, 144, false),
+            true,
+            modes,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(change.status, "changed");
+        assert_eq!(
+            change.previous.as_ref().map(|mode| mode.id.as_str()),
+            Some("current")
+        );
+        assert_eq!(
+            change.active.as_ref().map(|mode| mode.id.as_str()),
+            Some("target")
+        );
+        assert_eq!(
+            app_state
+                .display_modes
+                .lock()
+                .await
+                .restore_mode(&session_id)
+                .as_ref()
+                .map(|mode| mode.id.as_str()),
+            Some("current")
+        );
+    }
+
+    #[tokio::test]
+    async fn display_mode_restore_uses_original_temporary_mode() {
+        let app_state = Arc::new(AppState::new());
+        let session_id = SessionId("display-mode-restore-session".to_string());
+        app_state
+            .sessions
+            .lock()
+            .await
+            .insert(session_id.clone(), sender_snapshot(&session_id));
+        {
+            app_state.display_modes.lock().await.record_change(
+                session_id.clone(),
+                display_mode("requested", 1920, 1080, 144, false),
+                Some(display_mode("current", 2560, 1600, 60, true)),
+                display_mode("target", 1920, 1080, 144, true),
+                true,
+            );
+        }
+
+        let change = accept_lan_display_mode_restore_with_mode(
+            &app_state,
+            &session_id,
+            display_mode("current", 2560, 1600, 60, false),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(change.status, "restored");
+        assert_eq!(
+            change.active.as_ref().map(|mode| mode.id.as_str()),
+            Some("current")
+        );
+        assert!(app_state
+            .display_modes
+            .lock()
+            .await
+            .restore_mode(&session_id)
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn remote_capture_source_selection_reconciles_controller_profile() {
         let app_state = Arc::new(AppState::new());
         let session_id = SessionId("controller-capture-source-profile-session".to_string());
@@ -5450,5 +6009,42 @@ mod tests {
             negotiation.downgrade_reason.as_deref(),
             Some("matched selected capture source dimensions and aspect ratio")
         );
+    }
+
+    fn sender_snapshot(session_id: &SessionId) -> SessionSnapshot {
+        SessionSnapshot {
+            session_id: session_id.clone(),
+            transport: "quic".to_string(),
+            source_device_id: Some(DeviceId("controller-device".to_string())),
+            target_device_id: None,
+            local_listen_addr: None,
+            local_server_name: None,
+            local_cert_der_b64: None,
+            remote_listen_addr: None,
+            remote_server_name: None,
+            remote_cert_der_b64: None,
+            lifecycle_state: "listening".to_string(),
+            last_error: None,
+            sender_active: true,
+            receiver_active: false,
+        }
+    }
+
+    fn display_mode(
+        id: &str,
+        width: u32,
+        height: u32,
+        refresh_hz: u32,
+        is_current: bool,
+    ) -> mrd_ipc::DisplayMode {
+        mrd_ipc::DisplayMode {
+            id: id.to_string(),
+            source_id: Some("windows:display-shared:0".to_string()),
+            width,
+            height,
+            refresh_hz,
+            bit_depth: Some(32),
+            is_current,
+        }
     }
 }
