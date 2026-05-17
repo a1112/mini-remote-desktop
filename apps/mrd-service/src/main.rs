@@ -11,6 +11,7 @@
 mod app_state;
 mod capabilities;
 mod capture_source;
+mod display_mode;
 mod handlers;
 mod ipc_server;
 mod lan_discovery;
@@ -37,8 +38,25 @@ async fn main() -> Result<()> {
     // Initialize tray (Phase 4)
     let tray: Arc<std::sync::Mutex<dyn shell::TrayPort + Send + Sync>> = shell::default_tray();
 
+    let lan_discovery_config = lan_discovery::LanDiscoveryConfig::from_env()?;
+
     // Initialize application state with tray
-    let app_state = Arc::new(AppState::with_tray(tray.clone()));
+    let app_state = Arc::new(AppState::with_tray_and_lan_discovery_config(
+        tray.clone(),
+        lan_discovery_config,
+    ));
+    {
+        let (device_id, device_name) = app_state::default_lan_device_identity();
+        let mut devices = app_state.devices.lock().await;
+        if let Some((registered_id, registered_name)) =
+            devices.register_if_unregistered(device_id, device_name)
+        {
+            info!(
+                "Default LAN device registered: {} ({})",
+                registered_id.0, registered_name
+            );
+        }
+    }
     {
         let tray_available = tray.lock().unwrap().is_available();
         let mut shell = app_state.shell.lock().await;

@@ -1197,6 +1197,29 @@ describe("MatrixTestPage failure handling", () => {
       if (command === "ipc_select_remote_capture_source") {
         return Promise.resolve({ session_id: args?.sessionId, source, status: "selected" });
       }
+      if (command === "ipc_list_remote_display_modes") {
+        return Promise.resolve([
+          {
+            id: "display-1:1728x1080@60",
+            source_id: "display-1",
+            width: 1728,
+            height: 1080,
+            refresh_hz: 60,
+            bit_depth: 8,
+            is_current: true,
+          },
+        ]);
+      }
+      if (command === "ipc_set_remote_display_mode") {
+        return Promise.resolve({
+          session_id: args?.sessionId,
+          requested: args?.mode,
+          previous: args?.mode,
+          active: args?.mode,
+          status: "changed",
+          restore_required: false,
+        });
+      }
       if (command === "ipc_start_receiver") return Promise.resolve(args?.sessionId);
       if (command === "open_remote_display_window") {
         return Promise.resolve({
@@ -1236,6 +1259,17 @@ describe("MatrixTestPage failure handling", () => {
           media_probe_target_bitrate_mbps: 5,
         });
       }
+      if (command === "ipc_media_pipeline_snapshot") {
+        return Promise.resolve({
+          session_id: args?.sessionId,
+          attached_surfaces: [],
+          active_decoder: "nvdec",
+          active_renderer: "d3d11",
+          queue_depth: 0,
+          dropped_frames: 0,
+          stage_metrics: [],
+        });
+      }
       if (command === "ipc_stop_session") return Promise.resolve(args?.sessionId);
       return Promise.resolve(null);
     });
@@ -1252,7 +1286,9 @@ describe("MatrixTestPage failure handling", () => {
     selectSingleSupportedCombination();
     fireEvent.click(screen.getByRole("button", { name: /启动矩阵测试/ }));
 
-    await screen.findByText(/Runtime media profile downgraded/);
+    await screen.findByText(/Runtime media profile downgraded/, undefined, {
+      timeout: 3000,
+    });
     expect(resultRow()).toHaveTextContent("跳过");
   });
 });

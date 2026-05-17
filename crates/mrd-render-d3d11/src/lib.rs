@@ -110,6 +110,32 @@ pub struct D3d11Renderer {
     last_pixel_format: Option<RenderPixelFormat>,
 }
 
+fn fit_viewport_rect(
+    surface_width: u32,
+    surface_height: u32,
+    frame_width: usize,
+    frame_height: usize,
+) -> (f32, f32, f32, f32) {
+    if surface_width == 0 || surface_height == 0 || frame_width == 0 || frame_height == 0 {
+        return (0.0, 0.0, surface_width as f32, surface_height as f32);
+    }
+
+    let surface_width = surface_width as f32;
+    let surface_height = surface_height as f32;
+    let frame_aspect = frame_width as f32 / frame_height as f32;
+    let surface_aspect = surface_width / surface_height;
+
+    if surface_aspect > frame_aspect {
+        let height = surface_height;
+        let width = height * frame_aspect;
+        ((surface_width - width) * 0.5, 0.0, width, height)
+    } else {
+        let width = surface_width;
+        let height = width / frame_aspect;
+        (0.0, (surface_height - height) * 0.5, width, height)
+    }
+}
+
 impl D3d11Renderer {
     pub fn new() -> Result<Self, RenderError> {
         #[cfg(windows)]
@@ -173,6 +199,31 @@ impl D3d11Renderer {
     #[cfg(not(windows))]
     pub fn device_ptr(&self) -> *mut core::ffi::c_void {
         core::ptr::null_mut()
+    }
+
+    #[cfg(windows)]
+    fn present_flags() -> u32 {
+        use windows::Win32::Graphics::Dxgi::DXGI_PRESENT_DO_NOT_WAIT;
+
+        match std::env::var("MRD_D3D11_RENDER_PRESENT_BLOCKING") {
+            Ok(value) if value == "1" || value.eq_ignore_ascii_case("true") => 0,
+            _ => DXGI_PRESENT_DO_NOT_WAIT,
+        }
+    }
+
+    #[cfg(windows)]
+    fn present_swap_chain(
+        swap_chain: &windows::Win32::Graphics::Dxgi::IDXGISwapChain1,
+    ) -> Result<(), RenderError> {
+        use windows::Win32::Graphics::Dxgi::DXGI_ERROR_WAS_STILL_DRAWING;
+
+        let hr = unsafe { swap_chain.Present(0, Self::present_flags()) };
+        if hr == DXGI_ERROR_WAS_STILL_DRAWING {
+            return Ok(());
+        }
+        hr.ok()
+            .map_err(|error| RenderError::Message(format!("present 失败: {error}")))?;
+        Ok(())
     }
 
     #[cfg(windows)]
@@ -318,12 +369,8 @@ impl D3d11Renderer {
                 .OMSetRenderTargets(Some(&[Some(surface.render_target_view.clone())]), None);
             self.context
                 .ClearRenderTargetView(&surface.render_target_view, &clear);
-            surface
-                .swap_chain
-                .Present(0, 0)
-                .ok()
-                .map_err(|error| RenderError::Message(format!("present 失败: {error}")))?;
         }
+        Self::present_swap_chain(&surface.swap_chain)?;
         Ok(())
     }
 
@@ -399,12 +446,8 @@ impl D3d11Renderer {
                 row_pitch,
                 0,
             );
-            surface
-                .swap_chain
-                .Present(0, 0)
-                .ok()
-                .map_err(|error| RenderError::Message(format!("present 失败: {error}")))?;
         }
+        Self::present_swap_chain(&surface.swap_chain)?;
         Ok(())
     }
 
@@ -543,12 +586,8 @@ impl D3d11Renderer {
                 row_pitch,
                 0,
             );
-            surface
-                .swap_chain
-                .Present(0, 0)
-                .ok()
-                .map_err(|error| RenderError::Message(format!("present 失败: {error}")))?;
         }
+        Self::present_swap_chain(&surface.swap_chain)?;
         Ok(())
     }
 
@@ -809,12 +848,8 @@ impl D3d11Renderer {
                     Some(&source_box),
                 );
             }
-            surface
-                .swap_chain
-                .Present(0, 0)
-                .ok()
-                .map_err(|error| RenderError::Message(format!("present 失败: {error}")))?;
         }
+        Self::present_swap_chain(&surface.swap_chain)?;
         Ok(())
     }
 
@@ -862,11 +897,13 @@ impl D3d11Renderer {
             )
         };
 
+        let (viewport_x, viewport_y, viewport_width, viewport_height) =
+            fit_viewport_rect(surface_width, surface_height, frame.width, frame.height);
         let viewport = D3D11_VIEWPORT {
-            TopLeftX: 0.0,
-            TopLeftY: 0.0,
-            Width: surface_width as f32,
-            Height: surface_height as f32,
+            TopLeftX: viewport_x,
+            TopLeftY: viewport_y,
+            Width: viewport_width,
+            Height: viewport_height,
             MinDepth: 0.0,
             MaxDepth: 1.0,
         };
@@ -875,6 +912,9 @@ impl D3d11Renderer {
         let empty_srvs: [Option<ID3D11ShaderResourceView>; 2] = [None, None];
 
         unsafe {
+            let clear = [0.0_f32, 0.0, 0.0, 1.0];
+            self.context
+                .ClearRenderTargetView(&render_target_view, &clear);
             self.context
                 .OMSetRenderTargets(Some(&[Some(render_target_view)]), None);
             self.context.RSSetViewports(Some(&[viewport]));
@@ -886,11 +926,8 @@ impl D3d11Renderer {
             self.context.PSSetShaderResources(0, Some(&srvs));
             self.context.Draw(3, 0);
             self.context.PSSetShaderResources(0, Some(&empty_srvs));
-            swap_chain
-                .Present(0, 0)
-                .ok()
-                .map_err(|error| RenderError::Message(format!("present 失败: {error}")))?;
         }
+        Self::present_swap_chain(&swap_chain)?;
         Ok(())
     }
 }
@@ -973,8 +1010,28 @@ impl RendererInstance for D3d11Renderer {
 
 #[cfg(test)]
 mod tests {
-    use super::{D3d11Renderer, D3d11RendererFactory};
+    use super::{fit_viewport_rect, D3d11Renderer, D3d11RendererFactory};
     use mrd_render::{RenderFrame, RenderPixelFormat, RenderTarget, RendererFactory};
+
+    #[test]
+    fn fit_viewport_rect_preserves_source_aspect_ratio() {
+        let viewport = fit_viewport_rect(1200, 1200, 1920, 1080);
+
+        assert_eq!(viewport, (0.0, 262.5, 1200.0, 675.0));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn d3d11_renderer_defaults_to_nonblocking_present() {
+        use windows::Win32::Graphics::Dxgi::DXGI_PRESENT_DO_NOT_WAIT;
+
+        std::env::remove_var("MRD_D3D11_RENDER_PRESENT_BLOCKING");
+        assert_eq!(D3d11Renderer::present_flags(), DXGI_PRESENT_DO_NOT_WAIT);
+
+        std::env::set_var("MRD_D3D11_RENDER_PRESENT_BLOCKING", "1");
+        assert_eq!(D3d11Renderer::present_flags(), 0);
+        std::env::remove_var("MRD_D3D11_RENDER_PRESENT_BLOCKING");
+    }
 
     #[cfg(windows)]
     #[test]

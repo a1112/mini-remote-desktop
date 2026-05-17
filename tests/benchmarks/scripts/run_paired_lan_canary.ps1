@@ -3,9 +3,12 @@ param(
   [string]$OutputDir = "target/codex-matrix-compare",
   [string]$TargetDeviceId,
   [string]$TargetAddress,
+  [string[]]$ProfileId,
   [int]$DurationSecs = 30,
   [int]$BitrateMbps = 20,
   [double]$RatioThreshold = 0.8,
+  [ValidateSet("none", "temporary", "required")]
+  [string]$DisplayModePolicy = "temporary",
   [switch]$SkipLocal,
   [switch]$SkipCross,
   [switch]$NoBuild,
@@ -221,7 +224,7 @@ function Invoke-LocalCanaryProfile($Repo, $Profile, $GitCommit) {
   }
 }
 
-function Invoke-CrossCanaryProfile($Repo, $Profile, $OutputRoot, $TargetDeviceId, [int]$TimeoutMs, [switch]$KeepTauriOpen) {
+function Invoke-CrossCanaryProfile($Repo, $Profile, $OutputRoot, $TargetDeviceId, [int]$TimeoutMs, [string]$DisplayModePolicy, [switch]$KeepTauriOpen) {
   $reportPath = Join-Path $OutputRoot ("raw/cross-$($Profile.id).json")
   $logsDir = Join-Path $OutputRoot "logs"
   New-Item -ItemType Directory -Force -Path (Split-Path -Parent $reportPath), $logsDir | Out-Null
@@ -233,6 +236,7 @@ function Invoke-CrossCanaryProfile($Repo, $Profile, $OutputRoot, $TargetDeviceId
     Set-EnvVar "MRD_LAN_E2E_AUTORUN" "1" $savedEnv
     Set-EnvVar "MRD_LAN_E2E_TRANSPORT" "quic" $savedEnv
     Set-EnvVar "MRD_LAN_E2E_TIMEOUT_MS" ([string]$TimeoutMs) $savedEnv
+    Set-EnvVar "MRD_LAN_E2E_MIN_SAMPLE_DURATION_MS" ([string]($Profile.duration_secs * 1000)) $savedEnv
     Set-EnvVar "MRD_LAN_E2E_MIN_DECODED_FRAMES" "20" $savedEnv
     Set-EnvVar "MRD_LAN_E2E_MIN_FPS" ([string]([Math]::Max(1, [Math]::Floor($Profile.fps * 0.5)))) $savedEnv
     Set-EnvVar "MRD_LAN_E2E_STOP_ON_COMPLETE" "true" $savedEnv
@@ -241,6 +245,7 @@ function Invoke-CrossCanaryProfile($Repo, $Profile, $OutputRoot, $TargetDeviceId
     Set-EnvVar "MRD_LAN_E2E_PROFILE_HEIGHT" ([string]$Profile.height) $savedEnv
     Set-EnvVar "MRD_LAN_E2E_PROFILE_FPS" ([string]$Profile.fps) $savedEnv
     Set-EnvVar "MRD_LAN_E2E_PROFILE_BITRATE_MBPS" ([string]$Profile.bitrate_mbps) $savedEnv
+    Set-EnvVar "MRD_LAN_E2E_DISPLAY_MODE_POLICY" $DisplayModePolicy $savedEnv
     if ($TargetDeviceId) {
       Set-EnvVar "MRD_LAN_E2E_TARGET_DEVICE_ID" $TargetDeviceId $savedEnv
     }
@@ -301,6 +306,18 @@ $outputRoot = Join-Path $repo $OutputDir
 New-Item -ItemType Directory -Force -Path $outputRoot | Out-Null
 $gitCommit = (git -C $repo rev-parse --short=12 HEAD).Trim()
 $profiles = Get-PairedLanCanaryProfiles -DurationSecs $DurationSecs -BitrateMbps $BitrateMbps
+if ($ProfileId -and $ProfileId.Count -gt 0) {
+  $requestedProfiles = @(
+    $ProfileId |
+      ForEach-Object { $_ -split "," } |
+      ForEach-Object { $_.Trim() } |
+      Where-Object { $_ }
+  )
+  $profiles = @($profiles | Where-Object { $requestedProfiles -contains $_.id })
+  if ($profiles.Count -eq 0) {
+    throw "No paired LAN canary profiles matched: $($requestedProfiles -join ', ')"
+  }
+}
 
 if (-not $NoBuild) {
   cargo build -p app -p mrd-service
@@ -320,7 +337,7 @@ if (-not $SkipCross) {
   $timeoutMs = ($DurationSecs * 1000) + 30000
   foreach ($profile in $profiles) {
     Write-Host "Running cross-device canary $($profile.id)"
-    $crossRows += Invoke-CrossCanaryProfile -Repo $repo -Profile $profile -OutputRoot $outputRoot -TargetDeviceId $TargetDeviceId -TimeoutMs $timeoutMs -KeepTauriOpen:$KeepTauriOpen
+    $crossRows += Invoke-CrossCanaryProfile -Repo $repo -Profile $profile -OutputRoot $outputRoot -TargetDeviceId $TargetDeviceId -TimeoutMs $timeoutMs -DisplayModePolicy $DisplayModePolicy -KeepTauriOpen:$KeepTauriOpen
   }
 }
 

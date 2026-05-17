@@ -124,6 +124,21 @@ pub struct MediaStageMetrics {
     pub p95_ms: Option<f64>,
 }
 
+/// Synthetic transport impairment settings and counters for test runs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MediaTestImpairmentSnapshot {
+    pub loss_pct: f64,
+    pub base_delay_ms: u64,
+    pub jitter_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtu_bytes: Option<u32>,
+    pub seed: u64,
+    pub datagrams_sent: u64,
+    pub datagrams_dropped: u64,
+    pub datagrams_delayed: u64,
+    pub datagrams_fragmented_by_mtu: u64,
+}
+
 /// Runtime state for a session media pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MediaPipelineSnapshot {
@@ -136,6 +151,8 @@ pub struct MediaPipelineSnapshot {
     pub queue_depth: u32,
     pub dropped_frames: u64,
     pub stage_metrics: Vec<MediaStageMetrics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_impairment: Option<MediaTestImpairmentSnapshot>,
 }
 
 /// A capture source that can be selected for a remote session.
@@ -163,6 +180,50 @@ pub struct CaptureSourceSelection {
     pub source: CaptureSource,
     pub status: String,
     pub reason: Option<String>,
+}
+
+/// A display output mode that can be applied to a remote capture display.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DisplayMode {
+    /// Stable mode identifier, usually platform/source/resolution/refresh.
+    pub id: String,
+    /// Optional capture source id this mode belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
+    /// Pixel width.
+    pub width: u32,
+    /// Pixel height.
+    pub height: u32,
+    /// Refresh rate rounded to Hz.
+    pub refresh_hz: u32,
+    /// Color depth when the platform exposes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bit_depth: Option<u32>,
+    /// Whether this mode is currently active.
+    pub is_current: bool,
+}
+
+/// Result of a display mode change or restore operation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DisplayModeChange {
+    /// Session associated with the temporary display mode request.
+    pub session_id: SessionId,
+    /// Requested mode, absent for restore-only responses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested: Option<DisplayMode>,
+    /// Mode observed before the change, used for restore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous: Option<DisplayMode>,
+    /// Active mode after the operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<DisplayMode>,
+    /// Machine-readable status such as changed, restored, unsupported, or failed.
+    pub status: String,
+    /// Human-readable reason when status is not a clean change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Whether the original mode should be restored when the session ends.
+    pub restore_required: bool,
 }
 
 /// Platform identifier used by structured capability snapshots.
@@ -403,6 +464,16 @@ pub enum IpcRequest {
         session_id: SessionId,
         source_id: String,
     },
+    /// List display modes from the remote peer for a session.
+    ListRemoteDisplayModes { session_id: SessionId },
+    /// Temporarily set a remote display mode.
+    SetRemoteDisplayMode {
+        session_id: SessionId,
+        mode: DisplayMode,
+        restore_after_session: bool,
+    },
+    /// Restore the display mode saved for a session.
+    RestoreRemoteDisplayMode { session_id: SessionId },
     /// Attach a native render surface to a session media pipeline.
     AttachRenderSurface {
         session_id: SessionId,
@@ -514,6 +585,16 @@ pub enum IpcResponse {
     CaptureSourceSelected {
         session_id: SessionId,
         selection: CaptureSourceSelection,
+    },
+    /// Display modes returned by the remote peer.
+    DisplayModeList {
+        session_id: SessionId,
+        modes: Vec<DisplayMode>,
+    },
+    /// Display mode change or restore result.
+    DisplayModeChanged {
+        session_id: SessionId,
+        change: DisplayModeChange,
     },
     /// Native render surface attached.
     RenderSurfaceAttached {
@@ -701,4 +782,76 @@ pub struct ServiceStatus {
     pub running: bool,
     pub healthy: bool,
     pub pid: Option<u32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_mode_ipc_round_trips_with_restore_metadata() {
+        let session_id = SessionId("display-mode-session".to_string());
+        let mode = DisplayMode {
+            id: "windows:display:0:1920x1080@60".to_string(),
+            source_id: Some("windows:display:0".to_string()),
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60,
+            bit_depth: Some(32),
+            is_current: false,
+        };
+        let change = DisplayModeChange {
+            session_id: session_id.clone(),
+            requested: Some(mode.clone()),
+            previous: Some(DisplayMode {
+                id: "windows:display:0:2560x1600@60".to_string(),
+                source_id: Some("windows:display:0".to_string()),
+                width: 2560,
+                height: 1600,
+                refresh_hz: 60,
+                bit_depth: Some(32),
+                is_current: true,
+            }),
+            active: Some(mode.clone()),
+            status: "changed".to_string(),
+            reason: None,
+            restore_required: true,
+        };
+
+        let response = IpcResponse::DisplayModeChanged {
+            session_id: session_id.clone(),
+            change,
+        };
+        let encoded = serde_json::to_string(&response).unwrap();
+        assert!(encoded.contains("DisplayModeChanged"));
+        assert!(encoded.contains("restore_required"));
+
+        let decoded: IpcResponse = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn display_mode_control_requests_are_tagged_ipc_messages() {
+        let session_id = SessionId("display-mode-session".to_string());
+        let mode = DisplayMode {
+            id: "windows:display:0:1920x1080@144".to_string(),
+            source_id: Some("windows:display:0".to_string()),
+            width: 1920,
+            height: 1080,
+            refresh_hz: 144,
+            bit_depth: None,
+            is_current: false,
+        };
+
+        let request = IpcRequest::SetRemoteDisplayMode {
+            session_id,
+            mode,
+            restore_after_session: true,
+        };
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert!(encoded.contains("SetRemoteDisplayMode"));
+
+        let decoded: IpcRequest = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, request);
+    }
 }

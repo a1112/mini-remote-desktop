@@ -28,6 +28,8 @@ import type {
   CapabilitySnapshot,
   CaptureSource,
   CaptureSourceSelection,
+  DisplayMode,
+  DisplayModeChange,
   MediaProfile,
   MediaProfileNegotiation,
   MediaPipelineSnapshot,
@@ -440,6 +442,43 @@ export async function ipcSelectRemoteCaptureSource(
   return invokeAdapter<CaptureSourceSelection>('ipc_select_remote_capture_source', {
     sessionId,
     sourceId,
+  });
+}
+
+/**
+ * List remote display modes for the selected capture display.
+ */
+export async function ipcListRemoteDisplayModes(
+  sessionId: string
+): Promise<AdapterResult<DisplayMode[]>> {
+  return invokeAdapter<DisplayMode[]>('ipc_list_remote_display_modes', {
+    sessionId,
+  });
+}
+
+/**
+ * Temporarily set the remote display mode for an active LAN session.
+ */
+export async function ipcSetRemoteDisplayMode(
+  sessionId: string,
+  mode: DisplayMode,
+  restoreAfterSession = true
+): Promise<AdapterResult<DisplayModeChange>> {
+  return invokeAdapter<DisplayModeChange>('ipc_set_remote_display_mode', {
+    sessionId,
+    mode,
+    restoreAfterSession,
+  });
+}
+
+/**
+ * Restore a temporary remote display mode.
+ */
+export async function ipcRestoreRemoteDisplayMode(
+  sessionId: string
+): Promise<AdapterResult<DisplayModeChange>> {
+  return invokeAdapter<DisplayModeChange>('ipc_restore_remote_display_mode', {
+    sessionId,
   });
 }
 

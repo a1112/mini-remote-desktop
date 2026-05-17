@@ -1602,8 +1602,10 @@ mod imp {
                 );
             }
 
-            // Create shared texture if needed
-            if self.enable_shared_texture && self.shared_texture.is_none() {
+            // Create or recreate shared texture if needed. NVDEC can reconfigure
+            // after a display-mode/profile change; stale shared textures force
+            // the hot path back through CPU NV12.
+            if self.enable_shared_texture {
                 let (width, height) = self.callback_state.output_dimensions_u32();
                 if width > 0 && height > 0 {
                     let surface_kind = self
@@ -1612,6 +1614,21 @@ mod imp {
                         .as_ref()
                         .map(|config| DecodedSurfaceKind::from_bit_depth(config.bit_depth_minus8))
                         .unwrap_or(DecodedSurfaceKind::Nv12);
+                    let needs_texture = self
+                        .shared_texture
+                        .as_ref()
+                        .map(|texture| {
+                            texture.width != width
+                                || texture.height != height
+                                || texture.surface_kind != surface_kind
+                        })
+                        .unwrap_or(true);
+                    if !needs_texture {
+                        return Ok(());
+                    }
+
+                    self.callback_state.clear_shared_texture_registration();
+                    self.shared_texture = None;
                     let texture_result = if let Some(device_ptr) = self.external_d3d11_device_ptr {
                         unsafe {
                             D3D11SharedTexture::new_with_device_ptr(
@@ -1666,6 +1683,7 @@ mod imp {
                 } else {
                     None
                 };
+                self.callback_state.clear_shared_texture_registration();
                 if !self.parser.is_null() {
                     let _ = (self._cuvid.cuvid_destroy_video_parser)(self.parser);
                 }
@@ -1701,6 +1719,24 @@ mod imp {
             self.diagnostics.last_reconfigure_to_coded_width = None;
             self.diagnostics.last_reconfigure_to_coded_height = None;
             self.diagnostics.reconfigure_fallback_used = false;
+        }
+
+        fn clear_shared_texture_registration(&mut self) {
+            if let Some(unregister) = self.cu_graphics_unregister_resource {
+                if let Some(resource) = self.cuda_resource_y.take() {
+                    let _ = unsafe { unregister(resource) };
+                }
+                if let Some(resource) = self.cuda_resource_uv.take() {
+                    let _ = unsafe { unregister(resource) };
+                }
+            } else {
+                self.cuda_resource_y = None;
+                self.cuda_resource_uv = None;
+            }
+            self.d3d11_y_texture_ptr = None;
+            self.d3d11_uv_texture_ptr = None;
+            self.shared_texture_y = None;
+            self.shared_texture_uv = None;
         }
 
         fn record_recreate(&mut self, reason: &'static str, config: &DecoderConfig) {

@@ -419,6 +419,7 @@ fn serialize_deserialize_media_pipeline_snapshot_contract() {
                 p50_ms: Some(1.0),
                 p95_ms: Some(2.0),
             }],
+            test_impairment: None,
         },
     };
 

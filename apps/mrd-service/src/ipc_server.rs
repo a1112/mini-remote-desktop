@@ -27,7 +27,10 @@ pub struct IpcServer {
 
 impl IpcServer {
     pub fn new(app_state: Arc<AppState>) -> Self {
-        Self::new_with_endpoint(app_state, transport::IpcEndpoint::default_service())
+        Self::new_with_endpoint(
+            app_state,
+            transport::IpcEndpoint::service_from_env_or_default(),
+        )
     }
 
     pub fn new_with_endpoint(app_state: Arc<AppState>, endpoint: transport::IpcEndpoint) -> Self {
@@ -198,6 +201,28 @@ impl IpcServer {
                 source_id,
             } => {
                 session::select_remote_capture_source(&self.app_state, session_id, source_id).await
+            }
+
+            IpcRequest::ListRemoteDisplayModes { session_id } => {
+                session::list_remote_display_modes(&self.app_state, session_id).await
+            }
+
+            IpcRequest::SetRemoteDisplayMode {
+                session_id,
+                mode,
+                restore_after_session,
+            } => {
+                session::set_remote_display_mode(
+                    &self.app_state,
+                    session_id,
+                    mode,
+                    restore_after_session,
+                )
+                .await
+            }
+
+            IpcRequest::RestoreRemoteDisplayMode { session_id } => {
+                session::restore_remote_display_mode(&self.app_state, session_id).await
             }
 
             IpcRequest::AttachRenderSurface {

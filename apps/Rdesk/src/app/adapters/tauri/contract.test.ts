@@ -432,6 +432,76 @@ describe('Tauri Adapter Contract', () => {
       });
     });
 
+    it('ipc_list_remote_display_modes calls correct command', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue([
+        {
+          id: 'windows:display:0:1920x1080@144',
+          source_id: 'windows:display-shared:0',
+          width: 1920,
+          height: 1080,
+          refresh_hz: 144,
+          bit_depth: 32,
+          is_current: false,
+        },
+      ]);
+
+      await adapter.ipcListRemoteDisplayModes('session-123');
+
+      expect(mockInvoke).toHaveBeenCalledWith('ipc_list_remote_display_modes', {
+        sessionId: 'session-123',
+      });
+    });
+
+    it('ipc_set_remote_display_mode calls correct command with restore flag', async () => {
+      const mockInvoke = getMockInvoke();
+      const mode = {
+        id: 'windows:display:0:1920x1080@144',
+        source_id: 'windows:display-shared:0',
+        width: 1920,
+        height: 1080,
+        refresh_hz: 144,
+        bit_depth: 32,
+        is_current: false,
+      };
+      mockInvoke.mockResolvedValue({
+        session_id: 'session-123',
+        requested: mode,
+        previous: null,
+        active: { ...mode, is_current: true },
+        status: 'changed',
+        reason: null,
+        restore_required: true,
+      });
+
+      await adapter.ipcSetRemoteDisplayMode('session-123', mode, true);
+
+      expect(mockInvoke).toHaveBeenCalledWith('ipc_set_remote_display_mode', {
+        sessionId: 'session-123',
+        mode,
+        restoreAfterSession: true,
+      });
+    });
+
+    it('ipc_restore_remote_display_mode calls correct command', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue({
+        session_id: 'session-123',
+        requested: null,
+        previous: null,
+        active: null,
+        status: 'restored',
+        reason: null,
+        restore_required: false,
+      });
+
+      await adapter.ipcRestoreRemoteDisplayMode('session-123');
+
+      expect(mockInvoke).toHaveBeenCalledWith('ipc_restore_remote_display_mode', {
+        sessionId: 'session-123',
+      });
+    });
+
     it('ipc_accept_session calls correct command with args', async () => {
       const mockInvoke = getMockInvoke();
       mockInvoke.mockResolvedValue('session-123');

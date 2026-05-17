@@ -78,14 +78,30 @@ pub async fn attach_render_surface(
     }
     drop(sessions);
 
-    app_state.media_pipelines.lock().await.attach_surface(
-        session_id.clone(),
-        AttachedRenderSurface {
-            surface_id: surface_id.clone(),
-            backend,
-            window_handle,
-        },
-    );
+    let surface = AttachedRenderSurface {
+        surface_id: surface_id.clone(),
+        backend,
+        window_handle,
+    };
+
+    #[cfg(windows)]
+    if let Err(error) = app_state
+        .media_surface_renderers
+        .lock()
+        .await
+        .attach_surface(&session_id, &surface)
+    {
+        return IpcResponse::Error {
+            code: "E_RENDER_ATTACH".to_string(),
+            message: error,
+        };
+    }
+
+    app_state
+        .media_pipelines
+        .lock()
+        .await
+        .attach_surface(session_id.clone(), surface);
 
     IpcResponse::RenderSurfaceAttached {
         session_id,
@@ -101,6 +117,12 @@ pub async fn detach_render_surface(
 ) -> IpcResponse {
     app_state
         .media_pipelines
+        .lock()
+        .await
+        .detach_surface(&session_id, &surface_id);
+    #[cfg(windows)]
+    app_state
+        .media_surface_renderers
         .lock()
         .await
         .detach_surface(&session_id, &surface_id);
@@ -255,8 +277,8 @@ mod tests {
             &app_state,
             session_id.clone(),
             "surface-1".to_string(),
-            "d3d11".to_string(),
-            Some(0x1234),
+            "web".to_string(),
+            None,
         )
         .await;
         assert!(matches!(
@@ -266,7 +288,7 @@ mod tests {
 
         let snapshot = app_state.media_pipelines.lock().await.snapshot(&session_id);
         assert_eq!(snapshot.attached_surfaces.len(), 1);
-        assert_eq!(snapshot.active_renderer.as_deref(), Some("d3d11"));
+        assert_eq!(snapshot.active_renderer.as_deref(), Some("web"));
 
         let detached =
             detach_render_surface(&app_state, session_id.clone(), "surface-1".to_string()).await;

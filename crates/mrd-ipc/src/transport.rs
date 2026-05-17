@@ -9,6 +9,7 @@ use serde_json;
 pub const SERVICE_PIPE_NAME: &str = r"\\.\pipe\mrd-service";
 #[cfg(unix)]
 pub const SERVICE_SOCKET_PATH: &str = "/tmp/mrd-service.sock";
+pub const SERVICE_ENDPOINT_ENV: &str = "MRD_SERVICE_IPC_ENDPOINT";
 
 const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 
@@ -47,6 +48,32 @@ impl IpcEndpoint {
     #[cfg(unix)]
     pub fn unix_socket(path: impl Into<String>) -> Self {
         Self::UnixSocket(path.into())
+    }
+
+    /// Build a service endpoint from a non-empty environment variable value.
+    pub fn from_env_value(value: &str) -> Option<Self> {
+        let value = value.trim();
+        if value.is_empty() {
+            return None;
+        }
+
+        #[cfg(windows)]
+        {
+            Some(Self::NamedPipe(value.to_string()))
+        }
+
+        #[cfg(unix)]
+        {
+            Some(Self::UnixSocket(value.to_string()))
+        }
+    }
+
+    /// Resolve the service endpoint from `MRD_SERVICE_IPC_ENDPOINT`, or use the default.
+    pub fn service_from_env_or_default() -> Self {
+        std::env::var(SERVICE_ENDPOINT_ENV)
+            .ok()
+            .and_then(|value| Self::from_env_value(&value))
+            .unwrap_or_else(Self::default_service)
     }
 
     #[cfg(windows)]
@@ -257,7 +284,7 @@ impl IpcStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{IpcRequest, IpcResponse};
+    use crate::IpcRequest;
 
     #[test]
     fn frame_format_is_valid() {
@@ -265,6 +292,33 @@ mod tests {
         let json = serde_json::to_string(&request).unwrap();
         let len = json.len() as u32;
         assert_eq!(len.to_le_bytes().len(), 4);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn endpoint_from_env_value_uses_named_pipe_on_windows() {
+        let endpoint = IpcEndpoint::from_env_value(r"\\.\pipe\mrd-service-local-controller")
+            .expect("custom endpoint");
+        assert_eq!(
+            endpoint,
+            IpcEndpoint::named_pipe(r"\\.\pipe\mrd-service-local-controller")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn endpoint_from_env_value_uses_unix_socket_on_unix() {
+        let endpoint =
+            IpcEndpoint::from_env_value("/tmp/mrd-service-local-controller.sock").unwrap();
+        assert_eq!(
+            endpoint,
+            IpcEndpoint::unix_socket("/tmp/mrd-service-local-controller.sock")
+        );
+    }
+
+    #[test]
+    fn endpoint_from_env_value_rejects_blank_values() {
+        assert!(IpcEndpoint::from_env_value("  ").is_none());
     }
 
     #[tokio::test]

@@ -10,9 +10,13 @@ use image::{codecs::png::PngEncoder, ColorType, ImageEncoder};
 use mrd_application::ports::SessionSnapshot;
 use mrd_ipc::{
     AttachedRenderSurface, CaptureSourceSelection, MediaPipelineSnapshot, MediaProfileNegotiation,
-    MediaStageMetrics,
+    MediaStageMetrics, MediaTestImpairmentSnapshot,
 };
 use mrd_proto::{DeviceId, SessionId};
+#[cfg(windows)]
+use mrd_render::{BoxedRenderer, RenderFrame, RenderTarget, RendererFactory};
+#[cfg(windows)]
+use mrd_render_d3d11::D3d11RendererFactory;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::{sync::Mutex, task::AbortHandle};
@@ -93,6 +97,90 @@ impl CaptureSourceRegistry {
     }
 }
 
+/// Runtime display mode changes keyed by session.
+#[derive(Debug, Default)]
+pub struct DisplayModeRegistry {
+    modes: HashMap<SessionId, DisplayModeState>,
+}
+
+#[derive(Debug, Clone)]
+struct DisplayModeState {
+    original: Option<mrd_ipc::DisplayMode>,
+    active: Option<mrd_ipc::DisplayMode>,
+    restore_required: bool,
+}
+
+impl DisplayModeRegistry {
+    pub fn record_change(
+        &mut self,
+        session_id: SessionId,
+        requested: mrd_ipc::DisplayMode,
+        previous: Option<mrd_ipc::DisplayMode>,
+        active: mrd_ipc::DisplayMode,
+        restore_required: bool,
+    ) -> mrd_ipc::DisplayModeChange {
+        let original = previous.clone().or_else(|| {
+            self.modes
+                .get(&session_id)
+                .and_then(|state| state.original.clone())
+        });
+        self.modes.insert(
+            session_id.clone(),
+            DisplayModeState {
+                original: original.clone(),
+                active: Some(active.clone()),
+                restore_required,
+            },
+        );
+        mrd_ipc::DisplayModeChange {
+            session_id,
+            requested: Some(requested),
+            previous,
+            active: Some(active),
+            status: "changed".to_string(),
+            reason: None,
+            restore_required,
+        }
+    }
+
+    pub fn record_restore(
+        &mut self,
+        session_id: SessionId,
+        previous: mrd_ipc::DisplayMode,
+        active: mrd_ipc::DisplayMode,
+    ) -> mrd_ipc::DisplayModeChange {
+        self.modes.remove(&session_id);
+        mrd_ipc::DisplayModeChange {
+            session_id,
+            requested: None,
+            previous: Some(previous),
+            active: Some(active),
+            status: "restored".to_string(),
+            reason: None,
+            restore_required: false,
+        }
+    }
+
+    pub fn restore_mode(&self, session_id: &SessionId) -> Option<mrd_ipc::DisplayMode> {
+        self.modes
+            .get(session_id)
+            .filter(|state| state.restore_required)
+            .and_then(|state| state.original.clone())
+    }
+
+    pub fn active_mode(&self, session_id: &SessionId) -> Option<mrd_ipc::DisplayMode> {
+        self.modes
+            .get(session_id)
+            .and_then(|state| state.active.clone())
+    }
+
+    pub fn remove(&mut self, session_id: &SessionId) -> Option<mrd_ipc::DisplayMode> {
+        self.modes
+            .remove(session_id)
+            .and_then(|state| state.original)
+    }
+}
+
 /// Peer media capabilities observed for each active session.
 #[derive(Debug, Default)]
 pub struct SessionPeerMediaCapabilityRegistry {
@@ -131,6 +219,62 @@ struct MediaPipelineState {
     dropped_frames: u64,
     stage_samples: HashMap<String, VecDeque<f64>>,
     stage_summaries: HashMap<String, MediaStageMetrics>,
+    test_impairment: Option<MediaTestImpairmentSnapshot>,
+}
+
+#[cfg(windows)]
+#[derive(Debug, PartialEq, Eq)]
+pub enum MediaRenderQueueEnqueue {
+    Start(RenderFrame),
+    Queued { replaced: bool },
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct MediaRenderQueueState {
+    running: bool,
+    pending: Option<RenderFrame>,
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+pub struct MediaRenderQueueRegistry {
+    queues: HashMap<SessionId, MediaRenderQueueState>,
+}
+
+#[cfg(windows)]
+impl MediaRenderQueueRegistry {
+    pub fn enqueue_latest(
+        &mut self,
+        session_id: SessionId,
+        frame: RenderFrame,
+    ) -> MediaRenderQueueEnqueue {
+        let state = self.queues.entry(session_id).or_default();
+        if !state.running {
+            state.running = true;
+            return MediaRenderQueueEnqueue::Start(frame);
+        }
+
+        let replaced = state.pending.replace(frame).is_some();
+        MediaRenderQueueEnqueue::Queued { replaced }
+    }
+
+    pub fn take_next_or_finish(&mut self, session_id: &SessionId) -> Option<RenderFrame> {
+        let Some(state) = self.queues.get_mut(session_id) else {
+            return None;
+        };
+
+        if let Some(frame) = state.pending.take() {
+            return Some(frame);
+        }
+
+        state.running = false;
+        None
+    }
+
+    pub fn remove(&mut self, session_id: &SessionId) {
+        self.queues.remove(session_id);
+    }
 }
 
 impl MediaPipelineRegistry {
@@ -201,6 +345,17 @@ impl MediaPipelineRegistry {
         }
     }
 
+    pub fn set_test_impairment(
+        &mut self,
+        session_id: SessionId,
+        impairment: Option<MediaTestImpairmentSnapshot>,
+    ) {
+        self.pipelines
+            .entry(session_id)
+            .or_default()
+            .test_impairment = impairment;
+    }
+
     pub fn snapshot(&self, session_id: &SessionId) -> MediaPipelineSnapshot {
         let state = self.pipelines.get(session_id);
         let stage_metrics = state.map(media_pipeline_stage_metrics).unwrap_or_default();
@@ -214,11 +369,79 @@ impl MediaPipelineRegistry {
             queue_depth: state.map_or(0, |state| state.queue_depth),
             dropped_frames: state.map_or(0, |state| state.dropped_frames),
             stage_metrics,
+            test_impairment: state.and_then(|state| state.test_impairment.clone()),
         }
     }
 
     pub fn remove(&mut self, session_id: &SessionId) {
         self.pipelines.remove(session_id);
+    }
+}
+
+/// Native renderer instances owned by mrd-service for receiver sessions.
+#[cfg(windows)]
+#[derive(Default)]
+pub struct MediaSurfaceRendererRegistry {
+    renderers: HashMap<(SessionId, String), BoxedRenderer>,
+}
+
+#[cfg(windows)]
+impl MediaSurfaceRendererRegistry {
+    pub fn attach_surface(
+        &mut self,
+        session_id: &SessionId,
+        surface: &AttachedRenderSurface,
+    ) -> Result<(), String> {
+        if surface.backend != "d3d11" {
+            return Ok(());
+        }
+        let window_handle = surface
+            .window_handle
+            .ok_or_else(|| format!("render surface {} is missing HWND", surface.surface_id))?;
+        let key = (session_id.clone(), surface.surface_id.clone());
+        let mut renderer = D3d11RendererFactory
+            .create()
+            .map_err(|error| format!("create D3D11 renderer failed: {error}"))?;
+        renderer
+            .attach_target(RenderTarget::WindowHandle(window_handle as isize))
+            .map_err(|error| format!("attach D3D11 renderer target failed: {error}"))?;
+        self.renderers.insert(key, renderer);
+        Ok(())
+    }
+
+    pub fn detach_surface(&mut self, session_id: &SessionId, surface_id: &str) {
+        self.renderers
+            .remove(&(session_id.clone(), surface_id.to_string()));
+    }
+
+    pub fn detach_session(&mut self, session_id: &SessionId) {
+        self.renderers
+            .retain(|(renderer_session_id, _), _| renderer_session_id != session_id);
+    }
+
+    pub fn render_frame(
+        &mut self,
+        session_id: &SessionId,
+        frame: &RenderFrame,
+    ) -> Result<usize, String> {
+        let mut rendered = 0;
+        for ((renderer_session_id, _), renderer) in self.renderers.iter_mut() {
+            if renderer_session_id != session_id {
+                continue;
+            }
+            renderer
+                .upload_frame(frame.clone())
+                .map_err(|error| format!("upload frame to D3D11 renderer failed: {error}"))?;
+            rendered += 1;
+        }
+        Ok(rendered)
+    }
+
+    pub fn session_surface_count(&self, session_id: &SessionId) -> usize {
+        self.renderers
+            .keys()
+            .filter(|(renderer_session_id, _)| renderer_session_id == session_id)
+            .count()
     }
 }
 
@@ -578,6 +801,17 @@ impl DeviceRegistry {
         self.local_device = Some((device_id, device_name));
     }
 
+    pub fn register_if_unregistered(
+        &mut self,
+        device_id: DeviceId,
+        device_name: String,
+    ) -> Option<(DeviceId, String)> {
+        if self.local_device.is_none() {
+            self.register(device_id, device_name);
+        }
+        self.local_device.clone()
+    }
+
     pub fn get_local_device(&self) -> Option<&(DeviceId, String)> {
         self.local_device.as_ref()
     }
@@ -585,6 +819,58 @@ impl DeviceRegistry {
     pub fn is_registered(&self) -> bool {
         self.local_device.is_some()
     }
+}
+
+pub fn default_lan_device_identity() -> (DeviceId, String) {
+    lan_device_identity_from(
+        std::env::var("MRD_LAN_DEVICE_ID").ok(),
+        std::env::var("MRD_LAN_DEVICE_NAME").ok(),
+        default_hostname(),
+    )
+}
+
+fn default_hostname() -> Option<String> {
+    std::env::var("COMPUTERNAME")
+        .ok()
+        .or_else(|| std::env::var("HOSTNAME").ok())
+}
+
+fn lan_device_identity_from(
+    configured_id: Option<String>,
+    configured_name: Option<String>,
+    hostname: Option<String>,
+) -> (DeviceId, String) {
+    let device_name = configured_name
+        .and_then(non_empty_trimmed)
+        .or_else(|| hostname.clone().and_then(non_empty_trimmed))
+        .unwrap_or_else(|| "Rdesk LAN Device".to_string());
+    let device_id = configured_id
+        .and_then(non_empty_trimmed)
+        .unwrap_or_else(|| build_lan_device_id(hostname.as_deref().unwrap_or(&device_name)));
+    (DeviceId(device_id), device_name)
+}
+
+fn non_empty_trimmed(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn build_lan_device_id(seed: &str) -> String {
+    let mut sanitized: String = seed
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect();
+    if sanitized.len() > 16 {
+        sanitized = sanitized[sanitized.len() - 16..].to_string();
+    }
+    if sanitized.is_empty() {
+        sanitized = "local".to_string();
+    }
+    format!("lan-{sanitized}")
 }
 
 /// Application state for mrd-service
@@ -615,10 +901,18 @@ pub struct AppState {
     pub media_profiles: Arc<Mutex<MediaProfileRegistry>>,
     /// Selected capture source keyed by session.
     pub capture_sources: Arc<Mutex<CaptureSourceRegistry>>,
+    /// Temporary display mode state keyed by session.
+    pub display_modes: Arc<Mutex<DisplayModeRegistry>>,
     /// Peer media capabilities keyed by session.
     pub peer_media_capabilities: Arc<Mutex<SessionPeerMediaCapabilityRegistry>>,
     /// Receiver pipeline state keyed by session.
     pub media_pipelines: Arc<Mutex<MediaPipelineRegistry>>,
+    /// Native renderer instances keyed by receiver session/surface.
+    #[cfg(windows)]
+    pub media_surface_renderers: Arc<Mutex<MediaSurfaceRendererRegistry>>,
+    /// Drop-oldest receiver render queues keyed by session.
+    #[cfg(windows)]
+    pub media_render_queues: Arc<Mutex<MediaRenderQueueRegistry>>,
     /// Abort handles for active media tasks keyed by session.
     pub media_tasks: Arc<Mutex<MediaTaskRegistry>>,
 }
@@ -631,19 +925,36 @@ impl AppState {
     }
 
     pub fn with_tray(tray: TrayPortRef) -> Self {
+        Self::with_tray_and_lan_discovery_config(
+            tray,
+            crate::lan_discovery::LanDiscoveryConfig::default(),
+        )
+    }
+
+    pub fn with_tray_and_lan_discovery_config(
+        tray: TrayPortRef,
+        lan_discovery_config: crate::lan_discovery::LanDiscoveryConfig,
+    ) -> Self {
         Self {
             sessions: Arc::new(Mutex::new(SessionRegistry::default())),
             devices: Arc::new(Mutex::new(DeviceRegistry::default())),
             shell: Arc::new(Mutex::new(ShellState::default())),
             tray,
-            lan_discovery: Arc::new(crate::lan_discovery::LanDiscoveryState::default()),
+            lan_discovery: Arc::new(crate::lan_discovery::LanDiscoveryState::new(
+                lan_discovery_config,
+            )),
             probes: Arc::new(Mutex::new(ProbeRegistry::default())),
             media_profiles: Arc::new(Mutex::new(MediaProfileRegistry::default())),
             capture_sources: Arc::new(Mutex::new(CaptureSourceRegistry::default())),
+            display_modes: Arc::new(Mutex::new(DisplayModeRegistry::default())),
             peer_media_capabilities: Arc::new(Mutex::new(
                 SessionPeerMediaCapabilityRegistry::default(),
             )),
             media_pipelines: Arc::new(Mutex::new(MediaPipelineRegistry::default())),
+            #[cfg(windows)]
+            media_surface_renderers: Arc::new(Mutex::new(MediaSurfaceRendererRegistry::default())),
+            #[cfg(windows)]
+            media_render_queues: Arc::new(Mutex::new(MediaRenderQueueRegistry::default())),
             media_tasks: Arc::new(Mutex::new(MediaTaskRegistry::default())),
         }
     }
@@ -688,6 +999,11 @@ impl AppState {
         self.capture_sources.clone()
     }
 
+    /// Get a clone of the display mode registry.
+    pub fn display_modes(&self) -> Arc<Mutex<DisplayModeRegistry>> {
+        self.display_modes.clone()
+    }
+
     /// Get a clone of the peer media capability registry.
     pub fn peer_media_capabilities(&self) -> Arc<Mutex<SessionPeerMediaCapabilityRegistry>> {
         self.peer_media_capabilities.clone()
@@ -696,6 +1012,17 @@ impl AppState {
     /// Get a clone of the receiver media pipeline registry.
     pub fn media_pipelines(&self) -> Arc<Mutex<MediaPipelineRegistry>> {
         self.media_pipelines.clone()
+    }
+
+    /// Get a clone of the native receiver renderer registry.
+    #[cfg(windows)]
+    pub fn media_surface_renderers(&self) -> Arc<Mutex<MediaSurfaceRendererRegistry>> {
+        self.media_surface_renderers.clone()
+    }
+
+    #[cfg(windows)]
+    pub fn media_render_queues(&self) -> Arc<Mutex<MediaRenderQueueRegistry>> {
+        self.media_render_queues.clone()
     }
 
     /// Get a clone of the media task registry.
@@ -755,6 +1082,46 @@ mod tests {
         let retrieved = registry.get_local_device();
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().0, device_id);
+    }
+
+    #[test]
+    fn device_registry_keeps_explicit_registration() {
+        let mut registry = DeviceRegistry::default();
+        registry.register(
+            DeviceId("explicit-device".to_string()),
+            "Explicit Device".to_string(),
+        );
+
+        let registered = registry
+            .register_if_unregistered(
+                DeviceId("fallback-device".to_string()),
+                "Fallback Device".to_string(),
+            )
+            .expect("registered device");
+
+        assert_eq!(registered.0, DeviceId("explicit-device".to_string()));
+        assert_eq!(registered.1, "Explicit Device");
+    }
+
+    #[test]
+    fn default_lan_identity_uses_configured_id_and_name() {
+        let (device_id, device_name) = lan_device_identity_from(
+            Some(" lan-MOCK7EBPZ3RC ".to_string()),
+            Some(" Target PC ".to_string()),
+            Some("ignored-host".to_string()),
+        );
+
+        assert_eq!(device_id, DeviceId("lan-MOCK7EBPZ3RC".to_string()));
+        assert_eq!(device_name, "Target PC");
+    }
+
+    #[test]
+    fn default_lan_identity_falls_back_to_hostname() {
+        let (device_id, device_name) =
+            lan_device_identity_from(None, None, Some("DESKTOP-ABC/123".to_string()));
+
+        assert_eq!(device_id, DeviceId("lan-DESKTOPABC123".to_string()));
+        assert_eq!(device_name, "DESKTOP-ABC/123");
     }
 
     #[test]
@@ -939,6 +1306,36 @@ mod tests {
         }));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn media_render_queue_keeps_latest_frame_while_worker_is_running() {
+        let mut registry = MediaRenderQueueRegistry::default();
+        let session_id = SessionId("render-queue-session".to_string());
+        let first = RenderFrame::from_rgb24(1, 1, vec![1, 2, 3]);
+        let second = RenderFrame::from_rgb24(1, 1, vec![4, 5, 6]);
+        let third = RenderFrame::from_rgb24(1, 1, vec![7, 8, 9]);
+
+        match registry.enqueue_latest(session_id.clone(), first.clone()) {
+            MediaRenderQueueEnqueue::Start(frame) => assert_eq!(frame, first),
+            other => panic!("expected render worker start, got {other:?}"),
+        }
+        assert_eq!(
+            registry.enqueue_latest(session_id.clone(), second),
+            MediaRenderQueueEnqueue::Queued { replaced: false }
+        );
+        assert_eq!(
+            registry.enqueue_latest(session_id.clone(), third.clone()),
+            MediaRenderQueueEnqueue::Queued { replaced: true }
+        );
+
+        assert_eq!(registry.take_next_or_finish(&session_id), Some(third));
+        assert_eq!(registry.take_next_or_finish(&session_id), None);
+        match registry.enqueue_latest(session_id.clone(), first.clone()) {
+            MediaRenderQueueEnqueue::Start(frame) => assert_eq!(frame, first),
+            other => panic!("expected render worker restart, got {other:?}"),
+        }
+    }
+
     #[test]
     fn media_profile_registry_tracks_negotiated_profile() {
         let mut registry = MediaProfileRegistry::default();
@@ -1002,5 +1399,47 @@ mod tests {
         );
         assert!(registry.remove(&session_id).is_some());
         assert!(registry.get(&session_id).is_none());
+    }
+
+    #[test]
+    fn display_mode_registry_tracks_temporary_mode_for_restore() {
+        let mut registry = DisplayModeRegistry::default();
+        let session_id = SessionId("display-mode-session".to_string());
+        let original = mrd_ipc::DisplayMode {
+            id: "windows:display:0:2560x1600@60".to_string(),
+            source_id: Some("windows:display:0".to_string()),
+            width: 2560,
+            height: 1600,
+            refresh_hz: 60,
+            bit_depth: Some(32),
+            is_current: true,
+        };
+        let requested = mrd_ipc::DisplayMode {
+            id: "windows:display:0:1920x1080@60".to_string(),
+            source_id: Some("windows:display:0".to_string()),
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60,
+            bit_depth: Some(32),
+            is_current: false,
+        };
+
+        let change = registry.record_change(
+            session_id.clone(),
+            requested.clone(),
+            Some(original.clone()),
+            requested.clone(),
+            true,
+        );
+
+        assert_eq!(change.status, "changed");
+        assert!(change.restore_required);
+        assert_eq!(registry.restore_mode(&session_id), Some(original.clone()));
+
+        let restored = registry.record_restore(session_id.clone(), requested, original.clone());
+        assert_eq!(restored.status, "restored");
+        assert!(!restored.restore_required);
+        assert_eq!(restored.active, Some(original));
+        assert!(registry.restore_mode(&session_id).is_none());
     }
 }

@@ -42,6 +42,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    webview::PageLoadEvent,
     AppHandle, Manager, WebviewWindow, WebviewWindowBuilder,
 };
 
@@ -51,10 +52,12 @@ const TRAY_MENU_HIDE_ID: &str = "rdesk-tray-hide";
 const TRAY_MENU_CENTER_ID: &str = "rdesk-tray-center";
 const TRAY_MENU_QUIT_ID: &str = "rdesk-tray-quit";
 const SINGLE_INSTANCE_ADDR: &str = "127.0.0.1:47631";
+const RDESK_SINGLE_INSTANCE_ADDR_ENV: &str = "MRD_RDESK_SINGLE_INSTANCE_ADDR";
 const LAN_E2E_AUTORUN_ENV: &str = "MRD_LAN_E2E_AUTORUN";
 const LAN_E2E_TARGET_DEVICE_ID_ENV: &str = "MRD_LAN_E2E_TARGET_DEVICE_ID";
 const LAN_E2E_TRANSPORT_ENV: &str = "MRD_LAN_E2E_TRANSPORT";
 const LAN_E2E_TIMEOUT_MS_ENV: &str = "MRD_LAN_E2E_TIMEOUT_MS";
+const LAN_E2E_MIN_SAMPLE_DURATION_MS_ENV: &str = "MRD_LAN_E2E_MIN_SAMPLE_DURATION_MS";
 const LAN_E2E_MIN_DECODED_FRAMES_ENV: &str = "MRD_LAN_E2E_MIN_DECODED_FRAMES";
 const LAN_E2E_MIN_FPS_ENV: &str = "MRD_LAN_E2E_MIN_FPS";
 const LAN_E2E_STOP_ON_COMPLETE_ENV: &str = "MRD_LAN_E2E_STOP_ON_COMPLETE";
@@ -63,6 +66,9 @@ const LAN_E2E_PROFILE_WIDTH_ENV: &str = "MRD_LAN_E2E_PROFILE_WIDTH";
 const LAN_E2E_PROFILE_HEIGHT_ENV: &str = "MRD_LAN_E2E_PROFILE_HEIGHT";
 const LAN_E2E_PROFILE_FPS_ENV: &str = "MRD_LAN_E2E_PROFILE_FPS";
 const LAN_E2E_PROFILE_BITRATE_MBPS_ENV: &str = "MRD_LAN_E2E_PROFILE_BITRATE_MBPS";
+const LAN_E2E_DISPLAY_MODE_POLICY_ENV: &str = "MRD_LAN_E2E_DISPLAY_MODE_POLICY";
+const LAN_E2E_CAPTURE_SOURCE_ID_ENV: &str = "MRD_LAN_E2E_CAPTURE_SOURCE_ID";
+const LAN_E2E_CAPTURE_SOURCE_KIND_ENV: &str = "MRD_LAN_E2E_CAPTURE_SOURCE_KIND";
 
 static APP_IS_QUITTING: AtomicBool = AtomicBool::new(false);
 
@@ -506,56 +512,47 @@ async fn browser_webrtc_preview_stop(
 }
 
 #[tauri::command]
-fn configure_remote_display_native_surface(
+async fn configure_remote_display_native_surface(
     window: WebviewWindow,
     state: tauri::State<'_, AppState>,
     rect: NativeSurfaceRect,
     enabled: bool,
     visible: Option<bool>,
 ) -> Result<NativeRenderSurfaceSnapshot, String> {
-    let snapshot = state.remote_display_surfaces.lock().unwrap().configure(
-        &window,
-        rect,
-        enabled,
-        visible.unwrap_or(enabled),
-    )?;
-
-    let render_mode = match (snapshot.attached, snapshot.backend.as_str()) {
-        (true, "macos") => "macos_native",
-        (true, "linux") => "linux_native",
-        (true, _) => "d3d11_native",
-        (false, _) => "web",
+    let label = window.label().to_string();
+    let app_handle = window.app_handle().clone();
+    let snapshot = {
+        state.remote_display_surfaces.lock().unwrap().configure(
+            &window,
+            rect,
+            enabled,
+            visible.unwrap_or(enabled),
+        )?
     };
+    drop(window);
+
     let context = state
         .render_window_registry
         .lock()
         .unwrap()
-        .set_render_mode(
-            window.app_handle(),
-            window.label(),
-            render_mode.to_string(),
-            snapshot.attached,
-        )
-        .ok();
+        .context_for_label(&app_handle, &label);
 
-    if let Some(context) = context {
-        notify_remote_render_surface_configured(context, snapshot.clone());
+    if snapshot.attached && context.is_none() {
+        let _ = state
+            .remote_display_surfaces
+            .lock()
+            .unwrap()
+            .detach(&label, None);
+        return Err("remote display window context is not registered".to_string());
     }
 
-    Ok(snapshot)
-}
-
-fn notify_remote_render_surface_configured(
-    context: RenderWindowContext,
-    snapshot: NativeRenderSurfaceSnapshot,
-) {
-    tauri::async_runtime::spawn(async move {
+    if let Some(context) = context.clone() {
         let result = if snapshot.attached {
             send_attach_render_surface(
                 context.session_id,
                 context.surface_id,
-                snapshot.backend,
-                snapshot.hwnd.and_then(|value| parse_native_handle(&value)),
+                snapshot.backend.clone(),
+                snapshot.hwnd.as_deref().and_then(parse_native_handle),
             )
             .await
         } else {
@@ -563,9 +560,58 @@ fn notify_remote_render_surface_configured(
         };
 
         if let Err(error) = result {
-            tracing::warn!(%error, "failed to notify mrd-service about native render surface");
+            if snapshot.attached {
+                let _ = state
+                    .remote_display_surfaces
+                    .lock()
+                    .unwrap()
+                    .detach(&label, None);
+                if let Ok(context) = state
+                    .render_window_registry
+                    .lock()
+                    .unwrap()
+                    .set_render_mode(&app_handle, &label, "web".to_string(), false)
+                {
+                    notify_remote_render_surface_configured(context, snapshot.clone());
+                }
+                return Err(error);
+            }
+            tracing::warn!(%error, "failed to notify mrd-service about detached native render surface");
         }
-    });
+    }
+
+    let render_mode = render_mode_for_native_surface(&snapshot);
+    if let Ok(context) = state
+        .render_window_registry
+        .lock()
+        .unwrap()
+        .set_render_mode(
+            &app_handle,
+            &label,
+            render_mode.to_string(),
+            snapshot.attached,
+        )
+    {
+        notify_remote_render_surface_configured(context, snapshot.clone());
+    }
+
+    Ok(snapshot)
+}
+
+fn render_mode_for_native_surface(snapshot: &NativeRenderSurfaceSnapshot) -> &'static str {
+    match (snapshot.attached, snapshot.backend.as_str()) {
+        (true, "macos") => "macos_native",
+        (true, "linux") => "linux_native",
+        (true, _) => "d3d11_native",
+        (false, _) => "web",
+    }
+}
+
+fn notify_remote_render_surface_configured(
+    context: RenderWindowContext,
+    snapshot: NativeRenderSurfaceSnapshot,
+) {
+    let _ = (context, snapshot);
 }
 
 fn parse_native_handle(value: &str) -> Option<i64> {
@@ -1247,6 +1293,79 @@ async fn ipc_select_remote_capture_source(
 
     match response {
         IpcResponse::CaptureSourceSelected { selection, .. } => Ok(selection),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+/// List remote display modes through mrd-service IPC.
+#[tauri::command]
+async fn ipc_list_remote_display_modes(
+    session_id: String,
+) -> Result<Vec<mrd_ipc::DisplayMode>, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+    use mrd_proto::SessionId;
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::ListRemoteDisplayModes {
+            session_id: SessionId(session_id),
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::DisplayModeList { modes, .. } => Ok(modes),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+/// Set remote display mode through mrd-service IPC.
+#[tauri::command]
+async fn ipc_set_remote_display_mode(
+    session_id: String,
+    mode: mrd_ipc::DisplayMode,
+    restore_after_session: bool,
+) -> Result<mrd_ipc::DisplayModeChange, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+    use mrd_proto::SessionId;
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::SetRemoteDisplayMode {
+            session_id: SessionId(session_id),
+            mode,
+            restore_after_session,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::DisplayModeChanged { change, .. } => Ok(change),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+/// Restore remote display mode through mrd-service IPC.
+#[tauri::command]
+async fn ipc_restore_remote_display_mode(
+    session_id: String,
+) -> Result<mrd_ipc::DisplayModeChange, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+    use mrd_proto::SessionId;
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::RestoreRemoteDisplayMode {
+            session_id: SessionId(session_id),
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::DisplayModeChanged { change, .. } => Ok(change),
         IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
         _ => Err("Unexpected response".to_string()),
     }
@@ -2032,15 +2151,32 @@ fn detach_ui_async(reason: &'static str) {
 }
 
 fn claim_single_instance() -> Option<TcpListener> {
-    match TcpListener::bind(SINGLE_INSTANCE_ADDR) {
+    let addr = single_instance_addr();
+    match TcpListener::bind(&addr) {
         Ok(listener) => Some(listener),
         Err(_) => {
-            if let Ok(mut stream) = TcpStream::connect(SINGLE_INSTANCE_ADDR) {
+            if let Ok(mut stream) = TcpStream::connect(&addr) {
                 let _ = stream.write_all(b"show\n");
             }
             None
         }
     }
+}
+
+fn single_instance_addr() -> String {
+    single_instance_addr_from_env_value(
+        std::env::var(RDESK_SINGLE_INSTANCE_ADDR_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn single_instance_addr_from_env_value(value: Option<&str>) -> String {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(SINGLE_INSTANCE_ADDR)
+        .to_string()
 }
 
 fn spawn_single_instance_listener(listener: TcpListener, app: AppHandle) {
@@ -2146,6 +2282,7 @@ struct LanE2eAutorunLaunchConfig {
     target_device_id: Option<String>,
     transport: Option<String>,
     timeout_ms: Option<String>,
+    min_sample_duration_ms: Option<String>,
     min_decoded_frames: Option<String>,
     min_fps: Option<String>,
     stop_on_complete: Option<String>,
@@ -2153,6 +2290,9 @@ struct LanE2eAutorunLaunchConfig {
     profile_height: Option<String>,
     profile_fps: Option<String>,
     profile_bitrate_mbps: Option<String>,
+    display_mode_policy: Option<String>,
+    capture_source_id: Option<String>,
+    capture_source_kind: Option<String>,
 }
 
 fn lan_e2e_autorun_config_from_env() -> Option<LanE2eAutorunLaunchConfig> {
@@ -2172,6 +2312,7 @@ where
         target_device_id: non_empty_env(env(LAN_E2E_TARGET_DEVICE_ID_ENV)),
         transport: non_empty_env(env(LAN_E2E_TRANSPORT_ENV)),
         timeout_ms: non_empty_env(env(LAN_E2E_TIMEOUT_MS_ENV)),
+        min_sample_duration_ms: non_empty_env(env(LAN_E2E_MIN_SAMPLE_DURATION_MS_ENV)),
         min_decoded_frames: non_empty_env(env(LAN_E2E_MIN_DECODED_FRAMES_ENV)),
         min_fps: non_empty_env(env(LAN_E2E_MIN_FPS_ENV)),
         stop_on_complete: non_empty_env(env(LAN_E2E_STOP_ON_COMPLETE_ENV)),
@@ -2179,6 +2320,9 @@ where
         profile_height: non_empty_env(env(LAN_E2E_PROFILE_HEIGHT_ENV)),
         profile_fps: non_empty_env(env(LAN_E2E_PROFILE_FPS_ENV)),
         profile_bitrate_mbps: non_empty_env(env(LAN_E2E_PROFILE_BITRATE_MBPS_ENV)),
+        display_mode_policy: non_empty_env(env(LAN_E2E_DISPLAY_MODE_POLICY_ENV)),
+        capture_source_id: non_empty_env(env(LAN_E2E_CAPTURE_SOURCE_ID_ENV)),
+        capture_source_kind: non_empty_env(env(LAN_E2E_CAPTURE_SOURCE_KIND_ENV)),
     })
 }
 
@@ -2188,6 +2332,11 @@ fn build_lan_e2e_autorun_route(config: LanE2eAutorunLaunchConfig) -> String {
     push_query_param(&mut params, "targetDeviceId", config.target_device_id);
     push_query_param(&mut params, "transport", config.transport);
     push_query_param(&mut params, "timeoutMs", config.timeout_ms);
+    push_query_param(
+        &mut params,
+        "minSampleDurationMs",
+        config.min_sample_duration_ms,
+    );
     push_query_param(&mut params, "minDecodedFrames", config.min_decoded_frames);
     push_query_param(&mut params, "minFps", config.min_fps);
     push_query_param(&mut params, "stopOnComplete", config.stop_on_complete);
@@ -2195,6 +2344,9 @@ fn build_lan_e2e_autorun_route(config: LanE2eAutorunLaunchConfig) -> String {
     push_query_param(&mut params, "height", config.profile_height);
     push_query_param(&mut params, "fps", config.profile_fps);
     push_query_param(&mut params, "bitrateMbps", config.profile_bitrate_mbps);
+    push_query_param(&mut params, "displayModePolicy", config.display_mode_policy);
+    push_query_param(&mut params, "captureSourceId", config.capture_source_id);
+    push_query_param(&mut params, "captureSourceKind", config.capture_source_kind);
 
     let query = params
         .into_iter()
@@ -2204,12 +2356,14 @@ fn build_lan_e2e_autorun_route(config: LanE2eAutorunLaunchConfig) -> String {
     format!("/test/e2e?{query}")
 }
 
-fn navigate_main_window_to_route(window: &WebviewWindow, route: &str) -> Result<(), String> {
+fn navigate_webview_to_route(webview: &tauri::Webview, route: &str) -> Result<(), String> {
+    let script = build_main_window_route_navigation_script(route)?;
+    webview.eval(&script).map_err(|error| error.to_string())
+}
+
+fn build_main_window_route_navigation_script(route: &str) -> Result<String, String> {
     let route_json = serde_json::to_string(route).map_err(|error| error.to_string())?;
-    let script = format!(
-        "window.history.replaceState(null, '', {route_json}); window.dispatchEvent(new PopStateEvent('popstate'));"
-    );
-    window.eval(&script).map_err(|error| error.to_string())
+    Ok(format!("window.location.replace({route_json});"))
 }
 
 fn is_truthy_env_value(value: &str) -> bool {
@@ -2280,6 +2434,7 @@ mod tray_tests {
             target_device_id: Some("agent device/1".to_string()),
             transport: Some("quic".to_string()),
             timeout_ms: Some("2500".to_string()),
+            min_sample_duration_ms: Some("1500".to_string()),
             min_decoded_frames: Some("2".to_string()),
             min_fps: Some("5".to_string()),
             stop_on_complete: Some("false".to_string()),
@@ -2287,11 +2442,14 @@ mod tray_tests {
             profile_height: Some("1080".to_string()),
             profile_fps: Some("180".to_string()),
             profile_bitrate_mbps: Some("20".to_string()),
+            display_mode_policy: Some("temporary".to_string()),
+            capture_source_id: Some("windows:display-shared:1".to_string()),
+            capture_source_kind: Some("display".to_string()),
         });
 
         assert_eq!(
             route,
-            "/test/e2e?autorun=lan-e2e&targetDeviceId=agent%20device%2F1&transport=quic&timeoutMs=2500&minDecodedFrames=2&minFps=5&stopOnComplete=false&width=1920&height=1080&fps=180&bitrateMbps=20"
+            "/test/e2e?autorun=lan-e2e&targetDeviceId=agent%20device%2F1&transport=quic&timeoutMs=2500&minSampleDurationMs=1500&minDecodedFrames=2&minFps=5&stopOnComplete=false&width=1920&height=1080&fps=180&bitrateMbps=20&displayModePolicy=temporary&captureSourceId=windows%3Adisplay-shared%3A1&captureSourceKind=display"
         );
     }
 
@@ -2308,6 +2466,35 @@ mod tray_tests {
             }
         });
         assert!(enabled.is_some());
+    }
+
+    #[test]
+    fn lan_e2e_autorun_navigation_forces_route_load() {
+        let script = build_main_window_route_navigation_script(
+            "/test/e2e?autorun=lan-e2e&displayModePolicy=temporary",
+        )
+        .expect("script should be valid");
+
+        assert_eq!(
+            script,
+            "window.location.replace(\"/test/e2e?autorun=lan-e2e&displayModePolicy=temporary\");"
+        );
+    }
+
+    #[test]
+    fn single_instance_addr_can_be_overridden_for_test_instances() {
+        assert_eq!(
+            single_instance_addr_from_env_value(None),
+            SINGLE_INSTANCE_ADDR.to_string()
+        );
+        assert_eq!(
+            single_instance_addr_from_env_value(Some(" 127.0.0.1:48765 ")),
+            "127.0.0.1:48765".to_string()
+        );
+        assert_eq!(
+            single_instance_addr_from_env_value(Some(" ")),
+            SINGLE_INSTANCE_ADDR.to_string()
+        );
     }
 }
 
@@ -2354,6 +2541,12 @@ fn main() {
         return;
     };
 
+    let lan_e2e_autorun_route = lan_e2e_autorun_config_from_env().map(build_lan_e2e_autorun_route);
+    let lan_e2e_autorun_pending =
+        std::sync::Arc::new(AtomicBool::new(lan_e2e_autorun_route.is_some()));
+    let lan_e2e_autorun_route_for_load = lan_e2e_autorun_route.clone();
+    let lan_e2e_autorun_pending_for_load = lan_e2e_autorun_pending.clone();
+
     // Build the app
     tauri::Builder::default()
         .manage(AppState {
@@ -2384,6 +2577,20 @@ fn main() {
                 }
             }
         })
+        .on_page_load(move |webview, payload| {
+            if payload.event() != PageLoadEvent::Finished || webview.label() != "main" {
+                return;
+            }
+            if !lan_e2e_autorun_pending_for_load.swap(false, Ordering::SeqCst) {
+                return;
+            }
+            let Some(route) = lan_e2e_autorun_route_for_load.as_deref() else {
+                return;
+            };
+            if let Err(error) = navigate_webview_to_route(webview, route) {
+                eprintln!("failed to navigate to LAN E2E autorun route after page load: {error}");
+            }
+        })
         .setup(move |app| {
             spawn_single_instance_listener(single_instance_listener, app.handle().clone());
             setup_system_tray(app.handle())?;
@@ -2395,12 +2602,6 @@ fn main() {
                         "failed to apply native backdrop: {}",
                         backdrop_status.detail
                     );
-                }
-                if let Some(config) = lan_e2e_autorun_config_from_env() {
-                    let route = build_lan_e2e_autorun_route(config);
-                    if let Err(error) = navigate_main_window_to_route(&main_window, &route) {
-                        eprintln!("failed to navigate to LAN E2E autorun route: {error}");
-                    }
                 }
 
                 let app_handle_for_close = app.handle().clone();
@@ -2501,6 +2702,9 @@ fn main() {
             ipc_update_media_profile,
             ipc_list_remote_capture_sources,
             ipc_select_remote_capture_source,
+            ipc_list_remote_display_modes,
+            ipc_set_remote_display_mode,
+            ipc_restore_remote_display_mode,
             ipc_accept_session,
             ipc_stop_session,
             ipc_fail_session,

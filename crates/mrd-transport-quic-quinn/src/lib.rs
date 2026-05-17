@@ -12,6 +12,8 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use quinn::{ClientConfig, Connection, Endpoint, ServerConfig};
 use rustls::RootCertStore;
 use thiserror::Error;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::Mutex;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuicTransportMetadata {
@@ -98,6 +100,8 @@ impl QuinnServerListener {
                 endpoint: self.endpoint,
                 connection,
                 metadata,
+                reliable_send_stream: Mutex::new(None),
+                reliable_recv_stream: Mutex::new(None),
             }),
         })
     }
@@ -108,6 +112,8 @@ struct QuinnDatagramEndpointInner {
     endpoint: Endpoint,
     connection: Connection,
     metadata: QuicTransportMetadata,
+    reliable_send_stream: Mutex<Option<quinn::SendStream>>,
+    reliable_recv_stream: Mutex<Option<quinn::RecvStream>>,
 }
 
 impl Drop for QuinnDatagramEndpointInner {
@@ -136,6 +142,16 @@ impl QuinnDatagramEndpoint {
             .connection
             .send_datagram(payload)
             .map_err(|error| QuinnTransportError::Message(format!("send_datagram failed: {error}")))
+    }
+
+    pub async fn send_datagram_wait(&self, payload: Bytes) -> Result<(), QuinnTransportError> {
+        self.inner
+            .connection
+            .send_datagram_wait(payload)
+            .await
+            .map_err(|error| {
+                QuinnTransportError::Message(format!("send_datagram_wait failed: {error}"))
+            })
     }
 
     pub async fn read_datagram(&self) -> Result<Bytes, QuinnTransportError> {
@@ -170,6 +186,87 @@ impl QuinnDatagramEndpoint {
         let payload = stream.read_to_end(max_len).await.map_err(|error| {
             QuinnTransportError::Message(format!("reliable stream read failed: {error}"))
         })?;
+        Ok(Bytes::from(payload))
+    }
+
+    pub async fn send_reliable_message_persistent(
+        &self,
+        payload: Bytes,
+    ) -> Result<(), QuinnTransportError> {
+        let payload_len = u32::try_from(payload.len()).map_err(|_| {
+            QuinnTransportError::Message(format!(
+                "persistent reliable payload too large: {} bytes",
+                payload.len()
+            ))
+        })?;
+        let mut stream_guard = self.inner.reliable_send_stream.lock().await;
+        if stream_guard.is_none() {
+            let stream = self.inner.connection.open_uni().await.map_err(|error| {
+                QuinnTransportError::Message(format!("open persistent uni failed: {error}"))
+            })?;
+            *stream_guard = Some(stream);
+        }
+
+        let stream = stream_guard
+            .as_mut()
+            .ok_or_else(|| QuinnTransportError::Message("persistent uni stream missing".into()))?;
+        if let Err(error) = stream.write_all(&payload_len.to_le_bytes()).await {
+            *stream_guard = None;
+            return Err(QuinnTransportError::Message(format!(
+                "persistent reliable length write failed: {error}"
+            )));
+        }
+        if let Err(error) = stream.write_all(payload.as_ref()).await {
+            *stream_guard = None;
+            return Err(QuinnTransportError::Message(format!(
+                "persistent reliable payload write failed: {error}"
+            )));
+        }
+        if let Err(error) = stream.flush().await {
+            *stream_guard = None;
+            return Err(QuinnTransportError::Message(format!(
+                "persistent reliable flush failed: {error}"
+            )));
+        }
+        Ok(())
+    }
+
+    pub async fn read_reliable_message_persistent(
+        &self,
+        max_len: usize,
+    ) -> Result<Bytes, QuinnTransportError> {
+        let mut stream_guard = self.inner.reliable_recv_stream.lock().await;
+        if stream_guard.is_none() {
+            let stream = self.inner.connection.accept_uni().await.map_err(|error| {
+                QuinnTransportError::Message(format!("accept persistent uni failed: {error}"))
+            })?;
+            *stream_guard = Some(stream);
+        }
+
+        let stream = stream_guard.as_mut().ok_or_else(|| {
+            QuinnTransportError::Message("persistent receive stream missing".into())
+        })?;
+        let mut header = [0_u8; 4];
+        if let Err(error) = stream.read_exact(&mut header).await {
+            *stream_guard = None;
+            return Err(QuinnTransportError::Message(format!(
+                "persistent reliable length read failed: {error}"
+            )));
+        }
+        let payload_len = u32::from_le_bytes(header) as usize;
+        if payload_len > max_len {
+            *stream_guard = None;
+            return Err(QuinnTransportError::Message(format!(
+                "persistent reliable payload too large: {payload_len} > {max_len}"
+            )));
+        }
+        let mut payload = vec![0_u8; payload_len];
+        if let Err(error) = stream.read_exact(&mut payload).await {
+            *stream_guard = None;
+            return Err(QuinnTransportError::Message(format!(
+                "persistent reliable payload read failed: {error}"
+            )));
+        }
         Ok(Bytes::from(payload))
     }
 
@@ -214,6 +311,8 @@ impl QuinnDatagramEndpoint {
                 endpoint: client_endpoint,
                 connection: client_connection,
                 metadata,
+                reliable_send_stream: Mutex::new(None),
+                reliable_recv_stream: Mutex::new(None),
             }),
         })
     }

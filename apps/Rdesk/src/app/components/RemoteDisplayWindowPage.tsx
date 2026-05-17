@@ -617,6 +617,15 @@ export function RemoteDisplayWindowPage() {
   const remoteFramesReceived = probeSnapshot?.frames_received ?? 0;
   const remoteFramesDecoded = probeSnapshot?.frames_decoded ?? 0;
   const remoteFrameDataUrl = probeSnapshot?.latest_frame_data_url ?? null;
+  const nativeSurfaceAttached =
+    isNative && Boolean(nativeSurface?.attached || context?.native_surface_attached);
+  const showRemotePreviewFrame = !nativeSurfaceAttached && Boolean(remoteFrameDataUrl);
+  const remoteFrameAspectRatio =
+    probeSnapshot?.latest_frame_width && probeSnapshot?.latest_frame_height
+      ? `${probeSnapshot.latest_frame_width} / ${probeSnapshot.latest_frame_height}`
+      : probeSnapshot?.media_probe_width && probeSnapshot?.media_probe_height
+        ? `${probeSnapshot.media_probe_width} / ${probeSnapshot.media_probe_height}`
+        : undefined;
   const hasRemoteFrames = remoteFramesReceived > 0 || remoteFramesDecoded > 0;
   const remoteProbeTarget =
     probeSnapshot?.media_probe_width &&
@@ -2193,11 +2202,12 @@ export function RemoteDisplayWindowPage() {
             </div>
           </div>
         )}
-        {!isLocalPipelinePreview && remoteFrameDataUrl && (
+        {!isLocalPipelinePreview && showRemotePreviewFrame && remoteFrameDataUrl && (
           <img
             src={remoteFrameDataUrl}
             alt="Remote desktop frame"
             className="absolute inset-0 h-full w-full object-contain"
+            style={remoteFrameAspectRatio ? { aspectRatio: remoteFrameAspectRatio } : undefined}
           />
         )}
         {isLocalPipelinePreview && !isNative && webPreviewMode === "connecting" && (

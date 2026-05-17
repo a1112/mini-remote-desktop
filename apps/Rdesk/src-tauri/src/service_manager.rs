@@ -16,6 +16,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
+const SERVICE_BOOTSTRAP_DISABLED_ENV: &str = "MRD_SERVICE_BOOTSTRAP_DISABLED";
+
 /// Service bootstrap manager for mrd-service
 ///
 /// Phase 6: Reduced to bootstrap-only behavior.
@@ -47,6 +49,16 @@ impl ServiceManager {
         if self.is_reachable_via_ipc().await {
             tracing::info!("mrd-service is already running via IPC");
             return Ok(false);
+        }
+
+        if bootstrap_disabled_from_env_value(
+            std::env::var(SERVICE_BOOTSTRAP_DISABLED_ENV)
+                .ok()
+                .as_deref(),
+        ) {
+            anyhow::bail!(
+                "mrd-service bootstrap is disabled by {SERVICE_BOOTSTRAP_DISABLED_ENV} and IPC is unreachable"
+            );
         }
 
         // Service not reachable, bootstrap it
@@ -161,6 +173,13 @@ impl ServiceManager {
             .join("; ");
         anyhow::bail!("mrd-service executable not found. Tried: {tried}");
     }
+}
+
+fn bootstrap_disabled_from_env_value(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|value| value.trim().to_ascii_lowercase()),
+        Some(value) if matches!(value.as_str(), "1" | "true" | "yes" | "on")
+    )
 }
 
 pub fn runtime_log_dir() -> PathBuf {
@@ -385,6 +404,15 @@ mod tests {
     fn creates_service_manager() {
         let manager = ServiceManager::new();
         assert!(manager.is_ok());
+    }
+
+    #[test]
+    fn bootstrap_disabled_accepts_truthy_env_values() {
+        assert!(bootstrap_disabled_from_env_value(Some("1")));
+        assert!(bootstrap_disabled_from_env_value(Some("true")));
+        assert!(bootstrap_disabled_from_env_value(Some("yes")));
+        assert!(!bootstrap_disabled_from_env_value(Some("0")));
+        assert!(!bootstrap_disabled_from_env_value(None));
     }
 
     #[test]

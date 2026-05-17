@@ -5,6 +5,7 @@
 pub mod app_state;
 pub mod capabilities;
 pub mod capture_source;
+pub mod display_mode;
 pub mod handlers;
 pub mod ipc_server;
 pub mod lan_discovery;
