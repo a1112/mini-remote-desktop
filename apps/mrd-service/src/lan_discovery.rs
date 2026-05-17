@@ -2331,6 +2331,35 @@ async fn spawn_quic_media_sender(
     registry.lock().await.register(session_id, abort_handle);
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LanCaptureConfigKey {
+    source_id: String,
+    width: u32,
+    height: u32,
+}
+
+fn lan_capture_config_key(source_id: &str, profile: &MediaProfile) -> LanCaptureConfigKey {
+    LanCaptureConfigKey {
+        source_id: source_id.to_string(),
+        width: profile.width,
+        height: profile.height,
+    }
+}
+
+fn lan_capture_config_matches(
+    active: Option<&LanCaptureConfigKey>,
+    source_id: &str,
+    profile: &MediaProfile,
+) -> bool {
+    active
+        .map(|config| {
+            config.source_id == source_id
+                && config.width == profile.width
+                && config.height == profile.height
+        })
+        .unwrap_or(false)
+}
+
 async fn send_quic_media_loop(
     app_state: Arc<AppState>,
     endpoint: QuinnDatagramEndpoint,
@@ -2343,7 +2372,7 @@ async fn send_quic_media_loop(
         .max(QUIC_MEDIA_V3_FRAGMENT_HEADER_LEN.max(QUIC_AU_FRAGMENT_HEADER_LEN) + 1);
 
     let mut frame_id = 1_u64;
-    let mut active_source_id: Option<String> = None;
+    let mut active_capture_config: Option<LanCaptureConfigKey> = None;
     let mut capture: Option<LanFrameCapture> = None;
     let mut encoder: Option<Box<dyn VideoEncoder + Send>> = None;
     let mut encoder_config: Option<(usize, usize, u32, u32)> = None;
@@ -2379,13 +2408,13 @@ async fn send_quic_media_loop(
         }
 
         let source_id = selected_capture_source_id(&app_state, &session_id).await?;
-        if active_source_id.as_deref() != Some(source_id.as_str()) {
+        if !lan_capture_config_matches(active_capture_config.as_ref(), &source_id, &profile) {
             match create_lan_frame_capture(&source_id, &profile).await {
                 Ok(next_capture) => {
                     capture = Some(next_capture);
                     encoder = None;
                     encoder_config = None;
-                    active_source_id = Some(source_id);
+                    active_capture_config = Some(lan_capture_config_key(&source_id, &profile));
                     consecutive_frame_errors = 0;
                     set_session_last_error(&app_state, &session_id, None).await;
                 }
@@ -2393,7 +2422,7 @@ async fn send_quic_media_loop(
                     capture = None;
                     encoder = None;
                     encoder_config = None;
-                    active_source_id = None;
+                    active_capture_config = None;
                     handle_media_sender_frame_error(
                         &app_state,
                         &session_id,
@@ -2421,14 +2450,15 @@ async fn send_quic_media_loop(
         let raw_frame = match raw_frame_result {
             Ok(frame) => frame,
             Err(error) => {
-                let error_source_id = active_source_id
-                    .as_deref()
+                let error_source_id = active_capture_config
+                    .as_ref()
+                    .map(|config| config.source_id.as_str())
                     .unwrap_or("<unknown>")
                     .to_string();
                 capture = None;
                 encoder = None;
                 encoder_config = None;
-                active_source_id = None;
+                active_capture_config = None;
                 handle_media_sender_frame_error(
                     &app_state,
                     &session_id,
@@ -2450,7 +2480,10 @@ async fn send_quic_media_loop(
                 handle_media_sender_frame_error(
                     &app_state,
                     &session_id,
-                    active_source_id.as_deref().unwrap_or("<unknown>"),
+                    active_capture_config
+                        .as_ref()
+                        .map(|config| config.source_id.as_str())
+                        .unwrap_or("<unknown>"),
                     &mut consecutive_frame_errors,
                     format!("failed to prepare captured frame for H.264: {error:#}"),
                     false,
@@ -2483,7 +2516,10 @@ async fn send_quic_media_loop(
                     handle_media_sender_frame_error(
                         &app_state,
                         &session_id,
-                        active_source_id.as_deref().unwrap_or("<unknown>"),
+                        active_capture_config
+                            .as_ref()
+                            .map(|config| config.source_id.as_str())
+                            .unwrap_or("<unknown>"),
                         &mut consecutive_frame_errors,
                         format!("{error:#}"),
                         false,
@@ -2512,7 +2548,10 @@ async fn send_quic_media_loop(
                 handle_media_sender_frame_error(
                     &app_state,
                     &session_id,
-                    active_source_id.as_deref().unwrap_or("<unknown>"),
+                    active_capture_config
+                        .as_ref()
+                        .map(|config| config.source_id.as_str())
+                        .unwrap_or("<unknown>"),
                     &mut consecutive_frame_errors,
                     format!("{error:#}"),
                     false,
@@ -2607,7 +2646,10 @@ async fn send_quic_media_loop(
                 handle_media_sender_frame_error(
                     &app_state,
                     &session_id,
-                    active_source_id.as_deref().unwrap_or("<unknown>"),
+                    active_capture_config
+                        .as_ref()
+                        .map(|config| config.source_id.as_str())
+                        .unwrap_or("<unknown>"),
                     &mut consecutive_frame_errors,
                     format!("{error:#}"),
                     true,
@@ -2620,7 +2662,9 @@ async fn send_quic_media_loop(
             if let Some(stats_payload) = sender_stats.take_payload(
                 Instant::now(),
                 frame_id,
-                active_source_id.clone(),
+                active_capture_config
+                    .as_ref()
+                    .map(|config| config.source_id.clone()),
                 &profile,
             ) {
                 let stats_send_started = Instant::now();
@@ -6123,6 +6167,37 @@ mod tests {
         assert_eq!(negotiation.selected_height, Some(1080));
         assert_eq!(negotiation.status, "accepted");
         assert_eq!(negotiation.downgrade_reason, None);
+    }
+
+    #[test]
+    fn lan_capture_config_changes_when_profile_dimensions_change() {
+        let source_id = "windows:display-shared:0";
+        let before = MediaProfile {
+            width: 1728,
+            height: 1080,
+            fps: 60,
+            bitrate_mbps: 20,
+            codec: "h264".to_string(),
+        };
+        let after = MediaProfile {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            bitrate_mbps: 20,
+            codec: "h264".to_string(),
+        };
+        let active = lan_capture_config_key(source_id, &before);
+
+        assert!(lan_capture_config_matches(
+            Some(&active),
+            source_id,
+            &before
+        ));
+        assert!(!lan_capture_config_matches(
+            Some(&active),
+            source_id,
+            &after
+        ));
     }
 
     fn sender_snapshot(session_id: &SessionId) -> SessionSnapshot {
