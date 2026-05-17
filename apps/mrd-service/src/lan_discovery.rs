@@ -2572,81 +2572,190 @@ async fn send_quic_media_loop(
         for access_unit in access_units {
             let is_keyframe =
                 h264_access_unit_is_keyframe(access_unit.is_keyframe, &access_unit.bytes);
-            let mut reliable_fragments = None;
-            let send_result = (|| -> Result<()> {
-                let fragment_started = Instant::now();
-                let fragments = if media_v3_supported {
-                    fragment_media_payload_v3(
-                        QuicMediaPayloadType::AccessUnit,
-                        QuicMediaCodec::H264,
-                        lan_media_profile_id(&profile),
-                        frame_id as u32,
-                        access_unit.timestamp_us,
-                        is_keyframe,
-                        &access_unit.bytes,
-                        max_datagram_size,
-                    )
-                    .context("failed to fragment LAN QUIC media v3 frame")?
-                } else {
-                    let media_payload = encode_lan_media_envelope(LanMediaEnvelope {
-                        payload_type: LAN_MEDIA_PAYLOAD_H264_ACCESS_UNIT,
-                        codec: LAN_MEDIA_CODEC_H264,
-                        sequence: frame_id,
-                        timestamp_us: access_unit.timestamp_us,
-                        profile: profile.clone(),
-                        payload: access_unit.bytes.clone(),
-                    })?;
-                    fragment_access_unit(
-                        frame_id as u32,
-                        access_unit.timestamp_us,
-                        is_keyframe,
-                        &media_payload,
-                        max_datagram_size,
-                    )
-                    .context("failed to fragment LAN QUIC media v2 frame")?
+            let fragment_started = Instant::now();
+            let fragments = if media_v3_supported {
+                match fragment_media_payload_v3(
+                    QuicMediaPayloadType::AccessUnit,
+                    QuicMediaCodec::H264,
+                    lan_media_profile_id(&profile),
+                    frame_id as u32,
+                    access_unit.timestamp_us,
+                    is_keyframe,
+                    &access_unit.bytes,
+                    max_datagram_size,
+                )
+                .context("failed to fragment LAN QUIC media v3 frame")
+                {
+                    Ok(fragments) => fragments,
+                    Err(error) => {
+                        handle_media_sender_frame_error(
+                            &app_state,
+                            &session_id,
+                            active_capture_config
+                                .as_ref()
+                                .map(|config| config.source_id.as_str())
+                                .unwrap_or("<unknown>"),
+                            &mut consecutive_frame_errors,
+                            format!("{error:#}"),
+                            true,
+                        )
+                        .await?;
+                        frame_id = frame_id.wrapping_add(1).max(1);
+                        continue;
+                    }
+                }
+            } else {
+                let media_payload = match encode_lan_media_envelope(LanMediaEnvelope {
+                    payload_type: LAN_MEDIA_PAYLOAD_H264_ACCESS_UNIT,
+                    codec: LAN_MEDIA_CODEC_H264,
+                    sequence: frame_id,
+                    timestamp_us: access_unit.timestamp_us,
+                    profile: profile.clone(),
+                    payload: access_unit.bytes.clone(),
+                }) {
+                    Ok(media_payload) => media_payload,
+                    Err(error) => {
+                        handle_media_sender_frame_error(
+                            &app_state,
+                            &session_id,
+                            active_capture_config
+                                .as_ref()
+                                .map(|config| config.source_id.as_str())
+                                .unwrap_or("<unknown>"),
+                            &mut consecutive_frame_errors,
+                            format!("{error:#}"),
+                            true,
+                        )
+                        .await?;
+                        frame_id = frame_id.wrapping_add(1).max(1);
+                        continue;
+                    }
                 };
-                sender_stats.record_elapsed("sender.fragment", fragment_started);
+                match fragment_access_unit(
+                    frame_id as u32,
+                    access_unit.timestamp_us,
+                    is_keyframe,
+                    &media_payload,
+                    max_datagram_size,
+                )
+                .context("failed to fragment LAN QUIC media v2 frame")
+                {
+                    Ok(fragments) => fragments,
+                    Err(error) => {
+                        handle_media_sender_frame_error(
+                            &app_state,
+                            &session_id,
+                            active_capture_config
+                                .as_ref()
+                                .map(|config| config.source_id.as_str())
+                                .unwrap_or("<unknown>"),
+                            &mut consecutive_frame_errors,
+                            format!("{error:#}"),
+                            true,
+                        )
+                        .await?;
+                        frame_id = frame_id.wrapping_add(1).max(1);
+                        continue;
+                    }
+                }
+            };
+            sender_stats.record_elapsed("sender.fragment", fragment_started);
 
+            let send_as_reliable_frame = should_send_access_unit_as_reliable_frame(
+                reliable_media_supported,
+                media_v3_supported,
+                fragments.len(),
+            );
+            let reliable_fragments = if send_as_reliable_frame {
+                let reliable_fragment_started = Instant::now();
+                let result = fragment_media_payload_v3(
+                    QuicMediaPayloadType::AccessUnit,
+                    QuicMediaCodec::H264,
+                    lan_media_profile_id(&profile),
+                    frame_id as u32,
+                    access_unit.timestamp_us,
+                    is_keyframe,
+                    &access_unit.bytes,
+                    LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES,
+                )
+                .context("failed to fragment LAN QUIC reliable media v3 frame");
+                sender_stats.record_elapsed("sender.reliable_fragment", reliable_fragment_started);
+                match result {
+                    Ok(reliable_fragments) => Some(reliable_fragments),
+                    Err(error) => {
+                        handle_media_sender_frame_error(
+                            &app_state,
+                            &session_id,
+                            active_capture_config
+                                .as_ref()
+                                .map(|config| config.source_id.as_str())
+                                .unwrap_or("<unknown>"),
+                            &mut consecutive_frame_errors,
+                            format!("{error:#}"),
+                            true,
+                        )
+                        .await?;
+                        frame_id = frame_id.wrapping_add(1).max(1);
+                        continue;
+                    }
+                }
+            } else if should_send_access_unit_reliably(
+                reliable_media_supported,
+                is_keyframe,
+                access_unit.bytes.len(),
+                max_datagram_size,
+            ) {
+                Some(fragments.clone())
+            } else {
+                None
+            };
+
+            let mut send_result = Ok(());
+            if send_as_reliable_frame {
+                let reliable_send_started = Instant::now();
+                for reliable_fragment in reliable_fragments.unwrap_or_default() {
+                    if let Err(error) = endpoint.send_reliable_message(reliable_fragment).await {
+                        send_result = Err(error).with_context(|| {
+                            format!("failed to send LAN QUIC reliable media frame {}", frame_id)
+                        });
+                        break;
+                    }
+                }
+                sender_stats.record_elapsed("sender.send_reliable", reliable_send_started);
+            } else {
                 let datagram_send_started = Instant::now();
                 for fragment in &fragments {
-                    endpoint.send_datagram(fragment.clone()).with_context(|| {
-                        format!("failed to send LAN QUIC media frame {}", frame_id)
-                    })?;
+                    if let Err(error) = endpoint.send_datagram_wait(fragment.clone()).await {
+                        send_result = Err(error).with_context(|| {
+                            format!("failed to send LAN QUIC media frame {}", frame_id)
+                        });
+                        break;
+                    }
                 }
                 sender_stats.record_elapsed("sender.send_datagram", datagram_send_started);
 
-                if should_send_access_unit_reliably(
-                    reliable_media_supported,
-                    is_keyframe,
-                    access_unit.bytes.len(),
-                    max_datagram_size,
-                ) {
-                    reliable_fragments = Some(fragments);
-                }
-                Ok(())
-            })();
-
-            if send_result.is_ok() {
-                if let Some(reliable_fragments) = reliable_fragments {
-                    let reliable_endpoint = endpoint.clone();
-                    let reliable_session_id = session_id.clone();
-                    let reliable_frame_id = frame_id;
-                    tokio::spawn(async move {
-                        for reliable_fragment in reliable_fragments {
-                            if let Err(error) = reliable_endpoint
-                                .send_reliable_message(reliable_fragment)
-                                .await
-                            {
-                                tracing::warn!(
-                                    %error,
-                                    session_id = %reliable_session_id.0,
-                                    frame_id = reliable_frame_id,
-                                    "LAN QUIC reliable keyframe fragment send failed"
-                                );
-                                break;
+                if send_result.is_ok() {
+                    if let Some(reliable_fragments) = reliable_fragments {
+                        let reliable_endpoint = endpoint.clone();
+                        let reliable_session_id = session_id.clone();
+                        let reliable_frame_id = frame_id;
+                        tokio::spawn(async move {
+                            for reliable_fragment in reliable_fragments {
+                                if let Err(error) = reliable_endpoint
+                                    .send_reliable_message(reliable_fragment)
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        %error,
+                                        session_id = %reliable_session_id.0,
+                                        frame_id = reliable_frame_id,
+                                        "LAN QUIC reliable keyframe fragment send failed"
+                                    );
+                                    break;
+                                }
                             }
-                        }
-                    });
+                        });
+                    }
                 }
             }
 
@@ -2868,6 +2977,14 @@ fn should_send_access_unit_reliably(
     }
 
     is_keyframe
+}
+
+fn should_send_access_unit_as_reliable_frame(
+    reliable_media_supported: bool,
+    media_v3_supported: bool,
+    fragment_count: usize,
+) -> bool {
+    reliable_media_supported && media_v3_supported && fragment_count > 1
 }
 
 fn h264_access_unit_is_keyframe(metadata_is_keyframe: bool, payload: &[u8]) -> bool {
@@ -3351,24 +3468,46 @@ async fn render_lan_decoded_frame(
     }
 
     let render_frame = decoded_frame_to_render_frame(decoded_frame.clone())?;
-    let started = Instant::now();
-    let rendered = app_state
-        .media_surface_renderers
-        .lock()
-        .await
-        .render_frame(session_id, &render_frame)
-        .map_err(anyhow::Error::msg)?;
-    if rendered > 0 {
-        app_state
-            .media_pipelines
-            .lock()
-            .await
-            .record_stage_duration_ms(
-                session_id.clone(),
-                "render_present",
-                started.elapsed().as_secs_f64() * 1000.0,
-            );
-    }
+    let render_app_state = app_state.clone();
+    let render_session_id = session_id.clone();
+    tokio::spawn(async move {
+        let started = Instant::now();
+        let render_result = match render_app_state.media_surface_renderers.try_lock() {
+            Ok(mut renderers) => renderers
+                .render_frame(&render_session_id, &render_frame)
+                .map_err(anyhow::Error::msg),
+            Err(_) => {
+                render_app_state
+                    .media_pipelines
+                    .lock()
+                    .await
+                    .increment_dropped_frames(render_session_id, 1);
+                return;
+            }
+        };
+
+        match render_result {
+            Ok(rendered) if rendered > 0 => {
+                render_app_state
+                    .media_pipelines
+                    .lock()
+                    .await
+                    .record_stage_duration_ms(
+                        render_session_id,
+                        "render_present",
+                        started.elapsed().as_secs_f64() * 1000.0,
+                    );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    session_id = %render_session_id.0,
+                    "LAN media receiver failed to present decoded frame"
+                );
+            }
+        }
+    });
     Ok(())
 }
 
@@ -5951,6 +6090,14 @@ mod tests {
             32 * 1024 + 1,
             1_200
         ));
+    }
+
+    #[test]
+    fn lan_quic_media_routes_fragmented_v3_frames_over_reliable_stream() {
+        assert!(should_send_access_unit_as_reliable_frame(true, true, 2));
+        assert!(!should_send_access_unit_as_reliable_frame(true, true, 1));
+        assert!(!should_send_access_unit_as_reliable_frame(true, false, 2));
+        assert!(!should_send_access_unit_as_reliable_frame(false, true, 2));
     }
 
     #[test]

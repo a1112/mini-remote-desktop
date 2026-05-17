@@ -413,6 +413,59 @@ describe("runLanE2EAutomation", () => {
     );
   });
 
+  it("marks the display window as native once the service reports an attached render surface", async () => {
+    const commands = createCommands({
+      openRemoteDisplayWindow: vi.fn().mockResolvedValue(
+        ok({
+          label: "remote-display-agent-device",
+          session_id: "unused",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: false,
+          render_mode: "web",
+          native_surface_attached: false,
+          session_window_count: 1,
+        })
+      ),
+      ipcMediaPipelineSnapshot: vi.fn().mockResolvedValue(
+        ok({
+          session_id: "unused",
+          attached_surfaces: [
+            {
+              surface_id: "surface-1",
+              backend: "d3d11",
+              window_handle: 1234,
+            },
+          ],
+          active_decoder: "nvdec",
+          active_renderer: "d3d11",
+          queue_depth: 0,
+          dropped_frames: 0,
+          stage_metrics: [],
+        })
+      ),
+    });
+
+    const result = await runLanE2EAutomation(commands, {
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => "lan-e2e-test-session",
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.displayWindow).toEqual(
+      expect.objectContaining({
+        renderer_attached: true,
+        render_mode: "d3d11_native",
+        native_surface_attached: true,
+      })
+    );
+  });
+
   it("selects the preferred remote capture source before starting the receiver", async () => {
     const commands = withCaptureSourceCommands(createCommands());
 

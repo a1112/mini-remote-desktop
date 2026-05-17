@@ -42,6 +42,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    webview::PageLoadEvent,
     AppHandle, Manager, WebviewWindow, WebviewWindowBuilder,
 };
 
@@ -2329,9 +2330,9 @@ fn build_lan_e2e_autorun_route(config: LanE2eAutorunLaunchConfig) -> String {
     format!("/test/e2e?{query}")
 }
 
-fn navigate_main_window_to_route(window: &WebviewWindow, route: &str) -> Result<(), String> {
+fn navigate_webview_to_route(webview: &tauri::Webview, route: &str) -> Result<(), String> {
     let script = build_main_window_route_navigation_script(route)?;
-    window.eval(&script).map_err(|error| error.to_string())
+    webview.eval(&script).map_err(|error| error.to_string())
 }
 
 fn build_main_window_route_navigation_script(route: &str) -> Result<String, String> {
@@ -2496,6 +2497,12 @@ fn main() {
         return;
     };
 
+    let lan_e2e_autorun_route = lan_e2e_autorun_config_from_env().map(build_lan_e2e_autorun_route);
+    let lan_e2e_autorun_pending =
+        std::sync::Arc::new(AtomicBool::new(lan_e2e_autorun_route.is_some()));
+    let lan_e2e_autorun_route_for_load = lan_e2e_autorun_route.clone();
+    let lan_e2e_autorun_pending_for_load = lan_e2e_autorun_pending.clone();
+
     // Build the app
     tauri::Builder::default()
         .manage(AppState {
@@ -2526,6 +2533,20 @@ fn main() {
                 }
             }
         })
+        .on_page_load(move |webview, payload| {
+            if payload.event() != PageLoadEvent::Finished || webview.label() != "main" {
+                return;
+            }
+            if !lan_e2e_autorun_pending_for_load.swap(false, Ordering::SeqCst) {
+                return;
+            }
+            let Some(route) = lan_e2e_autorun_route_for_load.as_deref() else {
+                return;
+            };
+            if let Err(error) = navigate_webview_to_route(webview, route) {
+                eprintln!("failed to navigate to LAN E2E autorun route after page load: {error}");
+            }
+        })
         .setup(move |app| {
             spawn_single_instance_listener(single_instance_listener, app.handle().clone());
             setup_system_tray(app.handle())?;
@@ -2537,12 +2558,6 @@ fn main() {
                         "failed to apply native backdrop: {}",
                         backdrop_status.detail
                     );
-                }
-                if let Some(config) = lan_e2e_autorun_config_from_env() {
-                    let route = build_lan_e2e_autorun_route(config);
-                    if let Err(error) = navigate_main_window_to_route(&main_window, &route) {
-                        eprintln!("failed to navigate to LAN E2E autorun route: {error}");
-                    }
                 }
 
                 let app_handle_for_close = app.handle().clone();

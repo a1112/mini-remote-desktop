@@ -138,6 +138,16 @@ impl QuinnDatagramEndpoint {
             .map_err(|error| QuinnTransportError::Message(format!("send_datagram failed: {error}")))
     }
 
+    pub async fn send_datagram_wait(&self, payload: Bytes) -> Result<(), QuinnTransportError> {
+        self.inner
+            .connection
+            .send_datagram_wait(payload)
+            .await
+            .map_err(|error| {
+                QuinnTransportError::Message(format!("send_datagram_wait failed: {error}"))
+            })
+    }
+
     pub async fn read_datagram(&self) -> Result<Bytes, QuinnTransportError> {
         self.inner
             .connection

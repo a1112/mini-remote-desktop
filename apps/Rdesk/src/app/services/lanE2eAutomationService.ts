@@ -453,6 +453,9 @@ export async function runLanE2EAutomation(
         commands.ipcMediaPipelineSnapshot(sessionId),
         "runtime_error"
       );
+      if (displayWindow) {
+        displayWindow = syncDisplayWindowFromPipeline(displayWindow, mediaPipelineSnapshot);
+      }
       sampleDurationMs = now() - sampleStartedAt;
       if (!sampleFpsBaseline) {
         sampleFpsBaseline = {
@@ -547,6 +550,30 @@ export async function runLanE2EAutomation(
       }
     }
   }
+}
+
+function syncDisplayWindowFromPipeline(
+  displayWindow: RemoteDisplayWindowContext,
+  snapshot: MediaPipelineSnapshot
+): RemoteDisplayWindowContext {
+  const attachedSurface = snapshot.attached_surfaces.find(
+    (surface) => surface.surface_id === displayWindow.surface_id
+  );
+  if (!attachedSurface) return displayWindow;
+
+  return {
+    ...displayWindow,
+    renderer_attached: true,
+    native_surface_attached: true,
+    render_mode: renderModeForAttachedSurface(attachedSurface.backend),
+  };
+}
+
+function renderModeForAttachedSurface(backend: string): RemoteDisplayWindowContext["render_mode"] {
+  if (backend === "macos") return "macos_native";
+  if (backend === "linux") return "linux_native";
+  if (backend === "d3d12") return "d3d12_native";
+  return "d3d11_native";
 }
 
 async function maybeApplyRemoteDisplayMode(
