@@ -53,6 +53,32 @@ $slowCrossRow.fps_observed = 100.0
 $slowComparison = Compare-PairedLanCanaryRows -LocalRows @($localRow) -CrossRows @($slowCrossRow) -RatioThreshold 0.8
 Assert-Equal $slowComparison[0].status "threshold_miss" "Cross row below 80 percent is threshold_miss"
 
+$local60Row = [pscustomobject]@{
+  id = "1080p60"
+  width = 1920
+  height = 1080
+  fps = 60
+  bitrate_mbps = 20
+  status = "completed"
+  classification = "completed"
+  fps_observed = 144.0
+  selected_profile = [pscustomobject]@{ width = 1920; height = 1080; fps = 60; bitrate_mbps = 20 }
+}
+$cross60Row = [pscustomobject]@{
+  id = "1080p60"
+  width = 1920
+  height = 1080
+  fps = 60
+  bitrate_mbps = 20
+  status = "completed"
+  classification = "completed"
+  fps_observed = 56.0
+  selected_profile = [pscustomobject]@{ width = 1920; height = 1080; fps = 60; bitrate_mbps = 20 }
+}
+$cappedComparison = Compare-PairedLanCanaryRows -LocalRows @($local60Row) -CrossRows @($cross60Row) -RatioThreshold 0.8
+Assert-Equal $cappedComparison[0].status "completed" "Comparison caps local baseline to requested FPS"
+Assert-Equal ([Math]::Round($cappedComparison[0].fps_ratio, 3)) 0.933 "Capped FPS ratio uses requested FPS"
+
 $downgradedCrossRow = $crossRow.PSObject.Copy()
 $downgradedCrossRow.selected_profile = [pscustomobject]@{ width = 1728; height = 1080; fps = 144; bitrate_mbps = 20 }
 $downgradeComparison = Compare-PairedLanCanaryRows -LocalRows @($localRow) -CrossRows @($downgradedCrossRow) -RatioThreshold 0.8
