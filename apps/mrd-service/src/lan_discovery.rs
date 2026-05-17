@@ -3116,36 +3116,71 @@ async fn receive_quic_media_loop(
     } else {
         None
     };
+    let mut datagram_media_enabled = true;
     loop {
         if !session_allows_media(&app_state, &session_id).await {
             return Ok(());
         }
         let media_message = if let Some(rx) = reliable_media_rx.as_mut() {
-            let datagram_endpoint = endpoint.clone();
-            tokio::select! {
-                result = datagram_endpoint.read_datagram() => {
-                    result.context("failed to read LAN QUIC media datagram")?
+            if datagram_media_enabled {
+                let datagram_endpoint = endpoint.clone();
+                tokio::select! {
+                    result = datagram_endpoint.read_datagram() => {
+                        match result {
+                            Ok(message) => message,
+                            Err(error) => {
+                                datagram_media_enabled = false;
+                                tracing::warn!(
+                                    %error,
+                                    session_id = %session_id.0,
+                                    "LAN QUIC datagram media reader disabled while reliable media remains active"
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                    message = rx.recv() => {
+                        match message {
+                            Some(Ok(message)) => message,
+                            Some(Err(error)) => {
+                                reliable_media_rx = None;
+                                tracing::warn!(
+                                    %error,
+                                    session_id = %session_id.0,
+                                    "LAN QUIC reliable media reader disabled"
+                                );
+                                continue;
+                            }
+                            None => {
+                                reliable_media_rx = None;
+                                tracing::warn!(
+                                    session_id = %session_id.0,
+                                    "LAN QUIC reliable media reader stopped"
+                                );
+                                continue;
+                            }
+                        }
+                    }
                 }
-                message = rx.recv() => {
-                    match message {
-                        Some(Ok(message)) => message,
-                        Some(Err(error)) => {
-                            reliable_media_rx = None;
-                            tracing::warn!(
-                                %error,
-                                session_id = %session_id.0,
-                                "LAN QUIC reliable media reader disabled"
-                            );
-                            continue;
-                        }
-                        None => {
-                            reliable_media_rx = None;
-                            tracing::warn!(
-                                session_id = %session_id.0,
-                                "LAN QUIC reliable media reader stopped"
-                            );
-                            continue;
-                        }
+            } else {
+                match rx.recv().await {
+                    Some(Ok(message)) => message,
+                    Some(Err(error)) => {
+                        reliable_media_rx = None;
+                        tracing::warn!(
+                            %error,
+                            session_id = %session_id.0,
+                            "LAN QUIC reliable media reader disabled"
+                        );
+                        continue;
+                    }
+                    None => {
+                        reliable_media_rx = None;
+                        tracing::warn!(
+                            session_id = %session_id.0,
+                            "LAN QUIC reliable media reader stopped"
+                        );
+                        continue;
                     }
                 }
             }

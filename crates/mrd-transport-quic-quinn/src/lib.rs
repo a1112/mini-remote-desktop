@@ -12,6 +12,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use quinn::{ClientConfig, Connection, Endpoint, ServerConfig};
 use rustls::RootCertStore;
 use thiserror::Error;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -219,6 +220,12 @@ impl QuinnDatagramEndpoint {
             *stream_guard = None;
             return Err(QuinnTransportError::Message(format!(
                 "persistent reliable payload write failed: {error}"
+            )));
+        }
+        if let Err(error) = stream.flush().await {
+            *stream_guard = None;
+            return Err(QuinnTransportError::Message(format!(
+                "persistent reliable flush failed: {error}"
             )));
         }
         Ok(())
