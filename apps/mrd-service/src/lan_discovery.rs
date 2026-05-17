@@ -56,6 +56,7 @@ const LAN_MEDIA_TARGET_BITRATE_MBPS: u32 = 64;
 const LAN_QUIC_FALLBACK_DATAGRAM_BYTES: usize = 1_200;
 const LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES: usize = 4 * 1024 * 1024;
 const LAN_QUIC_RELIABLE_WHOLE_FRAME_MIN_PIXELS: u32 = 2560 * 1440;
+const LAN_QUIC_RELIABLE_WHOLE_FRAME_MIN_FRAGMENTS: usize = 6;
 const LAN_QUIC_RELIABLE_MEDIA_RETRY_DELAY: Duration = Duration::from_millis(10);
 const LAN_QUIC_MEDIA_TRANSPORT: &str = "quic_datagram";
 const LAN_QUIC_MEDIA_PROFILE_TRANSPORT: &str = "quic_datagram_2k144";
@@ -3320,6 +3321,7 @@ fn should_send_access_unit_as_reliable_frame(
         return enabled;
     }
     profile.width.saturating_mul(profile.height) >= LAN_QUIC_RELIABLE_WHOLE_FRAME_MIN_PIXELS
+        || fragment_count >= LAN_QUIC_RELIABLE_WHOLE_FRAME_MIN_FRAGMENTS
 }
 
 fn reliable_whole_frame_media_override() -> Option<bool> {
@@ -6708,6 +6710,13 @@ mod tests {
             true,
             true,
             2,
+            &profile_1080p,
+            None
+        ));
+        assert!(should_send_access_unit_as_reliable_frame(
+            true,
+            true,
+            LAN_QUIC_RELIABLE_WHOLE_FRAME_MIN_FRAGMENTS,
             &profile_1080p,
             None
         ));
