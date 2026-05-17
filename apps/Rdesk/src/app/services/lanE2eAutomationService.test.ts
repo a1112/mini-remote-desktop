@@ -502,6 +502,51 @@ describe("runLanE2EAutomation", () => {
     );
   });
 
+  it("can force a capture source kind for DXGI canary runs", async () => {
+    const commands = withCaptureSourceCommands(createCommands());
+
+    const result = await runLanE2EAutomation(commands, {
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      preferredCaptureSourceKind: "display",
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => "lan-e2e-test-session",
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.captureSource?.id).toBe("display");
+    expect(commands.ipcSelectRemoteCaptureSource).toHaveBeenCalledWith(
+      "lan-e2e-test-session",
+      "display"
+    );
+  });
+
+  it("prefers an exact capture source id over the requested source kind", async () => {
+    const commands = withCaptureSourceCommands(createCommands());
+
+    const result = await runLanE2EAutomation(commands, {
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      preferredCaptureSourceId: "window-codex",
+      preferredCaptureSourceKind: "display",
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => "lan-e2e-test-session",
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.captureSource?.id).toBe("window-codex");
+    expect(commands.ipcSelectRemoteCaptureSource).toHaveBeenCalledWith(
+      "lan-e2e-test-session",
+      "window-codex"
+    );
+  });
+
   it("sets temporary remote display mode before receiver startup and restores during cleanup", async () => {
     const commands = withCaptureSourceCommands(createCommands());
 

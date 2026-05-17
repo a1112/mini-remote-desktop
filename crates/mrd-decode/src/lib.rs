@@ -37,6 +37,7 @@ pub struct DecoderDescriptor {
 }
 
 const RGB24_OUTPUTS: &[PixelFormat] = &[PixelFormat::Rgb24];
+const D3D11_TEXTURE_OUTPUTS: &[PixelFormat] = &[PixelFormat::D3d11Texture];
 
 const H264_SOFTWARE_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
     id: "h264_software",
@@ -50,6 +51,13 @@ const NVDEC_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
     codec: CodecKind::H264,
     runtime_status: RuntimeStatus::RuntimeBacked,
     output_formats: RGB24_OUTPUTS,
+};
+
+const NVDEC_D3D11_SHARED_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
+    id: "nvdec_d3d11_shared",
+    codec: CodecKind::H264,
+    runtime_status: RuntimeStatus::RuntimeBacked,
+    output_formats: D3D11_TEXTURE_OUTPUTS,
 };
 
 const NVDEC_AV1_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
@@ -98,8 +106,9 @@ const LINUX_HEVC_MAIN10_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
 };
 
 pub fn available_decoder_descriptors() -> Vec<DecoderDescriptor> {
-    let mut descriptors = vec![
+    let descriptors = vec![
         H264_SOFTWARE_DESCRIPTOR.clone(),
+        NVDEC_D3D11_SHARED_DESCRIPTOR.clone(),
         NVDEC_DESCRIPTOR.clone(),
         NVDEC_HEVC_DESCRIPTOR.clone(),
         NVDEC_HEVC_MAIN10_DESCRIPTOR.clone(),
@@ -125,6 +134,7 @@ pub fn create_decoder(id: &str) -> Result<Box<dyn VideoDecoder>, PipelineError> 
             create_linux_hevc_main10_decoder()
         }
         "nvdec" => Ok(Box::new(NvdecVideoDecoder::new()?)),
+        "nvdec_d3d11_shared" => Ok(Box::new(NvdecVideoDecoder::new_d3d11_shared()?)),
         "nvdec_hevc" => Ok(Box::new(NvdecVideoDecoder::new_hevc()?)),
         "nvdec_hevc_main10" => Ok(Box::new(NvdecVideoDecoder::new_hevc_main10()?)),
         "nvdec_av1" => Ok(Box::new(NvdecVideoDecoder::new_av1()?)),
@@ -216,6 +226,7 @@ pub struct H264SoftwareDecoder {
 
 pub struct NvdecVideoDecoder {
     decoder: mrd_decode_nvdec::NvdecDecoder,
+    require_shared_output: bool,
 }
 
 impl NvdecVideoDecoder {
@@ -224,7 +235,29 @@ impl NvdecVideoDecoder {
             mrd_decode_nvdec::NvdecOutputMode::CpuNv12,
         )
         .map_err(|e| PipelineError::Message(format!("nvdec create failed: {e}")))?;
-        Ok(Self { decoder })
+        Ok(Self {
+            decoder,
+            require_shared_output: false,
+        })
+    }
+
+    pub fn new_d3d11_shared() -> Result<Self, PipelineError> {
+        let mut decoder = mrd_decode_nvdec::NvdecDecoder::new_with_output_mode(
+            mrd_decode_nvdec::NvdecOutputMode::CpuNv12,
+        )
+        .map_err(|e| PipelineError::Message(format!("nvdec d3d11 shared create failed: {e}")))?;
+        #[cfg(windows)]
+        decoder.enable_shared_texture(true);
+        #[cfg(not(windows))]
+        {
+            return Err(PipelineError::Message(
+                "nvdec d3d11 shared output is only available on Windows".to_string(),
+            ));
+        }
+        Ok(Self {
+            decoder,
+            require_shared_output: true,
+        })
     }
 
     pub fn new_av1() -> Result<Self, PipelineError> {
@@ -232,7 +265,10 @@ impl NvdecVideoDecoder {
             mrd_decode_nvdec::NvdecOutputMode::CpuNv12,
         )
         .map_err(|e| PipelineError::Message(format!("nvdec av1 create failed: {e}")))?;
-        Ok(Self { decoder })
+        Ok(Self {
+            decoder,
+            require_shared_output: false,
+        })
     }
 
     pub fn new_hevc() -> Result<Self, PipelineError> {
@@ -240,7 +276,10 @@ impl NvdecVideoDecoder {
             mrd_decode_nvdec::NvdecOutputMode::CpuNv12,
         )
         .map_err(|e| PipelineError::Message(format!("nvdec hevc create failed: {e}")))?;
-        Ok(Self { decoder })
+        Ok(Self {
+            decoder,
+            require_shared_output: false,
+        })
     }
 
     pub fn new_hevc_main10() -> Result<Self, PipelineError> {
@@ -248,7 +287,10 @@ impl NvdecVideoDecoder {
             mrd_decode_nvdec::NvdecOutputMode::CpuNv12,
         )
         .map_err(|e| PipelineError::Message(format!("nvdec hevc main10 create failed: {e}")))?;
-        Ok(Self { decoder })
+        Ok(Self {
+            decoder,
+            require_shared_output: false,
+        })
     }
 }
 
@@ -1112,18 +1154,22 @@ impl VideoDecoder for NvdecVideoDecoder {
 
     fn drain_decoded_frames(&mut self) -> Vec<CoreDecodedFrame> {
         use mrd_decode_nvdec::NvdecDecodedFrameData;
+        let require_shared_output = self.require_shared_output;
         self.decoder
             .drain_decoded_frames()
             .into_iter()
-            .map(|frame| match frame.data {
-                NvdecDecodedFrameData::CpuRgb24(data) => {
-                    CoreDecodedFrame::from_cpu_rgb24(frame.width, frame.height, 0, data)
-                }
+            .filter_map(|frame| match frame.data {
+                NvdecDecodedFrameData::CpuRgb24(data) => (!require_shared_output)
+                    .then(|| CoreDecodedFrame::from_cpu_rgb24(frame.width, frame.height, 0, data)),
                 NvdecDecodedFrameData::CpuNv12 { data, pitch } => {
-                    CoreDecodedFrame::from_cpu_nv12(frame.width, frame.height, 0, pitch, data)
+                    (!require_shared_output).then(|| {
+                        CoreDecodedFrame::from_cpu_nv12(frame.width, frame.height, 0, pitch, data)
+                    })
                 }
                 NvdecDecodedFrameData::CpuP010 { data, pitch } => {
-                    CoreDecodedFrame::from_cpu_p010(frame.width, frame.height, 0, pitch, data)
+                    (!require_shared_output).then(|| {
+                        CoreDecodedFrame::from_cpu_p010(frame.width, frame.height, 0, pitch, data)
+                    })
                 }
                 #[cfg(windows)]
                 NvdecDecodedFrameData::D3D11SharedNv12 {
@@ -1131,26 +1177,26 @@ impl VideoDecoder for NvdecVideoDecoder {
                     shared_handle_uv,
                     width: _,
                     height: _,
-                } => CoreDecodedFrame::from_d3d11_shared_nv12(
+                } => Some(CoreDecodedFrame::from_d3d11_shared_nv12(
                     frame.width,
                     frame.height,
                     0,
                     shared_handle_y,
                     shared_handle_uv,
-                ),
+                )),
                 #[cfg(windows)]
                 NvdecDecodedFrameData::D3D11SharedP010 {
                     shared_handle_y,
                     shared_handle_uv,
                     width: _,
                     height: _,
-                } => CoreDecodedFrame::from_d3d11_shared_p010(
+                } => Some(CoreDecodedFrame::from_d3d11_shared_p010(
                     frame.width,
                     frame.height,
                     0,
                     shared_handle_y,
                     shared_handle_uv,
-                ),
+                )),
             })
             .collect()
     }

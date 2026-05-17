@@ -52,6 +52,7 @@ const TRAY_MENU_HIDE_ID: &str = "rdesk-tray-hide";
 const TRAY_MENU_CENTER_ID: &str = "rdesk-tray-center";
 const TRAY_MENU_QUIT_ID: &str = "rdesk-tray-quit";
 const SINGLE_INSTANCE_ADDR: &str = "127.0.0.1:47631";
+const RDESK_SINGLE_INSTANCE_ADDR_ENV: &str = "MRD_RDESK_SINGLE_INSTANCE_ADDR";
 const LAN_E2E_AUTORUN_ENV: &str = "MRD_LAN_E2E_AUTORUN";
 const LAN_E2E_TARGET_DEVICE_ID_ENV: &str = "MRD_LAN_E2E_TARGET_DEVICE_ID";
 const LAN_E2E_TRANSPORT_ENV: &str = "MRD_LAN_E2E_TRANSPORT";
@@ -66,6 +67,8 @@ const LAN_E2E_PROFILE_HEIGHT_ENV: &str = "MRD_LAN_E2E_PROFILE_HEIGHT";
 const LAN_E2E_PROFILE_FPS_ENV: &str = "MRD_LAN_E2E_PROFILE_FPS";
 const LAN_E2E_PROFILE_BITRATE_MBPS_ENV: &str = "MRD_LAN_E2E_PROFILE_BITRATE_MBPS";
 const LAN_E2E_DISPLAY_MODE_POLICY_ENV: &str = "MRD_LAN_E2E_DISPLAY_MODE_POLICY";
+const LAN_E2E_CAPTURE_SOURCE_ID_ENV: &str = "MRD_LAN_E2E_CAPTURE_SOURCE_ID";
+const LAN_E2E_CAPTURE_SOURCE_KIND_ENV: &str = "MRD_LAN_E2E_CAPTURE_SOURCE_KIND";
 
 static APP_IS_QUITTING: AtomicBool = AtomicBool::new(false);
 
@@ -2148,15 +2151,32 @@ fn detach_ui_async(reason: &'static str) {
 }
 
 fn claim_single_instance() -> Option<TcpListener> {
-    match TcpListener::bind(SINGLE_INSTANCE_ADDR) {
+    let addr = single_instance_addr();
+    match TcpListener::bind(&addr) {
         Ok(listener) => Some(listener),
         Err(_) => {
-            if let Ok(mut stream) = TcpStream::connect(SINGLE_INSTANCE_ADDR) {
+            if let Ok(mut stream) = TcpStream::connect(&addr) {
                 let _ = stream.write_all(b"show\n");
             }
             None
         }
     }
+}
+
+fn single_instance_addr() -> String {
+    single_instance_addr_from_env_value(
+        std::env::var(RDESK_SINGLE_INSTANCE_ADDR_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn single_instance_addr_from_env_value(value: Option<&str>) -> String {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(SINGLE_INSTANCE_ADDR)
+        .to_string()
 }
 
 fn spawn_single_instance_listener(listener: TcpListener, app: AppHandle) {
@@ -2271,6 +2291,8 @@ struct LanE2eAutorunLaunchConfig {
     profile_fps: Option<String>,
     profile_bitrate_mbps: Option<String>,
     display_mode_policy: Option<String>,
+    capture_source_id: Option<String>,
+    capture_source_kind: Option<String>,
 }
 
 fn lan_e2e_autorun_config_from_env() -> Option<LanE2eAutorunLaunchConfig> {
@@ -2299,6 +2321,8 @@ where
         profile_fps: non_empty_env(env(LAN_E2E_PROFILE_FPS_ENV)),
         profile_bitrate_mbps: non_empty_env(env(LAN_E2E_PROFILE_BITRATE_MBPS_ENV)),
         display_mode_policy: non_empty_env(env(LAN_E2E_DISPLAY_MODE_POLICY_ENV)),
+        capture_source_id: non_empty_env(env(LAN_E2E_CAPTURE_SOURCE_ID_ENV)),
+        capture_source_kind: non_empty_env(env(LAN_E2E_CAPTURE_SOURCE_KIND_ENV)),
     })
 }
 
@@ -2321,6 +2345,8 @@ fn build_lan_e2e_autorun_route(config: LanE2eAutorunLaunchConfig) -> String {
     push_query_param(&mut params, "fps", config.profile_fps);
     push_query_param(&mut params, "bitrateMbps", config.profile_bitrate_mbps);
     push_query_param(&mut params, "displayModePolicy", config.display_mode_policy);
+    push_query_param(&mut params, "captureSourceId", config.capture_source_id);
+    push_query_param(&mut params, "captureSourceKind", config.capture_source_kind);
 
     let query = params
         .into_iter()
@@ -2417,11 +2443,13 @@ mod tray_tests {
             profile_fps: Some("180".to_string()),
             profile_bitrate_mbps: Some("20".to_string()),
             display_mode_policy: Some("temporary".to_string()),
+            capture_source_id: Some("windows:display-shared:1".to_string()),
+            capture_source_kind: Some("display".to_string()),
         });
 
         assert_eq!(
             route,
-            "/test/e2e?autorun=lan-e2e&targetDeviceId=agent%20device%2F1&transport=quic&timeoutMs=2500&minSampleDurationMs=1500&minDecodedFrames=2&minFps=5&stopOnComplete=false&width=1920&height=1080&fps=180&bitrateMbps=20&displayModePolicy=temporary"
+            "/test/e2e?autorun=lan-e2e&targetDeviceId=agent%20device%2F1&transport=quic&timeoutMs=2500&minSampleDurationMs=1500&minDecodedFrames=2&minFps=5&stopOnComplete=false&width=1920&height=1080&fps=180&bitrateMbps=20&displayModePolicy=temporary&captureSourceId=windows%3Adisplay-shared%3A1&captureSourceKind=display"
         );
     }
 
@@ -2450,6 +2478,22 @@ mod tray_tests {
         assert_eq!(
             script,
             "window.location.replace(\"/test/e2e?autorun=lan-e2e&displayModePolicy=temporary\");"
+        );
+    }
+
+    #[test]
+    fn single_instance_addr_can_be_overridden_for_test_instances() {
+        assert_eq!(
+            single_instance_addr_from_env_value(None),
+            SINGLE_INSTANCE_ADDR.to_string()
+        );
+        assert_eq!(
+            single_instance_addr_from_env_value(Some(" 127.0.0.1:48765 ")),
+            "127.0.0.1:48765".to_string()
+        );
+        assert_eq!(
+            single_instance_addr_from_env_value(Some(" ")),
+            SINGLE_INSTANCE_ADDR.to_string()
         );
     }
 }

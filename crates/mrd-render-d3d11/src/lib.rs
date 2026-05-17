@@ -202,6 +202,31 @@ impl D3d11Renderer {
     }
 
     #[cfg(windows)]
+    fn present_flags() -> u32 {
+        use windows::Win32::Graphics::Dxgi::DXGI_PRESENT_DO_NOT_WAIT;
+
+        match std::env::var("MRD_D3D11_RENDER_PRESENT_BLOCKING") {
+            Ok(value) if value == "1" || value.eq_ignore_ascii_case("true") => 0,
+            _ => DXGI_PRESENT_DO_NOT_WAIT,
+        }
+    }
+
+    #[cfg(windows)]
+    fn present_swap_chain(
+        swap_chain: &windows::Win32::Graphics::Dxgi::IDXGISwapChain1,
+    ) -> Result<(), RenderError> {
+        use windows::Win32::Graphics::Dxgi::DXGI_ERROR_WAS_STILL_DRAWING;
+
+        let hr = unsafe { swap_chain.Present(0, Self::present_flags()) };
+        if hr == DXGI_ERROR_WAS_STILL_DRAWING {
+            return Ok(());
+        }
+        hr.ok()
+            .map_err(|error| RenderError::Message(format!("present 失败: {error}")))?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
     fn attach_window_surface(
         &mut self,
         window_handle: isize,
@@ -344,12 +369,8 @@ impl D3d11Renderer {
                 .OMSetRenderTargets(Some(&[Some(surface.render_target_view.clone())]), None);
             self.context
                 .ClearRenderTargetView(&surface.render_target_view, &clear);
-            surface
-                .swap_chain
-                .Present(0, 0)
-                .ok()
-                .map_err(|error| RenderError::Message(format!("present 失败: {error}")))?;
         }
+        Self::present_swap_chain(&surface.swap_chain)?;
         Ok(())
     }
 
@@ -425,12 +446,8 @@ impl D3d11Renderer {
                 row_pitch,
                 0,
             );
-            surface
-                .swap_chain
-                .Present(0, 0)
-                .ok()
-                .map_err(|error| RenderError::Message(format!("present 失败: {error}")))?;
         }
+        Self::present_swap_chain(&surface.swap_chain)?;
         Ok(())
     }
 
@@ -569,12 +586,8 @@ impl D3d11Renderer {
                 row_pitch,
                 0,
             );
-            surface
-                .swap_chain
-                .Present(0, 0)
-                .ok()
-                .map_err(|error| RenderError::Message(format!("present 失败: {error}")))?;
         }
+        Self::present_swap_chain(&surface.swap_chain)?;
         Ok(())
     }
 
@@ -835,12 +848,8 @@ impl D3d11Renderer {
                     Some(&source_box),
                 );
             }
-            surface
-                .swap_chain
-                .Present(0, 0)
-                .ok()
-                .map_err(|error| RenderError::Message(format!("present 失败: {error}")))?;
         }
+        Self::present_swap_chain(&surface.swap_chain)?;
         Ok(())
     }
 
@@ -917,11 +926,8 @@ impl D3d11Renderer {
             self.context.PSSetShaderResources(0, Some(&srvs));
             self.context.Draw(3, 0);
             self.context.PSSetShaderResources(0, Some(&empty_srvs));
-            swap_chain
-                .Present(0, 0)
-                .ok()
-                .map_err(|error| RenderError::Message(format!("present 失败: {error}")))?;
         }
+        Self::present_swap_chain(&swap_chain)?;
         Ok(())
     }
 }
@@ -1012,6 +1018,19 @@ mod tests {
         let viewport = fit_viewport_rect(1200, 1200, 1920, 1080);
 
         assert_eq!(viewport, (0.0, 262.5, 1200.0, 675.0));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn d3d11_renderer_defaults_to_nonblocking_present() {
+        use windows::Win32::Graphics::Dxgi::DXGI_PRESENT_DO_NOT_WAIT;
+
+        std::env::remove_var("MRD_D3D11_RENDER_PRESENT_BLOCKING");
+        assert_eq!(D3d11Renderer::present_flags(), DXGI_PRESENT_DO_NOT_WAIT);
+
+        std::env::set_var("MRD_D3D11_RENDER_PRESENT_BLOCKING", "1");
+        assert_eq!(D3d11Renderer::present_flags(), 0);
+        std::env::remove_var("MRD_D3D11_RENDER_PRESENT_BLOCKING");
     }
 
     #[cfg(windows)]

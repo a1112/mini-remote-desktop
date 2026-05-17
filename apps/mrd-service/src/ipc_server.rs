@@ -27,7 +27,10 @@ pub struct IpcServer {
 
 impl IpcServer {
     pub fn new(app_state: Arc<AppState>) -> Self {
-        Self::new_with_endpoint(app_state, transport::IpcEndpoint::default_service())
+        Self::new_with_endpoint(
+            app_state,
+            transport::IpcEndpoint::service_from_env_or_default(),
+        )
     }
 
     pub fn new_with_endpoint(app_state: Arc<AppState>, endpoint: transport::IpcEndpoint) -> Self {

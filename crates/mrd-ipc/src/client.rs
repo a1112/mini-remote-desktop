@@ -61,7 +61,10 @@ pub struct IpcClient {
 impl IpcClient {
     /// Create a new IPC client
     pub fn new() -> Self {
-        Self::with_config_and_endpoint(ReconnectConfig::default(), IpcEndpoint::default_service())
+        Self::with_config_and_endpoint(
+            ReconnectConfig::default(),
+            IpcEndpoint::service_from_env_or_default(),
+        )
     }
 
     /// Create a new IPC client that connects to a custom endpoint.

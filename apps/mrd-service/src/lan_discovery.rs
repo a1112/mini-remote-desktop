@@ -1,3 +1,5 @@
+#[cfg(windows)]
+use crate::app_state::MediaRenderQueueEnqueue;
 use crate::app_state::{AppState, DecodedVideoFrameStats, MediaProbeFrameStats};
 use anyhow::{Context, Result};
 use mrd_application::ports::SessionSnapshot;
@@ -5,6 +7,7 @@ use mrd_encode_openh264::OpenH264Encoder;
 use mrd_ipc::{
     CaptureSource, CaptureSourceSelection, DisplayMode, DisplayModeChange, LanDiscoverySnapshot,
     LanPeerInfo, MediaProfile, MediaProfileNegotiation, MediaStageMetrics,
+    MediaTestImpairmentSnapshot,
 };
 use mrd_pipeline_core::{
     CapturedFrame, DecodedFrame, DecodedFrameData, FramePixelFormat, VideoDecoder, VideoEncoder,
@@ -30,6 +33,14 @@ use tokio::sync::{Mutex, Notify};
 use tokio::time::{interval, sleep_until, timeout, Instant};
 
 const DEFAULT_DISCOVERY_PORT: u16 = 21116;
+const LAN_DISCOVERY_PORT_ENV: &str = "MRD_LAN_DISCOVERY_PORT";
+const LAN_DISCOVERY_PROBE_ENDPOINTS_ENV: &str = "MRD_LAN_DISCOVERY_PROBE_ENDPOINTS";
+const LAN_TEST_IMPAIRMENT_LOSS_PCT_ENV: &str = "MRD_LAN_TEST_IMPAIRMENT_LOSS_PCT";
+const LAN_TEST_IMPAIRMENT_BASE_DELAY_MS_ENV: &str = "MRD_LAN_TEST_IMPAIRMENT_BASE_DELAY_MS";
+const LAN_TEST_IMPAIRMENT_JITTER_MS_ENV: &str = "MRD_LAN_TEST_IMPAIRMENT_JITTER_MS";
+const LAN_TEST_IMPAIRMENT_MTU_BYTES_ENV: &str = "MRD_LAN_TEST_IMPAIRMENT_MTU_BYTES";
+const LAN_TEST_IMPAIRMENT_SEED_ENV: &str = "MRD_LAN_TEST_IMPAIRMENT_SEED";
+const LAN_RELIABLE_WHOLE_FRAME_ENV: &str = "MRD_LAN_RELIABLE_WHOLE_FRAME";
 const PROTOCOL_VERSION: u32 = 1;
 const ANNOUNCE_INTERVAL_SECS: u64 = 3;
 const PEER_TTL_SECS: u64 = 12;
@@ -87,6 +98,7 @@ const LAN_PREVIEW_MAX_HEIGHT: u32 = 270;
 pub struct LanDiscoveryConfig {
     pub enabled: bool,
     pub discovery_port: u16,
+    pub probe_endpoints: Vec<SocketAddr>,
     pub announce_interval: Duration,
     pub peer_ttl: Duration,
 }
@@ -96,10 +108,49 @@ impl Default for LanDiscoveryConfig {
         Self {
             enabled: true,
             discovery_port: DEFAULT_DISCOVERY_PORT,
+            probe_endpoints: Vec::new(),
             announce_interval: Duration::from_secs(ANNOUNCE_INTERVAL_SECS),
             peer_ttl: Duration::from_secs(PEER_TTL_SECS),
         }
     }
+}
+
+impl LanDiscoveryConfig {
+    pub fn from_env() -> Result<Self> {
+        Self::from_env_lookup(|key| std::env::var(key).ok())
+    }
+
+    fn from_env_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self> {
+        let mut config = Self::default();
+        if let Some(port) = lookup(LAN_DISCOVERY_PORT_ENV) {
+            let port = port.trim();
+            if !port.is_empty() {
+                config.discovery_port = port
+                    .parse::<u16>()
+                    .with_context(|| format!("invalid {LAN_DISCOVERY_PORT_ENV}: {port}"))?;
+            }
+        }
+        if let Some(endpoints) = lookup(LAN_DISCOVERY_PROBE_ENDPOINTS_ENV) {
+            config.probe_endpoints = parse_probe_endpoints(&endpoints)?;
+        }
+        Ok(config)
+    }
+}
+
+fn parse_probe_endpoints(value: &str) -> Result<Vec<SocketAddr>> {
+    let mut endpoints = Vec::new();
+    for entry in value.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        endpoints.push(
+            entry
+                .parse::<SocketAddr>()
+                .with_context(|| format!("invalid LAN discovery probe endpoint: {entry}"))?,
+        );
+    }
+    Ok(endpoints)
 }
 
 #[derive(Debug)]
@@ -128,6 +179,17 @@ impl LanDiscoveryState {
 
     pub fn discovery_port(&self) -> u16 {
         self.config.discovery_port
+    }
+
+    fn probe_targets(&self, discovery_port: u16) -> Vec<SocketAddr> {
+        let mut targets = Vec::with_capacity(self.config.probe_endpoints.len() + 1);
+        targets.push(SocketAddr::from(([255, 255, 255, 255], discovery_port)));
+        for endpoint in &self.config.probe_endpoints {
+            if !targets.iter().any(|target| target == endpoint) {
+                targets.push(*endpoint);
+            }
+        }
+        targets
     }
 
     pub fn instance_id(&self) -> &str {
@@ -236,6 +298,22 @@ impl LanDiscoveryState {
             .await
             .get(&device_id.0)
             .map(|peer| peer.transports.clone())
+    }
+
+    pub async fn peer_media_capabilities(&self, device_id: &DeviceId) -> Option<Vec<String>> {
+        self.prune_stale_peers().await;
+        self.peers.lock().await.get(&device_id.0).map(|peer| {
+            let mut capabilities = peer.media_capabilities.clone();
+            for transport in &peer.transports {
+                if !capabilities
+                    .iter()
+                    .any(|capability| capability == transport)
+                {
+                    capabilities.push(transport.clone());
+                }
+            }
+            capabilities
+        })
     }
 }
 
@@ -496,6 +574,8 @@ struct LanSenderStatsPayload {
     target_fps: u32,
     target_bitrate_mbps: u32,
     metrics: Vec<MediaStageMetrics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    test_impairment: Option<MediaTestImpairmentSnapshot>,
 }
 
 #[derive(Debug)]
@@ -503,6 +583,26 @@ struct LanSenderStatsTracker {
     samples: HashMap<&'static str, VecDeque<f64>>,
     frame_count: u64,
     last_emit: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct LanMediaTestImpairment {
+    loss_pct: f64,
+    base_delay: Duration,
+    jitter: Duration,
+    mtu_bytes: Option<usize>,
+    seed: u64,
+    rng_state: u64,
+    datagrams_sent: u64,
+    datagrams_dropped: u64,
+    datagrams_delayed: u64,
+    datagrams_fragmented_by_mtu: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LanMediaDatagramDecision {
+    drop_datagram: bool,
+    delay: Duration,
 }
 
 impl LanRemoteAcceptResult {
@@ -544,17 +644,15 @@ impl LanSenderStatsTracker {
         self.frame_count = self.frame_count.saturating_add(1);
     }
 
-    fn take_payload(
-        &mut self,
-        now: Instant,
-        sequence: u64,
-        source_id: Option<String>,
-        profile: &MediaProfile,
-    ) -> Option<LanSenderStatsPayload> {
+    fn take_stage_metrics(&mut self, now: Instant) -> Option<Vec<MediaStageMetrics>> {
         if now.duration_since(self.last_emit) < LAN_MEDIA_SENDER_STATS_INTERVAL {
             return None;
         }
         self.last_emit = now;
+        Some(self.stage_metrics())
+    }
+
+    fn stage_metrics(&self) -> Vec<MediaStageMetrics> {
         let mut metrics = self
             .samples
             .iter()
@@ -565,6 +663,18 @@ impl LanSenderStatsTracker {
             })
             .collect::<Vec<_>>();
         metrics.sort_by(|left, right| left.stage.cmp(&right.stage));
+        metrics
+    }
+
+    fn take_payload(
+        &mut self,
+        now: Instant,
+        sequence: u64,
+        source_id: Option<String>,
+        profile: &MediaProfile,
+        test_impairment: Option<MediaTestImpairmentSnapshot>,
+    ) -> Option<LanSenderStatsPayload> {
+        let metrics = self.take_stage_metrics(now)?;
         Some(LanSenderStatsPayload {
             sequence,
             frame_count: self.frame_count,
@@ -572,8 +682,158 @@ impl LanSenderStatsTracker {
             target_fps: profile.fps,
             target_bitrate_mbps: profile.bitrate_mbps,
             metrics,
+            test_impairment,
         })
     }
+}
+
+impl LanMediaTestImpairment {
+    fn from_env() -> Result<Self> {
+        Self::from_env_lookup(|key| std::env::var(key).ok())
+    }
+
+    fn from_env_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self> {
+        let loss_pct =
+            parse_env_f64(&lookup, LAN_TEST_IMPAIRMENT_LOSS_PCT_ENV, 0.0)?.clamp(0.0, 100.0);
+        let base_delay_ms = parse_env_u64(&lookup, LAN_TEST_IMPAIRMENT_BASE_DELAY_MS_ENV, 0)?;
+        let jitter_ms = parse_env_u64(&lookup, LAN_TEST_IMPAIRMENT_JITTER_MS_ENV, 0)?;
+        let mtu_bytes = lookup(LAN_TEST_IMPAIRMENT_MTU_BYTES_ENV)
+            .and_then(|value| {
+                let trimmed = value.trim().to_string();
+                (!trimmed.is_empty()).then_some(trimmed)
+            })
+            .map(|value| {
+                value.parse::<usize>().with_context(|| {
+                    format!("invalid {LAN_TEST_IMPAIRMENT_MTU_BYTES_ENV}: {value}")
+                })
+            })
+            .transpose()?;
+        let seed = parse_env_u64(&lookup, LAN_TEST_IMPAIRMENT_SEED_ENV, 0x4d52_444c_414e)?;
+        Ok(Self {
+            loss_pct,
+            base_delay: Duration::from_millis(base_delay_ms),
+            jitter: Duration::from_millis(jitter_ms),
+            mtu_bytes,
+            seed,
+            rng_state: seed.max(1),
+            datagrams_sent: 0,
+            datagrams_dropped: 0,
+            datagrams_delayed: 0,
+            datagrams_fragmented_by_mtu: 0,
+        })
+    }
+
+    fn enabled(&self) -> bool {
+        self.loss_pct > 0.0
+            || !self.base_delay.is_zero()
+            || !self.jitter.is_zero()
+            || self.mtu_bytes.is_some()
+    }
+
+    fn effective_datagram_size(&self, negotiated_size: usize) -> usize {
+        let minimum = QUIC_MEDIA_V3_FRAGMENT_HEADER_LEN.max(QUIC_AU_FRAGMENT_HEADER_LEN) + 1;
+        self.mtu_bytes
+            .map(|mtu| mtu.clamp(minimum, negotiated_size))
+            .unwrap_or(negotiated_size)
+    }
+
+    fn record_mtu_fragmentation(&mut self, negotiated_size: usize) {
+        if self.effective_datagram_size(negotiated_size) < negotiated_size {
+            self.datagrams_fragmented_by_mtu = self.datagrams_fragmented_by_mtu.saturating_add(1);
+        }
+    }
+
+    fn next_datagram_decision(&mut self) -> LanMediaDatagramDecision {
+        let loss_roll = self.next_unit_f64() * 100.0;
+        let drop_datagram = self.loss_pct > 0.0 && loss_roll < self.loss_pct;
+        let delay = self.next_delay();
+
+        if drop_datagram {
+            self.datagrams_dropped = self.datagrams_dropped.saturating_add(1);
+        } else {
+            self.datagrams_sent = self.datagrams_sent.saturating_add(1);
+        }
+
+        LanMediaDatagramDecision {
+            drop_datagram,
+            delay,
+        }
+    }
+
+    fn next_delay(&mut self) -> Duration {
+        let jitter_ms = if self.jitter.is_zero() {
+            0
+        } else {
+            let jitter_bound = self.jitter.as_millis() as u64;
+            self.next_u64() % (jitter_bound.saturating_add(1))
+        };
+        let delay = self.base_delay + Duration::from_millis(jitter_ms);
+        if !delay.is_zero() {
+            self.datagrams_delayed = self.datagrams_delayed.saturating_add(1);
+        }
+        delay
+    }
+
+    fn snapshot(&self) -> Option<MediaTestImpairmentSnapshot> {
+        self.enabled().then(|| MediaTestImpairmentSnapshot {
+            loss_pct: self.loss_pct,
+            base_delay_ms: self.base_delay.as_millis() as u64,
+            jitter_ms: self.jitter.as_millis() as u64,
+            mtu_bytes: self.mtu_bytes.map(|value| value as u32),
+            seed: self.seed,
+            datagrams_sent: self.datagrams_sent,
+            datagrams_dropped: self.datagrams_dropped,
+            datagrams_delayed: self.datagrams_delayed,
+            datagrams_fragmented_by_mtu: self.datagrams_fragmented_by_mtu,
+        })
+    }
+
+    fn next_unit_f64(&mut self) -> f64 {
+        (self.next_u64() as f64) / (u64::MAX as f64)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.rng_state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng_state = x.max(1);
+        self.rng_state
+    }
+}
+
+fn parse_env_u64(
+    lookup: &impl Fn(&str) -> Option<String>,
+    key: &'static str,
+    default: u64,
+) -> Result<u64> {
+    let Some(value) = lookup(key) else {
+        return Ok(default);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(default);
+    }
+    value
+        .parse::<u64>()
+        .with_context(|| format!("invalid {key}: {value}"))
+}
+
+fn parse_env_f64(
+    lookup: &impl Fn(&str) -> Option<String>,
+    key: &'static str,
+    default: f64,
+) -> Result<f64> {
+    let Some(value) = lookup(key) else {
+        return Ok(default);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(default);
+    }
+    value
+        .parse::<f64>()
+        .with_context(|| format!("invalid {key}: {value}"))
 }
 
 fn sender_stats_percentile(samples: &VecDeque<f64>, quantile: f64) -> Option<f64> {
@@ -599,12 +859,9 @@ pub async fn send_probe(
         device_id: None,
         timestamp_ms: now_ms(),
     };
-    send_packet(
-        socket,
-        &packet,
-        SocketAddr::from(([255, 255, 255, 255], discovery_port)),
-    )
-    .await?;
+    for target in state.probe_targets(discovery_port) {
+        send_packet(socket, &packet, target).await?;
+    }
     state.last_probe_ms.store(now_ms(), Ordering::Relaxed);
     Ok(())
 }
@@ -662,6 +919,11 @@ pub async fn request_lan_remote_session(
         .peer_transports(target_device_id)
         .await
         .with_context(|| format!("LAN peer not found: {}", target_device_id.0))?;
+    let peer_media_capabilities = app_state
+        .lan_discovery
+        .peer_media_capabilities(target_device_id)
+        .await
+        .with_context(|| format!("LAN peer not found: {}", target_device_id.0))?;
     ensure_peer_supports_requested_media(target_device_id, transport_kind, &peer_transports)?;
     close_existing_lan_receiver_sessions_for_target(app_state, target_device_id, session_id).await;
 
@@ -714,6 +976,11 @@ pub async fn request_lan_remote_session(
                     .lock()
                     .await
                     .set(session_id.clone(), negotiation.clone());
+                app_state
+                    .peer_media_capabilities
+                    .lock()
+                    .await
+                    .set(session_id.clone(), peer_media_capabilities);
                 {
                     let mut sessions = app_state.sessions.lock().await;
                     if sessions.get(session_id).is_none() {
@@ -1113,14 +1380,18 @@ async fn announce_loop(socket: Arc<UdpSocket>, app_state: Arc<AppState>) {
             _ = ticker.tick() => {
                 if let Some(announcement) = build_announcement(&app_state).await {
                     let packet = LanDiscoveryPacket::Announce(announcement);
-                    let target = SocketAddr::from(([255, 255, 255, 255], app_state.lan_discovery.discovery_port()));
-                    if let Err(error) = send_packet(&socket, &packet, target).await {
-                        tracing::warn!(%error, "failed to send LAN discovery announce");
-                    } else {
-                        app_state
-                            .lan_discovery
-                            .last_probe_ms
-                            .store(now_ms(), Ordering::Relaxed);
+                    let targets = app_state
+                        .lan_discovery
+                        .probe_targets(app_state.lan_discovery.discovery_port());
+                    for target in targets {
+                        if let Err(error) = send_packet(&socket, &packet, target).await {
+                            tracing::warn!(%error, %target, "failed to send LAN discovery announce");
+                        } else {
+                            app_state
+                                .lan_discovery
+                                .last_probe_ms
+                                .store(now_ms(), Ordering::Relaxed);
+                        }
                     }
                 }
                 app_state.lan_discovery.prune_stale_peers().await;
@@ -2121,6 +2392,12 @@ async fn close_lan_media_sessions(
             .lock()
             .await
             .detach_session(&session_id);
+        #[cfg(windows)]
+        app_state
+            .media_render_queues
+            .lock()
+            .await
+            .remove(&session_id);
         app_state.media_pipelines.lock().await.remove(&session_id);
     }
 }
@@ -2391,6 +2668,7 @@ async fn send_quic_media_loop(
     let mut next_frame_at = Instant::now();
     let mut active_frame_interval = Duration::ZERO;
     let mut sender_stats = LanSenderStatsTracker::new(Instant::now());
+    let mut test_impairment = LanMediaTestImpairment::from_env()?;
     let reliable_media_supported = app_state
         .peer_media_capabilities
         .lock()
@@ -2590,7 +2868,7 @@ async fn send_quic_media_loop(
                     access_unit.timestamp_us,
                     is_keyframe,
                     &access_unit.bytes,
-                    max_datagram_size,
+                    test_impairment.effective_datagram_size(max_datagram_size),
                 )
                 .context("failed to fragment LAN QUIC media v3 frame")
                 {
@@ -2644,7 +2922,7 @@ async fn send_quic_media_loop(
                     access_unit.timestamp_us,
                     is_keyframe,
                     &media_payload,
-                    max_datagram_size,
+                    test_impairment.effective_datagram_size(max_datagram_size),
                 )
                 .context("failed to fragment LAN QUIC media v2 frame")
                 {
@@ -2668,11 +2946,13 @@ async fn send_quic_media_loop(
                 }
             };
             sender_stats.record_elapsed("sender.fragment", fragment_started);
+            test_impairment.record_mtu_fragmentation(max_datagram_size);
 
             let send_as_reliable_frame = should_send_access_unit_as_reliable_frame(
                 reliable_media_supported || persistent_media_supported,
                 media_v3_supported,
                 fragments.len(),
+                reliable_whole_frame_media_enabled(),
             );
             let reliable_fragments = if send_as_reliable_frame {
                 let reliable_fragment_started = Instant::now();
@@ -2722,6 +3002,10 @@ async fn send_quic_media_loop(
             if send_as_reliable_frame {
                 let reliable_send_started = Instant::now();
                 for reliable_fragment in reliable_fragments.unwrap_or_default() {
+                    let delay = test_impairment.next_delay();
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
                     let send = if persistent_media_supported {
                         endpoint
                             .send_reliable_message_persistent(reliable_fragment)
@@ -2740,6 +3024,30 @@ async fn send_quic_media_loop(
             } else {
                 let datagram_send_started = Instant::now();
                 for fragment in &fragments {
+                    let decision = test_impairment.next_datagram_decision();
+                    if decision.drop_datagram {
+                        continue;
+                    }
+                    if !decision.delay.is_zero() {
+                        let delayed_endpoint = endpoint.clone();
+                        let delayed_session_id = session_id.clone();
+                        let delayed_frame_id = frame_id;
+                        let delayed_fragment = fragment.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(decision.delay).await;
+                            if let Err(error) =
+                                delayed_endpoint.send_datagram_wait(delayed_fragment).await
+                            {
+                                tracing::debug!(
+                                    %error,
+                                    session_id = %delayed_session_id.0,
+                                    frame_id = delayed_frame_id,
+                                    "delayed LAN QUIC media datagram send failed"
+                                );
+                            }
+                        });
+                        continue;
+                    }
                     if let Err(error) = endpoint.send_datagram_wait(fragment.clone()).await {
                         send_result = Err(error).with_context(|| {
                             format!("failed to send LAN QUIC media frame {}", frame_id)
@@ -2798,6 +3106,7 @@ async fn send_quic_media_loop(
                     .as_ref()
                     .map(|config| config.source_id.clone()),
                 &profile,
+                test_impairment.snapshot(),
             ) {
                 let stats_send_started = Instant::now();
                 if let Err(error) =
@@ -2998,8 +3307,23 @@ fn should_send_access_unit_as_reliable_frame(
     reliable_media_supported: bool,
     media_v3_supported: bool,
     fragment_count: usize,
+    reliable_whole_frame_enabled: bool,
 ) -> bool {
-    reliable_media_supported && media_v3_supported && fragment_count > 1
+    reliable_whole_frame_enabled
+        && reliable_media_supported
+        && media_v3_supported
+        && fragment_count > 1
+}
+
+fn reliable_whole_frame_media_enabled() -> bool {
+    matches!(
+        std::env::var(LAN_RELIABLE_WHOLE_FRAME_ENV)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 fn h264_access_unit_is_keyframe(metadata_is_keyframe: bool, payload: &[u8]) -> bool {
@@ -3117,10 +3441,12 @@ async fn receive_quic_media_loop(
         None
     };
     let mut datagram_media_enabled = true;
+    let mut receiver_stats = LanSenderStatsTracker::new(Instant::now());
     loop {
         if !session_allows_media(&app_state, &session_id).await {
             return Ok(());
         }
+        let read_started = Instant::now();
         let media_message = if let Some(rx) = reliable_media_rx.as_mut() {
             if datagram_media_enabled {
                 let datagram_endpoint = endpoint.clone();
@@ -3190,16 +3516,15 @@ async fn receive_quic_media_loop(
                 .await
                 .context("failed to read LAN QUIC media datagram")?
         };
+        receiver_stats.record_elapsed("receiver.read", read_started);
         if !session_allows_media(&app_state, &session_id).await {
             return Ok(());
         }
         match decode_lan_sender_stats_datagram(&media_message) {
             Ok(Some(stats)) => {
-                app_state
-                    .media_pipelines
-                    .lock()
-                    .await
-                    .set_stage_metrics(session_id.clone(), stats.metrics);
+                let mut pipelines = app_state.media_pipelines.lock().await;
+                pipelines.set_stage_metrics(session_id.clone(), stats.metrics);
+                pipelines.set_test_impairment(session_id.clone(), stats.test_impairment);
                 continue;
             }
             Ok(None) => {}
@@ -3213,6 +3538,7 @@ async fn receive_quic_media_loop(
                 continue;
             }
         }
+        let reassemble_started = Instant::now();
         let reassembled_frame = if is_quic_media_v3_datagram(&media_message) {
             match media_v3_reassembler
                 .push_datagram(&media_message)
@@ -3234,9 +3560,11 @@ async fn receive_quic_media_loop(
                 .push_datagram(&media_message)
                 .context("failed to reassemble LAN QUIC media v2 frame")?
         };
+        receiver_stats.record_elapsed("receiver.reassemble", reassemble_started);
 
         if let Some(frame) = reassembled_frame {
             let ready_frames = frame_orderer.push(frame);
+            receiver_stats.record_ms("receiver.ready_frames", ready_frames.len() as f64);
             for frame in ready_frames {
                 let envelope = match decode_lan_media_envelope(&frame.payload) {
                     Ok(envelope) => envelope,
@@ -3262,11 +3590,14 @@ async fn receive_quic_media_loop(
                             continue;
                         }
 
+                        let decode_started = Instant::now();
                         match decode_h264_desktop_frame(decoder.decoder.as_mut(), &envelope.payload)
                         {
                             Ok(decoded_frames) if !decoded_frames.is_empty() => {
+                                receiver_stats.record_elapsed("receiver.decode", decode_started);
                                 consecutive_decode_errors = 0;
                                 decoder_waits_for_keyframe = false;
+                                let record_started = Instant::now();
                                 record_lan_decoded_frames(
                                     &app_state,
                                     &session_id,
@@ -3278,9 +3609,13 @@ async fn receive_quic_media_loop(
                                     &envelope.payload,
                                 )
                                 .await;
+                                receiver_stats.record_elapsed("receiver.record", record_started);
                             }
-                            Ok(_) => {}
+                            Ok(_) => {
+                                receiver_stats.record_elapsed("receiver.decode", decode_started);
+                            }
                             Err(error) => {
+                                receiver_stats.record_elapsed("receiver.decode", decode_started);
                                 let error = if frame.is_keyframe {
                                     match try_decode_h264_keyframe_with_fallback(
                                         &app_state,
@@ -3295,6 +3630,7 @@ async fn receive_quic_media_loop(
                                             decoder = next_decoder;
                                             consecutive_decode_errors = 0;
                                             decoder_waits_for_keyframe = false;
+                                            let record_started = Instant::now();
                                             record_lan_decoded_frames(
                                                 &app_state,
                                                 &session_id,
@@ -3306,6 +3642,8 @@ async fn receive_quic_media_loop(
                                                 &envelope.payload,
                                             )
                                             .await;
+                                            receiver_stats
+                                                .record_elapsed("receiver.record", record_started);
                                             continue;
                                         }
                                         Err(fallback_error) => fallback_error,
@@ -3420,6 +3758,13 @@ async fn receive_quic_media_loop(
                 }
             }
         }
+        if let Some(metrics) = receiver_stats.take_stage_metrics(Instant::now()) {
+            app_state
+                .media_pipelines
+                .lock()
+                .await
+                .set_stage_metrics(session_id.clone(), metrics);
+        }
     }
 }
 
@@ -3510,6 +3855,15 @@ async fn record_lan_decoded_frames(
         let width = decoded_frame.width as u32;
         let height = decoded_frame.height as u32;
         let decoded_pixel_format = decoded_frame_pixel_format(&decoded_frame);
+        app_state
+            .media_pipelines
+            .lock()
+            .await
+            .record_stage_duration_ms(
+                session_id.clone(),
+                format!("receiver.format.{decoded_pixel_format}"),
+                1.0,
+            );
         let payload_hash = format!("fnv1a64:{:016x}", fnv1a64(encoded_payload));
         let preview_frame = if should_update_lan_preview(sequence) {
             match decoded_frame_to_preview_rgb24(decoded_frame) {
@@ -3557,63 +3911,130 @@ async fn record_lan_decoded_frames(
 }
 
 #[cfg(windows)]
+enum LanRenderTaskOutcome {
+    Rendered { duration_ms: f64 },
+    Dropped,
+    Idle,
+}
+
+#[cfg(windows)]
 async fn render_lan_decoded_frame(
     app_state: &Arc<AppState>,
     session_id: &SessionId,
     decoded_frame: &DecodedFrame,
 ) -> Result<()> {
-    let has_surface = app_state
-        .media_surface_renderers
+    let render_frame = decoded_frame_to_render_frame(decoded_frame.clone())?;
+    let enqueue = app_state
+        .media_render_queues
         .lock()
         .await
-        .session_surface_count(session_id)
-        > 0;
-    if !has_surface {
-        return Ok(());
+        .enqueue_latest(session_id.clone(), render_frame);
+    match enqueue {
+        MediaRenderQueueEnqueue::Start(frame) => {
+            spawn_lan_render_worker(app_state.clone(), session_id.clone(), frame);
+        }
+        MediaRenderQueueEnqueue::Queued { replaced } => {
+            let mut pipelines = app_state.media_pipelines.lock().await;
+            pipelines.record_queue_depth(session_id.clone(), 1);
+            if replaced {
+                pipelines.increment_dropped_frames(session_id.clone(), 1);
+            }
+        }
     }
+    Ok(())
+}
 
-    let render_frame = decoded_frame_to_render_frame(decoded_frame.clone())?;
-    let render_app_state = app_state.clone();
-    let render_session_id = session_id.clone();
+#[cfg(windows)]
+fn spawn_lan_render_worker(
+    app_state: Arc<AppState>,
+    session_id: SessionId,
+    first_frame: RenderFrame,
+) {
     tokio::spawn(async move {
-        let started = Instant::now();
-        let render_result = match render_app_state.media_surface_renderers.try_lock() {
-            Ok(mut renderers) => renderers
-                .render_frame(&render_session_id, &render_frame)
-                .map_err(anyhow::Error::msg),
-            Err(_) => {
-                render_app_state
-                    .media_pipelines
-                    .lock()
-                    .await
-                    .increment_dropped_frames(render_session_id, 1);
-                return;
-            }
-        };
-
-        match render_result {
-            Ok(rendered) if rendered > 0 => {
-                render_app_state
-                    .media_pipelines
-                    .lock()
-                    .await
-                    .record_stage_duration_ms(
-                        render_session_id,
-                        "render_present",
-                        started.elapsed().as_secs_f64() * 1000.0,
+        let mut frame = first_frame;
+        loop {
+            match render_lan_frame_once(app_state.clone(), session_id.clone(), frame).await {
+                Ok(LanRenderTaskOutcome::Rendered { duration_ms }) => {
+                    app_state
+                        .media_pipelines
+                        .lock()
+                        .await
+                        .record_stage_duration_ms(
+                            session_id.clone(),
+                            "render_present",
+                            duration_ms,
+                        );
+                }
+                Ok(LanRenderTaskOutcome::Dropped) => {
+                    app_state
+                        .media_pipelines
+                        .lock()
+                        .await
+                        .increment_dropped_frames(session_id.clone(), 1);
+                }
+                Ok(LanRenderTaskOutcome::Idle) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        session_id = %session_id.0,
+                        "LAN media receiver failed to present decoded frame"
                     );
+                }
             }
-            Ok(_) => {}
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    session_id = %render_session_id.0,
-                    "LAN media receiver failed to present decoded frame"
-                );
+
+            let next_frame = app_state
+                .media_render_queues
+                .lock()
+                .await
+                .take_next_or_finish(&session_id);
+            match next_frame {
+                Some(next_frame) => {
+                    app_state
+                        .media_pipelines
+                        .lock()
+                        .await
+                        .record_queue_depth(session_id.clone(), 0);
+                    frame = next_frame;
+                }
+                None => {
+                    app_state
+                        .media_pipelines
+                        .lock()
+                        .await
+                        .record_queue_depth(session_id.clone(), 0);
+                    break;
+                }
             }
         }
     });
-    Ok(())
+}
+
+#[cfg(windows)]
+async fn render_lan_frame_once(
+    app_state: Arc<AppState>,
+    session_id: SessionId,
+    frame: RenderFrame,
+) -> Result<LanRenderTaskOutcome> {
+    tokio::task::spawn_blocking(move || {
+        let started = Instant::now();
+        match app_state.media_surface_renderers.try_lock() {
+            Ok(mut renderers) => {
+                let rendered = renderers
+                    .render_frame(&session_id, &frame)
+                    .map_err(anyhow::Error::msg)?;
+                if rendered > 0 {
+                    Ok(LanRenderTaskOutcome::Rendered {
+                        duration_ms: started.elapsed().as_secs_f64() * 1000.0,
+                    })
+                } else {
+                    Ok(LanRenderTaskOutcome::Idle)
+                }
+            }
+            Err(_) => Ok(LanRenderTaskOutcome::Dropped),
+        }
+    })
+    .await
+    .context("LAN media receiver render worker stopped")?
 }
 
 #[cfg(windows)]
@@ -3773,7 +4194,10 @@ fn preferred_lan_receiver_decoder_candidates() -> Vec<&'static str> {
         .as_str()
     {
         "software" | "h264_software" | "openh264" => vec!["h264_software"],
-        "nvdec" => vec!["nvdec"],
+        "nvdec" | "nvdec_d3d11_shared" | "d3d11_shared" => {
+            vec!["nvdec_d3d11_shared", "nvdec"]
+        }
+        "nvdec_cpu" | "nvdec_cpu_nv12" => vec!["nvdec"],
         _ => default_lan_receiver_decoder_candidates().to_vec(),
     }
 }
@@ -3807,7 +4231,7 @@ fn prioritize_lan_receiver_decoder_candidates(
 
 #[cfg(windows)]
 fn default_lan_receiver_decoder_candidates() -> &'static [&'static str] {
-    &["nvdec", "h264_software"]
+    &["nvdec_d3d11_shared", "nvdec", "h264_software"]
 }
 
 #[cfg(target_os = "linux")]
@@ -4785,6 +5209,54 @@ fn is_valid_discovery_packet(magic: &str, app_id: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn lan_discovery_config_reads_env_port_and_probe_endpoints() {
+        let config = LanDiscoveryConfig::from_env_lookup(|key| match key {
+            "MRD_LAN_DISCOVERY_PORT" => Some("21216".to_string()),
+            "MRD_LAN_DISCOVERY_PROBE_ENDPOINTS" => {
+                Some("127.0.0.1:21217, 127.0.0.1:21218".to_string())
+            }
+            _ => None,
+        })
+        .expect("env config");
+
+        assert_eq!(config.discovery_port, 21216);
+        assert_eq!(
+            config.probe_endpoints,
+            vec![
+                "127.0.0.1:21217".parse::<SocketAddr>().unwrap(),
+                "127.0.0.1:21218".parse::<SocketAddr>().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn lan_media_test_impairment_is_disabled_by_default() {
+        let config = LanMediaTestImpairment::from_env_lookup(|_| None).expect("default config");
+        assert!(!config.enabled());
+        assert_eq!(config.effective_datagram_size(1200), 1200);
+    }
+
+    #[test]
+    fn lan_media_test_impairment_uses_seeded_loss_decisions() {
+        let mut impairment = LanMediaTestImpairment::from_env_lookup(|key| match key {
+            "MRD_LAN_TEST_IMPAIRMENT_LOSS_PCT" => Some("100".to_string()),
+            "MRD_LAN_TEST_IMPAIRMENT_BASE_DELAY_MS" => Some("2".to_string()),
+            "MRD_LAN_TEST_IMPAIRMENT_JITTER_MS" => Some("3".to_string()),
+            "MRD_LAN_TEST_IMPAIRMENT_MTU_BYTES" => Some("900".to_string()),
+            "MRD_LAN_TEST_IMPAIRMENT_SEED" => Some("42".to_string()),
+            _ => None,
+        })
+        .expect("impairment config");
+
+        assert!(impairment.enabled());
+        assert_eq!(impairment.effective_datagram_size(1200), 900);
+        let decision = impairment.next_datagram_decision();
+        assert!(decision.drop_datagram);
+        assert!(decision.delay >= Duration::from_millis(2));
+        assert!(decision.delay <= Duration::from_millis(5));
+    }
+
     #[tokio::test]
     async fn snapshot_exposes_recent_peer() {
         let state = LanDiscoveryState::default();
@@ -5126,7 +5598,7 @@ mod tests {
 
         let mut snapshot = controller_state.probes.lock().await.snapshot(&session_id);
         for _ in 0..40 {
-            if snapshot.frames_received > 0 {
+            if snapshot.frames_decoded > 0 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -5151,10 +5623,9 @@ mod tests {
         assert_eq!(snapshot.media_probe_target_fps, Some(60));
         assert_eq!(snapshot.media_probe_target_bitrate_mbps, Some(5));
         assert!(snapshot.media_probe_payload_bytes.unwrap_or_default() > 0);
-        assert!(snapshot
-            .latest_frame_data_url
-            .as_deref()
-            .is_some_and(|value| value.starts_with("data:image/png;base64,")));
+        if let Some(data_url) = snapshot.latest_frame_data_url.as_deref() {
+            assert!(data_url.starts_with("data:image/png;base64,"));
+        }
         let session_snapshot = controller_state
             .sessions
             .lock()
@@ -5443,6 +5914,15 @@ mod tests {
         );
 
         assert_eq!(candidates, vec!["h264_software", "nvdec"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_receiver_decoder_defaults_to_d3d11_shared_nvdec() {
+        assert_eq!(
+            default_lan_receiver_decoder_candidates(),
+            &["nvdec_d3d11_shared", "nvdec", "h264_software"]
+        );
     }
 
     fn test_quic_au_frame(frame_id: u32, is_keyframe: bool) -> QuicAuFrame {
@@ -6143,6 +6623,7 @@ mod tests {
                 p50_ms: Some(1.2),
                 p95_ms: Some(2.4),
             }],
+            test_impairment: None,
         };
 
         let encoded = encode_lan_sender_stats_datagram(&payload).unwrap();
@@ -6198,11 +6679,22 @@ mod tests {
     }
 
     #[test]
-    fn lan_quic_media_routes_fragmented_v3_frames_over_reliable_stream() {
-        assert!(should_send_access_unit_as_reliable_frame(true, true, 2));
-        assert!(!should_send_access_unit_as_reliable_frame(true, true, 1));
-        assert!(!should_send_access_unit_as_reliable_frame(true, false, 2));
-        assert!(!should_send_access_unit_as_reliable_frame(false, true, 2));
+    fn lan_quic_media_routes_fragmented_v3_frames_over_datagrams_by_default() {
+        assert!(!should_send_access_unit_as_reliable_frame(
+            true, true, 2, false
+        ));
+        assert!(should_send_access_unit_as_reliable_frame(
+            true, true, 2, true
+        ));
+        assert!(!should_send_access_unit_as_reliable_frame(
+            true, true, 1, true
+        ));
+        assert!(!should_send_access_unit_as_reliable_frame(
+            true, false, 2, true
+        ));
+        assert!(!should_send_access_unit_as_reliable_frame(
+            false, true, 2, true
+        ));
     }
 
     #[test]

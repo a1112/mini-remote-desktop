@@ -214,6 +214,30 @@ describe("E2ETestPage LAN automation", () => {
       );
     });
   });
+
+  it("passes an exact autorun capture source id through to LAN automation", async () => {
+    const mockInvoke = installSuccessfulLanAutomationMock();
+
+    render(
+      <MemoryRouter
+        initialEntries={[
+          "/test/e2e?autorun=lan-e2e&targetDeviceId=agent-device&transport=quic&captureSourceId=window-codex&captureSourceKind=display_shared",
+        ]}
+      >
+        <E2ETestPage />
+      </MemoryRouter>
+    );
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "ipc_select_remote_capture_source",
+        expect.objectContaining({
+          sessionId: expect.stringMatching(/^lan-e2e-agent-device-/),
+          sourceId: "window-codex",
+        })
+      );
+    });
+  });
 });
 
 function installSuccessfulLanAutomationMock() {
@@ -321,22 +345,48 @@ function installSuccessfulLanAutomationMock() {
           process_id: 0,
           app_name: null,
         },
+        {
+          id: "window-codex",
+          platform: "windows",
+          source_kind: "window",
+          title: "Codex",
+          class_name: "Chrome_WidgetWin_1",
+          width: 1280,
+          height: 720,
+          process_id: 100,
+          app_name: "Codex",
+        },
       ]);
     }
     if (command === "ipc_select_remote_capture_source") {
+      const sourceId = args?.sourceId as string | undefined;
+      const selectedSource =
+        sourceId === "window-codex"
+          ? {
+              id: "window-codex",
+              platform: "windows",
+              source_kind: "window",
+              title: "Codex",
+              class_name: "Chrome_WidgetWin_1",
+              width: 1280,
+              height: 720,
+              process_id: 100,
+              app_name: "Codex",
+            }
+          : {
+              id: "display-shared",
+              platform: "windows",
+              source_kind: "display_shared",
+              title: "DISPLAY1",
+              class_name: "Monitor",
+              width: 2560,
+              height: 1440,
+              process_id: 0,
+              app_name: null,
+            };
       return Promise.resolve({
         session_id: "lan-e2e-agent-device-1000",
-        source: {
-          id: "display-shared",
-          platform: "windows",
-          source_kind: "display_shared",
-          title: "DISPLAY1",
-          class_name: "Monitor",
-          width: 2560,
-          height: 1440,
-          process_id: 0,
-          app_name: null,
-        },
+        source: selectedSource,
         status: "selected",
         reason: null,
       });

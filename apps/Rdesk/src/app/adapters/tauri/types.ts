@@ -623,6 +623,18 @@ export interface MediaStageMetrics {
   p95_ms?: number | null;
 }
 
+export interface MediaTestImpairmentSnapshot {
+  loss_pct: number;
+  base_delay_ms: number;
+  jitter_ms: number;
+  mtu_bytes?: number | null;
+  seed: number;
+  datagrams_sent: number;
+  datagrams_dropped: number;
+  datagrams_delayed: number;
+  datagrams_fragmented_by_mtu: number;
+}
+
 export interface MediaPipelineSnapshot {
   session_id: string;
   attached_surfaces: AttachedRenderSurface[];
@@ -631,6 +643,7 @@ export interface MediaPipelineSnapshot {
   queue_depth: number;
   dropped_frames: number;
   stage_metrics: MediaStageMetrics[];
+  test_impairment?: MediaTestImpairmentSnapshot | null;
 }
 
 export interface CaptureSource {

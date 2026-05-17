@@ -1,4 +1,4 @@
-use mrd_decode::{available_decoder_descriptors, create_decoder};
+use mrd_decode::{available_decoder_descriptors, create_decoder, PixelFormat};
 use mrd_decode_nvdec::probe_h264_available;
 use mrd_pipeline_core::DecodedFrameData;
 use openh264::{
@@ -14,6 +14,19 @@ fn nvdec_descriptor_is_listed() {
         .expect("nvdec descriptor");
 
     assert_eq!(descriptor.id, "nvdec");
+}
+
+#[test]
+fn nvdec_d3d11_shared_descriptor_is_listed() {
+    let descriptor = available_decoder_descriptors()
+        .into_iter()
+        .find(|descriptor| descriptor.id == "nvdec_d3d11_shared")
+        .expect("nvdec d3d11 shared descriptor");
+
+    assert_eq!(descriptor.id, "nvdec_d3d11_shared");
+    assert!(descriptor
+        .output_formats
+        .contains(&PixelFormat::D3d11Texture));
 }
 
 #[test]

@@ -82,6 +82,8 @@ export interface LanE2EAutomationOptions {
   stopOnComplete?: boolean;
   requestedProfile?: MediaProfile;
   displayModePolicy?: "none" | "temporary" | "required";
+  preferredCaptureSourceId?: string;
+  preferredCaptureSourceKind?: string;
   faultPlan?: CrossDeviceFaultPlan;
   createSessionId?: () => string;
   now?: () => number;
@@ -357,7 +359,12 @@ export async function runLanE2EAutomation(
     stage("pairing", "completed");
 
     stage("capture_source", "started");
-    captureSourceSelection = await selectRemoteCaptureSourceForSession(commands, sessionId);
+    captureSourceSelection = await selectRemoteCaptureSourceForSession(
+      commands,
+      sessionId,
+      options.preferredCaptureSourceId,
+      options.preferredCaptureSourceKind
+    );
     captureSource = captureSourceSelection.source;
     stage("capture_source", "completed");
 
@@ -386,7 +393,8 @@ export async function runLanE2EAutomation(
           captureSourceSelection = await selectRemoteCaptureSourceForSession(
             commands,
             sessionId,
-            captureSource.id
+            options.preferredCaptureSourceId ?? captureSource.id,
+            options.preferredCaptureSourceKind
           );
           captureSource = captureSourceSelection.source;
           stage("capture_source", "completed");
@@ -663,14 +671,18 @@ function displayModeScore(
 async function selectRemoteCaptureSourceForSession(
   commands: LanE2EAutomationCommands,
   sessionId: string,
-  preferredSourceId?: string
+  preferredSourceId?: string,
+  preferredSourceKind?: string
 ): Promise<CaptureSourceSelection> {
   const sources = await unwrap(
     commands.ipcListRemoteCaptureSources(sessionId, false, 24),
     "capture_source_failed"
   );
+  const normalizedPreferredSourceId = preferredSourceId?.trim().toLowerCase();
   const preferredSource =
-    sources.find((source) => source.id === preferredSourceId) ?? pickPreferredCaptureSource(sources);
+    (normalizedPreferredSourceId
+      ? sources.find((source) => source.id.toLowerCase() === normalizedPreferredSourceId)
+      : undefined) ?? pickPreferredCaptureSource(sources, preferredSourceKind);
   if (!preferredSource) {
     throw new LanE2ECommandError(
       "capture_source_failed",
@@ -691,7 +703,15 @@ async function selectRemoteCaptureSourceForSession(
   return selection;
 }
 
-function pickPreferredCaptureSource(sources: CaptureSource[]): CaptureSource | undefined {
+function pickPreferredCaptureSource(
+  sources: CaptureSource[],
+  preferredSourceKind?: string
+): CaptureSource | undefined {
+  const normalizedPreferredKind = preferredSourceKind?.trim();
+  if (normalizedPreferredKind) {
+    const matchingKind = sources.find((source) => source.source_kind === normalizedPreferredKind);
+    if (matchingKind) return matchingKind;
+  }
   return (
     sources.find((source) => source.source_kind === "display_shared") ??
     sources.find((source) => source.source_kind === "display") ??

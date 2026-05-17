@@ -124,6 +124,21 @@ pub struct MediaStageMetrics {
     pub p95_ms: Option<f64>,
 }
 
+/// Synthetic transport impairment settings and counters for test runs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MediaTestImpairmentSnapshot {
+    pub loss_pct: f64,
+    pub base_delay_ms: u64,
+    pub jitter_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtu_bytes: Option<u32>,
+    pub seed: u64,
+    pub datagrams_sent: u64,
+    pub datagrams_dropped: u64,
+    pub datagrams_delayed: u64,
+    pub datagrams_fragmented_by_mtu: u64,
+}
+
 /// Runtime state for a session media pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MediaPipelineSnapshot {
@@ -136,6 +151,8 @@ pub struct MediaPipelineSnapshot {
     pub queue_depth: u32,
     pub dropped_frames: u64,
     pub stage_metrics: Vec<MediaStageMetrics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_impairment: Option<MediaTestImpairmentSnapshot>,
 }
 
 /// A capture source that can be selected for a remote session.

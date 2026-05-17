@@ -10,7 +10,7 @@ use image::{codecs::png::PngEncoder, ColorType, ImageEncoder};
 use mrd_application::ports::SessionSnapshot;
 use mrd_ipc::{
     AttachedRenderSurface, CaptureSourceSelection, MediaPipelineSnapshot, MediaProfileNegotiation,
-    MediaStageMetrics,
+    MediaStageMetrics, MediaTestImpairmentSnapshot,
 };
 use mrd_proto::{DeviceId, SessionId};
 #[cfg(windows)]
@@ -219,6 +219,62 @@ struct MediaPipelineState {
     dropped_frames: u64,
     stage_samples: HashMap<String, VecDeque<f64>>,
     stage_summaries: HashMap<String, MediaStageMetrics>,
+    test_impairment: Option<MediaTestImpairmentSnapshot>,
+}
+
+#[cfg(windows)]
+#[derive(Debug, PartialEq, Eq)]
+pub enum MediaRenderQueueEnqueue {
+    Start(RenderFrame),
+    Queued { replaced: bool },
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct MediaRenderQueueState {
+    running: bool,
+    pending: Option<RenderFrame>,
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+pub struct MediaRenderQueueRegistry {
+    queues: HashMap<SessionId, MediaRenderQueueState>,
+}
+
+#[cfg(windows)]
+impl MediaRenderQueueRegistry {
+    pub fn enqueue_latest(
+        &mut self,
+        session_id: SessionId,
+        frame: RenderFrame,
+    ) -> MediaRenderQueueEnqueue {
+        let state = self.queues.entry(session_id).or_default();
+        if !state.running {
+            state.running = true;
+            return MediaRenderQueueEnqueue::Start(frame);
+        }
+
+        let replaced = state.pending.replace(frame).is_some();
+        MediaRenderQueueEnqueue::Queued { replaced }
+    }
+
+    pub fn take_next_or_finish(&mut self, session_id: &SessionId) -> Option<RenderFrame> {
+        let Some(state) = self.queues.get_mut(session_id) else {
+            return None;
+        };
+
+        if let Some(frame) = state.pending.take() {
+            return Some(frame);
+        }
+
+        state.running = false;
+        None
+    }
+
+    pub fn remove(&mut self, session_id: &SessionId) {
+        self.queues.remove(session_id);
+    }
 }
 
 impl MediaPipelineRegistry {
@@ -289,6 +345,17 @@ impl MediaPipelineRegistry {
         }
     }
 
+    pub fn set_test_impairment(
+        &mut self,
+        session_id: SessionId,
+        impairment: Option<MediaTestImpairmentSnapshot>,
+    ) {
+        self.pipelines
+            .entry(session_id)
+            .or_default()
+            .test_impairment = impairment;
+    }
+
     pub fn snapshot(&self, session_id: &SessionId) -> MediaPipelineSnapshot {
         let state = self.pipelines.get(session_id);
         let stage_metrics = state.map(media_pipeline_stage_metrics).unwrap_or_default();
@@ -302,6 +369,7 @@ impl MediaPipelineRegistry {
             queue_depth: state.map_or(0, |state| state.queue_depth),
             dropped_frames: state.map_or(0, |state| state.dropped_frames),
             stage_metrics,
+            test_impairment: state.and_then(|state| state.test_impairment.clone()),
         }
     }
 
@@ -842,6 +910,9 @@ pub struct AppState {
     /// Native renderer instances keyed by receiver session/surface.
     #[cfg(windows)]
     pub media_surface_renderers: Arc<Mutex<MediaSurfaceRendererRegistry>>,
+    /// Drop-oldest receiver render queues keyed by session.
+    #[cfg(windows)]
+    pub media_render_queues: Arc<Mutex<MediaRenderQueueRegistry>>,
     /// Abort handles for active media tasks keyed by session.
     pub media_tasks: Arc<Mutex<MediaTaskRegistry>>,
 }
@@ -854,12 +925,24 @@ impl AppState {
     }
 
     pub fn with_tray(tray: TrayPortRef) -> Self {
+        Self::with_tray_and_lan_discovery_config(
+            tray,
+            crate::lan_discovery::LanDiscoveryConfig::default(),
+        )
+    }
+
+    pub fn with_tray_and_lan_discovery_config(
+        tray: TrayPortRef,
+        lan_discovery_config: crate::lan_discovery::LanDiscoveryConfig,
+    ) -> Self {
         Self {
             sessions: Arc::new(Mutex::new(SessionRegistry::default())),
             devices: Arc::new(Mutex::new(DeviceRegistry::default())),
             shell: Arc::new(Mutex::new(ShellState::default())),
             tray,
-            lan_discovery: Arc::new(crate::lan_discovery::LanDiscoveryState::default()),
+            lan_discovery: Arc::new(crate::lan_discovery::LanDiscoveryState::new(
+                lan_discovery_config,
+            )),
             probes: Arc::new(Mutex::new(ProbeRegistry::default())),
             media_profiles: Arc::new(Mutex::new(MediaProfileRegistry::default())),
             capture_sources: Arc::new(Mutex::new(CaptureSourceRegistry::default())),
@@ -870,6 +953,8 @@ impl AppState {
             media_pipelines: Arc::new(Mutex::new(MediaPipelineRegistry::default())),
             #[cfg(windows)]
             media_surface_renderers: Arc::new(Mutex::new(MediaSurfaceRendererRegistry::default())),
+            #[cfg(windows)]
+            media_render_queues: Arc::new(Mutex::new(MediaRenderQueueRegistry::default())),
             media_tasks: Arc::new(Mutex::new(MediaTaskRegistry::default())),
         }
     }
@@ -933,6 +1018,11 @@ impl AppState {
     #[cfg(windows)]
     pub fn media_surface_renderers(&self) -> Arc<Mutex<MediaSurfaceRendererRegistry>> {
         self.media_surface_renderers.clone()
+    }
+
+    #[cfg(windows)]
+    pub fn media_render_queues(&self) -> Arc<Mutex<MediaRenderQueueRegistry>> {
+        self.media_render_queues.clone()
     }
 
     /// Get a clone of the media task registry.
@@ -1214,6 +1304,36 @@ mod tests {
                 && metric.p50_ms == Some(2.5)
                 && metric.p95_ms == Some(4.5)
         }));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn media_render_queue_keeps_latest_frame_while_worker_is_running() {
+        let mut registry = MediaRenderQueueRegistry::default();
+        let session_id = SessionId("render-queue-session".to_string());
+        let first = RenderFrame::from_rgb24(1, 1, vec![1, 2, 3]);
+        let second = RenderFrame::from_rgb24(1, 1, vec![4, 5, 6]);
+        let third = RenderFrame::from_rgb24(1, 1, vec![7, 8, 9]);
+
+        match registry.enqueue_latest(session_id.clone(), first.clone()) {
+            MediaRenderQueueEnqueue::Start(frame) => assert_eq!(frame, first),
+            other => panic!("expected render worker start, got {other:?}"),
+        }
+        assert_eq!(
+            registry.enqueue_latest(session_id.clone(), second),
+            MediaRenderQueueEnqueue::Queued { replaced: false }
+        );
+        assert_eq!(
+            registry.enqueue_latest(session_id.clone(), third.clone()),
+            MediaRenderQueueEnqueue::Queued { replaced: true }
+        );
+
+        assert_eq!(registry.take_next_or_finish(&session_id), Some(third));
+        assert_eq!(registry.take_next_or_finish(&session_id), None);
+        match registry.enqueue_latest(session_id.clone(), first.clone()) {
+            MediaRenderQueueEnqueue::Start(frame) => assert_eq!(frame, first),
+            other => panic!("expected render worker restart, got {other:?}"),
+        }
     }
 
     #[test]

@@ -93,6 +93,7 @@ function Convert-CrossReportToCanaryRow {
   }
   $classification = Get-CrossCanaryClassification -Report $Report -Profile $Profile -SelectedProfile $selected
   $status = Get-CrossCanaryStatus -Report $Report -Classification $classification
+  $displayLimitReason = Get-CanaryDisplayRefreshLimitReason -Report $Report -Profile $Profile
 
   [pscustomobject]@{
     id = $Profile.id
@@ -113,8 +114,10 @@ function Convert-CrossReportToCanaryRow {
     dropped_frames = [int64](Select-CanaryValue (Select-CanaryValue $pipeline.dropped_frames $probe.frames_dropped) 0)
     queue_depth = $pipeline.queue_depth
     stage_p95_ms = Convert-MediaStageMetricsToP95Map -StageMetrics $pipeline.stage_metrics
+    test_impairment = $pipeline.test_impairment
+    display_mode = $Report.displayModeChange
     raw_report_path = $ReportPath
-    error_message = $Report.errorMessage
+    error_message = Select-CanaryValue $Report.errorMessage $displayLimitReason
   }
 }
 
@@ -124,11 +127,11 @@ function Get-CrossCanaryStatus {
     [Parameter(Mandatory = $true)][string]$Classification
   )
 
-  if ($Report.status -eq "completed") { return "completed" }
-  if ($Report.status -eq "skipped") { return "skipped" }
-  if ($Classification -in @("unsupported", "profile_downgraded", "peer_version_mismatch")) {
+  if ($Classification -in @("unsupported", "profile_downgraded", "peer_version_mismatch", "display_refresh_limited")) {
     return "skipped"
   }
+  if ($Report.status -eq "completed") { return "completed" }
+  if ($Report.status -eq "skipped") { return "skipped" }
   return [string]$Report.status
 }
 
@@ -136,9 +139,12 @@ function Get-CrossCanaryClassification {
   param(
     [Parameter(Mandatory = $true)]$Report,
     [Parameter(Mandatory = $true)]$Profile,
-    [Parameter(Mandatory = $true)]$SelectedProfile
+  [Parameter(Mandatory = $true)]$SelectedProfile
   )
 
+  if (Get-CanaryDisplayRefreshLimitReason -Report $Report -Profile $Profile) {
+    return "display_refresh_limited"
+  }
   if (-not (Test-CanaryProfileMatch -Expected $Profile -Actual $SelectedProfile)) {
     return "profile_downgraded"
   }
@@ -168,6 +174,34 @@ function Get-CrossCanaryClassification {
       return "failed"
     }
   }
+}
+
+function Get-CanaryDisplayRefreshLimitReason {
+  param(
+    [Parameter(Mandatory = $true)]$Report,
+    [Parameter(Mandatory = $true)]$Profile
+  )
+
+  $active = $Report.displayModeChange.active
+  if (-not $active -or -not $active.refresh_hz) {
+    return $null
+  }
+
+  $activeRefreshHz = [int]$active.refresh_hz
+  $requestedFps = [int]$Profile.fps
+  if ($requestedFps -le 0 -or $activeRefreshHz -le 0 -or $activeRefreshHz -ge $requestedFps) {
+    return $null
+  }
+
+  $activeWidth = [int](Select-CanaryValue $active.width 0)
+  $activeHeight = [int](Select-CanaryValue $active.height 0)
+  $requestedWidth = [int](Select-CanaryValue $Profile.width 0)
+  $requestedHeight = [int](Select-CanaryValue $Profile.height 0)
+  if ($activeWidth -gt 0 -and $activeHeight -gt 0 -and ($activeWidth -ne $requestedWidth -or $activeHeight -ne $requestedHeight)) {
+    return $null
+  }
+
+  "Active display mode $($activeWidth)x$($activeHeight)@$($activeRefreshHz)Hz is below requested $($requestedFps) FPS"
 }
 
 function Convert-MediaStageMetricsToP95Map {
@@ -231,6 +265,19 @@ function Compare-PairedLanCanaryRows {
     $cross = @($CrossRows | Where-Object { $_.id -eq $local.id } | Select-Object -First 1)[0]
     $localFps = [double](Select-CanaryValue $local.fps_observed 0)
     $localBaselineFps = [double](Get-CanaryComparisonBaselineFps -LocalRow $local)
+    if ($local.classification -eq "display_refresh_limited") {
+      $results += [pscustomobject]@{
+        id = $local.id
+        comparable = $false
+        status = "display_refresh_limited"
+        local_fps = $localFps
+        local_baseline_fps = $localBaselineFps
+        cross_fps = 0.0
+        fps_ratio = $null
+        reason = $local.error_message
+      }
+      continue
+    }
     if (-not $cross) {
       $results += [pscustomobject]@{
         id = $local.id
@@ -241,6 +288,20 @@ function Compare-PairedLanCanaryRows {
         cross_fps = 0.0
         fps_ratio = $null
         reason = "Cross-device result is missing"
+      }
+      continue
+    }
+
+    if ($cross.classification -eq "display_refresh_limited") {
+      $results += [pscustomobject]@{
+        id = $local.id
+        comparable = $false
+        status = "display_refresh_limited"
+        local_fps = $localFps
+        local_baseline_fps = $localBaselineFps
+        cross_fps = [double](Select-CanaryValue $cross.fps_observed 0)
+        fps_ratio = $null
+        reason = $cross.error_message
       }
       continue
     }

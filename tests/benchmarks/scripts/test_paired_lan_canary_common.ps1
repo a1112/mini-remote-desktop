@@ -97,6 +97,40 @@ $peerMissingRow = Convert-CrossReportToCanaryRow -Profile $profiles[0] -Report $
 Assert-Equal $peerMissingRow.status "skipped" "Missing LAN peer is an environment skip"
 Assert-Equal $peerMissingRow.classification "unsupported" "Missing LAN peer is classified as unsupported"
 
+$displayLimitedReport = [pscustomobject]@{
+  status = "completed"
+  failureReason = $null
+  errorMessage = $null
+  sampleObservedFps = 144.0
+  displayModeChange = [pscustomobject]@{
+    active = [pscustomobject]@{ width = 1920; height = 1080; refresh_hz = 144 }
+  }
+  probeSnapshot = [pscustomobject]@{
+    current_fps = 144.0
+    frames_decoded = 1440
+    frames_dropped = 0
+    media_probe_width = 1920
+    media_probe_height = 1080
+    media_probe_target_fps = 249
+    media_probe_target_bitrate_mbps = 20
+  }
+  mediaPipelineSnapshot = [pscustomobject]@{
+    dropped_frames = 0
+    queue_depth = 0
+    stage_metrics = @()
+    test_impairment = $null
+  }
+  sessionSnapshot = [pscustomobject]@{ state = "streaming" }
+}
+$displayLimitedRow = Convert-CrossReportToCanaryRow -Profile $profiles[4] -Report $displayLimitedReport -ReportPath "raw/cross-1080p249.json"
+Assert-Equal $displayLimitedRow.status "skipped" "Display refresh capped profiles are environment skips"
+Assert-Equal $displayLimitedRow.classification "display_refresh_limited" "Display refresh cap is classified explicitly"
+Assert-True ($displayLimitedRow.error_message -match "144Hz") "Display refresh cap carries an actionable reason"
+
+$displayLimitedComparison = Compare-PairedLanCanaryRows -LocalRows @($displayLimitedRow) -CrossRows @($crossRow) -RatioThreshold 0.8
+Assert-Equal $displayLimitedComparison[0].status "display_refresh_limited" "Display-limited local rows are not compared"
+Assert-True (-not $displayLimitedComparison[0].comparable) "Display-limited local rows are non-comparable"
+
 $sampleFpsReport = [pscustomobject]@{
   status = "completed"
   failureReason = $null
@@ -115,10 +149,22 @@ $sampleFpsReport = [pscustomobject]@{
     dropped_frames = 0
     queue_depth = 0
     stage_metrics = @()
+    test_impairment = [pscustomobject]@{
+      loss_pct = 1.0
+      base_delay_ms = 2
+      jitter_ms = 3
+      mtu_bytes = 1200
+      seed = 42
+      datagrams_sent = 100
+      datagrams_dropped = 1
+      datagrams_delayed = 80
+      datagrams_fragmented_by_mtu = 10
+    }
   }
   sessionSnapshot = [pscustomobject]@{ state = "streaming" }
 }
 $sampleFpsRow = Convert-CrossReportToCanaryRow -Profile $profiles[0] -Report $sampleFpsReport -ReportPath "raw/cross-1080p60.json"
 Assert-Equal $sampleFpsRow.fps_observed 57.0 "Cross report prefers sample-window FPS over cumulative probe FPS"
+Assert-Equal $sampleFpsRow.test_impairment.datagrams_dropped 1 "Cross row carries media impairment counters"
 
 Write-Host "paired LAN canary common tests passed"

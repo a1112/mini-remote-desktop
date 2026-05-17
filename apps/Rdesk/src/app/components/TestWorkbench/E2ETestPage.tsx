@@ -599,6 +599,10 @@ function buildLanAutomationOptionsFromSearchParams(
     minFps: parsePositiveNumber(searchParams.get("minFps")),
     stopOnComplete: parseOptionalBoolean(searchParams.get("stopOnComplete")),
     displayModePolicy: parseDisplayModePolicy(searchParams.get("displayModePolicy")),
+    preferredCaptureSourceId:
+      searchParams.get("captureSourceId") ?? searchParams.get("sourceId") ?? undefined,
+    preferredCaptureSourceKind:
+      searchParams.get("captureSourceKind") ?? searchParams.get("captureKind") ?? undefined,
     requestedProfile: parseRequestedProfile(searchParams),
   };
 }
