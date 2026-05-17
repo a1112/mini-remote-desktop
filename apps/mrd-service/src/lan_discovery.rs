@@ -56,6 +56,7 @@ const LAN_MEDIA_TARGET_BITRATE_MBPS: u32 = 64;
 const LAN_QUIC_FALLBACK_DATAGRAM_BYTES: usize = 1_200;
 const LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES: usize = 4 * 1024 * 1024;
 const LAN_QUIC_RELIABLE_WHOLE_FRAME_MIN_PIXELS: u32 = 2560 * 1440;
+const LAN_QUIC_RELIABLE_MEDIA_RETRY_DELAY: Duration = Duration::from_millis(10);
 const LAN_QUIC_MEDIA_TRANSPORT: &str = "quic_datagram";
 const LAN_QUIC_MEDIA_PROFILE_TRANSPORT: &str = "quic_datagram_2k144";
 const LAN_QUIC_MEDIA_V2_TRANSPORT: &str = "quic_datagram_media_v2";
@@ -3433,7 +3434,7 @@ async fn receive_quic_media_loop(
                         .read_reliable_message(LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES)
                         .await
                 };
-                let should_stop = result.is_err();
+                let should_retry = result.is_err();
                 if tx
                     .send(result.map_err(|error| error.to_string()))
                     .await
@@ -3441,8 +3442,8 @@ async fn receive_quic_media_loop(
                 {
                     break;
                 }
-                if should_stop {
-                    break;
+                if should_retry {
+                    tokio::time::sleep(LAN_QUIC_RELIABLE_MEDIA_RETRY_DELAY).await;
                 }
             }
         });
@@ -3479,11 +3480,10 @@ async fn receive_quic_media_loop(
                         match message {
                             Some(Ok(message)) => message,
                             Some(Err(error)) => {
-                                reliable_media_rx = None;
                                 tracing::warn!(
                                     %error,
                                     session_id = %session_id.0,
-                                    "LAN QUIC reliable media reader disabled"
+                                    "LAN QUIC reliable media reader retrying"
                                 );
                                 continue;
                             }
@@ -3502,11 +3502,10 @@ async fn receive_quic_media_loop(
                 match rx.recv().await {
                     Some(Ok(message)) => message,
                     Some(Err(error)) => {
-                        reliable_media_rx = None;
                         tracing::warn!(
                             %error,
                             session_id = %session_id.0,
-                            "LAN QUIC reliable media reader disabled"
+                            "LAN QUIC reliable media reader retrying"
                         );
                         continue;
                     }
