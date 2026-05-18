@@ -16,6 +16,7 @@ function Get-PairedLanCanaryProfiles {
     [pscustomobject]@{ id = "1080p60"; width = 1920; height = 1080; fps = 60; bitrate_mbps = $BitrateMbps; duration_secs = $DurationSecs },
     [pscustomobject]@{ id = "2k60"; width = 2560; height = 1440; fps = 60; bitrate_mbps = $BitrateMbps; duration_secs = $DurationSecs },
     [pscustomobject]@{ id = "2k144"; width = 2560; height = 1440; fps = 144; bitrate_mbps = $BitrateMbps; duration_secs = $DurationSecs },
+    [pscustomobject]@{ id = "2k144_adaptive"; width = 2560; height = 1440; fps = 144; bitrate_mbps = 80; duration_secs = $DurationSecs; adaptive = $true },
     [pscustomobject]@{ id = "1600p165"; width = 2560; height = 1600; fps = 165; bitrate_mbps = 80; duration_secs = $DurationSecs },
     [pscustomobject]@{ id = "1600p165_120mbps"; width = 2560; height = 1600; fps = 165; bitrate_mbps = 120; duration_secs = $DurationSecs },
     [pscustomobject]@{ id = "1080p144"; width = 1920; height = 1080; fps = 144; bitrate_mbps = $BitrateMbps; duration_secs = $DurationSecs },
@@ -49,6 +50,7 @@ function Convert-LocalSummaryToCanaryRow {
 
   $status = if ($Summary.run_passed) { "completed" } else { "failed" }
   $classification = if ($Summary.run_passed) { "completed" } elseif ($Summary.fps_observed -lt ($Profile.fps * 0.8)) { "threshold_miss" } else { "failed" }
+  $localDropped = [int64](Select-CanaryValue $Summary.dropped_frames 0)
 
   [pscustomobject]@{
     id = $Profile.id
@@ -66,7 +68,11 @@ function Convert-LocalSummaryToCanaryRow {
     first_frame_seen = [bool]$Summary.first_frame_seen
     first_frame_time_ms = $Summary.first_frame_time_ms
     decoded_frames = $null
-    dropped_frames = [int64](Select-CanaryValue $Summary.dropped_frames 0)
+    dropped_frames = $localDropped
+    probe_dropped_frames = $localDropped
+    pipeline_dropped_frames = $localDropped
+    render_queue_replacements = 0
+    render_lock_drops = 0
     queue_depth = $null
     stage_p95_ms = [pscustomobject]@{
       encode = $Summary.encode_total_p95_ms
@@ -89,6 +95,7 @@ function Convert-CrossReportToCanaryRow {
 
   $probe = $Report.probeSnapshot
   $pipeline = $Report.mediaPipelineSnapshot
+  $adaptation = if ($Report.mediaAdaptationSnapshot) { $Report.mediaAdaptationSnapshot } elseif ($pipeline) { $pipeline.adaptation } else { $null }
   $selected = if ($probe -and $probe.media_probe_width -and $probe.media_probe_height -and $probe.media_probe_target_fps) {
     New-CanarySelectedProfile -Width $probe.media_probe_width -Height $probe.media_probe_height -Fps $probe.media_probe_target_fps -BitrateMbps (Select-CanaryValue $probe.media_probe_target_bitrate_mbps $Profile.bitrate_mbps)
   } else {
@@ -97,6 +104,10 @@ function Convert-CrossReportToCanaryRow {
   $classification = Get-CrossCanaryClassification -Report $Report -Profile $Profile -SelectedProfile $selected
   $status = Get-CrossCanaryStatus -Report $Report -Classification $classification
   $displayLimitReason = Get-CanaryDisplayRefreshLimitReason -Report $Report -Profile $Profile
+  $probeDropped = [int64](Select-CanaryValue $probe.frames_dropped 0)
+  $pipelineDropped = [int64](Select-CanaryValue $pipeline.dropped_frames 0)
+  $renderQueueReplacements = [int64](Select-CanaryValue $pipeline.render_queue_replacements $pipelineDropped)
+  $renderLockDrops = [int64](Select-CanaryValue $pipeline.render_lock_drops 0)
 
   [pscustomobject]@{
     id = $Profile.id
@@ -114,10 +125,16 @@ function Convert-CrossReportToCanaryRow {
     first_frame_seen = [bool]($probe -and $probe.frames_decoded -gt 0)
     first_frame_time_ms = $null
     decoded_frames = [int64](Select-CanaryValue $probe.frames_decoded 0)
-    dropped_frames = [int64](Select-CanaryValue (Select-CanaryValue $pipeline.dropped_frames $probe.frames_dropped) 0)
+    dropped_frames = $probeDropped
+    probe_dropped_frames = $probeDropped
+    pipeline_dropped_frames = $pipelineDropped
+    render_queue_replacements = $renderQueueReplacements
+    render_lock_drops = $renderLockDrops
     queue_depth = $pipeline.queue_depth
     stage_p95_ms = Convert-MediaStageMetricsToP95Map -StageMetrics $pipeline.stage_metrics
     test_impairment = $pipeline.test_impairment
+    adaptive = [bool](Select-CanaryValue $Profile.adaptive $false)
+    adaptation = $adaptation
     display_mode = $Report.displayModeChange
     raw_report_path = $ReportPath
     error_message = Select-CanaryValue $Report.errorMessage $displayLimitReason
@@ -398,13 +415,16 @@ function Write-CanaryJsonAndMarkdown {
     "- Skipped: $($Report.skipped)",
     "- Failed: $($Report.failed)",
     "",
-    "| Profile | Status | Class | FPS | Selected | Dropped | Queue | Error |",
-    "| --- | --- | --- | ---: | --- | ---: | ---: | --- |"
+    "| Profile | Status | Class | FPS | Selected | Probe Drop | Render Coalesce | Render Drop | Queue | Error |",
+    "| --- | --- | --- | ---: | --- | ---: | ---: | ---: | ---: | --- |"
   )
   foreach ($row in $Report.rows) {
     $selected = "$($row.selected_profile.width)x$($row.selected_profile.height)@$($row.selected_profile.fps)/$($row.selected_profile.bitrate_mbps)Mbps"
     $error = ((Select-CanaryValue $row.error_message "") -replace "\|", "/")
-    $lines += "| $($row.id) | $($row.status) | $($row.classification) | $([Math]::Round([double](Select-CanaryValue $row.fps_observed 0), 2)) | $selected | $($row.dropped_frames) | $($row.queue_depth) | $error |"
+    $probeDrops = Select-CanaryValue $row.probe_dropped_frames $row.dropped_frames
+    $renderCoalesce = Select-CanaryValue $row.render_queue_replacements 0
+    $renderDrops = Select-CanaryValue $row.render_lock_drops 0
+    $lines += "| $($row.id) | $($row.status) | $($row.classification) | $([Math]::Round([double](Select-CanaryValue $row.fps_observed 0), 2)) | $selected | $probeDrops | $renderCoalesce | $renderDrops | $($row.queue_depth) | $error |"
   }
   $lines -join [Environment]::NewLine | Set-Content -Path $MarkdownPath -Encoding Ascii
 }

@@ -30,6 +30,8 @@ import type {
   CaptureSourceSelection,
   DisplayMode,
   DisplayModeChange,
+  AdaptiveMediaConfig,
+  MediaAdaptationSnapshot,
   MediaProfile,
   MediaProfileNegotiation,
   MediaPipelineSnapshot,
@@ -416,6 +418,19 @@ export async function ipcUpdateMediaProfile(
   return invokeAdapter<MediaProfileNegotiation>('ipc_update_media_profile', {
     sessionId,
     requestedProfile,
+  });
+}
+
+/**
+ * Configure runtime LAN media bitrate/FPS/resolution adaptation.
+ */
+export async function ipcConfigureMediaAdaptation(
+  sessionId: string,
+  config: AdaptiveMediaConfig
+): Promise<AdapterResult<MediaAdaptationSnapshot>> {
+  return invokeAdapter<MediaAdaptationSnapshot>('ipc_configure_media_adaptation', {
+    sessionId,
+    config,
   });
 }
 

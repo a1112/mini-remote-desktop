@@ -182,6 +182,10 @@ impl IpcServer {
                 session::update_media_profile(&self.app_state, session_id, requested_profile).await
             }
 
+            IpcRequest::ConfigureMediaAdaptation { session_id, config } => {
+                session::configure_media_adaptation(&self.app_state, session_id, config).await
+            }
+
             IpcRequest::ListRemoteCaptureSources {
                 session_id,
                 include_previews,

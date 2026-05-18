@@ -9,8 +9,8 @@ use base64::{engine::general_purpose, Engine as _};
 use image::{codecs::png::PngEncoder, ColorType, ImageEncoder};
 use mrd_application::ports::SessionSnapshot;
 use mrd_ipc::{
-    AttachedRenderSurface, CaptureSourceSelection, MediaPipelineSnapshot, MediaProfileNegotiation,
-    MediaStageMetrics, MediaTestImpairmentSnapshot,
+    AttachedRenderSurface, CaptureSourceSelection, MediaAdaptationSnapshot, MediaPipelineSnapshot,
+    MediaProfileNegotiation, MediaStageMetrics, MediaTestImpairmentSnapshot,
 };
 use mrd_proto::{DeviceId, SessionId};
 #[cfg(windows)]
@@ -217,9 +217,12 @@ struct MediaPipelineState {
     active_renderer: Option<String>,
     queue_depth: u32,
     dropped_frames: u64,
+    render_queue_replacements: u64,
+    render_lock_drops: u64,
     stage_samples: HashMap<String, VecDeque<f64>>,
     stage_summaries: HashMap<String, MediaStageMetrics>,
     test_impairment: Option<MediaTestImpairmentSnapshot>,
+    adaptation: Option<MediaAdaptationSnapshot>,
 }
 
 #[cfg(windows)]
@@ -312,6 +315,18 @@ impl MediaPipelineRegistry {
         state.dropped_frames = state.dropped_frames.saturating_add(count);
     }
 
+    pub fn increment_render_queue_replacements(&mut self, session_id: SessionId, count: u64) {
+        let state = self.pipelines.entry(session_id).or_default();
+        state.render_queue_replacements = state.render_queue_replacements.saturating_add(count);
+        state.dropped_frames = state.dropped_frames.saturating_add(count);
+    }
+
+    pub fn increment_render_lock_drops(&mut self, session_id: SessionId, count: u64) {
+        let state = self.pipelines.entry(session_id).or_default();
+        state.render_lock_drops = state.render_lock_drops.saturating_add(count);
+        state.dropped_frames = state.dropped_frames.saturating_add(count);
+    }
+
     pub fn record_stage_duration_ms(
         &mut self,
         session_id: SessionId,
@@ -356,6 +371,20 @@ impl MediaPipelineRegistry {
             .test_impairment = impairment;
     }
 
+    pub fn set_adaptation(
+        &mut self,
+        session_id: SessionId,
+        adaptation: Option<MediaAdaptationSnapshot>,
+    ) {
+        self.pipelines.entry(session_id).or_default().adaptation = adaptation;
+    }
+
+    pub fn adaptation(&self, session_id: &SessionId) -> Option<MediaAdaptationSnapshot> {
+        self.pipelines
+            .get(session_id)
+            .and_then(|state| state.adaptation.clone())
+    }
+
     pub fn snapshot(&self, session_id: &SessionId) -> MediaPipelineSnapshot {
         let state = self.pipelines.get(session_id);
         let stage_metrics = state.map(media_pipeline_stage_metrics).unwrap_or_default();
@@ -368,8 +397,11 @@ impl MediaPipelineRegistry {
             active_renderer: state.and_then(|state| state.active_renderer.clone()),
             queue_depth: state.map_or(0, |state| state.queue_depth),
             dropped_frames: state.map_or(0, |state| state.dropped_frames),
+            render_queue_replacements: state.map_or(0, |state| state.render_queue_replacements),
+            render_lock_drops: state.map_or(0, |state| state.render_lock_drops),
             stage_metrics,
             test_impairment: state.and_then(|state| state.test_impairment.clone()),
+            adaptation: state.and_then(|state| state.adaptation.clone()),
         }
     }
 
@@ -1304,6 +1336,21 @@ mod tests {
                 && metric.p50_ms == Some(2.5)
                 && metric.p95_ms == Some(4.5)
         }));
+    }
+
+    #[test]
+    fn media_pipeline_registry_separates_render_drop_counters() {
+        let mut registry = MediaPipelineRegistry::default();
+        let session_id = SessionId("render-drops-session".to_string());
+
+        registry.increment_render_queue_replacements(session_id.clone(), 3);
+        registry.increment_render_lock_drops(session_id.clone(), 2);
+
+        let snapshot = registry.snapshot(&session_id);
+
+        assert_eq!(snapshot.dropped_frames, 5);
+        assert_eq!(snapshot.render_queue_replacements, 3);
+        assert_eq!(snapshot.render_lock_drops, 2);
     }
 
     #[cfg(windows)]

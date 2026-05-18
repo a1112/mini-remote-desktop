@@ -3528,6 +3528,7 @@ async fn receive_quic_media_loop(
                 .context("failed to read LAN QUIC media datagram")?
         };
         receiver_stats.record_elapsed("receiver.read", read_started);
+        receiver_stats.record_elapsed("receiver.message_wait", read_started);
         if !session_allows_media(&app_state, &session_id).await {
             return Ok(());
         }
@@ -3948,7 +3949,7 @@ async fn render_lan_decoded_frame(
             let mut pipelines = app_state.media_pipelines.lock().await;
             pipelines.record_queue_depth(session_id.clone(), 1);
             if replaced {
-                pipelines.increment_dropped_frames(session_id.clone(), 1);
+                pipelines.increment_render_queue_replacements(session_id.clone(), 1);
             }
         }
     }
@@ -3981,7 +3982,7 @@ fn spawn_lan_render_worker(
                         .media_pipelines
                         .lock()
                         .await
-                        .increment_dropped_frames(session_id.clone(), 1);
+                        .increment_render_lock_drops(session_id.clone(), 1);
                 }
                 Ok(LanRenderTaskOutcome::Idle) => {}
                 Err(error) => {
@@ -4026,26 +4027,29 @@ async fn render_lan_frame_once(
     session_id: SessionId,
     frame: RenderFrame,
 ) -> Result<LanRenderTaskOutcome> {
-    tokio::task::spawn_blocking(move || {
-        let started = Instant::now();
-        match app_state.media_surface_renderers.try_lock() {
-            Ok(mut renderers) => {
-                let rendered = renderers
-                    .render_frame(&session_id, &frame)
-                    .map_err(anyhow::Error::msg)?;
-                if rendered > 0 {
-                    Ok(LanRenderTaskOutcome::Rendered {
-                        duration_ms: started.elapsed().as_secs_f64() * 1000.0,
-                    })
-                } else {
-                    Ok(LanRenderTaskOutcome::Idle)
-                }
-            }
-            Err(_) => Ok(LanRenderTaskOutcome::Dropped),
-        }
-    })
-    .await
-    .context("LAN media receiver render worker stopped")?
+    let started = Instant::now();
+    let mut renderers = match app_state.media_surface_renderers.try_lock() {
+        Ok(renderers) => renderers,
+        Err(_) => match timeout(
+            Duration::from_millis(1),
+            app_state.media_surface_renderers.lock(),
+        )
+        .await
+        {
+            Ok(renderers) => renderers,
+            Err(_) => return Ok(LanRenderTaskOutcome::Dropped),
+        },
+    };
+    let rendered = renderers
+        .render_frame(&session_id, &frame)
+        .map_err(anyhow::Error::msg)?;
+    if rendered > 0 {
+        Ok(LanRenderTaskOutcome::Rendered {
+            duration_ms: started.elapsed().as_secs_f64() * 1000.0,
+        })
+    } else {
+        Ok(LanRenderTaskOutcome::Idle)
+    }
 }
 
 #[cfg(windows)]

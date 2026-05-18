@@ -70,6 +70,7 @@ const LAN_E2E_DISPLAY_MODE_POLICY_ENV: &str = "MRD_LAN_E2E_DISPLAY_MODE_POLICY";
 const LAN_E2E_CAPTURE_SOURCE_ID_ENV: &str = "MRD_LAN_E2E_CAPTURE_SOURCE_ID";
 const LAN_E2E_CAPTURE_SOURCE_KIND_ENV: &str = "MRD_LAN_E2E_CAPTURE_SOURCE_KIND";
 const LAN_E2E_EXPECTED_PEER_BUILD_ID_ENV: &str = "MRD_LAN_E2E_EXPECTED_PEER_BUILD_ID";
+const LAN_E2E_ADAPTIVE_ENV: &str = "MRD_LAN_E2E_ADAPTIVE";
 
 static APP_IS_QUITTING: AtomicBool = AtomicBool::new(false);
 
@@ -1247,6 +1248,31 @@ async fn ipc_update_media_profile(
     }
 }
 
+/// Configure LAN media adaptation via IPC.
+#[tauri::command]
+async fn ipc_configure_media_adaptation(
+    session_id: String,
+    config: mrd_ipc::AdaptiveMediaConfig,
+) -> Result<mrd_ipc::MediaAdaptationSnapshot, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+    use mrd_proto::SessionId;
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::ConfigureMediaAdaptation {
+            session_id: SessionId(session_id),
+            config,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::MediaAdaptationConfigured { snapshot, .. } => Ok(snapshot),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
 /// List remote capture sources through mrd-service IPC.
 #[tauri::command]
 async fn ipc_list_remote_capture_sources(
@@ -2308,6 +2334,7 @@ struct LanE2eAutorunLaunchConfig {
     capture_source_id: Option<String>,
     capture_source_kind: Option<String>,
     expected_peer_build_id: Option<String>,
+    adaptive: Option<String>,
 }
 
 fn lan_e2e_autorun_config_from_env() -> Option<LanE2eAutorunLaunchConfig> {
@@ -2339,6 +2366,7 @@ where
         capture_source_id: non_empty_env(env(LAN_E2E_CAPTURE_SOURCE_ID_ENV)),
         capture_source_kind: non_empty_env(env(LAN_E2E_CAPTURE_SOURCE_KIND_ENV)),
         expected_peer_build_id: non_empty_env(env(LAN_E2E_EXPECTED_PEER_BUILD_ID_ENV)),
+        adaptive: non_empty_env(env(LAN_E2E_ADAPTIVE_ENV)),
     })
 }
 
@@ -2368,6 +2396,7 @@ fn build_lan_e2e_autorun_route(config: LanE2eAutorunLaunchConfig) -> String {
         "expectedPeerBuildId",
         config.expected_peer_build_id,
     );
+    push_query_param(&mut params, "adaptive", config.adaptive);
 
     let query = params
         .into_iter()
@@ -2467,11 +2496,12 @@ mod tray_tests {
             capture_source_id: Some("windows:display-shared:1".to_string()),
             capture_source_kind: Some("display".to_string()),
             expected_peer_build_id: Some("abc123def456".to_string()),
+            adaptive: Some("true".to_string()),
         });
 
         assert_eq!(
             route,
-            "/test/e2e?autorun=lan-e2e&targetDeviceId=agent%20device%2F1&transport=quic&timeoutMs=2500&minSampleDurationMs=1500&minDecodedFrames=2&minFps=5&stopOnComplete=false&width=1920&height=1080&fps=180&bitrateMbps=20&displayModePolicy=temporary&captureSourceId=windows%3Adisplay-shared%3A1&captureSourceKind=display&expectedPeerBuildId=abc123def456"
+            "/test/e2e?autorun=lan-e2e&targetDeviceId=agent%20device%2F1&transport=quic&timeoutMs=2500&minSampleDurationMs=1500&minDecodedFrames=2&minFps=5&stopOnComplete=false&width=1920&height=1080&fps=180&bitrateMbps=20&displayModePolicy=temporary&captureSourceId=windows%3Adisplay-shared%3A1&captureSourceKind=display&expectedPeerBuildId=abc123def456&adaptive=true"
         );
     }
 
@@ -2733,6 +2763,7 @@ fn main() {
             ipc_start_session,
             ipc_start_lan_remote_session,
             ipc_update_media_profile,
+            ipc_configure_media_adaptation,
             ipc_list_remote_capture_sources,
             ipc_select_remote_capture_source,
             ipc_list_remote_display_modes,

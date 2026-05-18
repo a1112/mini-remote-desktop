@@ -139,6 +139,52 @@ pub struct MediaTestImpairmentSnapshot {
     pub datagrams_fragmented_by_mtu: u64,
 }
 
+fn default_adaptation_mode() -> String {
+    "keyframe_ladder".to_string()
+}
+
+fn default_downshift_cooldown_ms() -> u64 {
+    2_000
+}
+
+fn default_upshift_hold_ms() -> u64 {
+    5_000
+}
+
+/// Runtime configuration for LAN media bitrate/FPS/resolution adaptation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdaptiveMediaConfig {
+    pub enabled: bool,
+    #[serde(default = "default_adaptation_mode")]
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ceiling_profile: Option<MediaProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floor_profile: Option<MediaProfile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ladder: Vec<MediaProfile>,
+    #[serde(default = "default_downshift_cooldown_ms")]
+    pub downshift_cooldown_ms: u64,
+    #[serde(default = "default_upshift_hold_ms")]
+    pub upshift_hold_ms: u64,
+}
+
+/// Current adaptive LAN media controller state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MediaAdaptationSnapshot {
+    pub enabled: bool,
+    pub state: String,
+    pub ladder_index: u32,
+    pub current_profile: MediaProfile,
+    pub target_profile: MediaProfile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_reason: Option<String>,
+    pub last_change_ms: u64,
+    pub observed_fps: f32,
+    pub drop_ratio: f32,
+    pub queue_depth: u32,
+}
+
 /// Runtime state for a session media pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MediaPipelineSnapshot {
@@ -149,10 +195,18 @@ pub struct MediaPipelineSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_renderer: Option<String>,
     pub queue_depth: u32,
+    /// Legacy aggregate of receiver-side render drops. Prefer the explicit
+    /// render counters below for diagnostics.
     pub dropped_frames: u64,
+    #[serde(default)]
+    pub render_queue_replacements: u64,
+    #[serde(default)]
+    pub render_lock_drops: u64,
     pub stage_metrics: Vec<MediaStageMetrics>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test_impairment: Option<MediaTestImpairmentSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adaptation: Option<MediaAdaptationSnapshot>,
 }
 
 /// A capture source that can be selected for a remote session.
@@ -453,6 +507,11 @@ pub enum IpcRequest {
         session_id: SessionId,
         requested_profile: MediaProfile,
     },
+    /// Configure LAN media bitrate/FPS/resolution adaptation for an existing session.
+    ConfigureMediaAdaptation {
+        session_id: SessionId,
+        config: AdaptiveMediaConfig,
+    },
     /// List selectable capture sources from the remote peer for a session.
     ListRemoteCaptureSources {
         session_id: SessionId,
@@ -575,6 +634,11 @@ pub enum IpcResponse {
     MediaProfileUpdated {
         session_id: SessionId,
         negotiation: MediaProfileNegotiation,
+    },
+    /// LAN media adaptation controller configured.
+    MediaAdaptationConfigured {
+        session_id: SessionId,
+        snapshot: MediaAdaptationSnapshot,
     },
     /// Selectable capture sources returned by the remote peer.
     CaptureSourceList {

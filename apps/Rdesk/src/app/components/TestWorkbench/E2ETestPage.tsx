@@ -72,6 +72,7 @@ const lanAutomationCommands: LanE2EAutomationCommands = {
   ipcRegisterDevice: commands.ipcRegisterDevice,
   ipcRefreshLanDiscovery: commands.ipcRefreshLanDiscovery,
   ipcStartLanRemoteSession: commands.ipcStartLanRemoteSession,
+  ipcConfigureMediaAdaptation: commands.ipcConfigureMediaAdaptation,
   ipcListRemoteCaptureSources: commands.ipcListRemoteCaptureSources,
   ipcSelectRemoteCaptureSource: commands.ipcSelectRemoteCaptureSource,
   ipcListRemoteDisplayModes: commands.ipcListRemoteDisplayModes,
@@ -604,6 +605,7 @@ function buildLanAutomationOptionsFromSearchParams(
     preferredCaptureSourceKind:
       searchParams.get("captureSourceKind") ?? searchParams.get("captureKind") ?? undefined,
     expectedPeerBuildId: searchParams.get("expectedPeerBuildId") ?? undefined,
+    adaptive: parseOptionalBoolean(searchParams.get("adaptive")),
     requestedProfile: parseRequestedProfile(searchParams),
   };
 }

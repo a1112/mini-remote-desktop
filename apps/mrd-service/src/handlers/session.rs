@@ -162,6 +162,33 @@ pub async fn update_media_profile(
     }
 }
 
+/// Handle a runtime LAN media adaptation configuration request.
+pub async fn configure_media_adaptation(
+    app_state: &Arc<AppState>,
+    session_id: SessionId,
+    config: mrd_ipc::AdaptiveMediaConfig,
+) -> IpcResponse {
+    tracing::info!(
+        "Configuring media adaptation: {} enabled={} mode={}",
+        session_id.0,
+        config.enabled,
+        config.mode
+    );
+
+    match crate::media_adaptation::configure_media_adaptation(app_state, session_id.clone(), config)
+        .await
+    {
+        Ok(snapshot) => IpcResponse::MediaAdaptationConfigured {
+            session_id,
+            snapshot,
+        },
+        Err(error) => IpcResponse::Error {
+            code: "E_MEDIA_ADAPTATION".to_string(),
+            message: error.to_string(),
+        },
+    }
+}
+
 /// Handle a remote capture source listing request.
 pub async fn list_remote_capture_sources(
     app_state: &Arc<AppState>,

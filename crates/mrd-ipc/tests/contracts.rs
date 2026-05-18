@@ -2,11 +2,11 @@
 // Verify serialization/deserialization of all IPC messages
 
 use mrd_ipc::{
-    AttachedRenderSurface, CapabilityConstraint, CapabilityConstraintStatus, CapabilityDomain,
-    CapabilityItem, CapabilityPlatform, CapabilityProfile, CapabilitySnapshot, CapabilityStatus,
-    CaptureSource, CaptureSourceSelection, DeviceInfo, IpcRequest, IpcResponse,
-    MediaPipelineSnapshot, MediaProfile, MediaProfileNegotiation, MediaStageMetrics,
-    SessionBootstrap, SessionRuntimeSnapshot,
+    AdaptiveMediaConfig, AttachedRenderSurface, CapabilityConstraint, CapabilityConstraintStatus,
+    CapabilityDomain, CapabilityItem, CapabilityPlatform, CapabilityProfile, CapabilitySnapshot,
+    CapabilityStatus, CaptureSource, CaptureSourceSelection, DeviceInfo, IpcRequest, IpcResponse,
+    MediaAdaptationSnapshot, MediaPipelineSnapshot, MediaProfile, MediaProfileNegotiation,
+    MediaStageMetrics, SessionBootstrap, SessionRuntimeSnapshot,
 };
 use mrd_proto::{DeviceId, SessionId};
 
@@ -172,6 +172,35 @@ fn serialize_deserialize_update_media_profile() {
     };
 
     let json = serde_json::to_string(&request).unwrap();
+    let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(request, deserialized);
+}
+
+#[test]
+fn serialize_deserialize_configure_media_adaptation() {
+    let config = AdaptiveMediaConfig {
+        enabled: true,
+        mode: "keyframe_ladder".to_string(),
+        ceiling_profile: Some(test_media_profile()),
+        floor_profile: Some(MediaProfile {
+            width: 1280,
+            height: 720,
+            fps: 60,
+            bitrate_mbps: 10,
+            codec: "h264".to_string(),
+        }),
+        ladder: vec![test_media_profile()],
+        downshift_cooldown_ms: 2_000,
+        upshift_hold_ms: 5_000,
+    };
+    let request = IpcRequest::ConfigureMediaAdaptation {
+        session_id: test_session_id(),
+        config,
+    };
+
+    let json = serde_json::to_string(&request).unwrap();
+    assert!(json.contains("ConfigureMediaAdaptation"));
     let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
 
     assert_eq!(request, deserialized);
@@ -432,17 +461,56 @@ fn serialize_deserialize_media_pipeline_snapshot_contract() {
             active_renderer: Some("d3d11".to_string()),
             queue_depth: 1,
             dropped_frames: 2,
+            render_queue_replacements: 1,
+            render_lock_drops: 1,
             stage_metrics: vec![MediaStageMetrics {
                 stage: "decode".to_string(),
                 p50_ms: Some(1.0),
                 p95_ms: Some(2.0),
             }],
             test_impairment: None,
+            adaptation: Some(MediaAdaptationSnapshot {
+                enabled: true,
+                state: "stable".to_string(),
+                ladder_index: 0,
+                current_profile: test_media_profile(),
+                target_profile: test_media_profile(),
+                last_reason: Some("configured".to_string()),
+                last_change_ms: 1_700_000_000_000,
+                observed_fps: 144.0,
+                drop_ratio: 0.0,
+                queue_depth: 0,
+            }),
         },
     };
 
     let json = serde_json::to_string(&response).unwrap();
     let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(response, deserialized);
+}
+
+#[test]
+fn serialize_deserialize_media_adaptation_configured_response() {
+    let response = IpcResponse::MediaAdaptationConfigured {
+        session_id: test_session_id(),
+        snapshot: MediaAdaptationSnapshot {
+            enabled: true,
+            state: "stable".to_string(),
+            ladder_index: 0,
+            current_profile: test_media_profile(),
+            target_profile: test_media_profile(),
+            last_reason: Some("configured".to_string()),
+            last_change_ms: 1_700_000_000_000,
+            observed_fps: 144.0,
+            drop_ratio: 0.0,
+            queue_depth: 0,
+        },
+    };
+
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("MediaAdaptationConfigured"));
+    let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
+
     assert_eq!(response, deserialized);
 }
 

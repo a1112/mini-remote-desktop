@@ -104,6 +104,7 @@ export interface TestConfig {
   renderer_target_hwnd?: string;
   zero_copy?: boolean;
   transport_kind?: "loopback" | "quic" | "webrtc";
+  adaptive_media?: boolean;
 
   // Parameters
   resolution?: [number, number];
@@ -246,6 +247,11 @@ export interface TestRunSummary {
   total_latency_p95?: number;
   dropped_frames: number;
   frame_count: number;
+  adaptation_state?: string;
+  adaptation_ladder_index?: number;
+  adaptation_current_profile?: string;
+  adaptation_target_profile?: string;
+  adaptation_reason?: string;
   error_message?: string;
   failure_reason?: FailureReason;
 }
@@ -678,6 +684,29 @@ export interface TelemetryBundle {
   diagnostics: TelemetryDiagnostics;
 }
 
+export interface AdaptiveMediaConfig {
+  enabled: boolean;
+  mode?: "keyframe_ladder" | string;
+  ceiling_profile?: MediaProfile | null;
+  floor_profile?: MediaProfile | null;
+  ladder?: MediaProfile[];
+  downshift_cooldown_ms?: number;
+  upshift_hold_ms?: number;
+}
+
+export interface MediaAdaptationSnapshot {
+  enabled: boolean;
+  state: string;
+  ladder_index: number;
+  current_profile: MediaProfile;
+  target_profile: MediaProfile;
+  last_reason?: string | null;
+  last_change_ms: number;
+  observed_fps: number;
+  drop_ratio: number;
+  queue_depth: number;
+}
+
 export interface MediaPipelineSnapshot {
   session_id: string;
   attached_surfaces: AttachedRenderSurface[];
@@ -685,8 +714,11 @@ export interface MediaPipelineSnapshot {
   active_renderer?: string | null;
   queue_depth: number;
   dropped_frames: number;
+  render_queue_replacements?: number;
+  render_lock_drops?: number;
   stage_metrics: MediaStageMetrics[];
   test_impairment?: MediaTestImpairmentSnapshot | null;
+  adaptation?: MediaAdaptationSnapshot | null;
 }
 
 export interface CaptureSource {
