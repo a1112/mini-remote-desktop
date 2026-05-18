@@ -1,5 +1,8 @@
 $ErrorActionPreference = "Stop"
 
+$script:CanaryMaxProbeDropRatio = 0.05
+$script:CanaryMaxRenderDropRatio = 0.03
+
 function Select-CanaryValue {
   param($Value, $Fallback)
   if ($null -eq $Value) { return $Fallback }
@@ -14,6 +17,37 @@ function Normalize-CanaryCodec {
     return "hevc"
   }
   "h264"
+}
+
+function Resolve-PairedLanCanaryTargetDeviceId {
+  param(
+    $Diagnostics,
+    [string]$RequestedTargetDeviceId = ""
+  )
+
+  if ($RequestedTargetDeviceId.Trim()) {
+    return $RequestedTargetDeviceId.Trim()
+  }
+
+  $deviceIds = @()
+  foreach ($response in @($Diagnostics.udp_responses)) {
+    if (-not $response.payload) { continue }
+    try {
+      $payload = $response.payload | ConvertFrom-Json
+    } catch {
+      continue
+    }
+    if ($payload.type -ne "announce" -or -not $payload.device_id) {
+      continue
+    }
+    $deviceIds += [string]$payload.device_id
+  }
+
+  $uniqueDeviceIds = @($deviceIds | Where-Object { $_ } | Select-Object -Unique)
+  if ($uniqueDeviceIds.Count -eq 1) {
+    return $uniqueDeviceIds[0]
+  }
+  ""
 }
 
 function New-CanaryMediaChain {
@@ -72,6 +106,35 @@ function New-CanarySelectedProfile {
     fps = $Fps
     bitrate_mbps = $BitrateMbps
   }
+}
+
+function Get-CanaryVisualIntegrityIssue {
+  param(
+    $Probe,
+    $Pipeline
+  )
+
+  $decodedFrames = [double](Select-CanaryValue $Probe.frames_decoded 0)
+  $probeDrops = [double](Select-CanaryValue $Probe.frames_dropped 0)
+  $totalSequencedFrames = $decodedFrames + $probeDrops
+  if ($totalSequencedFrames -gt 0) {
+    $probeDropRatio = $probeDrops / $totalSequencedFrames
+    if ($probeDropRatio -gt $script:CanaryMaxProbeDropRatio) {
+      return "Visual integrity risk: drop ratio $([Math]::Round($probeDropRatio * 100, 2))% exceeds $([Math]::Round($script:CanaryMaxProbeDropRatio * 100, 2))% ($([int64]$probeDrops) dropped / $([int64]$totalSequencedFrames) sequenced frames)."
+    }
+  }
+
+  $renderQueueReplacements = [double](Select-CanaryValue $Pipeline.render_queue_replacements 0)
+  $renderLockDrops = [double](Select-CanaryValue $Pipeline.render_lock_drops 0)
+  $renderDrops = $renderQueueReplacements + $renderLockDrops
+  if ($decodedFrames -gt 0 -and $renderDrops -gt 0) {
+    $renderDropRatio = $renderDrops / $decodedFrames
+    if ($renderDropRatio -gt $script:CanaryMaxRenderDropRatio) {
+      return "Visual integrity risk: render drop/coalesce ratio $([Math]::Round($renderDropRatio * 100, 2))% exceeds $([Math]::Round($script:CanaryMaxRenderDropRatio * 100, 2))% ($([int64]$renderDrops) render drops / $([int64]$decodedFrames) decoded frames)."
+    }
+  }
+
+  $null
 }
 
 function Convert-LocalSummaryToCanaryRow {
@@ -135,7 +198,13 @@ function Convert-CrossReportToCanaryRow {
   } else {
     New-CanarySelectedProfile -Width $Profile.width -Height $Profile.height -Fps $Profile.fps -BitrateMbps $Profile.bitrate_mbps
   }
-  $classification = Get-CrossCanaryClassification -Report $Report -Profile $Profile -SelectedProfile $selected
+  $baseClassification = Get-CrossCanaryClassification -Report $Report -Profile $Profile -SelectedProfile $selected
+  $visualIntegrityIssue = if ($baseClassification -eq "completed") {
+    Get-CanaryVisualIntegrityIssue -Probe $probe -Pipeline $pipeline
+  } else {
+    $null
+  }
+  $classification = if ($visualIntegrityIssue) { "visual_integrity_risk" } else { $baseClassification }
   $status = Get-CrossCanaryStatus -Report $Report -Classification $classification
   $displayLimitReason = Get-CanaryDisplayRefreshLimitReason -Report $Report -Profile $Profile
   $probeDropped = [int64](Select-CanaryValue $probe.frames_dropped 0)
@@ -172,7 +241,9 @@ function Convert-CrossReportToCanaryRow {
     adaptation = $adaptation
     display_mode = $Report.displayModeChange
     raw_report_path = $ReportPath
-    error_message = Select-CanaryValue $Report.errorMessage $displayLimitReason
+    error_message = Select-CanaryValue $Report.errorMessage (Select-CanaryValue $visualIntegrityIssue $displayLimitReason)
+    visual_integrity_status = if ($visualIntegrityIssue) { "risk" } else { "ok" }
+    visual_integrity_message = $visualIntegrityIssue
     requested_codec = Normalize-CanaryCodec $RequestedCodec
     active_codec = $pipeline.active_codec
     active_codec_profile = $pipeline.active_codec_profile
@@ -196,6 +267,7 @@ function Get-CrossCanaryStatus {
   if ($Classification -in @("unsupported", "profile_downgraded", "peer_version_mismatch", "display_refresh_limited")) {
     return "skipped"
   }
+  if ($Classification -eq "visual_integrity_risk") { return "failed" }
   if ($Report.status -eq "completed") { return "completed" }
   if ($Report.status -eq "skipped") { return "skipped" }
   return [string]$Report.status
@@ -463,16 +535,17 @@ function Write-CanaryJsonAndMarkdown {
     "- Skipped: $($Report.skipped)",
     "- Failed: $($Report.failed)",
     "",
-    "| Profile | Status | Class | FPS | Selected | Probe Drop | Render Coalesce | Render Drop | Queue | Error |",
-    "| --- | --- | --- | ---: | --- | ---: | ---: | ---: | ---: | --- |"
+    "| Profile | Status | Class | FPS | Selected | Visual | Probe Drop | Render Coalesce | Render Drop | Queue | Error |",
+    "| --- | --- | --- | ---: | --- | --- | ---: | ---: | ---: | ---: | --- |"
   )
   foreach ($row in $Report.rows) {
     $selected = "$($row.selected_profile.width)x$($row.selected_profile.height)@$($row.selected_profile.fps)/$($row.selected_profile.bitrate_mbps)Mbps"
     $error = ((Select-CanaryValue $row.error_message "") -replace "\|", "/")
+    $visual = Select-CanaryValue $row.visual_integrity_status "n/a"
     $probeDrops = Select-CanaryValue $row.probe_dropped_frames $row.dropped_frames
     $renderCoalesce = Select-CanaryValue $row.render_queue_replacements 0
     $renderDrops = Select-CanaryValue $row.render_lock_drops 0
-    $lines += "| $($row.id) | $($row.status) | $($row.classification) | $([Math]::Round([double](Select-CanaryValue $row.fps_observed 0), 2)) | $selected | $probeDrops | $renderCoalesce | $renderDrops | $($row.queue_depth) | $error |"
+    $lines += "| $($row.id) | $($row.status) | $($row.classification) | $([Math]::Round([double](Select-CanaryValue $row.fps_observed 0), 2)) | $selected | $visual | $probeDrops | $renderCoalesce | $renderDrops | $($row.queue_depth) | $error |"
   }
   if ($Report.codec_request) {
     $lines += ""

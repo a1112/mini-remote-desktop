@@ -54,7 +54,7 @@ const LAN_MEDIA_TARGET_HEIGHT: u32 = 1600;
 const LAN_MEDIA_TARGET_FPS: u32 = 165;
 const LAN_MEDIA_MAX_FPS: u32 = 249;
 const LAN_MEDIA_TARGET_BITRATE_MBPS: u32 = 120;
-const LAN_QUIC_BEST_EFFORT_DATAGRAM_MAX_BITRATE_MBPS: u32 = 100;
+const LAN_QUIC_BEST_EFFORT_DATAGRAM_MAX_BITRATE_MBPS: u32 = 40;
 const LAN_QUIC_FALLBACK_DATAGRAM_BYTES: usize = 1_200;
 const LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES: usize = 4 * 1024 * 1024;
 const LAN_QUIC_RELIABLE_MEDIA_RETRY_DELAY: Duration = Duration::from_millis(10);
@@ -7470,9 +7470,17 @@ mod tests {
     #[test]
     fn lan_quic_media_uses_best_effort_only_for_low_latency_bitrate_tiers() {
         let low_latency = MediaProfile {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            bitrate_mbps: 20,
+            codec: "hevc".to_string(),
+            ..MediaProfile::default()
+        };
+        let high_quality_2k144 = MediaProfile {
             width: 2560,
-            height: 1600,
-            fps: 165,
+            height: 1440,
+            fps: 144,
             bitrate_mbps: 80,
             codec: "hevc".to_string(),
             ..MediaProfile::default()
@@ -7487,6 +7495,7 @@ mod tests {
         };
 
         assert!(use_best_effort_media_datagrams(&low_latency));
+        assert!(!use_best_effort_media_datagrams(&high_quality_2k144));
         assert!(!use_best_effort_media_datagrams(&high_bitrate));
     }
 

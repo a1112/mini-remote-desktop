@@ -207,12 +207,14 @@ $hevcReport = [pscustomobject]@{
   }
   sessionSnapshot = [pscustomobject]@{ state = "streaming" }
 }
-$hevcRow = Convert-CrossReportToCanaryRow -Profile $profiles[2] -Report $hevcReport -ReportPath "raw/cross-2k144-hevc.json"
+$profile2k14480 = [pscustomobject]@{ id = "2k144"; width = 2560; height = 1440; fps = 144; bitrate_mbps = 80; duration_secs = 30 }
+$hevcRow = Convert-CrossReportToCanaryRow -Profile $profile2k14480 -Report $hevcReport -ReportPath "raw/cross-2k144-hevc.json"
 Assert-Equal $hevcRow.chain "dxgi/nvenc_hevc/quic_datagram_media_v3_or_v2/nvdec_hevc_d3d11_shared/d3d11_shared" "HEVC cross row reports the active HEVC chain"
 Assert-Equal $hevcRow.active_codec "hevc" "HEVC cross row carries active codec"
 Assert-Equal $hevcRow.active_codec_profile "main" "HEVC cross row carries active profile"
 Assert-Equal $hevcRow.active_chroma_subsampling "4:2:0" "HEVC cross row carries chroma sampling"
 Assert-Equal $hevcRow.active_pixel_format "d3d11_shared_nv12" "HEVC cross row carries pixel format"
+Assert-Equal $hevcRow.visual_integrity_status "ok" "Healthy HEVC rows report visual integrity as ok"
 
 $renderDropReport = [pscustomobject]@{
   status = "completed"
@@ -238,11 +240,33 @@ $renderDropReport = [pscustomobject]@{
   }
   sessionSnapshot = [pscustomobject]@{ state = "streaming" }
 }
-$renderDropRow = Convert-CrossReportToCanaryRow -Profile $profiles[2] -Report $renderDropReport -ReportPath "raw/cross-2k144.json"
+$renderDropRow = Convert-CrossReportToCanaryRow -Profile $profile2k14480 -Report $renderDropReport -ReportPath "raw/cross-2k144.json"
 Assert-Equal $renderDropRow.dropped_frames 37 "Cross row dropped_frames tracks probe/transport drops"
 Assert-Equal $renderDropRow.probe_dropped_frames 37 "Cross row exposes probe drops separately"
 Assert-Equal $renderDropRow.pipeline_dropped_frames 457 "Cross row preserves legacy pipeline dropped frames"
 Assert-Equal $renderDropRow.render_queue_replacements 455 "Cross row exposes render queue replacements"
 Assert-Equal $renderDropRow.render_lock_drops 2 "Cross row exposes render lock drops"
+Assert-Equal $renderDropRow.status "failed" "Severe visual integrity risk fails the canary row"
+Assert-Equal $renderDropRow.classification "visual_integrity_risk" "Severe visual integrity risk is classified explicitly"
+Assert-True ($renderDropRow.error_message -match "render drop/coalesce ratio") "Visual integrity risk carries an actionable render-drop reason"
+Assert-Equal $renderDropRow.visual_integrity_status "risk" "Visual integrity status is exposed for reports"
+
+$singlePeerDiagnostics = [pscustomobject]@{
+  udp_responses = @(
+    [pscustomobject]@{
+      payload = '{"type":"announce","device_id":"lan-peer-a","media_protocol_version":3,"transports":["quic","quic_datagram","quic_datagram_2k144","quic_datagram_media_v3","media_profile_control_v1"],"media_capabilities":["dxgi_capture","nvenc_h264","nvdec","d3d11_native_render"]}'
+    }
+  )
+}
+Assert-Equal (Resolve-PairedLanCanaryTargetDeviceId -Diagnostics $singlePeerDiagnostics -RequestedTargetDeviceId "") "lan-peer-a" "Single discovered peer is selected automatically"
+
+$multiPeerDiagnostics = [pscustomobject]@{
+  udp_responses = @(
+    [pscustomobject]@{ payload = '{"type":"announce","device_id":"lan-peer-a"}' },
+    [pscustomobject]@{ payload = '{"type":"announce","device_id":"lan-peer-b"}' }
+  )
+}
+Assert-Equal (Resolve-PairedLanCanaryTargetDeviceId -Diagnostics $multiPeerDiagnostics -RequestedTargetDeviceId "") "" "Ambiguous discovered peers are not auto-selected"
+Assert-Equal (Resolve-PairedLanCanaryTargetDeviceId -Diagnostics $multiPeerDiagnostics -RequestedTargetDeviceId "explicit-peer") "explicit-peer" "Explicit target device id wins over discovery"
 
 Write-Host "paired LAN canary common tests passed"

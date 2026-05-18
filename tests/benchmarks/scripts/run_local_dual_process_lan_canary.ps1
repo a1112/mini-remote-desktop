@@ -538,7 +538,7 @@ foreach ($profile in $profiles) {
     -KeepTauriOpen:$KeepTauriOpen
 }
 
-$report = New-PairedLanCanaryReport -Mode "local-dual-process" -Rows $rows -GitCommit $gitCommit
+$report = New-PairedLanCanaryReport -Mode "local-dual-process" -Rows $rows -GitCommit $gitCommit -Codec $Codec
 $encoderLabel = if ($Codec -eq "hevc") { "nvenc_hevc" } else { "nvenc_h264" }
 $decoderLabel = if ($Codec -eq "hevc") { "nvdec_hevc_d3d11_shared" } else { "nvdec" }
 $report | Add-Member -Force -NotePropertyName "chain" -NotePropertyValue "local_dual_process/dxgi/$encoderLabel/quic_datagram_media_v3_or_v2/$decoderLabel/d3d11_shared"

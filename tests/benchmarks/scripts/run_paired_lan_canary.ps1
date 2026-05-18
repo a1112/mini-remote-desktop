@@ -364,11 +364,15 @@ if (-not $SkipLocal) {
 
 $crossRows = @()
 if (-not $SkipCross) {
-  Invoke-LanDiscoveryDiagnostics -OutputRoot $outputRoot -TargetAddress $TargetAddress | Out-Null
+  $discoveryDiagnostics = Invoke-LanDiscoveryDiagnostics -OutputRoot $outputRoot -TargetAddress $TargetAddress
+  $effectiveTargetDeviceId = Resolve-PairedLanCanaryTargetDeviceId -Diagnostics $discoveryDiagnostics -RequestedTargetDeviceId $TargetDeviceId
+  if (-not $TargetDeviceId -and $effectiveTargetDeviceId) {
+    Write-Host "Auto-selected LAN target $effectiveTargetDeviceId from discovery diagnostics"
+  }
   $timeoutMs = ($DurationSecs * 1000) + 30000
   foreach ($profile in $profiles) {
     Write-Host "Running cross-device canary $($profile.id)"
-    $crossRows += Invoke-CrossCanaryProfile -Repo $repo -Profile $profile -OutputRoot $outputRoot -TargetDeviceId $TargetDeviceId -TimeoutMs $timeoutMs -DisplayModePolicy $DisplayModePolicy -GitCommit $gitCommit -Codec $Codec -CodecProfile $CodecProfile -BitDepth $BitDepth -ChromaSubsampling $ChromaSubsampling -PixelFormat $PixelFormat -HdrEnabled $HdrEnabled -KeepTauriOpen:$KeepTauriOpen
+    $crossRows += Invoke-CrossCanaryProfile -Repo $repo -Profile $profile -OutputRoot $outputRoot -TargetDeviceId $effectiveTargetDeviceId -TimeoutMs $timeoutMs -DisplayModePolicy $DisplayModePolicy -GitCommit $gitCommit -Codec $Codec -CodecProfile $CodecProfile -BitDepth $BitDepth -ChromaSubsampling $ChromaSubsampling -PixelFormat $PixelFormat -HdrEnabled $HdrEnabled -KeepTauriOpen:$KeepTauriOpen
   }
 }
 
