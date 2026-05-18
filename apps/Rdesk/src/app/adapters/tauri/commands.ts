@@ -43,6 +43,8 @@ import type {
   TestStageEvent,
   MetricSeries,
   Artifact,
+  TelemetryBundle,
+  TelemetryQuery,
   TestPreset,
   EnvironmentSnapshot,
   WindowCaptureTarget,
@@ -817,6 +819,19 @@ export async function testGetRunEvents(runId: string): Promise<AdapterResult<Tes
  */
 export async function testGetRunArtifacts(runId: string): Promise<AdapterResult<Artifact[]>> {
   return invokeAdapter<Artifact[]>('test_get_run_artifacts', { runId });
+}
+
+/**
+ * Get a test run with persisted telemetry metrics, logs, events, and artifacts
+ */
+export async function testGetRunTelemetry(
+  runId: string,
+  query?: TelemetryQuery
+): Promise<AdapterResult<TelemetryBundle>> {
+  return invokeAdapter<TelemetryBundle>('test_get_run_telemetry', {
+    runId,
+    query: query ?? null,
+  });
 }
 
 /**

@@ -2094,6 +2094,19 @@ fn test_get_run_artifacts(
     state.test_orchestrator.get_run_artifacts(&run_id)
 }
 
+/// Get a test run with persisted telemetry.
+#[tauri::command]
+fn test_get_run_telemetry(
+    state: tauri::State<'_, AppState>,
+    run_id: String,
+    query: Option<mrd_test_telemetry::TelemetryQuery>,
+) -> Result<mrd_test_telemetry::TelemetryBundle, String> {
+    state
+        .test_orchestrator
+        .get_run_telemetry(&run_id, query.unwrap_or_default())
+        .map_err(|error| error.to_string())
+}
+
 /// List test presets
 #[tauri::command]
 fn test_list_presets(state: tauri::State<'_, AppState>) -> Vec<test_orchestrator::TestPreset> {
@@ -2535,9 +2548,20 @@ fn main() {
     ));
 
     // Create test orchestrator
-    let test_orchestrator = std::sync::Arc::new(test_orchestrator::TestOrchestrator::new(
-        test_harness.clone(),
-    ));
+    let telemetry_root = settings_path
+        .parent()
+        .map(|path| path.join("test-telemetry"))
+        .unwrap_or_else(|| {
+            std::env::temp_dir()
+                .join("mini-remote-desktop")
+                .join("test-telemetry")
+        });
+    let test_orchestrator = std::sync::Arc::new(
+        test_orchestrator::TestOrchestrator::new_with_telemetry_store(
+            test_harness.clone(),
+            mrd_test_telemetry::TelemetryStore::from_env_or_dir(telemetry_root),
+        ),
+    );
     let resource_monitor = std::sync::Arc::new(std::sync::Mutex::new(ResourceMonitor::new()));
     let render_window_registry =
         std::sync::Arc::new(std::sync::Mutex::new(RenderWindowRegistry::default()));
@@ -2759,6 +2783,7 @@ fn main() {
             test_get_run_events,
             test_get_run_metrics,
             test_get_run_artifacts,
+            test_get_run_telemetry,
             test_list_presets,
             test_save_preset,
             test_delete_preset,

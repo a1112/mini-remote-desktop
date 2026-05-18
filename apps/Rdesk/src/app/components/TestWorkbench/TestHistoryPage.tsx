@@ -1,9 +1,11 @@
-import { useEffect, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 import { useNavigate } from "react-router";
+import { ChevronDown, LineChart, X } from "lucide-react";
 import {
   testListRuns,
 } from "../../adapters/tauri/commands";
 import type { TestRun, RunStatus } from "../../adapters/tauri/types";
+import { TestTelemetryPanel } from "./TestTelemetryPanel";
 
 export function TestHistoryPage() {
   const navigate = useNavigate();
@@ -13,6 +15,8 @@ export function TestHistoryPage() {
     scenario?: string;
     status?: string;
   }>({});
+  const [modalRunId, setModalRunId] = useState<string | null>(null);
+  const [expandedRunId, setExpandedRunId] = useState<string | null>(null);
 
   useEffect(() => {
     loadRuns();
@@ -125,55 +129,118 @@ export function TestHistoryPage() {
               {runs.map((run) => {
                 const statusInfo = statusConfig[run.status] ?? statusConfig.queued;
                 const duration = ((run.finished_at || Date.now()) - run.started_at);
+                const expanded = expandedRunId === run.run_id;
 
                 return (
-                  <tr
-                    key={run.run_id}
-                    className="hover:bg-gray-50 dark:hover:bg-gray-700/50 cursor-pointer"
-                    onClick={() => navigate(`/test/run/${run.run_id}`)}
-                  >
-                    <td className="px-4 py-3">
-                      <span className={`px-2 py-1 rounded-full text-xs font-medium ${statusInfo.color}`}>
-                        {statusInfo.label}
-                      </span>
-                    </td>
-                    <td className="px-4 py-3 text-sm font-mono">{run.scenario_id}</td>
-                    <td className="px-4 py-3 text-sm">
-                      {new Date(run.started_at).toLocaleString()}
-                    </td>
-                    <td className="px-4 py-3 text-sm">
-                      {duration >= 60000
-                        ? `${Math.floor(duration / 60000)}m ${Math.floor((duration % 60000) / 1000)}s`
-                        : `${Math.floor(duration / 1000)}s`}
-                    </td>
-                    <td className="px-4 py-3 text-sm">
-                      {run.summary ? (
-                        <div className="text-xs">
-                          <div>{run.summary.frame_count} 帧</div>
-                          {run.summary.capture_fps && (
-                            <div className="text-gray-500">{run.summary.capture_fps.toFixed(1)} FPS</div>
-                          )}
+                  <Fragment key={run.run_id}>
+                    <tr
+                      className="hover:bg-gray-50 dark:hover:bg-gray-700/50 cursor-pointer"
+                      onClick={() => navigate(`/test/run/${run.run_id}`)}
+                    >
+                      <td className="px-4 py-3">
+                        <span className={`px-2 py-1 rounded-full text-xs font-medium ${statusInfo.color}`}>
+                          {statusInfo.label}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3 text-sm font-mono">{run.scenario_id}</td>
+                      <td className="px-4 py-3 text-sm">
+                        {new Date(run.started_at).toLocaleString()}
+                      </td>
+                      <td className="px-4 py-3 text-sm">
+                        {duration >= 60000
+                          ? `${Math.floor(duration / 60000)}m ${Math.floor((duration % 60000) / 1000)}s`
+                          : `${Math.floor(duration / 1000)}s`}
+                      </td>
+                      <td className="px-4 py-3 text-sm">
+                        {run.summary ? (
+                          <div className="text-xs">
+                            <div>{run.summary.frame_count} 帧</div>
+                            {run.summary.capture_fps && (
+                              <div className="text-gray-500">{run.summary.capture_fps.toFixed(1)} FPS</div>
+                            )}
+                          </div>
+                        ) : (
+                          <span className="text-gray-400">-</span>
+                        )}
+                      </td>
+                      <td className="px-4 py-3 text-right">
+                        <div className="flex items-center justify-end gap-2">
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setModalRunId(run.run_id);
+                            }}
+                            className="inline-flex items-center gap-1 text-sm font-medium text-blue-600 hover:text-blue-800"
+                          >
+                            <LineChart className="h-4 w-4" aria-hidden="true" />
+                            曲线
+                          </button>
+                          <button
+                            type="button"
+                            aria-expanded={expanded}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setExpandedRunId(expanded ? null : run.run_id);
+                            }}
+                            className="inline-flex items-center gap-1 text-sm font-medium text-blue-600 hover:text-blue-800"
+                          >
+                            <ChevronDown
+                              className={`h-4 w-4 transition-transform ${expanded ? "rotate-180" : ""}`}
+                              aria-hidden="true"
+                            />
+                            展开
+                          </button>
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              navigate(`/test/run/${run.run_id}`);
+                            }}
+                            className="text-sm font-medium text-blue-600 hover:text-blue-800"
+                          >
+                            查看详情
+                          </button>
                         </div>
-                      ) : (
-                        <span className="text-gray-400">-</span>
-                      )}
-                    </td>
-                    <td className="px-4 py-3 text-right">
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          navigate(`/test/run/${run.run_id}`);
-                        }}
-                        className="text-blue-600 hover:text-blue-800 text-sm font-medium"
-                      >
-                        查看详情
-                      </button>
-                    </td>
-                  </tr>
+                      </td>
+                    </tr>
+                    {expanded && (
+                      <tr>
+                        <td colSpan={6} className="bg-gray-50 p-4 dark:bg-gray-900/40">
+                          <TestTelemetryPanel runId={run.run_id} mode="inline" />
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
                 );
               })}
             </tbody>
           </table>
+        </div>
+      )}
+      {modalRunId && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="测试曲线"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+          onClick={() => setModalRunId(null)}
+        >
+          <div
+            className="max-h-[90vh] w-full max-w-6xl overflow-auto rounded-lg bg-white p-4 shadow-xl dark:bg-gray-900"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="mb-3 flex justify-end">
+              <button
+                type="button"
+                onClick={() => setModalRunId(null)}
+                className="inline-flex h-9 w-9 items-center justify-center rounded hover:bg-gray-100 dark:hover:bg-gray-800"
+                aria-label="关闭"
+              >
+                <X className="h-5 w-5" aria-hidden="true" />
+              </button>
+            </div>
+            <TestTelemetryPanel runId={modalRunId} mode="modal" />
+          </div>
         </div>
       )}
     </div>

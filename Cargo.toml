@@ -29,6 +29,7 @@ members = [
   "crates/mrd-signal-client",
   "crates/mrd-signal-proto",
   "crates/mrd-signal-server",
+  "crates/mrd-test-telemetry",
   "crates/mrd-transport-quic-quinn",
   "crates/mrd-transport-webrtc",
   "crates/mrd-buffer-pool",

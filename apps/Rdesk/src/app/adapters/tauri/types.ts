@@ -290,6 +290,9 @@ export interface MetricSeries {
     p95?: number;
     p99?: number;
   };
+  category?: string;
+  display_name?: string;
+  source?: string;
 }
 
 /**
@@ -633,6 +636,46 @@ export interface MediaTestImpairmentSnapshot {
   datagrams_dropped: number;
   datagrams_delayed: number;
   datagrams_fragmented_by_mtu: number;
+}
+
+export interface TelemetryRunMetadata {
+  run_id: string;
+  scenario_id: string;
+  status: string;
+  started_at: number;
+  finished_at?: number | null;
+  tags: string[];
+}
+
+export interface TelemetryLogEntry {
+  run_id: string;
+  timestamp: number;
+  level: string;
+  source: string;
+  message: string;
+  fields?: unknown;
+}
+
+export interface TelemetryQuery {
+  start_ms?: number | null;
+  end_ms?: number | null;
+  metric_names?: string[];
+  log_sources?: string[];
+  max_points?: number | null;
+}
+
+export interface TelemetryDiagnostics {
+  corrupt_rows: number;
+  warnings: string[];
+}
+
+export interface TelemetryBundle {
+  run?: TelemetryRunMetadata | null;
+  metrics: Record<string, MetricSeries>;
+  events: TestStageEvent[];
+  logs: TelemetryLogEntry[];
+  artifacts: Artifact[];
+  diagnostics: TelemetryDiagnostics;
 }
 
 export interface MediaPipelineSnapshot {

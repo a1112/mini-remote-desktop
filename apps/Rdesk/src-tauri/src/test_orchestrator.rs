@@ -11,6 +11,7 @@ use mrd_pipeline_core::{
     VideoEncoder,
 };
 use mrd_render::{RenderFrame, RendererFactory};
+use mrd_test_telemetry as telemetry;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -226,6 +227,12 @@ pub struct MetricSeries {
     pub unit: String,
     pub samples: Vec<MetricDataPoint>,
     pub aggregation: Option<MetricAggregation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// Metric aggregation
@@ -397,18 +404,33 @@ pub struct TestOrchestrator {
     run_metrics: Arc<Mutex<HashMap<RunId, HashMap<String, MetricSeries>>>>,
     run_events: Arc<Mutex<HashMap<RunId, Vec<TestStageEvent>>>>,
     run_artifacts: Arc<Mutex<HashMap<RunId, Vec<Artifact>>>>,
+    telemetry_store: Arc<telemetry::TelemetryStore>,
     presets: Arc<Mutex<HashMap<String, TestPreset>>>,
     current_harness_chain: Arc<Mutex<Option<TestChain>>>,
 }
 
 impl TestOrchestrator {
     pub fn new(harness: Arc<Mutex<TestHarness>>) -> Self {
+        let default_root = std::env::temp_dir()
+            .join("mini-remote-desktop")
+            .join("test-telemetry");
+        Self::new_with_telemetry_store(
+            harness,
+            telemetry::TelemetryStore::from_env_or_dir(default_root),
+        )
+    }
+
+    pub fn new_with_telemetry_store(
+        harness: Arc<Mutex<TestHarness>>,
+        telemetry_store: telemetry::TelemetryStore,
+    ) -> Self {
         Self {
             harness,
             runs: Arc::new(Mutex::new(HashMap::new())),
             run_metrics: Arc::new(Mutex::new(HashMap::new())),
             run_events: Arc::new(Mutex::new(HashMap::new())),
             run_artifacts: Arc::new(Mutex::new(HashMap::new())),
+            telemetry_store: Arc::new(telemetry_store),
             presets: Arc::new(Mutex::new(HashMap::new())),
             current_harness_chain: Arc::new(Mutex::new(None)),
         }
@@ -978,6 +1000,7 @@ impl TestOrchestrator {
         };
 
         self.runs.lock().unwrap().insert(run_id.clone(), run);
+        self.persist_run_by_id(&run_id);
 
         // Record stage event
         self.record_stage_event(run_id.clone(), "prepare", "started", None, None);
@@ -1004,6 +1027,7 @@ impl TestOrchestrator {
                     failure_reason: Some("initialization_failure".to_string()),
                     ..Default::default()
                 });
+                persist_run_to_store(&self.telemetry_store, run);
             }
 
             self.record_stage_event(
@@ -1028,6 +1052,7 @@ impl TestOrchestrator {
         let orchestrator_runs = self.runs.clone();
         let orchestrator_events = self.run_events.clone();
         let orchestrator_metrics = self.run_metrics.clone();
+        let telemetry_store = self.telemetry_store.clone();
         let harness = self.harness.clone();
         let duration_ms = config.duration_ms.unwrap_or(30_000);
 
@@ -1045,18 +1070,18 @@ impl TestOrchestrator {
                 };
 
                 if !is_running {
-                    orchestrator_events
-                        .lock()
-                        .unwrap()
-                        .entry(run_id_clone.clone())
-                        .or_insert_with(Vec::new)
-                        .push(TestStageEvent {
+                    push_stage_event(
+                        &orchestrator_events,
+                        &telemetry_store,
+                        &run_id_clone,
+                        TestStageEvent {
                             stage: "running".to_string(),
                             status: "stopped".to_string(),
                             timestamp: now_ms(),
                             duration_ms: None,
                             error: None,
-                        });
+                        },
+                    );
                     break;
                 }
 
@@ -1074,6 +1099,7 @@ impl TestOrchestrator {
                     mark_run_failed(
                         &orchestrator_runs,
                         &orchestrator_events,
+                        &telemetry_store,
                         &run_id_clone,
                         &metrics,
                         "runtime_failure",
@@ -1087,6 +1113,7 @@ impl TestOrchestrator {
                     mark_run_failed(
                         &orchestrator_runs,
                         &orchestrator_events,
+                        &telemetry_store,
                         &run_id_clone,
                         &metrics,
                         "runtime_stopped",
@@ -1100,29 +1127,70 @@ impl TestOrchestrator {
                     let run_series = series
                         .entry(run_id_clone.clone())
                         .or_insert_with(HashMap::new);
-                    push_metric_sample(run_series, "capture_fps", "fps", metrics.capture_fps);
-                    push_metric_sample(
+                    let timestamp =
+                        push_metric_sample(run_series, "capture_fps", "fps", metrics.capture_fps);
+                    append_metric_to_store(
+                        &telemetry_store,
+                        &run_id_clone,
+                        "capture_fps",
+                        "fps",
+                        timestamp,
+                        metrics.capture_fps,
+                    );
+                    let timestamp = push_metric_sample(
                         run_series,
                         "encode_latency_p95_ms",
                         "ms",
                         metrics.encode_latency_p95_ms,
                     );
-                    push_metric_sample(
+                    append_metric_to_store(
+                        &telemetry_store,
+                        &run_id_clone,
+                        "encode_latency_p95_ms",
+                        "ms",
+                        timestamp,
+                        metrics.encode_latency_p95_ms,
+                    );
+                    let timestamp = push_metric_sample(
                         run_series,
                         "transport_latency_p95_ms",
                         "ms",
                         metrics.transport_latency_p95_ms,
                     );
-                    push_metric_sample(
+                    append_metric_to_store(
+                        &telemetry_store,
+                        &run_id_clone,
+                        "transport_latency_p95_ms",
+                        "ms",
+                        timestamp,
+                        metrics.transport_latency_p95_ms,
+                    );
+                    let timestamp = push_metric_sample(
                         run_series,
                         "decode_latency_p95_ms",
                         "ms",
                         metrics.decode_latency_p95_ms,
                     );
-                    push_metric_sample(
+                    append_metric_to_store(
+                        &telemetry_store,
+                        &run_id_clone,
+                        "decode_latency_p95_ms",
+                        "ms",
+                        timestamp,
+                        metrics.decode_latency_p95_ms,
+                    );
+                    let timestamp = push_metric_sample(
                         run_series,
                         "total_latency_p95_ms",
                         "ms",
+                        metrics.total_latency_p95_ms,
+                    );
+                    append_metric_to_store(
+                        &telemetry_store,
+                        &run_id_clone,
+                        "total_latency_p95_ms",
+                        "ms",
+                        timestamp,
                         metrics.total_latency_p95_ms,
                     );
                 }
@@ -1144,6 +1212,7 @@ impl TestOrchestrator {
                         mark_run_failed(
                             &orchestrator_runs,
                             &orchestrator_events,
+                            &telemetry_store,
                             &run_id_clone,
                             &metrics,
                             failure_reason,
@@ -1155,6 +1224,7 @@ impl TestOrchestrator {
                             run.status = RunStatus::Completed;
                             run.finished_at = Some(now_ms());
                             run.summary = Some(summary_from_metrics(run.started_at, &metrics));
+                            persist_run_to_store(&telemetry_store, run);
                         }
                     }
                     let harness_for_stop = Arc::clone(&harness);
@@ -1209,6 +1279,7 @@ impl TestOrchestrator {
         };
 
         self.runs.lock().unwrap().insert(run_id.clone(), run);
+        self.persist_run_by_id(&run_id);
         self.record_stage_event(run_id.clone(), "prepare", "started", None, None);
         self.record_stage_event(run_id.clone(), "initialize", "started", None, None);
 
@@ -1216,6 +1287,7 @@ impl TestOrchestrator {
         let events = Arc::clone(&self.run_events);
         let metrics = Arc::clone(&self.run_metrics);
         let artifacts = Arc::clone(&self.run_artifacts);
+        let telemetry_store = Arc::clone(&self.telemetry_store);
         let run_id_clone = run_id.clone();
         thread::spawn(move || {
             events
@@ -1297,24 +1369,29 @@ impl TestOrchestrator {
                     let data =
                         serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
                     let size_bytes = data.len();
+                    let artifact = Artifact {
+                        artifact_id: format!("render_probe_{}", now_ms()),
+                        kind: "structured_log".to_string(),
+                        run_id: run_id_clone.clone(),
+                        created_at: now_ms(),
+                        data,
+                        metadata: Some(ArtifactMetadata {
+                            width: Some(result.width),
+                            height: Some(result.height),
+                            format: Some("json".to_string()),
+                            size_bytes: Some(size_bytes),
+                        }),
+                    };
                     artifacts
                         .lock()
                         .unwrap()
                         .entry(run_id_clone.clone())
                         .or_insert_with(Vec::new)
-                        .push(Artifact {
-                            artifact_id: format!("render_probe_{}", now_ms()),
-                            kind: "structured_log".to_string(),
-                            run_id: run_id_clone.clone(),
-                            created_at: now_ms(),
-                            data,
-                            metadata: Some(ArtifactMetadata {
-                                width: Some(result.width),
-                                height: Some(result.height),
-                                format: Some("json".to_string()),
-                                size_bytes: Some(size_bytes),
-                            }),
-                        });
+                        .push(artifact.clone());
+                    let _ = telemetry_store.upsert_artifacts(
+                        &run_id_clone,
+                        &[telemetry_artifact_from_artifact(artifact)],
+                    );
 
                     if let Some(run) = runs.lock().unwrap().get_mut(&run_id_clone) {
                         run.status = RunStatus::Completed;
@@ -1326,6 +1403,7 @@ impl TestOrchestrator {
                             frame_count: result.frames_presented,
                             ..Default::default()
                         });
+                        persist_run_to_store(&telemetry_store, run);
                     }
                     events
                         .lock()
@@ -1363,6 +1441,7 @@ impl TestOrchestrator {
                             failure_reason: Some("runtime_failure".to_string()),
                             ..Default::default()
                         });
+                        persist_run_to_store(&telemetry_store, run);
                     }
                     events
                         .lock()
@@ -1406,6 +1485,7 @@ impl TestOrchestrator {
         };
 
         self.runs.lock().unwrap().insert(run_id.clone(), run);
+        self.persist_run_by_id(&run_id);
         self.record_stage_event(run_id.clone(), "prepare", "started", None, None);
         self.record_stage_event(run_id.clone(), "capability_check", "started", None, None);
 
@@ -1638,6 +1718,7 @@ impl TestOrchestrator {
                             size_bytes: Some(size_bytes),
                         }),
                     });
+                self.persist_artifacts_by_id(&run_id);
 
                 if let Some(sample) = encoded_sample {
                     let sample_size = sample.len();
@@ -1659,6 +1740,7 @@ impl TestOrchestrator {
                                 size_bytes: Some(sample_size),
                             }),
                         });
+                    self.persist_artifacts_by_id(&run_id);
                 }
 
                 if let Some(run) = self.runs.lock().unwrap().get_mut(&run_id) {
@@ -1682,6 +1764,7 @@ impl TestOrchestrator {
                         ..Default::default()
                     });
                 }
+                self.persist_run_by_id(&run_id);
                 self.record_stage_event(run_id.clone(), "summarize", "completed", None, None);
             }
             Err(error) => {
@@ -2223,6 +2306,7 @@ impl TestOrchestrator {
             error,
         };
 
+        append_event_to_store(&self.telemetry_store, &run_id, &event);
         self.run_events
             .lock()
             .unwrap()
@@ -2259,6 +2343,61 @@ impl TestOrchestrator {
             .get(run_id)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Get persisted telemetry for a run.
+    pub fn get_run_telemetry(
+        &self,
+        run_id: &str,
+        query: telemetry::TelemetryQuery,
+    ) -> Result<telemetry::TelemetryBundle> {
+        let mut bundle = self.telemetry_store.query_bundle(run_id, query)?;
+
+        if bundle.run.is_none() {
+            if let Some(run) = self.get_run(run_id) {
+                bundle.run = Some(run_metadata_from_test_run(&run));
+            }
+        }
+        if bundle.metrics.is_empty() {
+            bundle.metrics = self
+                .get_run_metrics(run_id)
+                .into_iter()
+                .map(|(name, series)| (name, telemetry_series_from_metric_series(series)))
+                .collect();
+        }
+        if bundle.events.is_empty() {
+            bundle.events = self
+                .get_run_events(run_id)
+                .into_iter()
+                .map(telemetry_event_from_stage_event)
+                .collect();
+        }
+        if bundle.artifacts.is_empty() {
+            bundle.artifacts = self
+                .get_run_artifacts(run_id)
+                .into_iter()
+                .map(telemetry_artifact_from_artifact)
+                .collect();
+        }
+
+        Ok(bundle)
+    }
+
+    fn persist_run_by_id(&self, run_id: &str) {
+        if let Some(run) = self.get_run(run_id) {
+            persist_run_to_store(&self.telemetry_store, &run);
+        }
+    }
+
+    fn persist_artifacts_by_id(&self, run_id: &str) {
+        let artifacts: Vec<_> = self
+            .get_run_artifacts(run_id)
+            .into_iter()
+            .map(telemetry_artifact_from_artifact)
+            .collect();
+        if !artifacts.is_empty() {
+            let _ = self.telemetry_store.upsert_artifacts(run_id, &artifacts);
+        }
     }
 
     /// Save a preset
@@ -3188,9 +3327,168 @@ fn harness_config_from_data(config: &TestConfigData) -> HarnessConfig {
     }
 }
 
+fn run_metadata_from_test_run(run: &TestRun) -> telemetry::TelemetryRunMetadata {
+    telemetry::TelemetryRunMetadata {
+        run_id: run.run_id.clone(),
+        scenario_id: run.scenario_id.clone(),
+        status: serde_json::to_value(&run.status)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_else(|| format!("{:?}", run.status).to_ascii_lowercase()),
+        started_at: run.started_at,
+        finished_at: run.finished_at,
+        tags: vec![serde_json::to_value(&run.run_mode)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_else(|| "manual".to_string())],
+    }
+}
+
+fn persist_run_to_store(store: &telemetry::TelemetryStore, run: &TestRun) {
+    let _ = store.upsert_run(&run_metadata_from_test_run(run));
+}
+
+fn telemetry_event_from_stage_event(event: TestStageEvent) -> telemetry::TelemetryStageEvent {
+    telemetry::TelemetryStageEvent {
+        stage: event.stage,
+        status: event.status,
+        timestamp: event.timestamp,
+        duration_ms: event.duration_ms,
+        error: event.error,
+    }
+}
+
+fn telemetry_artifact_from_artifact(artifact: Artifact) -> telemetry::TelemetryArtifactRecord {
+    telemetry::TelemetryArtifactRecord {
+        artifact_id: artifact.artifact_id,
+        kind: artifact.kind,
+        run_id: artifact.run_id,
+        created_at: artifact.created_at,
+        data: artifact.data,
+        metadata: artifact
+            .metadata
+            .and_then(|metadata| serde_json::to_value(metadata).ok()),
+    }
+}
+
+fn telemetry_series_from_metric_series(series: MetricSeries) -> telemetry::TelemetryMetricSeries {
+    telemetry::TelemetryMetricSeries {
+        metric_name: series.metric_name,
+        unit: series.unit,
+        samples: series
+            .samples
+            .into_iter()
+            .map(|sample| telemetry::TelemetryMetricPoint {
+                timestamp: sample.timestamp,
+                value: sample.value,
+            })
+            .collect(),
+        aggregation: series
+            .aggregation
+            .map(|aggregation| telemetry::TelemetryMetricAggregation {
+                min: aggregation.min,
+                max: aggregation.max,
+                mean: aggregation.mean,
+                p50: aggregation.p50,
+                p95: aggregation.p95,
+                p99: aggregation.p99,
+            }),
+        category: series.category,
+        display_name: series.display_name,
+        source: series.source,
+    }
+}
+
+fn metric_metadata(
+    metric_name: &str,
+    unit: &str,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let category = if metric_name.contains("fps") {
+        "fps"
+    } else if metric_name.contains("bitrate") || metric_name.contains("bytes") {
+        "bitrate"
+    } else if metric_name.contains("latency") || metric_name.contains("time") {
+        "latency"
+    } else if metric_name.contains("drop") || metric_name.contains("queue") {
+        "drops_queue"
+    } else if metric_name.contains("transport") {
+        "transport"
+    } else {
+        match unit {
+            "fps" => "fps",
+            "ms" => "latency",
+            "Mbps" | "mbps" | "bps" => "bitrate",
+            _ => "other",
+        }
+    };
+    let display_name = metric_name
+        .trim_end_matches("_ms")
+        .replace('_', " ")
+        .split_whitespace()
+        .map(|part| {
+            if matches!(part, "fps" | "p50" | "p95" | "p99") {
+                part.to_ascii_uppercase()
+            } else {
+                let mut chars = part.chars();
+                match chars.next() {
+                    Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                    None => String::new(),
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    (
+        Some(category.to_string()),
+        Some(display_name),
+        Some("test_orchestrator".to_string()),
+    )
+}
+
+fn append_metric_to_store(
+    store: &telemetry::TelemetryStore,
+    run_id: &str,
+    metric_name: &str,
+    unit: &str,
+    timestamp: u64,
+    value: f64,
+) {
+    let (category, display_name, source) = metric_metadata(metric_name, unit);
+    let _ = store.append_metric(&telemetry::TelemetryMetricSample {
+        run_id: run_id.to_string(),
+        metric_name: metric_name.to_string(),
+        timestamp,
+        value,
+        unit: unit.to_string(),
+        category,
+        source,
+        display_name,
+    });
+}
+
+fn append_event_to_store(store: &telemetry::TelemetryStore, run_id: &str, event: &TestStageEvent) {
+    let _ = store.append_event(run_id, &telemetry_event_from_stage_event(event.clone()));
+}
+
+fn push_stage_event(
+    events: &Arc<Mutex<HashMap<RunId, Vec<TestStageEvent>>>>,
+    store: &telemetry::TelemetryStore,
+    run_id: &str,
+    event: TestStageEvent,
+) {
+    append_event_to_store(store, run_id, &event);
+    events
+        .lock()
+        .unwrap()
+        .entry(run_id.to_string())
+        .or_insert_with(Vec::new)
+        .push(event);
+}
+
 fn mark_run_failed(
     runs: &Arc<Mutex<HashMap<RunId, TestRun>>>,
     events: &Arc<Mutex<HashMap<RunId, Vec<TestStageEvent>>>>,
+    store: &telemetry::TelemetryStore,
     run_id: &str,
     metrics: &HarnessMetrics,
     failure_reason: &str,
@@ -3208,24 +3506,25 @@ fn mark_run_failed(
                 run.status = RunStatus::Failed;
                 run.finished_at = Some(now_ms());
                 run.summary = Some(summary);
+                persist_run_to_store(store, run);
                 should_record_event = true;
             }
         }
     }
 
     if should_record_event {
-        events
-            .lock()
-            .unwrap()
-            .entry(run_id.to_string())
-            .or_insert_with(Vec::new)
-            .push(TestStageEvent {
+        push_stage_event(
+            events,
+            store,
+            run_id,
+            TestStageEvent {
                 stage: "running".to_string(),
                 status: "failed".to_string(),
                 timestamp: now_ms(),
                 duration_ms: None,
                 error: Some(error_message),
-            });
+            },
+        );
     }
 }
 
@@ -3234,7 +3533,8 @@ fn push_metric_sample(
     metric_name: &str,
     unit: &str,
     value: f64,
-) {
+) -> u64 {
+    let (category, display_name, source) = metric_metadata(metric_name, unit);
     let series = run_series
         .entry(metric_name.to_string())
         .or_insert_with(|| MetricSeries {
@@ -3242,13 +3542,15 @@ fn push_metric_sample(
             unit: unit.to_string(),
             samples: Vec::new(),
             aggregation: None,
+            category,
+            display_name,
+            source,
         });
 
-    series.samples.push(MetricDataPoint {
-        timestamp: now_ms(),
-        value,
-    });
+    let timestamp = now_ms();
+    series.samples.push(MetricDataPoint { timestamp, value });
     series.aggregation = Some(compute_aggregation(&series.samples));
+    timestamp
 }
 
 fn compute_aggregation(samples: &[MetricDataPoint]) -> MetricAggregation {
@@ -3281,6 +3583,20 @@ fn compute_aggregation(samples: &[MetricDataPoint]) -> MetricAggregation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_orchestrator_with_telemetry_store(name: &str) -> TestOrchestrator {
+        let root = std::env::temp_dir().join(format!(
+            "mrd-test-orchestrator-telemetry-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        TestOrchestrator::new_with_telemetry_store(
+            Arc::new(Mutex::new(
+                TestHarness::new().expect("failed to create test harness"),
+            )),
+            telemetry::TelemetryStore::new(root),
+        )
+    }
 
     fn test_env() -> EnvironmentSnapshot {
         EnvironmentSnapshot {
@@ -3915,7 +4231,7 @@ mod tests {
 
     #[test]
     fn runtime_harness_error_marks_run_failed() {
-        let orchestrator = TestOrchestrator::default();
+        let orchestrator = test_orchestrator_with_telemetry_store("runtime-error");
         let run_id = "run_runtime_error".to_string();
         let started_at = now_ms();
 
@@ -3944,6 +4260,7 @@ mod tests {
         mark_run_failed(
             &orchestrator.runs,
             &orchestrator.run_events,
+            &orchestrator.telemetry_store,
             &run_id,
             &metrics,
             "runtime_failure",
@@ -3961,6 +4278,15 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| { event.stage == "running" && event.status == "failed" }));
+
+        let telemetry = orchestrator
+            .get_run_telemetry(&run_id, telemetry::TelemetryQuery::default())
+            .expect("telemetry bundle");
+        assert_eq!(telemetry.run.unwrap().status, "failed");
+        assert!(telemetry
+            .events
+            .iter()
+            .any(|event| event.stage == "running" && event.status == "failed"));
     }
 
     #[cfg(any(windows, target_os = "macos"))]

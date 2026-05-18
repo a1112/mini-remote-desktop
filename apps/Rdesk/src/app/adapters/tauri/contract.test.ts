@@ -911,6 +911,31 @@ describe('Tauri Adapter Contract', () => {
       });
     });
 
+    it('test_get_run_telemetry calls telemetry command with query', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue({
+        run: null,
+        metrics: {},
+        events: [],
+        logs: [],
+        artifacts: [],
+        diagnostics: { corrupt_rows: 0, warnings: [] },
+      });
+
+      await adapter.testGetRunTelemetry('run-1', {
+        metric_names: ['capture_fps'],
+        max_points: 500,
+      });
+
+      expect(mockInvoke).toHaveBeenCalledWith('test_get_run_telemetry', {
+        runId: 'run-1',
+        query: {
+          metric_names: ['capture_fps'],
+          max_points: 500,
+        },
+      });
+    });
+
     it('test preset commands call registered command names', async () => {
       const mockInvoke = getMockInvoke();
       const config = { encoder_type: 'openh264' as const };

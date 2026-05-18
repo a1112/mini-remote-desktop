@@ -3,14 +3,13 @@ import { useParams, useNavigate } from "react-router";
 import {
   testGetRun,
   testGetRunEvents,
-  testGetRunMetrics,
   testStopRun,
 } from "../../adapters/tauri/commands";
 import type {
   TestRun,
   TestStageEvent,
-  MetricSeries,
 } from "../../adapters/tauri/types";
+import { TestTelemetryPanel } from "./TestTelemetryPanel";
 
 export function RunDetailPage() {
   const { runId } = useParams<{ runId: string }>();
@@ -18,7 +17,6 @@ export function RunDetailPage() {
 
   const [run, setRun] = useState<TestRun | null>(null);
   const [events, setEvents] = useState<TestStageEvent[]>([]);
-  const [metrics, setMetrics] = useState<Record<string, MetricSeries>>({});
   const [loading, setLoading] = useState(true);
   const [stopping, setStopping] = useState(false);
 
@@ -41,16 +39,6 @@ export function RunDetailPage() {
         setRun(runData.value);
         if (eventsData.ok) {
           setEvents(eventsData.value);
-        }
-
-        // Load metrics if available
-        try {
-          const metricsData = await testGetRunMetrics(runId);
-          if (metricsData.ok) {
-            setMetrics(metricsData.value);
-          }
-        } catch {
-          // Metrics might not be available yet
         }
       } catch (error) {
         console.error("Failed to load run data:", error);
@@ -387,14 +375,9 @@ export function RunDetailPage() {
             </div>
           )}
 
-          {/* Metrics Chart Placeholder */}
-          {Object.keys(metrics).length > 0 && (
-            <div className="bg-white dark:bg-gray-800 rounded-lg shadow p-4">
-              <h2 className="text-lg font-semibold mb-4">实时指标</h2>
-              <div className="h-48 flex items-center justify-center text-gray-400">
-                <p>指标图表功能即将推出</p>
-              </div>
-            </div>
+          {/* Metrics Chart */}
+          {run && (
+            <TestTelemetryPanel runId={run.run_id} mode="fullPage" />
           )}
         </div>
       </div>
