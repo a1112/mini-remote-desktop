@@ -10,7 +10,7 @@ use image::{codecs::png::PngEncoder, ColorType, ImageEncoder};
 use mrd_application::ports::SessionSnapshot;
 use mrd_ipc::{
     AttachedRenderSurface, CaptureSourceSelection, MediaAdaptationSnapshot, MediaPipelineSnapshot,
-    MediaProfileNegotiation, MediaStageMetrics, MediaTestImpairmentSnapshot,
+    MediaProfile, MediaProfileNegotiation, MediaStageMetrics, MediaTestImpairmentSnapshot,
 };
 use mrd_proto::{DeviceId, SessionId};
 #[cfg(windows)]
@@ -215,6 +215,17 @@ struct MediaPipelineState {
     attached_surfaces: HashMap<String, AttachedRenderSurface>,
     active_decoder: Option<String>,
     active_renderer: Option<String>,
+    active_codec: Option<String>,
+    active_codec_profile: Option<String>,
+    active_bit_depth: Option<u8>,
+    active_chroma_subsampling: Option<String>,
+    active_pixel_format: Option<String>,
+    active_hdr_enabled: Option<bool>,
+    active_width: Option<u32>,
+    active_height: Option<u32>,
+    active_fps: Option<u32>,
+    active_bitrate_mbps: Option<u32>,
+    codec_fallback_reason: Option<String>,
     queue_depth: u32,
     dropped_frames: u64,
     render_queue_replacements: u64,
@@ -306,6 +317,42 @@ impl MediaPipelineRegistry {
         self.pipelines.entry(session_id).or_default().active_decoder = Some(decoder.into());
     }
 
+    pub fn set_active_media_profile(&mut self, session_id: SessionId, profile: &MediaProfile) {
+        let state = self.pipelines.entry(session_id).or_default();
+        state.active_codec = Some(profile.codec.clone());
+        state.active_codec_profile = profile.codec_profile.clone();
+        state.active_bit_depth = profile.bit_depth;
+        state.active_chroma_subsampling = profile.chroma_subsampling.clone();
+        state.active_pixel_format = profile.pixel_format.clone();
+        state.active_hdr_enabled = profile.hdr_enabled;
+        state.active_width = Some(profile.width);
+        state.active_height = Some(profile.height);
+        state.active_fps = Some(profile.fps);
+        state.active_bitrate_mbps = Some(profile.bitrate_mbps);
+    }
+
+    pub fn record_active_media_sample(
+        &mut self,
+        session_id: SessionId,
+        profile: &MediaProfile,
+        width: u32,
+        height: u32,
+        pixel_format: impl Into<String>,
+    ) {
+        self.set_active_media_profile(session_id.clone(), profile);
+        let state = self.pipelines.entry(session_id).or_default();
+        state.active_width = Some(width);
+        state.active_height = Some(height);
+        state.active_pixel_format = Some(pixel_format.into());
+    }
+
+    pub fn set_codec_fallback_reason(&mut self, session_id: SessionId, reason: Option<String>) {
+        self.pipelines
+            .entry(session_id)
+            .or_default()
+            .codec_fallback_reason = reason;
+    }
+
     pub fn record_queue_depth(&mut self, session_id: SessionId, queue_depth: u32) {
         self.pipelines.entry(session_id).or_default().queue_depth = queue_depth;
     }
@@ -395,6 +442,18 @@ impl MediaPipelineRegistry {
                 .unwrap_or_default(),
             active_decoder: state.and_then(|state| state.active_decoder.clone()),
             active_renderer: state.and_then(|state| state.active_renderer.clone()),
+            active_codec: state.and_then(|state| state.active_codec.clone()),
+            active_codec_profile: state.and_then(|state| state.active_codec_profile.clone()),
+            active_bit_depth: state.and_then(|state| state.active_bit_depth),
+            active_chroma_subsampling: state
+                .and_then(|state| state.active_chroma_subsampling.clone()),
+            active_pixel_format: state.and_then(|state| state.active_pixel_format.clone()),
+            active_hdr_enabled: state.and_then(|state| state.active_hdr_enabled),
+            active_width: state.and_then(|state| state.active_width),
+            active_height: state.and_then(|state| state.active_height),
+            active_fps: state.and_then(|state| state.active_fps),
+            active_bitrate_mbps: state.and_then(|state| state.active_bitrate_mbps),
+            codec_fallback_reason: state.and_then(|state| state.codec_fallback_reason.clone()),
             queue_depth: state.map_or(0, |state| state.queue_depth),
             dropped_frames: state.map_or(0, |state| state.dropped_frames),
             render_queue_replacements: state.map_or(0, |state| state.render_queue_replacements),
@@ -585,6 +644,7 @@ pub struct DecodedVideoFrameStats {
     pub target_fps: u32,
     pub target_bitrate_mbps: u32,
     pub encoded_bytes: u32,
+    pub format: String,
     pub pixel_format: String,
     pub payload_hash: String,
     pub preview_width: Option<u32>,
@@ -657,7 +717,7 @@ impl ProbeRegistry {
         stats.first_seen_ms.get_or_insert(now_ms);
         stats.last_seen_ms = Some(now_ms);
         stats.media_probe_valid = true;
-        stats.media_probe_format = Some("h264_desktop_frame".to_string());
+        stats.media_probe_format = Some(frame.format);
         stats.media_probe_width = Some(frame.width);
         stats.media_probe_height = Some(frame.height);
         stats.media_probe_target_fps = Some(frame.target_fps);
@@ -1230,6 +1290,7 @@ mod tests {
                 target_fps: 144,
                 target_bitrate_mbps: 64,
                 encoded_bytes: 1024,
+                format: "h264_desktop_frame".to_string(),
                 pixel_format: "rgb24".to_string(),
                 payload_hash: "fnv1a64:preview".to_string(),
                 preview_width: Some(2),
@@ -1272,6 +1333,7 @@ mod tests {
                 target_fps: 144,
                 target_bitrate_mbps: 20,
                 encoded_bytes: 2048,
+                format: "hevc_desktop_frame".to_string(),
                 pixel_format: "cpu_nv12".to_string(),
                 payload_hash: "fnv1a64:encoded".to_string(),
                 preview_width: None,
@@ -1287,6 +1349,10 @@ mod tests {
         assert_eq!(snapshot.frames_decoded, 1);
         assert_eq!(snapshot.media_probe_width, Some(1920));
         assert_eq!(snapshot.media_probe_height, Some(1080));
+        assert_eq!(
+            snapshot.media_probe_format.as_deref(),
+            Some("hevc_desktop_frame")
+        );
         assert_eq!(
             snapshot.last_media_payload_hash.as_deref(),
             Some("fnv1a64:encoded")
@@ -1353,6 +1419,52 @@ mod tests {
         assert_eq!(snapshot.render_lock_drops, 2);
     }
 
+    #[test]
+    fn media_pipeline_registry_exposes_active_media_profile_sampling() {
+        let mut registry = MediaPipelineRegistry::default();
+        let session_id = SessionId("active-profile-session".to_string());
+        let profile = MediaProfile {
+            width: 2560,
+            height: 1440,
+            fps: 144,
+            bitrate_mbps: 80,
+            codec: "hevc".to_string(),
+            codec_profile: Some("main".to_string()),
+            bit_depth: Some(8),
+            chroma_subsampling: Some("4:2:0".to_string()),
+            pixel_format: Some("nv12".to_string()),
+            hdr_enabled: Some(false),
+        };
+
+        registry.set_active_media_profile(session_id.clone(), &profile);
+
+        let snapshot = registry.snapshot(&session_id);
+
+        assert_eq!(snapshot.active_codec.as_deref(), Some("hevc"));
+        assert_eq!(snapshot.active_codec_profile.as_deref(), Some("main"));
+        assert_eq!(snapshot.active_bit_depth, Some(8));
+        assert_eq!(snapshot.active_chroma_subsampling.as_deref(), Some("4:2:0"));
+        assert_eq!(snapshot.active_pixel_format.as_deref(), Some("nv12"));
+        assert_eq!(snapshot.active_hdr_enabled, Some(false));
+        assert_eq!(snapshot.active_width, Some(2560));
+        assert_eq!(snapshot.active_height, Some(1440));
+        assert_eq!(snapshot.active_fps, Some(144));
+        assert_eq!(snapshot.active_bitrate_mbps, Some(80));
+
+        registry.record_active_media_sample(
+            session_id.clone(),
+            &profile,
+            2560,
+            1440,
+            "d3d11_shared_nv12",
+        );
+        let snapshot = registry.snapshot(&session_id);
+        assert_eq!(
+            snapshot.active_pixel_format.as_deref(),
+            Some("d3d11_shared_nv12")
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn media_render_queue_keeps_latest_frame_while_worker_is_running() {
@@ -1393,6 +1505,7 @@ mod tests {
             fps: 144,
             bitrate_mbps: 64,
             codec: "h264".to_string(),
+            ..mrd_ipc::MediaProfile::default()
         };
         let negotiation = MediaProfileNegotiation {
             requested: profile.clone(),

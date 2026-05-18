@@ -25,6 +25,7 @@ fn test_media_profile() -> MediaProfile {
         fps: 144,
         bitrate_mbps: 64,
         codec: "h264".to_string(),
+        ..MediaProfile::default()
     }
 }
 
@@ -189,6 +190,7 @@ fn serialize_deserialize_configure_media_adaptation() {
             fps: 60,
             bitrate_mbps: 10,
             codec: "h264".to_string(),
+            ..MediaProfile::default()
         }),
         ladder: vec![test_media_profile()],
         downshift_cooldown_ms: 2_000,
@@ -398,6 +400,7 @@ fn serialize_deserialize_media_profile_updated_response() {
             fps: 240,
             bitrate_mbps: 120,
             codec: "h264".to_string(),
+            ..MediaProfile::default()
         },
         selected: test_media_profile(),
         status: "downgraded".to_string(),
@@ -459,6 +462,17 @@ fn serialize_deserialize_media_pipeline_snapshot_contract() {
             }],
             active_decoder: Some("nvdec".to_string()),
             active_renderer: Some("d3d11".to_string()),
+            active_codec: Some("hevc".to_string()),
+            active_codec_profile: Some("main".to_string()),
+            active_bit_depth: Some(8),
+            active_chroma_subsampling: Some("4:2:0".to_string()),
+            active_pixel_format: Some("d3d11_shared_nv12".to_string()),
+            active_hdr_enabled: Some(false),
+            active_width: Some(2560),
+            active_height: Some(1440),
+            active_fps: Some(144),
+            active_bitrate_mbps: Some(80),
+            codec_fallback_reason: None,
             queue_depth: 1,
             dropped_frames: 2,
             render_queue_replacements: 1,

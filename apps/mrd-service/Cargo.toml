@@ -23,6 +23,7 @@ mrd-proto = { path = "../../crates/mrd-proto" }
 mrd-render = { path = "../../crates/mrd-render" }
 mrd-transport-quic-quinn = { path = "../../crates/mrd-transport-quic-quinn" }
 base64 = "0.22"
+bytes.workspace = true
 image = { version = "0.25", default-features = false, features = ["png"] }
 serde.workspace = true
 serde_json.workspace = true

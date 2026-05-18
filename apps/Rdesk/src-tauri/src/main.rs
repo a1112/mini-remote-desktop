@@ -66,6 +66,12 @@ const LAN_E2E_PROFILE_WIDTH_ENV: &str = "MRD_LAN_E2E_PROFILE_WIDTH";
 const LAN_E2E_PROFILE_HEIGHT_ENV: &str = "MRD_LAN_E2E_PROFILE_HEIGHT";
 const LAN_E2E_PROFILE_FPS_ENV: &str = "MRD_LAN_E2E_PROFILE_FPS";
 const LAN_E2E_PROFILE_BITRATE_MBPS_ENV: &str = "MRD_LAN_E2E_PROFILE_BITRATE_MBPS";
+const LAN_E2E_PROFILE_CODEC_ENV: &str = "MRD_LAN_E2E_PROFILE_CODEC";
+const LAN_E2E_PROFILE_CODEC_PROFILE_ENV: &str = "MRD_LAN_E2E_PROFILE_CODEC_PROFILE";
+const LAN_E2E_PROFILE_BIT_DEPTH_ENV: &str = "MRD_LAN_E2E_PROFILE_BIT_DEPTH";
+const LAN_E2E_PROFILE_CHROMA_SUBSAMPLING_ENV: &str = "MRD_LAN_E2E_PROFILE_CHROMA_SUBSAMPLING";
+const LAN_E2E_PROFILE_PIXEL_FORMAT_ENV: &str = "MRD_LAN_E2E_PROFILE_PIXEL_FORMAT";
+const LAN_E2E_PROFILE_HDR_ENABLED_ENV: &str = "MRD_LAN_E2E_PROFILE_HDR_ENABLED";
 const LAN_E2E_DISPLAY_MODE_POLICY_ENV: &str = "MRD_LAN_E2E_DISPLAY_MODE_POLICY";
 const LAN_E2E_CAPTURE_SOURCE_ID_ENV: &str = "MRD_LAN_E2E_CAPTURE_SOURCE_ID";
 const LAN_E2E_CAPTURE_SOURCE_KIND_ENV: &str = "MRD_LAN_E2E_CAPTURE_SOURCE_KIND";
@@ -2330,6 +2336,12 @@ struct LanE2eAutorunLaunchConfig {
     profile_height: Option<String>,
     profile_fps: Option<String>,
     profile_bitrate_mbps: Option<String>,
+    profile_codec: Option<String>,
+    profile_codec_profile: Option<String>,
+    profile_bit_depth: Option<String>,
+    profile_chroma_subsampling: Option<String>,
+    profile_pixel_format: Option<String>,
+    profile_hdr_enabled: Option<String>,
     display_mode_policy: Option<String>,
     capture_source_id: Option<String>,
     capture_source_kind: Option<String>,
@@ -2362,6 +2374,12 @@ where
         profile_height: non_empty_env(env(LAN_E2E_PROFILE_HEIGHT_ENV)),
         profile_fps: non_empty_env(env(LAN_E2E_PROFILE_FPS_ENV)),
         profile_bitrate_mbps: non_empty_env(env(LAN_E2E_PROFILE_BITRATE_MBPS_ENV)),
+        profile_codec: non_empty_env(env(LAN_E2E_PROFILE_CODEC_ENV)),
+        profile_codec_profile: non_empty_env(env(LAN_E2E_PROFILE_CODEC_PROFILE_ENV)),
+        profile_bit_depth: non_empty_env(env(LAN_E2E_PROFILE_BIT_DEPTH_ENV)),
+        profile_chroma_subsampling: non_empty_env(env(LAN_E2E_PROFILE_CHROMA_SUBSAMPLING_ENV)),
+        profile_pixel_format: non_empty_env(env(LAN_E2E_PROFILE_PIXEL_FORMAT_ENV)),
+        profile_hdr_enabled: non_empty_env(env(LAN_E2E_PROFILE_HDR_ENABLED_ENV)),
         display_mode_policy: non_empty_env(env(LAN_E2E_DISPLAY_MODE_POLICY_ENV)),
         capture_source_id: non_empty_env(env(LAN_E2E_CAPTURE_SOURCE_ID_ENV)),
         capture_source_kind: non_empty_env(env(LAN_E2E_CAPTURE_SOURCE_KIND_ENV)),
@@ -2388,6 +2406,16 @@ fn build_lan_e2e_autorun_route(config: LanE2eAutorunLaunchConfig) -> String {
     push_query_param(&mut params, "height", config.profile_height);
     push_query_param(&mut params, "fps", config.profile_fps);
     push_query_param(&mut params, "bitrateMbps", config.profile_bitrate_mbps);
+    push_query_param(&mut params, "codec", config.profile_codec);
+    push_query_param(&mut params, "codecProfile", config.profile_codec_profile);
+    push_query_param(&mut params, "bitDepth", config.profile_bit_depth);
+    push_query_param(
+        &mut params,
+        "chromaSubsampling",
+        config.profile_chroma_subsampling,
+    );
+    push_query_param(&mut params, "pixelFormat", config.profile_pixel_format);
+    push_query_param(&mut params, "hdrEnabled", config.profile_hdr_enabled);
     push_query_param(&mut params, "displayModePolicy", config.display_mode_policy);
     push_query_param(&mut params, "captureSourceId", config.capture_source_id);
     push_query_param(&mut params, "captureSourceKind", config.capture_source_kind);
@@ -2492,6 +2520,12 @@ mod tray_tests {
             profile_height: Some("1080".to_string()),
             profile_fps: Some("180".to_string()),
             profile_bitrate_mbps: Some("20".to_string()),
+            profile_codec: Some("hevc".to_string()),
+            profile_codec_profile: Some("main".to_string()),
+            profile_bit_depth: Some("8".to_string()),
+            profile_chroma_subsampling: Some("4:2:0".to_string()),
+            profile_pixel_format: Some("nv12".to_string()),
+            profile_hdr_enabled: Some("false".to_string()),
             display_mode_policy: Some("temporary".to_string()),
             capture_source_id: Some("windows:display-shared:1".to_string()),
             capture_source_kind: Some("display".to_string()),
@@ -2501,7 +2535,7 @@ mod tray_tests {
 
         assert_eq!(
             route,
-            "/test/e2e?autorun=lan-e2e&targetDeviceId=agent%20device%2F1&transport=quic&timeoutMs=2500&minSampleDurationMs=1500&minDecodedFrames=2&minFps=5&stopOnComplete=false&width=1920&height=1080&fps=180&bitrateMbps=20&displayModePolicy=temporary&captureSourceId=windows%3Adisplay-shared%3A1&captureSourceKind=display&expectedPeerBuildId=abc123def456&adaptive=true"
+            "/test/e2e?autorun=lan-e2e&targetDeviceId=agent%20device%2F1&transport=quic&timeoutMs=2500&minSampleDurationMs=1500&minDecodedFrames=2&minFps=5&stopOnComplete=false&width=1920&height=1080&fps=180&bitrateMbps=20&codec=hevc&codecProfile=main&bitDepth=8&chromaSubsampling=4%3A2%3A0&pixelFormat=nv12&hdrEnabled=false&displayModePolicy=temporary&captureSourceId=windows%3Adisplay-shared%3A1&captureSourceKind=display&expectedPeerBuildId=abc123def456&adaptive=true"
         );
     }
 

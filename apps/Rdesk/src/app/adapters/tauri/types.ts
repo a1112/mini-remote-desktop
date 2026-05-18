@@ -607,6 +607,11 @@ export interface MediaProfile {
   fps: number;
   bitrate_mbps: number;
   codec: string;
+  codec_profile?: string | null;
+  bit_depth?: number | null;
+  chroma_subsampling?: string | null;
+  pixel_format?: string | null;
+  hdr_enabled?: boolean | null;
 }
 
 export interface MediaProfileNegotiation {
@@ -712,6 +717,17 @@ export interface MediaPipelineSnapshot {
   attached_surfaces: AttachedRenderSurface[];
   active_decoder?: string | null;
   active_renderer?: string | null;
+  active_codec?: string | null;
+  active_codec_profile?: string | null;
+  active_bit_depth?: number | null;
+  active_chroma_subsampling?: string | null;
+  active_pixel_format?: string | null;
+  active_hdr_enabled?: boolean | null;
+  active_width?: number | null;
+  active_height?: number | null;
+  active_fps?: number | null;
+  active_bitrate_mbps?: number | null;
+  codec_fallback_reason?: string | null;
   queue_depth: number;
   dropped_frames: number;
   render_queue_replacements?: number;

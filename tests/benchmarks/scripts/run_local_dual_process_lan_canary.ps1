@@ -6,6 +6,13 @@ param(
   [int]$BitrateMbps = 20,
   [ValidateSet("none", "temporary", "required")]
   [string]$DisplayModePolicy = "temporary",
+  [ValidateSet("h264", "hevc")]
+  [string]$Codec = "h264",
+  [string]$CodecProfile = "",
+  [int]$BitDepth = 0,
+  [string]$ChromaSubsampling = "",
+  [string]$PixelFormat = "",
+  [bool]$HdrEnabled = $false,
   [string]$CaptureSourceId = "",
   [string]$CaptureSourceKind = "display_shared",
   [double]$LossPct = 0,
@@ -334,6 +341,20 @@ function Invoke-LocalDualProcessProfile {
     Set-EnvVar "MRD_LAN_E2E_PROFILE_HEIGHT" ([string]$Profile.height) $savedEnv
     Set-EnvVar "MRD_LAN_E2E_PROFILE_FPS" ([string]$Profile.fps) $savedEnv
     Set-EnvVar "MRD_LAN_E2E_PROFILE_BITRATE_MBPS" ([string]$Profile.bitrate_mbps) $savedEnv
+    Set-EnvVar "MRD_LAN_E2E_PROFILE_CODEC" $Codec $savedEnv
+    if ($CodecProfile.Trim()) {
+      Set-EnvVar "MRD_LAN_E2E_PROFILE_CODEC_PROFILE" $CodecProfile.Trim() $savedEnv
+    }
+    if ($BitDepth -gt 0) {
+      Set-EnvVar "MRD_LAN_E2E_PROFILE_BIT_DEPTH" ([string]$BitDepth) $savedEnv
+    }
+    if ($ChromaSubsampling.Trim()) {
+      Set-EnvVar "MRD_LAN_E2E_PROFILE_CHROMA_SUBSAMPLING" $ChromaSubsampling.Trim() $savedEnv
+    }
+    if ($PixelFormat.Trim()) {
+      Set-EnvVar "MRD_LAN_E2E_PROFILE_PIXEL_FORMAT" $PixelFormat.Trim() $savedEnv
+    }
+    Set-EnvVar "MRD_LAN_E2E_PROFILE_HDR_ENABLED" ([string]$HdrEnabled).ToLowerInvariant() $savedEnv
     Set-EnvVar "MRD_LAN_E2E_DISPLAY_MODE_POLICY" $DisplayModePolicy $savedEnv
     Set-EnvVar "MRD_LAN_E2E_EXPECTED_PEER_BUILD_ID" $GitCommit $savedEnv
     if ($Profile.adaptive) {
@@ -419,7 +440,9 @@ function Invoke-LocalDualProcessProfile {
 
     $row = Convert-CrossReportToCanaryRow -Profile $Profile -Report $report -ReportPath $reportPath
     $row | Add-Member -Force -NotePropertyName "mode" -NotePropertyValue "local-dual-process"
-    $row | Add-Member -Force -NotePropertyName "chain" -NotePropertyValue "local_dual_process/dxgi/nvenc_h264/quic_datagram_media_v3_or_v2/nvdec/d3d11_shared"
+    $encoderLabel = if ($Codec -eq "hevc") { "nvenc_hevc" } else { "nvenc_h264" }
+    $decoderLabel = if ($Codec -eq "hevc") { "nvdec_hevc_d3d11_shared" } else { "nvdec" }
+    $row | Add-Member -Force -NotePropertyName "chain" -NotePropertyValue "local_dual_process/dxgi/$encoderLabel/quic_datagram_media_v3_or_v2/$decoderLabel/d3d11_shared"
     $row | Add-Member -Force -NotePropertyName "controller_pipe" -NotePropertyValue $controllerPipe
     $row | Add-Member -Force -NotePropertyName "peer_pipe" -NotePropertyValue $peerPipe
     $row | Add-Member -Force -NotePropertyName "controller_discovery_port" -NotePropertyValue $ports.controller
@@ -427,6 +450,22 @@ function Invoke-LocalDualProcessProfile {
     $row | Add-Member -Force -NotePropertyName "run_dir" -NotePropertyValue $runDir
     $row | Add-Member -Force -NotePropertyName "requested_capture_source_id" -NotePropertyValue $(if ($CaptureSourceId.Trim()) { $CaptureSourceId.Trim() } else { $null })
     $row | Add-Member -Force -NotePropertyName "requested_capture_source_kind" -NotePropertyValue $(if ($CaptureSourceKind.Trim()) { $CaptureSourceKind.Trim() } else { $null })
+    $row | Add-Member -Force -NotePropertyName "requested_codec" -NotePropertyValue $Codec
+    $row | Add-Member -Force -NotePropertyName "requested_codec_profile" -NotePropertyValue $(if ($CodecProfile.Trim()) { $CodecProfile.Trim() } else { $null })
+    $row | Add-Member -Force -NotePropertyName "requested_bit_depth" -NotePropertyValue $(if ($BitDepth -gt 0) { $BitDepth } else { $null })
+    $row | Add-Member -Force -NotePropertyName "requested_chroma_subsampling" -NotePropertyValue $(if ($ChromaSubsampling.Trim()) { $ChromaSubsampling.Trim() } else { $null })
+    $row | Add-Member -Force -NotePropertyName "requested_pixel_format" -NotePropertyValue $(if ($PixelFormat.Trim()) { $PixelFormat.Trim() } else { $null })
+    $row | Add-Member -Force -NotePropertyName "requested_hdr_enabled" -NotePropertyValue $HdrEnabled
+    $row | Add-Member -Force -NotePropertyName "active_codec" -NotePropertyValue $report.mediaPipelineSnapshot.active_codec
+    $row | Add-Member -Force -NotePropertyName "active_codec_profile" -NotePropertyValue $report.mediaPipelineSnapshot.active_codec_profile
+    $row | Add-Member -Force -NotePropertyName "active_bit_depth" -NotePropertyValue $report.mediaPipelineSnapshot.active_bit_depth
+    $row | Add-Member -Force -NotePropertyName "active_chroma_subsampling" -NotePropertyValue $report.mediaPipelineSnapshot.active_chroma_subsampling
+    $row | Add-Member -Force -NotePropertyName "active_pixel_format" -NotePropertyValue $report.mediaPipelineSnapshot.active_pixel_format
+    $row | Add-Member -Force -NotePropertyName "active_hdr_enabled" -NotePropertyValue $report.mediaPipelineSnapshot.active_hdr_enabled
+    $row | Add-Member -Force -NotePropertyName "active_width" -NotePropertyValue $report.mediaPipelineSnapshot.active_width
+    $row | Add-Member -Force -NotePropertyName "active_height" -NotePropertyValue $report.mediaPipelineSnapshot.active_height
+    $row | Add-Member -Force -NotePropertyName "active_fps" -NotePropertyValue $report.mediaPipelineSnapshot.active_fps
+    $row | Add-Member -Force -NotePropertyName "active_bitrate_mbps" -NotePropertyValue $report.mediaPipelineSnapshot.active_bitrate_mbps
     $row | Add-Member -Force -NotePropertyName "actual_capture_source_id" -NotePropertyValue $report.captureSource.id
     $row | Add-Member -Force -NotePropertyName "actual_capture_source_kind" -NotePropertyValue $report.captureSource.source_kind
     $row | Add-Member -Force -NotePropertyName "motion_stimulus_title" -NotePropertyValue $(if ($NoMotionStimulus) { $null } else { $motionStimulusTitle })
@@ -500,11 +539,21 @@ foreach ($profile in $profiles) {
 }
 
 $report = New-PairedLanCanaryReport -Mode "local-dual-process" -Rows $rows -GitCommit $gitCommit
-$report | Add-Member -Force -NotePropertyName "chain" -NotePropertyValue "local_dual_process/dxgi/nvenc_h264/quic_datagram_media_v3_or_v2/nvdec/d3d11_shared"
+$encoderLabel = if ($Codec -eq "hevc") { "nvenc_hevc" } else { "nvenc_h264" }
+$decoderLabel = if ($Codec -eq "hevc") { "nvdec_hevc_d3d11_shared" } else { "nvdec" }
+$report | Add-Member -Force -NotePropertyName "chain" -NotePropertyValue "local_dual_process/dxgi/$encoderLabel/quic_datagram_media_v3_or_v2/$decoderLabel/d3d11_shared"
 $report | Add-Member -Force -NotePropertyName "test_impairment_config" -NotePropertyValue $impairment
 $report | Add-Member -Force -NotePropertyName "capture_source_request" -NotePropertyValue ([pscustomobject]@{
   id = if ($CaptureSourceId.Trim()) { $CaptureSourceId.Trim() } else { $null }
   kind = if ($CaptureSourceKind.Trim()) { $CaptureSourceKind.Trim() } else { $null }
+})
+$report | Add-Member -Force -NotePropertyName "codec_request" -NotePropertyValue ([pscustomobject]@{
+  codec = $Codec
+  codec_profile = if ($CodecProfile.Trim()) { $CodecProfile.Trim() } else { $null }
+  bit_depth = if ($BitDepth -gt 0) { $BitDepth } else { $null }
+  chroma_subsampling = if ($ChromaSubsampling.Trim()) { $ChromaSubsampling.Trim() } else { $null }
+  pixel_format = if ($PixelFormat.Trim()) { $PixelFormat.Trim() } else { $null }
+  hdr_enabled = $HdrEnabled
 })
 $report | Add-Member -Force -NotePropertyName "motion_stimulus" -NotePropertyValue ([pscustomobject]@{
   enabled = -not [bool]$NoMotionStimulus
@@ -536,6 +585,18 @@ Add-Content -Path $markdownPath -Encoding Ascii -Value @(
   "- RequestedSourceId: $(if ($CaptureSourceId.Trim()) { $CaptureSourceId.Trim() } else { '-' })",
   "- RequestedSourceKind: $(if ($CaptureSourceKind.Trim()) { $CaptureSourceKind.Trim() } else { '-' })",
   "- MotionStimulus: $(if ($NoMotionStimulus) { 'disabled' } else { 'enabled' })"
+)
+
+Add-Content -Path $markdownPath -Encoding Ascii -Value @(
+  "",
+  "## Codec Request",
+  "",
+  "- Codec: $Codec",
+  "- CodecProfile: $(if ($CodecProfile.Trim()) { $CodecProfile.Trim() } else { '-' })",
+  "- BitDepth: $(if ($BitDepth -gt 0) { $BitDepth } else { '-' })",
+  "- ChromaSubsampling: $(if ($ChromaSubsampling.Trim()) { $ChromaSubsampling.Trim() } else { '-' })",
+  "- PixelFormat: $(if ($PixelFormat.Trim()) { $PixelFormat.Trim() } else { '-' })",
+  "- HdrEnabled: $HdrEnabled"
 )
 
 $fixtureWarnings = @($rows | Where-Object { $_.fixture_warning } | Select-Object -ExpandProperty fixture_warning -Unique)

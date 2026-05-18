@@ -633,6 +633,7 @@ fn profile(size: (u32, u32), fps: u32, bitrate_mbps: u32) -> MediaProfile {
         fps,
         bitrate_mbps,
         codec: "h264".to_string(),
+        ..MediaProfile::default()
     }
 }
 
@@ -655,6 +656,7 @@ fn default_ceiling_profile() -> MediaProfile {
         fps: DEFAULT_CEILING_FPS,
         bitrate_mbps: DEFAULT_CEILING_BITRATE_MBPS,
         codec: "h264".to_string(),
+        ..MediaProfile::default()
     }
 }
 
@@ -665,6 +667,7 @@ fn default_floor_profile() -> MediaProfile {
         fps: DEFAULT_FLOOR_FPS,
         bitrate_mbps: DEFAULT_FLOOR_BITRATE_MBPS,
         codec: "h264".to_string(),
+        ..MediaProfile::default()
     }
 }
 
@@ -689,6 +692,7 @@ mod tests {
                 fps: 144,
                 bitrate_mbps: 80,
                 codec: "h264".to_string(),
+                ..MediaProfile::default()
             }),
             floor_profile: Some(MediaProfile {
                 width: 1280,
@@ -696,6 +700,7 @@ mod tests {
                 fps: 60,
                 bitrate_mbps: 10,
                 codec: "h264".to_string(),
+                ..MediaProfile::default()
             }),
             ladder: Vec::new(),
             downshift_cooldown_ms: 2_000,

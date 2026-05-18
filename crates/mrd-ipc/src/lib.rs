@@ -86,6 +86,38 @@ pub struct MediaProfile {
     pub fps: u32,
     pub bitrate_mbps: u32,
     pub codec: String,
+    /// Codec profile name, for example `main` or `main10`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codec_profile: Option<String>,
+    /// Video bit depth. HEVC Main uses 8, HEVC Main10 uses 10.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bit_depth: Option<u8>,
+    /// Chroma subsampling label such as `4:2:0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chroma_subsampling: Option<String>,
+    /// Runtime pixel format associated with this profile, for example `nv12`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pixel_format: Option<String>,
+    /// Whether HDR is expected for this media profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hdr_enabled: Option<bool>,
+}
+
+impl Default for MediaProfile {
+    fn default() -> Self {
+        Self {
+            width: 0,
+            height: 0,
+            fps: 0,
+            bitrate_mbps: 0,
+            codec: "h264".to_string(),
+            codec_profile: None,
+            bit_depth: None,
+            chroma_subsampling: None,
+            pixel_format: None,
+            hdr_enabled: None,
+        }
+    }
 }
 
 /// Result of media profile negotiation.
@@ -194,6 +226,39 @@ pub struct MediaPipelineSnapshot {
     pub active_decoder: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_renderer: Option<String>,
+    /// Codec currently flowing through the receiver pipeline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_codec: Option<String>,
+    /// Active codec profile, for example `main`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_codec_profile: Option<String>,
+    /// Active profile bit depth, for example `8` for NV12 or `10` for P010.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_bit_depth: Option<u8>,
+    /// Active chroma subsampling label, for example `4:2:0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_chroma_subsampling: Option<String>,
+    /// Active decoded pixel format, for example `d3d11_shared_nv12`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_pixel_format: Option<String>,
+    /// Whether HDR metadata is enabled for the active profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_hdr_enabled: Option<bool>,
+    /// Active negotiated width in pixels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_width: Option<u32>,
+    /// Active negotiated height in pixels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_height: Option<u32>,
+    /// Active negotiated frame rate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_fps: Option<u32>,
+    /// Active negotiated bitrate in Mbps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_bitrate_mbps: Option<u32>,
+    /// Last reason the runtime fell back from a requested codec.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codec_fallback_reason: Option<String>,
     pub queue_depth: u32,
     /// Legacy aggregate of receiver-side render drops. Prefer the explicit
     /// render counters below for diagnostics.
@@ -917,5 +982,29 @@ mod tests {
 
         let decoded: IpcRequest = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn media_profile_round_trips_hevc_chroma_metadata() {
+        let profile = MediaProfile {
+            width: 2560,
+            height: 1600,
+            fps: 165,
+            bitrate_mbps: 120,
+            codec: "hevc".to_string(),
+            codec_profile: Some("main".to_string()),
+            bit_depth: Some(8),
+            chroma_subsampling: Some("4:2:0".to_string()),
+            pixel_format: Some("nv12".to_string()),
+            hdr_enabled: Some(false),
+        };
+
+        let encoded = serde_json::to_string(&profile).unwrap();
+        assert!(encoded.contains("\"codec\":\"hevc\""));
+        assert!(encoded.contains("\"chroma_subsampling\":\"4:2:0\""));
+        assert!(encoded.contains("\"hdr_enabled\":false"));
+
+        let decoded: MediaProfile = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, profile);
     }
 }
