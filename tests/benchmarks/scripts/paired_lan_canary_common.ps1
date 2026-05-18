@@ -6,6 +6,39 @@ function Select-CanaryValue {
   $Value
 }
 
+function Normalize-CanaryCodec {
+  param([string]$Codec)
+
+  $normalized = (Select-CanaryValue $Codec "h264").Trim().ToLowerInvariant()
+  if ($normalized -in @("hevc", "h265")) {
+    return "hevc"
+  }
+  "h264"
+}
+
+function New-CanaryMediaChain {
+  param(
+    [ValidateSet("local", "cross", "local-dual-process")]
+    [string]$Mode = "cross",
+    [string]$Codec = "h264"
+  )
+
+  $normalized = Normalize-CanaryCodec $Codec
+  if ($normalized -eq "hevc") {
+    $encoder = "nvenc_hevc"
+    $decoder = "nvdec_hevc_d3d11_shared"
+  } else {
+    $encoder = "nvenc_h264"
+    $decoder = "nvdec"
+  }
+
+  switch ($Mode) {
+    "local-dual-process" { return "local_dual_process/dxgi/$encoder/quic_datagram_media_v3_or_v2/$decoder/d3d11_shared" }
+    "cross" { return "dxgi/$encoder/quic_datagram_media_v3_or_v2/$decoder/d3d11_shared" }
+    default { return "dxgi/$encoder/quic/$decoder/d3d11_shared" }
+  }
+}
+
 function Get-PairedLanCanaryProfiles {
   param(
     [int]$DurationSecs = 30,
@@ -59,7 +92,7 @@ function Convert-LocalSummaryToCanaryRow {
     fps = [int]$Profile.fps
     bitrate_mbps = [int]$Profile.bitrate_mbps
     duration_secs = [int]$Profile.duration_secs
-    chain = "dxgi/nvenc_h264/quic/nvdec/d3d11_shared"
+    chain = New-CanaryMediaChain -Mode "local" -Codec "h264"
     status = $status
     classification = $classification
     fps_observed = [double](Select-CanaryValue $Summary.fps_observed 0)
@@ -90,7 +123,8 @@ function Convert-CrossReportToCanaryRow {
   param(
     [Parameter(Mandatory = $true)]$Profile,
     [Parameter(Mandatory = $true)]$Report,
-    [string]$ReportPath
+    [string]$ReportPath,
+    [string]$RequestedCodec = "h264"
   )
 
   $probe = $Report.probeSnapshot
@@ -108,6 +142,7 @@ function Convert-CrossReportToCanaryRow {
   $pipelineDropped = [int64](Select-CanaryValue $pipeline.dropped_frames 0)
   $renderQueueReplacements = [int64](Select-CanaryValue $pipeline.render_queue_replacements $pipelineDropped)
   $renderLockDrops = [int64](Select-CanaryValue $pipeline.render_lock_drops 0)
+  $activeCodec = Select-CanaryValue $pipeline.active_codec $RequestedCodec
 
   [pscustomobject]@{
     id = $Profile.id
@@ -116,7 +151,7 @@ function Convert-CrossReportToCanaryRow {
     fps = [int]$Profile.fps
     bitrate_mbps = [int]$Profile.bitrate_mbps
     duration_secs = [int]$Profile.duration_secs
-    chain = "dxgi/nvenc_h264/quic_datagram_media_v3_or_v2/nvdec/d3d11_shared"
+    chain = New-CanaryMediaChain -Mode "cross" -Codec $activeCodec
     status = $status
     classification = $classification
     fps_observed = [double](Select-CanaryValue (Select-CanaryValue $Report.sampleObservedFps $probe.current_fps) 0)
@@ -138,6 +173,17 @@ function Convert-CrossReportToCanaryRow {
     display_mode = $Report.displayModeChange
     raw_report_path = $ReportPath
     error_message = Select-CanaryValue $Report.errorMessage $displayLimitReason
+    requested_codec = Normalize-CanaryCodec $RequestedCodec
+    active_codec = $pipeline.active_codec
+    active_codec_profile = $pipeline.active_codec_profile
+    active_bit_depth = $pipeline.active_bit_depth
+    active_chroma_subsampling = $pipeline.active_chroma_subsampling
+    active_pixel_format = $pipeline.active_pixel_format
+    active_hdr_enabled = $pipeline.active_hdr_enabled
+    active_width = $pipeline.active_width
+    active_height = $pipeline.active_height
+    active_fps = $pipeline.active_fps
+    active_bitrate_mbps = $pipeline.active_bitrate_mbps
   }
 }
 
@@ -378,7 +424,8 @@ function New-PairedLanCanaryReport {
     [Parameter(Mandatory = $true)][string]$Mode,
     [Parameter(Mandatory = $true)]$Rows,
     [string]$GitCommit,
-    [string]$GeneratedAt = (Get-Date).ToString("o")
+    [string]$GeneratedAt = (Get-Date).ToString("o"),
+    [string]$Codec = "h264"
   )
 
   [pscustomobject]@{
@@ -386,7 +433,8 @@ function New-PairedLanCanaryReport {
     mode = $Mode
     generated_at = $GeneratedAt
     git_commit = $GitCommit
-    chain = if ($Mode -eq "cross") { "dxgi/nvenc_h264/quic_datagram_media_v3_or_v2/nvdec/d3d11_shared" } else { "dxgi/nvenc_h264/quic_datagram/nvdec/d3d11_shared" }
+    chain = New-CanaryMediaChain -Mode $Mode -Codec $Codec
+    codec = Normalize-CanaryCodec $Codec
     completed = @($Rows | Where-Object { $_.status -eq "completed" }).Count
     skipped = @($Rows | Where-Object { $_.status -eq "skipped" }).Count
     failed = @($Rows | Where-Object { $_.status -ne "completed" -and $_.status -ne "skipped" }).Count
@@ -425,6 +473,17 @@ function Write-CanaryJsonAndMarkdown {
     $renderCoalesce = Select-CanaryValue $row.render_queue_replacements 0
     $renderDrops = Select-CanaryValue $row.render_lock_drops 0
     $lines += "| $($row.id) | $($row.status) | $($row.classification) | $([Math]::Round([double](Select-CanaryValue $row.fps_observed 0), 2)) | $selected | $probeDrops | $renderCoalesce | $renderDrops | $($row.queue_depth) | $error |"
+  }
+  if ($Report.codec_request) {
+    $lines += ""
+    $lines += "## Codec Request"
+    $lines += ""
+    $lines += "- Codec: $($Report.codec_request.codec)"
+    $lines += "- CodecProfile: $(if ($Report.codec_request.codec_profile) { $Report.codec_request.codec_profile } else { '-' })"
+    $lines += "- BitDepth: $(if ($Report.codec_request.bit_depth) { $Report.codec_request.bit_depth } else { '-' })"
+    $lines += "- ChromaSubsampling: $(if ($Report.codec_request.chroma_subsampling) { $Report.codec_request.chroma_subsampling } else { '-' })"
+    $lines += "- PixelFormat: $(if ($Report.codec_request.pixel_format) { $Report.codec_request.pixel_format } else { '-' })"
+    $lines += "- HdrEnabled: $($Report.codec_request.hdr_enabled)"
   }
   $lines -join [Environment]::NewLine | Set-Content -Path $MarkdownPath -Encoding Ascii
 }
