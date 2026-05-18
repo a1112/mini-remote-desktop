@@ -3152,9 +3152,7 @@ async fn send_quic_media_loop(
                         let delayed_fragment = fragment.clone();
                         tokio::spawn(async move {
                             tokio::time::sleep(decision.delay).await;
-                            if let Err(error) =
-                                delayed_endpoint.send_datagram_wait(delayed_fragment).await
-                            {
+                            if let Err(error) = delayed_endpoint.send_datagram(delayed_fragment) {
                                 tracing::debug!(
                                     %error,
                                     session_id = %delayed_session_id.0,
@@ -3165,7 +3163,7 @@ async fn send_quic_media_loop(
                         });
                         continue;
                     }
-                    if let Err(error) = endpoint.send_datagram_wait(fragment.clone()).await {
+                    if let Err(error) = endpoint.send_datagram(fragment.clone()) {
                         send_result = Err(error).with_context(|| {
                             format!("failed to send LAN QUIC media frame {}", frame_id)
                         });
