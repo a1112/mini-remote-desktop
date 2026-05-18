@@ -54,6 +54,7 @@ const LAN_MEDIA_TARGET_HEIGHT: u32 = 1600;
 const LAN_MEDIA_TARGET_FPS: u32 = 165;
 const LAN_MEDIA_MAX_FPS: u32 = 249;
 const LAN_MEDIA_TARGET_BITRATE_MBPS: u32 = 120;
+const LAN_QUIC_BEST_EFFORT_DATAGRAM_MAX_BITRATE_MBPS: u32 = 100;
 const LAN_QUIC_FALLBACK_DATAGRAM_BYTES: usize = 1_200;
 const LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES: usize = 4 * 1024 * 1024;
 const LAN_QUIC_RELIABLE_MEDIA_RETRY_DELAY: Duration = Duration::from_millis(10);
@@ -3139,6 +3140,7 @@ async fn send_quic_media_loop(
                 }
                 sender_stats.record_elapsed("sender.send_reliable", reliable_send_started);
             } else {
+                let best_effort_datagrams = use_best_effort_media_datagrams(&profile);
                 let datagram_send_started = Instant::now();
                 for fragment in &fragments {
                     let decision = test_impairment.next_datagram_decision();
@@ -3152,7 +3154,12 @@ async fn send_quic_media_loop(
                         let delayed_fragment = fragment.clone();
                         tokio::spawn(async move {
                             tokio::time::sleep(decision.delay).await;
-                            if let Err(error) = delayed_endpoint.send_datagram(delayed_fragment) {
+                            let send_result = if best_effort_datagrams {
+                                delayed_endpoint.send_datagram(delayed_fragment)
+                            } else {
+                                delayed_endpoint.send_datagram_wait(delayed_fragment).await
+                            };
+                            if let Err(error) = send_result {
                                 tracing::debug!(
                                     %error,
                                     session_id = %delayed_session_id.0,
@@ -3163,7 +3170,12 @@ async fn send_quic_media_loop(
                         });
                         continue;
                     }
-                    if let Err(error) = endpoint.send_datagram(fragment.clone()) {
+                    let send_fragment_result = if best_effort_datagrams {
+                        endpoint.send_datagram(fragment.clone())
+                    } else {
+                        endpoint.send_datagram_wait(fragment.clone()).await
+                    };
+                    if let Err(error) = send_fragment_result {
                         send_result = Err(error).with_context(|| {
                             format!("failed to send LAN QUIC media frame {}", frame_id)
                         });
@@ -3518,6 +3530,10 @@ fn select_reliable_media_send_mode(
     } else {
         LanReliableMediaSendMode::Disabled
     }
+}
+
+fn use_best_effort_media_datagrams(profile: &MediaProfile) -> bool {
+    profile.bitrate_mbps <= LAN_QUIC_BEST_EFFORT_DATAGRAM_MAX_BITRATE_MBPS
 }
 
 async fn send_lan_reliable_media_fragment(
@@ -7449,6 +7465,29 @@ mod tests {
             &profile_2k,
             Some(false)
         ));
+    }
+
+    #[test]
+    fn lan_quic_media_uses_best_effort_only_for_low_latency_bitrate_tiers() {
+        let low_latency = MediaProfile {
+            width: 2560,
+            height: 1600,
+            fps: 165,
+            bitrate_mbps: 80,
+            codec: "hevc".to_string(),
+            ..MediaProfile::default()
+        };
+        let high_bitrate = MediaProfile {
+            width: 2560,
+            height: 1600,
+            fps: 165,
+            bitrate_mbps: 120,
+            codec: "hevc".to_string(),
+            ..MediaProfile::default()
+        };
+
+        assert!(use_best_effort_media_datagrams(&low_latency));
+        assert!(!use_best_effort_media_datagrams(&high_bitrate));
     }
 
     #[test]
