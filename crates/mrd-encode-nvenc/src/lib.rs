@@ -45,7 +45,8 @@ mod imp {
     use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 
     const H264_SHARED_ASYNC_SLOT_COUNT: usize = 2;
-    const H264_SHARED_INPUT_CACHE_LIMIT: usize = 8;
+    const HEVC_SHARED_ASYNC_SLOT_COUNT: usize = 2;
+    const SHARED_INPUT_CACHE_LIMIT: usize = 8;
 
     pub struct NvencH264Encoder {
         _device: ID3D11Device,
@@ -71,7 +72,9 @@ mod imp {
         texture: ID3D11Texture2D,
         encoder: Encoder,
         registered: RegisteredResource,
-        shared_input: Option<SharedInputResource>,
+        shared_inputs: Vec<SharedInputResource>,
+        shared_encode_slots: Vec<SharedEncodeSlot>,
+        pending_shared_encodes: VecDeque<PendingSharedEncode>,
         bitstream: BitStream,
         width: usize,
         height: usize,
@@ -86,7 +89,6 @@ mod imp {
         width: u32,
         height: u32,
         _texture: ID3D11Texture2D,
-        registered: RegisteredResource,
     }
 
     struct SharedEncodeSlot {
@@ -668,16 +670,7 @@ mod imp {
             let texture =
                 texture.ok_or_else(|| PipelineError::message("missing opened shared texture"))?;
 
-            let registered = self
-                .encoder
-                .register_resource_dx11(&texture, NVencBufferFormat::ARGB, shared.row_pitch)
-                .map_err(|error| {
-                    PipelineError::message(format!(
-                        "nvenc register shared texture failed: {error:?}"
-                    ))
-                })?;
-
-            if self.shared_inputs.len() >= H264_SHARED_INPUT_CACHE_LIMIT {
+            if self.shared_inputs.len() >= SHARED_INPUT_CACHE_LIMIT {
                 self.shared_inputs.remove(0);
             }
             self.shared_inputs.push(SharedInputResource {
@@ -685,7 +678,6 @@ mod imp {
                 width: shared.width,
                 height: shared.height,
                 _texture: texture,
-                registered,
             });
 
             Ok(self
@@ -745,6 +737,23 @@ mod imp {
             )
         }
 
+        pub fn new_max_speed_with_bitrate(
+            width: usize,
+            height: usize,
+            fps: u32,
+            bitrate: u32,
+        ) -> Result<Self, PipelineError> {
+            Self::new_preset_internal(
+                width,
+                height,
+                fps,
+                bitrate.max(1),
+                NV_ENC_HEVC_PROFILE_MAIN_GUID,
+                NV_ENC_PRESET_P1_GUID,
+                true,
+            )
+        }
+
         pub fn new_main10_with_bitrate(
             width: usize,
             height: usize,
@@ -777,6 +786,26 @@ mod imp {
             bitrate: u32,
             profile_guid: Guid,
         ) -> Result<Self, PipelineError> {
+            Self::new_preset_internal(
+                width,
+                height,
+                fps,
+                bitrate,
+                profile_guid,
+                NV_ENC_PRESET_P3_GUID,
+                false,
+            )
+        }
+
+        fn new_preset_internal(
+            width: usize,
+            height: usize,
+            fps: u32,
+            bitrate: u32,
+            profile_guid: Guid,
+            preset_guid: Guid,
+            ultra_low_latency: bool,
+        ) -> Result<Self, PipelineError> {
             let width = width.max(2);
             let height = height.max(2);
             let fps = fps.max(1);
@@ -789,12 +818,12 @@ mod imp {
                 PipelineError::message(format!("nvenc open_dx failed: {error:?}"))
             })?;
             ensure_hevc_codec_supported(&session)?;
-            ensure_hevc_preset_supported(&session, NV_ENC_PRESET_P3_GUID)?;
+            ensure_hevc_preset_supported(&session, preset_guid.clone())?;
             let (session, mut preset) = session
                 .get_encode_preset_config_ex(
                     NV_ENC_CODEC_HEVC_GUID,
-                    NV_ENC_PRESET_P3_GUID,
-                    NVencTuningInfo::LowLatency,
+                    preset_guid.clone(),
+                    hevc_tuning_info(ultra_low_latency),
                 )
                 .map_err(|error| {
                     PipelineError::message(format!("nvenc HEVC preset config failed: {error:?}"))
@@ -806,11 +835,11 @@ mod imp {
 
             let init = InitParams {
                 encode_guid: NV_ENC_CODEC_HEVC_GUID,
-                preset_guid: NV_ENC_PRESET_P3_GUID,
+                preset_guid,
                 resolution: [width as u32, height as u32],
                 aspect_ratio: [width as u32, height as u32],
                 frame_rate: [fps, 1],
-                tuning_info: NVencTuningInfo::LowLatency,
+                tuning_info: hevc_tuning_info(ultra_low_latency),
                 buffer_format: NVencBufferFormat::ARGB,
                 encode_config: &mut preset.preset_cfg,
                 enable_ptd: true,
@@ -840,7 +869,9 @@ mod imp {
                 texture,
                 encoder,
                 registered,
-                shared_input: None,
+                shared_inputs: Vec::new(),
+                shared_encode_slots: Vec::new(),
+                pending_shared_encodes: VecDeque::new(),
                 bitstream,
                 width,
                 height,
@@ -861,47 +892,133 @@ mod imp {
                 )));
             }
 
-            self.ensure_shared_input(shared)?;
+            let source_texture = self.ensure_shared_input(shared)?;
+            self.ensure_shared_encode_slots()?;
+
+            let mut output = Vec::new();
+            if self.shared_encode_slots.is_empty() {
+                if let Some(access_unit) = self.complete_oldest_shared_encode()? {
+                    output.push(access_unit);
+                }
+            }
+
+            let slot = self
+                .shared_encode_slots
+                .pop()
+                .ok_or_else(|| PipelineError::message("missing shared NVENC HEVC encode slot"))?;
+            self.copy_shared_bgra_to_texture(&source_texture, &slot.texture)?;
 
             let force_idr = self.frame_index == 0 || self.frame_index % self.fps as usize == 0;
-            let shared_input = self
-                .shared_input
-                .as_ref()
-                .ok_or_else(|| PipelineError::message("missing shared input resource"))?;
-            let bytes = encode_picture_with_sps_pps(
+            submit_encode_picture(
                 &mut self.encoder,
-                &self.bitstream,
-                &shared_input.registered,
+                &slot.bitstream,
+                &slot.registered,
                 self.frame_index,
                 force_idr,
             )
             .map_err(|error| PipelineError::message(error.to_string()))?;
             self.frame_index += 1;
-
-            Ok(vec![EncodedAccessUnit {
-                codec: VideoCodec::Hevc,
+            self.pending_shared_encodes.push_back(PendingSharedEncode {
+                slot,
                 timestamp_us: frame.timestamp_us,
                 is_keyframe: force_idr,
+            });
+
+            if self.pending_shared_encodes.len() >= HEVC_SHARED_ASYNC_SLOT_COUNT {
+                if let Some(access_unit) = self.complete_oldest_shared_encode()? {
+                    output.push(access_unit);
+                }
+            }
+
+            Ok(output)
+        }
+
+        fn ensure_shared_encode_slots(&mut self) -> Result<(), PipelineError> {
+            while self.shared_encode_slots.len() + self.pending_shared_encodes.len()
+                < HEVC_SHARED_ASYNC_SLOT_COUNT
+            {
+                let texture =
+                    create_encode_texture(&self._device, self.width as u32, self.height as u32)
+                        .map_err(|error| {
+                            PipelineError::message(format!(
+                                "create shared NVENC HEVC slot texture failed: {error}"
+                            ))
+                        })?;
+                let registered = self
+                    .encoder
+                    .register_resource_dx11(&texture, NVencBufferFormat::ARGB, 0)
+                    .map_err(|error| {
+                        PipelineError::message(format!(
+                            "nvenc HEVC register shared slot resource failed: {error:?}"
+                        ))
+                    })?;
+                let bitstream = self.encoder.create_bitstream_buffer().map_err(|error| {
+                    PipelineError::message(format!(
+                        "nvenc HEVC shared slot bitstream buffer failed: {error:?}"
+                    ))
+                })?;
+                self.shared_encode_slots.push(SharedEncodeSlot {
+                    texture,
+                    registered,
+                    bitstream,
+                });
+            }
+
+            Ok(())
+        }
+
+        fn complete_oldest_shared_encode(
+            &mut self,
+        ) -> Result<Option<EncodedAccessUnit>, PipelineError> {
+            let Some(pending) = self.pending_shared_encodes.pop_front() else {
+                return Ok(None);
+            };
+            let bytes = lock_bitstream_bytes(&pending.slot.bitstream)
+                .map_err(|error| PipelineError::message(error.to_string()))?;
+            let access_unit = EncodedAccessUnit {
+                codec: VideoCodec::Hevc,
+                timestamp_us: pending.timestamp_us,
+                is_keyframe: pending.is_keyframe,
                 bytes: normalize_annexb_au(bytes),
-            }])
+            };
+            self.shared_encode_slots.push(pending.slot);
+            Ok(Some(access_unit))
+        }
+
+        fn copy_shared_bgra_to_texture(
+            &self,
+            source_texture: &ID3D11Texture2D,
+            target_texture: &ID3D11Texture2D,
+        ) -> Result<(), PipelineError> {
+            let source_resource: ID3D11Resource = source_texture.cast().map_err(|error| {
+                PipelineError::message(format!(
+                    "cast shared texture to NVENC HEVC copy source failed: {error}"
+                ))
+            })?;
+            let target_resource: ID3D11Resource = target_texture.cast().map_err(|error| {
+                PipelineError::message(format!(
+                    "cast registered NVENC HEVC texture to copy target failed: {error}"
+                ))
+            })?;
+
+            unsafe {
+                self.context
+                    .CopyResource(&target_resource, &source_resource);
+            }
+
+            Ok(())
         }
 
         fn ensure_shared_input(
             &mut self,
             shared: &D3D11SharedBgraFrame,
-        ) -> Result<(), PipelineError> {
-            let needs_new = self
-                .shared_input
-                .as_ref()
-                .map(|input| {
-                    input.shared_handle != shared.shared_handle
-                        || input.width != shared.width
-                        || input.height != shared.height
-                })
-                .unwrap_or(true);
-
-            if !needs_new {
-                return Ok(());
+        ) -> Result<ID3D11Texture2D, PipelineError> {
+            if let Some(input) = self.shared_inputs.iter().find(|input| {
+                input.shared_handle == shared.shared_handle
+                    && input.width == shared.width
+                    && input.height == shared.height
+            }) {
+                return Ok(input._texture.clone());
             }
 
             if shared.shared_handle == 0 {
@@ -923,24 +1040,22 @@ mod imp {
             let texture =
                 texture.ok_or_else(|| PipelineError::message("missing opened shared texture"))?;
 
-            let registered = self
-                .encoder
-                .register_resource_dx11(&texture, NVencBufferFormat::ARGB, shared.row_pitch)
-                .map_err(|error| {
-                    PipelineError::message(format!(
-                        "nvenc HEVC register shared texture failed: {error:?}"
-                    ))
-                })?;
-
-            self.shared_input = Some(SharedInputResource {
+            if self.shared_inputs.len() >= SHARED_INPUT_CACHE_LIMIT {
+                self.shared_inputs.remove(0);
+            }
+            self.shared_inputs.push(SharedInputResource {
                 shared_handle: shared.shared_handle,
                 width: shared.width,
                 height: shared.height,
                 _texture: texture,
-                registered,
             });
 
-            Ok(())
+            Ok(self
+                .shared_inputs
+                .last()
+                .expect("shared HEVC input resource was just inserted")
+                ._texture
+                .clone())
         }
     }
 
@@ -1089,6 +1204,14 @@ mod imp {
         Err(PipelineError::message(
             "NVENC HEVC unavailable: required HEVC preset is not supported by this GPU/driver",
         ))
+    }
+
+    fn hevc_tuning_info(ultra_low_latency: bool) -> NVencTuningInfo {
+        if ultra_low_latency {
+            NVencTuningInfo::UltraLowLatency
+        } else {
+            NVencTuningInfo::LowLatency
+        }
     }
 
     fn create_d3d11_device() -> anyhow::Result<(ID3D11Device, ID3D11DeviceContext)> {
@@ -1897,6 +2020,15 @@ impl NvencHevcEncoder {
             )?,
             main10: false,
         })
+    }
+
+    pub fn new_max_speed_with_bitrate(
+        width: usize,
+        height: usize,
+        fps: u32,
+        bitrate: u32,
+    ) -> Result<Self, PipelineError> {
+        Self::new_main_with_bitrate(width, height, fps, bitrate)
     }
 
     pub fn new_main10_with_bitrate(

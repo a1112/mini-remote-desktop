@@ -56,8 +56,6 @@ const LAN_MEDIA_MAX_FPS: u32 = 249;
 const LAN_MEDIA_TARGET_BITRATE_MBPS: u32 = 120;
 const LAN_QUIC_FALLBACK_DATAGRAM_BYTES: usize = 1_200;
 const LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES: usize = 4 * 1024 * 1024;
-const LAN_QUIC_RELIABLE_WHOLE_FRAME_MIN_PIXELS: u32 = 2560 * 1440;
-const LAN_QUIC_RELIABLE_WHOLE_FRAME_MIN_FRAGMENTS: usize = 6;
 const LAN_QUIC_RELIABLE_MEDIA_RETRY_DELAY: Duration = Duration::from_millis(10);
 const LAN_QUIC_MEDIA_TRANSPORT: &str = "quic_datagram";
 const LAN_QUIC_MEDIA_PROFILE_TRANSPORT: &str = "quic_datagram_2k144";
@@ -3299,14 +3297,28 @@ fn create_lan_hevc_encoder(
     fps: u32,
     bitrate: u32,
 ) -> Result<(&'static str, Box<dyn VideoEncoder + Send>)> {
-    mrd_encode_nvenc::NvencHevcEncoder::new_main_with_bitrate(width, height, fps, bitrate)
-        .map(|encoder| {
-            (
-                "nvenc_hevc",
-                Box::new(encoder) as Box<dyn VideoEncoder + Send>,
-            )
-        })
-        .map_err(|error| anyhow::anyhow!("nvenc_hevc: {error}"))
+    match mrd_encode_nvenc::NvencHevcEncoder::new_max_speed_with_bitrate(
+        width, height, fps, bitrate,
+    ) {
+        Ok(encoder) => Ok((
+            "nvenc_hevc_p1_ultra_low_latency",
+            Box::new(encoder) as Box<dyn VideoEncoder + Send>,
+        )),
+        Err(max_speed_error) => {
+            mrd_encode_nvenc::NvencHevcEncoder::new_main_with_bitrate(width, height, fps, bitrate)
+                .map(|encoder| {
+                    (
+                        "nvenc_hevc",
+                        Box::new(encoder) as Box<dyn VideoEncoder + Send>,
+                    )
+                })
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "nvenc_hevc_p1_ultra_low_latency: {max_speed_error}; nvenc_hevc: {error}"
+                    )
+                })
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -3538,18 +3550,18 @@ async fn send_lan_reliable_media_fragment(
 fn should_send_access_unit_as_reliable_frame(
     reliable_media_supported: bool,
     media_v3_supported: bool,
-    fragment_count: usize,
-    profile: &MediaProfile,
+    _fragment_count: usize,
+    _profile: &MediaProfile,
     reliable_whole_frame_override: Option<bool>,
 ) -> bool {
-    if !reliable_media_supported || !media_v3_supported || fragment_count <= 1 {
+    if !reliable_media_supported || !media_v3_supported {
         return false;
     }
     if let Some(enabled) = reliable_whole_frame_override {
         return enabled;
     }
-    profile.width.saturating_mul(profile.height) >= LAN_QUIC_RELIABLE_WHOLE_FRAME_MIN_PIXELS
-        || fragment_count >= LAN_QUIC_RELIABLE_WHOLE_FRAME_MIN_FRAGMENTS
+
+    false
 }
 
 fn reliable_whole_frame_media_override() -> Option<bool> {
@@ -7372,7 +7384,7 @@ mod tests {
     }
 
     #[test]
-    fn lan_quic_media_routes_large_fragmented_v3_frames_over_reliable_stream_by_default() {
+    fn lan_quic_media_uses_datagrams_by_default_and_reliable_whole_frame_only_when_enabled() {
         let profile_1080p = MediaProfile {
             width: 1920,
             height: 1080,
@@ -7397,14 +7409,7 @@ mod tests {
             &profile_1080p,
             None
         ));
-        assert!(should_send_access_unit_as_reliable_frame(
-            true,
-            true,
-            LAN_QUIC_RELIABLE_WHOLE_FRAME_MIN_FRAGMENTS,
-            &profile_1080p,
-            None
-        ));
-        assert!(should_send_access_unit_as_reliable_frame(
+        assert!(!should_send_access_unit_as_reliable_frame(
             true,
             true,
             2,
