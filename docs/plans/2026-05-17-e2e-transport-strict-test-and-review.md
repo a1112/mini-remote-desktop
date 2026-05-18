@@ -17,7 +17,7 @@ The local dual-process LAN test bed added on this branch is the right next evide
 | Area | Finding | Severity | Required Gate |
 | --- | --- | --- | --- |
 | LAN media path | Receiver now defaults to `nvdec_d3d11_shared` and reports `receiver.format.d3d11_shared_nv12`; CPU preview is no longer required for pass. | P0 | No accepted LAN row may use CPU/PNG preview as the primary frame path. |
-| Display refresh | 180/249 FPS rows can be selected in the runtime request but are environment-limited if the active display mode is only 144 Hz. | P0 | Report `display_refresh_limited` and mark the row non-comparable instead of passing or failing performance. |
+| Display refresh | 2K144 and 180/249 FPS rows can be selected in the runtime request but are environment-limited if the active display mode cannot produce the requested resolution and refresh. | P0 | Report `display_refresh_limited` and mark the row non-comparable instead of passing or failing performance. |
 | Test impairment | Delay/jitter must not sleep the capture/encode loop; impairment must act like network delivery delay. | P0 | `sender.send_datagram` p95 must stay sub-millisecond when only synthetic delay/jitter is enabled. |
 | QUIC media envelope | H.264 access units must route by v3 media envelope and never fall back to legacy probe parsing. | P0 | No report may contain `invalid magic` or `legacy probe fallback` for accepted media rows. |
 | Hybrid media transport | 1080p high-refresh frames should stay on datagrams; 2K-and-above multi-fragment access units should use persistent reliable media when available. | P0 | 2K rows must report `sender.send_reliable` or equivalent stream metrics, while 1080p144 keeps low `sender.send_datagram` p95. |
@@ -36,6 +36,7 @@ Required rows:
 | --- | --- | --- |
 | 1080p60 | `dxgi/nvenc_h264/quic/nvdec/d3d11_shared` | completed, decoded FPS >= 55 |
 | 2k60 | same | completed, decoded FPS >= 45 |
+| 2k144 | same | completed, decoded FPS >= 115 when active display mode is >= 2560x1440@144 Hz; otherwise `display_refresh_limited` |
 | 1080p144 | same | completed, decoded FPS >= 115 |
 | 1080p180 | same | completed only when active display mode >= 180 Hz; otherwise `display_refresh_limited` |
 | 1080p249 | same | completed only when active display mode >= 249 Hz; otherwise `display_refresh_limited` |
@@ -48,7 +49,7 @@ Command:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tests/benchmarks/scripts/run_local_dual_process_lan_canary.ps1 `
-  -ProfileId 1080p60,2k60,1080p144,1080p180,1080p249 `
+  -ProfileId 1080p60,2k60,2k144,1080p144,1080p180,1080p249 `
   -DurationSecs 30 `
   -NoBuild
 ```
@@ -117,6 +118,7 @@ Required rows:
 | --- | --- |
 | 1080p60 | cross FPS >= local selected-profile baseline * 0.8 |
 | 2k60 | cross FPS >= local selected-profile baseline * 0.8 |
+| 2k144 | cross FPS >= local selected-profile baseline * 0.8 when both sides select 2560x1440@144; otherwise `display_refresh_limited` or `profile_downgraded` |
 | 1080p144 | cross FPS >= local selected-profile baseline * 0.8 |
 | 1080p180 | compare only if both active display modes are >= 180 Hz |
 | 1080p249 | compare only if both active display modes are >= 249 Hz |
@@ -170,6 +172,7 @@ pnpm type-check
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tests/benchmarks/scripts/test_paired_lan_canary_common.ps1
+powershell -ExecutionPolicy Bypass -File tests/benchmarks/scripts/run_local_dual_process_lan_canary.ps1 -ProfileId 2k144 -DurationSecs 10 -NoBuild
 powershell -ExecutionPolicy Bypass -File tests/benchmarks/scripts/run_local_dual_process_lan_canary.ps1 -ProfileId 1080p144 -DurationSecs 10 -NoBuild
 powershell -ExecutionPolicy Bypass -File tests/benchmarks/scripts/run_local_dual_process_lan_canary.ps1 -ProfileId 1080p144 -DurationSecs 10 -NoBuild -LossPct 1 -BaseDelayMs 2 -JitterMs 3 -MtuBytes 1200
 ```

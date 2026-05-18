@@ -16,10 +16,11 @@ function Assert-True($Condition, [string]$Message) {
 }
 
 $profiles = Get-PairedLanCanaryProfiles -DurationSecs 30 -BitrateMbps 20
-Assert-Equal $profiles.Count 5 "Profile count"
+Assert-Equal $profiles.Count 6 "Profile count"
 Assert-Equal $profiles[0].id "1080p60" "First profile id"
-Assert-Equal $profiles[3].fps 180 "180 FPS profile is present"
-Assert-Equal $profiles[4].fps 249 "249 FPS profile is present"
+Assert-Equal $profiles[2].id "2k144" "2K144 profile is present"
+Assert-Equal $profiles[4].fps 180 "180 FPS profile is present"
+Assert-Equal $profiles[5].fps 249 "249 FPS profile is present"
 
 $localRow = [pscustomobject]@{
   id = "1080p144"
@@ -122,7 +123,7 @@ $displayLimitedReport = [pscustomobject]@{
   }
   sessionSnapshot = [pscustomobject]@{ state = "streaming" }
 }
-$displayLimitedRow = Convert-CrossReportToCanaryRow -Profile $profiles[4] -Report $displayLimitedReport -ReportPath "raw/cross-1080p249.json"
+$displayLimitedRow = Convert-CrossReportToCanaryRow -Profile $profiles[5] -Report $displayLimitedReport -ReportPath "raw/cross-1080p249.json"
 Assert-Equal $displayLimitedRow.status "skipped" "Display refresh capped profiles are environment skips"
 Assert-Equal $displayLimitedRow.classification "display_refresh_limited" "Display refresh cap is classified explicitly"
 Assert-True ($displayLimitedRow.error_message -match "144Hz") "Display refresh cap carries an actionable reason"

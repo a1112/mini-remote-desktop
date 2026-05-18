@@ -38,13 +38,14 @@ The service remains the correct home for the heavy media runtime. Rdesk should c
 
 QUIC datagrams are still the preferred LAN media transport for the mainline. WebRTC is useful for NAT/browser compatibility, but it should not block LAN acceptance. A peer that only lacks WebRTC should be marked `skipped` for WebRTC rows, not failed for the whole matrix.
 
-High-frame modes need explicit proof that they are not silently limited by display refresh rate, capture pacing, encoder completion, or renderer present scheduling. The paired canary should therefore include 144, 180, and 249 FPS rows and report selected FPS, current FPS, dropped frames, and stage p95.
+High-frame modes need explicit proof that they are not silently limited by display refresh rate, capture pacing, encoder completion, or renderer present scheduling. The paired canary should therefore include 2K144 plus 1080p144, 1080p180, and 1080p249 rows, and report selected FPS, current FPS, dropped frames, and stage p95.
 
 ## KPI Targets
 
 The practical acceptance targets for the next phase are:
 
 - 1080p144 LAN QUIC: cross-device FPS at least 80 percent of local baseline.
+- 2K144 LAN QUIC: cross-device FPS at least 80 percent of local baseline when both sides can select 2560x1440@144.
 - 1080p180 and 1080p249: runtime selected FPS must match requested FPS or be reported as profile downgraded.
 - 2K60: decoded FPS remains at or above 45 FPS on capable Windows peers.
 - No `invalid magic`, legacy probe fallback, profile mismatch, or service IPC crash in accepted rows.
