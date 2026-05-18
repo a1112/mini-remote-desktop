@@ -601,6 +601,25 @@ export interface RuntimeSnapshot {
   is_registered: boolean;
 }
 
+export interface AuditLogQuery {
+  session_id?: string | null;
+  action?: string | null;
+  limit?: number | null;
+}
+
+export interface AuditEvent {
+  id: number;
+  timestamp_ms: number;
+  action: string;
+  outcome: string;
+  session_id?: string | null;
+  actor_device_id?: string | null;
+  peer_device_id?: string | null;
+  transport_kind?: string | null;
+  reason?: string | null;
+  details: Array<[string, string]>;
+}
+
 export interface MediaProfile {
   width: number;
   height: number;

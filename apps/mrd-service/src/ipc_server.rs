@@ -10,6 +10,7 @@ use crate::{
 };
 use mrd_application::ports::SessionSnapshot;
 use mrd_ipc::{transport, IpcRequest, IpcResponse};
+use mrd_proto::{DeviceId, SessionId};
 use std::{io::ErrorKind, sync::Arc, time::Duration};
 
 const LAN_DISCOVERY_REFRESH_WAIT_MS: u64 = 450;
@@ -87,6 +88,18 @@ impl IpcServer {
                 tracing::info!("Registering device: {} ({})", device_id.0, device_name);
                 let mut devices = self.app_state.devices.lock().await;
                 devices.register(device_id.clone(), device_name);
+                drop(devices);
+                self.record_audit_event(
+                    "device.register",
+                    "success",
+                    None,
+                    Some(device_id.clone()),
+                    None,
+                    None,
+                    None,
+                    Vec::new(),
+                )
+                .await;
                 IpcResponse::DeviceRegistered { device_id }
             }
 
@@ -150,13 +163,26 @@ impl IpcServer {
                 target_device_id,
                 transport_kind,
             } => {
-                session::start_session(
+                let response = session::start_session(
                     &self.app_state,
-                    session_id,
-                    target_device_id,
-                    transport_kind,
+                    session_id.clone(),
+                    target_device_id.clone(),
+                    transport_kind.clone(),
                 )
-                .await
+                .await;
+                let (outcome, reason) = audit_outcome(&response);
+                self.record_audit_event(
+                    "session.start",
+                    outcome,
+                    Some(session_id),
+                    self.local_device_id().await,
+                    Some(target_device_id),
+                    Some(transport_kind),
+                    reason,
+                    Vec::new(),
+                )
+                .await;
+                response
             }
 
             IpcRequest::StartLanRemoteSession {
@@ -165,14 +191,41 @@ impl IpcServer {
                 transport_kind,
                 requested_profile,
             } => {
-                session::start_lan_remote_session(
+                let mut details = Vec::new();
+                if let Some(profile) = requested_profile.as_ref() {
+                    details.push((
+                        "requested_profile".to_string(),
+                        format!(
+                            "{}x{}@{}/{}Mbps/{}",
+                            profile.width,
+                            profile.height,
+                            profile.fps,
+                            profile.bitrate_mbps,
+                            profile.codec
+                        ),
+                    ));
+                }
+                let response = session::start_lan_remote_session(
                     &self.app_state,
-                    session_id,
-                    target_device_id,
-                    transport_kind,
+                    session_id.clone(),
+                    target_device_id.clone(),
+                    transport_kind.clone(),
                     requested_profile,
                 )
-                .await
+                .await;
+                let (outcome, reason) = audit_outcome(&response);
+                self.record_audit_event(
+                    "session.start_lan",
+                    outcome,
+                    Some(session_id),
+                    self.local_device_id().await,
+                    Some(target_device_id),
+                    Some(transport_kind),
+                    reason,
+                    details,
+                )
+                .await;
+                response
             }
 
             IpcRequest::UpdateMediaProfile {
@@ -256,7 +309,27 @@ impl IpcServer {
             IpcRequest::AcceptSession {
                 session_id,
                 source_device_id,
-            } => session::accept_session(&self.app_state, session_id, source_device_id).await,
+            } => {
+                let response = session::accept_session(
+                    &self.app_state,
+                    session_id.clone(),
+                    source_device_id.clone(),
+                )
+                .await;
+                let (outcome, reason) = audit_outcome(&response);
+                self.record_audit_event(
+                    "session.accept",
+                    outcome,
+                    Some(session_id),
+                    self.local_device_id().await,
+                    Some(source_device_id),
+                    None,
+                    reason,
+                    Vec::new(),
+                )
+                .await;
+                response
+            }
 
             IpcRequest::StartSender { session_id } => {
                 transport_handlers::start_sender(&self.app_state, session_id).await
@@ -267,15 +340,62 @@ impl IpcServer {
             }
 
             IpcRequest::StopSession { session_id } => {
-                session::stop_session(&self.app_state, session_id).await
+                let (peer_device_id, transport_kind) =
+                    self.session_audit_context(&session_id).await;
+                let response = session::stop_session(&self.app_state, session_id.clone()).await;
+                let (outcome, reason) = audit_outcome(&response);
+                self.record_audit_event(
+                    "session.stop",
+                    outcome,
+                    Some(session_id),
+                    self.local_device_id().await,
+                    peer_device_id,
+                    transport_kind,
+                    reason,
+                    Vec::new(),
+                )
+                .await;
+                response
             }
 
             IpcRequest::FailSession { session_id, reason } => {
-                session::fail_session(&self.app_state, session_id, reason).await
+                let (peer_device_id, transport_kind) =
+                    self.session_audit_context(&session_id).await;
+                let response =
+                    session::fail_session(&self.app_state, session_id.clone(), reason.clone())
+                        .await;
+                let (outcome, response_reason) = audit_outcome(&response);
+                self.record_audit_event(
+                    "session.fail",
+                    outcome,
+                    Some(session_id),
+                    self.local_device_id().await,
+                    peer_device_id,
+                    transport_kind,
+                    response_reason.or(Some(reason)),
+                    Vec::new(),
+                )
+                .await;
+                response
             }
 
             IpcRequest::RecoverSession { session_id } => {
-                session::recover_session(&self.app_state, session_id).await
+                let (peer_device_id, transport_kind) =
+                    self.session_audit_context(&session_id).await;
+                let response = session::recover_session(&self.app_state, session_id.clone()).await;
+                let (outcome, reason) = audit_outcome(&response);
+                self.record_audit_event(
+                    "session.recover",
+                    outcome,
+                    Some(session_id),
+                    self.local_device_id().await,
+                    peer_device_id,
+                    transport_kind,
+                    reason,
+                    Vec::new(),
+                )
+                .await;
+                response
             }
 
             IpcRequest::SessionRuntimeSnapshot { session_id } => {
@@ -300,6 +420,13 @@ impl IpcServer {
                         device_id,
                         is_registered: devices.is_registered(),
                     },
+                }
+            }
+
+            IpcRequest::AuditLog { query } => {
+                let audit_log = self.app_state.audit_log.lock().await;
+                IpcResponse::AuditLog {
+                    events: audit_log.query(&query),
                 }
             }
 
@@ -558,6 +685,53 @@ impl IpcServer {
         &self.app_state
     }
 
+    async fn local_device_id(&self) -> Option<DeviceId> {
+        self.app_state
+            .devices
+            .lock()
+            .await
+            .get_local_device()
+            .map(|(device_id, _)| device_id.clone())
+    }
+
+    async fn session_audit_context(
+        &self,
+        session_id: &SessionId,
+    ) -> (Option<DeviceId>, Option<String>) {
+        let sessions = self.app_state.sessions.lock().await;
+        let Some(snapshot) = sessions.get(session_id) else {
+            return (None, None);
+        };
+        let peer_device_id = snapshot
+            .target_device_id
+            .clone()
+            .or_else(|| snapshot.source_device_id.clone());
+        (peer_device_id, Some(snapshot.transport.clone()))
+    }
+
+    async fn record_audit_event(
+        &self,
+        action: impl Into<String>,
+        outcome: impl Into<String>,
+        session_id: Option<SessionId>,
+        actor_device_id: Option<DeviceId>,
+        peer_device_id: Option<DeviceId>,
+        transport_kind: Option<String>,
+        reason: Option<String>,
+        details: Vec<(String, String)>,
+    ) {
+        self.app_state.audit_log.lock().await.record(
+            action,
+            outcome,
+            session_id,
+            actor_device_id,
+            peer_device_id,
+            transport_kind,
+            reason,
+            details,
+        );
+    }
+
     /// Run the IPC server (accepts connections in a loop)
     pub async fn run(&self) -> anyhow::Result<()> {
         #[cfg(windows)]
@@ -640,6 +814,13 @@ fn is_connection_closed_error(error: &anyhow::Error) -> bool {
                 | ErrorKind::ConnectionAborted
         ),
         None => false,
+    }
+}
+
+fn audit_outcome(response: &IpcResponse) -> (&'static str, Option<String>) {
+    match response {
+        IpcResponse::Error { message, .. } => ("error", Some(message.clone())),
+        _ => ("success", None),
     }
 }
 

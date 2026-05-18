@@ -9,8 +9,9 @@ use base64::{engine::general_purpose, Engine as _};
 use image::{codecs::png::PngEncoder, ColorType, ImageEncoder};
 use mrd_application::ports::SessionSnapshot;
 use mrd_ipc::{
-    AttachedRenderSurface, CaptureSourceSelection, MediaAdaptationSnapshot, MediaPipelineSnapshot,
-    MediaProfile, MediaProfileNegotiation, MediaStageMetrics, MediaTestImpairmentSnapshot,
+    AttachedRenderSurface, AuditEvent, AuditLogQuery, CaptureSourceSelection,
+    MediaAdaptationSnapshot, MediaPipelineSnapshot, MediaProfile, MediaProfileNegotiation,
+    MediaStageMetrics, MediaTestImpairmentSnapshot,
 };
 use mrd_proto::{DeviceId, SessionId};
 #[cfg(windows)]
@@ -22,6 +23,7 @@ use std::sync::Arc;
 use tokio::{sync::Mutex, task::AbortHandle};
 
 const MEDIA_STAGE_SAMPLE_LIMIT: usize = 240;
+const AUDIT_EVENT_LIMIT: usize = 1_000;
 
 /// Session registry tracking all active sessions
 #[derive(Debug, Default)]
@@ -888,6 +890,91 @@ pub struct DeviceRegistry {
     local_device: Option<(DeviceId, String)>, // (id, name)
 }
 
+/// In-memory service audit event registry.
+#[derive(Debug)]
+pub struct AuditLogRegistry {
+    next_id: u64,
+    events: VecDeque<AuditEvent>,
+    max_events: usize,
+}
+
+impl Default for AuditLogRegistry {
+    fn default() -> Self {
+        Self {
+            next_id: 1,
+            events: VecDeque::new(),
+            max_events: AUDIT_EVENT_LIMIT,
+        }
+    }
+}
+
+impl AuditLogRegistry {
+    pub fn record(
+        &mut self,
+        action: impl Into<String>,
+        outcome: impl Into<String>,
+        session_id: Option<SessionId>,
+        actor_device_id: Option<DeviceId>,
+        peer_device_id: Option<DeviceId>,
+        transport_kind: Option<String>,
+        reason: Option<String>,
+        details: Vec<(String, String)>,
+    ) -> AuditEvent {
+        let event = AuditEvent {
+            id: self.next_id,
+            timestamp_ms: now_unix_ms(),
+            action: action.into(),
+            outcome: outcome.into(),
+            session_id,
+            actor_device_id,
+            peer_device_id,
+            transport_kind,
+            reason,
+            details,
+        };
+        self.next_id = self.next_id.saturating_add(1);
+        self.events.push_back(event.clone());
+        while self.events.len() > self.max_events {
+            self.events.pop_front();
+        }
+        event
+    }
+
+    pub fn query(&self, query: &AuditLogQuery) -> Vec<AuditEvent> {
+        let mut events = self
+            .events
+            .iter()
+            .filter(|event| {
+                query
+                    .session_id
+                    .as_ref()
+                    .is_none_or(|session_id| event.session_id.as_ref() == Some(session_id))
+            })
+            .filter(|event| {
+                query
+                    .action
+                    .as_ref()
+                    .is_none_or(|action| event.action == *action)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(limit) = query.limit {
+            let limit = limit as usize;
+            if events.len() > limit {
+                events = events.split_off(events.len() - limit);
+            }
+        }
+        events
+    }
+}
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
 impl DeviceRegistry {
     pub fn register(&mut self, device_id: DeviceId, device_name: String) {
         self.local_device = Some((device_id, device_name));
@@ -981,6 +1068,8 @@ pub struct AppState {
     pub sessions: Arc<Mutex<SessionRegistry>>,
     /// Device registry
     pub devices: Arc<Mutex<DeviceRegistry>>,
+    /// Service-owned security and operations audit events.
+    pub audit_log: Arc<Mutex<AuditLogRegistry>>,
     /// Shell state - UI presence and service lifecycle
     pub shell: Arc<Mutex<ShellState>>,
     /// Tray port (Phase 4)
@@ -1030,6 +1119,7 @@ impl AppState {
         Self {
             sessions: Arc::new(Mutex::new(SessionRegistry::default())),
             devices: Arc::new(Mutex::new(DeviceRegistry::default())),
+            audit_log: Arc::new(Mutex::new(AuditLogRegistry::default())),
             shell: Arc::new(Mutex::new(ShellState::default())),
             tray,
             lan_discovery: Arc::new(crate::lan_discovery::LanDiscoveryState::new(
@@ -1059,6 +1149,11 @@ impl AppState {
     /// Get a clone of the devices Arc for injection into handlers
     pub fn devices(&self) -> Arc<Mutex<DeviceRegistry>> {
         self.devices.clone()
+    }
+
+    /// Get a clone of the service audit log registry.
+    pub fn audit_log(&self) -> Arc<Mutex<AuditLogRegistry>> {
+        self.audit_log.clone()
     }
 
     /// Get a clone of the shell Arc for injection into handlers

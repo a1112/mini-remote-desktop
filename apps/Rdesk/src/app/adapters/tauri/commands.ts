@@ -25,6 +25,8 @@ import type {
   SessionInfo,
   SessionRuntimeSnapshot,
   RuntimeSnapshot,
+  AuditEvent,
+  AuditLogQuery,
   CapabilitySnapshot,
   CaptureSource,
   CaptureSourceSelection,
@@ -570,6 +572,15 @@ export async function ipcListSessions(): Promise<AdapterResult<SessionInfo[]>> {
  */
 export async function ipcRuntimeSnapshot(): Promise<AdapterResult<RuntimeSnapshot>> {
   return invokeAdapter<RuntimeSnapshot>('ipc_runtime_snapshot');
+}
+
+/**
+ * Query service-owned audit events.
+ */
+export async function ipcAuditLog(
+  query: AuditLogQuery = {}
+): Promise<AdapterResult<AuditEvent[]>> {
+  return invokeAdapter<AuditEvent[]>('ipc_audit_log', { query });
 }
 
 /**

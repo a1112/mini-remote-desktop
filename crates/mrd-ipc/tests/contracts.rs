@@ -2,11 +2,12 @@
 // Verify serialization/deserialization of all IPC messages
 
 use mrd_ipc::{
-    AdaptiveMediaConfig, AttachedRenderSurface, CapabilityConstraint, CapabilityConstraintStatus,
-    CapabilityDomain, CapabilityItem, CapabilityPlatform, CapabilityProfile, CapabilitySnapshot,
-    CapabilityStatus, CaptureSource, CaptureSourceSelection, DeviceInfo, IpcRequest, IpcResponse,
-    MediaAdaptationSnapshot, MediaPipelineSnapshot, MediaProfile, MediaProfileNegotiation,
-    MediaStageMetrics, SessionBootstrap, SessionRuntimeSnapshot,
+    AdaptiveMediaConfig, AttachedRenderSurface, AuditEvent, AuditLogQuery, CapabilityConstraint,
+    CapabilityConstraintStatus, CapabilityDomain, CapabilityItem, CapabilityPlatform,
+    CapabilityProfile, CapabilitySnapshot, CapabilityStatus, CaptureSource, CaptureSourceSelection,
+    DeviceInfo, IpcRequest, IpcResponse, MediaAdaptationSnapshot, MediaPipelineSnapshot,
+    MediaProfile, MediaProfileNegotiation, MediaStageMetrics, SessionBootstrap,
+    SessionRuntimeSnapshot,
 };
 use mrd_proto::{DeviceId, SessionId};
 
@@ -206,6 +207,44 @@ fn serialize_deserialize_configure_media_adaptation() {
     let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
 
     assert_eq!(request, deserialized);
+}
+
+#[test]
+fn serialize_deserialize_audit_log_query_and_response() {
+    let query = AuditLogQuery {
+        session_id: Some(test_session_id()),
+        action: Some("session.start".to_string()),
+        limit: Some(50),
+    };
+    let request = IpcRequest::AuditLog {
+        query: query.clone(),
+    };
+
+    let json = serde_json::to_string(&request).unwrap();
+    assert!(json.contains("AuditLog"));
+    let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(request, deserialized);
+
+    let event = AuditEvent {
+        id: 1,
+        timestamp_ms: 1_700_000_000_000,
+        action: "session.start".to_string(),
+        outcome: "success".to_string(),
+        session_id: query.session_id,
+        actor_device_id: Some(DeviceId("local".to_string())),
+        peer_device_id: Some(DeviceId("remote".to_string())),
+        transport_kind: Some("quic".to_string()),
+        reason: None,
+        details: vec![("source".to_string(), "ipc".to_string())],
+    };
+    let response = IpcResponse::AuditLog {
+        events: vec![event.clone()],
+    };
+
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("session.start"));
+    let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(response, deserialized);
 }
 
 #[test]
@@ -608,6 +647,13 @@ fn serialize_deserialize_all_request_types() {
         },
         IpcRequest::SessionRuntimeSnapshot {
             session_id: test_session_id(),
+        },
+        IpcRequest::AuditLog {
+            query: AuditLogQuery {
+                session_id: Some(test_session_id()),
+                action: Some("session.start".to_string()),
+                limit: Some(25),
+            },
         },
         IpcRequest::StreamProbeEvents,
     ];

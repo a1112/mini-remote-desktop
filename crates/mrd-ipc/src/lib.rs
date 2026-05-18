@@ -534,6 +534,51 @@ pub struct CapabilitySnapshot {
     pub updated_at_ms: u64,
 }
 
+/// Query used to retrieve service-owned audit events.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct AuditLogQuery {
+    /// Optional session id filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
+    /// Optional action filter, for example `session.start`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    /// Optional maximum number of newest matching events to return.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// Service-owned audit event for security, control, and operations review.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuditEvent {
+    /// Monotonic event id within one service process.
+    pub id: u64,
+    /// Event time in milliseconds since Unix epoch.
+    pub timestamp_ms: u64,
+    /// Stable action id, for example `session.start`.
+    pub action: String,
+    /// Machine-readable outcome, usually `success` or `error`.
+    pub outcome: String,
+    /// Optional related session id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
+    /// Optional local actor device id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_device_id: Option<DeviceId>,
+    /// Optional peer device id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_device_id: Option<DeviceId>,
+    /// Optional transport kind, for example `quic`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_kind: Option<String>,
+    /// Optional reason or error detail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Deterministic key/value details for UI and export.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub details: Vec<(String, String)>,
+}
+
 // === Core IPC Types ===
 
 /// IPC request from Rdesk to mrd-service
@@ -633,6 +678,8 @@ pub enum IpcRequest {
     SessionRuntimeSnapshot { session_id: SessionId },
     /// Get aggregated runtime snapshot
     RuntimeSnapshot,
+    /// Query service-owned audit events.
+    AuditLog { query: AuditLogQuery },
     /// Get structured local capability snapshot.
     CapabilitySnapshot,
     /// Get probe snapshot data
@@ -739,6 +786,8 @@ pub enum IpcResponse {
     SessionSnapshot { snapshot: SessionRuntimeSnapshot },
     /// Aggregated runtime snapshot
     RuntimeSnapshot { snapshot: RuntimeSnapshot },
+    /// Service-owned audit events.
+    AuditLog { events: Vec<AuditEvent> },
     /// Structured local capability snapshot.
     CapabilitySnapshot {
         /// Current local capability snapshot.

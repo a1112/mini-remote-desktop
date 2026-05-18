@@ -1594,6 +1594,24 @@ async fn ipc_runtime_snapshot() -> Result<mrd_ipc::RuntimeSnapshot, String> {
     }
 }
 
+/// Query service-owned audit events via IPC.
+#[tauri::command]
+async fn ipc_audit_log(query: mrd_ipc::AuditLogQuery) -> Result<Vec<mrd_ipc::AuditEvent>, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::AuditLog { query })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::AuditLog { events } => Ok(events),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
 /// Get structured local capability snapshot via IPC.
 #[tauri::command]
 async fn ipc_capability_snapshot() -> Result<mrd_ipc::CapabilitySnapshot, String> {
@@ -2809,6 +2827,7 @@ fn main() {
             ipc_recover_session,
             ipc_session_snapshot,
             ipc_runtime_snapshot,
+            ipc_audit_log,
             ipc_capability_snapshot,
             ipc_service_health,
             ipc_probe_snapshot,

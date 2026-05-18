@@ -129,6 +129,63 @@ async fn hard_cut_full_session_flow() {
 }
 
 #[tokio::test]
+async fn hard_cut_session_flow_is_auditable() {
+    let server = create_test_server();
+
+    let local_device = DeviceId("audit-local".to_string());
+    let _ = server
+        .handle_request(IpcRequest::RegisterDevice {
+            device_id: local_device.clone(),
+            device_name: "Audit Local".to_string(),
+        })
+        .await;
+
+    let session_id = SessionId("audit-session".to_string());
+    let peer_device = DeviceId("audit-peer".to_string());
+    let _ = server
+        .handle_request(IpcRequest::StartSession {
+            session_id: session_id.clone(),
+            target_device_id: peer_device.clone(),
+            transport_kind: "quic".to_string(),
+        })
+        .await;
+    let _ = server
+        .handle_request(IpcRequest::StopSession {
+            session_id: session_id.clone(),
+        })
+        .await;
+
+    let response = server
+        .handle_request(IpcRequest::AuditLog {
+            query: mrd_ipc::AuditLogQuery {
+                session_id: Some(session_id.clone()),
+                action: None,
+                limit: Some(10),
+            },
+        })
+        .await;
+
+    match response {
+        IpcResponse::AuditLog { events } => {
+            assert!(events.iter().any(|event| event.action == "session.start"));
+            assert!(events.iter().any(|event| event.action == "session.stop"));
+            assert!(events
+                .iter()
+                .all(|event| event.session_id.as_ref() == Some(&session_id)));
+            let start = events
+                .iter()
+                .find(|event| event.action == "session.start")
+                .expect("start audit event");
+            assert_eq!(start.actor_device_id, Some(local_device));
+            assert_eq!(start.peer_device_id, Some(peer_device));
+            assert_eq!(start.transport_kind.as_deref(), Some("quic"));
+            assert_eq!(start.outcome, "success");
+        }
+        other => panic!("Expected AuditLog response, got {:?}", other),
+    }
+}
+
+#[tokio::test]
 async fn hard_cut_runtime_snapshot_aggregates_state() {
     let server = create_test_server();
 
