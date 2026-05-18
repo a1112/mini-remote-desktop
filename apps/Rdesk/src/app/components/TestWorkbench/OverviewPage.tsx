@@ -92,6 +92,9 @@ export function OverviewPage() {
   const lan2k144Evaluation = capabilitySnapshot
     ? evaluateProfileSupport("lan.2k144", capabilitySnapshot)
     : null;
+  const lan1600p165Evaluation = capabilitySnapshot
+    ? evaluateProfileSupport("lan.1600p165", capabilitySnapshot)
+    : null;
 
   return (
     <div className="p-6">
@@ -165,6 +168,8 @@ export function OverviewPage() {
                     <div className="mt-1 flex flex-wrap items-center gap-2">
                       <span className="font-medium">lan.2k144</span>
                       <StatusBadge status={lan2k144Evaluation?.status ?? "blocked"} />
+                      <span className="font-medium">lan.1600p165</span>
+                      <StatusBadge status={lan1600p165Evaluation?.status ?? "blocked"} />
                     </div>
                   </div>
                 </div>
@@ -173,6 +178,11 @@ export function OverviewPage() {
               {lan2k144Evaluation && lan2k144Evaluation.reasons.length > 0 && (
                 <div className="mb-4 rounded-lg border border-yellow-500/30 bg-yellow-500/10 p-3 text-xs text-yellow-700 dark:text-yellow-200">
                   {lan2k144Evaluation.reasons.join("; ")}
+                </div>
+              )}
+              {lan1600p165Evaluation && lan1600p165Evaluation.reasons.length > 0 && (
+                <div className="mb-4 rounded-lg border border-yellow-500/30 bg-yellow-500/10 p-3 text-xs text-yellow-700 dark:text-yellow-200">
+                  {lan1600p165Evaluation.reasons.join("; ")}
                 </div>
               )}
 

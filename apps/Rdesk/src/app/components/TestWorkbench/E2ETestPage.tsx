@@ -603,6 +603,7 @@ function buildLanAutomationOptionsFromSearchParams(
       searchParams.get("captureSourceId") ?? searchParams.get("sourceId") ?? undefined,
     preferredCaptureSourceKind:
       searchParams.get("captureSourceKind") ?? searchParams.get("captureKind") ?? undefined,
+    expectedPeerBuildId: searchParams.get("expectedPeerBuildId") ?? undefined,
     requestedProfile: parseRequestedProfile(searchParams),
   };
 }

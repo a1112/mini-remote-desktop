@@ -781,6 +781,10 @@ mod tests {
                     .profiles
                     .iter()
                     .any(|profile| profile.id == "lan.2k144"));
+                assert!(snapshot
+                    .profiles
+                    .iter()
+                    .any(|profile| profile.id == "lan.1600p165"));
             }
             _ => panic!("Expected CapabilitySnapshot response"),
         }

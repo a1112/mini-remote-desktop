@@ -99,7 +99,7 @@ describe("OverviewPage", () => {
     expect(mockNavigate).toHaveBeenLastCalledWith("/test/run/run-1");
   });
 
-  it("shows structured capability domains, statuses, and 2K144 readiness", async () => {
+  it("shows structured capability domains, statuses, and high-refresh LAN readiness", async () => {
     mockOverviewData();
 
     render(<OverviewPage />);
@@ -112,7 +112,8 @@ describe("OverviewPage", () => {
     await userEvent.click(screen.getByRole("checkbox", { name: /显示不可用能力/ }));
     expect(screen.getAllByText("unimplemented").length).toBeGreaterThan(0);
     expect(screen.getByText("lan.2k144")).toBeInTheDocument();
-    expect(screen.getByText("blocked")).toBeInTheDocument();
+    expect(screen.getByText("lan.1600p165")).toBeInTheDocument();
+    expect(screen.getAllByText("blocked").length).toBeGreaterThan(0);
     expect(screen.getAllByText(/transport.media_profile_control_v1/).length).toBeGreaterThan(0);
   });
 });

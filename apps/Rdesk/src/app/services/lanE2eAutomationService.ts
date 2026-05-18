@@ -49,6 +49,7 @@ export type LanE2EFailureReason =
   | "service_unhealthy"
   | "local_device_registration_failed"
   | "peer_not_found"
+  | "peer_version_mismatch"
   | "peer_not_ready"
   | "session_start_failed"
   | "capture_source_failed"
@@ -84,6 +85,7 @@ export interface LanE2EAutomationOptions {
   displayModePolicy?: "none" | "temporary" | "required";
   preferredCaptureSourceId?: string;
   preferredCaptureSourceKind?: string;
+  expectedPeerBuildId?: string;
   faultPlan?: CrossDeviceFaultPlan;
   createSessionId?: () => string;
   now?: () => number;
@@ -204,9 +206,9 @@ const REQUIRED_WINDOWS_MEDIA_CAPABILITIES = [
 ];
 const DEFAULT_LAN_MEDIA_PROFILE: MediaProfile = {
   width: 2560,
-  height: 1440,
-  fps: 144,
-  bitrate_mbps: 64,
+  height: 1600,
+  fps: 165,
+  bitrate_mbps: 80,
   codec: "h264",
 };
 
@@ -324,6 +326,15 @@ export async function runLanE2EAutomation(
     if (!selectedPeer) {
       stage("preflight", "failed", "No LAN peer available");
       return finish("failed", "peer_not_found", "No LAN peer available");
+    }
+    if (
+      options.expectedPeerBuildId &&
+      !lanBuildIdsMatch(selectedPeer.service_build_id, options.expectedPeerBuildId)
+    ) {
+      const actualBuild = selectedPeer.service_build_id?.trim() || "unknown";
+      const message = `LAN peer build mismatch: expected ${options.expectedPeerBuildId}, got ${actualBuild}. Rebuild and restart the peer before running paired media canaries.`;
+      stage("preflight", "skipped", message);
+      return finish("skipped", "peer_version_mismatch", message);
     }
     stage("preflight", "completed");
 
@@ -1053,6 +1064,18 @@ function buildLocalLanDeviceId(hardwareSerial: string, now: () => number): strin
   return sanitized ? `lan-${sanitized}` : `lan-local-${now()}`;
 }
 
+function lanBuildIdsMatch(actual?: string | null, expected?: string | null): boolean {
+  const actualBuild = actual?.trim();
+  const expectedBuild = expected?.trim();
+  if (!expectedBuild) return true;
+  if (!actualBuild) return false;
+  return (
+    actualBuild === expectedBuild ||
+    actualBuild.startsWith(expectedBuild) ||
+    expectedBuild.startsWith(actualBuild)
+  );
+}
+
 async function unwrap<T>(
   resultPromise: Promise<AdapterResult<T>>,
   reason: LanE2EFailureReason
@@ -1077,6 +1100,7 @@ function stageForFailure(reason: LanE2EFailureReason): LanE2EStageEvent["stage"]
     case "service_unhealthy":
     case "local_device_registration_failed":
     case "peer_not_found":
+    case "peer_version_mismatch":
     case "peer_not_ready":
       return "preflight";
     case "session_start_failed":

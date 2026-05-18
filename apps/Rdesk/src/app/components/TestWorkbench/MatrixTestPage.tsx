@@ -160,6 +160,7 @@ const MATRIX_DIMENSIONS: MatrixDimension[] = [
       { id: "90", name: "90 FPS", enabled: false },
       { id: "120", name: "120 FPS", enabled: false },
       { id: "144", name: "144 FPS", enabled: false },
+      { id: "165", name: "165 FPS", enabled: false },
       { id: "180", name: "180 FPS", enabled: false },
       { id: "249", name: "249 FPS", enabled: false },
     ],
@@ -173,6 +174,10 @@ const MATRIX_DIMENSIONS: MatrixDimension[] = [
       { id: "8000000", name: "8 Mbps", enabled: false },
       { id: "12000000", name: "12 Mbps", enabled: false },
       { id: "20000000", name: "20 Mbps", enabled: false },
+      { id: "50000000", name: "50 Mbps", enabled: false },
+      { id: "80000000", name: "80 Mbps", enabled: false },
+      { id: "100000000", name: "100 Mbps", enabled: false },
+      { id: "120000000", name: "120 Mbps", enabled: false },
     ],
   },
   {

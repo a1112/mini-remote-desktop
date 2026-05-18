@@ -598,6 +598,18 @@ fn default_profiles() -> Vec<CapabilityProfile> {
             ],
         ),
         profile(
+            "lan.1600p165",
+            2560,
+            1600,
+            165,
+            80,
+            "h264",
+            vec![
+                "transport.quic_datagram",
+                "transport.media_profile_control_v1",
+            ],
+        ),
+        profile(
             "quality.4k60",
             3840,
             2160,
@@ -769,6 +781,10 @@ mod tests {
             .profiles
             .iter()
             .any(|profile| profile.id == "lan.2k144"));
+        assert!(snapshot
+            .profiles
+            .iter()
+            .any(|profile| profile.id == "lan.1600p165"));
         assert!(snapshot
             .constraints
             .iter()

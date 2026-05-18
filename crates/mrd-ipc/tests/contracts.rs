@@ -75,21 +75,38 @@ fn test_capability_snapshot() -> CapabilitySnapshot {
             reason: "OpenH264 requires CPU-backed input".to_string(),
             fallback_ids: vec!["memory.cpu".to_string()],
         }],
-        profiles: vec![CapabilityProfile {
-            id: "lan.2k144".to_string(),
-            width: 2560,
-            height: 1440,
-            fps: 144,
-            bitrate_mbps: 64,
-            codec: "h264".to_string(),
-            latency_budget_ms: None,
-            min_stable_fps_ratio: Some(0.8),
-            max_drop_ratio: Some(0.02),
-            required_capabilities: vec![
-                "transport.quic_datagram".to_string(),
-                "transport.media_profile_control_v1".to_string(),
-            ],
-        }],
+        profiles: vec![
+            CapabilityProfile {
+                id: "lan.2k144".to_string(),
+                width: 2560,
+                height: 1440,
+                fps: 144,
+                bitrate_mbps: 64,
+                codec: "h264".to_string(),
+                latency_budget_ms: None,
+                min_stable_fps_ratio: Some(0.8),
+                max_drop_ratio: Some(0.02),
+                required_capabilities: vec![
+                    "transport.quic_datagram".to_string(),
+                    "transport.media_profile_control_v1".to_string(),
+                ],
+            },
+            CapabilityProfile {
+                id: "lan.1600p165".to_string(),
+                width: 2560,
+                height: 1600,
+                fps: 165,
+                bitrate_mbps: 80,
+                codec: "h264".to_string(),
+                latency_budget_ms: None,
+                min_stable_fps_ratio: Some(0.8),
+                max_drop_ratio: Some(0.02),
+                required_capabilities: vec![
+                    "transport.quic_datagram".to_string(),
+                    "transport.media_profile_control_v1".to_string(),
+                ],
+            },
+        ],
         updated_at_ms: 1_700_000_000_000,
     }
 }
@@ -322,6 +339,7 @@ fn serialize_deserialize_capability_snapshot_response() {
 
     let json = serde_json::to_string(&response).unwrap();
     assert!(json.contains("lan.2k144"));
+    assert!(json.contains("lan.1600p165"));
     assert!(json.contains("transport.quic_datagram"));
     assert!(json.contains("\"platform\":\"windows\""));
     let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();

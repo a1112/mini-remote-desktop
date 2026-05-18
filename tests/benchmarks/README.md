@@ -33,7 +33,8 @@ powershell -ExecutionPolicy Bypass -File tests/benchmarks/scripts/run_paired_lan
 
 This runs the fixed `dxgi / nvenc_h264 / quic_datagram / nvdec / d3d11_shared`
 local baseline and the LAN QUIC media v2 cross-device autorun for
-`1080p60`, `2K60`, `2K144`, `1080p144`, `1080p180`, and `1080p249`.
+`1080p60`, `2K60`, `2K144`, `1600p165`, `1600p165_120mbps`,
+`1080p144`, `1080p180`, and `1080p249`.
 Reports are written to `target/codex-matrix-compare/`:
 
 - `local-canary-report.json` and `.md`

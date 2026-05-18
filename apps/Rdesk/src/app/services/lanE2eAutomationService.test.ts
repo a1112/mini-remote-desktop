@@ -14,9 +14,9 @@ function err(message: string) {
 
 const DEFAULT_REQUESTED_PROFILE = {
   width: 2560,
-  height: 1440,
-  fps: 144,
-  bitrate_mbps: 64,
+  height: 1600,
+  fps: 165,
+  bitrate_mbps: 80,
   codec: "h264",
 };
 
@@ -39,7 +39,7 @@ const DEFAULT_CAPTURE_SOURCES = [
     title: "DISPLAY1",
     class_name: "Monitor",
     width: 2560,
-    height: 1440,
+    height: 1600,
     process_id: 0,
     app_name: null,
   },
@@ -50,7 +50,7 @@ const DEFAULT_CAPTURE_SOURCES = [
     title: "DISPLAY1",
     class_name: "Monitor",
     width: 2560,
-    height: 1440,
+    height: 1600,
     process_id: 0,
     app_name: null,
   },
@@ -140,7 +140,7 @@ function createCommands(
           id: "mode-current",
           source_id: "display-shared",
           width: 2560,
-          height: 1440,
+          height: 1600,
           refresh_hz: 60,
           bit_depth: 32,
           is_current: true,
@@ -149,8 +149,8 @@ function createCommands(
           id: "mode-target",
           source_id: "display-shared",
           width: 2560,
-          height: 1440,
-          refresh_hz: 144,
+          height: 1600,
+          refresh_hz: 165,
           bit_depth: 32,
           is_current: false,
         },
@@ -163,8 +163,8 @@ function createCommands(
           id: "mode-target",
           source_id: "display-shared",
           width: 2560,
-          height: 1440,
-          refresh_hz: 144,
+          height: 1600,
+          refresh_hz: 165,
           bit_depth: 32,
           is_current: false,
         },
@@ -172,7 +172,7 @@ function createCommands(
           id: "mode-current",
           source_id: "display-shared",
           width: 2560,
-          height: 1440,
+          height: 1600,
           refresh_hz: 60,
           bit_depth: 32,
           is_current: true,
@@ -181,8 +181,8 @@ function createCommands(
           id: "mode-target",
           source_id: "display-shared",
           width: 2560,
-          height: 1440,
-          refresh_hz: 144,
+          height: 1600,
+          refresh_hz: 165,
           bit_depth: 32,
           is_current: true,
         },
@@ -231,14 +231,14 @@ function createCommands(
         frames_received: 4,
         frames_decoded: 3,
         frames_dropped: 0,
-        current_fps: 144,
-        bitrate_mbps: 64,
+        current_fps: 165,
+        bitrate_mbps: 80,
         media_probe_valid: true,
-        media_probe_format: "compressed_2k144_test_pattern",
+        media_probe_format: "compressed_h264_test_pattern",
         media_probe_width: 2560,
-        media_probe_height: 1440,
-        media_probe_target_fps: 144,
-        media_probe_target_bitrate_mbps: 64,
+        media_probe_height: 1600,
+        media_probe_target_fps: 165,
+        media_probe_target_bitrate_mbps: 80,
         media_probe_payload_bytes: 55555,
         last_media_sequence: 3,
         last_media_timestamp_us: 123456,
@@ -659,7 +659,7 @@ describe("runLanE2EAutomation", () => {
     expect(result.status).toBe("failed");
     expect(result.failureReason).toBe("media_profile_mismatch");
     expect(result.errorMessage).toContain("Runtime media profile mismatch");
-    expect(result.errorMessage).toContain("2560x1440 @ 144 FPS / 64 Mbps");
+    expect(result.errorMessage).toContain("2560x1600 @ 165 FPS / 80 Mbps");
   });
 
   it("keeps sampling transient profile mismatches until the profile stabilizes", async () => {
@@ -975,6 +975,25 @@ describe("runLanE2EAutomation", () => {
       "quic",
       DEFAULT_REQUESTED_PROFILE
     );
+  });
+
+  it("skips paired media canaries when the LAN peer build does not match", async () => {
+    const commands = createCommands();
+
+    const result = await runLanE2EAutomation(commands, {
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      expectedPeerBuildId: "newer-build",
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      createSessionId: () => "lan-e2e-test-session",
+    });
+
+    expect(result.status).toBe("skipped");
+    expect(result.failureReason).toBe("peer_version_mismatch");
+    expect(result.errorMessage).toContain("expected newer-build");
+    expect(result.errorMessage).toContain("got test-build");
+    expect(commands.ipcStartLanRemoteSession).not.toHaveBeenCalled();
   });
 
   it("treats legacy QUIC peers without datagram media capability as not ready", async () => {

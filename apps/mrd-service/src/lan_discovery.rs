@@ -49,10 +49,10 @@ const DISCOVERY_APP_ID: &str = "rdesk";
 const DISCOVERY_PACKET_BUFFER_BYTES: usize = 65_535;
 const DISCOVERY_SAFE_UDP_PAYLOAD_BYTES: usize = 60_000;
 const LAN_MEDIA_TARGET_WIDTH: u32 = 2560;
-const LAN_MEDIA_TARGET_HEIGHT: u32 = 1440;
-const LAN_MEDIA_TARGET_FPS: u32 = 144;
+const LAN_MEDIA_TARGET_HEIGHT: u32 = 1600;
+const LAN_MEDIA_TARGET_FPS: u32 = 165;
 const LAN_MEDIA_MAX_FPS: u32 = 249;
-const LAN_MEDIA_TARGET_BITRATE_MBPS: u32 = 64;
+const LAN_MEDIA_TARGET_BITRATE_MBPS: u32 = 120;
 const LAN_QUIC_FALLBACK_DATAGRAM_BYTES: usize = 1_200;
 const LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES: usize = 4 * 1024 * 1024;
 const LAN_QUIC_RELIABLE_WHOLE_FRAME_MIN_PIXELS: u32 = 2560 * 1440;
@@ -81,7 +81,7 @@ const LAN_MEDIA_REASSEMBLER_MAX_PENDING_FRAMES: usize = 256;
 const LAN_MEDIA_RECEIVER_REORDER_MAX_PENDING_FRAMES: usize = 8;
 const LAN_MEDIA_PROBE_MAGIC: &[u8; 8] = b"MRDMPF01";
 const LAN_MEDIA_PROBE_HEADER_BYTES: usize = 56;
-const LAN_MEDIA_PROBE_2K144_FORMAT: &str = "compressed_2k144_test_pattern";
+const LAN_MEDIA_PROBE_NATIVE_HIGH_FORMAT: &str = "compressed_native_high_test_pattern";
 const LAN_MEDIA_PROBE_DYNAMIC_FORMAT: &str = "compressed_h264_test_pattern";
 const LAN_MEDIA_PROBE_FORMAT_CODE: u32 = 2;
 const LAN_MEDIA_ENVELOPE_MAGIC: &[u8; 8] = b"MRDMV2F1";
@@ -5173,7 +5173,7 @@ fn media_probe_format(
         && target_fps == LAN_MEDIA_TARGET_FPS
         && target_bitrate_mbps == LAN_MEDIA_TARGET_BITRATE_MBPS
     {
-        LAN_MEDIA_PROBE_2K144_FORMAT
+        LAN_MEDIA_PROBE_NATIVE_HIGH_FORMAT
     } else {
         LAN_MEDIA_PROBE_DYNAMIC_FORMAT
     }
@@ -5829,18 +5829,18 @@ mod tests {
     }
 
     #[test]
-    fn media_probe_frame_uses_2k144_compressed_profile() {
+    fn media_probe_frame_uses_native_high_compressed_profile() {
         let profile = default_media_profile();
         let frame = build_media_probe_frame(42, 123_456, &profile);
         let stats = decode_media_probe_frame(&frame).unwrap();
 
         assert_eq!(stats.sequence, 42);
         assert_eq!(stats.width, 2560);
-        assert_eq!(stats.height, 1440);
-        assert_eq!(stats.target_fps, 144);
-        assert_eq!(stats.target_bitrate_mbps, 64);
-        assert_eq!(stats.format, "compressed_2k144_test_pattern");
-        assert!(stats.bytes_received < (2560_u64 * 1440 * 4));
+        assert_eq!(stats.height, 1600);
+        assert_eq!(stats.target_fps, 165);
+        assert_eq!(stats.target_bitrate_mbps, 120);
+        assert_eq!(stats.format, "compressed_native_high_test_pattern");
+        assert!(stats.bytes_received < (2560_u64 * 1600 * 4));
         assert!(stats.payload_hash.starts_with("fnv1a64:"));
     }
 
@@ -5850,16 +5850,16 @@ mod tests {
             width: 3840,
             height: 2160,
             fps: 300,
-            bitrate_mbps: 120,
+            bitrate_mbps: 160,
             codec: "hevc".to_string(),
         }))
         .unwrap();
 
         assert_eq!(negotiation.status, "downgraded");
         assert_eq!(negotiation.selected.width, 2560);
-        assert_eq!(negotiation.selected.height, 1440);
+        assert_eq!(negotiation.selected.height, 1600);
         assert_eq!(negotiation.selected.fps, 249);
-        assert_eq!(negotiation.selected.bitrate_mbps, 64);
+        assert_eq!(negotiation.selected.bitrate_mbps, 120);
         assert_eq!(negotiation.selected.codec, "h264");
     }
 

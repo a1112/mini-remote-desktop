@@ -58,8 +58,8 @@ type RenderMode = "web" | "d3d11_native" | "d3d12_native" | "metal_native" | "li
 type HostOs = "macos" | "windows" | "linux" | "other";
 type TransportKind = NonNullable<TestMatrixConfig["transport"]>;
 type ResolutionKey = "1280x720" | "1920x1080" | "2560x1440" | "2560x1600" | "3440x1440";
-type FpsKey = "30" | "60" | "120" | "144" | "180" | "249";
-type BitrateKey = "8" | "20" | "50" | "80";
+type FpsKey = "30" | "60" | "120" | "144" | "165" | "180" | "249";
+type BitrateKey = "8" | "20" | "50" | "80" | "100" | "120";
 type TestStatus = "idle" | "starting" | "running" | "stopping" | "completed" | "failed";
 type WebPreviewMode = "idle" | "connecting" | "webrtc" | "failed";
 type CaptureSourcePickerMode = "dropdown" | "modal";
@@ -123,6 +123,7 @@ const fpsOptions: Option<FpsKey>[] = [
   { value: "60", label: "60 FPS" },
   { value: "120", label: "120 FPS" },
   { value: "144", label: "144 FPS" },
+  { value: "165", label: "165 FPS" },
   { value: "180", label: "180 FPS" },
   { value: "249", label: "249 FPS" },
 ];
@@ -132,6 +133,8 @@ const bitrateOptions: Option<BitrateKey>[] = [
   { value: "20", label: "20 Mbps" },
   { value: "50", label: "50 Mbps" },
   { value: "80", label: "80 Mbps" },
+  { value: "100", label: "100 Mbps" },
+  { value: "120", label: "120 Mbps" },
 ];
 
 const captureSourcePickerOptions: Option<CaptureSourcePickerMode>[] = [

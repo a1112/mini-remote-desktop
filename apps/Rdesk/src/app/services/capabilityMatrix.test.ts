@@ -403,6 +403,21 @@ describe("capability profiles", () => {
     expect(profile?.required_capabilities).toContain("transport.media_profile_control_v1");
   });
 
+  it("exposes a native 1600p165 LAN profile for 16:10 high-refresh peers", () => {
+    const profile = getCapabilityProfile("lan.1600p165");
+
+    expect(profile).toMatchObject({
+      id: "lan.1600p165",
+      width: 2560,
+      height: 1600,
+      fps: 165,
+      bitrate_mbps: 80,
+      codec: "h264",
+    });
+    expect(profile?.required_capabilities).toContain("transport.quic_datagram");
+    expect(profile?.required_capabilities).toContain("transport.media_profile_control_v1");
+  });
+
   it("marks a profile ready only when all required capabilities are available", () => {
     const snapshot = withAvailableCapabilities(
       buildCapabilitySnapshotFromEnvironment(windowsEnvironment),
