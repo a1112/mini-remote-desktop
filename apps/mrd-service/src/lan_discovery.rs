@@ -35,6 +35,7 @@ use tokio::time::{interval, sleep_until, timeout, Instant};
 const DEFAULT_DISCOVERY_PORT: u16 = 21116;
 const LAN_DISCOVERY_PORT_ENV: &str = "MRD_LAN_DISCOVERY_PORT";
 const LAN_DISCOVERY_PROBE_ENDPOINTS_ENV: &str = "MRD_LAN_DISCOVERY_PROBE_ENDPOINTS";
+const SERVICE_BUILD_ID_ENV: &str = "MRD_SERVICE_BUILD_ID";
 const LAN_TEST_IMPAIRMENT_LOSS_PCT_ENV: &str = "MRD_LAN_TEST_IMPAIRMENT_LOSS_PCT";
 const LAN_TEST_IMPAIRMENT_BASE_DELAY_MS_ENV: &str = "MRD_LAN_TEST_IMPAIRMENT_BASE_DELAY_MS";
 const LAN_TEST_IMPAIRMENT_JITTER_MS_ENV: &str = "MRD_LAN_TEST_IMPAIRMENT_JITTER_MS";
@@ -2255,6 +2256,17 @@ async fn build_announcement(app_state: &Arc<AppState>) -> Option<LanAnnouncement
 }
 
 fn service_build_id() -> String {
+    service_build_id_from_lookup(|key| std::env::var(key).ok())
+}
+
+fn service_build_id_from_lookup(lookup: impl Fn(&str) -> Option<String>) -> String {
+    if let Some(value) = lookup(SERVICE_BUILD_ID_ENV) {
+        let value = value.trim();
+        if !value.is_empty() {
+            return value.to_string();
+        }
+    }
+
     option_env!("VERGEN_GIT_SHA")
         .or(option_env!("GIT_COMMIT"))
         .unwrap_or(env!("CARGO_PKG_VERSION"))
@@ -5837,6 +5849,19 @@ mod tests {
         assert!(peer
             .media_capabilities
             .contains(&LAN_QUIC_MEDIA_V3_TRANSPORT.to_string()));
+    }
+
+    #[test]
+    fn service_build_id_prefers_runtime_override() {
+        let build_id = service_build_id_from_lookup(|key| {
+            if key == SERVICE_BUILD_ID_ENV {
+                Some("peer-runtime-build".to_string())
+            } else {
+                None
+            }
+        });
+
+        assert_eq!(build_id, "peer-runtime-build");
     }
 
     #[tokio::test]
