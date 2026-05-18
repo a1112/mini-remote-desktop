@@ -74,11 +74,25 @@ const NVDEC_HEVC_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
     output_formats: RGB24_OUTPUTS,
 };
 
+const NVDEC_HEVC_D3D11_SHARED_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
+    id: "nvdec_hevc_d3d11_shared",
+    codec: CodecKind::Hevc,
+    runtime_status: RuntimeStatus::RuntimeBacked,
+    output_formats: D3D11_TEXTURE_OUTPUTS,
+};
+
 const NVDEC_HEVC_MAIN10_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
     id: "nvdec_hevc_main10",
     codec: CodecKind::HevcMain10,
     runtime_status: RuntimeStatus::RuntimeBacked,
     output_formats: RGB24_OUTPUTS,
+};
+
+const NVDEC_HEVC_MAIN10_D3D11_SHARED_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
+    id: "nvdec_hevc_main10_d3d11_shared",
+    codec: CodecKind::HevcMain10,
+    runtime_status: RuntimeStatus::RuntimeBacked,
+    output_formats: D3D11_TEXTURE_OUTPUTS,
 };
 
 #[cfg(target_os = "linux")]
@@ -110,7 +124,9 @@ pub fn available_decoder_descriptors() -> Vec<DecoderDescriptor> {
         H264_SOFTWARE_DESCRIPTOR.clone(),
         NVDEC_D3D11_SHARED_DESCRIPTOR.clone(),
         NVDEC_DESCRIPTOR.clone(),
+        NVDEC_HEVC_D3D11_SHARED_DESCRIPTOR.clone(),
         NVDEC_HEVC_DESCRIPTOR.clone(),
+        NVDEC_HEVC_MAIN10_D3D11_SHARED_DESCRIPTOR.clone(),
         NVDEC_HEVC_MAIN10_DESCRIPTOR.clone(),
         NVDEC_AV1_DESCRIPTOR.clone(),
     ];
@@ -135,7 +151,13 @@ pub fn create_decoder(id: &str) -> Result<Box<dyn VideoDecoder>, PipelineError> 
         }
         "nvdec" => Ok(Box::new(NvdecVideoDecoder::new()?)),
         "nvdec_d3d11_shared" => Ok(Box::new(NvdecVideoDecoder::new_d3d11_shared()?)),
+        "nvdec_hevc_d3d11_shared" | "nvdec_d3d11_shared_hevc" => {
+            Ok(Box::new(NvdecVideoDecoder::new_hevc_d3d11_shared()?))
+        }
         "nvdec_hevc" => Ok(Box::new(NvdecVideoDecoder::new_hevc()?)),
+        "nvdec_hevc_main10_d3d11_shared" | "nvdec_d3d11_shared_hevc_main10" => {
+            Ok(Box::new(NvdecVideoDecoder::new_hevc_main10_d3d11_shared()?))
+        }
         "nvdec_hevc_main10" => Ok(Box::new(NvdecVideoDecoder::new_hevc_main10()?)),
         "nvdec_av1" => Ok(Box::new(NvdecVideoDecoder::new_av1()?)),
         other => Err(PipelineError::Message(format!(
@@ -282,6 +304,27 @@ impl NvdecVideoDecoder {
         })
     }
 
+    pub fn new_hevc_d3d11_shared() -> Result<Self, PipelineError> {
+        let mut decoder = mrd_decode_nvdec::NvdecDecoder::new_hevc_with_output_mode(
+            mrd_decode_nvdec::NvdecOutputMode::CpuNv12,
+        )
+        .map_err(|e| {
+            PipelineError::Message(format!("nvdec hevc d3d11 shared create failed: {e}"))
+        })?;
+        #[cfg(windows)]
+        decoder.enable_shared_texture(true);
+        #[cfg(not(windows))]
+        {
+            return Err(PipelineError::Message(
+                "nvdec hevc d3d11 shared output is only available on Windows".to_string(),
+            ));
+        }
+        Ok(Self {
+            decoder,
+            require_shared_output: true,
+        })
+    }
+
     pub fn new_hevc_main10() -> Result<Self, PipelineError> {
         let decoder = mrd_decode_nvdec::NvdecDecoder::new_hevc_main10_with_output_mode(
             mrd_decode_nvdec::NvdecOutputMode::CpuNv12,
@@ -290,6 +333,27 @@ impl NvdecVideoDecoder {
         Ok(Self {
             decoder,
             require_shared_output: false,
+        })
+    }
+
+    pub fn new_hevc_main10_d3d11_shared() -> Result<Self, PipelineError> {
+        let mut decoder = mrd_decode_nvdec::NvdecDecoder::new_hevc_main10_with_output_mode(
+            mrd_decode_nvdec::NvdecOutputMode::CpuNv12,
+        )
+        .map_err(|e| {
+            PipelineError::Message(format!("nvdec hevc main10 d3d11 shared create failed: {e}"))
+        })?;
+        #[cfg(windows)]
+        decoder.enable_shared_texture(true);
+        #[cfg(not(windows))]
+        {
+            return Err(PipelineError::Message(
+                "nvdec hevc main10 d3d11 shared output is only available on Windows".to_string(),
+            ));
+        }
+        Ok(Self {
+            decoder,
+            require_shared_output: true,
         })
     }
 }
@@ -1226,6 +1290,17 @@ mod tests {
             parse_h264_dimensions(&access_units[0].bytes).expect("parse H.264 dimensions");
 
         assert_eq!(dimensions, Some((width, height)));
+    }
+
+    #[test]
+    fn exposes_hevc_d3d11_shared_nvdec_descriptor() {
+        let descriptor = available_decoder_descriptors()
+            .into_iter()
+            .find(|descriptor| descriptor.id == "nvdec_hevc_d3d11_shared")
+            .expect("HEVC D3D11 shared NVDEC descriptor");
+
+        assert_eq!(descriptor.codec, CodecKind::Hevc);
+        assert_eq!(descriptor.output_formats, D3D11_TEXTURE_OUTPUTS);
     }
 
     #[cfg(target_os = "linux")]

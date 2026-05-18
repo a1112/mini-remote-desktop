@@ -21,6 +21,7 @@ import {
   closeRemoteDisplayWindow,
   configureRemoteDisplayNativeSurface,
   currentRemoteDisplayWindowContext,
+  ipcMediaPipelineSnapshot,
   presentTestHarnessFrameOnNativeSurface,
   testGetCapabilities,
   testGetRun,
@@ -33,6 +34,7 @@ import {
   type EncoderType,
   type EnvironmentSnapshot,
   type HarnessMetrics,
+  type MediaPipelineSnapshot,
   type NativeRenderSurfaceSnapshot,
   type RemoteDisplayWindowContext,
   type TestConfig,
@@ -211,6 +213,66 @@ function nativeRendererForHost(hostOs: HostOs): NonNullable<TestConfig["renderer
   if (hostOs === "linux") return "linux";
   if (hostOs === "windows") return "d3d11";
   return null;
+}
+
+function dash(value: string | number | null | undefined) {
+  if (value === null || value === undefined || value === "") return "-";
+  return String(value);
+}
+
+function formatFps(value?: number | null) {
+  return typeof value === "number" ? `${value.toFixed(value >= 100 ? 0 : 1)} FPS` : "-";
+}
+
+function formatMbps(value?: number | null) {
+  return typeof value === "number" ? `${value.toFixed(value >= 10 ? 1 : 2)} Mbps` : "-";
+}
+
+function formatPercent(value: number) {
+  return `${Math.max(0, value).toFixed(value >= 10 ? 0 : 1)}%`;
+}
+
+function codecLabel(codec?: string | null, profile?: string | null) {
+  const normalized = codec?.toLowerCase();
+  const family =
+    normalized === "hevc" || normalized === "h265"
+      ? "H.265"
+      : normalized === "h264"
+        ? "H.264"
+        : normalized === "av1"
+          ? "AV1"
+          : dash(codec);
+  if (!profile) return family;
+  return `${family} ${profile.toLowerCase() === "main" ? "Main" : profile}`;
+}
+
+function decoderLabel(decoder?: string | null) {
+  switch (decoder) {
+    case "nvdec_hevc_d3d11_shared":
+    case "nvdec_d3d11_shared_hevc":
+      return "NVDEC HEVC / D3D11";
+    case "nvdec_hevc":
+      return "NVDEC HEVC";
+    case "nvdec":
+    case "nvdec_d3d11_shared":
+      return "NVDEC";
+    case "h264_software":
+    case "software":
+      return "Software";
+    default:
+      return dash(decoder);
+  }
+}
+
+function captureMethodLabel(source?: CaptureSourceSelection | null, capture?: CaptureType) {
+  const sourceKind = source?.source.source_kind;
+  if (source?.source.platform === "windows" && sourceKind === "display_shared") {
+    return "DXGINative";
+  }
+  if (capture === "dxgi") return "DXGINative";
+  if (capture === "winrt") return "WinRT";
+  if (capture === "linux") return "PipeWire";
+  return dash(capture);
 }
 
 function defaultNativeRenderMode(): RenderMode {
@@ -441,6 +503,28 @@ function TitleSelect<T extends string>({
   );
 }
 
+function DiagnosticGroup({
+  title,
+  rows,
+}: {
+  title: string;
+  rows: Array<[string, string | number]>;
+}) {
+  return (
+    <section className="rounded-md border border-emerald-400/10 bg-emerald-950/20 p-3">
+      <div className="mb-2 text-[12px] font-semibold text-emerald-100">{title}</div>
+      <div className="grid gap-1.5">
+        {rows.map(([label, value]) => (
+          <div key={label} className="grid grid-cols-[92px_1fr] gap-3">
+            <span className="text-emerald-200/60">{label}</span>
+            <span className="min-w-0 truncate text-emerald-50">{value}</span>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 export function RemoteDisplayWindowPage() {
   const { id } = useParams();
   const [searchParams] = useSearchParams();
@@ -462,7 +546,7 @@ export function RemoteDisplayWindowPage() {
     isTauriRuntime() ? defaultNativeRenderMode() : "web"
   );
   const [capture, setCapture] = useState<CaptureType>("dxgi");
-  const [encoder, setEncoder] = useState<EncoderType>("nvenc_h264");
+  const [encoder, setEncoder] = useState<EncoderType>("nvenc_hevc");
   const [decoder, setDecoder] = useState<DecoderType>("nvdec");
   const [transport, setTransport] = useState<TransportKind>("quic");
   const [resolution, setResolution] = useState<ResolutionKey>("1920x1080");
@@ -481,6 +565,8 @@ export function RemoteDisplayWindowPage() {
   const [sessionSnapshot, setSessionSnapshot] =
     useState<SessionRuntimeSnapshot | null>(null);
   const [probeSnapshot, setProbeSnapshot] = useState<ProbeSnapshot | null>(null);
+  const [mediaPipelineSnapshot, setMediaPipelineSnapshot] =
+    useState<MediaPipelineSnapshot | null>(null);
   const [mediaProfileNegotiation, setMediaProfileNegotiation] =
     useState<MediaProfileNegotiation | null>(null);
   const [captureSources, setCaptureSources] = useState<CaptureSource[]>([]);
@@ -490,6 +576,8 @@ export function RemoteDisplayWindowPage() {
   const [captureSourcePickerMode, setCaptureSourcePickerMode] =
     useState<CaptureSourcePickerMode>("dropdown");
   const [captureSourcePickerOpen, setCaptureSourcePickerOpen] = useState(false);
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
+  const [diagnosticsPinned, setDiagnosticsPinned] = useState(false);
 
   const sessionId = id ?? context?.session_id ?? "local-preview";
   const activeSurfaceId = context?.surface_id ?? surfaceId;
@@ -636,6 +724,58 @@ export function RemoteDisplayWindowPage() {
     probeSnapshot?.media_probe_target_fps
       ? `${probeSnapshot.media_probe_width}x${probeSnapshot.media_probe_height}@${probeSnapshot.media_probe_target_fps}`
       : null;
+  const remoteDropTotal =
+    (probeSnapshot?.frames_dropped ?? 0) + (mediaPipelineSnapshot?.dropped_frames ?? 0);
+  const remoteFrameTotal = Math.max(
+    1,
+    (probeSnapshot?.frames_received ?? 0) + remoteDropTotal
+  );
+  const remoteDropRatio = remoteDropTotal / remoteFrameTotal * 100;
+  const remoteLatencyMs =
+    mediaPipelineSnapshot?.stage_metrics?.find((metric) => metric.stage === "receiver.decode")
+      ?.p95_ms ?? null;
+  const remoteQuality =
+    (probeSnapshot?.last_error || mediaPipelineSnapshot?.codec_fallback_reason)
+      ? "降级"
+      : remoteDropRatio <= 0.5 && (probeSnapshot?.current_fps ?? 0) >= 55
+        ? "流畅"
+        : hasRemoteFrames
+          ? "一般"
+          : "等待";
+  const diagnosticsVisible = diagnosticsOpen || diagnosticsPinned;
+  const diagnosticsCodec = codecLabel(
+    mediaPipelineSnapshot?.active_codec ?? mediaProfileNegotiation?.selected.codec,
+    mediaPipelineSnapshot?.active_codec_profile ??
+      mediaProfileNegotiation?.selected.codec_profile
+  );
+  const diagnosticsChroma =
+    mediaPipelineSnapshot?.active_chroma_subsampling ??
+    mediaProfileNegotiation?.selected.chroma_subsampling ??
+    "-";
+  const diagnosticsPixelFormat =
+    mediaPipelineSnapshot?.active_pixel_format ??
+    mediaProfileNegotiation?.selected.pixel_format ??
+    probeSnapshot?.latest_frame_pixel_format ??
+    "-";
+  const diagnosticsBitDepth =
+    mediaPipelineSnapshot?.active_bit_depth ?? mediaProfileNegotiation?.selected.bit_depth ?? null;
+  const diagnosticsHdrEnabled =
+    mediaPipelineSnapshot?.active_hdr_enabled ?? mediaProfileNegotiation?.selected.hdr_enabled;
+  const diagnosticsResolution =
+    mediaPipelineSnapshot?.active_width && mediaPipelineSnapshot?.active_height
+      ? `${mediaPipelineSnapshot.active_width}x${mediaPipelineSnapshot.active_height}`
+      : probeSnapshot?.media_probe_width && probeSnapshot?.media_probe_height
+      ? `${probeSnapshot.media_probe_width}x${probeSnapshot.media_probe_height}`
+      : remoteProbeTarget?.split("@")[0] ?? "-";
+  const diagnosticsTarget =
+    mediaPipelineSnapshot?.active_width &&
+    mediaPipelineSnapshot?.active_height &&
+    mediaPipelineSnapshot?.active_fps
+      ? `${mediaPipelineSnapshot.active_width}x${mediaPipelineSnapshot.active_height}@${mediaPipelineSnapshot.active_fps}`
+      : remoteProbeTarget ??
+    (mediaProfileNegotiation?.selected
+      ? `${mediaProfileNegotiation.selected.width}x${mediaProfileNegotiation.selected.height}@${mediaProfileNegotiation.selected.fps}`
+      : "-");
 
   const title = useMemo(() => {
     if (context?.label) return context.label;
@@ -708,12 +848,19 @@ export function RemoteDisplayWindowPage() {
     isLocalPipelinePreview && renderMode === "web" ? localWebViewPlan.reason : null;
   const buildRemoteMediaProfile = useCallback(() => {
     const [width, height] = resolution.split("x").map(Number) as [number, number];
+    const hevc = isHevcEncoder(encoder);
+    const main10 = encoder === "nvenc_hevc_main10";
     return {
       width,
       height,
       fps: Number(fps),
       bitrate_mbps: Number(bitrate),
-      codec: isHevcEncoder(encoder) ? "hevc" : "h264",
+      codec: hevc ? "hevc" : "h264",
+      codec_profile: hevc ? (main10 ? "main10" : "main") : "high",
+      bit_depth: main10 ? 10 : 8,
+      chroma_subsampling: "4:2:0",
+      pixel_format: main10 ? "p010" : "nv12",
+      hdr_enabled: false,
     };
   }, [bitrate, encoder, fps, resolution]);
   const isTestBusy =
@@ -792,8 +939,8 @@ export function RemoteDisplayWindowPage() {
         pickAvailable(
           value,
           capabilities.available_encoders,
-          ["nvenc_h264", "nvenc_av1", "openh264"],
-          "nvenc_h264"
+          ["nvenc_hevc", "nvenc_h264", "nvenc_av1", "openh264"],
+          "nvenc_hevc"
         )
       );
       setDecoder((value) =>
@@ -1243,14 +1390,18 @@ export function RemoteDisplayWindowPage() {
     let cancelled = false;
     const poll = async () => {
       try {
-        const [snapshot, probe] = await Promise.all([
+        const [snapshot, probe, pipeline] = await Promise.all([
           getSessionSnapshot(sessionId),
           getProbeSnapshot(sessionId),
+          ipcMediaPipelineSnapshot(sessionId),
         ]);
         if (cancelled) return;
 
         setSessionSnapshot(snapshot);
         setProbeSnapshot(probe);
+        if (pipeline.ok && pipeline.value) {
+          setMediaPipelineSnapshot(pipeline.value);
+        }
 
         const errorMessage = snapshot.last_error ?? probe.last_error ?? null;
         if (errorMessage) {
@@ -1867,11 +2018,106 @@ export function RemoteDisplayWindowPage() {
           className="flex shrink-0 items-center gap-2 px-3"
           style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}
         >
-          <div className="hidden items-center gap-2 rounded-md bg-white/7 px-2 py-1 text-[11px] text-slate-300 md:flex">
-            <Network className="h-3.5 w-3.5 text-emerald-300" />
-            <span>0.3 ms</span>
-            <span className="text-slate-600">/</span>
-            <span>{formatTime(elapsed)}</span>
+          <div
+            className="relative hidden md:block"
+            onMouseEnter={() => setDiagnosticsOpen(true)}
+            onMouseLeave={() => {
+              if (!diagnosticsPinned) setDiagnosticsOpen(false);
+            }}
+            onBlur={(event) => {
+              if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+                setDiagnosticsOpen(false);
+                setDiagnosticsPinned(false);
+              }
+            }}
+          >
+            <button
+              type="button"
+              aria-label="连接诊断"
+              aria-expanded={diagnosticsVisible}
+              className="inline-flex items-center gap-2 rounded-md border border-emerald-400/20 bg-emerald-500/10 px-2 py-1 text-[11px] text-emerald-50 hover:bg-emerald-500/16"
+              onClick={() => {
+                setDiagnosticsPinned((value) => !value);
+                setDiagnosticsOpen(true);
+              }}
+              onKeyDown={(event) => {
+                if (event.key === "Escape") {
+                  setDiagnosticsOpen(false);
+                  setDiagnosticsPinned(false);
+                }
+              }}
+            >
+              <span className="h-2 w-2 rounded-full bg-emerald-300 shadow-[0_0_8px_rgba(52,211,153,0.9)]" />
+              <Network className="h-3.5 w-3.5 text-emerald-300" />
+              <span>{remoteQuality}</span>
+              <span className="text-emerald-200/60">/</span>
+              <span>{formatFps(probeSnapshot?.current_fps)}</span>
+              <span className="text-emerald-200/60">/</span>
+              <span>{remoteLatencyMs !== null ? `${remoteLatencyMs.toFixed(1)} ms` : "-"}</span>
+            </button>
+            {diagnosticsVisible ? (
+              <div className="absolute right-0 top-9 z-50 max-h-[min(72vh,520px)] w-[420px] overflow-y-auto rounded-md border border-emerald-400/20 bg-[#03140f]/95 p-4 text-[11px] text-emerald-50 shadow-2xl shadow-emerald-950/60 backdrop-blur">
+                <div className="mb-3 flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <span className="h-2 w-2 rounded-full bg-emerald-300" />
+                    <div className="text-sm font-semibold text-white">远程诊断</div>
+                  </div>
+                  <div className="text-emerald-200/70">{formatTime(elapsed)}</div>
+                </div>
+                <div className="grid gap-4">
+                  <DiagnosticGroup
+                    title="连接"
+                    rows={[
+                      ["连接时间", formatTime(elapsed)],
+                      ["连接质量", remoteQuality],
+                      ["帧率", formatFps(probeSnapshot?.current_fps)],
+                      ["延迟", remoteLatencyMs !== null ? `${remoteLatencyMs.toFixed(1)} ms` : "-"],
+                      ["丢包/掉帧", formatPercent(remoteDropRatio)],
+                      [
+                        "码率",
+                        formatMbps(
+                          probeSnapshot?.bitrate_mbps ??
+                            mediaPipelineSnapshot?.active_bitrate_mbps ??
+                            null
+                        ),
+                      ],
+                    ]}
+                  />
+                  <DiagnosticGroup
+                    title="画面"
+                    rows={[
+                      ["画面质量", remoteQuality === "流畅" ? "高清" : remoteQuality],
+                      ["画面呈现", "自动缩放"],
+                      ["编解码器", diagnosticsCodec],
+                      ["位深", diagnosticsBitDepth ? `${diagnosticsBitDepth}-bit` : "-"],
+                      ["色度采样", diagnosticsChroma],
+                      ["像素格式", diagnosticsPixelFormat],
+                      ["采集方式", captureMethodLabel(captureSourceSelection, capture)],
+                      ["HDR", diagnosticsHdrEnabled ? "已开启" : "已关闭"],
+                      ["分辨率/缩放", `${diagnosticsResolution} / ${diagnosticsTarget}`],
+                    ]}
+                  />
+                  <DiagnosticGroup
+                    title="双端"
+                    rows={[
+                      ["本机 CPU", dash(capabilities?.cpu_brand)],
+                      ["本机 GPU", dash(capabilities?.gpu_info)],
+                      ["本机内存", capabilities?.memory_gb ? `${capabilities.memory_gb}G` : "-"],
+                      ["本机系统", dash(capabilities?.os_type)],
+                      ["远端 Device", dash(sessionSnapshot?.session_id)],
+                      ["Build ID", dash(context?.label)],
+                      ["解码器", decoderLabel(mediaPipelineSnapshot?.active_decoder ?? decoder)],
+                      ["渲染器", dash(mediaPipelineSnapshot?.active_renderer ?? renderModeLabel)],
+                    ]}
+                  />
+                  {mediaPipelineSnapshot?.codec_fallback_reason ? (
+                    <div className="rounded-md border border-amber-300/20 bg-amber-400/10 p-2 text-amber-100">
+                      codec fallback: {mediaPipelineSnapshot.codec_fallback_reason}
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+            ) : null}
           </div>
           <div className="flex overflow-hidden rounded-md border border-white/10">
             <button

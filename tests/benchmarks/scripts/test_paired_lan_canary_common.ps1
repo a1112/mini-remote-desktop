@@ -16,15 +16,23 @@ function Assert-True($Condition, [string]$Message) {
 }
 
 $profiles = Get-PairedLanCanaryProfiles -DurationSecs 30 -BitrateMbps 20
-Assert-Equal $profiles.Count 8 "Profile count"
+Assert-Equal $profiles.Count 9 "Profile count"
 Assert-Equal $profiles[0].id "1080p60" "First profile id"
 Assert-Equal $profiles[2].id "2k144" "2K144 profile is present"
-Assert-Equal $profiles[3].id "1600p165" "Native 1600p165 profile is present"
-Assert-Equal $profiles[3].bitrate_mbps 80 "Native 1600p165 profile uses the higher default bitrate"
-Assert-Equal $profiles[4].id "1600p165_120mbps" "Native 1600p165 high-bitrate profile is present"
-Assert-Equal $profiles[4].bitrate_mbps 120 "Native 1600p165 high-bitrate profile reaches 120 Mbps"
-Assert-Equal $profiles[6].fps 180 "180 FPS profile is present"
-Assert-Equal $profiles[7].fps 249 "249 FPS profile is present"
+Assert-Equal $profiles[3].id "2k144_adaptive" "Adaptive 2K144 profile is present"
+Assert-Equal $profiles[3].bitrate_mbps 80 "Adaptive 2K144 profile uses the 80 Mbps ceiling"
+Assert-True $profiles[3].adaptive "Adaptive 2K144 profile enables adaptive autorun"
+Assert-Equal $profiles[4].id "1600p165" "Native 1600p165 profile is present"
+Assert-Equal $profiles[4].bitrate_mbps 80 "Native 1600p165 profile uses the higher default bitrate"
+Assert-Equal $profiles[5].id "1600p165_120mbps" "Native 1600p165 high-bitrate profile is present"
+Assert-Equal $profiles[5].bitrate_mbps 120 "Native 1600p165 high-bitrate profile reaches 120 Mbps"
+Assert-Equal $profiles[7].fps 180 "180 FPS profile is present"
+Assert-Equal $profiles[8].fps 249 "249 FPS profile is present"
+
+$h264CrossChain = New-CanaryMediaChain -Mode "cross" -Codec "h264"
+Assert-Equal $h264CrossChain "dxgi/nvenc_h264/quic_datagram_media_v3_or_v2/nvdec/d3d11_shared" "H.264 cross chain remains the default"
+$hevcCrossChain = New-CanaryMediaChain -Mode "cross" -Codec "hevc"
+Assert-Equal $hevcCrossChain "dxgi/nvenc_hevc/quic_datagram_media_v3_or_v2/nvdec_hevc_d3d11_shared/d3d11_shared" "HEVC cross chain uses HEVC encode/decode labels"
 
 $localRow = [pscustomobject]@{
   id = "1080p144"
@@ -127,7 +135,7 @@ $displayLimitedReport = [pscustomobject]@{
   }
   sessionSnapshot = [pscustomobject]@{ state = "streaming" }
 }
-$displayLimitedRow = Convert-CrossReportToCanaryRow -Profile $profiles[7] -Report $displayLimitedReport -ReportPath "raw/cross-1080p249.json"
+$displayLimitedRow = Convert-CrossReportToCanaryRow -Profile $profiles[8] -Report $displayLimitedReport -ReportPath "raw/cross-1080p249.json"
 Assert-Equal $displayLimitedRow.status "skipped" "Display refresh capped profiles are environment skips"
 Assert-Equal $displayLimitedRow.classification "display_refresh_limited" "Display refresh cap is classified explicitly"
 Assert-True ($displayLimitedRow.error_message -match "144Hz") "Display refresh cap carries an actionable reason"
@@ -171,5 +179,70 @@ $sampleFpsReport = [pscustomobject]@{
 $sampleFpsRow = Convert-CrossReportToCanaryRow -Profile $profiles[0] -Report $sampleFpsReport -ReportPath "raw/cross-1080p60.json"
 Assert-Equal $sampleFpsRow.fps_observed 57.0 "Cross report prefers sample-window FPS over cumulative probe FPS"
 Assert-Equal $sampleFpsRow.test_impairment.datagrams_dropped 1 "Cross row carries media impairment counters"
+
+$hevcReport = [pscustomobject]@{
+  status = "completed"
+  failureReason = $null
+  errorMessage = $null
+  sampleObservedFps = 122.0
+  probeSnapshot = [pscustomobject]@{
+    current_fps = 122.0
+    frames_decoded = 3660
+    frames_dropped = 12
+    media_probe_width = 2560
+    media_probe_height = 1440
+    media_probe_target_fps = 144
+    media_probe_target_bitrate_mbps = 80
+  }
+  mediaPipelineSnapshot = [pscustomobject]@{
+    dropped_frames = 0
+    queue_depth = 0
+    stage_metrics = @()
+    test_impairment = $null
+    active_codec = "hevc"
+    active_codec_profile = "main"
+    active_chroma_subsampling = "4:2:0"
+    active_pixel_format = "d3d11_shared_nv12"
+    active_bitrate_mbps = 80
+  }
+  sessionSnapshot = [pscustomobject]@{ state = "streaming" }
+}
+$hevcRow = Convert-CrossReportToCanaryRow -Profile $profiles[2] -Report $hevcReport -ReportPath "raw/cross-2k144-hevc.json"
+Assert-Equal $hevcRow.chain "dxgi/nvenc_hevc/quic_datagram_media_v3_or_v2/nvdec_hevc_d3d11_shared/d3d11_shared" "HEVC cross row reports the active HEVC chain"
+Assert-Equal $hevcRow.active_codec "hevc" "HEVC cross row carries active codec"
+Assert-Equal $hevcRow.active_codec_profile "main" "HEVC cross row carries active profile"
+Assert-Equal $hevcRow.active_chroma_subsampling "4:2:0" "HEVC cross row carries chroma sampling"
+Assert-Equal $hevcRow.active_pixel_format "d3d11_shared_nv12" "HEVC cross row carries pixel format"
+
+$renderDropReport = [pscustomobject]@{
+  status = "completed"
+  failureReason = $null
+  errorMessage = $null
+  sampleObservedFps = 136.0
+  probeSnapshot = [pscustomobject]@{
+    current_fps = 136.0
+    frames_decoded = 8282
+    frames_dropped = 37
+    media_probe_width = 2560
+    media_probe_height = 1440
+    media_probe_target_fps = 144
+    media_probe_target_bitrate_mbps = 80
+  }
+  mediaPipelineSnapshot = [pscustomobject]@{
+    dropped_frames = 457
+    render_queue_replacements = 455
+    render_lock_drops = 2
+    queue_depth = 0
+    stage_metrics = @()
+    test_impairment = $null
+  }
+  sessionSnapshot = [pscustomobject]@{ state = "streaming" }
+}
+$renderDropRow = Convert-CrossReportToCanaryRow -Profile $profiles[2] -Report $renderDropReport -ReportPath "raw/cross-2k144.json"
+Assert-Equal $renderDropRow.dropped_frames 37 "Cross row dropped_frames tracks probe/transport drops"
+Assert-Equal $renderDropRow.probe_dropped_frames 37 "Cross row exposes probe drops separately"
+Assert-Equal $renderDropRow.pipeline_dropped_frames 457 "Cross row preserves legacy pipeline dropped frames"
+Assert-Equal $renderDropRow.render_queue_replacements 455 "Cross row exposes render queue replacements"
+Assert-Equal $renderDropRow.render_lock_drops 2 "Cross row exposes render lock drops"
 
 Write-Host "paired LAN canary common tests passed"

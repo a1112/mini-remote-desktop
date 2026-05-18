@@ -86,6 +86,38 @@ pub struct MediaProfile {
     pub fps: u32,
     pub bitrate_mbps: u32,
     pub codec: String,
+    /// Codec profile name, for example `main` or `main10`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codec_profile: Option<String>,
+    /// Video bit depth. HEVC Main uses 8, HEVC Main10 uses 10.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bit_depth: Option<u8>,
+    /// Chroma subsampling label such as `4:2:0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chroma_subsampling: Option<String>,
+    /// Runtime pixel format associated with this profile, for example `nv12`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pixel_format: Option<String>,
+    /// Whether HDR is expected for this media profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hdr_enabled: Option<bool>,
+}
+
+impl Default for MediaProfile {
+    fn default() -> Self {
+        Self {
+            width: 0,
+            height: 0,
+            fps: 0,
+            bitrate_mbps: 0,
+            codec: "h264".to_string(),
+            codec_profile: None,
+            bit_depth: None,
+            chroma_subsampling: None,
+            pixel_format: None,
+            hdr_enabled: None,
+        }
+    }
 }
 
 /// Result of media profile negotiation.
@@ -139,6 +171,52 @@ pub struct MediaTestImpairmentSnapshot {
     pub datagrams_fragmented_by_mtu: u64,
 }
 
+fn default_adaptation_mode() -> String {
+    "keyframe_ladder".to_string()
+}
+
+fn default_downshift_cooldown_ms() -> u64 {
+    2_000
+}
+
+fn default_upshift_hold_ms() -> u64 {
+    5_000
+}
+
+/// Runtime configuration for LAN media bitrate/FPS/resolution adaptation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdaptiveMediaConfig {
+    pub enabled: bool,
+    #[serde(default = "default_adaptation_mode")]
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ceiling_profile: Option<MediaProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floor_profile: Option<MediaProfile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ladder: Vec<MediaProfile>,
+    #[serde(default = "default_downshift_cooldown_ms")]
+    pub downshift_cooldown_ms: u64,
+    #[serde(default = "default_upshift_hold_ms")]
+    pub upshift_hold_ms: u64,
+}
+
+/// Current adaptive LAN media controller state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MediaAdaptationSnapshot {
+    pub enabled: bool,
+    pub state: String,
+    pub ladder_index: u32,
+    pub current_profile: MediaProfile,
+    pub target_profile: MediaProfile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_reason: Option<String>,
+    pub last_change_ms: u64,
+    pub observed_fps: f32,
+    pub drop_ratio: f32,
+    pub queue_depth: u32,
+}
+
 /// Runtime state for a session media pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MediaPipelineSnapshot {
@@ -148,11 +226,52 @@ pub struct MediaPipelineSnapshot {
     pub active_decoder: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_renderer: Option<String>,
+    /// Codec currently flowing through the receiver pipeline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_codec: Option<String>,
+    /// Active codec profile, for example `main`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_codec_profile: Option<String>,
+    /// Active profile bit depth, for example `8` for NV12 or `10` for P010.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_bit_depth: Option<u8>,
+    /// Active chroma subsampling label, for example `4:2:0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_chroma_subsampling: Option<String>,
+    /// Active decoded pixel format, for example `d3d11_shared_nv12`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_pixel_format: Option<String>,
+    /// Whether HDR metadata is enabled for the active profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_hdr_enabled: Option<bool>,
+    /// Active negotiated width in pixels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_width: Option<u32>,
+    /// Active negotiated height in pixels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_height: Option<u32>,
+    /// Active negotiated frame rate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_fps: Option<u32>,
+    /// Active negotiated bitrate in Mbps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_bitrate_mbps: Option<u32>,
+    /// Last reason the runtime fell back from a requested codec.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codec_fallback_reason: Option<String>,
     pub queue_depth: u32,
+    /// Legacy aggregate of receiver-side render drops. Prefer the explicit
+    /// render counters below for diagnostics.
     pub dropped_frames: u64,
+    #[serde(default)]
+    pub render_queue_replacements: u64,
+    #[serde(default)]
+    pub render_lock_drops: u64,
     pub stage_metrics: Vec<MediaStageMetrics>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test_impairment: Option<MediaTestImpairmentSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adaptation: Option<MediaAdaptationSnapshot>,
 }
 
 /// A capture source that can be selected for a remote session.
@@ -415,6 +534,51 @@ pub struct CapabilitySnapshot {
     pub updated_at_ms: u64,
 }
 
+/// Query used to retrieve service-owned audit events.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct AuditLogQuery {
+    /// Optional session id filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
+    /// Optional action filter, for example `session.start`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    /// Optional maximum number of newest matching events to return.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// Service-owned audit event for security, control, and operations review.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuditEvent {
+    /// Monotonic event id within one service process.
+    pub id: u64,
+    /// Event time in milliseconds since Unix epoch.
+    pub timestamp_ms: u64,
+    /// Stable action id, for example `session.start`.
+    pub action: String,
+    /// Machine-readable outcome, usually `success` or `error`.
+    pub outcome: String,
+    /// Optional related session id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
+    /// Optional local actor device id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_device_id: Option<DeviceId>,
+    /// Optional peer device id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_device_id: Option<DeviceId>,
+    /// Optional transport kind, for example `quic`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_kind: Option<String>,
+    /// Optional reason or error detail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Deterministic key/value details for UI and export.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub details: Vec<(String, String)>,
+}
+
 // === Core IPC Types ===
 
 /// IPC request from Rdesk to mrd-service
@@ -452,6 +616,11 @@ pub enum IpcRequest {
     UpdateMediaProfile {
         session_id: SessionId,
         requested_profile: MediaProfile,
+    },
+    /// Configure LAN media bitrate/FPS/resolution adaptation for an existing session.
+    ConfigureMediaAdaptation {
+        session_id: SessionId,
+        config: AdaptiveMediaConfig,
     },
     /// List selectable capture sources from the remote peer for a session.
     ListRemoteCaptureSources {
@@ -509,6 +678,8 @@ pub enum IpcRequest {
     SessionRuntimeSnapshot { session_id: SessionId },
     /// Get aggregated runtime snapshot
     RuntimeSnapshot,
+    /// Query service-owned audit events.
+    AuditLog { query: AuditLogQuery },
     /// Get structured local capability snapshot.
     CapabilitySnapshot,
     /// Get probe snapshot data
@@ -576,6 +747,11 @@ pub enum IpcResponse {
         session_id: SessionId,
         negotiation: MediaProfileNegotiation,
     },
+    /// LAN media adaptation controller configured.
+    MediaAdaptationConfigured {
+        session_id: SessionId,
+        snapshot: MediaAdaptationSnapshot,
+    },
     /// Selectable capture sources returned by the remote peer.
     CaptureSourceList {
         session_id: SessionId,
@@ -610,6 +786,8 @@ pub enum IpcResponse {
     SessionSnapshot { snapshot: SessionRuntimeSnapshot },
     /// Aggregated runtime snapshot
     RuntimeSnapshot { snapshot: RuntimeSnapshot },
+    /// Service-owned audit events.
+    AuditLog { events: Vec<AuditEvent> },
     /// Structured local capability snapshot.
     CapabilitySnapshot {
         /// Current local capability snapshot.
@@ -853,5 +1031,29 @@ mod tests {
 
         let decoded: IpcRequest = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn media_profile_round_trips_hevc_chroma_metadata() {
+        let profile = MediaProfile {
+            width: 2560,
+            height: 1600,
+            fps: 165,
+            bitrate_mbps: 120,
+            codec: "hevc".to_string(),
+            codec_profile: Some("main".to_string()),
+            bit_depth: Some(8),
+            chroma_subsampling: Some("4:2:0".to_string()),
+            pixel_format: Some("nv12".to_string()),
+            hdr_enabled: Some(false),
+        };
+
+        let encoded = serde_json::to_string(&profile).unwrap();
+        assert!(encoded.contains("\"codec\":\"hevc\""));
+        assert!(encoded.contains("\"chroma_subsampling\":\"4:2:0\""));
+        assert!(encoded.contains("\"hdr_enabled\":false"));
+
+        let decoded: MediaProfile = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, profile);
     }
 }

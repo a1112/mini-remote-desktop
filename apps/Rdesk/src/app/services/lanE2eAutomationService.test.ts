@@ -125,6 +125,20 @@ function createCommands(
       })
     ),
     ipcStartLanRemoteSession: vi.fn().mockResolvedValue(ok("session-started")),
+    ipcConfigureMediaAdaptation: vi.fn().mockResolvedValue(
+      ok({
+        enabled: true,
+        state: "configured",
+        ladder_index: 0,
+        current_profile: DEFAULT_REQUESTED_PROFILE,
+        target_profile: DEFAULT_REQUESTED_PROFILE,
+        last_reason: "configured",
+        last_change_ms: 1_700_000_000_000,
+        observed_fps: 0,
+        drop_ratio: 0,
+        queue_depth: 0,
+      })
+    ),
     ipcListRemoteCaptureSources: vi.fn().mockResolvedValue(ok(DEFAULT_CAPTURE_SOURCES)),
     ipcSelectRemoteCaptureSource: vi.fn().mockResolvedValue(
       ok({
@@ -258,6 +272,7 @@ function createCommands(
           { stage: "decode", p50_ms: 0.8, p95_ms: 1.2 },
           { stage: "render_present", p50_ms: 5.0, p95_ms: 7.0 },
         ],
+        adaptation: null,
       })
     ),
     ipcStopSession: vi.fn().mockResolvedValue(ok("stopped")),
@@ -410,6 +425,73 @@ describe("runLanE2EAutomation", () => {
     expect(commands.ipcStopSession).toHaveBeenCalledWith("lan-e2e-test-session");
     expect(result.stages.map((stage) => `${stage.stage}:${stage.status}`)).toContain(
       "assert:completed"
+    );
+  });
+
+  it("configures adaptive media before receiver startup and reports its snapshot", async () => {
+    const ipcConfigureMediaAdaptation = vi.fn().mockResolvedValue(
+      ok({
+        enabled: true,
+        state: "configured",
+        ladder_index: 0,
+        current_profile: {
+          width: 2560,
+          height: 1600,
+          fps: 165,
+          bitrate_mbps: 80,
+          codec: "h264",
+        },
+        target_profile: {
+          width: 2560,
+          height: 1600,
+          fps: 165,
+          bitrate_mbps: 80,
+          codec: "h264",
+        },
+        last_reason: "configured",
+        last_change_ms: 1_700_000_000_000,
+        observed_fps: 0,
+        drop_ratio: 0,
+        queue_depth: 0,
+      })
+    );
+    const commands = createCommands({ ipcConfigureMediaAdaptation });
+
+    const result = await runLanE2EAutomation(commands, {
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      adaptive: true,
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => "lan-e2e-test-session",
+    });
+
+    expect(result.status).toBe("completed");
+    expect(ipcConfigureMediaAdaptation).toHaveBeenCalledWith(
+      "lan-e2e-test-session",
+      expect.objectContaining({
+        enabled: true,
+        mode: "keyframe_ladder",
+        ceiling_profile: expect.objectContaining({
+          width: 2560,
+          height: 1600,
+          fps: 165,
+          bitrate_mbps: 80,
+        }),
+        floor_profile: expect.objectContaining({
+          width: 1280,
+          height: 800,
+          fps: 60,
+          bitrate_mbps: 10,
+        }),
+      })
+    );
+    expect(result.mediaAdaptationSnapshot?.state).toBe("configured");
+    const events = result.stages.map((stage) => `${stage.stage}:${stage.status}`);
+    expect(events.indexOf("adaptation:completed")).toBeLessThan(
+      events.indexOf("receiver:started")
     );
   });
 

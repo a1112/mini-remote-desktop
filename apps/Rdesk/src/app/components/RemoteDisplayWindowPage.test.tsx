@@ -114,6 +114,104 @@ describe("RemoteDisplayWindowPage", () => {
     mockResizeObserver();
   });
 
+  it("shows a green LAN diagnostics popover with HEVC and chroma metadata", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(windowsCapabilities());
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-p2p-quic-123-1",
+          session_id: "p2p-quic-123",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: true,
+          render_mode: "d3d11_native",
+          native_surface_attached: true,
+          session_window_count: 1,
+        });
+      }
+      if (command === "configure_remote_display_native_surface") {
+        return Promise.resolve({
+          label: "render-p2p-quic-123-1",
+          backend: "d3d11",
+          attached: true,
+          visible: true,
+          parent_hwnd: "0xA",
+          hwnd: "0x14",
+          rect: { x: 0, y: 0, width: 1280, height: 720 },
+        });
+      }
+      if (command === "ipc_session_snapshot") {
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          role: "controller",
+          state: "streaming",
+          transport_kind: "quic",
+          last_error: null,
+          sender_active: false,
+          receiver_active: true,
+        });
+      }
+      if (command === "ipc_probe_snapshot") {
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          frames_received: 900,
+          frames_decoded: 896,
+          frames_dropped: 2,
+          current_fps: 144,
+          bitrate_mbps: 78.4,
+          media_probe_valid: true,
+          media_probe_width: 2560,
+          media_probe_height: 1440,
+          media_probe_target_fps: 144,
+          media_probe_target_bitrate_mbps: 80,
+          latest_frame_width: 2560,
+          latest_frame_height: 1440,
+          latest_frame_pixel_format: "d3d11_shared_nv12",
+          last_error: null,
+        });
+      }
+      if (command === "ipc_media_pipeline_snapshot") {
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          attached_surfaces: [{ surface_id: "surface-1", backend: "d3d11", window_handle: 20 }],
+          active_decoder: "nvdec_hevc_d3d11_shared",
+          active_renderer: "d3d11",
+          active_codec: "hevc",
+          active_codec_profile: "main",
+          active_bit_depth: 8,
+          active_chroma_subsampling: "4:2:0",
+          active_pixel_format: "d3d11_shared_nv12",
+          active_hdr_enabled: false,
+          active_width: 2560,
+          active_height: 1440,
+          active_fps: 144,
+          active_bitrate_mbps: 80,
+          codec_fallback_reason: null,
+          queue_depth: 0,
+          dropped_frames: 2,
+          stage_metrics: [{ stage: "receiver.decode", p95_ms: 1.2, samples: 20 }],
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay();
+
+    const diagnosticsChip = await screen.findByRole("button", { name: /连接诊断/ });
+    fireEvent.mouseEnter(diagnosticsChip);
+
+    expect(await screen.findByText("远程诊断")).toBeInTheDocument();
+    expect(screen.getByText("连接质量")).toBeInTheDocument();
+    expect(screen.getByText("H.265 Main")).toBeInTheDocument();
+    expect(screen.getByText("8-bit")).toBeInTheDocument();
+    expect(screen.getByText("4:2:0")).toBeInTheDocument();
+    expect(screen.getByText("NVDEC HEVC / D3D11")).toBeInTheDocument();
+    expect(screen.getByText("DXGINative")).toBeInTheDocument();
+  });
+
   it("exposes 180 and 249 FPS high-refresh profile options", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
@@ -899,14 +997,24 @@ describe("RemoteDisplayWindowPage", () => {
             height: 1080,
             fps: 144,
             bitrate_mbps: 20,
-            codec: "h264",
+            codec: "hevc",
+            codec_profile: "main",
+            bit_depth: 8,
+            chroma_subsampling: "4:2:0",
+            pixel_format: "nv12",
+            hdr_enabled: false,
           },
           selected: {
             width: 1920,
             height: 1080,
             fps: 144,
             bitrate_mbps: 20,
-            codec: "h264",
+            codec: "hevc",
+            codec_profile: "main",
+            bit_depth: 8,
+            chroma_subsampling: "4:2:0",
+            pixel_format: "nv12",
+            hdr_enabled: false,
           },
           status: "accepted",
           reason: null,
@@ -944,7 +1052,12 @@ describe("RemoteDisplayWindowPage", () => {
           height: 1080,
           fps: 144,
           bitrate_mbps: 20,
-          codec: "h264",
+          codec: "hevc",
+          codec_profile: "main",
+          bit_depth: 8,
+          chroma_subsampling: "4:2:0",
+          pixel_format: "nv12",
+          hdr_enabled: false,
         },
       });
     });

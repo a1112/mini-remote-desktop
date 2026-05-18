@@ -25,11 +25,15 @@ import type {
   SessionInfo,
   SessionRuntimeSnapshot,
   RuntimeSnapshot,
+  AuditEvent,
+  AuditLogQuery,
   CapabilitySnapshot,
   CaptureSource,
   CaptureSourceSelection,
   DisplayMode,
   DisplayModeChange,
+  AdaptiveMediaConfig,
+  MediaAdaptationSnapshot,
   MediaProfile,
   MediaProfileNegotiation,
   MediaPipelineSnapshot,
@@ -43,6 +47,8 @@ import type {
   TestStageEvent,
   MetricSeries,
   Artifact,
+  TelemetryBundle,
+  TelemetryQuery,
   TestPreset,
   EnvironmentSnapshot,
   WindowCaptureTarget,
@@ -418,6 +424,19 @@ export async function ipcUpdateMediaProfile(
 }
 
 /**
+ * Configure runtime LAN media bitrate/FPS/resolution adaptation.
+ */
+export async function ipcConfigureMediaAdaptation(
+  sessionId: string,
+  config: AdaptiveMediaConfig
+): Promise<AdapterResult<MediaAdaptationSnapshot>> {
+  return invokeAdapter<MediaAdaptationSnapshot>('ipc_configure_media_adaptation', {
+    sessionId,
+    config,
+  });
+}
+
+/**
  * List remote capture sources for an active LAN session.
  */
 export async function ipcListRemoteCaptureSources(
@@ -553,6 +572,15 @@ export async function ipcListSessions(): Promise<AdapterResult<SessionInfo[]>> {
  */
 export async function ipcRuntimeSnapshot(): Promise<AdapterResult<RuntimeSnapshot>> {
   return invokeAdapter<RuntimeSnapshot>('ipc_runtime_snapshot');
+}
+
+/**
+ * Query service-owned audit events.
+ */
+export async function ipcAuditLog(
+  query: AuditLogQuery = {}
+): Promise<AdapterResult<AuditEvent[]>> {
+  return invokeAdapter<AuditEvent[]>('ipc_audit_log', { query });
 }
 
 /**
@@ -817,6 +845,19 @@ export async function testGetRunEvents(runId: string): Promise<AdapterResult<Tes
  */
 export async function testGetRunArtifacts(runId: string): Promise<AdapterResult<Artifact[]>> {
   return invokeAdapter<Artifact[]>('test_get_run_artifacts', { runId });
+}
+
+/**
+ * Get a test run with persisted telemetry metrics, logs, events, and artifacts
+ */
+export async function testGetRunTelemetry(
+  runId: string,
+  query?: TelemetryQuery
+): Promise<AdapterResult<TelemetryBundle>> {
+  return invokeAdapter<TelemetryBundle>('test_get_run_telemetry', {
+    runId,
+    query: query ?? null,
+  });
 }
 
 /**

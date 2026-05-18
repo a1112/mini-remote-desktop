@@ -35,6 +35,7 @@ use tokio::time::{interval, sleep_until, timeout, Instant};
 const DEFAULT_DISCOVERY_PORT: u16 = 21116;
 const LAN_DISCOVERY_PORT_ENV: &str = "MRD_LAN_DISCOVERY_PORT";
 const LAN_DISCOVERY_PROBE_ENDPOINTS_ENV: &str = "MRD_LAN_DISCOVERY_PROBE_ENDPOINTS";
+const SERVICE_BUILD_ID_ENV: &str = "MRD_SERVICE_BUILD_ID";
 const LAN_TEST_IMPAIRMENT_LOSS_PCT_ENV: &str = "MRD_LAN_TEST_IMPAIRMENT_LOSS_PCT";
 const LAN_TEST_IMPAIRMENT_BASE_DELAY_MS_ENV: &str = "MRD_LAN_TEST_IMPAIRMENT_BASE_DELAY_MS";
 const LAN_TEST_IMPAIRMENT_JITTER_MS_ENV: &str = "MRD_LAN_TEST_IMPAIRMENT_JITTER_MS";
@@ -53,10 +54,9 @@ const LAN_MEDIA_TARGET_HEIGHT: u32 = 1600;
 const LAN_MEDIA_TARGET_FPS: u32 = 165;
 const LAN_MEDIA_MAX_FPS: u32 = 249;
 const LAN_MEDIA_TARGET_BITRATE_MBPS: u32 = 120;
+const LAN_QUIC_BEST_EFFORT_DATAGRAM_MAX_BITRATE_MBPS: u32 = 100;
 const LAN_QUIC_FALLBACK_DATAGRAM_BYTES: usize = 1_200;
 const LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES: usize = 4 * 1024 * 1024;
-const LAN_QUIC_RELIABLE_WHOLE_FRAME_MIN_PIXELS: u32 = 2560 * 1440;
-const LAN_QUIC_RELIABLE_WHOLE_FRAME_MIN_FRAGMENTS: usize = 6;
 const LAN_QUIC_RELIABLE_MEDIA_RETRY_DELAY: Duration = Duration::from_millis(10);
 const LAN_QUIC_MEDIA_TRANSPORT: &str = "quic_datagram";
 const LAN_QUIC_MEDIA_PROFILE_TRANSPORT: &str = "quic_datagram_2k144";
@@ -70,8 +70,12 @@ const LAN_DISPLAY_MODE_CONTROL_TRANSPORT: &str = "display_mode_control_v1";
 const LAN_MEDIA_PROTOCOL_VERSION: u32 = 3;
 const LAN_CAPTURE_DXGI_CAPABILITY: &str = "dxgi_capture";
 const LAN_ENCODE_NVENC_H264_CAPABILITY: &str = "nvenc_h264";
+const LAN_ENCODE_NVENC_HEVC_CAPABILITY: &str = "encode.nvenc_hevc";
 const LAN_DECODE_NVDEC_CAPABILITY: &str = "nvdec";
+const LAN_DECODE_NVDEC_HEVC_CAPABILITY: &str = "decode.nvdec_hevc";
+const LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY: &str = "media.hevc_main_420_8bit";
 const LAN_RENDER_D3D11_NATIVE_CAPABILITY: &str = "d3d11_native_render";
+const LAN_RENDER_D3D11_SHARED_NV12_CAPABILITY: &str = "render.d3d11_shared_nv12";
 const LAN_MEDIA_SENDER_MAX_CONSECUTIVE_FRAME_ERRORS: u32 = 8;
 const LAN_MEDIA_SENDER_ERROR_LOG_INTERVAL: u32 = 3;
 const LAN_MEDIA_RECEIVER_MAX_CONSECUTIVE_DECODE_ERRORS: u32 = 8;
@@ -86,13 +90,16 @@ const LAN_MEDIA_PROBE_DYNAMIC_FORMAT: &str = "compressed_h264_test_pattern";
 const LAN_MEDIA_PROBE_FORMAT_CODE: u32 = 2;
 const LAN_MEDIA_ENVELOPE_MAGIC: &[u8; 8] = b"MRDMV2F1";
 const LAN_MEDIA_ENVELOPE_HEADER_BYTES: usize = 48;
-const LAN_MEDIA_PAYLOAD_H264_ACCESS_UNIT: u8 = 1;
+const LAN_MEDIA_PAYLOAD_ACCESS_UNIT: u8 = 1;
+#[cfg(test)]
+const LAN_MEDIA_PAYLOAD_H264_ACCESS_UNIT: u8 = LAN_MEDIA_PAYLOAD_ACCESS_UNIT;
 const LAN_MEDIA_PAYLOAD_PROBE_FRAME: u8 = 2;
 const LAN_MEDIA_SENDER_STATS_MAGIC: &[u8; 8] = b"MRDMSTG1";
 const LAN_MEDIA_SENDER_STATS_HEADER_BYTES: usize = 12;
 const LAN_MEDIA_SENDER_STATS_INTERVAL: Duration = Duration::from_secs(1);
 const LAN_MEDIA_SENDER_STATS_SAMPLE_LIMIT: usize = 240;
 const LAN_MEDIA_CODEC_H264: u8 = 1;
+const LAN_MEDIA_CODEC_HEVC: u8 = 2;
 const LAN_PREVIEW_FRAME_INTERVAL: u64 = 120;
 const LAN_PREVIEW_MAX_WIDTH: u32 = 480;
 const LAN_PREVIEW_MAX_HEIGHT: u32 = 270;
@@ -567,6 +574,64 @@ struct LanMediaEnvelope {
     timestamp_us: u64,
     profile: MediaProfile,
     payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LanAccessUnitCodec {
+    H264,
+    Hevc,
+}
+
+impl LanAccessUnitCodec {
+    fn from_profile(profile: &MediaProfile) -> Self {
+        if profile.codec.eq_ignore_ascii_case("hevc") {
+            Self::Hevc
+        } else {
+            Self::H264
+        }
+    }
+
+    fn from_envelope_codec(codec: u8) -> Result<Self> {
+        match codec {
+            LAN_MEDIA_CODEC_H264 => Ok(Self::H264),
+            LAN_MEDIA_CODEC_HEVC => Ok(Self::Hevc),
+            _ => anyhow::bail!("unsupported LAN media access unit codec: {codec}"),
+        }
+    }
+
+    fn quic_codec(self) -> QuicMediaCodec {
+        match self {
+            Self::H264 => QuicMediaCodec::H264,
+            Self::Hevc => QuicMediaCodec::Hevc,
+        }
+    }
+
+    fn envelope_codec(self) -> u8 {
+        match self {
+            Self::H264 => LAN_MEDIA_CODEC_H264,
+            Self::Hevc => LAN_MEDIA_CODEC_HEVC,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::H264 => "h264",
+            Self::Hevc => "hevc",
+        }
+    }
+
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::H264 => "H.264",
+            Self::Hevc => "HEVC",
+        }
+    }
+}
+
+struct LanSenderEncoder {
+    codec: LanAccessUnitCodec,
+    backend: &'static str,
+    encoder: Box<dyn VideoEncoder + Send>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2190,6 +2255,17 @@ async fn build_announcement(app_state: &Arc<AppState>) -> Option<LanAnnouncement
 }
 
 fn service_build_id() -> String {
+    service_build_id_from_lookup(|key| std::env::var(key).ok())
+}
+
+fn service_build_id_from_lookup(lookup: impl Fn(&str) -> Option<String>) -> String {
+    if let Some(value) = lookup(SERVICE_BUILD_ID_ENV) {
+        let value = value.trim();
+        if !value.is_empty() {
+            return value.to_string();
+        }
+    }
+
     option_env!("VERGEN_GIT_SHA")
         .or(option_env!("GIT_COMMIT"))
         .unwrap_or(env!("CARGO_PKG_VERSION"))
@@ -2208,8 +2284,12 @@ fn lan_media_capabilities() -> Vec<String> {
         capabilities.extend([
             LAN_CAPTURE_DXGI_CAPABILITY.to_string(),
             LAN_ENCODE_NVENC_H264_CAPABILITY.to_string(),
+            LAN_ENCODE_NVENC_HEVC_CAPABILITY.to_string(),
             LAN_DECODE_NVDEC_CAPABILITY.to_string(),
+            LAN_DECODE_NVDEC_HEVC_CAPABILITY.to_string(),
+            LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY.to_string(),
             LAN_RENDER_D3D11_NATIVE_CAPABILITY.to_string(),
+            LAN_RENDER_D3D11_SHARED_NV12_CAPABILITY.to_string(),
             crate::display_mode::capability_name().to_string(),
         ]);
     }
@@ -2665,8 +2745,8 @@ async fn send_quic_media_loop(
     let mut frame_id = 1_u64;
     let mut active_capture_config: Option<LanCaptureConfigKey> = None;
     let mut capture: Option<LanFrameCapture> = None;
-    let mut encoder: Option<Box<dyn VideoEncoder + Send>> = None;
-    let mut encoder_config: Option<(usize, usize, u32, u32)> = None;
+    let mut encoder: Option<LanSenderEncoder> = None;
+    let mut encoder_config: Option<(usize, usize, u32, u32, LanAccessUnitCodec)> = None;
     let mut consecutive_frame_errors = 0_u32;
     let mut next_frame_at = Instant::now();
     let mut active_frame_interval = Duration::ZERO;
@@ -2682,6 +2762,8 @@ async fn send_quic_media_loop(
         .lock()
         .await
         .supports(&session_id, LAN_QUIC_PERSISTENT_MEDIA_TRANSPORT);
+    let reliable_media_send_mode =
+        select_reliable_media_send_mode(reliable_media_supported, persistent_media_supported);
     let media_v3_supported = app_state
         .peer_media_capabilities
         .lock()
@@ -2693,6 +2775,7 @@ async fn send_quic_media_loop(
             return Ok(());
         }
         let profile = selected_media_profile(&app_state, &session_id).await;
+        let requested_codec = LanAccessUnitCodec::from_profile(&profile);
         let frame_interval = media_frame_interval(&profile);
         if active_frame_interval != frame_interval {
             active_frame_interval = frame_interval;
@@ -2789,20 +2872,40 @@ async fn send_quic_media_loop(
                 continue;
             }
         };
-        let expected_encoder_config =
-            (frame.width, frame.height, profile.fps, profile.bitrate_mbps);
+        let expected_encoder_config = (
+            frame.width,
+            frame.height,
+            profile.fps,
+            profile.bitrate_mbps,
+            requested_codec,
+        );
         if encoder_config != Some(expected_encoder_config) {
             let encoder_create_started = Instant::now();
-            match create_lan_h264_encoder(
+            match create_lan_encoder(
+                requested_codec,
                 frame.width,
                 frame.height,
                 profile.fps,
                 profile.bitrate_mbps.saturating_mul(1_000_000).max(1),
             )
-            .context("failed to create LAN H.264 encoder")
+            .context("failed to create LAN media encoder")
             {
                 Ok(next_encoder) => {
                     sender_stats.record_elapsed("sender.encoder_create", encoder_create_started);
+                    let runtime_profile = lan_runtime_media_profile(&profile, next_encoder.codec);
+                    let fallback_reason = (next_encoder.codec != requested_codec).then(|| {
+                        format!(
+                            "{} unavailable; fell back to {} via {}",
+                            requested_codec.display_name(),
+                            next_encoder.codec.display_name(),
+                            next_encoder.backend
+                        )
+                    });
+                    {
+                        let mut pipelines = app_state.media_pipelines.lock().await;
+                        pipelines.set_active_media_profile(session_id.clone(), &runtime_profile);
+                        pipelines.set_codec_fallback_reason(session_id.clone(), fallback_reason);
+                    }
                     encoder = Some(next_encoder);
                     encoder_config = Some(expected_encoder_config);
                 }
@@ -2830,9 +2933,10 @@ async fn send_quic_media_loop(
         let encode_started = Instant::now();
         let encode_result = encoder
             .as_mut()
-            .context("LAN H.264 encoder was not initialized")
+            .context("LAN media encoder was not initialized")
             .and_then(|encoder| {
                 encoder
+                    .encoder
                     .encode(&frame)
                     .context("failed to encode LAN desktop frame")
             });
@@ -2859,13 +2963,22 @@ async fn send_quic_media_loop(
         };
 
         for access_unit in access_units {
-            let is_keyframe =
-                h264_access_unit_is_keyframe(access_unit.is_keyframe, &access_unit.bytes);
+            let runtime_codec = encoder
+                .as_ref()
+                .map(|encoder| encoder.codec)
+                .unwrap_or(requested_codec);
+            let runtime_profile = lan_runtime_media_profile(&profile, runtime_codec);
+            let is_keyframe = match runtime_codec {
+                LanAccessUnitCodec::H264 => {
+                    h264_access_unit_is_keyframe(access_unit.is_keyframe, &access_unit.bytes)
+                }
+                LanAccessUnitCodec::Hevc => access_unit.is_keyframe,
+            };
             let fragment_started = Instant::now();
             let fragments = if media_v3_supported {
                 match fragment_media_payload_v3(
                     QuicMediaPayloadType::AccessUnit,
-                    QuicMediaCodec::H264,
+                    runtime_codec.quic_codec(),
                     lan_media_profile_id(&profile),
                     frame_id as u32,
                     access_unit.timestamp_us,
@@ -2895,11 +3008,11 @@ async fn send_quic_media_loop(
                 }
             } else {
                 let media_payload = match encode_lan_media_envelope(LanMediaEnvelope {
-                    payload_type: LAN_MEDIA_PAYLOAD_H264_ACCESS_UNIT,
-                    codec: LAN_MEDIA_CODEC_H264,
+                    payload_type: LAN_MEDIA_PAYLOAD_ACCESS_UNIT,
+                    codec: runtime_codec.envelope_codec(),
                     sequence: frame_id,
                     timestamp_us: access_unit.timestamp_us,
-                    profile: profile.clone(),
+                    profile: runtime_profile.clone(),
                     payload: access_unit.bytes.clone(),
                 }) {
                     Ok(media_payload) => media_payload,
@@ -2951,8 +3064,10 @@ async fn send_quic_media_loop(
             sender_stats.record_elapsed("sender.fragment", fragment_started);
             test_impairment.record_mtu_fragmentation(max_datagram_size);
 
+            let reliable_media_enabled =
+                reliable_media_send_mode != LanReliableMediaSendMode::Disabled;
             let send_as_reliable_frame = should_send_access_unit_as_reliable_frame(
-                reliable_media_supported || persistent_media_supported,
+                reliable_media_enabled,
                 media_v3_supported,
                 fragments.len(),
                 &profile,
@@ -2962,7 +3077,7 @@ async fn send_quic_media_loop(
                 let reliable_fragment_started = Instant::now();
                 let result = fragment_media_payload_v3(
                     QuicMediaPayloadType::AccessUnit,
-                    QuicMediaCodec::H264,
+                    runtime_codec.quic_codec(),
                     lan_media_profile_id(&profile),
                     frame_id as u32,
                     access_unit.timestamp_us,
@@ -2992,7 +3107,7 @@ async fn send_quic_media_loop(
                     }
                 }
             } else if should_send_access_unit_reliably(
-                reliable_media_supported,
+                reliable_media_enabled,
                 is_keyframe,
                 access_unit.bytes.len(),
                 max_datagram_size,
@@ -3010,13 +3125,12 @@ async fn send_quic_media_loop(
                     if !delay.is_zero() {
                         tokio::time::sleep(delay).await;
                     }
-                    let send = if persistent_media_supported {
-                        endpoint
-                            .send_reliable_message_persistent(reliable_fragment)
-                            .await
-                    } else {
-                        endpoint.send_reliable_message(reliable_fragment).await
-                    };
+                    let send = send_lan_reliable_media_fragment(
+                        &endpoint,
+                        reliable_media_send_mode,
+                        reliable_fragment,
+                    )
+                    .await;
                     if let Err(error) = send {
                         send_result = Err(error).with_context(|| {
                             format!("failed to send LAN QUIC reliable media frame {}", frame_id)
@@ -3026,6 +3140,7 @@ async fn send_quic_media_loop(
                 }
                 sender_stats.record_elapsed("sender.send_reliable", reliable_send_started);
             } else {
+                let best_effort_datagrams = use_best_effort_media_datagrams(&profile);
                 let datagram_send_started = Instant::now();
                 for fragment in &fragments {
                     let decision = test_impairment.next_datagram_decision();
@@ -3039,9 +3154,12 @@ async fn send_quic_media_loop(
                         let delayed_fragment = fragment.clone();
                         tokio::spawn(async move {
                             tokio::time::sleep(decision.delay).await;
-                            if let Err(error) =
+                            let send_result = if best_effort_datagrams {
+                                delayed_endpoint.send_datagram(delayed_fragment)
+                            } else {
                                 delayed_endpoint.send_datagram_wait(delayed_fragment).await
-                            {
+                            };
+                            if let Err(error) = send_result {
                                 tracing::debug!(
                                     %error,
                                     session_id = %delayed_session_id.0,
@@ -3052,7 +3170,12 @@ async fn send_quic_media_loop(
                         });
                         continue;
                     }
-                    if let Err(error) = endpoint.send_datagram_wait(fragment.clone()).await {
+                    let send_fragment_result = if best_effort_datagrams {
+                        endpoint.send_datagram(fragment.clone())
+                    } else {
+                        endpoint.send_datagram_wait(fragment.clone()).await
+                    };
+                    if let Err(error) = send_fragment_result {
                         send_result = Err(error).with_context(|| {
                             format!("failed to send LAN QUIC media frame {}", frame_id)
                         });
@@ -3066,11 +3189,15 @@ async fn send_quic_media_loop(
                         let reliable_endpoint = endpoint.clone();
                         let reliable_session_id = session_id.clone();
                         let reliable_frame_id = frame_id;
+                        let reliable_send_mode = reliable_media_send_mode;
                         tokio::spawn(async move {
                             for reliable_fragment in reliable_fragments {
-                                if let Err(error) = reliable_endpoint
-                                    .send_reliable_message(reliable_fragment)
-                                    .await
+                                if let Err(error) = send_lan_reliable_media_fragment(
+                                    &reliable_endpoint,
+                                    reliable_send_mode,
+                                    reliable_fragment,
+                                )
+                                .await
                                 {
                                     tracing::warn!(
                                         %error,
@@ -3136,12 +3263,90 @@ async fn send_quic_media_loop(
     }
 }
 
+fn create_lan_encoder(
+    requested_codec: LanAccessUnitCodec,
+    width: usize,
+    height: usize,
+    fps: u32,
+    bitrate: u32,
+) -> Result<LanSenderEncoder> {
+    match requested_codec {
+        LanAccessUnitCodec::Hevc => match create_lan_hevc_encoder(width, height, fps, bitrate) {
+            Ok((backend, encoder)) => Ok(LanSenderEncoder {
+                codec: LanAccessUnitCodec::Hevc,
+                backend,
+                encoder,
+            }),
+            Err(hevc_error) => {
+                let (backend, encoder) = create_lan_h264_encoder(width, height, fps, bitrate)
+                    .with_context(|| {
+                        format!("HEVC unavailable ({hevc_error}); H.264 fallback also failed")
+                    })?;
+                Ok(LanSenderEncoder {
+                    codec: LanAccessUnitCodec::H264,
+                    backend,
+                    encoder,
+                })
+            }
+        },
+        LanAccessUnitCodec::H264 => {
+            let (backend, encoder) = create_lan_h264_encoder(width, height, fps, bitrate)?;
+            Ok(LanSenderEncoder {
+                codec: LanAccessUnitCodec::H264,
+                backend,
+                encoder,
+            })
+        }
+    }
+}
+
+#[cfg(windows)]
+fn create_lan_hevc_encoder(
+    width: usize,
+    height: usize,
+    fps: u32,
+    bitrate: u32,
+) -> Result<(&'static str, Box<dyn VideoEncoder + Send>)> {
+    match mrd_encode_nvenc::NvencHevcEncoder::new_max_speed_with_bitrate(
+        width, height, fps, bitrate,
+    ) {
+        Ok(encoder) => Ok((
+            "nvenc_hevc_p1_ultra_low_latency",
+            Box::new(encoder) as Box<dyn VideoEncoder + Send>,
+        )),
+        Err(max_speed_error) => {
+            mrd_encode_nvenc::NvencHevcEncoder::new_main_with_bitrate(width, height, fps, bitrate)
+                .map(|encoder| {
+                    (
+                        "nvenc_hevc",
+                        Box::new(encoder) as Box<dyn VideoEncoder + Send>,
+                    )
+                })
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "nvenc_hevc_p1_ultra_low_latency: {max_speed_error}; nvenc_hevc: {error}"
+                    )
+                })
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn create_lan_hevc_encoder(
+    _width: usize,
+    _height: usize,
+    _fps: u32,
+    _bitrate: u32,
+) -> Result<(&'static str, Box<dyn VideoEncoder + Send>)> {
+    anyhow::bail!("NVENC HEVC is unavailable on this platform")
+}
+
 fn create_lan_h264_encoder(
     width: usize,
     height: usize,
     fps: u32,
     bitrate: u32,
-) -> Result<Box<dyn VideoEncoder + Send>> {
+) -> Result<(&'static str, Box<dyn VideoEncoder + Send>)> {
     let mut last_error = None;
     for backend in preferred_lan_h264_encoder_backends() {
         let encoder: Result<Box<dyn VideoEncoder + Send>> = match *backend {
@@ -3159,7 +3364,7 @@ fn create_lan_h264_encoder(
             )),
         };
         match encoder {
-            Ok(encoder) => return Ok(encoder),
+            Ok(encoder) => return Ok((backend, encoder)),
             Err(error) => last_error = Some(format!("{backend}: {error}")),
         }
     }
@@ -3244,6 +3449,13 @@ struct LanMediaFrameOrderer {
     pending: BTreeMap<u32, QuicAuFrame>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LanReliableMediaSendMode {
+    Disabled,
+    PerMessage,
+    Persistent,
+}
+
 impl LanMediaFrameOrderer {
     fn new(max_pending_frames: usize) -> Self {
         Self {
@@ -3307,21 +3519,63 @@ fn should_send_access_unit_reliably(
     is_keyframe
 }
 
+fn select_reliable_media_send_mode(
+    reliable_media_supported: bool,
+    persistent_media_supported: bool,
+) -> LanReliableMediaSendMode {
+    if persistent_media_supported {
+        LanReliableMediaSendMode::Persistent
+    } else if reliable_media_supported {
+        LanReliableMediaSendMode::PerMessage
+    } else {
+        LanReliableMediaSendMode::Disabled
+    }
+}
+
+fn use_best_effort_media_datagrams(profile: &MediaProfile) -> bool {
+    profile.bitrate_mbps <= LAN_QUIC_BEST_EFFORT_DATAGRAM_MAX_BITRATE_MBPS
+}
+
+async fn send_lan_reliable_media_fragment(
+    endpoint: &QuinnDatagramEndpoint,
+    mode: LanReliableMediaSendMode,
+    fragment: bytes::Bytes,
+) -> Result<()> {
+    match mode {
+        LanReliableMediaSendMode::Disabled => {
+            anyhow::bail!("LAN reliable media send requested while reliable media is disabled")
+        }
+        LanReliableMediaSendMode::PerMessage => {
+            endpoint
+                .send_reliable_message(fragment)
+                .await
+                .context("failed to send per-message reliable LAN media fragment")?;
+        }
+        LanReliableMediaSendMode::Persistent => {
+            endpoint
+                .send_reliable_message_persistent(fragment)
+                .await
+                .context("failed to send persistent reliable LAN media fragment")?;
+        }
+    }
+    Ok(())
+}
+
 fn should_send_access_unit_as_reliable_frame(
     reliable_media_supported: bool,
     media_v3_supported: bool,
-    fragment_count: usize,
-    profile: &MediaProfile,
+    _fragment_count: usize,
+    _profile: &MediaProfile,
     reliable_whole_frame_override: Option<bool>,
 ) -> bool {
-    if !reliable_media_supported || !media_v3_supported || fragment_count <= 1 {
+    if !reliable_media_supported || !media_v3_supported {
         return false;
     }
     if let Some(enabled) = reliable_whole_frame_override {
         return enabled;
     }
-    profile.width.saturating_mul(profile.height) >= LAN_QUIC_RELIABLE_WHOLE_FRAME_MIN_PIXELS
-        || fragment_count >= LAN_QUIC_RELIABLE_WHOLE_FRAME_MIN_FRAGMENTS
+
+    false
 }
 
 fn reliable_whole_frame_media_override() -> Option<bool> {
@@ -3528,6 +3782,7 @@ async fn receive_quic_media_loop(
                 .context("failed to read LAN QUIC media datagram")?
         };
         receiver_stats.record_elapsed("receiver.read", read_started);
+        receiver_stats.record_elapsed("receiver.message_wait", read_started);
         if !session_allows_media(&app_state, &session_id).await {
             return Ok(());
         }
@@ -3591,7 +3846,52 @@ async fn receive_quic_media_loop(
                 };
 
                 match envelope.payload_type {
-                    LAN_MEDIA_PAYLOAD_H264_ACCESS_UNIT => {
+                    LAN_MEDIA_PAYLOAD_ACCESS_UNIT => {
+                        let frame_codec =
+                            match LanAccessUnitCodec::from_envelope_codec(envelope.codec) {
+                                Ok(codec) => codec,
+                                Err(error) => {
+                                    app_state.probes.lock().await.record_probe_drop(
+                                        &session_id,
+                                        frame.payload.len() as u64,
+                                        now_ms(),
+                                        format!("{error:#}"),
+                                    );
+                                    continue;
+                                }
+                            };
+                        if decoder.codec != frame_codec {
+                            let next_decoder = create_lan_receiver_decoder_with_preference(
+                                &app_state,
+                                &session_id,
+                                frame_codec,
+                                None,
+                            )
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "failed to switch LAN media receiver decoder to {}",
+                                    frame_codec.display_name()
+                                )
+                            });
+                            match next_decoder {
+                                Ok(next_decoder) => {
+                                    decoder = next_decoder;
+                                    decoder_waits_for_keyframe = true;
+                                    consecutive_decode_errors = 0;
+                                }
+                                Err(error) => {
+                                    app_state.probes.lock().await.record_probe_drop(
+                                        &session_id,
+                                        frame.payload.len() as u64,
+                                        now_ms(),
+                                        format!("{error:#}"),
+                                    );
+                                    decoder_waits_for_keyframe = true;
+                                    continue;
+                                }
+                            }
+                        }
                         if decoder_waits_for_keyframe && !frame.is_keyframe {
                             app_state.probes.lock().await.record_transient_frame_drop(
                                 &session_id,
@@ -3602,8 +3902,11 @@ async fn receive_quic_media_loop(
                         }
 
                         let decode_started = Instant::now();
-                        match decode_h264_desktop_frame(decoder.decoder.as_mut(), &envelope.payload)
-                        {
+                        match decode_lan_desktop_frame(
+                            frame_codec,
+                            decoder.decoder.as_mut(),
+                            &envelope.payload,
+                        ) {
                             Ok(decoded_frames) if !decoded_frames.is_empty() => {
                                 receiver_stats.record_elapsed("receiver.decode", decode_started);
                                 consecutive_decode_errors = 0;
@@ -3627,7 +3930,9 @@ async fn receive_quic_media_loop(
                             }
                             Err(error) => {
                                 receiver_stats.record_elapsed("receiver.decode", decode_started);
-                                let error = if frame.is_keyframe {
+                                let error = if frame.is_keyframe
+                                    && frame_codec == LanAccessUnitCodec::H264
+                                {
                                     match try_decode_h264_keyframe_with_fallback(
                                         &app_state,
                                         &session_id,
@@ -3668,7 +3973,8 @@ async fn receive_quic_media_loop(
                                 let payload_hash =
                                     format!("fnv1a64:{:016x}", fnv1a64(&envelope.payload));
                                 let message = format!(
-                                "failed to decode LAN H.264 media v2 access unit: sequence={}, keyframe={}, bytes={}, hash={}, reassembler={{completed:{}, expired:{}, evicted:{}, duplicate:{}, rejected:{}, pending:{}}}: {error}",
+                                "failed to decode LAN {} media v2 access unit: sequence={}, keyframe={}, bytes={}, hash={}, reassembler={{completed:{}, expired:{}, evicted:{}, duplicate:{}, rejected:{}, pending:{}}}: {error}",
+                                frame_codec.display_name(),
                                 envelope.sequence,
                                 frame.is_keyframe,
                                 envelope.payload.len(),
@@ -3701,10 +4007,11 @@ async fn receive_quic_media_loop(
                                     );
                                     decoder_waits_for_keyframe = true;
                                     decoder = create_lan_receiver_decoder_with_preference(
-                                    &app_state,
-                                    &session_id,
-                                    Some(decoder.backend),
-                                )
+                                        &app_state,
+                                        &session_id,
+                                        frame_codec,
+                                        Some(decoder.backend),
+                                    )
                                     .await
                                     .context(
                                         "failed to reset LAN media receiver decoder after decode error",
@@ -3727,10 +4034,11 @@ async fn receive_quic_media_loop(
                                         );
                                         decoder_waits_for_keyframe = true;
                                         decoder = create_lan_receiver_decoder_with_preference(
-                                        &app_state,
-                                        &session_id,
-                                        Some(decoder.backend),
-                                    )
+                                            &app_state,
+                                            &session_id,
+                                            frame_codec,
+                                            Some(decoder.backend),
+                                        )
                                         .await
                                         .context(
                                             "failed to reset LAN media receiver decoder after decode loss",
@@ -3810,19 +4118,28 @@ async fn quic_media_v3_frame_to_legacy_frame(
     }
 
     let payload_type = match frame.payload_type {
-        QuicMediaPayloadType::AccessUnit => LAN_MEDIA_PAYLOAD_H264_ACCESS_UNIT,
+        QuicMediaPayloadType::AccessUnit => LAN_MEDIA_PAYLOAD_ACCESS_UNIT,
         QuicMediaPayloadType::Probe => LAN_MEDIA_PAYLOAD_PROBE_FRAME,
         QuicMediaPayloadType::Control => 3,
     };
     let codec = match frame.codec {
         QuicMediaCodec::None => 0,
         QuicMediaCodec::H264 => LAN_MEDIA_CODEC_H264,
+        QuicMediaCodec::Hevc => LAN_MEDIA_CODEC_HEVC,
         unsupported => {
             anyhow::bail!("unsupported LAN media v3 codec: {unsupported:?}");
         }
     };
-    if frame.payload_type == QuicMediaPayloadType::AccessUnit && codec != LAN_MEDIA_CODEC_H264 {
-        anyhow::bail!("LAN media v3 access unit is not H.264");
+    if frame.payload_type == QuicMediaPayloadType::AccessUnit
+        && !matches!(codec, LAN_MEDIA_CODEC_H264 | LAN_MEDIA_CODEC_HEVC)
+    {
+        anyhow::bail!("LAN media v3 access unit has unsupported codec: {codec}");
+    }
+
+    let mut envelope_profile = profile;
+    if frame.payload_type == QuicMediaPayloadType::AccessUnit && codec != 0 {
+        envelope_profile.codec = lan_media_codec_name(codec).to_string();
+        normalize_lan_media_profile(&mut envelope_profile);
     }
 
     let envelope_payload = encode_lan_media_envelope(LanMediaEnvelope {
@@ -3830,7 +4147,7 @@ async fn quic_media_v3_frame_to_legacy_frame(
         codec,
         sequence: u64::from(frame.frame_id),
         timestamp_us: frame.timestamp_us,
-        profile,
+        profile: envelope_profile,
         payload: frame.payload.to_vec(),
     })?;
 
@@ -3866,6 +4183,17 @@ async fn record_lan_decoded_frames(
         let width = decoded_frame.width as u32;
         let height = decoded_frame.height as u32;
         let decoded_pixel_format = decoded_frame_pixel_format(&decoded_frame);
+        app_state
+            .media_pipelines
+            .lock()
+            .await
+            .record_active_media_sample(
+                session_id.clone(),
+                profile,
+                width,
+                height,
+                decoded_pixel_format.clone(),
+            );
         app_state
             .media_pipelines
             .lock()
@@ -3907,6 +4235,7 @@ async fn record_lan_decoded_frames(
                 target_fps: profile.fps,
                 target_bitrate_mbps: profile.bitrate_mbps,
                 encoded_bytes: encoded_payload.len() as u32,
+                format: decoded_video_probe_format(&profile.codec),
                 pixel_format: preview_rgb24
                     .as_ref()
                     .map(|_| "rgb24".to_string())
@@ -3948,7 +4277,7 @@ async fn render_lan_decoded_frame(
             let mut pipelines = app_state.media_pipelines.lock().await;
             pipelines.record_queue_depth(session_id.clone(), 1);
             if replaced {
-                pipelines.increment_dropped_frames(session_id.clone(), 1);
+                pipelines.increment_render_queue_replacements(session_id.clone(), 1);
             }
         }
     }
@@ -3981,7 +4310,7 @@ fn spawn_lan_render_worker(
                         .media_pipelines
                         .lock()
                         .await
-                        .increment_dropped_frames(session_id.clone(), 1);
+                        .increment_render_lock_drops(session_id.clone(), 1);
                 }
                 Ok(LanRenderTaskOutcome::Idle) => {}
                 Err(error) => {
@@ -4026,26 +4355,29 @@ async fn render_lan_frame_once(
     session_id: SessionId,
     frame: RenderFrame,
 ) -> Result<LanRenderTaskOutcome> {
-    tokio::task::spawn_blocking(move || {
-        let started = Instant::now();
-        match app_state.media_surface_renderers.try_lock() {
-            Ok(mut renderers) => {
-                let rendered = renderers
-                    .render_frame(&session_id, &frame)
-                    .map_err(anyhow::Error::msg)?;
-                if rendered > 0 {
-                    Ok(LanRenderTaskOutcome::Rendered {
-                        duration_ms: started.elapsed().as_secs_f64() * 1000.0,
-                    })
-                } else {
-                    Ok(LanRenderTaskOutcome::Idle)
-                }
-            }
-            Err(_) => Ok(LanRenderTaskOutcome::Dropped),
-        }
-    })
-    .await
-    .context("LAN media receiver render worker stopped")?
+    let started = Instant::now();
+    let mut renderers = match app_state.media_surface_renderers.try_lock() {
+        Ok(renderers) => renderers,
+        Err(_) => match timeout(
+            Duration::from_millis(1),
+            app_state.media_surface_renderers.lock(),
+        )
+        .await
+        {
+            Ok(renderers) => renderers,
+            Err(_) => return Ok(LanRenderTaskOutcome::Dropped),
+        },
+    };
+    let rendered = renderers
+        .render_frame(&session_id, &frame)
+        .map_err(anyhow::Error::msg)?;
+    if rendered > 0 {
+        Ok(LanRenderTaskOutcome::Rendered {
+            duration_ms: started.elapsed().as_secs_f64() * 1000.0,
+        })
+    } else {
+        Ok(LanRenderTaskOutcome::Idle)
+    }
 }
 
 #[cfg(windows)]
@@ -4110,6 +4442,7 @@ fn decoded_frame_to_render_frame(frame: DecodedFrame) -> Result<RenderFrame> {
 }
 
 struct LanReceiverDecoder {
+    codec: LanAccessUnitCodec,
     backend: &'static str,
     decoder: Box<dyn VideoDecoder>,
 }
@@ -4118,24 +4451,56 @@ async fn create_lan_receiver_decoder(
     app_state: &Arc<AppState>,
     session_id: &SessionId,
 ) -> Result<LanReceiverDecoder> {
-    create_lan_receiver_decoder_with_preference(app_state, session_id, None).await
+    let profile = selected_media_profile(app_state, session_id).await;
+    let requested_codec = LanAccessUnitCodec::from_profile(&profile);
+    match create_lan_receiver_decoder_with_preference(app_state, session_id, requested_codec, None)
+        .await
+    {
+        Ok(decoder) => Ok(decoder),
+        Err(error) if requested_codec == LanAccessUnitCodec::Hevc => {
+            app_state
+                .media_pipelines
+                .lock()
+                .await
+                .set_codec_fallback_reason(
+                    session_id.clone(),
+                    Some(format!(
+                        "{} receiver unavailable; fell back to H.264: {error:#}",
+                        requested_codec.display_name()
+                    )),
+                );
+            create_lan_receiver_decoder_with_preference(
+                app_state,
+                session_id,
+                LanAccessUnitCodec::H264,
+                None,
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn create_lan_receiver_decoder_with_preference(
     app_state: &Arc<AppState>,
     session_id: &SessionId,
+    codec: LanAccessUnitCodec,
     preferred_backend: Option<&'static str>,
 ) -> Result<LanReceiverDecoder> {
     let mut last_error = None;
-    for backend in lan_receiver_decoder_candidates(preferred_backend) {
+    let selected_profile = selected_media_profile(app_state, session_id).await;
+    for backend in lan_receiver_decoder_candidates(codec, preferred_backend) {
         match mrd_decode::create_decoder(backend) {
             Ok(decoder) => {
-                app_state
-                    .media_pipelines
-                    .lock()
-                    .await
-                    .set_active_decoder(session_id.clone(), backend);
-                return Ok(LanReceiverDecoder { backend, decoder });
+                let mut pipelines = app_state.media_pipelines.lock().await;
+                pipelines.set_active_decoder(session_id.clone(), backend);
+                let runtime_profile = lan_runtime_media_profile(&selected_profile, codec);
+                pipelines.set_active_media_profile(session_id.clone(), &runtime_profile);
+                return Ok(LanReceiverDecoder {
+                    codec,
+                    backend,
+                    decoder,
+                });
             }
             Err(error) => {
                 last_error = Some(format!("{backend}: {error}"));
@@ -4144,7 +4509,8 @@ async fn create_lan_receiver_decoder_with_preference(
     }
 
     anyhow::bail!(
-        "no LAN receiver decoder available{}",
+        "no LAN {} receiver decoder available{}",
+        codec.display_name(),
         last_error
             .map(|error| format!("; last error: {error}"))
             .unwrap_or_default()
@@ -4159,7 +4525,7 @@ async fn try_decode_h264_keyframe_with_fallback(
     primary_error: &anyhow::Error,
 ) -> Result<(LanReceiverDecoder, Vec<DecodedFrame>)> {
     let mut errors = vec![format!("{failed_backend}: {primary_error:#}")];
-    for backend in preferred_lan_receiver_decoder_candidates()
+    for backend in preferred_lan_receiver_decoder_candidates(LanAccessUnitCodec::H264)
         .into_iter()
         .filter(|backend| *backend != failed_backend)
     {
@@ -4184,7 +4550,14 @@ async fn try_decode_h264_keyframe_with_fallback(
                     primary_error = %primary_error,
                     "LAN media receiver switched decoder after keyframe decode failure"
                 );
-                return Ok((LanReceiverDecoder { backend, decoder }, decoded_frames));
+                return Ok((
+                    LanReceiverDecoder {
+                        codec: LanAccessUnitCodec::H264,
+                        backend,
+                        decoder,
+                    },
+                    decoded_frames,
+                ));
             }
             Ok(_) => errors.push(format!("{backend}: decoded no frames")),
             Err(error) => errors.push(format!("{backend}: {error:#}")),
@@ -4197,25 +4570,42 @@ async fn try_decode_h264_keyframe_with_fallback(
     )
 }
 
-fn preferred_lan_receiver_decoder_candidates() -> Vec<&'static str> {
-    match std::env::var("MRD_LAN_RECEIVER_DECODER")
+fn preferred_lan_receiver_decoder_candidates(codec: LanAccessUnitCodec) -> Vec<&'static str> {
+    let preferred = std::env::var("MRD_LAN_RECEIVER_DECODER")
         .unwrap_or_default()
         .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "software" | "h264_software" | "openh264" => vec!["h264_software"],
-        "nvdec" | "nvdec_d3d11_shared" | "d3d11_shared" => {
+        .to_ascii_lowercase();
+    match (codec, preferred.as_str()) {
+        (LanAccessUnitCodec::H264, "software" | "h264_software" | "openh264") => {
+            vec!["h264_software"]
+        }
+        (LanAccessUnitCodec::H264, "nvdec" | "nvdec_d3d11_shared" | "d3d11_shared") => {
             vec!["nvdec_d3d11_shared", "nvdec"]
         }
-        "nvdec_cpu" | "nvdec_cpu_nv12" => vec!["nvdec"],
-        _ => default_lan_receiver_decoder_candidates().to_vec(),
+        (LanAccessUnitCodec::H264, "nvdec_cpu" | "nvdec_cpu_nv12") => vec!["nvdec"],
+        (
+            LanAccessUnitCodec::Hevc,
+            "nvdec"
+            | "hevc"
+            | "nvdec_hevc_d3d11_shared"
+            | "nvdec_d3d11_shared_hevc"
+            | "d3d11_shared",
+        ) => {
+            vec!["nvdec_hevc_d3d11_shared", "nvdec_hevc"]
+        }
+        (LanAccessUnitCodec::Hevc, "nvdec_cpu" | "nvdec_cpu_nv12" | "nvdec_hevc") => {
+            vec!["nvdec_hevc"]
+        }
+        _ => default_lan_receiver_decoder_candidates(codec).to_vec(),
     }
 }
 
-fn lan_receiver_decoder_candidates(preferred_backend: Option<&'static str>) -> Vec<&'static str> {
+fn lan_receiver_decoder_candidates(
+    codec: LanAccessUnitCodec,
+    preferred_backend: Option<&'static str>,
+) -> Vec<&'static str> {
     prioritize_lan_receiver_decoder_candidates(
-        preferred_lan_receiver_decoder_candidates(),
+        preferred_lan_receiver_decoder_candidates(codec),
         preferred_backend,
     )
 }
@@ -4241,18 +4631,27 @@ fn prioritize_lan_receiver_decoder_candidates(
 }
 
 #[cfg(windows)]
-fn default_lan_receiver_decoder_candidates() -> &'static [&'static str] {
-    &["nvdec_d3d11_shared", "nvdec", "h264_software"]
+fn default_lan_receiver_decoder_candidates(codec: LanAccessUnitCodec) -> &'static [&'static str] {
+    match codec {
+        LanAccessUnitCodec::H264 => &["nvdec_d3d11_shared", "nvdec", "h264_software"],
+        LanAccessUnitCodec::Hevc => &["nvdec_hevc_d3d11_shared", "nvdec_hevc"],
+    }
 }
 
 #[cfg(target_os = "linux")]
-fn default_lan_receiver_decoder_candidates() -> &'static [&'static str] {
-    &["linux_h264", "h264_software"]
+fn default_lan_receiver_decoder_candidates(codec: LanAccessUnitCodec) -> &'static [&'static str] {
+    match codec {
+        LanAccessUnitCodec::H264 => &["linux_h264", "h264_software"],
+        LanAccessUnitCodec::Hevc => &["linux_hevc"],
+    }
 }
 
 #[cfg(all(not(windows), not(target_os = "linux")))]
-fn default_lan_receiver_decoder_candidates() -> &'static [&'static str] {
-    &["h264_software"]
+fn default_lan_receiver_decoder_candidates(codec: LanAccessUnitCodec) -> &'static [&'static str] {
+    match codec {
+        LanAccessUnitCodec::H264 => &["h264_software"],
+        LanAccessUnitCodec::Hevc => &[],
+    }
 }
 
 async fn session_allows_media(app_state: &Arc<AppState>, session_id: &SessionId) -> bool {
@@ -4621,13 +5020,43 @@ fn decode_h264_desktop_frame(
     decoder: &mut dyn VideoDecoder,
     payload: &[u8],
 ) -> Result<Vec<DecodedFrame>> {
+    decode_lan_desktop_frame(LanAccessUnitCodec::H264, decoder, payload)
+}
+
+fn decode_lan_desktop_frame(
+    codec: LanAccessUnitCodec,
+    decoder: &mut dyn VideoDecoder,
+    payload: &[u8],
+) -> Result<Vec<DecodedFrame>> {
     if let Err(error) = decoder.push_access_unit(payload) {
         anyhow::bail!(
-            "failed to decode LAN H.264 access unit: {error}; {}",
-            describe_h264_access_unit(payload)
+            "failed to decode LAN {} access unit: {error}; {}",
+            codec.display_name(),
+            describe_lan_access_unit(codec, payload)
         );
     }
     Ok(decoder.drain_decoded_frames())
+}
+
+fn describe_lan_access_unit(codec: LanAccessUnitCodec, payload: &[u8]) -> String {
+    match codec {
+        LanAccessUnitCodec::H264 => describe_h264_access_unit(payload),
+        LanAccessUnitCodec::Hevc => describe_hevc_access_unit(payload),
+    }
+}
+
+fn describe_hevc_access_unit(payload: &[u8]) -> String {
+    let prefix_hex = payload
+        .iter()
+        .take(16)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "payload_bytes={}, prefix_hex=[{}]",
+        payload.len(),
+        prefix_hex
+    )
 }
 
 fn describe_h264_access_unit(payload: &[u8]) -> String {
@@ -5027,19 +5456,36 @@ fn decode_lan_media_envelope(frame: &[u8]) -> Result<LanMediaEnvelope> {
         codec,
         sequence,
         timestamp_us,
-        profile: MediaProfile {
-            width,
-            height,
-            fps,
-            bitrate_mbps,
-            codec: if codec == LAN_MEDIA_CODEC_H264 {
-                "h264".to_string()
-            } else {
-                format!("unknown:{codec}")
-            },
-        },
+        profile: lan_media_profile_from_envelope(width, height, fps, bitrate_mbps, codec),
         payload: frame[LAN_MEDIA_ENVELOPE_HEADER_BYTES..].to_vec(),
     })
+}
+
+fn lan_media_profile_from_envelope(
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate_mbps: u32,
+    codec: u8,
+) -> MediaProfile {
+    let mut profile = MediaProfile {
+        width,
+        height,
+        fps,
+        bitrate_mbps,
+        codec: lan_media_codec_name(codec).to_string(),
+        ..MediaProfile::default()
+    };
+    apply_lan_media_profile_defaults(&mut profile);
+    profile
+}
+
+fn lan_media_codec_name(codec: u8) -> &'static str {
+    match codec {
+        LAN_MEDIA_CODEC_H264 => "h264",
+        LAN_MEDIA_CODEC_HEVC => "hevc",
+        _ => "unknown",
+    }
 }
 
 fn lan_media_profile_id(profile: &MediaProfile) -> u32 {
@@ -5075,13 +5521,16 @@ async fn selected_media_profile(app_state: &Arc<AppState>, session_id: &SessionI
 }
 
 fn default_media_profile() -> MediaProfile {
-    MediaProfile {
+    let mut profile = MediaProfile {
         width: LAN_MEDIA_TARGET_WIDTH,
         height: LAN_MEDIA_TARGET_HEIGHT,
         fps: LAN_MEDIA_TARGET_FPS,
         bitrate_mbps: LAN_MEDIA_TARGET_BITRATE_MBPS,
-        codec: "h264".to_string(),
-    }
+        codec: "hevc".to_string(),
+        ..MediaProfile::default()
+    };
+    apply_lan_media_profile_defaults(&mut profile);
+    profile
 }
 
 fn default_media_profile_negotiation() -> MediaProfileNegotiation {
@@ -5109,7 +5558,7 @@ fn negotiate_media_profile(
     selected.height = selected.height.min(LAN_MEDIA_TARGET_HEIGHT);
     selected.fps = selected.fps.min(LAN_MEDIA_MAX_FPS);
     selected.bitrate_mbps = selected.bitrate_mbps.min(LAN_MEDIA_TARGET_BITRATE_MBPS);
-    selected.codec = "h264".to_string();
+    normalize_lan_media_profile(&mut selected);
 
     let changed = selected != requested;
     Ok(MediaProfileNegotiation {
@@ -5137,6 +5586,59 @@ fn validate_media_profile(profile: &MediaProfile) -> Result<()> {
         anyhow::bail!("media profile width, height, fps and bitrate must be greater than zero");
     }
     Ok(())
+}
+
+fn normalize_lan_media_profile(profile: &mut MediaProfile) {
+    profile.codec = profile.codec.trim().to_ascii_lowercase();
+    if profile.codec != "h264" && profile.codec != "hevc" {
+        profile.codec = "h264".to_string();
+        profile.codec_profile = None;
+        profile.bit_depth = None;
+        profile.chroma_subsampling = None;
+        profile.pixel_format = None;
+        profile.hdr_enabled = None;
+        return;
+    }
+    apply_lan_media_profile_defaults(profile);
+}
+
+fn lan_runtime_media_profile(
+    selected_profile: &MediaProfile,
+    codec: LanAccessUnitCodec,
+) -> MediaProfile {
+    let mut profile = selected_profile.clone();
+    profile.codec = codec.name().to_string();
+    if codec == LanAccessUnitCodec::H264 {
+        profile.codec_profile = Some("high".to_string());
+        profile.bit_depth = Some(8);
+        profile.chroma_subsampling = Some("4:2:0".to_string());
+        profile.pixel_format = Some("nv12".to_string());
+        profile.hdr_enabled = Some(false);
+    } else {
+        apply_lan_media_profile_defaults(&mut profile);
+    }
+    profile
+}
+
+fn apply_lan_media_profile_defaults(profile: &mut MediaProfile) {
+    if profile.codec.eq_ignore_ascii_case("hevc") {
+        profile.codec = "hevc".to_string();
+        if profile.codec_profile.is_none() {
+            profile.codec_profile = Some("main".to_string());
+        }
+        if profile.bit_depth.is_none() {
+            profile.bit_depth = Some(8);
+        }
+        if profile.chroma_subsampling.is_none() {
+            profile.chroma_subsampling = Some("4:2:0".to_string());
+        }
+        if profile.pixel_format.is_none() {
+            profile.pixel_format = Some("nv12".to_string());
+        }
+        if profile.hdr_enabled.is_none() {
+            profile.hdr_enabled = Some(false);
+        }
+    }
 }
 
 fn media_frame_interval(profile: &MediaProfile) -> Duration {
@@ -5176,6 +5678,14 @@ fn media_probe_format(
         LAN_MEDIA_PROBE_NATIVE_HIGH_FORMAT
     } else {
         LAN_MEDIA_PROBE_DYNAMIC_FORMAT
+    }
+}
+
+fn decoded_video_probe_format(codec: &str) -> String {
+    match codec.trim().to_ascii_lowercase().as_str() {
+        "hevc" | "h265" => "hevc_desktop_frame".to_string(),
+        "av1" => "av1_desktop_frame".to_string(),
+        _ => "h264_desktop_frame".to_string(),
     }
 }
 
@@ -5340,10 +5850,22 @@ mod tests {
             .contains(&LAN_ENCODE_NVENC_H264_CAPABILITY.to_string()));
         assert!(peer
             .media_capabilities
+            .contains(&LAN_ENCODE_NVENC_HEVC_CAPABILITY.to_string()));
+        assert!(peer
+            .media_capabilities
             .contains(&LAN_DECODE_NVDEC_CAPABILITY.to_string()));
         assert!(peer
             .media_capabilities
+            .contains(&LAN_DECODE_NVDEC_HEVC_CAPABILITY.to_string()));
+        assert!(peer
+            .media_capabilities
+            .contains(&LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY.to_string()));
+        assert!(peer
+            .media_capabilities
             .contains(&LAN_RENDER_D3D11_NATIVE_CAPABILITY.to_string()));
+        assert!(peer
+            .media_capabilities
+            .contains(&LAN_RENDER_D3D11_SHARED_NV12_CAPABILITY.to_string()));
         assert!(peer
             .media_capabilities
             .contains(&LAN_QUIC_RELIABLE_MEDIA_TRANSPORT.to_string()));
@@ -5353,6 +5875,19 @@ mod tests {
         assert!(peer
             .media_capabilities
             .contains(&LAN_QUIC_MEDIA_V3_TRANSPORT.to_string()));
+    }
+
+    #[test]
+    fn service_build_id_prefers_runtime_override() {
+        let build_id = service_build_id_from_lookup(|key| {
+            if key == SERVICE_BUILD_ID_ENV {
+                Some("peer-runtime-build".to_string())
+            } else {
+                None
+            }
+        });
+
+        assert_eq!(build_id, "peer-runtime-build");
     }
 
     #[tokio::test]
@@ -5413,6 +5948,7 @@ mod tests {
                 fps: 240,
                 bitrate_mbps: 120,
                 codec: "hevc".to_string(),
+                ..MediaProfile::default()
             }),
             timestamp_ms: now_ms(),
         };
@@ -5458,7 +5994,12 @@ mod tests {
                     negotiation.selected.bitrate_mbps,
                     LAN_MEDIA_TARGET_BITRATE_MBPS
                 );
-                assert_eq!(negotiation.selected.codec, "h264");
+                assert_eq!(negotiation.selected.codec, "hevc");
+                assert_eq!(negotiation.selected.codec_profile.as_deref(), Some("main"));
+                assert_eq!(
+                    negotiation.selected.chroma_subsampling.as_deref(),
+                    Some("4:2:0")
+                );
             }
             _ => panic!("expected remote session ack"),
         }
@@ -5601,6 +6142,7 @@ mod tests {
                 fps: 60,
                 bitrate_mbps: 5,
                 codec: "h264".to_string(),
+                ..MediaProfile::default()
             }),
         )
         .await
@@ -5852,6 +6394,7 @@ mod tests {
             fps: 300,
             bitrate_mbps: 160,
             codec: "hevc".to_string(),
+            ..MediaProfile::default()
         }))
         .unwrap();
 
@@ -5860,7 +6403,34 @@ mod tests {
         assert_eq!(negotiation.selected.height, 1600);
         assert_eq!(negotiation.selected.fps, 249);
         assert_eq!(negotiation.selected.bitrate_mbps, 120);
-        assert_eq!(negotiation.selected.codec, "h264");
+        assert_eq!(negotiation.selected.codec, "hevc");
+    }
+
+    #[test]
+    fn media_profile_negotiation_preserves_supported_hevc_main_420_profile() {
+        let negotiation = negotiate_media_profile(Some(MediaProfile {
+            width: 2560,
+            height: 1600,
+            fps: 165,
+            bitrate_mbps: 120,
+            codec: "hevc".to_string(),
+            codec_profile: Some("main".to_string()),
+            bit_depth: Some(8),
+            chroma_subsampling: Some("4:2:0".to_string()),
+            pixel_format: Some("nv12".to_string()),
+            hdr_enabled: Some(false),
+        }))
+        .unwrap();
+
+        assert_eq!(negotiation.status, "accepted");
+        assert_eq!(negotiation.selected.codec, "hevc");
+        assert_eq!(negotiation.selected.codec_profile.as_deref(), Some("main"));
+        assert_eq!(
+            negotiation.selected.chroma_subsampling.as_deref(),
+            Some("4:2:0")
+        );
+        assert_eq!(negotiation.selected.pixel_format.as_deref(), Some("nv12"));
+        assert_eq!(negotiation.selected.hdr_enabled, Some(false));
     }
 
     #[test]
@@ -5871,6 +6441,7 @@ mod tests {
             fps: 249,
             bitrate_mbps: 20,
             codec: "h264".to_string(),
+            ..MediaProfile::default()
         }))
         .unwrap();
 
@@ -5931,8 +6502,12 @@ mod tests {
     #[test]
     fn windows_receiver_decoder_defaults_to_d3d11_shared_nvdec() {
         assert_eq!(
-            default_lan_receiver_decoder_candidates(),
+            default_lan_receiver_decoder_candidates(LanAccessUnitCodec::H264),
             &["nvdec_d3d11_shared", "nvdec", "h264_software"]
+        );
+        assert_eq!(
+            default_lan_receiver_decoder_candidates(LanAccessUnitCodec::Hevc),
+            &["nvdec_hevc_d3d11_shared", "nvdec_hevc"]
         );
     }
 
@@ -6046,6 +6621,7 @@ mod tests {
                 fps: 120,
                 bitrate_mbps: 20,
                 codec: "h264".to_string(),
+                ..MediaProfile::default()
             }))
             .unwrap(),
         );
@@ -6127,6 +6703,7 @@ mod tests {
                 fps: 60,
                 bitrate_mbps: 20,
                 codec: "h264".to_string(),
+                ..MediaProfile::default()
             }))
             .unwrap(),
         );
@@ -6293,6 +6870,7 @@ mod tests {
                 fps: 60,
                 bitrate_mbps: 20,
                 codec: "h264".to_string(),
+                ..MediaProfile::default()
             }))
             .unwrap(),
         );
@@ -6359,6 +6937,7 @@ mod tests {
             fps: 60,
             bitrate_mbps: 20,
             codec: "h264".to_string(),
+            ..MediaProfile::default()
         };
 
         let prepared = prepare_frame_for_h264(frame, &profile).expect("prepared frame");
@@ -6379,6 +6958,7 @@ mod tests {
             fps: 60,
             bitrate_mbps: 20,
             codec: "h264".to_string(),
+            ..MediaProfile::default()
         };
 
         let prepared = prepare_frame_for_h264(frame, &profile).expect("prepared shared frame");
@@ -6399,6 +6979,7 @@ mod tests {
             fps: 60,
             bitrate_mbps: 20,
             codec: "h264".to_string(),
+            ..MediaProfile::default()
         };
 
         let error = prepare_frame_for_h264(frame, &profile).expect_err("shared scale rejected");
@@ -6456,6 +7037,7 @@ mod tests {
             fps: 60,
             bitrate_mbps: 20,
             codec: "h264".to_string(),
+            ..MediaProfile::default()
         };
         let frame = build_media_probe_frame(7, 99_000, &profile);
         let stats = decode_media_probe_frame(&frame).unwrap();
@@ -6476,6 +7058,7 @@ mod tests {
             fps: 144,
             bitrate_mbps: 20,
             codec: "h264".to_string(),
+            ..MediaProfile::default()
         };
         let encoded = encode_lan_media_envelope(LanMediaEnvelope {
             payload_type: LAN_MEDIA_PAYLOAD_H264_ACCESS_UNIT,
@@ -6498,6 +7081,72 @@ mod tests {
     }
 
     #[test]
+    fn lan_media_v2_envelope_round_trips_hevc_access_unit() {
+        let profile = MediaProfile {
+            width: 2560,
+            height: 1600,
+            fps: 165,
+            bitrate_mbps: 120,
+            codec: "hevc".to_string(),
+            codec_profile: Some("main".to_string()),
+            bit_depth: Some(8),
+            chroma_subsampling: Some("4:2:0".to_string()),
+            pixel_format: Some("nv12".to_string()),
+            hdr_enabled: Some(false),
+        };
+        let encoded = encode_lan_media_envelope(LanMediaEnvelope {
+            payload_type: LAN_MEDIA_PAYLOAD_ACCESS_UNIT,
+            codec: LAN_MEDIA_CODEC_HEVC,
+            sequence: 9,
+            timestamp_us: 123_456,
+            profile: profile.clone(),
+            payload: b"fake-hevc".to_vec(),
+        })
+        .unwrap();
+
+        let decoded = decode_lan_media_envelope(&encoded).unwrap();
+
+        assert_eq!(decoded.payload_type, LAN_MEDIA_PAYLOAD_ACCESS_UNIT);
+        assert_eq!(decoded.codec, LAN_MEDIA_CODEC_HEVC);
+        assert_eq!(decoded.profile.codec, "hevc");
+        assert_eq!(decoded.profile.codec_profile.as_deref(), Some("main"));
+        assert_eq!(decoded.profile.chroma_subsampling.as_deref(), Some("4:2:0"));
+        assert_eq!(decoded.payload, b"fake-hevc");
+        assert_eq!(decoded.profile, profile);
+    }
+
+    #[test]
+    fn hevc_decode_error_message_does_not_use_h264_or_probe_fallback() {
+        struct RejectingDecoder;
+
+        impl VideoDecoder for RejectingDecoder {
+            fn push_access_unit(
+                &mut self,
+                _access_unit: &[u8],
+            ) -> std::result::Result<(), mrd_pipeline_core::PipelineError> {
+                Err(mrd_pipeline_core::PipelineError::message(
+                    "synthetic failure",
+                ))
+            }
+
+            fn drain_decoded_frames(&mut self) -> Vec<DecodedFrame> {
+                Vec::new()
+            }
+        }
+
+        let mut decoder = RejectingDecoder;
+        let error =
+            decode_lan_desktop_frame(LanAccessUnitCodec::Hevc, &mut decoder, &[0, 0, 1, 0x26])
+                .expect_err("decode should fail")
+                .to_string();
+
+        assert!(error.contains("HEVC access unit"));
+        assert!(!error.contains("H.264"));
+        assert!(!error.contains("invalid magic"));
+        assert!(!error.contains("probe fallback"));
+    }
+
+    #[test]
     fn lan_media_v2_envelope_rejects_legacy_probe_without_magic_fallback() {
         let profile = MediaProfile {
             width: 1920,
@@ -6505,6 +7154,7 @@ mod tests {
             fps: 60,
             bitrate_mbps: 20,
             codec: "h264".to_string(),
+            ..MediaProfile::default()
         };
         let legacy_probe = build_media_probe_frame(1, 1_000, &profile);
 
@@ -6524,6 +7174,7 @@ mod tests {
             fps: 144,
             bitrate_mbps: 20,
             codec: "h264".to_string(),
+            ..MediaProfile::default()
         };
         app_state.media_profiles.lock().await.set(
             session_id.clone(),
@@ -6568,6 +7219,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lan_media_v3_frame_converts_hevc_to_receiver_envelope() {
+        let app_state = Arc::new(AppState::new());
+        let session_id = SessionId("media-v3-hevc-session".to_string());
+        let profile = MediaProfile {
+            width: 2560,
+            height: 1600,
+            fps: 165,
+            bitrate_mbps: 120,
+            codec: "hevc".to_string(),
+            codec_profile: Some("main".to_string()),
+            bit_depth: Some(8),
+            chroma_subsampling: Some("4:2:0".to_string()),
+            pixel_format: Some("nv12".to_string()),
+            hdr_enabled: Some(false),
+        };
+        app_state.media_profiles.lock().await.set(
+            session_id.clone(),
+            MediaProfileNegotiation {
+                requested: profile.clone(),
+                selected: profile.clone(),
+                status: "accepted".to_string(),
+                reason: None,
+                selected_source_id: None,
+                selected_width: Some(profile.width),
+                selected_height: Some(profile.height),
+                downgrade_reason: None,
+            },
+        );
+
+        let converted = quic_media_v3_frame_to_legacy_frame(
+            &app_state,
+            &session_id,
+            QuicMediaFrame {
+                payload_type: QuicMediaPayloadType::AccessUnit,
+                codec: QuicMediaCodec::Hevc,
+                profile_id: lan_media_profile_id(&profile),
+                frame_id: 12,
+                timestamp_us: 77,
+                flags: 1,
+                payload: b"hevc-au".to_vec().into(),
+            },
+            QuicAuReassemblerStats::default(),
+        )
+        .await
+        .unwrap()
+        .expect("converted frame");
+
+        let envelope = decode_lan_media_envelope(&converted.payload).unwrap();
+        assert_eq!(envelope.payload_type, LAN_MEDIA_PAYLOAD_ACCESS_UNIT);
+        assert_eq!(envelope.codec, LAN_MEDIA_CODEC_HEVC);
+        assert_eq!(envelope.profile.codec, "hevc");
+        assert_eq!(envelope.payload, b"hevc-au");
+        assert_eq!(envelope.profile, profile);
+    }
+
+    #[tokio::test]
     async fn lan_media_v3_profile_mismatch_is_transient_drop() {
         let app_state = Arc::new(AppState::new());
         let session_id = SessionId("media-v3-mismatch-session".to_string());
@@ -6577,6 +7284,7 @@ mod tests {
             fps: 144,
             bitrate_mbps: 20,
             codec: "h264".to_string(),
+            ..MediaProfile::default()
         };
         let stale_profile = MediaProfile {
             fps: 60,
@@ -6690,13 +7398,14 @@ mod tests {
     }
 
     #[test]
-    fn lan_quic_media_routes_large_fragmented_v3_frames_over_reliable_stream_by_default() {
+    fn lan_quic_media_uses_datagrams_by_default_and_reliable_whole_frame_only_when_enabled() {
         let profile_1080p = MediaProfile {
             width: 1920,
             height: 1080,
             fps: 144,
             bitrate_mbps: 20,
             codec: "h264".to_string(),
+            ..MediaProfile::default()
         };
         let profile_2k = MediaProfile {
             width: 2560,
@@ -6704,6 +7413,7 @@ mod tests {
             fps: 60,
             bitrate_mbps: 20,
             codec: "h264".to_string(),
+            ..MediaProfile::default()
         };
 
         assert!(!should_send_access_unit_as_reliable_frame(
@@ -6713,14 +7423,7 @@ mod tests {
             &profile_1080p,
             None
         ));
-        assert!(should_send_access_unit_as_reliable_frame(
-            true,
-            true,
-            LAN_QUIC_RELIABLE_WHOLE_FRAME_MIN_FRAGMENTS,
-            &profile_1080p,
-            None
-        ));
-        assert!(should_send_access_unit_as_reliable_frame(
+        assert!(!should_send_access_unit_as_reliable_frame(
             true,
             true,
             2,
@@ -6762,6 +7465,49 @@ mod tests {
             &profile_2k,
             Some(false)
         ));
+    }
+
+    #[test]
+    fn lan_quic_media_uses_best_effort_only_for_low_latency_bitrate_tiers() {
+        let low_latency = MediaProfile {
+            width: 2560,
+            height: 1600,
+            fps: 165,
+            bitrate_mbps: 80,
+            codec: "hevc".to_string(),
+            ..MediaProfile::default()
+        };
+        let high_bitrate = MediaProfile {
+            width: 2560,
+            height: 1600,
+            fps: 165,
+            bitrate_mbps: 120,
+            codec: "hevc".to_string(),
+            ..MediaProfile::default()
+        };
+
+        assert!(use_best_effort_media_datagrams(&low_latency));
+        assert!(!use_best_effort_media_datagrams(&high_bitrate));
+    }
+
+    #[test]
+    fn lan_quic_media_prefers_persistent_reliable_stream_when_available() {
+        assert_eq!(
+            select_reliable_media_send_mode(true, true),
+            LanReliableMediaSendMode::Persistent
+        );
+        assert_eq!(
+            select_reliable_media_send_mode(false, true),
+            LanReliableMediaSendMode::Persistent
+        );
+        assert_eq!(
+            select_reliable_media_send_mode(true, false),
+            LanReliableMediaSendMode::PerMessage
+        );
+        assert_eq!(
+            select_reliable_media_send_mode(false, false),
+            LanReliableMediaSendMode::Disabled
+        );
     }
 
     #[test]
@@ -6934,6 +7680,7 @@ mod tests {
                 fps: 60,
                 bitrate_mbps: 8,
                 codec: "h264".to_string(),
+                ..MediaProfile::default()
             },
         )
         .await
@@ -6966,6 +7713,7 @@ mod tests {
             fps: 60,
             bitrate_mbps: 20,
             codec: "h264".to_string(),
+            ..MediaProfile::default()
         };
 
         record_lan_decoded_frames(
@@ -7046,6 +7794,7 @@ mod tests {
                 fps: 144,
                 bitrate_mbps: 20,
                 codec: "h264".to_string(),
+                ..MediaProfile::default()
             },
         )
         .await
@@ -7084,6 +7833,7 @@ mod tests {
                 fps: 60,
                 bitrate_mbps: 20,
                 codec: "h264".to_string(),
+                ..MediaProfile::default()
             }))
             .unwrap(),
         );
@@ -7170,6 +7920,7 @@ mod tests {
             fps: 60,
             bitrate_mbps: 20,
             codec: "h264".to_string(),
+            ..MediaProfile::default()
         };
         let after = MediaProfile {
             width: 1920,
@@ -7177,6 +7928,7 @@ mod tests {
             fps: 60,
             bitrate_mbps: 20,
             codec: "h264".to_string(),
+            ..MediaProfile::default()
         };
         let active = lan_capture_config_key(source_id, &before);
 

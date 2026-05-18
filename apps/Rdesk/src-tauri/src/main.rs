@@ -66,10 +66,17 @@ const LAN_E2E_PROFILE_WIDTH_ENV: &str = "MRD_LAN_E2E_PROFILE_WIDTH";
 const LAN_E2E_PROFILE_HEIGHT_ENV: &str = "MRD_LAN_E2E_PROFILE_HEIGHT";
 const LAN_E2E_PROFILE_FPS_ENV: &str = "MRD_LAN_E2E_PROFILE_FPS";
 const LAN_E2E_PROFILE_BITRATE_MBPS_ENV: &str = "MRD_LAN_E2E_PROFILE_BITRATE_MBPS";
+const LAN_E2E_PROFILE_CODEC_ENV: &str = "MRD_LAN_E2E_PROFILE_CODEC";
+const LAN_E2E_PROFILE_CODEC_PROFILE_ENV: &str = "MRD_LAN_E2E_PROFILE_CODEC_PROFILE";
+const LAN_E2E_PROFILE_BIT_DEPTH_ENV: &str = "MRD_LAN_E2E_PROFILE_BIT_DEPTH";
+const LAN_E2E_PROFILE_CHROMA_SUBSAMPLING_ENV: &str = "MRD_LAN_E2E_PROFILE_CHROMA_SUBSAMPLING";
+const LAN_E2E_PROFILE_PIXEL_FORMAT_ENV: &str = "MRD_LAN_E2E_PROFILE_PIXEL_FORMAT";
+const LAN_E2E_PROFILE_HDR_ENABLED_ENV: &str = "MRD_LAN_E2E_PROFILE_HDR_ENABLED";
 const LAN_E2E_DISPLAY_MODE_POLICY_ENV: &str = "MRD_LAN_E2E_DISPLAY_MODE_POLICY";
 const LAN_E2E_CAPTURE_SOURCE_ID_ENV: &str = "MRD_LAN_E2E_CAPTURE_SOURCE_ID";
 const LAN_E2E_CAPTURE_SOURCE_KIND_ENV: &str = "MRD_LAN_E2E_CAPTURE_SOURCE_KIND";
 const LAN_E2E_EXPECTED_PEER_BUILD_ID_ENV: &str = "MRD_LAN_E2E_EXPECTED_PEER_BUILD_ID";
+const LAN_E2E_ADAPTIVE_ENV: &str = "MRD_LAN_E2E_ADAPTIVE";
 
 static APP_IS_QUITTING: AtomicBool = AtomicBool::new(false);
 
@@ -1247,6 +1254,31 @@ async fn ipc_update_media_profile(
     }
 }
 
+/// Configure LAN media adaptation via IPC.
+#[tauri::command]
+async fn ipc_configure_media_adaptation(
+    session_id: String,
+    config: mrd_ipc::AdaptiveMediaConfig,
+) -> Result<mrd_ipc::MediaAdaptationSnapshot, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+    use mrd_proto::SessionId;
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::ConfigureMediaAdaptation {
+            session_id: SessionId(session_id),
+            config,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::MediaAdaptationConfigured { snapshot, .. } => Ok(snapshot),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
 /// List remote capture sources through mrd-service IPC.
 #[tauri::command]
 async fn ipc_list_remote_capture_sources(
@@ -1557,6 +1589,24 @@ async fn ipc_runtime_snapshot() -> Result<mrd_ipc::RuntimeSnapshot, String> {
 
     match response {
         IpcResponse::RuntimeSnapshot { snapshot } => Ok(snapshot),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+/// Query service-owned audit events via IPC.
+#[tauri::command]
+async fn ipc_audit_log(query: mrd_ipc::AuditLogQuery) -> Result<Vec<mrd_ipc::AuditEvent>, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::AuditLog { query })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::AuditLog { events } => Ok(events),
         IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
         _ => Err("Unexpected response".to_string()),
     }
@@ -2094,6 +2144,19 @@ fn test_get_run_artifacts(
     state.test_orchestrator.get_run_artifacts(&run_id)
 }
 
+/// Get a test run with persisted telemetry.
+#[tauri::command]
+fn test_get_run_telemetry(
+    state: tauri::State<'_, AppState>,
+    run_id: String,
+    query: Option<mrd_test_telemetry::TelemetryQuery>,
+) -> Result<mrd_test_telemetry::TelemetryBundle, String> {
+    state
+        .test_orchestrator
+        .get_run_telemetry(&run_id, query.unwrap_or_default())
+        .map_err(|error| error.to_string())
+}
+
 /// List test presets
 #[tauri::command]
 fn test_list_presets(state: tauri::State<'_, AppState>) -> Vec<test_orchestrator::TestPreset> {
@@ -2291,10 +2354,17 @@ struct LanE2eAutorunLaunchConfig {
     profile_height: Option<String>,
     profile_fps: Option<String>,
     profile_bitrate_mbps: Option<String>,
+    profile_codec: Option<String>,
+    profile_codec_profile: Option<String>,
+    profile_bit_depth: Option<String>,
+    profile_chroma_subsampling: Option<String>,
+    profile_pixel_format: Option<String>,
+    profile_hdr_enabled: Option<String>,
     display_mode_policy: Option<String>,
     capture_source_id: Option<String>,
     capture_source_kind: Option<String>,
     expected_peer_build_id: Option<String>,
+    adaptive: Option<String>,
 }
 
 fn lan_e2e_autorun_config_from_env() -> Option<LanE2eAutorunLaunchConfig> {
@@ -2322,10 +2392,17 @@ where
         profile_height: non_empty_env(env(LAN_E2E_PROFILE_HEIGHT_ENV)),
         profile_fps: non_empty_env(env(LAN_E2E_PROFILE_FPS_ENV)),
         profile_bitrate_mbps: non_empty_env(env(LAN_E2E_PROFILE_BITRATE_MBPS_ENV)),
+        profile_codec: non_empty_env(env(LAN_E2E_PROFILE_CODEC_ENV)),
+        profile_codec_profile: non_empty_env(env(LAN_E2E_PROFILE_CODEC_PROFILE_ENV)),
+        profile_bit_depth: non_empty_env(env(LAN_E2E_PROFILE_BIT_DEPTH_ENV)),
+        profile_chroma_subsampling: non_empty_env(env(LAN_E2E_PROFILE_CHROMA_SUBSAMPLING_ENV)),
+        profile_pixel_format: non_empty_env(env(LAN_E2E_PROFILE_PIXEL_FORMAT_ENV)),
+        profile_hdr_enabled: non_empty_env(env(LAN_E2E_PROFILE_HDR_ENABLED_ENV)),
         display_mode_policy: non_empty_env(env(LAN_E2E_DISPLAY_MODE_POLICY_ENV)),
         capture_source_id: non_empty_env(env(LAN_E2E_CAPTURE_SOURCE_ID_ENV)),
         capture_source_kind: non_empty_env(env(LAN_E2E_CAPTURE_SOURCE_KIND_ENV)),
         expected_peer_build_id: non_empty_env(env(LAN_E2E_EXPECTED_PEER_BUILD_ID_ENV)),
+        adaptive: non_empty_env(env(LAN_E2E_ADAPTIVE_ENV)),
     })
 }
 
@@ -2347,6 +2424,16 @@ fn build_lan_e2e_autorun_route(config: LanE2eAutorunLaunchConfig) -> String {
     push_query_param(&mut params, "height", config.profile_height);
     push_query_param(&mut params, "fps", config.profile_fps);
     push_query_param(&mut params, "bitrateMbps", config.profile_bitrate_mbps);
+    push_query_param(&mut params, "codec", config.profile_codec);
+    push_query_param(&mut params, "codecProfile", config.profile_codec_profile);
+    push_query_param(&mut params, "bitDepth", config.profile_bit_depth);
+    push_query_param(
+        &mut params,
+        "chromaSubsampling",
+        config.profile_chroma_subsampling,
+    );
+    push_query_param(&mut params, "pixelFormat", config.profile_pixel_format);
+    push_query_param(&mut params, "hdrEnabled", config.profile_hdr_enabled);
     push_query_param(&mut params, "displayModePolicy", config.display_mode_policy);
     push_query_param(&mut params, "captureSourceId", config.capture_source_id);
     push_query_param(&mut params, "captureSourceKind", config.capture_source_kind);
@@ -2355,6 +2442,7 @@ fn build_lan_e2e_autorun_route(config: LanE2eAutorunLaunchConfig) -> String {
         "expectedPeerBuildId",
         config.expected_peer_build_id,
     );
+    push_query_param(&mut params, "adaptive", config.adaptive);
 
     let query = params
         .into_iter()
@@ -2450,15 +2538,22 @@ mod tray_tests {
             profile_height: Some("1080".to_string()),
             profile_fps: Some("180".to_string()),
             profile_bitrate_mbps: Some("20".to_string()),
+            profile_codec: Some("hevc".to_string()),
+            profile_codec_profile: Some("main".to_string()),
+            profile_bit_depth: Some("8".to_string()),
+            profile_chroma_subsampling: Some("4:2:0".to_string()),
+            profile_pixel_format: Some("nv12".to_string()),
+            profile_hdr_enabled: Some("false".to_string()),
             display_mode_policy: Some("temporary".to_string()),
             capture_source_id: Some("windows:display-shared:1".to_string()),
             capture_source_kind: Some("display".to_string()),
             expected_peer_build_id: Some("abc123def456".to_string()),
+            adaptive: Some("true".to_string()),
         });
 
         assert_eq!(
             route,
-            "/test/e2e?autorun=lan-e2e&targetDeviceId=agent%20device%2F1&transport=quic&timeoutMs=2500&minSampleDurationMs=1500&minDecodedFrames=2&minFps=5&stopOnComplete=false&width=1920&height=1080&fps=180&bitrateMbps=20&displayModePolicy=temporary&captureSourceId=windows%3Adisplay-shared%3A1&captureSourceKind=display&expectedPeerBuildId=abc123def456"
+            "/test/e2e?autorun=lan-e2e&targetDeviceId=agent%20device%2F1&transport=quic&timeoutMs=2500&minSampleDurationMs=1500&minDecodedFrames=2&minFps=5&stopOnComplete=false&width=1920&height=1080&fps=180&bitrateMbps=20&codec=hevc&codecProfile=main&bitDepth=8&chromaSubsampling=4%3A2%3A0&pixelFormat=nv12&hdrEnabled=false&displayModePolicy=temporary&captureSourceId=windows%3Adisplay-shared%3A1&captureSourceKind=display&expectedPeerBuildId=abc123def456&adaptive=true"
         );
     }
 
@@ -2535,9 +2630,20 @@ fn main() {
     ));
 
     // Create test orchestrator
-    let test_orchestrator = std::sync::Arc::new(test_orchestrator::TestOrchestrator::new(
-        test_harness.clone(),
-    ));
+    let telemetry_root = settings_path
+        .parent()
+        .map(|path| path.join("test-telemetry"))
+        .unwrap_or_else(|| {
+            std::env::temp_dir()
+                .join("mini-remote-desktop")
+                .join("test-telemetry")
+        });
+    let test_orchestrator = std::sync::Arc::new(
+        test_orchestrator::TestOrchestrator::new_with_telemetry_store(
+            test_harness.clone(),
+            mrd_test_telemetry::TelemetryStore::from_env_or_dir(telemetry_root),
+        ),
+    );
     let resource_monitor = std::sync::Arc::new(std::sync::Mutex::new(ResourceMonitor::new()));
     let render_window_registry =
         std::sync::Arc::new(std::sync::Mutex::new(RenderWindowRegistry::default()));
@@ -2709,6 +2815,7 @@ fn main() {
             ipc_start_session,
             ipc_start_lan_remote_session,
             ipc_update_media_profile,
+            ipc_configure_media_adaptation,
             ipc_list_remote_capture_sources,
             ipc_select_remote_capture_source,
             ipc_list_remote_display_modes,
@@ -2720,6 +2827,7 @@ fn main() {
             ipc_recover_session,
             ipc_session_snapshot,
             ipc_runtime_snapshot,
+            ipc_audit_log,
             ipc_capability_snapshot,
             ipc_service_health,
             ipc_probe_snapshot,
@@ -2759,6 +2867,7 @@ fn main() {
             test_get_run_events,
             test_get_run_metrics,
             test_get_run_artifacts,
+            test_get_run_telemetry,
             test_list_presets,
             test_save_preset,
             test_delete_preset,

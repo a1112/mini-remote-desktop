@@ -15,6 +15,7 @@ mod display_mode;
 mod handlers;
 mod ipc_server;
 mod lan_discovery;
+mod media_adaptation;
 mod shell;
 
 use anyhow::Result;

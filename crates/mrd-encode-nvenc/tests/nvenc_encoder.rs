@@ -198,6 +198,33 @@ fn nvenc_hevc_encoder_emits_hevc_access_unit_when_available() {
 }
 
 #[cfg(windows)]
+#[test]
+fn nvenc_hevc_max_speed_encoder_emits_hevc_access_unit_when_available() {
+    let Ok(mut encoder) =
+        NvencHevcEncoder::new_max_speed_with_bitrate(SMOKE_WIDTH, SMOKE_HEIGHT, 30, 8_000_000)
+    else {
+        return;
+    };
+
+    let frame = CapturedFrame::from_cpu(
+        SMOKE_WIDTH,
+        SMOKE_HEIGHT,
+        FramePixelFormat::Bgra32,
+        33_000,
+        vec![0x66; SMOKE_WIDTH * SMOKE_HEIGHT * 4],
+    );
+    let access_unit = encoder
+        .encode(&frame)
+        .expect("nvenc hevc max-speed encode frame")
+        .into_iter()
+        .next()
+        .expect("single access unit");
+
+    assert_eq!(access_unit.codec, VideoCodec::Hevc);
+    assert!(!access_unit.bytes.is_empty());
+}
+
+#[cfg(windows)]
 fn extract_sps_profile_idc(access_unit: &[u8]) -> Option<u8> {
     let mut offset = 0usize;
     while let Some((start, start_len)) = find_h264_start_code(access_unit, offset) {

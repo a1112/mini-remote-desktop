@@ -72,6 +72,7 @@ const lanAutomationCommands: LanE2EAutomationCommands = {
   ipcRegisterDevice: commands.ipcRegisterDevice,
   ipcRefreshLanDiscovery: commands.ipcRefreshLanDiscovery,
   ipcStartLanRemoteSession: commands.ipcStartLanRemoteSession,
+  ipcConfigureMediaAdaptation: commands.ipcConfigureMediaAdaptation,
   ipcListRemoteCaptureSources: commands.ipcListRemoteCaptureSources,
   ipcSelectRemoteCaptureSource: commands.ipcSelectRemoteCaptureSource,
   ipcListRemoteDisplayModes: commands.ipcListRemoteDisplayModes,
@@ -604,6 +605,7 @@ function buildLanAutomationOptionsFromSearchParams(
     preferredCaptureSourceKind:
       searchParams.get("captureSourceKind") ?? searchParams.get("captureKind") ?? undefined,
     expectedPeerBuildId: searchParams.get("expectedPeerBuildId") ?? undefined,
+    adaptive: parseOptionalBoolean(searchParams.get("adaptive")),
     requestedProfile: parseRequestedProfile(searchParams),
   };
 }
@@ -616,13 +618,31 @@ function parseRequestedProfile(searchParams: URLSearchParams): LanE2EAutomationO
     searchParams.get("bitrateMbps") ?? searchParams.get("profileBitrateMbps")
   );
   if (!width || !height || !fps || !bitrate) return undefined;
-  return {
+  const codec = parseProfileCodec(searchParams.get("codec") ?? searchParams.get("profileCodec"));
+  const bitDepth = parsePositiveNumber(searchParams.get("bitDepth") ?? searchParams.get("profileBitDepth"));
+  const hdrEnabled = parseOptionalBoolean(searchParams.get("hdrEnabled") ?? searchParams.get("profileHdrEnabled"));
+  const profile: NonNullable<LanE2EAutomationOptions["requestedProfile"]> = {
     width,
     height,
     fps,
     bitrate_mbps: bitrate,
-    codec: "h264",
+    codec,
   };
+  const codecProfile = searchParams.get("codecProfile") ?? searchParams.get("profileCodecProfile");
+  const chromaSubsampling =
+    searchParams.get("chromaSubsampling") ?? searchParams.get("profileChromaSubsampling");
+  const pixelFormat = searchParams.get("pixelFormat") ?? searchParams.get("profilePixelFormat");
+  if (codecProfile) profile.codec_profile = codecProfile;
+  if (bitDepth) profile.bit_depth = bitDepth;
+  if (chromaSubsampling) profile.chroma_subsampling = chromaSubsampling;
+  if (pixelFormat) profile.pixel_format = pixelFormat;
+  if (hdrEnabled !== undefined) profile.hdr_enabled = hdrEnabled;
+  return profile;
+}
+
+function parseProfileCodec(value: string | null): "h264" | "hevc" {
+  const normalized = value?.trim().toLowerCase();
+  return normalized === "hevc" || normalized === "h265" || normalized === "h.265" ? "hevc" : "h264";
 }
 
 function parseCrossDeviceScenarioId(value: string | null): CrossDeviceScenarioId | undefined {

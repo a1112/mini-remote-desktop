@@ -14,6 +14,7 @@ import {
   Package,
   ArrowLeft,
   Home,
+  LineChart,
   Minus,
   Square,
   X,
@@ -38,6 +39,7 @@ const navigation = [
   { name: "Custom", href: "/test/custom", icon: Settings },
   { name: "Matrix", href: "/test/matrix", icon: Package },
   { name: "History", href: "/test/history", icon: History },
+  { name: "Telemetry", href: "/test/telemetry", icon: LineChart },
 ];
 
 export function WorkbenchLayout() {

@@ -4,7 +4,17 @@ fn main() {
 }
 
 fn emit_git_commit_env() {
-    println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-env-changed=GIT_COMMIT");
+    println!("cargo:rerun-if-env-changed=VERGEN_GIT_SHA");
+    println!("cargo:rerun-if-changed=../../.git/HEAD");
+
+    if let Ok(commit) = std::env::var("GIT_COMMIT") {
+        let commit = commit.trim();
+        if !commit.is_empty() {
+            println!("cargo:rustc-env=GIT_COMMIT={commit}");
+            return;
+        }
+    }
 
     let Ok(output) = std::process::Command::new("git")
         .args(["rev-parse", "--short=12", "HEAD"])

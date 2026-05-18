@@ -9,6 +9,7 @@ pub mod display_mode;
 pub mod handlers;
 pub mod ipc_server;
 pub mod lan_discovery;
+pub mod media_adaptation;
 pub mod shell;
 
 pub use app_state::{AppState, DeviceRegistry, SessionRegistry};

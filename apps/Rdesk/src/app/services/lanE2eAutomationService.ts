@@ -1,5 +1,6 @@
 import type {
   AdapterResult,
+  AdaptiveMediaConfig,
   CaptureSource,
   CaptureSourceSelection,
   DisplayMode,
@@ -8,6 +9,7 @@ import type {
   LanPeerInfo,
   MediaPipelineSnapshot,
   MediaProfile,
+  MediaAdaptationSnapshot,
   ProbeSnapshot,
   RemoteDisplayWindowContext,
   RuntimeSnapshot,
@@ -65,7 +67,7 @@ export type LanE2EFailureReason =
   | "stop_failed";
 
 export interface LanE2EStageEvent {
-  stage: "preflight" | "pairing" | "session" | "capture_source" | "display_mode" | "receiver" | "display" | "fault" | "sample" | "assert" | "cleanup";
+  stage: "preflight" | "pairing" | "session" | "capture_source" | "display_mode" | "adaptation" | "receiver" | "display" | "fault" | "sample" | "assert" | "cleanup";
   status: "started" | "completed" | "failed" | "skipped";
   timestamp: number;
   error?: string;
@@ -86,6 +88,8 @@ export interface LanE2EAutomationOptions {
   preferredCaptureSourceId?: string;
   preferredCaptureSourceKind?: string;
   expectedPeerBuildId?: string;
+  adaptive?: boolean;
+  adaptiveConfig?: AdaptiveMediaConfig;
   faultPlan?: CrossDeviceFaultPlan;
   createSessionId?: () => string;
   now?: () => number;
@@ -104,6 +108,7 @@ export interface LanE2EAutomationReport {
   sessionSnapshot?: SessionRuntimeSnapshot;
   probeSnapshot?: ProbeSnapshot;
   mediaPipelineSnapshot?: MediaPipelineSnapshot;
+  mediaAdaptationSnapshot?: MediaAdaptationSnapshot;
   profileProbeResult?: ProfileProbeResult;
   requestedProfile?: MediaProfile;
   faultPlan?: CrossDeviceFaultPlan;
@@ -139,6 +144,10 @@ export interface LanE2EAutomationCommands {
     transportKind: string,
     requestedProfile?: MediaProfile
   ): Promise<AdapterResult<string>>;
+  ipcConfigureMediaAdaptation?(
+    sessionId: string,
+    config: AdaptiveMediaConfig
+  ): Promise<AdapterResult<MediaAdaptationSnapshot>>;
   ipcListRemoteCaptureSources(
     sessionId: string,
     includePreviews: boolean,
@@ -243,6 +252,7 @@ export async function runLanE2EAutomation(
   let sessionSnapshot: SessionRuntimeSnapshot | undefined;
   let probeSnapshot: ProbeSnapshot | undefined;
   let mediaPipelineSnapshot: MediaPipelineSnapshot | undefined;
+  let mediaAdaptationSnapshot: MediaAdaptationSnapshot | undefined;
   let profileProbeResult: ProfileProbeResult | undefined;
   let controllerDeviceId: string | null | undefined;
   let sessionStarted = false;
@@ -278,6 +288,7 @@ export async function runLanE2EAutomation(
     sessionSnapshot,
     probeSnapshot,
     mediaPipelineSnapshot,
+    mediaAdaptationSnapshot,
     profileProbeResult,
     requestedProfile,
     faultPlan: options.faultPlan,
@@ -413,6 +424,23 @@ export async function runLanE2EAutomation(
       }
     }
 
+    if (options.adaptive) {
+      stage("adaptation", "started");
+      if (!commands.ipcConfigureMediaAdaptation) {
+        const message = "LAN adaptive media requires ipcConfigureMediaAdaptation";
+        stage("adaptation", "failed", message);
+        return finish("failed", "runtime_error", message);
+      }
+      mediaAdaptationSnapshot = await unwrap(
+        commands.ipcConfigureMediaAdaptation(
+          sessionId,
+          buildAdaptiveMediaConfig(requestedProfile, captureSource, options.adaptiveConfig)
+        ),
+        "runtime_error"
+      );
+      stage("adaptation", "completed");
+    }
+
     stage("receiver", "started");
     await unwrap(commands.ipcStartReceiver(sessionId), "receiver_start_failed");
     stage("receiver", "completed");
@@ -472,6 +500,7 @@ export async function runLanE2EAutomation(
         commands.ipcMediaPipelineSnapshot(sessionId),
         "runtime_error"
       );
+      mediaAdaptationSnapshot = mediaPipelineSnapshot.adaptation ?? mediaAdaptationSnapshot;
       if (displayWindow) {
         displayWindow = syncDisplayWindowFromPipeline(displayWindow, mediaPipelineSnapshot);
       }
@@ -511,11 +540,12 @@ export async function runLanE2EAutomation(
         validationMode
       );
       const profileMismatch = describeProfileProbeFailure(profileProbeResult);
-      if (profileMismatch && sampleDurationMs >= minSampleDurationMs) {
+      if (!options.adaptive && profileMismatch && sampleDurationMs >= minSampleDurationMs) {
         stage("assert", "failed", profileMismatch);
         return finish("failed", "media_profile_mismatch", profileMismatch);
       }
       if (
+        !options.adaptive &&
         profileProbeResult?.status === "degraded" &&
         probeSnapshot.frames_decoded >= minDecodedFrames &&
         sampleDurationMs >= minSampleDurationMs
@@ -593,6 +623,40 @@ function renderModeForAttachedSurface(backend: string): RemoteDisplayWindowConte
   if (backend === "linux") return "linux_native";
   if (backend === "d3d12") return "d3d12_native";
   return "d3d11_native";
+}
+
+function buildAdaptiveMediaConfig(
+  requestedProfile: MediaProfile | undefined,
+  captureSource: CaptureSource | undefined,
+  overrides: AdaptiveMediaConfig | undefined
+): AdaptiveMediaConfig {
+  const ceilingProfile = requestedProfile ?? DEFAULT_LAN_MEDIA_PROFILE;
+  const sourceAspect =
+    captureSource && captureSource.width > 0 && captureSource.height > 0
+      ? captureSource.width / captureSource.height
+      : ceilingProfile.width / ceilingProfile.height;
+  const floorWidth = 1280;
+  const floorHeight = Math.max(2, Math.floor(floorWidth / sourceAspect / 2) * 2);
+  return {
+    enabled: true,
+    mode: "keyframe_ladder",
+    ceiling_profile: {
+      ...ceilingProfile,
+      bitrate_mbps: Math.max(80, ceilingProfile.bitrate_mbps),
+      codec: ceilingProfile.codec || "h264",
+    },
+    floor_profile: {
+      width: floorWidth,
+      height: floorHeight,
+      fps: 60,
+      bitrate_mbps: 10,
+      codec: "h264",
+    },
+    ladder: [],
+    downshift_cooldown_ms: 2_000,
+    upshift_hold_ms: 5_000,
+    ...overrides,
+  };
 }
 
 async function maybeApplyRemoteDisplayMode(

@@ -372,6 +372,51 @@ describe('Tauri Adapter Contract', () => {
       });
     });
 
+    it('ipc_configure_media_adaptation calls correct command with args', async () => {
+      const mockInvoke = getMockInvoke();
+      const profile = {
+        width: 2560,
+        height: 1440,
+        fps: 144,
+        bitrate_mbps: 80,
+        codec: 'h264',
+      };
+      const config = {
+        enabled: true,
+        mode: 'keyframe_ladder',
+        ceiling_profile: profile,
+        floor_profile: {
+          width: 1280,
+          height: 720,
+          fps: 60,
+          bitrate_mbps: 10,
+          codec: 'h264',
+        },
+        ladder: [],
+        downshift_cooldown_ms: 2000,
+        upshift_hold_ms: 5000,
+      };
+      mockInvoke.mockResolvedValue({
+        enabled: true,
+        state: 'configured',
+        ladder_index: 0,
+        current_profile: profile,
+        target_profile: profile,
+        last_reason: 'configured',
+        last_change_ms: 1,
+        observed_fps: 0,
+        drop_ratio: 0,
+        queue_depth: 0,
+      });
+
+      await adapter.ipcConfigureMediaAdaptation('session-123', config);
+
+      expect(mockInvoke).toHaveBeenCalledWith('ipc_configure_media_adaptation', {
+        sessionId: 'session-123',
+        config,
+      });
+    });
+
     it('ipc_list_remote_capture_sources calls correct command with preview options', async () => {
       const mockInvoke = getMockInvoke();
       mockInvoke.mockResolvedValue([
@@ -585,6 +630,42 @@ describe('Tauri Adapter Contract', () => {
       await adapter.ipcRuntimeSnapshot();
 
       expect(mockInvoke).toHaveBeenCalledWith('ipc_runtime_snapshot', undefined);
+    });
+
+    it('ipc_audit_log calls correct command with query', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue([
+        {
+          id: 1,
+          timestamp_ms: 1710000000000,
+          action: 'session.start',
+          outcome: 'success',
+          session_id: 'session-123',
+          actor_device_id: 'local-device',
+          peer_device_id: 'peer-device',
+          transport_kind: 'quic',
+          reason: null,
+          details: [],
+        },
+      ]);
+
+      const result = await adapter.ipcAuditLog({
+        session_id: 'session-123',
+        action: 'session.start',
+        limit: 20,
+      });
+
+      expect(mockInvoke).toHaveBeenCalledWith('ipc_audit_log', {
+        query: {
+          session_id: 'session-123',
+          action: 'session.start',
+          limit: 20,
+        },
+      });
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.value[0]?.action).toBe('session.start');
+      }
     });
 
     it('ipc_probe_snapshot calls correct command with args', async () => {
@@ -908,6 +989,31 @@ describe('Tauri Adapter Contract', () => {
 
       expect(mockInvoke).toHaveBeenCalledWith('test_get_run_artifacts', {
         runId: 'run-1',
+      });
+    });
+
+    it('test_get_run_telemetry calls telemetry command with query', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue({
+        run: null,
+        metrics: {},
+        events: [],
+        logs: [],
+        artifacts: [],
+        diagnostics: { corrupt_rows: 0, warnings: [] },
+      });
+
+      await adapter.testGetRunTelemetry('run-1', {
+        metric_names: ['capture_fps'],
+        max_points: 500,
+      });
+
+      expect(mockInvoke).toHaveBeenCalledWith('test_get_run_telemetry', {
+        runId: 'run-1',
+        query: {
+          metric_names: ['capture_fps'],
+          max_points: 500,
+        },
       });
     });
 

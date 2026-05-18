@@ -104,6 +104,7 @@ export interface TestConfig {
   renderer_target_hwnd?: string;
   zero_copy?: boolean;
   transport_kind?: "loopback" | "quic" | "webrtc";
+  adaptive_media?: boolean;
 
   // Parameters
   resolution?: [number, number];
@@ -246,6 +247,11 @@ export interface TestRunSummary {
   total_latency_p95?: number;
   dropped_frames: number;
   frame_count: number;
+  adaptation_state?: string;
+  adaptation_ladder_index?: number;
+  adaptation_current_profile?: string;
+  adaptation_target_profile?: string;
+  adaptation_reason?: string;
   error_message?: string;
   failure_reason?: FailureReason;
 }
@@ -290,6 +296,9 @@ export interface MetricSeries {
     p95?: number;
     p99?: number;
   };
+  category?: string;
+  display_name?: string;
+  source?: string;
 }
 
 /**
@@ -592,12 +601,36 @@ export interface RuntimeSnapshot {
   is_registered: boolean;
 }
 
+export interface AuditLogQuery {
+  session_id?: string | null;
+  action?: string | null;
+  limit?: number | null;
+}
+
+export interface AuditEvent {
+  id: number;
+  timestamp_ms: number;
+  action: string;
+  outcome: string;
+  session_id?: string | null;
+  actor_device_id?: string | null;
+  peer_device_id?: string | null;
+  transport_kind?: string | null;
+  reason?: string | null;
+  details: Array<[string, string]>;
+}
+
 export interface MediaProfile {
   width: number;
   height: number;
   fps: number;
   bitrate_mbps: number;
   codec: string;
+  codec_profile?: string | null;
+  bit_depth?: number | null;
+  chroma_subsampling?: string | null;
+  pixel_format?: string | null;
+  hdr_enabled?: boolean | null;
 }
 
 export interface MediaProfileNegotiation {
@@ -635,15 +668,92 @@ export interface MediaTestImpairmentSnapshot {
   datagrams_fragmented_by_mtu: number;
 }
 
+export interface TelemetryRunMetadata {
+  run_id: string;
+  scenario_id: string;
+  status: string;
+  started_at: number;
+  finished_at?: number | null;
+  tags: string[];
+}
+
+export interface TelemetryLogEntry {
+  run_id: string;
+  timestamp: number;
+  level: string;
+  source: string;
+  message: string;
+  fields?: unknown;
+}
+
+export interface TelemetryQuery {
+  start_ms?: number | null;
+  end_ms?: number | null;
+  metric_names?: string[];
+  log_sources?: string[];
+  max_points?: number | null;
+}
+
+export interface TelemetryDiagnostics {
+  corrupt_rows: number;
+  warnings: string[];
+}
+
+export interface TelemetryBundle {
+  run?: TelemetryRunMetadata | null;
+  metrics: Record<string, MetricSeries>;
+  events: TestStageEvent[];
+  logs: TelemetryLogEntry[];
+  artifacts: Artifact[];
+  diagnostics: TelemetryDiagnostics;
+}
+
+export interface AdaptiveMediaConfig {
+  enabled: boolean;
+  mode?: "keyframe_ladder" | string;
+  ceiling_profile?: MediaProfile | null;
+  floor_profile?: MediaProfile | null;
+  ladder?: MediaProfile[];
+  downshift_cooldown_ms?: number;
+  upshift_hold_ms?: number;
+}
+
+export interface MediaAdaptationSnapshot {
+  enabled: boolean;
+  state: string;
+  ladder_index: number;
+  current_profile: MediaProfile;
+  target_profile: MediaProfile;
+  last_reason?: string | null;
+  last_change_ms: number;
+  observed_fps: number;
+  drop_ratio: number;
+  queue_depth: number;
+}
+
 export interface MediaPipelineSnapshot {
   session_id: string;
   attached_surfaces: AttachedRenderSurface[];
   active_decoder?: string | null;
   active_renderer?: string | null;
+  active_codec?: string | null;
+  active_codec_profile?: string | null;
+  active_bit_depth?: number | null;
+  active_chroma_subsampling?: string | null;
+  active_pixel_format?: string | null;
+  active_hdr_enabled?: boolean | null;
+  active_width?: number | null;
+  active_height?: number | null;
+  active_fps?: number | null;
+  active_bitrate_mbps?: number | null;
+  codec_fallback_reason?: string | null;
   queue_depth: number;
   dropped_frames: number;
+  render_queue_replacements?: number;
+  render_lock_drops?: number;
   stage_metrics: MediaStageMetrics[];
   test_impairment?: MediaTestImpairmentSnapshot | null;
+  adaptation?: MediaAdaptationSnapshot | null;
 }
 
 export interface CaptureSource {

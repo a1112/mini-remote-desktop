@@ -28,14 +28,36 @@ function cargoCommand() {
   return 'cargo';
 }
 
+function currentGitCommit() {
+  const result = spawnSync('git', ['rev-parse', '--short=12', 'HEAD'], {
+    cwd: workspaceRoot,
+    encoding: 'utf8',
+  });
+
+  if (result.status !== 0) {
+    return undefined;
+  }
+
+  const commit = result.stdout.trim();
+  return commit.length > 0 ? commit : undefined;
+}
+
 const args = ['build', '-p', 'mrd-service'];
 if (release) {
   args.push('--release');
 }
 
+const buildEnv = { ...process.env };
+if (!buildEnv.GIT_COMMIT) {
+  const commit = currentGitCommit();
+  if (commit) {
+    buildEnv.GIT_COMMIT = commit;
+  }
+}
+
 const result = spawnSync(cargoCommand(), args, {
   cwd: workspaceRoot,
-  env: process.env,
+  env: buildEnv,
   stdio: 'inherit',
 });
 

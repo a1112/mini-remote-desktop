@@ -20,6 +20,7 @@ import {
   CustomTestPage,
   MatrixTestPage,
   TestHistoryPage,
+  TestTelemetryPage,
 } from "./components/TestWorkbench";
 
 export const router = createBrowserRouter([
@@ -58,6 +59,8 @@ export const router = createBrowserRouter([
       { path: "custom", Component: CustomTestPage },
       { path: "matrix", Component: MatrixTestPage },
       { path: "history", Component: TestHistoryPage },
+      { path: "telemetry", Component: TestTelemetryPage },
+      { path: "telemetry/:runId", Component: TestTelemetryPage },
       { path: "run/:runId", Component: RunDetailPage },
     ],
   },

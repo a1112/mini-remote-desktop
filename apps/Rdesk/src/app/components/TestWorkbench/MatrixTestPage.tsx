@@ -181,6 +181,14 @@ const MATRIX_DIMENSIONS: MatrixDimension[] = [
     ],
   },
   {
+    id: "adaptive",
+    name: "自适应",
+    options: [
+      { id: "off", name: "固定", enabled: true },
+      { id: "on", name: "关键帧阶梯", enabled: false },
+    ],
+  },
+  {
     id: "duration",
     name: "时长",
     options: [
@@ -388,6 +396,9 @@ function buildConfig(options: SelectedMatrixOption[]): TestConfig {
         break;
       case "bitrate":
         config.bitrate = Number(option.id);
+        break;
+      case "adaptive":
+        config.adaptive_media = option.id === "on";
         break;
       case "duration":
         config.duration_ms = Number(option.id);
@@ -655,6 +666,7 @@ const lanAutomationCommands: LanE2EAutomationCommands = {
   ipcRegisterDevice: commands.ipcRegisterDevice,
   ipcRefreshLanDiscovery: commands.ipcRefreshLanDiscovery,
   ipcStartLanRemoteSession: commands.ipcStartLanRemoteSession,
+  ipcConfigureMediaAdaptation: commands.ipcConfigureMediaAdaptation,
   ipcListRemoteCaptureSources: commands.ipcListRemoteCaptureSources,
   ipcSelectRemoteCaptureSource: commands.ipcSelectRemoteCaptureSource,
   ipcListRemoteDisplayModes: commands.ipcListRemoteDisplayModes,
@@ -719,6 +731,7 @@ function matrixConfigKey(config: TestConfig): string {
     renderer_type: config.renderer_type,
     render_display: config.render_display,
     zero_copy: config.zero_copy,
+    adaptive_media: config.adaptive_media,
     resolution: config.resolution,
     fps: config.fps,
     bitrate: config.bitrate,
@@ -730,6 +743,7 @@ function matrixConfigKey(config: TestConfig): string {
 function crossDeviceMatrixKey(config: TestConfig): string {
   return JSON.stringify({
     transport_kind: crossDeviceTransportFromConfig(config),
+    adaptive_media: config.adaptive_media,
     resolution: config.resolution,
     fps: config.fps,
     bitrate: config.bitrate,
@@ -780,14 +794,28 @@ function crossDeviceMinimumExpectedFps(profile: MediaProfile): number {
 
 function summaryFromLanReport(report: LanE2EAutomationReport): TestRunSummary {
   const probe = report.probeSnapshot;
+  const adaptation = report.mediaAdaptationSnapshot ?? report.mediaPipelineSnapshot?.adaptation;
   return {
     total_duration_ms: Math.max(0, report.finishedAt - report.startedAt),
     capture_fps: probe?.current_fps ?? undefined,
     dropped_frames: probe?.frames_dropped ?? 0,
     frame_count: probe?.frames_decoded ?? 0,
+    adaptation_state: adaptation?.state,
+    adaptation_ladder_index: adaptation?.ladder_index,
+    adaptation_current_profile: adaptation
+      ? formatMatrixMediaProfile(adaptation.current_profile)
+      : undefined,
+    adaptation_target_profile: adaptation
+      ? formatMatrixMediaProfile(adaptation.target_profile)
+      : undefined,
+    adaptation_reason: adaptation?.last_reason ?? undefined,
     error_message: report.errorMessage,
     failure_reason: report.failureReason ? "validation_failure" : undefined,
   };
+}
+
+function formatMatrixMediaProfile(profile: MediaProfile): string {
+  return `${profile.width}x${profile.height}@${profile.fps}/${profile.bitrate_mbps}Mbps`;
 }
 
 function crossDevicePeerSkipReason(
@@ -1472,6 +1500,7 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
           targetDeviceId: targetPeer.device_id,
           transportKind,
           requestedProfile: profile,
+          adaptive: test.config.adaptive_media === true,
           displayModePolicy: "temporary",
           timeoutMs: Math.max(10_000, durationMs + (test.config.warmup_ms ?? 0) + 5000),
           sampleIntervalMs: 500,
@@ -1810,7 +1839,7 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
       {/* Test Results Grid */}
       {tests.length > 0 && (
         <div className="bg-card rounded-lg border overflow-x-auto">
-          <table className="w-full min-w-[1660px]">
+          <table className="w-full min-w-[1840px]">
             <thead className="bg-muted">
               <tr>
                 <th className="px-4 py-2 text-left text-sm font-medium">状态</th>
@@ -1822,6 +1851,7 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
                 <th className="px-4 py-2 text-left text-sm font-medium">分辨率</th>
                 <th className="px-4 py-2 text-left text-sm font-medium">帧率</th>
                 <th className="px-4 py-2 text-left text-sm font-medium">码率</th>
+                <th className="px-4 py-2 text-left text-sm font-medium">自适应</th>
                 <th className="px-4 py-2 text-left text-sm font-medium">Pipeline FPS</th>
                 <th className="px-4 py-2 text-left text-sm font-medium">Memory</th>
                 <th className="px-4 py-2 text-left text-sm font-medium">Encode P95</th>
@@ -1878,6 +1908,28 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
                   <td className="px-4 py-2 text-sm">{test.config.fps}</td>
                   <td className="px-4 py-2 text-sm">
                     {test.config.bitrate ? `${(test.config.bitrate / 1000000).toFixed(0)} Mbps` : "-"}
+                  </td>
+                  <td className="px-4 py-2 text-xs">
+                    {test.config.adaptive_media ? (
+                      <div
+                        className="max-w-[210px] truncate"
+                        title={[
+                          test.result?.adaptation_current_profile,
+                          test.result?.adaptation_target_profile,
+                          test.result?.adaptation_reason,
+                        ].filter(Boolean).join(" -> ")}
+                      >
+                        {test.result?.adaptation_state ?? "enabled"}
+                        {test.result?.adaptation_ladder_index != null
+                          ? ` #${test.result.adaptation_ladder_index}`
+                          : ""}
+                        {test.result?.adaptation_target_profile
+                          ? ` ${test.result.adaptation_target_profile}`
+                          : ""}
+                      </div>
+                    ) : (
+                      "固定"
+                    )}
                   </td>
                   <td className="px-4 py-2 text-sm">
                     {test.result?.capture_fps?.toFixed(1) ?? "-"}
