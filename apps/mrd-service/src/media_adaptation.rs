@@ -544,6 +544,23 @@ fn downshift_requires_confirmation(observation: MediaAdaptationObservation) -> b
     if observation.observed_fps < observation.target_fps as f32 * 0.50 {
         return false;
     }
+    if observation.drop_ratio > 0.08 {
+        return false;
+    }
+    let frame_budget_ms = 1000.0 / observation.target_fps.max(1) as f64;
+    let severe_perceptual_budget_ms = frame_budget_ms * 2.0;
+    if observation
+        .present_gap_p95_ms
+        .is_some_and(|p95| p95 > severe_perceptual_budget_ms)
+    {
+        return false;
+    }
+    if observation
+        .receive_p95_ms
+        .is_some_and(|p95| p95 > severe_perceptual_budget_ms)
+    {
+        return false;
+    }
     true
 }
 
@@ -1363,6 +1380,40 @@ mod tests {
                 second_confirmed,
             ),
             MediaAdaptationDecision::Downshift("drop ratio 6.00% above 3%".to_string())
+        );
+    }
+
+    #[test]
+    fn severe_drop_burst_downshifts_without_confirmation() {
+        let observation = MediaAdaptationObservation {
+            observed_fps: 130.0,
+            target_fps: 144,
+            drop_ratio: 0.09,
+            queue_depth: 0,
+            decode_p95_ms: Some(2.0),
+            render_p95_ms: Some(2.0),
+            receive_p95_ms: Some(1.0),
+            present_gap_p95_ms: Some(27.0),
+            no_valid_frames: false,
+        };
+        let mut pending_reason = None;
+        let mut pending_windows = 0;
+
+        let confirmed =
+            update_downshift_confirmation(observation, &mut pending_reason, &mut pending_windows);
+
+        assert!(confirmed);
+        assert_eq!(
+            choose_adaptation_decision_with_confirmation(
+                0,
+                7,
+                observation,
+                0,
+                2_000,
+                &config(),
+                confirmed,
+            ),
+            MediaAdaptationDecision::Downshift("drop ratio 9.00% above 3%".to_string())
         );
     }
 
