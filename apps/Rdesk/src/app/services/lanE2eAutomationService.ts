@@ -119,6 +119,8 @@ export interface LanE2EAutomationReport {
   sampleDurationMs: number;
   sampleFramesDecoded: number;
   sampleObservedFps?: number;
+  sampleRenderFramesPresented: number;
+  sampleObservedRenderFps?: number;
   thresholds: {
     minSampleDurationMs: number;
     minDecodedFrames: number;
@@ -263,9 +265,11 @@ export async function runLanE2EAutomation(
   let sampleDurationMs = 0;
   let sampleFramesDecoded = 0;
   let sampleObservedFps: number | undefined;
+  let sampleRenderFramesPresented = 0;
+  let sampleObservedRenderFps: number | undefined;
   let renderCappedProfileApplied = false;
   let sampleFpsBaseline:
-    | { framesDecoded: number; sampleDurationMs: number }
+    | { framesDecoded: number; renderPresentedFrames: number; sampleDurationMs: number }
     | undefined;
 
   const stage = (
@@ -307,6 +311,8 @@ export async function runLanE2EAutomation(
     sampleDurationMs,
     sampleFramesDecoded,
     sampleObservedFps,
+    sampleRenderFramesPresented,
+    sampleObservedRenderFps,
     thresholds: {
       minSampleDurationMs,
       minDecodedFrames,
@@ -525,6 +531,8 @@ export async function runLanE2EAutomation(
         sampleDurationMs = 0;
         sampleFramesDecoded = 0;
         sampleObservedFps = undefined;
+        sampleRenderFramesPresented = 0;
+        sampleObservedRenderFps = undefined;
         sampleFpsBaseline = undefined;
         await sleep(sampleIntervalMs);
         continue;
@@ -533,6 +541,7 @@ export async function runLanE2EAutomation(
       if (!sampleFpsBaseline) {
         sampleFpsBaseline = {
           framesDecoded: probeSnapshot.frames_decoded,
+          renderPresentedFrames: mediaPipelineSnapshot.render_presented_frames ?? 0,
           sampleDurationMs,
         };
       } else {
@@ -545,6 +554,15 @@ export async function runLanE2EAutomation(
         sampleObservedFps =
           sampleFpsElapsedMs > 0
             ? (sampleFramesDecoded * 1000) / sampleFpsElapsedMs
+            : undefined;
+        sampleRenderFramesPresented = Math.max(
+          0,
+          (mediaPipelineSnapshot.render_presented_frames ?? 0) -
+            sampleFpsBaseline.renderPresentedFrames
+        );
+        sampleObservedRenderFps =
+          sampleFpsElapsedMs > 0
+            ? (sampleRenderFramesPresented * 1000) / sampleFpsElapsedMs
             : undefined;
       }
       const fpsForThreshold = sampleObservedFps ?? probeSnapshot.current_fps ?? 0;

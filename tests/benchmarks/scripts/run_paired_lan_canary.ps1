@@ -280,6 +280,7 @@ function Invoke-CrossCanaryProfile($Repo, $Profile, $OutputRoot, $TargetDeviceId
     $process = Start-Process -FilePath "cmd.exe" -ArgumentList @("/c", "pnpm", "tauri:dev") -WorkingDirectory (Join-Path $Repo "apps/Rdesk") -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WindowStyle Hidden -PassThru
 
     $deadline = (Get-Date).AddMilliseconds($TimeoutMs + 60000)
+    $processExitGraceDeadline = $null
     $report = $null
     while ((Get-Date) -lt $deadline) {
       if (Test-Path $reportPath) {
@@ -293,7 +294,12 @@ function Invoke-CrossCanaryProfile($Repo, $Profile, $OutputRoot, $TargetDeviceId
         }
       }
       if ($process.HasExited) {
-        break
+        if ($null -eq $processExitGraceDeadline) {
+          $processExitGraceDeadline = (Get-Date).AddSeconds(15)
+        }
+        if ((Get-Date) -ge $processExitGraceDeadline) {
+          break
+        }
       }
       Start-Sleep -Seconds 1
     }

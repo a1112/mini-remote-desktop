@@ -263,6 +263,8 @@ $renderCappedReport = [pscustomobject]@{
   failureReason = $null
   errorMessage = $null
   sampleObservedFps = 130.0
+  sampleRenderFramesPresented = 5670
+  sampleObservedRenderFps = 126.0
   sampleDurationMs = 45000
   probeSnapshot = [pscustomobject]@{
     current_fps = 130.0
@@ -275,6 +277,7 @@ $renderCappedReport = [pscustomobject]@{
   }
   mediaPipelineSnapshot = [pscustomobject]@{
     dropped_frames = 0
+    render_presented_frames = 5670
     render_queue_replacements = 0
     render_lock_drops = 0
     render_pacing_target_fps = 144
@@ -296,6 +299,7 @@ Assert-Equal $renderCappedRow.status "completed" "Receiver render-paced FPS cap 
 Assert-Equal $renderCappedRow.classification "completed" "Receiver render-paced FPS cap is not profile_downgraded"
 Assert-Equal $renderCappedRow.selected_profile.fps 144 "Receiver render-paced row reports selected media FPS"
 Assert-Equal $renderCappedRow.render_pacing_target_fps 144 "Receiver render-paced row exposes pacing target"
+Assert-Equal $renderCappedRow.sample_observed_render_fps 126.0 "Receiver render-paced row carries sample-window render FPS"
 
 $local1600Row = [pscustomobject]@{
   id = "1600p165_120mbps"
@@ -355,6 +359,8 @@ $pacedRenderReport = [pscustomobject]@{
   failureReason = $null
   errorMessage = $null
   sampleObservedFps = 164.34
+  sampleObservedRenderFps = 141.0
+  sampleRenderFramesPresented = 6370
   sampleDurationMs = 45178
   probeSnapshot = [pscustomobject]@{
     current_fps = 164.34
@@ -367,6 +373,7 @@ $pacedRenderReport = [pscustomobject]@{
   }
   mediaPipelineSnapshot = [pscustomobject]@{
     dropped_frames = 721
+    render_presented_frames = 6370
     render_queue_replacements = 721
     render_lock_drops = 0
     render_pacing_target_fps = 144
@@ -386,7 +393,7 @@ $pacedRenderRow = Convert-CrossReportToCanaryRow -Profile $profile1600p165120 -R
 Assert-Equal $pacedRenderRow.status "completed" "Stable paced render coalescing does not fail the canary row"
 Assert-Equal $pacedRenderRow.classification "completed" "Stable paced render coalescing keeps the completed classification"
 Assert-Equal $pacedRenderRow.visual_integrity_status "paced" "Stable render coalescing is exposed as paced"
-Assert-Equal ([Math]::Round($pacedRenderRow.estimated_render_fps, 1)) 148.4 "Estimated render FPS subtracts paced coalesced frames"
+Assert-Equal ([Math]::Round($pacedRenderRow.estimated_render_fps, 1)) 141.0 "Estimated render FPS prefers sample-window presented frames"
 Assert-Equal $pacedRenderRow.render_pacing_target_fps 144 "Paced row exposes the local render pacing target"
 Assert-Equal ([Math]::Round($pacedRenderRow.render_present_gap_p95_ms, 2)) 7.07 "Paced row exposes render present gap P95"
 Assert-True ($pacedRenderRow.render_coalesce_ratio -gt 0.09) "Paced row exposes render coalesce ratio"

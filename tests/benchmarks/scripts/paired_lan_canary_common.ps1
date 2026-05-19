@@ -177,6 +177,11 @@ function Get-CanaryEstimatedRenderFps {
     $Report = $null
   )
 
+  $sampleObservedRenderFps = [double](Select-CanaryValue $Report.sampleObservedRenderFps 0)
+  if ($sampleObservedRenderFps -gt 0) {
+    return $sampleObservedRenderFps
+  }
+
   $decodedFrames = [double](Select-CanaryValue $Probe.frames_decoded 0)
   if ($decodedFrames -le 0) { return 0.0 }
 
@@ -331,6 +336,9 @@ function Convert-CrossReportToCanaryRow {
     pipeline_dropped_frames = $pipelineDropped
     render_queue_replacements = $renderQueueReplacements
     render_lock_drops = $renderLockDrops
+    render_presented_frames = [int64](Select-CanaryValue $pipeline.render_presented_frames 0)
+    sample_render_frames_presented = [int64](Select-CanaryValue $Report.sampleRenderFramesPresented 0)
+    sample_observed_render_fps = Select-CanaryValue $Report.sampleObservedRenderFps $null
     estimated_render_fps = [double](Get-CanaryEstimatedRenderFps -Probe $probe -Pipeline $pipeline -Report $Report)
     render_coalesce_ratio = $renderCoalesceRatio
     render_present_gap_p95_ms = [double](Select-CanaryStageP95Value -Pipeline $pipeline -Stage "render_present_gap" -Fallback 0)

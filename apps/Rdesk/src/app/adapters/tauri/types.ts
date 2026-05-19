@@ -749,6 +749,7 @@ export interface MediaPipelineSnapshot {
   codec_fallback_reason?: string | null;
   queue_depth: number;
   dropped_frames: number;
+  render_presented_frames?: number;
   render_queue_replacements?: number;
   render_lock_drops?: number;
   render_pacing_target_fps?: number | null;

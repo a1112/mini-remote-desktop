@@ -4584,15 +4584,15 @@ fn spawn_lan_render_worker(
             pace_lan_render_frame(&app_state, &session_id).await;
             match render_lan_frame_once(app_state.clone(), session_id.clone(), frame).await {
                 Ok(LanRenderTaskOutcome::Rendered { duration_ms }) => {
-                    app_state
-                        .media_pipelines
-                        .lock()
-                        .await
-                        .record_stage_duration_ms(
+                    {
+                        let mut pipelines = app_state.media_pipelines.lock().await;
+                        pipelines.increment_render_presented_frames(session_id.clone(), 1);
+                        pipelines.record_stage_duration_ms(
                             session_id.clone(),
                             "render_present",
                             duration_ms,
                         );
+                    }
                     let present_gap_ms = app_state
                         .media_render_queues
                         .lock()

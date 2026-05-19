@@ -234,6 +234,7 @@ struct MediaPipelineState {
     codec_fallback_reason: Option<String>,
     queue_depth: u32,
     dropped_frames: u64,
+    render_presented_frames: u64,
     render_queue_replacements: u64,
     render_lock_drops: u64,
     render_pacing_target_fps: Option<u32>,
@@ -434,6 +435,11 @@ impl MediaPipelineRegistry {
         state.dropped_frames = state.dropped_frames.saturating_add(count);
     }
 
+    pub fn increment_render_presented_frames(&mut self, session_id: SessionId, count: u64) {
+        let state = self.pipelines.entry(session_id).or_default();
+        state.render_presented_frames = state.render_presented_frames.saturating_add(count);
+    }
+
     pub fn increment_render_queue_replacements(&mut self, session_id: SessionId, count: u64) {
         let state = self.pipelines.entry(session_id).or_default();
         state.render_queue_replacements = state.render_queue_replacements.saturating_add(count);
@@ -535,6 +541,7 @@ impl MediaPipelineRegistry {
             codec_fallback_reason: state.and_then(|state| state.codec_fallback_reason.clone()),
             queue_depth: state.map_or(0, |state| state.queue_depth),
             dropped_frames: state.map_or(0, |state| state.dropped_frames),
+            render_presented_frames: state.map_or(0, |state| state.render_presented_frames),
             render_queue_replacements: state.map_or(0, |state| state.render_queue_replacements),
             render_lock_drops: state.map_or(0, |state| state.render_lock_drops),
             render_pacing_target_fps: state.and_then(|state| state.render_pacing_target_fps),

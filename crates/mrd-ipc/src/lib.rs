@@ -263,6 +263,9 @@ pub struct MediaPipelineSnapshot {
     /// Legacy aggregate of receiver-side render drops. Prefer the explicit
     /// render counters below for diagnostics.
     pub dropped_frames: u64,
+    /// Frames actually presented by the native render pipeline.
+    #[serde(default)]
+    pub render_presented_frames: u64,
     #[serde(default)]
     pub render_queue_replacements: u64,
     #[serde(default)]

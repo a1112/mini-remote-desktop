@@ -514,6 +514,7 @@ fn serialize_deserialize_media_pipeline_snapshot_contract() {
             codec_fallback_reason: None,
             queue_depth: 1,
             dropped_frames: 2,
+            render_presented_frames: 120,
             render_queue_replacements: 1,
             render_lock_drops: 1,
             render_pacing_target_fps: Some(144),

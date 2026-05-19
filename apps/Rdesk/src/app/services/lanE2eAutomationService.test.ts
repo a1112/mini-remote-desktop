@@ -869,7 +869,9 @@ describe("runLanE2EAutomation", () => {
   it("uses sample-window FPS when cumulative probe FPS includes startup delay", async () => {
     let currentTime = 0;
     let probeIndex = 0;
+    let pipelineIndex = 0;
     const decodedFrames = [10, 16, 17, 18];
+    const presentedFrames = [8, 14, 15, 16];
     const ipcProbeSnapshot = vi.fn().mockImplementation(() => {
       const frameCount = decodedFrames[Math.min(probeIndex, decodedFrames.length - 1)];
       probeIndex += 1;
@@ -896,7 +898,29 @@ describe("runLanE2EAutomation", () => {
         })
       );
     });
-    const commands = withCaptureSourceCommands(createCommands({ ipcProbeSnapshot }));
+    const ipcMediaPipelineSnapshot = vi.fn().mockImplementation(() => {
+      const renderPresentedFrames =
+        presentedFrames[Math.min(pipelineIndex, presentedFrames.length - 1)];
+      pipelineIndex += 1;
+      return Promise.resolve(
+        ok({
+          session_id: "unused",
+          attached_surfaces: [],
+          active_decoder: "nvdec",
+          active_renderer: "d3d11",
+          queue_depth: 0,
+          dropped_frames: 0,
+          render_presented_frames: renderPresentedFrames,
+          render_queue_replacements: 0,
+          render_lock_drops: 0,
+          stage_metrics: [],
+          adaptation: null,
+        })
+      );
+    });
+    const commands = withCaptureSourceCommands(
+      createCommands({ ipcProbeSnapshot, ipcMediaPipelineSnapshot })
+    );
 
     const result = await runLanE2EAutomation(commands, {
       targetDeviceId: "agent-device",
@@ -920,6 +944,8 @@ describe("runLanE2EAutomation", () => {
     expect(result.status).toBe("completed");
     expect(result.sampleFramesDecoded).toBe(6);
     expect(result.sampleObservedFps).toBeGreaterThanOrEqual(50);
+    expect(result.sampleRenderFramesPresented).toBe(6);
+    expect(result.sampleObservedRenderFps).toBeGreaterThanOrEqual(50);
   });
 
   it("skips comparison when the remote capture source downgrades the selected profile", async () => {
