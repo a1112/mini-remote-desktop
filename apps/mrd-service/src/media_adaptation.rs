@@ -12,6 +12,8 @@ const ADAPTATION_SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
 const ADAPTATION_DECISION_INTERVAL: Duration = Duration::from_secs(2);
 const ADAPTATION_INITIAL_PROFILE_GRACE_MS: u64 = 5_000;
 const ADAPTATION_SUBSEQUENT_DOWNSHIFT_COOLDOWN_MS: u64 = 5_000;
+const ADAPTATION_SAFE_START_MIN_BITRATE_MBPS: u32 = 90;
+const ADAPTATION_SAFE_START_MIN_FPS: u32 = 120;
 const DEFAULT_CEILING_WIDTH: u32 = 2560;
 const DEFAULT_CEILING_HEIGHT: u32 = 1440;
 const DEFAULT_CEILING_FPS: u32 = 144;
@@ -63,7 +65,10 @@ pub async fn configure_media_adaptation(
         .get(&session_id)
         .map(|selection| selection.source);
     let ladder = effective_ladder(&config, source.as_ref(), &current_profile);
-    let mut ladder_index = ladder_index_for_profile(&ladder, &current_profile);
+    let mut ladder_index = initial_ladder_index_for_profile(
+        &ladder,
+        ladder_index_for_profile(&ladder, &current_profile),
+    );
     let mut target_profile = ladder
         .get(ladder_index)
         .cloned()
@@ -97,7 +102,11 @@ pub async fn configure_media_adaptation(
         target_profile: target_profile.clone(),
         last_reason: Some(if config.enabled {
             if initial_profile_applied {
-                "initial adaptive profile applied".to_string()
+                if ladder_index > 0 {
+                    "initial adaptive safe-start profile applied".to_string()
+                } else {
+                    "initial adaptive profile applied".to_string()
+                }
             } else {
                 "configured".to_string()
             }
@@ -977,6 +986,33 @@ fn ladder_index_for_profile(ladder: &[MediaProfile], profile: &MediaProfile) -> 
         .unwrap_or(0)
 }
 
+fn initial_ladder_index_for_profile(ladder: &[MediaProfile], current_index: usize) -> usize {
+    if current_index != 0 || ladder.len() < 2 {
+        return current_index;
+    }
+
+    let top = &ladder[0];
+    let safe = &ladder[1];
+    let safe_keeps_shape = safe.width == top.width
+        && safe.height == top.height
+        && safe.fps == top.fps
+        && safe.codec == top.codec
+        && safe.codec_profile == top.codec_profile
+        && safe.bit_depth == top.bit_depth
+        && safe.chroma_subsampling == top.chroma_subsampling
+        && safe.pixel_format == top.pixel_format
+        && safe.hdr_enabled == top.hdr_enabled
+        && safe.bitrate_mbps < top.bitrate_mbps;
+    if safe_keeps_shape
+        && top.fps >= ADAPTATION_SAFE_START_MIN_FPS
+        && top.bitrate_mbps >= ADAPTATION_SAFE_START_MIN_BITRATE_MBPS
+    {
+        1
+    } else {
+        current_index
+    }
+}
+
 fn default_ceiling_profile() -> MediaProfile {
     MediaProfile {
         width: DEFAULT_CEILING_WIDTH,
@@ -1148,6 +1184,57 @@ mod tests {
         assert_eq!(ladder[0].chroma_subsampling.as_deref(), Some("4:2:0"));
         assert_eq!(ladder[0].pixel_format.as_deref(), Some("nv12"));
         assert_eq!(ladder[0].hdr_enabled, Some(false));
+    }
+
+    #[test]
+    fn high_bitrate_adaptive_profile_safe_starts_on_second_rung() {
+        let ceiling = MediaProfile {
+            width: 2560,
+            height: 1600,
+            fps: 165,
+            bitrate_mbps: 120,
+            codec: "hevc".to_string(),
+            codec_profile: Some("main".to_string()),
+            bit_depth: Some(8),
+            chroma_subsampling: Some("4:2:0".to_string()),
+            pixel_format: Some("nv12".to_string()),
+            hdr_enabled: Some(false),
+        };
+        let capped = cap_profile_to_render_fps(&ceiling, Some(144));
+        let ladder = default_ladder_for_source(
+            Some(&source(2560, 1600)),
+            &capped,
+            &config().floor_profile.unwrap(),
+        );
+
+        assert_eq!(ladder[0].bitrate_mbps, 96);
+        assert_eq!(ladder[1].bitrate_mbps, 77);
+        assert_eq!(
+            initial_ladder_index_for_profile(
+                &ladder,
+                ladder_index_for_profile(&ladder, &ladder[0])
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn normal_2k144_adaptive_profile_starts_at_ceiling() {
+        let ladder = default_ladder_for_source(
+            Some(&source(2560, 1440)),
+            &config().ceiling_profile.unwrap(),
+            &config().floor_profile.unwrap(),
+        );
+
+        assert_eq!(ladder[0].bitrate_mbps, 80);
+        assert_eq!(ladder[1].bitrate_mbps, 64);
+        assert_eq!(
+            initial_ladder_index_for_profile(
+                &ladder,
+                ladder_index_for_profile(&ladder, &ladder[0])
+            ),
+            0
+        );
     }
 
     #[test]
