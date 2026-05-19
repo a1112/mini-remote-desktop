@@ -279,6 +279,7 @@ fn write_i420(frame: &CapturedFrame, out: &mut [u8]) -> Result<(), PipelineError
         .and_then(|pixels| match frame.pixel_format {
             FramePixelFormat::Bgra32 | FramePixelFormat::Rgba32 => pixels.checked_mul(4),
             FramePixelFormat::Rgb24 => pixels.checked_mul(3),
+            FramePixelFormat::Nv12 => i420_len(frame.width, frame.height).ok(),
         })
         .ok_or_else(|| PipelineError::message("frame buffer size overflow"))?;
 
@@ -301,9 +302,26 @@ fn write_i420(frame: &CapturedFrame, out: &mut [u8]) -> Result<(), PipelineError
     let uv_size = y_size / 4;
     let (y_plane, uv_planes) = out.split_at_mut(y_size);
     let (u_plane, v_plane) = uv_planes.split_at_mut(uv_size);
+
+    if frame.pixel_format == FramePixelFormat::Nv12 {
+        y_plane.copy_from_slice(&frame.data[..y_size]);
+        let uv_plane = &frame.data[y_size..expected_len];
+        let chroma_width = frame.width / 2;
+        for row in 0..frame.height / 2 {
+            for col in 0..chroma_width {
+                let nv12_index = row * frame.width + col * 2;
+                let i420_index = row * chroma_width + col;
+                u_plane[i420_index] = uv_plane[nv12_index];
+                v_plane[i420_index] = uv_plane[nv12_index + 1];
+            }
+        }
+        return Ok(());
+    }
+
     let bytes_per_pixel = match frame.pixel_format {
         FramePixelFormat::Bgra32 | FramePixelFormat::Rgba32 => 4,
         FramePixelFormat::Rgb24 => 3,
+        FramePixelFormat::Nv12 => unreachable!("NV12 was copied above"),
     };
 
     for block_y in (0..frame.height).step_by(2) {
@@ -341,6 +359,7 @@ fn read_rgb(frame: &CapturedFrame, x: usize, y: usize, bytes_per_pixel: usize) -
             frame.data[index + 1],
             frame.data[index + 2],
         ),
+        FramePixelFormat::Nv12 => unreachable!("NV12 is not read as packed RGB"),
     }
 }
 
@@ -379,6 +398,7 @@ fn to_rgba(frame: &CapturedFrame) -> Result<Vec<u8>, PipelineError> {
         .and_then(|pixels| match frame.pixel_format {
             FramePixelFormat::Bgra32 | FramePixelFormat::Rgba32 => pixels.checked_mul(4),
             FramePixelFormat::Rgb24 => pixels.checked_mul(3),
+            FramePixelFormat::Nv12 => i420_len(frame.width, frame.height).ok(),
         })
         .ok_or_else(|| PipelineError::message("frame buffer size overflow"))?;
 
@@ -409,7 +429,34 @@ fn to_rgba(frame: &CapturedFrame) -> Result<Vec<u8>, PipelineError> {
             }
             Ok(rgba)
         }
+        FramePixelFormat::Nv12 => nv12_to_rgba(frame),
     }
+}
+
+fn nv12_to_rgba(frame: &CapturedFrame) -> Result<Vec<u8>, PipelineError> {
+    let y_size = frame
+        .width
+        .checked_mul(frame.height)
+        .ok_or_else(|| PipelineError::message("NV12 luma byte size overflow"))?;
+    let mut rgba = Vec::with_capacity(frame.width * frame.height * 4);
+    for y in 0..frame.height {
+        let y_row = y * frame.width;
+        let uv_row = y_size + (y / 2) * frame.width;
+        for x in 0..frame.width {
+            let luma = frame.data[y_row + x] as i32;
+            let uv_x = (x / 2) * 2;
+            let u = frame.data[uv_row + uv_x] as i32;
+            let v = frame.data[uv_row + uv_x + 1] as i32;
+            let c = (luma - 16).max(0);
+            let d = u - 128;
+            let e = v - 128;
+            rgba.push(clamp_u8((298 * c + 409 * e + 128) >> 8));
+            rgba.push(clamp_u8((298 * c - 100 * d - 208 * e + 128) >> 8));
+            rgba.push(clamp_u8((298 * c + 516 * d + 128) >> 8));
+            rgba.push(255);
+        }
+    }
+    Ok(rgba)
 }
 
 #[cfg(test)]

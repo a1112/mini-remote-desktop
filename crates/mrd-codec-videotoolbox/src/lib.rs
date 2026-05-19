@@ -7,7 +7,38 @@ use mrd_pipeline_core::{
 mod imp {
     use super::*;
     use shiguredo_video_toolbox as vt;
-    use std::{collections::VecDeque, num::NonZeroU32};
+    use std::{collections::VecDeque, ffi::c_void, num::NonZeroU32, ptr};
+
+    const CV_SUCCESS: i32 = 0;
+    const CV_PIXEL_FORMAT_NV12_VIDEO_RANGE: u32 = u32::from_be_bytes(*b"420v");
+
+    #[link(name = "CoreVideo", kind = "framework")]
+    unsafe extern "C" {
+        fn CVPixelBufferCreate(
+            allocator: *const c_void,
+            width: usize,
+            height: usize,
+            pixel_format_type: u32,
+            pixel_buffer_attributes: *const c_void,
+            pixel_buffer_out: *mut *mut c_void,
+        ) -> i32;
+        fn CVPixelBufferLockBaseAddress(pixel_buffer: *mut c_void, lock_flags: u64) -> i32;
+        fn CVPixelBufferUnlockBaseAddress(pixel_buffer: *mut c_void, lock_flags: u64) -> i32;
+        fn CVPixelBufferGetBaseAddressOfPlane(
+            pixel_buffer: *mut c_void,
+            plane_index: usize,
+        ) -> *mut c_void;
+        fn CVPixelBufferGetBytesPerRowOfPlane(
+            pixel_buffer: *mut c_void,
+            plane_index: usize,
+        ) -> usize;
+        fn CVPixelBufferGetHeightOfPlane(pixel_buffer: *mut c_void, plane_index: usize) -> usize;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFRelease(cf: *const c_void);
+    }
 
     pub struct VideoToolboxH264Encoder {
         encoder: vt::Encoder,
@@ -15,7 +46,7 @@ mod imp {
         height: usize,
         fps: u32,
         frame_index: u64,
-        i420: Vec<u8>,
+        nv12: Vec<u8>,
         timestamps: VecDeque<u64>,
     }
 
@@ -39,7 +70,7 @@ mod imp {
                     profile: vt::H264Profile::Baseline,
                     entropy_mode: vt::H264EntropyMode::Cavlc,
                 }),
-                pixel_format: vt::PixelFormat::I420,
+                pixel_format: vt::PixelFormat::Nv12,
                 average_bitrate: Some(u64::from(bitrate.max(1))),
                 fps_numerator: fps,
                 fps_denominator: 1,
@@ -62,7 +93,7 @@ mod imp {
                 height,
                 fps,
                 frame_index: 0,
-                i420: vec![0; i420_len(width, height)?],
+                nv12: vec![0; nv12_len(width, height)?],
                 timestamps: VecDeque::new(),
             })
         }
@@ -98,28 +129,35 @@ mod imp {
                 )));
             }
 
-            write_i420(frame, &mut self.i420)?;
             let y_size = self.width * self.height;
-            let uv_size = y_size / 4;
-            let (y_plane, chroma) = self.i420.split_at(y_size);
-            let (u_plane, v_plane) = chroma.split_at(uv_size);
+            let expected_nv12 = nv12_len(self.width, self.height)?;
+            let (y_plane, uv_plane) = match frame.pixel_format {
+                FramePixelFormat::Nv12 => {
+                    if frame.data.len() != expected_nv12 {
+                        return Err(PipelineError::message(format!(
+                            "VideoToolbox NV12 frame bytes mismatch: expected {expected_nv12}, got {}",
+                            frame.data.len()
+                        )));
+                    }
+                    frame.data.split_at(y_size)
+                }
+                FramePixelFormat::Bgra32 | FramePixelFormat::Rgba32 | FramePixelFormat::Rgb24 => {
+                    write_nv12(frame, &mut self.nv12)?;
+                    self.nv12.split_at(y_size)
+                }
+            };
             let options = vt::EncodeOptions {
                 force_key_frame: self.frame_index == 0
                     || self.frame_index % u64::from(self.fps) == 0,
             };
 
-            self.encoder
-                .encode(
-                    &vt::FrameData::I420 {
-                        y: y_plane,
-                        u: u_plane,
-                        v: v_plane,
-                    },
-                    &options,
-                )
-                .map_err(|error| {
-                    PipelineError::message(format!("VideoToolbox H.264 encode failed: {error}"))
-                })?;
+            self.encoder.encode_nv12_planes(
+                self.width,
+                self.height,
+                y_plane,
+                uv_plane,
+                &options,
+            )?;
             self.timestamps.push_back(frame.timestamp_us);
             self.frame_index = self.frame_index.wrapping_add(1);
             self.drain_encoded()
@@ -264,6 +302,178 @@ mod imp {
         Ok(out)
     }
 
+    trait VideoToolboxNv12EncodeExt {
+        fn encode_nv12_planes(
+            &mut self,
+            width: usize,
+            height: usize,
+            y_plane: &[u8],
+            uv_plane: &[u8],
+            options: &vt::EncodeOptions,
+        ) -> Result<(), PipelineError>;
+    }
+
+    impl VideoToolboxNv12EncodeExt for vt::Encoder {
+        fn encode_nv12_planes(
+            &mut self,
+            width: usize,
+            height: usize,
+            y_plane: &[u8],
+            uv_plane: &[u8],
+            options: &vt::EncodeOptions,
+        ) -> Result<(), PipelineError> {
+            validate_nv12_planes(width, height, y_plane, uv_plane)?;
+            let mut pixel_buffer = ptr::null_mut();
+            let status = unsafe {
+                CVPixelBufferCreate(
+                    ptr::null(),
+                    width,
+                    height,
+                    CV_PIXEL_FORMAT_NV12_VIDEO_RANGE,
+                    ptr::null(),
+                    &mut pixel_buffer,
+                )
+            };
+            if status != CV_SUCCESS || pixel_buffer.is_null() {
+                return Err(PipelineError::message(format!(
+                    "CVPixelBufferCreate(NV12) failed: status={status}"
+                )));
+            }
+
+            let encode_result = copy_and_encode_nv12_pixel_buffer(
+                self,
+                pixel_buffer,
+                width,
+                height,
+                y_plane,
+                uv_plane,
+                options,
+            );
+            unsafe {
+                CFRelease(pixel_buffer.cast_const());
+            }
+            encode_result
+        }
+    }
+
+    fn validate_nv12_planes(
+        width: usize,
+        height: usize,
+        y_plane: &[u8],
+        uv_plane: &[u8],
+    ) -> Result<(), PipelineError> {
+        let y_size = width
+            .checked_mul(height)
+            .ok_or_else(|| PipelineError::message("NV12 luma plane size overflow"))?;
+        let uv_size = width
+            .checked_mul(height.div_ceil(2))
+            .ok_or_else(|| PipelineError::message("NV12 chroma plane size overflow"))?;
+        if y_plane.len() < y_size {
+            return Err(PipelineError::message(format!(
+                "NV12 luma plane too short: {} < {y_size}",
+                y_plane.len()
+            )));
+        }
+        if uv_plane.len() < uv_size {
+            return Err(PipelineError::message(format!(
+                "NV12 chroma plane too short: {} < {uv_size}",
+                uv_plane.len()
+            )));
+        }
+        Ok(())
+    }
+
+    fn copy_and_encode_nv12_pixel_buffer(
+        encoder: &mut vt::Encoder,
+        pixel_buffer: *mut c_void,
+        width: usize,
+        height: usize,
+        y_plane: &[u8],
+        uv_plane: &[u8],
+        options: &vt::EncodeOptions,
+    ) -> Result<(), PipelineError> {
+        let status = unsafe { CVPixelBufferLockBaseAddress(pixel_buffer, 0) };
+        if status != CV_SUCCESS {
+            return Err(PipelineError::message(format!(
+                "CVPixelBufferLockBaseAddress(NV12) failed: status={status}"
+            )));
+        }
+
+        let copy_result = unsafe {
+            copy_nv12_plane(pixel_buffer, 0, y_plane, width, height)
+                .and_then(|_| copy_nv12_plane(pixel_buffer, 1, uv_plane, width, height.div_ceil(2)))
+        };
+        let unlock_status = unsafe { CVPixelBufferUnlockBaseAddress(pixel_buffer, 0) };
+        if let Err(error) = copy_result {
+            return Err(error);
+        }
+        if unlock_status != CV_SUCCESS {
+            return Err(PipelineError::message(format!(
+                "CVPixelBufferUnlockBaseAddress(NV12) failed: status={unlock_status}"
+            )));
+        }
+
+        unsafe { encoder.encode_pixel_buffer(pixel_buffer, options) }.map_err(|error| {
+            PipelineError::message(format!("VideoToolbox H.264 encode failed: {error}"))
+        })
+    }
+
+    unsafe fn copy_nv12_plane(
+        pixel_buffer: *mut c_void,
+        plane_index: usize,
+        src: &[u8],
+        row_bytes: usize,
+        rows: usize,
+    ) -> Result<(), PipelineError> {
+        let dst = unsafe { CVPixelBufferGetBaseAddressOfPlane(pixel_buffer, plane_index) };
+        if dst.is_null() {
+            return Err(PipelineError::message(format!(
+                "CVPixelBuffer NV12 plane {plane_index} base address is null"
+            )));
+        }
+        let dst_stride = unsafe { CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer, plane_index) };
+        let dst_height = unsafe { CVPixelBufferGetHeightOfPlane(pixel_buffer, plane_index) };
+        if dst_stride < row_bytes {
+            return Err(PipelineError::message(format!(
+                "CVPixelBuffer NV12 plane {plane_index} stride too small: {dst_stride} < {row_bytes}"
+            )));
+        }
+        if dst_height < rows {
+            return Err(PipelineError::message(format!(
+                "CVPixelBuffer NV12 plane {plane_index} height too small: {dst_height} < {rows}"
+            )));
+        }
+        let required = row_bytes
+            .checked_mul(rows)
+            .ok_or_else(|| PipelineError::message("NV12 plane copy size overflow"))?;
+        if src.len() < required {
+            return Err(PipelineError::message(format!(
+                "NV12 plane {plane_index} source too short: {} < {required}",
+                src.len()
+            )));
+        }
+
+        let dst = dst.cast::<u8>();
+        if dst_stride == row_bytes {
+            unsafe {
+                ptr::copy_nonoverlapping(src.as_ptr(), dst, required);
+            }
+        } else {
+            for row in 0..rows {
+                let src_offset = row * row_bytes;
+                let dst_offset = row * dst_stride;
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        src.as_ptr().add(src_offset),
+                        dst.add(dst_offset),
+                        row_bytes,
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn vt_frame_to_core(frame: vt::DecodedFrame<'_>) -> Result<CoreDecodedFrame, PipelineError> {
         match frame {
             vt::DecodedFrame::Nv12(frame) => {
@@ -378,21 +588,25 @@ mod imp {
             .map_err(|_| PipelineError::message(format!("VideoToolbox height too large: {height}")))
     }
 
-    fn i420_len(width: usize, height: usize) -> Result<usize, PipelineError> {
+    fn nv12_len(width: usize, height: usize) -> Result<usize, PipelineError> {
         width
             .checked_mul(height)
-            .and_then(|pixels| pixels.checked_mul(3))
-            .map(|bytes| bytes / 2)
-            .ok_or_else(|| PipelineError::message("VideoToolbox I420 buffer size overflow"))
+            .and_then(|y_size| {
+                width
+                    .checked_mul(height.div_ceil(2))
+                    .and_then(|uv_size| y_size.checked_add(uv_size))
+            })
+            .ok_or_else(|| PipelineError::message("VideoToolbox NV12 buffer size overflow"))
     }
 
-    fn write_i420(frame: &CapturedFrame, out: &mut [u8]) -> Result<(), PipelineError> {
+    fn write_nv12(frame: &CapturedFrame, out: &mut [u8]) -> Result<(), PipelineError> {
         let expected_len = frame
             .width
             .checked_mul(frame.height)
             .and_then(|pixels| match frame.pixel_format {
                 FramePixelFormat::Bgra32 | FramePixelFormat::Rgba32 => pixels.checked_mul(4),
                 FramePixelFormat::Rgb24 => pixels.checked_mul(3),
+                FramePixelFormat::Nv12 => nv12_len(frame.width, frame.height).ok(),
             })
             .ok_or_else(|| PipelineError::message("frame buffer size overflow"))?;
 
@@ -403,21 +617,25 @@ mod imp {
             )));
         }
 
-        let expected_i420 = i420_len(frame.width, frame.height)?;
-        if out.len() != expected_i420 {
+        let expected_nv12 = nv12_len(frame.width, frame.height)?;
+        if out.len() != expected_nv12 {
             return Err(PipelineError::message(format!(
-                "VideoToolbox I420 scratch mismatch: expected {expected_i420}, got {}",
+                "VideoToolbox NV12 scratch mismatch: expected {expected_nv12}, got {}",
                 out.len()
             )));
         }
 
+        if frame.pixel_format == FramePixelFormat::Nv12 {
+            out.copy_from_slice(&frame.data);
+            return Ok(());
+        }
+
         let y_size = frame.width * frame.height;
-        let uv_size = y_size / 4;
-        let (y_plane, uv_planes) = out.split_at_mut(y_size);
-        let (u_plane, v_plane) = uv_planes.split_at_mut(uv_size);
+        let (y_plane, uv_plane) = out.split_at_mut(y_size);
         let bytes_per_pixel = match frame.pixel_format {
             FramePixelFormat::Bgra32 | FramePixelFormat::Rgba32 => 4,
             FramePixelFormat::Rgb24 => 3,
+            FramePixelFormat::Nv12 => unreachable!("NV12 was copied above"),
         };
 
         for block_y in (0..frame.height).step_by(2) {
@@ -433,9 +651,9 @@ mod imp {
                 y_plane[(block_y + 1) * frame.width + block_x + 1] = rgb_to_y(p11);
 
                 let avg = average_rgb([p00, p10, p01, p11]);
-                let uv_index = (block_y / 2) * (frame.width / 2) + (block_x / 2);
-                u_plane[uv_index] = rgb_to_u(avg);
-                v_plane[uv_index] = rgb_to_v(avg);
+                let uv_index = (block_y / 2) * frame.width + block_x;
+                uv_plane[uv_index] = rgb_to_u(avg);
+                uv_plane[uv_index + 1] = rgb_to_v(avg);
             }
         }
 
@@ -455,6 +673,7 @@ mod imp {
                 frame.data[index + 1],
                 frame.data[index + 2],
             ),
+            FramePixelFormat::Nv12 => unreachable!("NV12 is not read as packed RGB"),
         }
     }
 
@@ -613,7 +832,7 @@ mod imp {
         use super::*;
 
         #[test]
-        fn bgra_to_i420_writes_expected_limited_range_planes() {
+        fn bgra_to_nv12_writes_expected_limited_range_planes() {
             let frame = CapturedFrame::from_cpu(
                 2,
                 2,
@@ -625,13 +844,12 @@ mod imp {
                     .take(2 * 2 * 4)
                     .collect(),
             );
-            let mut i420 = vec![0; i420_len(2, 2).expect("i420 size")];
+            let mut nv12 = vec![0; nv12_len(2, 2).expect("nv12 size")];
 
-            write_i420(&frame, &mut i420).expect("convert bgra to i420");
+            write_nv12(&frame, &mut nv12).expect("convert bgra to nv12");
 
-            assert_eq!(&i420[..4], &[82, 82, 82, 82]);
-            assert_eq!(&i420[4..5], &[90]);
-            assert_eq!(&i420[5..], &[240]);
+            assert_eq!(&nv12[..4], &[82, 82, 82, 82]);
+            assert_eq!(&nv12[4..], &[90, 240]);
         }
 
         #[test]

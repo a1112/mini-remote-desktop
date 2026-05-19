@@ -22,6 +22,7 @@ import {
   configureRemoteDisplayNativeSurface,
   currentRemoteDisplayWindowContext,
   ipcMediaPipelineSnapshot,
+  presentRemotePreviewFrameOnNativeSurface,
   presentTestHarnessFrameOnNativeSurface,
   testGetCapabilities,
   testGetRun,
@@ -536,6 +537,7 @@ export function RemoteDisplayWindowPage() {
   const webPreviewPeerRef = useRef<RTCPeerConnection | null>(null);
   const webPreviewSessionRef = useRef<string | null>(null);
   const autoCaptureSourceRequestedRef = useRef<string | null>(null);
+  const nativePreviewFrameKeyRef = useRef<string | null>(null);
   const linuxNativeProfileAppliedRef = useRef(false);
 
   const [context, setContext] = useState<RemoteDisplayWindowContext | null>(null);
@@ -1439,6 +1441,49 @@ export function RemoteDisplayWindowPage() {
       window.clearInterval(interval);
     };
   }, [isLocalPipelinePreview, sessionId, testStatus]);
+
+  useEffect(() => {
+    if (
+      isLocalPipelinePreview ||
+      !isTauriRuntime() ||
+      !isNative ||
+      !nativeSurfaceAttached ||
+      !remoteFrameDataUrl
+    ) {
+      return;
+    }
+
+    const frameKey =
+      probeSnapshot?.last_media_payload_hash ??
+      `${probeSnapshot?.last_media_sequence ?? "unknown"}:${remoteFrameDataUrl.length}`;
+    if (nativePreviewFrameKeyRef.current === frameKey) {
+      return;
+    }
+    nativePreviewFrameKeyRef.current = frameKey;
+
+    let cancelled = false;
+    void presentRemotePreviewFrameOnNativeSurface(remoteFrameDataUrl).then((result) => {
+      if (cancelled) return;
+      if (!result.ok) {
+        setLastError(result.error.message);
+        return;
+      }
+      if (!result.value) {
+        setLastError("Native render surface is not attached");
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    isLocalPipelinePreview,
+    isNative,
+    nativeSurfaceAttached,
+    probeSnapshot?.last_media_payload_hash,
+    probeSnapshot?.last_media_sequence,
+    remoteFrameDataUrl,
+  ]);
 
   const noDragSelector =
     'button, a, input, select, textarea, [role="button"], [data-no-drag="true"]';

@@ -81,6 +81,9 @@ describe('Tauri Adapter Contract', () => {
         rect: { x: 0, y: 44, width: 1280, height: 720 },
       });
       await adapter.presentTestHarnessFrameOnNativeSurface();
+      await adapter.presentRemotePreviewFrameOnNativeSurface(
+        'data:image/png;base64,AAAA'
+      );
       await adapter.closeRemoteDisplayWindow('render-session-1-1');
 
       expect(mockInvoke).toHaveBeenNthCalledWith(1, 'open_remote_display_window', {
@@ -108,7 +111,14 @@ describe('Tauri Adapter Contract', () => {
         'present_test_harness_frame_on_native_surface',
         undefined
       );
-      expect(mockInvoke).toHaveBeenNthCalledWith(6, 'close_remote_display_window', {
+      expect(mockInvoke).toHaveBeenNthCalledWith(
+        6,
+        'present_remote_preview_frame_on_native_surface',
+        {
+          dataUrl: 'data:image/png;base64,AAAA',
+        }
+      );
+      expect(mockInvoke).toHaveBeenNthCalledWith(7, 'close_remote_display_window', {
         label: 'render-session-1-1',
       });
     });

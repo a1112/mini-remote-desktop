@@ -2034,9 +2034,33 @@ impl TestOrchestrator {
             );
         }
 
+        if frame.pixel_format == FramePixelFormat::Nv12 {
+            let expected_len = nv12_frame_len(frame.width, frame.height)
+                .ok_or_else(|| anyhow::anyhow!("captured NV12 frame buffer size overflow"))?;
+            if frame.data.len() != expected_len {
+                anyhow::bail!(
+                    "captured NV12 frame bytes mismatch: expected {}, got {}",
+                    expected_len,
+                    frame.data.len()
+                );
+            }
+            if width == frame.width && height == frame.height {
+                return Ok(frame.clone());
+            }
+            let rgb_frame = CapturedFrame::from_cpu(
+                frame.width,
+                frame.height,
+                FramePixelFormat::Rgb24,
+                frame.timestamp_us,
+                Self::cpu_nv12_to_rgb24(&frame.data, frame.width, frame.height, frame.width),
+            );
+            return Self::openh264_compatible_frame(&rgb_frame);
+        }
+
         let bytes_per_pixel = match frame.pixel_format {
             FramePixelFormat::Bgra32 | FramePixelFormat::Rgba32 => 4,
             FramePixelFormat::Rgb24 => 3,
+            FramePixelFormat::Nv12 => unreachable!("NV12 handled above"),
         };
         let source_stride = frame
             .width
@@ -3189,25 +3213,6 @@ fn window_preview_data_url(
         anyhow::bail!("window preview frame has invalid dimensions");
     }
 
-    let bytes_per_pixel = match frame.pixel_format {
-        FramePixelFormat::Bgra32 | FramePixelFormat::Rgba32 => 4,
-        FramePixelFormat::Rgb24 => 3,
-    };
-    let source_stride = frame
-        .width
-        .checked_mul(bytes_per_pixel)
-        .ok_or_else(|| anyhow::anyhow!("window preview stride overflow"))?;
-    let required_len = source_stride
-        .checked_mul(frame.height)
-        .ok_or_else(|| anyhow::anyhow!("window preview byte size overflow"))?;
-    if frame.data.len() < required_len {
-        anyhow::bail!(
-            "window preview frame is truncated: {} < {}",
-            frame.data.len(),
-            required_len
-        );
-    }
-
     let scale = (max_width as f64 / frame.width as f64)
         .min(max_height as f64 / frame.height as f64)
         .min(1.0);
@@ -3219,26 +3224,70 @@ fn window_preview_data_url(
         .min(max_height);
 
     let mut rgba = Vec::with_capacity(preview_width * preview_height * 4);
-    for y in 0..preview_height {
-        let source_y = y * frame.height / preview_height;
-        for x in 0..preview_width {
-            let source_x = x * frame.width / preview_width;
-            let source_index = source_y * source_stride + source_x * bytes_per_pixel;
-            match frame.pixel_format {
-                FramePixelFormat::Bgra32 => {
-                    rgba.push(frame.data[source_index + 2]);
-                    rgba.push(frame.data[source_index + 1]);
-                    rgba.push(frame.data[source_index]);
-                    rgba.push(frame.data[source_index + 3]);
+    match frame.pixel_format {
+        FramePixelFormat::Nv12 => {
+            let required_len = nv12_frame_len(frame.width, frame.height)
+                .ok_or_else(|| anyhow::anyhow!("window preview NV12 byte size overflow"))?;
+            if frame.data.len() < required_len {
+                anyhow::bail!(
+                    "window preview NV12 frame is truncated: {} < {}",
+                    frame.data.len(),
+                    required_len
+                );
+            }
+            for y in 0..preview_height {
+                let source_y = y * frame.height / preview_height;
+                for x in 0..preview_width {
+                    let source_x = x * frame.width / preview_width;
+                    let (r, g, b) = sample_nv12_rgb(frame, source_x, source_y);
+                    rgba.extend_from_slice(&[r, g, b, 255]);
                 }
-                FramePixelFormat::Rgba32 => {
-                    rgba.extend_from_slice(&frame.data[source_index..source_index + 4]);
-                }
-                FramePixelFormat::Rgb24 => {
-                    rgba.push(frame.data[source_index]);
-                    rgba.push(frame.data[source_index + 1]);
-                    rgba.push(frame.data[source_index + 2]);
-                    rgba.push(255);
+            }
+        }
+        FramePixelFormat::Bgra32 | FramePixelFormat::Rgba32 | FramePixelFormat::Rgb24 => {
+            let bytes_per_pixel = match frame.pixel_format {
+                FramePixelFormat::Bgra32 | FramePixelFormat::Rgba32 => 4,
+                FramePixelFormat::Rgb24 => 3,
+                FramePixelFormat::Nv12 => unreachable!("NV12 handled above"),
+            };
+            let source_stride = frame
+                .width
+                .checked_mul(bytes_per_pixel)
+                .ok_or_else(|| anyhow::anyhow!("window preview stride overflow"))?;
+            let required_len = source_stride
+                .checked_mul(frame.height)
+                .ok_or_else(|| anyhow::anyhow!("window preview byte size overflow"))?;
+            if frame.data.len() < required_len {
+                anyhow::bail!(
+                    "window preview frame is truncated: {} < {}",
+                    frame.data.len(),
+                    required_len
+                );
+            }
+
+            for y in 0..preview_height {
+                let source_y = y * frame.height / preview_height;
+                for x in 0..preview_width {
+                    let source_x = x * frame.width / preview_width;
+                    let source_index = source_y * source_stride + source_x * bytes_per_pixel;
+                    match frame.pixel_format {
+                        FramePixelFormat::Bgra32 => {
+                            rgba.push(frame.data[source_index + 2]);
+                            rgba.push(frame.data[source_index + 1]);
+                            rgba.push(frame.data[source_index]);
+                            rgba.push(frame.data[source_index + 3]);
+                        }
+                        FramePixelFormat::Rgba32 => {
+                            rgba.extend_from_slice(&frame.data[source_index..source_index + 4]);
+                        }
+                        FramePixelFormat::Rgb24 => {
+                            rgba.push(frame.data[source_index]);
+                            rgba.push(frame.data[source_index + 1]);
+                            rgba.push(frame.data[source_index + 2]);
+                            rgba.push(255);
+                        }
+                        FramePixelFormat::Nv12 => unreachable!("NV12 handled above"),
+                    }
                 }
             }
         }
@@ -3258,6 +3307,35 @@ fn window_preview_data_url(
         preview_width as u32,
         preview_height as u32,
     ))
+}
+
+fn nv12_frame_len(width: usize, height: usize) -> Option<usize> {
+    width.checked_mul(height).and_then(|y_size| {
+        width
+            .checked_mul(height.div_ceil(2))
+            .and_then(|uv_size| y_size.checked_add(uv_size))
+    })
+}
+
+fn sample_nv12_rgb(frame: &CapturedFrame, x: usize, y: usize) -> (u8, u8, u8) {
+    let y_size = frame.width * frame.height;
+    let luma = frame.data[y * frame.width + x] as i32;
+    let uv_row = y_size + (y / 2) * frame.width;
+    let uv_x = (x / 2) * 2;
+    let u = frame.data[uv_row + uv_x] as i32;
+    let v = frame.data[uv_row + uv_x + 1] as i32;
+    let c = (luma - 16).max(0);
+    let d = u - 128;
+    let e = v - 128;
+    (
+        clamp_yuv_to_u8((298 * c + 409 * e + 128) >> 8),
+        clamp_yuv_to_u8((298 * c - 100 * d - 208 * e + 128) >> 8),
+        clamp_yuv_to_u8((298 * c + 516 * d + 128) >> 8),
+    )
+}
+
+fn clamp_yuv_to_u8(value: i32) -> u8 {
+    value.clamp(0, 255) as u8
 }
 
 impl Default for TestRunSummary {

@@ -8,7 +8,7 @@ use mrd_pipeline_core::{
 use screencapturekit::{
     cg::CGRect as ScRect,
     cm::SCFrameStatus,
-    cv::CVPixelBufferLockFlags,
+    cv::{CVPixelBufferLockFlags, CVPixelBufferLockGuard},
     prelude::*,
     shareable_content::{SCDisplay, SCWindow},
 };
@@ -19,6 +19,7 @@ use std::{
 };
 
 const BGRA_FOURCC: u32 = u32::from_be_bytes(*b"BGRA");
+const NV12_VIDEO_RANGE_FOURCC: u32 = u32::from_be_bytes(*b"420v");
 const DEFAULT_STREAM_FPS: u32 = 60;
 const DEFAULT_QUEUE_DEPTH: u32 = 4;
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_millis(1_000);
@@ -183,6 +184,12 @@ impl MacosScreenCapture {
         }
         if let Some(capture) = self.screencapturekit.as_mut() {
             capture.set_target_dimensions(width, height);
+        }
+    }
+
+    pub fn set_target_fps(&mut self, fps: u32) {
+        if let Some(capture) = self.screencapturekit.as_mut() {
+            capture.set_target_fps(fps);
         }
     }
 
@@ -626,6 +633,17 @@ impl ScreenCaptureKitCapture {
         self.reset_state();
     }
 
+    fn set_target_fps(&mut self, fps: u32) {
+        let fps = fps.clamp(1, 240);
+        if self.fps == fps {
+            return;
+        }
+
+        self.fps = fps;
+        self.stop_stream();
+        self.reset_state();
+    }
+
     fn capture_frame(&mut self) -> Result<CapturedFrame, PipelineError> {
         let timeout = if self.last_sequence == 0 {
             FIRST_FRAME_TIMEOUT
@@ -696,7 +714,7 @@ impl ScreenCaptureKitCapture {
         let config = SCStreamConfiguration::new()
             .with_width(width)
             .with_height(height)
-            .with_pixel_format(PixelFormat::BGRA)
+            .with_pixel_format(screencapturekit_pixel_format())
             .with_shows_cursor(true)
             .with_scales_to_fit(true)
             .with_queue_depth(self.queue_depth)
@@ -803,12 +821,13 @@ fn handle_screencapturekit_sample(
         return;
     };
 
-    if buffer.pixel_format() != BGRA_FOURCC {
+    let pixel_format = buffer.pixel_format();
+    if pixel_format != BGRA_FOURCC && pixel_format != NV12_VIDEO_RANGE_FOURCC {
         set_screencapturekit_error(
             shared,
             format!(
                 "ScreenCaptureKit returned unsupported pixel format 0x{:08x}",
-                buffer.pixel_format()
+                pixel_format
             ),
         );
         return;
@@ -826,9 +845,16 @@ fn handle_screencapturekit_sample(
     };
     let width = guard.width();
     let height = guard.height();
-    let stride = guard.bytes_per_row();
-    let packed = match repack_bgra(guard.as_slice(), width, height, stride) {
-        Ok(packed) => packed,
+    let frame_result = match pixel_format {
+        BGRA_FOURCC => repack_bgra(guard.as_slice(), width, height, guard.bytes_per_row())
+            .map(|packed| (FramePixelFormat::Bgra32, packed)),
+        NV12_VIDEO_RANGE_FOURCC => {
+            repack_nv12(&guard, width, height).map(|packed| (FramePixelFormat::Nv12, packed))
+        }
+        _ => unreachable!("unsupported ScreenCaptureKit pixel format was checked above"),
+    };
+    let (frame_pixel_format, packed) = match frame_result {
+        Ok(frame) => frame,
         Err(error) => {
             set_screencapturekit_error(
                 shared,
@@ -848,13 +874,7 @@ fn handle_screencapturekit_sample(
         }
     };
 
-    let frame = CapturedFrame::from_cpu(
-        width,
-        height,
-        FramePixelFormat::Bgra32,
-        timestamp_us,
-        packed,
-    );
+    let frame = CapturedFrame::from_cpu(width, height, frame_pixel_format, timestamp_us, packed);
     let (lock, cvar) = &**shared;
     if let Ok(mut state) = lock.lock() {
         state.latest = Some(frame);
@@ -899,6 +919,70 @@ fn repack_bgra(
         packed.extend_from_slice(&frame[start..start + row_bytes]);
     }
     Ok(packed)
+}
+
+fn repack_nv12(
+    guard: &CVPixelBufferLockGuard<'_>,
+    width: usize,
+    height: usize,
+) -> Result<Vec<u8>, PipelineError> {
+    if guard.plane_count() < 2 {
+        return Err(PipelineError::message(format!(
+            "NV12 pixel buffer has {} planes; expected at least 2",
+            guard.plane_count()
+        )));
+    }
+
+    let y_size = width
+        .checked_mul(height)
+        .ok_or_else(|| PipelineError::message("NV12 luma plane size overflow"))?;
+    let uv_height = height.div_ceil(2);
+    let uv_size = width
+        .checked_mul(uv_height)
+        .ok_or_else(|| PipelineError::message("NV12 chroma plane size overflow"))?;
+    let mut packed = vec![0_u8; y_size + uv_size];
+
+    for row_index in 0..height {
+        let row = guard.plane_row(0, row_index).ok_or_else(|| {
+            PipelineError::message(format!("NV12 luma plane row {row_index} is unavailable"))
+        })?;
+        if row.len() < width {
+            return Err(PipelineError::message(format!(
+                "NV12 luma row too short: {} < {width}",
+                row.len()
+            )));
+        }
+        let dst_start = row_index * width;
+        packed[dst_start..dst_start + width].copy_from_slice(&row[..width]);
+    }
+
+    for row_index in 0..uv_height {
+        let row = guard.plane_row(1, row_index).ok_or_else(|| {
+            PipelineError::message(format!("NV12 chroma plane row {row_index} is unavailable"))
+        })?;
+        if row.len() < width {
+            return Err(PipelineError::message(format!(
+                "NV12 chroma row too short: {} < {width}",
+                row.len()
+            )));
+        }
+        let dst_start = y_size + row_index * width;
+        packed[dst_start..dst_start + width].copy_from_slice(&row[..width]);
+    }
+
+    Ok(packed)
+}
+
+fn screencapturekit_pixel_format() -> PixelFormat {
+    match env::var("MRD_MACOS_CAPTURE_PIXEL_FORMAT")
+        .unwrap_or_else(|_| String::from("nv12"))
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "bgra" | "argb" => PixelFormat::BGRA,
+        _ => PixelFormat::YCbCr_420v,
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

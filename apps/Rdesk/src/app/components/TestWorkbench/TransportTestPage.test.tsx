@@ -17,17 +17,15 @@ describe("TransportTestPage execution targets", () => {
         "quic",
         "quic_datagram",
         "quic_datagram_2k144",
-        "quic_datagram_media_v2",
+        "quic_datagram_media_v3",
         "media_profile_control_v1",
         "capture_source_control_v1",
       ],
       protocol_version: 1,
-      media_protocol_version: 2,
+      media_protocol_version: 3,
       media_capabilities: [
-        "dxgi_capture",
-        "nvenc_h264",
-        "nvdec",
-        "d3d11_native_render",
+        "pipewire_capture",
+        "software_decode",
       ],
       age_ms: 80,
       p2p_available: true,
@@ -42,6 +40,7 @@ describe("TransportTestPage execution targets", () => {
       height: 720,
       process_id: 0,
     };
+    let probeSnapshotsServed = 0;
 
     mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
       if (command === "test_get_capabilities") {
@@ -84,6 +83,41 @@ describe("TransportTestPage execution targets", () => {
       if (command === "ipc_select_remote_capture_source") {
         return Promise.resolve({ session_id: args?.sessionId, source, status: "selected" });
       }
+      if (command === "ipc_list_remote_display_modes") {
+        return Promise.resolve([
+          {
+            id: "display-1-720p-60",
+            source_id: "display-1",
+            width: 1280,
+            height: 720,
+            refresh_hz: 60,
+            bit_depth: 32,
+            is_current: false,
+          },
+        ]);
+      }
+      if (command === "ipc_set_remote_display_mode") {
+        return Promise.resolve({
+          session_id: args?.sessionId,
+          requested: args?.mode,
+          previous: null,
+          active: args?.mode,
+          status: "changed",
+          reason: null,
+          restore_required: true,
+        });
+      }
+      if (command === "ipc_restore_remote_display_mode") {
+        return Promise.resolve({
+          session_id: args?.sessionId,
+          requested: null,
+          previous: null,
+          active: null,
+          status: "restored",
+          reason: null,
+          restore_required: false,
+        });
+      }
       if (command === "ipc_start_receiver") return Promise.resolve(args?.sessionId);
       if (command === "open_remote_display_window") {
         return Promise.resolve({
@@ -108,11 +142,15 @@ describe("TransportTestPage execution targets", () => {
         });
       }
       if (command === "ipc_probe_snapshot") {
+        probeSnapshotsServed += 1;
+        const framesDecoded = probeSnapshotsServed <= 1 ? 1 : 88;
+        const framesReceived = probeSnapshotsServed <= 1 ? 1 : 90;
+        const framesDropped = probeSnapshotsServed <= 1 ? 0 : 2;
         return Promise.resolve({
           session_id: args?.sessionId,
-          frames_received: 90,
-          frames_decoded: 88,
-          frames_dropped: 2,
+          frames_received: framesReceived,
+          frames_decoded: framesDecoded,
+          frames_dropped: framesDropped,
           current_fps: 30,
           bitrate_mbps: 5,
           media_probe_valid: true,
@@ -126,9 +164,21 @@ describe("TransportTestPage execution targets", () => {
       if (command === "ipc_media_pipeline_snapshot") {
         return Promise.resolve({
           session_id: args?.sessionId,
-          attached_surfaces: [],
-          active_decoder: "nvdec",
-          active_renderer: "d3d11_native",
+          attached_surfaces: [
+            {
+              surface_id: "surface-1",
+              backend: "linux",
+              window_handle: null,
+            },
+          ],
+          active_decoder: "software",
+          active_renderer: "linux_native",
+          active_codec: "h264",
+          active_pixel_format: "cpu_rgb24",
+          active_width: 1280,
+          active_height: 720,
+          active_fps: 30,
+          active_bitrate_mbps: 5,
           queue_depth: 0,
           dropped_frames: 2,
           stage_metrics: [

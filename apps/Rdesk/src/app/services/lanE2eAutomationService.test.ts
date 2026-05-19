@@ -1059,6 +1059,63 @@ describe("runLanE2EAutomation", () => {
     );
   });
 
+  it("accepts macOS native media capability profiles for QUIC LAN E2E", async () => {
+    const commands = createCommands({
+      ipcRefreshLanDiscovery: vi.fn().mockResolvedValue(
+        ok({
+          enabled: true,
+          running: true,
+          discovery_port: 37777,
+          instance_id: "controller-instance",
+          last_probe_ms: 10,
+          peers: [
+            {
+              device_id: "agent-device",
+              device_name: "Agent Mac",
+              device_type: "desktop",
+              ip: "192.168.1.24",
+              discovery_port: 37777,
+              p2p_control_addr: "192.168.1.24:37778",
+              transports: [
+                "quic",
+                "quic_datagram",
+                "quic_datagram_2k144",
+                "quic_datagram_media_v2",
+                "quic_datagram_media_v3",
+                "media_profile_control_v1",
+              ],
+              protocol_version: 1,
+              service_build_id: "test-build",
+              media_protocol_version: 3,
+              media_capabilities: [
+                "quic_datagram_media_v3",
+                "macos_capture",
+                "videotoolbox_h264",
+                "videotoolbox",
+                "macos_native_render",
+              ],
+              age_ms: 10,
+              p2p_available: true,
+            },
+          ],
+        })
+      ),
+    });
+
+    const result = await runLanE2EAutomation(commands, {
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => "lan-e2e-test-session",
+    });
+
+    expect(result.status).toBe("completed");
+    expect(commands.ipcStartLanRemoteSession).toHaveBeenCalled();
+  });
+
   it("skips paired media canaries when the LAN peer build does not match", async () => {
     const commands = createCommands();
 

@@ -28,6 +28,8 @@ pub enum FramePixelFormat {
     Bgra32,
     Rgba32,
     Rgb24,
+    /// CPU-backed NV12, tightly packed as Y plane followed by interleaved UV.
+    Nv12,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
