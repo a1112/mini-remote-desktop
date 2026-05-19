@@ -292,6 +292,11 @@ async fn run_media_adaptation_task(
             stable_since = None;
             pending_downshift_reason = None;
             pending_downshift_windows = 0;
+            let settling_reason = if is_initial_safe_start_ladder_index(&ladder, ladder_index) {
+                "initial adaptive safe-start settling"
+            } else {
+                "initial adaptive profile settling"
+            };
             update_adaptation_snapshot(
                 &app_state,
                 &session_id,
@@ -299,7 +304,7 @@ async fn run_media_adaptation_task(
                 ladder_index,
                 observation,
                 "settling",
-                Some("initial adaptive profile settling".to_string()),
+                Some(settling_reason.to_string()),
             )
             .await;
             counters = next_counters;
@@ -1013,6 +1018,10 @@ fn initial_ladder_index_for_profile(ladder: &[MediaProfile], current_index: usiz
     }
 }
 
+fn is_initial_safe_start_ladder_index(ladder: &[MediaProfile], ladder_index: usize) -> bool {
+    ladder_index > 0 && initial_ladder_index_for_profile(ladder, 0) == ladder_index
+}
+
 fn default_ceiling_profile() -> MediaProfile {
     MediaProfile {
         width: DEFAULT_CEILING_WIDTH,
@@ -1216,6 +1225,7 @@ mod tests {
             ),
             1
         );
+        assert!(is_initial_safe_start_ladder_index(&ladder, 1));
     }
 
     #[test]
@@ -1235,6 +1245,8 @@ mod tests {
             ),
             0
         );
+        assert!(!is_initial_safe_start_ladder_index(&ladder, 0));
+        assert!(!is_initial_safe_start_ladder_index(&ladder, 1));
     }
 
     #[test]
