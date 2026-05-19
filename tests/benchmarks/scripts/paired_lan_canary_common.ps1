@@ -9,6 +9,21 @@ function Select-CanaryValue {
   $Value
 }
 
+function Select-CanaryObjectPropertyValue {
+  param($Object, [string]$Name, $Fallback)
+  if ($null -eq $Object) { return $Fallback }
+  $property = $Object.PSObject.Properties[$Name]
+  if ($null -eq $property) { return $Fallback }
+  Select-CanaryValue $property.Value $Fallback
+}
+
+function Select-CanarySenderSendStageValue {
+  param($StageMap, $Fallback)
+  $datagram = Select-CanaryObjectPropertyValue $StageMap "sender.send_datagram" $null
+  if ($null -ne $datagram) { return $datagram }
+  Select-CanaryObjectPropertyValue $StageMap "sender.send_reliable" $Fallback
+}
+
 function Normalize-CanaryCodec {
   param([string]$Codec)
 
@@ -557,8 +572,8 @@ function Write-CanaryJsonAndMarkdown {
     $visual = Select-CanaryValue $row.visual_integrity_status "n/a"
     $encodeP50 = [Math]::Round([double](Select-CanaryValue $row.stage_p50_ms.'sender.encode' 0), 2)
     $encodeP95 = [Math]::Round([double](Select-CanaryValue $row.stage_p95_ms.'sender.encode' 0), 2)
-    $sendP50 = [Math]::Round([double](Select-CanaryValue $row.stage_p50_ms.'sender.send_datagram' 0), 2)
-    $sendP95 = [Math]::Round([double](Select-CanaryValue $row.stage_p95_ms.'sender.send_datagram' 0), 2)
+    $sendP50 = [Math]::Round([double](Select-CanarySenderSendStageValue -StageMap $row.stage_p50_ms -Fallback 0), 2)
+    $sendP95 = [Math]::Round([double](Select-CanarySenderSendStageValue -StageMap $row.stage_p95_ms -Fallback 0), 2)
     $probeDrops = Select-CanaryValue $row.probe_dropped_frames $row.dropped_frames
     $renderCoalesce = Select-CanaryValue $row.render_queue_replacements 0
     $renderDrops = Select-CanaryValue $row.render_lock_drops 0
