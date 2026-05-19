@@ -69,6 +69,9 @@ const LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_BITRATE_MBPS: u32 = 120;
 const LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_FPS: u32 = 120;
 const LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES: usize = 4 * 1024 * 1024;
 const LAN_QUIC_RELIABLE_MEDIA_RETRY_DELAY: Duration = Duration::from_millis(10);
+const LAN_QUIC_DATAGRAM_SEND_BUDGET_MIN_BITRATE_MBPS: u32 = 80;
+const LAN_QUIC_DATAGRAM_SEND_BUDGET_MIN_FPS: u32 = 120;
+const LAN_QUIC_DATAGRAM_SEND_BUDGET: Duration = Duration::from_millis(3);
 const LAN_MEDIA_HIGH_RESOLUTION_TIMER_MIN_FPS: u32 = 90;
 const LAN_MEDIA_HIGH_RESOLUTION_TIMER_PERIOD_MS: u32 = 1;
 const LAN_MEDIA_PRECISE_SLEEP_MIN_FPS: u32 = 90;
@@ -3279,7 +3282,15 @@ async fn send_quic_media_loop(
             } else {
                 let best_effort_datagrams = use_best_effort_media_datagrams(&profile);
                 let datagram_send_started = Instant::now();
+                let datagram_send_deadline =
+                    lan_datagram_frame_send_budget(&profile, reliable_media_enabled)
+                        .and_then(|budget| datagram_send_started.checked_add(budget));
                 for fragment in &fragments {
+                    let remaining_send_budget = datagram_send_deadline
+                        .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+                    if remaining_send_budget.is_some_and(|remaining| remaining.is_zero()) {
+                        break;
+                    }
                     let decision = test_impairment.next_datagram_decision();
                     if decision.drop_datagram {
                         continue;
@@ -3295,6 +3306,7 @@ async fn send_quic_media_loop(
                                 &delayed_endpoint,
                                 delayed_fragment,
                                 !best_effort_datagrams,
+                                None,
                             )
                             .await;
                             if let Err(error) = send_result {
@@ -3312,13 +3324,20 @@ async fn send_quic_media_loop(
                         &endpoint,
                         fragment.clone(),
                         !best_effort_datagrams,
+                        remaining_send_budget,
                     )
                     .await;
-                    if let Err(error) = send_fragment_result {
-                        send_result = Err(error).with_context(|| {
-                            format!("failed to send LAN QUIC media frame {}", frame_id)
-                        });
-                        break;
+                    match send_fragment_result {
+                        Ok(LanDatagramSendOutcome::Sent) => {}
+                        Ok(LanDatagramSendOutcome::DroppedForCapacity) => {
+                            break;
+                        }
+                        Err(error) => {
+                            send_result = Err(error).with_context(|| {
+                                format!("failed to send LAN QUIC media frame {}", frame_id)
+                            });
+                            break;
+                        }
                     }
                 }
                 sender_stats.record_elapsed("sender.send_datagram", datagram_send_started);
@@ -3703,23 +3722,58 @@ fn lan_media_datagram_size(
     negotiated_max_datagram_size.min(safe_cap).max(minimum)
 }
 
+fn lan_datagram_frame_send_budget(
+    profile: &MediaProfile,
+    reliable_media_enabled: bool,
+) -> Option<Duration> {
+    if reliable_media_enabled
+        && profile.fps >= LAN_QUIC_DATAGRAM_SEND_BUDGET_MIN_FPS
+        && profile.bitrate_mbps >= LAN_QUIC_DATAGRAM_SEND_BUDGET_MIN_BITRATE_MBPS
+    {
+        Some(LAN_QUIC_DATAGRAM_SEND_BUDGET)
+    } else {
+        None
+    }
+}
+
+enum LanDatagramSendOutcome {
+    Sent,
+    DroppedForCapacity,
+}
+
 async fn send_lan_media_datagram(
     endpoint: &QuinnDatagramEndpoint,
     fragment: bytes::Bytes,
     wait_for_capacity: bool,
-) -> Result<()> {
+    wait_timeout: Option<Duration>,
+) -> Result<LanDatagramSendOutcome> {
     if !wait_for_capacity {
-        return endpoint
+        endpoint
             .send_datagram(fragment)
-            .context("failed to send LAN QUIC media datagram");
+            .context("failed to send LAN QUIC media datagram")?;
+        return Ok(LanDatagramSendOutcome::Sent);
     }
 
     match endpoint.send_datagram(fragment.clone()) {
-        Ok(()) => Ok(()),
-        Err(_) => endpoint
-            .send_datagram_wait(fragment)
-            .await
-            .context("failed to send LAN QUIC media datagram after waiting for capacity"),
+        Ok(()) => Ok(LanDatagramSendOutcome::Sent),
+        Err(_) => {
+            let Some(timeout) = wait_timeout else {
+                endpoint
+                    .send_datagram_wait(fragment)
+                    .await
+                    .context("failed to send LAN QUIC media datagram after waiting for capacity")?;
+                return Ok(LanDatagramSendOutcome::Sent);
+            };
+            if timeout.is_zero() {
+                return Ok(LanDatagramSendOutcome::DroppedForCapacity);
+            }
+            match tokio::time::timeout(timeout, endpoint.send_datagram_wait(fragment)).await {
+                Ok(Ok(())) => Ok(LanDatagramSendOutcome::Sent),
+                Ok(Err(error)) => Err(error)
+                    .context("failed to send LAN QUIC media datagram after waiting for capacity"),
+                Err(_) => Ok(LanDatagramSendOutcome::DroppedForCapacity),
+            }
+        }
     }
 }
 
@@ -8213,6 +8267,34 @@ mod tests {
         assert!(use_best_effort_media_datagrams(&low_latency));
         assert!(!use_best_effort_media_datagrams(&high_quality_2k144));
         assert!(!use_best_effort_media_datagrams(&high_bitrate));
+    }
+
+    #[test]
+    fn high_refresh_datagram_send_budget_requires_reliable_media() {
+        let high_refresh = MediaProfile {
+            width: 2560,
+            height: 1600,
+            fps: 144,
+            bitrate_mbps: 96,
+            codec: "hevc".to_string(),
+            ..MediaProfile::default()
+        };
+        let low_bitrate = MediaProfile {
+            bitrate_mbps: 40,
+            ..high_refresh.clone()
+        };
+        let low_refresh = MediaProfile {
+            fps: 60,
+            ..high_refresh.clone()
+        };
+
+        assert_eq!(
+            lan_datagram_frame_send_budget(&high_refresh, true),
+            Some(LAN_QUIC_DATAGRAM_SEND_BUDGET)
+        );
+        assert_eq!(lan_datagram_frame_send_budget(&high_refresh, false), None);
+        assert_eq!(lan_datagram_frame_send_budget(&low_bitrate, true), None);
+        assert_eq!(lan_datagram_frame_send_budget(&low_refresh, true), None);
     }
 
     #[test]
