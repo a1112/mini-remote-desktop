@@ -19,9 +19,9 @@ function Select-CanaryObjectPropertyValue {
 
 function Select-CanarySenderSendStageValue {
   param($StageMap, $Fallback)
-  $datagram = Select-CanaryObjectPropertyValue $StageMap "sender.send_datagram" $null
-  if ($null -ne $datagram) { return $datagram }
-  Select-CanaryObjectPropertyValue $StageMap "sender.send_reliable" $Fallback
+  $reliable = Select-CanaryObjectPropertyValue $StageMap "sender.send_reliable" $null
+  if ($null -ne $reliable) { return $reliable }
+  Select-CanaryObjectPropertyValue $StageMap "sender.send_datagram" $Fallback
 }
 
 function Normalize-CanaryCodec {

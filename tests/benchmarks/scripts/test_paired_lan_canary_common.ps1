@@ -243,6 +243,7 @@ $reliableSendReport = [pscustomobject]@{
     queue_depth = 0
     stage_metrics = @(
       [pscustomobject]@{ stage = "sender.encode"; p50_ms = 0.4; p95_ms = 0.8 },
+      [pscustomobject]@{ stage = "sender.send_datagram"; p50_ms = 0.04; p95_ms = 0.06 },
       [pscustomobject]@{ stage = "sender.send_reliable"; p50_ms = 2.1; p95_ms = 5.4 }
     )
     test_impairment = $null
@@ -254,8 +255,8 @@ $reliableSendReport = [pscustomobject]@{
 $profile1600p165120 = [pscustomobject]@{ id = "1600p165_120mbps"; width = 2560; height = 1600; fps = 165; bitrate_mbps = 120; duration_secs = 30 }
 $reliableSendRow = Convert-CrossReportToCanaryRow -Profile $profile1600p165120 -Report $reliableSendReport -ReportPath "raw/cross-1600p165-120.json"
 Assert-Equal $reliableSendRow.stage_p50_ms.'sender.send_reliable' 2.1 "Reliable HEVC row exposes sender reliable-send P50"
-Assert-Equal (Select-CanarySenderSendStageValue -StageMap $reliableSendRow.stage_p50_ms -Fallback 0) 2.1 "Report send P50 falls back to reliable send"
-Assert-Equal (Select-CanarySenderSendStageValue -StageMap $reliableSendRow.stage_p95_ms -Fallback 0) 5.4 "Report send P95 falls back to reliable send"
+Assert-Equal (Select-CanarySenderSendStageValue -StageMap $reliableSendRow.stage_p50_ms -Fallback 0) 2.1 "Report send P50 prefers reliable send when present"
+Assert-Equal (Select-CanarySenderSendStageValue -StageMap $reliableSendRow.stage_p95_ms -Fallback 0) 5.4 "Report send P95 prefers reliable send when present"
 
 $renderDropReport = [pscustomobject]@{
   status = "completed"
