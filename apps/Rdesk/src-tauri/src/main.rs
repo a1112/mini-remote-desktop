@@ -699,8 +699,33 @@ fn present_test_harness_frame_on_native_surface(
     present_native_probe_frame(target)
 }
 
+#[tauri::command]
+fn present_remote_preview_frame_on_native_surface(
+    window: WebviewWindow,
+    state: tauri::State<'_, AppState>,
+    data_url: String,
+) -> Result<bool, String> {
+    let label = window.label().to_string();
+    let target = state
+        .remote_display_surfaces
+        .lock()
+        .unwrap()
+        .render_target_handle(&label);
+    let Some(target) = target else {
+        return Ok(false);
+    };
+
+    let frame = render_frame_from_png_data_url(&data_url)?;
+    present_native_frame(target, frame)
+}
+
 #[cfg(target_os = "macos")]
 fn present_native_probe_frame(target: isize) -> Result<bool, String> {
+    present_native_frame(target, build_native_probe_frame(640, 360))
+}
+
+#[cfg(target_os = "macos")]
+fn present_native_frame(target: isize, frame: mrd_render::RenderFrame) -> Result<bool, String> {
     use mrd_render::{RenderTarget, RendererFactory};
 
     let factory = mrd_render_macos::MacosRendererFactory;
@@ -711,7 +736,7 @@ fn present_native_probe_frame(target: isize) -> Result<bool, String> {
         .attach_target(RenderTarget::WindowHandle(target))
         .map_err(|error| format!("attach Metal probe renderer failed: {error}"))?;
     renderer
-        .upload_frame(build_native_probe_frame(640, 360))
+        .upload_frame(frame)
         .map_err(|error| format!("present Metal probe frame failed: {error}"))?;
 
     let snapshot = renderer.snapshot();
@@ -720,6 +745,11 @@ fn present_native_probe_frame(target: isize) -> Result<bool, String> {
 
 #[cfg(windows)]
 fn present_native_probe_frame(target: isize) -> Result<bool, String> {
+    present_native_frame(target, build_native_probe_frame(640, 360))
+}
+
+#[cfg(windows)]
+fn present_native_frame(target: isize, frame: mrd_render::RenderFrame) -> Result<bool, String> {
     use mrd_render::{RenderTarget, RendererFactory};
 
     let factory = mrd_render_d3d11::D3d11RendererFactory;
@@ -730,7 +760,7 @@ fn present_native_probe_frame(target: isize) -> Result<bool, String> {
         .attach_target(RenderTarget::WindowHandle(target))
         .map_err(|error| format!("attach D3D11 probe renderer failed: {error}"))?;
     renderer
-        .upload_frame(build_native_probe_frame(640, 360))
+        .upload_frame(frame)
         .map_err(|error| format!("present D3D11 probe frame failed: {error}"))?;
 
     let snapshot = renderer.snapshot();
@@ -739,6 +769,11 @@ fn present_native_probe_frame(target: isize) -> Result<bool, String> {
 
 #[cfg(target_os = "linux")]
 fn present_native_probe_frame(target: isize) -> Result<bool, String> {
+    present_native_frame(target, build_native_probe_frame(640, 360))
+}
+
+#[cfg(target_os = "linux")]
+fn present_native_frame(target: isize, frame: mrd_render::RenderFrame) -> Result<bool, String> {
     use mrd_render::{RenderTarget, RendererFactory};
 
     let factory = mrd_render_linux::LinuxRendererFactory;
@@ -749,7 +784,7 @@ fn present_native_probe_frame(target: isize) -> Result<bool, String> {
         .attach_target(RenderTarget::WindowHandle(target))
         .map_err(|error| format!("attach Linux probe renderer failed: {error}"))?;
     renderer
-        .upload_frame(build_native_probe_frame(640, 360))
+        .upload_frame(frame)
         .map_err(|error| format!("present Linux probe frame failed: {error}"))?;
 
     let snapshot = renderer.snapshot();
@@ -759,6 +794,32 @@ fn present_native_probe_frame(target: isize) -> Result<bool, String> {
 #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 fn present_native_probe_frame(_target: isize) -> Result<bool, String> {
     Ok(false)
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+fn present_native_frame(_target: isize, _frame: mrd_render::RenderFrame) -> Result<bool, String> {
+    Ok(false)
+}
+
+fn render_frame_from_png_data_url(data_url: &str) -> Result<mrd_render::RenderFrame, String> {
+    use base64::Engine;
+
+    let encoded = data_url
+        .trim()
+        .strip_prefix("data:image/png;base64,")
+        .ok_or_else(|| "remote preview frame is not a PNG data URL".to_string())?;
+    let png = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|error| format!("decode remote preview data URL failed: {error}"))?;
+    let image = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
+        .map_err(|error| format!("decode remote preview PNG failed: {error}"))?
+        .to_rgb8();
+    let (width, height) = image.dimensions();
+    Ok(mrd_render::RenderFrame::from_rgb24(
+        width as usize,
+        height as usize,
+        image.into_raw(),
+    ))
 }
 
 fn build_native_probe_frame(width: usize, height: usize) -> mrd_render::RenderFrame {
@@ -2016,6 +2077,26 @@ mod frame_encoding_tests {
         assert_eq!(frame.pixel_format, mrd_render::RenderPixelFormat::Bgra32);
         assert_eq!(frame.as_bgra32().unwrap().len(), 64 * 48 * 4);
     }
+
+    #[test]
+    fn png_data_url_is_decoded_as_rgb_render_frame() {
+        let image = image::RgbImage::from_raw(1, 1, vec![10, 20, 30]).unwrap();
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let data_url = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(png.into_inner())
+        );
+
+        let frame = render_frame_from_png_data_url(&data_url).unwrap();
+
+        assert_eq!(frame.width, 1);
+        assert_eq!(frame.height, 1);
+        assert_eq!(frame.pixel_format, mrd_render::RenderPixelFormat::Rgb24);
+        assert_eq!(frame.as_rgb24(), Some(&[10, 20, 30][..]));
+    }
 }
 
 // ============================================================================
@@ -2796,6 +2877,7 @@ fn main() {
             browser_webrtc_preview_stop,
             configure_remote_display_native_surface,
             present_test_harness_frame_on_native_surface,
+            present_remote_preview_frame_on_native_surface,
             get_client_diagnostics,
             open_diagnostics_folder,
             automation_write_report,

@@ -207,6 +207,14 @@ export async function presentTestHarnessFrameOnNativeSurface(): Promise<AdapterR
   return invokeAdapter<boolean>('present_test_harness_frame_on_native_surface');
 }
 
+export async function presentRemotePreviewFrameOnNativeSurface(
+  dataUrl: string
+): Promise<AdapterResult<boolean>> {
+  return invokeAdapter<boolean>('present_remote_preview_frame_on_native_surface', {
+    dataUrl,
+  });
+}
+
 export async function browserWebrtcPreviewStart(params: {
   sessionId: string;
   offerSdp: string;

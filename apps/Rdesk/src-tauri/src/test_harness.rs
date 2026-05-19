@@ -3120,6 +3120,11 @@ fn captured_frame_to_render_frame(frame: &CapturedFrame) -> RenderFrame {
             frame.height,
             rgba32_to_bgra32(&frame.data, frame.width, frame.height),
         ),
+        FramePixelFormat::Nv12 => RenderFrame::from_rgb24(
+            frame.width,
+            frame.height,
+            cpu_nv12_to_rgb24(&frame.data, frame.width, frame.height, frame.width),
+        ),
     }
 }
 
@@ -3487,6 +3492,18 @@ fn adapt_frame_dimensions_into(
     target_height: usize,
     scratch: &mut Option<CapturedFrame>,
 ) {
+    if frame.pixel_format == FramePixelFormat::Nv12 {
+        let rgb_frame = CapturedFrame::from_cpu(
+            frame.width,
+            frame.height,
+            FramePixelFormat::Rgb24,
+            frame.timestamp_us,
+            cpu_nv12_to_rgb24(&frame.data, frame.width, frame.height, frame.width),
+        );
+        adapt_frame_dimensions_into(&rgb_frame, target_width, target_height, scratch);
+        return;
+    }
+
     let bytes_per_pixel = bytes_per_pixel(frame.pixel_format);
     let required_len = target_width * target_height * bytes_per_pixel;
     let output = scratch.get_or_insert_with(|| {
@@ -3671,6 +3688,7 @@ fn bytes_per_pixel(format: FramePixelFormat) -> usize {
     match format {
         FramePixelFormat::Bgra32 | FramePixelFormat::Rgba32 => 4,
         FramePixelFormat::Rgb24 => 3,
+        FramePixelFormat::Nv12 => 0,
     }
 }
 

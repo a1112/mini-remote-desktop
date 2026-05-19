@@ -9,6 +9,8 @@ use mrd_ipc::{
     LanPeerInfo, MediaProfile, MediaProfileNegotiation, MediaStageMetrics,
     MediaTestImpairmentSnapshot,
 };
+#[cfg(target_os = "macos")]
+use mrd_pipeline_core::FrameCapture;
 use mrd_pipeline_core::{
     CapturedFrame, DecodedFrame, DecodedFrameData, FramePixelFormat, VideoDecoder, VideoEncoder,
 };
@@ -26,8 +28,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Condvar as StdCondvar, Mutex as StdMutex};
+use std::thread;
+use std::time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, Notify};
 use tokio::time::{interval, sleep_until, timeout, Instant};
@@ -42,6 +45,8 @@ const LAN_TEST_IMPAIRMENT_JITTER_MS_ENV: &str = "MRD_LAN_TEST_IMPAIRMENT_JITTER_
 const LAN_TEST_IMPAIRMENT_MTU_BYTES_ENV: &str = "MRD_LAN_TEST_IMPAIRMENT_MTU_BYTES";
 const LAN_TEST_IMPAIRMENT_SEED_ENV: &str = "MRD_LAN_TEST_IMPAIRMENT_SEED";
 const LAN_RELIABLE_WHOLE_FRAME_ENV: &str = "MRD_LAN_RELIABLE_WHOLE_FRAME";
+#[cfg(target_os = "macos")]
+const LAN_CAPTURE_PUMP_ENV: &str = "MRD_LAN_CAPTURE_PUMP";
 const PROTOCOL_VERSION: u32 = 1;
 const ANNOUNCE_INTERVAL_SECS: u64 = 3;
 const PEER_TTL_SECS: u64 = 12;
@@ -76,10 +81,20 @@ const LAN_DECODE_NVDEC_HEVC_CAPABILITY: &str = "decode.nvdec_hevc";
 const LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY: &str = "media.hevc_main_420_8bit";
 const LAN_RENDER_D3D11_NATIVE_CAPABILITY: &str = "d3d11_native_render";
 const LAN_RENDER_D3D11_SHARED_NV12_CAPABILITY: &str = "render.d3d11_shared_nv12";
+const LAN_CAPTURE_MACOS_CAPABILITY: &str = "macos_capture";
+const LAN_ENCODE_VIDEOTOOLBOX_H264_CAPABILITY: &str = "videotoolbox_h264";
+const LAN_DECODE_VIDEOTOOLBOX_CAPABILITY: &str = "videotoolbox";
+const LAN_RENDER_MACOS_NATIVE_CAPABILITY: &str = "macos_native_render";
 const LAN_MEDIA_SENDER_MAX_CONSECUTIVE_FRAME_ERRORS: u32 = 8;
 const LAN_MEDIA_SENDER_ERROR_LOG_INTERVAL: u32 = 3;
 const LAN_MEDIA_RECEIVER_MAX_CONSECUTIVE_DECODE_ERRORS: u32 = 8;
 const LAN_MEDIA_RECEIVER_DECODE_ERROR_LOG_INTERVAL: u32 = 3;
+#[cfg(target_os = "macos")]
+const LAN_CAPTURE_PUMP_QUEUE_CAPACITY: usize = 2;
+#[cfg(target_os = "macos")]
+const LAN_CAPTURE_PUMP_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(target_os = "macos")]
+const LAN_CAPTURE_PUMP_ERROR_BACKOFF: Duration = Duration::from_millis(5);
 const LAN_MEDIA_REASSEMBLER_FRAME_TIMEOUT_MS: u64 = 1_500;
 const LAN_MEDIA_REASSEMBLER_MAX_PENDING_FRAMES: usize = 256;
 const LAN_MEDIA_RECEIVER_REORDER_MAX_PENDING_FRAMES: usize = 8;
@@ -2293,10 +2308,28 @@ fn lan_media_capabilities() -> Vec<String> {
             crate::display_mode::capability_name().to_string(),
         ]);
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        capabilities.extend([
+            LAN_CAPTURE_MACOS_CAPABILITY.to_string(),
+            LAN_ENCODE_VIDEOTOOLBOX_H264_CAPABILITY.to_string(),
+            LAN_DECODE_VIDEOTOOLBOX_CAPABILITY.to_string(),
+            LAN_RENDER_MACOS_NATIVE_CAPABILITY.to_string(),
+            "openh264_fallback".to_string(),
+            "software_decode".to_string(),
+        ]);
+    }
+    #[cfg(target_os = "linux")]
     {
         capabilities.extend([
             "pipewire_capture".to_string(),
+            "openh264_fallback".to_string(),
+            "software_decode".to_string(),
+        ]);
+    }
+    #[cfg(all(not(windows), not(target_os = "macos"), not(target_os = "linux")))]
+    {
+        capabilities.extend([
             "openh264_fallback".to_string(),
             "software_decode".to_string(),
         ]);
@@ -2744,7 +2777,7 @@ async fn send_quic_media_loop(
 
     let mut frame_id = 1_u64;
     let mut active_capture_config: Option<LanCaptureConfigKey> = None;
-    let mut capture: Option<LanFrameCapture> = None;
+    let mut capture: Option<LanSenderFrameCapture> = None;
     let mut encoder: Option<LanSenderEncoder> = None;
     let mut encoder_config: Option<(usize, usize, u32, u32, LanAccessUnitCodec)> = None;
     let mut consecutive_frame_errors = 0_u32;
@@ -2790,14 +2823,32 @@ async fn send_quic_media_loop(
         let source_id = selected_capture_source_id(&app_state, &session_id).await?;
         if !lan_capture_config_matches(active_capture_config.as_ref(), &source_id, &profile) {
             match create_lan_frame_capture(&source_id, &profile).await {
-                Ok(next_capture) => {
-                    capture = Some(next_capture);
-                    encoder = None;
-                    encoder_config = None;
-                    active_capture_config = Some(lan_capture_config_key(&source_id, &profile));
-                    consecutive_frame_errors = 0;
-                    set_session_last_error(&app_state, &session_id, None).await;
-                }
+                Ok(next_capture) => match LanSenderFrameCapture::new(next_capture) {
+                    Ok(next_sender_capture) => {
+                        capture = Some(next_sender_capture);
+                        encoder = None;
+                        encoder_config = None;
+                        active_capture_config = Some(lan_capture_config_key(&source_id, &profile));
+                        consecutive_frame_errors = 0;
+                        set_session_last_error(&app_state, &session_id, None).await;
+                    }
+                    Err(error) => {
+                        capture = None;
+                        encoder = None;
+                        encoder_config = None;
+                        active_capture_config = None;
+                        handle_media_sender_frame_error(
+                            &app_state,
+                            &session_id,
+                            &source_id,
+                            &mut consecutive_frame_errors,
+                            format!("failed to initialize LAN capture sender: {error:#}"),
+                            false,
+                        )
+                        .await?;
+                        continue;
+                    }
+                },
                 Err(error) => {
                     capture = None;
                     encoder = None;
@@ -3356,6 +3407,14 @@ fn create_lan_h264_encoder(
             )
             .map(|encoder| Box::new(encoder) as Box<dyn VideoEncoder + Send>)
             .map_err(|error| anyhow::anyhow!(error.to_string())),
+            #[cfg(target_os = "macos")]
+            "videotoolbox_h264" => {
+                mrd_codec_videotoolbox::VideoToolboxH264Encoder::new_with_bitrate(
+                    width, height, fps, bitrate,
+                )
+                .map(|encoder| Box::new(encoder) as Box<dyn VideoEncoder + Send>)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))
+            }
             "openh264" => OpenH264Encoder::new_with_bitrate(width, height, fps, bitrate)
                 .map(|encoder| Box::new(encoder) as Box<dyn VideoEncoder + Send>)
                 .map_err(|error| anyhow::anyhow!(error.to_string())),
@@ -3382,9 +3441,14 @@ fn preferred_lan_h264_encoder_backends() -> &'static [&'static str] {
     &["nvenc_h264", "openh264"]
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn preferred_lan_h264_encoder_backends() -> &'static [&'static str] {
     &["openh264"]
+}
+
+#[cfg(target_os = "macos")]
+fn preferred_lan_h264_encoder_backends() -> &'static [&'static str] {
+    &["videotoolbox_h264", "openh264"]
 }
 
 async fn handle_media_sender_frame_error(
@@ -3585,6 +3649,21 @@ fn reliable_whole_frame_media_override() -> Option<bool> {
 }
 
 fn reliable_whole_frame_media_override_from_env_value(value: Option<&str>) -> Option<bool> {
+    match value?.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        "" => None,
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn lan_capture_pump_enabled() -> bool {
+    env_bool_override(std::env::var(LAN_CAPTURE_PUMP_ENV).ok().as_deref()).unwrap_or(true)
+}
+
+#[cfg(target_os = "macos")]
+fn env_bool_override(value: Option<&str>) -> Option<bool> {
     match value?.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
         "0" | "false" | "no" | "off" => Some(false),
@@ -4490,7 +4569,7 @@ async fn create_lan_receiver_decoder_with_preference(
     let mut last_error = None;
     let selected_profile = selected_media_profile(app_state, session_id).await;
     for backend in lan_receiver_decoder_candidates(codec, preferred_backend) {
-        match mrd_decode::create_decoder(backend) {
+        match create_lan_video_decoder(backend) {
             Ok(decoder) => {
                 let mut pipelines = app_state.media_pipelines.lock().await;
                 pipelines.set_active_decoder(session_id.clone(), backend);
@@ -4529,7 +4608,7 @@ async fn try_decode_h264_keyframe_with_fallback(
         .into_iter()
         .filter(|backend| *backend != failed_backend)
     {
-        let mut decoder = match mrd_decode::create_decoder(backend) {
+        let mut decoder = match create_lan_video_decoder(backend) {
             Ok(decoder) => decoder,
             Err(error) => {
                 errors.push(format!("{backend}: create failed: {error}"));
@@ -4570,6 +4649,17 @@ async fn try_decode_h264_keyframe_with_fallback(
     )
 }
 
+fn create_lan_video_decoder(backend: &str) -> Result<Box<dyn VideoDecoder>> {
+    #[cfg(target_os = "macos")]
+    if backend == "videotoolbox" {
+        return mrd_codec_videotoolbox::VideoToolboxH264Decoder::new()
+            .map(|decoder| Box::new(decoder) as Box<dyn VideoDecoder>)
+            .map_err(|error| anyhow::anyhow!(error.to_string()));
+    }
+
+    mrd_decode::create_decoder(backend).map_err(|error| anyhow::anyhow!(error.to_string()))
+}
+
 fn preferred_lan_receiver_decoder_candidates(codec: LanAccessUnitCodec) -> Vec<&'static str> {
     let preferred = std::env::var("MRD_LAN_RECEIVER_DECODER")
         .unwrap_or_default()
@@ -4578,6 +4668,10 @@ fn preferred_lan_receiver_decoder_candidates(codec: LanAccessUnitCodec) -> Vec<&
     match (codec, preferred.as_str()) {
         (LanAccessUnitCodec::H264, "software" | "h264_software" | "openh264") => {
             vec!["h264_software"]
+        }
+        #[cfg(target_os = "macos")]
+        (LanAccessUnitCodec::H264, "videotoolbox" | "videotoolbox_h264") => {
+            vec!["videotoolbox", "h264_software"]
         }
         (LanAccessUnitCodec::H264, "nvdec" | "nvdec_d3d11_shared" | "d3d11_shared") => {
             vec!["nvdec_d3d11_shared", "nvdec"]
@@ -4646,7 +4740,15 @@ fn default_lan_receiver_decoder_candidates(codec: LanAccessUnitCodec) -> &'stati
     }
 }
 
-#[cfg(all(not(windows), not(target_os = "linux")))]
+#[cfg(target_os = "macos")]
+fn default_lan_receiver_decoder_candidates(codec: LanAccessUnitCodec) -> &'static [&'static str] {
+    match codec {
+        LanAccessUnitCodec::H264 => &["videotoolbox", "h264_software"],
+        LanAccessUnitCodec::Hevc => &[],
+    }
+}
+
+#[cfg(all(not(windows), not(target_os = "macos"), not(target_os = "linux")))]
 fn default_lan_receiver_decoder_candidates(codec: LanAccessUnitCodec) -> &'static [&'static str] {
     match codec {
         LanAccessUnitCodec::H264 => &["h264_software"],
@@ -4731,6 +4833,141 @@ impl LanFrameCapture {
             }
             #[cfg(not(any(windows, target_os = "macos", target_os = "linux", test)))]
             _ => anyhow::bail!("Frame capture not supported on this platform"),
+        }
+    }
+}
+
+enum LanSenderFrameCapture {
+    Direct(LanFrameCapture),
+    #[cfg(target_os = "macos")]
+    Pumped(MacosPumpedLanFrameCapture),
+}
+
+impl LanSenderFrameCapture {
+    fn new(capture: LanFrameCapture) -> Result<Self> {
+        #[cfg(target_os = "macos")]
+        {
+            if matches!(capture, LanFrameCapture::Macos(_)) && lan_capture_pump_enabled() {
+                return Ok(Self::Pumped(MacosPumpedLanFrameCapture::new(capture)?));
+            }
+        }
+
+        Ok(Self::Direct(capture))
+    }
+
+    fn capture_frame(&mut self) -> Result<CapturedFrame> {
+        match self {
+            Self::Direct(capture) => capture.capture_frame(),
+            #[cfg(target_os = "macos")]
+            Self::Pumped(capture) => capture.capture_frame(),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct MacosPumpedLanFrameCapture {
+    shared: Arc<(StdMutex<MacosPumpedLanFrameState>, StdCondvar)>,
+    stop: Arc<AtomicBool>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct MacosPumpedLanFrameState {
+    frames: VecDeque<CapturedFrame>,
+    sequence: u64,
+    error: Option<String>,
+}
+
+#[cfg(target_os = "macos")]
+impl MacosPumpedLanFrameCapture {
+    fn new(mut capture: LanFrameCapture) -> Result<Self> {
+        let shared = Arc::new((
+            StdMutex::new(MacosPumpedLanFrameState {
+                frames: VecDeque::new(),
+                sequence: 0,
+                error: None,
+            }),
+            StdCondvar::new(),
+        ));
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_shared = shared.clone();
+        let worker_stop = stop.clone();
+        let worker = thread::Builder::new()
+            .name("mrd-lan-capture-pump".to_string())
+            .spawn(move || {
+                while !worker_stop.load(Ordering::Relaxed) {
+                    match capture.capture_frame() {
+                        Ok(frame) => {
+                            let (lock, cvar) = &*worker_shared;
+                            if let Ok(mut state) = lock.lock() {
+                                while state.frames.len() >= LAN_CAPTURE_PUMP_QUEUE_CAPACITY {
+                                    state.frames.pop_front();
+                                }
+                                state.frames.push_back(frame);
+                                state.sequence = state.sequence.wrapping_add(1).max(1);
+                                state.error = None;
+                                cvar.notify_all();
+                            }
+                        }
+                        Err(error) => {
+                            let (lock, cvar) = &*worker_shared;
+                            if let Ok(mut state) = lock.lock() {
+                                state.error = Some(format!("{error:#}"));
+                                cvar.notify_all();
+                            }
+                            thread::sleep(LAN_CAPTURE_PUMP_ERROR_BACKOFF);
+                        }
+                    }
+                }
+            })
+            .context("failed to start macOS LAN capture pump")?;
+
+        Ok(Self {
+            shared,
+            stop,
+            worker: Some(worker),
+        })
+    }
+
+    fn capture_frame(&mut self) -> Result<CapturedFrame> {
+        let deadline = StdInstant::now() + LAN_CAPTURE_PUMP_WAIT_TIMEOUT;
+        let (lock, cvar) = &*self.shared;
+        let mut state = lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("macOS LAN capture pump state poisoned"))?;
+
+        loop {
+            if let Some(frame) = state.frames.pop_back() {
+                state.frames.clear();
+                return Ok(frame);
+            }
+
+            if let Some(error) = state.error.take() {
+                anyhow::bail!("macOS LAN capture pump failed: {error}");
+            }
+
+            let now = StdInstant::now();
+            if now >= deadline {
+                anyhow::bail!("macOS LAN capture pump timed out waiting for a captured frame");
+            }
+
+            let wait = deadline.saturating_duration_since(now);
+            let (guard, _) = cvar
+                .wait_timeout(state, wait)
+                .map_err(|_| anyhow::anyhow!("macOS LAN capture pump state poisoned"))?;
+            state = guard;
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MacosPumpedLanFrameCapture {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.shared.1.notify_all();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
         }
     }
 }
@@ -4849,9 +5086,7 @@ async fn create_lan_frame_capture(
 
     #[cfg(target_os = "macos")]
     {
-        return Ok(LanFrameCapture::Macos(
-            crate::capture_source::create_frame_capture(source_id)?,
-        ));
+        return create_macos_lan_frame_capture(source_id, _profile);
     }
 
     #[cfg(target_os = "linux")]
@@ -4867,6 +5102,26 @@ async fn create_lan_frame_capture(
             "remote desktop capture is currently only available on Windows, macOS, and Linux"
         )
     }
+}
+
+#[cfg(target_os = "macos")]
+fn create_macos_lan_frame_capture(
+    source_id: &str,
+    profile: &MediaProfile,
+) -> Result<LanFrameCapture> {
+    let mut capture = crate::capture_source::create_frame_capture(source_id)?;
+    let (target_width, target_height) =
+        h264_target_dimensions(capture.width(), capture.height(), profile);
+    capture.set_target_dimensions(target_width, target_height);
+    if std::env::var("MRD_MACOS_CAPTURE_FPS").is_err() {
+        capture.set_target_fps(macos_lan_capture_stream_fps(profile));
+    }
+    Ok(LanFrameCapture::Macos(capture))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_lan_capture_stream_fps(profile: &MediaProfile) -> u32 {
+    profile.fps.max(1).saturating_mul(2).clamp(1, 240)
 }
 
 #[cfg(windows)]
@@ -4928,6 +5183,41 @@ fn prepare_frame_for_h264(frame: CapturedFrame, profile: &MediaProfile) -> Resul
         );
     }
 
+    if frame.pixel_format == FramePixelFormat::Nv12 {
+        let required_len = nv12_cpu_frame_len(frame.width, frame.height)
+            .ok_or_else(|| anyhow::anyhow!("captured NV12 byte size overflow"))?;
+        if frame.data.len() < required_len {
+            anyhow::bail!(
+                "captured NV12 frame is truncated: {} < {}",
+                frame.data.len(),
+                required_len
+            );
+        }
+
+        if target_width == frame.width && target_height == frame.height {
+            return Ok(frame);
+        }
+
+        let source_rgb = nv12_to_rgb24(&frame.data, frame.width, frame.width, frame.height)?;
+        let mut rgb = Vec::with_capacity(target_width * target_height * 3);
+        for y in 0..target_height {
+            let source_y = y * frame.height / target_height;
+            for x in 0..target_width {
+                let source_x = x * frame.width / target_width;
+                let offset = (source_y * frame.width + source_x) * 3;
+                rgb.extend_from_slice(&source_rgb[offset..offset + 3]);
+            }
+        }
+
+        return Ok(CapturedFrame::from_cpu(
+            target_width,
+            target_height,
+            FramePixelFormat::Rgb24,
+            frame.timestamp_us,
+            rgb,
+        ));
+    }
+
     let bytes_per_pixel = frame_bytes_per_pixel(frame.pixel_format);
     let source_stride = frame
         .width
@@ -4986,7 +5276,16 @@ fn frame_bytes_per_pixel(pixel_format: FramePixelFormat) -> usize {
     match pixel_format {
         FramePixelFormat::Bgra32 | FramePixelFormat::Rgba32 => 4,
         FramePixelFormat::Rgb24 => 3,
+        FramePixelFormat::Nv12 => 1,
     }
+}
+
+fn nv12_cpu_frame_len(width: usize, height: usize) -> Option<usize> {
+    width.checked_mul(height).and_then(|y_size| {
+        width
+            .checked_mul(height.div_ceil(2))
+            .and_then(|uv_size| y_size.checked_add(uv_size))
+    })
 }
 
 fn read_captured_rgb(
@@ -5013,6 +5312,7 @@ fn read_captured_rgb(
             frame.data[index + 1],
             frame.data[index + 2],
         ),
+        FramePixelFormat::Nv12 => unreachable!("NV12 is handled before packed RGB scaling"),
     }
 }
 
@@ -5842,30 +6142,28 @@ mod tests {
 
         assert_eq!(peer.service_build_id.as_deref(), Some("build-a"));
         assert_eq!(peer.media_protocol_version, Some(3));
-        assert!(peer
-            .media_capabilities
-            .contains(&LAN_CAPTURE_DXGI_CAPABILITY.to_string()));
-        assert!(peer
-            .media_capabilities
-            .contains(&LAN_ENCODE_NVENC_H264_CAPABILITY.to_string()));
-        assert!(peer
-            .media_capabilities
-            .contains(&LAN_ENCODE_NVENC_HEVC_CAPABILITY.to_string()));
-        assert!(peer
-            .media_capabilities
-            .contains(&LAN_DECODE_NVDEC_CAPABILITY.to_string()));
-        assert!(peer
-            .media_capabilities
-            .contains(&LAN_DECODE_NVDEC_HEVC_CAPABILITY.to_string()));
-        assert!(peer
-            .media_capabilities
-            .contains(&LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY.to_string()));
-        assert!(peer
-            .media_capabilities
-            .contains(&LAN_RENDER_D3D11_NATIVE_CAPABILITY.to_string()));
-        assert!(peer
-            .media_capabilities
-            .contains(&LAN_RENDER_D3D11_SHARED_NV12_CAPABILITY.to_string()));
+        #[cfg(windows)]
+        for capability in [
+            LAN_CAPTURE_DXGI_CAPABILITY,
+            LAN_ENCODE_NVENC_H264_CAPABILITY,
+            LAN_ENCODE_NVENC_HEVC_CAPABILITY,
+            LAN_DECODE_NVDEC_CAPABILITY,
+            LAN_DECODE_NVDEC_HEVC_CAPABILITY,
+            LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY,
+            LAN_RENDER_D3D11_NATIVE_CAPABILITY,
+            LAN_RENDER_D3D11_SHARED_NV12_CAPABILITY,
+        ] {
+            assert!(peer.media_capabilities.contains(&capability.to_string()));
+        }
+        #[cfg(target_os = "macos")]
+        for capability in [
+            LAN_CAPTURE_MACOS_CAPABILITY,
+            LAN_ENCODE_VIDEOTOOLBOX_H264_CAPABILITY,
+            LAN_DECODE_VIDEOTOOLBOX_CAPABILITY,
+            LAN_RENDER_MACOS_NATIVE_CAPABILITY,
+        ] {
+            assert!(peer.media_capabilities.contains(&capability.to_string()));
+        }
         assert!(peer
             .media_capabilities
             .contains(&LAN_QUIC_RELIABLE_MEDIA_TRANSPORT.to_string()));
@@ -6946,6 +7244,27 @@ mod tests {
         assert_eq!(prepared.height, 32);
         assert_eq!(prepared.pixel_format, FramePixelFormat::Bgra32);
         assert_eq!(prepared.data, data);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_lan_capture_stream_fps_requests_headroom() {
+        let profile = MediaProfile {
+            width: 2560,
+            height: 1440,
+            fps: 60,
+            bitrate_mbps: 20,
+            codec: "h264".to_string(),
+            ..MediaProfile::default()
+        };
+
+        assert_eq!(macos_lan_capture_stream_fps(&profile), 120);
+
+        let high_refresh = MediaProfile {
+            fps: 165,
+            ..profile
+        };
+        assert_eq!(macos_lan_capture_stream_fps(&high_refresh), 240);
     }
 
     #[cfg(windows)]

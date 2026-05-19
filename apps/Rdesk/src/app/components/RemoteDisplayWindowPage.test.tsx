@@ -929,6 +929,9 @@ describe("RemoteDisplayWindowPage", () => {
           last_error: null,
         });
       }
+      if (command === "present_remote_preview_frame_on_native_surface") {
+        return Promise.resolve(true);
+      }
       if (command === "ipc_list_remote_capture_sources") {
         return Promise.resolve([remoteDisplaySource]);
       }
@@ -1425,6 +1428,11 @@ describe("RemoteDisplayWindowPage", () => {
 
     await screen.findByText(/remote rx 3/);
     expect(screen.queryByAltText("Remote desktop frame")).toBeNull();
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("present_remote_preview_frame_on_native_surface", {
+        dataUrl: "data:image/png;base64,REMOTE",
+      });
+    });
   });
 
   it("blocks remote receiver start when no remote capture source is available", async () => {

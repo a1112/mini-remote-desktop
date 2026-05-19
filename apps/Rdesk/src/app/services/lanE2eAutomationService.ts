@@ -207,11 +207,37 @@ const QUIC_2K144_MEDIA_CAPABILITY = "quic_datagram_2k144";
 const QUIC_DATAGRAM_MEDIA_V2_CAPABILITY = "quic_datagram_media_v2";
 const QUIC_DATAGRAM_MEDIA_V3_CAPABILITY = "quic_datagram_media_v3";
 const MEDIA_PROFILE_CONTROL_CAPABILITY = "media_profile_control_v1";
-const REQUIRED_WINDOWS_MEDIA_CAPABILITIES = [
-  "dxgi_capture",
-  "nvenc_h264",
-  "nvdec",
-  "d3d11_native_render",
+interface RequiredPlatformMediaCapabilityProfile {
+  id: "windows" | "macos" | "linux";
+  label: string;
+  verifyHint: string;
+  capabilities: string[];
+}
+
+const REQUIRED_PLATFORM_MEDIA_CAPABILITY_PROFILES: RequiredPlatformMediaCapabilityProfile[] = [
+  {
+    id: "windows",
+    label: "Windows",
+    verifyHint: "verify DXGI/NVENC/NVDEC/D3D11 native support",
+    capabilities: ["dxgi_capture", "nvenc_h264", "nvdec", "d3d11_native_render"],
+  },
+  {
+    id: "macos",
+    label: "macOS",
+    verifyHint: "verify ScreenCaptureKit/VideoToolbox/Metal native support",
+    capabilities: [
+      "macos_capture",
+      "videotoolbox_h264",
+      "videotoolbox",
+      "macos_native_render",
+    ],
+  },
+  {
+    id: "linux",
+    label: "Linux",
+    verifyHint: "verify PipeWire/Linux decode/native render support",
+    capabilities: ["pipewire_capture", "software_decode"],
+  },
 ];
 const DEFAULT_LAN_MEDIA_PROFILE: MediaProfile = {
   width: 2560,
@@ -909,12 +935,27 @@ function peerSupportsTransport(peer: LanPeerInfo, transportKind: string): boolea
       transports.includes(QUIC_2K144_MEDIA_CAPABILITY) &&
       transports.includes(MEDIA_PROFILE_CONTROL_CAPABILITY) &&
       (supportsMediaV3 || supportsMediaV2) &&
-      REQUIRED_WINDOWS_MEDIA_CAPABILITIES.every((capability) =>
-        mediaCapabilities.includes(capability)
-      )
+      findSupportedPlatformMediaCapabilityProfile(mediaCapabilities) !== undefined
     );
   }
   return transports.includes(requestedTransport);
+}
+
+function findSupportedPlatformMediaCapabilityProfile(
+  mediaCapabilities: string[]
+): RequiredPlatformMediaCapabilityProfile | undefined {
+  return REQUIRED_PLATFORM_MEDIA_CAPABILITY_PROFILES.find((profile) =>
+    profile.capabilities.every((capability) => mediaCapabilities.includes(capability))
+  );
+}
+
+function describeMissingPlatformMediaCapabilities(mediaCapabilities: string[]): string {
+  return REQUIRED_PLATFORM_MEDIA_CAPABILITY_PROFILES.map((profile) => {
+    const missing = profile.capabilities.filter(
+      (capability) => !mediaCapabilities.includes(capability)
+    );
+    return `${profile.label}: ${missing.length > 0 ? missing.join(", ") : "none"}`;
+  }).join("; ");
 }
 
 function buildPeerNotReadyMessage(peer: LanPeerInfo, transportKind: string): string {
@@ -953,11 +994,10 @@ function buildPeerNotReadyMessage(peer: LanPeerInfo, transportKind: string): str
     if (!supportsMediaProtocol) {
       return `LAN peer is not on a compatible QUIC media protocol: ${peer.device_id} supports ${transportList}, media protocol ${mediaProtocolVersion || "unknown"}. Rebuild and restart the peer mrd-service/Rdesk from the same branch.`;
     }
-    const missingMediaCapabilities = REQUIRED_WINDOWS_MEDIA_CAPABILITIES.filter(
-      (capability) => !mediaCapabilities.includes(capability)
-    );
-    if (missingMediaCapabilities.length > 0) {
-      return `LAN peer is missing required Windows media capabilities [${missingMediaCapabilities.join(", ")}]: ${peer.device_id}. Rebuild/restart the peer and verify DXGI/NVENC/NVDEC/D3D11 native support.`;
+    const supportedPlatformProfile =
+      findSupportedPlatformMediaCapabilityProfile(mediaCapabilities);
+    if (!supportedPlatformProfile) {
+      return `LAN peer is missing a complete platform media capability profile: ${peer.device_id}. Missing by profile [${describeMissingPlatformMediaCapabilities(mediaCapabilities)}]. Rebuild/restart the peer and verify native capture/codec/render support.`;
     }
     return `LAN peer does not support ${QUIC_2K144_MEDIA_CAPABILITY}: ${peer.device_id} supports ${transportList}`;
   }

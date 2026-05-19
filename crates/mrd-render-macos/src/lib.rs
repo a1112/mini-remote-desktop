@@ -115,12 +115,29 @@ impl MacosMetalRenderer {
         }
 
         self.ensure_texture(width, height);
+        let upload_data = if bgra_contains_non_opaque_alpha(data) {
+            if self.scratch_bgra.len() != expected {
+                self.scratch_bgra.resize(expected, 0);
+            }
+            for (src, dst) in data
+                .chunks_exact(4)
+                .zip(self.scratch_bgra.chunks_exact_mut(4))
+            {
+                dst[0] = src[0];
+                dst[1] = src[1];
+                dst[2] = src[2];
+                dst[3] = 255;
+            }
+            self.scratch_bgra.as_slice()
+        } else {
+            data
+        };
         let texture = self
             .texture
             .as_ref()
             .ok_or_else(|| RenderError::Message("Metal texture was not created".to_string()))?;
         let region = metal::MTLRegion::new_2d(0, 0, width as u64, height as u64);
-        texture.replace_region(region, 0, data.as_ptr().cast(), (width * 4) as u64);
+        texture.replace_region(region, 0, upload_data.as_ptr().cast(), (width * 4) as u64);
         Ok(())
     }
 
@@ -297,6 +314,11 @@ fn copy_region_size(
 }
 
 #[cfg(target_os = "macos")]
+fn bgra_contains_non_opaque_alpha(data: &[u8]) -> bool {
+    data.chunks_exact(4).any(|pixel| pixel[3] != 255)
+}
+
+#[cfg(target_os = "macos")]
 fn run_on_main_thread_sync<T, F>(f: F) -> Result<T, String>
 where
     T: Send,
@@ -421,5 +443,14 @@ mod tests {
         assert_eq!(scaled_drawable_dimension(640.0, 2.0), 1280);
         assert_eq!(scaled_drawable_dimension(0.0, 2.0), 1);
         assert_eq!(scaled_drawable_dimension(f64::NAN, 2.0), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bgra_alpha_detection_flags_transparent_desktop_frames() {
+        assert!(!bgra_contains_non_opaque_alpha(&[
+            1, 2, 3, 255, 4, 5, 6, 255
+        ]));
+        assert!(bgra_contains_non_opaque_alpha(&[1, 2, 3, 0, 4, 5, 6, 255]));
     }
 }

@@ -20,6 +20,7 @@ mrd-decode = { path = "../../crates/mrd-decode" }
 mrd-render = { path = "../../crates/mrd-render" }
 mrd-transport-quic-quinn = { path = "../../crates/mrd-transport-quic-quinn" }
 mrd-observability = { path = "../../crates/mrd-observability" }
+tokio.workspace = true
 
 [[test]]
 name = "automated_e2e_pipeline"
@@ -28,6 +29,10 @@ path = "automated_e2e_pipeline.rs"
 [[test]]
 name = "automated_e2e_matrix"
 path = "automated_e2e_matrix.rs"
+
+[[test]]
+name = "threaded_transport_e2e"
+path = "threaded_transport_e2e.rs"
 
 [target.'cfg(windows)'.dependencies]
 mrd-capture-winrt = { path = "../../crates/mrd-capture-winrt" }
