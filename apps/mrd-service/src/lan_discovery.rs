@@ -56,7 +56,9 @@ const LAN_MEDIA_MAX_FPS: u32 = 249;
 const LAN_MEDIA_TARGET_BITRATE_MBPS: u32 = 120;
 const LAN_QUIC_BEST_EFFORT_DATAGRAM_MAX_BITRATE_MBPS: u32 = 40;
 const LAN_QUIC_FALLBACK_DATAGRAM_BYTES: usize = 1_200;
-const LAN_QUIC_LAN_HIGH_QUALITY_DATAGRAM_BYTES: usize = 1_350;
+// Keep the default media fragment below common LAN/QUIC path MTU headroom.
+// Larger datagrams reduce sender P95 but raised cross-device frame drop ratio.
+const LAN_QUIC_LAN_HIGH_QUALITY_DATAGRAM_BYTES: usize = LAN_QUIC_FALLBACK_DATAGRAM_BYTES;
 const LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES: usize = 4 * 1024 * 1024;
 const LAN_QUIC_RELIABLE_MEDIA_RETRY_DELAY: Duration = Duration::from_millis(10);
 const LAN_QUIC_MEDIA_TRANSPORT: &str = "quic_datagram";
@@ -7546,7 +7548,7 @@ mod tests {
     }
 
     #[test]
-    fn high_quality_lan_media_uses_larger_safe_datagram_size_when_negotiated() {
+    fn high_quality_lan_media_keeps_safe_datagram_size_by_default() {
         let profile = MediaProfile {
             width: 2560,
             height: 1600,
@@ -7558,7 +7560,7 @@ mod tests {
 
         assert_eq!(
             lan_media_datagram_size(1_500, &profile, true),
-            LAN_QUIC_LAN_HIGH_QUALITY_DATAGRAM_BYTES
+            LAN_QUIC_FALLBACK_DATAGRAM_BYTES
         );
         assert_eq!(
             lan_media_datagram_size(1_500, &profile, false),
