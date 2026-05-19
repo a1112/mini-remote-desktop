@@ -315,6 +315,12 @@ impl MediaRenderQueueRegistry {
         None
     }
 
+    pub fn pending_depth(&self, session_id: &SessionId) -> usize {
+        self.queues
+            .get(session_id)
+            .map_or(0, |state| state.pending.len())
+    }
+
     pub fn pacing_delay(&self, session_id: &SessionId, fps: u32, now: Instant) -> Duration {
         let Some(last_present_at) = self
             .queues
@@ -1703,6 +1709,7 @@ mod tests {
                 depth: 1
             }
         );
+        assert_eq!(registry.pending_depth(&session_id), 1);
         assert_eq!(
             registry.enqueue_bounded(session_id.clone(), third.clone(), 3),
             MediaRenderQueueEnqueue::Queued {
@@ -1710,6 +1717,7 @@ mod tests {
                 depth: 2
             }
         );
+        assert_eq!(registry.pending_depth(&session_id), 2);
         assert_eq!(
             registry.enqueue_bounded(session_id.clone(), fourth.clone(), 3),
             MediaRenderQueueEnqueue::Queued {
@@ -1717,6 +1725,7 @@ mod tests {
                 depth: 3
             }
         );
+        assert_eq!(registry.pending_depth(&session_id), 3);
         assert_eq!(
             registry.enqueue_bounded(session_id.clone(), fifth.clone(), 3),
             MediaRenderQueueEnqueue::Queued {
@@ -1724,10 +1733,14 @@ mod tests {
                 depth: 3
             }
         );
+        assert_eq!(registry.pending_depth(&session_id), 3);
 
         assert_eq!(registry.take_next_or_finish(&session_id), Some(third));
+        assert_eq!(registry.pending_depth(&session_id), 2);
         assert_eq!(registry.take_next_or_finish(&session_id), Some(fourth));
+        assert_eq!(registry.pending_depth(&session_id), 1);
         assert_eq!(registry.take_next_or_finish(&session_id), Some(fifth));
+        assert_eq!(registry.pending_depth(&session_id), 0);
         assert_eq!(registry.take_next_or_finish(&session_id), None);
     }
 

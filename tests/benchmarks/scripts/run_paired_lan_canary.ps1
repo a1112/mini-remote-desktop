@@ -375,9 +375,12 @@ if (-not $SkipCross) {
   if (-not $TargetDeviceId -and $effectiveTargetDeviceId) {
     Write-Host "Auto-selected LAN target $effectiveTargetDeviceId from discovery diagnostics"
   }
-  $timeoutMs = ($DurationSecs * 1000) + 30000
   foreach ($profile in $profiles) {
     Write-Host "Running cross-device canary $($profile.id)"
+    $timeoutMs = ($profile.duration_secs * 1000) + 30000
+    if ($profile.adaptive) {
+      $timeoutMs += 90000
+    }
     $crossRows += Invoke-CrossCanaryProfile -Repo $repo -Profile $profile -OutputRoot $outputRoot -TargetDeviceId $effectiveTargetDeviceId -TimeoutMs $timeoutMs -DisplayModePolicy $DisplayModePolicy -GitCommit $gitCommit -Codec $Codec -CodecProfile $CodecProfile -BitDepth $BitDepth -ChromaSubsampling $ChromaSubsampling -PixelFormat $PixelFormat -HdrEnabled $HdrEnabled -KeepTauriOpen:$KeepTauriOpen
   }
 }

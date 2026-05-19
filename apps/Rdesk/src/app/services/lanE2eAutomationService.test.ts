@@ -496,6 +496,65 @@ describe("runLanE2EAutomation", () => {
     );
   });
 
+  it("preserves HEVC codec and sampling in adaptive floor profile", async () => {
+    const ipcConfigureMediaAdaptation = vi.fn().mockResolvedValue(
+      ok({
+        enabled: true,
+        state: "configured",
+        ladder_index: 0,
+        current_profile: DEFAULT_REQUESTED_PROFILE,
+        target_profile: DEFAULT_REQUESTED_PROFILE,
+        last_reason: "configured",
+        last_change_ms: 1_700_000_000_000,
+        observed_fps: 0,
+        drop_ratio: 0,
+        queue_depth: 0,
+      })
+    );
+    const commands = createCommands({ ipcConfigureMediaAdaptation });
+
+    await runLanE2EAutomation(commands, {
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      adaptive: true,
+      requestedProfile: {
+        width: 2560,
+        height: 1600,
+        fps: 165,
+        bitrate_mbps: 120,
+        codec: "hevc",
+        codec_profile: "main",
+        bit_depth: 8,
+        chroma_subsampling: "4:2:0",
+        pixel_format: "nv12",
+        hdr_enabled: false,
+      },
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => "lan-e2e-test-session",
+    });
+
+    expect(ipcConfigureMediaAdaptation).toHaveBeenCalledWith(
+      "lan-e2e-test-session",
+      expect.objectContaining({
+        floor_profile: expect.objectContaining({
+          width: 1280,
+          height: 800,
+          fps: 60,
+          bitrate_mbps: 10,
+          codec: "hevc",
+          codec_profile: "main",
+          bit_depth: 8,
+          chroma_subsampling: "4:2:0",
+          pixel_format: "nv12",
+          hdr_enabled: false,
+        }),
+      })
+    );
+  });
+
   it("marks the display window as native once the service reports an attached render surface", async () => {
     const commands = createCommands({
       openRemoteDisplayWindow: vi.fn().mockResolvedValue(
@@ -748,6 +807,38 @@ describe("runLanE2EAutomation", () => {
     expect(restoreRemoteDisplayMode).toHaveBeenCalledWith("lan-e2e-test-session");
   });
 
+  it("reuses the selected capture source when post-display-mode refresh times out", async () => {
+    const commands = withCaptureSourceCommands(createCommands());
+    commands.ipcListRemoteCaptureSources
+      .mockResolvedValueOnce(ok(DEFAULT_CAPTURE_SOURCES))
+      .mockResolvedValueOnce(err("LAN capture sources request timed out"));
+
+    const result = await runLanE2EAutomation(commands, {
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      displayModePolicy: "temporary",
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => "lan-e2e-test-session",
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.captureSource?.id).toBe("display-shared");
+    expect(result.captureSourceSelection?.reason).toContain(
+      "Reused pre-display-mode source after refresh failed"
+    );
+    expect(commands.ipcSelectRemoteCaptureSource).toHaveBeenCalledTimes(1);
+    expect(commands.ipcStartReceiver).toHaveBeenCalled();
+    expect(result.stages).toContainEqual(
+      expect.objectContaining({
+        stage: "capture_source",
+        status: "skipped",
+      })
+    );
+  });
+
   it("fails before receiver startup when the remote has no capture sources", async () => {
     const commands = withCaptureSourceCommands(createCommands(), []);
 
@@ -871,9 +962,11 @@ describe("runLanE2EAutomation", () => {
     let probeIndex = 0;
     let pipelineIndex = 0;
     const decodedFrames = [10, 16, 17, 18];
+    const droppedFrames = [2, 5, 5, 5];
     const presentedFrames = [8, 14, 15, 16];
     const ipcProbeSnapshot = vi.fn().mockImplementation(() => {
       const frameCount = decodedFrames[Math.min(probeIndex, decodedFrames.length - 1)];
+      const droppedFrameCount = droppedFrames[Math.min(probeIndex, droppedFrames.length - 1)];
       probeIndex += 1;
       currentTime += currentTime === 0 ? 10 : 100;
       return Promise.resolve(
@@ -881,7 +974,7 @@ describe("runLanE2EAutomation", () => {
           session_id: "unused",
           frames_received: frameCount,
           frames_decoded: frameCount,
-          frames_dropped: 0,
+          frames_dropped: droppedFrameCount,
           current_fps: 10,
           bitrate_mbps: 20,
           media_probe_valid: true,
@@ -943,6 +1036,7 @@ describe("runLanE2EAutomation", () => {
 
     expect(result.status).toBe("completed");
     expect(result.sampleFramesDecoded).toBe(6);
+    expect(result.sampleFramesDropped).toBe(3);
     expect(result.sampleObservedFps).toBeGreaterThanOrEqual(50);
     expect(result.sampleRenderFramesPresented).toBe(6);
     expect(result.sampleObservedRenderFps).toBeGreaterThanOrEqual(50);

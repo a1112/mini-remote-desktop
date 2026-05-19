@@ -47,6 +47,7 @@ mod imp {
     const H264_SHARED_ASYNC_SLOT_COUNT: usize = 2;
     const HEVC_SHARED_ASYNC_SLOT_COUNT: usize = 3;
     const SHARED_INPUT_CACHE_LIMIT: usize = 8;
+    const HEVC_REMOTE_DESKTOP_MAX_KEYFRAME_INTERVAL_FRAMES: usize = 60;
 
     pub struct NvencH264Encoder {
         _device: ID3D11Device,
@@ -83,6 +84,10 @@ mod imp {
     }
 
     unsafe impl Send for NvencHevcEncoder {}
+
+    fn hevc_remote_desktop_keyframe_interval(fps: u32) -> usize {
+        (fps.max(1) as usize).min(HEVC_REMOTE_DESKTOP_MAX_KEYFRAME_INTERVAL_FRAMES)
+    }
 
     struct SharedInputResource {
         shared_handle: isize,
@@ -831,7 +836,7 @@ mod imp {
             preset.preset_cfg.profile_guid = profile_guid;
             preset.preset_cfg.rc_params.average_bit_rate = bitrate;
             preset.preset_cfg.frame_interval_p = 1;
-            preset.preset_cfg.gop_len = fps;
+            preset.preset_cfg.gop_len = hevc_remote_desktop_keyframe_interval(fps) as u32;
 
             let init = InitParams {
                 encode_guid: NV_ENC_CODEC_HEVC_GUID,
@@ -908,7 +913,8 @@ mod imp {
                 .ok_or_else(|| PipelineError::message("missing shared NVENC HEVC encode slot"))?;
             self.copy_shared_bgra_to_texture(&source_texture, &slot.texture)?;
 
-            let force_idr = self.frame_index == 0 || self.frame_index % self.fps as usize == 0;
+            let keyframe_interval = hevc_remote_desktop_keyframe_interval(self.fps);
+            let force_idr = self.frame_index == 0 || self.frame_index % keyframe_interval == 0;
             submit_encode_picture(
                 &mut self.encoder,
                 &slot.bitstream,
@@ -1153,7 +1159,8 @@ mod imp {
                 );
             }
 
-            let force_idr = self.frame_index == 0 || self.frame_index % self.fps as usize == 0;
+            let keyframe_interval = hevc_remote_desktop_keyframe_interval(self.fps);
+            let force_idr = self.frame_index == 0 || self.frame_index % keyframe_interval == 0;
             let bytes = encode_picture_with_sps_pps(
                 &mut self.encoder,
                 &self.bitstream,
@@ -1222,6 +1229,14 @@ mod imp {
         fn hevc_shared_encode_queue_has_tail_latency_headroom() {
             assert!(HEVC_SHARED_ASYNC_SLOT_COUNT >= 3);
             assert!(HEVC_SHARED_ASYNC_SLOT_COUNT <= 4);
+        }
+
+        #[test]
+        fn hevc_remote_desktop_keyframe_interval_caps_high_refresh_recovery() {
+            assert_eq!(hevc_remote_desktop_keyframe_interval(30), 30);
+            assert_eq!(hevc_remote_desktop_keyframe_interval(60), 60);
+            assert_eq!(hevc_remote_desktop_keyframe_interval(144), 60);
+            assert_eq!(hevc_remote_desktop_keyframe_interval(249), 60);
         }
     }
 

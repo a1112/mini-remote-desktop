@@ -10,6 +10,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const ADAPTATION_SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
 const ADAPTATION_DECISION_INTERVAL: Duration = Duration::from_secs(2);
+const ADAPTATION_INITIAL_PROFILE_GRACE_MS: u64 = 5_000;
+const ADAPTATION_SUBSEQUENT_DOWNSHIFT_COOLDOWN_MS: u64 = 5_000;
 const DEFAULT_CEILING_WIDTH: u32 = 2560;
 const DEFAULT_CEILING_HEIGHT: u32 = 1440;
 const DEFAULT_CEILING_FPS: u32 = 144;
@@ -27,6 +29,8 @@ pub(crate) struct MediaAdaptationObservation {
     pub queue_depth: u32,
     pub decode_p95_ms: Option<f64>,
     pub render_p95_ms: Option<f64>,
+    pub receive_p95_ms: Option<f64>,
+    pub present_gap_p95_ms: Option<f64>,
     pub no_valid_frames: bool,
 }
 
@@ -51,7 +55,7 @@ pub async fn configure_media_adaptation(
     config: AdaptiveMediaConfig,
 ) -> Result<MediaAdaptationSnapshot> {
     ensure_session_exists(app_state, &session_id).await?;
-    let current_profile = current_media_profile(app_state, &session_id, &config).await;
+    let mut current_profile = current_media_profile(app_state, &session_id, &config).await;
     let source = app_state
         .capture_sources
         .lock()
@@ -59,11 +63,28 @@ pub async fn configure_media_adaptation(
         .get(&session_id)
         .map(|selection| selection.source);
     let ladder = effective_ladder(&config, source.as_ref(), &current_profile);
-    let ladder_index = ladder_index_for_profile(&ladder, &current_profile);
-    let target_profile = ladder
+    let mut ladder_index = ladder_index_for_profile(&ladder, &current_profile);
+    let mut target_profile = ladder
         .get(ladder_index)
         .cloned()
         .unwrap_or_else(|| current_profile.clone());
+    let mut initial_profile_applied = false;
+    if config.enabled && current_profile != target_profile {
+        let negotiation = crate::lan_discovery::request_lan_media_profile_update(
+            app_state,
+            &session_id,
+            target_profile.clone(),
+        )
+        .await
+        .context("failed to apply initial adaptive media profile")?;
+        current_profile = negotiation.selected;
+        ladder_index = ladder_index_for_profile(&ladder, &current_profile);
+        target_profile = ladder
+            .get(ladder_index)
+            .cloned()
+            .unwrap_or_else(|| current_profile.clone());
+        initial_profile_applied = true;
+    }
     let snapshot = MediaAdaptationSnapshot {
         enabled: config.enabled,
         state: if config.enabled {
@@ -75,7 +96,11 @@ pub async fn configure_media_adaptation(
         current_profile: current_profile.clone(),
         target_profile: target_profile.clone(),
         last_reason: Some(if config.enabled {
-            "configured".to_string()
+            if initial_profile_applied {
+                "initial adaptive profile applied".to_string()
+            } else {
+                "configured".to_string()
+            }
         } else {
             "disabled".to_string()
         }),
@@ -104,6 +129,7 @@ pub async fn configure_media_adaptation(
                 task_config,
                 ladder,
                 ladder_index,
+                initial_profile_applied,
             )
             .await;
         });
@@ -148,6 +174,7 @@ async fn run_media_adaptation_task(
     config: AdaptiveMediaConfig,
     ladder: Vec<MediaProfile>,
     mut ladder_index: usize,
+    initial_profile_was_applied: bool,
 ) {
     if ladder.is_empty() {
         return;
@@ -156,6 +183,10 @@ async fn run_media_adaptation_task(
     let mut last_decision = Instant::now();
     let mut last_change = Instant::now();
     let mut stable_since: Option<Instant> = None;
+    let mut pending_downshift_reason: Option<String> = None;
+    let mut pending_downshift_windows = 0_u32;
+    let mut initial_profile_checked = false;
+    let mut initial_profile_grace_until: Option<Instant> = None;
     let mut counters = sample_counters(&app_state, &session_id).await;
     let mut last_valid_frame = counters.timestamp;
 
@@ -172,6 +203,59 @@ async fn run_media_adaptation_task(
         }
 
         let now = Instant::now();
+        if !initial_profile_checked {
+            initial_profile_checked = true;
+            if initial_profile_was_applied {
+                counters = sample_counters(&app_state, &session_id).await;
+                last_decision = now;
+                last_valid_frame = now;
+                initial_profile_grace_until =
+                    now.checked_add(Duration::from_millis(ADAPTATION_INITIAL_PROFILE_GRACE_MS));
+                continue;
+            }
+            let current_profile = current_media_profile(&app_state, &session_id, &config).await;
+            let target_profile = ladder
+                .get(ladder_index)
+                .cloned()
+                .unwrap_or_else(default_ceiling_profile);
+            if current_profile != target_profile {
+                let observation = MediaAdaptationObservation {
+                    observed_fps: 0.0,
+                    target_fps: target_profile.fps,
+                    drop_ratio: 0.0,
+                    queue_depth: 0,
+                    decode_p95_ms: None,
+                    render_p95_ms: None,
+                    receive_p95_ms: None,
+                    present_gap_p95_ms: None,
+                    no_valid_frames: false,
+                };
+                if apply_adaptation_profile(
+                    &app_state,
+                    &session_id,
+                    &ladder,
+                    ladder_index,
+                    observation,
+                    "configured",
+                    Some("initial adaptive profile applied".to_string()),
+                )
+                .await
+                .is_ok()
+                {
+                    counters = sample_counters(&app_state, &session_id).await;
+                    last_decision = now;
+                    last_change = now;
+                    last_valid_frame = now;
+                    initial_profile_grace_until =
+                        now.checked_add(Duration::from_millis(ADAPTATION_INITIAL_PROFILE_GRACE_MS));
+                } else {
+                    initial_profile_checked = false;
+                    last_decision = now;
+                }
+                continue;
+            }
+        }
+
         if now.duration_since(last_decision) < ADAPTATION_DECISION_INTERVAL {
             continue;
         }
@@ -195,49 +279,85 @@ async fn run_media_adaptation_task(
             &current_profile,
             now.duration_since(last_valid_frame) >= Duration::from_secs(2),
         );
+        if initial_profile_grace_until.is_some_and(|deadline| now < deadline) {
+            stable_since = None;
+            pending_downshift_reason = None;
+            pending_downshift_windows = 0;
+            update_adaptation_snapshot(
+                &app_state,
+                &session_id,
+                &ladder,
+                ladder_index,
+                observation,
+                "settling",
+                Some("initial adaptive profile settling".to_string()),
+            )
+            .await;
+            counters = next_counters;
+            last_decision = now;
+            continue;
+        }
         let stable_for_ms = stable_since
             .map(|started| now.duration_since(started).as_millis() as u64)
             .unwrap_or(0);
         let since_change_ms = now.duration_since(last_change).as_millis() as u64;
-        let decision = choose_adaptation_decision(
+        let downshift_confirmed = update_downshift_confirmation(
+            observation,
+            &mut pending_downshift_reason,
+            &mut pending_downshift_windows,
+        );
+        let decision = choose_adaptation_decision_with_confirmation(
             ladder_index,
             ladder.len(),
             observation,
             stable_for_ms,
             since_change_ms,
             &config,
+            downshift_confirmed,
         );
 
         match decision {
             MediaAdaptationDecision::Downshift(reason) => {
-                ladder_index = (ladder_index + 1).min(ladder.len().saturating_sub(1));
+                pending_downshift_reason = None;
+                pending_downshift_windows = 0;
+                let next_ladder_index = (ladder_index + 1).min(ladder.len().saturating_sub(1));
                 stable_since = None;
-                last_change = now;
-                apply_adaptation_profile(
+                if apply_adaptation_profile(
                     &app_state,
                     &session_id,
                     &ladder,
-                    ladder_index,
+                    next_ladder_index,
                     observation,
                     "downshift",
                     Some(reason),
                 )
-                .await;
+                .await
+                .is_ok()
+                {
+                    ladder_index = next_ladder_index;
+                    last_change = now;
+                }
             }
             MediaAdaptationDecision::Upshift(reason) => {
-                ladder_index = ladder_index.saturating_sub(1);
+                pending_downshift_reason = None;
+                pending_downshift_windows = 0;
+                let next_ladder_index = ladder_index.saturating_sub(1);
                 stable_since = None;
-                last_change = now;
-                apply_adaptation_profile(
+                if apply_adaptation_profile(
                     &app_state,
                     &session_id,
                     &ladder,
-                    ladder_index,
+                    next_ladder_index,
                     observation,
                     "upshift",
                     Some(reason),
                 )
-                .await;
+                .await
+                .is_ok()
+                {
+                    ladder_index = next_ladder_index;
+                    last_change = now;
+                }
             }
             MediaAdaptationDecision::Hold => {
                 if observation_is_healthy(observation) {
@@ -324,10 +444,13 @@ fn observation_from_snapshots(
         queue_depth: pipeline.queue_depth,
         decode_p95_ms: stage_p95(pipeline, &["receiver.decode", "decode"]),
         render_p95_ms: stage_p95(pipeline, &["render_present", "present", "render_upload"]),
+        receive_p95_ms: stage_p95(pipeline, &["receiver.read", "receiver.message_wait"]),
+        present_gap_p95_ms: stage_p95(pipeline, &["render_present_gap", "render_enqueue_gap"]),
         no_valid_frames,
     }
 }
 
+#[cfg(test)]
 pub(crate) fn choose_adaptation_decision(
     ladder_index: usize,
     ladder_len: usize,
@@ -336,12 +459,42 @@ pub(crate) fn choose_adaptation_decision(
     since_last_change_ms: u64,
     config: &AdaptiveMediaConfig,
 ) -> MediaAdaptationDecision {
+    choose_adaptation_decision_with_confirmation(
+        ladder_index,
+        ladder_len,
+        observation,
+        stable_for_ms,
+        since_last_change_ms,
+        config,
+        true,
+    )
+}
+
+fn choose_adaptation_decision_with_confirmation(
+    ladder_index: usize,
+    ladder_len: usize,
+    observation: MediaAdaptationObservation,
+    stable_for_ms: u64,
+    since_last_change_ms: u64,
+    config: &AdaptiveMediaConfig,
+    downshift_confirmed: bool,
+) -> MediaAdaptationDecision {
     if ladder_len == 0 || !config.enabled {
         return MediaAdaptationDecision::Hold;
     }
 
     if let Some(reason) = downshift_reason(observation) {
-        if ladder_index + 1 < ladder_len && since_last_change_ms >= config.downshift_cooldown_ms {
+        if !downshift_confirmed {
+            return MediaAdaptationDecision::Hold;
+        }
+        let required_cooldown_ms = if ladder_index > 0 {
+            config
+                .downshift_cooldown_ms
+                .max(ADAPTATION_SUBSEQUENT_DOWNSHIFT_COOLDOWN_MS)
+        } else {
+            config.downshift_cooldown_ms
+        };
+        if ladder_index + 1 < ladder_len && since_last_change_ms >= required_cooldown_ms {
             return MediaAdaptationDecision::Downshift(reason);
         }
         return MediaAdaptationDecision::Hold;
@@ -357,10 +510,48 @@ pub(crate) fn choose_adaptation_decision(
     MediaAdaptationDecision::Hold
 }
 
+fn update_downshift_confirmation(
+    observation: MediaAdaptationObservation,
+    pending_reason: &mut Option<String>,
+    pending_windows: &mut u32,
+) -> bool {
+    let Some(reason) = downshift_reason(observation) else {
+        *pending_reason = None;
+        *pending_windows = 0;
+        return true;
+    };
+
+    if !downshift_requires_confirmation(observation) {
+        *pending_reason = None;
+        *pending_windows = 0;
+        return true;
+    }
+
+    if pending_reason.as_deref() == Some(reason.as_str()) {
+        *pending_windows = pending_windows.saturating_add(1);
+    } else {
+        *pending_reason = Some(reason);
+        *pending_windows = 1;
+    }
+
+    *pending_windows >= 2
+}
+
+fn downshift_requires_confirmation(observation: MediaAdaptationObservation) -> bool {
+    if observation.no_valid_frames {
+        return false;
+    }
+    if observation.observed_fps < observation.target_fps as f32 * 0.50 {
+        return false;
+    }
+    true
+}
+
 fn downshift_reason(observation: MediaAdaptationObservation) -> Option<String> {
     if observation.no_valid_frames {
         return Some("no valid frames for 2s".to_string());
     }
+    let frame_budget_ms = 1000.0 / observation.target_fps.max(1) as f64;
     if observation.observed_fps < observation.target_fps as f32 * 0.85 {
         return Some(format!(
             "fps {:.1} below 85% of target {}",
@@ -368,15 +559,27 @@ fn downshift_reason(observation: MediaAdaptationObservation) -> Option<String> {
         ));
     }
     if observation.drop_ratio > 0.03 {
-        return Some(format!(
-            "drop ratio {:.2}% above 3%",
-            observation.drop_ratio * 100.0
-        ));
+        let severe_drop = observation.drop_ratio > 0.10;
+        let throughput_stressed = observation.observed_fps < observation.target_fps as f32 * 0.95
+            || observation.queue_depth > 0;
+        let perceptual_budget_ms = frame_budget_ms * 1.5;
+        let perceptual_stressed = observation.target_fps <= 120
+            || observation
+                .present_gap_p95_ms
+                .is_some_and(|p95| p95 > perceptual_budget_ms)
+            || observation
+                .receive_p95_ms
+                .is_some_and(|p95| p95 > perceptual_budget_ms);
+        if severe_drop || throughput_stressed || perceptual_stressed {
+            return Some(format!(
+                "drop ratio {:.2}% above 3%",
+                observation.drop_ratio * 100.0
+            ));
+        }
     }
     if observation.queue_depth > 1 {
         return Some(format!("queue depth {} above 1", observation.queue_depth));
     }
-    let frame_budget_ms = 1000.0 / observation.target_fps.max(1) as f64;
     if observation
         .decode_p95_ms
         .is_some_and(|p95| p95 > frame_budget_ms)
@@ -394,6 +597,27 @@ fn downshift_reason(observation: MediaAdaptationObservation) -> Option<String> {
             "render p95 exceeds {:.2}ms budget",
             frame_budget_ms
         ));
+    }
+    if observation.target_fps > 120 {
+        let perceptual_budget_ms = frame_budget_ms * 1.5;
+        if observation
+            .present_gap_p95_ms
+            .is_some_and(|p95| p95 > perceptual_budget_ms)
+        {
+            return Some(format!(
+                "present gap p95 exceeds {:.2}ms perceptual budget",
+                perceptual_budget_ms
+            ));
+        }
+        if observation
+            .receive_p95_ms
+            .is_some_and(|p95| p95 > perceptual_budget_ms)
+        {
+            return Some(format!(
+                "receiver read p95 exceeds {:.2}ms perceptual budget",
+                perceptual_budget_ms
+            ));
+        }
     }
     None
 }
@@ -424,6 +648,19 @@ fn observation_is_healthy(observation: MediaAdaptationObservation) -> bool {
     {
         return false;
     }
+    let perceptual_budget_ms = frame_budget_ms * 1.25;
+    if observation
+        .present_gap_p95_ms
+        .is_some_and(|p95| p95 > perceptual_budget_ms)
+    {
+        return false;
+    }
+    if observation
+        .receive_p95_ms
+        .is_some_and(|p95| p95 > perceptual_budget_ms)
+    {
+        return false;
+    }
     true
 }
 
@@ -435,9 +672,9 @@ async fn apply_adaptation_profile(
     observation: MediaAdaptationObservation,
     state: &str,
     reason: Option<String>,
-) {
+) -> Result<MediaProfile> {
     let Some(target_profile) = ladder.get(ladder_index).cloned() else {
-        return;
+        anyhow::bail!("adaptive media ladder index {ladder_index} is out of range");
     };
 
     match crate::lan_discovery::request_lan_media_profile_update(
@@ -448,6 +685,7 @@ async fn apply_adaptation_profile(
     .await
     {
         Ok(negotiation) => {
+            let selected_profile = negotiation.selected.clone();
             update_adaptation_snapshot_with_profiles(
                 app_state,
                 session_id,
@@ -455,12 +693,14 @@ async fn apply_adaptation_profile(
                 observation,
                 state,
                 reason,
-                negotiation.selected,
+                selected_profile.clone(),
                 target_profile,
             )
             .await;
+            Ok(selected_profile)
         }
         Err(error) => {
+            let message = error.to_string();
             update_adaptation_snapshot(
                 app_state,
                 session_id,
@@ -468,9 +708,10 @@ async fn apply_adaptation_profile(
                 ladder_index,
                 observation,
                 "error",
-                Some(error.to_string()),
+                Some(message),
             )
             .await;
+            Err(error)
         }
     }
 }
@@ -511,23 +752,37 @@ async fn update_adaptation_snapshot_with_profiles(
     current_profile: MediaProfile,
     target_profile: MediaProfile,
 ) {
+    let mut pipelines = app_state.media_pipelines.lock().await;
+    let previous = pipelines.adaptation(session_id);
+    let profile_changed = previous
+        .as_ref()
+        .is_none_or(|snapshot| snapshot.current_profile != current_profile);
+    let last_reason = reason.or_else(|| {
+        previous
+            .as_ref()
+            .and_then(|snapshot| snapshot.last_reason.clone())
+    });
+    let last_change_ms = if profile_changed || state != "stable" {
+        epoch_ms()
+    } else {
+        previous
+            .as_ref()
+            .map(|snapshot| snapshot.last_change_ms)
+            .unwrap_or_else(epoch_ms)
+    };
     let snapshot = MediaAdaptationSnapshot {
         enabled: true,
         state: state.to_string(),
         ladder_index: ladder_index as u32,
         current_profile,
         target_profile,
-        last_reason: reason,
-        last_change_ms: epoch_ms(),
+        last_reason,
+        last_change_ms,
         observed_fps: observation.observed_fps,
         drop_ratio: observation.drop_ratio,
         queue_depth: observation.queue_depth,
     };
-    app_state
-        .media_pipelines
-        .lock()
-        .await
-        .set_adaptation(session_id.clone(), Some(snapshot));
+    pipelines.set_adaptation(session_id.clone(), Some(snapshot));
 }
 
 fn stage_p95(pipeline: &MediaPipelineSnapshot, names: &[&str]) -> Option<f64> {
@@ -545,19 +800,65 @@ pub(crate) fn effective_ladder(
     source: Option<&CaptureSource>,
     current_profile: &MediaProfile,
 ) -> Vec<MediaProfile> {
+    effective_ladder_with_render_fps_cap(
+        config,
+        source,
+        current_profile,
+        crate::lan_discovery::lan_local_render_fps_cap(),
+    )
+}
+
+fn effective_ladder_with_render_fps_cap(
+    config: &AdaptiveMediaConfig,
+    source: Option<&CaptureSource>,
+    current_profile: &MediaProfile,
+    render_fps_cap: Option<u32>,
+) -> Vec<MediaProfile> {
     if !config.ladder.is_empty() {
-        return sanitize_ladder(config.ladder.clone());
+        return sanitize_ladder(
+            config
+                .ladder
+                .iter()
+                .map(|profile| cap_profile_to_render_fps(profile, render_fps_cap))
+                .collect(),
+        );
     }
 
     let ceiling = config
         .ceiling_profile
         .clone()
         .unwrap_or_else(|| current_profile.clone());
+    let ceiling = cap_profile_to_render_fps(&ceiling, render_fps_cap);
     let floor = config
         .floor_profile
         .clone()
         .unwrap_or_else(default_floor_profile);
     default_ladder_for_source(source, &ceiling, &floor)
+}
+
+fn cap_profile_to_render_fps(profile: &MediaProfile, render_fps_cap: Option<u32>) -> MediaProfile {
+    let Some(render_fps_cap) = render_fps_cap.filter(|cap| *cap > 0) else {
+        return profile.clone();
+    };
+    if profile.fps <= render_fps_cap {
+        return profile.clone();
+    }
+
+    MediaProfile {
+        fps: render_fps_cap,
+        bitrate_mbps: cap_bitrate_for_render_fps(profile.bitrate_mbps, profile.fps, render_fps_cap),
+        ..profile.clone()
+    }
+}
+
+fn cap_bitrate_for_render_fps(bitrate_mbps: u32, source_fps: u32, render_fps_cap: u32) -> u32 {
+    let bitrate_mbps = bitrate_mbps.max(1);
+    let source_fps = source_fps.max(1);
+    let render_fps_cap = render_fps_cap.max(1).min(source_fps);
+    let fps_scaled =
+        ((bitrate_mbps as f64) * (render_fps_cap as f64 / source_fps as f64)).round() as u32;
+    let stability_scaled = ((bitrate_mbps as f64) * 0.8).round() as u32;
+    fps_scaled.min(stability_scaled).max(1)
 }
 
 pub(crate) fn default_ladder_for_source(
@@ -583,16 +884,28 @@ pub(crate) fn default_ladder_for_source(
     let second_bitrate = ((high_bitrate as f32) * 0.8).round() as u32;
 
     sanitize_ladder(vec![
-        profile(high, high_fps, high_bitrate),
-        profile(high, high_fps, second_bitrate.max(1)),
-        profile(high, high_fps.min(120), 50.min(high_bitrate).max(1)),
-        profile(mid, high_fps.min(120), 40.min(high_bitrate).max(1)),
-        profile(mid, high_fps.min(90), 28.min(high_bitrate).max(1)),
-        profile(mid, high_fps.min(60), 20.min(high_bitrate).max(1)),
+        profile(high, high_fps, high_bitrate, ceiling),
+        profile(high, high_fps, second_bitrate.max(1), ceiling),
+        profile(
+            high,
+            high_fps.min(120),
+            50.min(high_bitrate).max(1),
+            ceiling,
+        ),
+        profile(
+            high,
+            high_fps.min(120),
+            40.min(high_bitrate).max(1),
+            ceiling,
+        ),
+        profile(mid, high_fps.min(120), 40.min(high_bitrate).max(1), ceiling),
+        profile(mid, high_fps.min(90), 28.min(high_bitrate).max(1), ceiling),
+        profile(mid, high_fps.min(60), 20.min(high_bitrate).max(1), ceiling),
         profile(
             low,
             floor.fps.min(high_fps).max(1),
             floor.bitrate_mbps.max(1),
+            ceiling,
         ),
     ])
 }
@@ -626,15 +939,13 @@ fn even_size_for_width(
     (even_width, height)
 }
 
-fn profile(size: (u32, u32), fps: u32, bitrate_mbps: u32) -> MediaProfile {
-    MediaProfile {
-        width: size.0,
-        height: size.1,
-        fps,
-        bitrate_mbps,
-        codec: "h264".to_string(),
-        ..MediaProfile::default()
-    }
+fn profile(size: (u32, u32), fps: u32, bitrate_mbps: u32, template: &MediaProfile) -> MediaProfile {
+    let mut profile = template.clone();
+    profile.width = size.0;
+    profile.height = size.1;
+    profile.fps = fps;
+    profile.bitrate_mbps = bitrate_mbps;
+    profile
 }
 
 fn ladder_index_for_profile(ladder: &[MediaProfile], profile: &MediaProfile) -> usize {
@@ -752,11 +1063,113 @@ mod tests {
         );
 
         assert_eq!((ladder[0].width, ladder[0].height), (2560, 1600));
-        assert_eq!((ladder[3].width, ladder[3].height), (1920, 1200));
+        assert_eq!((ladder[3].width, ladder[3].height), (2560, 1600));
+        assert_eq!(ladder[3].bitrate_mbps, 40);
+        assert_eq!((ladder[4].width, ladder[4].height), (1920, 1200));
         assert_eq!(
             (ladder.last().unwrap().width, ladder.last().unwrap().height),
             (1280, 800)
         );
+    }
+
+    #[test]
+    fn default_ladder_preserves_ceiling_codec_and_sampling() {
+        let ceiling = MediaProfile {
+            width: 2560,
+            height: 1600,
+            fps: 165,
+            bitrate_mbps: 120,
+            codec: "hevc".to_string(),
+            codec_profile: Some("main".to_string()),
+            bit_depth: Some(8),
+            chroma_subsampling: Some("4:2:0".to_string()),
+            pixel_format: Some("nv12".to_string()),
+            hdr_enabled: Some(false),
+        };
+        let ladder = default_ladder_for_source(
+            Some(&source(2560, 1600)),
+            &ceiling,
+            &config().floor_profile.unwrap(),
+        );
+
+        for profile in ladder {
+            assert_eq!(profile.codec, "hevc");
+            assert_eq!(profile.codec_profile.as_deref(), Some("main"));
+            assert_eq!(profile.bit_depth, Some(8));
+            assert_eq!(profile.chroma_subsampling.as_deref(), Some("4:2:0"));
+            assert_eq!(profile.pixel_format.as_deref(), Some("nv12"));
+            assert_eq!(profile.hdr_enabled, Some(false));
+        }
+    }
+
+    #[test]
+    fn default_ladder_can_cap_ceiling_to_local_render_fps() {
+        let ceiling = MediaProfile {
+            width: 2560,
+            height: 1600,
+            fps: 165,
+            bitrate_mbps: 120,
+            codec: "hevc".to_string(),
+            codec_profile: Some("main".to_string()),
+            bit_depth: Some(8),
+            chroma_subsampling: Some("4:2:0".to_string()),
+            pixel_format: Some("nv12".to_string()),
+            hdr_enabled: Some(false),
+        };
+        let capped = cap_profile_to_render_fps(&ceiling, Some(144));
+        let ladder = default_ladder_for_source(
+            Some(&source(2560, 1600)),
+            &capped,
+            &config().floor_profile.unwrap(),
+        );
+
+        assert_eq!(ladder[0].fps, 144);
+        assert_eq!(ladder[0].bitrate_mbps, 96);
+        assert_eq!(ladder[0].codec, "hevc");
+        assert_eq!(ladder[0].codec_profile.as_deref(), Some("main"));
+        assert_eq!(ladder[0].bit_depth, Some(8));
+        assert_eq!(ladder[0].chroma_subsampling.as_deref(), Some("4:2:0"));
+        assert_eq!(ladder[0].pixel_format.as_deref(), Some("nv12"));
+        assert_eq!(ladder[0].hdr_enabled, Some(false));
+    }
+
+    #[test]
+    fn effective_ladder_caps_explicit_ladder_to_local_render_fps() {
+        let ceiling = MediaProfile {
+            width: 2560,
+            height: 1600,
+            fps: 165,
+            bitrate_mbps: 120,
+            codec: "hevc".to_string(),
+            codec_profile: Some("main".to_string()),
+            bit_depth: Some(8),
+            chroma_subsampling: Some("4:2:0".to_string()),
+            pixel_format: Some("nv12".to_string()),
+            hdr_enabled: Some(false),
+        };
+        let config = AdaptiveMediaConfig {
+            ladder: vec![
+                ceiling.clone(),
+                MediaProfile {
+                    fps: 120,
+                    bitrate_mbps: 50,
+                    ..ceiling.clone()
+                },
+            ],
+            ..config()
+        };
+
+        let ladder = effective_ladder_with_render_fps_cap(
+            &config,
+            Some(&source(2560, 1600)),
+            &ceiling,
+            Some(144),
+        );
+
+        assert_eq!(ladder[0].fps, 144);
+        assert_eq!(ladder[0].bitrate_mbps, 96);
+        assert_eq!(ladder[0].codec, "hevc");
+        assert_eq!(ladder[1].fps, 120);
     }
 
     #[test]
@@ -768,6 +1181,8 @@ mod tests {
             queue_depth: 0,
             decode_p95_ms: Some(2.0),
             render_p95_ms: Some(2.0),
+            receive_p95_ms: Some(2.0),
+            present_gap_p95_ms: Some(2.0),
             no_valid_frames: false,
         };
 
@@ -786,6 +1201,8 @@ mod tests {
             queue_depth: 0,
             decode_p95_ms: Some(2.0),
             render_p95_ms: Some(2.0),
+            receive_p95_ms: Some(2.0),
+            present_gap_p95_ms: Some(2.0),
             no_valid_frames: false,
         };
 
@@ -804,6 +1221,8 @@ mod tests {
             queue_depth: 0,
             decode_p95_ms: Some(2.0),
             render_p95_ms: Some(2.0),
+            receive_p95_ms: Some(2.0),
+            present_gap_p95_ms: Some(2.0),
             no_valid_frames: false,
         };
 
@@ -811,5 +1230,226 @@ mod tests {
             choose_adaptation_decision(0, 7, observation, 0, 500, &config()),
             MediaAdaptationDecision::Hold
         );
+    }
+
+    #[test]
+    fn subsequent_downshift_uses_longer_reconfigure_grace() {
+        let observation = MediaAdaptationObservation {
+            observed_fps: 90.0,
+            target_fps: 120,
+            drop_ratio: 0.0,
+            queue_depth: 0,
+            decode_p95_ms: Some(2.0),
+            render_p95_ms: Some(2.0),
+            receive_p95_ms: Some(2.0),
+            present_gap_p95_ms: Some(2.0),
+            no_valid_frames: false,
+        };
+
+        assert_eq!(
+            choose_adaptation_decision(2, 7, observation, 0, 2_000, &config()),
+            MediaAdaptationDecision::Hold
+        );
+        assert_eq!(
+            choose_adaptation_decision(2, 7, observation, 0, 5_000, &config()),
+            MediaAdaptationDecision::Downshift("fps 90.0 below 85% of target 120".to_string())
+        );
+    }
+
+    #[test]
+    fn perceptual_jitter_downshifts_after_cooldown() {
+        let observation = MediaAdaptationObservation {
+            observed_fps: 144.0,
+            target_fps: 144,
+            drop_ratio: 0.0,
+            queue_depth: 0,
+            decode_p95_ms: Some(2.0),
+            render_p95_ms: Some(2.0),
+            receive_p95_ms: Some(2.0),
+            present_gap_p95_ms: Some(12.0),
+            no_valid_frames: false,
+        };
+
+        assert_eq!(
+            choose_adaptation_decision(0, 7, observation, 0, 2_000, &config()),
+            MediaAdaptationDecision::Downshift(
+                "present gap p95 exceeds 10.42ms perceptual budget".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn high_fps_drop_burst_without_qoe_stress_holds() {
+        let observation = MediaAdaptationObservation {
+            observed_fps: 164.0,
+            target_fps: 165,
+            drop_ratio: 0.0695,
+            queue_depth: 0,
+            decode_p95_ms: Some(2.0),
+            render_p95_ms: Some(2.0),
+            receive_p95_ms: Some(1.0),
+            present_gap_p95_ms: Some(8.5),
+            no_valid_frames: false,
+        };
+
+        assert_eq!(downshift_reason(observation), None);
+    }
+
+    #[test]
+    fn high_fps_drop_burst_with_perceptual_stress_downshifts() {
+        let observation = MediaAdaptationObservation {
+            observed_fps: 164.0,
+            target_fps: 165,
+            drop_ratio: 0.0695,
+            queue_depth: 0,
+            decode_p95_ms: Some(2.0),
+            render_p95_ms: Some(2.0),
+            receive_p95_ms: Some(1.0),
+            present_gap_p95_ms: Some(10.0),
+            no_valid_frames: false,
+        };
+
+        assert_eq!(
+            downshift_reason(observation),
+            Some("drop ratio 6.95% above 3%".to_string())
+        );
+    }
+
+    #[test]
+    fn transient_drop_reason_requires_two_windows_in_task_path() {
+        let observation = MediaAdaptationObservation {
+            observed_fps: 150.0,
+            target_fps: 165,
+            drop_ratio: 0.06,
+            queue_depth: 0,
+            decode_p95_ms: Some(2.0),
+            render_p95_ms: Some(2.0),
+            receive_p95_ms: Some(1.0),
+            present_gap_p95_ms: Some(1.0),
+            no_valid_frames: false,
+        };
+        let mut pending_reason = None;
+        let mut pending_windows = 0;
+
+        let first_confirmed =
+            update_downshift_confirmation(observation, &mut pending_reason, &mut pending_windows);
+        assert!(!first_confirmed);
+        assert_eq!(pending_windows, 1);
+        assert_eq!(
+            choose_adaptation_decision_with_confirmation(
+                0,
+                7,
+                observation,
+                0,
+                2_000,
+                &config(),
+                first_confirmed,
+            ),
+            MediaAdaptationDecision::Hold
+        );
+
+        let second_confirmed =
+            update_downshift_confirmation(observation, &mut pending_reason, &mut pending_windows);
+        assert!(second_confirmed);
+        assert_eq!(pending_windows, 2);
+        assert_eq!(
+            choose_adaptation_decision_with_confirmation(
+                0,
+                7,
+                observation,
+                0,
+                2_000,
+                &config(),
+                second_confirmed,
+            ),
+            MediaAdaptationDecision::Downshift("drop ratio 6.00% above 3%".to_string())
+        );
+    }
+
+    #[test]
+    fn transient_low_fps_downshift_waits_for_confirmation() {
+        let observation = MediaAdaptationObservation {
+            observed_fps: 120.0,
+            target_fps: 165,
+            drop_ratio: 0.0,
+            queue_depth: 0,
+            decode_p95_ms: Some(2.0),
+            render_p95_ms: Some(2.0),
+            receive_p95_ms: Some(1.0),
+            present_gap_p95_ms: Some(1.0),
+            no_valid_frames: false,
+        };
+        let mut pending_reason = None;
+        let mut pending_windows = 0;
+
+        assert!(!update_downshift_confirmation(
+            observation,
+            &mut pending_reason,
+            &mut pending_windows
+        ));
+        assert_eq!(pending_windows, 1);
+        assert!(update_downshift_confirmation(
+            observation,
+            &mut pending_reason,
+            &mut pending_windows
+        ));
+        assert_eq!(pending_windows, 2);
+    }
+
+    #[test]
+    fn severe_fps_downshift_does_not_wait_for_confirmation() {
+        let observation = MediaAdaptationObservation {
+            observed_fps: 70.0,
+            target_fps: 165,
+            drop_ratio: 0.0,
+            queue_depth: 0,
+            decode_p95_ms: Some(2.0),
+            render_p95_ms: Some(2.0),
+            receive_p95_ms: Some(1.0),
+            present_gap_p95_ms: Some(1.0),
+            no_valid_frames: false,
+        };
+        let mut pending_reason = None;
+        let mut pending_windows = 0;
+
+        assert!(update_downshift_confirmation(
+            observation,
+            &mut pending_reason,
+            &mut pending_windows
+        ));
+    }
+
+    #[test]
+    fn stable_health_requires_perceptual_jitter_budget() {
+        let observation = MediaAdaptationObservation {
+            observed_fps: 144.0,
+            target_fps: 144,
+            drop_ratio: 0.0,
+            queue_depth: 0,
+            decode_p95_ms: Some(2.0),
+            render_p95_ms: Some(2.0),
+            receive_p95_ms: Some(9.0),
+            present_gap_p95_ms: Some(2.0),
+            no_valid_frames: false,
+        };
+
+        assert!(!observation_is_healthy(observation));
+    }
+
+    #[test]
+    fn perceptual_jitter_downshift_stops_at_120fps_guard() {
+        let observation = MediaAdaptationObservation {
+            observed_fps: 120.0,
+            target_fps: 120,
+            drop_ratio: 0.0,
+            queue_depth: 0,
+            decode_p95_ms: Some(2.0),
+            render_p95_ms: Some(2.0),
+            receive_p95_ms: Some(2.0),
+            present_gap_p95_ms: Some(20.0),
+            no_valid_frames: false,
+        };
+
+        assert_eq!(downshift_reason(observation), None);
     }
 }

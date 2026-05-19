@@ -16,7 +16,7 @@ function Assert-True($Condition, [string]$Message) {
 }
 
 $profiles = Get-PairedLanCanaryProfiles -DurationSecs 30 -BitrateMbps 20
-Assert-Equal $profiles.Count 9 "Profile count"
+Assert-Equal $profiles.Count 10 "Profile count"
 Assert-Equal $profiles[0].id "1080p60" "First profile id"
 Assert-Equal $profiles[2].id "2k144" "2K144 profile is present"
 Assert-Equal $profiles[3].id "2k144_adaptive" "Adaptive 2K144 profile is present"
@@ -26,8 +26,11 @@ Assert-Equal $profiles[4].id "1600p165" "Native 1600p165 profile is present"
 Assert-Equal $profiles[4].bitrate_mbps 80 "Native 1600p165 profile uses the higher default bitrate"
 Assert-Equal $profiles[5].id "1600p165_120mbps" "Native 1600p165 high-bitrate profile is present"
 Assert-Equal $profiles[5].bitrate_mbps 120 "Native 1600p165 high-bitrate profile reaches 120 Mbps"
-Assert-Equal $profiles[7].fps 180 "180 FPS profile is present"
-Assert-Equal $profiles[8].fps 249 "249 FPS profile is present"
+Assert-Equal $profiles[6].id "1600p165_120mbps_adaptive" "Native 1600p165 adaptive high-bitrate profile is present"
+Assert-Equal $profiles[6].bitrate_mbps 120 "Native 1600p165 adaptive profile starts from 120 Mbps"
+Assert-True $profiles[6].adaptive "Native 1600p165 high-bitrate profile enables adaptive autorun"
+Assert-Equal $profiles[8].fps 180 "180 FPS profile is present"
+Assert-Equal $profiles[9].fps 249 "249 FPS profile is present"
 
 $h264CrossChain = New-CanaryMediaChain -Mode "cross" -Codec "h264"
 Assert-Equal $h264CrossChain "dxgi/nvenc_h264/quic_datagram_media_v3_or_v2/nvdec/d3d11_shared" "H.264 cross chain remains the default"
@@ -149,6 +152,8 @@ $sampleFpsReport = [pscustomobject]@{
   failureReason = $null
   errorMessage = $null
   sampleObservedFps = 57.0
+  sampleFramesDecoded = 1710
+  sampleFramesDropped = 1
   probeSnapshot = [pscustomobject]@{
     current_fps = 44.0
     frames_decoded = 484
@@ -178,7 +183,61 @@ $sampleFpsReport = [pscustomobject]@{
 }
 $sampleFpsRow = Convert-CrossReportToCanaryRow -Profile $profiles[0] -Report $sampleFpsReport -ReportPath "raw/cross-1080p60.json"
 Assert-Equal $sampleFpsRow.fps_observed 57.0 "Cross report prefers sample-window FPS over cumulative probe FPS"
+Assert-Equal $sampleFpsRow.sample_probe_dropped_frames 1 "Cross row carries sample-window probe drops separately from cumulative drops"
 Assert-Equal $sampleFpsRow.test_impairment.datagrams_dropped 1 "Cross row carries media impairment counters"
+
+$adaptiveDowngradeReport = [pscustomobject]@{
+  status = "completed"
+  failureReason = $null
+  errorMessage = $null
+  sampleObservedFps = 94.0
+  sampleObservedRenderFps = 91.0
+  sampleRenderFramesPresented = 2730
+  probeSnapshot = [pscustomobject]@{
+    current_fps = 94.0
+    frames_decoded = 2835
+    frames_dropped = 308
+    media_probe_width = 1920
+    media_probe_height = 1200
+    media_probe_target_fps = 90
+    media_probe_target_bitrate_mbps = 28
+  }
+  mediaPipelineSnapshot = [pscustomobject]@{
+    dropped_frames = 0
+    queue_depth = 0
+    render_queue_replacements = 17
+    render_lock_drops = 0
+    render_presented_frames = 2734
+    stage_metrics = @(
+      [pscustomobject]@{ stage = "render_present_gap"; p50_ms = 10.9; p95_ms = 15.0 }
+    )
+    test_impairment = $null
+    active_codec = "hevc"
+    adaptation = [pscustomobject]@{
+      current_profile = [pscustomobject]@{ width = 1920; height = 1200; fps = 90; bitrate_mbps = 28; codec = "hevc" }
+      target_profile = [pscustomobject]@{ width = 1920; height = 1200; fps = 90; bitrate_mbps = 28; codec = "hevc" }
+      state = "stable"
+      ladder_index = 5
+      last_reason = "present gap p95 exceeds 10.42ms perceptual budget"
+    }
+  }
+  sessionSnapshot = [pscustomobject]@{ state = "streaming" }
+}
+$adaptiveDowngradeRow = Convert-CrossReportToCanaryRow -Profile $profiles[6] -Report $adaptiveDowngradeReport -ReportPath "raw/cross-1600p165-adaptive.json" -RequestedCodec "hevc"
+Assert-Equal $adaptiveDowngradeRow.status "completed" "Adaptive profile changes are accepted as completed rows"
+Assert-Equal $adaptiveDowngradeRow.classification "completed" "Adaptive profile changes are not marked as profile downgrade"
+Assert-Equal $adaptiveDowngradeRow.selected_profile.width 1920 "Adaptive row keeps the final selected width"
+Assert-Equal $adaptiveDowngradeRow.active_codec "hevc" "Adaptive row keeps HEVC after downgrade"
+Assert-Equal $adaptiveDowngradeRow.adaptation_state "stable" "Adaptive row exposes the final adaptation state"
+Assert-Equal $adaptiveDowngradeRow.adaptation_ladder_index 5 "Adaptive row exposes the final ladder index"
+Assert-Equal $adaptiveDowngradeRow.adaptation_last_reason "present gap p95 exceeds 10.42ms perceptual budget" "Adaptive row exposes the last adaptation reason"
+
+$startupDropOnlyIssue = Get-CanaryVisualIntegrityIssue `
+  -Probe ([pscustomobject]@{ frames_decoded = 4800; frames_dropped = 250 }) `
+  -Pipeline ([pscustomobject]@{ render_queue_replacements = 0; render_lock_drops = 0; stage_metrics = @() }) `
+  -Report ([pscustomobject]@{ sampleFramesDecoded = 4700; sampleFramesDropped = 1 }) `
+  -Profile $profiles[6]
+Assert-True ($null -eq $startupDropOnlyIssue) "Visual integrity check uses sample-window drops when available"
 
 $hevcReport = [pscustomobject]@{
   status = "completed"

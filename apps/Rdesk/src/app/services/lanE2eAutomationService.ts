@@ -118,6 +118,7 @@ export interface LanE2EAutomationReport {
   mediaVerified: boolean;
   sampleDurationMs: number;
   sampleFramesDecoded: number;
+  sampleFramesDropped: number;
   sampleObservedFps?: number;
   sampleRenderFramesPresented: number;
   sampleObservedRenderFps?: number;
@@ -264,12 +265,18 @@ export async function runLanE2EAutomation(
   let sessionStarted = false;
   let sampleDurationMs = 0;
   let sampleFramesDecoded = 0;
+  let sampleFramesDropped = 0;
   let sampleObservedFps: number | undefined;
   let sampleRenderFramesPresented = 0;
   let sampleObservedRenderFps: number | undefined;
   let renderCappedProfileApplied = false;
   let sampleFpsBaseline:
-    | { framesDecoded: number; renderPresentedFrames: number; sampleDurationMs: number }
+    | {
+        framesDecoded: number;
+        framesDropped: number;
+        renderPresentedFrames: number;
+        sampleDurationMs: number;
+      }
     | undefined;
 
   const stage = (
@@ -310,6 +317,7 @@ export async function runLanE2EAutomation(
       (validationMode === "webrtc_rtp" || profileProbeResult?.status === "passed"),
     sampleDurationMs,
     sampleFramesDecoded,
+    sampleFramesDropped,
     sampleObservedFps,
     sampleRenderFramesPresented,
     sampleObservedRenderFps,
@@ -423,14 +431,28 @@ export async function runLanE2EAutomation(
         stage("display_mode", "completed");
         if (captureSource) {
           stage("capture_source", "started");
-          captureSourceSelection = await selectRemoteCaptureSourceForSession(
-            commands,
-            sessionId,
-            options.preferredCaptureSourceId ?? captureSource.id,
-            options.preferredCaptureSourceKind
-          );
-          captureSource = captureSourceSelection.source;
-          stage("capture_source", "completed");
+          try {
+            captureSourceSelection = await selectRemoteCaptureSourceForSession(
+              commands,
+              sessionId,
+              options.preferredCaptureSourceId ?? captureSource.id,
+              options.preferredCaptureSourceKind
+            );
+            captureSource = captureSourceSelection.source;
+            stage("capture_source", "completed");
+          } catch (error) {
+            const message =
+              error instanceof Error
+                ? error.message
+                : `Remote capture source refresh failed: ${String(error)}`;
+            captureSourceSelection = {
+              session_id: sessionId,
+              source: captureSource,
+              status: "selected",
+              reason: `Reused pre-display-mode source after refresh failed: ${message}`,
+            };
+            stage("capture_source", "skipped", captureSourceSelection.reason ?? undefined);
+          }
         }
       }
     }
@@ -530,6 +552,7 @@ export async function runLanE2EAutomation(
         sampleStartedAt = now();
         sampleDurationMs = 0;
         sampleFramesDecoded = 0;
+        sampleFramesDropped = 0;
         sampleObservedFps = undefined;
         sampleRenderFramesPresented = 0;
         sampleObservedRenderFps = undefined;
@@ -541,6 +564,7 @@ export async function runLanE2EAutomation(
       if (!sampleFpsBaseline) {
         sampleFpsBaseline = {
           framesDecoded: probeSnapshot.frames_decoded,
+          framesDropped: probeSnapshot.frames_dropped,
           renderPresentedFrames: mediaPipelineSnapshot.render_presented_frames ?? 0,
           sampleDurationMs,
         };
@@ -548,6 +572,10 @@ export async function runLanE2EAutomation(
         sampleFramesDecoded = Math.max(
           0,
           probeSnapshot.frames_decoded - sampleFpsBaseline.framesDecoded
+        );
+        sampleFramesDropped = Math.max(
+          0,
+          probeSnapshot.frames_dropped - sampleFpsBaseline.framesDropped
         );
         const sampleFpsElapsedMs =
           sampleDurationMs - sampleFpsBaseline.sampleDurationMs;
@@ -695,6 +723,11 @@ function buildAdaptiveMediaConfig(
   overrides: AdaptiveMediaConfig | undefined
 ): AdaptiveMediaConfig {
   const ceilingProfile = requestedProfile ?? DEFAULT_LAN_MEDIA_PROFILE;
+  const normalizedCeilingProfile = {
+    ...ceilingProfile,
+    bitrate_mbps: Math.max(80, ceilingProfile.bitrate_mbps),
+    codec: ceilingProfile.codec || "h264",
+  };
   const sourceAspect =
     captureSource && captureSource.width > 0 && captureSource.height > 0
       ? captureSource.width / captureSource.height
@@ -704,17 +737,13 @@ function buildAdaptiveMediaConfig(
   return {
     enabled: true,
     mode: "keyframe_ladder",
-    ceiling_profile: {
-      ...ceilingProfile,
-      bitrate_mbps: Math.max(80, ceilingProfile.bitrate_mbps),
-      codec: ceilingProfile.codec || "h264",
-    },
+    ceiling_profile: normalizedCeilingProfile,
     floor_profile: {
+      ...normalizedCeilingProfile,
       width: floorWidth,
       height: floorHeight,
       fps: 60,
       bitrate_mbps: 10,
-      codec: "h264",
     },
     ladder: [],
     downshift_cooldown_ms: 2_000,
