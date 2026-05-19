@@ -2765,8 +2765,6 @@ async fn send_quic_media_loop(
         .lock()
         .await
         .supports(&session_id, LAN_QUIC_PERSISTENT_MEDIA_TRANSPORT);
-    let reliable_media_send_mode =
-        select_reliable_media_send_mode(reliable_media_supported, persistent_media_supported);
     let media_v3_supported = app_state
         .peer_media_capabilities
         .lock()
@@ -2783,6 +2781,11 @@ async fn send_quic_media_loop(
             return Ok(());
         }
         let profile = selected_media_profile(&app_state, &session_id).await;
+        let reliable_media_send_mode = select_reliable_media_send_mode_for_profile(
+            reliable_media_supported,
+            persistent_media_supported,
+            &profile,
+        );
         let max_datagram_size = lan_media_datagram_size(
             negotiated_max_datagram_size,
             &profile,
@@ -3547,6 +3550,20 @@ fn select_reliable_media_send_mode(
     }
 }
 
+fn select_reliable_media_send_mode_for_profile(
+    reliable_media_supported: bool,
+    persistent_media_supported: bool,
+    profile: &MediaProfile,
+) -> LanReliableMediaSendMode {
+    if reliable_media_supported
+        && profile.bitrate_mbps >= LAN_QUIC_RELIABLE_WHOLE_FRAME_MIN_BITRATE_MBPS
+    {
+        LanReliableMediaSendMode::PerMessage
+    } else {
+        select_reliable_media_send_mode(reliable_media_supported, persistent_media_supported)
+    }
+}
+
 fn use_best_effort_media_datagrams(profile: &MediaProfile) -> bool {
     profile.bitrate_mbps <= LAN_QUIC_BEST_EFFORT_DATAGRAM_MAX_BITRATE_MBPS
 }
@@ -3719,25 +3736,34 @@ async fn receive_quic_media_loop(
         .lock()
         .await
         .supports(&session_id, LAN_QUIC_PERSISTENT_MEDIA_TRANSPORT);
-    let reliable_media_supported = persistent_reliable_media_supported
-        || app_state
-            .peer_media_capabilities
-            .lock()
-            .await
-            .supports(&session_id, LAN_QUIC_RELIABLE_MEDIA_TRANSPORT);
-    let mut reliable_media_rx = if reliable_media_supported {
+    let per_message_reliable_media_supported = app_state
+        .peer_media_capabilities
+        .lock()
+        .await
+        .supports(&session_id, LAN_QUIC_RELIABLE_MEDIA_TRANSPORT);
+    let initial_media_profile = selected_media_profile(&app_state, &session_id).await;
+    let reliable_media_read_mode = select_reliable_media_send_mode_for_profile(
+        per_message_reliable_media_supported,
+        persistent_reliable_media_supported,
+        &initial_media_profile,
+    );
+    let mut reliable_media_rx = if reliable_media_read_mode != LanReliableMediaSendMode::Disabled {
         let (tx, rx) = tokio::sync::mpsc::channel(32);
         let reliable_endpoint = endpoint.clone();
         tokio::spawn(async move {
             loop {
-                let result = if persistent_reliable_media_supported {
-                    reliable_endpoint
-                        .read_reliable_message_persistent(LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES)
-                        .await
-                } else {
-                    reliable_endpoint
-                        .read_reliable_message(LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES)
-                        .await
+                let result = match reliable_media_read_mode {
+                    LanReliableMediaSendMode::Disabled => break,
+                    LanReliableMediaSendMode::PerMessage => {
+                        reliable_endpoint
+                            .read_reliable_message(LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES)
+                            .await
+                    }
+                    LanReliableMediaSendMode::Persistent => {
+                        reliable_endpoint
+                            .read_reliable_message_persistent(LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES)
+                            .await
+                    }
                 };
                 let should_retry = result.is_err();
                 if tx
@@ -7586,6 +7612,39 @@ mod tests {
         assert_eq!(
             select_reliable_media_send_mode(false, false),
             LanReliableMediaSendMode::Disabled
+        );
+    }
+
+    #[test]
+    fn high_bitrate_reliable_media_prefers_per_message_streams_to_reduce_hol() {
+        let high_bitrate = MediaProfile {
+            width: 2560,
+            height: 1600,
+            fps: 165,
+            bitrate_mbps: 120,
+            codec: "hevc".to_string(),
+            ..MediaProfile::default()
+        };
+        let stable_bitrate = MediaProfile {
+            width: 2560,
+            height: 1440,
+            fps: 144,
+            bitrate_mbps: 80,
+            codec: "hevc".to_string(),
+            ..MediaProfile::default()
+        };
+
+        assert_eq!(
+            select_reliable_media_send_mode_for_profile(true, true, &high_bitrate),
+            LanReliableMediaSendMode::PerMessage
+        );
+        assert_eq!(
+            select_reliable_media_send_mode_for_profile(true, true, &stable_bitrate),
+            LanReliableMediaSendMode::Persistent
+        );
+        assert_eq!(
+            select_reliable_media_send_mode_for_profile(false, true, &high_bitrate),
+            LanReliableMediaSendMode::Persistent
         );
     }
 
