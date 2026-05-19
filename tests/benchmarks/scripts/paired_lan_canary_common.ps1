@@ -235,6 +235,7 @@ function Convert-CrossReportToCanaryRow {
     render_queue_replacements = $renderQueueReplacements
     render_lock_drops = $renderLockDrops
     queue_depth = $pipeline.queue_depth
+    stage_p50_ms = Convert-MediaStageMetricsToP50Map -StageMetrics $pipeline.stage_metrics
     stage_p95_ms = Convert-MediaStageMetricsToP95Map -StageMetrics $pipeline.stage_metrics
     test_impairment = $pipeline.test_impairment
     adaptive = [bool](Select-CanaryValue $Profile.adaptive $false)
@@ -349,6 +350,18 @@ function Convert-MediaStageMetricsToP95Map {
   if ($StageMetrics) {
     foreach ($metric in $StageMetrics) {
       $map[$metric.stage] = $metric.p95_ms
+    }
+  }
+  [pscustomobject]$map
+}
+
+function Convert-MediaStageMetricsToP50Map {
+  param($StageMetrics)
+
+  $map = [ordered]@{}
+  if ($StageMetrics) {
+    foreach ($metric in $StageMetrics) {
+      $map[$metric.stage] = $metric.p50_ms
     }
   }
   [pscustomobject]$map
@@ -535,17 +548,21 @@ function Write-CanaryJsonAndMarkdown {
     "- Skipped: $($Report.skipped)",
     "- Failed: $($Report.failed)",
     "",
-    "| Profile | Status | Class | FPS | Selected | Visual | Probe Drop | Render Coalesce | Render Drop | Queue | Error |",
-    "| --- | --- | --- | ---: | --- | --- | ---: | ---: | ---: | ---: | --- |"
+    "| Profile | Status | Class | FPS | Selected | Visual | Enc P50/P95 | Send P50/P95 | Probe Drop | Render Coalesce | Render Drop | Queue | Error |",
+    "| --- | --- | --- | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
   )
   foreach ($row in $Report.rows) {
     $selected = "$($row.selected_profile.width)x$($row.selected_profile.height)@$($row.selected_profile.fps)/$($row.selected_profile.bitrate_mbps)Mbps"
     $error = ((Select-CanaryValue $row.error_message "") -replace "\|", "/")
     $visual = Select-CanaryValue $row.visual_integrity_status "n/a"
+    $encodeP50 = [Math]::Round([double](Select-CanaryValue $row.stage_p50_ms.'sender.encode' 0), 2)
+    $encodeP95 = [Math]::Round([double](Select-CanaryValue $row.stage_p95_ms.'sender.encode' 0), 2)
+    $sendP50 = [Math]::Round([double](Select-CanaryValue $row.stage_p50_ms.'sender.send_datagram' 0), 2)
+    $sendP95 = [Math]::Round([double](Select-CanaryValue $row.stage_p95_ms.'sender.send_datagram' 0), 2)
     $probeDrops = Select-CanaryValue $row.probe_dropped_frames $row.dropped_frames
     $renderCoalesce = Select-CanaryValue $row.render_queue_replacements 0
     $renderDrops = Select-CanaryValue $row.render_lock_drops 0
-    $lines += "| $($row.id) | $($row.status) | $($row.classification) | $([Math]::Round([double](Select-CanaryValue $row.fps_observed 0), 2)) | $selected | $visual | $probeDrops | $renderCoalesce | $renderDrops | $($row.queue_depth) | $error |"
+    $lines += "| $($row.id) | $($row.status) | $($row.classification) | $([Math]::Round([double](Select-CanaryValue $row.fps_observed 0), 2)) | $selected | $visual | $encodeP50/$encodeP95 | $sendP50/$sendP95 | $probeDrops | $renderCoalesce | $renderDrops | $($row.queue_depth) | $error |"
   }
   if ($Report.codec_request) {
     $lines += ""

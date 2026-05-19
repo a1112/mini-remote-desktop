@@ -197,7 +197,12 @@ $hevcReport = [pscustomobject]@{
   mediaPipelineSnapshot = [pscustomobject]@{
     dropped_frames = 0
     queue_depth = 0
-    stage_metrics = @()
+    stage_metrics = @(
+      [pscustomobject]@{ stage = "sender.encode"; p50_ms = 0.6; p95_ms = 4.8 },
+      [pscustomobject]@{ stage = "sender.send_datagram"; p50_ms = 1.1; p95_ms = 3.2 },
+      [pscustomobject]@{ stage = "receiver.decode"; p50_ms = 1.3; p95_ms = 1.9 },
+      [pscustomobject]@{ stage = "render_present"; p50_ms = 0.2; p95_ms = 0.4 }
+    )
     test_impairment = $null
     active_codec = "hevc"
     active_codec_profile = "main"
@@ -215,6 +220,9 @@ Assert-Equal $hevcRow.active_codec_profile "main" "HEVC cross row carries active
 Assert-Equal $hevcRow.active_chroma_subsampling "4:2:0" "HEVC cross row carries chroma sampling"
 Assert-Equal $hevcRow.active_pixel_format "d3d11_shared_nv12" "HEVC cross row carries pixel format"
 Assert-Equal $hevcRow.visual_integrity_status "ok" "Healthy HEVC rows report visual integrity as ok"
+Assert-Equal $hevcRow.stage_p50_ms.'sender.encode' 0.6 "HEVC row exposes sender encode P50"
+Assert-Equal $hevcRow.stage_p50_ms.'sender.send_datagram' 1.1 "HEVC row exposes sender datagram send P50"
+Assert-Equal $hevcRow.stage_p95_ms.'sender.send_datagram' 3.2 "HEVC row still exposes sender datagram send P95"
 
 $renderDropReport = [pscustomobject]@{
   status = "completed"

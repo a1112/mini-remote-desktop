@@ -56,6 +56,7 @@ const LAN_MEDIA_MAX_FPS: u32 = 249;
 const LAN_MEDIA_TARGET_BITRATE_MBPS: u32 = 120;
 const LAN_QUIC_BEST_EFFORT_DATAGRAM_MAX_BITRATE_MBPS: u32 = 40;
 const LAN_QUIC_FALLBACK_DATAGRAM_BYTES: usize = 1_200;
+const LAN_QUIC_LAN_HIGH_QUALITY_DATAGRAM_BYTES: usize = 1_350;
 const LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES: usize = 4 * 1024 * 1024;
 const LAN_QUIC_RELIABLE_MEDIA_RETRY_DELAY: Duration = Duration::from_millis(10);
 const LAN_QUIC_MEDIA_TRANSPORT: &str = "quic_datagram";
@@ -2736,10 +2737,9 @@ async fn send_quic_media_loop(
     endpoint: QuinnDatagramEndpoint,
     session_id: SessionId,
 ) -> Result<()> {
-    let max_datagram_size = endpoint
+    let negotiated_max_datagram_size = endpoint
         .max_datagram_size()
         .unwrap_or(LAN_QUIC_FALLBACK_DATAGRAM_BYTES)
-        .min(LAN_QUIC_FALLBACK_DATAGRAM_BYTES)
         .max(QUIC_MEDIA_V3_FRAGMENT_HEADER_LEN.max(QUIC_AU_FRAGMENT_HEADER_LEN) + 1);
 
     let mut frame_id = 1_u64;
@@ -2769,12 +2769,22 @@ async fn send_quic_media_loop(
         .lock()
         .await
         .supports(&session_id, LAN_QUIC_MEDIA_V3_TRANSPORT);
+    let high_quality_datagram_supported = app_state
+        .peer_media_capabilities
+        .lock()
+        .await
+        .supports(&session_id, LAN_QUIC_MEDIA_PROFILE_TRANSPORT);
     loop {
         let loop_started = Instant::now();
         if !session_allows_media(&app_state, &session_id).await {
             return Ok(());
         }
         let profile = selected_media_profile(&app_state, &session_id).await;
+        let max_datagram_size = lan_media_datagram_size(
+            negotiated_max_datagram_size,
+            &profile,
+            high_quality_datagram_supported,
+        );
         let requested_codec = LanAccessUnitCodec::from_profile(&profile);
         let frame_interval = media_frame_interval(&profile);
         if active_frame_interval != frame_interval {
@@ -3154,11 +3164,12 @@ async fn send_quic_media_loop(
                         let delayed_fragment = fragment.clone();
                         tokio::spawn(async move {
                             tokio::time::sleep(decision.delay).await;
-                            let send_result = if best_effort_datagrams {
-                                delayed_endpoint.send_datagram(delayed_fragment)
-                            } else {
-                                delayed_endpoint.send_datagram_wait(delayed_fragment).await
-                            };
+                            let send_result = send_lan_media_datagram(
+                                &delayed_endpoint,
+                                delayed_fragment,
+                                !best_effort_datagrams,
+                            )
+                            .await;
                             if let Err(error) = send_result {
                                 tracing::debug!(
                                     %error,
@@ -3170,11 +3181,12 @@ async fn send_quic_media_loop(
                         });
                         continue;
                     }
-                    let send_fragment_result = if best_effort_datagrams {
-                        endpoint.send_datagram(fragment.clone())
-                    } else {
-                        endpoint.send_datagram_wait(fragment.clone()).await
-                    };
+                    let send_fragment_result = send_lan_media_datagram(
+                        &endpoint,
+                        fragment.clone(),
+                        !best_effort_datagrams,
+                    )
+                    .await;
                     if let Err(error) = send_fragment_result {
                         send_result = Err(error).with_context(|| {
                             format!("failed to send LAN QUIC media frame {}", frame_id)
@@ -3534,6 +3546,40 @@ fn select_reliable_media_send_mode(
 
 fn use_best_effort_media_datagrams(profile: &MediaProfile) -> bool {
     profile.bitrate_mbps <= LAN_QUIC_BEST_EFFORT_DATAGRAM_MAX_BITRATE_MBPS
+}
+
+fn lan_media_datagram_size(
+    negotiated_max_datagram_size: usize,
+    profile: &MediaProfile,
+    high_quality_datagram_supported: bool,
+) -> usize {
+    let minimum = QUIC_MEDIA_V3_FRAGMENT_HEADER_LEN.max(QUIC_AU_FRAGMENT_HEADER_LEN) + 1;
+    let safe_cap = if high_quality_datagram_supported && !use_best_effort_media_datagrams(profile) {
+        LAN_QUIC_LAN_HIGH_QUALITY_DATAGRAM_BYTES
+    } else {
+        LAN_QUIC_FALLBACK_DATAGRAM_BYTES
+    };
+    negotiated_max_datagram_size.min(safe_cap).max(minimum)
+}
+
+async fn send_lan_media_datagram(
+    endpoint: &QuinnDatagramEndpoint,
+    fragment: bytes::Bytes,
+    wait_for_capacity: bool,
+) -> Result<()> {
+    if !wait_for_capacity {
+        return endpoint
+            .send_datagram(fragment)
+            .context("failed to send LAN QUIC media datagram");
+    }
+
+    match endpoint.send_datagram(fragment.clone()) {
+        Ok(()) => Ok(()),
+        Err(_) => endpoint
+            .send_datagram_wait(fragment)
+            .await
+            .context("failed to send LAN QUIC media datagram after waiting for capacity"),
+    }
 }
 
 async fn send_lan_reliable_media_fragment(
@@ -7497,6 +7543,27 @@ mod tests {
         assert!(use_best_effort_media_datagrams(&low_latency));
         assert!(!use_best_effort_media_datagrams(&high_quality_2k144));
         assert!(!use_best_effort_media_datagrams(&high_bitrate));
+    }
+
+    #[test]
+    fn high_quality_lan_media_uses_larger_safe_datagram_size_when_negotiated() {
+        let profile = MediaProfile {
+            width: 2560,
+            height: 1600,
+            fps: 165,
+            bitrate_mbps: 120,
+            codec: "hevc".to_string(),
+            ..MediaProfile::default()
+        };
+
+        assert_eq!(
+            lan_media_datagram_size(1_500, &profile, true),
+            LAN_QUIC_LAN_HIGH_QUALITY_DATAGRAM_BYTES
+        );
+        assert_eq!(
+            lan_media_datagram_size(1_500, &profile, false),
+            LAN_QUIC_FALLBACK_DATAGRAM_BYTES
+        );
     }
 
     #[test]

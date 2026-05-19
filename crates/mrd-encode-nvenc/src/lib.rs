@@ -45,7 +45,7 @@ mod imp {
     use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 
     const H264_SHARED_ASYNC_SLOT_COUNT: usize = 2;
-    const HEVC_SHARED_ASYNC_SLOT_COUNT: usize = 2;
+    const HEVC_SHARED_ASYNC_SLOT_COUNT: usize = 3;
     const SHARED_INPUT_CACHE_LIMIT: usize = 8;
 
     pub struct NvencH264Encoder {
@@ -1211,6 +1211,17 @@ mod imp {
             NVencTuningInfo::UltraLowLatency
         } else {
             NVencTuningInfo::LowLatency
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn hevc_shared_encode_queue_has_tail_latency_headroom() {
+            assert!(HEVC_SHARED_ASYNC_SLOT_COUNT >= 3);
+            assert!(HEVC_SHARED_ASYNC_SLOT_COUNT <= 4);
         }
     }
 
