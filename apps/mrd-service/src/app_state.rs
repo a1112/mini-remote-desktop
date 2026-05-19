@@ -20,6 +20,10 @@ use mrd_render::{BoxedRenderer, RenderFrame, RenderTarget, RendererFactory};
 use mrd_render_d3d11::D3d11RendererFactory;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+#[cfg(windows)]
+use std::time::Duration;
+#[cfg(windows)]
+use tokio::time::Instant;
 use tokio::{sync::Mutex, task::AbortHandle};
 
 const MEDIA_STAGE_SAMPLE_LIMIT: usize = 240;
@@ -250,6 +254,8 @@ pub enum MediaRenderQueueEnqueue {
 struct MediaRenderQueueState {
     running: bool,
     pending: Option<RenderFrame>,
+    last_enqueue_at: Option<Instant>,
+    last_present_at: Option<Instant>,
 }
 
 #[cfg(windows)]
@@ -288,9 +294,53 @@ impl MediaRenderQueueRegistry {
         None
     }
 
+    pub fn pacing_delay(&self, session_id: &SessionId, fps: u32, now: Instant) -> Duration {
+        let Some(last_present_at) = self
+            .queues
+            .get(session_id)
+            .and_then(|state| state.last_present_at)
+        else {
+            return Duration::ZERO;
+        };
+        let Some(frame_interval) = render_frame_interval(fps) else {
+            return Duration::ZERO;
+        };
+        let elapsed = now
+            .checked_duration_since(last_present_at)
+            .unwrap_or(Duration::ZERO);
+        frame_interval.saturating_sub(elapsed)
+    }
+
+    pub fn record_enqueued(&mut self, session_id: &SessionId, at: Instant) -> Option<Duration> {
+        let state = self.queues.entry(session_id.clone()).or_default();
+        let gap = state
+            .last_enqueue_at
+            .and_then(|last| at.checked_duration_since(last));
+        state.last_enqueue_at = Some(at);
+        gap
+    }
+
+    pub fn record_presented(&mut self, session_id: &SessionId, at: Instant) -> Option<Duration> {
+        let state = self.queues.entry(session_id.clone()).or_default();
+        let gap = state
+            .last_present_at
+            .and_then(|last| at.checked_duration_since(last));
+        state.last_present_at = Some(at);
+        gap
+    }
+
     pub fn remove(&mut self, session_id: &SessionId) {
         self.queues.remove(session_id);
     }
+}
+
+#[cfg(windows)]
+fn render_frame_interval(fps: u32) -> Option<Duration> {
+    if fps == 0 {
+        return None;
+    }
+
+    Some(Duration::from_secs_f64(1.0 / f64::from(fps)))
 }
 
 impl MediaPipelineRegistry {
@@ -1588,6 +1638,63 @@ mod tests {
             MediaRenderQueueEnqueue::Start(frame) => assert_eq!(frame, first),
             other => panic!("expected render worker restart, got {other:?}"),
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn media_render_queue_paces_early_frames_to_target_fps() {
+        use std::time::Duration;
+        use tokio::time::Instant;
+
+        let mut registry = MediaRenderQueueRegistry::default();
+        let session_id = SessionId("render-pacing-session".to_string());
+        let now = Instant::now();
+
+        assert_eq!(registry.pacing_delay(&session_id, 165, now), Duration::ZERO);
+
+        registry.record_presented(&session_id, now);
+        let early = now + Duration::from_millis(2);
+        let early_delay = registry.pacing_delay(&session_id, 165, early);
+        assert!(
+            early_delay >= Duration::from_millis(3),
+            "expected pacing delay for early frame, got {early_delay:?}"
+        );
+        assert!(
+            early_delay <= Duration::from_millis(5),
+            "expected bounded pacing delay for early frame, got {early_delay:?}"
+        );
+
+        let late = now + Duration::from_millis(10);
+        assert_eq!(
+            registry.pacing_delay(&session_id, 165, late),
+            Duration::ZERO
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn media_render_queue_records_enqueue_and_present_gaps() {
+        use std::time::Duration;
+        use tokio::time::Instant;
+
+        let mut registry = MediaRenderQueueRegistry::default();
+        let session_id = SessionId("render-gap-session".to_string());
+        let now = Instant::now();
+
+        assert_eq!(registry.record_enqueued(&session_id, now), None);
+        assert_eq!(
+            registry.record_enqueued(&session_id, now + Duration::from_millis(7)),
+            Some(Duration::from_millis(7))
+        );
+
+        assert_eq!(
+            registry.record_presented(&session_id, now + Duration::from_millis(1)),
+            None
+        );
+        assert_eq!(
+            registry.record_presented(&session_id, now + Duration::from_millis(9)),
+            Some(Duration::from_millis(8))
+        );
     }
 
     #[test]

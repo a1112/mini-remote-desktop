@@ -44,6 +44,7 @@ const LAN_TEST_IMPAIRMENT_JITTER_MS_ENV: &str = "MRD_LAN_TEST_IMPAIRMENT_JITTER_
 const LAN_TEST_IMPAIRMENT_MTU_BYTES_ENV: &str = "MRD_LAN_TEST_IMPAIRMENT_MTU_BYTES";
 const LAN_TEST_IMPAIRMENT_SEED_ENV: &str = "MRD_LAN_TEST_IMPAIRMENT_SEED";
 const LAN_RELIABLE_WHOLE_FRAME_ENV: &str = "MRD_LAN_RELIABLE_WHOLE_FRAME";
+const LAN_RENDER_PACING_ENV: &str = "MRD_LAN_RENDER_PACING";
 const PROTOCOL_VERSION: u32 = 1;
 const ANNOUNCE_INTERVAL_SECS: u64 = 3;
 const PEER_TTL_SECS: u64 = 12;
@@ -62,6 +63,8 @@ const LAN_QUIC_FALLBACK_DATAGRAM_BYTES: usize = 1_200;
 // Larger datagrams reduce sender P95 but raised cross-device frame drop ratio.
 const LAN_QUIC_LAN_HIGH_QUALITY_DATAGRAM_BYTES: usize = LAN_QUIC_FALLBACK_DATAGRAM_BYTES;
 const LAN_QUIC_RELIABLE_WHOLE_FRAME_MIN_BITRATE_MBPS: u32 = 80;
+const LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_BITRATE_MBPS: u32 = 120;
+const LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_FPS: u32 = 160;
 const LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES: usize = 4 * 1024 * 1024;
 const LAN_QUIC_RELIABLE_MEDIA_RETRY_DELAY: Duration = Duration::from_millis(10);
 const LAN_MEDIA_HIGH_RESOLUTION_TIMER_MIN_FPS: u32 = 90;
@@ -3640,7 +3643,7 @@ fn should_send_access_unit_as_reliable_frame(
     reliable_media_supported: bool,
     media_v3_supported: bool,
     _fragment_count: usize,
-    _profile: &MediaProfile,
+    profile: &MediaProfile,
     reliable_whole_frame_override: Option<bool>,
 ) -> bool {
     if !reliable_media_supported || !media_v3_supported {
@@ -3650,7 +3653,12 @@ fn should_send_access_unit_as_reliable_frame(
         return enabled;
     }
 
-    false
+    should_default_to_reliable_whole_frame(profile)
+}
+
+fn should_default_to_reliable_whole_frame(profile: &MediaProfile) -> bool {
+    profile.bitrate_mbps >= LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_BITRATE_MBPS
+        && profile.fps >= LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_FPS
 }
 
 fn reliable_whole_frame_media_override() -> Option<bool> {
@@ -3666,6 +3674,18 @@ fn reliable_whole_frame_media_override_from_env_value(value: Option<&str>) -> Op
         "" => None,
         _ => None,
     }
+}
+
+#[cfg(windows)]
+fn lan_render_pacing_enabled() -> bool {
+    lan_render_pacing_from_env_value(std::env::var(LAN_RENDER_PACING_ENV).ok().as_deref())
+}
+
+fn lan_render_pacing_from_env_value(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|value| value.trim().to_ascii_lowercase()),
+        Some(value) if matches!(value.as_str(), "1" | "true" | "yes" | "on")
+    )
 }
 
 fn h264_access_unit_is_keyframe(metadata_is_keyframe: bool, payload: &[u8]) -> bool {
@@ -4348,11 +4368,22 @@ async fn render_lan_decoded_frame(
     decoded_frame: &DecodedFrame,
 ) -> Result<()> {
     let render_frame = decoded_frame_to_render_frame(decoded_frame.clone())?;
-    let enqueue = app_state
-        .media_render_queues
-        .lock()
-        .await
-        .enqueue_latest(session_id.clone(), render_frame);
+    let (enqueue, enqueue_gap_ms) = {
+        let mut render_queues = app_state.media_render_queues.lock().await;
+        let now = Instant::now();
+        let enqueue_gap_ms = render_queues
+            .record_enqueued(session_id, now)
+            .map(duration_as_millis);
+        let enqueue = render_queues.enqueue_latest(session_id.clone(), render_frame);
+        (enqueue, enqueue_gap_ms)
+    };
+    if let Some(enqueue_gap_ms) = enqueue_gap_ms {
+        app_state
+            .media_pipelines
+            .lock()
+            .await
+            .record_stage_duration_ms(session_id.clone(), "render_enqueue_gap", enqueue_gap_ms);
+    }
     match enqueue {
         MediaRenderQueueEnqueue::Start(frame) => {
             spawn_lan_render_worker(app_state.clone(), session_id.clone(), frame);
@@ -4377,6 +4408,7 @@ fn spawn_lan_render_worker(
     tokio::spawn(async move {
         let mut frame = first_frame;
         loop {
+            pace_lan_render_frame(&app_state, &session_id).await;
             match render_lan_frame_once(app_state.clone(), session_id.clone(), frame).await {
                 Ok(LanRenderTaskOutcome::Rendered { duration_ms }) => {
                     app_state
@@ -4388,6 +4420,23 @@ fn spawn_lan_render_worker(
                             "render_present",
                             duration_ms,
                         );
+                    let present_gap_ms = app_state
+                        .media_render_queues
+                        .lock()
+                        .await
+                        .record_presented(&session_id, Instant::now())
+                        .map(duration_as_millis);
+                    if let Some(present_gap_ms) = present_gap_ms {
+                        app_state
+                            .media_pipelines
+                            .lock()
+                            .await
+                            .record_stage_duration_ms(
+                                session_id.clone(),
+                                "render_present_gap",
+                                present_gap_ms,
+                            );
+                    }
                 }
                 Ok(LanRenderTaskOutcome::Dropped) => {
                     app_state
@@ -4431,6 +4480,52 @@ fn spawn_lan_render_worker(
             }
         }
     });
+}
+
+#[cfg(windows)]
+async fn pace_lan_render_frame(app_state: &Arc<AppState>, session_id: &SessionId) {
+    if !lan_render_pacing_enabled() {
+        return;
+    }
+
+    let fps = selected_media_profile(app_state, session_id).await.fps;
+    let delay =
+        app_state
+            .media_render_queues
+            .lock()
+            .await
+            .pacing_delay(session_id, fps, Instant::now());
+    if delay < Duration::from_micros(500) {
+        return;
+    }
+
+    let started = Instant::now();
+    sleep_until_lan_render_frame(started + delay).await;
+    app_state
+        .media_pipelines
+        .lock()
+        .await
+        .record_stage_duration_ms(
+            session_id.clone(),
+            "render_pacing_wait",
+            started.elapsed().as_secs_f64() * 1000.0,
+        );
+}
+
+#[cfg(windows)]
+async fn sleep_until_lan_render_frame(deadline: Instant) {
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+
+        if deadline > now + Duration::from_micros(750) {
+            tokio::task::yield_now().await;
+        } else {
+            std::hint::spin_loop();
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -5904,6 +5999,10 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn duration_as_millis(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
 }
 
 fn new_instance_id() -> String {
@@ -7794,15 +7893,17 @@ mod tests {
     }
 
     #[test]
-    fn high_bitrate_media_keeps_delta_frames_on_datagrams_by_default() {
-        let high_bitrate = MediaProfile {
-            width: 2560,
-            height: 1600,
-            fps: 165,
-            bitrate_mbps: 120,
-            codec: "hevc".to_string(),
-            ..MediaProfile::default()
-        };
+    fn render_pacing_env_override_is_opt_in_only() {
+        assert!(!lan_render_pacing_from_env_value(None));
+        assert!(!lan_render_pacing_from_env_value(Some("")));
+        assert!(!lan_render_pacing_from_env_value(Some("0")));
+        assert!(!lan_render_pacing_from_env_value(Some("off")));
+        assert!(lan_render_pacing_from_env_value(Some("1")));
+        assert!(lan_render_pacing_from_env_value(Some("true")));
+    }
+
+    #[test]
+    fn stable_high_quality_media_keeps_delta_frames_on_datagrams_by_default() {
         let stable_bitrate = MediaProfile {
             width: 2560,
             height: 1440,
@@ -7816,14 +7917,56 @@ mod tests {
             true,
             true,
             64,
-            &high_bitrate,
+            &stable_bitrate,
+            None
+        ));
+    }
+
+    #[test]
+    fn ultra_high_bitrate_fps_uses_reliable_whole_frame_by_default() {
+        let ultra_high = MediaProfile {
+            width: 2560,
+            height: 1600,
+            fps: 165,
+            bitrate_mbps: 120,
+            codec: "hevc".to_string(),
+            ..MediaProfile::default()
+        };
+        let stable_2k144 = MediaProfile {
+            width: 2560,
+            height: 1440,
+            fps: 144,
+            bitrate_mbps: 80,
+            codec: "hevc".to_string(),
+            ..MediaProfile::default()
+        };
+
+        assert!(should_send_access_unit_as_reliable_frame(
+            true,
+            true,
+            64,
+            &ultra_high,
             None
         ));
         assert!(!should_send_access_unit_as_reliable_frame(
             true,
             true,
             64,
-            &stable_bitrate,
+            &stable_2k144,
+            None
+        ));
+        assert!(!should_send_access_unit_as_reliable_frame(
+            false,
+            true,
+            64,
+            &ultra_high,
+            None
+        ));
+        assert!(!should_send_access_unit_as_reliable_frame(
+            true,
+            false,
+            64,
+            &ultra_high,
             None
         ));
     }
