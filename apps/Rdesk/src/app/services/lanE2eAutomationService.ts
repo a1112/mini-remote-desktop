@@ -144,6 +144,10 @@ export interface LanE2EAutomationCommands {
     transportKind: string,
     requestedProfile?: MediaProfile
   ): Promise<AdapterResult<string>>;
+  ipcUpdateMediaProfile?(
+    sessionId: string,
+    requestedProfile: MediaProfile
+  ): Promise<AdapterResult<unknown>>;
   ipcConfigureMediaAdaptation?(
     sessionId: string,
     config: AdaptiveMediaConfig
@@ -238,7 +242,7 @@ export async function runLanE2EAutomation(
   const stopOnComplete = options.stopOnComplete ?? true;
   const transportKind = options.transportKind ?? "quic";
   const displayModePolicy = options.displayModePolicy ?? "none";
-  const requestedProfile =
+  let requestedProfile =
     shouldRequestMediaProfile(scenarioId, transportKind)
       ? options.requestedProfile ?? DEFAULT_LAN_MEDIA_PROFILE
       : options.requestedProfile;
@@ -259,6 +263,7 @@ export async function runLanE2EAutomation(
   let sampleDurationMs = 0;
   let sampleFramesDecoded = 0;
   let sampleObservedFps: number | undefined;
+  let renderCappedProfileApplied = false;
   let sampleFpsBaseline:
     | { framesDecoded: number; sampleDurationMs: number }
     | undefined;
@@ -489,7 +494,7 @@ export async function runLanE2EAutomation(
 
     stage("sample", "started");
     const deadline = now() + timeoutMs;
-    const sampleStartedAt = now();
+    let sampleStartedAt = now();
     while (now() <= deadline) {
       sessionSnapshot = await unwrap(
         commands.ipcSessionSnapshot(sessionId),
@@ -503,6 +508,26 @@ export async function runLanE2EAutomation(
       mediaAdaptationSnapshot = mediaPipelineSnapshot.adaptation ?? mediaAdaptationSnapshot;
       if (displayWindow) {
         displayWindow = syncDisplayWindowFromPipeline(displayWindow, mediaPipelineSnapshot);
+      }
+      const renderCappedProfile = buildRenderCappedMediaProfile(
+        requestedProfile,
+        mediaPipelineSnapshot,
+        renderCappedProfileApplied
+      );
+      if (renderCappedProfile && commands.ipcUpdateMediaProfile && !options.adaptive) {
+        await unwrap(
+          commands.ipcUpdateMediaProfile(sessionId, renderCappedProfile),
+          "runtime_error"
+        );
+        requestedProfile = renderCappedProfile;
+        renderCappedProfileApplied = true;
+        sampleStartedAt = now();
+        sampleDurationMs = 0;
+        sampleFramesDecoded = 0;
+        sampleObservedFps = undefined;
+        sampleFpsBaseline = undefined;
+        await sleep(sampleIntervalMs);
+        continue;
       }
       sampleDurationMs = now() - sampleStartedAt;
       if (!sampleFpsBaseline) {
@@ -623,6 +648,27 @@ function renderModeForAttachedSurface(backend: string): RemoteDisplayWindowConte
   if (backend === "linux") return "linux_native";
   if (backend === "d3d12") return "d3d12_native";
   return "d3d11_native";
+}
+
+function buildRenderCappedMediaProfile(
+  requestedProfile: MediaProfile | undefined,
+  snapshot: MediaPipelineSnapshot | undefined,
+  alreadyApplied: boolean
+): MediaProfile | undefined {
+  if (alreadyApplied || !requestedProfile || !snapshot) return undefined;
+  const renderTargetFps = snapshot.render_pacing_target_fps;
+  if (
+    !Number.isFinite(renderTargetFps) ||
+    !renderTargetFps ||
+    renderTargetFps <= 0 ||
+    renderTargetFps >= requestedProfile.fps
+  ) {
+    return undefined;
+  }
+  return {
+    ...requestedProfile,
+    fps: Math.max(1, Math.floor(renderTargetFps)),
+  };
 }
 
 function buildAdaptiveMediaConfig(

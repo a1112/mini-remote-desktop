@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, Notify};
@@ -45,6 +45,7 @@ const LAN_TEST_IMPAIRMENT_MTU_BYTES_ENV: &str = "MRD_LAN_TEST_IMPAIRMENT_MTU_BYT
 const LAN_TEST_IMPAIRMENT_SEED_ENV: &str = "MRD_LAN_TEST_IMPAIRMENT_SEED";
 const LAN_RELIABLE_WHOLE_FRAME_ENV: &str = "MRD_LAN_RELIABLE_WHOLE_FRAME";
 const LAN_RENDER_PACING_ENV: &str = "MRD_LAN_RENDER_PACING";
+const LAN_RENDER_MAX_FPS_ENV: &str = "MRD_LAN_RENDER_MAX_FPS";
 const PROTOCOL_VERSION: u32 = 1;
 const ANNOUNCE_INTERVAL_SECS: u64 = 3;
 const PEER_TTL_SECS: u64 = 12;
@@ -64,7 +65,7 @@ const LAN_QUIC_FALLBACK_DATAGRAM_BYTES: usize = 1_200;
 const LAN_QUIC_LAN_HIGH_QUALITY_DATAGRAM_BYTES: usize = LAN_QUIC_FALLBACK_DATAGRAM_BYTES;
 const LAN_QUIC_RELIABLE_WHOLE_FRAME_MIN_BITRATE_MBPS: u32 = 80;
 const LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_BITRATE_MBPS: u32 = 120;
-const LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_FPS: u32 = 160;
+const LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_FPS: u32 = 120;
 const LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES: usize = 4 * 1024 * 1024;
 const LAN_QUIC_RELIABLE_MEDIA_RETRY_DELAY: Duration = Duration::from_millis(10);
 const LAN_MEDIA_HIGH_RESOLUTION_TIMER_MIN_FPS: u32 = 90;
@@ -72,6 +73,8 @@ const LAN_MEDIA_HIGH_RESOLUTION_TIMER_PERIOD_MS: u32 = 1;
 const LAN_MEDIA_PRECISE_SLEEP_MIN_FPS: u32 = 90;
 const LAN_MEDIA_PRECISE_SLEEP_GUARD: Duration = Duration::from_millis(2);
 const LAN_RENDER_SURFACE_LOCK_TIMEOUT: Duration = Duration::from_millis(2);
+const LAN_RENDER_PACING_DEFAULT_MIN_FPS: u32 = 120;
+const LAN_RENDER_PACING_MAX_PENDING_FRAMES: usize = 2;
 const LAN_QUIC_MEDIA_TRANSPORT: &str = "quic_datagram";
 const LAN_QUIC_MEDIA_PROFILE_TRANSPORT: &str = "quic_datagram_2k144";
 const LAN_QUIC_MEDIA_V2_TRANSPORT: &str = "quic_datagram_media_v2";
@@ -91,6 +94,9 @@ const LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY: &str = "media.hevc_main_420_8bit"
 const LAN_RENDER_D3D11_NATIVE_CAPABILITY: &str = "d3d11_native_render";
 const LAN_RENDER_D3D11_SHARED_NV12_CAPABILITY: &str = "render.d3d11_shared_nv12";
 const LAN_MEDIA_SENDER_MAX_CONSECUTIVE_FRAME_ERRORS: u32 = 8;
+
+#[cfg(windows)]
+static LOCAL_RENDER_REFRESH_HZ: OnceLock<Option<u32>> = OnceLock::new();
 const LAN_MEDIA_SENDER_ERROR_LOG_INTERVAL: u32 = 3;
 const LAN_MEDIA_RECEIVER_MAX_CONSECUTIVE_DECODE_ERRORS: u32 = 8;
 const LAN_MEDIA_RECEIVER_DECODE_ERROR_LOG_INTERVAL: u32 = 3;
@@ -3774,15 +3780,71 @@ fn reliable_whole_frame_media_override_from_env_value(value: Option<&str>) -> Op
 }
 
 #[cfg(windows)]
-fn lan_render_pacing_enabled() -> bool {
-    lan_render_pacing_from_env_value(std::env::var(LAN_RENDER_PACING_ENV).ok().as_deref())
+fn lan_render_pacing_enabled_for_profile(profile: &MediaProfile) -> bool {
+    if let Some(enabled) =
+        lan_render_pacing_from_env_value(std::env::var(LAN_RENDER_PACING_ENV).ok().as_deref())
+    {
+        return enabled;
+    }
+
+    profile.fps >= LAN_RENDER_PACING_DEFAULT_MIN_FPS
 }
 
-fn lan_render_pacing_from_env_value(value: Option<&str>) -> bool {
-    matches!(
-        value.map(|value| value.trim().to_ascii_lowercase()),
-        Some(value) if matches!(value.as_str(), "1" | "true" | "yes" | "on")
-    )
+#[cfg(windows)]
+fn lan_render_queue_capacity_for_profile(profile: &MediaProfile) -> usize {
+    if lan_render_pacing_enabled_for_profile(profile) {
+        LAN_RENDER_PACING_MAX_PENDING_FRAMES
+    } else {
+        1
+    }
+}
+
+#[cfg(windows)]
+fn lan_render_pacing_target_fps(profile: &MediaProfile) -> u32 {
+    lan_render_pacing_target_fps_from_values(profile.fps, lan_local_render_refresh_hz())
+}
+
+#[cfg(windows)]
+fn lan_render_pacing_target_fps_from_values(
+    profile_fps: u32,
+    local_refresh_hz: Option<u32>,
+) -> u32 {
+    let profile_fps = profile_fps.max(1);
+    match local_refresh_hz.filter(|refresh_hz| *refresh_hz > 0) {
+        Some(refresh_hz) => profile_fps.min(refresh_hz),
+        None => profile_fps,
+    }
+}
+
+#[cfg(windows)]
+fn lan_local_render_refresh_hz() -> Option<u32> {
+    if let Some(refresh_hz) = std::env::var(LAN_RENDER_MAX_FPS_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|value| *value > 0)
+    {
+        return Some(refresh_hz);
+    }
+
+    *LOCAL_RENDER_REFRESH_HZ.get_or_init(|| {
+        crate::display_mode::list_display_modes(None)
+            .ok()
+            .and_then(|modes| {
+                modes
+                    .into_iter()
+                    .find(|mode| mode.is_current && mode.refresh_hz > 0)
+            })
+            .map(|mode| mode.refresh_hz)
+    })
+}
+
+fn lan_render_pacing_from_env_value(value: Option<&str>) -> Option<bool> {
+    match value?.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        "" => None,
+        _ => None,
+    }
 }
 
 fn h264_access_unit_is_keyframe(metadata_is_keyframe: bool, payload: &[u8]) -> bool {
@@ -4465,29 +4527,43 @@ async fn render_lan_decoded_frame(
     decoded_frame: &DecodedFrame,
 ) -> Result<()> {
     let render_frame = decoded_frame_to_render_frame(decoded_frame.clone())?;
+    let render_profile = selected_media_profile(app_state, session_id).await;
+    let render_pacing_enabled = lan_render_pacing_enabled_for_profile(&render_profile);
+    let max_pending_frames = lan_render_queue_capacity_for_profile(&render_profile);
+    let render_pacing_target_fps =
+        render_pacing_enabled.then(|| lan_render_pacing_target_fps(&render_profile));
     let (enqueue, enqueue_gap_ms) = {
         let mut render_queues = app_state.media_render_queues.lock().await;
         let now = Instant::now();
         let enqueue_gap_ms = render_queues
             .record_enqueued(session_id, now)
             .map(duration_as_millis);
-        let enqueue = render_queues.enqueue_latest(session_id.clone(), render_frame);
+        let enqueue =
+            render_queues.enqueue_bounded(session_id.clone(), render_frame, max_pending_frames);
         (enqueue, enqueue_gap_ms)
     };
     if let Some(enqueue_gap_ms) = enqueue_gap_ms {
+        let mut pipelines = app_state.media_pipelines.lock().await;
+        pipelines.set_render_pacing_target_fps(session_id.clone(), render_pacing_target_fps);
+        pipelines.record_stage_duration_ms(
+            session_id.clone(),
+            "render_enqueue_gap",
+            enqueue_gap_ms,
+        );
+    } else {
         app_state
             .media_pipelines
             .lock()
             .await
-            .record_stage_duration_ms(session_id.clone(), "render_enqueue_gap", enqueue_gap_ms);
+            .set_render_pacing_target_fps(session_id.clone(), render_pacing_target_fps);
     }
     match enqueue {
         MediaRenderQueueEnqueue::Start(frame) => {
             spawn_lan_render_worker(app_state.clone(), session_id.clone(), frame);
         }
-        MediaRenderQueueEnqueue::Queued { replaced } => {
+        MediaRenderQueueEnqueue::Queued { replaced, depth } => {
             let mut pipelines = app_state.media_pipelines.lock().await;
-            pipelines.record_queue_depth(session_id.clone(), 1);
+            pipelines.record_queue_depth(session_id.clone(), depth as u32);
             if replaced {
                 pipelines.increment_render_queue_replacements(session_id.clone(), 1);
             }
@@ -4581,17 +4657,17 @@ fn spawn_lan_render_worker(
 
 #[cfg(windows)]
 async fn pace_lan_render_frame(app_state: &Arc<AppState>, session_id: &SessionId) {
-    if !lan_render_pacing_enabled() {
+    let profile = selected_media_profile(app_state, session_id).await;
+    if !lan_render_pacing_enabled_for_profile(&profile) {
         return;
     }
 
-    let fps = selected_media_profile(app_state, session_id).await.fps;
-    let delay =
-        app_state
-            .media_render_queues
-            .lock()
-            .await
-            .pacing_delay(session_id, fps, Instant::now());
+    let target_fps = lan_render_pacing_target_fps(&profile);
+    let delay = app_state.media_render_queues.lock().await.pacing_delay(
+        session_id,
+        target_fps,
+        Instant::now(),
+    );
     if delay < Duration::from_micros(500) {
         return;
     }
@@ -8119,13 +8195,54 @@ mod tests {
     }
 
     #[test]
-    fn render_pacing_env_override_is_opt_in_only() {
-        assert!(!lan_render_pacing_from_env_value(None));
-        assert!(!lan_render_pacing_from_env_value(Some("")));
-        assert!(!lan_render_pacing_from_env_value(Some("0")));
-        assert!(!lan_render_pacing_from_env_value(Some("off")));
-        assert!(lan_render_pacing_from_env_value(Some("1")));
-        assert!(lan_render_pacing_from_env_value(Some("true")));
+    fn render_pacing_env_override_parses_truthy_and_falsey_values() {
+        assert_eq!(lan_render_pacing_from_env_value(None), None);
+        assert_eq!(lan_render_pacing_from_env_value(Some("")), None);
+        assert_eq!(lan_render_pacing_from_env_value(Some("0")), Some(false));
+        assert_eq!(lan_render_pacing_from_env_value(Some("off")), Some(false));
+        assert_eq!(lan_render_pacing_from_env_value(Some("1")), Some(true));
+        assert_eq!(lan_render_pacing_from_env_value(Some("true")), Some(true));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn render_pacing_defaults_to_high_fps_with_small_backlog() {
+        let high_fps = MediaProfile {
+            width: 2560,
+            height: 1600,
+            fps: 165,
+            bitrate_mbps: 120,
+            codec: "hevc".to_string(),
+            ..MediaProfile::default()
+        };
+        let low_fps = MediaProfile {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            bitrate_mbps: 20,
+            codec: "h264".to_string(),
+            ..MediaProfile::default()
+        };
+
+        assert!(lan_render_pacing_enabled_for_profile(&high_fps));
+        assert_eq!(
+            lan_render_queue_capacity_for_profile(&high_fps),
+            LAN_RENDER_PACING_MAX_PENDING_FRAMES
+        );
+        assert_eq!(
+            lan_render_pacing_target_fps_from_values(high_fps.fps, Some(144)),
+            144
+        );
+        assert_eq!(
+            lan_render_pacing_target_fps_from_values(high_fps.fps, Some(240)),
+            165
+        );
+        assert_eq!(
+            lan_render_pacing_target_fps_from_values(high_fps.fps, None),
+            165
+        );
+        assert!(!lan_render_pacing_enabled_for_profile(&low_fps));
+        assert_eq!(lan_render_queue_capacity_for_profile(&low_fps), 1);
     }
 
     #[test]
@@ -8149,11 +8266,19 @@ mod tests {
     }
 
     #[test]
-    fn ultra_high_bitrate_fps_uses_reliable_whole_frame_by_default() {
+    fn ultra_high_bitrate_uses_reliable_whole_frame_by_default() {
         let ultra_high = MediaProfile {
             width: 2560,
             height: 1600,
             fps: 165,
+            bitrate_mbps: 120,
+            codec: "hevc".to_string(),
+            ..MediaProfile::default()
+        };
+        let render_capped = MediaProfile {
+            width: 2560,
+            height: 1600,
+            fps: 144,
             bitrate_mbps: 120,
             codec: "hevc".to_string(),
             ..MediaProfile::default()
@@ -8172,6 +8297,13 @@ mod tests {
             true,
             64,
             &ultra_high,
+            None
+        ));
+        assert!(should_send_access_unit_as_reliable_frame(
+            true,
+            true,
+            64,
+            &render_capped,
             None
         ));
         assert!(!should_send_access_unit_as_reliable_frame(

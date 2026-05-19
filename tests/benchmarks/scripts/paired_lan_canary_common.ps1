@@ -2,6 +2,8 @@ $ErrorActionPreference = "Stop"
 
 $script:CanaryMaxProbeDropRatio = 0.05
 $script:CanaryMaxRenderDropRatio = 0.03
+$script:CanaryMinPacedRenderFpsRatio = 0.88
+$script:CanaryMaxPacedPresentGapMultiplier = 1.5
 
 function Select-CanaryValue {
   param($Value, $Fallback)
@@ -22,6 +24,17 @@ function Select-CanarySenderSendStageValue {
   $reliable = Select-CanaryObjectPropertyValue $StageMap "sender.send_reliable" $null
   if ($null -ne $reliable) { return $reliable }
   Select-CanaryObjectPropertyValue $StageMap "sender.send_datagram" $Fallback
+}
+
+function Select-CanaryStageP95Value {
+  param($Pipeline, [string]$Stage, $Fallback)
+  if ($null -eq $Pipeline -or $null -eq $Pipeline.stage_metrics) { return $Fallback }
+  foreach ($metric in @($Pipeline.stage_metrics)) {
+    if ($metric.stage -eq $Stage) {
+      return (Select-CanaryValue $metric.p95_ms $Fallback)
+    }
+  }
+  $Fallback
 }
 
 function Normalize-CanaryCodec {
@@ -126,7 +139,9 @@ function New-CanarySelectedProfile {
 function Get-CanaryVisualIntegrityIssue {
   param(
     $Probe,
-    $Pipeline
+    $Pipeline,
+    $Report = $null,
+    $Profile = $null
   )
 
   $decodedFrames = [double](Select-CanaryValue $Probe.frames_decoded 0)
@@ -145,11 +160,75 @@ function Get-CanaryVisualIntegrityIssue {
   if ($decodedFrames -gt 0 -and $renderDrops -gt 0) {
     $renderDropRatio = $renderDrops / $decodedFrames
     if ($renderDropRatio -gt $script:CanaryMaxRenderDropRatio) {
+      if (Test-CanaryPacedRenderCoalescingAcceptable -Probe $Probe -Pipeline $Pipeline -Report $Report -Profile $Profile) {
+        return $null
+      }
       return "Visual integrity risk: render drop/coalesce ratio $([Math]::Round($renderDropRatio * 100, 2))% exceeds $([Math]::Round($script:CanaryMaxRenderDropRatio * 100, 2))% ($([int64]$renderDrops) render drops / $([int64]$decodedFrames) decoded frames)."
     }
   }
 
   $null
+}
+
+function Get-CanaryEstimatedRenderFps {
+  param(
+    $Probe,
+    $Pipeline,
+    $Report = $null
+  )
+
+  $decodedFrames = [double](Select-CanaryValue $Probe.frames_decoded 0)
+  if ($decodedFrames -le 0) { return 0.0 }
+
+  $renderQueueReplacements = [double](Select-CanaryValue $Pipeline.render_queue_replacements 0)
+  $renderLockDrops = [double](Select-CanaryValue $Pipeline.render_lock_drops 0)
+  $presentedFrames = [Math]::Max(0.0, $decodedFrames - $renderQueueReplacements - $renderLockDrops)
+  $sampleDurationMs = [double](Select-CanaryValue $Report.sampleDurationMs 0)
+  if ($sampleDurationMs -gt 0) {
+    return $presentedFrames / ($sampleDurationMs / 1000.0)
+  }
+
+  $observedFps = [double](Select-CanaryValue (Select-CanaryValue $Report.sampleObservedFps $Probe.current_fps) 0)
+  if ($observedFps -gt 0) {
+    return $observedFps * ($presentedFrames / $decodedFrames)
+  }
+  0.0
+}
+
+function Get-CanaryRenderCoalesceRatio {
+  param(
+    $Probe,
+    $Pipeline
+  )
+
+  $decodedFrames = [double](Select-CanaryValue $Probe.frames_decoded 0)
+  if ($decodedFrames -le 0) { return 0.0 }
+  $renderQueueReplacements = [double](Select-CanaryValue $Pipeline.render_queue_replacements 0)
+  $renderLockDrops = [double](Select-CanaryValue $Pipeline.render_lock_drops 0)
+  ($renderQueueReplacements + $renderLockDrops) / $decodedFrames
+}
+
+function Test-CanaryPacedRenderCoalescingAcceptable {
+  param(
+    $Probe,
+    $Pipeline,
+    $Report = $null,
+    $Profile = $null
+  )
+
+  if ($null -eq $Pipeline -or $null -eq $Probe) { return $false }
+  $renderLockDrops = [double](Select-CanaryValue $Pipeline.render_lock_drops 0)
+  if ($renderLockDrops -gt 0) { return $false }
+
+  $targetFps = [double](Select-CanaryValue $Pipeline.render_pacing_target_fps (Select-CanaryValue $Probe.media_probe_target_fps (Select-CanaryValue $Profile.fps 0)))
+  if ($targetFps -le 0) { return $false }
+  $presentGapP95 = [double](Select-CanaryStageP95Value -Pipeline $Pipeline -Stage "render_present_gap" -Fallback 0)
+  if ($presentGapP95 -le 0) { return $false }
+
+  $frameBudgetMs = 1000.0 / $targetFps
+  $estimatedRenderFps = [double](Get-CanaryEstimatedRenderFps -Probe $Probe -Pipeline $Pipeline -Report $Report)
+  ($estimatedRenderFps -ge ($targetFps * $script:CanaryMinPacedRenderFpsRatio)) -and
+    ($presentGapP95 -le ($frameBudgetMs * $script:CanaryMaxPacedPresentGapMultiplier))
 }
 
 function Convert-LocalSummaryToCanaryRow {
@@ -214,8 +293,11 @@ function Convert-CrossReportToCanaryRow {
     New-CanarySelectedProfile -Width $Profile.width -Height $Profile.height -Fps $Profile.fps -BitrateMbps $Profile.bitrate_mbps
   }
   $baseClassification = Get-CrossCanaryClassification -Report $Report -Profile $Profile -SelectedProfile $selected
+  $renderCoalesceRatio = [double](Get-CanaryRenderCoalesceRatio -Probe $probe -Pipeline $pipeline)
+  $pacedRenderCoalescing = ($renderCoalesceRatio -gt $script:CanaryMaxRenderDropRatio) -and
+    (Test-CanaryPacedRenderCoalescingAcceptable -Probe $probe -Pipeline $pipeline -Report $Report -Profile $Profile)
   $visualIntegrityIssue = if ($baseClassification -eq "completed") {
-    Get-CanaryVisualIntegrityIssue -Probe $probe -Pipeline $pipeline
+    Get-CanaryVisualIntegrityIssue -Probe $probe -Pipeline $pipeline -Report $Report -Profile $Profile
   } else {
     $null
   }
@@ -249,6 +331,10 @@ function Convert-CrossReportToCanaryRow {
     pipeline_dropped_frames = $pipelineDropped
     render_queue_replacements = $renderQueueReplacements
     render_lock_drops = $renderLockDrops
+    estimated_render_fps = [double](Get-CanaryEstimatedRenderFps -Probe $probe -Pipeline $pipeline -Report $Report)
+    render_coalesce_ratio = $renderCoalesceRatio
+    render_present_gap_p95_ms = [double](Select-CanaryStageP95Value -Pipeline $pipeline -Stage "render_present_gap" -Fallback 0)
+    render_pacing_target_fps = $pipeline.render_pacing_target_fps
     queue_depth = $pipeline.queue_depth
     stage_p50_ms = Convert-MediaStageMetricsToP50Map -StageMetrics $pipeline.stage_metrics
     stage_p95_ms = Convert-MediaStageMetricsToP95Map -StageMetrics $pipeline.stage_metrics
@@ -258,7 +344,7 @@ function Convert-CrossReportToCanaryRow {
     display_mode = $Report.displayModeChange
     raw_report_path = $ReportPath
     error_message = Select-CanaryValue $Report.errorMessage (Select-CanaryValue $visualIntegrityIssue $displayLimitReason)
-    visual_integrity_status = if ($visualIntegrityIssue) { "risk" } else { "ok" }
+    visual_integrity_status = if ($visualIntegrityIssue) { "risk" } elseif ($pacedRenderCoalescing) { "paced" } else { "ok" }
     visual_integrity_message = $visualIntegrityIssue
     requested_codec = Normalize-CanaryCodec $RequestedCodec
     active_codec = $pipeline.active_codec
@@ -293,13 +379,19 @@ function Get-CrossCanaryClassification {
   param(
     [Parameter(Mandatory = $true)]$Report,
     [Parameter(Mandatory = $true)]$Profile,
-  [Parameter(Mandatory = $true)]$SelectedProfile
+    [Parameter(Mandatory = $true)]$SelectedProfile
   )
 
   if (Get-CanaryDisplayRefreshLimitReason -Report $Report -Profile $Profile) {
     return "display_refresh_limited"
   }
   if (-not (Test-CanaryProfileMatch -Expected $Profile -Actual $SelectedProfile)) {
+    if (
+      $Report.status -eq "completed" -and
+      (Test-CanaryRenderPacedProfileCap -Profile $Profile -SelectedProfile $SelectedProfile -Pipeline $Report.mediaPipelineSnapshot)
+    ) {
+      return "completed"
+    }
     return "profile_downgraded"
   }
   if ($Report.status -eq "completed") {
@@ -394,6 +486,36 @@ function Test-CanaryProfileMatch {
   ([int]$Expected.bitrate_mbps -eq [int]$Actual.bitrate_mbps)
 }
 
+function Test-CanaryRenderPacedProfileCap {
+  param(
+    [Parameter(Mandatory = $true)]$Profile,
+    [Parameter(Mandatory = $true)]$SelectedProfile,
+    $Pipeline = $null
+  )
+
+  $targetFps = [int](Select-CanaryValue $Pipeline.render_pacing_target_fps 0)
+  if ($targetFps -le 0) { return $false }
+
+  ([int]$SelectedProfile.width -eq [int]$Profile.width) -and
+  ([int]$SelectedProfile.height -eq [int]$Profile.height) -and
+  ([int]$SelectedProfile.bitrate_mbps -eq [int]$Profile.bitrate_mbps) -and
+  ([int]$SelectedProfile.fps -eq $targetFps) -and
+  ($targetFps -lt [int]$Profile.fps)
+}
+
+function Test-CanaryCrossRowRenderPacedProfileCap {
+  param(
+    [Parameter(Mandatory = $true)]$LocalRow,
+    [Parameter(Mandatory = $true)]$CrossRow
+  )
+
+  if (-not $CrossRow.selected_profile) { return $false }
+  Test-CanaryRenderPacedProfileCap `
+    -Profile $LocalRow `
+    -SelectedProfile $CrossRow.selected_profile `
+    -Pipeline ([pscustomobject]@{ render_pacing_target_fps = $CrossRow.render_pacing_target_fps })
+}
+
 function Get-CanaryComparisonBaselineFps {
   param(
     [Parameter(Mandatory = $true)]$LocalRow
@@ -472,9 +594,11 @@ function Compare-PairedLanCanaryRows {
       continue
     }
 
+    $renderPacedProfileCap = Test-CanaryCrossRowRenderPacedProfileCap -LocalRow $local -CrossRow $cross
     $profilesMatch =
       (Test-CanaryProfileMatch -Expected $local.selected_profile -Actual $cross.selected_profile) -and
       (Test-CanaryProfileMatch -Expected $local -Actual $cross.selected_profile)
+    $profilesMatch = $profilesMatch -or $renderPacedProfileCap
     if (-not $profilesMatch) {
       $results += [pscustomobject]@{
         id = $local.id
@@ -490,7 +614,12 @@ function Compare-PairedLanCanaryRows {
     }
 
     $crossFps = [double](Select-CanaryValue $cross.fps_observed 0)
-    $ratio = if ($localBaselineFps -gt 0) { $crossFps / $localBaselineFps } else { 0.0 }
+    $comparisonBaselineFps = if ($renderPacedProfileCap) {
+      [Math]::Min($localBaselineFps, [double](Select-CanaryValue $cross.selected_profile.fps $localBaselineFps))
+    } else {
+      $localBaselineFps
+    }
+    $ratio = if ($comparisonBaselineFps -gt 0) { $crossFps / $comparisonBaselineFps } else { 0.0 }
     $status = if ($local.status -ne "completed") {
       "local_failed"
     } elseif ($cross.status -ne "completed") {
@@ -506,7 +635,7 @@ function Compare-PairedLanCanaryRows {
       comparable = ($status -ne "profile_downgraded")
       status = $status
       local_fps = $localFps
-      local_baseline_fps = $localBaselineFps
+      local_baseline_fps = $comparisonBaselineFps
       cross_fps = $crossFps
       fps_ratio = $ratio
       reason = if ($status -eq "threshold_miss") { "Cross FPS below $([Math]::Round($RatioThreshold * 100)) percent of local baseline" } else { $cross.error_message }
@@ -563,8 +692,8 @@ function Write-CanaryJsonAndMarkdown {
     "- Skipped: $($Report.skipped)",
     "- Failed: $($Report.failed)",
     "",
-    "| Profile | Status | Class | FPS | Selected | Visual | Enc P50/P95 | Send P50/P95 | Probe Drop | Render Coalesce | Render Drop | Queue | Error |",
-    "| --- | --- | --- | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
+    "| Profile | Status | Class | FPS | Render FPS | Render Target | Selected | Visual | Enc P50/P95 | Send P50/P95 | Present Gap P95 | Probe Drop | Render Coalesce | Render Drop | Queue | Error |",
+    "| --- | --- | --- | ---: | ---: | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
   )
   foreach ($row in $Report.rows) {
     $selected = "$($row.selected_profile.width)x$($row.selected_profile.height)@$($row.selected_profile.fps)/$($row.selected_profile.bitrate_mbps)Mbps"
@@ -574,10 +703,13 @@ function Write-CanaryJsonAndMarkdown {
     $encodeP95 = [Math]::Round([double](Select-CanaryValue $row.stage_p95_ms.'sender.encode' 0), 2)
     $sendP50 = [Math]::Round([double](Select-CanarySenderSendStageValue -StageMap $row.stage_p50_ms -Fallback 0), 2)
     $sendP95 = [Math]::Round([double](Select-CanarySenderSendStageValue -StageMap $row.stage_p95_ms -Fallback 0), 2)
+    $estimatedRenderFps = [Math]::Round([double](Select-CanaryValue $row.estimated_render_fps 0), 2)
+    $renderTargetFps = Select-CanaryValue $row.render_pacing_target_fps "-"
+    $presentGapP95 = [Math]::Round([double](Select-CanaryValue $row.render_present_gap_p95_ms 0), 2)
     $probeDrops = Select-CanaryValue $row.probe_dropped_frames $row.dropped_frames
     $renderCoalesce = Select-CanaryValue $row.render_queue_replacements 0
     $renderDrops = Select-CanaryValue $row.render_lock_drops 0
-    $lines += "| $($row.id) | $($row.status) | $($row.classification) | $([Math]::Round([double](Select-CanaryValue $row.fps_observed 0), 2)) | $selected | $visual | $encodeP50/$encodeP95 | $sendP50/$sendP95 | $probeDrops | $renderCoalesce | $renderDrops | $($row.queue_depth) | $error |"
+    $lines += "| $($row.id) | $($row.status) | $($row.classification) | $([Math]::Round([double](Select-CanaryValue $row.fps_observed 0), 2)) | $estimatedRenderFps | $renderTargetFps | $selected | $visual | $encodeP50/$encodeP95 | $sendP50/$sendP95 | $presentGapP95 | $probeDrops | $renderCoalesce | $renderDrops | $($row.queue_depth) | $error |"
   }
   if ($Report.codec_request) {
     $lines += ""

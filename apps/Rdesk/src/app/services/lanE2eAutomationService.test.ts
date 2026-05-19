@@ -125,6 +125,7 @@ function createCommands(
       })
     ),
     ipcStartLanRemoteSession: vi.fn().mockResolvedValue(ok("session-started")),
+    ipcUpdateMediaProfile: vi.fn().mockResolvedValue(ok({ status: "selected" })),
     ipcConfigureMediaAdaptation: vi.fn().mockResolvedValue(
       ok({
         enabled: true,
@@ -582,6 +583,73 @@ describe("runLanE2EAutomation", () => {
     expect(result.stages.map((stage) => `${stage.stage}:${stage.status}`)).toContain(
       "capture_source:completed"
     );
+  });
+
+  it("caps the media profile to the receiver render pacing target", async () => {
+    let activeProfile = { ...DEFAULT_REQUESTED_PROFILE };
+    const ipcUpdateMediaProfile = vi.fn().mockImplementation((_sessionId, profile) => {
+      activeProfile = profile;
+      return Promise.resolve(ok({ status: "selected" }));
+    });
+    const commands = withCaptureSourceCommands(
+      createCommands({
+        ipcUpdateMediaProfile,
+        ipcProbeSnapshot: vi.fn().mockImplementation(() =>
+          Promise.resolve(
+            ok({
+              session_id: "unused",
+              frames_received: 4,
+              frames_decoded: 3,
+              frames_dropped: 0,
+              current_fps: activeProfile.fps,
+              bitrate_mbps: activeProfile.bitrate_mbps,
+              media_probe_valid: true,
+              media_probe_format: "compressed_h264_test_pattern",
+              media_probe_width: activeProfile.width,
+              media_probe_height: activeProfile.height,
+              media_probe_target_fps: activeProfile.fps,
+              media_probe_target_bitrate_mbps: activeProfile.bitrate_mbps,
+              media_probe_payload_bytes: 55555,
+              last_media_sequence: 3,
+              last_media_timestamp_us: 123456,
+              last_media_payload_hash: "fnv1a64:abc123",
+              last_error: null,
+            })
+          )
+        ),
+        ipcMediaPipelineSnapshot: vi.fn().mockResolvedValue(
+          ok({
+            session_id: "unused",
+            attached_surfaces: [],
+            active_decoder: "nvdec",
+            active_renderer: "d3d11",
+            render_pacing_target_fps: 144,
+            queue_depth: 1,
+            dropped_frames: 0,
+            stage_metrics: [],
+            adaptation: null,
+          })
+        ),
+      })
+    );
+
+    const result = await runLanE2EAutomation(commands, {
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      requestedProfile: { ...DEFAULT_REQUESTED_PROFILE },
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => "lan-e2e-test-session",
+    });
+
+    expect(result.status).toBe("completed");
+    expect(ipcUpdateMediaProfile).toHaveBeenCalledWith(
+      "lan-e2e-test-session",
+      expect.objectContaining({ fps: 144 })
+    );
+    expect(result.requestedProfile?.fps).toBe(144);
   });
 
   it("can force a capture source kind for DXGI canary runs", async () => {

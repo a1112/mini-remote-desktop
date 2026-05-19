@@ -236,6 +236,7 @@ struct MediaPipelineState {
     dropped_frames: u64,
     render_queue_replacements: u64,
     render_lock_drops: u64,
+    render_pacing_target_fps: Option<u32>,
     stage_samples: HashMap<String, VecDeque<f64>>,
     stage_summaries: HashMap<String, MediaStageMetrics>,
     test_impairment: Option<MediaTestImpairmentSnapshot>,
@@ -246,14 +247,14 @@ struct MediaPipelineState {
 #[derive(Debug, PartialEq, Eq)]
 pub enum MediaRenderQueueEnqueue {
     Start(RenderFrame),
-    Queued { replaced: bool },
+    Queued { replaced: bool, depth: usize },
 }
 
 #[cfg(windows)]
 #[derive(Default)]
 struct MediaRenderQueueState {
     running: bool,
-    pending: Option<RenderFrame>,
+    pending: VecDeque<RenderFrame>,
     last_enqueue_at: Option<Instant>,
     last_present_at: Option<Instant>,
 }
@@ -271,14 +272,33 @@ impl MediaRenderQueueRegistry {
         session_id: SessionId,
         frame: RenderFrame,
     ) -> MediaRenderQueueEnqueue {
+        self.enqueue_bounded(session_id, frame, 1)
+    }
+
+    pub fn enqueue_bounded(
+        &mut self,
+        session_id: SessionId,
+        frame: RenderFrame,
+        max_pending_frames: usize,
+    ) -> MediaRenderQueueEnqueue {
         let state = self.queues.entry(session_id).or_default();
         if !state.running {
             state.running = true;
             return MediaRenderQueueEnqueue::Start(frame);
         }
 
-        let replaced = state.pending.replace(frame).is_some();
-        MediaRenderQueueEnqueue::Queued { replaced }
+        let max_pending_frames = max_pending_frames.max(1);
+        let replaced = if state.pending.len() >= max_pending_frames {
+            state.pending.pop_front();
+            true
+        } else {
+            false
+        };
+        state.pending.push_back(frame);
+        MediaRenderQueueEnqueue::Queued {
+            replaced,
+            depth: state.pending.len(),
+        }
     }
 
     pub fn take_next_or_finish(&mut self, session_id: &SessionId) -> Option<RenderFrame> {
@@ -286,7 +306,7 @@ impl MediaRenderQueueRegistry {
             return None;
         };
 
-        if let Some(frame) = state.pending.take() {
+        if let Some(frame) = state.pending.pop_front() {
             return Some(frame);
         }
 
@@ -426,6 +446,13 @@ impl MediaPipelineRegistry {
         state.dropped_frames = state.dropped_frames.saturating_add(count);
     }
 
+    pub fn set_render_pacing_target_fps(&mut self, session_id: SessionId, fps: Option<u32>) {
+        self.pipelines
+            .entry(session_id)
+            .or_default()
+            .render_pacing_target_fps = fps;
+    }
+
     pub fn record_stage_duration_ms(
         &mut self,
         session_id: SessionId,
@@ -510,6 +537,7 @@ impl MediaPipelineRegistry {
             dropped_frames: state.map_or(0, |state| state.dropped_frames),
             render_queue_replacements: state.map_or(0, |state| state.render_queue_replacements),
             render_lock_drops: state.map_or(0, |state| state.render_lock_drops),
+            render_pacing_target_fps: state.and_then(|state| state.render_pacing_target_fps),
             stage_metrics,
             test_impairment: state.and_then(|state| state.test_impairment.clone()),
             adaptation: state.and_then(|state| state.adaptation.clone()),
@@ -1625,11 +1653,17 @@ mod tests {
         }
         assert_eq!(
             registry.enqueue_latest(session_id.clone(), second),
-            MediaRenderQueueEnqueue::Queued { replaced: false }
+            MediaRenderQueueEnqueue::Queued {
+                replaced: false,
+                depth: 1
+            }
         );
         assert_eq!(
             registry.enqueue_latest(session_id.clone(), third.clone()),
-            MediaRenderQueueEnqueue::Queued { replaced: true }
+            MediaRenderQueueEnqueue::Queued {
+                replaced: true,
+                depth: 1
+            }
         );
 
         assert_eq!(registry.take_next_or_finish(&session_id), Some(third));
@@ -1638,6 +1672,56 @@ mod tests {
             MediaRenderQueueEnqueue::Start(frame) => assert_eq!(frame, first),
             other => panic!("expected render worker restart, got {other:?}"),
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn media_render_queue_can_hold_a_small_paced_backlog() {
+        let mut registry = MediaRenderQueueRegistry::default();
+        let session_id = SessionId("render-queue-paced-session".to_string());
+        let first = RenderFrame::from_rgb24(1, 1, vec![1, 2, 3]);
+        let second = RenderFrame::from_rgb24(1, 1, vec![4, 5, 6]);
+        let third = RenderFrame::from_rgb24(1, 1, vec![7, 8, 9]);
+        let fourth = RenderFrame::from_rgb24(1, 1, vec![10, 11, 12]);
+        let fifth = RenderFrame::from_rgb24(1, 1, vec![13, 14, 15]);
+
+        match registry.enqueue_bounded(session_id.clone(), first.clone(), 3) {
+            MediaRenderQueueEnqueue::Start(frame) => assert_eq!(frame, first),
+            other => panic!("expected render worker start, got {other:?}"),
+        }
+        assert_eq!(
+            registry.enqueue_bounded(session_id.clone(), second.clone(), 3),
+            MediaRenderQueueEnqueue::Queued {
+                replaced: false,
+                depth: 1
+            }
+        );
+        assert_eq!(
+            registry.enqueue_bounded(session_id.clone(), third.clone(), 3),
+            MediaRenderQueueEnqueue::Queued {
+                replaced: false,
+                depth: 2
+            }
+        );
+        assert_eq!(
+            registry.enqueue_bounded(session_id.clone(), fourth.clone(), 3),
+            MediaRenderQueueEnqueue::Queued {
+                replaced: false,
+                depth: 3
+            }
+        );
+        assert_eq!(
+            registry.enqueue_bounded(session_id.clone(), fifth.clone(), 3),
+            MediaRenderQueueEnqueue::Queued {
+                replaced: true,
+                depth: 3
+            }
+        );
+
+        assert_eq!(registry.take_next_or_finish(&session_id), Some(third));
+        assert_eq!(registry.take_next_or_finish(&session_id), Some(fourth));
+        assert_eq!(registry.take_next_or_finish(&session_id), Some(fifth));
+        assert_eq!(registry.take_next_or_finish(&session_id), None);
     }
 
     #[cfg(windows)]

@@ -751,6 +751,7 @@ export interface MediaPipelineSnapshot {
   dropped_frames: number;
   render_queue_replacements?: number;
   render_lock_drops?: number;
+  render_pacing_target_fps?: number | null;
   stage_metrics: MediaStageMetrics[];
   test_impairment?: MediaTestImpairmentSnapshot | null;
   adaptation?: MediaAdaptationSnapshot | null;

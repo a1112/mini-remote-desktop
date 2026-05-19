@@ -258,6 +258,63 @@ Assert-Equal $reliableSendRow.stage_p50_ms.'sender.send_reliable' 2.1 "Reliable 
 Assert-Equal (Select-CanarySenderSendStageValue -StageMap $reliableSendRow.stage_p50_ms -Fallback 0) 2.1 "Report send P50 prefers reliable send when present"
 Assert-Equal (Select-CanarySenderSendStageValue -StageMap $reliableSendRow.stage_p95_ms -Fallback 0) 5.4 "Report send P95 prefers reliable send when present"
 
+$renderCappedReport = [pscustomobject]@{
+  status = "completed"
+  failureReason = $null
+  errorMessage = $null
+  sampleObservedFps = 130.0
+  sampleDurationMs = 45000
+  probeSnapshot = [pscustomobject]@{
+    current_fps = 130.0
+    frames_decoded = 5850
+    frames_dropped = 0
+    media_probe_width = 2560
+    media_probe_height = 1600
+    media_probe_target_fps = 144
+    media_probe_target_bitrate_mbps = 120
+  }
+  mediaPipelineSnapshot = [pscustomobject]@{
+    dropped_frames = 0
+    render_queue_replacements = 0
+    render_lock_drops = 0
+    render_pacing_target_fps = 144
+    queue_depth = 1
+    stage_metrics = @(
+      [pscustomobject]@{ stage = "sender.encode"; p50_ms = 0.4; p95_ms = 0.8 },
+      [pscustomobject]@{ stage = "sender.send_reliable"; p50_ms = 0.9; p95_ms = 1.6 },
+      [pscustomobject]@{ stage = "render_present_gap"; p50_ms = 6.94; p95_ms = 7.4 }
+    )
+    test_impairment = $null
+    active_codec = "hevc"
+    active_fps = 144
+    active_bitrate_mbps = 120
+  }
+  sessionSnapshot = [pscustomobject]@{ state = "streaming" }
+}
+$renderCappedRow = Convert-CrossReportToCanaryRow -Profile $profile1600p165120 -Report $renderCappedReport -ReportPath "raw/cross-1600p165-render-capped.json"
+Assert-Equal $renderCappedRow.status "completed" "Receiver render-paced FPS cap remains a completed canary row"
+Assert-Equal $renderCappedRow.classification "completed" "Receiver render-paced FPS cap is not profile_downgraded"
+Assert-Equal $renderCappedRow.selected_profile.fps 144 "Receiver render-paced row reports selected media FPS"
+Assert-Equal $renderCappedRow.render_pacing_target_fps 144 "Receiver render-paced row exposes pacing target"
+
+$local1600Row = [pscustomobject]@{
+  id = "1600p165_120mbps"
+  width = 2560
+  height = 1600
+  fps = 165
+  bitrate_mbps = 120
+  status = "completed"
+  classification = "completed"
+  fps_observed = 160.0
+  selected_profile = [pscustomobject]@{ width = 2560; height = 1600; fps = 165; bitrate_mbps = 120 }
+  stage_p95_ms = [pscustomobject]@{ decode = 1.5; present = 0.4 }
+}
+$renderCappedComparison = Compare-PairedLanCanaryRows -LocalRows @($local1600Row) -CrossRows @($renderCappedRow) -RatioThreshold 0.8
+Assert-Equal $renderCappedComparison[0].status "completed" "Receiver render-paced cap compares against the capped baseline"
+Assert-True $renderCappedComparison[0].comparable "Receiver render-paced cap remains comparable"
+Assert-Equal $renderCappedComparison[0].local_baseline_fps 144 "Receiver render-paced comparison baseline uses the local render target"
+Assert-Equal ([Math]::Round($renderCappedComparison[0].fps_ratio, 3)) 0.903 "Receiver render-paced FPS ratio uses capped baseline"
+
 $renderDropReport = [pscustomobject]@{
   status = "completed"
   failureReason = $null
@@ -292,6 +349,47 @@ Assert-Equal $renderDropRow.status "failed" "Severe visual integrity risk fails 
 Assert-Equal $renderDropRow.classification "visual_integrity_risk" "Severe visual integrity risk is classified explicitly"
 Assert-True ($renderDropRow.error_message -match "render drop/coalesce ratio") "Visual integrity risk carries an actionable render-drop reason"
 Assert-Equal $renderDropRow.visual_integrity_status "risk" "Visual integrity status is exposed for reports"
+
+$pacedRenderReport = [pscustomobject]@{
+  status = "completed"
+  failureReason = $null
+  errorMessage = $null
+  sampleObservedFps = 164.34
+  sampleDurationMs = 45178
+  probeSnapshot = [pscustomobject]@{
+    current_fps = 164.34
+    frames_decoded = 7425
+    frames_dropped = 5
+    media_probe_width = 2560
+    media_probe_height = 1600
+    media_probe_target_fps = 165
+    media_probe_target_bitrate_mbps = 120
+  }
+  mediaPipelineSnapshot = [pscustomobject]@{
+    dropped_frames = 721
+    render_queue_replacements = 721
+    render_lock_drops = 0
+    render_pacing_target_fps = 144
+    queue_depth = 8
+    stage_metrics = @(
+      [pscustomobject]@{ stage = "sender.encode"; p50_ms = 0.34; p95_ms = 0.42 },
+      [pscustomobject]@{ stage = "sender.send_reliable"; p50_ms = 0.06; p95_ms = 0.08 },
+      [pscustomobject]@{ stage = "render_present_gap"; p50_ms = 6.28; p95_ms = 7.07 }
+    )
+    test_impairment = $null
+    active_codec = "hevc"
+    active_bitrate_mbps = 120
+  }
+  sessionSnapshot = [pscustomobject]@{ state = "streaming" }
+}
+$pacedRenderRow = Convert-CrossReportToCanaryRow -Profile $profile1600p165120 -Report $pacedRenderReport -ReportPath "raw/cross-1600p165-paced.json"
+Assert-Equal $pacedRenderRow.status "completed" "Stable paced render coalescing does not fail the canary row"
+Assert-Equal $pacedRenderRow.classification "completed" "Stable paced render coalescing keeps the completed classification"
+Assert-Equal $pacedRenderRow.visual_integrity_status "paced" "Stable render coalescing is exposed as paced"
+Assert-Equal ([Math]::Round($pacedRenderRow.estimated_render_fps, 1)) 148.4 "Estimated render FPS subtracts paced coalesced frames"
+Assert-Equal $pacedRenderRow.render_pacing_target_fps 144 "Paced row exposes the local render pacing target"
+Assert-Equal ([Math]::Round($pacedRenderRow.render_present_gap_p95_ms, 2)) 7.07 "Paced row exposes render present gap P95"
+Assert-True ($pacedRenderRow.render_coalesce_ratio -gt 0.09) "Paced row exposes render coalesce ratio"
 
 $singlePeerDiagnostics = [pscustomobject]@{
   udp_responses = @(

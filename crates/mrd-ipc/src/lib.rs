@@ -267,6 +267,9 @@ pub struct MediaPipelineSnapshot {
     pub render_queue_replacements: u64,
     #[serde(default)]
     pub render_lock_drops: u64,
+    /// Receiver-side render pacing target after local display refresh caps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_pacing_target_fps: Option<u32>,
     pub stage_metrics: Vec<MediaStageMetrics>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test_impairment: Option<MediaTestImpairmentSnapshot>,

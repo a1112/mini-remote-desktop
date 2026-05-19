@@ -42,6 +42,7 @@ describe("TransportTestPage execution targets", () => {
       height: 720,
       process_id: 0,
     };
+    let decodedFrames = 58;
 
     mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
       if (command === "test_get_capabilities") {
@@ -84,6 +85,28 @@ describe("TransportTestPage execution targets", () => {
       if (command === "ipc_select_remote_capture_source") {
         return Promise.resolve({ session_id: args?.sessionId, source, status: "selected" });
       }
+      if (command === "ipc_list_remote_display_modes") {
+        return Promise.resolve([
+          {
+            id: "display-1:1280x720@30",
+            source_id: "display-1",
+            width: 1280,
+            height: 720,
+            refresh_hz: 30,
+            is_current: true,
+          },
+        ]);
+      }
+      if (command === "ipc_set_remote_display_mode") {
+        return Promise.resolve({
+          session_id: args?.sessionId,
+          requested_mode_id: "display-1:1280x720@30",
+          applied_mode_id: "display-1:1280x720@30",
+          previous_mode_id: "display-1:1280x720@30",
+          restore_required: false,
+          status: "applied",
+        });
+      }
       if (command === "ipc_start_receiver") return Promise.resolve(args?.sessionId);
       if (command === "open_remote_display_window") {
         return Promise.resolve({
@@ -108,10 +131,11 @@ describe("TransportTestPage execution targets", () => {
         });
       }
       if (command === "ipc_probe_snapshot") {
+        decodedFrames += 30;
         return Promise.resolve({
           session_id: args?.sessionId,
-          frames_received: 90,
-          frames_decoded: 88,
+          frames_received: decodedFrames + 2,
+          frames_decoded: decodedFrames,
           frames_dropped: 2,
           current_fps: 30,
           bitrate_mbps: 5,
@@ -136,6 +160,9 @@ describe("TransportTestPage execution targets", () => {
             { stage: "present", p50_ms: 4.0, p95_ms: 7.0 },
           ],
         });
+      }
+      if (command === "ipc_update_media_profile") {
+        return Promise.resolve({ status: "selected" });
       }
       if (command === "ipc_stop_session") return Promise.resolve(args?.sessionId);
       return Promise.resolve(null);
@@ -174,6 +201,6 @@ describe("TransportTestPage execution targets", () => {
       "test_start_run",
       expect.anything()
     );
-    expect(await screen.findByText("88")).toBeInTheDocument();
+    expect(await screen.findByText("118", {}, { timeout: 3_000 })).toBeInTheDocument();
   });
 });
