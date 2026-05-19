@@ -31,6 +31,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, Notify};
 use tokio::time::{interval, sleep_until, timeout, Instant};
+#[cfg(windows)]
+use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
 
 const DEFAULT_DISCOVERY_PORT: u16 = 21116;
 const LAN_DISCOVERY_PORT_ENV: &str = "MRD_LAN_DISCOVERY_PORT";
@@ -62,6 +64,11 @@ const LAN_QUIC_LAN_HIGH_QUALITY_DATAGRAM_BYTES: usize = LAN_QUIC_FALLBACK_DATAGR
 const LAN_QUIC_RELIABLE_WHOLE_FRAME_MIN_BITRATE_MBPS: u32 = 80;
 const LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES: usize = 4 * 1024 * 1024;
 const LAN_QUIC_RELIABLE_MEDIA_RETRY_DELAY: Duration = Duration::from_millis(10);
+const LAN_MEDIA_HIGH_RESOLUTION_TIMER_MIN_FPS: u32 = 90;
+const LAN_MEDIA_HIGH_RESOLUTION_TIMER_PERIOD_MS: u32 = 1;
+const LAN_MEDIA_PRECISE_SLEEP_MIN_FPS: u32 = 90;
+const LAN_MEDIA_PRECISE_SLEEP_GUARD: Duration = Duration::from_millis(2);
+const LAN_RENDER_SURFACE_LOCK_TIMEOUT: Duration = Duration::from_millis(2);
 const LAN_QUIC_MEDIA_TRANSPORT: &str = "quic_datagram";
 const LAN_QUIC_MEDIA_PROFILE_TRANSPORT: &str = "quic_datagram_2k144";
 const LAN_QUIC_MEDIA_V2_TRANSPORT: &str = "quic_datagram_media_v2";
@@ -2753,6 +2760,7 @@ async fn send_quic_media_loop(
     let mut consecutive_frame_errors = 0_u32;
     let mut next_frame_at = Instant::now();
     let mut active_frame_interval = Duration::ZERO;
+    let mut media_timer_resolution = MediaTimerResolution::default();
     let mut sender_stats = LanSenderStatsTracker::new(Instant::now());
     let mut test_impairment = LanMediaTestImpairment::from_env()?;
     let reliable_media_supported = app_state
@@ -2781,6 +2789,7 @@ async fn send_quic_media_loop(
             return Ok(());
         }
         let profile = selected_media_profile(&app_state, &session_id).await;
+        media_timer_resolution.update_for_profile(&profile);
         let reliable_media_send_mode = select_reliable_media_send_mode_for_profile(
             reliable_media_supported,
             persistent_media_supported,
@@ -2800,7 +2809,7 @@ async fn send_quic_media_loop(
         if let Some(delay_until) =
             schedule_next_media_frame(Instant::now(), &mut next_frame_at, frame_interval)
         {
-            sleep_until(delay_until).await;
+            sleep_until_media_frame(delay_until, &profile).await;
         }
 
         let source_id = selected_capture_source_id(&app_state, &session_id).await?;
@@ -4434,7 +4443,7 @@ async fn render_lan_frame_once(
     let mut renderers = match app_state.media_surface_renderers.try_lock() {
         Ok(renderers) => renderers,
         Err(_) => match timeout(
-            Duration::from_millis(1),
+            LAN_RENDER_SURFACE_LOCK_TIMEOUT,
             app_state.media_surface_renderers.lock(),
         )
         .await
@@ -5718,6 +5727,114 @@ fn apply_lan_media_profile_defaults(profile: &mut MediaProfile) {
 
 fn media_frame_interval(profile: &MediaProfile) -> Duration {
     Duration::from_micros((1_000_000 / u64::from(profile.fps.max(1))).max(1))
+}
+
+fn media_profile_requests_high_resolution_timer(profile: &MediaProfile) -> bool {
+    profile.fps >= LAN_MEDIA_HIGH_RESOLUTION_TIMER_MIN_FPS
+}
+
+fn media_frame_precise_sleep_guard(profile: &MediaProfile) -> Duration {
+    if profile.fps < LAN_MEDIA_PRECISE_SLEEP_MIN_FPS {
+        return Duration::ZERO;
+    }
+
+    LAN_MEDIA_PRECISE_SLEEP_GUARD.min(media_frame_interval(profile) / 2)
+}
+
+async fn sleep_until_media_frame(delay_until: Instant, profile: &MediaProfile) {
+    let guard = media_frame_precise_sleep_guard(profile);
+    if guard.is_zero() {
+        sleep_until(delay_until).await;
+        return;
+    }
+
+    let now = Instant::now();
+    if delay_until > now + guard {
+        sleep_until(delay_until - guard).await;
+    }
+
+    loop {
+        if Instant::now() >= delay_until {
+            break;
+        }
+        std::hint::spin_loop();
+    }
+}
+
+#[derive(Default)]
+struct MediaTimerResolution {
+    requested: bool,
+    #[cfg(windows)]
+    period: Option<WindowsMediaTimerPeriod>,
+}
+
+impl MediaTimerResolution {
+    fn update_for_profile(&mut self, profile: &MediaProfile) {
+        if media_profile_requests_high_resolution_timer(profile) {
+            self.request();
+        } else {
+            self.release();
+        }
+    }
+
+    fn request(&mut self) {
+        if self.requested {
+            return;
+        }
+        #[cfg(windows)]
+        {
+            match WindowsMediaTimerPeriod::begin(LAN_MEDIA_HIGH_RESOLUTION_TIMER_PERIOD_MS) {
+                Some(period) => {
+                    self.period = Some(period);
+                    self.requested = true;
+                }
+                None => {
+                    tracing::debug!(
+                        period_ms = LAN_MEDIA_HIGH_RESOLUTION_TIMER_PERIOD_MS,
+                        "failed to request high resolution media timer"
+                    );
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            self.requested = true;
+        }
+    }
+
+    fn release(&mut self) {
+        #[cfg(windows)]
+        {
+            self.period = None;
+        }
+        self.requested = false;
+    }
+}
+
+#[cfg(windows)]
+struct WindowsMediaTimerPeriod {
+    period_ms: u32,
+}
+
+#[cfg(windows)]
+impl WindowsMediaTimerPeriod {
+    fn begin(period_ms: u32) -> Option<Self> {
+        let result = unsafe { timeBeginPeriod(period_ms) };
+        if result == 0 {
+            Some(Self { period_ms })
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsMediaTimerPeriod {
+    fn drop(&mut self) {
+        unsafe {
+            timeEndPeriod(self.period_ms);
+        }
+    }
 }
 
 fn schedule_next_media_frame(
@@ -7852,6 +7969,58 @@ mod tests {
             None
         );
         assert_eq!(next_frame_at, now + interval);
+    }
+
+    #[test]
+    fn high_refresh_media_profiles_request_high_resolution_timer() {
+        let high_refresh = MediaProfile {
+            width: 2560,
+            height: 1440,
+            fps: 144,
+            bitrate_mbps: 80,
+            codec: "hevc".to_string(),
+            ..MediaProfile::default()
+        };
+        let low_refresh = MediaProfile {
+            width: 1920,
+            height: 1080,
+            fps: 30,
+            bitrate_mbps: 20,
+            codec: "h264".to_string(),
+            ..MediaProfile::default()
+        };
+
+        assert!(media_profile_requests_high_resolution_timer(&high_refresh));
+        assert!(!media_profile_requests_high_resolution_timer(&low_refresh));
+    }
+
+    #[test]
+    fn high_refresh_media_profiles_use_precise_sleep_guard() {
+        let high_refresh = MediaProfile {
+            width: 2560,
+            height: 1440,
+            fps: 144,
+            bitrate_mbps: 80,
+            codec: "hevc".to_string(),
+            ..MediaProfile::default()
+        };
+        let low_refresh = MediaProfile {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            bitrate_mbps: 20,
+            codec: "h264".to_string(),
+            ..MediaProfile::default()
+        };
+
+        let guard = media_frame_precise_sleep_guard(&high_refresh);
+
+        assert!(guard > Duration::ZERO);
+        assert!(guard < media_frame_interval(&high_refresh));
+        assert_eq!(
+            media_frame_precise_sleep_guard(&low_refresh),
+            Duration::ZERO
+        );
     }
 
     #[tokio::test]
