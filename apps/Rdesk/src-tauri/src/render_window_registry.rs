@@ -37,6 +37,20 @@ pub struct RenderWindowContext {
 pub struct RenderWindowRegistry {
     next_ids: HashMap<SessionId, u32>,
     windows_by_session: HashMap<SessionId, Vec<RenderWindowEntry>>,
+    native_surface_service_bindings: HashMap<String, NativeSurfaceServiceBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeSurfaceServiceBinding {
+    backend: String,
+    hwnd: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeSurfaceServiceAction {
+    Attach,
+    Detach,
+    Unchanged,
 }
 
 impl RenderWindowRegistry {
@@ -165,6 +179,9 @@ impl RenderWindowRegistry {
 
         self.windows_by_session
             .retain(|_session_id, entries| !entries.is_empty());
+        if removed.is_some() {
+            self.native_surface_service_bindings.remove(label);
+        }
         removed
     }
 
@@ -256,6 +273,51 @@ impl RenderWindowRegistry {
         Err(format!("未找到渲染窗口: {}", label))
     }
 
+    pub fn native_surface_service_action(
+        &self,
+        label: &str,
+        attached: bool,
+        backend: &str,
+        hwnd: Option<&str>,
+    ) -> NativeSurfaceServiceAction {
+        if !attached {
+            return if self.native_surface_service_bindings.contains_key(label) {
+                NativeSurfaceServiceAction::Detach
+            } else {
+                NativeSurfaceServiceAction::Unchanged
+            };
+        }
+
+        let next = NativeSurfaceServiceBinding {
+            backend: backend.to_string(),
+            hwnd: hwnd.map(str::to_string),
+        };
+        match self.native_surface_service_bindings.get(label) {
+            Some(current) if current == &next => NativeSurfaceServiceAction::Unchanged,
+            _ => NativeSurfaceServiceAction::Attach,
+        }
+    }
+
+    pub fn record_native_surface_service_binding(
+        &mut self,
+        label: &str,
+        attached: bool,
+        backend: &str,
+        hwnd: Option<&str>,
+    ) {
+        if attached {
+            self.native_surface_service_bindings.insert(
+                label.to_string(),
+                NativeSurfaceServiceBinding {
+                    backend: backend.to_string(),
+                    hwnd: hwnd.map(str::to_string),
+                },
+            );
+        } else {
+            self.native_surface_service_bindings.remove(label);
+        }
+    }
+
     pub fn surface_window_count<R: tauri::Runtime>(
         &mut self,
         app: &tauri::AppHandle<R>,
@@ -281,7 +343,9 @@ fn remote_display_url(session_id: &str, surface_id: &str) -> Result<WebviewUrl, 
 
 #[cfg(test)]
 mod tests {
-    use super::{RenderWindowContext, RenderWindowEntry, RenderWindowRegistry};
+    use super::{
+        NativeSurfaceServiceAction, RenderWindowContext, RenderWindowEntry, RenderWindowRegistry,
+    };
     use mrd_proto::SessionId;
 
     #[test]
@@ -475,5 +539,79 @@ mod tests {
             Some((session, 0))
         );
         assert!(registry.windows_by_session.is_empty());
+    }
+
+    #[test]
+    fn native_surface_service_binding_skips_redundant_attach_for_same_handle() {
+        let mut registry = RenderWindowRegistry::default();
+
+        assert_eq!(
+            registry.native_surface_service_action(
+                "render-session-a-1",
+                true,
+                "d3d11",
+                Some("0x1234")
+            ),
+            NativeSurfaceServiceAction::Attach
+        );
+
+        registry.record_native_surface_service_binding(
+            "render-session-a-1",
+            true,
+            "d3d11",
+            Some("0x1234"),
+        );
+
+        assert_eq!(
+            registry.native_surface_service_action(
+                "render-session-a-1",
+                true,
+                "d3d11",
+                Some("0x1234")
+            ),
+            NativeSurfaceServiceAction::Unchanged
+        );
+    }
+
+    #[test]
+    fn native_surface_service_binding_reattaches_when_handle_changes() {
+        let mut registry = RenderWindowRegistry::default();
+        registry.record_native_surface_service_binding(
+            "render-session-a-1",
+            true,
+            "d3d11",
+            Some("0x1234"),
+        );
+
+        assert_eq!(
+            registry.native_surface_service_action(
+                "render-session-a-1",
+                true,
+                "d3d11",
+                Some("0x5678")
+            ),
+            NativeSurfaceServiceAction::Attach
+        );
+    }
+
+    #[test]
+    fn native_surface_service_binding_detaches_once() {
+        let mut registry = RenderWindowRegistry::default();
+        registry.record_native_surface_service_binding(
+            "render-session-a-1",
+            true,
+            "d3d11",
+            Some("0x1234"),
+        );
+
+        assert_eq!(
+            registry.native_surface_service_action("render-session-a-1", false, "web", None),
+            NativeSurfaceServiceAction::Detach
+        );
+        registry.record_native_surface_service_binding("render-session-a-1", false, "web", None);
+        assert_eq!(
+            registry.native_surface_service_action("render-session-a-1", false, "web", None),
+            NativeSurfaceServiceAction::Unchanged
+        );
     }
 }

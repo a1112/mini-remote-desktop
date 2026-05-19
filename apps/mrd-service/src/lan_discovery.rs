@@ -3639,8 +3639,8 @@ async fn send_lan_reliable_media_fragment(
 fn should_send_access_unit_as_reliable_frame(
     reliable_media_supported: bool,
     media_v3_supported: bool,
-    fragment_count: usize,
-    profile: &MediaProfile,
+    _fragment_count: usize,
+    _profile: &MediaProfile,
     reliable_whole_frame_override: Option<bool>,
 ) -> bool {
     if !reliable_media_supported || !media_v3_supported {
@@ -3650,7 +3650,7 @@ fn should_send_access_unit_as_reliable_frame(
         return enabled;
     }
 
-    profile.bitrate_mbps >= LAN_QUIC_RELIABLE_WHOLE_FRAME_MIN_BITRATE_MBPS && fragment_count > 1
+    false
 }
 
 fn reliable_whole_frame_media_override() -> Option<bool> {
@@ -7794,7 +7794,7 @@ mod tests {
     }
 
     #[test]
-    fn high_bitrate_media_uses_reliable_whole_frame_when_available() {
+    fn high_bitrate_media_keeps_delta_frames_on_datagrams_by_default() {
         let high_bitrate = MediaProfile {
             width: 2560,
             height: 1600,
@@ -7812,14 +7812,14 @@ mod tests {
             ..MediaProfile::default()
         };
 
-        assert!(should_send_access_unit_as_reliable_frame(
+        assert!(!should_send_access_unit_as_reliable_frame(
             true,
             true,
             64,
             &high_bitrate,
             None
         ));
-        assert!(should_send_access_unit_as_reliable_frame(
+        assert!(!should_send_access_unit_as_reliable_frame(
             true,
             true,
             64,
@@ -7829,7 +7829,7 @@ mod tests {
     }
 
     #[test]
-    fn high_quality_media_uses_reliable_whole_frame_to_avoid_datagram_jitter() {
+    fn reliable_whole_frame_requires_explicit_override() {
         let high_quality_2k144 = MediaProfile {
             width: 2560,
             height: 1440,
@@ -7839,12 +7839,19 @@ mod tests {
             ..MediaProfile::default()
         };
 
-        assert!(should_send_access_unit_as_reliable_frame(
+        assert!(!should_send_access_unit_as_reliable_frame(
             true,
             true,
             64,
             &high_quality_2k144,
             None
+        ));
+        assert!(should_send_access_unit_as_reliable_frame(
+            true,
+            true,
+            64,
+            &high_quality_2k144,
+            Some(true)
         ));
         assert!(!should_send_access_unit_as_reliable_frame(
             true,
