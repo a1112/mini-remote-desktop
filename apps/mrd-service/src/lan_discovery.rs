@@ -59,7 +59,7 @@ const LAN_QUIC_FALLBACK_DATAGRAM_BYTES: usize = 1_200;
 // Keep the default media fragment below common LAN/QUIC path MTU headroom.
 // Larger datagrams reduce sender P95 but raised cross-device frame drop ratio.
 const LAN_QUIC_LAN_HIGH_QUALITY_DATAGRAM_BYTES: usize = LAN_QUIC_FALLBACK_DATAGRAM_BYTES;
-const LAN_QUIC_RELIABLE_WHOLE_FRAME_MIN_BITRATE_MBPS: u32 = 100;
+const LAN_QUIC_RELIABLE_WHOLE_FRAME_MIN_BITRATE_MBPS: u32 = 80;
 const LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES: usize = 4 * 1024 * 1024;
 const LAN_QUIC_RELIABLE_MEDIA_RETRY_DELAY: Duration = Duration::from_millis(10);
 const LAN_QUIC_MEDIA_TRANSPORT: &str = "quic_datagram";
@@ -7616,7 +7616,7 @@ mod tests {
     }
 
     #[test]
-    fn high_bitrate_reliable_media_prefers_per_message_streams_to_reduce_hol() {
+    fn high_quality_reliable_media_prefers_per_message_streams_to_reduce_hol() {
         let high_bitrate = MediaProfile {
             width: 2560,
             height: 1600,
@@ -7640,7 +7640,7 @@ mod tests {
         );
         assert_eq!(
             select_reliable_media_send_mode_for_profile(true, true, &stable_bitrate),
-            LanReliableMediaSendMode::Persistent
+            LanReliableMediaSendMode::PerMessage
         );
         assert_eq!(
             select_reliable_media_send_mode_for_profile(false, true, &high_bitrate),
@@ -7702,25 +7702,45 @@ mod tests {
             &high_bitrate,
             None
         ));
-        assert!(!should_send_access_unit_as_reliable_frame(
+        assert!(should_send_access_unit_as_reliable_frame(
             true,
             true,
             64,
             &stable_bitrate,
             None
         ));
+    }
+
+    #[test]
+    fn high_quality_media_uses_reliable_whole_frame_to_avoid_datagram_jitter() {
+        let high_quality_2k144 = MediaProfile {
+            width: 2560,
+            height: 1440,
+            fps: 144,
+            bitrate_mbps: 80,
+            codec: "hevc".to_string(),
+            ..MediaProfile::default()
+        };
+
+        assert!(should_send_access_unit_as_reliable_frame(
+            true,
+            true,
+            64,
+            &high_quality_2k144,
+            None
+        ));
         assert!(!should_send_access_unit_as_reliable_frame(
             true,
             true,
             64,
-            &high_bitrate,
+            &high_quality_2k144,
             Some(false)
         ));
         assert!(!should_send_access_unit_as_reliable_frame(
             false,
             true,
             64,
-            &high_bitrate,
+            &high_quality_2k144,
             None
         ));
     }
