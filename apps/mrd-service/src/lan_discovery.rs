@@ -1394,7 +1394,9 @@ pub async fn request_lan_display_mode_set(
             ..
         } if is_valid_discovery_packet(&magic, &app_id) && ack_session_id == session_id.0 => {
             if accepted {
-                change.context("LAN peer accepted display mode set without change")
+                let change = change.context("LAN peer accepted display mode set without change")?;
+                record_remote_display_mode_change(app_state, session_id, &change).await;
+                Ok(change)
             } else {
                 anyhow::bail!(
                     "LAN peer rejected display mode set: {}",
@@ -1443,7 +1445,10 @@ pub async fn request_lan_display_mode_restore(
             ..
         } if is_valid_discovery_packet(&magic, &app_id) && ack_session_id == session_id.0 => {
             if accepted {
-                change.context("LAN peer accepted display mode restore without change")
+                let change =
+                    change.context("LAN peer accepted display mode restore without change")?;
+                clear_remote_display_mode_change(app_state, session_id).await;
+                Ok(change)
             } else {
                 anyhow::bail!(
                     "LAN peer rejected display mode restore: {}",
@@ -1452,6 +1457,33 @@ pub async fn request_lan_display_mode_restore(
             }
         }
         _ => anyhow::bail!("unexpected LAN display mode restore response"),
+    }
+}
+
+async fn record_remote_display_mode_change(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+    change: &DisplayModeChange,
+) {
+    let Some(active) = change.active.as_ref() else {
+        return;
+    };
+    let requested = change.requested.clone().unwrap_or_else(|| active.clone());
+    app_state.display_modes.lock().await.record_change(
+        session_id.clone(),
+        requested,
+        change.previous.clone(),
+        active.clone(),
+        change.restore_required,
+    );
+    reconcile_media_profile_to_display_mode(app_state, session_id, active).await;
+}
+
+async fn clear_remote_display_mode_change(app_state: &Arc<AppState>, session_id: &SessionId) {
+    app_state.display_modes.lock().await.remove(session_id);
+    let selection = app_state.capture_sources.lock().await.get(session_id);
+    if let Some(selection) = selection {
+        reconcile_media_profile_to_capture_source(app_state, session_id, &selection.source).await;
     }
 }
 
@@ -1985,6 +2017,10 @@ async fn accept_lan_media_profile_update(
     if let Some(selection) = selected_source.as_ref() {
         reconcile_negotiation_to_capture_source(&mut negotiation, &selection.source);
     }
+    let active_display_mode = app_state.display_modes.lock().await.active_mode(session_id);
+    if let Some(mode) = active_display_mode.as_ref() {
+        reconcile_negotiation_to_display_mode(&mut negotiation, mode);
+    }
     app_state
         .media_profiles
         .lock()
@@ -2051,13 +2087,15 @@ async fn accept_lan_display_mode_set(
 ) -> Result<DisplayModeChange> {
     ensure_active_sender_session(app_state, session_id, "display mode set").await?;
     let (previous, active) = crate::display_mode::set_display_mode(&mode)?;
-    Ok(app_state.display_modes.lock().await.record_change(
+    let change = app_state.display_modes.lock().await.record_change(
         session_id.clone(),
         mode,
         previous,
-        active,
+        active.clone(),
         restore_after_session,
-    ))
+    );
+    reconcile_media_profile_to_display_mode(app_state, session_id, &active).await;
+    Ok(change)
 }
 
 #[cfg(test)]
@@ -2082,13 +2120,15 @@ async fn accept_lan_display_mode_set_from_modes(
             requested.width, requested.height, requested.refresh_hz
         )
     })?;
-    Ok(app_state.display_modes.lock().await.record_change(
+    let change = app_state.display_modes.lock().await.record_change(
         session_id.clone(),
         requested,
         previous,
-        active,
+        active.clone(),
         restore_after_session,
-    ))
+    );
+    reconcile_media_profile_to_display_mode(app_state, session_id, &active).await;
+    Ok(change)
 }
 
 async fn accept_lan_display_mode_restore(
@@ -2149,12 +2189,29 @@ async fn reconcile_media_profile_to_capture_source(
     session_id: &SessionId,
     source: &CaptureSource,
 ) {
+    let active_display_mode = app_state.display_modes.lock().await.active_mode(session_id);
     let mut profiles = app_state.media_profiles.lock().await;
     let mut negotiation = profiles
         .get(session_id)
         .unwrap_or_else(default_media_profile_negotiation);
     reconcile_negotiation_to_capture_source(&mut negotiation, source);
+    if let Some(mode) = active_display_mode.as_ref() {
+        reconcile_negotiation_to_display_mode(&mut negotiation, mode);
+    }
 
+    profiles.set(session_id.clone(), negotiation);
+}
+
+async fn reconcile_media_profile_to_display_mode(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+    mode: &DisplayMode,
+) {
+    let mut profiles = app_state.media_profiles.lock().await;
+    let mut negotiation = profiles
+        .get(session_id)
+        .unwrap_or_else(default_media_profile_negotiation);
+    reconcile_negotiation_to_display_mode(&mut negotiation, mode);
     profiles.set(session_id.clone(), negotiation);
 }
 
@@ -2201,6 +2258,46 @@ fn reconcile_negotiation_to_capture_source(
             .clone()
             .or(capability_limited.reason.clone());
         negotiation.downgrade_reason = downgrade_reason.or(capability_limited.downgrade_reason);
+    } else {
+        negotiation.status = "accepted".to_string();
+        negotiation.reason = None;
+        negotiation.downgrade_reason = None;
+    }
+}
+
+fn reconcile_negotiation_to_display_mode(
+    negotiation: &mut MediaProfileNegotiation,
+    mode: &DisplayMode,
+) {
+    let mut selected = negotiation.selected.clone();
+    let mut changed_for_display = false;
+
+    if mode.width > 0 && mode.height > 0 {
+        let (selected_width, selected_height) =
+            h264_target_dimensions(mode.width as usize, mode.height as usize, &selected);
+        if selected_width as u32 != selected.width || selected_height as u32 != selected.height {
+            changed_for_display = true;
+        }
+        selected.width = selected_width as u32;
+        selected.height = selected_height as u32;
+    }
+
+    if mode.refresh_hz > 0 && selected.fps > mode.refresh_hz {
+        selected.fps = mode.refresh_hz;
+        changed_for_display = true;
+    }
+
+    negotiation.selected = selected;
+    negotiation.selected_width = Some(negotiation.selected.width);
+    negotiation.selected_height = Some(negotiation.selected.height);
+
+    if negotiation.selected != negotiation.requested {
+        negotiation.status = "downgraded".to_string();
+        if changed_for_display {
+            let reason = "matched active display mode dimensions and refresh rate".to_string();
+            negotiation.reason = Some(reason.clone());
+            negotiation.downgrade_reason = Some(reason);
+        }
     } else {
         negotiation.status = "accepted".to_string();
         negotiation.reason = None;
@@ -7087,6 +7184,135 @@ mod tests {
                 .as_ref()
                 .map(|mode| mode.id.as_str()),
             Some("current")
+        );
+    }
+
+    #[tokio::test]
+    async fn display_mode_set_clamps_media_profile_to_active_refresh() {
+        let app_state = Arc::new(AppState::new());
+        let session_id = SessionId("display-mode-profile-session".to_string());
+        app_state
+            .sessions
+            .lock()
+            .await
+            .insert(session_id.clone(), sender_snapshot(&session_id));
+        app_state.media_profiles.lock().await.set(
+            session_id.clone(),
+            negotiate_media_profile(Some(MediaProfile {
+                width: 2560,
+                height: 1600,
+                fps: 165,
+                bitrate_mbps: 120,
+                codec: "hevc".to_string(),
+                ..MediaProfile::default()
+            }))
+            .unwrap(),
+        );
+        let modes = vec![
+            display_mode("current", 2560, 1440, 144, true),
+            display_mode("active", 1920, 1200, 144, false),
+        ];
+
+        accept_lan_display_mode_set_from_modes(
+            &app_state,
+            &session_id,
+            display_mode("requested", 2560, 1600, 165, false),
+            true,
+            modes,
+        )
+        .await
+        .unwrap();
+
+        let negotiation = app_state
+            .media_profiles
+            .lock()
+            .await
+            .get(&session_id)
+            .expect("profile after display mode set");
+        assert_eq!(negotiation.selected.width, 1920);
+        assert_eq!(negotiation.selected.height, 1200);
+        assert_eq!(negotiation.selected.fps, 144);
+        assert_eq!(negotiation.status, "downgraded");
+        assert_eq!(
+            negotiation.downgrade_reason.as_deref(),
+            Some("matched active display mode dimensions and refresh rate")
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_display_mode_ack_updates_controller_expected_profile() {
+        let app_state = Arc::new(AppState::new());
+        let session_id = SessionId("controller-display-mode-profile-session".to_string());
+        app_state
+            .sessions
+            .lock()
+            .await
+            .insert(session_id.clone(), sender_snapshot(&session_id));
+        app_state.media_profiles.lock().await.set(
+            session_id.clone(),
+            negotiate_media_profile(Some(MediaProfile {
+                width: 2560,
+                height: 1600,
+                fps: 165,
+                bitrate_mbps: 120,
+                codec: "hevc".to_string(),
+                ..MediaProfile::default()
+            }))
+            .unwrap(),
+        );
+        store_capture_source_selection(
+            &app_state,
+            &session_id,
+            CaptureSourceSelection {
+                session_id: session_id.clone(),
+                source: mrd_ipc::CaptureSource {
+                    id: "windows:display-shared:0".to_string(),
+                    platform: "windows".to_string(),
+                    source_kind: "display_shared".to_string(),
+                    title: "Display 1".to_string(),
+                    class_name: "WinRTMonitorShared".to_string(),
+                    width: 1920,
+                    height: 1200,
+                    process_id: 0,
+                    app_name: Some("Display".to_string()),
+                    bundle_identifier: None,
+                    preview_data_url: None,
+                    preview_width: None,
+                    preview_height: None,
+                },
+                status: "selected".to_string(),
+                reason: None,
+            },
+        )
+        .await;
+
+        record_remote_display_mode_change(
+            &app_state,
+            &session_id,
+            &DisplayModeChange {
+                session_id: session_id.clone(),
+                requested: Some(display_mode("requested", 1920, 1200, 144, false)),
+                previous: Some(display_mode("previous", 2560, 1600, 165, true)),
+                active: Some(display_mode("active", 1920, 1200, 144, true)),
+                status: "changed".to_string(),
+                reason: None,
+                restore_required: true,
+            },
+        )
+        .await;
+
+        let negotiation = app_state
+            .media_profiles
+            .lock()
+            .await
+            .get(&session_id)
+            .expect("controller profile after display mode ack");
+        assert_eq!(negotiation.selected.width, 1920);
+        assert_eq!(negotiation.selected.height, 1200);
+        assert_eq!(negotiation.selected.fps, 144);
+        assert_eq!(
+            negotiation.downgrade_reason.as_deref(),
+            Some("matched active display mode dimensions and refresh rate")
         );
     }
 
