@@ -171,6 +171,21 @@ pub struct MediaTestImpairmentSnapshot {
     pub datagrams_fragmented_by_mtu: u64,
 }
 
+/// Sender-side LAN media transport counters.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MediaSenderTransportSnapshot {
+    pub datagram_fragments_attempted: u64,
+    pub datagram_fragments_sent: u64,
+    pub datagram_fragments_delayed: u64,
+    pub datagram_fragments_dropped_by_impairment: u64,
+    pub datagram_fragments_dropped_for_capacity: u64,
+    pub datagram_fragments_dropped_for_budget: u64,
+    pub datagram_frames_cut_short_for_capacity: u64,
+    pub datagram_frames_cut_short_for_budget: u64,
+    pub reliable_fragments_sent: u64,
+    pub reliable_frames_sent: u64,
+}
+
 fn default_adaptation_mode() -> String {
     "keyframe_ladder".to_string()
 }
@@ -276,6 +291,8 @@ pub struct MediaPipelineSnapshot {
     pub stage_metrics: Vec<MediaStageMetrics>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test_impairment: Option<MediaTestImpairmentSnapshot>,
+    #[serde(default)]
+    pub sender_transport: MediaSenderTransportSnapshot,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adaptation: Option<MediaAdaptationSnapshot>,
 }

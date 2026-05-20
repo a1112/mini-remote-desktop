@@ -11,7 +11,7 @@ use mrd_application::ports::SessionSnapshot;
 use mrd_ipc::{
     AttachedRenderSurface, AuditEvent, AuditLogQuery, CaptureSourceSelection,
     MediaAdaptationSnapshot, MediaPipelineSnapshot, MediaProfile, MediaProfileNegotiation,
-    MediaStageMetrics, MediaTestImpairmentSnapshot,
+    MediaSenderTransportSnapshot, MediaStageMetrics, MediaTestImpairmentSnapshot,
 };
 use mrd_proto::{DeviceId, SessionId};
 #[cfg(windows)]
@@ -243,6 +243,7 @@ struct MediaPipelineState {
     stage_samples: HashMap<String, VecDeque<f64>>,
     stage_summaries: HashMap<String, MediaStageMetrics>,
     test_impairment: Option<MediaTestImpairmentSnapshot>,
+    sender_transport: MediaSenderTransportSnapshot,
     adaptation: Option<MediaAdaptationSnapshot>,
 }
 
@@ -511,6 +512,17 @@ impl MediaPipelineRegistry {
             .test_impairment = impairment;
     }
 
+    pub fn set_sender_transport(
+        &mut self,
+        session_id: SessionId,
+        transport: MediaSenderTransportSnapshot,
+    ) {
+        self.pipelines
+            .entry(session_id)
+            .or_default()
+            .sender_transport = transport;
+    }
+
     pub fn set_adaptation(
         &mut self,
         session_id: SessionId,
@@ -555,6 +567,9 @@ impl MediaPipelineRegistry {
             render_pacing_target_fps: state.and_then(|state| state.render_pacing_target_fps),
             stage_metrics,
             test_impairment: state.and_then(|state| state.test_impairment.clone()),
+            sender_transport: state
+                .map(|state| state.sender_transport.clone())
+                .unwrap_or_default(),
             adaptation: state.and_then(|state| state.adaptation.clone()),
         }
     }

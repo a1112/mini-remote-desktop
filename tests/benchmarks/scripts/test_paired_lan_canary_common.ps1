@@ -224,6 +224,18 @@ $adaptiveDowngradeReport = [pscustomobject]@{
       [pscustomobject]@{ stage = "render_present_gap"; p50_ms = 10.9; p95_ms = 15.0 }
     )
     test_impairment = $null
+    sender_transport = [pscustomobject]@{
+      datagram_fragments_attempted = 40
+      datagram_fragments_sent = 38
+      datagram_fragments_delayed = 0
+      datagram_fragments_dropped_by_impairment = 0
+      datagram_fragments_dropped_for_capacity = 2
+      datagram_fragments_dropped_for_budget = 0
+      datagram_frames_cut_short_for_capacity = 1
+      datagram_frames_cut_short_for_budget = 0
+      reliable_fragments_sent = 0
+      reliable_frames_sent = 0
+    }
     active_codec = "hevc"
     adaptation = [pscustomobject]@{
       current_profile = [pscustomobject]@{ width = 1920; height = 1200; fps = 90; bitrate_mbps = 28; codec = "hevc" }
@@ -275,6 +287,18 @@ $hevcReport = [pscustomobject]@{
       [pscustomobject]@{ stage = "render_present"; p50_ms = 0.2; p95_ms = 0.4 }
     )
     test_impairment = $null
+    sender_transport = [pscustomobject]@{
+      datagram_fragments_attempted = 40
+      datagram_fragments_sent = 38
+      datagram_fragments_delayed = 0
+      datagram_fragments_dropped_by_impairment = 0
+      datagram_fragments_dropped_for_capacity = 2
+      datagram_fragments_dropped_for_budget = 0
+      datagram_frames_cut_short_for_capacity = 1
+      datagram_frames_cut_short_for_budget = 0
+      reliable_fragments_sent = 0
+      reliable_frames_sent = 0
+    }
     active_codec = "hevc"
     active_codec_profile = "main"
     active_chroma_subsampling = "4:2:0"
@@ -294,6 +318,8 @@ Assert-Equal $hevcRow.visual_integrity_status "ok" "Healthy HEVC rows report vis
 Assert-Equal $hevcRow.stage_p50_ms.'sender.encode' 0.6 "HEVC row exposes sender encode P50"
 Assert-Equal $hevcRow.stage_p50_ms.'sender.send_datagram' 1.1 "HEVC row exposes sender datagram send P50"
 Assert-Equal $hevcRow.stage_p95_ms.'sender.send_datagram' 3.2 "HEVC row still exposes sender datagram send P95"
+Assert-Equal $hevcRow.sender_transport.datagram_fragments_dropped_for_capacity 2 "HEVC row exposes sender capacity drop counters"
+Assert-Equal $hevcRow.sender_transport.datagram_fragments_attempted 40 "HEVC row exposes sender datagram attempted counters"
 
 $reliableSendReport = [pscustomobject]@{
   status = "completed"

@@ -334,6 +334,7 @@ function Convert-CrossReportToCanaryRow {
   $renderQueueReplacements = [int64](Select-CanaryValue $pipeline.render_queue_replacements $pipelineDropped)
   $renderLockDrops = [int64](Select-CanaryValue $pipeline.render_lock_drops 0)
   $activeCodec = Select-CanaryValue $pipeline.active_codec $RequestedCodec
+  $senderTransport = Select-CanaryObjectPropertyValue $pipeline "sender_transport" $null
 
   [pscustomobject]@{
     id = $Profile.id
@@ -374,6 +375,7 @@ function Convert-CrossReportToCanaryRow {
     stage_p50_ms = Convert-MediaStageMetricsToP50Map -StageMetrics $pipeline.stage_metrics
     stage_p95_ms = Convert-MediaStageMetricsToP95Map -StageMetrics $pipeline.stage_metrics
     test_impairment = $pipeline.test_impairment
+    sender_transport = $senderTransport
     adaptive = [bool](Select-CanaryValue $Profile.adaptive $false)
     adaptation = $adaptation
     adaptation_state = Select-CanaryValue $adaptation.state "-"
@@ -736,8 +738,8 @@ function Write-CanaryJsonAndMarkdown {
     "- Skipped: $($Report.skipped)",
     "- Failed: $($Report.failed)",
     "",
-    "| Profile | Status | Class | FPS | Render FPS | Render Target | Selected | Adaptive | Visual | Enc P50/P95 | Send P50/P95 | Present Gap P95 | Sample/Probe Drop | Drop Breakdown gap/decode/transient | Render Coalesce | Render Drop | Queue | Error |",
-    "| --- | --- | --- | ---: | ---: | ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
+    "| Profile | Status | Class | FPS | Render FPS | Render Target | Selected | Adaptive | Visual | Enc P50/P95 | Send P50/P95 | Present Gap P95 | Sample/Probe Drop | Drop Breakdown gap/decode/transient | Sender Drop cap/budget/impair | Render Coalesce | Render Drop | Queue | Error |",
+    "| --- | --- | --- | ---: | ---: | ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
   )
   foreach ($row in $Report.rows) {
     $selected = "$($row.selected_profile.width)x$($row.selected_profile.height)@$($row.selected_profile.fps)/$($row.selected_profile.bitrate_mbps)Mbps"
@@ -758,9 +760,13 @@ function Write-CanaryJsonAndMarkdown {
     $decodeErrorDrops = Select-CanaryValue $row.sample_decode_error_drops (Select-CanaryValue $row.decode_error_drops 0)
     $transientDrops = Select-CanaryValue $row.sample_transient_drops (Select-CanaryValue $row.transient_drops 0)
     $dropBreakdown = "$sequenceGapDrops/$decodeErrorDrops/$transientDrops"
+    $senderCapacityDrops = Select-CanaryValue $row.sender_transport.datagram_fragments_dropped_for_capacity 0
+    $senderBudgetDrops = Select-CanaryValue $row.sender_transport.datagram_fragments_dropped_for_budget 0
+    $senderImpairmentDrops = Select-CanaryValue $row.sender_transport.datagram_fragments_dropped_by_impairment 0
+    $senderDropBreakdown = "$senderCapacityDrops/$senderBudgetDrops/$senderImpairmentDrops"
     $renderCoalesce = Select-CanaryValue $row.render_queue_replacements 0
     $renderDrops = Select-CanaryValue $row.render_lock_drops 0
-    $lines += "| $($row.id) | $($row.status) | $($row.classification) | $([Math]::Round([double](Select-CanaryValue $row.fps_observed 0), 2)) | $estimatedRenderFps | $renderTargetFps | $selected | $adaptive | $visual | $encodeP50/$encodeP95 | $sendP50/$sendP95 | $presentGapP95 | $probeDrops | $dropBreakdown | $renderCoalesce | $renderDrops | $($row.queue_depth) | $error |"
+    $lines += "| $($row.id) | $($row.status) | $($row.classification) | $([Math]::Round([double](Select-CanaryValue $row.fps_observed 0), 2)) | $estimatedRenderFps | $renderTargetFps | $selected | $adaptive | $visual | $encodeP50/$encodeP95 | $sendP50/$sendP95 | $presentGapP95 | $probeDrops | $dropBreakdown | $senderDropBreakdown | $renderCoalesce | $renderDrops | $($row.queue_depth) | $error |"
   }
   if ($Report.codec_request) {
     $lines += ""

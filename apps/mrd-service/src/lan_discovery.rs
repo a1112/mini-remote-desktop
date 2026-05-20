@@ -6,8 +6,8 @@ use mrd_application::ports::SessionSnapshot;
 use mrd_encode_openh264::OpenH264Encoder;
 use mrd_ipc::{
     CaptureSource, CaptureSourceSelection, DisplayMode, DisplayModeChange, LanDiscoverySnapshot,
-    LanPeerInfo, MediaProfile, MediaProfileNegotiation, MediaStageMetrics,
-    MediaTestImpairmentSnapshot,
+    LanPeerInfo, MediaProfile, MediaProfileNegotiation, MediaSenderTransportSnapshot,
+    MediaStageMetrics, MediaTestImpairmentSnapshot,
 };
 use mrd_pipeline_core::{
     CapturedFrame, DecodedFrame, DecodedFrameData, FramePixelFormat, VideoDecoder, VideoEncoder,
@@ -69,8 +69,6 @@ const LAN_QUIC_LAN_HIGH_QUALITY_DATAGRAM_BYTES: usize = LAN_QUIC_FALLBACK_DATAGR
 const LAN_QUIC_RELIABLE_WHOLE_FRAME_MIN_BITRATE_MBPS: u32 = 80;
 const LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_BITRATE_MBPS: u32 = 120;
 const LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_FPS: u32 = 120;
-const LAN_QUIC_RELIABLE_WHOLE_FRAME_STABILITY_MIN_BITRATE_MBPS: u32 = 64;
-const LAN_QUIC_RELIABLE_WHOLE_FRAME_STABILITY_MIN_FPS: u32 = 144;
 const LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES: usize = 4 * 1024 * 1024;
 const LAN_QUIC_RELIABLE_MEDIA_RETRY_DELAY: Duration = Duration::from_millis(10);
 const LAN_QUIC_DATAGRAM_SEND_BUDGET_MIN_BITRATE_MBPS: u32 = 80;
@@ -676,6 +674,8 @@ struct LanSenderStatsPayload {
     target_fps: u32,
     target_bitrate_mbps: u32,
     metrics: Vec<MediaStageMetrics>,
+    #[serde(default)]
+    sender_transport: MediaSenderTransportSnapshot,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     test_impairment: Option<MediaTestImpairmentSnapshot>,
 }
@@ -684,7 +684,20 @@ struct LanSenderStatsPayload {
 struct LanSenderStatsTracker {
     samples: HashMap<&'static str, VecDeque<f64>>,
     frame_count: u64,
+    sender_transport: MediaSenderTransportSnapshot,
     last_emit: Instant,
+}
+
+#[derive(Debug, Clone, Default)]
+struct LanSenderDatagramFrameReport {
+    fragments_attempted: u64,
+    fragments_sent: u64,
+    fragments_delayed: u64,
+    fragments_dropped_by_impairment: u64,
+    fragments_dropped_for_capacity: u64,
+    fragments_dropped_for_budget: u64,
+    cut_short_for_capacity: bool,
+    cut_short_for_budget: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -723,6 +736,7 @@ impl LanSenderStatsTracker {
         Self {
             samples: HashMap::new(),
             frame_count: 0,
+            sender_transport: MediaSenderTransportSnapshot::default(),
             last_emit: now,
         }
     }
@@ -744,6 +758,58 @@ impl LanSenderStatsTracker {
 
     fn frame_completed(&mut self) {
         self.frame_count = self.frame_count.saturating_add(1);
+    }
+
+    fn record_datagram_frame(&mut self, report: LanSenderDatagramFrameReport) {
+        self.sender_transport.datagram_fragments_attempted = self
+            .sender_transport
+            .datagram_fragments_attempted
+            .saturating_add(report.fragments_attempted);
+        self.sender_transport.datagram_fragments_sent = self
+            .sender_transport
+            .datagram_fragments_sent
+            .saturating_add(report.fragments_sent);
+        self.sender_transport.datagram_fragments_delayed = self
+            .sender_transport
+            .datagram_fragments_delayed
+            .saturating_add(report.fragments_delayed);
+        self.sender_transport
+            .datagram_fragments_dropped_by_impairment = self
+            .sender_transport
+            .datagram_fragments_dropped_by_impairment
+            .saturating_add(report.fragments_dropped_by_impairment);
+        self.sender_transport
+            .datagram_fragments_dropped_for_capacity = self
+            .sender_transport
+            .datagram_fragments_dropped_for_capacity
+            .saturating_add(report.fragments_dropped_for_capacity);
+        self.sender_transport.datagram_fragments_dropped_for_budget = self
+            .sender_transport
+            .datagram_fragments_dropped_for_budget
+            .saturating_add(report.fragments_dropped_for_budget);
+        if report.cut_short_for_capacity {
+            self.sender_transport.datagram_frames_cut_short_for_capacity = self
+                .sender_transport
+                .datagram_frames_cut_short_for_capacity
+                .saturating_add(1);
+        }
+        if report.cut_short_for_budget {
+            self.sender_transport.datagram_frames_cut_short_for_budget = self
+                .sender_transport
+                .datagram_frames_cut_short_for_budget
+                .saturating_add(1);
+        }
+    }
+
+    fn record_reliable_frame(&mut self, fragments_sent: u64, frame_sent: bool) {
+        self.sender_transport.reliable_fragments_sent = self
+            .sender_transport
+            .reliable_fragments_sent
+            .saturating_add(fragments_sent);
+        if frame_sent {
+            self.sender_transport.reliable_frames_sent =
+                self.sender_transport.reliable_frames_sent.saturating_add(1);
+        }
     }
 
     fn take_stage_metrics(&mut self, now: Instant) -> Option<Vec<MediaStageMetrics>> {
@@ -784,6 +850,7 @@ impl LanSenderStatsTracker {
             target_fps: profile.fps,
             target_bitrate_mbps: profile.bitrate_mbps,
             metrics,
+            sender_transport: self.sender_transport.clone(),
             test_impairment,
         })
     }
@@ -3265,6 +3332,7 @@ async fn send_quic_media_loop(
             let mut send_result = Ok(());
             if send_as_reliable_frame {
                 let reliable_send_started = Instant::now();
+                let mut reliable_fragments_sent = 0_u64;
                 for reliable_fragment in reliable_fragments.unwrap_or_default() {
                     let delay = test_impairment.next_delay();
                     if !delay.is_zero() {
@@ -3282,25 +3350,43 @@ async fn send_quic_media_loop(
                         });
                         break;
                     }
+                    reliable_fragments_sent = reliable_fragments_sent.saturating_add(1);
                 }
                 sender_stats.record_elapsed("sender.send_reliable", reliable_send_started);
+                sender_stats.record_reliable_frame(
+                    reliable_fragments_sent,
+                    reliable_fragments_sent > 0 && send_result.is_ok(),
+                );
             } else {
                 let best_effort_datagrams = use_best_effort_media_datagrams(&profile);
                 let datagram_send_started = Instant::now();
                 let datagram_send_deadline =
                     lan_datagram_frame_send_budget(&profile, reliable_media_enabled)
                         .and_then(|budget| datagram_send_started.checked_add(budget));
-                for fragment in &fragments {
+                let mut datagram_report = LanSenderDatagramFrameReport {
+                    fragments_attempted: fragments.len() as u64,
+                    ..LanSenderDatagramFrameReport::default()
+                };
+                for (fragment_index, fragment) in fragments.iter().enumerate() {
                     let remaining_send_budget = datagram_send_deadline
                         .map(|deadline| deadline.saturating_duration_since(Instant::now()));
                     if remaining_send_budget.is_some_and(|remaining| remaining.is_zero()) {
+                        datagram_report.fragments_dropped_for_budget = datagram_report
+                            .fragments_dropped_for_budget
+                            .saturating_add((fragments.len() - fragment_index) as u64);
+                        datagram_report.cut_short_for_budget = true;
                         break;
                     }
                     let decision = test_impairment.next_datagram_decision();
                     if decision.drop_datagram {
+                        datagram_report.fragments_dropped_by_impairment = datagram_report
+                            .fragments_dropped_by_impairment
+                            .saturating_add(1);
                         continue;
                     }
                     if !decision.delay.is_zero() {
+                        datagram_report.fragments_delayed =
+                            datagram_report.fragments_delayed.saturating_add(1);
                         let delayed_endpoint = endpoint.clone();
                         let delayed_session_id = session_id.clone();
                         let delayed_frame_id = frame_id;
@@ -3333,8 +3419,15 @@ async fn send_quic_media_loop(
                     )
                     .await;
                     match send_fragment_result {
-                        Ok(LanDatagramSendOutcome::Sent) => {}
+                        Ok(LanDatagramSendOutcome::Sent) => {
+                            datagram_report.fragments_sent =
+                                datagram_report.fragments_sent.saturating_add(1);
+                        }
                         Ok(LanDatagramSendOutcome::DroppedForCapacity) => {
+                            datagram_report.fragments_dropped_for_capacity = datagram_report
+                                .fragments_dropped_for_capacity
+                                .saturating_add((fragments.len() - fragment_index) as u64);
+                            datagram_report.cut_short_for_capacity = true;
                             break;
                         }
                         Err(error) => {
@@ -3345,6 +3438,7 @@ async fn send_quic_media_loop(
                         }
                     }
                 }
+                sender_stats.record_datagram_frame(datagram_report);
                 sender_stats.record_elapsed("sender.send_datagram", datagram_send_started);
 
                 if send_result.is_ok() {
@@ -3825,14 +3919,8 @@ fn should_send_access_unit_as_reliable_frame(
 }
 
 fn should_default_to_reliable_whole_frame(profile: &MediaProfile) -> bool {
-    let ultra_high_bitrate = profile.bitrate_mbps
-        >= LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_BITRATE_MBPS
-        && profile.fps >= LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_FPS;
-    let high_refresh_stability = profile.bitrate_mbps
-        >= LAN_QUIC_RELIABLE_WHOLE_FRAME_STABILITY_MIN_BITRATE_MBPS
-        && profile.fps >= LAN_QUIC_RELIABLE_WHOLE_FRAME_STABILITY_MIN_FPS;
-
-    ultra_high_bitrate || high_refresh_stability
+    profile.bitrate_mbps >= LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_BITRATE_MBPS
+        && profile.fps >= LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_FPS
 }
 
 fn reliable_whole_frame_media_override() -> Option<bool> {
@@ -4155,6 +4243,7 @@ async fn receive_quic_media_loop(
                 let mut pipelines = app_state.media_pipelines.lock().await;
                 pipelines.set_stage_metrics(session_id.clone(), stats.metrics);
                 pipelines.set_test_impairment(session_id.clone(), stats.test_impairment);
+                pipelines.set_sender_transport(session_id.clone(), stats.sender_transport);
                 continue;
             }
             Ok(None) => {}
@@ -8171,6 +8260,18 @@ mod tests {
                 p50_ms: Some(1.2),
                 p95_ms: Some(2.4),
             }],
+            sender_transport: MediaSenderTransportSnapshot {
+                datagram_fragments_attempted: 4,
+                datagram_fragments_sent: 3,
+                datagram_fragments_delayed: 0,
+                datagram_fragments_dropped_by_impairment: 0,
+                datagram_fragments_dropped_for_capacity: 1,
+                datagram_fragments_dropped_for_budget: 0,
+                datagram_frames_cut_short_for_capacity: 1,
+                datagram_frames_cut_short_for_budget: 0,
+                reliable_fragments_sent: 0,
+                reliable_frames_sent: 0,
+            },
             test_impairment: None,
         };
 
@@ -8182,6 +8283,68 @@ mod tests {
             decode_lan_sender_stats_datagram(b"not-stats").unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn lan_sender_stats_tracker_accumulates_transport_counters() {
+        let mut tracker = LanSenderStatsTracker::new(Instant::now());
+        tracker.record_datagram_frame(LanSenderDatagramFrameReport {
+            fragments_attempted: 5,
+            fragments_sent: 3,
+            fragments_delayed: 1,
+            fragments_dropped_by_impairment: 1,
+            fragments_dropped_for_capacity: 1,
+            fragments_dropped_for_budget: 0,
+            cut_short_for_capacity: true,
+            cut_short_for_budget: false,
+        });
+        tracker.record_datagram_frame(LanSenderDatagramFrameReport {
+            fragments_attempted: 4,
+            fragments_sent: 2,
+            fragments_delayed: 0,
+            fragments_dropped_by_impairment: 0,
+            fragments_dropped_for_capacity: 0,
+            fragments_dropped_for_budget: 2,
+            cut_short_for_capacity: false,
+            cut_short_for_budget: true,
+        });
+        tracker.record_reliable_frame(7, true);
+
+        assert_eq!(tracker.sender_transport.datagram_fragments_attempted, 9);
+        assert_eq!(tracker.sender_transport.datagram_fragments_sent, 5);
+        assert_eq!(tracker.sender_transport.datagram_fragments_delayed, 1);
+        assert_eq!(
+            tracker
+                .sender_transport
+                .datagram_fragments_dropped_by_impairment,
+            1
+        );
+        assert_eq!(
+            tracker
+                .sender_transport
+                .datagram_fragments_dropped_for_capacity,
+            1
+        );
+        assert_eq!(
+            tracker
+                .sender_transport
+                .datagram_fragments_dropped_for_budget,
+            2
+        );
+        assert_eq!(
+            tracker
+                .sender_transport
+                .datagram_frames_cut_short_for_capacity,
+            1
+        );
+        assert_eq!(
+            tracker
+                .sender_transport
+                .datagram_frames_cut_short_for_budget,
+            1
+        );
+        assert_eq!(tracker.sender_transport.reliable_fragments_sent, 7);
+        assert_eq!(tracker.sender_transport.reliable_frames_sent, 1);
     }
 
     #[cfg(windows)]
@@ -8591,7 +8754,7 @@ mod tests {
     }
 
     #[test]
-    fn high_refresh_stability_tier_uses_reliable_whole_frame_by_default() {
+    fn high_refresh_stability_tier_keeps_delta_frames_on_datagrams_by_default() {
         let stability_tier = MediaProfile {
             width: 2560,
             height: 1440,
@@ -8601,7 +8764,7 @@ mod tests {
             ..MediaProfile::default()
         };
 
-        assert!(should_send_access_unit_as_reliable_frame(
+        assert!(!should_send_access_unit_as_reliable_frame(
             true,
             true,
             64,
@@ -8651,7 +8814,7 @@ mod tests {
             &render_capped,
             None
         ));
-        assert!(should_send_access_unit_as_reliable_frame(
+        assert!(!should_send_access_unit_as_reliable_frame(
             true,
             true,
             64,
