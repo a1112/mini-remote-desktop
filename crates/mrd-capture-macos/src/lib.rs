@@ -1,3 +1,5 @@
+#![cfg(target_os = "macos")]
+
 use core_graphics::{
     display::CGDisplay,
     geometry::{CGPoint, CGRect as CgRect, CGSize},

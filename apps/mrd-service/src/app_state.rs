@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 // mrd-service application state
 //
 // This module defines the shared state owned by mrd-service.
@@ -12,6 +14,7 @@ use mrd_ipc::{
     AttachedRenderSurface, AuditEvent, AuditLogQuery, CaptureSourceSelection,
     MediaAdaptationSnapshot, MediaPipelineSnapshot, MediaProfile, MediaProfileNegotiation,
     MediaSenderTransportSnapshot, MediaStageMetrics, MediaTestImpairmentSnapshot,
+    PairedDeviceIdentity,
 };
 use mrd_proto::{DeviceId, SessionId};
 #[cfg(windows)]
@@ -1035,6 +1038,57 @@ pub struct DeviceRegistry {
     local_device: Option<(DeviceId, String)>, // (id, name)
 }
 
+/// In-memory paired device identity registry.
+#[derive(Debug, Default)]
+pub struct DeviceIdentityRegistry {
+    paired_devices: HashMap<DeviceId, PairedDeviceIdentity>,
+}
+
+impl DeviceIdentityRegistry {
+    pub fn upsert(
+        &mut self,
+        device_id: DeviceId,
+        certificate_fingerprint: Option<String>,
+        trust_status: impl Into<String>,
+    ) {
+        let display_name = device_id.0.clone();
+        let existing = self.paired_devices.remove(&device_id);
+        let certificate_fingerprint = certificate_fingerprint.or_else(|| {
+            existing
+                .as_ref()
+                .and_then(|identity| identity.certificate_fingerprint.clone())
+        });
+        self.paired_devices.insert(
+            device_id.clone(),
+            PairedDeviceIdentity {
+                display_name: existing
+                    .as_ref()
+                    .map(|identity| identity.display_name.clone())
+                    .unwrap_or(display_name),
+                device_id,
+                certificate_fingerprint,
+                trust_status: trust_status.into(),
+                last_seen_ms: Some(now_unix_ms()),
+            },
+        );
+    }
+
+    pub fn revoke(&mut self, device_id: &DeviceId) {
+        if let Some(identity) = self.paired_devices.get_mut(device_id) {
+            identity.trust_status = "revoked".to_string();
+            identity.last_seen_ms = Some(now_unix_ms());
+        } else {
+            self.upsert(device_id.clone(), None, "revoked");
+        }
+    }
+
+    pub fn list(&self) -> Vec<PairedDeviceIdentity> {
+        let mut identities = self.paired_devices.values().cloned().collect::<Vec<_>>();
+        identities.sort_by(|a, b| a.device_id.0.cmp(&b.device_id.0));
+        identities
+    }
+}
+
 /// In-memory service audit event registry.
 #[derive(Debug)]
 pub struct AuditLogRegistry {
@@ -1215,6 +1269,8 @@ pub struct AppState {
     pub devices: Arc<Mutex<DeviceRegistry>>,
     /// Service-owned security and operations audit events.
     pub audit_log: Arc<Mutex<AuditLogRegistry>>,
+    /// Service-owned device pairing and identity state.
+    pub device_identities: Arc<Mutex<DeviceIdentityRegistry>>,
     /// Shell state - UI presence and service lifecycle
     pub shell: Arc<Mutex<ShellState>>,
     /// Tray port (Phase 4)
@@ -1265,6 +1321,7 @@ impl AppState {
             sessions: Arc::new(Mutex::new(SessionRegistry::default())),
             devices: Arc::new(Mutex::new(DeviceRegistry::default())),
             audit_log: Arc::new(Mutex::new(AuditLogRegistry::default())),
+            device_identities: Arc::new(Mutex::new(DeviceIdentityRegistry::default())),
             shell: Arc::new(Mutex::new(ShellState::default())),
             tray,
             lan_discovery: Arc::new(crate::lan_discovery::LanDiscoveryState::new(
@@ -1299,6 +1356,11 @@ impl AppState {
     /// Get a clone of the service audit log registry.
     pub fn audit_log(&self) -> Arc<Mutex<AuditLogRegistry>> {
         self.audit_log.clone()
+    }
+
+    /// Get a clone of the device identity registry.
+    pub fn device_identities(&self) -> Arc<Mutex<DeviceIdentityRegistry>> {
+        self.device_identities.clone()
     }
 
     /// Get a clone of the shell Arc for injection into handlers

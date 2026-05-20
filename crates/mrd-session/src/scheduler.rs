@@ -1,6 +1,7 @@
-// Multi-session scheduler and resource isolation
-//
-// Provides concurrent session management with resource limits and priority.
+//! Multi-session scheduler and resource isolation.
+//!
+//! The scheduler limits concurrent streaming sessions and keeps session-level
+//! resource metadata independent of concrete transport implementations.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -12,9 +13,13 @@ use crate::{SessionId, SessionLifecycleState};
 /// Session priority for scheduling decisions
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SessionPriority {
+    /// Background or best-effort sessions.
     Low = 0,
+    /// Normal interactive sessions.
     Normal = 1,
+    /// Preferred sessions when resources are constrained.
     High = 2,
+    /// Sessions that should be admitted before all others.
     Critical = 3,
 }
 
@@ -51,16 +56,12 @@ impl Default for SessionResourceLimits {
 /// Session entry with scheduling metadata
 #[derive(Debug)]
 struct ScheduledSession {
-    /// Session ID
-    id: SessionId,
     /// Current lifecycle state
     state: SessionLifecycleState,
     /// Session priority
     priority: SessionPriority,
     /// Resource limits
     limits: SessionResourceLimits,
-    /// Creation timestamp
-    created_at: std::time::Instant,
     /// Last activity timestamp
     last_activity: std::time::Instant,
     /// Whether this session is currently active (streaming)
@@ -68,14 +69,12 @@ struct ScheduledSession {
 }
 
 impl ScheduledSession {
-    fn new(id: SessionId, priority: SessionPriority, limits: SessionResourceLimits) -> Self {
+    fn new(_id: SessionId, priority: SessionPriority, limits: SessionResourceLimits) -> Self {
         let now = std::time::Instant::now();
         Self {
-            id,
             state: SessionLifecycleState::Created,
             priority,
             limits,
-            created_at: now,
             last_activity: now,
             is_active: false,
         }
@@ -343,10 +342,15 @@ impl Drop for StreamingPermit {
 /// Session scheduler errors
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionSchedulerError {
+    /// Requested session does not exist.
     SessionNotFound,
+    /// A session with the same id is already registered.
     SessionAlreadyExists,
+    /// Scheduler has been shut down.
     SchedulerClosed,
+    /// No streaming slots are currently available.
     MaxConcurrentSessionsReached,
+    /// Requested transition is not valid for the current state.
     InvalidState,
 }
 
@@ -367,9 +371,13 @@ impl std::error::Error for SessionSchedulerError {}
 /// Session scheduler statistics
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionSchedulerStats {
+    /// Number of registered sessions.
     pub total_sessions: usize,
+    /// Number of sessions currently holding a streaming permit.
     pub active_sessions: usize,
+    /// Number of streaming permits still available.
     pub available_slots: usize,
+    /// Maximum concurrent streaming sessions configured for the scheduler.
     pub max_concurrent_streams: usize,
 }
 

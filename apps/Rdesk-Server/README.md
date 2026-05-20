@@ -12,7 +12,7 @@ Current product path: `apps/Rdesk-Server`
 CREATE DATABASE rdesk_server;
 ```
 
-2. Install dependencies:
+2. Install runtime dependencies:
 
 ```powershell
 cd G:\Project\mini-remote-desktop\apps\Rdesk-Server
@@ -31,6 +31,17 @@ Copy-Item .env.example .env
 
 ```powershell
 python -m app.main
+```
+
+## Tests
+
+Install the development dependency set when running backend tests. It includes
+the runtime requirements plus FastAPI/Starlette `TestClient` support.
+
+```powershell
+cd G:\Project\mini-remote-desktop\apps\Rdesk-Server
+pip install -r requirements-dev.txt
+python -m unittest discover -s tests
 ```
 
 ## API

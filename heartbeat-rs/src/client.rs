@@ -6,7 +6,6 @@
 //! - 支持动态服务器发现
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -15,26 +14,7 @@ use tokio::net::UdpSocket;
 use tokio::time::{interval, Instant};
 use tracing::{debug, error, info, warn};
 
-/// 心跳消息
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HeartbeatMessage {
-    pub device_id: String,
-    pub device_type: String,
-    pub device_name: String,
-    pub protocol_version: u32,
-    pub timestamp_ms: u64,
-    #[serde(default)]
-    pub transports: Vec<String>,
-}
-
-/// 心跳响应
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HeartbeatResponse {
-    pub server_timestamp_ms: u64,
-    pub online_count: usize,
-    #[serde(default)]
-    pub reregister: bool,
-}
+pub use crate::protocol::{HeartbeatMessage, HeartbeatResponse};
 
 /// 心跳客户端配置
 #[derive(Debug, Clone)]
@@ -52,15 +32,12 @@ pub struct HeartbeatConfig {
     pub device_name: String,
 
     /// 心跳间隔（秒）
-    #[serde(default = "default_heartbeat_interval")]
     pub heartbeat_interval_secs: u64,
 
     /// 协议版本
-    #[serde(default = "default_protocol_version")]
     pub protocol_version: u32,
 
     /// 支持的传输协议
-    #[serde(default)]
     pub transports: Vec<String>,
 }
 
@@ -96,8 +73,7 @@ impl HeartbeatClient {
     /// 创建新的心跳客户端
     pub fn new(config: HeartbeatConfig) -> Result<Self> {
         // 绑定到随机端口
-        let socket =
-            UdpSocket::bind("0.0.0.0:0").context("failed to bind UDP socket for heartbeat")?;
+        let socket = bind_udp_socket("0.0.0.0:0")?;
 
         info!(
             server_addr = %config.server_addr,
@@ -226,8 +202,7 @@ pub struct HeartbeatDiscovery {
 impl HeartbeatDiscovery {
     /// 创建发现客户端
     pub fn new(discovery_port: u16) -> Result<Self> {
-        let socket =
-            UdpSocket::bind(("0.0.0.0", 0)).context("failed to bind UDP socket for discovery")?;
+        let socket = bind_udp_socket(("0.0.0.0", 0))?;
 
         socket
             .set_broadcast(true)
@@ -282,6 +257,17 @@ impl HeartbeatDiscovery {
 
         Ok(addrs)
     }
+}
+
+fn bind_udp_socket<A>(addr: A) -> Result<UdpSocket>
+where
+    A: std::net::ToSocketAddrs,
+{
+    let socket = std::net::UdpSocket::bind(addr).context("failed to bind heartbeat UDP socket")?;
+    socket
+        .set_nonblocking(true)
+        .context("failed to set heartbeat UDP socket nonblocking")?;
+    UdpSocket::from_std(socket).context("failed to create tokio UDP socket")
 }
 
 #[cfg(test)]

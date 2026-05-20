@@ -62,6 +62,7 @@ pub fn preferred_capture_source(sources: &[CaptureSource]) -> Option<CaptureSour
         .cloned()
 }
 
+#[allow(dead_code)]
 pub fn default_capture_source(include_previews: bool) -> Result<CaptureSource> {
     let sources = list_capture_sources(include_previews, Some(MAX_CAPTURE_SOURCE_LIMIT as u32))?;
     preferred_capture_source(&sources)

@@ -5,9 +5,12 @@ use mrd_ipc::{
     AdaptiveMediaConfig, AttachedRenderSurface, AuditEvent, AuditLogQuery, CapabilityConstraint,
     CapabilityConstraintStatus, CapabilityDomain, CapabilityItem, CapabilityPlatform,
     CapabilityProfile, CapabilitySnapshot, CapabilityStatus, CaptureSource, CaptureSourceSelection,
-    DeviceInfo, IpcRequest, IpcResponse, MediaAdaptationSnapshot, MediaPipelineSnapshot,
-    MediaProfile, MediaProfileNegotiation, MediaSenderTransportSnapshot, MediaStageMetrics,
-    SessionBootstrap, SessionRuntimeSnapshot,
+    ControlChannelLaneSnapshot, ControlChannelReliability, ControlChannelSnapshot,
+    DeviceIdentitySnapshot, DeviceInfo, IpcRequest, IpcResponse, MediaAdaptationSnapshot,
+    MediaPipelineSnapshot, MediaProfile, MediaProfileNegotiation, MediaSenderTransportSnapshot,
+    MediaStageMetrics, PairedDeviceIdentity, ScenarioEvaluation, ScenarioEvaluationReason,
+    ScenarioEvaluationStatus, SessionBootstrap, SessionRuntimeSnapshot, TelemetryArtifactRef,
+    TelemetryBundle, TelemetryMetricSummary, TransportPolicyConfig, TransportPolicySnapshot,
 };
 use mrd_proto::{DeviceId, SessionId};
 
@@ -348,6 +351,152 @@ fn serialize_deserialize_capability_snapshot_request() {
 }
 
 #[test]
+fn serialize_deserialize_scenario_evaluation_contracts() {
+    let request = IpcRequest::EvaluateScenarioProfile {
+        scenario_id: "lan.2k144".to_string(),
+        peer_device_id: Some(test_device_id()),
+        requested_profile: Some(test_media_profile()),
+    };
+
+    let json = serde_json::to_string(&request).unwrap();
+    assert!(json.contains("EvaluateScenarioProfile"));
+    let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(request, deserialized);
+
+    let evaluation = ScenarioEvaluation {
+        scenario_id: "lan.2k144".to_string(),
+        status: ScenarioEvaluationStatus::Ready,
+        selected_profile: Some(test_media_profile()),
+        transport_kind: Some("quic".to_string()),
+        reasons: vec![ScenarioEvaluationReason {
+            code: "profile.ready".to_string(),
+            severity: "info".to_string(),
+            message: "All required capabilities are present.".to_string(),
+            capability_id: None,
+        }],
+        required_capabilities: vec!["transport.quic_datagram".to_string()],
+        missing_capabilities: Vec::new(),
+        fallback_profile: None,
+    };
+    let response = IpcResponse::ScenarioProfileEvaluated {
+        evaluation: evaluation.clone(),
+    };
+
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("\"status\":\"ready\""));
+    let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(response, deserialized);
+}
+
+#[test]
+fn serialize_deserialize_policy_identity_control_and_telemetry_contracts() {
+    let policy = TransportPolicyConfig {
+        mode: "auto".to_string(),
+        preferred_transport: Some("quic".to_string()),
+        allow_lan_quic: true,
+        allow_webrtc: true,
+        allow_relay: true,
+    };
+    let request = IpcRequest::SetTransportPolicy {
+        session_id: test_session_id(),
+        policy,
+    };
+    let json = serde_json::to_string(&request).unwrap();
+    let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(request, deserialized);
+
+    let policy_snapshot = TransportPolicySnapshot {
+        session_id: Some(test_session_id()),
+        mode: "auto".to_string(),
+        selected_transport: "quic".to_string(),
+        candidate_transports: vec!["quic".to_string(), "webrtc".to_string()],
+        relay_required: false,
+        reason: Some("LAN high-refresh profile selected QUIC datagram.".to_string()),
+        fallback_reason: None,
+    };
+    let response = IpcResponse::TransportPolicyUpdated {
+        snapshot: policy_snapshot,
+    };
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("TransportPolicyUpdated"));
+    let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(response, deserialized);
+
+    let control_snapshot = ControlChannelSnapshot {
+        session_id: test_session_id(),
+        reliable: ControlChannelLaneSnapshot {
+            name: "ctrl_rel".to_string(),
+            reliability: ControlChannelReliability::ReliableOrdered,
+            ordered: true,
+            max_retransmits: None,
+            queued_messages: 2,
+            dropped_messages: 0,
+            coalesced_messages: 0,
+        },
+        realtime: ControlChannelLaneSnapshot {
+            name: "ctrl_rt".to_string(),
+            reliability: ControlChannelReliability::UnreliableRealtime,
+            ordered: false,
+            max_retransmits: Some(0),
+            queued_messages: 0,
+            dropped_messages: 3,
+            coalesced_messages: 9,
+        },
+    };
+    let response = IpcResponse::ControlChannelSnapshot {
+        snapshot: control_snapshot,
+    };
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("ctrl_rel"));
+    assert!(json.contains("ctrl_rt"));
+    let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(response, deserialized);
+
+    let identity = DeviceIdentitySnapshot {
+        local_device_id: Some(test_device_id()),
+        display_name: Some("Controller".to_string()),
+        certificate_fingerprint: Some("sha256:abc".to_string()),
+        consent_required: true,
+        paired_devices: vec![PairedDeviceIdentity {
+            device_id: DeviceId("peer".to_string()),
+            display_name: "Peer".to_string(),
+            certificate_fingerprint: Some("sha256:def".to_string()),
+            trust_status: "paired".to_string(),
+            last_seen_ms: Some(1_700_000_000_000),
+        }],
+    };
+    let response = IpcResponse::DeviceIdentitySnapshot { snapshot: identity };
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("sha256:abc"));
+    let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(response, deserialized);
+
+    let bundle = TelemetryBundle {
+        run_id: "run-1".to_string(),
+        session_id: Some(test_session_id()),
+        metrics: vec![TelemetryMetricSummary {
+            name: "fps".to_string(),
+            unit: "fps".to_string(),
+            sample_count: 100,
+            p50: Some(143.0),
+            p95: Some(145.0),
+        }],
+        event_count: 4,
+        log_count: 12,
+        artifacts: vec![TelemetryArtifactRef {
+            name: "report".to_string(),
+            path: "target/report.md".to_string(),
+            kind: "markdown".to_string(),
+        }],
+    };
+    let response = IpcResponse::TelemetryBundle { bundle };
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("TelemetryBundle"));
+    let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(response, deserialized);
+}
+
+#[test]
 fn serialize_deserialize_device_registered_response() {
     let response = IpcResponse::DeviceRegistered {
         device_id: test_device_id(),
@@ -668,6 +817,43 @@ fn serialize_deserialize_all_request_types() {
                 action: Some("session.start".to_string()),
                 limit: Some(25),
             },
+        },
+        IpcRequest::CapabilitySnapshot,
+        IpcRequest::EvaluateScenarioProfile {
+            scenario_id: "lan.2k144".to_string(),
+            peer_device_id: Some(test_device_id()),
+            requested_profile: Some(test_media_profile()),
+        },
+        IpcRequest::GetPeerCapabilitySnapshot {
+            peer_device_id: test_device_id(),
+        },
+        IpcRequest::SetTransportPolicy {
+            session_id: test_session_id(),
+            policy: TransportPolicyConfig {
+                mode: "auto".to_string(),
+                preferred_transport: None,
+                allow_lan_quic: true,
+                allow_webrtc: true,
+                allow_relay: true,
+            },
+        },
+        IpcRequest::GetControlChannelSnapshot {
+            session_id: test_session_id(),
+        },
+        IpcRequest::PairDevice {
+            device_id: test_device_id(),
+            certificate_fingerprint: Some("sha256:peer".to_string()),
+        },
+        IpcRequest::ApprovePairing {
+            device_id: test_device_id(),
+        },
+        IpcRequest::RevokeDevice {
+            device_id: test_device_id(),
+        },
+        IpcRequest::GetDeviceIdentitySnapshot,
+        IpcRequest::GetTelemetryBundle {
+            run_id: "run-1".to_string(),
+            session_id: Some(test_session_id()),
         },
         IpcRequest::StreamProbeEvents,
     ];

@@ -1,6 +1,7 @@
 use mrd_ipc::{
     CapabilityConstraint, CapabilityConstraintStatus, CapabilityDomain, CapabilityItem,
-    CapabilityPlatform, CapabilityProfile, CapabilitySnapshot, CapabilityStatus,
+    CapabilityPlatform, CapabilityProfile, CapabilitySnapshot, CapabilityStatus, LanPeerInfo,
+    MediaProfile, ScenarioEvaluation, ScenarioEvaluationReason, ScenarioEvaluationStatus,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -16,6 +17,259 @@ pub fn local_capability_snapshot() -> CapabilitySnapshot {
         constraints: default_constraints(),
         profiles: default_profiles(),
         updated_at_ms: now_ms(),
+    }
+}
+
+pub fn evaluate_scenario_profile(
+    scenario_id: &str,
+    requested_profile: Option<MediaProfile>,
+) -> ScenarioEvaluation {
+    let snapshot = local_capability_snapshot();
+    evaluate_against_snapshot(&snapshot, scenario_id, requested_profile)
+}
+
+pub fn peer_capability_snapshot(peer: &LanPeerInfo) -> CapabilitySnapshot {
+    let capabilities = peer
+        .transports
+        .iter()
+        .map(|transport| format!("transport.{transport}"))
+        .chain(peer.media_capabilities.iter().cloned())
+        .map(|id| CapabilityItem {
+            label: id.clone(),
+            domain: capability_domain_from_id(&id),
+            id,
+            status: CapabilityStatus::Available,
+            platform: CapabilityPlatform::Unknown,
+            reason: None,
+            detail: Some(format!("advertised by LAN peer {}", peer.device_id.0)),
+            requires: Vec::new(),
+            conflicts_with: Vec::new(),
+            depends_on: Vec::new(),
+            fallback_ids: Vec::new(),
+            last_probe_time_ms: None,
+        })
+        .collect();
+
+    CapabilitySnapshot {
+        schema_version: SCHEMA_VERSION,
+        platform: CapabilityPlatform::Unknown,
+        service_version: peer
+            .service_build_id
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
+        capabilities,
+        constraints: default_constraints(),
+        profiles: default_profiles(),
+        updated_at_ms: now_ms(),
+    }
+}
+
+fn evaluate_against_snapshot(
+    snapshot: &CapabilitySnapshot,
+    scenario_id: &str,
+    requested_profile: Option<MediaProfile>,
+) -> ScenarioEvaluation {
+    let profile = snapshot
+        .profiles
+        .iter()
+        .find(|profile| profile.id == scenario_id)
+        .cloned();
+    let required_capabilities = profile
+        .as_ref()
+        .map(|profile| profile.required_capabilities.clone())
+        .unwrap_or_default();
+
+    let mut missing_capabilities = Vec::new();
+    let mut degraded = false;
+    let mut reasons = Vec::new();
+    for capability_id in &required_capabilities {
+        match snapshot
+            .capabilities
+            .iter()
+            .find(|item| item.id == *capability_id)
+        {
+            Some(item) if capability_status_runs(&item.status) => {
+                if matches!(
+                    item.status,
+                    CapabilityStatus::Supported | CapabilityStatus::Degraded
+                ) {
+                    degraded = true;
+                    reasons.push(reason(
+                        "capability.degraded",
+                        "warning",
+                        format!(
+                            "{} is {}, runtime may run below preferred parity.",
+                            item.id,
+                            capability_status_label(&item.status)
+                        ),
+                        Some(item.id.clone()),
+                    ));
+                }
+            }
+            Some(item) => {
+                missing_capabilities.push(item.id.clone());
+                reasons.push(reason(
+                    "capability.blocked",
+                    "error",
+                    item.reason.clone().unwrap_or_else(|| {
+                        format!(
+                            "{} is {} and cannot satisfy this scenario.",
+                            item.id,
+                            capability_status_label(&item.status)
+                        )
+                    }),
+                    Some(item.id.clone()),
+                ));
+            }
+            None => {
+                missing_capabilities.push(capability_id.clone());
+                reasons.push(reason(
+                    "capability.missing",
+                    "error",
+                    format!("{capability_id} is not advertised by this endpoint."),
+                    Some(capability_id.clone()),
+                ));
+            }
+        }
+    }
+
+    let mut selected_profile = requested_profile.or_else(|| profile.as_ref().map(profile_to_media));
+    if let Some(selected) = selected_profile.as_mut() {
+        if selected.codec.trim().is_empty() {
+            selected.codec = profile
+                .as_ref()
+                .map(|profile| profile.codec.clone())
+                .unwrap_or_else(|| "h264".to_string());
+        }
+    }
+
+    let status = if profile.is_none() && selected_profile.is_none() {
+        reasons.push(reason(
+            "profile.unknown",
+            "error",
+            format!("Scenario profile {scenario_id} is not known by this service."),
+            None,
+        ));
+        ScenarioEvaluationStatus::Blocked
+    } else if !missing_capabilities.is_empty() {
+        ScenarioEvaluationStatus::Blocked
+    } else if degraded {
+        ScenarioEvaluationStatus::Degraded
+    } else {
+        reasons.push(reason(
+            "profile.ready",
+            "info",
+            "All required capabilities are present.".to_string(),
+            None,
+        ));
+        ScenarioEvaluationStatus::Ready
+    };
+
+    let fallback_profile = if matches!(status, ScenarioEvaluationStatus::Blocked) {
+        snapshot
+            .profiles
+            .iter()
+            .find(|profile| profile.id == "diagnostic.software")
+            .map(profile_to_media)
+    } else {
+        None
+    };
+
+    ScenarioEvaluation {
+        scenario_id: scenario_id.to_string(),
+        status,
+        selected_profile,
+        transport_kind: Some(transport_for_scenario(scenario_id, &required_capabilities)),
+        reasons,
+        required_capabilities,
+        missing_capabilities,
+        fallback_profile,
+    }
+}
+
+fn profile_to_media(profile: &CapabilityProfile) -> MediaProfile {
+    MediaProfile {
+        width: profile.width,
+        height: profile.height,
+        fps: profile.fps,
+        bitrate_mbps: profile.bitrate_mbps,
+        codec: profile.codec.clone(),
+        ..MediaProfile::default()
+    }
+}
+
+fn capability_status_runs(status: &CapabilityStatus) -> bool {
+    matches!(
+        status,
+        CapabilityStatus::Available
+            | CapabilityStatus::Usable
+            | CapabilityStatus::Supported
+            | CapabilityStatus::Degraded
+    )
+}
+
+fn capability_status_label(status: &CapabilityStatus) -> &'static str {
+    match status {
+        CapabilityStatus::Supported => "supported",
+        CapabilityStatus::Available => "available",
+        CapabilityStatus::Usable => "usable",
+        CapabilityStatus::Degraded => "degraded",
+        CapabilityStatus::PermissionMissing => "permission_missing",
+        CapabilityStatus::DriverMissing => "driver_missing",
+        CapabilityStatus::HardwareMissing => "hardware_missing",
+        CapabilityStatus::Unimplemented => "unimplemented",
+        CapabilityStatus::Unsupported => "unsupported",
+        CapabilityStatus::Unknown => "unknown",
+    }
+}
+
+fn reason(
+    code: impl Into<String>,
+    severity: impl Into<String>,
+    message: impl Into<String>,
+    capability_id: Option<String>,
+) -> ScenarioEvaluationReason {
+    ScenarioEvaluationReason {
+        code: code.into(),
+        severity: severity.into(),
+        message: message.into(),
+        capability_id,
+    }
+}
+
+fn transport_for_scenario(scenario_id: &str, required_capabilities: &[String]) -> String {
+    if scenario_id.starts_with("wan.")
+        || required_capabilities
+            .iter()
+            .any(|id| id == "transport.webrtc")
+    {
+        "webrtc".to_string()
+    } else if required_capabilities
+        .iter()
+        .any(|id| id == "transport.quic" || id == "transport.quic_datagram")
+        || scenario_id.starts_with("lan.")
+        || scenario_id.starts_with("quality.")
+    {
+        "quic".to_string()
+    } else {
+        "loopback".to_string()
+    }
+}
+
+fn capability_domain_from_id(id: &str) -> CapabilityDomain {
+    match id.split_once('.').map(|(prefix, _)| prefix).unwrap_or(id) {
+        "capture" => CapabilityDomain::Capture,
+        "capture_source" => CapabilityDomain::CaptureSource,
+        "encode" => CapabilityDomain::Encode,
+        "decode" => CapabilityDomain::Decode,
+        "render" => CapabilityDomain::Render,
+        "memory" => CapabilityDomain::Memory,
+        "transport" | "quic" | "webrtc" => CapabilityDomain::Transport,
+        "control" => CapabilityDomain::Control,
+        "audio" => CapabilityDomain::Audio,
+        "service" => CapabilityDomain::Service,
+        "security" => CapabilityDomain::Security,
+        _ => CapabilityDomain::Service,
     }
 }
 

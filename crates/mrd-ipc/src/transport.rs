@@ -6,9 +6,12 @@
 use anyhow::Result;
 use serde_json;
 
+/// Default Windows named pipe used by `mrd-service`.
 pub const SERVICE_PIPE_NAME: &str = r"\\.\pipe\mrd-service";
 #[cfg(unix)]
+/// Default Unix domain socket used by `mrd-service`.
 pub const SERVICE_SOCKET_PATH: &str = "/tmp/mrd-service.sock";
+/// Environment variable that overrides the service IPC endpoint.
 pub const SERVICE_ENDPOINT_ENV: &str = "MRD_SERVICE_IPC_ENDPOINT";
 
 const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
@@ -126,16 +129,19 @@ async fn write_message<W: tokio::io::AsyncWriteExt + std::marker::Unpin>(
 
 // Unix server
 #[cfg(unix)]
+/// Unix domain socket IPC server.
 pub struct IpcServer {
     listener: UnixListener,
 }
 
 #[cfg(unix)]
 impl IpcServer {
+    /// Bind the default service endpoint.
     pub async fn bind() -> Result<Self> {
         Self::bind_with_endpoint(IpcEndpoint::default_service()).await
     }
 
+    /// Bind a custom Unix domain socket endpoint.
     pub async fn bind_with_endpoint(endpoint: IpcEndpoint) -> Result<Self> {
         let socket_path = endpoint.socket_path();
         let _ = std::fs::remove_file(socket_path);
@@ -143,6 +149,7 @@ impl IpcServer {
         Ok(Self { listener })
     }
 
+    /// Accept a single IPC stream from a client.
     pub async fn accept(&self) -> Result<IpcStream> {
         let socket = self.listener.accept().await?.0;
         Ok(IpcStream { socket })
@@ -151,20 +158,24 @@ impl IpcServer {
 
 // Windows server
 #[cfg(windows)]
+/// Windows named-pipe IPC server.
 pub struct IpcServer {
     endpoint: IpcEndpoint,
 }
 
 #[cfg(windows)]
 impl IpcServer {
+    /// Bind the default service endpoint.
     pub async fn bind() -> Result<Self> {
         Self::bind_with_endpoint(IpcEndpoint::default_service()).await
     }
 
+    /// Bind a custom Windows named-pipe endpoint.
     pub async fn bind_with_endpoint(endpoint: IpcEndpoint) -> Result<Self> {
         Ok(Self { endpoint })
     }
 
+    /// Accept a single IPC stream from a client.
     pub async fn accept(&self) -> Result<IpcStream> {
         let server = ServerOptions::new()
             .first_pipe_instance(false)
@@ -176,14 +187,17 @@ impl IpcServer {
 
 // Unix client
 #[cfg(unix)]
+/// Unix IPC client factory.
 pub struct IpcClient;
 
 #[cfg(unix)]
 impl IpcClient {
+    /// Connect to the default service endpoint.
     pub async fn connect() -> Result<IpcStream> {
         Self::connect_with_endpoint(&IpcEndpoint::default_service()).await
     }
 
+    /// Connect to a custom Unix domain socket endpoint.
     pub async fn connect_with_endpoint(endpoint: &IpcEndpoint) -> Result<IpcStream> {
         let socket = UnixStream::connect(endpoint.socket_path()).await?;
         Ok(IpcStream { socket })
@@ -192,14 +206,17 @@ impl IpcClient {
 
 // Windows client
 #[cfg(windows)]
+/// Windows IPC client factory.
 pub struct IpcClient;
 
 #[cfg(windows)]
 impl IpcClient {
+    /// Connect to the default service endpoint.
     pub async fn connect() -> Result<IpcStream> {
         Self::connect_with_endpoint(&IpcEndpoint::default_service()).await
     }
 
+    /// Connect to a custom Windows named-pipe endpoint.
     pub async fn connect_with_endpoint(endpoint: &IpcEndpoint) -> Result<IpcStream> {
         let pipe = ClientOptions::new().open(endpoint.pipe_name())?;
         Ok(IpcStream::Client(pipe))
@@ -208,28 +225,33 @@ impl IpcClient {
 
 // Unix stream
 #[cfg(unix)]
+/// Unix IPC stream.
 pub struct IpcStream {
     socket: UnixStream,
 }
 
 #[cfg(unix)]
 impl IpcStream {
+    /// Send an IPC request.
     pub async fn send_request(&mut self, request: &crate::IpcRequest) -> Result<()> {
         let json = serde_json::to_string(request)?;
         write_message(&mut self.socket, json.as_bytes()).await
     }
 
+    /// Receive an IPC response.
     pub async fn recv_response(&mut self) -> Result<crate::IpcResponse> {
         let buf = read_message(&mut self.socket).await?;
         let response: crate::IpcResponse = serde_json::from_slice(&buf)?;
         Ok(response)
     }
 
+    /// Send an IPC response.
     pub async fn send_response(&mut self, response: &crate::IpcResponse) -> Result<()> {
         let json = serde_json::to_string(response)?;
         write_message(&mut self.socket, json.as_bytes()).await
     }
 
+    /// Receive an IPC request.
     pub async fn recv_request(&mut self) -> Result<crate::IpcRequest> {
         let buf = read_message(&mut self.socket).await?;
         let request: crate::IpcRequest = serde_json::from_slice(&buf)?;
@@ -239,13 +261,17 @@ impl IpcStream {
 
 // Windows stream
 #[cfg(windows)]
+/// Windows IPC stream backed by a named-pipe client or server handle.
 pub enum IpcStream {
+    /// Client-side pipe handle.
     Client(NamedPipeClient),
+    /// Server-side pipe handle.
     Server(tokio::net::windows::named_pipe::NamedPipeServer),
 }
 
 #[cfg(windows)]
 impl IpcStream {
+    /// Send an IPC request.
     pub async fn send_request(&mut self, request: &crate::IpcRequest) -> Result<()> {
         let json = serde_json::to_string(request)?;
         match self {
@@ -254,6 +280,7 @@ impl IpcStream {
         }
     }
 
+    /// Receive an IPC response.
     pub async fn recv_response(&mut self) -> Result<crate::IpcResponse> {
         let buf = match self {
             IpcStream::Client(pipe) => read_message(pipe).await?,
@@ -263,6 +290,7 @@ impl IpcStream {
         Ok(response)
     }
 
+    /// Send an IPC response.
     pub async fn send_response(&mut self, response: &crate::IpcResponse) -> Result<()> {
         let json = serde_json::to_string(response)?;
         match self {
@@ -271,6 +299,7 @@ impl IpcStream {
         }
     }
 
+    /// Receive an IPC request.
     pub async fn recv_request(&mut self) -> Result<crate::IpcRequest> {
         let buf = match self {
             IpcStream::Client(pipe) => read_message(pipe).await?,

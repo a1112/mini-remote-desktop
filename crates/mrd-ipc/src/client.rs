@@ -33,10 +33,17 @@ impl Default for ReconnectConfig {
 /// Connection state of the IPC client
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionState {
+    /// No active IPC connection.
     Disconnected,
+    /// A connection attempt is in progress.
     Connecting,
+    /// Connected to the service.
     Connected,
-    Reconnecting { attempt: u32 },
+    /// Reconnect loop is retrying after a failed connection.
+    Reconnecting {
+        /// Current reconnect attempt number.
+        attempt: u32,
+    },
 }
 
 /// IPC client - communicates with mrd-service

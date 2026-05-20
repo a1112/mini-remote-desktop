@@ -115,9 +115,13 @@ const LAN_DECODE_NVDEC_HEVC_CAPABILITY: &str = "decode.nvdec_hevc";
 const LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY: &str = "media.hevc_main_420_8bit";
 const LAN_RENDER_D3D11_NATIVE_CAPABILITY: &str = "d3d11_native_render";
 const LAN_RENDER_D3D11_SHARED_NV12_CAPABILITY: &str = "render.d3d11_shared_nv12";
+#[cfg(target_os = "macos")]
 const LAN_CAPTURE_MACOS_CAPABILITY: &str = "macos_capture";
+#[cfg(target_os = "macos")]
 const LAN_ENCODE_VIDEOTOOLBOX_H264_CAPABILITY: &str = "videotoolbox_h264";
+#[cfg(target_os = "macos")]
 const LAN_DECODE_VIDEOTOOLBOX_CAPABILITY: &str = "videotoolbox";
+#[cfg(target_os = "macos")]
 const LAN_RENDER_MACOS_NATIVE_CAPABILITY: &str = "macos_native_render";
 const LAN_MEDIA_SENDER_MAX_CONSECUTIVE_FRAME_ERRORS: u32 = 8;
 
