@@ -14,6 +14,9 @@ const ADAPTATION_INITIAL_PROFILE_GRACE_MS: u64 = 5_000;
 const ADAPTATION_SUBSEQUENT_DOWNSHIFT_COOLDOWN_MS: u64 = 5_000;
 const ADAPTATION_SAFE_START_MIN_BITRATE_MBPS: u32 = 80;
 const ADAPTATION_SAFE_START_MIN_FPS: u32 = 120;
+const ADAPTATION_HIGH_REFRESH_STABILITY_BITRATE_MBPS: u32 = 64;
+const ADAPTATION_DOWNSHIFT_CONFIRMATION_WINDOWS: u32 = 2;
+const ADAPTATION_HIGH_REFRESH_FPS_ONLY_CONFIRMATION_WINDOWS: u32 = 4;
 const DEFAULT_CEILING_WIDTH: u32 = 2560;
 const DEFAULT_CEILING_HEIGHT: u32 = 1440;
 const DEFAULT_CEILING_FPS: u32 = 144;
@@ -541,6 +544,7 @@ fn update_downshift_confirmation(
         return true;
     }
 
+    let required_windows = downshift_confirmation_windows_required(observation);
     if pending_reason.as_deref() == Some(reason.as_str()) {
         *pending_windows = pending_windows.saturating_add(1);
     } else {
@@ -548,7 +552,7 @@ fn update_downshift_confirmation(
         *pending_windows = 1;
     }
 
-    *pending_windows >= 2
+    *pending_windows >= required_windows
 }
 
 fn downshift_requires_confirmation(observation: MediaAdaptationObservation) -> bool {
@@ -573,6 +577,36 @@ fn downshift_requires_confirmation(observation: MediaAdaptationObservation) -> b
         return false;
     }
     true
+}
+
+fn downshift_confirmation_windows_required(observation: MediaAdaptationObservation) -> u32 {
+    let fps_low = observation.observed_fps < observation.target_fps as f32 * 0.85;
+    if !fps_low || observation.target_fps <= ADAPTATION_SAFE_START_MIN_FPS {
+        return ADAPTATION_DOWNSHIFT_CONFIRMATION_WINDOWS;
+    }
+
+    let frame_budget_ms = 1000.0 / observation.target_fps.max(1) as f64;
+    let perceptual_budget_ms = frame_budget_ms * 1.5;
+    let has_supporting_stress = observation.drop_ratio > 0.005
+        || observation.queue_depth > 0
+        || observation
+            .decode_p95_ms
+            .is_some_and(|p95| p95 > frame_budget_ms)
+        || observation
+            .render_p95_ms
+            .is_some_and(|p95| p95 > frame_budget_ms)
+        || observation
+            .present_gap_p95_ms
+            .is_some_and(|p95| p95 > perceptual_budget_ms)
+        || observation
+            .receive_p95_ms
+            .is_some_and(|p95| p95 > perceptual_budget_ms);
+
+    if has_supporting_stress {
+        ADAPTATION_DOWNSHIFT_CONFIRMATION_WINDOWS
+    } else {
+        ADAPTATION_HIGH_REFRESH_FPS_ONLY_CONFIRMATION_WINDOWS
+    }
 }
 
 fn downshift_reason(observation: MediaAdaptationObservation) -> Option<String> {
@@ -911,9 +945,16 @@ pub(crate) fn default_ladder_for_source(
     let high_bitrate = ceiling.bitrate_mbps.max(1);
     let second_bitrate = ((high_bitrate as f32) * 0.8).round() as u32;
 
-    sanitize_ladder(vec![
+    let mut ladder = vec![
         profile(high, high_fps, high_bitrate, ceiling),
         profile(high, high_fps, second_bitrate.max(1), ceiling),
+    ];
+    if let Some(stability_bitrate) =
+        high_refresh_stability_bitrate(high, high_fps, high_bitrate, second_bitrate)
+    {
+        ladder.push(profile(high, high_fps, stability_bitrate, ceiling));
+    }
+    ladder.extend([
         profile(
             high,
             high_fps.min(120),
@@ -935,7 +976,27 @@ pub(crate) fn default_ladder_for_source(
             floor.bitrate_mbps.max(1),
             ceiling,
         ),
-    ])
+    ]);
+    sanitize_ladder(ladder)
+}
+
+fn high_refresh_stability_bitrate(
+    high: (u32, u32),
+    high_fps: u32,
+    high_bitrate: u32,
+    second_bitrate: u32,
+) -> Option<u32> {
+    let pixels = high.0 as u64 * high.1 as u64;
+    let baseline_pixels = DEFAULT_CEILING_WIDTH as u64 * DEFAULT_CEILING_HEIGHT as u64;
+    if high_fps >= ADAPTATION_SAFE_START_MIN_FPS
+        && pixels > baseline_pixels
+        && high_bitrate > ADAPTATION_HIGH_REFRESH_STABILITY_BITRATE_MBPS
+        && second_bitrate > ADAPTATION_HIGH_REFRESH_STABILITY_BITRATE_MBPS
+    {
+        Some(ADAPTATION_HIGH_REFRESH_STABILITY_BITRATE_MBPS)
+    } else {
+        None
+    }
 }
 
 fn sanitize_ladder(ladder: Vec<MediaProfile>) -> Vec<MediaProfile> {
@@ -1215,6 +1276,10 @@ mod tests {
 
         assert_eq!(ladder[0].bitrate_mbps, 96);
         assert_eq!(ladder[1].bitrate_mbps, 77);
+        assert_eq!(ladder[2].fps, 144);
+        assert_eq!(ladder[2].bitrate_mbps, 64);
+        assert_eq!(ladder[3].fps, 120);
+        assert_eq!(ladder[3].bitrate_mbps, 50);
         assert_eq!(
             initial_ladder_index_for_profile(
                 &ladder,
@@ -1567,12 +1632,24 @@ mod tests {
             &mut pending_windows
         ));
         assert_eq!(pending_windows, 1);
-        assert!(update_downshift_confirmation(
+        assert!(!update_downshift_confirmation(
             observation,
             &mut pending_reason,
             &mut pending_windows
         ));
         assert_eq!(pending_windows, 2);
+        assert!(!update_downshift_confirmation(
+            observation,
+            &mut pending_reason,
+            &mut pending_windows
+        ));
+        assert_eq!(pending_windows, 3);
+        assert!(update_downshift_confirmation(
+            observation,
+            &mut pending_reason,
+            &mut pending_windows
+        ));
+        assert_eq!(pending_windows, 4);
     }
 
     #[test]
@@ -1582,6 +1659,48 @@ mod tests {
             target_fps: 165,
             drop_ratio: 0.0,
             queue_depth: 0,
+            decode_p95_ms: Some(2.0),
+            render_p95_ms: Some(2.0),
+            receive_p95_ms: Some(1.0),
+            present_gap_p95_ms: Some(1.0),
+            no_valid_frames: false,
+        };
+        let mut pending_reason = None;
+        let mut pending_windows = 0;
+
+        assert!(!update_downshift_confirmation(
+            observation,
+            &mut pending_reason,
+            &mut pending_windows
+        ));
+        assert_eq!(pending_windows, 1);
+        assert!(!update_downshift_confirmation(
+            observation,
+            &mut pending_reason,
+            &mut pending_windows
+        ));
+        assert_eq!(pending_windows, 2);
+        assert!(!update_downshift_confirmation(
+            observation,
+            &mut pending_reason,
+            &mut pending_windows
+        ));
+        assert_eq!(pending_windows, 3);
+        assert!(update_downshift_confirmation(
+            observation,
+            &mut pending_reason,
+            &mut pending_windows
+        ));
+        assert_eq!(pending_windows, 4);
+    }
+
+    #[test]
+    fn low_fps_with_queue_stress_confirms_after_two_windows() {
+        let observation = MediaAdaptationObservation {
+            observed_fps: 70.0,
+            target_fps: 165,
+            drop_ratio: 0.0,
+            queue_depth: 1,
             decode_p95_ms: Some(2.0),
             render_p95_ms: Some(2.0),
             receive_p95_ms: Some(1.0),
