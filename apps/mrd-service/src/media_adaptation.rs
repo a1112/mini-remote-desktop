@@ -588,7 +588,7 @@ fn downshift_confirmation_windows_required(observation: MediaAdaptationObservati
     let frame_budget_ms = 1000.0 / observation.target_fps.max(1) as f64;
     let perceptual_budget_ms = frame_budget_ms * 1.5;
     let has_supporting_stress = observation.drop_ratio > 0.005
-        || observation.queue_depth > 0
+        || observation.queue_depth > 1
         || observation
             .decode_p95_ms
             .is_some_and(|p95| p95 > frame_budget_ms)
@@ -694,7 +694,7 @@ fn observation_is_healthy(observation: MediaAdaptationObservation) -> bool {
     if observation.drop_ratio > 0.005 {
         return false;
     }
-    if observation.queue_depth != 0 {
+    if observation.queue_depth > 1 {
         return false;
     }
     let frame_budget_ms = 1000.0 / observation.target_fps.max(1) as f64;
@@ -1714,12 +1714,54 @@ mod tests {
     }
 
     #[test]
-    fn low_fps_with_queue_stress_confirms_after_two_windows() {
+    fn low_fps_with_single_paced_queue_frame_waits_for_fps_only_confirmation() {
         let observation = MediaAdaptationObservation {
             observed_fps: 70.0,
             target_fps: 165,
             drop_ratio: 0.0,
             queue_depth: 1,
+            decode_p95_ms: Some(2.0),
+            render_p95_ms: Some(2.0),
+            receive_p95_ms: Some(1.0),
+            present_gap_p95_ms: Some(1.0),
+            no_valid_frames: false,
+        };
+        let mut pending_reason = None;
+        let mut pending_windows = 0;
+
+        assert!(!update_downshift_confirmation(
+            observation,
+            &mut pending_reason,
+            &mut pending_windows
+        ));
+        assert_eq!(pending_windows, 1);
+        assert!(!update_downshift_confirmation(
+            observation,
+            &mut pending_reason,
+            &mut pending_windows
+        ));
+        assert_eq!(pending_windows, 2);
+        assert!(!update_downshift_confirmation(
+            observation,
+            &mut pending_reason,
+            &mut pending_windows
+        ));
+        assert_eq!(pending_windows, 3);
+        assert!(update_downshift_confirmation(
+            observation,
+            &mut pending_reason,
+            &mut pending_windows
+        ));
+        assert_eq!(pending_windows, 4);
+    }
+
+    #[test]
+    fn low_fps_with_real_queue_backlog_confirms_after_two_windows() {
+        let observation = MediaAdaptationObservation {
+            observed_fps: 70.0,
+            target_fps: 165,
+            drop_ratio: 0.0,
+            queue_depth: 2,
             decode_p95_ms: Some(2.0),
             render_p95_ms: Some(2.0),
             receive_p95_ms: Some(1.0),
@@ -1758,6 +1800,23 @@ mod tests {
         };
 
         assert!(!observation_is_healthy(observation));
+    }
+
+    #[test]
+    fn stable_health_allows_single_paced_render_queue_frame() {
+        let observation = MediaAdaptationObservation {
+            observed_fps: 120.0,
+            target_fps: 120,
+            drop_ratio: 0.004,
+            queue_depth: 1,
+            decode_p95_ms: Some(1.9),
+            render_p95_ms: Some(0.4),
+            receive_p95_ms: Some(0.1),
+            present_gap_p95_ms: Some(8.7),
+            no_valid_frames: false,
+        };
+
+        assert!(observation_is_healthy(observation));
     }
 
     #[test]
