@@ -945,14 +945,13 @@ pub(crate) fn default_ladder_for_source(
     let high_bitrate = ceiling.bitrate_mbps.max(1);
     let second_bitrate = ((high_bitrate as f32) * 0.8).round() as u32;
 
-    let mut ladder = vec![
-        profile(high, high_fps, high_bitrate, ceiling),
-        profile(high, high_fps, second_bitrate.max(1), ceiling),
-    ];
+    let mut ladder = vec![profile(high, high_fps, high_bitrate, ceiling)];
     if let Some(stability_bitrate) =
         high_refresh_stability_bitrate(high, high_fps, high_bitrate, second_bitrate)
     {
         ladder.push(profile(high, high_fps, stability_bitrate, ceiling));
+    } else {
+        ladder.push(profile(high, high_fps, second_bitrate.max(1), ceiling));
     }
     ladder.extend([
         profile(
@@ -1055,7 +1054,8 @@ fn initial_ladder_index_for_profile(ladder: &[MediaProfile], current_index: usiz
     }
 
     let top = &ladder[0];
-    let safe = &ladder[1];
+    let safe_index = initial_safe_start_candidate_index(ladder);
+    let safe = &ladder[safe_index];
     let safe_keeps_shape = safe.width == top.width
         && safe.height == top.height
         && safe.fps == top.fps
@@ -1070,10 +1070,30 @@ fn initial_ladder_index_for_profile(ladder: &[MediaProfile], current_index: usiz
         && top.fps >= ADAPTATION_SAFE_START_MIN_FPS
         && top.bitrate_mbps >= ADAPTATION_SAFE_START_MIN_BITRATE_MBPS
     {
-        1
+        safe_index
     } else {
         current_index
     }
+}
+
+fn initial_safe_start_candidate_index(ladder: &[MediaProfile]) -> usize {
+    let top = &ladder[0];
+    let pixels = top.width as u64 * top.height as u64;
+    let baseline_pixels = DEFAULT_CEILING_WIDTH as u64 * DEFAULT_CEILING_HEIGHT as u64;
+    if pixels <= baseline_pixels {
+        return 1;
+    }
+
+    ladder
+        .iter()
+        .position(|profile| {
+            profile.width == top.width
+                && profile.height == top.height
+                && profile.fps == top.fps
+                && profile.bitrate_mbps == ADAPTATION_HIGH_REFRESH_STABILITY_BITRATE_MBPS
+                && profile.bitrate_mbps < top.bitrate_mbps
+        })
+        .unwrap_or(1)
 }
 
 fn is_initial_safe_start_ladder_index(ladder: &[MediaProfile], ladder_index: usize) -> bool {
@@ -1254,7 +1274,7 @@ mod tests {
     }
 
     #[test]
-    fn high_bitrate_adaptive_profile_safe_starts_on_second_rung() {
+    fn high_bitrate_adaptive_profile_safe_starts_on_stability_rung() {
         let ceiling = MediaProfile {
             width: 2560,
             height: 1600,
@@ -1275,11 +1295,10 @@ mod tests {
         );
 
         assert_eq!(ladder[0].bitrate_mbps, 96);
-        assert_eq!(ladder[1].bitrate_mbps, 77);
-        assert_eq!(ladder[2].fps, 144);
-        assert_eq!(ladder[2].bitrate_mbps, 64);
-        assert_eq!(ladder[3].fps, 120);
-        assert_eq!(ladder[3].bitrate_mbps, 50);
+        assert_eq!(ladder[1].fps, 144);
+        assert_eq!(ladder[1].bitrate_mbps, 64);
+        assert_eq!(ladder[2].fps, 120);
+        assert_eq!(ladder[2].bitrate_mbps, 50);
         assert_eq!(
             initial_ladder_index_for_profile(
                 &ladder,

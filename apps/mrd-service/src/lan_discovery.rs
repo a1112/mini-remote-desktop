@@ -27,6 +27,8 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+#[cfg(windows)]
+use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard, TryLockError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, Notify};
@@ -80,7 +82,8 @@ const LAN_RENDER_PACING_PRECISE_SLEEP_MIN_FPS: u32 = 90;
 const LAN_RENDER_PACING_PRECISE_SLEEP_GUARD: Duration = Duration::from_millis(2);
 const LAN_RENDER_PACING_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const LAN_RENDER_PACING_PRESENT_LEAD: Duration = Duration::from_micros(250);
-const LAN_RENDER_SURFACE_LOCK_TIMEOUT: Duration = Duration::from_millis(3);
+const LAN_RENDER_SURFACE_RENDERER_LOCK_TIMEOUT: Duration = Duration::from_millis(2);
+const LAN_RENDER_SURFACE_RENDERER_LOCK_POLL_INTERVAL: Duration = Duration::from_micros(100);
 const LAN_RENDER_PACING_DEFAULT_MIN_FPS: u32 = 120;
 const LAN_RENDER_PACING_DEFAULT_MAX_PENDING_FRAMES: usize = 3;
 const LAN_RENDER_PACING_MAX_PENDING_FRAMES_LIMIT: usize = 8;
@@ -4877,27 +4880,63 @@ async fn render_lan_frame_once(
     frame: RenderFrame,
 ) -> Result<LanRenderTaskOutcome> {
     let started = Instant::now();
-    let mut renderers = match app_state.media_surface_renderers.try_lock() {
-        Ok(renderers) => renderers,
-        Err(_) => match timeout(
-            LAN_RENDER_SURFACE_LOCK_TIMEOUT,
-            app_state.media_surface_renderers.lock(),
-        )
-        .await
-        {
-            Ok(renderers) => renderers,
-            Err(_) => return Ok(LanRenderTaskOutcome::Dropped),
-        },
+    let renderers = {
+        let render_registry = app_state.media_surface_renderers.lock().await;
+        render_registry.renderers_for_session(&session_id)
     };
-    let rendered = renderers
-        .render_frame(&session_id, &frame)
-        .map_err(anyhow::Error::msg)?;
+    if renderers.is_empty() {
+        return Ok(LanRenderTaskOutcome::Idle);
+    }
+
+    let mut rendered = 0;
+    for renderer in &renderers {
+        let Some(mut renderer) =
+            wait_for_mutex_guard(renderer.as_ref(), LAN_RENDER_SURFACE_RENDERER_LOCK_TIMEOUT)
+                .map_err(|error| anyhow::anyhow!(error))?
+        else {
+            if rendered == 0 {
+                return Ok(LanRenderTaskOutcome::Dropped);
+            }
+            continue;
+        };
+        renderer
+            .upload_frame(frame.clone())
+            .map_err(|error| anyhow::anyhow!("upload frame to D3D11 renderer failed: {error}"))?;
+        rendered += 1;
+    }
+
     if rendered > 0 {
         Ok(LanRenderTaskOutcome::Rendered {
             duration_ms: started.elapsed().as_secs_f64() * 1000.0,
         })
     } else {
         Ok(LanRenderTaskOutcome::Idle)
+    }
+}
+
+#[cfg(windows)]
+fn wait_for_mutex_guard<'a, T>(
+    mutex: &'a StdMutex<T>,
+    wait_timeout: Duration,
+) -> Result<Option<StdMutexGuard<'a, T>>, String> {
+    let started = std::time::Instant::now();
+    let mut spins = 0;
+    loop {
+        match mutex.try_lock() {
+            Ok(guard) => return Ok(Some(guard)),
+            Err(TryLockError::Poisoned(_)) => return Err("D3D11 renderer lock was poisoned".into()),
+            Err(TryLockError::WouldBlock) => {
+                if started.elapsed() >= wait_timeout {
+                    return Ok(None);
+                }
+                if spins < 16 {
+                    spins += 1;
+                    std::hint::spin_loop();
+                } else {
+                    std::thread::sleep(LAN_RENDER_SURFACE_RENDERER_LOCK_POLL_INTERVAL);
+                }
+            }
+        }
     }
 }
 
@@ -8489,6 +8528,26 @@ mod tests {
         assert!(!lan_render_pacing_enabled_for_profile(&low_fps));
         assert_eq!(lan_render_queue_capacity_for_profile(&low_fps), 1);
         assert_eq!(lan_render_cap_target_fps_for_profile(&low_fps), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn surface_renderer_lock_waits_through_short_contention() {
+        let mutex = Arc::new(std::sync::Mutex::new(()));
+        let guard = mutex.lock().expect("hold test mutex");
+        let waiter = {
+            let mutex = mutex.clone();
+            std::thread::spawn(move || {
+                wait_for_mutex_guard(&mutex, Duration::from_millis(20))
+                    .expect("wait for mutex")
+                    .is_some()
+            })
+        };
+
+        std::thread::sleep(Duration::from_millis(2));
+        drop(guard);
+
+        assert!(waiter.join().expect("waiter thread"));
     }
 
     #[test]

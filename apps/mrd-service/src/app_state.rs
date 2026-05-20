@@ -21,6 +21,8 @@ use mrd_render_d3d11::D3d11RendererFactory;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 #[cfg(windows)]
+use std::sync::Mutex as StdMutex;
+#[cfg(windows)]
 use std::time::Duration;
 #[cfg(windows)]
 use tokio::time::Instant;
@@ -564,9 +566,13 @@ impl MediaPipelineRegistry {
 
 /// Native renderer instances owned by mrd-service for receiver sessions.
 #[cfg(windows)]
+pub(crate) type SharedSurfaceRenderer = Arc<StdMutex<BoxedRenderer>>;
+
+/// Native renderer instances owned by mrd-service for receiver sessions.
+#[cfg(windows)]
 #[derive(Default)]
 pub struct MediaSurfaceRendererRegistry {
-    renderers: HashMap<(SessionId, String), BoxedRenderer>,
+    renderers: HashMap<(SessionId, String), SharedSurfaceRenderer>,
 }
 
 #[cfg(windows)]
@@ -589,7 +595,8 @@ impl MediaSurfaceRendererRegistry {
         renderer
             .attach_target(RenderTarget::WindowHandle(window_handle as isize))
             .map_err(|error| format!("attach D3D11 renderer target failed: {error}"))?;
-        self.renderers.insert(key, renderer);
+        self.renderers
+            .insert(key, Arc::new(StdMutex::new(renderer)));
         Ok(())
     }
 
@@ -603,17 +610,25 @@ impl MediaSurfaceRendererRegistry {
             .retain(|(renderer_session_id, _), _| renderer_session_id != session_id);
     }
 
+    pub fn renderers_for_session(&self, session_id: &SessionId) -> Vec<SharedSurfaceRenderer> {
+        self.renderers
+            .iter()
+            .filter_map(|((renderer_session_id, _), renderer)| {
+                (renderer_session_id == session_id).then(|| renderer.clone())
+            })
+            .collect()
+    }
+
     pub fn render_frame(
-        &mut self,
+        &self,
         session_id: &SessionId,
         frame: &RenderFrame,
     ) -> Result<usize, String> {
         let mut rendered = 0;
-        for ((renderer_session_id, _), renderer) in self.renderers.iter_mut() {
-            if renderer_session_id != session_id {
-                continue;
-            }
+        for renderer in self.renderers_for_session(session_id) {
             renderer
+                .lock()
+                .map_err(|_| "D3D11 renderer lock was poisoned".to_string())?
                 .upload_frame(frame.clone())
                 .map_err(|error| format!("upload frame to D3D11 renderer failed: {error}"))?;
             rendered += 1;
@@ -626,6 +641,19 @@ impl MediaSurfaceRendererRegistry {
             .keys()
             .filter(|(renderer_session_id, _)| renderer_session_id == session_id)
             .count()
+    }
+
+    #[cfg(test)]
+    pub fn insert_renderer_for_test(
+        &mut self,
+        session_id: &SessionId,
+        surface_id: impl Into<String>,
+        renderer: BoxedRenderer,
+    ) {
+        self.renderers.insert(
+            (session_id.clone(), surface_id.into()),
+            Arc::new(StdMutex::new(renderer)),
+        );
     }
 }
 
@@ -1603,6 +1631,73 @@ mod tests {
         assert_eq!(snapshot.dropped_frames, 5);
         assert_eq!(snapshot.render_queue_replacements, 3);
         assert_eq!(snapshot.render_lock_drops, 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn media_surface_renderer_registry_returns_shared_session_renderers() {
+        use mrd_render::{RenderError, RenderTarget, RendererInstance, RendererSnapshot};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingRenderer {
+            uploads: Arc<AtomicUsize>,
+        }
+
+        impl RendererInstance for CountingRenderer {
+            fn attach_target(&mut self, _target: RenderTarget) -> Result<(), RenderError> {
+                Ok(())
+            }
+
+            fn upload_frame(&mut self, _frame: RenderFrame) -> Result<(), RenderError> {
+                self.uploads.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+
+            fn snapshot(&self) -> RendererSnapshot {
+                RendererSnapshot {
+                    attached_to_target: true,
+                    uploaded_frame_count: self.uploads.load(Ordering::SeqCst) as u64,
+                    last_width: 1,
+                    last_height: 1,
+                    last_pixel_format: None,
+                }
+            }
+        }
+
+        let mut registry = MediaSurfaceRendererRegistry::default();
+        let session_a = SessionId("surface-session-a".to_string());
+        let session_b = SessionId("surface-session-b".to_string());
+        let uploads_a = Arc::new(AtomicUsize::new(0));
+        let uploads_b = Arc::new(AtomicUsize::new(0));
+
+        registry.insert_renderer_for_test(
+            &session_a,
+            "surface-a",
+            Box::new(CountingRenderer {
+                uploads: uploads_a.clone(),
+            }),
+        );
+        registry.insert_renderer_for_test(
+            &session_b,
+            "surface-b",
+            Box::new(CountingRenderer {
+                uploads: uploads_b.clone(),
+            }),
+        );
+
+        let session_a_renderers = registry.renderers_for_session(&session_a);
+        assert_eq!(session_a_renderers.len(), 1);
+        drop(registry);
+
+        let frame = RenderFrame::from_rgb24(1, 1, vec![1, 2, 3]);
+        session_a_renderers[0]
+            .lock()
+            .expect("renderer lock")
+            .upload_frame(frame)
+            .expect("upload frame");
+
+        assert_eq!(uploads_a.load(Ordering::SeqCst), 1);
+        assert_eq!(uploads_b.load(Ordering::SeqCst), 0);
     }
 
     #[test]
