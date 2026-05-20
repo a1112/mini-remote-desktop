@@ -1040,10 +1040,19 @@ describe("runLanE2EAutomation", () => {
     let pipelineIndex = 0;
     const decodedFrames = [10, 16, 17, 18];
     const droppedFrames = [2, 5, 5, 5];
+    const sequenceGapDrops = [1, 3, 3, 3];
+    const decodeErrorDrops = [1, 2, 2, 2];
+    const transientDrops = [0, 1, 1, 1];
     const presentedFrames = [8, 14, 15, 16];
     const ipcProbeSnapshot = vi.fn().mockImplementation(() => {
       const frameCount = decodedFrames[Math.min(probeIndex, decodedFrames.length - 1)];
       const droppedFrameCount = droppedFrames[Math.min(probeIndex, droppedFrames.length - 1)];
+      const sequenceGapDropCount =
+        sequenceGapDrops[Math.min(probeIndex, sequenceGapDrops.length - 1)];
+      const decodeErrorDropCount =
+        decodeErrorDrops[Math.min(probeIndex, decodeErrorDrops.length - 1)];
+      const transientDropCount =
+        transientDrops[Math.min(probeIndex, transientDrops.length - 1)];
       probeIndex += 1;
       currentTime += currentTime === 0 ? 10 : 100;
       return Promise.resolve(
@@ -1052,6 +1061,9 @@ describe("runLanE2EAutomation", () => {
           frames_received: frameCount,
           frames_decoded: frameCount,
           frames_dropped: droppedFrameCount,
+          sequence_gap_drops: sequenceGapDropCount,
+          decode_error_drops: decodeErrorDropCount,
+          transient_drops: transientDropCount,
           current_fps: 10,
           bitrate_mbps: 20,
           media_probe_valid: true,
@@ -1114,6 +1126,9 @@ describe("runLanE2EAutomation", () => {
     expect(result.status).toBe("completed");
     expect(result.sampleFramesDecoded).toBe(6);
     expect(result.sampleFramesDropped).toBe(3);
+    expect(result.sampleSequenceGapDrops).toBe(2);
+    expect(result.sampleDecodeErrorDrops).toBe(1);
+    expect(result.sampleTransientDrops).toBe(1);
     expect(result.sampleObservedFps).toBeGreaterThanOrEqual(50);
     expect(result.sampleRenderFramesPresented).toBe(6);
     expect(result.sampleObservedRenderFps).toBeGreaterThanOrEqual(50);

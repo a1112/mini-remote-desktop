@@ -937,6 +937,12 @@ pub struct ProbeSnapshot {
     pub frames_received: u64,
     pub frames_decoded: u64,
     pub frames_dropped: u64,
+    #[serde(default)]
+    pub sequence_gap_drops: u64,
+    #[serde(default)]
+    pub decode_error_drops: u64,
+    #[serde(default)]
+    pub transient_drops: u64,
     pub current_fps: Option<f32>,
     pub bitrate_mbps: Option<f32>,
     pub media_probe_valid: bool,

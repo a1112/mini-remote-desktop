@@ -806,6 +806,9 @@ export interface ProbeSnapshot {
   frames_received: number;
   frames_decoded: number;
   frames_dropped: number;
+  sequence_gap_drops?: number;
+  decode_error_drops?: number;
+  transient_drops?: number;
   current_fps?: number | null;
   bitrate_mbps?: number | null;
   media_probe_valid?: boolean;

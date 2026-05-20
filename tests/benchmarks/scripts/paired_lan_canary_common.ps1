@@ -272,7 +272,13 @@ function Convert-LocalSummaryToCanaryRow {
     decoded_frames = $null
     dropped_frames = $localDropped
     probe_dropped_frames = $localDropped
+    sequence_gap_drops = 0
+    decode_error_drops = 0
+    transient_drops = 0
     pipeline_dropped_frames = $localDropped
+    sample_sequence_gap_drops = $null
+    sample_decode_error_drops = $null
+    sample_transient_drops = $null
     render_queue_replacements = 0
     render_lock_drops = 0
     queue_depth = $null
@@ -318,6 +324,12 @@ function Convert-CrossReportToCanaryRow {
   $displayLimitReason = Get-CanaryDisplayRefreshLimitReason -Report $Report -Profile $Profile
   $probeDropped = [int64](Select-CanaryValue $probe.frames_dropped 0)
   $sampleProbeDropped = Select-CanaryObjectPropertyValue $Report "sampleFramesDropped" $null
+  $sequenceGapDropped = [int64](Select-CanaryValue $probe.sequence_gap_drops 0)
+  $decodeErrorDropped = [int64](Select-CanaryValue $probe.decode_error_drops 0)
+  $transientDropped = [int64](Select-CanaryValue $probe.transient_drops 0)
+  $sampleSequenceGapDropped = Select-CanaryObjectPropertyValue $Report "sampleSequenceGapDrops" $null
+  $sampleDecodeErrorDropped = Select-CanaryObjectPropertyValue $Report "sampleDecodeErrorDrops" $null
+  $sampleTransientDropped = Select-CanaryObjectPropertyValue $Report "sampleTransientDrops" $null
   $pipelineDropped = [int64](Select-CanaryValue $pipeline.dropped_frames 0)
   $renderQueueReplacements = [int64](Select-CanaryValue $pipeline.render_queue_replacements $pipelineDropped)
   $renderLockDrops = [int64](Select-CanaryValue $pipeline.render_lock_drops 0)
@@ -342,6 +354,12 @@ function Convert-CrossReportToCanaryRow {
     dropped_frames = $probeDropped
     probe_dropped_frames = $probeDropped
     sample_probe_dropped_frames = $sampleProbeDropped
+    sequence_gap_drops = $sequenceGapDropped
+    decode_error_drops = $decodeErrorDropped
+    transient_drops = $transientDropped
+    sample_sequence_gap_drops = $sampleSequenceGapDropped
+    sample_decode_error_drops = $sampleDecodeErrorDropped
+    sample_transient_drops = $sampleTransientDropped
     pipeline_dropped_frames = $pipelineDropped
     render_queue_replacements = $renderQueueReplacements
     render_lock_drops = $renderLockDrops
@@ -718,8 +736,8 @@ function Write-CanaryJsonAndMarkdown {
     "- Skipped: $($Report.skipped)",
     "- Failed: $($Report.failed)",
     "",
-    "| Profile | Status | Class | FPS | Render FPS | Render Target | Selected | Adaptive | Visual | Enc P50/P95 | Send P50/P95 | Present Gap P95 | Sample/Probe Drop | Render Coalesce | Render Drop | Queue | Error |",
-    "| --- | --- | --- | ---: | ---: | ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
+    "| Profile | Status | Class | FPS | Render FPS | Render Target | Selected | Adaptive | Visual | Enc P50/P95 | Send P50/P95 | Present Gap P95 | Sample/Probe Drop | Drop Breakdown gap/decode/transient | Render Coalesce | Render Drop | Queue | Error |",
+    "| --- | --- | --- | ---: | ---: | ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
   )
   foreach ($row in $Report.rows) {
     $selected = "$($row.selected_profile.width)x$($row.selected_profile.height)@$($row.selected_profile.fps)/$($row.selected_profile.bitrate_mbps)Mbps"
@@ -736,9 +754,13 @@ function Write-CanaryJsonAndMarkdown {
     $renderTargetFps = Select-CanaryValue $row.render_pacing_target_fps "-"
     $presentGapP95 = [Math]::Round([double](Select-CanaryValue $row.render_present_gap_p95_ms 0), 2)
     $probeDrops = Select-CanaryValue $row.sample_probe_dropped_frames (Select-CanaryValue $row.probe_dropped_frames $row.dropped_frames)
+    $sequenceGapDrops = Select-CanaryValue $row.sample_sequence_gap_drops (Select-CanaryValue $row.sequence_gap_drops 0)
+    $decodeErrorDrops = Select-CanaryValue $row.sample_decode_error_drops (Select-CanaryValue $row.decode_error_drops 0)
+    $transientDrops = Select-CanaryValue $row.sample_transient_drops (Select-CanaryValue $row.transient_drops 0)
+    $dropBreakdown = "$sequenceGapDrops/$decodeErrorDrops/$transientDrops"
     $renderCoalesce = Select-CanaryValue $row.render_queue_replacements 0
     $renderDrops = Select-CanaryValue $row.render_lock_drops 0
-    $lines += "| $($row.id) | $($row.status) | $($row.classification) | $([Math]::Round([double](Select-CanaryValue $row.fps_observed 0), 2)) | $estimatedRenderFps | $renderTargetFps | $selected | $adaptive | $visual | $encodeP50/$encodeP95 | $sendP50/$sendP95 | $presentGapP95 | $probeDrops | $renderCoalesce | $renderDrops | $($row.queue_depth) | $error |"
+    $lines += "| $($row.id) | $($row.status) | $($row.classification) | $([Math]::Round([double](Select-CanaryValue $row.fps_observed 0), 2)) | $estimatedRenderFps | $renderTargetFps | $selected | $adaptive | $visual | $encodeP50/$encodeP95 | $sendP50/$sendP95 | $presentGapP95 | $probeDrops | $dropBreakdown | $renderCoalesce | $renderDrops | $($row.queue_depth) | $error |"
   }
   if ($Report.codec_request) {
     $lines += ""

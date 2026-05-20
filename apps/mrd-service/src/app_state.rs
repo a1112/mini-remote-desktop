@@ -716,6 +716,9 @@ struct SessionProbeStats {
     frames_received: u64,
     frames_decoded: u64,
     frames_dropped: u64,
+    sequence_gap_drops: u64,
+    decode_error_drops: u64,
+    transient_drops: u64,
     bytes_received: u64,
     first_seen_ms: Option<u64>,
     last_seen_ms: Option<u64>,
@@ -793,9 +796,9 @@ impl ProbeRegistry {
         let stats = self.probes.entry(session_id.clone()).or_default();
         if let Some(last_sequence) = stats.last_media_sequence {
             if frame.sequence > last_sequence.saturating_add(1) {
-                stats.frames_dropped = stats
-                    .frames_dropped
-                    .saturating_add(frame.sequence.saturating_sub(last_sequence + 1));
+                let missing = frame.sequence.saturating_sub(last_sequence + 1);
+                stats.frames_dropped = stats.frames_dropped.saturating_add(missing);
+                stats.sequence_gap_drops = stats.sequence_gap_drops.saturating_add(missing);
             }
         }
 
@@ -826,9 +829,9 @@ impl ProbeRegistry {
         let stats = self.probes.entry(session_id.clone()).or_default();
         if let Some(last_sequence) = stats.last_media_sequence {
             if frame.sequence > last_sequence.saturating_add(1) {
-                stats.frames_dropped = stats
-                    .frames_dropped
-                    .saturating_add(frame.sequence.saturating_sub(last_sequence + 1));
+                let missing = frame.sequence.saturating_sub(last_sequence + 1);
+                stats.frames_dropped = stats.frames_dropped.saturating_add(missing);
+                stats.sequence_gap_drops = stats.sequence_gap_drops.saturating_add(missing);
             }
         }
 
@@ -871,6 +874,7 @@ impl ProbeRegistry {
         let stats = self.probes.entry(session_id.clone()).or_default();
         stats.frames_received = stats.frames_received.saturating_add(1);
         stats.frames_dropped = stats.frames_dropped.saturating_add(1);
+        stats.decode_error_drops = stats.decode_error_drops.saturating_add(1);
         stats.bytes_received = stats.bytes_received.saturating_add(bytes_received);
         stats.first_seen_ms.get_or_insert(now_ms);
         stats.last_seen_ms = Some(now_ms);
@@ -886,6 +890,7 @@ impl ProbeRegistry {
         let stats = self.probes.entry(session_id.clone()).or_default();
         stats.frames_received = stats.frames_received.saturating_add(1);
         stats.frames_dropped = stats.frames_dropped.saturating_add(1);
+        stats.transient_drops = stats.transient_drops.saturating_add(1);
         stats.bytes_received = stats.bytes_received.saturating_add(bytes_received);
         stats.first_seen_ms.get_or_insert(now_ms);
         stats.last_seen_ms = Some(now_ms);
@@ -898,6 +903,9 @@ impl ProbeRegistry {
                 frames_received: 0,
                 frames_decoded: 0,
                 frames_dropped: 0,
+                sequence_gap_drops: 0,
+                decode_error_drops: 0,
+                transient_drops: 0,
                 current_fps: None,
                 bitrate_mbps: None,
                 media_probe_valid: false,
@@ -938,6 +946,9 @@ impl ProbeRegistry {
             frames_received: stats.frames_received,
             frames_decoded: stats.frames_decoded,
             frames_dropped: stats.frames_dropped,
+            sequence_gap_drops: stats.sequence_gap_drops,
+            decode_error_drops: stats.decode_error_drops,
+            transient_drops: stats.transient_drops,
             current_fps,
             bitrate_mbps,
             media_probe_valid: stats.media_probe_valid,
@@ -1586,6 +1597,62 @@ mod tests {
         assert_eq!(snapshot.frames_decoded, 0);
         assert_eq!(snapshot.frames_dropped, 1);
         assert_eq!(snapshot.last_error, None);
+    }
+
+    #[test]
+    fn probe_registry_breaks_down_drop_causes() {
+        let mut registry = ProbeRegistry::default();
+        let session_id = SessionId("drop-breakdown-session".to_string());
+
+        registry.record_decoded_video_frame(
+            &session_id,
+            DecodedVideoFrameStats {
+                bytes_received: 2048,
+                sequence: 10,
+                timestamp_us: 100_000,
+                width: 1920,
+                height: 1080,
+                target_fps: 144,
+                target_bitrate_mbps: 64,
+                encoded_bytes: 2048,
+                format: "hevc_desktop_frame".to_string(),
+                pixel_format: "d3d11_shared_nv12".to_string(),
+                payload_hash: "fnv1a64:first".to_string(),
+                preview_width: None,
+                preview_height: None,
+                rgb24: None,
+            },
+            1_000,
+        );
+        registry.record_decoded_video_frame(
+            &session_id,
+            DecodedVideoFrameStats {
+                bytes_received: 2048,
+                sequence: 13,
+                timestamp_us: 120_000,
+                width: 1920,
+                height: 1080,
+                target_fps: 144,
+                target_bitrate_mbps: 64,
+                encoded_bytes: 2048,
+                format: "hevc_desktop_frame".to_string(),
+                pixel_format: "d3d11_shared_nv12".to_string(),
+                payload_hash: "fnv1a64:gap".to_string(),
+                preview_width: None,
+                preview_height: None,
+                rgb24: None,
+            },
+            1_020,
+        );
+        registry.record_probe_drop(&session_id, 512, 1_030, "decode failed");
+        registry.record_transient_frame_drop(&session_id, 256, 1_040);
+
+        let snapshot = registry.snapshot(&session_id);
+
+        assert_eq!(snapshot.frames_dropped, 4);
+        assert_eq!(snapshot.sequence_gap_drops, 2);
+        assert_eq!(snapshot.decode_error_drops, 1);
+        assert_eq!(snapshot.transient_drops, 1);
     }
 
     #[test]

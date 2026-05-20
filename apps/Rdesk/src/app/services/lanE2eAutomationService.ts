@@ -119,6 +119,9 @@ export interface LanE2EAutomationReport {
   sampleDurationMs: number;
   sampleFramesDecoded: number;
   sampleFramesDropped: number;
+  sampleSequenceGapDrops?: number;
+  sampleDecodeErrorDrops?: number;
+  sampleTransientDrops?: number;
   sampleObservedFps?: number;
   sampleRenderFramesPresented: number;
   sampleObservedRenderFps?: number;
@@ -271,6 +274,9 @@ export async function runLanE2EAutomation(
   let sampleDurationMs = 0;
   let sampleFramesDecoded = 0;
   let sampleFramesDropped = 0;
+  let sampleSequenceGapDrops: number | undefined;
+  let sampleDecodeErrorDrops: number | undefined;
+  let sampleTransientDrops: number | undefined;
   let sampleObservedFps: number | undefined;
   let sampleRenderFramesPresented = 0;
   let sampleObservedRenderFps: number | undefined;
@@ -279,6 +285,9 @@ export async function runLanE2EAutomation(
     | {
         framesDecoded: number;
         framesDropped: number;
+        sequenceGapDrops: number;
+        decodeErrorDrops: number;
+        transientDrops: number;
         renderPresentedFrames: number;
         sampleDurationMs: number;
       }
@@ -323,6 +332,9 @@ export async function runLanE2EAutomation(
     sampleDurationMs,
     sampleFramesDecoded,
     sampleFramesDropped,
+    sampleSequenceGapDrops,
+    sampleDecodeErrorDrops,
+    sampleTransientDrops,
     sampleObservedFps,
     sampleRenderFramesPresented,
     sampleObservedRenderFps,
@@ -558,6 +570,9 @@ export async function runLanE2EAutomation(
         sampleDurationMs = 0;
         sampleFramesDecoded = 0;
         sampleFramesDropped = 0;
+        sampleSequenceGapDrops = undefined;
+        sampleDecodeErrorDrops = undefined;
+        sampleTransientDrops = undefined;
         sampleObservedFps = undefined;
         sampleRenderFramesPresented = 0;
         sampleObservedRenderFps = undefined;
@@ -570,6 +585,9 @@ export async function runLanE2EAutomation(
         sampleFpsBaseline = {
           framesDecoded: probeSnapshot.frames_decoded,
           framesDropped: probeSnapshot.frames_dropped,
+          sequenceGapDrops: probeSnapshot.sequence_gap_drops ?? 0,
+          decodeErrorDrops: probeSnapshot.decode_error_drops ?? 0,
+          transientDrops: probeSnapshot.transient_drops ?? 0,
           renderPresentedFrames: mediaPipelineSnapshot.render_presented_frames ?? 0,
           sampleDurationMs,
         };
@@ -581,6 +599,18 @@ export async function runLanE2EAutomation(
         sampleFramesDropped = Math.max(
           0,
           probeSnapshot.frames_dropped - sampleFpsBaseline.framesDropped
+        );
+        sampleSequenceGapDrops = Math.max(
+          0,
+          (probeSnapshot.sequence_gap_drops ?? 0) - sampleFpsBaseline.sequenceGapDrops
+        );
+        sampleDecodeErrorDrops = Math.max(
+          0,
+          (probeSnapshot.decode_error_drops ?? 0) - sampleFpsBaseline.decodeErrorDrops
+        );
+        sampleTransientDrops = Math.max(
+          0,
+          (probeSnapshot.transient_drops ?? 0) - sampleFpsBaseline.transientDrops
         );
         const sampleFpsElapsedMs =
           sampleDurationMs - sampleFpsBaseline.sampleDurationMs;

@@ -69,6 +69,8 @@ const LAN_QUIC_LAN_HIGH_QUALITY_DATAGRAM_BYTES: usize = LAN_QUIC_FALLBACK_DATAGR
 const LAN_QUIC_RELIABLE_WHOLE_FRAME_MIN_BITRATE_MBPS: u32 = 80;
 const LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_BITRATE_MBPS: u32 = 120;
 const LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_FPS: u32 = 120;
+const LAN_QUIC_RELIABLE_WHOLE_FRAME_STABILITY_MIN_BITRATE_MBPS: u32 = 64;
+const LAN_QUIC_RELIABLE_WHOLE_FRAME_STABILITY_MIN_FPS: u32 = 144;
 const LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES: usize = 4 * 1024 * 1024;
 const LAN_QUIC_RELIABLE_MEDIA_RETRY_DELAY: Duration = Duration::from_millis(10);
 const LAN_QUIC_DATAGRAM_SEND_BUDGET_MIN_BITRATE_MBPS: u32 = 80;
@@ -3638,7 +3640,7 @@ impl LanMediaFrameOrderer {
         self.pending.entry(frame.frame_id).or_insert(frame);
 
         let mut ready = self.drain_contiguous();
-        if ready.is_empty() && self.pending.len() > self.max_pending_frames {
+        if ready.is_empty() && self.pending.len() >= self.max_pending_frames {
             if let Some(next_frame_id) = self.pending.keys().next().copied() {
                 self.next_frame_id = Some(next_frame_id);
                 ready = self.drain_contiguous();
@@ -3823,8 +3825,14 @@ fn should_send_access_unit_as_reliable_frame(
 }
 
 fn should_default_to_reliable_whole_frame(profile: &MediaProfile) -> bool {
-    profile.bitrate_mbps >= LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_BITRATE_MBPS
-        && profile.fps >= LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_FPS
+    let ultra_high_bitrate = profile.bitrate_mbps
+        >= LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_BITRATE_MBPS
+        && profile.fps >= LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_FPS;
+    let high_refresh_stability = profile.bitrate_mbps
+        >= LAN_QUIC_RELIABLE_WHOLE_FRAME_STABILITY_MIN_BITRATE_MBPS
+        && profile.fps >= LAN_QUIC_RELIABLE_WHOLE_FRAME_STABILITY_MIN_FPS;
+
+    ultra_high_bitrate || high_refresh_stability
 }
 
 fn reliable_whole_frame_media_override() -> Option<bool> {
@@ -7162,10 +7170,22 @@ mod tests {
             vec![10]
         );
         assert!(orderer.push(test_quic_au_frame(12, false)).is_empty());
-        assert!(orderer.push(test_quic_au_frame(13, false)).is_empty());
-        let ready = orderer.push(test_quic_au_frame(14, false));
+        let ready = orderer.push(test_quic_au_frame(13, false));
 
-        assert_eq!(frame_ids(&ready), vec![12, 13, 14]);
+        assert_eq!(frame_ids(&ready), vec![12, 13]);
+    }
+
+    #[test]
+    fn lan_media_frame_orderer_releases_first_late_frame_at_low_latency_limit() {
+        let mut orderer = LanMediaFrameOrderer::new(1);
+
+        assert_eq!(
+            frame_ids(&orderer.push(test_quic_au_frame(20, true))),
+            vec![20]
+        );
+        let ready = orderer.push(test_quic_au_frame(22, false));
+
+        assert_eq!(frame_ids(&ready), vec![22]);
     }
 
     #[test]
@@ -8551,11 +8571,11 @@ mod tests {
     }
 
     #[test]
-    fn stable_high_quality_media_keeps_delta_frames_on_datagrams_by_default() {
+    fn below_high_refresh_stability_tier_keeps_delta_frames_on_datagrams_by_default() {
         let stable_bitrate = MediaProfile {
             width: 2560,
             height: 1440,
-            fps: 144,
+            fps: 120,
             bitrate_mbps: 80,
             codec: "hevc".to_string(),
             ..MediaProfile::default()
@@ -8566,6 +8586,26 @@ mod tests {
             true,
             64,
             &stable_bitrate,
+            None
+        ));
+    }
+
+    #[test]
+    fn high_refresh_stability_tier_uses_reliable_whole_frame_by_default() {
+        let stability_tier = MediaProfile {
+            width: 2560,
+            height: 1440,
+            fps: 144,
+            bitrate_mbps: 64,
+            codec: "hevc".to_string(),
+            ..MediaProfile::default()
+        };
+
+        assert!(should_send_access_unit_as_reliable_frame(
+            true,
+            true,
+            64,
+            &stability_tier,
             None
         ));
     }
@@ -8611,7 +8651,7 @@ mod tests {
             &render_capped,
             None
         ));
-        assert!(!should_send_access_unit_as_reliable_frame(
+        assert!(should_send_access_unit_as_reliable_frame(
             true,
             true,
             64,
@@ -8636,10 +8676,10 @@ mod tests {
 
     #[test]
     fn reliable_whole_frame_requires_explicit_override() {
-        let high_quality_2k144 = MediaProfile {
+        let high_quality_2k120 = MediaProfile {
             width: 2560,
             height: 1440,
-            fps: 144,
+            fps: 120,
             bitrate_mbps: 80,
             codec: "hevc".to_string(),
             ..MediaProfile::default()
@@ -8649,28 +8689,28 @@ mod tests {
             true,
             true,
             64,
-            &high_quality_2k144,
+            &high_quality_2k120,
             None
         ));
         assert!(should_send_access_unit_as_reliable_frame(
             true,
             true,
             64,
-            &high_quality_2k144,
+            &high_quality_2k120,
             Some(true)
         ));
         assert!(!should_send_access_unit_as_reliable_frame(
             true,
             true,
             64,
-            &high_quality_2k144,
+            &high_quality_2k120,
             Some(false)
         ));
         assert!(!should_send_access_unit_as_reliable_frame(
             false,
             true,
             64,
-            &high_quality_2k144,
+            &high_quality_2k120,
             None
         ));
     }

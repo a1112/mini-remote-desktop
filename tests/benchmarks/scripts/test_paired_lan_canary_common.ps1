@@ -154,10 +154,16 @@ $sampleFpsReport = [pscustomobject]@{
   sampleObservedFps = 57.0
   sampleFramesDecoded = 1710
   sampleFramesDropped = 1
+  sampleSequenceGapDrops = 2
+  sampleDecodeErrorDrops = 3
+  sampleTransientDrops = 4
   probeSnapshot = [pscustomobject]@{
     current_fps = 44.0
     frames_decoded = 484
     frames_dropped = 0
+    sequence_gap_drops = 5
+    decode_error_drops = 6
+    transient_drops = 7
     media_probe_width = 1920
     media_probe_height = 1080
     media_probe_target_fps = 60
@@ -184,6 +190,12 @@ $sampleFpsReport = [pscustomobject]@{
 $sampleFpsRow = Convert-CrossReportToCanaryRow -Profile $profiles[0] -Report $sampleFpsReport -ReportPath "raw/cross-1080p60.json"
 Assert-Equal $sampleFpsRow.fps_observed 57.0 "Cross report prefers sample-window FPS over cumulative probe FPS"
 Assert-Equal $sampleFpsRow.sample_probe_dropped_frames 1 "Cross row carries sample-window probe drops separately from cumulative drops"
+Assert-Equal $sampleFpsRow.sample_sequence_gap_drops 2 "Cross row carries sample-window sequence gap drops separately"
+Assert-Equal $sampleFpsRow.sample_decode_error_drops 3 "Cross row carries sample-window decode/probe error drops separately"
+Assert-Equal $sampleFpsRow.sample_transient_drops 4 "Cross row carries sample-window transient drops separately"
+Assert-Equal $sampleFpsRow.sequence_gap_drops 5 "Cross row keeps cumulative sequence gap drops"
+Assert-Equal $sampleFpsRow.decode_error_drops 6 "Cross row keeps cumulative decode/probe error drops"
+Assert-Equal $sampleFpsRow.transient_drops 7 "Cross row keeps cumulative transient drops"
 Assert-Equal $sampleFpsRow.test_impairment.datagrams_dropped 1 "Cross row carries media impairment counters"
 
 $adaptiveDowngradeReport = [pscustomobject]@{
