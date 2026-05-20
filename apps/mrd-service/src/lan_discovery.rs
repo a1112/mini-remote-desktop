@@ -3367,14 +3367,24 @@ async fn send_quic_media_loop(
                     fragments_attempted: fragments.len() as u64,
                     ..LanSenderDatagramFrameReport::default()
                 };
+                let mut skip_unsent_datagram_frame = false;
                 for (fragment_index, fragment) in fragments.iter().enumerate() {
-                    let remaining_send_budget = datagram_send_deadline
-                        .map(|deadline| deadline.saturating_duration_since(Instant::now()));
-                    if remaining_send_budget.is_some_and(|remaining| remaining.is_zero()) {
+                    let frame_send_started =
+                        datagram_report.fragments_sent > 0 || datagram_report.fragments_delayed > 0;
+                    let remaining_send_budget = if frame_send_started {
+                        None
+                    } else {
+                        datagram_send_deadline
+                            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                    };
+                    if !frame_send_started
+                        && remaining_send_budget.is_some_and(|remaining| remaining.is_zero())
+                    {
                         datagram_report.fragments_dropped_for_budget = datagram_report
                             .fragments_dropped_for_budget
                             .saturating_add((fragments.len() - fragment_index) as u64);
                         datagram_report.cut_short_for_budget = true;
+                        skip_unsent_datagram_frame = true;
                         break;
                     }
                     let decision = test_impairment.next_datagram_decision();
@@ -3428,6 +3438,9 @@ async fn send_quic_media_loop(
                                 .fragments_dropped_for_capacity
                                 .saturating_add((fragments.len() - fragment_index) as u64);
                             datagram_report.cut_short_for_capacity = true;
+                            if !frame_send_started {
+                                skip_unsent_datagram_frame = true;
+                            }
                             break;
                         }
                         Err(error) => {
@@ -3440,6 +3453,10 @@ async fn send_quic_media_loop(
                 }
                 sender_stats.record_datagram_frame(datagram_report);
                 sender_stats.record_elapsed("sender.send_datagram", datagram_send_started);
+
+                if skip_unsent_datagram_frame {
+                    continue;
+                }
 
                 if send_result.is_ok() {
                     if let Some(reliable_fragments) = reliable_fragments {
