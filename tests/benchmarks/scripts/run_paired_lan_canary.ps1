@@ -16,9 +16,13 @@ param(
   [string]$ChromaSubsampling = "",
   [string]$PixelFormat = "",
   [bool]$HdrEnabled = $false,
+  [string]$CaptureSourceId = "",
+  [string]$CaptureSourceKind = "display_shared",
+  [int]$RenderMaxFps = 0,
   [switch]$SkipLocal,
   [switch]$SkipCross,
   [switch]$NoBuild,
+  [switch]$NoRenderProfileCap,
   [switch]$KeepTauriOpen
 )
 
@@ -188,7 +192,7 @@ function Get-IPv4BroadcastAddress([string]$IPAddress, [int]$PrefixLength) {
   [System.Net.IPAddress]::new($broadcast).ToString()
 }
 
-function Invoke-LocalCanaryProfile($Repo, $Profile, $GitCommit) {
+function Invoke-LocalCanaryProfile($Repo, $Profile, $GitCommit, [string]$Codec) {
   $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
   $date = Get-Date -Format 'yyyy-MM-dd'
   $runId = "paired-local-$($Profile.id)-$timestamp-$GitCommit"
@@ -211,9 +215,14 @@ function Invoke-LocalCanaryProfile($Repo, $Profile, $GitCommit) {
     Set-EnvVar "MRD_BENCH_GIT_COMMIT" $GitCommit $savedEnv
     Set-EnvVar "MRD_BENCH_TRANSPORT" "quic_datagram" $savedEnv
     Set-EnvVar "MRD_BENCH_CAPTURE_BACKEND" "dxgi" $savedEnv
-    Set-EnvVar "MRD_BENCH_ENCODE_BACKEND" "nvenc_h264" $savedEnv
+    if ((Normalize-CanaryCodec $Codec) -eq "hevc") {
+      Set-EnvVar "MRD_BENCH_ENCODE_BACKEND" "nvenc_hevc" $savedEnv
+    } else {
+      Set-EnvVar "MRD_BENCH_ENCODE_BACKEND" "nvenc_h264" $savedEnv
+    }
     Set-EnvVar "MRD_BENCH_DECODE_BACKEND" "nvdec" $savedEnv
     Set-EnvVar "MRD_BENCH_RENDERER_BACKEND" "d3d11_shared" $savedEnv
+    Set-EnvVar "MRD_BENCH_BITRATE_BPS" ([string]([int64]$Profile.bitrate_mbps * 1000000)) $savedEnv
 
     $stdout = Join-Path $logsDir "host.stdout.log"
     $stderr = Join-Path $logsDir "host.stderr.log"
@@ -225,13 +234,13 @@ function Invoke-LocalCanaryProfile($Repo, $Profile, $GitCommit) {
     powershell -ExecutionPolicy Bypass -File (Join-Path $Repo "tests/benchmarks/scripts/summarize_transport_results.ps1") -RunDir $runDir
     $summaryPath = Join-Path $runDir "summary.json"
     $summary = Get-Content $summaryPath -Raw | ConvertFrom-Json
-    Convert-LocalSummaryToCanaryRow -Profile $Profile -Summary $summary -SummaryPath $summaryPath
+    Convert-LocalSummaryToCanaryRow -Profile $Profile -Summary $summary -SummaryPath $summaryPath -RequestedCodec $Codec
   } finally {
     Restore-EnvVars $savedEnv
   }
 }
 
-function Invoke-CrossCanaryProfile($Repo, $Profile, $OutputRoot, $TargetDeviceId, [int]$TimeoutMs, [string]$DisplayModePolicy, [string]$GitCommit, [string]$Codec, [string]$CodecProfile, [int]$BitDepth, [string]$ChromaSubsampling, [string]$PixelFormat, [bool]$HdrEnabled, [switch]$KeepTauriOpen) {
+function Invoke-CrossCanaryProfile($Repo, $Profile, $OutputRoot, $TargetDeviceId, [int]$TimeoutMs, [string]$DisplayModePolicy, [string]$GitCommit, [string]$Codec, [string]$CodecProfile, [int]$BitDepth, [string]$ChromaSubsampling, [string]$PixelFormat, [bool]$HdrEnabled, [string]$CaptureSourceId, [string]$CaptureSourceKind, [int]$RenderMaxFps, [switch]$NoRenderProfileCap, [switch]$KeepTauriOpen) {
   $reportPath = Join-Path $OutputRoot ("raw/cross-$($Profile.id).json")
   $logsDir = Join-Path $OutputRoot "logs"
   New-Item -ItemType Directory -Force -Path (Split-Path -Parent $reportPath), $logsDir | Out-Null
@@ -268,11 +277,23 @@ function Invoke-CrossCanaryProfile($Repo, $Profile, $OutputRoot, $TargetDeviceId
     Set-EnvVar "MRD_LAN_E2E_PROFILE_HDR_ENABLED" ([string]$HdrEnabled).ToLowerInvariant() $savedEnv
     Set-EnvVar "MRD_LAN_E2E_DISPLAY_MODE_POLICY" $DisplayModePolicy $savedEnv
     Set-EnvVar "MRD_LAN_E2E_EXPECTED_PEER_BUILD_ID" $GitCommit $savedEnv
+    if ($NoRenderProfileCap) {
+      Set-EnvVar "MRD_LAN_E2E_RENDER_PROFILE_CAP" "false" $savedEnv
+    }
+    if ($RenderMaxFps -gt 0) {
+      Set-EnvVar "MRD_LAN_RENDER_MAX_FPS" ([string]$RenderMaxFps) $savedEnv
+    }
     if ($Profile.adaptive) {
       Set-EnvVar "MRD_LAN_E2E_ADAPTIVE" "true" $savedEnv
     }
     if ($TargetDeviceId) {
       Set-EnvVar "MRD_LAN_E2E_TARGET_DEVICE_ID" $TargetDeviceId $savedEnv
+    }
+    if ($CaptureSourceId.Trim()) {
+      Set-EnvVar "MRD_LAN_E2E_CAPTURE_SOURCE_ID" $CaptureSourceId.Trim() $savedEnv
+    }
+    if ($CaptureSourceKind.Trim()) {
+      Set-EnvVar "MRD_LAN_E2E_CAPTURE_SOURCE_KIND" $CaptureSourceKind.Trim() $savedEnv
     }
 
     $stdout = Join-Path $logsDir "cross-$($Profile.id).stdout.log"
@@ -280,6 +301,7 @@ function Invoke-CrossCanaryProfile($Repo, $Profile, $OutputRoot, $TargetDeviceId
     $process = Start-Process -FilePath "cmd.exe" -ArgumentList @("/c", "pnpm", "tauri:dev") -WorkingDirectory (Join-Path $Repo "apps/Rdesk") -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WindowStyle Hidden -PassThru
 
     $deadline = (Get-Date).AddMilliseconds($TimeoutMs + 60000)
+    $processExitGraceDeadline = $null
     $report = $null
     while ((Get-Date) -lt $deadline) {
       if (Test-Path $reportPath) {
@@ -293,7 +315,12 @@ function Invoke-CrossCanaryProfile($Repo, $Profile, $OutputRoot, $TargetDeviceId
         }
       }
       if ($process.HasExited) {
-        break
+        if ($null -eq $processExitGraceDeadline) {
+          $processExitGraceDeadline = (Get-Date).AddSeconds(15)
+        }
+        if ((Get-Date) -ge $processExitGraceDeadline) {
+          break
+        }
       }
       Start-Sleep -Seconds 1
     }
@@ -323,6 +350,8 @@ function Invoke-CrossCanaryProfile($Repo, $Profile, $OutputRoot, $TargetDeviceId
     $row | Add-Member -Force -NotePropertyName "requested_chroma_subsampling" -NotePropertyValue $(if ($ChromaSubsampling.Trim()) { $ChromaSubsampling.Trim() } else { $null })
     $row | Add-Member -Force -NotePropertyName "requested_pixel_format" -NotePropertyValue $(if ($PixelFormat.Trim()) { $PixelFormat.Trim() } else { $null })
     $row | Add-Member -Force -NotePropertyName "requested_hdr_enabled" -NotePropertyValue $HdrEnabled
+    $row | Add-Member -Force -NotePropertyName "requested_capture_source_id" -NotePropertyValue $(if ($CaptureSourceId.Trim()) { $CaptureSourceId.Trim() } else { $null })
+    $row | Add-Member -Force -NotePropertyName "requested_capture_source_kind" -NotePropertyValue $(if ($CaptureSourceKind.Trim()) { $CaptureSourceKind.Trim() } else { $null })
     $row
   } finally {
     Restore-EnvVars $savedEnv
@@ -351,28 +380,41 @@ if ($ProfileId -and $ProfileId.Count -gt 0) {
 }
 
 if (-not $NoBuild) {
-  cargo build -p app -p mrd-service
+  $savedBuildEnv = @{}
+  try {
+    Set-EnvVar "GIT_COMMIT" $gitCommit $savedBuildEnv
+    cargo build -p app -p mrd-service
+  } finally {
+    Restore-EnvVars $savedBuildEnv
+  }
 }
 
 $localRows = @()
 if (-not $SkipLocal) {
   foreach ($profile in $profiles) {
     Write-Host "Running local canary $($profile.id)"
-    $localRows += Invoke-LocalCanaryProfile -Repo $repo -Profile $profile -GitCommit $gitCommit
+    $localRows += Invoke-LocalCanaryProfile -Repo $repo -Profile $profile -GitCommit $gitCommit -Codec $Codec
   }
 }
 
 $crossRows = @()
 if (-not $SkipCross) {
-  Invoke-LanDiscoveryDiagnostics -OutputRoot $outputRoot -TargetAddress $TargetAddress | Out-Null
-  $timeoutMs = ($DurationSecs * 1000) + 30000
+  $discoveryDiagnostics = Invoke-LanDiscoveryDiagnostics -OutputRoot $outputRoot -TargetAddress $TargetAddress
+  $effectiveTargetDeviceId = Resolve-PairedLanCanaryTargetDeviceId -Diagnostics $discoveryDiagnostics -RequestedTargetDeviceId $TargetDeviceId
+  if (-not $TargetDeviceId -and $effectiveTargetDeviceId) {
+    Write-Host "Auto-selected LAN target $effectiveTargetDeviceId from discovery diagnostics"
+  }
   foreach ($profile in $profiles) {
     Write-Host "Running cross-device canary $($profile.id)"
-    $crossRows += Invoke-CrossCanaryProfile -Repo $repo -Profile $profile -OutputRoot $outputRoot -TargetDeviceId $TargetDeviceId -TimeoutMs $timeoutMs -DisplayModePolicy $DisplayModePolicy -GitCommit $gitCommit -Codec $Codec -CodecProfile $CodecProfile -BitDepth $BitDepth -ChromaSubsampling $ChromaSubsampling -PixelFormat $PixelFormat -HdrEnabled $HdrEnabled -KeepTauriOpen:$KeepTauriOpen
+    $timeoutMs = ($profile.duration_secs * 1000) + 30000
+    if ($profile.adaptive) {
+      $timeoutMs += 90000
+    }
+    $crossRows += Invoke-CrossCanaryProfile -Repo $repo -Profile $profile -OutputRoot $outputRoot -TargetDeviceId $effectiveTargetDeviceId -TimeoutMs $timeoutMs -DisplayModePolicy $DisplayModePolicy -GitCommit $gitCommit -Codec $Codec -CodecProfile $CodecProfile -BitDepth $BitDepth -ChromaSubsampling $ChromaSubsampling -PixelFormat $PixelFormat -HdrEnabled $HdrEnabled -CaptureSourceId $CaptureSourceId -CaptureSourceKind $CaptureSourceKind -RenderMaxFps $RenderMaxFps -NoRenderProfileCap:$NoRenderProfileCap -KeepTauriOpen:$KeepTauriOpen
   }
 }
 
-$localReport = New-PairedLanCanaryReport -Mode "local" -Rows $localRows -GitCommit $gitCommit -Codec "h264"
+$localReport = New-PairedLanCanaryReport -Mode "local" -Rows $localRows -GitCommit $gitCommit -Codec $Codec
 $crossReport = New-PairedLanCanaryReport -Mode "cross" -Rows $crossRows -GitCommit $gitCommit -Codec $Codec
 $crossReport | Add-Member -Force -NotePropertyName "codec_request" -NotePropertyValue ([pscustomobject]@{
   codec = $Codec
@@ -382,6 +424,7 @@ $crossReport | Add-Member -Force -NotePropertyName "codec_request" -NoteProperty
   pixel_format = if ($PixelFormat.Trim()) { $PixelFormat.Trim() } else { $null }
   hdr_enabled = $HdrEnabled
 })
+$crossReport | Add-Member -Force -NotePropertyName "render_max_fps_override" -NotePropertyValue $(if ($RenderMaxFps -gt 0) { $RenderMaxFps } else { $null })
 $comparisonRows = @(Compare-PairedLanCanaryRows -LocalRows $localRows -CrossRows $crossRows -RatioThreshold $RatioThreshold)
 
 Write-CanaryJsonAndMarkdown -Report $localReport -JsonPath (Join-Path $outputRoot "local-canary-report.json") -MarkdownPath (Join-Path $outputRoot "local-canary-report.md") -Title "Local Canary Report"

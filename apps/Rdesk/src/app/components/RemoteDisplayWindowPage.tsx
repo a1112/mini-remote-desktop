@@ -894,7 +894,10 @@ export function RemoteDisplayWindowPage() {
         } else if (result.value?.render_mode === "d3d12_native") {
           setRenderMode("d3d11_native");
         } else if (result.value?.render_mode === "web") {
-          setRenderMode("web");
+          const contextSessionId = result.value.session_id;
+          if (!contextSessionId || isLocalPipelinePreviewSession(contextSessionId)) {
+            setRenderMode("web");
+          }
         }
       }
     });

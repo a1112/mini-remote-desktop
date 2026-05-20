@@ -666,6 +666,7 @@ const lanAutomationCommands: LanE2EAutomationCommands = {
   ipcRegisterDevice: commands.ipcRegisterDevice,
   ipcRefreshLanDiscovery: commands.ipcRefreshLanDiscovery,
   ipcStartLanRemoteSession: commands.ipcStartLanRemoteSession,
+  ipcUpdateMediaProfile: commands.ipcUpdateMediaProfile,
   ipcConfigureMediaAdaptation: commands.ipcConfigureMediaAdaptation,
   ipcListRemoteCaptureSources: commands.ipcListRemoteCaptureSources,
   ipcSelectRemoteCaptureSource: commands.ipcSelectRemoteCaptureSource,

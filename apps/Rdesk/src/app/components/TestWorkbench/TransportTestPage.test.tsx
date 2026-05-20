@@ -40,7 +40,7 @@ describe("TransportTestPage execution targets", () => {
       height: 720,
       process_id: 0,
     };
-    let probeSnapshotsServed = 0;
+    let decodedFrames = 58;
 
     mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
       if (command === "test_get_capabilities") {
@@ -86,13 +86,13 @@ describe("TransportTestPage execution targets", () => {
       if (command === "ipc_list_remote_display_modes") {
         return Promise.resolve([
           {
-            id: "display-1-720p-60",
+            id: "display-1:1280x720@30",
             source_id: "display-1",
             width: 1280,
             height: 720,
-            refresh_hz: 60,
+            refresh_hz: 30,
             bit_depth: 32,
-            is_current: false,
+            is_current: true,
           },
         ]);
       }
@@ -142,15 +142,12 @@ describe("TransportTestPage execution targets", () => {
         });
       }
       if (command === "ipc_probe_snapshot") {
-        probeSnapshotsServed += 1;
-        const framesDecoded = probeSnapshotsServed <= 1 ? 1 : 88;
-        const framesReceived = probeSnapshotsServed <= 1 ? 1 : 90;
-        const framesDropped = probeSnapshotsServed <= 1 ? 0 : 2;
+        decodedFrames += 30;
         return Promise.resolve({
           session_id: args?.sessionId,
-          frames_received: framesReceived,
-          frames_decoded: framesDecoded,
-          frames_dropped: framesDropped,
+          frames_received: decodedFrames + 2,
+          frames_decoded: decodedFrames,
+          frames_dropped: 2,
           current_fps: 30,
           bitrate_mbps: 5,
           media_probe_valid: true,
@@ -186,6 +183,9 @@ describe("TransportTestPage execution targets", () => {
             { stage: "present", p50_ms: 4.0, p95_ms: 7.0 },
           ],
         });
+      }
+      if (command === "ipc_update_media_profile") {
+        return Promise.resolve({ status: "selected" });
       }
       if (command === "ipc_stop_session") return Promise.resolve(args?.sessionId);
       return Promise.resolve(null);
@@ -224,6 +224,6 @@ describe("TransportTestPage execution targets", () => {
       "test_start_run",
       expect.anything()
     );
-    expect(await screen.findByText("88")).toBeInTheDocument();
+    expect(await screen.findByText("118", {}, { timeout: 3_000 })).toBeInTheDocument();
   });
 });

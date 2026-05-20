@@ -45,8 +45,9 @@ mod imp {
     use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 
     const H264_SHARED_ASYNC_SLOT_COUNT: usize = 2;
-    const HEVC_SHARED_ASYNC_SLOT_COUNT: usize = 2;
+    const HEVC_SHARED_ASYNC_SLOT_COUNT: usize = 3;
     const SHARED_INPUT_CACHE_LIMIT: usize = 8;
+    const HEVC_REMOTE_DESKTOP_MAX_KEYFRAME_INTERVAL_FRAMES: usize = 60;
 
     pub struct NvencH264Encoder {
         _device: ID3D11Device,
@@ -83,6 +84,10 @@ mod imp {
     }
 
     unsafe impl Send for NvencHevcEncoder {}
+
+    fn hevc_remote_desktop_keyframe_interval(fps: u32) -> usize {
+        (fps.max(1) as usize).min(HEVC_REMOTE_DESKTOP_MAX_KEYFRAME_INTERVAL_FRAMES)
+    }
 
     struct SharedInputResource {
         shared_handle: isize,
@@ -831,7 +836,7 @@ mod imp {
             preset.preset_cfg.profile_guid = profile_guid;
             preset.preset_cfg.rc_params.average_bit_rate = bitrate;
             preset.preset_cfg.frame_interval_p = 1;
-            preset.preset_cfg.gop_len = fps;
+            preset.preset_cfg.gop_len = hevc_remote_desktop_keyframe_interval(fps) as u32;
 
             let init = InitParams {
                 encode_guid: NV_ENC_CODEC_HEVC_GUID,
@@ -908,7 +913,8 @@ mod imp {
                 .ok_or_else(|| PipelineError::message("missing shared NVENC HEVC encode slot"))?;
             self.copy_shared_bgra_to_texture(&source_texture, &slot.texture)?;
 
-            let force_idr = self.frame_index == 0 || self.frame_index % self.fps as usize == 0;
+            let keyframe_interval = hevc_remote_desktop_keyframe_interval(self.fps);
+            let force_idr = self.frame_index == 0 || self.frame_index % keyframe_interval == 0;
             submit_encode_picture(
                 &mut self.encoder,
                 &slot.bitstream,
@@ -1153,7 +1159,8 @@ mod imp {
                 );
             }
 
-            let force_idr = self.frame_index == 0 || self.frame_index % self.fps as usize == 0;
+            let keyframe_interval = hevc_remote_desktop_keyframe_interval(self.fps);
+            let force_idr = self.frame_index == 0 || self.frame_index % keyframe_interval == 0;
             let bytes = encode_picture_with_sps_pps(
                 &mut self.encoder,
                 &self.bitstream,
@@ -1211,6 +1218,25 @@ mod imp {
             NVencTuningInfo::UltraLowLatency
         } else {
             NVencTuningInfo::LowLatency
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn hevc_shared_encode_queue_has_tail_latency_headroom() {
+            assert!(HEVC_SHARED_ASYNC_SLOT_COUNT >= 3);
+            assert!(HEVC_SHARED_ASYNC_SLOT_COUNT <= 4);
+        }
+
+        #[test]
+        fn hevc_remote_desktop_keyframe_interval_caps_high_refresh_recovery() {
+            assert_eq!(hevc_remote_desktop_keyframe_interval(30), 30);
+            assert_eq!(hevc_remote_desktop_keyframe_interval(60), 60);
+            assert_eq!(hevc_remote_desktop_keyframe_interval(144), 60);
+            assert_eq!(hevc_remote_desktop_keyframe_interval(249), 60);
         }
     }
 
@@ -1382,6 +1408,7 @@ mod imp {
             .and_then(|pixels| match frame.pixel_format {
                 FramePixelFormat::Bgra32 | FramePixelFormat::Rgba32 => pixels.checked_mul(4),
                 FramePixelFormat::Rgb24 => pixels.checked_mul(3),
+                FramePixelFormat::Nv12 => nv12_len(frame.width, frame.height),
             })
             .ok_or_else(|| PipelineError::message("frame buffer size overflow"))?;
 
@@ -1414,7 +1441,48 @@ mod imp {
                 }
                 Ok(bgra)
             }
+            FramePixelFormat::Nv12 => nv12_to_bgra(frame),
         }
+    }
+
+    fn nv12_len(width: usize, height: usize) -> Option<usize> {
+        if width % 2 != 0 || height % 2 != 0 {
+            return None;
+        }
+        let y_size = width.checked_mul(height)?;
+        y_size.checked_add(y_size / 2)
+    }
+
+    fn nv12_to_bgra(frame: &CapturedFrame) -> Result<Vec<u8>, PipelineError> {
+        let y_size = frame
+            .width
+            .checked_mul(frame.height)
+            .ok_or_else(|| PipelineError::message("NV12 luma byte size overflow"))?;
+        let mut bgra = Vec::with_capacity(
+            frame
+                .width
+                .checked_mul(frame.height)
+                .and_then(|pixels| pixels.checked_mul(4))
+                .ok_or_else(|| PipelineError::message("BGRA output byte size overflow"))?,
+        );
+        for y in 0..frame.height {
+            let y_row = y * frame.width;
+            let uv_row = y_size + (y / 2) * frame.width;
+            for x in 0..frame.width {
+                let luma = frame.data[y_row + x] as i32;
+                let uv_x = (x / 2) * 2;
+                let u = frame.data[uv_row + uv_x] as i32;
+                let v = frame.data[uv_row + uv_x + 1] as i32;
+                let c = (luma - 16).max(0);
+                let d = u - 128;
+                let e = v - 128;
+                let r = ((298 * c + 409 * e + 128) >> 8).clamp(0, 255) as u8;
+                let g = ((298 * c - 100 * d - 208 * e + 128) >> 8).clamp(0, 255) as u8;
+                let b = ((298 * c + 516 * d + 128) >> 8).clamp(0, 255) as u8;
+                bgra.extend_from_slice(&[b, g, r, 255]);
+            }
+        }
+        Ok(bgra)
     }
 }
 

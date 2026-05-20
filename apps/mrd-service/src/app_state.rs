@@ -11,7 +11,7 @@ use mrd_application::ports::SessionSnapshot;
 use mrd_ipc::{
     AttachedRenderSurface, AuditEvent, AuditLogQuery, CaptureSourceSelection,
     MediaAdaptationSnapshot, MediaPipelineSnapshot, MediaProfile, MediaProfileNegotiation,
-    MediaStageMetrics, MediaTestImpairmentSnapshot,
+    MediaSenderTransportSnapshot, MediaStageMetrics, MediaTestImpairmentSnapshot,
 };
 use mrd_proto::{DeviceId, SessionId};
 #[cfg(windows)]
@@ -20,6 +20,12 @@ use mrd_render::{BoxedRenderer, RenderFrame, RenderTarget, RendererFactory};
 use mrd_render_d3d11::D3d11RendererFactory;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+#[cfg(windows)]
+use std::sync::Mutex as StdMutex;
+#[cfg(windows)]
+use std::time::Duration;
+#[cfg(windows)]
+use tokio::time::Instant;
 use tokio::{sync::Mutex, task::AbortHandle};
 
 const MEDIA_STAGE_SAMPLE_LIMIT: usize = 240;
@@ -230,11 +236,14 @@ struct MediaPipelineState {
     codec_fallback_reason: Option<String>,
     queue_depth: u32,
     dropped_frames: u64,
+    render_presented_frames: u64,
     render_queue_replacements: u64,
     render_lock_drops: u64,
+    render_pacing_target_fps: Option<u32>,
     stage_samples: HashMap<String, VecDeque<f64>>,
     stage_summaries: HashMap<String, MediaStageMetrics>,
     test_impairment: Option<MediaTestImpairmentSnapshot>,
+    sender_transport: MediaSenderTransportSnapshot,
     adaptation: Option<MediaAdaptationSnapshot>,
 }
 
@@ -242,14 +251,16 @@ struct MediaPipelineState {
 #[derive(Debug, PartialEq, Eq)]
 pub enum MediaRenderQueueEnqueue {
     Start(RenderFrame),
-    Queued { replaced: bool },
+    Queued { replaced: bool, depth: usize },
 }
 
 #[cfg(windows)]
 #[derive(Default)]
 struct MediaRenderQueueState {
     running: bool,
-    pending: Option<RenderFrame>,
+    pending: VecDeque<RenderFrame>,
+    last_enqueue_at: Option<Instant>,
+    last_present_at: Option<Instant>,
 }
 
 #[cfg(windows)]
@@ -265,14 +276,33 @@ impl MediaRenderQueueRegistry {
         session_id: SessionId,
         frame: RenderFrame,
     ) -> MediaRenderQueueEnqueue {
+        self.enqueue_bounded(session_id, frame, 1)
+    }
+
+    pub fn enqueue_bounded(
+        &mut self,
+        session_id: SessionId,
+        frame: RenderFrame,
+        max_pending_frames: usize,
+    ) -> MediaRenderQueueEnqueue {
         let state = self.queues.entry(session_id).or_default();
         if !state.running {
             state.running = true;
             return MediaRenderQueueEnqueue::Start(frame);
         }
 
-        let replaced = state.pending.replace(frame).is_some();
-        MediaRenderQueueEnqueue::Queued { replaced }
+        let max_pending_frames = max_pending_frames.max(1);
+        let replaced = if state.pending.len() >= max_pending_frames {
+            state.pending.pop_front();
+            true
+        } else {
+            false
+        };
+        state.pending.push_back(frame);
+        MediaRenderQueueEnqueue::Queued {
+            replaced,
+            depth: state.pending.len(),
+        }
     }
 
     pub fn take_next_or_finish(&mut self, session_id: &SessionId) -> Option<RenderFrame> {
@@ -280,7 +310,7 @@ impl MediaRenderQueueRegistry {
             return None;
         };
 
-        if let Some(frame) = state.pending.take() {
+        if let Some(frame) = state.pending.pop_front() {
             return Some(frame);
         }
 
@@ -288,9 +318,59 @@ impl MediaRenderQueueRegistry {
         None
     }
 
+    pub fn pending_depth(&self, session_id: &SessionId) -> usize {
+        self.queues
+            .get(session_id)
+            .map_or(0, |state| state.pending.len())
+    }
+
+    pub fn pacing_delay(&self, session_id: &SessionId, fps: u32, now: Instant) -> Duration {
+        let Some(last_present_at) = self
+            .queues
+            .get(session_id)
+            .and_then(|state| state.last_present_at)
+        else {
+            return Duration::ZERO;
+        };
+        let Some(frame_interval) = render_frame_interval(fps) else {
+            return Duration::ZERO;
+        };
+        let elapsed = now
+            .checked_duration_since(last_present_at)
+            .unwrap_or(Duration::ZERO);
+        frame_interval.saturating_sub(elapsed)
+    }
+
+    pub fn record_enqueued(&mut self, session_id: &SessionId, at: Instant) -> Option<Duration> {
+        let state = self.queues.entry(session_id.clone()).or_default();
+        let gap = state
+            .last_enqueue_at
+            .and_then(|last| at.checked_duration_since(last));
+        state.last_enqueue_at = Some(at);
+        gap
+    }
+
+    pub fn record_presented(&mut self, session_id: &SessionId, at: Instant) -> Option<Duration> {
+        let state = self.queues.entry(session_id.clone()).or_default();
+        let gap = state
+            .last_present_at
+            .and_then(|last| at.checked_duration_since(last));
+        state.last_present_at = Some(at);
+        gap
+    }
+
     pub fn remove(&mut self, session_id: &SessionId) {
         self.queues.remove(session_id);
     }
+}
+
+#[cfg(windows)]
+fn render_frame_interval(fps: u32) -> Option<Duration> {
+    if fps == 0 {
+        return None;
+    }
+
+    Some(Duration::from_secs_f64(1.0 / f64::from(fps)))
 }
 
 impl MediaPipelineRegistry {
@@ -364,6 +444,11 @@ impl MediaPipelineRegistry {
         state.dropped_frames = state.dropped_frames.saturating_add(count);
     }
 
+    pub fn increment_render_presented_frames(&mut self, session_id: SessionId, count: u64) {
+        let state = self.pipelines.entry(session_id).or_default();
+        state.render_presented_frames = state.render_presented_frames.saturating_add(count);
+    }
+
     pub fn increment_render_queue_replacements(&mut self, session_id: SessionId, count: u64) {
         let state = self.pipelines.entry(session_id).or_default();
         state.render_queue_replacements = state.render_queue_replacements.saturating_add(count);
@@ -374,6 +459,13 @@ impl MediaPipelineRegistry {
         let state = self.pipelines.entry(session_id).or_default();
         state.render_lock_drops = state.render_lock_drops.saturating_add(count);
         state.dropped_frames = state.dropped_frames.saturating_add(count);
+    }
+
+    pub fn set_render_pacing_target_fps(&mut self, session_id: SessionId, fps: Option<u32>) {
+        self.pipelines
+            .entry(session_id)
+            .or_default()
+            .render_pacing_target_fps = fps;
     }
 
     pub fn record_stage_duration_ms(
@@ -420,6 +512,17 @@ impl MediaPipelineRegistry {
             .test_impairment = impairment;
     }
 
+    pub fn set_sender_transport(
+        &mut self,
+        session_id: SessionId,
+        transport: MediaSenderTransportSnapshot,
+    ) {
+        self.pipelines
+            .entry(session_id)
+            .or_default()
+            .sender_transport = transport;
+    }
+
     pub fn set_adaptation(
         &mut self,
         session_id: SessionId,
@@ -458,10 +561,15 @@ impl MediaPipelineRegistry {
             codec_fallback_reason: state.and_then(|state| state.codec_fallback_reason.clone()),
             queue_depth: state.map_or(0, |state| state.queue_depth),
             dropped_frames: state.map_or(0, |state| state.dropped_frames),
+            render_presented_frames: state.map_or(0, |state| state.render_presented_frames),
             render_queue_replacements: state.map_or(0, |state| state.render_queue_replacements),
             render_lock_drops: state.map_or(0, |state| state.render_lock_drops),
+            render_pacing_target_fps: state.and_then(|state| state.render_pacing_target_fps),
             stage_metrics,
             test_impairment: state.and_then(|state| state.test_impairment.clone()),
+            sender_transport: state
+                .map(|state| state.sender_transport.clone())
+                .unwrap_or_default(),
             adaptation: state.and_then(|state| state.adaptation.clone()),
         }
     }
@@ -473,9 +581,13 @@ impl MediaPipelineRegistry {
 
 /// Native renderer instances owned by mrd-service for receiver sessions.
 #[cfg(windows)]
+pub(crate) type SharedSurfaceRenderer = Arc<StdMutex<BoxedRenderer>>;
+
+/// Native renderer instances owned by mrd-service for receiver sessions.
+#[cfg(windows)]
 #[derive(Default)]
 pub struct MediaSurfaceRendererRegistry {
-    renderers: HashMap<(SessionId, String), BoxedRenderer>,
+    renderers: HashMap<(SessionId, String), SharedSurfaceRenderer>,
 }
 
 #[cfg(windows)]
@@ -498,7 +610,8 @@ impl MediaSurfaceRendererRegistry {
         renderer
             .attach_target(RenderTarget::WindowHandle(window_handle as isize))
             .map_err(|error| format!("attach D3D11 renderer target failed: {error}"))?;
-        self.renderers.insert(key, renderer);
+        self.renderers
+            .insert(key, Arc::new(StdMutex::new(renderer)));
         Ok(())
     }
 
@@ -512,17 +625,25 @@ impl MediaSurfaceRendererRegistry {
             .retain(|(renderer_session_id, _), _| renderer_session_id != session_id);
     }
 
+    pub fn renderers_for_session(&self, session_id: &SessionId) -> Vec<SharedSurfaceRenderer> {
+        self.renderers
+            .iter()
+            .filter_map(|((renderer_session_id, _), renderer)| {
+                (renderer_session_id == session_id).then(|| renderer.clone())
+            })
+            .collect()
+    }
+
     pub fn render_frame(
-        &mut self,
+        &self,
         session_id: &SessionId,
         frame: &RenderFrame,
     ) -> Result<usize, String> {
         let mut rendered = 0;
-        for ((renderer_session_id, _), renderer) in self.renderers.iter_mut() {
-            if renderer_session_id != session_id {
-                continue;
-            }
+        for renderer in self.renderers_for_session(session_id) {
             renderer
+                .lock()
+                .map_err(|_| "D3D11 renderer lock was poisoned".to_string())?
                 .upload_frame(frame.clone())
                 .map_err(|error| format!("upload frame to D3D11 renderer failed: {error}"))?;
             rendered += 1;
@@ -535,6 +656,19 @@ impl MediaSurfaceRendererRegistry {
             .keys()
             .filter(|(renderer_session_id, _)| renderer_session_id == session_id)
             .count()
+    }
+
+    #[cfg(test)]
+    pub fn insert_renderer_for_test(
+        &mut self,
+        session_id: &SessionId,
+        surface_id: impl Into<String>,
+        renderer: BoxedRenderer,
+    ) {
+        self.renderers.insert(
+            (session_id.clone(), surface_id.into()),
+            Arc::new(StdMutex::new(renderer)),
+        );
     }
 }
 
@@ -597,6 +731,9 @@ struct SessionProbeStats {
     frames_received: u64,
     frames_decoded: u64,
     frames_dropped: u64,
+    sequence_gap_drops: u64,
+    decode_error_drops: u64,
+    transient_drops: u64,
     bytes_received: u64,
     first_seen_ms: Option<u64>,
     last_seen_ms: Option<u64>,
@@ -674,9 +811,9 @@ impl ProbeRegistry {
         let stats = self.probes.entry(session_id.clone()).or_default();
         if let Some(last_sequence) = stats.last_media_sequence {
             if frame.sequence > last_sequence.saturating_add(1) {
-                stats.frames_dropped = stats
-                    .frames_dropped
-                    .saturating_add(frame.sequence.saturating_sub(last_sequence + 1));
+                let missing = frame.sequence.saturating_sub(last_sequence + 1);
+                stats.frames_dropped = stats.frames_dropped.saturating_add(missing);
+                stats.sequence_gap_drops = stats.sequence_gap_drops.saturating_add(missing);
             }
         }
 
@@ -707,9 +844,9 @@ impl ProbeRegistry {
         let stats = self.probes.entry(session_id.clone()).or_default();
         if let Some(last_sequence) = stats.last_media_sequence {
             if frame.sequence > last_sequence.saturating_add(1) {
-                stats.frames_dropped = stats
-                    .frames_dropped
-                    .saturating_add(frame.sequence.saturating_sub(last_sequence + 1));
+                let missing = frame.sequence.saturating_sub(last_sequence + 1);
+                stats.frames_dropped = stats.frames_dropped.saturating_add(missing);
+                stats.sequence_gap_drops = stats.sequence_gap_drops.saturating_add(missing);
             }
         }
 
@@ -752,6 +889,7 @@ impl ProbeRegistry {
         let stats = self.probes.entry(session_id.clone()).or_default();
         stats.frames_received = stats.frames_received.saturating_add(1);
         stats.frames_dropped = stats.frames_dropped.saturating_add(1);
+        stats.decode_error_drops = stats.decode_error_drops.saturating_add(1);
         stats.bytes_received = stats.bytes_received.saturating_add(bytes_received);
         stats.first_seen_ms.get_or_insert(now_ms);
         stats.last_seen_ms = Some(now_ms);
@@ -767,6 +905,7 @@ impl ProbeRegistry {
         let stats = self.probes.entry(session_id.clone()).or_default();
         stats.frames_received = stats.frames_received.saturating_add(1);
         stats.frames_dropped = stats.frames_dropped.saturating_add(1);
+        stats.transient_drops = stats.transient_drops.saturating_add(1);
         stats.bytes_received = stats.bytes_received.saturating_add(bytes_received);
         stats.first_seen_ms.get_or_insert(now_ms);
         stats.last_seen_ms = Some(now_ms);
@@ -779,6 +918,9 @@ impl ProbeRegistry {
                 frames_received: 0,
                 frames_decoded: 0,
                 frames_dropped: 0,
+                sequence_gap_drops: 0,
+                decode_error_drops: 0,
+                transient_drops: 0,
                 current_fps: None,
                 bitrate_mbps: None,
                 media_probe_valid: false,
@@ -819,6 +961,9 @@ impl ProbeRegistry {
             frames_received: stats.frames_received,
             frames_decoded: stats.frames_decoded,
             frames_dropped: stats.frames_dropped,
+            sequence_gap_drops: stats.sequence_gap_drops,
+            decode_error_drops: stats.decode_error_drops,
+            transient_drops: stats.transient_drops,
             current_fps,
             bitrate_mbps,
             media_probe_valid: stats.media_probe_valid,
@@ -1470,6 +1615,62 @@ mod tests {
     }
 
     #[test]
+    fn probe_registry_breaks_down_drop_causes() {
+        let mut registry = ProbeRegistry::default();
+        let session_id = SessionId("drop-breakdown-session".to_string());
+
+        registry.record_decoded_video_frame(
+            &session_id,
+            DecodedVideoFrameStats {
+                bytes_received: 2048,
+                sequence: 10,
+                timestamp_us: 100_000,
+                width: 1920,
+                height: 1080,
+                target_fps: 144,
+                target_bitrate_mbps: 64,
+                encoded_bytes: 2048,
+                format: "hevc_desktop_frame".to_string(),
+                pixel_format: "d3d11_shared_nv12".to_string(),
+                payload_hash: "fnv1a64:first".to_string(),
+                preview_width: None,
+                preview_height: None,
+                rgb24: None,
+            },
+            1_000,
+        );
+        registry.record_decoded_video_frame(
+            &session_id,
+            DecodedVideoFrameStats {
+                bytes_received: 2048,
+                sequence: 13,
+                timestamp_us: 120_000,
+                width: 1920,
+                height: 1080,
+                target_fps: 144,
+                target_bitrate_mbps: 64,
+                encoded_bytes: 2048,
+                format: "hevc_desktop_frame".to_string(),
+                pixel_format: "d3d11_shared_nv12".to_string(),
+                payload_hash: "fnv1a64:gap".to_string(),
+                preview_width: None,
+                preview_height: None,
+                rgb24: None,
+            },
+            1_020,
+        );
+        registry.record_probe_drop(&session_id, 512, 1_030, "decode failed");
+        registry.record_transient_frame_drop(&session_id, 256, 1_040);
+
+        let snapshot = registry.snapshot(&session_id);
+
+        assert_eq!(snapshot.frames_dropped, 4);
+        assert_eq!(snapshot.sequence_gap_drops, 2);
+        assert_eq!(snapshot.decode_error_drops, 1);
+        assert_eq!(snapshot.transient_drops, 1);
+    }
+
+    #[test]
     fn media_pipeline_registry_exposes_stage_metrics() {
         let mut registry = MediaPipelineRegistry::default();
         let session_id = SessionId("metrics-session".to_string());
@@ -1512,6 +1713,73 @@ mod tests {
         assert_eq!(snapshot.dropped_frames, 5);
         assert_eq!(snapshot.render_queue_replacements, 3);
         assert_eq!(snapshot.render_lock_drops, 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn media_surface_renderer_registry_returns_shared_session_renderers() {
+        use mrd_render::{RenderError, RenderTarget, RendererInstance, RendererSnapshot};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingRenderer {
+            uploads: Arc<AtomicUsize>,
+        }
+
+        impl RendererInstance for CountingRenderer {
+            fn attach_target(&mut self, _target: RenderTarget) -> Result<(), RenderError> {
+                Ok(())
+            }
+
+            fn upload_frame(&mut self, _frame: RenderFrame) -> Result<(), RenderError> {
+                self.uploads.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+
+            fn snapshot(&self) -> RendererSnapshot {
+                RendererSnapshot {
+                    attached_to_target: true,
+                    uploaded_frame_count: self.uploads.load(Ordering::SeqCst) as u64,
+                    last_width: 1,
+                    last_height: 1,
+                    last_pixel_format: None,
+                }
+            }
+        }
+
+        let mut registry = MediaSurfaceRendererRegistry::default();
+        let session_a = SessionId("surface-session-a".to_string());
+        let session_b = SessionId("surface-session-b".to_string());
+        let uploads_a = Arc::new(AtomicUsize::new(0));
+        let uploads_b = Arc::new(AtomicUsize::new(0));
+
+        registry.insert_renderer_for_test(
+            &session_a,
+            "surface-a",
+            Box::new(CountingRenderer {
+                uploads: uploads_a.clone(),
+            }),
+        );
+        registry.insert_renderer_for_test(
+            &session_b,
+            "surface-b",
+            Box::new(CountingRenderer {
+                uploads: uploads_b.clone(),
+            }),
+        );
+
+        let session_a_renderers = registry.renderers_for_session(&session_a);
+        assert_eq!(session_a_renderers.len(), 1);
+        drop(registry);
+
+        let frame = RenderFrame::from_rgb24(1, 1, vec![1, 2, 3]);
+        session_a_renderers[0]
+            .lock()
+            .expect("renderer lock")
+            .upload_frame(frame)
+            .expect("upload frame");
+
+        assert_eq!(uploads_a.load(Ordering::SeqCst), 1);
+        assert_eq!(uploads_b.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -1575,11 +1843,17 @@ mod tests {
         }
         assert_eq!(
             registry.enqueue_latest(session_id.clone(), second),
-            MediaRenderQueueEnqueue::Queued { replaced: false }
+            MediaRenderQueueEnqueue::Queued {
+                replaced: false,
+                depth: 1
+            }
         );
         assert_eq!(
             registry.enqueue_latest(session_id.clone(), third.clone()),
-            MediaRenderQueueEnqueue::Queued { replaced: true }
+            MediaRenderQueueEnqueue::Queued {
+                replaced: true,
+                depth: 1
+            }
         );
 
         assert_eq!(registry.take_next_or_finish(&session_id), Some(third));
@@ -1588,6 +1862,120 @@ mod tests {
             MediaRenderQueueEnqueue::Start(frame) => assert_eq!(frame, first),
             other => panic!("expected render worker restart, got {other:?}"),
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn media_render_queue_can_hold_a_small_paced_backlog() {
+        let mut registry = MediaRenderQueueRegistry::default();
+        let session_id = SessionId("render-queue-paced-session".to_string());
+        let first = RenderFrame::from_rgb24(1, 1, vec![1, 2, 3]);
+        let second = RenderFrame::from_rgb24(1, 1, vec![4, 5, 6]);
+        let third = RenderFrame::from_rgb24(1, 1, vec![7, 8, 9]);
+        let fourth = RenderFrame::from_rgb24(1, 1, vec![10, 11, 12]);
+        let fifth = RenderFrame::from_rgb24(1, 1, vec![13, 14, 15]);
+
+        match registry.enqueue_bounded(session_id.clone(), first.clone(), 3) {
+            MediaRenderQueueEnqueue::Start(frame) => assert_eq!(frame, first),
+            other => panic!("expected render worker start, got {other:?}"),
+        }
+        assert_eq!(
+            registry.enqueue_bounded(session_id.clone(), second.clone(), 3),
+            MediaRenderQueueEnqueue::Queued {
+                replaced: false,
+                depth: 1
+            }
+        );
+        assert_eq!(registry.pending_depth(&session_id), 1);
+        assert_eq!(
+            registry.enqueue_bounded(session_id.clone(), third.clone(), 3),
+            MediaRenderQueueEnqueue::Queued {
+                replaced: false,
+                depth: 2
+            }
+        );
+        assert_eq!(registry.pending_depth(&session_id), 2);
+        assert_eq!(
+            registry.enqueue_bounded(session_id.clone(), fourth.clone(), 3),
+            MediaRenderQueueEnqueue::Queued {
+                replaced: false,
+                depth: 3
+            }
+        );
+        assert_eq!(registry.pending_depth(&session_id), 3);
+        assert_eq!(
+            registry.enqueue_bounded(session_id.clone(), fifth.clone(), 3),
+            MediaRenderQueueEnqueue::Queued {
+                replaced: true,
+                depth: 3
+            }
+        );
+        assert_eq!(registry.pending_depth(&session_id), 3);
+
+        assert_eq!(registry.take_next_or_finish(&session_id), Some(third));
+        assert_eq!(registry.pending_depth(&session_id), 2);
+        assert_eq!(registry.take_next_or_finish(&session_id), Some(fourth));
+        assert_eq!(registry.pending_depth(&session_id), 1);
+        assert_eq!(registry.take_next_or_finish(&session_id), Some(fifth));
+        assert_eq!(registry.pending_depth(&session_id), 0);
+        assert_eq!(registry.take_next_or_finish(&session_id), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn media_render_queue_paces_early_frames_to_target_fps() {
+        use std::time::Duration;
+        use tokio::time::Instant;
+
+        let mut registry = MediaRenderQueueRegistry::default();
+        let session_id = SessionId("render-pacing-session".to_string());
+        let now = Instant::now();
+
+        assert_eq!(registry.pacing_delay(&session_id, 165, now), Duration::ZERO);
+
+        registry.record_presented(&session_id, now);
+        let early = now + Duration::from_millis(2);
+        let early_delay = registry.pacing_delay(&session_id, 165, early);
+        assert!(
+            early_delay >= Duration::from_millis(3),
+            "expected pacing delay for early frame, got {early_delay:?}"
+        );
+        assert!(
+            early_delay <= Duration::from_millis(5),
+            "expected bounded pacing delay for early frame, got {early_delay:?}"
+        );
+
+        let late = now + Duration::from_millis(10);
+        assert_eq!(
+            registry.pacing_delay(&session_id, 165, late),
+            Duration::ZERO
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn media_render_queue_records_enqueue_and_present_gaps() {
+        use std::time::Duration;
+        use tokio::time::Instant;
+
+        let mut registry = MediaRenderQueueRegistry::default();
+        let session_id = SessionId("render-gap-session".to_string());
+        let now = Instant::now();
+
+        assert_eq!(registry.record_enqueued(&session_id, now), None);
+        assert_eq!(
+            registry.record_enqueued(&session_id, now + Duration::from_millis(7)),
+            Some(Duration::from_millis(7))
+        );
+
+        assert_eq!(
+            registry.record_presented(&session_id, now + Duration::from_millis(1)),
+            None
+        );
+        assert_eq!(
+            registry.record_presented(&session_id, now + Duration::from_millis(9)),
+            Some(Duration::from_millis(8))
+        );
     }
 
     #[test]

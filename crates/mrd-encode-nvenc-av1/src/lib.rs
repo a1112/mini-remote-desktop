@@ -670,8 +670,55 @@ mod imp {
                 }
                 bgra
             }
+            FramePixelFormat::Nv12 => nv12_to_bgra(frame, expected_len)?,
         };
 
+        Ok(bgra)
+    }
+
+    fn nv12_len(width: usize, height: usize) -> Option<usize> {
+        if width % 2 != 0 || height % 2 != 0 {
+            return None;
+        }
+        let y_size = width.checked_mul(height)?;
+        y_size.checked_add(y_size / 2)
+    }
+
+    fn nv12_to_bgra(
+        frame: &CapturedFrame,
+        expected_output_len: usize,
+    ) -> Result<Vec<u8>, PipelineError> {
+        let expected_input_len = nv12_len(frame.width, frame.height)
+            .ok_or_else(|| PipelineError::message("NV12 frame size overflow or odd dimensions"))?;
+        if frame.data.len() != expected_input_len {
+            return Err(PipelineError::message(format!(
+                "NV12 frame bytes mismatch: expected {expected_input_len}, got {}",
+                frame.data.len()
+            )));
+        }
+
+        let y_size = frame
+            .width
+            .checked_mul(frame.height)
+            .ok_or_else(|| PipelineError::message("NV12 luma byte size overflow"))?;
+        let mut bgra = Vec::with_capacity(expected_output_len);
+        for y in 0..frame.height {
+            let y_row = y * frame.width;
+            let uv_row = y_size + (y / 2) * frame.width;
+            for x in 0..frame.width {
+                let luma = frame.data[y_row + x] as i32;
+                let uv_x = (x / 2) * 2;
+                let u = frame.data[uv_row + uv_x] as i32;
+                let v = frame.data[uv_row + uv_x + 1] as i32;
+                let c = (luma - 16).max(0);
+                let d = u - 128;
+                let e = v - 128;
+                let r = ((298 * c + 409 * e + 128) >> 8).clamp(0, 255) as u8;
+                let g = ((298 * c - 100 * d - 208 * e + 128) >> 8).clamp(0, 255) as u8;
+                let b = ((298 * c + 516 * d + 128) >> 8).clamp(0, 255) as u8;
+                bgra.extend_from_slice(&[b, g, r, 255]);
+            }
+        }
         Ok(bgra)
     }
 }

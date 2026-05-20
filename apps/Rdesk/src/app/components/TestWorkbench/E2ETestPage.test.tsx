@@ -474,7 +474,13 @@ function installSuccessfulLanAutomationMock() {
     if (command === "ipc_media_pipeline_snapshot") {
       return Promise.resolve({
         session_id: "lan-e2e-agent-device-1000",
-        attached_surfaces: [],
+        attached_surfaces: [
+          {
+            surface_id: "surface-1",
+            backend: "d3d11",
+            window_handle: 1234,
+          },
+        ],
         active_decoder: "nvdec",
         active_renderer: "d3d11",
         queue_depth: 1,
