@@ -587,7 +587,7 @@ fn downshift_confirmation_windows_required(observation: MediaAdaptationObservati
 
     let frame_budget_ms = 1000.0 / observation.target_fps.max(1) as f64;
     let perceptual_budget_ms = frame_budget_ms * 1.5;
-    let has_supporting_stress = observation.drop_ratio > 0.005
+    let has_supporting_stress = observation.drop_ratio > 0.03
         || observation.queue_depth > 1
         || observation
             .decode_p95_ms
@@ -615,6 +615,11 @@ fn downshift_reason(observation: MediaAdaptationObservation) -> Option<String> {
     }
     let frame_budget_ms = 1000.0 / observation.target_fps.max(1) as f64;
     if observation.observed_fps < observation.target_fps as f32 * 0.85 {
+        if observation.target_fps > ADAPTATION_SAFE_START_MIN_FPS
+            && !low_fps_has_supporting_high_refresh_stress(observation)
+        {
+            return None;
+        }
         return Some(format!(
             "fps {:.1} below 85% of target {}",
             observation.observed_fps, observation.target_fps
@@ -682,6 +687,25 @@ fn downshift_reason(observation: MediaAdaptationObservation) -> Option<String> {
         }
     }
     None
+}
+
+fn low_fps_has_supporting_high_refresh_stress(observation: MediaAdaptationObservation) -> bool {
+    let frame_budget_ms = 1000.0 / observation.target_fps.max(1) as f64;
+    let perceptual_budget_ms = frame_budget_ms * 1.5;
+    observation.drop_ratio > 0.03
+        || observation.queue_depth > 1
+        || observation
+            .decode_p95_ms
+            .is_some_and(|p95| p95 > frame_budget_ms)
+        || observation
+            .render_p95_ms
+            .is_some_and(|p95| p95 > frame_budget_ms)
+        || observation
+            .present_gap_p95_ms
+            .is_some_and(|p95| p95 > perceptual_budget_ms)
+        || observation
+            .receive_p95_ms
+            .is_some_and(|p95| p95 > perceptual_budget_ms)
 }
 
 fn observation_is_healthy(observation: MediaAdaptationObservation) -> bool {
@@ -1406,7 +1430,7 @@ mod tests {
         let observation = MediaAdaptationObservation {
             observed_fps: 90.0,
             target_fps: 144,
-            drop_ratio: 0.0,
+            drop_ratio: 0.04,
             queue_depth: 0,
             decode_p95_ms: Some(2.0),
             render_p95_ms: Some(2.0),
@@ -1630,7 +1654,7 @@ mod tests {
     }
 
     #[test]
-    fn transient_low_fps_downshift_waits_for_confirmation() {
+    fn transient_high_refresh_low_fps_without_qoe_stress_holds() {
         let observation = MediaAdaptationObservation {
             observed_fps: 120.0,
             target_fps: 165,
@@ -1645,34 +1669,112 @@ mod tests {
         let mut pending_reason = None;
         let mut pending_windows = 0;
 
+        assert_eq!(downshift_reason(observation), None);
+        assert!(update_downshift_confirmation(
+            observation,
+            &mut pending_reason,
+            &mut pending_windows
+        ));
+        assert_eq!(pending_windows, 0);
+        assert!(update_downshift_confirmation(
+            observation,
+            &mut pending_reason,
+            &mut pending_windows
+        ));
+        assert_eq!(pending_windows, 0);
+        assert!(update_downshift_confirmation(
+            observation,
+            &mut pending_reason,
+            &mut pending_windows
+        ));
+        assert_eq!(pending_windows, 0);
+        assert!(update_downshift_confirmation(
+            observation,
+            &mut pending_reason,
+            &mut pending_windows
+        ));
+        assert_eq!(pending_windows, 0);
+    }
+
+    #[test]
+    fn high_refresh_low_fps_with_light_sequence_gap_holds() {
+        let observation = MediaAdaptationObservation {
+            observed_fps: 78.4,
+            target_fps: 144,
+            drop_ratio: 0.0083,
+            queue_depth: 0,
+            decode_p95_ms: Some(1.8),
+            render_p95_ms: Some(0.3),
+            receive_p95_ms: Some(0.1),
+            present_gap_p95_ms: Some(9.4),
+            no_valid_frames: false,
+        };
+        let mut pending_reason = None;
+        let mut pending_windows = 0;
+
+        assert_eq!(downshift_reason(observation), None);
+        assert!(update_downshift_confirmation(
+            observation,
+            &mut pending_reason,
+            &mut pending_windows
+        ));
+        assert_eq!(pending_windows, 0);
+        assert!(update_downshift_confirmation(
+            observation,
+            &mut pending_reason,
+            &mut pending_windows
+        ));
+        assert_eq!(pending_windows, 0);
+        assert!(update_downshift_confirmation(
+            observation,
+            &mut pending_reason,
+            &mut pending_windows
+        ));
+        assert_eq!(pending_windows, 0);
+        assert!(update_downshift_confirmation(
+            observation,
+            &mut pending_reason,
+            &mut pending_windows
+        ));
+        assert_eq!(pending_windows, 0);
+    }
+
+    #[test]
+    fn high_refresh_low_fps_with_material_drop_stress_confirms_after_two_windows() {
+        let observation = MediaAdaptationObservation {
+            observed_fps: 78.4,
+            target_fps: 144,
+            drop_ratio: 0.04,
+            queue_depth: 0,
+            decode_p95_ms: Some(1.8),
+            render_p95_ms: Some(0.3),
+            receive_p95_ms: Some(0.1),
+            present_gap_p95_ms: Some(9.4),
+            no_valid_frames: false,
+        };
+        let mut pending_reason = None;
+        let mut pending_windows = 0;
+
+        assert_eq!(
+            downshift_reason(observation),
+            Some("fps 78.4 below 85% of target 144".to_string())
+        );
         assert!(!update_downshift_confirmation(
             observation,
             &mut pending_reason,
             &mut pending_windows
         ));
         assert_eq!(pending_windows, 1);
-        assert!(!update_downshift_confirmation(
-            observation,
-            &mut pending_reason,
-            &mut pending_windows
-        ));
-        assert_eq!(pending_windows, 2);
-        assert!(!update_downshift_confirmation(
-            observation,
-            &mut pending_reason,
-            &mut pending_windows
-        ));
-        assert_eq!(pending_windows, 3);
         assert!(update_downshift_confirmation(
             observation,
             &mut pending_reason,
             &mut pending_windows
         ));
-        assert_eq!(pending_windows, 4);
+        assert_eq!(pending_windows, 2);
     }
 
     #[test]
-    fn severe_fps_without_drop_or_perceptual_stress_waits_for_confirmation() {
+    fn severe_fps_without_drop_or_perceptual_stress_holds() {
         let observation = MediaAdaptationObservation {
             observed_fps: 70.0,
             target_fps: 165,
@@ -1687,34 +1789,35 @@ mod tests {
         let mut pending_reason = None;
         let mut pending_windows = 0;
 
-        assert!(!update_downshift_confirmation(
-            observation,
-            &mut pending_reason,
-            &mut pending_windows
-        ));
-        assert_eq!(pending_windows, 1);
-        assert!(!update_downshift_confirmation(
-            observation,
-            &mut pending_reason,
-            &mut pending_windows
-        ));
-        assert_eq!(pending_windows, 2);
-        assert!(!update_downshift_confirmation(
-            observation,
-            &mut pending_reason,
-            &mut pending_windows
-        ));
-        assert_eq!(pending_windows, 3);
+        assert_eq!(downshift_reason(observation), None);
         assert!(update_downshift_confirmation(
             observation,
             &mut pending_reason,
             &mut pending_windows
         ));
-        assert_eq!(pending_windows, 4);
+        assert_eq!(pending_windows, 0);
+        assert!(update_downshift_confirmation(
+            observation,
+            &mut pending_reason,
+            &mut pending_windows
+        ));
+        assert_eq!(pending_windows, 0);
+        assert!(update_downshift_confirmation(
+            observation,
+            &mut pending_reason,
+            &mut pending_windows
+        ));
+        assert_eq!(pending_windows, 0);
+        assert!(update_downshift_confirmation(
+            observation,
+            &mut pending_reason,
+            &mut pending_windows
+        ));
+        assert_eq!(pending_windows, 0);
     }
 
     #[test]
-    fn low_fps_with_single_paced_queue_frame_waits_for_fps_only_confirmation() {
+    fn low_fps_with_single_paced_queue_frame_holds() {
         let observation = MediaAdaptationObservation {
             observed_fps: 70.0,
             target_fps: 165,
@@ -1729,30 +1832,31 @@ mod tests {
         let mut pending_reason = None;
         let mut pending_windows = 0;
 
-        assert!(!update_downshift_confirmation(
-            observation,
-            &mut pending_reason,
-            &mut pending_windows
-        ));
-        assert_eq!(pending_windows, 1);
-        assert!(!update_downshift_confirmation(
-            observation,
-            &mut pending_reason,
-            &mut pending_windows
-        ));
-        assert_eq!(pending_windows, 2);
-        assert!(!update_downshift_confirmation(
-            observation,
-            &mut pending_reason,
-            &mut pending_windows
-        ));
-        assert_eq!(pending_windows, 3);
+        assert_eq!(downshift_reason(observation), None);
         assert!(update_downshift_confirmation(
             observation,
             &mut pending_reason,
             &mut pending_windows
         ));
-        assert_eq!(pending_windows, 4);
+        assert_eq!(pending_windows, 0);
+        assert!(update_downshift_confirmation(
+            observation,
+            &mut pending_reason,
+            &mut pending_windows
+        ));
+        assert_eq!(pending_windows, 0);
+        assert!(update_downshift_confirmation(
+            observation,
+            &mut pending_reason,
+            &mut pending_windows
+        ));
+        assert_eq!(pending_windows, 0);
+        assert!(update_downshift_confirmation(
+            observation,
+            &mut pending_reason,
+            &mut pending_windows
+        ));
+        assert_eq!(pending_windows, 0);
     }
 
     #[test]

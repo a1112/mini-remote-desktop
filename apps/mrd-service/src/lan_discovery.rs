@@ -66,9 +66,9 @@ const LAN_QUIC_FALLBACK_DATAGRAM_BYTES: usize = 1_200;
 // Keep the default media fragment below common LAN/QUIC path MTU headroom.
 // Larger datagrams reduce sender P95 but raised cross-device frame drop ratio.
 const LAN_QUIC_LAN_HIGH_QUALITY_DATAGRAM_BYTES: usize = LAN_QUIC_FALLBACK_DATAGRAM_BYTES;
-const LAN_QUIC_RELIABLE_WHOLE_FRAME_MIN_BITRATE_MBPS: u32 = 80;
-const LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_BITRATE_MBPS: u32 = 120;
-const LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_FPS: u32 = 120;
+const LAN_QUIC_RELIABLE_WHOLE_FRAME_MIN_BITRATE_MBPS: u32 = 64;
+const LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_BITRATE_MBPS: u32 = 64;
+const LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_FPS: u32 = 144;
 const LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES: usize = 4 * 1024 * 1024;
 const LAN_QUIC_RELIABLE_MEDIA_RETRY_DELAY: Duration = Duration::from_millis(10);
 const LAN_QUIC_DATAGRAM_SEND_BUDGET_MIN_BITRATE_MBPS: u32 = 80;
@@ -8561,7 +8561,7 @@ mod tests {
     }
 
     #[test]
-    fn high_quality_reliable_media_prefers_per_message_streams_to_reduce_hol() {
+    fn high_refresh_reliable_media_prefers_per_message_streams_to_reduce_hol() {
         let high_bitrate = MediaProfile {
             width: 2560,
             height: 1600,
@@ -8574,7 +8574,7 @@ mod tests {
             width: 2560,
             height: 1440,
             fps: 144,
-            bitrate_mbps: 80,
+            bitrate_mbps: 64,
             codec: "hevc".to_string(),
             ..MediaProfile::default()
         };
@@ -8754,7 +8754,7 @@ mod tests {
     }
 
     #[test]
-    fn high_refresh_stability_tier_keeps_delta_frames_on_datagrams_by_default() {
+    fn high_refresh_stability_tier_uses_reliable_whole_frame_by_default() {
         let stability_tier = MediaProfile {
             width: 2560,
             height: 1440,
@@ -8764,7 +8764,7 @@ mod tests {
             ..MediaProfile::default()
         };
 
-        assert!(!should_send_access_unit_as_reliable_frame(
+        assert!(should_send_access_unit_as_reliable_frame(
             true,
             true,
             64,
@@ -8774,7 +8774,7 @@ mod tests {
     }
 
     #[test]
-    fn ultra_high_bitrate_uses_reliable_whole_frame_by_default() {
+    fn high_refresh_high_quality_uses_reliable_whole_frame_by_default() {
         let ultra_high = MediaProfile {
             width: 2560,
             height: 1600,
@@ -8795,7 +8795,7 @@ mod tests {
             width: 2560,
             height: 1440,
             fps: 144,
-            bitrate_mbps: 80,
+            bitrate_mbps: 64,
             codec: "hevc".to_string(),
             ..MediaProfile::default()
         };
@@ -8814,7 +8814,7 @@ mod tests {
             &render_capped,
             None
         ));
-        assert!(!should_send_access_unit_as_reliable_frame(
+        assert!(should_send_access_unit_as_reliable_frame(
             true,
             true,
             64,
