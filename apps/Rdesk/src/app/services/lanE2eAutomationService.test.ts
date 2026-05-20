@@ -884,6 +884,114 @@ describe("runLanE2EAutomation", () => {
     expect(restoreRemoteDisplayMode).toHaveBeenCalledWith("lan-e2e-test-session");
   });
 
+  it("selects the display source that can satisfy a high-refresh requested profile", async () => {
+    const sources = [
+      {
+        id: "display-shared-144",
+        platform: "windows",
+        source_kind: "display_shared",
+        title: "DISPLAY0",
+        class_name: "Monitor",
+        width: 2560,
+        height: 1440,
+        process_id: 0,
+        app_name: null,
+      },
+      {
+        id: "display-shared-180",
+        platform: "windows",
+        source_kind: "display_shared",
+        title: "DISPLAY1",
+        class_name: "Monitor",
+        width: 2560,
+        height: 1440,
+        process_id: 0,
+        app_name: null,
+      },
+    ];
+    const commands = withCaptureSourceCommands(createCommands(), sources);
+    let selectedSourceId = "";
+    commands.ipcSelectRemoteCaptureSource.mockImplementation((_sessionId, sourceId) => {
+      selectedSourceId = sourceId;
+      const selectedSource = sources.find((source) => source.id === sourceId) ?? sources[0];
+      return Promise.resolve(ok({
+        session_id: "lan-e2e-test-session",
+        source: selectedSource,
+        status: "selected",
+        reason: null,
+      }));
+    });
+    commands.ipcListRemoteDisplayModes = vi.fn().mockImplementation(() =>
+      Promise.resolve(ok([
+        {
+          id: selectedSourceId === "display-shared-180" ? "mode-180" : "mode-144",
+          source_id: selectedSourceId,
+          width: 2560,
+          height: 1440,
+          refresh_hz: selectedSourceId === "display-shared-180" ? 180 : 144,
+          bit_depth: 32,
+          is_current: true,
+        },
+      ]))
+    );
+    commands.ipcSetRemoteDisplayMode = vi.fn().mockImplementation((_sessionId, mode) =>
+      Promise.resolve(ok({
+        session_id: "lan-e2e-test-session",
+        requested: mode,
+        previous: null,
+        active: { ...mode, is_current: true },
+        status: "changed",
+        reason: null,
+        restore_required: true,
+      }))
+    );
+    commands.ipcProbeSnapshot = vi.fn().mockResolvedValue(ok({
+      session_id: "unused",
+      frames_received: 4,
+      frames_decoded: 3,
+      frames_dropped: 0,
+      current_fps: 180,
+      bitrate_mbps: 120,
+      media_probe_valid: true,
+      media_probe_format: "compressed_h264_test_pattern",
+      media_probe_width: 2560,
+      media_probe_height: 1440,
+      media_probe_target_fps: 180,
+      media_probe_target_bitrate_mbps: 120,
+      media_probe_payload_bytes: 55555,
+      last_media_sequence: 3,
+      last_media_timestamp_us: 123456,
+      last_media_payload_hash: "fnv1a64:abc123",
+      last_error: null,
+    }));
+
+    const result = await runLanE2EAutomation(commands, {
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      displayModePolicy: "temporary",
+      requestedProfile: {
+        width: 2560,
+        height: 1440,
+        fps: 180,
+        bitrate_mbps: 120,
+        codec: "hevc",
+      },
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => "lan-e2e-test-session",
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.captureSource?.id).toBe("display-shared-180");
+    expect(commands.ipcSetRemoteDisplayMode).toHaveBeenCalledWith(
+      "lan-e2e-test-session",
+      expect.objectContaining({ id: "mode-180" }),
+      true
+    );
+  });
+
   it("reuses the selected capture source when post-display-mode refresh times out", async () => {
     const commands = withCaptureSourceCommands(createCommands());
     commands.ipcListRemoteCaptureSources

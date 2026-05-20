@@ -16,6 +16,8 @@ param(
   [string]$ChromaSubsampling = "",
   [string]$PixelFormat = "",
   [bool]$HdrEnabled = $false,
+  [string]$CaptureSourceId = "",
+  [string]$CaptureSourceKind = "display_shared",
   [switch]$SkipLocal,
   [switch]$SkipCross,
   [switch]$NoBuild,
@@ -236,7 +238,7 @@ function Invoke-LocalCanaryProfile($Repo, $Profile, $GitCommit, [string]$Codec) 
   }
 }
 
-function Invoke-CrossCanaryProfile($Repo, $Profile, $OutputRoot, $TargetDeviceId, [int]$TimeoutMs, [string]$DisplayModePolicy, [string]$GitCommit, [string]$Codec, [string]$CodecProfile, [int]$BitDepth, [string]$ChromaSubsampling, [string]$PixelFormat, [bool]$HdrEnabled, [switch]$KeepTauriOpen) {
+function Invoke-CrossCanaryProfile($Repo, $Profile, $OutputRoot, $TargetDeviceId, [int]$TimeoutMs, [string]$DisplayModePolicy, [string]$GitCommit, [string]$Codec, [string]$CodecProfile, [int]$BitDepth, [string]$ChromaSubsampling, [string]$PixelFormat, [bool]$HdrEnabled, [string]$CaptureSourceId, [string]$CaptureSourceKind, [switch]$KeepTauriOpen) {
   $reportPath = Join-Path $OutputRoot ("raw/cross-$($Profile.id).json")
   $logsDir = Join-Path $OutputRoot "logs"
   New-Item -ItemType Directory -Force -Path (Split-Path -Parent $reportPath), $logsDir | Out-Null
@@ -278,6 +280,12 @@ function Invoke-CrossCanaryProfile($Repo, $Profile, $OutputRoot, $TargetDeviceId
     }
     if ($TargetDeviceId) {
       Set-EnvVar "MRD_LAN_E2E_TARGET_DEVICE_ID" $TargetDeviceId $savedEnv
+    }
+    if ($CaptureSourceId.Trim()) {
+      Set-EnvVar "MRD_LAN_E2E_CAPTURE_SOURCE_ID" $CaptureSourceId.Trim() $savedEnv
+    }
+    if ($CaptureSourceKind.Trim()) {
+      Set-EnvVar "MRD_LAN_E2E_CAPTURE_SOURCE_KIND" $CaptureSourceKind.Trim() $savedEnv
     }
 
     $stdout = Join-Path $logsDir "cross-$($Profile.id).stdout.log"
@@ -334,6 +342,8 @@ function Invoke-CrossCanaryProfile($Repo, $Profile, $OutputRoot, $TargetDeviceId
     $row | Add-Member -Force -NotePropertyName "requested_chroma_subsampling" -NotePropertyValue $(if ($ChromaSubsampling.Trim()) { $ChromaSubsampling.Trim() } else { $null })
     $row | Add-Member -Force -NotePropertyName "requested_pixel_format" -NotePropertyValue $(if ($PixelFormat.Trim()) { $PixelFormat.Trim() } else { $null })
     $row | Add-Member -Force -NotePropertyName "requested_hdr_enabled" -NotePropertyValue $HdrEnabled
+    $row | Add-Member -Force -NotePropertyName "requested_capture_source_id" -NotePropertyValue $(if ($CaptureSourceId.Trim()) { $CaptureSourceId.Trim() } else { $null })
+    $row | Add-Member -Force -NotePropertyName "requested_capture_source_kind" -NotePropertyValue $(if ($CaptureSourceKind.Trim()) { $CaptureSourceKind.Trim() } else { $null })
     $row
   } finally {
     Restore-EnvVars $savedEnv
@@ -362,7 +372,13 @@ if ($ProfileId -and $ProfileId.Count -gt 0) {
 }
 
 if (-not $NoBuild) {
-  cargo build -p app -p mrd-service
+  $savedBuildEnv = @{}
+  try {
+    Set-EnvVar "GIT_COMMIT" $gitCommit $savedBuildEnv
+    cargo build -p app -p mrd-service
+  } finally {
+    Restore-EnvVars $savedBuildEnv
+  }
 }
 
 $localRows = @()
@@ -386,7 +402,7 @@ if (-not $SkipCross) {
     if ($profile.adaptive) {
       $timeoutMs += 90000
     }
-    $crossRows += Invoke-CrossCanaryProfile -Repo $repo -Profile $profile -OutputRoot $outputRoot -TargetDeviceId $effectiveTargetDeviceId -TimeoutMs $timeoutMs -DisplayModePolicy $DisplayModePolicy -GitCommit $gitCommit -Codec $Codec -CodecProfile $CodecProfile -BitDepth $BitDepth -ChromaSubsampling $ChromaSubsampling -PixelFormat $PixelFormat -HdrEnabled $HdrEnabled -KeepTauriOpen:$KeepTauriOpen
+    $crossRows += Invoke-CrossCanaryProfile -Repo $repo -Profile $profile -OutputRoot $outputRoot -TargetDeviceId $effectiveTargetDeviceId -TimeoutMs $timeoutMs -DisplayModePolicy $DisplayModePolicy -GitCommit $gitCommit -Codec $Codec -CodecProfile $CodecProfile -BitDepth $BitDepth -ChromaSubsampling $ChromaSubsampling -PixelFormat $PixelFormat -HdrEnabled $HdrEnabled -CaptureSourceId $CaptureSourceId -CaptureSourceKind $CaptureSourceKind -KeepTauriOpen:$KeepTauriOpen
   }
 }
 

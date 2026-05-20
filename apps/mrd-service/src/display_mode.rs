@@ -12,6 +12,19 @@ pub fn list_display_modes(source_id: Option<&str>) -> Result<Vec<DisplayMode>> {
     list_platform_display_modes(source_index)
 }
 
+pub fn highest_current_refresh_hz() -> Option<u32> {
+    select_highest_current_refresh_hz(&list_current_platform_display_modes().ok()?)
+}
+
+pub fn current_display_modes() -> Result<Vec<DisplayMode>> {
+    list_current_platform_display_modes()
+}
+
+pub fn display_device_name_for_source_id(source_id: &str) -> Result<String> {
+    let source_index = parse_display_source_index(Some(source_id))?.unwrap_or(0);
+    platform_display_device_name(source_index)
+}
+
 pub fn set_display_mode(mode: &DisplayMode) -> Result<(Option<DisplayMode>, DisplayMode)> {
     let source_index = parse_display_source_index(mode.source_id.as_deref())?.unwrap_or(0);
     let previous = current_platform_display_mode(source_index).ok();
@@ -78,6 +91,28 @@ fn display_mode_score(
     let width_delta = mode.width.abs_diff(width);
     let refresh_delta = mode.refresh_hz.abs_diff(refresh_hz);
     (aspect_delta, height_delta, width_delta, refresh_delta)
+}
+
+fn select_highest_current_refresh_hz(modes: &[DisplayMode]) -> Option<u32> {
+    modes
+        .iter()
+        .filter(|mode| mode.is_current && mode.refresh_hz > 0)
+        .map(|mode| mode.refresh_hz)
+        .max()
+}
+
+fn display_device_name_from_raw(raw: &[u16]) -> Option<String> {
+    let end = raw.iter().position(|unit| *unit == 0).unwrap_or(raw.len());
+    if end == 0 {
+        return None;
+    }
+    let value = String::from_utf16_lossy(&raw[..end]);
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 #[cfg(windows)]
@@ -160,6 +195,21 @@ fn list_platform_display_modes(source_index: Option<u32>) -> Result<Vec<DisplayM
 }
 
 #[cfg(windows)]
+fn list_current_platform_display_modes() -> Result<Vec<DisplayMode>> {
+    let mut modes = Vec::new();
+    for source_index in 0..32 {
+        match current_platform_display_mode(source_index) {
+            Ok(mode) => modes.push(mode),
+            Err(_) if source_index == 0 => {
+                return Err(anyhow::anyhow!("no Windows displays found"))
+            }
+            Err(_) => break,
+        }
+    }
+    Ok(modes)
+}
+
+#[cfg(windows)]
 fn current_platform_display_mode(source_index: u32) -> Result<DisplayMode> {
     let modes = list_platform_display_modes(Some(source_index))?;
     modes
@@ -225,8 +275,20 @@ fn display_device(source_index: u32) -> Result<windows::Win32::Graphics::Gdi::DI
     Ok(device)
 }
 
+#[cfg(windows)]
+fn platform_display_device_name(source_index: u32) -> Result<String> {
+    let device = display_device(source_index)?;
+    display_device_name_from_raw(&device.DeviceName)
+        .ok_or_else(|| anyhow::anyhow!("Windows display device {source_index} has no device name"))
+}
+
 #[cfg(not(windows))]
 fn list_platform_display_modes(_source_index: Option<u32>) -> Result<Vec<DisplayMode>> {
+    anyhow::bail!("display mode control is currently only available on Windows")
+}
+
+#[cfg(not(windows))]
+fn list_current_platform_display_modes() -> Result<Vec<DisplayMode>> {
     anyhow::bail!("display mode control is currently only available on Windows")
 }
 
@@ -237,6 +299,11 @@ fn current_platform_display_mode(_source_index: u32) -> Result<DisplayMode> {
 
 #[cfg(not(windows))]
 fn set_platform_display_mode(_source_index: u32, _mode: &DisplayMode) -> Result<DisplayMode> {
+    anyhow::bail!("display mode control is currently only available on Windows")
+}
+
+#[cfg(not(windows))]
+fn platform_display_device_name(_source_index: u32) -> Result<String> {
     anyhow::bail!("display mode control is currently only available on Windows")
 }
 
@@ -288,6 +355,30 @@ mod tests {
         let selected = choose_display_mode(&modes, 1920, 1080, 144).unwrap();
 
         assert_eq!(selected.id, "m2");
+    }
+
+    #[test]
+    fn highest_current_refresh_hz_uses_fastest_current_display() {
+        let modes = vec![
+            mode("display-0", 2560, 1440, 144, true),
+            mode("display-1", 2560, 1440, 180, true),
+            mode("not-active", 2560, 1440, 240, false),
+        ];
+
+        assert_eq!(select_highest_current_refresh_hz(&modes), Some(180));
+    }
+
+    #[test]
+    fn display_device_name_from_raw_trims_nul_terminated_utf16() {
+        let mut raw = [0_u16; 32];
+        for (index, unit) in "\\\\.\\DISPLAY2".encode_utf16().enumerate() {
+            raw[index] = unit;
+        }
+
+        assert_eq!(
+            display_device_name_from_raw(&raw),
+            Some("\\\\.\\DISPLAY2".to_string())
+        );
     }
 
     fn mode(id: &str, width: u32, height: u32, refresh_hz: u32, is_current: bool) -> DisplayMode {

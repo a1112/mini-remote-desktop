@@ -511,7 +511,13 @@ if ($ProfileId -and $ProfileId.Count -gt 0) {
 }
 
 if (-not $NoBuild) {
-  cargo build -p app -p mrd-service
+  $savedBuildEnv = @{}
+  try {
+    Set-EnvVar "GIT_COMMIT" $gitCommit $savedBuildEnv
+    cargo build -p app -p mrd-service
+  } finally {
+    Restore-EnvVars $savedBuildEnv
+  }
 }
 
 $impairment = [pscustomobject]@{

@@ -15,22 +15,37 @@ function Assert-True($Condition, [string]$Message) {
   }
 }
 
+function Find-Profile([object[]]$Profiles, [string]$Id) {
+  $match = @($Profiles | Where-Object { $_.id -eq $Id })
+  if ($match.Count -ne 1) {
+    throw "Expected exactly one profile '$Id', got $($match.Count)"
+  }
+  $match[0]
+}
+
 $profiles = Get-PairedLanCanaryProfiles -DurationSecs 30 -BitrateMbps 20
-Assert-Equal $profiles.Count 10 "Profile count"
+Assert-Equal $profiles.Count 13 "Profile count"
 Assert-Equal $profiles[0].id "1080p60" "First profile id"
 Assert-Equal $profiles[2].id "2k144" "2K144 profile is present"
 Assert-Equal $profiles[3].id "2k144_adaptive" "Adaptive 2K144 profile is present"
 Assert-Equal $profiles[3].bitrate_mbps 80 "Adaptive 2K144 profile uses the 80 Mbps ceiling"
 Assert-True $profiles[3].adaptive "Adaptive 2K144 profile enables adaptive autorun"
-Assert-Equal $profiles[4].id "1600p165" "Native 1600p165 profile is present"
-Assert-Equal $profiles[4].bitrate_mbps 80 "Native 1600p165 profile uses the higher default bitrate"
-Assert-Equal $profiles[5].id "1600p165_120mbps" "Native 1600p165 high-bitrate profile is present"
-Assert-Equal $profiles[5].bitrate_mbps 120 "Native 1600p165 high-bitrate profile reaches 120 Mbps"
-Assert-Equal $profiles[6].id "1600p165_120mbps_adaptive" "Native 1600p165 adaptive high-bitrate profile is present"
-Assert-Equal $profiles[6].bitrate_mbps 120 "Native 1600p165 adaptive profile starts from 120 Mbps"
-Assert-True $profiles[6].adaptive "Native 1600p165 high-bitrate profile enables adaptive autorun"
-Assert-Equal $profiles[8].fps 180 "180 FPS profile is present"
-Assert-Equal $profiles[9].fps 249 "249 FPS profile is present"
+Assert-Equal $profiles[4].id "2k180" "Native 2K180 profile is present"
+Assert-Equal $profiles[4].bitrate_mbps 100 "Native 2K180 profile uses the higher default bitrate"
+Assert-Equal $profiles[5].id "2k180_120mbps" "Native 2K180 high-bitrate profile is present"
+Assert-Equal $profiles[5].bitrate_mbps 120 "Native 2K180 high-bitrate profile reaches 120 Mbps"
+Assert-Equal $profiles[6].id "2k180_120mbps_adaptive" "Native 2K180 adaptive high-bitrate profile is present"
+Assert-Equal $profiles[6].bitrate_mbps 120 "Native 2K180 adaptive profile starts from 120 Mbps"
+Assert-True $profiles[6].adaptive "Native 2K180 high-bitrate profile enables adaptive autorun"
+Assert-Equal $profiles[7].id "1600p165" "Native 1600p165 profile is present"
+Assert-Equal $profiles[7].bitrate_mbps 80 "Native 1600p165 profile uses the higher default bitrate"
+Assert-Equal $profiles[8].id "1600p165_120mbps" "Native 1600p165 high-bitrate profile is present"
+Assert-Equal $profiles[8].bitrate_mbps 120 "Native 1600p165 high-bitrate profile reaches 120 Mbps"
+Assert-Equal $profiles[9].id "1600p165_120mbps_adaptive" "Native 1600p165 adaptive high-bitrate profile is present"
+Assert-Equal $profiles[9].bitrate_mbps 120 "Native 1600p165 adaptive profile starts from 120 Mbps"
+Assert-True $profiles[9].adaptive "Native 1600p165 high-bitrate profile enables adaptive autorun"
+Assert-Equal $profiles[11].fps 180 "180 FPS profile is present"
+Assert-Equal $profiles[12].fps 249 "249 FPS profile is present"
 
 $h264CrossChain = New-CanaryMediaChain -Mode "cross" -Codec "h264"
 Assert-Equal $h264CrossChain "dxgi/nvenc_h264/quic_datagram_media_v3_or_v2/nvdec/d3d11_shared" "H.264 cross chain remains the default"
@@ -138,7 +153,7 @@ $displayLimitedReport = [pscustomobject]@{
   }
   sessionSnapshot = [pscustomobject]@{ state = "streaming" }
 }
-$displayLimitedRow = Convert-CrossReportToCanaryRow -Profile $profiles[8] -Report $displayLimitedReport -ReportPath "raw/cross-1080p249.json"
+$displayLimitedRow = Convert-CrossReportToCanaryRow -Profile (Find-Profile $profiles "1080p249") -Report $displayLimitedReport -ReportPath "raw/cross-1080p249.json"
 Assert-Equal $displayLimitedRow.status "skipped" "Display refresh capped profiles are environment skips"
 Assert-Equal $displayLimitedRow.classification "display_refresh_limited" "Display refresh cap is classified explicitly"
 Assert-True ($displayLimitedRow.error_message -match "144Hz") "Display refresh cap carries an actionable reason"
@@ -247,7 +262,8 @@ $adaptiveDowngradeReport = [pscustomobject]@{
   }
   sessionSnapshot = [pscustomobject]@{ state = "streaming" }
 }
-$adaptiveDowngradeRow = Convert-CrossReportToCanaryRow -Profile $profiles[6] -Report $adaptiveDowngradeReport -ReportPath "raw/cross-1600p165-adaptive.json" -RequestedCodec "hevc"
+$native1600p165AdaptiveProfile = Find-Profile $profiles "1600p165_120mbps_adaptive"
+$adaptiveDowngradeRow = Convert-CrossReportToCanaryRow -Profile $native1600p165AdaptiveProfile -Report $adaptiveDowngradeReport -ReportPath "raw/cross-1600p165-adaptive.json" -RequestedCodec "hevc"
 Assert-Equal $adaptiveDowngradeRow.status "completed" "Adaptive profile changes are accepted as completed rows"
 Assert-Equal $adaptiveDowngradeRow.classification "completed" "Adaptive profile changes are not marked as profile downgrade"
 Assert-Equal $adaptiveDowngradeRow.selected_profile.width 1920 "Adaptive row keeps the final selected width"
@@ -260,7 +276,7 @@ $startupDropOnlyIssue = Get-CanaryVisualIntegrityIssue `
   -Probe ([pscustomobject]@{ frames_decoded = 4800; frames_dropped = 250 }) `
   -Pipeline ([pscustomobject]@{ render_queue_replacements = 0; render_lock_drops = 0; stage_metrics = @() }) `
   -Report ([pscustomobject]@{ sampleFramesDecoded = 4700; sampleFramesDropped = 1 }) `
-  -Profile $profiles[6]
+  -Profile $native1600p165AdaptiveProfile
 Assert-True ($null -eq $startupDropOnlyIssue) "Visual integrity check uses sample-window drops when available"
 
 $hevcReport = [pscustomobject]@{
@@ -320,6 +336,90 @@ Assert-Equal $hevcRow.stage_p50_ms.'sender.send_datagram' 1.1 "HEVC row exposes 
 Assert-Equal $hevcRow.stage_p95_ms.'sender.send_datagram' 3.2 "HEVC row still exposes sender datagram send P95"
 Assert-Equal $hevcRow.sender_transport.datagram_fragments_dropped_for_capacity 2 "HEVC row exposes sender capacity drop counters"
 Assert-Equal $hevcRow.sender_transport.datagram_fragments_attempted 40 "HEVC row exposes sender datagram attempted counters"
+
+$displaySourceReport = [pscustomobject]@{
+  status = "completed"
+  failureReason = $null
+  errorMessage = $null
+  sampleObservedFps = 175.0
+  captureSource = [pscustomobject]@{
+    id = "windows:display-shared:1"
+    source_kind = "display_shared"
+    title = "Display 2 (D3D11 shared copy)"
+    class_name = "DXGIShared:\\\\.\\DISPLAY2"
+    width = 2560
+    height = 1440
+  }
+  displayModeChange = [pscustomobject]@{
+    active = [pscustomobject]@{
+      source_id = "windows:display-shared:1"
+      width = 2560
+      height = 1440
+      refresh_hz = 180
+    }
+  }
+  probeSnapshot = [pscustomobject]@{
+    current_fps = 175.0
+    frames_decoded = 7875
+    frames_dropped = 4
+    media_probe_width = 2560
+    media_probe_height = 1440
+    media_probe_target_fps = 180
+    media_probe_target_bitrate_mbps = 120
+  }
+  mediaPipelineSnapshot = [pscustomobject]@{
+    dropped_frames = 0
+    queue_depth = 0
+    stage_metrics = @(
+      [pscustomobject]@{ stage = "sender.capture"; p50_ms = 0.18; p95_ms = 0.28 },
+      [pscustomobject]@{ stage = "sender.encode"; p50_ms = 0.42; p95_ms = 0.63 },
+      [pscustomobject]@{ stage = "sender.send_datagram"; p50_ms = 0.05; p95_ms = 1.65 },
+      [pscustomobject]@{ stage = "receiver.decode"; p50_ms = 1.48; p95_ms = 2.11 },
+      [pscustomobject]@{ stage = "render_present_gap"; p50_ms = 5.63; p95_ms = 6.68 }
+    )
+    test_impairment = $null
+    active_codec = "hevc"
+  }
+  sessionSnapshot = [pscustomobject]@{ state = "streaming" }
+}
+$displaySourceRow = Convert-CrossReportToCanaryRow -Profile (Find-Profile $profiles "2k180_120mbps") -Report $displaySourceReport -ReportPath "raw/cross-2k180.json" -RequestedCodec "hevc"
+Assert-Equal $displaySourceRow.actual_capture_source_id "windows:display-shared:1" "Cross row records the actual remote display source id"
+Assert-Equal $displaySourceRow.actual_capture_source_class_name "DXGIShared:\\\\.\\DISPLAY2" "Cross row records the DXGI/GDI display mapping"
+Assert-Equal $displaySourceRow.active_display_mode_summary "2560x1440@180" "Cross row records active remote display mode"
+Assert-Equal $displaySourceRow.capture_source_summary "windows:display-shared:1 / display_shared / 2560x1440 / Display 2 (D3D11 shared copy)" "Cross row exposes a readable remote display summary"
+
+$localStageRow = [pscustomobject]@{
+  id = "2k180_120mbps"
+  width = 2560
+  height = 1440
+  fps = 180
+  bitrate_mbps = 120
+  status = "completed"
+  classification = "completed"
+  fps_observed = 176.0
+  selected_profile = [pscustomobject]@{ width = 2560; height = 1440; fps = 180; bitrate_mbps = 120 }
+  stage_p95_ms = [pscustomobject]@{
+    'sender.capture' = 0.25
+    'sender.encode' = 0.65
+    'sender.send_datagram' = 0.8
+    'receiver.decode' = 2.0
+    'render_present_gap' = 6.7
+  }
+}
+$slowSendCrossRow = $displaySourceRow.PSObject.Copy()
+$slowSendCrossRow.fps_observed = 110.0
+$slowSendCrossRow.stage_p95_ms = [pscustomobject]@{
+  'sender.capture' = 0.3
+  'sender.encode' = 0.75
+  'sender.send_datagram' = 6.2
+  'receiver.decode' = 2.2
+  'render_present_gap' = 7.0
+}
+$stageComparison = Compare-PairedLanCanaryRows -LocalRows @($localStageRow) -CrossRows @($slowSendCrossRow) -RatioThreshold 0.8
+Assert-Equal $stageComparison[0].status "threshold_miss" "Slow cross row remains a threshold miss"
+Assert-Equal $stageComparison[0].root_cause "transport_send_p95_regression" "Comparison identifies high sender send P95 as the likely gap source"
+Assert-Equal ([Math]::Round($stageComparison[0].send_delta_p95_ms, 1)) 5.4 "Comparison reports sender send P95 delta"
+Assert-Equal $stageComparison[0].cross_capture_source "windows:display-shared:1 / display_shared / 2560x1440 / Display 2 (D3D11 shared copy)" "Comparison carries cross display source context"
 
 $reliableSendReport = [pscustomobject]@{
   status = "completed"

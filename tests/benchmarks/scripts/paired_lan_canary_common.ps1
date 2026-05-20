@@ -37,6 +37,16 @@ function Select-CanaryStageP95Value {
   $Fallback
 }
 
+function Select-CanaryStageMapValue {
+  param($StageMap, [string[]]$Stages, $Fallback)
+  if ($null -eq $StageMap) { return $Fallback }
+  foreach ($stage in $Stages) {
+    $value = Select-CanaryObjectPropertyValue $StageMap $stage $null
+    if ($null -ne $value) { return $value }
+  }
+  $Fallback
+}
+
 function Normalize-CanaryCodec {
   param([string]$Codec)
 
@@ -112,6 +122,9 @@ function Get-PairedLanCanaryProfiles {
     [pscustomobject]@{ id = "2k60"; width = 2560; height = 1440; fps = 60; bitrate_mbps = $BitrateMbps; duration_secs = $DurationSecs },
     [pscustomobject]@{ id = "2k144"; width = 2560; height = 1440; fps = 144; bitrate_mbps = $BitrateMbps; duration_secs = $DurationSecs },
     [pscustomobject]@{ id = "2k144_adaptive"; width = 2560; height = 1440; fps = 144; bitrate_mbps = 80; duration_secs = $DurationSecs; adaptive = $true },
+    [pscustomobject]@{ id = "2k180"; width = 2560; height = 1440; fps = 180; bitrate_mbps = 100; duration_secs = $DurationSecs },
+    [pscustomobject]@{ id = "2k180_120mbps"; width = 2560; height = 1440; fps = 180; bitrate_mbps = 120; duration_secs = $DurationSecs },
+    [pscustomobject]@{ id = "2k180_120mbps_adaptive"; width = 2560; height = 1440; fps = 180; bitrate_mbps = 120; duration_secs = $DurationSecs; adaptive = $true },
     [pscustomobject]@{ id = "1600p165"; width = 2560; height = 1600; fps = 165; bitrate_mbps = 80; duration_secs = $DurationSecs },
     [pscustomobject]@{ id = "1600p165_120mbps"; width = 2560; height = 1600; fps = 165; bitrate_mbps = 120; duration_secs = $DurationSecs },
     [pscustomobject]@{ id = "1600p165_120mbps_adaptive"; width = 2560; height = 1600; fps = 165; bitrate_mbps = 120; duration_secs = $DurationSecs; adaptive = $true },
@@ -291,6 +304,8 @@ function Convert-LocalSummaryToCanaryRow {
       present = $Summary.render_present_p95_ms
     }
     raw_summary_path = $SummaryPath
+    capture_source_summary = "local / dxgi / $($Summary.width)x$($Summary.height) / single-process baseline"
+    active_display_mode_summary = "-"
     requested_codec = Normalize-CanaryCodec $RequestedCodec
     active_codec = Normalize-CanaryCodec $RequestedCodec
     error_message = $null
@@ -338,6 +353,8 @@ function Convert-CrossReportToCanaryRow {
   $renderLockDrops = [int64](Select-CanaryValue $pipeline.render_lock_drops 0)
   $activeCodec = Select-CanaryValue $pipeline.active_codec $RequestedCodec
   $senderTransport = Select-CanaryObjectPropertyValue $pipeline "sender_transport" $null
+  $captureSource = Select-CanaryObjectPropertyValue $Report "captureSource" $null
+  $activeDisplayMode = Select-CanaryObjectPropertyValue (Select-CanaryObjectPropertyValue $Report "displayModeChange" $null) "active" $null
 
   [pscustomobject]@{
     id = $Profile.id
@@ -385,10 +402,20 @@ function Convert-CrossReportToCanaryRow {
     adaptation_ladder_index = Select-CanaryValue $adaptation.ladder_index $null
     adaptation_last_reason = Select-CanaryValue $adaptation.last_reason ""
     display_mode = $Report.displayModeChange
+    active_display_mode_summary = Get-CanaryDisplayModeSummary -DisplayMode $activeDisplayMode
+    active_display_mode_source_id = Select-CanaryValue $activeDisplayMode.source_id $null
+    active_display_refresh_hz = Select-CanaryValue $activeDisplayMode.refresh_hz $null
     raw_report_path = $ReportPath
     error_message = Select-CanaryValue $Report.errorMessage (Select-CanaryValue $visualIntegrityIssue $displayLimitReason)
     visual_integrity_status = if ($visualIntegrityIssue) { "risk" } elseif ($pacedRenderCoalescing) { "paced" } else { "ok" }
     visual_integrity_message = $visualIntegrityIssue
+    actual_capture_source_id = Select-CanaryValue $captureSource.id $null
+    actual_capture_source_kind = Select-CanaryValue $captureSource.source_kind $null
+    actual_capture_source_title = Select-CanaryValue $captureSource.title $null
+    actual_capture_source_class_name = Select-CanaryValue $captureSource.class_name $null
+    actual_capture_source_width = Select-CanaryValue $captureSource.width $null
+    actual_capture_source_height = Select-CanaryValue $captureSource.height $null
+    capture_source_summary = Get-CanaryCaptureSourceSummary -Source $captureSource
     requested_codec = Normalize-CanaryCodec $RequestedCodec
     active_codec = $pipeline.active_codec
     active_codec_profile = $pipeline.active_codec_profile
@@ -523,6 +550,55 @@ function Convert-MediaStageMetricsToP50Map {
   [pscustomobject]$map
 }
 
+function Get-CanaryCaptureSourceSummary {
+  param($Source)
+
+  if ($null -eq $Source) { return "-" }
+  $id = Select-CanaryValue $Source.id "-"
+  $kind = Select-CanaryValue $Source.source_kind "-"
+  $width = [int](Select-CanaryValue $Source.width 0)
+  $height = [int](Select-CanaryValue $Source.height 0)
+  $title = Select-CanaryValue $Source.title "-"
+  $size = if ($width -gt 0 -and $height -gt 0) { "${width}x${height}" } else { "-" }
+  "$id / $kind / $size / $title"
+}
+
+function Get-CanaryDisplayModeSummary {
+  param($DisplayMode)
+
+  if ($null -eq $DisplayMode) { return "-" }
+  $width = [int](Select-CanaryValue $DisplayMode.width 0)
+  $height = [int](Select-CanaryValue $DisplayMode.height 0)
+  $refresh = [int](Select-CanaryValue $DisplayMode.refresh_hz 0)
+  if ($width -le 0 -or $height -le 0 -or $refresh -le 0) { return "-" }
+  "${width}x${height}@${refresh}"
+}
+
+function Get-CanaryRowStageValue {
+  param(
+    $Row,
+    [ValidateSet("p50", "p95")]
+    [string]$Statistic,
+    [string[]]$Stages,
+    $Fallback = $null
+  )
+
+  $map = if ($Statistic -eq "p50") { $Row.stage_p50_ms } else { $Row.stage_p95_ms }
+  Select-CanaryStageMapValue -StageMap $map -Stages $Stages -Fallback $Fallback
+}
+
+function Get-CanaryRowSendStageValue {
+  param(
+    $Row,
+    [ValidateSet("p50", "p95")]
+    [string]$Statistic,
+    $Fallback = $null
+  )
+
+  $map = if ($Statistic -eq "p50") { $Row.stage_p50_ms } else { $Row.stage_p95_ms }
+  Select-CanarySenderSendStageValue -StageMap $map -Fallback $Fallback
+}
+
 function Test-CanaryProfileMatch {
   param(
     [Parameter(Mandatory = $true)]$Expected,
@@ -590,6 +666,60 @@ function Get-CanaryComparisonBaselineFps {
   $observed
 }
 
+function Get-PairedLanCanaryGapRootCause {
+  param(
+    [Parameter(Mandatory = $true)]$LocalRow,
+    [Parameter(Mandatory = $true)]$CrossRow,
+    [Parameter(Mandatory = $true)][string]$Status
+  )
+
+  if ($Status -eq "completed") { return "none" }
+  if ($CrossRow.classification -and $CrossRow.classification -ne "completed") {
+    return [string]$CrossRow.classification
+  }
+
+  $crossProbeDrops = [double](Select-CanaryValue $CrossRow.sample_probe_dropped_frames (Select-CanaryValue $CrossRow.probe_dropped_frames 0))
+  $crossSequenceDrops = [double](Select-CanaryValue $CrossRow.sample_sequence_gap_drops (Select-CanaryValue $CrossRow.sequence_gap_drops 0))
+  $crossDecodeDrops = [double](Select-CanaryValue $CrossRow.sample_decode_error_drops (Select-CanaryValue $CrossRow.decode_error_drops 0))
+  $crossTransientDrops = [double](Select-CanaryValue $CrossRow.sample_transient_drops (Select-CanaryValue $CrossRow.transient_drops 0))
+
+  $localCaptureP95 = [double](Get-CanaryRowStageValue -Row $LocalRow -Statistic "p95" -Stages @("sender.capture", "capture") -Fallback 0)
+  $crossCaptureP95 = [double](Get-CanaryRowStageValue -Row $CrossRow -Statistic "p95" -Stages @("sender.capture", "capture") -Fallback 0)
+  if ($crossCaptureP95 -gt 0 -and (($crossCaptureP95 - $localCaptureP95) -ge 2.0 -or ($localCaptureP95 -gt 0 -and $crossCaptureP95 -ge ($localCaptureP95 * 2.0)))) {
+    return "capture_p95_regression"
+  }
+
+  $localEncodeP95 = [double](Get-CanaryRowStageValue -Row $LocalRow -Statistic "p95" -Stages @("sender.encode", "encode") -Fallback 0)
+  $crossEncodeP95 = [double](Get-CanaryRowStageValue -Row $CrossRow -Statistic "p95" -Stages @("sender.encode", "encode") -Fallback 0)
+  if ($crossEncodeP95 -gt 0 -and (($crossEncodeP95 - $localEncodeP95) -ge 2.0 -or ($localEncodeP95 -gt 0 -and $crossEncodeP95 -ge ($localEncodeP95 * 2.0)))) {
+    return "encode_p95_regression"
+  }
+
+  $localSendP95 = [double](Get-CanaryRowSendStageValue -Row $LocalRow -Statistic "p95" -Fallback 0)
+  $crossSendP95 = [double](Get-CanaryRowSendStageValue -Row $CrossRow -Statistic "p95" -Fallback 0)
+  if ($crossSendP95 -gt 0 -and (($crossSendP95 - $localSendP95) -ge 2.0 -or ($localSendP95 -gt 0 -and $crossSendP95 -ge ($localSendP95 * 2.0)))) {
+    return "transport_send_p95_regression"
+  }
+
+  if (($crossProbeDrops + $crossSequenceDrops + $crossDecodeDrops + $crossTransientDrops) -gt 0) {
+    return "transport_loss_or_jitter"
+  }
+
+  $localDecodeP95 = [double](Get-CanaryRowStageValue -Row $LocalRow -Statistic "p95" -Stages @("receiver.decode", "decode") -Fallback 0)
+  $crossDecodeP95 = [double](Get-CanaryRowStageValue -Row $CrossRow -Statistic "p95" -Stages @("receiver.decode", "decode") -Fallback 0)
+  if ($crossDecodeP95 -gt 0 -and (($crossDecodeP95 - $localDecodeP95) -ge 2.0 -or ($localDecodeP95 -gt 0 -and $crossDecodeP95 -ge ($localDecodeP95 * 2.0)))) {
+    return "decode_p95_regression"
+  }
+
+  $targetFps = [double](Select-CanaryValue $CrossRow.render_pacing_target_fps (Select-CanaryValue $CrossRow.selected_profile.fps $CrossRow.fps))
+  $crossPresentGapP95 = [double](Get-CanaryRowStageValue -Row $CrossRow -Statistic "p95" -Stages @("render_present_gap", "present_gap") -Fallback 0)
+  if ($targetFps -gt 0 -and $crossPresentGapP95 -gt ((1000.0 / $targetFps) * $script:CanaryMaxPacedPresentGapMultiplier)) {
+    return "render_pacing_jitter"
+  }
+
+  "fps_threshold_miss"
+}
+
 function Compare-PairedLanCanaryRows {
   param(
     [Parameter(Mandatory = $true)]$LocalRows,
@@ -620,10 +750,14 @@ function Compare-PairedLanCanaryRows {
         id = $local.id
         comparable = $false
         status = "missing_cross"
+        root_cause = "missing_cross"
         local_fps = $localFps
         local_baseline_fps = $localBaselineFps
         cross_fps = 0.0
         fps_ratio = $null
+        local_capture_source = Select-CanaryValue $local.capture_source_summary "-"
+        cross_capture_source = "-"
+        cross_display_mode = "-"
         reason = "Cross-device result is missing"
       }
       continue
@@ -634,10 +768,14 @@ function Compare-PairedLanCanaryRows {
         id = $local.id
         comparable = $false
         status = "display_refresh_limited"
+        root_cause = "display_refresh_limited"
         local_fps = $localFps
         local_baseline_fps = $localBaselineFps
         cross_fps = [double](Select-CanaryValue $cross.fps_observed 0)
         fps_ratio = $null
+        local_capture_source = Select-CanaryValue $local.capture_source_summary "-"
+        cross_capture_source = Select-CanaryValue $cross.capture_source_summary "-"
+        cross_display_mode = Select-CanaryValue $cross.active_display_mode_summary "-"
         reason = $cross.error_message
       }
       continue
@@ -653,10 +791,14 @@ function Compare-PairedLanCanaryRows {
         id = $local.id
         comparable = $false
         status = "profile_downgraded"
+        root_cause = "profile_downgraded"
         local_fps = $localFps
         local_baseline_fps = $localBaselineFps
         cross_fps = [double](Select-CanaryValue $cross.fps_observed 0)
         fps_ratio = $null
+        local_capture_source = Select-CanaryValue $local.capture_source_summary "-"
+        cross_capture_source = Select-CanaryValue $cross.capture_source_summary "-"
+        cross_display_mode = Select-CanaryValue $cross.active_display_mode_summary "-"
         reason = "Selected local/cross profiles differ"
       }
       continue
@@ -678,20 +820,54 @@ function Compare-PairedLanCanaryRows {
     } else {
       "threshold_miss"
     }
+    $rootCause = Get-PairedLanCanaryGapRootCause -LocalRow $local -CrossRow $cross -Status $status
+    $localCaptureP95 = [double](Get-CanaryRowStageValue -Row $local -Statistic "p95" -Stages @("sender.capture", "capture") -Fallback 0)
+    $crossCaptureP95 = [double](Get-CanaryRowStageValue -Row $cross -Statistic "p95" -Stages @("sender.capture", "capture") -Fallback 0)
+    $localEncodeP50 = [double](Get-CanaryRowStageValue -Row $local -Statistic "p50" -Stages @("sender.encode", "encode") -Fallback 0)
+    $crossEncodeP50 = [double](Get-CanaryRowStageValue -Row $cross -Statistic "p50" -Stages @("sender.encode", "encode") -Fallback 0)
+    $localEncodeP95 = [double](Get-CanaryRowStageValue -Row $local -Statistic "p95" -Stages @("sender.encode", "encode") -Fallback 0)
+    $crossEncodeP95 = [double](Get-CanaryRowStageValue -Row $cross -Statistic "p95" -Stages @("sender.encode", "encode") -Fallback 0)
+    $localSendP50 = [double](Get-CanaryRowSendStageValue -Row $local -Statistic "p50" -Fallback 0)
+    $crossSendP50 = [double](Get-CanaryRowSendStageValue -Row $cross -Statistic "p50" -Fallback 0)
+    $localSendP95 = [double](Get-CanaryRowSendStageValue -Row $local -Statistic "p95" -Fallback 0)
+    $crossSendP95 = [double](Get-CanaryRowSendStageValue -Row $cross -Statistic "p95" -Fallback 0)
+    $localDecodeP95 = [double](Get-CanaryRowStageValue -Row $local -Statistic "p95" -Stages @("receiver.decode", "decode") -Fallback 0)
+    $crossDecodeP95 = [double](Get-CanaryRowStageValue -Row $cross -Statistic "p95" -Stages @("receiver.decode", "decode") -Fallback 0)
+    $localPresentGapP95 = [double](Get-CanaryRowStageValue -Row $local -Statistic "p95" -Stages @("render_present_gap", "present_gap", "present") -Fallback 0)
+    $crossPresentGapP95 = [double](Get-CanaryRowStageValue -Row $cross -Statistic "p95" -Stages @("render_present_gap", "present_gap", "present") -Fallback 0)
 
     $results += [pscustomobject]@{
       id = $local.id
       comparable = ($status -ne "profile_downgraded")
       status = $status
+      root_cause = $rootCause
       local_fps = $localFps
       local_baseline_fps = $comparisonBaselineFps
       cross_fps = $crossFps
       fps_ratio = $ratio
+      local_capture_source = Select-CanaryValue $local.capture_source_summary "-"
+      cross_capture_source = Select-CanaryValue $cross.capture_source_summary "-"
+      cross_display_mode = Select-CanaryValue $cross.active_display_mode_summary "-"
       reason = if ($status -eq "threshold_miss") { "Cross FPS below $([Math]::Round($RatioThreshold * 100)) percent of local baseline" } else { $cross.error_message }
-      local_decode_p95_ms = $local.stage_p95_ms.decode
-      cross_decode_p95_ms = $cross.stage_p95_ms.decode
-      local_render_p95_ms = $local.stage_p95_ms.present
-      cross_render_p95_ms = $cross.stage_p95_ms.render_present
+      local_capture_p95_ms = $localCaptureP95
+      cross_capture_p95_ms = $crossCaptureP95
+      capture_delta_p95_ms = $crossCaptureP95 - $localCaptureP95
+      local_encode_p50_ms = $localEncodeP50
+      cross_encode_p50_ms = $crossEncodeP50
+      local_encode_p95_ms = $localEncodeP95
+      cross_encode_p95_ms = $crossEncodeP95
+      encode_delta_p95_ms = $crossEncodeP95 - $localEncodeP95
+      local_send_p50_ms = $localSendP50
+      cross_send_p50_ms = $crossSendP50
+      local_send_p95_ms = $localSendP95
+      cross_send_p95_ms = $crossSendP95
+      send_delta_p95_ms = $crossSendP95 - $localSendP95
+      local_decode_p95_ms = $localDecodeP95
+      cross_decode_p95_ms = $crossDecodeP95
+      decode_delta_p95_ms = $crossDecodeP95 - $localDecodeP95
+      local_render_p95_ms = $localPresentGapP95
+      cross_render_p95_ms = $crossPresentGapP95
+      render_delta_p95_ms = $crossPresentGapP95 - $localPresentGapP95
     }
   }
   $results
@@ -741,12 +917,14 @@ function Write-CanaryJsonAndMarkdown {
     "- Skipped: $($Report.skipped)",
     "- Failed: $($Report.failed)",
     "",
-    "| Profile | Status | Class | FPS | Render FPS | Render Target | Selected | Adaptive | Visual | Enc P50/P95 | Send P50/P95 | Present Gap P95 | Sample/Probe Drop | Drop Breakdown gap/decode/transient | Sender Drop cap/budget/impair | Render Coalesce | Render Drop | Queue | Error |",
-    "| --- | --- | --- | ---: | ---: | ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
+    "| Profile | Status | Class | FPS | Render FPS | Render Target | Selected | Source | Display Mode | Adaptive | Visual | Enc P50/P95 | Send P50/P95 | Present Gap P95 | Sample/Probe Drop | Drop Breakdown gap/decode/transient | Sender Drop cap/budget/impair | Render Coalesce | Render Drop | Queue | Error |",
+    "| --- | --- | --- | ---: | ---: | ---: | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
   )
   foreach ($row in $Report.rows) {
     $selected = "$($row.selected_profile.width)x$($row.selected_profile.height)@$($row.selected_profile.fps)/$($row.selected_profile.bitrate_mbps)Mbps"
     $error = ((Select-CanaryValue $row.error_message "") -replace "\|", "/")
+    $source = ((Select-CanaryValue $row.capture_source_summary "-") -replace "\|", "/")
+    $displayMode = Select-CanaryValue $row.active_display_mode_summary "-"
     $visual = Select-CanaryValue $row.visual_integrity_status "n/a"
     $adaptiveState = Select-CanaryValue $row.adaptation_state "-"
     $adaptiveReason = ((Select-CanaryValue $row.adaptation_last_reason "") -replace "\|", "/")
@@ -769,7 +947,7 @@ function Write-CanaryJsonAndMarkdown {
     $senderDropBreakdown = "$senderCapacityDrops/$senderBudgetDrops/$senderImpairmentDrops"
     $renderCoalesce = Select-CanaryValue $row.render_queue_replacements 0
     $renderDrops = Select-CanaryValue $row.render_lock_drops 0
-    $lines += "| $($row.id) | $($row.status) | $($row.classification) | $([Math]::Round([double](Select-CanaryValue $row.fps_observed 0), 2)) | $estimatedRenderFps | $renderTargetFps | $selected | $adaptive | $visual | $encodeP50/$encodeP95 | $sendP50/$sendP95 | $presentGapP95 | $probeDrops | $dropBreakdown | $senderDropBreakdown | $renderCoalesce | $renderDrops | $($row.queue_depth) | $error |"
+    $lines += "| $($row.id) | $($row.status) | $($row.classification) | $([Math]::Round([double](Select-CanaryValue $row.fps_observed 0), 2)) | $estimatedRenderFps | $renderTargetFps | $selected | $source | $displayMode | $adaptive | $visual | $encodeP50/$encodeP95 | $sendP50/$sendP95 | $presentGapP95 | $probeDrops | $dropBreakdown | $senderDropBreakdown | $renderCoalesce | $renderDrops | $($row.queue_depth) | $error |"
   }
   if ($Report.codec_request) {
     $lines += ""
@@ -806,13 +984,19 @@ function Write-PairedLanComparisonMarkdown {
     "- Rule: cross FPS must be at least 80 percent of local baseline FPS when selected profiles match.",
     "- Local baseline FPS caps local observed FPS to the selected/requested profile FPS.",
     "",
-    "| Profile | Status | Comparable | Local FPS | Local Baseline FPS | Cross FPS | Ratio | Local decode p95 | Cross decode p95 | Local present p95 | Cross present p95 | Reason |",
-    "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
+    "| Profile | Status | Root Cause | Comparable | Local FPS | Local Baseline FPS | Cross FPS | Ratio | Cross Source | Cross Display | Enc P95 local/cross/delta | Send P95 local/cross/delta | Decode P95 local/cross/delta | Present Gap P95 local/cross/delta | Reason |",
+    "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | --- | --- | ---: | ---: | ---: | ---: | --- |"
   )
   foreach ($row in $Rows) {
     $ratio = if ($null -eq $row.fps_ratio) { "-" } else { [Math]::Round([double]$row.fps_ratio, 3) }
     $reason = ((Select-CanaryValue $row.reason "") -replace "\|", "/")
-    $lines += "| $($row.id) | $($row.status) | $($row.comparable) | $([Math]::Round([double]$row.local_fps, 2)) | $([Math]::Round([double]$row.local_baseline_fps, 2)) | $([Math]::Round([double]$row.cross_fps, 2)) | $ratio | $($row.local_decode_p95_ms) | $($row.cross_decode_p95_ms) | $($row.local_render_p95_ms) | $($row.cross_render_p95_ms) | $reason |"
+    $crossSource = ((Select-CanaryValue $row.cross_capture_source "-") -replace "\|", "/")
+    $crossDisplay = Select-CanaryValue $row.cross_display_mode "-"
+    $enc = "$([Math]::Round([double](Select-CanaryValue $row.local_encode_p95_ms 0), 2))/$([Math]::Round([double](Select-CanaryValue $row.cross_encode_p95_ms 0), 2))/$([Math]::Round([double](Select-CanaryValue $row.encode_delta_p95_ms 0), 2))"
+    $send = "$([Math]::Round([double](Select-CanaryValue $row.local_send_p95_ms 0), 2))/$([Math]::Round([double](Select-CanaryValue $row.cross_send_p95_ms 0), 2))/$([Math]::Round([double](Select-CanaryValue $row.send_delta_p95_ms 0), 2))"
+    $decode = "$([Math]::Round([double](Select-CanaryValue $row.local_decode_p95_ms 0), 2))/$([Math]::Round([double](Select-CanaryValue $row.cross_decode_p95_ms 0), 2))/$([Math]::Round([double](Select-CanaryValue $row.decode_delta_p95_ms 0), 2))"
+    $render = "$([Math]::Round([double](Select-CanaryValue $row.local_render_p95_ms 0), 2))/$([Math]::Round([double](Select-CanaryValue $row.cross_render_p95_ms 0), 2))/$([Math]::Round([double](Select-CanaryValue $row.render_delta_p95_ms 0), 2))"
+    $lines += "| $($row.id) | $($row.status) | $($row.root_cause) | $($row.comparable) | $([Math]::Round([double]$row.local_fps, 2)) | $([Math]::Round([double]$row.local_baseline_fps, 2)) | $([Math]::Round([double]$row.cross_fps, 2)) | $ratio | $crossSource | $crossDisplay | $enc | $send | $decode | $render | $reason |"
   }
   $lines -join [Environment]::NewLine | Set-Content -Path $MarkdownPath -Encoding Ascii
 }

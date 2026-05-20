@@ -4032,16 +4032,7 @@ fn lan_local_render_refresh_hz() -> Option<u32> {
         return Some(refresh_hz);
     }
 
-    *LOCAL_RENDER_REFRESH_HZ.get_or_init(|| {
-        crate::display_mode::list_display_modes(None)
-            .ok()
-            .and_then(|modes| {
-                modes
-                    .into_iter()
-                    .find(|mode| mode.is_current && mode.refresh_hz > 0)
-            })
-            .map(|mode| mode.refresh_hz)
-    })
+    *LOCAL_RENDER_REFRESH_HZ.get_or_init(|| crate::display_mode::highest_current_refresh_hz())
 }
 
 fn lan_render_pacing_from_env_value(value: Option<&str>) -> Option<bool> {
@@ -5550,8 +5541,16 @@ fn create_windows_lan_frame_capture(
 ) -> Result<LanFrameCapture> {
     match windows_lan_capture_backend(source_id) {
         "dxgi_shared" => {
-            let mut capture = mrd_capture_dxgi::DxgiSharedTextureCapture::new_primary()
-                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            let device_name = crate::display_mode::display_device_name_for_source_id(source_id)
+                .with_context(|| format!("failed to resolve Windows display for {source_id}"))?;
+            let mut capture =
+                mrd_capture_dxgi::DxgiSharedTextureCapture::new_for_device_name(&device_name)
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))
+                    .with_context(|| {
+                        format!(
+                            "failed to create DXGI shared capture for {source_id} ({device_name})"
+                        )
+                    })?;
             capture.set_target_dimensions(profile.width as usize, profile.height as usize);
             Ok(LanFrameCapture::DxgiShared(capture))
         }

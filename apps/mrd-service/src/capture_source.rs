@@ -179,6 +179,83 @@ fn list_capture_sources_impl() -> Result<Vec<CaptureSource>> {
 
 #[cfg(windows)]
 fn list_windows_display_capture_sources() -> Vec<CaptureSource> {
+    let current_modes = crate::display_mode::current_display_modes().unwrap_or_default();
+    if !current_modes.is_empty() {
+        let dxgi_device_names = mrd_capture_dxgi::enumerate_dxgi_output_targets()
+            .map(|targets| {
+                targets
+                    .into_iter()
+                    .map(|target| target.device_name.to_ascii_lowercase())
+                    .collect::<std::collections::BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+
+        let mut sources = Vec::with_capacity(current_modes.len().saturating_mul(2));
+        for mode in current_modes {
+            let Some(shared_source_id) = mode.source_id.clone() else {
+                continue;
+            };
+            let display_index = windows_display_index_from_source_id(&shared_source_id)
+                .unwrap_or(sources.len() / 2);
+            let display_number = display_index + 1;
+            let device_name =
+                crate::display_mode::display_device_name_for_source_id(&shared_source_id).ok();
+            let has_dxgi_shared = device_name
+                .as_deref()
+                .map(|name| dxgi_device_names.contains(&name.to_ascii_lowercase()))
+                .unwrap_or(false);
+
+            if has_dxgi_shared {
+                sources.push(CaptureSource {
+                    id: shared_source_id.clone(),
+                    platform: "windows".to_string(),
+                    source_kind: "display_shared".to_string(),
+                    title: format!("Display {display_number} (D3D11 shared copy)"),
+                    class_name: device_name
+                        .as_ref()
+                        .map(|name| format!("DXGIShared:{name}"))
+                        .unwrap_or_else(|| "DXGIShared".to_string()),
+                    width: mode.width,
+                    height: mode.height,
+                    process_id: 0,
+                    app_name: Some("Display".to_string()),
+                    bundle_identifier: None,
+                    preview_data_url: None,
+                    preview_width: None,
+                    preview_height: None,
+                });
+            }
+
+            sources.push(CaptureSource {
+                id: shared_source_id.replacen("windows:display-shared:", "windows:display:", 1),
+                platform: "windows".to_string(),
+                source_kind: "display".to_string(),
+                title: format!("Display {display_number} (full screen copy)"),
+                class_name: device_name
+                    .as_ref()
+                    .map(|name| format!("WinRTMonitor:{name}"))
+                    .unwrap_or_else(|| "WinRTMonitor".to_string()),
+                width: mode.width,
+                height: mode.height,
+                process_id: 0,
+                app_name: Some("Display".to_string()),
+                bundle_identifier: None,
+                preview_data_url: None,
+                preview_width: None,
+                preview_height: None,
+            });
+        }
+
+        if !sources.is_empty() {
+            return sources;
+        }
+    }
+
+    list_windows_winrt_display_capture_sources()
+}
+
+#[cfg(windows)]
+fn list_windows_winrt_display_capture_sources() -> Vec<CaptureSource> {
     let Ok(count) = mrd_capture_winrt::get_monitor_count() else {
         return Vec::new();
     };
@@ -224,6 +301,15 @@ fn list_windows_display_capture_sources() -> Vec<CaptureSource> {
     }
 
     sources
+}
+
+#[cfg(windows)]
+fn windows_display_index_from_source_id(source_id: &str) -> Option<usize> {
+    source_id
+        .trim()
+        .rsplit(':')
+        .next()
+        .and_then(|value| value.parse::<usize>().ok())
 }
 
 #[cfg(target_os = "macos")]

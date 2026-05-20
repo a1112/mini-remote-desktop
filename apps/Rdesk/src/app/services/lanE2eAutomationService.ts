@@ -421,7 +421,8 @@ export async function runLanE2EAutomation(
       commands,
       sessionId,
       options.preferredCaptureSourceId,
-      options.preferredCaptureSourceKind
+      options.preferredCaptureSourceKind,
+      requestedProfile
     );
     captureSource = captureSourceSelection.source;
     stage("capture_source", "completed");
@@ -453,7 +454,8 @@ export async function runLanE2EAutomation(
               commands,
               sessionId,
               options.preferredCaptureSourceId ?? captureSource.id,
-              options.preferredCaptureSourceKind
+              options.preferredCaptureSourceKind,
+              requestedProfile
             );
             captureSource = captureSourceSelection.source;
             stage("capture_source", "completed");
@@ -895,13 +897,25 @@ async function selectRemoteCaptureSourceForSession(
   commands: LanE2EAutomationCommands,
   sessionId: string,
   preferredSourceId?: string,
-  preferredSourceKind?: string
+  preferredSourceKind?: string,
+  requestedProfile?: MediaProfile
 ): Promise<CaptureSourceSelection> {
   const sources = await unwrap(
     commands.ipcListRemoteCaptureSources(sessionId, false, 24),
     "capture_source_failed"
   );
   const normalizedPreferredSourceId = preferredSourceId?.trim().toLowerCase();
+  if (!normalizedPreferredSourceId && requestedProfile) {
+    const profileAwareSelection = await selectDisplayCaptureSourceForProfile(
+      commands,
+      sessionId,
+      sources,
+      preferredSourceKind,
+      requestedProfile
+    );
+    if (profileAwareSelection) return profileAwareSelection;
+  }
+
   const preferredSource =
     (normalizedPreferredSourceId
       ? sources.find((source) => source.id.toLowerCase() === normalizedPreferredSourceId)
@@ -924,6 +938,101 @@ async function selectRemoteCaptureSourceForSession(
     );
   }
   return selection;
+}
+
+async function selectDisplayCaptureSourceForProfile(
+  commands: LanE2EAutomationCommands,
+  sessionId: string,
+  sources: CaptureSource[],
+  preferredSourceKind: string | undefined,
+  requestedProfile: MediaProfile
+): Promise<CaptureSourceSelection | undefined> {
+  if (!commands.ipcListRemoteDisplayModes) return undefined;
+
+  const candidates = displayCaptureCandidatesForProfile(sources, preferredSourceKind);
+  if (candidates.length < 2) return undefined;
+
+  let best:
+    | {
+        selection: CaptureSourceSelection;
+        score: ReturnType<typeof displayModeScore>;
+        refreshHz: number;
+        pixels: number;
+      }
+    | undefined;
+
+  for (const candidate of candidates) {
+    const selectionResult = await commands.ipcSelectRemoteCaptureSource(sessionId, candidate.id);
+    if (!selectionResult.ok || selectionResult.value.status.toLowerCase() !== "selected") {
+      continue;
+    }
+    const modesResult = await commands.ipcListRemoteDisplayModes(sessionId);
+    if (!modesResult.ok) continue;
+    const mode = chooseRemoteDisplayMode(
+      modesResult.value,
+      requestedProfile.width,
+      requestedProfile.height,
+      requestedProfile.fps
+    );
+    if (!mode) continue;
+
+    const score = displayModeScore(
+      mode,
+      requestedProfile.width,
+      requestedProfile.height,
+      requestedProfile.fps
+    );
+    const ranked = {
+      selection: selectionResult.value,
+      score,
+      refreshHz: mode.refresh_hz,
+      pixels: mode.width * mode.height,
+    };
+    if (!best || compareDisplayModeScores(ranked, best) < 0) {
+      best = ranked;
+    }
+  }
+
+  if (!best) return undefined;
+  const finalSelectionResult = await commands.ipcSelectRemoteCaptureSource(
+    sessionId,
+    best.selection.source.id
+  );
+  if (finalSelectionResult.ok && finalSelectionResult.value.status.toLowerCase() === "selected") {
+    return finalSelectionResult.value;
+  }
+  return best.selection;
+}
+
+function displayCaptureCandidatesForProfile(
+  sources: CaptureSource[],
+  preferredSourceKind?: string
+): CaptureSource[] {
+  const normalizedPreferredKind = preferredSourceKind?.trim();
+  const isDisplaySource = (source: CaptureSource) =>
+    source.source_kind === "display_shared" || source.source_kind === "display";
+  if (normalizedPreferredKind) {
+    return sources.filter(
+      (source) => source.source_kind === normalizedPreferredKind && isDisplaySource(source)
+    );
+  }
+
+  const sharedDisplays = sources.filter((source) => source.source_kind === "display_shared");
+  if (sharedDisplays.length > 1) return sharedDisplays;
+  const displays = sources.filter((source) => source.source_kind === "display");
+  if (displays.length > 1) return displays;
+  return [];
+}
+
+function compareDisplayModeScores(
+  left: { score: ReturnType<typeof displayModeScore>; refreshHz: number; pixels: number },
+  right: { score: ReturnType<typeof displayModeScore>; refreshHz: number; pixels: number }
+): number {
+  for (let index = 0; index < left.score.length; index += 1) {
+    const delta = (left.score[index] ?? 0) - (right.score[index] ?? 0);
+    if (delta !== 0) return delta;
+  }
+  return right.refreshHz - left.refreshHz || right.pixels - left.pixels;
 }
 
 function pickPreferredCaptureSource(
