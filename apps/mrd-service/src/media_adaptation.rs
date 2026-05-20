@@ -715,7 +715,7 @@ fn observation_is_healthy(observation: MediaAdaptationObservation) -> bool {
     if observation.observed_fps < observation.target_fps as f32 * 0.95 {
         return false;
     }
-    if observation.drop_ratio > 0.005 {
+    if observation.drop_ratio > healthy_drop_ratio_threshold(observation) {
         return false;
     }
     if observation.queue_depth > 1 {
@@ -748,6 +748,14 @@ fn observation_is_healthy(observation: MediaAdaptationObservation) -> bool {
         return false;
     }
     true
+}
+
+fn healthy_drop_ratio_threshold(observation: MediaAdaptationObservation) -> f32 {
+    if observation.target_fps >= ADAPTATION_SAFE_START_MIN_FPS {
+        0.02
+    } else {
+        0.005
+    }
 }
 
 async fn apply_adaptation_profile(
@@ -1921,6 +1929,29 @@ mod tests {
         };
 
         assert!(observation_is_healthy(observation));
+    }
+
+    #[test]
+    fn high_refresh_stable_health_allows_light_datagram_loss_for_upshift() {
+        let observation = MediaAdaptationObservation {
+            observed_fps: 142.0,
+            target_fps: 144,
+            drop_ratio: 0.012,
+            queue_depth: 0,
+            decode_p95_ms: Some(2.0),
+            render_p95_ms: Some(0.4),
+            receive_p95_ms: Some(0.1),
+            present_gap_p95_ms: Some(8.0),
+            no_valid_frames: false,
+        };
+        let standard_refresh = MediaAdaptationObservation {
+            target_fps: 60,
+            observed_fps: 60.0,
+            ..observation
+        };
+
+        assert!(observation_is_healthy(observation));
+        assert!(!observation_is_healthy(standard_refresh));
     }
 
     #[test]
