@@ -557,6 +557,225 @@ pub struct CapabilitySnapshot {
     pub updated_at_ms: u64,
 }
 
+/// Readiness state for a product scenario/profile evaluation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScenarioEvaluationStatus {
+    /// All required capabilities are available for the requested scenario.
+    Ready,
+    /// Scenario can run, but not at preferred parity.
+    Degraded,
+    /// Scenario must not run until the blocker is addressed.
+    Blocked,
+    /// Scenario is intentionally excluded, usually for peer/version mismatch.
+    Skipped,
+}
+
+/// One deterministic reason emitted by scenario/profile evaluation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScenarioEvaluationReason {
+    /// Stable reason code, for example `capability.missing`.
+    pub code: String,
+    /// Severity label such as `info`, `warning`, or `error`.
+    pub severity: String,
+    /// Human-readable explanation for UI and reports.
+    pub message: String,
+    /// Related capability id when the reason is tied to a capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_id: Option<String>,
+}
+
+/// Result of evaluating whether a scenario/profile should run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ScenarioEvaluation {
+    /// Stable scenario/profile id such as `lan.2k144`.
+    pub scenario_id: String,
+    /// Overall readiness result.
+    pub status: ScenarioEvaluationStatus,
+    /// Profile selected after capability/profile evaluation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_profile: Option<MediaProfile>,
+    /// Transport selected by the policy layer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_kind: Option<String>,
+    /// Ordered explanation list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<ScenarioEvaluationReason>,
+    /// Required capability ids for the evaluated scenario.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_capabilities: Vec<String>,
+    /// Required capability ids not available on the evaluated side.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_capabilities: Vec<String>,
+    /// Optional fallback profile when the preferred profile is degraded/blocked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_profile: Option<MediaProfile>,
+}
+
+/// Runtime transport policy requested by the UI shell or automation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransportPolicyConfig {
+    /// Policy mode, usually `auto`, `lan`, or `wan`.
+    pub mode: String,
+    /// Optional preferred transport, for example `quic` or `webrtc`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_transport: Option<String>,
+    /// Whether LAN QUIC can be selected.
+    pub allow_lan_quic: bool,
+    /// Whether WebRTC can be selected.
+    pub allow_webrtc: bool,
+    /// Whether relay/TURN paths can be selected.
+    pub allow_relay: bool,
+}
+
+/// Service-owned transport policy decision snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransportPolicySnapshot {
+    /// Optional session id associated with the decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
+    /// Policy mode applied for this decision.
+    pub mode: String,
+    /// Transport selected by policy.
+    pub selected_transport: String,
+    /// Candidate transports considered by policy.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidate_transports: Vec<String>,
+    /// Whether relay/TURN is required by the selected route.
+    pub relay_required: bool,
+    /// Human-readable reason for the selected route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Fallback reason when preferred transport was not selected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+}
+
+/// Control channel reliability class.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlChannelReliability {
+    /// Reliable ordered lane for non-droppable control events.
+    ReliableOrdered,
+    /// Low-latency lane for coalescible/droppable realtime events.
+    UnreliableRealtime,
+}
+
+/// Runtime counters for one control channel lane.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ControlChannelLaneSnapshot {
+    /// Stable lane name, for example `ctrl_rel` or `ctrl_rt`.
+    pub name: String,
+    /// Reliability semantics for this lane.
+    pub reliability: ControlChannelReliability,
+    /// Whether messages are ordered.
+    pub ordered: bool,
+    /// Maximum retransmits, absent for fully reliable lanes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retransmits: Option<u16>,
+    /// Messages currently queued.
+    pub queued_messages: u64,
+    /// Messages dropped by lane policy.
+    pub dropped_messages: u64,
+    /// Messages coalesced by lane policy.
+    pub coalesced_messages: u64,
+}
+
+/// Runtime control channel state for a session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ControlChannelSnapshot {
+    /// Session id associated with these lanes.
+    pub session_id: SessionId,
+    /// Reliable control lane.
+    pub reliable: ControlChannelLaneSnapshot,
+    /// Realtime control lane.
+    pub realtime: ControlChannelLaneSnapshot,
+}
+
+/// One paired device identity known by the local service.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PairedDeviceIdentity {
+    /// Paired peer device id.
+    pub device_id: DeviceId,
+    /// Peer display name at pairing time.
+    pub display_name: String,
+    /// Pinned peer certificate or key fingerprint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate_fingerprint: Option<String>,
+    /// Trust status such as `pending`, `paired`, or `revoked`.
+    pub trust_status: String,
+    /// Last observation timestamp in milliseconds since Unix epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen_ms: Option<u64>,
+}
+
+/// Local service device identity and pairing state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceIdentitySnapshot {
+    /// Registered local device id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_device_id: Option<DeviceId>,
+    /// Registered local display name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// Local certificate or key fingerprint when provisioned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate_fingerprint: Option<String>,
+    /// Whether user consent is required before starting remote control.
+    pub consent_required: bool,
+    /// Known paired devices.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paired_devices: Vec<PairedDeviceIdentity>,
+}
+
+/// Summary statistics for a telemetry metric series.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TelemetryMetricSummary {
+    /// Metric name.
+    pub name: String,
+    /// Display unit.
+    pub unit: String,
+    /// Number of samples available.
+    pub sample_count: u64,
+    /// Median value when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p50: Option<f64>,
+    /// 95th percentile value when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p95: Option<f64>,
+}
+
+/// File artifact associated with a telemetry run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TelemetryArtifactRef {
+    /// Artifact display name.
+    pub name: String,
+    /// Local or exported artifact path.
+    pub path: String,
+    /// Artifact kind such as `json`, `markdown`, or `log`.
+    pub kind: String,
+}
+
+/// Compact service-facing telemetry bundle for run/session diagnostics.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TelemetryBundle {
+    /// Test or session run id.
+    pub run_id: String,
+    /// Optional session id linked to the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
+    /// Metric summaries available for the run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metrics: Vec<TelemetryMetricSummary>,
+    /// Number of structured events available.
+    pub event_count: u64,
+    /// Number of log entries available.
+    pub log_count: u64,
+    /// Linked report/log artifacts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<TelemetryArtifactRef>,
+}
+
 /// Query used to retrieve service-owned audit events.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct AuditLogQuery {
@@ -705,6 +924,62 @@ pub enum IpcRequest {
     AuditLog { query: AuditLogQuery },
     /// Get structured local capability snapshot.
     CapabilitySnapshot,
+    /// Evaluate a scenario/profile before starting a session.
+    EvaluateScenarioProfile {
+        /// Stable scenario/profile id.
+        scenario_id: String,
+        /// Optional peer device id to include in evaluation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer_device_id: Option<DeviceId>,
+        /// Optional concrete requested profile override.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        requested_profile: Option<MediaProfile>,
+    },
+    /// Get structured capability snapshot for a discovered peer.
+    GetPeerCapabilitySnapshot {
+        /// Peer device id.
+        peer_device_id: DeviceId,
+    },
+    /// Set transport policy for a session.
+    SetTransportPolicy {
+        /// Target session id.
+        session_id: SessionId,
+        /// Requested policy.
+        policy: TransportPolicyConfig,
+    },
+    /// Get control channel lane state for a session.
+    GetControlChannelSnapshot {
+        /// Target session id.
+        session_id: SessionId,
+    },
+    /// Start or refresh local pairing intent for a device.
+    PairDevice {
+        /// Peer device id.
+        device_id: DeviceId,
+        /// Optional presented peer fingerprint.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        certificate_fingerprint: Option<String>,
+    },
+    /// Approve a pending pairing.
+    ApprovePairing {
+        /// Peer device id.
+        device_id: DeviceId,
+    },
+    /// Revoke a paired device.
+    RevokeDevice {
+        /// Peer device id.
+        device_id: DeviceId,
+    },
+    /// Get local device identity and pairing snapshot.
+    GetDeviceIdentitySnapshot,
+    /// Get compact telemetry bundle for a run/session.
+    GetTelemetryBundle {
+        /// Test or session run id.
+        run_id: String,
+        /// Optional linked session id.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<SessionId>,
+    },
     /// Get probe snapshot data
     ProbeSnapshot { session_id: SessionId },
     /// Get media pipeline snapshot data.
@@ -815,6 +1090,44 @@ pub enum IpcResponse {
     CapabilitySnapshot {
         /// Current local capability snapshot.
         snapshot: CapabilitySnapshot,
+    },
+    /// Scenario/profile preflight evaluation result.
+    ScenarioProfileEvaluated {
+        /// Evaluation result.
+        evaluation: ScenarioEvaluation,
+    },
+    /// Structured peer capability snapshot.
+    PeerCapabilitySnapshot {
+        /// Peer device id.
+        peer_device_id: DeviceId,
+        /// Snapshot when the peer is known and can be mapped.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        snapshot: Option<CapabilitySnapshot>,
+    },
+    /// Transport policy update result.
+    TransportPolicyUpdated {
+        /// Service-owned policy decision snapshot.
+        snapshot: TransportPolicySnapshot,
+    },
+    /// Control channel lane snapshot.
+    ControlChannelSnapshot {
+        /// Reliable/realtime lane snapshot.
+        snapshot: ControlChannelSnapshot,
+    },
+    /// Pairing operation result.
+    PairingUpdated {
+        /// Device identity snapshot after the operation.
+        snapshot: DeviceIdentitySnapshot,
+    },
+    /// Local device identity snapshot.
+    DeviceIdentitySnapshot {
+        /// Current identity state.
+        snapshot: DeviceIdentitySnapshot,
+    },
+    /// Compact telemetry bundle.
+    TelemetryBundle {
+        /// Requested telemetry bundle.
+        bundle: TelemetryBundle,
     },
     /// Probe snapshot data
     ProbeSnapshot { snapshot: ProbeSnapshot },

@@ -434,6 +434,140 @@ impl IpcServer {
                 snapshot: crate::capabilities::local_capability_snapshot(),
             },
 
+            IpcRequest::EvaluateScenarioProfile {
+                scenario_id,
+                peer_device_id,
+                requested_profile,
+            } => {
+                if let Some(peer_device_id) = peer_device_id {
+                    let snapshot = self.app_state.lan_discovery.snapshot().await;
+                    if !snapshot
+                        .peers
+                        .iter()
+                        .any(|peer| peer.device_id == peer_device_id)
+                    {
+                        return IpcResponse::ScenarioProfileEvaluated {
+                            evaluation: peer_not_found_evaluation(scenario_id, peer_device_id),
+                        };
+                    }
+                }
+                IpcResponse::ScenarioProfileEvaluated {
+                    evaluation: crate::capabilities::evaluate_scenario_profile(
+                        &scenario_id,
+                        requested_profile,
+                    ),
+                }
+            }
+
+            IpcRequest::GetPeerCapabilitySnapshot { peer_device_id } => {
+                let snapshot = self.app_state.lan_discovery.snapshot().await;
+                let capability_snapshot = snapshot
+                    .peers
+                    .iter()
+                    .find(|peer| peer.device_id == peer_device_id)
+                    .map(crate::capabilities::peer_capability_snapshot);
+                IpcResponse::PeerCapabilitySnapshot {
+                    peer_device_id,
+                    snapshot: capability_snapshot,
+                }
+            }
+
+            IpcRequest::SetTransportPolicy { session_id, policy } => {
+                IpcResponse::TransportPolicyUpdated {
+                    snapshot: transport_policy_snapshot(Some(session_id), &policy),
+                }
+            }
+
+            IpcRequest::GetControlChannelSnapshot { session_id } => {
+                IpcResponse::ControlChannelSnapshot {
+                    snapshot: control_channel_snapshot(session_id),
+                }
+            }
+
+            IpcRequest::PairDevice {
+                device_id,
+                certificate_fingerprint,
+            } => {
+                self.app_state.device_identities.lock().await.upsert(
+                    device_id.clone(),
+                    certificate_fingerprint,
+                    "pending",
+                );
+                self.record_audit_event(
+                    "device.pair",
+                    "success",
+                    None,
+                    self.local_device_id().await,
+                    Some(device_id),
+                    None,
+                    None,
+                    Vec::new(),
+                )
+                .await;
+                IpcResponse::PairingUpdated {
+                    snapshot: self.identity_snapshot().await,
+                }
+            }
+
+            IpcRequest::ApprovePairing { device_id } => {
+                self.app_state.device_identities.lock().await.upsert(
+                    device_id.clone(),
+                    None,
+                    "paired",
+                );
+                self.record_audit_event(
+                    "device.approve_pairing",
+                    "success",
+                    None,
+                    self.local_device_id().await,
+                    Some(device_id),
+                    None,
+                    None,
+                    Vec::new(),
+                )
+                .await;
+                IpcResponse::PairingUpdated {
+                    snapshot: self.identity_snapshot().await,
+                }
+            }
+
+            IpcRequest::RevokeDevice { device_id } => {
+                self.app_state
+                    .device_identities
+                    .lock()
+                    .await
+                    .revoke(&device_id);
+                self.record_audit_event(
+                    "device.revoke",
+                    "success",
+                    None,
+                    self.local_device_id().await,
+                    Some(device_id),
+                    None,
+                    None,
+                    Vec::new(),
+                )
+                .await;
+                IpcResponse::PairingUpdated {
+                    snapshot: self.identity_snapshot().await,
+                }
+            }
+
+            IpcRequest::GetDeviceIdentitySnapshot => IpcResponse::DeviceIdentitySnapshot {
+                snapshot: self.identity_snapshot().await,
+            },
+
+            IpcRequest::GetTelemetryBundle { run_id, session_id } => IpcResponse::TelemetryBundle {
+                bundle: mrd_ipc::TelemetryBundle {
+                    run_id,
+                    session_id,
+                    metrics: Vec::new(),
+                    event_count: 0,
+                    log_count: 0,
+                    artifacts: Vec::new(),
+                },
+            },
+
             IpcRequest::MediaPipelineSnapshot { session_id } => {
                 transport_handlers::media_pipeline_snapshot(&self.app_state, session_id).await
             }
@@ -694,6 +828,23 @@ impl IpcServer {
             .map(|(device_id, _)| device_id.clone())
     }
 
+    async fn identity_snapshot(&self) -> mrd_ipc::DeviceIdentitySnapshot {
+        let devices = self.app_state.devices.lock().await;
+        let (local_device_id, display_name) = devices
+            .get_local_device()
+            .map(|(device_id, name)| (Some(device_id.clone()), Some(name.clone())))
+            .unwrap_or((None, None));
+        drop(devices);
+        let paired_devices = self.app_state.device_identities.lock().await.list();
+        mrd_ipc::DeviceIdentitySnapshot {
+            local_device_id,
+            display_name,
+            certificate_fingerprint: None,
+            consent_required: true,
+            paired_devices,
+        }
+    }
+
     async fn session_audit_context(
         &self,
         session_id: &SessionId,
@@ -821,6 +972,98 @@ fn audit_outcome(response: &IpcResponse) -> (&'static str, Option<String>) {
     match response {
         IpcResponse::Error { message, .. } => ("error", Some(message.clone())),
         _ => ("success", None),
+    }
+}
+
+fn peer_not_found_evaluation(
+    scenario_id: String,
+    peer_device_id: DeviceId,
+) -> mrd_ipc::ScenarioEvaluation {
+    mrd_ipc::ScenarioEvaluation {
+        scenario_id,
+        status: mrd_ipc::ScenarioEvaluationStatus::Skipped,
+        selected_profile: None,
+        transport_kind: None,
+        reasons: vec![mrd_ipc::ScenarioEvaluationReason {
+            code: "peer_not_found".to_string(),
+            severity: "warning".to_string(),
+            message: format!("LAN peer {} is not currently discovered.", peer_device_id.0),
+            capability_id: None,
+        }],
+        required_capabilities: Vec::new(),
+        missing_capabilities: Vec::new(),
+        fallback_profile: None,
+    }
+}
+
+fn transport_policy_snapshot(
+    session_id: Option<SessionId>,
+    policy: &mrd_ipc::TransportPolicyConfig,
+) -> mrd_ipc::TransportPolicySnapshot {
+    let mut candidates = Vec::new();
+    if policy.allow_lan_quic {
+        candidates.push("quic".to_string());
+    }
+    if policy.allow_webrtc {
+        candidates.push("webrtc".to_string());
+    }
+
+    let preferred = policy.preferred_transport.as_deref();
+    let selected = match preferred {
+        Some("quic") if policy.allow_lan_quic => "quic",
+        Some("webrtc") if policy.allow_webrtc => "webrtc",
+        _ if policy.mode == "wan" && policy.allow_webrtc => "webrtc",
+        _ if policy.allow_lan_quic => "quic",
+        _ if policy.allow_webrtc => "webrtc",
+        _ => "none",
+    };
+
+    let relay_required = selected == "webrtc" && policy.mode == "wan" && policy.allow_relay;
+    let fallback_reason = preferred
+        .filter(|preferred| *preferred != selected)
+        .map(|preferred| {
+            format!("{preferred} was requested but is not allowed by the active transport policy.")
+        });
+
+    mrd_ipc::TransportPolicySnapshot {
+        session_id,
+        mode: policy.mode.clone(),
+        selected_transport: selected.to_string(),
+        candidate_transports: candidates,
+        relay_required,
+        reason: Some(match selected {
+            "quic" => "LAN/high-refresh route selected QUIC datagram media.".to_string(),
+            "webrtc" if relay_required => {
+                "WAN route selected WebRTC with relay allowed.".to_string()
+            }
+            "webrtc" => "WebRTC route selected by transport policy.".to_string(),
+            _ => "No transport is allowed by the active transport policy.".to_string(),
+        }),
+        fallback_reason,
+    }
+}
+
+fn control_channel_snapshot(session_id: SessionId) -> mrd_ipc::ControlChannelSnapshot {
+    mrd_ipc::ControlChannelSnapshot {
+        session_id,
+        reliable: mrd_ipc::ControlChannelLaneSnapshot {
+            name: "ctrl_rel".to_string(),
+            reliability: mrd_ipc::ControlChannelReliability::ReliableOrdered,
+            ordered: true,
+            max_retransmits: None,
+            queued_messages: 0,
+            dropped_messages: 0,
+            coalesced_messages: 0,
+        },
+        realtime: mrd_ipc::ControlChannelLaneSnapshot {
+            name: "ctrl_rt".to_string(),
+            reliability: mrd_ipc::ControlChannelReliability::UnreliableRealtime,
+            ordered: false,
+            max_retransmits: Some(0),
+            queued_messages: 0,
+            dropped_messages: 0,
+            coalesced_messages: 0,
+        },
     }
 }
 
