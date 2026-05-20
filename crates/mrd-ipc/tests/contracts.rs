@@ -6,8 +6,8 @@ use mrd_ipc::{
     CapabilityConstraintStatus, CapabilityDomain, CapabilityItem, CapabilityPlatform,
     CapabilityProfile, CapabilitySnapshot, CapabilityStatus, CaptureSource, CaptureSourceSelection,
     DeviceInfo, IpcRequest, IpcResponse, MediaAdaptationSnapshot, MediaPipelineSnapshot,
-    MediaProfile, MediaProfileNegotiation, MediaStageMetrics, SessionBootstrap,
-    SessionRuntimeSnapshot,
+    MediaProfile, MediaProfileNegotiation, MediaSenderTransportSnapshot, MediaStageMetrics,
+    SessionBootstrap, SessionRuntimeSnapshot,
 };
 use mrd_proto::{DeviceId, SessionId};
 
@@ -514,14 +514,28 @@ fn serialize_deserialize_media_pipeline_snapshot_contract() {
             codec_fallback_reason: None,
             queue_depth: 1,
             dropped_frames: 2,
+            render_presented_frames: 120,
             render_queue_replacements: 1,
             render_lock_drops: 1,
+            render_pacing_target_fps: Some(144),
             stage_metrics: vec![MediaStageMetrics {
                 stage: "decode".to_string(),
                 p50_ms: Some(1.0),
                 p95_ms: Some(2.0),
             }],
             test_impairment: None,
+            sender_transport: MediaSenderTransportSnapshot {
+                datagram_fragments_attempted: 4,
+                datagram_fragments_sent: 3,
+                datagram_fragments_delayed: 0,
+                datagram_fragments_dropped_by_impairment: 0,
+                datagram_fragments_dropped_for_capacity: 1,
+                datagram_fragments_dropped_for_budget: 0,
+                datagram_frames_cut_short_for_capacity: 1,
+                datagram_frames_cut_short_for_budget: 0,
+                reliable_fragments_sent: 0,
+                reliable_frames_sent: 0,
+            },
             adaptation: Some(MediaAdaptationSnapshot {
                 enabled: true,
                 state: "stable".to_string(),

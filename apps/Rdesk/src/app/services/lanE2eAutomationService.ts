@@ -88,6 +88,7 @@ export interface LanE2EAutomationOptions {
   preferredCaptureSourceId?: string;
   preferredCaptureSourceKind?: string;
   expectedPeerBuildId?: string;
+  renderProfileCap?: boolean;
   adaptive?: boolean;
   adaptiveConfig?: AdaptiveMediaConfig;
   faultPlan?: CrossDeviceFaultPlan;
@@ -118,7 +119,13 @@ export interface LanE2EAutomationReport {
   mediaVerified: boolean;
   sampleDurationMs: number;
   sampleFramesDecoded: number;
+  sampleFramesDropped: number;
+  sampleSequenceGapDrops?: number;
+  sampleDecodeErrorDrops?: number;
+  sampleTransientDrops?: number;
   sampleObservedFps?: number;
+  sampleRenderFramesPresented: number;
+  sampleObservedRenderFps?: number;
   thresholds: {
     minSampleDurationMs: number;
     minDecodedFrames: number;
@@ -144,6 +151,10 @@ export interface LanE2EAutomationCommands {
     transportKind: string,
     requestedProfile?: MediaProfile
   ): Promise<AdapterResult<string>>;
+  ipcUpdateMediaProfile?(
+    sessionId: string,
+    requestedProfile: MediaProfile
+  ): Promise<AdapterResult<unknown>>;
   ipcConfigureMediaAdaptation?(
     sessionId: string,
     config: AdaptiveMediaConfig
@@ -246,6 +257,12 @@ const DEFAULT_LAN_MEDIA_PROFILE: MediaProfile = {
   bitrate_mbps: 80,
   codec: "h264",
 };
+const ADAPTIVE_STARTUP_SAFE_MIN_FPS = 120;
+const ADAPTIVE_STARTUP_SAFE_MIN_BITRATE_MBPS = 80;
+const ADAPTIVE_STARTUP_SAFE_BITRATE_RATIO = 0.8;
+const SAMPLE_DURATION_TOLERANCE_MS = 250;
+const REMOTE_DISPLAY_SURFACE_ATTACH_TIMEOUT_MS = 10_000;
+const REMOTE_DISPLAY_SURFACE_ATTACH_POLL_MS = 100;
 
 export async function runLanE2EAutomation(
   commands: LanE2EAutomationCommands,
@@ -259,15 +276,23 @@ export async function runLanE2EAutomation(
   const sampleIntervalMs = options.sampleIntervalMs ?? DEFAULT_SAMPLE_INTERVAL_MS;
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const minSampleDurationMs = options.minSampleDurationMs ?? DEFAULT_MIN_SAMPLE_DURATION_MS;
+  const sampleDurationToleranceMs = sampleDurationToleranceFor(minSampleDurationMs);
+  const sampleWindowTimeoutMs = Math.max(
+    timeoutMs,
+    minSampleDurationMs + sampleIntervalMs + sampleDurationToleranceMs
+  );
   const minDecodedFrames = options.minDecodedFrames ?? DEFAULT_MIN_DECODED_FRAMES;
   const minFps = options.minFps ?? DEFAULT_MIN_FPS;
   const stopOnComplete = options.stopOnComplete ?? true;
   const transportKind = options.transportKind ?? "quic";
   const displayModePolicy = options.displayModePolicy ?? "none";
-  const requestedProfile =
+  const renderProfileCapEnabled = options.renderProfileCap ?? true;
+  let requestedProfile =
     shouldRequestMediaProfile(scenarioId, transportKind)
       ? options.requestedProfile ?? DEFAULT_LAN_MEDIA_PROFILE
       : options.requestedProfile;
+  const sessionStartProfile =
+    options.adaptive ? buildAdaptiveStartupMediaProfile(requestedProfile) : requestedProfile;
   const validationMode = transportKind === "webrtc" ? "webrtc_rtp" : "quic_datagram";
   let sessionId: string | undefined;
   let peer: LanPeerInfo | undefined;
@@ -284,9 +309,24 @@ export async function runLanE2EAutomation(
   let sessionStarted = false;
   let sampleDurationMs = 0;
   let sampleFramesDecoded = 0;
+  let sampleFramesDropped = 0;
+  let sampleSequenceGapDrops: number | undefined;
+  let sampleDecodeErrorDrops: number | undefined;
+  let sampleTransientDrops: number | undefined;
   let sampleObservedFps: number | undefined;
+  let sampleRenderFramesPresented = 0;
+  let sampleObservedRenderFps: number | undefined;
+  let renderCappedProfileApplied = false;
   let sampleFpsBaseline:
-    | { framesDecoded: number; sampleDurationMs: number }
+    | {
+        framesDecoded: number;
+        framesDropped: number;
+        sequenceGapDrops: number;
+        decodeErrorDrops: number;
+        transientDrops: number;
+        renderPresentedFrames: number;
+        sampleDurationMs: number;
+      }
     | undefined;
 
   const stage = (
@@ -327,7 +367,13 @@ export async function runLanE2EAutomation(
       (validationMode === "webrtc_rtp" || profileProbeResult?.status === "passed"),
     sampleDurationMs,
     sampleFramesDecoded,
+    sampleFramesDropped,
+    sampleSequenceGapDrops,
+    sampleDecodeErrorDrops,
+    sampleTransientDrops,
     sampleObservedFps,
+    sampleRenderFramesPresented,
+    sampleObservedRenderFps,
     thresholds: {
       minSampleDurationMs,
       minDecodedFrames,
@@ -399,7 +445,7 @@ export async function runLanE2EAutomation(
         sessionId,
         selectedPeer.device_id,
         transportKind,
-        requestedProfile
+        sessionStartProfile
       ),
       "session_start_failed"
     );
@@ -411,7 +457,8 @@ export async function runLanE2EAutomation(
       commands,
       sessionId,
       options.preferredCaptureSourceId,
-      options.preferredCaptureSourceKind
+      options.preferredCaptureSourceKind,
+      requestedProfile
     );
     captureSource = captureSourceSelection.source;
     stage("capture_source", "completed");
@@ -438,14 +485,29 @@ export async function runLanE2EAutomation(
         stage("display_mode", "completed");
         if (captureSource) {
           stage("capture_source", "started");
-          captureSourceSelection = await selectRemoteCaptureSourceForSession(
-            commands,
-            sessionId,
-            options.preferredCaptureSourceId ?? captureSource.id,
-            options.preferredCaptureSourceKind
-          );
-          captureSource = captureSourceSelection.source;
-          stage("capture_source", "completed");
+          try {
+            captureSourceSelection = await selectRemoteCaptureSourceForSession(
+              commands,
+              sessionId,
+              options.preferredCaptureSourceId,
+              options.preferredCaptureSourceKind,
+              requestedProfile
+            );
+            captureSource = captureSourceSelection.source;
+            stage("capture_source", "completed");
+          } catch (error) {
+            const message =
+              error instanceof Error
+                ? error.message
+                : `Remote capture source refresh failed: ${String(error)}`;
+            captureSourceSelection = {
+              session_id: sessionId,
+              source: captureSource,
+              status: "selected",
+              reason: `Reused pre-display-mode source after refresh failed: ${message}`,
+            };
+            stage("capture_source", "skipped", captureSourceSelection.reason ?? undefined);
+          }
         }
       }
     }
@@ -476,6 +538,20 @@ export async function runLanE2EAutomation(
       commands.openRemoteDisplayWindow({ sessionId }),
       "display_window_failed"
     );
+
+    const nativeSurface = await waitForRemoteDisplayNativeSurface(
+      commands,
+      sessionId,
+      displayWindow,
+      timeoutMs,
+      now
+    );
+    displayWindow = nativeSurface.displayWindow;
+    mediaPipelineSnapshot = nativeSurface.mediaPipelineSnapshot;
+    if (!nativeSurface.attached) {
+      stage("display", "failed", nativeSurface.message);
+      return finish("failed", "display_window_failed", nativeSurface.message);
+    }
     stage("display", "completed");
 
     if (scenarioId === "cross.fault.recovery") {
@@ -514,8 +590,8 @@ export async function runLanE2EAutomation(
     }
 
     stage("sample", "started");
-    const deadline = now() + timeoutMs;
-    const sampleStartedAt = now();
+    let deadline = now() + sampleWindowTimeoutMs;
+    let sampleStartedAt = now();
     while (now() <= deadline) {
       sessionSnapshot = await unwrap(
         commands.ipcSessionSnapshot(sessionId),
@@ -530,10 +606,44 @@ export async function runLanE2EAutomation(
       if (displayWindow) {
         displayWindow = syncDisplayWindowFromPipeline(displayWindow, mediaPipelineSnapshot);
       }
+      const renderCappedProfile = renderProfileCapEnabled
+        ? buildRenderCappedMediaProfile(
+            requestedProfile,
+            mediaPipelineSnapshot,
+            renderCappedProfileApplied
+          )
+        : undefined;
+      if (renderCappedProfile && commands.ipcUpdateMediaProfile && !options.adaptive) {
+        await unwrap(
+          commands.ipcUpdateMediaProfile(sessionId, renderCappedProfile),
+          "runtime_error"
+        );
+        requestedProfile = renderCappedProfile;
+        renderCappedProfileApplied = true;
+        sampleStartedAt = now();
+        deadline = sampleStartedAt + sampleWindowTimeoutMs;
+        sampleDurationMs = 0;
+        sampleFramesDecoded = 0;
+        sampleFramesDropped = 0;
+        sampleSequenceGapDrops = undefined;
+        sampleDecodeErrorDrops = undefined;
+        sampleTransientDrops = undefined;
+        sampleObservedFps = undefined;
+        sampleRenderFramesPresented = 0;
+        sampleObservedRenderFps = undefined;
+        sampleFpsBaseline = undefined;
+        await sleep(sampleIntervalMs);
+        continue;
+      }
       sampleDurationMs = now() - sampleStartedAt;
       if (!sampleFpsBaseline) {
         sampleFpsBaseline = {
           framesDecoded: probeSnapshot.frames_decoded,
+          framesDropped: probeSnapshot.frames_dropped,
+          sequenceGapDrops: probeSnapshot.sequence_gap_drops ?? 0,
+          decodeErrorDrops: probeSnapshot.decode_error_drops ?? 0,
+          transientDrops: probeSnapshot.transient_drops ?? 0,
+          renderPresentedFrames: mediaPipelineSnapshot.render_presented_frames ?? 0,
           sampleDurationMs,
         };
       } else {
@@ -541,11 +651,36 @@ export async function runLanE2EAutomation(
           0,
           probeSnapshot.frames_decoded - sampleFpsBaseline.framesDecoded
         );
+        sampleFramesDropped = Math.max(
+          0,
+          probeSnapshot.frames_dropped - sampleFpsBaseline.framesDropped
+        );
+        sampleSequenceGapDrops = Math.max(
+          0,
+          (probeSnapshot.sequence_gap_drops ?? 0) - sampleFpsBaseline.sequenceGapDrops
+        );
+        sampleDecodeErrorDrops = Math.max(
+          0,
+          (probeSnapshot.decode_error_drops ?? 0) - sampleFpsBaseline.decodeErrorDrops
+        );
+        sampleTransientDrops = Math.max(
+          0,
+          (probeSnapshot.transient_drops ?? 0) - sampleFpsBaseline.transientDrops
+        );
         const sampleFpsElapsedMs =
           sampleDurationMs - sampleFpsBaseline.sampleDurationMs;
         sampleObservedFps =
           sampleFpsElapsedMs > 0
             ? (sampleFramesDecoded * 1000) / sampleFpsElapsedMs
+            : undefined;
+        sampleRenderFramesPresented = Math.max(
+          0,
+          (mediaPipelineSnapshot.render_presented_frames ?? 0) -
+            sampleFpsBaseline.renderPresentedFrames
+        );
+        sampleObservedRenderFps =
+          sampleFpsElapsedMs > 0
+            ? (sampleRenderFramesPresented * 1000) / sampleFpsElapsedMs
             : undefined;
       }
       const fpsForThreshold = sampleObservedFps ?? probeSnapshot.current_fps ?? 0;
@@ -566,7 +701,11 @@ export async function runLanE2EAutomation(
         validationMode
       );
       const profileMismatch = describeProfileProbeFailure(profileProbeResult);
-      if (!options.adaptive && profileMismatch && sampleDurationMs >= minSampleDurationMs) {
+      const sampleDurationReady = hasReachedSampleDuration(
+        sampleDurationMs,
+        minSampleDurationMs
+      );
+      if (!options.adaptive && profileMismatch && sampleDurationReady) {
         stage("assert", "failed", profileMismatch);
         return finish("failed", "media_profile_mismatch", profileMismatch);
       }
@@ -574,7 +713,7 @@ export async function runLanE2EAutomation(
         !options.adaptive &&
         profileProbeResult?.status === "degraded" &&
         probeSnapshot.frames_decoded >= minDecodedFrames &&
-        sampleDurationMs >= minSampleDurationMs
+        sampleDurationReady
       ) {
         const message =
           profileProbeResult.error ?? "Runtime media profile was downgraded by the remote source";
@@ -586,7 +725,7 @@ export async function runLanE2EAutomation(
         probeSnapshot.frames_decoded >= minDecodedFrames &&
         (validationMode !== "quic_datagram" || probeSnapshot.media_probe_valid === true) &&
         fpsForThreshold >= minFps &&
-        sampleDurationMs >= minSampleDurationMs
+        sampleDurationReady
       ) {
         stage("sample", "completed");
         stage("assert", "completed");
@@ -644,11 +783,105 @@ function syncDisplayWindowFromPipeline(
   };
 }
 
+async function waitForRemoteDisplayNativeSurface(
+  commands: LanE2EAutomationCommands,
+  sessionId: string,
+  displayWindow: RemoteDisplayWindowContext,
+  timeoutMs: number,
+  now: () => number
+): Promise<{
+  attached: boolean;
+  displayWindow: RemoteDisplayWindowContext;
+  mediaPipelineSnapshot?: MediaPipelineSnapshot;
+  message?: string;
+}> {
+  const deadline =
+    now() + Math.min(timeoutMs, REMOTE_DISPLAY_SURFACE_ATTACH_TIMEOUT_MS);
+  let currentWindow = displayWindow;
+  let latestSnapshot: MediaPipelineSnapshot | undefined;
+
+  while (true) {
+    latestSnapshot = await unwrap(
+      commands.ipcMediaPipelineSnapshot(sessionId),
+      "runtime_error"
+    );
+    currentWindow = syncDisplayWindowFromPipeline(currentWindow, latestSnapshot);
+    if (remoteDisplayNativeSurfaceAttached(currentWindow, latestSnapshot)) {
+      return {
+        attached: true,
+        displayWindow: currentWindow,
+        mediaPipelineSnapshot: latestSnapshot,
+      };
+    }
+
+    if (now() >= deadline) break;
+    await sleep(REMOTE_DISPLAY_SURFACE_ATTACH_POLL_MS);
+  }
+
+  return {
+    attached: false,
+    displayWindow: currentWindow,
+    mediaPipelineSnapshot: latestSnapshot,
+    message: `Remote display native surface did not attach for ${displayWindow.label}/${displayWindow.surface_id}; attached surfaces: ${
+      latestSnapshot?.attached_surfaces.map((surface) => surface.surface_id).join(", ") ||
+      "none"
+    }`,
+  };
+}
+
+function remoteDisplayNativeSurfaceAttached(
+  displayWindow: RemoteDisplayWindowContext,
+  snapshot: MediaPipelineSnapshot
+): boolean {
+  return (
+    displayWindow.native_surface_attached === true &&
+    snapshot.attached_surfaces.some(
+      (surface) => surface.surface_id === displayWindow.surface_id
+    )
+  );
+}
+
 function renderModeForAttachedSurface(backend: string): RemoteDisplayWindowContext["render_mode"] {
   if (backend === "macos") return "macos_native";
   if (backend === "linux") return "linux_native";
   if (backend === "d3d12") return "d3d12_native";
   return "d3d11_native";
+}
+
+function buildRenderCappedMediaProfile(
+  requestedProfile: MediaProfile | undefined,
+  snapshot: MediaPipelineSnapshot | undefined,
+  alreadyApplied: boolean
+): MediaProfile | undefined {
+  if (alreadyApplied || !requestedProfile || !snapshot) return undefined;
+  const renderTargetFps = snapshot.render_pacing_target_fps;
+  if (
+    !Number.isFinite(renderTargetFps) ||
+    !renderTargetFps ||
+    renderTargetFps <= 0 ||
+    renderTargetFps >= requestedProfile.fps
+  ) {
+    return undefined;
+  }
+  return {
+    ...requestedProfile,
+    fps: Math.max(1, Math.floor(renderTargetFps)),
+  };
+}
+
+function hasReachedSampleDuration(
+  sampleDurationMs: number,
+  minSampleDurationMs: number
+): boolean {
+  return sampleDurationMs + sampleDurationToleranceFor(minSampleDurationMs) >= minSampleDurationMs;
+}
+
+function sampleDurationToleranceFor(minSampleDurationMs: number): number {
+  if (minSampleDurationMs <= 0) return 0;
+  return Math.min(
+    SAMPLE_DURATION_TOLERANCE_MS,
+    Math.floor(minSampleDurationMs * 0.01)
+  );
 }
 
 function buildAdaptiveMediaConfig(
@@ -657,6 +890,11 @@ function buildAdaptiveMediaConfig(
   overrides: AdaptiveMediaConfig | undefined
 ): AdaptiveMediaConfig {
   const ceilingProfile = requestedProfile ?? DEFAULT_LAN_MEDIA_PROFILE;
+  const normalizedCeilingProfile = {
+    ...ceilingProfile,
+    bitrate_mbps: Math.max(80, ceilingProfile.bitrate_mbps),
+    codec: ceilingProfile.codec || "h264",
+  };
   const sourceAspect =
     captureSource && captureSource.width > 0 && captureSource.height > 0
       ? captureSource.width / captureSource.height
@@ -666,22 +904,38 @@ function buildAdaptiveMediaConfig(
   return {
     enabled: true,
     mode: "keyframe_ladder",
-    ceiling_profile: {
-      ...ceilingProfile,
-      bitrate_mbps: Math.max(80, ceilingProfile.bitrate_mbps),
-      codec: ceilingProfile.codec || "h264",
-    },
+    ceiling_profile: normalizedCeilingProfile,
     floor_profile: {
+      ...normalizedCeilingProfile,
       width: floorWidth,
       height: floorHeight,
       fps: 60,
       bitrate_mbps: 10,
-      codec: "h264",
     },
     ladder: [],
     downshift_cooldown_ms: 2_000,
     upshift_hold_ms: 5_000,
     ...overrides,
+  };
+}
+
+function buildAdaptiveStartupMediaProfile(
+  requestedProfile: MediaProfile | undefined
+): MediaProfile | undefined {
+  if (!requestedProfile) return undefined;
+  if (
+    requestedProfile.fps < ADAPTIVE_STARTUP_SAFE_MIN_FPS ||
+    requestedProfile.bitrate_mbps < ADAPTIVE_STARTUP_SAFE_MIN_BITRATE_MBPS
+  ) {
+    return requestedProfile;
+  }
+
+  return {
+    ...requestedProfile,
+    bitrate_mbps: Math.max(
+      1,
+      Math.floor(requestedProfile.bitrate_mbps * ADAPTIVE_STARTUP_SAFE_BITRATE_RATIO)
+    ),
   };
 }
 
@@ -773,13 +1027,25 @@ async function selectRemoteCaptureSourceForSession(
   commands: LanE2EAutomationCommands,
   sessionId: string,
   preferredSourceId?: string,
-  preferredSourceKind?: string
+  preferredSourceKind?: string,
+  requestedProfile?: MediaProfile
 ): Promise<CaptureSourceSelection> {
   const sources = await unwrap(
     commands.ipcListRemoteCaptureSources(sessionId, false, 24),
     "capture_source_failed"
   );
   const normalizedPreferredSourceId = preferredSourceId?.trim().toLowerCase();
+  if (!normalizedPreferredSourceId && requestedProfile) {
+    const profileAwareSelection = await selectDisplayCaptureSourceForProfile(
+      commands,
+      sessionId,
+      sources,
+      preferredSourceKind,
+      requestedProfile
+    );
+    if (profileAwareSelection) return profileAwareSelection;
+  }
+
   const preferredSource =
     (normalizedPreferredSourceId
       ? sources.find((source) => source.id.toLowerCase() === normalizedPreferredSourceId)
@@ -802,6 +1068,101 @@ async function selectRemoteCaptureSourceForSession(
     );
   }
   return selection;
+}
+
+async function selectDisplayCaptureSourceForProfile(
+  commands: LanE2EAutomationCommands,
+  sessionId: string,
+  sources: CaptureSource[],
+  preferredSourceKind: string | undefined,
+  requestedProfile: MediaProfile
+): Promise<CaptureSourceSelection | undefined> {
+  if (!commands.ipcListRemoteDisplayModes) return undefined;
+
+  const candidates = displayCaptureCandidatesForProfile(sources, preferredSourceKind);
+  if (candidates.length < 2) return undefined;
+
+  let best:
+    | {
+        selection: CaptureSourceSelection;
+        score: ReturnType<typeof displayModeScore>;
+        refreshHz: number;
+        pixels: number;
+      }
+    | undefined;
+
+  for (const candidate of candidates) {
+    const selectionResult = await commands.ipcSelectRemoteCaptureSource(sessionId, candidate.id);
+    if (!selectionResult.ok || selectionResult.value.status.toLowerCase() !== "selected") {
+      continue;
+    }
+    const modesResult = await commands.ipcListRemoteDisplayModes(sessionId);
+    if (!modesResult.ok) continue;
+    const mode = chooseRemoteDisplayMode(
+      modesResult.value,
+      requestedProfile.width,
+      requestedProfile.height,
+      requestedProfile.fps
+    );
+    if (!mode) continue;
+
+    const score = displayModeScore(
+      mode,
+      requestedProfile.width,
+      requestedProfile.height,
+      requestedProfile.fps
+    );
+    const ranked = {
+      selection: selectionResult.value,
+      score,
+      refreshHz: mode.refresh_hz,
+      pixels: mode.width * mode.height,
+    };
+    if (!best || compareDisplayModeScores(ranked, best) < 0) {
+      best = ranked;
+    }
+  }
+
+  if (!best) return undefined;
+  const finalSelectionResult = await commands.ipcSelectRemoteCaptureSource(
+    sessionId,
+    best.selection.source.id
+  );
+  if (finalSelectionResult.ok && finalSelectionResult.value.status.toLowerCase() === "selected") {
+    return finalSelectionResult.value;
+  }
+  return best.selection;
+}
+
+function displayCaptureCandidatesForProfile(
+  sources: CaptureSource[],
+  preferredSourceKind?: string
+): CaptureSource[] {
+  const normalizedPreferredKind = preferredSourceKind?.trim();
+  const isDisplaySource = (source: CaptureSource) =>
+    source.source_kind === "display_shared" || source.source_kind === "display";
+  if (normalizedPreferredKind) {
+    return sources.filter(
+      (source) => source.source_kind === normalizedPreferredKind && isDisplaySource(source)
+    );
+  }
+
+  const sharedDisplays = sources.filter((source) => source.source_kind === "display_shared");
+  if (sharedDisplays.length > 1) return sharedDisplays;
+  const displays = sources.filter((source) => source.source_kind === "display");
+  if (displays.length > 1) return displays;
+  return [];
+}
+
+function compareDisplayModeScores(
+  left: { score: ReturnType<typeof displayModeScore>; refreshHz: number; pixels: number },
+  right: { score: ReturnType<typeof displayModeScore>; refreshHz: number; pixels: number }
+): number {
+  for (let index = 0; index < left.score.length; index += 1) {
+    const delta = (left.score[index] ?? 0) - (right.score[index] ?? 0);
+    if (delta !== 0) return delta;
+  }
+  return right.refreshHz - left.refreshHz || right.pixels - left.pixels;
 }
 
 function pickPreferredCaptureSource(

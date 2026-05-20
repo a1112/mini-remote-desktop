@@ -702,6 +702,9 @@ mod tests {
         harness.set_config(TestConfig {
             resolution: Some((manifest.width as usize, manifest.height as usize)),
             fps: Some(manifest.fps),
+            bitrate: std::env::var("MRD_BENCH_BITRATE_BPS")
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok()),
             renderer: Some(parse_renderer_backend(&manifest.renderer_backend)),
             transport: Some(parse_transport_backend(&manifest.transport)),
             zero_copy: Some(benchmark_zero_copy_enabled(manifest)),

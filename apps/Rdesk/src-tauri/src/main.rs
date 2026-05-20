@@ -32,7 +32,9 @@ use mrd_proto::SessionId;
 use remote_display_surface::{
     NativeRenderSurfaceSnapshot, NativeSurfaceRect, RemoteDisplaySurfaceManager,
 };
-use render_window_registry::{PendingRenderWindow, RenderWindowContext, RenderWindowRegistry};
+use render_window_registry::{
+    NativeSurfaceServiceAction, PendingRenderWindow, RenderWindowContext, RenderWindowRegistry,
+};
 use resource_monitor::{ResourceMonitor, SystemResourceSnapshot};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -76,6 +78,7 @@ const LAN_E2E_DISPLAY_MODE_POLICY_ENV: &str = "MRD_LAN_E2E_DISPLAY_MODE_POLICY";
 const LAN_E2E_CAPTURE_SOURCE_ID_ENV: &str = "MRD_LAN_E2E_CAPTURE_SOURCE_ID";
 const LAN_E2E_CAPTURE_SOURCE_KIND_ENV: &str = "MRD_LAN_E2E_CAPTURE_SOURCE_KIND";
 const LAN_E2E_EXPECTED_PEER_BUILD_ID_ENV: &str = "MRD_LAN_E2E_EXPECTED_PEER_BUILD_ID";
+const LAN_E2E_RENDER_PROFILE_CAP_ENV: &str = "MRD_LAN_E2E_RENDER_PROFILE_CAP";
 const LAN_E2E_ADAPTIVE_ENV: &str = "MRD_LAN_E2E_ADAPTIVE";
 
 static APP_IS_QUITTING: AtomicBool = AtomicBool::new(false);
@@ -539,11 +542,19 @@ async fn configure_remote_display_native_surface(
     };
     drop(window);
 
-    let context = state
-        .render_window_registry
-        .lock()
-        .unwrap()
-        .context_for_label(&app_handle, &label);
+    let (context, service_action) = {
+        let mut registry = state.render_window_registry.lock().unwrap();
+        let context = registry.context_for_label(&app_handle, &label);
+        let service_action = context.as_ref().map(|_| {
+            registry.native_surface_service_action(
+                &label,
+                snapshot.attached,
+                &snapshot.backend,
+                snapshot.hwnd.as_deref(),
+            )
+        });
+        (context, service_action)
+    };
 
     if snapshot.attached && context.is_none() {
         let _ = state
@@ -555,16 +566,21 @@ async fn configure_remote_display_native_surface(
     }
 
     if let Some(context) = context.clone() {
-        let result = if snapshot.attached {
-            send_attach_render_surface(
-                context.session_id,
-                context.surface_id,
-                snapshot.backend.clone(),
-                snapshot.hwnd.as_deref().and_then(parse_native_handle),
-            )
-            .await
-        } else {
-            send_detach_render_surface(context.session_id, context.surface_id).await
+        let result = match service_action.unwrap_or(NativeSurfaceServiceAction::Unchanged) {
+            NativeSurfaceServiceAction::Attach => {
+                send_attach_render_surface(
+                    context.session_id.clone(),
+                    context.surface_id.clone(),
+                    snapshot.backend.clone(),
+                    snapshot.hwnd.as_deref().and_then(parse_native_handle),
+                )
+                .await
+            }
+            NativeSurfaceServiceAction::Detach => {
+                send_detach_render_surface(context.session_id.clone(), context.surface_id.clone())
+                    .await
+            }
+            NativeSurfaceServiceAction::Unchanged => Ok(()),
         };
 
         if let Err(error) = result {
@@ -585,6 +601,17 @@ async fn configure_remote_display_native_surface(
                 return Err(error);
             }
             tracing::warn!(%error, "failed to notify mrd-service about detached native render surface");
+        } else if !matches!(service_action, Some(NativeSurfaceServiceAction::Unchanged)) {
+            state
+                .render_window_registry
+                .lock()
+                .unwrap()
+                .record_native_surface_service_binding(
+                    &label,
+                    snapshot.attached,
+                    &snapshot.backend,
+                    snapshot.hwnd.as_deref(),
+                );
         }
     }
 
@@ -2445,6 +2472,7 @@ struct LanE2eAutorunLaunchConfig {
     capture_source_id: Option<String>,
     capture_source_kind: Option<String>,
     expected_peer_build_id: Option<String>,
+    render_profile_cap: Option<String>,
     adaptive: Option<String>,
 }
 
@@ -2483,6 +2511,7 @@ where
         capture_source_id: non_empty_env(env(LAN_E2E_CAPTURE_SOURCE_ID_ENV)),
         capture_source_kind: non_empty_env(env(LAN_E2E_CAPTURE_SOURCE_KIND_ENV)),
         expected_peer_build_id: non_empty_env(env(LAN_E2E_EXPECTED_PEER_BUILD_ID_ENV)),
+        render_profile_cap: non_empty_env(env(LAN_E2E_RENDER_PROFILE_CAP_ENV)),
         adaptive: non_empty_env(env(LAN_E2E_ADAPTIVE_ENV)),
     })
 }
@@ -2523,6 +2552,7 @@ fn build_lan_e2e_autorun_route(config: LanE2eAutorunLaunchConfig) -> String {
         "expectedPeerBuildId",
         config.expected_peer_build_id,
     );
+    push_query_param(&mut params, "renderProfileCap", config.render_profile_cap);
     push_query_param(&mut params, "adaptive", config.adaptive);
 
     let query = params
@@ -2629,12 +2659,13 @@ mod tray_tests {
             capture_source_id: Some("windows:display-shared:1".to_string()),
             capture_source_kind: Some("display".to_string()),
             expected_peer_build_id: Some("abc123def456".to_string()),
+            render_profile_cap: Some("false".to_string()),
             adaptive: Some("true".to_string()),
         });
 
         assert_eq!(
             route,
-            "/test/e2e?autorun=lan-e2e&targetDeviceId=agent%20device%2F1&transport=quic&timeoutMs=2500&minSampleDurationMs=1500&minDecodedFrames=2&minFps=5&stopOnComplete=false&width=1920&height=1080&fps=180&bitrateMbps=20&codec=hevc&codecProfile=main&bitDepth=8&chromaSubsampling=4%3A2%3A0&pixelFormat=nv12&hdrEnabled=false&displayModePolicy=temporary&captureSourceId=windows%3Adisplay-shared%3A1&captureSourceKind=display&expectedPeerBuildId=abc123def456&adaptive=true"
+            "/test/e2e?autorun=lan-e2e&targetDeviceId=agent%20device%2F1&transport=quic&timeoutMs=2500&minSampleDurationMs=1500&minDecodedFrames=2&minFps=5&stopOnComplete=false&width=1920&height=1080&fps=180&bitrateMbps=20&codec=hevc&codecProfile=main&bitDepth=8&chromaSubsampling=4%3A2%3A0&pixelFormat=nv12&hdrEnabled=false&displayModePolicy=temporary&captureSourceId=windows%3Adisplay-shared%3A1&captureSourceKind=display&expectedPeerBuildId=abc123def456&renderProfileCap=false&adaptive=true"
         );
     }
 

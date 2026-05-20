@@ -731,6 +731,19 @@ export interface MediaAdaptationSnapshot {
   queue_depth: number;
 }
 
+export interface MediaSenderTransportSnapshot {
+  datagram_fragments_attempted: number;
+  datagram_fragments_sent: number;
+  datagram_fragments_delayed: number;
+  datagram_fragments_dropped_by_impairment: number;
+  datagram_fragments_dropped_for_capacity: number;
+  datagram_fragments_dropped_for_budget: number;
+  datagram_frames_cut_short_for_capacity: number;
+  datagram_frames_cut_short_for_budget: number;
+  reliable_fragments_sent: number;
+  reliable_frames_sent: number;
+}
+
 export interface MediaPipelineSnapshot {
   session_id: string;
   attached_surfaces: AttachedRenderSurface[];
@@ -749,10 +762,13 @@ export interface MediaPipelineSnapshot {
   codec_fallback_reason?: string | null;
   queue_depth: number;
   dropped_frames: number;
+  render_presented_frames?: number;
   render_queue_replacements?: number;
   render_lock_drops?: number;
+  render_pacing_target_fps?: number | null;
   stage_metrics: MediaStageMetrics[];
   test_impairment?: MediaTestImpairmentSnapshot | null;
+  sender_transport?: MediaSenderTransportSnapshot | null;
   adaptation?: MediaAdaptationSnapshot | null;
 }
 
@@ -804,6 +820,9 @@ export interface ProbeSnapshot {
   frames_received: number;
   frames_decoded: number;
   frames_dropped: number;
+  sequence_gap_drops?: number;
+  decode_error_drops?: number;
+  transient_drops?: number;
   current_fps?: number | null;
   bitrate_mbps?: number | null;
   media_probe_valid?: boolean;

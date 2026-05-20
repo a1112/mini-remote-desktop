@@ -30,6 +30,7 @@ use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SA
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication,
     IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
+    DXGI_OUTPUT_DESC,
 };
 #[cfg(windows)]
 use windows::Win32::Graphics::Gdi::{
@@ -143,15 +144,46 @@ struct SharedBgraTexture {
 }
 
 #[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DxgiOutputTarget {
+    pub adapter_index: u32,
+    pub output_index: u32,
+    pub device_name: String,
+    pub left: i32,
+    pub top: i32,
+    pub width: usize,
+    pub height: usize,
+}
+
+#[cfg(windows)]
 impl DxgiSharedTextureCapture {
     pub fn new_primary() -> Result<Self, PipelineError> {
         Self::new_first_output()
     }
 
+    pub fn new_for_device_name(device_name: &str) -> Result<Self, PipelineError> {
+        let requested = device_name.trim().to_string();
+        if requested.is_empty() {
+            return Err(PipelineError::message("DXGI output device name is empty"));
+        }
+        Self::new_matching_output(
+            |desc| dxgi_device_name_matches(&desc.DeviceName, &requested),
+            &format!("no attached DXGI output matched {requested}"),
+        )
+    }
+
     fn new_first_output() -> Result<Self, PipelineError> {
+        Self::new_matching_output(|_| true, "no attached DXGI output found")
+    }
+
+    fn new_matching_output(
+        mut accepts_output: impl FnMut(&DXGI_OUTPUT_DESC) -> bool,
+        missing_message: &str,
+    ) -> Result<Self, PipelineError> {
         let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.map_err(|error| {
             PipelineError::message(format!("CreateDXGIFactory1 failed: {error}"))
         })?;
+        let mut duplicate_errors = Vec::new();
 
         for adapter_index in 0..16 {
             let adapter1 = match unsafe { factory.EnumAdapters1(adapter_index) } {
@@ -173,6 +205,9 @@ impl DxgiSharedTextureCapture {
                 if !desc.AttachedToDesktop.as_bool() {
                     continue;
                 }
+                if !accepts_output(&desc) {
+                    continue;
+                }
 
                 let output1: IDXGIOutput1 = output.cast().map_err(|error| {
                     PipelineError::message(format!("cast IDXGIOutput1 failed: {error}"))
@@ -181,9 +216,19 @@ impl DxgiSharedTextureCapture {
                     create_d3d11_device_for_adapter(&adapter).map_err(|error| {
                         PipelineError::message(format!("create D3D11 device failed: {error}"))
                     })?;
-                let duplication = unsafe { output1.DuplicateOutput(&device) }.map_err(|error| {
-                    PipelineError::message(format!("DuplicateOutput failed: {error}"))
-                })?;
+                let duplication = match unsafe { output1.DuplicateOutput(&device) } {
+                    Ok(duplication) => duplication,
+                    Err(error) => {
+                        duplicate_errors.push(format!(
+                            "{} adapter={} output={}: {error}",
+                            dxgi_device_name_from_raw(&desc.DeviceName)
+                                .unwrap_or_else(|| "<unknown>".to_string()),
+                            adapter_index,
+                            output_index
+                        ));
+                        continue;
+                    }
+                };
 
                 let rect = desc.DesktopCoordinates;
                 let width = rect.right.saturating_sub(rect.left) as usize;
@@ -209,7 +254,14 @@ impl DxgiSharedTextureCapture {
             }
         }
 
-        Err(PipelineError::message("no attached DXGI output found"))
+        if duplicate_errors.is_empty() {
+            Err(PipelineError::message(missing_message.to_string()))
+        } else {
+            Err(PipelineError::message(format!(
+                "{missing_message}; DuplicateOutput failures: {}",
+                duplicate_errors.join("; ")
+            )))
+        }
     }
 
     pub fn width(&self) -> usize {
@@ -642,6 +694,27 @@ fn centered_crop_origin(
     )
 }
 
+fn dxgi_device_name_from_raw(raw: &[u16]) -> Option<String> {
+    let end = raw.iter().position(|unit| *unit == 0).unwrap_or(raw.len());
+    if end == 0 {
+        return None;
+    }
+    let value = String::from_utf16_lossy(&raw[..end]);
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn dxgi_device_name_matches(raw: &[u16], requested: &str) -> bool {
+    let Some(actual) = dxgi_device_name_from_raw(raw) else {
+        return false;
+    };
+    actual.eq_ignore_ascii_case(requested.trim())
+}
+
 fn now_us() -> Result<u64, PipelineError> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -651,7 +724,7 @@ fn now_us() -> Result<u64, PipelineError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{centered_crop_origin, repack_bgra};
+    use super::{centered_crop_origin, dxgi_device_name_matches, repack_bgra};
 
     #[test]
     fn repack_bgra_strips_padding_stride() {
@@ -673,4 +746,65 @@ mod tests {
         assert_eq!(centered_crop_origin(1920, 1080, 1920, 1080), (0, 0));
         assert_eq!(centered_crop_origin(1280, 720, 1920, 1080), (0, 0));
     }
+
+    #[test]
+    fn dxgi_device_name_matches_trimmed_case_insensitive_names() {
+        let mut raw = [0_u16; 32];
+        for (index, unit) in "\\\\.\\DISPLAY2".encode_utf16().enumerate() {
+            raw[index] = unit;
+        }
+
+        assert!(dxgi_device_name_matches(&raw, "\\\\.\\display2"));
+        assert!(!dxgi_device_name_matches(&raw, "\\\\.\\DISPLAY1"));
+    }
+}
+
+#[cfg(windows)]
+pub fn enumerate_dxgi_output_targets() -> Result<Vec<DxgiOutputTarget>, PipelineError> {
+    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }
+        .map_err(|error| PipelineError::message(format!("CreateDXGIFactory1 failed: {error}")))?;
+    let mut targets = Vec::new();
+
+    for adapter_index in 0..16 {
+        let adapter1 = match unsafe { factory.EnumAdapters1(adapter_index) } {
+            Ok(adapter) => adapter,
+            Err(_) => break,
+        };
+        let adapter: IDXGIAdapter = adapter1.cast().map_err(|error| {
+            PipelineError::message(format!("cast IDXGIAdapter failed: {error}"))
+        })?;
+
+        for output_index in 0..16 {
+            let output = match unsafe { adapter.EnumOutputs(output_index) } {
+                Ok(output) => output,
+                Err(_) => break,
+            };
+            let desc = unsafe { output.GetDesc() }.map_err(|error| {
+                PipelineError::message(format!("IDXGIOutput::GetDesc failed: {error}"))
+            })?;
+            if !desc.AttachedToDesktop.as_bool() {
+                continue;
+            }
+            let rect = desc.DesktopCoordinates;
+            let width = rect.right.saturating_sub(rect.left) as usize;
+            let height = rect.bottom.saturating_sub(rect.top) as usize;
+            if width == 0 || height == 0 {
+                continue;
+            }
+            let Some(device_name) = dxgi_device_name_from_raw(&desc.DeviceName) else {
+                continue;
+            };
+            targets.push(DxgiOutputTarget {
+                adapter_index,
+                output_index,
+                device_name,
+                left: rect.left,
+                top: rect.top,
+                width,
+                height,
+            });
+        }
+    }
+
+    Ok(targets)
 }
