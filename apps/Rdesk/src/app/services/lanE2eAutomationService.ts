@@ -227,6 +227,9 @@ const DEFAULT_LAN_MEDIA_PROFILE: MediaProfile = {
   bitrate_mbps: 80,
   codec: "h264",
 };
+const ADAPTIVE_STARTUP_SAFE_MIN_FPS = 120;
+const ADAPTIVE_STARTUP_SAFE_MIN_BITRATE_MBPS = 80;
+const ADAPTIVE_STARTUP_SAFE_BITRATE_RATIO = 0.8;
 
 export async function runLanE2EAutomation(
   commands: LanE2EAutomationCommands,
@@ -249,6 +252,8 @@ export async function runLanE2EAutomation(
     shouldRequestMediaProfile(scenarioId, transportKind)
       ? options.requestedProfile ?? DEFAULT_LAN_MEDIA_PROFILE
       : options.requestedProfile;
+  const sessionStartProfile =
+    options.adaptive ? buildAdaptiveStartupMediaProfile(requestedProfile) : requestedProfile;
   const validationMode = transportKind === "webrtc" ? "webrtc_rtp" : "quic_datagram";
   let sessionId: string | undefined;
   let peer: LanPeerInfo | undefined;
@@ -392,7 +397,7 @@ export async function runLanE2EAutomation(
         sessionId,
         selectedPeer.device_id,
         transportKind,
-        requestedProfile
+        sessionStartProfile
       ),
       "session_start_failed"
     );
@@ -749,6 +754,26 @@ function buildAdaptiveMediaConfig(
     downshift_cooldown_ms: 2_000,
     upshift_hold_ms: 5_000,
     ...overrides,
+  };
+}
+
+function buildAdaptiveStartupMediaProfile(
+  requestedProfile: MediaProfile | undefined
+): MediaProfile | undefined {
+  if (!requestedProfile) return undefined;
+  if (
+    requestedProfile.fps < ADAPTIVE_STARTUP_SAFE_MIN_FPS ||
+    requestedProfile.bitrate_mbps < ADAPTIVE_STARTUP_SAFE_MIN_BITRATE_MBPS
+  ) {
+    return requestedProfile;
+  }
+
+  return {
+    ...requestedProfile,
+    bitrate_mbps: Math.max(
+      1,
+      Math.floor(requestedProfile.bitrate_mbps * ADAPTIVE_STARTUP_SAFE_BITRATE_RATIO)
+    ),
   };
 }
 

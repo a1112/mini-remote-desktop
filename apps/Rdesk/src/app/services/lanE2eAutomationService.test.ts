@@ -470,6 +470,17 @@ describe("runLanE2EAutomation", () => {
     });
 
     expect(result.status).toBe("completed");
+    expect(commands.ipcStartLanRemoteSession).toHaveBeenCalledWith(
+      "lan-e2e-test-session",
+      "agent-device",
+      "quic",
+      expect.objectContaining({
+        width: 2560,
+        height: 1600,
+        fps: 165,
+        bitrate_mbps: 64,
+      })
+    );
     expect(ipcConfigureMediaAdaptation).toHaveBeenCalledWith(
       "lan-e2e-test-session",
       expect.objectContaining({
@@ -536,6 +547,23 @@ describe("runLanE2EAutomation", () => {
       createSessionId: () => "lan-e2e-test-session",
     });
 
+    expect(commands.ipcStartLanRemoteSession).toHaveBeenCalledWith(
+      "lan-e2e-test-session",
+      "agent-device",
+      "quic",
+      expect.objectContaining({
+        width: 2560,
+        height: 1600,
+        fps: 165,
+        bitrate_mbps: 96,
+        codec: "hevc",
+        codec_profile: "main",
+        bit_depth: 8,
+        chroma_subsampling: "4:2:0",
+        pixel_format: "nv12",
+        hdr_enabled: false,
+      })
+    );
     expect(ipcConfigureMediaAdaptation).toHaveBeenCalledWith(
       "lan-e2e-test-session",
       expect.objectContaining({
@@ -552,6 +580,55 @@ describe("runLanE2EAutomation", () => {
           hdr_enabled: false,
         }),
       })
+    );
+  });
+
+  it("keeps low bitrate adaptive session startup at the requested profile", async () => {
+    const ipcConfigureMediaAdaptation = vi.fn().mockResolvedValue(
+      ok({
+        enabled: true,
+        state: "configured",
+        ladder_index: 0,
+        current_profile: DEFAULT_REQUESTED_PROFILE,
+        target_profile: DEFAULT_REQUESTED_PROFILE,
+        last_reason: "configured",
+        last_change_ms: 1_700_000_000_000,
+        observed_fps: 0,
+        drop_ratio: 0,
+        queue_depth: 0,
+      })
+    );
+    const commands = createCommands({ ipcConfigureMediaAdaptation });
+    const requestedProfile = {
+      width: 1920,
+      height: 1080,
+      fps: 60,
+      bitrate_mbps: 20,
+      codec: "hevc",
+      codec_profile: "main",
+      bit_depth: 8,
+      chroma_subsampling: "4:2:0",
+      pixel_format: "nv12",
+      hdr_enabled: false,
+    };
+
+    await runLanE2EAutomation(commands, {
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      adaptive: true,
+      requestedProfile,
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => "lan-e2e-test-session",
+    });
+
+    expect(commands.ipcStartLanRemoteSession).toHaveBeenCalledWith(
+      "lan-e2e-test-session",
+      "agent-device",
+      "quic",
+      requestedProfile
     );
   });
 

@@ -12,7 +12,7 @@ const ADAPTATION_SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
 const ADAPTATION_DECISION_INTERVAL: Duration = Duration::from_secs(2);
 const ADAPTATION_INITIAL_PROFILE_GRACE_MS: u64 = 5_000;
 const ADAPTATION_SUBSEQUENT_DOWNSHIFT_COOLDOWN_MS: u64 = 5_000;
-const ADAPTATION_SAFE_START_MIN_BITRATE_MBPS: u32 = 90;
+const ADAPTATION_SAFE_START_MIN_BITRATE_MBPS: u32 = 80;
 const ADAPTATION_SAFE_START_MIN_FPS: u32 = 120;
 const DEFAULT_CEILING_WIDTH: u32 = 2560;
 const DEFAULT_CEILING_HEIGHT: u32 = 1440;
@@ -553,9 +553,6 @@ fn update_downshift_confirmation(
 
 fn downshift_requires_confirmation(observation: MediaAdaptationObservation) -> bool {
     if observation.no_valid_frames {
-        return false;
-    }
-    if observation.observed_fps < observation.target_fps as f32 * 0.50 {
         return false;
     }
     if observation.drop_ratio > 0.08 {
@@ -1229,7 +1226,7 @@ mod tests {
     }
 
     #[test]
-    fn normal_2k144_adaptive_profile_starts_at_ceiling() {
+    fn standard_2k144_adaptive_profile_safe_starts_on_second_rung() {
         let ladder = default_ladder_for_source(
             Some(&source(2560, 1440)),
             &config().ceiling_profile.unwrap(),
@@ -1238,6 +1235,38 @@ mod tests {
 
         assert_eq!(ladder[0].bitrate_mbps, 80);
         assert_eq!(ladder[1].bitrate_mbps, 64);
+        assert_eq!(
+            initial_ladder_index_for_profile(
+                &ladder,
+                ladder_index_for_profile(&ladder, &ladder[0])
+            ),
+            1
+        );
+        assert!(is_initial_safe_start_ladder_index(&ladder, 1));
+    }
+
+    #[test]
+    fn low_bitrate_adaptive_profile_starts_at_ceiling() {
+        let ceiling = MediaProfile {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            bitrate_mbps: 20,
+            codec: "hevc".to_string(),
+            codec_profile: Some("main".to_string()),
+            bit_depth: Some(8),
+            chroma_subsampling: Some("4:2:0".to_string()),
+            pixel_format: Some("nv12".to_string()),
+            hdr_enabled: Some(false),
+        };
+        let ladder = default_ladder_for_source(
+            Some(&source(1920, 1080)),
+            &ceiling,
+            &config().floor_profile.unwrap(),
+        );
+
+        assert_eq!(ladder[0].bitrate_mbps, 20);
+        assert_eq!(ladder[1].bitrate_mbps, 16);
         assert_eq!(
             initial_ladder_index_for_profile(
                 &ladder,
@@ -1547,7 +1576,7 @@ mod tests {
     }
 
     #[test]
-    fn severe_fps_downshift_does_not_wait_for_confirmation() {
+    fn severe_fps_without_drop_or_perceptual_stress_waits_for_confirmation() {
         let observation = MediaAdaptationObservation {
             observed_fps: 70.0,
             target_fps: 165,
@@ -1562,11 +1591,18 @@ mod tests {
         let mut pending_reason = None;
         let mut pending_windows = 0;
 
+        assert!(!update_downshift_confirmation(
+            observation,
+            &mut pending_reason,
+            &mut pending_windows
+        ));
+        assert_eq!(pending_windows, 1);
         assert!(update_downshift_confirmation(
             observation,
             &mut pending_reason,
             &mut pending_windows
         ));
+        assert_eq!(pending_windows, 2);
     }
 
     #[test]
