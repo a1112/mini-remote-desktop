@@ -1338,6 +1338,16 @@ describe("RemoteDisplayWindowPage", () => {
 
     renderRemoteDisplay();
 
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "configure_remote_display_native_surface",
+        expect.objectContaining({
+          enabled: true,
+          visible: true,
+        })
+      );
+    });
+
     const frame = await screen.findByAltText("Remote desktop frame");
     expect(frame).toHaveAttribute("src", "data:image/png;base64,REMOTE");
     expect(frame).toHaveStyle({ aspectRatio: "1280 / 720" });

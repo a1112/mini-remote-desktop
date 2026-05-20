@@ -15,6 +15,7 @@ param(
   [bool]$HdrEnabled = $false,
   [string]$CaptureSourceId = "",
   [string]$CaptureSourceKind = "display_shared",
+  [int]$RenderMaxFps = 0,
   [double]$LossPct = 0,
   [int]$BaseDelayMs = 0,
   [int]$JitterMs = 0,
@@ -22,6 +23,7 @@ param(
   [UInt64]$Seed = 0,
   [switch]$NoMotionStimulus,
   [switch]$NoBuild,
+  [switch]$NoRenderProfileCap,
   [switch]$KeepTauriOpen
 )
 
@@ -199,7 +201,9 @@ function Start-LocalServiceInstance {
     [Parameter(Mandatory = $true)][string]$DeviceId,
     [Parameter(Mandatory = $true)][string]$DeviceName,
     [Parameter(Mandatory = $true)][string]$LogsDir,
-    [Parameter(Mandatory = $true)]$Impairment
+    [Parameter(Mandatory = $true)]$Impairment,
+    [string]$ServiceBuildId = "",
+    [int]$RenderMaxFps = 0
   )
 
   New-Item -ItemType Directory -Force -Path $LogsDir | Out-Null
@@ -211,6 +215,12 @@ function Start-LocalServiceInstance {
     Set-EnvVar "MRD_LAN_DISCOVERY_PORT" ([string]$DiscoveryPort) $savedEnv
     Set-EnvVar "MRD_LAN_DISCOVERY_PROBE_ENDPOINTS" "127.0.0.1:$PeerDiscoveryPort" $savedEnv
     Set-EnvVar "RUST_LOG" "info" $savedEnv
+    if ($ServiceBuildId.Trim()) {
+      Set-EnvVar "MRD_SERVICE_BUILD_ID" $ServiceBuildId.Trim() $savedEnv
+    }
+    if ($RenderMaxFps -gt 0) {
+      Set-EnvVar "MRD_LAN_RENDER_MAX_FPS" ([string]$RenderMaxFps) $savedEnv
+    }
 
     if ($Role -eq "peer") {
       Set-EnvVar "MRD_LAN_TEST_IMPAIRMENT_LOSS_PCT" ([string]$Impairment.loss_pct) $savedEnv
@@ -259,7 +269,9 @@ function Invoke-LocalDualProcessProfile {
     [Parameter(Mandatory = $true)][string]$DisplayModePolicy,
     [string]$CaptureSourceId = "",
     [string]$CaptureSourceKind = "display_shared",
+    [int]$RenderMaxFps = 0,
     [switch]$NoMotionStimulus,
+    [switch]$NoRenderProfileCap,
     [switch]$KeepTauriOpen
   )
 
@@ -308,7 +320,9 @@ function Invoke-LocalDualProcessProfile {
       -DeviceId $controllerDeviceId `
       -DeviceName "Local Dual Controller" `
       -LogsDir (Join-Path $logsDir "controller") `
-      -Impairment $Impairment
+      -Impairment $Impairment `
+      -ServiceBuildId $GitCommit `
+      -RenderMaxFps $RenderMaxFps
 
     $peer = Start-LocalServiceInstance `
       -ServiceExe $runServiceExe `
@@ -319,7 +333,9 @@ function Invoke-LocalDualProcessProfile {
       -DeviceId $peerDeviceId `
       -DeviceName "Local Dual Peer" `
       -LogsDir (Join-Path $logsDir "peer") `
-      -Impairment $Impairment
+      -Impairment $Impairment `
+      -ServiceBuildId $GitCommit `
+      -RenderMaxFps $RenderMaxFps
 
     Wait-IpcServiceHealth -PipeEndpoint $controllerPipe -TimeoutSecs 20 | Out-Null
     Wait-IpcServiceHealth -PipeEndpoint $peerPipe -TimeoutSecs 20 | Out-Null
@@ -357,6 +373,9 @@ function Invoke-LocalDualProcessProfile {
     Set-EnvVar "MRD_LAN_E2E_PROFILE_HDR_ENABLED" ([string]$HdrEnabled).ToLowerInvariant() $savedEnv
     Set-EnvVar "MRD_LAN_E2E_DISPLAY_MODE_POLICY" $DisplayModePolicy $savedEnv
     Set-EnvVar "MRD_LAN_E2E_EXPECTED_PEER_BUILD_ID" $GitCommit $savedEnv
+    if ($NoRenderProfileCap) {
+      Set-EnvVar "MRD_LAN_E2E_RENDER_PROFILE_CAP" "false" $savedEnv
+    }
     if ($Profile.adaptive) {
       Set-EnvVar "MRD_LAN_E2E_ADAPTIVE" "true" $savedEnv
     }
@@ -540,7 +559,9 @@ foreach ($profile in $profiles) {
     -DisplayModePolicy $DisplayModePolicy `
     -CaptureSourceId $CaptureSourceId `
     -CaptureSourceKind $CaptureSourceKind `
+    -RenderMaxFps $RenderMaxFps `
     -NoMotionStimulus:$NoMotionStimulus `
+    -NoRenderProfileCap:$NoRenderProfileCap `
     -KeepTauriOpen:$KeepTauriOpen
 }
 
@@ -553,6 +574,7 @@ $report | Add-Member -Force -NotePropertyName "capture_source_request" -NoteProp
   id = if ($CaptureSourceId.Trim()) { $CaptureSourceId.Trim() } else { $null }
   kind = if ($CaptureSourceKind.Trim()) { $CaptureSourceKind.Trim() } else { $null }
 })
+$report | Add-Member -Force -NotePropertyName "render_max_fps_override" -NotePropertyValue $(if ($RenderMaxFps -gt 0) { $RenderMaxFps } else { $null })
 $report | Add-Member -Force -NotePropertyName "codec_request" -NotePropertyValue ([pscustomobject]@{
   codec = $Codec
   codec_profile = if ($CodecProfile.Trim()) { $CodecProfile.Trim() } else { $null }

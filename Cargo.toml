@@ -61,6 +61,7 @@ bytes = "1"
 nvenc = { path = "vendor/nvenc" }
 
 [profile.dev.package.app]
+codegen-units = 1
 opt-level = 2
 
 [profile.dev.package.mrd-encode-openh264]

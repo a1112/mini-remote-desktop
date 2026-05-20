@@ -606,6 +606,7 @@ function buildLanAutomationOptionsFromSearchParams(
     preferredCaptureSourceKind:
       searchParams.get("captureSourceKind") ?? searchParams.get("captureKind") ?? undefined,
     expectedPeerBuildId: searchParams.get("expectedPeerBuildId") ?? undefined,
+    renderProfileCap: parseOptionalBoolean(searchParams.get("renderProfileCap")),
     adaptive: parseOptionalBoolean(searchParams.get("adaptive")),
     requestedProfile: parseRequestedProfile(searchParams),
   };

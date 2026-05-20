@@ -67,7 +67,7 @@ const LAN_QUIC_FALLBACK_DATAGRAM_BYTES: usize = 1_200;
 // Larger datagrams reduce sender P95 but raised cross-device frame drop ratio.
 const LAN_QUIC_LAN_HIGH_QUALITY_DATAGRAM_BYTES: usize = LAN_QUIC_FALLBACK_DATAGRAM_BYTES;
 const LAN_QUIC_RELIABLE_WHOLE_FRAME_MIN_BITRATE_MBPS: u32 = 80;
-const LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_BITRATE_MBPS: u32 = 120;
+const LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_BITRATE_MBPS: u32 = 100;
 const LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_FPS: u32 = 120;
 const LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES: usize = 4 * 1024 * 1024;
 const LAN_QUIC_RELIABLE_MEDIA_RETRY_DELAY: Duration = Duration::from_millis(10);
@@ -114,7 +114,9 @@ const LAN_MEDIA_RECEIVER_MAX_CONSECUTIVE_DECODE_ERRORS: u32 = 8;
 const LAN_MEDIA_RECEIVER_DECODE_ERROR_LOG_INTERVAL: u32 = 3;
 const LAN_MEDIA_REASSEMBLER_FRAME_TIMEOUT_MS: u64 = 1_500;
 const LAN_MEDIA_REASSEMBLER_MAX_PENDING_FRAMES: usize = 256;
-const LAN_MEDIA_RECEIVER_REORDER_MAX_PENDING_FRAMES: usize = 1;
+// Small bounded reorder window: absorbs normal QUIC stream/datagram jitter at 144-180 Hz
+// without letting a genuinely missing frame add visible input latency.
+const LAN_MEDIA_RECEIVER_REORDER_MAX_PENDING_FRAMES: usize = 4;
 const LAN_MEDIA_PROBE_MAGIC: &[u8; 8] = b"MRDMPF01";
 const LAN_MEDIA_PROBE_HEADER_BYTES: usize = 56;
 const LAN_MEDIA_PROBE_NATIVE_HIGH_FORMAT: &str = "compressed_native_high_test_pattern";
@@ -7294,6 +7296,21 @@ mod tests {
     }
 
     #[test]
+    fn production_lan_media_frame_orderer_absorbs_short_high_refresh_reordering() {
+        let mut orderer = LanMediaFrameOrderer::new(LAN_MEDIA_RECEIVER_REORDER_MAX_PENDING_FRAMES);
+
+        assert_eq!(
+            frame_ids(&orderer.push(test_quic_au_frame(100, true))),
+            vec![100]
+        );
+        assert!(orderer.push(test_quic_au_frame(102, false)).is_empty());
+        assert!(orderer.push(test_quic_au_frame(103, false)).is_empty());
+        let ready = orderer.push(test_quic_au_frame(101, false));
+
+        assert_eq!(frame_ids(&ready), vec![101, 102, 103]);
+    }
+
+    #[test]
     fn decoder_candidate_preference_keeps_fallback_backend_first() {
         let candidates = prioritize_lan_receiver_decoder_candidates(
             vec!["nvdec", "h264_software"],
@@ -8807,6 +8824,14 @@ mod tests {
             codec: "hevc".to_string(),
             ..MediaProfile::default()
         };
+        let high_refresh_2k180 = MediaProfile {
+            width: 2560,
+            height: 1440,
+            fps: 180,
+            bitrate_mbps: 100,
+            codec: "h264".to_string(),
+            ..MediaProfile::default()
+        };
         let stable_2k144 = MediaProfile {
             width: 2560,
             height: 1440,
@@ -8828,6 +8853,13 @@ mod tests {
             true,
             64,
             &render_capped,
+            None
+        ));
+        assert!(should_send_access_unit_as_reliable_frame(
+            true,
+            true,
+            64,
+            &high_refresh_2k180,
             None
         ));
         assert!(!should_send_access_unit_as_reliable_frame(

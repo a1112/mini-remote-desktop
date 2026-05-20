@@ -88,6 +88,7 @@ export interface LanE2EAutomationOptions {
   preferredCaptureSourceId?: string;
   preferredCaptureSourceKind?: string;
   expectedPeerBuildId?: string;
+  renderProfileCap?: boolean;
   adaptive?: boolean;
   adaptiveConfig?: AdaptiveMediaConfig;
   faultPlan?: CrossDeviceFaultPlan;
@@ -233,6 +234,9 @@ const DEFAULT_LAN_MEDIA_PROFILE: MediaProfile = {
 const ADAPTIVE_STARTUP_SAFE_MIN_FPS = 120;
 const ADAPTIVE_STARTUP_SAFE_MIN_BITRATE_MBPS = 80;
 const ADAPTIVE_STARTUP_SAFE_BITRATE_RATIO = 0.8;
+const SAMPLE_DURATION_TOLERANCE_MS = 250;
+const REMOTE_DISPLAY_SURFACE_ATTACH_TIMEOUT_MS = 10_000;
+const REMOTE_DISPLAY_SURFACE_ATTACH_POLL_MS = 100;
 
 export async function runLanE2EAutomation(
   commands: LanE2EAutomationCommands,
@@ -246,11 +250,17 @@ export async function runLanE2EAutomation(
   const sampleIntervalMs = options.sampleIntervalMs ?? DEFAULT_SAMPLE_INTERVAL_MS;
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const minSampleDurationMs = options.minSampleDurationMs ?? DEFAULT_MIN_SAMPLE_DURATION_MS;
+  const sampleDurationToleranceMs = sampleDurationToleranceFor(minSampleDurationMs);
+  const sampleWindowTimeoutMs = Math.max(
+    timeoutMs,
+    minSampleDurationMs + sampleIntervalMs + sampleDurationToleranceMs
+  );
   const minDecodedFrames = options.minDecodedFrames ?? DEFAULT_MIN_DECODED_FRAMES;
   const minFps = options.minFps ?? DEFAULT_MIN_FPS;
   const stopOnComplete = options.stopOnComplete ?? true;
   const transportKind = options.transportKind ?? "quic";
   const displayModePolicy = options.displayModePolicy ?? "none";
+  const renderProfileCapEnabled = options.renderProfileCap ?? true;
   let requestedProfile =
     shouldRequestMediaProfile(scenarioId, transportKind)
       ? options.requestedProfile ?? DEFAULT_LAN_MEDIA_PROFILE
@@ -453,7 +463,7 @@ export async function runLanE2EAutomation(
             captureSourceSelection = await selectRemoteCaptureSourceForSession(
               commands,
               sessionId,
-              options.preferredCaptureSourceId ?? captureSource.id,
+              options.preferredCaptureSourceId,
               options.preferredCaptureSourceKind,
               requestedProfile
             );
@@ -502,6 +512,20 @@ export async function runLanE2EAutomation(
       commands.openRemoteDisplayWindow({ sessionId }),
       "display_window_failed"
     );
+
+    const nativeSurface = await waitForRemoteDisplayNativeSurface(
+      commands,
+      sessionId,
+      displayWindow,
+      timeoutMs,
+      now
+    );
+    displayWindow = nativeSurface.displayWindow;
+    mediaPipelineSnapshot = nativeSurface.mediaPipelineSnapshot;
+    if (!nativeSurface.attached) {
+      stage("display", "failed", nativeSurface.message);
+      return finish("failed", "display_window_failed", nativeSurface.message);
+    }
     stage("display", "completed");
 
     if (scenarioId === "cross.fault.recovery") {
@@ -540,7 +564,7 @@ export async function runLanE2EAutomation(
     }
 
     stage("sample", "started");
-    const deadline = now() + timeoutMs;
+    let deadline = now() + sampleWindowTimeoutMs;
     let sampleStartedAt = now();
     while (now() <= deadline) {
       sessionSnapshot = await unwrap(
@@ -556,11 +580,13 @@ export async function runLanE2EAutomation(
       if (displayWindow) {
         displayWindow = syncDisplayWindowFromPipeline(displayWindow, mediaPipelineSnapshot);
       }
-      const renderCappedProfile = buildRenderCappedMediaProfile(
-        requestedProfile,
-        mediaPipelineSnapshot,
-        renderCappedProfileApplied
-      );
+      const renderCappedProfile = renderProfileCapEnabled
+        ? buildRenderCappedMediaProfile(
+            requestedProfile,
+            mediaPipelineSnapshot,
+            renderCappedProfileApplied
+          )
+        : undefined;
       if (renderCappedProfile && commands.ipcUpdateMediaProfile && !options.adaptive) {
         await unwrap(
           commands.ipcUpdateMediaProfile(sessionId, renderCappedProfile),
@@ -569,6 +595,7 @@ export async function runLanE2EAutomation(
         requestedProfile = renderCappedProfile;
         renderCappedProfileApplied = true;
         sampleStartedAt = now();
+        deadline = sampleStartedAt + sampleWindowTimeoutMs;
         sampleDurationMs = 0;
         sampleFramesDecoded = 0;
         sampleFramesDropped = 0;
@@ -648,7 +675,11 @@ export async function runLanE2EAutomation(
         validationMode
       );
       const profileMismatch = describeProfileProbeFailure(profileProbeResult);
-      if (!options.adaptive && profileMismatch && sampleDurationMs >= minSampleDurationMs) {
+      const sampleDurationReady = hasReachedSampleDuration(
+        sampleDurationMs,
+        minSampleDurationMs
+      );
+      if (!options.adaptive && profileMismatch && sampleDurationReady) {
         stage("assert", "failed", profileMismatch);
         return finish("failed", "media_profile_mismatch", profileMismatch);
       }
@@ -656,7 +687,7 @@ export async function runLanE2EAutomation(
         !options.adaptive &&
         profileProbeResult?.status === "degraded" &&
         probeSnapshot.frames_decoded >= minDecodedFrames &&
-        sampleDurationMs >= minSampleDurationMs
+        sampleDurationReady
       ) {
         const message =
           profileProbeResult.error ?? "Runtime media profile was downgraded by the remote source";
@@ -668,7 +699,7 @@ export async function runLanE2EAutomation(
         probeSnapshot.frames_decoded >= minDecodedFrames &&
         (validationMode !== "quic_datagram" || probeSnapshot.media_probe_valid === true) &&
         fpsForThreshold >= minFps &&
-        sampleDurationMs >= minSampleDurationMs
+        sampleDurationReady
       ) {
         stage("sample", "completed");
         stage("assert", "completed");
@@ -726,6 +757,64 @@ function syncDisplayWindowFromPipeline(
   };
 }
 
+async function waitForRemoteDisplayNativeSurface(
+  commands: LanE2EAutomationCommands,
+  sessionId: string,
+  displayWindow: RemoteDisplayWindowContext,
+  timeoutMs: number,
+  now: () => number
+): Promise<{
+  attached: boolean;
+  displayWindow: RemoteDisplayWindowContext;
+  mediaPipelineSnapshot?: MediaPipelineSnapshot;
+  message?: string;
+}> {
+  const deadline =
+    now() + Math.min(timeoutMs, REMOTE_DISPLAY_SURFACE_ATTACH_TIMEOUT_MS);
+  let currentWindow = displayWindow;
+  let latestSnapshot: MediaPipelineSnapshot | undefined;
+
+  while (true) {
+    latestSnapshot = await unwrap(
+      commands.ipcMediaPipelineSnapshot(sessionId),
+      "runtime_error"
+    );
+    currentWindow = syncDisplayWindowFromPipeline(currentWindow, latestSnapshot);
+    if (remoteDisplayNativeSurfaceAttached(currentWindow, latestSnapshot)) {
+      return {
+        attached: true,
+        displayWindow: currentWindow,
+        mediaPipelineSnapshot: latestSnapshot,
+      };
+    }
+
+    if (now() >= deadline) break;
+    await sleep(REMOTE_DISPLAY_SURFACE_ATTACH_POLL_MS);
+  }
+
+  return {
+    attached: false,
+    displayWindow: currentWindow,
+    mediaPipelineSnapshot: latestSnapshot,
+    message: `Remote display native surface did not attach for ${displayWindow.label}/${displayWindow.surface_id}; attached surfaces: ${
+      latestSnapshot?.attached_surfaces.map((surface) => surface.surface_id).join(", ") ||
+      "none"
+    }`,
+  };
+}
+
+function remoteDisplayNativeSurfaceAttached(
+  displayWindow: RemoteDisplayWindowContext,
+  snapshot: MediaPipelineSnapshot
+): boolean {
+  return (
+    displayWindow.native_surface_attached === true &&
+    snapshot.attached_surfaces.some(
+      (surface) => surface.surface_id === displayWindow.surface_id
+    )
+  );
+}
+
 function renderModeForAttachedSurface(backend: string): RemoteDisplayWindowContext["render_mode"] {
   if (backend === "macos") return "macos_native";
   if (backend === "linux") return "linux_native";
@@ -752,6 +841,21 @@ function buildRenderCappedMediaProfile(
     ...requestedProfile,
     fps: Math.max(1, Math.floor(renderTargetFps)),
   };
+}
+
+function hasReachedSampleDuration(
+  sampleDurationMs: number,
+  minSampleDurationMs: number
+): boolean {
+  return sampleDurationMs + sampleDurationToleranceFor(minSampleDurationMs) >= minSampleDurationMs;
+}
+
+function sampleDurationToleranceFor(minSampleDurationMs: number): number {
+  if (minSampleDurationMs <= 0) return 0;
+  return Math.min(
+    SAMPLE_DURATION_TOLERANCE_MS,
+    Math.floor(minSampleDurationMs * 0.01)
+  );
 }
 
 function buildAdaptiveMediaConfig(
