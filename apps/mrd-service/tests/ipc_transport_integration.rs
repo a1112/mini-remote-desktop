@@ -34,6 +34,7 @@ fn test_endpoint(test_name: &str) -> IpcEndpoint {
 }
 
 /// Start a real IPC server in the background
+#[allow(dead_code)]
 async fn start_ipc_server() -> anyhow::Result<()> {
     let app_state = Arc::new(mrd_service::app_state::AppState::new());
     let server =

@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 pub use mrd_pipeline_core::{
     DecodedFrame as CoreDecodedFrame, DecodedFrameData, PipelineError, RuntimeStatus, VideoDecoder,
 };

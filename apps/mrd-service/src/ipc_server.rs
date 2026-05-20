@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 // IPC server for mrd-service
 //
 // Handles incoming IPC requests from Rdesk shell and dispatches

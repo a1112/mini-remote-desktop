@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 // mrd-service application state
 //
 // This module defines the shared state owned by mrd-service.

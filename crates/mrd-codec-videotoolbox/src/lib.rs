@@ -1,6 +1,12 @@
+#[cfg(target_os = "macos")]
 use mrd_pipeline_core::{
     CapturedFrame, DecodedFrame as CoreDecodedFrame, EncodedAccessUnit, FramePixelFormat,
     PipelineError, VideoCodec, VideoDecoder, VideoEncoder,
+};
+#[cfg(not(target_os = "macos"))]
+use mrd_pipeline_core::{
+    CapturedFrame, DecodedFrame as CoreDecodedFrame, EncodedAccessUnit, PipelineError,
+    VideoDecoder, VideoEncoder,
 };
 
 #[cfg(target_os = "macos")]

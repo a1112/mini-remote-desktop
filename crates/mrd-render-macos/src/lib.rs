@@ -3,9 +3,11 @@
 #[cfg(target_os = "macos")]
 use metal::foreign_types::ForeignType;
 use mrd_render::{
-    BoxedRenderer, RenderError, RenderFrame, RenderFrameData, RenderPixelFormat, RenderTarget,
-    RendererDescriptor, RendererFactory, RendererInstance, RendererSnapshot, RuntimeStatus,
+    BoxedRenderer, RenderError, RenderPixelFormat, RendererDescriptor, RendererFactory,
+    RuntimeStatus,
 };
+#[cfg(target_os = "macos")]
+use mrd_render::{RenderFrame, RenderFrameData, RenderTarget, RendererInstance, RendererSnapshot};
 
 const MACOS_SUPPORTED_FORMATS: &[RenderPixelFormat] =
     &[RenderPixelFormat::Rgb24, RenderPixelFormat::Bgra32];

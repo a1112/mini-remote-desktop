@@ -5,8 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-core-graphics = "0.23"
 mrd-pipeline-core = { path = "../mrd-pipeline-core" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.23"
 screencapturekit = "1.5.4"
 
 [dev-dependencies]
