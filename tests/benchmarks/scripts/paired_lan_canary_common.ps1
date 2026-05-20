@@ -247,7 +247,8 @@ function Convert-LocalSummaryToCanaryRow {
   param(
     [Parameter(Mandatory = $true)]$Profile,
     [Parameter(Mandatory = $true)]$Summary,
-    [string]$SummaryPath
+    [string]$SummaryPath,
+    [string]$RequestedCodec = "h264"
   )
 
   $status = if ($Summary.run_passed) { "completed" } else { "failed" }
@@ -261,7 +262,7 @@ function Convert-LocalSummaryToCanaryRow {
     fps = [int]$Profile.fps
     bitrate_mbps = [int]$Profile.bitrate_mbps
     duration_secs = [int]$Profile.duration_secs
-    chain = New-CanaryMediaChain -Mode "local" -Codec "h264"
+    chain = New-CanaryMediaChain -Mode "local" -Codec $RequestedCodec
     status = $status
     classification = $classification
     fps_observed = [double](Select-CanaryValue $Summary.fps_observed 0)
@@ -290,6 +291,8 @@ function Convert-LocalSummaryToCanaryRow {
       present = $Summary.render_present_p95_ms
     }
     raw_summary_path = $SummaryPath
+    requested_codec = Normalize-CanaryCodec $RequestedCodec
+    active_codec = Normalize-CanaryCodec $RequestedCodec
     error_message = $null
   }
 }

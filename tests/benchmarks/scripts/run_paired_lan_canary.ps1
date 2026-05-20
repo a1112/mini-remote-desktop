@@ -188,7 +188,7 @@ function Get-IPv4BroadcastAddress([string]$IPAddress, [int]$PrefixLength) {
   [System.Net.IPAddress]::new($broadcast).ToString()
 }
 
-function Invoke-LocalCanaryProfile($Repo, $Profile, $GitCommit) {
+function Invoke-LocalCanaryProfile($Repo, $Profile, $GitCommit, [string]$Codec) {
   $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
   $date = Get-Date -Format 'yyyy-MM-dd'
   $runId = "paired-local-$($Profile.id)-$timestamp-$GitCommit"
@@ -211,9 +211,14 @@ function Invoke-LocalCanaryProfile($Repo, $Profile, $GitCommit) {
     Set-EnvVar "MRD_BENCH_GIT_COMMIT" $GitCommit $savedEnv
     Set-EnvVar "MRD_BENCH_TRANSPORT" "quic_datagram" $savedEnv
     Set-EnvVar "MRD_BENCH_CAPTURE_BACKEND" "dxgi" $savedEnv
-    Set-EnvVar "MRD_BENCH_ENCODE_BACKEND" "nvenc_h264" $savedEnv
+    if ((Normalize-CanaryCodec $Codec) -eq "hevc") {
+      Set-EnvVar "MRD_BENCH_ENCODE_BACKEND" "nvenc_hevc" $savedEnv
+    } else {
+      Set-EnvVar "MRD_BENCH_ENCODE_BACKEND" "nvenc_h264" $savedEnv
+    }
     Set-EnvVar "MRD_BENCH_DECODE_BACKEND" "nvdec" $savedEnv
     Set-EnvVar "MRD_BENCH_RENDERER_BACKEND" "d3d11_shared" $savedEnv
+    Set-EnvVar "MRD_BENCH_BITRATE_BPS" ([string]([int64]$Profile.bitrate_mbps * 1000000)) $savedEnv
 
     $stdout = Join-Path $logsDir "host.stdout.log"
     $stderr = Join-Path $logsDir "host.stderr.log"
@@ -225,7 +230,7 @@ function Invoke-LocalCanaryProfile($Repo, $Profile, $GitCommit) {
     powershell -ExecutionPolicy Bypass -File (Join-Path $Repo "tests/benchmarks/scripts/summarize_transport_results.ps1") -RunDir $runDir
     $summaryPath = Join-Path $runDir "summary.json"
     $summary = Get-Content $summaryPath -Raw | ConvertFrom-Json
-    Convert-LocalSummaryToCanaryRow -Profile $Profile -Summary $summary -SummaryPath $summaryPath
+    Convert-LocalSummaryToCanaryRow -Profile $Profile -Summary $summary -SummaryPath $summaryPath -RequestedCodec $Codec
   } finally {
     Restore-EnvVars $savedEnv
   }
@@ -364,7 +369,7 @@ $localRows = @()
 if (-not $SkipLocal) {
   foreach ($profile in $profiles) {
     Write-Host "Running local canary $($profile.id)"
-    $localRows += Invoke-LocalCanaryProfile -Repo $repo -Profile $profile -GitCommit $gitCommit
+    $localRows += Invoke-LocalCanaryProfile -Repo $repo -Profile $profile -GitCommit $gitCommit -Codec $Codec
   }
 }
 
@@ -385,7 +390,7 @@ if (-not $SkipCross) {
   }
 }
 
-$localReport = New-PairedLanCanaryReport -Mode "local" -Rows $localRows -GitCommit $gitCommit -Codec "h264"
+$localReport = New-PairedLanCanaryReport -Mode "local" -Rows $localRows -GitCommit $gitCommit -Codec $Codec
 $crossReport = New-PairedLanCanaryReport -Mode "cross" -Rows $crossRows -GitCommit $gitCommit -Codec $Codec
 $crossReport | Add-Member -Force -NotePropertyName "codec_request" -NotePropertyValue ([pscustomobject]@{
   codec = $Codec
