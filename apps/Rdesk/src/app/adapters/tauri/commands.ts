@@ -97,24 +97,12 @@ function browserDevCapabilities(): EnvironmentSnapshot | null {
     cpu_brand: 'Browser dev fallback',
     cpu_cores: navigator.hardwareConcurrency || 1,
     memory_gb: 0,
-    gpu_info: 'Unavailable outside Tauri shell',
-    available_captures: isMac
-      ? ['macos', 'synthetic']
-      : isWindows
-        ? ['dxgi', 'winrt', 'synthetic']
-        : ['synthetic'],
-    available_encoders: isMac
-      ? ['none', 'videotoolbox_h264', 'openh264']
-      : isWindows
-        ? ['none', 'openh264']
-        : ['none', 'openh264'],
-    available_decoders: isMac ? ['none', 'software', 'videotoolbox'] : ['none', 'software'],
-    available_renderers: isMac
-      ? ['macos', 'webview']
-      : isWindows
-      ? ['d3d11', 'd3d12', 'opengl', 'webview']
-      : ['webview'],
-    available_memory_modes: isWindows ? ['cpu', 'd3d11_shared'] : ['cpu'],
+    gpu_info: 'mrd-service not connected; browser diagnostic fallback only',
+    available_captures: ['synthetic'],
+    available_encoders: ['none', 'openh264'],
+    available_decoders: ['none', 'software'],
+    available_renderers: ['webview'],
+    available_memory_modes: ['cpu'],
   };
 }
 

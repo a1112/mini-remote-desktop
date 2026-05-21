@@ -77,7 +77,74 @@ function windowsCapabilities(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function capabilityItem(id: string, domain: string, status: string, reason?: string) {
+  return {
+    id,
+    domain,
+    label: id,
+    status,
+    platform: "windows",
+    reason: reason ?? null,
+    detail: null,
+    requires: [],
+    conflicts_with: [],
+    depends_on: [],
+    fallback_ids: [],
+    last_probe_time_ms: null,
+  };
+}
+
+function serviceCapabilitySnapshot(capabilities: ReturnType<typeof capabilityItem>[]) {
+  return {
+    schema_version: 1,
+    platform: "windows",
+    service_version: "test",
+    capabilities,
+    constraints: [],
+    profiles: [],
+    recent_profile_results: [],
+    updated_at_ms: 1,
+  };
+}
+
 describe("MatrixTestPage failure handling", () => {
+  it("uses service capability status instead of legacy environment defaults", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(
+          windowsCapabilities({
+            available_encoders: ["nvenc_h264", "openh264"],
+            available_decoders: ["nvdec", "software"],
+            available_renderers: ["none", "d3d11"],
+            available_memory_modes: ["cpu", "d3d11_shared"],
+          })
+        );
+      }
+      if (command === "ipc_capability_snapshot") {
+        return Promise.resolve(
+          serviceCapabilitySnapshot([
+            capabilityItem("capture.synthetic", "capture", "available"),
+            capabilityItem("encode.nvenc_h264", "encode", "hardware_missing", "NVENC probe failed"),
+            capabilityItem("encode.openh264", "encode", "degraded", "software fallback"),
+            capabilityItem("decode.software", "decode", "degraded", "software fallback"),
+            capabilityItem("render.webview", "render", "degraded", "diagnostic fallback"),
+            capabilityItem("memory.cpu", "memory", "available"),
+            capabilityItem("transport.loopback", "transport", "available"),
+          ])
+        );
+      }
+      return Promise.resolve(null);
+    });
+
+    render(<MatrixTestPage />);
+
+    expect(await screen.findByLabelText("Synthetic")).toBeInTheDocument();
+    expect(screen.queryByLabelText("NVENC H.264")).not.toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: /OpenH264/ })).not.toBeChecked();
+    expect(screen.getByRole("checkbox", { name: /软件/ })).not.toBeChecked();
+  });
+
   it("exposes 180 and 249 FPS high-refresh matrix options", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {
@@ -91,6 +158,37 @@ describe("MatrixTestPage failure handling", () => {
 
     expect(await screen.findByLabelText("180 FPS")).toBeInTheDocument();
     expect(screen.getByLabelText("249 FPS")).toBeInTheDocument();
+  });
+
+  it("removes non-target resolution presets from the matrix", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation(() => Promise.resolve(null));
+
+    render(<MatrixTestPage />);
+
+    expect(screen.queryByLabelText("768p")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("900p")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("1200p")).not.toBeInTheDocument();
+  });
+
+  it("disables loopback when the execution scope is cross-device", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation(() => Promise.resolve(null));
+
+    render(<MatrixTestPage runDelayMs={0} />);
+
+    fireEvent.change(screen.getByLabelText("执行范围"), {
+      target: { value: "cross-device" },
+    });
+
+    await waitFor(() => {
+      const loopback = screen.getByLabelText("Loopback") as HTMLInputElement;
+      expect(loopback).toBeDisabled();
+      expect(loopback).not.toBeChecked();
+    });
+    expect(screen.getByText("仅本机")).toBeInTheDocument();
+    expect(screen.getByText(/Loopback 仅支持本机进程内测试/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /启动矩阵测试/ })).toBeDisabled();
   });
 
   it("exposes HEVC encoders when Windows capabilities report NVENC HEVC support", async () => {
@@ -1037,6 +1135,7 @@ describe("MatrixTestPage failure handling", () => {
       target: { value: "linux-agent" },
     });
     selectSingleSupportedCombination();
+    fireEvent.click(screen.getByLabelText("QUIC Datagram"));
     fireEvent.click(screen.getByLabelText("5 Mbps"));
     fireEvent.click(screen.getByLabelText("8 Mbps"));
     fireEvent.click(screen.getByRole("button", { name: /启动矩阵测试/ }));
@@ -1262,7 +1361,13 @@ describe("MatrixTestPage failure handling", () => {
       if (command === "ipc_media_pipeline_snapshot") {
         return Promise.resolve({
           session_id: args?.sessionId,
-          attached_surfaces: [],
+          attached_surfaces: [
+            {
+              surface_id: "surface-1",
+              backend: "d3d11",
+              window_handle: 1,
+            },
+          ],
           active_decoder: "nvdec",
           active_renderer: "d3d11",
           queue_depth: 0,
@@ -1284,6 +1389,7 @@ describe("MatrixTestPage failure handling", () => {
       target: { value: "linux-agent" },
     });
     selectSingleSupportedCombination();
+    fireEvent.click(screen.getByLabelText("QUIC Datagram"));
     fireEvent.click(screen.getByRole("button", { name: /启动矩阵测试/ }));
 
     await screen.findByText(/Runtime media profile downgraded/, undefined, {

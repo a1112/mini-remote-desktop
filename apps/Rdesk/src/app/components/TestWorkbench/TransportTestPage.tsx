@@ -14,6 +14,14 @@ import {
 } from "../../services/lanE2eAutomationService";
 import { chooseCapability } from "./capabilityMeta";
 import {
+  buildCapabilitySnapshotFromIpc,
+  capabilityForOption,
+  capabilityOptionState,
+  environmentSnapshotFromCapabilitySnapshot,
+  shouldShowCapabilityOptionForSnapshot,
+  type CapabilitySnapshot,
+} from "../../services/capabilityMatrix";
+import {
   shouldShowCapabilityOption,
   useShowUnavailableCapabilities,
 } from "./useCapabilityVisibility";
@@ -53,6 +61,8 @@ interface TransportOption {
   description: string;
   available: boolean;
   icon: React.ReactNode;
+  statusLabel?: string;
+  unavailableReason?: string;
 }
 
 const TRANSPORT_OPTIONS: TransportOption[] = [
@@ -99,13 +109,31 @@ export function TransportTestPage() {
   const [metrics, setMetrics] = useState<TransportMetrics | null>(null);
   const [throughputHistory, setThroughputHistory] = useState<number[]>([]);
   const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
+  const [serviceCapabilitySnapshot, setServiceCapabilitySnapshot] =
+    useState<CapabilitySnapshot | null>(null);
   const [startError, setStartError] = useState<string | null>(null);
   const [showUnavailable] = useShowUnavailableCapabilities();
 
-  const selectedOption = TRANSPORT_OPTIONS.find((o) => o.id === selectedTransport);
-  const visibleTransportOptions = TRANSPORT_OPTIONS.filter((option) =>
-    shouldShowCapabilityOption(option.available, showUnavailable)
+  const visibleTransportOptions = TRANSPORT_OPTIONS.map((option) => {
+    const capability = capabilityForOption(serviceCapabilitySnapshot, "transport", option.id);
+    const state = capabilityOptionState(serviceCapabilitySnapshot, "transport", option.id);
+    return {
+      ...option,
+      available: serviceCapabilitySnapshot ? state === "selectable" : option.available,
+      statusLabel: capability?.status,
+      unavailableReason: capability?.reason ?? capability?.detail,
+    };
+  }).filter((option) =>
+    serviceCapabilitySnapshot
+      ? shouldShowCapabilityOptionForSnapshot(
+          serviceCapabilitySnapshot,
+          "transport",
+          option.id,
+          showUnavailable
+        )
+      : shouldShowCapabilityOption(option.available, showUnavailable)
   );
+  const selectedOption = visibleTransportOptions.find((o) => o.id === selectedTransport);
 
   const TEST_PROFILES = [
     { id: "latency", name: "延迟优先", desc: "优化低延迟传输" },
@@ -121,10 +149,38 @@ export function TransportTestPage() {
 
   useEffect(() => {
     let cancelled = false;
+    let legacyEnvironment: EnvironmentSnapshot | null = null;
+    let serviceSnapshot: CapabilitySnapshot | null = null;
 
-    commands.testGetCapabilities().then((result) => {
-      if (!cancelled && result.ok) {
-        setCapabilities(result.value);
+    const applyLegacyEnvironment = (environment: EnvironmentSnapshot) => {
+      if (cancelled) return;
+      legacyEnvironment = environment;
+      if (serviceSnapshot) {
+        setCapabilities(environmentSnapshotFromCapabilitySnapshot(serviceSnapshot, environment));
+        return;
+      }
+      setServiceCapabilitySnapshot(null);
+      setCapabilities(environment);
+    };
+
+    const applyServiceSnapshot = (snapshot: CapabilitySnapshot) => {
+      if (cancelled) return;
+      serviceSnapshot = snapshot;
+      setServiceCapabilitySnapshot(snapshot);
+      setCapabilities(environmentSnapshotFromCapabilitySnapshot(snapshot, legacyEnvironment));
+    };
+
+    void commands.testGetCapabilities().then((environmentResult) => {
+      if (environmentResult.ok) {
+        applyLegacyEnvironment(environmentResult.value);
+      }
+    });
+
+    void commands.ipcCapabilitySnapshot().then((serviceResult) => {
+      if (serviceResult.ok && serviceResult.value) {
+        applyServiceSnapshot(buildCapabilitySnapshotFromIpc(serviceResult.value));
+      } else if (!cancelled) {
+        setServiceCapabilitySnapshot(null);
       }
     });
 
@@ -384,8 +440,19 @@ export function TransportTestPage() {
               </div>
               <p className="text-sm text-muted-foreground">{option.description}</p>
               {!option.available && (
-                <span className="inline-block mt-2 text-xs bg-yellow-100 text-yellow-800 px-2 py-0.5 rounded">
-                  即将推出
+                <span
+                  className="inline-block mt-2 text-xs bg-yellow-100 text-yellow-800 px-2 py-0.5 rounded"
+                  title={option.unavailableReason ?? option.statusLabel}
+                >
+                  {option.statusLabel ?? "不可用"}
+                </span>
+              )}
+              {option.available && option.statusLabel && option.statusLabel !== "available" && (
+                <span
+                  className="inline-block mt-2 text-xs bg-amber-100 text-amber-800 px-2 py-0.5 rounded"
+                  title={option.unavailableReason ?? option.statusLabel}
+                >
+                  {option.statusLabel === "supported" ? "待探测" : option.statusLabel}
                 </span>
               )}
             </button>

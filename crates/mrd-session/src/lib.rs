@@ -1,10 +1,12 @@
-// mrd-session: Session domain model
-//
-// Defines session aggregates, roles, and state without depending
-// on concrete infrastructure implementations.
+//! Session domain model.
+//!
+//! This crate owns session aggregates, lifecycle state, scheduling and
+//! transport-independent snapshots. It must not depend on concrete transport,
+//! capture, render or UI infrastructure.
 
 #![warn(missing_docs)]
 
+/// Multi-session scheduling and resource isolation.
 pub mod scheduler;
 
 use mrd_proto::{BackendRole, DeviceId, SessionId};
@@ -29,7 +31,10 @@ pub enum SessionLifecycleState {
     /// Media streaming active
     Streaming,
     /// Session failed with error message
-    Failed { message: String },
+    Failed {
+        /// Human-readable failure reason.
+        message: String,
+    },
     /// Session closed cleanly
     Closed,
 }
@@ -71,17 +76,24 @@ impl Default for SessionLifecycleState {
 /// Capability set for a device
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CapabilitySet {
+    /// Whether this peer can negotiate a WebRTC session.
     pub supports_webrtc: bool,
+    /// Whether this peer can negotiate a QUIC session.
     pub supports_quic: bool,
 }
 
 /// Session plan containing routing and capability information
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionPlan {
+    /// Stable session identifier.
     pub session_id: SessionId,
+    /// Device that initiated the session.
     pub initiator: DeviceId,
+    /// Device that should accept the session.
     pub target: DeviceId,
+    /// Backend role expected for this process.
     pub role: BackendRole,
+    /// Capability set used when selecting the transport.
     pub capabilities: CapabilitySet,
 }
 

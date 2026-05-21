@@ -20,6 +20,14 @@ import type {
 } from "../../adapters/tauri/types";
 import { capabilityAvailable, capabilityTag, unavailableText } from "./capabilityMeta";
 import {
+  buildCapabilitySnapshotFromIpc,
+  capabilityForOption,
+  capabilityOptionState,
+  environmentSnapshotFromCapabilitySnapshot,
+  shouldShowCapabilityOptionForSnapshot,
+  type CapabilitySnapshot,
+} from "../../services/capabilityMatrix";
+import {
   shouldShowCapabilityOption,
   useShowUnavailableCapabilities,
 } from "./useCapabilityVisibility";
@@ -238,6 +246,8 @@ export function CaptureTestPage() {
   const [sourcePickerQuery, setSourcePickerQuery] = useState("");
   const [startAfterSourcePick, setStartAfterSourcePick] = useState(false);
   const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
+  const [serviceCapabilitySnapshot, setServiceCapabilitySnapshot] =
+    useState<CapabilitySnapshot | null>(null);
   const [startError, setStartError] = useState<string | null>(null);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [showUnavailable] = useShowUnavailableCapabilities();
@@ -248,9 +258,18 @@ export function CaptureTestPage() {
   const isWindowProbeMode = selectedWindowCapture && captureScope === "window_probe";
   const isWindowMode = isWindowPerfMode || isWindowProbeMode;
   const captureAvailable = (capture: CaptureType) =>
-    capabilityAvailable(capabilities, "available_captures", capture, capture === "synthetic");
+    serviceCapabilitySnapshot
+      ? capabilityOptionState(serviceCapabilitySnapshot, "capture", capture) !== "disabled"
+      : capabilityAvailable(capabilities, "available_captures", capture, capture === "synthetic");
   const visibleCaptureOptions = CAPTURE_OPTIONS.filter((option) =>
-    !capabilities || shouldShowCapabilityOption(captureAvailable(option.id), showUnavailable)
+    serviceCapabilitySnapshot
+      ? shouldShowCapabilityOptionForSnapshot(
+          serviceCapabilitySnapshot,
+          "capture",
+          option.id,
+          showUnavailable
+        )
+      : !capabilities || shouldShowCapabilityOption(captureAvailable(option.id), showUnavailable)
   );
   const compatibleShareSources = shareSources.filter((source) =>
     shareSourceCompatibleWithCapture(source, selectedCapture)
@@ -307,10 +326,36 @@ export function CaptureTestPage() {
 
   useEffect(() => {
     let cancelled = false;
+    let legacyEnvironment: EnvironmentSnapshot | null = null;
+    let serviceSnapshot: CapabilitySnapshot | null = null;
 
-    commands.testGetCapabilities().then((result) => {
-      if (!cancelled && result.ok) {
-        setCapabilities(result.value);
+    const applyLegacyEnvironment = (environment: EnvironmentSnapshot) => {
+      if (cancelled) return;
+      legacyEnvironment = environment;
+      if (serviceSnapshot) {
+        setCapabilities(environmentSnapshotFromCapabilitySnapshot(serviceSnapshot, environment));
+        return;
+      }
+      setServiceCapabilitySnapshot(null);
+      setCapabilities(environment);
+    };
+
+    const applyServiceSnapshot = (snapshot: CapabilitySnapshot) => {
+      if (cancelled) return;
+      serviceSnapshot = snapshot;
+      setServiceCapabilitySnapshot(snapshot);
+      setCapabilities(environmentSnapshotFromCapabilitySnapshot(snapshot, legacyEnvironment));
+    };
+
+    void commands.testGetCapabilities().then((result) => {
+      if (result.ok) applyLegacyEnvironment(result.value);
+    });
+
+    void commands.ipcCapabilitySnapshot().then((result) => {
+      if (result.ok && result.value) {
+        applyServiceSnapshot(buildCapabilitySnapshotFromIpc(result.value));
+      } else if (!cancelled) {
+        setServiceCapabilitySnapshot(null);
       }
     });
 
@@ -337,7 +382,7 @@ export function CaptureTestPage() {
     if (!capabilities || captureAvailable(selectedCapture)) return;
     const nextCapture = CAPTURE_OPTIONS.find((option) => captureAvailable(option.id));
     if (nextCapture) setSelectedCapture(nextCapture.id);
-  }, [capabilities, selectedCapture]);
+  }, [capabilities, selectedCapture, serviceCapabilitySnapshot]);
 
   useEffect(() => {
     if (!selectedShareSourceId) return;
@@ -667,8 +712,21 @@ export function CaptureTestPage() {
         <h2 className="text-lg font-semibold mb-4">选择捕获源</h2>
         <div className="grid md:grid-cols-3 gap-4">
           {visibleCaptureOptions.map((option) => {
+            const capability = capabilityForOption(
+              serviceCapabilitySnapshot,
+              "capture",
+              option.id
+            );
             const available = captureAvailable(option.id);
-            const disabledLabel = unavailableText(capabilities, "available_captures", option.id);
+            const disabledLabel = serviceCapabilitySnapshot
+              ? !available
+                ? capability?.reason ?? capability?.status ?? "不可用"
+                : null
+              : unavailableText(capabilities, "available_captures", option.id);
+            const statusLabel =
+              serviceCapabilitySnapshot && available && capability?.status !== "available"
+                ? capability?.status
+                : null;
             return (
             <button
               key={option.id}
@@ -693,6 +751,14 @@ export function CaptureTestPage() {
               {disabledLabel && (
                 <span className="inline-block mt-2 text-xs bg-yellow-100 text-yellow-800 px-2 py-0.5 rounded">
                   {disabledLabel}
+                </span>
+              )}
+              {statusLabel && (
+                <span
+                  className="inline-block mt-2 text-xs bg-amber-100 text-amber-800 px-2 py-0.5 rounded"
+                  title={capability?.reason ?? statusLabel}
+                >
+                  {statusLabel === "supported" ? "待探测" : statusLabel}
                 </span>
               )}
             </button>

@@ -7,20 +7,20 @@
 //! - 维护设备在线状态和 IP 地址信息
 
 pub mod client;
+pub mod protocol;
 
 use anyhow::Result;
-use client::HeartbeatMessage;
-use serde::{Deserialize, Serialize};
+use protocol::HeartbeatMessage;
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::net::{UdpSocket, UdpSocket as TokioUdpSocket};
+use tokio::net::UdpSocket as TokioUdpSocket;
 use tokio::sync::RwLock;
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
-use uuid::Uuid;
 
 /// 默认配置
 const DEFAULT_UDP_PORT: u16 = 21114;
@@ -28,45 +28,12 @@ const DEFAULT_WEBSOCKET_PORT: u16 = 9527;
 const HEARTBEAT_INTERVAL_SECS: u64 = 30;
 const CONNECTION_TIMEOUT_SECS: u64 = 60;
 
-/// 心跳消息格式
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HeartbeatMessage {
-    /// 设备 ID
-    pub device_id: String,
-    /// 设备类型 (agent, controller)
-    pub device_type: String,
-    /// 设备名称
-    pub device_name: String,
-    /// 协议版本
-    pub protocol_version: u32,
-    /// 时间戳（毫秒）
-    pub timestamp_ms: u64,
-    /// 支持的传输协议
-    #[serde(default)]
-    pub transports: Vec<String>,
-}
-
-/// 心跳响应
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HeartbeatResponse {
-    /// 服务器时间戳
-    pub server_timestamp_ms: u64,
-    /// 在线设备数量
-    pub online_count: usize,
-    /// 是否需要重注册
-    #[serde(default)]
-    pub reregister: bool,
-}
-
 /// 在线设备信息
 #[derive(Debug, Clone)]
 struct OnlineDevice {
-    device_id: String,
     device_type: String,
     device_name: String,
-    addr: SocketAddr,
     last_seen: Instant,
-    transports: Vec<String>,
 }
 
 /// 服务器状态
@@ -180,8 +147,9 @@ async fn main() -> Result<()> {
             Ok((len, addr)) => {
                 let state = state.clone();
                 let msg_count = msg_count.clone();
+                let packet = buf[..len].to_vec();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_heartbeat(&buf[..len], addr, state).await {
+                    if let Err(e) = handle_heartbeat(&packet, addr, state).await {
                         warn!(error = %e, peer = %addr, "failed to handle heartbeat");
                     } else {
                         let count = msg_count.fetch_add(1, Ordering::Relaxed) + 1;
@@ -202,34 +170,34 @@ async fn main() -> Result<()> {
 async fn handle_heartbeat(data: &[u8], addr: SocketAddr, state: SharedState) -> Result<()> {
     // 解析 JSON 消息
     let msg: HeartbeatMessage = serde_json::from_slice(data)?;
+    let device_id = msg.device_id.clone();
+    let device_type = msg.device_type.clone();
+    let device_name = msg.device_name.clone();
 
     let now = Instant::now();
     let device = OnlineDevice {
-        device_id: msg.device_id.clone(),
-        device_type: msg.device_type,
-        device_name: msg.device_name,
-        addr,
+        device_type: device_type.clone(),
+        device_name: device_name.clone(),
         last_seen: now,
-        transports: msg.transports,
     };
 
     // 更新设备状态
     {
         let mut s = state.write().await;
-        let is_new = !s.devices.contains_key(&msg.device_id);
-        s.devices.insert(msg.device_id.clone(), device);
+        let is_new = !s.devices.contains_key(&device_id);
+        s.devices.insert(device_id.clone(), device);
 
         if is_new {
             info!(
-                device_id = %msg.device_id,
-                device_type = %msg.device_type,
-                device_name = %msg.device_name,
+                device_id = %device_id,
+                device_type = %device_type,
+                device_name = %device_name,
                 addr = %addr,
                 "device came online"
             );
         } else {
             debug!(
-                device_id = %msg.device_id,
+                device_id = %device_id,
                 addr = %addr,
                 "heartbeat from device"
             );

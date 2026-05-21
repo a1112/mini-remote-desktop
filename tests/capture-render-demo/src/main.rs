@@ -292,6 +292,9 @@ fn captured_frame_into_render_frame(frame: CapturedFrame) -> Result<RenderFrame>
             }
             Ok(RenderFrame::from_bgra32(frame.width, frame.height, bgra))
         }
+        FramePixelFormat::Nv12 => {
+            bail!("capture-render-demo does not render CPU-backed NV12 frames directly")
+        }
     }
 }
 

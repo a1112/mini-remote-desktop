@@ -1,0 +1,4 @@
+-r requirements.txt
+
+# TestClient support for FastAPI/Starlette unit tests.
+httpx==0.28.1

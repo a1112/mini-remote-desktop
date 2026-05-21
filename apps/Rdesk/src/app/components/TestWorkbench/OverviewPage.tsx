@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router";
 import {
   Activity,
@@ -9,8 +9,23 @@ import {
   Monitor,
   ArrowRight,
 } from "lucide-react";
+import {
+  CartesianGrid,
+  Legend,
+  Line,
+  LineChart,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
 import * as commands from "../../adapters/tauri/commands";
-import type { TestScenario, TestRun, EnvironmentSnapshot } from "../../adapters/tauri/types";
+import type {
+  TestScenario,
+  TestRun,
+  EnvironmentSnapshot,
+  MetricSeries,
+} from "../../adapters/tauri/types";
 import {
   buildCapabilitySnapshotFromIpc,
   buildCapabilitySnapshotFromEnvironment,
@@ -24,6 +39,12 @@ import {
   shouldShowCapabilityStatus,
   useShowUnavailableCapabilities,
 } from "./useCapabilityVisibility";
+import {
+  buildChartGroups,
+  normalizeMetrics,
+  type ChartGroup,
+  type NormalizedMetric,
+} from "../../services/testTelemetryService";
 
 const CAPABILITY_DOMAIN_ORDER: CapabilityDomain[] = [
   "capture",
@@ -39,10 +60,24 @@ const CAPABILITY_DOMAIN_ORDER: CapabilityDomain[] = [
   "security",
 ];
 
+const REALTIME_CHART_COLORS = [
+  "#2563eb",
+  "#16a34a",
+  "#dc2626",
+  "#9333ea",
+  "#ea580c",
+  "#0891b2",
+  "#4f46e5",
+  "#be123c",
+];
+
 export function OverviewPage() {
   const navigate = useNavigate();
   const [scenarios, setScenarios] = useState<TestScenario[]>([]);
   const [recentRuns, setRecentRuns] = useState<TestRun[]>([]);
+  const [activeRun, setActiveRun] = useState<TestRun | null>(null);
+  const [activeRunMetrics, setActiveRunMetrics] = useState<Record<string, MetricSeries>>({});
+  const [activeMetricsError, setActiveMetricsError] = useState<string | null>(null);
   const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
   const [serviceCapabilitySnapshot, setServiceCapabilitySnapshot] =
     useState<CapabilitySnapshot | null>(null);
@@ -52,6 +87,58 @@ export function OverviewPage() {
   useEffect(() => {
     loadOverviewData();
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function refreshRuns() {
+      const runsResult = await commands.testListRuns({ limit: 5 });
+      if (cancelled || !runsResult.ok) return;
+      setRecentRuns(runsResult.value);
+      setActiveRun(selectActiveRun(runsResult.value));
+    }
+
+    const intervalId = window.setInterval(() => {
+      void refreshRuns();
+    }, 1000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!activeRun || !isActiveRun(activeRun)) {
+      setActiveRunMetrics({});
+      setActiveMetricsError(null);
+      return;
+    }
+
+    let cancelled = false;
+    const activeRunId = activeRun.run_id;
+
+    async function refreshMetrics() {
+      const metricsResult = await commands.testGetRunMetrics(activeRunId);
+      if (cancelled) return;
+      if (metricsResult.ok) {
+        setActiveRunMetrics(metricsResult.value);
+        setActiveMetricsError(null);
+      } else {
+        setActiveMetricsError(metricsResult.error.message);
+      }
+    }
+
+    void refreshMetrics();
+    const intervalId = window.setInterval(() => {
+      void refreshMetrics();
+    }, 1000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [activeRun?.run_id, activeRun?.status]);
 
   async function loadOverviewData() {
     setLoading(true);
@@ -64,7 +151,10 @@ export function OverviewPage() {
       ]);
 
       if (scenariosResult.ok) setScenarios(scenariosResult.value);
-      if (runsResult.ok) setRecentRuns(runsResult.value);
+      if (runsResult.ok) {
+        setRecentRuns(runsResult.value);
+        setActiveRun(selectActiveRun(runsResult.value));
+      }
       if (capsResult.ok) setCapabilities(capsResult.value);
       if (serviceCapsResult.ok && serviceCapsResult.value) {
         setServiceCapabilitySnapshot(buildCapabilitySnapshotFromIpc(serviceCapsResult.value));
@@ -214,6 +304,12 @@ export function OverviewPage() {
             </section>
           )}
 
+          <CurrentRunRealtimeCharts
+            activeRun={activeRun}
+            metrics={activeRunMetrics}
+            error={activeMetricsError}
+          />
+
           {/* Quick Stats */}
           <section className="grid grid-cols-1 md:grid-cols-4 gap-4">
             <div className="bg-card rounded-lg border p-4">
@@ -339,6 +435,136 @@ export function OverviewPage() {
   );
 }
 
+function CurrentRunRealtimeCharts({
+  activeRun,
+  metrics,
+  error,
+}: {
+  activeRun: TestRun | null;
+  metrics: Record<string, MetricSeries>;
+  error: string | null;
+}) {
+  const normalizedMetrics = useMemo(
+    () => normalizeMetrics(metrics, activeRun?.started_at),
+    [metrics, activeRun?.started_at]
+  );
+  const fpsMetrics = normalizedMetrics
+    .filter((metric) => metric.category === "fps" || metric.unit.toLowerCase() === "fps")
+    .slice(0, 4);
+  const latencyMetrics = normalizedMetrics
+    .filter((metric) => isStageP95LatencyMetric(metric))
+    .sort(compareStageLatencyMetric)
+    .slice(0, 8);
+  const primaryFps = latestMetricValue(fpsMetrics[0]);
+  const primaryLatency =
+    latestMetricValue(latencyMetrics.find((metric) => metric.key === "total_latency_p95_ms")) ??
+    latestMetricValue(latencyMetrics[0]);
+  const fpsChartGroup = buildChartGroups(fpsMetrics)[0];
+  const latencyChartGroup = buildChartGroups(latencyMetrics)[0];
+
+  return (
+    <section className="bg-card rounded-lg border p-6">
+      <div className="mb-4 flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
+        <div>
+          <h2 className="text-lg font-semibold">当前测试实时曲线</h2>
+          <p className="text-sm text-muted-foreground">
+            {activeRun ? activeRun.scenario_id : "暂无运行中的测试"}
+          </p>
+        </div>
+        <div className="flex flex-wrap gap-2 text-sm">
+          <RealtimeValuePill label="FPS" value={formatFps(primaryFps)} />
+          <RealtimeValuePill label="Total P95" value={formatMs(primaryLatency)} />
+        </div>
+      </div>
+
+      {error && (
+        <div className="mb-4 rounded-lg border border-red-500/30 bg-red-500/10 p-3 text-sm text-red-700 dark:text-red-200">
+          {error}
+        </div>
+      )}
+
+      {!activeRun ? (
+        <div className="rounded-lg border border-dashed bg-background/60 p-8 text-center text-sm text-muted-foreground">
+          启动测试后，这里会显示实时 FPS 和各阶段 P95 延迟。
+        </div>
+      ) : (
+        <div className="grid gap-4 xl:grid-cols-2">
+          <RealtimeChartCard
+            title="FPS"
+            emptyText="等待 FPS 样本"
+            chartGroup={fpsChartGroup}
+          />
+          <RealtimeChartCard
+            title="阶段 P95 延迟"
+            emptyText="等待 P95 延迟样本"
+            chartGroup={latencyChartGroup}
+          />
+        </div>
+      )}
+    </section>
+  );
+}
+
+function RealtimeChartCard({
+  title,
+  emptyText,
+  chartGroup,
+}: {
+  title: string;
+  emptyText: string;
+  chartGroup?: ChartGroup;
+}) {
+  return (
+    <div className="rounded-lg border bg-background/60 p-4">
+      <div className="mb-3 flex items-center justify-between gap-2">
+        <h3 className="text-sm font-semibold">{title}</h3>
+        {chartGroup && (
+          <span className="text-xs text-muted-foreground">{chartGroup.unit}</span>
+        )}
+      </div>
+      {!chartGroup || chartGroup.rows.length === 0 ? (
+        <div className="flex h-48 items-center justify-center rounded border border-dashed text-sm text-muted-foreground">
+          {emptyText}
+        </div>
+      ) : (
+        <div className="h-48 min-w-0">
+          <ResponsiveContainer width="100%" height="100%">
+            <LineChart data={chartGroup.rows} margin={{ top: 8, right: 16, bottom: 0, left: 0 }}>
+              <CartesianGrid strokeDasharray="3 3" />
+              <XAxis dataKey="time" tick={{ fontSize: 11 }} minTickGap={20} />
+              <YAxis tick={{ fontSize: 11 }} width={44} />
+              <Tooltip />
+              <Legend wrapperStyle={{ fontSize: 11 }} />
+              {chartGroup.metrics.map((metric, index) => (
+                <Line
+                  key={metric.key}
+                  type="monotone"
+                  dataKey={metric.key}
+                  name={metric.label}
+                  stroke={REALTIME_CHART_COLORS[index % REALTIME_CHART_COLORS.length]}
+                  strokeWidth={2}
+                  dot={false}
+                  isAnimationActive={false}
+                  connectNulls
+                />
+              ))}
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function RealtimeValuePill({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-lg border bg-background/70 px-3 py-2">
+      <div className="text-xs text-muted-foreground">{label}</div>
+      <div className="font-mono font-semibold">{value}</div>
+    </div>
+  );
+}
+
 function groupCapabilitiesByDomain(
   capabilities: CapabilityItem[],
   showUnavailable: boolean
@@ -354,6 +580,65 @@ function groupCapabilitiesByDomain(
         shouldShowCapabilityStatus(capability.status, showUnavailable)
     ),
   })).filter((group) => group.items.length > 0);
+}
+
+function selectActiveRun(runs: TestRun[]): TestRun | null {
+  return runs.find((run) => isActiveRun(run)) ?? null;
+}
+
+function isActiveRun(run: TestRun): boolean {
+  return run.status === "queued" || run.status === "preparing" || run.status === "running";
+}
+
+function isStageP95LatencyMetric(metric: NormalizedMetric): boolean {
+  const key = metric.key.toLowerCase();
+  if (metric.unit.toLowerCase() !== "ms") return false;
+  if (!key.includes("p95")) return false;
+  return (
+    key.includes("capture") ||
+    key.includes("source_wait") ||
+    key.includes("encode") ||
+    key.includes("transport") ||
+    key.includes("decode") ||
+    key.includes("render") ||
+    key.includes("present") ||
+    key.includes("interactive") ||
+    key.includes("total")
+  );
+}
+
+function compareStageLatencyMetric(left: NormalizedMetric, right: NormalizedMetric): number {
+  return stageLatencyRank(left.key) - stageLatencyRank(right.key) || left.label.localeCompare(right.label);
+}
+
+function stageLatencyRank(key: string): number {
+  const normalized = key.toLowerCase();
+  const order = [
+    "capture",
+    "source_wait",
+    "encode",
+    "transport",
+    "decode",
+    "render",
+    "present",
+    "interactive",
+    "total",
+  ];
+  const index = order.findIndex((part) => normalized.includes(part));
+  return index === -1 ? order.length : index;
+}
+
+function latestMetricValue(metric?: NormalizedMetric): number | null {
+  if (!metric || metric.samples.length === 0) return null;
+  return metric.samples[metric.samples.length - 1]!.value;
+}
+
+function formatFps(value: number | null): string {
+  return value == null ? "-" : `${value.toFixed(1)} FPS`;
+}
+
+function formatMs(value: number | null): string {
+  return value == null ? "-" : `${value.toFixed(2)} ms`;
 }
 
 function StatusBadge({ status }: { status: CapabilityStatus | "ready" | "blocked" | "skipped" }) {

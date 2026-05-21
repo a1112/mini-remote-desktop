@@ -862,6 +862,7 @@ impl FrameCapture for BenchmarkCapture {
             pixel_format: FramePixelFormat::Bgra32,
             timestamp_us: self.tick as u64 * 33_000,
             data,
+            d3d11_shared_bgra: None,
         })
     }
 }

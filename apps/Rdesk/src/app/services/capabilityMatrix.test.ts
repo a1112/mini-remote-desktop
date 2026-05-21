@@ -10,6 +10,9 @@ import {
   evaluateCapabilityCombination,
   evaluateProfileProbe,
   evaluateProfileSupport,
+  capabilityIdForLegacyOption,
+  capabilityOptionState,
+  environmentSnapshotFromCapabilitySnapshot,
   getCapabilityProfile,
   pickPreferredCaptureSourceKind,
   type CapabilityItem,
@@ -384,6 +387,48 @@ describe("evaluateCapabilityCombination", () => {
     ];
 
     expect(pickPreferredCaptureSourceKind(sources)).toBe("display_shared");
+  });
+});
+
+describe("service capability option mapping", () => {
+  it("maps UI renderer ids to service-owned renderer capability ids", () => {
+    expect(capabilityIdForLegacyOption("renderer", "d3d12")).toBe("render.d3d12_native");
+    expect(capabilityIdForLegacyOption("renderer", "d3d12_native")).toBe(
+      "render.d3d12_native"
+    );
+  });
+
+  it("keeps unavailable service capabilities out of legacy environment arrays", () => {
+    const snapshot: CapabilitySnapshot = {
+      schema_version: 1,
+      platform: "windows",
+      capabilities: [
+        {
+          id: "render.d3d11",
+          domain: "render",
+          label: "D3D11",
+          status: "driver_missing",
+          platform: "windows",
+          reason: "D3D11 runtime probe failed",
+        },
+        {
+          id: "render.opengl",
+          domain: "render",
+          label: "OpenGL",
+          status: "supported",
+          platform: "windows",
+        },
+      ],
+      constraints: [],
+      profiles: [],
+      recent_profile_results: [],
+    };
+
+    const environment = environmentSnapshotFromCapabilitySnapshot(snapshot, windowsEnvironment);
+
+    expect(environment.available_renderers).toEqual(["none", "opengl"]);
+    expect(capabilityOptionState(snapshot, "renderer", "d3d11")).toBe("disabled");
+    expect(capabilityOptionState(snapshot, "renderer", "opengl")).toBe("selectable");
   });
 });
 

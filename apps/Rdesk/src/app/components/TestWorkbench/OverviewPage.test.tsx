@@ -1,4 +1,5 @@
 import { render, screen, waitFor } from "@testing-library/react";
+import type { ReactNode } from "react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { getMockInvoke } from "../../../test/mocks/tauri";
@@ -11,6 +12,22 @@ vi.mock("react-router", async (importOriginal) => {
   return {
     ...actual,
     useNavigate: () => mockNavigate,
+  };
+});
+
+vi.mock("recharts", () => {
+  const Container = ({ children }: { children?: ReactNode }) => (
+    <div data-testid="mock-recharts">{children}</div>
+  );
+  return {
+    CartesianGrid: () => null,
+    Legend: () => null,
+    Line: () => null,
+    LineChart: Container,
+    ResponsiveContainer: Container,
+    Tooltip: () => null,
+    XAxis: () => null,
+    YAxis: () => null,
   };
 });
 
@@ -68,6 +85,91 @@ function mockOverviewData() {
   });
 }
 
+function mockOverviewDataWithActiveRun() {
+  const mockInvoke = getMockInvoke();
+
+  mockInvoke.mockImplementation((command: string) => {
+    if (command === "test_list_scenarios") {
+      return Promise.resolve([]);
+    }
+
+    if (command === "test_list_runs") {
+      return Promise.resolve([
+        {
+          run_id: "run-active",
+          scenario_id: "matrix-live",
+          run_mode: "matrix",
+          status: "running",
+          started_at: 1_000,
+          config_snapshot: {},
+          environment_snapshot: {
+            cpu_brand: "Intel",
+            cpu_cores: 16,
+            memory_gb: 32,
+            gpu_info: "NVIDIA RTX",
+            available_encoders: ["nvenc_h264"],
+            available_decoders: ["nvdec"],
+          },
+        },
+      ]);
+    }
+
+    if (command === "test_get_run_metrics") {
+      return Promise.resolve({
+        capture_fps: {
+          metric_name: "capture_fps",
+          unit: "fps",
+          samples: [
+            { timestamp: 1_000, value: 120 },
+            { timestamp: 2_000, value: 144 },
+          ],
+        },
+        encode_latency_p95_ms: {
+          metric_name: "encode_latency_p95_ms",
+          unit: "ms",
+          samples: [
+            { timestamp: 1_000, value: 1.7 },
+            { timestamp: 2_000, value: 2.4 },
+          ],
+        },
+        decode_latency_p95_ms: {
+          metric_name: "decode_latency_p95_ms",
+          unit: "ms",
+          samples: [
+            { timestamp: 1_000, value: 0.9 },
+            { timestamp: 2_000, value: 1.2 },
+          ],
+        },
+        total_latency_p95_ms: {
+          metric_name: "total_latency_p95_ms",
+          unit: "ms",
+          samples: [
+            { timestamp: 1_000, value: 6.8 },
+            { timestamp: 2_000, value: 7.4 },
+          ],
+        },
+      });
+    }
+
+    if (command === "test_get_capabilities") {
+      return Promise.resolve({
+        os_type: "windows",
+        cpu_brand: "Intel",
+        cpu_cores: 16,
+        memory_gb: 32,
+        gpu_info: "NVIDIA RTX",
+        available_captures: ["dxgi"],
+        available_encoders: ["nvenc_h264"],
+        available_decoders: ["nvdec"],
+        available_renderers: ["d3d11"],
+        available_memory_modes: ["d3d11_shared"],
+      });
+    }
+
+    return Promise.resolve(null);
+  });
+}
+
 describe("OverviewPage", () => {
   beforeEach(() => {
     mockNavigate.mockReset();
@@ -115,5 +217,23 @@ describe("OverviewPage", () => {
     expect(screen.getByText("lan.1600p165")).toBeInTheDocument();
     expect(screen.getAllByText("blocked").length).toBeGreaterThan(0);
     expect(screen.getAllByText(/transport.media_profile_control_v1/).length).toBeGreaterThan(0);
+  });
+
+  it("shows realtime curves for the active test run", async () => {
+    mockOverviewDataWithActiveRun();
+
+    render(<OverviewPage />);
+
+    expect(await screen.findByText("当前测试实时曲线")).toBeInTheDocument();
+    expect(screen.getAllByText("matrix-live").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("FPS").length).toBeGreaterThan(0);
+    expect(screen.getByText("阶段 P95 延迟")).toBeInTheDocument();
+
+    await waitFor(() => {
+      expect(screen.getByText("144.0 FPS")).toBeInTheDocument();
+      expect(screen.getByText("7.40 ms")).toBeInTheDocument();
+    });
+
+    expect(getMockInvoke()).toHaveBeenCalledWith("test_get_run_metrics", { runId: "run-active" });
   });
 });

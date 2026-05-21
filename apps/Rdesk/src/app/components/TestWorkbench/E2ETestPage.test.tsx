@@ -5,6 +5,113 @@ import { getMockInvoke } from "../../../test/mocks/tauri";
 import { E2ETestPage } from "./E2ETestPage";
 
 describe("E2ETestPage LAN automation", () => {
+  it("builds the local E2E config from service capability status", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve({
+          os_type: "windows",
+          cpu_brand: "test",
+          cpu_cores: 8,
+          memory_gb: 16,
+          gpu_info: "NVIDIA",
+          available_captures: ["dxgi", "synthetic"],
+          available_encoders: ["nvenc_h264", "openh264"],
+          available_decoders: ["nvdec", "software", "none"],
+          available_renderers: ["d3d11"],
+          available_memory_modes: ["cpu", "d3d11_shared"],
+        });
+      }
+      if (command === "ipc_capability_snapshot") {
+        return Promise.resolve({
+          schema_version: 1,
+          platform: "windows",
+          service_version: "test",
+          capabilities: [
+            {
+              id: "capture.dxgi",
+              domain: "capture",
+              label: "DXGI",
+              status: "driver_missing",
+              platform: "windows",
+              reason: "DXGI probe failed",
+            },
+            {
+              id: "capture.synthetic",
+              domain: "capture",
+              label: "Synthetic",
+              status: "available",
+              platform: "windows",
+            },
+            {
+              id: "encode.nvenc_h264",
+              domain: "encode",
+              label: "NVENC H.264",
+              status: "driver_missing",
+              platform: "windows",
+              reason: "NVENC probe failed",
+            },
+            {
+              id: "encode.openh264",
+              domain: "encode",
+              label: "OpenH264",
+              status: "degraded",
+              platform: "windows",
+            },
+            {
+              id: "decode.nvdec",
+              domain: "decode",
+              label: "NVDEC",
+              status: "driver_missing",
+              platform: "windows",
+              reason: "NVDEC probe failed",
+            },
+            {
+              id: "decode.software",
+              domain: "decode",
+              label: "Software",
+              status: "degraded",
+              platform: "windows",
+            },
+          ],
+          constraints: [],
+          profiles: [],
+          updated_at_ms: 1,
+        });
+      }
+      if (command === "test_start_run") return Promise.resolve("run-service-fallback");
+      if (command === "test_get_run") return Promise.resolve(null);
+      return Promise.resolve(null);
+    });
+
+    render(
+      <MemoryRouter>
+        <E2ETestPage />
+      </MemoryRouter>
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("synthetic")).toBeInTheDocument();
+      expect(screen.getByText("openh264")).toBeInTheDocument();
+      expect(screen.getByText("software")).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByRole("button", { name: /启动测试/ }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_start_run",
+        expect.objectContaining({
+          scenarioId: "e2e.local",
+          config: expect.objectContaining({
+            capture_type: "synthetic",
+            encoder_type: "openh264",
+            decoder_type: "software",
+          }),
+        })
+      );
+    });
+  });
+
   it("starts the Linux local end-to-end scenario with Linux capture and render", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {

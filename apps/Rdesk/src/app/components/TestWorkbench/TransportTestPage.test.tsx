@@ -4,6 +4,74 @@ import { getMockInvoke } from "../../../test/mocks/tauri";
 import { TransportTestPage } from "./TransportTestPage";
 
 describe("TransportTestPage execution targets", () => {
+  function capabilityItem(id: string, domain: string, status: string, reason?: string) {
+    return {
+      id,
+      domain,
+      label: id,
+      status,
+      platform: "windows",
+      reason: reason ?? null,
+      detail: null,
+      requires: [],
+      conflicts_with: [],
+      depends_on: [],
+      fallback_ids: [],
+      last_probe_time_ms: null,
+    };
+  }
+
+  function serviceCapabilitySnapshot(capabilities: ReturnType<typeof capabilityItem>[]) {
+    return {
+      schema_version: 1,
+      platform: "windows",
+      service_version: "test",
+      capabilities,
+      constraints: [],
+      profiles: [],
+      recent_profile_results: [],
+      updated_at_ms: 1,
+    };
+  }
+
+  it("uses service transport capability status instead of static transport defaults", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve({
+          os_type: "windows",
+          cpu_brand: "",
+          cpu_cores: 16,
+          memory_gb: 32,
+          gpu_info: "NVIDIA",
+          available_captures: ["synthetic", "dxgi"],
+          available_encoders: ["openh264", "nvenc_h264"],
+          available_decoders: ["software", "nvdec", "none"],
+          available_renderers: ["none", "d3d11"],
+          available_memory_modes: ["cpu", "d3d11_shared"],
+        });
+      }
+      if (command === "ipc_capability_snapshot") {
+        return Promise.resolve(
+          serviceCapabilitySnapshot([
+            capabilityItem("transport.quic", "transport", "available"),
+            capabilityItem("transport.webrtc", "transport", "unsupported", "WebRTC media path disabled"),
+            capabilityItem("capture.synthetic", "capture", "available"),
+            capabilityItem("encode.openh264", "encode", "degraded"),
+            capabilityItem("decode.software", "decode", "degraded"),
+            capabilityItem("memory.cpu", "memory", "available"),
+          ])
+        );
+      }
+      return Promise.resolve(null);
+    });
+
+    render(<TransportTestPage />);
+
+    expect(await screen.findByRole("button", { name: /QUIC/ })).toBeEnabled();
+    expect(screen.queryByRole("button", { name: /WebRTC/ })).not.toBeInTheDocument();
+  });
+
   it("runs a cross-device transport test against the selected discovered peer", async () => {
     const mockInvoke = getMockInvoke();
     const peer = {

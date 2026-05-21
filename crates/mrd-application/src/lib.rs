@@ -1,8 +1,8 @@
-// mrd-application: Application use case layer
-//
-// Orchestrates session lifecycle, signaling, transport, and media
-// through well-defined use cases. Depends on abstract ports rather
-// than concrete implementations.
+//! Application use-case layer.
+//!
+//! This crate orchestrates session lifecycle, signaling, transport and media
+//! through abstract ports. It should contain policy and workflow logic, while
+//! concrete adapters stay in service or infrastructure crates.
 
 #![warn(missing_docs)]
 
@@ -72,22 +72,33 @@ pub mod ports {
     /// Session snapshot DTO
     #[derive(Debug, Clone)]
     pub struct SessionSnapshot {
+        /// Stable session identifier.
         pub session_id: SessionId,
+        /// Selected transport identifier.
         pub transport: String,
+        /// Local controller/source device.
         pub source_device_id: Option<DeviceId>,
+        /// Remote target/agent device.
         pub target_device_id: Option<DeviceId>,
+        /// Local QUIC/WebRTC listen address when available.
         pub local_listen_addr: Option<String>,
+        /// Local TLS/SNI server name.
         pub local_server_name: Option<String>,
+        /// Local certificate DER, base64 encoded.
         pub local_cert_der_b64: Option<String>,
+        /// Remote transport listen address.
         pub remote_listen_addr: Option<String>,
+        /// Remote TLS/SNI server name.
         pub remote_server_name: Option<String>,
+        /// Remote certificate DER, base64 encoded.
         pub remote_cert_der_b64: Option<String>,
         /// Explicit lifecycle state from domain model
         pub lifecycle_state: String,
         /// Last error if any
         pub last_error: Option<String>,
-        /// Media pipeline state
+        /// Whether sender-side media is active.
         pub sender_active: bool,
+        /// Whether receiver-side media is active.
         pub receiver_active: bool,
     }
 

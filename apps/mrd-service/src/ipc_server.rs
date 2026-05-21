@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 // IPC server for mrd-service
 //
 // Handles incoming IPC requests from Rdesk shell and dispatches
@@ -9,7 +11,10 @@ use crate::{
     shell::{AutostartPortRef, UiLauncherPortRef},
 };
 use mrd_application::ports::SessionSnapshot;
-use mrd_ipc::{transport, IpcRequest, IpcResponse};
+use mrd_ipc::{
+    transport, CapabilitySnapshot, CapabilityStatus, IpcRequest, IpcResponse, MediaProfile,
+    ScenarioEvaluationStatus,
+};
 use mrd_proto::{DeviceId, SessionId};
 use std::{io::ErrorKind, sync::Arc, time::Duration};
 
@@ -163,13 +168,24 @@ impl IpcServer {
                 target_device_id,
                 transport_kind,
             } => {
-                let response = session::start_session(
-                    &self.app_state,
-                    session_id.clone(),
-                    target_device_id.clone(),
-                    transport_kind.clone(),
-                )
-                .await;
+                let response = match self
+                    .preflight_session_start(&target_device_id, &transport_kind, None, false)
+                    .await
+                {
+                    Ok(()) => {
+                        session::start_session(
+                            &self.app_state,
+                            session_id.clone(),
+                            target_device_id.clone(),
+                            transport_kind.clone(),
+                        )
+                        .await
+                    }
+                    Err(message) => IpcResponse::Error {
+                        code: "E_PREFLIGHT".to_string(),
+                        message,
+                    },
+                };
                 let (outcome, reason) = audit_outcome(&response);
                 self.record_audit_event(
                     "session.start",
@@ -205,14 +221,30 @@ impl IpcServer {
                         ),
                     ));
                 }
-                let response = session::start_lan_remote_session(
-                    &self.app_state,
-                    session_id.clone(),
-                    target_device_id.clone(),
-                    transport_kind.clone(),
-                    requested_profile,
-                )
-                .await;
+                let response = match self
+                    .preflight_session_start(
+                        &target_device_id,
+                        &transport_kind,
+                        requested_profile.as_ref(),
+                        true,
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        session::start_lan_remote_session(
+                            &self.app_state,
+                            session_id.clone(),
+                            target_device_id.clone(),
+                            transport_kind.clone(),
+                            requested_profile,
+                        )
+                        .await
+                    }
+                    Err(message) => IpcResponse::Error {
+                        code: "E_PREFLIGHT".to_string(),
+                        message,
+                    },
+                };
                 let (outcome, reason) = audit_outcome(&response);
                 self.record_audit_event(
                     "session.start_lan",
@@ -430,8 +462,147 @@ impl IpcServer {
                 }
             }
 
-            IpcRequest::CapabilitySnapshot => IpcResponse::CapabilitySnapshot {
-                snapshot: crate::capabilities::local_capability_snapshot(),
+            IpcRequest::CapabilitySnapshot => {
+                let snapshot = self.app_state.cached_capability_snapshot().await;
+                self.app_state.refresh_capability_snapshot_in_background();
+                IpcResponse::CapabilitySnapshot { snapshot }
+            }
+
+            IpcRequest::EvaluateScenarioProfile {
+                scenario_id,
+                peer_device_id,
+                requested_profile,
+            } => {
+                if let Some(peer_device_id) = peer_device_id {
+                    let snapshot = self.app_state.lan_discovery.snapshot().await;
+                    if !snapshot
+                        .peers
+                        .iter()
+                        .any(|peer| peer.device_id == peer_device_id)
+                    {
+                        return IpcResponse::ScenarioProfileEvaluated {
+                            evaluation: peer_not_found_evaluation(scenario_id, peer_device_id),
+                        };
+                    }
+                }
+                let snapshot = self.app_state.cached_capability_snapshot().await;
+                self.app_state.refresh_capability_snapshot_in_background();
+                IpcResponse::ScenarioProfileEvaluated {
+                    evaluation: crate::capabilities::evaluate_scenario_profile_against_snapshot(
+                        &snapshot,
+                        &scenario_id,
+                        requested_profile,
+                    ),
+                }
+            }
+
+            IpcRequest::GetPeerCapabilitySnapshot { peer_device_id } => {
+                let snapshot = self.app_state.lan_discovery.snapshot().await;
+                let capability_snapshot = snapshot
+                    .peers
+                    .iter()
+                    .find(|peer| peer.device_id == peer_device_id)
+                    .map(crate::capabilities::peer_capability_snapshot);
+                IpcResponse::PeerCapabilitySnapshot {
+                    peer_device_id,
+                    snapshot: capability_snapshot,
+                }
+            }
+
+            IpcRequest::SetTransportPolicy { session_id, policy } => {
+                IpcResponse::TransportPolicyUpdated {
+                    snapshot: transport_policy_snapshot(Some(session_id), &policy),
+                }
+            }
+
+            IpcRequest::GetControlChannelSnapshot { session_id } => {
+                IpcResponse::ControlChannelSnapshot {
+                    snapshot: control_channel_snapshot(session_id),
+                }
+            }
+
+            IpcRequest::PairDevice {
+                device_id,
+                certificate_fingerprint,
+            } => {
+                self.app_state.device_identities.lock().await.upsert(
+                    device_id.clone(),
+                    certificate_fingerprint,
+                    "pending",
+                );
+                self.record_audit_event(
+                    "device.pair",
+                    "success",
+                    None,
+                    self.local_device_id().await,
+                    Some(device_id),
+                    None,
+                    None,
+                    Vec::new(),
+                )
+                .await;
+                IpcResponse::PairingUpdated {
+                    snapshot: self.identity_snapshot().await,
+                }
+            }
+
+            IpcRequest::ApprovePairing { device_id } => {
+                self.app_state.device_identities.lock().await.upsert(
+                    device_id.clone(),
+                    None,
+                    "paired",
+                );
+                self.record_audit_event(
+                    "device.approve_pairing",
+                    "success",
+                    None,
+                    self.local_device_id().await,
+                    Some(device_id),
+                    None,
+                    None,
+                    Vec::new(),
+                )
+                .await;
+                IpcResponse::PairingUpdated {
+                    snapshot: self.identity_snapshot().await,
+                }
+            }
+
+            IpcRequest::RevokeDevice { device_id } => {
+                self.app_state
+                    .device_identities
+                    .lock()
+                    .await
+                    .revoke(&device_id);
+                self.record_audit_event(
+                    "device.revoke",
+                    "success",
+                    None,
+                    self.local_device_id().await,
+                    Some(device_id),
+                    None,
+                    None,
+                    Vec::new(),
+                )
+                .await;
+                IpcResponse::PairingUpdated {
+                    snapshot: self.identity_snapshot().await,
+                }
+            }
+
+            IpcRequest::GetDeviceIdentitySnapshot => IpcResponse::DeviceIdentitySnapshot {
+                snapshot: self.identity_snapshot().await,
+            },
+
+            IpcRequest::GetTelemetryBundle { run_id, session_id } => IpcResponse::TelemetryBundle {
+                bundle: mrd_ipc::TelemetryBundle {
+                    run_id,
+                    session_id,
+                    metrics: Vec::new(),
+                    event_count: 0,
+                    log_count: 0,
+                    artifacts: Vec::new(),
+                },
             },
 
             IpcRequest::MediaPipelineSnapshot { session_id } => {
@@ -694,6 +865,23 @@ impl IpcServer {
             .map(|(device_id, _)| device_id.clone())
     }
 
+    async fn identity_snapshot(&self) -> mrd_ipc::DeviceIdentitySnapshot {
+        let devices = self.app_state.devices.lock().await;
+        let (local_device_id, display_name) = devices
+            .get_local_device()
+            .map(|(device_id, name)| (Some(device_id.clone()), Some(name.clone())))
+            .unwrap_or((None, None));
+        drop(devices);
+        let paired_devices = self.app_state.device_identities.lock().await.list();
+        mrd_ipc::DeviceIdentitySnapshot {
+            local_device_id,
+            display_name,
+            certificate_fingerprint: None,
+            consent_required: true,
+            paired_devices,
+        }
+    }
+
     async fn session_audit_context(
         &self,
         session_id: &SessionId,
@@ -730,6 +918,47 @@ impl IpcServer {
             reason,
             details,
         );
+    }
+
+    async fn preflight_session_start(
+        &self,
+        target_device_id: &DeviceId,
+        transport_kind: &str,
+        requested_profile: Option<&MediaProfile>,
+        require_lan_peer: bool,
+    ) -> Result<(), String> {
+        let snapshot = self.app_state.cached_capability_snapshot().await;
+        self.app_state.refresh_capability_snapshot_in_background();
+
+        ensure_transport_preflight(&snapshot, transport_kind)?;
+
+        if let Some(profile) = requested_profile {
+            let scenario_id = scenario_id_for_profile(profile);
+            let evaluation = crate::capabilities::evaluate_scenario_profile_against_snapshot(
+                &snapshot,
+                scenario_id,
+                Some(profile.clone()),
+            );
+            if matches!(evaluation.status, ScenarioEvaluationStatus::Blocked) {
+                return Err(format_preflight_evaluation_failure(&evaluation));
+            }
+        }
+
+        if require_lan_peer {
+            let discovery = self.app_state.lan_discovery.snapshot().await;
+            if !discovery
+                .peers
+                .iter()
+                .any(|peer| &peer.device_id == target_device_id)
+            {
+                return Err(format!(
+                    "LAN peer {} was not found during session preflight.",
+                    target_device_id.0
+                ));
+            }
+        }
+
+        Ok(())
     }
 
     /// Run the IPC server (accepts connections in a loop)
@@ -821,6 +1050,180 @@ fn audit_outcome(response: &IpcResponse) -> (&'static str, Option<String>) {
     match response {
         IpcResponse::Error { message, .. } => ("error", Some(message.clone())),
         _ => ("success", None),
+    }
+}
+
+fn ensure_transport_preflight(
+    snapshot: &CapabilitySnapshot,
+    transport_kind: &str,
+) -> Result<(), String> {
+    let capability_id = transport_capability_id(transport_kind);
+    let Some(capability) = snapshot
+        .capabilities
+        .iter()
+        .find(|item| item.id == capability_id)
+    else {
+        return Err(format!(
+            "{capability_id} is not advertised by local service capability preflight."
+        ));
+    };
+
+    if capability_status_runs(&capability.status) {
+        return Ok(());
+    }
+
+    Err(format!(
+        "{} preflight failed: {}",
+        capability.id,
+        capability.reason.clone().unwrap_or_else(|| {
+            format!("status {:?} cannot start this session.", capability.status)
+        })
+    ))
+}
+
+fn transport_capability_id(transport_kind: &str) -> &'static str {
+    let kind = transport_kind.to_ascii_lowercase();
+    if kind.contains("webrtc") {
+        "transport.webrtc"
+    } else if kind.contains("quic_datagram") {
+        "transport.quic_datagram"
+    } else if kind.contains("quic") {
+        "transport.quic"
+    } else {
+        "transport.loopback"
+    }
+}
+
+fn scenario_id_for_profile(profile: &MediaProfile) -> &'static str {
+    if profile.width >= 3840 || profile.height >= 2160 {
+        "quality.4k60"
+    } else if profile.height >= 1600 && profile.fps >= 165 {
+        "lan.1600p165"
+    } else if profile.width >= 2560 && profile.height >= 1440 && profile.fps >= 144 {
+        "lan.2k144"
+    } else {
+        "interactive.1080p60"
+    }
+}
+
+fn format_preflight_evaluation_failure(evaluation: &mrd_ipc::ScenarioEvaluation) -> String {
+    let mut parts = vec![format!(
+        "Scenario {} was blocked by session preflight.",
+        evaluation.scenario_id
+    )];
+    if !evaluation.missing_capabilities.is_empty() {
+        parts.push(format!(
+            "missing capabilities: {}",
+            evaluation.missing_capabilities.join(", ")
+        ));
+    }
+    for reason in &evaluation.reasons {
+        if reason.severity == "error" {
+            parts.push(reason.message.clone());
+        }
+    }
+    parts.join(" ")
+}
+
+fn capability_status_runs(status: &CapabilityStatus) -> bool {
+    matches!(
+        status,
+        CapabilityStatus::Available
+            | CapabilityStatus::Usable
+            | CapabilityStatus::Supported
+            | CapabilityStatus::Degraded
+    )
+}
+
+fn peer_not_found_evaluation(
+    scenario_id: String,
+    peer_device_id: DeviceId,
+) -> mrd_ipc::ScenarioEvaluation {
+    mrd_ipc::ScenarioEvaluation {
+        scenario_id,
+        status: mrd_ipc::ScenarioEvaluationStatus::Skipped,
+        selected_profile: None,
+        transport_kind: None,
+        reasons: vec![mrd_ipc::ScenarioEvaluationReason {
+            code: "peer_not_found".to_string(),
+            severity: "warning".to_string(),
+            message: format!("LAN peer {} is not currently discovered.", peer_device_id.0),
+            capability_id: None,
+        }],
+        required_capabilities: Vec::new(),
+        missing_capabilities: Vec::new(),
+        fallback_profile: None,
+    }
+}
+
+fn transport_policy_snapshot(
+    session_id: Option<SessionId>,
+    policy: &mrd_ipc::TransportPolicyConfig,
+) -> mrd_ipc::TransportPolicySnapshot {
+    let mut candidates = Vec::new();
+    if policy.allow_lan_quic {
+        candidates.push("quic".to_string());
+    }
+    if policy.allow_webrtc {
+        candidates.push("webrtc".to_string());
+    }
+
+    let preferred = policy.preferred_transport.as_deref();
+    let selected = match preferred {
+        Some("quic") if policy.allow_lan_quic => "quic",
+        Some("webrtc") if policy.allow_webrtc => "webrtc",
+        _ if policy.mode == "wan" && policy.allow_webrtc => "webrtc",
+        _ if policy.allow_lan_quic => "quic",
+        _ if policy.allow_webrtc => "webrtc",
+        _ => "none",
+    };
+
+    let relay_required = selected == "webrtc" && policy.mode == "wan" && policy.allow_relay;
+    let fallback_reason = preferred
+        .filter(|preferred| *preferred != selected)
+        .map(|preferred| {
+            format!("{preferred} was requested but is not allowed by the active transport policy.")
+        });
+
+    mrd_ipc::TransportPolicySnapshot {
+        session_id,
+        mode: policy.mode.clone(),
+        selected_transport: selected.to_string(),
+        candidate_transports: candidates,
+        relay_required,
+        reason: Some(match selected {
+            "quic" => "LAN/high-refresh route selected QUIC datagram media.".to_string(),
+            "webrtc" if relay_required => {
+                "WAN route selected WebRTC with relay allowed.".to_string()
+            }
+            "webrtc" => "WebRTC route selected by transport policy.".to_string(),
+            _ => "No transport is allowed by the active transport policy.".to_string(),
+        }),
+        fallback_reason,
+    }
+}
+
+fn control_channel_snapshot(session_id: SessionId) -> mrd_ipc::ControlChannelSnapshot {
+    mrd_ipc::ControlChannelSnapshot {
+        session_id,
+        reliable: mrd_ipc::ControlChannelLaneSnapshot {
+            name: "ctrl_rel".to_string(),
+            reliability: mrd_ipc::ControlChannelReliability::ReliableOrdered,
+            ordered: true,
+            max_retransmits: None,
+            queued_messages: 0,
+            dropped_messages: 0,
+            coalesced_messages: 0,
+        },
+        realtime: mrd_ipc::ControlChannelLaneSnapshot {
+            name: "ctrl_rt".to_string(),
+            reliability: mrd_ipc::ControlChannelReliability::UnreliableRealtime,
+            ordered: false,
+            max_retransmits: Some(0),
+            queued_messages: 0,
+            dropped_messages: 0,
+            coalesced_messages: 0,
+        },
     }
 }
 
@@ -973,5 +1376,112 @@ mod tests {
             }
             _ => panic!("Expected CapabilitySnapshot response"),
         }
+    }
+
+    #[tokio::test]
+    async fn capability_snapshot_returns_cached_app_state_fact_source() {
+        let app_state = Arc::new(AppState::new());
+        let cached = crate::capabilities::local_capability_snapshot_static();
+        app_state
+            .replace_capability_snapshot_for_test(cached.clone())
+            .await;
+        let server = IpcServer::new(app_state);
+
+        let response = server.handle_request(IpcRequest::CapabilitySnapshot).await;
+
+        match response {
+            IpcResponse::CapabilitySnapshot { snapshot } => {
+                assert_eq!(snapshot.updated_at_ms, cached.updated_at_ms);
+                assert_eq!(snapshot.capabilities.len(), cached.capabilities.len());
+            }
+            _ => panic!("Expected CapabilitySnapshot response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn start_session_preflight_blocks_unsupported_transport_before_start() {
+        let app_state = Arc::new(AppState::new());
+        let mut cached = crate::capabilities::local_capability_snapshot_static();
+        set_capability_status(
+            &mut cached,
+            "transport.quic",
+            mrd_ipc::CapabilityStatus::Unsupported,
+            "QUIC disabled for preflight test",
+        );
+        app_state.replace_capability_snapshot_for_test(cached).await;
+        let server = IpcServer::new(app_state.clone());
+        let session_id = SessionId("preflight-blocked-session".to_string());
+
+        let response = server
+            .handle_request(IpcRequest::StartSession {
+                session_id: session_id.clone(),
+                target_device_id: DeviceId("target".to_string()),
+                transport_kind: "quic".to_string(),
+            })
+            .await;
+
+        match response {
+            IpcResponse::Error { code, message } => {
+                assert_eq!(code, "E_PREFLIGHT");
+                assert!(message.contains("transport.quic"));
+            }
+            _ => panic!("Expected preflight error response"),
+        }
+        assert!(app_state.sessions.lock().await.get(&session_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn start_lan_remote_session_preflight_blocks_before_peer_request() {
+        let app_state = Arc::new(AppState::new());
+        let mut cached = crate::capabilities::local_capability_snapshot_static();
+        set_capability_status(
+            &mut cached,
+            "transport.quic_datagram",
+            mrd_ipc::CapabilityStatus::Unsupported,
+            "QUIC datagram disabled for preflight test",
+        );
+        app_state.replace_capability_snapshot_for_test(cached).await;
+        let server = IpcServer::new(app_state.clone());
+        let session_id = SessionId("lan-preflight-blocked-session".to_string());
+
+        let response = server
+            .handle_request(IpcRequest::StartLanRemoteSession {
+                session_id: session_id.clone(),
+                target_device_id: DeviceId("target".to_string()),
+                transport_kind: "quic".to_string(),
+                requested_profile: Some(mrd_ipc::MediaProfile {
+                    width: 2560,
+                    height: 1440,
+                    fps: 144,
+                    bitrate_mbps: 64,
+                    codec: "h264".to_string(),
+                    ..mrd_ipc::MediaProfile::default()
+                }),
+            })
+            .await;
+
+        match response {
+            IpcResponse::Error { code, message } => {
+                assert_eq!(code, "E_PREFLIGHT");
+                assert!(message.contains("transport.quic_datagram"));
+            }
+            _ => panic!("Expected preflight error response"),
+        }
+        assert!(app_state.sessions.lock().await.get(&session_id).is_none());
+    }
+
+    fn set_capability_status(
+        snapshot: &mut mrd_ipc::CapabilitySnapshot,
+        id: &str,
+        status: mrd_ipc::CapabilityStatus,
+        reason: &str,
+    ) {
+        let capability = snapshot
+            .capabilities
+            .iter_mut()
+            .find(|item| item.id == id)
+            .expect("capability in snapshot");
+        capability.status = status;
+        capability.reason = Some(reason.to_string());
     }
 }

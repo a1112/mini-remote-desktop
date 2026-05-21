@@ -78,7 +78,77 @@ const linuxShareSources = [
   },
 ];
 
+function capabilitySnapshot(capabilities: Array<{
+  id: string;
+  domain: string;
+  label: string;
+  status: string;
+  reason?: string;
+}>) {
+  return {
+    schema_version: 1,
+    platform: "windows",
+    service_version: "test",
+    capabilities: capabilities.map((capability) => ({
+      platform: "windows",
+      ...capability,
+    })),
+    constraints: [],
+    profiles: [],
+    updated_at_ms: 1,
+  };
+}
+
 describe("CaptureTestPage window picker", () => {
+  it("uses service capture capability status instead of legacy capture defaults", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve({
+          os_type: "windows",
+          cpu_brand: "test",
+          cpu_cores: 8,
+          memory_gb: 16,
+          gpu_info: "NVIDIA",
+          available_captures: ["dxgi", "synthetic"],
+          available_encoders: ["none"],
+          available_decoders: ["none"],
+          available_renderers: ["none"],
+          available_memory_modes: ["cpu"],
+        });
+      }
+      if (command === "ipc_capability_snapshot") {
+        return Promise.resolve(
+          capabilitySnapshot([
+            {
+              id: "capture.dxgi",
+              domain: "capture",
+              label: "DXGI",
+              status: "driver_missing",
+              reason: "DXGI probe failed",
+            },
+            {
+              id: "capture.synthetic",
+              domain: "capture",
+              label: "Synthetic",
+              status: "available",
+            },
+          ])
+        );
+      }
+      if (command === "test_list_capture_share_sources") return Promise.resolve([]);
+      if (command === "test_list_capture_share_sources_with_previews") return Promise.resolve([]);
+      return Promise.resolve(null);
+    });
+
+    render(<CaptureTestPage />);
+
+    await waitFor(() => {
+      expect(screen.queryByRole("button", { name: /DXGI/ })).not.toBeInTheDocument();
+    });
+    expect(screen.getByRole("button", { name: /合成测试模式/ })).toBeEnabled();
+  });
+
   it("starts Linux capture through the dedicated Linux scenario", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {

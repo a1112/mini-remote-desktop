@@ -18,6 +18,144 @@ fn create_test_server() -> IpcServer {
 }
 
 #[tokio::test]
+async fn service_evaluates_lan_profile_and_exposes_policy_identity_telemetry() {
+    let server = create_test_server();
+    let session_id = SessionId("scenario-session".to_string());
+
+    let evaluation = server
+        .handle_request(IpcRequest::EvaluateScenarioProfile {
+            scenario_id: "lan.2k144".to_string(),
+            peer_device_id: None,
+            requested_profile: None,
+        })
+        .await;
+    match evaluation {
+        IpcResponse::ScenarioProfileEvaluated { evaluation } => {
+            assert_eq!(evaluation.scenario_id, "lan.2k144");
+            assert!(matches!(
+                evaluation.status,
+                mrd_ipc::ScenarioEvaluationStatus::Ready
+                    | mrd_ipc::ScenarioEvaluationStatus::Degraded
+            ));
+            assert!(evaluation
+                .required_capabilities
+                .iter()
+                .any(|capability| capability == "transport.quic_datagram"));
+            assert!(evaluation.transport_kind.as_deref() == Some("quic"));
+        }
+        other => panic!(
+            "Expected ScenarioProfileEvaluated response, got {:?}",
+            other
+        ),
+    }
+
+    let policy = server
+        .handle_request(IpcRequest::SetTransportPolicy {
+            session_id: session_id.clone(),
+            policy: mrd_ipc::TransportPolicyConfig {
+                mode: "auto".to_string(),
+                preferred_transport: None,
+                allow_lan_quic: true,
+                allow_webrtc: true,
+                allow_relay: true,
+            },
+        })
+        .await;
+    match policy {
+        IpcResponse::TransportPolicyUpdated { snapshot } => {
+            assert_eq!(snapshot.session_id, Some(session_id.clone()));
+            assert_eq!(snapshot.selected_transport, "quic");
+            assert!(!snapshot.relay_required);
+        }
+        other => panic!("Expected TransportPolicyUpdated response, got {:?}", other),
+    }
+
+    let control = server
+        .handle_request(IpcRequest::GetControlChannelSnapshot {
+            session_id: session_id.clone(),
+        })
+        .await;
+    match control {
+        IpcResponse::ControlChannelSnapshot { snapshot } => {
+            assert_eq!(snapshot.reliable.name, "ctrl_rel");
+            assert_eq!(snapshot.realtime.name, "ctrl_rt");
+            assert!(snapshot.reliable.ordered);
+            assert!(!snapshot.realtime.ordered);
+        }
+        other => panic!("Expected ControlChannelSnapshot response, got {:?}", other),
+    }
+
+    let identity = server
+        .handle_request(IpcRequest::GetDeviceIdentitySnapshot)
+        .await;
+    match identity {
+        IpcResponse::DeviceIdentitySnapshot { snapshot } => {
+            assert!(snapshot.consent_required);
+            assert!(snapshot.certificate_fingerprint.is_none());
+        }
+        other => panic!("Expected DeviceIdentitySnapshot response, got {:?}", other),
+    }
+
+    let peer_device_id = DeviceId("paired-peer".to_string());
+    let paired = server
+        .handle_request(IpcRequest::PairDevice {
+            device_id: peer_device_id.clone(),
+            certificate_fingerprint: Some("sha256:peer".to_string()),
+        })
+        .await;
+    match paired {
+        IpcResponse::PairingUpdated { snapshot } => {
+            let paired_peer = snapshot
+                .paired_devices
+                .iter()
+                .find(|device| device.device_id == peer_device_id)
+                .expect("paired peer should be listed");
+            assert_eq!(paired_peer.trust_status, "pending");
+            assert_eq!(
+                paired_peer.certificate_fingerprint.as_deref(),
+                Some("sha256:peer")
+            );
+        }
+        other => panic!("Expected PairingUpdated response, got {:?}", other),
+    }
+
+    let approved = server
+        .handle_request(IpcRequest::ApprovePairing {
+            device_id: peer_device_id.clone(),
+        })
+        .await;
+    match approved {
+        IpcResponse::PairingUpdated { snapshot } => {
+            let paired_peer = snapshot
+                .paired_devices
+                .iter()
+                .find(|device| device.device_id == peer_device_id)
+                .expect("approved peer should still be listed");
+            assert_eq!(paired_peer.trust_status, "paired");
+            assert_eq!(
+                paired_peer.certificate_fingerprint.as_deref(),
+                Some("sha256:peer")
+            );
+        }
+        other => panic!("Expected PairingUpdated response, got {:?}", other),
+    }
+
+    let telemetry = server
+        .handle_request(IpcRequest::GetTelemetryBundle {
+            run_id: "run-1".to_string(),
+            session_id: Some(session_id),
+        })
+        .await;
+    match telemetry {
+        IpcResponse::TelemetryBundle { bundle } => {
+            assert_eq!(bundle.run_id, "run-1");
+            assert_eq!(bundle.event_count, 0);
+        }
+        other => panic!("Expected TelemetryBundle response, got {:?}", other),
+    }
+}
+
+#[tokio::test]
 async fn hard_cut_service_responds_to_health_check() {
     let server = create_test_server();
 

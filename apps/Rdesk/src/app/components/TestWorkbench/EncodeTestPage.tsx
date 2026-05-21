@@ -4,6 +4,14 @@ import * as commands from "../../adapters/tauri/commands";
 import type { EnvironmentSnapshot, TestConfig } from "../../adapters/tauri/types";
 import { capabilityAvailable, capabilityTag, unavailableText } from "./capabilityMeta";
 import {
+  buildCapabilitySnapshotFromIpc,
+  capabilityForOption,
+  capabilityOptionState,
+  environmentSnapshotFromCapabilitySnapshot,
+  shouldShowCapabilityOptionForSnapshot,
+  type CapabilitySnapshot,
+} from "../../services/capabilityMatrix";
+import {
   shouldShowCapabilityOption,
   useShowUnavailableCapabilities,
 } from "./useCapabilityVisibility";
@@ -150,6 +158,8 @@ export function EncodeTestPage() {
   const [isRunning, setIsRunning] = useState(false);
   const [metrics, setMetrics] = useState<EncoderMetrics | null>(null);
   const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
+  const [serviceCapabilitySnapshot, setServiceCapabilitySnapshot] =
+    useState<CapabilitySnapshot | null>(null);
   const [startError, setStartError] = useState<string | null>(null);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const metricsRequestInFlightRef = useRef(false);
@@ -165,19 +175,55 @@ export function EncodeTestPage() {
       : "硬件编码默认使用 DXGI + D3D11 shared zero-copy，更接近真实桌面串流链路。";
   const isEncoderAvailable = (option: EncoderOption) => {
     if (!option.available) return false;
+    if (serviceCapabilitySnapshot) {
+      return capabilityOptionState(serviceCapabilitySnapshot, "encoder", option.id) !== "disabled";
+    }
     return capabilityAvailable(capabilities, "available_encoders", option.id, option.id === "openh264");
   };
   const selectedAvailable = selectedOption ? isEncoderAvailable(selectedOption) : false;
   const visibleEncoderOptions = ENCODER_OPTIONS.filter((option) =>
-    !capabilities || shouldShowCapabilityOption(isEncoderAvailable(option), showUnavailable)
+    serviceCapabilitySnapshot
+      ? shouldShowCapabilityOptionForSnapshot(
+          serviceCapabilitySnapshot,
+          "encoder",
+          option.id,
+          showUnavailable
+        )
+      : !capabilities || shouldShowCapabilityOption(isEncoderAvailable(option), showUnavailable)
   );
 
   useEffect(() => {
     let cancelled = false;
+    let legacyEnvironment: EnvironmentSnapshot | null = null;
+    let serviceSnapshot: CapabilitySnapshot | null = null;
 
-    commands.testGetCapabilities().then((result) => {
-      if (!cancelled && result.ok) {
-        setCapabilities(result.value);
+    const applyLegacyEnvironment = (environment: EnvironmentSnapshot) => {
+      if (cancelled) return;
+      legacyEnvironment = environment;
+      if (serviceSnapshot) {
+        setCapabilities(environmentSnapshotFromCapabilitySnapshot(serviceSnapshot, environment));
+        return;
+      }
+      setServiceCapabilitySnapshot(null);
+      setCapabilities(environment);
+    };
+
+    const applyServiceSnapshot = (snapshot: CapabilitySnapshot) => {
+      if (cancelled) return;
+      serviceSnapshot = snapshot;
+      setServiceCapabilitySnapshot(snapshot);
+      setCapabilities(environmentSnapshotFromCapabilitySnapshot(snapshot, legacyEnvironment));
+    };
+
+    void commands.testGetCapabilities().then((result) => {
+      if (result.ok) applyLegacyEnvironment(result.value);
+    });
+
+    void commands.ipcCapabilitySnapshot().then((result) => {
+      if (result.ok && result.value) {
+        applyServiceSnapshot(buildCapabilitySnapshotFromIpc(result.value));
+      } else if (!cancelled) {
+        setServiceCapabilitySnapshot(null);
       }
     });
 
@@ -190,7 +236,7 @@ export function EncodeTestPage() {
     if (!capabilities || selectedAvailable) return;
     const nextEncoder = ENCODER_OPTIONS.find((option) => isEncoderAvailable(option));
     if (nextEncoder) setSelectedEncoder(nextEncoder.id);
-  }, [capabilities, selectedAvailable]);
+  }, [capabilities, selectedAvailable, serviceCapabilitySnapshot]);
 
   useEffect(() => {
     if (!isRunning) return;
@@ -289,9 +335,22 @@ export function EncodeTestPage() {
         <h2 className="text-lg font-semibold mb-4">选择编码器</h2>
         <div className="grid md:grid-cols-3 gap-4">
           {visibleEncoderOptions.map((option) => {
+            const capability = capabilityForOption(
+              serviceCapabilitySnapshot,
+              "encoder",
+              option.id
+            );
             const available = isEncoderAvailable(option);
             const isAv1Unavailable = option.id === "nvenc_av1" && !available;
-            const disabledLabel = unavailableText(capabilities, "available_encoders", option.id);
+            const disabledLabel = serviceCapabilitySnapshot
+              ? !available
+                ? capability?.reason ?? capability?.status ?? "不可用"
+                : null
+              : unavailableText(capabilities, "available_encoders", option.id);
+            const statusLabel =
+              serviceCapabilitySnapshot && available && capability?.status !== "available"
+                ? capability?.status
+                : null;
             return (
             <button
               key={option.id}
@@ -317,6 +376,14 @@ export function EncodeTestPage() {
               {(isAv1Unavailable || disabledLabel) && (
                 <span className="inline-block mt-2 ml-2 text-xs bg-yellow-100 text-yellow-800 px-2 py-0.5 rounded">
                   {isAv1Unavailable ? "GPU 不支持" : disabledLabel}
+                </span>
+              )}
+              {statusLabel && (
+                <span
+                  className="inline-block mt-2 ml-2 text-xs bg-amber-100 text-amber-800 px-2 py-0.5 rounded"
+                  title={capability?.reason ?? statusLabel}
+                >
+                  {statusLabel === "supported" ? "待探测" : statusLabel}
                 </span>
               )}
             </button>

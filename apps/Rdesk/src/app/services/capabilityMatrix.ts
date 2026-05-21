@@ -116,6 +116,10 @@ export interface CapabilitySnapshot {
   updated_at_ms?: number;
 }
 
+export type CapabilitySourceState = "service" | "legacyFallback" | "unavailable";
+
+export type CapabilityOptionState = "selectable" | "degraded" | "disabled";
+
 type LegacyCapabilityKey =
   | "available_captures"
   | "available_encoders"
@@ -458,6 +462,117 @@ export function evaluateCapabilityCombination(
   return { status, reasons, requiredFallbacks };
 }
 
+export function capabilityStatusIsSelectable(status: CapabilityStatus): boolean {
+  return status === "available" || status === "supported" || status === "usable";
+}
+
+export function capabilityStatusIsVisibleByDefault(status: CapabilityStatus): boolean {
+  return capabilityStatusIsSelectable(status) || status === "degraded";
+}
+
+export function capabilityIdForLegacyOption(
+  dimensionId: string,
+  optionId: string
+): string | null {
+  switch (dimensionId) {
+    case "capture":
+      return `capture.${optionId}`;
+    case "encoder":
+      return optionId === "none" ? null : `encode.${optionId}`;
+    case "decoder":
+      return optionId === "none" ? null : `decode.${optionId}`;
+    case "transport":
+      return `transport.${optionId}`;
+    case "renderer":
+      if (optionId === "renderer_none" || optionId === "none") return null;
+      return optionId === "d3d12" || optionId === "d3d12_native"
+        ? "render.d3d12_native"
+        : `render.${optionId}`;
+    case "memory":
+      return `memory.${optionId}`;
+    default:
+      return null;
+  }
+}
+
+export function capabilityForOption(
+  snapshot: CapabilitySnapshot | null | undefined,
+  dimensionId: string,
+  optionId: string
+): CapabilityItem | null {
+  const capabilityId = capabilityIdForLegacyOption(dimensionId, optionId);
+  if (!snapshot || !capabilityId) return null;
+  return snapshot.capabilities.find((item) => item.id === capabilityId) ?? null;
+}
+
+export function capabilityOptionState(
+  snapshot: CapabilitySnapshot | null | undefined,
+  dimensionId: string,
+  optionId: string
+): CapabilityOptionState {
+  const capabilityId = capabilityIdForLegacyOption(dimensionId, optionId);
+  if (!capabilityId) return "selectable";
+  const capability = capabilityForOption(snapshot, dimensionId, optionId);
+  if (!capability) return snapshot ? "disabled" : "selectable";
+  if (capabilityStatusIsSelectable(capability.status)) return "selectable";
+  if (capability.status === "degraded") return "degraded";
+  return "disabled";
+}
+
+export function shouldShowCapabilityOptionForSnapshot(
+  snapshot: CapabilitySnapshot | null | undefined,
+  dimensionId: string,
+  optionId: string,
+  showUnavailable: boolean
+): boolean {
+  if (!snapshot) return true;
+  const capabilityId = capabilityIdForLegacyOption(dimensionId, optionId);
+  if (!capabilityId) return true;
+  const capability = capabilityForOption(snapshot, dimensionId, optionId);
+  if (!capability) return showUnavailable;
+  return showUnavailable || capabilityStatusIsVisibleByDefault(capability.status);
+}
+
+export function environmentSnapshotFromCapabilitySnapshot(
+  snapshot: CapabilitySnapshot,
+  fallback?: EnvironmentSnapshot | null
+): EnvironmentSnapshot {
+  const valuesByKey: Record<LegacyCapabilityKey, string[]> = {
+    available_captures: [],
+    available_encoders: [],
+    available_decoders: ["none"],
+    available_renderers: ["none"],
+    available_memory_modes: [],
+  };
+
+  for (const capability of snapshot.capabilities) {
+    if (!capabilityStatusIsVisibleByDefault(capability.status)) continue;
+    const [domain, ...rest] = capability.id.split(".");
+    const value = rest.join(".");
+    if (!value) continue;
+    if (domain === "capture") valuesByKey.available_captures.push(value);
+    if (domain === "encode") valuesByKey.available_encoders.push(value);
+    if (domain === "decode") valuesByKey.available_decoders.push(value);
+    if (domain === "render") {
+      valuesByKey.available_renderers.push(value === "d3d12_native" ? "d3d12" : value);
+    }
+    if (domain === "memory") valuesByKey.available_memory_modes.push(value);
+  }
+
+  return {
+    os_type: snapshot.platform,
+    cpu_brand: fallback?.cpu_brand ?? "mrd-service capability snapshot",
+    cpu_cores: fallback?.cpu_cores ?? 0,
+    memory_gb: fallback?.memory_gb ?? 0,
+    gpu_info: fallback?.gpu_info ?? "Reported by mrd-service",
+    available_captures: unique(valuesByKey.available_captures),
+    available_encoders: unique(valuesByKey.available_encoders),
+    available_decoders: unique(valuesByKey.available_decoders),
+    available_renderers: unique(valuesByKey.available_renderers),
+    available_memory_modes: unique(valuesByKey.available_memory_modes),
+  };
+}
+
 export function pickPreferredCaptureSourceKind(items: CapabilityItem[]): string | undefined {
   const candidates = items.filter(
     (item) => item.domain === "capture_source" && isSelectableCapability(item)
@@ -563,6 +678,10 @@ export function evaluateProfileProbe(
 
 function hasCapability(snapshot: CapabilitySnapshot, id: string): boolean {
   return snapshot.capabilities.some((capability) => capability.id === id);
+}
+
+function unique(values: string[]): string[] {
+  return values.filter((value, index, all) => all.indexOf(value) === index);
 }
 
 function findCaptureSourceKind(items: CapabilityItem[], kind: string): string | undefined {

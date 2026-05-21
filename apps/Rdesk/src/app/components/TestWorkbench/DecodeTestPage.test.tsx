@@ -18,7 +18,77 @@ function mockCapabilities() {
   };
 }
 
+function capabilitySnapshot(capabilities: Array<{
+  id: string;
+  domain: string;
+  label: string;
+  status: string;
+  reason?: string;
+}>) {
+  return {
+    schema_version: 1,
+    platform: "windows",
+    service_version: "test",
+    capabilities: capabilities.map((capability) => ({
+      platform: "windows",
+      ...capability,
+    })),
+    constraints: [],
+    profiles: [],
+    updated_at_ms: 1,
+  };
+}
+
 describe("DecodeTestPage backend contract", () => {
+  it("uses service decoder capability status instead of legacy decoder defaults", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(mockCapabilities());
+      }
+      if (command === "ipc_capability_snapshot") {
+        return Promise.resolve(
+          capabilitySnapshot([
+            {
+              id: "decode.nvdec",
+              domain: "decode",
+              label: "NVDEC",
+              status: "driver_missing",
+              reason: "NVDEC probe failed",
+            },
+            {
+              id: "decode.software",
+              domain: "decode",
+              label: "Software",
+              status: "degraded",
+            },
+            {
+              id: "encode.openh264",
+              domain: "encode",
+              label: "OpenH264",
+              status: "degraded",
+            },
+            {
+              id: "capture.synthetic",
+              domain: "capture",
+              label: "Synthetic",
+              status: "available",
+            },
+          ])
+        );
+      }
+      if (command === "test_start_run") return Promise.resolve("run-software");
+      return Promise.resolve(null);
+    });
+
+    render(<DecodeTestPage />);
+
+    await waitFor(() => {
+      expect(screen.queryByRole("button", { name: /^选择解码器 NVDEC$/ })).not.toBeInTheDocument();
+    });
+    expect(screen.getByRole("button", { name: /^选择解码器 软件解码 \(H\.264\)$/ })).toBeEnabled();
+  });
+
   it("uses a Linux-compatible rendererless software decode path on Linux", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {

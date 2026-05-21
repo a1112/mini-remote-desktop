@@ -12,7 +12,11 @@ import type {
 import {
   buildCapabilitySnapshotFromIpc,
   buildCapabilitySnapshotFromEnvironment,
+  capabilityForOption,
+  capabilityOptionState,
+  environmentSnapshotFromCapabilitySnapshot,
   evaluateCapabilityCombination,
+  shouldShowCapabilityOptionForSnapshot,
   type CapabilitySnapshot,
 } from "../../services/capabilityMatrix";
 import {
@@ -36,6 +40,9 @@ interface MatrixOption {
   name: string;
   enabled: boolean;
   available?: boolean;
+  statusLabel?: string;
+  unavailableReason?: string;
+  scopeBlockedReason?: string;
   defaultEnabledOn?: HostOs[];
 }
 
@@ -139,10 +146,7 @@ const MATRIX_DIMENSIONS: MatrixDimension[] = [
     name: "分辨率",
     options: [
       { id: "1280x720", name: "720p", enabled: true },
-      { id: "1366x768", name: "768p", enabled: false },
-      { id: "1600x900", name: "900p", enabled: false },
       { id: "1920x1080", name: "1080p", enabled: true },
-      { id: "1920x1200", name: "1200p", enabled: false },
       { id: "2560x1440", name: "1440p", enabled: false },
       { id: "2560x1600", name: "1600p", enabled: false },
       { id: "3440x1440", name: "UWQHD", enabled: false },
@@ -272,6 +276,7 @@ function shouldEnableOptionByDefault(
 
 function createMatrixDimensions(
   capabilities?: EnvironmentSnapshot | null,
+  capabilitySnapshot?: CapabilitySnapshot | null,
   showUnavailable = false
 ): MatrixDimension[] {
   const os = normalizeHostOs(capabilities?.os_type ?? "windows");
@@ -286,6 +291,9 @@ function createMatrixDimensions(
     capabilities?.available_memory_modes ?? defaultMemoryModesForOs(os);
 
   const optionAvailable = (dimensionId: string, optionId: string): boolean => {
+    if (capabilitySnapshot) {
+      return capabilityOptionState(capabilitySnapshot, dimensionId, optionId) !== "disabled";
+    }
     switch (dimensionId) {
       case "capture":
         return availableCaptures.includes(optionId);
@@ -314,14 +322,30 @@ function createMatrixDimensions(
   return MATRIX_DIMENSIONS.map((dimension) => ({
     ...dimension,
     options: dimension.options
-      .map((option) => ({
-        ...option,
-        available: optionAvailable(dimension.id, option.id),
-        enabled:
-          optionAvailable(dimension.id, option.id) &&
-          shouldEnableOptionByDefault(dimension.id, option, os, availableDecoders),
-      }))
-      .filter((option) => showUnavailable || option.available),
+      .map((option) => {
+        const state = capabilityOptionState(capabilitySnapshot, dimension.id, option.id);
+        const capability = capabilityForOption(capabilitySnapshot, dimension.id, option.id);
+        const available = optionAvailable(dimension.id, option.id);
+        const selectable = state === "selectable" && available;
+        return {
+          ...option,
+          available,
+          statusLabel: capability?.status,
+          unavailableReason: capability?.reason ?? capability?.detail,
+          enabled:
+            selectable &&
+            shouldEnableOptionByDefault(dimension.id, option, os, availableDecoders),
+        };
+      })
+      .filter(
+        (option) =>
+          shouldShowCapabilityOptionForSnapshot(
+            capabilitySnapshot,
+            dimension.id,
+            option.id,
+            showUnavailable
+          ) && (showUnavailable || option.available)
+      ),
   })).filter((dimension) => dimension.options.length > 0);
 }
 
@@ -654,6 +678,8 @@ const MAX_MATRIX_RUNS = 300;
 const MAX_MATRIX_RENDER_ROWS = 250;
 const SKIP_YIELD_BATCH_SIZE = 20;
 const LOCAL_LAN_TARGET_ID = "__local__";
+const CROSS_DEVICE_LOOPBACK_REASON =
+  "Loopback 仅支持本机进程内测试；跨设备矩阵请显式选择 QUIC Datagram 或 WebRTC RTP。";
 
 type MatrixRunScope = "local" | "cross-device";
 
@@ -711,6 +737,64 @@ function setOptionEnabled(
   );
 }
 
+function applyRunScopeToDimensions(
+  dimensions: MatrixDimension[],
+  runScope: MatrixRunScope
+): MatrixDimension[] {
+  if (runScope !== "cross-device") {
+    return dimensions.map((dimension) => ({
+      ...dimension,
+      options: dimension.options.map((option) => ({
+        ...option,
+        scopeBlockedReason: undefined,
+      })),
+    }));
+  }
+
+  return dimensions.map((dimension) =>
+    dimension.id === "transport"
+      ? {
+          ...dimension,
+          options: dimension.options.map((option) =>
+            option.id === "loopback"
+              ? {
+                  ...option,
+                  enabled: false,
+                  scopeBlockedReason: CROSS_DEVICE_LOOPBACK_REASON,
+                }
+              : option
+          ),
+        }
+      : dimension
+  );
+}
+
+function optionScopeBlockedReason(
+  runScope: MatrixRunScope,
+  dimensionId: string,
+  optionId: string
+): string | null {
+  return runScope === "cross-device" && dimensionId === "transport" && optionId === "loopback"
+    ? CROSS_DEVICE_LOOPBACK_REASON
+    : null;
+}
+
+function matrixGenerationBlockedReason(
+  dimensions: MatrixDimension[],
+  runScope: MatrixRunScope
+): string | null {
+  if (runScope !== "cross-device") return null;
+  const transportDimension = dimensions.find((dimension) => dimension.id === "transport");
+  const hasCrossDeviceTransport =
+    transportDimension?.options.some(
+      (option) =>
+        option.enabled &&
+        !option.scopeBlockedReason &&
+        (option.id === "quic" || option.id === "webrtc")
+    ) ?? false;
+  return hasCrossDeviceTransport ? null : CROSS_DEVICE_LOOPBACK_REASON;
+}
+
 function isOptionEnabled(
   dimensions: MatrixDimension[],
   dimensionId: string,
@@ -742,8 +826,9 @@ function matrixConfigKey(config: TestConfig): string {
 }
 
 function crossDeviceMatrixKey(config: TestConfig): string {
+  const transportKind = crossDeviceTransportFromConfig(config);
   return JSON.stringify({
-    transport_kind: crossDeviceTransportFromConfig(config),
+    transport_kind: transportKind ?? config.transport_kind ?? "loopback",
     adaptive_media: config.adaptive_media,
     resolution: config.resolution,
     fps: config.fps,
@@ -764,7 +849,7 @@ function createCrossDeviceMatrixTests(matrixTests: MatrixTest[]): MatrixTest[] {
       ...test,
       id: `cross_device_${tests.length}`,
       status: "pending",
-      skipReason: undefined,
+      skipReason: test.skipReason ?? crossDeviceUnsupportedTransportReason(test.config) ?? undefined,
       failureReason: undefined,
       result: undefined,
       duration: undefined,
@@ -774,8 +859,22 @@ function createCrossDeviceMatrixTests(matrixTests: MatrixTest[]): MatrixTest[] {
   return tests;
 }
 
-function crossDeviceTransportFromConfig(config: TestConfig): "quic" | "webrtc" {
-  return config.transport_kind === "webrtc" ? "webrtc" : "quic";
+function crossDeviceTransportFromConfig(config: TestConfig): "quic" | "webrtc" | null {
+  if (config.transport_kind === "quic" || config.transport_kind === "webrtc") {
+    return config.transport_kind;
+  }
+  return null;
+}
+
+function crossDeviceUnsupportedTransportReason(config: TestConfig): string | null {
+  const transportKind = config.transport_kind ?? "loopback";
+  if (transportKind === "loopback") {
+    return CROSS_DEVICE_LOOPBACK_REASON;
+  }
+  if (transportKind !== "quic" && transportKind !== "webrtc") {
+    return `跨设备矩阵不支持传输层 ${transportKind}；请使用 QUIC Datagram 或 WebRTC RTP。`;
+  }
+  return null;
 }
 
 function mediaProfileFromConfig(config: TestConfig): MediaProfile {
@@ -986,7 +1085,7 @@ function createLocalUiDebugMatrixTests(
 export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) {
   const [showUnavailable] = useShowUnavailableCapabilities();
   const [dimensions, setDimensions] = useState<MatrixDimension[]>(() =>
-    createMatrixDimensions(null, readShowUnavailableCapabilities())
+    createMatrixDimensions(null, null, readShowUnavailableCapabilities())
   );
   const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
   const [serviceCapabilitySnapshot, setServiceCapabilitySnapshot] =
@@ -1011,31 +1110,63 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
   );
   const capabilitySnapshot =
     serviceCapabilitySnapshot ?? environmentCapabilitySnapshot;
+  const scopedDimensions = useMemo(
+    () => applyRunScopeToDimensions(dimensions, runScope),
+    [dimensions, runScope]
+  );
+  const selectionBlockedReason = useMemo(
+    () => matrixGenerationBlockedReason(scopedDimensions, runScope),
+    [scopedDimensions, runScope]
+  );
 
   useEffect(() => {
     let cancelled = false;
+    let legacyEnvironment: EnvironmentSnapshot | null = null;
+    let serviceSnapshot: CapabilitySnapshot | null = null;
 
-    async function loadCapabilities() {
-      const [legacyResult, serviceResult] = await Promise.all([
-        commands.testGetCapabilities(),
-        commands.ipcCapabilitySnapshot(),
-      ]);
-
+    const applyLegacyEnvironment = (environment: EnvironmentSnapshot) => {
       if (cancelled) {
         return;
       }
+      legacyEnvironment = environment;
+      if (serviceSnapshot) {
+        const mergedEnvironment = environmentSnapshotFromCapabilitySnapshot(
+          serviceSnapshot,
+          legacyEnvironment
+        );
+        setCapabilities(mergedEnvironment);
+        setDimensions(createMatrixDimensions(mergedEnvironment, serviceSnapshot, showUnavailable));
+        return;
+      }
+      setCapabilities(environment);
+      setServiceCapabilitySnapshot(null);
+      setDimensions(createMatrixDimensions(environment, null, showUnavailable));
+    };
 
+    const applyServiceSnapshot = (snapshot: CapabilitySnapshot) => {
+      if (cancelled) {
+        return;
+      }
+      serviceSnapshot = snapshot;
+      const environment = environmentSnapshotFromCapabilitySnapshot(snapshot, legacyEnvironment);
+      setCapabilities(environment);
+      setServiceCapabilitySnapshot(snapshot);
+      setDimensions(createMatrixDimensions(environment, snapshot, showUnavailable));
+    };
+
+    void commands.testGetCapabilities().then((legacyResult) => {
       if (legacyResult.ok && legacyResult.value) {
-        setCapabilities(legacyResult.value);
-        setDimensions(createMatrixDimensions(legacyResult.value, showUnavailable));
+        applyLegacyEnvironment(legacyResult.value);
       }
+    });
 
+    void commands.ipcCapabilitySnapshot().then((serviceResult) => {
       if (serviceResult.ok && serviceResult.value) {
-        setServiceCapabilitySnapshot(buildCapabilitySnapshotFromIpc(serviceResult.value));
+        applyServiceSnapshot(buildCapabilitySnapshotFromIpc(serviceResult.value));
+      } else if (!cancelled) {
+        setServiceCapabilitySnapshot(null);
       }
-    }
-
-    void loadCapabilities();
+    });
 
     return () => {
       cancelled = true;
@@ -1046,7 +1177,7 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
     setIsRefreshingLanPeers(true);
     const result = await commands.ipcRefreshLanDiscovery();
     if (result.ok) {
-      const peers = result.value.peers ?? [];
+      const peers = result.value?.peers ?? [];
       setLanPeers(peers);
       setSelectedLanTargetId((current) =>
         current === LOCAL_LAN_TARGET_ID ||
@@ -1067,6 +1198,11 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
 
   const toggleOption = (dimensionId: string, optionId: string) => {
     setMatrixNotice(null);
+    const scopeBlockedReason = optionScopeBlockedReason(runScope, dimensionId, optionId);
+    if (scopeBlockedReason) {
+      setMatrixNotice(scopeBlockedReason);
+      return;
+    }
     setDimensions((current) => {
       const option = current
         .find((dim) => dim.id === dimensionId)
@@ -1136,10 +1272,14 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
   };
 
   const generateMatrix = useCallback((): MatrixGenerationResult => {
-    const enabledOptions = dimensions
+    if (selectionBlockedReason) {
+      return { tests: [], truncated: false };
+    }
+
+    const enabledOptions = scopedDimensions
       .map((dim) =>
         dim.options
-          .filter((o) => o.enabled)
+          .filter((o) => o.enabled && !o.scopeBlockedReason)
           .map((option) => ({
             dimensionId: dim.id,
             option,
@@ -1191,7 +1331,7 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
 
     generate(0, []);
     return { tests: combinations, truncated };
-  }, [capabilitySnapshot, dimensions]);
+  }, [capabilitySnapshot, scopedDimensions, selectionBlockedReason]);
 
   const waitForRunCompletion = async (runId: string, config: TestConfig): Promise<TestRun | null> => {
     const timeoutMs = Math.max(
@@ -1488,6 +1628,14 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
       try {
         const profile = mediaProfileFromConfig(test.config);
         const transportKind = crossDeviceTransportFromConfig(test.config);
+        if (!transportKind) {
+          markSkipped(
+            crossDeviceUnsupportedTransportReason(test.config) ??
+              "跨设备矩阵需要显式选择 QUIC Datagram 或 WebRTC RTP。"
+          );
+          await yieldToUi();
+          continue;
+        }
         const peerSkipReason = crossDevicePeerSkipReason(targetPeer, transportKind);
         if (peerSkipReason) {
           markSkipped(peerSkipReason);
@@ -1719,37 +1867,70 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
       <div className="bg-card rounded-lg border p-4 mb-6">
         <h2 className="text-lg font-semibold mb-4">选择测试维度</h2>
         <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {dimensions.map((dim) => (
+          {scopedDimensions.map((dim) => (
             <div key={dim.id}>
               <h3 className="font-medium text-sm mb-2">{dim.name}</h3>
               <div className="space-y-1">
-                {dim.options.map((opt) => (
-                  <label
-                    key={opt.id}
-                    className={`flex items-center gap-2 p-2 rounded hover:bg-muted ${
-                      opt.available === false ? "cursor-not-allowed opacity-50" : "cursor-pointer"
-                    }`}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={opt.enabled}
-                      onChange={() => toggleOption(dim.id, opt.id)}
-                      disabled={isRunning || opt.available === false}
-                      className="rounded"
-                    />
-                    <span className="text-sm">{opt.name}</span>
-                    {opt.available === false && (
-                      <span className="text-xs bg-yellow-100 text-yellow-800 px-1 rounded">
-                        不可用
-                      </span>
-                    )}
-                    {opt.id === "nvenc_av1" && (
-                      <span className="text-xs bg-yellow-100 text-yellow-800 px-1 rounded">
-                        NVDEC
-                      </span>
-                    )}
-                  </label>
-                ))}
+                {dim.options.map((opt) => {
+                  const scopeBlocked = Boolean(opt.scopeBlockedReason);
+                  return (
+                    <label
+                      key={opt.id}
+                      className={`flex items-center gap-2 p-2 rounded hover:bg-muted ${
+                        opt.available === false || scopeBlocked
+                          ? "cursor-not-allowed opacity-50"
+                          : "cursor-pointer"
+                      }`}
+                    >
+                      <input
+                        type="checkbox"
+                        aria-label={opt.name}
+                        checked={opt.enabled}
+                        onChange={() => toggleOption(dim.id, opt.id)}
+                        disabled={isRunning || opt.available === false || scopeBlocked}
+                        className="rounded"
+                      />
+                      <span className="text-sm">{opt.name}</span>
+                      {scopeBlocked && (
+                        <span
+                          className="text-xs bg-slate-100 text-slate-700 px-1 rounded dark:bg-slate-800 dark:text-slate-200"
+                          title={opt.scopeBlockedReason}
+                        >
+                          仅本机
+                        </span>
+                      )}
+                      {opt.available === false && (
+                        <span
+                          className="text-xs bg-yellow-100 text-yellow-800 px-1 rounded"
+                          title={opt.unavailableReason ?? opt.statusLabel}
+                        >
+                          不可用
+                        </span>
+                      )}
+                      {opt.available !== false && opt.statusLabel === "degraded" && (
+                        <span
+                          className="text-xs bg-amber-100 text-amber-800 px-1 rounded"
+                          title={opt.unavailableReason ?? "degraded"}
+                        >
+                          degraded
+                        </span>
+                      )}
+                      {opt.available !== false && opt.statusLabel === "supported" && (
+                        <span
+                          className="text-xs bg-blue-100 text-blue-800 px-1 rounded"
+                          title={opt.unavailableReason ?? "supported"}
+                        >
+                          待探测
+                        </span>
+                      )}
+                      {opt.id === "nvenc_av1" && (
+                        <span className="text-xs bg-yellow-100 text-yellow-800 px-1 rounded">
+                          NVDEC
+                        </span>
+                      )}
+                    </label>
+                  );
+                })}
               </div>
             </div>
           ))}
@@ -1771,7 +1952,11 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
               </button>
               <button
                 onClick={handleStart}
-                disabled={plannedTotalTests === 0 || matrixGeneration.truncated}
+                disabled={
+                  plannedTotalTests === 0 ||
+                  matrixGeneration.truncated ||
+                  Boolean(selectionBlockedReason)
+                }
                 className="flex items-center gap-2 px-4 py-2 bg-primary text-primary-foreground rounded hover:bg-primary/90 disabled:opacity-50"
               >
                 <Play className="h-4 w-4" />
@@ -1804,6 +1989,12 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
         {matrixGeneration.truncated && !isRunning && (
           <div className="mb-4 rounded border border-yellow-500/40 bg-yellow-500/10 px-3 py-2 text-sm text-yellow-700 dark:text-yellow-300">
             当前选择超过 {MAX_MATRIX_RUNS} 个组合。减少勾选项后再启动，避免矩阵一次性生成和跳过过多用例导致界面无响应。
+          </div>
+        )}
+
+        {selectionBlockedReason && !isRunning && (
+          <div className="mb-4 rounded border border-yellow-500/40 bg-yellow-500/10 px-3 py-2 text-sm text-yellow-700 dark:text-yellow-300">
+            {selectionBlockedReason}
           </div>
         )}
 

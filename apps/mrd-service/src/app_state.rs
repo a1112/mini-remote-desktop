@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 // mrd-service application state
 //
 // This module defines the shared state owned by mrd-service.
@@ -9,9 +11,10 @@ use base64::{engine::general_purpose, Engine as _};
 use image::{codecs::png::PngEncoder, ColorType, ImageEncoder};
 use mrd_application::ports::SessionSnapshot;
 use mrd_ipc::{
-    AttachedRenderSurface, AuditEvent, AuditLogQuery, CaptureSourceSelection,
+    AttachedRenderSurface, AuditEvent, AuditLogQuery, CapabilitySnapshot, CaptureSourceSelection,
     MediaAdaptationSnapshot, MediaPipelineSnapshot, MediaProfile, MediaProfileNegotiation,
     MediaSenderTransportSnapshot, MediaStageMetrics, MediaTestImpairmentSnapshot,
+    PairedDeviceIdentity,
 };
 use mrd_proto::{DeviceId, SessionId};
 #[cfg(windows)]
@@ -209,6 +212,48 @@ impl SessionPeerMediaCapabilityRegistry {
 
     pub fn remove(&mut self, session_id: &SessionId) -> Option<Vec<String>> {
         self.capabilities.remove(session_id)
+    }
+}
+
+/// Cached service-owned capability snapshot exposed to UI and session handlers.
+#[derive(Debug)]
+pub struct CapabilitySnapshotRegistry {
+    snapshot: CapabilitySnapshot,
+    refresh_in_progress: bool,
+}
+
+impl Default for CapabilitySnapshotRegistry {
+    fn default() -> Self {
+        Self {
+            snapshot: crate::capabilities::local_capability_snapshot_static(),
+            refresh_in_progress: false,
+        }
+    }
+}
+
+impl CapabilitySnapshotRegistry {
+    pub fn snapshot(&self) -> CapabilitySnapshot {
+        self.snapshot.clone()
+    }
+
+    pub fn replace(&mut self, snapshot: CapabilitySnapshot) {
+        self.snapshot = snapshot;
+        self.refresh_in_progress = false;
+    }
+
+    pub fn begin_refresh(&mut self) -> bool {
+        if self.refresh_in_progress {
+            return false;
+        }
+        self.refresh_in_progress = true;
+        true
+    }
+
+    pub fn finish_refresh(&mut self, snapshot: Option<CapabilitySnapshot>) {
+        if let Some(snapshot) = snapshot {
+            self.snapshot = snapshot;
+        }
+        self.refresh_in_progress = false;
     }
 }
 
@@ -1035,6 +1080,57 @@ pub struct DeviceRegistry {
     local_device: Option<(DeviceId, String)>, // (id, name)
 }
 
+/// In-memory paired device identity registry.
+#[derive(Debug, Default)]
+pub struct DeviceIdentityRegistry {
+    paired_devices: HashMap<DeviceId, PairedDeviceIdentity>,
+}
+
+impl DeviceIdentityRegistry {
+    pub fn upsert(
+        &mut self,
+        device_id: DeviceId,
+        certificate_fingerprint: Option<String>,
+        trust_status: impl Into<String>,
+    ) {
+        let display_name = device_id.0.clone();
+        let existing = self.paired_devices.remove(&device_id);
+        let certificate_fingerprint = certificate_fingerprint.or_else(|| {
+            existing
+                .as_ref()
+                .and_then(|identity| identity.certificate_fingerprint.clone())
+        });
+        self.paired_devices.insert(
+            device_id.clone(),
+            PairedDeviceIdentity {
+                display_name: existing
+                    .as_ref()
+                    .map(|identity| identity.display_name.clone())
+                    .unwrap_or(display_name),
+                device_id,
+                certificate_fingerprint,
+                trust_status: trust_status.into(),
+                last_seen_ms: Some(now_unix_ms()),
+            },
+        );
+    }
+
+    pub fn revoke(&mut self, device_id: &DeviceId) {
+        if let Some(identity) = self.paired_devices.get_mut(device_id) {
+            identity.trust_status = "revoked".to_string();
+            identity.last_seen_ms = Some(now_unix_ms());
+        } else {
+            self.upsert(device_id.clone(), None, "revoked");
+        }
+    }
+
+    pub fn list(&self) -> Vec<PairedDeviceIdentity> {
+        let mut identities = self.paired_devices.values().cloned().collect::<Vec<_>>();
+        identities.sort_by(|a, b| a.device_id.0.cmp(&b.device_id.0));
+        identities
+    }
+}
+
 /// In-memory service audit event registry.
 #[derive(Debug)]
 pub struct AuditLogRegistry {
@@ -1215,6 +1311,8 @@ pub struct AppState {
     pub devices: Arc<Mutex<DeviceRegistry>>,
     /// Service-owned security and operations audit events.
     pub audit_log: Arc<Mutex<AuditLogRegistry>>,
+    /// Service-owned device pairing and identity state.
+    pub device_identities: Arc<Mutex<DeviceIdentityRegistry>>,
     /// Shell state - UI presence and service lifecycle
     pub shell: Arc<Mutex<ShellState>>,
     /// Tray port (Phase 4)
@@ -1231,6 +1329,8 @@ pub struct AppState {
     pub display_modes: Arc<Mutex<DisplayModeRegistry>>,
     /// Peer media capabilities keyed by session.
     pub peer_media_capabilities: Arc<Mutex<SessionPeerMediaCapabilityRegistry>>,
+    /// Cached local capability facts refreshed outside request handling.
+    pub capability_snapshot: Arc<Mutex<CapabilitySnapshotRegistry>>,
     /// Receiver pipeline state keyed by session.
     pub media_pipelines: Arc<Mutex<MediaPipelineRegistry>>,
     /// Native renderer instances keyed by receiver session/surface.
@@ -1265,6 +1365,7 @@ impl AppState {
             sessions: Arc::new(Mutex::new(SessionRegistry::default())),
             devices: Arc::new(Mutex::new(DeviceRegistry::default())),
             audit_log: Arc::new(Mutex::new(AuditLogRegistry::default())),
+            device_identities: Arc::new(Mutex::new(DeviceIdentityRegistry::default())),
             shell: Arc::new(Mutex::new(ShellState::default())),
             tray,
             lan_discovery: Arc::new(crate::lan_discovery::LanDiscoveryState::new(
@@ -1277,6 +1378,7 @@ impl AppState {
             peer_media_capabilities: Arc::new(Mutex::new(
                 SessionPeerMediaCapabilityRegistry::default(),
             )),
+            capability_snapshot: Arc::new(Mutex::new(CapabilitySnapshotRegistry::default())),
             media_pipelines: Arc::new(Mutex::new(MediaPipelineRegistry::default())),
             #[cfg(windows)]
             media_surface_renderers: Arc::new(Mutex::new(MediaSurfaceRendererRegistry::default())),
@@ -1299,6 +1401,11 @@ impl AppState {
     /// Get a clone of the service audit log registry.
     pub fn audit_log(&self) -> Arc<Mutex<AuditLogRegistry>> {
         self.audit_log.clone()
+    }
+
+    /// Get a clone of the device identity registry.
+    pub fn device_identities(&self) -> Arc<Mutex<DeviceIdentityRegistry>> {
+        self.device_identities.clone()
     }
 
     /// Get a clone of the shell Arc for injection into handlers
@@ -1339,6 +1446,49 @@ impl AppState {
     /// Get a clone of the peer media capability registry.
     pub fn peer_media_capabilities(&self) -> Arc<Mutex<SessionPeerMediaCapabilityRegistry>> {
         self.peer_media_capabilities.clone()
+    }
+
+    /// Get a clone of the local capability snapshot registry.
+    pub fn capability_snapshot(&self) -> Arc<Mutex<CapabilitySnapshotRegistry>> {
+        self.capability_snapshot.clone()
+    }
+
+    /// Return the currently cached local capability snapshot without running runtime probes.
+    pub async fn cached_capability_snapshot(&self) -> CapabilitySnapshot {
+        self.capability_snapshot.lock().await.snapshot()
+    }
+
+    /// Refresh the local capability snapshot on a blocking worker without delaying IPC handlers.
+    pub fn refresh_capability_snapshot_in_background(self: &Arc<Self>) {
+        let app_state = Arc::clone(self);
+        tokio::spawn(async move {
+            let should_refresh = {
+                let mut registry = app_state.capability_snapshot.lock().await;
+                registry.begin_refresh()
+            };
+            if !should_refresh {
+                return;
+            }
+
+            let snapshot =
+                tokio::task::spawn_blocking(crate::capabilities::local_capability_snapshot)
+                    .await
+                    .map_err(|error| {
+                        tracing::warn!("capability snapshot refresh task failed: {}", error);
+                        error
+                    })
+                    .ok();
+            app_state
+                .capability_snapshot
+                .lock()
+                .await
+                .finish_refresh(snapshot);
+        });
+    }
+
+    #[cfg(test)]
+    pub async fn replace_capability_snapshot_for_test(&self, snapshot: CapabilitySnapshot) {
+        self.capability_snapshot.lock().await.replace(snapshot);
     }
 
     /// Get a clone of the receiver media pipeline registry.

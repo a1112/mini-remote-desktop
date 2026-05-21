@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 // Shell abstraction for mrd-service
 //
 // Provides platform-agnostic ports for:

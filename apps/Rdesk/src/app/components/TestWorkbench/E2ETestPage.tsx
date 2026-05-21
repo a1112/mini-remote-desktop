@@ -12,6 +12,11 @@ import {
   type LanE2EStatus,
 } from "../../services/lanE2eAutomationService";
 import { capabilityAvailable, chooseCapability } from "./capabilityMeta";
+import {
+  buildCapabilitySnapshotFromIpc,
+  environmentSnapshotFromCapabilitySnapshot,
+  type CapabilitySnapshot,
+} from "../../services/capabilityMatrix";
 
 function buildDefaultConfig(capabilities: EnvironmentSnapshot | null): TestConfig {
   const capture = chooseCapability(
@@ -96,6 +101,7 @@ export function E2ETestPage() {
   const [metrics, setMetrics] = useState<HarnessMetrics | null>(null);
   const [capturedFrame, setCapturedFrame] = useState<string | null>(null);
   const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
+  const [, setServiceCapabilitySnapshot] = useState<CapabilitySnapshot | null>(null);
   const [lanRunState, setLanRunState] = useState<LanE2EStatus | "idle">("idle");
   const [lanReport, setLanReport] = useState<LanE2EAutomationReport | null>(null);
   const [lanScenarioId, setLanScenarioId] =
@@ -104,10 +110,36 @@ export function E2ETestPage() {
 
   useEffect(() => {
     let cancelled = false;
+    let legacyEnvironment: EnvironmentSnapshot | null = null;
+    let serviceSnapshot: CapabilitySnapshot | null = null;
 
-    commands.testGetCapabilities().then((result) => {
-      if (!cancelled && result.ok) {
-        setCapabilities(result.value);
+    const applyLegacyEnvironment = (environment: EnvironmentSnapshot) => {
+      if (cancelled) return;
+      legacyEnvironment = environment;
+      if (serviceSnapshot) {
+        setCapabilities(environmentSnapshotFromCapabilitySnapshot(serviceSnapshot, environment));
+        return;
+      }
+      setServiceCapabilitySnapshot(null);
+      setCapabilities(environment);
+    };
+
+    const applyServiceSnapshot = (snapshot: CapabilitySnapshot) => {
+      if (cancelled) return;
+      serviceSnapshot = snapshot;
+      setServiceCapabilitySnapshot(snapshot);
+      setCapabilities(environmentSnapshotFromCapabilitySnapshot(snapshot, legacyEnvironment));
+    };
+
+    void commands.testGetCapabilities().then((result) => {
+      if (result.ok) applyLegacyEnvironment(result.value);
+    });
+
+    void commands.ipcCapabilitySnapshot().then((result) => {
+      if (result.ok && result.value) {
+        applyServiceSnapshot(buildCapabilitySnapshotFromIpc(result.value));
+      } else if (!cancelled) {
+        setServiceCapabilitySnapshot(null);
       }
     });
 
