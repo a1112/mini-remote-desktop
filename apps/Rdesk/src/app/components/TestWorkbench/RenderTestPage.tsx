@@ -4,6 +4,14 @@ import * as commands from "../../adapters/tauri/commands";
 import type { EnvironmentSnapshot, FrameData, MetricSeries, TestConfig } from "../../adapters/tauri/types";
 import { capabilityAvailable, capabilityTag, chooseCapability, unavailableText } from "./capabilityMeta";
 import {
+  buildCapabilitySnapshotFromIpc,
+  capabilityForOption,
+  capabilityOptionState,
+  environmentSnapshotFromCapabilitySnapshot,
+  shouldShowCapabilityOptionForSnapshot,
+  type CapabilitySnapshot,
+} from "../../services/capabilityMatrix";
+import {
   shouldShowCapabilityOption,
   useShowUnavailableCapabilities,
 } from "./useCapabilityVisibility";
@@ -104,6 +112,8 @@ export function RenderTestPage() {
   const [webViewDurationMs, setWebViewDurationMs] = useState(0);
   const [metrics, setMetrics] = useState<RenderMetrics | null>(null);
   const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
+  const [serviceCapabilitySnapshot, setServiceCapabilitySnapshot] =
+    useState<CapabilitySnapshot | null>(null);
   const [startError, setStartError] = useState<string | null>(null);
   const [previewFrame, setPreviewFrame] = useState<FrameData | null>(null);
   const lastCapturedGenerationRef = useRef<number | undefined>(undefined);
@@ -113,11 +123,21 @@ export function RenderTestPage() {
 
   const selectedOption = RENDERER_OPTIONS.find((o) => o.id === selectedRenderer);
   const selectedAvailable = selectedOption
-    ? isRendererAvailable(capabilities, selectedOption.id)
+    ? serviceCapabilitySnapshot
+      ? capabilityOptionState(serviceCapabilitySnapshot, "renderer", selectedOption.id) !==
+        "disabled"
+      : isRendererAvailable(capabilities, selectedOption.id)
     : false;
   const visibleRendererOptions = RENDERER_OPTIONS.filter((option) =>
-    !capabilities ||
-    shouldShowCapabilityOption(isRendererAvailable(capabilities, option.id), showUnavailable)
+    serviceCapabilitySnapshot
+      ? shouldShowCapabilityOptionForSnapshot(
+          serviceCapabilitySnapshot,
+          "renderer",
+          option.id,
+          showUnavailable
+        )
+      : !capabilities ||
+        shouldShowCapabilityOption(isRendererAvailable(capabilities, option.id), showUnavailable)
   );
 
   const RENDER_MODES = [
@@ -128,10 +148,38 @@ export function RenderTestPage() {
 
   useEffect(() => {
     let cancelled = false;
+    let legacyEnvironment: EnvironmentSnapshot | null = null;
+    let serviceSnapshot: CapabilitySnapshot | null = null;
 
-    commands.testGetCapabilities().then((result) => {
-      if (!cancelled && result.ok) {
-        setCapabilities(result.value);
+    const applyLegacyEnvironment = (environment: EnvironmentSnapshot) => {
+      if (cancelled) return;
+      legacyEnvironment = environment;
+      if (serviceSnapshot) {
+        setCapabilities(environmentSnapshotFromCapabilitySnapshot(serviceSnapshot, environment));
+        return;
+      }
+      setServiceCapabilitySnapshot(null);
+      setCapabilities(environment);
+    };
+
+    const applyServiceSnapshot = (snapshot: CapabilitySnapshot) => {
+      if (cancelled) return;
+      serviceSnapshot = snapshot;
+      setServiceCapabilitySnapshot(snapshot);
+      setCapabilities(environmentSnapshotFromCapabilitySnapshot(snapshot, legacyEnvironment));
+    };
+
+    void commands.testGetCapabilities().then((environmentResult) => {
+      if (environmentResult.ok) {
+        applyLegacyEnvironment(environmentResult.value);
+      }
+    });
+
+    void commands.ipcCapabilitySnapshot().then((serviceResult) => {
+      if (serviceResult.ok && serviceResult.value) {
+        applyServiceSnapshot(buildCapabilitySnapshotFromIpc(serviceResult.value));
+      } else if (!cancelled) {
+        setServiceCapabilitySnapshot(null);
       }
     });
 
@@ -141,12 +189,27 @@ export function RenderTestPage() {
   }, []);
 
   useEffect(() => {
+    if (serviceCapabilitySnapshot) {
+      if (
+        capabilityOptionState(serviceCapabilitySnapshot, "renderer", selectedRenderer) !==
+        "disabled"
+      ) {
+        return;
+      }
+      const nextRenderer = RENDERER_OPTIONS.find(
+        (option) =>
+          capabilityOptionState(serviceCapabilitySnapshot, "renderer", option.id) !==
+          "disabled"
+      );
+      if (nextRenderer) setSelectedRenderer(nextRenderer.id);
+      return;
+    }
     if (!capabilities || isRendererAvailable(capabilities, selectedRenderer)) return;
     const nextRenderer = RENDERER_OPTIONS.find((option) =>
       isRendererAvailable(capabilities, option.id)
     );
     if (nextRenderer) setSelectedRenderer(nextRenderer.id);
-  }, [capabilities, selectedRenderer]);
+  }, [capabilities, selectedRenderer, serviceCapabilitySnapshot]);
 
   useEffect(() => {
     if (!isRunning) return;
@@ -395,8 +458,24 @@ export function RenderTestPage() {
         <h2 className="text-lg font-semibold mb-4">选择渲染器</h2>
         <div className="grid md:grid-cols-3 gap-4">
           {visibleRendererOptions.map((option) => {
-            const available = isRendererAvailable(capabilities, option.id);
-            const disabledLabel = unavailableText(capabilities, "available_renderers", option.id);
+            const capability = capabilityForOption(
+              serviceCapabilitySnapshot,
+              "renderer",
+              option.id
+            );
+            const available = serviceCapabilitySnapshot
+              ? capabilityOptionState(serviceCapabilitySnapshot, "renderer", option.id) !==
+                "disabled"
+              : isRendererAvailable(capabilities, option.id);
+            const disabledLabel = serviceCapabilitySnapshot
+              ? !available
+                ? capability?.reason ?? capability?.status ?? "不可用"
+                : null
+              : unavailableText(capabilities, "available_renderers", option.id);
+            const statusLabel =
+              serviceCapabilitySnapshot && available && capability?.status !== "available"
+                ? capability?.status
+                : null;
             return (
             <button
               key={option.id}
@@ -420,6 +499,14 @@ export function RenderTestPage() {
               {disabledLabel && (
                 <span className="inline-block mt-2 text-xs bg-yellow-100 text-yellow-800 px-2 py-0.5 rounded">
                   {disabledLabel}
+                </span>
+              )}
+              {statusLabel && (
+                <span
+                  className="inline-block mt-2 text-xs bg-amber-100 text-amber-800 px-2 py-0.5 rounded"
+                  title={capability?.reason ?? statusLabel}
+                >
+                  {statusLabel}
                 </span>
               )}
             </button>

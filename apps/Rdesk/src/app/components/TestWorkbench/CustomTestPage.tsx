@@ -5,6 +5,13 @@ import * as commands from "../../adapters/tauri/commands";
 import type { EnvironmentSnapshot, TestConfig } from "../../adapters/tauri/types";
 import { capabilityAvailable, capabilityTag, unavailableText } from "./capabilityMeta";
 import {
+  buildCapabilitySnapshotFromIpc,
+  capabilityOptionState,
+  environmentSnapshotFromCapabilitySnapshot,
+  shouldShowCapabilityOptionForSnapshot,
+  type CapabilitySnapshot,
+} from "../../services/capabilityMatrix";
+import {
   shouldShowCapabilityOption,
   useShowUnavailableCapabilities,
 } from "./useCapabilityVisibility";
@@ -231,15 +238,43 @@ export function CustomTestPage() {
   const [selectedBitrate, setSelectedBitrate] = useState("5000");
   const [starting, setStarting] = useState(false);
   const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
+  const [serviceCapabilitySnapshot, setServiceCapabilitySnapshot] =
+    useState<CapabilitySnapshot | null>(null);
   const [startError, setStartError] = useState<string | null>(null);
   const [showUnavailable] = useShowUnavailableCapabilities();
 
   useEffect(() => {
     let cancelled = false;
+    let legacyEnvironment: EnvironmentSnapshot | null = null;
+    let serviceSnapshot: CapabilitySnapshot | null = null;
 
-    commands.testGetCapabilities().then((result) => {
-      if (!cancelled && result.ok) {
-        setCapabilities(result.value);
+    const applyLegacyEnvironment = (environment: EnvironmentSnapshot) => {
+      if (cancelled) return;
+      legacyEnvironment = environment;
+      if (serviceSnapshot) {
+        setCapabilities(environmentSnapshotFromCapabilitySnapshot(serviceSnapshot, environment));
+        return;
+      }
+      setServiceCapabilitySnapshot(null);
+      setCapabilities(environment);
+    };
+
+    const applyServiceSnapshot = (snapshot: CapabilitySnapshot) => {
+      if (cancelled) return;
+      serviceSnapshot = snapshot;
+      setServiceCapabilitySnapshot(snapshot);
+      setCapabilities(environmentSnapshotFromCapabilitySnapshot(snapshot, legacyEnvironment));
+    };
+
+    void commands.testGetCapabilities().then((result) => {
+      if (result.ok) applyLegacyEnvironment(result.value);
+    });
+
+    void commands.ipcCapabilitySnapshot().then((result) => {
+      if (result.ok && result.value) {
+        applyServiceSnapshot(buildCapabilitySnapshotFromIpc(result.value));
+      } else if (!cancelled) {
+        setServiceCapabilitySnapshot(null);
       }
     });
 
@@ -249,13 +284,19 @@ export function CustomTestPage() {
   }, []);
 
   const isCaptureAvailable = (capture: CaptureId) =>
-    capabilityAvailable(capabilities, "available_captures", capture, capture === "synthetic");
+    serviceCapabilitySnapshot
+      ? capabilityOptionState(serviceCapabilitySnapshot, "capture", capture) !== "disabled"
+      : capabilityAvailable(capabilities, "available_captures", capture, capture === "synthetic");
   const isEncoderAvailable = (encoder: EncoderId) =>
     encoder === "none" ||
-    capabilityAvailable(capabilities, "available_encoders", encoder, encoder === "openh264");
+    (serviceCapabilitySnapshot
+      ? capabilityOptionState(serviceCapabilitySnapshot, "encoder", encoder) !== "disabled"
+      : capabilityAvailable(capabilities, "available_encoders", encoder, encoder === "openh264"));
   const isDecoderAvailable = (decoder: DecoderId) =>
     decoder === "none" ||
-    capabilityAvailable(capabilities, "available_decoders", decoder, decoder === "software");
+    (serviceCapabilitySnapshot
+      ? capabilityOptionState(serviceCapabilitySnapshot, "decoder", decoder) !== "disabled"
+      : capabilityAvailable(capabilities, "available_decoders", decoder, decoder === "software"));
   const selectedRenderer = resolveRendererType(
     selectedCapture,
     selectedEncoder,
@@ -268,13 +309,34 @@ export function CustomTestPage() {
     selectedRenderer
   );
   const visibleCaptureOptions = CAPTURE_OPTIONS.filter((option) =>
-    !capabilities || shouldShowCapabilityOption(isCaptureAvailable(option.id), showUnavailable)
+    serviceCapabilitySnapshot
+      ? shouldShowCapabilityOptionForSnapshot(
+          serviceCapabilitySnapshot,
+          "capture",
+          option.id,
+          showUnavailable
+        )
+      : !capabilities || shouldShowCapabilityOption(isCaptureAvailable(option.id), showUnavailable)
   );
   const visibleEncoderOptions = ENCODER_OPTIONS.filter((option) =>
-    !capabilities || shouldShowCapabilityOption(isEncoderAvailable(option.id), showUnavailable)
+    serviceCapabilitySnapshot
+      ? shouldShowCapabilityOptionForSnapshot(
+          serviceCapabilitySnapshot,
+          "encoder",
+          option.id,
+          showUnavailable
+        )
+      : !capabilities || shouldShowCapabilityOption(isEncoderAvailable(option.id), showUnavailable)
   );
   const visibleDecoderOptions = DECODER_OPTIONS.filter((option) =>
-    !capabilities || shouldShowCapabilityOption(isDecoderAvailable(option.id), showUnavailable)
+    serviceCapabilitySnapshot
+      ? shouldShowCapabilityOptionForSnapshot(
+          serviceCapabilitySnapshot,
+          "decoder",
+          option.id,
+          showUnavailable
+        )
+      : !capabilities || shouldShowCapabilityOption(isDecoderAvailable(option.id), showUnavailable)
   );
 
   useEffect(() => {
@@ -298,7 +360,14 @@ export function CustomTestPage() {
       const nextDecoder = DECODER_OPTIONS.find((option) => isDecoderAvailable(option.id));
       if (nextDecoder) setSelectedDecoder(nextDecoder.id);
     }
-  }, [capabilities, selectedCapture, selectedDecoder, selectedEncoder, selectedTransport]);
+  }, [
+    capabilities,
+    selectedCapture,
+    selectedDecoder,
+    selectedEncoder,
+    selectedTransport,
+    serviceCapabilitySnapshot,
+  ]);
 
   const blockedReason = () => {
     if (!isCaptureAvailable(selectedCapture)) {

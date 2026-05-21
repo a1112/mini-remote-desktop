@@ -3,7 +3,81 @@ import { describe, expect, it } from "vitest";
 import { getMockInvoke } from "../../../test/mocks/tauri";
 import { EncodeTestPage } from "./EncodeTestPage";
 
+function capabilitySnapshot(capabilities: Array<{
+  id: string;
+  domain: string;
+  label: string;
+  status: string;
+  reason?: string;
+}>) {
+  return {
+    schema_version: 1,
+    platform: "windows",
+    service_version: "test",
+    capabilities: capabilities.map((capability) => ({
+      platform: "windows",
+      ...capability,
+    })),
+    constraints: [],
+    profiles: [],
+    updated_at_ms: 1,
+  };
+}
+
 describe("EncodeTestPage backend contract", () => {
+  it("uses service encoder capability status instead of legacy encoder defaults", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve({
+          os_type: "windows",
+          cpu_brand: "test",
+          cpu_cores: 8,
+          memory_gb: 16,
+          gpu_info: "NVIDIA",
+          available_captures: ["dxgi", "synthetic"],
+          available_encoders: ["nvenc_h264", "openh264"],
+          available_decoders: ["none"],
+          available_renderers: ["none"],
+          available_memory_modes: ["cpu"],
+        });
+      }
+      if (command === "ipc_capability_snapshot") {
+        return Promise.resolve(
+          capabilitySnapshot([
+            {
+              id: "encode.nvenc_h264",
+              domain: "encode",
+              label: "NVENC H.264",
+              status: "driver_missing",
+              reason: "NVENC probe failed",
+            },
+            {
+              id: "encode.openh264",
+              domain: "encode",
+              label: "OpenH264",
+              status: "degraded",
+            },
+            {
+              id: "capture.synthetic",
+              domain: "capture",
+              label: "Synthetic",
+              status: "available",
+            },
+          ])
+        );
+      }
+      return Promise.resolve(null);
+    });
+
+    render(<EncodeTestPage />);
+
+    await waitFor(() => {
+      expect(screen.queryByRole("button", { name: /NVENC H\.264/ })).not.toBeInTheDocument();
+    });
+    expect(screen.getByRole("button", { name: /OpenH264/ })).toBeEnabled();
+  });
+
   it("starts OpenH264 with CPU-backed synthetic capture and zero-copy disabled", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {

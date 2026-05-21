@@ -19,6 +19,62 @@ describe("RenderTestPage platform capabilities", () => {
     };
   }
 
+  function capabilityItem(id: string, domain: string, status: string, reason?: string) {
+    return {
+      id,
+      domain,
+      label: id,
+      status,
+      platform: "windows",
+      reason: reason ?? null,
+      detail: null,
+      requires: [],
+      conflicts_with: [],
+      depends_on: [],
+      fallback_ids: [],
+      last_probe_time_ms: null,
+    };
+  }
+
+  function serviceCapabilitySnapshot(capabilities: ReturnType<typeof capabilityItem>[]) {
+    return {
+      schema_version: 1,
+      platform: "windows",
+      service_version: "test",
+      capabilities,
+      constraints: [],
+      profiles: [],
+      recent_profile_results: [],
+      updated_at_ms: 1,
+    };
+  }
+
+  it("uses service renderer capability status instead of legacy renderer defaults", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(mockWindowsRenderCapabilities());
+      }
+      if (command === "ipc_capability_snapshot") {
+        return Promise.resolve(
+          serviceCapabilitySnapshot([
+            capabilityItem("render.d3d11", "render", "available"),
+            capabilityItem("render.d3d12_native", "render", "unimplemented", "probe-only"),
+            capabilityItem("render.opengl", "render", "unknown", "probe pending"),
+            capabilityItem("render.webview", "render", "degraded", "diagnostic fallback"),
+          ])
+        );
+      }
+      return Promise.resolve(null);
+    });
+
+    render(<RenderTestPage />);
+
+    expect(await screen.findByRole("button", { name: /Direct3D 11/ })).toBeEnabled();
+    expect(screen.queryByRole("button", { name: /Direct3D 12/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /OpenGL/ })).not.toBeInTheDocument();
+  });
+
   it("starts Direct3D 12 through the independent render probe without downgrading to D3D11", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {
