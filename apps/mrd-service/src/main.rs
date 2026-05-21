@@ -64,6 +64,7 @@ async fn main() -> Result<()> {
         shell.tray_available = tray_available;
     }
     info!("Application state initialized");
+    app_state.refresh_capability_snapshot_in_background();
 
     match lan_discovery::start_lan_discovery(app_state.clone()).await {
         Ok(()) => info!("LAN peer discovery started"),

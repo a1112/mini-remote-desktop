@@ -11,7 +11,7 @@ use base64::{engine::general_purpose, Engine as _};
 use image::{codecs::png::PngEncoder, ColorType, ImageEncoder};
 use mrd_application::ports::SessionSnapshot;
 use mrd_ipc::{
-    AttachedRenderSurface, AuditEvent, AuditLogQuery, CaptureSourceSelection,
+    AttachedRenderSurface, AuditEvent, AuditLogQuery, CapabilitySnapshot, CaptureSourceSelection,
     MediaAdaptationSnapshot, MediaPipelineSnapshot, MediaProfile, MediaProfileNegotiation,
     MediaSenderTransportSnapshot, MediaStageMetrics, MediaTestImpairmentSnapshot,
     PairedDeviceIdentity,
@@ -212,6 +212,48 @@ impl SessionPeerMediaCapabilityRegistry {
 
     pub fn remove(&mut self, session_id: &SessionId) -> Option<Vec<String>> {
         self.capabilities.remove(session_id)
+    }
+}
+
+/// Cached service-owned capability snapshot exposed to UI and session handlers.
+#[derive(Debug)]
+pub struct CapabilitySnapshotRegistry {
+    snapshot: CapabilitySnapshot,
+    refresh_in_progress: bool,
+}
+
+impl Default for CapabilitySnapshotRegistry {
+    fn default() -> Self {
+        Self {
+            snapshot: crate::capabilities::local_capability_snapshot_static(),
+            refresh_in_progress: false,
+        }
+    }
+}
+
+impl CapabilitySnapshotRegistry {
+    pub fn snapshot(&self) -> CapabilitySnapshot {
+        self.snapshot.clone()
+    }
+
+    pub fn replace(&mut self, snapshot: CapabilitySnapshot) {
+        self.snapshot = snapshot;
+        self.refresh_in_progress = false;
+    }
+
+    pub fn begin_refresh(&mut self) -> bool {
+        if self.refresh_in_progress {
+            return false;
+        }
+        self.refresh_in_progress = true;
+        true
+    }
+
+    pub fn finish_refresh(&mut self, snapshot: Option<CapabilitySnapshot>) {
+        if let Some(snapshot) = snapshot {
+            self.snapshot = snapshot;
+        }
+        self.refresh_in_progress = false;
     }
 }
 
@@ -1287,6 +1329,8 @@ pub struct AppState {
     pub display_modes: Arc<Mutex<DisplayModeRegistry>>,
     /// Peer media capabilities keyed by session.
     pub peer_media_capabilities: Arc<Mutex<SessionPeerMediaCapabilityRegistry>>,
+    /// Cached local capability facts refreshed outside request handling.
+    pub capability_snapshot: Arc<Mutex<CapabilitySnapshotRegistry>>,
     /// Receiver pipeline state keyed by session.
     pub media_pipelines: Arc<Mutex<MediaPipelineRegistry>>,
     /// Native renderer instances keyed by receiver session/surface.
@@ -1334,6 +1378,7 @@ impl AppState {
             peer_media_capabilities: Arc::new(Mutex::new(
                 SessionPeerMediaCapabilityRegistry::default(),
             )),
+            capability_snapshot: Arc::new(Mutex::new(CapabilitySnapshotRegistry::default())),
             media_pipelines: Arc::new(Mutex::new(MediaPipelineRegistry::default())),
             #[cfg(windows)]
             media_surface_renderers: Arc::new(Mutex::new(MediaSurfaceRendererRegistry::default())),
@@ -1401,6 +1446,49 @@ impl AppState {
     /// Get a clone of the peer media capability registry.
     pub fn peer_media_capabilities(&self) -> Arc<Mutex<SessionPeerMediaCapabilityRegistry>> {
         self.peer_media_capabilities.clone()
+    }
+
+    /// Get a clone of the local capability snapshot registry.
+    pub fn capability_snapshot(&self) -> Arc<Mutex<CapabilitySnapshotRegistry>> {
+        self.capability_snapshot.clone()
+    }
+
+    /// Return the currently cached local capability snapshot without running runtime probes.
+    pub async fn cached_capability_snapshot(&self) -> CapabilitySnapshot {
+        self.capability_snapshot.lock().await.snapshot()
+    }
+
+    /// Refresh the local capability snapshot on a blocking worker without delaying IPC handlers.
+    pub fn refresh_capability_snapshot_in_background(self: &Arc<Self>) {
+        let app_state = Arc::clone(self);
+        tokio::spawn(async move {
+            let should_refresh = {
+                let mut registry = app_state.capability_snapshot.lock().await;
+                registry.begin_refresh()
+            };
+            if !should_refresh {
+                return;
+            }
+
+            let snapshot =
+                tokio::task::spawn_blocking(crate::capabilities::local_capability_snapshot)
+                    .await
+                    .map_err(|error| {
+                        tracing::warn!("capability snapshot refresh task failed: {}", error);
+                        error
+                    })
+                    .ok();
+            app_state
+                .capability_snapshot
+                .lock()
+                .await
+                .finish_refresh(snapshot);
+        });
+    }
+
+    #[cfg(test)]
+    pub async fn replace_capability_snapshot_for_test(&self, snapshot: CapabilitySnapshot) {
+        self.capability_snapshot.lock().await.replace(snapshot);
     }
 
     /// Get a clone of the receiver media pipeline registry.

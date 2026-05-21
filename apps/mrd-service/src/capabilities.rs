@@ -3,29 +3,46 @@ use mrd_ipc::{
     CapabilityPlatform, CapabilityProfile, CapabilitySnapshot, CapabilityStatus, LanPeerInfo,
     MediaProfile, ScenarioEvaluation, ScenarioEvaluationReason, ScenarioEvaluationStatus,
 };
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    sync::OnceLock,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 const SCHEMA_VERSION: u32 = 1;
 
+#[derive(Clone, Copy)]
+enum CapabilityProbeMode {
+    Runtime,
+    Static,
+}
+
 pub fn local_capability_snapshot() -> CapabilitySnapshot {
+    local_capability_snapshot_with_mode(CapabilityProbeMode::Runtime)
+}
+
+pub fn local_capability_snapshot_static() -> CapabilitySnapshot {
+    local_capability_snapshot_with_mode(CapabilityProbeMode::Static)
+}
+
+fn local_capability_snapshot_with_mode(probe_mode: CapabilityProbeMode) -> CapabilitySnapshot {
     let platform = current_platform();
     CapabilitySnapshot {
         schema_version: SCHEMA_VERSION,
         platform: platform.clone(),
         service_version: env!("CARGO_PKG_VERSION").to_string(),
-        capabilities: local_capabilities(platform),
+        capabilities: local_capabilities(platform, probe_mode),
         constraints: default_constraints(),
         profiles: default_profiles(),
         updated_at_ms: now_ms(),
     }
 }
 
-pub fn evaluate_scenario_profile(
+pub fn evaluate_scenario_profile_against_snapshot(
+    snapshot: &CapabilitySnapshot,
     scenario_id: &str,
     requested_profile: Option<MediaProfile>,
 ) -> ScenarioEvaluation {
-    let snapshot = local_capability_snapshot();
-    evaluate_against_snapshot(&snapshot, scenario_id, requested_profile)
+    evaluate_against_snapshot(snapshot, scenario_id, requested_profile)
 }
 
 pub fn peer_capability_snapshot(peer: &LanPeerInfo) -> CapabilitySnapshot {
@@ -273,15 +290,18 @@ fn capability_domain_from_id(id: &str) -> CapabilityDomain {
     }
 }
 
-fn local_capabilities(platform: CapabilityPlatform) -> Vec<CapabilityItem> {
+fn local_capabilities(
+    platform: CapabilityPlatform,
+    probe_mode: CapabilityProbeMode,
+) -> Vec<CapabilityItem> {
     let mut items = Vec::new();
 
     add_capture_capabilities(&mut items, &platform);
     add_capture_source_capabilities(&mut items, &platform);
-    add_encode_capabilities(&mut items, &platform);
-    add_decode_capabilities(&mut items, &platform);
-    add_render_capabilities(&mut items, &platform);
-    add_memory_capabilities(&mut items, &platform);
+    add_encode_capabilities(&mut items, &platform, probe_mode);
+    add_decode_capabilities(&mut items, &platform, probe_mode);
+    add_render_capabilities(&mut items, &platform, probe_mode);
+    add_memory_capabilities(&mut items, &platform, probe_mode);
     add_transport_capabilities(&mut items, &platform);
     add_control_capabilities(&mut items, &platform);
     add_audio_capabilities(&mut items, &platform);
@@ -408,7 +428,11 @@ fn add_capture_source_capabilities(items: &mut Vec<CapabilityItem>, platform: &C
     );
 }
 
-fn add_encode_capabilities(items: &mut Vec<CapabilityItem>, platform: &CapabilityPlatform) {
+fn add_encode_capabilities(
+    items: &mut Vec<CapabilityItem>,
+    platform: &CapabilityPlatform,
+    probe_mode: CapabilityProbeMode,
+) {
     push_degraded(
         items,
         platform,
@@ -418,36 +442,58 @@ fn add_encode_capabilities(items: &mut Vec<CapabilityItem>, platform: &Capabilit
         "Software encoder fallback; usable but below hardware path parity.",
     );
 
-    let nvidia_status = if matches!(
+    let (h264_status, h264_reason) = match probe_mode {
+        CapabilityProbeMode::Runtime => probe_nvenc_h264_status(platform),
+        CapabilityProbeMode::Static => static_nvenc_status(platform, "NVENC H.264"),
+    };
+    push_item(
+        items,
         platform,
-        CapabilityPlatform::Windows | CapabilityPlatform::Linux
-    ) {
-        CapabilityStatus::Supported
-    } else {
-        CapabilityStatus::Unsupported
-    };
-    let nvidia_reason = if nvidia_status == CapabilityStatus::Supported {
-        Some("NVIDIA runtime probing is owned by the Rdesk harness for this phase.")
-    } else {
-        Some("NVENC is not supported on this platform in the current product mode.")
-    };
+        CapabilityDomain::Encode,
+        "encode.nvenc_h264",
+        "NVENC H.264",
+        h264_status,
+        Some(h264_reason.as_str()),
+    );
 
-    for (id, label) in [
-        ("encode.nvenc_h264", "NVENC H.264"),
-        ("encode.nvenc_hevc", "NVENC HEVC"),
-        ("encode.nvenc_hevc_main10", "NVENC HEVC Main10"),
-        ("encode.nvenc_av1", "NVENC AV1"),
-    ] {
-        push_item(
-            items,
-            platform,
-            CapabilityDomain::Encode,
-            id,
-            label,
-            nvidia_status.clone(),
-            nvidia_reason,
-        );
-    }
+    let (hevc_status, hevc_reason) = match probe_mode {
+        CapabilityProbeMode::Runtime => probe_nvenc_hevc_status(platform),
+        CapabilityProbeMode::Static => static_nvenc_status(platform, "NVENC HEVC"),
+    };
+    push_item(
+        items,
+        platform,
+        CapabilityDomain::Encode,
+        "encode.nvenc_hevc",
+        "NVENC HEVC",
+        hevc_status,
+        Some(hevc_reason.as_str()),
+    );
+
+    let (hevc_main10_status, hevc_main10_reason) = match probe_mode {
+        CapabilityProbeMode::Runtime => probe_nvenc_hevc_main10_status(platform),
+        CapabilityProbeMode::Static => static_nvenc_status(platform, "NVENC HEVC Main10"),
+    };
+    push_item(
+        items,
+        platform,
+        CapabilityDomain::Encode,
+        "encode.nvenc_hevc_main10",
+        "NVENC HEVC Main10",
+        hevc_main10_status,
+        Some(hevc_main10_reason.as_str()),
+    );
+
+    let (av1_status, av1_reason) = nvenc_av1_status(platform);
+    push_item(
+        items,
+        platform,
+        CapabilityDomain::Encode,
+        "encode.nvenc_av1",
+        "NVENC AV1",
+        av1_status,
+        Some(av1_reason.as_str()),
+    );
 
     if matches!(platform, CapabilityPlatform::Macos) {
         push_supported(
@@ -461,7 +507,11 @@ fn add_encode_capabilities(items: &mut Vec<CapabilityItem>, platform: &Capabilit
     }
 }
 
-fn add_decode_capabilities(items: &mut Vec<CapabilityItem>, platform: &CapabilityPlatform) {
+fn add_decode_capabilities(
+    items: &mut Vec<CapabilityItem>,
+    platform: &CapabilityPlatform,
+    probe_mode: CapabilityProbeMode,
+) {
     push_degraded(
         items,
         platform,
@@ -472,19 +522,37 @@ fn add_decode_capabilities(items: &mut Vec<CapabilityItem>, platform: &Capabilit
     );
 
     let nvdec_status = if matches!(platform, CapabilityPlatform::Windows) {
-        CapabilityStatus::Supported
+        let (status, reason) = match probe_mode {
+            CapabilityProbeMode::Runtime => probe_nvdec_h264_status(platform),
+            CapabilityProbeMode::Static => static_windows_runtime_status("NVDEC H.264"),
+        };
+        push_item(
+            items,
+            platform,
+            CapabilityDomain::Decode,
+            "decode.nvdec",
+            "NVDEC",
+            status,
+            Some(reason.as_str()),
+        );
+        None
     } else {
-        CapabilityStatus::Unimplemented
+        Some((
+            CapabilityStatus::Unimplemented,
+            "NVDEC runtime probing is only wired for Windows in service-owned capability snapshots.",
+        ))
     };
-    push_item(
-        items,
-        platform,
-        CapabilityDomain::Decode,
-        "decode.nvdec",
-        "NVDEC",
-        nvdec_status,
-        Some("NVDEC runtime probing is owned by the Rdesk harness for this phase."),
-    );
+    if let Some((status, reason)) = nvdec_status {
+        push_item(
+            items,
+            platform,
+            CapabilityDomain::Decode,
+            "decode.nvdec",
+            "NVDEC",
+            status,
+            Some(reason),
+        );
+    }
 
     if matches!(platform, CapabilityPlatform::Linux) {
         #[cfg(target_os = "linux")]
@@ -590,15 +658,25 @@ fn add_decode_capabilities(items: &mut Vec<CapabilityItem>, platform: &Capabilit
     }
 }
 
-fn add_render_capabilities(items: &mut Vec<CapabilityItem>, platform: &CapabilityPlatform) {
+fn add_render_capabilities(
+    items: &mut Vec<CapabilityItem>,
+    platform: &CapabilityPlatform,
+    probe_mode: CapabilityProbeMode,
+) {
     match platform {
         CapabilityPlatform::Windows => {
-            push_available(
+            let (d3d11_status, d3d11_reason) = match probe_mode {
+                CapabilityProbeMode::Runtime => probe_d3d11_render_status(platform),
+                CapabilityProbeMode::Static => static_windows_runtime_status("D3D11 renderer"),
+            };
+            push_item(
                 items,
                 platform,
                 CapabilityDomain::Render,
                 "render.d3d11",
                 "D3D11",
+                d3d11_status,
+                Some(d3d11_reason.as_str()),
             );
             push_item(
                 items,
@@ -647,7 +725,11 @@ fn add_render_capabilities(items: &mut Vec<CapabilityItem>, platform: &Capabilit
     );
 }
 
-fn add_memory_capabilities(items: &mut Vec<CapabilityItem>, platform: &CapabilityPlatform) {
+fn add_memory_capabilities(
+    items: &mut Vec<CapabilityItem>,
+    platform: &CapabilityPlatform,
+    probe_mode: CapabilityProbeMode,
+) {
     push_available(
         items,
         platform,
@@ -655,10 +737,22 @@ fn add_memory_capabilities(items: &mut Vec<CapabilityItem>, platform: &Capabilit
         "memory.cpu",
         "CPU memory",
     );
-    let status = if matches!(platform, CapabilityPlatform::Windows) {
-        CapabilityStatus::Available
+    let (status, reason) = if matches!(platform, CapabilityPlatform::Windows) {
+        let (status, reason) = match probe_mode {
+            CapabilityProbeMode::Runtime => probe_d3d11_render_status(platform),
+            CapabilityProbeMode::Static => static_windows_runtime_status("D3D11 shared texture"),
+        };
+        (
+            status,
+            Some(format!(
+                "D3D11 shared texture follows D3D11 runtime probe: {reason}"
+            )),
+        )
     } else {
-        CapabilityStatus::Unimplemented
+        (
+            CapabilityStatus::Unimplemented,
+            Some("D3D11 shared texture interop is Windows-only.".to_string()),
+        )
     };
     push_item(
         items,
@@ -667,12 +761,212 @@ fn add_memory_capabilities(items: &mut Vec<CapabilityItem>, platform: &Capabilit
         "memory.d3d11_shared",
         "D3D11 shared texture",
         status,
-        if matches!(platform, CapabilityPlatform::Windows) {
-            None
-        } else {
-            Some("D3D11 shared texture interop is Windows-only.")
-        },
+        reason.as_deref(),
     );
+}
+
+fn static_nvenc_status(platform: &CapabilityPlatform, label: &str) -> (CapabilityStatus, String) {
+    if matches!(
+        platform,
+        CapabilityPlatform::Windows | CapabilityPlatform::Linux
+    ) {
+        (
+            CapabilityStatus::Supported,
+            format!("{label} is platform-declared; runtime probe refresh is pending."),
+        )
+    } else {
+        unsupported_nvenc_status(label)
+    }
+}
+
+fn static_windows_runtime_status(label: &str) -> (CapabilityStatus, String) {
+    (
+        CapabilityStatus::Supported,
+        format!("{label} is platform-declared on Windows; runtime probe refresh is pending."),
+    )
+}
+
+fn probe_nvenc_h264_status(platform: &CapabilityPlatform) -> (CapabilityStatus, String) {
+    if !matches!(
+        platform,
+        CapabilityPlatform::Windows | CapabilityPlatform::Linux
+    ) {
+        return unsupported_nvenc_status("NVENC H.264");
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    {
+        static RESULT: OnceLock<(CapabilityStatus, String)> = OnceLock::new();
+        RESULT
+            .get_or_init(|| {
+                classify_runtime_probe(
+                    "NVENC H.264",
+                    mrd_encode_nvenc::NvencH264Encoder::probe_h264_available()
+                        .map_err(|error| error.to_string()),
+                )
+            })
+            .clone()
+    }
+
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        unsupported_nvenc_status("NVENC H.264")
+    }
+}
+
+fn probe_nvenc_hevc_status(platform: &CapabilityPlatform) -> (CapabilityStatus, String) {
+    if !matches!(
+        platform,
+        CapabilityPlatform::Windows | CapabilityPlatform::Linux
+    ) {
+        return unsupported_nvenc_status("NVENC HEVC");
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    {
+        static RESULT: OnceLock<(CapabilityStatus, String)> = OnceLock::new();
+        RESULT
+            .get_or_init(|| {
+                classify_runtime_probe(
+                    "NVENC HEVC",
+                    mrd_encode_nvenc::NvencHevcEncoder::probe_hevc_available()
+                        .map_err(|error| error.to_string()),
+                )
+            })
+            .clone()
+    }
+
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        unsupported_nvenc_status("NVENC HEVC")
+    }
+}
+
+fn probe_nvenc_hevc_main10_status(platform: &CapabilityPlatform) -> (CapabilityStatus, String) {
+    if !matches!(
+        platform,
+        CapabilityPlatform::Windows | CapabilityPlatform::Linux
+    ) {
+        return unsupported_nvenc_status("NVENC HEVC Main10");
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    {
+        static RESULT: OnceLock<(CapabilityStatus, String)> = OnceLock::new();
+        RESULT
+            .get_or_init(|| {
+                classify_runtime_probe(
+                    "NVENC HEVC Main10",
+                    mrd_encode_nvenc::NvencHevcEncoder::probe_hevc_main10_available()
+                        .map_err(|error| error.to_string()),
+                )
+            })
+            .clone()
+    }
+
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        unsupported_nvenc_status("NVENC HEVC Main10")
+    }
+}
+
+fn nvenc_av1_status(platform: &CapabilityPlatform) -> (CapabilityStatus, String) {
+    if matches!(
+        platform,
+        CapabilityPlatform::Windows | CapabilityPlatform::Linux
+    ) {
+        (
+            CapabilityStatus::Supported,
+            "NVENC AV1 is declared as a harness capability; service-owned runtime probe and LAN sender integration are not wired yet.".to_string(),
+        )
+    } else {
+        unsupported_nvenc_status("NVENC AV1")
+    }
+}
+
+fn unsupported_nvenc_status(label: &str) -> (CapabilityStatus, String) {
+    (
+        CapabilityStatus::Unsupported,
+        format!("{label} is not supported on this platform in the current product mode."),
+    )
+}
+
+fn probe_nvdec_h264_status(platform: &CapabilityPlatform) -> (CapabilityStatus, String) {
+    if !matches!(platform, CapabilityPlatform::Windows) {
+        return (
+            CapabilityStatus::Unimplemented,
+            "NVDEC runtime probing is only wired for Windows in service-owned capability snapshots."
+                .to_string(),
+        );
+    }
+
+    #[cfg(windows)]
+    {
+        static RESULT: OnceLock<(CapabilityStatus, String)> = OnceLock::new();
+        RESULT
+            .get_or_init(|| {
+                classify_runtime_probe(
+                    "NVDEC H.264",
+                    mrd_decode_nvdec::probe_h264_available().map_err(|error| error.to_string()),
+                )
+            })
+            .clone()
+    }
+
+    #[cfg(not(windows))]
+    {
+        (
+            CapabilityStatus::Unimplemented,
+            "NVDEC runtime probing is only compiled on Windows.".to_string(),
+        )
+    }
+}
+
+fn probe_d3d11_render_status(platform: &CapabilityPlatform) -> (CapabilityStatus, String) {
+    if !matches!(platform, CapabilityPlatform::Windows) {
+        return (
+            CapabilityStatus::Unimplemented,
+            "D3D11 rendering is Windows-only.".to_string(),
+        );
+    }
+
+    #[cfg(windows)]
+    {
+        static RESULT: OnceLock<(CapabilityStatus, String)> = OnceLock::new();
+        RESULT
+            .get_or_init(|| {
+                use mrd_render::RendererFactory as _;
+                classify_runtime_probe(
+                    "D3D11 renderer",
+                    mrd_render_d3d11::D3d11RendererFactory
+                        .create()
+                        .map(|_| ())
+                        .map_err(|error| error.to_string()),
+                )
+            })
+            .clone()
+    }
+
+    #[cfg(not(windows))]
+    {
+        (
+            CapabilityStatus::Unimplemented,
+            "D3D11 rendering is only compiled on Windows.".to_string(),
+        )
+    }
+}
+
+fn classify_runtime_probe(label: &str, result: Result<(), String>) -> (CapabilityStatus, String) {
+    match result {
+        Ok(()) => (
+            CapabilityStatus::Available,
+            format!("{label} runtime probe succeeded."),
+        ),
+        Err(error) => (
+            CapabilityStatus::DriverMissing,
+            format!("{label} runtime probe failed: {error}"),
+        ),
+    }
 }
 
 fn add_transport_capabilities(items: &mut Vec<CapabilityItem>, platform: &CapabilityPlatform) {
