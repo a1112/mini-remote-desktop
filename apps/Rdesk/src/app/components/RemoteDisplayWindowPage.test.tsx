@@ -13,6 +13,7 @@ import {
   browserWebrtcPreviewH264Profile,
   buildWebRtcDiagnosticsStageRows,
   WebRtcPresentationLatencyTracker,
+  shouldAutoSwitchWebRtcVideoToWebCodecs,
   summarizeWebRtcInboundVideoStats,
 } from "./RemoteDisplayWindowPage";
 
@@ -354,6 +355,50 @@ describe("RemoteDisplayWindowPage", () => {
 
     expect(stats?.latestMs).toBeCloseTo(50);
     expect(stats?.source).toBe("rtp_frame_timing_channel");
+  });
+
+  it("auto-switches high-latency WebRTC video to the separate WebCodecs web path", () => {
+    expect(
+      shouldAutoSwitchWebRtcVideoToWebCodecs({
+        targetFps: 120,
+        actualFps: 57,
+        latencyP95Ms: 196,
+        metadataAgeMs: 109,
+        jitterBufferMs: 39,
+        webCodecsAvailable: true,
+        alreadyAttempted: false,
+      })
+    ).toEqual({
+      shouldSwitch: true,
+      reason:
+        "WebRTC video backlog: p95 196.0 ms, metadata age 109.0 ms, fps 57.0/120. Switching to WebCodecs web path.",
+    });
+  });
+
+  it("keeps WebRTC video when the WebCodecs web path is unavailable or already attempted", () => {
+    expect(
+      shouldAutoSwitchWebRtcVideoToWebCodecs({
+        targetFps: 120,
+        actualFps: 57,
+        latencyP95Ms: 196,
+        metadataAgeMs: 109,
+        jitterBufferMs: 39,
+        webCodecsAvailable: false,
+        alreadyAttempted: false,
+      }).shouldSwitch
+    ).toBe(false);
+
+    expect(
+      shouldAutoSwitchWebRtcVideoToWebCodecs({
+        targetFps: 120,
+        actualFps: 57,
+        latencyP95Ms: 196,
+        metadataAgeMs: 109,
+        jitterBufferMs: 39,
+        webCodecsAvailable: true,
+        alreadyAttempted: true,
+      }).shouldSwitch
+    ).toBe(false);
   });
 
   it("shows a green LAN diagnostics popover with HEVC and chroma metadata", async () => {
