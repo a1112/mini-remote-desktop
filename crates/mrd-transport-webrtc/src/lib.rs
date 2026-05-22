@@ -5,10 +5,15 @@ use rtp::{
     sequence::new_random_sequencer,
 };
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 use webrtc::{
+    media::Sample,
     rtp_transceiver::rtp_codec::RTCRtpCodecCapability,
-    track::track_local::{track_local_static_rtp::TrackLocalStaticRTP, TrackLocalWriter},
+    track::track_local::{
+        track_local_static_rtp::TrackLocalStaticRTP,
+        track_local_static_sample::TrackLocalStaticSample, TrackLocalWriter,
+    },
 };
 
 #[derive(Debug, Error)]
@@ -21,6 +26,17 @@ pub struct H264RtpSender {
     track: Arc<TrackLocalStaticRTP>,
     packetizer: Box<dyn Packetizer + Send + Sync>,
     frame_samples: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct H264RtpSendReport {
+    pub bytes_written: usize,
+    pub rtp_timestamp: u32,
+}
+
+pub struct H264SampleSender {
+    track: Arc<TrackLocalStaticSample>,
+    frame_duration: Duration,
 }
 
 pub struct Av1RtpSender {
@@ -444,10 +460,29 @@ impl H264RtpSender {
         mtu: u16,
         profile: H264Profile,
     ) -> Self {
+        Self::new_with_profile_level_id(
+            track_id,
+            stream_id,
+            fps,
+            mtu,
+            profile,
+            h264_profile_level_id(profile),
+        )
+    }
+
+    pub fn new_with_profile_level_id(
+        track_id: impl Into<String>,
+        stream_id: impl Into<String>,
+        fps: u32,
+        mtu: u16,
+        profile: H264Profile,
+        profile_level_id: impl Into<String>,
+    ) -> Self {
         let payload_type = match profile {
             H264Profile::Baseline => 102,
             H264Profile::High => 123,
         };
+        let profile_level_id = profile_level_id.into();
         let payloader = Box::<rtp::codecs::h264::H264Payloader>::default();
         let packetizer = Box::new(new_packetizer(
             mtu.max(576) as usize,
@@ -459,7 +494,7 @@ impl H264RtpSender {
         ));
         Self {
             track: Arc::new(TrackLocalStaticRTP::new(
-                h264_codec_capability(profile),
+                h264_codec_capability_for_profile_level_id(&profile_level_id),
                 track_id.into(),
                 stream_id.into(),
             )),
@@ -494,7 +529,20 @@ impl H264RtpSender {
         &mut self,
         access_unit: &EncodedAccessUnit,
     ) -> Result<usize, TransportError> {
+        self.send_access_unit_with_report(access_unit)
+            .await
+            .map(|report| report.bytes_written)
+    }
+
+    pub async fn send_access_unit_with_report(
+        &mut self,
+        access_unit: &EncodedAccessUnit,
+    ) -> Result<H264RtpSendReport, TransportError> {
         let packets = self.packetize_access_unit(access_unit)?;
+        let rtp_timestamp = packets
+            .first()
+            .map(|packet| packet.header.timestamp)
+            .unwrap_or_default();
         let mut written = 0usize;
         for packet in packets {
             written +=
@@ -502,7 +550,56 @@ impl H264RtpSender {
                     TransportError::Message(format!("write_rtp failed: {error}"))
                 })?;
         }
-        Ok(written)
+        Ok(H264RtpSendReport {
+            bytes_written: written,
+            rtp_timestamp,
+        })
+    }
+}
+
+impl H264SampleSender {
+    pub fn new_with_profile_level_id(
+        track_id: impl Into<String>,
+        stream_id: impl Into<String>,
+        fps: u32,
+        profile_level_id: impl Into<String>,
+    ) -> Self {
+        let profile_level_id = profile_level_id.into();
+        let frame_duration = Duration::from_nanos(1_000_000_000u64 / fps.max(1) as u64);
+        Self {
+            track: Arc::new(TrackLocalStaticSample::new(
+                h264_codec_capability_for_profile_level_id(&profile_level_id),
+                track_id.into(),
+                stream_id.into(),
+            )),
+            frame_duration,
+        }
+    }
+
+    pub fn track(&self) -> Arc<TrackLocalStaticSample> {
+        self.track.clone()
+    }
+
+    pub async fn send_access_unit(
+        &self,
+        access_unit: &EncodedAccessUnit,
+    ) -> Result<usize, TransportError> {
+        if access_unit.codec != VideoCodec::H264 {
+            return Err(TransportError::Message(
+                "H264 sample sender only supports H264 access units".into(),
+            ));
+        }
+
+        let sample = Sample {
+            data: bytes::Bytes::copy_from_slice(access_unit.bytes.as_slice()),
+            duration: self.frame_duration,
+            ..Default::default()
+        };
+        self.track
+            .write_sample(&sample)
+            .await
+            .map_err(|error| TransportError::Message(format!("write_sample failed: {error}")))?;
+        Ok(access_unit.bytes.len())
     }
 }
 
@@ -572,11 +669,21 @@ impl Av1RtpSender {
     }
 }
 
+fn h264_profile_level_id(profile: H264Profile) -> &'static str {
+    match profile {
+        // The browser preview path can send 1440p/120 from the local DXGI source.
+        // Advertise level 5.2 so the browser does not negotiate a low-level H.264
+        // receiver and then reject the first high-rate access units.
+        H264Profile::Baseline => "42e034",
+        H264Profile::High => "640034",
+    }
+}
+
 pub fn h264_codec_capability(profile: H264Profile) -> RTCRtpCodecCapability {
-    let profile_level_id = match profile {
-        H264Profile::Baseline => "42e01f",
-        H264Profile::High => "640032",
-    };
+    h264_codec_capability_for_profile_level_id(h264_profile_level_id(profile))
+}
+
+pub fn h264_codec_capability_for_profile_level_id(profile_level_id: &str) -> RTCRtpCodecCapability {
     RTCRtpCodecCapability {
         mime_type: "video/H264".to_string(),
         clock_rate: 90_000,
@@ -650,8 +757,8 @@ fn write_leb128(mut value: u32, out: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        annex_b_contains_keyframe, Av1AccessUnitAssembler, Av1RtpIngress, Av1RtpSender,
-        H264AccessUnitAssembler, H264RtpIngress,
+        annex_b_contains_keyframe, h264_codec_capability, Av1AccessUnitAssembler, Av1RtpIngress,
+        Av1RtpSender, H264AccessUnitAssembler, H264Profile, H264RtpIngress,
     };
     use mrd_encode_nvenc::NvencH264Encoder;
     use mrd_pipeline_core::{CapturedFrame, FramePixelFormat, VideoCodec, VideoEncoder};
@@ -809,6 +916,44 @@ mod tests {
         assert_eq!(output.codec, VideoCodec::Av1);
         assert_eq!(output.timestamp_us, input.timestamp_us);
         assert_eq!(output.bytes, input.bytes);
+    }
+
+    #[test]
+    fn h264_browser_capability_advertises_2k120_safe_level() {
+        let baseline = h264_codec_capability(H264Profile::Baseline);
+        let high = h264_codec_capability(H264Profile::High);
+
+        assert!(baseline.sdp_fmtp_line.contains("profile-level-id=42e034"));
+        assert!(high.sdp_fmtp_line.contains("profile-level-id=640034"));
+    }
+
+    #[test]
+    fn h264_packetizer_exposes_stable_rtp_timestamp_per_access_unit() {
+        let mut sender = super::H264RtpSender::new("video", "stream", 120, 1200);
+        let first = mrd_pipeline_core::EncodedAccessUnit {
+            codec: VideoCodec::H264,
+            timestamp_us: 1_000,
+            is_keyframe: true,
+            bytes: vec![0, 0, 0, 1, 0x65, 1, 2, 3],
+        };
+        let second = mrd_pipeline_core::EncodedAccessUnit {
+            timestamp_us: 9_333,
+            bytes: vec![0, 0, 0, 1, 0x41, 4, 5, 6],
+            ..first.clone()
+        };
+
+        let first_packets = sender
+            .packetize_access_unit(&first)
+            .expect("packetize first access unit");
+        let second_packets = sender
+            .packetize_access_unit(&second)
+            .expect("packetize second access unit");
+        let first_timestamp = first_packets[0].header.timestamp;
+
+        assert!(first_packets
+            .iter()
+            .all(|packet| packet.header.timestamp == first_timestamp));
+        assert_eq!(second_packets[0].header.timestamp, first_timestamp + 750);
     }
 
     #[test]

@@ -1,8 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useSearchParams } from "react-router";
 import {
+  Activity,
   ArrowLeft,
+  BarChart3,
   Circle,
+  Gauge,
   Loader2,
   Maximize2,
   Minimize,
@@ -68,13 +71,123 @@ type WebPreviewMode = "idle" | "connecting" | "webrtc" | "failed";
 type CaptureSourcePickerMode = "dropdown" | "modal";
 
 const METRICS_POLL_MS = 500;
-const WEB_PREVIEW_CONNECT_TIMEOUT_MS = 3_000;
-const WEB_VIEW_MAX_FPS = 60;
+const WEB_PREVIEW_CONNECT_TIMEOUT_MS = 8_000;
+const WEB_VIEW_MAX_FPS = 120;
+const DIAGNOSTICS_SAMPLE_LIMIT = 90;
 
 type Option<T extends string> = {
   value: T;
   label: string;
 };
+
+type DiagnosticsSample = {
+  atMs: number;
+  fps: number | null;
+  paintFps: number | null;
+  latencyP95Ms: number | null;
+  captureP95Ms: number | null;
+  encodeP95Ms: number | null;
+  transportP95Ms: number | null;
+  decodeP95Ms: number | null;
+  renderP95Ms: number | null;
+  queueDepth: number | null;
+  droppedFrames: number | null;
+  bitrateMbps: number | null;
+};
+
+type DiagnosticsStageRow = {
+  label: string;
+  value: number | null;
+  samples?: number | null;
+};
+
+export type WebRtcInboundVideoCounters = {
+  timestampMs: number;
+  framesDecoded: number;
+  framesDropped: number;
+  packetsLost: number;
+  jitterSeconds: number | null;
+  jitterBufferDelaySeconds: number | null;
+  jitterBufferEmittedCount: number | null;
+  totalDecodeTimeSeconds: number | null;
+  totalProcessingDelaySeconds: number | null;
+  totalInterFrameDelaySeconds: number | null;
+  freezeCount: number;
+  frameWidth: number | null;
+  frameHeight: number | null;
+};
+
+export type WebRtcReceiverStats = {
+  decodedFps: number | null;
+  framesDecoded: number;
+  framesDropped: number;
+  packetsLost: number;
+  jitterMs: number | null;
+  jitterBufferDelayAvgMs: number | null;
+  decodeAvgMs: number | null;
+  processingDelayAvgMs: number | null;
+  interFrameDelayAvgMs: number | null;
+  freezeCount: number;
+  frameWidth: number | null;
+  frameHeight: number | null;
+};
+
+export type WebRtcPresentationLatencyStats = {
+  latestMs: number;
+  p50Ms: number;
+  p95Ms: number;
+  maxMs: number;
+  samples: number;
+  source: "browser_capture_time" | "rtp_frame_timing_channel" | "frame_timing_channel";
+};
+
+type WebRtcFrameTimingMetadata = {
+  sequence: number;
+  captureUnixUs: number;
+  sentUnixUs: number | null;
+  keyframe: boolean;
+  rtpTimestamp: number | null;
+};
+
+type WebRtcFrameTimingDebug = {
+  received: number;
+  lastMessage: string | null;
+  lastStats: WebRtcPresentationLatencyStats | null;
+  localChannelState?: string | null;
+  remoteChannelState?: string | null;
+};
+
+type WindowWithMrdFrameTimingDebug = Window & {
+  __mrdFrameTimingDebug?: WebRtcFrameTimingDebug;
+  __mrdWebPreviewPeer?: RTCPeerConnection;
+};
+
+type WebRtcVideoFrameCallbackMetadata = {
+  presentedFrames?: number;
+  presentationTime?: number;
+  expectedDisplayTime?: number;
+  captureTime?: number;
+  receiveTime?: number;
+  rtpTimestamp?: number;
+};
+
+const WEBRTC_FRAME_TIMING_CHANNEL = "mrd-frame-timing";
+const WEBRTC_PRESENTATION_LATENCY_SAMPLE_LIMIT = 240;
+const WEBRTC_FRAME_TIMING_STALE_MS = 200;
+
+function updateWebRtcFrameTimingDebug(
+  update: Partial<WebRtcFrameTimingDebug>
+): void {
+  if (typeof window === "undefined") return;
+  const debugWindow = window as WindowWithMrdFrameTimingDebug;
+  debugWindow.__mrdFrameTimingDebug = {
+    received: 0,
+    lastMessage: null,
+    lastStats: null,
+    ...debugWindow.__mrdFrameTimingDebug,
+    ...update,
+  };
+}
 
 const captureOptions: Option<CaptureType>[] = [
   { value: "dxgi", label: "DXGI" },
@@ -144,6 +257,13 @@ const captureSourcePickerOptions: Option<CaptureSourcePickerMode>[] = [
   { value: "dropdown", label: "下拉选择" },
   { value: "modal", label: "弹窗选择" },
 ];
+
+export function browserWebrtcPreviewH264Profile(
+  encoder: EncoderType,
+  _decoder: DecoderType
+): "baseline" | "high" {
+  return encoder === "nvenc_h264" ? "high" : "baseline";
+}
 
 function optionLabel<T extends string>(options: Option<T>[], value: T) {
   return options.find((option) => option.value === value)?.label ?? value;
@@ -225,12 +345,393 @@ function formatFps(value?: number | null) {
   return typeof value === "number" ? `${value.toFixed(value >= 100 ? 0 : 1)} FPS` : "-";
 }
 
+function formatHz(value?: number | null) {
+  return typeof value === "number" ? `${value.toFixed(value >= 100 ? 0 : 1)} Hz` : "-";
+}
+
 function formatMbps(value?: number | null) {
   return typeof value === "number" ? `${value.toFixed(value >= 10 ? 1 : 2)} Mbps` : "-";
 }
 
+function formatMs(value?: number | null) {
+  return typeof value === "number" ? `${value.toFixed(value >= 10 ? 1 : 2)} ms` : "-";
+}
+
 function formatPercent(value: number) {
   return `${Math.max(0, value).toFixed(value >= 10 ? 0 : 1)}%`;
+}
+
+function formatCount(value?: number | null) {
+  return typeof value === "number" ? value.toLocaleString() : "-";
+}
+
+function percentile(values: number[], percentileValue: number) {
+  const finiteValues = values.filter((value) => Number.isFinite(value));
+  if (finiteValues.length === 0) return null;
+
+  const sorted = [...finiteValues].sort((a, b) => a - b);
+  const index = Math.min(
+    sorted.length - 1,
+    Math.max(0, Math.ceil(sorted.length * percentileValue) - 1)
+  );
+  return sorted[index] ?? null;
+}
+
+function parseWebRtcFrameTimingMetadata(data: unknown): WebRtcFrameTimingMetadata | null {
+  let raw: unknown = data;
+  if (typeof data === "string") {
+    try {
+      raw = JSON.parse(data);
+    } catch {
+      return null;
+    }
+  }
+  if (!raw || typeof raw !== "object") return null;
+  const record = raw as Record<string, unknown>;
+  if (record.type !== "mrd.frame_timing.v1") return null;
+  const sequence = numberFromStats(record.sequence);
+  const captureUnixUs = numberFromStats(record.capture_unix_us);
+  if (sequence === null || captureUnixUs === null) return null;
+  return {
+    sequence,
+    captureUnixUs,
+    sentUnixUs: numberFromStats(record.sent_unix_us),
+    keyframe: record.keyframe === true,
+    rtpTimestamp: numberFromStats(record.rtp_timestamp),
+  };
+}
+
+export class WebRtcPresentationLatencyTracker {
+  private readonly timeOriginMs: number;
+  private readonly maxSamples: number;
+  private readonly pendingBySequence: WebRtcFrameTimingMetadata[] = [];
+  private readonly pendingByRtpTimestamp = new Map<number, WebRtcFrameTimingMetadata>();
+  private readonly samplesMs: number[] = [];
+  private lastPresentedFrames = 0;
+
+  constructor(options: { timeOriginMs?: number; maxSamples?: number } = {}) {
+    this.timeOriginMs =
+      options.timeOriginMs ??
+      (typeof performance !== "undefined" && typeof performance.now === "function"
+        ? Date.now() - performance.now()
+        : Date.now());
+    this.maxSamples = options.maxSamples ?? WEBRTC_PRESENTATION_LATENCY_SAMPLE_LIMIT;
+  }
+
+  addMetadata(data: unknown): void {
+    const metadata = parseWebRtcFrameTimingMetadata(data);
+    if (!metadata) return;
+    this.pendingBySequence.push(metadata);
+    if (typeof metadata.rtpTimestamp === "number") {
+      this.pendingByRtpTimestamp.set(metadata.rtpTimestamp, metadata);
+    }
+    while (this.pendingBySequence.length > this.maxSamples) {
+      const dropped = this.pendingBySequence.shift();
+      if (typeof dropped?.rtpTimestamp === "number") {
+        this.pendingByRtpTimestamp.delete(dropped.rtpTimestamp);
+      }
+    }
+  }
+
+  observeFrame(
+    nowMs: number,
+    metadata: WebRtcVideoFrameCallbackMetadata
+  ): WebRtcPresentationLatencyStats | null {
+    const presentationTimeMs = metadata.presentationTime ?? metadata.expectedDisplayTime ?? nowMs;
+    const browserCaptureTimeMs = numberFromStats(metadata.captureTime);
+    if (browserCaptureTimeMs !== null) {
+      return this.recordLatency(
+        presentationTimeMs - browserCaptureTimeMs,
+        "browser_capture_time"
+      );
+    }
+
+    const presentationUnixMs = this.timeOriginMs + presentationTimeMs;
+    const rtpTimestamp = numberFromStats(metadata.rtpTimestamp);
+    const rtpTiming = rtpTimestamp === null ? null : this.consumeRtpTiming(rtpTimestamp);
+    const timing = rtpTiming ?? this.consumeSequenceTiming(metadata.presentedFrames, presentationUnixMs);
+    if (!timing) return this.currentStats();
+
+    return this.recordLatency(
+      presentationUnixMs - timing.captureUnixUs / 1000,
+      rtpTiming ? "rtp_frame_timing_channel" : "frame_timing_channel"
+    );
+  }
+
+  private consumeRtpTiming(rtpTimestamp: number): WebRtcFrameTimingMetadata | null {
+    const timing = this.pendingByRtpTimestamp.get(rtpTimestamp) ?? null;
+    if (!timing) return null;
+    this.pendingByRtpTimestamp.delete(rtpTimestamp);
+    const index = this.pendingBySequence.findIndex((entry) => entry === timing);
+    if (index >= 0) {
+      this.pendingBySequence.splice(0, index + 1);
+    }
+    return timing;
+  }
+
+  private consumeSequenceTiming(
+    presentedFrames: number | undefined,
+    presentationUnixMs: number
+  ): WebRtcFrameTimingMetadata | null {
+    while (
+      this.pendingBySequence.length > 1 &&
+      presentationUnixMs - (this.pendingBySequence[0]?.captureUnixUs ?? 0) / 1000 >
+        WEBRTC_FRAME_TIMING_STALE_MS
+    ) {
+      const dropped = this.pendingBySequence.shift();
+      if (typeof dropped?.rtpTimestamp === "number") {
+        this.pendingByRtpTimestamp.delete(dropped.rtpTimestamp);
+      }
+    }
+
+    const frameDelta =
+      typeof presentedFrames === "number"
+        ? this.lastPresentedFrames > 0
+          ? Math.max(1, presentedFrames - this.lastPresentedFrames)
+          : Math.max(1, Math.min(presentedFrames, this.pendingBySequence.length))
+        : 1;
+    if (typeof presentedFrames === "number") {
+      this.lastPresentedFrames = presentedFrames;
+    }
+
+    let timing: WebRtcFrameTimingMetadata | null = null;
+    for (let index = 0; index < frameDelta; index += 1) {
+      const next = this.pendingBySequence.shift();
+      if (!next) break;
+      if (typeof next.rtpTimestamp === "number") {
+        this.pendingByRtpTimestamp.delete(next.rtpTimestamp);
+      }
+      timing = next;
+    }
+    return timing;
+  }
+
+  private recordLatency(
+    latencyMs: number,
+    source: WebRtcPresentationLatencyStats["source"]
+  ): WebRtcPresentationLatencyStats | null {
+    if (!Number.isFinite(latencyMs) || latencyMs < 0 || latencyMs > 10_000) {
+      return this.currentStats();
+    }
+    this.samplesMs.push(latencyMs);
+    while (this.samplesMs.length > this.maxSamples) {
+      this.samplesMs.shift();
+    }
+    return this.currentStats(source);
+  }
+
+  private currentStats(
+    source: WebRtcPresentationLatencyStats["source"] = "frame_timing_channel"
+  ): WebRtcPresentationLatencyStats | null {
+    if (this.samplesMs.length === 0) return null;
+    const latestMs = this.samplesMs[this.samplesMs.length - 1] ?? 0;
+    return {
+      latestMs,
+      p50Ms: percentile(this.samplesMs, 0.5) ?? 0,
+      p95Ms: percentile(this.samplesMs, 0.95) ?? 0,
+      maxMs: Math.max(...this.samplesMs),
+      samples: this.samplesMs.length,
+      source,
+    };
+  }
+}
+
+function findStageMetric(
+  snapshot: MediaPipelineSnapshot | null,
+  stageNames: string[]
+): MediaPipelineSnapshot["stage_metrics"][number] | null {
+  const metrics = snapshot?.stage_metrics ?? [];
+  for (const stageName of stageNames) {
+    const exact = metrics.find((metric) => metric.stage === stageName);
+    if (exact) return exact;
+  }
+
+  return (
+    metrics.find((metric) =>
+      stageNames.some((stageName) => metric.stage.toLowerCase().includes(stageName.toLowerCase()))
+    ) ?? null
+  );
+}
+
+function findStageP95(snapshot: MediaPipelineSnapshot | null, stageNames: string[]) {
+  return findStageMetric(snapshot, stageNames)?.p95_ms ?? null;
+}
+
+function hasDiagnosticsSampleValue(sample: DiagnosticsSample) {
+  return [
+    sample.fps,
+    sample.paintFps,
+    sample.latencyP95Ms,
+    sample.captureP95Ms,
+    sample.encodeP95Ms,
+    sample.transportP95Ms,
+    sample.decodeP95Ms,
+    sample.renderP95Ms,
+    sample.queueDepth,
+    sample.droppedFrames,
+    sample.bitrateMbps,
+  ].some((value) => typeof value === "number");
+}
+
+function numberFromStats(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function stringFromStats(value: unknown): string | null {
+  return typeof value === "string" ? value : null;
+}
+
+function deltaAverageSeconds(
+  currentTotal: number | null,
+  previousTotal: number | null,
+  currentCount: number | null,
+  previousCount: number | null
+) {
+  if (
+    currentTotal === null ||
+    previousTotal === null ||
+    currentCount === null ||
+    previousCount === null
+  ) {
+    return null;
+  }
+  const countDelta = currentCount - previousCount;
+  if (countDelta <= 0) return null;
+  return Math.max(0, currentTotal - previousTotal) / countDelta * 1000;
+}
+
+function inboundVideoCountersFromStats(
+  report: RTCStatsReport
+): WebRtcInboundVideoCounters | null {
+  for (const rawStats of report.values()) {
+    const stats = rawStats as Record<string, unknown>;
+    if (
+      stringFromStats(stats.type) !== "inbound-rtp" ||
+      stringFromStats(stats.kind) !== "video"
+    ) {
+      continue;
+    }
+
+    const framesDecoded = numberFromStats(stats.framesDecoded);
+    const timestampMs = numberFromStats(stats.timestamp);
+    if (framesDecoded === null || timestampMs === null) return null;
+
+    return {
+      timestampMs,
+      framesDecoded,
+      framesDropped: numberFromStats(stats.framesDropped) ?? 0,
+      packetsLost: numberFromStats(stats.packetsLost) ?? 0,
+      jitterSeconds: numberFromStats(stats.jitter),
+      jitterBufferDelaySeconds: numberFromStats(stats.jitterBufferDelay),
+      jitterBufferEmittedCount: numberFromStats(stats.jitterBufferEmittedCount),
+      totalDecodeTimeSeconds: numberFromStats(stats.totalDecodeTime),
+      totalProcessingDelaySeconds: numberFromStats(stats.totalProcessingDelay),
+      totalInterFrameDelaySeconds: numberFromStats(stats.totalInterFrameDelay),
+      freezeCount: numberFromStats(stats.freezeCount) ?? 0,
+      frameWidth: numberFromStats(stats.frameWidth),
+      frameHeight: numberFromStats(stats.frameHeight),
+    };
+  }
+  return null;
+}
+
+export function summarizeWebRtcInboundVideoStats(
+  report: RTCStatsReport,
+  previous: WebRtcInboundVideoCounters | null,
+  fallbackNowMs: number
+): { stats: WebRtcReceiverStats | null; counters: WebRtcInboundVideoCounters | null } {
+  const counters = inboundVideoCountersFromStats(report);
+  if (!counters) return { stats: null, counters: null };
+
+  const previousTimestamp = previous?.timestampMs ?? fallbackNowMs;
+  const elapsedSeconds = Math.max(0.001, (counters.timestampMs - previousTimestamp) / 1000);
+  const decodedDelta =
+    previous ? Math.max(0, counters.framesDecoded - previous.framesDecoded) : null;
+  const decodedFps = decodedDelta === null ? null : decodedDelta / elapsedSeconds;
+  const decodeAvgMs = previous
+    ? deltaAverageSeconds(
+        counters.totalDecodeTimeSeconds,
+        previous.totalDecodeTimeSeconds,
+        counters.framesDecoded,
+        previous.framesDecoded
+      )
+    : null;
+  const processingDelayAvgMs = previous
+    ? deltaAverageSeconds(
+        counters.totalProcessingDelaySeconds,
+        previous.totalProcessingDelaySeconds,
+        counters.framesDecoded,
+        previous.framesDecoded
+      )
+    : null;
+  const interFrameDelayAvgMs = previous
+    ? deltaAverageSeconds(
+        counters.totalInterFrameDelaySeconds,
+        previous.totalInterFrameDelaySeconds,
+        counters.framesDecoded,
+        previous.framesDecoded
+      )
+    : null;
+  const jitterBufferDelayAvgMs = previous
+    ? deltaAverageSeconds(
+        counters.jitterBufferDelaySeconds,
+        previous.jitterBufferDelaySeconds,
+        counters.jitterBufferEmittedCount,
+        previous.jitterBufferEmittedCount
+      )
+    : null;
+
+  return {
+    counters,
+    stats: {
+      decodedFps,
+      framesDecoded: counters.framesDecoded,
+      framesDropped: counters.framesDropped,
+      packetsLost: counters.packetsLost,
+      jitterMs: counters.jitterSeconds === null ? null : counters.jitterSeconds * 1000,
+      jitterBufferDelayAvgMs,
+      decodeAvgMs,
+      processingDelayAvgMs,
+      interFrameDelayAvgMs,
+      freezeCount: counters.freezeCount,
+      frameWidth: counters.frameWidth,
+      frameHeight: counters.frameHeight,
+    },
+  };
+}
+
+export function buildWebRtcDiagnosticsStageRows(
+  stats: WebRtcReceiverStats | null,
+  presentationLatencyStats: WebRtcPresentationLatencyStats | null = null
+): DiagnosticsStageRow[] {
+  const rows: DiagnosticsStageRow[] = [];
+  if (presentationLatencyStats) {
+    rows.push(
+      {
+        label: "e2e.capture_to_present_p50",
+        value: presentationLatencyStats.p50Ms,
+        samples: presentationLatencyStats.samples,
+      },
+      {
+        label: "e2e.capture_to_present_p95",
+        value: presentationLatencyStats.p95Ms,
+        samples: presentationLatencyStats.samples,
+      },
+      {
+        label: "e2e.capture_to_present_max",
+        value: presentationLatencyStats.maxMs,
+        samples: presentationLatencyStats.samples,
+      }
+    );
+  }
+  if (!stats) return rows;
+  rows.push(
+    { label: "webrtc.decode_avg", value: stats.decodeAvgMs },
+    { label: "webrtc.jitter_buffer_avg", value: stats.jitterBufferDelayAvgMs },
+    { label: "webrtc.processing_avg", value: stats.processingDelayAvgMs },
+    { label: "webrtc.render_interval_avg", value: stats.interFrameDelayAvgMs },
+  );
+  return rows.filter((row) => typeof row.value === "number");
 }
 
 function codecLabel(codec?: string | null, profile?: string | null) {
@@ -245,6 +746,13 @@ function codecLabel(codec?: string | null, profile?: string | null) {
           : dash(codec);
   if (!profile) return family;
   return `${family} ${profile.toLowerCase() === "main" ? "Main" : profile}`;
+}
+
+function codecFromEncoder(encoder: EncoderType): string | null {
+  if (encoder.includes("hevc")) return "hevc";
+  if (encoder.includes("h264") || encoder === "openh264") return "h264";
+  if (encoder.includes("av1")) return "av1";
+  return null;
 }
 
 function decoderLabel(decoder?: string | null) {
@@ -328,8 +836,63 @@ function browserSupportsH264WebrtcVideo(): boolean {
   );
 }
 
+function applyWebRtcLowLatencyHints(receiver?: RTCRtpReceiver | null) {
+  if (!receiver) return;
+  const tunableReceiver = receiver as RTCRtpReceiver & {
+    playoutDelayHint?: number;
+    jitterBufferTarget?: number;
+  };
+  try {
+    tunableReceiver.playoutDelayHint = 0;
+  } catch {
+    // Optional browser API.
+  }
+  try {
+    tunableReceiver.jitterBufferTarget = 0;
+  } catch {
+    // Optional browser API.
+  }
+}
+
+export function applyWebRtcVideoMotionHint(track?: MediaStreamTrack | null) {
+  if (!track) return;
+  try {
+    track.contentHint = "motion";
+  } catch {
+    // Optional browser hint.
+  }
+}
+
 function fpsForWebView(fps: FpsKey): FpsKey {
-  return Number(fps) > WEB_VIEW_MAX_FPS ? "60" : fps;
+  return Number(fps) > WEB_VIEW_MAX_FPS ? "120" : fps;
+}
+
+function optionValueFromSearch<T extends string>(
+  options: Option<T>[],
+  value: string | null
+): T | null {
+  if (!value) return null;
+  return options.some((option) => option.value === value) ? (value as T) : null;
+}
+
+function resolutionFromSearch(searchParams: URLSearchParams): ResolutionKey | null {
+  const direct = optionValueFromSearch(resolutionOptions, searchParams.get("resolution"));
+  if (direct) return direct;
+  const width = searchParams.get("width") ?? searchParams.get("profileWidth");
+  const height = searchParams.get("height") ?? searchParams.get("profileHeight");
+  if (!width || !height) return null;
+  return optionValueFromSearch(resolutionOptions, `${width}x${height}`);
+}
+
+function fpsFromSearch(searchParams: URLSearchParams): FpsKey | null {
+  return optionValueFromSearch(fpsOptions, searchParams.get("fps") ?? searchParams.get("profileFps"));
+}
+
+function bitrateFromSearch(searchParams: URLSearchParams): BitrateKey | null {
+  return optionValueFromSearch(
+    bitrateOptions,
+    searchParams.get("bitrateMbps") ?? searchParams.get("profileBitrateMbps")
+  );
 }
 
 type LocalWebViewProfile = {
@@ -338,6 +901,7 @@ type LocalWebViewProfile = {
   decoder: DecoderType;
   transport: TransportKind;
   fps: FpsKey;
+  bitrate: BitrateKey;
 };
 
 type LocalWebViewPlan = {
@@ -355,6 +919,8 @@ function resolveLocalWebViewPlan({
   decoder,
   transport,
   fps,
+  bitrate,
+  capHighFpsBitrate,
 }: {
   capabilities: EnvironmentSnapshot | null;
   hostOs: HostOs;
@@ -363,6 +929,8 @@ function resolveLocalWebViewPlan({
   decoder: DecoderType;
   transport: TransportKind;
   fps: FpsKey;
+  bitrate: BitrateKey;
+  capHighFpsBitrate: boolean;
 }): LocalWebViewPlan {
   const captureDefaults: CaptureType[] =
     hostOs === "macos"
@@ -390,11 +958,19 @@ function resolveLocalWebViewPlan({
     hostOs === "macos"
       ? ["openh264", "videotoolbox_h264"]
       : hostOs === "windows"
-        ? ["openh264", "nvenc_h264"]
+        ? ["nvenc_h264", "openh264"]
         : ["openh264"];
+  const targetFps = fpsForWebView(fps);
+  const targetFpsNumber = Number(targetFps);
+  const hardwareH264Encoders: EncoderType[] =
+    hostOs === "macos" ? ["videotoolbox_h264"] : ["nvenc_h264"];
+  const requiresHardwareH264 = targetFpsNumber > 30;
+  const previewEncoderCandidates = requiresHardwareH264
+    ? hardwareH264Encoders
+    : preferredEncoders;
   const encoderCandidates = uniqueValues([
-    ...preferredEncoders,
-    ...(isH264PreviewEncoder(encoder) ? [encoder] : []),
+    ...previewEncoderCandidates,
+    ...(isH264PreviewEncoder(encoder) && !requiresHardwareH264 ? [encoder] : []),
   ]);
   const nextEncoder = pickCapability(
     encoderCandidates,
@@ -404,27 +980,33 @@ function resolveLocalWebViewPlan({
   if (!nextEncoder) {
     return {
       profile: null,
-      reason: "Web View 需要可输出 H.264 的编码器",
+      reason: requiresHardwareH264
+        ? `网页 ${targetFps} FPS 本机采集需要硬件 H.264 编码器；当前 service 未报告 NVENC/VideoToolbox H.264 可用，OpenH264 仅作为 <=30 FPS 诊断兜底。`
+        : "Web View 需要可输出 H.264 的编码器",
       changed: false,
       message: null,
     };
   }
 
   const nextDecoder: DecoderType = "none";
+  const nextBitrate: BitrateKey =
+    capHighFpsBitrate && targetFpsNumber >= 120 && Number(bitrate) > 8 ? "8" : bitrate;
 
   const profile: LocalWebViewProfile = {
     capture: nextCapture,
     encoder: nextEncoder,
     decoder: nextDecoder,
     transport: "webrtc",
-    fps: fpsForWebView(fps),
+    fps: targetFps,
+    bitrate: nextBitrate,
   };
   const changed =
     profile.capture !== capture ||
     profile.encoder !== encoder ||
     profile.decoder !== decoder ||
     profile.transport !== transport ||
-    profile.fps !== fps;
+    profile.fps !== fps ||
+    profile.bitrate !== bitrate;
 
   return {
     profile,
@@ -437,7 +1019,10 @@ function resolveLocalWebViewPlan({
         )} / ${optionLabel(decoderOptions, profile.decoder)} / ${optionLabel(
           transportOptions,
           profile.transport
-        )} / ${optionLabel(fpsOptions, profile.fps)}`
+        )} / ${optionLabel(fpsOptions, profile.fps)} / ${optionLabel(
+          bitrateOptions,
+          profile.bitrate
+        )}`
       : null,
   };
 }
@@ -526,6 +1111,114 @@ function DiagnosticGroup({
   );
 }
 
+function DiagnosticsSparkline({
+  samples,
+  value,
+  colorClass,
+}: {
+  samples: DiagnosticsSample[];
+  value: (sample: DiagnosticsSample) => number | null;
+  colorClass: string;
+}) {
+  const points = samples
+    .map((sample, index) => ({ index, metric: value(sample) }))
+    .filter((point): point is { index: number; metric: number } => typeof point.metric === "number");
+
+  if (points.length < 2) {
+    return (
+      <div className="flex h-12 items-center justify-center rounded border border-emerald-300/10 bg-black/20 text-[10px] text-emerald-100/45">
+        等待样本
+      </div>
+    );
+  }
+
+  const min = Math.min(...points.map((point) => point.metric));
+  const max = Math.max(...points.map((point) => point.metric));
+  const span = Math.max(0.001, max - min);
+  const maxIndex = Math.max(1, samples.length - 1);
+  const polyline = points
+    .map((point) => {
+      const x = point.index / maxIndex * 100;
+      const y = 36 - (point.metric - min) / span * 30;
+      return `${x.toFixed(2)},${y.toFixed(2)}`;
+    })
+    .join(" ");
+
+  return (
+    <svg
+      className="h-12 w-full rounded border border-emerald-300/10 bg-black/20"
+      viewBox="0 0 100 40"
+      preserveAspectRatio="none"
+      aria-hidden="true"
+    >
+      <polyline
+        points={polyline}
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        vectorEffect="non-scaling-stroke"
+        className={colorClass}
+      />
+    </svg>
+  );
+}
+
+function DiagnosticMetricTile({
+  title,
+  value,
+  subtitle,
+  samples,
+  sampleValue,
+  colorClass,
+}: {
+  title: string;
+  value: string;
+  subtitle: string;
+  samples: DiagnosticsSample[];
+  sampleValue: (sample: DiagnosticsSample) => number | null;
+  colorClass: string;
+}) {
+  return (
+    <div className="rounded-md border border-emerald-400/10 bg-emerald-950/20 p-3">
+      <div className="mb-2 flex items-start justify-between gap-2">
+        <div>
+          <div className="text-[11px] font-semibold text-emerald-100">{title}</div>
+          <div className="text-[10px] text-emerald-200/55">{subtitle}</div>
+        </div>
+        <div className="text-right text-sm font-semibold text-white">{value}</div>
+      </div>
+      <DiagnosticsSparkline samples={samples} value={sampleValue} colorClass={colorClass} />
+    </div>
+  );
+}
+
+function DiagnosticStageList({ rows }: { rows: DiagnosticsStageRow[] }) {
+  const visibleRows = rows.filter((row) => typeof row.value === "number");
+  return (
+    <section className="rounded-md border border-emerald-400/10 bg-emerald-950/20 p-3">
+      <div className="mb-2 flex items-center gap-2 text-[12px] font-semibold text-emerald-100">
+        <Gauge className="h-3.5 w-3.5 text-emerald-300" />
+        阶段延迟 P95
+      </div>
+      {visibleRows.length > 0 ? (
+        <div className="grid gap-1.5">
+          {visibleRows.map((row) => (
+            <div key={row.label} className="grid grid-cols-[1fr_76px_52px] items-center gap-2">
+              <span className="min-w-0 truncate text-emerald-200/70">{row.label}</span>
+              <span className="text-right font-medium text-emerald-50">{formatMs(row.value)}</span>
+              <span className="text-right text-emerald-200/45">
+                {row.samples ? `${row.samples}x` : "-"}
+              </span>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="text-emerald-200/55">当前路径暂无阶段延迟样本</div>
+      )}
+    </section>
+  );
+}
+
 export function RemoteDisplayWindowPage() {
   const { id } = useParams();
   const [searchParams] = useSearchParams();
@@ -536,9 +1229,13 @@ export function RemoteDisplayWindowPage() {
   const webPreviewVideoRef = useRef<HTMLVideoElement | null>(null);
   const webPreviewPeerRef = useRef<RTCPeerConnection | null>(null);
   const webPreviewSessionRef = useRef<string | null>(null);
+  const webRtcStatsCountersRef = useRef<WebRtcInboundVideoCounters | null>(null);
+  const autoStartRequestedRef = useRef<string | null>(null);
   const autoCaptureSourceRequestedRef = useRef<string | null>(null);
   const nativePreviewFrameKeyRef = useRef<string | null>(null);
   const linuxNativeProfileAppliedRef = useRef(false);
+  const diagnosticsCurrentRef = useRef<DiagnosticsSample | null>(null);
+  const diagnosticsPopoverRef = useRef<HTMLDivElement | null>(null);
 
   const [context, setContext] = useState<RemoteDisplayWindowContext | null>(null);
   const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
@@ -551,9 +1248,13 @@ export function RemoteDisplayWindowPage() {
   const [encoder, setEncoder] = useState<EncoderType>("nvenc_hevc");
   const [decoder, setDecoder] = useState<DecoderType>("nvdec");
   const [transport, setTransport] = useState<TransportKind>("quic");
-  const [resolution, setResolution] = useState<ResolutionKey>("1920x1080");
-  const [fps, setFps] = useState<FpsKey>("144");
-  const [bitrate, setBitrate] = useState<BitrateKey>("20");
+  const [resolution, setResolution] = useState<ResolutionKey>(
+    () => resolutionFromSearch(searchParams) ?? "1920x1080"
+  );
+  const [fps, setFps] = useState<FpsKey>(() => fpsFromSearch(searchParams) ?? "144");
+  const [bitrate, setBitrate] = useState<BitrateKey>(
+    () => bitrateFromSearch(searchParams) ?? "20"
+  );
   const [isMaximized, setIsMaximized] = useState(false);
   const [elapsed, setElapsed] = useState(0);
   const [lastError, setLastError] = useState<string | null>(null);
@@ -563,6 +1264,19 @@ export function RemoteDisplayWindowPage() {
   const [metrics, setMetrics] = useState<HarnessMetrics | null>(null);
   const [webPreviewMode, setWebPreviewMode] = useState<WebPreviewMode>("idle");
   const [webPreviewError, setWebPreviewError] = useState<string | null>(null);
+  const [webVideoFps, setWebVideoFps] = useState<number | null>(null);
+  const [webPaintFps, setWebPaintFps] = useState<number | null>(null);
+  const [webFrameIntervalP95Ms, setWebFrameIntervalP95Ms] = useState<number | null>(null);
+  const [webVideoFrameCount, setWebVideoFrameCount] = useState(0);
+  const [webPresentationLatencyStats, setWebPresentationLatencyStats] =
+    useState<WebRtcPresentationLatencyStats | null>(null);
+  const [webFrameTimingMetadataCount, setWebFrameTimingMetadataCount] = useState(0);
+  const [webFrameTimingChannelState, setWebFrameTimingChannelState] =
+    useState<string | null>(null);
+  const [webFrameTimingMetadataAgeMs, setWebFrameTimingMetadataAgeMs] =
+    useState<number | null>(null);
+  const [webRtcReceiverStats, setWebRtcReceiverStats] =
+    useState<WebRtcReceiverStats | null>(null);
   const [testMessage, setTestMessage] = useState<string | null>(null);
   const [sessionSnapshot, setSessionSnapshot] =
     useState<SessionRuntimeSnapshot | null>(null);
@@ -580,11 +1294,19 @@ export function RemoteDisplayWindowPage() {
   const [captureSourcePickerOpen, setCaptureSourcePickerOpen] = useState(false);
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
   const [diagnosticsPinned, setDiagnosticsPinned] = useState(false);
+  const [diagnosticsSamples, setDiagnosticsSamples] = useState<DiagnosticsSample[]>([]);
 
   const sessionId = id ?? context?.session_id ?? "local-preview";
   const activeSurfaceId = context?.surface_id ?? surfaceId;
   const isLocalPipelinePreview = isLocalPipelinePreviewSession(sessionId);
   const hostOs = normalizeOs(capabilities?.os_type);
+  const requestedResolution = useMemo(() => resolutionFromSearch(searchParams), [searchParams]);
+  const requestedFps = useMemo(() => fpsFromSearch(searchParams), [searchParams]);
+  const requestedBitrate = useMemo(() => bitrateFromSearch(searchParams), [searchParams]);
+  const queryProfileNeedsApply =
+    (requestedResolution !== null && requestedResolution !== resolution) ||
+    (requestedFps !== null && requestedFps !== fps) ||
+    (requestedBitrate !== null && requestedBitrate !== bitrate);
   const localWebViewPlan = useMemo(
     () =>
       resolveLocalWebViewPlan({
@@ -595,8 +1317,20 @@ export function RemoteDisplayWindowPage() {
         decoder,
         transport,
         fps,
+        bitrate,
+        capHighFpsBitrate: requestedBitrate === null,
       }),
-    [capabilities, capture, decoder, encoder, fps, hostOs, transport]
+    [
+      bitrate,
+      capabilities,
+      capture,
+      decoder,
+      encoder,
+      fps,
+      hostOs,
+      requestedBitrate,
+      transport,
+    ]
   );
   const nativeRenderMode = nativeRenderModeForHost(hostOs);
   const nativeRendererType =
@@ -733,34 +1467,176 @@ export function RemoteDisplayWindowPage() {
     (probeSnapshot?.frames_received ?? 0) + remoteDropTotal
   );
   const remoteDropRatio = remoteDropTotal / remoteFrameTotal * 100;
-  const remoteLatencyMs =
-    mediaPipelineSnapshot?.stage_metrics?.find((metric) => metric.stage === "receiver.decode")
-      ?.p95_ms ?? null;
+  const stageCaptureP95Ms = findStageP95(mediaPipelineSnapshot, [
+    "sender.capture",
+    "capture",
+  ]);
+  const stageEncodeP95Ms = findStageP95(mediaPipelineSnapshot, [
+    "sender.encode",
+    "encode",
+  ]);
+  const stageTransportP95Ms = findStageP95(mediaPipelineSnapshot, [
+    "sender.send_datagram",
+    "sender.transport",
+    "transport",
+    "fragment/send",
+  ]);
+  const stageDecodeP95Ms = findStageP95(mediaPipelineSnapshot, [
+    "receiver.decode",
+    "decode",
+  ]);
+  const stageRenderP95Ms = findStageP95(mediaPipelineSnapshot, [
+    "receiver.present",
+    "receiver.render_upload",
+    "render_upload",
+    "present",
+    "render",
+  ]);
+  const diagnosticsFps =
+    probeSnapshot?.current_fps ??
+    webVideoFps ??
+    webRtcReceiverStats?.decodedFps ??
+    metrics?.decoded_fps ??
+    metrics?.capture_fps ??
+    null;
+  const diagnosticsVisualFps = webVideoFps ?? diagnosticsFps;
+  const diagnosticsCaptureP95Ms =
+    metrics?.capture_latency_p95_ms ?? stageCaptureP95Ms;
+  const diagnosticsEncodeP95Ms =
+    metrics?.encode_latency_p95_ms ?? stageEncodeP95Ms;
+  const diagnosticsTransportP95Ms =
+    metrics?.transport_latency_p95_ms ?? stageTransportP95Ms;
+  const diagnosticsDecodeP95Ms =
+    metrics?.decode_latency_p95_ms ?? stageDecodeP95Ms ?? webRtcReceiverStats?.decodeAvgMs ?? null;
+  const diagnosticsRenderP95Ms = stageRenderP95Ms;
+  const diagnosticsLatencyP95Ms =
+    webPresentationLatencyStats?.p95Ms ??
+    metrics?.total_latency_p95_ms ??
+    stageDecodeP95Ms ??
+    webFrameIntervalP95Ms ??
+    null;
+  const diagnosticsLatencyIsPrecise =
+    webPresentationLatencyStats?.source === "browser_capture_time" ||
+    webPresentationLatencyStats?.source === "rtp_frame_timing_channel";
+  const diagnosticsLatencyLabel = webPresentationLatencyStats
+    ? diagnosticsLatencyIsPrecise
+      ? "真实端到端 p95"
+      : "端到端估算 p95"
+    : typeof metrics?.total_latency_p95_ms === "number"
+    ? "端到端 p95"
+    : typeof stageDecodeP95Ms === "number"
+      ? "解码 p95"
+      : typeof webFrameIntervalP95Ms === "number"
+        ? "Web 呈现间隔 p95"
+      : "延迟 p95";
+  const diagnosticsE2eLabelPrefix = diagnosticsLatencyIsPrecise ? "真实 E2E" : "估算 E2E";
+  const diagnosticsBitrateMbps =
+    probeSnapshot?.bitrate_mbps ?? mediaPipelineSnapshot?.active_bitrate_mbps ?? Number(bitrate);
+  const diagnosticsDroppedFrames =
+    metrics?.dropped_frames ?? webRtcReceiverStats?.framesDropped ?? remoteDropTotal ?? null;
+  const diagnosticsDropRatio =
+    metrics && metrics.frame_count > 0
+      ? metrics.dropped_frames / metrics.frame_count * 100
+      : remoteDropRatio;
+  const diagnosticsQueueDepth = mediaPipelineSnapshot?.queue_depth ?? null;
+  const diagnosticsTargetFps =
+    mediaPipelineSnapshot?.active_fps ??
+    probeSnapshot?.media_probe_target_fps ??
+    Number(fps);
+  const diagnosticsBrowserPaintLimited =
+    Number(fps) >= 100 &&
+    typeof webVideoFps === "number" &&
+    webVideoFps < diagnosticsTargetFps * 0.85 &&
+    typeof webRtcReceiverStats?.decodedFps === "number" &&
+    webRtcReceiverStats.decodedFps >= diagnosticsTargetFps * 0.9 &&
+    (webRtcReceiverStats.framesDropped ?? 0) === 0 &&
+    (webRtcReceiverStats.packetsLost ?? 0) === 0;
+  const diagnosticsCurrent: DiagnosticsSample = {
+    atMs: 0,
+    fps: diagnosticsVisualFps,
+    paintFps: webPaintFps,
+    latencyP95Ms: diagnosticsLatencyP95Ms,
+    captureP95Ms: diagnosticsCaptureP95Ms,
+    encodeP95Ms: diagnosticsEncodeP95Ms,
+    transportP95Ms: diagnosticsTransportP95Ms,
+    decodeP95Ms: diagnosticsDecodeP95Ms,
+    renderP95Ms: diagnosticsRenderP95Ms,
+    queueDepth: diagnosticsQueueDepth,
+    droppedFrames: diagnosticsDroppedFrames,
+    bitrateMbps: diagnosticsBitrateMbps,
+  };
+  const diagnosticsStageRows = useMemo<DiagnosticsStageRow[]>(() => {
+    const pipelineRows =
+      mediaPipelineSnapshot?.stage_metrics
+        ?.filter((metric) => typeof metric.p95_ms === "number")
+        .map((metric) => ({
+          label: metric.stage,
+          value: metric.p95_ms ?? null,
+          samples: (metric as { samples?: number | null }).samples,
+        })) ?? [];
+
+    if (pipelineRows.length > 0) return pipelineRows;
+
+    const webRtcRows = buildWebRtcDiagnosticsStageRows(
+      webRtcReceiverStats,
+      webPresentationLatencyStats
+    );
+    if (webRtcRows.length > 0) return webRtcRows;
+
+    return [
+      { label: "capture", value: metrics?.capture_latency_p95_ms ?? null },
+      { label: "encode", value: metrics?.encode_latency_p95_ms ?? null },
+      { label: "transport", value: metrics?.transport_latency_p95_ms ?? null },
+      { label: "decode", value: metrics?.decode_latency_p95_ms ?? null },
+      { label: "total", value: metrics?.total_latency_p95_ms ?? null },
+      { label: "web.frame_interval", value: webFrameIntervalP95Ms },
+    ];
+  }, [
+    mediaPipelineSnapshot?.stage_metrics,
+    metrics?.capture_latency_p95_ms,
+    metrics?.decode_latency_p95_ms,
+    metrics?.encode_latency_p95_ms,
+    metrics?.total_latency_p95_ms,
+    metrics?.transport_latency_p95_ms,
+    webPresentationLatencyStats,
+    webRtcReceiverStats,
+    webFrameIntervalP95Ms,
+  ]);
   const remoteQuality =
     (probeSnapshot?.last_error || mediaPipelineSnapshot?.codec_fallback_reason)
       ? "降级"
-      : remoteDropRatio <= 0.5 && (probeSnapshot?.current_fps ?? 0) >= 55
+      : diagnosticsBrowserPaintLimited
+        ? "受限"
+      : diagnosticsDropRatio <= 0.5 &&
+          typeof diagnosticsVisualFps === "number" &&
+          diagnosticsVisualFps >= diagnosticsTargetFps * 0.9
         ? "流畅"
-        : hasRemoteFrames
+        : hasRemoteFrames || typeof diagnosticsVisualFps === "number"
           ? "一般"
           : "等待";
   const diagnosticsVisible = diagnosticsOpen || diagnosticsPinned;
+  const diagnosticsSelectedCodec =
+    mediaPipelineSnapshot?.active_codec ??
+    mediaProfileNegotiation?.selected.codec ??
+    codecFromEncoder(encoder);
   const diagnosticsCodec = codecLabel(
-    mediaPipelineSnapshot?.active_codec ?? mediaProfileNegotiation?.selected.codec,
+    diagnosticsSelectedCodec,
     mediaPipelineSnapshot?.active_codec_profile ??
       mediaProfileNegotiation?.selected.codec_profile
   );
   const diagnosticsChroma =
     mediaPipelineSnapshot?.active_chroma_subsampling ??
     mediaProfileNegotiation?.selected.chroma_subsampling ??
-    "-";
+    (diagnosticsSelectedCodec ? "4:2:0" : "-");
   const diagnosticsPixelFormat =
     mediaPipelineSnapshot?.active_pixel_format ??
     mediaProfileNegotiation?.selected.pixel_format ??
     probeSnapshot?.latest_frame_pixel_format ??
-    "-";
+    (renderMode === "web" && diagnosticsSelectedCodec ? "WebRTC 4:2:0" : "-");
   const diagnosticsBitDepth =
-    mediaPipelineSnapshot?.active_bit_depth ?? mediaProfileNegotiation?.selected.bit_depth ?? null;
+    mediaPipelineSnapshot?.active_bit_depth ??
+    mediaProfileNegotiation?.selected.bit_depth ??
+    (diagnosticsSelectedCodec ? 8 : null);
   const diagnosticsHdrEnabled =
     mediaPipelineSnapshot?.active_hdr_enabled ?? mediaProfileNegotiation?.selected.hdr_enabled;
   const diagnosticsResolution =
@@ -768,7 +1644,7 @@ export function RemoteDisplayWindowPage() {
       ? `${mediaPipelineSnapshot.active_width}x${mediaPipelineSnapshot.active_height}`
       : probeSnapshot?.media_probe_width && probeSnapshot?.media_probe_height
       ? `${probeSnapshot.media_probe_width}x${probeSnapshot.media_probe_height}`
-      : remoteProbeTarget?.split("@")[0] ?? "-";
+      : remoteProbeTarget?.split("@")[0] ?? resolution;
   const diagnosticsTarget =
     mediaPipelineSnapshot?.active_width &&
     mediaPipelineSnapshot?.active_height &&
@@ -777,7 +1653,62 @@ export function RemoteDisplayWindowPage() {
       : remoteProbeTarget ??
     (mediaProfileNegotiation?.selected
       ? `${mediaProfileNegotiation.selected.width}x${mediaProfileNegotiation.selected.height}@${mediaProfileNegotiation.selected.fps}`
-      : "-");
+      : `${resolution}@${fps}`);
+
+  useEffect(() => {
+    diagnosticsCurrentRef.current = diagnosticsCurrent;
+  }, [diagnosticsCurrent]);
+
+  useEffect(() => {
+    setDiagnosticsSamples([]);
+  }, [sessionId]);
+
+  useEffect(() => {
+    const record = () => {
+      const current = diagnosticsCurrentRef.current;
+      if (!current || !hasDiagnosticsSampleValue(current)) return;
+
+      const nextSample = {
+        ...current,
+        atMs: Date.now(),
+      };
+      setDiagnosticsSamples((samples) => {
+        const next = [...samples, nextSample];
+        return next.slice(Math.max(0, next.length - DIAGNOSTICS_SAMPLE_LIMIT));
+      });
+    };
+
+    record();
+    const interval = window.setInterval(record, 1_000);
+    return () => window.clearInterval(interval);
+  }, [sessionId]);
+
+  useEffect(() => {
+    if (!diagnosticsVisible) return;
+
+    const closeIfOutside = (event: MouseEvent | PointerEvent) => {
+      const target = event.target as Node | null;
+      if (target && diagnosticsPopoverRef.current?.contains(target)) return;
+      setDiagnosticsOpen(false);
+      setDiagnosticsPinned(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      setDiagnosticsOpen(false);
+      setDiagnosticsPinned(false);
+    };
+
+    document.addEventListener("pointerdown", closeIfOutside, true);
+    document.addEventListener("mousedown", closeIfOutside, true);
+    document.addEventListener("click", closeIfOutside, true);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeIfOutside, true);
+      document.removeEventListener("mousedown", closeIfOutside, true);
+      document.removeEventListener("click", closeIfOutside, true);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [diagnosticsVisible]);
 
   const title = useMemo(() => {
     if (context?.label) return context.label;
@@ -804,6 +1735,7 @@ export function RemoteDisplayWindowPage() {
     const selectedDecoder = selection?.decoder ?? decoder;
     const selectedTransport = selection?.transport ?? transport;
     const selectedFps = selection?.fps ?? fps;
+    const selectedBitrate = selection?.bitrate ?? bitrate;
     const [width, height] = resolution.split("x").map(Number) as [number, number];
     const selectedUsesNativeSharedTexture =
       nativeRendererType === "d3d11" &&
@@ -818,7 +1750,7 @@ export function RemoteDisplayWindowPage() {
       transport_kind: selectedTransport,
       resolution: [width, height],
       fps: Number(selectedFps),
-      bitrate: Number(bitrate) * 1_000_000,
+      bitrate: Number(selectedBitrate) * 1_000_000,
       duration_ms: 30_000,
       warmup_ms: 500,
       input_source: selectedCapture === "synthetic" ? "synthetic" : "screen",
@@ -999,6 +1931,7 @@ export function RemoteDisplayWindowPage() {
     setDecoder(localWebViewPlan.profile.decoder);
     setTransport(localWebViewPlan.profile.transport);
     setFps(localWebViewPlan.profile.fps);
+    setBitrate(localWebViewPlan.profile.bitrate);
     setLastError(null);
     if (localWebViewPlan.message) setTestMessage(localWebViewPlan.message);
   }, [isLocalPipelinePreview, isTestBusy, localWebViewPlan, renderMode]);
@@ -1106,10 +2039,16 @@ export function RemoteDisplayWindowPage() {
       stream?.getTracks().forEach((track) => track.stop());
       video.srcObject = null;
     }
+    setWebVideoFps(null);
+    setWebPaintFps(null);
+    setWebFrameIntervalP95Ms(null);
+    setWebVideoFrameCount(0);
+    setWebRtcReceiverStats(null);
+    webRtcStatsCountersRef.current = null;
 
     const previewSessionId = webPreviewSessionRef.current;
     webPreviewSessionRef.current = null;
-    if (stopHost && previewSessionId && isTauriRuntime()) {
+    if (stopHost && previewSessionId) {
       void browserWebrtcPreviewStop(previewSessionId);
     }
   }, []);
@@ -1195,6 +2134,7 @@ export function RemoteDisplayWindowPage() {
 
   useEffect(() => {
     if (!isLocalPipelinePreview || !isTestBusy) return;
+    if (!isNative && !isTauriRuntime()) return;
 
     let cancelled = false;
     const poll = async () => {
@@ -1234,13 +2174,17 @@ export function RemoteDisplayWindowPage() {
       cancelled = true;
       window.clearInterval(interval);
     };
-  }, [currentRunId, isLocalPipelinePreview, isTestBusy, testStatus]);
+  }, [currentRunId, isLocalPipelinePreview, isNative, isTestBusy, testStatus]);
 
   useEffect(() => {
     if (!isLocalPipelinePreview || !isTestBusy || isNative) {
       closeWebPreviewPeer();
       setWebPreviewMode("idle");
       setWebPreviewError(null);
+      setWebPresentationLatencyStats(null);
+      setWebFrameTimingMetadataCount(0);
+      setWebFrameTimingChannelState(null);
+      setWebFrameTimingMetadataAgeMs(null);
       return;
     }
 
@@ -1248,35 +2192,119 @@ export function RemoteDisplayWindowPage() {
       closeWebPreviewPeer();
       setWebPreviewMode("failed");
       setWebPreviewError(localStartBlockReason);
+      setWebPresentationLatencyStats(null);
+      setWebFrameTimingMetadataCount(0);
+      setWebFrameTimingChannelState(null);
+      setWebFrameTimingMetadataAgeMs(null);
       return;
     }
 
-    if (!isTauriRuntime() || typeof RTCPeerConnection === "undefined") {
+    if (typeof RTCPeerConnection === "undefined") {
       setWebPreviewMode("failed");
       setWebPreviewError("WebRTC is unavailable in this runtime");
+      setWebPresentationLatencyStats(null);
+      setWebFrameTimingMetadataCount(0);
+      setWebFrameTimingChannelState(null);
+      setWebFrameTimingMetadataAgeMs(null);
       return;
     }
 
     if (encoder === "nvenc_av1") {
       setWebPreviewMode("failed");
       setWebPreviewError("Browser WebRTC preview currently supports H.264 output");
+      setWebPresentationLatencyStats(null);
+      setWebFrameTimingMetadataCount(0);
+      setWebFrameTimingChannelState(null);
+      setWebFrameTimingMetadataAgeMs(null);
       return;
     }
 
     if (!browserSupportsH264WebrtcVideo()) {
       setWebPreviewMode("failed");
       setWebPreviewError("Browser WebRTC video renderer does not advertise H.264 receive support");
+      setWebPresentationLatencyStats(null);
+      setWebFrameTimingMetadataCount(0);
+      setWebFrameTimingChannelState(null);
+      setWebFrameTimingMetadataAgeMs(null);
       return;
     }
 
     let cancelled = false;
     let renderedVideoFrame = false;
     let connectTimeoutId: number | null = null;
+    let statsIntervalId: number | null = null;
     const peer = new RTCPeerConnection({ iceServers: [] });
+    const presentationLatencyTracker = new WebRtcPresentationLatencyTracker();
+    let latestPresentationLatencyStats: WebRtcPresentationLatencyStats | null = null;
+    (window as WindowWithMrdFrameTimingDebug).__mrdWebPreviewPeer = peer;
+    updateWebRtcFrameTimingDebug({
+      received: 0,
+      lastMessage: null,
+      lastStats: null,
+      localChannelState: null,
+      remoteChannelState: null,
+    });
+    const frameTimingChannel = peer.createDataChannel(WEBRTC_FRAME_TIMING_CHANNEL, {
+      ordered: false,
+      maxRetransmits: 0,
+    });
+    frameTimingChannel.onopen = () => {
+      setWebFrameTimingChannelState(`local:${frameTimingChannel.readyState}`);
+      updateWebRtcFrameTimingDebug({ localChannelState: frameTimingChannel.readyState });
+    };
+    frameTimingChannel.onclose = () => {
+      setWebFrameTimingChannelState(`local:${frameTimingChannel.readyState}`);
+      updateWebRtcFrameTimingDebug({ localChannelState: frameTimingChannel.readyState });
+    };
+    frameTimingChannel.onmessage = (event) => {
+      setWebFrameTimingMetadataCount((count) => count + 1);
+      const timing = parseWebRtcFrameTimingMetadata(event.data);
+      if (timing) {
+        setWebFrameTimingMetadataAgeMs(Date.now() - timing.captureUnixUs / 1000);
+      }
+      updateWebRtcFrameTimingDebug({
+        received: ((window as WindowWithMrdFrameTimingDebug).__mrdFrameTimingDebug?.received ?? 0) + 1,
+        lastMessage: typeof event.data === "string" ? event.data : String(event.data),
+        localChannelState: frameTimingChannel.readyState,
+      });
+      presentationLatencyTracker.addMetadata(event.data);
+    };
+    peer.ondatachannel = (event) => {
+      if (event.channel.label !== WEBRTC_FRAME_TIMING_CHANNEL) return;
+      setWebFrameTimingChannelState(`remote:${event.channel.readyState}`);
+      updateWebRtcFrameTimingDebug({ remoteChannelState: event.channel.readyState });
+      event.channel.onopen = () => {
+        setWebFrameTimingChannelState(`remote:${event.channel.readyState}`);
+        updateWebRtcFrameTimingDebug({ remoteChannelState: event.channel.readyState });
+      };
+      event.channel.onclose = () => {
+        setWebFrameTimingChannelState(`remote:${event.channel.readyState}`);
+        updateWebRtcFrameTimingDebug({ remoteChannelState: event.channel.readyState });
+      };
+      event.channel.onmessage = (messageEvent) => {
+        setWebFrameTimingMetadataCount((count) => count + 1);
+        const timing = parseWebRtcFrameTimingMetadata(messageEvent.data);
+        if (timing) {
+          setWebFrameTimingMetadataAgeMs(Date.now() - timing.captureUnixUs / 1000);
+        }
+        updateWebRtcFrameTimingDebug({
+          received:
+            ((window as WindowWithMrdFrameTimingDebug).__mrdFrameTimingDebug?.received ?? 0) + 1,
+          lastMessage:
+            typeof messageEvent.data === "string" ? messageEvent.data : String(messageEvent.data),
+          remoteChannelState: event.channel.readyState,
+        });
+        presentationLatencyTracker.addMetadata(messageEvent.data);
+      };
+    };
     webPreviewPeerRef.current = peer;
     webPreviewSessionRef.current = sessionId;
     setWebPreviewMode("connecting");
     setWebPreviewError(null);
+    setWebPresentationLatencyStats(null);
+    setWebFrameTimingMetadataCount(0);
+    setWebFrameTimingChannelState("connecting");
+    setWebFrameTimingMetadataAgeMs(null);
 
     const markVideoRendered = () => {
       if (cancelled || renderedVideoFrame) return;
@@ -1289,10 +2317,44 @@ export function RemoteDisplayWindowPage() {
       setWebPreviewError(null);
     };
 
-    peer.addTransceiver("video", { direction: "recvonly" });
+    const startReceiverStatsPolling = (receiver: RTCRtpReceiver) => {
+      if (statsIntervalId !== null) {
+        window.clearInterval(statsIntervalId);
+        statsIntervalId = null;
+      }
+      webRtcStatsCountersRef.current = null;
+      const poll = async () => {
+        try {
+          const report = await receiver.getStats();
+          if (cancelled) return;
+          const next = summarizeWebRtcInboundVideoStats(
+            report,
+            webRtcStatsCountersRef.current,
+            performance.now()
+          );
+          webRtcStatsCountersRef.current = next.counters;
+          if (next.stats) {
+            setWebRtcReceiverStats(next.stats);
+          }
+        } catch {
+          // Stats are diagnostic-only; keep media playback independent.
+        }
+      };
+      void poll();
+      statsIntervalId = window.setInterval(() => {
+        void poll();
+      }, 1_000);
+    };
+
+    const videoTransceiver = peer.addTransceiver("video", { direction: "recvonly" });
+    applyWebRtcLowLatencyHints(videoTransceiver.receiver);
     peer.ontrack = (event) => {
       if (cancelled) return;
+      applyWebRtcLowLatencyHints(event.receiver);
+      applyWebRtcVideoMotionHint(event.track);
+      startReceiverStatsPolling(event.receiver);
       const stream = event.streams[0] ?? new MediaStream([event.track]);
+      stream.getVideoTracks().forEach(applyWebRtcVideoMotionHint);
 
       const bindStreamToVideo = () => {
         if (cancelled) return;
@@ -1302,17 +2364,69 @@ export function RemoteDisplayWindowPage() {
           return;
         }
 
-        video.srcObject = stream;
+        if (video.srcObject !== stream) {
+          video.srcObject = stream;
+        }
         video.muted = true;
         video.playsInline = true;
         const videoWithFrameCallback = video as HTMLVideoElement & {
-          requestVideoFrameCallback?: (callback: () => void) => number;
+          requestVideoFrameCallback?: (
+            callback: (
+              now: number,
+              metadata: WebRtcVideoFrameCallbackMetadata
+            ) => void
+          ) => number;
         };
-        videoWithFrameCallback.requestVideoFrameCallback?.(() => markVideoRendered());
+        let lastStatsAt = performance.now();
+        let lastPresentedFrames = 0;
+        let callbacksSinceStats = 0;
+        let lastFrameCallbackAt: number | null = null;
+        const frameIntervalsMs: number[] = [];
+        const observeFrame = (now: number, metadata: WebRtcVideoFrameCallbackMetadata) => {
+          if (cancelled) return;
+          markVideoRendered();
+          latestPresentationLatencyStats =
+            presentationLatencyTracker.observeFrame(now, metadata) ?? latestPresentationLatencyStats;
+          if (latestPresentationLatencyStats) {
+            updateWebRtcFrameTimingDebug({ lastStats: latestPresentationLatencyStats });
+          }
+          callbacksSinceStats += 1;
+          if (lastFrameCallbackAt !== null) {
+            frameIntervalsMs.push(now - lastFrameCallbackAt);
+            if (frameIntervalsMs.length > 240) {
+              frameIntervalsMs.shift();
+            }
+          }
+          lastFrameCallbackAt = now;
+          const presentedFrames = metadata.presentedFrames ?? lastPresentedFrames + 1;
+          const elapsedMs = performance.now() - lastStatsAt;
+          if (elapsedMs >= 1000) {
+            const deltaFrames = presentedFrames - lastPresentedFrames;
+            setWebVideoFps((deltaFrames * 1000) / elapsedMs);
+            setWebPaintFps((callbacksSinceStats * 1000) / elapsedMs);
+            setWebFrameIntervalP95Ms(percentile(frameIntervalsMs, 0.95));
+            if (latestPresentationLatencyStats) {
+              setWebPresentationLatencyStats(latestPresentationLatencyStats);
+            }
+            setWebVideoFrameCount(presentedFrames);
+            lastPresentedFrames = presentedFrames;
+            callbacksSinceStats = 0;
+            lastStatsAt = performance.now();
+          }
+          videoWithFrameCallback.requestVideoFrameCallback?.(observeFrame);
+        };
+        videoWithFrameCallback.requestVideoFrameCallback?.(observeFrame);
         video.addEventListener("loadeddata", markVideoRendered, { once: true });
         video.addEventListener("playing", markVideoRendered, { once: true });
         void video.play().catch((error) => {
           if (cancelled) return;
+          if (error instanceof DOMException && error.name === "AbortError") {
+            return;
+          }
+          const message = error instanceof Error ? error.message : String(error);
+          if (message.toLowerCase().includes("interrupted by a new load request")) {
+            return;
+          }
           setWebPreviewError(error instanceof Error ? error.message : String(error));
         });
       };
@@ -1348,7 +2462,10 @@ export function RemoteDisplayWindowPage() {
           sessionId,
           offerSdp,
           fps: Number(fps),
-          h264Profile: encoder === "nvenc_h264" && decoder === "nvdec" ? "high" : "baseline",
+          width: Number(resolution.split("x")[0]),
+          height: Number(resolution.split("x")[1]),
+          bitrateMbps: Number(bitrate),
+          h264Profile: browserWebrtcPreviewH264Profile(encoder, decoder),
         });
         if (cancelled) return;
         if (!answer.ok) {
@@ -1375,10 +2492,14 @@ export function RemoteDisplayWindowPage() {
       if (connectTimeoutId !== null) {
         window.clearTimeout(connectTimeoutId);
       }
+      if (statsIntervalId !== null) {
+        window.clearInterval(statsIntervalId);
+      }
       closeWebPreviewPeer();
     };
   }, [
     closeWebPreviewPeer,
+    bitrate,
     decoder,
     encoder,
     fps,
@@ -1386,6 +2507,7 @@ export function RemoteDisplayWindowPage() {
     isNative,
     isTestBusy,
     localStartBlockReason,
+    resolution,
     sessionId,
   ]);
 
@@ -1807,6 +2929,20 @@ export function RemoteDisplayWindowPage() {
     setWebPreviewMode("idle");
     setWebPreviewError(null);
 
+    if (!isNative && !isTauriRuntime()) {
+      if (localWebViewPlan.profile && localWebViewPlan.changed) {
+        setCapture(localWebViewPlan.profile.capture);
+        setEncoder(localWebViewPlan.profile.encoder);
+        setDecoder(localWebViewPlan.profile.decoder);
+        setTransport(localWebViewPlan.profile.transport);
+        setFps(localWebViewPlan.profile.fps);
+        setBitrate(localWebViewPlan.profile.bitrate);
+      }
+      setTestStatus("running");
+      setTestMessage("网页 WebRTC 本机采集运行中");
+      return;
+    }
+
     await testHarnessStop();
 
     let configForRun = testConfig;
@@ -1817,6 +2953,7 @@ export function RemoteDisplayWindowPage() {
         setDecoder(localWebViewPlan.profile.decoder);
         setTransport(localWebViewPlan.profile.transport);
         setFps(localWebViewPlan.profile.fps);
+        setBitrate(localWebViewPlan.profile.bitrate);
         if (localWebViewPlan.message) setTestMessage(localWebViewPlan.message);
       }
       configForRun = buildTestConfig(null, localWebViewPlan.profile);
@@ -1864,6 +3001,46 @@ export function RemoteDisplayWindowPage() {
     setLastError(result.error.message);
   };
 
+  useEffect(() => {
+    if (requestedResolution !== null && requestedResolution !== resolution) {
+      setResolution(requestedResolution);
+    }
+    if (requestedFps !== null && requestedFps !== fps) {
+      setFps(requestedFps);
+    }
+    if (requestedBitrate !== null && requestedBitrate !== bitrate) {
+      setBitrate(requestedBitrate);
+    }
+  }, [
+    bitrate,
+    fps,
+    requestedBitrate,
+    requestedFps,
+    requestedResolution,
+    resolution,
+  ]);
+
+  useEffect(() => {
+    if (searchParams.get("autostart") !== "1") return;
+    const autostartKey = `${sessionId}:${searchParams.toString()}`;
+    if (autoStartRequestedRef.current === autostartKey) return;
+    if (!isLocalPipelinePreview || isTestBusy || localStartBlockReason) return;
+    if (renderMode !== "web" || !capabilities) return;
+    if (queryProfileNeedsApply) return;
+
+    autoStartRequestedRef.current = autostartKey;
+    void handleStartTest();
+  }, [
+    capabilities,
+    isLocalPipelinePreview,
+    isTestBusy,
+    localStartBlockReason,
+    queryProfileNeedsApply,
+    renderMode,
+    searchParams,
+    sessionId,
+  ]);
+
   const handleStopTest = async () => {
     if (!isLocalPipelinePreview) {
       setTestStatus("idle");
@@ -1874,6 +3051,13 @@ export function RemoteDisplayWindowPage() {
     setTestStatus("stopping");
     closeWebPreviewPeer();
     setWebPreviewMode("idle");
+    if (!isNative && !isTauriRuntime()) {
+      await browserWebrtcPreviewStop(sessionId);
+      setTestStatus("idle");
+      setCurrentRunId(null);
+      setTestMessage("网页显示已停止");
+      return;
+    }
     const result = currentRunId
       ? await testStopRun(currentRunId)
       : await testHarnessStop();
@@ -1920,6 +3104,7 @@ export function RemoteDisplayWindowPage() {
   const statusLabel = isLocalPipelinePreview
     ? "connected"
     : sessionSnapshot?.state ?? "loading";
+  const isBrowserBridgeRemote = !isTauriRuntime() && !isLocalPipelinePreview;
   const webPreviewUsesVideo =
     isLocalPipelinePreview &&
     !isNative &&
@@ -2067,15 +3252,16 @@ export function RemoteDisplayWindowPage() {
           style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}
         >
           <div
+            ref={diagnosticsPopoverRef}
             className="relative hidden md:block"
             onMouseEnter={() => setDiagnosticsOpen(true)}
             onMouseLeave={() => {
               if (!diagnosticsPinned) setDiagnosticsOpen(false);
             }}
             onBlur={(event) => {
+              if (diagnosticsPinned) return;
               if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
                 setDiagnosticsOpen(false);
-                setDiagnosticsPinned(false);
               }
             }}
           >
@@ -2085,7 +3271,7 @@ export function RemoteDisplayWindowPage() {
               aria-expanded={diagnosticsVisible}
               className="inline-flex items-center gap-2 rounded-md border border-emerald-400/20 bg-emerald-500/10 px-2 py-1 text-[11px] text-emerald-50 hover:bg-emerald-500/16"
               onClick={() => {
-                setDiagnosticsPinned((value) => !value);
+                setDiagnosticsPinned(true);
                 setDiagnosticsOpen(true);
               }}
               onKeyDown={(event) => {
@@ -2099,9 +3285,9 @@ export function RemoteDisplayWindowPage() {
               <Network className="h-3.5 w-3.5 text-emerald-300" />
               <span>{remoteQuality}</span>
               <span className="text-emerald-200/60">/</span>
-              <span>{formatFps(probeSnapshot?.current_fps)}</span>
+              <span>{formatFps(diagnosticsVisualFps)}</span>
               <span className="text-emerald-200/60">/</span>
-              <span>{remoteLatencyMs !== null ? `${remoteLatencyMs.toFixed(1)} ms` : "-"}</span>
+              <span>{formatMs(diagnosticsLatencyP95Ms)}</span>
             </button>
             {diagnosticsVisible ? (
               <div className="absolute right-0 top-9 z-50 max-h-[min(72vh,520px)] w-[420px] overflow-y-auto rounded-md border border-emerald-400/20 bg-[#03140f]/95 p-4 text-[11px] text-emerald-50 shadow-2xl shadow-emerald-950/60 backdrop-blur">
@@ -2113,22 +3299,141 @@ export function RemoteDisplayWindowPage() {
                   <div className="text-emerald-200/70">{formatTime(elapsed)}</div>
                 </div>
                 <div className="grid gap-4">
+                  <div className="grid grid-cols-2 gap-2">
+                    <div className="rounded-md border border-emerald-400/10 bg-emerald-500/10 p-2">
+                      <div className="flex items-center gap-1.5 text-emerald-200/65">
+                        <Activity className="h-3.5 w-3.5" />
+                        {webVideoFps ? "Web 视频" : "FPS"}
+                      </div>
+                      <div className="mt-1 text-lg font-semibold text-white">
+                        {formatFps(diagnosticsVisualFps)}
+                      </div>
+                      {webPaintFps ? (
+                        <div className="mt-0.5 text-[10px] text-emerald-200/55">
+                          回调 {formatHz(webPaintFps)}
+                        </div>
+                      ) : null}
+                    </div>
+                    <div className="rounded-md border border-emerald-400/10 bg-emerald-500/10 p-2">
+                      <div className="flex items-center gap-1.5 text-emerald-200/65">
+                        <Gauge className="h-3.5 w-3.5" />
+                        {diagnosticsLatencyLabel}
+                      </div>
+                      <div className="mt-1 text-lg font-semibold text-white">
+                        {formatMs(diagnosticsLatencyP95Ms)}
+                      </div>
+                    </div>
+                    <div className="rounded-md border border-emerald-400/10 bg-emerald-500/10 p-2">
+                      <div className="text-emerald-200/65">码率 / 队列</div>
+                      <div className="mt-1 text-sm font-semibold text-white">
+                        {formatMbps(diagnosticsBitrateMbps)} / {formatCount(diagnosticsQueueDepth)}
+                      </div>
+                    </div>
+                    <div className="rounded-md border border-emerald-400/10 bg-emerald-500/10 p-2">
+                      <div className="text-emerald-200/65">掉帧 / 丢弃率</div>
+                      <div className="mt-1 text-sm font-semibold text-white">
+                        {formatCount(diagnosticsDroppedFrames)} / {formatPercent(diagnosticsDropRatio)}
+                      </div>
+                    </div>
+                  </div>
+                  <section className="rounded-md border border-emerald-400/10 bg-emerald-950/20 p-3">
+                    <div className="mb-3 flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-2 text-[12px] font-semibold text-emerald-100">
+                        <BarChart3 className="h-3.5 w-3.5 text-emerald-300" />
+                        性能曲线
+                      </div>
+                      <div className="text-[10px] text-emerald-200/55">
+                        最近 {Math.min(diagnosticsSamples.length, DIAGNOSTICS_SAMPLE_LIMIT)} 秒
+                      </div>
+                    </div>
+                    <div className="grid gap-3">
+                      <DiagnosticMetricTile
+                        title="FPS"
+                        value={formatFps(diagnosticsVisualFps)}
+                        subtitle={
+                          webPaintFps
+                            ? `目标 ${diagnosticsTargetFps} FPS / 回调 ${formatHz(webPaintFps)}`
+                            : `目标 ${diagnosticsTargetFps} FPS`
+                        }
+                        samples={diagnosticsSamples}
+                        sampleValue={(sample) => sample.fps}
+                        colorClass="text-emerald-300"
+                      />
+                      <DiagnosticMetricTile
+                        title={diagnosticsLatencyLabel}
+                        value={formatMs(diagnosticsLatencyP95Ms)}
+                        subtitle={
+                          webPresentationLatencyStats
+                            ? `p50 ${formatMs(webPresentationLatencyStats.p50Ms)} / 最新 ${formatMs(
+                                webPresentationLatencyStats.latestMs
+                              )}`
+                            : "阶段指标优先，Web 路径回退帧间隔"
+                        }
+                        samples={diagnosticsSamples}
+                        sampleValue={(sample) => sample.latencyP95Ms}
+                        colorClass="text-cyan-300"
+                      />
+                      <DiagnosticMetricTile
+                        title="码率"
+                        value={formatMbps(diagnosticsBitrateMbps)}
+                        subtitle="接收 probe / active profile"
+                        samples={diagnosticsSamples}
+                        sampleValue={(sample) => sample.bitrateMbps}
+                        colorClass="text-lime-300"
+                      />
+                    </div>
+                  </section>
+                  <DiagnosticStageList rows={diagnosticsStageRows} />
+                  {webRtcReceiverStats ? (
+                    <DiagnosticGroup
+                      title="WebRTC 接收"
+                      rows={[
+                        ["视频呈现 FPS", formatFps(webVideoFps)],
+                        ["回调频率", formatHz(webPaintFps)],
+                        ["解码 FPS", formatFps(webRtcReceiverStats.decodedFps)],
+                        ["解码帧", formatCount(webRtcReceiverStats.framesDecoded)],
+                        ["掉帧", formatCount(webRtcReceiverStats.framesDropped)],
+                        ["网络抖动", formatMs(webRtcReceiverStats.jitterMs)],
+                        ["JitterBuffer", formatMs(webRtcReceiverStats.jitterBufferDelayAvgMs)],
+                        ["解码均值", formatMs(webRtcReceiverStats.decodeAvgMs)],
+                        ["处理均值", formatMs(webRtcReceiverStats.processingDelayAvgMs)],
+                        ["渲染间隔", formatMs(webRtcReceiverStats.interFrameDelayAvgMs)],
+                        [`${diagnosticsE2eLabelPrefix} p50`, formatMs(webPresentationLatencyStats?.p50Ms)],
+                        [`${diagnosticsE2eLabelPrefix} p95`, formatMs(webPresentationLatencyStats?.p95Ms)],
+                        [`${diagnosticsE2eLabelPrefix} max`, formatMs(webPresentationLatencyStats?.maxMs)],
+                        ["E2E 样本", formatCount(webPresentationLatencyStats?.samples)],
+                        [
+                          "E2E metadata",
+                          `${formatCount(webFrameTimingMetadataCount)} / ${dash(
+                            webFrameTimingChannelState
+                          )} / age ${formatMs(webFrameTimingMetadataAgeMs)}`,
+                        ],
+                        ["冻结次数", formatCount(webRtcReceiverStats.freezeCount)],
+                        ["丢包", formatCount(webRtcReceiverStats.packetsLost)],
+                      ]}
+                    />
+                  ) : null}
+                  {diagnosticsBrowserPaintLimited ? (
+                    <div className="rounded-md border border-amber-300/20 bg-amber-400/10 p-2 text-amber-100">
+                      浏览器视频呈现低于目标，但 WebRTC 解码仍在高帧运行：当前 Web View
+                      合成层可能限制显示节奏，建议用 Chrome 或原生渲染链路复测。
+                    </div>
+                  ) : null}
                   <DiagnosticGroup
                     title="连接"
                     rows={[
                       ["连接时间", formatTime(elapsed)],
                       ["连接质量", remoteQuality],
-                      ["帧率", formatFps(probeSnapshot?.current_fps)],
-                      ["延迟", remoteLatencyMs !== null ? `${remoteLatencyMs.toFixed(1)} ms` : "-"],
-                      ["丢包/掉帧", formatPercent(remoteDropRatio)],
                       [
-                        "码率",
-                        formatMbps(
-                          probeSnapshot?.bitrate_mbps ??
-                            mediaPipelineSnapshot?.active_bitrate_mbps ??
-                            null
-                        ),
+                        "帧率",
+                        webVideoFps || webPaintFps
+                          ? `视频 ${formatFps(diagnosticsVisualFps)} / 回调 ${formatHz(webPaintFps)} / 解码 ${formatFps(webRtcReceiverStats?.decodedFps ?? diagnosticsFps)}`
+                          : formatFps(diagnosticsVisualFps),
                       ],
+                      ["延迟", `${diagnosticsLatencyLabel}: ${formatMs(diagnosticsLatencyP95Ms)}`],
+                      ["丢包/掉帧", `${formatPercent(diagnosticsDropRatio)} / ${formatCount(diagnosticsDroppedFrames)}`],
+                      ["队列深度", formatCount(diagnosticsQueueDepth)],
+                      ["码率", formatMbps(diagnosticsBitrateMbps)],
                     ]}
                   />
                   <DiagnosticGroup
@@ -2481,6 +3786,12 @@ export function RemoteDisplayWindowPage() {
           <video
             ref={webPreviewVideoRef}
             className="absolute inset-0 h-full w-full bg-black object-contain"
+            style={{
+              backfaceVisibility: "hidden",
+              contain: "strict",
+              transform: "translateZ(0)",
+              willChange: "transform",
+            }}
             autoPlay
             muted
             playsInline
@@ -2547,6 +3858,11 @@ export function RemoteDisplayWindowPage() {
             {remoteProbeTarget ? ` / ${remoteProbeTarget}` : ""}
           </div>
         )}
+        {isBrowserBridgeRemote && (
+          <div className="absolute left-3 top-3 rounded-md border border-amber-300/25 bg-black/50 px-3 py-2 text-[11px] text-amber-100 backdrop-blur">
+            Web preview / mrd-service bridge / 非 native 高刷渲染
+          </div>
+        )}
         {lastError && (
           <div className="absolute bottom-3 left-3 max-w-xl rounded-md border border-red-500/30 bg-red-950/70 px-3 py-2 text-xs text-red-100">
             {lastError}
@@ -2571,6 +3887,11 @@ export function RemoteDisplayWindowPage() {
           {metrics && (
             <span className="hidden lg:inline">
               {metrics.capture_fps.toFixed(1)} FPS / {metrics.total_latency_p95_ms.toFixed(1)} ms
+            </span>
+          )}
+          {!metrics && webVideoFps !== null && (
+            <span className="hidden lg:inline">
+              web {webVideoFps.toFixed(1)} FPS / {webVideoFrameCount} frames
             </span>
           )}
           <span className="hidden xl:inline">

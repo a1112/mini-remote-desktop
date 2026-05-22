@@ -213,7 +213,7 @@ export function DevicesPage() {
     setLaunchingDeviceId("__local_test__");
     try {
       const result = await launchLocalRemoteDisplayTest();
-      if (result.mode === "route") navigate(`/session/${result.sessionId}`);
+      if (result.mode === "route") navigate(`/display/${result.sessionId}`);
     } catch (error) {
       alert(error instanceof Error ? error.message : "Open local test display failed");
     } finally {
