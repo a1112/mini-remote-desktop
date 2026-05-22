@@ -1727,6 +1727,10 @@ export function RemoteDisplayWindowPage() {
   const matrixStopRequestedRef = useRef(false);
   const webPreviewRunStartedAtRef = useRef<number | null>(null);
   const webPreviewAutoStopTimerRef = useRef<number | null>(null);
+  const webVideoFpsRef = useRef<number | null>(null);
+  const webVideoFrameCountRef = useRef(0);
+  const webRtcReceiverStatsRef = useRef<WebRtcReceiverStats | null>(null);
+  const webPresentationLatencyStatsRef = useRef<WebRtcPresentationLatencyStats | null>(null);
 
   const [context, setContext] = useState<RemoteDisplayWindowContext | null>(null);
   const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
@@ -2410,6 +2414,22 @@ export function RemoteDisplayWindowPage() {
   useEffect(() => {
     diagnosticsCurrentRef.current = diagnosticsCurrent;
   }, [diagnosticsCurrent]);
+
+  useEffect(() => {
+    webVideoFpsRef.current = webVideoFps;
+  }, [webVideoFps]);
+
+  useEffect(() => {
+    webVideoFrameCountRef.current = webVideoFrameCount;
+  }, [webVideoFrameCount]);
+
+  useEffect(() => {
+    webRtcReceiverStatsRef.current = webRtcReceiverStats;
+  }, [webRtcReceiverStats]);
+
+  useEffect(() => {
+    webPresentationLatencyStatsRef.current = webPresentationLatencyStats;
+  }, [webPresentationLatencyStats]);
 
   useEffect(() => {
     diagnosticsSamplesRef.current = [];
@@ -4294,10 +4314,16 @@ export function RemoteDisplayWindowPage() {
       const encodeSamples = samples.map((sample) => sample.encodeP95Ms);
       const transportSamples = samples.map((sample) => sample.transportP95Ms);
       const decodeSamples = samples.map((sample) => sample.decodeP95Ms);
+      const latencyNumericSamples = latencySamples.filter(
+        (value): value is number => typeof value === "number"
+      );
+      const receiverStats = webRtcReceiverStatsRef.current;
+      const presentationStats = webPresentationLatencyStatsRef.current;
       const droppedFrames =
         latestValue(samples.map((sample) => sample.droppedFrames)) ??
-        webRtcReceiverStats?.framesDropped ??
+        receiverStats?.framesDropped ??
         0;
+      const frameCount = Math.max(webVideoFrameCountRef.current, receiverStats?.framesDecoded ?? 0);
 
       return {
         run_id:
@@ -4321,16 +4347,20 @@ export function RemoteDisplayWindowPage() {
           },
         summary: {
           total_duration_ms: now - startedAt,
-          capture_fps: average(fpsSamples) ?? webVideoFps ?? undefined,
+          capture_fps: average(fpsSamples) ?? webVideoFpsRef.current ?? undefined,
           encode_latency_p95: percentile(encodeSamples.filter((value): value is number => typeof value === "number"), 0.95) ?? undefined,
           transport_latency_p95: percentile(transportSamples.filter((value): value is number => typeof value === "number"), 0.95) ?? undefined,
           decode_latency_p95: percentile(decodeSamples.filter((value): value is number => typeof value === "number"), 0.95) ?? undefined,
+          total_latency_p50:
+            percentile(latencyNumericSamples, 0.5) ??
+            presentationStats?.p50Ms ??
+            undefined,
           total_latency_p95:
-            percentile(latencySamples.filter((value): value is number => typeof value === "number"), 0.95) ??
-            webPresentationLatencyStats?.p95Ms ??
+            percentile(latencyNumericSamples, 0.95) ??
+            presentationStats?.p95Ms ??
             undefined,
           dropped_frames: droppedFrames,
-          frame_count: webVideoFrameCount,
+          frame_count: frameCount,
           error_message: message,
           failure_reason:
             status === "failed"
@@ -4345,10 +4375,6 @@ export function RemoteDisplayWindowPage() {
       capabilities,
       currentRunId,
       testConfig,
-      webPresentationLatencyStats?.p95Ms,
-      webRtcReceiverStats?.framesDropped,
-      webVideoFps,
-      webVideoFrameCount,
     ]
   );
 
@@ -4362,9 +4388,9 @@ export function RemoteDisplayWindowPage() {
   const completeBrowserPreviewRun = useCallback(
     async (status: TestRun["status"] = "completed", message?: string) => {
       clearBrowserPreviewAutoStopTimer();
+      const completedRun = buildBrowserPreviewCompletedRun(status, message);
       closeWebPreviewPeer();
       await browserWebrtcPreviewStop(sessionId);
-      const completedRun = buildBrowserPreviewCompletedRun(status, message);
       setLastCompletedRun(completedRun);
       setCurrentRunId(null);
       setTestStatus(status === "failed" ? "failed" : "completed");
@@ -4748,6 +4774,7 @@ export function RemoteDisplayWindowPage() {
   );
   const reportFpsMinValue = typeof reportFpsMin === "number" ? -reportFpsMin : null;
   const reportLatencyP50 =
+    lastRunSummary?.total_latency_p50 ??
     webPresentationLatencyStats?.p50Ms ??
     percentile(
       diagnosticsSamples
@@ -5852,10 +5879,10 @@ export function RemoteDisplayWindowPage() {
               <div className="rounded-lg border border-white/10 bg-white/8 p-3">
                 <div className="text-[10px] uppercase text-emerald-200/55">E2E 延迟 p50 / p95</div>
                 <div className="mt-1 text-lg font-semibold text-white">
-                  {formatSummaryMs(reportLatencyP95)}
+                  {formatSummaryMs(reportLatencyP50)} / {formatSummaryMs(reportLatencyP95)}
                 </div>
                 <div className="text-[10px] text-emerald-200/55">
-                  p50 {formatSummaryMs(reportLatencyP50)}
+                  感知延迟中位 / 尾延迟
                 </div>
               </div>
               <div className="rounded-lg border border-white/10 bg-white/8 p-3">

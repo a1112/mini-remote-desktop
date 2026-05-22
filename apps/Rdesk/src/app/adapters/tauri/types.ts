@@ -244,6 +244,7 @@ export interface TestRunSummary {
   transport_latency_p95?: number;
   decode_latency_p50?: number;
   decode_latency_p95?: number;
+  total_latency_p50?: number;
   total_latency_p95?: number;
   dropped_frames: number;
   frame_count: number;
