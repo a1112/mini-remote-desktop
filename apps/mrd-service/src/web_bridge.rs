@@ -1,4 +1,8 @@
 use crate::{
+    browser_webcodecs_preview::{
+        spawn_browser_webcodecs_capture_sender, BrowserWebcodecsPreviewControlMessage,
+        BrowserWebcodecsPreviewOutbound,
+    },
     browser_webrtc_preview::{
         BrowserWebrtcPreviewHost, BrowserWebrtcPreviewStartRequest, BrowserWebrtcPreviewStopRequest,
     },
@@ -21,9 +25,12 @@ use std::{
     env,
     future::pending,
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tokio::{net::TcpListener, task::JoinHandle};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{info, warn};
@@ -174,6 +181,10 @@ pub fn build_router(ipc_server: IpcServer, config: WebBridgeConfig) -> Router {
         .route("/ipc", post(ipc_handler))
         .route("/ws", get(ws_handler))
         .route(
+            "/browser/webcodecs-preview/ws",
+            get(browser_webcodecs_preview_ws_handler),
+        )
+        .route(
             "/browser/webrtc-preview/start",
             post(browser_webrtc_preview_start),
         )
@@ -224,6 +235,16 @@ async fn ws_handler(
 ) -> impl IntoResponse {
     let auth_error = authorize_ws_token(&state.config, &headers, query.token.as_deref()).err();
     ws.on_upgrade(move |socket| handle_ws(socket, state, auth_error))
+}
+
+async fn browser_webcodecs_preview_ws_handler(
+    State(state): State<WebBridgeState>,
+    Query(query): Query<WebSocketAuthQuery>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    let auth_error = authorize_ws_token(&state.config, &headers, query.token.as_deref()).err();
+    ws.on_upgrade(move |socket| handle_browser_webcodecs_ws(socket, auth_error))
 }
 
 async fn browser_webrtc_preview_start(
@@ -319,6 +340,106 @@ async fn handle_ws(mut socket: WebSocket, state: WebBridgeState, auth_error: Opt
             break;
         }
     }
+}
+
+async fn handle_browser_webcodecs_ws(mut socket: WebSocket, auth_error: Option<IpcResponse>) {
+    if let Some(response) = auth_error {
+        let _ = send_webcodecs_error_from_ipc_response(&mut socket, response).await;
+        return;
+    }
+
+    let (outbound_tx, mut outbound_rx) = mpsc::channel::<BrowserWebcodecsPreviewOutbound>(4);
+    let mut running: Option<Arc<AtomicBool>> = None;
+    let mut capture_task: Option<tokio::task::JoinHandle<()>> = None;
+
+    loop {
+        tokio::select! {
+            inbound = socket.recv() => {
+                let Some(Ok(message)) = inbound else {
+                    break;
+                };
+                let Message::Text(text) = message else {
+                    continue;
+                };
+                match serde_json::from_str::<BrowserWebcodecsPreviewControlMessage>(&text) {
+                    Ok(BrowserWebcodecsPreviewControlMessage::Start(request)) => {
+                        if let Some(flag) = running.take() {
+                            flag.store(false, Ordering::Relaxed);
+                        }
+                        if let Some(task) = capture_task.take() {
+                            task.abort();
+                        }
+                        let flag = Arc::new(AtomicBool::new(true));
+                        capture_task = Some(spawn_browser_webcodecs_capture_sender(
+                            request,
+                            outbound_tx.clone(),
+                            flag.clone(),
+                        ));
+                        running = Some(flag);
+                    }
+                    Ok(BrowserWebcodecsPreviewControlMessage::Stop) => {
+                        break;
+                    }
+                    Err(error) => {
+                        let payload = BridgeErrorPayload {
+                            code: "E_BROWSER_WEBCODECS_BAD_REQUEST".to_string(),
+                            message: format!("Invalid WebCodecs preview request: {error}"),
+                        };
+                        let _ = socket
+                            .send(Message::Text(
+                                serde_json::to_string(&payload)
+                                    .unwrap_or_else(|_| "{\"code\":\"E_BROWSER_WEBCODECS_BAD_REQUEST\"}".to_string())
+                                    .into(),
+                            ))
+                            .await;
+                    }
+                }
+            }
+            outbound = outbound_rx.recv() => {
+                let Some(outbound) = outbound else {
+                    break;
+                };
+                let send_result = match outbound {
+                    BrowserWebcodecsPreviewOutbound::Text(text) => {
+                        socket.send(Message::Text(text.into())).await
+                    }
+                    BrowserWebcodecsPreviewOutbound::Binary(bytes) => {
+                        socket.send(Message::Binary(bytes)).await
+                    }
+                };
+                if send_result.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
+    if let Some(flag) = running {
+        flag.store(false, Ordering::Relaxed);
+    }
+    if let Some(task) = capture_task {
+        task.abort();
+    }
+}
+
+async fn send_webcodecs_error_from_ipc_response(
+    socket: &mut WebSocket,
+    response: IpcResponse,
+) -> Result<(), axum::Error> {
+    let (code, message) = match response {
+        IpcResponse::Error { code, message } => (code, message),
+        other => (
+            "E_WEB_BRIDGE_AUTH".to_string(),
+            format!("unexpected bridge auth response: {other:?}"),
+        ),
+    };
+    socket
+        .send(Message::Text(
+            serde_json::to_string(&BridgeErrorPayload { code, message })
+                .unwrap_or_else(|_| "{\"code\":\"E_WEB_BRIDGE_AUTH\"}".to_string())
+                .into(),
+        ))
+        .await
 }
 
 async fn send_ws_response(
@@ -417,6 +538,7 @@ fn index_document(config: &WebBridgeConfig) -> String {
       <div class="row"><span class="key">Health</span><code>GET /health</code></div>
       <div class="row"><span class="key">IPC bridge</span><code>POST /ipc</code></div>
       <div class="row"><span class="key">WebSocket</span><code>GET /ws</code></div>
+      <div class="row"><span class="key">WebCodecs preview</span><code>GET /browser/webcodecs-preview/ws</code></div>
     </div>
   </main>
 </body>

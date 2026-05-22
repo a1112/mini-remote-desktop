@@ -3,6 +3,7 @@
 // This library is used by tests to access the service's internal modules.
 
 pub mod app_state;
+pub mod browser_webcodecs_preview;
 pub mod browser_webrtc_preview;
 pub mod capabilities;
 pub mod capture_source;

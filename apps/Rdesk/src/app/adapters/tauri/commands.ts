@@ -64,6 +64,7 @@ import {
   invokeServiceBridgeIpc,
   postServiceBridgeJson,
   serviceBridgeHealth,
+  serviceBridgeWebSocketUrl,
   type ServiceBridgeIpcRequest,
   type ServiceBridgeIpcResponse,
 } from '../serviceBridge/client';
@@ -338,6 +339,10 @@ export async function browserWebrtcPreviewStop(
     return { ok: true, value: undefined };
   }
   return invokeAdapter<void>('browser_webrtc_preview_stop', { sessionId });
+}
+
+export function browserWebcodecsPreviewWebSocketUrl(): string {
+  return serviceBridgeWebSocketUrl('/browser/webcodecs-preview/ws');
 }
 
 export async function getClientDiagnostics(): Promise<AdapterResult<ClientDiagnostics>> {

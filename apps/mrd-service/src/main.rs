@@ -9,6 +9,7 @@
 // - Shell lifecycle (UI launcher, tray, autostart)
 
 mod app_state;
+mod browser_webcodecs_preview;
 mod browser_webrtc_preview;
 mod capabilities;
 mod capture_source;

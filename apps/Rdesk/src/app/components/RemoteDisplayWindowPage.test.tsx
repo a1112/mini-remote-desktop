@@ -125,6 +125,7 @@ const remoteDisplaySource = {
 describe("RemoteDisplayWindowPage", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
     getMockInvoke().mockReset();
     mockRenderAreaRect();
     mockResizeObserver();
@@ -839,6 +840,37 @@ describe("RemoteDisplayWindowPage", () => {
       screen.getAllByText(/WebCodecs 超低延迟路径需要/)
     ).not.toHaveLength(0);
     expect(screen.getByRole("button", { name: "开始测试" })).toBeDisabled();
+  });
+
+  it("allows WebCodecs ultra-low-latency start when the browser decoder APIs exist", async () => {
+    vi.stubGlobal("VideoDecoder", class {});
+    vi.stubGlobal("EncodedVideoChunk", class {});
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(windowsCapabilities());
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-local-display-test-1",
+          session_id: "local-display-test-1",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: false,
+          render_mode: "web",
+          native_surface_attached: false,
+          session_window_count: 1,
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay("local-display-test-1");
+
+    fireEvent.click(await screen.findByRole("button", { name: "测试配置" }));
+    fireEvent.click(await screen.findByRole("button", { name: "WebCodecs Ultra" }));
+
+    expect(screen.getByRole("button", { name: "开始测试" })).toBeEnabled();
   });
 
   it("blocks high-FPS browser rendering when only the OpenH264 diagnostic fallback is available", async () => {
