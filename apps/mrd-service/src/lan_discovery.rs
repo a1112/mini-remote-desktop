@@ -33,7 +33,7 @@ use std::sync::Arc;
 use std::sync::{Condvar as StdCondvar, Mutex as StdMutex};
 #[cfg(windows)]
 use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock, TryLockError};
-#[cfg(target_os = "macos")]
+#[cfg(any(windows, target_os = "macos"))]
 use std::thread;
 #[cfg(target_os = "macos")]
 use std::time::Instant as StdInstant;
@@ -4800,6 +4800,7 @@ async fn record_lan_decoded_frames(
 enum LanRenderTaskOutcome {
     Rendered {
         upload_duration_ms: f64,
+        lock_wait_ms: f64,
         presented_frames: u64,
         present_skips: u64,
     },
@@ -4863,108 +4864,143 @@ fn spawn_lan_render_worker(
     session_id: SessionId,
     first_frame: RenderFrame,
 ) {
-    tokio::spawn(async move {
-        let mut frame = first_frame;
-        let mut timer_resolution = MediaTimerResolution::default();
-        loop {
-            let render_profile = selected_media_profile(&app_state, &session_id).await;
-            if render_profile_requests_high_resolution_timer(&render_profile) {
-                timer_resolution.request();
-            } else {
-                timer_resolution.release();
-            }
-            pace_lan_render_frame(&app_state, &session_id, &render_profile).await;
-            match render_lan_frame_once(app_state.clone(), session_id.clone(), frame).await {
-                Ok(LanRenderTaskOutcome::Rendered {
-                    upload_duration_ms,
-                    presented_frames,
-                    present_skips,
-                }) => {
-                    {
-                        let mut pipelines = app_state.media_pipelines.lock().await;
+    let fallback_app_state = app_state.clone();
+    let fallback_session_id = session_id.clone();
+    let fallback_first_frame = first_frame.clone();
+    let handle = tokio::runtime::Handle::current();
+    let spawn_result = thread::Builder::new()
+        .name("mrd-lan-render".to_string())
+        .spawn(move || {
+            handle.block_on(run_lan_render_worker(app_state, session_id, first_frame));
+        });
+
+    if let Err(error) = spawn_result {
+        tracing::warn!(
+            %error,
+            session_id = %fallback_session_id.0,
+            "failed to spawn dedicated LAN render thread; falling back to Tokio task"
+        );
+        tokio::spawn(run_lan_render_worker(
+            fallback_app_state,
+            fallback_session_id,
+            fallback_first_frame,
+        ));
+    }
+}
+
+#[cfg(windows)]
+async fn run_lan_render_worker(
+    app_state: Arc<AppState>,
+    session_id: SessionId,
+    first_frame: RenderFrame,
+) {
+    let mut frame = first_frame;
+    let mut timer_resolution = MediaTimerResolution::default();
+    loop {
+        let render_profile = selected_media_profile(&app_state, &session_id).await;
+        if render_profile_requests_high_resolution_timer(&render_profile) {
+            timer_resolution.request();
+        } else {
+            timer_resolution.release();
+        }
+        pace_lan_render_frame(&app_state, &session_id, &render_profile).await;
+        match render_lan_frame_once(app_state.clone(), session_id.clone(), frame).await {
+            Ok(LanRenderTaskOutcome::Rendered {
+                upload_duration_ms,
+                lock_wait_ms,
+                presented_frames,
+                present_skips,
+            }) => {
+                {
+                    let mut pipelines = app_state.media_pipelines.lock().await;
+                    pipelines.record_stage_duration_ms(
+                        session_id.clone(),
+                        "render_upload",
+                        upload_duration_ms,
+                    );
+                    if lock_wait_ms > 0.0 {
                         pipelines.record_stage_duration_ms(
                             session_id.clone(),
-                            "render_upload",
-                            upload_duration_ms,
+                            "render_lock_wait",
+                            lock_wait_ms,
                         );
-                        if presented_frames > 0 {
-                            pipelines.increment_render_presented_frames(
-                                session_id.clone(),
-                                presented_frames,
-                            );
-                            pipelines.record_stage_duration_ms(
-                                session_id.clone(),
-                                "render_present",
-                                upload_duration_ms,
-                            );
-                        }
-                        if present_skips > 0 {
-                            pipelines
-                                .increment_render_present_skips(session_id.clone(), present_skips);
-                        }
                     }
                     if presented_frames > 0 {
-                        let present_gap_ms = app_state
-                            .media_render_queues
-                            .lock()
-                            .await
-                            .record_presented(&session_id, Instant::now())
-                            .map(duration_as_millis);
-                        if let Some(present_gap_ms) = present_gap_ms {
-                            app_state
-                                .media_pipelines
-                                .lock()
-                                .await
-                                .record_stage_duration_ms(
-                                    session_id.clone(),
-                                    "render_present_gap",
-                                    present_gap_ms,
-                                );
-                        }
+                        pipelines.increment_render_presented_frames(
+                            session_id.clone(),
+                            presented_frames,
+                        );
+                        pipelines.record_stage_duration_ms(
+                            session_id.clone(),
+                            "render_present",
+                            upload_duration_ms,
+                        );
+                    }
+                    if present_skips > 0 {
+                        pipelines.increment_render_present_skips(session_id.clone(), present_skips);
                     }
                 }
-                Ok(LanRenderTaskOutcome::Dropped) => {
-                    app_state
-                        .media_pipelines
+                if presented_frames > 0 {
+                    let present_gap_ms = app_state
+                        .media_render_queues
                         .lock()
                         .await
-                        .increment_render_lock_drops(session_id.clone(), 1);
-                }
-                Ok(LanRenderTaskOutcome::Idle) => {}
-                Err(error) => {
-                    tracing::warn!(
-                        %error,
-                        session_id = %session_id.0,
-                        "LAN media receiver failed to present decoded frame"
-                    );
+                        .record_presented(&session_id, Instant::now())
+                        .map(duration_as_millis);
+                    if let Some(present_gap_ms) = present_gap_ms {
+                        app_state
+                            .media_pipelines
+                            .lock()
+                            .await
+                            .record_stage_duration_ms(
+                                session_id.clone(),
+                                "render_present_gap",
+                                present_gap_ms,
+                            );
+                    }
                 }
             }
-
-            let next_frame = app_state
-                .media_render_queues
-                .lock()
-                .await
-                .take_next_or_finish(&session_id);
-            match next_frame {
-                Some(next_frame) => {
-                    app_state
-                        .media_pipelines
-                        .lock()
-                        .await
-                        .record_queue_depth(session_id.clone(), 0);
-                    frame = next_frame;
-                }
-                None => {
-                    app_state
-                        .media_pipelines
-                        .lock()
-                        .await
-                        .record_queue_depth(session_id.clone(), 0);
-                    break;
-                }
+            Ok(LanRenderTaskOutcome::Dropped) => {
+                app_state
+                    .media_pipelines
+                    .lock()
+                    .await
+                    .increment_render_lock_drops(session_id.clone(), 1);
+            }
+            Ok(LanRenderTaskOutcome::Idle) => {}
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    session_id = %session_id.0,
+                    "LAN media receiver failed to present decoded frame"
+                );
             }
         }
-    });
+
+        let next_frame = app_state
+            .media_render_queues
+            .lock()
+            .await
+            .take_next_or_finish(&session_id);
+        match next_frame {
+            Some(next_frame) => {
+                app_state
+                    .media_pipelines
+                    .lock()
+                    .await
+                    .record_queue_depth(session_id.clone(), 0);
+                frame = next_frame;
+            }
+            None => {
+                app_state
+                    .media_pipelines
+                    .lock()
+                    .await
+                    .record_queue_depth(session_id.clone(), 0);
+                break;
+            }
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -5093,7 +5129,6 @@ async fn render_lan_frame_once(
     session_id: SessionId,
     frame: RenderFrame,
 ) -> Result<LanRenderTaskOutcome> {
-    let started = Instant::now();
     let renderers = {
         let render_registry = app_state.media_surface_renderers.lock().await;
         render_registry.renderers_for_session(&session_id)
@@ -5103,22 +5138,29 @@ async fn render_lan_frame_once(
     }
 
     let mut rendered = 0;
+    let mut upload_duration_ms = 0.0_f64;
+    let mut lock_wait_ms = 0.0_f64;
     let mut presented_frames = 0_u64;
     let mut present_skips = 0_u64;
     for renderer in &renderers {
+        let lock_started = Instant::now();
         let Some(mut renderer) =
             wait_for_mutex_guard(renderer.as_ref(), LAN_RENDER_SURFACE_RENDERER_LOCK_TIMEOUT)
                 .map_err(|error| anyhow::anyhow!(error))?
         else {
+            lock_wait_ms += lock_started.elapsed().as_secs_f64() * 1000.0;
             if rendered == 0 {
                 return Ok(LanRenderTaskOutcome::Dropped);
             }
             continue;
         };
+        lock_wait_ms += lock_started.elapsed().as_secs_f64() * 1000.0;
         let before = renderer.snapshot();
+        let upload_started = Instant::now();
         renderer
             .upload_frame(frame.clone())
             .map_err(|error| anyhow::anyhow!("upload frame to D3D11 renderer failed: {error}"))?;
+        upload_duration_ms += upload_started.elapsed().as_secs_f64() * 1000.0;
         let after = renderer.snapshot();
         let uploaded_delta = after
             .uploaded_frame_count
@@ -5143,7 +5185,8 @@ async fn render_lan_frame_once(
 
     if rendered > 0 {
         Ok(LanRenderTaskOutcome::Rendered {
-            upload_duration_ms: started.elapsed().as_secs_f64() * 1000.0,
+            upload_duration_ms,
+            lock_wait_ms,
             presented_frames,
             present_skips,
         })

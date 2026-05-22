@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { getMockInvoke } from "../../test/mocks/tauri";
@@ -505,6 +505,7 @@ describe("RemoteDisplayWindowPage", () => {
             { stage: "sender.encode", p95_ms: 2.4, samples: 20 },
             { stage: "sender.send_datagram", p95_ms: 3.1, samples: 20 },
             { stage: "receiver.decode", p95_ms: 1.2, samples: 20 },
+            { stage: "render_lock_wait", p95_ms: 0.3, samples: 20 },
             { stage: "receiver.present", p95_ms: 4.6, samples: 20 },
           ],
         });
@@ -558,6 +559,8 @@ describe("RemoteDisplayWindowPage", () => {
     expect(screen.getByText("DXGINative")).toBeInTheDocument();
     expect(screen.getByText("渲染丢帧细分")).toBeInTheDocument();
     expect(screen.getByText("队列 1 / 锁 2 / Present 3")).toBeInTheDocument();
+    expect(screen.getByText("渲染锁等待 p95")).toBeInTheDocument();
+    expect(screen.getAllByText("0.30 ms").length).toBeGreaterThan(0);
 
     fireEvent.click(diagnosticsChip);
     fireEvent.mouseLeave(diagnosticsChip.parentElement ?? diagnosticsChip);
@@ -1042,6 +1045,67 @@ describe("RemoteDisplayWindowPage", () => {
           }),
         })
       );
+    });
+  });
+
+  it("uses a stop action inside the test config modal while the local run is active", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(windowsCapabilities());
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-local-display-test-1",
+          session_id: "local-display-test-1",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: false,
+          render_mode: "web",
+          native_surface_attached: false,
+          session_window_count: 1,
+        });
+      }
+      if (command === "test_harness_stop") {
+        return Promise.resolve(null);
+      }
+      if (command === "test_start_run") {
+        return Promise.resolve("run-modal-stop");
+      }
+      if (command === "test_stop_run") {
+        return Promise.resolve(null);
+      }
+      if (command === "test_harness_get_metrics") {
+        return Promise.resolve({
+          is_running: true,
+          capture_fps: 120,
+          frame_count: 12,
+          total_latency_p95_ms: 13,
+          error_message: null,
+        });
+      }
+      if (command === "test_get_run") {
+        return Promise.resolve({ run_id: "run-modal-stop", status: "running", summary: null });
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay("local-display-test-1");
+
+    fireEvent.click(await screen.findByRole("button", { name: "Start local pipeline test" }));
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Stop local pipeline test" })).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "测试配置" }));
+
+    const dialog = await screen.findByRole("dialog", { name: "测试配置" });
+    expect(within(dialog).getByText("当前测试运行中；停止后修改才会影响下一次启动")).toBeInTheDocument();
+    expect(within(dialog).getByRole("button", { name: "FPS 144 FPS" })).toBeDisabled();
+    fireEvent.click(within(dialog).getByRole("button", { name: "停止测试" }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("test_stop_run", { runId: "run-modal-stop" });
     });
   });
 

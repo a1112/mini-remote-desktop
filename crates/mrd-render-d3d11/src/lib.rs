@@ -45,6 +45,12 @@ struct SharedNv12SrvCache {
 }
 
 #[cfg(windows)]
+struct SharedBgraResourceCache {
+    shared_handle: isize,
+    resource: windows::Win32::Graphics::Direct3D11::ID3D11Resource,
+}
+
+#[cfg(windows)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum D3d11PresentStatus {
     Presented,
@@ -112,7 +118,9 @@ float4 main(PsIn input) : SV_TARGET {
 "#;
 
 #[cfg(windows)]
-const SHARED_NV12_SRV_CACHE_LIMIT: usize = 8;
+const SHARED_NV12_SRV_CACHE_LIMIT: usize = 32;
+#[cfg(windows)]
+const SHARED_BGRA_RESOURCE_CACHE_LIMIT: usize = 16;
 
 pub struct D3d11Renderer {
     #[cfg(windows)]
@@ -125,6 +133,8 @@ pub struct D3d11Renderer {
     shared_nv12_pipeline: Option<SharedNv12Pipeline>,
     #[cfg(windows)]
     shared_nv12_srv_cache: Vec<SharedNv12SrvCache>,
+    #[cfg(windows)]
+    shared_bgra_resource_cache: Vec<SharedBgraResourceCache>,
     attached_to_target: bool,
     uploaded_frame_count: u64,
     presented_frame_count: u64,
@@ -199,6 +209,7 @@ impl D3d11Renderer {
                 surface: None,
                 shared_nv12_pipeline: None,
                 shared_nv12_srv_cache: Vec::new(),
+                shared_bgra_resource_cache: Vec::new(),
                 attached_to_target: false,
                 uploaded_frame_count: 0,
                 presented_frame_count: 0,
@@ -464,10 +475,6 @@ impl D3d11Renderer {
         };
 
         unsafe {
-            self.context
-                .OMSetRenderTargets(Some(&[Some(surface.render_target_view.clone())]), None);
-            self.context
-                .ClearRenderTargetView(&surface.render_target_view, &[0.0, 0.0, 0.0, 1.0]);
             self.context.UpdateSubresource(
                 &surface.back_buffer,
                 0,
@@ -606,10 +613,6 @@ impl D3d11Renderer {
         };
 
         unsafe {
-            self.context
-                .OMSetRenderTargets(Some(&[Some(surface.render_target_view.clone())]), None);
-            self.context
-                .ClearRenderTargetView(&surface.render_target_view, &[0.0, 0.0, 0.0, 1.0]);
             self.context.UpdateSubresource(
                 &surface.back_buffer,
                 0,
@@ -790,6 +793,41 @@ impl D3d11Renderer {
     }
 
     #[cfg(windows)]
+    fn shared_bgra_resource(
+        &mut self,
+        shared_handle: isize,
+    ) -> Result<windows::Win32::Graphics::Direct3D11::ID3D11Resource, RenderError> {
+        if let Some(position) = self
+            .shared_bgra_resource_cache
+            .iter()
+            .position(|cache| cache.shared_handle == shared_handle)
+        {
+            let cache = self.shared_bgra_resource_cache.remove(position);
+            let resource = cache.resource.clone();
+            self.shared_bgra_resource_cache.push(cache);
+            return Ok(resource);
+        }
+
+        let texture = self.open_shared_texture(shared_handle)?;
+        let resource: windows::Win32::Graphics::Direct3D11::ID3D11Resource =
+            texture.cast().map_err(|error| {
+                RenderError::Message(format!(
+                    "cast shared BGRA texture to resource failed: {error}"
+                ))
+            })?;
+        self.shared_bgra_resource_cache
+            .push(SharedBgraResourceCache {
+                shared_handle,
+                resource: resource.clone(),
+            });
+        while self.shared_bgra_resource_cache.len() > SHARED_BGRA_RESOURCE_CACHE_LIMIT {
+            self.shared_bgra_resource_cache.remove(0);
+        }
+
+        Ok(resource)
+    }
+
+    #[cfg(windows)]
     fn shared_nv12_srvs(
         &mut self,
         y_handle: isize,
@@ -829,7 +867,7 @@ impl D3d11Renderer {
 
     #[cfg(windows)]
     fn present_shared_bgra_frame(
-        &self,
+        &mut self,
         frame: &RenderFrame,
     ) -> Result<D3d11PresentStatus, RenderError> {
         use mrd_render::RenderFrameData;
@@ -838,6 +876,10 @@ impl D3d11Renderer {
         let Some(surface) = self.surface.as_ref() else {
             return Ok(D3d11PresentStatus::NoTarget);
         };
+        let surface_width = surface.width;
+        let surface_height = surface.height;
+        let back_buffer = surface.back_buffer.clone();
+        let swap_chain = surface.swap_chain.clone();
 
         let shared_handle = match &frame.data {
             RenderFrameData::D3D11SharedBgra { shared_handle, .. } => *shared_handle,
@@ -848,26 +890,19 @@ impl D3d11Renderer {
             }
         };
 
-        let source_texture = self.open_shared_texture(shared_handle)?;
-        let source_resource: ID3D11Resource = source_texture.cast().map_err(|error| {
-            RenderError::Message(format!(
-                "cast shared BGRA texture to resource failed: {error}"
-            ))
-        })?;
-        let target_resource: ID3D11Resource = surface.back_buffer.cast().map_err(|error| {
+        let source_resource = self.shared_bgra_resource(shared_handle)?;
+        let target_resource: ID3D11Resource = back_buffer.cast().map_err(|error| {
             RenderError::Message(format!("cast back buffer to resource failed: {error}"))
         })?;
 
-        let copy_width = frame.width.min(surface.width as usize);
-        let copy_height = frame.height.min(surface.height as usize);
+        let copy_width = frame.width.min(surface_width as usize);
+        let copy_height = frame.height.min(surface_height as usize);
         if copy_width == 0 || copy_height == 0 {
             return Ok(D3d11PresentStatus::NoTarget);
         }
 
         unsafe {
-            self.context
-                .OMSetRenderTargets(Some(&[Some(surface.render_target_view.clone())]), None);
-            if frame.width == surface.width as usize && frame.height == surface.height as usize {
+            if frame.width == surface_width as usize && frame.height == surface_height as usize {
                 self.context
                     .CopyResource(&target_resource, &source_resource);
             } else {
@@ -891,7 +926,7 @@ impl D3d11Renderer {
                 );
             }
         }
-        Self::present_swap_chain(&surface.swap_chain)
+        Self::present_swap_chain(&swap_chain)
     }
 
     #[cfg(windows)]

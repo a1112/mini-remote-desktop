@@ -1557,8 +1557,10 @@ function TileOptionGroup<T extends string>({
               type="button"
               aria-label={`${label} ${option.label}`}
               className={`min-h-8 rounded-md border px-2 py-1 text-[11px] font-medium transition ${
-                selected
-                  ? "border-cyan-300/60 bg-cyan-500/20 text-cyan-50"
+                selected && optionDisabled
+                  ? "cursor-not-allowed border-cyan-300/30 bg-cyan-500/10 text-cyan-100/60"
+                  : selected
+                    ? "border-cyan-300/60 bg-cyan-500/20 text-cyan-50"
                   : optionDisabled
                     ? "cursor-not-allowed border-white/8 bg-white/[0.03] text-slate-600"
                     : "border-white/10 bg-white/[0.03] text-slate-200 hover:border-cyan-300/45 hover:bg-cyan-500/12"
@@ -1606,8 +1608,10 @@ function MultiTileOptionGroup<T extends string>({
               type="button"
               aria-label={`${label} ${option.label}`}
               className={`min-h-8 rounded-md border px-2 py-1 text-[11px] font-medium transition ${
-                selected
-                  ? "border-violet-300/60 bg-violet-500/20 text-violet-50"
+                selected && optionDisabled
+                  ? "cursor-not-allowed border-violet-300/30 bg-violet-500/10 text-violet-100/60"
+                  : selected
+                    ? "border-violet-300/60 bg-violet-500/20 text-violet-50"
                   : optionDisabled
                     ? "cursor-not-allowed border-white/8 bg-white/[0.03] text-slate-600"
                     : "border-white/10 bg-white/[0.03] text-slate-200 hover:border-violet-300/45 hover:bg-violet-500/12"
@@ -2248,6 +2252,10 @@ export function RemoteDisplayWindowPage() {
     "render_present",
     "present",
     "render",
+  ]);
+  const stageRenderLockWaitP95Ms = findStageP95(mediaPipelineSnapshot, [
+    "receiver.render_lock_wait",
+    "render_lock_wait",
   ]);
   const diagnosticsFps =
     probeSnapshot?.current_fps ??
@@ -3034,12 +3042,16 @@ export function RemoteDisplayWindowPage() {
   }, []);
 
   const switchToNativeRender = useCallback(() => {
+    if (localRenderSwitchLocked) {
+      setTestMessage("请先停止测试再切换 native 渲染路径");
+      return;
+    }
     if (!nativeRendererAvailableForHost) return;
     closeWebPreviewPeer();
     setWebPreviewMode("idle");
     setWebPreviewEngine("webrtc");
     setRenderMode(nativeRenderMode);
-  }, [closeWebPreviewPeer, nativeRenderMode, nativeRendererAvailableForHost]);
+  }, [closeWebPreviewPeer, localRenderSwitchLocked, nativeRenderMode, nativeRendererAvailableForHost]);
 
   const switchToD3d12Render = useCallback(() => {
     if (!d3d12RendererAvailable || localRenderSwitchLocked) return;
@@ -4055,6 +4067,10 @@ export function RemoteDisplayWindowPage() {
   };
 
   const applyLowLatencyProfile = useCallback(() => {
+    if (localRenderSwitchLocked) {
+      setTestMessage("请先停止测试再切换低延迟预设");
+      return;
+    }
     setWebPreviewEngine("webrtc");
     if (hostOs === "macos") {
       setCapture("macos");
@@ -4106,7 +4122,7 @@ export function RemoteDisplayWindowPage() {
         ? "d3d11_native"
         : "web"
     );
-  }, [capabilities, hostOs]);
+  }, [capabilities, hostOs, localRenderSwitchLocked]);
 
   const applyBrowserWebRtc2k144LowLatencyProfile = useCallback(() => {
     if (browserWebRtc2k144BlockReason) {
@@ -5293,6 +5309,7 @@ export function RemoteDisplayWindowPage() {
                           diagnosticsRenderLockDrops
                         )} / Present ${formatCount(diagnosticsRenderPresentSkips)}`,
                       ],
+                      ["渲染锁等待 p95", formatMs(stageRenderLockWaitP95Ms)],
                       ["队列深度", formatCount(diagnosticsQueueDepth)],
                       ["码率", formatMbps(diagnosticsBitrateMbps)],
                     ]}
@@ -5368,6 +5385,9 @@ export function RemoteDisplayWindowPage() {
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 px-4"
           style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}
           data-no-drag="true"
+          role="dialog"
+          aria-modal="true"
+          aria-label="测试配置"
         >
           <div className="flex max-h-[calc(100vh-2rem)] w-full max-w-5xl flex-col rounded-lg border border-white/10 bg-[#0f1724] shadow-2xl">
             <div className="flex items-center justify-between border-b border-white/10 px-4 py-3">
@@ -5503,6 +5523,11 @@ export function RemoteDisplayWindowPage() {
             </div>
 
             <div className="min-h-0 space-y-3 overflow-y-auto px-4 py-4">
+              {localRenderSwitchLocked && (
+                <div className="rounded-lg border border-amber-400/25 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-100">
+                  当前测试运行中；停止后修改才会影响下一次启动
+                </div>
+              )}
               <div className="grid gap-3 lg:grid-cols-[1.2fr_1fr]">
                 <div className="rounded-lg border border-white/10 bg-black/18 p-3">
                   <div className="mb-2 flex items-center justify-between gap-2">
@@ -5714,8 +5739,10 @@ export function RemoteDisplayWindowPage() {
               </div>
               <div className="flex items-center gap-2">
                 <button
-                  className="rounded-md border border-cyan-400/30 px-3 py-1.5 text-[11px] font-medium text-cyan-100 hover:bg-cyan-500/15"
+                  className="rounded-md border border-cyan-400/30 px-3 py-1.5 text-[11px] font-medium text-cyan-100 hover:bg-cyan-500/15 disabled:cursor-not-allowed disabled:opacity-45"
                   onClick={applyLowLatencyProfile}
+                  disabled={localRenderSwitchLocked}
+                  title={configChangeLockedTitle ?? "切换本机低延迟预设"}
                 >
                   Low latency
                 </button>
@@ -5754,21 +5781,34 @@ export function RemoteDisplayWindowPage() {
                   关闭
                 </button>
                 <button
-                  className="inline-flex items-center gap-2 rounded-md bg-cyan-500 px-3 py-1.5 text-[11px] font-medium text-white hover:bg-cyan-400 disabled:opacity-50"
-                  onClick={() => void handleStartTest()}
-                  disabled={
-                    testStatus === "starting" ||
-                    testStatus === "stopping" ||
-                    Boolean(localStartBlockReason)
+                  className={`inline-flex items-center gap-2 rounded-md px-3 py-1.5 text-[11px] font-medium text-white disabled:opacity-50 ${
+                    isLocalPipelinePreview && isTestBusy
+                      ? "bg-red-500/90 hover:bg-red-400"
+                      : "bg-cyan-500 hover:bg-cyan-400"
+                  }`}
+                  onClick={() =>
+                    void (isLocalPipelinePreview && isTestBusy
+                      ? handleStopTest()
+                      : handleStartTest())
                   }
-                  title={localStartBlockReason ?? undefined}
+                  disabled={
+                    testStatus === "stopping" ||
+                    (!isTestBusy && Boolean(localStartBlockReason))
+                  }
+                  title={
+                    isLocalPipelinePreview && isTestBusy
+                      ? "停止当前测试后才能切换配置"
+                      : localStartBlockReason ?? undefined
+                  }
                 >
-                  {testStatus === "starting" ? (
+                  {testStatus === "starting" || testStatus === "stopping" ? (
                     <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : isLocalPipelinePreview && isTestBusy ? (
+                    <Square className="h-3 w-3" />
                   ) : (
                     <Play className="h-3.5 w-3.5" />
                   )}
-                  开始测试
+                  {isLocalPipelinePreview && isTestBusy ? "停止测试" : "开始测试"}
                 </button>
               </div>
             </div>
