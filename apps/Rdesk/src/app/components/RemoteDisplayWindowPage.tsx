@@ -67,7 +67,13 @@ import { withTauriWindow } from "../utils/tauriWindow";
 type RenderMode = "web" | "d3d11_native" | "d3d12_native" | "metal_native" | "linux_native";
 type HostOs = "macos" | "windows" | "linux" | "other";
 type TransportKind = NonNullable<TestMatrixConfig["transport"]>;
-type ResolutionKey = "1280x720" | "1920x1080" | "2560x1440" | "2560x1600" | "3440x1440";
+type ResolutionKey =
+  | "1280x720"
+  | "1920x1080"
+  | "2560x1440"
+  | "2560x1600"
+  | "3440x1440"
+  | "3840x2160";
 type FpsKey = "30" | "60" | "120" | "144" | "165" | "180" | "249";
 type BitrateKey = "8" | "20" | "50" | "80" | "100" | "120";
 type TestStatus = "idle" | "starting" | "running" | "stopping" | "completed" | "failed";
@@ -333,6 +339,7 @@ const resolutionOptions: Option<ResolutionKey>[] = [
   { value: "2560x1440", label: "1440p" },
   { value: "2560x1600", label: "1600p" },
   { value: "3440x1440", label: "UWQHD" },
+  { value: "3840x2160", label: "4K" },
 ];
 
 const fpsOptions: Option<FpsKey>[] = [
@@ -4698,6 +4705,7 @@ export function RemoteDisplayWindowPage() {
     ? "connected"
     : sessionSnapshot?.state ?? "loading";
   const isBrowserBridgeRemote = !isTauriRuntime() && !isLocalPipelinePreview;
+  const showDesktopWindowControls = isTauriRuntime();
   const webPreviewUsesVideo =
     isLocalPipelinePreview &&
     !isNative &&
@@ -5246,27 +5254,31 @@ export function RemoteDisplayWindowPage() {
               </div>
             ) : null}
           </div>
-          <button
-            onClick={() => void withTauriWindow((appWindow) => appWindow.minimize())}
-            className="inline-flex h-8 w-9 items-center justify-center rounded-sm text-slate-400 hover:bg-white/10 hover:text-white"
-            title="Minimize"
-          >
-            <Minimize className="h-4 w-4" />
-          </button>
-          <button
-            onClick={() => void handleToggleMaximize()}
-            className="inline-flex h-8 w-9 items-center justify-center rounded-sm text-slate-400 hover:bg-white/10 hover:text-white"
-            title={isMaximized ? "Restore" : "Maximize"}
-          >
-            {isMaximized ? <Square className="h-3 w-3" /> : <Maximize2 className="h-3.5 w-3.5" />}
-          </button>
-          <button
-            onClick={() => void handleClose()}
-            className="inline-flex h-8 w-9 items-center justify-center rounded-sm text-slate-400 hover:bg-red-500 hover:text-white"
-            title="Close"
-          >
-            <X className="h-4 w-4" />
-          </button>
+          {showDesktopWindowControls ? (
+            <>
+              <button
+                onClick={() => void withTauriWindow((appWindow) => appWindow.minimize())}
+                className="inline-flex h-8 w-9 items-center justify-center rounded-sm text-slate-400 hover:bg-white/10 hover:text-white"
+                title="Minimize"
+              >
+                <Minimize className="h-4 w-4" />
+              </button>
+              <button
+                onClick={() => void handleToggleMaximize()}
+                className="inline-flex h-8 w-9 items-center justify-center rounded-sm text-slate-400 hover:bg-white/10 hover:text-white"
+                title={isMaximized ? "Restore" : "Maximize"}
+              >
+                {isMaximized ? <Square className="h-3 w-3" /> : <Maximize2 className="h-3.5 w-3.5" />}
+              </button>
+              <button
+                onClick={() => void handleClose()}
+                className="inline-flex h-8 w-9 items-center justify-center rounded-sm text-slate-400 hover:bg-red-500 hover:text-white"
+                title="Close"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </>
+          ) : null}
         </div>
       </div>
 

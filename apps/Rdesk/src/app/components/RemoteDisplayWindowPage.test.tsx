@@ -16,8 +16,10 @@ import {
   summarizeWebRtcInboundVideoStats,
 } from "./RemoteDisplayWindowPage";
 
+const runtimeMock = vi.hoisted(() => ({ isTauri: true }));
+
 vi.mock("../utils/runtime", () => ({
-  isTauriRuntime: () => true,
+  isTauriRuntime: () => runtimeMock.isTauri,
 }));
 
 vi.mock("../utils/tauriWindow", () => ({
@@ -131,6 +133,7 @@ describe("RemoteDisplayWindowPage", () => {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
     getMockInvoke().mockReset();
+    runtimeMock.isTauri = true;
     mockRenderAreaRect();
     mockResizeObserver();
   });
@@ -495,7 +498,7 @@ describe("RemoteDisplayWindowPage", () => {
     });
   });
 
-  it("exposes 180 and 249 FPS high-refresh profile options", async () => {
+  it("exposes 4K and high-refresh profile options", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
       if (command === "test_get_capabilities") {
@@ -530,6 +533,7 @@ describe("RemoteDisplayWindowPage", () => {
     renderRemoteDisplay("local-display-test-1");
 
     fireEvent.click(await screen.findByRole("button", { name: "测试配置" }));
+    expect(await screen.findByText("4K")).toBeInTheDocument();
     expect(await screen.findByText("180 FPS")).toBeInTheDocument();
     expect(screen.getByText("249 FPS")).toBeInTheDocument();
   });
@@ -1033,6 +1037,24 @@ describe("RemoteDisplayWindowPage", () => {
     expect(screen.getByText("1 dropped")).toBeInTheDocument();
     expect(screen.getByText("运行配置")).toBeInTheDocument();
     expect(screen.getByText("阶段 P95")).toBeInTheDocument();
+  });
+
+  it("hides desktop window controls in the browser display path", async () => {
+    runtimeMock.isTauri = false;
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(windowsCapabilities());
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay("local-display-test-1");
+
+    expect(await screen.findByRole("button", { name: "测试配置" })).toBeInTheDocument();
+    expect(screen.queryByTitle("Minimize")).not.toBeInTheDocument();
+    expect(screen.queryByTitle("Maximize")).not.toBeInTheDocument();
+    expect(screen.queryByTitle("Close")).not.toBeInTheDocument();
   });
 
   it("allows WebCodecs ultra-low-latency start when the browser decoder APIs exist", async () => {
