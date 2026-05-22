@@ -44,6 +44,7 @@ import {
   type RemoteDisplayWindowContext,
   type TestConfig,
   type TestMatrixConfig,
+  type TestRun,
 } from "../adapters/tauri";
 import {
   getProbeSnapshot,
@@ -71,6 +72,11 @@ type TestStatus = "idle" | "starting" | "running" | "stopping" | "completed" | "
 type WebPreviewMode = "idle" | "connecting" | "webrtc" | "webcodecs" | "failed";
 type WebPreviewEngine = "webrtc" | "webcodecs";
 type CaptureSourcePickerMode = "dropdown" | "modal";
+type LocalTestDurationMode = "30s" | "60s" | "manual";
+type MatrixDimensionKey = "capture" | "encoder" | "resolution" | "fps" | "bitrate";
+type LocalTestSelection = Partial<LocalWebViewProfile> & {
+  resolution?: ResolutionKey;
+};
 
 const METRICS_POLL_MS = 500;
 const WEB_PREVIEW_CONNECT_TIMEOUT_MS = 8_000;
@@ -337,6 +343,20 @@ const captureSourcePickerOptions: Option<CaptureSourcePickerMode>[] = [
   { value: "modal", label: "弹窗选择" },
 ];
 
+const localTestDurationOptions: Option<LocalTestDurationMode>[] = [
+  { value: "30s", label: "30S" },
+  { value: "60s", label: "60S" },
+  { value: "manual", label: "手动停止" },
+];
+
+const matrixDimensionOptions: Option<MatrixDimensionKey>[] = [
+  { value: "capture", label: "CAP" },
+  { value: "encoder", label: "ENC" },
+  { value: "resolution", label: "SIZE" },
+  { value: "fps", label: "FPS" },
+  { value: "bitrate", label: "BR" },
+];
+
 export function browserWebrtcPreviewH264Profile(
   encoder: EncoderType,
   _decoder: DecoderType
@@ -442,6 +462,24 @@ function formatPercent(value: number) {
 
 function formatCount(value?: number | null) {
   return typeof value === "number" ? value.toLocaleString() : "-";
+}
+
+function localTestDurationMs(mode: LocalTestDurationMode): number {
+  if (mode === "60s") return 60_000;
+  if (mode === "manual") return 24 * 60 * 60 * 1000;
+  return 30_000;
+}
+
+function formatSummaryFps(value?: number | null) {
+  return typeof value === "number" ? `${value.toFixed(1)} FPS` : "-";
+}
+
+function formatSummaryMs(value?: number | null) {
+  return typeof value === "number" ? `${value.toFixed(1)} ms` : "-";
+}
+
+function formatDropped(value?: number | null) {
+  return typeof value === "number" ? `${value.toLocaleString()} dropped` : "-";
 }
 
 function percentile(values: number[], percentileValue: number) {
@@ -1246,23 +1284,30 @@ function TitleSelect<T extends string>({
   value,
   options,
   onChange,
+  disabled = false,
+  title,
   className = "",
 }: {
   label: string;
   value: T;
   options: Option<T>[];
   onChange: (value: T) => void;
+  disabled?: boolean;
+  title?: string;
   className?: string;
 }) {
   return (
     <label
-      className={`flex h-9 min-w-0 items-center gap-1 rounded-md border border-white/10 bg-black/20 px-2 text-[10px] text-slate-400 ${className}`}
-      title={label}
+      className={`flex h-9 min-w-0 items-center gap-1 rounded-md border border-white/10 bg-black/20 px-2 text-[10px] text-slate-400 ${
+        disabled ? "opacity-60" : ""
+      } ${className}`}
+      title={title ?? label}
     >
       <span className="shrink-0 uppercase tracking-normal">{label}</span>
       <select
-        className="min-w-0 bg-transparent text-[11px] font-medium text-slate-100 outline-none"
+        className="min-w-0 bg-transparent text-[11px] font-medium text-slate-100 outline-none disabled:cursor-not-allowed disabled:text-slate-500"
         value={value}
+        disabled={disabled}
         onChange={(event) => onChange(event.target.value as T)}
       >
         {options.map((option) => (
@@ -1294,6 +1339,107 @@ function ReadonlyTitleValue({
         {value}
       </span>
     </div>
+  );
+}
+
+function TileOptionGroup<T extends string>({
+  label,
+  value,
+  options,
+  onChange,
+  disabled = false,
+  title,
+}: {
+  label: string;
+  value: T;
+  options: Array<Option<T> & { disabledReason?: string | null }>;
+  onChange: (value: T) => void;
+  disabled?: boolean;
+  title?: string;
+}) {
+  return (
+    <section
+      className="min-w-0 rounded-lg border border-white/10 bg-black/18 p-2"
+      title={title ?? label}
+    >
+      <div className="mb-2 text-[10px] font-semibold uppercase tracking-normal text-slate-400">
+        {label}
+      </div>
+      <div className="flex flex-wrap gap-1.5">
+        {options.map((option) => {
+          const optionDisabled = disabled || Boolean(option.disabledReason);
+          const selected = option.value === value;
+          return (
+            <button
+              key={option.value}
+              type="button"
+              aria-label={`${label} ${option.label}`}
+              className={`min-h-8 rounded-md border px-2 py-1 text-[11px] font-medium transition ${
+                selected
+                  ? "border-cyan-300/60 bg-cyan-500/20 text-cyan-50"
+                  : optionDisabled
+                    ? "cursor-not-allowed border-white/8 bg-white/[0.03] text-slate-600"
+                    : "border-white/10 bg-white/[0.03] text-slate-200 hover:border-cyan-300/45 hover:bg-cyan-500/12"
+              }`}
+              disabled={optionDisabled}
+              title={option.disabledReason ?? title ?? option.label}
+              onClick={() => onChange(option.value)}
+            >
+              {option.label}
+            </button>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+function MultiTileOptionGroup<T extends string>({
+  label,
+  values,
+  options,
+  onToggle,
+  disabled = false,
+  title,
+}: {
+  label: string;
+  values: readonly T[];
+  options: Array<Option<T> & { disabledReason?: string | null }>;
+  onToggle: (value: T) => void;
+  disabled?: boolean;
+  title?: string;
+}) {
+  return (
+    <section className="rounded-lg border border-white/10 bg-black/18 p-2" title={title ?? label}>
+      <div className="mb-2 text-[10px] font-semibold uppercase tracking-normal text-slate-400">
+        {label}
+      </div>
+      <div className="flex flex-wrap gap-1.5">
+        {options.map((option) => {
+          const optionDisabled = disabled || Boolean(option.disabledReason);
+          const selected = values.includes(option.value);
+          return (
+            <button
+              key={option.value}
+              type="button"
+              aria-label={`${label} ${option.label}`}
+              className={`min-h-8 rounded-md border px-2 py-1 text-[11px] font-medium transition ${
+                selected
+                  ? "border-violet-300/60 bg-violet-500/20 text-violet-50"
+                  : optionDisabled
+                    ? "cursor-not-allowed border-white/8 bg-white/[0.03] text-slate-600"
+                    : "border-white/10 bg-white/[0.03] text-slate-200 hover:border-violet-300/45 hover:bg-violet-500/12"
+              }`}
+              disabled={optionDisabled}
+              title={option.disabledReason ?? title ?? option.label}
+              onClick={() => onToggle(option.value)}
+            >
+              {option.label}
+            </button>
+          );
+        })}
+      </div>
+    </section>
   );
 }
 
@@ -1436,6 +1582,9 @@ export function RemoteDisplayWindowPage() {
   const syncTimerIdsRef = useRef<number[]>([]);
   const webPreviewVideoRef = useRef<HTMLVideoElement | null>(null);
   const webCodecsCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const webCodecsTransferredCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const webCodecsWorkerInitRetryRef = useRef(0);
+  const webCodecsMainCanvasRecoveringRef = useRef(false);
   const webPreviewPeerRef = useRef<RTCPeerConnection | null>(null);
   const webPreviewSessionRef = useRef<string | null>(null);
   const webRtcStatsCountersRef = useRef<WebRtcInboundVideoCounters | null>(null);
@@ -1445,6 +1594,7 @@ export function RemoteDisplayWindowPage() {
   const linuxNativeProfileAppliedRef = useRef(false);
   const diagnosticsCurrentRef = useRef<DiagnosticsSample | null>(null);
   const diagnosticsPopoverRef = useRef<HTMLDivElement | null>(null);
+  const matrixStopRequestedRef = useRef(false);
 
   const [context, setContext] = useState<RemoteDisplayWindowContext | null>(null);
   const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
@@ -1470,10 +1620,19 @@ export function RemoteDisplayWindowPage() {
   const [testSettingsOpen, setTestSettingsOpen] = useState(false);
   const [testStatus, setTestStatus] = useState<TestStatus>("idle");
   const [currentRunId, setCurrentRunId] = useState<string | null>(null);
+  const [lastCompletedRun, setLastCompletedRun] = useState<TestRun | null>(null);
   const [metrics, setMetrics] = useState<HarnessMetrics | null>(null);
+  const [durationMode, setDurationMode] = useState<LocalTestDurationMode>("30s");
+  const [matrixModeEnabled, setMatrixModeEnabled] = useState(false);
+  const [matrixDimensions, setMatrixDimensions] =
+    useState<MatrixDimensionKey[]>(["fps"]);
+  const [matrixRunProgress, setMatrixRunProgress] =
+    useState<{ current: number; total: number; label: string } | null>(null);
+  const [queryProfileAppliedKey, setQueryProfileAppliedKey] = useState<string | null>(null);
   const [webPreviewMode, setWebPreviewMode] = useState<WebPreviewMode>("idle");
   const [webPreviewEngine, setWebPreviewEngine] = useState<WebPreviewEngine>("webrtc");
   const [webPreviewError, setWebPreviewError] = useState<string | null>(null);
+  const [webCodecsCanvasEpoch, setWebCodecsCanvasEpoch] = useState(0);
   const [webVideoFps, setWebVideoFps] = useState<number | null>(null);
   const [webPaintFps, setWebPaintFps] = useState<number | null>(null);
   const [webFrameIntervalP95Ms, setWebFrameIntervalP95Ms] = useState<number | null>(null);
@@ -1513,10 +1672,17 @@ export function RemoteDisplayWindowPage() {
   const requestedResolution = useMemo(() => resolutionFromSearch(searchParams), [searchParams]);
   const requestedFps = useMemo(() => fpsFromSearch(searchParams), [searchParams]);
   const requestedBitrate = useMemo(() => bitrateFromSearch(searchParams), [searchParams]);
+  const queryProfileKey = useMemo(
+    () =>
+      requestedResolution !== null || requestedFps !== null || requestedBitrate !== null
+        ? `${sessionId}:${requestedResolution ?? ""}:${requestedFps ?? ""}:${
+            requestedBitrate ?? ""
+          }`
+        : null,
+    [requestedBitrate, requestedFps, requestedResolution, sessionId]
+  );
   const queryProfileNeedsApply =
-    (requestedResolution !== null && requestedResolution !== resolution) ||
-    (requestedFps !== null && requestedFps !== fps) ||
-    (requestedBitrate !== null && requestedBitrate !== bitrate);
+    queryProfileKey !== null && queryProfileAppliedKey !== queryProfileKey;
   const explicitBrowser2k144LowLatencyProfile =
     renderMode === "web" &&
     webPreviewEngine === "webrtc" &&
@@ -1609,6 +1775,16 @@ export function RemoteDisplayWindowPage() {
         : encoderOptions,
     [capabilities]
   );
+  const browserPreviewEncoderOptions = useMemo(() => {
+    const targetFps = Number(fps);
+    const needsHardwareH264 = Number.isFinite(targetFps) && targetFps > 30;
+    const allowed = visibleEncoderOptions.filter((option) => {
+      if (!isH264PreviewEncoder(option.value)) return false;
+      if (!needsHardwareH264) return true;
+      return option.value === "nvenc_h264" || option.value === "videotoolbox_h264";
+    });
+    return allowed.length > 0 ? allowed : visibleEncoderOptions;
+  }, [fps, visibleEncoderOptions]);
   const visibleDecoderOptions = useMemo(
     () =>
       capabilities?.available_decoders?.length
@@ -1616,6 +1792,148 @@ export function RemoteDisplayWindowPage() {
         : decoderOptions,
     [capabilities]
   );
+  const activeEncoderOptions =
+    isLocalPipelinePreview && renderMode === "web"
+      ? browserPreviewEncoderOptions
+      : visibleEncoderOptions;
+  const browserEncoderConstraintTitle =
+    isLocalPipelinePreview && renderMode === "web"
+      ? Number(fps) > 30
+        ? "网页渲染路径当前只接入 H.264；高帧率需要硬件 H.264，HEVC/AV1/OpenH264 不进入该路径。"
+        : "网页渲染路径当前只接入 H.264 access unit，HEVC/AV1 尚未接入浏览器预览路径。"
+      : undefined;
+  const selectedDurationMs = localTestDurationMs(durationMode);
+  const activeEncoderValues = useMemo(
+    () => new Set(activeEncoderOptions.map((option) => option.value)),
+    [activeEncoderOptions]
+  );
+  const captureTileOptions = useMemo(
+    () =>
+      captureOptions.map((option) => ({
+        ...option,
+        disabledReason:
+          capabilities?.available_captures?.length &&
+          !capabilities.available_captures.includes(option.value)
+            ? "当前平台能力未报告该采集路径"
+            : null,
+      })),
+    [capabilities]
+  );
+  const encoderTileOptions = useMemo(
+    () =>
+      encoderOptions.map((option) => ({
+        ...option,
+        disabledReason: capabilities?.available_encoders?.length &&
+          !capabilities.available_encoders.includes(option.value)
+          ? "当前平台能力未报告该编码器"
+          : isLocalPipelinePreview &&
+              renderMode === "web" &&
+              !activeEncoderValues.has(option.value)
+            ? browserEncoderConstraintTitle ??
+              "当前网页渲染路径未接入该编码器"
+            : null,
+      })),
+    [activeEncoderValues, browserEncoderConstraintTitle, capabilities, isLocalPipelinePreview, renderMode]
+  );
+  const decoderTileOptions = useMemo(
+    () =>
+      decoderOptions.map((option) => ({
+        ...option,
+        disabledReason:
+          capabilities?.available_decoders?.length &&
+          !capabilities.available_decoders.includes(option.value)
+            ? "当前平台能力未报告该解码器"
+            : null,
+      })),
+    [capabilities]
+  );
+  const durationTileOptions = useMemo(
+    () =>
+      localTestDurationOptions.map((option) => ({
+        ...option,
+        disabledReason:
+          matrixModeEnabled && option.value === "manual"
+            ? "多选矩阵需要固定时长；手动停止仅用于单次测试"
+            : null,
+      })),
+    [matrixModeEnabled]
+  );
+  const browserWebViewFpsLimitReason = `Web View 当前接入上限为 ${WEB_VIEW_MAX_FPS} FPS；更高档位需要 native 渲染或后续浏览器媒体链路。`;
+  const browserHardwareH264Available = useMemo(() => {
+    if (!capabilities?.available_encoders?.length) return true;
+    const hardwareEncoders =
+      hostOs === "macos" ? ["videotoolbox_h264"] : ["nvenc_h264"];
+    return hardwareEncoders.some((encoder) =>
+      capabilities.available_encoders.includes(encoder)
+    );
+  }, [capabilities, hostOs]);
+  const fpsTileOptions = useMemo(
+    () =>
+      fpsOptions.map((option) => ({
+        ...option,
+        disabledReason:
+          isLocalPipelinePreview &&
+          renderMode === "web" &&
+          Number(option.value) > WEB_VIEW_MAX_FPS
+            ? browserWebViewFpsLimitReason
+            : isLocalPipelinePreview &&
+                renderMode === "web" &&
+                Number(option.value) > 30 &&
+                !browserHardwareH264Available
+              ? "网页高帧率预览需要硬件 H.264 编码器；当前平台只允许 30 FPS 诊断档。"
+              : null,
+      })),
+    [
+      browserHardwareH264Available,
+      browserWebViewFpsLimitReason,
+      isLocalPipelinePreview,
+      renderMode,
+    ]
+  );
+  const bitrateTileOptions = useMemo(
+    () =>
+      bitrateOptions.map((option) => ({
+        ...option,
+        disabledReason:
+          isLocalPipelinePreview &&
+          renderMode === "web" &&
+          requestedBitrate === null &&
+          !explicitBrowser2k144LowLatencyProfile &&
+          Number(fpsForWebView(fps)) >= 120 &&
+          Number(option.value) > 8
+            ? "当前 Web View 高帧率默认保护档会把码率限制到 8 Mbps；使用 2K144 预设或 URL 显式码率可运行更高码率。"
+            : null,
+      })),
+    [
+      explicitBrowser2k144LowLatencyProfile,
+      fps,
+      isLocalPipelinePreview,
+      renderMode,
+      requestedBitrate,
+    ]
+  );
+  const resolutionTileOptions = useMemo(
+    () =>
+      resolutionOptions.map((option) => ({
+        ...option,
+        disabledReason: null,
+      })),
+    []
+  );
+
+  useEffect(() => {
+    if (!isLocalPipelinePreview || renderMode !== "web") return;
+    const firstOption = activeEncoderOptions[0];
+    if (!firstOption) return;
+    if (activeEncoderOptions.some((option) => option.value === encoder)) return;
+    setEncoder(firstOption.value);
+  }, [activeEncoderOptions, encoder, isLocalPipelinePreview, renderMode]);
+
+  useEffect(() => {
+    if (matrixModeEnabled && durationMode === "manual") {
+      setDurationMode("30s");
+    }
+  }, [durationMode, matrixModeEnabled]);
 
   useEffect(() => {
     if (isHevcEncoder(encoder) && transport === "webrtc") {
@@ -1962,14 +2280,15 @@ export function RemoteDisplayWindowPage() {
       )} / ${optionLabel(bitrateOptions, bitrate)}`,
     [bitrate, capture, displayDecoderLabel, displayTransportLabel, encoder, fps, resolution]
   );
-  const buildTestConfig = useCallback((rendererTargetHwnd?: string | null, selection?: Partial<LocalWebViewProfile>) => {
+  const buildTestConfig = useCallback((rendererTargetHwnd?: string | null, selection?: LocalTestSelection) => {
     const selectedCapture = selection?.capture ?? capture;
     const selectedEncoder = selection?.encoder ?? encoder;
     const selectedDecoder = selection?.decoder ?? decoder;
     const selectedTransport = selection?.transport ?? transport;
     const selectedFps = selection?.fps ?? fps;
     const selectedBitrate = selection?.bitrate ?? bitrate;
-    const [width, height] = resolution.split("x").map(Number) as [number, number];
+    const selectedResolution = selection?.resolution ?? resolution;
+    const [width, height] = selectedResolution.split("x").map(Number) as [number, number];
     const selectedUsesNativeSharedTexture =
       nativeRendererType === "d3d11" &&
       selectedCapture === "dxgi" &&
@@ -1984,7 +2303,7 @@ export function RemoteDisplayWindowPage() {
       resolution: [width, height],
       fps: Number(selectedFps),
       bitrate: Number(selectedBitrate) * 1_000_000,
-      duration_ms: 30_000,
+      duration_ms: selectedDurationMs,
       warmup_ms: 500,
       input_source: selectedCapture === "synthetic" ? "synthetic" : "screen",
       output_validation: true,
@@ -2005,12 +2324,75 @@ export function RemoteDisplayWindowPage() {
     isNative,
     nativeRendererType,
     resolution,
+    selectedDurationMs,
     transport,
   ]);
   const testConfig = useMemo(
     () => buildTestConfig(nativeSurface?.hwnd),
     [buildTestConfig, nativeSurface?.hwnd]
   );
+  const toggleMatrixDimension = useCallback((value: MatrixDimensionKey) => {
+    setMatrixDimensions((current) => {
+      if (current.includes(value)) {
+        const next = current.filter((item) => item !== value);
+        return next.length > 0 ? next : current;
+      }
+      return [...current, value];
+    });
+  }, []);
+  const buildLocalMatrixSelections = useCallback((): LocalTestSelection[] => {
+    if (!matrixModeEnabled) return [{}];
+    const dimensionValues: Array<Array<LocalTestSelection>> = matrixDimensions.map((dimension) => {
+      switch (dimension) {
+        case "capture":
+          return captureTileOptions
+            .filter((option) => !option.disabledReason)
+            .map((option) => ({ capture: option.value }));
+        case "encoder":
+          return encoderTileOptions
+            .filter((option) => !option.disabledReason)
+            .map((option) => ({ encoder: option.value }));
+        case "resolution":
+          return resolutionTileOptions
+            .filter((option) => !option.disabledReason)
+            .map((option) => ({ resolution: option.value }));
+        case "fps":
+          return fpsTileOptions
+            .filter((option) => !option.disabledReason)
+            .map((option) => ({ fps: option.value }));
+        case "bitrate":
+          return bitrateTileOptions
+            .filter((option) => !option.disabledReason)
+            .map((option) => ({ bitrate: option.value }));
+        default:
+          return [{}];
+      }
+    });
+
+    const combinations = dimensionValues.reduce<LocalTestSelection[]>(
+      (acc, values) =>
+        acc.flatMap((base) =>
+          values.map((value) => ({
+            ...base,
+            ...value,
+          }))
+        ),
+      [{}]
+    );
+
+    return combinations.slice(0, 36);
+  }, [
+    activeEncoderOptions,
+    bitrateTileOptions,
+    captureTileOptions,
+    encoderTileOptions,
+    fpsTileOptions,
+    matrixDimensions,
+    matrixModeEnabled,
+    resolutionTileOptions,
+    visibleCaptureOptions,
+  ]);
+  const matrixSelectionCount = matrixModeEnabled ? buildLocalMatrixSelections().length : 1;
   const isTestBusy =
     testStatus === "starting" || testStatus === "running" || testStatus === "stopping";
   const webCodecsStartBlockReason =
@@ -2331,17 +2713,38 @@ export function RemoteDisplayWindowPage() {
     setRenderMode("d3d12_native");
   }, [closeWebPreviewPeer, d3d12RendererAvailable, localRenderSwitchLocked]);
 
-  const switchToWebRender = useCallback(() => {
+  const switchToWebRtcRender = useCallback(() => {
     if (isLocalPipelinePreview && isTestBusy) {
-      setTestMessage("请先停止测试再切换 Web View");
+      setTestMessage("请先停止测试再切换 WebRTC video");
       return;
     }
 
     closeWebPreviewPeer();
     setWebPreviewMode("idle");
     setWebPreviewEngine("webrtc");
+    if (isLocalPipelinePreview) {
+      setDecoder("none");
+      setTransport("webrtc");
+      setTestMessage("WebRTC video：浏览器视频解码 / RTP timing");
+    }
     setRenderMode("web");
   }, [closeWebPreviewPeer, isLocalPipelinePreview, isTestBusy]);
+
+  const switchToWebCodecsRender = useCallback(() => {
+    if (!isLocalPipelinePreview) return;
+    if (browserWebCodecsUltraBlockReason) {
+      setTestMessage(browserWebCodecsUltraBlockReason);
+      return;
+    }
+
+    closeWebPreviewPeer();
+    setWebPreviewMode("idle");
+    setWebPreviewEngine("webcodecs");
+    setDecoder("none");
+    setTransport("webrtc");
+    setRenderMode("web");
+    setTestMessage("WebCodecs WebGL2：WebSocket AU bridge / Worker + WebGL2 优先");
+  }, [browserWebCodecsUltraBlockReason, closeWebPreviewPeer, isLocalPipelinePreview]);
 
   const clearNativeSurfaceSyncSchedule = useCallback(() => {
     if (syncAnimationFrameRef.current !== null) {
@@ -2420,6 +2823,7 @@ export function RemoteDisplayWindowPage() {
 
       if (runResult.value.status !== "running") {
         setTestStatus(runResult.value.status === "completed" ? "completed" : "failed");
+        setLastCompletedRun(runResult.value);
         setTestMessage(
           runResult.value.summary?.error_message ??
             (runResult.value.status === "completed" ? "测试完成" : `测试${runResult.value.status}`)
@@ -2774,8 +3178,16 @@ export function RemoteDisplayWindowPage() {
     localStartBlockReason,
     resolution,
     sessionId,
+    webCodecsCanvasEpoch,
     webPreviewEngine,
   ]);
+
+  useEffect(() => {
+    if (!isTestBusy || webPreviewEngine !== "webcodecs") {
+      webCodecsWorkerInitRetryRef.current = 0;
+      webCodecsMainCanvasRecoveringRef.current = false;
+    }
+  }, [isTestBusy, webPreviewEngine]);
 
   useEffect(() => {
     if (
@@ -2819,16 +3231,27 @@ export function RemoteDisplayWindowPage() {
     }
 
     const canvasElement = webCodecsCanvasRef.current;
-    if (browserSupportsWebCodecsWorkerRendering(canvasElement)) {
+    const targetFps = Number(fps);
+    const preferWorkerRendering =
+      Number.isFinite(targetFps) &&
+      targetFps <= 144 &&
+      browserSupportsWebCodecsWorkerRendering(canvasElement);
+    if (preferWorkerRendering) {
+      if (canvasElement && webCodecsTransferredCanvasRef.current === canvasElement) {
+        return;
+      }
       let worker: Worker | null = null;
       let resizeObserver: ResizeObserver | null = null;
       let cancelled = false;
+      let canvasTransferred = false;
       try {
         const offscreenCanvas = (
           canvasElement as HTMLCanvasElement & {
             transferControlToOffscreen: () => OffscreenCanvas;
           }
         ).transferControlToOffscreen();
+        canvasTransferred = true;
+        webCodecsTransferredCanvasRef.current = canvasElement;
         worker = new Worker(new URL("../workers/webCodecsPreview.worker.ts", import.meta.url), {
           type: "module",
         });
@@ -2919,16 +3342,34 @@ export function RemoteDisplayWindowPage() {
           resizeObserver?.disconnect();
           worker?.postMessage({ type: "stop" });
           worker?.terminate();
+          if (webCodecsTransferredCanvasRef.current === canvasElement) {
+            webCodecsTransferredCanvasRef.current = null;
+          }
         };
       } catch (error) {
         resizeObserver?.disconnect();
         worker?.terminate();
+        if (webCodecsTransferredCanvasRef.current === canvasElement) {
+          return;
+        }
+        const message = error instanceof Error ? error.message : String(error);
+        const transferredCanvasError =
+          canvasTransferred || /transferred|transferControlToOffscreen/i.test(message);
+        if (transferredCanvasError && webCodecsWorkerInitRetryRef.current < 2) {
+          webCodecsWorkerInitRetryRef.current += 1;
+          setWebFrameTimingChannelState("webcodecs-worker:retry");
+          setTestMessage(`WebCodecs canvas 已重建，正在重新启动 Worker: ${message}`);
+          setWebCodecsCanvasEpoch((current) => current + 1);
+          return;
+        }
+        if (transferredCanvasError) {
+          setWebPreviewMode("failed");
+          setWebPreviewError(`WebCodecs Worker 初始化失败: ${message}`);
+          setWebFrameTimingChannelState("webcodecs-worker:error");
+          return;
+        }
         setWebFrameTimingChannelState("webcodecs-main:fallback");
-        setTestMessage(
-          `WebCodecs Worker 初始化失败，回退主线程解码: ${
-            error instanceof Error ? error.message : String(error)
-          }`
-        );
+        setTestMessage(`WebCodecs Worker 初始化失败，回退主线程解码: ${message}`);
       }
     }
 
@@ -2944,6 +3385,7 @@ export function RemoteDisplayWindowPage() {
     const headersByTimestamp = new Map<number, WebCodecsFrameHeader>();
     const socket = new WebSocket(browserWebcodecsPreviewWebSocketUrl());
     socket.binaryType = "arraybuffer";
+    setWebFrameTimingChannelState("webcodecs-main:2d");
 
     const updateLatencyStats = (latestMs: number) => {
       latencySamplesMs.push(latestMs);
@@ -2978,7 +3420,21 @@ export function RemoteDisplayWindowPage() {
         framesSinceStats += 1;
         totalFrames += 1;
         const canvas = webCodecsCanvasRef.current;
-        const context = canvas?.getContext("2d", { alpha: false });
+        let context: CanvasRenderingContext2D | null = null;
+        try {
+          context = canvas?.getContext("2d", { alpha: false }) ?? null;
+          webCodecsMainCanvasRecoveringRef.current = false;
+        } catch (error) {
+          if (!webCodecsMainCanvasRecoveringRef.current) {
+            webCodecsMainCanvasRecoveringRef.current = true;
+            const message = error instanceof Error ? error.message : String(error);
+            setWebFrameTimingChannelState("webcodecs-main:recovering");
+            setTestMessage(`WebCodecs canvas 已重建，正在恢复主线程绘制: ${message}`);
+            setWebCodecsCanvasEpoch((current) => current + 1);
+          }
+          frame.close();
+          return;
+        }
         if (canvas && context) {
           const displayWidth = frame.displayWidth || frame.codedWidth;
           const displayHeight = frame.displayHeight || frame.codedHeight;
@@ -3575,6 +4031,22 @@ export function RemoteDisplayWindowPage() {
     };
   }, [isLocalPipelinePreview, sessionId]);
 
+  const waitForLocalRunFinished = useCallback(
+    async (runId: string, timeoutMs: number): Promise<TestRun | null> => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (matrixStopRequestedRef.current) return null;
+        const runResult = await testGetRun(runId);
+        if (runResult.ok && runResult.value?.status !== "running") {
+          return runResult.value;
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, METRICS_POLL_MS));
+      }
+      return null;
+    },
+    []
+  );
+
   const handleStartTest = async () => {
     if (!isLocalPipelinePreview) {
       await handleStartRemoteReceiver();
@@ -3594,7 +4066,10 @@ export function RemoteDisplayWindowPage() {
     setTestMessage("测试启动中");
     setTestStatus("starting");
     setCurrentRunId(null);
+    setLastCompletedRun(null);
     setMetrics(null);
+    setMatrixRunProgress(null);
+    matrixStopRequestedRef.current = false;
     setWebPreviewMode("idle");
     setWebPreviewError(null);
 
@@ -3619,6 +4094,8 @@ export function RemoteDisplayWindowPage() {
     await testHarnessStop();
 
     let configForRun = testConfig;
+    let rendererTargetHwndForRun: string | null = null;
+    let baseWebSelection: LocalTestSelection | undefined;
     if (!isNative && localWebViewPlan.profile) {
       if (localWebViewPlan.changed) {
         setCapture(localWebViewPlan.profile.capture);
@@ -3629,7 +4106,8 @@ export function RemoteDisplayWindowPage() {
         setBitrate(localWebViewPlan.profile.bitrate);
         if (localWebViewPlan.message) setTestMessage(localWebViewPlan.message);
       }
-      configForRun = buildTestConfig(null, localWebViewPlan.profile);
+      baseWebSelection = localWebViewPlan.profile;
+      configForRun = buildTestConfig(null, baseWebSelection);
     }
 
     if (isNative && requiresEmbeddedNativeSurface) {
@@ -3652,9 +4130,70 @@ export function RemoteDisplayWindowPage() {
         setLastError(message);
         return;
       }
-      configForRun = buildTestConfig(rendererTargetHwnd);
+      rendererTargetHwndForRun = rendererTargetHwnd;
+      configForRun = buildTestConfig(rendererTargetHwndForRun);
     } else if (isNative) {
       configForRun = buildTestConfig(null);
+    }
+
+    if (matrixModeEnabled) {
+      const selections = buildLocalMatrixSelections();
+      setMatrixRunProgress({ current: 0, total: selections.length, label: "准备矩阵" });
+      let completed = 0;
+      let failed = 0;
+      let lastRun: TestRun | null = null;
+
+      for (let index = 0; index < selections.length; index += 1) {
+        if (matrixStopRequestedRef.current) break;
+        const selection = {
+          ...(baseWebSelection ?? {}),
+          ...selections[index],
+        };
+        const label = [
+          selection.capture ?? capture,
+          selection.encoder ?? encoder,
+          selection.resolution ?? resolution,
+          `${selection.fps ?? fps} FPS`,
+          `${selection.bitrate ?? bitrate} Mbps`,
+        ].join(" / ");
+        setMatrixRunProgress({ current: index + 1, total: selections.length, label });
+        setTestMessage(`矩阵 ${index + 1}/${selections.length}: ${label}`);
+        await testHarnessStop();
+        const runResult = await testStartRun({
+          scenarioId: "custom",
+          config: buildTestConfig(rendererTargetHwndForRun, selection),
+        });
+        if (!runResult.ok) {
+          failed += 1;
+          setLastError(runResult.error.message);
+          continue;
+        }
+        setCurrentRunId(runResult.value);
+        const run = await waitForLocalRunFinished(
+          runResult.value,
+          (selectedDurationMs || 30_000) + 8_000
+        );
+        if (run) {
+          lastRun = run;
+          if (run.status === "completed") completed += 1;
+          else failed += 1;
+        } else if (!matrixStopRequestedRef.current) {
+          failed += 1;
+        }
+      }
+
+      await testHarnessStop();
+      setCurrentRunId(null);
+      setLastCompletedRun(lastRun);
+      const stopped = matrixStopRequestedRef.current;
+      setTestStatus(stopped ? "completed" : failed > 0 ? "failed" : "completed");
+      setTestMessage(
+        stopped
+          ? `矩阵已手动停止: ${completed}/${selections.length} 完成`
+          : `矩阵完成: ${completed}/${selections.length} 完成, ${failed} 失败`
+      );
+      setMatrixRunProgress(null);
+      return;
     }
 
     const result = await testStartRun({
@@ -3675,6 +4214,7 @@ export function RemoteDisplayWindowPage() {
   };
 
   useEffect(() => {
+    if (queryProfileKey === null || queryProfileAppliedKey === queryProfileKey) return;
     if (requestedResolution !== null && requestedResolution !== resolution) {
       setResolution(requestedResolution);
     }
@@ -3684,9 +4224,12 @@ export function RemoteDisplayWindowPage() {
     if (requestedBitrate !== null && requestedBitrate !== bitrate) {
       setBitrate(requestedBitrate);
     }
+    setQueryProfileAppliedKey(queryProfileKey);
   }, [
     bitrate,
     fps,
+    queryProfileAppliedKey,
+    queryProfileKey,
     requestedBitrate,
     requestedFps,
     requestedResolution,
@@ -3722,6 +4265,7 @@ export function RemoteDisplayWindowPage() {
     }
 
     setTestStatus("stopping");
+    matrixStopRequestedRef.current = true;
     closeWebPreviewPeer();
     setWebPreviewMode("idle");
     if (!isNative && !isTauriRuntime()) {
@@ -3739,6 +4283,7 @@ export function RemoteDisplayWindowPage() {
     if (result.ok) {
       setTestStatus("idle");
       setCurrentRunId(null);
+      setMatrixRunProgress(null);
       setTestMessage("测试已停止");
       return;
     }
@@ -3812,6 +4357,9 @@ export function RemoteDisplayWindowPage() {
   const renderSwitchLockedTitle = localRenderSwitchLocked
     ? "请先停止测试再切换渲染模式"
     : undefined;
+  const configChangeLockedTitle = localRenderSwitchLocked
+    ? "当前测试运行中；停止后修改才会影响下一次启动"
+    : undefined;
   const settingsFooterMessage = localStartBlockReason
     ? localStartBlockReason
     : isLocalPipelinePreview
@@ -3821,6 +4369,15 @@ export function RemoteDisplayWindowPage() {
       : mediaProfileNegotiation
         ? `远端 ${mediaProfileNegotiation.selected.width}x${mediaProfileNegotiation.selected.height}@${mediaProfileNegotiation.selected.fps} / ${mediaProfileNegotiation.selected.bitrate_mbps} Mbps`
         : "远程参数将通过协商层下发";
+  const lastRunSummary = lastCompletedRun?.summary;
+  const lastRunFps =
+    lastRunSummary?.capture_fps ?? metrics?.capture_fps ?? webVideoFps ?? null;
+  const lastRunLatencyP95 =
+    lastRunSummary?.total_latency_p95 ??
+    metrics?.total_latency_p95_ms ??
+    webPresentationLatencyStats?.p95Ms ??
+    null;
+  const lastRunDropped = lastRunSummary?.dropped_frames ?? metrics?.dropped_frames ?? null;
   const primaryActionBlocked = Boolean(!isTestBusy && localStartBlockReason);
   const renderCaptureSourceCards = (closeAfterSelect = false) => (
     <div className="grid max-h-80 gap-3 overflow-y-auto pr-1 sm:grid-cols-2 lg:grid-cols-3">
@@ -4162,56 +4719,6 @@ export function RemoteDisplayWindowPage() {
               </div>
             ) : null}
           </div>
-          <div className="flex overflow-hidden rounded-md border border-white/10">
-            <button
-              className={`px-2.5 py-1 text-[11px] ${
-                renderMode === "web"
-                  ? "bg-white/14 text-white"
-                  : localRenderSwitchLocked
-                    ? "cursor-not-allowed text-slate-600"
-                    : "text-slate-400 hover:bg-white/8"
-              }`}
-              onClick={switchToWebRender}
-              disabled={localRenderSwitchLocked}
-              title={renderSwitchLockedTitle}
-            >
-              Web View
-            </button>
-            <button
-              className={`px-2.5 py-1 text-[11px] ${
-                renderMode === nativeRenderMode
-                  ? "bg-cyan-500/25 text-cyan-100"
-                  : nativeRendererAvailableForHost && !localRenderSwitchLocked
-                    ? "text-slate-400 hover:bg-white/8"
-                    : "cursor-not-allowed text-slate-600"
-              }`}
-              onClick={switchToNativeRender}
-              disabled={!nativeRendererAvailableForHost || localRenderSwitchLocked}
-              title={renderSwitchLockedTitle}
-            >
-              {nativeRenderLabel}
-            </button>
-            <button
-              className={`px-2.5 py-1 text-[11px] ${
-                renderMode === "d3d12_native"
-                  ? "bg-cyan-500/25 text-cyan-100"
-                  : d3d12RendererAvailable && !localRenderSwitchLocked
-                    ? "text-slate-400 hover:bg-white/8"
-                    : "cursor-not-allowed text-slate-600"
-              }`}
-              onClick={switchToD3d12Render}
-              disabled={!d3d12RendererAvailable || localRenderSwitchLocked}
-              title={
-                localRenderSwitchLocked
-                  ? renderSwitchLockedTitle
-                  : d3d12RendererAvailable
-                    ? undefined
-                    : d3d12UnavailableTitle
-              }
-            >
-              DX12 native
-            </button>
-          </div>
           <button
             onClick={() => void withTauriWindow((appWindow) => appWindow.minimize())}
             className="inline-flex h-8 w-9 items-center justify-center rounded-sm text-slate-400 hover:bg-white/10 hover:text-white"
@@ -4246,6 +4753,9 @@ export function RemoteDisplayWindowPage() {
             <div className="flex items-center justify-between border-b border-white/10 px-4 py-3">
               <div>
                 <div className="text-sm font-semibold text-slate-100">测试配置</div>
+                <div className="mt-1 text-[11px] text-slate-500">
+                  渲染路径、采集/编码参数和浏览器显示路径统一在这里切换。
+                </div>
               </div>
               <button
                 className="inline-flex h-8 w-8 items-center justify-center rounded-md text-slate-400 hover:bg-white/10 hover:text-white"
@@ -4256,19 +4766,188 @@ export function RemoteDisplayWindowPage() {
               </button>
             </div>
 
-            <div className="grid min-h-0 gap-3 overflow-y-auto px-4 py-4 sm:grid-cols-2 lg:grid-cols-3">
-              <TitleSelect
-                label="CAP"
-                value={capture}
-                options={visibleCaptureOptions}
-                onChange={setCapture}
-              />
-              <TitleSelect
-                label="ENC"
-                value={encoder}
-                options={visibleEncoderOptions}
-                onChange={setEncoder}
-              />
+            <div className="border-b border-white/10 px-4 py-3">
+              <div className="mb-2 flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-300">
+                    渲染路径
+                  </div>
+                  <div className="mt-1 text-[11px] text-slate-500">
+                    WebRTC / WebCodecs 用浏览器解码绘制；native 路径由独立原生 surface 承载。
+                  </div>
+                </div>
+                <div className="text-[11px] text-slate-500">当前: {effectiveRenderLabel}</div>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {isLocalPipelinePreview ? (
+                  <>
+                    <button
+                      className={`rounded-md border px-3 py-1.5 text-[11px] font-medium ${
+                        renderMode === "web" && webPreviewEngine === "webrtc"
+                          ? "border-cyan-300/50 bg-cyan-500/20 text-cyan-100"
+                          : localRenderSwitchLocked
+                            ? "cursor-not-allowed border-white/10 text-slate-600"
+                            : "border-white/10 text-slate-300 hover:bg-white/10"
+                      }`}
+                      onClick={switchToWebRtcRender}
+                      disabled={localRenderSwitchLocked}
+                      title={renderSwitchLockedTitle ?? "浏览器 WebRTC video 显示路径"}
+                    >
+                      WebRTC video
+                    </button>
+                    <button
+                      className={`rounded-md border px-3 py-1.5 text-[11px] font-medium ${
+                        renderMode === "web" && webPreviewEngine === "webcodecs"
+                          ? "border-violet-300/50 bg-violet-500/20 text-violet-100"
+                          : localRenderSwitchLocked || browserWebCodecsUltraBlockReason
+                            ? "cursor-not-allowed border-white/10 text-slate-600"
+                            : "border-white/10 text-slate-300 hover:bg-white/10"
+                      }`}
+                      onClick={switchToWebCodecsRender}
+                      disabled={localRenderSwitchLocked || Boolean(browserWebCodecsUltraBlockReason)}
+                      title={
+                        renderSwitchLockedTitle ??
+                        browserWebCodecsUltraBlockReason ??
+                        "浏览器 WebCodecs + WebGL2 优先显示路径"
+                      }
+                    >
+                      WebCodecs WebGL2
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    className={`rounded-md border px-3 py-1.5 text-[11px] font-medium ${
+                      renderMode === "web"
+                        ? "border-cyan-300/50 bg-cyan-500/20 text-cyan-100"
+                        : localRenderSwitchLocked
+                          ? "cursor-not-allowed border-white/10 text-slate-600"
+                          : "border-white/10 text-slate-300 hover:bg-white/10"
+                    }`}
+                    onClick={switchToWebRtcRender}
+                    disabled={localRenderSwitchLocked}
+                    title={renderSwitchLockedTitle ?? "浏览器 Web View 显示路径"}
+                  >
+                    Web View
+                  </button>
+                )}
+                <button
+                  className={`rounded-md border px-3 py-1.5 text-[11px] font-medium ${
+                    renderMode === nativeRenderMode
+                      ? "border-cyan-300/50 bg-cyan-500/20 text-cyan-100"
+                      : nativeRendererAvailableForHost && !localRenderSwitchLocked
+                        ? "border-white/10 text-slate-300 hover:bg-white/10"
+                        : "cursor-not-allowed border-white/10 text-slate-600"
+                  }`}
+                  onClick={switchToNativeRender}
+                  disabled={!nativeRendererAvailableForHost || localRenderSwitchLocked}
+                  title={
+                    localRenderSwitchLocked
+                      ? renderSwitchLockedTitle
+                      : nativeRendererAvailableForHost
+                        ? "原生窗口渲染路径"
+                        : `${nativeRenderLabel} 当前不可用`
+                  }
+                >
+                  {nativeRenderLabel}
+                </button>
+                <button
+                  className={`rounded-md border px-3 py-1.5 text-[11px] font-medium ${
+                    renderMode === "d3d12_native"
+                      ? "border-cyan-300/50 bg-cyan-500/20 text-cyan-100"
+                      : d3d12RendererAvailable && !localRenderSwitchLocked
+                        ? "border-white/10 text-slate-300 hover:bg-white/10"
+                        : "cursor-not-allowed border-white/10 text-slate-600"
+                  }`}
+                  onClick={switchToD3d12Render}
+                  disabled={!d3d12RendererAvailable || localRenderSwitchLocked}
+                  title={
+                    localRenderSwitchLocked
+                      ? renderSwitchLockedTitle
+                      : d3d12RendererAvailable
+                        ? "D3D12 native 渲染路径"
+                        : d3d12UnavailableTitle
+                  }
+                >
+                  DX12 native
+                </button>
+              </div>
+              {isLocalPipelinePreview && renderMode === "web" ? (
+                <div className="mt-3 rounded-md border border-cyan-400/15 bg-cyan-500/10 px-3 py-2 text-[11px] text-cyan-100/85">
+                  当前网页渲染路径会锁定浏览器侧解码和传输语义：
+                  {webPreviewEngine === "webcodecs"
+                    ? " DEC=Browser WebCodecs，NET=WebSocket AU。"
+                    : " DEC=Browser video decode，NET=WebRTC RTP。"}
+                  编码器只显示已接入浏览器预览的 H.264 路径；HEVC/AV1 属于 native/后续浏览器媒体链路。
+                </div>
+              ) : null}
+            </div>
+
+            <div className="min-h-0 space-y-3 overflow-y-auto px-4 py-4">
+              <div className="grid gap-3 lg:grid-cols-[1.2fr_1fr]">
+                <div className="rounded-lg border border-white/10 bg-black/18 p-3">
+                  <div className="mb-2 flex items-center justify-between gap-2">
+                    <div>
+                      <div className="text-[10px] font-semibold uppercase tracking-normal text-slate-400">
+                        测试模式
+                      </div>
+                      <div className="mt-1 text-[11px] text-slate-500">
+                        单次使用当前组合；多选矩阵按所选维度顺序执行，最多 36 条。
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      className={`rounded-md border px-3 py-1.5 text-[11px] font-medium ${
+                        matrixModeEnabled
+                          ? "border-violet-300/50 bg-violet-500/20 text-violet-100"
+                          : "border-white/10 text-slate-200 hover:bg-white/10"
+                      } ${localRenderSwitchLocked ? "cursor-not-allowed opacity-60" : ""}`}
+                      disabled={localRenderSwitchLocked}
+                      title={configChangeLockedTitle ?? "切换单次/多选矩阵测试模式"}
+                      onClick={() => setMatrixModeEnabled((value) => !value)}
+                    >
+                      {matrixModeEnabled ? `多选矩阵 (${matrixSelectionCount})` : "单次测试"}
+                    </button>
+                  </div>
+                  <MultiTileOptionGroup
+                    label="MATRIX"
+                    values={matrixDimensions}
+                    options={matrixDimensionOptions}
+                    onToggle={toggleMatrixDimension}
+                    disabled={localRenderSwitchLocked || !matrixModeEnabled}
+                    title={
+                      !matrixModeEnabled
+                        ? "开启多选矩阵后选择参与展开的维度"
+                        : configChangeLockedTitle
+                    }
+                  />
+                </div>
+                <TileOptionGroup
+                  label="DURATION"
+                  value={durationMode}
+                  options={durationTileOptions}
+                  onChange={setDurationMode}
+                  disabled={localRenderSwitchLocked}
+                  title={configChangeLockedTitle ?? "测试时长；手动停止使用长时运行并由停止按钮结束"}
+                />
+              </div>
+
+              <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+                <TileOptionGroup
+                  label="CAP"
+                  value={capture}
+                  options={captureTileOptions}
+                  onChange={setCapture}
+                  disabled={localRenderSwitchLocked}
+                  title={configChangeLockedTitle}
+                />
+                <TileOptionGroup
+                  label="ENC"
+                  value={encoder}
+                  options={encoderTileOptions}
+                  onChange={setEncoder}
+                  disabled={localRenderSwitchLocked}
+                  title={configChangeLockedTitle ?? browserEncoderConstraintTitle}
+                />
               {isLocalPipelinePreview && renderMode === "web" ? (
                 <ReadonlyTitleValue
                   label="DEC"
@@ -4276,40 +4955,60 @@ export function RemoteDisplayWindowPage() {
                   title="网页显示路径由浏览器负责解码，不使用矩阵里的本机 decoder 字段。"
                 />
               ) : (
-                <TitleSelect
+                <TileOptionGroup
                   label="DEC"
                   value={decoder}
-                  options={visibleDecoderOptions}
+                  options={decoderTileOptions}
                   onChange={setDecoder}
+                  disabled={localRenderSwitchLocked}
+                  title={configChangeLockedTitle}
                 />
               )}
-              {isLocalPipelinePreview && renderMode === "web" && webPreviewEngine === "webcodecs" ? (
+              {isLocalPipelinePreview && renderMode === "web" ? (
                 <ReadonlyTitleValue
                   label="NET"
-                  value="WebSocket AU"
-                  title="WebCodecs 使用本机 mrd-service WebSocket 传输 H.264 access unit，不走 WebRTC RTP。"
+                  value={webPreviewEngine === "webcodecs" ? "WebSocket AU" : "WebRTC RTP"}
+                  title={
+                    webPreviewEngine === "webcodecs"
+                      ? "WebCodecs 使用本机 mrd-service WebSocket 传输 H.264 access unit，不走 WebRTC RTP。"
+                      : "WebRTC video 使用浏览器 MediaStream / RTP 接收，不使用矩阵里的 Loopback/QUIC 传输。"
+                  }
                 />
               ) : (
-                <TitleSelect
+                <TileOptionGroup
                   label="NET"
                   value={transport}
                   options={transportOptions}
                   onChange={setTransport}
+                  disabled={localRenderSwitchLocked}
+                  title={configChangeLockedTitle}
                 />
               )}
-              <TitleSelect
-                label="SIZE"
-                value={resolution}
-                options={resolutionOptions}
-                onChange={setResolution}
-              />
-              <TitleSelect label="FPS" value={fps} options={fpsOptions} onChange={setFps} />
-              <TitleSelect
-                label="BR"
-                value={bitrate}
-                options={bitrateOptions}
-                onChange={setBitrate}
-              />
+                <TileOptionGroup
+                  label="SIZE"
+                  value={resolution}
+                  options={resolutionTileOptions}
+                  onChange={setResolution}
+                  disabled={localRenderSwitchLocked}
+                  title={configChangeLockedTitle}
+                />
+                <TileOptionGroup
+                  label="FPS"
+                  value={fps}
+                  options={fpsTileOptions}
+                  onChange={setFps}
+                  disabled={localRenderSwitchLocked}
+                  title={configChangeLockedTitle}
+                />
+                <TileOptionGroup
+                  label="BR"
+                  value={bitrate}
+                  options={bitrateTileOptions}
+                  onChange={setBitrate}
+                  disabled={localRenderSwitchLocked}
+                  title={configChangeLockedTitle}
+                />
+              </div>
             </div>
 
             {!isLocalPipelinePreview && (
@@ -4416,7 +5115,7 @@ export function RemoteDisplayWindowPage() {
                       disabled={Boolean(browserWebCodecsUltraBlockReason)}
                       title={browserWebCodecsUltraBlockReason ?? "浏览器 WebCodecs + WebSocket AU + WebGL2 优先路径"}
                     >
-                      WebCodecs WebGL2
+                      WebCodecs 2K144
                     </button>
                   </>
                 )}
@@ -4525,6 +5224,7 @@ export function RemoteDisplayWindowPage() {
         )}
         {isLocalPipelinePreview && !isNative && webPreviewEngine === "webcodecs" && (
           <canvas
+            key={webCodecsCanvasEpoch}
             ref={webCodecsCanvasRef}
             className="absolute inset-0 h-full w-full bg-black object-contain"
             style={{
@@ -4606,6 +5306,42 @@ export function RemoteDisplayWindowPage() {
         {isBrowserBridgeRemote && (
           <div className="absolute left-3 top-3 rounded-md border border-amber-300/25 bg-black/50 px-3 py-2 text-[11px] text-amber-100 backdrop-blur">
             Web preview / mrd-service bridge / 非 native 高刷渲染
+          </div>
+        )}
+        {isLocalPipelinePreview && testStatus === "completed" && lastCompletedRun && (
+          <div className="absolute left-3 top-3 max-w-md rounded-lg border border-emerald-300/25 bg-emerald-950/70 px-3 py-3 text-xs text-emerald-50 shadow-xl backdrop-blur">
+            <div className="mb-2 flex items-center justify-between gap-3">
+              <div className="font-semibold">测试结果</div>
+              <div className="truncate text-[10px] text-emerald-200/70">
+                {lastCompletedRun.run_id}
+              </div>
+            </div>
+            <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+              <div className="rounded-md bg-white/8 px-2 py-1.5">
+                <div className="text-[10px] text-emerald-200/60">FPS</div>
+                <div className="font-semibold">{formatSummaryFps(lastRunFps)}</div>
+              </div>
+              <div className="rounded-md bg-white/8 px-2 py-1.5">
+                <div className="text-[10px] text-emerald-200/60">P95</div>
+                <div className="font-semibold">{formatSummaryMs(lastRunLatencyP95)}</div>
+              </div>
+              <div className="rounded-md bg-white/8 px-2 py-1.5">
+                <div className="text-[10px] text-emerald-200/60">Drop</div>
+                <div className="font-semibold">{formatDropped(lastRunDropped)}</div>
+              </div>
+              <div className="rounded-md bg-white/8 px-2 py-1.5">
+                <div className="text-[10px] text-emerald-200/60">Frames</div>
+                <div className="font-semibold">
+                  {formatCount(lastRunSummary?.frame_count ?? metrics?.frame_count ?? null)}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+        {isLocalPipelinePreview && matrixRunProgress && (
+          <div className="absolute right-3 top-3 max-w-md rounded-md border border-violet-300/25 bg-violet-950/65 px-3 py-2 text-[11px] text-violet-100 backdrop-blur">
+            矩阵 {matrixRunProgress.current}/{matrixRunProgress.total}:{" "}
+            {matrixRunProgress.label}
           </div>
         )}
         {lastError && (

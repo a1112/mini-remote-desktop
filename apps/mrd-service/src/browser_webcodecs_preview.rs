@@ -20,7 +20,7 @@ use tokio::{sync::mpsc, task::JoinHandle};
 use tracing::info;
 
 const DEFAULT_BROWSER_WEBCODECS_FPS: u32 = 120;
-const MAX_BROWSER_WEBCODECS_FPS: u32 = 144;
+const MAX_BROWSER_WEBCODECS_FPS: u32 = 249;
 const DEFAULT_BROWSER_WEBCODECS_BITRATE_MBPS: u32 = 20;
 const MAX_BROWSER_WEBCODECS_BITRATE_MBPS: u32 = 120;
 const WEBCODECS_CHUNK_MAGIC: &[u8; 8] = b"MRDWC01\0";
@@ -388,9 +388,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn webcodecs_preview_allows_144_fps_but_clamps_above_it() {
+    fn webcodecs_preview_allows_high_refresh_fps_but_clamps_above_it() {
         assert_eq!(sanitize_browser_webcodecs_preview_fps(Some(144)), 144);
-        assert_eq!(sanitize_browser_webcodecs_preview_fps(Some(249)), 144);
+        assert_eq!(sanitize_browser_webcodecs_preview_fps(Some(180)), 180);
+        assert_eq!(sanitize_browser_webcodecs_preview_fps(Some(249)), 249);
+        assert_eq!(sanitize_browser_webcodecs_preview_fps(Some(300)), 249);
         assert_eq!(sanitize_browser_webcodecs_preview_fps(None), 120);
     }
 
