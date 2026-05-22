@@ -41,6 +41,8 @@ pub struct BrowserWebcodecsPreviewStartRequest {
 pub enum BrowserWebcodecsPreviewControlMessage {
     #[serde(rename = "start")]
     Start(BrowserWebcodecsPreviewStartRequest),
+    #[serde(rename = "request_keyframe")]
+    RequestKeyframe,
     #[serde(rename = "stop")]
     Stop,
 }
@@ -143,9 +145,10 @@ pub fn spawn_browser_webcodecs_capture_sender(
     request: BrowserWebcodecsPreviewStartRequest,
     outbound: mpsc::Sender<BrowserWebcodecsPreviewOutbound>,
     running: Arc<AtomicBool>,
+    request_keyframe: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
-        run_browser_webcodecs_capture_sender(request, outbound, running);
+        run_browser_webcodecs_capture_sender(request, outbound, running, request_keyframe);
     })
 }
 
@@ -154,6 +157,7 @@ fn run_browser_webcodecs_capture_sender(
     request: BrowserWebcodecsPreviewStartRequest,
     outbound: mpsc::Sender<BrowserWebcodecsPreviewOutbound>,
     running: Arc<AtomicBool>,
+    request_keyframe: Arc<AtomicBool>,
 ) {
     let session_id = request.session_id.clone();
     let fps = sanitize_browser_webcodecs_preview_fps(request.fps);
@@ -244,7 +248,7 @@ fn run_browser_webcodecs_capture_sender(
                 break;
             }
         };
-        if request_next_keyframe {
+        if request_next_keyframe || request_keyframe.swap(false, Ordering::Relaxed) {
             encoder.request_keyframe();
             request_next_keyframe = false;
         }
@@ -300,6 +304,7 @@ fn run_browser_webcodecs_capture_sender(
     request: BrowserWebcodecsPreviewStartRequest,
     outbound: mpsc::Sender<BrowserWebcodecsPreviewOutbound>,
     running: Arc<AtomicBool>,
+    _request_keyframe: Arc<AtomicBool>,
 ) {
     send_error(
         &outbound,
@@ -421,5 +426,15 @@ mod tests {
             "avc1.640034"
         );
         assert_eq!(browser_webcodecs_h264_codec_string(None), "avc1.42e034");
+    }
+
+    #[test]
+    fn webcodecs_preview_control_message_parses_keyframe_request() {
+        let message: BrowserWebcodecsPreviewControlMessage =
+            serde_json::from_str(r#"{"type":"request_keyframe"}"#).expect("parse request");
+        assert!(matches!(
+            message,
+            BrowserWebcodecsPreviewControlMessage::RequestKeyframe
+        ));
     }
 }

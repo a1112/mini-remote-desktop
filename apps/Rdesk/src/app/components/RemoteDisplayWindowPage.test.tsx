@@ -6,6 +6,7 @@ import {
   RemoteDisplayWindowPage,
   applyWebRtcReceiverLowLatencyHint,
   applyWebRtcVideoMotionHint,
+  webCodecsMemoryPathLabelFromState,
   browserSupportsWebCodecsWorkerRendering,
   browserWebrtcPreviewH264Profile,
   buildWebRtcDiagnosticsStageRows,
@@ -887,6 +888,18 @@ describe("RemoteDisplayWindowPage", () => {
     ).toBe(true);
     expect(browserSupportsWebCodecsWorkerRendering(null)).toBe(false);
     expect(browserSupportsWebCodecsWorkerRendering({})).toBe(false);
+  });
+
+  it("labels the active WebCodecs worker renderer backend", () => {
+    expect(webCodecsMemoryPathLabelFromState("webcodecs-worker:webgl2")).toBe(
+      "WebGL2 OffscreenCanvas"
+    );
+    expect(webCodecsMemoryPathLabelFromState("webcodecs-worker:2d")).toBe(
+      "OffscreenCanvas 2D"
+    );
+    expect(webCodecsMemoryPathLabelFromState("webcodecs-worker:connecting")).toBe(
+      "OffscreenCanvas"
+    );
   });
 
   it("blocks high-FPS browser rendering when only the OpenH264 diagnostic fallback is available", async () => {

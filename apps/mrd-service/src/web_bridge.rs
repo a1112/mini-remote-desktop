@@ -350,6 +350,7 @@ async fn handle_browser_webcodecs_ws(mut socket: WebSocket, auth_error: Option<I
 
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<BrowserWebcodecsPreviewOutbound>(4);
     let mut running: Option<Arc<AtomicBool>> = None;
+    let mut request_keyframe: Option<Arc<AtomicBool>> = None;
     let mut capture_task: Option<tokio::task::JoinHandle<()>> = None;
 
     loop {
@@ -370,12 +371,20 @@ async fn handle_browser_webcodecs_ws(mut socket: WebSocket, auth_error: Option<I
                             task.abort();
                         }
                         let flag = Arc::new(AtomicBool::new(true));
+                        let keyframe_flag = Arc::new(AtomicBool::new(false));
                         capture_task = Some(spawn_browser_webcodecs_capture_sender(
                             request,
                             outbound_tx.clone(),
                             flag.clone(),
+                            keyframe_flag.clone(),
                         ));
                         running = Some(flag);
+                        request_keyframe = Some(keyframe_flag);
+                    }
+                    Ok(BrowserWebcodecsPreviewControlMessage::RequestKeyframe) => {
+                        if let Some(flag) = &request_keyframe {
+                            flag.store(true, Ordering::Relaxed);
+                        }
                     }
                     Ok(BrowserWebcodecsPreviewControlMessage::Stop) => {
                         break;
@@ -415,6 +424,9 @@ async fn handle_browser_webcodecs_ws(mut socket: WebSocket, auth_error: Option<I
     }
 
     if let Some(flag) = running {
+        flag.store(false, Ordering::Relaxed);
+    }
+    if let Some(flag) = request_keyframe {
         flag.store(false, Ordering::Relaxed);
     }
     if let Some(task) = capture_task {

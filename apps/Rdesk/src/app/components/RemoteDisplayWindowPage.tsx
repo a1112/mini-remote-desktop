@@ -209,6 +209,7 @@ type WebCodecsWorkerMessage =
       height: number;
       fps: number;
       bitrateMbps: number;
+      rendererBackend: "webgl2" | "2d";
     }
   | {
       type: "stats";
@@ -225,6 +226,7 @@ type WebCodecsWorkerMessage =
       droppedFrames: number;
       canvasWidth: number;
       canvasHeight: number;
+      rendererBackend: "webgl2" | "2d";
     }
   | {
       type: "closed";
@@ -972,6 +974,15 @@ export function browserSupportsWebCodecsWorkerRendering(
       maybeWindow.OffscreenCanvas &&
       canvas?.transferControlToOffscreen
   );
+}
+
+export function webCodecsMemoryPathLabelFromState(
+  channelState: string | null | undefined
+): string {
+  if (channelState === "webcodecs-worker:webgl2") return "WebGL2 OffscreenCanvas";
+  if (channelState === "webcodecs-worker:2d") return "OffscreenCanvas 2D";
+  if (channelState?.startsWith("webcodecs-worker")) return "OffscreenCanvas";
+  return "WebCodecs canvas";
 }
 
 const WEBRTC_LOW_LATENCY_PLAYOUT_SECONDS = 0.02;
@@ -2777,9 +2788,11 @@ export function RemoteDisplayWindowPage() {
           if (message.type === "ready") {
             setWebPreviewMode("webcodecs");
             setWebPreviewError(null);
-            setWebFrameTimingChannelState("webcodecs-worker:open");
+            setWebFrameTimingChannelState(`webcodecs-worker:${message.rendererBackend}`);
             setTestMessage(
-              `WebCodecs Worker + OffscreenCanvas 本机采集运行中 (${message.width}x${message.height}@${message.fps})`
+              `WebCodecs Worker + ${
+                message.rendererBackend === "webgl2" ? "WebGL2" : "2D Canvas"
+              } 本机采集运行中 (${message.width}x${message.height}@${message.fps})`
             );
             return;
           }
@@ -3701,9 +3714,7 @@ export function RemoteDisplayWindowPage() {
         ? "Linux upload"
         : isLocalPipelinePreview && !isNative
           ? webPreviewEngine === "webcodecs"
-            ? webCodecsWorkerActive
-              ? "OffscreenCanvas"
-              : "WebCodecs canvas"
+            ? webCodecsMemoryPathLabelFromState(webFrameTimingChannelState)
             : "WebRTC MediaStream"
           : "CPU preview";
   const effectiveRenderLabel =
