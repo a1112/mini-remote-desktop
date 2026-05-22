@@ -39,6 +39,11 @@ pub struct H264SampleSender {
     frame_duration: Duration,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct H264SampleSendReport {
+    pub bytes_written: usize,
+}
+
 pub struct Av1RtpSender {
     track: Arc<TrackLocalStaticRTP>,
     packetizer: Box<dyn Packetizer + Send + Sync>,
@@ -584,6 +589,15 @@ impl H264SampleSender {
         &self,
         access_unit: &EncodedAccessUnit,
     ) -> Result<usize, TransportError> {
+        self.send_access_unit_with_report(access_unit)
+            .await
+            .map(|report| report.bytes_written)
+    }
+
+    pub async fn send_access_unit_with_report(
+        &self,
+        access_unit: &EncodedAccessUnit,
+    ) -> Result<H264SampleSendReport, TransportError> {
         if access_unit.codec != VideoCodec::H264 {
             return Err(TransportError::Message(
                 "H264 sample sender only supports H264 access units".into(),
@@ -599,7 +613,9 @@ impl H264SampleSender {
             .write_sample(&sample)
             .await
             .map_err(|error| TransportError::Message(format!("write_sample failed: {error}")))?;
-        Ok(access_unit.bytes.len())
+        Ok(H264SampleSendReport {
+            bytes_written: access_unit.bytes.len(),
+        })
     }
 }
 

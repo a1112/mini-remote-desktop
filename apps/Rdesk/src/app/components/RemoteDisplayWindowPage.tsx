@@ -68,11 +68,12 @@ type FpsKey = "30" | "60" | "120" | "144" | "165" | "180" | "249";
 type BitrateKey = "8" | "20" | "50" | "80" | "100" | "120";
 type TestStatus = "idle" | "starting" | "running" | "stopping" | "completed" | "failed";
 type WebPreviewMode = "idle" | "connecting" | "webrtc" | "failed";
+type WebPreviewEngine = "webrtc" | "webcodecs";
 type CaptureSourcePickerMode = "dropdown" | "modal";
 
 const METRICS_POLL_MS = 500;
 const WEB_PREVIEW_CONNECT_TIMEOUT_MS = 8_000;
-const WEB_VIEW_MAX_FPS = 120;
+const WEB_VIEW_MAX_FPS = 144;
 const DIAGNOSTICS_SAMPLE_LIMIT = 90;
 
 type Option<T extends string> = {
@@ -421,7 +422,14 @@ export class WebRtcPresentationLatencyTracker {
   addMetadata(data: unknown): void {
     const metadata = parseWebRtcFrameTimingMetadata(data);
     if (!metadata) return;
-    this.pendingBySequence.push(metadata);
+    const insertAt = this.pendingBySequence.findIndex(
+      (entry) => entry.sequence > metadata.sequence
+    );
+    if (insertAt >= 0) {
+      this.pendingBySequence.splice(insertAt, 0, metadata);
+    } else {
+      this.pendingBySequence.push(metadata);
+    }
     if (typeof metadata.rtpTimestamp === "number") {
       this.pendingByRtpTimestamp.set(metadata.rtpTimestamp, metadata);
     }
@@ -836,19 +844,30 @@ function browserSupportsH264WebrtcVideo(): boolean {
   );
 }
 
-function applyWebRtcLowLatencyHints(receiver?: RTCRtpReceiver | null) {
+export function browserSupportsWebCodecsH264(): boolean {
+  if (typeof window === "undefined") return false;
+  const maybeWindow = window as Window & {
+    VideoDecoder?: unknown;
+    EncodedVideoChunk?: unknown;
+  };
+  return Boolean(maybeWindow.VideoDecoder && maybeWindow.EncodedVideoChunk);
+}
+
+const WEBRTC_LOW_LATENCY_PLAYOUT_SECONDS = 0.02;
+
+export function applyWebRtcReceiverLowLatencyHint(receiver?: RTCRtpReceiver | null) {
   if (!receiver) return;
   const tunableReceiver = receiver as RTCRtpReceiver & {
     playoutDelayHint?: number;
     jitterBufferTarget?: number;
   };
   try {
-    tunableReceiver.playoutDelayHint = 0;
+    tunableReceiver.playoutDelayHint = WEBRTC_LOW_LATENCY_PLAYOUT_SECONDS;
   } catch {
     // Optional browser API.
   }
   try {
-    tunableReceiver.jitterBufferTarget = 0;
+    tunableReceiver.jitterBufferTarget = WEBRTC_LOW_LATENCY_PLAYOUT_SECONDS;
   } catch {
     // Optional browser API.
   }
@@ -864,7 +883,7 @@ export function applyWebRtcVideoMotionHint(track?: MediaStreamTrack | null) {
 }
 
 function fpsForWebView(fps: FpsKey): FpsKey {
-  return Number(fps) > WEB_VIEW_MAX_FPS ? "120" : fps;
+  return Number(fps) > WEB_VIEW_MAX_FPS ? "144" : fps;
 }
 
 function optionValueFromSearch<T extends string>(
@@ -910,6 +929,26 @@ type LocalWebViewPlan = {
   changed: boolean;
   message: string | null;
 };
+
+function isExplicitBrowser2k144LowLatencyProfile({
+  capture,
+  encoder,
+  decoder,
+  transport,
+  fps,
+  bitrate,
+  resolution,
+}: LocalWebViewProfile & { resolution: ResolutionKey }): boolean {
+  return (
+    capture === "dxgi" &&
+    encoder === "nvenc_h264" &&
+    decoder === "none" &&
+    transport === "webrtc" &&
+    resolution === "2560x1440" &&
+    fps === "144" &&
+    bitrate === "20"
+  );
+}
 
 function resolveLocalWebViewPlan({
   capabilities,
@@ -1263,6 +1302,7 @@ export function RemoteDisplayWindowPage() {
   const [currentRunId, setCurrentRunId] = useState<string | null>(null);
   const [metrics, setMetrics] = useState<HarnessMetrics | null>(null);
   const [webPreviewMode, setWebPreviewMode] = useState<WebPreviewMode>("idle");
+  const [webPreviewEngine, setWebPreviewEngine] = useState<WebPreviewEngine>("webrtc");
   const [webPreviewError, setWebPreviewError] = useState<string | null>(null);
   const [webVideoFps, setWebVideoFps] = useState<number | null>(null);
   const [webPaintFps, setWebPaintFps] = useState<number | null>(null);
@@ -1307,6 +1347,18 @@ export function RemoteDisplayWindowPage() {
     (requestedResolution !== null && requestedResolution !== resolution) ||
     (requestedFps !== null && requestedFps !== fps) ||
     (requestedBitrate !== null && requestedBitrate !== bitrate);
+  const explicitBrowser2k144LowLatencyProfile =
+    renderMode === "web" &&
+    webPreviewEngine === "webrtc" &&
+    isExplicitBrowser2k144LowLatencyProfile({
+      capture,
+      encoder,
+      decoder,
+      transport,
+      resolution,
+      fps,
+      bitrate,
+    });
   const localWebViewPlan = useMemo(
     () =>
       resolveLocalWebViewPlan({
@@ -1318,7 +1370,8 @@ export function RemoteDisplayWindowPage() {
         transport,
         fps,
         bitrate,
-        capHighFpsBitrate: requestedBitrate === null,
+        capHighFpsBitrate:
+          requestedBitrate === null && !explicitBrowser2k144LowLatencyProfile,
       }),
     [
       bitrate,
@@ -1326,6 +1379,7 @@ export function RemoteDisplayWindowPage() {
       capture,
       decoder,
       encoder,
+      explicitBrowser2k144LowLatencyProfile,
       fps,
       hostOs,
       requestedBitrate,
@@ -1778,8 +1832,15 @@ export function RemoteDisplayWindowPage() {
     () => buildTestConfig(nativeSurface?.hwnd),
     [buildTestConfig, nativeSurface?.hwnd]
   );
+  const webCodecsStartBlockReason =
+    isLocalPipelinePreview && renderMode === "web" && webPreviewEngine === "webcodecs"
+      ? browserSupportsWebCodecsH264()
+        ? "WebCodecs 超低延迟路径需要编码帧 bridge；当前版本仅暴露原型入口，请先使用 WebRTC 2K144 低延迟档。"
+        : "WebCodecs 超低延迟路径需要浏览器 VideoDecoder / EncodedVideoChunk 支持。"
+      : null;
   const localStartBlockReason =
-    isLocalPipelinePreview && renderMode === "web" ? localWebViewPlan.reason : null;
+    webCodecsStartBlockReason ??
+    (isLocalPipelinePreview && renderMode === "web" ? localWebViewPlan.reason : null);
   const buildRemoteMediaProfile = useCallback(() => {
     const [width, height] = resolution.split("x").map(Number) as [number, number];
     const hevc = isHevcEncoder(encoder);
@@ -2057,6 +2118,7 @@ export function RemoteDisplayWindowPage() {
     if (!nativeRendererAvailableForHost) return;
     closeWebPreviewPeer();
     setWebPreviewMode("idle");
+    setWebPreviewEngine("webrtc");
     setRenderMode(nativeRenderMode);
   }, [closeWebPreviewPeer, nativeRenderMode, nativeRendererAvailableForHost]);
 
@@ -2064,6 +2126,7 @@ export function RemoteDisplayWindowPage() {
     if (!d3d12RendererAvailable || localRenderSwitchLocked) return;
     closeWebPreviewPeer();
     setWebPreviewMode("idle");
+    setWebPreviewEngine("webrtc");
     setRenderMode("d3d12_native");
   }, [closeWebPreviewPeer, d3d12RendererAvailable, localRenderSwitchLocked]);
 
@@ -2075,6 +2138,7 @@ export function RemoteDisplayWindowPage() {
 
     closeWebPreviewPeer();
     setWebPreviewMode("idle");
+    setWebPreviewEngine("webrtc");
     setRenderMode("web");
   }, [closeWebPreviewPeer, isLocalPipelinePreview, isTestBusy]);
 
@@ -2347,10 +2411,10 @@ export function RemoteDisplayWindowPage() {
     };
 
     const videoTransceiver = peer.addTransceiver("video", { direction: "recvonly" });
-    applyWebRtcLowLatencyHints(videoTransceiver.receiver);
+    applyWebRtcReceiverLowLatencyHint(videoTransceiver.receiver);
     peer.ontrack = (event) => {
       if (cancelled) return;
-      applyWebRtcLowLatencyHints(event.receiver);
+      applyWebRtcReceiverLowLatencyHint(event.receiver);
       applyWebRtcVideoMotionHint(event.track);
       startReceiverStatsPolling(event.receiver);
       const stream = event.streams[0] ?? new MediaStream([event.track]);
@@ -2631,6 +2695,7 @@ export function RemoteDisplayWindowPage() {
   };
 
   const applyLowLatencyProfile = useCallback(() => {
+    setWebPreviewEngine("webrtc");
     if (hostOs === "macos") {
       setCapture("macos");
       setEncoder("videotoolbox_h264");
@@ -2682,6 +2747,36 @@ export function RemoteDisplayWindowPage() {
         : "web"
     );
   }, [capabilities, hostOs]);
+
+  const applyBrowserWebRtc2k144LowLatencyProfile = useCallback(() => {
+    setWebPreviewEngine("webrtc");
+    setCapture("dxgi");
+    setEncoder("nvenc_h264");
+    setDecoder("none");
+    setTransport("webrtc");
+    setResolution("2560x1440");
+    setFps("144");
+    setBitrate("20");
+    setRenderMode("web");
+    setTestMessage("WebRTC 2K144 低延迟档：RTP timestamp / 20 Mbps / Web View");
+  }, []);
+
+  const applyBrowserWebCodecsUltraLowLatencyProfile = useCallback(() => {
+    setWebPreviewEngine("webcodecs");
+    setCapture("dxgi");
+    setEncoder("nvenc_h264");
+    setDecoder("none");
+    setTransport("webrtc");
+    setResolution("2560x1440");
+    setFps("144");
+    setBitrate("20");
+    setRenderMode("web");
+    setTestMessage(
+      browserSupportsWebCodecsH264()
+        ? "WebCodecs 超低延迟路径：等待编码帧 bridge 接入"
+        : "WebCodecs 超低延迟路径：当前浏览器缺少 VideoDecoder"
+    );
+  }, []);
 
   const ensureRemoteCaptureSourceSelected = useCallback(async () => {
     if (isLocalPipelinePreview) return null;
@@ -3108,16 +3203,19 @@ export function RemoteDisplayWindowPage() {
   const webPreviewUsesVideo =
     isLocalPipelinePreview &&
     !isNative &&
+    webPreviewEngine === "webrtc" &&
     (webPreviewMode === "connecting" || webPreviewMode === "webrtc");
   const effectiveRenderLabel =
     isLocalPipelinePreview && !isNative
-      ? webPreviewMode === "webrtc"
-        ? "WebRTC video"
-        : webPreviewMode === "connecting"
-          ? "WebRTC connecting"
-          : webPreviewMode === "failed"
-            ? "WebRTC failed"
-            : "WebRTC video"
+      ? webPreviewEngine === "webcodecs"
+        ? "WebCodecs prototype"
+        : webPreviewMode === "webrtc"
+          ? "WebRTC video"
+          : webPreviewMode === "connecting"
+            ? "WebRTC connecting"
+            : webPreviewMode === "failed"
+              ? "WebRTC failed"
+              : "WebRTC video"
       : renderModeLabel;
   const renderSwitchLockedTitle = localRenderSwitchLocked
     ? "请先停止测试再切换渲染模式"
@@ -3694,6 +3792,22 @@ export function RemoteDisplayWindowPage() {
                 >
                   Low latency
                 </button>
+                {isLocalPipelinePreview && (
+                  <>
+                    <button
+                      className="rounded-md border border-sky-400/30 px-3 py-1.5 text-[11px] font-medium text-sky-100 hover:bg-sky-500/15"
+                      onClick={applyBrowserWebRtc2k144LowLatencyProfile}
+                    >
+                      WebRTC 2K144
+                    </button>
+                    <button
+                      className="rounded-md border border-violet-400/30 px-3 py-1.5 text-[11px] font-medium text-violet-100 hover:bg-violet-500/15"
+                      onClick={applyBrowserWebCodecsUltraLowLatencyProfile}
+                    >
+                      WebCodecs Ultra
+                    </button>
+                  </>
+                )}
                 {!isLocalPipelinePreview && (
                   <button
                     className="rounded-md border border-emerald-400/30 px-3 py-1.5 text-[11px] font-medium text-emerald-100 hover:bg-emerald-500/15"
@@ -3802,7 +3916,11 @@ export function RemoteDisplayWindowPage() {
             <div className="text-center">
               <PanelTop className="mx-auto mb-3 h-9 w-9 text-slate-500" />
               <div className="text-sm font-medium text-slate-300">
-                {isTestBusy ? "等待 WebRTC 视频帧" : "点击开始显示本机 WebRTC 画面"}
+                {webPreviewEngine === "webcodecs"
+                  ? "WebCodecs 超低延迟路径"
+                  : isTestBusy
+                    ? "等待 WebRTC 视频帧"
+                    : "点击开始显示本机 WebRTC 画面"}
               </div>
               <div className="mt-1 text-xs text-slate-500">
                 {localStartBlockReason ?? webPreviewError ?? testDescription}

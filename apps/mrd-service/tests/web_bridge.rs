@@ -38,9 +38,10 @@ fn bridge_allows_only_browser_safe_ipc_requests() {
 }
 
 #[test]
-fn browser_webrtc_preview_allows_120_fps_first_phase_target() {
+fn browser_webrtc_preview_allows_144_fps_followup_target() {
     assert_eq!(sanitize_browser_preview_fps(Some(120)), 120);
-    assert_eq!(sanitize_browser_preview_fps(Some(249)), 120);
+    assert_eq!(sanitize_browser_preview_fps(Some(144)), 144);
+    assert_eq!(sanitize_browser_preview_fps(Some(249)), 144);
     assert_eq!(sanitize_browser_preview_fps(None), 120);
 }
 

@@ -16,7 +16,7 @@ use mrd_encode_nvenc::NvencH264Encoder;
 use mrd_pipeline_core::{EncodedAccessUnit, VideoCodec};
 #[cfg(windows)]
 use mrd_pipeline_core::{FrameCapture, VideoEncoder};
-use mrd_transport_webrtc::{H264Profile, H264RtpSender};
+use mrd_transport_webrtc::{H264Profile, H264RtpSender, H264SampleSender};
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
@@ -35,7 +35,7 @@ use webrtc::{
 };
 
 const DEFAULT_BROWSER_PREVIEW_FPS: u32 = 120;
-const MAX_BROWSER_PREVIEW_FPS: u32 = 120;
+const MAX_BROWSER_PREVIEW_FPS: u32 = 144;
 const DEFAULT_BROWSER_PREVIEW_BITRATE_MBPS: u32 = 80;
 const MAX_BROWSER_PREVIEW_BITRATE_MBPS: u32 = 160;
 const BROWSER_PREVIEW_QUEUE_TARGET_LATENCY_MS: u32 = 96;
@@ -184,6 +184,94 @@ fn summarize_timing_us(samples: &[u64]) -> TimingSummaryUs {
 fn take_timing_samples(samples: &Mutex<Vec<u64>>) -> Vec<u64> {
     let mut samples = samples.lock().expect("lock browser preview timing samples");
     std::mem::take(&mut *samples)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserPreviewSenderTrackKind {
+    Rtp,
+    Sample,
+}
+
+fn browser_preview_sender_track_kind(bitrate_bps: u32) -> BrowserPreviewSenderTrackKind {
+    if bitrate_bps <= 20_000_000 {
+        BrowserPreviewSenderTrackKind::Rtp
+    } else {
+        BrowserPreviewSenderTrackKind::Sample
+    }
+}
+
+struct BrowserPreviewMediaSendReport {
+    bytes_written: usize,
+    rtp_timestamp: Option<u32>,
+}
+
+enum BrowserPreviewMediaSender {
+    Rtp(H264RtpSender),
+    Sample(H264SampleSender),
+}
+
+impl BrowserPreviewMediaSender {
+    fn new(
+        track_id: impl Into<String>,
+        stream_id: impl Into<String>,
+        fps: u32,
+        profile: H264Profile,
+        profile_level_id: impl Into<String>,
+        bitrate_bps: u32,
+    ) -> Self {
+        let track_id = track_id.into();
+        let stream_id = stream_id.into();
+        let profile_level_id = profile_level_id.into();
+        match browser_preview_sender_track_kind(bitrate_bps) {
+            BrowserPreviewSenderTrackKind::Rtp => {
+                Self::Rtp(H264RtpSender::new_with_profile_level_id(
+                    track_id,
+                    stream_id,
+                    fps,
+                    1200,
+                    profile,
+                    profile_level_id,
+                ))
+            }
+            BrowserPreviewSenderTrackKind::Sample => {
+                Self::Sample(H264SampleSender::new_with_profile_level_id(
+                    track_id,
+                    stream_id,
+                    fps,
+                    profile_level_id,
+                ))
+            }
+        }
+    }
+
+    fn track(&self) -> Arc<dyn TrackLocal + Send + Sync> {
+        match self {
+            Self::Rtp(sender) => sender.track(),
+            Self::Sample(sender) => sender.track(),
+        }
+    }
+
+    async fn send_access_unit_with_report(
+        &mut self,
+        access_unit: &EncodedAccessUnit,
+    ) -> Result<BrowserPreviewMediaSendReport, mrd_transport_webrtc::TransportError> {
+        match self {
+            Self::Rtp(sender) => {
+                let report = sender.send_access_unit_with_report(access_unit).await?;
+                Ok(BrowserPreviewMediaSendReport {
+                    bytes_written: report.bytes_written,
+                    rtp_timestamp: Some(report.rtp_timestamp),
+                })
+            }
+            Self::Sample(sender) => {
+                let report = sender.send_access_unit_with_report(access_unit).await?;
+                Ok(BrowserPreviewMediaSendReport {
+                    bytes_written: report.bytes_written,
+                    rtp_timestamp: None,
+                })
+            }
+        }
+    }
 }
 
 struct BrowserPreviewFrameQueue {
@@ -353,15 +441,20 @@ impl BrowserWebrtcPreviewHost {
             "browser WebRTC preview H.264 offer selected profile-level-id={} for {}",
             profile_level_id, session_id
         );
-        let media_sender = H264RtpSender::new_with_profile_level_id(
+        let track_kind = browser_preview_sender_track_kind(bitrate_bps);
+        info!(
+            "browser WebRTC preview selected {:?} track pacing for {}",
+            track_kind, session_id
+        );
+        let media_sender = BrowserPreviewMediaSender::new(
             "video",
             format!("{session_id}-browser-web"),
             fps,
-            1200,
             profile,
             profile_level_id,
+            bitrate_bps,
         );
-        let track: Arc<dyn TrackLocal + Send + Sync> = media_sender.track();
+        let track = media_sender.track();
         let rtp_sender = pc
             .add_track(track)
             .await
@@ -672,7 +765,7 @@ fn spawn_local_capture_sender(
     bitrate_bps: u32,
     width: Option<u32>,
     height: Option<u32>,
-    media_sender: H264RtpSender,
+    media_sender: BrowserPreviewMediaSender,
     frame_timing_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
     running: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
@@ -699,7 +792,7 @@ fn run_local_capture_sender(
     bitrate_bps: u32,
     width: Option<u32>,
     height: Option<u32>,
-    media_sender: H264RtpSender,
+    media_sender: BrowserPreviewMediaSender,
     frame_timing_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
     running: Arc<AtomicBool>,
     handle: tokio::runtime::Handle,
@@ -732,14 +825,15 @@ fn run_local_capture_sender(
     };
 
     info!(
-        "browser WebRTC preview sender started for {} at {}x{} @ {} fps / {} Mbps (source {}x{})",
+        "browser WebRTC preview sender started for {} at {}x{} @ {} fps / {} Mbps (source {}x{}, track {:?})",
         session_id,
         capture.width(),
         capture.height(),
         fps,
         bitrate_bps / 1_000_000,
         source_width,
-        source_height
+        source_height,
+        browser_preview_sender_track_kind(bitrate_bps)
     );
 
     let access_unit_queue = Arc::new(BrowserPreviewFrameQueue::new(
@@ -768,7 +862,7 @@ fn run_local_capture_sender(
                         frame_sequence,
                         &access_unit,
                         now_unix_us_lossy(),
-                        Some(report.rtp_timestamp),
+                        report.rtp_timestamp,
                     );
                     match send_browser_frame_timing_message(&frame_timing_channel, &timing_message)
                     {
@@ -966,7 +1060,7 @@ fn run_local_capture_sender(
     _bitrate_bps: u32,
     _width: Option<u32>,
     _height: Option<u32>,
-    _media_sender: H264RtpSender,
+    _media_sender: BrowserPreviewMediaSender,
     _frame_timing_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
     running: Arc<AtomicBool>,
     _handle: tokio::runtime::Handle,
@@ -1014,6 +1108,22 @@ mod tests {
     }
 
     #[test]
+    fn browser_preview_uses_rtp_track_for_low_latency_browser_video() {
+        assert_eq!(
+            browser_preview_sender_track_kind(20_000_000),
+            BrowserPreviewSenderTrackKind::Rtp
+        );
+    }
+
+    #[test]
+    fn browser_preview_uses_sample_track_for_high_bitrate_browser_video() {
+        assert_eq!(
+            browser_preview_sender_track_kind(50_000_000),
+            BrowserPreviewSenderTrackKind::Sample
+        );
+    }
+
+    #[test]
     fn browser_offer_profile_level_id_prefers_matching_h264_profile() {
         let offer = "\
 a=fmtp:102 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\r\n\
@@ -1054,8 +1164,9 @@ a=fmtp:123 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640c1
         assert_eq!(browser_preview_queue_capacity(30), 4);
         assert_eq!(browser_preview_queue_capacity(60), 6);
         assert_eq!(browser_preview_queue_capacity(120), 12);
+        assert_eq!(browser_preview_queue_capacity(144), 12);
 
-        let max_buffered_latency_ms = browser_preview_queue_capacity(120) as u32 * 1000 / 120;
+        let max_buffered_latency_ms = browser_preview_queue_capacity(144) as u32 * 1000 / 144;
         assert!(max_buffered_latency_ms <= 100);
     }
 
