@@ -9,6 +9,7 @@
 // - Shell lifecycle (UI launcher, tray, autostart)
 
 mod app_state;
+mod browser_webrtc_preview;
 mod capabilities;
 mod capture_source;
 mod display_mode;
@@ -17,6 +18,7 @@ mod ipc_server;
 mod lan_discovery;
 mod media_adaptation;
 mod shell;
+mod web_bridge;
 
 use anyhow::Result;
 use app_state::AppState;
@@ -86,6 +88,7 @@ async fn main() -> Result<()> {
     // Initialize IPC server with app state
     let ipc_server = IpcServer::new(app_state);
     info!("IPC server initialized");
+    let web_bridge_task = web_bridge::spawn_from_env(ipc_server.clone()).await?;
 
     info!("mrd-service running (press Ctrl+C to stop)");
 
@@ -94,6 +97,11 @@ async fn main() -> Result<()> {
         result = ipc_server.run() => {
             if let Err(e) = result {
                 eprintln!("IPC server error: {}", e);
+            }
+        }
+        result = web_bridge::wait_for_task(web_bridge_task) => {
+            if let Err(e) = result {
+                eprintln!("Web bridge error: {}", e);
             }
         }
         _ = tokio::signal::ctrl_c() => {

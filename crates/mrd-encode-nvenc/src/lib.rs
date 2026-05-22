@@ -47,6 +47,7 @@ mod imp {
     const H264_SHARED_ASYNC_SLOT_COUNT: usize = 2;
     const HEVC_SHARED_ASYNC_SLOT_COUNT: usize = 3;
     const SHARED_INPUT_CACHE_LIMIT: usize = 8;
+    const H264_REMOTE_DESKTOP_MAX_KEYFRAME_INTERVAL_FRAMES: usize = 30;
     const HEVC_REMOTE_DESKTOP_MAX_KEYFRAME_INTERVAL_FRAMES: usize = 60;
 
     pub struct NvencH264Encoder {
@@ -63,6 +64,7 @@ mod imp {
         height: usize,
         fps: u32,
         frame_index: usize,
+        force_next_keyframe: bool,
     }
 
     unsafe impl Send for NvencH264Encoder {}
@@ -84,6 +86,16 @@ mod imp {
     }
 
     unsafe impl Send for NvencHevcEncoder {}
+
+    fn h264_remote_desktop_keyframe_interval(fps: u32) -> usize {
+        (fps.max(1) as usize).min(H264_REMOTE_DESKTOP_MAX_KEYFRAME_INTERVAL_FRAMES)
+    }
+
+    fn h264_should_force_keyframe(frame_index: usize, fps: u32, force_next: bool) -> bool {
+        force_next
+            || frame_index == 0
+            || frame_index % h264_remote_desktop_keyframe_interval(fps) == 0
+    }
 
     fn hevc_remote_desktop_keyframe_interval(fps: u32) -> usize {
         (fps.max(1) as usize).min(HEVC_REMOTE_DESKTOP_MAX_KEYFRAME_INTERVAL_FRAMES)
@@ -200,7 +212,7 @@ mod imp {
             // Maximum speed optimizations:
             preset.preset_cfg.profile_guid = NV_ENC_H264_PROFILE_BASELINE_GUID;
             preset.preset_cfg.rc_params.average_bit_rate = bitrate;
-            preset.preset_cfg.gop_len = fps.min(30);
+            preset.preset_cfg.gop_len = h264_remote_desktop_keyframe_interval(fps) as u32;
             preset.preset_cfg.frame_interval_p = 1;
 
             let init = InitParams {
@@ -245,6 +257,7 @@ mod imp {
                 height,
                 fps,
                 frame_index: 0,
+                force_next_keyframe: false,
             })
         }
 
@@ -280,7 +293,7 @@ mod imp {
             // - Lower bitrate for faster encoding
             preset.preset_cfg.rc_params.average_bit_rate = bitrate;
             // - Very short GOP for minimal I-frame overhead
-            preset.preset_cfg.gop_len = fps.min(30);
+            preset.preset_cfg.gop_len = h264_remote_desktop_keyframe_interval(fps) as u32;
             // - Disable frame doubling
             preset.preset_cfg.frame_interval_p = 1;
 
@@ -326,6 +339,7 @@ mod imp {
                 height,
                 fps,
                 frame_index: 0,
+                force_next_keyframe: false,
             })
         }
 
@@ -388,7 +402,7 @@ mod imp {
             preset.preset_cfg.profile_guid = profile_guid;
             preset.preset_cfg.rc_params.average_bit_rate = bitrate;
             preset.preset_cfg.frame_interval_p = 1;
-            preset.preset_cfg.gop_len = fps;
+            preset.preset_cfg.gop_len = h264_remote_desktop_keyframe_interval(fps) as u32;
 
             let init = InitParams {
                 encode_guid: NV_ENC_CODEC_H264_GUID,
@@ -432,6 +446,7 @@ mod imp {
                 height,
                 fps,
                 frame_index: 0,
+                force_next_keyframe: false,
             })
         }
 
@@ -463,7 +478,7 @@ mod imp {
             preset.preset_cfg.profile_guid = profile_guid;
             preset.preset_cfg.rc_params.average_bit_rate = 12_000_000;
             preset.preset_cfg.frame_interval_p = 1;
-            preset.preset_cfg.gop_len = fps;
+            preset.preset_cfg.gop_len = h264_remote_desktop_keyframe_interval(fps) as u32;
 
             let init = InitParams {
                 encode_guid: NV_ENC_CODEC_H264_GUID,
@@ -507,12 +522,17 @@ mod imp {
                 height,
                 fps,
                 frame_index: 0,
+                force_next_keyframe: false,
             })
         }
 
         pub fn probe_h264_available() -> Result<(), PipelineError> {
-            let _ = Self::new(16, 16, 30)?;
+            let _ = Self::new_max_speed_with_bitrate(1280, 720, 60, 20_000_000)?;
             Ok(())
+        }
+
+        pub fn request_keyframe(&mut self) {
+            self.force_next_keyframe = true;
         }
 
         fn encode_shared_bgra(
@@ -543,7 +563,8 @@ mod imp {
                 .ok_or_else(|| PipelineError::message("missing shared NVENC encode slot"))?;
             self.copy_shared_bgra_to_texture(&source_texture, &slot.texture)?;
 
-            let force_idr = self.frame_index == 0 || self.frame_index % self.fps as usize == 0;
+            let force_idr =
+                h264_should_force_keyframe(self.frame_index, self.fps, self.force_next_keyframe);
             submit_encode_picture(
                 &mut self.encoder,
                 &slot.bitstream,
@@ -552,6 +573,7 @@ mod imp {
                 force_idr,
             )
             .map_err(|error| PipelineError::message(error.to_string()))?;
+            self.force_next_keyframe = false;
             self.frame_index += 1;
             self.pending_shared_encodes.push_back(PendingSharedEncode {
                 slot,
@@ -775,12 +797,12 @@ mod imp {
         }
 
         pub fn probe_hevc_available() -> Result<(), PipelineError> {
-            let _ = Self::new_main(16, 16, 30)?;
+            let _ = Self::new_max_speed_with_bitrate(1280, 720, 60, 20_000_000)?;
             Ok(())
         }
 
         pub fn probe_hevc_main10_available() -> Result<(), PipelineError> {
-            let _ = Self::new_main10(16, 16, 30)?;
+            let _ = Self::new_main10_with_bitrate(1280, 720, 60, 20_000_000)?;
             Ok(())
         }
 
@@ -1102,7 +1124,8 @@ mod imp {
                 );
             }
 
-            let force_idr = self.frame_index == 0 || self.frame_index % self.fps as usize == 0;
+            let force_idr =
+                h264_should_force_keyframe(self.frame_index, self.fps, self.force_next_keyframe);
             let bytes = encode_picture_with_sps_pps(
                 &mut self.encoder,
                 &self.bitstream,
@@ -1111,6 +1134,7 @@ mod imp {
                 force_idr,
             )
             .map_err(|error| PipelineError::message(error.to_string()))?;
+            self.force_next_keyframe = false;
             self.frame_index += 1;
 
             Ok(vec![EncodedAccessUnit {
@@ -1237,6 +1261,21 @@ mod imp {
             assert_eq!(hevc_remote_desktop_keyframe_interval(60), 60);
             assert_eq!(hevc_remote_desktop_keyframe_interval(144), 60);
             assert_eq!(hevc_remote_desktop_keyframe_interval(249), 60);
+        }
+
+        #[test]
+        fn h264_remote_desktop_keyframe_interval_caps_browser_recovery() {
+            assert_eq!(h264_remote_desktop_keyframe_interval(30), 30);
+            assert_eq!(h264_remote_desktop_keyframe_interval(60), 30);
+            assert_eq!(h264_remote_desktop_keyframe_interval(120), 30);
+            assert_eq!(h264_remote_desktop_keyframe_interval(249), 30);
+        }
+
+        #[test]
+        fn h264_requested_keyframe_overrides_interval() {
+            assert!(!h264_should_force_keyframe(7, 120, false));
+            assert!(h264_should_force_keyframe(7, 120, true));
+            assert!(h264_should_force_keyframe(30, 120, false));
         }
     }
 

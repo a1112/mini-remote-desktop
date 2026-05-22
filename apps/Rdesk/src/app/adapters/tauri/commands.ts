@@ -60,6 +60,13 @@ import type {
   TestMatrixConfig,
   PipelineComparisonResult,
 } from './types';
+import {
+  invokeServiceBridgeIpc,
+  postServiceBridgeJson,
+  serviceBridgeHealth,
+  type ServiceBridgeIpcRequest,
+  type ServiceBridgeIpcResponse,
+} from '../serviceBridge/client';
 
 /**
  * Wrap Tauri invoke with consistent error handling
@@ -77,11 +84,75 @@ async function invokeAdapter<T>(
   }
 }
 
+async function invokeBridgeOrTauri<T>(
+  command: string,
+  args: Record<string, unknown> | undefined,
+  request: ServiceBridgeIpcRequest,
+  unwrap: (response: ServiceBridgeIpcResponse) => T
+): Promise<AdapterResult<T>> {
+  if (shouldUseServiceBridge()) {
+    return invokeServiceBridgeIpc<T>(request, unwrap);
+  }
+  return invokeAdapter<T>(command, args);
+}
+
+function responseField<T>(field: string): (response: ServiceBridgeIpcResponse) => T {
+  return (response) => response[field] as T;
+}
+
+function environmentFromCapabilitySnapshot(snapshot: CapabilitySnapshot): EnvironmentSnapshot {
+  const captures: string[] = [];
+  const encoders: string[] = [];
+  const decoders: string[] = ['none'];
+  const renderers: string[] = ['none'];
+  const memoryModes: string[] = [];
+
+  for (const capability of snapshot.capabilities) {
+    if (
+      capability.status !== 'available' &&
+      capability.status !== 'supported' &&
+      capability.status !== 'usable' &&
+      capability.status !== 'degraded'
+    ) {
+      continue;
+    }
+    const [domain, ...rest] = capability.id.split('.');
+    const value = rest.join('.');
+    if (!value) continue;
+    if (domain === 'capture') captures.push(value);
+    if (domain === 'encode') encoders.push(value);
+    if (domain === 'decode') decoders.push(value);
+    if (domain === 'render') renderers.push(value === 'd3d12_native' ? 'd3d12' : value);
+    if (domain === 'memory') memoryModes.push(value);
+  }
+
+  return {
+    os_type: snapshot.platform,
+    cpu_brand: 'mrd-service capability snapshot',
+    cpu_cores: 0,
+    memory_gb: 0,
+    gpu_info: 'Reported by mrd-service',
+    available_captures: Array.from(new Set(captures)),
+    available_encoders: Array.from(new Set(encoders)),
+    available_decoders: Array.from(new Set(decoders)),
+    available_renderers: Array.from(new Set(renderers)),
+    available_memory_modes: Array.from(new Set(memoryModes)),
+  };
+}
+
 function isLocalBrowserFallbackAllowed(): boolean {
   if (typeof window === 'undefined') return false;
   if ('__TAURI_INTERNALS__' in window) return false;
   const host = window.location.hostname;
   return host === 'localhost' || host === '127.0.0.1' || host === '::1';
+}
+
+function shouldUseServiceBridge(): boolean {
+  if (!isLocalBrowserFallbackAllowed()) return false;
+  if (import.meta.env.MODE === 'test') {
+    return Boolean((window as Window & { __MRD_FORCE_WEB_BRIDGE__?: boolean }).__MRD_FORCE_WEB_BRIDGE__);
+  }
+  return true;
 }
 
 function browserDevCapabilities(): EnvironmentSnapshot | null {
@@ -152,6 +223,21 @@ export async function openRemoteDisplayWindow(params: {
   sessionId: string;
   surfaceId?: string | null;
 }): Promise<AdapterResult<RemoteDisplayWindowContext>> {
+  if (shouldUseServiceBridge()) {
+    return {
+      ok: true,
+      value: {
+        label: `web-${params.sessionId}`,
+        session_id: params.sessionId,
+        surface_id: params.surfaceId ?? `web-${params.sessionId}`,
+        role: 'controller',
+        renderer_attached: false,
+        render_mode: 'web',
+        native_surface_attached: false,
+        session_window_count: 1,
+      },
+    };
+  }
   return invokeAdapter<RemoteDisplayWindowContext>('open_remote_display_window', {
     sessionId: params.sessionId,
     surfaceId: params.surfaceId ?? null,
@@ -169,6 +255,9 @@ export async function listRemoteDisplayWindows(
 export async function currentRemoteDisplayWindowContext(): Promise<
   AdapterResult<RemoteDisplayWindowContext | null>
 > {
+  if (shouldUseServiceBridge()) {
+    return { ok: true, value: null };
+  }
   return invokeAdapter<RemoteDisplayWindowContext | null>(
     'current_remote_display_window_context'
   );
@@ -207,19 +296,47 @@ export async function browserWebrtcPreviewStart(params: {
   sessionId: string;
   offerSdp: string;
   fps?: number;
+  width?: number;
+  height?: number;
   h264Profile?: "baseline" | "high";
+  bitrateMbps?: number;
 }): Promise<AdapterResult<BrowserWebrtcPreviewAnswer>> {
+  if (shouldUseServiceBridge()) {
+    return postServiceBridgeJson<BrowserWebrtcPreviewAnswer>(
+      '/browser/webrtc-preview/start',
+      {
+        session_id: params.sessionId,
+        offer_sdp: params.offerSdp,
+        fps: params.fps ?? null,
+        width: params.width ?? null,
+        height: params.height ?? null,
+        h264_profile: params.h264Profile ?? null,
+        bitrate_mbps: params.bitrateMbps ?? null,
+      }
+    );
+  }
   return invokeAdapter<BrowserWebrtcPreviewAnswer>('browser_webrtc_preview_start', {
     sessionId: params.sessionId,
     offerSdp: params.offerSdp,
     fps: params.fps ?? null,
+    width: params.width ?? null,
+    height: params.height ?? null,
     h264Profile: params.h264Profile ?? null,
+    bitrateMbps: params.bitrateMbps ?? null,
   });
 }
 
 export async function browserWebrtcPreviewStop(
   sessionId: string
 ): Promise<AdapterResult<void>> {
+  if (shouldUseServiceBridge()) {
+    const result = await postServiceBridgeJson<{ stopped: boolean }>(
+      '/browser/webrtc-preview/stop',
+      { session_id: sessionId }
+    );
+    if (!result.ok) return result;
+    return { ok: true, value: undefined };
+  }
   return invokeAdapter<void>('browser_webrtc_preview_stop', { sessionId });
 }
 
@@ -249,6 +366,11 @@ export async function automationWriteReport(
  * Returns true if bootstrap was performed.
  */
 export async function serviceBootstrapIfNeeded(): Promise<AdapterResult<boolean>> {
+  if (shouldUseServiceBridge()) {
+    const health = await serviceBridgeHealth();
+    if (!health.ok) return health;
+    return { ok: true, value: false };
+  }
   return invokeAdapter<boolean>('service_bootstrap_if_needed');
 }
 
@@ -258,6 +380,19 @@ export async function serviceBootstrapIfNeeded(): Promise<AdapterResult<boolean>
 export async function serviceWaitForHealthy(
   timeoutSecs: number
 ): Promise<AdapterResult<boolean>> {
+  if (shouldUseServiceBridge()) {
+    const deadline = Date.now() + timeoutSecs * 1000;
+    let lastError = 'mrd-service web bridge is not healthy';
+    do {
+      const health = await serviceBridgeHealth();
+      if (health.ok && health.value.status === 'ok') {
+        return { ok: true, value: true };
+      }
+      lastError = health.ok ? 'mrd-service web bridge is not healthy' : health.error.message;
+      await new Promise((resolve) => window.setTimeout(resolve, 250));
+    } while (Date.now() < deadline);
+    return { ok: false, error: { message: lastError } };
+  }
   return invokeAdapter<boolean>('service_wait_for_healthy', {
     timeoutSecs,
   });
@@ -274,7 +409,12 @@ export async function serviceDidBootstrap(): Promise<AdapterResult<boolean>> {
  * Get the shell-owned service/UI status snapshot via IPC.
  */
 export async function shellGetStatus(): Promise<AdapterResult<ShellStatusSnapshot>> {
-  return invokeAdapter<ShellStatusSnapshot>('shell_get_status');
+  return invokeBridgeOrTauri<ShellStatusSnapshot>(
+    'shell_get_status',
+    undefined,
+    { type: 'GetShellStatus' },
+    responseField<ShellStatusSnapshot>('status')
+  );
 }
 
 /**
@@ -360,14 +500,24 @@ export async function ipcListDevices(): Promise<AdapterResult<DeviceInfo[]>> {
  * Get LAN P2P discovery snapshot via IPC.
  */
 export async function ipcLanDiscoverySnapshot(): Promise<AdapterResult<LanDiscoverySnapshot>> {
-  return invokeAdapter<LanDiscoverySnapshot>('ipc_lan_discovery_snapshot');
+  return invokeBridgeOrTauri<LanDiscoverySnapshot>(
+    'ipc_lan_discovery_snapshot',
+    undefined,
+    { type: 'LanDiscoverySnapshot' },
+    responseField<LanDiscoverySnapshot>('snapshot')
+  );
 }
 
 /**
  * Trigger immediate LAN P2P discovery probe via IPC.
  */
 export async function ipcRefreshLanDiscovery(): Promise<AdapterResult<LanDiscoverySnapshot>> {
-  return invokeAdapter<LanDiscoverySnapshot>('ipc_refresh_lan_discovery');
+  return invokeBridgeOrTauri<LanDiscoverySnapshot>(
+    'ipc_refresh_lan_discovery',
+    undefined,
+    { type: 'RefreshLanDiscovery' },
+    responseField<LanDiscoverySnapshot>('snapshot')
+  );
 }
 
 // ============================================================================
@@ -398,12 +548,24 @@ export async function ipcStartLanRemoteSession(
   transportKind: string,
   requestedProfile?: MediaProfile
 ): Promise<AdapterResult<string>> {
-  return invokeAdapter<string>('ipc_start_lan_remote_session', {
+  const args = {
     sessionId,
     targetDeviceId,
     transportKind,
     ...(requestedProfile ? { requestedProfile } : {}),
-  });
+  };
+  return invokeBridgeOrTauri<string>(
+    'ipc_start_lan_remote_session',
+    args,
+    {
+      type: 'StartLanRemoteSession',
+      session_id: sessionId,
+      target_device_id: targetDeviceId,
+      transport_kind: transportKind,
+      ...(requestedProfile ? { requested_profile: requestedProfile } : {}),
+    },
+    responseField<string>('session_id')
+  );
 }
 
 /**
@@ -413,10 +575,19 @@ export async function ipcUpdateMediaProfile(
   sessionId: string,
   requestedProfile: MediaProfile
 ): Promise<AdapterResult<MediaProfileNegotiation>> {
-  return invokeAdapter<MediaProfileNegotiation>('ipc_update_media_profile', {
-    sessionId,
-    requestedProfile,
-  });
+  return invokeBridgeOrTauri<MediaProfileNegotiation>(
+    'ipc_update_media_profile',
+    {
+      sessionId,
+      requestedProfile,
+    },
+    {
+      type: 'UpdateMediaProfile',
+      session_id: sessionId,
+      requested_profile: requestedProfile,
+    },
+    responseField<MediaProfileNegotiation>('negotiation')
+  );
 }
 
 /**
@@ -426,10 +597,19 @@ export async function ipcConfigureMediaAdaptation(
   sessionId: string,
   config: AdaptiveMediaConfig
 ): Promise<AdapterResult<MediaAdaptationSnapshot>> {
-  return invokeAdapter<MediaAdaptationSnapshot>('ipc_configure_media_adaptation', {
-    sessionId,
-    config,
-  });
+  return invokeBridgeOrTauri<MediaAdaptationSnapshot>(
+    'ipc_configure_media_adaptation',
+    {
+      sessionId,
+      config,
+    },
+    {
+      type: 'ConfigureMediaAdaptation',
+      session_id: sessionId,
+      config,
+    },
+    responseField<MediaAdaptationSnapshot>('snapshot')
+  );
 }
 
 /**
@@ -440,11 +620,22 @@ export async function ipcListRemoteCaptureSources(
   includePreviews = true,
   limit?: number
 ): Promise<AdapterResult<CaptureSource[]>> {
-  return invokeAdapter<CaptureSource[]>('ipc_list_remote_capture_sources', {
+  const args = {
     sessionId,
     includePreviews,
     ...(limit === undefined ? {} : { limit }),
-  });
+  };
+  return invokeBridgeOrTauri<CaptureSource[]>(
+    'ipc_list_remote_capture_sources',
+    args,
+    {
+      type: 'ListRemoteCaptureSources',
+      session_id: sessionId,
+      include_previews: includePreviews,
+      limit: limit ?? null,
+    },
+    responseField<CaptureSource[]>('sources')
+  );
 }
 
 /**
@@ -454,10 +645,19 @@ export async function ipcSelectRemoteCaptureSource(
   sessionId: string,
   sourceId: string
 ): Promise<AdapterResult<CaptureSourceSelection>> {
-  return invokeAdapter<CaptureSourceSelection>('ipc_select_remote_capture_source', {
-    sessionId,
-    sourceId,
-  });
+  return invokeBridgeOrTauri<CaptureSourceSelection>(
+    'ipc_select_remote_capture_source',
+    {
+      sessionId,
+      sourceId,
+    },
+    {
+      type: 'SelectRemoteCaptureSource',
+      session_id: sessionId,
+      source_id: sourceId,
+    },
+    responseField<CaptureSourceSelection>('selection')
+  );
 }
 
 /**
@@ -466,9 +666,17 @@ export async function ipcSelectRemoteCaptureSource(
 export async function ipcListRemoteDisplayModes(
   sessionId: string
 ): Promise<AdapterResult<DisplayMode[]>> {
-  return invokeAdapter<DisplayMode[]>('ipc_list_remote_display_modes', {
-    sessionId,
-  });
+  return invokeBridgeOrTauri<DisplayMode[]>(
+    'ipc_list_remote_display_modes',
+    {
+      sessionId,
+    },
+    {
+      type: 'ListRemoteDisplayModes',
+      session_id: sessionId,
+    },
+    responseField<DisplayMode[]>('modes')
+  );
 }
 
 /**
@@ -479,11 +687,21 @@ export async function ipcSetRemoteDisplayMode(
   mode: DisplayMode,
   restoreAfterSession = true
 ): Promise<AdapterResult<DisplayModeChange>> {
-  return invokeAdapter<DisplayModeChange>('ipc_set_remote_display_mode', {
-    sessionId,
-    mode,
-    restoreAfterSession,
-  });
+  return invokeBridgeOrTauri<DisplayModeChange>(
+    'ipc_set_remote_display_mode',
+    {
+      sessionId,
+      mode,
+      restoreAfterSession,
+    },
+    {
+      type: 'SetRemoteDisplayMode',
+      session_id: sessionId,
+      mode,
+      restore_after_session: restoreAfterSession,
+    },
+    responseField<DisplayModeChange>('change')
+  );
 }
 
 /**
@@ -492,9 +710,17 @@ export async function ipcSetRemoteDisplayMode(
 export async function ipcRestoreRemoteDisplayMode(
   sessionId: string
 ): Promise<AdapterResult<DisplayModeChange>> {
-  return invokeAdapter<DisplayModeChange>('ipc_restore_remote_display_mode', {
-    sessionId,
-  });
+  return invokeBridgeOrTauri<DisplayModeChange>(
+    'ipc_restore_remote_display_mode',
+    {
+      sessionId,
+    },
+    {
+      type: 'RestoreRemoteDisplayMode',
+      session_id: sessionId,
+    },
+    responseField<DisplayModeChange>('change')
+  );
 }
 
 /**
@@ -551,23 +777,41 @@ export async function ipcRecoverSession(
 export async function ipcSessionSnapshot(
   sessionId: string
 ): Promise<AdapterResult<SessionRuntimeSnapshot>> {
-  return invokeAdapter<SessionRuntimeSnapshot>('ipc_session_snapshot', {
-    sessionId,
-  });
+  return invokeBridgeOrTauri<SessionRuntimeSnapshot>(
+    'ipc_session_snapshot',
+    {
+      sessionId,
+    },
+    {
+      type: 'SessionRuntimeSnapshot',
+      session_id: sessionId,
+    },
+    responseField<SessionRuntimeSnapshot>('snapshot')
+  );
 }
 
 /**
  * List session summaries.
  */
 export async function ipcListSessions(): Promise<AdapterResult<SessionInfo[]>> {
-  return invokeAdapter<SessionInfo[]>('ipc_list_sessions');
+  return invokeBridgeOrTauri<SessionInfo[]>(
+    'ipc_list_sessions',
+    undefined,
+    { type: 'ListSessions' },
+    responseField<SessionInfo[]>('sessions')
+  );
 }
 
 /**
  * Get aggregated runtime snapshot.
  */
 export async function ipcRuntimeSnapshot(): Promise<AdapterResult<RuntimeSnapshot>> {
-  return invokeAdapter<RuntimeSnapshot>('ipc_runtime_snapshot');
+  return invokeBridgeOrTauri<RuntimeSnapshot>(
+    'ipc_runtime_snapshot',
+    undefined,
+    { type: 'RuntimeSnapshot' },
+    responseField<RuntimeSnapshot>('snapshot')
+  );
 }
 
 /**
@@ -583,7 +827,12 @@ export async function ipcAuditLog(
  * Get structured local capability snapshot from mrd-service.
  */
 export async function ipcCapabilitySnapshot(): Promise<AdapterResult<CapabilitySnapshot>> {
-  return invokeAdapter<CapabilitySnapshot>('ipc_capability_snapshot');
+  return invokeBridgeOrTauri<CapabilitySnapshot>(
+    'ipc_capability_snapshot',
+    undefined,
+    { type: 'CapabilitySnapshot' },
+    responseField<CapabilitySnapshot>('snapshot')
+  );
 }
 
 /**
@@ -592,9 +841,17 @@ export async function ipcCapabilitySnapshot(): Promise<AdapterResult<CapabilityS
 export async function ipcProbeSnapshot(
   sessionId: string
 ): Promise<AdapterResult<ProbeSnapshot>> {
-  return invokeAdapter<ProbeSnapshot>('ipc_probe_snapshot', {
-    sessionId,
-  });
+  return invokeBridgeOrTauri<ProbeSnapshot>(
+    'ipc_probe_snapshot',
+    {
+      sessionId,
+    },
+    {
+      type: 'ProbeSnapshot',
+      session_id: sessionId,
+    },
+    responseField<ProbeSnapshot>('snapshot')
+  );
 }
 
 /**
@@ -603,9 +860,17 @@ export async function ipcProbeSnapshot(
 export async function ipcMediaPipelineSnapshot(
   sessionId: string
 ): Promise<AdapterResult<MediaPipelineSnapshot>> {
-  return invokeAdapter<MediaPipelineSnapshot>('ipc_media_pipeline_snapshot', {
-    sessionId,
-  });
+  return invokeBridgeOrTauri<MediaPipelineSnapshot>(
+    'ipc_media_pipeline_snapshot',
+    {
+      sessionId,
+    },
+    {
+      type: 'MediaPipelineSnapshot',
+      session_id: sessionId,
+    },
+    responseField<MediaPipelineSnapshot>('snapshot')
+  );
 }
 
 // ============================================================================
@@ -629,9 +894,17 @@ export async function ipcStartSender(
 export async function ipcStartReceiver(
   sessionId: string
 ): Promise<AdapterResult<string>> {
-  return invokeAdapter<string>('ipc_start_receiver', {
-    sessionId,
-  });
+  return invokeBridgeOrTauri<string>(
+    'ipc_start_receiver',
+    {
+      sessionId,
+    },
+    {
+      type: 'StartReceiver',
+      session_id: sessionId,
+    },
+    responseField<string>('session_id')
+  );
 }
 
 // ============================================================================
@@ -736,6 +1009,16 @@ export async function testListScenarios(): Promise<AdapterResult<TestScenario[]>
  * Get current environment capabilities
  */
 export async function testGetCapabilities(): Promise<AdapterResult<EnvironmentSnapshot>> {
+  if (shouldUseServiceBridge()) {
+    const serviceSnapshot = await ipcCapabilitySnapshot();
+    if (serviceSnapshot.ok) {
+      return {
+        ok: true,
+        value: environmentFromCapabilitySnapshot(serviceSnapshot.value),
+      };
+    }
+  }
+
   const result = await invokeAdapter<EnvironmentSnapshot>('test_get_capabilities');
   if (result.ok) return result;
 
@@ -850,10 +1133,19 @@ export async function testGetRunTelemetry(
   runId: string,
   query?: TelemetryQuery
 ): Promise<AdapterResult<TelemetryBundle>> {
-  return invokeAdapter<TelemetryBundle>('test_get_run_telemetry', {
-    runId,
-    query: query ?? null,
-  });
+  return invokeBridgeOrTauri<TelemetryBundle>(
+    'test_get_run_telemetry',
+    {
+      runId,
+      query: query ?? null,
+    },
+    {
+      type: 'GetTelemetryBundle',
+      run_id: runId,
+      session_id: query && 'session_id' in query ? (query as Record<string, unknown>).session_id : null,
+    },
+    responseField<TelemetryBundle>('bundle')
+  );
 }
 
 /**

@@ -164,6 +164,10 @@ export function RemoteSessionPage() {
     useState<"idle" | "opening" | "open" | "failed">("idle");
   const [displayLaunchMessage, setDisplayLaunchMessage] =
     useState("原生显示窗口将承载远程画面");
+  const effectiveDisplayLaunchMessage =
+    isWebRemoteSession && displayLaunchMessage === "原生显示窗口将承载远程画面"
+      ? "网页渲染将承载本机 mrd-service 采集画面"
+      : displayLaunchMessage;
 
   const noDragSelector =
     'button, a, input, select, textarea, [role="button"], [role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"], [data-radix-collection-item], [data-no-drag="true"]';
@@ -393,7 +397,7 @@ export function RemoteSessionPage() {
   const handlePopOutWindow = async () => {
     if (!id) return;
     if (!isTauriRuntime()) {
-      navigate(`/session/${id}`);
+      navigate(`/display/${id}`);
       return;
     }
     setDisplayLaunchState("opening");
@@ -646,17 +650,19 @@ export function RemoteSessionPage() {
                 <div className="min-w-0">
                   <div className="flex items-center gap-2 text-sm font-semibold text-white">
                     <Monitor className="h-4 w-4 text-blue-300" />
-                    原生显示窗口承载画面
+                    {isWebRemoteSession ? "网页渲染路径承载画面" : "原生显示窗口承载画面"}
                   </div>
                   <div className="mt-1 text-xs text-gray-400">
-                    Rdesk 前端保留管理和状态，远程帧由后台原生窗口走 D3D11/Metal 渲染链路。
+                    {isWebRemoteSession
+                      ? "浏览器页面使用 WebRTC video 承载本机 mrd-service 采集流，不再映射到外部 D3D11 原生窗口。"
+                      : "Rdesk 前端保留管理和状态，远程帧由后台原生窗口走 D3D11/Metal 渲染链路。"}
                   </div>
                 </div>
                 <button
                   onClick={() => void handlePopOutWindow()}
                   className="shrink-0 rounded-md bg-blue-500/20 px-3 py-1.5 text-xs text-blue-100 hover:bg-blue-500/30"
                 >
-                  打开显示窗口
+                  {isWebRemoteSession ? "打开网页渲染" : "打开显示窗口"}
                 </button>
               </div>
               <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
@@ -669,7 +675,7 @@ export function RemoteSessionPage() {
                 <DisplayMetric label="解码帧" value={`${probeSnapshot?.frames_decoded ?? 0}`} />
               </div>
               <div className="mt-4 rounded-md bg-white/6 px-3 py-2 text-xs text-gray-300">
-                {displayLaunchMessage}
+                {effectiveDisplayLaunchMessage}
                 {activeDisplayWindow ? (
                   <span className="ml-2 text-gray-500">
                     {activeDisplayWindow.label} · {activeDisplayWindow.surface_id}

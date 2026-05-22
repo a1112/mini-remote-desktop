@@ -235,7 +235,7 @@ describe('RemoteSessionPage - Page Level Tests', () => {
       if (popOutButton) {
         await userEvent.click(popOutButton);
 
-        expect(mockNavigate).toHaveBeenCalledWith('/session/test-device-1');
+        expect(mockNavigate).toHaveBeenCalledWith('/display/test-device-1');
         expect(mockAlert).not.toHaveBeenCalled();
       }
 

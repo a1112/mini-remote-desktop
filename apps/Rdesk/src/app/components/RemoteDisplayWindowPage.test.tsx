@@ -2,7 +2,14 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { getMockInvoke } from "../../test/mocks/tauri";
-import { RemoteDisplayWindowPage } from "./RemoteDisplayWindowPage";
+import {
+  RemoteDisplayWindowPage,
+  applyWebRtcVideoMotionHint,
+  browserWebrtcPreviewH264Profile,
+  buildWebRtcDiagnosticsStageRows,
+  WebRtcPresentationLatencyTracker,
+  summarizeWebRtcInboundVideoStats,
+} from "./RemoteDisplayWindowPage";
 
 vi.mock("../utils/runtime", () => ({
   isTauriRuntime: () => true,
@@ -75,6 +82,14 @@ function windowsCapabilities() {
   };
 }
 
+function windowsOpenH264OnlyCapabilities() {
+  return {
+    ...windowsCapabilities(),
+    available_encoders: ["openh264"],
+    available_decoders: ["software"],
+  };
+}
+
 function linuxCapabilities() {
   return {
     os_type: "linux",
@@ -112,6 +127,187 @@ describe("RemoteDisplayWindowPage", () => {
     getMockInvoke().mockReset();
     mockRenderAreaRect();
     mockResizeObserver();
+  });
+
+  it("summarizes WebRTC inbound video stats for stutter diagnosis", () => {
+    const firstReport = new Map<string, Record<string, unknown>>([
+      [
+        "inbound-video",
+        {
+          type: "inbound-rtp",
+          kind: "video",
+          timestamp: 1_000,
+          framesDecoded: 1_000,
+          framesDropped: 2,
+          packetsLost: 0,
+          jitter: 0.002,
+          jitterBufferDelay: 0.5,
+          jitterBufferEmittedCount: 1_000,
+          totalDecodeTime: 0.3,
+          totalProcessingDelay: 0.8,
+          totalInterFrameDelay: 8.2,
+          freezeCount: 0,
+        },
+      ],
+    ]) as unknown as RTCStatsReport;
+    const first = summarizeWebRtcInboundVideoStats(firstReport, null, 1_000);
+
+    const secondReport = new Map<string, Record<string, unknown>>([
+      [
+        "inbound-video",
+        {
+          type: "inbound-rtp",
+          kind: "video",
+          timestamp: 2_000,
+          framesDecoded: 1_120,
+          framesDropped: 3,
+          packetsLost: 1,
+          jitter: 0.003,
+          jitterBufferDelay: 0.68,
+          jitterBufferEmittedCount: 1_120,
+          totalDecodeTime: 0.42,
+          totalProcessingDelay: 1.16,
+          totalInterFrameDelay: 9.2,
+          freezeCount: 1,
+        },
+      ],
+    ]) as unknown as RTCStatsReport;
+    const second = summarizeWebRtcInboundVideoStats(secondReport, first.counters, 2_000);
+
+    expect(second.stats?.decodedFps).toBeCloseTo(120);
+    expect(second.stats?.decodeAvgMs).toBeCloseTo(1);
+    expect(second.stats?.jitterBufferDelayAvgMs).toBeCloseTo(1.5);
+    expect(second.stats?.processingDelayAvgMs).toBeCloseTo(3);
+    expect(second.stats?.interFrameDelayAvgMs).toBeCloseTo(8.33, 1);
+    expect(second.stats?.framesDropped).toBe(3);
+
+    const rows = buildWebRtcDiagnosticsStageRows(second.stats);
+    expect(rows.map((row) => row.label)).toEqual([
+      "webrtc.decode_avg",
+      "webrtc.jitter_buffer_avg",
+      "webrtc.processing_avg",
+      "webrtc.render_interval_avg",
+    ]);
+  });
+
+  it("selects H.264 High for NVENC browser preview independent of matrix decoder field", () => {
+    expect(browserWebrtcPreviewH264Profile("nvenc_h264", "none")).toBe("high");
+    expect(browserWebrtcPreviewH264Profile("nvenc_h264", "software")).toBe("high");
+    expect(browserWebrtcPreviewH264Profile("openh264", "none")).toBe("baseline");
+  });
+
+  it("marks browser WebRTC video tracks as motion content", () => {
+    const track = { contentHint: "" } as MediaStreamTrack;
+
+    applyWebRtcVideoMotionHint(track);
+
+    expect(track.contentHint).toBe("motion");
+  });
+
+  it("estimates capture-to-present latency from browser WebRTC frame timing metadata", () => {
+    const tracker = new WebRtcPresentationLatencyTracker({ timeOriginMs: 1_000_000 });
+
+    tracker.addMetadata(
+      JSON.stringify({
+        type: "mrd.frame_timing.v1",
+        sequence: 1,
+        capture_unix_us: 1_000_010_000,
+      })
+    );
+    tracker.addMetadata(
+      JSON.stringify({
+        type: "mrd.frame_timing.v1",
+        sequence: 2,
+        capture_unix_us: 1_000_030_000,
+      })
+    );
+
+    const first = tracker.observeFrame(50, { presentedFrames: 1, presentationTime: 50 });
+    const second = tracker.observeFrame(82, { presentedFrames: 2, presentationTime: 82 });
+
+    expect(first?.latestMs).toBeCloseTo(40);
+    expect(second?.latestMs).toBeCloseTo(52);
+    expect(second?.p50Ms).toBeCloseTo(40);
+    expect(second?.p95Ms).toBeCloseTo(52);
+    expect(second?.samples).toBe(2);
+  });
+
+  it("catches up queued frame timing metadata on the first video callback", () => {
+    const tracker = new WebRtcPresentationLatencyTracker({ timeOriginMs: 1_000_000 });
+
+    for (let sequence = 1; sequence <= 120; sequence += 1) {
+      tracker.addMetadata(
+        JSON.stringify({
+          type: "mrd.frame_timing.v1",
+          sequence,
+          capture_unix_us: 1_000_000_000 + sequence * 8_333,
+        })
+      );
+    }
+
+    const stats = tracker.observeFrame(1_000, {
+      presentedFrames: 120,
+      presentationTime: 1_000,
+    });
+
+    expect(stats?.latestMs).toBeGreaterThanOrEqual(0);
+    expect(stats?.latestMs).toBeLessThan(20);
+  });
+
+  it("drops stale startup frame timing metadata before estimating presentation latency", () => {
+    const tracker = new WebRtcPresentationLatencyTracker({ timeOriginMs: 1_000_000 });
+
+    for (let sequence = 1; sequence <= 120; sequence += 1) {
+      tracker.addMetadata(
+        JSON.stringify({
+          type: "mrd.frame_timing.v1",
+          sequence,
+          capture_unix_us: 1_000_000_000 + sequence * 8_333,
+        })
+      );
+    }
+
+    const stats = tracker.observeFrame(1_000, {
+      presentedFrames: 1,
+      presentationTime: 1_000,
+    });
+
+    expect(stats?.latestMs).toBeLessThan(220);
+  });
+
+  it("prefers native WebRTC video frame captureTime when the browser exposes it", () => {
+    const tracker = new WebRtcPresentationLatencyTracker({ timeOriginMs: 1_000_000 });
+
+    const stats = tracker.observeFrame(120, {
+      presentedFrames: 1,
+      presentationTime: 120,
+      captureTime: 91,
+    });
+
+    expect(stats?.latestMs).toBeCloseTo(29);
+    expect(stats?.p95Ms).toBeCloseTo(29);
+  });
+
+  it("marks RTP timestamp matched frame timing as a precise E2E source", () => {
+    const tracker = new WebRtcPresentationLatencyTracker({ timeOriginMs: 1_000_000 });
+
+    tracker.addMetadata(
+      JSON.stringify({
+        type: "mrd.frame_timing.v1",
+        sequence: 1,
+        capture_unix_us: 1_000_040_000,
+        rtp_timestamp: 1234,
+      })
+    );
+
+    const stats = tracker.observeFrame(90, {
+      presentedFrames: 1,
+      presentationTime: 90,
+      rtpTimestamp: 1234,
+    });
+
+    expect(stats?.latestMs).toBeCloseTo(50);
+    expect(stats?.source).toBe("rtp_frame_timing_channel");
   });
 
   it("shows a green LAN diagnostics popover with HEVC and chroma metadata", async () => {
@@ -192,7 +388,13 @@ describe("RemoteDisplayWindowPage", () => {
           codec_fallback_reason: null,
           queue_depth: 0,
           dropped_frames: 2,
-          stage_metrics: [{ stage: "receiver.decode", p95_ms: 1.2, samples: 20 }],
+          stage_metrics: [
+            { stage: "sender.capture", p95_ms: 1.7, samples: 20 },
+            { stage: "sender.encode", p95_ms: 2.4, samples: 20 },
+            { stage: "sender.send_datagram", p95_ms: 3.1, samples: 20 },
+            { stage: "receiver.decode", p95_ms: 1.2, samples: 20 },
+            { stage: "receiver.present", p95_ms: 4.6, samples: 20 },
+          ],
         });
       }
       return Promise.resolve(null);
@@ -205,11 +407,23 @@ describe("RemoteDisplayWindowPage", () => {
 
     expect(await screen.findByText("远程诊断")).toBeInTheDocument();
     expect(screen.getByText("连接质量")).toBeInTheDocument();
+    expect(screen.getByText("性能曲线")).toBeInTheDocument();
+    expect(screen.getByText("阶段延迟 P95")).toBeInTheDocument();
+    expect(screen.getByText("sender.encode")).toBeInTheDocument();
     expect(screen.getByText("H.265 Main")).toBeInTheDocument();
     expect(screen.getByText("8-bit")).toBeInTheDocument();
     expect(screen.getByText("4:2:0")).toBeInTheDocument();
     expect(screen.getByText("NVDEC HEVC / D3D11")).toBeInTheDocument();
     expect(screen.getByText("DXGINative")).toBeInTheDocument();
+
+    fireEvent.click(diagnosticsChip);
+    fireEvent.mouseLeave(diagnosticsChip.parentElement ?? diagnosticsChip);
+    expect(screen.getByText("远程诊断")).toBeInTheDocument();
+
+    fireEvent.pointerDown(document.body);
+    await waitFor(() => {
+      expect(screen.queryByText("远程诊断")).not.toBeInTheDocument();
+    });
   });
 
   it("exposes 180 and 249 FPS high-refresh profile options", async () => {
@@ -468,16 +682,51 @@ describe("RemoteDisplayWindowPage", () => {
           scenarioId: "custom",
           config: expect.objectContaining({
             capture_type: "dxgi",
-            encoder_type: "openh264",
+            encoder_type: "nvenc_h264",
             decoder_type: "none",
             transport_kind: "webrtc",
-            fps: 60,
+            fps: 120,
             render_display: false,
             visual_preview: false,
             zero_copy: false,
           }),
         })
       );
+    });
+  });
+
+  it("blocks high-FPS browser rendering when only the OpenH264 diagnostic fallback is available", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(windowsOpenH264OnlyCapabilities());
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-local-display-test-1",
+          session_id: "local-display-test-1",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: false,
+          render_mode: "web",
+          native_surface_attached: false,
+          session_window_count: 1,
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay("local-display-test-1");
+
+    const startButton = await screen.findByRole("button", {
+      name: "Start local pipeline test",
+    });
+
+    await waitFor(() => {
+      expect(startButton).toBeDisabled();
+      expect(
+        screen.getByText(/网页 120 FPS 本机采集需要硬件 H\.264 编码器/)
+      ).toBeInTheDocument();
     });
   });
 
@@ -546,9 +795,10 @@ describe("RemoteDisplayWindowPage", () => {
           scenarioId: "custom",
           config: expect.objectContaining({
             capture_type: "linux",
-            encoder_type: "openh264",
+            encoder_type: "nvenc_h264",
             decoder_type: "none",
             transport_kind: "webrtc",
+            fps: 120,
             render_display: false,
             visual_preview: false,
             zero_copy: false,
