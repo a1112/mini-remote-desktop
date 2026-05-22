@@ -985,6 +985,24 @@ export function webCodecsMemoryPathLabelFromState(
   return "WebCodecs canvas";
 }
 
+export function webPreviewDecoderLabel(
+  engine: WebPreviewEngine,
+  fallbackLabel: string
+): string {
+  if (engine === "webcodecs") return "Browser WebCodecs";
+  if (engine === "webrtc") return "Browser video decode";
+  return fallbackLabel;
+}
+
+export function webPreviewTransportLabel(
+  engine: WebPreviewEngine,
+  fallbackLabel: string
+): string {
+  if (engine === "webcodecs") return "WebSocket AU bridge";
+  if (engine === "webrtc") return "WebRTC RTP";
+  return fallbackLabel;
+}
+
 const WEBRTC_LOW_LATENCY_PLAYOUT_SECONDS = 0.02;
 
 export function applyWebRtcReceiverLowLatencyHint(receiver?: RTCRtpReceiver | null) {
@@ -1187,10 +1205,7 @@ function resolveLocalWebViewPlan({
       ? `Web View 已切换到 ${optionLabel(captureOptions, profile.capture)} / ${optionLabel(
           encoderOptions,
           profile.encoder
-        )} / ${optionLabel(decoderOptions, profile.decoder)} / ${optionLabel(
-          transportOptions,
-          profile.transport
-        )} / ${optionLabel(fpsOptions, profile.fps)} / ${optionLabel(
+        )} / Browser video decode / WebRTC RTP / ${optionLabel(fpsOptions, profile.fps)} / ${optionLabel(
           bitrateOptions,
           profile.bitrate
         )}`
@@ -1257,6 +1272,28 @@ function TitleSelect<T extends string>({
         ))}
       </select>
     </label>
+  );
+}
+
+function ReadonlyTitleValue({
+  label,
+  value,
+  title,
+}: {
+  label: string;
+  value: string;
+  title?: string;
+}) {
+  return (
+    <div
+      className="flex h-9 min-w-0 items-center gap-1 rounded-md border border-white/10 bg-black/20 px-2 text-[10px] text-slate-400"
+      title={title ?? label}
+    >
+      <span className="shrink-0 uppercase tracking-normal">{label}</span>
+      <span className="min-w-0 truncate text-[11px] font-medium text-slate-100">
+        {value}
+      </span>
+    </div>
   );
 }
 
@@ -1819,7 +1856,11 @@ export function RemoteDisplayWindowPage() {
     mediaPipelineSnapshot?.active_pixel_format ??
     mediaProfileNegotiation?.selected.pixel_format ??
     probeSnapshot?.latest_frame_pixel_format ??
-    (renderMode === "web" && diagnosticsSelectedCodec ? "WebRTC 4:2:0" : "-");
+    (renderMode === "web" && diagnosticsSelectedCodec
+      ? webPreviewEngine === "webcodecs"
+        ? "WebCodecs H.264 Annex B"
+        : "WebRTC 4:2:0"
+      : "-");
   const diagnosticsBitDepth =
     mediaPipelineSnapshot?.active_bit_depth ??
     mediaProfileNegotiation?.selected.bit_depth ??
@@ -1902,19 +1943,24 @@ export function RemoteDisplayWindowPage() {
     return `display-${sessionId}`;
   }, [context?.label, sessionId]);
 
+  const displayDecoderLabel =
+    isLocalPipelinePreview && renderMode === "web"
+      ? webPreviewDecoderLabel(webPreviewEngine, optionLabel(decoderOptions, decoder))
+      : optionLabel(decoderOptions, decoder);
+  const displayTransportLabel =
+    isLocalPipelinePreview && renderMode === "web"
+      ? webPreviewTransportLabel(webPreviewEngine, optionLabel(transportOptions, transport))
+      : optionLabel(transportOptions, transport);
   const testDescription = useMemo(
     () =>
       `${optionLabel(captureOptions, capture)} -> ${optionLabel(
         encoderOptions,
         encoder
-      )} -> ${optionLabel(decoderOptions, decoder)} / ${optionLabel(
-        transportOptions,
-        transport
-      )} / ${optionLabel(resolutionOptions, resolution)} @ ${optionLabel(
+      )} -> ${displayDecoderLabel} / ${displayTransportLabel} / ${optionLabel(resolutionOptions, resolution)} @ ${optionLabel(
         fpsOptions,
         fps
       )} / ${optionLabel(bitrateOptions, bitrate)}`,
-    [bitrate, capture, decoder, encoder, fps, resolution, transport]
+    [bitrate, capture, displayDecoderLabel, displayTransportLabel, encoder, fps, resolution]
   );
   const buildTestConfig = useCallback((rendererTargetHwnd?: string | null, selection?: Partial<LocalWebViewProfile>) => {
     const selectedCapture = selection?.capture ?? capture;
@@ -1965,6 +2011,8 @@ export function RemoteDisplayWindowPage() {
     () => buildTestConfig(nativeSurface?.hwnd),
     [buildTestConfig, nativeSurface?.hwnd]
   );
+  const isTestBusy =
+    testStatus === "starting" || testStatus === "running" || testStatus === "stopping";
   const webCodecsStartBlockReason =
     isLocalPipelinePreview && renderMode === "web" && webPreviewEngine === "webcodecs"
       ? browserSupportsWebCodecsH264()
@@ -1974,6 +2022,28 @@ export function RemoteDisplayWindowPage() {
   const localStartBlockReason =
     webCodecsStartBlockReason ??
     (isLocalPipelinePreview && renderMode === "web" ? localWebViewPlan.reason : null);
+  const browserWebRtc2k144BlockReason = !isLocalPipelinePreview
+    ? "仅本机 Web View 测试可用"
+    : isTestBusy
+      ? "请先停止当前测试再切换测试档位"
+      : !browserSupportsH264WebrtcVideo()
+        ? "当前浏览器未声明 H.264 WebRTC 接收能力"
+        : capabilities &&
+            (!(capabilities.available_captures ?? []).includes("dxgi") ||
+              !capabilities.available_encoders.includes("nvenc_h264"))
+          ? "WebRTC 2K144 需要 Windows DXGI + NVENC H.264"
+          : null;
+  const browserWebCodecsUltraBlockReason = !isLocalPipelinePreview
+    ? "仅本机 Web View 测试可用"
+    : isTestBusy
+      ? "请先停止当前测试再切换测试档位"
+      : !browserSupportsWebCodecsH264()
+        ? "当前浏览器缺少 VideoDecoder / EncodedVideoChunk"
+        : capabilities &&
+            (!(capabilities.available_captures ?? []).includes("dxgi") ||
+              !capabilities.available_encoders.includes("nvenc_h264"))
+          ? "WebCodecs 2K144 需要 Windows DXGI + NVENC H.264"
+          : null;
   const buildRemoteMediaProfile = useCallback(() => {
     const [width, height] = resolution.split("x").map(Number) as [number, number];
     const hevc = isHevcEncoder(encoder);
@@ -1991,8 +2061,6 @@ export function RemoteDisplayWindowPage() {
       hdr_enabled: false,
     };
   }, [bitrate, encoder, fps, resolution]);
-  const isTestBusy =
-    testStatus === "starting" || testStatus === "running" || testStatus === "stopping";
   const localRenderSwitchLocked = isLocalPipelinePreview && isTestBusy;
 
   useEffect(() => {
@@ -3249,6 +3317,10 @@ export function RemoteDisplayWindowPage() {
   }, [capabilities, hostOs]);
 
   const applyBrowserWebRtc2k144LowLatencyProfile = useCallback(() => {
+    if (browserWebRtc2k144BlockReason) {
+      setTestMessage(browserWebRtc2k144BlockReason);
+      return;
+    }
     setWebPreviewEngine("webrtc");
     setCapture("dxgi");
     setEncoder("nvenc_h264");
@@ -3258,10 +3330,14 @@ export function RemoteDisplayWindowPage() {
     setFps("144");
     setBitrate("20");
     setRenderMode("web");
-    setTestMessage("WebRTC 2K144 低延迟档：RTP timestamp / 20 Mbps / Web View");
-  }, []);
+    setTestMessage("WebRTC 2K144 低延迟档：浏览器视频解码 / RTP timing / 20 Mbps / Web View");
+  }, [browserWebRtc2k144BlockReason]);
 
   const applyBrowserWebCodecsUltraLowLatencyProfile = useCallback(() => {
+    if (browserWebCodecsUltraBlockReason) {
+      setTestMessage(browserWebCodecsUltraBlockReason);
+      return;
+    }
     setWebPreviewEngine("webcodecs");
     setCapture("dxgi");
     setEncoder("nvenc_h264");
@@ -3272,11 +3348,9 @@ export function RemoteDisplayWindowPage() {
     setBitrate("20");
     setRenderMode("web");
     setTestMessage(
-      browserSupportsWebCodecsH264()
-        ? "WebCodecs 超低延迟路径：等待编码帧 bridge 接入"
-        : "WebCodecs 超低延迟路径：当前浏览器缺少 VideoDecoder"
+      "WebCodecs 2K144：WebSocket AU bridge / Worker + WebGL2 优先，自动回退 2D/主线程"
     );
-  }, []);
+  }, [browserWebCodecsUltraBlockReason]);
 
   const ensureRemoteCaptureSourceSelected = useCallback(async () => {
     if (isLocalPipelinePreview) return null;
@@ -3534,7 +3608,11 @@ export function RemoteDisplayWindowPage() {
         setBitrate(localWebViewPlan.profile.bitrate);
       }
       setTestStatus("running");
-      setTestMessage("网页 WebRTC 本机采集运行中");
+      setTestMessage(
+        webPreviewEngine === "webcodecs"
+          ? "网页 WebCodecs 本机采集运行中"
+          : "网页 WebRTC 本机采集运行中"
+      );
       return;
     }
 
@@ -4191,18 +4269,34 @@ export function RemoteDisplayWindowPage() {
                 options={visibleEncoderOptions}
                 onChange={setEncoder}
               />
-              <TitleSelect
-                label="DEC"
-                value={decoder}
-                options={visibleDecoderOptions}
-                onChange={setDecoder}
-              />
-              <TitleSelect
-                label="NET"
-                value={transport}
-                options={transportOptions}
-                onChange={setTransport}
-              />
+              {isLocalPipelinePreview && renderMode === "web" ? (
+                <ReadonlyTitleValue
+                  label="DEC"
+                  value={displayDecoderLabel}
+                  title="网页显示路径由浏览器负责解码，不使用矩阵里的本机 decoder 字段。"
+                />
+              ) : (
+                <TitleSelect
+                  label="DEC"
+                  value={decoder}
+                  options={visibleDecoderOptions}
+                  onChange={setDecoder}
+                />
+              )}
+              {isLocalPipelinePreview && renderMode === "web" && webPreviewEngine === "webcodecs" ? (
+                <ReadonlyTitleValue
+                  label="NET"
+                  value="WebSocket AU"
+                  title="WebCodecs 使用本机 mrd-service WebSocket 传输 H.264 access unit，不走 WebRTC RTP。"
+                />
+              ) : (
+                <TitleSelect
+                  label="NET"
+                  value={transport}
+                  options={transportOptions}
+                  onChange={setTransport}
+                />
+              )}
               <TitleSelect
                 label="SIZE"
                 value={resolution}
@@ -4309,16 +4403,20 @@ export function RemoteDisplayWindowPage() {
                 {isLocalPipelinePreview && (
                   <>
                     <button
-                      className="rounded-md border border-sky-400/30 px-3 py-1.5 text-[11px] font-medium text-sky-100 hover:bg-sky-500/15"
+                      className="rounded-md border border-sky-400/30 px-3 py-1.5 text-[11px] font-medium text-sky-100 hover:bg-sky-500/15 disabled:cursor-not-allowed disabled:opacity-45"
                       onClick={applyBrowserWebRtc2k144LowLatencyProfile}
+                      disabled={Boolean(browserWebRtc2k144BlockReason)}
+                      title={browserWebRtc2k144BlockReason ?? "浏览器 WebRTC H.264 RTP 预览路径"}
                     >
                       WebRTC 2K144
                     </button>
                     <button
-                      className="rounded-md border border-violet-400/30 px-3 py-1.5 text-[11px] font-medium text-violet-100 hover:bg-violet-500/15"
+                      className="rounded-md border border-violet-400/30 px-3 py-1.5 text-[11px] font-medium text-violet-100 hover:bg-violet-500/15 disabled:cursor-not-allowed disabled:opacity-45"
                       onClick={applyBrowserWebCodecsUltraLowLatencyProfile}
+                      disabled={Boolean(browserWebCodecsUltraBlockReason)}
+                      title={browserWebCodecsUltraBlockReason ?? "浏览器 WebCodecs + WebSocket AU + WebGL2 优先路径"}
                     >
-                      WebCodecs Ultra
+                      WebCodecs WebGL2
                     </button>
                   </>
                 )}

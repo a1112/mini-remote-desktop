@@ -7,6 +7,8 @@ import {
   applyWebRtcReceiverLowLatencyHint,
   applyWebRtcVideoMotionHint,
   webCodecsMemoryPathLabelFromState,
+  webPreviewDecoderLabel,
+  webPreviewTransportLabel,
   browserSupportsWebCodecsWorkerRendering,
   browserWebrtcPreviewH264Profile,
   buildWebRtcDiagnosticsStageRows,
@@ -807,7 +809,7 @@ describe("RemoteDisplayWindowPage", () => {
     });
   });
 
-  it("shows WebCodecs ultra-low-latency as an explicit prototype path", async () => {
+  it("disables WebCodecs WebGL2 when browser decoder APIs are missing", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {
       if (command === "test_get_capabilities") {
@@ -831,17 +833,13 @@ describe("RemoteDisplayWindowPage", () => {
     renderRemoteDisplay("local-display-test-1");
 
     fireEvent.click(await screen.findByRole("button", { name: "测试配置" }));
-    fireEvent.click(await screen.findByRole("button", { name: "WebCodecs Ultra" }));
+    const webCodecsButton = await screen.findByRole("button", { name: "WebCodecs WebGL2" });
 
-    expect(
-      await screen.findByText("WebCodecs 超低延迟路径", {
-        selector: ".text-sm",
-      })
-    ).toBeInTheDocument();
-    expect(
-      screen.getAllByText(/WebCodecs 超低延迟路径需要/)
-    ).not.toHaveLength(0);
-    expect(screen.getByRole("button", { name: "开始测试" })).toBeDisabled();
+    expect(webCodecsButton).toBeDisabled();
+    expect(webCodecsButton).toHaveAttribute(
+      "title",
+      expect.stringContaining("缺少 VideoDecoder")
+    );
   });
 
   it("allows WebCodecs ultra-low-latency start when the browser decoder APIs exist", async () => {
@@ -870,7 +868,7 @@ describe("RemoteDisplayWindowPage", () => {
     renderRemoteDisplay("local-display-test-1");
 
     fireEvent.click(await screen.findByRole("button", { name: "测试配置" }));
-    fireEvent.click(await screen.findByRole("button", { name: "WebCodecs Ultra" }));
+    fireEvent.click(await screen.findByRole("button", { name: "WebCodecs WebGL2" }));
 
     expect(screen.getByRole("button", { name: "开始测试" })).toBeEnabled();
   });
@@ -900,6 +898,13 @@ describe("RemoteDisplayWindowPage", () => {
     expect(webCodecsMemoryPathLabelFromState("webcodecs-worker:connecting")).toBe(
       "OffscreenCanvas"
     );
+  });
+
+  it("uses browser-preview labels instead of matrix-only decoder and transport labels", () => {
+    expect(webPreviewDecoderLabel("webcodecs", "No decode")).toBe("Browser WebCodecs");
+    expect(webPreviewTransportLabel("webcodecs", "WebRTC")).toBe("WebSocket AU bridge");
+    expect(webPreviewDecoderLabel("webrtc", "No decode")).toBe("Browser video decode");
+    expect(webPreviewTransportLabel("webrtc", "WebRTC")).toBe("WebRTC RTP");
   });
 
   it("blocks high-FPS browser rendering when only the OpenH264 diagnostic fallback is available", async () => {
