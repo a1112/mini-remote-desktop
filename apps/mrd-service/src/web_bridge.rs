@@ -7,6 +7,7 @@ use crate::{
         BrowserWebrtcPreviewHost, BrowserWebrtcPreviewStartRequest, BrowserWebrtcPreviewStopRequest,
     },
     ipc_server::IpcServer,
+    resource_monitor::{ResourceMonitor, ResourceSnapshotRequest},
 };
 use anyhow::{anyhow, Context, Result};
 use axum::{
@@ -102,6 +103,7 @@ struct WebBridgeState {
     config: WebBridgeConfig,
     ipc_server: IpcServer,
     browser_webrtc_preview: Arc<Mutex<BrowserWebrtcPreviewHost>>,
+    resource_monitor: Arc<Mutex<ResourceMonitor>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -178,6 +180,7 @@ pub fn build_router(ipc_server: IpcServer, config: WebBridgeConfig) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/health", get(health))
+        .route("/resource", post(resource_snapshot))
         .route("/ipc", post(ipc_handler))
         .route("/ws", get(ws_handler))
         .route(
@@ -196,6 +199,7 @@ pub fn build_router(ipc_server: IpcServer, config: WebBridgeConfig) -> Router {
             config,
             ipc_server,
             browser_webrtc_preview: Arc::new(Mutex::new(BrowserWebrtcPreviewHost::default())),
+            resource_monitor: Arc::new(Mutex::new(ResourceMonitor::new())),
         })
         .layer(cors)
 }
@@ -211,6 +215,19 @@ async fn health(State(state): State<WebBridgeState>) -> Json<HealthResponse> {
         bridge_enabled: state.config.enabled,
         bind: state.config.bind().to_string(),
     })
+}
+
+async fn resource_snapshot(
+    State(state): State<WebBridgeState>,
+    headers: HeaderMap,
+    Json(request): Json<ResourceSnapshotRequest>,
+) -> Response {
+    if let Err(response) = authorize_headers(&state.config, &headers) {
+        return bridge_error_from_ipc_response(response).into_response();
+    }
+
+    let snapshot = state.resource_monitor.lock().await.snapshot(request.target);
+    Json(snapshot).into_response()
 }
 
 async fn ipc_handler(

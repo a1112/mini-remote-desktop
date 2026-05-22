@@ -12,6 +12,7 @@ pub mod handlers;
 pub mod ipc_server;
 pub mod lan_discovery;
 pub mod media_adaptation;
+pub mod resource_monitor;
 pub mod shell;
 pub mod web_bridge;
 

@@ -868,6 +868,7 @@ export interface SystemResourceSnapshot {
   target_name: string;
   target_pid?: number | null;
   target_found: boolean;
+  cpu_metrics_available?: boolean;
   cpu_usage_percent: number;
   memory_used_mb: number;
   memory_total_mb: number;

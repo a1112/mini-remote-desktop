@@ -155,15 +155,17 @@ fn get_hardware_info() -> Result<HardwareInfo, String> {
 #[tauri::command]
 async fn get_system_resource_snapshot(
     state: tauri::State<'_, AppState>,
+    target: Option<String>,
 ) -> Result<SystemResourceSnapshot, String> {
     let service_pid = query_service_pid().await;
     let harness_running = state.test_harness.lock().unwrap().get_metrics().is_running;
-    let (target_pid, target_name) = if harness_running {
-        (Some(std::process::id()), "Rdesk Workbench")
-    } else if service_pid.is_some() {
-        (service_pid, "mrd-service")
-    } else {
-        (Some(std::process::id()), "Rdesk Workbench")
+    let target_kind = target.as_deref().unwrap_or("auto");
+    let (target_pid, target_name) = match target_kind {
+        "display" | "rdesk" | "rdesk-display" => (Some(std::process::id()), "Rdesk display"),
+        "mrd-service" | "service" => (service_pid, "mrd-service"),
+        _ if harness_running => (Some(std::process::id()), "Rdesk Workbench"),
+        _ if service_pid.is_some() => (service_pid, "mrd-service"),
+        _ => (Some(std::process::id()), "Rdesk Workbench"),
     };
 
     Ok(state

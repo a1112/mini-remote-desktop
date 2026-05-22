@@ -355,7 +355,7 @@ describe("RemoteDisplayWindowPage", () => {
 
   it("shows a green LAN diagnostics popover with HEVC and chroma metadata", async () => {
     const mockInvoke = getMockInvoke();
-    mockInvoke.mockImplementation((command: string) => {
+    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
       if (command === "test_get_capabilities") {
         return Promise.resolve(windowsCapabilities());
       }
@@ -440,6 +440,29 @@ describe("RemoteDisplayWindowPage", () => {
           ],
         });
       }
+      if (command === "get_system_resource_snapshot") {
+        const isDisplay = args?.target === "display";
+        return Promise.resolve({
+          target_name: isDisplay ? "Rdesk display" : "mrd-service",
+          target_pid: isDisplay ? 111 : 222,
+          target_found: true,
+          cpu_metrics_available: true,
+          cpu_usage_percent: isDisplay ? 6.5 : 12.5,
+          memory_used_mb: isDisplay ? 384 : 256,
+          memory_total_mb: 32768,
+          memory_usage_percent: isDisplay ? 1.2 : 0.8,
+          gpu_usage_percent: isDisplay ? 18 : 22,
+          gpu_memory_used_mb: isDisplay ? 512 : 1024,
+          gpu_memory_total_mb: 8192,
+          gpu_metrics_available: true,
+          gpu_metrics_scope: isDisplay ? "system" : "process",
+          network_rx_bps: isDisplay ? 2_000_000 : 3_000_000,
+          network_tx_bps: isDisplay ? 1_000_000 : 4_000_000,
+          network_metrics_available: true,
+          network_metrics_scope: "system",
+          sampled_at_ms: Date.now(),
+        });
+      }
       return Promise.resolve(null);
     });
 
@@ -451,6 +474,9 @@ describe("RemoteDisplayWindowPage", () => {
     expect(await screen.findByText("远程诊断")).toBeInTheDocument();
     expect(screen.getByText("连接质量")).toBeInTheDocument();
     expect(screen.getByText("性能曲线")).toBeInTheDocument();
+    expect(screen.getByText("资源占用曲线")).toBeInTheDocument();
+    expect(screen.getByText("mrd-service CPU / 内存")).toBeInTheDocument();
+    expect(screen.getByText("接收显示 CPU / 内存")).toBeInTheDocument();
     expect(screen.getByText("阶段延迟 P95")).toBeInTheDocument();
     expect(screen.getByText("sender.encode")).toBeInTheDocument();
     expect(screen.getByText("H.265 Main")).toBeInTheDocument();

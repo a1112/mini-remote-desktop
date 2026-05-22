@@ -923,8 +923,61 @@ export async function getHardwareInfo(): Promise<AdapterResult<HardwareInfo>> {
   return invokeAdapter<HardwareInfo>('get_hardware_info');
 }
 
-export async function getSystemResourceSnapshot(): Promise<AdapterResult<SystemResourceSnapshot>> {
-  return invokeAdapter<SystemResourceSnapshot>('get_system_resource_snapshot');
+export type SystemResourceTarget = 'auto' | 'mrd-service' | 'display';
+
+export async function getSystemResourceSnapshot(
+  target: SystemResourceTarget = 'auto'
+): Promise<AdapterResult<SystemResourceSnapshot>> {
+  if (shouldUseServiceBridge()) {
+    if (target === 'display') {
+      return { ok: true, value: browserDisplayResourceSnapshot() };
+    }
+    return postServiceBridgeJson<SystemResourceSnapshot>('/resource', {
+      target: target === 'auto' ? 'mrd_service' : target.replace('-', '_'),
+    });
+  }
+
+  return invokeAdapter<SystemResourceSnapshot>(
+    'get_system_resource_snapshot',
+    target === 'auto' ? undefined : { target }
+  );
+}
+
+function browserDisplayResourceSnapshot(): SystemResourceSnapshot {
+  const memory = (performance as Performance & {
+    memory?: {
+      usedJSHeapSize?: number;
+      totalJSHeapSize?: number;
+      jsHeapSizeLimit?: number;
+    };
+  }).memory;
+  const usedMb = bytesToMb(memory?.usedJSHeapSize ?? 0);
+  const totalMb = bytesToMb(memory?.jsHeapSizeLimit ?? memory?.totalJSHeapSize ?? 0);
+
+  return {
+    target_name: 'Browser display',
+    target_pid: null,
+    target_found: true,
+    cpu_metrics_available: false,
+    cpu_usage_percent: 0,
+    memory_used_mb: usedMb,
+    memory_total_mb: totalMb,
+    memory_usage_percent: totalMb > 0 ? Math.min(100, usedMb / totalMb * 100) : 0,
+    gpu_usage_percent: null,
+    gpu_memory_used_mb: null,
+    gpu_memory_total_mb: null,
+    gpu_metrics_available: false,
+    gpu_metrics_scope: 'unavailable',
+    network_rx_bps: 0,
+    network_tx_bps: 0,
+    network_metrics_available: false,
+    network_metrics_scope: 'unavailable',
+    sampled_at_ms: Date.now(),
+  };
+}
+
+function bytesToMb(bytes: number): number {
+  return Math.round(Math.max(0, bytes) / 1024 / 1024);
 }
 
 /**

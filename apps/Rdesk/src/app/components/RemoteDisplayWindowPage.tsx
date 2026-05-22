@@ -25,6 +25,7 @@ import {
   closeRemoteDisplayWindow,
   configureRemoteDisplayNativeSurface,
   currentRemoteDisplayWindowContext,
+  getSystemResourceSnapshot,
   ipcMediaPipelineSnapshot,
   presentRemotePreviewFrameOnNativeSurface,
   presentTestHarnessFrameOnNativeSurface,
@@ -42,6 +43,7 @@ import {
   type MediaPipelineSnapshot,
   type NativeRenderSurfaceSnapshot,
   type RemoteDisplayWindowContext,
+  type SystemResourceSnapshot,
   type TestConfig,
   type TestMatrixConfig,
   type TestRun,
@@ -101,6 +103,20 @@ type DiagnosticsSample = {
   queueDepth: number | null;
   droppedFrames: number | null;
   bitrateMbps: number | null;
+  serviceCpuPercent: number | null;
+  serviceMemoryPercent: number | null;
+  serviceMemoryMb: number | null;
+  serviceGpuPercent: number | null;
+  serviceGpuMemoryMb: number | null;
+  serviceNetworkRxMbps: number | null;
+  serviceNetworkTxMbps: number | null;
+  displayCpuPercent: number | null;
+  displayMemoryPercent: number | null;
+  displayMemoryMb: number | null;
+  displayGpuPercent: number | null;
+  displayGpuMemoryMb: number | null;
+  displayNetworkRxMbps: number | null;
+  displayNetworkTxMbps: number | null;
 };
 
 type DiagnosticsStageRow = {
@@ -460,6 +476,24 @@ function formatPercent(value: number) {
   return `${Math.max(0, value).toFixed(value >= 10 ? 0 : 1)}%`;
 }
 
+function formatOptionalPercent(value?: number | null) {
+  return typeof value === "number" ? formatPercent(value) : "-";
+}
+
+function formatMb(value?: number | null) {
+  return typeof value === "number" ? `${value.toLocaleString()} MB` : "-";
+}
+
+function bpsToMbps(value?: number | null) {
+  return typeof value === "number" ? value * 8 / 1_000_000 : null;
+}
+
+function sumNullable(...values: Array<number | null | undefined>) {
+  const finiteValues = values.filter((value): value is number => typeof value === "number");
+  if (finiteValues.length === 0) return null;
+  return finiteValues.reduce((total, value) => total + value, 0);
+}
+
 function formatCount(value?: number | null) {
   return typeof value === "number" ? value.toLocaleString() : "-";
 }
@@ -723,6 +757,16 @@ function hasDiagnosticsSampleValue(sample: DiagnosticsSample) {
     sample.queueDepth,
     sample.droppedFrames,
     sample.bitrateMbps,
+    sample.serviceCpuPercent,
+    sample.serviceMemoryPercent,
+    sample.serviceGpuPercent,
+    sample.serviceNetworkRxMbps,
+    sample.serviceNetworkTxMbps,
+    sample.displayCpuPercent,
+    sample.displayMemoryPercent,
+    sample.displayGpuPercent,
+    sample.displayNetworkRxMbps,
+    sample.displayNetworkTxMbps,
   ].some((value) => typeof value === "number");
 }
 
@@ -1546,6 +1590,27 @@ function DiagnosticMetricTile({
   );
 }
 
+function resourceMetric(
+  snapshot: SystemResourceSnapshot | null,
+  value: (snapshot: SystemResourceSnapshot) => number | null | undefined
+) {
+  if (!snapshot?.target_found) return null;
+  const next = value(snapshot);
+  return typeof next === "number" && Number.isFinite(next) ? next : null;
+}
+
+function resourceNetworkSubtitle(snapshot: SystemResourceSnapshot | null) {
+  if (!snapshot?.network_metrics_available) return "网络指标不可用";
+  const scope = snapshot.network_metrics_scope === "system" ? "系统网卡" : "进程";
+  return `${scope} RX/TX`;
+}
+
+function resourceGpuSubtitle(snapshot: SystemResourceSnapshot | null) {
+  if (!snapshot?.gpu_metrics_available) return "GPU 指标不可用";
+  const scope = snapshot.gpu_metrics_scope === "process" ? "进程显存 / 系统利用率" : "系统 GPU";
+  return scope;
+}
+
 function DiagnosticStageList({ rows }: { rows: DiagnosticsStageRow[] }) {
   const visibleRows = rows.filter((row) => typeof row.value === "number");
   return (
@@ -1664,6 +1729,10 @@ export function RemoteDisplayWindowPage() {
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
   const [diagnosticsPinned, setDiagnosticsPinned] = useState(false);
   const [diagnosticsSamples, setDiagnosticsSamples] = useState<DiagnosticsSample[]>([]);
+  const [serviceResourceSnapshot, setServiceResourceSnapshot] =
+    useState<SystemResourceSnapshot | null>(null);
+  const [displayResourceSnapshot, setDisplayResourceSnapshot] =
+    useState<SystemResourceSnapshot | null>(null);
 
   const sessionId = id ?? context?.session_id ?? "local-preview";
   const activeSurfaceId = context?.surface_id ?? surfaceId;
@@ -2081,6 +2150,62 @@ export function RemoteDisplayWindowPage() {
       ? metrics.dropped_frames / metrics.frame_count * 100
       : remoteDropRatio;
   const diagnosticsQueueDepth = mediaPipelineSnapshot?.queue_depth ?? null;
+  const diagnosticsServiceCpuPercent = resourceMetric(
+    serviceResourceSnapshot,
+    (snapshot) => snapshot.cpu_metrics_available === false ? null : snapshot.cpu_usage_percent
+  );
+  const diagnosticsServiceMemoryPercent = resourceMetric(
+    serviceResourceSnapshot,
+    (snapshot) => snapshot.memory_usage_percent
+  );
+  const diagnosticsServiceMemoryMb = resourceMetric(
+    serviceResourceSnapshot,
+    (snapshot) => snapshot.memory_used_mb
+  );
+  const diagnosticsServiceGpuPercent = resourceMetric(
+    serviceResourceSnapshot,
+    (snapshot) => snapshot.gpu_usage_percent
+  );
+  const diagnosticsServiceGpuMemoryMb = resourceMetric(
+    serviceResourceSnapshot,
+    (snapshot) => snapshot.gpu_memory_used_mb
+  );
+  const diagnosticsServiceNetworkRxMbps = resourceMetric(
+    serviceResourceSnapshot,
+    (snapshot) => bpsToMbps(snapshot.network_rx_bps)
+  );
+  const diagnosticsServiceNetworkTxMbps = resourceMetric(
+    serviceResourceSnapshot,
+    (snapshot) => bpsToMbps(snapshot.network_tx_bps)
+  );
+  const diagnosticsDisplayCpuPercent = resourceMetric(
+    displayResourceSnapshot,
+    (snapshot) => snapshot.cpu_metrics_available === false ? null : snapshot.cpu_usage_percent
+  );
+  const diagnosticsDisplayMemoryPercent = resourceMetric(
+    displayResourceSnapshot,
+    (snapshot) => snapshot.memory_usage_percent
+  );
+  const diagnosticsDisplayMemoryMb = resourceMetric(
+    displayResourceSnapshot,
+    (snapshot) => snapshot.memory_used_mb
+  );
+  const diagnosticsDisplayGpuPercent = resourceMetric(
+    displayResourceSnapshot,
+    (snapshot) => snapshot.gpu_usage_percent
+  );
+  const diagnosticsDisplayGpuMemoryMb = resourceMetric(
+    displayResourceSnapshot,
+    (snapshot) => snapshot.gpu_memory_used_mb
+  );
+  const diagnosticsDisplayNetworkRxMbps = resourceMetric(
+    displayResourceSnapshot,
+    (snapshot) => bpsToMbps(snapshot.network_rx_bps)
+  );
+  const diagnosticsDisplayNetworkTxMbps = resourceMetric(
+    displayResourceSnapshot,
+    (snapshot) => bpsToMbps(snapshot.network_tx_bps)
+  );
   const diagnosticsTargetFps =
     mediaPipelineSnapshot?.active_fps ??
     probeSnapshot?.media_probe_target_fps ??
@@ -2106,6 +2231,20 @@ export function RemoteDisplayWindowPage() {
     queueDepth: diagnosticsQueueDepth,
     droppedFrames: diagnosticsDroppedFrames,
     bitrateMbps: diagnosticsBitrateMbps,
+    serviceCpuPercent: diagnosticsServiceCpuPercent,
+    serviceMemoryPercent: diagnosticsServiceMemoryPercent,
+    serviceMemoryMb: diagnosticsServiceMemoryMb,
+    serviceGpuPercent: diagnosticsServiceGpuPercent,
+    serviceGpuMemoryMb: diagnosticsServiceGpuMemoryMb,
+    serviceNetworkRxMbps: diagnosticsServiceNetworkRxMbps,
+    serviceNetworkTxMbps: diagnosticsServiceNetworkTxMbps,
+    displayCpuPercent: diagnosticsDisplayCpuPercent,
+    displayMemoryPercent: diagnosticsDisplayMemoryPercent,
+    displayMemoryMb: diagnosticsDisplayMemoryMb,
+    displayGpuPercent: diagnosticsDisplayGpuPercent,
+    displayGpuMemoryMb: diagnosticsDisplayGpuMemoryMb,
+    displayNetworkRxMbps: diagnosticsDisplayNetworkRxMbps,
+    displayNetworkTxMbps: diagnosticsDisplayNetworkTxMbps,
   };
   const diagnosticsStageRows = useMemo<DiagnosticsStageRow[]>(() => {
     const pipelineRows =
@@ -2208,6 +2347,34 @@ export function RemoteDisplayWindowPage() {
   useEffect(() => {
     setDiagnosticsSamples([]);
   }, [sessionId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let inFlight = false;
+
+    const refreshResources = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const [serviceResult, displayResult] = await Promise.all([
+          getSystemResourceSnapshot("mrd-service"),
+          getSystemResourceSnapshot("display"),
+        ]);
+        if (cancelled) return;
+        if (serviceResult.ok) setServiceResourceSnapshot(serviceResult.value);
+        if (displayResult.ok) setDisplayResourceSnapshot(displayResult.value);
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    void refreshResources();
+    const interval = window.setInterval(() => void refreshResources(), 2_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, []);
 
   useEffect(() => {
     const record = () => {
@@ -4630,6 +4797,81 @@ export function RemoteDisplayWindowPage() {
                       />
                     </div>
                   </section>
+                  <section className="rounded-md border border-emerald-400/10 bg-emerald-950/20 p-3">
+                    <div className="mb-3 flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-2 text-[12px] font-semibold text-emerald-100">
+                        <Activity className="h-3.5 w-3.5 text-emerald-300" />
+                        资源占用曲线
+                      </div>
+                      <div className="text-[10px] text-emerald-200/55">
+                        mrd-service / 接收显示
+                      </div>
+                    </div>
+                    <div className="grid gap-3">
+                      <DiagnosticMetricTile
+                        title="mrd-service CPU / 内存"
+                        value={`${formatOptionalPercent(diagnosticsServiceCpuPercent)} / ${formatOptionalPercent(
+                          diagnosticsServiceMemoryPercent
+                        )}`}
+                        subtitle={`${dash(serviceResourceSnapshot?.target_name)} PID ${dash(
+                          serviceResourceSnapshot?.target_pid
+                        )} / ${formatMb(diagnosticsServiceMemoryMb)}`}
+                        samples={diagnosticsSamples}
+                        sampleValue={(sample) => sample.serviceCpuPercent}
+                        colorClass="text-emerald-300"
+                      />
+                      <DiagnosticMetricTile
+                        title="mrd-service GPU / 网络"
+                        value={`${formatOptionalPercent(diagnosticsServiceGpuPercent)} / ${formatMbps(
+                          sumNullable(
+                            diagnosticsServiceNetworkRxMbps,
+                            diagnosticsServiceNetworkTxMbps
+                          )
+                        )}`}
+                        subtitle={`${resourceGpuSubtitle(serviceResourceSnapshot)} / ${resourceNetworkSubtitle(
+                          serviceResourceSnapshot
+                        )}`}
+                        samples={diagnosticsSamples}
+                        sampleValue={(sample) =>
+                          typeof sample.serviceGpuPercent === "number"
+                            ? sample.serviceGpuPercent
+                            : sumNullable(sample.serviceNetworkRxMbps, sample.serviceNetworkTxMbps)
+                        }
+                        colorClass="text-lime-300"
+                      />
+                      <DiagnosticMetricTile
+                        title="接收显示 CPU / 内存"
+                        value={`${formatOptionalPercent(diagnosticsDisplayCpuPercent)} / ${formatOptionalPercent(
+                          diagnosticsDisplayMemoryPercent
+                        )}`}
+                        subtitle={`${dash(displayResourceSnapshot?.target_name)} / ${formatMb(
+                          diagnosticsDisplayMemoryMb
+                        )}`}
+                        samples={diagnosticsSamples}
+                        sampleValue={(sample) => sample.displayCpuPercent ?? sample.displayMemoryPercent}
+                        colorClass="text-cyan-300"
+                      />
+                      <DiagnosticMetricTile
+                        title="接收显示 GPU / 网络"
+                        value={`${formatOptionalPercent(diagnosticsDisplayGpuPercent)} / ${formatMbps(
+                          sumNullable(
+                            diagnosticsDisplayNetworkRxMbps,
+                            diagnosticsDisplayNetworkTxMbps
+                          )
+                        )}`}
+                        subtitle={`${resourceGpuSubtitle(displayResourceSnapshot)} / ${resourceNetworkSubtitle(
+                          displayResourceSnapshot
+                        )}`}
+                        samples={diagnosticsSamples}
+                        sampleValue={(sample) =>
+                          typeof sample.displayGpuPercent === "number"
+                            ? sample.displayGpuPercent
+                            : sumNullable(sample.displayNetworkRxMbps, sample.displayNetworkTxMbps)
+                        }
+                        colorClass="text-violet-300"
+                      />
+                    </div>
+                  </section>
                   <DiagnosticStageList rows={diagnosticsStageRows} />
                   {webRtcReceiverStats ? (
                     <DiagnosticGroup
@@ -4704,6 +4946,8 @@ export function RemoteDisplayWindowPage() {
                       ["本机 GPU", dash(capabilities?.gpu_info)],
                       ["本机内存", capabilities?.memory_gb ? `${capabilities.memory_gb}G` : "-"],
                       ["本机系统", dash(capabilities?.os_type)],
+                      ["mrd-service 资源", `${formatOptionalPercent(diagnosticsServiceCpuPercent)} CPU / ${formatMb(diagnosticsServiceMemoryMb)}`],
+                      ["接收显示资源", `${formatOptionalPercent(diagnosticsDisplayCpuPercent)} CPU / ${formatMb(diagnosticsDisplayMemoryMb)}`],
                       ["远端 Device", dash(sessionSnapshot?.session_id)],
                       ["Build ID", dash(context?.label)],
                       ["解码器", decoderLabel(mediaPipelineSnapshot?.active_decoder ?? decoder)],
