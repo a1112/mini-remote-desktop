@@ -13,11 +13,14 @@ import {
   browserWebrtcPreviewH264Profile,
   buildWebRtcDiagnosticsStageRows,
   WebRtcPresentationLatencyTracker,
+  shouldAutoSwitchWebRtcVideoToWebCodecs,
   summarizeWebRtcInboundVideoStats,
 } from "./RemoteDisplayWindowPage";
 
+const runtimeMock = vi.hoisted(() => ({ isTauri: true }));
+
 vi.mock("../utils/runtime", () => ({
-  isTauriRuntime: () => true,
+  isTauriRuntime: () => runtimeMock.isTauri,
 }));
 
 vi.mock("../utils/tauriWindow", () => ({
@@ -131,6 +134,7 @@ describe("RemoteDisplayWindowPage", () => {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
     getMockInvoke().mockReset();
+    runtimeMock.isTauri = true;
     mockRenderAreaRect();
     mockResizeObserver();
   });
@@ -353,9 +357,71 @@ describe("RemoteDisplayWindowPage", () => {
     expect(stats?.source).toBe("rtp_frame_timing_channel");
   });
 
+  it("does not auto-switch explicit WebRTC video tests to WebCodecs", () => {
+    expect(
+      shouldAutoSwitchWebRtcVideoToWebCodecs({
+        targetFps: 120,
+        actualFps: 57,
+        latencyP95Ms: 196,
+        metadataAgeMs: 109,
+        jitterBufferMs: 39,
+        webCodecsAvailable: true,
+        allowAutoSwitch: false,
+        alreadyAttempted: false,
+      })
+    ).toEqual({ shouldSwitch: false, reason: null });
+  });
+
+  it("auto-switches production WebRTC video backlog to the separate WebCodecs web path", () => {
+    expect(
+      shouldAutoSwitchWebRtcVideoToWebCodecs({
+        targetFps: 120,
+        actualFps: 57,
+        latencyP95Ms: 196,
+        metadataAgeMs: 109,
+        jitterBufferMs: 39,
+        webCodecsAvailable: true,
+        allowAutoSwitch: true,
+        alreadyAttempted: false,
+      })
+    ).toEqual({
+      shouldSwitch: true,
+      reason:
+        "WebRTC video backlog: p95 196.0 ms, metadata age 109.0 ms, fps 57.0/120. Switching to WebCodecs web path.",
+    });
+  });
+
+  it("keeps WebRTC video when the WebCodecs web path is unavailable or already attempted", () => {
+    expect(
+      shouldAutoSwitchWebRtcVideoToWebCodecs({
+        targetFps: 120,
+        actualFps: 57,
+        latencyP95Ms: 196,
+        metadataAgeMs: 109,
+        jitterBufferMs: 39,
+        webCodecsAvailable: false,
+        allowAutoSwitch: true,
+        alreadyAttempted: false,
+      }).shouldSwitch
+    ).toBe(false);
+
+    expect(
+      shouldAutoSwitchWebRtcVideoToWebCodecs({
+        targetFps: 120,
+        actualFps: 57,
+        latencyP95Ms: 196,
+        metadataAgeMs: 109,
+        jitterBufferMs: 39,
+        webCodecsAvailable: true,
+        allowAutoSwitch: true,
+        alreadyAttempted: true,
+      }).shouldSwitch
+    ).toBe(false);
+  });
+
   it("shows a green LAN diagnostics popover with HEVC and chroma metadata", async () => {
     const mockInvoke = getMockInvoke();
-    mockInvoke.mockImplementation((command: string) => {
+    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
       if (command === "test_get_capabilities") {
         return Promise.resolve(windowsCapabilities());
       }
@@ -440,6 +506,29 @@ describe("RemoteDisplayWindowPage", () => {
           ],
         });
       }
+      if (command === "get_system_resource_snapshot") {
+        const isDisplay = args?.target === "display";
+        return Promise.resolve({
+          target_name: isDisplay ? "Rdesk display" : "mrd-service",
+          target_pid: isDisplay ? 111 : 222,
+          target_found: true,
+          cpu_metrics_available: true,
+          cpu_usage_percent: isDisplay ? 6.5 : 12.5,
+          memory_used_mb: isDisplay ? 384 : 256,
+          memory_total_mb: 32768,
+          memory_usage_percent: isDisplay ? 1.2 : 0.8,
+          gpu_usage_percent: isDisplay ? 18 : 22,
+          gpu_memory_used_mb: isDisplay ? 512 : 1024,
+          gpu_memory_total_mb: 8192,
+          gpu_metrics_available: true,
+          gpu_metrics_scope: isDisplay ? "system" : "process",
+          network_rx_bps: isDisplay ? 2_000_000 : 3_000_000,
+          network_tx_bps: isDisplay ? 1_000_000 : 4_000_000,
+          network_metrics_available: true,
+          network_metrics_scope: "system",
+          sampled_at_ms: Date.now(),
+        });
+      }
       return Promise.resolve(null);
     });
 
@@ -451,6 +540,9 @@ describe("RemoteDisplayWindowPage", () => {
     expect(await screen.findByText("远程诊断")).toBeInTheDocument();
     expect(screen.getByText("连接质量")).toBeInTheDocument();
     expect(screen.getByText("性能曲线")).toBeInTheDocument();
+    expect(screen.getByText("资源占用曲线")).toBeInTheDocument();
+    expect(screen.getByText("mrd-service CPU / 内存")).toBeInTheDocument();
+    expect(screen.getByText("接收显示 CPU / 内存")).toBeInTheDocument();
     expect(screen.getByText("阶段延迟 P95")).toBeInTheDocument();
     expect(screen.getByText("sender.encode")).toBeInTheDocument();
     expect(screen.getByText("H.265 Main")).toBeInTheDocument();
@@ -469,7 +561,7 @@ describe("RemoteDisplayWindowPage", () => {
     });
   });
 
-  it("exposes 180 and 249 FPS high-refresh profile options", async () => {
+  it("exposes 4K and high-refresh profile options", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
       if (command === "test_get_capabilities") {
@@ -504,6 +596,7 @@ describe("RemoteDisplayWindowPage", () => {
     renderRemoteDisplay("local-display-test-1");
 
     fireEvent.click(await screen.findByRole("button", { name: "测试配置" }));
+    expect(await screen.findByText("4K")).toBeInTheDocument();
     expect(await screen.findByText("180 FPS")).toBeInTheDocument();
     expect(screen.getByText("249 FPS")).toBeInTheDocument();
   });
@@ -1000,11 +1093,31 @@ describe("RemoteDisplayWindowPage", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "Start local pipeline test" }));
 
-    expect(await screen.findByText("测试结果")).toBeInTheDocument();
+    expect(await screen.findByText("完整测试报告")).toBeInTheDocument();
     expect(screen.getByText("run-completed")).toBeInTheDocument();
     expect(screen.getByText("120.4 FPS")).toBeInTheDocument();
     expect(screen.getAllByText("12.8 ms").length).toBeGreaterThan(0);
     expect(screen.getByText("1 dropped")).toBeInTheDocument();
+    expect(screen.getByText("运行配置")).toBeInTheDocument();
+    expect(screen.getByText("阶段 P95")).toBeInTheDocument();
+  });
+
+  it("hides desktop window controls in the browser display path", async () => {
+    runtimeMock.isTauri = false;
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(windowsCapabilities());
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay("local-display-test-1");
+
+    expect(await screen.findByRole("button", { name: "测试配置" })).toBeInTheDocument();
+    expect(screen.queryByTitle("Minimize")).not.toBeInTheDocument();
+    expect(screen.queryByTitle("Maximize")).not.toBeInTheDocument();
+    expect(screen.queryByTitle("Close")).not.toBeInTheDocument();
   });
 
   it("allows WebCodecs ultra-low-latency start when the browser decoder APIs exist", async () => {

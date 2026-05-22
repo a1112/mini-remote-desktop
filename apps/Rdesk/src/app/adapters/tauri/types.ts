@@ -244,6 +244,7 @@ export interface TestRunSummary {
   transport_latency_p95?: number;
   decode_latency_p50?: number;
   decode_latency_p95?: number;
+  total_latency_p50?: number;
   total_latency_p95?: number;
   dropped_frames: number;
   frame_count: number;
@@ -868,6 +869,7 @@ export interface SystemResourceSnapshot {
   target_name: string;
   target_pid?: number | null;
   target_found: boolean;
+  cpu_metrics_available?: boolean;
   cpu_usage_percent: number;
   memory_used_mb: number;
   memory_total_mb: number;

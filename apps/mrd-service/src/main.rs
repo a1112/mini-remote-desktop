@@ -18,6 +18,7 @@ mod handlers;
 mod ipc_server;
 mod lan_discovery;
 mod media_adaptation;
+mod resource_monitor;
 mod shell;
 mod web_bridge;
 

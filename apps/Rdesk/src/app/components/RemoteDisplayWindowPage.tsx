@@ -25,6 +25,7 @@ import {
   closeRemoteDisplayWindow,
   configureRemoteDisplayNativeSurface,
   currentRemoteDisplayWindowContext,
+  getSystemResourceSnapshot,
   ipcMediaPipelineSnapshot,
   presentRemotePreviewFrameOnNativeSurface,
   presentTestHarnessFrameOnNativeSurface,
@@ -42,6 +43,7 @@ import {
   type MediaPipelineSnapshot,
   type NativeRenderSurfaceSnapshot,
   type RemoteDisplayWindowContext,
+  type SystemResourceSnapshot,
   type TestConfig,
   type TestMatrixConfig,
   type TestRun,
@@ -65,7 +67,13 @@ import { withTauriWindow } from "../utils/tauriWindow";
 type RenderMode = "web" | "d3d11_native" | "d3d12_native" | "metal_native" | "linux_native";
 type HostOs = "macos" | "windows" | "linux" | "other";
 type TransportKind = NonNullable<TestMatrixConfig["transport"]>;
-type ResolutionKey = "1280x720" | "1920x1080" | "2560x1440" | "2560x1600" | "3440x1440";
+type ResolutionKey =
+  | "1280x720"
+  | "1920x1080"
+  | "2560x1440"
+  | "2560x1600"
+  | "3440x1440"
+  | "3840x2160";
 type FpsKey = "30" | "60" | "120" | "144" | "165" | "180" | "249";
 type BitrateKey = "8" | "20" | "50" | "80" | "100" | "120";
 type TestStatus = "idle" | "starting" | "running" | "stopping" | "completed" | "failed";
@@ -101,6 +109,20 @@ type DiagnosticsSample = {
   queueDepth: number | null;
   droppedFrames: number | null;
   bitrateMbps: number | null;
+  serviceCpuPercent: number | null;
+  serviceMemoryPercent: number | null;
+  serviceMemoryMb: number | null;
+  serviceGpuPercent: number | null;
+  serviceGpuMemoryMb: number | null;
+  serviceNetworkRxMbps: number | null;
+  serviceNetworkTxMbps: number | null;
+  displayCpuPercent: number | null;
+  displayMemoryPercent: number | null;
+  displayMemoryMb: number | null;
+  displayGpuPercent: number | null;
+  displayGpuMemoryMb: number | null;
+  displayNetworkRxMbps: number | null;
+  displayNetworkTxMbps: number | null;
 };
 
 type DiagnosticsStageRow = {
@@ -317,6 +339,7 @@ const resolutionOptions: Option<ResolutionKey>[] = [
   { value: "2560x1440", label: "1440p" },
   { value: "2560x1600", label: "1600p" },
   { value: "3440x1440", label: "UWQHD" },
+  { value: "3840x2160", label: "4K" },
 ];
 
 const fpsOptions: Option<FpsKey>[] = [
@@ -460,6 +483,24 @@ function formatPercent(value: number) {
   return `${Math.max(0, value).toFixed(value >= 10 ? 0 : 1)}%`;
 }
 
+function formatOptionalPercent(value?: number | null) {
+  return typeof value === "number" ? formatPercent(value) : "-";
+}
+
+function formatMb(value?: number | null) {
+  return typeof value === "number" ? `${value.toLocaleString()} MB` : "-";
+}
+
+function bpsToMbps(value?: number | null) {
+  return typeof value === "number" ? value * 8 / 1_000_000 : null;
+}
+
+function sumNullable(...values: Array<number | null | undefined>) {
+  const finiteValues = values.filter((value): value is number => typeof value === "number");
+  if (finiteValues.length === 0) return null;
+  return finiteValues.reduce((total, value) => total + value, 0);
+}
+
 function formatCount(value?: number | null) {
   return typeof value === "number" ? value.toLocaleString() : "-";
 }
@@ -480,6 +521,70 @@ function formatSummaryMs(value?: number | null) {
 
 function formatDropped(value?: number | null) {
   return typeof value === "number" ? `${value.toLocaleString()} dropped` : "-";
+}
+
+function formatDurationMs(value?: number | null) {
+  if (typeof value !== "number") return "-";
+  const totalSeconds = Math.max(0, Math.round(value / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return minutes > 0
+    ? `${minutes}m ${seconds.toString().padStart(2, "0")}s`
+    : `${seconds}s`;
+}
+
+function formatTimestamp(value?: number | null) {
+  if (typeof value !== "number") return "-";
+  return new Date(value).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+function runStatusLabel(status?: TestRun["status"] | null) {
+  if (status === "completed") return "完成";
+  if (status === "failed") return "失败";
+  if (status === "cancelled") return "已停止";
+  if (status === "running") return "运行中";
+  if (status === "preparing") return "准备中";
+  if (status === "queued") return "排队中";
+  return "-";
+}
+
+function average(values: Array<number | null | undefined>) {
+  const finiteValues = values.filter((value): value is number => typeof value === "number");
+  if (finiteValues.length === 0) return null;
+  return finiteValues.reduce((total, value) => total + value, 0) / finiteValues.length;
+}
+
+function maxValue(values: Array<number | null | undefined>) {
+  const finiteValues = values.filter((value): value is number => typeof value === "number");
+  return finiteValues.length > 0 ? Math.max(...finiteValues) : null;
+}
+
+function latestValue(values: Array<number | null | undefined>) {
+  for (let index = values.length - 1; index >= 0; index -= 1) {
+    const value = values[index];
+    if (typeof value === "number") return value;
+  }
+  return null;
+}
+
+function configResolutionLabel(config?: TestConfig | null) {
+  const resolution = config?.resolution;
+  return resolution ? `${resolution[0]}x${resolution[1]}` : "-";
+}
+
+function configBitrateMbps(config?: TestConfig | null) {
+  if (typeof config?.bitrate !== "number") return null;
+  return config.bitrate / 1_000_000;
+}
+
+function configCodecLabel(config?: TestConfig | null) {
+  return `${dash(config?.capture_type)} -> ${dash(config?.encoder_type)} -> ${dash(
+    config?.decoder_type
+  )} / ${dash(config?.transport_kind)}`;
 }
 
 function percentile(values: number[], percentileValue: number) {
@@ -723,6 +828,16 @@ function hasDiagnosticsSampleValue(sample: DiagnosticsSample) {
     sample.queueDepth,
     sample.droppedFrames,
     sample.bitrateMbps,
+    sample.serviceCpuPercent,
+    sample.serviceMemoryPercent,
+    sample.serviceGpuPercent,
+    sample.serviceNetworkRxMbps,
+    sample.serviceNetworkTxMbps,
+    sample.displayCpuPercent,
+    sample.displayMemoryPercent,
+    sample.displayGpuPercent,
+    sample.displayNetworkRxMbps,
+    sample.displayNetworkTxMbps,
   ].some((value) => typeof value === "number");
 }
 
@@ -1042,6 +1157,11 @@ export function webPreviewTransportLabel(
 }
 
 const WEBRTC_LOW_LATENCY_PLAYOUT_SECONDS = 0.02;
+const WEBRTC_VIDEO_BACKLOG_SWITCH_MIN_FPS = 90;
+const WEBRTC_VIDEO_BACKLOG_SWITCH_LATENCY_MS = 120;
+const WEBRTC_VIDEO_BACKLOG_SWITCH_METADATA_AGE_MS = 80;
+const WEBRTC_VIDEO_BACKLOG_SWITCH_JITTER_BUFFER_MS = 35;
+const WEBRTC_VIDEO_BACKLOG_SWITCH_FPS_RATIO = 0.75;
 
 export function applyWebRtcReceiverLowLatencyHint(receiver?: RTCRtpReceiver | null) {
   if (!receiver) return;
@@ -1068,6 +1188,67 @@ export function applyWebRtcVideoMotionHint(track?: MediaStreamTrack | null) {
   } catch {
     // Optional browser hint.
   }
+}
+
+export type WebRtcVideoToWebCodecsSwitchInput = {
+  targetFps: number;
+  actualFps: number | null;
+  latencyP95Ms: number | null;
+  metadataAgeMs: number | null;
+  jitterBufferMs: number | null;
+  webCodecsAvailable: boolean;
+  allowAutoSwitch: boolean;
+  alreadyAttempted: boolean;
+};
+
+export type WebRtcVideoToWebCodecsSwitchDecision = {
+  shouldSwitch: boolean;
+  reason: string | null;
+};
+
+export function shouldAutoSwitchWebRtcVideoToWebCodecs({
+  targetFps,
+  actualFps,
+  latencyP95Ms,
+  metadataAgeMs,
+  jitterBufferMs,
+  webCodecsAvailable,
+  allowAutoSwitch,
+  alreadyAttempted,
+}: WebRtcVideoToWebCodecsSwitchInput): WebRtcVideoToWebCodecsSwitchDecision {
+  if (
+    !allowAutoSwitch ||
+    !webCodecsAvailable ||
+    alreadyAttempted ||
+    targetFps < WEBRTC_VIDEO_BACKLOG_SWITCH_MIN_FPS
+  ) {
+    return { shouldSwitch: false, reason: null };
+  }
+
+  const highLatency =
+    typeof latencyP95Ms === "number" &&
+    latencyP95Ms >= WEBRTC_VIDEO_BACKLOG_SWITCH_LATENCY_MS;
+  const staleMetadata =
+    typeof metadataAgeMs === "number" &&
+    metadataAgeMs >= WEBRTC_VIDEO_BACKLOG_SWITCH_METADATA_AGE_MS;
+  const jitterBacklog =
+    typeof jitterBufferMs === "number" &&
+    jitterBufferMs >= WEBRTC_VIDEO_BACKLOG_SWITCH_JITTER_BUFFER_MS;
+  const lowFps =
+    typeof actualFps === "number" &&
+    actualFps > 0 &&
+    actualFps < targetFps * WEBRTC_VIDEO_BACKLOG_SWITCH_FPS_RATIO;
+
+  if (!highLatency || (!staleMetadata && !jitterBacklog && !lowFps)) {
+    return { shouldSwitch: false, reason: null };
+  }
+
+  return {
+    shouldSwitch: true,
+    reason: `WebRTC video backlog: p95 ${latencyP95Ms.toFixed(1)} ms, metadata age ${
+      typeof metadataAgeMs === "number" ? metadataAgeMs.toFixed(1) : "-"
+    } ms, fps ${typeof actualFps === "number" ? actualFps.toFixed(1) : "-"}/${targetFps}. Switching to WebCodecs web path.`,
+  };
 }
 
 function fpsForWebView(fps: FpsKey): FpsKey {
@@ -1546,6 +1727,27 @@ function DiagnosticMetricTile({
   );
 }
 
+function resourceMetric(
+  snapshot: SystemResourceSnapshot | null,
+  value: (snapshot: SystemResourceSnapshot) => number | null | undefined
+) {
+  if (!snapshot?.target_found) return null;
+  const next = value(snapshot);
+  return typeof next === "number" && Number.isFinite(next) ? next : null;
+}
+
+function resourceNetworkSubtitle(snapshot: SystemResourceSnapshot | null) {
+  if (!snapshot?.network_metrics_available) return "网络指标不可用";
+  const scope = snapshot.network_metrics_scope === "system" ? "系统网卡" : "进程";
+  return `${scope} RX/TX`;
+}
+
+function resourceGpuSubtitle(snapshot: SystemResourceSnapshot | null) {
+  if (!snapshot?.gpu_metrics_available) return "GPU 指标不可用";
+  const scope = snapshot.gpu_metrics_scope === "process" ? "进程显存 / 系统利用率" : "系统 GPU";
+  return scope;
+}
+
 function DiagnosticStageList({ rows }: { rows: DiagnosticsStageRow[] }) {
   const visibleRows = rows.filter((row) => typeof row.value === "number");
   return (
@@ -1593,8 +1795,15 @@ export function RemoteDisplayWindowPage() {
   const nativePreviewFrameKeyRef = useRef<string | null>(null);
   const linuxNativeProfileAppliedRef = useRef(false);
   const diagnosticsCurrentRef = useRef<DiagnosticsSample | null>(null);
+  const diagnosticsSamplesRef = useRef<DiagnosticsSample[]>([]);
   const diagnosticsPopoverRef = useRef<HTMLDivElement | null>(null);
   const matrixStopRequestedRef = useRef(false);
+  const webPreviewRunStartedAtRef = useRef<number | null>(null);
+  const webPreviewAutoStopTimerRef = useRef<number | null>(null);
+  const webVideoFpsRef = useRef<number | null>(null);
+  const webVideoFrameCountRef = useRef(0);
+  const webRtcReceiverStatsRef = useRef<WebRtcReceiverStats | null>(null);
+  const webPresentationLatencyStatsRef = useRef<WebRtcPresentationLatencyStats | null>(null);
 
   const [context, setContext] = useState<RemoteDisplayWindowContext | null>(null);
   const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
@@ -1664,6 +1873,10 @@ export function RemoteDisplayWindowPage() {
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
   const [diagnosticsPinned, setDiagnosticsPinned] = useState(false);
   const [diagnosticsSamples, setDiagnosticsSamples] = useState<DiagnosticsSample[]>([]);
+  const [serviceResourceSnapshot, setServiceResourceSnapshot] =
+    useState<SystemResourceSnapshot | null>(null);
+  const [displayResourceSnapshot, setDisplayResourceSnapshot] =
+    useState<SystemResourceSnapshot | null>(null);
 
   const sessionId = id ?? context?.session_id ?? "local-preview";
   const activeSurfaceId = context?.surface_id ?? surfaceId;
@@ -2081,6 +2294,62 @@ export function RemoteDisplayWindowPage() {
       ? metrics.dropped_frames / metrics.frame_count * 100
       : remoteDropRatio;
   const diagnosticsQueueDepth = mediaPipelineSnapshot?.queue_depth ?? null;
+  const diagnosticsServiceCpuPercent = resourceMetric(
+    serviceResourceSnapshot,
+    (snapshot) => snapshot.cpu_metrics_available === false ? null : snapshot.cpu_usage_percent
+  );
+  const diagnosticsServiceMemoryPercent = resourceMetric(
+    serviceResourceSnapshot,
+    (snapshot) => snapshot.memory_usage_percent
+  );
+  const diagnosticsServiceMemoryMb = resourceMetric(
+    serviceResourceSnapshot,
+    (snapshot) => snapshot.memory_used_mb
+  );
+  const diagnosticsServiceGpuPercent = resourceMetric(
+    serviceResourceSnapshot,
+    (snapshot) => snapshot.gpu_usage_percent
+  );
+  const diagnosticsServiceGpuMemoryMb = resourceMetric(
+    serviceResourceSnapshot,
+    (snapshot) => snapshot.gpu_memory_used_mb
+  );
+  const diagnosticsServiceNetworkRxMbps = resourceMetric(
+    serviceResourceSnapshot,
+    (snapshot) => bpsToMbps(snapshot.network_rx_bps)
+  );
+  const diagnosticsServiceNetworkTxMbps = resourceMetric(
+    serviceResourceSnapshot,
+    (snapshot) => bpsToMbps(snapshot.network_tx_bps)
+  );
+  const diagnosticsDisplayCpuPercent = resourceMetric(
+    displayResourceSnapshot,
+    (snapshot) => snapshot.cpu_metrics_available === false ? null : snapshot.cpu_usage_percent
+  );
+  const diagnosticsDisplayMemoryPercent = resourceMetric(
+    displayResourceSnapshot,
+    (snapshot) => snapshot.memory_usage_percent
+  );
+  const diagnosticsDisplayMemoryMb = resourceMetric(
+    displayResourceSnapshot,
+    (snapshot) => snapshot.memory_used_mb
+  );
+  const diagnosticsDisplayGpuPercent = resourceMetric(
+    displayResourceSnapshot,
+    (snapshot) => snapshot.gpu_usage_percent
+  );
+  const diagnosticsDisplayGpuMemoryMb = resourceMetric(
+    displayResourceSnapshot,
+    (snapshot) => snapshot.gpu_memory_used_mb
+  );
+  const diagnosticsDisplayNetworkRxMbps = resourceMetric(
+    displayResourceSnapshot,
+    (snapshot) => bpsToMbps(snapshot.network_rx_bps)
+  );
+  const diagnosticsDisplayNetworkTxMbps = resourceMetric(
+    displayResourceSnapshot,
+    (snapshot) => bpsToMbps(snapshot.network_tx_bps)
+  );
   const diagnosticsTargetFps =
     mediaPipelineSnapshot?.active_fps ??
     probeSnapshot?.media_probe_target_fps ??
@@ -2106,6 +2375,20 @@ export function RemoteDisplayWindowPage() {
     queueDepth: diagnosticsQueueDepth,
     droppedFrames: diagnosticsDroppedFrames,
     bitrateMbps: diagnosticsBitrateMbps,
+    serviceCpuPercent: diagnosticsServiceCpuPercent,
+    serviceMemoryPercent: diagnosticsServiceMemoryPercent,
+    serviceMemoryMb: diagnosticsServiceMemoryMb,
+    serviceGpuPercent: diagnosticsServiceGpuPercent,
+    serviceGpuMemoryMb: diagnosticsServiceGpuMemoryMb,
+    serviceNetworkRxMbps: diagnosticsServiceNetworkRxMbps,
+    serviceNetworkTxMbps: diagnosticsServiceNetworkTxMbps,
+    displayCpuPercent: diagnosticsDisplayCpuPercent,
+    displayMemoryPercent: diagnosticsDisplayMemoryPercent,
+    displayMemoryMb: diagnosticsDisplayMemoryMb,
+    displayGpuPercent: diagnosticsDisplayGpuPercent,
+    displayGpuMemoryMb: diagnosticsDisplayGpuMemoryMb,
+    displayNetworkRxMbps: diagnosticsDisplayNetworkRxMbps,
+    displayNetworkTxMbps: diagnosticsDisplayNetworkTxMbps,
   };
   const diagnosticsStageRows = useMemo<DiagnosticsStageRow[]>(() => {
     const pipelineRows =
@@ -2206,8 +2489,53 @@ export function RemoteDisplayWindowPage() {
   }, [diagnosticsCurrent]);
 
   useEffect(() => {
+    webVideoFpsRef.current = webVideoFps;
+  }, [webVideoFps]);
+
+  useEffect(() => {
+    webVideoFrameCountRef.current = webVideoFrameCount;
+  }, [webVideoFrameCount]);
+
+  useEffect(() => {
+    webRtcReceiverStatsRef.current = webRtcReceiverStats;
+  }, [webRtcReceiverStats]);
+
+  useEffect(() => {
+    webPresentationLatencyStatsRef.current = webPresentationLatencyStats;
+  }, [webPresentationLatencyStats]);
+
+  useEffect(() => {
+    diagnosticsSamplesRef.current = [];
     setDiagnosticsSamples([]);
   }, [sessionId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let inFlight = false;
+
+    const refreshResources = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const [serviceResult, displayResult] = await Promise.all([
+          getSystemResourceSnapshot("mrd-service"),
+          getSystemResourceSnapshot("display"),
+        ]);
+        if (cancelled) return;
+        if (serviceResult.ok) setServiceResourceSnapshot(serviceResult.value);
+        if (displayResult.ok) setDisplayResourceSnapshot(displayResult.value);
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    void refreshResources();
+    const interval = window.setInterval(() => void refreshResources(), 2_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, []);
 
   useEffect(() => {
     const record = () => {
@@ -2220,7 +2548,9 @@ export function RemoteDisplayWindowPage() {
       };
       setDiagnosticsSamples((samples) => {
         const next = [...samples, nextSample];
-        return next.slice(Math.max(0, next.length - DIAGNOSTICS_SAMPLE_LIMIT));
+        const bounded = next.slice(Math.max(0, next.length - DIAGNOSTICS_SAMPLE_LIMIT));
+        diagnosticsSamplesRef.current = bounded;
+        return bounded;
       });
     };
 
@@ -4047,6 +4377,116 @@ export function RemoteDisplayWindowPage() {
     []
   );
 
+  const buildBrowserPreviewCompletedRun = useCallback(
+    (status: TestRun["status"], message?: string): TestRun => {
+      const now = Date.now();
+      const startedAt = webPreviewRunStartedAtRef.current ?? now;
+      const samples = diagnosticsSamplesRef.current;
+      const fpsSamples = samples.map((sample) => sample.fps);
+      const latencySamples = samples.map((sample) => sample.latencyP95Ms);
+      const encodeSamples = samples.map((sample) => sample.encodeP95Ms);
+      const transportSamples = samples.map((sample) => sample.transportP95Ms);
+      const decodeSamples = samples.map((sample) => sample.decodeP95Ms);
+      const latencyNumericSamples = latencySamples.filter(
+        (value): value is number => typeof value === "number"
+      );
+      const receiverStats = webRtcReceiverStatsRef.current;
+      const presentationStats = webPresentationLatencyStatsRef.current;
+      const droppedFrames =
+        latestValue(samples.map((sample) => sample.droppedFrames)) ??
+        receiverStats?.framesDropped ??
+        0;
+      const frameCount = Math.max(webVideoFrameCountRef.current, receiverStats?.framesDecoded ?? 0);
+
+      return {
+        run_id:
+          currentRunId ??
+          `web-preview-${startedAt.toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+        scenario_id: "browser-local-preview",
+        run_mode: "manual",
+        status,
+        started_at: startedAt,
+        finished_at: now,
+        config_snapshot: testConfig,
+        environment_snapshot:
+          capabilities ?? {
+            os_type: "browser",
+            cpu_brand: "Browser",
+            cpu_cores: navigator.hardwareConcurrency || 1,
+            memory_gb: 0,
+            gpu_info: "Browser Web View",
+            available_encoders: [],
+            available_decoders: [],
+          },
+        summary: {
+          total_duration_ms: now - startedAt,
+          capture_fps: average(fpsSamples) ?? webVideoFpsRef.current ?? undefined,
+          encode_latency_p95: percentile(encodeSamples.filter((value): value is number => typeof value === "number"), 0.95) ?? undefined,
+          transport_latency_p95: percentile(transportSamples.filter((value): value is number => typeof value === "number"), 0.95) ?? undefined,
+          decode_latency_p95: percentile(decodeSamples.filter((value): value is number => typeof value === "number"), 0.95) ?? undefined,
+          total_latency_p50:
+            percentile(latencyNumericSamples, 0.5) ??
+            presentationStats?.p50Ms ??
+            undefined,
+          total_latency_p95:
+            percentile(latencyNumericSamples, 0.95) ??
+            presentationStats?.p95Ms ??
+            undefined,
+          dropped_frames: droppedFrames,
+          frame_count: frameCount,
+          error_message: message,
+          failure_reason:
+            status === "failed"
+              ? "runtime_failure"
+              : status === "cancelled"
+                ? "runtime_stopped"
+                : undefined,
+        },
+      };
+    },
+    [
+      capabilities,
+      currentRunId,
+      testConfig,
+    ]
+  );
+
+  const clearBrowserPreviewAutoStopTimer = useCallback(() => {
+    if (webPreviewAutoStopTimerRef.current !== null) {
+      window.clearTimeout(webPreviewAutoStopTimerRef.current);
+      webPreviewAutoStopTimerRef.current = null;
+    }
+  }, []);
+
+  const completeBrowserPreviewRun = useCallback(
+    async (status: TestRun["status"] = "completed", message?: string) => {
+      clearBrowserPreviewAutoStopTimer();
+      const completedRun = buildBrowserPreviewCompletedRun(status, message);
+      closeWebPreviewPeer();
+      await browserWebrtcPreviewStop(sessionId);
+      setLastCompletedRun(completedRun);
+      setCurrentRunId(null);
+      setTestStatus(status === "failed" ? "failed" : "completed");
+      setTestMessage(
+        message ??
+          (status === "cancelled"
+            ? "测试已手动停止，报告已生成"
+            : status === "failed"
+              ? "测试失败，报告已生成"
+              : "测试完成，报告已生成")
+      );
+      webPreviewRunStartedAtRef.current = null;
+    },
+    [
+      buildBrowserPreviewCompletedRun,
+      clearBrowserPreviewAutoStopTimer,
+      closeWebPreviewPeer,
+      sessionId,
+    ]
+  );
+
+  useEffect(() => clearBrowserPreviewAutoStopTimer, [clearBrowserPreviewAutoStopTimer]);
+
   const handleStartTest = async () => {
     if (!isLocalPipelinePreview) {
       await handleStartRemoteReceiver();
@@ -4070,6 +4510,8 @@ export function RemoteDisplayWindowPage() {
     setMetrics(null);
     setMatrixRunProgress(null);
     matrixStopRequestedRef.current = false;
+    clearBrowserPreviewAutoStopTimer();
+    webPreviewRunStartedAtRef.current = null;
     setWebPreviewMode("idle");
     setWebPreviewError(null);
 
@@ -4082,12 +4524,21 @@ export function RemoteDisplayWindowPage() {
         setFps(localWebViewPlan.profile.fps);
         setBitrate(localWebViewPlan.profile.bitrate);
       }
+      const startedAt = Date.now();
+      const runId = `web-preview-${startedAt.toString(36)}`;
+      webPreviewRunStartedAtRef.current = startedAt;
+      setCurrentRunId(runId);
       setTestStatus("running");
       setTestMessage(
         webPreviewEngine === "webcodecs"
           ? "网页 WebCodecs 本机采集运行中"
           : "网页 WebRTC 本机采集运行中"
       );
+      if (durationMode !== "manual") {
+        webPreviewAutoStopTimerRef.current = window.setTimeout(() => {
+          void completeBrowserPreviewRun("completed");
+        }, selectedDurationMs);
+      }
       return;
     }
 
@@ -4269,10 +4720,7 @@ export function RemoteDisplayWindowPage() {
     closeWebPreviewPeer();
     setWebPreviewMode("idle");
     if (!isNative && !isTauriRuntime()) {
-      await browserWebrtcPreviewStop(sessionId);
-      setTestStatus("idle");
-      setCurrentRunId(null);
-      setTestMessage("网页显示已停止");
+      await completeBrowserPreviewRun("cancelled");
       return;
     }
     const result = currentRunId
@@ -4323,6 +4771,7 @@ export function RemoteDisplayWindowPage() {
     ? "connected"
     : sessionSnapshot?.state ?? "loading";
   const isBrowserBridgeRemote = !isTauriRuntime() && !isLocalPipelinePreview;
+  const showDesktopWindowControls = isTauriRuntime();
   const webPreviewUsesVideo =
     isLocalPipelinePreview &&
     !isNative &&
@@ -4378,6 +4827,81 @@ export function RemoteDisplayWindowPage() {
     webPresentationLatencyStats?.p95Ms ??
     null;
   const lastRunDropped = lastRunSummary?.dropped_frames ?? metrics?.dropped_frames ?? null;
+  const reportConfig = lastCompletedRun?.config_snapshot ?? null;
+  const reportEnvironment = lastCompletedRun?.environment_snapshot ?? capabilities ?? null;
+  const reportDurationMs =
+    lastRunSummary?.total_duration_ms ??
+    (lastCompletedRun?.finished_at && lastCompletedRun.started_at
+      ? lastCompletedRun.finished_at - lastCompletedRun.started_at
+      : null);
+  const reportFrameCount = lastRunSummary?.frame_count ?? metrics?.frame_count ?? null;
+  const reportDropRatio =
+    typeof lastRunDropped === "number" && typeof reportFrameCount === "number" && reportFrameCount > 0
+      ? lastRunDropped / reportFrameCount * 100
+      : diagnosticsDropRatio;
+  const reportFpsAvg =
+    lastRunSummary?.capture_fps ?? average(diagnosticsSamples.map((sample) => sample.fps));
+  const reportFpsMin = maxValue(
+    diagnosticsSamples.map((sample) =>
+      typeof sample.fps === "number" ? -sample.fps : null
+    )
+  );
+  const reportFpsMinValue = typeof reportFpsMin === "number" ? -reportFpsMin : null;
+  const reportLatencyP50 =
+    lastRunSummary?.total_latency_p50 ??
+    webPresentationLatencyStats?.p50Ms ??
+    percentile(
+      diagnosticsSamples
+        .map((sample) => sample.latencyP95Ms)
+        .filter((value): value is number => typeof value === "number"),
+      0.5
+    );
+  const reportLatencyP95 = lastRunLatencyP95;
+  const reportServiceCpuP95 = percentile(
+    diagnosticsSamples
+      .map((sample) => sample.serviceCpuPercent)
+      .filter((value): value is number => typeof value === "number"),
+    0.95
+  );
+  const reportServiceMemoryPeak = maxValue(
+    diagnosticsSamples.map((sample) => sample.serviceMemoryMb)
+  );
+  const reportServiceGpuP95 = percentile(
+    diagnosticsSamples
+      .map((sample) => sample.serviceGpuPercent)
+      .filter((value): value is number => typeof value === "number"),
+    0.95
+  );
+  const reportServiceNetworkPeak = maxValue(
+    diagnosticsSamples.map((sample) =>
+      sumNullable(sample.serviceNetworkRxMbps, sample.serviceNetworkTxMbps)
+    )
+  );
+  const reportDisplayCpuP95 = percentile(
+    diagnosticsSamples
+      .map((sample) => sample.displayCpuPercent)
+      .filter((value): value is number => typeof value === "number"),
+    0.95
+  );
+  const reportDisplayMemoryPeak = maxValue(
+    diagnosticsSamples.map((sample) => sample.displayMemoryMb)
+  );
+  const reportDisplayGpuP95 = percentile(
+    diagnosticsSamples
+      .map((sample) => sample.displayGpuPercent)
+      .filter((value): value is number => typeof value === "number"),
+    0.95
+  );
+  const reportDisplayNetworkPeak = maxValue(
+    diagnosticsSamples.map((sample) =>
+      sumNullable(sample.displayNetworkRxMbps, sample.displayNetworkTxMbps)
+    )
+  );
+  const reportVisible =
+    isLocalPipelinePreview &&
+    lastCompletedRun &&
+    !isTestBusy &&
+    ["completed", "failed", "cancelled"].includes(lastCompletedRun.status);
   const primaryActionBlocked = Boolean(!isTestBusy && localStartBlockReason);
   const renderCaptureSourceCards = (closeAfterSelect = false) => (
     <div className="grid max-h-80 gap-3 overflow-y-auto pr-1 sm:grid-cols-2 lg:grid-cols-3">
@@ -4630,6 +5154,81 @@ export function RemoteDisplayWindowPage() {
                       />
                     </div>
                   </section>
+                  <section className="rounded-md border border-emerald-400/10 bg-emerald-950/20 p-3">
+                    <div className="mb-3 flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-2 text-[12px] font-semibold text-emerald-100">
+                        <Activity className="h-3.5 w-3.5 text-emerald-300" />
+                        资源占用曲线
+                      </div>
+                      <div className="text-[10px] text-emerald-200/55">
+                        mrd-service / 接收显示
+                      </div>
+                    </div>
+                    <div className="grid gap-3">
+                      <DiagnosticMetricTile
+                        title="mrd-service CPU / 内存"
+                        value={`${formatOptionalPercent(diagnosticsServiceCpuPercent)} / ${formatOptionalPercent(
+                          diagnosticsServiceMemoryPercent
+                        )}`}
+                        subtitle={`${dash(serviceResourceSnapshot?.target_name)} PID ${dash(
+                          serviceResourceSnapshot?.target_pid
+                        )} / ${formatMb(diagnosticsServiceMemoryMb)}`}
+                        samples={diagnosticsSamples}
+                        sampleValue={(sample) => sample.serviceCpuPercent}
+                        colorClass="text-emerald-300"
+                      />
+                      <DiagnosticMetricTile
+                        title="mrd-service GPU / 网络"
+                        value={`${formatOptionalPercent(diagnosticsServiceGpuPercent)} / ${formatMbps(
+                          sumNullable(
+                            diagnosticsServiceNetworkRxMbps,
+                            diagnosticsServiceNetworkTxMbps
+                          )
+                        )}`}
+                        subtitle={`${resourceGpuSubtitle(serviceResourceSnapshot)} / ${resourceNetworkSubtitle(
+                          serviceResourceSnapshot
+                        )}`}
+                        samples={diagnosticsSamples}
+                        sampleValue={(sample) =>
+                          typeof sample.serviceGpuPercent === "number"
+                            ? sample.serviceGpuPercent
+                            : sumNullable(sample.serviceNetworkRxMbps, sample.serviceNetworkTxMbps)
+                        }
+                        colorClass="text-lime-300"
+                      />
+                      <DiagnosticMetricTile
+                        title="接收显示 CPU / 内存"
+                        value={`${formatOptionalPercent(diagnosticsDisplayCpuPercent)} / ${formatOptionalPercent(
+                          diagnosticsDisplayMemoryPercent
+                        )}`}
+                        subtitle={`${dash(displayResourceSnapshot?.target_name)} / ${formatMb(
+                          diagnosticsDisplayMemoryMb
+                        )}`}
+                        samples={diagnosticsSamples}
+                        sampleValue={(sample) => sample.displayCpuPercent ?? sample.displayMemoryPercent}
+                        colorClass="text-cyan-300"
+                      />
+                      <DiagnosticMetricTile
+                        title="接收显示 GPU / 网络"
+                        value={`${formatOptionalPercent(diagnosticsDisplayGpuPercent)} / ${formatMbps(
+                          sumNullable(
+                            diagnosticsDisplayNetworkRxMbps,
+                            diagnosticsDisplayNetworkTxMbps
+                          )
+                        )}`}
+                        subtitle={`${resourceGpuSubtitle(displayResourceSnapshot)} / ${resourceNetworkSubtitle(
+                          displayResourceSnapshot
+                        )}`}
+                        samples={diagnosticsSamples}
+                        sampleValue={(sample) =>
+                          typeof sample.displayGpuPercent === "number"
+                            ? sample.displayGpuPercent
+                            : sumNullable(sample.displayNetworkRxMbps, sample.displayNetworkTxMbps)
+                        }
+                        colorClass="text-violet-300"
+                      />
+                    </div>
+                  </section>
                   <DiagnosticStageList rows={diagnosticsStageRows} />
                   {webRtcReceiverStats ? (
                     <DiagnosticGroup
@@ -4704,6 +5303,8 @@ export function RemoteDisplayWindowPage() {
                       ["本机 GPU", dash(capabilities?.gpu_info)],
                       ["本机内存", capabilities?.memory_gb ? `${capabilities.memory_gb}G` : "-"],
                       ["本机系统", dash(capabilities?.os_type)],
+                      ["mrd-service 资源", `${formatOptionalPercent(diagnosticsServiceCpuPercent)} CPU / ${formatMb(diagnosticsServiceMemoryMb)}`],
+                      ["接收显示资源", `${formatOptionalPercent(diagnosticsDisplayCpuPercent)} CPU / ${formatMb(diagnosticsDisplayMemoryMb)}`],
                       ["远端 Device", dash(sessionSnapshot?.session_id)],
                       ["Build ID", dash(context?.label)],
                       ["解码器", decoderLabel(mediaPipelineSnapshot?.active_decoder ?? decoder)],
@@ -4719,27 +5320,31 @@ export function RemoteDisplayWindowPage() {
               </div>
             ) : null}
           </div>
-          <button
-            onClick={() => void withTauriWindow((appWindow) => appWindow.minimize())}
-            className="inline-flex h-8 w-9 items-center justify-center rounded-sm text-slate-400 hover:bg-white/10 hover:text-white"
-            title="Minimize"
-          >
-            <Minimize className="h-4 w-4" />
-          </button>
-          <button
-            onClick={() => void handleToggleMaximize()}
-            className="inline-flex h-8 w-9 items-center justify-center rounded-sm text-slate-400 hover:bg-white/10 hover:text-white"
-            title={isMaximized ? "Restore" : "Maximize"}
-          >
-            {isMaximized ? <Square className="h-3 w-3" /> : <Maximize2 className="h-3.5 w-3.5" />}
-          </button>
-          <button
-            onClick={() => void handleClose()}
-            className="inline-flex h-8 w-9 items-center justify-center rounded-sm text-slate-400 hover:bg-red-500 hover:text-white"
-            title="Close"
-          >
-            <X className="h-4 w-4" />
-          </button>
+          {showDesktopWindowControls ? (
+            <>
+              <button
+                onClick={() => void withTauriWindow((appWindow) => appWindow.minimize())}
+                className="inline-flex h-8 w-9 items-center justify-center rounded-sm text-slate-400 hover:bg-white/10 hover:text-white"
+                title="Minimize"
+              >
+                <Minimize className="h-4 w-4" />
+              </button>
+              <button
+                onClick={() => void handleToggleMaximize()}
+                className="inline-flex h-8 w-9 items-center justify-center rounded-sm text-slate-400 hover:bg-white/10 hover:text-white"
+                title={isMaximized ? "Restore" : "Maximize"}
+              >
+                {isMaximized ? <Square className="h-3 w-3" /> : <Maximize2 className="h-3.5 w-3.5" />}
+              </button>
+              <button
+                onClick={() => void handleClose()}
+                className="inline-flex h-8 w-9 items-center justify-center rounded-sm text-slate-400 hover:bg-red-500 hover:text-white"
+                title="Close"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </>
+          ) : null}
         </div>
       </div>
 
@@ -5308,34 +5913,149 @@ export function RemoteDisplayWindowPage() {
             Web preview / mrd-service bridge / 非 native 高刷渲染
           </div>
         )}
-        {isLocalPipelinePreview && testStatus === "completed" && lastCompletedRun && (
-          <div className="absolute left-3 top-3 max-w-md rounded-lg border border-emerald-300/25 bg-emerald-950/70 px-3 py-3 text-xs text-emerald-50 shadow-xl backdrop-blur">
-            <div className="mb-2 flex items-center justify-between gap-3">
-              <div className="font-semibold">测试结果</div>
-              <div className="truncate text-[10px] text-emerald-200/70">
-                {lastCompletedRun.run_id}
+        {reportVisible && lastCompletedRun && (
+          <div className="absolute inset-x-3 top-3 z-20 mx-auto max-h-[calc(100%-1.5rem)] max-w-5xl overflow-y-auto rounded-xl border border-emerald-300/25 bg-[#03140f]/88 p-4 text-xs text-emerald-50 shadow-2xl shadow-emerald-950/60 backdrop-blur-md">
+            <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <div className="flex items-center gap-2 text-sm font-semibold text-white">
+                  <BarChart3 className="h-4 w-4 text-emerald-300" />
+                  完整测试报告
+                </div>
+                <div className="mt-1 max-w-3xl truncate text-[11px] text-emerald-200/65">
+                  {configCodecLabel(reportConfig)} / {configResolutionLabel(reportConfig)} @{" "}
+                  {dash(reportConfig?.fps)} FPS / {formatMbps(configBitrateMbps(reportConfig))}
+                </div>
               </div>
-            </div>
-            <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-              <div className="rounded-md bg-white/8 px-2 py-1.5">
-                <div className="text-[10px] text-emerald-200/60">FPS</div>
-                <div className="font-semibold">{formatSummaryFps(lastRunFps)}</div>
-              </div>
-              <div className="rounded-md bg-white/8 px-2 py-1.5">
-                <div className="text-[10px] text-emerald-200/60">P95</div>
-                <div className="font-semibold">{formatSummaryMs(lastRunLatencyP95)}</div>
-              </div>
-              <div className="rounded-md bg-white/8 px-2 py-1.5">
-                <div className="text-[10px] text-emerald-200/60">Drop</div>
-                <div className="font-semibold">{formatDropped(lastRunDropped)}</div>
-              </div>
-              <div className="rounded-md bg-white/8 px-2 py-1.5">
-                <div className="text-[10px] text-emerald-200/60">Frames</div>
-                <div className="font-semibold">
-                  {formatCount(lastRunSummary?.frame_count ?? metrics?.frame_count ?? null)}
+              <div className="text-right">
+                <div
+                  className={`inline-flex rounded-full border px-2 py-1 text-[11px] font-semibold ${
+                    lastCompletedRun.status === "failed"
+                      ? "border-red-300/35 bg-red-500/15 text-red-100"
+                      : lastCompletedRun.status === "cancelled"
+                        ? "border-amber-300/35 bg-amber-500/15 text-amber-100"
+                        : "border-emerald-300/35 bg-emerald-500/15 text-emerald-100"
+                  }`}
+                >
+                  {runStatusLabel(lastCompletedRun.status)}
+                </div>
+                <div className="mt-1 max-w-[260px] truncate text-[10px] text-emerald-200/60">
+                  {lastCompletedRun.run_id}
                 </div>
               </div>
             </div>
+
+            <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+              <div className="rounded-lg border border-white/10 bg-white/8 p-3">
+                <div className="text-[10px] uppercase text-emerald-200/55">FPS 平均 / 最低</div>
+                <div className="mt-1 text-lg font-semibold text-white">
+                  {formatSummaryFps(reportFpsAvg)}
+                </div>
+                <div className="text-[10px] text-emerald-200/55">
+                  min {formatSummaryFps(reportFpsMinValue)}
+                </div>
+              </div>
+              <div className="rounded-lg border border-white/10 bg-white/8 p-3">
+                <div className="text-[10px] uppercase text-emerald-200/55">E2E 延迟 p50 / p95</div>
+                <div className="mt-1 text-lg font-semibold text-white">
+                  {formatSummaryMs(reportLatencyP50)} / {formatSummaryMs(reportLatencyP95)}
+                </div>
+                <div className="text-[10px] text-emerald-200/55">
+                  感知延迟中位 / 尾延迟
+                </div>
+              </div>
+              <div className="rounded-lg border border-white/10 bg-white/8 p-3">
+                <div className="text-[10px] uppercase text-emerald-200/55">掉帧 / 丢弃率</div>
+                <div className="mt-1 text-lg font-semibold text-white">
+                  {formatDropped(lastRunDropped)}
+                </div>
+                <div className="text-[10px] text-emerald-200/55">
+                  {formatPercent(reportDropRatio)}
+                </div>
+              </div>
+              <div className="rounded-lg border border-white/10 bg-white/8 p-3">
+                <div className="text-[10px] uppercase text-emerald-200/55">帧数 / 时长</div>
+                <div className="mt-1 text-lg font-semibold text-white">
+                  {formatCount(reportFrameCount)}
+                </div>
+                <div className="text-[10px] text-emerald-200/55">
+                  {formatDurationMs(reportDurationMs)}
+                </div>
+              </div>
+            </div>
+
+            <div className="mt-3 grid gap-3 lg:grid-cols-[1.1fr_1fr]">
+              <section className="rounded-lg border border-white/10 bg-black/20 p-3">
+                <div className="mb-2 text-[11px] font-semibold text-emerald-100">运行配置</div>
+                <div className="grid gap-1.5 sm:grid-cols-2">
+                  {[
+                    ["状态", runStatusLabel(lastCompletedRun.status)],
+                    ["开始/结束", `${formatTimestamp(lastCompletedRun.started_at)} / ${formatTimestamp(lastCompletedRun.finished_at)}`],
+                    ["链路", configCodecLabel(reportConfig)],
+                    ["渲染", dash(reportConfig?.renderer_type ?? effectiveRenderLabel)],
+                    ["分辨率", configResolutionLabel(reportConfig)],
+                    ["目标 FPS", dash(reportConfig?.fps)],
+                    ["码率", formatMbps(configBitrateMbps(reportConfig))],
+                    ["内存路径", memoryPathLabel],
+                    ["CPU", dash(reportEnvironment?.cpu_brand)],
+                    ["GPU", dash(reportEnvironment?.gpu_info)],
+                  ].map(([label, value]) => (
+                    <div key={label} className="grid grid-cols-[76px_1fr] gap-2">
+                      <span className="text-emerald-200/55">{label}</span>
+                      <span className="min-w-0 truncate text-emerald-50">{value}</span>
+                    </div>
+                  ))}
+                </div>
+              </section>
+
+              <section className="rounded-lg border border-white/10 bg-black/20 p-3">
+                <div className="mb-2 text-[11px] font-semibold text-emerald-100">阶段 P95</div>
+                <div className="grid gap-1.5">
+                  {[
+                    ["capture", diagnosticsCaptureP95Ms],
+                    ["encode", lastRunSummary?.encode_latency_p95 ?? diagnosticsEncodeP95Ms],
+                    ["transport", lastRunSummary?.transport_latency_p95 ?? diagnosticsTransportP95Ms],
+                    ["decode", lastRunSummary?.decode_latency_p95 ?? diagnosticsDecodeP95Ms],
+                    ["render", diagnosticsRenderP95Ms],
+                  ].map(([label, value]) => (
+                    <div key={label} className="grid grid-cols-[1fr_76px] gap-2">
+                      <span className="text-emerald-200/60">{label}</span>
+                      <span className="text-right font-medium text-emerald-50">
+                        {formatSummaryMs(value as number | null)}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </section>
+            </div>
+
+            <div className="mt-3 grid gap-3 lg:grid-cols-2">
+              <section className="rounded-lg border border-white/10 bg-black/20 p-3">
+                <div className="mb-2 text-[11px] font-semibold text-emerald-100">mrd-service 资源</div>
+                <div className="grid grid-cols-2 gap-2">
+                  <div>CPU p95: {formatOptionalPercent(reportServiceCpuP95)}</div>
+                  <div>内存峰值: {formatMb(reportServiceMemoryPeak)}</div>
+                  <div>GPU p95: {formatOptionalPercent(reportServiceGpuP95)}</div>
+                  <div>网络峰值: {formatMbps(reportServiceNetworkPeak)}</div>
+                </div>
+              </section>
+              <section className="rounded-lg border border-white/10 bg-black/20 p-3">
+                <div className="mb-2 text-[11px] font-semibold text-emerald-100">接收显示资源</div>
+                <div className="grid grid-cols-2 gap-2">
+                  <div>CPU p95: {formatOptionalPercent(reportDisplayCpuP95)}</div>
+                  <div>内存峰值: {formatMb(reportDisplayMemoryPeak)}</div>
+                  <div>GPU p95: {formatOptionalPercent(reportDisplayGpuP95)}</div>
+                  <div>网络峰值: {formatMbps(reportDisplayNetworkPeak)}</div>
+                </div>
+              </section>
+            </div>
+
+            {(lastRunSummary?.error_message || mediaPipelineSnapshot?.codec_fallback_reason) && (
+              <div className="mt-3 rounded-lg border border-amber-300/25 bg-amber-500/10 p-3 text-amber-100">
+                {lastRunSummary?.error_message
+                  ? `error: ${lastRunSummary.error_message}`
+                  : `codec fallback: ${mediaPipelineSnapshot?.codec_fallback_reason}`}
+              </div>
+            )}
           </div>
         )}
         {isLocalPipelinePreview && matrixRunProgress && (
