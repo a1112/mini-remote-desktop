@@ -198,6 +198,42 @@ type WebCodecsAccessUnitMessage = {
   payload: Uint8Array;
 };
 
+type WebCodecsWorkerCapableCanvas = {
+  transferControlToOffscreen?: () => OffscreenCanvas;
+};
+
+type WebCodecsWorkerMessage =
+  | {
+      type: "ready";
+      width: number;
+      height: number;
+      fps: number;
+      bitrateMbps: number;
+    }
+  | {
+      type: "stats";
+      fps: number;
+      paintFps: number;
+      frameCount: number;
+      frameIntervalP95Ms: number | null;
+      latencyLatestMs: number;
+      latencyP50Ms: number;
+      latencyP95Ms: number;
+      latencyMaxMs: number;
+      latencySamples: number;
+      decodeQueueSize: number;
+      droppedFrames: number;
+      canvasWidth: number;
+      canvasHeight: number;
+    }
+  | {
+      type: "closed";
+    }
+  | {
+      type: "error";
+      message: string;
+    };
+
 type WindowWithMrdFrameTimingDebug = Window & {
   __mrdFrameTimingDebug?: WebRtcFrameTimingDebug;
   __mrdWebPreviewPeer?: RTCPeerConnection;
@@ -920,6 +956,22 @@ export function browserSupportsWebCodecsH264(): boolean {
     EncodedVideoChunk?: unknown;
   };
   return Boolean(maybeWindow.VideoDecoder && maybeWindow.EncodedVideoChunk);
+}
+
+export function browserSupportsWebCodecsWorkerRendering(
+  canvas: WebCodecsWorkerCapableCanvas | null
+): boolean {
+  if (!browserSupportsWebCodecsH264()) return false;
+  if (typeof window === "undefined") return false;
+  const maybeWindow = window as Window & {
+    Worker?: unknown;
+    OffscreenCanvas?: unknown;
+  };
+  return Boolean(
+    maybeWindow.Worker &&
+      maybeWindow.OffscreenCanvas &&
+      canvas?.transferControlToOffscreen
+  );
 }
 
 const WEBRTC_LOW_LATENCY_PLAYOUT_SECONDS = 0.02;
@@ -2687,6 +2739,118 @@ export function RemoteDisplayWindowPage() {
       return;
     }
 
+    const canvasElement = webCodecsCanvasRef.current;
+    if (browserSupportsWebCodecsWorkerRendering(canvasElement)) {
+      let worker: Worker | null = null;
+      let resizeObserver: ResizeObserver | null = null;
+      let cancelled = false;
+      try {
+        const offscreenCanvas = (
+          canvasElement as HTMLCanvasElement & {
+            transferControlToOffscreen: () => OffscreenCanvas;
+          }
+        ).transferControlToOffscreen();
+        worker = new Worker(new URL("../workers/webCodecsPreview.worker.ts", import.meta.url), {
+          type: "module",
+        });
+
+        const viewport = () => {
+          const bounds = canvasElement?.getBoundingClientRect();
+          const [requestedWidth, requestedHeight] = resolution.split("x").map(Number);
+          return {
+            viewportWidth: bounds?.width || canvasElement?.clientWidth || requestedWidth,
+            viewportHeight: bounds?.height || canvasElement?.clientHeight || requestedHeight,
+            devicePixelRatio: window.devicePixelRatio || 1,
+          };
+        };
+        const postResize = () => {
+          if (!worker) return;
+          worker.postMessage({
+            type: "resize",
+            ...viewport(),
+          });
+        };
+
+        worker.onmessage = (event: MessageEvent<WebCodecsWorkerMessage>) => {
+          if (cancelled) return;
+          const message = event.data;
+          if (message.type === "ready") {
+            setWebPreviewMode("webcodecs");
+            setWebPreviewError(null);
+            setWebFrameTimingChannelState("webcodecs-worker:open");
+            setTestMessage(
+              `WebCodecs Worker + OffscreenCanvas 本机采集运行中 (${message.width}x${message.height}@${message.fps})`
+            );
+            return;
+          }
+          if (message.type === "stats") {
+            setWebVideoFps(message.fps);
+            setWebPaintFps(message.paintFps);
+            setWebVideoFrameCount(message.frameCount);
+            setWebFrameIntervalP95Ms(message.frameIntervalP95Ms);
+            setWebPresentationLatencyStats({
+              latestMs: message.latencyLatestMs,
+              p50Ms: message.latencyP50Ms,
+              p95Ms: message.latencyP95Ms,
+              maxMs: message.latencyMaxMs,
+              samples: message.latencySamples,
+              source: "webcodecs_frame_header",
+            });
+            return;
+          }
+          if (message.type === "error") {
+            setWebPreviewMode("failed");
+            setWebPreviewError(message.message);
+            setWebFrameTimingChannelState("webcodecs-worker:error");
+            return;
+          }
+          setWebFrameTimingChannelState("webcodecs-worker:closed");
+        };
+        worker.onerror = (event) => {
+          if (cancelled) return;
+          setWebPreviewMode("failed");
+          setWebPreviewError(event.message || "WebCodecs worker failed");
+          setWebFrameTimingChannelState("webcodecs-worker:error");
+        };
+        setWebPreviewMode("connecting");
+        setWebPreviewError(null);
+        setWebFrameTimingChannelState("webcodecs-worker:connecting");
+        worker.postMessage(
+          {
+            type: "start",
+            canvas: offscreenCanvas,
+            websocketUrl: browserWebcodecsPreviewWebSocketUrl(),
+            sessionId,
+            fps: Number(fps),
+            width: Number(resolution.split("x")[0]),
+            height: Number(resolution.split("x")[1]),
+            bitrateMbps: Number(bitrate),
+            h264Profile: "baseline",
+            ...viewport(),
+          },
+          [offscreenCanvas]
+        );
+        resizeObserver = new ResizeObserver(postResize);
+        resizeObserver.observe(canvasElement as Element);
+
+        return () => {
+          cancelled = true;
+          resizeObserver?.disconnect();
+          worker?.postMessage({ type: "stop" });
+          worker?.terminate();
+        };
+      } catch (error) {
+        resizeObserver?.disconnect();
+        worker?.terminate();
+        setWebFrameTimingChannelState("webcodecs-main:fallback");
+        setTestMessage(
+          `WebCodecs Worker 初始化失败，回退主线程解码: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
+      }
+    }
+
     let cancelled = false;
     let decoderClosed = false;
     let configured = false;
@@ -3528,10 +3692,26 @@ export function RemoteDisplayWindowPage() {
     !isNative &&
     webPreviewEngine === "webrtc" &&
     (webPreviewMode === "connecting" || webPreviewMode === "webrtc");
+  const webCodecsWorkerActive = webFrameTimingChannelState?.startsWith("webcodecs-worker") ?? false;
+  const memoryPathLabel = usesNativeSharedTexture
+    ? "D3D11 shared"
+    : nativeRendererType === "macos"
+      ? "Metal upload"
+      : nativeRendererType === "linux"
+        ? "Linux upload"
+        : isLocalPipelinePreview && !isNative
+          ? webPreviewEngine === "webcodecs"
+            ? webCodecsWorkerActive
+              ? "OffscreenCanvas"
+              : "WebCodecs canvas"
+            : "WebRTC MediaStream"
+          : "CPU preview";
   const effectiveRenderLabel =
     isLocalPipelinePreview && !isNative
       ? webPreviewEngine === "webcodecs"
-        ? "WebCodecs prototype"
+        ? webCodecsWorkerActive
+          ? "WebCodecs worker"
+          : "WebCodecs canvas"
         : webPreviewMode === "webrtc"
           ? "WebRTC video"
           : webPreviewMode === "connecting"
@@ -4351,7 +4531,7 @@ export function RemoteDisplayWindowPage() {
             </span>
           )}
           <span className="hidden xl:inline">
-            memory: {usesNativeSharedTexture ? "D3D11 shared" : nativeRendererType === "macos" ? "Metal upload" : nativeRendererType === "linux" ? "Linux upload" : isLocalPipelinePreview && !isNative ? "WebRTC MediaStream" : "CPU preview"}
+            memory: {memoryPathLabel}
           </span>
           {isNative && nativeSurface?.attached && (
             <span className="hidden xl:inline">

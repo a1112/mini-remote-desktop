@@ -6,6 +6,7 @@ import {
   RemoteDisplayWindowPage,
   applyWebRtcReceiverLowLatencyHint,
   applyWebRtcVideoMotionHint,
+  browserSupportsWebCodecsWorkerRendering,
   browserWebrtcPreviewH264Profile,
   buildWebRtcDiagnosticsStageRows,
   WebRtcPresentationLatencyTracker,
@@ -871,6 +872,21 @@ describe("RemoteDisplayWindowPage", () => {
     fireEvent.click(await screen.findByRole("button", { name: "WebCodecs Ultra" }));
 
     expect(screen.getByRole("button", { name: "开始测试" })).toBeEnabled();
+  });
+
+  it("detects when WebCodecs can render through a worker offscreen canvas", () => {
+    vi.stubGlobal("VideoDecoder", class {});
+    vi.stubGlobal("EncodedVideoChunk", class {});
+    vi.stubGlobal("Worker", class {});
+    vi.stubGlobal("OffscreenCanvas", class {});
+
+    expect(
+      browserSupportsWebCodecsWorkerRendering({
+        transferControlToOffscreen: () => ({}) as OffscreenCanvas,
+      })
+    ).toBe(true);
+    expect(browserSupportsWebCodecsWorkerRendering(null)).toBe(false);
+    expect(browserSupportsWebCodecsWorkerRendering({})).toBe(false);
   });
 
   it("blocks high-FPS browser rendering when only the OpenH264 diagnostic fallback is available", async () => {
