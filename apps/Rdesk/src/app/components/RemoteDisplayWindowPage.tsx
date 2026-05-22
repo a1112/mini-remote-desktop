@@ -516,6 +516,70 @@ function formatDropped(value?: number | null) {
   return typeof value === "number" ? `${value.toLocaleString()} dropped` : "-";
 }
 
+function formatDurationMs(value?: number | null) {
+  if (typeof value !== "number") return "-";
+  const totalSeconds = Math.max(0, Math.round(value / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return minutes > 0
+    ? `${minutes}m ${seconds.toString().padStart(2, "0")}s`
+    : `${seconds}s`;
+}
+
+function formatTimestamp(value?: number | null) {
+  if (typeof value !== "number") return "-";
+  return new Date(value).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+function runStatusLabel(status?: TestRun["status"] | null) {
+  if (status === "completed") return "完成";
+  if (status === "failed") return "失败";
+  if (status === "cancelled") return "已停止";
+  if (status === "running") return "运行中";
+  if (status === "preparing") return "准备中";
+  if (status === "queued") return "排队中";
+  return "-";
+}
+
+function average(values: Array<number | null | undefined>) {
+  const finiteValues = values.filter((value): value is number => typeof value === "number");
+  if (finiteValues.length === 0) return null;
+  return finiteValues.reduce((total, value) => total + value, 0) / finiteValues.length;
+}
+
+function maxValue(values: Array<number | null | undefined>) {
+  const finiteValues = values.filter((value): value is number => typeof value === "number");
+  return finiteValues.length > 0 ? Math.max(...finiteValues) : null;
+}
+
+function latestValue(values: Array<number | null | undefined>) {
+  for (let index = values.length - 1; index >= 0; index -= 1) {
+    const value = values[index];
+    if (typeof value === "number") return value;
+  }
+  return null;
+}
+
+function configResolutionLabel(config?: TestConfig | null) {
+  const resolution = config?.resolution;
+  return resolution ? `${resolution[0]}x${resolution[1]}` : "-";
+}
+
+function configBitrateMbps(config?: TestConfig | null) {
+  if (typeof config?.bitrate !== "number") return null;
+  return config.bitrate / 1_000_000;
+}
+
+function configCodecLabel(config?: TestConfig | null) {
+  return `${dash(config?.capture_type)} -> ${dash(config?.encoder_type)} -> ${dash(
+    config?.decoder_type
+  )} / ${dash(config?.transport_kind)}`;
+}
+
 function percentile(values: number[], percentileValue: number) {
   const finiteValues = values.filter((value) => Number.isFinite(value));
   if (finiteValues.length === 0) return null;
@@ -1658,8 +1722,11 @@ export function RemoteDisplayWindowPage() {
   const nativePreviewFrameKeyRef = useRef<string | null>(null);
   const linuxNativeProfileAppliedRef = useRef(false);
   const diagnosticsCurrentRef = useRef<DiagnosticsSample | null>(null);
+  const diagnosticsSamplesRef = useRef<DiagnosticsSample[]>([]);
   const diagnosticsPopoverRef = useRef<HTMLDivElement | null>(null);
   const matrixStopRequestedRef = useRef(false);
+  const webPreviewRunStartedAtRef = useRef<number | null>(null);
+  const webPreviewAutoStopTimerRef = useRef<number | null>(null);
 
   const [context, setContext] = useState<RemoteDisplayWindowContext | null>(null);
   const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
@@ -2345,6 +2412,7 @@ export function RemoteDisplayWindowPage() {
   }, [diagnosticsCurrent]);
 
   useEffect(() => {
+    diagnosticsSamplesRef.current = [];
     setDiagnosticsSamples([]);
   }, [sessionId]);
 
@@ -2387,7 +2455,9 @@ export function RemoteDisplayWindowPage() {
       };
       setDiagnosticsSamples((samples) => {
         const next = [...samples, nextSample];
-        return next.slice(Math.max(0, next.length - DIAGNOSTICS_SAMPLE_LIMIT));
+        const bounded = next.slice(Math.max(0, next.length - DIAGNOSTICS_SAMPLE_LIMIT));
+        diagnosticsSamplesRef.current = bounded;
+        return bounded;
       });
     };
 
@@ -4214,6 +4284,110 @@ export function RemoteDisplayWindowPage() {
     []
   );
 
+  const buildBrowserPreviewCompletedRun = useCallback(
+    (status: TestRun["status"], message?: string): TestRun => {
+      const now = Date.now();
+      const startedAt = webPreviewRunStartedAtRef.current ?? now;
+      const samples = diagnosticsSamplesRef.current;
+      const fpsSamples = samples.map((sample) => sample.fps);
+      const latencySamples = samples.map((sample) => sample.latencyP95Ms);
+      const encodeSamples = samples.map((sample) => sample.encodeP95Ms);
+      const transportSamples = samples.map((sample) => sample.transportP95Ms);
+      const decodeSamples = samples.map((sample) => sample.decodeP95Ms);
+      const droppedFrames =
+        latestValue(samples.map((sample) => sample.droppedFrames)) ??
+        webRtcReceiverStats?.framesDropped ??
+        0;
+
+      return {
+        run_id:
+          currentRunId ??
+          `web-preview-${startedAt.toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+        scenario_id: "browser-local-preview",
+        run_mode: "manual",
+        status,
+        started_at: startedAt,
+        finished_at: now,
+        config_snapshot: testConfig,
+        environment_snapshot:
+          capabilities ?? {
+            os_type: "browser",
+            cpu_brand: "Browser",
+            cpu_cores: navigator.hardwareConcurrency || 1,
+            memory_gb: 0,
+            gpu_info: "Browser Web View",
+            available_encoders: [],
+            available_decoders: [],
+          },
+        summary: {
+          total_duration_ms: now - startedAt,
+          capture_fps: average(fpsSamples) ?? webVideoFps ?? undefined,
+          encode_latency_p95: percentile(encodeSamples.filter((value): value is number => typeof value === "number"), 0.95) ?? undefined,
+          transport_latency_p95: percentile(transportSamples.filter((value): value is number => typeof value === "number"), 0.95) ?? undefined,
+          decode_latency_p95: percentile(decodeSamples.filter((value): value is number => typeof value === "number"), 0.95) ?? undefined,
+          total_latency_p95:
+            percentile(latencySamples.filter((value): value is number => typeof value === "number"), 0.95) ??
+            webPresentationLatencyStats?.p95Ms ??
+            undefined,
+          dropped_frames: droppedFrames,
+          frame_count: webVideoFrameCount,
+          error_message: message,
+          failure_reason:
+            status === "failed"
+              ? "runtime_failure"
+              : status === "cancelled"
+                ? "runtime_stopped"
+                : undefined,
+        },
+      };
+    },
+    [
+      capabilities,
+      currentRunId,
+      testConfig,
+      webPresentationLatencyStats?.p95Ms,
+      webRtcReceiverStats?.framesDropped,
+      webVideoFps,
+      webVideoFrameCount,
+    ]
+  );
+
+  const clearBrowserPreviewAutoStopTimer = useCallback(() => {
+    if (webPreviewAutoStopTimerRef.current !== null) {
+      window.clearTimeout(webPreviewAutoStopTimerRef.current);
+      webPreviewAutoStopTimerRef.current = null;
+    }
+  }, []);
+
+  const completeBrowserPreviewRun = useCallback(
+    async (status: TestRun["status"] = "completed", message?: string) => {
+      clearBrowserPreviewAutoStopTimer();
+      closeWebPreviewPeer();
+      await browserWebrtcPreviewStop(sessionId);
+      const completedRun = buildBrowserPreviewCompletedRun(status, message);
+      setLastCompletedRun(completedRun);
+      setCurrentRunId(null);
+      setTestStatus(status === "failed" ? "failed" : "completed");
+      setTestMessage(
+        message ??
+          (status === "cancelled"
+            ? "测试已手动停止，报告已生成"
+            : status === "failed"
+              ? "测试失败，报告已生成"
+              : "测试完成，报告已生成")
+      );
+      webPreviewRunStartedAtRef.current = null;
+    },
+    [
+      buildBrowserPreviewCompletedRun,
+      clearBrowserPreviewAutoStopTimer,
+      closeWebPreviewPeer,
+      sessionId,
+    ]
+  );
+
+  useEffect(() => clearBrowserPreviewAutoStopTimer, [clearBrowserPreviewAutoStopTimer]);
+
   const handleStartTest = async () => {
     if (!isLocalPipelinePreview) {
       await handleStartRemoteReceiver();
@@ -4237,6 +4411,8 @@ export function RemoteDisplayWindowPage() {
     setMetrics(null);
     setMatrixRunProgress(null);
     matrixStopRequestedRef.current = false;
+    clearBrowserPreviewAutoStopTimer();
+    webPreviewRunStartedAtRef.current = null;
     setWebPreviewMode("idle");
     setWebPreviewError(null);
 
@@ -4249,12 +4425,21 @@ export function RemoteDisplayWindowPage() {
         setFps(localWebViewPlan.profile.fps);
         setBitrate(localWebViewPlan.profile.bitrate);
       }
+      const startedAt = Date.now();
+      const runId = `web-preview-${startedAt.toString(36)}`;
+      webPreviewRunStartedAtRef.current = startedAt;
+      setCurrentRunId(runId);
       setTestStatus("running");
       setTestMessage(
         webPreviewEngine === "webcodecs"
           ? "网页 WebCodecs 本机采集运行中"
           : "网页 WebRTC 本机采集运行中"
       );
+      if (durationMode !== "manual") {
+        webPreviewAutoStopTimerRef.current = window.setTimeout(() => {
+          void completeBrowserPreviewRun("completed");
+        }, selectedDurationMs);
+      }
       return;
     }
 
@@ -4436,10 +4621,7 @@ export function RemoteDisplayWindowPage() {
     closeWebPreviewPeer();
     setWebPreviewMode("idle");
     if (!isNative && !isTauriRuntime()) {
-      await browserWebrtcPreviewStop(sessionId);
-      setTestStatus("idle");
-      setCurrentRunId(null);
-      setTestMessage("网页显示已停止");
+      await completeBrowserPreviewRun("cancelled");
       return;
     }
     const result = currentRunId
@@ -4545,6 +4727,80 @@ export function RemoteDisplayWindowPage() {
     webPresentationLatencyStats?.p95Ms ??
     null;
   const lastRunDropped = lastRunSummary?.dropped_frames ?? metrics?.dropped_frames ?? null;
+  const reportConfig = lastCompletedRun?.config_snapshot ?? null;
+  const reportEnvironment = lastCompletedRun?.environment_snapshot ?? capabilities ?? null;
+  const reportDurationMs =
+    lastRunSummary?.total_duration_ms ??
+    (lastCompletedRun?.finished_at && lastCompletedRun.started_at
+      ? lastCompletedRun.finished_at - lastCompletedRun.started_at
+      : null);
+  const reportFrameCount = lastRunSummary?.frame_count ?? metrics?.frame_count ?? null;
+  const reportDropRatio =
+    typeof lastRunDropped === "number" && typeof reportFrameCount === "number" && reportFrameCount > 0
+      ? lastRunDropped / reportFrameCount * 100
+      : diagnosticsDropRatio;
+  const reportFpsAvg =
+    lastRunSummary?.capture_fps ?? average(diagnosticsSamples.map((sample) => sample.fps));
+  const reportFpsMin = maxValue(
+    diagnosticsSamples.map((sample) =>
+      typeof sample.fps === "number" ? -sample.fps : null
+    )
+  );
+  const reportFpsMinValue = typeof reportFpsMin === "number" ? -reportFpsMin : null;
+  const reportLatencyP50 =
+    webPresentationLatencyStats?.p50Ms ??
+    percentile(
+      diagnosticsSamples
+        .map((sample) => sample.latencyP95Ms)
+        .filter((value): value is number => typeof value === "number"),
+      0.5
+    );
+  const reportLatencyP95 = lastRunLatencyP95;
+  const reportServiceCpuP95 = percentile(
+    diagnosticsSamples
+      .map((sample) => sample.serviceCpuPercent)
+      .filter((value): value is number => typeof value === "number"),
+    0.95
+  );
+  const reportServiceMemoryPeak = maxValue(
+    diagnosticsSamples.map((sample) => sample.serviceMemoryMb)
+  );
+  const reportServiceGpuP95 = percentile(
+    diagnosticsSamples
+      .map((sample) => sample.serviceGpuPercent)
+      .filter((value): value is number => typeof value === "number"),
+    0.95
+  );
+  const reportServiceNetworkPeak = maxValue(
+    diagnosticsSamples.map((sample) =>
+      sumNullable(sample.serviceNetworkRxMbps, sample.serviceNetworkTxMbps)
+    )
+  );
+  const reportDisplayCpuP95 = percentile(
+    diagnosticsSamples
+      .map((sample) => sample.displayCpuPercent)
+      .filter((value): value is number => typeof value === "number"),
+    0.95
+  );
+  const reportDisplayMemoryPeak = maxValue(
+    diagnosticsSamples.map((sample) => sample.displayMemoryMb)
+  );
+  const reportDisplayGpuP95 = percentile(
+    diagnosticsSamples
+      .map((sample) => sample.displayGpuPercent)
+      .filter((value): value is number => typeof value === "number"),
+    0.95
+  );
+  const reportDisplayNetworkPeak = maxValue(
+    diagnosticsSamples.map((sample) =>
+      sumNullable(sample.displayNetworkRxMbps, sample.displayNetworkTxMbps)
+    )
+  );
+  const reportVisible =
+    isLocalPipelinePreview &&
+    lastCompletedRun &&
+    !isTestBusy &&
+    ["completed", "failed", "cancelled"].includes(lastCompletedRun.status);
   const primaryActionBlocked = Boolean(!isTestBusy && localStartBlockReason);
   const renderCaptureSourceCards = (closeAfterSelect = false) => (
     <div className="grid max-h-80 gap-3 overflow-y-auto pr-1 sm:grid-cols-2 lg:grid-cols-3">
@@ -5552,34 +5808,149 @@ export function RemoteDisplayWindowPage() {
             Web preview / mrd-service bridge / 非 native 高刷渲染
           </div>
         )}
-        {isLocalPipelinePreview && testStatus === "completed" && lastCompletedRun && (
-          <div className="absolute left-3 top-3 max-w-md rounded-lg border border-emerald-300/25 bg-emerald-950/70 px-3 py-3 text-xs text-emerald-50 shadow-xl backdrop-blur">
-            <div className="mb-2 flex items-center justify-between gap-3">
-              <div className="font-semibold">测试结果</div>
-              <div className="truncate text-[10px] text-emerald-200/70">
-                {lastCompletedRun.run_id}
+        {reportVisible && lastCompletedRun && (
+          <div className="absolute inset-x-3 top-3 z-20 mx-auto max-h-[calc(100%-1.5rem)] max-w-5xl overflow-y-auto rounded-xl border border-emerald-300/25 bg-[#03140f]/88 p-4 text-xs text-emerald-50 shadow-2xl shadow-emerald-950/60 backdrop-blur-md">
+            <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <div className="flex items-center gap-2 text-sm font-semibold text-white">
+                  <BarChart3 className="h-4 w-4 text-emerald-300" />
+                  完整测试报告
+                </div>
+                <div className="mt-1 max-w-3xl truncate text-[11px] text-emerald-200/65">
+                  {configCodecLabel(reportConfig)} / {configResolutionLabel(reportConfig)} @{" "}
+                  {dash(reportConfig?.fps)} FPS / {formatMbps(configBitrateMbps(reportConfig))}
+                </div>
               </div>
-            </div>
-            <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-              <div className="rounded-md bg-white/8 px-2 py-1.5">
-                <div className="text-[10px] text-emerald-200/60">FPS</div>
-                <div className="font-semibold">{formatSummaryFps(lastRunFps)}</div>
-              </div>
-              <div className="rounded-md bg-white/8 px-2 py-1.5">
-                <div className="text-[10px] text-emerald-200/60">P95</div>
-                <div className="font-semibold">{formatSummaryMs(lastRunLatencyP95)}</div>
-              </div>
-              <div className="rounded-md bg-white/8 px-2 py-1.5">
-                <div className="text-[10px] text-emerald-200/60">Drop</div>
-                <div className="font-semibold">{formatDropped(lastRunDropped)}</div>
-              </div>
-              <div className="rounded-md bg-white/8 px-2 py-1.5">
-                <div className="text-[10px] text-emerald-200/60">Frames</div>
-                <div className="font-semibold">
-                  {formatCount(lastRunSummary?.frame_count ?? metrics?.frame_count ?? null)}
+              <div className="text-right">
+                <div
+                  className={`inline-flex rounded-full border px-2 py-1 text-[11px] font-semibold ${
+                    lastCompletedRun.status === "failed"
+                      ? "border-red-300/35 bg-red-500/15 text-red-100"
+                      : lastCompletedRun.status === "cancelled"
+                        ? "border-amber-300/35 bg-amber-500/15 text-amber-100"
+                        : "border-emerald-300/35 bg-emerald-500/15 text-emerald-100"
+                  }`}
+                >
+                  {runStatusLabel(lastCompletedRun.status)}
+                </div>
+                <div className="mt-1 max-w-[260px] truncate text-[10px] text-emerald-200/60">
+                  {lastCompletedRun.run_id}
                 </div>
               </div>
             </div>
+
+            <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+              <div className="rounded-lg border border-white/10 bg-white/8 p-3">
+                <div className="text-[10px] uppercase text-emerald-200/55">FPS 平均 / 最低</div>
+                <div className="mt-1 text-lg font-semibold text-white">
+                  {formatSummaryFps(reportFpsAvg)}
+                </div>
+                <div className="text-[10px] text-emerald-200/55">
+                  min {formatSummaryFps(reportFpsMinValue)}
+                </div>
+              </div>
+              <div className="rounded-lg border border-white/10 bg-white/8 p-3">
+                <div className="text-[10px] uppercase text-emerald-200/55">E2E 延迟 p50 / p95</div>
+                <div className="mt-1 text-lg font-semibold text-white">
+                  {formatSummaryMs(reportLatencyP95)}
+                </div>
+                <div className="text-[10px] text-emerald-200/55">
+                  p50 {formatSummaryMs(reportLatencyP50)}
+                </div>
+              </div>
+              <div className="rounded-lg border border-white/10 bg-white/8 p-3">
+                <div className="text-[10px] uppercase text-emerald-200/55">掉帧 / 丢弃率</div>
+                <div className="mt-1 text-lg font-semibold text-white">
+                  {formatDropped(lastRunDropped)}
+                </div>
+                <div className="text-[10px] text-emerald-200/55">
+                  {formatPercent(reportDropRatio)}
+                </div>
+              </div>
+              <div className="rounded-lg border border-white/10 bg-white/8 p-3">
+                <div className="text-[10px] uppercase text-emerald-200/55">帧数 / 时长</div>
+                <div className="mt-1 text-lg font-semibold text-white">
+                  {formatCount(reportFrameCount)}
+                </div>
+                <div className="text-[10px] text-emerald-200/55">
+                  {formatDurationMs(reportDurationMs)}
+                </div>
+              </div>
+            </div>
+
+            <div className="mt-3 grid gap-3 lg:grid-cols-[1.1fr_1fr]">
+              <section className="rounded-lg border border-white/10 bg-black/20 p-3">
+                <div className="mb-2 text-[11px] font-semibold text-emerald-100">运行配置</div>
+                <div className="grid gap-1.5 sm:grid-cols-2">
+                  {[
+                    ["状态", runStatusLabel(lastCompletedRun.status)],
+                    ["开始/结束", `${formatTimestamp(lastCompletedRun.started_at)} / ${formatTimestamp(lastCompletedRun.finished_at)}`],
+                    ["链路", configCodecLabel(reportConfig)],
+                    ["渲染", dash(reportConfig?.renderer_type ?? effectiveRenderLabel)],
+                    ["分辨率", configResolutionLabel(reportConfig)],
+                    ["目标 FPS", dash(reportConfig?.fps)],
+                    ["码率", formatMbps(configBitrateMbps(reportConfig))],
+                    ["内存路径", memoryPathLabel],
+                    ["CPU", dash(reportEnvironment?.cpu_brand)],
+                    ["GPU", dash(reportEnvironment?.gpu_info)],
+                  ].map(([label, value]) => (
+                    <div key={label} className="grid grid-cols-[76px_1fr] gap-2">
+                      <span className="text-emerald-200/55">{label}</span>
+                      <span className="min-w-0 truncate text-emerald-50">{value}</span>
+                    </div>
+                  ))}
+                </div>
+              </section>
+
+              <section className="rounded-lg border border-white/10 bg-black/20 p-3">
+                <div className="mb-2 text-[11px] font-semibold text-emerald-100">阶段 P95</div>
+                <div className="grid gap-1.5">
+                  {[
+                    ["capture", diagnosticsCaptureP95Ms],
+                    ["encode", lastRunSummary?.encode_latency_p95 ?? diagnosticsEncodeP95Ms],
+                    ["transport", lastRunSummary?.transport_latency_p95 ?? diagnosticsTransportP95Ms],
+                    ["decode", lastRunSummary?.decode_latency_p95 ?? diagnosticsDecodeP95Ms],
+                    ["render", diagnosticsRenderP95Ms],
+                  ].map(([label, value]) => (
+                    <div key={label} className="grid grid-cols-[1fr_76px] gap-2">
+                      <span className="text-emerald-200/60">{label}</span>
+                      <span className="text-right font-medium text-emerald-50">
+                        {formatSummaryMs(value as number | null)}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </section>
+            </div>
+
+            <div className="mt-3 grid gap-3 lg:grid-cols-2">
+              <section className="rounded-lg border border-white/10 bg-black/20 p-3">
+                <div className="mb-2 text-[11px] font-semibold text-emerald-100">mrd-service 资源</div>
+                <div className="grid grid-cols-2 gap-2">
+                  <div>CPU p95: {formatOptionalPercent(reportServiceCpuP95)}</div>
+                  <div>内存峰值: {formatMb(reportServiceMemoryPeak)}</div>
+                  <div>GPU p95: {formatOptionalPercent(reportServiceGpuP95)}</div>
+                  <div>网络峰值: {formatMbps(reportServiceNetworkPeak)}</div>
+                </div>
+              </section>
+              <section className="rounded-lg border border-white/10 bg-black/20 p-3">
+                <div className="mb-2 text-[11px] font-semibold text-emerald-100">接收显示资源</div>
+                <div className="grid grid-cols-2 gap-2">
+                  <div>CPU p95: {formatOptionalPercent(reportDisplayCpuP95)}</div>
+                  <div>内存峰值: {formatMb(reportDisplayMemoryPeak)}</div>
+                  <div>GPU p95: {formatOptionalPercent(reportDisplayGpuP95)}</div>
+                  <div>网络峰值: {formatMbps(reportDisplayNetworkPeak)}</div>
+                </div>
+              </section>
+            </div>
+
+            {(lastRunSummary?.error_message || mediaPipelineSnapshot?.codec_fallback_reason) && (
+              <div className="mt-3 rounded-lg border border-amber-300/25 bg-amber-500/10 p-3 text-amber-100">
+                {lastRunSummary?.error_message
+                  ? `error: ${lastRunSummary.error_message}`
+                  : `codec fallback: ${mediaPipelineSnapshot?.codec_fallback_reason}`}
+              </div>
+            )}
           </div>
         )}
         {isLocalPipelinePreview && matrixRunProgress && (

@@ -1026,11 +1026,13 @@ describe("RemoteDisplayWindowPage", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "Start local pipeline test" }));
 
-    expect(await screen.findByText("测试结果")).toBeInTheDocument();
+    expect(await screen.findByText("完整测试报告")).toBeInTheDocument();
     expect(screen.getByText("run-completed")).toBeInTheDocument();
     expect(screen.getByText("120.4 FPS")).toBeInTheDocument();
     expect(screen.getAllByText("12.8 ms").length).toBeGreaterThan(0);
     expect(screen.getByText("1 dropped")).toBeInTheDocument();
+    expect(screen.getByText("运行配置")).toBeInTheDocument();
+    expect(screen.getByText("阶段 P95")).toBeInTheDocument();
   });
 
   it("allows WebCodecs ultra-low-latency start when the browser decoder APIs exist", async () => {
