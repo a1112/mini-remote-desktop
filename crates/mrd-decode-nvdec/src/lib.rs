@@ -2859,9 +2859,9 @@ mod imp {
                     codec: request.codec_name().to_string(),
                     bit_depth_minus8: request.bit_depth_minus8,
                     chroma_format: request.chroma_format,
-                    runtime_supported: false,
+                    runtime_supported: true,
                     runtime_reason: format!(
-                        "{} runtime probe failed at cuvidGetDecoderCaps",
+                        "{} cuvidGetDecoderCaps returned an error; treating runtime support as unknown because decoder creation handles this probe as non-fatal",
                         request.probe_label()
                     ),
                     wired_supported: matches!(wired_decision, NvdecSupportDecision::Supported),

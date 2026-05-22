@@ -4796,8 +4796,13 @@ async fn record_lan_decoded_frames(
 }
 
 #[cfg(windows)]
+#[derive(Debug)]
 enum LanRenderTaskOutcome {
-    Rendered { duration_ms: f64 },
+    Rendered {
+        upload_duration_ms: f64,
+        presented_frames: u64,
+        present_skips: u64,
+    },
     Dropped,
     Idle,
 }
@@ -4870,32 +4875,52 @@ fn spawn_lan_render_worker(
             }
             pace_lan_render_frame(&app_state, &session_id, &render_profile).await;
             match render_lan_frame_once(app_state.clone(), session_id.clone(), frame).await {
-                Ok(LanRenderTaskOutcome::Rendered { duration_ms }) => {
+                Ok(LanRenderTaskOutcome::Rendered {
+                    upload_duration_ms,
+                    presented_frames,
+                    present_skips,
+                }) => {
                     {
                         let mut pipelines = app_state.media_pipelines.lock().await;
-                        pipelines.increment_render_presented_frames(session_id.clone(), 1);
                         pipelines.record_stage_duration_ms(
                             session_id.clone(),
-                            "render_present",
-                            duration_ms,
+                            "render_upload",
+                            upload_duration_ms,
                         );
+                        if presented_frames > 0 {
+                            pipelines.increment_render_presented_frames(
+                                session_id.clone(),
+                                presented_frames,
+                            );
+                            pipelines.record_stage_duration_ms(
+                                session_id.clone(),
+                                "render_present",
+                                upload_duration_ms,
+                            );
+                        }
+                        if present_skips > 0 {
+                            pipelines
+                                .increment_render_present_skips(session_id.clone(), present_skips);
+                        }
                     }
-                    let present_gap_ms = app_state
-                        .media_render_queues
-                        .lock()
-                        .await
-                        .record_presented(&session_id, Instant::now())
-                        .map(duration_as_millis);
-                    if let Some(present_gap_ms) = present_gap_ms {
-                        app_state
-                            .media_pipelines
+                    if presented_frames > 0 {
+                        let present_gap_ms = app_state
+                            .media_render_queues
                             .lock()
                             .await
-                            .record_stage_duration_ms(
-                                session_id.clone(),
-                                "render_present_gap",
-                                present_gap_ms,
-                            );
+                            .record_presented(&session_id, Instant::now())
+                            .map(duration_as_millis);
+                        if let Some(present_gap_ms) = present_gap_ms {
+                            app_state
+                                .media_pipelines
+                                .lock()
+                                .await
+                                .record_stage_duration_ms(
+                                    session_id.clone(),
+                                    "render_present_gap",
+                                    present_gap_ms,
+                                );
+                        }
                     }
                 }
                 Ok(LanRenderTaskOutcome::Dropped) => {
@@ -5078,6 +5103,8 @@ async fn render_lan_frame_once(
     }
 
     let mut rendered = 0;
+    let mut presented_frames = 0_u64;
+    let mut present_skips = 0_u64;
     for renderer in &renderers {
         let Some(mut renderer) =
             wait_for_mutex_guard(renderer.as_ref(), LAN_RENDER_SURFACE_RENDERER_LOCK_TIMEOUT)
@@ -5088,15 +5115,37 @@ async fn render_lan_frame_once(
             }
             continue;
         };
+        let before = renderer.snapshot();
         renderer
             .upload_frame(frame.clone())
             .map_err(|error| anyhow::anyhow!("upload frame to D3D11 renderer failed: {error}"))?;
+        let after = renderer.snapshot();
+        let uploaded_delta = after
+            .uploaded_frame_count
+            .saturating_sub(before.uploaded_frame_count);
+        let mut presented_delta = after
+            .presented_frame_count
+            .saturating_sub(before.presented_frame_count);
+        let skipped_delta = after
+            .present_skipped_count
+            .saturating_sub(before.present_skipped_count);
+        if uploaded_delta > 0
+            && presented_delta == 0
+            && skipped_delta == 0
+            && after.last_present_status.is_none()
+        {
+            presented_delta = uploaded_delta;
+        }
+        presented_frames = presented_frames.saturating_add(presented_delta);
+        present_skips = present_skips.saturating_add(skipped_delta);
         rendered += 1;
     }
 
     if rendered > 0 {
         Ok(LanRenderTaskOutcome::Rendered {
-            duration_ms: started.elapsed().as_secs_f64() * 1000.0,
+            upload_duration_ms: started.elapsed().as_secs_f64() * 1000.0,
+            presented_frames,
+            present_skips,
         })
     } else {
         Ok(LanRenderTaskOutcome::Idle)
@@ -9503,6 +9552,77 @@ mod tests {
             Some(LAN_PREVIEW_FRAME_INTERVAL)
         );
         assert!(snapshot.latest_frame_data_url.is_none());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn d3d11_present_skip_is_not_counted_as_presented_frame() {
+        use mrd_render::{RenderError, RenderTarget, RendererInstance, RendererSnapshot};
+
+        struct PresentSkipRenderer {
+            uploaded: u64,
+            skipped: u64,
+        }
+
+        impl RendererInstance for PresentSkipRenderer {
+            fn attach_target(&mut self, _target: RenderTarget) -> Result<(), RenderError> {
+                Ok(())
+            }
+
+            fn upload_frame(&mut self, _frame: RenderFrame) -> Result<(), RenderError> {
+                self.uploaded += 1;
+                self.skipped += 1;
+                Ok(())
+            }
+
+            fn snapshot(&self) -> RendererSnapshot {
+                RendererSnapshot {
+                    attached_to_target: true,
+                    uploaded_frame_count: self.uploaded,
+                    presented_frame_count: 0,
+                    present_skipped_count: self.skipped,
+                    last_present_status: Some("skipped_still_drawing".to_string()),
+                    last_width: 1,
+                    last_height: 1,
+                    last_pixel_format: None,
+                }
+            }
+        }
+
+        let app_state = Arc::new(AppState::new());
+        let session_id = SessionId("present-skip-session".to_string());
+        app_state
+            .media_surface_renderers
+            .lock()
+            .await
+            .insert_renderer_for_test(
+                &session_id,
+                "surface-1",
+                Box::new(PresentSkipRenderer {
+                    uploaded: 0,
+                    skipped: 0,
+                }),
+            );
+
+        let outcome = render_lan_frame_once(
+            app_state,
+            session_id,
+            RenderFrame::from_bgra32(1, 1, vec![0, 0, 0, 255]),
+        )
+        .await
+        .expect("render one frame");
+
+        match outcome {
+            LanRenderTaskOutcome::Rendered {
+                presented_frames,
+                present_skips,
+                ..
+            } => {
+                assert_eq!(presented_frames, 0);
+                assert_eq!(present_skips, 1);
+            }
+            other => panic!("unexpected render outcome: {other:?}"),
+        }
     }
 
     #[tokio::test]

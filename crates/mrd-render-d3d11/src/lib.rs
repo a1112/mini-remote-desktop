@@ -45,6 +45,25 @@ struct SharedNv12SrvCache {
 }
 
 #[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum D3d11PresentStatus {
+    Presented,
+    SkippedStillDrawing,
+    NoTarget,
+}
+
+#[cfg(windows)]
+impl D3d11PresentStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Presented => "presented",
+            Self::SkippedStillDrawing => "skipped_still_drawing",
+            Self::NoTarget => "no_target",
+        }
+    }
+}
+
+#[cfg(windows)]
 const SHARED_NV12_VERTEX_SHADER: &str = r#"
 struct VsOut {
     float4 position : SV_POSITION;
@@ -92,6 +111,9 @@ float4 main(PsIn input) : SV_TARGET {
 }
 "#;
 
+#[cfg(windows)]
+const SHARED_NV12_SRV_CACHE_LIMIT: usize = 8;
+
 pub struct D3d11Renderer {
     #[cfg(windows)]
     device: windows::Win32::Graphics::Direct3D11::ID3D11Device,
@@ -102,9 +124,12 @@ pub struct D3d11Renderer {
     #[cfg(windows)]
     shared_nv12_pipeline: Option<SharedNv12Pipeline>,
     #[cfg(windows)]
-    shared_nv12_srv_cache: Option<SharedNv12SrvCache>,
+    shared_nv12_srv_cache: Vec<SharedNv12SrvCache>,
     attached_to_target: bool,
     uploaded_frame_count: u64,
+    presented_frame_count: u64,
+    present_skipped_count: u64,
+    last_present_status: Option<&'static str>,
     last_width: usize,
     last_height: usize,
     last_pixel_format: Option<RenderPixelFormat>,
@@ -173,9 +198,12 @@ impl D3d11Renderer {
                 context,
                 surface: None,
                 shared_nv12_pipeline: None,
-                shared_nv12_srv_cache: None,
+                shared_nv12_srv_cache: Vec::new(),
                 attached_to_target: false,
                 uploaded_frame_count: 0,
+                presented_frame_count: 0,
+                present_skipped_count: 0,
+                last_present_status: None,
                 last_width: 0,
                 last_height: 0,
                 last_pixel_format: None,
@@ -214,16 +242,16 @@ impl D3d11Renderer {
     #[cfg(windows)]
     fn present_swap_chain(
         swap_chain: &windows::Win32::Graphics::Dxgi::IDXGISwapChain1,
-    ) -> Result<(), RenderError> {
+    ) -> Result<D3d11PresentStatus, RenderError> {
         use windows::Win32::Graphics::Dxgi::DXGI_ERROR_WAS_STILL_DRAWING;
 
         let hr = unsafe { swap_chain.Present(0, Self::present_flags()) };
         if hr == DXGI_ERROR_WAS_STILL_DRAWING {
-            return Ok(());
+            return Ok(D3d11PresentStatus::SkippedStillDrawing);
         }
         hr.ok()
             .map_err(|error| RenderError::Message(format!("present 失败: {error}")))?;
-        Ok(())
+        Ok(D3d11PresentStatus::Presented)
     }
 
     #[cfg(windows)]
@@ -358,9 +386,9 @@ impl D3d11Renderer {
     }
 
     #[cfg(windows)]
-    fn present_clear_frame(&self, frame: &RenderFrame) -> Result<(), RenderError> {
+    fn present_clear_frame(&self, frame: &RenderFrame) -> Result<D3d11PresentStatus, RenderError> {
         let Some(surface) = self.surface.as_ref() else {
-            return Ok(());
+            return Ok(D3d11PresentStatus::NoTarget);
         };
 
         let clear = Self::average_clear_color(frame);
@@ -370,16 +398,18 @@ impl D3d11Renderer {
             self.context
                 .ClearRenderTargetView(&surface.render_target_view, &clear);
         }
-        Self::present_swap_chain(&surface.swap_chain)?;
-        Ok(())
+        Self::present_swap_chain(&surface.swap_chain)
     }
 
     #[cfg(windows)]
-    fn present_uploaded_frame_bgra(&self, frame: &RenderFrame) -> Result<(), RenderError> {
+    fn present_uploaded_frame_bgra(
+        &self,
+        frame: &RenderFrame,
+    ) -> Result<D3d11PresentStatus, RenderError> {
         use mrd_render::RenderFrameData;
         use windows::Win32::Graphics::Direct3D11::D3D11_BOX;
         let Some(surface) = self.surface.as_ref() else {
-            return Ok(());
+            return Ok(D3d11PresentStatus::NoTarget);
         };
 
         let data = match &frame.data {
@@ -422,7 +452,7 @@ impl D3d11Renderer {
         let copy_width = upload_width.min(surface_width);
         let copy_height = upload_height.min(surface_height);
         if copy_width == 0 || copy_height == 0 {
-            return Ok(());
+            return Ok(D3d11PresentStatus::NoTarget);
         }
         let copy_box = D3D11_BOX {
             left: 0,
@@ -447,8 +477,7 @@ impl D3d11Renderer {
                 0,
             );
         }
-        Self::present_swap_chain(&surface.swap_chain)?;
-        Ok(())
+        Self::present_swap_chain(&surface.swap_chain)
     }
 
     #[cfg(windows)]
@@ -532,10 +561,13 @@ impl D3d11Renderer {
     }
 
     #[cfg(windows)]
-    fn present_uploaded_frame(&self, frame: &RenderFrame) -> Result<(), RenderError> {
+    fn present_uploaded_frame(
+        &self,
+        frame: &RenderFrame,
+    ) -> Result<D3d11PresentStatus, RenderError> {
         use windows::Win32::Graphics::Direct3D11::D3D11_BOX;
         let Some(surface) = self.surface.as_ref() else {
-            return Ok(());
+            return Ok(D3d11PresentStatus::NoTarget);
         };
 
         let bgra = Self::rgb24_to_bgra(frame)?;
@@ -562,7 +594,7 @@ impl D3d11Renderer {
         let copy_width = upload_width.min(surface_width);
         let copy_height = upload_height.min(surface_height);
         if copy_width == 0 || copy_height == 0 {
-            return Ok(());
+            return Ok(D3d11PresentStatus::NoTarget);
         }
         let copy_box = D3D11_BOX {
             left: 0,
@@ -587,8 +619,7 @@ impl D3d11Renderer {
                 0,
             );
         }
-        Self::present_swap_chain(&surface.swap_chain)?;
-        Ok(())
+        Self::present_swap_chain(&surface.swap_chain)
     }
 
     #[cfg(windows)]
@@ -770,31 +801,42 @@ impl D3d11Renderer {
         ),
         RenderError,
     > {
-        if let Some(cache) = self.shared_nv12_srv_cache.as_ref() {
-            if cache.y_handle == y_handle && cache.uv_handle == uv_handle {
-                return Ok((cache.y_srv.clone(), cache.uv_srv.clone()));
-            }
+        if let Some(position) = self
+            .shared_nv12_srv_cache
+            .iter()
+            .position(|cache| cache.y_handle == y_handle && cache.uv_handle == uv_handle)
+        {
+            let cache = self.shared_nv12_srv_cache.remove(position);
+            let result = (cache.y_srv.clone(), cache.uv_srv.clone());
+            self.shared_nv12_srv_cache.push(cache);
+            return Ok(result);
         }
 
         let y_srv = self.open_shared_texture_srv(y_handle)?;
         let uv_srv = self.open_shared_texture_srv(uv_handle)?;
-        self.shared_nv12_srv_cache = Some(SharedNv12SrvCache {
+        self.shared_nv12_srv_cache.push(SharedNv12SrvCache {
             y_handle,
             uv_handle,
             y_srv: y_srv.clone(),
             uv_srv: uv_srv.clone(),
         });
+        while self.shared_nv12_srv_cache.len() > SHARED_NV12_SRV_CACHE_LIMIT {
+            self.shared_nv12_srv_cache.remove(0);
+        }
 
         Ok((y_srv, uv_srv))
     }
 
     #[cfg(windows)]
-    fn present_shared_bgra_frame(&self, frame: &RenderFrame) -> Result<(), RenderError> {
+    fn present_shared_bgra_frame(
+        &self,
+        frame: &RenderFrame,
+    ) -> Result<D3d11PresentStatus, RenderError> {
         use mrd_render::RenderFrameData;
         use windows::Win32::Graphics::Direct3D11::{ID3D11Resource, D3D11_BOX};
 
         let Some(surface) = self.surface.as_ref() else {
-            return Ok(());
+            return Ok(D3d11PresentStatus::NoTarget);
         };
 
         let shared_handle = match &frame.data {
@@ -819,7 +861,7 @@ impl D3d11Renderer {
         let copy_width = frame.width.min(surface.width as usize);
         let copy_height = frame.height.min(surface.height as usize);
         if copy_width == 0 || copy_height == 0 {
-            return Ok(());
+            return Ok(D3d11PresentStatus::NoTarget);
         }
 
         unsafe {
@@ -849,18 +891,20 @@ impl D3d11Renderer {
                 );
             }
         }
-        Self::present_swap_chain(&surface.swap_chain)?;
-        Ok(())
+        Self::present_swap_chain(&surface.swap_chain)
     }
 
     #[cfg(windows)]
-    fn present_shared_texture_frame(&mut self, frame: &RenderFrame) -> Result<(), RenderError> {
+    fn present_shared_texture_frame(
+        &mut self,
+        frame: &RenderFrame,
+    ) -> Result<D3d11PresentStatus, RenderError> {
         use mrd_render::RenderFrameData;
         use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
         use windows::Win32::Graphics::Direct3D11::{ID3D11ShaderResourceView, D3D11_VIEWPORT};
 
         let Some(surface) = self.surface.as_ref() else {
-            return Ok(());
+            return Ok(D3d11PresentStatus::NoTarget);
         };
 
         let (shared_handle_y, shared_handle_uv) = match &frame.data {
@@ -912,9 +956,16 @@ impl D3d11Renderer {
         let empty_srvs: [Option<ID3D11ShaderResourceView>; 2] = [None, None];
 
         unsafe {
-            let clear = [0.0_f32, 0.0, 0.0, 1.0];
-            self.context
-                .ClearRenderTargetView(&render_target_view, &clear);
+            if should_clear_shared_present_surface(
+                surface_width,
+                surface_height,
+                frame.width,
+                frame.height,
+            ) {
+                let clear = [0.0_f32, 0.0, 0.0, 1.0];
+                self.context
+                    .ClearRenderTargetView(&render_target_view, &clear);
+            }
             self.context
                 .OMSetRenderTargets(Some(&[Some(render_target_view)]), None);
             self.context.RSSetViewports(Some(&[viewport]));
@@ -927,9 +978,24 @@ impl D3d11Renderer {
             self.context.Draw(3, 0);
             self.context.PSSetShaderResources(0, Some(&empty_srvs));
         }
-        Self::present_swap_chain(&swap_chain)?;
-        Ok(())
+        Self::present_swap_chain(&swap_chain)
     }
+}
+
+#[cfg(windows)]
+fn should_clear_shared_present_surface(
+    surface_width: u32,
+    surface_height: u32,
+    frame_width: usize,
+    frame_height: usize,
+) -> bool {
+    let (x, y, width, height) =
+        fit_viewport_rect(surface_width, surface_height, frame_width, frame_height);
+    let epsilon = 0.5_f32;
+    x.abs() > epsilon
+        || y.abs() > epsilon
+        || ((surface_width as f32) - width).abs() > epsilon
+        || ((surface_height as f32) - height).abs() > epsilon
 }
 
 impl RendererInstance for D3d11Renderer {
@@ -948,59 +1014,84 @@ impl RendererInstance for D3d11Renderer {
     }
 
     fn upload_frame(&mut self, frame: RenderFrame) -> Result<(), RenderError> {
-        use mrd_render::RenderFrameData;
-        match &frame.data {
-            RenderFrameData::Rgb24(_) =>
-            {
-                #[cfg(windows)]
-                if self.surface.is_some() {
-                    self.present_uploaded_frame(&frame)?;
-                } else {
-                    self.present_clear_frame(&frame)?;
-                }
-            }
-            RenderFrameData::Bgra32(_) =>
-            {
-                #[cfg(windows)]
-                if self.surface.is_some() {
-                    self.present_uploaded_frame_bgra(&frame)?;
-                } else {
-                    self.present_clear_frame(&frame)?;
-                }
-            }
-            #[cfg(windows)]
-            RenderFrameData::D3D11SharedBgra { .. } =>
-            {
-                #[cfg(windows)]
-                if self.surface.is_some() {
-                    self.present_shared_bgra_frame(&frame)?;
-                } else {
-                    self.present_clear_frame(&frame)?;
-                }
-            }
-            #[cfg(windows)]
-            RenderFrameData::D3D11SharedNv12 { .. } | RenderFrameData::D3D11SharedP010 { .. } =>
-            {
-                #[cfg(windows)]
-                if self.surface.is_some() {
-                    self.present_shared_texture_frame(&frame)?;
-                } else {
-                    self.present_clear_frame(&frame)?;
-                }
-            }
+        #[cfg(not(windows))]
+        {
+            let _ = frame;
+            return Err(RenderError::Message(
+                "d3d11 renderer 仅支持 Windows".to_string(),
+            ));
         }
 
-        self.uploaded_frame_count += 1;
-        self.last_width = frame.width;
-        self.last_height = frame.height;
-        self.last_pixel_format = Some(frame.pixel_format);
-        Ok(())
+        #[cfg(windows)]
+        {
+            use mrd_render::RenderFrameData;
+            let present_status = match &frame.data {
+                RenderFrameData::Rgb24(_) =>
+                {
+                    #[cfg(windows)]
+                    if self.surface.is_some() {
+                        self.present_uploaded_frame(&frame)?
+                    } else {
+                        self.present_clear_frame(&frame)?
+                    }
+                }
+                RenderFrameData::Bgra32(_) =>
+                {
+                    #[cfg(windows)]
+                    if self.surface.is_some() {
+                        self.present_uploaded_frame_bgra(&frame)?
+                    } else {
+                        self.present_clear_frame(&frame)?
+                    }
+                }
+                #[cfg(windows)]
+                RenderFrameData::D3D11SharedBgra { .. } =>
+                {
+                    #[cfg(windows)]
+                    if self.surface.is_some() {
+                        self.present_shared_bgra_frame(&frame)?
+                    } else {
+                        self.present_clear_frame(&frame)?
+                    }
+                }
+                #[cfg(windows)]
+                RenderFrameData::D3D11SharedNv12 { .. }
+                | RenderFrameData::D3D11SharedP010 { .. } =>
+                {
+                    #[cfg(windows)]
+                    if self.surface.is_some() {
+                        self.present_shared_texture_frame(&frame)?
+                    } else {
+                        self.present_clear_frame(&frame)?
+                    }
+                }
+            };
+
+            self.uploaded_frame_count += 1;
+            match present_status {
+                D3d11PresentStatus::Presented => {
+                    self.presented_frame_count += 1;
+                }
+                D3d11PresentStatus::SkippedStillDrawing => {
+                    self.present_skipped_count += 1;
+                }
+                D3d11PresentStatus::NoTarget => {}
+            }
+            self.last_present_status = Some(present_status.as_str());
+            self.last_width = frame.width;
+            self.last_height = frame.height;
+            self.last_pixel_format = Some(frame.pixel_format);
+            Ok(())
+        }
     }
 
     fn snapshot(&self) -> RendererSnapshot {
         RendererSnapshot {
             attached_to_target: self.attached_to_target,
             uploaded_frame_count: self.uploaded_frame_count,
+            presented_frame_count: self.presented_frame_count,
+            present_skipped_count: self.present_skipped_count,
+            last_present_status: self.last_present_status.map(str::to_string),
             last_width: self.last_width,
             last_height: self.last_height,
             last_pixel_format: self.last_pixel_format,
@@ -1010,7 +1101,9 @@ impl RendererInstance for D3d11Renderer {
 
 #[cfg(test)]
 mod tests {
-    use super::{fit_viewport_rect, D3d11Renderer, D3d11RendererFactory};
+    use super::{fit_viewport_rect, D3d11RendererFactory};
+    #[cfg(windows)]
+    use super::{should_clear_shared_present_surface, D3d11PresentStatus, D3d11Renderer};
     use mrd_render::{RenderFrame, RenderPixelFormat, RenderTarget, RendererFactory};
 
     #[test]
@@ -1018,6 +1111,29 @@ mod tests {
         let viewport = fit_viewport_rect(1200, 1200, 1920, 1080);
 
         assert_eq!(viewport, (0.0, 262.5, 1200.0, 675.0));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shared_present_clears_only_when_letterboxed() {
+        assert!(!should_clear_shared_present_surface(1920, 1080, 1920, 1080));
+        assert!(should_clear_shared_present_surface(
+            1920,
+            1080,
+            2560,
+            1440 + 120
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn d3d11_present_status_labels_are_stable_for_metrics() {
+        assert_eq!(D3d11PresentStatus::Presented.as_str(), "presented");
+        assert_eq!(
+            D3d11PresentStatus::SkippedStillDrawing.as_str(),
+            "skipped_still_drawing"
+        );
+        assert_eq!(D3d11PresentStatus::NoTarget.as_str(), "no_target");
     }
 
     #[cfg(windows)]
@@ -1049,6 +1165,9 @@ mod tests {
         let snapshot = renderer.snapshot();
         assert!(snapshot.attached_to_target);
         assert_eq!(snapshot.uploaded_frame_count, 1);
+        assert_eq!(snapshot.presented_frame_count, 0);
+        assert_eq!(snapshot.present_skipped_count, 0);
+        assert_eq!(snapshot.last_present_status.as_deref(), Some("no_target"));
         assert_eq!(snapshot.last_width, 16);
         assert_eq!(snapshot.last_height, 16);
         assert_eq!(snapshot.last_pixel_format, Some(RenderPixelFormat::Rgb24));

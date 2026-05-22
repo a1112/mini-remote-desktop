@@ -497,6 +497,9 @@ describe("RemoteDisplayWindowPage", () => {
           codec_fallback_reason: null,
           queue_depth: 0,
           dropped_frames: 2,
+          render_queue_replacements: 1,
+          render_lock_drops: 2,
+          render_present_skips: 3,
           stage_metrics: [
             { stage: "sender.capture", p95_ms: 1.7, samples: 20 },
             { stage: "sender.encode", p95_ms: 2.4, samples: 20 },
@@ -538,6 +541,9 @@ describe("RemoteDisplayWindowPage", () => {
     fireEvent.mouseEnter(diagnosticsChip);
 
     expect(await screen.findByText("远程诊断")).toBeInTheDocument();
+    const diagnosticsPopover = screen.getByTestId("remote-diagnostics-popover");
+    expect(diagnosticsPopover).toHaveClass("fixed");
+    expect(diagnosticsPopover.className).toContain("z-[1000]");
     expect(screen.getByText("连接质量")).toBeInTheDocument();
     expect(screen.getByText("性能曲线")).toBeInTheDocument();
     expect(screen.getByText("资源占用曲线")).toBeInTheDocument();
@@ -550,6 +556,8 @@ describe("RemoteDisplayWindowPage", () => {
     expect(screen.getByText("4:2:0")).toBeInTheDocument();
     expect(screen.getByText("NVDEC HEVC / D3D11")).toBeInTheDocument();
     expect(screen.getByText("DXGINative")).toBeInTheDocument();
+    expect(screen.getByText("渲染丢帧细分")).toBeInTheDocument();
+    expect(screen.getByText("队列 1 / 锁 2 / Present 3")).toBeInTheDocument();
 
     fireEvent.click(diagnosticsChip);
     fireEvent.mouseLeave(diagnosticsChip.parentElement ?? diagnosticsChip);

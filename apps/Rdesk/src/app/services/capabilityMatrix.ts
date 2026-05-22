@@ -148,6 +148,8 @@ const KNOWN_STATUS_BY_ID: Record<string, CapabilityStatus> = {
   "encode.openh264": "degraded",
   "encode.videotoolbox_h264": "available",
   "decode.nvdec": "available",
+  "decode.nvdec_hevc": "available",
+  "decode.nvdec_hevc_main10": "available",
   "decode.software": "degraded",
   "decode.linux_h264": "available",
   "decode.linux_hevc": "available",
@@ -160,6 +162,7 @@ const KNOWN_STATUS_BY_ID: Record<string, CapabilityStatus> = {
   "render.webview": "degraded",
   "memory.cpu": "available",
   "memory.d3d11_shared": "available",
+  "media.hevc_main_420_8bit": "supported",
 };
 
 const DOMAIN_BASELINE_ITEMS: Array<Omit<CapabilityItem, "platform">> = [
@@ -247,6 +250,13 @@ const DOMAIN_BASELINE_ITEMS: Array<Omit<CapabilityItem, "platform">> = [
     status: "unknown",
     reason: "Requires session policy snapshot",
   },
+  {
+    id: "media.hevc_main_420_8bit",
+    domain: "service",
+    label: "HEVC Main 8-bit 4:2:0",
+    status: "supported",
+    reason: "LAN high-performance HEVC profile metadata; encoder and decoder capabilities still gate runtime use",
+  },
 ];
 
 export const BUILTIN_CAPABILITY_PROFILES: CapabilityProfile[] = [
@@ -277,13 +287,14 @@ export const BUILTIN_CAPABILITY_PROFILES: CapabilityProfile[] = [
     height: 1440,
     fps: 144,
     bitrate_mbps: 64,
-    codec: "h264",
+    codec: "hevc",
     latency_budget_ms: 35,
     min_stable_fps_ratio: 0.4,
     max_drop_ratio: 0.05,
     required_capabilities: [
-      "encode.nvenc_h264",
-      "decode.nvdec",
+      "encode.nvenc_hevc",
+      "decode.nvdec_hevc",
+      "media.hevc_main_420_8bit",
       "render.d3d11",
       "memory.d3d11_shared",
       "transport.quic_datagram",
@@ -296,13 +307,14 @@ export const BUILTIN_CAPABILITY_PROFILES: CapabilityProfile[] = [
     height: 1600,
     fps: 165,
     bitrate_mbps: 80,
-    codec: "h264",
+    codec: "hevc",
     latency_budget_ms: 35,
     min_stable_fps_ratio: 0.4,
     max_drop_ratio: 0.05,
     required_capabilities: [
-      "encode.nvenc_h264",
-      "decode.nvdec",
+      "encode.nvenc_hevc",
+      "decode.nvdec_hevc",
+      "media.hevc_main_420_8bit",
       "render.d3d11",
       "memory.d3d11_shared",
       "transport.quic_datagram",
@@ -317,7 +329,12 @@ export const BUILTIN_CAPABILITY_PROFILES: CapabilityProfile[] = [
     bitrate_mbps: 80,
     codec: "hevc",
     latency_budget_ms: 50,
-    required_capabilities: ["encode.nvenc_hevc", "decode.nvdec", "render.d3d11"],
+    required_capabilities: [
+      "encode.nvenc_hevc",
+      "decode.nvdec_hevc",
+      "media.hevc_main_420_8bit",
+      "render.d3d11",
+    ],
   },
   {
     id: "diagnostic.software",

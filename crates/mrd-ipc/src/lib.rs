@@ -295,6 +295,9 @@ mod wire {
         pub render_queue_replacements: u64,
         #[serde(default)]
         pub render_lock_drops: u64,
+        /// Frames accepted by the renderer but skipped by non-blocking present.
+        #[serde(default)]
+        pub render_present_skips: u64,
         /// Receiver-side render pacing target after local display refresh caps.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub render_pacing_target_fps: Option<u32>,

@@ -3719,6 +3719,9 @@ mod tests {
             RendererSnapshot {
                 attached_to_target: true,
                 uploaded_frame_count: self.uploaded as u64,
+                presented_frame_count: self.uploaded as u64,
+                present_skipped_count: 0,
+                last_present_status: Some("presented".to_string()),
                 last_width: 1,
                 last_height: 1,
                 last_pixel_format: Some(RenderPixelFormat::Bgra32),

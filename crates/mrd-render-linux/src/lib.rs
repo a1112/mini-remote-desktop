@@ -155,6 +155,9 @@ impl RendererInstance for LinuxRenderer {
         RendererSnapshot {
             attached_to_target: self.attached,
             uploaded_frame_count: self.frame_count,
+            presented_frame_count: self.frame_count,
+            present_skipped_count: 0,
+            last_present_status: Some("presented".to_string()),
             last_width: self.width as usize,
             last_height: self.height as usize,
             last_pixel_format: self.last_pixel_format,
@@ -214,6 +217,9 @@ impl RendererInstance for SoftwareRenderer {
         RendererSnapshot {
             attached_to_target: false,
             uploaded_frame_count: self.frame_count,
+            presented_frame_count: self.frame_count,
+            present_skipped_count: 0,
+            last_present_status: Some("presented".to_string()),
             last_width: self.last_width,
             last_height: self.last_height,
             last_pixel_format: self.last_pixel_format,
@@ -624,6 +630,9 @@ impl RendererInstance for X11Renderer {
         RendererSnapshot {
             attached_to_target: self.window.is_some(),
             uploaded_frame_count: self.frame_count,
+            presented_frame_count: self.frame_count,
+            present_skipped_count: 0,
+            last_present_status: Some("presented".to_string()),
             last_width: self.width as usize,
             last_height: self.height as usize,
             last_pixel_format: self.last_pixel_format,

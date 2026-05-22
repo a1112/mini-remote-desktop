@@ -89,7 +89,8 @@ type LocalTestSelection = Partial<LocalWebViewProfile> & {
 const METRICS_POLL_MS = 500;
 const WEB_PREVIEW_CONNECT_TIMEOUT_MS = 8_000;
 const WEB_VIEW_MAX_FPS = 144;
-const DIAGNOSTICS_SAMPLE_LIMIT = 90;
+const DIAGNOSTICS_SAMPLE_LIMIT = 60;
+const DIAGNOSTICS_SAMPLE_INTERVAL_MS = 1_500;
 
 type Option<T extends string> = {
   value: T;
@@ -2244,6 +2245,7 @@ export function RemoteDisplayWindowPage() {
     "receiver.present",
     "receiver.render_upload",
     "render_upload",
+    "render_present",
     "present",
     "render",
   ]);
@@ -2289,6 +2291,10 @@ export function RemoteDisplayWindowPage() {
     probeSnapshot?.bitrate_mbps ?? mediaPipelineSnapshot?.active_bitrate_mbps ?? Number(bitrate);
   const diagnosticsDroppedFrames =
     metrics?.dropped_frames ?? webRtcReceiverStats?.framesDropped ?? remoteDropTotal ?? null;
+  const diagnosticsRenderQueueReplacements =
+    mediaPipelineSnapshot?.render_queue_replacements ?? null;
+  const diagnosticsRenderLockDrops = mediaPipelineSnapshot?.render_lock_drops ?? null;
+  const diagnosticsRenderPresentSkips = mediaPipelineSnapshot?.render_present_skips ?? null;
   const diagnosticsDropRatio =
     metrics && metrics.frame_count > 0
       ? metrics.dropped_frames / metrics.frame_count * 100
@@ -2546,18 +2552,18 @@ export function RemoteDisplayWindowPage() {
         ...current,
         atMs: Date.now(),
       };
-      setDiagnosticsSamples((samples) => {
-        const next = [...samples, nextSample];
-        const bounded = next.slice(Math.max(0, next.length - DIAGNOSTICS_SAMPLE_LIMIT));
-        diagnosticsSamplesRef.current = bounded;
-        return bounded;
-      });
+      const next = [...diagnosticsSamplesRef.current, nextSample];
+      const bounded = next.slice(Math.max(0, next.length - DIAGNOSTICS_SAMPLE_LIMIT));
+      diagnosticsSamplesRef.current = bounded;
+      if (diagnosticsVisible) {
+        setDiagnosticsSamples(bounded);
+      }
     };
 
     record();
-    const interval = window.setInterval(record, 1_000);
+    const interval = window.setInterval(record, DIAGNOSTICS_SAMPLE_INTERVAL_MS);
     return () => window.clearInterval(interval);
-  }, [sessionId]);
+  }, [diagnosticsVisible, sessionId]);
 
   useEffect(() => {
     if (!diagnosticsVisible) return;
@@ -5061,7 +5067,10 @@ export function RemoteDisplayWindowPage() {
               <span>{formatMs(diagnosticsLatencyP95Ms)}</span>
             </button>
             {diagnosticsVisible ? (
-              <div className="absolute right-0 top-9 z-50 max-h-[min(72vh,520px)] w-[420px] overflow-y-auto rounded-md border border-emerald-400/20 bg-[#03140f]/95 p-4 text-[11px] text-emerald-50 shadow-2xl shadow-emerald-950/60 backdrop-blur">
+              <div
+                className="fixed right-4 top-16 z-[1000] max-h-[calc(100vh-5rem)] w-[min(420px,calc(100vw-2rem))] overflow-y-auto rounded-md border border-emerald-400/20 bg-[#03140f]/95 p-4 text-[11px] text-emerald-50 shadow-2xl shadow-emerald-950/60 backdrop-blur"
+                data-testid="remote-diagnostics-popover"
+              >
                 <div className="mb-3 flex items-center justify-between">
                   <div className="flex items-center gap-2">
                     <span className="h-2 w-2 rounded-full bg-emerald-300" />
@@ -5278,6 +5287,12 @@ export function RemoteDisplayWindowPage() {
                       ],
                       ["延迟", `${diagnosticsLatencyLabel}: ${formatMs(diagnosticsLatencyP95Ms)}`],
                       ["丢包/掉帧", `${formatPercent(diagnosticsDropRatio)} / ${formatCount(diagnosticsDroppedFrames)}`],
+                      [
+                        "渲染丢帧细分",
+                        `队列 ${formatCount(diagnosticsRenderQueueReplacements)} / 锁 ${formatCount(
+                          diagnosticsRenderLockDrops
+                        )} / Present ${formatCount(diagnosticsRenderPresentSkips)}`,
+                      ],
                       ["队列深度", formatCount(diagnosticsQueueDepth)],
                       ["码率", formatMbps(diagnosticsBitrateMbps)],
                     ]}

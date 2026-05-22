@@ -666,6 +666,7 @@ fn serialize_deserialize_media_pipeline_snapshot_contract() {
             render_presented_frames: 120,
             render_queue_replacements: 1,
             render_lock_drops: 1,
+            render_present_skips: 2,
             render_pacing_target_fps: Some(144),
             stage_metrics: vec![MediaStageMetrics {
                 stage: "decode".to_string(),

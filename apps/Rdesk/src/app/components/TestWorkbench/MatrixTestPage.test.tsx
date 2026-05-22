@@ -1,7 +1,12 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { getMockInvoke } from "../../../test/mocks/tauri";
-import { MatrixTestPage } from "./MatrixTestPage";
+import {
+  MatrixTestPage,
+  crossDevicePeerSkipReason,
+  formatMatrixMediaProfile,
+  mediaProfileFromConfig,
+} from "./MatrixTestPage";
 
 function selectSingleSupportedCombination() {
   fireEvent.click(screen.getByLabelText("OpenH264"));
@@ -108,6 +113,109 @@ function serviceCapabilitySnapshot(capabilities: ReturnType<typeof capabilityIte
 }
 
 describe("MatrixTestPage failure handling", () => {
+  it("builds HEVC Main and Main10 media profiles from HEVC matrix encoders", () => {
+    expect(
+      mediaProfileFromConfig({
+        encoder_type: "nvenc_hevc",
+        resolution: [2560, 1440],
+        fps: 144,
+        bitrate: 80_000_000,
+      })
+    ).toEqual({
+      width: 2560,
+      height: 1440,
+      fps: 144,
+      bitrate_mbps: 80,
+      codec: "hevc",
+      codec_profile: "main",
+      bit_depth: 8,
+      chroma_subsampling: "4:2:0",
+      pixel_format: "nv12",
+      hdr_enabled: false,
+    });
+
+    expect(
+      mediaProfileFromConfig({
+        encoder_type: "nvenc_hevc_main10",
+        resolution: [3840, 2160],
+        fps: 120,
+        bitrate: 120_000_000,
+      })
+    ).toEqual({
+      width: 3840,
+      height: 2160,
+      fps: 120,
+      bitrate_mbps: 120,
+      codec: "hevc",
+      codec_profile: "main10",
+      bit_depth: 10,
+      chroma_subsampling: "4:2:0",
+      pixel_format: "p010",
+      hdr_enabled: false,
+    });
+  });
+
+  it("requires HEVC peer media capabilities for HEVC cross-device matrix profiles", () => {
+    const peer = {
+      device_id: "windows-peer",
+      device_name: "Windows Peer",
+      device_type: "desktop",
+      ip: "192.168.1.51",
+      discovery_port: 21116,
+      p2p_control_addr: "192.168.1.51:21116",
+      transports: [
+        "quic",
+        "quic_datagram",
+        "quic_datagram_2k144",
+        "quic_datagram_media_v3",
+        "media_profile_control_v1",
+      ],
+      protocol_version: 1,
+      service_build_id: "test-build",
+      media_protocol_version: 3,
+      media_capabilities: [
+        "dxgi_capture",
+        "nvenc_h264",
+        "nvdec",
+        "d3d11_native_render",
+      ],
+      age_ms: 20,
+      p2p_available: true,
+    };
+
+    expect(
+      crossDevicePeerSkipReason(peer, "quic", {
+        width: 2560,
+        height: 1440,
+        fps: 144,
+        bitrate_mbps: 80,
+        codec: "hevc",
+        codec_profile: "main",
+        bit_depth: 8,
+        chroma_subsampling: "4:2:0",
+        pixel_format: "nv12",
+        hdr_enabled: false,
+      })
+    ).toMatch(/nvenc_hevc.*nvdec_hevc.*media\.hevc_main_420_8bit/);
+  });
+
+  it("formats matrix media profiles with HEVC codec and chroma metadata", () => {
+    expect(
+      formatMatrixMediaProfile({
+        width: 2560,
+        height: 1440,
+        fps: 144,
+        bitrate_mbps: 80,
+        codec: "hevc",
+        codec_profile: "main",
+        bit_depth: 8,
+        chroma_subsampling: "4:2:0",
+        pixel_format: "nv12",
+        hdr_enabled: false,
+      })
+    ).toBe("hevc/main/8-bit/4:2:0/nv12 2560x1440@144/80Mbps");
+  });
+
   it("uses service capability status instead of legacy environment defaults", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {

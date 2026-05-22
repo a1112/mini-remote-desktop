@@ -100,6 +100,9 @@ impl OpenglRenderer {
             snapshot: RendererSnapshot {
                 attached_to_target: false,
                 uploaded_frame_count: 0,
+                presented_frame_count: 0,
+                present_skipped_count: 0,
+                last_present_status: None,
                 last_width: 0,
                 last_height: 0,
                 last_pixel_format: None,
@@ -192,6 +195,8 @@ impl RendererInstance for OpenglRenderer {
         }
 
         self.snapshot.uploaded_frame_count += 1;
+        self.snapshot.presented_frame_count += 1;
+        self.snapshot.last_present_status = Some("presented".to_string());
         self.snapshot.last_width = frame.width;
         self.snapshot.last_height = frame.height;
         self.snapshot.last_pixel_format = Some(original_pixel_format);

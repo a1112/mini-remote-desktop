@@ -284,6 +284,7 @@ struct MediaPipelineState {
     render_presented_frames: u64,
     render_queue_replacements: u64,
     render_lock_drops: u64,
+    render_present_skips: u64,
     render_pacing_target_fps: Option<u32>,
     stage_samples: HashMap<String, VecDeque<f64>>,
     stage_summaries: HashMap<String, MediaStageMetrics>,
@@ -506,6 +507,12 @@ impl MediaPipelineRegistry {
         state.dropped_frames = state.dropped_frames.saturating_add(count);
     }
 
+    pub fn increment_render_present_skips(&mut self, session_id: SessionId, count: u64) {
+        let state = self.pipelines.entry(session_id).or_default();
+        state.render_present_skips = state.render_present_skips.saturating_add(count);
+        state.dropped_frames = state.dropped_frames.saturating_add(count);
+    }
+
     pub fn set_render_pacing_target_fps(&mut self, session_id: SessionId, fps: Option<u32>) {
         self.pipelines
             .entry(session_id)
@@ -609,6 +616,7 @@ impl MediaPipelineRegistry {
             render_presented_frames: state.map_or(0, |state| state.render_presented_frames),
             render_queue_replacements: state.map_or(0, |state| state.render_queue_replacements),
             render_lock_drops: state.map_or(0, |state| state.render_lock_drops),
+            render_present_skips: state.map_or(0, |state| state.render_present_skips),
             render_pacing_target_fps: state.and_then(|state| state.render_pacing_target_fps),
             stage_metrics,
             test_impairment: state.and_then(|state| state.test_impairment.clone()),
@@ -1857,12 +1865,14 @@ mod tests {
 
         registry.increment_render_queue_replacements(session_id.clone(), 3);
         registry.increment_render_lock_drops(session_id.clone(), 2);
+        registry.increment_render_present_skips(session_id.clone(), 4);
 
         let snapshot = registry.snapshot(&session_id);
 
-        assert_eq!(snapshot.dropped_frames, 5);
+        assert_eq!(snapshot.dropped_frames, 9);
         assert_eq!(snapshot.render_queue_replacements, 3);
         assert_eq!(snapshot.render_lock_drops, 2);
+        assert_eq!(snapshot.render_present_skips, 4);
     }
 
     #[cfg(windows)]
@@ -1889,6 +1899,9 @@ mod tests {
                 RendererSnapshot {
                     attached_to_target: true,
                     uploaded_frame_count: self.uploads.load(Ordering::SeqCst) as u64,
+                    presented_frame_count: self.uploads.load(Ordering::SeqCst) as u64,
+                    present_skipped_count: 0,
+                    last_present_status: Some("presented".to_string()),
                     last_width: 1,
                     last_height: 1,
                     last_pixel_format: None,

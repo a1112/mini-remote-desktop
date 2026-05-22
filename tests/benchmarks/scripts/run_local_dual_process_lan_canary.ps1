@@ -21,6 +21,8 @@ param(
   [int]$JitterMs = 0,
   [int]$MtuBytes = 0,
   [UInt64]$Seed = 0,
+  [string]$ServiceExePath = "",
+  [int]$TauriStartupGraceSecs = 90,
   [switch]$NoMotionStimulus,
   [switch]$NoBuild,
   [switch]$NoRenderProfileCap,
@@ -214,6 +216,10 @@ function Start-LocalServiceInstance {
     Set-EnvVar "MRD_LAN_DEVICE_NAME" $DeviceName $savedEnv
     Set-EnvVar "MRD_LAN_DISCOVERY_PORT" ([string]$DiscoveryPort) $savedEnv
     Set-EnvVar "MRD_LAN_DISCOVERY_PROBE_ENDPOINTS" "127.0.0.1:$PeerDiscoveryPort" $savedEnv
+    # The local dual-process runner already talks to both services through
+    # isolated named pipes. Disable the localhost web bridge so the two service
+    # instances do not contend for the default 127.0.0.1:9532 listener.
+    Set-EnvVar "MRD_WEB_BRIDGE_ENABLED" "false" $savedEnv
     Set-EnvVar "RUST_LOG" "info" $savedEnv
     if ($ServiceBuildId.Trim()) {
       Set-EnvVar "MRD_SERVICE_BUILD_ID" $ServiceBuildId.Trim() $savedEnv
@@ -267,9 +273,11 @@ function Invoke-LocalDualProcessProfile {
     [Parameter(Mandatory = $true)][string]$GitCommit,
     [Parameter(Mandatory = $true)]$Impairment,
     [Parameter(Mandatory = $true)][string]$DisplayModePolicy,
+    [string]$ServiceExePath = "",
     [string]$CaptureSourceId = "",
     [string]$CaptureSourceKind = "display_shared",
     [int]$RenderMaxFps = 0,
+    [int]$TauriStartupGraceSecs = 90,
     [switch]$NoMotionStimulus,
     [switch]$NoRenderProfileCap,
     [switch]$KeepTauriOpen
@@ -282,7 +290,15 @@ function Invoke-LocalDualProcessProfile {
   $logsDir = Join-Path $runDir "logs"
   New-Item -ItemType Directory -Force -Path $rawDir, $logsDir | Out-Null
 
-  $serviceExe = Join-Path $Repo "target/debug/mrd-service.exe"
+  $serviceExe = if ($ServiceExePath.Trim()) {
+    if ([System.IO.Path]::IsPathRooted($ServiceExePath)) {
+      $ServiceExePath
+    } else {
+      Join-Path $Repo $ServiceExePath
+    }
+  } else {
+    Join-Path $Repo "target/debug/mrd-service.exe"
+  }
   if (-not (Test-Path $serviceExe)) {
     throw "mrd-service executable was not found at $serviceExe"
   }
@@ -385,6 +401,7 @@ function Invoke-LocalDualProcessProfile {
     if ($CaptureSourceKind.Trim()) {
       Set-EnvVar "MRD_LAN_E2E_CAPTURE_SOURCE_KIND" $CaptureSourceKind.Trim() $savedEnv
     }
+    Set-EnvVar "CARGO_TARGET_DIR" (Join-Path $OutputRoot "tauri-target") $savedEnv
 
     $tauriStdout = Join-Path $logsDir "tauri.stdout.log"
     $tauriStderr = Join-Path $logsDir "tauri.stderr.log"
@@ -397,7 +414,8 @@ function Invoke-LocalDualProcessProfile {
       -WindowStyle Hidden `
       -PassThru
 
-    $deadline = (Get-Date).AddMilliseconds(($Profile.duration_secs * 1000) + 90000)
+    $startupGraceMs = [Math]::Max(1, $TauriStartupGraceSecs) * 1000
+    $deadline = (Get-Date).AddMilliseconds(($Profile.duration_secs * 1000) + $startupGraceMs)
     $report = $null
     while ((Get-Date) -lt $deadline) {
       if (Test-Path $reportPath) {
@@ -557,9 +575,11 @@ foreach ($profile in $profiles) {
     -GitCommit $gitCommit `
     -Impairment $impairment `
     -DisplayModePolicy $DisplayModePolicy `
+    -ServiceExePath $ServiceExePath `
     -CaptureSourceId $CaptureSourceId `
     -CaptureSourceKind $CaptureSourceKind `
     -RenderMaxFps $RenderMaxFps `
+    -TauriStartupGraceSecs $TauriStartupGraceSecs `
     -NoMotionStimulus:$NoMotionStimulus `
     -NoRenderProfileCap:$NoRenderProfileCap `
     -KeepTauriOpen:$KeepTauriOpen

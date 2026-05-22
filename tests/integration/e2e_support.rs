@@ -804,6 +804,9 @@ impl RendererInstance for InMemoryRenderer {
         RendererSnapshot {
             attached_to_target: false,
             uploaded_frame_count: self.uploaded_frame_count,
+            presented_frame_count: self.uploaded_frame_count,
+            present_skipped_count: 0,
+            last_present_status: Some("presented".to_string()),
             last_width: self.last_width,
             last_height: self.last_height,
             last_pixel_format: self.last_pixel_format,

@@ -24,28 +24,33 @@ function Find-Profile([object[]]$Profiles, [string]$Id) {
 }
 
 $profiles = Get-PairedLanCanaryProfiles -DurationSecs 30 -BitrateMbps 20
-Assert-Equal $profiles.Count 13 "Profile count"
+Assert-Equal $profiles.Count 14 "Profile count"
 Assert-Equal $profiles[0].id "1080p60" "First profile id"
 Assert-Equal $profiles[2].id "2k144" "2K144 profile is present"
 Assert-Equal $profiles[3].id "2k144_adaptive" "Adaptive 2K144 profile is present"
 Assert-Equal $profiles[3].bitrate_mbps 80 "Adaptive 2K144 profile uses the 80 Mbps ceiling"
 Assert-True $profiles[3].adaptive "Adaptive 2K144 profile enables adaptive autorun"
-Assert-Equal $profiles[4].id "2k180" "Native 2K180 profile is present"
-Assert-Equal $profiles[4].bitrate_mbps 100 "Native 2K180 profile uses the higher default bitrate"
-Assert-Equal $profiles[5].id "2k180_120mbps" "Native 2K180 high-bitrate profile is present"
-Assert-Equal $profiles[5].bitrate_mbps 120 "Native 2K180 high-bitrate profile reaches 120 Mbps"
-Assert-Equal $profiles[6].id "2k180_120mbps_adaptive" "Native 2K180 adaptive high-bitrate profile is present"
-Assert-Equal $profiles[6].bitrate_mbps 120 "Native 2K180 adaptive profile starts from 120 Mbps"
-Assert-True $profiles[6].adaptive "Native 2K180 high-bitrate profile enables adaptive autorun"
-Assert-Equal $profiles[7].id "1600p165" "Native 1600p165 profile is present"
-Assert-Equal $profiles[7].bitrate_mbps 80 "Native 1600p165 profile uses the higher default bitrate"
-Assert-Equal $profiles[8].id "1600p165_120mbps" "Native 1600p165 high-bitrate profile is present"
-Assert-Equal $profiles[8].bitrate_mbps 120 "Native 1600p165 high-bitrate profile reaches 120 Mbps"
-Assert-Equal $profiles[9].id "1600p165_120mbps_adaptive" "Native 1600p165 adaptive high-bitrate profile is present"
-Assert-Equal $profiles[9].bitrate_mbps 120 "Native 1600p165 adaptive profile starts from 120 Mbps"
-Assert-True $profiles[9].adaptive "Native 1600p165 high-bitrate profile enables adaptive autorun"
-Assert-Equal $profiles[11].fps 180 "180 FPS profile is present"
-Assert-Equal $profiles[12].fps 249 "249 FPS profile is present"
+Assert-Equal $profiles[4].id "4k120" "4K120 profile is present"
+Assert-Equal $profiles[4].width 3840 "4K120 profile width"
+Assert-Equal $profiles[4].height 2160 "4K120 profile height"
+Assert-Equal $profiles[4].fps 120 "4K120 profile fps"
+Assert-Equal $profiles[4].bitrate_mbps 120 "4K120 profile uses high HEVC bitrate"
+Assert-Equal $profiles[5].id "2k180" "Native 2K180 profile is present"
+Assert-Equal $profiles[5].bitrate_mbps 100 "Native 2K180 profile uses the higher default bitrate"
+Assert-Equal $profiles[6].id "2k180_120mbps" "Native 2K180 high-bitrate profile is present"
+Assert-Equal $profiles[6].bitrate_mbps 120 "Native 2K180 high-bitrate profile reaches 120 Mbps"
+Assert-Equal $profiles[7].id "2k180_120mbps_adaptive" "Native 2K180 adaptive high-bitrate profile is present"
+Assert-Equal $profiles[7].bitrate_mbps 120 "Native 2K180 adaptive profile starts from 120 Mbps"
+Assert-True $profiles[7].adaptive "Native 2K180 high-bitrate profile enables adaptive autorun"
+Assert-Equal $profiles[8].id "1600p165" "Native 1600p165 profile is present"
+Assert-Equal $profiles[8].bitrate_mbps 80 "Native 1600p165 profile uses the higher default bitrate"
+Assert-Equal $profiles[9].id "1600p165_120mbps" "Native 1600p165 high-bitrate profile is present"
+Assert-Equal $profiles[9].bitrate_mbps 120 "Native 1600p165 high-bitrate profile reaches 120 Mbps"
+Assert-Equal $profiles[10].id "1600p165_120mbps_adaptive" "Native 1600p165 adaptive high-bitrate profile is present"
+Assert-Equal $profiles[10].bitrate_mbps 120 "Native 1600p165 adaptive profile starts from 120 Mbps"
+Assert-True $profiles[10].adaptive "Native 1600p165 high-bitrate profile enables adaptive autorun"
+Assert-Equal $profiles[12].fps 180 "180 FPS profile is present"
+Assert-Equal $profiles[13].fps 249 "249 FPS profile is present"
 
 $h264CrossChain = New-CanaryMediaChain -Mode "cross" -Codec "h264"
 Assert-Equal $h264CrossChain "dxgi/nvenc_h264/quic_datagram_media_v3_or_v2/nvdec/d3d11_shared" "H.264 cross chain remains the default"
@@ -531,9 +536,10 @@ $renderDropReport = [pscustomobject]@{
     media_probe_target_bitrate_mbps = 80
   }
   mediaPipelineSnapshot = [pscustomobject]@{
-    dropped_frames = 457
+    dropped_frames = 464
     render_queue_replacements = 455
     render_lock_drops = 2
+    render_present_skips = 7
     queue_depth = 0
     stage_metrics = @()
     test_impairment = $null
@@ -543,9 +549,10 @@ $renderDropReport = [pscustomobject]@{
 $renderDropRow = Convert-CrossReportToCanaryRow -Profile $profile2k14480 -Report $renderDropReport -ReportPath "raw/cross-2k144.json"
 Assert-Equal $renderDropRow.dropped_frames 37 "Cross row dropped_frames tracks probe/transport drops"
 Assert-Equal $renderDropRow.probe_dropped_frames 37 "Cross row exposes probe drops separately"
-Assert-Equal $renderDropRow.pipeline_dropped_frames 457 "Cross row preserves legacy pipeline dropped frames"
+Assert-Equal $renderDropRow.pipeline_dropped_frames 464 "Cross row preserves legacy pipeline dropped frames"
 Assert-Equal $renderDropRow.render_queue_replacements 455 "Cross row exposes render queue replacements"
 Assert-Equal $renderDropRow.render_lock_drops 2 "Cross row exposes render lock drops"
+Assert-Equal $renderDropRow.render_present_skips 7 "Cross row exposes non-blocking D3D11 present skips"
 Assert-Equal $renderDropRow.status "failed" "Severe visual integrity risk fails the canary row"
 Assert-Equal $renderDropRow.classification "visual_integrity_risk" "Severe visual integrity risk is classified explicitly"
 Assert-True ($renderDropRow.error_message -match "render drop/coalesce ratio") "Visual integrity risk carries an actionable render-drop reason"
@@ -573,6 +580,7 @@ $pacedRenderReport = [pscustomobject]@{
     render_presented_frames = 6370
     render_queue_replacements = 721
     render_lock_drops = 0
+    render_present_skips = 0
     render_pacing_target_fps = 144
     queue_depth = 8
     stage_metrics = @(

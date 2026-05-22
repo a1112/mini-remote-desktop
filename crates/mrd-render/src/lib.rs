@@ -233,7 +233,18 @@ pub struct RendererDescriptor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RendererSnapshot {
     pub attached_to_target: bool,
+    /// Frames accepted by the renderer upload boundary.
     pub uploaded_frame_count: u64,
+    /// Frames that reached the platform presentation boundary.
+    ///
+    /// Renderers that cannot distinguish upload from presentation should keep
+    /// this aligned with `uploaded_frame_count`.
+    pub presented_frame_count: u64,
+    /// Frames skipped by a non-blocking present path, for example
+    /// `DXGI_ERROR_WAS_STILL_DRAWING` on D3D11.
+    pub present_skipped_count: u64,
+    /// Last presentation status reported by the renderer.
+    pub last_present_status: Option<String>,
     pub last_width: usize,
     pub last_height: usize,
     pub last_pixel_format: Option<RenderPixelFormat>,

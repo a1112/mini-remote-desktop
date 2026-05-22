@@ -877,15 +877,25 @@ function crossDeviceUnsupportedTransportReason(config: TestConfig): string | nul
   return null;
 }
 
-function mediaProfileFromConfig(config: TestConfig): MediaProfile {
+export function mediaProfileFromConfig(config: TestConfig): MediaProfile {
   const [width, height] = config.resolution ?? [1920, 1080];
-  return {
+  const hevc = config.encoder_type === "nvenc_hevc" || config.encoder_type === "nvenc_hevc_main10";
+  const main10 = config.encoder_type === "nvenc_hevc_main10";
+  const profile: MediaProfile = {
     width,
     height,
     fps: config.fps ?? 60,
     bitrate_mbps: Math.max(1, Math.round((config.bitrate ?? 20_000_000) / 1_000_000)),
-    codec: "h264",
+    codec: hevc ? "hevc" : "h264",
   };
+  if (hevc) {
+    profile.codec_profile = main10 ? "main10" : "main";
+    profile.bit_depth = main10 ? 10 : 8;
+    profile.chroma_subsampling = "4:2:0";
+    profile.pixel_format = main10 ? "p010" : "nv12";
+    profile.hdr_enabled = false;
+  }
+  return profile;
 }
 
 function crossDeviceMinimumExpectedFps(profile: MediaProfile): number {
@@ -914,13 +924,22 @@ function summaryFromLanReport(report: LanE2EAutomationReport): TestRunSummary {
   };
 }
 
-function formatMatrixMediaProfile(profile: MediaProfile): string {
-  return `${profile.width}x${profile.height}@${profile.fps}/${profile.bitrate_mbps}Mbps`;
+export function formatMatrixMediaProfile(profile: MediaProfile): string {
+  const codecParts = [
+    profile.codec,
+    profile.codec_profile,
+    profile.bit_depth != null ? `${profile.bit_depth}-bit` : null,
+    profile.chroma_subsampling,
+    profile.pixel_format,
+  ].filter((part): part is string => Boolean(part));
+  const codecLabel = codecParts.length > 0 ? `${codecParts.join("/")} ` : "";
+  return `${codecLabel}${profile.width}x${profile.height}@${profile.fps}/${profile.bitrate_mbps}Mbps`;
 }
 
-function crossDevicePeerSkipReason(
+export function crossDevicePeerSkipReason(
   peer: LanPeerInfo,
-  transportKind: "quic" | "webrtc"
+  transportKind: "quic" | "webrtc",
+  profile?: MediaProfile
 ): string | null {
   const transports = peer.transports.map((transport) => transport.toLowerCase());
   const transportList = peer.transports.length > 0 ? peer.transports.join(", ") : "none";
@@ -961,15 +980,25 @@ function crossDevicePeerSkipReason(
     mediaProtocolVersion >= 2 &&
     (transports.includes("quic_datagram_media_v2") ||
       mediaCapabilities.includes("quic_datagram_media_v2"));
-  const requiredMediaCapabilities = [
-    "dxgi_capture",
-    "nvenc_h264",
-    "nvdec",
-    "d3d11_native_render",
-  ];
-  const missingMediaCapabilities = requiredMediaCapabilities.filter(
-    (capability) => !mediaCapabilities.includes(capability)
-  );
+  const codec = profile?.codec?.toLowerCase() ?? "h264";
+  const requiredMediaCapabilities =
+    codec === "hevc"
+      ? [
+          ["dxgi_capture"],
+          ["nvenc_hevc", "encode.nvenc_hevc"],
+          ["nvdec_hevc", "decode.nvdec_hevc"],
+          ["d3d11_native_render"],
+          ["media.hevc_main_420_8bit"],
+        ]
+      : [
+          ["dxgi_capture"],
+          ["nvenc_h264", "encode.nvenc_h264"],
+          ["nvdec", "decode.nvdec"],
+          ["d3d11_native_render"],
+        ];
+  const missingMediaCapabilities = requiredMediaCapabilities
+    .filter((aliases) => !aliases.some((capability) => mediaCapabilities.includes(capability)))
+    .map((aliases) => aliases[0]);
   if (!hasMediaV3 && !hasMediaV2) {
     return `LAN peer is not on a compatible QUIC media protocol: ${peer.device_id} reports media protocol ${
       mediaProtocolVersion || "unknown"
@@ -1636,7 +1665,7 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
           await yieldToUi();
           continue;
         }
-        const peerSkipReason = crossDevicePeerSkipReason(targetPeer, transportKind);
+        const peerSkipReason = crossDevicePeerSkipReason(targetPeer, transportKind, profile);
         if (peerSkipReason) {
           markSkipped(peerSkipReason);
           await yieldToUi();
