@@ -357,7 +357,7 @@ describe("RemoteDisplayWindowPage", () => {
     expect(stats?.source).toBe("rtp_frame_timing_channel");
   });
 
-  it("auto-switches high-latency WebRTC video to the separate WebCodecs web path", () => {
+  it("does not auto-switch explicit WebRTC video tests to WebCodecs", () => {
     expect(
       shouldAutoSwitchWebRtcVideoToWebCodecs({
         targetFps: 120,
@@ -366,6 +366,22 @@ describe("RemoteDisplayWindowPage", () => {
         metadataAgeMs: 109,
         jitterBufferMs: 39,
         webCodecsAvailable: true,
+        allowAutoSwitch: false,
+        alreadyAttempted: false,
+      })
+    ).toEqual({ shouldSwitch: false, reason: null });
+  });
+
+  it("auto-switches production WebRTC video backlog to the separate WebCodecs web path", () => {
+    expect(
+      shouldAutoSwitchWebRtcVideoToWebCodecs({
+        targetFps: 120,
+        actualFps: 57,
+        latencyP95Ms: 196,
+        metadataAgeMs: 109,
+        jitterBufferMs: 39,
+        webCodecsAvailable: true,
+        allowAutoSwitch: true,
         alreadyAttempted: false,
       })
     ).toEqual({
@@ -384,6 +400,7 @@ describe("RemoteDisplayWindowPage", () => {
         metadataAgeMs: 109,
         jitterBufferMs: 39,
         webCodecsAvailable: false,
+        allowAutoSwitch: true,
         alreadyAttempted: false,
       }).shouldSwitch
     ).toBe(false);
@@ -396,6 +413,7 @@ describe("RemoteDisplayWindowPage", () => {
         metadataAgeMs: 109,
         jitterBufferMs: 39,
         webCodecsAvailable: true,
+        allowAutoSwitch: true,
         alreadyAttempted: true,
       }).shouldSwitch
     ).toBe(false);

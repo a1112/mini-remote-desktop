@@ -1197,6 +1197,7 @@ export type WebRtcVideoToWebCodecsSwitchInput = {
   metadataAgeMs: number | null;
   jitterBufferMs: number | null;
   webCodecsAvailable: boolean;
+  allowAutoSwitch: boolean;
   alreadyAttempted: boolean;
 };
 
@@ -1212,9 +1213,15 @@ export function shouldAutoSwitchWebRtcVideoToWebCodecs({
   metadataAgeMs,
   jitterBufferMs,
   webCodecsAvailable,
+  allowAutoSwitch,
   alreadyAttempted,
 }: WebRtcVideoToWebCodecsSwitchInput): WebRtcVideoToWebCodecsSwitchDecision {
-  if (!webCodecsAvailable || alreadyAttempted || targetFps < WEBRTC_VIDEO_BACKLOG_SWITCH_MIN_FPS) {
+  if (
+    !allowAutoSwitch ||
+    !webCodecsAvailable ||
+    alreadyAttempted ||
+    targetFps < WEBRTC_VIDEO_BACKLOG_SWITCH_MIN_FPS
+  ) {
     return { shouldSwitch: false, reason: null };
   }
 
@@ -1793,7 +1800,6 @@ export function RemoteDisplayWindowPage() {
   const matrixStopRequestedRef = useRef(false);
   const webPreviewRunStartedAtRef = useRef<number | null>(null);
   const webPreviewAutoStopTimerRef = useRef<number | null>(null);
-  const webLowLatencyAutoSwitchAttemptedRef = useRef(false);
   const webVideoFpsRef = useRef<number | null>(null);
   const webVideoFrameCountRef = useRef(0);
   const webRtcReceiverStatsRef = useRef<WebRtcReceiverStats | null>(null);
@@ -3512,55 +3518,6 @@ export function RemoteDisplayWindowPage() {
       webCodecsMainCanvasRecoveringRef.current = false;
     }
   }, [isTestBusy, webPreviewEngine]);
-
-  useEffect(() => {
-    if (!isTestBusy) {
-      webLowLatencyAutoSwitchAttemptedRef.current = false;
-    }
-  }, [bitrate, encoder, fps, isTestBusy, resolution, sessionId]);
-
-  useEffect(() => {
-    if (
-      !isLocalPipelinePreview ||
-      !isTestBusy ||
-      isNative ||
-      webPreviewEngine !== "webrtc"
-    ) {
-      return;
-    }
-
-    const decision = shouldAutoSwitchWebRtcVideoToWebCodecs({
-      targetFps: Number(fps),
-      actualFps: webVideoFps ?? webRtcReceiverStats?.decodedFps ?? null,
-      latencyP95Ms: webPresentationLatencyStats?.p95Ms ?? null,
-      metadataAgeMs: webFrameTimingMetadataAgeMs,
-      jitterBufferMs: webRtcReceiverStats?.jitterBufferDelayAvgMs ?? null,
-      webCodecsAvailable: browserSupportsWebCodecsH264(),
-      alreadyAttempted: webLowLatencyAutoSwitchAttemptedRef.current,
-    });
-    if (!decision.shouldSwitch) return;
-
-    webLowLatencyAutoSwitchAttemptedRef.current = true;
-    closeWebPreviewPeer();
-    setWebPreviewMode("idle");
-    setWebPreviewEngine("webcodecs");
-    setDecoder("none");
-    setTransport("webrtc");
-    setRenderMode("web");
-    setTestMessage(`Web 低延迟策略: ${decision.reason}`);
-  }, [
-    closeWebPreviewPeer,
-    fps,
-    isLocalPipelinePreview,
-    isNative,
-    isTestBusy,
-    webFrameTimingMetadataAgeMs,
-    webPresentationLatencyStats?.p95Ms,
-    webPreviewEngine,
-    webRtcReceiverStats?.decodedFps,
-    webRtcReceiverStats?.jitterBufferDelayAvgMs,
-    webVideoFps,
-  ]);
 
   useEffect(() => {
     if (
