@@ -4,7 +4,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { getMockInvoke } from "../../test/mocks/tauri";
 import {
   RemoteDisplayWindowPage,
+  applyWebRtcReceiverLowLatencyHint,
   applyWebRtcVideoMotionHint,
+  webCodecsMemoryPathLabelFromState,
+  webPreviewDecoderLabel,
+  webPreviewTransportLabel,
+  browserSupportsWebCodecsWorkerRendering,
   browserWebrtcPreviewH264Profile,
   buildWebRtcDiagnosticsStageRows,
   WebRtcPresentationLatencyTracker,
@@ -32,9 +37,9 @@ vi.mock("../utils/tauriWindow", () => ({
     }),
 }));
 
-function renderRemoteDisplay(sessionId = "p2p-quic-123") {
+function renderRemoteDisplay(sessionId = "p2p-quic-123", search = "?surface=surface-1") {
   render(
-    <MemoryRouter initialEntries={[`/display/${sessionId}?surface=surface-1`]}>
+    <MemoryRouter initialEntries={[`/display/${sessionId}${search}`]}>
       <Routes>
         <Route path="/display/:id" element={<RemoteDisplayWindowPage />} />
       </Routes>
@@ -124,6 +129,7 @@ const remoteDisplaySource = {
 describe("RemoteDisplayWindowPage", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
     getMockInvoke().mockReset();
     mockRenderAreaRect();
     mockResizeObserver();
@@ -204,6 +210,18 @@ describe("RemoteDisplayWindowPage", () => {
     expect(track.contentHint).toBe("motion");
   });
 
+  it("applies low-latency playout hints to browser WebRTC receivers when supported", () => {
+    const receiver = {
+      jitterBufferTarget: 0.2,
+      playoutDelayHint: 0.2,
+    };
+
+    applyWebRtcReceiverLowLatencyHint(receiver as unknown as RTCRtpReceiver);
+
+    expect(receiver.jitterBufferTarget).toBeCloseTo(0.02);
+    expect(receiver.playoutDelayHint).toBeCloseTo(0.02);
+  });
+
   it("estimates capture-to-present latency from browser WebRTC frame timing metadata", () => {
     const tracker = new WebRtcPresentationLatencyTracker({ timeOriginMs: 1_000_000 });
 
@@ -252,6 +270,31 @@ describe("RemoteDisplayWindowPage", () => {
 
     expect(stats?.latestMs).toBeGreaterThanOrEqual(0);
     expect(stats?.latestMs).toBeLessThan(20);
+  });
+
+  it("orders unordered browser frame timing metadata by sequence before fallback matching", () => {
+    const tracker = new WebRtcPresentationLatencyTracker({ timeOriginMs: 1_000_000 });
+
+    tracker.addMetadata(
+      JSON.stringify({
+        type: "mrd.frame_timing.v1",
+        sequence: 2,
+        capture_unix_us: 1_000_020_000,
+      })
+    );
+    tracker.addMetadata(
+      JSON.stringify({
+        type: "mrd.frame_timing.v1",
+        sequence: 1,
+        capture_unix_us: 1_000_010_000,
+      })
+    );
+
+    const first = tracker.observeFrame(40, { presentedFrames: 1, presentationTime: 40 });
+    const second = tracker.observeFrame(50, { presentedFrames: 2, presentationTime: 50 });
+
+    expect(first?.latestMs).toBeCloseTo(30);
+    expect(second?.latestMs).toBeCloseTo(30);
   });
 
   it("drops stale startup frame timing metadata before estimating presentation latency", () => {
@@ -465,7 +508,7 @@ describe("RemoteDisplayWindowPage", () => {
     expect(screen.getByText("249 FPS")).toBeInTheDocument();
   });
 
-  it("allows switching back to Metal after selecting Web View on macOS", async () => {
+  it("allows switching back to Metal after selecting browser WebRTC video on macOS", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
       if (command === "test_get_capabilities") {
@@ -510,7 +553,8 @@ describe("RemoteDisplayWindowPage", () => {
 
     renderRemoteDisplay("local-display-test-1");
 
-    const webButton = await screen.findByRole("button", { name: "Web View" });
+    fireEvent.click(await screen.findByRole("button", { name: "测试配置" }));
+    const webButton = await screen.findByRole("button", { name: "WebRTC video" });
     fireEvent.click(webButton);
 
     const metalButton = await screen.findByRole("button", { name: "Metal native" });
@@ -685,7 +729,7 @@ describe("RemoteDisplayWindowPage", () => {
             encoder_type: "nvenc_h264",
             decoder_type: "none",
             transport_kind: "webrtc",
-            fps: 120,
+            fps: 144,
             render_display: false,
             visual_preview: false,
             zero_copy: false,
@@ -693,6 +737,401 @@ describe("RemoteDisplayWindowPage", () => {
         })
       );
     });
+  });
+
+  it("applies the explicit 2K144 WebRTC low-latency browser profile", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(windowsCapabilities());
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-local-display-test-1",
+          session_id: "local-display-test-1",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: false,
+          render_mode: "web",
+          native_surface_attached: false,
+          session_window_count: 1,
+        });
+      }
+      if (command === "test_harness_stop") {
+        return Promise.resolve(null);
+      }
+      if (command === "test_start_run") {
+        return Promise.resolve("run-web-2k144-lowlat");
+      }
+      if (command === "test_harness_get_metrics") {
+        return Promise.resolve({
+          is_running: true,
+          capture_fps: 144,
+          frame_count: 12,
+          total_latency_p95_ms: 46,
+          error_message: null,
+        });
+      }
+      if (command === "test_get_run") {
+        return Promise.resolve({
+          run_id: "run-web-2k144-lowlat",
+          status: "running",
+          summary: null,
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay("local-display-test-1");
+
+    fireEvent.click(await screen.findByRole("button", { name: "测试配置" }));
+    fireEvent.click(await screen.findByRole("button", { name: "WebRTC 2K144" }));
+    fireEvent.click(await screen.findByRole("button", { name: "开始测试" }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_start_run",
+        expect.objectContaining({
+          scenarioId: "custom",
+          config: expect.objectContaining({
+            capture_type: "dxgi",
+            encoder_type: "nvenc_h264",
+            decoder_type: "none",
+            transport_kind: "webrtc",
+            resolution: [2560, 1440],
+            fps: 144,
+            bitrate: 20_000_000,
+            render_display: false,
+            visual_preview: false,
+            zero_copy: false,
+          }),
+        })
+      );
+    });
+  });
+
+  it("disables WebCodecs WebGL2 when browser decoder APIs are missing", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(windowsCapabilities());
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-local-display-test-1",
+          session_id: "local-display-test-1",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: false,
+          render_mode: "web",
+          native_surface_attached: false,
+          session_window_count: 1,
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay("local-display-test-1");
+
+    fireEvent.click(await screen.findByRole("button", { name: "测试配置" }));
+    const webCodecsButton = await screen.findByRole("button", { name: "WebCodecs WebGL2" });
+
+    expect(webCodecsButton).toBeDisabled();
+    expect(webCodecsButton).toHaveAttribute(
+      "title",
+      expect.stringContaining("缺少 VideoDecoder")
+    );
+  });
+
+  it("shows browser render path constraints instead of unsupported matrix mappings", async () => {
+    vi.stubGlobal("VideoDecoder", class {});
+    vi.stubGlobal("EncodedVideoChunk", class {});
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(windowsCapabilities());
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-local-display-test-1",
+          session_id: "local-display-test-1",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: false,
+          render_mode: "web",
+          native_surface_attached: false,
+          session_window_count: 1,
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay("local-display-test-1");
+
+    fireEvent.click(await screen.findByRole("button", { name: "测试配置" }));
+
+    expect(await screen.findByText("Browser video decode")).toBeInTheDocument();
+    expect(screen.getByText("WebRTC RTP")).toBeInTheDocument();
+
+    expect(screen.getByRole("button", { name: "ENC NVENC H.264" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "ENC NVENC HEVC Main" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "ENC NVENC AV1" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "FPS 144 FPS" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "FPS 165 FPS" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "FPS 180 FPS" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "FPS 249 FPS" })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "WebCodecs WebGL2" }));
+
+    expect(screen.getByText("Browser WebCodecs")).toBeInTheDocument();
+    expect(screen.getByText("WebSocket AU")).toBeInTheDocument();
+  });
+
+  it("uses the selected 60S duration for local display tests", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(windowsCapabilities());
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-local-display-test-1",
+          session_id: "local-display-test-1",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: false,
+          render_mode: "web",
+          native_surface_attached: false,
+          session_window_count: 1,
+        });
+      }
+      if (command === "test_harness_stop") {
+        return Promise.resolve(null);
+      }
+      if (command === "test_start_run") {
+        return Promise.resolve("run-60s");
+      }
+      if (command === "test_harness_get_metrics") {
+        return Promise.resolve({
+          is_running: true,
+          capture_fps: 120,
+          frame_count: 12,
+          total_latency_p95_ms: 13,
+          error_message: null,
+        });
+      }
+      if (command === "test_get_run") {
+        return Promise.resolve({ run_id: "run-60s", status: "running", summary: null });
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay("local-display-test-1");
+
+    fireEvent.click(await screen.findByRole("button", { name: "测试配置" }));
+    fireEvent.click(await screen.findByRole("button", { name: "DURATION 60S" }));
+    fireEvent.click(screen.getByRole("button", { name: "开始测试" }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_start_run",
+        expect.objectContaining({
+          config: expect.objectContaining({
+            duration_ms: 60_000,
+          }),
+        })
+      );
+    });
+  });
+
+  it("shows the completed test summary on the main display surface", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(windowsCapabilities());
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-local-display-test-1",
+          session_id: "local-display-test-1",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: false,
+          render_mode: "web",
+          native_surface_attached: false,
+          session_window_count: 1,
+        });
+      }
+      if (command === "test_harness_stop") {
+        return Promise.resolve(null);
+      }
+      if (command === "test_start_run") {
+        return Promise.resolve("run-completed");
+      }
+      if (command === "test_harness_get_metrics") {
+        return Promise.resolve({
+          is_running: false,
+          capture_fps: 120.4,
+          frame_count: 3612,
+          total_latency_p95_ms: 12.8,
+          error_message: null,
+        });
+      }
+      if (command === "test_get_run") {
+        return Promise.resolve({
+          run_id: "run-completed",
+          status: "completed",
+          summary: {
+            total_duration_ms: 30_000,
+            capture_fps: 120.4,
+            total_latency_p95: 12.8,
+            encode_latency_p95: 2.2,
+            transport_latency_p95: 1.4,
+            decode_latency_p95: 0.9,
+            dropped_frames: 1,
+            frame_count: 3612,
+          },
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay("local-display-test-1");
+
+    fireEvent.click(await screen.findByRole("button", { name: "Start local pipeline test" }));
+
+    expect(await screen.findByText("测试结果")).toBeInTheDocument();
+    expect(screen.getByText("run-completed")).toBeInTheDocument();
+    expect(screen.getByText("120.4 FPS")).toBeInTheDocument();
+    expect(screen.getAllByText("12.8 ms").length).toBeGreaterThan(0);
+    expect(screen.getByText("1 dropped")).toBeInTheDocument();
+  });
+
+  it("allows WebCodecs ultra-low-latency start when the browser decoder APIs exist", async () => {
+    vi.stubGlobal("VideoDecoder", class {});
+    vi.stubGlobal("EncodedVideoChunk", class {});
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(windowsCapabilities());
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-local-display-test-1",
+          session_id: "local-display-test-1",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: false,
+          render_mode: "web",
+          native_surface_attached: false,
+          session_window_count: 1,
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay("local-display-test-1");
+
+    fireEvent.click(await screen.findByRole("button", { name: "测试配置" }));
+    fireEvent.click(await screen.findByRole("button", { name: "WebCodecs WebGL2" }));
+
+    expect(screen.getByRole("button", { name: "开始测试" })).toBeEnabled();
+  });
+
+  it("detects when WebCodecs can render through a worker offscreen canvas", () => {
+    vi.stubGlobal("VideoDecoder", class {});
+    vi.stubGlobal("EncodedVideoChunk", class {});
+    vi.stubGlobal("Worker", class {});
+    vi.stubGlobal("OffscreenCanvas", class {});
+
+    expect(
+      browserSupportsWebCodecsWorkerRendering({
+        transferControlToOffscreen: () => ({}) as OffscreenCanvas,
+      })
+    ).toBe(true);
+    expect(browserSupportsWebCodecsWorkerRendering(null)).toBe(false);
+    expect(browserSupportsWebCodecsWorkerRendering({})).toBe(false);
+  });
+
+  it("labels the active WebCodecs worker renderer backend", () => {
+    expect(webCodecsMemoryPathLabelFromState("webcodecs-worker:webgl2")).toBe(
+      "WebGL2 OffscreenCanvas"
+    );
+    expect(webCodecsMemoryPathLabelFromState("webcodecs-worker:2d")).toBe(
+      "OffscreenCanvas 2D"
+    );
+    expect(webCodecsMemoryPathLabelFromState("webcodecs-worker:connecting")).toBe(
+      "OffscreenCanvas"
+    );
+  });
+
+  it("lets test config override the initial URL profile after it has been applied", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(windowsCapabilities());
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-local-display-test-1",
+          session_id: "local-display-test-1",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: false,
+          render_mode: "web",
+          native_surface_attached: false,
+          session_window_count: 1,
+        });
+      }
+      if (command === "test_harness_stop") {
+        return Promise.resolve(null);
+      }
+      if (command === "test_start_run") {
+        return Promise.resolve("run-url-override");
+      }
+      if (command === "test_harness_get_metrics") {
+        return Promise.resolve({
+          is_running: true,
+          capture_fps: 144,
+          frame_count: 12,
+          total_latency_p95_ms: 12,
+          error_message: null,
+        });
+      }
+      if (command === "test_get_run") {
+        return Promise.resolve({ run_id: "run-url-override", status: "running", summary: null });
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay(
+      "local-display-test-1",
+      "?surface=surface-1&width=2560&height=1440&fps=120&bitrateMbps=20"
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "测试配置" }));
+    fireEvent.click(await screen.findByRole("button", { name: "FPS 144 FPS" }));
+    fireEvent.click(screen.getByRole("button", { name: "开始测试" }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_start_run",
+        expect.objectContaining({
+          config: expect.objectContaining({
+            fps: 144,
+            resolution: [2560, 1440],
+            bitrate: 20_000_000,
+          }),
+        })
+      );
+    });
+  });
+
+  it("uses browser-preview labels instead of matrix-only decoder and transport labels", () => {
+    expect(webPreviewDecoderLabel("webcodecs", "No decode")).toBe("Browser WebCodecs");
+    expect(webPreviewTransportLabel("webcodecs", "WebRTC")).toBe("WebSocket AU bridge");
+    expect(webPreviewDecoderLabel("webrtc", "No decode")).toBe("Browser video decode");
+    expect(webPreviewTransportLabel("webrtc", "WebRTC")).toBe("WebRTC RTP");
   });
 
   it("blocks high-FPS browser rendering when only the OpenH264 diagnostic fallback is available", async () => {
@@ -725,7 +1164,7 @@ describe("RemoteDisplayWindowPage", () => {
     await waitFor(() => {
       expect(startButton).toBeDisabled();
       expect(
-        screen.getByText(/网页 120 FPS 本机采集需要硬件 H\.264 编码器/)
+        screen.getByText(/网页 144 FPS 本机采集需要硬件 H\.264 编码器/)
       ).toBeInTheDocument();
     });
   });
@@ -798,7 +1237,7 @@ describe("RemoteDisplayWindowPage", () => {
             encoder_type: "nvenc_h264",
             decoder_type: "none",
             transport_kind: "webrtc",
-            fps: 120,
+            fps: 144,
             render_display: false,
             visual_preview: false,
             zero_copy: false,
@@ -863,6 +1302,7 @@ describe("RemoteDisplayWindowPage", () => {
 
     renderRemoteDisplay("local-display-test-1");
 
+    fireEvent.click(await screen.findByRole("button", { name: "测试配置" }));
     const linuxNativeButton = await screen.findByRole("button", { name: "Linux native" });
     await waitFor(() => expect(linuxNativeButton).toBeEnabled());
     fireEvent.click(linuxNativeButton);
@@ -1031,7 +1471,7 @@ describe("RemoteDisplayWindowPage", () => {
     renderRemoteDisplay("local-display-test-1");
 
     fireEvent.click(await screen.findByRole("button", { name: "测试配置" }));
-    fireEvent.change(screen.getByLabelText("ENC"), { target: { value: "nvenc_av1" } });
+    fireEvent.click(screen.getByRole("button", { name: "ENC NVENC AV1" }));
     fireEvent.click(screen.getByRole("button", { name: "Start local pipeline test" }));
 
     await waitFor(() => {
@@ -1107,8 +1547,8 @@ describe("RemoteDisplayWindowPage", () => {
     renderRemoteDisplay("local-display-test-1");
 
     fireEvent.click(await screen.findByRole("button", { name: "测试配置" }));
-    fireEvent.change(screen.getByLabelText("ENC"), { target: { value: "nvenc_hevc_main10" } });
-    fireEvent.change(screen.getByLabelText("NET"), { target: { value: "quic" } });
+    fireEvent.click(screen.getByRole("button", { name: "ENC NVENC HEVC Main10" }));
+    fireEvent.click(screen.getByRole("button", { name: "NET QUIC" }));
     fireEvent.click(screen.getByRole("button", { name: "Start local pipeline test" }));
 
     await waitFor(() => {
@@ -1867,6 +2307,8 @@ describe("RemoteDisplayWindowPage", () => {
 
     renderRemoteDisplay("local-display-test-1");
 
+    expect(screen.queryByRole("button", { name: "DX12 native" })).not.toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("button", { name: "测试配置" }));
     const dx12Button = await screen.findByRole("button", { name: "DX12 native" });
     expect(dx12Button).toBeDisabled();
     expect(dx12Button).toHaveAttribute("title", expect.stringContaining("D3D12"));
@@ -1909,6 +2351,8 @@ describe("RemoteDisplayWindowPage", () => {
 
     renderRemoteDisplay("local-display-test-1");
 
+    expect(screen.queryByRole("button", { name: "DX12 native" })).not.toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("button", { name: "测试配置" }));
     const dx12Button = await screen.findByRole("button", { name: "DX12 native" });
     expect(dx12Button).toBeDisabled();
     expect(dx12Button).toHaveAttribute("title", expect.stringContaining("渲染测试"));

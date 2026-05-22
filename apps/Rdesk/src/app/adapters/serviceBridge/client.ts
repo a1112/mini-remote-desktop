@@ -32,6 +32,18 @@ export function serviceBridgeEndpoint(): string {
   return configured || DEFAULT_ENDPOINT;
 }
 
+export function serviceBridgeWebSocketUrl(path: string): string {
+  const url = new URL(serviceBridgeEndpoint());
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+  url.pathname = path;
+  url.search = '';
+  if (typeof window !== 'undefined') {
+    const token = window.localStorage?.getItem(TOKEN_STORAGE_KEY)?.trim();
+    if (token) url.searchParams.set('token', token);
+  }
+  return url.toString();
+}
+
 export function setServiceBridgeEndpointForTest(endpoint: string): void {
   endpointOverrideForTest = endpoint;
 }
