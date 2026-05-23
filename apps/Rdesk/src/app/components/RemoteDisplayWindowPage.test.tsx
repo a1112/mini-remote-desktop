@@ -129,6 +129,30 @@ const remoteDisplaySource = {
   preview_height: 135,
 };
 
+const localDisplaySources = [
+  {
+    ...remoteDisplaySource,
+    id: "windows:display-shared:0",
+    title: "Display 1 (D3D11 shared copy)",
+    width: 2560,
+    height: 1440,
+    preview_data_url: null,
+    preview_width: null,
+    preview_height: null,
+  },
+  {
+    ...remoteDisplaySource,
+    id: "windows:display-shared:1",
+    title: "Display 2 (D3D11 shared copy)",
+    class_name: "DXGIShared:\\\\.\\DISPLAY2",
+    width: 3840,
+    height: 2160,
+    preview_data_url: null,
+    preview_width: null,
+    preview_height: null,
+  },
+];
+
 describe("RemoteDisplayWindowPage", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
@@ -2038,6 +2062,61 @@ describe("RemoteDisplayWindowPage", () => {
         sourceId: "windows:window:0x1234",
       });
     });
+  });
+
+  it("shows local display source selection for local preview sessions", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(windowsCapabilities());
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-local-display-test-1",
+          session_id: "local-display-test-1",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: false,
+          render_mode: "web",
+          native_surface_attached: false,
+          session_window_count: 1,
+        });
+      }
+      if (command === "ipc_list_local_capture_sources") {
+        return Promise.resolve(localDisplaySources);
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay("local-display-test-1");
+
+    fireEvent.click(await screen.findByRole("button", { name: "配置" }));
+    expect(await screen.findByText("本机捕获源")).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("button", { name: "刷新捕获源" }));
+
+    const localSourceSelect = await screen.findByLabelText("本机捕获源下拉");
+    fireEvent.change(localSourceSelect, {
+      target: { value: "windows:display-shared:1" },
+    });
+
+    await waitFor(() => {
+      expect(screen.getAllByText(/Display 2/).length).toBeGreaterThan(0);
+    });
+    expect(screen.getByText(/3840x2160/)).toBeInTheDocument();
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("ipc_list_local_capture_sources", {
+        includePreviews: false,
+        limit: 24,
+      });
+      expect(mockInvoke).toHaveBeenCalledWith("ipc_list_local_capture_sources", {
+        includePreviews: true,
+        limit: 2,
+      });
+    });
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      "ipc_select_remote_capture_source",
+      expect.anything()
+    );
   });
 
   it("auto-selects the best fullscreen shared capture source for LAN remote sessions", async () => {

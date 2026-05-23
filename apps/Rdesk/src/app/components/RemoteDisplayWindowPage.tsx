@@ -51,6 +51,7 @@ import {
 import {
   getProbeSnapshot,
   getSessionSnapshot,
+  listLocalCaptureSources,
   listRemoteCaptureSources,
   selectRemoteCaptureSource,
   startReceiver,
@@ -413,6 +414,18 @@ function pickPreferredCaptureSource(sources: CaptureSource[]) {
     sources[0] ??
     null
   );
+}
+
+function localCaptureSourceSelection(
+  sessionId: string,
+  source: CaptureSource
+): CaptureSourceSelection {
+  return {
+    session_id: sessionId,
+    source,
+    status: "selected",
+    reason: null,
+  };
 }
 
 function isNvencSharedTextureEncoder(encoder: EncoderType) {
@@ -4265,15 +4278,14 @@ export function RemoteDisplayWindowPage() {
     }
   }, [buildRemoteMediaProfile, isLocalPipelinePreview, sessionId, transport]);
 
-  const hydrateRemoteCaptureSourcePreviews = useCallback(async (sources: CaptureSource[]) => {
-    if (isLocalPipelinePreview || sources.length === 0) return;
+  const hydrateCaptureSourcePreviews = useCallback(async (sources: CaptureSource[]) => {
+    if (sources.length === 0) return;
 
     try {
-      const previewSources = await listRemoteCaptureSources(
-        sessionId,
-        true,
-        Math.min(sources.length, 8)
-      );
+      const previewLimit = Math.min(sources.length, 8);
+      const previewSources = isLocalPipelinePreview
+        ? await listLocalCaptureSources(true, previewLimit)
+        : await listRemoteCaptureSources(sessionId, true, previewLimit);
       const previewById = new Map(previewSources.map((source) => [source.id, source]));
       setCaptureSources((currentSources) =>
         currentSources.map((source) => {
@@ -4292,21 +4304,21 @@ export function RemoteDisplayWindowPage() {
     }
   }, [isLocalPipelinePreview, sessionId]);
 
-  const handleRefreshRemoteCaptureSources = useCallback(async () => {
-    if (isLocalPipelinePreview) return;
-
+  const handleRefreshCaptureSources = useCallback(async () => {
     setCaptureSourcesLoading(true);
     setLastError(null);
-    setTestMessage("正在枚举远端捕获源");
+    setTestMessage(isLocalPipelinePreview ? "正在枚举本机捕获源" : "正在枚举远端捕获源");
     try {
-      const sources = await listRemoteCaptureSources(sessionId, false, 24);
+      const sources = isLocalPipelinePreview
+        ? await listLocalCaptureSources(false, 24)
+        : await listRemoteCaptureSources(sessionId, false, 24);
       const nextSources = Array.isArray(sources) ? sources : [];
       setCaptureSources(nextSources);
-      void hydrateRemoteCaptureSourcePreviews(nextSources);
+      void hydrateCaptureSourcePreviews(nextSources);
       setTestMessage(
         nextSources.length > 0
-          ? `已获取 ${nextSources.length} 个远端捕获源`
-          : "未发现可捕获的远端窗口/屏幕"
+          ? `已获取 ${nextSources.length} 个${isLocalPipelinePreview ? "本机" : "远端"}捕获源`
+          : `未发现可捕获的${isLocalPipelinePreview ? "本机" : "远端"}窗口/屏幕`
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -4316,14 +4328,23 @@ export function RemoteDisplayWindowPage() {
     } finally {
       setCaptureSourcesLoading(false);
     }
-  }, [hydrateRemoteCaptureSourcePreviews, isLocalPipelinePreview, sessionId]);
+  }, [hydrateCaptureSourcePreviews, isLocalPipelinePreview, sessionId]);
 
-  const handleSelectRemoteCaptureSource = useCallback(
+  const handleSelectCaptureSource = useCallback(
     async (source: CaptureSource) => {
-      if (isLocalPipelinePreview) return;
-
       setLastError(null);
-      setTestMessage(`正在切换远端捕获源: ${captureSourceKindLabel(source.source_kind)} / ${source.title}`);
+      if (isLocalPipelinePreview) {
+        const selection = localCaptureSourceSelection(sessionId, source);
+        setCaptureSourceSelection(selection);
+        setTestMessage(
+          `本机捕获源已切换: ${captureSourceKindLabel(source.source_kind)} / ${source.title}`
+        );
+        return;
+      }
+
+      setTestMessage(
+        `正在切换远端捕获源: ${captureSourceKindLabel(source.source_kind)} / ${source.title}`
+      );
       try {
         const selection = await selectRemoteCaptureSource(sessionId, source.id);
         setCaptureSourceSelection(selection);
@@ -4925,6 +4946,13 @@ export function RemoteDisplayWindowPage() {
     !isTestBusy &&
     ["completed", "failed", "cancelled"].includes(lastCompletedRun.status);
   const primaryActionBlocked = Boolean(!isTestBusy && localStartBlockReason);
+  const captureSourceScopeLabel = isLocalPipelinePreview ? "本机捕获源" : "远端捕获源";
+  const captureSourceDescription = isLocalPipelinePreview
+    ? "默认优先本机全屏 shared copy，可切换到当前连接的其他显示器。"
+    : "默认优先全屏 shared copy，可切换全屏 copy 或单窗口源。";
+  const captureSourceEmptyMessage = isLocalPipelinePreview
+    ? "暂无捕获源。点击刷新从本机服务获取当前显示器列表。"
+    : "暂无捕获源。点击刷新从远端设备获取当前全屏/窗口列表。";
   const renderCaptureSourceCards = (closeAfterSelect = false) => (
     <div className="grid max-h-80 gap-3 overflow-y-auto pr-1 sm:grid-cols-2 lg:grid-cols-3">
       {captureSources.map((source) => {
@@ -4935,7 +4963,7 @@ export function RemoteDisplayWindowPage() {
             type="button"
             aria-label={`选择 ${source.title}`}
             onClick={() => {
-              void handleSelectRemoteCaptureSource(source);
+              void handleSelectCaptureSource(source);
               if (closeAfterSelect) setCaptureSourcePickerOpen(false);
             }}
             className={[
@@ -5656,82 +5684,80 @@ export function RemoteDisplayWindowPage() {
               </div>
             </div>
 
-            {!isLocalPipelinePreview && (
-              <div className="border-t border-white/10 px-4 py-4">
-                <div className="mb-3 flex items-center justify-between gap-3">
-                  <div>
-                    <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.18em] text-slate-300">
-                      <PanelTop className="h-3.5 w-3.5 text-cyan-300" />
-                      远端捕获源
-                    </div>
-                    <div className="mt-1 text-[11px] text-slate-500">
-                      默认优先全屏 shared copy，可切换全屏 copy 或单窗口源。
-                    </div>
+            <div className="border-t border-white/10 px-4 py-4">
+              <div className="mb-3 flex items-center justify-between gap-3">
+                <div>
+                  <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.18em] text-slate-300">
+                    <PanelTop className="h-3.5 w-3.5 text-cyan-300" />
+                    {captureSourceScopeLabel}
                   </div>
-                  <div className="flex flex-wrap items-center justify-end gap-2">
-                    <TitleSelect
-                      label="PICK"
-                      value={captureSourcePickerMode}
-                      options={captureSourcePickerOptions}
-                      onChange={setCaptureSourcePickerMode}
-                    />
-                    <button
-                      className="inline-flex items-center gap-2 rounded-md border border-cyan-400/30 px-3 py-1.5 text-[11px] font-medium text-cyan-100 hover:bg-cyan-500/15 disabled:opacity-50"
-                      onClick={() => void handleRefreshRemoteCaptureSources()}
-                      disabled={captureSourcesLoading}
-                    >
-                      {captureSourcesLoading && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-                      刷新捕获源
-                    </button>
-                    {captureSourcePickerMode === "modal" && (
-                      <button
-                        className="rounded-md border border-white/15 px-3 py-1.5 text-[11px] font-medium text-slate-200 hover:bg-white/10"
-                        onClick={() => setCaptureSourcePickerOpen(true)}
-                      >
-                        打开捕获源弹窗
-                      </button>
-                    )}
+                  <div className="mt-1 text-[11px] text-slate-500">
+                    {captureSourceDescription}
                   </div>
                 </div>
-
-                {captureSources.length === 0 ? (
-                  <div className="rounded-lg border border-white/10 bg-black/20 px-3 py-4 text-center text-[11px] text-slate-500">
-                    暂无捕获源。点击刷新从远端设备获取当前全屏/窗口列表。
-                  </div>
-                ) : captureSourcePickerMode === "dropdown" ? (
-                  <label className="block">
-                    <span className="sr-only">远端捕获源下拉</span>
-                    <select
-                      aria-label="远端捕获源下拉"
-                      className="w-full rounded-lg border border-white/10 bg-black/25 px-3 py-2 text-xs text-slate-100 outline-none"
-                      value={captureSourceSelection?.source.id ?? ""}
-                      onChange={(event) => {
-                        const source = captureSources.find(
-                          (candidate) => candidate.id === event.target.value
-                        );
-                        if (source) void handleSelectRemoteCaptureSource(source);
-                      }}
+                <div className="flex flex-wrap items-center justify-end gap-2">
+                  <TitleSelect
+                    label="PICK"
+                    value={captureSourcePickerMode}
+                    options={captureSourcePickerOptions}
+                    onChange={setCaptureSourcePickerMode}
+                  />
+                  <button
+                    className="inline-flex items-center gap-2 rounded-md border border-cyan-400/30 px-3 py-1.5 text-[11px] font-medium text-cyan-100 hover:bg-cyan-500/15 disabled:opacity-50"
+                    onClick={() => void handleRefreshCaptureSources()}
+                    disabled={captureSourcesLoading}
+                  >
+                    {captureSourcesLoading && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                    刷新捕获源
+                  </button>
+                  {captureSourcePickerMode === "modal" && (
+                    <button
+                      className="rounded-md border border-white/15 px-3 py-1.5 text-[11px] font-medium text-slate-200 hover:bg-white/10"
+                      onClick={() => setCaptureSourcePickerOpen(true)}
                     >
-                      <option value="" className="bg-[#111827] text-slate-100">
-                        选择远端捕获源
-                      </option>
-                      {captureSources.map((source) => (
-                        <option
-                          key={source.id}
-                          value={source.id}
-                          className="bg-[#111827] text-slate-100"
-                        >
-                          {captureSourceKindLabel(source.source_kind)} / {source.title} /{" "}
-                          {source.width}x{source.height}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                ) : (
-                  renderCaptureSourceCards()
-                )}
+                      打开捕获源弹窗
+                    </button>
+                  )}
+                </div>
               </div>
-            )}
+
+              {captureSources.length === 0 ? (
+                <div className="rounded-lg border border-white/10 bg-black/20 px-3 py-4 text-center text-[11px] text-slate-500">
+                  {captureSourceEmptyMessage}
+                </div>
+              ) : captureSourcePickerMode === "dropdown" ? (
+                <label className="block">
+                  <span className="sr-only">{captureSourceScopeLabel}下拉</span>
+                  <select
+                    aria-label={`${captureSourceScopeLabel}下拉`}
+                    className="w-full rounded-lg border border-white/10 bg-black/25 px-3 py-2 text-xs text-slate-100 outline-none"
+                    value={captureSourceSelection?.source.id ?? ""}
+                    onChange={(event) => {
+                      const source = captureSources.find(
+                        (candidate) => candidate.id === event.target.value
+                      );
+                      if (source) void handleSelectCaptureSource(source);
+                    }}
+                  >
+                    <option value="" className="bg-[#111827] text-slate-100">
+                      选择{captureSourceScopeLabel}
+                    </option>
+                    {captureSources.map((source) => (
+                      <option
+                        key={source.id}
+                        value={source.id}
+                        className="bg-[#111827] text-slate-100"
+                      >
+                        {captureSourceKindLabel(source.source_kind)} / {source.title} /{" "}
+                        {source.width}x{source.height}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              ) : (
+                renderCaptureSourceCards()
+              )}
+            </div>
 
             <div className="flex items-center justify-between border-t border-white/10 px-4 py-3">
               <div className="text-[11px] text-slate-500">
@@ -5816,7 +5842,7 @@ export function RemoteDisplayWindowPage() {
         </div>
       )}
 
-      {!isLocalPipelinePreview && captureSourcePickerOpen && (
+      {captureSourcePickerOpen && (
         <div
           className="fixed inset-0 z-[60] flex items-center justify-center bg-black/65 px-4"
           style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}
@@ -5825,15 +5851,17 @@ export function RemoteDisplayWindowPage() {
           <div className="flex max-h-[calc(100vh-3rem)] w-full max-w-5xl flex-col rounded-lg border border-white/10 bg-[#0f1724] shadow-2xl">
             <div className="flex items-center justify-between border-b border-white/10 px-4 py-3">
               <div>
-                <div className="text-sm font-semibold text-slate-100">远端捕获源选择</div>
+                <div className="text-sm font-semibold text-slate-100">
+                  {captureSourceScopeLabel}选择
+                </div>
                 <div className="mt-1 text-[11px] text-slate-500">
-                  优先选择全屏 shared copy；需要应用窗口时选择单窗口源。
+                  {captureSourceDescription}
                 </div>
               </div>
               <div className="flex items-center gap-2">
                 <button
                   className="inline-flex items-center gap-2 rounded-md border border-cyan-400/30 px-3 py-1.5 text-[11px] font-medium text-cyan-100 hover:bg-cyan-500/15 disabled:opacity-50"
-                  onClick={() => void handleRefreshRemoteCaptureSources()}
+                  onClick={() => void handleRefreshCaptureSources()}
                   disabled={captureSourcesLoading}
                 >
                   {captureSourcesLoading && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
@@ -5851,7 +5879,7 @@ export function RemoteDisplayWindowPage() {
             <div className="min-h-0 overflow-y-auto px-4 py-4">
               {captureSources.length === 0 ? (
                 <div className="rounded-lg border border-white/10 bg-black/20 px-3 py-8 text-center text-[11px] text-slate-500">
-                  暂无捕获源。点击刷新从远端设备获取当前全屏/窗口列表。
+                  {captureSourceEmptyMessage}
                 </div>
               ) : (
                 renderCaptureSourceCards(true)
