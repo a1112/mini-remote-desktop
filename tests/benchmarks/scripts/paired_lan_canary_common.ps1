@@ -111,6 +111,21 @@ function New-CanaryMediaChain {
   }
 }
 
+function New-LocalDualProcessTauriEnvPlan {
+  param(
+    [Parameter(Mandatory = $true)][string]$OutputRoot,
+    [Parameter(Mandatory = $true)][string]$ServiceExe,
+    [switch]$NoBuild
+  )
+
+  $envPlan = [ordered]@{
+    MRD_SERVICE_PREBUILT_EXE = $ServiceExe
+    MRD_SERVICE_EXE = $ServiceExe
+  }
+
+  [pscustomobject]$envPlan
+}
+
 function Get-PairedLanCanaryProfiles {
   param(
     [int]$DurationSecs = 30,

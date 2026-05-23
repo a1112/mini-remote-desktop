@@ -280,6 +280,7 @@ function Invoke-LocalDualProcessProfile {
     [int]$TauriStartupGraceSecs = 90,
     [switch]$NoMotionStimulus,
     [switch]$NoRenderProfileCap,
+    [switch]$NoBuild,
     [switch]$KeepTauriOpen
   )
 
@@ -401,7 +402,13 @@ function Invoke-LocalDualProcessProfile {
     if ($CaptureSourceKind.Trim()) {
       Set-EnvVar "MRD_LAN_E2E_CAPTURE_SOURCE_KIND" $CaptureSourceKind.Trim() $savedEnv
     }
-    Set-EnvVar "CARGO_TARGET_DIR" (Join-Path $OutputRoot "tauri-target") $savedEnv
+    $tauriEnvPlan = New-LocalDualProcessTauriEnvPlan `
+      -OutputRoot $OutputRoot `
+      -ServiceExe $runServiceExe `
+      -NoBuild:$NoBuild
+    foreach ($envVar in $tauriEnvPlan.PSObject.Properties) {
+      Set-EnvVar $envVar.Name ([string]$envVar.Value) $savedEnv
+    }
 
     $tauriStdout = Join-Path $logsDir "tauri.stdout.log"
     $tauriStderr = Join-Path $logsDir "tauri.stderr.log"
@@ -551,7 +558,8 @@ if (-not $NoBuild) {
   $savedBuildEnv = @{}
   try {
     Set-EnvVar "GIT_COMMIT" $gitCommit $savedBuildEnv
-    cargo build -p app -p mrd-service
+    cargo build -p mrd-service
+    cargo build -p app --no-default-features
   } finally {
     Restore-EnvVars $savedBuildEnv
   }
@@ -582,6 +590,7 @@ foreach ($profile in $profiles) {
     -TauriStartupGraceSecs $TauriStartupGraceSecs `
     -NoMotionStimulus:$NoMotionStimulus `
     -NoRenderProfileCap:$NoRenderProfileCap `
+    -NoBuild:$NoBuild `
     -KeepTauriOpen:$KeepTauriOpen
 }
 
