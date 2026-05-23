@@ -2648,6 +2648,7 @@ export function RemoteDisplayWindowPage() {
     const selectedFps = selection?.fps ?? fps;
     const selectedBitrate = selection?.bitrate ?? bitrate;
     const selectedResolution = selection?.resolution ?? resolution;
+    const selectedLocalSource = isLocalPipelinePreview ? captureSourceSelection?.source : null;
     const [width, height] = selectedResolution.split("x").map(Number) as [number, number];
     const selectedUsesNativeSharedTexture =
       nativeRendererType === "d3d11" &&
@@ -2672,16 +2673,25 @@ export function RemoteDisplayWindowPage() {
         isNative && (rendererTargetHwnd || nativeRendererType === "linux")
       ),
       zero_copy: selectedUsesNativeSharedTexture,
+      ...(selectedLocalSource
+        ? {
+            source_id: selectedLocalSource.id,
+            source_kind: selectedLocalSource.source_kind,
+            display_id: selectedLocalSource.id,
+          }
+        : {}),
       ...(nativeRendererType ? { renderer_type: nativeRendererType } : {}),
       ...(isNative && rendererTargetHwnd ? { renderer_target_hwnd: rendererTargetHwnd } : {}),
     } satisfies TestConfig;
   }, [
     bitrate,
     capture,
+    captureSourceSelection,
     decoder,
     encoder,
     fps,
     isNative,
+    isLocalPipelinePreview,
     nativeRendererType,
     resolution,
     selectedDurationMs,

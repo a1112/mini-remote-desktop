@@ -148,6 +148,7 @@ pub struct TestConfig {
     pub transport: Option<TransportKind>,
     pub zero_copy: Option<bool>,
     pub input_source: Option<String>,
+    pub source_id: Option<String>,
     pub display_id: Option<String>,
     pub window_handle: Option<String>,
     pub visual_preview: Option<bool>,
@@ -164,6 +165,7 @@ impl Default for TestConfig {
             transport: None,
             zero_copy: None,
             input_source: None,
+            source_id: None,
             display_id: None,
             window_handle: None,
             visual_preview: None,
@@ -1544,13 +1546,7 @@ impl TestHarness {
                 {
                     match capture_type {
                         CaptureType::Dxgi => {
-                            let mut capture =
-                                DxgiSharedTextureCapture::new_primary().map_err(|e| {
-                                    anyhow::anyhow!(
-                                        "DXGI shared texture capture init failed: {:?}",
-                                        e
-                                    )
-                                })?;
+                            let mut capture = create_dxgi_shared_texture_capture(config)?;
                             let (width, height) = select_pipeline_dimensions(
                                 capture.width(),
                                 capture.height(),
@@ -1570,8 +1566,7 @@ impl TestHarness {
                                     },
                                 )?
                             } else {
-                                let monitor_index =
-                                    parse_display_index(config.display_id.as_deref())?;
+                                let monitor_index = parse_display_index(display_ref(config))?;
                                 WinrtCapture::from_monitor_index_shared_texture(monitor_index)
                                     .map_err(|error| {
                                         anyhow::anyhow!("WinRT shared capture init failed: {error}")
@@ -1614,7 +1609,7 @@ impl TestHarness {
                                 WinrtMonitorCapture::new_window(hwnd)?
                             } else {
                                 WinrtMonitorCapture::new_monitor(parse_display_index(
-                                    config.display_id.as_deref(),
+                                    display_ref(config),
                                 )?)?
                             };
                             let (width, height) = select_pipeline_dimensions(
@@ -3412,6 +3407,55 @@ fn parse_display_index(input: Option<&str>) -> Result<u32> {
     u32::try_from(value).map_err(|_| anyhow::anyhow!("display index out of range: {value}"))
 }
 
+fn display_ref(config: &TestConfig) -> Option<&str> {
+    config.display_id.as_deref().or(config.source_id.as_deref())
+}
+
+#[cfg(windows)]
+fn create_dxgi_shared_texture_capture(config: &TestConfig) -> Result<DxgiSharedTextureCapture> {
+    let Some(source_id) = display_ref(config) else {
+        return DxgiSharedTextureCapture::new_primary()
+            .map_err(|e| anyhow::anyhow!("DXGI shared texture capture init failed: {:?}", e));
+    };
+    let device_name = dxgi_device_name_for_source_id(source_id)?;
+    DxgiSharedTextureCapture::new_for_device_name(&device_name).map_err(|e| {
+        anyhow::anyhow!(
+            "DXGI shared texture capture init failed for {source_id} ({device_name}): {:?}",
+            e
+        )
+    })
+}
+
+#[cfg(windows)]
+fn dxgi_device_name_for_source_id(source_id: &str) -> Result<String> {
+    let source_index = parse_display_index(Some(source_id))? as usize;
+    let targets = mrd_capture_dxgi::enumerate_dxgi_output_targets()
+        .map_err(|error| anyhow::anyhow!("DXGI output enumeration failed: {error}"))?;
+    targets
+        .get(source_index)
+        .map(|target| target.device_name.clone())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "DXGI output source {source_id} resolved to index {source_index}, but only {} attached outputs were found",
+                targets.len()
+            )
+        })
+}
+
+#[cfg(test)]
+mod display_source_tests {
+    use super::*;
+
+    #[test]
+    fn parse_display_index_accepts_windows_display_source_ids() {
+        assert_eq!(
+            parse_display_index(Some("windows:display-shared:1")).unwrap(),
+            1
+        );
+        assert_eq!(parse_display_index(Some("windows:display:0")).unwrap(), 0);
+    }
+}
+
 fn parse_display_id(input: &str) -> Result<u32> {
     let value = parse_numeric_capture_source_id(input, "display id")?;
     u32::try_from(value).map_err(|_| anyhow::anyhow!("display id out of range: {value}"))
@@ -4345,6 +4389,7 @@ mod tests {
                 _ => None,
             },
             input_source: std::env::var("MRD_HARNESS_INPUT_SOURCE").ok(),
+            source_id: std::env::var("MRD_HARNESS_SOURCE_ID").ok(),
             display_id: std::env::var("MRD_HARNESS_DISPLAY_ID").ok(),
             window_handle: std::env::var("MRD_HARNESS_WINDOW_HANDLE").ok(),
             visual_preview: match std::env::var("MRD_HARNESS_VISUAL_PREVIEW").as_deref() {

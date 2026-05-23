@@ -2119,6 +2119,86 @@ describe("RemoteDisplayWindowPage", () => {
     );
   });
 
+  it("passes the selected local display source into native local test config", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(windowsCapabilities());
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-local-display-test-1",
+          session_id: "local-display-test-1",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: false,
+          render_mode: "d3d11_native",
+          native_surface_attached: true,
+          session_window_count: 1,
+        });
+      }
+      if (command === "configure_remote_display_native_surface") {
+        return Promise.resolve({
+          label: "render-local-display-test-1",
+          backend: args?.enabled ? "d3d11" : "web",
+          attached: Boolean(args?.enabled),
+          visible: Boolean(args?.visible),
+          parent_hwnd: "0xA",
+          hwnd: args?.enabled ? "0x14" : null,
+          rect: { x: 0, y: 56, width: 1280, height: 720 },
+        });
+      }
+      if (command === "ipc_list_local_capture_sources") {
+        return Promise.resolve(localDisplaySources);
+      }
+      if (command === "present_test_harness_frame_on_native_surface") {
+        return Promise.resolve(true);
+      }
+      if (command === "test_harness_stop") {
+        return Promise.resolve(null);
+      }
+      if (command === "test_start_run") {
+        return Promise.resolve("run-local-source");
+      }
+      if (command === "test_harness_get_metrics") {
+        return Promise.resolve({
+          is_running: true,
+          capture_fps: 120,
+          frame_count: 12,
+          total_latency_p95_ms: 8,
+          error_message: null,
+        });
+      }
+      if (command === "test_get_run") {
+        return Promise.resolve({ run_id: "run-local-source", status: "running", summary: null });
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay("local-display-test-1");
+
+    fireEvent.click(await screen.findByRole("button", { name: "测试配置" }));
+    fireEvent.click(await screen.findByRole("button", { name: "刷新捕获源" }));
+    fireEvent.change(await screen.findByLabelText("本机捕获源下拉"), {
+      target: { value: "windows:display-shared:1" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Start local pipeline test" }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_start_run",
+        expect.objectContaining({
+          scenarioId: "custom",
+          config: expect.objectContaining({
+            source_id: "windows:display-shared:1",
+            source_kind: "display_shared",
+            display_id: "windows:display-shared:1",
+          }),
+        })
+      );
+    });
+  });
+
   it("auto-selects the best fullscreen shared capture source for LAN remote sessions", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {
