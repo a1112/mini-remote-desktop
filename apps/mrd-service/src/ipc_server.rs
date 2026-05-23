@@ -271,6 +271,17 @@ impl IpcServer {
                 session::configure_media_adaptation(&self.app_state, session_id, config).await
             }
 
+            IpcRequest::ListLocalCaptureSources {
+                include_previews,
+                limit,
+            } => match crate::capture_source::list_capture_sources(include_previews, limit) {
+                Ok(sources) => IpcResponse::LocalCaptureSourceList { sources },
+                Err(error) => IpcResponse::Error {
+                    code: "CAPTURE_SOURCE_LIST_FAILED".to_string(),
+                    message: error.to_string(),
+                },
+            },
+
             IpcRequest::ListRemoteCaptureSources {
                 session_id,
                 include_previews,
@@ -1324,6 +1335,30 @@ mod tests {
                 assert_eq!(sessions[0].role, "controller");
             }
             _ => panic!("Expected SessionList response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_local_capture_sources_returns_local_response_or_error() {
+        let app_state = Arc::new(AppState::new());
+        let server = IpcServer::new(app_state);
+
+        let response = server
+            .handle_request(IpcRequest::ListLocalCaptureSources {
+                include_previews: false,
+                limit: Some(4),
+            })
+            .await;
+
+        match response {
+            IpcResponse::LocalCaptureSourceList { sources } => {
+                assert!(sources.len() <= 4);
+            }
+            IpcResponse::Error { code, message } => {
+                assert_eq!(code, "CAPTURE_SOURCE_LIST_FAILED");
+                assert!(!message.trim().is_empty());
+            }
+            other => panic!("unexpected response: {other:?}"),
         }
     }
 

@@ -877,6 +877,11 @@ mod wire {
             session_id: SessionId,
             config: AdaptiveMediaConfig,
         },
+        /// List selectable capture sources on the local service host.
+        ListLocalCaptureSources {
+            include_previews: bool,
+            limit: Option<u32>,
+        },
         /// List selectable capture sources from the remote peer for a session.
         ListRemoteCaptureSources {
             session_id: SessionId,
@@ -1063,6 +1068,8 @@ mod wire {
             session_id: SessionId,
             snapshot: MediaAdaptationSnapshot,
         },
+        /// Local selectable capture sources returned by mrd-service.
+        LocalCaptureSourceList { sources: Vec<CaptureSource> },
         /// Selectable capture sources returned by the remote peer.
         CaptureSourceList {
             session_id: SessionId,

@@ -511,6 +511,7 @@ pub fn is_ipc_request_allowed(request: &IpcRequest) -> bool {
             | IpcRequest::RefreshLanDiscovery
             | IpcRequest::ListSessions
             | IpcRequest::StartLanRemoteSession { .. }
+            | IpcRequest::ListLocalCaptureSources { .. }
             | IpcRequest::ListRemoteCaptureSources { .. }
             | IpcRequest::SelectRemoteCaptureSource { .. }
             | IpcRequest::ListRemoteDisplayModes { .. }
@@ -701,5 +702,15 @@ mod tests {
         assert!(html.contains("/health"));
         assert!(html.contains("/ipc"));
         assert!(html.contains("/ws"));
+    }
+
+    #[test]
+    fn web_bridge_allows_local_capture_source_listing() {
+        assert!(is_ipc_request_allowed(
+            &IpcRequest::ListLocalCaptureSources {
+                include_previews: false,
+                limit: Some(24),
+            }
+        ));
     }
 }
