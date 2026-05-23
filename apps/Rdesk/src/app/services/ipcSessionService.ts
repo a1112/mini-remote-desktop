@@ -249,6 +249,17 @@ export const updateMediaProfile = async (
 };
 
 /**
+ * List local capture sources with best-effort screenshot previews.
+ */
+export const listLocalCaptureSources = async (
+  includePreviews = true,
+  limit?: number
+): Promise<CaptureSource[]> => {
+  const result = await tauriAdapter.ipcListLocalCaptureSources(includePreviews, limit);
+  return unwrapAdapterResult(result);
+};
+
+/**
  * List remote capture sources with best-effort screenshot previews.
  */
 export const listRemoteCaptureSources = async (

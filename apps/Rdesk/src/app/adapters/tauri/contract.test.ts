@@ -427,6 +427,34 @@ describe('Tauri Adapter Contract', () => {
       });
     });
 
+    it('ipc_list_local_capture_sources calls correct command with args', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue([
+        {
+          id: 'windows:display-shared:1',
+          platform: 'windows',
+          source_kind: 'display_shared',
+          title: 'Display 2 (D3D11 shared copy)',
+          class_name: 'DXGIShared:\\\\.\\DISPLAY2',
+          width: 3840,
+          height: 2160,
+          process_id: 0,
+          app_name: 'Display',
+          bundle_identifier: null,
+          preview_data_url: null,
+          preview_width: null,
+          preview_height: null,
+        },
+      ]);
+
+      await adapter.ipcListLocalCaptureSources(false, 24);
+
+      expect(mockInvoke).toHaveBeenCalledWith('ipc_list_local_capture_sources', {
+        includePreviews: false,
+        limit: 24,
+      });
+    });
+
     it('ipc_list_remote_capture_sources calls correct command with preview options', async () => {
       const mockInvoke = getMockInvoke();
       mockInvoke.mockResolvedValue([

@@ -618,6 +618,29 @@ export async function ipcConfigureMediaAdaptation(
 }
 
 /**
+ * List local capture sources from the mrd-service host.
+ */
+export async function ipcListLocalCaptureSources(
+  includePreviews = true,
+  limit?: number
+): Promise<AdapterResult<CaptureSource[]>> {
+  const args = {
+    includePreviews,
+    ...(limit === undefined ? {} : { limit }),
+  };
+  return invokeBridgeOrTauri<CaptureSource[]>(
+    'ipc_list_local_capture_sources',
+    args,
+    {
+      type: 'ListLocalCaptureSources',
+      include_previews: includePreviews,
+      limit: limit ?? null,
+    },
+    responseField<CaptureSource[]>('sources')
+  );
+}
+
+/**
  * List remote capture sources for an active LAN session.
  */
 export async function ipcListRemoteCaptureSources(
