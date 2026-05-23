@@ -1,6 +1,6 @@
-use bytes::Bytes;
 #[cfg(windows)]
-use mrd_capture_dxgi::DxgiSharedTextureCapture;
+use crate::browser_preview_capture::open_browser_preview_dxgi_capture;
+use bytes::Bytes;
 #[cfg(windows)]
 use mrd_encode_nvenc::NvencH264Encoder;
 use mrd_pipeline_core::EncodedAccessUnit;
@@ -34,6 +34,8 @@ pub struct BrowserWebcodecsPreviewStartRequest {
     pub height: Option<u32>,
     pub bitrate_mbps: Option<u32>,
     pub h264_profile: Option<String>,
+    #[serde(default)]
+    pub source_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -164,7 +166,7 @@ fn run_browser_webcodecs_capture_sender(
     let bitrate_mbps = sanitize_browser_webcodecs_preview_bitrate_mbps(request.bitrate_mbps);
     let bitrate_bps = bitrate_mbps.saturating_mul(1_000_000);
     let codec = browser_webcodecs_h264_codec_string(request.h264_profile.as_deref());
-    let mut capture = match DxgiSharedTextureCapture::new_primary() {
+    let mut capture = match open_browser_preview_dxgi_capture(request.source_id.as_deref()) {
         Ok(capture) => capture,
         Err(error) => {
             send_error(
@@ -214,8 +216,15 @@ fn run_browser_webcodecs_capture_sender(
     let _ = BrowserWebcodecsPreviewOutbound::text_json(&ready)
         .and_then(|message| outbound.blocking_send(message).ok());
     info!(
-        "browser WebCodecs preview sender started for {} at {}x{} @ {} fps / {} Mbps (source {}x{})",
-        session_id, width, height, fps, bitrate_mbps, source_width, source_height
+        "browser WebCodecs preview sender started for {} at {}x{} @ {} fps / {} Mbps (source_id {}, source {}x{})",
+        session_id,
+        width,
+        height,
+        fps,
+        bitrate_mbps,
+        request.source_id.as_deref().unwrap_or("<primary>"),
+        source_width,
+        source_height
     );
 
     let frame_interval = Duration::from_nanos(1_000_000_000u64 / fps.max(1) as u64);
@@ -394,6 +403,22 @@ mod tests {
         assert_eq!(sanitize_browser_webcodecs_preview_fps(Some(249)), 249);
         assert_eq!(sanitize_browser_webcodecs_preview_fps(Some(300)), 249);
         assert_eq!(sanitize_browser_webcodecs_preview_fps(None), 120);
+    }
+
+    #[test]
+    fn browser_webcodecs_preview_start_deserializes_source_id() {
+        let message: BrowserWebcodecsPreviewControlMessage = serde_json::from_str(
+            r#"{"type":"start","session_id":"s1","source_id":"windows:display-shared:1"}"#,
+        )
+        .unwrap();
+
+        let BrowserWebcodecsPreviewControlMessage::Start(request) = message else {
+            panic!("expected start message");
+        };
+        assert_eq!(
+            request.source_id.as_deref(),
+            Some("windows:display-shared:1")
+        );
     }
 
     #[test]

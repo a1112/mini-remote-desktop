@@ -10,7 +10,7 @@ use std::{
 };
 
 #[cfg(windows)]
-use mrd_capture_dxgi::DxgiSharedTextureCapture;
+use crate::browser_preview_capture::open_browser_preview_dxgi_capture;
 #[cfg(windows)]
 use mrd_encode_nvenc::NvencH264Encoder;
 use mrd_pipeline_core::{EncodedAccessUnit, VideoCodec};
@@ -55,6 +55,8 @@ pub struct BrowserWebrtcPreviewStartRequest {
     pub h264_profile: Option<String>,
     #[serde(default)]
     pub bitrate_mbps: Option<u32>,
+    #[serde(default)]
+    pub source_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -402,7 +404,13 @@ impl BrowserWebrtcPreviewHost {
         let profile = h264_profile_from_label(request.h264_profile.as_deref());
         let profile_level_id =
             select_browser_offer_h264_profile_level_id(&request.offer_sdp, profile);
-        validate_browser_preview_sender(fps, bitrate_bps, request.width, request.height)?;
+        validate_browser_preview_sender(
+            request.source_id.as_deref(),
+            fps,
+            bitrate_bps,
+            request.width,
+            request.height,
+        )?;
         let pc = build_peer_connection().await?;
         let running = Arc::new(AtomicBool::new(true));
         let frame_timing_channel = Arc::new(Mutex::new(None::<Arc<RTCDataChannel>>));
@@ -518,6 +526,7 @@ impl BrowserWebrtcPreviewHost {
             bitrate_bps,
             request.width,
             request.height,
+            request.source_id.clone(),
             media_sender,
             frame_timing_channel,
             running.clone(),
@@ -551,12 +560,13 @@ impl BrowserWebrtcPreviewHost {
 
 #[cfg(windows)]
 fn validate_browser_preview_sender(
+    source_id: Option<&str>,
     fps: u32,
     bitrate_bps: u32,
     width: Option<u32>,
     height: Option<u32>,
 ) -> Result<(), String> {
-    let mut capture = DxgiSharedTextureCapture::new_primary()
+    let mut capture = open_browser_preview_dxgi_capture(source_id)
         .map_err(|error| format!("browser WebRTC preview DXGI capture unavailable: {error}"))?;
     let (target_width, target_height) = sanitize_browser_preview_target_dimensions(
         width,
@@ -577,6 +587,7 @@ fn validate_browser_preview_sender(
 
 #[cfg(not(windows))]
 fn validate_browser_preview_sender(
+    _source_id: Option<&str>,
     _fps: u32,
     _bitrate_bps: u32,
     _width: Option<u32>,
@@ -765,6 +776,7 @@ fn spawn_local_capture_sender(
     bitrate_bps: u32,
     width: Option<u32>,
     height: Option<u32>,
+    source_id: Option<String>,
     media_sender: BrowserPreviewMediaSender,
     frame_timing_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
     running: Arc<AtomicBool>,
@@ -777,6 +789,7 @@ fn spawn_local_capture_sender(
             bitrate_bps,
             width,
             height,
+            source_id,
             media_sender,
             frame_timing_channel,
             running,
@@ -792,12 +805,13 @@ fn run_local_capture_sender(
     bitrate_bps: u32,
     width: Option<u32>,
     height: Option<u32>,
+    source_id: Option<String>,
     media_sender: BrowserPreviewMediaSender,
     frame_timing_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
     running: Arc<AtomicBool>,
     handle: tokio::runtime::Handle,
 ) {
-    let mut capture = match DxgiSharedTextureCapture::new_primary() {
+    let mut capture = match open_browser_preview_dxgi_capture(source_id.as_deref()) {
         Ok(capture) => capture,
         Err(error) => {
             warn!("browser WebRTC preview DXGI capture failed for {session_id}: {error}");
@@ -825,12 +839,13 @@ fn run_local_capture_sender(
     };
 
     info!(
-        "browser WebRTC preview sender started for {} at {}x{} @ {} fps / {} Mbps (source {}x{}, track {:?})",
+        "browser WebRTC preview sender started for {} at {}x{} @ {} fps / {} Mbps (source_id {}, source {}x{}, track {:?})",
         session_id,
         capture.width(),
         capture.height(),
         fps,
         bitrate_bps / 1_000_000,
+        source_id.as_deref().unwrap_or("<primary>"),
         source_width,
         source_height,
         browser_preview_sender_track_kind(bitrate_bps)
@@ -1060,6 +1075,7 @@ fn run_local_capture_sender(
     _bitrate_bps: u32,
     _width: Option<u32>,
     _height: Option<u32>,
+    _source_id: Option<String>,
     _media_sender: BrowserPreviewMediaSender,
     _frame_timing_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
     running: Arc<AtomicBool>,
@@ -1105,6 +1121,19 @@ mod tests {
         assert!(json.contains("\"sent_unix_us\":1779371954350999"));
         assert!(json.contains("\"rtp_timestamp\":123456"));
         assert!(json.contains("\"keyframe\":true"));
+    }
+
+    #[test]
+    fn browser_webrtc_preview_start_deserializes_source_id() {
+        let request: BrowserWebrtcPreviewStartRequest = serde_json::from_str(
+            r#"{"session_id":"s1","offer_sdp":"v=0","source_id":"windows:display-shared:1"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            request.source_id.as_deref(),
+            Some("windows:display-shared:1")
+        );
     }
 
     #[test]
