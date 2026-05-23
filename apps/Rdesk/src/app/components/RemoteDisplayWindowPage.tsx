@@ -1899,6 +1899,9 @@ export function RemoteDisplayWindowPage() {
   const sessionId = id ?? context?.session_id ?? "local-preview";
   const activeSurfaceId = context?.surface_id ?? surfaceId;
   const isLocalPipelinePreview = isLocalPipelinePreviewSession(sessionId);
+  const selectedLocalPreviewSourceId = isLocalPipelinePreview
+    ? captureSourceSelection?.source.id
+    : undefined;
   const hostOs = normalizeOs(capabilities?.os_type);
   const requestedResolution = useMemo(() => resolutionFromSearch(searchParams), [searchParams]);
   const requestedFps = useMemo(() => fpsFromSearch(searchParams), [searchParams]);
@@ -3496,6 +3499,7 @@ export function RemoteDisplayWindowPage() {
           height: Number(resolution.split("x")[1]),
           bitrateMbps: Number(bitrate),
           h264Profile: browserWebrtcPreviewH264Profile(encoder, decoder),
+          sourceId: selectedLocalPreviewSourceId,
         });
         if (cancelled) return;
         if (!answer.ok) {
@@ -3538,6 +3542,7 @@ export function RemoteDisplayWindowPage() {
     isTestBusy,
     localStartBlockReason,
     resolution,
+    selectedLocalPreviewSourceId,
     sessionId,
     webCodecsCanvasEpoch,
     webPreviewEngine,
@@ -3691,6 +3696,7 @@ export function RemoteDisplayWindowPage() {
             height: Number(resolution.split("x")[1]),
             bitrateMbps: Number(bitrate),
             h264Profile: "baseline",
+            sourceId: selectedLocalPreviewSourceId,
             ...viewport(),
           },
           [offscreenCanvas]
@@ -3879,6 +3885,7 @@ export function RemoteDisplayWindowPage() {
           height: Number(resolution.split("x")[1]),
           bitrate_mbps: Number(bitrate),
           h264_profile: "baseline",
+          source_id: selectedLocalPreviewSourceId ?? null,
         })
       );
     };
@@ -3956,6 +3963,7 @@ export function RemoteDisplayWindowPage() {
     isTestBusy,
     localStartBlockReason,
     resolution,
+    selectedLocalPreviewSourceId,
     sessionId,
     webPreviewEngine,
   ]);

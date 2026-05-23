@@ -123,6 +123,36 @@ describe('Tauri Adapter Contract', () => {
       });
     });
 
+    it('browser WebRTC preview start passes selected source id', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue({
+        session_id: 'local-display-test-1',
+        answer_sdp: 'answer-sdp',
+      });
+
+      await adapter.browserWebrtcPreviewStart({
+        sessionId: 'local-display-test-1',
+        offerSdp: 'offer-sdp',
+        fps: 120,
+        width: 2560,
+        height: 1440,
+        h264Profile: 'high',
+        bitrateMbps: 80,
+        sourceId: 'windows:display-shared:1',
+      });
+
+      expect(mockInvoke).toHaveBeenCalledWith('browser_webrtc_preview_start', {
+        sessionId: 'local-display-test-1',
+        offerSdp: 'offer-sdp',
+        fps: 120,
+        width: 2560,
+        height: 1440,
+        h264Profile: 'high',
+        bitrateMbps: 80,
+        sourceId: 'windows:display-shared:1',
+      });
+    });
+
     it('diagnostic commands call registered command names', async () => {
       const mockInvoke = getMockInvoke();
       mockInvoke

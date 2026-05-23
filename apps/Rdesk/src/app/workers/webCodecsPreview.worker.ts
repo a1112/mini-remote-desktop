@@ -35,16 +35,46 @@ type WebCodecsAccessUnitMessage = {
   payload: Uint8Array;
 };
 
-type StartMessage = {
-  type: "start";
-  canvas: OffscreenCanvas;
-  websocketUrl: string;
+type WebCodecsPreviewStartControlInput = {
   sessionId: string;
   fps: number;
   width: number;
   height: number;
   bitrateMbps: number;
   h264Profile: string;
+  sourceId?: string;
+};
+
+export type WebCodecsPreviewStartControlMessage = {
+  type: "start";
+  session_id: string;
+  fps: number;
+  width: number;
+  height: number;
+  bitrate_mbps: number;
+  h264_profile: string;
+  source_id: string | null;
+};
+
+export function buildWebCodecsPreviewStartControlMessage(
+  message: WebCodecsPreviewStartControlInput
+): WebCodecsPreviewStartControlMessage {
+  return {
+    type: "start",
+    session_id: message.sessionId,
+    fps: message.fps,
+    width: message.width,
+    height: message.height,
+    bitrate_mbps: message.bitrateMbps,
+    h264_profile: message.h264Profile,
+    source_id: message.sourceId ?? null,
+  };
+}
+
+type StartMessage = WebCodecsPreviewStartControlInput & {
+  type: "start";
+  canvas: OffscreenCanvas;
+  websocketUrl: string;
   viewportWidth: number;
   viewportHeight: number;
   devicePixelRatio: number;
@@ -471,17 +501,7 @@ function start(message: StartMessage) {
   socket = new WebSocket(message.websocketUrl);
   socket.binaryType = "arraybuffer";
   socket.onopen = () => {
-    socket?.send(
-      JSON.stringify({
-        type: "start",
-        session_id: message.sessionId,
-        fps: message.fps,
-        width: message.width,
-        height: message.height,
-        bitrate_mbps: message.bitrateMbps,
-        h264_profile: message.h264Profile,
-      })
-    );
+    socket?.send(JSON.stringify(buildWebCodecsPreviewStartControlMessage(message)));
   };
   socket.onmessage = (event) => {
     void (async () => {

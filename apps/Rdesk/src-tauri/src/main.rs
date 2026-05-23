@@ -488,10 +488,11 @@ async fn browser_webrtc_preview_start(
     height: Option<u32>,
     h264_profile: Option<String>,
     bitrate_mbps: Option<u32>,
+    source_id: Option<String>,
 ) -> Result<BrowserWebrtcPreviewAnswer, String> {
     ensure_rustls_crypto_provider();
 
-    let _ = (width, height, bitrate_mbps);
+    let _ = (width, height, bitrate_mbps, source_id);
     let session_id = SessionId(session_id);
     let fps = fps.unwrap_or(60).clamp(1, 144);
     let h264_profile = h264_profile.unwrap_or_else(|| "baseline".to_string());

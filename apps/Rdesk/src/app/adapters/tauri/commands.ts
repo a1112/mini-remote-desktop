@@ -301,6 +301,7 @@ export async function browserWebrtcPreviewStart(params: {
   height?: number;
   h264Profile?: "baseline" | "high";
   bitrateMbps?: number;
+  sourceId?: string;
 }): Promise<AdapterResult<BrowserWebrtcPreviewAnswer>> {
   if (shouldUseServiceBridge()) {
     return postServiceBridgeJson<BrowserWebrtcPreviewAnswer>(
@@ -313,6 +314,7 @@ export async function browserWebrtcPreviewStart(params: {
         height: params.height ?? null,
         h264_profile: params.h264Profile ?? null,
         bitrate_mbps: params.bitrateMbps ?? null,
+        source_id: params.sourceId ?? null,
       }
     );
   }
@@ -324,6 +326,7 @@ export async function browserWebrtcPreviewStart(params: {
     height: params.height ?? null,
     h264Profile: params.h264Profile ?? null,
     bitrateMbps: params.bitrateMbps ?? null,
+    sourceId: params.sourceId ?? null,
   });
 }
 

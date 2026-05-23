@@ -184,8 +184,10 @@ describe('commands service bridge integration', () => {
       offerSdp: 'offer-sdp',
       fps: 120,
       h264Profile: 'high',
+      sourceId: 'windows:display-shared:1',
     });
     const stop = await browserWebrtcPreviewStop('local-display-test-1');
+    const startBody = JSON.parse((fetchMock.mock.calls[0]?.[1] as RequestInit).body as string);
 
     expect(start.ok && start.value.answer_sdp).toBe('answer-sdp');
     expect(stop.ok).toBe(true);
@@ -193,6 +195,12 @@ describe('commands service bridge integration', () => {
       1,
       'http://127.0.0.1:9532/browser/webrtc-preview/start',
       expect.objectContaining({ method: 'POST' })
+    );
+    expect(startBody).toEqual(
+      expect.objectContaining({
+        session_id: 'local-display-test-1',
+        source_id: 'windows:display-shared:1',
+      })
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,
