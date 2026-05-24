@@ -11,6 +11,10 @@ import {
   webPreviewTransportLabel,
   browserSupportsWebCodecsWorkerRendering,
   browserWebrtcPreviewH264Profile,
+  browserSupportsWebrtcVideoCodec,
+  webRtcPreviewCodecForEncoder,
+  webCodecsPreviewCodecForEncoder,
+  buildWebCodecsDecoderConfig,
   buildWebRtcDiagnosticsStageRows,
   WebRtcPresentationLatencyTracker,
   shouldAutoSwitchWebRtcVideoToWebCodecs,
@@ -228,6 +232,47 @@ describe("RemoteDisplayWindowPage", () => {
     expect(browserWebrtcPreviewH264Profile("nvenc_h264", "none")).toBe("high");
     expect(browserWebrtcPreviewH264Profile("nvenc_h264", "software")).toBe("high");
     expect(browserWebrtcPreviewH264Profile("openh264", "none")).toBe("baseline");
+  });
+
+  it("selects HEVC only for the browser WebRTC HEVC Main preview path", () => {
+    expect(webRtcPreviewCodecForEncoder("nvenc_h264")).toBe("h264");
+    expect(webRtcPreviewCodecForEncoder("openh264")).toBe("h264");
+    expect(webRtcPreviewCodecForEncoder("nvenc_hevc")).toBe("hevc");
+    expect(webRtcPreviewCodecForEncoder("nvenc_hevc_main10")).toBeNull();
+    expect(webRtcPreviewCodecForEncoder("nvenc_av1")).toBeNull();
+  });
+
+  it("detects browser WebRTC HEVC receive capability beside H.264", () => {
+    vi.stubGlobal("RTCRtpReceiver", {
+      getCapabilities: () => ({
+        codecs: [{ mimeType: "video/H265" }],
+      }),
+    });
+
+    expect(browserSupportsWebrtcVideoCodec("hevc")).toBe(true);
+    expect(browserSupportsWebrtcVideoCodec("h264")).toBe(false);
+  });
+
+  it("selects HEVC for WebCodecs preview when the HEVC encoder is active", () => {
+    expect(webCodecsPreviewCodecForEncoder("nvenc_h264")).toBe("h264");
+    expect(webCodecsPreviewCodecForEncoder("nvenc_hevc")).toBe("hevc");
+    expect(webCodecsPreviewCodecForEncoder("nvenc_hevc_main10")).toBe("h264");
+  });
+
+  it("builds HEVC WebCodecs decoder config without AVC metadata", () => {
+    const config = buildWebCodecsDecoderConfig({
+      type: "mrd.webcodecs.ready.v1",
+      session_id: "s1",
+      codec: "hev1.1.6.L156.B0",
+      codec_format: "annexb",
+      width: 2560,
+      height: 1440,
+      fps: 120,
+      bitrate_mbps: 40,
+    });
+
+    expect(config).toMatchObject({ hevc: { format: "annexb" } });
+    expect("avc" in config).toBe(false);
   });
 
   it("marks browser WebRTC video tracks as motion content", () => {
@@ -854,7 +899,7 @@ describe("RemoteDisplayWindowPage", () => {
           scenarioId: "custom",
           config: expect.objectContaining({
             capture_type: "dxgi",
-            encoder_type: "nvenc_h264",
+            encoder_type: "nvenc_hevc",
             decoder_type: "none",
             transport_kind: "webrtc",
             fps: 144,
@@ -1002,7 +1047,7 @@ describe("RemoteDisplayWindowPage", () => {
     expect(screen.getByText("WebRTC RTP")).toBeInTheDocument();
 
     expect(screen.getByRole("button", { name: "ENC NVENC H.264" })).toBeEnabled();
-    expect(screen.getByRole("button", { name: "ENC NVENC HEVC Main" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "ENC NVENC HEVC Main" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "ENC NVENC AV1" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "FPS 144 FPS" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "FPS 165 FPS" })).toBeDisabled();
@@ -1013,6 +1058,9 @@ describe("RemoteDisplayWindowPage", () => {
 
     expect(screen.getByText("Browser WebCodecs")).toBeInTheDocument();
     expect(screen.getByText("WebSocket AU")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "ENC NVENC HEVC Main" })).toBeEnabled();
+    });
   });
 
   it("uses the selected 60S duration for local display tests", async () => {
@@ -1373,7 +1421,7 @@ describe("RemoteDisplayWindowPage", () => {
     await waitFor(() => {
       expect(startButton).toBeDisabled();
       expect(
-        screen.getByText(/网页 144 FPS 本机采集需要硬件 H\.264 编码器/)
+        screen.getByText(/网页 144 FPS 本机采集需要硬件 H\.264 编码器或 HEVC Main 编码器/)
       ).toBeInTheDocument();
     });
   });

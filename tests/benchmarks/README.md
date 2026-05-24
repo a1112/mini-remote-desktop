@@ -24,6 +24,21 @@ powershell -ExecutionPolicy Bypass -File tests/benchmarks/scripts/run_transport_
   -ScenarioPath tests/benchmarks/scenarios/quick.transport.quic.nvenc.json
 ```
 
+H.264 vs HEVC WebRTC/NVDEC comparison:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tests/benchmarks/scripts/run_transport_matrix.ps1 `
+  -ScenarioPath tests/benchmarks/scenarios/quick.transport.webrtc.nvenc.h264_nvdec.json
+
+powershell -ExecutionPolicy Bypass -File tests/benchmarks/scripts/run_transport_matrix.ps1 `
+  -ScenarioPath tests/benchmarks/scenarios/quick.transport.webrtc.nvenc.hevc_nvdec.json
+```
+
+Compare the generated `summary.json` files for observed FPS, bitrate, keyframes,
+encode/send/decode p95 latency, and NVDEC capability fields. These two scenarios
+use the same capture, transport, renderer, resolution, FPS, and duration; only the
+codec-specific encoder/decoder pair changes.
+
 Paired LAN canary comparison:
 
 ```powershell

@@ -325,6 +325,54 @@ describe("MatrixTestPage failure handling", () => {
     expect(screen.getByLabelText("NVENC HEVC Main10")).toBeInTheDocument();
   });
 
+  it("allows HEVC Main matrix runs over WebRTC RTP when decoder is compatible", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve({
+          os_type: "windows",
+          cpu_brand: "",
+          cpu_cores: 16,
+          memory_gb: 32,
+          gpu_info: "NVIDIA",
+          available_captures: ["dxgi", "synthetic"],
+          available_encoders: ["nvenc_h264", "nvenc_hevc", "openh264"],
+          available_decoders: ["nvdec", "software"],
+          available_renderers: ["none", "d3d11"],
+          available_memory_modes: ["cpu"],
+        });
+      }
+      if (command === "test_start_run") return Promise.resolve("run-1");
+      if (command === "test_get_run") return Promise.resolve(null);
+      return Promise.resolve(null);
+    });
+
+    render(<MatrixTestPage runDelayMs={0} />);
+
+    await screen.findByLabelText("NVENC HEVC Main");
+    fireEvent.click(screen.getByLabelText("OpenH264"));
+    fireEvent.click(screen.getByLabelText("NVENC H.264"));
+    fireEvent.click(screen.getByLabelText("NVENC HEVC Main"));
+    fireEvent.click(screen.getByLabelText("软件"));
+    fireEvent.click(screen.getByLabelText("WebRTC RTP"));
+    fireEvent.click(screen.getByLabelText("720p"));
+    fireEvent.click(screen.getByLabelText("30 FPS"));
+    fireEvent.click(screen.getByRole("button", { name: /启动矩阵测试/ }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_start_run",
+        expect.objectContaining({
+          config: expect.objectContaining({
+            encoder_type: "nvenc_hevc",
+            decoder_type: "nvdec",
+            transport_kind: "webrtc",
+          }),
+        })
+      );
+    });
+  });
+
   it("passes HEVC Main10 D3D11 shared texture matrix runs", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {

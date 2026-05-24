@@ -303,6 +303,7 @@ export async function browserWebrtcPreviewStart(params: {
   fps?: number;
   width?: number;
   height?: number;
+  codec?: "h264" | "hevc";
   h264Profile?: "baseline" | "high";
   bitrateMbps?: number;
   sourceId?: string;
@@ -316,6 +317,7 @@ export async function browserWebrtcPreviewStart(params: {
         fps: params.fps ?? null,
         width: params.width ?? null,
         height: params.height ?? null,
+        codec: params.codec ?? null,
         h264_profile: params.h264Profile ?? null,
         bitrate_mbps: params.bitrateMbps ?? null,
         source_id: params.sourceId ?? null,
@@ -328,6 +330,7 @@ export async function browserWebrtcPreviewStart(params: {
     fps: params.fps ?? null,
     width: params.width ?? null,
     height: params.height ?? null,
+    codec: params.codec ?? null,
     h264Profile: params.h264Profile ?? null,
     bitrateMbps: params.bitrateMbps ?? null,
     sourceId: params.sourceId ?? null,

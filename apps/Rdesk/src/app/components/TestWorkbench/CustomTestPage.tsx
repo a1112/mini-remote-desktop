@@ -195,7 +195,7 @@ const TRANSPORT_OPTIONS: TransportOption[] = [
   {
     id: "webrtc",
     name: "WebRTC RTP",
-    description: "浏览器 RTP 路径，当前仅 H.264/AV1",
+    description: "浏览器 RTP 路径，支持 H.264/HEVC/AV1",
   },
 ];
 
@@ -353,9 +353,6 @@ export function CustomTestPage() {
     if (selectedEncoder === "none" && selectedDecoder !== "none") {
       setSelectedDecoder("none");
     }
-    if (isHevcEncoder(selectedEncoder) && selectedTransport === "webrtc") {
-      setSelectedTransport("quic");
-    }
     if (!isDecoderAvailable(selectedDecoder)) {
       const nextDecoder = DECODER_OPTIONS.find((option) => isDecoderAvailable(option.id));
       if (nextDecoder) setSelectedDecoder(nextDecoder.id);
@@ -421,9 +418,6 @@ export function CustomTestPage() {
       (selectedDecoder === "linux_hevc" || selectedDecoder === "linux_hevc_main10")
     ) {
       return "Linux HEVC 硬解不能解码 H.264 输出。";
-    }
-    if (isHevcEncoder(selectedEncoder) && selectedTransport === "webrtc") {
-      return "HEVC WebRTC RTP 打包尚未接入，请使用 QUIC Datagram 或 Loopback。";
     }
     if (selectedEncoder === "videotoolbox_h264" && selectedDecoder === "nvdec") {
       return "VideoToolbox H.264 是 macOS 原生路径，请选择 VideoToolbox、软件解码或 encode-only。";
@@ -688,43 +682,34 @@ export function CustomTestPage() {
         <div className="bg-card rounded-lg border p-4">
           <h3 className="font-medium mb-3">传输层</h3>
           <div className="space-y-2">
-            {TRANSPORT_OPTIONS.map((option) => {
-              const hevcWebrtcBlocked = isHevcEncoder(selectedEncoder) && option.id === "webrtc";
-              return (
-                <label
-                  key={option.id}
-                  className={`flex items-start gap-3 p-3 rounded cursor-pointer border transition-colors ${
-                    selectedTransport === option.id
-                      ? "bg-primary/10 border-primary"
-                      : "bg-background hover:bg-muted"
-                  } ${hevcWebrtcBlocked ? "opacity-50 cursor-not-allowed" : ""}`}
-                >
-                  <input
-                    type="radio"
-                    name="transport"
-                    value={option.id}
-                    checked={selectedTransport === option.id}
-                    onChange={(e) => setSelectedTransport(e.target.value as TransportId)}
-                    className="mt-1"
-                    disabled={hevcWebrtcBlocked}
-                  />
-                  <div className="flex-1">
-                    <div className="flex items-center gap-2 font-medium text-sm">
-                      {option.name}
-                      <span className="text-xs bg-muted px-1 rounded">
-                        {capabilityTag(option.id)}
-                      </span>
-                      {hevcWebrtcBlocked && (
-                        <span className="text-xs bg-yellow-100 text-yellow-800 px-1 rounded">
-                          HEVC 未接入
-                        </span>
-                      )}
-                    </div>
-                    <p className="text-xs text-muted-foreground mt-1">{option.description}</p>
+            {TRANSPORT_OPTIONS.map((option) => (
+              <label
+                key={option.id}
+                className={`flex items-start gap-3 p-3 rounded cursor-pointer border transition-colors ${
+                  selectedTransport === option.id
+                    ? "bg-primary/10 border-primary"
+                    : "bg-background hover:bg-muted"
+                }`}
+              >
+                <input
+                  type="radio"
+                  name="transport"
+                  value={option.id}
+                  checked={selectedTransport === option.id}
+                  onChange={(e) => setSelectedTransport(e.target.value as TransportId)}
+                  className="mt-1"
+                />
+                <div className="flex-1">
+                  <div className="flex items-center gap-2 font-medium text-sm">
+                    {option.name}
+                    <span className="text-xs bg-muted px-1 rounded">
+                      {capabilityTag(option.id)}
+                    </span>
                   </div>
-                </label>
-              );
-            })}
+                  <p className="text-xs text-muted-foreground mt-1">{option.description}</p>
+                </div>
+              </label>
+            ))}
           </div>
         </div>
       </div>

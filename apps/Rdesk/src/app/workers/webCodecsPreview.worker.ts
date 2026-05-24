@@ -41,6 +41,7 @@ type WebCodecsPreviewStartControlInput = {
   width: number;
   height: number;
   bitrateMbps: number;
+  codec: "h264" | "hevc";
   h264Profile: string;
   sourceId?: string;
 };
@@ -52,6 +53,7 @@ export type WebCodecsPreviewStartControlMessage = {
   width: number;
   height: number;
   bitrate_mbps: number;
+  codec: "h264" | "hevc";
   h264_profile: string;
   source_id: string | null;
 };
@@ -66,6 +68,7 @@ export function buildWebCodecsPreviewStartControlMessage(
     width: message.width,
     height: message.height,
     bitrate_mbps: message.bitrateMbps,
+    codec: message.codec,
     h264_profile: message.h264Profile,
     source_id: message.sourceId ?? null,
   };
@@ -385,6 +388,29 @@ function requestKeyframe(reason: string) {
   }
 }
 
+function isHevcWebCodecsCodec(codec: string) {
+  return /^(hev1|hvc1)\./i.test(codec);
+}
+
+export function buildWebCodecsVideoDecoderConfig(ready: WebCodecsReadyMessage) {
+  const base = {
+    codec: ready.codec,
+    codedWidth: ready.width,
+    codedHeight: ready.height,
+    hardwareAcceleration: isHevcWebCodecsCodec(ready.codec) ? "prefer-hardware" : "prefer-software",
+    optimizeForLatency: true,
+  } satisfies VideoDecoderConfig;
+  return isHevcWebCodecsCodec(ready.codec)
+    ? ({
+        ...base,
+        hevc: { format: "annexb" },
+      } as VideoDecoderConfig & { hevc: { format: "annexb" } })
+    : ({
+        ...base,
+        avc: { format: "annexb" },
+      } as VideoDecoderConfig & { avc: { format: "annexb" } });
+}
+
 function handleDecodedFrame(frame: VideoFrame) {
   try {
     const now = performance.now();
@@ -428,14 +454,7 @@ function handleDecodedFrame(frame: VideoFrame) {
 
 async function configureDecoder(ready: WebCodecsReadyMessage) {
   if (configured || !decoder) return;
-  const config = {
-    codec: ready.codec,
-    codedWidth: ready.width,
-    codedHeight: ready.height,
-    hardwareAcceleration: "prefer-software",
-    optimizeForLatency: true,
-    avc: { format: "annexb" },
-  } as VideoDecoderConfig & { avc: { format: "annexb" } };
+  const config = buildWebCodecsVideoDecoderConfig(ready);
   const support = await VideoDecoder.isConfigSupported(config).catch(() => null);
   if (support && !support.supported) {
     throw new Error(`WebCodecs worker decoder does not support ${ready.codec} annexb`);

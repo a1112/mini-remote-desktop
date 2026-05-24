@@ -28,6 +28,7 @@ use app_settings::{
     default_settings_path, load_settings, save_settings, AppSettings, DecodePolicy,
 };
 use device_info::HardwareInfo;
+use mrd_pipeline_core::VideoCodec;
 use mrd_proto::SessionId;
 use remote_display_surface::{
     NativeRenderSurfaceSnapshot, NativeSurfaceRect, RemoteDisplaySurfaceManager,
@@ -715,6 +716,7 @@ async fn browser_webrtc_preview_start(
     fps: Option<u32>,
     width: Option<u32>,
     height: Option<u32>,
+    codec: Option<String>,
     h264_profile: Option<String>,
     bitrate_mbps: Option<u32>,
     source_id: Option<String>,
@@ -725,6 +727,7 @@ async fn browser_webrtc_preview_start(
     let session_id = SessionId(session_id);
     let fps = fps.unwrap_or(60).clamp(1, 144);
     let h264_profile = h264_profile.unwrap_or_else(|| "baseline".to_string());
+    let codec = browser_webrtc_preview_codec_from_label(codec.as_deref())?;
     let encoded_access_units = state
         .test_harness
         .lock()
@@ -733,16 +736,75 @@ async fn browser_webrtc_preview_start(
     let mut host = state.webrtc_host.lock().await;
     host.apply_remote_offer(session_id.clone(), offer_sdp)
         .await?;
-    host.prepare_browser_h264_sender(session_id.clone(), fps, &h264_profile)
-        .await?;
+    match codec {
+        VideoCodec::H264 => {
+            host.prepare_browser_h264_sender(session_id.clone(), fps, &h264_profile)
+                .await?;
+        }
+        VideoCodec::Hevc => {
+            host.prepare_browser_hevc_sender(session_id.clone(), fps)
+                .await?;
+        }
+        VideoCodec::Av1 => {
+            return Err("browser WebRTC preview does not support AV1".to_string());
+        }
+    }
     let answer = host.create_answer(session_id.clone()).await?;
-    host.start_encoded_access_unit_sender(session_id, fps, &h264_profile, encoded_access_units)
-        .await?;
+    host.start_encoded_access_unit_sender_with_codec(
+        session_id,
+        fps,
+        codec,
+        &h264_profile,
+        encoded_access_units,
+    )
+    .await?;
 
     Ok(BrowserWebrtcPreviewAnswer {
         session_id: answer.session_id.0,
         answer_sdp: answer.sdp,
     })
+}
+
+fn browser_webrtc_preview_codec_from_label(codec: Option<&str>) -> Result<VideoCodec, String> {
+    match codec
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        None | Some("h264" | "avc" | "avc1") => Ok(VideoCodec::H264),
+        Some("hevc" | "h265" | "hev1" | "hvc1") => Ok(VideoCodec::Hevc),
+        Some("av1") => Err("browser WebRTC preview does not support AV1".to_string()),
+        Some(other) => Err(format!("unsupported browser WebRTC preview codec: {other}")),
+    }
+}
+
+#[cfg(test)]
+mod browser_webrtc_preview_tests {
+    use super::*;
+
+    #[test]
+    fn browser_webrtc_preview_codec_labels_parse_h264_and_hevc() {
+        assert_eq!(
+            browser_webrtc_preview_codec_from_label(None).unwrap(),
+            VideoCodec::H264
+        );
+        assert_eq!(
+            browser_webrtc_preview_codec_from_label(Some("h265")).unwrap(),
+            VideoCodec::Hevc
+        );
+        assert_eq!(
+            browser_webrtc_preview_codec_from_label(Some("hevc")).unwrap(),
+            VideoCodec::Hevc
+        );
+    }
+
+    #[test]
+    fn browser_webrtc_preview_codec_rejects_av1() {
+        let error = browser_webrtc_preview_codec_from_label(Some("av1")).unwrap_err();
+
+        assert!(error.contains("does not support AV1"));
+    }
 }
 
 #[tauri::command]
