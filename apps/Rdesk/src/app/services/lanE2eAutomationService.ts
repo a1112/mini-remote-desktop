@@ -87,6 +87,7 @@ export interface LanE2EAutomationOptions {
   displayModePolicy?: "none" | "temporary" | "required";
   preferredCaptureSourceId?: string;
   preferredCaptureSourceKind?: string;
+  preferredRenderDisplaySourceId?: string;
   expectedPeerBuildId?: string;
   renderProfileCap?: boolean;
   adaptive?: boolean;
@@ -178,6 +179,8 @@ export interface LanE2EAutomationCommands {
   ipcStartReceiver(sessionId: string): Promise<AdapterResult<string>>;
   openRemoteDisplayWindow(params: {
     sessionId: string;
+    preferredDisplaySourceId?: string;
+    avoidCaptureSourceId?: string;
   }): Promise<AdapterResult<RemoteDisplayWindowContext>>;
   ipcSessionSnapshot(sessionId: string): Promise<AdapterResult<SessionRuntimeSnapshot>>;
   ipcProbeSnapshot(sessionId: string): Promise<AdapterResult<ProbeSnapshot>>;
@@ -486,12 +489,14 @@ export async function runLanE2EAutomation(
         if (captureSource) {
           stage("capture_source", "started");
           try {
+            const refreshSourceId =
+              options.preferredCaptureSourceId?.trim() ||
+              displayModeChange.active?.source_id ||
+              captureSource.id;
             captureSourceSelection = await selectRemoteCaptureSourceForSession(
               commands,
               sessionId,
-              options.preferredCaptureSourceId,
-              options.preferredCaptureSourceKind,
-              requestedProfile
+              refreshSourceId
             );
             captureSource = captureSourceSelection.source;
             stage("capture_source", "completed");
@@ -535,7 +540,15 @@ export async function runLanE2EAutomation(
 
     stage("display", "started");
     displayWindow = await unwrap(
-      commands.openRemoteDisplayWindow({ sessionId }),
+      commands.openRemoteDisplayWindow({
+        sessionId,
+        ...(options.preferredRenderDisplaySourceId
+          ? { preferredDisplaySourceId: options.preferredRenderDisplaySourceId }
+          : {}),
+        ...(captureSource
+          ? { avoidCaptureSourceId: captureSourceDisplayPlacementRef(captureSource) }
+          : {}),
+      }),
       "display_window_failed"
     );
 
@@ -1035,7 +1048,20 @@ async function selectRemoteCaptureSourceForSession(
     "capture_source_failed"
   );
   const normalizedPreferredSourceId = preferredSourceId?.trim().toLowerCase();
-  if (!normalizedPreferredSourceId && requestedProfile) {
+  if (normalizedPreferredSourceId) {
+    const preferredSource = sources.find(
+      (source) => source.id.toLowerCase() === normalizedPreferredSourceId
+    );
+    if (!preferredSource) {
+      throw new LanE2ECommandError(
+        "capture_source_failed",
+        `Requested remote capture source is unavailable: ${preferredSourceId?.trim()}`
+      );
+    }
+    return selectRemoteCaptureSource(commands, sessionId, preferredSource);
+  }
+
+  if (requestedProfile) {
     const profileAwareSelection = await selectDisplayCaptureSourceForProfile(
       commands,
       sessionId,
@@ -1046,10 +1072,7 @@ async function selectRemoteCaptureSourceForSession(
     if (profileAwareSelection) return profileAwareSelection;
   }
 
-  const preferredSource =
-    (normalizedPreferredSourceId
-      ? sources.find((source) => source.id.toLowerCase() === normalizedPreferredSourceId)
-      : undefined) ?? pickPreferredCaptureSource(sources, preferredSourceKind);
+  const preferredSource = pickPreferredCaptureSource(sources, preferredSourceKind);
   if (!preferredSource) {
     throw new LanE2ECommandError(
       "capture_source_failed",
@@ -1057,17 +1080,38 @@ async function selectRemoteCaptureSourceForSession(
     );
   }
 
+  return selectRemoteCaptureSource(commands, sessionId, preferredSource);
+}
+
+async function selectRemoteCaptureSource(
+  commands: LanE2EAutomationCommands,
+  sessionId: string,
+  source: CaptureSource
+): Promise<CaptureSourceSelection> {
   const selection = await unwrap(
-    commands.ipcSelectRemoteCaptureSource(sessionId, preferredSource.id),
+    commands.ipcSelectRemoteCaptureSource(sessionId, source.id),
     "capture_source_failed"
   );
   if (selection.status.toLowerCase() !== "selected") {
     throw new LanE2ECommandError(
       "capture_source_failed",
-      selection.reason ?? `Remote capture source rejected: ${preferredSource.id}`
+      selection.reason ?? `Remote capture source rejected: ${source.id}`
     );
   }
   return selection;
+}
+
+function captureSourceDisplayPlacementRef(source: CaptureSource): string {
+  if (!source.source_kind.toLowerCase().includes("display")) return source.id;
+  return displayNameRefFromCaptureSource(source) ?? source.id;
+}
+
+function displayNameRefFromCaptureSource(source: CaptureSource): string | undefined {
+  for (const candidate of [source.class_name, source.title]) {
+    const value = candidate?.trim();
+    if (value && /DISPLAY\d+/i.test(value)) return value;
+  }
+  return undefined;
 }
 
 async function selectDisplayCaptureSourceForProfile(

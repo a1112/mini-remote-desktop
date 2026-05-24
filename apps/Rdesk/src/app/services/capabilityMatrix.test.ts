@@ -442,8 +442,11 @@ describe("capability profiles", () => {
       height: 1440,
       fps: 144,
       bitrate_mbps: 64,
-      codec: "h264",
+      codec: "hevc",
     });
+    expect(profile?.required_capabilities).toContain("encode.nvenc_hevc");
+    expect(profile?.required_capabilities).toContain("decode.nvdec_hevc");
+    expect(profile?.required_capabilities).toContain("media.hevc_main_420_8bit");
     expect(profile?.required_capabilities).toContain("transport.quic_datagram");
     expect(profile?.required_capabilities).toContain("transport.media_profile_control_v1");
   });
@@ -457,8 +460,11 @@ describe("capability profiles", () => {
       height: 1600,
       fps: 165,
       bitrate_mbps: 80,
-      codec: "h264",
+      codec: "hevc",
     });
+    expect(profile?.required_capabilities).toContain("encode.nvenc_hevc");
+    expect(profile?.required_capabilities).toContain("decode.nvdec_hevc");
+    expect(profile?.required_capabilities).toContain("media.hevc_main_420_8bit");
     expect(profile?.required_capabilities).toContain("transport.quic_datagram");
     expect(profile?.required_capabilities).toContain("transport.media_profile_control_v1");
   });
@@ -466,7 +472,13 @@ describe("capability profiles", () => {
   it("marks a profile ready only when all required capabilities are available", () => {
     const snapshot = withAvailableCapabilities(
       buildCapabilitySnapshotFromEnvironment(windowsEnvironment),
-      ["transport.quic_datagram", "transport.media_profile_control_v1"]
+      [
+        "encode.nvenc_hevc",
+        "decode.nvdec_hevc",
+        "media.hevc_main_420_8bit",
+        "transport.quic_datagram",
+        "transport.media_profile_control_v1",
+      ]
     );
 
     const result = evaluateProfileSupport("lan.2k144", snapshot);

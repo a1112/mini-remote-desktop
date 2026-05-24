@@ -381,8 +381,8 @@ fn read_jsonl_lossy<T: for<'de> Deserialize<'de>>(
 }
 
 fn matches_time(timestamp: u64, query: &TelemetryQuery) -> bool {
-    query.start_ms.map_or(true, |start| timestamp >= start)
-        && query.end_ms.map_or(true, |end| timestamp <= end)
+    query.start_ms.is_none_or(|start| timestamp >= start)
+        && query.end_ms.is_none_or(|end| timestamp <= end)
 }
 
 fn compute_aggregation(samples: &[TelemetryMetricPoint]) -> TelemetryMetricAggregation {

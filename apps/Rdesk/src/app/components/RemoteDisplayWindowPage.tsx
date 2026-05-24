@@ -51,6 +51,7 @@ import {
 import {
   getProbeSnapshot,
   getSessionSnapshot,
+  listLocalCaptureSources,
   listRemoteCaptureSources,
   selectRemoteCaptureSource,
   startReceiver,
@@ -89,7 +90,8 @@ type LocalTestSelection = Partial<LocalWebViewProfile> & {
 const METRICS_POLL_MS = 500;
 const WEB_PREVIEW_CONNECT_TIMEOUT_MS = 8_000;
 const WEB_VIEW_MAX_FPS = 144;
-const DIAGNOSTICS_SAMPLE_LIMIT = 90;
+const DIAGNOSTICS_SAMPLE_LIMIT = 60;
+const DIAGNOSTICS_SAMPLE_INTERVAL_MS = 1_500;
 
 type Option<T extends string> = {
   value: T;
@@ -412,6 +414,18 @@ function pickPreferredCaptureSource(sources: CaptureSource[]) {
     sources[0] ??
     null
   );
+}
+
+function localCaptureSourceSelection(
+  sessionId: string,
+  source: CaptureSource
+): CaptureSourceSelection {
+  return {
+    session_id: sessionId,
+    source,
+    status: "selected",
+    reason: null,
+  };
 }
 
 function isNvencSharedTextureEncoder(encoder: EncoderType) {
@@ -1556,8 +1570,10 @@ function TileOptionGroup<T extends string>({
               type="button"
               aria-label={`${label} ${option.label}`}
               className={`min-h-8 rounded-md border px-2 py-1 text-[11px] font-medium transition ${
-                selected
-                  ? "border-cyan-300/60 bg-cyan-500/20 text-cyan-50"
+                selected && optionDisabled
+                  ? "cursor-not-allowed border-cyan-300/30 bg-cyan-500/10 text-cyan-100/60"
+                  : selected
+                    ? "border-cyan-300/60 bg-cyan-500/20 text-cyan-50"
                   : optionDisabled
                     ? "cursor-not-allowed border-white/8 bg-white/[0.03] text-slate-600"
                     : "border-white/10 bg-white/[0.03] text-slate-200 hover:border-cyan-300/45 hover:bg-cyan-500/12"
@@ -1605,8 +1621,10 @@ function MultiTileOptionGroup<T extends string>({
               type="button"
               aria-label={`${label} ${option.label}`}
               className={`min-h-8 rounded-md border px-2 py-1 text-[11px] font-medium transition ${
-                selected
-                  ? "border-violet-300/60 bg-violet-500/20 text-violet-50"
+                selected && optionDisabled
+                  ? "cursor-not-allowed border-violet-300/30 bg-violet-500/10 text-violet-100/60"
+                  : selected
+                    ? "border-violet-300/60 bg-violet-500/20 text-violet-50"
                   : optionDisabled
                     ? "cursor-not-allowed border-white/8 bg-white/[0.03] text-slate-600"
                     : "border-white/10 bg-white/[0.03] text-slate-200 hover:border-violet-300/45 hover:bg-violet-500/12"
@@ -1881,6 +1899,9 @@ export function RemoteDisplayWindowPage() {
   const sessionId = id ?? context?.session_id ?? "local-preview";
   const activeSurfaceId = context?.surface_id ?? surfaceId;
   const isLocalPipelinePreview = isLocalPipelinePreviewSession(sessionId);
+  const selectedLocalPreviewSourceId = isLocalPipelinePreview
+    ? captureSourceSelection?.source.id
+    : undefined;
   const hostOs = normalizeOs(capabilities?.os_type);
   const requestedResolution = useMemo(() => resolutionFromSearch(searchParams), [searchParams]);
   const requestedFps = useMemo(() => fpsFromSearch(searchParams), [searchParams]);
@@ -2244,8 +2265,13 @@ export function RemoteDisplayWindowPage() {
     "receiver.present",
     "receiver.render_upload",
     "render_upload",
+    "render_present",
     "present",
     "render",
+  ]);
+  const stageRenderLockWaitP95Ms = findStageP95(mediaPipelineSnapshot, [
+    "receiver.render_lock_wait",
+    "render_lock_wait",
   ]);
   const diagnosticsFps =
     probeSnapshot?.current_fps ??
@@ -2289,6 +2315,10 @@ export function RemoteDisplayWindowPage() {
     probeSnapshot?.bitrate_mbps ?? mediaPipelineSnapshot?.active_bitrate_mbps ?? Number(bitrate);
   const diagnosticsDroppedFrames =
     metrics?.dropped_frames ?? webRtcReceiverStats?.framesDropped ?? remoteDropTotal ?? null;
+  const diagnosticsRenderQueueReplacements =
+    mediaPipelineSnapshot?.render_queue_replacements ?? null;
+  const diagnosticsRenderLockDrops = mediaPipelineSnapshot?.render_lock_drops ?? null;
+  const diagnosticsRenderPresentSkips = mediaPipelineSnapshot?.render_present_skips ?? null;
   const diagnosticsDropRatio =
     metrics && metrics.frame_count > 0
       ? metrics.dropped_frames / metrics.frame_count * 100
@@ -2546,18 +2576,18 @@ export function RemoteDisplayWindowPage() {
         ...current,
         atMs: Date.now(),
       };
-      setDiagnosticsSamples((samples) => {
-        const next = [...samples, nextSample];
-        const bounded = next.slice(Math.max(0, next.length - DIAGNOSTICS_SAMPLE_LIMIT));
-        diagnosticsSamplesRef.current = bounded;
-        return bounded;
-      });
+      const next = [...diagnosticsSamplesRef.current, nextSample];
+      const bounded = next.slice(Math.max(0, next.length - DIAGNOSTICS_SAMPLE_LIMIT));
+      diagnosticsSamplesRef.current = bounded;
+      if (diagnosticsVisible) {
+        setDiagnosticsSamples(bounded);
+      }
     };
 
     record();
-    const interval = window.setInterval(record, 1_000);
+    const interval = window.setInterval(record, DIAGNOSTICS_SAMPLE_INTERVAL_MS);
     return () => window.clearInterval(interval);
-  }, [sessionId]);
+  }, [diagnosticsVisible, sessionId]);
 
   useEffect(() => {
     if (!diagnosticsVisible) return;
@@ -2618,6 +2648,7 @@ export function RemoteDisplayWindowPage() {
     const selectedFps = selection?.fps ?? fps;
     const selectedBitrate = selection?.bitrate ?? bitrate;
     const selectedResolution = selection?.resolution ?? resolution;
+    const selectedLocalSource = isLocalPipelinePreview ? captureSourceSelection?.source : null;
     const [width, height] = selectedResolution.split("x").map(Number) as [number, number];
     const selectedUsesNativeSharedTexture =
       nativeRendererType === "d3d11" &&
@@ -2642,16 +2673,25 @@ export function RemoteDisplayWindowPage() {
         isNative && (rendererTargetHwnd || nativeRendererType === "linux")
       ),
       zero_copy: selectedUsesNativeSharedTexture,
+      ...(selectedLocalSource
+        ? {
+            source_id: selectedLocalSource.id,
+            source_kind: selectedLocalSource.source_kind,
+            display_id: selectedLocalSource.id,
+          }
+        : {}),
       ...(nativeRendererType ? { renderer_type: nativeRendererType } : {}),
       ...(isNative && rendererTargetHwnd ? { renderer_target_hwnd: rendererTargetHwnd } : {}),
     } satisfies TestConfig;
   }, [
     bitrate,
     capture,
+    captureSourceSelection,
     decoder,
     encoder,
     fps,
     isNative,
+    isLocalPipelinePreview,
     nativeRendererType,
     resolution,
     selectedDurationMs,
@@ -3028,12 +3068,16 @@ export function RemoteDisplayWindowPage() {
   }, []);
 
   const switchToNativeRender = useCallback(() => {
+    if (localRenderSwitchLocked) {
+      setTestMessage("请先停止测试再切换 native 渲染路径");
+      return;
+    }
     if (!nativeRendererAvailableForHost) return;
     closeWebPreviewPeer();
     setWebPreviewMode("idle");
     setWebPreviewEngine("webrtc");
     setRenderMode(nativeRenderMode);
-  }, [closeWebPreviewPeer, nativeRenderMode, nativeRendererAvailableForHost]);
+  }, [closeWebPreviewPeer, localRenderSwitchLocked, nativeRenderMode, nativeRendererAvailableForHost]);
 
   const switchToD3d12Render = useCallback(() => {
     if (!d3d12RendererAvailable || localRenderSwitchLocked) return;
@@ -3465,6 +3509,7 @@ export function RemoteDisplayWindowPage() {
           height: Number(resolution.split("x")[1]),
           bitrateMbps: Number(bitrate),
           h264Profile: browserWebrtcPreviewH264Profile(encoder, decoder),
+          sourceId: selectedLocalPreviewSourceId,
         });
         if (cancelled) return;
         if (!answer.ok) {
@@ -3507,6 +3552,7 @@ export function RemoteDisplayWindowPage() {
     isTestBusy,
     localStartBlockReason,
     resolution,
+    selectedLocalPreviewSourceId,
     sessionId,
     webCodecsCanvasEpoch,
     webPreviewEngine,
@@ -3660,6 +3706,7 @@ export function RemoteDisplayWindowPage() {
             height: Number(resolution.split("x")[1]),
             bitrateMbps: Number(bitrate),
             h264Profile: "baseline",
+            sourceId: selectedLocalPreviewSourceId,
             ...viewport(),
           },
           [offscreenCanvas]
@@ -3848,6 +3895,7 @@ export function RemoteDisplayWindowPage() {
           height: Number(resolution.split("x")[1]),
           bitrate_mbps: Number(bitrate),
           h264_profile: "baseline",
+          source_id: selectedLocalPreviewSourceId ?? null,
         })
       );
     };
@@ -3925,6 +3973,7 @@ export function RemoteDisplayWindowPage() {
     isTestBusy,
     localStartBlockReason,
     resolution,
+    selectedLocalPreviewSourceId,
     sessionId,
     webPreviewEngine,
   ]);
@@ -4049,6 +4098,10 @@ export function RemoteDisplayWindowPage() {
   };
 
   const applyLowLatencyProfile = useCallback(() => {
+    if (localRenderSwitchLocked) {
+      setTestMessage("请先停止测试再切换低延迟预设");
+      return;
+    }
     setWebPreviewEngine("webrtc");
     if (hostOs === "macos") {
       setCapture("macos");
@@ -4100,7 +4153,7 @@ export function RemoteDisplayWindowPage() {
         ? "d3d11_native"
         : "web"
     );
-  }, [capabilities, hostOs]);
+  }, [capabilities, hostOs, localRenderSwitchLocked]);
 
   const applyBrowserWebRtc2k144LowLatencyProfile = useCallback(() => {
     if (browserWebRtc2k144BlockReason) {
@@ -4243,15 +4296,14 @@ export function RemoteDisplayWindowPage() {
     }
   }, [buildRemoteMediaProfile, isLocalPipelinePreview, sessionId, transport]);
 
-  const hydrateRemoteCaptureSourcePreviews = useCallback(async (sources: CaptureSource[]) => {
-    if (isLocalPipelinePreview || sources.length === 0) return;
+  const hydrateCaptureSourcePreviews = useCallback(async (sources: CaptureSource[]) => {
+    if (sources.length === 0) return;
 
     try {
-      const previewSources = await listRemoteCaptureSources(
-        sessionId,
-        true,
-        Math.min(sources.length, 8)
-      );
+      const previewLimit = Math.min(sources.length, 8);
+      const previewSources = isLocalPipelinePreview
+        ? await listLocalCaptureSources(true, previewLimit)
+        : await listRemoteCaptureSources(sessionId, true, previewLimit);
       const previewById = new Map(previewSources.map((source) => [source.id, source]));
       setCaptureSources((currentSources) =>
         currentSources.map((source) => {
@@ -4270,21 +4322,21 @@ export function RemoteDisplayWindowPage() {
     }
   }, [isLocalPipelinePreview, sessionId]);
 
-  const handleRefreshRemoteCaptureSources = useCallback(async () => {
-    if (isLocalPipelinePreview) return;
-
+  const handleRefreshCaptureSources = useCallback(async () => {
     setCaptureSourcesLoading(true);
     setLastError(null);
-    setTestMessage("正在枚举远端捕获源");
+    setTestMessage(isLocalPipelinePreview ? "正在枚举本机捕获源" : "正在枚举远端捕获源");
     try {
-      const sources = await listRemoteCaptureSources(sessionId, false, 24);
+      const sources = isLocalPipelinePreview
+        ? await listLocalCaptureSources(false, 24)
+        : await listRemoteCaptureSources(sessionId, false, 24);
       const nextSources = Array.isArray(sources) ? sources : [];
       setCaptureSources(nextSources);
-      void hydrateRemoteCaptureSourcePreviews(nextSources);
+      void hydrateCaptureSourcePreviews(nextSources);
       setTestMessage(
         nextSources.length > 0
-          ? `已获取 ${nextSources.length} 个远端捕获源`
-          : "未发现可捕获的远端窗口/屏幕"
+          ? `已获取 ${nextSources.length} 个${isLocalPipelinePreview ? "本机" : "远端"}捕获源`
+          : `未发现可捕获的${isLocalPipelinePreview ? "本机" : "远端"}窗口/屏幕`
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -4294,14 +4346,23 @@ export function RemoteDisplayWindowPage() {
     } finally {
       setCaptureSourcesLoading(false);
     }
-  }, [hydrateRemoteCaptureSourcePreviews, isLocalPipelinePreview, sessionId]);
+  }, [hydrateCaptureSourcePreviews, isLocalPipelinePreview, sessionId]);
 
-  const handleSelectRemoteCaptureSource = useCallback(
+  const handleSelectCaptureSource = useCallback(
     async (source: CaptureSource) => {
-      if (isLocalPipelinePreview) return;
-
       setLastError(null);
-      setTestMessage(`正在切换远端捕获源: ${captureSourceKindLabel(source.source_kind)} / ${source.title}`);
+      if (isLocalPipelinePreview) {
+        const selection = localCaptureSourceSelection(sessionId, source);
+        setCaptureSourceSelection(selection);
+        setTestMessage(
+          `本机捕获源已切换: ${captureSourceKindLabel(source.source_kind)} / ${source.title}`
+        );
+        return;
+      }
+
+      setTestMessage(
+        `正在切换远端捕获源: ${captureSourceKindLabel(source.source_kind)} / ${source.title}`
+      );
       try {
         const selection = await selectRemoteCaptureSource(sessionId, source.id);
         setCaptureSourceSelection(selection);
@@ -4903,6 +4964,13 @@ export function RemoteDisplayWindowPage() {
     !isTestBusy &&
     ["completed", "failed", "cancelled"].includes(lastCompletedRun.status);
   const primaryActionBlocked = Boolean(!isTestBusy && localStartBlockReason);
+  const captureSourceScopeLabel = isLocalPipelinePreview ? "本机捕获源" : "远端捕获源";
+  const captureSourceDescription = isLocalPipelinePreview
+    ? "默认优先本机全屏 shared copy，可切换到当前连接的其他显示器。"
+    : "默认优先全屏 shared copy，可切换全屏 copy 或单窗口源。";
+  const captureSourceEmptyMessage = isLocalPipelinePreview
+    ? "暂无捕获源。点击刷新从本机服务获取当前显示器列表。"
+    : "暂无捕获源。点击刷新从远端设备获取当前全屏/窗口列表。";
   const renderCaptureSourceCards = (closeAfterSelect = false) => (
     <div className="grid max-h-80 gap-3 overflow-y-auto pr-1 sm:grid-cols-2 lg:grid-cols-3">
       {captureSources.map((source) => {
@@ -4913,7 +4981,7 @@ export function RemoteDisplayWindowPage() {
             type="button"
             aria-label={`选择 ${source.title}`}
             onClick={() => {
-              void handleSelectRemoteCaptureSource(source);
+              void handleSelectCaptureSource(source);
               if (closeAfterSelect) setCaptureSourcePickerOpen(false);
             }}
             className={[
@@ -5061,7 +5129,10 @@ export function RemoteDisplayWindowPage() {
               <span>{formatMs(diagnosticsLatencyP95Ms)}</span>
             </button>
             {diagnosticsVisible ? (
-              <div className="absolute right-0 top-9 z-50 max-h-[min(72vh,520px)] w-[420px] overflow-y-auto rounded-md border border-emerald-400/20 bg-[#03140f]/95 p-4 text-[11px] text-emerald-50 shadow-2xl shadow-emerald-950/60 backdrop-blur">
+              <div
+                className="fixed right-4 top-16 z-[1000] max-h-[calc(100vh-5rem)] w-[min(420px,calc(100vw-2rem))] overflow-y-auto rounded-md border border-emerald-400/20 bg-[#03140f]/95 p-4 text-[11px] text-emerald-50 shadow-2xl shadow-emerald-950/60 backdrop-blur"
+                data-testid="remote-diagnostics-popover"
+              >
                 <div className="mb-3 flex items-center justify-between">
                   <div className="flex items-center gap-2">
                     <span className="h-2 w-2 rounded-full bg-emerald-300" />
@@ -5278,6 +5349,13 @@ export function RemoteDisplayWindowPage() {
                       ],
                       ["延迟", `${diagnosticsLatencyLabel}: ${formatMs(diagnosticsLatencyP95Ms)}`],
                       ["丢包/掉帧", `${formatPercent(diagnosticsDropRatio)} / ${formatCount(diagnosticsDroppedFrames)}`],
+                      [
+                        "渲染丢帧细分",
+                        `队列 ${formatCount(diagnosticsRenderQueueReplacements)} / 锁 ${formatCount(
+                          diagnosticsRenderLockDrops
+                        )} / Present ${formatCount(diagnosticsRenderPresentSkips)}`,
+                      ],
+                      ["渲染锁等待 p95", formatMs(stageRenderLockWaitP95Ms)],
                       ["队列深度", formatCount(diagnosticsQueueDepth)],
                       ["码率", formatMbps(diagnosticsBitrateMbps)],
                     ]}
@@ -5353,6 +5431,9 @@ export function RemoteDisplayWindowPage() {
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 px-4"
           style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}
           data-no-drag="true"
+          role="dialog"
+          aria-modal="true"
+          aria-label="测试配置"
         >
           <div className="flex max-h-[calc(100vh-2rem)] w-full max-w-5xl flex-col rounded-lg border border-white/10 bg-[#0f1724] shadow-2xl">
             <div className="flex items-center justify-between border-b border-white/10 px-4 py-3">
@@ -5488,6 +5569,11 @@ export function RemoteDisplayWindowPage() {
             </div>
 
             <div className="min-h-0 space-y-3 overflow-y-auto px-4 py-4">
+              {localRenderSwitchLocked && (
+                <div className="rounded-lg border border-amber-400/25 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-100">
+                  当前测试运行中；停止后修改才会影响下一次启动
+                </div>
+              )}
               <div className="grid gap-3 lg:grid-cols-[1.2fr_1fr]">
                 <div className="rounded-lg border border-white/10 bg-black/18 p-3">
                   <div className="mb-2 flex items-center justify-between gap-2">
@@ -5616,82 +5702,80 @@ export function RemoteDisplayWindowPage() {
               </div>
             </div>
 
-            {!isLocalPipelinePreview && (
-              <div className="border-t border-white/10 px-4 py-4">
-                <div className="mb-3 flex items-center justify-between gap-3">
-                  <div>
-                    <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.18em] text-slate-300">
-                      <PanelTop className="h-3.5 w-3.5 text-cyan-300" />
-                      远端捕获源
-                    </div>
-                    <div className="mt-1 text-[11px] text-slate-500">
-                      默认优先全屏 shared copy，可切换全屏 copy 或单窗口源。
-                    </div>
+            <div className="border-t border-white/10 px-4 py-4">
+              <div className="mb-3 flex items-center justify-between gap-3">
+                <div>
+                  <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.18em] text-slate-300">
+                    <PanelTop className="h-3.5 w-3.5 text-cyan-300" />
+                    {captureSourceScopeLabel}
                   </div>
-                  <div className="flex flex-wrap items-center justify-end gap-2">
-                    <TitleSelect
-                      label="PICK"
-                      value={captureSourcePickerMode}
-                      options={captureSourcePickerOptions}
-                      onChange={setCaptureSourcePickerMode}
-                    />
-                    <button
-                      className="inline-flex items-center gap-2 rounded-md border border-cyan-400/30 px-3 py-1.5 text-[11px] font-medium text-cyan-100 hover:bg-cyan-500/15 disabled:opacity-50"
-                      onClick={() => void handleRefreshRemoteCaptureSources()}
-                      disabled={captureSourcesLoading}
-                    >
-                      {captureSourcesLoading && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-                      刷新捕获源
-                    </button>
-                    {captureSourcePickerMode === "modal" && (
-                      <button
-                        className="rounded-md border border-white/15 px-3 py-1.5 text-[11px] font-medium text-slate-200 hover:bg-white/10"
-                        onClick={() => setCaptureSourcePickerOpen(true)}
-                      >
-                        打开捕获源弹窗
-                      </button>
-                    )}
+                  <div className="mt-1 text-[11px] text-slate-500">
+                    {captureSourceDescription}
                   </div>
                 </div>
-
-                {captureSources.length === 0 ? (
-                  <div className="rounded-lg border border-white/10 bg-black/20 px-3 py-4 text-center text-[11px] text-slate-500">
-                    暂无捕获源。点击刷新从远端设备获取当前全屏/窗口列表。
-                  </div>
-                ) : captureSourcePickerMode === "dropdown" ? (
-                  <label className="block">
-                    <span className="sr-only">远端捕获源下拉</span>
-                    <select
-                      aria-label="远端捕获源下拉"
-                      className="w-full rounded-lg border border-white/10 bg-black/25 px-3 py-2 text-xs text-slate-100 outline-none"
-                      value={captureSourceSelection?.source.id ?? ""}
-                      onChange={(event) => {
-                        const source = captureSources.find(
-                          (candidate) => candidate.id === event.target.value
-                        );
-                        if (source) void handleSelectRemoteCaptureSource(source);
-                      }}
+                <div className="flex flex-wrap items-center justify-end gap-2">
+                  <TitleSelect
+                    label="PICK"
+                    value={captureSourcePickerMode}
+                    options={captureSourcePickerOptions}
+                    onChange={setCaptureSourcePickerMode}
+                  />
+                  <button
+                    className="inline-flex items-center gap-2 rounded-md border border-cyan-400/30 px-3 py-1.5 text-[11px] font-medium text-cyan-100 hover:bg-cyan-500/15 disabled:opacity-50"
+                    onClick={() => void handleRefreshCaptureSources()}
+                    disabled={captureSourcesLoading}
+                  >
+                    {captureSourcesLoading && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                    刷新捕获源
+                  </button>
+                  {captureSourcePickerMode === "modal" && (
+                    <button
+                      className="rounded-md border border-white/15 px-3 py-1.5 text-[11px] font-medium text-slate-200 hover:bg-white/10"
+                      onClick={() => setCaptureSourcePickerOpen(true)}
                     >
-                      <option value="" className="bg-[#111827] text-slate-100">
-                        选择远端捕获源
-                      </option>
-                      {captureSources.map((source) => (
-                        <option
-                          key={source.id}
-                          value={source.id}
-                          className="bg-[#111827] text-slate-100"
-                        >
-                          {captureSourceKindLabel(source.source_kind)} / {source.title} /{" "}
-                          {source.width}x{source.height}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                ) : (
-                  renderCaptureSourceCards()
-                )}
+                      打开捕获源弹窗
+                    </button>
+                  )}
+                </div>
               </div>
-            )}
+
+              {captureSources.length === 0 ? (
+                <div className="rounded-lg border border-white/10 bg-black/20 px-3 py-4 text-center text-[11px] text-slate-500">
+                  {captureSourceEmptyMessage}
+                </div>
+              ) : captureSourcePickerMode === "dropdown" ? (
+                <label className="block">
+                  <span className="sr-only">{captureSourceScopeLabel}下拉</span>
+                  <select
+                    aria-label={`${captureSourceScopeLabel}下拉`}
+                    className="w-full rounded-lg border border-white/10 bg-black/25 px-3 py-2 text-xs text-slate-100 outline-none"
+                    value={captureSourceSelection?.source.id ?? ""}
+                    onChange={(event) => {
+                      const source = captureSources.find(
+                        (candidate) => candidate.id === event.target.value
+                      );
+                      if (source) void handleSelectCaptureSource(source);
+                    }}
+                  >
+                    <option value="" className="bg-[#111827] text-slate-100">
+                      选择{captureSourceScopeLabel}
+                    </option>
+                    {captureSources.map((source) => (
+                      <option
+                        key={source.id}
+                        value={source.id}
+                        className="bg-[#111827] text-slate-100"
+                      >
+                        {captureSourceKindLabel(source.source_kind)} / {source.title} /{" "}
+                        {source.width}x{source.height}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              ) : (
+                renderCaptureSourceCards()
+              )}
+            </div>
 
             <div className="flex items-center justify-between border-t border-white/10 px-4 py-3">
               <div className="text-[11px] text-slate-500">
@@ -5699,8 +5783,10 @@ export function RemoteDisplayWindowPage() {
               </div>
               <div className="flex items-center gap-2">
                 <button
-                  className="rounded-md border border-cyan-400/30 px-3 py-1.5 text-[11px] font-medium text-cyan-100 hover:bg-cyan-500/15"
+                  className="rounded-md border border-cyan-400/30 px-3 py-1.5 text-[11px] font-medium text-cyan-100 hover:bg-cyan-500/15 disabled:cursor-not-allowed disabled:opacity-45"
                   onClick={applyLowLatencyProfile}
+                  disabled={localRenderSwitchLocked}
+                  title={configChangeLockedTitle ?? "切换本机低延迟预设"}
                 >
                   Low latency
                 </button>
@@ -5739,21 +5825,34 @@ export function RemoteDisplayWindowPage() {
                   关闭
                 </button>
                 <button
-                  className="inline-flex items-center gap-2 rounded-md bg-cyan-500 px-3 py-1.5 text-[11px] font-medium text-white hover:bg-cyan-400 disabled:opacity-50"
-                  onClick={() => void handleStartTest()}
-                  disabled={
-                    testStatus === "starting" ||
-                    testStatus === "stopping" ||
-                    Boolean(localStartBlockReason)
+                  className={`inline-flex items-center gap-2 rounded-md px-3 py-1.5 text-[11px] font-medium text-white disabled:opacity-50 ${
+                    isLocalPipelinePreview && isTestBusy
+                      ? "bg-red-500/90 hover:bg-red-400"
+                      : "bg-cyan-500 hover:bg-cyan-400"
+                  }`}
+                  onClick={() =>
+                    void (isLocalPipelinePreview && isTestBusy
+                      ? handleStopTest()
+                      : handleStartTest())
                   }
-                  title={localStartBlockReason ?? undefined}
+                  disabled={
+                    testStatus === "stopping" ||
+                    (!isTestBusy && Boolean(localStartBlockReason))
+                  }
+                  title={
+                    isLocalPipelinePreview && isTestBusy
+                      ? "停止当前测试后才能切换配置"
+                      : localStartBlockReason ?? undefined
+                  }
                 >
-                  {testStatus === "starting" ? (
+                  {testStatus === "starting" || testStatus === "stopping" ? (
                     <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : isLocalPipelinePreview && isTestBusy ? (
+                    <Square className="h-3 w-3" />
                   ) : (
                     <Play className="h-3.5 w-3.5" />
                   )}
-                  开始测试
+                  {isLocalPipelinePreview && isTestBusy ? "停止测试" : "开始测试"}
                 </button>
               </div>
             </div>
@@ -5761,7 +5860,7 @@ export function RemoteDisplayWindowPage() {
         </div>
       )}
 
-      {!isLocalPipelinePreview && captureSourcePickerOpen && (
+      {captureSourcePickerOpen && (
         <div
           className="fixed inset-0 z-[60] flex items-center justify-center bg-black/65 px-4"
           style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}
@@ -5770,15 +5869,17 @@ export function RemoteDisplayWindowPage() {
           <div className="flex max-h-[calc(100vh-3rem)] w-full max-w-5xl flex-col rounded-lg border border-white/10 bg-[#0f1724] shadow-2xl">
             <div className="flex items-center justify-between border-b border-white/10 px-4 py-3">
               <div>
-                <div className="text-sm font-semibold text-slate-100">远端捕获源选择</div>
+                <div className="text-sm font-semibold text-slate-100">
+                  {captureSourceScopeLabel}选择
+                </div>
                 <div className="mt-1 text-[11px] text-slate-500">
-                  优先选择全屏 shared copy；需要应用窗口时选择单窗口源。
+                  {captureSourceDescription}
                 </div>
               </div>
               <div className="flex items-center gap-2">
                 <button
                   className="inline-flex items-center gap-2 rounded-md border border-cyan-400/30 px-3 py-1.5 text-[11px] font-medium text-cyan-100 hover:bg-cyan-500/15 disabled:opacity-50"
-                  onClick={() => void handleRefreshRemoteCaptureSources()}
+                  onClick={() => void handleRefreshCaptureSources()}
                   disabled={captureSourcesLoading}
                 >
                   {captureSourcesLoading && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
@@ -5796,7 +5897,7 @@ export function RemoteDisplayWindowPage() {
             <div className="min-h-0 overflow-y-auto px-4 py-4">
               {captureSources.length === 0 ? (
                 <div className="rounded-lg border border-white/10 bg-black/20 px-3 py-8 text-center text-[11px] text-slate-500">
-                  暂无捕获源。点击刷新从远端设备获取当前全屏/窗口列表。
+                  {captureSourceEmptyMessage}
                 </div>
               ) : (
                 renderCaptureSourceCards(true)

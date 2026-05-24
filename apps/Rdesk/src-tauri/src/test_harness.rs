@@ -3,6 +3,15 @@
 //! This module provides a test harness that runs the full capture→encode→decode
 //! pipeline locally for visualization and testing purposes.
 
+#![allow(
+    clippy::derivable_impls,
+    clippy::large_enum_variant,
+    clippy::needless_return,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::while_let_loop
+)]
+
 use anyhow::Result;
 use mrd_capture_dxgi::DxgiDesktopCapture;
 #[cfg(windows)]
@@ -148,6 +157,7 @@ pub struct TestConfig {
     pub transport: Option<TransportKind>,
     pub zero_copy: Option<bool>,
     pub input_source: Option<String>,
+    pub source_id: Option<String>,
     pub display_id: Option<String>,
     pub window_handle: Option<String>,
     pub visual_preview: Option<bool>,
@@ -164,6 +174,7 @@ impl Default for TestConfig {
             transport: None,
             zero_copy: None,
             input_source: None,
+            source_id: None,
             display_id: None,
             window_handle: None,
             visual_preview: None,
@@ -171,6 +182,7 @@ impl Default for TestConfig {
     }
 }
 
+#[allow(dead_code)]
 impl TestChain {
     pub fn display_name(&self) -> &'static str {
         match self {
@@ -263,6 +275,7 @@ impl Default for TestChain {
     }
 }
 
+#[allow(dead_code)]
 fn default_screen_capture_type() -> CaptureType {
     #[cfg(windows)]
     {
@@ -449,6 +462,7 @@ struct PipelineState {
     adapted_frame: Option<CapturedFrame>,
 }
 
+#[allow(dead_code)]
 enum PipelineDecoder {
     Nvdec(NvdecDecoder),
     Software(Box<dyn VideoDecoder>),
@@ -1036,6 +1050,7 @@ fn run_macos_render_loop(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn run_renderer_upload_loop(
     mut renderer: Box<dyn RendererInstance>,
     receiver: mpsc::Receiver<RenderCommand>,
@@ -1544,13 +1559,7 @@ impl TestHarness {
                 {
                     match capture_type {
                         CaptureType::Dxgi => {
-                            let mut capture =
-                                DxgiSharedTextureCapture::new_primary().map_err(|e| {
-                                    anyhow::anyhow!(
-                                        "DXGI shared texture capture init failed: {:?}",
-                                        e
-                                    )
-                                })?;
+                            let mut capture = create_dxgi_shared_texture_capture(config)?;
                             let (width, height) = select_pipeline_dimensions(
                                 capture.width(),
                                 capture.height(),
@@ -1570,12 +1579,7 @@ impl TestHarness {
                                     },
                                 )?
                             } else {
-                                let monitor_index =
-                                    parse_display_index(config.display_id.as_deref())?;
-                                WinrtCapture::from_monitor_index_shared_texture(monitor_index)
-                                    .map_err(|error| {
-                                        anyhow::anyhow!("WinRT shared capture init failed: {error}")
-                                    })?
+                                create_winrt_capture_for_display_ref(display_ref(config), true)?
                             };
                             let (width, height) = select_pipeline_dimensions(
                                 capture.width(),
@@ -1613,9 +1617,7 @@ impl TestHarness {
                                 let hwnd = parse_window_handle(config.window_handle.as_deref())?;
                                 WinrtMonitorCapture::new_window(hwnd)?
                             } else {
-                                WinrtMonitorCapture::new_monitor(parse_display_index(
-                                    config.display_id.as_deref(),
-                                )?)?
+                                WinrtMonitorCapture::new_display_ref(display_ref(config))?
                             };
                             let (width, height) = select_pipeline_dimensions(
                                 capture.width(),
@@ -2899,6 +2901,7 @@ fn create_videotoolbox_h264_decoder() -> Result<PipelineDecoder> {
     }
 }
 
+#[allow(dead_code)]
 fn videotoolbox_decoder_enabled() -> bool {
     !matches!(
         std::env::var("MRD_DISABLE_VIDEOTOOLBOX_DECODER").as_deref(),
@@ -3326,6 +3329,7 @@ struct WinrtMonitorCapture {
 
 #[cfg(windows)]
 impl WinrtMonitorCapture {
+    #[allow(dead_code)]
     fn new_primary() -> Result<Self> {
         Self::new_monitor(0)
     }
@@ -3333,6 +3337,11 @@ impl WinrtMonitorCapture {
     fn new_monitor(monitor_index: u32) -> Result<Self> {
         let inner = WinrtCapture::from_monitor_index(monitor_index)
             .map_err(|error| anyhow::anyhow!("WinRT capture init failed: {error}"))?;
+        Self::from_inner(inner, "WinRT capture")
+    }
+
+    fn new_display_ref(display_ref: Option<&str>) -> Result<Self> {
+        let inner = create_winrt_capture_for_display_ref(display_ref, false)?;
         Self::from_inner(inner, "WinRT capture")
     }
 
@@ -3412,6 +3421,333 @@ fn parse_display_index(input: Option<&str>) -> Result<u32> {
     u32::try_from(value).map_err(|_| anyhow::anyhow!("display index out of range: {value}"))
 }
 
+fn display_ref(config: &TestConfig) -> Option<&str> {
+    config.display_id.as_deref().or(config.source_id.as_deref())
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WindowsDisplaySelection {
+    DeviceName(String),
+    Index(u32),
+}
+
+#[cfg(windows)]
+fn create_winrt_capture_for_display_ref(
+    display_ref: Option<&str>,
+    shared_texture: bool,
+) -> Result<WinrtCapture> {
+    match select_windows_display_ref(display_ref, windows_display_device_name_for_source_id)? {
+        WindowsDisplaySelection::DeviceName(device_name) => {
+            if shared_texture {
+                WinrtCapture::from_monitor_device_name_shared_texture(&device_name).map_err(
+                    |error| {
+                        anyhow::anyhow!(
+                            "WinRT shared capture init failed for {device_name}: {error}"
+                        )
+                    },
+                )
+            } else {
+                WinrtCapture::from_monitor_device_name(&device_name).map_err(|error| {
+                    anyhow::anyhow!("WinRT capture init failed for {device_name}: {error}")
+                })
+            }
+        }
+        WindowsDisplaySelection::Index(monitor_index) => {
+            if shared_texture {
+                WinrtCapture::from_monitor_index_shared_texture(monitor_index)
+                    .map_err(|error| anyhow::anyhow!("WinRT shared capture init failed: {error}"))
+            } else {
+                WinrtCapture::from_monitor_index(monitor_index)
+                    .map_err(|error| anyhow::anyhow!("WinRT capture init failed: {error}"))
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn select_windows_display_ref(
+    display_ref: Option<&str>,
+    resolve_device_name: impl FnOnce(&str) -> Result<String>,
+) -> Result<WindowsDisplaySelection> {
+    let Some(display_ref) = display_ref.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(WindowsDisplaySelection::Index(0));
+    };
+
+    if is_windows_display_source_id(display_ref) {
+        return Ok(WindowsDisplaySelection::DeviceName(resolve_device_name(
+            display_ref,
+        )?));
+    }
+
+    Ok(WindowsDisplaySelection::Index(parse_display_index(Some(
+        display_ref,
+    ))?))
+}
+
+#[cfg(windows)]
+fn is_windows_display_source_id(display_ref: &str) -> bool {
+    let parts = display_ref.trim().split(':').collect::<Vec<_>>();
+    matches!(
+        parts.as_slice(),
+        ["windows", "display", index] | ["windows", "display-shared", index]
+            if index.parse::<u32>().is_ok()
+    )
+}
+
+#[cfg(windows)]
+fn windows_display_device_name_for_source_id(source_id: &str) -> Result<String> {
+    let source_index = parse_display_index(Some(source_id))?;
+    windows_display_target_for_source_index(source_index)
+        .map(|target| target.device_name)
+        .map_err(|error| {
+            anyhow::anyhow!("resolve Windows display source {source_id} failed: {error}")
+        })
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WindowsDisplayTarget {
+    source_index: u32,
+    device_name: String,
+    primary: bool,
+    left: i32,
+    top: i32,
+}
+
+#[cfg(windows)]
+fn windows_display_target_for_source_index(source_index: u32) -> Result<WindowsDisplayTarget> {
+    enumerate_windows_display_targets()?
+        .into_iter()
+        .find(|target| target.source_index == source_index)
+        .ok_or_else(|| anyhow::anyhow!("Windows display target not found for index {source_index}"))
+}
+
+#[cfg(windows)]
+fn enumerate_windows_display_targets() -> Result<Vec<WindowsDisplayTarget>> {
+    let monitor_targets = enumerate_monitor_display_targets()?;
+    if !monitor_targets.is_empty() {
+        return Ok(assign_windows_display_source_indices(monitor_targets));
+    }
+
+    let device_targets = enumerate_display_device_targets();
+    if device_targets.is_empty() {
+        anyhow::bail!("no Windows displays found")
+    } else {
+        Ok(assign_windows_display_source_indices(device_targets))
+    }
+}
+
+#[cfg(windows)]
+fn enumerate_monitor_display_targets() -> Result<Vec<WindowsDisplayTarget>> {
+    use windows::Win32::Foundation::{BOOL, LPARAM, RECT};
+    use windows::Win32::Graphics::Gdi::{
+        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
+    };
+
+    unsafe extern "system" fn collect_monitor(
+        monitor: HMONITOR,
+        _hdc: HDC,
+        _rect: *mut RECT,
+        data: LPARAM,
+    ) -> BOOL {
+        let targets = &mut *(data.0 as *mut Vec<WindowsDisplayTarget>);
+        let mut info = MONITORINFOEXW::default();
+        info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+
+        if !GetMonitorInfoW(
+            monitor,
+            (&mut info as *mut MONITORINFOEXW).cast::<MONITORINFO>(),
+        )
+        .as_bool()
+        {
+            return BOOL(1);
+        }
+
+        let rect = info.monitorInfo.rcMonitor;
+        let width = rect.right.saturating_sub(rect.left);
+        let height = rect.bottom.saturating_sub(rect.top);
+        if width <= 0 || height <= 0 {
+            return BOOL(1);
+        }
+
+        let Some(device_name) = windows_display_device_name_from_raw(&info.szDevice) else {
+            return BOOL(1);
+        };
+
+        targets.push(WindowsDisplayTarget {
+            source_index: 0,
+            device_name,
+            primary: info.monitorInfo.dwFlags & 1 != 0,
+            left: rect.left,
+            top: rect.top,
+        });
+        BOOL(1)
+    }
+
+    let mut targets = Vec::<WindowsDisplayTarget>::new();
+    let ok = unsafe {
+        EnumDisplayMonitors(
+            None,
+            None,
+            Some(collect_monitor),
+            LPARAM(&mut targets as *mut _ as isize),
+        )
+        .as_bool()
+    };
+    if !ok {
+        anyhow::bail!(
+            "EnumDisplayMonitors failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(targets)
+}
+
+#[cfg(windows)]
+fn enumerate_display_device_targets() -> Vec<WindowsDisplayTarget> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Graphics::Gdi::{
+        EnumDisplayDevicesW, DISPLAY_DEVICEW, DISPLAY_DEVICE_ATTACHED_TO_DESKTOP,
+        DISPLAY_DEVICE_PRIMARY_DEVICE,
+    };
+
+    let mut targets = Vec::new();
+    for device_index in 0..32 {
+        let mut device = DISPLAY_DEVICEW {
+            cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+            ..Default::default()
+        };
+        let ok =
+            unsafe { EnumDisplayDevicesW(PCWSTR::null(), device_index, &mut device, 0).as_bool() };
+        if !ok {
+            break;
+        }
+        if device.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP == 0 {
+            continue;
+        }
+        let Some(device_name) = windows_display_device_name_from_raw(&device.DeviceName) else {
+            continue;
+        };
+
+        targets.push(WindowsDisplayTarget {
+            source_index: 0,
+            device_name,
+            primary: device.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE != 0,
+            left: device_index as i32,
+            top: 0,
+        });
+    }
+    targets
+}
+
+#[cfg(windows)]
+fn assign_windows_display_source_indices(
+    mut targets: Vec<WindowsDisplayTarget>,
+) -> Vec<WindowsDisplayTarget> {
+    targets.sort_by_key(|target| {
+        (
+            !target.primary,
+            target.left,
+            target.top,
+            target.device_name.to_ascii_lowercase(),
+        )
+    });
+    for (index, target) in targets.iter_mut().enumerate() {
+        target.source_index = index as u32;
+    }
+    targets
+}
+
+#[cfg(windows)]
+fn windows_display_device_name_from_raw(raw: &[u16]) -> Option<String> {
+    let end = raw.iter().position(|unit| *unit == 0).unwrap_or(raw.len());
+    if end == 0 {
+        return None;
+    }
+    let value = String::from_utf16_lossy(&raw[..end]);
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+#[cfg(windows)]
+fn create_dxgi_shared_texture_capture(config: &TestConfig) -> Result<DxgiSharedTextureCapture> {
+    let Some(source_id) = display_ref(config) else {
+        return DxgiSharedTextureCapture::new_primary()
+            .map_err(|e| anyhow::anyhow!("DXGI shared texture capture init failed: {:?}", e));
+    };
+    let device_name = dxgi_device_name_for_source_id(source_id)?;
+    DxgiSharedTextureCapture::new_for_device_name(&device_name).map_err(|e| {
+        anyhow::anyhow!(
+            "DXGI shared texture capture init failed for {source_id} ({device_name}): {:?}",
+            e
+        )
+    })
+}
+
+#[cfg(windows)]
+fn dxgi_device_name_for_source_id(source_id: &str) -> Result<String> {
+    let source_index = match select_windows_display_ref(
+        Some(source_id),
+        windows_display_device_name_for_source_id,
+    )? {
+        WindowsDisplaySelection::DeviceName(device_name) => return Ok(device_name),
+        WindowsDisplaySelection::Index(source_index) => source_index as usize,
+    };
+    let targets = mrd_capture_dxgi::enumerate_dxgi_output_targets()
+        .map_err(|error| anyhow::anyhow!("DXGI output enumeration failed: {error}"))?;
+    targets
+        .get(source_index)
+        .map(|target| target.device_name.clone())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "DXGI output source {source_id} resolved to index {source_index}, but only {} attached outputs were found",
+                targets.len()
+            )
+        })
+}
+
+#[cfg(test)]
+mod display_source_tests {
+    use super::*;
+
+    #[test]
+    fn parse_display_index_accepts_windows_display_source_ids() {
+        assert_eq!(
+            parse_display_index(Some("windows:display-shared:1")).unwrap(),
+            1
+        );
+        assert_eq!(parse_display_index(Some("windows:display:0")).unwrap(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_display_ref_selection_prefers_device_names_for_source_ids() {
+        let selection = select_windows_display_ref(Some("windows:display-shared:2"), |source_id| {
+            Ok(format!("device:{source_id}"))
+        })
+        .unwrap();
+        assert_eq!(
+            selection,
+            WindowsDisplaySelection::DeviceName("device:windows:display-shared:2".to_string())
+        );
+
+        assert_eq!(
+            select_windows_display_ref(Some("3"), |_| unreachable!()).unwrap(),
+            WindowsDisplaySelection::Index(3)
+        );
+        assert_eq!(
+            select_windows_display_ref(None, |_| unreachable!()).unwrap(),
+            WindowsDisplaySelection::Index(0)
+        );
+    }
+}
+
+#[allow(dead_code)]
 fn parse_display_id(input: &str) -> Result<u32> {
     let value = parse_numeric_capture_source_id(input, "display id")?;
     u32::try_from(value).map_err(|_| anyhow::anyhow!("display id out of range: {value}"))
@@ -3719,6 +4055,12 @@ mod tests {
             RendererSnapshot {
                 attached_to_target: true,
                 uploaded_frame_count: self.uploaded as u64,
+                presented_frame_count: self.uploaded as u64,
+                present_skipped_count: 0,
+                last_present_status: Some("presented".to_string()),
+                low_latency_frame_latency_target: None,
+                swap_chain_max_frame_latency: None,
+                swap_chain_allow_tearing: None,
                 last_width: 1,
                 last_height: 1,
                 last_pixel_format: Some(RenderPixelFormat::Bgra32),
@@ -4342,6 +4684,7 @@ mod tests {
                 _ => None,
             },
             input_source: std::env::var("MRD_HARNESS_INPUT_SOURCE").ok(),
+            source_id: std::env::var("MRD_HARNESS_SOURCE_ID").ok(),
             display_id: std::env::var("MRD_HARNESS_DISPLAY_ID").ok(),
             window_handle: std::env::var("MRD_HARNESS_WINDOW_HANDLE").ok(),
             visual_preview: match std::env::var("MRD_HARNESS_VISUAL_PREVIEW").as_deref() {

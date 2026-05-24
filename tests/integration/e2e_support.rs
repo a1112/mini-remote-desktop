@@ -632,7 +632,7 @@ fn create_renderer() -> Result<Box<dyn RendererInstance>> {
         renderer
             .attach_target(RenderTarget::WindowHandle(0))
             .map_err(|error| anyhow!(error))?;
-        return Ok(renderer);
+        Ok(renderer)
     }
 
     #[cfg(not(any(target_os = "macos", windows)))]
@@ -804,6 +804,12 @@ impl RendererInstance for InMemoryRenderer {
         RendererSnapshot {
             attached_to_target: false,
             uploaded_frame_count: self.uploaded_frame_count,
+            presented_frame_count: self.uploaded_frame_count,
+            present_skipped_count: 0,
+            last_present_status: Some("presented".to_string()),
+            low_latency_frame_latency_target: None,
+            swap_chain_max_frame_latency: None,
+            swap_chain_allow_tearing: None,
             last_width: self.last_width,
             last_height: self.last_height,
             last_pixel_format: self.last_pixel_format,

@@ -271,6 +271,17 @@ impl IpcServer {
                 session::configure_media_adaptation(&self.app_state, session_id, config).await
             }
 
+            IpcRequest::ListLocalCaptureSources {
+                include_previews,
+                limit,
+            } => match crate::capture_source::list_capture_sources(include_previews, limit) {
+                Ok(sources) => IpcResponse::LocalCaptureSourceList { sources },
+                Err(error) => IpcResponse::Error {
+                    code: "CAPTURE_SOURCE_LIST_FAILED".to_string(),
+                    message: error.to_string(),
+                },
+            },
+
             IpcRequest::ListRemoteCaptureSources {
                 session_id,
                 include_previews,
@@ -897,6 +908,7 @@ impl IpcServer {
         (peer_device_id, Some(snapshot.transport.clone()))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn record_audit_event(
         &self,
         action: impl Into<String>,
@@ -1328,6 +1340,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_local_capture_sources_returns_local_response_or_error() {
+        let app_state = Arc::new(AppState::new());
+        let server = IpcServer::new(app_state);
+
+        let response = server
+            .handle_request(IpcRequest::ListLocalCaptureSources {
+                include_previews: false,
+                limit: Some(4),
+            })
+            .await;
+
+        match response {
+            IpcResponse::LocalCaptureSourceList { sources } => {
+                assert!(sources.len() <= 4);
+            }
+            IpcResponse::Error { code, message } => {
+                assert_eq!(code, "CAPTURE_SOURCE_LIST_FAILED");
+                assert!(!message.trim().is_empty());
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn runtime_snapshot_aggregates_state() {
         let app_state = Arc::new(AppState::new());
         let server = IpcServer::new(app_state);
@@ -1344,7 +1380,7 @@ mod tests {
 
         match response {
             IpcResponse::RuntimeSnapshot { snapshot } => {
-                assert_eq!(snapshot.is_registered, true);
+                assert!(snapshot.is_registered);
                 assert_eq!(snapshot.device_id, Some(device_id));
             }
             _ => panic!("Expected RuntimeSnapshot response"),

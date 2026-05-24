@@ -292,6 +292,13 @@ impl NvdecDecoder {
     }
 
     #[cfg(windows)]
+    /// Creates an H.264 NVDEC decoder that can interoperate with the supplied D3D11 device.
+    ///
+    /// # Safety
+    ///
+    /// `d3d11_device_ptr` must be a valid, non-null `ID3D11Device` pointer that remains alive for
+    /// the lifetime of the decoder. The pointer must be safe to use from the decoder's calling
+    /// thread according to the D3D11 device's threading guarantees.
     pub unsafe fn new_with_output_mode_and_d3d11_device_ptr(
         output_mode: NvdecOutputMode,
         d3d11_device_ptr: *mut c_void,
@@ -306,6 +313,13 @@ impl NvdecDecoder {
     }
 
     #[cfg(windows)]
+    /// Creates an AV1 NVDEC decoder that can interoperate with the supplied D3D11 device.
+    ///
+    /// # Safety
+    ///
+    /// `d3d11_device_ptr` must be a valid, non-null `ID3D11Device` pointer that remains alive for
+    /// the lifetime of the decoder. The pointer must be safe to use from the decoder's calling
+    /// thread according to the D3D11 device's threading guarantees.
     pub unsafe fn new_av1_with_output_mode_and_d3d11_device_ptr(
         output_mode: NvdecOutputMode,
         d3d11_device_ptr: *mut c_void,
@@ -320,6 +334,13 @@ impl NvdecDecoder {
     }
 
     #[cfg(windows)]
+    /// Creates an HEVC NVDEC decoder that can interoperate with the supplied D3D11 device.
+    ///
+    /// # Safety
+    ///
+    /// `d3d11_device_ptr` must be a valid, non-null `ID3D11Device` pointer that remains alive for
+    /// the lifetime of the decoder. The pointer must be safe to use from the decoder's calling
+    /// thread according to the D3D11 device's threading guarantees.
     pub unsafe fn new_hevc_with_output_mode_and_d3d11_device_ptr(
         output_mode: NvdecOutputMode,
         d3d11_device_ptr: *mut c_void,
@@ -334,6 +355,13 @@ impl NvdecDecoder {
     }
 
     #[cfg(windows)]
+    /// Creates an HEVC Main10 NVDEC decoder that can interoperate with the supplied D3D11 device.
+    ///
+    /// # Safety
+    ///
+    /// `d3d11_device_ptr` must be a valid, non-null `ID3D11Device` pointer that remains alive for
+    /// the lifetime of the decoder. The pointer must be safe to use from the decoder's calling
+    /// thread according to the D3D11 device's threading guarantees.
     pub unsafe fn new_hevc_main10_with_output_mode_and_d3d11_device_ptr(
         output_mode: NvdecOutputMode,
         d3d11_device_ptr: *mut c_void,
@@ -348,6 +376,13 @@ impl NvdecDecoder {
     }
 
     #[cfg(windows)]
+    /// Creates an NVDEC decoder for `codec` that can interoperate with the supplied D3D11 device.
+    ///
+    /// # Safety
+    ///
+    /// `d3d11_device_ptr` must be a valid, non-null `ID3D11Device` pointer that remains alive for
+    /// the lifetime of the decoder. The pointer must be safe to use from the decoder's calling
+    /// thread according to the D3D11 device's threading guarantees.
     pub unsafe fn new_for_codec_with_output_mode_and_d3d11_device_ptr(
         codec: NvdecCodecKind,
         output_mode: NvdecOutputMode,
@@ -565,7 +600,7 @@ fn probe_capability(
 
 #[cfg(windows)]
 mod imp {
-    #![allow(non_snake_case)]
+    #![allow(clippy::upper_case_acronyms, non_snake_case)]
 
     use super::{
         c_int, c_void, NvdecCapabilityProbe, NvdecDecodedFrame, NvdecDecodedFrameData,
@@ -2859,9 +2894,9 @@ mod imp {
                     codec: request.codec_name().to_string(),
                     bit_depth_minus8: request.bit_depth_minus8,
                     chroma_format: request.chroma_format,
-                    runtime_supported: false,
+                    runtime_supported: true,
                     runtime_reason: format!(
-                        "{} runtime probe failed at cuvidGetDecoderCaps",
+                        "{} cuvidGetDecoderCaps returned an error; treating runtime support as unknown because decoder creation handles this probe as non-fatal",
                         request.probe_label()
                     ),
                     wired_supported: matches!(wired_decision, NvdecSupportDecision::Supported),
@@ -3371,7 +3406,7 @@ mod imp {
             // Allow small differences due to rounding
             let mut max_diff = 0u8;
             for (i, (&a, &b)) in int_rgb.iter().zip(float_rgb.iter()).enumerate() {
-                let diff = if a > b { a - b } else { b - a };
+                let diff = a.abs_diff(b);
                 max_diff = max_diff.max(diff);
                 if diff > 2 {
                     println!(

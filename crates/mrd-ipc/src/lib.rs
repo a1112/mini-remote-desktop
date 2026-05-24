@@ -293,8 +293,14 @@ mod wire {
         pub render_presented_frames: u64,
         #[serde(default)]
         pub render_queue_replacements: u64,
+        /// Stale queued render frames dropped when the render worker catches up to latest.
+        #[serde(default)]
+        pub render_stale_frame_drops: u64,
         #[serde(default)]
         pub render_lock_drops: u64,
+        /// Frames accepted by the renderer but skipped by non-blocking present.
+        #[serde(default)]
+        pub render_present_skips: u64,
         /// Receiver-side render pacing target after local display refresh caps.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub render_pacing_target_fps: Option<u32>,
@@ -874,6 +880,11 @@ mod wire {
             session_id: SessionId,
             config: AdaptiveMediaConfig,
         },
+        /// List selectable capture sources on the local service host.
+        ListLocalCaptureSources {
+            include_previews: bool,
+            limit: Option<u32>,
+        },
         /// List selectable capture sources from the remote peer for a session.
         ListRemoteCaptureSources {
             session_id: SessionId,
@@ -1023,6 +1034,7 @@ mod wire {
 
     /// IPC response from mrd-service to Rdesk
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    #[allow(clippy::large_enum_variant)]
     #[serde(tag = "type")]
     pub enum IpcResponse {
         /// Device registration successful
@@ -1060,6 +1072,8 @@ mod wire {
             session_id: SessionId,
             snapshot: MediaAdaptationSnapshot,
         },
+        /// Local selectable capture sources returned by mrd-service.
+        LocalCaptureSourceList { sources: Vec<CaptureSource> },
         /// Selectable capture sources returned by the remote peer.
         CaptureSourceList {
             session_id: SessionId,

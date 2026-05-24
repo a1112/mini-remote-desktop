@@ -18,9 +18,10 @@ use std::collections::HashMap;
 /// This enum represents the authoritative lifecycle state of a session.
 /// Unlike inferred states from bootstrap metadata, this state is explicitly
 /// tracked and transitioned by the service.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SessionLifecycleState {
     /// Session created but not yet listening or connecting
+    #[default]
     Created,
     /// Local transport is listening for incoming connections (agent role)
     Listening,
@@ -67,12 +68,6 @@ impl SessionLifecycleState {
     }
 }
 
-impl Default for SessionLifecycleState {
-    fn default() -> Self {
-        Self::Created
-    }
-}
-
 /// Capability set for a device
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CapabilitySet {
@@ -98,7 +93,7 @@ pub struct SessionPlan {
 }
 
 /// QUIC session snapshot (domain state, independent of Quinn)
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct QuicSessionSnapshot {
     /// Transport protocol identifier
     pub transport: String,
@@ -124,24 +119,6 @@ pub struct QuicSessionSnapshot {
     pub last_error: Option<String>,
 }
 
-impl Default for QuicSessionSnapshot {
-    fn default() -> Self {
-        Self {
-            transport: String::new(),
-            source_device_id: None,
-            target_device_id: None,
-            local_listen_addr: None,
-            local_server_name: None,
-            local_cert_der_b64: None,
-            remote_listen_addr: None,
-            remote_server_name: None,
-            remote_cert_der_b64: None,
-            lifecycle_state: SessionLifecycleState::default(),
-            last_error: None,
-        }
-    }
-}
-
 /// QUIC session coordinator - manages QUIC session state at domain level
 #[derive(Debug, Default)]
 pub struct QuicSessionCoordinator {
@@ -150,6 +127,7 @@ pub struct QuicSessionCoordinator {
 
 impl QuicSessionCoordinator {
     /// Request a new QUIC session as controller
+    #[allow(clippy::too_many_arguments)]
     pub fn request_session(
         &mut self,
         session_id: SessionId,

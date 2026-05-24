@@ -38,17 +38,12 @@ impl MetricScope {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ResourceTarget {
+    #[default]
     MrdService,
     System,
-}
-
-impl Default for ResourceTarget {
-    fn default() -> Self {
-        Self::MrdService
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -87,6 +82,12 @@ pub struct ResourceMonitor {
     last_gpu_sample: GpuSample,
     last_gpu_refresh: Option<Instant>,
     last_network_refresh: Option<Instant>,
+}
+
+impl Default for ResourceMonitor {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ResourceMonitor {

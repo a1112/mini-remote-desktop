@@ -103,7 +103,7 @@ mod mock {
                 std::thread::sleep(delay);
             }
 
-            let is_keyframe = self.frame_count % self.keyframe_interval == 0;
+            let is_keyframe = self.frame_count.is_multiple_of(self.keyframe_interval);
             self.frame_count += 1;
 
             // Simulate H.264 Annex-B format

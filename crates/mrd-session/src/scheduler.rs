@@ -11,11 +11,12 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use crate::{SessionId, SessionLifecycleState};
 
 /// Session priority for scheduling decisions
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SessionPriority {
     /// Background or best-effort sessions.
     Low = 0,
     /// Normal interactive sessions.
+    #[default]
     Normal = 1,
     /// Preferred sessions when resources are constrained.
     High = 2,
@@ -23,14 +24,8 @@ pub enum SessionPriority {
     Critical = 3,
 }
 
-impl Default for SessionPriority {
-    fn default() -> Self {
-        Self::Normal
-    }
-}
-
 /// Resource limits for a session
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SessionResourceLimits {
     /// Maximum bitrate in Mbps
     pub max_bitrate_mbps: Option<f32>,
@@ -40,17 +35,6 @@ pub struct SessionResourceLimits {
     pub max_resolution: Option<(u32, u32)>,
     /// CPU budget percentage (0-100)
     pub cpu_budget_percent: Option<u32>,
-}
-
-impl Default for SessionResourceLimits {
-    fn default() -> Self {
-        Self {
-            max_bitrate_mbps: None,
-            max_fps: None,
-            max_resolution: None,
-            cpu_budget_percent: None,
-        }
-    }
 }
 
 /// Session entry with scheduling metadata

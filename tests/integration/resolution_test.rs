@@ -379,26 +379,23 @@ mod windows_resolution {
             let hrr_result =
                 test_encoding_at_resolution(2560, 1440, 144, 120, EncoderMode::HighRefreshRate);
 
-            match (ull_result, hrr_result) {
-                (Ok(ull), Ok(hrr)) => {
-                    println!(
-                        "ULL: P50={:.2}ms, P95={:.2}ms",
-                        ull.encode_p50.as_secs_f64() * 1000.0,
-                        ull.encode_p95.as_secs_f64() * 1000.0
-                    );
-                    println!(
-                        "HRR: P50={:.2}ms, P95={:.2}ms",
-                        hrr.encode_p50.as_secs_f64() * 1000.0,
-                        hrr.encode_p95.as_secs_f64() * 1000.0
-                    );
-                    println!(
-                        "Improvement: {:.1}%",
-                        ((ull.encode_p95.as_nanos() - hrr.encode_p95.as_nanos()) as f64
-                            / ull.encode_p95.as_nanos() as f64)
-                            * 100.0
-                    );
-                }
-                _ => {}
+            if let (Ok(ull), Ok(hrr)) = (ull_result, hrr_result) {
+                println!(
+                    "ULL: P50={:.2}ms, P95={:.2}ms",
+                    ull.encode_p50.as_secs_f64() * 1000.0,
+                    ull.encode_p95.as_secs_f64() * 1000.0
+                );
+                println!(
+                    "HRR: P50={:.2}ms, P95={:.2}ms",
+                    hrr.encode_p50.as_secs_f64() * 1000.0,
+                    hrr.encode_p95.as_secs_f64() * 1000.0
+                );
+                println!(
+                    "Improvement: {:.1}%",
+                    ((ull.encode_p95.as_nanos() - hrr.encode_p95.as_nanos()) as f64
+                        / ull.encode_p95.as_nanos() as f64)
+                        * 100.0
+                );
             }
         }
     }

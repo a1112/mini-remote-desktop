@@ -79,6 +79,7 @@ impl RealtimeRuntime {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn request_session_with_transport(
         &self,
         handle: u64,
@@ -145,13 +146,9 @@ impl RealtimeRuntime {
             .get_mut(&handle)
             .ok_or_else(|| format!("未找到 realtime 连接句柄: {}", handle))?;
 
-        loop {
-            match tokio::time::timeout(std::time::Duration::from_millis(5), connection.recv_event())
-                .await
-            {
-                Ok(Ok(_)) => {}
-                Ok(Err(_)) | Err(_) => break,
-            }
+        while let Ok(Ok(_)) =
+            tokio::time::timeout(std::time::Duration::from_millis(5), connection.recv_event()).await
+        {
         }
 
         Ok(connection.drain_inbound_events())

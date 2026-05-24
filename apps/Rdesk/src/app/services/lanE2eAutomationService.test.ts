@@ -428,11 +428,53 @@ describe("runLanE2EAutomation", () => {
     expect(commands.ipcStartReceiver).toHaveBeenCalledWith("lan-e2e-test-session");
     expect(commands.openRemoteDisplayWindow).toHaveBeenCalledWith({
       sessionId: "lan-e2e-test-session",
+      avoidCaptureSourceId: "DISPLAY1",
     });
     expect(commands.ipcStopSession).toHaveBeenCalledWith("lan-e2e-test-session");
     expect(result.stages.map((stage) => `${stage.stage}:${stage.status}`)).toContain(
       "assert:completed"
     );
+  });
+
+  it("uses the captured display device name when placing the receiver window", async () => {
+    const dxgiDisplaySource = {
+      id: "windows:display-shared:2",
+      platform: "windows",
+      source_kind: "display_shared",
+      title: "Display 3 (D3D11 shared copy)",
+      class_name: "DXGIShared:\\\\.\\DISPLAY3",
+      width: 2560,
+      height: 1440,
+      process_id: 0,
+      app_name: "Display",
+    };
+    const commands = createCommands({
+      ipcListRemoteCaptureSources: vi.fn().mockResolvedValue(ok([dxgiDisplaySource])),
+      ipcSelectRemoteCaptureSource: vi.fn().mockResolvedValue(
+        ok({
+          session_id: "lan-e2e-test-session",
+          source: dxgiDisplaySource,
+          status: "selected",
+          reason: null,
+        })
+      ),
+    });
+
+    const result = await runLanE2EAutomation(commands, {
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => "lan-e2e-test-session",
+    });
+
+    expect(result.status).toBe("completed");
+    expect(commands.openRemoteDisplayWindow).toHaveBeenCalledWith({
+      sessionId: "lan-e2e-test-session",
+      avoidCaptureSourceId: "DXGIShared:\\\\.\\DISPLAY3",
+    });
   });
 
   it("configures adaptive media before receiver startup and reports its snapshot", async () => {
@@ -891,6 +933,30 @@ describe("runLanE2EAutomation", () => {
     );
   });
 
+  it("fails instead of falling back when an exact capture source id is unavailable", async () => {
+    const commands = withCaptureSourceCommands(createCommands());
+
+    const result = await runLanE2EAutomation(commands, {
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      preferredCaptureSourceId: "windows:display-shared:0",
+      preferredCaptureSourceKind: "display_shared",
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => "lan-e2e-test-session",
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.failureReason).toBe("capture_source_failed");
+    expect(result.errorMessage).toContain("windows:display-shared:0");
+    expect(commands.ipcSelectRemoteCaptureSource).not.toHaveBeenCalledWith(
+      "lan-e2e-test-session",
+      "display-shared"
+    );
+  });
+
   it("sets temporary remote display mode before receiver startup and restores during cleanup", async () => {
     const commands = withCaptureSourceCommands(createCommands());
 
@@ -942,7 +1008,7 @@ describe("runLanE2EAutomation", () => {
     expect(restoreRemoteDisplayMode).toHaveBeenCalledWith("lan-e2e-test-session");
   });
 
-  it("reselects the capture source after a display mode switch when no source id was requested", async () => {
+  it("reselects the active display mode source after a display mode switch", async () => {
     const lowResolutionSource = {
       id: "display-shared-low",
       platform: "windows",
@@ -1044,7 +1110,7 @@ describe("runLanE2EAutomation", () => {
     });
 
     expect(result.status).toBe("completed");
-    expect(result.captureSource?.id).toBe("display-shared-2k");
+    expect(result.captureSource?.id).toBe("display-shared-low");
     expect(commands.ipcSelectRemoteCaptureSource).toHaveBeenNthCalledWith(
       1,
       "lan-e2e-test-session",
@@ -1052,7 +1118,7 @@ describe("runLanE2EAutomation", () => {
     );
     expect(commands.ipcSelectRemoteCaptureSource).toHaveBeenLastCalledWith(
       "lan-e2e-test-session",
-      "display-shared-2k"
+      "display-shared-low"
     );
   });
 

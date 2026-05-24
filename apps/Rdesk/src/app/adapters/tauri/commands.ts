@@ -223,6 +223,8 @@ export async function applyNativeChrome(): Promise<AdapterResult<NativeBackdropS
 export async function openRemoteDisplayWindow(params: {
   sessionId: string;
   surfaceId?: string | null;
+  preferredDisplaySourceId?: string | null;
+  avoidCaptureSourceId?: string | null;
 }): Promise<AdapterResult<RemoteDisplayWindowContext>> {
   if (shouldUseServiceBridge()) {
     return {
@@ -242,6 +244,8 @@ export async function openRemoteDisplayWindow(params: {
   return invokeAdapter<RemoteDisplayWindowContext>('open_remote_display_window', {
     sessionId: params.sessionId,
     surfaceId: params.surfaceId ?? null,
+    preferredDisplaySourceId: params.preferredDisplaySourceId ?? null,
+    avoidCaptureSourceId: params.avoidCaptureSourceId ?? null,
   });
 }
 
@@ -301,6 +305,7 @@ export async function browserWebrtcPreviewStart(params: {
   height?: number;
   h264Profile?: "baseline" | "high";
   bitrateMbps?: number;
+  sourceId?: string;
 }): Promise<AdapterResult<BrowserWebrtcPreviewAnswer>> {
   if (shouldUseServiceBridge()) {
     return postServiceBridgeJson<BrowserWebrtcPreviewAnswer>(
@@ -313,6 +318,7 @@ export async function browserWebrtcPreviewStart(params: {
         height: params.height ?? null,
         h264_profile: params.h264Profile ?? null,
         bitrate_mbps: params.bitrateMbps ?? null,
+        source_id: params.sourceId ?? null,
       }
     );
   }
@@ -324,6 +330,7 @@ export async function browserWebrtcPreviewStart(params: {
     height: params.height ?? null,
     h264Profile: params.h264Profile ?? null,
     bitrateMbps: params.bitrateMbps ?? null,
+    sourceId: params.sourceId ?? null,
   });
 }
 
@@ -614,6 +621,29 @@ export async function ipcConfigureMediaAdaptation(
       config,
     },
     responseField<MediaAdaptationSnapshot>('snapshot')
+  );
+}
+
+/**
+ * List local capture sources from the mrd-service host.
+ */
+export async function ipcListLocalCaptureSources(
+  includePreviews = true,
+  limit?: number
+): Promise<AdapterResult<CaptureSource[]>> {
+  const args = {
+    includePreviews,
+    ...(limit === undefined ? {} : { limit }),
+  };
+  return invokeBridgeOrTauri<CaptureSource[]>(
+    'ipc_list_local_capture_sources',
+    args,
+    {
+      type: 'ListLocalCaptureSources',
+      include_previews: includePreviews,
+      limit: limit ?? null,
+    },
+    responseField<CaptureSource[]>('sources')
   );
 }
 

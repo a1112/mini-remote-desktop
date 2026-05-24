@@ -315,7 +315,7 @@ impl TrayPort for NoOpTray {
 pub fn default_tray() -> std::sync::Arc<std::sync::Mutex<dyn TrayPort + Send + Sync>> {
     #[cfg(windows)]
     {
-        return std::sync::Arc::new(std::sync::Mutex::new(windows::WindowsTray::new()));
+        std::sync::Arc::new(std::sync::Mutex::new(windows::WindowsTray::new()))
     }
 
     #[cfg(target_os = "macos")]
@@ -512,7 +512,7 @@ pub fn default_autostart(entry_name: impl Into<String>) -> AutostartPortRef {
 
     #[cfg(windows)]
     {
-        return std::sync::Arc::new(std::sync::Mutex::new(WindowsAutostart::new(entry_name)));
+        std::sync::Arc::new(std::sync::Mutex::new(WindowsAutostart::new(entry_name)))
     }
 
     #[cfg(target_os = "macos")]

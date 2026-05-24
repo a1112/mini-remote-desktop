@@ -1,7 +1,11 @@
 #![allow(deprecated, unexpected_cfgs)]
 
-use anyhow::{anyhow, bail, Context, Result};
+#[cfg(target_os = "macos")]
+use anyhow::Context;
+use anyhow::{anyhow, bail, Result};
+#[cfg(target_os = "macos")]
 use mrd_pipeline_core::{CapturedFrame, FramePixelFormat};
+#[cfg(target_os = "macos")]
 use mrd_render::RenderFrame;
 use std::env;
 
@@ -237,6 +241,7 @@ fn run(_options: DemoOptions) -> Result<()> {
     bail!("capture-render-demo currently implements the direct visual path on macOS")
 }
 
+#[cfg(target_os = "macos")]
 fn captured_frame_into_render_frame(frame: CapturedFrame) -> Result<RenderFrame> {
     let expected_pixels = frame
         .width

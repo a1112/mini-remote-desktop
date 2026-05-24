@@ -89,6 +89,8 @@ describe('Tauri Adapter Contract', () => {
       expect(mockInvoke).toHaveBeenNthCalledWith(1, 'open_remote_display_window', {
         sessionId: 'session-1',
         surfaceId: 'surface-1',
+        preferredDisplaySourceId: null,
+        avoidCaptureSourceId: null,
       });
       expect(mockInvoke).toHaveBeenNthCalledWith(2, 'list_remote_display_windows', {
         sessionId: 'session-1',
@@ -120,6 +122,36 @@ describe('Tauri Adapter Contract', () => {
       );
       expect(mockInvoke).toHaveBeenNthCalledWith(7, 'close_remote_display_window', {
         label: 'render-session-1-1',
+      });
+    });
+
+    it('browser WebRTC preview start passes selected source id', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue({
+        session_id: 'local-display-test-1',
+        answer_sdp: 'answer-sdp',
+      });
+
+      await adapter.browserWebrtcPreviewStart({
+        sessionId: 'local-display-test-1',
+        offerSdp: 'offer-sdp',
+        fps: 120,
+        width: 2560,
+        height: 1440,
+        h264Profile: 'high',
+        bitrateMbps: 80,
+        sourceId: 'windows:display-shared:1',
+      });
+
+      expect(mockInvoke).toHaveBeenCalledWith('browser_webrtc_preview_start', {
+        sessionId: 'local-display-test-1',
+        offerSdp: 'offer-sdp',
+        fps: 120,
+        width: 2560,
+        height: 1440,
+        h264Profile: 'high',
+        bitrateMbps: 80,
+        sourceId: 'windows:display-shared:1',
       });
     });
 
@@ -424,6 +456,34 @@ describe('Tauri Adapter Contract', () => {
       expect(mockInvoke).toHaveBeenCalledWith('ipc_configure_media_adaptation', {
         sessionId: 'session-123',
         config,
+      });
+    });
+
+    it('ipc_list_local_capture_sources calls correct command with args', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue([
+        {
+          id: 'windows:display-shared:1',
+          platform: 'windows',
+          source_kind: 'display_shared',
+          title: 'Display 2 (D3D11 shared copy)',
+          class_name: 'DXGIShared:\\\\.\\DISPLAY2',
+          width: 3840,
+          height: 2160,
+          process_id: 0,
+          app_name: 'Display',
+          bundle_identifier: null,
+          preview_data_url: null,
+          preview_width: null,
+          preview_height: null,
+        },
+      ]);
+
+      await adapter.ipcListLocalCaptureSources(false, 24);
+
+      expect(mockInvoke).toHaveBeenCalledWith('ipc_list_local_capture_sources', {
+        includePreviews: false,
+        limit: 24,
       });
     });
 

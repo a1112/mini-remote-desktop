@@ -411,8 +411,12 @@ impl ComponentResult {
 
 #[derive(Debug, Clone, Default)]
 pub struct ProbeRegistry {
-    sessions: Arc<Mutex<HashMap<(SessionId, String), Arc<Mutex<ProbeState>>>>>,
+    sessions: ProbeSessionMap,
 }
+
+type ProbeSessionKey = (SessionId, String);
+type ProbeStateHandle = Arc<Mutex<ProbeState>>;
+type ProbeSessionMap = Arc<Mutex<HashMap<ProbeSessionKey, ProbeStateHandle>>>;
 
 impl ProbeRegistry {
     pub fn session_handle(

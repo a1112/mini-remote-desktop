@@ -24,28 +24,33 @@ function Find-Profile([object[]]$Profiles, [string]$Id) {
 }
 
 $profiles = Get-PairedLanCanaryProfiles -DurationSecs 30 -BitrateMbps 20
-Assert-Equal $profiles.Count 13 "Profile count"
+Assert-Equal $profiles.Count 14 "Profile count"
 Assert-Equal $profiles[0].id "1080p60" "First profile id"
 Assert-Equal $profiles[2].id "2k144" "2K144 profile is present"
 Assert-Equal $profiles[3].id "2k144_adaptive" "Adaptive 2K144 profile is present"
 Assert-Equal $profiles[3].bitrate_mbps 80 "Adaptive 2K144 profile uses the 80 Mbps ceiling"
 Assert-True $profiles[3].adaptive "Adaptive 2K144 profile enables adaptive autorun"
-Assert-Equal $profiles[4].id "2k180" "Native 2K180 profile is present"
-Assert-Equal $profiles[4].bitrate_mbps 100 "Native 2K180 profile uses the higher default bitrate"
-Assert-Equal $profiles[5].id "2k180_120mbps" "Native 2K180 high-bitrate profile is present"
-Assert-Equal $profiles[5].bitrate_mbps 120 "Native 2K180 high-bitrate profile reaches 120 Mbps"
-Assert-Equal $profiles[6].id "2k180_120mbps_adaptive" "Native 2K180 adaptive high-bitrate profile is present"
-Assert-Equal $profiles[6].bitrate_mbps 120 "Native 2K180 adaptive profile starts from 120 Mbps"
-Assert-True $profiles[6].adaptive "Native 2K180 high-bitrate profile enables adaptive autorun"
-Assert-Equal $profiles[7].id "1600p165" "Native 1600p165 profile is present"
-Assert-Equal $profiles[7].bitrate_mbps 80 "Native 1600p165 profile uses the higher default bitrate"
-Assert-Equal $profiles[8].id "1600p165_120mbps" "Native 1600p165 high-bitrate profile is present"
-Assert-Equal $profiles[8].bitrate_mbps 120 "Native 1600p165 high-bitrate profile reaches 120 Mbps"
-Assert-Equal $profiles[9].id "1600p165_120mbps_adaptive" "Native 1600p165 adaptive high-bitrate profile is present"
-Assert-Equal $profiles[9].bitrate_mbps 120 "Native 1600p165 adaptive profile starts from 120 Mbps"
-Assert-True $profiles[9].adaptive "Native 1600p165 high-bitrate profile enables adaptive autorun"
-Assert-Equal $profiles[11].fps 180 "180 FPS profile is present"
-Assert-Equal $profiles[12].fps 249 "249 FPS profile is present"
+Assert-Equal $profiles[4].id "4k120" "4K120 profile is present"
+Assert-Equal $profiles[4].width 3840 "4K120 profile width"
+Assert-Equal $profiles[4].height 2160 "4K120 profile height"
+Assert-Equal $profiles[4].fps 120 "4K120 profile fps"
+Assert-Equal $profiles[4].bitrate_mbps 120 "4K120 profile uses high HEVC bitrate"
+Assert-Equal $profiles[5].id "2k180" "Native 2K180 profile is present"
+Assert-Equal $profiles[5].bitrate_mbps 100 "Native 2K180 profile uses the higher default bitrate"
+Assert-Equal $profiles[6].id "2k180_120mbps" "Native 2K180 high-bitrate profile is present"
+Assert-Equal $profiles[6].bitrate_mbps 120 "Native 2K180 high-bitrate profile reaches 120 Mbps"
+Assert-Equal $profiles[7].id "2k180_120mbps_adaptive" "Native 2K180 adaptive high-bitrate profile is present"
+Assert-Equal $profiles[7].bitrate_mbps 120 "Native 2K180 adaptive profile starts from 120 Mbps"
+Assert-True $profiles[7].adaptive "Native 2K180 high-bitrate profile enables adaptive autorun"
+Assert-Equal $profiles[8].id "1600p165" "Native 1600p165 profile is present"
+Assert-Equal $profiles[8].bitrate_mbps 80 "Native 1600p165 profile uses the higher default bitrate"
+Assert-Equal $profiles[9].id "1600p165_120mbps" "Native 1600p165 high-bitrate profile is present"
+Assert-Equal $profiles[9].bitrate_mbps 120 "Native 1600p165 high-bitrate profile reaches 120 Mbps"
+Assert-Equal $profiles[10].id "1600p165_120mbps_adaptive" "Native 1600p165 adaptive high-bitrate profile is present"
+Assert-Equal $profiles[10].bitrate_mbps 120 "Native 1600p165 adaptive profile starts from 120 Mbps"
+Assert-True $profiles[10].adaptive "Native 1600p165 high-bitrate profile enables adaptive autorun"
+Assert-Equal $profiles[12].fps 180 "180 FPS profile is present"
+Assert-Equal $profiles[13].fps 249 "249 FPS profile is present"
 
 $h264CrossChain = New-CanaryMediaChain -Mode "cross" -Codec "h264"
 Assert-Equal $h264CrossChain "dxgi/nvenc_h264/quic_datagram_media_v3_or_v2/nvdec/d3d11_shared" "H.264 cross chain remains the default"
@@ -233,6 +238,7 @@ $adaptiveDowngradeReport = [pscustomobject]@{
     dropped_frames = 0
     queue_depth = 0
     render_queue_replacements = 17
+    render_stale_frame_drops = 0
     render_lock_drops = 0
     render_presented_frames = 2734
     stage_metrics = @(
@@ -274,7 +280,7 @@ Assert-Equal $adaptiveDowngradeRow.adaptation_last_reason "present gap p95 excee
 
 $startupDropOnlyIssue = Get-CanaryVisualIntegrityIssue `
   -Probe ([pscustomobject]@{ frames_decoded = 4800; frames_dropped = 250 }) `
-  -Pipeline ([pscustomobject]@{ render_queue_replacements = 0; render_lock_drops = 0; stage_metrics = @() }) `
+  -Pipeline ([pscustomobject]@{ render_queue_replacements = 0; render_stale_frame_drops = 0; render_lock_drops = 0; stage_metrics = @() }) `
   -Report ([pscustomobject]@{ sampleFramesDecoded = 4700; sampleFramesDropped = 1 }) `
   -Profile $native1600p165AdaptiveProfile
 Assert-True ($null -eq $startupDropOnlyIssue) "Visual integrity check uses sample-window drops when available"
@@ -476,6 +482,7 @@ $renderCappedReport = [pscustomobject]@{
     dropped_frames = 0
     render_presented_frames = 5670
     render_queue_replacements = 0
+    render_stale_frame_drops = 0
     render_lock_drops = 0
     render_pacing_target_fps = 144
     queue_depth = 1
@@ -531,9 +538,11 @@ $renderDropReport = [pscustomobject]@{
     media_probe_target_bitrate_mbps = 80
   }
   mediaPipelineSnapshot = [pscustomobject]@{
-    dropped_frames = 457
+    dropped_frames = 464
     render_queue_replacements = 455
+    render_stale_frame_drops = 0
     render_lock_drops = 2
+    render_present_skips = 7
     queue_depth = 0
     stage_metrics = @()
     test_impairment = $null
@@ -543,9 +552,11 @@ $renderDropReport = [pscustomobject]@{
 $renderDropRow = Convert-CrossReportToCanaryRow -Profile $profile2k14480 -Report $renderDropReport -ReportPath "raw/cross-2k144.json"
 Assert-Equal $renderDropRow.dropped_frames 37 "Cross row dropped_frames tracks probe/transport drops"
 Assert-Equal $renderDropRow.probe_dropped_frames 37 "Cross row exposes probe drops separately"
-Assert-Equal $renderDropRow.pipeline_dropped_frames 457 "Cross row preserves legacy pipeline dropped frames"
+Assert-Equal $renderDropRow.pipeline_dropped_frames 464 "Cross row preserves legacy pipeline dropped frames"
 Assert-Equal $renderDropRow.render_queue_replacements 455 "Cross row exposes render queue replacements"
+Assert-Equal $renderDropRow.render_stale_frame_drops 0 "Cross row exposes render stale frame drops"
 Assert-Equal $renderDropRow.render_lock_drops 2 "Cross row exposes render lock drops"
+Assert-Equal $renderDropRow.render_present_skips 7 "Cross row exposes non-blocking D3D11 present skips"
 Assert-Equal $renderDropRow.status "failed" "Severe visual integrity risk fails the canary row"
 Assert-Equal $renderDropRow.classification "visual_integrity_risk" "Severe visual integrity risk is classified explicitly"
 Assert-True ($renderDropRow.error_message -match "render drop/coalesce ratio") "Visual integrity risk carries an actionable render-drop reason"
@@ -571,8 +582,10 @@ $pacedRenderReport = [pscustomobject]@{
   mediaPipelineSnapshot = [pscustomobject]@{
     dropped_frames = 721
     render_presented_frames = 6370
-    render_queue_replacements = 721
+    render_queue_replacements = 0
+    render_stale_frame_drops = 721
     render_lock_drops = 0
+    render_present_skips = 0
     render_pacing_target_fps = 144
     queue_depth = 8
     stage_metrics = @(
@@ -593,6 +606,7 @@ Assert-Equal $pacedRenderRow.visual_integrity_status "paced" "Stable render coal
 Assert-Equal ([Math]::Round($pacedRenderRow.estimated_render_fps, 1)) 141.0 "Estimated render FPS prefers sample-window presented frames"
 Assert-Equal $pacedRenderRow.render_pacing_target_fps 144 "Paced row exposes the local render pacing target"
 Assert-Equal ([Math]::Round($pacedRenderRow.render_present_gap_p95_ms, 2)) 7.07 "Paced row exposes render present gap P95"
+Assert-Equal $pacedRenderRow.render_stale_frame_drops 721 "Paced row exposes render stale frame drops"
 Assert-True ($pacedRenderRow.render_coalesce_ratio -gt 0.09) "Paced row exposes render coalesce ratio"
 
 $singlePeerDiagnostics = [pscustomobject]@{
@@ -612,5 +626,27 @@ $multiPeerDiagnostics = [pscustomobject]@{
 }
 Assert-Equal (Resolve-PairedLanCanaryTargetDeviceId -Diagnostics $multiPeerDiagnostics -RequestedTargetDeviceId "") "" "Ambiguous discovered peers are not auto-selected"
 Assert-Equal (Resolve-PairedLanCanaryTargetDeviceId -Diagnostics $multiPeerDiagnostics -RequestedTargetDeviceId "explicit-peer") "explicit-peer" "Explicit target device id wins over discovery"
+
+$tauriNoBuildEnv = New-LocalDualProcessTauriEnvPlan `
+  -OutputRoot ([System.IO.Path]::Combine("tmp", "canary")) `
+  -ServiceExe ([System.IO.Path]::Combine("tmp", "canary", "run", "mrd-service.exe")) `
+  -WorkspaceTargetDir ([System.IO.Path]::Combine("tmp", "repo", "target")) `
+  -NoBuild:$true
+Assert-Equal $tauriNoBuildEnv.MRD_SERVICE_PREBUILT_EXE ([System.IO.Path]::Combine("tmp", "canary", "run", "mrd-service.exe")) "NoBuild local dual canary uses the copied service executable"
+Assert-Equal $tauriNoBuildEnv.MRD_SERVICE_EXE ([System.IO.Path]::Combine("tmp", "canary", "run", "mrd-service.exe")) "NoBuild local dual canary exposes the copied service executable to Tauri"
+Assert-Equal $tauriNoBuildEnv.CARGO_TARGET_DIR ([System.IO.Path]::Combine("tmp", "repo", "target")) "NoBuild local dual canary pins Tauri to the workspace cargo target"
+
+$tauriBuildEnv = New-LocalDualProcessTauriEnvPlan `
+  -OutputRoot ([System.IO.Path]::Combine("tmp", "canary")) `
+  -ServiceExe ([System.IO.Path]::Combine("tmp", "canary", "run", "mrd-service.exe")) `
+  -WorkspaceTargetDir ([System.IO.Path]::Combine("tmp", "repo", "target")) `
+  -NoBuild:$false
+Assert-Equal $tauriBuildEnv.CARGO_TARGET_DIR ([System.IO.Path]::Combine("tmp", "repo", "target")) "Build local dual canary also pins Tauri to the workspace cargo target"
+
+$localDualScript = Get-Content -Path (Join-Path $scriptDir "run_local_dual_process_lan_canary.ps1") -Raw
+Assert-True ($localDualScript -match "cargo build -p mrd-service") "Local dual canary prebuilds the service executable"
+Assert-True ($localDualScript -match "cargo build -p app --no-default-features") "Local dual canary prebuilds the same Tauri shell target used by tauri dev"
+Assert-True ($localDualScript -match "CARGO_TARGET_DIR") "Local dual canary keeps prebuild and Tauri dev on the same cargo target"
+Assert-True ($localDualScript -match "MRD_LAN_E2E_RENDER_DISPLAY_SOURCE_ID") "Local dual canary can route the receiver window to an explicit display source"
 
 Write-Host "paired LAN canary common tests passed"

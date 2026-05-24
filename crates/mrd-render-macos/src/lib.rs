@@ -405,6 +405,12 @@ impl RendererInstance for MacosMetalRenderer {
         RendererSnapshot {
             attached_to_target: self.attached_to_target,
             uploaded_frame_count: self.uploaded_frame_count,
+            presented_frame_count: self.uploaded_frame_count,
+            present_skipped_count: 0,
+            last_present_status: Some("presented".to_string()),
+            low_latency_frame_latency_target: None,
+            swap_chain_max_frame_latency: None,
+            swap_chain_allow_tearing: None,
             last_width: self.last_width,
             last_height: self.last_height,
             last_pixel_format: self.last_pixel_format,

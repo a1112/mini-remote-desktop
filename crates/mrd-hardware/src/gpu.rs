@@ -185,9 +185,7 @@ mod tests {
 
     #[test]
     fn detect_gpu_caps_returns_valid_caps() {
-        let caps = detect_gpu_caps();
-        // Should not panic and should return valid caps
-        assert_eq!(caps.detected || !caps.detected, true); // Always true
+        let _caps = detect_gpu_caps();
     }
 
     #[test]

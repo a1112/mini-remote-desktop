@@ -10,6 +10,15 @@ const release = process.argv.includes('--release') || process.argv.includes('--p
 const profile = release ? 'release' : 'debug';
 const exeName = process.platform === 'win32' ? 'mrd-service.exe' : 'mrd-service';
 
+function prebuiltServiceExe() {
+  const path = process.env.MRD_SERVICE_PREBUILT_EXE;
+  if (!path || !path.trim()) {
+    return undefined;
+  }
+
+  return resolve(path.trim());
+}
+
 function cargoCommand() {
   if (process.env.CARGO) {
     return process.env.CARGO;
@@ -40,6 +49,16 @@ function currentGitCommit() {
 
   const commit = result.stdout.trim();
   return commit.length > 0 ? commit : undefined;
+}
+
+const prebuiltExe = prebuiltServiceExe();
+if (prebuiltExe) {
+  if (!existsSync(prebuiltExe)) {
+    throw new Error(`MRD_SERVICE_PREBUILT_EXE was set, but ${prebuiltExe} was not found`);
+  }
+
+  console.log(`mrd-service ready: ${prebuiltExe}`);
+  process.exit(0);
 }
 
 const args = ['build', '-p', 'mrd-service'];

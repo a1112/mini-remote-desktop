@@ -74,10 +74,7 @@ fn nvdec_runtime_probe_reports_library_state() {
 
     if cfg!(windows) {
         assert!(
-            runtime
-                .checked_items
-                .iter()
-                .any(|item| *item == "nvcuvid.dll"),
+            runtime.checked_items.contains(&"nvcuvid.dll"),
             "windows probe should report nvcuvid.dll check"
         );
         assert!(

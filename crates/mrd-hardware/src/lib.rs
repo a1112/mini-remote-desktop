@@ -45,7 +45,7 @@ impl VideoEncoderBackend {
     }
 
     /// Parse from string
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "nvenc" | "nvidia" => Some(Self::Nvenc),
             "openh264" | "software" | "sw" | "software_h264" | "h264_software"
@@ -90,7 +90,7 @@ impl VideoDecoderBackend {
     }
 
     /// Parse from string
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "nvdec" | "nvidia" => Some(Self::Nvdec),
             "software" | "sw" | "software_h264" | "h264_software" | "software-h264"
@@ -145,26 +145,26 @@ mod tests {
     #[test]
     fn encoder_backend_from_str_works() {
         assert_eq!(
-            VideoEncoderBackend::from_str("nvenc"),
+            VideoEncoderBackend::parse("nvenc"),
             Some(VideoEncoderBackend::Nvenc)
         );
         assert_eq!(
-            VideoEncoderBackend::from_str("NVENC"),
+            VideoEncoderBackend::parse("NVENC"),
             Some(VideoEncoderBackend::Nvenc)
         );
         assert_eq!(
-            VideoEncoderBackend::from_str("openh264"),
+            VideoEncoderBackend::parse("openh264"),
             Some(VideoEncoderBackend::OpenH264)
         );
         assert_eq!(
-            VideoEncoderBackend::from_str("software_h264"),
+            VideoEncoderBackend::parse("software_h264"),
             Some(VideoEncoderBackend::OpenH264)
         );
         assert_eq!(
-            VideoEncoderBackend::from_str("h264-software"),
+            VideoEncoderBackend::parse("h264-software"),
             Some(VideoEncoderBackend::OpenH264)
         );
-        assert_eq!(VideoEncoderBackend::from_str("unknown"), None);
+        assert_eq!(VideoEncoderBackend::parse("unknown"), None);
     }
 
     #[test]
@@ -176,22 +176,22 @@ mod tests {
     #[test]
     fn decoder_backend_from_str_works() {
         assert_eq!(
-            VideoDecoderBackend::from_str("nvdec"),
+            VideoDecoderBackend::parse("nvdec"),
             Some(VideoDecoderBackend::Nvdec)
         );
         assert_eq!(
-            VideoDecoderBackend::from_str("software"),
+            VideoDecoderBackend::parse("software"),
             Some(VideoDecoderBackend::Software)
         );
         assert_eq!(
-            VideoDecoderBackend::from_str("h264_software"),
+            VideoDecoderBackend::parse("h264_software"),
             Some(VideoDecoderBackend::Software)
         );
         assert_eq!(
-            VideoDecoderBackend::from_str("software-h264"),
+            VideoDecoderBackend::parse("software-h264"),
             Some(VideoDecoderBackend::Software)
         );
-        assert_eq!(VideoDecoderBackend::from_str("unknown"), None);
+        assert_eq!(VideoDecoderBackend::parse("unknown"), None);
     }
 
     #[test]

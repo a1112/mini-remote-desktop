@@ -25,7 +25,6 @@ pub fn sync_session_runtime(
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use mrd_decode::PixelFormat;
     use mrd_pipeline_core::DecodedFrame;
     use mrd_proto::SessionId;
 

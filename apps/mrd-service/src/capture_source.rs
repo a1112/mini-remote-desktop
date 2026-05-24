@@ -74,13 +74,13 @@ pub fn create_frame_capture(source_id: &str) -> Result<mrd_capture_winrt::WinrtC
     let mut capture = match parse_windows_capture_source_ref(source_id)? {
         WindowsCaptureSourceRef::Window(hwnd) => {
             mrd_capture_winrt::WinrtCapture::from_window_handle(hwnd)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?
         }
         WindowsCaptureSourceRef::Display { index }
         | WindowsCaptureSourceRef::DisplayShared { index } => {
-            mrd_capture_winrt::WinrtCapture::from_monitor_index(index)
+            create_windows_monitor_capture(source_id, index)?
         }
-    }
-    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    };
     capture
         .start()
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
@@ -144,6 +144,13 @@ enum WindowsCaptureSourceRef {
     Window(isize),
     Display { index: u32 },
     DisplayShared { index: u32 },
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WindowsMonitorCaptureTarget {
+    DeviceName(String),
+    Index(u32),
 }
 
 #[cfg(target_os = "macos")]
@@ -261,29 +268,28 @@ fn list_windows_winrt_display_capture_sources() -> Vec<CaptureSource> {
         return Vec::new();
     };
 
-    let mut sources = Vec::with_capacity(count.saturating_mul(2));
+    let mut dimensions = Vec::with_capacity(count);
     for index in 0..count {
         let Ok(capture) = mrd_capture_winrt::WinrtCapture::from_monitor_index(index as u32) else {
             continue;
         };
-        let width = capture.width() as u32;
-        let height = capture.height() as u32;
+        dimensions.push((
+            index as u32,
+            capture.width() as u32,
+            capture.height() as u32,
+        ));
+    }
+
+    windows_winrt_display_sources_from_indexed_dimensions(dimensions)
+}
+
+#[cfg(windows)]
+fn windows_winrt_display_sources_from_indexed_dimensions(
+    dimensions: Vec<(u32, u32, u32)>,
+) -> Vec<CaptureSource> {
+    let mut sources = Vec::with_capacity(dimensions.len());
+    for (index, width, height) in dimensions {
         let display_number = index + 1;
-        sources.push(CaptureSource {
-            id: format!("windows:display-shared:{index}"),
-            platform: "windows".to_string(),
-            source_kind: "display_shared".to_string(),
-            title: format!("Display {display_number} (D3D11 shared copy)"),
-            class_name: "WinRTMonitorShared".to_string(),
-            width,
-            height,
-            process_id: 0,
-            app_name: Some("Display".to_string()),
-            bundle_identifier: None,
-            preview_data_url: None,
-            preview_width: None,
-            preview_height: None,
-        });
         sources.push(CaptureSource {
             id: format!("windows:display:{index}"),
             platform: "windows".to_string(),
@@ -304,6 +310,19 @@ fn list_windows_winrt_display_capture_sources() -> Vec<CaptureSource> {
     sources
 }
 
+#[cfg(all(windows, test))]
+fn windows_winrt_display_sources_from_dimensions(
+    dimensions: Vec<(u32, u32)>,
+) -> Vec<CaptureSource> {
+    windows_winrt_display_sources_from_indexed_dimensions(
+        dimensions
+            .into_iter()
+            .enumerate()
+            .map(|(index, (width, height))| (index as u32, width, height))
+            .collect(),
+    )
+}
+
 #[cfg(windows)]
 fn windows_display_index_from_source_id(source_id: &str) -> Option<usize> {
     source_id
@@ -311,6 +330,42 @@ fn windows_display_index_from_source_id(source_id: &str) -> Option<usize> {
         .rsplit(':')
         .next()
         .and_then(|value| value.parse::<usize>().ok())
+}
+
+#[cfg(windows)]
+fn create_windows_monitor_capture(
+    source_id: &str,
+    fallback_index: u32,
+) -> Result<mrd_capture_winrt::WinrtCapture> {
+    let device_name = crate::display_mode::display_device_name_for_source_id(source_id).ok();
+    match windows_monitor_capture_target(device_name, fallback_index) {
+        WindowsMonitorCaptureTarget::DeviceName(device_name) => {
+            mrd_capture_winrt::WinrtCapture::from_monitor_device_name(&device_name).map_err(
+                |error| {
+                    anyhow::anyhow!(
+                        "WinRT monitor capture by device name '{device_name}' failed: {error}"
+                    )
+                },
+            )
+        }
+        WindowsMonitorCaptureTarget::Index(index) => {
+            mrd_capture_winrt::WinrtCapture::from_monitor_index(index)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))
+        }
+    }
+}
+
+#[cfg(windows)]
+fn windows_monitor_capture_target(
+    device_name: Option<String>,
+    fallback_index: u32,
+) -> WindowsMonitorCaptureTarget {
+    match device_name.map(|value| value.trim().to_string()) {
+        Some(device_name) if !device_name.is_empty() => {
+            WindowsMonitorCaptureTarget::DeviceName(device_name)
+        }
+        _ => WindowsMonitorCaptureTarget::Index(fallback_index),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -469,13 +524,13 @@ fn capture_source_preview_data_url(
     let mut capture = match parse_windows_capture_source_ref(source_id)? {
         WindowsCaptureSourceRef::Window(hwnd) => {
             mrd_capture_winrt::WinrtCapture::from_window_handle(hwnd)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?
         }
         WindowsCaptureSourceRef::Display { index }
         | WindowsCaptureSourceRef::DisplayShared { index } => {
-            mrd_capture_winrt::WinrtCapture::from_monitor_index(index)
+            create_windows_monitor_capture(source_id, index)?
         }
-    }
-    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    };
     capture
         .start()
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
@@ -833,6 +888,30 @@ mod tests {
         assert_eq!(selected.id, "windows:display:0");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_winrt_fallback_does_not_advertise_dxgi_shared_sources() {
+        let sources = super::windows_winrt_display_sources_from_dimensions(vec![(1920, 1080)]);
+
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].id, "windows:display:0");
+        assert_eq!(sources[0].source_kind, "display");
+        assert!(sources
+            .iter()
+            .all(|source| source.source_kind != "display_shared"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_winrt_fallback_preserves_sparse_monitor_indices() {
+        let sources =
+            super::windows_winrt_display_sources_from_indexed_dimensions(vec![(2, 2560, 1440)]);
+
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].id, "windows:display:2");
+        assert_eq!(sources[0].title, "Display 3 (full screen copy)");
+    }
+
     #[test]
     fn preview_timeout_stays_inside_lan_request_budget() {
         assert_eq!(
@@ -863,6 +942,23 @@ mod tests {
         assert_eq!(
             super::parse_windows_capture_source_ref("windows:window:0x1234").unwrap(),
             super::WindowsCaptureSourceRef::Window(0x1234)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_monitor_capture_target_prefers_device_name_before_index_fallback() {
+        assert_eq!(
+            super::windows_monitor_capture_target(Some("\\\\.\\DISPLAY7".to_string()), 2),
+            super::WindowsMonitorCaptureTarget::DeviceName("\\\\.\\DISPLAY7".to_string())
+        );
+        assert_eq!(
+            super::windows_monitor_capture_target(Some("  ".to_string()), 2),
+            super::WindowsMonitorCaptureTarget::Index(2)
+        );
+        assert_eq!(
+            super::windows_monitor_capture_target(None, 2),
+            super::WindowsMonitorCaptureTarget::Index(2)
         );
     }
 

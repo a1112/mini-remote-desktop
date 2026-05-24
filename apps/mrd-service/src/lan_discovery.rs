@@ -33,7 +33,7 @@ use std::sync::Arc;
 use std::sync::{Condvar as StdCondvar, Mutex as StdMutex};
 #[cfg(windows)]
 use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock, TryLockError};
-#[cfg(target_os = "macos")]
+#[cfg(any(windows, target_os = "macos"))]
 use std::thread;
 #[cfg(target_os = "macos")]
 use std::time::Instant as StdInstant;
@@ -3783,13 +3783,13 @@ async fn handle_media_sender_frame_error(
 fn should_log_media_sender_frame_error(consecutive_frame_errors: u32) -> bool {
     consecutive_frame_errors == 1
         || consecutive_frame_errors >= LAN_MEDIA_SENDER_MAX_CONSECUTIVE_FRAME_ERRORS
-        || consecutive_frame_errors % LAN_MEDIA_SENDER_ERROR_LOG_INTERVAL == 0
+        || consecutive_frame_errors.is_multiple_of(LAN_MEDIA_SENDER_ERROR_LOG_INTERVAL)
 }
 
 fn should_log_media_receiver_decode_error(consecutive_decode_errors: u32) -> bool {
     consecutive_decode_errors == 1
         || consecutive_decode_errors == LAN_MEDIA_RECEIVER_MAX_CONSECUTIVE_DECODE_ERRORS
-        || consecutive_decode_errors % LAN_MEDIA_RECEIVER_DECODE_ERROR_LOG_INTERVAL == 0
+        || consecutive_decode_errors.is_multiple_of(LAN_MEDIA_RECEIVER_DECODE_ERROR_LOG_INTERVAL)
 }
 
 struct LanMediaFrameOrderer {
@@ -4121,7 +4121,7 @@ fn lan_local_render_refresh_hz() -> Option<u32> {
         return Some(refresh_hz);
     }
 
-    *LOCAL_RENDER_REFRESH_HZ.get_or_init(|| crate::display_mode::highest_current_refresh_hz())
+    *LOCAL_RENDER_REFRESH_HZ.get_or_init(crate::display_mode::highest_current_refresh_hz)
 }
 
 fn lan_render_pacing_from_env_value(value: Option<&str>) -> Option<bool> {
@@ -4704,6 +4704,7 @@ async fn quic_media_v3_frame_to_legacy_frame(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn record_lan_decoded_frames(
     app_state: &Arc<AppState>,
     session_id: &SessionId,
@@ -4796,8 +4797,14 @@ async fn record_lan_decoded_frames(
 }
 
 #[cfg(windows)]
+#[derive(Debug)]
 enum LanRenderTaskOutcome {
-    Rendered { duration_ms: f64 },
+    Rendered {
+        upload_duration_ms: f64,
+        lock_wait_ms: f64,
+        presented_frames: u64,
+        present_skips: u64,
+    },
     Dropped,
     Idle,
 }
@@ -4858,28 +4865,95 @@ fn spawn_lan_render_worker(
     session_id: SessionId,
     first_frame: RenderFrame,
 ) {
-    tokio::spawn(async move {
-        let mut frame = first_frame;
-        let mut timer_resolution = MediaTimerResolution::default();
-        loop {
-            let render_profile = selected_media_profile(&app_state, &session_id).await;
-            if render_profile_requests_high_resolution_timer(&render_profile) {
-                timer_resolution.request();
-            } else {
-                timer_resolution.release();
-            }
-            pace_lan_render_frame(&app_state, &session_id, &render_profile).await;
-            match render_lan_frame_once(app_state.clone(), session_id.clone(), frame).await {
-                Ok(LanRenderTaskOutcome::Rendered { duration_ms }) => {
-                    {
-                        let mut pipelines = app_state.media_pipelines.lock().await;
-                        pipelines.increment_render_presented_frames(session_id.clone(), 1);
+    let fallback_app_state = app_state.clone();
+    let fallback_session_id = session_id.clone();
+    let fallback_first_frame = first_frame.clone();
+    let handle = tokio::runtime::Handle::current();
+    let spawn_result = thread::Builder::new()
+        .name("mrd-lan-render".to_string())
+        .spawn(move || {
+            configure_lan_render_thread_priority();
+            handle.block_on(run_lan_render_worker(app_state, session_id, first_frame));
+        });
+
+    if let Err(error) = spawn_result {
+        tracing::warn!(
+            %error,
+            session_id = %fallback_session_id.0,
+            "failed to spawn dedicated LAN render thread; falling back to Tokio task"
+        );
+        tokio::spawn(run_lan_render_worker(
+            fallback_app_state,
+            fallback_session_id,
+            fallback_first_frame,
+        ));
+    }
+}
+
+#[cfg(windows)]
+fn configure_lan_render_thread_priority() {
+    use windows::Win32::System::Threading::{
+        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST,
+    };
+
+    if unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) }.is_err() {
+        tracing::debug!("failed to raise LAN render thread priority");
+    }
+}
+
+#[cfg(windows)]
+async fn run_lan_render_worker(
+    app_state: Arc<AppState>,
+    session_id: SessionId,
+    first_frame: RenderFrame,
+) {
+    let mut frame = first_frame;
+    let mut timer_resolution = MediaTimerResolution::default();
+    loop {
+        let render_profile = selected_media_profile(&app_state, &session_id).await;
+        if render_profile_requests_high_resolution_timer(&render_profile) {
+            timer_resolution.request();
+        } else {
+            timer_resolution.release();
+        }
+        pace_lan_render_frame(&app_state, &session_id, &render_profile).await;
+        match render_lan_frame_once(app_state.clone(), session_id.clone(), frame).await {
+            Ok(LanRenderTaskOutcome::Rendered {
+                upload_duration_ms,
+                lock_wait_ms,
+                presented_frames,
+                present_skips,
+            }) => {
+                {
+                    let mut pipelines = app_state.media_pipelines.lock().await;
+                    pipelines.record_stage_duration_ms(
+                        session_id.clone(),
+                        "render_upload",
+                        upload_duration_ms,
+                    );
+                    if lock_wait_ms > 0.0 {
+                        pipelines.record_stage_duration_ms(
+                            session_id.clone(),
+                            "render_lock_wait",
+                            lock_wait_ms,
+                        );
+                    }
+                    if presented_frames > 0 {
+                        pipelines.increment_render_presented_frames(
+                            session_id.clone(),
+                            presented_frames,
+                        );
                         pipelines.record_stage_duration_ms(
                             session_id.clone(),
                             "render_present",
-                            duration_ms,
+                            upload_duration_ms,
                         );
                     }
+                    if present_skips > 0 {
+                        pipelines.increment_render_present_skips(session_id.clone(), present_skips);
+                    }
+                }
+                if presented_frames > 0 {
                     let present_gap_ms = app_state
                         .media_render_queues
                         .lock()
@@ -4898,48 +4972,49 @@ fn spawn_lan_render_worker(
                             );
                     }
                 }
-                Ok(LanRenderTaskOutcome::Dropped) => {
-                    app_state
-                        .media_pipelines
-                        .lock()
-                        .await
-                        .increment_render_lock_drops(session_id.clone(), 1);
-                }
-                Ok(LanRenderTaskOutcome::Idle) => {}
-                Err(error) => {
-                    tracing::warn!(
-                        %error,
-                        session_id = %session_id.0,
-                        "LAN media receiver failed to present decoded frame"
-                    );
-                }
             }
-
-            let next_frame = app_state
-                .media_render_queues
-                .lock()
-                .await
-                .take_next_or_finish(&session_id);
-            match next_frame {
-                Some(next_frame) => {
-                    app_state
-                        .media_pipelines
-                        .lock()
-                        .await
-                        .record_queue_depth(session_id.clone(), 0);
-                    frame = next_frame;
-                }
-                None => {
-                    app_state
-                        .media_pipelines
-                        .lock()
-                        .await
-                        .record_queue_depth(session_id.clone(), 0);
-                    break;
-                }
+            Ok(LanRenderTaskOutcome::Dropped) => {
+                app_state
+                    .media_pipelines
+                    .lock()
+                    .await
+                    .increment_render_lock_drops(session_id.clone(), 1);
+            }
+            Ok(LanRenderTaskOutcome::Idle) => {}
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    session_id = %session_id.0,
+                    "LAN media receiver failed to present decoded frame"
+                );
             }
         }
-    });
+
+        let (next_frame, stale_drops) = app_state
+            .media_render_queues
+            .lock()
+            .await
+            .take_latest_or_finish(&session_id);
+        match next_frame {
+            Some(next_frame) => {
+                let mut pipelines = app_state.media_pipelines.lock().await;
+                pipelines.record_queue_depth(session_id.clone(), 0);
+                if stale_drops > 0 {
+                    pipelines
+                        .increment_render_stale_frame_drops(session_id.clone(), stale_drops as u64);
+                }
+                frame = next_frame;
+            }
+            None => {
+                app_state
+                    .media_pipelines
+                    .lock()
+                    .await
+                    .record_queue_depth(session_id.clone(), 0);
+                break;
+            }
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -5026,9 +5101,8 @@ async fn sleep_until_lan_render_frame(
 }
 
 #[cfg(windows)]
-fn should_interrupt_render_pacing_sleep(pending_depth: usize, max_pending_frames: usize) -> bool {
-    let interrupt_depth = max_pending_frames.saturating_sub(1).max(1);
-    pending_depth >= interrupt_depth
+fn should_interrupt_render_pacing_sleep(pending_depth: usize, _max_pending_frames: usize) -> bool {
+    pending_depth > 0
 }
 
 #[cfg(windows)]
@@ -5068,7 +5142,6 @@ async fn render_lan_frame_once(
     session_id: SessionId,
     frame: RenderFrame,
 ) -> Result<LanRenderTaskOutcome> {
-    let started = Instant::now();
     let renderers = {
         let render_registry = app_state.media_surface_renderers.lock().await;
         render_registry.renderers_for_session(&session_id)
@@ -5078,25 +5151,57 @@ async fn render_lan_frame_once(
     }
 
     let mut rendered = 0;
+    let mut upload_duration_ms = 0.0_f64;
+    let mut lock_wait_ms = 0.0_f64;
+    let mut presented_frames = 0_u64;
+    let mut present_skips = 0_u64;
     for renderer in &renderers {
+        let lock_started = Instant::now();
         let Some(mut renderer) =
             wait_for_mutex_guard(renderer.as_ref(), LAN_RENDER_SURFACE_RENDERER_LOCK_TIMEOUT)
                 .map_err(|error| anyhow::anyhow!(error))?
         else {
+            lock_wait_ms += lock_started.elapsed().as_secs_f64() * 1000.0;
             if rendered == 0 {
                 return Ok(LanRenderTaskOutcome::Dropped);
             }
             continue;
         };
+        lock_wait_ms += lock_started.elapsed().as_secs_f64() * 1000.0;
+        let before = renderer.snapshot();
+        let upload_started = Instant::now();
         renderer
             .upload_frame(frame.clone())
             .map_err(|error| anyhow::anyhow!("upload frame to D3D11 renderer failed: {error}"))?;
+        upload_duration_ms += upload_started.elapsed().as_secs_f64() * 1000.0;
+        let after = renderer.snapshot();
+        let uploaded_delta = after
+            .uploaded_frame_count
+            .saturating_sub(before.uploaded_frame_count);
+        let mut presented_delta = after
+            .presented_frame_count
+            .saturating_sub(before.presented_frame_count);
+        let skipped_delta = after
+            .present_skipped_count
+            .saturating_sub(before.present_skipped_count);
+        if uploaded_delta > 0
+            && presented_delta == 0
+            && skipped_delta == 0
+            && after.last_present_status.is_none()
+        {
+            presented_delta = uploaded_delta;
+        }
+        presented_frames = presented_frames.saturating_add(presented_delta);
+        present_skips = present_skips.saturating_add(skipped_delta);
         rendered += 1;
     }
 
     if rendered > 0 {
         Ok(LanRenderTaskOutcome::Rendered {
-            duration_ms: started.elapsed().as_secs_f64() * 1000.0,
+            upload_duration_ms,
+            lock_wait_ms,
+            presented_frames,
+            present_skips,
         })
     } else {
         Ok(LanRenderTaskOutcome::Idle)
@@ -5718,7 +5823,7 @@ async fn selected_capture_source_id(
 
     #[cfg(test)]
     {
-        return Ok(TEST_SYNTHETIC_CAPTURE_SOURCE_ID.to_string());
+        Ok(TEST_SYNTHETIC_CAPTURE_SOURCE_ID.to_string())
     }
 
     #[cfg(not(test))]
@@ -5751,7 +5856,7 @@ async fn create_lan_frame_capture(
 
     #[cfg(windows)]
     {
-        return create_windows_lan_frame_capture(source_id, _profile);
+        create_windows_lan_frame_capture(source_id, _profile)
     }
 
     #[cfg(target_os = "macos")]
@@ -5829,8 +5934,6 @@ fn windows_lan_capture_backend(source_id: &str) -> &'static str {
     let normalized = source_id.trim().to_ascii_lowercase();
     if normalized.starts_with("windows:display-shared:") {
         "dxgi_shared"
-    } else if normalized.starts_with("windows:display:") {
-        "dxgi"
     } else {
         "winrt"
     }
@@ -6120,7 +6223,7 @@ fn find_h264_start_code(payload: &[u8], from: usize) -> Option<(usize, usize)> {
 }
 
 fn should_update_lan_preview(sequence: u64) -> bool {
-    sequence <= 1 || sequence % LAN_PREVIEW_FRAME_INTERVAL == 0
+    sequence <= 1 || sequence.is_multiple_of(LAN_PREVIEW_FRAME_INTERVAL)
 }
 
 fn decoded_frame_pixel_format(frame: &DecodedFrame) -> String {
@@ -7078,7 +7181,7 @@ mod tests {
                 let media = media.expect("QUIC media bootstrap");
                 assert_eq!(media.transport_kind, "quic");
                 let quic = media.quic.expect("QUIC bootstrap details");
-                assert!(quic.listen_addr.ends_with(":0") == false);
+                assert!(!quic.listen_addr.ends_with(":0"));
                 assert!(!quic.server_name.is_empty());
                 assert!(!quic.cert_der.is_empty());
                 let negotiation = media_profile.expect("media profile negotiation");
@@ -8704,12 +8807,12 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_lan_sender_prefers_dxgi_for_display_sources() {
+    fn windows_lan_sender_uses_monitor_specific_backends_for_display_sources() {
         assert_eq!(
             windows_lan_capture_backend("windows:display-shared:0"),
             "dxgi_shared"
         );
-        assert_eq!(windows_lan_capture_backend("windows:display:0"), "dxgi");
+        assert_eq!(windows_lan_capture_backend("windows:display:0"), "winrt");
         assert_eq!(
             windows_lan_capture_backend("windows:window:0x1234"),
             "winrt"
@@ -9042,7 +9145,10 @@ mod tests {
             lan_render_cap_target_fps_for_profile(&high_fps),
             Some(lan_render_pacing_target_fps(&high_fps))
         );
-        assert!(render_profile_requests_high_resolution_timer(&high_fps));
+        assert_eq!(
+            render_profile_requests_high_resolution_timer(&high_fps),
+            lan_render_pacing_target_fps(&high_fps) >= LAN_RENDER_PACING_PRECISE_SLEEP_MIN_FPS
+        );
         let precise_guard = render_pacing_precise_sleep_guard(120);
         assert!(precise_guard > Duration::ZERO);
         assert!(precise_guard < render_pacing_frame_interval(120));
@@ -9056,7 +9162,7 @@ mod tests {
             Duration::from_micros(7_000)
         );
         assert!(!should_interrupt_render_pacing_sleep(0, 3));
-        assert!(!should_interrupt_render_pacing_sleep(1, 3));
+        assert!(should_interrupt_render_pacing_sleep(1, 3));
         assert!(should_interrupt_render_pacing_sleep(2, 3));
         assert!(should_interrupt_render_pacing_sleep(1, 1));
         assert_eq!(
@@ -9503,6 +9609,80 @@ mod tests {
             Some(LAN_PREVIEW_FRAME_INTERVAL)
         );
         assert!(snapshot.latest_frame_data_url.is_none());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn d3d11_present_skip_is_not_counted_as_presented_frame() {
+        use mrd_render::{RenderError, RenderTarget, RendererInstance, RendererSnapshot};
+
+        struct PresentSkipRenderer {
+            uploaded: u64,
+            skipped: u64,
+        }
+
+        impl RendererInstance for PresentSkipRenderer {
+            fn attach_target(&mut self, _target: RenderTarget) -> Result<(), RenderError> {
+                Ok(())
+            }
+
+            fn upload_frame(&mut self, _frame: RenderFrame) -> Result<(), RenderError> {
+                self.uploaded += 1;
+                self.skipped += 1;
+                Ok(())
+            }
+
+            fn snapshot(&self) -> RendererSnapshot {
+                RendererSnapshot {
+                    attached_to_target: true,
+                    uploaded_frame_count: self.uploaded,
+                    presented_frame_count: 0,
+                    present_skipped_count: self.skipped,
+                    last_present_status: Some("skipped_still_drawing".to_string()),
+                    low_latency_frame_latency_target: None,
+                    swap_chain_max_frame_latency: None,
+                    swap_chain_allow_tearing: None,
+                    last_width: 1,
+                    last_height: 1,
+                    last_pixel_format: None,
+                }
+            }
+        }
+
+        let app_state = Arc::new(AppState::new());
+        let session_id = SessionId("present-skip-session".to_string());
+        app_state
+            .media_surface_renderers
+            .lock()
+            .await
+            .insert_renderer_for_test(
+                &session_id,
+                "surface-1",
+                Box::new(PresentSkipRenderer {
+                    uploaded: 0,
+                    skipped: 0,
+                }),
+            );
+
+        let outcome = render_lan_frame_once(
+            app_state,
+            session_id,
+            RenderFrame::from_bgra32(1, 1, vec![0, 0, 0, 255]),
+        )
+        .await
+        .expect("render one frame");
+
+        match outcome {
+            LanRenderTaskOutcome::Rendered {
+                presented_frames,
+                present_skips,
+                ..
+            } => {
+                assert_eq!(presented_frames, 0);
+                assert_eq!(present_skips, 1);
+            }
+            other => panic!("unexpected render outcome: {other:?}"),
+        }
     }
 
     #[tokio::test]

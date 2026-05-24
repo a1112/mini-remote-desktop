@@ -14,7 +14,7 @@ fn localhost_web_bridge_does_not_require_token() {
         WebBridgeConfig::new_for_test("127.0.0.1:9532".parse::<SocketAddr>().unwrap(), None)
             .expect("localhost bridge config");
 
-    assert!(config.requires_token() == false);
+    assert!(!config.requires_token());
 }
 
 #[test]

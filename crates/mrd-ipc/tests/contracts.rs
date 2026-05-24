@@ -266,6 +266,20 @@ fn serialize_deserialize_list_remote_capture_sources() {
 }
 
 #[test]
+fn serialize_deserialize_list_local_capture_sources() {
+    let request = IpcRequest::ListLocalCaptureSources {
+        include_previews: false,
+        limit: Some(24),
+    };
+
+    let json = serde_json::to_string(&request).unwrap();
+    assert!(json.contains("ListLocalCaptureSources"));
+    let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(request, deserialized);
+}
+
+#[test]
 fn serialize_deserialize_select_remote_capture_source() {
     let request = IpcRequest::SelectRemoteCaptureSource {
         session_id: test_session_id(),
@@ -665,7 +679,9 @@ fn serialize_deserialize_media_pipeline_snapshot_contract() {
             dropped_frames: 2,
             render_presented_frames: 120,
             render_queue_replacements: 1,
+            render_stale_frame_drops: 1,
             render_lock_drops: 1,
+            render_present_skips: 2,
             render_pacing_target_fps: Some(144),
             stage_metrics: vec![MediaStageMetrics {
                 stage: "decode".to_string(),
@@ -745,6 +761,20 @@ fn serialize_deserialize_capture_source_list_response() {
 }
 
 #[test]
+fn serialize_deserialize_local_capture_source_list_response() {
+    let response = IpcResponse::LocalCaptureSourceList {
+        sources: vec![test_capture_source()],
+    };
+
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("LocalCaptureSourceList"));
+    assert!(json.contains("windows:window:0x1234"));
+    let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(deserialized, response);
+}
+
+#[test]
 fn serialize_deserialize_capture_source_selected_response() {
     let selection = CaptureSourceSelection {
         session_id: test_session_id(),
@@ -785,6 +815,10 @@ fn serialize_deserialize_all_request_types() {
         IpcRequest::UpdateMediaProfile {
             session_id: test_session_id(),
             requested_profile: test_media_profile(),
+        },
+        IpcRequest::ListLocalCaptureSources {
+            include_previews: true,
+            limit: Some(16),
         },
         IpcRequest::ListRemoteCaptureSources {
             session_id: test_session_id(),

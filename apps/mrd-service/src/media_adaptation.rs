@@ -836,6 +836,7 @@ async fn update_adaptation_snapshot(
     .await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn update_adaptation_snapshot_with_profiles(
     app_state: &Arc<AppState>,
     session_id: &SessionId,

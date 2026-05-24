@@ -535,6 +535,32 @@ fn add_decode_capabilities(
             status,
             Some(reason.as_str()),
         );
+        let (hevc_status, hevc_reason) = match probe_mode {
+            CapabilityProbeMode::Runtime => probe_nvdec_hevc_status(platform),
+            CapabilityProbeMode::Static => static_windows_runtime_status("NVDEC HEVC"),
+        };
+        push_item(
+            items,
+            platform,
+            CapabilityDomain::Decode,
+            "decode.nvdec_hevc",
+            "NVDEC HEVC",
+            hevc_status,
+            Some(hevc_reason.as_str()),
+        );
+        let (hevc_main10_status, hevc_main10_reason) = match probe_mode {
+            CapabilityProbeMode::Runtime => probe_nvdec_hevc_main10_status(platform),
+            CapabilityProbeMode::Static => static_windows_runtime_status("NVDEC HEVC Main10"),
+        };
+        push_item(
+            items,
+            platform,
+            CapabilityDomain::Decode,
+            "decode.nvdec_hevc_main10",
+            "NVDEC HEVC Main10",
+            hevc_main10_status,
+            Some(hevc_main10_reason.as_str()),
+        );
         None
     } else {
         Some((
@@ -922,6 +948,69 @@ fn probe_nvdec_h264_status(platform: &CapabilityPlatform) -> (CapabilityStatus, 
     }
 }
 
+fn probe_nvdec_hevc_status(platform: &CapabilityPlatform) -> (CapabilityStatus, String) {
+    if !matches!(platform, CapabilityPlatform::Windows) {
+        return (
+            CapabilityStatus::Unimplemented,
+            "NVDEC HEVC runtime probing is only wired for Windows in service-owned capability snapshots."
+                .to_string(),
+        );
+    }
+
+    #[cfg(windows)]
+    {
+        static RESULT: OnceLock<(CapabilityStatus, String)> = OnceLock::new();
+        RESULT
+            .get_or_init(|| {
+                classify_runtime_probe(
+                    "NVDEC HEVC",
+                    mrd_decode_nvdec::probe_hevc_available().map_err(|error| error.to_string()),
+                )
+            })
+            .clone()
+    }
+
+    #[cfg(not(windows))]
+    {
+        (
+            CapabilityStatus::Unimplemented,
+            "NVDEC HEVC runtime probing is only compiled on Windows.".to_string(),
+        )
+    }
+}
+
+fn probe_nvdec_hevc_main10_status(platform: &CapabilityPlatform) -> (CapabilityStatus, String) {
+    if !matches!(platform, CapabilityPlatform::Windows) {
+        return (
+            CapabilityStatus::Unimplemented,
+            "NVDEC HEVC Main10 runtime probing is only wired for Windows in service-owned capability snapshots."
+                .to_string(),
+        );
+    }
+
+    #[cfg(windows)]
+    {
+        static RESULT: OnceLock<(CapabilityStatus, String)> = OnceLock::new();
+        RESULT
+            .get_or_init(|| {
+                classify_runtime_probe(
+                    "NVDEC HEVC Main10",
+                    mrd_decode_nvdec::probe_hevc_main10_available()
+                        .map_err(|error| error.to_string()),
+                )
+            })
+            .clone()
+    }
+
+    #[cfg(not(windows))]
+    {
+        (
+            CapabilityStatus::Unimplemented,
+            "NVDEC HEVC Main10 runtime probing is only compiled on Windows.".to_string(),
+        )
+    }
+}
+
 fn probe_d3d11_render_status(platform: &CapabilityPlatform) -> (CapabilityStatus, String) {
     if !matches!(platform, CapabilityPlatform::Windows) {
         return (
@@ -1048,6 +1137,19 @@ fn add_service_capabilities(items: &mut Vec<CapabilityItem>, platform: &Capabili
         "Autostart",
         "Autostart support is provided by platform shell adapters.",
     );
+    if matches!(
+        platform,
+        CapabilityPlatform::Windows | CapabilityPlatform::Linux
+    ) {
+        push_supported(
+            items,
+            platform,
+            CapabilityDomain::Service,
+            "media.hevc_main_420_8bit",
+            "HEVC Main 8-bit 4:2:0",
+            "HEVC Main 8-bit 4:2:0 is the default LAN high-performance profile when encoder and decoder probes pass.",
+        );
+    }
 }
 
 fn add_security_capabilities(items: &mut Vec<CapabilityItem>, platform: &CapabilityPlatform) {
@@ -1139,8 +1241,11 @@ fn default_profiles() -> Vec<CapabilityProfile> {
             1440,
             144,
             64,
-            "h264",
+            "hevc",
             vec![
+                "encode.nvenc_hevc",
+                "decode.nvdec_hevc",
+                "media.hevc_main_420_8bit",
                 "transport.quic_datagram",
                 "transport.media_profile_control_v1",
             ],
@@ -1151,8 +1256,11 @@ fn default_profiles() -> Vec<CapabilityProfile> {
             1600,
             165,
             80,
-            "h264",
+            "hevc",
             vec![
+                "encode.nvenc_hevc",
+                "decode.nvdec_hevc",
+                "media.hevc_main_420_8bit",
                 "transport.quic_datagram",
                 "transport.media_profile_control_v1",
             ],
@@ -1163,8 +1271,11 @@ fn default_profiles() -> Vec<CapabilityProfile> {
             2160,
             60,
             80,
-            "h264",
+            "hevc",
             vec![
+                "encode.nvenc_hevc",
+                "decode.nvdec_hevc",
+                "media.hevc_main_420_8bit",
                 "transport.quic_datagram",
                 "transport.media_profile_control_v1",
             ],
@@ -1346,5 +1457,33 @@ mod tests {
             .capabilities
             .iter()
             .any(|item| item.id == "render.opengl"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_snapshot_exposes_hevc_decode_and_profiles() {
+        let snapshot = local_capability_snapshot_static();
+
+        assert!(snapshot
+            .capabilities
+            .iter()
+            .any(|item| item.id == "decode.nvdec_hevc"));
+        assert!(snapshot
+            .capabilities
+            .iter()
+            .any(|item| item.id == "decode.nvdec_hevc_main10"));
+
+        let lan_2k144 = snapshot
+            .profiles
+            .iter()
+            .find(|profile| profile.id == "lan.2k144")
+            .expect("lan.2k144 profile");
+        assert_eq!(lan_2k144.codec, "hevc");
+        assert!(lan_2k144
+            .required_capabilities
+            .contains(&"encode.nvenc_hevc".to_string()));
+        assert!(lan_2k144
+            .required_capabilities
+            .contains(&"decode.nvdec_hevc".to_string()));
     }
 }

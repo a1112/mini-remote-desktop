@@ -100,6 +100,12 @@ impl OpenglRenderer {
             snapshot: RendererSnapshot {
                 attached_to_target: false,
                 uploaded_frame_count: 0,
+                presented_frame_count: 0,
+                present_skipped_count: 0,
+                last_present_status: None,
+                low_latency_frame_latency_target: None,
+                swap_chain_max_frame_latency: None,
+                swap_chain_allow_tearing: None,
                 last_width: 0,
                 last_height: 0,
                 last_pixel_format: None,
@@ -192,6 +198,8 @@ impl RendererInstance for OpenglRenderer {
         }
 
         self.snapshot.uploaded_frame_count += 1;
+        self.snapshot.presented_frame_count += 1;
+        self.snapshot.last_present_status = Some("presented".to_string());
         self.snapshot.last_width = frame.width;
         self.snapshot.last_height = frame.height;
         self.snapshot.last_pixel_format = Some(original_pixel_format);
@@ -503,7 +511,7 @@ unsafe fn load_wgl_proc<T: Copy>(name: &'static [u8]) -> Result<T, RenderError> 
         ))
     })?;
     let addr = proc as *const () as usize;
-    if matches!(addr, 0 | 1 | 2 | 3) || addr == usize::MAX {
+    if matches!(addr, 0..=3) || addr == usize::MAX {
         return Err(RenderError::Message(format!(
             "OpenGL extension function returned invalid pointer: {}",
             String::from_utf8_lossy(&name[..name.len().saturating_sub(1)])

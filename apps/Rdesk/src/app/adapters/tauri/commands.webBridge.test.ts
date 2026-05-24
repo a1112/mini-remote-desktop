@@ -4,6 +4,7 @@ import {
   browserWebrtcPreviewStart,
   browserWebrtcPreviewStop,
   ipcCapabilitySnapshot,
+  ipcListLocalCaptureSources,
   ipcRefreshLanDiscovery,
   serviceBootstrapIfNeeded,
   shellGetStatus,
@@ -112,6 +113,61 @@ describe('commands service bridge integration', () => {
     expect(invoke).not.toHaveBeenCalled();
   });
 
+  it('uses the browser service bridge for local capture source listing outside Tauri', async () => {
+    const invoke = getMockInvoke();
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        response: {
+          type: 'LocalCaptureSourceList',
+          sources: [
+            {
+              id: 'windows:display-shared:1',
+              platform: 'windows',
+              source_kind: 'display_shared',
+              title: 'Display 2 (D3D11 shared copy)',
+              class_name: 'DXGIShared:\\\\.\\DISPLAY2',
+              width: 3840,
+              height: 2160,
+              process_id: 0,
+              app_name: 'Display',
+              bundle_identifier: null,
+              preview_data_url: null,
+              preview_width: null,
+              preview_height: null,
+            },
+          ],
+        },
+      }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await ipcListLocalCaptureSources(false, 24);
+    const requestBody = JSON.parse((fetchMock.mock.calls[0]?.[1] as RequestInit).body as string);
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      throw new Error(JSON.stringify(result.error));
+    }
+    expect(result.value).toHaveLength(1);
+    expect(result.value[0]!.id).toBe('windows:display-shared:1');
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://127.0.0.1:9532/ipc',
+      expect.objectContaining({
+        method: 'POST',
+        body: expect.stringContaining('"type":"ListLocalCaptureSources"'),
+      })
+    );
+    expect(requestBody.request).toEqual(
+      expect.objectContaining({
+        type: 'ListLocalCaptureSources',
+        include_previews: false,
+        limit: 24,
+      })
+    );
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
   it('uses the browser service bridge for WebRTC preview start and stop outside Tauri', async () => {
     const invoke = getMockInvoke();
     const fetchMock = vi.fn()
@@ -133,8 +189,10 @@ describe('commands service bridge integration', () => {
       offerSdp: 'offer-sdp',
       fps: 120,
       h264Profile: 'high',
+      sourceId: 'windows:display-shared:1',
     });
     const stop = await browserWebrtcPreviewStop('local-display-test-1');
+    const startBody = JSON.parse((fetchMock.mock.calls[0]?.[1] as RequestInit).body as string);
 
     expect(start.ok && start.value.answer_sdp).toBe('answer-sdp');
     expect(stop.ok).toBe(true);
@@ -142,6 +200,12 @@ describe('commands service bridge integration', () => {
       1,
       'http://127.0.0.1:9532/browser/webrtc-preview/start',
       expect.objectContaining({ method: 'POST' })
+    );
+    expect(startBody).toEqual(
+      expect.objectContaining({
+        session_id: 'local-display-test-1',
+        source_id: 'windows:display-shared:1',
+      })
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,

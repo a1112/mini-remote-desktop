@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { getMockInvoke } from "../../test/mocks/tauri";
@@ -128,6 +128,30 @@ const remoteDisplaySource = {
   preview_width: 240,
   preview_height: 135,
 };
+
+const localDisplaySources = [
+  {
+    ...remoteDisplaySource,
+    id: "windows:display-shared:0",
+    title: "Display 1 (D3D11 shared copy)",
+    width: 2560,
+    height: 1440,
+    preview_data_url: null,
+    preview_width: null,
+    preview_height: null,
+  },
+  {
+    ...remoteDisplaySource,
+    id: "windows:display-shared:1",
+    title: "Display 2 (D3D11 shared copy)",
+    class_name: "DXGIShared:\\\\.\\DISPLAY2",
+    width: 3840,
+    height: 2160,
+    preview_data_url: null,
+    preview_width: null,
+    preview_height: null,
+  },
+];
 
 describe("RemoteDisplayWindowPage", () => {
   beforeEach(() => {
@@ -497,11 +521,15 @@ describe("RemoteDisplayWindowPage", () => {
           codec_fallback_reason: null,
           queue_depth: 0,
           dropped_frames: 2,
+          render_queue_replacements: 1,
+          render_lock_drops: 2,
+          render_present_skips: 3,
           stage_metrics: [
             { stage: "sender.capture", p95_ms: 1.7, samples: 20 },
             { stage: "sender.encode", p95_ms: 2.4, samples: 20 },
             { stage: "sender.send_datagram", p95_ms: 3.1, samples: 20 },
             { stage: "receiver.decode", p95_ms: 1.2, samples: 20 },
+            { stage: "render_lock_wait", p95_ms: 0.3, samples: 20 },
             { stage: "receiver.present", p95_ms: 4.6, samples: 20 },
           ],
         });
@@ -538,6 +566,9 @@ describe("RemoteDisplayWindowPage", () => {
     fireEvent.mouseEnter(diagnosticsChip);
 
     expect(await screen.findByText("远程诊断")).toBeInTheDocument();
+    const diagnosticsPopover = screen.getByTestId("remote-diagnostics-popover");
+    expect(diagnosticsPopover).toHaveClass("fixed");
+    expect(diagnosticsPopover.className).toContain("z-[1000]");
     expect(screen.getByText("连接质量")).toBeInTheDocument();
     expect(screen.getByText("性能曲线")).toBeInTheDocument();
     expect(screen.getByText("资源占用曲线")).toBeInTheDocument();
@@ -550,6 +581,10 @@ describe("RemoteDisplayWindowPage", () => {
     expect(screen.getByText("4:2:0")).toBeInTheDocument();
     expect(screen.getByText("NVDEC HEVC / D3D11")).toBeInTheDocument();
     expect(screen.getByText("DXGINative")).toBeInTheDocument();
+    expect(screen.getByText("渲染丢帧细分")).toBeInTheDocument();
+    expect(screen.getByText("队列 1 / 锁 2 / Present 3")).toBeInTheDocument();
+    expect(screen.getByText("渲染锁等待 p95")).toBeInTheDocument();
+    expect(screen.getAllByText("0.30 ms").length).toBeGreaterThan(0);
 
     fireEvent.click(diagnosticsChip);
     fireEvent.mouseLeave(diagnosticsChip.parentElement ?? diagnosticsChip);
@@ -1034,6 +1069,67 @@ describe("RemoteDisplayWindowPage", () => {
           }),
         })
       );
+    });
+  });
+
+  it("uses a stop action inside the test config modal while the local run is active", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(windowsCapabilities());
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-local-display-test-1",
+          session_id: "local-display-test-1",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: false,
+          render_mode: "web",
+          native_surface_attached: false,
+          session_window_count: 1,
+        });
+      }
+      if (command === "test_harness_stop") {
+        return Promise.resolve(null);
+      }
+      if (command === "test_start_run") {
+        return Promise.resolve("run-modal-stop");
+      }
+      if (command === "test_stop_run") {
+        return Promise.resolve(null);
+      }
+      if (command === "test_harness_get_metrics") {
+        return Promise.resolve({
+          is_running: true,
+          capture_fps: 120,
+          frame_count: 12,
+          total_latency_p95_ms: 13,
+          error_message: null,
+        });
+      }
+      if (command === "test_get_run") {
+        return Promise.resolve({ run_id: "run-modal-stop", status: "running", summary: null });
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay("local-display-test-1");
+
+    fireEvent.click(await screen.findByRole("button", { name: "Start local pipeline test" }));
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Stop local pipeline test" })).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "测试配置" }));
+
+    const dialog = await screen.findByRole("dialog", { name: "测试配置" });
+    expect(within(dialog).getByText("当前测试运行中；停止后修改才会影响下一次启动")).toBeInTheDocument();
+    expect(within(dialog).getByRole("button", { name: "FPS 144 FPS" })).toBeDisabled();
+    fireEvent.click(within(dialog).getByRole("button", { name: "停止测试" }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("test_stop_run", { runId: "run-modal-stop" });
     });
   });
 
@@ -1965,6 +2061,141 @@ describe("RemoteDisplayWindowPage", () => {
         sessionId: "p2p-quic-123",
         sourceId: "windows:window:0x1234",
       });
+    });
+  });
+
+  it("shows local display source selection for local preview sessions", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(windowsCapabilities());
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-local-display-test-1",
+          session_id: "local-display-test-1",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: false,
+          render_mode: "web",
+          native_surface_attached: false,
+          session_window_count: 1,
+        });
+      }
+      if (command === "ipc_list_local_capture_sources") {
+        return Promise.resolve(localDisplaySources);
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay("local-display-test-1");
+
+    fireEvent.click(await screen.findByRole("button", { name: "配置" }));
+    expect(await screen.findByText("本机捕获源")).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("button", { name: "刷新捕获源" }));
+
+    const localSourceSelect = await screen.findByLabelText("本机捕获源下拉");
+    fireEvent.change(localSourceSelect, {
+      target: { value: "windows:display-shared:1" },
+    });
+
+    await waitFor(() => {
+      expect(screen.getAllByText(/Display 2/).length).toBeGreaterThan(0);
+    });
+    expect(screen.getByText(/3840x2160/)).toBeInTheDocument();
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("ipc_list_local_capture_sources", {
+        includePreviews: false,
+        limit: 24,
+      });
+      expect(mockInvoke).toHaveBeenCalledWith("ipc_list_local_capture_sources", {
+        includePreviews: true,
+        limit: 2,
+      });
+    });
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      "ipc_select_remote_capture_source",
+      expect.anything()
+    );
+  });
+
+  it("passes the selected local display source into native local test config", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(windowsCapabilities());
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-local-display-test-1",
+          session_id: "local-display-test-1",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: false,
+          render_mode: "d3d11_native",
+          native_surface_attached: true,
+          session_window_count: 1,
+        });
+      }
+      if (command === "configure_remote_display_native_surface") {
+        return Promise.resolve({
+          label: "render-local-display-test-1",
+          backend: args?.enabled ? "d3d11" : "web",
+          attached: Boolean(args?.enabled),
+          visible: Boolean(args?.visible),
+          parent_hwnd: "0xA",
+          hwnd: args?.enabled ? "0x14" : null,
+          rect: { x: 0, y: 56, width: 1280, height: 720 },
+        });
+      }
+      if (command === "ipc_list_local_capture_sources") {
+        return Promise.resolve(localDisplaySources);
+      }
+      if (command === "present_test_harness_frame_on_native_surface") {
+        return Promise.resolve(true);
+      }
+      if (command === "test_harness_stop") {
+        return Promise.resolve(null);
+      }
+      if (command === "test_start_run") {
+        return Promise.resolve("run-local-source");
+      }
+      if (command === "test_harness_get_metrics") {
+        return Promise.resolve({
+          is_running: true,
+          capture_fps: 120,
+          frame_count: 12,
+          total_latency_p95_ms: 8,
+          error_message: null,
+        });
+      }
+      if (command === "test_get_run") {
+        return Promise.resolve({ run_id: "run-local-source", status: "running", summary: null });
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay("local-display-test-1");
+
+    fireEvent.click(await screen.findByRole("button", { name: "测试配置" }));
+    fireEvent.click(await screen.findByRole("button", { name: "刷新捕获源" }));
+    fireEvent.change(await screen.findByLabelText("本机捕获源下拉"), {
+      target: { value: "windows:display-shared:1" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Start local pipeline test" }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_start_run",
+        expect.objectContaining({
+          scenarioId: "custom",
+          config: expect.objectContaining({
+            source_id: "windows:display-shared:1",
+            source_kind: "display_shared",
+            display_id: "windows:display-shared:1",
+          }),
+        })
+      );
     });
   });
 

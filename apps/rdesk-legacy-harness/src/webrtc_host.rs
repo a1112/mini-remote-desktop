@@ -11,7 +11,7 @@ use crate::app_settings::DecodePolicy;
 use crate::frame_sink::DecodedFrameSink;
 use crate::webrtc_media::H264AccessUnitAssembler;
 use mrd_capture_dxgi::DxgiDesktopCapture;
-use mrd_decode::{PixelFormat, VideoDecoder};
+use mrd_decode::VideoDecoder;
 use mrd_encode_openh264::OpenH264Encoder;
 use mrd_observability::{
     MediaProbeEvent, PipelineProbeSnapshot, ProbeRegistry, ProbeSessionHandle, StageId,
@@ -411,6 +411,7 @@ impl WebrtcHost {
         Ok(())
     }
 
+    #[allow(dead_code)]
     async fn start_sender_with_components<C, E>(
         &mut self,
         session_id: SessionId,
@@ -466,6 +467,7 @@ impl WebrtcHost {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) async fn prepare_test_video_sender_with_backend(
         &mut self,
         session_id: SessionId,
@@ -568,6 +570,7 @@ async fn ensure_sample_sender(
     Ok(sender)
 }
 
+#[allow(dead_code)]
 async fn wait_for_peer_connection_connected(
     pc: &Arc<RTCPeerConnection>,
     timeout: Duration,
@@ -1028,6 +1031,7 @@ fn apply_decoded_frames_to_snapshot(
     }
 }
 
+#[allow(dead_code)]
 async fn run_embedded_sender_loop<C, E>(
     mut capture: C,
     mut encoder: E,
@@ -1119,6 +1123,7 @@ async fn run_embedded_sender_loop<C, E>(
     snapshot.lock().expect("lock host snapshot").sender_running = false;
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_blocking_desktop_sender_loop<C, E>(
     capture: &mut C,
     encoder: &mut E,
@@ -1465,13 +1470,13 @@ mod tests {
                 chunk[3] = 255;
             }
 
-            Ok(CapturedFrame {
-                width: 16,
-                height: 16,
-                pixel_format: FramePixelFormat::Bgra32,
-                timestamp_us: self.tick as u64 * 33_000,
+            Ok(CapturedFrame::from_cpu(
+                16,
+                16,
+                FramePixelFormat::Bgra32,
+                self.tick as u64 * 33_000,
                 data,
-            })
+            ))
         }
     }
 
@@ -1873,13 +1878,13 @@ mod tests {
         }
 
         let access_unit = encoder
-            .encode(&CapturedFrame {
-                width: 1280,
-                height: 720,
-                pixel_format: FramePixelFormat::Bgra32,
-                timestamp_us: 33_000,
-                data: frame,
-            })
+            .encode(&CapturedFrame::from_cpu(
+                1280,
+                720,
+                FramePixelFormat::Bgra32,
+                33_000,
+                frame,
+            ))
             .expect("encode nvenc frame")
             .into_iter()
             .next()

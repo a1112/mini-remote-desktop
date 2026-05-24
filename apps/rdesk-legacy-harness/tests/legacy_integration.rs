@@ -9,36 +9,21 @@ use axum::{
     routing::get,
     Router,
 };
-use base64::Engine;
-use futures_util::{SinkExt, StreamExt};
-use mrd_pipeline_core::{CapturedFrame, FrameCapture, FramePixelFormat, VideoEncoder};
+use futures_util::StreamExt;
 use mrd_proto::{DeviceId, SessionId};
 use mrd_signal_client::{decode_message, encode_message};
-use mrd_signal_proto::{IceCandidate, SessionDescription, SignalMessage};
+use mrd_signal_proto::SignalMessage;
 use rdesk_legacy_harness::test_helpers::*;
 use rdesk_legacy_harness::{
     app_settings::{load_settings, DecodePolicy},
-    benchmark::{write_benchmark_artifacts, BenchmarkManifest, BenchmarkPaths, BenchmarkSummary},
     frame_sink::DecodedFrameSink,
-    quic_host::QuicHost,
-    quic_session::QuicSessionCoordinator,
     realtime_runtime::RealtimeRuntime,
     render_host::RenderHost,
-    session_lifecycle::SessionLifecycleCoordinator,
-    webrtc_host::WebrtcHost,
     webrtc_session::WebrtcSessionCoordinator,
 };
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use std::{collections::HashMap, sync::Arc, sync::Once};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, Mutex};
-
-fn ensure_rustls_crypto_provider() {
-    static INSTALL: Once = Once::new();
-    INSTALL.call_once(|| {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    });
-}
+use tokio::sync::Mutex;
 
 // =============================================================================
 // Test: NVDEC runtime probe
@@ -362,6 +347,5 @@ fn render_host_snapshot_reports_attachment_and_preview() {
     assert!(response
         .preview_data_url
         .as_deref()
-        .map_or(false, |value: &str| value
-            .starts_with("data:image/png;base64,")));
+        .is_some_and(|value: &str| value.starts_with("data:image/png;base64,")));
 }

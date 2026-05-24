@@ -25,6 +25,8 @@ struct RenderSurface {
     swap_chain: windows::Win32::Graphics::Dxgi::IDXGISwapChain1,
     back_buffer: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
     render_target_view: windows::Win32::Graphics::Direct3D11::ID3D11RenderTargetView,
+    max_frame_latency: Option<u32>,
+    allow_tearing: bool,
     width: u32,
     height: u32,
 }
@@ -42,6 +44,31 @@ struct SharedNv12SrvCache {
     uv_handle: isize,
     y_srv: windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView,
     uv_srv: windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView,
+}
+
+#[cfg(windows)]
+struct SharedBgraResourceCache {
+    shared_handle: isize,
+    resource: windows::Win32::Graphics::Direct3D11::ID3D11Resource,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum D3d11PresentStatus {
+    Presented,
+    SkippedStillDrawing,
+    NoTarget,
+}
+
+#[cfg(windows)]
+impl D3d11PresentStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Presented => "presented",
+            Self::SkippedStillDrawing => "skipped_still_drawing",
+            Self::NoTarget => "no_target",
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -92,6 +119,13 @@ float4 main(PsIn input) : SV_TARGET {
 }
 "#;
 
+#[cfg(windows)]
+const SHARED_NV12_SRV_CACHE_LIMIT: usize = 32;
+#[cfg(windows)]
+const SHARED_BGRA_RESOURCE_CACHE_LIMIT: usize = 16;
+#[cfg(windows)]
+const D3D11_LOW_LATENCY_MAX_FRAME_LATENCY: u32 = 1;
+
 pub struct D3d11Renderer {
     #[cfg(windows)]
     device: windows::Win32::Graphics::Direct3D11::ID3D11Device,
@@ -102,9 +136,14 @@ pub struct D3d11Renderer {
     #[cfg(windows)]
     shared_nv12_pipeline: Option<SharedNv12Pipeline>,
     #[cfg(windows)]
-    shared_nv12_srv_cache: Option<SharedNv12SrvCache>,
+    shared_nv12_srv_cache: Vec<SharedNv12SrvCache>,
+    #[cfg(windows)]
+    shared_bgra_resource_cache: Vec<SharedBgraResourceCache>,
     attached_to_target: bool,
     uploaded_frame_count: u64,
+    presented_frame_count: u64,
+    present_skipped_count: u64,
+    last_present_status: Option<&'static str>,
     last_width: usize,
     last_height: usize,
     last_pixel_format: Option<RenderPixelFormat>,
@@ -173,9 +212,13 @@ impl D3d11Renderer {
                 context,
                 surface: None,
                 shared_nv12_pipeline: None,
-                shared_nv12_srv_cache: None,
+                shared_nv12_srv_cache: Vec::new(),
+                shared_bgra_resource_cache: Vec::new(),
                 attached_to_target: false,
                 uploaded_frame_count: 0,
+                presented_frame_count: 0,
+                present_skipped_count: 0,
+                last_present_status: None,
                 last_width: 0,
                 last_height: 0,
                 last_pixel_format: None,
@@ -202,28 +245,133 @@ impl D3d11Renderer {
     }
 
     #[cfg(windows)]
-    fn present_flags() -> u32 {
-        use windows::Win32::Graphics::Dxgi::DXGI_PRESENT_DO_NOT_WAIT;
+    fn present_flags(allow_tearing: bool) -> u32 {
+        use windows::Win32::Graphics::Dxgi::{
+            DXGI_PRESENT_ALLOW_TEARING, DXGI_PRESENT_DO_NOT_WAIT,
+        };
 
-        match std::env::var("MRD_D3D11_RENDER_PRESENT_BLOCKING") {
-            Ok(value) if value == "1" || value.eq_ignore_ascii_case("true") => 0,
-            _ => DXGI_PRESENT_DO_NOT_WAIT,
+        if matches!(
+            std::env::var("MRD_D3D11_RENDER_PRESENT_BLOCKING"),
+            Ok(value) if value == "1" || value.eq_ignore_ascii_case("true")
+        ) {
+            return 0;
         }
+
+        let mut flags = DXGI_PRESENT_DO_NOT_WAIT;
+        if allow_tearing {
+            flags |= DXGI_PRESENT_ALLOW_TEARING;
+        }
+        flags
     }
 
     #[cfg(windows)]
     fn present_swap_chain(
         swap_chain: &windows::Win32::Graphics::Dxgi::IDXGISwapChain1,
-    ) -> Result<(), RenderError> {
+        allow_tearing: bool,
+    ) -> Result<D3d11PresentStatus, RenderError> {
         use windows::Win32::Graphics::Dxgi::DXGI_ERROR_WAS_STILL_DRAWING;
 
-        let hr = unsafe { swap_chain.Present(0, Self::present_flags()) };
+        let hr = unsafe { swap_chain.Present(0, Self::present_flags(allow_tearing)) };
         if hr == DXGI_ERROR_WAS_STILL_DRAWING {
-            return Ok(());
+            return Ok(D3d11PresentStatus::SkippedStillDrawing);
         }
         hr.ok()
             .map_err(|error| RenderError::Message(format!("present 失败: {error}")))?;
-        Ok(())
+        Ok(D3d11PresentStatus::Presented)
+    }
+
+    #[cfg(windows)]
+    fn low_latency_frame_latency_target() -> u32 {
+        D3D11_LOW_LATENCY_MAX_FRAME_LATENCY
+    }
+
+    #[cfg(windows)]
+    fn max_frame_latency_target() -> Option<u32> {
+        match std::env::var("MRD_D3D11_RENDER_MAX_FRAME_LATENCY") {
+            Ok(value) if value == "0" || value.eq_ignore_ascii_case("off") => None,
+            Ok(value) => value
+                .parse::<u32>()
+                .ok()
+                .filter(|latency| *latency > 0)
+                .or(Some(D3D11_LOW_LATENCY_MAX_FRAME_LATENCY)),
+            Err(_) => Some(D3D11_LOW_LATENCY_MAX_FRAME_LATENCY),
+        }
+    }
+
+    #[cfg(windows)]
+    fn configure_low_latency_device(
+        dxgi_device: &windows::Win32::Graphics::Dxgi::IDXGIDevice,
+    ) -> Result<Option<u32>, RenderError> {
+        use windows::Win32::Graphics::Dxgi::IDXGIDevice1;
+
+        let Some(max_frame_latency) = Self::max_frame_latency_target() else {
+            return Ok(None);
+        };
+        let dxgi_device1: IDXGIDevice1 = dxgi_device
+            .cast()
+            .map_err(|error| RenderError::Message(format!("转换 IDXGIDevice1 失败: {error}")))?;
+        unsafe { dxgi_device1.SetMaximumFrameLatency(max_frame_latency) }.map_err(|error| {
+            RenderError::Message(format!("配置 DXGI device 帧延迟失败: {error}"))
+        })?;
+        Ok(Some(max_frame_latency))
+    }
+
+    #[cfg(windows)]
+    fn window_swap_chain_desc(
+        width: u32,
+        height: u32,
+        allow_tearing: bool,
+    ) -> windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_DESC1 {
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
+        };
+        use windows::Win32::Graphics::Dxgi::{
+            DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING,
+            DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT,
+        };
+
+        let mut flags = 0_u32;
+        if allow_tearing {
+            flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0 as u32;
+        }
+
+        DXGI_SWAP_CHAIN_DESC1 {
+            Width: width,
+            Height: height,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            Stereo: false.into(),
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+            BufferCount: 2,
+            Scaling: DXGI_SCALING_STRETCH,
+            SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+            AlphaMode: DXGI_ALPHA_MODE_IGNORE,
+            Flags: flags,
+        }
+    }
+
+    #[cfg(windows)]
+    fn check_tearing_support(factory: &windows::Win32::Graphics::Dxgi::IDXGIFactory2) -> bool {
+        use windows::Win32::Foundation::BOOL;
+        use windows::Win32::Graphics::Dxgi::{IDXGIFactory5, DXGI_FEATURE_PRESENT_ALLOW_TEARING};
+
+        let Ok(factory5): Result<IDXGIFactory5, _> = factory.cast() else {
+            return false;
+        };
+        let mut allow_tearing = BOOL(0);
+        unsafe {
+            factory5
+                .CheckFeatureSupport(
+                    DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+                    &mut allow_tearing as *mut BOOL as *mut core::ffi::c_void,
+                    core::mem::size_of::<BOOL>() as u32,
+                )
+                .is_ok()
+                && allow_tearing.as_bool()
+        }
     }
 
     #[cfg(windows)]
@@ -233,13 +381,7 @@ impl D3d11Renderer {
     ) -> Result<Option<RenderSurface>, RenderError> {
         use windows::Win32::Foundation::{HWND, RECT};
         use windows::Win32::Graphics::Direct3D11::{ID3D11RenderTargetView, ID3D11Texture2D};
-        use windows::Win32::Graphics::Dxgi::Common::{
-            DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
-        };
-        use windows::Win32::Graphics::Dxgi::{
-            IDXGIDevice, IDXGIFactory2, IDXGISwapChain1, DXGI_SCALING_STRETCH,
-            DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT,
-        };
+        use windows::Win32::Graphics::Dxgi::{IDXGIDevice, IDXGIFactory2, IDXGISwapChain1};
         use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 
         if window_handle == 0 {
@@ -257,26 +399,13 @@ impl D3d11Renderer {
             .device
             .cast()
             .map_err(|error| RenderError::Message(format!("转换 IDXGIDevice 失败: {error}")))?;
+        let max_frame_latency = Self::configure_low_latency_device(&dxgi_device)?;
         let adapter = unsafe { dxgi_device.GetAdapter() }
             .map_err(|error| RenderError::Message(format!("获取 DXGI adapter 失败: {error}")))?;
         let factory: IDXGIFactory2 = unsafe { adapter.GetParent() }
             .map_err(|error| RenderError::Message(format!("获取 DXGI factory 失败: {error}")))?;
-        let swap_chain_desc = DXGI_SWAP_CHAIN_DESC1 {
-            Width: width,
-            Height: height,
-            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-            Stereo: false.into(),
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-            BufferCount: 2,
-            Scaling: DXGI_SCALING_STRETCH,
-            SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
-            AlphaMode: DXGI_ALPHA_MODE_IGNORE,
-            Flags: 0,
-        };
+        let allow_tearing = Self::check_tearing_support(&factory);
+        let swap_chain_desc = Self::window_swap_chain_desc(width, height, allow_tearing);
 
         let swap_chain: IDXGISwapChain1 = unsafe {
             factory.CreateSwapChainForHwnd(
@@ -304,6 +433,8 @@ impl D3d11Renderer {
             swap_chain,
             back_buffer,
             render_target_view,
+            max_frame_latency,
+            allow_tearing,
             width,
             height,
         }))
@@ -358,9 +489,9 @@ impl D3d11Renderer {
     }
 
     #[cfg(windows)]
-    fn present_clear_frame(&self, frame: &RenderFrame) -> Result<(), RenderError> {
+    fn present_clear_frame(&self, frame: &RenderFrame) -> Result<D3d11PresentStatus, RenderError> {
         let Some(surface) = self.surface.as_ref() else {
-            return Ok(());
+            return Ok(D3d11PresentStatus::NoTarget);
         };
 
         let clear = Self::average_clear_color(frame);
@@ -370,16 +501,18 @@ impl D3d11Renderer {
             self.context
                 .ClearRenderTargetView(&surface.render_target_view, &clear);
         }
-        Self::present_swap_chain(&surface.swap_chain)?;
-        Ok(())
+        Self::present_swap_chain(&surface.swap_chain, surface.allow_tearing)
     }
 
     #[cfg(windows)]
-    fn present_uploaded_frame_bgra(&self, frame: &RenderFrame) -> Result<(), RenderError> {
+    fn present_uploaded_frame_bgra(
+        &self,
+        frame: &RenderFrame,
+    ) -> Result<D3d11PresentStatus, RenderError> {
         use mrd_render::RenderFrameData;
         use windows::Win32::Graphics::Direct3D11::D3D11_BOX;
         let Some(surface) = self.surface.as_ref() else {
-            return Ok(());
+            return Ok(D3d11PresentStatus::NoTarget);
         };
 
         let data = match &frame.data {
@@ -422,7 +555,7 @@ impl D3d11Renderer {
         let copy_width = upload_width.min(surface_width);
         let copy_height = upload_height.min(surface_height);
         if copy_width == 0 || copy_height == 0 {
-            return Ok(());
+            return Ok(D3d11PresentStatus::NoTarget);
         }
         let copy_box = D3D11_BOX {
             left: 0,
@@ -434,10 +567,6 @@ impl D3d11Renderer {
         };
 
         unsafe {
-            self.context
-                .OMSetRenderTargets(Some(&[Some(surface.render_target_view.clone())]), None);
-            self.context
-                .ClearRenderTargetView(&surface.render_target_view, &[0.0, 0.0, 0.0, 1.0]);
             self.context.UpdateSubresource(
                 &surface.back_buffer,
                 0,
@@ -447,8 +576,7 @@ impl D3d11Renderer {
                 0,
             );
         }
-        Self::present_swap_chain(&surface.swap_chain)?;
-        Ok(())
+        Self::present_swap_chain(&surface.swap_chain, surface.allow_tearing)
     }
 
     #[cfg(windows)]
@@ -532,10 +660,13 @@ impl D3d11Renderer {
     }
 
     #[cfg(windows)]
-    fn present_uploaded_frame(&self, frame: &RenderFrame) -> Result<(), RenderError> {
+    fn present_uploaded_frame(
+        &self,
+        frame: &RenderFrame,
+    ) -> Result<D3d11PresentStatus, RenderError> {
         use windows::Win32::Graphics::Direct3D11::D3D11_BOX;
         let Some(surface) = self.surface.as_ref() else {
-            return Ok(());
+            return Ok(D3d11PresentStatus::NoTarget);
         };
 
         let bgra = Self::rgb24_to_bgra(frame)?;
@@ -562,7 +693,7 @@ impl D3d11Renderer {
         let copy_width = upload_width.min(surface_width);
         let copy_height = upload_height.min(surface_height);
         if copy_width == 0 || copy_height == 0 {
-            return Ok(());
+            return Ok(D3d11PresentStatus::NoTarget);
         }
         let copy_box = D3D11_BOX {
             left: 0,
@@ -574,10 +705,6 @@ impl D3d11Renderer {
         };
 
         unsafe {
-            self.context
-                .OMSetRenderTargets(Some(&[Some(surface.render_target_view.clone())]), None);
-            self.context
-                .ClearRenderTargetView(&surface.render_target_view, &[0.0, 0.0, 0.0, 1.0]);
             self.context.UpdateSubresource(
                 &surface.back_buffer,
                 0,
@@ -587,12 +714,14 @@ impl D3d11Renderer {
                 0,
             );
         }
-        Self::present_swap_chain(&surface.swap_chain)?;
-        Ok(())
+        Self::present_swap_chain(&surface.swap_chain, surface.allow_tearing)
     }
 
     #[cfg(windows)]
-    fn compile_shader(source: &str, target: &'static [u8]) -> Result<Vec<u8>, RenderError> {
+    fn compile_shader(
+        source: &str,
+        target: &'static core::ffi::CStr,
+    ) -> Result<Vec<u8>, RenderError> {
         use windows::core::PCSTR;
         use windows::Win32::Graphics::Direct3D::{Fxc::D3DCompile, ID3DBlob, ID3DInclude};
 
@@ -605,8 +734,8 @@ impl D3d11Renderer {
                 PCSTR::null(),
                 None,
                 None::<&ID3DInclude>,
-                PCSTR(b"main\0".as_ptr()),
-                PCSTR(target.as_ptr()),
+                PCSTR(c"main".as_ptr().cast()),
+                PCSTR(target.as_ptr().cast()),
                 0,
                 0,
                 &mut code,
@@ -646,8 +775,8 @@ impl D3d11Renderer {
             D3D11_TEXTURE_ADDRESS_CLAMP,
         };
 
-        let vertex_code = Self::compile_shader(SHARED_NV12_VERTEX_SHADER, b"vs_5_0\0")?;
-        let pixel_code = Self::compile_shader(SHARED_NV12_PIXEL_SHADER, b"ps_5_0\0")?;
+        let vertex_code = Self::compile_shader(SHARED_NV12_VERTEX_SHADER, c"vs_5_0")?;
+        let pixel_code = Self::compile_shader(SHARED_NV12_PIXEL_SHADER, c"ps_5_0")?;
 
         let mut vertex_shader = None::<ID3D11VertexShader>;
         let mut pixel_shader = None::<ID3D11PixelShader>;
@@ -759,6 +888,41 @@ impl D3d11Renderer {
     }
 
     #[cfg(windows)]
+    fn shared_bgra_resource(
+        &mut self,
+        shared_handle: isize,
+    ) -> Result<windows::Win32::Graphics::Direct3D11::ID3D11Resource, RenderError> {
+        if let Some(position) = self
+            .shared_bgra_resource_cache
+            .iter()
+            .position(|cache| cache.shared_handle == shared_handle)
+        {
+            let cache = self.shared_bgra_resource_cache.remove(position);
+            let resource = cache.resource.clone();
+            self.shared_bgra_resource_cache.push(cache);
+            return Ok(resource);
+        }
+
+        let texture = self.open_shared_texture(shared_handle)?;
+        let resource: windows::Win32::Graphics::Direct3D11::ID3D11Resource =
+            texture.cast().map_err(|error| {
+                RenderError::Message(format!(
+                    "cast shared BGRA texture to resource failed: {error}"
+                ))
+            })?;
+        self.shared_bgra_resource_cache
+            .push(SharedBgraResourceCache {
+                shared_handle,
+                resource: resource.clone(),
+            });
+        while self.shared_bgra_resource_cache.len() > SHARED_BGRA_RESOURCE_CACHE_LIMIT {
+            self.shared_bgra_resource_cache.remove(0);
+        }
+
+        Ok(resource)
+    }
+
+    #[cfg(windows)]
     fn shared_nv12_srvs(
         &mut self,
         y_handle: isize,
@@ -770,32 +934,48 @@ impl D3d11Renderer {
         ),
         RenderError,
     > {
-        if let Some(cache) = self.shared_nv12_srv_cache.as_ref() {
-            if cache.y_handle == y_handle && cache.uv_handle == uv_handle {
-                return Ok((cache.y_srv.clone(), cache.uv_srv.clone()));
-            }
+        if let Some(position) = self
+            .shared_nv12_srv_cache
+            .iter()
+            .position(|cache| cache.y_handle == y_handle && cache.uv_handle == uv_handle)
+        {
+            let cache = self.shared_nv12_srv_cache.remove(position);
+            let result = (cache.y_srv.clone(), cache.uv_srv.clone());
+            self.shared_nv12_srv_cache.push(cache);
+            return Ok(result);
         }
 
         let y_srv = self.open_shared_texture_srv(y_handle)?;
         let uv_srv = self.open_shared_texture_srv(uv_handle)?;
-        self.shared_nv12_srv_cache = Some(SharedNv12SrvCache {
+        self.shared_nv12_srv_cache.push(SharedNv12SrvCache {
             y_handle,
             uv_handle,
             y_srv: y_srv.clone(),
             uv_srv: uv_srv.clone(),
         });
+        while self.shared_nv12_srv_cache.len() > SHARED_NV12_SRV_CACHE_LIMIT {
+            self.shared_nv12_srv_cache.remove(0);
+        }
 
         Ok((y_srv, uv_srv))
     }
 
     #[cfg(windows)]
-    fn present_shared_bgra_frame(&self, frame: &RenderFrame) -> Result<(), RenderError> {
+    fn present_shared_bgra_frame(
+        &mut self,
+        frame: &RenderFrame,
+    ) -> Result<D3d11PresentStatus, RenderError> {
         use mrd_render::RenderFrameData;
         use windows::Win32::Graphics::Direct3D11::{ID3D11Resource, D3D11_BOX};
 
         let Some(surface) = self.surface.as_ref() else {
-            return Ok(());
+            return Ok(D3d11PresentStatus::NoTarget);
         };
+        let surface_width = surface.width;
+        let surface_height = surface.height;
+        let back_buffer = surface.back_buffer.clone();
+        let swap_chain = surface.swap_chain.clone();
+        let allow_tearing = surface.allow_tearing;
 
         let shared_handle = match &frame.data {
             RenderFrameData::D3D11SharedBgra { shared_handle, .. } => *shared_handle,
@@ -806,26 +986,19 @@ impl D3d11Renderer {
             }
         };
 
-        let source_texture = self.open_shared_texture(shared_handle)?;
-        let source_resource: ID3D11Resource = source_texture.cast().map_err(|error| {
-            RenderError::Message(format!(
-                "cast shared BGRA texture to resource failed: {error}"
-            ))
-        })?;
-        let target_resource: ID3D11Resource = surface.back_buffer.cast().map_err(|error| {
+        let source_resource = self.shared_bgra_resource(shared_handle)?;
+        let target_resource: ID3D11Resource = back_buffer.cast().map_err(|error| {
             RenderError::Message(format!("cast back buffer to resource failed: {error}"))
         })?;
 
-        let copy_width = frame.width.min(surface.width as usize);
-        let copy_height = frame.height.min(surface.height as usize);
+        let copy_width = frame.width.min(surface_width as usize);
+        let copy_height = frame.height.min(surface_height as usize);
         if copy_width == 0 || copy_height == 0 {
-            return Ok(());
+            return Ok(D3d11PresentStatus::NoTarget);
         }
 
         unsafe {
-            self.context
-                .OMSetRenderTargets(Some(&[Some(surface.render_target_view.clone())]), None);
-            if frame.width == surface.width as usize && frame.height == surface.height as usize {
+            if frame.width == surface_width as usize && frame.height == surface_height as usize {
                 self.context
                     .CopyResource(&target_resource, &source_resource);
             } else {
@@ -849,18 +1022,20 @@ impl D3d11Renderer {
                 );
             }
         }
-        Self::present_swap_chain(&surface.swap_chain)?;
-        Ok(())
+        Self::present_swap_chain(&swap_chain, allow_tearing)
     }
 
     #[cfg(windows)]
-    fn present_shared_texture_frame(&mut self, frame: &RenderFrame) -> Result<(), RenderError> {
+    fn present_shared_texture_frame(
+        &mut self,
+        frame: &RenderFrame,
+    ) -> Result<D3d11PresentStatus, RenderError> {
         use mrd_render::RenderFrameData;
         use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
         use windows::Win32::Graphics::Direct3D11::{ID3D11ShaderResourceView, D3D11_VIEWPORT};
 
         let Some(surface) = self.surface.as_ref() else {
-            return Ok(());
+            return Ok(D3d11PresentStatus::NoTarget);
         };
 
         let (shared_handle_y, shared_handle_uv) = match &frame.data {
@@ -887,6 +1062,7 @@ impl D3d11Renderer {
         let surface_height = surface.height;
         let render_target_view = surface.render_target_view.clone();
         let swap_chain = surface.swap_chain.clone();
+        let allow_tearing = surface.allow_tearing;
         let (y_srv, uv_srv) = self.shared_nv12_srvs(shared_handle_y, shared_handle_uv)?;
         let (vertex_shader, pixel_shader, sampler) = {
             let pipeline = self.ensure_shared_nv12_pipeline()?;
@@ -912,9 +1088,16 @@ impl D3d11Renderer {
         let empty_srvs: [Option<ID3D11ShaderResourceView>; 2] = [None, None];
 
         unsafe {
-            let clear = [0.0_f32, 0.0, 0.0, 1.0];
-            self.context
-                .ClearRenderTargetView(&render_target_view, &clear);
+            if should_clear_shared_present_surface(
+                surface_width,
+                surface_height,
+                frame.width,
+                frame.height,
+            ) {
+                let clear = [0.0_f32, 0.0, 0.0, 1.0];
+                self.context
+                    .ClearRenderTargetView(&render_target_view, &clear);
+            }
             self.context
                 .OMSetRenderTargets(Some(&[Some(render_target_view)]), None);
             self.context.RSSetViewports(Some(&[viewport]));
@@ -927,9 +1110,24 @@ impl D3d11Renderer {
             self.context.Draw(3, 0);
             self.context.PSSetShaderResources(0, Some(&empty_srvs));
         }
-        Self::present_swap_chain(&swap_chain)?;
-        Ok(())
+        Self::present_swap_chain(&swap_chain, allow_tearing)
     }
+}
+
+#[cfg(windows)]
+fn should_clear_shared_present_surface(
+    surface_width: u32,
+    surface_height: u32,
+    frame_width: usize,
+    frame_height: usize,
+) -> bool {
+    let (x, y, width, height) =
+        fit_viewport_rect(surface_width, surface_height, frame_width, frame_height);
+    let epsilon = 0.5_f32;
+    x.abs() > epsilon
+        || y.abs() > epsilon
+        || ((surface_width as f32) - width).abs() > epsilon
+        || ((surface_height as f32) - height).abs() > epsilon
 }
 
 impl RendererInstance for D3d11Renderer {
@@ -948,59 +1146,102 @@ impl RendererInstance for D3d11Renderer {
     }
 
     fn upload_frame(&mut self, frame: RenderFrame) -> Result<(), RenderError> {
-        use mrd_render::RenderFrameData;
-        match &frame.data {
-            RenderFrameData::Rgb24(_) =>
-            {
-                #[cfg(windows)]
-                if self.surface.is_some() {
-                    self.present_uploaded_frame(&frame)?;
-                } else {
-                    self.present_clear_frame(&frame)?;
-                }
-            }
-            RenderFrameData::Bgra32(_) =>
-            {
-                #[cfg(windows)]
-                if self.surface.is_some() {
-                    self.present_uploaded_frame_bgra(&frame)?;
-                } else {
-                    self.present_clear_frame(&frame)?;
-                }
-            }
-            #[cfg(windows)]
-            RenderFrameData::D3D11SharedBgra { .. } =>
-            {
-                #[cfg(windows)]
-                if self.surface.is_some() {
-                    self.present_shared_bgra_frame(&frame)?;
-                } else {
-                    self.present_clear_frame(&frame)?;
-                }
-            }
-            #[cfg(windows)]
-            RenderFrameData::D3D11SharedNv12 { .. } | RenderFrameData::D3D11SharedP010 { .. } =>
-            {
-                #[cfg(windows)]
-                if self.surface.is_some() {
-                    self.present_shared_texture_frame(&frame)?;
-                } else {
-                    self.present_clear_frame(&frame)?;
-                }
-            }
+        #[cfg(not(windows))]
+        {
+            let _ = frame;
+            return Err(RenderError::Message(
+                "d3d11 renderer 仅支持 Windows".to_string(),
+            ));
         }
 
-        self.uploaded_frame_count += 1;
-        self.last_width = frame.width;
-        self.last_height = frame.height;
-        self.last_pixel_format = Some(frame.pixel_format);
-        Ok(())
+        #[cfg(windows)]
+        {
+            use mrd_render::RenderFrameData;
+            let present_status = match &frame.data {
+                RenderFrameData::Rgb24(_) =>
+                {
+                    #[cfg(windows)]
+                    if self.surface.is_some() {
+                        self.present_uploaded_frame(&frame)?
+                    } else {
+                        self.present_clear_frame(&frame)?
+                    }
+                }
+                RenderFrameData::Bgra32(_) =>
+                {
+                    #[cfg(windows)]
+                    if self.surface.is_some() {
+                        self.present_uploaded_frame_bgra(&frame)?
+                    } else {
+                        self.present_clear_frame(&frame)?
+                    }
+                }
+                #[cfg(windows)]
+                RenderFrameData::D3D11SharedBgra { .. } =>
+                {
+                    #[cfg(windows)]
+                    if self.surface.is_some() {
+                        self.present_shared_bgra_frame(&frame)?
+                    } else {
+                        self.present_clear_frame(&frame)?
+                    }
+                }
+                #[cfg(windows)]
+                RenderFrameData::D3D11SharedNv12 { .. }
+                | RenderFrameData::D3D11SharedP010 { .. } =>
+                {
+                    #[cfg(windows)]
+                    if self.surface.is_some() {
+                        self.present_shared_texture_frame(&frame)?
+                    } else {
+                        self.present_clear_frame(&frame)?
+                    }
+                }
+            };
+
+            self.uploaded_frame_count += 1;
+            match present_status {
+                D3d11PresentStatus::Presented => {
+                    self.presented_frame_count += 1;
+                }
+                D3d11PresentStatus::SkippedStillDrawing => {
+                    self.present_skipped_count += 1;
+                }
+                D3d11PresentStatus::NoTarget => {}
+            }
+            self.last_present_status = Some(present_status.as_str());
+            self.last_width = frame.width;
+            self.last_height = frame.height;
+            self.last_pixel_format = Some(frame.pixel_format);
+            Ok(())
+        }
     }
 
     fn snapshot(&self) -> RendererSnapshot {
+        #[cfg(windows)]
+        let swap_chain_max_frame_latency = self
+            .surface
+            .as_ref()
+            .and_then(|surface| surface.max_frame_latency);
+        #[cfg(windows)]
+        let swap_chain_allow_tearing = self.surface.as_ref().map(|surface| surface.allow_tearing);
+        #[cfg(not(windows))]
+        let swap_chain_max_frame_latency = None;
+        #[cfg(not(windows))]
+        let swap_chain_allow_tearing = None;
+
         RendererSnapshot {
             attached_to_target: self.attached_to_target,
             uploaded_frame_count: self.uploaded_frame_count,
+            presented_frame_count: self.presented_frame_count,
+            present_skipped_count: self.present_skipped_count,
+            last_present_status: self.last_present_status.map(str::to_string),
+            #[cfg(windows)]
+            low_latency_frame_latency_target: Some(Self::low_latency_frame_latency_target()),
+            #[cfg(not(windows))]
+            low_latency_frame_latency_target: None,
+            swap_chain_max_frame_latency,
+            swap_chain_allow_tearing,
             last_width: self.last_width,
             last_height: self.last_height,
             last_pixel_format: self.last_pixel_format,
@@ -1010,7 +1251,9 @@ impl RendererInstance for D3d11Renderer {
 
 #[cfg(test)]
 mod tests {
-    use super::{fit_viewport_rect, D3d11Renderer, D3d11RendererFactory};
+    use super::{fit_viewport_rect, D3d11RendererFactory};
+    #[cfg(windows)]
+    use super::{should_clear_shared_present_surface, D3d11PresentStatus, D3d11Renderer};
     use mrd_render::{RenderFrame, RenderPixelFormat, RenderTarget, RendererFactory};
 
     #[test]
@@ -1022,15 +1265,98 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn shared_present_clears_only_when_letterboxed() {
+        assert!(!should_clear_shared_present_surface(1920, 1080, 1920, 1080));
+        assert!(should_clear_shared_present_surface(
+            1920,
+            1080,
+            2560,
+            1440 + 120
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn d3d11_present_status_labels_are_stable_for_metrics() {
+        assert_eq!(D3d11PresentStatus::Presented.as_str(), "presented");
+        assert_eq!(
+            D3d11PresentStatus::SkippedStillDrawing.as_str(),
+            "skipped_still_drawing"
+        );
+        assert_eq!(D3d11PresentStatus::NoTarget.as_str(), "no_target");
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn d3d11_renderer_defaults_to_nonblocking_present() {
-        use windows::Win32::Graphics::Dxgi::DXGI_PRESENT_DO_NOT_WAIT;
+        use windows::Win32::Graphics::Dxgi::{
+            DXGI_PRESENT_ALLOW_TEARING, DXGI_PRESENT_DO_NOT_WAIT,
+        };
 
         std::env::remove_var("MRD_D3D11_RENDER_PRESENT_BLOCKING");
-        assert_eq!(D3d11Renderer::present_flags(), DXGI_PRESENT_DO_NOT_WAIT);
+        assert_eq!(
+            D3d11Renderer::present_flags(false),
+            DXGI_PRESENT_DO_NOT_WAIT
+        );
+        assert_eq!(
+            D3d11Renderer::present_flags(true),
+            DXGI_PRESENT_DO_NOT_WAIT | DXGI_PRESENT_ALLOW_TEARING
+        );
 
         std::env::set_var("MRD_D3D11_RENDER_PRESENT_BLOCKING", "1");
-        assert_eq!(D3d11Renderer::present_flags(), 0);
+        assert_eq!(D3d11Renderer::present_flags(false), 0);
+        assert_eq!(D3d11Renderer::present_flags(true), 0);
         std::env::remove_var("MRD_D3D11_RENDER_PRESENT_BLOCKING");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn d3d11_renderer_allows_max_frame_latency_override_for_perf_debugging() {
+        std::env::remove_var("MRD_D3D11_RENDER_MAX_FRAME_LATENCY");
+        assert_eq!(D3d11Renderer::max_frame_latency_target(), Some(1));
+
+        std::env::set_var("MRD_D3D11_RENDER_MAX_FRAME_LATENCY", "0");
+        assert_eq!(D3d11Renderer::max_frame_latency_target(), None);
+
+        std::env::set_var("MRD_D3D11_RENDER_MAX_FRAME_LATENCY", "2");
+        assert_eq!(D3d11Renderer::max_frame_latency_target(), Some(2));
+        std::env::remove_var("MRD_D3D11_RENDER_MAX_FRAME_LATENCY");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn d3d11_renderer_reports_low_latency_frame_latency_target() {
+        let factory = D3d11RendererFactory;
+        let renderer = factory.create().expect("d3d11 renderer");
+
+        let snapshot = renderer.snapshot();
+
+        assert_eq!(snapshot.low_latency_frame_latency_target, Some(1));
+        assert_eq!(snapshot.swap_chain_max_frame_latency, None);
+        assert_eq!(snapshot.swap_chain_allow_tearing, None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn d3d11_swap_chain_desc_keeps_waitable_object_off_for_nonblocking_present() {
+        use windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+
+        let desc = D3d11Renderer::window_swap_chain_desc(16, 16, false);
+
+        assert_eq!(
+            desc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32,
+            0
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn d3d11_swap_chain_desc_enables_tearing_when_supported() {
+        use windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+
+        let desc = D3d11Renderer::window_swap_chain_desc(16, 16, true);
+
+        assert_ne!(desc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0 as u32, 0);
     }
 
     #[cfg(windows)]
@@ -1049,6 +1375,9 @@ mod tests {
         let snapshot = renderer.snapshot();
         assert!(snapshot.attached_to_target);
         assert_eq!(snapshot.uploaded_frame_count, 1);
+        assert_eq!(snapshot.presented_frame_count, 0);
+        assert_eq!(snapshot.present_skipped_count, 0);
+        assert_eq!(snapshot.last_present_status.as_deref(), Some("no_target"));
         assert_eq!(snapshot.last_width, 16);
         assert_eq!(snapshot.last_height, 16);
         assert_eq!(snapshot.last_pixel_format, Some(RenderPixelFormat::Rgb24));

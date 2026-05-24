@@ -59,7 +59,7 @@ fn get_motherboard_serial() -> String {
 
         // 使用 WMIC 获取主板序列号
         let output = Command::new("wmic")
-            .args(&["baseboard", "get", "serialnumber"])
+            .args(["baseboard", "get", "serialnumber"])
             .output();
 
         if let Ok(out) = output {
@@ -179,7 +179,7 @@ fn get_cpu_info() -> CpuInfo {
         use std::process::Command;
 
         let name = Command::new("wmic")
-            .args(&["cpu", "get", "name"])
+            .args(["cpu", "get", "name"])
             .output()
             .ok()
             .and_then(|out| String::from_utf8(out.stdout).ok())
@@ -192,7 +192,7 @@ fn get_cpu_info() -> CpuInfo {
             .unwrap_or_else(|| "Unknown CPU".to_string());
 
         let vendor_id = Command::new("wmic")
-            .args(&["cpu", "get", "Manufacturer"])
+            .args(["cpu", "get", "Manufacturer"])
             .output()
             .ok()
             .and_then(|out| String::from_utf8(out.stdout).ok())
@@ -253,7 +253,7 @@ fn get_gpu_info() -> Vec<GpuInfo> {
         use std::process::Command;
 
         let output = Command::new("wmic")
-            .args(&["path", "win32_VideoController", "get", "name,AdapterRAM"])
+            .args(["path", "win32_VideoController", "get", "name,AdapterRAM"])
             .output();
 
         if let Ok(out) = output {

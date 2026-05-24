@@ -94,7 +94,7 @@ mod imp {
     fn h264_should_force_keyframe(frame_index: usize, fps: u32, force_next: bool) -> bool {
         force_next
             || frame_index == 0
-            || frame_index % h264_remote_desktop_keyframe_interval(fps) == 0
+            || frame_index.is_multiple_of(h264_remote_desktop_keyframe_interval(fps))
     }
 
     fn hevc_remote_desktop_keyframe_interval(fps: u32) -> usize {
@@ -936,7 +936,8 @@ mod imp {
             self.copy_shared_bgra_to_texture(&source_texture, &slot.texture)?;
 
             let keyframe_interval = hevc_remote_desktop_keyframe_interval(self.fps);
-            let force_idr = self.frame_index == 0 || self.frame_index % keyframe_interval == 0;
+            let force_idr =
+                self.frame_index == 0 || self.frame_index.is_multiple_of(keyframe_interval);
             submit_encode_picture(
                 &mut self.encoder,
                 &slot.bitstream,
@@ -1184,7 +1185,8 @@ mod imp {
             }
 
             let keyframe_interval = hevc_remote_desktop_keyframe_interval(self.fps);
-            let force_idr = self.frame_index == 0 || self.frame_index % keyframe_interval == 0;
+            let force_idr =
+                self.frame_index == 0 || self.frame_index.is_multiple_of(keyframe_interval);
             let bytes = encode_picture_with_sps_pps(
                 &mut self.encoder,
                 &self.bitstream,
@@ -1246,13 +1248,16 @@ mod imp {
     }
 
     #[cfg(test)]
+    #[allow(clippy::items_after_test_module)]
     mod tests {
         use super::*;
 
         #[test]
         fn hevc_shared_encode_queue_has_tail_latency_headroom() {
-            assert!(HEVC_SHARED_ASYNC_SLOT_COUNT >= 3);
-            assert!(HEVC_SHARED_ASYNC_SLOT_COUNT <= 4);
+            const {
+                assert!(HEVC_SHARED_ASYNC_SLOT_COUNT >= 3);
+                assert!(HEVC_SHARED_ASYNC_SLOT_COUNT <= 4);
+            }
         }
 
         #[test]
@@ -1485,7 +1490,7 @@ mod imp {
     }
 
     fn nv12_len(width: usize, height: usize) -> Option<usize> {
-        if width % 2 != 0 || height % 2 != 0 {
+        if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             return None;
         }
         let y_size = width.checked_mul(height)?;

@@ -31,6 +31,7 @@ pub mod ports {
     /// Session coordinator port - manages session state and signaling metadata
     pub trait SessionCoordinatorPort: Send + Sync {
         /// Request a new session as controller
+        #[allow(clippy::too_many_arguments)]
         fn request_session(
             &mut self,
             session_id: SessionId,

@@ -44,6 +44,8 @@ use windows::Win32::Graphics::Gdi::{
 const DXGI_SHARED_ACQUIRE_TIMEOUT_MS: u32 = 0;
 #[cfg(windows)]
 const DXGI_SHARED_TEXTURE_RING_SIZE: usize = 3;
+#[cfg(windows)]
+const DXGI_SHARED_CAPTURE_FLUSH_AFTER_COPY_ENV: &str = "MRD_DXGI_SHARED_CAPTURE_FLUSH_AFTER_COPY";
 
 pub struct DxgiDesktopCapture {
     capturer: Capturer,
@@ -130,6 +132,7 @@ pub struct DxgiSharedTextureCapture {
     source_height: usize,
     width: usize,
     height: usize,
+    flush_after_copy: bool,
 }
 
 #[cfg(windows)]
@@ -250,6 +253,7 @@ impl DxgiSharedTextureCapture {
                     source_height: height,
                     width,
                     height,
+                    flush_after_copy: dxgi_shared_capture_flush_after_copy_enabled(),
                 });
             }
         }
@@ -328,38 +332,34 @@ impl FrameCapture for DxgiSharedTextureCapture {
     }
 
     fn capture_frame(&mut self) -> Result<CapturedFrame, PipelineError> {
-        loop {
-            let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
-            let mut desktop_resource = None::<IDXGIResource>;
-            let acquire = unsafe {
-                self.duplication.AcquireNextFrame(
-                    DXGI_SHARED_ACQUIRE_TIMEOUT_MS,
-                    &mut frame_info,
-                    &mut desktop_resource,
-                )
-            };
+        let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
+        let mut desktop_resource = None::<IDXGIResource>;
+        let acquire = unsafe {
+            self.duplication.AcquireNextFrame(
+                DXGI_SHARED_ACQUIRE_TIMEOUT_MS,
+                &mut frame_info,
+                &mut desktop_resource,
+            )
+        };
 
-            match acquire {
-                Ok(()) => {
-                    let result = self.copy_acquired_frame_to_shared(desktop_resource);
-                    let _ = unsafe { self.duplication.ReleaseFrame() };
-                    return result;
-                }
-                Err(error) if error.code() == DXGI_ERROR_WAIT_TIMEOUT => {
-                    if let Some(frame) = self.last_shared_frame()? {
-                        return Ok(frame);
-                    }
-                    return self.seed_shared_texture_from_gdi();
-                }
-                Err(error) if error.code() == DXGI_ERROR_ACCESS_LOST => {
-                    return Err(PipelineError::message("DXGI duplication access lost"));
-                }
-                Err(error) => {
-                    return Err(PipelineError::message(format!(
-                        "AcquireNextFrame failed: {error}"
-                    )));
-                }
+        match acquire {
+            Ok(()) => {
+                let result = self.copy_acquired_frame_to_shared(desktop_resource);
+                let _ = unsafe { self.duplication.ReleaseFrame() };
+                result
             }
+            Err(error) if error.code() == DXGI_ERROR_WAIT_TIMEOUT => {
+                if let Some(frame) = self.last_shared_frame()? {
+                    return Ok(frame);
+                }
+                self.seed_shared_texture_from_gdi()
+            }
+            Err(error) if error.code() == DXGI_ERROR_ACCESS_LOST => {
+                Err(PipelineError::message("DXGI duplication access lost"))
+            }
+            Err(error) => Err(PipelineError::message(format!(
+                "AcquireNextFrame failed: {error}"
+            ))),
         }
     }
 }
@@ -396,7 +396,9 @@ impl DxgiSharedTextureCapture {
                 row_pitch,
                 0,
             );
-            self.context.Flush();
+            if self.flush_after_copy {
+                self.context.Flush();
+            }
         }
 
         Ok(CapturedFrame::from_d3d11_shared_bgra(
@@ -474,7 +476,9 @@ impl DxgiSharedTextureCapture {
                     Some(&source_box),
                 );
             }
-            self.context.Flush();
+            if self.flush_after_copy {
+                self.context.Flush();
+            }
         }
 
         Ok(CapturedFrame::from_d3d11_shared_bgra(
@@ -722,9 +726,31 @@ fn now_us() -> Result<u64, PipelineError> {
         .as_micros() as u64)
 }
 
+#[cfg(windows)]
+fn dxgi_shared_capture_flush_after_copy_enabled() -> bool {
+    dxgi_shared_capture_flush_after_copy_enabled_from_env_value(
+        std::env::var(DXGI_SHARED_CAPTURE_FLUSH_AFTER_COPY_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn dxgi_shared_capture_flush_after_copy_enabled_from_env_value(value: Option<&str>) -> bool {
+    value.map(str::trim).is_some_and(|value| {
+        value == "1"
+            || value.eq_ignore_ascii_case("true")
+            || value.eq_ignore_ascii_case("yes")
+            || value.eq_ignore_ascii_case("on")
+    })
+}
+
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
-    use super::{centered_crop_origin, dxgi_device_name_matches, repack_bgra};
+    use super::{
+        centered_crop_origin, dxgi_device_name_matches,
+        dxgi_shared_capture_flush_after_copy_enabled_from_env_value, repack_bgra,
+    };
 
     #[test]
     fn repack_bgra_strips_padding_stride() {
@@ -756,6 +782,30 @@ mod tests {
 
         assert!(dxgi_device_name_matches(&raw, "\\\\.\\display2"));
         assert!(!dxgi_device_name_matches(&raw, "\\\\.\\DISPLAY1"));
+    }
+
+    #[test]
+    fn dxgi_shared_capture_flush_after_copy_defaults_off() {
+        assert!(!dxgi_shared_capture_flush_after_copy_enabled_from_env_value(None));
+        assert!(!dxgi_shared_capture_flush_after_copy_enabled_from_env_value(Some("")));
+        assert!(!dxgi_shared_capture_flush_after_copy_enabled_from_env_value(Some("0")));
+        assert!(!dxgi_shared_capture_flush_after_copy_enabled_from_env_value(Some("false")));
+    }
+
+    #[test]
+    fn dxgi_shared_capture_flush_after_copy_accepts_opt_in_values() {
+        assert!(dxgi_shared_capture_flush_after_copy_enabled_from_env_value(
+            Some("1")
+        ));
+        assert!(dxgi_shared_capture_flush_after_copy_enabled_from_env_value(
+            Some("tRuE")
+        ));
+        assert!(dxgi_shared_capture_flush_after_copy_enabled_from_env_value(
+            Some("YES")
+        ));
+        assert!(dxgi_shared_capture_flush_after_copy_enabled_from_env_value(
+            Some(" on ")
+        ));
     }
 }
 

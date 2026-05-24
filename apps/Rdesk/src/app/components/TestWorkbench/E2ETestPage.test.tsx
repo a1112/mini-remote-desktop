@@ -364,7 +364,7 @@ describe("E2ETestPage LAN automation", () => {
     render(
       <MemoryRouter
         initialEntries={[
-          "/test/e2e?autorun=lan-e2e&targetDeviceId=agent-device&transport=quic&captureSourceId=window-codex&captureSourceKind=display_shared",
+          "/test/e2e?autorun=lan-e2e&targetDeviceId=agent-device&transport=quic&captureSourceId=window-codex&captureSourceKind=display_shared&renderDisplaySourceId=windows:display-shared:0",
         ]}
       >
         <E2ETestPage />
@@ -380,6 +380,12 @@ describe("E2ETestPage LAN automation", () => {
         })
       );
     });
+    expect(mockInvoke).toHaveBeenCalledWith(
+      "open_remote_display_window",
+      expect.objectContaining({
+        preferredDisplaySourceId: "windows:display-shared:0",
+      })
+    );
   });
 });
 

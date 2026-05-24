@@ -3,6 +3,12 @@
 //! This module provides the test orchestrator that manages test scenarios,
 //! runs, metrics collection, and artifact storage.
 
+#![allow(
+    clippy::derivable_impls,
+    clippy::needless_return,
+    clippy::unwrap_or_default
+)]
+
 use anyhow::Result;
 use base64::Engine;
 use image::{codecs::png::PngEncoder, ColorType, ImageEncoder};
@@ -2291,6 +2297,7 @@ impl TestOrchestrator {
     }
 
     /// Update run metrics from harness
+    #[allow(dead_code)]
     pub fn update_run_metrics(&self, run_id: &str, metrics: &HarnessMetrics) {
         let mut runs = self.runs.lock().unwrap();
         if let Some(run) = runs.get_mut(run_id) {
@@ -2466,6 +2473,7 @@ impl TestOrchestrator {
     }
 
     /// Get current harness chain
+    #[allow(dead_code)]
     pub fn get_harness_chain(&self) -> Option<TestChain> {
         self.current_harness_chain.lock().unwrap().clone()
     }
@@ -3393,7 +3401,11 @@ fn harness_config_from_data(config: &TestConfigData) -> HarnessConfig {
         renderer_target_hwnd: config.renderer_target_hwnd,
         zero_copy: config.zero_copy,
         input_source: config.input_source.clone(),
-        display_id: config.display_id.clone(),
+        source_id: config.source_id.clone(),
+        display_id: config
+            .display_id
+            .clone()
+            .or_else(|| config.source_id.clone()),
         window_handle: config.window_hwnd.clone(),
         visual_preview: config.visual_preview,
         transport: match config.transport_kind.as_deref() {
@@ -3825,6 +3837,25 @@ mod tests {
 
         assert_eq!(from_string.renderer_target_hwnd, Some(42));
         assert_eq!(from_number.renderer_target_hwnd, Some(42));
+    }
+
+    #[test]
+    fn harness_config_preserves_source_id() {
+        let config = TestConfigData {
+            source_id: Some("windows:display-shared:1".to_string()),
+            ..Default::default()
+        };
+
+        let harness = harness_config_from_data(&config);
+
+        assert_eq!(
+            harness.source_id.as_deref(),
+            Some("windows:display-shared:1")
+        );
+        assert_eq!(
+            harness.display_id.as_deref(),
+            Some("windows:display-shared:1")
+        );
     }
 
     #[test]

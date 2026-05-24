@@ -233,7 +233,24 @@ pub struct RendererDescriptor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RendererSnapshot {
     pub attached_to_target: bool,
+    /// Frames accepted by the renderer upload boundary.
     pub uploaded_frame_count: u64,
+    /// Frames that reached the platform presentation boundary.
+    ///
+    /// Renderers that cannot distinguish upload from presentation should keep
+    /// this aligned with `uploaded_frame_count`.
+    pub presented_frame_count: u64,
+    /// Frames skipped by a non-blocking present path, for example
+    /// `DXGI_ERROR_WAS_STILL_DRAWING` on D3D11.
+    pub present_skipped_count: u64,
+    /// Last presentation status reported by the renderer.
+    pub last_present_status: Option<String>,
+    /// Renderer low-latency frame latency target, when the backend supports one.
+    pub low_latency_frame_latency_target: Option<u32>,
+    /// Actual swap-chain frame latency configured on the attached surface.
+    pub swap_chain_max_frame_latency: Option<u32>,
+    /// Whether the attached swap chain was created with tearing presents enabled.
+    pub swap_chain_allow_tearing: Option<bool>,
     pub last_width: usize,
     pub last_height: usize,
     pub last_pixel_format: Option<RenderPixelFormat>,

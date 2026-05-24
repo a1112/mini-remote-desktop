@@ -159,6 +159,7 @@ pub(crate) struct QuicBenchmarkOutcome {
     pub receiver_probe: PipelineProbeSnapshot,
     pub sink_snapshot: DecodedFrameSnapshot,
     pub first_frame_time_ms: f64,
+    #[allow(dead_code)]
     pub transport_label: String,
 }
 
@@ -567,7 +568,7 @@ pub(crate) async fn run_quic_benchmark_pipeline(
 }
 
 enum QuicBenchmarkEncoder {
-    OpenH264(OpenH264Encoder),
+    OpenH264(Box<OpenH264Encoder>),
     Nvenc(NvencH264Encoder),
 }
 
@@ -599,12 +600,12 @@ fn create_test_encoder(
         "nvenc_hq_p5" => Ok(QuicBenchmarkEncoder::Nvenc(
             NvencH264Encoder::new_high_quality_p5(width, height, fps)?,
         )),
-        "openh264" => Ok(QuicBenchmarkEncoder::OpenH264(OpenH264Encoder::new(
-            width, height, fps,
-        )?)),
-        "openh264_speed" => Ok(QuicBenchmarkEncoder::OpenH264(OpenH264Encoder::new_speed(
-            width, height, fps,
-        )?)),
+        "openh264" => Ok(QuicBenchmarkEncoder::OpenH264(Box::new(
+            OpenH264Encoder::new(width, height, fps)?,
+        ))),
+        "openh264_speed" => Ok(QuicBenchmarkEncoder::OpenH264(Box::new(
+            OpenH264Encoder::new_speed(width, height, fps)?,
+        ))),
         other => Err(PipelineError::message(format!(
             "unsupported test encoder backend: {other}"
         ))),
