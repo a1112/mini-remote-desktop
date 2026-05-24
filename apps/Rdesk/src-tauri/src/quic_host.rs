@@ -10,6 +10,8 @@ use std::{
 use mrd_capture_dxgi::DxgiDesktopCapture;
 use mrd_decode::VideoDecoder;
 use mrd_encode_nvenc::NvencH264Encoder;
+#[cfg(any(windows, target_os = "linux"))]
+use mrd_encode_nvenc_av1::NvencAv1Encoder;
 use mrd_encode_openh264::OpenH264Encoder;
 use mrd_observability::{
     MediaProbeEvent, PipelineProbeSnapshot, ProbeRegistry, ProbeSessionHandle, StageId,
@@ -811,6 +813,8 @@ fn run_blocking_sender_loop<C, E>(
 enum QuicHostEncoder {
     OpenH264(Box<OpenH264Encoder>),
     Nvenc(NvencH264Encoder),
+    #[cfg(any(windows, target_os = "linux"))]
+    NvencAv1(NvencAv1Encoder),
 }
 
 impl VideoEncoder for QuicHostEncoder {
@@ -821,6 +825,8 @@ impl VideoEncoder for QuicHostEncoder {
         match self {
             Self::OpenH264(encoder) => encoder.encode(frame),
             Self::Nvenc(encoder) => encoder.encode(frame),
+            #[cfg(any(windows, target_os = "linux"))]
+            Self::NvencAv1(encoder) => encoder.encode(frame),
         }
     }
 }
@@ -841,6 +847,10 @@ fn create_test_encoder(
         "nvenc_hq_p5" => Ok(QuicHostEncoder::Nvenc(
             NvencH264Encoder::new_high_quality_p5(width, height, fps)?,
         )),
+        #[cfg(any(windows, target_os = "linux"))]
+        "nvenc_av1" => Ok(QuicHostEncoder::NvencAv1(NvencAv1Encoder::new_low_latency(
+            width, height, fps,
+        )?)),
         "openh264" => Ok(QuicHostEncoder::OpenH264(Box::new(OpenH264Encoder::new(
             width, height, fps,
         )?))),

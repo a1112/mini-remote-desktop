@@ -548,7 +548,11 @@ pub struct RegisteredResource {
 
 impl Drop for RegisteredResource {
     fn drop(&mut self) {
-        unsafe { self.encoder.unmap_input_resource(self.mapped).unwrap() };
-        unsafe { self.encoder.unregister_resource(self.registered).unwrap() };
+        unsafe {
+            let _ = self.encoder.unmap_input_resource(self.mapped);
+        }
+        unsafe {
+            let _ = self.encoder.unregister_resource(self.registered);
+        }
     }
 }
