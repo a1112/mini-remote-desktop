@@ -75,7 +75,22 @@ mod imp {
             height: usize,
             fps: u32,
         ) -> Result<Self, PipelineError> {
-            Self::new(width, height, fps)
+            Self::new_low_latency_with_bitrate(width, height, fps, 8_000_000)
+        }
+
+        pub fn new_low_latency_with_bitrate(
+            width: usize,
+            height: usize,
+            fps: u32,
+            bitrate: u32,
+        ) -> Result<Self, PipelineError> {
+            Self::new_low_latency_internal(
+                width,
+                height,
+                fps,
+                NV_ENC_AV1_PROFILE_MAIN_GUID,
+                bitrate.max(1),
+            )
         }
 
         /// Ultra-low latency AV1 encoder for remote desktop scenarios
@@ -85,7 +100,22 @@ mod imp {
             height: usize,
             fps: u32,
         ) -> Result<Self, PipelineError> {
-            Self::new_ultra_low_latency_internal(width, height, fps, NV_ENC_AV1_PROFILE_MAIN_GUID)
+            Self::new_ultra_low_latency_with_bitrate(width, height, fps, 6_000_000)
+        }
+
+        pub fn new_ultra_low_latency_with_bitrate(
+            width: usize,
+            height: usize,
+            fps: u32,
+            bitrate: u32,
+        ) -> Result<Self, PipelineError> {
+            Self::new_ultra_low_latency_internal(
+                width,
+                height,
+                fps,
+                NV_ENC_AV1_PROFILE_MAIN_GUID,
+                bitrate.max(1),
+            )
         }
 
         /// High refresh rate AV1 encoder (120Hz+) optimized for minimum latency
@@ -172,7 +202,7 @@ mod imp {
             fps: u32,
             profile_guid: Guid,
         ) -> Result<Self, PipelineError> {
-            Self::new_low_latency_internal(width, height, fps, profile_guid)
+            Self::new_low_latency_internal(width, height, fps, profile_guid, 8_000_000)
         }
 
         fn new_low_latency_internal(
@@ -180,10 +210,12 @@ mod imp {
             height: usize,
             fps: u32,
             profile_guid: Guid,
+            bitrate: u32,
         ) -> Result<Self, PipelineError> {
             let width = width.max(2);
             let height = height.max(2);
             let fps = fps.max(1);
+            let bitrate = bitrate.max(1);
             let (device, context) = create_d3d11_device().map_err(|error| {
                 PipelineError::message(format!("create d3d11 device failed: {error}"))
             })?;
@@ -203,8 +235,7 @@ mod imp {
                     PipelineError::message(format!("nvenc preset config failed: {error:?}"))
                 })?;
             preset.preset_cfg.profile_guid = profile_guid;
-            // AV1 specific bitrate settings (may need adjustment based on quality requirements)
-            preset.preset_cfg.rc_params.average_bit_rate = 8_000_000; // 8 Mbps default
+            preset.preset_cfg.rc_params.average_bit_rate = bitrate;
             preset.preset_cfg.frame_interval_p = 1;
             preset.preset_cfg.gop_len = fps * 2; // AV1 can use longer GOP
 
@@ -256,10 +287,12 @@ mod imp {
             height: usize,
             fps: u32,
             profile_guid: Guid,
+            bitrate: u32,
         ) -> Result<Self, PipelineError> {
             let width = width.max(2);
             let height = height.max(2);
             let fps = fps.max(1);
+            let bitrate = bitrate.max(1);
             let (device, context) = create_d3d11_device().map_err(|error| {
                 PipelineError::message(format!("create d3d11 device failed: {error}"))
             })?;
@@ -279,8 +312,7 @@ mod imp {
                     PipelineError::message(format!("nvenc preset config failed: {error:?}"))
                 })?;
             preset.preset_cfg.profile_guid = profile_guid;
-            // Ultra-low latency AV1 settings - lower bitrate for faster encoding
-            preset.preset_cfg.rc_params.average_bit_rate = 6_000_000;
+            preset.preset_cfg.rc_params.average_bit_rate = bitrate;
             preset.preset_cfg.frame_interval_p = 1;
             preset.preset_cfg.gop_len = fps * 2;
 
@@ -755,6 +787,15 @@ impl NvencAv1Encoder {
     }
 
     pub fn new_low_latency(width: usize, height: usize, fps: u32) -> Result<Self, PipelineError> {
+        Self::new_low_latency_with_bitrate(width, height, fps, 8_000_000)
+    }
+
+    pub fn new_low_latency_with_bitrate(
+        width: usize,
+        height: usize,
+        fps: u32,
+        _bitrate: u32,
+    ) -> Result<Self, PipelineError> {
         require_gst_element("nvav1enc")?;
         require_gst_element("av1parse")?;
         Ok(Self {
@@ -770,7 +811,16 @@ impl NvencAv1Encoder {
         height: usize,
         fps: u32,
     ) -> Result<Self, PipelineError> {
-        Self::new_low_latency(width, height, fps)
+        Self::new_ultra_low_latency_with_bitrate(width, height, fps, 6_000_000)
+    }
+
+    pub fn new_ultra_low_latency_with_bitrate(
+        width: usize,
+        height: usize,
+        fps: u32,
+        bitrate: u32,
+    ) -> Result<Self, PipelineError> {
+        Self::new_low_latency_with_bitrate(width, height, fps, bitrate)
     }
 
     pub fn new_high_refresh_rate(

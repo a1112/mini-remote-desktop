@@ -44,6 +44,17 @@ $env:MRD_BENCH_CAPTURE_BACKEND = $scenario.capture_backend
 $env:MRD_BENCH_ENCODE_BACKEND = $scenario.encode_backend
 $env:MRD_BENCH_DECODE_BACKEND = $scenario.decode_backend
 $env:MRD_BENCH_RENDERER_BACKEND = $scenario.renderer_backend
+$bitrateBps = Get-TransportMatrixBitrateBps -Scenario $scenario
+if ($null -ne $bitrateBps) {
+  $env:MRD_BENCH_BITRATE_BPS = $bitrateBps
+} else {
+  Remove-Item Env:MRD_BENCH_BITRATE_BPS -ErrorAction SilentlyContinue
+}
+if (@($scenario.PSObject.Properties.Name) -contains "pace_to_fps") {
+  $env:MRD_BENCH_PACE_TO_FPS = [string]$scenario.pace_to_fps
+} else {
+  Remove-Item Env:MRD_BENCH_PACE_TO_FPS -ErrorAction SilentlyContinue
+}
 
 $process = Start-Process `
   -FilePath "cargo" `

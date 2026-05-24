@@ -15,6 +15,29 @@ function Get-TransportMatrixCargoFeatureArgs {
   }
 }
 
+function Get-TransportMatrixBitrateBps {
+  param([object]$Scenario)
+
+  $propertyNames = @($Scenario.PSObject.Properties.Name)
+  if ($propertyNames -contains "bitrate_bps" -and $null -ne $Scenario.bitrate_bps) {
+    $bitrateBps = [int64]$Scenario.bitrate_bps
+    if ($bitrateBps -le 0) {
+      throw "scenario bitrate_bps must be greater than zero"
+    }
+    return [string]$bitrateBps
+  }
+
+  if ($propertyNames -contains "bitrate_mbps" -and $null -ne $Scenario.bitrate_mbps) {
+    $bitrateMbps = [double]$Scenario.bitrate_mbps
+    if ($bitrateMbps -le 0) {
+      throw "scenario bitrate_mbps must be greater than zero"
+    }
+    return [string][int64]($bitrateMbps * 1000000)
+  }
+
+  return $null
+}
+
 function Assert-TransportMatrixSummaryPassed {
   param(
     [Parameter(Mandatory = $true)]

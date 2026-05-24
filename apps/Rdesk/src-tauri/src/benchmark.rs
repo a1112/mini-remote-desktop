@@ -709,6 +709,7 @@ mod tests {
             renderer: Some(parse_renderer_backend(&manifest.renderer_backend)),
             transport: Some(parse_transport_backend(&manifest.transport)),
             zero_copy: Some(benchmark_zero_copy_enabled(manifest)),
+            pace_to_fps: Some(env_bool("MRD_BENCH_PACE_TO_FPS", false)),
             visual_preview: Some(false),
             ..Default::default()
         });
@@ -977,6 +978,18 @@ mod tests {
         std::env::var(key)
             .ok()
             .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    }
+
+    fn env_bool(key: &str, default: bool) -> bool {
+        std::env::var(key)
+            .ok()
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
             .unwrap_or(default)
     }
 

@@ -41,6 +41,23 @@ Assert-ArrayEqual $vvcArgs @("--features", "production-vvc-software-codec") "VVC
 $noneArgs = Get-TransportMatrixCargoFeatureArgs -DecodeBackend "nvdec"
 Assert-ArrayEqual $noneArgs @() "Hardware decode matrix does not enable software codec features"
 
+$bitrateBps = Get-TransportMatrixBitrateBps -Scenario ([pscustomobject]@{ bitrate_bps = 12000000 })
+if ($bitrateBps -ne "12000000") {
+  throw "bitrate_bps scenario field should pass through unchanged"
+}
+
+$bitrateMbps = Get-TransportMatrixBitrateBps -Scenario ([pscustomobject]@{ bitrate_mbps = 12 })
+if ($bitrateMbps -ne "12000000") {
+  throw "bitrate_mbps scenario field should convert to bps"
+}
+
+$noBitrate = Get-TransportMatrixBitrateBps -Scenario ([pscustomobject]@{ profile = "default" })
+if ($null -ne $noBitrate) {
+  throw "scenario without bitrate should leave MRD_BENCH_BITRATE_BPS unset"
+}
+
+Assert-Throws { Get-TransportMatrixBitrateBps -Scenario ([pscustomobject]@{ bitrate_bps = 0 }) } "greater than zero" "Zero bitrate_bps must be rejected"
+
 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("mrd-transport-summary-{0}.json" -f ([guid]::NewGuid()))
 try {
   @{ run_passed = $false; scenario = "quick.transport"; profile = "hevc" } |

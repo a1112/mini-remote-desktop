@@ -837,10 +837,15 @@ fn create_test_encoder(
     height: usize,
     fps: u32,
 ) -> Result<QuicHostEncoder, PipelineError> {
+    let benchmark_bitrate = std::env::var("MRD_BENCH_BITRATE_BPS")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|bitrate| *bitrate > 0);
     match backend {
-        "nvenc" => Ok(QuicHostEncoder::Nvenc(NvencH264Encoder::new(
-            width, height, fps,
-        )?)),
+        "nvenc" => Ok(QuicHostEncoder::Nvenc(match benchmark_bitrate {
+            Some(bitrate) => NvencH264Encoder::new_with_bitrate(width, height, fps, bitrate)?,
+            None => NvencH264Encoder::new(width, height, fps)?,
+        })),
         "nvenc_ll_p1" => Ok(QuicHostEncoder::Nvenc(
             NvencH264Encoder::new_low_latency_p1(width, height, fps)?,
         )),
@@ -848,9 +853,12 @@ fn create_test_encoder(
             NvencH264Encoder::new_high_quality_p5(width, height, fps)?,
         )),
         #[cfg(any(windows, target_os = "linux"))]
-        "nvenc_av1" => Ok(QuicHostEncoder::NvencAv1(NvencAv1Encoder::new_low_latency(
-            width, height, fps,
-        )?)),
+        "nvenc_av1" => Ok(QuicHostEncoder::NvencAv1(match benchmark_bitrate {
+            Some(bitrate) => {
+                NvencAv1Encoder::new_low_latency_with_bitrate(width, height, fps, bitrate)?
+            }
+            None => NvencAv1Encoder::new_low_latency(width, height, fps)?,
+        })),
         "openh264" => Ok(QuicHostEncoder::OpenH264(Box::new(OpenH264Encoder::new(
             width, height, fps,
         )?))),

@@ -3489,6 +3489,7 @@ fn harness_config_from_data(config: &TestConfigData) -> HarnessConfig {
         },
         renderer_target_hwnd: config.renderer_target_hwnd,
         zero_copy: config.zero_copy,
+        pace_to_fps: None,
         input_source: config.input_source.clone(),
         source_id: config.source_id.clone(),
         display_id: config

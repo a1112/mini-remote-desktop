@@ -156,6 +156,7 @@ pub struct TestConfig {
     pub renderer_target_hwnd: Option<isize>,
     pub transport: Option<TransportKind>,
     pub zero_copy: Option<bool>,
+    pub pace_to_fps: Option<bool>,
     pub input_source: Option<String>,
     pub source_id: Option<String>,
     pub display_id: Option<String>,
@@ -173,6 +174,7 @@ impl Default for TestConfig {
             renderer_target_hwnd: None,
             transport: None,
             zero_copy: None,
+            pace_to_fps: None,
             input_source: None,
             source_id: None,
             display_id: None,
@@ -457,6 +459,8 @@ struct PipelineState {
     renderer: Option<PipelineRenderer>,
     use_decoder: bool,
     visual_preview: bool,
+    pace_to_fps: bool,
+    fps: u32,
     width: usize,
     height: usize,
     adapted_frame: Option<CapturedFrame>,
@@ -2094,10 +2098,13 @@ impl TestHarness {
                 EncoderType::NvencAv1 => {
                     #[cfg(any(windows, target_os = "linux"))]
                     {
-                        let enc =
-                            NvencAv1Encoder::new_low_latency(width, height, fps).map_err(|e| {
-                                anyhow::anyhow!("NVENC AV1 encoder init failed: {:?}", e)
-                            })?;
+                        let enc = NvencAv1Encoder::new_low_latency_with_bitrate(
+                            width,
+                            height,
+                            fps,
+                            low_latency_bitrate,
+                        )
+                        .map_err(|e| anyhow::anyhow!("NVENC AV1 encoder init failed: {:?}", e))?;
                         match decoder {
                             DecoderType::None => {
                                 (Some(Box::new(enc) as Box<dyn VideoEncoder>), None, false)
@@ -2173,6 +2180,8 @@ impl TestHarness {
             renderer,
             use_decoder,
             visual_preview: config.visual_preview.unwrap_or(true),
+            pace_to_fps: config.pace_to_fps.unwrap_or(false),
+            fps,
             width,
             height,
             adapted_frame: None,
@@ -2206,8 +2215,27 @@ impl TestHarness {
         let dump_first_access_unit_path = std::env::var("MRD_HARNESS_DUMP_FIRST_ACCESS_UNIT").ok();
         let mut dumped_first_access_unit = false;
         let update_web_preview = state.visual_preview;
+        let frame_period = if state.pace_to_fps {
+            Some(Duration::from_secs_f64(1.0 / state.fps.max(1) as f64))
+        } else {
+            None
+        };
+        let mut next_frame_at = Instant::now();
 
         while running.load(Ordering::Relaxed) {
+            if let Some(period) = frame_period {
+                let now = Instant::now();
+                if now < next_frame_at {
+                    thread::sleep(next_frame_at - now);
+                }
+                next_frame_at = next_frame_at
+                    .checked_add(period)
+                    .unwrap_or_else(Instant::now);
+                if next_frame_at < Instant::now() {
+                    next_frame_at = Instant::now() + period;
+                }
+            }
+
             let pipeline_start = Instant::now();
             let next_frame_count = frame_count + 1;
             let preview_due =
@@ -4767,6 +4795,11 @@ mod tests {
             zero_copy: match std::env::var("MRD_HARNESS_ZERO_COPY").as_deref() {
                 Ok("1") | Ok("true") | Ok("d3d11_shared") => Some(true),
                 Ok("0") | Ok("false") | Ok("cpu") => Some(false),
+                _ => None,
+            },
+            pace_to_fps: match std::env::var("MRD_HARNESS_PACE_TO_FPS").as_deref() {
+                Ok("1") | Ok("true") | Ok("yes") => Some(true),
+                Ok("0") | Ok("false") | Ok("no") => Some(false),
                 _ => None,
             },
             input_source: std::env::var("MRD_HARNESS_INPUT_SOURCE").ok(),

@@ -10,5 +10,7 @@
   "height": 720,
   "fps": 30,
   "duration_secs": 20,
+  "bitrate_bps": 12000000,
+  "pace_to_fps": true,
   "threshold_file": "transport.quick.json"
 }
