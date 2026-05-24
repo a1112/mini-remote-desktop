@@ -1,0 +1,14 @@
+{
+  "scenario": "quick.transport",
+  "profile": "transport-webrtc-nvenc-av1-nvdec",
+  "transport": "webrtc",
+  "capture_backend": "dxgi",
+  "encode_backend": "nvenc_av1",
+  "decode_backend": "nvdec_av1",
+  "renderer_backend": "d3d11_shared",
+  "width": 1280,
+  "height": 720,
+  "fps": 30,
+  "duration_secs": 20,
+  "threshold_file": "transport.quick.json"
+}

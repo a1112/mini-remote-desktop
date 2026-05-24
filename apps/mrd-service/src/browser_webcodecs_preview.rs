@@ -31,6 +31,8 @@ const WEBCODECS_BINARY_HEADER_LEN: usize = 12;
 pub enum BrowserWebcodecsPreviewCodec {
     H264,
     Hevc,
+    #[serde(alias = "hevc-main10", alias = "h265_main10", alias = "h265-main10")]
+    HevcMain10,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -133,6 +135,10 @@ pub fn browser_webcodecs_hevc_codec_string() -> &'static str {
     "hev1.1.6.L156.B0"
 }
 
+pub fn browser_webcodecs_hevc_main10_codec_string() -> &'static str {
+    "hev1.2.4.L156.B0"
+}
+
 pub fn browser_webcodecs_codec_string(
     codec: BrowserWebcodecsPreviewCodec,
     h264_profile: Option<&str>,
@@ -140,6 +146,7 @@ pub fn browser_webcodecs_codec_string(
     match codec {
         BrowserWebcodecsPreviewCodec::H264 => browser_webcodecs_h264_codec_string(h264_profile),
         BrowserWebcodecsPreviewCodec::Hevc => browser_webcodecs_hevc_codec_string(),
+        BrowserWebcodecsPreviewCodec::HevcMain10 => browser_webcodecs_hevc_main10_codec_string(),
     }
 }
 
@@ -186,6 +193,7 @@ pub fn spawn_browser_webcodecs_capture_sender(
 enum BrowserWebcodecsEncoder {
     H264(NvencH264Encoder),
     Hevc(NvencHevcEncoder),
+    HevcMain10(NvencHevcEncoder),
 }
 
 #[cfg(windows)]
@@ -193,7 +201,7 @@ impl BrowserWebcodecsEncoder {
     fn request_keyframe(&mut self) {
         match self {
             Self::H264(encoder) => encoder.request_keyframe(),
-            Self::Hevc(_) => {}
+            Self::Hevc(_) | Self::HevcMain10(_) => {}
         }
     }
 
@@ -204,6 +212,7 @@ impl BrowserWebcodecsEncoder {
         match self {
             Self::H264(encoder) => encoder.encode(frame),
             Self::Hevc(encoder) => encoder.encode(frame),
+            Self::HevcMain10(encoder) => encoder.encode(frame),
         }
     }
 }
@@ -255,6 +264,13 @@ fn run_browser_webcodecs_capture_sender(
             bitrate_bps,
         )
         .map(BrowserWebcodecsEncoder::Hevc),
+        BrowserWebcodecsPreviewCodec::HevcMain10 => NvencHevcEncoder::new_main10_with_bitrate(
+            capture.width(),
+            capture.height(),
+            fps,
+            bitrate_bps,
+        )
+        .map(BrowserWebcodecsEncoder::HevcMain10),
     };
     let mut encoder = match encoder_result {
         Ok(encoder) => encoder,
@@ -267,6 +283,7 @@ fn run_browser_webcodecs_capture_sender(
                     match selected_codec {
                         BrowserWebcodecsPreviewCodec::H264 => "H.264",
                         BrowserWebcodecsPreviewCodec::Hevc => "HEVC",
+                        BrowserWebcodecsPreviewCodec::HevcMain10 => "HEVC Main10",
                     }
                 ),
             );
@@ -398,7 +415,9 @@ fn run_browser_webcodecs_capture_sender(
 fn video_codec_for_webcodecs_preview(codec: BrowserWebcodecsPreviewCodec) -> VideoCodec {
     match codec {
         BrowserWebcodecsPreviewCodec::H264 => VideoCodec::H264,
-        BrowserWebcodecsPreviewCodec::Hevc => VideoCodec::Hevc,
+        BrowserWebcodecsPreviewCodec::Hevc | BrowserWebcodecsPreviewCodec::HevcMain10 => {
+            VideoCodec::Hevc
+        }
     }
 }
 
@@ -519,6 +538,28 @@ mod tests {
     }
 
     #[test]
+    fn browser_webcodecs_preview_start_deserializes_hevc_main10_codec() {
+        let message: BrowserWebcodecsPreviewControlMessage =
+            serde_json::from_str(r#"{"type":"start","session_id":"s1","codec":"hevc_main10"}"#)
+                .unwrap();
+
+        let BrowserWebcodecsPreviewControlMessage::Start(request) = message else {
+            panic!("expected start message");
+        };
+        assert_eq!(
+            request.codec,
+            Some(BrowserWebcodecsPreviewCodec::HevcMain10)
+        );
+        assert_eq!(
+            browser_webcodecs_codec_string(
+                request.selected_codec(),
+                request.h264_profile.as_deref()
+            ),
+            "hev1.2.4.L156.B0"
+        );
+    }
+
+    #[test]
     fn webcodecs_preview_binary_message_has_magic_header_and_payload() {
         let header = BrowserWebcodecsFrameHeader {
             message_type: "mrd.webcodecs.frame.v1",
@@ -553,6 +594,10 @@ mod tests {
         assert_eq!(
             browser_webcodecs_codec_string(BrowserWebcodecsPreviewCodec::Hevc, None),
             "hev1.1.6.L156.B0"
+        );
+        assert_eq!(
+            browser_webcodecs_codec_string(BrowserWebcodecsPreviewCodec::HevcMain10, None),
+            "hev1.2.4.L156.B0"
         );
     }
 

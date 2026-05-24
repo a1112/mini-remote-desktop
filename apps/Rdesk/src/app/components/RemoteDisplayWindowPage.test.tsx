@@ -234,12 +234,12 @@ describe("RemoteDisplayWindowPage", () => {
     expect(browserWebrtcPreviewH264Profile("openh264", "none")).toBe("baseline");
   });
 
-  it("selects HEVC only for the browser WebRTC HEVC Main preview path", () => {
+  it("selects browser WebRTC codecs for hardware H.264, HEVC Main, and AV1", () => {
     expect(webRtcPreviewCodecForEncoder("nvenc_h264")).toBe("h264");
     expect(webRtcPreviewCodecForEncoder("openh264")).toBe("h264");
     expect(webRtcPreviewCodecForEncoder("nvenc_hevc")).toBe("hevc");
     expect(webRtcPreviewCodecForEncoder("nvenc_hevc_main10")).toBeNull();
-    expect(webRtcPreviewCodecForEncoder("nvenc_av1")).toBeNull();
+    expect(webRtcPreviewCodecForEncoder("nvenc_av1")).toBe("av1");
   });
 
   it("detects browser WebRTC HEVC receive capability beside H.264", () => {
@@ -251,12 +251,13 @@ describe("RemoteDisplayWindowPage", () => {
 
     expect(browserSupportsWebrtcVideoCodec("hevc")).toBe(true);
     expect(browserSupportsWebrtcVideoCodec("h264")).toBe(false);
+    expect(browserSupportsWebrtcVideoCodec("av1")).toBe(false);
   });
 
   it("selects HEVC for WebCodecs preview when the HEVC encoder is active", () => {
     expect(webCodecsPreviewCodecForEncoder("nvenc_h264")).toBe("h264");
     expect(webCodecsPreviewCodecForEncoder("nvenc_hevc")).toBe("hevc");
-    expect(webCodecsPreviewCodecForEncoder("nvenc_hevc_main10")).toBe("h264");
+    expect(webCodecsPreviewCodecForEncoder("nvenc_hevc_main10")).toBe("hevc_main10");
   });
 
   it("builds HEVC WebCodecs decoder config without AVC metadata", () => {
@@ -264,6 +265,22 @@ describe("RemoteDisplayWindowPage", () => {
       type: "mrd.webcodecs.ready.v1",
       session_id: "s1",
       codec: "hev1.1.6.L156.B0",
+      codec_format: "annexb",
+      width: 2560,
+      height: 1440,
+      fps: 120,
+      bitrate_mbps: 40,
+    });
+
+    expect(config).toMatchObject({ hevc: { format: "annexb" } });
+    expect("avc" in config).toBe(false);
+  });
+
+  it("builds HEVC Main10 WebCodecs decoder config without AVC metadata", () => {
+    const config = buildWebCodecsDecoderConfig({
+      type: "mrd.webcodecs.ready.v1",
+      session_id: "s1",
+      codec: "hev1.2.4.L156.B0",
       codec_format: "annexb",
       width: 2560,
       height: 1440,

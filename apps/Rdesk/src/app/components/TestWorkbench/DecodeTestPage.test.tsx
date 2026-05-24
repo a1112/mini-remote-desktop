@@ -86,7 +86,7 @@ describe("DecodeTestPage backend contract", () => {
     await waitFor(() => {
       expect(screen.queryByRole("button", { name: /^选择解码器 NVDEC$/ })).not.toBeInTheDocument();
     });
-    expect(screen.getByRole("button", { name: /^选择解码器 软件解码 \(H\.264\)$/ })).toBeEnabled();
+    expect(screen.getByRole("button", { name: /^选择解码器 软件解码$/ })).toBeEnabled();
   });
 
   it("uses a Linux-compatible rendererless software decode path on Linux", async () => {

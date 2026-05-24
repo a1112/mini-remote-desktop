@@ -9,7 +9,10 @@ use std::{
 
 use crate::app_settings::DecodePolicy;
 use crate::frame_sink::DecodedFrameSink;
-use crate::webrtc_media::{H264AccessUnitAssembler, HevcAccessUnitAssembler};
+use crate::webrtc_media::{
+    Av1AccessUnitAssembler, H264AccessUnitAssembler, HevcAccessUnitAssembler,
+    VvcAccessUnitAssembler,
+};
 use mrd_capture_dxgi::DxgiDesktopCapture;
 use mrd_decode::VideoDecoder;
 use mrd_encode_openh264::OpenH264Encoder;
@@ -22,8 +25,8 @@ use mrd_pipeline_core::{
 use mrd_proto::SessionId;
 use mrd_signal_proto::{IceCandidate, SessionDescription};
 use mrd_transport_webrtc::{
-    annex_b_contains_keyframe, hevc_annex_b_contains_keyframe, H264Profile, H264RtpSender,
-    HevcRtpSender,
+    annex_b_contains_keyframe, hevc_annex_b_contains_keyframe, vvc_annex_b_contains_keyframe,
+    vvc_codec_capability, Av1RtpSender, H264Profile, H264RtpSender, HevcRtpSender, VvcRtpSender,
 };
 use tokio::task::JoinHandle;
 use webrtc::{
@@ -39,7 +42,10 @@ use webrtc::{
         configuration::RTCConfiguration, peer_connection_state::RTCPeerConnectionState,
         sdp::session_description::RTCSessionDescription, RTCPeerConnection,
     },
-    rtp_transceiver::{rtp_codec::RTPCodecType, RTCRtpTransceiverInit},
+    rtp_transceiver::{
+        rtp_codec::{RTCRtpCodecParameters, RTPCodecType},
+        RTCRtpTransceiverInit,
+    },
     track::track_local::TrackLocal,
     track::track_remote::TrackRemote,
 };
@@ -97,6 +103,8 @@ struct HostedPeer {
 enum EncodedRtpSender {
     H264(H264RtpSender),
     Hevc(HevcRtpSender),
+    Av1(Av1RtpSender),
+    Vvc(VvcRtpSender),
 }
 
 #[cfg(test)]
@@ -126,6 +134,24 @@ impl EncodedRtpSender {
         Self::Hevc(HevcRtpSender::new(track_id, stream_id, fps, mtu))
     }
 
+    fn new_av1(
+        track_id: impl Into<String>,
+        stream_id: impl Into<String>,
+        fps: u32,
+        mtu: u16,
+    ) -> Self {
+        Self::Av1(Av1RtpSender::new(track_id, stream_id, fps, mtu))
+    }
+
+    fn new_vvc(
+        track_id: impl Into<String>,
+        stream_id: impl Into<String>,
+        fps: u32,
+        mtu: u16,
+    ) -> Self {
+        Self::Vvc(VvcRtpSender::new(track_id, stream_id, fps, mtu))
+    }
+
     fn for_codec(
         codec: VideoCodec,
         track_id: impl Into<String>,
@@ -137,9 +163,8 @@ impl EncodedRtpSender {
         Ok(match codec {
             VideoCodec::H264 => Self::new_h264(track_id, stream_id, fps, mtu, h264_profile),
             VideoCodec::Hevc => Self::new_hevc(track_id, stream_id, fps, mtu),
-            VideoCodec::Av1 => {
-                return Err("WebRTC host AV1 RTP sender is not implemented".to_string());
-            }
+            VideoCodec::Av1 => Self::new_av1(track_id, stream_id, fps, mtu),
+            VideoCodec::Vvc => Self::new_vvc(track_id, stream_id, fps, mtu),
         })
     }
 
@@ -147,6 +172,8 @@ impl EncodedRtpSender {
         match self {
             Self::H264(sender) => sender.track(),
             Self::Hevc(sender) => sender.track(),
+            Self::Av1(sender) => sender.track(),
+            Self::Vvc(sender) => sender.track(),
         }
     }
 
@@ -157,6 +184,8 @@ impl EncodedRtpSender {
         match self {
             Self::H264(sender) => sender.send_access_unit(access_unit).await,
             Self::Hevc(sender) => sender.send_access_unit(access_unit).await,
+            Self::Av1(sender) => sender.send_access_unit(access_unit).await,
+            Self::Vvc(sender) => sender.send_access_unit(access_unit).await,
         }
     }
 
@@ -168,6 +197,8 @@ impl EncodedRtpSender {
         let packets = match self {
             Self::H264(sender) => sender.packetize_access_unit(access_unit)?,
             Self::Hevc(sender) => sender.packetize_access_unit(access_unit)?,
+            Self::Av1(sender) => sender.packetize_access_unit(access_unit)?,
+            Self::Vvc(sender) => sender.packetize_access_unit(access_unit)?,
         };
         Ok(packets
             .into_iter()
@@ -181,6 +212,8 @@ impl EncodedRtpSender {
 enum RemoteAccessUnitAssembler {
     H264(H264AccessUnitAssembler),
     Hevc(HevcAccessUnitAssembler),
+    Av1(Av1AccessUnitAssembler),
+    Vvc(VvcAccessUnitAssembler),
 }
 
 impl RemoteAccessUnitAssembler {
@@ -189,6 +222,10 @@ impl RemoteAccessUnitAssembler {
             Some(Self::H264(H264AccessUnitAssembler::default()))
         } else if is_hevc_mime(mime_type) {
             Some(Self::Hevc(HevcAccessUnitAssembler::default()))
+        } else if mime_type.eq_ignore_ascii_case("video/av1") {
+            Some(Self::Av1(Av1AccessUnitAssembler::default()))
+        } else if is_vvc_mime(mime_type) {
+            Some(Self::Vvc(VvcAccessUnitAssembler::default()))
         } else {
             None
         }
@@ -198,6 +235,8 @@ impl RemoteAccessUnitAssembler {
         match self {
             Self::H264(_) => VideoCodec::H264,
             Self::Hevc(_) => VideoCodec::Hevc,
+            Self::Av1(_) => VideoCodec::Av1,
+            Self::Vvc(_) => VideoCodec::Vvc,
         }
     }
 
@@ -223,6 +262,22 @@ impl RemoteAccessUnitAssembler {
                     codec: VideoCodec::Hevc,
                     timestamp_us,
                     is_keyframe: hevc_annex_b_contains_keyframe(&bytes),
+                    bytes,
+                }),
+            Self::Av1(assembler) => assembler
+                .push_rtp_packet(payload, marker, sequence_number)
+                .map(|(bytes, is_keyframe)| EncodedAccessUnit {
+                    codec: VideoCodec::Av1,
+                    timestamp_us,
+                    is_keyframe,
+                    bytes,
+                }),
+            Self::Vvc(assembler) => assembler
+                .push_rtp_packet(payload, marker, sequence_number)
+                .map(|bytes| EncodedAccessUnit {
+                    codec: VideoCodec::Vvc,
+                    timestamp_us,
+                    is_keyframe: vvc_annex_b_contains_keyframe(&bytes),
                     bytes,
                 }),
         }
@@ -584,6 +639,28 @@ impl WebrtcHost {
         Ok(())
     }
 
+    pub async fn prepare_browser_av1_sender(
+        &mut self,
+        session_id: SessionId,
+        fps: u32,
+    ) -> Result<(), String> {
+        let pc = self.get_or_create_peer(&session_id).await?;
+        let session = self
+            .sessions
+            .get_mut(&session_id)
+            .ok_or_else(|| format!("未找到 webrtc host 会话: {}", session_id.0))?;
+        let _ = ensure_sample_sender(
+            &pc,
+            &session_id,
+            session,
+            fps,
+            VideoCodec::Av1,
+            H264Profile::Baseline,
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn start_encoded_access_unit_sender(
         &mut self,
         session_id: SessionId,
@@ -923,6 +1000,7 @@ async fn build_peer_connection(
     media_engine
         .register_default_codecs()
         .map_err(|e| format!("注册默认编解码器失败: {}", e))?;
+    register_vvc_codec(&mut media_engine)?;
     let mut interceptor_registry = Registry::new();
     interceptor_registry = register_default_interceptors(interceptor_registry, &mut media_engine)
         .map_err(|e| format!("注册默认 interceptor 失败: {}", e))?;
@@ -1156,6 +1234,19 @@ async fn build_peer_connection(
     Ok(pc)
 }
 
+fn register_vvc_codec(media_engine: &mut MediaEngine) -> Result<(), String> {
+    media_engine
+        .register_codec(
+            RTCRtpCodecParameters {
+                capability: vvc_codec_capability(),
+                payload_type: 127,
+                ..Default::default()
+            },
+            RTPCodecType::Video,
+        )
+        .map_err(|e| format!("注册 H.266/VVC 编解码器失败: {}", e))
+}
+
 fn decode_access_unit_into_snapshot(
     session_id: SessionId,
     source_id: String,
@@ -1208,7 +1299,14 @@ fn preferred_backend_for_codec(codec: VideoCodec, policy: DecodePolicy) -> &'sta
             .first()
             .copied()
             .unwrap_or("unsupported"),
-        VideoCodec::Av1 => "unsupported",
+        VideoCodec::Av1 => av1_decoder_backend_order(policy)
+            .first()
+            .copied()
+            .unwrap_or("unsupported"),
+        VideoCodec::Vvc => vvc_decoder_backend_order(policy)
+            .first()
+            .copied()
+            .unwrap_or("unsupported"),
     }
 }
 
@@ -1217,7 +1315,8 @@ fn decoder_backend_order_for_codec(codec: VideoCodec, policy: DecodePolicy) -> V
     match codec {
         VideoCodec::H264 => h264_decoder_backend_order(policy),
         VideoCodec::Hevc => hevc_decoder_backend_order(policy),
-        VideoCodec::Av1 => Vec::new(),
+        VideoCodec::Av1 => av1_decoder_backend_order(policy),
+        VideoCodec::Vvc => vvc_decoder_backend_order(policy),
     }
 }
 
@@ -1232,34 +1331,50 @@ fn h264_decoder_backend_order(policy: DecodePolicy) -> Vec<&'static str> {
 
 fn hevc_decoder_backend_order(policy: DecodePolicy) -> Vec<&'static str> {
     match policy {
-        DecodePolicy::Software | DecodePolicy::D3d11va => Vec::new(),
+        DecodePolicy::Software | DecodePolicy::D3d11va => vec!["software_hevc"],
         DecodePolicy::Auto | DecodePolicy::Nvdec => {
             #[cfg(windows)]
             {
-                vec!["nvdec_hevc"]
+                vec!["nvdec_hevc", "software_hevc"]
             }
             #[cfg(target_os = "linux")]
             {
-                vec!["linux_hevc"]
+                vec!["linux_hevc", "software_hevc"]
             }
             #[cfg(not(any(windows, target_os = "linux")))]
             {
-                Vec::new()
+                vec!["software_hevc"]
             }
         }
     }
+}
+
+fn av1_decoder_backend_order(policy: DecodePolicy) -> Vec<&'static str> {
+    match policy {
+        DecodePolicy::Software | DecodePolicy::D3d11va => vec!["software_av1"],
+        DecodePolicy::Auto | DecodePolicy::Nvdec => {
+            #[cfg(windows)]
+            {
+                vec!["nvdec_av1", "software_av1"]
+            }
+            #[cfg(not(windows))]
+            {
+                vec!["software_av1"]
+            }
+        }
+    }
+}
+
+fn vvc_decoder_backend_order(_policy: DecodePolicy) -> Vec<&'static str> {
+    vec!["software_vvc"]
 }
 
 fn select_decoder_for_codec(codec: VideoCodec, policy: DecodePolicy) -> DecoderSelection {
     match codec {
         VideoCodec::H264 => select_h264_decoder(policy),
         VideoCodec::Hevc => select_hevc_decoder(policy),
-        VideoCodec::Av1 => DecoderSelection {
-            backend_id: None,
-            decoder: None,
-            reason: "WebRTC remote AV1 decode is not implemented".to_string(),
-            fallback_reason: None,
-        },
+        VideoCodec::Av1 => select_ordered_decoder("AV1", av1_decoder_backend_order(policy)),
+        VideoCodec::Vvc => select_ordered_decoder("H.266/VVC", vvc_decoder_backend_order(policy)),
     }
 }
 
@@ -1381,6 +1496,39 @@ fn select_hevc_decoder(policy: DecodePolicy) -> DecoderSelection {
     }
 }
 
+fn select_ordered_decoder(label: &str, order: Vec<&'static str>) -> DecoderSelection {
+    if order.is_empty() {
+        return DecoderSelection {
+            backend_id: None,
+            decoder: None,
+            reason: format!("{label} remote decode has no configured backend"),
+            fallback_reason: None,
+        };
+    }
+
+    let mut failures = Vec::new();
+    for backend in order {
+        match mrd_decode::create_decoder(backend) {
+            Ok(decoder) => {
+                return DecoderSelection {
+                    backend_id: Some(backend),
+                    decoder: Some(decoder),
+                    reason: format!("selected {backend} for WebRTC {label} remote decode"),
+                    fallback_reason: None,
+                };
+            }
+            Err(error) => failures.push(format!("{backend} failed ({error})")),
+        }
+    }
+
+    DecoderSelection {
+        backend_id: None,
+        decoder: None,
+        reason: format!("{label} decoder unavailable: {}", failures.join("; ")),
+        fallback_reason: None,
+    }
+}
+
 fn nvdec_runtime_supports_h264() -> bool {
     let probe = mrd_decode_nvdec::probe_runtime();
     probe.capability_probes.iter().any(|capability| {
@@ -1396,11 +1544,16 @@ fn is_hevc_mime(mime_type: &str) -> bool {
     mime_type.eq_ignore_ascii_case("video/hevc") || mime_type.eq_ignore_ascii_case("video/h265")
 }
 
+fn is_vvc_mime(mime_type: &str) -> bool {
+    mime_type.eq_ignore_ascii_case("video/h266") || mime_type.eq_ignore_ascii_case("video/vvc")
+}
+
 fn codec_label(codec: VideoCodec) -> &'static str {
     match codec {
         VideoCodec::H264 => "h264",
         VideoCodec::Hevc => "hevc",
         VideoCodec::Av1 => "av1",
+        VideoCodec::Vvc => "vvc",
     }
 }
 
@@ -1720,7 +1873,7 @@ mod tests {
 
     use super::{
         decode_access_unit_into_snapshot, decoder_backend_order_for_codec,
-        h264_decoder_backend_order, select_h264_decoder, EncodedRtpSender,
+        h264_decoder_backend_order, select_h264_decoder, EncodedRtpSender, H264Profile,
         RemoteAccessUnitAssembler, WebrtcHost, WebrtcHostSnapshot,
     };
     use crate::app_settings::DecodePolicy;
@@ -1952,6 +2105,24 @@ mod tests {
         }
     }
 
+    fn synthetic_av1_access_unit() -> EncodedAccessUnit {
+        EncodedAccessUnit {
+            codec: VideoCodec::Av1,
+            timestamp_us: 42_000,
+            is_keyframe: true,
+            bytes: vec![0x0a, 0x02, 0xaa, 0xbb],
+        }
+    }
+
+    fn synthetic_vvc_access_unit() -> EncodedAccessUnit {
+        EncodedAccessUnit {
+            codec: VideoCodec::Vvc,
+            timestamp_us: 42_000,
+            is_keyframe: true,
+            bytes: vec![0, 0, 0, 1, 0x01, 0x38, 0xaa, 0xbb, 0xcc],
+        }
+    }
+
     #[test]
     fn webrtc_host_hevc_remote_assembler_wraps_access_units_with_codec_metadata() {
         let mut assembler =
@@ -1971,11 +2142,11 @@ mod tests {
         let order = decoder_backend_order_for_codec(VideoCodec::Hevc, DecodePolicy::Auto);
 
         #[cfg(windows)]
-        assert_eq!(order, vec!["nvdec_hevc"]);
+        assert_eq!(order, vec!["nvdec_hevc", "software_hevc"]);
         #[cfg(target_os = "linux")]
-        assert_eq!(order, vec!["linux_hevc"]);
+        assert_eq!(order, vec!["linux_hevc", "software_hevc"]);
         #[cfg(not(any(windows, target_os = "linux")))]
-        assert!(order.is_empty());
+        assert_eq!(order, vec!["software_hevc"]);
     }
 
     #[test]
@@ -1986,6 +2157,72 @@ mod tests {
             .expect("packetize HEVC");
 
         assert_eq!(packets.len(), 2);
+        assert!(packets.last().expect("last packet").marker);
+    }
+
+    #[test]
+    fn webrtc_host_av1_remote_assembler_wraps_access_units_with_codec_metadata() {
+        let mut assembler =
+            RemoteAccessUnitAssembler::for_mime("video/AV1").expect("AV1 assembler");
+
+        let access_unit = assembler
+            .push_rtp_packet(&[0b0001_1000, 0x08, 0xaa, 0xbb], true, 7, 33_000)
+            .expect("AV1 access unit");
+
+        assert_eq!(access_unit.codec, VideoCodec::Av1);
+        assert_eq!(access_unit.timestamp_us, 33_000);
+        assert!(access_unit.is_keyframe);
+    }
+
+    #[test]
+    fn webrtc_host_av1_sender_packetizes_av1_access_units() {
+        let mut sender = EncodedRtpSender::for_codec(
+            VideoCodec::Av1,
+            "video",
+            "stream",
+            60,
+            1200,
+            H264Profile::Baseline,
+        )
+        .expect("AV1 sender");
+        let packets = sender
+            .packetize_access_unit(&synthetic_av1_access_unit())
+            .expect("packetize AV1");
+
+        assert!(!packets.is_empty());
+        assert!(packets.last().expect("last packet").marker);
+    }
+
+    #[test]
+    fn webrtc_host_vvc_remote_assembler_wraps_access_units_with_codec_metadata() {
+        let mut assembler =
+            RemoteAccessUnitAssembler::for_mime("video/H266").expect("VVC assembler");
+
+        let access_unit = assembler
+            .push_rtp_packet(&[0x01, 0x38, 0xaa], true, 7, 33_000)
+            .expect("VVC access unit");
+
+        assert_eq!(access_unit.codec, VideoCodec::Vvc);
+        assert_eq!(access_unit.timestamp_us, 33_000);
+        assert!(access_unit.is_keyframe);
+    }
+
+    #[test]
+    fn webrtc_host_vvc_sender_packetizes_vvc_access_units() {
+        let mut sender = EncodedRtpSender::for_codec(
+            VideoCodec::Vvc,
+            "video",
+            "stream",
+            60,
+            1200,
+            H264Profile::Baseline,
+        )
+        .expect("VVC sender");
+        let packets = sender
+            .packetize_access_unit(&synthetic_vvc_access_unit())
+            .expect("packetize VVC");
+
+        assert!(!packets.is_empty());
         assert!(packets.last().expect("last packet").marker);
     }
 

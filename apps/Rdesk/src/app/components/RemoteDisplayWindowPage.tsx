@@ -1109,18 +1109,23 @@ function isH264PreviewEncoder(encoder: EncoderType) {
   );
 }
 
-export function webRtcPreviewCodecForEncoder(encoder: EncoderType): "h264" | "hevc" | null {
+export function webRtcPreviewCodecForEncoder(encoder: EncoderType): "h264" | "hevc" | "av1" | null {
   if (encoder === "nvenc_hevc") return "hevc";
+  if (encoder === "nvenc_av1") return "av1";
   if (isH264PreviewEncoder(encoder)) return "h264";
   return null;
 }
 
-export function browserSupportsWebrtcVideoCodec(codec: "h264" | "hevc"): boolean {
+export function browserSupportsWebrtcVideoCodec(codec: "h264" | "hevc" | "av1"): boolean {
   if (typeof RTCRtpReceiver === "undefined") return true;
   const capabilities = RTCRtpReceiver.getCapabilities?.("video");
   if (!capabilities?.codecs?.length) return true;
   const mimeTypes =
-    codec === "hevc" ? new Set(["video/h265", "video/hevc"]) : new Set(["video/h264"]);
+    codec === "hevc"
+      ? new Set(["video/h265", "video/hevc"])
+      : codec === "av1"
+        ? new Set(["video/av1"])
+        : new Set(["video/h264"]);
   return capabilities.codecs.some((candidate) => mimeTypes.has(candidate.mimeType.toLowerCase()));
 }
 
@@ -1141,8 +1146,10 @@ export function browserSupportsWebCodecsH264(): boolean {
   return Boolean(maybeWindow.VideoDecoder && maybeWindow.EncodedVideoChunk);
 }
 
-export function webCodecsPreviewCodecForEncoder(encoder: EncoderType): "h264" | "hevc" {
-  return encoder === "nvenc_hevc" ? "hevc" : "h264";
+export function webCodecsPreviewCodecForEncoder(encoder: EncoderType): "h264" | "hevc" | "hevc_main10" {
+  if (encoder === "nvenc_hevc") return "hevc";
+  if (encoder === "nvenc_hevc_main10") return "hevc_main10";
+  return "h264";
 }
 
 function isHevcWebCodecsCodec(codec: string): boolean {
@@ -3332,7 +3339,7 @@ export function RemoteDisplayWindowPage() {
     const previewCodec = webRtcPreviewCodecForEncoder(encoder);
     if (!previewCodec) {
       setWebPreviewMode("failed");
-      setWebPreviewError("Browser WebRTC preview currently supports H.264 and HEVC Main output");
+      setWebPreviewError("Browser WebRTC preview currently supports H.264, HEVC Main, and AV1 output");
       setWebPresentationLatencyStats(null);
       setWebFrameTimingMetadataCount(0);
       setWebFrameTimingChannelState(null);
@@ -3343,7 +3350,9 @@ export function RemoteDisplayWindowPage() {
     if (!browserSupportsWebrtcVideoCodec(previewCodec)) {
       setWebPreviewMode("failed");
       setWebPreviewError(
-        `Browser WebRTC video renderer does not advertise ${previewCodec === "hevc" ? "HEVC" : "H.264"} receive support`
+        `Browser WebRTC video renderer does not advertise ${
+          previewCodec === "hevc" ? "HEVC" : previewCodec === "av1" ? "AV1" : "H.264"
+        } receive support`
       );
       setWebPresentationLatencyStats(null);
       setWebFrameTimingMetadataCount(0);

@@ -746,7 +746,13 @@ async fn browser_webrtc_preview_start(
                 .await?;
         }
         VideoCodec::Av1 => {
-            return Err("browser WebRTC preview does not support AV1".to_string());
+            host.prepare_browser_av1_sender(session_id.clone(), fps)
+                .await?;
+        }
+        VideoCodec::Vvc => {
+            return Err(
+                "browser WebRTC preview does not support H.266/VVC in current browsers".to_string(),
+            );
         }
     }
     let answer = host.create_answer(session_id.clone()).await?;
@@ -774,7 +780,10 @@ fn browser_webrtc_preview_codec_from_label(codec: Option<&str>) -> Result<VideoC
     {
         None | Some("h264" | "avc" | "avc1") => Ok(VideoCodec::H264),
         Some("hevc" | "h265" | "hev1" | "hvc1") => Ok(VideoCodec::Hevc),
-        Some("av1") => Err("browser WebRTC preview does not support AV1".to_string()),
+        Some("av1") => Ok(VideoCodec::Av1),
+        Some("vvc" | "h266" | "h.266") => {
+            Err("browser WebRTC preview does not support H.266/VVC in current browsers".to_string())
+        }
         Some(other) => Err(format!("unsupported browser WebRTC preview codec: {other}")),
     }
 }
@@ -800,10 +809,18 @@ mod browser_webrtc_preview_tests {
     }
 
     #[test]
-    fn browser_webrtc_preview_codec_rejects_av1() {
-        let error = browser_webrtc_preview_codec_from_label(Some("av1")).unwrap_err();
+    fn browser_webrtc_preview_codec_labels_parse_av1() {
+        assert_eq!(
+            browser_webrtc_preview_codec_from_label(Some("av1")).unwrap(),
+            VideoCodec::Av1
+        );
+    }
 
-        assert!(error.contains("does not support AV1"));
+    #[test]
+    fn browser_webrtc_preview_codec_rejects_vvc() {
+        let error = browser_webrtc_preview_codec_from_label(Some("h266")).unwrap_err();
+
+        assert!(error.contains("H.266/VVC"));
     }
 }
 

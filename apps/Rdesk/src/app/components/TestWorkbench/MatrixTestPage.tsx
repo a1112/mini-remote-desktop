@@ -541,17 +541,11 @@ function unsupportedMatrixReason(config: TestConfig): string | null {
   ) {
     return "D3D11 shared texture input requires direct render or NVENC GPU encoders";
   }
-  if (isHevcEncoder(config.encoder_type) && config.decoder_type === "software") {
-    return "NVENC HEVC currently requires NVDEC or encode-only matrix runs";
-  }
   if (isHevcEncoder(config.encoder_type) && config.decoder_type === "linux_h264") {
     return "Linux H.264 hardware decoder cannot decode NVENC HEVC output";
   }
   if (config.encoder_type === "nvenc_hevc_main10" && config.decoder_type === "linux_hevc") {
     return "NVENC HEVC Main10 requires the Linux HEVC Main10 decoder path";
-  }
-  if (config.encoder_type === "nvenc_av1" && config.decoder_type === "software") {
-    return "NVENC AV1 currently requires NVDEC or encode-only matrix runs";
   }
   if (config.encoder_type === "nvenc_av1" && config.decoder_type === "linux_h264") {
     return "Linux H.264 hardware decoder cannot decode NVENC AV1 output";

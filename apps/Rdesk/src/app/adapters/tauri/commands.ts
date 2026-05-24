@@ -303,7 +303,7 @@ export async function browserWebrtcPreviewStart(params: {
   fps?: number;
   width?: number;
   height?: number;
-  codec?: "h264" | "hevc";
+  codec?: "h264" | "hevc" | "av1";
   h264Profile?: "baseline" | "high";
   bitrateMbps?: number;
   sourceId?: string;

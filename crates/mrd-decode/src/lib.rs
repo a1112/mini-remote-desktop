@@ -7,10 +7,11 @@ use openh264::{
     decoder::{DecodedYUV, Decoder as OpenH264Decoder},
     formats::YUVSource,
 };
+use std::process::{Command, Stdio};
 #[cfg(target_os = "linux")]
 use std::{
     io::{Read, Write},
-    process::{Child, ChildStdin, Command, Stdio},
+    process::{Child, ChildStdin},
     sync::mpsc,
     thread,
 };
@@ -21,6 +22,7 @@ pub enum CodecKind {
     Hevc,
     HevcMain10,
     Av1,
+    Vvc,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +46,34 @@ const D3D11_TEXTURE_OUTPUTS: &[PixelFormat] = &[PixelFormat::D3d11Texture];
 const H264_SOFTWARE_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
     id: "h264_software",
     codec: CodecKind::H264,
+    runtime_status: RuntimeStatus::RuntimeBacked,
+    output_formats: RGB24_OUTPUTS,
+};
+
+const HEVC_SOFTWARE_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
+    id: "software_hevc",
+    codec: CodecKind::Hevc,
+    runtime_status: RuntimeStatus::RuntimeBacked,
+    output_formats: RGB24_OUTPUTS,
+};
+
+const HEVC_MAIN10_SOFTWARE_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
+    id: "software_hevc_main10",
+    codec: CodecKind::HevcMain10,
+    runtime_status: RuntimeStatus::RuntimeBacked,
+    output_formats: RGB24_OUTPUTS,
+};
+
+const AV1_SOFTWARE_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
+    id: "software_av1",
+    codec: CodecKind::Av1,
+    runtime_status: RuntimeStatus::RuntimeBacked,
+    output_formats: RGB24_OUTPUTS,
+};
+
+const VVC_SOFTWARE_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
+    id: "software_vvc",
+    codec: CodecKind::Vvc,
     runtime_status: RuntimeStatus::RuntimeBacked,
     output_formats: RGB24_OUTPUTS,
 };
@@ -124,6 +154,10 @@ const LINUX_HEVC_MAIN10_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
 pub fn available_decoder_descriptors() -> Vec<DecoderDescriptor> {
     let descriptors = vec![
         H264_SOFTWARE_DESCRIPTOR.clone(),
+        HEVC_SOFTWARE_DESCRIPTOR.clone(),
+        HEVC_MAIN10_SOFTWARE_DESCRIPTOR.clone(),
+        AV1_SOFTWARE_DESCRIPTOR.clone(),
+        VVC_SOFTWARE_DESCRIPTOR.clone(),
         NVDEC_D3D11_SHARED_DESCRIPTOR.clone(),
         NVDEC_DESCRIPTOR.clone(),
         NVDEC_HEVC_D3D11_SHARED_DESCRIPTOR.clone(),
@@ -146,6 +180,18 @@ pub fn available_decoder_descriptors() -> Vec<DecoderDescriptor> {
 pub fn create_decoder(id: &str) -> Result<Box<dyn VideoDecoder>, PipelineError> {
     match id {
         "h264_software" => Ok(Box::new(H264SoftwareDecoder::new()?)),
+        "software_hevc" | "hevc_software" => Ok(Box::new(FfmpegSoftwareDecoder::new(
+            FfmpegSoftwareCodec::Hevc,
+        )?)),
+        "software_hevc_main10" | "hevc_main10_software" => Ok(Box::new(
+            FfmpegSoftwareDecoder::new(FfmpegSoftwareCodec::HevcMain10)?,
+        )),
+        "software_av1" | "av1_software" => Ok(Box::new(FfmpegSoftwareDecoder::new(
+            FfmpegSoftwareCodec::Av1,
+        )?)),
+        "software_vvc" | "vvc_software" | "software_h266" | "h266_software" => Ok(Box::new(
+            FfmpegSoftwareDecoder::new(FfmpegSoftwareCodec::Vvc)?,
+        )),
         "linux_h264" | "gstreamer_h264" | "vaapi_h264" => create_linux_h264_decoder(),
         "linux_hevc" | "gstreamer_hevc" | "vaapi_hevc" => create_linux_hevc_decoder(),
         "linux_hevc_main10" | "gstreamer_hevc_main10" | "vaapi_hevc_main10" => {
@@ -246,6 +292,59 @@ fn create_linux_hevc_main10_decoder() -> Result<Box<dyn VideoDecoder>, PipelineE
 pub struct H264SoftwareDecoder {
     decoder: OpenH264Decoder,
     decoded_frames: Vec<CoreDecodedFrame>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FfmpegSoftwareCodec {
+    Hevc,
+    HevcMain10,
+    Av1,
+    Vvc,
+}
+
+impl FfmpegSoftwareCodec {
+    fn input_format(self) -> &'static str {
+        match self {
+            Self::Hevc | Self::HevcMain10 => "hevc",
+            Self::Av1 => "av1",
+            Self::Vvc => "vvc",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Hevc => "HEVC",
+            Self::HevcMain10 => "HEVC Main10",
+            Self::Av1 => "AV1",
+            Self::Vvc => "H.266/VVC",
+        }
+    }
+
+    fn runtime_label(self) -> &'static str {
+        match self {
+            Self::Vvc => "ffmpeg/vvdec",
+            Self::Hevc | Self::HevcMain10 | Self::Av1 => "ffmpeg",
+        }
+    }
+}
+
+pub struct FfmpegSoftwareDecoder {
+    codec: FfmpegSoftwareCodec,
+    stream: Vec<u8>,
+    decoded_frames: Vec<CoreDecodedFrame>,
+    frame_index: u64,
+}
+
+impl FfmpegSoftwareDecoder {
+    fn new(codec: FfmpegSoftwareCodec) -> Result<Self, PipelineError> {
+        ensure_ffmpeg_available(codec)?;
+        Ok(Self {
+            codec,
+            stream: Vec::new(),
+            decoded_frames: Vec::new(),
+            frame_index: 0,
+        })
+    }
 }
 
 pub struct NvdecVideoDecoder {
@@ -690,6 +789,24 @@ impl H264SoftwareDecoder {
     }
 }
 
+impl VideoDecoder for FfmpegSoftwareDecoder {
+    fn push_access_unit(&mut self, access_unit: &[u8]) -> Result<(), PipelineError> {
+        if access_unit.is_empty() {
+            return Ok(());
+        }
+
+        self.stream.extend_from_slice(access_unit);
+        let frame = decode_first_ppm_frame_with_ffmpeg(self.codec, &self.stream, self.frame_index)?;
+        self.frame_index = self.frame_index.saturating_add(1);
+        self.decoded_frames.push(frame);
+        Ok(())
+    }
+
+    fn drain_decoded_frames(&mut self) -> Vec<CoreDecodedFrame> {
+        std::mem::take(&mut self.decoded_frames)
+    }
+}
+
 impl VideoDecoder for H264SoftwareDecoder {
     fn push_access_unit(&mut self, access_unit: &[u8]) -> Result<(), PipelineError> {
         let decoded_frame = match self.decoder.decode(access_unit) {
@@ -719,6 +836,150 @@ fn decoded_yuv_to_rgb_frame(decoded: &DecodedYUV<'_>, timestamp_us: u64) -> Core
     let mut rgb = vec![0_u8; width * height * 3];
     decoded.write_rgb8(&mut rgb);
     CoreDecodedFrame::from_cpu_rgb24(width, height, timestamp_us, rgb)
+}
+
+fn ensure_ffmpeg_available(codec: FfmpegSoftwareCodec) -> Result<(), PipelineError> {
+    Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| {
+            PipelineError::Message(format!(
+                "{} executable not found for software {} decode: {error}",
+                codec.runtime_label(),
+                codec.label()
+            ))
+        })
+        .and_then(|status| {
+            if status.success() {
+                Ok(())
+            } else {
+                Err(PipelineError::Message(format!(
+                    "{} executable is not healthy for software {} decode",
+                    codec.runtime_label(),
+                    codec.label()
+                )))
+            }
+        })
+}
+
+fn decode_first_ppm_frame_with_ffmpeg(
+    codec: FfmpegSoftwareCodec,
+    stream: &[u8],
+    frame_index: u64,
+) -> Result<CoreDecodedFrame, PipelineError> {
+    let mut child = Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-f",
+            codec.input_format(),
+            "-i",
+            "pipe:0",
+            "-frames:v",
+            "1",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "ppm",
+            "pipe:1",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| {
+            PipelineError::Message(format!(
+                "spawn ffmpeg software {} decoder failed: {error}",
+                codec.label()
+            ))
+        })?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        stdin.write_all(stream).map_err(|error| {
+            PipelineError::Message(format!(
+                "write {} stream to ffmpeg decoder failed: {error}",
+                codec.label()
+            ))
+        })?;
+    }
+
+    let output = child.wait_with_output().map_err(|error| {
+        PipelineError::Message(format!(
+            "wait for ffmpeg software {} decoder failed: {error}",
+            codec.label()
+        ))
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(PipelineError::Message(format!(
+            "ffmpeg software {} decode failed: {}",
+            codec.label(),
+            stderr.trim()
+        )));
+    }
+
+    parse_ppm_frame(&output.stdout, frame_index.saturating_mul(16_667)).ok_or_else(|| {
+        PipelineError::Message(format!(
+            "ffmpeg software {} decoder produced no PPM frame",
+            codec.label()
+        ))
+    })
+}
+
+fn parse_ppm_frame(bytes: &[u8], timestamp_us: u64) -> Option<CoreDecodedFrame> {
+    let mut offset = 0usize;
+    let magic = next_ppm_token(bytes, &mut offset)?;
+    if magic != b"P6" {
+        return None;
+    }
+    let width = std::str::from_utf8(next_ppm_token(bytes, &mut offset)?)
+        .ok()?
+        .parse::<usize>()
+        .ok()?;
+    let height = std::str::from_utf8(next_ppm_token(bytes, &mut offset)?)
+        .ok()?
+        .parse::<usize>()
+        .ok()?;
+    let max = std::str::from_utf8(next_ppm_token(bytes, &mut offset)?)
+        .ok()?
+        .parse::<usize>()
+        .ok()?;
+    if max != 255 {
+        return None;
+    }
+    while offset < bytes.len() && bytes[offset].is_ascii_whitespace() {
+        offset += 1;
+    }
+    let frame_len = width.checked_mul(height)?.checked_mul(3)?;
+    let frame = bytes.get(offset..offset.checked_add(frame_len)?)?.to_vec();
+    Some(CoreDecodedFrame::from_cpu_rgb24(
+        width,
+        height,
+        timestamp_us,
+        frame,
+    ))
+}
+
+fn next_ppm_token<'a>(bytes: &'a [u8], offset: &mut usize) -> Option<&'a [u8]> {
+    while *offset < bytes.len() {
+        if bytes[*offset] == b'#' {
+            while *offset < bytes.len() && bytes[*offset] != b'\n' {
+                *offset += 1;
+            }
+        } else if bytes[*offset].is_ascii_whitespace() {
+            *offset += 1;
+        } else {
+            break;
+        }
+    }
+    let start = *offset;
+    while *offset < bytes.len() && !bytes[*offset].is_ascii_whitespace() {
+        *offset += 1;
+    }
+    (start < *offset).then_some(&bytes[start..*offset])
 }
 
 fn parse_h264_dimensions(access_unit: &[u8]) -> Result<Option<(usize, usize)>, PipelineError> {

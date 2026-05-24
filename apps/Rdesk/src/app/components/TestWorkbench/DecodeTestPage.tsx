@@ -73,8 +73,8 @@ const DECODER_OPTIONS: DecoderOption[] = [
   },
   {
     id: "software",
-    name: "软件解码 (H.264)",
-    description: "CPU H.264 软件解码，跨平台 fallback 基线",
+    name: "软件解码",
+    description: "CPU H.264 / HEVC / AV1 软件解码，跨平台 fallback 基线",
     type: "software",
     icon: <Cpu className="h-5 w-5 text-orange-500" />,
   },
@@ -118,20 +118,20 @@ const CODEC_OPTIONS: CodecOption[] = [
   {
     id: "hevc",
     name: "HEVC",
-    description: "NVENC HEVC -> 硬件解码，Windows/NVIDIA 与 Linux GStreamer 路径。",
-    supportedDecoders: ["nvdec", "linux_hevc", "linux_hevc_main10"],
+    description: "NVENC HEVC -> 硬件或软件解码，Windows/NVIDIA、Linux GStreamer 与 FFmpeg fallback 路径。",
+    supportedDecoders: ["nvdec", "software", "linux_hevc", "linux_hevc_main10"],
   },
   {
     id: "hevc_main10",
     name: "HEVC Main10",
-    description: "10-bit HEVC -> 硬件解码，验证 Main10 能力。",
-    supportedDecoders: ["nvdec", "linux_hevc_main10"],
+    description: "10-bit HEVC -> 硬件或软件解码，验证 Main10 能力。",
+    supportedDecoders: ["nvdec", "software", "linux_hevc_main10"],
   },
   {
     id: "av1",
     name: "AV1",
-    description: "NVENC AV1 -> NVDEC，取决于 GPU 代际能力。",
-    supportedDecoders: ["nvdec"],
+    description: "NVENC AV1 -> NVDEC 或软件解码，取决于 GPU 代际能力和 FFmpeg runtime。",
+    supportedDecoders: ["nvdec", "software"],
   },
 ];
 
@@ -225,12 +225,20 @@ function buildDecodeRun(
   };
 
   if (decoder === "software") {
+    const encoderType: TestConfig["encoder_type"] =
+      codec === "hevc"
+        ? "nvenc_hevc"
+        : codec === "hevc_main10"
+          ? "nvenc_hevc_main10"
+          : codec === "av1"
+            ? "nvenc_av1"
+            : "openh264";
     return {
       scenarioId: "custom",
       config: {
         ...common,
-        capture_type: "synthetic",
-        encoder_type: "openh264",
+        capture_type: encoderType === "openh264" ? "synthetic" : "dxgi",
+        encoder_type: encoderType,
         decoder_type: "software",
         zero_copy: false,
       },
@@ -690,7 +698,7 @@ export function DecodeTestPage() {
           <InfoPill label="目标档位" value={`${selectedProfile.resolution[0]}x${selectedProfile.resolution[1]} @ ${selectedProfile.fps}fps`} />
         </div>
         <p className="mt-3 text-xs text-muted-foreground">
-          软件解码只跑 H.264 CPU fallback；NVDEC 可切换 H.264 / HEVC / HEVC Main10 / AV1。页面不再限制在 60fps 档位，实际吞吐以 decoded FPS 为准。
+          软件解码可跑 H.264 / HEVC / HEVC Main10 / AV1 CPU fallback；NVDEC 可切换 H.264 / HEVC / HEVC Main10 / AV1。页面不再限制在 60fps 档位，实际吞吐以 decoded FPS 为准。
         </p>
       </div>
 

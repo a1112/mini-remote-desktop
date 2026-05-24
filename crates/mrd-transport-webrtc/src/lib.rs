@@ -1,7 +1,7 @@
 use mrd_pipeline_core::{EncodedAccessUnit, VideoCodec};
 use rtp::{
     packet::Packet,
-    packetizer::{new_packetizer, Packetizer},
+    packetizer::{new_packetizer, Packetizer, Payloader},
     sequence::new_random_sequencer,
 };
 use std::sync::Arc;
@@ -34,6 +34,12 @@ pub struct HevcRtpSender {
     frame_samples: u32,
 }
 
+pub struct VvcRtpSender {
+    track: Arc<TrackLocalStaticRTP>,
+    packetizer: Box<dyn Packetizer + Send + Sync>,
+    frame_samples: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct H264RtpSendReport {
     pub bytes_written: usize,
@@ -42,6 +48,12 @@ pub struct H264RtpSendReport {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HevcRtpSendReport {
+    pub bytes_written: usize,
+    pub rtp_timestamp: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VvcRtpSendReport {
     pub bytes_written: usize,
     pub rtp_timestamp: u32,
 }
@@ -78,6 +90,14 @@ pub struct H264AccessUnitAssembler {
 
 #[derive(Debug, Default, Clone)]
 pub struct HevcAccessUnitAssembler {
+    annex_b_buffer: Vec<u8>,
+    fragmentation_unit_active: bool,
+    last_sequence_number: Option<u16>,
+    drop_until_marker: bool,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct VvcAccessUnitAssembler {
     annex_b_buffer: Vec<u8>,
     fragmentation_unit_active: bool,
     last_sequence_number: Option<u16>,
@@ -362,6 +382,148 @@ impl HevcAccessUnitAssembler {
     }
 }
 
+impl VvcAccessUnitAssembler {
+    pub fn push_rtp_packet(
+        &mut self,
+        payload: &[u8],
+        marker: bool,
+        sequence_number: u16,
+    ) -> Option<Vec<u8>> {
+        if let Some(previous) = self.last_sequence_number {
+            let expected = previous.wrapping_add(1);
+            if sequence_number != expected && self.has_incomplete_access_unit() {
+                self.reset();
+                self.drop_until_marker = true;
+            }
+        }
+        self.last_sequence_number = Some(sequence_number);
+
+        if self.drop_until_marker {
+            if marker {
+                self.drop_until_marker = false;
+            }
+            return None;
+        }
+
+        self.push_rtp_payload(payload, marker)
+    }
+
+    pub fn push_rtp_payload(&mut self, payload: &[u8], marker: bool) -> Option<Vec<u8>> {
+        if payload.len() < 2 {
+            return None;
+        }
+
+        let nal_type = vvc_nal_type(payload);
+        match nal_type {
+            0..=27 => {
+                self.append_nal(payload);
+                if marker {
+                    self.take_access_unit()
+                } else {
+                    None
+                }
+            }
+            28 => self.push_aggregation_packet(payload, marker),
+            29 => self.push_fragmentation_unit(payload, marker),
+            _ => {
+                if marker {
+                    self.reset();
+                }
+                None
+            }
+        }
+    }
+
+    fn push_aggregation_packet(&mut self, payload: &[u8], marker: bool) -> Option<Vec<u8>> {
+        if payload.len() < 4 {
+            self.reset();
+            return None;
+        }
+
+        let mut offset = 2usize;
+        while offset + 2 <= payload.len() {
+            let nal_len = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+            offset += 2;
+            if nal_len == 0 || offset + nal_len > payload.len() {
+                self.reset();
+                return None;
+            }
+            self.append_nal(&payload[offset..offset + nal_len]);
+            offset += nal_len;
+        }
+
+        if offset != payload.len() {
+            self.reset();
+            return None;
+        }
+
+        if marker {
+            return self.take_access_unit();
+        }
+
+        None
+    }
+
+    fn push_fragmentation_unit(&mut self, payload: &[u8], marker: bool) -> Option<Vec<u8>> {
+        if payload.len() < 4 {
+            self.reset();
+            return None;
+        }
+
+        let fu_header = payload[2];
+        let start = fu_header & 0x80 != 0;
+        let end = fu_header & 0x40 != 0;
+        let fu_type = fu_header & 0x1f;
+        let reconstructed_nal_header = [payload[0], (fu_type << 3) | (payload[1] & 0x07)];
+
+        if start {
+            if self.fragmentation_unit_active {
+                self.reset();
+            }
+            self.annex_b_buffer.extend_from_slice(&[0, 0, 0, 1]);
+            self.annex_b_buffer
+                .extend_from_slice(&reconstructed_nal_header);
+            self.annex_b_buffer.extend_from_slice(&payload[3..]);
+            self.fragmentation_unit_active = true;
+        } else if self.fragmentation_unit_active {
+            self.annex_b_buffer.extend_from_slice(&payload[3..]);
+        } else {
+            self.reset();
+            return None;
+        }
+
+        if end || marker {
+            self.fragmentation_unit_active = false;
+            return self.take_access_unit();
+        }
+
+        None
+    }
+
+    fn append_nal(&mut self, nal: &[u8]) {
+        self.annex_b_buffer.extend_from_slice(&[0, 0, 0, 1]);
+        self.annex_b_buffer.extend_from_slice(nal);
+    }
+
+    fn take_access_unit(&mut self) -> Option<Vec<u8>> {
+        if self.annex_b_buffer.is_empty() {
+            return None;
+        }
+        let mut complete = Vec::new();
+        std::mem::swap(&mut complete, &mut self.annex_b_buffer);
+        Some(complete)
+    }
+
+    fn reset(&mut self) {
+        self.annex_b_buffer.clear();
+        self.fragmentation_unit_active = false;
+    }
+
+    fn has_incomplete_access_unit(&self) -> bool {
+        self.fragmentation_unit_active || !self.annex_b_buffer.is_empty()
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct H264RtpIngress {
     assembler: H264AccessUnitAssembler,
@@ -370,6 +532,11 @@ pub struct H264RtpIngress {
 #[derive(Debug, Default, Clone)]
 pub struct HevcRtpIngress {
     assembler: HevcAccessUnitAssembler,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct VvcRtpIngress {
+    assembler: VvcAccessUnitAssembler,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -451,6 +618,41 @@ impl HevcRtpIngress {
                 codec: VideoCodec::Hevc,
                 timestamp_us,
                 is_keyframe: hevc_annex_b_contains_keyframe(&bytes),
+                bytes,
+            })
+    }
+}
+
+impl VvcRtpIngress {
+    pub fn push_packet(
+        &mut self,
+        payload: &[u8],
+        marker: bool,
+        sequence_number: u16,
+        timestamp_us: u64,
+    ) -> Option<EncodedAccessUnit> {
+        self.assembler
+            .push_rtp_packet(payload, marker, sequence_number)
+            .map(|bytes| EncodedAccessUnit {
+                codec: VideoCodec::Vvc,
+                timestamp_us,
+                is_keyframe: vvc_annex_b_contains_keyframe(&bytes),
+                bytes,
+            })
+    }
+
+    pub fn push_payload(
+        &mut self,
+        payload: &[u8],
+        marker: bool,
+        timestamp_us: u64,
+    ) -> Option<EncodedAccessUnit> {
+        self.assembler
+            .push_rtp_payload(payload, marker)
+            .map(|bytes| EncodedAccessUnit {
+                codec: VideoCodec::Vvc,
+                timestamp_us,
+                is_keyframe: vvc_annex_b_contains_keyframe(&bytes),
                 bytes,
             })
     }
@@ -846,6 +1048,118 @@ impl HevcRtpSender {
     }
 }
 
+impl VvcRtpSender {
+    pub fn new(
+        track_id: impl Into<String>,
+        stream_id: impl Into<String>,
+        fps: u32,
+        mtu: u16,
+    ) -> Self {
+        let payload_type = 127;
+        let payloader = Box::<VvcPayloader>::default();
+        let packetizer = Box::new(new_packetizer(
+            mtu.max(576) as usize,
+            payload_type,
+            0,
+            payloader,
+            Box::new(new_random_sequencer()),
+            90_000,
+        ));
+        Self {
+            track: Arc::new(TrackLocalStaticRTP::new(
+                vvc_codec_capability(),
+                track_id.into(),
+                stream_id.into(),
+            )),
+            packetizer,
+            frame_samples: (90_000 / fps.max(1)).max(1),
+        }
+    }
+
+    pub fn track(&self) -> Arc<TrackLocalStaticRTP> {
+        self.track.clone()
+    }
+
+    pub fn packetize_access_unit(
+        &mut self,
+        access_unit: &EncodedAccessUnit,
+    ) -> Result<Vec<Packet>, TransportError> {
+        if access_unit.codec != VideoCodec::Vvc {
+            return Err(TransportError::Message(
+                "VVC RTP sender only supports VVC access units".into(),
+            ));
+        }
+
+        self.packetizer
+            .packetize(
+                &bytes::Bytes::copy_from_slice(access_unit.bytes.as_slice()),
+                self.frame_samples,
+            )
+            .map_err(|error| TransportError::Message(format!("packetize failed: {error}")))
+    }
+
+    pub async fn send_access_unit(
+        &mut self,
+        access_unit: &EncodedAccessUnit,
+    ) -> Result<usize, TransportError> {
+        self.send_access_unit_with_report(access_unit)
+            .await
+            .map(|report| report.bytes_written)
+    }
+
+    pub async fn send_access_unit_with_report(
+        &mut self,
+        access_unit: &EncodedAccessUnit,
+    ) -> Result<VvcRtpSendReport, TransportError> {
+        let packets = self.packetize_access_unit(access_unit)?;
+        let rtp_timestamp = packets
+            .first()
+            .map(|packet| packet.header.timestamp)
+            .unwrap_or_default();
+        let mut written = 0usize;
+        for packet in packets {
+            written +=
+                self.track.write_rtp(&packet).await.map_err(|error| {
+                    TransportError::Message(format!("write_rtp failed: {error}"))
+                })?;
+        }
+        Ok(VvcRtpSendReport {
+            bytes_written: written,
+            rtp_timestamp,
+        })
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct VvcPayloader;
+
+impl Payloader for VvcPayloader {
+    fn payload(
+        &mut self,
+        mtu: usize,
+        payload: &bytes::Bytes,
+    ) -> Result<Vec<bytes::Bytes>, rtp::Error> {
+        if payload.is_empty() || mtu == 0 {
+            return Ok(vec![]);
+        }
+
+        let mut payloads = Vec::new();
+        let nals = annex_b_nal_units(payload);
+        if nals.is_empty() {
+            emit_vvc_nal(payload.as_ref(), mtu, &mut payloads);
+        } else {
+            for nal in nals {
+                emit_vvc_nal(nal, mtu, &mut payloads);
+            }
+        }
+        Ok(payloads)
+    }
+
+    fn clone_to(&self) -> Box<dyn Payloader + Send + Sync> {
+        Box::new(self.clone())
+    }
+}
+
 impl H264SampleSender {
     pub fn new_with_profile_level_id(
         track_id: impl Into<String>,
@@ -969,6 +1283,73 @@ impl Av1RtpSender {
     }
 }
 
+fn emit_vvc_nal(nal: &[u8], mtu: usize, payloads: &mut Vec<bytes::Bytes>) {
+    if nal.len() < 2 {
+        return;
+    }
+    if nal.len() <= mtu {
+        payloads.push(bytes::Bytes::copy_from_slice(nal));
+        return;
+    }
+
+    let max_fragment_size = mtu.saturating_sub(3);
+    if max_fragment_size == 0 {
+        return;
+    }
+
+    let nal_type = vvc_nal_type(nal);
+    let payload_header = [nal[0], (29 << 3) | (nal[1] & 0x07)];
+    let mut offset = 2usize;
+    let mut first = true;
+    while offset < nal.len() {
+        let end = (offset + max_fragment_size).min(nal.len());
+        let mut out = Vec::with_capacity(3 + end - offset);
+        out.extend_from_slice(&payload_header);
+        let mut fu_header = nal_type;
+        if first {
+            fu_header |= 0x80;
+        }
+        if end == nal.len() {
+            fu_header |= 0x40;
+        }
+        out.push(fu_header);
+        out.extend_from_slice(&nal[offset..end]);
+        payloads.push(bytes::Bytes::from(out));
+        first = false;
+        offset = end;
+    }
+}
+
+fn annex_b_nal_units(payload: &[u8]) -> Vec<&[u8]> {
+    let mut nals = Vec::new();
+    let mut offset = 0usize;
+    while let Some((start, start_code_len)) = find_annex_b_start_code(payload, offset) {
+        let nal_start = start + start_code_len;
+        let next = find_annex_b_start_code(payload, nal_start)
+            .map(|(next, _)| next)
+            .unwrap_or(payload.len());
+        if nal_start < next {
+            nals.push(&payload[nal_start..next]);
+        }
+        offset = next;
+    }
+    nals
+}
+
+fn find_annex_b_start_code(payload: &[u8], from: usize) -> Option<(usize, usize)> {
+    let mut index = from;
+    while index + 3 <= payload.len() {
+        if index + 4 <= payload.len() && payload[index..index + 4] == [0, 0, 0, 1] {
+            return Some((index, 4));
+        }
+        if payload[index..index + 3] == [0, 0, 1] {
+            return Some((index, 3));
+        }
+        index += 1;
+    }
+    None
+}
+
 fn h264_profile_level_id(profile: H264Profile) -> &'static str {
     match profile {
         // The browser preview path can send 1440p/120 from the local DXGI source.
@@ -1008,6 +1389,16 @@ pub fn av1_codec_capability() -> RTCRtpCodecCapability {
 pub fn hevc_codec_capability() -> RTCRtpCodecCapability {
     RTCRtpCodecCapability {
         mime_type: "video/H265".to_string(),
+        clock_rate: 90_000,
+        channels: 0,
+        sdp_fmtp_line: String::new(),
+        rtcp_feedback: vec![],
+    }
+}
+
+pub fn vvc_codec_capability() -> RTCRtpCodecCapability {
+    RTCRtpCodecCapability {
+        mime_type: "video/H266".to_string(),
         clock_rate: 90_000,
         channels: 0,
         sdp_fmtp_line: String::new(),
@@ -1064,6 +1455,38 @@ fn hevc_nal_type(nal: &[u8]) -> u8 {
     }
 }
 
+pub fn vvc_annex_b_contains_keyframe(access_unit: &[u8]) -> bool {
+    let mut offset = 0usize;
+    while offset + 5 < access_unit.len() {
+        if access_unit[offset..].starts_with(&[0, 0, 0, 1]) {
+            let nal = &access_unit[offset + 4..];
+            let nal_type = vvc_nal_type(nal);
+            if matches!(nal_type, 7 | 8 | 9 | 10 | 14 | 15 | 16) {
+                return true;
+            }
+            offset += 4;
+        } else if access_unit[offset..].starts_with(&[0, 0, 1]) {
+            let nal = &access_unit[offset + 3..];
+            let nal_type = vvc_nal_type(nal);
+            if matches!(nal_type, 7 | 8 | 9 | 10 | 14 | 15 | 16) {
+                return true;
+            }
+            offset += 3;
+        } else {
+            offset += 1;
+        }
+    }
+    false
+}
+
+fn vvc_nal_type(nal: &[u8]) -> u8 {
+    if nal.len() < 2 {
+        32
+    } else {
+        (nal[1] >> 3) & 0x1f
+    }
+}
+
 fn read_leb128(data: &[u8], offset: &mut usize) -> Option<usize> {
     let mut value = 0usize;
     let mut shift = 0usize;
@@ -1100,8 +1523,9 @@ fn write_leb128(mut value: u32, out: &mut Vec<u8>) {
 mod tests {
     use super::{
         annex_b_contains_keyframe, h264_codec_capability, hevc_codec_capability,
-        Av1AccessUnitAssembler, Av1RtpIngress, Av1RtpSender, H264AccessUnitAssembler, H264Profile,
-        H264RtpIngress, HevcAccessUnitAssembler, HevcRtpIngress, HevcRtpSender,
+        vvc_codec_capability, Av1AccessUnitAssembler, Av1RtpIngress, Av1RtpSender,
+        H264AccessUnitAssembler, H264Profile, H264RtpIngress, HevcAccessUnitAssembler,
+        HevcRtpIngress, HevcRtpSender, VvcAccessUnitAssembler, VvcRtpIngress, VvcRtpSender,
     };
     use mrd_encode_nvenc::NvencH264Encoder;
     use mrd_pipeline_core::{CapturedFrame, FramePixelFormat, VideoCodec, VideoEncoder};
@@ -1443,6 +1867,61 @@ mod tests {
     }
 
     #[test]
+    fn vvc_single_nal_emits_annex_b_access_unit_on_marker() {
+        let mut assembler = VvcAccessUnitAssembler::default();
+
+        let access_unit = assembler
+            .push_rtp_payload(&[0x01, 0x78, 0xaa], true)
+            .expect("single VVC NAL access unit");
+
+        assert_eq!(access_unit, vec![0, 0, 0, 1, 0x01, 0x78, 0xaa]);
+    }
+
+    #[test]
+    fn vvc_fragmentation_unit_reassembles_original_nal_header() {
+        let mut assembler = VvcAccessUnitAssembler::default();
+
+        assert!(assembler
+            .push_rtp_payload(&[0x01, 0xe8, 0x87, 0xaa, 0xbb], false)
+            .is_none());
+        assert_eq!(
+            assembler.push_rtp_payload(&[0x01, 0xe8, 0x47, 0xcc], true),
+            Some(vec![0, 0, 0, 1, 0x01, 0x38, 0xaa, 0xbb, 0xcc])
+        );
+    }
+
+    #[test]
+    fn vvc_packetizer_roundtrips_annex_b_access_unit_through_ingress() {
+        let mut sender = VvcRtpSender::new("track", "stream", 60, 16);
+        let input = mrd_pipeline_core::EncodedAccessUnit {
+            codec: VideoCodec::Vvc,
+            timestamp_us: 42,
+            is_keyframe: true,
+            bytes: vec![0, 0, 0, 1, 0x01, 0x38, 0xcc, 0xdd, 0xee, 0xff],
+        };
+
+        let packets = sender
+            .packetize_access_unit(&input)
+            .expect("packetize VVC access unit");
+        let mut ingress = VvcRtpIngress::default();
+        let mut output = None;
+        for packet in packets {
+            output = ingress.push_packet(
+                &packet.payload,
+                packet.header.marker,
+                packet.header.sequence_number,
+                input.timestamp_us,
+            );
+        }
+
+        let output = output.expect("reassembled VVC access unit");
+        assert_eq!(output.codec, VideoCodec::Vvc);
+        assert_eq!(output.timestamp_us, input.timestamp_us);
+        assert_eq!(output.bytes, input.bytes);
+        assert!(output.is_keyframe);
+    }
+
+    #[test]
     fn h264_browser_capability_advertises_2k120_safe_level() {
         let baseline = h264_codec_capability(H264Profile::Baseline);
         let high = h264_codec_capability(H264Profile::High);
@@ -1457,6 +1936,14 @@ mod tests {
 
         assert_eq!(hevc.mime_type, "video/H265");
         assert_eq!(hevc.clock_rate, 90_000);
+    }
+
+    #[test]
+    fn vvc_codec_capability_uses_h266_rtp_mime() {
+        let vvc = vvc_codec_capability();
+
+        assert_eq!(vvc.mime_type, "video/H266");
+        assert_eq!(vvc.clock_rate, 90_000);
     }
 
     #[test]

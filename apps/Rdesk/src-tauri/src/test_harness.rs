@@ -476,12 +476,14 @@ enum WebrtcRtpSender {
     H264(mrd_transport_webrtc::H264RtpSender),
     Hevc(mrd_transport_webrtc::HevcRtpSender),
     Av1(mrd_transport_webrtc::Av1RtpSender),
+    Vvc(mrd_transport_webrtc::VvcRtpSender),
 }
 
 enum WebrtcRtpIngress {
     H264(mrd_transport_webrtc::H264RtpIngress),
     Hevc(mrd_transport_webrtc::HevcRtpIngress),
     Av1(mrd_transport_webrtc::Av1RtpIngress),
+    Vvc(mrd_transport_webrtc::VvcRtpIngress),
 }
 
 enum PipelineTransport {
@@ -529,6 +531,15 @@ impl PipelineTransport {
                     )),
                     ingress: WebrtcRtpIngress::Av1(mrd_transport_webrtc::Av1RtpIngress::default()),
                 },
+                VideoCodec::Vvc => Self::WebrtcRtp {
+                    sender: WebrtcRtpSender::Vvc(mrd_transport_webrtc::VvcRtpSender::new(
+                        "matrix-video",
+                        "matrix-stream",
+                        fps,
+                        1200,
+                    )),
+                    ingress: WebrtcRtpIngress::Vvc(mrd_transport_webrtc::VvcRtpIngress::default()),
+                },
             },
             TransportKind::QuicDatagram => Self::QuicDatagram {
                 reassembler: mrd_transport_quic_quinn::QuicAuReassembler::default(),
@@ -560,6 +571,11 @@ impl PipelineTransport {
                             .map_err(|error| {
                                 anyhow::anyhow!("WebRTC AV1 RTP packetize failed: {error}")
                             })?,
+                        WebrtcRtpSender::Vvc(sender) => sender
+                            .packetize_access_unit(&access_unit)
+                            .map_err(|error| {
+                                anyhow::anyhow!("WebRTC VVC RTP packetize failed: {error}")
+                            })?,
                     };
                     for packet in packets {
                         let unit = match ingress {
@@ -576,6 +592,12 @@ impl PipelineTransport {
                                 access_unit.timestamp_us,
                             ),
                             WebrtcRtpIngress::Av1(ingress) => ingress.push_packet(
+                                &packet.payload,
+                                packet.header.marker,
+                                packet.header.sequence_number,
+                                access_unit.timestamp_us,
+                            ),
+                            WebrtcRtpIngress::Vvc(ingress) => ingress.push_packet(
                                 &packet.payload,
                                 packet.header.marker,
                                 packet.header.sequence_number,
@@ -1926,9 +1948,17 @@ impl TestHarness {
                                 }
                             }
                             DecoderType::Software => {
-                                return Err(anyhow::anyhow!(
-                                    "HEVC software decoder path is not implemented"
-                                ));
+                                let enc =
+                                    create_hevc_encoder(width, height, fps, speed_bitrate, main10)?;
+                                let decoder_id = if main10 {
+                                    "software_hevc_main10"
+                                } else {
+                                    "software_hevc"
+                                };
+                                let dec = mrd_decode::create_decoder(decoder_id).map_err(|e| {
+                                    anyhow::anyhow!("{decoder_id} decoder init failed: {:?}", e)
+                                })?;
+                                (Some(enc), Some(PipelineDecoder::Software(dec)), true)
                             }
                             DecoderType::LinuxH264 => {
                                 return Err(anyhow::anyhow!(
@@ -2096,9 +2126,15 @@ impl TestHarness {
                                 }
                             }
                             DecoderType::Software => {
-                                return Err(anyhow::anyhow!(
-                                    "AV1 software decoder path is not implemented"
-                                ));
+                                let dec =
+                                    mrd_decode::create_decoder("software_av1").map_err(|e| {
+                                        anyhow::anyhow!("software_av1 decoder init failed: {:?}", e)
+                                    })?;
+                                (
+                                    Some(Box::new(enc) as Box<dyn VideoEncoder>),
+                                    Some(PipelineDecoder::Software(dec)),
+                                    true,
+                                )
                             }
                             DecoderType::LinuxH264 => {
                                 return Err(anyhow::anyhow!(

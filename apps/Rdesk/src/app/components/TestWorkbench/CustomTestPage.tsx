@@ -390,9 +390,6 @@ export function CustomTestPage() {
     if (selectedEncoder === "none" && selectedDecoder !== "none") {
       return "直接渲染链路不经过码流，请选择无解码。";
     }
-    if (selectedEncoder === "nvenc_av1" && selectedDecoder === "software") {
-      return "NVENC AV1 当前只支持 NVDEC 或 encode-only 链路，软件 AV1 解码链路尚未接入。";
-    }
     if (selectedEncoder === "nvenc_av1" && selectedDecoder === "linux_h264") {
       return "Linux H.264 硬解当前只接入 H.264，不能解码 NVENC AV1 输出。";
     }
@@ -401,9 +398,6 @@ export function CustomTestPage() {
       (selectedDecoder === "linux_hevc" || selectedDecoder === "linux_hevc_main10")
     ) {
       return "Linux HEVC 硬解不能解码 NVENC AV1 输出。";
-    }
-    if (isHevcEncoder(selectedEncoder) && selectedDecoder === "software") {
-      return "NVENC HEVC 当前只支持 NVDEC 或 encode-only 链路，软件 HEVC 解码链路尚未接入。";
     }
     if (isHevcEncoder(selectedEncoder) && selectedDecoder === "linux_h264") {
       return "Linux H.264 硬解当前只接入 H.264，不能解码 NVENC HEVC 输出。";

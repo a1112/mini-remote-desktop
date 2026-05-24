@@ -908,7 +908,16 @@ mod tests {
     fn parse_decoder_backend(value: &str) -> DecoderType {
         match value {
             "none" => DecoderType::None,
-            "software" | "h264_software" | "openh264" => DecoderType::Software,
+            "software"
+            | "h264_software"
+            | "openh264"
+            | "software_h264"
+            | "software_hevc"
+            | "hevc_software"
+            | "software_hevc_main10"
+            | "hevc_main10_software"
+            | "software_av1"
+            | "av1_software" => DecoderType::Software,
             #[cfg(target_os = "linux")]
             "linux_h264" => DecoderType::LinuxH264,
             #[cfg(target_os = "linux")]

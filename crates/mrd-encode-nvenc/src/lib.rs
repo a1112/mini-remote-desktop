@@ -2013,7 +2013,7 @@ fn annex_b_contains_keyframe(codec: VideoCodec, bytes: &[u8]) -> bool {
                     return true;
                 }
             }
-            VideoCodec::Av1 => {}
+            VideoCodec::Av1 | VideoCodec::Vvc => {}
         }
         index += start_len;
     }
