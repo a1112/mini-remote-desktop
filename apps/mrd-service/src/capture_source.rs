@@ -74,13 +74,13 @@ pub fn create_frame_capture(source_id: &str) -> Result<mrd_capture_winrt::WinrtC
     let mut capture = match parse_windows_capture_source_ref(source_id)? {
         WindowsCaptureSourceRef::Window(hwnd) => {
             mrd_capture_winrt::WinrtCapture::from_window_handle(hwnd)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?
         }
         WindowsCaptureSourceRef::Display { index }
         | WindowsCaptureSourceRef::DisplayShared { index } => {
-            mrd_capture_winrt::WinrtCapture::from_monitor_index(index)
+            create_windows_monitor_capture(source_id, index)?
         }
-    }
-    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    };
     capture
         .start()
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
@@ -144,6 +144,13 @@ enum WindowsCaptureSourceRef {
     Window(isize),
     Display { index: u32 },
     DisplayShared { index: u32 },
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WindowsMonitorCaptureTarget {
+    DeviceName(String),
+    Index(u32),
 }
 
 #[cfg(target_os = "macos")]
@@ -325,6 +332,42 @@ fn windows_display_index_from_source_id(source_id: &str) -> Option<usize> {
         .and_then(|value| value.parse::<usize>().ok())
 }
 
+#[cfg(windows)]
+fn create_windows_monitor_capture(
+    source_id: &str,
+    fallback_index: u32,
+) -> Result<mrd_capture_winrt::WinrtCapture> {
+    let device_name = crate::display_mode::display_device_name_for_source_id(source_id).ok();
+    match windows_monitor_capture_target(device_name, fallback_index) {
+        WindowsMonitorCaptureTarget::DeviceName(device_name) => {
+            mrd_capture_winrt::WinrtCapture::from_monitor_device_name(&device_name).map_err(
+                |error| {
+                    anyhow::anyhow!(
+                        "WinRT monitor capture by device name '{device_name}' failed: {error}"
+                    )
+                },
+            )
+        }
+        WindowsMonitorCaptureTarget::Index(index) => {
+            mrd_capture_winrt::WinrtCapture::from_monitor_index(index)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))
+        }
+    }
+}
+
+#[cfg(windows)]
+fn windows_monitor_capture_target(
+    device_name: Option<String>,
+    fallback_index: u32,
+) -> WindowsMonitorCaptureTarget {
+    match device_name.map(|value| value.trim().to_string()) {
+        Some(device_name) if !device_name.is_empty() => {
+            WindowsMonitorCaptureTarget::DeviceName(device_name)
+        }
+        _ => WindowsMonitorCaptureTarget::Index(fallback_index),
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn list_capture_sources_impl() -> Result<Vec<CaptureSource>> {
     let mut sources = list_macos_display_capture_sources()?;
@@ -481,13 +524,13 @@ fn capture_source_preview_data_url(
     let mut capture = match parse_windows_capture_source_ref(source_id)? {
         WindowsCaptureSourceRef::Window(hwnd) => {
             mrd_capture_winrt::WinrtCapture::from_window_handle(hwnd)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?
         }
         WindowsCaptureSourceRef::Display { index }
         | WindowsCaptureSourceRef::DisplayShared { index } => {
-            mrd_capture_winrt::WinrtCapture::from_monitor_index(index)
+            create_windows_monitor_capture(source_id, index)?
         }
-    }
-    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    };
     capture
         .start()
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
@@ -899,6 +942,23 @@ mod tests {
         assert_eq!(
             super::parse_windows_capture_source_ref("windows:window:0x1234").unwrap(),
             super::WindowsCaptureSourceRef::Window(0x1234)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_monitor_capture_target_prefers_device_name_before_index_fallback() {
+        assert_eq!(
+            super::windows_monitor_capture_target(Some("\\\\.\\DISPLAY7".to_string()), 2),
+            super::WindowsMonitorCaptureTarget::DeviceName("\\\\.\\DISPLAY7".to_string())
+        );
+        assert_eq!(
+            super::windows_monitor_capture_target(Some("  ".to_string()), 2),
+            super::WindowsMonitorCaptureTarget::Index(2)
+        );
+        assert_eq!(
+            super::windows_monitor_capture_target(None, 2),
+            super::WindowsMonitorCaptureTarget::Index(2)
         );
     }
 

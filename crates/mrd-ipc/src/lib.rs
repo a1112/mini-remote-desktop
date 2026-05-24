@@ -293,6 +293,9 @@ mod wire {
         pub render_presented_frames: u64,
         #[serde(default)]
         pub render_queue_replacements: u64,
+        /// Stale queued render frames dropped when the render worker catches up to latest.
+        #[serde(default)]
+        pub render_stale_frame_drops: u64,
         #[serde(default)]
         pub render_lock_drops: u64,
         /// Frames accepted by the renderer but skipped by non-blocking present.

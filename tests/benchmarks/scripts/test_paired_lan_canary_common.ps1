@@ -238,6 +238,7 @@ $adaptiveDowngradeReport = [pscustomobject]@{
     dropped_frames = 0
     queue_depth = 0
     render_queue_replacements = 17
+    render_stale_frame_drops = 0
     render_lock_drops = 0
     render_presented_frames = 2734
     stage_metrics = @(
@@ -279,7 +280,7 @@ Assert-Equal $adaptiveDowngradeRow.adaptation_last_reason "present gap p95 excee
 
 $startupDropOnlyIssue = Get-CanaryVisualIntegrityIssue `
   -Probe ([pscustomobject]@{ frames_decoded = 4800; frames_dropped = 250 }) `
-  -Pipeline ([pscustomobject]@{ render_queue_replacements = 0; render_lock_drops = 0; stage_metrics = @() }) `
+  -Pipeline ([pscustomobject]@{ render_queue_replacements = 0; render_stale_frame_drops = 0; render_lock_drops = 0; stage_metrics = @() }) `
   -Report ([pscustomobject]@{ sampleFramesDecoded = 4700; sampleFramesDropped = 1 }) `
   -Profile $native1600p165AdaptiveProfile
 Assert-True ($null -eq $startupDropOnlyIssue) "Visual integrity check uses sample-window drops when available"
@@ -481,6 +482,7 @@ $renderCappedReport = [pscustomobject]@{
     dropped_frames = 0
     render_presented_frames = 5670
     render_queue_replacements = 0
+    render_stale_frame_drops = 0
     render_lock_drops = 0
     render_pacing_target_fps = 144
     queue_depth = 1
@@ -538,6 +540,7 @@ $renderDropReport = [pscustomobject]@{
   mediaPipelineSnapshot = [pscustomobject]@{
     dropped_frames = 464
     render_queue_replacements = 455
+    render_stale_frame_drops = 0
     render_lock_drops = 2
     render_present_skips = 7
     queue_depth = 0
@@ -551,6 +554,7 @@ Assert-Equal $renderDropRow.dropped_frames 37 "Cross row dropped_frames tracks p
 Assert-Equal $renderDropRow.probe_dropped_frames 37 "Cross row exposes probe drops separately"
 Assert-Equal $renderDropRow.pipeline_dropped_frames 464 "Cross row preserves legacy pipeline dropped frames"
 Assert-Equal $renderDropRow.render_queue_replacements 455 "Cross row exposes render queue replacements"
+Assert-Equal $renderDropRow.render_stale_frame_drops 0 "Cross row exposes render stale frame drops"
 Assert-Equal $renderDropRow.render_lock_drops 2 "Cross row exposes render lock drops"
 Assert-Equal $renderDropRow.render_present_skips 7 "Cross row exposes non-blocking D3D11 present skips"
 Assert-Equal $renderDropRow.status "failed" "Severe visual integrity risk fails the canary row"
@@ -578,7 +582,8 @@ $pacedRenderReport = [pscustomobject]@{
   mediaPipelineSnapshot = [pscustomobject]@{
     dropped_frames = 721
     render_presented_frames = 6370
-    render_queue_replacements = 721
+    render_queue_replacements = 0
+    render_stale_frame_drops = 721
     render_lock_drops = 0
     render_present_skips = 0
     render_pacing_target_fps = 144
@@ -601,6 +606,7 @@ Assert-Equal $pacedRenderRow.visual_integrity_status "paced" "Stable render coal
 Assert-Equal ([Math]::Round($pacedRenderRow.estimated_render_fps, 1)) 141.0 "Estimated render FPS prefers sample-window presented frames"
 Assert-Equal $pacedRenderRow.render_pacing_target_fps 144 "Paced row exposes the local render pacing target"
 Assert-Equal ([Math]::Round($pacedRenderRow.render_present_gap_p95_ms, 2)) 7.07 "Paced row exposes render present gap P95"
+Assert-Equal $pacedRenderRow.render_stale_frame_drops 721 "Paced row exposes render stale frame drops"
 Assert-True ($pacedRenderRow.render_coalesce_ratio -gt 0.09) "Paced row exposes render coalesce ratio"
 
 $singlePeerDiagnostics = [pscustomobject]@{

@@ -4872,6 +4872,7 @@ fn spawn_lan_render_worker(
     let spawn_result = thread::Builder::new()
         .name("mrd-lan-render".to_string())
         .spawn(move || {
+            configure_lan_render_thread_priority();
             handle.block_on(run_lan_render_worker(app_state, session_id, first_frame));
         });
 
@@ -4886,6 +4887,17 @@ fn spawn_lan_render_worker(
             fallback_session_id,
             fallback_first_frame,
         ));
+    }
+}
+
+#[cfg(windows)]
+fn configure_lan_render_thread_priority() {
+    use windows::Win32::System::Threading::{
+        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST,
+    };
+
+    if unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) }.is_err() {
+        tracing::debug!("failed to raise LAN render thread priority");
     }
 }
 
@@ -4978,18 +4990,19 @@ async fn run_lan_render_worker(
             }
         }
 
-        let next_frame = app_state
+        let (next_frame, stale_drops) = app_state
             .media_render_queues
             .lock()
             .await
-            .take_next_or_finish(&session_id);
+            .take_latest_or_finish(&session_id);
         match next_frame {
             Some(next_frame) => {
-                app_state
-                    .media_pipelines
-                    .lock()
-                    .await
-                    .record_queue_depth(session_id.clone(), 0);
+                let mut pipelines = app_state.media_pipelines.lock().await;
+                pipelines.record_queue_depth(session_id.clone(), 0);
+                if stale_drops > 0 {
+                    pipelines
+                        .increment_render_stale_frame_drops(session_id.clone(), stale_drops as u64);
+                }
                 frame = next_frame;
             }
             None => {
@@ -9626,6 +9639,9 @@ mod tests {
                     presented_frame_count: 0,
                     present_skipped_count: self.skipped,
                     last_present_status: Some("skipped_still_drawing".to_string()),
+                    low_latency_frame_latency_target: None,
+                    swap_chain_max_frame_latency: None,
+                    swap_chain_allow_tearing: None,
                     last_width: 1,
                     last_height: 1,
                     last_pixel_format: None,

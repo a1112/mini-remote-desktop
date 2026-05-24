@@ -347,6 +347,7 @@ fn build_remote_display_window(
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RemoteDisplayMonitorPlacement {
     name: Option<String>,
+    primary: bool,
     position_x: i32,
     position_y: i32,
     width: u32,
@@ -362,13 +363,57 @@ fn place_remote_display_window(
     let monitors = app
         .available_monitors()
         .map_err(|error| format!("list monitors failed: {error}"))?
-        .into_iter()
+        .into_iter();
+    let primary_monitor = app
+        .primary_monitor()
+        .ok()
+        .flatten()
         .map(|monitor| RemoteDisplayMonitorPlacement {
             name: monitor.name().cloned(),
+            primary: true,
             position_x: monitor.position().x,
             position_y: monitor.position().y,
             width: monitor.size().width,
             height: monitor.size().height,
+        })
+        .map(|monitor| {
+            (
+                monitor.name.as_deref().map(normalize_display_name),
+                monitor.position_x,
+                monitor.position_y,
+                monitor.width,
+                monitor.height,
+            )
+        });
+    let monitors = monitors
+        .map(|monitor| {
+            let name = monitor.name().cloned();
+            let position_x = monitor.position().x;
+            let position_y = monitor.position().y;
+            let width = monitor.size().width;
+            let height = monitor.size().height;
+            let normalized_name = name.as_deref().map(normalize_display_name);
+            let primary = primary_monitor.as_ref().is_some_and(
+                |(primary_name, primary_x, primary_y, primary_width, primary_height)| {
+                    let name_matches = primary_name
+                        .as_deref()
+                        .zip(normalized_name.as_deref())
+                        .is_some_and(|(left, right)| left == right);
+                    name_matches
+                        || (*primary_x == position_x
+                            && *primary_y == position_y
+                            && *primary_width == width
+                            && *primary_height == height)
+                },
+            );
+            RemoteDisplayMonitorPlacement {
+                name,
+                primary,
+                position_x,
+                position_y,
+                width,
+                height,
+            }
         })
         .collect::<Vec<_>>();
 
@@ -404,8 +449,8 @@ fn choose_remote_display_window_placement(
         return None;
     }
 
-    if let Some(preferred_name) =
-        preferred_display_source_id.and_then(display_name_for_capture_source_id)
+    if let Some(preferred_name) = preferred_display_source_id
+        .and_then(|source_id| display_name_for_preferred_display_source_id(monitors, source_id))
     {
         let normalized_preferred = normalize_display_name(&preferred_name);
         if let Some(monitor) = monitors.iter().find(|monitor| {
@@ -439,6 +484,32 @@ fn choose_remote_display_window_placement(
     None
 }
 
+fn display_name_for_preferred_display_source_id(
+    monitors: &[RemoteDisplayMonitorPlacement],
+    source_id: &str,
+) -> Option<String> {
+    display_name_for_capture_source_id(source_id).or_else(|| {
+        let source_index = display_source_index_from_source_id(source_id)?;
+        let mut sorted = monitors
+            .iter()
+            .filter(|monitor| monitor.name.as_deref().is_some())
+            .collect::<Vec<_>>();
+        sorted.sort_by_key(|monitor| {
+            (
+                !monitor.primary,
+                monitor.position_x,
+                monitor.position_y,
+                monitor
+                    .name
+                    .as_deref()
+                    .map(normalize_display_name)
+                    .unwrap_or_default(),
+            )
+        });
+        sorted.get(source_index)?.name.clone()
+    })
+}
+
 fn display_name_for_capture_source_id(source_id: &str) -> Option<String> {
     let trimmed = source_id.trim();
     if trimmed.is_empty() {
@@ -449,12 +520,17 @@ fn display_name_for_capture_source_id(source_id: &str) -> Option<String> {
         return Some(format!("\\\\.\\DISPLAY{display_number}"));
     }
 
-    let lower = trimmed.to_ascii_lowercase();
-    if !(lower.contains("display-shared") || lower.contains("display")) {
-        return None;
+    None
+}
+
+fn display_source_index_from_source_id(source_id: &str) -> Option<usize> {
+    let trimmed = source_id.trim();
+    let parts = trimmed.split(':').collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["windows", "display", index] | ["windows", "display-shared", index] => index.parse().ok(),
+        ["display", index] => index.parse().ok(),
+        _ => None,
     }
-    let index = trimmed.rsplit(':').next()?.parse::<u32>().ok()?;
-    Some(format!("\\\\.\\DISPLAY{}", index + 1))
 }
 
 fn display_number_from_display_name(value: &str) -> Option<u32> {
@@ -2884,11 +2960,19 @@ mod tray_tests {
     fn display_source_id_maps_to_windows_display_name() {
         assert_eq!(
             display_name_for_capture_source_id("windows:display-shared:1").as_deref(),
-            Some("\\\\.\\DISPLAY2")
+            None
+        );
+        assert_eq!(
+            display_name_for_capture_source_id("windows:display:1").as_deref(),
+            None
         );
         assert_eq!(
             display_name_for_capture_source_id("DXGIShared:\\\\.\\DISPLAY1").as_deref(),
             Some("\\\\.\\DISPLAY1")
+        );
+        assert_eq!(
+            display_name_for_capture_source_id("\\\\.\\DISPLAY3").as_deref(),
+            Some("\\\\.\\DISPLAY3")
         );
     }
 
@@ -2897,6 +2981,7 @@ mod tray_tests {
         let monitors = vec![
             RemoteDisplayMonitorPlacement {
                 name: Some("\\\\.\\DISPLAY2".to_string()),
+                primary: false,
                 position_x: 0,
                 position_y: 0,
                 width: 2560,
@@ -2904,6 +2989,7 @@ mod tray_tests {
             },
             RemoteDisplayMonitorPlacement {
                 name: Some("\\\\.\\DISPLAY1".to_string()),
+                primary: false,
                 position_x: 3840,
                 position_y: 0,
                 width: 3840,
@@ -2914,7 +3000,7 @@ mod tray_tests {
         let selected = choose_remote_display_window_placement(
             &monitors,
             None,
-            Some("windows:display-shared:1"),
+            Some("DXGIShared:\\\\.\\DISPLAY2"),
         )
         .expect("secondary display should be selected");
 
@@ -2926,6 +3012,7 @@ mod tray_tests {
         let monitors = vec![
             RemoteDisplayMonitorPlacement {
                 name: Some("\\\\.\\DISPLAY1".to_string()),
+                primary: false,
                 position_x: -2560,
                 position_y: 0,
                 width: 2560,
@@ -2933,6 +3020,7 @@ mod tray_tests {
             },
             RemoteDisplayMonitorPlacement {
                 name: Some("\\\\.\\DISPLAY2".to_string()),
+                primary: false,
                 position_x: 2560,
                 position_y: -2385,
                 width: 1440,
@@ -2940,6 +3028,7 @@ mod tray_tests {
             },
             RemoteDisplayMonitorPlacement {
                 name: Some("\\\\.\\DISPLAY3".to_string()),
+                primary: true,
                 position_x: 0,
                 position_y: 0,
                 width: 2560,
@@ -2949,12 +3038,51 @@ mod tray_tests {
 
         let selected = choose_remote_display_window_placement(
             &monitors,
-            Some("windows:display-shared:1"),
-            Some("windows:display-shared:2"),
+            Some("DXGIShared:\\\\.\\DISPLAY2"),
+            Some("DXGIShared:\\\\.\\DISPLAY3"),
         )
         .expect("explicit render display should be selected");
 
         assert_eq!(selected.name.as_deref(), Some("\\\\.\\DISPLAY2"));
+    }
+
+    #[test]
+    fn remote_display_window_maps_display_source_id_by_monitor_topology() {
+        let monitors = vec![
+            RemoteDisplayMonitorPlacement {
+                name: Some("\\\\.\\DISPLAY2".to_string()),
+                primary: true,
+                position_x: 0,
+                position_y: 0,
+                width: 2560,
+                height: 1440,
+            },
+            RemoteDisplayMonitorPlacement {
+                name: Some("\\\\.\\DISPLAY1".to_string()),
+                primary: false,
+                position_x: -3840,
+                position_y: 0,
+                width: 3840,
+                height: 2160,
+            },
+            RemoteDisplayMonitorPlacement {
+                name: Some("\\\\.\\DISPLAY3".to_string()),
+                primary: false,
+                position_x: 2560,
+                position_y: 0,
+                width: 2560,
+                height: 1440,
+            },
+        ];
+
+        let selected = choose_remote_display_window_placement(
+            &monitors,
+            Some("windows:display-shared:1"),
+            Some("windows:display-shared:0"),
+        )
+        .expect("topology display source should be selected");
+
+        assert_eq!(selected.name.as_deref(), Some("\\\\.\\DISPLAY1"));
     }
 
     #[test]

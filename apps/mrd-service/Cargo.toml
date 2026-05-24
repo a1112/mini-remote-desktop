@@ -43,7 +43,7 @@ mrd-capture-winrt = { path = "../../crates/mrd-capture-winrt" }
 mrd-decode-nvdec = { path = "../../crates/mrd-decode-nvdec" }
 mrd-encode-nvenc = { path = "../../crates/mrd-encode-nvenc" }
 mrd-render-d3d11 = { path = "../../crates/mrd-render-d3d11" }
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Media"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Media", "Win32_System_Threading"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mrd-capture-macos = { path = "../../crates/mrd-capture-macos" }

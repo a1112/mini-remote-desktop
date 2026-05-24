@@ -117,6 +117,34 @@ fn display_device_name_from_raw(raw: &[u16]) -> Option<String> {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WindowsDisplayTarget {
+    source_index: u32,
+    device_name: String,
+    primary: bool,
+    left: i32,
+    top: i32,
+    width: u32,
+    height: u32,
+}
+
+fn assign_windows_display_source_indices(
+    mut targets: Vec<WindowsDisplayTarget>,
+) -> Vec<WindowsDisplayTarget> {
+    targets.sort_by_key(|target| {
+        (
+            !target.primary,
+            target.left,
+            target.top,
+            target.device_name.to_ascii_lowercase(),
+        )
+    });
+    for (index, target) in targets.iter_mut().enumerate() {
+        target.source_index = index as u32;
+    }
+    targets
+}
+
 #[cfg(windows)]
 fn list_platform_display_modes(source_index: Option<u32>) -> Result<Vec<DisplayMode>> {
     use std::collections::BTreeMap;
@@ -125,15 +153,15 @@ fn list_platform_display_modes(source_index: Option<u32>) -> Result<Vec<DisplayM
         EnumDisplaySettingsW, DEVMODEW, ENUM_CURRENT_SETTINGS, ENUM_DISPLAY_SETTINGS_MODE,
     };
 
-    let index = source_index.unwrap_or(0);
-    let device = display_device(index)?;
+    let target = windows_display_target_for_source_index(source_index.unwrap_or(0))?;
+    let device_name = wide_null(&target.device_name);
     let current = unsafe {
         let mut value = DEVMODEW {
             dmSize: std::mem::size_of::<DEVMODEW>() as u16,
             ..Default::default()
         };
         if !EnumDisplaySettingsW(
-            PCWSTR(device.DeviceName.as_ptr()),
+            PCWSTR(device_name.as_ptr()),
             ENUM_CURRENT_SETTINGS,
             &mut value,
         )
@@ -154,7 +182,7 @@ fn list_platform_display_modes(source_index: Option<u32>) -> Result<Vec<DisplayM
         };
         let ok = unsafe {
             EnumDisplaySettingsW(
-                PCWSTR(device.DeviceName.as_ptr()),
+                PCWSTR(device_name.as_ptr()),
                 ENUM_DISPLAY_SETTINGS_MODE(mode_index),
                 &mut dev_mode,
             )
@@ -175,8 +203,11 @@ fn list_platform_display_modes(source_index: Option<u32>) -> Result<Vec<DisplayM
                     && value.dmDisplayFrequency == refresh_hz
             });
             let mode = DisplayMode {
-                id: format!("windows:display:{index}:{width}x{height}@{refresh_hz}"),
-                source_id: Some(format!("windows:display-shared:{index}")),
+                id: format!(
+                    "windows:display:{}:{width}x{height}@{refresh_hz}",
+                    target.source_index
+                ),
+                source_id: Some(format!("windows:display-shared:{}", target.source_index)),
                 width,
                 height,
                 refresh_hz,
@@ -202,7 +233,26 @@ fn list_platform_display_modes(source_index: Option<u32>) -> Result<Vec<DisplayM
 
 #[cfg(windows)]
 fn list_current_platform_display_modes() -> Result<Vec<DisplayMode>> {
-    collect_current_platform_display_modes_by_index(current_platform_display_mode)
+    let targets = enumerate_windows_display_targets()?;
+    let mut modes = Vec::with_capacity(targets.len());
+    let mut first_error = None;
+
+    for target in targets {
+        match current_display_mode_for_windows_target(&target) {
+            Ok(mode) => modes.push(mode),
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+    }
+
+    if modes.is_empty() {
+        Err(first_error.unwrap_or_else(|| anyhow::anyhow!("no Windows displays found")))
+    } else {
+        Ok(modes)
+    }
 }
 
 fn collect_current_platform_display_modes_by_index(
@@ -229,11 +279,8 @@ fn collect_current_platform_display_modes_by_index(
 
 #[cfg(windows)]
 fn current_platform_display_mode(source_index: u32) -> Result<DisplayMode> {
-    let modes = list_platform_display_modes(Some(source_index))?;
-    modes
-        .into_iter()
-        .find(|mode| mode.is_current)
-        .ok_or_else(|| anyhow::anyhow!("current display mode not found for display {source_index}"))
+    let target = windows_display_target_for_source_index(source_index)?;
+    current_display_mode_for_windows_target(&target)
 }
 
 #[cfg(windows)]
@@ -244,7 +291,8 @@ fn set_platform_display_mode(source_index: u32, mode: &DisplayMode) -> Result<Di
         DM_DISPLAYFREQUENCY, DM_PELSHEIGHT, DM_PELSWIDTH,
     };
 
-    let device = display_device(source_index)?;
+    let target = windows_display_target_for_source_index(source_index)?;
+    let device_name = wide_null(&target.device_name);
     let dev_mode = DEVMODEW {
         dmSize: std::mem::size_of::<DEVMODEW>() as u16,
         dmPelsWidth: mode.width,
@@ -257,7 +305,7 @@ fn set_platform_display_mode(source_index: u32, mode: &DisplayMode) -> Result<Di
 
     let result = unsafe {
         ChangeDisplaySettingsExW(
-            PCWSTR(device.DeviceName.as_ptr()),
+            PCWSTR(device_name.as_ptr()),
             Some(&dev_mode),
             None,
             windows::Win32::Graphics::Gdi::CDS_TYPE(0),
@@ -282,26 +330,178 @@ fn set_platform_display_mode(source_index: u32, mode: &DisplayMode) -> Result<Di
 }
 
 #[cfg(windows)]
-fn display_device(source_index: u32) -> Result<windows::Win32::Graphics::Gdi::DISPLAY_DEVICEW> {
+fn current_display_mode_for_windows_target(target: &WindowsDisplayTarget) -> Result<DisplayMode> {
     use windows::core::PCWSTR;
-    use windows::Win32::Graphics::Gdi::{EnumDisplayDevicesW, DISPLAY_DEVICEW};
+    use windows::Win32::Graphics::Gdi::{EnumDisplaySettingsW, DEVMODEW, ENUM_CURRENT_SETTINGS};
 
-    let mut device = DISPLAY_DEVICEW {
-        cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+    let device_name = wide_null(&target.device_name);
+    let mut value = DEVMODEW {
+        dmSize: std::mem::size_of::<DEVMODEW>() as u16,
         ..Default::default()
     };
-    let ok = unsafe { EnumDisplayDevicesW(PCWSTR::null(), source_index, &mut device, 0).as_bool() };
+    let ok = unsafe {
+        EnumDisplaySettingsW(
+            PCWSTR(device_name.as_ptr()),
+            ENUM_CURRENT_SETTINGS,
+            &mut value,
+        )
+        .as_bool()
+    };
     if !ok {
-        anyhow::bail!("Windows display device not found for index {source_index}");
+        anyhow::bail!(
+            "current display mode not found for display {} ({})",
+            target.source_index,
+            target.device_name
+        );
     }
-    Ok(device)
+
+    Ok(DisplayMode {
+        id: format!(
+            "windows:display:{}:{}x{}@{}",
+            target.source_index, value.dmPelsWidth, value.dmPelsHeight, value.dmDisplayFrequency
+        ),
+        source_id: Some(format!("windows:display-shared:{}", target.source_index)),
+        width: value.dmPelsWidth,
+        height: value.dmPelsHeight,
+        refresh_hz: value.dmDisplayFrequency,
+        bit_depth: Some(value.dmBitsPerPel),
+        is_current: true,
+    })
+}
+
+#[cfg(windows)]
+fn windows_display_target_for_source_index(source_index: u32) -> Result<WindowsDisplayTarget> {
+    enumerate_windows_display_targets()?
+        .into_iter()
+        .find(|target| target.source_index == source_index)
+        .ok_or_else(|| anyhow::anyhow!("Windows display target not found for index {source_index}"))
+}
+
+#[cfg(windows)]
+fn enumerate_windows_display_targets() -> Result<Vec<WindowsDisplayTarget>> {
+    let monitor_targets = enumerate_monitor_display_targets()?;
+    if !monitor_targets.is_empty() {
+        return Ok(assign_windows_display_source_indices(monitor_targets));
+    }
+
+    let device_targets = enumerate_display_device_targets();
+    if device_targets.is_empty() {
+        anyhow::bail!("no Windows displays found")
+    } else {
+        Ok(assign_windows_display_source_indices(device_targets))
+    }
+}
+
+#[cfg(windows)]
+fn enumerate_monitor_display_targets() -> Result<Vec<WindowsDisplayTarget>> {
+    use windows::Win32::Foundation::{LPARAM, RECT};
+    use windows::Win32::Graphics::Gdi::{
+        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW,
+    };
+
+    unsafe extern "system" fn collect_monitor(
+        monitor: HMONITOR,
+        _hdc: HDC,
+        _rect: *mut RECT,
+        data: LPARAM,
+    ) -> windows::core::BOOL {
+        let targets = &mut *(data.0 as *mut Vec<WindowsDisplayTarget>);
+        let mut info = MONITORINFOEXW::default();
+        info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+
+        if !GetMonitorInfoW(monitor, (&mut info as *mut MONITORINFOEXW).cast()).as_bool() {
+            return windows::core::BOOL(1);
+        }
+
+        let rect = info.monitorInfo.rcMonitor;
+        let width = rect.right.saturating_sub(rect.left);
+        let height = rect.bottom.saturating_sub(rect.top);
+        if width <= 0 || height <= 0 {
+            return windows::core::BOOL(1);
+        }
+
+        let Some(device_name) = display_device_name_from_raw(&info.szDevice) else {
+            return windows::core::BOOL(1);
+        };
+
+        targets.push(WindowsDisplayTarget {
+            source_index: 0,
+            device_name,
+            primary: info.monitorInfo.dwFlags & 1 != 0,
+            left: rect.left,
+            top: rect.top,
+            width: width as u32,
+            height: height as u32,
+        });
+        windows::core::BOOL(1)
+    }
+
+    let mut targets = Vec::<WindowsDisplayTarget>::new();
+    let ok = unsafe {
+        EnumDisplayMonitors(
+            None,
+            None,
+            Some(collect_monitor),
+            LPARAM(&mut targets as *mut _ as isize),
+        )
+        .as_bool()
+    };
+    if !ok {
+        anyhow::bail!(
+            "EnumDisplayMonitors failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(targets)
+}
+
+#[cfg(windows)]
+fn enumerate_display_device_targets() -> Vec<WindowsDisplayTarget> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Graphics::Gdi::{
+        EnumDisplayDevicesW, DISPLAY_DEVICEW, DISPLAY_DEVICE_ATTACHED_TO_DESKTOP,
+        DISPLAY_DEVICE_PRIMARY_DEVICE,
+    };
+
+    let mut targets = Vec::new();
+    for device_index in 0..32 {
+        let mut device = DISPLAY_DEVICEW {
+            cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+            ..Default::default()
+        };
+        let ok =
+            unsafe { EnumDisplayDevicesW(PCWSTR::null(), device_index, &mut device, 0).as_bool() };
+        if !ok {
+            break;
+        }
+        if device.StateFlags.0 & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP.0 == 0 {
+            continue;
+        }
+        let Some(device_name) = display_device_name_from_raw(&device.DeviceName) else {
+            continue;
+        };
+
+        targets.push(WindowsDisplayTarget {
+            source_index: 0,
+            device_name,
+            primary: device.StateFlags.0 & DISPLAY_DEVICE_PRIMARY_DEVICE.0 != 0,
+            left: device_index as i32,
+            top: 0,
+            width: 0,
+            height: 0,
+        });
+    }
+    targets
+}
+
+#[cfg(windows)]
+fn wide_null(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 #[cfg(windows)]
 fn platform_display_device_name(source_index: u32) -> Result<String> {
-    let device = display_device(source_index)?;
-    display_device_name_from_raw(&device.DeviceName)
-        .ok_or_else(|| anyhow::anyhow!("Windows display device {source_index} has no device name"))
+    Ok(windows_display_target_for_source_index(source_index)?.device_name)
 }
 
 #[cfg(not(windows))]
@@ -412,6 +612,27 @@ mod tests {
     }
 
     #[test]
+    fn display_targets_are_ordered_by_primary_then_virtual_geometry() {
+        let targets = assign_windows_display_source_indices(vec![
+            display_target("\\\\.\\DISPLAY3", false, 2560, 0),
+            display_target("\\\\.\\DISPLAY1", true, 3840, 0),
+            display_target("\\\\.\\DISPLAY2", false, -2560, 0),
+        ]);
+
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| (target.source_index, target.device_name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, "\\\\.\\DISPLAY1"),
+                (1, "\\\\.\\DISPLAY2"),
+                (2, "\\\\.\\DISPLAY3"),
+            ]
+        );
+    }
+
+    #[test]
     fn display_device_name_from_raw_trims_nul_terminated_utf16() {
         let mut raw = [0_u16; 32];
         for (index, unit) in "\\\\.\\DISPLAY2".encode_utf16().enumerate() {
@@ -422,6 +643,23 @@ mod tests {
             display_device_name_from_raw(&raw),
             Some("\\\\.\\DISPLAY2".to_string())
         );
+    }
+
+    fn display_target(
+        device_name: &str,
+        primary: bool,
+        left: i32,
+        top: i32,
+    ) -> WindowsDisplayTarget {
+        WindowsDisplayTarget {
+            source_index: 99,
+            device_name: device_name.to_string(),
+            primary,
+            left,
+            top,
+            width: 2560,
+            height: 1440,
+        }
     }
 
     fn mode(id: &str, width: u32, height: u32, refresh_hz: u32, is_current: bool) -> DisplayMode {

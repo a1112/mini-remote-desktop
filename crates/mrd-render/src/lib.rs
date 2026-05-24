@@ -245,6 +245,12 @@ pub struct RendererSnapshot {
     pub present_skipped_count: u64,
     /// Last presentation status reported by the renderer.
     pub last_present_status: Option<String>,
+    /// Renderer low-latency frame latency target, when the backend supports one.
+    pub low_latency_frame_latency_target: Option<u32>,
+    /// Actual swap-chain frame latency configured on the attached surface.
+    pub swap_chain_max_frame_latency: Option<u32>,
+    /// Whether the attached swap chain was created with tearing presents enabled.
+    pub swap_chain_allow_tearing: Option<bool>,
     pub last_width: usize,
     pub last_height: usize,
     pub last_pixel_format: Option<RenderPixelFormat>,

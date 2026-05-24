@@ -283,6 +283,7 @@ struct MediaPipelineState {
     dropped_frames: u64,
     render_presented_frames: u64,
     render_queue_replacements: u64,
+    render_stale_frame_drops: u64,
     render_lock_drops: u64,
     render_present_skips: u64,
     render_pacing_target_fps: Option<u32>,
@@ -360,6 +361,23 @@ impl MediaRenderQueueRegistry {
 
         state.running = false;
         None
+    }
+
+    pub fn take_latest_or_finish(
+        &mut self,
+        session_id: &SessionId,
+    ) -> (Option<RenderFrame>, usize) {
+        let Some(state) = self.queues.get_mut(session_id) else {
+            return (None, 0);
+        };
+
+        let Some(frame) = state.pending.pop_back() else {
+            state.running = false;
+            return (None, 0);
+        };
+        let dropped = state.pending.len();
+        state.pending.clear();
+        (Some(frame), dropped)
     }
 
     pub fn pending_depth(&self, session_id: &SessionId) -> usize {
@@ -499,6 +517,12 @@ impl MediaPipelineRegistry {
         state.dropped_frames = state.dropped_frames.saturating_add(count);
     }
 
+    pub fn increment_render_stale_frame_drops(&mut self, session_id: SessionId, count: u64) {
+        let state = self.pipelines.entry(session_id).or_default();
+        state.render_stale_frame_drops = state.render_stale_frame_drops.saturating_add(count);
+        state.dropped_frames = state.dropped_frames.saturating_add(count);
+    }
+
     pub fn increment_render_lock_drops(&mut self, session_id: SessionId, count: u64) {
         let state = self.pipelines.entry(session_id).or_default();
         state.render_lock_drops = state.render_lock_drops.saturating_add(count);
@@ -613,6 +637,7 @@ impl MediaPipelineRegistry {
             dropped_frames: state.map_or(0, |state| state.dropped_frames),
             render_presented_frames: state.map_or(0, |state| state.render_presented_frames),
             render_queue_replacements: state.map_or(0, |state| state.render_queue_replacements),
+            render_stale_frame_drops: state.map_or(0, |state| state.render_stale_frame_drops),
             render_lock_drops: state.map_or(0, |state| state.render_lock_drops),
             render_present_skips: state.map_or(0, |state| state.render_present_skips),
             render_pacing_target_fps: state.and_then(|state| state.render_pacing_target_fps),
@@ -1862,13 +1887,15 @@ mod tests {
         let session_id = SessionId("render-drops-session".to_string());
 
         registry.increment_render_queue_replacements(session_id.clone(), 3);
+        registry.increment_render_stale_frame_drops(session_id.clone(), 5);
         registry.increment_render_lock_drops(session_id.clone(), 2);
         registry.increment_render_present_skips(session_id.clone(), 4);
 
         let snapshot = registry.snapshot(&session_id);
 
-        assert_eq!(snapshot.dropped_frames, 9);
+        assert_eq!(snapshot.dropped_frames, 14);
         assert_eq!(snapshot.render_queue_replacements, 3);
+        assert_eq!(snapshot.render_stale_frame_drops, 5);
         assert_eq!(snapshot.render_lock_drops, 2);
         assert_eq!(snapshot.render_present_skips, 4);
     }
@@ -1900,6 +1927,9 @@ mod tests {
                     presented_frame_count: self.uploads.load(Ordering::SeqCst) as u64,
                     present_skipped_count: 0,
                     last_present_status: Some("presented".to_string()),
+                    low_latency_frame_latency_target: None,
+                    swap_chain_max_frame_latency: None,
+                    swap_chain_allow_tearing: None,
                     last_width: 1,
                     last_height: 1,
                     last_pixel_format: None,
@@ -2080,6 +2110,36 @@ mod tests {
         assert_eq!(registry.take_next_or_finish(&session_id), Some(fifth));
         assert_eq!(registry.pending_depth(&session_id), 0);
         assert_eq!(registry.take_next_or_finish(&session_id), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn media_render_queue_can_take_latest_and_drop_stale_backlog() {
+        let mut registry = MediaRenderQueueRegistry::default();
+        let session_id = SessionId("render-queue-latest-session".to_string());
+        let first = RenderFrame::from_rgb24(1, 1, vec![1, 2, 3]);
+        let second = RenderFrame::from_rgb24(1, 1, vec![4, 5, 6]);
+        let third = RenderFrame::from_rgb24(1, 1, vec![7, 8, 9]);
+        let fourth = RenderFrame::from_rgb24(1, 1, vec![10, 11, 12]);
+
+        match registry.enqueue_bounded(session_id.clone(), first.clone(), 3) {
+            MediaRenderQueueEnqueue::Start(frame) => assert_eq!(frame, first),
+            other => panic!("expected render worker start, got {other:?}"),
+        }
+        registry.enqueue_bounded(session_id.clone(), second, 3);
+        registry.enqueue_bounded(session_id.clone(), third, 3);
+        registry.enqueue_bounded(session_id.clone(), fourth.clone(), 3);
+
+        let (latest, dropped) = registry.take_latest_or_finish(&session_id);
+
+        assert_eq!(latest, Some(fourth));
+        assert_eq!(dropped, 2);
+        assert_eq!(registry.pending_depth(&session_id), 0);
+        assert_eq!(registry.take_latest_or_finish(&session_id), (None, 0));
+        match registry.enqueue_bounded(session_id.clone(), first.clone(), 3) {
+            MediaRenderQueueEnqueue::Start(frame) => assert_eq!(frame, first),
+            other => panic!("expected render worker restart, got {other:?}"),
+        }
     }
 
     #[cfg(windows)]

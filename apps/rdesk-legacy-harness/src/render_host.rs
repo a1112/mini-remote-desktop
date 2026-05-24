@@ -42,6 +42,9 @@ pub struct RenderHostSnapshot {
 pub struct RendererSnapshotResponse {
     pub attached_to_target: bool,
     pub uploaded_frame_count: u64,
+    pub low_latency_frame_latency_target: Option<u32>,
+    pub swap_chain_max_frame_latency: Option<u32>,
+    pub swap_chain_allow_tearing: Option<bool>,
     pub last_width: usize,
     pub last_height: usize,
     pub last_pixel_format: Option<String>,
@@ -372,6 +375,9 @@ fn renderer_snapshot_response(snapshot: RendererSnapshot) -> RendererSnapshotRes
     RendererSnapshotResponse {
         attached_to_target: snapshot.attached_to_target,
         uploaded_frame_count: snapshot.uploaded_frame_count,
+        low_latency_frame_latency_target: snapshot.low_latency_frame_latency_target,
+        swap_chain_max_frame_latency: snapshot.swap_chain_max_frame_latency,
+        swap_chain_allow_tearing: snapshot.swap_chain_allow_tearing,
         last_width: snapshot.last_width,
         last_height: snapshot.last_height,
         last_pixel_format: snapshot.last_pixel_format.map(|format| match format {

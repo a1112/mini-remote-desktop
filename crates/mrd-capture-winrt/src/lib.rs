@@ -135,6 +135,21 @@ impl WinrtCapture {
         Self::from_monitor_index(monitor_index).map(Self::with_shared_texture_output)
     }
 
+    /// Create a new capture from a DXGI monitor device name, e.g. `\\.\DISPLAY1`.
+    pub fn from_monitor_device_name(device_name: &str) -> Result<Self, PipelineError> {
+        let item = Self::get_monitor_item_by_device_name(device_name).map_err(|e| {
+            PipelineError::message(format!("get monitor item by device name failed: {e}"))
+        })?;
+        Self::from_item(item)
+    }
+
+    /// Create a new D3D11 shared-texture capture from a DXGI monitor device name.
+    pub fn from_monitor_device_name_shared_texture(
+        device_name: &str,
+    ) -> Result<Self, PipelineError> {
+        Self::from_monitor_device_name(device_name).map(Self::with_shared_texture_output)
+    }
+
     /// Create a new capture from a window handle (HWND)
     pub fn from_window(hwnd: HWND) -> Result<Self, PipelineError> {
         let item = Self::create_item_for_window(hwnd)
@@ -235,6 +250,40 @@ impl WinrtCapture {
         }
 
         Err(anyhow!("Monitor {} not found", monitor_index))
+    }
+
+    /// Get a monitor capture item by DXGI device name.
+    fn get_monitor_item_by_device_name(device_name: &str) -> Result<GraphicsCaptureItem> {
+        let requested = device_name.trim();
+        if requested.is_empty() {
+            return Err(anyhow!("Monitor device name is empty"));
+        }
+
+        let factory: IDXGIFactory1 =
+            unsafe { CreateDXGIFactory1() }.context("CreateDXGIFactory1 failed")?;
+
+        for adapter_i in 0..10 {
+            let adapter = unsafe { factory.EnumAdapters1(adapter_i) };
+            let Ok(adapter) = adapter else { continue };
+
+            for output_i in 0..10 {
+                let output = unsafe { adapter.EnumOutputs(output_i) };
+                let Ok(output) = output else { continue };
+
+                let desc = unsafe {
+                    match output.GetDesc() {
+                        Ok(d) => d,
+                        Err(_) => continue,
+                    }
+                };
+
+                if dxgi_device_name_matches(&desc.DeviceName, requested) {
+                    return Self::create_item_for_monitor(desc.Monitor);
+                }
+            }
+        }
+
+        Err(anyhow!("Monitor device name '{requested}' not found"))
     }
 
     /// Get monitor count
@@ -1111,6 +1160,27 @@ unsafe fn read_class_name(hwnd: HWND) -> String {
     String::from_utf16_lossy(&buffer[..copied.max(0) as usize])
 }
 
+fn dxgi_device_name_from_raw(raw: &[u16]) -> Option<String> {
+    let end = raw.iter().position(|unit| *unit == 0).unwrap_or(raw.len());
+    if end == 0 {
+        return None;
+    }
+    let value = String::from_utf16_lossy(&raw[..end]);
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn dxgi_device_name_matches(raw: &[u16], requested: &str) -> bool {
+    let requested = requested.trim();
+    !requested.is_empty()
+        && dxgi_device_name_from_raw(raw)
+            .is_some_and(|actual| actual.eq_ignore_ascii_case(requested))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1140,6 +1210,21 @@ mod tests {
         if let Ok(capture) = result {
             println!("Monitor size: {}x{}", capture.width(), capture.height());
         }
+    }
+
+    #[test]
+    fn dxgi_device_name_matches_trimmed_case_insensitive_names() {
+        let mut raw = [0_u16; 32];
+        for (index, unit) in "\\\\.\\DISPLAY2".encode_utf16().enumerate() {
+            raw[index] = unit;
+        }
+
+        assert_eq!(
+            dxgi_device_name_from_raw(&raw).as_deref(),
+            Some("\\\\.\\DISPLAY2")
+        );
+        assert!(dxgi_device_name_matches(&raw, " \\\\.\\display2 "));
+        assert!(!dxgi_device_name_matches(&raw, "\\\\.\\DISPLAY1"));
     }
 
     #[test]
