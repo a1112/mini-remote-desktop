@@ -550,9 +550,6 @@ function unsupportedMatrixReason(config: TestConfig): string | null {
   if (config.encoder_type === "nvenc_hevc_main10" && config.decoder_type === "linux_hevc") {
     return "NVENC HEVC Main10 requires the Linux HEVC Main10 decoder path";
   }
-  if (isHevcEncoder(config.encoder_type) && config.transport_kind === "webrtc") {
-    return "HEVC WebRTC RTP packetizer is not implemented; use QUIC or loopback";
-  }
   if (config.encoder_type === "nvenc_av1" && config.decoder_type === "software") {
     return "NVENC AV1 currently requires NVDEC or encode-only matrix runs";
   }

@@ -474,11 +474,13 @@ enum PipelineDecoder {
 
 enum WebrtcRtpSender {
     H264(mrd_transport_webrtc::H264RtpSender),
+    Hevc(mrd_transport_webrtc::HevcRtpSender),
     Av1(mrd_transport_webrtc::Av1RtpSender),
 }
 
 enum WebrtcRtpIngress {
     H264(mrd_transport_webrtc::H264RtpIngress),
+    Hevc(mrd_transport_webrtc::HevcRtpIngress),
     Av1(mrd_transport_webrtc::Av1RtpIngress),
 }
 
@@ -509,6 +511,15 @@ impl PipelineTransport {
                     )),
                     ingress: WebrtcRtpIngress::H264(mrd_transport_webrtc::H264RtpIngress::default()),
                 },
+                VideoCodec::Hevc => Self::WebrtcRtp {
+                    sender: WebrtcRtpSender::Hevc(mrd_transport_webrtc::HevcRtpSender::new(
+                        "matrix-video",
+                        "matrix-stream",
+                        fps,
+                        1200,
+                    )),
+                    ingress: WebrtcRtpIngress::Hevc(mrd_transport_webrtc::HevcRtpIngress::default()),
+                },
                 VideoCodec::Av1 => Self::WebrtcRtp {
                     sender: WebrtcRtpSender::Av1(mrd_transport_webrtc::Av1RtpSender::new(
                         "matrix-video",
@@ -518,11 +529,6 @@ impl PipelineTransport {
                     )),
                     ingress: WebrtcRtpIngress::Av1(mrd_transport_webrtc::Av1RtpIngress::default()),
                 },
-                VideoCodec::Hevc => {
-                    anyhow::bail!(
-                        "WebRTC RTP HEVC packetizer is not implemented; use loopback or QUIC datagram"
-                    )
-                }
             },
             TransportKind::QuicDatagram => Self::QuicDatagram {
                 reassembler: mrd_transport_quic_quinn::QuicAuReassembler::default(),
@@ -544,6 +550,11 @@ impl PipelineTransport {
                             .map_err(|error| {
                                 anyhow::anyhow!("WebRTC H264 RTP packetize failed: {error}")
                             })?,
+                        WebrtcRtpSender::Hevc(sender) => sender
+                            .packetize_access_unit(&access_unit)
+                            .map_err(|error| {
+                                anyhow::anyhow!("WebRTC HEVC RTP packetize failed: {error}")
+                            })?,
                         WebrtcRtpSender::Av1(sender) => sender
                             .packetize_access_unit(&access_unit)
                             .map_err(|error| {
@@ -553,6 +564,12 @@ impl PipelineTransport {
                     for packet in packets {
                         let unit = match ingress {
                             WebrtcRtpIngress::H264(ingress) => ingress.push_packet(
+                                &packet.payload,
+                                packet.header.marker,
+                                packet.header.sequence_number,
+                                access_unit.timestamp_us,
+                            ),
+                            WebrtcRtpIngress::Hevc(ingress) => ingress.push_packet(
                                 &packet.payload,
                                 packet.header.marker,
                                 packet.header.sequence_number,
@@ -4155,6 +4172,43 @@ mod tests {
             comparison_labels(&hevc_main10),
             ("capture-encode-decode-render", "hevc-main10")
         );
+    }
+
+    fn synthetic_hevc_access_unit() -> EncodedAccessUnit {
+        EncodedAccessUnit {
+            codec: VideoCodec::Hevc,
+            timestamp_us: 42_000,
+            is_keyframe: true,
+            bytes: vec![
+                0, 0, 0, 1, 0x40, 0x01, 0xaa, 0, 0, 0, 1, 0x42, 0x01, 0xbb, 0, 0, 0, 1, 0x44, 0x01,
+                0xc0, 0, 0, 0, 1, 0x26, 0x01, 0xcc, 0xdd,
+            ],
+        }
+    }
+
+    #[test]
+    fn hevc_webrtc_transport_initializes_for_matrix_runs() {
+        assert!(
+            PipelineTransport::new(Some(&TransportKind::WebrtcRtp), 60, VideoCodec::Hevc).is_ok()
+        );
+    }
+
+    #[test]
+    fn hevc_webrtc_transport_roundtrips_hevc_access_units() {
+        let input = synthetic_hevc_access_unit();
+        let mut transport =
+            PipelineTransport::new(Some(&TransportKind::WebrtcRtp), 60, input.codec)
+                .expect("HEVC WebRTC transport");
+
+        let output = transport
+            .transmit(vec![input.clone()])
+            .expect("transmit HEVC access unit");
+
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].codec, VideoCodec::Hevc);
+        assert_eq!(output[0].timestamp_us, input.timestamp_us);
+        assert_eq!(output[0].bytes, input.bytes);
+        assert!(output[0].is_keyframe);
     }
 
     #[test]

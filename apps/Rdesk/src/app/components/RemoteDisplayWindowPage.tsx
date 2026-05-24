@@ -1109,13 +1109,27 @@ function isH264PreviewEncoder(encoder: EncoderType) {
   );
 }
 
-function browserSupportsH264WebrtcVideo(): boolean {
+export function webRtcPreviewCodecForEncoder(encoder: EncoderType): "h264" | "hevc" | null {
+  if (encoder === "nvenc_hevc") return "hevc";
+  if (isH264PreviewEncoder(encoder)) return "h264";
+  return null;
+}
+
+export function browserSupportsWebrtcVideoCodec(codec: "h264" | "hevc"): boolean {
   if (typeof RTCRtpReceiver === "undefined") return true;
   const capabilities = RTCRtpReceiver.getCapabilities?.("video");
   if (!capabilities?.codecs?.length) return true;
-  return capabilities.codecs.some(
-    (codec) => codec.mimeType.toLowerCase() === "video/h264"
-  );
+  const mimeTypes =
+    codec === "hevc" ? new Set(["video/h265", "video/hevc"]) : new Set(["video/h264"]);
+  return capabilities.codecs.some((candidate) => mimeTypes.has(candidate.mimeType.toLowerCase()));
+}
+
+function browserSupportsH264WebrtcVideo(): boolean {
+  return browserSupportsWebrtcVideoCodec("h264");
+}
+
+function browserSupportsHevcWebrtcVideo(): boolean {
+  return browserSupportsWebrtcVideoCodec("hevc");
 }
 
 export function browserSupportsWebCodecsH264(): boolean {
@@ -1125,6 +1139,33 @@ export function browserSupportsWebCodecsH264(): boolean {
     EncodedVideoChunk?: unknown;
   };
   return Boolean(maybeWindow.VideoDecoder && maybeWindow.EncodedVideoChunk);
+}
+
+export function webCodecsPreviewCodecForEncoder(encoder: EncoderType): "h264" | "hevc" {
+  return encoder === "nvenc_hevc" ? "hevc" : "h264";
+}
+
+function isHevcWebCodecsCodec(codec: string): boolean {
+  return /^(hev1|hvc1)\./i.test(codec);
+}
+
+export function buildWebCodecsDecoderConfig(ready: WebCodecsReadyMessage) {
+  const base = {
+    codec: ready.codec,
+    codedWidth: ready.width,
+    codedHeight: ready.height,
+    hardwareAcceleration: isHevcWebCodecsCodec(ready.codec) ? "prefer-hardware" : "prefer-software",
+    optimizeForLatency: true,
+  } satisfies VideoDecoderConfig;
+  return isHevcWebCodecsCodec(ready.codec)
+    ? ({
+        ...base,
+        hevc: { format: "annexb" },
+      } as VideoDecoderConfig & { hevc: { format: "annexb" } })
+    : ({
+        ...base,
+        avc: { format: "annexb" },
+      } as VideoDecoderConfig & { avc: { format: "annexb" } });
 }
 
 export function browserSupportsWebCodecsWorkerRendering(
@@ -1336,6 +1377,8 @@ function isExplicitBrowser2k144LowLatencyProfile({
 function resolveLocalWebViewPlan({
   capabilities,
   hostOs,
+  webPreviewEngine,
+  hevcWebRtcSupported,
   capture,
   encoder,
   decoder,
@@ -1346,6 +1389,8 @@ function resolveLocalWebViewPlan({
 }: {
   capabilities: EnvironmentSnapshot | null;
   hostOs: HostOs;
+  webPreviewEngine: WebPreviewEngine;
+  hevcWebRtcSupported: boolean;
   capture: CaptureType;
   encoder: EncoderType;
   decoder: DecoderType;
@@ -1376,23 +1421,43 @@ function resolveLocalWebViewPlan({
     };
   }
 
+  const hevcPreviewAllowed =
+    hostOs === "windows" &&
+    capabilities?.available_encoders?.includes("nvenc_hevc") &&
+    (webPreviewEngine === "webcodecs" || hevcWebRtcSupported);
   const preferredEncoders: EncoderType[] =
     hostOs === "macos"
       ? ["openh264", "videotoolbox_h264"]
       : hostOs === "windows"
-        ? ["nvenc_h264", "openh264"]
+        ? ["nvenc_h264", ...(hevcPreviewAllowed ? (["nvenc_hevc"] as const) : []), "openh264"]
         : ["openh264"];
   const targetFps = fpsForWebView(fps);
   const targetFpsNumber = Number(targetFps);
   const hardwareH264Encoders: EncoderType[] =
     hostOs === "macos" ? ["videotoolbox_h264"] : ["nvenc_h264"];
-  const requiresHardwareH264 = targetFpsNumber > 30;
-  const previewEncoderCandidates = requiresHardwareH264
-    ? hardwareH264Encoders
+  const hardwarePreviewEncoders: EncoderType[] = [
+    ...hardwareH264Encoders,
+    ...(hevcPreviewAllowed ? (["nvenc_hevc"] as const) : []),
+  ];
+  const requiresHardwarePreviewEncoder = targetFpsNumber > 30;
+  const selectedPreviewCodec =
+    webPreviewEngine === "webrtc"
+      ? webRtcPreviewCodecForEncoder(encoder)
+      : encoder === "nvenc_hevc"
+        ? "hevc"
+        : isH264PreviewEncoder(encoder)
+          ? "h264"
+          : null;
+  const selectedEncoderAllowed =
+    (selectedPreviewCodec === "h264" &&
+      (!requiresHardwarePreviewEncoder || hardwarePreviewEncoders.includes(encoder))) ||
+    (selectedPreviewCodec === "hevc" && hevcPreviewAllowed);
+  const previewEncoderCandidates = requiresHardwarePreviewEncoder
+    ? hardwarePreviewEncoders
     : preferredEncoders;
   const encoderCandidates = uniqueValues([
+    ...(selectedEncoderAllowed ? [encoder] : []),
     ...previewEncoderCandidates,
-    ...(isH264PreviewEncoder(encoder) && !requiresHardwareH264 ? [encoder] : []),
   ]);
   const nextEncoder = pickCapability(
     encoderCandidates,
@@ -1402,9 +1467,9 @@ function resolveLocalWebViewPlan({
   if (!nextEncoder) {
     return {
       profile: null,
-      reason: requiresHardwareH264
-        ? `网页 ${targetFps} FPS 本机采集需要硬件 H.264 编码器；当前 service 未报告 NVENC/VideoToolbox H.264 可用，OpenH264 仅作为 <=30 FPS 诊断兜底。`
-        : "Web View 需要可输出 H.264 的编码器",
+      reason: requiresHardwarePreviewEncoder
+        ? `网页 ${targetFps} FPS 本机采集需要硬件 H.264 编码器或 HEVC Main 编码器；当前 service 未报告可用硬件浏览器预览编码器，OpenH264 仅作为 <=30 FPS 诊断兜底。`
+        : "Web View 需要可输出 H.264 或 HEVC Main 的编码器",
       changed: false,
       message: null,
     };
@@ -1934,6 +1999,8 @@ export function RemoteDisplayWindowPage() {
       resolveLocalWebViewPlan({
         capabilities,
         hostOs,
+        webPreviewEngine,
+        hevcWebRtcSupported: browserSupportsHevcWebrtcVideo(),
         capture,
         encoder,
         decoder,
@@ -1954,6 +2021,7 @@ export function RemoteDisplayWindowPage() {
       hostOs,
       requestedBitrate,
       transport,
+      webPreviewEngine,
     ]
   );
   const nativeRenderMode = nativeRenderModeForHost(hostOs);
@@ -2011,14 +2079,20 @@ export function RemoteDisplayWindowPage() {
   );
   const browserPreviewEncoderOptions = useMemo(() => {
     const targetFps = Number(fps);
-    const needsHardwareH264 = Number.isFinite(targetFps) && targetFps > 30;
+    const needsHardwarePreviewEncoder = Number.isFinite(targetFps) && targetFps > 30;
     const allowed = visibleEncoderOptions.filter((option) => {
-      if (!isH264PreviewEncoder(option.value)) return false;
-      if (!needsHardwareH264) return true;
-      return option.value === "nvenc_h264" || option.value === "videotoolbox_h264";
+      const webCodecsHevc = webPreviewEngine === "webcodecs" && option.value === "nvenc_hevc";
+      const webRtcHevc =
+        webPreviewEngine === "webrtc" &&
+        option.value === "nvenc_hevc" &&
+        browserSupportsHevcWebrtcVideo();
+      const hevcPreview = webCodecsHevc || webRtcHevc;
+      if (!isH264PreviewEncoder(option.value) && !hevcPreview) return false;
+      if (!needsHardwarePreviewEncoder) return true;
+      return option.value === "nvenc_h264" || option.value === "videotoolbox_h264" || hevcPreview;
     });
     return allowed.length > 0 ? allowed : visibleEncoderOptions;
-  }, [fps, visibleEncoderOptions]);
+  }, [fps, visibleEncoderOptions, webPreviewEngine]);
   const visibleDecoderOptions = useMemo(
     () =>
       capabilities?.available_decoders?.length
@@ -2033,8 +2107,8 @@ export function RemoteDisplayWindowPage() {
   const browserEncoderConstraintTitle =
     isLocalPipelinePreview && renderMode === "web"
       ? Number(fps) > 30
-        ? "网页渲染路径当前只接入 H.264；高帧率需要硬件 H.264，HEVC/AV1/OpenH264 不进入该路径。"
-        : "网页渲染路径当前只接入 H.264 access unit，HEVC/AV1 尚未接入浏览器预览路径。"
+        ? "网页渲染路径高帧率需要硬件 H.264 或 HEVC Main；AV1/OpenH264 不进入该路径。"
+        : "网页渲染路径接入 H.264 与 HEVC Main access unit；AV1 尚未接入浏览器预览路径。"
       : undefined;
   const selectedDurationMs = localTestDurationMs(durationMode);
   const activeEncoderValues = useMemo(
@@ -2096,11 +2170,17 @@ export function RemoteDisplayWindowPage() {
   const browserHardwareH264Available = useMemo(() => {
     if (!capabilities?.available_encoders?.length) return true;
     const hardwareEncoders =
-      hostOs === "macos" ? ["videotoolbox_h264"] : ["nvenc_h264"];
+      hostOs === "macos"
+        ? ["videotoolbox_h264"]
+        : webPreviewEngine === "webcodecs"
+          ? ["nvenc_h264", "nvenc_hevc"]
+          : browserSupportsHevcWebrtcVideo()
+            ? ["nvenc_h264", "nvenc_hevc"]
+            : ["nvenc_h264"];
     return hardwareEncoders.some((encoder) =>
       capabilities.available_encoders.includes(encoder)
     );
-  }, [capabilities, hostOs]);
+  }, [capabilities, hostOs, webPreviewEngine]);
   const fpsTileOptions = useMemo(
     () =>
       fpsOptions.map((option) => ({
@@ -2114,7 +2194,7 @@ export function RemoteDisplayWindowPage() {
                 renderMode === "web" &&
                 Number(option.value) > 30 &&
                 !browserHardwareH264Available
-              ? "网页高帧率预览需要硬件 H.264 编码器；当前平台只允许 30 FPS 诊断档。"
+              ? "网页高帧率预览需要硬件 H.264 或 HEVC Main 编码器；当前平台只允许 30 FPS 诊断档。"
               : null,
       })),
     [
@@ -2170,9 +2250,6 @@ export function RemoteDisplayWindowPage() {
   }, [durationMode, matrixModeEnabled]);
 
   useEffect(() => {
-    if (isHevcEncoder(encoder) && transport === "webrtc") {
-      setTransport("quic");
-    }
     if (isHevcEncoder(encoder) && (decoder === "software" || decoder === "linux_h264")) {
       const preferredLinuxDecoder = encoder === "nvenc_hevc_main10" ? "linux_hevc_main10" : "linux_hevc";
       setDecoder(
@@ -2195,7 +2272,7 @@ export function RemoteDisplayWindowPage() {
     ) {
       setDecoder(capabilities?.available_decoders.includes("linux_h264") ? "linux_h264" : "software");
     }
-  }, [capabilities?.available_decoders, decoder, encoder, transport]);
+  }, [capabilities?.available_decoders, decoder, encoder]);
 
   const renderModeLabel =
     renderMode === "metal_native"
@@ -3252,9 +3329,10 @@ export function RemoteDisplayWindowPage() {
       return;
     }
 
-    if (encoder === "nvenc_av1") {
+    const previewCodec = webRtcPreviewCodecForEncoder(encoder);
+    if (!previewCodec) {
       setWebPreviewMode("failed");
-      setWebPreviewError("Browser WebRTC preview currently supports H.264 output");
+      setWebPreviewError("Browser WebRTC preview currently supports H.264 and HEVC Main output");
       setWebPresentationLatencyStats(null);
       setWebFrameTimingMetadataCount(0);
       setWebFrameTimingChannelState(null);
@@ -3262,9 +3340,11 @@ export function RemoteDisplayWindowPage() {
       return;
     }
 
-    if (!browserSupportsH264WebrtcVideo()) {
+    if (!browserSupportsWebrtcVideoCodec(previewCodec)) {
       setWebPreviewMode("failed");
-      setWebPreviewError("Browser WebRTC video renderer does not advertise H.264 receive support");
+      setWebPreviewError(
+        `Browser WebRTC video renderer does not advertise ${previewCodec === "hevc" ? "HEVC" : "H.264"} receive support`
+      );
       setWebPresentationLatencyStats(null);
       setWebFrameTimingMetadataCount(0);
       setWebFrameTimingChannelState(null);
@@ -3508,6 +3588,7 @@ export function RemoteDisplayWindowPage() {
           width: Number(resolution.split("x")[0]),
           height: Number(resolution.split("x")[1]),
           bitrateMbps: Number(bitrate),
+          codec: previewCodec,
           h264Profile: browserWebrtcPreviewH264Profile(encoder, decoder),
           sourceId: selectedLocalPreviewSourceId,
         });
@@ -3586,7 +3667,7 @@ export function RemoteDisplayWindowPage() {
         output: (frame: VideoFrame) => void;
         error: (error: Error) => void;
       }) => {
-        configure: (config: Record<string, unknown>) => void;
+        configure: (config: VideoDecoderConfig) => void;
         decode: (chunk: unknown) => void;
         close: () => void;
         decodeQueueSize?: number;
@@ -3705,6 +3786,7 @@ export function RemoteDisplayWindowPage() {
             width: Number(resolution.split("x")[0]),
             height: Number(resolution.split("x")[1]),
             bitrateMbps: Number(bitrate),
+            codec: webCodecsPreviewCodecForEncoder(encoder),
             h264Profile: "baseline",
             sourceId: selectedLocalPreviewSourceId,
             ...viewport(),
@@ -3854,17 +3936,12 @@ export function RemoteDisplayWindowPage() {
 
     const configureDecoder = async (ready: WebCodecsReadyMessage) => {
       if (configured || cancelled) return;
-      const config = {
-        codec: ready.codec,
-        codedWidth: ready.width,
-        codedHeight: ready.height,
-        hardwareAcceleration: "prefer-software",
-        optimizeForLatency: true,
-        avc: { format: "annexb" },
-      };
+      const config = buildWebCodecsDecoderConfig(ready);
       const supportChecker = (
         VideoDecoderCtor as unknown as {
-          isConfigSupported?: (config: Record<string, unknown>) => Promise<{ supported: boolean; config: Record<string, unknown> }>;
+          isConfigSupported?: (
+            config: VideoDecoderConfig
+          ) => Promise<{ supported: boolean; config?: VideoDecoderConfig }>;
         }
       ).isConfigSupported;
       const support = supportChecker ? await supportChecker(config).catch(() => null) : null;
@@ -3877,7 +3954,7 @@ export function RemoteDisplayWindowPage() {
       setWebPreviewError(null);
       setWebFrameTimingChannelState("webcodecs:open");
       setTestMessage(
-        `WebCodecs H.264 Annex B 本机采集运行中 (${ready.width}x${ready.height}@${ready.fps})`
+        `WebCodecs ${isHevcWebCodecsCodec(ready.codec) ? "HEVC" : "H.264"} Annex B 本机采集运行中 (${ready.width}x${ready.height}@${ready.fps})`
       );
     };
 
@@ -3894,6 +3971,7 @@ export function RemoteDisplayWindowPage() {
           width: Number(resolution.split("x")[0]),
           height: Number(resolution.split("x")[1]),
           bitrate_mbps: Number(bitrate),
+          codec: webCodecsPreviewCodecForEncoder(encoder),
           h264_profile: "baseline",
           source_id: selectedLocalPreviewSourceId ?? null,
         })
@@ -5563,7 +5641,7 @@ export function RemoteDisplayWindowPage() {
                   {webPreviewEngine === "webcodecs"
                     ? " DEC=Browser WebCodecs，NET=WebSocket AU。"
                     : " DEC=Browser video decode，NET=WebRTC RTP。"}
-                  编码器只显示已接入浏览器预览的 H.264 路径；HEVC/AV1 属于 native/后续浏览器媒体链路。
+                  编码器显示已接入浏览器预览的 H.264 路径与 WebCodecs HEVC；AV1 属于 native/后续浏览器媒体链路。
                 </div>
               ) : null}
             </div>

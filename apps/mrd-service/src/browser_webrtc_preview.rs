@@ -12,11 +12,11 @@ use std::{
 #[cfg(windows)]
 use crate::browser_preview_capture::open_browser_preview_dxgi_capture;
 #[cfg(windows)]
-use mrd_encode_nvenc::NvencH264Encoder;
+use mrd_encode_nvenc::{NvencH264Encoder, NvencHevcEncoder};
 use mrd_pipeline_core::{EncodedAccessUnit, VideoCodec};
 #[cfg(windows)]
 use mrd_pipeline_core::{FrameCapture, VideoEncoder};
-use mrd_transport_webrtc::{H264Profile, H264RtpSender, H264SampleSender};
+use mrd_transport_webrtc::{H264Profile, H264RtpSender, H264SampleSender, HevcRtpSender};
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
@@ -46,6 +46,8 @@ pub struct BrowserWebrtcPreviewStartRequest {
     pub session_id: String,
     pub offer_sdp: String,
     #[serde(default)]
+    pub codec: Option<BrowserWebrtcPreviewCodec>,
+    #[serde(default)]
     pub fps: Option<u32>,
     #[serde(default)]
     pub width: Option<u32>,
@@ -57,6 +59,21 @@ pub struct BrowserWebrtcPreviewStartRequest {
     pub bitrate_mbps: Option<u32>,
     #[serde(default)]
     pub source_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserWebrtcPreviewCodec {
+    #[serde(alias = "avc")]
+    H264,
+    #[serde(alias = "h265")]
+    Hevc,
+}
+
+impl BrowserWebrtcPreviewStartRequest {
+    pub fn selected_codec(&self) -> BrowserWebrtcPreviewCodec {
+        self.codec.unwrap_or(BrowserWebrtcPreviewCodec::H264)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -208,8 +225,9 @@ struct BrowserPreviewMediaSendReport {
 }
 
 enum BrowserPreviewMediaSender {
-    Rtp(H264RtpSender),
-    Sample(H264SampleSender),
+    H264Rtp(H264RtpSender),
+    H264Sample(H264SampleSender),
+    HevcRtp(HevcRtpSender),
 }
 
 impl BrowserPreviewMediaSender {
@@ -217,6 +235,7 @@ impl BrowserPreviewMediaSender {
         track_id: impl Into<String>,
         stream_id: impl Into<String>,
         fps: u32,
+        codec: BrowserWebrtcPreviewCodec,
         profile: H264Profile,
         profile_level_id: impl Into<String>,
         bitrate_bps: u32,
@@ -224,32 +243,46 @@ impl BrowserPreviewMediaSender {
         let track_id = track_id.into();
         let stream_id = stream_id.into();
         let profile_level_id = profile_level_id.into();
-        match browser_preview_sender_track_kind(bitrate_bps) {
-            BrowserPreviewSenderTrackKind::Rtp => {
-                Self::Rtp(H264RtpSender::new_with_profile_level_id(
-                    track_id,
-                    stream_id,
-                    fps,
-                    1200,
-                    profile,
-                    profile_level_id,
-                ))
+        match codec {
+            BrowserWebrtcPreviewCodec::H264 => match browser_preview_sender_track_kind(bitrate_bps)
+            {
+                BrowserPreviewSenderTrackKind::Rtp => {
+                    Self::H264Rtp(H264RtpSender::new_with_profile_level_id(
+                        track_id,
+                        stream_id,
+                        fps,
+                        1200,
+                        profile,
+                        profile_level_id,
+                    ))
+                }
+                BrowserPreviewSenderTrackKind::Sample => {
+                    Self::H264Sample(H264SampleSender::new_with_profile_level_id(
+                        track_id,
+                        stream_id,
+                        fps,
+                        profile_level_id,
+                    ))
+                }
+            },
+            BrowserWebrtcPreviewCodec::Hevc => {
+                Self::HevcRtp(HevcRtpSender::new(track_id, stream_id, fps, 1200))
             }
-            BrowserPreviewSenderTrackKind::Sample => {
-                Self::Sample(H264SampleSender::new_with_profile_level_id(
-                    track_id,
-                    stream_id,
-                    fps,
-                    profile_level_id,
-                ))
-            }
+        }
+    }
+
+    fn track_kind(&self) -> BrowserPreviewSenderTrackKind {
+        match self {
+            Self::H264Rtp(_) | Self::HevcRtp(_) => BrowserPreviewSenderTrackKind::Rtp,
+            Self::H264Sample(_) => BrowserPreviewSenderTrackKind::Sample,
         }
     }
 
     fn track(&self) -> Arc<dyn TrackLocal + Send + Sync> {
         match self {
-            Self::Rtp(sender) => sender.track(),
-            Self::Sample(sender) => sender.track(),
+            Self::H264Rtp(sender) => sender.track(),
+            Self::H264Sample(sender) => sender.track(),
+            Self::HevcRtp(sender) => sender.track(),
         }
     }
 
@@ -258,21 +291,86 @@ impl BrowserPreviewMediaSender {
         access_unit: &EncodedAccessUnit,
     ) -> Result<BrowserPreviewMediaSendReport, mrd_transport_webrtc::TransportError> {
         match self {
-            Self::Rtp(sender) => {
+            Self::H264Rtp(sender) => {
                 let report = sender.send_access_unit_with_report(access_unit).await?;
                 Ok(BrowserPreviewMediaSendReport {
                     bytes_written: report.bytes_written,
                     rtp_timestamp: Some(report.rtp_timestamp),
                 })
             }
-            Self::Sample(sender) => {
+            Self::H264Sample(sender) => {
                 let report = sender.send_access_unit_with_report(access_unit).await?;
                 Ok(BrowserPreviewMediaSendReport {
                     bytes_written: report.bytes_written,
                     rtp_timestamp: None,
                 })
             }
+            Self::HevcRtp(sender) => {
+                let report = sender.send_access_unit_with_report(access_unit).await?;
+                Ok(BrowserPreviewMediaSendReport {
+                    bytes_written: report.bytes_written,
+                    rtp_timestamp: Some(report.rtp_timestamp),
+                })
+            }
         }
+    }
+}
+
+#[cfg(windows)]
+enum BrowserPreviewEncoder {
+    H264(NvencH264Encoder),
+    Hevc(NvencHevcEncoder),
+}
+
+#[cfg(windows)]
+impl BrowserPreviewEncoder {
+    fn new(
+        codec: BrowserWebrtcPreviewCodec,
+        width: usize,
+        height: usize,
+        fps: u32,
+        bitrate_bps: u32,
+    ) -> Result<Self, mrd_pipeline_core::PipelineError> {
+        match codec {
+            BrowserWebrtcPreviewCodec::H264 => {
+                NvencH264Encoder::new_max_speed_with_bitrate(width, height, fps, bitrate_bps)
+                    .map(Self::H264)
+            }
+            BrowserWebrtcPreviewCodec::Hevc => {
+                NvencHevcEncoder::new_max_speed_with_bitrate(width, height, fps, bitrate_bps)
+                    .map(Self::Hevc)
+            }
+        }
+    }
+
+    fn codec(&self) -> VideoCodec {
+        match self {
+            Self::H264(_) => VideoCodec::H264,
+            Self::Hevc(_) => VideoCodec::Hevc,
+        }
+    }
+
+    fn request_keyframe(&mut self) {
+        if let Self::H264(encoder) = self {
+            encoder.request_keyframe();
+        }
+    }
+
+    fn encode(
+        &mut self,
+        frame: &mrd_pipeline_core::CapturedFrame,
+    ) -> Result<Vec<EncodedAccessUnit>, mrd_pipeline_core::PipelineError> {
+        match self {
+            Self::H264(encoder) => encoder.encode(frame),
+            Self::Hevc(encoder) => encoder.encode(frame),
+        }
+    }
+}
+
+fn browser_webrtc_preview_codec_label(codec: BrowserWebrtcPreviewCodec) -> &'static str {
+    match codec {
+        BrowserWebrtcPreviewCodec::H264 => "H.264",
+        BrowserWebrtcPreviewCodec::Hevc => "HEVC",
     }
 }
 
@@ -401,11 +499,13 @@ impl BrowserWebrtcPreviewHost {
         let fps = sanitize_browser_preview_fps(request.fps);
         let bitrate_bps =
             sanitize_browser_preview_bitrate_mbps(request.bitrate_mbps).saturating_mul(1_000_000);
+        let codec = request.selected_codec();
         let profile = h264_profile_from_label(request.h264_profile.as_deref());
         let profile_level_id =
             select_browser_offer_h264_profile_level_id(&request.offer_sdp, profile);
         validate_browser_preview_sender(
             request.source_id.as_deref(),
+            codec,
             fps,
             bitrate_bps,
             request.width,
@@ -446,21 +546,24 @@ impl BrowserWebrtcPreviewHost {
             })
         }));
         info!(
-            "browser WebRTC preview H.264 offer selected profile-level-id={} for {}",
-            profile_level_id, session_id
-        );
-        let track_kind = browser_preview_sender_track_kind(bitrate_bps);
-        info!(
-            "browser WebRTC preview selected {:?} track pacing for {}",
-            track_kind, session_id
+            "browser WebRTC preview {} offer selected profile-level-id={} for {}",
+            browser_webrtc_preview_codec_label(codec),
+            profile_level_id,
+            session_id
         );
         let media_sender = BrowserPreviewMediaSender::new(
             "video",
             format!("{session_id}-browser-web"),
             fps,
+            codec,
             profile,
             profile_level_id,
             bitrate_bps,
+        );
+        let track_kind = media_sender.track_kind();
+        info!(
+            "browser WebRTC preview selected {:?} track pacing for {}",
+            track_kind, session_id
         );
         let track = media_sender.track();
         let rtp_sender = pc
@@ -527,6 +630,7 @@ impl BrowserWebrtcPreviewHost {
             request.width,
             request.height,
             request.source_id.clone(),
+            codec,
             media_sender,
             frame_timing_channel,
             running.clone(),
@@ -561,6 +665,7 @@ impl BrowserWebrtcPreviewHost {
 #[cfg(windows)]
 fn validate_browser_preview_sender(
     source_id: Option<&str>,
+    codec: BrowserWebrtcPreviewCodec,
     fps: u32,
     bitrate_bps: u32,
     width: Option<u32>,
@@ -575,25 +680,27 @@ fn validate_browser_preview_sender(
         capture.height(),
     );
     capture.set_target_dimensions(target_width, target_height);
-    let _encoder = NvencH264Encoder::new_max_speed_with_bitrate(
-        capture.width(),
-        capture.height(),
-        fps,
-        bitrate_bps,
-    )
-    .map_err(|error| format!("browser WebRTC preview NVENC H.264 unavailable: {error}"))?;
+    let _encoder =
+        BrowserPreviewEncoder::new(codec, capture.width(), capture.height(), fps, bitrate_bps)
+            .map_err(|error| {
+                format!(
+                    "browser WebRTC preview NVENC {} unavailable: {error}",
+                    browser_webrtc_preview_codec_label(codec)
+                )
+            })?;
     Ok(())
 }
 
 #[cfg(not(windows))]
 fn validate_browser_preview_sender(
     _source_id: Option<&str>,
+    _codec: BrowserWebrtcPreviewCodec,
     _fps: u32,
     _bitrate_bps: u32,
     _width: Option<u32>,
     _height: Option<u32>,
 ) -> Result<(), String> {
-    Err("browser WebRTC preview currently requires Windows DXGI + NVENC H.264".to_string())
+    Err("browser WebRTC preview currently requires Windows DXGI + NVENC H.264/HEVC".to_string())
 }
 
 pub fn sanitize_browser_preview_fps(fps: Option<u32>) -> u32 {
@@ -778,6 +885,7 @@ fn spawn_local_capture_sender(
     width: Option<u32>,
     height: Option<u32>,
     source_id: Option<String>,
+    codec: BrowserWebrtcPreviewCodec,
     media_sender: BrowserPreviewMediaSender,
     frame_timing_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
     running: Arc<AtomicBool>,
@@ -791,6 +899,7 @@ fn spawn_local_capture_sender(
             width,
             height,
             source_id,
+            codec,
             media_sender,
             frame_timing_channel,
             running,
@@ -808,6 +917,7 @@ fn run_local_capture_sender(
     width: Option<u32>,
     height: Option<u32>,
     source_id: Option<String>,
+    codec: BrowserWebrtcPreviewCodec,
     media_sender: BrowserPreviewMediaSender,
     frame_timing_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
     running: Arc<AtomicBool>,
@@ -826,7 +936,8 @@ fn run_local_capture_sender(
     let (target_width, target_height) =
         sanitize_browser_preview_target_dimensions(width, height, source_width, source_height);
     capture.set_target_dimensions(target_width, target_height);
-    let mut encoder = match NvencH264Encoder::new_max_speed_with_bitrate(
+    let mut encoder = match BrowserPreviewEncoder::new(
+        codec,
         capture.width(),
         capture.height(),
         fps,
@@ -834,14 +945,18 @@ fn run_local_capture_sender(
     ) {
         Ok(encoder) => encoder,
         Err(error) => {
-            warn!("browser WebRTC preview NVENC failed for {session_id}: {error}");
+            warn!(
+                "browser WebRTC preview NVENC {} failed for {session_id}: {error}",
+                browser_webrtc_preview_codec_label(codec)
+            );
             running.store(false, Ordering::Relaxed);
             return;
         }
     };
 
     info!(
-        "browser WebRTC preview sender started for {} at {}x{} @ {} fps / {} Mbps (source_id {}, source {}x{}, track {:?})",
+        "browser WebRTC preview {} sender started for {} at {}x{} @ {} fps / {} Mbps (source_id {}, source {}x{}, track {:?})",
+        browser_webrtc_preview_codec_label(codec),
         session_id,
         capture.width(),
         capture.height(),
@@ -850,7 +965,7 @@ fn run_local_capture_sender(
         source_id.as_deref().unwrap_or("<primary>"),
         source_width,
         source_height,
-        browser_preview_sender_track_kind(bitrate_bps)
+        media_sender.track_kind()
     );
 
     let access_unit_queue = Arc::new(BrowserPreviewFrameQueue::new(
@@ -979,7 +1094,7 @@ fn run_local_capture_sender(
         encode_samples_us.push(encode_elapsed.min(u64::MAX as u128) as u64);
         frames_encoded += 1;
         for access_unit in access_units {
-            if access_unit.codec != VideoCodec::H264 {
+            if access_unit.codec != encoder.codec() {
                 continue;
             }
             let push_result = access_unit_queue.push_latest(access_unit, &send_stats);
@@ -1078,6 +1193,7 @@ fn run_local_capture_sender(
     _width: Option<u32>,
     _height: Option<u32>,
     _source_id: Option<String>,
+    _codec: BrowserWebrtcPreviewCodec,
     _media_sender: BrowserPreviewMediaSender,
     _frame_timing_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
     running: Arc<AtomicBool>,
@@ -1139,6 +1255,15 @@ mod tests {
     }
 
     #[test]
+    fn browser_webrtc_preview_start_deserializes_hevc_codec() {
+        let request: BrowserWebrtcPreviewStartRequest =
+            serde_json::from_str(r#"{"session_id":"s1","offer_sdp":"v=0","codec":"hevc"}"#)
+                .unwrap();
+
+        assert_eq!(request.selected_codec(), BrowserWebrtcPreviewCodec::Hevc);
+    }
+
+    #[test]
     fn browser_preview_uses_rtp_track_for_low_latency_browser_video() {
         assert_eq!(
             browser_preview_sender_track_kind(20_000_000),
@@ -1152,6 +1277,21 @@ mod tests {
             browser_preview_sender_track_kind(50_000_000),
             BrowserPreviewSenderTrackKind::Sample
         );
+    }
+
+    #[test]
+    fn browser_preview_hevc_media_sender_uses_rtp_even_at_high_bitrate() {
+        let sender = BrowserPreviewMediaSender::new(
+            "video",
+            "stream",
+            120,
+            BrowserWebrtcPreviewCodec::Hevc,
+            H264Profile::High,
+            "640034",
+            80_000_000,
+        );
+
+        assert!(matches!(sender, BrowserPreviewMediaSender::HevcRtp(_)));
     }
 
     #[test]

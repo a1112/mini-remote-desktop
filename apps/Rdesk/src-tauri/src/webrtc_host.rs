@@ -9,7 +9,7 @@ use std::{
 
 use crate::app_settings::DecodePolicy;
 use crate::frame_sink::DecodedFrameSink;
-use crate::webrtc_media::H264AccessUnitAssembler;
+use crate::webrtc_media::{H264AccessUnitAssembler, HevcAccessUnitAssembler};
 use mrd_capture_dxgi::DxgiDesktopCapture;
 use mrd_decode::VideoDecoder;
 use mrd_encode_openh264::OpenH264Encoder;
@@ -21,7 +21,10 @@ use mrd_pipeline_core::{
 };
 use mrd_proto::SessionId;
 use mrd_signal_proto::{IceCandidate, SessionDescription};
-use mrd_transport_webrtc::{annex_b_contains_keyframe, H264Profile, H264RtpSender};
+use mrd_transport_webrtc::{
+    annex_b_contains_keyframe, hevc_annex_b_contains_keyframe, H264Profile, H264RtpSender,
+    HevcRtpSender,
+};
 use tokio::task::JoinHandle;
 use webrtc::{
     api::{
@@ -86,9 +89,144 @@ pub struct WebrtcHostSnapshot {
 struct HostedPeer {
     pc: Arc<RTCPeerConnection>,
     snapshot: Arc<Mutex<WebrtcHostSnapshot>>,
-    sample_sender: Option<Arc<tokio::sync::Mutex<H264RtpSender>>>,
+    sample_sender: Option<Arc<tokio::sync::Mutex<EncodedRtpSender>>>,
     sender_running: Arc<AtomicBool>,
     sender_task: Option<JoinHandle<()>>,
+}
+
+enum EncodedRtpSender {
+    H264(H264RtpSender),
+    Hevc(HevcRtpSender),
+}
+
+#[cfg(test)]
+struct EncodedRtpPacketSummary {
+    marker: bool,
+}
+
+impl EncodedRtpSender {
+    fn new_h264(
+        track_id: impl Into<String>,
+        stream_id: impl Into<String>,
+        fps: u32,
+        mtu: u16,
+        profile: H264Profile,
+    ) -> Self {
+        Self::H264(H264RtpSender::new_with_profile(
+            track_id, stream_id, fps, mtu, profile,
+        ))
+    }
+
+    fn new_hevc(
+        track_id: impl Into<String>,
+        stream_id: impl Into<String>,
+        fps: u32,
+        mtu: u16,
+    ) -> Self {
+        Self::Hevc(HevcRtpSender::new(track_id, stream_id, fps, mtu))
+    }
+
+    fn for_codec(
+        codec: VideoCodec,
+        track_id: impl Into<String>,
+        stream_id: impl Into<String>,
+        fps: u32,
+        mtu: u16,
+        h264_profile: H264Profile,
+    ) -> Result<Self, String> {
+        Ok(match codec {
+            VideoCodec::H264 => Self::new_h264(track_id, stream_id, fps, mtu, h264_profile),
+            VideoCodec::Hevc => Self::new_hevc(track_id, stream_id, fps, mtu),
+            VideoCodec::Av1 => {
+                return Err("WebRTC host AV1 RTP sender is not implemented".to_string());
+            }
+        })
+    }
+
+    fn track(&self) -> Arc<dyn TrackLocal + Send + Sync> {
+        match self {
+            Self::H264(sender) => sender.track(),
+            Self::Hevc(sender) => sender.track(),
+        }
+    }
+
+    async fn send_access_unit(
+        &mut self,
+        access_unit: &EncodedAccessUnit,
+    ) -> Result<usize, mrd_transport_webrtc::TransportError> {
+        match self {
+            Self::H264(sender) => sender.send_access_unit(access_unit).await,
+            Self::Hevc(sender) => sender.send_access_unit(access_unit).await,
+        }
+    }
+
+    #[cfg(test)]
+    fn packetize_access_unit(
+        &mut self,
+        access_unit: &EncodedAccessUnit,
+    ) -> Result<Vec<EncodedRtpPacketSummary>, mrd_transport_webrtc::TransportError> {
+        let packets = match self {
+            Self::H264(sender) => sender.packetize_access_unit(access_unit)?,
+            Self::Hevc(sender) => sender.packetize_access_unit(access_unit)?,
+        };
+        Ok(packets
+            .into_iter()
+            .map(|packet| EncodedRtpPacketSummary {
+                marker: packet.header.marker,
+            })
+            .collect())
+    }
+}
+
+enum RemoteAccessUnitAssembler {
+    H264(H264AccessUnitAssembler),
+    Hevc(HevcAccessUnitAssembler),
+}
+
+impl RemoteAccessUnitAssembler {
+    fn for_mime(mime_type: &str) -> Option<Self> {
+        if mime_type.eq_ignore_ascii_case("video/h264") {
+            Some(Self::H264(H264AccessUnitAssembler::default()))
+        } else if is_hevc_mime(mime_type) {
+            Some(Self::Hevc(HevcAccessUnitAssembler::default()))
+        } else {
+            None
+        }
+    }
+
+    fn codec(&self) -> VideoCodec {
+        match self {
+            Self::H264(_) => VideoCodec::H264,
+            Self::Hevc(_) => VideoCodec::Hevc,
+        }
+    }
+
+    fn push_rtp_packet(
+        &mut self,
+        payload: &[u8],
+        marker: bool,
+        sequence_number: u16,
+        timestamp_us: u64,
+    ) -> Option<EncodedAccessUnit> {
+        match self {
+            Self::H264(assembler) => assembler
+                .push_rtp_packet(payload, marker, sequence_number)
+                .map(|bytes| EncodedAccessUnit {
+                    codec: VideoCodec::H264,
+                    timestamp_us,
+                    is_keyframe: annex_b_contains_keyframe(&bytes),
+                    bytes,
+                }),
+            Self::Hevc(assembler) => assembler
+                .push_rtp_packet(payload, marker, sequence_number)
+                .map(|bytes| EncodedAccessUnit {
+                    codec: VideoCodec::Hevc,
+                    timestamp_us,
+                    is_keyframe: hevc_annex_b_contains_keyframe(&bytes),
+                    bytes,
+                }),
+        }
+    }
 }
 
 pub struct WebrtcHost {
@@ -324,8 +462,15 @@ impl WebrtcHost {
             return Ok(());
         }
 
-        let sample_sender =
-            ensure_sample_sender(&pc, &session_id, session, fps, H264Profile::Baseline).await?;
+        let sample_sender = ensure_sample_sender(
+            &pc,
+            &session_id,
+            session,
+            fps,
+            VideoCodec::H264,
+            H264Profile::Baseline,
+        )
+        .await?;
         let probe = self
             .probe_registry
             .session_handle(session_id.clone(), crate::frame_sink::DEFAULT_SOURCE_ID);
@@ -382,7 +527,15 @@ impl WebrtcHost {
             .sessions
             .get_mut(&session_id)
             .ok_or_else(|| format!("鏈壘鍒?webrtc host 浼氳瘽: {}", session_id.0))?;
-        let _ = ensure_sample_sender(&pc, &session_id, session, 60, H264Profile::Baseline).await?;
+        let _ = ensure_sample_sender(
+            &pc,
+            &session_id,
+            session,
+            60,
+            VideoCodec::H264,
+            H264Profile::Baseline,
+        )
+        .await?;
         Ok(())
     }
 
@@ -402,7 +555,30 @@ impl WebrtcHost {
             &session_id,
             session,
             fps,
+            VideoCodec::H264,
             h264_profile_from_label(h264_profile),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn prepare_browser_hevc_sender(
+        &mut self,
+        session_id: SessionId,
+        fps: u32,
+    ) -> Result<(), String> {
+        let pc = self.get_or_create_peer(&session_id).await?;
+        let session = self
+            .sessions
+            .get_mut(&session_id)
+            .ok_or_else(|| format!("未找到 webrtc host 会话: {}", session_id.0))?;
+        let _ = ensure_sample_sender(
+            &pc,
+            &session_id,
+            session,
+            fps,
+            VideoCodec::Hevc,
+            H264Profile::Baseline,
         )
         .await?;
         Ok(())
@@ -412,6 +588,24 @@ impl WebrtcHost {
         &mut self,
         session_id: SessionId,
         fps: u32,
+        h264_profile: &str,
+        receiver: mpsc::Receiver<Vec<EncodedAccessUnit>>,
+    ) -> Result<(), String> {
+        self.start_encoded_access_unit_sender_with_codec(
+            session_id,
+            fps,
+            VideoCodec::H264,
+            h264_profile,
+            receiver,
+        )
+        .await
+    }
+
+    pub async fn start_encoded_access_unit_sender_with_codec(
+        &mut self,
+        session_id: SessionId,
+        fps: u32,
+        codec: VideoCodec,
         h264_profile: &str,
         receiver: mpsc::Receiver<Vec<EncodedAccessUnit>>,
     ) -> Result<(), String> {
@@ -430,6 +624,7 @@ impl WebrtcHost {
             &session_id,
             session,
             fps,
+            codec,
             h264_profile_from_label(h264_profile),
         )
         .await?;
@@ -437,7 +632,7 @@ impl WebrtcHost {
             .probe_registry
             .session_handle(session_id.clone(), crate::frame_sink::DEFAULT_SOURCE_ID);
         probe.set_backend("harness");
-        probe.set_codec("h264");
+        probe.set_codec(codec_label(codec));
         probe.set_transport("webrtc");
 
         session.sender_running.store(true, Ordering::Relaxed);
@@ -528,7 +723,15 @@ impl WebrtcHost {
             sender.clone()
         } else {
             let fps = fps_from_frame_interval(frame_interval);
-            ensure_sample_sender(&pc, &session_id, session, fps, H264Profile::Baseline).await?
+            ensure_sample_sender(
+                &pc,
+                &session_id,
+                session,
+                fps,
+                VideoCodec::H264,
+                H264Profile::Baseline,
+            )
+            .await?
         };
         let probe = self
             .probe_registry
@@ -573,7 +776,8 @@ impl WebrtcHost {
             "nvenc" => H264Profile::High,
             _ => H264Profile::Baseline,
         };
-        let _ = ensure_sample_sender(&pc, &session_id, session, 60, profile).await?;
+        let _ =
+            ensure_sample_sender(&pc, &session_id, session, 60, VideoCodec::H264, profile).await?;
         Ok(())
     }
 
@@ -634,20 +838,22 @@ async fn ensure_sample_sender(
     session_id: &SessionId,
     session: &mut HostedPeer,
     fps: u32,
+    codec: VideoCodec,
     profile: H264Profile,
-) -> Result<Arc<tokio::sync::Mutex<H264RtpSender>>, String> {
+) -> Result<Arc<tokio::sync::Mutex<EncodedRtpSender>>, String> {
     if let Some(sender) = session.sample_sender.as_ref() {
         return Ok(sender.clone());
     }
 
-    let sender = Arc::new(tokio::sync::Mutex::new(H264RtpSender::new_with_profile(
+    let sender = Arc::new(tokio::sync::Mutex::new(EncodedRtpSender::for_codec(
+        codec,
         "video",
         format!("{}-embedded", session_id.0),
         fps.max(1),
         1200,
         profile,
-    )));
-    let track: Arc<dyn TrackLocal + Send + Sync> = sender.lock().await.track();
+    )?));
+    let track = sender.lock().await.track();
     let rtp_sender = pc
         .add_track(track)
         .await
@@ -807,20 +1013,16 @@ async fn build_peer_connection(
                 source_id
             };
 
-            let mut h264_assembler = if mime_type.eq_ignore_ascii_case("video/h264") {
-                Some(H264AccessUnitAssembler::default())
-            } else {
-                None
-            };
-            let (mut decoder, mut active_backend_id) = if mime_type.eq_ignore_ascii_case("video/h264")
-            {
+            let mut access_unit_assembler = RemoteAccessUnitAssembler::for_mime(&mime_type);
+            let remote_codec = access_unit_assembler.as_ref().map(|assembler| assembler.codec());
+            let (mut decoder, mut active_backend_id) = if let Some(codec) = remote_codec {
                 let decode_policy = *decode_policy.lock().expect("lock decode policy");
-                let selection = select_h264_decoder(decode_policy);
+                let selection = select_decoder_for_codec(codec, decode_policy);
                 {
                     let mut snapshot = snapshot.lock().expect("lock host snapshot");
                     snapshot.decode_policy = Some(decode_policy.as_str().to_string());
                     snapshot.preferred_decode_backend =
-                        Some(preferred_backend_for_policy(decode_policy).to_string());
+                        Some(preferred_backend_for_codec(codec, decode_policy).to_string());
                     snapshot.active_decode_backend = selection.backend_id.map(str::to_string);
                     snapshot.decode_backend_reason = Some(selection.reason.clone());
                     if let Some(fallback_reason) = selection.fallback_reason.clone() {
@@ -838,11 +1040,13 @@ async fn build_peer_connection(
                 let packet_count = counter.fetch_add(1, Ordering::Relaxed) + 1;
                 let assemble_started_at = std::time::Instant::now();
                 let sequence_number = _packet.header.sequence_number;
-                let next_access_unit = h264_assembler.as_mut().and_then(|assembler| {
+                let timestamp_us = u64::from(_packet.header.timestamp) * 1_000_000 / 90_000;
+                let next_access_unit = access_unit_assembler.as_mut().and_then(|assembler| {
                     assembler.push_rtp_packet(
                         &_packet.payload,
                         _packet.header.marker,
                         sequence_number,
+                        timestamp_us,
                     )
                 });
                 probe.record_stage(
@@ -868,13 +1072,13 @@ async fn build_peer_connection(
                 if let Some(access_unit) = next_access_unit {
                     let access_unit_count = access_unit_counter.fetch_add(1, Ordering::Relaxed) + 1;
                     snapshot_guard.remote_h264_access_unit_count = access_unit_count;
-                    snapshot_guard.last_remote_access_unit_bytes = access_unit.len();
+                    snapshot_guard.last_remote_access_unit_bytes = access_unit.bytes.len();
                     snapshot_guard
                         .recent_remote_access_unit_bytes
-                        .push(access_unit.len());
+                        .push(access_unit.bytes.len());
                     snapshot_guard
                         .recent_remote_access_unit_keyframes
-                        .push(annex_b_contains_keyframe(&access_unit));
+                        .push(access_unit.is_keyframe);
                     if snapshot_guard.recent_remote_access_unit_bytes.len() > 8 {
                         snapshot_guard.recent_remote_access_unit_bytes.remove(0);
                     }
@@ -885,8 +1089,8 @@ async fn build_peer_connection(
                     probe.record_stage(
                         StageId::H264Assemble,
                         assemble_started_at.elapsed(),
-                        access_unit.len(),
-                        annex_b_contains_keyframe(&access_unit),
+                        access_unit.bytes.len(),
+                        access_unit.is_keyframe,
                     );
                     if let Some(decoder_ref) = decoder.as_mut() {
                         if let Err(error) = decode_access_unit_into_snapshot(
@@ -896,9 +1100,9 @@ async fn build_peer_connection(
                             frame_sink.clone(),
                             probe.clone(),
                             decoder_ref.as_mut(),
-                            &access_unit,
+                            &access_unit.bytes,
                         ) {
-                            if active_backend_id == Some("nvdec") {
+                            if access_unit.codec == VideoCodec::H264 && active_backend_id == Some("nvdec") {
                                 match mrd_decode::create_decoder("h264_software") {
                                     Ok(mut software_decoder) => {
                                         {
@@ -924,7 +1128,7 @@ async fn build_peer_connection(
                                             frame_sink.clone(),
                                             probe.clone(),
                                             software_decoder.as_mut(),
-                                            &access_unit,
+                                            &access_unit.bytes,
                                         );
                                         decoder = Some(software_decoder);
                                         active_backend_id = Some("h264_software");
@@ -997,12 +1201,65 @@ fn preferred_backend_for_policy(policy: DecodePolicy) -> &'static str {
     }
 }
 
+fn preferred_backend_for_codec(codec: VideoCodec, policy: DecodePolicy) -> &'static str {
+    match codec {
+        VideoCodec::H264 => preferred_backend_for_policy(policy),
+        VideoCodec::Hevc => hevc_decoder_backend_order(policy)
+            .first()
+            .copied()
+            .unwrap_or("unsupported"),
+        VideoCodec::Av1 => "unsupported",
+    }
+}
+
+#[allow(dead_code)]
+fn decoder_backend_order_for_codec(codec: VideoCodec, policy: DecodePolicy) -> Vec<&'static str> {
+    match codec {
+        VideoCodec::H264 => h264_decoder_backend_order(policy),
+        VideoCodec::Hevc => hevc_decoder_backend_order(policy),
+        VideoCodec::Av1 => Vec::new(),
+    }
+}
+
 fn h264_decoder_backend_order(policy: DecodePolicy) -> Vec<&'static str> {
     match policy {
         DecodePolicy::Auto => vec!["h264_software", "nvdec"],
         DecodePolicy::Software => vec!["h264_software"],
         DecodePolicy::D3d11va => vec!["d3d11va", "h264_software"],
         DecodePolicy::Nvdec => vec!["nvdec", "h264_software"],
+    }
+}
+
+fn hevc_decoder_backend_order(policy: DecodePolicy) -> Vec<&'static str> {
+    match policy {
+        DecodePolicy::Software | DecodePolicy::D3d11va => Vec::new(),
+        DecodePolicy::Auto | DecodePolicy::Nvdec => {
+            #[cfg(windows)]
+            {
+                vec!["nvdec_hevc"]
+            }
+            #[cfg(target_os = "linux")]
+            {
+                vec!["linux_hevc"]
+            }
+            #[cfg(not(any(windows, target_os = "linux")))]
+            {
+                Vec::new()
+            }
+        }
+    }
+}
+
+fn select_decoder_for_codec(codec: VideoCodec, policy: DecodePolicy) -> DecoderSelection {
+    match codec {
+        VideoCodec::H264 => select_h264_decoder(policy),
+        VideoCodec::Hevc => select_hevc_decoder(policy),
+        VideoCodec::Av1 => DecoderSelection {
+            backend_id: None,
+            decoder: None,
+            reason: "WebRTC remote AV1 decode is not implemented".to_string(),
+            fallback_reason: None,
+        },
     }
 }
 
@@ -1088,6 +1345,42 @@ fn select_h264_decoder(policy: DecodePolicy) -> DecoderSelection {
     }
 }
 
+fn select_hevc_decoder(policy: DecodePolicy) -> DecoderSelection {
+    let order = hevc_decoder_backend_order(policy);
+    if order.is_empty() {
+        return DecoderSelection {
+            backend_id: None,
+            decoder: None,
+            reason:
+                "HEVC remote decode requires NVDEC HEVC on Windows or Linux HEVC hardware decode"
+                    .to_string(),
+            fallback_reason: None,
+        };
+    }
+
+    let mut failures = Vec::new();
+    for backend in order {
+        match mrd_decode::create_decoder(backend) {
+            Ok(decoder) => {
+                return DecoderSelection {
+                    backend_id: Some(backend),
+                    decoder: Some(decoder),
+                    reason: format!("selected {backend} for WebRTC HEVC remote decode"),
+                    fallback_reason: None,
+                };
+            }
+            Err(error) => failures.push(format!("{backend} failed ({error})")),
+        }
+    }
+
+    DecoderSelection {
+        backend_id: None,
+        decoder: None,
+        reason: format!("HEVC decoder unavailable: {}", failures.join("; ")),
+        fallback_reason: None,
+    }
+}
+
 fn nvdec_runtime_supports_h264() -> bool {
     let probe = mrd_decode_nvdec::probe_runtime();
     probe.capability_probes.iter().any(|capability| {
@@ -1097,6 +1390,18 @@ fn nvdec_runtime_supports_h264() -> bool {
             && capability.runtime_supported
             && capability.wired_supported
     })
+}
+
+fn is_hevc_mime(mime_type: &str) -> bool {
+    mime_type.eq_ignore_ascii_case("video/hevc") || mime_type.eq_ignore_ascii_case("video/h265")
+}
+
+fn codec_label(codec: VideoCodec) -> &'static str {
+    match codec {
+        VideoCodec::H264 => "h264",
+        VideoCodec::Hevc => "hevc",
+        VideoCodec::Av1 => "av1",
+    }
 }
 
 fn apply_decoded_frames_to_snapshot(
@@ -1144,7 +1449,7 @@ fn decoded_frame_data_kind(frame: &DecodedFrame) -> &'static str {
 
 fn run_blocking_encoded_access_unit_sender_loop(
     receiver: mpsc::Receiver<Vec<EncodedAccessUnit>>,
-    sample_sender: Arc<tokio::sync::Mutex<H264RtpSender>>,
+    sample_sender: Arc<tokio::sync::Mutex<EncodedRtpSender>>,
     snapshot: Arc<Mutex<WebrtcHostSnapshot>>,
     probe: ProbeSessionHandle,
     running: Arc<AtomicBool>,
@@ -1158,10 +1463,6 @@ fn run_blocking_encoded_access_unit_sender_loop(
         };
 
         for access_unit in access_units {
-            if access_unit.codec != VideoCodec::H264 {
-                continue;
-            }
-
             let send_started_at = std::time::Instant::now();
             match handle.block_on(async {
                 sample_sender
@@ -1216,7 +1517,7 @@ async fn run_embedded_sender_loop<C, E>(
     mut capture: C,
     mut encoder: E,
     frame_interval: Duration,
-    sample_sender: Arc<tokio::sync::Mutex<H264RtpSender>>,
+    sample_sender: Arc<tokio::sync::Mutex<EncodedRtpSender>>,
     snapshot: Arc<Mutex<WebrtcHostSnapshot>>,
     probe: ProbeSessionHandle,
     running: Arc<AtomicBool>,
@@ -1309,7 +1610,7 @@ fn run_blocking_desktop_sender_loop<C, E>(
     capture: &mut C,
     encoder: &mut E,
     frame_interval: Duration,
-    sample_sender: Arc<tokio::sync::Mutex<H264RtpSender>>,
+    sample_sender: Arc<tokio::sync::Mutex<EncodedRtpSender>>,
     snapshot: Arc<Mutex<WebrtcHostSnapshot>>,
     probe: ProbeSessionHandle,
     running: Arc<AtomicBool>,
@@ -1408,7 +1709,9 @@ mod tests {
     use mrd_encode_nvenc::NvencH264Encoder;
     use mrd_encode_openh264::OpenH264Encoder;
     use mrd_observability::{PipelineProbeSnapshot, ProbeRegistry, StageId};
-    use mrd_pipeline_core::{CapturedFrame, FrameCapture, FramePixelFormat, VideoEncoder};
+    use mrd_pipeline_core::{
+        CapturedFrame, EncodedAccessUnit, FrameCapture, FramePixelFormat, VideoCodec, VideoEncoder,
+    };
     use mrd_proto::SessionId;
     use openh264::{
         encoder::Encoder,
@@ -1416,8 +1719,9 @@ mod tests {
     };
 
     use super::{
-        decode_access_unit_into_snapshot, h264_decoder_backend_order, select_h264_decoder,
-        WebrtcHost, WebrtcHostSnapshot,
+        decode_access_unit_into_snapshot, decoder_backend_order_for_codec,
+        h264_decoder_backend_order, select_h264_decoder, EncodedRtpSender,
+        RemoteAccessUnitAssembler, WebrtcHost, WebrtcHostSnapshot,
     };
     use crate::app_settings::DecodePolicy;
     use crate::frame_sink::{DecodedFrameSink, DecodedFrameSnapshot};
@@ -1634,6 +1938,55 @@ mod tests {
             assembler.push_rtp_payload(&[0x7c, 0x45, 0xcc, 0xdd], true),
             Some(vec![0, 0, 0, 1, 0x65, 0xaa, 0xbb, 0xcc, 0xdd])
         );
+    }
+
+    fn synthetic_hevc_access_unit() -> EncodedAccessUnit {
+        EncodedAccessUnit {
+            codec: VideoCodec::Hevc,
+            timestamp_us: 42_000,
+            is_keyframe: true,
+            bytes: vec![
+                0, 0, 0, 1, 0x40, 0x01, 0xaa, 0, 0, 0, 1, 0x42, 0x01, 0xbb, 0, 0, 0, 1, 0x44, 0x01,
+                0xc0, 0, 0, 0, 1, 0x26, 0x01, 0xcc, 0xdd,
+            ],
+        }
+    }
+
+    #[test]
+    fn webrtc_host_hevc_remote_assembler_wraps_access_units_with_codec_metadata() {
+        let mut assembler =
+            RemoteAccessUnitAssembler::for_mime("video/HEVC").expect("HEVC assembler");
+
+        let access_unit = assembler
+            .push_rtp_packet(&[0x26, 0x01, 0xaa], true, 7, 33_000)
+            .expect("HEVC access unit");
+
+        assert_eq!(access_unit.codec, VideoCodec::Hevc);
+        assert_eq!(access_unit.timestamp_us, 33_000);
+        assert!(access_unit.is_keyframe);
+    }
+
+    #[test]
+    fn webrtc_host_hevc_decoder_order_uses_hevc_backends() {
+        let order = decoder_backend_order_for_codec(VideoCodec::Hevc, DecodePolicy::Auto);
+
+        #[cfg(windows)]
+        assert_eq!(order, vec!["nvdec_hevc"]);
+        #[cfg(target_os = "linux")]
+        assert_eq!(order, vec!["linux_hevc"]);
+        #[cfg(not(any(windows, target_os = "linux")))]
+        assert!(order.is_empty());
+    }
+
+    #[test]
+    fn webrtc_host_hevc_sender_packetizes_hevc_access_units() {
+        let mut sender = EncodedRtpSender::new_hevc("video", "stream", 60, 1200);
+        let packets = sender
+            .packetize_access_unit(&synthetic_hevc_access_unit())
+            .expect("packetize HEVC");
+
+        assert_eq!(packets.len(), 2);
+        assert!(packets.last().expect("last packet").marker);
     }
 
     struct FakeCapture {

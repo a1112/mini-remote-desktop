@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router";
 import { describe, expect, it } from "vitest";
 import { getMockInvoke } from "../../../test/mocks/tauri";
@@ -111,5 +111,38 @@ describe("CustomTestPage platform capabilities", () => {
     expect(screen.queryByRole("radio", { name: /NVDEC/ })).not.toBeInTheDocument();
     expect(screen.getByRole("radio", { name: /Synthetic/ })).toBeEnabled();
     expect(screen.getByRole("radio", { name: /OpenH264/ })).toBeEnabled();
+  });
+
+  it("allows HEVC custom tests to select WebRTC RTP transport", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve({
+          os_type: "windows",
+          cpu_brand: "test",
+          cpu_cores: 8,
+          memory_gb: 16,
+          gpu_info: "NVIDIA",
+          available_captures: ["dxgi", "synthetic"],
+          available_encoders: ["nvenc_h264", "nvenc_hevc", "openh264"],
+          available_decoders: ["nvdec", "software", "none"],
+          available_renderers: ["d3d11", "none"],
+          available_memory_modes: ["cpu"],
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    render(
+      <MemoryRouter>
+        <CustomTestPage />
+      </MemoryRouter>
+    );
+
+    fireEvent.click(await screen.findByRole("radio", { name: /NVENC HEVC Main/ }));
+    const webrtc = screen.getByRole("radio", { name: /WebRTC RTP/ });
+
+    expect(webrtc).toBeEnabled();
+    expect(screen.queryByText("HEVC 未接入")).not.toBeInTheDocument();
   });
 });

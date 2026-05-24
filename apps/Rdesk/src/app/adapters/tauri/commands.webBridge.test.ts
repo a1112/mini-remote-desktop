@@ -188,6 +188,7 @@ describe('commands service bridge integration', () => {
       sessionId: 'local-display-test-1',
       offerSdp: 'offer-sdp',
       fps: 120,
+      codec: 'hevc',
       h264Profile: 'high',
       sourceId: 'windows:display-shared:1',
     });
@@ -204,6 +205,7 @@ describe('commands service bridge integration', () => {
     expect(startBody).toEqual(
       expect.objectContaining({
         session_id: 'local-display-test-1',
+        codec: 'hevc',
         source_id: 'windows:display-shared:1',
       })
     );

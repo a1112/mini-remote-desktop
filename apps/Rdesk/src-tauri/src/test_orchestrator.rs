@@ -1987,37 +1987,85 @@ impl TestOrchestrator {
             });
         }
 
-        let mut sender = mrd_transport_webrtc::H264RtpSender::new(
-            "single-window-video",
-            "single-window-stream",
-            fps,
-            1200,
-        );
-        let mut ingress = mrd_transport_webrtc::H264RtpIngress::default();
+        enum RtpLoopback {
+            H264 {
+                sender: mrd_transport_webrtc::H264RtpSender,
+                ingress: mrd_transport_webrtc::H264RtpIngress,
+            },
+            Hevc {
+                sender: mrd_transport_webrtc::HevcRtpSender,
+                ingress: mrd_transport_webrtc::HevcRtpIngress,
+            },
+        }
+
+        let codec = access_units
+            .first()
+            .map(|access_unit| access_unit.codec)
+            .ok_or_else(|| anyhow::anyhow!("WebRTC RTP loopback received no access units"))?;
+        let mut loopback = match codec {
+            mrd_pipeline_core::VideoCodec::H264 => RtpLoopback::H264 {
+                sender: mrd_transport_webrtc::H264RtpSender::new(
+                    "single-window-video",
+                    "single-window-stream",
+                    fps,
+                    1200,
+                ),
+                ingress: mrd_transport_webrtc::H264RtpIngress::default(),
+            },
+            mrd_pipeline_core::VideoCodec::Hevc => RtpLoopback::Hevc {
+                sender: mrd_transport_webrtc::HevcRtpSender::new(
+                    "single-window-video",
+                    "single-window-stream",
+                    fps,
+                    1200,
+                ),
+                ingress: mrd_transport_webrtc::HevcRtpIngress::default(),
+            },
+            mrd_pipeline_core::VideoCodec::Av1 => {
+                anyhow::bail!("WebRTC RTP single-window probe does not support AV1 yet")
+            }
+        };
         let mut reassembled = Vec::new();
         let mut rtp_packet_count = 0usize;
         let mut payload_bytes = 0usize;
 
         for access_unit in access_units {
-            let packets = sender
-                .packetize_access_unit(access_unit)
-                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            if access_unit.codec != codec {
+                anyhow::bail!("WebRTC RTP loopback cannot mix codecs in one probe");
+            }
+            let packets = match &mut loopback {
+                RtpLoopback::H264 { sender, .. } => sender
+                    .packetize_access_unit(access_unit)
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?,
+                RtpLoopback::Hevc { sender, .. } => sender
+                    .packetize_access_unit(access_unit)
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?,
+            };
             for packet in packets {
                 rtp_packet_count += 1;
                 payload_bytes += packet.payload.len();
-                if let Some(received) = ingress.push_packet(
-                    &packet.payload,
-                    packet.header.marker,
-                    packet.header.sequence_number,
-                    access_unit.timestamp_us,
-                ) {
+                let received = match &mut loopback {
+                    RtpLoopback::H264 { ingress, .. } => ingress.push_packet(
+                        &packet.payload,
+                        packet.header.marker,
+                        packet.header.sequence_number,
+                        access_unit.timestamp_us,
+                    ),
+                    RtpLoopback::Hevc { ingress, .. } => ingress.push_packet(
+                        &packet.payload,
+                        packet.header.marker,
+                        packet.header.sequence_number,
+                        access_unit.timestamp_us,
+                    ),
+                };
+                if let Some(received) = received {
                     reassembled.push(received);
                 }
             }
         }
 
         if reassembled.is_empty() {
-            anyhow::bail!("WebRTC RTP loopback produced no H264 access units");
+            anyhow::bail!("WebRTC RTP loopback produced no access units");
         }
 
         Ok(SingleWindowTransportProbe {
@@ -3856,6 +3904,39 @@ mod tests {
             harness.display_id.as_deref(),
             Some("windows:display-shared:1")
         );
+    }
+
+    fn synthetic_hevc_access_unit() -> EncodedAccessUnit {
+        EncodedAccessUnit {
+            codec: mrd_pipeline_core::VideoCodec::Hevc,
+            timestamp_us: 42_000,
+            is_keyframe: true,
+            bytes: vec![
+                0, 0, 0, 1, 0x40, 0x01, 0xaa, 0, 0, 0, 1, 0x42, 0x01, 0xbb, 0, 0, 0, 1, 0x44, 0x01,
+                0xc0, 0, 0, 0, 1, 0x26, 0x01, 0xcc, 0xdd,
+            ],
+        }
+    }
+
+    #[test]
+    fn single_window_hevc_webrtc_transport_roundtrips_access_units() {
+        let input = synthetic_hevc_access_unit();
+        let config = TestConfigData {
+            transport_kind: Some("webrtc".to_string()),
+            ..Default::default()
+        };
+
+        let probe =
+            TestOrchestrator::transport_single_window_access_units(&[input.clone()], 60, &config)
+                .expect("HEVC single-window WebRTC loopback");
+
+        assert_eq!(probe.transport, "webrtc_rtp_loopback");
+        assert_eq!(probe.rtp_packet_count, 2);
+        assert_eq!(probe.access_units.len(), 1);
+        assert_eq!(probe.access_units[0].codec, input.codec);
+        assert_eq!(probe.access_units[0].timestamp_us, input.timestamp_us);
+        assert_eq!(probe.access_units[0].bytes, input.bytes);
+        assert!(probe.access_units[0].is_keyframe);
     }
 
     #[test]

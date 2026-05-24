@@ -2,10 +2,10 @@
 use crate::browser_preview_capture::open_browser_preview_dxgi_capture;
 use bytes::Bytes;
 #[cfg(windows)]
-use mrd_encode_nvenc::NvencH264Encoder;
-use mrd_pipeline_core::EncodedAccessUnit;
+use mrd_encode_nvenc::{NvencH264Encoder, NvencHevcEncoder};
+use mrd_pipeline_core::{EncodedAccessUnit, VideoCodec};
 #[cfg(windows)]
-use mrd_pipeline_core::{FrameCapture, VideoCodec, VideoEncoder};
+use mrd_pipeline_core::{FrameCapture, VideoEncoder};
 use serde::{Deserialize, Serialize};
 use std::{
     hint,
@@ -26,6 +26,13 @@ const MAX_BROWSER_WEBCODECS_BITRATE_MBPS: u32 = 120;
 const WEBCODECS_CHUNK_MAGIC: &[u8; 8] = b"MRDWC01\0";
 const WEBCODECS_BINARY_HEADER_LEN: usize = 12;
 
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserWebcodecsPreviewCodec {
+    H264,
+    Hevc,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct BrowserWebcodecsPreviewStartRequest {
     pub session_id: String,
@@ -33,9 +40,16 @@ pub struct BrowserWebcodecsPreviewStartRequest {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub bitrate_mbps: Option<u32>,
+    pub codec: Option<BrowserWebcodecsPreviewCodec>,
     pub h264_profile: Option<String>,
     #[serde(default)]
     pub source_id: Option<String>,
+}
+
+impl BrowserWebcodecsPreviewStartRequest {
+    pub fn selected_codec(&self) -> BrowserWebcodecsPreviewCodec {
+        self.codec.unwrap_or(BrowserWebcodecsPreviewCodec::H264)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -115,6 +129,20 @@ pub fn browser_webcodecs_h264_codec_string(profile: Option<&str>) -> &'static st
     }
 }
 
+pub fn browser_webcodecs_hevc_codec_string() -> &'static str {
+    "hev1.1.6.L156.B0"
+}
+
+pub fn browser_webcodecs_codec_string(
+    codec: BrowserWebcodecsPreviewCodec,
+    h264_profile: Option<&str>,
+) -> &'static str {
+    match codec {
+        BrowserWebcodecsPreviewCodec::H264 => browser_webcodecs_h264_codec_string(h264_profile),
+        BrowserWebcodecsPreviewCodec::Hevc => browser_webcodecs_hevc_codec_string(),
+    }
+}
+
 pub fn encode_webcodecs_chunk_message(
     header: &BrowserWebcodecsFrameHeader,
     payload: &[u8],
@@ -155,6 +183,32 @@ pub fn spawn_browser_webcodecs_capture_sender(
 }
 
 #[cfg(windows)]
+enum BrowserWebcodecsEncoder {
+    H264(NvencH264Encoder),
+    Hevc(NvencHevcEncoder),
+}
+
+#[cfg(windows)]
+impl BrowserWebcodecsEncoder {
+    fn request_keyframe(&mut self) {
+        match self {
+            Self::H264(encoder) => encoder.request_keyframe(),
+            Self::Hevc(_) => {}
+        }
+    }
+
+    fn encode(
+        &mut self,
+        frame: &mrd_pipeline_core::CapturedFrame,
+    ) -> Result<Vec<EncodedAccessUnit>, mrd_pipeline_core::PipelineError> {
+        match self {
+            Self::H264(encoder) => encoder.encode(frame),
+            Self::Hevc(encoder) => encoder.encode(frame),
+        }
+    }
+}
+
+#[cfg(windows)]
 fn run_browser_webcodecs_capture_sender(
     request: BrowserWebcodecsPreviewStartRequest,
     outbound: mpsc::Sender<BrowserWebcodecsPreviewOutbound>,
@@ -165,7 +219,8 @@ fn run_browser_webcodecs_capture_sender(
     let fps = sanitize_browser_webcodecs_preview_fps(request.fps);
     let bitrate_mbps = sanitize_browser_webcodecs_preview_bitrate_mbps(request.bitrate_mbps);
     let bitrate_bps = bitrate_mbps.saturating_mul(1_000_000);
-    let codec = browser_webcodecs_h264_codec_string(request.h264_profile.as_deref());
+    let selected_codec = request.selected_codec();
+    let codec = browser_webcodecs_codec_string(selected_codec, request.h264_profile.as_deref());
     let mut capture = match open_browser_preview_dxgi_capture(request.source_id.as_deref()) {
         Ok(capture) => capture,
         Err(error) => {
@@ -185,18 +240,35 @@ fn run_browser_webcodecs_capture_sender(
     capture.set_target_dimensions(target_width, target_height);
     let width = capture.width() as u32;
     let height = capture.height() as u32;
-    let mut encoder = match NvencH264Encoder::new_max_speed_with_bitrate(
-        capture.width(),
-        capture.height(),
-        fps,
-        bitrate_bps,
-    ) {
+    let encoder_result = match selected_codec {
+        BrowserWebcodecsPreviewCodec::H264 => NvencH264Encoder::new_max_speed_with_bitrate(
+            capture.width(),
+            capture.height(),
+            fps,
+            bitrate_bps,
+        )
+        .map(BrowserWebcodecsEncoder::H264),
+        BrowserWebcodecsPreviewCodec::Hevc => NvencHevcEncoder::new_max_speed_with_bitrate(
+            capture.width(),
+            capture.height(),
+            fps,
+            bitrate_bps,
+        )
+        .map(BrowserWebcodecsEncoder::Hevc),
+    };
+    let mut encoder = match encoder_result {
         Ok(encoder) => encoder,
         Err(error) => {
             send_error(
                 &outbound,
                 &session_id,
-                format!("WebCodecs NVENC H.264 failed: {error}"),
+                format!(
+                    "WebCodecs NVENC {} failed: {error}",
+                    match selected_codec {
+                        BrowserWebcodecsPreviewCodec::H264 => "H.264",
+                        BrowserWebcodecsPreviewCodec::Hevc => "HEVC",
+                    }
+                ),
             );
             running.store(false, Ordering::Relaxed);
             return;
@@ -275,7 +347,7 @@ fn run_browser_webcodecs_capture_sender(
         };
 
         for access_unit in access_units {
-            if access_unit.codec != VideoCodec::H264 {
+            if access_unit.codec != video_codec_for_webcodecs_preview(selected_codec) {
                 continue;
             }
             sequence = sequence.saturating_add(1);
@@ -318,9 +390,16 @@ fn run_browser_webcodecs_capture_sender(
     send_error(
         &outbound,
         &request.session_id,
-        "browser WebCodecs preview currently requires Windows DXGI + NVENC H.264".to_string(),
+        "browser WebCodecs preview currently requires Windows DXGI + NVENC H.264/HEVC".to_string(),
     );
     running.store(false, Ordering::Relaxed);
+}
+
+fn video_codec_for_webcodecs_preview(codec: BrowserWebcodecsPreviewCodec) -> VideoCodec {
+    match codec {
+        BrowserWebcodecsPreviewCodec::H264 => VideoCodec::H264,
+        BrowserWebcodecsPreviewCodec::Hevc => VideoCodec::Hevc,
+    }
 }
 
 fn frame_header(
@@ -422,6 +501,24 @@ mod tests {
     }
 
     #[test]
+    fn browser_webcodecs_preview_start_deserializes_hevc_codec() {
+        let message: BrowserWebcodecsPreviewControlMessage =
+            serde_json::from_str(r#"{"type":"start","session_id":"s1","codec":"hevc"}"#).unwrap();
+
+        let BrowserWebcodecsPreviewControlMessage::Start(request) = message else {
+            panic!("expected start message");
+        };
+        assert_eq!(request.codec, Some(BrowserWebcodecsPreviewCodec::Hevc));
+        assert_eq!(
+            browser_webcodecs_codec_string(
+                request.selected_codec(),
+                request.h264_profile.as_deref()
+            ),
+            "hev1.1.6.L156.B0"
+        );
+    }
+
+    #[test]
     fn webcodecs_preview_binary_message_has_magic_header_and_payload() {
         let header = BrowserWebcodecsFrameHeader {
             message_type: "mrd.webcodecs.frame.v1",
@@ -453,6 +550,10 @@ mod tests {
             "avc1.640034"
         );
         assert_eq!(browser_webcodecs_h264_codec_string(None), "avc1.42e034");
+        assert_eq!(
+            browser_webcodecs_codec_string(BrowserWebcodecsPreviewCodec::Hevc, None),
+            "hev1.1.6.L156.B0"
+        );
     }
 
     #[test]
