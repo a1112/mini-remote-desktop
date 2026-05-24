@@ -9,10 +9,23 @@ import {
 } from "./MatrixTestPage";
 
 function selectSingleSupportedCombination() {
-  fireEvent.click(screen.getByLabelText("OpenH264"));
-  fireEvent.click(screen.getByLabelText("软件"));
-  fireEvent.click(screen.getByLabelText("720p"));
-  fireEvent.click(screen.getByLabelText("30 FPS"));
+  setLabeledCheckbox("NVENC HEVC Main", false);
+  setLabeledCheckbox("NVENC HEVC Main10", false);
+  setLabeledCheckbox(/NVENC AV1/, false);
+  setLabeledCheckbox("OpenH264", false);
+  if (screen.queryByLabelText("NVENC H.264")) {
+    setLabeledCheckbox("NVENC H.264", true);
+  } else if (screen.queryByLabelText("OpenH264")) {
+    setLabeledCheckbox("OpenH264", true);
+  } else if (screen.queryByLabelText("NVENC HEVC Main")) {
+    setLabeledCheckbox("NVENC HEVC Main", true);
+  }
+  setLabeledCheckbox("NVDEC", true);
+  setLabeledCheckbox("软件", false);
+  setLabeledCheckbox("720p", false);
+  setLabeledCheckbox("1080p", true);
+  setLabeledCheckbox("30 FPS", false);
+  setLabeledCheckbox("60 FPS", true);
 }
 
 function setCheckbox(checkbox: HTMLElement, checked: boolean) {
@@ -23,7 +36,8 @@ function setCheckbox(checkbox: HTMLElement, checked: boolean) {
 }
 
 function setLabeledCheckbox(label: string | RegExp, checked: boolean) {
-  setCheckbox(screen.getByLabelText(label), checked);
+  const checkbox = screen.queryByLabelText(label);
+  if (checkbox) setCheckbox(checkbox, checked);
 }
 
 function resultRow() {
@@ -350,13 +364,14 @@ describe("MatrixTestPage failure handling", () => {
     render(<MatrixTestPage runDelayMs={0} />);
 
     await screen.findByLabelText("NVENC HEVC Main");
-    fireEvent.click(screen.getByLabelText("OpenH264"));
-    fireEvent.click(screen.getByLabelText("NVENC H.264"));
-    fireEvent.click(screen.getByLabelText("NVENC HEVC Main"));
-    fireEvent.click(screen.getByLabelText("软件"));
-    fireEvent.click(screen.getByLabelText("WebRTC RTP"));
-    fireEvent.click(screen.getByLabelText("720p"));
-    fireEvent.click(screen.getByLabelText("30 FPS"));
+    setLabeledCheckbox("OpenH264", false);
+    setLabeledCheckbox("NVENC H.264", false);
+    setLabeledCheckbox("NVENC HEVC Main", true);
+    setLabeledCheckbox("软件", false);
+    setLabeledCheckbox("Loopback", false);
+    setLabeledCheckbox("WebRTC RTP", true);
+    setLabeledCheckbox("720p", false);
+    setLabeledCheckbox("30 FPS", false);
     fireEvent.click(screen.getByRole("button", { name: /启动矩阵测试/ }));
 
     await waitFor(() => {

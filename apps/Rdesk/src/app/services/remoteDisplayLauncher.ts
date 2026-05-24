@@ -35,7 +35,12 @@ const DEFAULT_REMOTE_MEDIA_PROFILE: MediaProfile = {
   height: 1080,
   fps: 60,
   bitrate_mbps: 20,
-  codec: "h264",
+  codec: "hevc",
+  codec_profile: "main",
+  bit_depth: 8,
+  chroma_subsampling: "4:2:0",
+  pixel_format: "nv12",
+  hdr_enabled: false,
 };
 
 const DEFAULT_REMOTE_APPLICATION_MEDIA_PROFILE: MediaProfile = {
@@ -43,7 +48,12 @@ const DEFAULT_REMOTE_APPLICATION_MEDIA_PROFILE: MediaProfile = {
   height: 1080,
   fps: 60,
   bitrate_mbps: 20,
-  codec: "h264",
+  codec: "hevc",
+  codec_profile: "main",
+  bit_depth: 8,
+  chroma_subsampling: "4:2:0",
+  pixel_format: "nv12",
+  hdr_enabled: false,
 };
 
 type RemoteDisplayLaunchOptions = {

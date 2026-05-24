@@ -299,8 +299,8 @@ export function TransportTestPage() {
       capture === "macos"
         ? ["videotoolbox_h264", "openh264"]
         : capture === "linux"
-          ? ["nvenc_h264", "openh264"]
-          : ["nvenc_h264", "openh264"],
+          ? ["nvenc_hevc", "nvenc_h264", "openh264"]
+          : ["nvenc_hevc", "nvenc_h264", "openh264"],
       capabilities,
       "available_encoders",
       "openh264"
@@ -322,7 +322,7 @@ export function TransportTestPage() {
       transport_kind: selectedTransport,
       resolution: [1280, 720],
       fps: testProfile === "throughput" ? 60 : 30,
-      bitrate: testProfile === "throughput" ? 20_000_000 : 5_000_000,
+      bitrate: encoder === "nvenc_hevc" ? 20_000_000 : testProfile === "throughput" ? 20_000_000 : 5_000_000,
       duration_ms: 10_000,
       warmup_ms: 500,
       input_source: capture === "synthetic" ? "synthetic" : "screen",
@@ -700,8 +700,13 @@ function mediaProfileForTestProfile(testProfile: TestProfile): MediaProfile {
     width: 1280,
     height: 720,
     fps: testProfile === "throughput" ? 60 : 30,
-    bitrate_mbps: testProfile === "throughput" ? 20 : 5,
-    codec: "h264",
+    bitrate_mbps: 20,
+    codec: "hevc",
+    codec_profile: "main",
+    bit_depth: 8,
+    chroma_subsampling: "4:2:0",
+    pixel_format: "nv12",
+    hdr_enabled: false,
   };
 }
 

@@ -230,12 +230,12 @@ function resolveRendererType(
 export function CustomTestPage() {
   const navigate = useNavigate();
   const [selectedCapture, setSelectedCapture] = useState<CaptureId>("dxgi");
-  const [selectedEncoder, setSelectedEncoder] = useState<EncoderId>("nvenc_h264");
+  const [selectedEncoder, setSelectedEncoder] = useState<EncoderId>("nvenc_hevc");
   const [selectedDecoder, setSelectedDecoder] = useState<DecoderId>("nvdec");
   const [selectedTransport, setSelectedTransport] = useState<TransportId>("quic");
   const [selectedResolution, setSelectedResolution] = useState("1920x1080");
   const [selectedFps, setSelectedFps] = useState(60);
-  const [selectedBitrate, setSelectedBitrate] = useState("5000");
+  const [selectedBitrate, setSelectedBitrate] = useState("20000");
   const [starting, setStarting] = useState(false);
   const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
   const [serviceCapabilitySnapshot, setServiceCapabilitySnapshot] =

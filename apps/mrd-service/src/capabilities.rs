@@ -1229,8 +1229,25 @@ fn default_profiles() -> Vec<CapabilityProfile> {
             1080,
             60,
             20,
+            "hevc",
+            vec![
+                "encode.nvenc_hevc",
+                "decode.nvdec_hevc",
+                "media.hevc_main_420_8bit",
+                "transport.quic_datagram",
+                "transport.media_profile_control_v1",
+            ],
+        ),
+        profile(
+            "compat.h264.1080p60",
+            1920,
+            1080,
+            60,
+            20,
             "h264",
             vec![
+                "encode.nvenc_h264",
+                "decode.nvdec",
                 "transport.quic_datagram",
                 "transport.media_profile_control_v1",
             ],
@@ -1444,6 +1461,19 @@ mod tests {
             .profiles
             .iter()
             .any(|profile| profile.id == "lan.1600p165"));
+        let interactive = snapshot
+            .profiles
+            .iter()
+            .find(|profile| profile.id == "interactive.1080p60")
+            .expect("interactive.1080p60 profile");
+        assert_eq!(interactive.codec, "hevc");
+        assert!(interactive
+            .required_capabilities
+            .contains(&"encode.nvenc_hevc".to_string()));
+        assert!(snapshot
+            .profiles
+            .iter()
+            .any(|profile| profile.id == "compat.h264.1080p60" && profile.codec == "h264"));
         assert!(snapshot
             .constraints
             .iter()
