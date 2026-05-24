@@ -7,6 +7,7 @@ use openh264::{
     decoder::{DecodedYUV, Decoder as OpenH264Decoder},
     formats::YUVSource,
 };
+#[cfg(target_os = "linux")]
 use std::process::{Command, Stdio};
 #[cfg(target_os = "linux")]
 use std::{
@@ -180,18 +181,12 @@ pub fn available_decoder_descriptors() -> Vec<DecoderDescriptor> {
 pub fn create_decoder(id: &str) -> Result<Box<dyn VideoDecoder>, PipelineError> {
     match id {
         "h264_software" => Ok(Box::new(H264SoftwareDecoder::new()?)),
-        "software_hevc" | "hevc_software" => Ok(Box::new(FfmpegSoftwareDecoder::new(
-            FfmpegSoftwareCodec::Hevc,
-        )?)),
-        "software_hevc_main10" | "hevc_main10_software" => Ok(Box::new(
-            FfmpegSoftwareDecoder::new(FfmpegSoftwareCodec::HevcMain10)?,
-        )),
-        "software_av1" | "av1_software" => Ok(Box::new(FfmpegSoftwareDecoder::new(
-            FfmpegSoftwareCodec::Av1,
-        )?)),
-        "software_vvc" | "vvc_software" | "software_h266" | "h266_software" => Ok(Box::new(
-            FfmpegSoftwareDecoder::new(FfmpegSoftwareCodec::Vvc)?,
-        )),
+        "software_hevc" | "hevc_software" => create_rust_h265_decoder(false),
+        "software_hevc_main10" | "hevc_main10_software" => create_rust_h265_decoder(true),
+        "software_av1" | "av1_software" => create_dav1d_decoder(),
+        "software_vvc" | "vvc_software" | "software_h266" | "h266_software" => {
+            create_vvdec_decoder()
+        }
         "linux_h264" | "gstreamer_h264" | "vaapi_h264" => create_linux_h264_decoder(),
         "linux_hevc" | "gstreamer_hevc" | "vaapi_hevc" => create_linux_hevc_decoder(),
         "linux_hevc_main10" | "gstreamer_hevc_main10" | "vaapi_hevc_main10" => {
@@ -295,55 +290,169 @@ pub struct H264SoftwareDecoder {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FfmpegSoftwareCodec {
-    Hevc,
-    HevcMain10,
-    Av1,
-    Vvc,
+enum SoftwareYuvLayout {
+    I400,
+    I420,
+    I422,
+    I444,
 }
 
-impl FfmpegSoftwareCodec {
-    fn input_format(self) -> &'static str {
-        match self {
-            Self::Hevc | Self::HevcMain10 => "hevc",
-            Self::Av1 => "av1",
-            Self::Vvc => "vvc",
-        }
+struct PlanarYuvFrame<'a> {
+    width: usize,
+    height: usize,
+    layout: SoftwareYuvLayout,
+    bit_depth: usize,
+    bytes_per_sample: usize,
+    y: &'a [u8],
+    y_stride: usize,
+    u: &'a [u8],
+    u_stride: usize,
+    v: &'a [u8],
+    v_stride: usize,
+    full_range: bool,
+}
+
+fn software_codec_not_compiled(
+    codec_label: &str,
+    runtime_label: &str,
+    feature: &str,
+) -> PipelineError {
+    PipelineError::Message(format!(
+        "software {codec_label} decoder requires {runtime_label}; rebuild mrd-decode with feature `{feature}` to enable that backend"
+    ))
+}
+
+#[cfg(feature = "software-rust-h265")]
+pub struct RustH265SoftwareDecoder {
+    tx: std::sync::mpsc::Sender<RustH265Request>,
+    decoded_frames: Vec<CoreDecodedFrame>,
+}
+
+#[cfg(feature = "software-rust-h265")]
+enum RustH265Request {
+    Push {
+        access_unit: Vec<u8>,
+        reply: std::sync::mpsc::Sender<Result<Vec<CoreDecodedFrame>, PipelineError>>,
+    },
+    Stop,
+}
+
+#[cfg(feature = "software-rust-h265")]
+impl RustH265SoftwareDecoder {
+    fn new(require_main10: bool) -> Result<Self, PipelineError> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("mrd-rust-h265-decoder".to_string())
+            .spawn(move || rust_h265_worker(rx, require_main10))
+            .map_err(|error| {
+                PipelineError::Message(format!("spawn rust_h265 decoder worker failed: {error}"))
+            })?;
+        Ok(Self {
+            tx,
+            decoded_frames: Vec::new(),
+        })
     }
 
-    fn label(self) -> &'static str {
-        match self {
-            Self::Hevc => "HEVC",
-            Self::HevcMain10 => "HEVC Main10",
-            Self::Av1 => "AV1",
-            Self::Vvc => "H.266/VVC",
-        }
-    }
-
-    fn runtime_label(self) -> &'static str {
-        match self {
-            Self::Vvc => "ffmpeg/vvdec",
-            Self::Hevc | Self::HevcMain10 | Self::Av1 => "ffmpeg",
-        }
+    fn push_access_unit_nals(&mut self, access_unit: &[u8]) -> Result<(), PipelineError> {
+        let (reply, reply_rx) = std::sync::mpsc::channel();
+        self.tx
+            .send(RustH265Request::Push {
+                access_unit: access_unit.to_vec(),
+                reply,
+            })
+            .map_err(|error| {
+                PipelineError::Message(format!("rust_h265 decoder worker stopped: {error}"))
+            })?;
+        let frames = reply_rx.recv().map_err(|error| {
+            PipelineError::Message(format!("rust_h265 decoder worker did not reply: {error}"))
+        })??;
+        self.decoded_frames.extend(frames);
+        Ok(())
     }
 }
 
-pub struct FfmpegSoftwareDecoder {
-    codec: FfmpegSoftwareCodec,
-    stream: Vec<u8>,
+#[cfg(feature = "software-rust-h265")]
+impl Drop for RustH265SoftwareDecoder {
+    fn drop(&mut self) {
+        let _ = self.tx.send(RustH265Request::Stop);
+    }
+}
+
+#[cfg(feature = "software-dav1d")]
+pub struct Dav1dSoftwareDecoder {
+    decoder: shiguredo_dav1d::Decoder,
     decoded_frames: Vec<CoreDecodedFrame>,
     frame_index: u64,
 }
 
-impl FfmpegSoftwareDecoder {
-    fn new(codec: FfmpegSoftwareCodec) -> Result<Self, PipelineError> {
-        ensure_ffmpeg_available(codec)?;
+#[cfg(feature = "software-dav1d")]
+impl Dav1dSoftwareDecoder {
+    fn new() -> Result<Self, PipelineError> {
+        let mut config = shiguredo_dav1d::DecoderConfig::new();
+        config.n_threads = std::thread::available_parallelism()
+            .map(|count| count.get().min(8))
+            .unwrap_or(1);
+        let decoder = shiguredo_dav1d::Decoder::new(config)
+            .map_err(|error| PipelineError::Message(format!("dav1d init failed: {error}")))?;
         Ok(Self {
-            codec,
-            stream: Vec::new(),
+            decoder,
             decoded_frames: Vec::new(),
             frame_index: 0,
         })
+    }
+
+    fn collect_frames(&mut self) -> Result<(), PipelineError> {
+        loop {
+            match self.decoder.next_frame() {
+                Ok(Some(frame)) => {
+                    let timestamp_us = self.frame_index.saturating_mul(16_667);
+                    self.frame_index = self.frame_index.saturating_add(1);
+                    self.decoded_frames
+                        .push(dav1d_frame_to_rgb_frame(&frame, timestamp_us)?);
+                }
+                Ok(None) => return Ok(()),
+                Err(error) => {
+                    return Err(PipelineError::Message(format!(
+                        "dav1d receive frame failed: {error}"
+                    )))
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "software-vvdec")]
+pub struct VvdecSoftwareDecoder {
+    decoder: vvdec::Decoder,
+    decoded_frames: Vec<CoreDecodedFrame>,
+    frame_index: u64,
+}
+
+#[cfg(feature = "software-vvdec")]
+impl VvdecSoftwareDecoder {
+    fn new() -> Result<Self, PipelineError> {
+        let threads = std::thread::available_parallelism()
+            .map(|count| count.get().min(8) as i32)
+            .unwrap_or(1);
+        let decoder = vvdec::Decoder::builder()
+            .num_threads(threads)
+            .build()
+            .map_err(|error| PipelineError::Message(format!("VVdeC init failed: {error}")))?;
+        Ok(Self {
+            decoder,
+            decoded_frames: Vec::new(),
+            frame_index: 0,
+        })
+    }
+
+    fn push_frame(&mut self, frame: vvdec::Frame) -> Result<(), PipelineError> {
+        let timestamp_us = frame
+            .cts()
+            .unwrap_or_else(|| self.frame_index.saturating_mul(16_667));
+        self.frame_index = self.frame_index.saturating_add(1);
+        self.decoded_frames
+            .push(vvdec_frame_to_rgb_frame(&frame, timestamp_us)?);
+        Ok(())
     }
 }
 
@@ -789,17 +898,112 @@ impl H264SoftwareDecoder {
     }
 }
 
-impl VideoDecoder for FfmpegSoftwareDecoder {
+#[cfg(feature = "software-rust-h265")]
+fn create_rust_h265_decoder(require_main10: bool) -> Result<Box<dyn VideoDecoder>, PipelineError> {
+    Ok(Box::new(RustH265SoftwareDecoder::new(require_main10)?))
+}
+
+#[cfg(not(feature = "software-rust-h265"))]
+fn create_rust_h265_decoder(_require_main10: bool) -> Result<Box<dyn VideoDecoder>, PipelineError> {
+    Err(software_codec_not_compiled(
+        "HEVC/Main10",
+        "rust_h265",
+        "software-rust-h265",
+    ))
+}
+
+#[cfg(feature = "software-dav1d")]
+fn create_dav1d_decoder() -> Result<Box<dyn VideoDecoder>, PipelineError> {
+    Ok(Box::new(Dav1dSoftwareDecoder::new()?))
+}
+
+#[cfg(not(feature = "software-dav1d"))]
+fn create_dav1d_decoder() -> Result<Box<dyn VideoDecoder>, PipelineError> {
+    Err(software_codec_not_compiled(
+        "AV1",
+        "dav1d",
+        "software-dav1d",
+    ))
+}
+
+#[cfg(feature = "software-vvdec")]
+fn create_vvdec_decoder() -> Result<Box<dyn VideoDecoder>, PipelineError> {
+    Ok(Box::new(VvdecSoftwareDecoder::new()?))
+}
+
+#[cfg(not(feature = "software-vvdec"))]
+fn create_vvdec_decoder() -> Result<Box<dyn VideoDecoder>, PipelineError> {
+    Err(software_codec_not_compiled(
+        "H.266/VVC",
+        "VVdeC",
+        "software-vvdec",
+    ))
+}
+
+#[cfg(feature = "software-rust-h265")]
+impl VideoDecoder for RustH265SoftwareDecoder {
     fn push_access_unit(&mut self, access_unit: &[u8]) -> Result<(), PipelineError> {
         if access_unit.is_empty() {
             return Ok(());
         }
 
-        self.stream.extend_from_slice(access_unit);
-        let frame = decode_first_ppm_frame_with_ffmpeg(self.codec, &self.stream, self.frame_index)?;
-        self.frame_index = self.frame_index.saturating_add(1);
-        self.decoded_frames.push(frame);
-        Ok(())
+        self.push_access_unit_nals(access_unit)
+    }
+
+    fn drain_decoded_frames(&mut self) -> Vec<CoreDecodedFrame> {
+        std::mem::take(&mut self.decoded_frames)
+    }
+}
+
+#[cfg(feature = "software-dav1d")]
+impl VideoDecoder for Dav1dSoftwareDecoder {
+    fn push_access_unit(&mut self, access_unit: &[u8]) -> Result<(), PipelineError> {
+        if access_unit.is_empty() {
+            return Ok(());
+        }
+
+        match self.decoder.decode(access_unit) {
+            Ok(()) => {}
+            Err(error) if error.is_eagain() => {
+                self.collect_frames()?;
+                self.decoder.decode(access_unit).map_err(|error| {
+                    PipelineError::Message(format!("dav1d decode failed after drain: {error}"))
+                })?;
+            }
+            Err(error) => {
+                return Err(PipelineError::Message(format!(
+                    "dav1d decode failed: {error}"
+                )))
+            }
+        }
+
+        self.collect_frames()
+    }
+
+    fn drain_decoded_frames(&mut self) -> Vec<CoreDecodedFrame> {
+        std::mem::take(&mut self.decoded_frames)
+    }
+}
+
+#[cfg(feature = "software-vvdec")]
+impl VideoDecoder for VvdecSoftwareDecoder {
+    fn push_access_unit(&mut self, access_unit: &[u8]) -> Result<(), PipelineError> {
+        if access_unit.is_empty() {
+            return Ok(());
+        }
+
+        let timestamp_us = self.frame_index.saturating_mul(16_667);
+        let mut au = vvdec::AccessUnit::new(access_unit);
+        au.cts = Some(timestamp_us);
+        au.is_random_access_point = true;
+        match self.decoder.decode::<&[u8], _>(au) {
+            Ok(Some(frame)) => self.push_frame(frame),
+            Ok(None) => Ok(()),
+            Err(error) if matches!(error, vvdec::Error::TryAgain) => Ok(()),
+            Err(error) => Err(PipelineError::Message(format!(
+                "VVdeC decode failed: {error}"
+            ))),
+        }
     }
 
     fn drain_decoded_frames(&mut self) -> Vec<CoreDecodedFrame> {
@@ -838,148 +1042,368 @@ fn decoded_yuv_to_rgb_frame(decoded: &DecodedYUV<'_>, timestamp_us: u64) -> Core
     CoreDecodedFrame::from_cpu_rgb24(width, height, timestamp_us, rgb)
 }
 
-fn ensure_ffmpeg_available(codec: FfmpegSoftwareCodec) -> Result<(), PipelineError> {
-    Command::new("ffmpeg")
-        .arg("-version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|error| {
-            PipelineError::Message(format!(
-                "{} executable not found for software {} decode: {error}",
-                codec.runtime_label(),
-                codec.label()
-            ))
-        })
-        .and_then(|status| {
-            if status.success() {
-                Ok(())
-            } else {
-                Err(PipelineError::Message(format!(
-                    "{} executable is not healthy for software {} decode",
-                    codec.runtime_label(),
-                    codec.label()
-                )))
+#[cfg(feature = "software-rust-h265")]
+fn rust_h265_worker(rx: std::sync::mpsc::Receiver<RustH265Request>, require_main10: bool) {
+    let mut decoder = rust_h265::Decoder::new();
+    let mut frame_index = 0_u64;
+    while let Ok(request) = rx.recv() {
+        match request {
+            RustH265Request::Push { access_unit, reply } => {
+                let _ = reply.send(decode_rust_h265_access_unit(
+                    &mut decoder,
+                    &access_unit,
+                    require_main10,
+                    &mut frame_index,
+                ));
             }
-        })
+            RustH265Request::Stop => break,
+        }
+    }
 }
 
-fn decode_first_ppm_frame_with_ffmpeg(
-    codec: FfmpegSoftwareCodec,
-    stream: &[u8],
-    frame_index: u64,
-) -> Result<CoreDecodedFrame, PipelineError> {
-    let mut child = Command::new("ffmpeg")
-        .args([
-            "-v",
-            "error",
-            "-f",
-            codec.input_format(),
-            "-i",
-            "pipe:0",
-            "-frames:v",
-            "1",
-            "-f",
-            "image2pipe",
-            "-vcodec",
-            "ppm",
-            "pipe:1",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| {
-            PipelineError::Message(format!(
-                "spawn ffmpeg software {} decoder failed: {error}",
-                codec.label()
-            ))
-        })?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write;
-        stdin.write_all(stream).map_err(|error| {
-            PipelineError::Message(format!(
-                "write {} stream to ffmpeg decoder failed: {error}",
-                codec.label()
-            ))
-        })?;
+#[cfg(feature = "software-rust-h265")]
+fn decode_rust_h265_access_unit(
+    decoder: &mut rust_h265::Decoder,
+    access_unit: &[u8],
+    require_main10: bool,
+    frame_index: &mut u64,
+) -> Result<Vec<CoreDecodedFrame>, PipelineError> {
+    let nals = rust_h265::parse_annex_b(access_unit);
+    if nals.is_empty() {
+        return Err(PipelineError::Message(
+            "rust_h265 requires Annex B HEVC access units".to_string(),
+        ));
     }
 
-    let output = child.wait_with_output().map_err(|error| {
-        PipelineError::Message(format!(
-            "wait for ffmpeg software {} decoder failed: {error}",
-            codec.label()
-        ))
-    })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut decoded_frames = Vec::new();
+    for nal in nals {
+        if let Some(frame) = decoder
+            .decode_nal(&nal)
+            .map_err(|error| PipelineError::Message(format!("rust_h265 decode failed: {error}")))?
+        {
+            if require_main10 && frame.bit_depth < 10 {
+                return Err(PipelineError::Message(format!(
+                    "rust_h265 decoded HEVC frame is {}-bit, expected Main10",
+                    frame.bit_depth
+                )));
+            }
+            decoded_frames.push(rust_h265_frame_to_rgb_frame(
+                &frame,
+                (*frame_index).saturating_mul(16_667),
+            )?);
+            *frame_index = (*frame_index).saturating_add(1);
+        }
+    }
+    Ok(decoded_frames)
+}
+
+#[cfg(feature = "software-rust-h265")]
+fn rust_h265_frame_to_rgb_frame(
+    frame: &rust_h265::Frame,
+    timestamp_us: u64,
+) -> Result<CoreDecodedFrame, PipelineError> {
+    let width = frame.width as usize;
+    let height = frame.height as usize;
+    let chroma_width = width.div_ceil(2);
+    let chroma_height = height.div_ceil(2);
+    let bit_depth = frame.bit_depth as usize;
+    let expected_y = width
+        .checked_mul(height)
+        .ok_or_else(|| PipelineError::Message("HEVC frame dimensions overflow".to_string()))?;
+    let expected_uv = chroma_width
+        .checked_mul(chroma_height)
+        .ok_or_else(|| PipelineError::Message("HEVC chroma dimensions overflow".to_string()))?;
+    if frame.y.len() < expected_y || frame.u.len() < expected_uv || frame.v.len() < expected_uv {
         return Err(PipelineError::Message(format!(
-            "ffmpeg software {} decode failed: {}",
-            codec.label(),
-            stderr.trim()
+            "rust_h265 returned undersized HEVC planes: y={} u={} v={}, expected y>={expected_y} uv>={expected_uv}",
+            frame.y.len(),
+            frame.u.len(),
+            frame.v.len()
         )));
     }
 
-    parse_ppm_frame(&output.stdout, frame_index.saturating_mul(16_667)).ok_or_else(|| {
-        PipelineError::Message(format!(
-            "ffmpeg software {} decoder produced no PPM frame",
-            codec.label()
-        ))
-    })
-}
+    let rgb = match (&frame.y, &frame.u, &frame.v) {
+        (rust_h265::PixelData::U8(y), rust_h265::PixelData::U8(u), rust_h265::PixelData::U8(v)) => {
+            planar_yuv_to_rgb24(PlanarYuvFrame {
+                width,
+                height,
+                layout: SoftwareYuvLayout::I420,
+                bit_depth,
+                bytes_per_sample: 1,
+                y,
+                y_stride: width,
+                u,
+                u_stride: chroma_width,
+                v,
+                v_stride: chroma_width,
+                full_range: false,
+            })?
+        }
+        (
+            rust_h265::PixelData::U16(y),
+            rust_h265::PixelData::U16(u),
+            rust_h265::PixelData::U16(v),
+        ) => {
+            let y_bytes = u16_samples_to_le_bytes(y);
+            let u_bytes = u16_samples_to_le_bytes(u);
+            let v_bytes = u16_samples_to_le_bytes(v);
+            planar_yuv_to_rgb24(PlanarYuvFrame {
+                width,
+                height,
+                layout: SoftwareYuvLayout::I420,
+                bit_depth,
+                bytes_per_sample: 2,
+                y: &y_bytes,
+                y_stride: width * 2,
+                u: &u_bytes,
+                u_stride: chroma_width * 2,
+                v: &v_bytes,
+                v_stride: chroma_width * 2,
+                full_range: false,
+            })?
+        }
+        _ => {
+            return Err(PipelineError::Message(
+                "rust_h265 returned mixed bit-depth planes".to_string(),
+            ))
+        }
+    };
 
-fn parse_ppm_frame(bytes: &[u8], timestamp_us: u64) -> Option<CoreDecodedFrame> {
-    let mut offset = 0usize;
-    let magic = next_ppm_token(bytes, &mut offset)?;
-    if magic != b"P6" {
-        return None;
-    }
-    let width = std::str::from_utf8(next_ppm_token(bytes, &mut offset)?)
-        .ok()?
-        .parse::<usize>()
-        .ok()?;
-    let height = std::str::from_utf8(next_ppm_token(bytes, &mut offset)?)
-        .ok()?
-        .parse::<usize>()
-        .ok()?;
-    let max = std::str::from_utf8(next_ppm_token(bytes, &mut offset)?)
-        .ok()?
-        .parse::<usize>()
-        .ok()?;
-    if max != 255 {
-        return None;
-    }
-    while offset < bytes.len() && bytes[offset].is_ascii_whitespace() {
-        offset += 1;
-    }
-    let frame_len = width.checked_mul(height)?.checked_mul(3)?;
-    let frame = bytes.get(offset..offset.checked_add(frame_len)?)?.to_vec();
-    Some(CoreDecodedFrame::from_cpu_rgb24(
+    Ok(CoreDecodedFrame::from_cpu_rgb24(
         width,
         height,
         timestamp_us,
-        frame,
+        rgb,
     ))
 }
 
-fn next_ppm_token<'a>(bytes: &'a [u8], offset: &mut usize) -> Option<&'a [u8]> {
-    while *offset < bytes.len() {
-        if bytes[*offset] == b'#' {
-            while *offset < bytes.len() && bytes[*offset] != b'\n' {
-                *offset += 1;
-            }
-        } else if bytes[*offset].is_ascii_whitespace() {
-            *offset += 1;
-        } else {
-            break;
+#[cfg(feature = "software-dav1d")]
+fn dav1d_frame_to_rgb_frame(
+    frame: &shiguredo_dav1d::DecodedFrame,
+    timestamp_us: u64,
+) -> Result<CoreDecodedFrame, PipelineError> {
+    let layout = match frame.pixel_layout() {
+        shiguredo_dav1d::PixelLayout::I400 => SoftwareYuvLayout::I400,
+        shiguredo_dav1d::PixelLayout::I420 => SoftwareYuvLayout::I420,
+        shiguredo_dav1d::PixelLayout::I422 => SoftwareYuvLayout::I422,
+        shiguredo_dav1d::PixelLayout::I444 => SoftwareYuvLayout::I444,
+        shiguredo_dav1d::PixelLayout::Reserved => {
+            return Err(PipelineError::Message(
+                "dav1d returned a reserved AV1 pixel layout".to_string(),
+            ))
+        }
+    };
+    let width = frame.width();
+    let height = frame.height();
+    let bit_depth = frame.bit_depth();
+    let bytes_per_sample = bytes_per_sample_for_bit_depth(bit_depth);
+    let rgb = planar_yuv_to_rgb24(PlanarYuvFrame {
+        width,
+        height,
+        layout,
+        bit_depth,
+        bytes_per_sample,
+        y: frame.y_plane(),
+        y_stride: frame.y_stride(),
+        u: frame.u_plane(),
+        u_stride: frame.u_stride(),
+        v: frame.v_plane(),
+        v_stride: frame.v_stride(),
+        full_range: matches!(frame.color_range(), Some(shiguredo_dav1d::ColorRange::Full)),
+    })?;
+    Ok(CoreDecodedFrame::from_cpu_rgb24(
+        width,
+        height,
+        timestamp_us,
+        rgb,
+    ))
+}
+
+#[cfg(feature = "software-vvdec")]
+fn vvdec_frame_to_rgb_frame(
+    frame: &vvdec::Frame,
+    timestamp_us: u64,
+) -> Result<CoreDecodedFrame, PipelineError> {
+    let layout = match frame.color_format() {
+        vvdec::ColorFormat::Yuv400Planar => SoftwareYuvLayout::I400,
+        vvdec::ColorFormat::Yuv420Planar => SoftwareYuvLayout::I420,
+        vvdec::ColorFormat::Yuv422Planar => SoftwareYuvLayout::I422,
+        vvdec::ColorFormat::Yuv444Planar => SoftwareYuvLayout::I444,
+        other => {
+            return Err(PipelineError::Message(format!(
+                "VVdeC returned unsupported color format: {other:?}"
+            )))
+        }
+    };
+    let y = frame.plane(vvdec::PlaneComponent::Y).ok_or_else(|| {
+        PipelineError::Message("VVdeC decoded frame is missing Y plane".to_string())
+    })?;
+    let u = frame.plane(vvdec::PlaneComponent::U);
+    let v = frame.plane(vvdec::PlaneComponent::V);
+    let bit_depth = frame.bit_depth() as usize;
+    let bytes_per_sample = y.bytes_per_sample() as usize;
+    let rgb = planar_yuv_to_rgb24(PlanarYuvFrame {
+        width: frame.width() as usize,
+        height: frame.height() as usize,
+        layout,
+        bit_depth,
+        bytes_per_sample,
+        y: y.as_ref(),
+        y_stride: y.stride() as usize,
+        u: u.as_ref().map(|plane| plane.as_ref()).unwrap_or(&[]),
+        u_stride: u.as_ref().map(|plane| plane.stride() as usize).unwrap_or(0),
+        v: v.as_ref().map(|plane| plane.as_ref()).unwrap_or(&[]),
+        v_stride: v.as_ref().map(|plane| plane.stride() as usize).unwrap_or(0),
+        full_range: false,
+    })?;
+    Ok(CoreDecodedFrame::from_cpu_rgb24(
+        frame.width() as usize,
+        frame.height() as usize,
+        timestamp_us,
+        rgb,
+    ))
+}
+
+fn bytes_per_sample_for_bit_depth(bit_depth: usize) -> usize {
+    if bit_depth > 8 {
+        2
+    } else {
+        1
+    }
+}
+
+#[cfg(feature = "software-rust-h265")]
+fn u16_samples_to_le_bytes(samples: &[u16]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(samples.len() * 2);
+    for sample in samples {
+        bytes.extend_from_slice(&sample.to_le_bytes());
+    }
+    bytes
+}
+
+fn planar_yuv_to_rgb24(frame: PlanarYuvFrame<'_>) -> Result<Vec<u8>, PipelineError> {
+    if frame.width == 0 || frame.height == 0 {
+        return Err(PipelineError::Message(
+            "decoded YUV frame has empty dimensions".to_string(),
+        ));
+    }
+    if frame.bit_depth == 0 || frame.bit_depth > 16 {
+        return Err(PipelineError::Message(format!(
+            "unsupported decoded YUV bit depth: {}",
+            frame.bit_depth
+        )));
+    }
+
+    let mut rgb = vec![0_u8; frame.width * frame.height * 3];
+    for y in 0..frame.height {
+        for x in 0..frame.width {
+            let yy = read_yuv_sample(
+                frame.y,
+                frame.y_stride,
+                x,
+                y,
+                frame.bytes_per_sample,
+                frame.bit_depth,
+            )?;
+            let (cx, cy) = chroma_coordinates(frame.layout, x, y);
+            let uu = if matches!(frame.layout, SoftwareYuvLayout::I400) {
+                128
+            } else {
+                read_yuv_sample(
+                    frame.u,
+                    frame.u_stride,
+                    cx,
+                    cy,
+                    frame.bytes_per_sample,
+                    frame.bit_depth,
+                )?
+            };
+            let vv = if matches!(frame.layout, SoftwareYuvLayout::I400) {
+                128
+            } else {
+                read_yuv_sample(
+                    frame.v,
+                    frame.v_stride,
+                    cx,
+                    cy,
+                    frame.bytes_per_sample,
+                    frame.bit_depth,
+                )?
+            };
+            let [r, g, b] = yuv_to_rgb8(yy, uu, vv, frame.full_range);
+            let offset = (y * frame.width + x) * 3;
+            rgb[offset] = r;
+            rgb[offset + 1] = g;
+            rgb[offset + 2] = b;
         }
     }
-    let start = *offset;
-    while *offset < bytes.len() && !bytes[*offset].is_ascii_whitespace() {
-        *offset += 1;
+    Ok(rgb)
+}
+
+fn chroma_coordinates(layout: SoftwareYuvLayout, x: usize, y: usize) -> (usize, usize) {
+    match layout {
+        SoftwareYuvLayout::I400 | SoftwareYuvLayout::I444 => (x, y),
+        SoftwareYuvLayout::I420 => (x / 2, y / 2),
+        SoftwareYuvLayout::I422 => (x / 2, y),
     }
-    (start < *offset).then_some(&bytes[start..*offset])
+}
+
+fn read_yuv_sample(
+    plane: &[u8],
+    stride: usize,
+    x: usize,
+    y: usize,
+    bytes_per_sample: usize,
+    bit_depth: usize,
+) -> Result<u8, PipelineError> {
+    let byte_offset = y
+        .checked_mul(stride)
+        .and_then(|row| row.checked_add(x.checked_mul(bytes_per_sample)?))
+        .ok_or_else(|| PipelineError::Message("decoded YUV plane offset overflow".to_string()))?;
+    let sample = match bytes_per_sample {
+        1 => *plane.get(byte_offset).ok_or_else(|| {
+            PipelineError::Message("decoded YUV 8-bit sample out of bounds".to_string())
+        })? as u16,
+        2 => {
+            let lo = *plane.get(byte_offset).ok_or_else(|| {
+                PipelineError::Message("decoded YUV 16-bit sample out of bounds".to_string())
+            })?;
+            let hi = *plane.get(byte_offset + 1).ok_or_else(|| {
+                PipelineError::Message("decoded YUV 16-bit sample out of bounds".to_string())
+            })?;
+            u16::from_le_bytes([lo, hi])
+        }
+        other => {
+            return Err(PipelineError::Message(format!(
+                "unsupported decoded YUV bytes-per-sample: {other}"
+            )))
+        }
+    };
+    if bit_depth > 8 {
+        Ok((sample >> (bit_depth - 8)).min(255) as u8)
+    } else {
+        Ok(sample.min(255) as u8)
+    }
+}
+
+fn yuv_to_rgb8(y: u8, u: u8, v: u8, full_range: bool) -> [u8; 3] {
+    let c = if full_range {
+        y as i32
+    } else {
+        (y as i32 - 16).max(0)
+    };
+    let d = u as i32 - 128;
+    let e = v as i32 - 128;
+    let luma = if full_range { 256 * c } else { 298 * c };
+    [
+        clamp_u8((luma + 409 * e + 128) >> 8),
+        clamp_u8((luma - 100 * d - 208 * e + 128) >> 8),
+        clamp_u8((luma + 516 * d + 128) >> 8),
+    ]
+}
+
+fn clamp_u8(value: i32) -> u8 {
+    value.clamp(0, 255) as u8
 }
 
 fn parse_h264_dimensions(access_unit: &[u8]) -> Result<Option<(usize, usize)>, PipelineError> {
@@ -1564,6 +1988,30 @@ mod tests {
 
         assert_eq!(descriptor.codec, CodecKind::Hevc);
         assert_eq!(descriptor.output_formats, D3D11_TEXTURE_OUTPUTS);
+    }
+
+    #[cfg(feature = "software-rust-h265")]
+    #[test]
+    fn rust_h265_main10_frame_converts_to_rgb24() {
+        let frame = rust_h265::Frame {
+            y: rust_h265::PixelData::U16(vec![512; 4]),
+            u: rust_h265::PixelData::U16(vec![512; 1]),
+            v: rust_h265::PixelData::U16(vec![512; 1]),
+            width: 2,
+            height: 2,
+            pic_order_cnt: 0,
+            bit_depth: 10,
+        };
+
+        let decoded = rust_h265_frame_to_rgb_frame(&frame, 42).expect("convert Main10 HEVC frame");
+
+        assert_eq!(decoded.width, 2);
+        assert_eq!(decoded.height, 2);
+        assert_eq!(decoded.timestamp_us, 42);
+        match decoded.data {
+            DecodedFrameData::CpuRgb24(rgb) => assert_eq!(rgb.len(), 12),
+            other => panic!("expected RGB24 decoded frame, got {other:?}"),
+        }
     }
 
     #[cfg(target_os = "linux")]

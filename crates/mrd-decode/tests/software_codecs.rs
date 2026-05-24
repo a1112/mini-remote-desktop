@@ -20,33 +20,24 @@ fn software_hevc_av1_and_vvc_descriptors_are_exposed_as_rgb24_decoders() {
 }
 
 #[test]
-fn software_hevc_creation_is_runtime_probed_not_compile_gated() {
-    match create_decoder("software_hevc") {
-        Ok(mut decoder) => {
-            let result = decoder.push_access_unit(&[0, 1, 2, 3]);
-            assert!(result.is_err());
-        }
-        Err(error) => {
-            let message = error.to_string().to_ascii_lowercase();
-            assert!(
-                message.contains("ffmpeg"),
-                "software HEVC unavailable should name ffmpeg: {message}"
-            );
-        }
-    }
-}
-
-#[test]
-fn software_vvc_aliases_report_ffmpeg_or_vvdec_runtime_boundary() {
-    let error = create_decoder("software_h266")
-        .err()
-        .map(|error| error.to_string());
-
-    if let Some(message) = error {
-        let lower = message.to_ascii_lowercase();
+fn production_software_codecs_do_not_depend_on_ffmpeg() {
+    for (id, expected_runtime) in [
+        ("software_hevc", "rust_h265"),
+        ("software_hevc_main10", "rust_h265"),
+        ("software_av1", "dav1d"),
+        ("software_h266", "vvdec"),
+    ] {
+        let error = create_decoder(id)
+            .err()
+            .unwrap_or_else(|| panic!("{id} unexpectedly available in the default test build"));
+        let message = error.to_string().to_ascii_lowercase();
         assert!(
-            lower.contains("ffmpeg") || lower.contains("vvdec"),
-            "software VVC unavailable should name the external runtime: {message}"
+            !message.contains("ffmpeg"),
+            "{id} unavailable message must not mention ffmpeg: {message}"
+        );
+        assert!(
+            message.contains(expected_runtime),
+            "{id} unavailable message should name {expected_runtime}: {message}"
         );
     }
 }
