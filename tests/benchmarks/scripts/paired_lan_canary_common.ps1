@@ -115,12 +115,16 @@ function New-LocalDualProcessTauriEnvPlan {
   param(
     [Parameter(Mandatory = $true)][string]$OutputRoot,
     [Parameter(Mandatory = $true)][string]$ServiceExe,
+    [string]$WorkspaceTargetDir = "",
     [switch]$NoBuild
   )
 
   $envPlan = [ordered]@{
     MRD_SERVICE_PREBUILT_EXE = $ServiceExe
     MRD_SERVICE_EXE = $ServiceExe
+  }
+  if ($WorkspaceTargetDir.Trim()) {
+    $envPlan.CARGO_TARGET_DIR = $WorkspaceTargetDir.Trim()
   }
 
   [pscustomobject]$envPlan

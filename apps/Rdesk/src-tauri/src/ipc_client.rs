@@ -8,10 +8,12 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 /// Global IPC client for communicating with mrd-service
+#[allow(dead_code)]
 pub struct ServiceClient {
     client: Arc<Mutex<IpcClient>>,
 }
 
+#[allow(dead_code)]
 impl ServiceClient {
     pub fn new() -> Self {
         Self {

@@ -3,6 +3,12 @@
 //! This module provides the test orchestrator that manages test scenarios,
 //! runs, metrics collection, and artifact storage.
 
+#![allow(
+    clippy::derivable_impls,
+    clippy::needless_return,
+    clippy::unwrap_or_default
+)]
+
 use anyhow::Result;
 use base64::Engine;
 use image::{codecs::png::PngEncoder, ColorType, ImageEncoder};
@@ -2291,6 +2297,7 @@ impl TestOrchestrator {
     }
 
     /// Update run metrics from harness
+    #[allow(dead_code)]
     pub fn update_run_metrics(&self, run_id: &str, metrics: &HarnessMetrics) {
         let mut runs = self.runs.lock().unwrap();
         if let Some(run) = runs.get_mut(run_id) {
@@ -2466,6 +2473,7 @@ impl TestOrchestrator {
     }
 
     /// Get current harness chain
+    #[allow(dead_code)]
     pub fn get_harness_chain(&self) -> Option<TestChain> {
         self.current_harness_chain.lock().unwrap().clone()
     }

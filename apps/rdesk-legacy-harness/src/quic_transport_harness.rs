@@ -138,13 +138,13 @@ impl FrameCapture for FakeCapture {
             chunk[3] = 255;
         }
 
-        Ok(CapturedFrame {
-            width: 16,
-            height: 16,
-            pixel_format: FramePixelFormat::Bgra32,
-            timestamp_us: self.tick as u64 * 33_000,
+        Ok(CapturedFrame::from_cpu(
+            16,
+            16,
+            FramePixelFormat::Bgra32,
+            self.tick as u64 * 33_000,
             data,
-        })
+        ))
     }
 }
 
@@ -154,6 +154,7 @@ struct FrameProgressSample {
     observed_samples: usize,
 }
 
+#[allow(dead_code)]
 pub(crate) struct QuicBenchmarkOutcome {
     pub sender_probe: PipelineProbeSnapshot,
     pub receiver_probe: PipelineProbeSnapshot,
@@ -370,7 +371,7 @@ impl QuicHostedPairHarness {
                     frame.is_keyframe,
                 );
                 for frame in frames {
-                    let bytes = frame.data.len();
+                    let bytes = frame.cpu_bytes().map_or(0, |data| data.len());
                     sink.lock().expect("lock sink").ingest_frame_for_source(
                         session_id.clone(),
                         DEFAULT_SOURCE_ID.to_string(),
@@ -491,6 +492,7 @@ fn sync_reassembly_probe(
     dropped
 }
 
+#[allow(dead_code)]
 pub(crate) async fn run_quic_benchmark_pipeline(
     session_id: SessionId,
     width: usize,
@@ -554,7 +556,7 @@ pub(crate) async fn run_quic_benchmark_pipeline(
 }
 
 enum QuicBenchmarkEncoder {
-    OpenH264(OpenH264Encoder),
+    OpenH264(Box<OpenH264Encoder>),
     Nvenc(NvencH264Encoder),
 }
 
@@ -586,12 +588,12 @@ fn create_test_encoder(
         "nvenc_hq_p5" => Ok(QuicBenchmarkEncoder::Nvenc(
             NvencH264Encoder::new_high_quality_p5(width, height, fps)?,
         )),
-        "openh264" => Ok(QuicBenchmarkEncoder::OpenH264(OpenH264Encoder::new(
-            width, height, fps,
-        )?)),
-        "openh264_speed" => Ok(QuicBenchmarkEncoder::OpenH264(OpenH264Encoder::new_speed(
-            width, height, fps,
-        )?)),
+        "openh264" => Ok(QuicBenchmarkEncoder::OpenH264(Box::new(
+            OpenH264Encoder::new(width, height, fps)?,
+        ))),
+        "openh264_speed" => Ok(QuicBenchmarkEncoder::OpenH264(Box::new(
+            OpenH264Encoder::new_speed(width, height, fps)?,
+        ))),
         other => Err(PipelineError::message(format!(
             "unsupported test encoder backend: {other}"
         ))),

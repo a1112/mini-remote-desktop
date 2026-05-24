@@ -153,7 +153,7 @@ async fn main() -> Result<()> {
                         warn!(error = %e, peer = %addr, "failed to handle heartbeat");
                     } else {
                         let count = msg_count.fetch_add(1, Ordering::Relaxed) + 1;
-                        if count % 100 == 0 {
+                        if count.is_multiple_of(100) {
                             debug!(count, "heartbeats processed");
                         }
                     }

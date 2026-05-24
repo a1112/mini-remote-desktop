@@ -261,29 +261,28 @@ fn list_windows_winrt_display_capture_sources() -> Vec<CaptureSource> {
         return Vec::new();
     };
 
-    let mut sources = Vec::with_capacity(count.saturating_mul(2));
+    let mut dimensions = Vec::with_capacity(count);
     for index in 0..count {
         let Ok(capture) = mrd_capture_winrt::WinrtCapture::from_monitor_index(index as u32) else {
             continue;
         };
-        let width = capture.width() as u32;
-        let height = capture.height() as u32;
+        dimensions.push((
+            index as u32,
+            capture.width() as u32,
+            capture.height() as u32,
+        ));
+    }
+
+    windows_winrt_display_sources_from_indexed_dimensions(dimensions)
+}
+
+#[cfg(windows)]
+fn windows_winrt_display_sources_from_indexed_dimensions(
+    dimensions: Vec<(u32, u32, u32)>,
+) -> Vec<CaptureSource> {
+    let mut sources = Vec::with_capacity(dimensions.len());
+    for (index, width, height) in dimensions {
         let display_number = index + 1;
-        sources.push(CaptureSource {
-            id: format!("windows:display-shared:{index}"),
-            platform: "windows".to_string(),
-            source_kind: "display_shared".to_string(),
-            title: format!("Display {display_number} (D3D11 shared copy)"),
-            class_name: "WinRTMonitorShared".to_string(),
-            width,
-            height,
-            process_id: 0,
-            app_name: Some("Display".to_string()),
-            bundle_identifier: None,
-            preview_data_url: None,
-            preview_width: None,
-            preview_height: None,
-        });
         sources.push(CaptureSource {
             id: format!("windows:display:{index}"),
             platform: "windows".to_string(),
@@ -302,6 +301,19 @@ fn list_windows_winrt_display_capture_sources() -> Vec<CaptureSource> {
     }
 
     sources
+}
+
+#[cfg(all(windows, test))]
+fn windows_winrt_display_sources_from_dimensions(
+    dimensions: Vec<(u32, u32)>,
+) -> Vec<CaptureSource> {
+    windows_winrt_display_sources_from_indexed_dimensions(
+        dimensions
+            .into_iter()
+            .enumerate()
+            .map(|(index, (width, height))| (index as u32, width, height))
+            .collect(),
+    )
 }
 
 #[cfg(windows)]
@@ -831,6 +843,30 @@ mod tests {
         let selected = super::preferred_capture_source(&sources).expect("selected source");
 
         assert_eq!(selected.id, "windows:display:0");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_winrt_fallback_does_not_advertise_dxgi_shared_sources() {
+        let sources = super::windows_winrt_display_sources_from_dimensions(vec![(1920, 1080)]);
+
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].id, "windows:display:0");
+        assert_eq!(sources[0].source_kind, "display");
+        assert!(sources
+            .iter()
+            .all(|source| source.source_kind != "display_shared"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_winrt_fallback_preserves_sparse_monitor_indices() {
+        let sources =
+            super::windows_winrt_display_sources_from_indexed_dimensions(vec![(2, 2560, 1440)]);
+
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].id, "windows:display:2");
+        assert_eq!(sources[0].title, "Display 3 (full screen copy)");
     }
 
     #[test]

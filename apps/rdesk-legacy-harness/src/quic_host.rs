@@ -8,7 +8,7 @@ use std::{
 };
 
 use mrd_capture_dxgi::DxgiDesktopCapture;
-use mrd_decode::{PixelFormat, VideoDecoder};
+use mrd_decode::VideoDecoder;
 use mrd_encode_nvenc::NvencH264Encoder;
 use mrd_encode_openh264::OpenH264Encoder;
 use mrd_observability::{
@@ -87,20 +87,11 @@ impl HostedQuicPeer {
     }
 }
 
+#[derive(Default)]
 pub struct QuicHost {
     sessions: HashMap<SessionId, HostedQuicPeer>,
     frame_sink: Option<Arc<Mutex<DecodedFrameSink>>>,
     probe_registry: ProbeRegistry,
-}
-
-impl Default for QuicHost {
-    fn default() -> Self {
-        Self {
-            sessions: HashMap::new(),
-            frame_sink: None,
-            probe_registry: ProbeRegistry::default(),
-        }
-    }
 }
 
 impl QuicHost {
@@ -796,7 +787,7 @@ fn run_blocking_sender_loop<C, E>(
 }
 
 enum QuicHostEncoder {
-    OpenH264(OpenH264Encoder),
+    OpenH264(Box<OpenH264Encoder>),
     Nvenc(NvencH264Encoder),
 }
 
@@ -828,12 +819,12 @@ fn create_test_encoder(
         "nvenc_hq_p5" => Ok(QuicHostEncoder::Nvenc(
             NvencH264Encoder::new_high_quality_p5(width, height, fps)?,
         )),
-        "openh264" => Ok(QuicHostEncoder::OpenH264(OpenH264Encoder::new(
+        "openh264" => Ok(QuicHostEncoder::OpenH264(Box::new(OpenH264Encoder::new(
             width, height, fps,
-        )?)),
-        "openh264_speed" => Ok(QuicHostEncoder::OpenH264(OpenH264Encoder::new_speed(
-            width, height, fps,
-        )?)),
+        )?))),
+        "openh264_speed" => Ok(QuicHostEncoder::OpenH264(Box::new(
+            OpenH264Encoder::new_speed(width, height, fps)?,
+        ))),
         other => Err(PipelineError::message(format!(
             "unsupported quic host encoder backend: {other}"
         ))),

@@ -128,8 +128,10 @@ fn list_platform_display_modes(source_index: Option<u32>) -> Result<Vec<DisplayM
     let index = source_index.unwrap_or(0);
     let device = display_device(index)?;
     let current = unsafe {
-        let mut value = DEVMODEW::default();
-        value.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+        let mut value = DEVMODEW {
+            dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+            ..Default::default()
+        };
         if !EnumDisplaySettingsW(
             PCWSTR(device.DeviceName.as_ptr()),
             ENUM_CURRENT_SETTINGS,
@@ -146,8 +148,10 @@ fn list_platform_display_modes(source_index: Option<u32>) -> Result<Vec<DisplayM
     let mut modes = BTreeMap::<(u32, u32, u32, u32), DisplayMode>::new();
     let mut mode_index = 0;
     loop {
-        let mut dev_mode = DEVMODEW::default();
-        dev_mode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+        let mut dev_mode = DEVMODEW {
+            dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+            ..Default::default()
+        };
         let ok = unsafe {
             EnumDisplaySettingsW(
                 PCWSTR(device.DeviceName.as_ptr()),
@@ -198,17 +202,29 @@ fn list_platform_display_modes(source_index: Option<u32>) -> Result<Vec<DisplayM
 
 #[cfg(windows)]
 fn list_current_platform_display_modes() -> Result<Vec<DisplayMode>> {
+    collect_current_platform_display_modes_by_index(current_platform_display_mode)
+}
+
+fn collect_current_platform_display_modes_by_index(
+    mut current_mode: impl FnMut(u32) -> Result<DisplayMode>,
+) -> Result<Vec<DisplayMode>> {
     let mut modes = Vec::new();
+    let mut first_error = None;
     for source_index in 0..32 {
-        match current_platform_display_mode(source_index) {
+        match current_mode(source_index) {
             Ok(mode) => modes.push(mode),
-            Err(_) if source_index == 0 => {
-                return Err(anyhow::anyhow!("no Windows displays found"))
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
             }
-            Err(_) => break,
         }
     }
-    Ok(modes)
+    if modes.is_empty() {
+        Err(first_error.unwrap_or_else(|| anyhow::anyhow!("no Windows displays found")))
+    } else {
+        Ok(modes)
+    }
 }
 
 #[cfg(windows)]
@@ -229,13 +245,15 @@ fn set_platform_display_mode(source_index: u32, mode: &DisplayMode) -> Result<Di
     };
 
     let device = display_device(source_index)?;
-    let mut dev_mode = DEVMODEW::default();
-    dev_mode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
-    dev_mode.dmPelsWidth = mode.width;
-    dev_mode.dmPelsHeight = mode.height;
-    dev_mode.dmDisplayFrequency = mode.refresh_hz;
-    dev_mode.dmBitsPerPel = mode.bit_depth.unwrap_or(32);
-    dev_mode.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY | DM_BITSPERPEL;
+    let dev_mode = DEVMODEW {
+        dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+        dmPelsWidth: mode.width,
+        dmPelsHeight: mode.height,
+        dmDisplayFrequency: mode.refresh_hz,
+        dmBitsPerPel: mode.bit_depth.unwrap_or(32),
+        dmFields: DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY | DM_BITSPERPEL,
+        ..Default::default()
+    };
 
     let result = unsafe {
         ChangeDisplaySettingsExW(
@@ -268,8 +286,10 @@ fn display_device(source_index: u32) -> Result<windows::Win32::Graphics::Gdi::DI
     use windows::core::PCWSTR;
     use windows::Win32::Graphics::Gdi::{EnumDisplayDevicesW, DISPLAY_DEVICEW};
 
-    let mut device = DISPLAY_DEVICEW::default();
-    device.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
+    let mut device = DISPLAY_DEVICEW {
+        cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+        ..Default::default()
+    };
     let ok = unsafe { EnumDisplayDevicesW(PCWSTR::null(), source_index, &mut device, 0).as_bool() };
     if !ok {
         anyhow::bail!("Windows display device not found for index {source_index}");
@@ -368,6 +388,27 @@ mod tests {
         ];
 
         assert_eq!(select_highest_current_refresh_hz(&modes), Some(180));
+    }
+
+    #[test]
+    fn current_display_mode_collection_skips_sparse_or_unavailable_indices() {
+        let mut results = vec![
+            Ok(mode("display-0", 1920, 1080, 60, true)),
+            Err(anyhow::anyhow!("display 1 unavailable")),
+            Ok(mode("display-2", 2560, 1440, 144, true)),
+        ]
+        .into_iter();
+
+        let modes = collect_current_platform_display_modes_by_index(|_| {
+            results
+                .next()
+                .unwrap_or_else(|| Err(anyhow::anyhow!("end of synthetic device list")))
+        })
+        .unwrap();
+
+        assert_eq!(modes.len(), 2);
+        assert_eq!(modes[0].id, "display-0");
+        assert_eq!(modes[1].id, "display-2");
     }
 
     #[test]

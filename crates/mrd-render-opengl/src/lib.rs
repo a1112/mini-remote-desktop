@@ -508,7 +508,7 @@ unsafe fn load_wgl_proc<T: Copy>(name: &'static [u8]) -> Result<T, RenderError> 
         ))
     })?;
     let addr = proc as *const () as usize;
-    if matches!(addr, 0 | 1 | 2 | 3) || addr == usize::MAX {
+    if matches!(addr, 0..=3) || addr == usize::MAX {
         return Err(RenderError::Message(format!(
             "OpenGL extension function returned invalid pointer: {}",
             String::from_utf8_lossy(&name[..name.len().saturating_sub(1)])

@@ -1,4 +1,4 @@
-/// RGB24 to BGRA conversion utilities
+//! RGB24 to BGRA conversion utilities
 
 /// Converts RGB24 to BGRA32 using optimized methods
 ///

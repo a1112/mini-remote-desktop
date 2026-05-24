@@ -53,6 +53,7 @@ pub struct SurfaceSourceBindingResponse {
     pub source_id: String,
 }
 
+#[derive(Default)]
 pub struct RenderHost {
     renderers: HashMap<SessionId, HashMap<String, BoxedRenderer>>,
     surface_sources: HashMap<SessionId, HashMap<String, String>>,
@@ -264,17 +265,6 @@ impl RenderHost {
     }
 }
 
-impl Default for RenderHost {
-    fn default() -> Self {
-        Self {
-            renderers: HashMap::new(),
-            surface_sources: HashMap::new(),
-            frame_sink: None,
-            probe_registry: None,
-        }
-    }
-}
-
 fn decoded_frame_snapshot_response(
     snapshot: &crate::frame_sink::DecodedFrameSnapshot,
 ) -> DecodedFrameSnapshotResponse {
@@ -401,7 +391,6 @@ fn renderer_snapshot_response(snapshot: RendererSnapshot) -> RendererSnapshotRes
 mod tests {
     use super::{RenderHost, SurfaceSourceBindingResponse};
     use crate::frame_sink::{DecodedFrameSink, DEFAULT_SOURCE_ID};
-    use mrd_decode::PixelFormat;
     use mrd_pipeline_core::DecodedFrame;
     use mrd_proto::SessionId;
 

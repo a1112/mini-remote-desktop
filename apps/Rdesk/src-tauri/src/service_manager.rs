@@ -100,10 +100,10 @@ impl ServiceManager {
         use mrd_ipc::client::IpcClient;
 
         let mut client = IpcClient::new();
-        match client.send_request(IpcRequest::ServiceHealth).await {
-            Ok(IpcResponse::ServiceHealth { .. }) => true,
-            _ => false,
-        }
+        matches!(
+            client.send_request(IpcRequest::ServiceHealth).await,
+            Ok(IpcResponse::ServiceHealth { .. })
+        )
     }
 
     /// Wait for service to be healthy (with timeout)
@@ -127,6 +127,7 @@ impl ServiceManager {
     }
 
     /// Get the bootstrap child PID if we bootstrapped
+    #[allow(dead_code)]
     pub async fn bootstrap_pid(&self) -> Option<u32> {
         if !self.did_bootstrap().await {
             return None;

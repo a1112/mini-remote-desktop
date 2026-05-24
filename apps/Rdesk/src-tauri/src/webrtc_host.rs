@@ -109,6 +109,7 @@ impl Default for WebrtcHost {
     }
 }
 
+#[allow(dead_code)]
 impl WebrtcHost {
     pub fn with_frame_sink(frame_sink: Arc<Mutex<DecodedFrameSink>>) -> Self {
         Self::with_frame_sink_and_probes(frame_sink, ProbeRegistry::default())
@@ -676,6 +677,7 @@ fn fps_from_frame_interval(frame_interval: Duration) -> u32 {
     ((1000 / millis) as u32).clamp(1, 240)
 }
 
+#[allow(dead_code)]
 async fn wait_for_peer_connection_connected(
     pc: &Arc<RTCPeerConnection>,
     timeout: Duration,
@@ -690,6 +692,7 @@ async fn wait_for_peer_connection_connected(
     pc.connection_state() == RTCPeerConnectionState::Connected
 }
 
+#[allow(dead_code)]
 async fn ensure_recvonly_video_transceiver(pc: &Arc<RTCPeerConnection>) -> Result<(), String> {
     pc.add_transceiver_from_kind(
         RTPCodecType::Video,
@@ -1208,6 +1211,7 @@ fn run_blocking_encoded_access_unit_sender_loop(
     snapshot.lock().expect("lock host snapshot").sender_running = false;
 }
 
+#[allow(dead_code)]
 async fn run_embedded_sender_loop<C, E>(
     mut capture: C,
     mut encoder: E,
@@ -1299,6 +1303,8 @@ async fn run_embedded_sender_loop<C, E>(
     snapshot.lock().expect("lock host snapshot").sender_running = false;
 }
 
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
 fn run_blocking_desktop_sender_loop<C, E>(
     capture: &mut C,
     encoder: &mut E,
@@ -1420,7 +1426,7 @@ mod tests {
     fn ensure_rustls_crypto_provider() {
         static INSTALL: Once = Once::new();
         INSTALL.call_once(|| {
-            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+            let _ = rustls::crypto::ring::default_provider().install_default();
         });
     }
 

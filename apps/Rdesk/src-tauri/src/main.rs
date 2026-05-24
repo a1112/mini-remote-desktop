@@ -1,6 +1,7 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #![allow(unexpected_cfgs)]
+#![allow(clippy::incompatible_msrv)]
 
 mod app_settings;
 #[cfg(test)]
@@ -27,7 +28,6 @@ use app_settings::{
     default_settings_path, load_settings, save_settings, AppSettings, DecodePolicy,
 };
 use device_info::HardwareInfo;
-use mrd_ipc;
 use mrd_proto::SessionId;
 use remote_display_surface::{
     NativeRenderSurfaceSnapshot, NativeSurfaceRect, RemoteDisplaySurfaceManager,
@@ -45,7 +45,7 @@ use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     webview::PageLoadEvent,
-    AppHandle, Manager, WebviewWindow, WebviewWindowBuilder,
+    AppHandle, Manager, PhysicalPosition, WebviewWindow, WebviewWindowBuilder,
 };
 
 const TRAY_ICON_ID: &str = "rdesk-tray";
@@ -77,6 +77,7 @@ const LAN_E2E_PROFILE_HDR_ENABLED_ENV: &str = "MRD_LAN_E2E_PROFILE_HDR_ENABLED";
 const LAN_E2E_DISPLAY_MODE_POLICY_ENV: &str = "MRD_LAN_E2E_DISPLAY_MODE_POLICY";
 const LAN_E2E_CAPTURE_SOURCE_ID_ENV: &str = "MRD_LAN_E2E_CAPTURE_SOURCE_ID";
 const LAN_E2E_CAPTURE_SOURCE_KIND_ENV: &str = "MRD_LAN_E2E_CAPTURE_SOURCE_KIND";
+const LAN_E2E_RENDER_DISPLAY_SOURCE_ID_ENV: &str = "MRD_LAN_E2E_RENDER_DISPLAY_SOURCE_ID";
 const LAN_E2E_EXPECTED_PEER_BUILD_ID_ENV: &str = "MRD_LAN_E2E_EXPECTED_PEER_BUILD_ID";
 const LAN_E2E_RENDER_PROFILE_CAP_ENV: &str = "MRD_LAN_E2E_RENDER_PROFILE_CAP";
 const LAN_E2E_ADAPTIVE_ENV: &str = "MRD_LAN_E2E_ADAPTIVE";
@@ -95,7 +96,7 @@ enum TrayAction {
 struct AppState {
     settings_path: std::path::PathBuf,
     // Service lifecycle manager - controls mrd-service
-    service_manager: std::sync::Arc<std::sync::Mutex<service_manager::ServiceManager>>,
+    service_manager: std::sync::Arc<service_manager::ServiceManager>,
     // Test harness for end-to-end pipeline visualization
     test_harness: std::sync::Arc<std::sync::Mutex<test_harness::TestHarness>>,
     // Test orchestrator - unified test execution and management
@@ -142,7 +143,7 @@ struct BrowserWebrtcPreviewAnswer {
 fn ensure_rustls_crypto_provider() {
     static INSTALL: std::sync::Once = std::sync::Once::new();
     INSTALL.call_once(|| {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let _ = rustls::crypto::ring::default_provider().install_default();
     });
 }
 
@@ -244,6 +245,8 @@ fn open_remote_display_window(
     state: tauri::State<'_, AppState>,
     session_id: String,
     surface_id: Option<String>,
+    preferred_display_source_id: Option<String>,
+    avoid_capture_source_id: Option<String>,
 ) -> Result<RenderWindowContext, String> {
     let spec = {
         let mut registry = state.render_window_registry.lock().unwrap();
@@ -274,7 +277,13 @@ fn open_remote_display_window(
     std::thread::spawn(move || {
         let build_app = app_for_window.clone();
         if let Err(error) = app_for_window.run_on_main_thread(move || {
-            if let Err(error) = build_remote_display_window(&build_app, state_for_window, spec) {
+            if let Err(error) = build_remote_display_window(
+                &build_app,
+                state_for_window,
+                spec,
+                preferred_display_source_id,
+                avoid_capture_source_id,
+            ) {
                 eprintln!("{error}");
             }
         }) {
@@ -289,6 +298,8 @@ fn build_remote_display_window(
     app: &AppHandle,
     state: AppState,
     spec: PendingRenderWindow,
+    preferred_display_source_id: Option<String>,
+    avoid_capture_source_id: Option<String>,
 ) -> Result<(), String> {
     let label = spec.label.clone();
     let session_id = spec.session_id.0.clone();
@@ -301,6 +312,13 @@ fn build_remote_display_window(
         .visible(false)
         .build()
         .map_err(|error| format!("create remote display window failed: {error}"))?;
+
+    remote_display_window_placement_result(place_remote_display_window(
+        app,
+        &window,
+        preferred_display_source_id.as_deref(),
+        avoid_capture_source_id.as_deref(),
+    ))?;
 
     let cleanup_app = app.clone();
     let cleanup_state = state.clone();
@@ -324,6 +342,140 @@ fn build_remote_display_window(
         .map_err(|error| format!("show remote display window failed: {error}"))?;
     let _ = window.set_focus();
     Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RemoteDisplayMonitorPlacement {
+    name: Option<String>,
+    position_x: i32,
+    position_y: i32,
+    width: u32,
+    height: u32,
+}
+
+fn place_remote_display_window(
+    app: &AppHandle,
+    window: &WebviewWindow,
+    preferred_display_source_id: Option<&str>,
+    avoid_capture_source_id: Option<&str>,
+) -> Result<(), String> {
+    let monitors = app
+        .available_monitors()
+        .map_err(|error| format!("list monitors failed: {error}"))?
+        .into_iter()
+        .map(|monitor| RemoteDisplayMonitorPlacement {
+            name: monitor.name().cloned(),
+            position_x: monitor.position().x,
+            position_y: monitor.position().y,
+            width: monitor.size().width,
+            height: monitor.size().height,
+        })
+        .collect::<Vec<_>>();
+
+    if let Some(placement) = choose_remote_display_window_placement(
+        &monitors,
+        preferred_display_source_id,
+        avoid_capture_source_id,
+    ) {
+        let x = placement.position_x.saturating_add(48);
+        let y = placement.position_y.saturating_add(48);
+        window
+            .set_position(PhysicalPosition::new(x, y))
+            .map_err(|error| format!("position remote display window failed: {error}"))?;
+    }
+    Ok(())
+}
+
+fn remote_display_window_placement_result(result: Result<(), String>) -> Result<(), String> {
+    if let Err(error) = result {
+        eprintln!(
+            "position remote display window failed; continuing with default placement: {error}"
+        );
+    }
+    Ok(())
+}
+
+fn choose_remote_display_window_placement(
+    monitors: &[RemoteDisplayMonitorPlacement],
+    preferred_display_source_id: Option<&str>,
+    avoid_capture_source_id: Option<&str>,
+) -> Option<RemoteDisplayMonitorPlacement> {
+    if monitors.is_empty() {
+        return None;
+    }
+
+    if let Some(preferred_name) =
+        preferred_display_source_id.and_then(display_name_for_capture_source_id)
+    {
+        let normalized_preferred = normalize_display_name(&preferred_name);
+        if let Some(monitor) = monitors.iter().find(|monitor| {
+            monitor
+                .name
+                .as_deref()
+                .map(normalize_display_name)
+                .as_deref()
+                == Some(normalized_preferred.as_str())
+        }) {
+            return Some(monitor.clone());
+        }
+    }
+
+    let avoided_name = avoid_capture_source_id
+        .and_then(display_name_for_capture_source_id)
+        .map(|name| normalize_display_name(&name));
+    if let Some(avoided_name) = avoided_name {
+        if let Some(monitor) = monitors.iter().find(|monitor| {
+            monitor
+                .name
+                .as_deref()
+                .map(normalize_display_name)
+                .as_deref()
+                != Some(avoided_name.as_str())
+        }) {
+            return Some(monitor.clone());
+        }
+    }
+
+    None
+}
+
+fn display_name_for_capture_source_id(source_id: &str) -> Option<String> {
+    let trimmed = source_id.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(display_number) = display_number_from_display_name(trimmed) {
+        return Some(format!("\\\\.\\DISPLAY{display_number}"));
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if !(lower.contains("display-shared") || lower.contains("display")) {
+        return None;
+    }
+    let index = trimmed.rsplit(':').next()?.parse::<u32>().ok()?;
+    Some(format!("\\\\.\\DISPLAY{}", index + 1))
+}
+
+fn display_number_from_display_name(value: &str) -> Option<u32> {
+    let upper = value.to_ascii_uppercase();
+    let display_index = upper.find("DISPLAY")?;
+    let digits = upper[display_index + "DISPLAY".len()..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse::<u32>().ok()
+}
+
+fn normalize_display_name(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase()
 }
 
 fn cleanup_remote_display_window(
@@ -479,6 +631,7 @@ fn close_remote_display_window(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn browser_webrtc_preview_start(
     state: tauri::State<'_, AppState>,
     session_id: String,
@@ -884,8 +1037,6 @@ fn build_native_probe_frame(width: usize, height: usize) -> mrd_render::RenderFr
 fn get_client_diagnostics(state: tauri::State<'_, AppState>) -> ClientDiagnostics {
     let service_exe_path = state
         .service_manager
-        .lock()
-        .unwrap()
         .service_exe_path()
         .display()
         .to_string();
@@ -1004,8 +1155,6 @@ async fn service_bootstrap_if_needed(state: tauri::State<'_, AppState>) -> Resul
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             manager
-                .lock()
-                .unwrap()
                 .bootstrap_if_needed()
                 .await
                 .map_err(|e| e.to_string())
@@ -1027,8 +1176,6 @@ async fn service_wait_for_healthy(
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             manager
-                .lock()
-                .unwrap()
                 .wait_for_healthy(timeout_secs)
                 .await
                 .map_err(|e| e.to_string())
@@ -1045,7 +1192,7 @@ async fn service_did_bootstrap(state: tauri::State<'_, AppState>) -> Result<bool
 
     tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async { Ok(manager.lock().unwrap().did_bootstrap().await) })
+        rt.block_on(async { Ok(manager.did_bootstrap().await) })
     })
     .await
     .map_err(|e| e.to_string())?
@@ -2039,6 +2186,9 @@ fn test_harness_get_comparison_result(
         .get_pipeline_comparison_result()
 }
 
+type HarnessFramePayload = Option<(String, usize, usize, u64)>;
+type HarnessFramesResponse = (HarnessFramePayload, HarnessFramePayload);
+
 #[tauri::command]
 async fn test_harness_get_frames(
     state: tauri::State<'_, AppState>,
@@ -2046,13 +2196,7 @@ async fn test_harness_get_frames(
     include_rendered: Option<bool>,
     last_captured_generation: Option<u64>,
     last_rendered_generation: Option<u64>,
-) -> Result<
-    (
-        Option<(String, usize, usize, u64)>,
-        Option<(String, usize, usize, u64)>,
-    ),
-    String,
-> {
+) -> Result<HarnessFramesResponse, String> {
     let include_captured = include_captured.unwrap_or(true);
     let include_rendered = include_rendered.unwrap_or(true);
     let test_harness = state.test_harness.clone();
@@ -2502,6 +2646,7 @@ struct LanE2eAutorunLaunchConfig {
     display_mode_policy: Option<String>,
     capture_source_id: Option<String>,
     capture_source_kind: Option<String>,
+    render_display_source_id: Option<String>,
     expected_peer_build_id: Option<String>,
     render_profile_cap: Option<String>,
     adaptive: Option<String>,
@@ -2541,6 +2686,7 @@ where
         display_mode_policy: non_empty_env(env(LAN_E2E_DISPLAY_MODE_POLICY_ENV)),
         capture_source_id: non_empty_env(env(LAN_E2E_CAPTURE_SOURCE_ID_ENV)),
         capture_source_kind: non_empty_env(env(LAN_E2E_CAPTURE_SOURCE_KIND_ENV)),
+        render_display_source_id: non_empty_env(env(LAN_E2E_RENDER_DISPLAY_SOURCE_ID_ENV)),
         expected_peer_build_id: non_empty_env(env(LAN_E2E_EXPECTED_PEER_BUILD_ID_ENV)),
         render_profile_cap: non_empty_env(env(LAN_E2E_RENDER_PROFILE_CAP_ENV)),
         adaptive: non_empty_env(env(LAN_E2E_ADAPTIVE_ENV)),
@@ -2578,6 +2724,11 @@ fn build_lan_e2e_autorun_route(config: LanE2eAutorunLaunchConfig) -> String {
     push_query_param(&mut params, "displayModePolicy", config.display_mode_policy);
     push_query_param(&mut params, "captureSourceId", config.capture_source_id);
     push_query_param(&mut params, "captureSourceKind", config.capture_source_kind);
+    push_query_param(
+        &mut params,
+        "renderDisplaySourceId",
+        config.render_display_source_id,
+    );
     push_query_param(
         &mut params,
         "expectedPeerBuildId",
@@ -2689,6 +2840,7 @@ mod tray_tests {
             display_mode_policy: Some("temporary".to_string()),
             capture_source_id: Some("windows:display-shared:1".to_string()),
             capture_source_kind: Some("display".to_string()),
+            render_display_source_id: Some("windows:display-shared:0".to_string()),
             expected_peer_build_id: Some("abc123def456".to_string()),
             render_profile_cap: Some("false".to_string()),
             adaptive: Some("true".to_string()),
@@ -2696,7 +2848,7 @@ mod tray_tests {
 
         assert_eq!(
             route,
-            "/test/e2e?autorun=lan-e2e&targetDeviceId=agent%20device%2F1&transport=quic&timeoutMs=2500&minSampleDurationMs=1500&minDecodedFrames=2&minFps=5&stopOnComplete=false&width=1920&height=1080&fps=180&bitrateMbps=20&codec=hevc&codecProfile=main&bitDepth=8&chromaSubsampling=4%3A2%3A0&pixelFormat=nv12&hdrEnabled=false&displayModePolicy=temporary&captureSourceId=windows%3Adisplay-shared%3A1&captureSourceKind=display&expectedPeerBuildId=abc123def456&renderProfileCap=false&adaptive=true"
+            "/test/e2e?autorun=lan-e2e&targetDeviceId=agent%20device%2F1&transport=quic&timeoutMs=2500&minSampleDurationMs=1500&minDecodedFrames=2&minFps=5&stopOnComplete=false&width=1920&height=1080&fps=180&bitrateMbps=20&codec=hevc&codecProfile=main&bitDepth=8&chromaSubsampling=4%3A2%3A0&pixelFormat=nv12&hdrEnabled=false&displayModePolicy=temporary&captureSourceId=windows%3Adisplay-shared%3A1&captureSourceKind=display&renderDisplaySourceId=windows%3Adisplay-shared%3A0&expectedPeerBuildId=abc123def456&renderProfileCap=false&adaptive=true"
         );
     }
 
@@ -2726,6 +2878,88 @@ mod tray_tests {
             script,
             "window.location.replace(\"/test/e2e?autorun=lan-e2e&displayModePolicy=temporary\");"
         );
+    }
+
+    #[test]
+    fn display_source_id_maps_to_windows_display_name() {
+        assert_eq!(
+            display_name_for_capture_source_id("windows:display-shared:1").as_deref(),
+            Some("\\\\.\\DISPLAY2")
+        );
+        assert_eq!(
+            display_name_for_capture_source_id("DXGIShared:\\\\.\\DISPLAY1").as_deref(),
+            Some("\\\\.\\DISPLAY1")
+        );
+    }
+
+    #[test]
+    fn remote_display_window_avoids_captured_display_when_possible() {
+        let monitors = vec![
+            RemoteDisplayMonitorPlacement {
+                name: Some("\\\\.\\DISPLAY2".to_string()),
+                position_x: 0,
+                position_y: 0,
+                width: 2560,
+                height: 1440,
+            },
+            RemoteDisplayMonitorPlacement {
+                name: Some("\\\\.\\DISPLAY1".to_string()),
+                position_x: 3840,
+                position_y: 0,
+                width: 3840,
+                height: 2160,
+            },
+        ];
+
+        let selected = choose_remote_display_window_placement(
+            &monitors,
+            None,
+            Some("windows:display-shared:1"),
+        )
+        .expect("secondary display should be selected");
+
+        assert_eq!(selected.name.as_deref(), Some("\\\\.\\DISPLAY1"));
+    }
+
+    #[test]
+    fn remote_display_window_prefers_requested_display_source() {
+        let monitors = vec![
+            RemoteDisplayMonitorPlacement {
+                name: Some("\\\\.\\DISPLAY1".to_string()),
+                position_x: -2560,
+                position_y: 0,
+                width: 2560,
+                height: 1440,
+            },
+            RemoteDisplayMonitorPlacement {
+                name: Some("\\\\.\\DISPLAY2".to_string()),
+                position_x: 2560,
+                position_y: -2385,
+                width: 1440,
+                height: 2560,
+            },
+            RemoteDisplayMonitorPlacement {
+                name: Some("\\\\.\\DISPLAY3".to_string()),
+                position_x: 0,
+                position_y: 0,
+                width: 2560,
+                height: 1440,
+            },
+        ];
+
+        let selected = choose_remote_display_window_placement(
+            &monitors,
+            Some("windows:display-shared:1"),
+            Some("windows:display-shared:2"),
+        )
+        .expect("explicit render display should be selected");
+
+        assert_eq!(selected.name.as_deref(), Some("\\\\.\\DISPLAY2"));
+    }
+
+    #[test]
+    fn remote_display_window_placement_error_does_not_abort_creation() {
+        assert!(remote_display_window_placement_result(Err("position failed".to_string())).is_ok());
     }
 
     #[test]
@@ -2763,9 +2997,9 @@ fn main() {
     });
 
     // Create shared service manager (bootstrap-only in Phase 6)
-    let service_manager = std::sync::Arc::new(std::sync::Mutex::new(
+    let service_manager = std::sync::Arc::new(
         service_manager::ServiceManager::new().expect("failed to create ServiceManager"),
-    ));
+    );
 
     // Create test harness for end-to-end pipeline visualization
     let test_harness = std::sync::Arc::new(std::sync::Mutex::new(
@@ -2884,8 +3118,7 @@ fn main() {
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 rt.block_on(async move {
                     // Bootstrap mrd-service only if not reachable via IPC
-                    let bootstrapped = match service_mgr.lock().unwrap().bootstrap_if_needed().await
-                    {
+                    let bootstrapped = match service_mgr.bootstrap_if_needed().await {
                         Ok(did_bootstrap) => did_bootstrap,
                         Err(e) => {
                             eprintln!("Failed to bootstrap mrd-service: {}", e);
@@ -2900,7 +3133,7 @@ fn main() {
                     }
 
                     // Wait for service to be healthy (max 30 seconds)
-                    if let Err(e) = service_mgr.lock().unwrap().wait_for_healthy(30).await {
+                    if let Err(e) = service_mgr.wait_for_healthy(30).await {
                         eprintln!("mrd-service health check failed: {}", e);
                     } else {
                         println!("mrd-service is ready");

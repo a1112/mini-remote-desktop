@@ -626,7 +626,10 @@ impl D3d11Renderer {
     }
 
     #[cfg(windows)]
-    fn compile_shader(source: &str, target: &'static [u8]) -> Result<Vec<u8>, RenderError> {
+    fn compile_shader(
+        source: &str,
+        target: &'static core::ffi::CStr,
+    ) -> Result<Vec<u8>, RenderError> {
         use windows::core::PCSTR;
         use windows::Win32::Graphics::Direct3D::{Fxc::D3DCompile, ID3DBlob, ID3DInclude};
 
@@ -639,8 +642,8 @@ impl D3d11Renderer {
                 PCSTR::null(),
                 None,
                 None::<&ID3DInclude>,
-                PCSTR(b"main\0".as_ptr()),
-                PCSTR(target.as_ptr()),
+                PCSTR(c"main".as_ptr().cast()),
+                PCSTR(target.as_ptr().cast()),
                 0,
                 0,
                 &mut code,
@@ -680,8 +683,8 @@ impl D3d11Renderer {
             D3D11_TEXTURE_ADDRESS_CLAMP,
         };
 
-        let vertex_code = Self::compile_shader(SHARED_NV12_VERTEX_SHADER, b"vs_5_0\0")?;
-        let pixel_code = Self::compile_shader(SHARED_NV12_PIXEL_SHADER, b"ps_5_0\0")?;
+        let vertex_code = Self::compile_shader(SHARED_NV12_VERTEX_SHADER, c"vs_5_0")?;
+        let pixel_code = Self::compile_shader(SHARED_NV12_PIXEL_SHADER, c"ps_5_0")?;
 
         let mut vertex_shader = None::<ID3D11VertexShader>;
         let mut pixel_shader = None::<ID3D11PixelShader>;

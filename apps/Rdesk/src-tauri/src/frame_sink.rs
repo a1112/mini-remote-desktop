@@ -23,6 +23,7 @@ pub struct DecodedFrameSink {
     latest_source_frames: HashMap<(SessionId, String), DecodedFrame>,
 }
 
+#[allow(dead_code)]
 impl DecodedFrameSink {
     pub fn ingest_frame(&mut self, session_id: SessionId, frame: DecodedFrame) {
         self.ingest_frame_for_source(session_id, DEFAULT_SOURCE_ID.to_string(), frame);

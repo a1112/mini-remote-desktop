@@ -3783,13 +3783,13 @@ async fn handle_media_sender_frame_error(
 fn should_log_media_sender_frame_error(consecutive_frame_errors: u32) -> bool {
     consecutive_frame_errors == 1
         || consecutive_frame_errors >= LAN_MEDIA_SENDER_MAX_CONSECUTIVE_FRAME_ERRORS
-        || consecutive_frame_errors % LAN_MEDIA_SENDER_ERROR_LOG_INTERVAL == 0
+        || consecutive_frame_errors.is_multiple_of(LAN_MEDIA_SENDER_ERROR_LOG_INTERVAL)
 }
 
 fn should_log_media_receiver_decode_error(consecutive_decode_errors: u32) -> bool {
     consecutive_decode_errors == 1
         || consecutive_decode_errors == LAN_MEDIA_RECEIVER_MAX_CONSECUTIVE_DECODE_ERRORS
-        || consecutive_decode_errors % LAN_MEDIA_RECEIVER_DECODE_ERROR_LOG_INTERVAL == 0
+        || consecutive_decode_errors.is_multiple_of(LAN_MEDIA_RECEIVER_DECODE_ERROR_LOG_INTERVAL)
 }
 
 struct LanMediaFrameOrderer {
@@ -4121,7 +4121,7 @@ fn lan_local_render_refresh_hz() -> Option<u32> {
         return Some(refresh_hz);
     }
 
-    *LOCAL_RENDER_REFRESH_HZ.get_or_init(|| crate::display_mode::highest_current_refresh_hz())
+    *LOCAL_RENDER_REFRESH_HZ.get_or_init(crate::display_mode::highest_current_refresh_hz)
 }
 
 fn lan_render_pacing_from_env_value(value: Option<&str>) -> Option<bool> {
@@ -4704,6 +4704,7 @@ async fn quic_media_v3_frame_to_legacy_frame(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn record_lan_decoded_frames(
     app_state: &Arc<AppState>,
     session_id: &SessionId,
@@ -5087,9 +5088,8 @@ async fn sleep_until_lan_render_frame(
 }
 
 #[cfg(windows)]
-fn should_interrupt_render_pacing_sleep(pending_depth: usize, max_pending_frames: usize) -> bool {
-    let interrupt_depth = max_pending_frames.saturating_sub(1).max(1);
-    pending_depth >= interrupt_depth
+fn should_interrupt_render_pacing_sleep(pending_depth: usize, _max_pending_frames: usize) -> bool {
+    pending_depth > 0
 }
 
 #[cfg(windows)]
@@ -5810,7 +5810,7 @@ async fn selected_capture_source_id(
 
     #[cfg(test)]
     {
-        return Ok(TEST_SYNTHETIC_CAPTURE_SOURCE_ID.to_string());
+        Ok(TEST_SYNTHETIC_CAPTURE_SOURCE_ID.to_string())
     }
 
     #[cfg(not(test))]
@@ -5843,7 +5843,7 @@ async fn create_lan_frame_capture(
 
     #[cfg(windows)]
     {
-        return create_windows_lan_frame_capture(source_id, _profile);
+        create_windows_lan_frame_capture(source_id, _profile)
     }
 
     #[cfg(target_os = "macos")]
@@ -5921,8 +5921,6 @@ fn windows_lan_capture_backend(source_id: &str) -> &'static str {
     let normalized = source_id.trim().to_ascii_lowercase();
     if normalized.starts_with("windows:display-shared:") {
         "dxgi_shared"
-    } else if normalized.starts_with("windows:display:") {
-        "dxgi"
     } else {
         "winrt"
     }
@@ -6212,7 +6210,7 @@ fn find_h264_start_code(payload: &[u8], from: usize) -> Option<(usize, usize)> {
 }
 
 fn should_update_lan_preview(sequence: u64) -> bool {
-    sequence <= 1 || sequence % LAN_PREVIEW_FRAME_INTERVAL == 0
+    sequence <= 1 || sequence.is_multiple_of(LAN_PREVIEW_FRAME_INTERVAL)
 }
 
 fn decoded_frame_pixel_format(frame: &DecodedFrame) -> String {
@@ -7170,7 +7168,7 @@ mod tests {
                 let media = media.expect("QUIC media bootstrap");
                 assert_eq!(media.transport_kind, "quic");
                 let quic = media.quic.expect("QUIC bootstrap details");
-                assert!(quic.listen_addr.ends_with(":0") == false);
+                assert!(!quic.listen_addr.ends_with(":0"));
                 assert!(!quic.server_name.is_empty());
                 assert!(!quic.cert_der.is_empty());
                 let negotiation = media_profile.expect("media profile negotiation");
@@ -8796,12 +8794,12 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_lan_sender_prefers_dxgi_for_display_sources() {
+    fn windows_lan_sender_uses_monitor_specific_backends_for_display_sources() {
         assert_eq!(
             windows_lan_capture_backend("windows:display-shared:0"),
             "dxgi_shared"
         );
-        assert_eq!(windows_lan_capture_backend("windows:display:0"), "dxgi");
+        assert_eq!(windows_lan_capture_backend("windows:display:0"), "winrt");
         assert_eq!(
             windows_lan_capture_backend("windows:window:0x1234"),
             "winrt"
@@ -9134,7 +9132,10 @@ mod tests {
             lan_render_cap_target_fps_for_profile(&high_fps),
             Some(lan_render_pacing_target_fps(&high_fps))
         );
-        assert!(render_profile_requests_high_resolution_timer(&high_fps));
+        assert_eq!(
+            render_profile_requests_high_resolution_timer(&high_fps),
+            lan_render_pacing_target_fps(&high_fps) >= LAN_RENDER_PACING_PRECISE_SLEEP_MIN_FPS
+        );
         let precise_guard = render_pacing_precise_sleep_guard(120);
         assert!(precise_guard > Duration::ZERO);
         assert!(precise_guard < render_pacing_frame_interval(120));
@@ -9148,7 +9149,7 @@ mod tests {
             Duration::from_micros(7_000)
         );
         assert!(!should_interrupt_render_pacing_sleep(0, 3));
-        assert!(!should_interrupt_render_pacing_sleep(1, 3));
+        assert!(should_interrupt_render_pacing_sleep(1, 3));
         assert!(should_interrupt_render_pacing_sleep(2, 3));
         assert!(should_interrupt_render_pacing_sleep(1, 1));
         assert_eq!(

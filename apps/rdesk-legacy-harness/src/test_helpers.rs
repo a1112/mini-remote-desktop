@@ -6,23 +6,18 @@
 use crate::app_settings::{save_settings, AppSettings, DecodePolicy};
 use crate::{
     DecodedFrameSink, DecodedFrameSnapshot, QuicHost, QuicHostSnapshot, QuicSessionCoordinator,
-    QuicSessionSnapshot, RealtimeRegistration, RealtimeRuntime, RenderHost, RenderHostSnapshot,
-    RenderSurfaceDescriptor, SessionLifecycleCoordinator, SessionLifecycleSnapshot,
-    SurfaceSourceBinding, WebrtcHost, WebrtcHostSnapshot, WebrtcSessionCoordinator,
-    WebrtcSessionSnapshot,
+    QuicSessionSnapshot, RealtimeRegistration, RealtimeRuntime, RenderHost,
+    SessionLifecycleCoordinator, SessionLifecycleSnapshot, SurfaceSourceBinding, WebrtcHost,
+    WebrtcHostSnapshot, WebrtcSessionCoordinator, WebrtcSessionSnapshot,
 };
 
 use image::{codecs::png::PngEncoder, ColorType, ImageEncoder};
 use mrd_decode_nvdec::probe_runtime as probe_nvdec_runtime;
-use mrd_pipeline_core::{CapturedFrame, DecodedFrame, FrameCapture, FramePixelFormat};
 use mrd_proto::{BackendRole, DeviceId, SessionId};
-use mrd_signal_client::encode_message;
 use mrd_signal_proto::{IceCandidate, SessionDescription, SignalMessage};
-use std::collections::HashMap;
-use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::Mutex;
 
 // =============================================================================
 // Response types for test helpers
@@ -456,6 +451,7 @@ pub async fn realtime_register_with(
     Ok(realtime_registration_response(registration))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn realtime_request_session_with(
     runtime: &RealtimeRuntime,
     handle: u64,

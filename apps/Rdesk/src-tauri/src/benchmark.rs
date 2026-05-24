@@ -186,6 +186,7 @@ impl BenchmarkSummary {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn from_transport_probes(
         manifest: &BenchmarkManifest,
         sender_probe: &PipelineProbeSnapshot,

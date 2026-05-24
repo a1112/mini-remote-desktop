@@ -613,6 +613,7 @@ impl QuicMediaFragment {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn fragment_media_payload_v3(
     payload_type: QuicMediaPayloadType,
     codec: QuicMediaCodec,

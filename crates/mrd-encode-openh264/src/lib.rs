@@ -132,7 +132,8 @@ impl VideoEncoder for OpenH264Encoder {
 
 impl OpenH264Encoder {
     fn should_force_intra(&mut self, timestamp_us: u64) -> bool {
-        let frame_interval_due = self.frame_index == 0 || self.frame_index % self.fps as u64 == 0;
+        let frame_interval_due =
+            self.frame_index == 0 || self.frame_index.is_multiple_of(self.fps as u64);
         let recovery_interval_due = self
             .last_forced_intra_timestamp_us
             .is_some_and(|last| timestamp_us.saturating_sub(last) >= RECOVERY_KEYFRAME_INTERVAL_US);
@@ -153,7 +154,7 @@ fn validate_even_dimensions(width: usize, height: usize) -> Result<(), PipelineE
         )));
     }
 
-    if width % 2 != 0 || height % 2 != 0 {
+    if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
         return Err(PipelineError::message(format!(
             "openh264 requires even frame dimensions, got {width}x{height}"
         )));

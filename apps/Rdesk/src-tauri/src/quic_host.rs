@@ -88,20 +88,11 @@ impl HostedQuicPeer {
     }
 }
 
+#[derive(Default)]
 pub struct QuicHost {
     sessions: HashMap<SessionId, HostedQuicPeer>,
     frame_sink: Option<Arc<Mutex<DecodedFrameSink>>>,
     probe_registry: ProbeRegistry,
-}
-
-impl Default for QuicHost {
-    fn default() -> Self {
-        Self {
-            sessions: HashMap::new(),
-            frame_sink: None,
-            probe_registry: ProbeRegistry::default(),
-        }
-    }
 }
 
 impl QuicHost {
@@ -246,6 +237,7 @@ impl QuicHost {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn start_embedded_desktop_sender(
         &mut self,
         session_id: SessionId,
@@ -356,6 +348,7 @@ impl QuicHost {
             .snapshot(session_id, &format!("{DEFAULT_SOURCE_ID}-sender"))
     }
 
+    #[allow(dead_code)]
     pub fn probe_recent_events(
         &self,
         session_id: &SessionId,
@@ -373,6 +366,7 @@ impl QuicHost {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn stop_embedded_video_sender(
         &mut self,
         session_id: &SessionId,
@@ -715,6 +709,7 @@ fn sync_reassembly_probe(
     dropped
 }
 
+#[allow(dead_code)]
 fn run_blocking_sender_loop<C, E>(
     capture: &mut C,
     encoder: &mut E,
@@ -814,7 +809,7 @@ fn run_blocking_sender_loop<C, E>(
 }
 
 enum QuicHostEncoder {
-    OpenH264(OpenH264Encoder),
+    OpenH264(Box<OpenH264Encoder>),
     Nvenc(NvencH264Encoder),
 }
 
@@ -846,12 +841,12 @@ fn create_test_encoder(
         "nvenc_hq_p5" => Ok(QuicHostEncoder::Nvenc(
             NvencH264Encoder::new_high_quality_p5(width, height, fps)?,
         )),
-        "openh264" => Ok(QuicHostEncoder::OpenH264(OpenH264Encoder::new(
+        "openh264" => Ok(QuicHostEncoder::OpenH264(Box::new(OpenH264Encoder::new(
             width, height, fps,
-        )?)),
-        "openh264_speed" => Ok(QuicHostEncoder::OpenH264(OpenH264Encoder::new_speed(
-            width, height, fps,
-        )?)),
+        )?))),
+        "openh264_speed" => Ok(QuicHostEncoder::OpenH264(Box::new(
+            OpenH264Encoder::new_speed(width, height, fps)?,
+        ))),
         other => Err(PipelineError::message(format!(
             "unsupported quic host encoder backend: {other}"
         ))),

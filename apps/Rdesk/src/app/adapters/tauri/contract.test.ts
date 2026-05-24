@@ -89,6 +89,8 @@ describe('Tauri Adapter Contract', () => {
       expect(mockInvoke).toHaveBeenNthCalledWith(1, 'open_remote_display_window', {
         sessionId: 'session-1',
         surfaceId: 'surface-1',
+        preferredDisplaySourceId: null,
+        avoidCaptureSourceId: null,
       });
       expect(mockInvoke).toHaveBeenNthCalledWith(2, 'list_remote_display_windows', {
         sessionId: 'session-1',

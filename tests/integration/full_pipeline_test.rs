@@ -117,7 +117,7 @@ mod windows_full_pipeline {
 
                 // 4. Reassemble
                 for fragment in &fragments {
-                    let parsed = match QuicAuFragment::decode(fragment) {
+                    let _parsed = match QuicAuFragment::decode(fragment) {
                         Ok(f) => f,
                         Err(e) => {
                             println!("Fragment decode failed: {}", e);

@@ -632,7 +632,7 @@ fn create_renderer() -> Result<Box<dyn RendererInstance>> {
         renderer
             .attach_target(RenderTarget::WindowHandle(0))
             .map_err(|error| anyhow!(error))?;
-        return Ok(renderer);
+        Ok(renderer)
     }
 
     #[cfg(not(any(target_os = "macos", windows)))]

@@ -1,0 +1,3 @@
+[build]
+# Share artifacts with the workspace root so Tauri and mrd-service builds reuse Rust deps.
+target-dir = "../../../target"

@@ -87,6 +87,7 @@ export interface LanE2EAutomationOptions {
   displayModePolicy?: "none" | "temporary" | "required";
   preferredCaptureSourceId?: string;
   preferredCaptureSourceKind?: string;
+  preferredRenderDisplaySourceId?: string;
   expectedPeerBuildId?: string;
   renderProfileCap?: boolean;
   adaptive?: boolean;
@@ -178,6 +179,8 @@ export interface LanE2EAutomationCommands {
   ipcStartReceiver(sessionId: string): Promise<AdapterResult<string>>;
   openRemoteDisplayWindow(params: {
     sessionId: string;
+    preferredDisplaySourceId?: string;
+    avoidCaptureSourceId?: string;
   }): Promise<AdapterResult<RemoteDisplayWindowContext>>;
   ipcSessionSnapshot(sessionId: string): Promise<AdapterResult<SessionRuntimeSnapshot>>;
   ipcProbeSnapshot(sessionId: string): Promise<AdapterResult<ProbeSnapshot>>;
@@ -535,7 +538,13 @@ export async function runLanE2EAutomation(
 
     stage("display", "started");
     displayWindow = await unwrap(
-      commands.openRemoteDisplayWindow({ sessionId }),
+      commands.openRemoteDisplayWindow({
+        sessionId,
+        ...(options.preferredRenderDisplaySourceId
+          ? { preferredDisplaySourceId: options.preferredRenderDisplaySourceId }
+          : {}),
+        ...(captureSource?.id ? { avoidCaptureSourceId: captureSource.id } : {}),
+      }),
       "display_window_failed"
     );
 

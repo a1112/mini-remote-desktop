@@ -711,7 +711,7 @@ fn h264_profile_level_id_with_minimum_level(profile_level_id: &str, minimum_leve
 fn ensure_rustls_crypto_provider() {
     static INSTALL: Once = Once::new();
     INSTALL.call_once(|| {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let _ = rustls::crypto::ring::default_provider().install_default();
     });
 }
 
@@ -770,6 +770,7 @@ async fn build_peer_connection() -> Result<Arc<RTCPeerConnection>, String> {
         .map_err(|error| format!("create browser WebRTC peer connection failed: {error}"))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_local_capture_sender(
     session_id: String,
     fps: u32,
@@ -799,6 +800,7 @@ fn spawn_local_capture_sender(
 }
 
 #[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
 fn run_local_capture_sender(
     session_id: String,
     fps: u32,

@@ -576,6 +576,7 @@ fn index_document(config: &WebBridgeConfig) -> String {
     )
 }
 
+#[allow(clippy::result_large_err)]
 fn authorize_headers(config: &WebBridgeConfig, headers: &HeaderMap) -> Result<(), IpcResponse> {
     authorize_token(
         config,
@@ -585,6 +586,7 @@ fn authorize_headers(config: &WebBridgeConfig, headers: &HeaderMap) -> Result<()
     )
 }
 
+#[allow(clippy::result_large_err)]
 fn authorize_ws_token(
     config: &WebBridgeConfig,
     headers: &HeaderMap,
@@ -596,6 +598,7 @@ fn authorize_ws_token(
     authorize_token(config, header_token.or(query_token))
 }
 
+#[allow(clippy::result_large_err)]
 fn authorize_token(config: &WebBridgeConfig, actual: Option<&str>) -> Result<(), IpcResponse> {
     let Some(expected) = config.token.as_deref() else {
         return Ok(());
@@ -619,6 +622,7 @@ fn authorize_token(config: &WebBridgeConfig, actual: Option<&str>) -> Result<(),
 }
 
 #[cfg(test)]
+#[allow(clippy::result_large_err)]
 fn authorize_ws_token_for_test(
     config: &WebBridgeConfig,
     header_token: Option<&str>,
@@ -629,10 +633,7 @@ fn authorize_ws_token_for_test(
 
 fn forbidden_response(request: &IpcRequest) -> IpcResponse {
     let debug = format!("{request:?}");
-    let request_name = debug
-        .split(|ch: char| ch == ' ' || ch == '{' || ch == '(')
-        .next()
-        .unwrap_or("request");
+    let request_name = debug.split([' ', '{', '(']).next().unwrap_or("request");
     IpcResponse::Error {
         code: "E_WEB_BRIDGE_FORBIDDEN".to_string(),
         message: format!("{request_name} is not available through the web bridge."),

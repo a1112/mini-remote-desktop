@@ -15,6 +15,7 @@ param(
   [bool]$HdrEnabled = $false,
   [string]$CaptureSourceId = "",
   [string]$CaptureSourceKind = "display_shared",
+  [string]$RenderDisplaySourceId = "",
   [int]$RenderMaxFps = 0,
   [double]$LossPct = 0,
   [int]$BaseDelayMs = 0,
@@ -402,9 +403,13 @@ function Invoke-LocalDualProcessProfile {
     if ($CaptureSourceKind.Trim()) {
       Set-EnvVar "MRD_LAN_E2E_CAPTURE_SOURCE_KIND" $CaptureSourceKind.Trim() $savedEnv
     }
+    if ($RenderDisplaySourceId.Trim()) {
+      Set-EnvVar "MRD_LAN_E2E_RENDER_DISPLAY_SOURCE_ID" $RenderDisplaySourceId.Trim() $savedEnv
+    }
     $tauriEnvPlan = New-LocalDualProcessTauriEnvPlan `
       -OutputRoot $OutputRoot `
       -ServiceExe $runServiceExe `
+      -WorkspaceTargetDir (Join-Path $Repo "target") `
       -NoBuild:$NoBuild
     foreach ($envVar in $tauriEnvPlan.PSObject.Properties) {
       Set-EnvVar $envVar.Name ([string]$envVar.Value) $savedEnv
@@ -558,6 +563,7 @@ if (-not $NoBuild) {
   $savedBuildEnv = @{}
   try {
     Set-EnvVar "GIT_COMMIT" $gitCommit $savedBuildEnv
+    Set-EnvVar "CARGO_TARGET_DIR" (Join-Path $repo "target") $savedBuildEnv
     cargo build -p mrd-service
     cargo build -p app --no-default-features
   } finally {
@@ -603,6 +609,7 @@ $report | Add-Member -Force -NotePropertyName "capture_source_request" -NoteProp
   id = if ($CaptureSourceId.Trim()) { $CaptureSourceId.Trim() } else { $null }
   kind = if ($CaptureSourceKind.Trim()) { $CaptureSourceKind.Trim() } else { $null }
 })
+$report | Add-Member -Force -NotePropertyName "render_display_source_request" -NotePropertyValue $(if ($RenderDisplaySourceId.Trim()) { $RenderDisplaySourceId.Trim() } else { $null })
 $report | Add-Member -Force -NotePropertyName "render_max_fps_override" -NotePropertyValue $(if ($RenderMaxFps -gt 0) { $RenderMaxFps } else { $null })
 $report | Add-Member -Force -NotePropertyName "codec_request" -NotePropertyValue ([pscustomobject]@{
   codec = $Codec

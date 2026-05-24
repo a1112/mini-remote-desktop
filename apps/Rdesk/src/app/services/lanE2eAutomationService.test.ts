@@ -428,6 +428,7 @@ describe("runLanE2EAutomation", () => {
     expect(commands.ipcStartReceiver).toHaveBeenCalledWith("lan-e2e-test-session");
     expect(commands.openRemoteDisplayWindow).toHaveBeenCalledWith({
       sessionId: "lan-e2e-test-session",
+      avoidCaptureSourceId: "display",
     });
     expect(commands.ipcStopSession).toHaveBeenCalledWith("lan-e2e-test-session");
     expect(result.stages.map((stage) => `${stage.stage}:${stage.status}`)).toContain(

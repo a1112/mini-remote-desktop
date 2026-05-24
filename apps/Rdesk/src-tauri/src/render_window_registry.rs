@@ -91,6 +91,7 @@ impl RenderWindowRegistry {
         entries.len()
     }
 
+    #[allow(dead_code)]
     pub fn open_window<R: tauri::Runtime>(
         &mut self,
         app: &tauri::AppHandle<R>,
@@ -152,6 +153,7 @@ impl RenderWindowRegistry {
             .collect()
     }
 
+    #[allow(dead_code)]
     pub fn close_window<R: tauri::Runtime>(
         &mut self,
         app: &tauri::AppHandle<R>,
@@ -185,6 +187,7 @@ impl RenderWindowRegistry {
         removed
     }
 
+    #[allow(dead_code)]
     pub fn set_renderer_attached<R: tauri::Runtime>(
         &mut self,
         app: &tauri::AppHandle<R>,
@@ -224,6 +227,7 @@ impl RenderWindowRegistry {
         None
     }
 
+    #[allow(dead_code)]
     pub fn rebind_window_surface<R: tauri::Runtime>(
         &mut self,
         app: &tauri::AppHandle<R>,
@@ -318,6 +322,7 @@ impl RenderWindowRegistry {
         }
     }
 
+    #[allow(dead_code)]
     pub fn surface_window_count<R: tauri::Runtime>(
         &mut self,
         app: &tauri::AppHandle<R>,

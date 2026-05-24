@@ -223,6 +223,8 @@ export async function applyNativeChrome(): Promise<AdapterResult<NativeBackdropS
 export async function openRemoteDisplayWindow(params: {
   sessionId: string;
   surfaceId?: string | null;
+  preferredDisplaySourceId?: string | null;
+  avoidCaptureSourceId?: string | null;
 }): Promise<AdapterResult<RemoteDisplayWindowContext>> {
   if (shouldUseServiceBridge()) {
     return {
@@ -242,6 +244,8 @@ export async function openRemoteDisplayWindow(params: {
   return invokeAdapter<RemoteDisplayWindowContext>('open_remote_display_window', {
     sessionId: params.sessionId,
     surfaceId: params.surfaceId ?? null,
+    preferredDisplaySourceId: params.preferredDisplaySourceId ?? null,
+    avoidCaptureSourceId: params.avoidCaptureSourceId ?? null,
   });
 }
 

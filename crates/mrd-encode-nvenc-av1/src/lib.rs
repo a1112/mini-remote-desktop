@@ -368,7 +368,7 @@ mod imp {
             self.ensure_shared_input(shared)?;
 
             let force_key =
-                self.frame_index == 0 || self.frame_index % (self.fps as usize * 2) == 0;
+                self.frame_index == 0 || self.frame_index.is_multiple_of(self.fps as usize * 2);
             let shared_input = self
                 .shared_input
                 .as_ref()
@@ -488,7 +488,7 @@ mod imp {
 
             // AV1 uses key frames instead of IDR frames
             let force_key =
-                self.frame_index == 0 || self.frame_index % (self.fps as usize * 2) == 0;
+                self.frame_index == 0 || self.frame_index.is_multiple_of(self.fps as usize * 2);
             let bytes = encode_picture(
                 &mut self.encoder,
                 &self.bitstream,
@@ -677,7 +677,7 @@ mod imp {
     }
 
     fn nv12_len(width: usize, height: usize) -> Option<usize> {
-        if width % 2 != 0 || height % 2 != 0 {
+        if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             return None;
         }
         let y_size = width.checked_mul(height)?;

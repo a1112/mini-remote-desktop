@@ -1031,6 +1031,7 @@ mod wire {
 
     /// IPC response from mrd-service to Rdesk
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    #[allow(clippy::large_enum_variant)]
     #[serde(tag = "type")]
     pub enum IpcResponse {
         /// Device registration successful

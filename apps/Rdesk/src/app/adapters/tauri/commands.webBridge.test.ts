@@ -145,7 +145,12 @@ describe('commands service bridge integration', () => {
     const result = await ipcListLocalCaptureSources(false, 24);
     const requestBody = JSON.parse((fetchMock.mock.calls[0]?.[1] as RequestInit).body as string);
 
-    expect(result.ok && result.value[0].id).toBe('windows:display-shared:1');
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      throw new Error(JSON.stringify(result.error));
+    }
+    expect(result.value).toHaveLength(1);
+    expect(result.value[0]!.id).toBe('windows:display-shared:1');
     expect(fetchMock).toHaveBeenCalledWith(
       'http://127.0.0.1:9532/ipc',
       expect.objectContaining({

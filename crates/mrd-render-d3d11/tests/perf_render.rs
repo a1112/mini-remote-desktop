@@ -3,7 +3,7 @@
 use std::{fs, path::Path, time::Instant};
 
 use mrd_observability::{ComponentKind, ComponentResult};
-use mrd_render::{RenderFrame, RenderPixelFormat, RenderTarget, RendererFactory};
+use mrd_render::{RenderFrame, RenderTarget, RendererFactory};
 use mrd_render_d3d11::D3d11RendererFactory;
 
 #[test]

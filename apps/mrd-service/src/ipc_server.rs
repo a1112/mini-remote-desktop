@@ -908,6 +908,7 @@ impl IpcServer {
         (peer_device_id, Some(snapshot.transport.clone()))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn record_audit_event(
         &self,
         action: impl Into<String>,
@@ -1379,7 +1380,7 @@ mod tests {
 
         match response {
             IpcResponse::RuntimeSnapshot { snapshot } => {
-                assert_eq!(snapshot.is_registered, true);
+                assert!(snapshot.is_registered);
                 assert_eq!(snapshot.device_id, Some(device_id));
             }
             _ => panic!("Expected RuntimeSnapshot response"),

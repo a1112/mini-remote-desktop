@@ -352,9 +352,7 @@ impl MediaRenderQueueRegistry {
     }
 
     pub fn take_next_or_finish(&mut self, session_id: &SessionId) -> Option<RenderFrame> {
-        let Some(state) = self.queues.get_mut(session_id) else {
-            return None;
-        };
+        let state = self.queues.get_mut(session_id)?;
 
         if let Some(frame) = state.pending.pop_front() {
             return Some(frame);
@@ -681,9 +679,8 @@ impl MediaSurfaceRendererRegistry {
     pub fn renderers_for_session(&self, session_id: &SessionId) -> Vec<SharedSurfaceRenderer> {
         self.renderers
             .iter()
-            .filter_map(|((renderer_session_id, _), renderer)| {
-                (renderer_session_id == session_id).then(|| renderer.clone())
-            })
+            .filter(|((renderer_session_id, _), _)| renderer_session_id == session_id)
+            .map(|(_, renderer)| renderer.clone())
             .collect()
     }
 
@@ -1158,6 +1155,7 @@ impl Default for AuditLogRegistry {
 }
 
 impl AuditLogRegistry {
+    #[allow(clippy::too_many_arguments)]
     pub fn record(
         &mut self,
         action: impl Into<String>,

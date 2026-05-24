@@ -3,6 +3,15 @@
 //! This module provides a test harness that runs the full capture→encode→decode
 //! pipeline locally for visualization and testing purposes.
 
+#![allow(
+    clippy::derivable_impls,
+    clippy::large_enum_variant,
+    clippy::needless_return,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::while_let_loop
+)]
+
 use anyhow::Result;
 use mrd_capture_dxgi::DxgiDesktopCapture;
 #[cfg(windows)]
@@ -173,6 +182,7 @@ impl Default for TestConfig {
     }
 }
 
+#[allow(dead_code)]
 impl TestChain {
     pub fn display_name(&self) -> &'static str {
         match self {
@@ -265,6 +275,7 @@ impl Default for TestChain {
     }
 }
 
+#[allow(dead_code)]
 fn default_screen_capture_type() -> CaptureType {
     #[cfg(windows)]
     {
@@ -451,6 +462,7 @@ struct PipelineState {
     adapted_frame: Option<CapturedFrame>,
 }
 
+#[allow(dead_code)]
 enum PipelineDecoder {
     Nvdec(NvdecDecoder),
     Software(Box<dyn VideoDecoder>),
@@ -1038,6 +1050,7 @@ fn run_macos_render_loop(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn run_renderer_upload_loop(
     mut renderer: Box<dyn RendererInstance>,
     receiver: mpsc::Receiver<RenderCommand>,
@@ -2894,6 +2907,7 @@ fn create_videotoolbox_h264_decoder() -> Result<PipelineDecoder> {
     }
 }
 
+#[allow(dead_code)]
 fn videotoolbox_decoder_enabled() -> bool {
     !matches!(
         std::env::var("MRD_DISABLE_VIDEOTOOLBOX_DECODER").as_deref(),
@@ -3321,6 +3335,7 @@ struct WinrtMonitorCapture {
 
 #[cfg(windows)]
 impl WinrtMonitorCapture {
+    #[allow(dead_code)]
     fn new_primary() -> Result<Self> {
         Self::new_monitor(0)
     }
@@ -3456,6 +3471,7 @@ mod display_source_tests {
     }
 }
 
+#[allow(dead_code)]
 fn parse_display_id(input: &str) -> Result<u32> {
     let value = parse_numeric_capture_source_id(input, "display id")?;
     u32::try_from(value).map_err(|_| anyhow::anyhow!("display id out of range: {value}"))

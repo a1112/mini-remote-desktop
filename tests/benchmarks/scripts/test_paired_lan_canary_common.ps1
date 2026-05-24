@@ -624,19 +624,23 @@ Assert-Equal (Resolve-PairedLanCanaryTargetDeviceId -Diagnostics $multiPeerDiagn
 $tauriNoBuildEnv = New-LocalDualProcessTauriEnvPlan `
   -OutputRoot ([System.IO.Path]::Combine("tmp", "canary")) `
   -ServiceExe ([System.IO.Path]::Combine("tmp", "canary", "run", "mrd-service.exe")) `
+  -WorkspaceTargetDir ([System.IO.Path]::Combine("tmp", "repo", "target")) `
   -NoBuild:$true
 Assert-Equal $tauriNoBuildEnv.MRD_SERVICE_PREBUILT_EXE ([System.IO.Path]::Combine("tmp", "canary", "run", "mrd-service.exe")) "NoBuild local dual canary uses the copied service executable"
 Assert-Equal $tauriNoBuildEnv.MRD_SERVICE_EXE ([System.IO.Path]::Combine("tmp", "canary", "run", "mrd-service.exe")) "NoBuild local dual canary exposes the copied service executable to Tauri"
-Assert-True (-not ($tauriNoBuildEnv.PSObject.Properties.Name -contains "CARGO_TARGET_DIR")) "NoBuild local dual canary reuses the workspace cargo target"
+Assert-Equal $tauriNoBuildEnv.CARGO_TARGET_DIR ([System.IO.Path]::Combine("tmp", "repo", "target")) "NoBuild local dual canary pins Tauri to the workspace cargo target"
 
 $tauriBuildEnv = New-LocalDualProcessTauriEnvPlan `
   -OutputRoot ([System.IO.Path]::Combine("tmp", "canary")) `
   -ServiceExe ([System.IO.Path]::Combine("tmp", "canary", "run", "mrd-service.exe")) `
+  -WorkspaceTargetDir ([System.IO.Path]::Combine("tmp", "repo", "target")) `
   -NoBuild:$false
-Assert-True (-not ($tauriBuildEnv.PSObject.Properties.Name -contains "CARGO_TARGET_DIR")) "Build local dual canary also reuses the workspace cargo target"
+Assert-Equal $tauriBuildEnv.CARGO_TARGET_DIR ([System.IO.Path]::Combine("tmp", "repo", "target")) "Build local dual canary also pins Tauri to the workspace cargo target"
 
 $localDualScript = Get-Content -Path (Join-Path $scriptDir "run_local_dual_process_lan_canary.ps1") -Raw
 Assert-True ($localDualScript -match "cargo build -p mrd-service") "Local dual canary prebuilds the service executable"
 Assert-True ($localDualScript -match "cargo build -p app --no-default-features") "Local dual canary prebuilds the same Tauri shell target used by tauri dev"
+Assert-True ($localDualScript -match "CARGO_TARGET_DIR") "Local dual canary keeps prebuild and Tauri dev on the same cargo target"
+Assert-True ($localDualScript -match "MRD_LAN_E2E_RENDER_DISPLAY_SOURCE_ID") "Local dual canary can route the receiver window to an explicit display source"
 
 Write-Host "paired LAN canary common tests passed"
