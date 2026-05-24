@@ -153,10 +153,10 @@ fn nvenc_hevc_encoder_prefers_d3d11_shared_bgra_input() {
 
 #[cfg(windows)]
 #[test]
-fn nvenc_hevc_main10_encoder_prefers_d3d11_shared_bgra_input() {
+fn nvenc_hevc_main10_encoder_prefers_cpu_input_for_p010_conversion() {
     assert_eq!(
         NvencHevcEncoder::preferred_main10_input_memory_kind(),
-        mrd_pipeline_core::FrameMemoryKind::D3D11SharedBgra
+        mrd_pipeline_core::FrameMemoryKind::Cpu
     );
 }
 
@@ -225,6 +225,33 @@ fn nvenc_hevc_max_speed_encoder_emits_hevc_access_unit_when_available() {
 }
 
 #[cfg(windows)]
+#[test]
+fn nvenc_hevc_main10_access_unit_signals_10_bit_sps() {
+    let Ok(mut encoder) =
+        NvencHevcEncoder::new_main10_with_bitrate(SMOKE_WIDTH, SMOKE_HEIGHT, 30, 8_000_000)
+    else {
+        return;
+    };
+
+    let frame = CapturedFrame::from_cpu(
+        SMOKE_WIDTH,
+        SMOKE_HEIGHT,
+        FramePixelFormat::Bgra32,
+        33_000,
+        vec![0x80; SMOKE_WIDTH * SMOKE_HEIGHT * 4],
+    );
+    let access_unit = encoder
+        .encode(&frame)
+        .expect("nvenc hevc main10 encode frame")
+        .into_iter()
+        .next()
+        .expect("single access unit");
+    let bit_depth = extract_hevc_sps_luma_bit_depth(&access_unit.bytes).expect("HEVC SPS");
+
+    assert_eq!(bit_depth, 10);
+}
+
+#[cfg(windows)]
 fn extract_sps_profile_idc(access_unit: &[u8]) -> Option<u8> {
     let mut offset = 0usize;
     while let Some((start, start_len)) = find_h264_start_code(access_unit, offset) {
@@ -237,6 +264,150 @@ fn extract_sps_profile_idc(access_unit: &[u8]) -> Option<u8> {
         offset = nal_header.saturating_add(1);
     }
     None
+}
+
+#[cfg(windows)]
+fn extract_hevc_sps_luma_bit_depth(access_unit: &[u8]) -> Option<u8> {
+    let mut offset = 0usize;
+    while let Some((start, start_len)) = find_h264_start_code(access_unit, offset) {
+        let nal_start = start + start_len;
+        let next = find_h264_start_code(access_unit, nal_start)
+            .map(|(next, _)| next)
+            .unwrap_or(access_unit.len());
+        let nal = access_unit.get(nal_start..next)?;
+        if nal.len() >= 3 && ((nal[0] >> 1) & 0x3f) == 33 {
+            return parse_hevc_sps_luma_bit_depth(&nal[2..]);
+        }
+        offset = nal_start.saturating_add(1);
+    }
+    None
+}
+
+#[cfg(windows)]
+fn parse_hevc_sps_luma_bit_depth(bytes: &[u8]) -> Option<u8> {
+    let rbsp = hevc_rbsp(bytes);
+    let mut bits = BitReader::new(&rbsp);
+    bits.read_bits(4)?;
+    let max_sub_layers_minus1 = bits.read_bits(3)? as usize;
+    bits.read_bit()?;
+    skip_profile_tier_level(&mut bits, max_sub_layers_minus1)?;
+    bits.read_ue()?;
+    let chroma_format_idc = bits.read_ue()?;
+    if chroma_format_idc == 3 {
+        bits.read_bit()?;
+    }
+    bits.read_ue()?;
+    bits.read_ue()?;
+    if bits.read_bit()? != 0 {
+        bits.read_ue()?;
+        bits.read_ue()?;
+        bits.read_ue()?;
+        bits.read_ue()?;
+    }
+    Some(8 + bits.read_ue()? as u8)
+}
+
+#[cfg(windows)]
+fn skip_profile_tier_level(bits: &mut BitReader<'_>, max_sub_layers_minus1: usize) -> Option<()> {
+    bits.read_bits(2)?;
+    bits.read_bit()?;
+    bits.read_bits(5)?;
+    bits.read_bits(32)?;
+    bits.read_bits(4)?;
+    bits.read_bits(16)?;
+    bits.read_bits(16)?;
+    bits.read_bits(12)?;
+    bits.read_bits(8)?;
+
+    let mut profile_present = vec![false; max_sub_layers_minus1];
+    let mut level_present = vec![false; max_sub_layers_minus1];
+    for i in 0..max_sub_layers_minus1 {
+        profile_present[i] = bits.read_bit()? != 0;
+        level_present[i] = bits.read_bit()? != 0;
+    }
+    if max_sub_layers_minus1 > 0 {
+        for _ in max_sub_layers_minus1..8 {
+            bits.read_bits(2)?;
+        }
+    }
+    for i in 0..max_sub_layers_minus1 {
+        if profile_present[i] {
+            bits.read_bits(2)?;
+            bits.read_bit()?;
+            bits.read_bits(5)?;
+            bits.read_bits(32)?;
+            bits.read_bits(4)?;
+            bits.read_bits(16)?;
+            bits.read_bits(16)?;
+            bits.read_bits(12)?;
+        }
+        if level_present[i] {
+            bits.read_bits(8)?;
+        }
+    }
+    Some(())
+}
+
+#[cfg(windows)]
+fn hevc_rbsp(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut zeros = 0usize;
+    for &byte in bytes {
+        if zeros >= 2 && byte == 0x03 {
+            zeros = 0;
+            continue;
+        }
+        out.push(byte);
+        zeros = if byte == 0 { zeros + 1 } else { 0 };
+    }
+    out
+}
+
+#[cfg(windows)]
+struct BitReader<'a> {
+    bytes: &'a [u8],
+    bit_offset: usize,
+}
+
+#[cfg(windows)]
+impl<'a> BitReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            bytes,
+            bit_offset: 0,
+        }
+    }
+
+    fn read_bit(&mut self) -> Option<u8> {
+        let byte = *self.bytes.get(self.bit_offset / 8)?;
+        let bit = (byte >> (7 - (self.bit_offset % 8))) & 1;
+        self.bit_offset += 1;
+        Some(bit)
+    }
+
+    fn read_bits(&mut self, count: usize) -> Option<u32> {
+        let mut value = 0u32;
+        for _ in 0..count {
+            value = (value << 1) | self.read_bit()? as u32;
+        }
+        Some(value)
+    }
+
+    fn read_ue(&mut self) -> Option<u32> {
+        let mut leading_zero_bits = 0u32;
+        while self.read_bit()? == 0 {
+            leading_zero_bits += 1;
+            if leading_zero_bits > 31 {
+                return None;
+            }
+        }
+        let suffix = if leading_zero_bits == 0 {
+            0
+        } else {
+            self.read_bits(leading_zero_bits as usize)?
+        };
+        Some((1 << leading_zero_bits) - 1 + suffix)
+    }
 }
 
 #[cfg(windows)]

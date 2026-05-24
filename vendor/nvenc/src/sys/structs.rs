@@ -489,6 +489,18 @@ pub struct NVencConfig {
     rsvd2: [*mut c_void; 64],
 }
 
+impl NVencConfig {
+    pub fn set_hevc_main10_bit_depths(&mut self) {
+        unsafe {
+            let hevc = &mut *(&mut self.encode_codec_config.hevc
+                as *mut ManuallyDrop<NVencConfigHEVC>
+                as *mut NVencConfigHEVC);
+            hevc.output_bit_depth = NVencBitDepth::Depth10;
+            hevc.input_bit_depth = NVencBitDepth::Depth10;
+        }
+    }
+}
+
 pub const NV_ENC_CONFIG_VER: u32 = struct_version(9) | (1 << 31);
 
 #[bitfields::bitfield(u32)]

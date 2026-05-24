@@ -15,6 +15,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..\..")
+. (Join-Path $PSScriptRoot "pipeline_compare_common.ps1")
 $resultsPath = Join-Path $repoRoot $ResultsDir
 New-Item -ItemType Directory -Force -Path $resultsPath | Out-Null
 
@@ -147,6 +148,9 @@ function Invoke-RdeskPipeline {
     $stdoutPath = Join-Path $resultsPath ("rdesk_{0}_{1}.stdout.log" -f $Pipeline, $stamp)
     $stderrPath = Join-Path $resultsPath ("rdesk_{0}_{1}.stderr.log" -f $Pipeline, $stamp)
     $zeroCopy = -not (Test-SoftwareCodecRequest)
+    $cargoArgs = @("test", "-p", "app") +
+        (Get-PipelineCompareCargoFeatureArgs -Codec $Codec) +
+        @("nvenc_nvdec_harness_prints_stage_metrics", "--", "--ignored", "--nocapture")
     Set-HarnessEnv `
         -Pipeline $Pipeline `
         -Encoder $Encoder `
@@ -159,7 +163,7 @@ function Invoke-RdeskPipeline {
     Write-Host "Running $Pipeline..."
     $process = Start-Process `
         -FilePath "cargo" `
-        -ArgumentList @("test", "-p", "app", "nvenc_nvdec_harness_prints_stage_metrics", "--", "--ignored", "--nocapture") `
+        -ArgumentList $cargoArgs `
         -Wait `
         -PassThru `
         -NoNewWindow `

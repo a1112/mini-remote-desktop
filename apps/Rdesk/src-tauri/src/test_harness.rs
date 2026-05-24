@@ -3017,11 +3017,7 @@ fn comparison_transport_label(
 fn encoder_allows_zero_copy(encoder: &EncoderType) -> bool {
     matches!(
         encoder,
-        EncoderType::None
-            | EncoderType::NvencH264
-            | EncoderType::NvencHevc
-            | EncoderType::NvencHevcMain10
-            | EncoderType::NvencAv1
+        EncoderType::None | EncoderType::NvencH264 | EncoderType::NvencHevc | EncoderType::NvencAv1
     )
 }
 
@@ -4164,7 +4160,7 @@ mod tests {
     #[test]
     fn nvenc_hevc_allows_zero_copy_policy() {
         assert!(encoder_allows_zero_copy(&EncoderType::NvencHevc));
-        assert!(encoder_allows_zero_copy(&EncoderType::NvencHevcMain10));
+        assert!(!encoder_allows_zero_copy(&EncoderType::NvencHevcMain10));
     }
 
     #[test]

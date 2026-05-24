@@ -42,7 +42,9 @@ mod imp {
         D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
         D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
     };
-    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+    use windows::Win32::Graphics::Dxgi::Common::{
+        DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_P010, DXGI_SAMPLE_DESC,
+    };
 
     const H264_SHARED_ASYNC_SLOT_COUNT: usize = 2;
     const HEVC_SHARED_ASYNC_SLOT_COUNT: usize = 3;
@@ -83,6 +85,7 @@ mod imp {
         height: usize,
         fps: u32,
         frame_index: usize,
+        main10: bool,
     }
 
     unsafe impl Send for NvencHevcEncoder {}
@@ -546,7 +549,6 @@ mod imp {
                     self.width, self.height, shared.width, shared.height
                 )));
             }
-
             let source_texture = self.ensure_shared_input(shared)?;
             self.ensure_shared_encode_slots()?;
 
@@ -722,7 +724,7 @@ mod imp {
         }
 
         pub fn preferred_main10_input_memory_kind() -> FrameMemoryKind {
-            FrameMemoryKind::D3D11SharedBgra
+            FrameMemoryKind::Cpu
         }
 
         pub fn new(width: usize, height: usize, fps: u32) -> Result<Self, PipelineError> {
@@ -855,10 +857,19 @@ mod imp {
                 .map_err(|error| {
                     PipelineError::message(format!("nvenc HEVC preset config failed: {error:?}"))
                 })?;
+            let main10 = profile_guid == NV_ENC_HEVC_PROFILE_MAIN10_GUID;
             preset.preset_cfg.profile_guid = profile_guid;
             preset.preset_cfg.rc_params.average_bit_rate = bitrate;
             preset.preset_cfg.frame_interval_p = 1;
             preset.preset_cfg.gop_len = hevc_remote_desktop_keyframe_interval(fps) as u32;
+            let texture_format = if main10 {
+                DXGI_FORMAT_P010
+            } else {
+                DXGI_FORMAT_B8G8R8A8_UNORM
+            };
+            if main10 {
+                preset.preset_cfg.set_hevc_main10_bit_depths();
+            }
 
             let init = InitParams {
                 encode_guid: NV_ENC_CODEC_HEVC_GUID,
@@ -867,7 +878,11 @@ mod imp {
                 aspect_ratio: [width as u32, height as u32],
                 frame_rate: [fps, 1],
                 tuning_info: hevc_tuning_info(ultra_low_latency),
-                buffer_format: NVencBufferFormat::ARGB,
+                buffer_format: if main10 {
+                    NVencBufferFormat::YUV420_10Bit
+                } else {
+                    NVencBufferFormat::ARGB
+                },
                 encode_config: &mut preset.preset_cfg,
                 enable_ptd: true,
                 max_encoder_resolution: [width as u32, height as u32],
@@ -875,12 +890,25 @@ mod imp {
             let encoder = session.init_encoder(init).map_err(|error| {
                 PipelineError::message(format!("nvenc HEVC init encoder failed: {error:?}"))
             })?;
-            let texture =
-                create_encode_texture(&device, width as u32, height as u32).map_err(|error| {
-                    PipelineError::message(format!("create nvenc HEVC texture failed: {error}"))
-                })?;
+            let texture = create_encode_texture_with_format(
+                &device,
+                width as u32,
+                height as u32,
+                texture_format,
+            )
+            .map_err(|error| {
+                PipelineError::message(format!("create nvenc HEVC texture failed: {error}"))
+            })?;
             let registered = encoder
-                .register_resource_dx11(&texture, NVencBufferFormat::ARGB, 0)
+                .register_resource_dx11(
+                    &texture,
+                    if main10 {
+                        NVencBufferFormat::YUV420_10Bit
+                    } else {
+                        NVencBufferFormat::ARGB
+                    },
+                    0,
+                )
                 .map_err(|error| {
                     PipelineError::message(format!(
                         "nvenc HEVC register resource failed: {error:?}"
@@ -904,6 +932,7 @@ mod imp {
                 height,
                 fps,
                 frame_index: 0,
+                main10,
             })
         }
 
@@ -917,6 +946,11 @@ mod imp {
                     "shared texture size mismatch: expected {}x{}, got {}x{}",
                     self.width, self.height, shared.width, shared.height
                 )));
+            }
+            if self.main10 {
+                return Err(PipelineError::message(
+                    "NVENC HEVC Main10 requires CPU BGRA input until shared BGRA to P010 conversion is implemented",
+                ));
             }
 
             let source_texture = self.ensure_shared_input(shared)?;
@@ -1149,7 +1183,11 @@ mod imp {
 
     impl VideoEncoder for NvencHevcEncoder {
         fn input_memory_kind(&self) -> FrameMemoryKind {
-            Self::preferred_input_memory_kind()
+            if self.main10 {
+                Self::preferred_main10_input_memory_kind()
+            } else {
+                Self::preferred_input_memory_kind()
+            }
         }
 
         fn encode(
@@ -1166,19 +1204,21 @@ mod imp {
                 return self.encode_shared_bgra(frame, shared);
             }
 
-            let bgra = to_bgra(frame)?;
-            let row_pitch = self
-                .width
-                .checked_mul(4)
-                .ok_or_else(|| PipelineError::message("row pitch overflow"))?
-                as u32;
+            let upload;
+            let (upload_data, row_pitch) = if self.main10 {
+                upload = bgra_frame_to_p010(frame, self.width, self.height)?;
+                (upload.as_slice(), (self.width * 2) as u32)
+            } else {
+                upload = to_bgra(frame)?;
+                (upload.as_slice(), (self.width * 4) as u32)
+            };
 
             unsafe {
                 self.context.UpdateSubresource(
                     &self.texture,
                     0,
                     None,
-                    bgra.as_ptr() as *const core::ffi::c_void,
+                    upload_data.as_ptr() as *const core::ffi::c_void,
                     row_pitch,
                     0,
                 );
@@ -1326,19 +1366,33 @@ mod imp {
         width: u32,
         height: u32,
     ) -> anyhow::Result<ID3D11Texture2D> {
+        create_encode_texture_with_format(device, width, height, DXGI_FORMAT_B8G8R8A8_UNORM)
+    }
+
+    fn create_encode_texture_with_format(
+        device: &ID3D11Device,
+        width: u32,
+        height: u32,
+        format: DXGI_FORMAT,
+    ) -> anyhow::Result<ID3D11Texture2D> {
         let mut texture = None;
+        let bind_flags = if format == DXGI_FORMAT_P010 {
+            D3D11_BIND_SHADER_RESOURCE.0
+        } else {
+            D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0
+        };
         let desc = D3D11_TEXTURE2D_DESC {
             Width: width,
             Height: height,
             MipLevels: 1,
             ArraySize: 1,
-            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            Format: format,
             SampleDesc: DXGI_SAMPLE_DESC {
                 Count: 1,
                 Quality: 0,
             },
             Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
+            BindFlags: bind_flags as u32,
             CPUAccessFlags: 0,
             MiscFlags: 0,
         };
@@ -1487,6 +1541,76 @@ mod imp {
             }
             FramePixelFormat::Nv12 => nv12_to_bgra(frame),
         }
+    }
+
+    fn bgra_frame_to_p010(
+        frame: &CapturedFrame,
+        width: usize,
+        height: usize,
+    ) -> Result<Vec<u8>, PipelineError> {
+        if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+            return Err(PipelineError::message(
+                "P010 HEVC Main10 input requires even frame dimensions",
+            ));
+        }
+
+        let bgra = to_bgra(frame)?;
+        let y_samples = width
+            .checked_mul(height)
+            .ok_or_else(|| PipelineError::message("P010 luma size overflow"))?;
+        let total_bytes = y_samples
+            .checked_mul(3)
+            .ok_or_else(|| PipelineError::message("P010 frame size overflow"))?;
+        let mut p010 = vec![0_u8; total_bytes];
+        let uv_offset = y_samples * 2;
+
+        for y in 0..height {
+            for x in 0..width {
+                let [yy, _, _] = bgra_pixel_to_yuv8(&bgra, width, x, y);
+                write_p010_sample(&mut p010, (y * width + x) * 2, yy);
+            }
+        }
+
+        for y in (0..height).step_by(2) {
+            for x in (0..width).step_by(2) {
+                let mut u_acc = 0_u32;
+                let mut v_acc = 0_u32;
+                for dy in 0..2 {
+                    for dx in 0..2 {
+                        let [_, u, v] = bgra_pixel_to_yuv8(&bgra, width, x + dx, y + dy);
+                        u_acc += u as u32;
+                        v_acc += v as u32;
+                    }
+                }
+                let u = (u_acc / 4) as u8;
+                let v = (v_acc / 4) as u8;
+                let chroma_index = (y / 2) * width + x;
+                write_p010_sample(&mut p010, uv_offset + chroma_index * 2, u);
+                write_p010_sample(&mut p010, uv_offset + (chroma_index + 1) * 2, v);
+            }
+        }
+
+        Ok(p010)
+    }
+
+    fn bgra_pixel_to_yuv8(bgra: &[u8], width: usize, x: usize, y: usize) -> [u8; 3] {
+        let offset = (y * width + x) * 4;
+        let b = bgra[offset] as i32;
+        let g = bgra[offset + 1] as i32;
+        let r = bgra[offset + 2] as i32;
+        let yy = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+        let u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
+        let v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
+        [
+            yy.clamp(16, 235) as u8,
+            u.clamp(16, 240) as u8,
+            v.clamp(16, 240) as u8,
+        ]
+    }
+
+    fn write_p010_sample(buffer: &mut [u8], byte_offset: usize, value8: u8) {
+        let sample = (value8 as u16) << 8;
+        buffer[byte_offset..byte_offset + 2].copy_from_slice(&sample.to_le_bytes());
     }
 
     fn nv12_len(width: usize, height: usize) -> Option<usize> {

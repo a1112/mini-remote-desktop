@@ -6,6 +6,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 $repo = (Resolve-Path $RepoRoot).Path
+. (Join-Path $repo 'tests/benchmarks/scripts/transport_matrix_common.ps1')
 $scenarioFile = Join-Path $repo $ScenarioPath
 $scenario = Get-Content $scenarioFile -Raw | ConvertFrom-Json
 $gitCommit = (git -C $repo rev-parse --short HEAD).Trim()
@@ -24,6 +25,9 @@ New-Item -ItemType File -Force -Path (Join-Path $logsDir 'signaling.stderr.log')
 $hostStdout = Join-Path $logsDir 'host.stdout.log'
 $hostStderr = Join-Path $logsDir 'host.stderr.log'
 $thresholdPath = Join-Path $repo ("tests/benchmarks/thresholds/{0}" -f $scenario.threshold_file)
+$cargoArgs = @("test", "-p", "app") +
+  (Get-TransportMatrixCargoFeatureArgs -DecodeBackend $scenario.decode_backend) +
+  @("benchmark_run_writes_requested_artifacts", "--", "--nocapture")
 
 $env:MRD_BENCH_ARTIFACT_ROOT = $repo
 $env:MRD_BENCH_SCENARIO = $scenario.scenario
@@ -43,7 +47,7 @@ $env:MRD_BENCH_RENDERER_BACKEND = $scenario.renderer_backend
 
 $process = Start-Process `
   -FilePath "cargo" `
-  -ArgumentList @("test", "-p", "app", "benchmark_run_writes_requested_artifacts", "--", "--nocapture") `
+  -ArgumentList $cargoArgs `
   -WorkingDirectory $repo `
   -RedirectStandardOutput $hostStdout `
   -RedirectStandardError $hostStderr `
@@ -58,6 +62,8 @@ if ($process.ExitCode -ne 0) {
 powershell -ExecutionPolicy Bypass -File (Join-Path $repo 'tests/benchmarks/scripts/summarize_transport_results.ps1') `
   -RunDir $runDir `
   -ThresholdPath $thresholdPath
+
+Assert-TransportMatrixSummaryPassed -SummaryPath (Join-Path $runDir 'summary.json')
 
 Write-Output "Benchmark run completed."
 Write-Output "Run directory: $runDir"

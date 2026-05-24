@@ -99,3 +99,5 @@ x11 = { version = "2.21", features = ["xlib"] }
 # If you use cargo directly instead of tauri's cli you can use this feature flag to switch between tauri's `dev` and `build` modes.
 # DO NOT REMOVE!!
 custom-protocol = [ "tauri/custom-protocol" ]
+production-software-codecs = [ "mrd-decode/production-software-codecs" ]
+production-vvc-software-codec = [ "mrd-decode/production-vvc-software-codec" ]
