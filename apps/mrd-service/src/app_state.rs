@@ -107,10 +107,7 @@ impl CaptureSourceRegistry {
         self.selections.remove(session_id)
     }
 
-    pub fn active_window_capture_count(
-        &self,
-        sessions: &SessionRegistry,
-    ) -> usize {
+    pub fn active_window_capture_count(&self, sessions: &SessionRegistry) -> usize {
         self.selections
             .iter()
             .filter(|(session_id, selection)| {

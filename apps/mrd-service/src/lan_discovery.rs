@@ -7361,10 +7361,8 @@ mod tests {
 
     #[test]
     fn invalid_window_source_error_is_source_loss_not_display_fallback() {
-        let error = window_capture_source_error(
-            "windows:window:0x0",
-            "window hwnd must not be zero",
-        );
+        let error =
+            window_capture_source_error("windows:window:0x0", "window hwnd must not be zero");
 
         assert_eq!(error.code, "WINDOW_CAPTURE_SOURCE_NOT_FOUND");
         assert!(error.message.contains("windows:window:0x0"));
@@ -10759,7 +10757,10 @@ mod tests {
         sender_snapshot_for_source(session_id, "controller-device")
     }
 
-    fn sender_snapshot_for_source(session_id: &SessionId, source_device_id: &str) -> SessionSnapshot {
+    fn sender_snapshot_for_source(
+        session_id: &SessionId,
+        source_device_id: &str,
+    ) -> SessionSnapshot {
         SessionSnapshot {
             session_id: session_id.clone(),
             transport: "quic".to_string(),
@@ -10778,7 +10779,10 @@ mod tests {
         }
     }
 
-    fn receiver_snapshot_for_target(session_id: &SessionId, target_device_id: &str) -> SessionSnapshot {
+    fn receiver_snapshot_for_target(
+        session_id: &SessionId,
+        target_device_id: &str,
+    ) -> SessionSnapshot {
         SessionSnapshot {
             session_id: session_id.clone(),
             transport: "quic".to_string(),
