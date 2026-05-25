@@ -2024,7 +2024,7 @@ async fn accept_lan_remote_session(
         Ok(value) => value,
         Err(error) => return LanRemoteAcceptResult::rejected(error.to_string()),
     };
-    close_existing_lan_sender_sessions(app_state, &session_id).await;
+    close_existing_lan_sender_sessions_for_source(app_state, &source_device_id, &session_id).await;
 
     let (listener, bootstrap) = match QuinnServerListener::bind("0.0.0.0:0").await {
         Ok(value) => value,
@@ -2665,8 +2665,9 @@ async fn close_existing_lan_receiver_sessions_for_target(
     .await;
 }
 
-async fn close_existing_lan_sender_sessions(
+async fn close_existing_lan_sender_sessions_for_source(
     app_state: &Arc<AppState>,
+    source_device_id: &DeviceId,
     next_session_id: &SessionId,
 ) {
     let stale_sessions = {
@@ -2676,6 +2677,7 @@ async fn close_existing_lan_sender_sessions(
             .into_iter()
             .filter(|snapshot| {
                 snapshot.session_id != *next_session_id
+                    && snapshot.source_device_id.as_ref() == Some(source_device_id)
                     && snapshot.sender_active
                     && normalize_transport_kind(&snapshot.transport) == "quic"
                     && !matches!(snapshot.lifecycle_state.as_str(), "closed" | "failed")
@@ -2686,7 +2688,7 @@ async fn close_existing_lan_sender_sessions(
     close_lan_media_sessions(
         app_state,
         stale_sessions,
-        "replaced by newer sender session",
+        "replaced by newer sender session from same source device",
     )
     .await;
 }
@@ -7287,11 +7289,10 @@ fn update_dynamic_window_fps_decision(
 }
 
 async fn active_window_capture_count(app_state: &Arc<AppState>) -> u32 {
-    app_state
-        .capture_sources
-        .lock()
-        .await
-        .active_window_capture_count()
+    let sessions = app_state.sessions.lock().await;
+    let capture_sources = app_state.capture_sources.lock().await;
+    capture_sources
+        .active_window_capture_count(&sessions)
         .try_into()
         .unwrap_or(u32::MAX)
 }
@@ -8804,6 +8805,22 @@ mod tests {
         let session_b = SessionId("window-b".to_string());
         let session_display = SessionId("display".to_string());
 
+        {
+            let mut sessions = app_state.sessions.lock().await;
+            sessions.insert(
+                session_a.clone(),
+                sender_snapshot_for_source(&session_a, "controller-a"),
+            );
+            sessions.insert(
+                session_b.clone(),
+                sender_snapshot_for_source(&session_b, "controller-b"),
+            );
+            sessions.insert(
+                session_display.clone(),
+                sender_snapshot_for_source(&session_display, "controller-c"),
+            );
+        }
+
         store_capture_source_selection(
             &app_state,
             &session_a,
@@ -8839,6 +8856,88 @@ mod tests {
         .await;
 
         assert_eq!(active_window_capture_count(&app_state).await, 2);
+    }
+
+    #[tokio::test]
+    async fn closing_existing_sender_sessions_keeps_other_source_devices_active() {
+        let app_state = Arc::new(AppState::default());
+        let next_session = SessionId("new-controller-a".to_string());
+        let old_same_source = SessionId("old-controller-a".to_string());
+        let other_source = SessionId("controller-b".to_string());
+
+        {
+            let mut sessions = app_state.sessions.lock().await;
+            sessions.insert(
+                old_same_source.clone(),
+                sender_snapshot_for_source(&old_same_source, "controller-a"),
+            );
+            sessions.insert(
+                other_source.clone(),
+                sender_snapshot_for_source(&other_source, "controller-b"),
+            );
+        }
+
+        close_existing_lan_sender_sessions_for_source(
+            &app_state,
+            &DeviceId("controller-a".to_string()),
+            &next_session,
+        )
+        .await;
+
+        let sessions = app_state.sessions.lock().await;
+        assert_eq!(
+            sessions.get(&old_same_source).unwrap().lifecycle_state,
+            "closed"
+        );
+        assert!(sessions.get(&other_source).unwrap().sender_active);
+        assert_eq!(
+            sessions.get(&other_source).unwrap().lifecycle_state,
+            "listening"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_window_capture_count_ignores_remote_and_inactive_selections() {
+        let app_state = Arc::new(AppState::default());
+        let active_sender = SessionId("active-sender".to_string());
+        let remote_controller = SessionId("remote-controller".to_string());
+        let failed_sender = SessionId("failed-sender".to_string());
+
+        {
+            let mut sessions = app_state.sessions.lock().await;
+            sessions.insert(
+                active_sender.clone(),
+                sender_snapshot_for_source(&active_sender, "controller-a"),
+            );
+            sessions.insert(
+                remote_controller.clone(),
+                receiver_snapshot_for_target(&remote_controller, "target-a"),
+            );
+            sessions.insert(
+                failed_sender.clone(),
+                SessionSnapshot {
+                    lifecycle_state: "failed".to_string(),
+                    sender_active: false,
+                    ..sender_snapshot_for_source(&failed_sender, "controller-b")
+                },
+            );
+        }
+
+        for session_id in [&active_sender, &remote_controller, &failed_sender] {
+            store_capture_source_selection(
+                &app_state,
+                session_id,
+                CaptureSourceSelection {
+                    session_id: session_id.clone(),
+                    source: test_window_capture_source("windows:window:0x1111"),
+                    status: "selected".to_string(),
+                    reason: None,
+                },
+            )
+            .await;
+        }
+
+        assert_eq!(active_window_capture_count(&app_state).await, 1);
     }
 
     #[tokio::test]
@@ -10657,10 +10756,14 @@ mod tests {
     }
 
     fn sender_snapshot(session_id: &SessionId) -> SessionSnapshot {
+        sender_snapshot_for_source(session_id, "controller-device")
+    }
+
+    fn sender_snapshot_for_source(session_id: &SessionId, source_device_id: &str) -> SessionSnapshot {
         SessionSnapshot {
             session_id: session_id.clone(),
             transport: "quic".to_string(),
-            source_device_id: Some(DeviceId("controller-device".to_string())),
+            source_device_id: Some(DeviceId(source_device_id.to_string())),
             target_device_id: None,
             local_listen_addr: None,
             local_server_name: None,
@@ -10672,6 +10775,25 @@ mod tests {
             last_error: None,
             sender_active: true,
             receiver_active: false,
+        }
+    }
+
+    fn receiver_snapshot_for_target(session_id: &SessionId, target_device_id: &str) -> SessionSnapshot {
+        SessionSnapshot {
+            session_id: session_id.clone(),
+            transport: "quic".to_string(),
+            source_device_id: None,
+            target_device_id: Some(DeviceId(target_device_id.to_string())),
+            local_listen_addr: None,
+            local_server_name: None,
+            local_cert_der_b64: None,
+            remote_listen_addr: None,
+            remote_server_name: None,
+            remote_cert_der_b64: None,
+            lifecycle_state: "streaming".to_string(),
+            last_error: None,
+            sender_active: false,
+            receiver_active: true,
         }
     }
 

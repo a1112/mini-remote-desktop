@@ -107,10 +107,19 @@ impl CaptureSourceRegistry {
         self.selections.remove(session_id)
     }
 
-    pub fn active_window_capture_count(&self) -> usize {
+    pub fn active_window_capture_count(
+        &self,
+        sessions: &SessionRegistry,
+    ) -> usize {
         self.selections
-            .values()
-            .filter(|selection| selection.source.source_kind == "window")
+            .iter()
+            .filter(|(session_id, selection)| {
+                selection.source.source_kind == "window"
+                    && sessions.get(session_id).is_some_and(|snapshot| {
+                        snapshot.sender_active
+                            && !matches!(snapshot.lifecycle_state.as_str(), "closed" | "failed")
+                    })
+            })
             .count()
     }
 }
