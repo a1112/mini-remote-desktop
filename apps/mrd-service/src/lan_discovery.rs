@@ -2959,6 +2959,32 @@ struct DynamicWindowFpsConfigKey {
     fps: u32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CaptureSourceFailure {
+    code: &'static str,
+    message: String,
+}
+
+fn window_capture_source_error(source_id: &str, detail: impl AsRef<str>) -> CaptureSourceFailure {
+    CaptureSourceFailure {
+        code: "WINDOW_CAPTURE_SOURCE_NOT_FOUND",
+        message: format!(
+            "Window capture source '{}' is unavailable: {}",
+            source_id,
+            detail.as_ref()
+        ),
+    }
+}
+
+fn format_capture_source_failure(source_id: &str, message: String) -> String {
+    if is_windows_window_source_id(source_id) {
+        let failure = window_capture_source_error(source_id, &message);
+        format!("{}: {}", failure.code, failure.message)
+    } else {
+        message
+    }
+}
+
 fn lan_capture_config_key(source_id: &str, profile: &MediaProfile) -> LanCaptureConfigKey {
     LanCaptureConfigKey {
         source_id: source_id.to_string(),
@@ -3114,8 +3140,11 @@ async fn send_quic_media_loop(
                             &session_id,
                             &source_id,
                             &mut consecutive_frame_errors,
-                            format!("failed to initialize LAN capture sender: {error:#}"),
-                            false,
+                            format_capture_source_failure(
+                                &source_id,
+                                format!("failed to initialize LAN capture sender: {error:#}"),
+                            ),
+                            selected_source_is_window,
                         )
                         .await?;
                         continue;
@@ -3137,8 +3166,11 @@ async fn send_quic_media_loop(
                         &session_id,
                         &source_id,
                         &mut consecutive_frame_errors,
-                        format!("failed to create LAN capture source: {error:#}"),
-                        false,
+                        format_capture_source_failure(
+                            &source_id,
+                            format!("failed to create LAN capture source: {error:#}"),
+                        ),
+                        selected_source_is_window,
                     )
                     .await?;
                     continue;
@@ -3186,8 +3218,8 @@ async fn send_quic_media_loop(
                     &session_id,
                     &error_source_id,
                     &mut consecutive_frame_errors,
-                    format!("{error:#}"),
-                    false,
+                    format_capture_source_failure(&error_source_id, format!("{error:#}")),
+                    is_windows_window_source_id(&error_source_id),
                 )
                 .await?;
                 continue;
@@ -7230,6 +7262,18 @@ mod tests {
         let input = window_dynamic_fps_input_for_capture_error(&error);
         assert!(!input.frame_changed);
         assert!(!input.source_available);
+    }
+
+    #[test]
+    fn invalid_window_source_error_is_source_loss_not_display_fallback() {
+        let error = window_capture_source_error(
+            "windows:window:0x0",
+            "window hwnd must not be zero",
+        );
+
+        assert_eq!(error.code, "WINDOW_CAPTURE_SOURCE_NOT_FOUND");
+        assert!(error.message.contains("windows:window:0x0"));
+        assert!(!error.message.contains("display"));
     }
 
     #[test]
