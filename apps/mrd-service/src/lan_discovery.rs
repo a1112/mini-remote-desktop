@@ -6960,6 +6960,97 @@ fn duration_as_millis(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum DynamicWindowFpsTier {
+    Active,
+    Warm,
+    Idle,
+    Suspended,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+struct DynamicWindowFpsDecision {
+    tier: DynamicWindowFpsTier,
+    target_fps: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+struct DynamicWindowFpsInput {
+    frame_changed: bool,
+    input_active: bool,
+    source_available: bool,
+    active_window_capture_count: u32,
+}
+
+#[allow(dead_code)]
+struct DynamicWindowFpsPolicy {
+    profile_fps: u32,
+    quiet_updates: u32,
+    decision: DynamicWindowFpsDecision,
+}
+
+impl DynamicWindowFpsPolicy {
+    #[allow(dead_code)]
+    fn new(profile_fps: u32) -> Self {
+        Self {
+            profile_fps,
+            quiet_updates: 0,
+            decision: DynamicWindowFpsDecision {
+                tier: DynamicWindowFpsTier::Active,
+                target_fps: profile_fps,
+            },
+        }
+    }
+
+    #[allow(dead_code)]
+    fn update(&mut self, input: DynamicWindowFpsInput) -> DynamicWindowFpsDecision {
+        if !input.source_available {
+            self.quiet_updates = 0;
+            self.decision = DynamicWindowFpsDecision {
+                tier: DynamicWindowFpsTier::Suspended,
+                target_fps: 0,
+            };
+            return self.decision;
+        }
+
+        if input.frame_changed || input.input_active {
+            self.quiet_updates = 0;
+            let target_fps = if input.active_window_capture_count >= 3 {
+                self.profile_fps.min(60)
+            } else {
+                self.profile_fps
+            };
+            self.decision = DynamicWindowFpsDecision {
+                tier: DynamicWindowFpsTier::Active,
+                target_fps,
+            };
+            return self.decision;
+        }
+
+        self.quiet_updates = self.quiet_updates.saturating_add(1);
+        self.decision = if self.quiet_updates >= 10 {
+            DynamicWindowFpsDecision {
+                tier: DynamicWindowFpsTier::Idle,
+                target_fps: self.profile_fps.min(15),
+            }
+        } else {
+            DynamicWindowFpsDecision {
+                tier: DynamicWindowFpsTier::Warm,
+                target_fps: self.profile_fps.min(60),
+            }
+        };
+        self.decision
+    }
+
+    #[allow(dead_code)]
+    fn current(&self) -> DynamicWindowFpsDecision {
+        self.decision
+    }
+}
+
 fn new_instance_id() -> String {
     format!("mrd-{}-{}", std::process::id(), now_ms())
 }
@@ -6975,6 +7066,47 @@ fn is_valid_discovery_packet(magic: &str, app_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dynamic_window_fps_enters_active_tier_on_changed_frame() {
+        let mut policy = DynamicWindowFpsPolicy::new(120);
+        let decision = policy.update(DynamicWindowFpsInput {
+            frame_changed: true,
+            input_active: false,
+            source_available: true,
+            active_window_capture_count: 1,
+        });
+        assert_eq!(decision.tier, DynamicWindowFpsTier::Active);
+        assert_eq!(decision.target_fps, 120);
+    }
+
+    #[test]
+    fn dynamic_window_fps_caps_idle_window() {
+        let mut policy = DynamicWindowFpsPolicy::new(120);
+        for _ in 0..10 {
+            policy.update(DynamicWindowFpsInput {
+                frame_changed: false,
+                input_active: false,
+                source_available: true,
+                active_window_capture_count: 1,
+            });
+        }
+        let decision = policy.current();
+        assert_eq!(decision.tier, DynamicWindowFpsTier::Idle);
+        assert!(decision.target_fps <= 15);
+    }
+
+    #[test]
+    fn dynamic_window_fps_reduces_background_fps_under_multi_window_pressure() {
+        let mut policy = DynamicWindowFpsPolicy::new(144);
+        let decision = policy.update(DynamicWindowFpsInput {
+            frame_changed: true,
+            input_active: false,
+            source_available: true,
+            active_window_capture_count: 3,
+        });
+        assert!(decision.target_fps <= 60);
+    }
 
     #[test]
     fn lan_discovery_config_reads_env_port_and_probe_endpoints() {
