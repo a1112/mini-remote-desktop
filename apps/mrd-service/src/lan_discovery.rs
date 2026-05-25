@@ -2959,22 +2959,6 @@ struct DynamicWindowFpsConfigKey {
     fps: u32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct LanCapturedFrameSignature {
-    width: usize,
-    height: usize,
-    timestamp_us: u64,
-}
-
-fn window_frame_changed(
-    previous: Option<&LanCapturedFrameSignature>,
-    current: &LanCapturedFrameSignature,
-) -> bool {
-    previous
-        .map(|previous| previous.width != current.width || previous.height != current.height)
-        .unwrap_or(true)
-}
-
 fn lan_capture_config_key(source_id: &str, profile: &MediaProfile) -> LanCaptureConfigKey {
     LanCaptureConfigKey {
         source_id: source_id.to_string(),
@@ -3033,7 +3017,6 @@ async fn send_quic_media_loop(
     let mut dynamic_window_fps_config: Option<DynamicWindowFpsConfigKey> = None;
     let mut dynamic_window_fps_policy: Option<DynamicWindowFpsPolicy> = None;
     let mut dynamic_window_fps_decision: Option<DynamicWindowFpsDecision> = None;
-    let mut previous_captured_frame_signature: Option<LanCapturedFrameSignature> = None;
     let reliable_media_supported = app_state
         .peer_media_capabilities
         .lock()
@@ -3083,13 +3066,11 @@ async fn send_quic_media_loop(
                 dynamic_window_fps_decision = Some(policy.current());
                 dynamic_window_fps_policy = Some(policy);
                 dynamic_window_fps_config = Some(selected_dynamic_window_fps_config_key);
-                previous_captured_frame_signature = None;
             }
         } else {
             dynamic_window_fps_config = None;
             dynamic_window_fps_policy = None;
             dynamic_window_fps_decision = None;
-            previous_captured_frame_signature = None;
         }
         let frame_interval = if selected_source_is_window {
             media_frame_interval_for_dynamic_decision(&profile, dynamic_window_fps_decision)
@@ -3122,7 +3103,6 @@ async fn send_quic_media_loop(
                         encoder = None;
                         encoder_config = None;
                         active_capture_config = None;
-                        previous_captured_frame_signature = None;
                         update_dynamic_window_fps_decision(
                             &mut dynamic_window_fps_policy,
                             &mut dynamic_window_fps_decision,
@@ -3146,7 +3126,6 @@ async fn send_quic_media_loop(
                     encoder = None;
                     encoder_config = None;
                     active_capture_config = None;
-                    previous_captured_frame_signature = None;
                     update_dynamic_window_fps_decision(
                         &mut dynamic_window_fps_policy,
                         &mut dynamic_window_fps_decision,
@@ -3185,11 +3164,17 @@ async fn send_quic_media_loop(
                     .map(|config| config.source_id.as_str())
                     .unwrap_or("<unknown>")
                     .to_string();
+                if selected_source_is_window && is_winrt_window_capture_no_frame_timeout(&error) {
+                    if let Some(policy) = dynamic_window_fps_policy.as_mut() {
+                        dynamic_window_fps_decision =
+                            Some(policy.update(window_dynamic_fps_input_for_capture_error(&error)));
+                    }
+                    continue;
+                }
                 capture = None;
                 encoder = None;
                 encoder_config = None;
                 active_capture_config = None;
-                previous_captured_frame_signature = None;
                 update_dynamic_window_fps_decision(
                     &mut dynamic_window_fps_policy,
                     &mut dynamic_window_fps_decision,
@@ -3209,18 +3194,8 @@ async fn send_quic_media_loop(
             }
         };
         if let Some(policy) = dynamic_window_fps_policy.as_mut() {
-            let captured_signature = LanCapturedFrameSignature {
-                width: raw_frame.width,
-                height: raw_frame.height,
-                timestamp_us: raw_frame.timestamp_us,
-            };
-            let frame_changed = window_frame_changed(
-                previous_captured_frame_signature.as_ref(),
-                &captured_signature,
-            );
-            previous_captured_frame_signature = Some(captured_signature);
             dynamic_window_fps_decision =
-                Some(policy.update(window_dynamic_fps_input(frame_changed, true)));
+                Some(policy.update(window_dynamic_fps_input_for_captured_frame()));
         }
         let prepare_started = Instant::now();
         let frame_result = prepare_frame_for_h264(raw_frame, &profile);
@@ -7175,6 +7150,18 @@ fn window_dynamic_fps_input(frame_changed: bool, source_available: bool) -> Dyna
     }
 }
 
+fn window_dynamic_fps_input_for_captured_frame() -> DynamicWindowFpsInput {
+    window_dynamic_fps_input(true, true)
+}
+
+fn is_winrt_window_capture_no_frame_timeout(error: &anyhow::Error) -> bool {
+    format!("{error:#}").contains("WinRT capture produced no frame within")
+}
+
+fn window_dynamic_fps_input_for_capture_error(error: &anyhow::Error) -> DynamicWindowFpsInput {
+    window_dynamic_fps_input(false, is_winrt_window_capture_no_frame_timeout(error))
+}
+
 fn update_dynamic_window_fps_decision(
     policy: &mut Option<DynamicWindowFpsPolicy>,
     decision: &mut Option<DynamicWindowFpsDecision>,
@@ -7216,46 +7203,33 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_window_frame_changed_ignores_timestamp_only_changes() {
-        let previous = LanCapturedFrameSignature {
-            width: 1280,
-            height: 720,
-            timestamp_us: 1_000,
-        };
-        let current = LanCapturedFrameSignature {
-            width: 1280,
-            height: 720,
-            timestamp_us: 2_000,
-        };
+    fn successful_window_capture_frame_is_dynamic_fps_activity() {
+        let input = window_dynamic_fps_input_for_captured_frame();
 
-        assert!(!window_frame_changed(Some(&previous), &current));
+        assert!(input.frame_changed);
+        assert!(input.source_available);
     }
 
     #[test]
-    fn dynamic_window_frame_changed_detects_dimension_changes() {
-        let previous = LanCapturedFrameSignature {
-            width: 1280,
-            height: 720,
-            timestamp_us: 1_000,
-        };
-        let current = LanCapturedFrameSignature {
-            width: 1281,
-            height: 720,
-            timestamp_us: 1_000,
-        };
+    fn winrt_no_frame_timeout_is_dynamic_fps_idle_not_source_loss() {
+        let error = anyhow::anyhow!(
+            "failed to capture LAN desktop frame: WinRT capture produced no frame within 1000 ms"
+        );
 
-        assert!(window_frame_changed(Some(&previous), &current));
+        assert!(is_winrt_window_capture_no_frame_timeout(&error));
+        let input = window_dynamic_fps_input_for_capture_error(&error);
+        assert!(!input.frame_changed);
+        assert!(input.source_available);
     }
 
     #[test]
-    fn dynamic_window_frame_changed_treats_first_frame_as_changed() {
-        let current = LanCapturedFrameSignature {
-            width: 1280,
-            height: 720,
-            timestamp_us: 1_000,
-        };
+    fn non_timeout_window_capture_error_is_dynamic_fps_source_loss() {
+        let error = anyhow::anyhow!("failed to capture LAN desktop frame: access denied");
 
-        assert!(window_frame_changed(None, &current));
+        assert!(!is_winrt_window_capture_no_frame_timeout(&error));
+        let input = window_dynamic_fps_input_for_capture_error(&error);
+        assert!(!input.frame_changed);
+        assert!(!input.source_available);
     }
 
     #[test]
