@@ -7011,7 +7011,7 @@ impl DynamicWindowFpsPolicy {
             self.quiet_updates = 0;
             self.decision = DynamicWindowFpsDecision {
                 tier: DynamicWindowFpsTier::Suspended,
-                target_fps: 0,
+                target_fps: 1,
             };
             return self.decision;
         }
@@ -7093,7 +7093,7 @@ mod tests {
         }
         let decision = policy.current();
         assert_eq!(decision.tier, DynamicWindowFpsTier::Idle);
-        assert!(decision.target_fps <= 15);
+        assert_eq!(decision.target_fps, 15);
     }
 
     #[test]
@@ -7105,7 +7105,68 @@ mod tests {
             source_available: true,
             active_window_capture_count: 3,
         });
-        assert!(decision.target_fps <= 60);
+        assert_eq!(decision.tier, DynamicWindowFpsTier::Active);
+        assert_eq!(decision.target_fps, 60);
+    }
+
+    #[test]
+    fn dynamic_window_fps_suspended_keeps_nonzero_heartbeat_target() {
+        let mut policy = DynamicWindowFpsPolicy::new(120);
+        let decision = policy.update(DynamicWindowFpsInput {
+            frame_changed: false,
+            input_active: false,
+            source_available: false,
+            active_window_capture_count: 1,
+        });
+
+        assert_eq!(decision.tier, DynamicWindowFpsTier::Suspended);
+        assert_eq!(decision.target_fps, 1);
+    }
+
+    #[test]
+    fn dynamic_window_fps_recovers_from_suspended_to_active_on_changed_frame() {
+        let mut policy = DynamicWindowFpsPolicy::new(120);
+        let suspended = policy.update(DynamicWindowFpsInput {
+            frame_changed: false,
+            input_active: false,
+            source_available: false,
+            active_window_capture_count: 1,
+        });
+        assert_eq!(suspended.tier, DynamicWindowFpsTier::Suspended);
+
+        let decision = policy.update(DynamicWindowFpsInput {
+            frame_changed: true,
+            input_active: false,
+            source_available: true,
+            active_window_capture_count: 1,
+        });
+
+        assert_eq!(decision.tier, DynamicWindowFpsTier::Active);
+        assert_eq!(decision.target_fps, 120);
+    }
+
+    #[test]
+    fn dynamic_window_fps_recovers_from_idle_to_active_on_input() {
+        let mut policy = DynamicWindowFpsPolicy::new(120);
+        for _ in 0..10 {
+            policy.update(DynamicWindowFpsInput {
+                frame_changed: false,
+                input_active: false,
+                source_available: true,
+                active_window_capture_count: 1,
+            });
+        }
+        assert_eq!(policy.current().tier, DynamicWindowFpsTier::Idle);
+
+        let decision = policy.update(DynamicWindowFpsInput {
+            frame_changed: false,
+            input_active: true,
+            source_available: true,
+            active_window_capture_count: 1,
+        });
+
+        assert_eq!(decision.tier, DynamicWindowFpsTier::Active);
+        assert_eq!(decision.target_fps, 120);
     }
 
     #[test]
