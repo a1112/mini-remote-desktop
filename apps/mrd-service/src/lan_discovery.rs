@@ -1134,7 +1134,6 @@ pub async fn request_lan_remote_session(
         .await
         .with_context(|| format!("LAN peer not found: {}", target_device_id.0))?;
     ensure_peer_supports_requested_media(target_device_id, transport_kind, &peer_transports)?;
-    close_existing_lan_receiver_sessions_for_target(app_state, target_device_id, session_id).await;
 
     let (source_device_id, source_device_name) = {
         let devices = app_state.devices.lock().await;
@@ -1416,6 +1415,12 @@ pub async fn request_lan_capture_source_select(
             if accepted {
                 let selection =
                     selection.context("LAN peer accepted capture source without selection")?;
+                close_existing_display_lan_receiver_sessions_for_target(
+                    app_state,
+                    session_id,
+                    &selection.source,
+                )
+                .await;
                 store_capture_source_selection(app_state, session_id, selection.clone()).await;
                 Ok(selection)
             } else {
@@ -2024,8 +2029,6 @@ async fn accept_lan_remote_session(
         Ok(value) => value,
         Err(error) => return LanRemoteAcceptResult::rejected(error.to_string()),
     };
-    close_existing_lan_sender_sessions_for_source(app_state, &source_device_id, &session_id).await;
-
     let (listener, bootstrap) = match QuinnServerListener::bind("0.0.0.0:0").await {
         Ok(value) => value,
         Err(error) => {
@@ -2193,6 +2196,8 @@ async fn accept_lan_capture_source_select_from_sources(
         status: "selected".to_string(),
         reason: None,
     };
+    close_existing_display_lan_sender_sessions_for_source(app_state, session_id, &selection.source)
+        .await;
     store_capture_source_selection(app_state, session_id, selection.clone()).await;
     Ok(selection)
 }
@@ -2638,20 +2643,36 @@ fn quic_bootstrap_for_peer(
     })
 }
 
-async fn close_existing_lan_receiver_sessions_for_target(
+async fn close_existing_display_lan_receiver_sessions_for_target(
     app_state: &Arc<AppState>,
-    target_device_id: &DeviceId,
     next_session_id: &SessionId,
+    next_source: &CaptureSource,
 ) {
+    if is_window_capture_source(next_source) {
+        return;
+    }
+    let target_device_id = {
+        let sessions = app_state.sessions.lock().await;
+        sessions
+            .get(next_session_id)
+            .and_then(|snapshot| snapshot.target_device_id.clone())
+    };
+    let Some(target_device_id) = target_device_id else {
+        return;
+    };
     let stale_sessions = {
         let sessions = app_state.sessions.lock().await;
+        let capture_sources = app_state.capture_sources.lock().await;
         sessions
             .list_all()
             .into_iter()
             .filter(|snapshot| {
                 snapshot.session_id != *next_session_id
-                    && snapshot.target_device_id.as_ref() == Some(target_device_id)
+                    && snapshot.target_device_id.as_ref() == Some(&target_device_id)
                     && snapshot.receiver_active
+                    && !capture_sources
+                        .get(&snapshot.session_id)
+                        .is_some_and(|selection| is_window_capture_source(&selection.source))
                     && !matches!(snapshot.lifecycle_state.as_str(), "closed" | "failed")
             })
             .map(|snapshot| snapshot.session_id)
@@ -2660,26 +2681,42 @@ async fn close_existing_lan_receiver_sessions_for_target(
     close_lan_media_sessions(
         app_state,
         stale_sessions,
-        "replaced by newer receiver session",
+        "replaced by newer display receiver session",
     )
     .await;
 }
 
-async fn close_existing_lan_sender_sessions_for_source(
+async fn close_existing_display_lan_sender_sessions_for_source(
     app_state: &Arc<AppState>,
-    source_device_id: &DeviceId,
     next_session_id: &SessionId,
+    next_source: &CaptureSource,
 ) {
+    if is_window_capture_source(next_source) {
+        return;
+    }
+    let source_device_id = {
+        let sessions = app_state.sessions.lock().await;
+        sessions
+            .get(next_session_id)
+            .and_then(|snapshot| snapshot.source_device_id.clone())
+    };
+    let Some(source_device_id) = source_device_id else {
+        return;
+    };
     let stale_sessions = {
         let sessions = app_state.sessions.lock().await;
+        let capture_sources = app_state.capture_sources.lock().await;
         sessions
             .list_all()
             .into_iter()
             .filter(|snapshot| {
                 snapshot.session_id != *next_session_id
-                    && snapshot.source_device_id.as_ref() == Some(source_device_id)
+                    && snapshot.source_device_id.as_ref() == Some(&source_device_id)
                     && snapshot.sender_active
                     && normalize_transport_kind(&snapshot.transport) == "quic"
+                    && !capture_sources
+                        .get(&snapshot.session_id)
+                        .is_some_and(|selection| is_window_capture_source(&selection.source))
                     && !matches!(snapshot.lifecycle_state.as_str(), "closed" | "failed")
             })
             .map(|snapshot| snapshot.session_id)
@@ -2688,9 +2725,13 @@ async fn close_existing_lan_sender_sessions_for_source(
     close_lan_media_sessions(
         app_state,
         stale_sessions,
-        "replaced by newer sender session from same source device",
+        "replaced by newer display sender session from same source device",
     )
     .await;
+}
+
+fn is_window_capture_source(source: &CaptureSource) -> bool {
+    source.source_kind.eq_ignore_ascii_case("window")
 }
 
 async fn close_lan_media_sessions(
@@ -8857,17 +8898,92 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn closing_existing_sender_sessions_keeps_other_source_devices_active() {
+    async fn window_sender_selection_keeps_same_source_device_sessions_active() {
         let app_state = Arc::new(AppState::default());
-        let next_session = SessionId("new-controller-a".to_string());
-        let old_same_source = SessionId("old-controller-a".to_string());
-        let other_source = SessionId("controller-b".to_string());
+        let next_session = SessionId("new-window-controller-a".to_string());
+        let old_display = SessionId("old-display-controller-a".to_string());
+        let old_window = SessionId("old-window-controller-a".to_string());
 
         {
             let mut sessions = app_state.sessions.lock().await;
             sessions.insert(
-                old_same_source.clone(),
-                sender_snapshot_for_source(&old_same_source, "controller-a"),
+                next_session.clone(),
+                sender_snapshot_for_source(&next_session, "controller-a"),
+            );
+            sessions.insert(
+                old_display.clone(),
+                sender_snapshot_for_source(&old_display, "controller-a"),
+            );
+            sessions.insert(
+                old_window.clone(),
+                sender_snapshot_for_source(&old_window, "controller-a"),
+            );
+        }
+
+        store_capture_source_selection(
+            &app_state,
+            &old_display,
+            CaptureSourceSelection {
+                session_id: old_display.clone(),
+                source: test_display_capture_source("windows:display-shared:0"),
+                status: "selected".to_string(),
+                reason: None,
+            },
+        )
+        .await;
+        store_capture_source_selection(
+            &app_state,
+            &old_window,
+            CaptureSourceSelection {
+                session_id: old_window.clone(),
+                source: test_window_capture_source("windows:window:0x1111"),
+                status: "selected".to_string(),
+                reason: None,
+            },
+        )
+        .await;
+
+        close_existing_display_lan_sender_sessions_for_source(
+            &app_state,
+            &next_session,
+            &test_window_capture_source("windows:window:0x2222"),
+        )
+        .await;
+
+        let sessions = app_state.sessions.lock().await;
+        assert!(sessions.get(&old_display).unwrap().sender_active);
+        assert_eq!(
+            sessions.get(&old_display).unwrap().lifecycle_state,
+            "listening"
+        );
+        assert!(sessions.get(&old_window).unwrap().sender_active);
+        assert_eq!(
+            sessions.get(&old_window).unwrap().lifecycle_state,
+            "listening"
+        );
+    }
+
+    #[tokio::test]
+    async fn display_sender_selection_closes_only_existing_display_sessions_from_same_source() {
+        let app_state = Arc::new(AppState::default());
+        let next_session = SessionId("new-display-controller-a".to_string());
+        let old_display = SessionId("old-display-controller-a".to_string());
+        let old_window = SessionId("old-window-controller-a".to_string());
+        let other_source = SessionId("display-controller-b".to_string());
+
+        {
+            let mut sessions = app_state.sessions.lock().await;
+            sessions.insert(
+                next_session.clone(),
+                sender_snapshot_for_source(&next_session, "controller-a"),
+            );
+            sessions.insert(
+                old_display.clone(),
+                sender_snapshot_for_source(&old_display, "controller-a"),
+            );
+            sessions.insert(
+                old_window.clone(),
+                sender_snapshot_for_source(&old_window, "controller-a"),
             );
             sessions.insert(
                 other_source.clone(),
@@ -8875,22 +8991,215 @@ mod tests {
             );
         }
 
-        close_existing_lan_sender_sessions_for_source(
+        store_capture_source_selection(
             &app_state,
-            &DeviceId("controller-a".to_string()),
+            &old_display,
+            CaptureSourceSelection {
+                session_id: old_display.clone(),
+                source: test_display_capture_source("windows:display-shared:0"),
+                status: "selected".to_string(),
+                reason: None,
+            },
+        )
+        .await;
+        store_capture_source_selection(
+            &app_state,
+            &old_window,
+            CaptureSourceSelection {
+                session_id: old_window.clone(),
+                source: test_window_capture_source("windows:window:0x1111"),
+                status: "selected".to_string(),
+                reason: None,
+            },
+        )
+        .await;
+        store_capture_source_selection(
+            &app_state,
+            &other_source,
+            CaptureSourceSelection {
+                session_id: other_source.clone(),
+                source: test_display_capture_source("windows:display-shared:1"),
+                status: "selected".to_string(),
+                reason: None,
+            },
+        )
+        .await;
+
+        close_existing_display_lan_sender_sessions_for_source(
+            &app_state,
             &next_session,
+            &test_display_capture_source("windows:display-shared:2"),
         )
         .await;
 
         let sessions = app_state.sessions.lock().await;
         assert_eq!(
-            sessions.get(&old_same_source).unwrap().lifecycle_state,
+            sessions.get(&old_display).unwrap().lifecycle_state,
             "closed"
+        );
+        assert!(!sessions.get(&old_display).unwrap().sender_active);
+        assert!(sessions.get(&old_window).unwrap().sender_active);
+        assert_eq!(
+            sessions.get(&old_window).unwrap().lifecycle_state,
+            "listening"
         );
         assert!(sessions.get(&other_source).unwrap().sender_active);
         assert_eq!(
             sessions.get(&other_source).unwrap().lifecycle_state,
             "listening"
+        );
+    }
+
+    #[tokio::test]
+    async fn window_receiver_selection_keeps_same_target_sessions_active() {
+        let app_state = Arc::new(AppState::default());
+        let next_session = SessionId("new-window-target-a".to_string());
+        let old_display = SessionId("old-display-target-a".to_string());
+        let old_window = SessionId("old-window-target-a".to_string());
+
+        {
+            let mut sessions = app_state.sessions.lock().await;
+            sessions.insert(
+                next_session.clone(),
+                receiver_snapshot_for_target(&next_session, "target-a"),
+            );
+            sessions.insert(
+                old_display.clone(),
+                receiver_snapshot_for_target(&old_display, "target-a"),
+            );
+            sessions.insert(
+                old_window.clone(),
+                receiver_snapshot_for_target(&old_window, "target-a"),
+            );
+        }
+
+        store_capture_source_selection(
+            &app_state,
+            &old_display,
+            CaptureSourceSelection {
+                session_id: old_display.clone(),
+                source: test_display_capture_source("windows:display-shared:0"),
+                status: "selected".to_string(),
+                reason: None,
+            },
+        )
+        .await;
+        store_capture_source_selection(
+            &app_state,
+            &old_window,
+            CaptureSourceSelection {
+                session_id: old_window.clone(),
+                source: test_window_capture_source("windows:window:0x1111"),
+                status: "selected".to_string(),
+                reason: None,
+            },
+        )
+        .await;
+
+        close_existing_display_lan_receiver_sessions_for_target(
+            &app_state,
+            &next_session,
+            &test_window_capture_source("windows:window:0x2222"),
+        )
+        .await;
+
+        let sessions = app_state.sessions.lock().await;
+        assert!(sessions.get(&old_display).unwrap().receiver_active);
+        assert_eq!(
+            sessions.get(&old_display).unwrap().lifecycle_state,
+            "streaming"
+        );
+        assert!(sessions.get(&old_window).unwrap().receiver_active);
+        assert_eq!(
+            sessions.get(&old_window).unwrap().lifecycle_state,
+            "streaming"
+        );
+    }
+
+    #[tokio::test]
+    async fn display_receiver_selection_closes_only_existing_display_sessions_for_same_target() {
+        let app_state = Arc::new(AppState::default());
+        let next_session = SessionId("new-display-target-a".to_string());
+        let old_display = SessionId("old-display-target-a".to_string());
+        let old_window = SessionId("old-window-target-a".to_string());
+        let other_target = SessionId("display-target-b".to_string());
+
+        {
+            let mut sessions = app_state.sessions.lock().await;
+            sessions.insert(
+                next_session.clone(),
+                receiver_snapshot_for_target(&next_session, "target-a"),
+            );
+            sessions.insert(
+                old_display.clone(),
+                receiver_snapshot_for_target(&old_display, "target-a"),
+            );
+            sessions.insert(
+                old_window.clone(),
+                receiver_snapshot_for_target(&old_window, "target-a"),
+            );
+            sessions.insert(
+                other_target.clone(),
+                receiver_snapshot_for_target(&other_target, "target-b"),
+            );
+        }
+
+        store_capture_source_selection(
+            &app_state,
+            &old_display,
+            CaptureSourceSelection {
+                session_id: old_display.clone(),
+                source: test_display_capture_source("windows:display-shared:0"),
+                status: "selected".to_string(),
+                reason: None,
+            },
+        )
+        .await;
+        store_capture_source_selection(
+            &app_state,
+            &old_window,
+            CaptureSourceSelection {
+                session_id: old_window.clone(),
+                source: test_window_capture_source("windows:window:0x1111"),
+                status: "selected".to_string(),
+                reason: None,
+            },
+        )
+        .await;
+        store_capture_source_selection(
+            &app_state,
+            &other_target,
+            CaptureSourceSelection {
+                session_id: other_target.clone(),
+                source: test_display_capture_source("windows:display-shared:1"),
+                status: "selected".to_string(),
+                reason: None,
+            },
+        )
+        .await;
+
+        close_existing_display_lan_receiver_sessions_for_target(
+            &app_state,
+            &next_session,
+            &test_display_capture_source("windows:display-shared:2"),
+        )
+        .await;
+
+        let sessions = app_state.sessions.lock().await;
+        assert_eq!(
+            sessions.get(&old_display).unwrap().lifecycle_state,
+            "closed"
+        );
+        assert!(!sessions.get(&old_display).unwrap().receiver_active);
+        assert!(sessions.get(&old_window).unwrap().receiver_active);
+        assert_eq!(
+            sessions.get(&old_window).unwrap().lifecycle_state,
+            "streaming"
+        );
+        assert!(sessions.get(&other_target).unwrap().receiver_active);
+        assert_eq!(
+            sessions.get(&other_target).unwrap().lifecycle_state,
+            "streaming"
         );
     }
 
