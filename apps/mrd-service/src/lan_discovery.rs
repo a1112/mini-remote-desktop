@@ -5897,7 +5897,7 @@ fn create_windows_lan_frame_capture(
     source_id: &str,
     profile: &MediaProfile,
 ) -> Result<LanFrameCapture> {
-    match windows_lan_capture_backend(source_id) {
+    match windows_lan_capture_backend(source_id, windows_lan_nvenc_h264_available()) {
         WindowsLanCaptureBackend::DxgiShared => {
             let device_name = crate::display_mode::display_device_name_for_source_id(source_id)
                 .with_context(|| format!("failed to resolve Windows display for {source_id}"))?;
@@ -5922,7 +5922,12 @@ fn create_windows_lan_frame_capture(
                     })?;
             capture
                 .start()
-                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                .map_err(|error| anyhow::anyhow!(error.to_string()))
+                .with_context(|| {
+                    format!(
+                        "failed to start WinRT shared window capture for {source_id} (WinrtWindowShared, hwnd=0x{hwnd:x})"
+                    )
+                })?;
             Ok(LanFrameCapture::Winrt(capture))
         }
         WindowsLanCaptureBackend::Winrt => Ok(LanFrameCapture::Winrt(
@@ -5940,15 +5945,31 @@ enum WindowsLanCaptureBackend {
 }
 
 #[cfg(windows)]
-fn windows_lan_capture_backend(source_id: &str) -> WindowsLanCaptureBackend {
+fn windows_lan_capture_backend(
+    source_id: &str,
+    nvenc_h264_available: bool,
+) -> WindowsLanCaptureBackend {
     let normalized = source_id.trim().to_ascii_lowercase();
     if normalized.starts_with("windows:display-shared:") {
         WindowsLanCaptureBackend::DxgiShared
-    } else if normalized.starts_with("windows:window:") {
+    } else if normalized.starts_with("windows:window:")
+        && windows_lan_window_capture_uses_shared_texture(nvenc_h264_available)
+    {
         WindowsLanCaptureBackend::WinrtWindowShared
     } else {
         WindowsLanCaptureBackend::Winrt
     }
+}
+
+#[cfg(windows)]
+fn windows_lan_window_capture_uses_shared_texture(nvenc_h264_available: bool) -> bool {
+    nvenc_h264_available
+}
+
+#[cfg(windows)]
+fn windows_lan_nvenc_h264_available() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| mrd_encode_nvenc::NvencH264Encoder::probe_h264_available().is_ok())
 }
 
 #[cfg(windows)]
@@ -8826,11 +8847,11 @@ mod tests {
     #[test]
     fn windows_lan_sender_uses_monitor_specific_backends_for_display_sources() {
         assert_eq!(
-            windows_lan_capture_backend("windows:display-shared:0"),
+            windows_lan_capture_backend("windows:display-shared:0", false),
             WindowsLanCaptureBackend::DxgiShared
         );
         assert_eq!(
-            windows_lan_capture_backend("windows:display:0"),
+            windows_lan_capture_backend("windows:display:0", true),
             WindowsLanCaptureBackend::Winrt
         );
     }
@@ -8839,16 +8860,37 @@ mod tests {
     #[test]
     fn windows_lan_capture_backend_selects_winrt_window_shared_for_window_sources() {
         assert_eq!(
-            windows_lan_capture_backend("windows:window:0x1234"),
+            windows_lan_capture_backend("windows:window:0x1234", true),
             WindowsLanCaptureBackend::WinrtWindowShared
         );
     }
 
     #[cfg(windows)]
     #[test]
+    fn windows_lan_capture_backend_keeps_window_sources_on_cpu_when_nvenc_h264_is_unavailable() {
+        assert_eq!(
+            windows_lan_capture_backend("windows:window:0x1234", false),
+            WindowsLanCaptureBackend::Winrt
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_lan_window_shared_capture_uses_shared_texture_when_nvenc_h264_is_available() {
+        assert!(windows_lan_window_capture_uses_shared_texture(true));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_lan_window_shared_capture_uses_cpu_texture_when_nvenc_h264_is_unavailable() {
+        assert!(!windows_lan_window_capture_uses_shared_texture(false));
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn windows_lan_capture_backend_keeps_dxgi_shared_for_display_shared_sources() {
         assert_eq!(
-            windows_lan_capture_backend("windows:display-shared:1"),
+            windows_lan_capture_backend("windows:display-shared:1", false),
             WindowsLanCaptureBackend::DxgiShared
         );
     }
