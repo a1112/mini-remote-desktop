@@ -9,7 +9,7 @@
 
 use base64::{engine::general_purpose, Engine as _};
 use image::{codecs::png::PngEncoder, ColorType, ImageEncoder};
-use mrd_application::ports::{SessionLifecycleState, SessionSnapshot};
+use mrd_application::ports::SessionSnapshot;
 use mrd_ipc::{
     AttachedRenderSurface, AuditEvent, AuditLogQuery, CapabilitySnapshot, CaptureSourceSelection,
     MediaAdaptationSnapshot, MediaPipelineSnapshot, MediaProfile, MediaProfileNegotiation,
@@ -1565,6 +1565,7 @@ impl Default for AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mrd_application::ports::SessionLifecycleState;
 
     #[test]
     fn session_registry_tracks_sessions() {
