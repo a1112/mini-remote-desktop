@@ -52,3 +52,4 @@ mrd-codec-videotoolbox = { path = "../../crates/mrd-codec-videotoolbox" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 mrd-capture-pipewire = { path = "../../crates/mrd-capture-pipewire", features = ["portal"] }
+mrd-encode-nvenc = { path = "../../crates/mrd-encode-nvenc" }

@@ -9,7 +9,7 @@ use mrd_ipc::{
     LanPeerInfo, MediaProfile, MediaProfileNegotiation, MediaSenderTransportSnapshot,
     MediaStageMetrics, MediaTestImpairmentSnapshot,
 };
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use mrd_pipeline_core::FrameCapture;
 use mrd_pipeline_core::{
     CapturedFrame, DecodedFrame, DecodedFrameData, FramePixelFormat, VideoDecoder, VideoEncoder,
