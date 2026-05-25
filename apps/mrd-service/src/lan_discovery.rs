@@ -5920,6 +5920,9 @@ fn create_windows_lan_frame_capture(
                     .with_context(|| {
                         format!("failed to create WinRT shared window capture for {source_id}")
                     })?;
+            let (target_width, target_height) =
+                window_h264_capture_dimensions(profile.width as usize, profile.height as usize);
+            capture.set_target_dimensions(target_width, target_height);
             capture
                 .start()
                 .map_err(|error| anyhow::anyhow!(error.to_string()))
@@ -6085,6 +6088,10 @@ fn h264_target_dimensions(width: usize, height: usize, profile: &MediaProfile) -
     let target_width = even_dimension(((width as f64 * scale).round() as usize).max(2));
     let target_height = even_dimension(((height as f64 * scale).round() as usize).max(2));
     (target_width.max(2), target_height.max(2))
+}
+
+fn window_h264_capture_dimensions(width: usize, height: usize) -> (usize, usize) {
+    (even_dimension(width).max(2), even_dimension(height).max(2))
 }
 
 fn even_dimension(value: usize) -> usize {
@@ -8401,6 +8408,22 @@ mod tests {
         assert!(error
             .to_string()
             .contains("requires exact selected profile"));
+    }
+
+    #[test]
+    fn window_h264_capture_dimensions_makes_odd_profile_dimensions_even_and_non_zero() {
+        assert_eq!(window_h264_capture_dimensions(1001, 777), (1000, 776));
+        assert_eq!(window_h264_capture_dimensions(1, 1), (2, 2));
+    }
+
+    #[test]
+    fn window_h264_capture_dimensions_returns_even_dimensions_for_odd_window_profile() {
+        let (width, height) = window_h264_capture_dimensions(1001, 777);
+
+        assert_eq!(width % 2, 0);
+        assert_eq!(height % 2, 0);
+        assert!(width >= 2);
+        assert!(height >= 2);
     }
 
     #[test]
