@@ -2966,6 +2966,15 @@ struct LanCapturedFrameSignature {
     timestamp_us: u64,
 }
 
+fn window_frame_changed(
+    previous: Option<&LanCapturedFrameSignature>,
+    current: &LanCapturedFrameSignature,
+) -> bool {
+    previous
+        .map(|previous| previous.width != current.width || previous.height != current.height)
+        .unwrap_or(true)
+}
+
 fn lan_capture_config_key(source_id: &str, profile: &MediaProfile) -> LanCaptureConfigKey {
     LanCaptureConfigKey {
         source_id: source_id.to_string(),
@@ -3205,9 +3214,10 @@ async fn send_quic_media_loop(
                 height: raw_frame.height,
                 timestamp_us: raw_frame.timestamp_us,
             };
-            let frame_changed = previous_captured_frame_signature
-                .map(|previous| previous != captured_signature)
-                .unwrap_or(true);
+            let frame_changed = window_frame_changed(
+                previous_captured_frame_signature.as_ref(),
+                &captured_signature,
+            );
             previous_captured_frame_signature = Some(captured_signature);
             dynamic_window_fps_decision =
                 Some(policy.update(window_dynamic_fps_input(frame_changed, true)));
@@ -7203,6 +7213,49 @@ mod tests {
         });
         assert_eq!(decision.tier, DynamicWindowFpsTier::Active);
         assert_eq!(decision.target_fps, 120);
+    }
+
+    #[test]
+    fn dynamic_window_frame_changed_ignores_timestamp_only_changes() {
+        let previous = LanCapturedFrameSignature {
+            width: 1280,
+            height: 720,
+            timestamp_us: 1_000,
+        };
+        let current = LanCapturedFrameSignature {
+            width: 1280,
+            height: 720,
+            timestamp_us: 2_000,
+        };
+
+        assert!(!window_frame_changed(Some(&previous), &current));
+    }
+
+    #[test]
+    fn dynamic_window_frame_changed_detects_dimension_changes() {
+        let previous = LanCapturedFrameSignature {
+            width: 1280,
+            height: 720,
+            timestamp_us: 1_000,
+        };
+        let current = LanCapturedFrameSignature {
+            width: 1281,
+            height: 720,
+            timestamp_us: 1_000,
+        };
+
+        assert!(window_frame_changed(Some(&previous), &current));
+    }
+
+    #[test]
+    fn dynamic_window_frame_changed_treats_first_frame_as_changed() {
+        let current = LanCapturedFrameSignature {
+            width: 1280,
+            height: 720,
+            timestamp_us: 1_000,
+        };
+
+        assert!(window_frame_changed(None, &current));
     }
 
     #[test]
