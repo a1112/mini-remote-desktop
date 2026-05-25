@@ -77,9 +77,31 @@ pub struct WinrtCapture {
     source_height: usize,
     width: usize,
     height: usize,
+    target_dimensions: WinrtTargetDimensions,
 }
 
 unsafe impl Send for WinrtCapture {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WinrtTargetDimensions {
+    Native,
+    Fixed { width: usize, height: usize },
+}
+
+impl WinrtTargetDimensions {
+    fn resolve(self, source_width: usize, source_height: usize) -> (usize, usize) {
+        match self {
+            Self::Native => (
+                native_even_target_dimension(source_width),
+                native_even_target_dimension(source_height),
+            ),
+            Self::Fixed { width, height } => (
+                clamp_even_target_dimension(width, source_width),
+                clamp_even_target_dimension(height, source_height),
+            ),
+        }
+    }
+}
 
 struct SharedBgraTexture {
     texture: ID3D11Texture2D,
@@ -212,6 +234,7 @@ impl WinrtCapture {
             source_height: height,
             width,
             height,
+            target_dimensions: WinrtTargetDimensions::Native,
         })
     }
 
@@ -366,8 +389,10 @@ impl WinrtCapture {
 
     /// Set target output dimensions for D3D11 shared-texture output.
     pub fn set_target_dimensions(&mut self, width: usize, height: usize) {
-        self.width = clamp_even_target_dimension(width, self.source_width);
-        self.height = clamp_even_target_dimension(height, self.source_height);
+        self.target_dimensions = WinrtTargetDimensions::Fixed { width, height };
+        (self.width, self.height) = self
+            .target_dimensions
+            .resolve(self.source_width, self.source_height);
         self.shared_texture = None;
     }
 
@@ -650,12 +675,20 @@ impl WinrtCapture {
         source_width: usize,
         source_height: usize,
     ) -> Result<CapturedFrame, PipelineError> {
+        if !source_supports_shared_even_target(source_width)
+            || !source_supports_shared_even_target(source_height)
+        {
+            return Err(PipelineError::message(format!(
+                "WinRT shared texture source is too small for even target: {source_width}x{source_height}"
+            )));
+        }
+
         let source_resource: ID3D11Resource = texture.cast().map_err(|e| {
             PipelineError::message(format!("cast source texture to resource failed: {e:?}"))
         })?;
 
-        let width = self.width.clamp(2, source_width.max(2));
-        let height = self.height.clamp(2, source_height.max(2));
+        let width = self.width.clamp(2, source_width);
+        let height = self.height.clamp(2, source_height);
         self.ensure_shared_texture(width, height)?;
         let shared = self
             .shared_texture
@@ -753,16 +786,9 @@ impl WinrtCapture {
             )
             .map_err(|e| PipelineError::message(format!("recreate frame pool failed: {e:?}")))?;
 
-        let was_native_size = self.width == native_even_target_dimension(self.source_width)
-            && self.height == native_even_target_dimension(self.source_height);
         self.source_width = width;
         self.source_height = height;
-        if was_native_size {
-            self.width = native_even_target_dimension(width);
-            self.height = native_even_target_dimension(height);
-        } else {
-            self.set_target_dimensions(self.width, self.height);
-        }
+        (self.width, self.height) = self.target_dimensions.resolve(width, height);
         self.shared_texture = None;
         Ok(())
     }
@@ -1169,6 +1195,10 @@ fn native_even_target_dimension(source: usize) -> usize {
     clamp_even_target_dimension(source, source)
 }
 
+fn source_supports_shared_even_target(source: usize) -> bool {
+    source >= 2
+}
+
 fn dxgi_device_name_from_raw(raw: &[u16]) -> Option<String> {
     let end = raw.iter().position(|unit| *unit == 0).unwrap_or(raw.len());
     if end == 0 {
@@ -1249,6 +1279,34 @@ mod tests {
         assert_eq!(native_even_target_dimension(1001), 1000);
         assert_eq!(native_even_target_dimension(777), 776);
         assert_eq!(native_even_target_dimension(1), 2);
+    }
+
+    #[test]
+    fn fixed_target_dimension_preserves_requested_profile_on_resize() {
+        let target_dimensions = WinrtTargetDimensions::Fixed {
+            width: 1000,
+            height: 776,
+        };
+
+        assert_eq!(target_dimensions.resolve(1001, 777), (1000, 776));
+        assert_eq!(target_dimensions.resolve(1200, 900), (1000, 776));
+        assert_eq!(target_dimensions.resolve(640, 480), (640, 480));
+    }
+
+    #[test]
+    fn native_target_dimension_follows_source_resize() {
+        let target_dimensions = WinrtTargetDimensions::Native;
+
+        assert_eq!(target_dimensions.resolve(1001, 777), (1000, 776));
+        assert_eq!(target_dimensions.resolve(1200, 900), (1200, 900));
+    }
+
+    #[test]
+    fn shared_target_dimension_rejects_sources_smaller_than_two_pixels() {
+        assert!(!source_supports_shared_even_target(0));
+        assert!(!source_supports_shared_even_target(1));
+        assert!(source_supports_shared_even_target(2));
+        assert!(source_supports_shared_even_target(3));
     }
 
     #[test]
