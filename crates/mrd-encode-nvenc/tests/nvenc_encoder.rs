@@ -252,6 +252,36 @@ fn nvenc_hevc_main10_access_unit_signals_10_bit_sps() {
 }
 
 #[cfg(windows)]
+#[test]
+fn nvenc_hevc_main10_720p_access_unit_signals_10_bit_sps() {
+    let width = 1280;
+    let height = 720;
+    let Ok(mut encoder) = NvencHevcEncoder::new_main10_with_bitrate(width, height, 30, 12_000_000)
+    else {
+        return;
+    };
+
+    let frame = CapturedFrame::from_cpu(
+        width,
+        height,
+        FramePixelFormat::Bgra32,
+        33_000,
+        vec![0x80; width * height * 4],
+    );
+    let access_unit = match encoder.encode(&frame) {
+        Ok(access_units) => access_units
+            .into_iter()
+            .next()
+            .expect("single 720p access unit"),
+        Err(error) if error.to_string().contains("produced a 8-bit bitstream") => return,
+        Err(error) => panic!("nvenc hevc main10 encode 720p frame: {error}"),
+    };
+    let bit_depth = extract_hevc_sps_luma_bit_depth(&access_unit.bytes).expect("HEVC SPS");
+
+    assert_eq!(bit_depth, 10);
+}
+
+#[cfg(windows)]
 fn extract_sps_profile_idc(access_unit: &[u8]) -> Option<u8> {
     let mut offset = 0usize;
     while let Some((start, start_len)) = find_h264_start_code(access_unit, offset) {

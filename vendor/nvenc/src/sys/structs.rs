@@ -495,6 +495,11 @@ impl NVencConfig {
             let hevc = &mut *(&mut self.encode_codec_config.hevc
                 as *mut ManuallyDrop<NVencConfigHEVC>
                 as *mut NVencConfigHEVC);
+            const HEVC_CHROMA_FORMAT_IDC_SHIFT: u32 = 9;
+            const HEVC_CHROMA_FORMAT_IDC_MASK: u32 = 0b11 << HEVC_CHROMA_FORMAT_IDC_SHIFT;
+            const HEVC_CHROMA_FORMAT_IDC_420: u32 = 1 << HEVC_CHROMA_FORMAT_IDC_SHIFT;
+            hevc.bitflags =
+                (hevc.bitflags & !HEVC_CHROMA_FORMAT_IDC_MASK) | HEVC_CHROMA_FORMAT_IDC_420;
             hevc.output_bit_depth = NVencBitDepth::Depth10;
             hevc.input_bit_depth = NVencBitDepth::Depth10;
         }

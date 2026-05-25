@@ -297,6 +297,7 @@ enum SoftwareYuvLayout {
     I444,
 }
 
+#[derive(Clone, Copy)]
 struct PlanarYuvFrame<'a> {
     width: usize,
     height: usize,
@@ -1143,25 +1144,18 @@ fn rust_h265_frame_to_rgb_frame(
             rust_h265::PixelData::U16(y),
             rust_h265::PixelData::U16(u),
             rust_h265::PixelData::U16(v),
-        ) => {
-            let y_bytes = u16_samples_to_le_bytes(y);
-            let u_bytes = u16_samples_to_le_bytes(u);
-            let v_bytes = u16_samples_to_le_bytes(v);
-            planar_yuv_to_rgb24(PlanarYuvFrame {
-                width,
-                height,
-                layout: SoftwareYuvLayout::I420,
-                bit_depth,
-                bytes_per_sample: 2,
-                y: &y_bytes,
-                y_stride: width * 2,
-                u: &u_bytes,
-                u_stride: chroma_width * 2,
-                v: &v_bytes,
-                v_stride: chroma_width * 2,
-                full_range: false,
-            })?
-        }
+        ) => planar_i420_u16_to_rgb24(PlanarYuv16Frame {
+            width,
+            height,
+            bit_depth,
+            y,
+            y_stride: width,
+            u,
+            u_stride: chroma_width,
+            v,
+            v_stride: chroma_width,
+            full_range: false,
+        })?,
         _ => {
             return Err(PipelineError::Message(
                 "rust_h265 returned mixed bit-depth planes".to_string(),
@@ -1272,16 +1266,185 @@ fn bytes_per_sample_for_bit_depth(bit_depth: usize) -> usize {
     }
 }
 
-#[cfg(feature = "software-rust-h265")]
-fn u16_samples_to_le_bytes(samples: &[u16]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(samples.len() * 2);
-    for sample in samples {
-        bytes.extend_from_slice(&sample.to_le_bytes());
+fn planar_yuv_to_rgb24(frame: PlanarYuvFrame<'_>) -> Result<Vec<u8>, PipelineError> {
+    if matches!(frame.layout, SoftwareYuvLayout::I420)
+        && frame.bit_depth == 8
+        && frame.bytes_per_sample == 1
+    {
+        return planar_i420_8_to_rgb24(frame);
     }
-    bytes
+
+    planar_yuv_to_rgb24_generic(frame)
 }
 
-fn planar_yuv_to_rgb24(frame: PlanarYuvFrame<'_>) -> Result<Vec<u8>, PipelineError> {
+fn planar_i420_8_to_rgb24(frame: PlanarYuvFrame<'_>) -> Result<Vec<u8>, PipelineError> {
+    if frame.width == 0 || frame.height == 0 {
+        return Err(PipelineError::Message(
+            "decoded YUV frame has empty dimensions".to_string(),
+        ));
+    }
+
+    let chroma_width = frame.width.div_ceil(2);
+    let chroma_height = frame.height.div_ceil(2);
+    let min_y_len = frame
+        .height
+        .saturating_sub(1)
+        .checked_mul(frame.y_stride)
+        .and_then(|offset| offset.checked_add(frame.width))
+        .ok_or_else(|| PipelineError::Message("decoded Y plane length overflow".to_string()))?;
+    let min_uv_len = chroma_height
+        .saturating_sub(1)
+        .checked_mul(frame.u_stride)
+        .and_then(|offset| offset.checked_add(chroma_width))
+        .ok_or_else(|| PipelineError::Message("decoded UV plane length overflow".to_string()))?;
+    if frame.y.len() < min_y_len || frame.u.len() < min_uv_len || frame.v.len() < min_uv_len {
+        return Err(PipelineError::Message(format!(
+            "decoded I420 frame is undersized: y={} u={} v={}, expected y>={min_y_len} uv>={min_uv_len}",
+            frame.y.len(),
+            frame.u.len(),
+            frame.v.len()
+        )));
+    }
+
+    let mut rgb = vec![0_u8; frame.width * frame.height * 3];
+    for y in (0..frame.height).step_by(2) {
+        let y0_row = y * frame.y_stride;
+        let y1_row = (y + 1).min(frame.height - 1) * frame.y_stride;
+        let uv_row = (y / 2) * frame.u_stride;
+        let out0_row = y * frame.width * 3;
+        let out1_row = (y + 1).min(frame.height - 1) * frame.width * 3;
+        for x in (0..frame.width).step_by(2) {
+            let uv_offset = uv_row + x / 2;
+            let u = frame.u[uv_offset];
+            let v = frame.v[uv_offset];
+            write_rgb_pixel(
+                &mut rgb,
+                out0_row + x * 3,
+                frame.y[y0_row + x],
+                u,
+                v,
+                frame.full_range,
+            );
+            if x + 1 < frame.width {
+                write_rgb_pixel(
+                    &mut rgb,
+                    out0_row + (x + 1) * 3,
+                    frame.y[y0_row + x + 1],
+                    u,
+                    v,
+                    frame.full_range,
+                );
+            }
+            if y + 1 < frame.height {
+                write_rgb_pixel(
+                    &mut rgb,
+                    out1_row + x * 3,
+                    frame.y[y1_row + x],
+                    u,
+                    v,
+                    frame.full_range,
+                );
+                if x + 1 < frame.width {
+                    write_rgb_pixel(
+                        &mut rgb,
+                        out1_row + (x + 1) * 3,
+                        frame.y[y1_row + x + 1],
+                        u,
+                        v,
+                        frame.full_range,
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(rgb)
+}
+
+#[inline]
+fn write_rgb_pixel(rgb: &mut [u8], offset: usize, y: u8, u: u8, v: u8, full_range: bool) {
+    let [r, g, b] = yuv_to_rgb8(y, u, v, full_range);
+    rgb[offset] = r;
+    rgb[offset + 1] = g;
+    rgb[offset + 2] = b;
+}
+
+#[cfg(feature = "software-rust-h265")]
+struct PlanarYuv16Frame<'a> {
+    width: usize,
+    height: usize,
+    bit_depth: usize,
+    y: &'a [u16],
+    y_stride: usize,
+    u: &'a [u16],
+    u_stride: usize,
+    v: &'a [u16],
+    v_stride: usize,
+    full_range: bool,
+}
+
+#[cfg(feature = "software-rust-h265")]
+fn planar_i420_u16_to_rgb24(frame: PlanarYuv16Frame<'_>) -> Result<Vec<u8>, PipelineError> {
+    if frame.width == 0 || frame.height == 0 {
+        return Err(PipelineError::Message(
+            "decoded YUV frame has empty dimensions".to_string(),
+        ));
+    }
+    if frame.bit_depth <= 8 || frame.bit_depth > 16 {
+        return Err(PipelineError::Message(format!(
+            "unsupported decoded 16-bit YUV bit depth: {}",
+            frame.bit_depth
+        )));
+    }
+
+    let chroma_width = frame.width.div_ceil(2);
+    let chroma_height = frame.height.div_ceil(2);
+    let min_y_len = frame
+        .height
+        .saturating_sub(1)
+        .checked_mul(frame.y_stride)
+        .and_then(|offset| offset.checked_add(frame.width))
+        .ok_or_else(|| PipelineError::Message("decoded Y plane length overflow".to_string()))?;
+    let min_uv_len = chroma_height
+        .saturating_sub(1)
+        .checked_mul(frame.u_stride)
+        .and_then(|offset| offset.checked_add(chroma_width))
+        .ok_or_else(|| PipelineError::Message("decoded UV plane length overflow".to_string()))?;
+    if frame.y.len() < min_y_len || frame.u.len() < min_uv_len || frame.v.len() < min_uv_len {
+        return Err(PipelineError::Message(format!(
+            "decoded I420 16-bit frame is undersized: y={} u={} v={}, expected y>={min_y_len} uv>={min_uv_len}",
+            frame.y.len(),
+            frame.u.len(),
+            frame.v.len()
+        )));
+    }
+
+    let shift = frame.bit_depth - 8;
+    let to_u8 = |sample: u16| ((sample >> shift).min(255)) as u8;
+    let mut rgb = vec![0_u8; frame.width * frame.height * 3];
+    for y in 0..frame.height {
+        let y_row = y * frame.y_stride;
+        let uv_row = (y / 2) * frame.u_stride;
+        let out_row = y * frame.width * 3;
+        for x in 0..frame.width {
+            let uv_offset = uv_row + x / 2;
+            let [r, g, b] = yuv_to_rgb8(
+                to_u8(frame.y[y_row + x]),
+                to_u8(frame.u[uv_offset]),
+                to_u8(frame.v[uv_offset]),
+                frame.full_range,
+            );
+            let offset = out_row + x * 3;
+            rgb[offset] = r;
+            rgb[offset + 1] = g;
+            rgb[offset + 2] = b;
+        }
+    }
+
+    Ok(rgb)
+}
+
+fn planar_yuv_to_rgb24_generic(frame: PlanarYuvFrame<'_>) -> Result<Vec<u8>, PipelineError> {
     if frame.width == 0 || frame.height == 0 {
         return Err(PipelineError::Message(
             "decoded YUV frame has empty dimensions".to_string(),
@@ -2012,6 +2175,36 @@ mod tests {
             DecodedFrameData::CpuRgb24(rgb) => assert_eq!(rgb.len(), 12),
             other => panic!("expected RGB24 decoded frame, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn planar_i420_fast_path_matches_generic_yuv_conversion() {
+        let width = 4;
+        let height = 4;
+        let y = (0..width * height)
+            .map(|index| 16 + (index as u8 * 7))
+            .collect::<Vec<_>>();
+        let u = vec![96, 128, 144, 160];
+        let v = vec![112, 120, 136, 152];
+        let frame = PlanarYuvFrame {
+            width,
+            height,
+            layout: SoftwareYuvLayout::I420,
+            bit_depth: 8,
+            bytes_per_sample: 1,
+            y: &y,
+            y_stride: width,
+            u: &u,
+            u_stride: width / 2,
+            v: &v,
+            v_stride: width / 2,
+            full_range: false,
+        };
+
+        let fast = planar_i420_8_to_rgb24(frame).expect("fast I420 conversion");
+        let generic = planar_yuv_to_rgb24_generic(frame).expect("generic I420 conversion");
+
+        assert_eq!(fast, generic);
     }
 
     #[cfg(target_os = "linux")]

@@ -65,6 +65,7 @@ pub struct BenchmarkSummary {
     pub nvdec_h264_capability: String,
     pub nvdec_hevc_capability: String,
     pub nvdec_hevc_main10_capability: String,
+    pub failure_reason: Option<String>,
     pub run_passed: bool,
 }
 
@@ -182,6 +183,7 @@ impl BenchmarkSummary {
             nvdec_h264_capability,
             nvdec_hevc_capability,
             nvdec_hevc_main10_capability,
+            failure_reason: None,
             run_passed: session_established && first_frame_seen && probe_complete,
         }
     }
@@ -287,6 +289,7 @@ impl BenchmarkSummary {
             nvdec_h264_capability,
             nvdec_hevc_capability,
             nvdec_hevc_main10_capability,
+            failure_reason: None,
             run_passed: session_established && first_frame_seen && probe_complete,
         }
     }
@@ -333,6 +336,7 @@ impl BenchmarkSummary {
             "nvdec_h264_capability",
             "nvdec_hevc_capability",
             "nvdec_hevc_main10_capability",
+            "failure_reason",
             "run_passed",
         ]
     }
@@ -379,6 +383,7 @@ impl BenchmarkSummary {
             self.nvdec_h264_capability.clone(),
             self.nvdec_hevc_capability.clone(),
             self.nvdec_hevc_main10_capability.clone(),
+            csv_escape_text(self.failure_reason.as_deref().unwrap_or_default()),
             self.run_passed.to_string(),
         ]
     }
@@ -497,6 +502,10 @@ fn option_f64(value: Option<f64>) -> String {
     value.map(|item| item.to_string()).unwrap_or_default()
 }
 
+fn csv_escape_text(value: &str) -> String {
+    value.replace(['\r', '\n'], " ").replace(',', ";")
+}
+
 fn option_u64(value: Option<u64>) -> String {
     value.map(|item| item.to_string()).unwrap_or_default()
 }
@@ -520,6 +529,7 @@ Duration: `{duration}s`\n\n\
 - First frame seen: `{first_frame_seen}`\n\
 - First frame time ms: `{first_frame_ms}`\n\
 - Probe complete: `{probe_complete}`\n\
+- Failure reason: `{failure_reason}`\n\
 \n## Metrics\n\n\
 | Metric | Value |\n\
 | --- | --- |\n\
@@ -565,6 +575,7 @@ Duration: `{duration}s`\n\n\
         first_frame_seen = summary.first_frame_seen,
         first_frame_ms = option_f64(summary.first_frame_time_ms),
         probe_complete = summary.probe_complete,
+        failure_reason = summary.failure_reason.as_deref().unwrap_or_default(),
         fps_observed = summary.fps_observed,
         bitrate_kbps = summary.bitrate_kbps,
         encode_p95 = option_f64(summary.encode_total_p95_ms),
@@ -729,6 +740,7 @@ mod tests {
             && metrics.decoded_frames > 0
             && metrics.encode_latency_p95_ms > 0.0
             && metrics.decode_latency_p95_ms > 0.0;
+        let failure_reason = harness_failure_reason(&metrics, first_frame_time_ms, probe_complete);
         let run_passed = first_frame_seen
             && probe_complete
             && metrics.encode_failures == 0
@@ -776,10 +788,34 @@ mod tests {
             nvdec_h264_capability: String::new(),
             nvdec_hevc_capability: String::new(),
             nvdec_hevc_main10_capability: String::new(),
+            failure_reason,
             run_passed,
         };
 
         (summary, probe)
+    }
+
+    fn harness_failure_reason(
+        metrics: &crate::test_harness::HarnessMetrics,
+        first_frame_time_ms: Option<f64>,
+        probe_complete: bool,
+    ) -> Option<String> {
+        if let Some(message) = metrics.error_message.as_deref() {
+            return Some(message.to_string());
+        }
+        if metrics.encoded_units == 0 {
+            return Some("encoder produced no non-empty access units".to_string());
+        }
+        if metrics.decoded_frames == 0 {
+            return Some("decoder produced no frames".to_string());
+        }
+        if first_frame_time_ms.is_none() {
+            return Some("first decoded frame was not observed before timeout".to_string());
+        }
+        if !probe_complete {
+            return Some("benchmark probe did not collect all required stage metrics".to_string());
+        }
+        None
     }
 
     fn wait_for_first_decoded_frame(harness: &TestHarness, timeout: Duration) -> Option<f64> {
@@ -1230,6 +1266,7 @@ mod tests {
             nvdec_h264_capability: "runtime=true wired=true".into(),
             nvdec_hevc_capability: "runtime=true wired=false".into(),
             nvdec_hevc_main10_capability: "runtime=false wired=false".into(),
+            failure_reason: Some("encode produced no HEVC Main10 access units".into()),
             run_passed: false,
         };
 
@@ -1243,6 +1280,14 @@ mod tests {
         assert_eq!(row[2], "webrtc");
         assert!(header.contains(&"quic_receiver_completed_frames"));
         assert!(header.contains(&"nvdec_hevc_main10_capability"));
+        let failure_reason_index = header
+            .iter()
+            .position(|column| *column == "failure_reason")
+            .expect("failure_reason column");
+        assert_eq!(
+            row[failure_reason_index],
+            "encode produced no HEVC Main10 access units"
+        );
     }
 
     #[test]

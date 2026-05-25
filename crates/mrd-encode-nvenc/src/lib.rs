@@ -573,6 +573,7 @@ mod imp {
                 &slot.registered,
                 self.frame_index,
                 force_idr,
+                NVencBufferFormat::ARGB,
             )
             .map_err(|error| PipelineError::message(error.to_string()))?;
             self.force_next_keyframe = false;
@@ -804,8 +805,24 @@ mod imp {
         }
 
         pub fn probe_hevc_main10_available() -> Result<(), PipelineError> {
-            let _ = Self::new_main10_with_bitrate(1280, 720, 60, 20_000_000)?;
-            Ok(())
+            let mut encoder = Self::new_main10_with_bitrate(1280, 720, 60, 20_000_000)?;
+            let frame = CapturedFrame::from_cpu(
+                1280,
+                720,
+                FramePixelFormat::Bgra32,
+                0,
+                vec![0x80; 1280 * 720 * 4],
+            );
+            let access_units = encoder.encode(&frame)?;
+            if access_units
+                .iter()
+                .any(|unit| hevc_sps_luma_bit_depth(&unit.bytes) == Some(10))
+            {
+                return Ok(());
+            }
+            Err(PipelineError::message(
+                "NVENC HEVC Main10 probe did not produce a 10-bit HEVC bitstream",
+            ))
         }
 
         fn new_low_latency_internal(
@@ -978,6 +995,7 @@ mod imp {
                 &slot.registered,
                 self.frame_index,
                 force_idr,
+                NVencBufferFormat::ARGB,
             )
             .map_err(|error| PipelineError::message(error.to_string()))?;
             self.frame_index += 1;
@@ -1167,6 +1185,7 @@ mod imp {
                 &self.registered,
                 self.frame_index,
                 force_idr,
+                NVencBufferFormat::ARGB,
             )
             .map_err(|error| PipelineError::message(error.to_string()))?;
             self.force_next_keyframe = false;
@@ -1233,8 +1252,16 @@ mod imp {
                 &self.registered,
                 self.frame_index,
                 force_idr,
+                if self.main10 {
+                    NVencBufferFormat::YUV420_10Bit
+                } else {
+                    NVencBufferFormat::ARGB
+                },
             )
             .map_err(|error| PipelineError::message(error.to_string()))?;
+            if self.main10 {
+                validate_hevc_main10_bitstream(&bytes)?;
+            }
             self.frame_index += 1;
 
             Ok(vec![EncodedAccessUnit {
@@ -1407,8 +1434,16 @@ mod imp {
         registered: &RegisteredResource,
         frame_index: usize,
         force_idr: bool,
+        buffer_format: NVencBufferFormat,
     ) -> anyhow::Result<Vec<u8>> {
-        submit_encode_picture(encoder, bitstream, registered, frame_index, force_idr)?;
+        submit_encode_picture(
+            encoder,
+            bitstream,
+            registered,
+            frame_index,
+            force_idr,
+            buffer_format,
+        )?;
         lock_bitstream_bytes(bitstream)
     }
 
@@ -1418,6 +1453,7 @@ mod imp {
         registered: &RegisteredResource,
         frame_index: usize,
         force_idr: bool,
+        buffer_format: NVencBufferFormat,
     ) -> anyhow::Result<()> {
         let flags = if force_idr {
             NVencPicFlags::ForceIDR as u32 | NVencPicFlags::OutputSpspps as u32
@@ -1430,7 +1466,7 @@ mod imp {
                 bitstream,
                 frame_index,
                 frame_index as u64,
-                NVencBufferFormat::ARGB,
+                buffer_format,
                 NVencPicStruct::Frame,
                 if force_idr {
                     NVencPicType::IDR
@@ -1459,6 +1495,178 @@ mod imp {
             return v;
         }
         buf
+    }
+
+    fn validate_hevc_main10_bitstream(access_unit: &[u8]) -> Result<(), PipelineError> {
+        match hevc_sps_luma_bit_depth(access_unit) {
+            Some(10) => Ok(()),
+            Some(bit_depth) => Err(PipelineError::message(format!(
+                "NVENC HEVC Main10 produced a {bit_depth}-bit bitstream"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    fn hevc_sps_luma_bit_depth(access_unit: &[u8]) -> Option<u8> {
+        let mut offset = 0usize;
+        while let Some((start, start_len)) = find_start_code(access_unit, offset) {
+            let nal_start = start + start_len;
+            let next = find_start_code(access_unit, nal_start)
+                .map(|(next, _)| next)
+                .unwrap_or(access_unit.len());
+            let nal = access_unit.get(nal_start..next)?;
+            if nal.len() >= 3 && ((nal[0] >> 1) & 0x3f) == 33 {
+                return parse_hevc_sps_luma_bit_depth(&nal[2..]);
+            }
+            offset = nal_start.saturating_add(1);
+        }
+        None
+    }
+
+    fn find_start_code(buf: &[u8], from: usize) -> Option<(usize, usize)> {
+        if from >= buf.len() {
+            return None;
+        }
+        let mut i = from;
+        while i + 3 <= buf.len() {
+            if buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1 {
+                return Some((i, 3));
+            }
+            if i + 4 <= buf.len()
+                && buf[i] == 0
+                && buf[i + 1] == 0
+                && buf[i + 2] == 0
+                && buf[i + 3] == 1
+            {
+                return Some((i, 4));
+            }
+            i += 1;
+        }
+        None
+    }
+
+    fn parse_hevc_sps_luma_bit_depth(bytes: &[u8]) -> Option<u8> {
+        let rbsp = hevc_rbsp(bytes);
+        let mut bits = BitReader::new(&rbsp);
+        bits.read_bits(4)?;
+        let max_sub_layers_minus1 = bits.read_bits(3)? as usize;
+        bits.read_bit()?;
+        skip_hevc_profile_tier_level(&mut bits, max_sub_layers_minus1)?;
+        bits.read_ue()?;
+        let chroma_format_idc = bits.read_ue()?;
+        if chroma_format_idc == 3 {
+            bits.read_bit()?;
+        }
+        bits.read_ue()?;
+        bits.read_ue()?;
+        if bits.read_bit()? != 0 {
+            bits.read_ue()?;
+            bits.read_ue()?;
+            bits.read_ue()?;
+            bits.read_ue()?;
+        }
+        Some(8 + bits.read_ue()? as u8)
+    }
+
+    fn skip_hevc_profile_tier_level(
+        bits: &mut BitReader<'_>,
+        max_sub_layers_minus1: usize,
+    ) -> Option<()> {
+        bits.read_bits(2)?;
+        bits.read_bit()?;
+        bits.read_bits(5)?;
+        bits.read_bits(32)?;
+        bits.read_bits(4)?;
+        bits.read_bits(16)?;
+        bits.read_bits(16)?;
+        bits.read_bits(12)?;
+        bits.read_bits(8)?;
+
+        let mut profile_present = vec![false; max_sub_layers_minus1];
+        let mut level_present = vec![false; max_sub_layers_minus1];
+        for i in 0..max_sub_layers_minus1 {
+            profile_present[i] = bits.read_bit()? != 0;
+            level_present[i] = bits.read_bit()? != 0;
+        }
+        if max_sub_layers_minus1 > 0 {
+            for _ in max_sub_layers_minus1..8 {
+                bits.read_bits(2)?;
+            }
+        }
+        for i in 0..max_sub_layers_minus1 {
+            if profile_present[i] {
+                bits.read_bits(2)?;
+                bits.read_bit()?;
+                bits.read_bits(5)?;
+                bits.read_bits(32)?;
+                bits.read_bits(4)?;
+                bits.read_bits(16)?;
+                bits.read_bits(16)?;
+                bits.read_bits(12)?;
+            }
+            if level_present[i] {
+                bits.read_bits(8)?;
+            }
+        }
+        Some(())
+    }
+
+    fn hevc_rbsp(bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut zeros = 0usize;
+        for &byte in bytes {
+            if zeros >= 2 && byte == 0x03 {
+                zeros = 0;
+                continue;
+            }
+            out.push(byte);
+            zeros = if byte == 0 { zeros + 1 } else { 0 };
+        }
+        out
+    }
+
+    struct BitReader<'a> {
+        bytes: &'a [u8],
+        bit_offset: usize,
+    }
+
+    impl<'a> BitReader<'a> {
+        fn new(bytes: &'a [u8]) -> Self {
+            Self {
+                bytes,
+                bit_offset: 0,
+            }
+        }
+
+        fn read_bit(&mut self) -> Option<u8> {
+            let byte = *self.bytes.get(self.bit_offset / 8)?;
+            let bit = (byte >> (7 - (self.bit_offset % 8))) & 1;
+            self.bit_offset += 1;
+            Some(bit)
+        }
+
+        fn read_bits(&mut self, count: usize) -> Option<u32> {
+            let mut value = 0u32;
+            for _ in 0..count {
+                value = (value << 1) | self.read_bit()? as u32;
+            }
+            Some(value)
+        }
+
+        fn read_ue(&mut self) -> Option<u32> {
+            let mut leading_zero_bits = 0u32;
+            while self.read_bit()? == 0 {
+                leading_zero_bits += 1;
+                if leading_zero_bits > 31 {
+                    return None;
+                }
+            }
+            if leading_zero_bits == 0 {
+                return Some(0);
+            }
+            let suffix = self.read_bits(leading_zero_bits as usize)?;
+            Some((1u32 << leading_zero_bits) - 1 + suffix)
+        }
     }
 
     fn looks_like_annexb(buf: &[u8]) -> bool {
