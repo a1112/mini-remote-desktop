@@ -3,7 +3,7 @@
 // These handlers implement the core session orchestration logic.
 
 use crate::app_state::AppState;
-use mrd_application::ports::SessionSnapshot;
+use mrd_application::ports::{SessionLifecycleState, SessionSnapshot};
 use mrd_ipc::{DisplayMode, IpcResponse, MediaProfile};
 use mrd_proto::{DeviceId, SessionId};
 use std::sync::Arc;
@@ -36,7 +36,7 @@ pub async fn start_session(
             remote_listen_addr: None,
             remote_server_name: None,
             remote_cert_der_b64: None,
-            lifecycle_state: "connecting".to_string(),
+            lifecycle_state: SessionLifecycleState::Connecting,
             last_error: None,
             sender_active: false,
             receiver_active: false,
@@ -76,7 +76,7 @@ pub async fn start_lan_remote_session(
                 remote_listen_addr: None,
                 remote_server_name: None,
                 remote_cert_der_b64: None,
-                lifecycle_state: "connecting".to_string(),
+                lifecycle_state: SessionLifecycleState::Connecting,
                 last_error: None,
                 sender_active: false,
                 receiver_active: false,
@@ -99,7 +99,7 @@ pub async fn start_lan_remote_session(
                 sessions.insert(
                     session_id.clone(),
                     SessionSnapshot {
-                        lifecycle_state: "connected".to_string(),
+                        lifecycle_state: SessionLifecycleState::Connected,
                         last_error: None,
                         ..snapshot
                     },
@@ -114,7 +114,9 @@ pub async fn start_lan_remote_session(
                 sessions.insert(
                     session_id.clone(),
                     SessionSnapshot {
-                        lifecycle_state: "failed".to_string(),
+                        lifecycle_state: SessionLifecycleState::Failed {
+                            message: message.clone(),
+                        },
                         last_error: Some(message.clone()),
                         ..snapshot
                     },
@@ -329,7 +331,7 @@ pub async fn accept_session(
                 remote_listen_addr: None,
                 remote_server_name: None,
                 remote_cert_der_b64: None,
-                lifecycle_state: "listening".to_string(),
+                lifecycle_state: SessionLifecycleState::Listening,
                 last_error: None,
                 sender_active: false,
                 receiver_active: false,
@@ -349,7 +351,7 @@ pub async fn stop_session(app_state: &Arc<AppState>, session_id: SessionId) -> I
         sessions.insert(
             session_id.clone(),
             SessionSnapshot {
-                lifecycle_state: "closed".to_string(),
+                lifecycle_state: SessionLifecycleState::Closed,
                 last_error: None,
                 sender_active: false,
                 receiver_active: false,
@@ -398,7 +400,9 @@ pub async fn fail_session(
         sessions.insert(
             session_id.clone(),
             SessionSnapshot {
-                lifecycle_state: "failed".to_string(),
+                lifecycle_state: SessionLifecycleState::Failed {
+                    message: reason.clone(),
+                },
                 last_error: Some(reason.clone()),
                 sender_active: false,
                 receiver_active: false,
@@ -437,7 +441,7 @@ pub async fn recover_session(app_state: &Arc<AppState>, session_id: SessionId) -
 
     let mut sessions = app_state.sessions.lock().await;
     if let Some(snapshot) = sessions.get(&session_id).cloned() {
-        let lifecycle_state = recovery_state_for(&snapshot).to_string();
+        let lifecycle_state = recovery_state_for(&snapshot);
         sessions.insert(
             session_id.clone(),
             SessionSnapshot {
@@ -483,7 +487,7 @@ pub async fn session_snapshot(app_state: &Arc<AppState>, session_id: SessionId) 
                 snapshot: mrd_ipc::SessionRuntimeSnapshot {
                     session_id: s.session_id.clone(),
                     role,
-                    state: s.lifecycle_state.clone(),
+                    state: s.lifecycle_state.as_str().to_string(),
                     transport_kind: s.transport.clone(),
                     local_bootstrap: if s.local_listen_addr.is_some()
                         || s.local_server_name.is_some()
@@ -520,13 +524,13 @@ pub async fn session_snapshot(app_state: &Arc<AppState>, session_id: SessionId) 
     }
 }
 
-fn recovery_state_for(snapshot: &SessionSnapshot) -> &'static str {
+fn recovery_state_for(snapshot: &SessionSnapshot) -> SessionLifecycleState {
     if snapshot.target_device_id.is_some() {
-        "connecting"
+        SessionLifecycleState::Connecting
     } else if snapshot.source_device_id.is_some() {
-        "listening"
+        SessionLifecycleState::Listening
     } else {
-        "created"
+        SessionLifecycleState::Created
     }
 }
 
@@ -593,7 +597,10 @@ mod tests {
 
         let sessions = app_state.sessions.lock().await;
         let stored = sessions.get(&session_id).expect("failed LAN session");
-        assert_eq!(stored.lifecycle_state, "failed");
+        assert!(matches!(
+            stored.lifecycle_state,
+            SessionLifecycleState::Failed { .. }
+        ));
         assert!(stored.last_error.is_some());
     }
 
@@ -624,7 +631,7 @@ mod tests {
         let stored = sessions
             .get(&session_id)
             .expect("closed session should remain");
-        assert_eq!(stored.lifecycle_state, "closed");
+        assert_eq!(stored.lifecycle_state, SessionLifecycleState::Closed);
         assert!(!stored.sender_active);
         assert!(!stored.receiver_active);
     }
@@ -680,7 +687,10 @@ mod tests {
         {
             let sessions = app_state.sessions.lock().await;
             let stored = sessions.get(&session_id).expect("failed session");
-            assert_eq!(stored.lifecycle_state, "failed");
+            assert!(matches!(
+                stored.lifecycle_state,
+                SessionLifecycleState::Failed { .. }
+            ));
             assert_eq!(stored.last_error.as_deref(), Some("transport lost"));
         }
 
@@ -689,7 +699,7 @@ mod tests {
 
         let sessions = app_state.sessions.lock().await;
         let stored = sessions.get(&session_id).expect("recovered session");
-        assert_eq!(stored.lifecycle_state, "connecting");
+        assert_eq!(stored.lifecycle_state, SessionLifecycleState::Connecting);
         assert!(stored.last_error.is_none());
     }
 }

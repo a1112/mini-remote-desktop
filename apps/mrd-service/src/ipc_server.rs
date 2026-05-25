@@ -10,7 +10,7 @@ use crate::{
     handlers::{session, transport as transport_handlers},
     shell::{AutostartPortRef, UiLauncherPortRef},
 };
-use mrd_application::ports::SessionSnapshot;
+use mrd_application::ports::{SessionLifecycleState, SessionSnapshot};
 use mrd_ipc::{
     transport, CapabilitySnapshot, CapabilityStatus, IpcRequest, IpcResponse, MediaProfile,
     ScenarioEvaluationStatus,
@@ -151,7 +151,7 @@ impl IpcServer {
                         } else {
                             "unknown".to_string()
                         },
-                        state: snap.lifecycle_state.clone(),
+                        state: snap.lifecycle_state.as_str().to_string(),
                         transport_kind: snap.transport.clone(),
                         last_error: snap.last_error.clone(),
                         sender_active: snap.sender_active,
@@ -744,7 +744,7 @@ impl IpcServer {
                 let active_session_count = sessions
                     .list_all()
                     .into_iter()
-                    .filter(|session| session.lifecycle_state != "closed")
+                    .filter(|session| session.lifecycle_state != SessionLifecycleState::Closed)
                     .count();
                 IpcResponse::ShellStatus {
                     status: mrd_ipc::ShellStatusSnapshot {
@@ -828,7 +828,7 @@ impl IpcServer {
         .to_string();
 
         // Use explicit lifecycle state from domain model
-        let state = snap.lifecycle_state.clone();
+        let state = snap.lifecycle_state.as_str().to_string();
 
         Some(mrd_ipc::SessionRuntimeSnapshot {
             session_id: snap.session_id.clone(),
@@ -1269,7 +1269,7 @@ mod tests {
             remote_listen_addr: None,
             remote_server_name: None,
             remote_cert_der_b64: None,
-            lifecycle_state: "listening".to_string(),
+            lifecycle_state: SessionLifecycleState::Listening,
             last_error: None,
             sender_active: false,
             receiver_active: false,
@@ -1314,7 +1314,7 @@ mod tests {
             remote_listen_addr: None,
             remote_server_name: None,
             remote_cert_der_b64: None,
-            lifecycle_state: "created".to_string(),
+            lifecycle_state: SessionLifecycleState::Created,
             last_error: None,
             sender_active: false,
             receiver_active: false,

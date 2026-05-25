@@ -68,6 +68,12 @@ impl SessionLifecycleState {
     }
 }
 
+impl std::fmt::Display for SessionLifecycleState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Capability set for a device
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CapabilitySet {

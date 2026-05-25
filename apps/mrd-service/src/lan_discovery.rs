@@ -2,7 +2,7 @@
 use crate::app_state::MediaRenderQueueEnqueue;
 use crate::app_state::{AppState, DecodedVideoFrameStats, MediaProbeFrameStats};
 use anyhow::{Context, Result};
-use mrd_application::ports::SessionSnapshot;
+use mrd_application::ports::{SessionLifecycleState, SessionSnapshot};
 use mrd_encode_openh264::OpenH264Encoder;
 use mrd_ipc::{
     CaptureSource, CaptureSourceSelection, DisplayMode, DisplayModeChange, LanDiscoverySnapshot,
@@ -1205,7 +1205,7 @@ pub async fn request_lan_remote_session(
                                 remote_listen_addr: None,
                                 remote_server_name: None,
                                 remote_cert_der_b64: None,
-                                lifecycle_state: "connecting".to_string(),
+                                lifecycle_state: SessionLifecycleState::Connecting,
                                 last_error: None,
                                 sender_active: false,
                                 receiver_active: false,
@@ -2074,7 +2074,7 @@ async fn accept_lan_remote_session(
                 remote_listen_addr: None,
                 remote_server_name: None,
                 remote_cert_der_b64: None,
-                lifecycle_state: "listening".to_string(),
+                lifecycle_state: SessionLifecycleState::Listening,
                 last_error: None,
                 sender_active: true,
                 receiver_active: false,
@@ -2134,7 +2134,7 @@ async fn accept_lan_media_profile_update(
                 snapshot.transport
             );
         }
-        if snapshot.lifecycle_state == "closed" || snapshot.lifecycle_state == "failed" {
+        if snapshot.lifecycle_state.is_terminal() {
             anyhow::bail!(
                 "media profile update rejected for {} session",
                 snapshot.lifecycle_state
@@ -2452,7 +2452,7 @@ async fn ensure_active_sender_session(
     if !snapshot.sender_active {
         anyhow::bail!("{operation} requires an active target sender session");
     }
-    if snapshot.lifecycle_state == "closed" || snapshot.lifecycle_state == "failed" {
+    if snapshot.lifecycle_state.is_terminal() {
         anyhow::bail!(
             "{operation} rejected for {} session",
             snapshot.lifecycle_state
@@ -2614,7 +2614,7 @@ async fn start_lan_media_receiver(
                     remote_listen_addr: Some(bootstrap.listen_addr.to_string()),
                     remote_server_name: Some(bootstrap.server_name.clone()),
                     remote_cert_der_b64: None,
-                    lifecycle_state: "streaming".to_string(),
+                    lifecycle_state: SessionLifecycleState::Streaming,
                     last_error: None,
                     receiver_active: true,
                     ..snapshot
@@ -2673,7 +2673,7 @@ async fn close_existing_display_lan_receiver_sessions_for_target(
                     && !capture_sources
                         .get(&snapshot.session_id)
                         .is_some_and(|selection| is_window_capture_source(&selection.source))
-                    && !matches!(snapshot.lifecycle_state.as_str(), "closed" | "failed")
+                    && !snapshot.lifecycle_state.is_terminal()
             })
             .map(|snapshot| snapshot.session_id)
             .collect::<Vec<_>>()
@@ -2717,7 +2717,7 @@ async fn close_existing_display_lan_sender_sessions_for_source(
                     && !capture_sources
                         .get(&snapshot.session_id)
                         .is_some_and(|selection| is_window_capture_source(&selection.source))
-                    && !matches!(snapshot.lifecycle_state.as_str(), "closed" | "failed")
+                    && !snapshot.lifecycle_state.is_terminal()
             })
             .map(|snapshot| snapshot.session_id)
             .collect::<Vec<_>>()
@@ -2747,7 +2747,7 @@ async fn close_lan_media_sessions(
                 sessions.insert(
                     session_id.clone(),
                     SessionSnapshot {
-                        lifecycle_state: "closed".to_string(),
+                        lifecycle_state: SessionLifecycleState::Closed,
                         last_error: None,
                         sender_active: false,
                         receiver_active: false,
@@ -4326,7 +4326,7 @@ async fn set_session_last_error(
     let Some(snapshot) = sessions.get(session_id).cloned() else {
         return;
     };
-    if matches!(snapshot.lifecycle_state.as_str(), "closed" | "failed") {
+    if snapshot.lifecycle_state.is_terminal() {
         return;
     }
     sessions.insert(
@@ -5715,7 +5715,7 @@ async fn session_allows_media(app_state: &Arc<AppState>, session_id: &SessionId)
     let Some(snapshot) = sessions.get(session_id) else {
         return false;
     };
-    !matches!(snapshot.lifecycle_state.as_str(), "closed" | "failed")
+    !snapshot.lifecycle_state.is_terminal()
 }
 
 async fn mark_session_failed(app_state: &Arc<AppState>, session_id: &SessionId, reason: String) {
@@ -5723,13 +5723,15 @@ async fn mark_session_failed(app_state: &Arc<AppState>, session_id: &SessionId, 
     let Some(snapshot) = sessions.get(session_id).cloned() else {
         return;
     };
-    if snapshot.lifecycle_state == "closed" {
+    if snapshot.lifecycle_state == SessionLifecycleState::Closed {
         return;
     }
     sessions.insert(
         session_id.clone(),
         SessionSnapshot {
-            lifecycle_state: "failed".to_string(),
+            lifecycle_state: SessionLifecycleState::Failed {
+                message: reason.clone(),
+            },
             last_error: Some(reason),
             sender_active: false,
             receiver_active: false,
@@ -7851,7 +7853,7 @@ mod tests {
             Some(DeviceId("controller-device".to_string()))
         );
         assert_eq!(snapshot.transport, "quic");
-        assert_eq!(snapshot.lifecycle_state, "listening");
+        assert_eq!(snapshot.lifecycle_state, SessionLifecycleState::Listening);
         assert!(snapshot.sender_active);
         assert!(snapshot.local_listen_addr.is_some());
         assert!(app_state.peer_media_capabilities.lock().await.supports(
@@ -8028,7 +8030,10 @@ mod tests {
             session_snapshot.receiver_active,
             "controller should mark the LAN QUIC receiver active after connecting"
         );
-        assert_eq!(session_snapshot.lifecycle_state, "streaming");
+        assert_eq!(
+            session_snapshot.lifecycle_state,
+            SessionLifecycleState::Streaming
+        );
         assert!(
             controller_state
                 .media_tasks
@@ -8409,7 +8414,7 @@ mod tests {
                 remote_listen_addr: None,
                 remote_server_name: None,
                 remote_cert_der_b64: None,
-                lifecycle_state: "listening".to_string(),
+                lifecycle_state: SessionLifecycleState::Listening,
                 last_error: None,
                 sender_active: true,
                 receiver_active: false,
@@ -8472,7 +8477,7 @@ mod tests {
                 remote_listen_addr: None,
                 remote_server_name: None,
                 remote_cert_der_b64: None,
-                lifecycle_state: "listening".to_string(),
+                lifecycle_state: SessionLifecycleState::Listening,
                 last_error: None,
                 sender_active: true,
                 receiver_active: false,
@@ -8554,7 +8559,7 @@ mod tests {
                 remote_listen_addr: None,
                 remote_server_name: None,
                 remote_cert_der_b64: None,
-                lifecycle_state: "listening".to_string(),
+                lifecycle_state: SessionLifecycleState::Listening,
                 last_error: None,
                 sender_active: true,
                 receiver_active: false,
@@ -8954,12 +8959,12 @@ mod tests {
         assert!(sessions.get(&old_display).unwrap().sender_active);
         assert_eq!(
             sessions.get(&old_display).unwrap().lifecycle_state,
-            "listening"
+            SessionLifecycleState::Listening
         );
         assert!(sessions.get(&old_window).unwrap().sender_active);
         assert_eq!(
             sessions.get(&old_window).unwrap().lifecycle_state,
-            "listening"
+            SessionLifecycleState::Listening
         );
     }
 
@@ -9035,18 +9040,18 @@ mod tests {
         let sessions = app_state.sessions.lock().await;
         assert_eq!(
             sessions.get(&old_display).unwrap().lifecycle_state,
-            "closed"
+            SessionLifecycleState::Closed
         );
         assert!(!sessions.get(&old_display).unwrap().sender_active);
         assert!(sessions.get(&old_window).unwrap().sender_active);
         assert_eq!(
             sessions.get(&old_window).unwrap().lifecycle_state,
-            "listening"
+            SessionLifecycleState::Listening
         );
         assert!(sessions.get(&other_source).unwrap().sender_active);
         assert_eq!(
             sessions.get(&other_source).unwrap().lifecycle_state,
-            "listening"
+            SessionLifecycleState::Listening
         );
     }
 
@@ -9107,12 +9112,12 @@ mod tests {
         assert!(sessions.get(&old_display).unwrap().receiver_active);
         assert_eq!(
             sessions.get(&old_display).unwrap().lifecycle_state,
-            "streaming"
+            SessionLifecycleState::Streaming
         );
         assert!(sessions.get(&old_window).unwrap().receiver_active);
         assert_eq!(
             sessions.get(&old_window).unwrap().lifecycle_state,
-            "streaming"
+            SessionLifecycleState::Streaming
         );
     }
 
@@ -9188,18 +9193,18 @@ mod tests {
         let sessions = app_state.sessions.lock().await;
         assert_eq!(
             sessions.get(&old_display).unwrap().lifecycle_state,
-            "closed"
+            SessionLifecycleState::Closed
         );
         assert!(!sessions.get(&old_display).unwrap().receiver_active);
         assert!(sessions.get(&old_window).unwrap().receiver_active);
         assert_eq!(
             sessions.get(&old_window).unwrap().lifecycle_state,
-            "streaming"
+            SessionLifecycleState::Streaming
         );
         assert!(sessions.get(&other_target).unwrap().receiver_active);
         assert_eq!(
             sessions.get(&other_target).unwrap().lifecycle_state,
-            "streaming"
+            SessionLifecycleState::Streaming
         );
     }
 
@@ -9223,7 +9228,9 @@ mod tests {
             sessions.insert(
                 failed_sender.clone(),
                 SessionSnapshot {
-                    lifecycle_state: "failed".to_string(),
+                    lifecycle_state: SessionLifecycleState::Failed {
+                        message: "failed".to_string(),
+                    },
                     sender_active: false,
                     ..sender_snapshot_for_source(&failed_sender, "controller-b")
                 },
@@ -9304,7 +9311,7 @@ mod tests {
                 remote_listen_addr: None,
                 remote_server_name: None,
                 remote_cert_der_b64: None,
-                lifecycle_state: "streaming".to_string(),
+                lifecycle_state: SessionLifecycleState::Streaming,
                 last_error: None,
                 sender_active: false,
                 receiver_active: true,
@@ -10708,7 +10715,7 @@ mod tests {
                 remote_listen_addr: None,
                 remote_server_name: None,
                 remote_cert_der_b64: None,
-                lifecycle_state: "listening".to_string(),
+                lifecycle_state: SessionLifecycleState::Listening,
                 last_error: None,
                 sender_active: true,
                 receiver_active: false,
@@ -10873,7 +10880,7 @@ mod tests {
                 remote_listen_addr: None,
                 remote_server_name: None,
                 remote_cert_der_b64: None,
-                lifecycle_state: "listening".to_string(),
+                lifecycle_state: SessionLifecycleState::Listening,
                 last_error: None,
                 sender_active: true,
                 receiver_active: false,
@@ -11081,7 +11088,7 @@ mod tests {
             remote_listen_addr: None,
             remote_server_name: None,
             remote_cert_der_b64: None,
-            lifecycle_state: "listening".to_string(),
+            lifecycle_state: SessionLifecycleState::Listening,
             last_error: None,
             sender_active: true,
             receiver_active: false,
@@ -11103,7 +11110,7 @@ mod tests {
             remote_listen_addr: None,
             remote_server_name: None,
             remote_cert_der_b64: None,
-            lifecycle_state: "streaming".to_string(),
+            lifecycle_state: SessionLifecycleState::Streaming,
             last_error: None,
             sender_active: false,
             receiver_active: true,

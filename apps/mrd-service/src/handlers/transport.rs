@@ -3,6 +3,7 @@
 // These handlers implement media control (sender/receiver) logic.
 
 use crate::app_state::AppState;
+use mrd_application::ports::SessionLifecycleState;
 use mrd_ipc::{AttachedRenderSurface, IpcResponse};
 use mrd_proto::SessionId;
 use std::sync::Arc;
@@ -17,7 +18,7 @@ pub async fn start_sender(app_state: &Arc<AppState>, session_id: SessionId) -> I
             session_id.clone(),
             mrd_application::ports::SessionSnapshot {
                 sender_active: true,
-                lifecycle_state: "streaming".to_string(),
+                lifecycle_state: SessionLifecycleState::Streaming,
                 last_error: None,
                 ..snapshot
             },
@@ -41,7 +42,7 @@ pub async fn start_receiver(app_state: &Arc<AppState>, session_id: SessionId) ->
             session_id.clone(),
             mrd_application::ports::SessionSnapshot {
                 receiver_active: true,
-                lifecycle_state: "streaming".to_string(),
+                lifecycle_state: SessionLifecycleState::Streaming,
                 last_error: None,
                 ..snapshot
             },

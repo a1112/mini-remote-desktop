@@ -404,7 +404,7 @@ async fn session_can_adapt(app_state: &Arc<AppState>, session_id: &SessionId) ->
     let sessions = app_state.sessions.lock().await;
     sessions
         .get(session_id)
-        .map(|snapshot| !matches!(snapshot.lifecycle_state.as_str(), "closed" | "failed"))
+        .map(|snapshot| !snapshot.lifecycle_state.is_terminal())
         .unwrap_or(false)
 }
 

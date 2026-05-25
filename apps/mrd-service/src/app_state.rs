@@ -9,7 +9,7 @@
 
 use base64::{engine::general_purpose, Engine as _};
 use image::{codecs::png::PngEncoder, ColorType, ImageEncoder};
-use mrd_application::ports::SessionSnapshot;
+use mrd_application::ports::{SessionLifecycleState, SessionSnapshot};
 use mrd_ipc::{
     AttachedRenderSurface, AuditEvent, AuditLogQuery, CapabilitySnapshot, CaptureSourceSelection,
     MediaAdaptationSnapshot, MediaPipelineSnapshot, MediaProfile, MediaProfileNegotiation,
@@ -113,8 +113,7 @@ impl CaptureSourceRegistry {
             .filter(|(session_id, selection)| {
                 selection.source.source_kind == "window"
                     && sessions.get(session_id).is_some_and(|snapshot| {
-                        snapshot.sender_active
-                            && !matches!(snapshot.lifecycle_state.as_str(), "closed" | "failed")
+                        snapshot.sender_active && !snapshot.lifecycle_state.is_terminal()
                     })
             })
             .count()
@@ -1583,7 +1582,7 @@ mod tests {
             remote_listen_addr: None,
             remote_server_name: None,
             remote_cert_der_b64: None,
-            lifecycle_state: "created".to_string(),
+            lifecycle_state: SessionLifecycleState::Created,
             last_error: None,
             sender_active: false,
             receiver_active: false,

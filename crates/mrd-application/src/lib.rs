@@ -17,6 +17,7 @@ use mrd_signal_proto::{IceCandidate, SignalMessage};
 /// be tested independently and swapped between implementations.
 pub mod ports {
     use super::*;
+    pub use mrd_session::SessionLifecycleState;
 
     /// Signaling client port - handles communication with signaling server
     #[async_trait::async_trait]
@@ -94,7 +95,7 @@ pub mod ports {
         /// Remote certificate DER, base64 encoded.
         pub remote_cert_der_b64: Option<String>,
         /// Explicit lifecycle state from domain model
-        pub lifecycle_state: String,
+        pub lifecycle_state: SessionLifecycleState,
         /// Last error if any
         pub last_error: Option<String>,
         /// Whether sender-side media is active.

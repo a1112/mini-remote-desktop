@@ -4,7 +4,7 @@
 // correctly without state being collapsed or lost.
 
 use mrd_proto::{DeviceId, SessionId};
-use mrd_session::QuicSessionCoordinator;
+use mrd_session::{QuicSessionCoordinator, SessionLifecycleState};
 
 #[test]
 fn multiple_sessions_can_be_tracked_independently() {
@@ -101,6 +101,28 @@ fn session_not_found_returns_none() {
 }
 
 #[test]
+fn application_session_snapshot_uses_domain_lifecycle_state() {
+    let snapshot = mrd_application::ports::SessionSnapshot {
+        session_id: SessionId("domain-state-session".to_string()),
+        transport: "quic".to_string(),
+        source_device_id: None,
+        target_device_id: Some(DeviceId("agent".to_string())),
+        local_listen_addr: None,
+        local_server_name: None,
+        local_cert_der_b64: None,
+        remote_listen_addr: None,
+        remote_server_name: None,
+        remote_cert_der_b64: None,
+        lifecycle_state: SessionLifecycleState::Connecting,
+        last_error: None,
+        sender_active: false,
+        receiver_active: false,
+    };
+
+    assert_eq!(snapshot.lifecycle_state, SessionLifecycleState::Connecting);
+}
+
+#[test]
 fn multiple_realtime_events_in_one_drain_cycle() {
     use mrd_application::ports::{SessionCoordinatorPort, SessionSnapshot, SignalingPort};
     use mrd_signal_proto::{SessionAccept, SessionRequest, SignalMessage};
@@ -152,7 +174,7 @@ fn multiple_realtime_events_in_one_drain_cycle() {
                     remote_listen_addr: None,
                     remote_server_name: None,
                     remote_cert_der_b64: None,
-                    lifecycle_state: "created".to_string(),
+                    lifecycle_state: SessionLifecycleState::Created,
                     last_error: None,
                     sender_active: false,
                     receiver_active: false,
@@ -183,7 +205,7 @@ fn multiple_realtime_events_in_one_drain_cycle() {
                     remote_listen_addr,
                     remote_server_name,
                     remote_cert_der_b64,
-                    lifecycle_state: "listening".to_string(),
+                    lifecycle_state: SessionLifecycleState::Listening,
                     last_error: None,
                     sender_active: false,
                     receiver_active: false,
