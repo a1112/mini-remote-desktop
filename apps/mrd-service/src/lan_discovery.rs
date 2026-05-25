@@ -3100,6 +3100,11 @@ async fn send_quic_media_loop(
         let selected_dynamic_window_fps_config_key =
             dynamic_window_fps_config_key(&source_id, &profile);
         let selected_source_is_window = is_windows_window_source_id(&source_id);
+        let selected_window_capture_count = if selected_source_is_window {
+            active_window_capture_count(&app_state).await
+        } else {
+            0
+        };
         if selected_source_is_window {
             if dynamic_window_fps_config.as_ref() != Some(&selected_dynamic_window_fps_config_key) {
                 let policy = DynamicWindowFpsPolicy::new(profile.fps);
@@ -3148,6 +3153,7 @@ async fn send_quic_media_loop(
                             &mut dynamic_window_fps_decision,
                             false,
                             false,
+                            selected_window_capture_count,
                         );
                         handle_media_sender_frame_error(
                             &app_state,
@@ -3174,6 +3180,7 @@ async fn send_quic_media_loop(
                         &mut dynamic_window_fps_decision,
                         false,
                         false,
+                        selected_window_capture_count,
                     );
                     handle_media_sender_frame_error(
                         &app_state,
@@ -3213,7 +3220,10 @@ async fn send_quic_media_loop(
                 if selected_source_is_window && is_winrt_window_capture_no_frame_timeout(&error) {
                     if let Some(policy) = dynamic_window_fps_policy.as_mut() {
                         dynamic_window_fps_decision =
-                            Some(policy.update(window_dynamic_fps_input_for_capture_error(&error)));
+                            Some(policy.update(window_dynamic_fps_input_for_capture_error(
+                                &error,
+                                selected_window_capture_count,
+                            )));
                     }
                     continue;
                 }
@@ -3226,6 +3236,7 @@ async fn send_quic_media_loop(
                     &mut dynamic_window_fps_decision,
                     false,
                     false,
+                    selected_window_capture_count,
                 );
                 handle_media_sender_frame_error(
                     &app_state,
@@ -3241,8 +3252,9 @@ async fn send_quic_media_loop(
         };
         let capture_memory_path = captured_frame_memory_path(&raw_frame).to_string();
         if let Some(policy) = dynamic_window_fps_policy.as_mut() {
-            dynamic_window_fps_decision =
-                Some(policy.update(window_dynamic_fps_input_for_captured_frame()));
+            dynamic_window_fps_decision = Some(policy.update(
+                window_dynamic_fps_input_for_captured_frame(selected_window_capture_count),
+            ));
         }
         let prepare_started = Instant::now();
         let frame_result = prepare_frame_for_h264(raw_frame, &profile);
@@ -7224,25 +7236,38 @@ impl DynamicWindowFpsPolicy {
     }
 }
 
-fn window_dynamic_fps_input(frame_changed: bool, source_available: bool) -> DynamicWindowFpsInput {
+fn window_dynamic_fps_input(
+    frame_changed: bool,
+    source_available: bool,
+    active_window_capture_count: u32,
+) -> DynamicWindowFpsInput {
     DynamicWindowFpsInput {
         frame_changed,
         input_active: false,
         source_available,
-        active_window_capture_count: 1,
+        active_window_capture_count: active_window_capture_count.max(1),
     }
 }
 
-fn window_dynamic_fps_input_for_captured_frame() -> DynamicWindowFpsInput {
-    window_dynamic_fps_input(true, true)
+fn window_dynamic_fps_input_for_captured_frame(
+    active_window_capture_count: u32,
+) -> DynamicWindowFpsInput {
+    window_dynamic_fps_input(true, true, active_window_capture_count)
 }
 
 fn is_winrt_window_capture_no_frame_timeout(error: &anyhow::Error) -> bool {
     format!("{error:#}").contains("WinRT capture produced no frame within")
 }
 
-fn window_dynamic_fps_input_for_capture_error(error: &anyhow::Error) -> DynamicWindowFpsInput {
-    window_dynamic_fps_input(false, is_winrt_window_capture_no_frame_timeout(error))
+fn window_dynamic_fps_input_for_capture_error(
+    error: &anyhow::Error,
+    active_window_capture_count: u32,
+) -> DynamicWindowFpsInput {
+    window_dynamic_fps_input(
+        false,
+        is_winrt_window_capture_no_frame_timeout(error),
+        active_window_capture_count,
+    )
 }
 
 fn update_dynamic_window_fps_decision(
@@ -7250,10 +7275,25 @@ fn update_dynamic_window_fps_decision(
     decision: &mut Option<DynamicWindowFpsDecision>,
     frame_changed: bool,
     source_available: bool,
+    active_window_capture_count: u32,
 ) {
     if let Some(policy) = policy.as_mut() {
-        *decision = Some(policy.update(window_dynamic_fps_input(frame_changed, source_available)));
+        *decision = Some(policy.update(window_dynamic_fps_input(
+            frame_changed,
+            source_available,
+            active_window_capture_count,
+        )));
     }
+}
+
+async fn active_window_capture_count(app_state: &Arc<AppState>) -> u32 {
+    app_state
+        .capture_sources
+        .lock()
+        .await
+        .active_window_capture_count()
+        .try_into()
+        .unwrap_or(u32::MAX)
 }
 
 fn new_instance_id() -> String {
@@ -7287,10 +7327,11 @@ mod tests {
 
     #[test]
     fn successful_window_capture_frame_is_dynamic_fps_activity() {
-        let input = window_dynamic_fps_input_for_captured_frame();
+        let input = window_dynamic_fps_input_for_captured_frame(3);
 
         assert!(input.frame_changed);
         assert!(input.source_available);
+        assert_eq!(input.active_window_capture_count, 3);
     }
 
     #[test]
@@ -7300,9 +7341,10 @@ mod tests {
         );
 
         assert!(is_winrt_window_capture_no_frame_timeout(&error));
-        let input = window_dynamic_fps_input_for_capture_error(&error);
+        let input = window_dynamic_fps_input_for_capture_error(&error, 2);
         assert!(!input.frame_changed);
         assert!(input.source_available);
+        assert_eq!(input.active_window_capture_count, 2);
     }
 
     #[test]
@@ -7310,9 +7352,10 @@ mod tests {
         let error = anyhow::anyhow!("failed to capture LAN desktop frame: access denied");
 
         assert!(!is_winrt_window_capture_no_frame_timeout(&error));
-        let input = window_dynamic_fps_input_for_capture_error(&error);
+        let input = window_dynamic_fps_input_for_capture_error(&error, 2);
         assert!(!input.frame_changed);
         assert!(!input.source_available);
+        assert_eq!(input.active_window_capture_count, 2);
     }
 
     #[test]
@@ -8708,6 +8751,94 @@ mod tests {
             negotiation.downgrade_reason.as_deref(),
             Some("matched active display mode dimensions and refresh rate")
         );
+    }
+
+    #[tokio::test]
+    async fn capture_source_selection_tracks_different_windows_per_session() {
+        let app_state = Arc::new(AppState::default());
+        let session_a = SessionId("window-a".to_string());
+        let session_b = SessionId("window-b".to_string());
+
+        store_capture_source_selection(
+            &app_state,
+            &session_a,
+            CaptureSourceSelection {
+                session_id: session_a.clone(),
+                source: test_window_capture_source("windows:window:0x1111"),
+                status: "selected".to_string(),
+                reason: None,
+            },
+        )
+        .await;
+
+        store_capture_source_selection(
+            &app_state,
+            &session_b,
+            CaptureSourceSelection {
+                session_id: session_b.clone(),
+                source: test_window_capture_source("windows:window:0x2222"),
+                status: "selected".to_string(),
+                reason: None,
+            },
+        )
+        .await;
+
+        assert_eq!(
+            selected_capture_source_id(&app_state, &session_a)
+                .await
+                .unwrap(),
+            "windows:window:0x1111"
+        );
+        assert_eq!(
+            selected_capture_source_id(&app_state, &session_b)
+                .await
+                .unwrap(),
+            "windows:window:0x2222"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_window_capture_count_counts_selected_window_sessions() {
+        let app_state = Arc::new(AppState::default());
+        let session_a = SessionId("window-a".to_string());
+        let session_b = SessionId("window-b".to_string());
+        let session_display = SessionId("display".to_string());
+
+        store_capture_source_selection(
+            &app_state,
+            &session_a,
+            CaptureSourceSelection {
+                session_id: session_a.clone(),
+                source: test_window_capture_source("windows:window:0x1111"),
+                status: "selected".to_string(),
+                reason: None,
+            },
+        )
+        .await;
+        store_capture_source_selection(
+            &app_state,
+            &session_b,
+            CaptureSourceSelection {
+                session_id: session_b.clone(),
+                source: test_window_capture_source("windows:window:0x2222"),
+                status: "selected".to_string(),
+                reason: None,
+            },
+        )
+        .await;
+        store_capture_source_selection(
+            &app_state,
+            &session_display,
+            CaptureSourceSelection {
+                session_id: session_display.clone(),
+                source: test_display_capture_source("windows:display-shared:0"),
+                status: "selected".to_string(),
+                reason: None,
+            },
+        )
+        .await;
+
+        assert_eq!(active_window_capture_count(&app_state).await, 2);
     }
 
     #[tokio::test]
@@ -10541,6 +10672,42 @@ mod tests {
             last_error: None,
             sender_active: true,
             receiver_active: false,
+        }
+    }
+
+    fn test_window_capture_source(id: &str) -> CaptureSource {
+        CaptureSource {
+            id: id.to_string(),
+            platform: "windows".to_string(),
+            source_kind: "window".to_string(),
+            title: "Target App".to_string(),
+            class_name: "ApplicationFrameWindow".to_string(),
+            width: 1280,
+            height: 720,
+            process_id: 4242,
+            app_name: Some("Target App".to_string()),
+            bundle_identifier: None,
+            preview_data_url: None,
+            preview_width: None,
+            preview_height: None,
+        }
+    }
+
+    fn test_display_capture_source(id: &str) -> CaptureSource {
+        CaptureSource {
+            id: id.to_string(),
+            platform: "windows".to_string(),
+            source_kind: "display_shared".to_string(),
+            title: "Display 1".to_string(),
+            class_name: "WinRTMonitorShared".to_string(),
+            width: 1920,
+            height: 1080,
+            process_id: 0,
+            app_name: Some("Display".to_string()),
+            bundle_identifier: None,
+            preview_data_url: None,
+            preview_width: None,
+            preview_height: None,
         }
     }
 

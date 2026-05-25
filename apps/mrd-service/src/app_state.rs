@@ -106,6 +106,13 @@ impl CaptureSourceRegistry {
     pub fn remove(&mut self, session_id: &SessionId) -> Option<CaptureSourceSelection> {
         self.selections.remove(session_id)
     }
+
+    pub fn active_window_capture_count(&self) -> usize {
+        self.selections
+            .values()
+            .filter(|selection| selection.source.source_kind == "window")
+            .count()
+    }
 }
 
 /// Runtime display mode changes keyed by session.
