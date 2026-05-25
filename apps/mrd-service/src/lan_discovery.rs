@@ -5912,9 +5912,22 @@ fn create_windows_lan_frame_capture(
             capture.set_target_dimensions(profile.width as usize, profile.height as usize);
             Ok(LanFrameCapture::DxgiShared(capture))
         }
-        WindowsLanCaptureBackend::WinrtWindowShared | WindowsLanCaptureBackend::Winrt => Ok(
-            LanFrameCapture::Winrt(crate::capture_source::create_frame_capture(source_id)?),
-        ),
+        WindowsLanCaptureBackend::WinrtWindowShared => {
+            let hwnd = parse_windows_window_source_id(source_id)?;
+            let mut capture =
+                mrd_capture_winrt::WinrtCapture::from_window_handle_shared_texture(hwnd)
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))
+                    .with_context(|| {
+                        format!("failed to create WinRT shared window capture for {source_id}")
+                    })?;
+            capture
+                .start()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            Ok(LanFrameCapture::Winrt(capture))
+        }
+        WindowsLanCaptureBackend::Winrt => Ok(LanFrameCapture::Winrt(
+            crate::capture_source::create_frame_capture(source_id)?,
+        )),
     }
 }
 
@@ -5936,6 +5949,11 @@ fn windows_lan_capture_backend(source_id: &str) -> WindowsLanCaptureBackend {
     } else {
         WindowsLanCaptureBackend::Winrt
     }
+}
+
+#[cfg(windows)]
+fn parse_windows_window_source_id(source_id: &str) -> Result<isize> {
+    crate::capture_source::parse_windows_window_hwnd_source_id(source_id)
 }
 
 fn prepare_frame_for_h264(frame: CapturedFrame, profile: &MediaProfile) -> Result<CapturedFrame> {
@@ -8833,6 +8851,25 @@ mod tests {
             windows_lan_capture_backend("windows:display-shared:1"),
             WindowsLanCaptureBackend::DxgiShared
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parse_windows_window_source_id_extracts_hwnd() {
+        assert_eq!(
+            parse_windows_window_source_id("windows:window:0x1234").unwrap(),
+            0x1234
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parse_windows_window_source_id_rejects_display_source() {
+        let error = parse_windows_window_source_id("windows:display-shared:1")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("window"));
     }
 
     #[test]

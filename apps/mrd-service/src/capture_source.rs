@@ -592,15 +592,26 @@ fn parse_windows_capture_source_ref(source_id: &str) -> Result<WindowsCaptureSou
             index: parse_windows_display_index(source_id, value)?,
         });
     }
-    if let Some(value) = trimmed.strip_prefix("windows:window:") {
-        return Ok(WindowsCaptureSourceRef::Window(parse_windows_hwnd_value(
-            source_id, value,
-        )?));
+    if trimmed.starts_with("windows:window:") {
+        return Ok(WindowsCaptureSourceRef::Window(
+            parse_windows_window_hwnd_source_id(source_id)?,
+        ));
     }
 
     Ok(WindowsCaptureSourceRef::Window(parse_windows_hwnd_value(
         source_id, trimmed,
     )?))
+}
+
+#[cfg(windows)]
+pub(crate) fn parse_windows_window_hwnd_source_id(source_id: &str) -> Result<isize> {
+    let trimmed = source_id.trim();
+    let value = trimmed.strip_prefix("windows:window:").ok_or_else(|| {
+        anyhow::anyhow!(
+            "invalid Windows window capture source id '{source_id}': expected window source"
+        )
+    })?;
+    parse_windows_hwnd_value(source_id, value)
 }
 
 #[cfg(target_os = "macos")]
