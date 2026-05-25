@@ -169,12 +169,17 @@ pub fn available_decoder_descriptors() -> Vec<DecoderDescriptor> {
     ];
 
     #[cfg(target_os = "linux")]
-    descriptors.extend([
-        LINUX_H264_DESCRIPTOR.clone(),
-        LINUX_HEVC_DESCRIPTOR.clone(),
-        LINUX_HEVC_MAIN10_DESCRIPTOR.clone(),
-    ]);
+    {
+        let mut descriptors = descriptors;
+        descriptors.extend([
+            LINUX_H264_DESCRIPTOR.clone(),
+            LINUX_HEVC_DESCRIPTOR.clone(),
+            LINUX_HEVC_MAIN10_DESCRIPTOR.clone(),
+        ]);
+        descriptors
+    }
 
+    #[cfg(not(target_os = "linux"))]
     descriptors
 }
 
@@ -475,22 +480,27 @@ impl NvdecVideoDecoder {
     }
 
     pub fn new_d3d11_shared() -> Result<Self, PipelineError> {
-        let mut decoder = mrd_decode_nvdec::NvdecDecoder::new_with_output_mode(
-            mrd_decode_nvdec::NvdecOutputMode::CpuNv12,
-        )
-        .map_err(|e| PipelineError::Message(format!("nvdec d3d11 shared create failed: {e}")))?;
-        #[cfg(windows)]
-        decoder.enable_shared_texture(true);
         #[cfg(not(windows))]
         {
             return Err(PipelineError::Message(
                 "nvdec d3d11 shared output is only available on Windows".to_string(),
             ));
         }
-        Ok(Self {
-            decoder,
-            require_shared_output: true,
-        })
+
+        #[cfg(windows)]
+        {
+            let mut decoder = mrd_decode_nvdec::NvdecDecoder::new_with_output_mode(
+                mrd_decode_nvdec::NvdecOutputMode::CpuNv12,
+            )
+            .map_err(|e| {
+                PipelineError::Message(format!("nvdec d3d11 shared create failed: {e}"))
+            })?;
+            decoder.enable_shared_texture(true);
+            Ok(Self {
+                decoder,
+                require_shared_output: true,
+            })
+        }
     }
 
     pub fn new_av1() -> Result<Self, PipelineError> {
@@ -516,24 +526,27 @@ impl NvdecVideoDecoder {
     }
 
     pub fn new_hevc_d3d11_shared() -> Result<Self, PipelineError> {
-        let mut decoder = mrd_decode_nvdec::NvdecDecoder::new_hevc_with_output_mode(
-            mrd_decode_nvdec::NvdecOutputMode::CpuNv12,
-        )
-        .map_err(|e| {
-            PipelineError::Message(format!("nvdec hevc d3d11 shared create failed: {e}"))
-        })?;
-        #[cfg(windows)]
-        decoder.enable_shared_texture(true);
         #[cfg(not(windows))]
         {
             return Err(PipelineError::Message(
                 "nvdec hevc d3d11 shared output is only available on Windows".to_string(),
             ));
         }
-        Ok(Self {
-            decoder,
-            require_shared_output: true,
-        })
+
+        #[cfg(windows)]
+        {
+            let mut decoder = mrd_decode_nvdec::NvdecDecoder::new_hevc_with_output_mode(
+                mrd_decode_nvdec::NvdecOutputMode::CpuNv12,
+            )
+            .map_err(|e| {
+                PipelineError::Message(format!("nvdec hevc d3d11 shared create failed: {e}"))
+            })?;
+            decoder.enable_shared_texture(true);
+            Ok(Self {
+                decoder,
+                require_shared_output: true,
+            })
+        }
     }
 
     pub fn new_hevc_main10() -> Result<Self, PipelineError> {
@@ -548,24 +561,27 @@ impl NvdecVideoDecoder {
     }
 
     pub fn new_hevc_main10_d3d11_shared() -> Result<Self, PipelineError> {
-        let mut decoder = mrd_decode_nvdec::NvdecDecoder::new_hevc_main10_with_output_mode(
-            mrd_decode_nvdec::NvdecOutputMode::CpuNv12,
-        )
-        .map_err(|e| {
-            PipelineError::Message(format!("nvdec hevc main10 d3d11 shared create failed: {e}"))
-        })?;
-        #[cfg(windows)]
-        decoder.enable_shared_texture(true);
         #[cfg(not(windows))]
         {
             return Err(PipelineError::Message(
                 "nvdec hevc main10 d3d11 shared output is only available on Windows".to_string(),
             ));
         }
-        Ok(Self {
-            decoder,
-            require_shared_output: true,
-        })
+
+        #[cfg(windows)]
+        {
+            let mut decoder = mrd_decode_nvdec::NvdecDecoder::new_hevc_main10_with_output_mode(
+                mrd_decode_nvdec::NvdecOutputMode::CpuNv12,
+            )
+            .map_err(|e| {
+                PipelineError::Message(format!("nvdec hevc main10 d3d11 shared create failed: {e}"))
+            })?;
+            decoder.enable_shared_texture(true);
+            Ok(Self {
+                decoder,
+                require_shared_output: true,
+            })
+        }
     }
 }
 
