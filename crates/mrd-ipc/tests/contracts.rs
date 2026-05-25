@@ -690,6 +690,11 @@ fn serialize_deserialize_media_pipeline_snapshot_contract() {
             }],
             test_impairment: None,
             sender_transport: MediaSenderTransportSnapshot {
+                capture_source_id: Some("windows:window:0x1234".to_string()),
+                capture_source_kind: Some("window".to_string()),
+                capture_memory_path: Some("d3d11_shared_bgra".to_string()),
+                dynamic_fps_tier: Some("active".to_string()),
+                target_fps: Some(144),
                 datagram_fragments_attempted: 4,
                 datagram_fragments_sent: 3,
                 datagram_fragments_delayed: 0,
@@ -719,6 +724,29 @@ fn serialize_deserialize_media_pipeline_snapshot_contract() {
     let json = serde_json::to_string(&response).unwrap();
     let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
     assert_eq!(response, deserialized);
+}
+
+#[test]
+fn media_sender_snapshot_serializes_window_dynamic_fps_fields() {
+    let snapshot = MediaSenderTransportSnapshot {
+        capture_source_id: Some("windows:window:0x1234".to_string()),
+        capture_source_kind: Some("window".to_string()),
+        capture_memory_path: Some("d3d11_shared_bgra".to_string()),
+        dynamic_fps_tier: Some("active".to_string()),
+        target_fps: Some(120),
+        ..MediaSenderTransportSnapshot::default()
+    };
+
+    let json = serde_json::to_string(&snapshot).unwrap();
+
+    assert!(json.contains("windows:window:0x1234"));
+    assert!(json.contains("capture_source_kind"));
+    assert!(json.contains("capture_memory_path"));
+    assert!(json.contains("dynamic_fps_tier"));
+    assert!(json.contains("target_fps"));
+
+    let deserialized: MediaSenderTransportSnapshot = serde_json::from_str(&json).unwrap();
+    assert_eq!(snapshot, deserialized);
 }
 
 #[test]

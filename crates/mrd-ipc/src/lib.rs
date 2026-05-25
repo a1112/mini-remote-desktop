@@ -184,6 +184,16 @@ mod wire {
     /// Sender-side LAN media transport counters.
     #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
     pub struct MediaSenderTransportSnapshot {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub capture_source_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub capture_source_kind: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub capture_memory_path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub dynamic_fps_tier: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub target_fps: Option<u32>,
         pub datagram_fragments_attempted: u64,
         pub datagram_fragments_sent: u64,
         pub datagram_fragments_delayed: u64,

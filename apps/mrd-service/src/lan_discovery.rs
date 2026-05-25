@@ -865,10 +865,24 @@ impl LanSenderStatsTracker {
         now: Instant,
         sequence: u64,
         source_id: Option<String>,
+        capture_source_kind: Option<String>,
+        capture_memory_path: Option<String>,
         profile: &MediaProfile,
+        dynamic_fps_decision: Option<DynamicWindowFpsDecision>,
         test_impairment: Option<MediaTestImpairmentSnapshot>,
     ) -> Option<LanSenderStatsPayload> {
         let metrics = self.take_stage_metrics(now)?;
+        let mut sender_transport = self.sender_transport.clone();
+        sender_transport.capture_source_id = source_id.clone();
+        sender_transport.capture_source_kind = capture_source_kind;
+        sender_transport.capture_memory_path = capture_memory_path;
+        sender_transport.dynamic_fps_tier =
+            dynamic_fps_decision.map(|decision| decision.tier.as_str().to_string());
+        sender_transport.target_fps = Some(
+            dynamic_fps_decision
+                .map(|decision| decision.target_fps)
+                .unwrap_or(profile.fps),
+        );
         Some(LanSenderStatsPayload {
             sequence,
             frame_count: self.frame_count,
@@ -876,7 +890,7 @@ impl LanSenderStatsTracker {
             target_fps: profile.fps,
             target_bitrate_mbps: profile.bitrate_mbps,
             metrics,
-            sender_transport: self.sender_transport.clone(),
+            sender_transport,
             test_impairment,
         })
     }
@@ -3225,6 +3239,7 @@ async fn send_quic_media_loop(
                 continue;
             }
         };
+        let capture_memory_path = captured_frame_memory_path(&raw_frame).to_string();
         if let Some(policy) = dynamic_window_fps_policy.as_mut() {
             dynamic_window_fps_decision =
                 Some(policy.update(window_dynamic_fps_input_for_captured_frame()));
@@ -3676,7 +3691,12 @@ async fn send_quic_media_loop(
                 active_capture_config
                     .as_ref()
                     .map(|config| config.source_id.clone()),
+                active_capture_config
+                    .as_ref()
+                    .and_then(|config| capture_source_kind_from_id(&config.source_id)),
+                Some(capture_memory_path.clone()),
                 &profile,
+                dynamic_window_fps_decision,
                 test_impairment.snapshot(),
             ) {
                 let stats_send_started = Instant::now();
@@ -6091,6 +6111,26 @@ fn is_windows_window_source_id(source_id: &str) -> bool {
         .starts_with("windows:window:")
 }
 
+fn capture_source_kind_from_id(source_id: &str) -> Option<String> {
+    source_id
+        .trim()
+        .split(':')
+        .nth(1)
+        .filter(|kind| !kind.is_empty())
+        .map(|kind| kind.replace('-', "_"))
+}
+
+fn captured_frame_memory_path(frame: &CapturedFrame) -> &'static str {
+    #[cfg(windows)]
+    {
+        if frame.d3d11_shared_bgra().is_some() {
+            return "d3d11_shared_bgra";
+        }
+    }
+
+    "cpu"
+}
+
 fn prepare_frame_for_h264(frame: CapturedFrame, profile: &MediaProfile) -> Result<CapturedFrame> {
     if frame.width < 2 || frame.height < 2 {
         anyhow::bail!(
@@ -7089,6 +7129,17 @@ enum DynamicWindowFpsTier {
     Warm,
     Idle,
     Suspended,
+}
+
+impl DynamicWindowFpsTier {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Warm => "warm",
+            Self::Idle => "idle",
+            Self::Suspended => "suspended",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9240,6 +9291,11 @@ mod tests {
                 p95_ms: Some(2.4),
             }],
             sender_transport: MediaSenderTransportSnapshot {
+                capture_source_id: Some("windows:display-shared:0".to_string()),
+                capture_source_kind: Some("display_shared".to_string()),
+                capture_memory_path: Some("d3d11_shared_bgra".to_string()),
+                dynamic_fps_tier: None,
+                target_fps: Some(144),
                 datagram_fragments_attempted: 4,
                 datagram_fragments_sent: 3,
                 datagram_fragments_delayed: 0,
