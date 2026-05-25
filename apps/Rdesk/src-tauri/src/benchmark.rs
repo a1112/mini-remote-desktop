@@ -705,6 +705,10 @@ mod tests {
         manifest: &BenchmarkManifest,
         session_id: &SessionId,
     ) -> (BenchmarkSummary, PipelineProbeSnapshot) {
+        if let Some(reason) = unsupported_encoder_backend_reason(&manifest.encode_backend) {
+            return unsupported_benchmark_result(manifest, session_id, reason);
+        }
+
         let mut harness = TestHarness::new().expect("create benchmark harness");
         harness.set_chain(TestChain::Custom {
             capture: parse_capture_backend(&manifest.capture_backend),
@@ -954,7 +958,11 @@ mod tests {
             | "software_hevc_main10"
             | "hevc_main10_software"
             | "software_av1"
-            | "av1_software" => DecoderType::Software,
+            | "av1_software"
+            | "software_vvc"
+            | "vvc_software"
+            | "software_h266"
+            | "h266_software" => DecoderType::Software,
             #[cfg(target_os = "linux")]
             "linux_h264" => DecoderType::LinuxH264,
             #[cfg(target_os = "linux")]
@@ -972,6 +980,93 @@ mod tests {
             "loopback" => TransportKind::Loopback,
             _ => TransportKind::WebrtcRtp,
         }
+    }
+
+    fn unsupported_encoder_backend_reason(value: &str) -> Option<String> {
+        matches!(
+            value,
+            "software_vvc"
+                | "vvc_software"
+                | "software_h266"
+                | "h266_software"
+                | "software-vvc"
+                | "vvc-software"
+                | "software-h266"
+                | "h266-software"
+                | "vvenc"
+                | "vvc"
+                | "h266"
+                | "h.266"
+        )
+        .then(|| {
+            "H.266/VVC benchmark encode is capability-gated: VVenC software encode is not wired into the harness; NVIDIA and browser hardware H.266 paths are unavailable".to_string()
+        })
+    }
+
+    fn unsupported_benchmark_result(
+        manifest: &BenchmarkManifest,
+        session_id: &SessionId,
+        reason: String,
+    ) -> (BenchmarkSummary, PipelineProbeSnapshot) {
+        let probe = PipelineProbeSnapshot::from_parts(
+            session_id.clone(),
+            "benchmark".into(),
+            Some(manifest.encode_backend.clone()),
+            Some("vvc".into()),
+            Some(manifest.transport.clone()),
+            0.0,
+            0.0,
+            0,
+            0,
+            vec![],
+            vec![],
+        );
+        let summary = BenchmarkSummary {
+            run_id: manifest.run_id.clone(),
+            scenario: manifest.scenario.clone(),
+            transport: manifest.transport.clone(),
+            capture_backend: manifest.capture_backend.clone(),
+            encode_backend: manifest.encode_backend.clone(),
+            decode_backend: manifest.decode_backend.clone(),
+            renderer_backend: manifest.renderer_backend.clone(),
+            width: manifest.width,
+            height: manifest.height,
+            fps_target: manifest.fps,
+            duration_secs: manifest.duration_secs,
+            session_established: false,
+            first_frame_seen: false,
+            first_frame_time_ms: None,
+            probe_complete: false,
+            fps_observed: 0.0,
+            bitrate_kbps: 0.0,
+            keyframes: 0,
+            dropped_frames: 0,
+            quic_receiver_completed_frames: None,
+            quic_receiver_expired_frames: None,
+            quic_receiver_evicted_frames: None,
+            quic_receiver_duplicate_fragments: None,
+            quic_receiver_rejected_fragments: None,
+            quic_receiver_pending_frames: None,
+            quic_receiver_reassembly_drops: None,
+            zero_write_access_unit_count: 0,
+            warning_count: 0,
+            error_count: 1,
+            restart_count: 0,
+            encode_total_p95_ms: None,
+            send_write_p95_ms: None,
+            decode_total_p95_ms: None,
+            frame_sink_ingest_p95_ms: None,
+            render_upload_p95_ms: None,
+            render_present_p95_ms: None,
+            nvdec_runtime_summary: String::new(),
+            nvdec_h264_capability: String::new(),
+            nvdec_hevc_capability: String::new(),
+            nvdec_hevc_main10_capability: String::new(),
+            failure_reason: Some(reason),
+            run_passed: false,
+        };
+
+        (summary, probe)
     }
 
     fn benchmark_zero_copy_enabled(manifest: &BenchmarkManifest) -> bool {
@@ -1181,6 +1276,39 @@ mod tests {
             TransportKind::QuicDatagram
         );
         assert_eq!(parse_transport_backend("webrtc"), TransportKind::WebrtcRtp);
+    }
+
+    #[test]
+    fn benchmark_h266_encoder_backend_is_capability_gated() {
+        let manifest = BenchmarkManifest {
+            run_id: "quick-webrtc-20260308-vvc".into(),
+            scenario: "quick.transport".into(),
+            transport: "webrtc".into(),
+            capture_backend: "dxgi".into(),
+            encode_backend: "software_vvc".into(),
+            decode_backend: "software_vvc".into(),
+            renderer_backend: "d3d11".into(),
+            width: 2560,
+            height: 1440,
+            fps: 144,
+            duration_secs: 20,
+            git_commit: "abc123".into(),
+        };
+        let session_id = SessionId("session-vvc".into());
+
+        let (summary, probe) = run_harness_benchmark(&manifest, &session_id);
+
+        assert!(!summary.run_passed);
+        assert_eq!(summary.fps_observed, 0.0);
+        assert_eq!(summary.error_count, 1);
+        assert_eq!(summary.encode_backend, "software_vvc");
+        assert_eq!(summary.decode_backend, "software_vvc");
+        assert!(summary
+            .failure_reason
+            .as_deref()
+            .expect("failure reason")
+            .contains("VVenC software encode is not wired"));
+        assert_eq!(probe.codec.as_deref(), Some("vvc"));
     }
 
     #[test]
