@@ -1263,8 +1263,7 @@ mod tests {
 
         assert!(ladder.len() > 1);
         assert!(ladder.iter().any(|profile| {
-            profile.fps < current_profile.fps
-                || profile.bitrate_mbps < current_profile.bitrate_mbps
+            profile.fps < current_profile.fps || profile.bitrate_mbps < current_profile.bitrate_mbps
         }));
         assert!(ladder.iter().all(|profile| {
             profile.width == current_profile.width && profile.height == current_profile.height

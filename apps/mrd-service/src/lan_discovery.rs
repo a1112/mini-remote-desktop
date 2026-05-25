@@ -6197,7 +6197,8 @@ fn windows_lan_profile_requires_scaling_path(
     source_height: usize,
     profile: &MediaProfile,
 ) -> bool {
-    let (target_width, target_height) = h264_target_dimensions(source_width, source_height, profile);
+    let (target_width, target_height) =
+        h264_target_dimensions(source_width, source_height, profile);
     let native_width = even_dimension(source_width).max(2);
     let native_height = even_dimension(source_height).max(2);
     target_width < native_width || target_height < native_height
