@@ -2951,6 +2951,13 @@ struct LanCaptureConfigKey {
     height: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LanCapturedFrameSignature {
+    width: usize,
+    height: usize,
+    timestamp_us: u64,
+}
+
 fn lan_capture_config_key(source_id: &str, profile: &MediaProfile) -> LanCaptureConfigKey {
     LanCaptureConfigKey {
         source_id: source_id.to_string(),
@@ -2994,6 +3001,10 @@ async fn send_quic_media_loop(
     let mut media_timer_resolution = MediaTimerResolution::default();
     let mut sender_stats = LanSenderStatsTracker::new(Instant::now());
     let mut test_impairment = LanMediaTestImpairment::from_env()?;
+    let mut dynamic_window_fps_config: Option<LanCaptureConfigKey> = None;
+    let mut dynamic_window_fps_policy: Option<DynamicWindowFpsPolicy> = None;
+    let mut dynamic_window_fps_decision: Option<DynamicWindowFpsDecision> = None;
+    let mut previous_captured_frame_signature: Option<LanCapturedFrameSignature> = None;
     let reliable_media_supported = app_state
         .peer_media_capabilities
         .lock()
@@ -3032,7 +3043,28 @@ async fn send_quic_media_loop(
             high_quality_datagram_supported,
         );
         let requested_codec = LanAccessUnitCodec::from_profile(&profile);
-        let frame_interval = media_frame_interval(&profile);
+        let source_id = selected_capture_source_id(&app_state, &session_id).await?;
+        let selected_config_key = lan_capture_config_key(&source_id, &profile);
+        let selected_source_is_window = is_windows_window_source_id(&source_id);
+        if selected_source_is_window {
+            if dynamic_window_fps_config.as_ref() != Some(&selected_config_key) {
+                let policy = DynamicWindowFpsPolicy::new(profile.fps);
+                dynamic_window_fps_decision = Some(policy.current());
+                dynamic_window_fps_policy = Some(policy);
+                dynamic_window_fps_config = Some(selected_config_key.clone());
+                previous_captured_frame_signature = None;
+            }
+        } else {
+            dynamic_window_fps_config = None;
+            dynamic_window_fps_policy = None;
+            dynamic_window_fps_decision = None;
+            previous_captured_frame_signature = None;
+        }
+        let frame_interval = if selected_source_is_window {
+            media_frame_interval_for_dynamic_decision(&profile, dynamic_window_fps_decision)
+        } else {
+            media_frame_interval(&profile)
+        };
         if active_frame_interval != frame_interval {
             active_frame_interval = frame_interval;
             next_frame_at = Instant::now() + frame_interval;
@@ -3043,7 +3075,6 @@ async fn send_quic_media_loop(
             sleep_until_media_frame(delay_until, &profile).await;
         }
 
-        let source_id = selected_capture_source_id(&app_state, &session_id).await?;
         if !lan_capture_config_matches(active_capture_config.as_ref(), &source_id, &profile) {
             match create_lan_frame_capture(&source_id, &profile).await {
                 Ok(next_capture) => match LanSenderFrameCapture::new(next_capture) {
@@ -3051,7 +3082,7 @@ async fn send_quic_media_loop(
                         capture = Some(next_sender_capture);
                         encoder = None;
                         encoder_config = None;
-                        active_capture_config = Some(lan_capture_config_key(&source_id, &profile));
+                        active_capture_config = Some(selected_config_key.clone());
                         consecutive_frame_errors = 0;
                         set_session_last_error(&app_state, &session_id, None).await;
                     }
@@ -3060,6 +3091,13 @@ async fn send_quic_media_loop(
                         encoder = None;
                         encoder_config = None;
                         active_capture_config = None;
+                        previous_captured_frame_signature = None;
+                        update_dynamic_window_fps_decision(
+                            &mut dynamic_window_fps_policy,
+                            &mut dynamic_window_fps_decision,
+                            false,
+                            false,
+                        );
                         handle_media_sender_frame_error(
                             &app_state,
                             &session_id,
@@ -3077,6 +3115,13 @@ async fn send_quic_media_loop(
                     encoder = None;
                     encoder_config = None;
                     active_capture_config = None;
+                    previous_captured_frame_signature = None;
+                    update_dynamic_window_fps_decision(
+                        &mut dynamic_window_fps_policy,
+                        &mut dynamic_window_fps_decision,
+                        false,
+                        false,
+                    );
                     handle_media_sender_frame_error(
                         &app_state,
                         &session_id,
@@ -3113,6 +3158,13 @@ async fn send_quic_media_loop(
                 encoder = None;
                 encoder_config = None;
                 active_capture_config = None;
+                previous_captured_frame_signature = None;
+                update_dynamic_window_fps_decision(
+                    &mut dynamic_window_fps_policy,
+                    &mut dynamic_window_fps_decision,
+                    false,
+                    false,
+                );
                 handle_media_sender_frame_error(
                     &app_state,
                     &session_id,
@@ -3125,6 +3177,19 @@ async fn send_quic_media_loop(
                 continue;
             }
         };
+        if let Some(policy) = dynamic_window_fps_policy.as_mut() {
+            let captured_signature = LanCapturedFrameSignature {
+                width: raw_frame.width,
+                height: raw_frame.height,
+                timestamp_us: raw_frame.timestamp_us,
+            };
+            let frame_changed = previous_captured_frame_signature
+                .map(|previous| previous != captured_signature)
+                .unwrap_or(true);
+            previous_captured_frame_signature = Some(captured_signature);
+            dynamic_window_fps_decision =
+                Some(policy.update(window_dynamic_fps_input(frame_changed, true)));
+        }
         let prepare_started = Instant::now();
         let frame_result = prepare_frame_for_h264(raw_frame, &profile);
         sender_stats.record_elapsed("sender.prepare", prepare_started);
@@ -5980,6 +6045,13 @@ fn parse_windows_window_source_id(source_id: &str) -> Result<isize> {
     crate::capture_source::parse_windows_window_hwnd_source_id(source_id)
 }
 
+fn is_windows_window_source_id(source_id: &str) -> bool {
+    source_id
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("windows:window:")
+}
+
 fn prepare_frame_for_h264(frame: CapturedFrame, profile: &MediaProfile) -> Result<CapturedFrame> {
     if frame.width < 2 || frame.height < 2 {
         anyhow::bail!(
@@ -6771,6 +6843,17 @@ fn media_frame_interval(profile: &MediaProfile) -> Duration {
     Duration::from_micros((1_000_000 / u64::from(profile.fps.max(1))).max(1))
 }
 
+fn media_frame_interval_for_dynamic_decision(
+    profile: &MediaProfile,
+    decision: Option<DynamicWindowFpsDecision>,
+) -> Duration {
+    let fps = decision
+        .map(|decision| decision.target_fps)
+        .unwrap_or(profile.fps)
+        .max(1);
+    Duration::from_micros((1_000_000 / u64::from(fps)).max(1))
+}
+
 fn media_profile_requests_high_resolution_timer(profile: &MediaProfile) -> bool {
     profile.fps >= LAN_MEDIA_HIGH_RESOLUTION_TIMER_MIN_FPS
 }
@@ -7051,6 +7134,26 @@ impl DynamicWindowFpsPolicy {
     }
 }
 
+fn window_dynamic_fps_input(frame_changed: bool, source_available: bool) -> DynamicWindowFpsInput {
+    DynamicWindowFpsInput {
+        frame_changed,
+        input_active: false,
+        source_available,
+        active_window_capture_count: 1,
+    }
+}
+
+fn update_dynamic_window_fps_decision(
+    policy: &mut Option<DynamicWindowFpsPolicy>,
+    decision: &mut Option<DynamicWindowFpsDecision>,
+    frame_changed: bool,
+    source_available: bool,
+) {
+    if let Some(policy) = policy.as_mut() {
+        *decision = Some(policy.update(window_dynamic_fps_input(frame_changed, source_available)));
+    }
+}
+
 fn new_instance_id() -> String {
     format!("mrd-{}-{}", std::process::id(), now_ms())
 }
@@ -7167,6 +7270,53 @@ mod tests {
 
         assert_eq!(decision.tier, DynamicWindowFpsTier::Active);
         assert_eq!(decision.target_fps, 120);
+    }
+
+    #[test]
+    fn media_frame_interval_uses_dynamic_window_target_when_present() {
+        let profile = MediaProfile {
+            fps: 144,
+            ..MediaProfile::default()
+        };
+        let decision = DynamicWindowFpsDecision {
+            tier: DynamicWindowFpsTier::Idle,
+            target_fps: 12,
+        };
+
+        assert_eq!(
+            media_frame_interval_for_dynamic_decision(&profile, Some(decision)),
+            Duration::from_micros(83_333)
+        );
+    }
+
+    #[test]
+    fn dynamic_window_fps_interval_falls_back_to_profile_target_when_decision_absent() {
+        let profile = MediaProfile {
+            fps: 25,
+            ..MediaProfile::default()
+        };
+
+        assert_eq!(
+            media_frame_interval_for_dynamic_decision(&profile, None),
+            Duration::from_micros(40_000)
+        );
+    }
+
+    #[test]
+    fn dynamic_window_fps_interval_clamps_zero_target_to_one_fps() {
+        let profile = MediaProfile {
+            fps: 144,
+            ..MediaProfile::default()
+        };
+        let decision = DynamicWindowFpsDecision {
+            tier: DynamicWindowFpsTier::Suspended,
+            target_fps: 0,
+        };
+
+        assert_eq!(
+            media_frame_interval_for_dynamic_decision(&profile, Some(decision)),
+            Duration::from_secs(1)
+        );
     }
 
     #[test]
