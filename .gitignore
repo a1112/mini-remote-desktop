@@ -53,6 +53,7 @@ client-qt/venv
 /apps/Rdesk/src-tauri/gen/
 /bin/
 .claude/
+.worktrees/
 
 # Track committed Tauri app icons
 !apps/Rdesk/src-tauri/icons/
