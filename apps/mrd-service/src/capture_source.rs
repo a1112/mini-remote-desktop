@@ -683,12 +683,15 @@ fn parse_windows_hwnd_value(source_id: &str, value: &str) -> Result<isize> {
         .strip_prefix("0x")
         .or_else(|| value.strip_prefix("0X"))
         .unwrap_or(value);
-    usize::from_str_radix(value, 16)
+    let hwnd = usize::from_str_radix(value, 16)
         .or_else(|_| value.parse::<usize>())
-        .map(|value| value as isize)
         .map_err(|error| {
             anyhow::anyhow!("invalid Windows capture source id '{source_id}': {error}")
-        })
+        })?;
+    if hwnd == 0 {
+        anyhow::bail!("invalid Windows window capture source id '{source_id}': HWND is zero");
+    }
+    Ok(hwnd as isize)
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -943,6 +946,45 @@ mod tests {
             super::parse_windows_capture_source_ref("windows:window:0x1234").unwrap(),
             super::WindowsCaptureSourceRef::Window(0x1234)
         );
+    }
+
+    #[cfg(all(windows, test))]
+    #[test]
+    fn parse_windows_capture_source_ref_accepts_window_hwnd_hex() {
+        assert_eq!(
+            super::parse_windows_capture_source_ref("windows:window:0x1234").unwrap(),
+            super::WindowsCaptureSourceRef::Window(0x1234)
+        );
+    }
+
+    #[cfg(all(windows, test))]
+    #[test]
+    fn parse_windows_capture_source_ref_rejects_empty_window_hwnd() {
+        let error = super::parse_windows_capture_source_ref("windows:window:")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("window"));
+    }
+
+    #[cfg(all(windows, test))]
+    #[test]
+    fn parse_windows_capture_source_ref_rejects_zero_window_hwnd() {
+        let error = super::parse_windows_capture_source_ref("windows:window:0x0")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("window"));
+    }
+
+    #[cfg(all(windows, test))]
+    #[test]
+    fn parse_windows_capture_source_ref_rejects_malformed_window_hwnd() {
+        let error = super::parse_windows_capture_source_ref("windows:window:not-a-hwnd")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("window"));
     }
 
     #[cfg(windows)]
