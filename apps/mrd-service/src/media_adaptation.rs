@@ -909,26 +909,48 @@ fn effective_ladder_with_render_fps_cap(
     current_profile: &MediaProfile,
     render_fps_cap: Option<u32>,
 ) -> Vec<MediaProfile> {
-    if !config.ladder.is_empty() {
-        return sanitize_ladder(
+    let ladder = if !config.ladder.is_empty() {
+        sanitize_ladder(
             config
                 .ladder
                 .iter()
                 .map(|profile| cap_profile_to_render_fps(profile, render_fps_cap))
                 .collect(),
-        );
-    }
+        )
+    } else {
+        let ceiling = config
+            .ceiling_profile
+            .clone()
+            .unwrap_or_else(|| current_profile.clone());
+        let ceiling = cap_profile_to_render_fps(&ceiling, render_fps_cap);
+        let floor = config
+            .floor_profile
+            .clone()
+            .unwrap_or_else(default_floor_profile);
+        default_ladder_for_source(source, &ceiling, &floor)
+    };
 
-    let ceiling = config
-        .ceiling_profile
-        .clone()
-        .unwrap_or_else(|| current_profile.clone());
-    let ceiling = cap_profile_to_render_fps(&ceiling, render_fps_cap);
-    let floor = config
-        .floor_profile
-        .clone()
-        .unwrap_or_else(default_floor_profile);
-    default_ladder_for_source(source, &ceiling, &floor)
+    if config.dynamic_resolution_enabled {
+        ladder
+    } else {
+        freeze_ladder_resolution(ladder, current_profile)
+    }
+}
+
+fn freeze_ladder_resolution(
+    ladder: Vec<MediaProfile>,
+    current_profile: &MediaProfile,
+) -> Vec<MediaProfile> {
+    sanitize_ladder(
+        ladder
+            .into_iter()
+            .map(|profile| MediaProfile {
+                width: current_profile.width,
+                height: current_profile.height,
+                ..profile
+            })
+            .collect(),
+    )
 }
 
 fn cap_profile_to_render_fps(profile: &MediaProfile, render_fps_cap: Option<u32>) -> MediaProfile {
@@ -1187,6 +1209,7 @@ mod tests {
                 ..MediaProfile::default()
             }),
             ladder: Vec::new(),
+            dynamic_resolution_enabled: false,
             downshift_cooldown_ms: 2_000,
             upshift_hold_ms: 5_000,
         }
@@ -1225,6 +1248,65 @@ mod tests {
         assert_eq!(ladder[1].bitrate_mbps, 64);
         assert_eq!(ladder.last().unwrap().width, 1280);
         assert_eq!(ladder.last().unwrap().height, 720);
+    }
+
+    #[test]
+    fn effective_ladder_keeps_resolution_fixed_when_dynamic_resolution_is_disabled() {
+        let config = config();
+        let current_profile = config.ceiling_profile.clone().unwrap();
+        let ladder = effective_ladder_with_render_fps_cap(
+            &config,
+            Some(&source(2560, 1440)),
+            &current_profile,
+            Some(144),
+        );
+
+        assert!(ladder.len() > 1);
+        assert!(ladder.iter().any(|profile| {
+            profile.fps < current_profile.fps
+                || profile.bitrate_mbps < current_profile.bitrate_mbps
+        }));
+        assert!(ladder.iter().all(|profile| {
+            profile.width == current_profile.width && profile.height == current_profile.height
+        }));
+    }
+
+    #[test]
+    fn effective_ladder_allows_lower_resolution_when_dynamic_resolution_is_enabled() {
+        let mut config = config();
+        config.dynamic_resolution_enabled = true;
+        let current_profile = MediaProfile {
+            width: 2560,
+            height: 1600,
+            fps: 144,
+            bitrate_mbps: 80,
+            codec: "h264".to_string(),
+            ..MediaProfile::default()
+        };
+        config.ceiling_profile = Some(current_profile.clone());
+        config.floor_profile = Some(MediaProfile {
+            width: 1280,
+            height: 800,
+            fps: 60,
+            bitrate_mbps: 10,
+            codec: "h264".to_string(),
+            ..MediaProfile::default()
+        });
+
+        let ladder = effective_ladder_with_render_fps_cap(
+            &config,
+            Some(&source(2560, 1600)),
+            &current_profile,
+            Some(144),
+        );
+
+        assert!(ladder
+            .iter()
+            .any(|profile| profile.width < 2560 || profile.height < 1600));
+        assert_eq!(
+            (ladder.last().unwrap().width, ladder.last().unwrap().height),
+            (1280, 800)
+        );
     }
 
     #[test]
