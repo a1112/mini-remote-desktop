@@ -5563,8 +5563,6 @@ enum LanFrameCapture {
     #[cfg(windows)]
     DxgiShared(mrd_capture_dxgi::DxgiSharedTextureCapture),
     #[cfg(windows)]
-    DxgiDesktop(mrd_capture_dxgi::DxgiDesktopCapture),
-    #[cfg(windows)]
     Winrt(mrd_capture_winrt::WinrtCapture),
     #[cfg(target_os = "macos")]
     Macos(mrd_capture_macos::MacosScreenCapture),
@@ -5582,11 +5580,6 @@ impl LanFrameCapture {
         match self {
             #[cfg(windows)]
             LanFrameCapture::DxgiShared(capture) => {
-                mrd_pipeline_core::FrameCapture::capture_frame(capture)
-                    .map_err(|error| anyhow::anyhow!(error.to_string()))
-            }
-            #[cfg(windows)]
-            LanFrameCapture::DxgiDesktop(capture) => {
                 mrd_pipeline_core::FrameCapture::capture_frame(capture)
                     .map_err(|error| anyhow::anyhow!(error.to_string()))
             }
@@ -5905,7 +5898,7 @@ fn create_windows_lan_frame_capture(
     profile: &MediaProfile,
 ) -> Result<LanFrameCapture> {
     match windows_lan_capture_backend(source_id) {
-        "dxgi_shared" => {
+        WindowsLanCaptureBackend::DxgiShared => {
             let device_name = crate::display_mode::display_device_name_for_source_id(source_id)
                 .with_context(|| format!("failed to resolve Windows display for {source_id}"))?;
             let mut capture =
@@ -5919,23 +5912,29 @@ fn create_windows_lan_frame_capture(
             capture.set_target_dimensions(profile.width as usize, profile.height as usize);
             Ok(LanFrameCapture::DxgiShared(capture))
         }
-        "dxgi" => Ok(LanFrameCapture::DxgiDesktop(
-            mrd_capture_dxgi::DxgiDesktopCapture::new_primary()
-                .map_err(|error| anyhow::anyhow!(error.to_string()))?,
-        )),
-        _ => Ok(LanFrameCapture::Winrt(
-            crate::capture_source::create_frame_capture(source_id)?,
-        )),
+        WindowsLanCaptureBackend::WinrtWindowShared | WindowsLanCaptureBackend::Winrt => Ok(
+            LanFrameCapture::Winrt(crate::capture_source::create_frame_capture(source_id)?),
+        ),
     }
 }
 
 #[cfg(windows)]
-fn windows_lan_capture_backend(source_id: &str) -> &'static str {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsLanCaptureBackend {
+    DxgiShared,
+    WinrtWindowShared,
+    Winrt,
+}
+
+#[cfg(windows)]
+fn windows_lan_capture_backend(source_id: &str) -> WindowsLanCaptureBackend {
     let normalized = source_id.trim().to_ascii_lowercase();
     if normalized.starts_with("windows:display-shared:") {
-        "dxgi_shared"
+        WindowsLanCaptureBackend::DxgiShared
+    } else if normalized.starts_with("windows:window:") {
+        WindowsLanCaptureBackend::WinrtWindowShared
     } else {
-        "winrt"
+        WindowsLanCaptureBackend::Winrt
     }
 }
 
@@ -8810,12 +8809,29 @@ mod tests {
     fn windows_lan_sender_uses_monitor_specific_backends_for_display_sources() {
         assert_eq!(
             windows_lan_capture_backend("windows:display-shared:0"),
-            "dxgi_shared"
+            WindowsLanCaptureBackend::DxgiShared
         );
-        assert_eq!(windows_lan_capture_backend("windows:display:0"), "winrt");
+        assert_eq!(
+            windows_lan_capture_backend("windows:display:0"),
+            WindowsLanCaptureBackend::Winrt
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_lan_capture_backend_selects_winrt_window_shared_for_window_sources() {
         assert_eq!(
             windows_lan_capture_backend("windows:window:0x1234"),
-            "winrt"
+            WindowsLanCaptureBackend::WinrtWindowShared
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_lan_capture_backend_keeps_dxgi_shared_for_display_shared_sources() {
+        assert_eq!(
+            windows_lan_capture_backend("windows:display-shared:1"),
+            WindowsLanCaptureBackend::DxgiShared
         );
     }
 
