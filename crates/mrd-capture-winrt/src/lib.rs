@@ -753,12 +753,13 @@ impl WinrtCapture {
             )
             .map_err(|e| PipelineError::message(format!("recreate frame pool failed: {e:?}")))?;
 
-        let was_native_size = self.width == self.source_width && self.height == self.source_height;
+        let was_native_size = self.width == native_even_target_dimension(self.source_width)
+            && self.height == native_even_target_dimension(self.source_height);
         self.source_width = width;
         self.source_height = height;
         if was_native_size {
-            self.width = width;
-            self.height = height;
+            self.width = native_even_target_dimension(width);
+            self.height = native_even_target_dimension(height);
         } else {
             self.set_target_dimensions(self.width, self.height);
         }
@@ -1164,6 +1165,10 @@ fn clamp_even_target_dimension(requested: usize, source: usize) -> usize {
     (requested.clamp(2, source.max(2)) & !1).max(2)
 }
 
+fn native_even_target_dimension(source: usize) -> usize {
+    clamp_even_target_dimension(source, source)
+}
+
 fn dxgi_device_name_from_raw(raw: &[u16]) -> Option<String> {
     let end = raw.iter().position(|unit| *unit == 0).unwrap_or(raw.len());
     if end == 0 {
@@ -1237,6 +1242,13 @@ mod tests {
         assert_eq!(clamp_even_target_dimension(1080, 777), 776);
         assert_eq!(clamp_even_target_dimension(1, 1), 2);
         assert_eq!(clamp_even_target_dimension(800, 1000), 800);
+    }
+
+    #[test]
+    fn native_even_target_dimension_reconciles_resized_sources() {
+        assert_eq!(native_even_target_dimension(1001), 1000);
+        assert_eq!(native_even_target_dimension(777), 776);
+        assert_eq!(native_even_target_dimension(1), 2);
     }
 
     #[test]
