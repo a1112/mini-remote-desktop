@@ -200,6 +200,7 @@ impl WinrtCapture {
     /// Switch the capture output to a D3D11 shared BGRA texture.
     pub fn with_shared_texture_output(mut self) -> Self {
         self.output_memory_kind = FrameMemoryKind::D3D11SharedBgra;
+        self.refresh_output_dimensions_for_source();
         self.shared_texture = None;
         self
     }
@@ -390,9 +391,7 @@ impl WinrtCapture {
     /// Set target output dimensions for D3D11 shared-texture output.
     pub fn set_target_dimensions(&mut self, width: usize, height: usize) {
         self.target_dimensions = WinrtTargetDimensions::Fixed { width, height };
-        (self.width, self.height) = self
-            .target_dimensions
-            .resolve(self.source_width, self.source_height);
+        self.refresh_output_dimensions_for_source();
         self.shared_texture = None;
     }
 
@@ -687,8 +686,11 @@ impl WinrtCapture {
             PipelineError::message(format!("cast source texture to resource failed: {e:?}"))
         })?;
 
-        let width = self.width.clamp(2, source_width);
-        let height = self.height.clamp(2, source_height);
+        let (width, height) = shared_target_dimensions_for_source(
+            self.target_dimensions,
+            source_width,
+            source_height,
+        );
         self.ensure_shared_texture(width, height)?;
         let shared = self
             .shared_texture
@@ -788,9 +790,18 @@ impl WinrtCapture {
 
         self.source_width = width;
         self.source_height = height;
-        (self.width, self.height) = self.target_dimensions.resolve(width, height);
+        self.refresh_output_dimensions_for_source();
         self.shared_texture = None;
         Ok(())
+    }
+
+    fn refresh_output_dimensions_for_source(&mut self) {
+        (self.width, self.height) = output_dimensions_for_source(
+            self.output_memory_kind,
+            self.target_dimensions,
+            self.source_width,
+            self.source_height,
+        );
     }
 
     /// Check if capture is available
@@ -1195,6 +1206,27 @@ fn native_even_target_dimension(source: usize) -> usize {
     clamp_even_target_dimension(source, source)
 }
 
+fn shared_target_dimensions_for_source(
+    target_dimensions: WinrtTargetDimensions,
+    source_width: usize,
+    source_height: usize,
+) -> (usize, usize) {
+    target_dimensions.resolve(source_width, source_height)
+}
+
+fn output_dimensions_for_source(
+    output_memory_kind: FrameMemoryKind,
+    target_dimensions: WinrtTargetDimensions,
+    source_width: usize,
+    source_height: usize,
+) -> (usize, usize) {
+    if output_memory_kind == FrameMemoryKind::D3D11SharedBgra {
+        shared_target_dimensions_for_source(target_dimensions, source_width, source_height)
+    } else {
+        (source_width, source_height)
+    }
+}
+
 fn source_supports_shared_even_target(source: usize) -> bool {
     source >= 2
 }
@@ -1299,6 +1331,59 @@ mod tests {
 
         assert_eq!(target_dimensions.resolve(1001, 777), (1000, 776));
         assert_eq!(target_dimensions.resolve(1200, 900), (1200, 900));
+    }
+
+    #[test]
+    fn native_shared_target_dimension_uses_even_size_for_default_first_frame() {
+        assert_eq!(
+            output_dimensions_for_source(
+                FrameMemoryKind::D3D11SharedBgra,
+                WinrtTargetDimensions::Native,
+                1001,
+                777,
+            ),
+            (1000, 776)
+        );
+    }
+
+    #[test]
+    fn cpu_native_target_dimension_keeps_raw_source_size() {
+        assert_eq!(
+            output_dimensions_for_source(
+                FrameMemoryKind::Cpu,
+                WinrtTargetDimensions::Native,
+                1001,
+                777,
+            ),
+            (1001, 777)
+        );
+    }
+
+    #[test]
+    fn fixed_shared_target_dimension_survives_resize_and_clamps_when_source_shrinks() {
+        let target_dimensions = WinrtTargetDimensions::Fixed {
+            width: 1000,
+            height: 776,
+        };
+
+        assert_eq!(
+            output_dimensions_for_source(
+                FrameMemoryKind::D3D11SharedBgra,
+                target_dimensions,
+                1200,
+                900,
+            ),
+            (1000, 776)
+        );
+        assert_eq!(
+            output_dimensions_for_source(
+                FrameMemoryKind::D3D11SharedBgra,
+                target_dimensions,
+                640,
+                480,
+            ),
+            (640, 480)
+        );
     }
 
     #[test]
