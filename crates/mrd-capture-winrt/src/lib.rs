@@ -366,8 +366,8 @@ impl WinrtCapture {
 
     /// Set target output dimensions for D3D11 shared-texture output.
     pub fn set_target_dimensions(&mut self, width: usize, height: usize) {
-        self.width = width.clamp(2, self.source_width.max(2));
-        self.height = height.clamp(2, self.source_height.max(2));
+        self.width = clamp_even_target_dimension(width, self.source_width);
+        self.height = clamp_even_target_dimension(height, self.source_height);
         self.shared_texture = None;
     }
 
@@ -1160,6 +1160,10 @@ unsafe fn read_class_name(hwnd: HWND) -> String {
     String::from_utf16_lossy(&buffer[..copied.max(0) as usize])
 }
 
+fn clamp_even_target_dimension(requested: usize, source: usize) -> usize {
+    (requested.clamp(2, source.max(2)) & !1).max(2)
+}
+
 fn dxgi_device_name_from_raw(raw: &[u16]) -> Option<String> {
     let end = raw.iter().position(|unit| *unit == 0).unwrap_or(raw.len());
     if end == 0 {
@@ -1225,6 +1229,14 @@ mod tests {
         );
         assert!(dxgi_device_name_matches(&raw, " \\\\.\\display2 "));
         assert!(!dxgi_device_name_matches(&raw, "\\\\.\\DISPLAY1"));
+    }
+
+    #[test]
+    fn clamp_even_target_dimension_keeps_shared_targets_even_after_source_clamp() {
+        assert_eq!(clamp_even_target_dimension(1920, 1001), 1000);
+        assert_eq!(clamp_even_target_dimension(1080, 777), 776);
+        assert_eq!(clamp_even_target_dimension(1, 1), 2);
+        assert_eq!(clamp_even_target_dimension(800, 1000), 800);
     }
 
     #[test]
