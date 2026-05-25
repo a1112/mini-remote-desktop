@@ -6078,7 +6078,8 @@ fn create_windows_lan_frame_capture(
     source_id: &str,
     profile: &MediaProfile,
 ) -> Result<LanFrameCapture> {
-    match windows_lan_capture_backend(source_id, windows_lan_nvenc_h264_available()) {
+    let nvenc_h264_available = windows_lan_nvenc_h264_available();
+    match windows_lan_capture_backend(source_id, nvenc_h264_available) {
         WindowsLanCaptureBackend::DxgiShared => {
             let device_name = crate::display_mode::display_device_name_for_source_id(source_id)
                 .with_context(|| format!("failed to resolve Windows display for {source_id}"))?;
@@ -6090,6 +6091,16 @@ fn create_windows_lan_frame_capture(
                             "failed to create DXGI shared capture for {source_id} ({device_name})"
                         )
                     })?;
+            if windows_lan_capture_backend_for_profile(
+                source_id,
+                capture.width(),
+                capture.height(),
+                profile,
+                nvenc_h264_available,
+            ) != WindowsLanCaptureBackend::DxgiShared
+            {
+                return create_windows_lan_winrt_capture(source_id);
+            }
             capture.set_target_dimensions(profile.width as usize, profile.height as usize);
             Ok(LanFrameCapture::DxgiShared(capture))
         }
@@ -6101,6 +6112,16 @@ fn create_windows_lan_frame_capture(
                     .with_context(|| {
                         format!("failed to create WinRT shared window capture for {source_id}")
                     })?;
+            if windows_lan_capture_backend_for_profile(
+                source_id,
+                capture.width(),
+                capture.height(),
+                profile,
+                nvenc_h264_available,
+            ) != WindowsLanCaptureBackend::WinrtWindowShared
+            {
+                return create_windows_lan_winrt_capture(source_id);
+            }
             let (target_width, target_height) =
                 window_h264_capture_dimensions(profile.width as usize, profile.height as usize);
             capture.set_target_dimensions(target_width, target_height);
@@ -6114,10 +6135,15 @@ fn create_windows_lan_frame_capture(
                 })?;
             Ok(LanFrameCapture::Winrt(capture))
         }
-        WindowsLanCaptureBackend::Winrt => Ok(LanFrameCapture::Winrt(
-            crate::capture_source::create_frame_capture(source_id)?,
-        )),
+        WindowsLanCaptureBackend::Winrt => create_windows_lan_winrt_capture(source_id),
     }
+}
+
+#[cfg(windows)]
+fn create_windows_lan_winrt_capture(source_id: &str) -> Result<LanFrameCapture> {
+    Ok(LanFrameCapture::Winrt(
+        crate::capture_source::create_frame_capture(source_id)?,
+    ))
 }
 
 #[cfg(windows)]
@@ -6143,6 +6169,38 @@ fn windows_lan_capture_backend(
     } else {
         WindowsLanCaptureBackend::Winrt
     }
+}
+
+#[cfg(windows)]
+fn windows_lan_capture_backend_for_profile(
+    source_id: &str,
+    source_width: usize,
+    source_height: usize,
+    profile: &MediaProfile,
+    nvenc_h264_available: bool,
+) -> WindowsLanCaptureBackend {
+    let backend = windows_lan_capture_backend(source_id, nvenc_h264_available);
+    if matches!(
+        backend,
+        WindowsLanCaptureBackend::DxgiShared | WindowsLanCaptureBackend::WinrtWindowShared
+    ) && windows_lan_profile_requires_scaling_path(source_width, source_height, profile)
+    {
+        WindowsLanCaptureBackend::Winrt
+    } else {
+        backend
+    }
+}
+
+#[cfg(windows)]
+fn windows_lan_profile_requires_scaling_path(
+    source_width: usize,
+    source_height: usize,
+    profile: &MediaProfile,
+) -> bool {
+    let (target_width, target_height) = h264_target_dimensions(source_width, source_height, profile);
+    let native_width = even_dimension(source_width).max(2);
+    let native_height = even_dimension(source_height).max(2);
+    target_width < native_width || target_height < native_height
 }
 
 #[cfg(windows)]
@@ -9976,6 +10034,78 @@ mod tests {
             windows_lan_capture_backend("windows:display-shared:1", false),
             WindowsLanCaptureBackend::DxgiShared
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_lan_capture_backend_for_profile_keeps_shared_for_full_size_display() {
+        assert_eq!(
+            windows_lan_capture_backend_for_profile(
+                "windows:display-shared:1",
+                2560,
+                1440,
+                &test_media_profile(2560, 1440),
+                false
+            ),
+            WindowsLanCaptureBackend::DxgiShared
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_lan_capture_backend_for_profile_uses_scaling_path_for_reduced_display() {
+        assert_eq!(
+            windows_lan_capture_backend_for_profile(
+                "windows:display-shared:1",
+                2560,
+                1440,
+                &test_media_profile(1920, 1080),
+                false
+            ),
+            WindowsLanCaptureBackend::Winrt
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_lan_capture_backend_for_profile_keeps_shared_for_full_size_window() {
+        assert_eq!(
+            windows_lan_capture_backend_for_profile(
+                "windows:window:0x1234",
+                1280,
+                720,
+                &test_media_profile(1280, 720),
+                true
+            ),
+            WindowsLanCaptureBackend::WinrtWindowShared
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_lan_capture_backend_for_profile_uses_scaling_path_for_reduced_window() {
+        assert_eq!(
+            windows_lan_capture_backend_for_profile(
+                "windows:window:0x1234",
+                1280,
+                720,
+                &test_media_profile(960, 540),
+                true
+            ),
+            WindowsLanCaptureBackend::Winrt
+        );
+    }
+
+    #[cfg(windows)]
+    fn test_media_profile(width: u32, height: u32) -> MediaProfile {
+        MediaProfile {
+            width,
+            height,
+            fps: 144,
+            bitrate_mbps: 80,
+            codec: "h264".to_string(),
+            ..MediaProfile::default()
+        }
     }
 
     #[cfg(windows)]
