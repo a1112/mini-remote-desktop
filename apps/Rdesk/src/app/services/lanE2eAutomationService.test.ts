@@ -550,6 +550,7 @@ describe("runLanE2EAutomation", () => {
       expect.objectContaining({
         enabled: true,
         mode: "keyframe_ladder",
+        dynamic_resolution_enabled: false,
         ceiling_profile: expect.objectContaining({
           width: 2560,
           height: 1600,
@@ -643,6 +644,47 @@ describe("runLanE2EAutomation", () => {
           pixel_format: "nv12",
           hdr_enabled: false,
         }),
+      })
+    );
+  });
+
+  it("honors explicit dynamic resolution adaptive config overrides", async () => {
+    const ipcConfigureMediaAdaptation = vi.fn().mockResolvedValue(
+      ok({
+        enabled: true,
+        state: "configured",
+        ladder_index: 0,
+        current_profile: DEFAULT_REQUESTED_PROFILE,
+        target_profile: DEFAULT_REQUESTED_PROFILE,
+        last_reason: "configured",
+        last_change_ms: 1_700_000_000_000,
+        observed_fps: 0,
+        drop_ratio: 0,
+        queue_depth: 0,
+      })
+    );
+    const commands = createCommands({ ipcConfigureMediaAdaptation });
+
+    await runLanE2EAutomation(commands, {
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      adaptive: true,
+      adaptiveConfig: {
+        enabled: true,
+        dynamic_resolution_enabled: true,
+      },
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => "lan-e2e-test-session",
+    });
+
+    expect(ipcConfigureMediaAdaptation).toHaveBeenCalledWith(
+      "lan-e2e-test-session",
+      expect.objectContaining({
+        enabled: true,
+        dynamic_resolution_enabled: true,
       })
     );
   });

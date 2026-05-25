@@ -940,6 +940,7 @@ function buildAdaptiveMediaConfig(
       bitrate_mbps: 10,
     },
     ladder: [],
+    dynamic_resolution_enabled: false,
     downshift_cooldown_ms: 2_000,
     upshift_hold_ms: 5_000,
     ...overrides,

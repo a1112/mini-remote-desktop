@@ -437,6 +437,7 @@ describe('Tauri Adapter Contract', () => {
           codec: 'h264',
         },
         ladder: [],
+        dynamic_resolution_enabled: true,
         downshift_cooldown_ms: 2000,
         upshift_hold_ms: 5000,
       };
