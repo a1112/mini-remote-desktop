@@ -247,6 +247,33 @@ describe("E2ETestPage LAN automation", () => {
     expect(screen.getAllByText(/全屏 shared \/ DISPLAY1 \/ 2560x1440/).length).toBeGreaterThan(0);
   });
 
+  it("configures LAN E2E adaptive media with dynamic resolution from the UI", async () => {
+    const mockInvoke = installSuccessfulLanAutomationMock();
+
+    render(
+      <MemoryRouter>
+        <E2ETestPage />
+      </MemoryRouter>
+    );
+
+    fireEvent.click(await screen.findByLabelText("启用自适应媒体"));
+    fireEvent.click(await screen.findByLabelText("启用动态分辨率"));
+    fireEvent.click(await screen.findByRole("button", { name: /开始跨设备 E2E/ }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "ipc_configure_media_adaptation",
+        expect.objectContaining({
+          sessionId: expect.stringMatching(/^lan-e2e-agent-device-/),
+          config: expect.objectContaining({
+            enabled: true,
+            dynamic_resolution_enabled: true,
+          }),
+        })
+      );
+    });
+  });
+
   it("runs the cross-device discovery scenario without starting a LAN session", async () => {
     const mockInvoke = installSuccessfulLanAutomationMock();
 
@@ -538,6 +565,20 @@ function installSuccessfulLanAutomationMock() {
         source: selectedSource,
         status: "selected",
         reason: null,
+      });
+    }
+    if (command === "ipc_configure_media_adaptation") {
+      return Promise.resolve({
+        enabled: true,
+        state: "steady",
+        ladder_index: 0,
+        current_profile: activeProfile,
+        target_profile: activeProfile,
+        last_reason: null,
+        last_change_ms: 0,
+        observed_fps: activeProfile.fps,
+        drop_ratio: 0,
+        queue_depth: 0,
       });
     }
     if (command === "ipc_start_receiver") return Promise.resolve("receiver-started");

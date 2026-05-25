@@ -105,6 +105,7 @@ export interface TestConfig {
   zero_copy?: boolean;
   transport_kind?: "loopback" | "quic" | "webrtc";
   adaptive_media?: boolean;
+  dynamic_resolution_enabled?: boolean;
 
   // Parameters
   resolution?: [number, number];

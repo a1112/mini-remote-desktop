@@ -106,6 +106,8 @@ export function E2ETestPage() {
   const [lanReport, setLanReport] = useState<LanE2EAutomationReport | null>(null);
   const [lanScenarioId, setLanScenarioId] =
     useState<CrossDeviceScenarioId>("cross.e2e.remote_display_smoke");
+  const [lanAdaptiveEnabled, setLanAdaptiveEnabled] = useState(false);
+  const [lanDynamicResolutionEnabled, setLanDynamicResolutionEnabled] = useState(false);
   const currentConfig = buildDefaultConfig(capabilities);
 
   useEffect(() => {
@@ -236,7 +238,15 @@ export function E2ETestPage() {
   };
 
   const handleStartLanE2E = async () => {
-    await startLanE2E();
+    await startLanE2E({
+      adaptive: lanAdaptiveEnabled,
+      adaptiveConfig: lanAdaptiveEnabled
+        ? {
+            enabled: true,
+            dynamic_resolution_enabled: lanDynamicResolutionEnabled,
+          }
+        : undefined,
+    });
   };
 
   useEffect(() => {
@@ -348,6 +358,32 @@ export function E2ETestPage() {
               <option value="cross.e2e.media_profile">媒体画像校验</option>
               <option value="cross.fault.recovery">故障恢复预检</option>
             </select>
+            <label className="flex items-center gap-2 rounded-lg border bg-background px-3 py-2 text-sm">
+              <input
+                type="checkbox"
+                aria-label="启用自适应媒体"
+                checked={lanAdaptiveEnabled}
+                disabled={lanRunState === "running"}
+                onChange={(event) => {
+                  const enabled = event.target.checked;
+                  setLanAdaptiveEnabled(enabled);
+                  if (!enabled) {
+                    setLanDynamicResolutionEnabled(false);
+                  }
+                }}
+              />
+              <span>自适应媒体</span>
+            </label>
+            <label className="flex items-center gap-2 rounded-lg border bg-background px-3 py-2 text-sm">
+              <input
+                type="checkbox"
+                aria-label="启用动态分辨率"
+                checked={lanDynamicResolutionEnabled}
+                disabled={lanRunState === "running" || !lanAdaptiveEnabled}
+                onChange={(event) => setLanDynamicResolutionEnabled(event.target.checked)}
+              />
+              <span>动态分辨率</span>
+            </label>
             <button
               type="button"
               onClick={handleStartLanE2E}
@@ -623,6 +659,10 @@ function formatValidationMode(mode: LanE2EAutomationReport["validationMode"]): s
 function buildLanAutomationOptionsFromSearchParams(
   searchParams: URLSearchParams
 ): LanE2EAutomationOptions {
+  const dynamicResolution = parseOptionalBoolean(
+    searchParams.get("dynamicResolution") ?? searchParams.get("dynamic_resolution")
+  );
+  const adaptive = parseOptionalBoolean(searchParams.get("adaptive")) ?? (dynamicResolution ? true : undefined);
   return {
     scenarioId: parseCrossDeviceScenarioId(searchParams.get("scenarioId") ?? searchParams.get("scenario")),
     targetDeviceId: searchParams.get("targetDeviceId") ?? searchParams.get("target") ?? undefined,
@@ -641,7 +681,13 @@ function buildLanAutomationOptionsFromSearchParams(
       searchParams.get("renderDisplaySourceId") ?? searchParams.get("renderSourceId") ?? undefined,
     expectedPeerBuildId: searchParams.get("expectedPeerBuildId") ?? undefined,
     renderProfileCap: parseOptionalBoolean(searchParams.get("renderProfileCap")),
-    adaptive: parseOptionalBoolean(searchParams.get("adaptive")),
+    adaptive,
+    adaptiveConfig: adaptive
+      ? {
+          enabled: true,
+          dynamic_resolution_enabled: dynamicResolution === true,
+        }
+      : undefined,
     requestedProfile: parseRequestedProfile(searchParams),
   };
 }

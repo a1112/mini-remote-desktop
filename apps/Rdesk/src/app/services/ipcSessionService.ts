@@ -69,6 +69,8 @@ export interface RuntimeSnapshot {
 
 export type MediaProfile = tauriAdapter.MediaProfile;
 export type MediaProfileNegotiation = tauriAdapter.MediaProfileNegotiation;
+export type AdaptiveMediaConfig = tauriAdapter.AdaptiveMediaConfig;
+export type MediaAdaptationSnapshot = tauriAdapter.MediaAdaptationSnapshot;
 export type CaptureSource = tauriAdapter.CaptureSource;
 export type CaptureSourceSelection = tauriAdapter.CaptureSourceSelection;
 export type DisplayMode = tauriAdapter.DisplayMode;
@@ -245,6 +247,17 @@ export const updateMediaProfile = async (
   requestedProfile: MediaProfile
 ): Promise<MediaProfileNegotiation> => {
   const result = await tauriAdapter.ipcUpdateMediaProfile(sessionId, requestedProfile);
+  return unwrapAdapterResult(result);
+};
+
+/**
+ * Configure runtime media adaptation for an active LAN session.
+ */
+export const configureMediaAdaptation = async (
+  sessionId: string,
+  config: AdaptiveMediaConfig
+): Promise<MediaAdaptationSnapshot> => {
+  const result = await tauriAdapter.ipcConfigureMediaAdaptation(sessionId, config);
   return unwrapAdapterResult(result);
 };
 

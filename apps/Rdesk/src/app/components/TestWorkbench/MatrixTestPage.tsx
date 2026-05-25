@@ -193,6 +193,14 @@ const MATRIX_DIMENSIONS: MatrixDimension[] = [
     ],
   },
   {
+    id: "dynamic_resolution",
+    name: "动态分辨率",
+    options: [
+      { id: "off", name: "关闭", enabled: true },
+      { id: "on", name: "降采样", enabled: false },
+    ],
+  },
+  {
     id: "duration",
     name: "时长",
     options: [
@@ -436,6 +444,9 @@ function buildConfig(options: SelectedMatrixOption[]): TestConfig {
         break;
       case "adaptive":
         config.adaptive_media = option.id === "on";
+        break;
+      case "dynamic_resolution":
+        config.dynamic_resolution_enabled = option.id === "on";
         break;
       case "duration":
         config.duration_ms = Number(option.id);
@@ -821,6 +832,7 @@ function matrixConfigKey(config: TestConfig): string {
     render_display: config.render_display,
     zero_copy: config.zero_copy,
     adaptive_media: config.adaptive_media,
+    dynamic_resolution_enabled: config.dynamic_resolution_enabled,
     resolution: config.resolution,
     fps: config.fps,
     bitrate: config.bitrate,
@@ -834,6 +846,7 @@ function crossDeviceMatrixKey(config: TestConfig): string {
   return JSON.stringify({
     transport_kind: transportKind ?? config.transport_kind ?? "loopback",
     adaptive_media: config.adaptive_media,
+    dynamic_resolution_enabled: config.dynamic_resolution_enabled,
     resolution: config.resolution,
     fps: config.fps,
     bitrate: config.bitrate,
@@ -1683,6 +1696,13 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
           transportKind,
           requestedProfile: profile,
           adaptive: test.config.adaptive_media === true,
+          adaptiveConfig:
+            test.config.adaptive_media === true
+              ? {
+                  enabled: true,
+                  dynamic_resolution_enabled: test.config.dynamic_resolution_enabled === true,
+                }
+              : undefined,
           displayModePolicy: "temporary",
           timeoutMs: Math.max(10_000, durationMs + (test.config.warmup_ms ?? 0) + 5000),
           sampleIntervalMs: 500,
@@ -2151,6 +2171,7 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
                         {test.result?.adaptation_target_profile
                           ? ` ${test.result.adaptation_target_profile}`
                           : ""}
+                        {test.config.dynamic_resolution_enabled ? " / 动态分辨率" : ""}
                       </div>
                     ) : (
                       "固定"

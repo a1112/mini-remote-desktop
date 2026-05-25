@@ -2030,6 +2030,118 @@ describe("RemoteDisplayWindowPage", () => {
     });
   });
 
+  it("applies remote dynamic resolution adaptation from the settings panel", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(windowsCapabilities());
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-p2p-quic-123-1",
+          session_id: "p2p-quic-123",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: false,
+          render_mode: "d3d11_native",
+          native_surface_attached: false,
+          session_window_count: 1,
+        });
+      }
+      if (command === "configure_remote_display_native_surface") {
+        return Promise.resolve({
+          label: "render-p2p-quic-123-1",
+          backend: "d3d11",
+          attached: true,
+          visible: true,
+          parent_hwnd: "0xA",
+          hwnd: "0x14",
+          rect: { x: 0, y: 0, width: 1280, height: 720 },
+        });
+      }
+      if (command === "ipc_update_media_profile") {
+        const selected = {
+          width: 1920,
+          height: 1080,
+          fps: 144,
+          bitrate_mbps: 20,
+          codec: "hevc",
+          codec_profile: "main",
+          bit_depth: 8,
+          chroma_subsampling: "4:2:0",
+          pixel_format: "nv12",
+          hdr_enabled: false,
+        };
+        return Promise.resolve({
+          requested: selected,
+          selected,
+          status: "accepted",
+          reason: null,
+        });
+      }
+      if (command === "ipc_configure_media_adaptation") {
+        const currentProfile = {
+          width: 1920,
+          height: 1080,
+          fps: 144,
+          bitrate_mbps: 20,
+          codec: "hevc",
+          codec_profile: "main",
+          bit_depth: 8,
+          chroma_subsampling: "4:2:0",
+          pixel_format: "nv12",
+          hdr_enabled: false,
+        };
+        return Promise.resolve({
+          enabled: true,
+          state: "steady",
+          ladder_index: 0,
+          current_profile: currentProfile,
+          target_profile: currentProfile,
+          last_reason: null,
+          last_change_ms: 0,
+          observed_fps: 144,
+          drop_ratio: 0,
+          queue_depth: 0,
+        });
+      }
+      if (command === "ipc_probe_snapshot") {
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          frames_received: 1,
+          frames_decoded: 1,
+          frames_dropped: 0,
+          current_fps: 144,
+          bitrate_mbps: 20,
+          media_probe_valid: true,
+          media_probe_width: 1920,
+          media_probe_height: 1080,
+          media_probe_target_fps: 144,
+          media_probe_target_bitrate_mbps: 20,
+          last_error: null,
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay();
+
+    fireEvent.click(await screen.findByRole("button", { name: "配置" }));
+    fireEvent.click(await screen.findByLabelText("启用远端自适应媒体"));
+    fireEvent.click(await screen.findByLabelText("启用远端动态分辨率"));
+    fireEvent.click(await screen.findByRole("button", { name: "应用远端" }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("ipc_configure_media_adaptation", {
+        sessionId: "p2p-quic-123",
+        config: expect.objectContaining({
+          enabled: true,
+          dynamic_resolution_enabled: true,
+        }),
+      });
+    });
+  });
+
   it("lists remote window capture sources and selects one", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {

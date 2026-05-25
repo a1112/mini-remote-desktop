@@ -54,10 +54,13 @@ import {
   listLocalCaptureSources,
   listRemoteCaptureSources,
   selectRemoteCaptureSource,
+  configureMediaAdaptation,
   startReceiver,
   updateMediaProfile,
+  type AdaptiveMediaConfig,
   type CaptureSource,
   type CaptureSourceSelection,
+  type MediaAdaptationSnapshot,
   type MediaProfileNegotiation,
   type ProbeSnapshot,
   type SessionRuntimeSnapshot,
@@ -1953,6 +1956,11 @@ export function RemoteDisplayWindowPage() {
     useState<MediaPipelineSnapshot | null>(null);
   const [mediaProfileNegotiation, setMediaProfileNegotiation] =
     useState<MediaProfileNegotiation | null>(null);
+  const [remoteAdaptiveMediaEnabled, setRemoteAdaptiveMediaEnabled] = useState(false);
+  const [remoteDynamicResolutionEnabled, setRemoteDynamicResolutionEnabled] =
+    useState(false);
+  const [mediaAdaptationSnapshot, setMediaAdaptationSnapshot] =
+    useState<MediaAdaptationSnapshot | null>(null);
   const [captureSources, setCaptureSources] = useState<CaptureSource[]>([]);
   const [captureSourcesLoading, setCaptureSourcesLoading] = useState(false);
   const [captureSourceSelection, setCaptureSourceSelection] =
@@ -1971,6 +1979,8 @@ export function RemoteDisplayWindowPage() {
   const sessionId = id ?? context?.session_id ?? "local-preview";
   const activeSurfaceId = context?.surface_id ?? surfaceId;
   const isLocalPipelinePreview = isLocalPipelinePreviewSession(sessionId);
+  const activeMediaAdaptationSnapshot =
+    mediaAdaptationSnapshot ?? mediaPipelineSnapshot?.adaptation ?? null;
   const selectedLocalPreviewSourceId = isLocalPipelinePreview
     ? captureSourceSelection?.source.id
     : undefined;
@@ -2897,6 +2907,31 @@ export function RemoteDisplayWindowPage() {
       hdr_enabled: false,
     };
   }, [bitrate, encoder, fps, resolution]);
+  const buildRemoteAdaptiveMediaConfig = useCallback(
+    (enabled: boolean): AdaptiveMediaConfig => {
+      const ceilingProfile = buildRemoteMediaProfile();
+      const aspectRatio = ceilingProfile.width / ceilingProfile.height;
+      const floorWidth = Math.min(ceilingProfile.width, 1280);
+      const floorHeight = Math.max(2, Math.floor(floorWidth / aspectRatio / 2) * 2);
+      return {
+        enabled,
+        mode: "keyframe_ladder",
+        ceiling_profile: ceilingProfile,
+        floor_profile: {
+          ...ceilingProfile,
+          width: floorWidth,
+          height: floorHeight,
+          fps: Math.min(60, ceilingProfile.fps),
+          bitrate_mbps: Math.max(1, Math.min(10, ceilingProfile.bitrate_mbps)),
+        },
+        ladder: [],
+        dynamic_resolution_enabled: enabled && remoteDynamicResolutionEnabled,
+        downshift_cooldown_ms: 2_000,
+        upshift_hold_ms: 5_000,
+      };
+    },
+    [buildRemoteMediaProfile, remoteDynamicResolutionEnabled]
+  );
   const localRenderSwitchLocked = isLocalPipelinePreview && isTestBusy;
 
   useEffect(() => {
@@ -4370,9 +4405,26 @@ export function RemoteDisplayWindowPage() {
     try {
       const negotiation = await updateMediaProfile(sessionId, buildRemoteMediaProfile());
       setMediaProfileNegotiation(negotiation);
+      const adaptationEnabled =
+        remoteAdaptiveMediaEnabled || activeMediaAdaptationSnapshot?.enabled === true;
+      const adaptation = adaptationEnabled
+        ? await configureMediaAdaptation(
+            sessionId,
+            buildRemoteAdaptiveMediaConfig(remoteAdaptiveMediaEnabled)
+          )
+        : null;
+      if (adaptation) {
+        setMediaAdaptationSnapshot(adaptation);
+      }
       const selected = negotiation.selected;
       setTestMessage(
-        `远端已切换 ${selected.width}x${selected.height}@${selected.fps} / ${selected.bitrate_mbps} Mbps (${negotiation.status})`
+        `远端已切换 ${selected.width}x${selected.height}@${selected.fps} / ${selected.bitrate_mbps} Mbps (${negotiation.status}${
+          adaptation?.enabled
+            ? remoteDynamicResolutionEnabled
+              ? " / 动态分辨率"
+              : " / 自适应"
+            : ""
+        })`
       );
       const probe = await getProbeSnapshot(sessionId);
       setProbeSnapshot(probe);
@@ -4381,7 +4433,16 @@ export function RemoteDisplayWindowPage() {
       setLastError(message);
       setTestMessage(message);
     }
-  }, [buildRemoteMediaProfile, isLocalPipelinePreview, sessionId, transport]);
+  }, [
+    activeMediaAdaptationSnapshot,
+    buildRemoteAdaptiveMediaConfig,
+    buildRemoteMediaProfile,
+    isLocalPipelinePreview,
+    remoteAdaptiveMediaEnabled,
+    remoteDynamicResolutionEnabled,
+    sessionId,
+    transport,
+  ]);
 
   const hydrateCaptureSourcePreviews = useCallback(async (sources: CaptureSource[]) => {
     if (sources.length === 0) return;
@@ -4963,6 +5024,8 @@ export function RemoteDisplayWindowPage() {
       ? metrics
         ? `${metrics.capture_fps.toFixed(1)} FPS / ${metrics.frame_count} frames`
         : "等待开始测试"
+      : activeMediaAdaptationSnapshot?.enabled
+        ? `远端自适应 ${activeMediaAdaptationSnapshot.state} #${activeMediaAdaptationSnapshot.ladder_index}`
       : mediaProfileNegotiation
         ? `远端 ${mediaProfileNegotiation.selected.width}x${mediaProfileNegotiation.selected.height}@${mediaProfileNegotiation.selected.fps} / ${mediaProfileNegotiation.selected.bitrate_mbps} Mbps`
         : "远程参数将通过协商层下发";
@@ -5787,6 +5850,52 @@ export function RemoteDisplayWindowPage() {
                   title={configChangeLockedTitle}
                 />
               </div>
+
+              {!isLocalPipelinePreview && (
+                <div className="rounded-lg border border-white/10 bg-black/18 p-3">
+                  <div className="mb-2 flex items-center justify-between gap-3">
+                    <div className="text-[10px] font-semibold uppercase tracking-normal text-slate-400">
+                      ADAPT
+                    </div>
+                    <div className="text-[11px] text-slate-500">
+                      {activeMediaAdaptationSnapshot?.enabled
+                        ? `${activeMediaAdaptationSnapshot.state} #${activeMediaAdaptationSnapshot.ladder_index}`
+                        : "固定"}
+                    </div>
+                  </div>
+                  <div className="grid gap-2 sm:grid-cols-2">
+                    <label className="flex items-center justify-between gap-3 rounded-md border border-white/10 bg-black/20 px-3 py-2 text-[11px] text-slate-200">
+                      <span>自适应媒体</span>
+                      <input
+                        type="checkbox"
+                        aria-label="启用远端自适应媒体"
+                        checked={remoteAdaptiveMediaEnabled}
+                        onChange={(event) => {
+                          const enabled = event.target.checked;
+                          setRemoteAdaptiveMediaEnabled(enabled);
+                          if (!enabled) {
+                            setRemoteDynamicResolutionEnabled(false);
+                          }
+                        }}
+                      />
+                    </label>
+                    <label
+                      className={`flex items-center justify-between gap-3 rounded-md border border-white/10 bg-black/20 px-3 py-2 text-[11px] ${
+                        remoteAdaptiveMediaEnabled ? "text-slate-200" : "text-slate-500"
+                      }`}
+                    >
+                      <span>动态分辨率</span>
+                      <input
+                        type="checkbox"
+                        aria-label="启用远端动态分辨率"
+                        checked={remoteDynamicResolutionEnabled}
+                        disabled={!remoteAdaptiveMediaEnabled}
+                        onChange={(event) => setRemoteDynamicResolutionEnabled(event.target.checked)}
+                      />
+                    </label>
+                  </div>
+                </div>
+              )}
             </div>
 
             <div className="border-t border-white/10 px-4 py-4">
