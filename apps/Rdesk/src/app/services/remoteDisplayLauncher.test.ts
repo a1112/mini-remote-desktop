@@ -104,7 +104,7 @@ describe("launchRemoteDisplayForDevice", () => {
     });
   });
 
-  it("requests the default 1080p60 QUIC media profile for LAN P2P remote display", async () => {
+  it("requests the default HEVC 1080p60 QUIC media profile for LAN P2P remote display", async () => {
     await launchRemoteDisplayForDevice("remote-device", {
       sessionId: "p2p-quic-session",
       transportKind: "quic",
@@ -120,7 +120,12 @@ describe("launchRemoteDisplayForDevice", () => {
         height: 1080,
         fps: 60,
         bitrate_mbps: 20,
-        codec: "h264",
+        codec: "hevc",
+        codec_profile: "main",
+        bit_depth: 8,
+        chroma_subsampling: "4:2:0",
+        pixel_format: "nv12",
+        hdr_enabled: false,
       }
     );
   });
@@ -194,7 +199,12 @@ describe("launchRemoteDisplayForDevice", () => {
         height: 1080,
         fps: 60,
         bitrate_mbps: 20,
-        codec: "h264",
+        codec: "hevc",
+        codec_profile: "main",
+        bit_depth: 8,
+        chroma_subsampling: "4:2:0",
+        pixel_format: "nv12",
+        hdr_enabled: false,
       }
     );
     expect(mocks.listRemoteCaptureSources).toHaveBeenCalledWith(

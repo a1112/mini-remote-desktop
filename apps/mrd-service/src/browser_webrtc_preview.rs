@@ -13,10 +13,14 @@ use std::{
 use crate::browser_preview_capture::open_browser_preview_dxgi_capture;
 #[cfg(windows)]
 use mrd_encode_nvenc::{NvencH264Encoder, NvencHevcEncoder};
+#[cfg(windows)]
+use mrd_encode_nvenc_av1::NvencAv1Encoder;
 use mrd_pipeline_core::{EncodedAccessUnit, VideoCodec};
 #[cfg(windows)]
 use mrd_pipeline_core::{FrameCapture, VideoEncoder};
-use mrd_transport_webrtc::{H264Profile, H264RtpSender, H264SampleSender, HevcRtpSender};
+use mrd_transport_webrtc::{
+    Av1RtpSender, H264Profile, H264RtpSender, H264SampleSender, HevcRtpSender,
+};
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
@@ -68,6 +72,7 @@ pub enum BrowserWebrtcPreviewCodec {
     H264,
     #[serde(alias = "h265")]
     Hevc,
+    Av1,
 }
 
 impl BrowserWebrtcPreviewStartRequest {
@@ -228,6 +233,7 @@ enum BrowserPreviewMediaSender {
     H264Rtp(H264RtpSender),
     H264Sample(H264SampleSender),
     HevcRtp(HevcRtpSender),
+    Av1Rtp(Av1RtpSender),
 }
 
 impl BrowserPreviewMediaSender {
@@ -268,12 +274,17 @@ impl BrowserPreviewMediaSender {
             BrowserWebrtcPreviewCodec::Hevc => {
                 Self::HevcRtp(HevcRtpSender::new(track_id, stream_id, fps, 1200))
             }
+            BrowserWebrtcPreviewCodec::Av1 => {
+                Self::Av1Rtp(Av1RtpSender::new(track_id, stream_id, fps, 1200))
+            }
         }
     }
 
     fn track_kind(&self) -> BrowserPreviewSenderTrackKind {
         match self {
-            Self::H264Rtp(_) | Self::HevcRtp(_) => BrowserPreviewSenderTrackKind::Rtp,
+            Self::H264Rtp(_) | Self::HevcRtp(_) | Self::Av1Rtp(_) => {
+                BrowserPreviewSenderTrackKind::Rtp
+            }
             Self::H264Sample(_) => BrowserPreviewSenderTrackKind::Sample,
         }
     }
@@ -283,6 +294,7 @@ impl BrowserPreviewMediaSender {
             Self::H264Rtp(sender) => sender.track(),
             Self::H264Sample(sender) => sender.track(),
             Self::HevcRtp(sender) => sender.track(),
+            Self::Av1Rtp(sender) => sender.track(),
         }
     }
 
@@ -312,6 +324,10 @@ impl BrowserPreviewMediaSender {
                     rtp_timestamp: Some(report.rtp_timestamp),
                 })
             }
+            Self::Av1Rtp(sender) => Ok(BrowserPreviewMediaSendReport {
+                bytes_written: sender.send_access_unit(access_unit).await?,
+                rtp_timestamp: None,
+            }),
         }
     }
 }
@@ -320,6 +336,7 @@ impl BrowserPreviewMediaSender {
 enum BrowserPreviewEncoder {
     H264(NvencH264Encoder),
     Hevc(NvencHevcEncoder),
+    Av1(NvencAv1Encoder),
 }
 
 #[cfg(windows)]
@@ -340,6 +357,10 @@ impl BrowserPreviewEncoder {
                 NvencHevcEncoder::new_max_speed_with_bitrate(width, height, fps, bitrate_bps)
                     .map(Self::Hevc)
             }
+            BrowserWebrtcPreviewCodec::Av1 => {
+                let _ = bitrate_bps;
+                NvencAv1Encoder::new_high_refresh_rate(width, height, fps).map(Self::Av1)
+            }
         }
     }
 
@@ -347,12 +368,14 @@ impl BrowserPreviewEncoder {
         match self {
             Self::H264(_) => VideoCodec::H264,
             Self::Hevc(_) => VideoCodec::Hevc,
+            Self::Av1(_) => VideoCodec::Av1,
         }
     }
 
     fn request_keyframe(&mut self) {
-        if let Self::H264(encoder) = self {
-            encoder.request_keyframe();
+        match self {
+            Self::H264(encoder) => encoder.request_keyframe(),
+            Self::Hevc(_) | Self::Av1(_) => {}
         }
     }
 
@@ -363,6 +386,7 @@ impl BrowserPreviewEncoder {
         match self {
             Self::H264(encoder) => encoder.encode(frame),
             Self::Hevc(encoder) => encoder.encode(frame),
+            Self::Av1(encoder) => encoder.encode(frame),
         }
     }
 }
@@ -371,6 +395,7 @@ fn browser_webrtc_preview_codec_label(codec: BrowserWebrtcPreviewCodec) -> &'sta
     match codec {
         BrowserWebrtcPreviewCodec::H264 => "H.264",
         BrowserWebrtcPreviewCodec::Hevc => "HEVC",
+        BrowserWebrtcPreviewCodec::Av1 => "AV1",
     }
 }
 
@@ -1264,6 +1289,14 @@ mod tests {
     }
 
     #[test]
+    fn browser_webrtc_preview_start_deserializes_av1_codec() {
+        let request: BrowserWebrtcPreviewStartRequest =
+            serde_json::from_str(r#"{"session_id":"s1","offer_sdp":"v=0","codec":"av1"}"#).unwrap();
+
+        assert_eq!(request.selected_codec(), BrowserWebrtcPreviewCodec::Av1);
+    }
+
+    #[test]
     fn browser_preview_uses_rtp_track_for_low_latency_browser_video() {
         assert_eq!(
             browser_preview_sender_track_kind(20_000_000),
@@ -1292,6 +1325,21 @@ mod tests {
         );
 
         assert!(matches!(sender, BrowserPreviewMediaSender::HevcRtp(_)));
+    }
+
+    #[test]
+    fn browser_preview_av1_media_sender_uses_rtp_even_at_high_bitrate() {
+        let sender = BrowserPreviewMediaSender::new(
+            "video",
+            "stream",
+            120,
+            BrowserWebrtcPreviewCodec::Av1,
+            H264Profile::High,
+            "640034",
+            80_000_000,
+        );
+
+        assert!(matches!(sender, BrowserPreviewMediaSender::Av1Rtp(_)));
     }
 
     #[test]

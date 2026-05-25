@@ -1,4 +1,7 @@
-pub use mrd_transport_webrtc::{H264AccessUnitAssembler, HevcAccessUnitAssembler};
+pub use mrd_transport_webrtc::{
+    Av1AccessUnitAssembler, H264AccessUnitAssembler, HevcAccessUnitAssembler,
+    VvcAccessUnitAssembler,
+};
 
 #[cfg(test)]
 mod tests {

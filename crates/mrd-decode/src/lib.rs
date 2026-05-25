@@ -8,9 +8,11 @@ use openh264::{
     formats::YUVSource,
 };
 #[cfg(target_os = "linux")]
+use std::process::{Command, Stdio};
+#[cfg(target_os = "linux")]
 use std::{
     io::{Read, Write},
-    process::{Child, ChildStdin, Command, Stdio},
+    process::{Child, ChildStdin},
     sync::mpsc,
     thread,
 };
@@ -21,6 +23,7 @@ pub enum CodecKind {
     Hevc,
     HevcMain10,
     Av1,
+    Vvc,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +47,34 @@ const D3D11_TEXTURE_OUTPUTS: &[PixelFormat] = &[PixelFormat::D3d11Texture];
 const H264_SOFTWARE_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
     id: "h264_software",
     codec: CodecKind::H264,
+    runtime_status: RuntimeStatus::RuntimeBacked,
+    output_formats: RGB24_OUTPUTS,
+};
+
+const HEVC_SOFTWARE_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
+    id: "software_hevc",
+    codec: CodecKind::Hevc,
+    runtime_status: RuntimeStatus::RuntimeBacked,
+    output_formats: RGB24_OUTPUTS,
+};
+
+const HEVC_MAIN10_SOFTWARE_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
+    id: "software_hevc_main10",
+    codec: CodecKind::HevcMain10,
+    runtime_status: RuntimeStatus::RuntimeBacked,
+    output_formats: RGB24_OUTPUTS,
+};
+
+const AV1_SOFTWARE_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
+    id: "software_av1",
+    codec: CodecKind::Av1,
+    runtime_status: RuntimeStatus::RuntimeBacked,
+    output_formats: RGB24_OUTPUTS,
+};
+
+const VVC_SOFTWARE_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
+    id: "software_vvc",
+    codec: CodecKind::Vvc,
     runtime_status: RuntimeStatus::RuntimeBacked,
     output_formats: RGB24_OUTPUTS,
 };
@@ -124,6 +155,10 @@ const LINUX_HEVC_MAIN10_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
 pub fn available_decoder_descriptors() -> Vec<DecoderDescriptor> {
     let descriptors = vec![
         H264_SOFTWARE_DESCRIPTOR.clone(),
+        HEVC_SOFTWARE_DESCRIPTOR.clone(),
+        HEVC_MAIN10_SOFTWARE_DESCRIPTOR.clone(),
+        AV1_SOFTWARE_DESCRIPTOR.clone(),
+        VVC_SOFTWARE_DESCRIPTOR.clone(),
         NVDEC_D3D11_SHARED_DESCRIPTOR.clone(),
         NVDEC_DESCRIPTOR.clone(),
         NVDEC_HEVC_D3D11_SHARED_DESCRIPTOR.clone(),
@@ -146,6 +181,12 @@ pub fn available_decoder_descriptors() -> Vec<DecoderDescriptor> {
 pub fn create_decoder(id: &str) -> Result<Box<dyn VideoDecoder>, PipelineError> {
     match id {
         "h264_software" => Ok(Box::new(H264SoftwareDecoder::new()?)),
+        "software_hevc" | "hevc_software" => create_rust_h265_decoder(false),
+        "software_hevc_main10" | "hevc_main10_software" => create_rust_h265_decoder(true),
+        "software_av1" | "av1_software" => create_dav1d_decoder(),
+        "software_vvc" | "vvc_software" | "software_h266" | "h266_software" => {
+            create_vvdec_decoder()
+        }
         "linux_h264" | "gstreamer_h264" | "vaapi_h264" => create_linux_h264_decoder(),
         "linux_hevc" | "gstreamer_hevc" | "vaapi_hevc" => create_linux_hevc_decoder(),
         "linux_hevc_main10" | "gstreamer_hevc_main10" | "vaapi_hevc_main10" => {
@@ -246,6 +287,174 @@ fn create_linux_hevc_main10_decoder() -> Result<Box<dyn VideoDecoder>, PipelineE
 pub struct H264SoftwareDecoder {
     decoder: OpenH264Decoder,
     decoded_frames: Vec<CoreDecodedFrame>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SoftwareYuvLayout {
+    I400,
+    I420,
+    I422,
+    I444,
+}
+
+#[derive(Clone, Copy)]
+struct PlanarYuvFrame<'a> {
+    width: usize,
+    height: usize,
+    layout: SoftwareYuvLayout,
+    bit_depth: usize,
+    bytes_per_sample: usize,
+    y: &'a [u8],
+    y_stride: usize,
+    u: &'a [u8],
+    u_stride: usize,
+    v: &'a [u8],
+    v_stride: usize,
+    full_range: bool,
+}
+
+fn software_codec_not_compiled(
+    codec_label: &str,
+    runtime_label: &str,
+    feature: &str,
+) -> PipelineError {
+    PipelineError::Message(format!(
+        "software {codec_label} decoder requires {runtime_label}; rebuild mrd-decode with feature `{feature}` to enable that backend"
+    ))
+}
+
+#[cfg(feature = "software-rust-h265")]
+pub struct RustH265SoftwareDecoder {
+    tx: std::sync::mpsc::Sender<RustH265Request>,
+    decoded_frames: Vec<CoreDecodedFrame>,
+}
+
+#[cfg(feature = "software-rust-h265")]
+enum RustH265Request {
+    Push {
+        access_unit: Vec<u8>,
+        reply: std::sync::mpsc::Sender<Result<Vec<CoreDecodedFrame>, PipelineError>>,
+    },
+    Stop,
+}
+
+#[cfg(feature = "software-rust-h265")]
+impl RustH265SoftwareDecoder {
+    fn new(require_main10: bool) -> Result<Self, PipelineError> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("mrd-rust-h265-decoder".to_string())
+            .spawn(move || rust_h265_worker(rx, require_main10))
+            .map_err(|error| {
+                PipelineError::Message(format!("spawn rust_h265 decoder worker failed: {error}"))
+            })?;
+        Ok(Self {
+            tx,
+            decoded_frames: Vec::new(),
+        })
+    }
+
+    fn push_access_unit_nals(&mut self, access_unit: &[u8]) -> Result<(), PipelineError> {
+        let (reply, reply_rx) = std::sync::mpsc::channel();
+        self.tx
+            .send(RustH265Request::Push {
+                access_unit: access_unit.to_vec(),
+                reply,
+            })
+            .map_err(|error| {
+                PipelineError::Message(format!("rust_h265 decoder worker stopped: {error}"))
+            })?;
+        let frames = reply_rx.recv().map_err(|error| {
+            PipelineError::Message(format!("rust_h265 decoder worker did not reply: {error}"))
+        })??;
+        self.decoded_frames.extend(frames);
+        Ok(())
+    }
+}
+
+#[cfg(feature = "software-rust-h265")]
+impl Drop for RustH265SoftwareDecoder {
+    fn drop(&mut self) {
+        let _ = self.tx.send(RustH265Request::Stop);
+    }
+}
+
+#[cfg(feature = "software-dav1d")]
+pub struct Dav1dSoftwareDecoder {
+    decoder: shiguredo_dav1d::Decoder,
+    decoded_frames: Vec<CoreDecodedFrame>,
+    frame_index: u64,
+}
+
+#[cfg(feature = "software-dav1d")]
+impl Dav1dSoftwareDecoder {
+    fn new() -> Result<Self, PipelineError> {
+        let mut config = shiguredo_dav1d::DecoderConfig::new();
+        config.n_threads = std::thread::available_parallelism()
+            .map(|count| count.get().min(8))
+            .unwrap_or(1);
+        let decoder = shiguredo_dav1d::Decoder::new(config)
+            .map_err(|error| PipelineError::Message(format!("dav1d init failed: {error}")))?;
+        Ok(Self {
+            decoder,
+            decoded_frames: Vec::new(),
+            frame_index: 0,
+        })
+    }
+
+    fn collect_frames(&mut self) -> Result<(), PipelineError> {
+        loop {
+            match self.decoder.next_frame() {
+                Ok(Some(frame)) => {
+                    let timestamp_us = self.frame_index.saturating_mul(16_667);
+                    self.frame_index = self.frame_index.saturating_add(1);
+                    self.decoded_frames
+                        .push(dav1d_frame_to_rgb_frame(&frame, timestamp_us)?);
+                }
+                Ok(None) => return Ok(()),
+                Err(error) => {
+                    return Err(PipelineError::Message(format!(
+                        "dav1d receive frame failed: {error}"
+                    )))
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "software-vvdec")]
+pub struct VvdecSoftwareDecoder {
+    decoder: vvdec::Decoder,
+    decoded_frames: Vec<CoreDecodedFrame>,
+    frame_index: u64,
+}
+
+#[cfg(feature = "software-vvdec")]
+impl VvdecSoftwareDecoder {
+    fn new() -> Result<Self, PipelineError> {
+        let threads = std::thread::available_parallelism()
+            .map(|count| count.get().min(8) as i32)
+            .unwrap_or(1);
+        let decoder = vvdec::Decoder::builder()
+            .num_threads(threads)
+            .build()
+            .map_err(|error| PipelineError::Message(format!("VVdeC init failed: {error}")))?;
+        Ok(Self {
+            decoder,
+            decoded_frames: Vec::new(),
+            frame_index: 0,
+        })
+    }
+
+    fn push_frame(&mut self, frame: vvdec::Frame) -> Result<(), PipelineError> {
+        let timestamp_us = frame
+            .cts()
+            .unwrap_or_else(|| self.frame_index.saturating_mul(16_667));
+        self.frame_index = self.frame_index.saturating_add(1);
+        self.decoded_frames
+            .push(vvdec_frame_to_rgb_frame(&frame, timestamp_us)?);
+        Ok(())
+    }
 }
 
 pub struct NvdecVideoDecoder {
@@ -690,6 +899,119 @@ impl H264SoftwareDecoder {
     }
 }
 
+#[cfg(feature = "software-rust-h265")]
+fn create_rust_h265_decoder(require_main10: bool) -> Result<Box<dyn VideoDecoder>, PipelineError> {
+    Ok(Box::new(RustH265SoftwareDecoder::new(require_main10)?))
+}
+
+#[cfg(not(feature = "software-rust-h265"))]
+fn create_rust_h265_decoder(_require_main10: bool) -> Result<Box<dyn VideoDecoder>, PipelineError> {
+    Err(software_codec_not_compiled(
+        "HEVC/Main10",
+        "rust_h265",
+        "software-rust-h265",
+    ))
+}
+
+#[cfg(feature = "software-dav1d")]
+fn create_dav1d_decoder() -> Result<Box<dyn VideoDecoder>, PipelineError> {
+    Ok(Box::new(Dav1dSoftwareDecoder::new()?))
+}
+
+#[cfg(not(feature = "software-dav1d"))]
+fn create_dav1d_decoder() -> Result<Box<dyn VideoDecoder>, PipelineError> {
+    Err(software_codec_not_compiled(
+        "AV1",
+        "dav1d",
+        "software-dav1d",
+    ))
+}
+
+#[cfg(feature = "software-vvdec")]
+fn create_vvdec_decoder() -> Result<Box<dyn VideoDecoder>, PipelineError> {
+    Ok(Box::new(VvdecSoftwareDecoder::new()?))
+}
+
+#[cfg(not(feature = "software-vvdec"))]
+fn create_vvdec_decoder() -> Result<Box<dyn VideoDecoder>, PipelineError> {
+    Err(software_codec_not_compiled(
+        "H.266/VVC",
+        "VVdeC",
+        "software-vvdec",
+    ))
+}
+
+#[cfg(feature = "software-rust-h265")]
+impl VideoDecoder for RustH265SoftwareDecoder {
+    fn push_access_unit(&mut self, access_unit: &[u8]) -> Result<(), PipelineError> {
+        if access_unit.is_empty() {
+            return Ok(());
+        }
+
+        self.push_access_unit_nals(access_unit)
+    }
+
+    fn drain_decoded_frames(&mut self) -> Vec<CoreDecodedFrame> {
+        std::mem::take(&mut self.decoded_frames)
+    }
+}
+
+#[cfg(feature = "software-dav1d")]
+impl VideoDecoder for Dav1dSoftwareDecoder {
+    fn push_access_unit(&mut self, access_unit: &[u8]) -> Result<(), PipelineError> {
+        if access_unit.is_empty() {
+            return Ok(());
+        }
+
+        match self.decoder.decode(access_unit) {
+            Ok(()) => {}
+            Err(error) if error.is_eagain() => {
+                self.collect_frames()?;
+                self.decoder.decode(access_unit).map_err(|error| {
+                    PipelineError::Message(format!("dav1d decode failed after drain: {error}"))
+                })?;
+            }
+            Err(error) => {
+                return Err(PipelineError::Message(format!(
+                    "dav1d decode failed: {error}"
+                )))
+            }
+        }
+
+        self.collect_frames()
+    }
+
+    fn drain_decoded_frames(&mut self) -> Vec<CoreDecodedFrame> {
+        std::mem::take(&mut self.decoded_frames)
+    }
+}
+
+#[cfg(feature = "software-vvdec")]
+impl VideoDecoder for VvdecSoftwareDecoder {
+    fn push_access_unit(&mut self, access_unit: &[u8]) -> Result<(), PipelineError> {
+        if access_unit.is_empty() {
+            return Ok(());
+        }
+
+        let timestamp_us = self.frame_index.saturating_mul(16_667);
+        let mut au = vvdec::AccessUnit::new(access_unit);
+        au.cts = Some(timestamp_us);
+        au.is_random_access_point = true;
+        match self.decoder.decode::<&[u8], _>(au) {
+            Ok(Some(frame)) => self.push_frame(frame),
+            Ok(None) => Ok(()),
+            Err(error) if matches!(error, vvdec::Error::TryAgain) => Ok(()),
+            Err(error) => Err(PipelineError::Message(format!(
+                "VVdeC decode failed: {error}"
+            ))),
+        }
+    }
+
+    fn drain_decoded_frames(&mut self) -> Vec<CoreDecodedFrame> {
+        std::mem::take(&mut self.decoded_frames)
+    }
+}
+
 impl VideoDecoder for H264SoftwareDecoder {
     fn push_access_unit(&mut self, access_unit: &[u8]) -> Result<(), PipelineError> {
         let decoded_frame = match self.decoder.decode(access_unit) {
@@ -719,6 +1041,532 @@ fn decoded_yuv_to_rgb_frame(decoded: &DecodedYUV<'_>, timestamp_us: u64) -> Core
     let mut rgb = vec![0_u8; width * height * 3];
     decoded.write_rgb8(&mut rgb);
     CoreDecodedFrame::from_cpu_rgb24(width, height, timestamp_us, rgb)
+}
+
+#[cfg(feature = "software-rust-h265")]
+fn rust_h265_worker(rx: std::sync::mpsc::Receiver<RustH265Request>, require_main10: bool) {
+    let mut decoder = rust_h265::Decoder::new();
+    let mut frame_index = 0_u64;
+    while let Ok(request) = rx.recv() {
+        match request {
+            RustH265Request::Push { access_unit, reply } => {
+                let _ = reply.send(decode_rust_h265_access_unit(
+                    &mut decoder,
+                    &access_unit,
+                    require_main10,
+                    &mut frame_index,
+                ));
+            }
+            RustH265Request::Stop => break,
+        }
+    }
+}
+
+#[cfg(feature = "software-rust-h265")]
+fn decode_rust_h265_access_unit(
+    decoder: &mut rust_h265::Decoder,
+    access_unit: &[u8],
+    require_main10: bool,
+    frame_index: &mut u64,
+) -> Result<Vec<CoreDecodedFrame>, PipelineError> {
+    let nals = rust_h265::parse_annex_b(access_unit);
+    if nals.is_empty() {
+        return Err(PipelineError::Message(
+            "rust_h265 requires Annex B HEVC access units".to_string(),
+        ));
+    }
+
+    let mut decoded_frames = Vec::new();
+    for nal in nals {
+        if let Some(frame) = decoder
+            .decode_nal(&nal)
+            .map_err(|error| PipelineError::Message(format!("rust_h265 decode failed: {error}")))?
+        {
+            if require_main10 && frame.bit_depth < 10 {
+                return Err(PipelineError::Message(format!(
+                    "rust_h265 decoded HEVC frame is {}-bit, expected Main10",
+                    frame.bit_depth
+                )));
+            }
+            decoded_frames.push(rust_h265_frame_to_rgb_frame(
+                &frame,
+                (*frame_index).saturating_mul(16_667),
+            )?);
+            *frame_index = (*frame_index).saturating_add(1);
+        }
+    }
+    Ok(decoded_frames)
+}
+
+#[cfg(feature = "software-rust-h265")]
+fn rust_h265_frame_to_rgb_frame(
+    frame: &rust_h265::Frame,
+    timestamp_us: u64,
+) -> Result<CoreDecodedFrame, PipelineError> {
+    let width = frame.width as usize;
+    let height = frame.height as usize;
+    let chroma_width = width.div_ceil(2);
+    let chroma_height = height.div_ceil(2);
+    let bit_depth = frame.bit_depth as usize;
+    let expected_y = width
+        .checked_mul(height)
+        .ok_or_else(|| PipelineError::Message("HEVC frame dimensions overflow".to_string()))?;
+    let expected_uv = chroma_width
+        .checked_mul(chroma_height)
+        .ok_or_else(|| PipelineError::Message("HEVC chroma dimensions overflow".to_string()))?;
+    if frame.y.len() < expected_y || frame.u.len() < expected_uv || frame.v.len() < expected_uv {
+        return Err(PipelineError::Message(format!(
+            "rust_h265 returned undersized HEVC planes: y={} u={} v={}, expected y>={expected_y} uv>={expected_uv}",
+            frame.y.len(),
+            frame.u.len(),
+            frame.v.len()
+        )));
+    }
+
+    let rgb = match (&frame.y, &frame.u, &frame.v) {
+        (rust_h265::PixelData::U8(y), rust_h265::PixelData::U8(u), rust_h265::PixelData::U8(v)) => {
+            planar_yuv_to_rgb24(PlanarYuvFrame {
+                width,
+                height,
+                layout: SoftwareYuvLayout::I420,
+                bit_depth,
+                bytes_per_sample: 1,
+                y,
+                y_stride: width,
+                u,
+                u_stride: chroma_width,
+                v,
+                v_stride: chroma_width,
+                full_range: false,
+            })?
+        }
+        (
+            rust_h265::PixelData::U16(y),
+            rust_h265::PixelData::U16(u),
+            rust_h265::PixelData::U16(v),
+        ) => planar_i420_u16_to_rgb24(PlanarYuv16Frame {
+            width,
+            height,
+            bit_depth,
+            y,
+            y_stride: width,
+            u,
+            u_stride: chroma_width,
+            v,
+            v_stride: chroma_width,
+            full_range: false,
+        })?,
+        _ => {
+            return Err(PipelineError::Message(
+                "rust_h265 returned mixed bit-depth planes".to_string(),
+            ))
+        }
+    };
+
+    Ok(CoreDecodedFrame::from_cpu_rgb24(
+        width,
+        height,
+        timestamp_us,
+        rgb,
+    ))
+}
+
+#[cfg(feature = "software-dav1d")]
+fn dav1d_frame_to_rgb_frame(
+    frame: &shiguredo_dav1d::DecodedFrame,
+    timestamp_us: u64,
+) -> Result<CoreDecodedFrame, PipelineError> {
+    let layout = match frame.pixel_layout() {
+        shiguredo_dav1d::PixelLayout::I400 => SoftwareYuvLayout::I400,
+        shiguredo_dav1d::PixelLayout::I420 => SoftwareYuvLayout::I420,
+        shiguredo_dav1d::PixelLayout::I422 => SoftwareYuvLayout::I422,
+        shiguredo_dav1d::PixelLayout::I444 => SoftwareYuvLayout::I444,
+        shiguredo_dav1d::PixelLayout::Reserved => {
+            return Err(PipelineError::Message(
+                "dav1d returned a reserved AV1 pixel layout".to_string(),
+            ))
+        }
+    };
+    let width = frame.width();
+    let height = frame.height();
+    let bit_depth = frame.bit_depth();
+    let bytes_per_sample = bytes_per_sample_for_bit_depth(bit_depth);
+    let rgb = planar_yuv_to_rgb24(PlanarYuvFrame {
+        width,
+        height,
+        layout,
+        bit_depth,
+        bytes_per_sample,
+        y: frame.y_plane(),
+        y_stride: frame.y_stride(),
+        u: frame.u_plane(),
+        u_stride: frame.u_stride(),
+        v: frame.v_plane(),
+        v_stride: frame.v_stride(),
+        full_range: matches!(frame.color_range(), Some(shiguredo_dav1d::ColorRange::Full)),
+    })?;
+    Ok(CoreDecodedFrame::from_cpu_rgb24(
+        width,
+        height,
+        timestamp_us,
+        rgb,
+    ))
+}
+
+#[cfg(feature = "software-vvdec")]
+fn vvdec_frame_to_rgb_frame(
+    frame: &vvdec::Frame,
+    timestamp_us: u64,
+) -> Result<CoreDecodedFrame, PipelineError> {
+    let layout = match frame.color_format() {
+        vvdec::ColorFormat::Yuv400Planar => SoftwareYuvLayout::I400,
+        vvdec::ColorFormat::Yuv420Planar => SoftwareYuvLayout::I420,
+        vvdec::ColorFormat::Yuv422Planar => SoftwareYuvLayout::I422,
+        vvdec::ColorFormat::Yuv444Planar => SoftwareYuvLayout::I444,
+        other => {
+            return Err(PipelineError::Message(format!(
+                "VVdeC returned unsupported color format: {other:?}"
+            )))
+        }
+    };
+    let y = frame.plane(vvdec::PlaneComponent::Y).ok_or_else(|| {
+        PipelineError::Message("VVdeC decoded frame is missing Y plane".to_string())
+    })?;
+    let u = frame.plane(vvdec::PlaneComponent::U);
+    let v = frame.plane(vvdec::PlaneComponent::V);
+    let bit_depth = frame.bit_depth() as usize;
+    let bytes_per_sample = y.bytes_per_sample() as usize;
+    let rgb = planar_yuv_to_rgb24(PlanarYuvFrame {
+        width: frame.width() as usize,
+        height: frame.height() as usize,
+        layout,
+        bit_depth,
+        bytes_per_sample,
+        y: y.as_ref(),
+        y_stride: y.stride() as usize,
+        u: u.as_ref().map(|plane| plane.as_ref()).unwrap_or(&[]),
+        u_stride: u.as_ref().map(|plane| plane.stride() as usize).unwrap_or(0),
+        v: v.as_ref().map(|plane| plane.as_ref()).unwrap_or(&[]),
+        v_stride: v.as_ref().map(|plane| plane.stride() as usize).unwrap_or(0),
+        full_range: false,
+    })?;
+    Ok(CoreDecodedFrame::from_cpu_rgb24(
+        frame.width() as usize,
+        frame.height() as usize,
+        timestamp_us,
+        rgb,
+    ))
+}
+
+fn bytes_per_sample_for_bit_depth(bit_depth: usize) -> usize {
+    if bit_depth > 8 {
+        2
+    } else {
+        1
+    }
+}
+
+fn planar_yuv_to_rgb24(frame: PlanarYuvFrame<'_>) -> Result<Vec<u8>, PipelineError> {
+    if matches!(frame.layout, SoftwareYuvLayout::I420)
+        && frame.bit_depth == 8
+        && frame.bytes_per_sample == 1
+    {
+        return planar_i420_8_to_rgb24(frame);
+    }
+
+    planar_yuv_to_rgb24_generic(frame)
+}
+
+fn planar_i420_8_to_rgb24(frame: PlanarYuvFrame<'_>) -> Result<Vec<u8>, PipelineError> {
+    if frame.width == 0 || frame.height == 0 {
+        return Err(PipelineError::Message(
+            "decoded YUV frame has empty dimensions".to_string(),
+        ));
+    }
+
+    let chroma_width = frame.width.div_ceil(2);
+    let chroma_height = frame.height.div_ceil(2);
+    let min_y_len = frame
+        .height
+        .saturating_sub(1)
+        .checked_mul(frame.y_stride)
+        .and_then(|offset| offset.checked_add(frame.width))
+        .ok_or_else(|| PipelineError::Message("decoded Y plane length overflow".to_string()))?;
+    let min_uv_len = chroma_height
+        .saturating_sub(1)
+        .checked_mul(frame.u_stride)
+        .and_then(|offset| offset.checked_add(chroma_width))
+        .ok_or_else(|| PipelineError::Message("decoded UV plane length overflow".to_string()))?;
+    if frame.y.len() < min_y_len || frame.u.len() < min_uv_len || frame.v.len() < min_uv_len {
+        return Err(PipelineError::Message(format!(
+            "decoded I420 frame is undersized: y={} u={} v={}, expected y>={min_y_len} uv>={min_uv_len}",
+            frame.y.len(),
+            frame.u.len(),
+            frame.v.len()
+        )));
+    }
+
+    let mut rgb = vec![0_u8; frame.width * frame.height * 3];
+    for y in (0..frame.height).step_by(2) {
+        let y0_row = y * frame.y_stride;
+        let y1_row = (y + 1).min(frame.height - 1) * frame.y_stride;
+        let uv_row = (y / 2) * frame.u_stride;
+        let out0_row = y * frame.width * 3;
+        let out1_row = (y + 1).min(frame.height - 1) * frame.width * 3;
+        for x in (0..frame.width).step_by(2) {
+            let uv_offset = uv_row + x / 2;
+            let u = frame.u[uv_offset];
+            let v = frame.v[uv_offset];
+            write_rgb_pixel(
+                &mut rgb,
+                out0_row + x * 3,
+                frame.y[y0_row + x],
+                u,
+                v,
+                frame.full_range,
+            );
+            if x + 1 < frame.width {
+                write_rgb_pixel(
+                    &mut rgb,
+                    out0_row + (x + 1) * 3,
+                    frame.y[y0_row + x + 1],
+                    u,
+                    v,
+                    frame.full_range,
+                );
+            }
+            if y + 1 < frame.height {
+                write_rgb_pixel(
+                    &mut rgb,
+                    out1_row + x * 3,
+                    frame.y[y1_row + x],
+                    u,
+                    v,
+                    frame.full_range,
+                );
+                if x + 1 < frame.width {
+                    write_rgb_pixel(
+                        &mut rgb,
+                        out1_row + (x + 1) * 3,
+                        frame.y[y1_row + x + 1],
+                        u,
+                        v,
+                        frame.full_range,
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(rgb)
+}
+
+#[inline]
+fn write_rgb_pixel(rgb: &mut [u8], offset: usize, y: u8, u: u8, v: u8, full_range: bool) {
+    let [r, g, b] = yuv_to_rgb8(y, u, v, full_range);
+    rgb[offset] = r;
+    rgb[offset + 1] = g;
+    rgb[offset + 2] = b;
+}
+
+#[cfg(feature = "software-rust-h265")]
+struct PlanarYuv16Frame<'a> {
+    width: usize,
+    height: usize,
+    bit_depth: usize,
+    y: &'a [u16],
+    y_stride: usize,
+    u: &'a [u16],
+    u_stride: usize,
+    v: &'a [u16],
+    v_stride: usize,
+    full_range: bool,
+}
+
+#[cfg(feature = "software-rust-h265")]
+fn planar_i420_u16_to_rgb24(frame: PlanarYuv16Frame<'_>) -> Result<Vec<u8>, PipelineError> {
+    if frame.width == 0 || frame.height == 0 {
+        return Err(PipelineError::Message(
+            "decoded YUV frame has empty dimensions".to_string(),
+        ));
+    }
+    if frame.bit_depth <= 8 || frame.bit_depth > 16 {
+        return Err(PipelineError::Message(format!(
+            "unsupported decoded 16-bit YUV bit depth: {}",
+            frame.bit_depth
+        )));
+    }
+
+    let chroma_width = frame.width.div_ceil(2);
+    let chroma_height = frame.height.div_ceil(2);
+    let min_y_len = frame
+        .height
+        .saturating_sub(1)
+        .checked_mul(frame.y_stride)
+        .and_then(|offset| offset.checked_add(frame.width))
+        .ok_or_else(|| PipelineError::Message("decoded Y plane length overflow".to_string()))?;
+    let min_uv_len = chroma_height
+        .saturating_sub(1)
+        .checked_mul(frame.u_stride)
+        .and_then(|offset| offset.checked_add(chroma_width))
+        .ok_or_else(|| PipelineError::Message("decoded UV plane length overflow".to_string()))?;
+    if frame.y.len() < min_y_len || frame.u.len() < min_uv_len || frame.v.len() < min_uv_len {
+        return Err(PipelineError::Message(format!(
+            "decoded I420 16-bit frame is undersized: y={} u={} v={}, expected y>={min_y_len} uv>={min_uv_len}",
+            frame.y.len(),
+            frame.u.len(),
+            frame.v.len()
+        )));
+    }
+
+    let shift = frame.bit_depth - 8;
+    let to_u8 = |sample: u16| ((sample >> shift).min(255)) as u8;
+    let mut rgb = vec![0_u8; frame.width * frame.height * 3];
+    for y in 0..frame.height {
+        let y_row = y * frame.y_stride;
+        let uv_row = (y / 2) * frame.u_stride;
+        let out_row = y * frame.width * 3;
+        for x in 0..frame.width {
+            let uv_offset = uv_row + x / 2;
+            let [r, g, b] = yuv_to_rgb8(
+                to_u8(frame.y[y_row + x]),
+                to_u8(frame.u[uv_offset]),
+                to_u8(frame.v[uv_offset]),
+                frame.full_range,
+            );
+            let offset = out_row + x * 3;
+            rgb[offset] = r;
+            rgb[offset + 1] = g;
+            rgb[offset + 2] = b;
+        }
+    }
+
+    Ok(rgb)
+}
+
+fn planar_yuv_to_rgb24_generic(frame: PlanarYuvFrame<'_>) -> Result<Vec<u8>, PipelineError> {
+    if frame.width == 0 || frame.height == 0 {
+        return Err(PipelineError::Message(
+            "decoded YUV frame has empty dimensions".to_string(),
+        ));
+    }
+    if frame.bit_depth == 0 || frame.bit_depth > 16 {
+        return Err(PipelineError::Message(format!(
+            "unsupported decoded YUV bit depth: {}",
+            frame.bit_depth
+        )));
+    }
+
+    let mut rgb = vec![0_u8; frame.width * frame.height * 3];
+    for y in 0..frame.height {
+        for x in 0..frame.width {
+            let yy = read_yuv_sample(
+                frame.y,
+                frame.y_stride,
+                x,
+                y,
+                frame.bytes_per_sample,
+                frame.bit_depth,
+            )?;
+            let (cx, cy) = chroma_coordinates(frame.layout, x, y);
+            let uu = if matches!(frame.layout, SoftwareYuvLayout::I400) {
+                128
+            } else {
+                read_yuv_sample(
+                    frame.u,
+                    frame.u_stride,
+                    cx,
+                    cy,
+                    frame.bytes_per_sample,
+                    frame.bit_depth,
+                )?
+            };
+            let vv = if matches!(frame.layout, SoftwareYuvLayout::I400) {
+                128
+            } else {
+                read_yuv_sample(
+                    frame.v,
+                    frame.v_stride,
+                    cx,
+                    cy,
+                    frame.bytes_per_sample,
+                    frame.bit_depth,
+                )?
+            };
+            let [r, g, b] = yuv_to_rgb8(yy, uu, vv, frame.full_range);
+            let offset = (y * frame.width + x) * 3;
+            rgb[offset] = r;
+            rgb[offset + 1] = g;
+            rgb[offset + 2] = b;
+        }
+    }
+    Ok(rgb)
+}
+
+fn chroma_coordinates(layout: SoftwareYuvLayout, x: usize, y: usize) -> (usize, usize) {
+    match layout {
+        SoftwareYuvLayout::I400 | SoftwareYuvLayout::I444 => (x, y),
+        SoftwareYuvLayout::I420 => (x / 2, y / 2),
+        SoftwareYuvLayout::I422 => (x / 2, y),
+    }
+}
+
+fn read_yuv_sample(
+    plane: &[u8],
+    stride: usize,
+    x: usize,
+    y: usize,
+    bytes_per_sample: usize,
+    bit_depth: usize,
+) -> Result<u8, PipelineError> {
+    let byte_offset = y
+        .checked_mul(stride)
+        .and_then(|row| row.checked_add(x.checked_mul(bytes_per_sample)?))
+        .ok_or_else(|| PipelineError::Message("decoded YUV plane offset overflow".to_string()))?;
+    let sample = match bytes_per_sample {
+        1 => *plane.get(byte_offset).ok_or_else(|| {
+            PipelineError::Message("decoded YUV 8-bit sample out of bounds".to_string())
+        })? as u16,
+        2 => {
+            let lo = *plane.get(byte_offset).ok_or_else(|| {
+                PipelineError::Message("decoded YUV 16-bit sample out of bounds".to_string())
+            })?;
+            let hi = *plane.get(byte_offset + 1).ok_or_else(|| {
+                PipelineError::Message("decoded YUV 16-bit sample out of bounds".to_string())
+            })?;
+            u16::from_le_bytes([lo, hi])
+        }
+        other => {
+            return Err(PipelineError::Message(format!(
+                "unsupported decoded YUV bytes-per-sample: {other}"
+            )))
+        }
+    };
+    if bit_depth > 8 {
+        Ok((sample >> (bit_depth - 8)).min(255) as u8)
+    } else {
+        Ok(sample.min(255) as u8)
+    }
+}
+
+fn yuv_to_rgb8(y: u8, u: u8, v: u8, full_range: bool) -> [u8; 3] {
+    let c = if full_range {
+        y as i32
+    } else {
+        (y as i32 - 16).max(0)
+    };
+    let d = u as i32 - 128;
+    let e = v as i32 - 128;
+    let luma = if full_range { 256 * c } else { 298 * c };
+    [
+        clamp_u8((luma + 409 * e + 128) >> 8),
+        clamp_u8((luma - 100 * d - 208 * e + 128) >> 8),
+        clamp_u8((luma + 516 * d + 128) >> 8),
+    ]
+}
+
+fn clamp_u8(value: i32) -> u8 {
+    value.clamp(0, 255) as u8
 }
 
 fn parse_h264_dimensions(access_unit: &[u8]) -> Result<Option<(usize, usize)>, PipelineError> {
@@ -1303,6 +2151,60 @@ mod tests {
 
         assert_eq!(descriptor.codec, CodecKind::Hevc);
         assert_eq!(descriptor.output_formats, D3D11_TEXTURE_OUTPUTS);
+    }
+
+    #[cfg(feature = "software-rust-h265")]
+    #[test]
+    fn rust_h265_main10_frame_converts_to_rgb24() {
+        let frame = rust_h265::Frame {
+            y: rust_h265::PixelData::U16(vec![512; 4]),
+            u: rust_h265::PixelData::U16(vec![512; 1]),
+            v: rust_h265::PixelData::U16(vec![512; 1]),
+            width: 2,
+            height: 2,
+            pic_order_cnt: 0,
+            bit_depth: 10,
+        };
+
+        let decoded = rust_h265_frame_to_rgb_frame(&frame, 42).expect("convert Main10 HEVC frame");
+
+        assert_eq!(decoded.width, 2);
+        assert_eq!(decoded.height, 2);
+        assert_eq!(decoded.timestamp_us, 42);
+        match decoded.data {
+            DecodedFrameData::CpuRgb24(rgb) => assert_eq!(rgb.len(), 12),
+            other => panic!("expected RGB24 decoded frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn planar_i420_fast_path_matches_generic_yuv_conversion() {
+        let width = 4;
+        let height = 4;
+        let y = (0..width * height)
+            .map(|index| 16 + (index as u8 * 7))
+            .collect::<Vec<_>>();
+        let u = vec![96, 128, 144, 160];
+        let v = vec![112, 120, 136, 152];
+        let frame = PlanarYuvFrame {
+            width,
+            height,
+            layout: SoftwareYuvLayout::I420,
+            bit_depth: 8,
+            bytes_per_sample: 1,
+            y: &y,
+            y_stride: width,
+            u: &u,
+            u_stride: width / 2,
+            v: &v,
+            v_stride: width / 2,
+            full_range: false,
+        };
+
+        let fast = planar_i420_8_to_rgb24(frame).expect("fast I420 conversion");
+        let generic = planar_yuv_to_rgb24_generic(frame).expect("generic I420 conversion");
+
+        assert_eq!(fast, generic);
     }
 
     #[cfg(target_os = "linux")]

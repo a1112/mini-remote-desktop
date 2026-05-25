@@ -6,6 +6,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 $repo = (Resolve-Path $RepoRoot).Path
+. (Join-Path $repo 'tests/benchmarks/scripts/transport_matrix_common.ps1')
 $scenarioFile = Join-Path $repo $ScenarioPath
 $scenario = Get-Content $scenarioFile -Raw | ConvertFrom-Json
 $gitCommit = (git -C $repo rev-parse --short HEAD).Trim()
@@ -24,6 +25,9 @@ New-Item -ItemType File -Force -Path (Join-Path $logsDir 'signaling.stderr.log')
 $hostStdout = Join-Path $logsDir 'host.stdout.log'
 $hostStderr = Join-Path $logsDir 'host.stderr.log'
 $thresholdPath = Join-Path $repo ("tests/benchmarks/thresholds/{0}" -f $scenario.threshold_file)
+$cargoArgs = @("test", "-p", "app") +
+  (Get-TransportMatrixCargoFeatureArgs -DecodeBackend $scenario.decode_backend) +
+  @("benchmark_run_writes_requested_artifacts", "--", "--nocapture")
 
 $env:MRD_BENCH_ARTIFACT_ROOT = $repo
 $env:MRD_BENCH_SCENARIO = $scenario.scenario
@@ -40,10 +44,21 @@ $env:MRD_BENCH_CAPTURE_BACKEND = $scenario.capture_backend
 $env:MRD_BENCH_ENCODE_BACKEND = $scenario.encode_backend
 $env:MRD_BENCH_DECODE_BACKEND = $scenario.decode_backend
 $env:MRD_BENCH_RENDERER_BACKEND = $scenario.renderer_backend
+$bitrateBps = Get-TransportMatrixBitrateBps -Scenario $scenario
+if ($null -ne $bitrateBps) {
+  $env:MRD_BENCH_BITRATE_BPS = $bitrateBps
+} else {
+  Remove-Item Env:MRD_BENCH_BITRATE_BPS -ErrorAction SilentlyContinue
+}
+if (@($scenario.PSObject.Properties.Name) -contains "pace_to_fps") {
+  $env:MRD_BENCH_PACE_TO_FPS = [string]$scenario.pace_to_fps
+} else {
+  Remove-Item Env:MRD_BENCH_PACE_TO_FPS -ErrorAction SilentlyContinue
+}
 
 $process = Start-Process `
   -FilePath "cargo" `
-  -ArgumentList @("test", "-p", "app", "benchmark_run_writes_requested_artifacts", "--", "--nocapture") `
+  -ArgumentList $cargoArgs `
   -WorkingDirectory $repo `
   -RedirectStandardOutput $hostStdout `
   -RedirectStandardError $hostStderr `
@@ -58,6 +73,8 @@ if ($process.ExitCode -ne 0) {
 powershell -ExecutionPolicy Bypass -File (Join-Path $repo 'tests/benchmarks/scripts/summarize_transport_results.ps1') `
   -RunDir $runDir `
   -ThresholdPath $thresholdPath
+
+Assert-TransportMatrixSummaryPassed -SummaryPath (Join-Path $runDir 'summary.json')
 
 Write-Output "Benchmark run completed."
 Write-Output "Run directory: $runDir"

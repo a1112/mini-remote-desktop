@@ -41,7 +41,7 @@ type WebCodecsPreviewStartControlInput = {
   width: number;
   height: number;
   bitrateMbps: number;
-  codec: "h264" | "hevc";
+  codec: "h264" | "hevc" | "hevc_main10";
   h264Profile: string;
   sourceId?: string;
 };
@@ -53,7 +53,7 @@ export type WebCodecsPreviewStartControlMessage = {
   width: number;
   height: number;
   bitrate_mbps: number;
-  codec: "h264" | "hevc";
+  codec: "h264" | "hevc" | "hevc_main10";
   h264_profile: string;
   source_id: string | null;
 };

@@ -21,6 +21,7 @@ pub enum VideoCodec {
     H264,
     Hevc,
     Av1,
+    Vvc,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

@@ -36,6 +36,9 @@ foreach ($path in @($hostStdout, $hostStderr, $signalingStdout, $signalingStderr
 $summary.warning_count = $warningCount
 $summary.error_count = $errorCount
 $summary.restart_count = $restartCount
+if (-not ($summary.PSObject.Properties.Name -contains 'failure_reason')) {
+  $summary | Add-Member -NotePropertyName failure_reason -NotePropertyValue $null
+}
 
 if ($ThresholdPath -and (Test-Path $ThresholdPath)) {
   $thresholds = Get-Content $ThresholdPath -Raw | ConvertFrom-Json
@@ -51,6 +54,33 @@ if ($ThresholdPath -and (Test-Path $ThresholdPath)) {
     ($summary.warning_count -le $thresholds.max_warning_count) -and
     ($summary.error_count -le $thresholds.max_error_count)
   )
+  if (-not $summary.run_passed -and [string]::IsNullOrWhiteSpace([string]$summary.failure_reason)) {
+    $reasons = @()
+    if (-not $summary.session_established) { $reasons += "session was not established" }
+    if (-not $summary.first_frame_seen) { $reasons += "first frame was not observed" }
+    if ($null -ne $summary.first_frame_time_ms -and $summary.first_frame_time_ms -gt $thresholds.max_first_frame_time_ms) {
+      $reasons += "first frame time $($summary.first_frame_time_ms)ms exceeded $($thresholds.max_first_frame_time_ms)ms"
+    }
+    if ($summary.fps_observed -lt $thresholds.min_fps_observed) {
+      $reasons += "observed FPS $($summary.fps_observed) below $($thresholds.min_fps_observed)"
+    }
+    if ($null -ne $summary.encode_total_p95_ms -and $summary.encode_total_p95_ms -gt $thresholds.max_encode_total_p95_ms) {
+      $reasons += "encode p95 $($summary.encode_total_p95_ms)ms exceeded $($thresholds.max_encode_total_p95_ms)ms"
+    }
+    if ($null -ne $summary.send_write_p95_ms -and $summary.send_write_p95_ms -gt $thresholds.max_send_write_p95_ms) {
+      $reasons += "send p95 $($summary.send_write_p95_ms)ms exceeded $($thresholds.max_send_write_p95_ms)ms"
+    }
+    if ($null -ne $summary.decode_total_p95_ms -and $summary.decode_total_p95_ms -gt $thresholds.max_decode_total_p95_ms) {
+      $reasons += "decode p95 $($summary.decode_total_p95_ms)ms exceeded $($thresholds.max_decode_total_p95_ms)ms"
+    }
+    if ($summary.warning_count -gt $thresholds.max_warning_count) {
+      $reasons += "warning count $($summary.warning_count) exceeded $($thresholds.max_warning_count)"
+    }
+    if ($summary.error_count -gt $thresholds.max_error_count) {
+      $reasons += "error count $($summary.error_count) exceeded $($thresholds.max_error_count)"
+    }
+    $summary.failure_reason = if ($reasons.Count -gt 0) { $reasons -join "; " } else { "benchmark thresholds were not met" }
+  }
 }
 
 $summary | ConvertTo-Json -Depth 8 | Set-Content $summaryPath -Encoding Ascii
@@ -63,7 +93,7 @@ $headers = @(
   'quic_receiver_duplicate_fragments','quic_receiver_rejected_fragments','quic_receiver_pending_frames',
   'quic_receiver_reassembly_drops','zero_write_access_unit_count',
   'warning_count','error_count','restart_count','encode_total_p95_ms','send_write_p95_ms','decode_total_p95_ms',
-  'frame_sink_ingest_p95_ms','render_upload_p95_ms','render_present_p95_ms','run_passed'
+  'frame_sink_ingest_p95_ms','render_upload_p95_ms','render_present_p95_ms','failure_reason','run_passed'
 )
 $row = [pscustomobject]@{}
 foreach ($header in $headers) { $row | Add-Member -NotePropertyName $header -NotePropertyValue $summary.$header }
@@ -87,6 +117,7 @@ $report = @(
   "- First frame seen: $($summary.first_frame_seen)",
   "- First frame time ms: $($summary.first_frame_time_ms)",
   "- Probe complete: $($summary.probe_complete)",
+  "- Failure reason: $($summary.failure_reason)",
   "",
   "## Metrics",
   "",

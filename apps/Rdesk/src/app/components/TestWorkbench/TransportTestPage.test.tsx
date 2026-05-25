@@ -282,8 +282,13 @@ describe("TransportTestPage execution targets", () => {
             width: 1280,
             height: 720,
             fps: 30,
-            bitrate_mbps: 5,
-            codec: "h264",
+            bitrate_mbps: 20,
+            codec: "hevc",
+            codec_profile: "main",
+            bit_depth: 8,
+            chroma_subsampling: "4:2:0",
+            pixel_format: "nv12",
+            hdr_enabled: false,
           },
         })
       );

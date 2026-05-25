@@ -26,6 +26,7 @@
     "warning_count",
     "error_count",
     "restart_count",
+    "failure_reason",
     "run_passed"
   ],
   "properties": {
@@ -59,6 +60,7 @@
     "warning_count": { "type": "integer", "minimum": 0 },
     "error_count": { "type": "integer", "minimum": 0 },
     "restart_count": { "type": "integer", "minimum": 0 },
+    "failure_reason": { "type": ["string", "null"] },
     "encode_total_p95_ms": { "type": ["number", "null"] },
     "send_write_p95_ms": { "type": ["number", "null"] },
     "decode_total_p95_ms": { "type": ["number", "null"] },

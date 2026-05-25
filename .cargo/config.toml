@@ -1,0 +1,2 @@
+[env]
+SYSTEM_DEPS_LIBVVDEC_BUILD_INTERNAL = "always"

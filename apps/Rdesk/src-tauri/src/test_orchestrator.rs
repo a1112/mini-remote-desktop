@@ -1996,6 +1996,14 @@ impl TestOrchestrator {
                 sender: mrd_transport_webrtc::HevcRtpSender,
                 ingress: mrd_transport_webrtc::HevcRtpIngress,
             },
+            Av1 {
+                sender: mrd_transport_webrtc::Av1RtpSender,
+                ingress: mrd_transport_webrtc::Av1RtpIngress,
+            },
+            Vvc {
+                sender: mrd_transport_webrtc::VvcRtpSender,
+                ingress: mrd_transport_webrtc::VvcRtpIngress,
+            },
         }
 
         let codec = access_units
@@ -2021,9 +2029,24 @@ impl TestOrchestrator {
                 ),
                 ingress: mrd_transport_webrtc::HevcRtpIngress::default(),
             },
-            mrd_pipeline_core::VideoCodec::Av1 => {
-                anyhow::bail!("WebRTC RTP single-window probe does not support AV1 yet")
-            }
+            mrd_pipeline_core::VideoCodec::Av1 => RtpLoopback::Av1 {
+                sender: mrd_transport_webrtc::Av1RtpSender::new(
+                    "single-window-video",
+                    "single-window-stream",
+                    fps,
+                    1200,
+                ),
+                ingress: mrd_transport_webrtc::Av1RtpIngress::default(),
+            },
+            mrd_pipeline_core::VideoCodec::Vvc => RtpLoopback::Vvc {
+                sender: mrd_transport_webrtc::VvcRtpSender::new(
+                    "single-window-video",
+                    "single-window-stream",
+                    fps,
+                    1200,
+                ),
+                ingress: mrd_transport_webrtc::VvcRtpIngress::default(),
+            },
         };
         let mut reassembled = Vec::new();
         let mut rtp_packet_count = 0usize;
@@ -2040,6 +2063,12 @@ impl TestOrchestrator {
                 RtpLoopback::Hevc { sender, .. } => sender
                     .packetize_access_unit(access_unit)
                     .map_err(|error| anyhow::anyhow!(error.to_string()))?,
+                RtpLoopback::Av1 { sender, .. } => sender
+                    .packetize_access_unit(access_unit)
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?,
+                RtpLoopback::Vvc { sender, .. } => sender
+                    .packetize_access_unit(access_unit)
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?,
             };
             for packet in packets {
                 rtp_packet_count += 1;
@@ -2052,6 +2081,18 @@ impl TestOrchestrator {
                         access_unit.timestamp_us,
                     ),
                     RtpLoopback::Hevc { ingress, .. } => ingress.push_packet(
+                        &packet.payload,
+                        packet.header.marker,
+                        packet.header.sequence_number,
+                        access_unit.timestamp_us,
+                    ),
+                    RtpLoopback::Av1 { ingress, .. } => ingress.push_packet(
+                        &packet.payload,
+                        packet.header.marker,
+                        packet.header.sequence_number,
+                        access_unit.timestamp_us,
+                    ),
+                    RtpLoopback::Vvc { ingress, .. } => ingress.push_packet(
                         &packet.payload,
                         packet.header.marker,
                         packet.header.sequence_number,
@@ -3448,6 +3489,7 @@ fn harness_config_from_data(config: &TestConfigData) -> HarnessConfig {
         },
         renderer_target_hwnd: config.renderer_target_hwnd,
         zero_copy: config.zero_copy,
+        pace_to_fps: None,
         input_source: config.input_source.clone(),
         source_id: config.source_id.clone(),
         display_id: config

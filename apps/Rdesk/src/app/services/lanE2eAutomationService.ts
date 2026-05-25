@@ -253,7 +253,19 @@ const REQUIRED_PLATFORM_MEDIA_CAPABILITY_PROFILES: RequiredPlatformMediaCapabili
     capabilities: ["pipewire_capture", "software_decode"],
   },
 ];
-const DEFAULT_LAN_MEDIA_PROFILE: MediaProfile = {
+const DEFAULT_LAN_HEVC_MEDIA_PROFILE: MediaProfile = {
+  width: 2560,
+  height: 1600,
+  fps: 165,
+  bitrate_mbps: 80,
+  codec: "hevc",
+  codec_profile: "main",
+  bit_depth: 8,
+  chroma_subsampling: "4:2:0",
+  pixel_format: "nv12",
+  hdr_enabled: false,
+};
+const DEFAULT_LAN_H264_FALLBACK_MEDIA_PROFILE: MediaProfile = {
   width: 2560,
   height: 1600,
   fps: 165,
@@ -290,12 +302,8 @@ export async function runLanE2EAutomation(
   const transportKind = options.transportKind ?? "quic";
   const displayModePolicy = options.displayModePolicy ?? "none";
   const renderProfileCapEnabled = options.renderProfileCap ?? true;
-  let requestedProfile =
-    shouldRequestMediaProfile(scenarioId, transportKind)
-      ? options.requestedProfile ?? DEFAULT_LAN_MEDIA_PROFILE
-      : options.requestedProfile;
-  const sessionStartProfile =
-    options.adaptive ? buildAdaptiveStartupMediaProfile(requestedProfile) : requestedProfile;
+  const requestMediaProfile = shouldRequestMediaProfile(scenarioId, transportKind);
+  let requestedProfile = options.requestedProfile;
   const validationMode = transportKind === "webrtc" ? "webrtc_rtp" : "quic_datagram";
   let sessionId: string | undefined;
   let peer: LanPeerInfo | undefined;
@@ -428,6 +436,12 @@ export async function runLanE2EAutomation(
       stage("assert", "completed");
       return finish("completed");
     }
+
+    if (requestMediaProfile && !options.requestedProfile) {
+      requestedProfile = defaultLanMediaProfileForPeer(selectedPeer);
+    }
+    const sessionStartProfile =
+      options.adaptive ? buildAdaptiveStartupMediaProfile(requestedProfile) : requestedProfile;
 
     if (scenarioId === "cross.fault.recovery" && !commands.crossE2EInjectFault) {
       const message = "Cross-device fault recovery requires mrd-service fault injection support";
@@ -902,7 +916,7 @@ function buildAdaptiveMediaConfig(
   captureSource: CaptureSource | undefined,
   overrides: AdaptiveMediaConfig | undefined
 ): AdaptiveMediaConfig {
-  const ceilingProfile = requestedProfile ?? DEFAULT_LAN_MEDIA_PROFILE;
+  const ceilingProfile = requestedProfile ?? DEFAULT_LAN_HEVC_MEDIA_PROFILE;
   const normalizedCeilingProfile = {
     ...ceilingProfile,
     bitrate_mbps: Math.max(80, ceilingProfile.bitrate_mbps),
@@ -1344,6 +1358,25 @@ function peerSupportsTransport(peer: LanPeerInfo, transportKind: string): boolea
     );
   }
   return transports.includes(requestedTransport);
+}
+
+function defaultLanMediaProfileForPeer(peer: LanPeerInfo): MediaProfile {
+  return peerSupportsHevcMain(peer)
+    ? { ...DEFAULT_LAN_HEVC_MEDIA_PROFILE }
+    : { ...DEFAULT_LAN_H264_FALLBACK_MEDIA_PROFILE };
+}
+
+function peerSupportsHevcMain(peer: LanPeerInfo): boolean {
+  const mediaCapabilities = (peer.media_capabilities ?? []).map((capability) =>
+    capability.toLowerCase()
+  );
+  const hasAny = (aliases: string[]) =>
+    aliases.some((capability) => mediaCapabilities.includes(capability));
+  return (
+    hasAny(["nvenc_hevc", "encode.nvenc_hevc"]) &&
+    hasAny(["nvdec_hevc", "decode.nvdec_hevc"]) &&
+    hasAny(["media.hevc_main_420_8bit"])
+  );
 }
 
 function findSupportedPlatformMediaCapabilityProfile(

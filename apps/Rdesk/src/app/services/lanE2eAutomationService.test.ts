@@ -17,6 +17,19 @@ const DEFAULT_REQUESTED_PROFILE = {
   height: 1600,
   fps: 165,
   bitrate_mbps: 80,
+  codec: "hevc",
+  codec_profile: "main",
+  bit_depth: 8,
+  chroma_subsampling: "4:2:0",
+  pixel_format: "nv12",
+  hdr_enabled: false,
+};
+
+const H264_FALLBACK_REQUESTED_PROFILE = {
+  width: 2560,
+  height: 1600,
+  fps: 165,
+  bitrate_mbps: 80,
   codec: "h264",
 };
 
@@ -120,6 +133,9 @@ function createCommands(
             media_capabilities: [
               "quic_datagram_media_v3",
               "dxgi_capture",
+              "nvenc_hevc",
+              "nvdec_hevc",
+              "media.hevc_main_420_8bit",
               "nvenc_h264",
               "nvdec",
               "d3d11_native_render",
@@ -1852,7 +1868,69 @@ describe("runLanE2EAutomation", () => {
       "lan-e2e-test-session",
       "agent-device",
       "quic",
-      DEFAULT_REQUESTED_PROFILE
+      H264_FALLBACK_REQUESTED_PROFILE
+    );
+  });
+
+  it("falls back to the H.264 compatibility profile when the peer lacks HEVC media capabilities", async () => {
+    const ipcRefreshLanDiscovery = vi.fn().mockResolvedValue(
+      ok({
+        enabled: true,
+        running: true,
+        discovery_port: 37777,
+        instance_id: "controller-instance",
+        last_probe_ms: 10,
+        peers: [
+          {
+            device_id: "agent-device",
+            device_name: "Agent PC",
+            device_type: "desktop",
+            ip: "192.168.1.24",
+            discovery_port: 37777,
+            p2p_control_addr: "192.168.1.24:37778",
+            transports: [
+              "quic",
+              "quic_datagram",
+              "quic_datagram_2k144",
+              "quic_datagram_media_v2",
+              "quic_datagram_media_v3",
+              "media_profile_control_v1",
+            ],
+            protocol_version: 1,
+            service_build_id: "test-build",
+            media_protocol_version: 3,
+            media_capabilities: [
+              "quic_datagram_media_v3",
+              "dxgi_capture",
+              "nvenc_h264",
+              "nvdec",
+              "d3d11_native_render",
+            ],
+            age_ms: 20,
+            p2p_available: true,
+          },
+        ],
+      })
+    );
+    const commands = createCommands({ ipcRefreshLanDiscovery });
+
+    const result = await runLanE2EAutomation(commands, {
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => "lan-e2e-test-session",
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.requestedProfile).toEqual(H264_FALLBACK_REQUESTED_PROFILE);
+    expect(commands.ipcStartLanRemoteSession).toHaveBeenCalledWith(
+      "lan-e2e-test-session",
+      "agent-device",
+      "quic",
+      H264_FALLBACK_REQUESTED_PROFILE
     );
   });
 

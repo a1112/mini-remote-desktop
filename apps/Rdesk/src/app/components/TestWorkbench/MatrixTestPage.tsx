@@ -68,8 +68,8 @@ const MATRIX_DIMENSIONS: MatrixDimension[] = [
     id: "encoder",
     name: "编码器",
     options: [
-      { id: "nvenc_h264", name: "NVENC H.264", enabled: true },
-      { id: "nvenc_hevc", name: "NVENC HEVC Main", enabled: false },
+      { id: "nvenc_h264", name: "NVENC H.264", enabled: false },
+      { id: "nvenc_hevc", name: "NVENC HEVC Main", enabled: true },
       { id: "nvenc_hevc_main10", name: "NVENC HEVC Main10", enabled: false },
       { id: "openh264", name: "OpenH264", enabled: true },
       { id: "nvenc_av1", name: "NVENC AV1", enabled: false },
@@ -174,10 +174,10 @@ const MATRIX_DIMENSIONS: MatrixDimension[] = [
     name: "码率",
     options: [
       { id: "3000000", name: "3 Mbps", enabled: false },
-      { id: "5000000", name: "5 Mbps", enabled: true },
+      { id: "5000000", name: "5 Mbps", enabled: false },
       { id: "8000000", name: "8 Mbps", enabled: false },
       { id: "12000000", name: "12 Mbps", enabled: false },
-      { id: "20000000", name: "20 Mbps", enabled: false },
+      { id: "20000000", name: "20 Mbps", enabled: true },
       { id: "50000000", name: "50 Mbps", enabled: false },
       { id: "80000000", name: "80 Mbps", enabled: false },
       { id: "100000000", name: "100 Mbps", enabled: false },
@@ -261,8 +261,15 @@ function shouldEnableOptionByDefault(
   dimensionId: string,
   option: MatrixOption,
   os: HostOs,
+  availableEncoders: string[],
   availableDecoders: string[]
 ): boolean {
+  if (dimensionId === "encoder") {
+    const hasHevc = availableEncoders.includes("nvenc_hevc");
+    const hasHardwareH264 = availableEncoders.includes("nvenc_h264");
+    if (option.id === "nvenc_h264") return !hasHevc && hasHardwareH264;
+    if (option.id === "openh264") return !hasHevc && !hasHardwareH264;
+  }
   if (
     os === "linux" &&
     dimensionId === "decoder" &&
@@ -334,7 +341,13 @@ function createMatrixDimensions(
           unavailableReason: capability?.reason ?? capability?.detail,
           enabled:
             selectable &&
-            shouldEnableOptionByDefault(dimension.id, option, os, availableDecoders),
+            shouldEnableOptionByDefault(
+              dimension.id,
+              option,
+              os,
+              availableEncoders,
+              availableDecoders
+            ),
         };
       })
       .filter(
@@ -541,17 +554,11 @@ function unsupportedMatrixReason(config: TestConfig): string | null {
   ) {
     return "D3D11 shared texture input requires direct render or NVENC GPU encoders";
   }
-  if (isHevcEncoder(config.encoder_type) && config.decoder_type === "software") {
-    return "NVENC HEVC currently requires NVDEC or encode-only matrix runs";
-  }
   if (isHevcEncoder(config.encoder_type) && config.decoder_type === "linux_h264") {
     return "Linux H.264 hardware decoder cannot decode NVENC HEVC output";
   }
   if (config.encoder_type === "nvenc_hevc_main10" && config.decoder_type === "linux_hevc") {
     return "NVENC HEVC Main10 requires the Linux HEVC Main10 decoder path";
-  }
-  if (config.encoder_type === "nvenc_av1" && config.decoder_type === "software") {
-    return "NVENC AV1 currently requires NVDEC or encode-only matrix runs";
   }
   if (config.encoder_type === "nvenc_av1" && config.decoder_type === "linux_h264") {
     return "Linux H.264 hardware decoder cannot decode NVENC AV1 output";

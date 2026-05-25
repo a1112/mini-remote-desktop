@@ -29,8 +29,8 @@ function buildDefaultConfig(capabilities: EnvironmentSnapshot | null): TestConfi
     capture === "macos"
       ? ["videotoolbox_h264", "openh264"]
       : capture === "linux"
-        ? ["nvenc_h264", "openh264"]
-        : ["nvenc_h264", "openh264"],
+        ? ["nvenc_hevc", "nvenc_h264", "openh264"]
+        : ["nvenc_hevc", "nvenc_h264", "openh264"],
     capabilities,
     "available_encoders",
     "openh264"
@@ -62,7 +62,7 @@ function buildDefaultConfig(capabilities: EnvironmentSnapshot | null): TestConfi
     zero_copy: renderer === "d3d11" && encoder.startsWith("nvenc") ? true : undefined,
     resolution: [1920, 1080],
     fps: 60,
-    bitrate: 5000000,
+    bitrate: encoder === "nvenc_hevc" ? 20_000_000 : 5_000_000,
     duration_ms: 10000,
     warmup_ms: 2000,
     input_source: capture === "synthetic" ? "synthetic" : "screen",

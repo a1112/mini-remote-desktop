@@ -15,6 +15,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..\..")
+. (Join-Path $PSScriptRoot "pipeline_compare_common.ps1")
 $resultsPath = Join-Path $repoRoot $ResultsDir
 New-Item -ItemType Directory -Force -Path $resultsPath | Out-Null
 
@@ -33,7 +34,23 @@ function Test-SoftwareCodecRequest {
         -or $codecName -eq "software_h264" `
         -or $codecName -eq "software-h264" `
         -or $codecName -eq "h264_software" `
-        -or $codecName -eq "h264-software"
+        -or $codecName -eq "h264-software" `
+        -or $codecName -eq "software_hevc" `
+        -or $codecName -eq "software-hevc" `
+        -or $codecName -eq "hevc_software" `
+        -or $codecName -eq "hevc-software" `
+        -or $codecName -eq "software_h265" `
+        -or $codecName -eq "software-h265" `
+        -or $codecName -eq "h265_software" `
+        -or $codecName -eq "h265-software" `
+        -or $codecName -eq "software_hevc_main10" `
+        -or $codecName -eq "software-hevc-main10" `
+        -or $codecName -eq "hevc_main10_software" `
+        -or $codecName -eq "hevc-main10-software" `
+        -or $codecName -eq "software_av1" `
+        -or $codecName -eq "software-av1" `
+        -or $codecName -eq "av1_software" `
+        -or $codecName -eq "av1-software"
 }
 
 function Get-EffectiveDimensions {
@@ -131,6 +148,9 @@ function Invoke-RdeskPipeline {
     $stdoutPath = Join-Path $resultsPath ("rdesk_{0}_{1}.stdout.log" -f $Pipeline, $stamp)
     $stderrPath = Join-Path $resultsPath ("rdesk_{0}_{1}.stderr.log" -f $Pipeline, $stamp)
     $zeroCopy = -not (Test-SoftwareCodecRequest)
+    $cargoArgs = @("test", "-p", "app") +
+        (Get-PipelineCompareCargoFeatureArgs -Codec $Codec) +
+        @("nvenc_nvdec_harness_prints_stage_metrics", "--", "--ignored", "--nocapture")
     Set-HarnessEnv `
         -Pipeline $Pipeline `
         -Encoder $Encoder `
@@ -143,7 +163,7 @@ function Invoke-RdeskPipeline {
     Write-Host "Running $Pipeline..."
     $process = Start-Process `
         -FilePath "cargo" `
-        -ArgumentList @("test", "-p", "app", "nvenc_nvdec_harness_prints_stage_metrics", "--", "--ignored", "--nocapture") `
+        -ArgumentList $cargoArgs `
         -Wait `
         -PassThru `
         -NoNewWindow `
@@ -202,23 +222,34 @@ try {
     $compareInputs += Invoke-RdeskPipeline -Pipeline "capture-render" -Encoder "none" -Decoder "none"
 
     $codecName = $Codec.ToLowerInvariant()
-    if ($Software -or $codecName -eq "openh264" -or $codecName -eq "software_h264" -or $codecName -eq "software-h264" -or $codecName -eq "h264_software" -or $codecName -eq "h264-software") {
+    if ($codecName -eq "vvc" -or $codecName -eq "h266" -or $codecName -eq "software_vvc" -or $codecName -eq "software-h266") {
+        throw "VVC/H.266 automated compare is capability-gated: native RTP packetize/reassemble is available, but VVenC encode is not wired into the harness yet."
+    } elseif ($codecName -eq "openh264" -or $codecName -eq "software_h264" -or $codecName -eq "software-h264" -or $codecName -eq "h264_software" -or $codecName -eq "h264-software") {
         $encoder = "openh264"
+        $decoder = "software"
+    } elseif ($codecName -eq "software_hevc" -or $codecName -eq "software-hevc" -or $codecName -eq "hevc_software" -or $codecName -eq "hevc-software" -or $codecName -eq "software_h265" -or $codecName -eq "software-h265" -or $codecName -eq "h265_software" -or $codecName -eq "h265-software") {
+        $encoder = "nvenc_hevc"
+        $decoder = "software"
+    } elseif ($codecName -eq "software_hevc_main10" -or $codecName -eq "software-hevc-main10" -or $codecName -eq "hevc_main10_software" -or $codecName -eq "hevc-main10-software") {
+        $encoder = "nvenc_hevc_main10"
+        $decoder = "software"
+    } elseif ($codecName -eq "software_av1" -or $codecName -eq "software-av1" -or $codecName -eq "av1_software" -or $codecName -eq "av1-software") {
+        $encoder = "nvenc_av1"
         $decoder = "software"
     } elseif ($codecName -eq "av1") {
         $encoder = "nvenc_av1"
-        $decoder = "nvdec"
+        $decoder = if ($Software) { "software" } else { "nvdec" }
     } elseif ($codecName -eq "h264") {
-        $encoder = "nvenc_h264"
-        $decoder = "nvdec"
+        $encoder = if ($Software) { "openh264" } else { "nvenc_h264" }
+        $decoder = if ($Software) { "software" } else { "nvdec" }
     } elseif ($codecName -eq "hevc") {
         $encoder = "nvenc_hevc"
-        $decoder = "nvdec"
+        $decoder = if ($Software) { "software" } else { "nvdec" }
     } elseif ($codecName -eq "hevc-main10" -or $codecName -eq "hevc_main10" -or $codecName -eq "main10") {
         $encoder = "nvenc_hevc_main10"
-        $decoder = "nvdec"
+        $decoder = if ($Software) { "software" } else { "nvdec" }
     } else {
-        throw "Unsupported codec '$Codec'. Supported values: av1, h264, hevc, hevc-main10, openh264, software-h264"
+        throw "Unsupported codec '$Codec'. Supported values: av1, h264, hevc, hevc-main10, openh264, software-h264, software-hevc, software-hevc-main10, software-av1"
     }
 
     $compareInputs += Invoke-RdeskPipeline -Pipeline "capture-encode" -Encoder $encoder -Decoder "none"

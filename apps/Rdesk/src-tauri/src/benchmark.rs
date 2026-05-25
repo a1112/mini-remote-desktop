@@ -65,6 +65,7 @@ pub struct BenchmarkSummary {
     pub nvdec_h264_capability: String,
     pub nvdec_hevc_capability: String,
     pub nvdec_hevc_main10_capability: String,
+    pub failure_reason: Option<String>,
     pub run_passed: bool,
 }
 
@@ -182,6 +183,7 @@ impl BenchmarkSummary {
             nvdec_h264_capability,
             nvdec_hevc_capability,
             nvdec_hevc_main10_capability,
+            failure_reason: None,
             run_passed: session_established && first_frame_seen && probe_complete,
         }
     }
@@ -287,6 +289,7 @@ impl BenchmarkSummary {
             nvdec_h264_capability,
             nvdec_hevc_capability,
             nvdec_hevc_main10_capability,
+            failure_reason: None,
             run_passed: session_established && first_frame_seen && probe_complete,
         }
     }
@@ -333,6 +336,7 @@ impl BenchmarkSummary {
             "nvdec_h264_capability",
             "nvdec_hevc_capability",
             "nvdec_hevc_main10_capability",
+            "failure_reason",
             "run_passed",
         ]
     }
@@ -379,6 +383,7 @@ impl BenchmarkSummary {
             self.nvdec_h264_capability.clone(),
             self.nvdec_hevc_capability.clone(),
             self.nvdec_hevc_main10_capability.clone(),
+            csv_escape_text(self.failure_reason.as_deref().unwrap_or_default()),
             self.run_passed.to_string(),
         ]
     }
@@ -497,6 +502,10 @@ fn option_f64(value: Option<f64>) -> String {
     value.map(|item| item.to_string()).unwrap_or_default()
 }
 
+fn csv_escape_text(value: &str) -> String {
+    value.replace(['\r', '\n'], " ").replace(',', ";")
+}
+
 fn option_u64(value: Option<u64>) -> String {
     value.map(|item| item.to_string()).unwrap_or_default()
 }
@@ -520,6 +529,7 @@ Duration: `{duration}s`\n\n\
 - First frame seen: `{first_frame_seen}`\n\
 - First frame time ms: `{first_frame_ms}`\n\
 - Probe complete: `{probe_complete}`\n\
+- Failure reason: `{failure_reason}`\n\
 \n## Metrics\n\n\
 | Metric | Value |\n\
 | --- | --- |\n\
@@ -565,6 +575,7 @@ Duration: `{duration}s`\n\n\
         first_frame_seen = summary.first_frame_seen,
         first_frame_ms = option_f64(summary.first_frame_time_ms),
         probe_complete = summary.probe_complete,
+        failure_reason = summary.failure_reason.as_deref().unwrap_or_default(),
         fps_observed = summary.fps_observed,
         bitrate_kbps = summary.bitrate_kbps,
         encode_p95 = option_f64(summary.encode_total_p95_ms),
@@ -694,6 +705,10 @@ mod tests {
         manifest: &BenchmarkManifest,
         session_id: &SessionId,
     ) -> (BenchmarkSummary, PipelineProbeSnapshot) {
+        if let Some(reason) = unsupported_encoder_backend_reason(&manifest.encode_backend) {
+            return unsupported_benchmark_result(manifest, session_id, reason);
+        }
+
         let mut harness = TestHarness::new().expect("create benchmark harness");
         harness.set_chain(TestChain::Custom {
             capture: parse_capture_backend(&manifest.capture_backend),
@@ -709,6 +724,7 @@ mod tests {
             renderer: Some(parse_renderer_backend(&manifest.renderer_backend)),
             transport: Some(parse_transport_backend(&manifest.transport)),
             zero_copy: Some(benchmark_zero_copy_enabled(manifest)),
+            pace_to_fps: Some(env_bool("MRD_BENCH_PACE_TO_FPS", false)),
             visual_preview: Some(false),
             ..Default::default()
         });
@@ -728,6 +744,7 @@ mod tests {
             && metrics.decoded_frames > 0
             && metrics.encode_latency_p95_ms > 0.0
             && metrics.decode_latency_p95_ms > 0.0;
+        let failure_reason = harness_failure_reason(&metrics, first_frame_time_ms, probe_complete);
         let run_passed = first_frame_seen
             && probe_complete
             && metrics.encode_failures == 0
@@ -775,10 +792,34 @@ mod tests {
             nvdec_h264_capability: String::new(),
             nvdec_hevc_capability: String::new(),
             nvdec_hevc_main10_capability: String::new(),
+            failure_reason,
             run_passed,
         };
 
         (summary, probe)
+    }
+
+    fn harness_failure_reason(
+        metrics: &crate::test_harness::HarnessMetrics,
+        first_frame_time_ms: Option<f64>,
+        probe_complete: bool,
+    ) -> Option<String> {
+        if let Some(message) = metrics.error_message.as_deref() {
+            return Some(message.to_string());
+        }
+        if metrics.encoded_units == 0 {
+            return Some("encoder produced no non-empty access units".to_string());
+        }
+        if metrics.decoded_frames == 0 {
+            return Some("decoder produced no frames".to_string());
+        }
+        if first_frame_time_ms.is_none() {
+            return Some("first decoded frame was not observed before timeout".to_string());
+        }
+        if !probe_complete {
+            return Some("benchmark probe did not collect all required stage metrics".to_string());
+        }
+        None
     }
 
     fn wait_for_first_decoded_frame(harness: &TestHarness, timeout: Duration) -> Option<f64> {
@@ -908,7 +949,20 @@ mod tests {
     fn parse_decoder_backend(value: &str) -> DecoderType {
         match value {
             "none" => DecoderType::None,
-            "software" | "h264_software" | "openh264" => DecoderType::Software,
+            "software"
+            | "h264_software"
+            | "openh264"
+            | "software_h264"
+            | "software_hevc"
+            | "hevc_software"
+            | "software_hevc_main10"
+            | "hevc_main10_software"
+            | "software_av1"
+            | "av1_software"
+            | "software_vvc"
+            | "vvc_software"
+            | "software_h266"
+            | "h266_software" => DecoderType::Software,
             #[cfg(target_os = "linux")]
             "linux_h264" => DecoderType::LinuxH264,
             #[cfg(target_os = "linux")]
@@ -926,6 +980,93 @@ mod tests {
             "loopback" => TransportKind::Loopback,
             _ => TransportKind::WebrtcRtp,
         }
+    }
+
+    fn unsupported_encoder_backend_reason(value: &str) -> Option<String> {
+        matches!(
+            value,
+            "software_vvc"
+                | "vvc_software"
+                | "software_h266"
+                | "h266_software"
+                | "software-vvc"
+                | "vvc-software"
+                | "software-h266"
+                | "h266-software"
+                | "vvenc"
+                | "vvc"
+                | "h266"
+                | "h.266"
+        )
+        .then(|| {
+            "H.266/VVC benchmark encode is capability-gated: VVenC software encode is not wired into the harness; NVIDIA and browser hardware H.266 paths are unavailable".to_string()
+        })
+    }
+
+    fn unsupported_benchmark_result(
+        manifest: &BenchmarkManifest,
+        session_id: &SessionId,
+        reason: String,
+    ) -> (BenchmarkSummary, PipelineProbeSnapshot) {
+        let probe = PipelineProbeSnapshot::from_parts(
+            session_id.clone(),
+            "benchmark".into(),
+            Some(manifest.encode_backend.clone()),
+            Some("vvc".into()),
+            Some(manifest.transport.clone()),
+            0.0,
+            0.0,
+            0,
+            0,
+            vec![],
+            vec![],
+        );
+        let summary = BenchmarkSummary {
+            run_id: manifest.run_id.clone(),
+            scenario: manifest.scenario.clone(),
+            transport: manifest.transport.clone(),
+            capture_backend: manifest.capture_backend.clone(),
+            encode_backend: manifest.encode_backend.clone(),
+            decode_backend: manifest.decode_backend.clone(),
+            renderer_backend: manifest.renderer_backend.clone(),
+            width: manifest.width,
+            height: manifest.height,
+            fps_target: manifest.fps,
+            duration_secs: manifest.duration_secs,
+            session_established: false,
+            first_frame_seen: false,
+            first_frame_time_ms: None,
+            probe_complete: false,
+            fps_observed: 0.0,
+            bitrate_kbps: 0.0,
+            keyframes: 0,
+            dropped_frames: 0,
+            quic_receiver_completed_frames: None,
+            quic_receiver_expired_frames: None,
+            quic_receiver_evicted_frames: None,
+            quic_receiver_duplicate_fragments: None,
+            quic_receiver_rejected_fragments: None,
+            quic_receiver_pending_frames: None,
+            quic_receiver_reassembly_drops: None,
+            zero_write_access_unit_count: 0,
+            warning_count: 0,
+            error_count: 1,
+            restart_count: 0,
+            encode_total_p95_ms: None,
+            send_write_p95_ms: None,
+            decode_total_p95_ms: None,
+            frame_sink_ingest_p95_ms: None,
+            render_upload_p95_ms: None,
+            render_present_p95_ms: None,
+            nvdec_runtime_summary: String::new(),
+            nvdec_h264_capability: String::new(),
+            nvdec_hevc_capability: String::new(),
+            nvdec_hevc_main10_capability: String::new(),
+            failure_reason: Some(reason),
+            run_passed: false,
+        };
+
+        (summary, probe)
     }
 
     fn benchmark_zero_copy_enabled(manifest: &BenchmarkManifest) -> bool {
@@ -968,6 +1109,18 @@ mod tests {
         std::env::var(key)
             .ok()
             .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    }
+
+    fn env_bool(key: &str, default: bool) -> bool {
+        std::env::var(key)
+            .ok()
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
             .unwrap_or(default)
     }
 
@@ -1126,6 +1279,39 @@ mod tests {
     }
 
     #[test]
+    fn benchmark_h266_encoder_backend_is_capability_gated() {
+        let manifest = BenchmarkManifest {
+            run_id: "quick-webrtc-20260308-vvc".into(),
+            scenario: "quick.transport".into(),
+            transport: "webrtc".into(),
+            capture_backend: "dxgi".into(),
+            encode_backend: "software_vvc".into(),
+            decode_backend: "software_vvc".into(),
+            renderer_backend: "d3d11".into(),
+            width: 2560,
+            height: 1440,
+            fps: 144,
+            duration_secs: 20,
+            git_commit: "abc123".into(),
+        };
+        let session_id = SessionId("session-vvc".into());
+
+        let (summary, probe) = run_harness_benchmark(&manifest, &session_id);
+
+        assert!(!summary.run_passed);
+        assert_eq!(summary.fps_observed, 0.0);
+        assert_eq!(summary.error_count, 1);
+        assert_eq!(summary.encode_backend, "software_vvc");
+        assert_eq!(summary.decode_backend, "software_vvc");
+        assert!(summary
+            .failure_reason
+            .as_deref()
+            .expect("failure reason")
+            .contains("VVenC software encode is not wired"));
+        assert_eq!(probe.codec.as_deref(), Some("vvc"));
+    }
+
+    #[test]
     fn benchmark_enables_zero_copy_for_nvdec_d3d11_runs() {
         let manifest = BenchmarkManifest {
             run_id: "quick-quic-20260308-abc123".into(),
@@ -1208,6 +1394,7 @@ mod tests {
             nvdec_h264_capability: "runtime=true wired=true".into(),
             nvdec_hevc_capability: "runtime=true wired=false".into(),
             nvdec_hevc_main10_capability: "runtime=false wired=false".into(),
+            failure_reason: Some("encode produced no HEVC Main10 access units".into()),
             run_passed: false,
         };
 
@@ -1221,6 +1408,14 @@ mod tests {
         assert_eq!(row[2], "webrtc");
         assert!(header.contains(&"quic_receiver_completed_frames"));
         assert!(header.contains(&"nvdec_hevc_main10_capability"));
+        let failure_reason_index = header
+            .iter()
+            .position(|column| *column == "failure_reason")
+            .expect("failure_reason column");
+        assert_eq!(
+            row[failure_reason_index],
+            "encode produced no HEVC Main10 access units"
+        );
     }
 
     #[test]
