@@ -230,6 +230,8 @@ mod wire {
         pub floor_profile: Option<MediaProfile>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub ladder: Vec<MediaProfile>,
+        #[serde(default)]
+        pub dynamic_resolution_enabled: bool,
         #[serde(default = "default_downshift_cooldown_ms")]
         pub downshift_cooldown_ms: u64,
         #[serde(default = "default_upshift_hold_ms")]

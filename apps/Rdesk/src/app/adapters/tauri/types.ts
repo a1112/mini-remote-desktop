@@ -715,6 +715,7 @@ export interface AdaptiveMediaConfig {
   ceiling_profile?: MediaProfile | null;
   floor_profile?: MediaProfile | null;
   ladder?: MediaProfile[];
+  dynamic_resolution_enabled?: boolean;
   downshift_cooldown_ms?: number;
   upshift_hold_ms?: number;
 }

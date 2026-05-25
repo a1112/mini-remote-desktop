@@ -197,6 +197,7 @@ fn serialize_deserialize_configure_media_adaptation() {
             ..MediaProfile::default()
         }),
         ladder: vec![test_media_profile()],
+        dynamic_resolution_enabled: true,
         downshift_cooldown_ms: 2_000,
         upshift_hold_ms: 5_000,
     };
@@ -210,6 +211,23 @@ fn serialize_deserialize_configure_media_adaptation() {
     let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
 
     assert_eq!(request, deserialized);
+
+    let legacy_json = r#"{
+        "type":"ConfigureMediaAdaptation",
+        "session_id":"session-123",
+        "config":{
+            "enabled":true,
+            "mode":"keyframe_ladder",
+            "ladder":[],
+            "downshift_cooldown_ms":2000,
+            "upshift_hold_ms":5000
+        }
+    }"#;
+    let legacy: IpcRequest = serde_json::from_str(legacy_json).unwrap();
+    let IpcRequest::ConfigureMediaAdaptation { config, .. } = legacy else {
+        panic!("expected ConfigureMediaAdaptation request");
+    };
+    assert!(!config.dynamic_resolution_enabled);
 }
 
 #[test]
