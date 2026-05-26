@@ -27,6 +27,7 @@ param(
   [switch]$NoMotionStimulus,
   [switch]$NoBuild,
   [switch]$NoRenderProfileCap,
+  [switch]$ShowTauriWindow,
   [switch]$KeepTauriOpen
 )
 
@@ -84,20 +85,22 @@ function New-DiscoveryPortPair {
   throw "could not find two free UDP discovery ports"
 }
 
-function Start-MotionStimulusWindow([string]$Title) {
+function Start-MotionStimulusWindow([string]$Title, [int]$Width = 640, [int]$Height = 360) {
   $titleLiteral = $Title.Replace("'", "''")
   $script = @'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
 $title = '__MRD_TITLE__'
+$width = __MRD_WIDTH__
+$height = __MRD_HEIGHT__
 $form = New-Object System.Windows.Forms.Form
 $form.Text = $title
 $form.StartPosition = 'Manual'
 $form.Left = 48
 $form.Top = 48
-$form.Width = 640
-$form.Height = 360
+$form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
+$form.ClientSize = New-Object System.Drawing.Size($width, $height)
 $form.TopMost = $true
 $form.BackColor = [System.Drawing.Color]::Black
 
@@ -123,7 +126,7 @@ $timer.Add_Tick({
 })
 $timer.Start()
 [System.Windows.Forms.Application]::Run($form)
-'@.Replace("__MRD_TITLE__", $titleLiteral)
+'@.Replace("__MRD_TITLE__", $titleLiteral).Replace("__MRD_WIDTH__", [string]$Width).Replace("__MRD_HEIGHT__", [string]$Height)
 
   $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($script))
   Start-Process `
@@ -131,6 +134,23 @@ $timer.Start()
     -ArgumentList @("-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $encoded) `
     -WindowStyle Normal `
     -PassThru
+}
+
+function Resolve-ProcessWindowCaptureSourceId($Process, [int]$TimeoutSecs = 5) {
+  if (-not $Process) { return "" }
+  $deadline = (Get-Date).AddSeconds($TimeoutSecs)
+  while ((Get-Date) -lt $deadline) {
+    try {
+      $refreshed = Get-Process -Id $Process.Id -ErrorAction Stop
+      if ($refreshed.MainWindowHandle -and $refreshed.MainWindowHandle.ToInt64() -ne 0) {
+        return ("windows:window:0x{0:X}" -f $refreshed.MainWindowHandle.ToInt64())
+      }
+    } catch {
+      return ""
+    }
+    Start-Sleep -Milliseconds 100
+  }
+  ""
 }
 
 function ConvertTo-NamedPipeName([string]$Endpoint) {
@@ -282,6 +302,7 @@ function Invoke-LocalDualProcessProfile {
     [switch]$NoMotionStimulus,
     [switch]$NoRenderProfileCap,
     [switch]$NoBuild,
+    [switch]$ShowTauriWindow,
     [switch]$KeepTauriOpen
   )
 
@@ -325,9 +346,25 @@ function Invoke-LocalDualProcessProfile {
   try {
     $motionStimulusTitle = "MRD Local Dual Motion $runId"
     if (-not $NoMotionStimulus) {
-      $motionStimulus = Start-MotionStimulusWindow -Title $motionStimulusTitle
+      $motionStimulus = Start-MotionStimulusWindow `
+        -Title $motionStimulusTitle `
+        -Width ([Math]::Max(640, [int]$Profile.width)) `
+        -Height ([Math]::Max(360, [int]$Profile.height))
       Start-Sleep -Milliseconds 750
     }
+    $effectiveCaptureSourceId = $CaptureSourceId
+    if (
+      -not $effectiveCaptureSourceId.Trim() -and
+      $CaptureSourceKind.Trim() -eq "window" -and
+      $motionStimulus
+    ) {
+      $effectiveCaptureSourceId = Resolve-ProcessWindowCaptureSourceId -Process $motionStimulus
+      if ($effectiveCaptureSourceId.Trim()) {
+        Write-Host "Using motion stimulus capture source $effectiveCaptureSourceId"
+      }
+    }
+
+    Set-EnvVar "MRD_D3D11_RENDER_PRESENT_BLOCKING" "true" $savedEnv
 
     $controller = Start-LocalServiceInstance `
       -ServiceExe $runServiceExe `
@@ -397,8 +434,8 @@ function Invoke-LocalDualProcessProfile {
     if ($Profile.adaptive) {
       Set-EnvVar "MRD_LAN_E2E_ADAPTIVE" "true" $savedEnv
     }
-    if ($CaptureSourceId.Trim()) {
-      Set-EnvVar "MRD_LAN_E2E_CAPTURE_SOURCE_ID" $CaptureSourceId.Trim() $savedEnv
+    if ($effectiveCaptureSourceId.Trim()) {
+      Set-EnvVar "MRD_LAN_E2E_CAPTURE_SOURCE_ID" $effectiveCaptureSourceId.Trim() $savedEnv
     }
     if ($CaptureSourceKind.Trim()) {
       Set-EnvVar "MRD_LAN_E2E_CAPTURE_SOURCE_KIND" $CaptureSourceKind.Trim() $savedEnv
@@ -417,13 +454,14 @@ function Invoke-LocalDualProcessProfile {
 
     $tauriStdout = Join-Path $logsDir "tauri.stdout.log"
     $tauriStderr = Join-Path $logsDir "tauri.stderr.log"
+    $tauriWindowStyle = if ($ShowTauriWindow) { "Normal" } else { "Hidden" }
     $tauri = Start-Process `
       -FilePath "cmd.exe" `
       -ArgumentList @("/c", "pnpm", "tauri:dev") `
       -WorkingDirectory (Join-Path $Repo "apps/Rdesk") `
       -RedirectStandardOutput $tauriStdout `
       -RedirectStandardError $tauriStderr `
-      -WindowStyle Hidden `
+      -WindowStyle $tauriWindowStyle `
       -PassThru
 
     $startupGraceMs = [Math]::Max(1, $TauriStartupGraceSecs) * 1000
@@ -497,9 +535,10 @@ function Invoke-LocalDualProcessProfile {
     $row | Add-Member -Force -NotePropertyName "controller_discovery_port" -NotePropertyValue $ports.controller
     $row | Add-Member -Force -NotePropertyName "peer_discovery_port" -NotePropertyValue $ports.peer
     $row | Add-Member -Force -NotePropertyName "run_dir" -NotePropertyValue $runDir
-    $row | Add-Member -Force -NotePropertyName "requested_capture_source_id" -NotePropertyValue $(if ($CaptureSourceId.Trim()) { $CaptureSourceId.Trim() } else { $null })
+    $row | Add-Member -Force -NotePropertyName "requested_capture_source_id" -NotePropertyValue $(if ($effectiveCaptureSourceId.Trim()) { $effectiveCaptureSourceId.Trim() } else { $null })
     $row | Add-Member -Force -NotePropertyName "requested_capture_source_kind" -NotePropertyValue $(if ($CaptureSourceKind.Trim()) { $CaptureSourceKind.Trim() } else { $null })
     $row | Add-Member -Force -NotePropertyName "requested_codec" -NotePropertyValue $Codec
+    $row | Add-Member -Force -NotePropertyName "tauri_window_visible" -NotePropertyValue ([bool]$ShowTauriWindow)
     $row | Add-Member -Force -NotePropertyName "requested_codec_profile" -NotePropertyValue $(if ($CodecProfile.Trim()) { $CodecProfile.Trim() } else { $null })
     $row | Add-Member -Force -NotePropertyName "requested_bit_depth" -NotePropertyValue $(if ($BitDepth -gt 0) { $BitDepth } else { $null })
     $row | Add-Member -Force -NotePropertyName "requested_chroma_subsampling" -NotePropertyValue $(if ($ChromaSubsampling.Trim()) { $ChromaSubsampling.Trim() } else { $null })
@@ -597,6 +636,7 @@ foreach ($profile in $profiles) {
     -NoMotionStimulus:$NoMotionStimulus `
     -NoRenderProfileCap:$NoRenderProfileCap `
     -NoBuild:$NoBuild `
+    -ShowTauriWindow:$ShowTauriWindow `
     -KeepTauriOpen:$KeepTauriOpen
 }
 
@@ -611,6 +651,7 @@ $report | Add-Member -Force -NotePropertyName "capture_source_request" -NoteProp
 })
 $report | Add-Member -Force -NotePropertyName "render_display_source_request" -NotePropertyValue $(if ($RenderDisplaySourceId.Trim()) { $RenderDisplaySourceId.Trim() } else { $null })
 $report | Add-Member -Force -NotePropertyName "render_max_fps_override" -NotePropertyValue $(if ($RenderMaxFps -gt 0) { $RenderMaxFps } else { $null })
+$report | Add-Member -Force -NotePropertyName "tauri_window_visible" -NotePropertyValue ([bool]$ShowTauriWindow)
 $report | Add-Member -Force -NotePropertyName "codec_request" -NotePropertyValue ([pscustomobject]@{
   codec = $Codec
   codec_profile = if ($CodecProfile.Trim()) { $CodecProfile.Trim() } else { $null }

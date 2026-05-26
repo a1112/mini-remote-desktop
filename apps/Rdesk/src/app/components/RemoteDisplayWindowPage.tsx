@@ -84,10 +84,12 @@ type TestStatus = "idle" | "starting" | "running" | "stopping" | "completed" | "
 type WebPreviewMode = "idle" | "connecting" | "webrtc" | "webcodecs" | "failed";
 type WebPreviewEngine = "webrtc" | "webcodecs";
 type CaptureSourcePickerMode = "dropdown" | "modal";
+type CaptureSourceDevice = "local" | "remote";
 type LocalTestDurationMode = "30s" | "60s" | "manual";
 type MatrixDimensionKey = "capture" | "encoder" | "resolution" | "fps" | "bitrate";
 type LocalTestSelection = Partial<LocalWebViewProfile> & {
   resolution?: ResolutionKey;
+  captureSource?: CaptureSource;
 };
 
 const METRICS_POLL_MS = 500;
@@ -95,6 +97,10 @@ const WEB_PREVIEW_CONNECT_TIMEOUT_MS = 8_000;
 const WEB_VIEW_MAX_FPS = 144;
 const DIAGNOSTICS_SAMPLE_LIMIT = 60;
 const DIAGNOSTICS_SAMPLE_INTERVAL_MS = 1_500;
+
+function messageFromUnknownError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
 
 type Option<T extends string> = {
   value: T;
@@ -378,7 +384,7 @@ const localTestDurationOptions: Option<LocalTestDurationMode>[] = [
 ];
 
 const matrixDimensionOptions: Option<MatrixDimensionKey>[] = [
-  { value: "capture", label: "CAP" },
+  { value: "capture", label: "捕获源" },
   { value: "encoder", label: "ENC" },
   { value: "resolution", label: "SIZE" },
   { value: "fps", label: "FPS" },
@@ -407,6 +413,44 @@ function captureSourceKindLabel(kind: string) {
     default:
       return kind || "未知";
   }
+}
+
+function isDisplayCaptureSource(source: CaptureSource) {
+  return source.source_kind === "display" || source.source_kind === "display_shared";
+}
+
+function captureSourceAllowedForCapture(source: CaptureSource, capture: CaptureType) {
+  if (capture === "dxgi") return isDisplayCaptureSource(source) || source.source_kind === "window";
+  if (capture === "winrt") return isDisplayCaptureSource(source);
+  if (capture === "synthetic") return false;
+  return isDisplayCaptureSource(source);
+}
+
+function windowHandleFromCaptureSource(source: CaptureSource) {
+  const match = /0x[0-9a-f]+/i.exec(source.id);
+  return match?.[0] ?? source.id;
+}
+
+export function localThreeFrameLatencyStatus(
+  fps: number | null | undefined,
+  latencyP95Ms: number | null | undefined
+) {
+  if (
+    typeof fps !== "number" ||
+    !Number.isFinite(fps) ||
+    fps <= 0 ||
+    typeof latencyP95Ms !== "number" ||
+    !Number.isFinite(latencyP95Ms)
+  ) {
+    return { budgetMs: null, withinBudget: null, label: "等待样本" };
+  }
+  const budgetMs = Math.round((3_000 / fps) * 10) / 10;
+  const withinBudget = latencyP95Ms <= budgetMs;
+  return {
+    budgetMs,
+    withinBudget,
+    label: withinBudget ? "3帧内" : "超过3帧",
+  };
 }
 
 function pickPreferredCaptureSource(sources: CaptureSource[]) {
@@ -1984,6 +2028,13 @@ export function RemoteDisplayWindowPage() {
   const selectedLocalPreviewSourceId = isLocalPipelinePreview
     ? captureSourceSelection?.source.id
     : undefined;
+  const filteredCaptureSources = useMemo(
+    () => captureSources.filter((source) => captureSourceAllowedForCapture(source, capture)),
+    [capture, captureSources]
+  );
+  const selectedCaptureSourceVisible =
+    !captureSourceSelection ||
+    filteredCaptureSources.some((source) => source.id === captureSourceSelection.source.id);
   const hostOs = normalizeOs(capabilities?.os_type);
   const requestedResolution = useMemo(() => resolutionFromSearch(searchParams), [searchParams]);
   const requestedFps = useMemo(() => fpsFromSearch(searchParams), [searchParams]);
@@ -2061,14 +2112,16 @@ export function RemoteDisplayWindowPage() {
     (!capabilities
       ? true
       : nativeRendererType
-        ? capabilities.available_renderers?.includes(nativeRendererType) ?? false
+        ? !isLocalPipelinePreview ||
+          (capabilities.available_renderers?.includes(nativeRendererType) ?? false)
         : false);
   const nativeRendererAvailableForHost =
     isTauriRuntime() &&
     nativeRendererTypeForHost !== null &&
     (!capabilities
       ? true
-      : capabilities.available_renderers?.includes(nativeRendererTypeForHost) ?? false);
+      : !isLocalPipelinePreview ||
+        (capabilities.available_renderers?.includes(nativeRendererTypeForHost) ?? false));
   const d3d12RendererAvailable = false;
   const d3d12UnavailableTitle =
     "D3D12 目前仅接入渲染测试页的独立 probe，尚未接入远程显示主链路。";
@@ -2478,6 +2531,10 @@ export function RemoteDisplayWindowPage() {
     mediaPipelineSnapshot?.active_fps ??
     probeSnapshot?.media_probe_target_fps ??
     Number(fps);
+  const localLatencyTarget = localThreeFrameLatencyStatus(
+    diagnosticsTargetFps,
+    diagnosticsLatencyP95Ms
+  );
   const diagnosticsBrowserPaintLimited =
     Number(fps) >= 100 &&
     typeof webVideoFps === "number" &&
@@ -2742,7 +2799,13 @@ export function RemoteDisplayWindowPage() {
     const selectedFps = selection?.fps ?? fps;
     const selectedBitrate = selection?.bitrate ?? bitrate;
     const selectedResolution = selection?.resolution ?? resolution;
-    const selectedLocalSource = isLocalPipelinePreview ? captureSourceSelection?.source : null;
+    const selectedLocalSourceCandidate = selection?.captureSource ?? captureSourceSelection?.source;
+    const selectedLocalSource =
+      isLocalPipelinePreview &&
+      selectedLocalSourceCandidate &&
+      captureSourceAllowedForCapture(selectedLocalSourceCandidate, selectedCapture)
+        ? selectedLocalSourceCandidate
+        : null;
     const [width, height] = selectedResolution.split("x").map(Number) as [number, number];
     const selectedUsesNativeSharedTexture =
       nativeRendererType === "d3d11" &&
@@ -2760,15 +2823,27 @@ export function RemoteDisplayWindowPage() {
       bitrate: Number(selectedBitrate) * 1_000_000,
       duration_ms: selectedDurationMs,
       warmup_ms: 500,
-      input_source: selectedCapture === "synthetic" ? "synthetic" : "screen",
+      input_source:
+        selectedCapture === "synthetic"
+          ? "synthetic"
+          : selectedLocalSource?.source_kind === "window"
+            ? "window"
+            : "screen",
       output_validation: true,
-      visual_preview: false,
+      visual_preview: true,
       render_display: Boolean(
         isNative && (rendererTargetHwnd || nativeRendererType === "linux")
       ),
       zero_copy: selectedUsesNativeSharedTexture,
       ...(selectedLocalSource
-        ? {
+        ? selectedLocalSource.source_kind === "window"
+          ? {
+              source_id: selectedLocalSource.id,
+              source_kind: selectedLocalSource.source_kind,
+              window_hwnd: windowHandleFromCaptureSource(selectedLocalSource),
+              window_title: selectedLocalSource.title,
+            }
+          : {
             source_id: selectedLocalSource.id,
             source_kind: selectedLocalSource.source_kind,
             display_id: selectedLocalSource.id,
@@ -2809,9 +2884,9 @@ export function RemoteDisplayWindowPage() {
     const dimensionValues: Array<Array<LocalTestSelection>> = matrixDimensions.map((dimension) => {
       switch (dimension) {
         case "capture":
-          return captureTileOptions
-            .filter((option) => !option.disabledReason)
-            .map((option) => ({ capture: option.value }));
+          return filteredCaptureSources.length > 0
+            ? filteredCaptureSources.map((source) => ({ captureSource: source }))
+            : [{}];
         case "encoder":
           return encoderTileOptions
             .filter((option) => !option.disabledReason)
@@ -2846,15 +2921,13 @@ export function RemoteDisplayWindowPage() {
 
     return combinations.slice(0, 36);
   }, [
-    activeEncoderOptions,
     bitrateTileOptions,
-    captureTileOptions,
     encoderTileOptions,
+    filteredCaptureSources,
     fpsTileOptions,
     matrixDimensions,
     matrixModeEnabled,
     resolutionTileOptions,
-    visibleCaptureOptions,
   ]);
   const matrixSelectionCount = matrixModeEnabled ? buildLocalMatrixSelections().length : 1;
   const isTestBusy =
@@ -3299,6 +3372,13 @@ export function RemoteDisplayWindowPage() {
 
     let cancelled = false;
     const poll = async () => {
+      const failPoll = (message: string) => {
+        setTestStatus("failed");
+        setCurrentRunId(null);
+        setTestMessage(message);
+        setLastError(message);
+      };
+
       const metricsResult = await testHarnessGetMetrics();
       if (cancelled) return;
 
@@ -3308,11 +3388,22 @@ export function RemoteDisplayWindowPage() {
           setTestMessage(metricsResult.value.error_message);
           setLastError(metricsResult.value.error_message);
         }
+      } else if (!currentRunId) {
+        failPoll(metricsResult.error.message);
+        return;
       }
 
       if (!currentRunId) return;
       const runResult = await testGetRun(currentRunId);
-      if (cancelled || !runResult.ok || !runResult.value) return;
+      if (cancelled) return;
+      if (!runResult.ok) {
+        failPoll(runResult.error.message);
+        return;
+      }
+      if (!runResult.value) {
+        failPoll(`测试运行状态丢失: ${currentRunId}`);
+        return;
+      }
 
       if (runResult.value.status !== "running") {
         setTestStatus(runResult.value.status === "completed" ? "completed" : "failed");
@@ -3327,9 +3418,23 @@ export function RemoteDisplayWindowPage() {
       }
     };
 
-    void poll();
+    void poll().catch((error) => {
+      if (cancelled) return;
+      const message = messageFromUnknownError(error);
+      setTestStatus("failed");
+      setCurrentRunId(null);
+      setTestMessage(message);
+      setLastError(message);
+    });
     const interval = window.setInterval(() => {
-      void poll();
+      void poll().catch((error) => {
+        if (cancelled) return;
+        const message = messageFromUnknownError(error);
+        setTestStatus("failed");
+        setCurrentRunId(null);
+        setTestMessage(message);
+        setLastError(message);
+      });
     }, METRICS_POLL_MS);
 
     return () => {
@@ -4332,7 +4437,7 @@ export function RemoteDisplayWindowPage() {
     const selection = await selectRemoteCaptureSource(sessionId, preferredSource.id);
     setCaptureSourceSelection(selection);
     setTestMessage(
-      `默认远端捕获源: ${captureSourceKindLabel(selection.source.source_kind)} / ${selection.source.title}`
+      `默认捕获源（远端设备）: ${captureSourceKindLabel(selection.source.source_kind)} / ${selection.source.title}`
     );
     return selection;
   }, [captureSourceSelection, captureSources, isLocalPipelinePreview, sessionId]);
@@ -4448,7 +4553,7 @@ export function RemoteDisplayWindowPage() {
     if (sources.length === 0) return;
 
     try {
-      const previewLimit = Math.min(sources.length, 8);
+      const previewLimit = Math.min(sources.length, 24);
       const previewSources = isLocalPipelinePreview
         ? await listLocalCaptureSources(true, previewLimit)
         : await listRemoteCaptureSources(sessionId, true, previewLimit);
@@ -4473,18 +4578,26 @@ export function RemoteDisplayWindowPage() {
   const handleRefreshCaptureSources = useCallback(async () => {
     setCaptureSourcesLoading(true);
     setLastError(null);
-    setTestMessage(isLocalPipelinePreview ? "正在枚举本机捕获源" : "正在枚举远端捕获源");
+    setTestMessage(
+      isLocalPipelinePreview ? "正在枚举捕获源（本机）" : "正在枚举捕获源（远端设备）"
+    );
     try {
       const sources = isLocalPipelinePreview
         ? await listLocalCaptureSources(false, 24)
         : await listRemoteCaptureSources(sessionId, false, 24);
       const nextSources = Array.isArray(sources) ? sources : [];
       setCaptureSources(nextSources);
-      void hydrateCaptureSourcePreviews(nextSources);
+      void hydrateCaptureSourcePreviews(
+        nextSources.filter((source) => captureSourceAllowedForCapture(source, capture))
+      );
       setTestMessage(
         nextSources.length > 0
-          ? `已获取 ${nextSources.length} 个${isLocalPipelinePreview ? "本机" : "远端"}捕获源`
-          : `未发现可捕获的${isLocalPipelinePreview ? "本机" : "远端"}窗口/屏幕`
+          ? `已获取 ${nextSources.length} 个捕获源（${
+              isLocalPipelinePreview ? "本机" : "远端设备"
+            }）`
+          : `未发现可捕获的窗口/屏幕（${
+              isLocalPipelinePreview ? "本机" : "远端设备"
+            }）`
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -4494,7 +4607,7 @@ export function RemoteDisplayWindowPage() {
     } finally {
       setCaptureSourcesLoading(false);
     }
-  }, [hydrateCaptureSourcePreviews, isLocalPipelinePreview, sessionId]);
+  }, [capture, hydrateCaptureSourcePreviews, isLocalPipelinePreview, sessionId]);
 
   const handleSelectCaptureSource = useCallback(
     async (source: CaptureSource) => {
@@ -4503,19 +4616,19 @@ export function RemoteDisplayWindowPage() {
         const selection = localCaptureSourceSelection(sessionId, source);
         setCaptureSourceSelection(selection);
         setTestMessage(
-          `本机捕获源已切换: ${captureSourceKindLabel(source.source_kind)} / ${source.title}`
+          `捕获源已切换（本机）: ${captureSourceKindLabel(source.source_kind)} / ${source.title}`
         );
         return;
       }
 
       setTestMessage(
-        `正在切换远端捕获源: ${captureSourceKindLabel(source.source_kind)} / ${source.title}`
+        `正在切换捕获源（远端设备）: ${captureSourceKindLabel(source.source_kind)} / ${source.title}`
       );
       try {
         const selection = await selectRemoteCaptureSource(sessionId, source.id);
         setCaptureSourceSelection(selection);
         setTestMessage(
-          `远端捕获源已切换: ${captureSourceKindLabel(selection.source.source_kind)} / ${selection.source.title}`
+          `捕获源已切换（远端设备）: ${captureSourceKindLabel(selection.source.source_kind)} / ${selection.source.title}`
         );
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -4525,6 +4638,28 @@ export function RemoteDisplayWindowPage() {
     },
     [isLocalPipelinePreview, sessionId]
   );
+
+  useEffect(() => {
+    if (
+      captureSourceSelection &&
+      !captureSourceAllowedForCapture(captureSourceSelection.source, capture)
+    ) {
+      setCaptureSourceSelection(null);
+    }
+  }, [capture, captureSourceSelection]);
+
+  useEffect(() => {
+    if (!captureSourcePickerOpen || filteredCaptureSources.length === 0) return;
+    const missingPreviewSources = filteredCaptureSources.filter(
+      (source) => !source.preview_data_url
+    );
+    if (missingPreviewSources.length === 0) return;
+    void hydrateCaptureSourcePreviews(filteredCaptureSources);
+  }, [
+    captureSourcePickerOpen,
+    filteredCaptureSources,
+    hydrateCaptureSourcePreviews,
+  ]);
 
   useEffect(() => {
     if (
@@ -4556,12 +4691,12 @@ export function RemoteDisplayWindowPage() {
 
         setCaptureSourceSelection(selection);
         setTestMessage(
-          `默认远端捕获源: ${captureSourceKindLabel(selection.source.source_kind)} / ${selection.source.title}`
+          `默认捕获源（远端设备）: ${captureSourceKindLabel(selection.source.source_kind)} / ${selection.source.title}`
         );
       } catch (error) {
         if (cancelled) return;
         const message = error instanceof Error ? error.message : String(error);
-        setTestMessage(`远端默认捕获源选择失败: ${message}`);
+        setTestMessage(`默认捕获源选择失败（远端设备）: ${message}`);
       }
     })();
 
@@ -4751,126 +4886,137 @@ export function RemoteDisplayWindowPage() {
       return;
     }
 
-    await testHarnessStop();
-
-    let configForRun = testConfig;
-    let rendererTargetHwndForRun: string | null = null;
-    let baseWebSelection: LocalTestSelection | undefined;
-    if (!isNative && localWebViewPlan.profile) {
-      if (localWebViewPlan.changed) {
-        setCapture(localWebViewPlan.profile.capture);
-        setEncoder(localWebViewPlan.profile.encoder);
-        setDecoder(localWebViewPlan.profile.decoder);
-        setTransport(localWebViewPlan.profile.transport);
-        setFps(localWebViewPlan.profile.fps);
-        setBitrate(localWebViewPlan.profile.bitrate);
-        if (localWebViewPlan.message) setTestMessage(localWebViewPlan.message);
-      }
-      baseWebSelection = localWebViewPlan.profile;
-      configForRun = buildTestConfig(null, baseWebSelection);
-    }
-
-    if (isNative && requiresEmbeddedNativeSurface) {
-      const snapshot = await syncNativeSurface({ visible: true });
-      const rendererTargetHwnd = snapshot?.hwnd ?? nativeSurface?.hwnd;
-      if (!rendererTargetHwnd) {
-        const message = `${nativeRenderLabel} render surface is not attached`;
-        setTestStatus("failed");
-        setTestMessage(message);
-        setLastError(message);
-        return;
-      }
-      const probe = await presentTestHarnessFrameOnNativeSurface();
-      if (!probe.ok || !probe.value) {
-        const message = probe.ok
-          ? `${nativeRenderLabel} render probe did not present a frame`
-          : probe.error.message;
-        setTestStatus("failed");
-        setTestMessage(message);
-        setLastError(message);
-        return;
-      }
-      rendererTargetHwndForRun = rendererTargetHwnd;
-      configForRun = buildTestConfig(rendererTargetHwndForRun);
-    } else if (isNative) {
-      configForRun = buildTestConfig(null);
-    }
-
-    if (matrixModeEnabled) {
-      const selections = buildLocalMatrixSelections();
-      setMatrixRunProgress({ current: 0, total: selections.length, label: "准备矩阵" });
-      let completed = 0;
-      let failed = 0;
-      let lastRun: TestRun | null = null;
-
-      for (let index = 0; index < selections.length; index += 1) {
-        if (matrixStopRequestedRef.current) break;
-        const selection = {
-          ...(baseWebSelection ?? {}),
-          ...selections[index],
-        };
-        const label = [
-          selection.capture ?? capture,
-          selection.encoder ?? encoder,
-          selection.resolution ?? resolution,
-          `${selection.fps ?? fps} FPS`,
-          `${selection.bitrate ?? bitrate} Mbps`,
-        ].join(" / ");
-        setMatrixRunProgress({ current: index + 1, total: selections.length, label });
-        setTestMessage(`矩阵 ${index + 1}/${selections.length}: ${label}`);
-        await testHarnessStop();
-        const runResult = await testStartRun({
-          scenarioId: "custom",
-          config: buildTestConfig(rendererTargetHwndForRun, selection),
-        });
-        if (!runResult.ok) {
-          failed += 1;
-          setLastError(runResult.error.message);
-          continue;
-        }
-        setCurrentRunId(runResult.value);
-        const run = await waitForLocalRunFinished(
-          runResult.value,
-          (selectedDurationMs || 30_000) + 8_000
-        );
-        if (run) {
-          lastRun = run;
-          if (run.status === "completed") completed += 1;
-          else failed += 1;
-        } else if (!matrixStopRequestedRef.current) {
-          failed += 1;
-        }
-      }
-
+    try {
       await testHarnessStop();
+
+      let configForRun = testConfig;
+      let rendererTargetHwndForRun: string | null = null;
+      let baseWebSelection: LocalTestSelection | undefined;
+      if (!isNative && localWebViewPlan.profile) {
+        if (localWebViewPlan.changed) {
+          setCapture(localWebViewPlan.profile.capture);
+          setEncoder(localWebViewPlan.profile.encoder);
+          setDecoder(localWebViewPlan.profile.decoder);
+          setTransport(localWebViewPlan.profile.transport);
+          setFps(localWebViewPlan.profile.fps);
+          setBitrate(localWebViewPlan.profile.bitrate);
+          if (localWebViewPlan.message) setTestMessage(localWebViewPlan.message);
+        }
+        baseWebSelection = localWebViewPlan.profile;
+        configForRun = buildTestConfig(null, baseWebSelection);
+      }
+
+      if (isNative && requiresEmbeddedNativeSurface) {
+        const snapshot = await syncNativeSurface({ visible: true });
+        const rendererTargetHwnd = snapshot?.hwnd ?? nativeSurface?.hwnd;
+        if (!rendererTargetHwnd) {
+          const message = `${nativeRenderLabel} render surface is not attached`;
+          setTestStatus("failed");
+          setTestMessage(message);
+          setLastError(message);
+          return;
+        }
+        const probe = await presentTestHarnessFrameOnNativeSurface();
+        if (!probe.ok || !probe.value) {
+          const message = probe.ok
+            ? `${nativeRenderLabel} render probe did not present a frame`
+            : probe.error.message;
+          setTestStatus("failed");
+          setTestMessage(message);
+          setLastError(message);
+          return;
+        }
+        rendererTargetHwndForRun = rendererTargetHwnd;
+        configForRun = buildTestConfig(rendererTargetHwndForRun);
+      } else if (isNative) {
+        configForRun = buildTestConfig(null);
+      }
+
+      if (matrixModeEnabled) {
+        const selections = buildLocalMatrixSelections();
+        setMatrixRunProgress({ current: 0, total: selections.length, label: "准备矩阵" });
+        let completed = 0;
+        let failed = 0;
+        let lastRun: TestRun | null = null;
+
+        for (let index = 0; index < selections.length; index += 1) {
+          if (matrixStopRequestedRef.current) break;
+          const selection = {
+            ...(baseWebSelection ?? {}),
+            ...selections[index],
+          };
+          const label = [
+            selection.captureSource
+              ? `源:${selection.captureSource.title}`
+              : selection.capture ?? capture,
+            selection.encoder ?? encoder,
+            selection.resolution ?? resolution,
+            `${selection.fps ?? fps} FPS`,
+            `${selection.bitrate ?? bitrate} Mbps`,
+          ].join(" / ");
+          setMatrixRunProgress({ current: index + 1, total: selections.length, label });
+          setTestMessage(`矩阵 ${index + 1}/${selections.length}: ${label}`);
+          await testHarnessStop();
+          const runResult = await testStartRun({
+            scenarioId: "custom",
+            config: buildTestConfig(rendererTargetHwndForRun, selection),
+          });
+          if (!runResult.ok) {
+            failed += 1;
+            setLastError(runResult.error.message);
+            continue;
+          }
+          setCurrentRunId(runResult.value);
+          const run = await waitForLocalRunFinished(
+            runResult.value,
+            (selectedDurationMs || 30_000) + 8_000
+          );
+          if (run) {
+            lastRun = run;
+            if (run.status === "completed") completed += 1;
+            else failed += 1;
+          } else if (!matrixStopRequestedRef.current) {
+            failed += 1;
+          }
+        }
+
+        await testHarnessStop();
+        setCurrentRunId(null);
+        setLastCompletedRun(lastRun);
+        const stopped = matrixStopRequestedRef.current;
+        setTestStatus(stopped ? "completed" : failed > 0 ? "failed" : "completed");
+        setTestMessage(
+          stopped
+            ? `矩阵已手动停止: ${completed}/${selections.length} 完成`
+            : `矩阵完成: ${completed}/${selections.length} 完成, ${failed} 失败`
+        );
+        setMatrixRunProgress(null);
+        return;
+      }
+
+      const result = await testStartRun({
+        scenarioId: "custom",
+        config: configForRun,
+      });
+
+      if (result.ok) {
+        setCurrentRunId(result.value);
+        setTestStatus("running");
+        setTestMessage("测试运行中");
+        return;
+      }
+
+      setTestStatus("failed");
+      setTestMessage(result.error.message);
+      setLastError(result.error.message);
+    } catch (error) {
+      const message = `测试启动失败: ${messageFromUnknownError(error)}`;
+      setTestStatus("failed");
       setCurrentRunId(null);
-      setLastCompletedRun(lastRun);
-      const stopped = matrixStopRequestedRef.current;
-      setTestStatus(stopped ? "completed" : failed > 0 ? "failed" : "completed");
-      setTestMessage(
-        stopped
-          ? `矩阵已手动停止: ${completed}/${selections.length} 完成`
-          : `矩阵完成: ${completed}/${selections.length} 完成, ${failed} 失败`
-      );
       setMatrixRunProgress(null);
-      return;
+      setTestMessage(message);
+      setLastError(message);
     }
-
-    const result = await testStartRun({
-      scenarioId: "custom",
-      config: configForRun,
-    });
-
-    if (result.ok) {
-      setCurrentRunId(result.value);
-      setTestStatus("running");
-      setTestMessage("测试运行中");
-      return;
-    }
-
-    setTestStatus("failed");
-    setTestMessage(result.error.message);
-    setLastError(result.error.message);
   };
 
   useEffect(() => {
@@ -5114,16 +5260,24 @@ export function RemoteDisplayWindowPage() {
     !isTestBusy &&
     ["completed", "failed", "cancelled"].includes(lastCompletedRun.status);
   const primaryActionBlocked = Boolean(!isTestBusy && localStartBlockReason);
-  const captureSourceScopeLabel = isLocalPipelinePreview ? "本机捕获源" : "远端捕获源";
+  const captureSourceDevice: CaptureSourceDevice = isLocalPipelinePreview ? "local" : "remote";
+  const captureSourceDeviceLabel = isLocalPipelinePreview ? "本机" : "远端设备";
+  const captureSourceScopeLabel = "捕获源";
   const captureSourceDescription = isLocalPipelinePreview
-    ? "默认优先本机全屏 shared copy，可切换到当前连接的其他显示器。"
-    : "默认优先全屏 shared copy，可切换全屏 copy 或单窗口源。";
-  const captureSourceEmptyMessage = isLocalPipelinePreview
-    ? "暂无捕获源。点击刷新从本机服务获取当前显示器列表。"
-    : "暂无捕获源。点击刷新从远端设备获取当前全屏/窗口列表。";
+    ? "从本机服务选择显示器或窗口；DXGI 可选显示器和窗口，WinRT/复制仅显示显示器。"
+    : "从被控设备选择显示器或窗口；默认优先全屏 shared copy，DXGI 可切换单窗口源。";
+  const captureSourceEmptyMessage = `暂无符合当前采集方式的捕获源。点击刷新从${captureSourceDeviceLabel}获取当前显示器/窗口列表。`;
+  const renderSelectedCaptureSourceSummary = () =>
+    selectedCaptureSourceVisible && captureSourceSelection ? (
+      <div className="mt-2 rounded-lg border border-white/10 bg-black/20 px-3 py-2 text-[11px] text-slate-400">
+        当前选择: {captureSourceKindLabel(captureSourceSelection.source.source_kind)} /{" "}
+        {captureSourceSelection.source.title} / {captureSourceSelection.source.width}x
+        {captureSourceSelection.source.height}
+      </div>
+    ) : null;
   const renderCaptureSourceCards = (closeAfterSelect = false) => (
     <div className="grid max-h-80 gap-3 overflow-y-auto pr-1 sm:grid-cols-2 lg:grid-cols-3">
-      {captureSources.map((source) => {
+      {filteredCaptureSources.map((source) => {
         const selected = captureSourceSelection?.source.id === source.id;
         return (
           <button
@@ -5150,7 +5304,7 @@ export function RemoteDisplayWindowPage() {
                 />
               ) : (
                 <div className="flex h-full w-full items-center justify-center text-[10px] text-slate-600">
-                  无预览
+                  {captureSourcesLoading ? "正在生成预览" : "预览不可用"}
                 </div>
               )}
             </div>
@@ -5314,6 +5468,15 @@ export function RemoteDisplayWindowPage() {
                       <div className="mt-1 text-lg font-semibold text-white">
                         {formatMs(diagnosticsLatencyP95Ms)}
                       </div>
+                      {isLocalPipelinePreview && (
+                        <div className={`mt-0.5 text-[10px] ${
+                          localLatencyTarget.withinBudget === false
+                            ? "text-amber-200"
+                            : "text-emerald-200/55"
+                        }`}>
+                          3帧目标 {formatMs(localLatencyTarget.budgetMs)} / {localLatencyTarget.label}
+                        </div>
+                      )}
                     </div>
                     <div className="rounded-md border border-emerald-400/10 bg-emerald-500/10 p-2">
                       <div className="text-emerald-200/65">码率 / 队列</div>
@@ -5355,7 +5518,9 @@ export function RemoteDisplayWindowPage() {
                         title={diagnosticsLatencyLabel}
                         value={formatMs(diagnosticsLatencyP95Ms)}
                         subtitle={
-                          webPresentationLatencyStats
+                          isLocalPipelinePreview
+                            ? `3帧目标 ${formatMs(localLatencyTarget.budgetMs)} / ${localLatencyTarget.label}`
+                            : webPresentationLatencyStats
                             ? `p50 ${formatMs(webPresentationLatencyStats.p50Ms)} / 最新 ${formatMs(
                                 webPresentationLatencyStats.latestMs
                               )}`
@@ -5774,7 +5939,7 @@ export function RemoteDisplayWindowPage() {
 
               <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
                 <TileOptionGroup
-                  label="CAP"
+                  label="采集方式"
                   value={capture}
                   options={captureTileOptions}
                   onChange={setCapture}
@@ -5910,6 +6075,22 @@ export function RemoteDisplayWindowPage() {
                   </div>
                 </div>
                 <div className="flex flex-wrap items-center justify-end gap-2">
+                  <label className="block">
+                    <span className="sr-only">被捕获设备</span>
+                    <select
+                      aria-label="被捕获设备"
+                      value={captureSourceDevice}
+                      disabled
+                      className="rounded-md border border-white/10 bg-black/25 px-2 py-1.5 text-[11px] text-slate-300 disabled:opacity-80"
+                    >
+                      <option value="local" className="bg-[#111827] text-slate-100">
+                        本机
+                      </option>
+                      <option value="remote" className="bg-[#111827] text-slate-100">
+                        远端设备
+                      </option>
+                    </select>
+                  </label>
                   <TitleSelect
                     label="PICK"
                     value={captureSourcePickerMode}
@@ -5924,52 +6105,58 @@ export function RemoteDisplayWindowPage() {
                     {captureSourcesLoading && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
                     刷新捕获源
                   </button>
-                  {captureSourcePickerMode === "modal" && (
+                  {(
                     <button
                       className="rounded-md border border-white/15 px-3 py-1.5 text-[11px] font-medium text-slate-200 hover:bg-white/10"
                       onClick={() => setCaptureSourcePickerOpen(true)}
                     >
-                      打开捕获源弹窗
+                      选择捕获源
                     </button>
                   )}
                 </div>
               </div>
 
-              {captureSources.length === 0 ? (
+              {captureSources.length === 0 || filteredCaptureSources.length === 0 ? (
                 <div className="rounded-lg border border-white/10 bg-black/20 px-3 py-4 text-center text-[11px] text-slate-500">
                   {captureSourceEmptyMessage}
                 </div>
               ) : captureSourcePickerMode === "dropdown" ? (
-                <label className="block">
-                  <span className="sr-only">{captureSourceScopeLabel}下拉</span>
-                  <select
-                    aria-label={`${captureSourceScopeLabel}下拉`}
-                    className="w-full rounded-lg border border-white/10 bg-black/25 px-3 py-2 text-xs text-slate-100 outline-none"
-                    value={captureSourceSelection?.source.id ?? ""}
-                    onChange={(event) => {
-                      const source = captureSources.find(
-                        (candidate) => candidate.id === event.target.value
-                      );
-                      if (source) void handleSelectCaptureSource(source);
-                    }}
-                  >
-                    <option value="" className="bg-[#111827] text-slate-100">
-                      选择{captureSourceScopeLabel}
-                    </option>
-                    {captureSources.map((source) => (
-                      <option
-                        key={source.id}
-                        value={source.id}
-                        className="bg-[#111827] text-slate-100"
-                      >
-                        {captureSourceKindLabel(source.source_kind)} / {source.title} /{" "}
-                        {source.width}x{source.height}
+                <>
+                  <label className="block">
+                    <span className="sr-only">{captureSourceScopeLabel}下拉</span>
+                    <select
+                      aria-label={`${captureSourceScopeLabel}下拉`}
+                      className="w-full rounded-lg border border-white/10 bg-black/25 px-3 py-2 text-xs text-slate-100 outline-none"
+                      value={selectedCaptureSourceVisible ? captureSourceSelection?.source.id ?? "" : ""}
+                      onChange={(event) => {
+                        const source = filteredCaptureSources.find(
+                          (candidate) => candidate.id === event.target.value
+                        );
+                        if (source) void handleSelectCaptureSource(source);
+                      }}
+                    >
+                      <option value="" className="bg-[#111827] text-slate-100">
+                        选择{captureSourceScopeLabel}
                       </option>
-                    ))}
-                  </select>
-                </label>
+                      {filteredCaptureSources.map((source) => (
+                        <option
+                          key={source.id}
+                          value={source.id}
+                          className="bg-[#111827] text-slate-100"
+                        >
+                          {captureSourceKindLabel(source.source_kind)} / {source.title} /{" "}
+                          {source.width}x{source.height}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  {renderSelectedCaptureSourceSummary()}
+                </>
               ) : (
-                renderCaptureSourceCards()
+                <>
+                  {renderCaptureSourceCards()}
+                  {renderSelectedCaptureSourceSummary()}
+                </>
               )}
             </div>
 
@@ -6062,7 +6249,11 @@ export function RemoteDisplayWindowPage() {
           style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}
           data-no-drag="true"
         >
-          <div className="flex max-h-[calc(100vh-3rem)] w-full max-w-5xl flex-col rounded-lg border border-white/10 bg-[#0f1724] shadow-2xl">
+          <div
+            role="dialog"
+            aria-label={`${captureSourceScopeLabel}选择`}
+            className="flex max-h-[calc(100vh-3rem)] w-full max-w-5xl flex-col rounded-lg border border-white/10 bg-[#0f1724] shadow-2xl"
+          >
             <div className="flex items-center justify-between border-b border-white/10 px-4 py-3">
               <div>
                 <div className="text-sm font-semibold text-slate-100">
@@ -6091,7 +6282,17 @@ export function RemoteDisplayWindowPage() {
               </div>
             </div>
             <div className="min-h-0 overflow-y-auto px-4 py-4">
-              {captureSources.length === 0 ? (
+              <div className="mb-4">
+                <TileOptionGroup
+                  label="采集方式"
+                  value={capture}
+                  options={captureTileOptions}
+                  onChange={setCapture}
+                  disabled={localRenderSwitchLocked}
+                  title={configChangeLockedTitle ?? "切换捕获方式以过滤可选源"}
+                />
+              </div>
+              {captureSources.length === 0 || filteredCaptureSources.length === 0 ? (
                 <div className="rounded-lg border border-white/10 bg-black/20 px-3 py-8 text-center text-[11px] text-slate-500">
                   {captureSourceEmptyMessage}
                 </div>
@@ -6257,7 +6458,9 @@ export function RemoteDisplayWindowPage() {
                   {formatSummaryMs(reportLatencyP50)} / {formatSummaryMs(reportLatencyP95)}
                 </div>
                 <div className="text-[10px] text-emerald-200/55">
-                  感知延迟中位 / 尾延迟
+                  {isLocalPipelinePreview
+                    ? `3帧目标 ${formatSummaryMs(localLatencyTarget.budgetMs)} / ${localLatencyTarget.label}`
+                    : "感知延迟中位 / 尾延迟"}
                 </div>
               </div>
               <div className="rounded-lg border border-white/10 bg-white/8 p-3">
