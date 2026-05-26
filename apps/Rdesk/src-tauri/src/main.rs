@@ -847,14 +847,16 @@ async fn configure_remote_display_native_surface(
 ) -> Result<NativeRenderSurfaceSnapshot, String> {
     let label = window.label().to_string();
     let app_handle = window.app_handle().clone();
-    let snapshot = {
-        state.remote_display_surfaces.lock().unwrap().configure(
-            &window,
-            rect,
-            enabled,
-            visible.unwrap_or(enabled),
-        )?
-    };
+    eprintln!(
+        "render-surface ui configure request label={label} enabled={enabled} visible={visible:?}"
+    );
+    let snapshot = configure_native_surface_for_window(
+        &window,
+        state.inner().clone(),
+        rect,
+        enabled,
+        visible.unwrap_or(enabled),
+    )?;
     drop(window);
 
     let (context, service_action) = {
@@ -871,18 +873,40 @@ async fn configure_remote_display_native_surface(
         (context, service_action)
     };
 
+    let service_action_label = match service_action.as_ref() {
+        Some(NativeSurfaceServiceAction::Attach) => "attach",
+        Some(NativeSurfaceServiceAction::Detach) => "detach",
+        Some(NativeSurfaceServiceAction::Unchanged) => "unchanged",
+        None => "none",
+    };
+    eprintln!(
+        "render-surface ui configured label={label} enabled={enabled} attached={} backend={} hwnd={:?} context_session={} context_surface={} service_action={}",
+        snapshot.attached,
+        snapshot.backend,
+        snapshot.hwnd,
+        context
+            .as_ref()
+            .map(|context| context.session_id.as_str())
+            .unwrap_or("-"),
+        context
+            .as_ref()
+            .map(|context| context.surface_id.as_str())
+            .unwrap_or("-"),
+        service_action_label
+    );
+
     if snapshot.attached && context.is_none() {
-        let _ = state
-            .remote_display_surfaces
-            .lock()
-            .unwrap()
-            .detach(&label, None);
+        let _ = detach_native_surface_for_label(&app_handle, state.inner().clone(), label.clone());
         return Err("remote display window context is not registered".to_string());
     }
 
     if let Some(context) = context.clone() {
         let result = match service_action.unwrap_or(NativeSurfaceServiceAction::Unchanged) {
             NativeSurfaceServiceAction::Attach => {
+                eprintln!(
+                    "render-surface ui ipc attach session_id={} surface_id={} backend={} hwnd={:?}",
+                    context.session_id, context.surface_id, snapshot.backend, snapshot.hwnd
+                );
                 send_attach_render_surface(
                     context.session_id.clone(),
                     context.surface_id.clone(),
@@ -892,6 +916,10 @@ async fn configure_remote_display_native_surface(
                 .await
             }
             NativeSurfaceServiceAction::Detach => {
+                eprintln!(
+                    "render-surface ui ipc detach session_id={} surface_id={}",
+                    context.session_id, context.surface_id
+                );
                 send_detach_render_surface(context.session_id.clone(), context.surface_id.clone())
                     .await
             }
@@ -899,12 +927,16 @@ async fn configure_remote_display_native_surface(
         };
 
         if let Err(error) = result {
+            eprintln!(
+                "render-surface ui ipc failed label={label} session_id={} surface_id={} error={error}",
+                context.session_id, context.surface_id
+            );
             if snapshot.attached {
-                let _ = state
-                    .remote_display_surfaces
-                    .lock()
-                    .unwrap()
-                    .detach(&label, None);
+                let _ = detach_native_surface_for_label(
+                    &app_handle,
+                    state.inner().clone(),
+                    label.clone(),
+                );
                 if let Ok(context) = state
                     .render_window_registry
                     .lock()
@@ -917,6 +949,10 @@ async fn configure_remote_display_native_surface(
             }
             tracing::warn!(%error, "failed to notify mrd-service about detached native render surface");
         } else if !matches!(service_action, Some(NativeSurfaceServiceAction::Unchanged)) {
+            eprintln!(
+                "render-surface ui ipc ok label={label} session_id={} surface_id={} action={service_action_label}",
+                context.session_id, context.surface_id
+            );
             state
                 .render_window_registry
                 .lock()
@@ -946,6 +982,86 @@ async fn configure_remote_display_native_surface(
     }
 
     Ok(snapshot)
+}
+
+#[cfg(windows)]
+fn configure_native_surface_for_window(
+    window: &WebviewWindow,
+    state: AppState,
+    rect: NativeSurfaceRect,
+    enabled: bool,
+    visible: bool,
+) -> Result<NativeRenderSurfaceSnapshot, String> {
+    let scheduler_window = window.clone();
+    let surface_window = window.clone();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    scheduler_window
+        .run_on_main_thread(move || {
+            let result = state.remote_display_surfaces.lock().unwrap().configure(
+                &surface_window,
+                rect,
+                enabled,
+                visible,
+            );
+            let _ = sender.send(result);
+        })
+        .map_err(|error| format!("schedule native surface update failed: {error}"))?;
+
+    receiver
+        .recv()
+        .map_err(|error| format!("native surface update failed: {error}"))?
+}
+
+#[cfg(not(windows))]
+fn configure_native_surface_for_window(
+    window: &WebviewWindow,
+    state: AppState,
+    rect: NativeSurfaceRect,
+    enabled: bool,
+    visible: bool,
+) -> Result<NativeRenderSurfaceSnapshot, String> {
+    state
+        .remote_display_surfaces
+        .lock()
+        .unwrap()
+        .configure(window, rect, enabled, visible)
+}
+
+#[cfg(windows)]
+fn detach_native_surface_for_label(
+    app_handle: &AppHandle,
+    state: AppState,
+    label: String,
+) -> Result<bool, String> {
+    let app_handle = app_handle.clone();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    app_handle
+        .run_on_main_thread(move || {
+            let result = state
+                .remote_display_surfaces
+                .lock()
+                .unwrap()
+                .detach(&label, None);
+            let _ = sender.send(result);
+        })
+        .map_err(|error| format!("schedule native surface detach failed: {error}"))?;
+
+    receiver
+        .recv()
+        .map_err(|error| format!("native surface detach failed: {error}"))?
+}
+
+#[cfg(not(windows))]
+fn detach_native_surface_for_label(
+    _app_handle: &AppHandle,
+    state: AppState,
+    label: String,
+) -> Result<bool, String> {
+    state
+        .remote_display_surfaces
+        .lock()
+        .unwrap()
+        .detach(&label, None)
 }
 
 fn render_mode_for_native_surface(snapshot: &NativeRenderSurfaceSnapshot) -> &'static str {
@@ -2223,23 +2339,31 @@ async fn set_decode_policy_with(
 // ============================================================================
 
 #[tauri::command]
-fn test_harness_start(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    state
-        .test_harness
-        .lock()
-        .unwrap()
-        .start_replacing_existing()
-        .map_err(|e| e.to_string())
+async fn test_harness_start(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let test_harness = state.test_harness.clone();
+    tokio::task::spawn_blocking(move || {
+        test_harness
+            .lock()
+            .unwrap()
+            .start_replacing_existing()
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-fn test_harness_stop(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    state
-        .test_harness
-        .lock()
-        .unwrap()
-        .stop()
-        .map_err(|e| e.to_string())
+async fn test_harness_stop(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let test_harness = state.test_harness.clone();
+    tokio::task::spawn_blocking(move || {
+        test_harness
+            .lock()
+            .unwrap()
+            .stop()
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -2326,19 +2450,28 @@ fn test_harness_get_chain(state: tauri::State<'_, AppState>) -> String {
 }
 
 #[tauri::command]
-fn test_harness_get_metrics(state: tauri::State<'_, AppState>) -> test_harness::HarnessMetrics {
-    state.test_harness.lock().unwrap().get_metrics()
+async fn test_harness_get_metrics(
+    state: tauri::State<'_, AppState>,
+) -> Result<test_harness::HarnessMetrics, String> {
+    let test_harness = state.test_harness.clone();
+    tokio::task::spawn_blocking(move || Ok(test_harness.lock().unwrap().get_metrics()))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-fn test_harness_get_comparison_result(
+async fn test_harness_get_comparison_result(
     state: tauri::State<'_, AppState>,
-) -> mrd_observability::PipelineComparisonResult {
-    state
-        .test_harness
-        .lock()
-        .unwrap()
-        .get_pipeline_comparison_result()
+) -> Result<mrd_observability::PipelineComparisonResult, String> {
+    let test_harness = state.test_harness.clone();
+    tokio::task::spawn_blocking(move || {
+        Ok(test_harness
+            .lock()
+            .unwrap()
+            .get_pipeline_comparison_result())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 type HarnessFramePayload = Option<(String, usize, usize, u64)>;

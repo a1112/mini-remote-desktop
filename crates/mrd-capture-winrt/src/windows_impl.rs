@@ -73,6 +73,7 @@ pub struct WinrtCapture {
     closed: Arc<AtomicBool>,
     output_memory_kind: FrameMemoryKind,
     shared_texture: Option<SharedBgraTexture>,
+    last_frame: Option<CapturedFrame>,
     source_width: usize,
     source_height: usize,
     width: usize,
@@ -231,6 +232,7 @@ impl WinrtCapture {
             closed: Arc::new(AtomicBool::new(false)),
             output_memory_kind: FrameMemoryKind::Cpu,
             shared_texture: None,
+            last_frame: None,
             source_width: width,
             source_height: height,
             width,
@@ -503,6 +505,7 @@ impl WinrtCapture {
         self.frame_event_rx = None;
         self.direct3d_device = None;
         self.shared_texture = None;
+        self.last_frame = None;
         Ok(())
     }
 
@@ -510,7 +513,9 @@ impl WinrtCapture {
     pub fn try_get_frame(&mut self) -> Option<CapturedFrame> {
         let frame_pool = self.frame_pool.clone()?;
         let frame = frame_pool.TryGetNextFrame().ok()?;
-        self.frame_to_captured_frame(&frame).ok()
+        let frame = self.frame_to_captured_frame(&frame).ok()?;
+        self.last_frame = Some(frame.clone());
+        Some(frame)
     }
 
     /// Capture a frame (synchronous approximation)
@@ -537,8 +542,16 @@ impl WinrtCapture {
             }
 
             match frame_pool.TryGetNextFrame() {
-                Ok(frame) => return self.frame_to_captured_frame(&frame),
+                Ok(frame) => {
+                    let frame = self.frame_to_captured_frame(&frame)?;
+                    self.last_frame = Some(frame.clone());
+                    return Ok(frame);
+                }
                 Err(error) => last_error = Some(format!("{error:?}")),
+            }
+
+            if let Some(frame) = self.last_frame.as_ref() {
+                return Ok(reused_last_frame_with_timestamp(frame, now_us()));
             }
 
             let now = Instant::now();
@@ -1091,6 +1104,12 @@ fn now_us() -> u64 {
         .as_micros() as u64
 }
 
+fn reused_last_frame_with_timestamp(frame: &CapturedFrame, timestamp_us: u64) -> CapturedFrame {
+    let mut frame = frame.clone();
+    frame.timestamp_us = timestamp_us;
+    frame
+}
+
 unsafe extern "system" fn enum_window_capture_target(hwnd: HWND, lparam: LPARAM) -> BOOL {
     if !is_window_capture_candidate(hwnd) {
         return true.into();
@@ -1392,6 +1411,19 @@ mod tests {
         assert!(!source_supports_shared_even_target(1));
         assert!(source_supports_shared_even_target(2));
         assert!(source_supports_shared_even_target(3));
+    }
+
+    #[test]
+    fn reused_last_frame_refreshes_timestamp() {
+        let previous = CapturedFrame::from_cpu(2, 2, FramePixelFormat::Bgra32, 10, vec![0; 16]);
+
+        let reused = reused_last_frame_with_timestamp(&previous, 20);
+
+        assert_eq!(reused.width, 2);
+        assert_eq!(reused.height, 2);
+        assert_eq!(reused.pixel_format, FramePixelFormat::Bgra32);
+        assert_eq!(reused.data, previous.data);
+        assert_eq!(reused.timestamp_us, 20);
     }
 
     #[test]

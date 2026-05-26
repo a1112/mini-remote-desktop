@@ -1425,6 +1425,7 @@ pub struct TestHarness {
     metrics: Arc<Mutex<HarnessMetrics>>,
     frame_buffer: Arc<Mutex<FrameBuffer>>,
     encoded_subscribers: Arc<Mutex<Vec<mpsc::SyncSender<Vec<EncodedAccessUnit>>>>>,
+    latest_keyframe_access_units: Arc<Mutex<Option<Vec<EncodedAccessUnit>>>>,
     thread_handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -1455,6 +1456,7 @@ impl TestHarness {
             metrics,
             frame_buffer,
             encoded_subscribers: Arc::new(Mutex::new(Vec::new())),
+            latest_keyframe_access_units: Arc::new(Mutex::new(None)),
             thread_handle: None,
         })
     }
@@ -1473,6 +1475,9 @@ impl TestHarness {
 
     pub fn subscribe_encoded_access_units(&self) -> mpsc::Receiver<Vec<EncodedAccessUnit>> {
         let (sender, receiver) = mpsc::sync_channel(ENCODED_ACCESS_UNIT_SUBSCRIBER_QUEUE_DEPTH);
+        if let Some(keyframe_units) = self.latest_keyframe_access_units.lock().unwrap().clone() {
+            let _ = sender.try_send(keyframe_units);
+        }
         self.encoded_subscribers.lock().unwrap().push(sender);
         receiver
     }
@@ -1490,6 +1495,7 @@ impl TestHarness {
         let frame_buffer = self.frame_buffer.clone();
         let metrics = self.metrics.clone();
         let encoded_subscribers = self.encoded_subscribers.clone();
+        let latest_keyframe_access_units = self.latest_keyframe_access_units.clone();
         let running = self.running.clone();
         let running_for_thread = running.clone();
         {
@@ -1516,6 +1522,7 @@ impl TestHarness {
                 frame_buffer,
                 metrics,
                 encoded_subscribers,
+                latest_keyframe_access_units,
                 running_for_thread,
                 chain,
                 config,
@@ -1552,6 +1559,7 @@ impl TestHarness {
         frame_buffer: Arc<Mutex<FrameBuffer>>,
         metrics: Arc<Mutex<HarnessMetrics>>,
         encoded_subscribers: Arc<Mutex<Vec<mpsc::SyncSender<Vec<EncodedAccessUnit>>>>>,
+        latest_keyframe_access_units: Arc<Mutex<Option<Vec<EncodedAccessUnit>>>>,
         running: Arc<AtomicBool>,
         chain: TestChain,
         config: TestConfig,
@@ -1577,7 +1585,14 @@ impl TestHarness {
             m.error_message = None;
         }
 
-        Self::process_loop(state, frame_buffer, metrics, encoded_subscribers, running);
+        Self::process_loop(
+            state,
+            frame_buffer,
+            metrics,
+            encoded_subscribers,
+            latest_keyframe_access_units,
+            running,
+        );
     }
 
     fn initialize_components(chain: &TestChain, config: &TestConfig) -> Result<PipelineState> {
@@ -2193,6 +2208,7 @@ impl TestHarness {
         frame_buffer: Arc<Mutex<FrameBuffer>>,
         metrics: Arc<Mutex<HarnessMetrics>>,
         encoded_subscribers: Arc<Mutex<Vec<mpsc::SyncSender<Vec<EncodedAccessUnit>>>>>,
+        latest_keyframe_access_units: Arc<Mutex<Option<Vec<EncodedAccessUnit>>>>,
         running: Arc<AtomicBool>,
     ) {
         let start_time = Instant::now();
@@ -2311,7 +2327,11 @@ impl TestHarness {
             let (transported_units, transport_latency) = if encoded_units.is_empty() {
                 (encoded_units, None)
             } else {
-                Self::broadcast_encoded_access_units(&encoded_subscribers, &encoded_units);
+                Self::broadcast_encoded_access_units(
+                    &encoded_subscribers,
+                    &latest_keyframe_access_units,
+                    &encoded_units,
+                );
                 let transport_start = Instant::now();
                 match state.transport.transmit(encoded_units) {
                     Ok(units) => (units, Some(transport_start.elapsed())),
@@ -2598,10 +2618,14 @@ impl TestHarness {
 
     fn broadcast_encoded_access_units(
         subscribers: &Arc<Mutex<Vec<mpsc::SyncSender<Vec<EncodedAccessUnit>>>>>,
+        latest_keyframe_access_units: &Arc<Mutex<Option<Vec<EncodedAccessUnit>>>>,
         encoded_units: &[EncodedAccessUnit],
     ) {
         if encoded_units.is_empty() {
             return;
+        }
+        if encoded_units.iter().any(|unit| unit.is_keyframe) {
+            *latest_keyframe_access_units.lock().unwrap() = Some(encoded_units.to_vec());
         }
 
         let mut subscribers = subscribers.lock().unwrap();
@@ -4591,9 +4615,47 @@ mod tests {
             bytes: vec![0, 0, 1, 0x65],
         }];
 
-        TestHarness::broadcast_encoded_access_units(&harness.encoded_subscribers, &units);
+        TestHarness::broadcast_encoded_access_units(
+            &harness.encoded_subscribers,
+            &harness.latest_keyframe_access_units,
+            &units,
+        );
 
         assert_eq!(receiver.try_recv().expect("encoded access unit"), units);
+    }
+
+    #[test]
+    fn encoded_access_unit_subscriber_replays_latest_keyframe_on_late_subscribe() {
+        let harness = TestHarness::new().expect("create harness");
+        let keyframe = vec![EncodedAccessUnit {
+            codec: VideoCodec::H264,
+            timestamp_us: 1,
+            is_keyframe: true,
+            bytes: vec![0, 0, 1, 0x65],
+        }];
+        let delta = vec![EncodedAccessUnit {
+            codec: VideoCodec::H264,
+            timestamp_us: 2,
+            is_keyframe: false,
+            bytes: vec![0, 0, 1, 0x41],
+        }];
+
+        TestHarness::broadcast_encoded_access_units(
+            &harness.encoded_subscribers,
+            &harness.latest_keyframe_access_units,
+            &keyframe,
+        );
+        TestHarness::broadcast_encoded_access_units(
+            &harness.encoded_subscribers,
+            &harness.latest_keyframe_access_units,
+            &delta,
+        );
+        let receiver = harness.subscribe_encoded_access_units();
+
+        assert_eq!(
+            receiver.try_recv().expect("replayed keyframe access unit"),
+            keyframe
+        );
     }
 
     #[test]
@@ -4608,7 +4670,11 @@ mod tests {
             bytes: vec![0, 0, 1, 0x41],
         }];
 
-        TestHarness::broadcast_encoded_access_units(&harness.encoded_subscribers, &units);
+        TestHarness::broadcast_encoded_access_units(
+            &harness.encoded_subscribers,
+            &harness.latest_keyframe_access_units,
+            &units,
+        );
 
         assert!(harness.encoded_subscribers.lock().unwrap().is_empty());
     }

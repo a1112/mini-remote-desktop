@@ -449,23 +449,47 @@ fn render_frame_interval(fps: u32) -> Option<Duration> {
 
 impl MediaPipelineRegistry {
     pub fn attach_surface(&mut self, session_id: SessionId, surface: AttachedRenderSurface) {
+        let session_id_label = session_id.0.clone();
+        let surface_id = surface.surface_id.clone();
+        let backend = surface.backend.clone();
         let state = self.pipelines.entry(session_id).or_default();
         if state.active_renderer.is_none() {
             state.active_renderer = Some(surface.backend.clone());
         }
-        state
+        let replaced = state
             .attached_surfaces
-            .insert(surface.surface_id.clone(), surface);
+            .insert(surface.surface_id.clone(), surface)
+            .is_some();
+        tracing::info!(
+            session_id = %session_id_label,
+            surface_id = %surface_id,
+            backend = %backend,
+            replaced,
+            attached_surface_count = state.attached_surfaces.len(),
+            "render-surface pipeline attach"
+        );
     }
 
     pub fn detach_surface(&mut self, session_id: &SessionId, surface_id: &str) -> bool {
         let Some(state) = self.pipelines.get_mut(session_id) else {
+            tracing::info!(
+                session_id = %session_id.0,
+                surface_id = %surface_id,
+                "render-surface pipeline detach skipped: missing pipeline"
+            );
             return false;
         };
         let removed = state.attached_surfaces.remove(surface_id).is_some();
         if state.attached_surfaces.is_empty() {
             state.active_renderer = None;
         }
+        tracing::info!(
+            session_id = %session_id.0,
+            surface_id = %surface_id,
+            removed,
+            attached_surface_count = state.attached_surfaces.len(),
+            "render-surface pipeline detach"
+        );
         removed
     }
 
@@ -685,13 +709,35 @@ impl MediaSurfaceRendererRegistry {
         session_id: &SessionId,
         surface: &AttachedRenderSurface,
     ) -> Result<(), String> {
+        tracing::info!(
+            session_id = %session_id.0,
+            surface_id = %surface.surface_id,
+            backend = %surface.backend,
+            window_handle = ?surface.window_handle,
+            "render-surface renderer attach requested"
+        );
         if surface.backend != "d3d11" {
+            tracing::info!(
+                session_id = %session_id.0,
+                surface_id = %surface.surface_id,
+                backend = %surface.backend,
+                "render-surface renderer attach skipped: non-d3d11 backend"
+            );
+            return Ok(());
+        }
+        let key = (session_id.clone(), surface.surface_id.clone());
+        if self.renderers.contains_key(&key) {
+            tracing::info!(
+                session_id = %session_id.0,
+                surface_id = %surface.surface_id,
+                renderer_count = self.session_surface_count(session_id),
+                "render-surface renderer attach reused existing renderer"
+            );
             return Ok(());
         }
         let window_handle = surface
             .window_handle
             .ok_or_else(|| format!("render surface {} is missing HWND", surface.surface_id))?;
-        let key = (session_id.clone(), surface.surface_id.clone());
         let mut renderer = D3d11RendererFactory
             .create()
             .map_err(|error| format!("create D3D11 renderer failed: {error}"))?;
@@ -700,17 +746,40 @@ impl MediaSurfaceRendererRegistry {
             .map_err(|error| format!("attach D3D11 renderer target failed: {error}"))?;
         self.renderers
             .insert(key, Arc::new(StdMutex::new(renderer)));
+        tracing::info!(
+            session_id = %session_id.0,
+            surface_id = %surface.surface_id,
+            renderer_count = self.session_surface_count(session_id),
+            "render-surface renderer attach completed"
+        );
         Ok(())
     }
 
     pub fn detach_surface(&mut self, session_id: &SessionId, surface_id: &str) {
-        self.renderers
-            .remove(&(session_id.clone(), surface_id.to_string()));
+        let removed = self
+            .renderers
+            .remove(&(session_id.clone(), surface_id.to_string()))
+            .is_some();
+        tracing::info!(
+            session_id = %session_id.0,
+            surface_id = %surface_id,
+            removed,
+            renderer_count = self.session_surface_count(session_id),
+            "render-surface renderer detach"
+        );
     }
 
     pub fn detach_session(&mut self, session_id: &SessionId) {
+        let before = self.renderers.len();
         self.renderers
             .retain(|(renderer_session_id, _), _| renderer_session_id != session_id);
+        let removed = before.saturating_sub(self.renderers.len());
+        tracing::info!(
+            session_id = %session_id.0,
+            removed,
+            renderer_count = self.session_surface_count(session_id),
+            "render-surface renderer detach session"
+        );
     }
 
     pub fn renderers_for_session(&self, session_id: &SessionId) -> Vec<SharedSurfaceRenderer> {
@@ -1984,6 +2053,57 @@ mod tests {
 
         assert_eq!(uploads_a.load(Ordering::SeqCst), 1);
         assert_eq!(uploads_b.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn media_surface_renderer_registry_reuses_existing_surface_on_duplicate_attach() {
+        use mrd_ipc::AttachedRenderSurface;
+        use mrd_render::{RenderError, RenderTarget, RendererInstance, RendererSnapshot};
+
+        struct NoopRenderer;
+
+        impl RendererInstance for NoopRenderer {
+            fn attach_target(&mut self, _target: RenderTarget) -> Result<(), RenderError> {
+                Ok(())
+            }
+
+            fn upload_frame(&mut self, _frame: RenderFrame) -> Result<(), RenderError> {
+                Ok(())
+            }
+
+            fn snapshot(&self) -> RendererSnapshot {
+                RendererSnapshot {
+                    attached_to_target: true,
+                    uploaded_frame_count: 0,
+                    presented_frame_count: 0,
+                    present_skipped_count: 0,
+                    last_present_status: None,
+                    low_latency_frame_latency_target: None,
+                    swap_chain_max_frame_latency: None,
+                    swap_chain_allow_tearing: None,
+                    last_width: 1,
+                    last_height: 1,
+                    last_pixel_format: None,
+                }
+            }
+        }
+
+        let mut registry = MediaSurfaceRendererRegistry::default();
+        let session_id = SessionId("surface-session".to_string());
+        registry.insert_renderer_for_test(&session_id, "surface-1", Box::new(NoopRenderer));
+
+        let result = registry.attach_surface(
+            &session_id,
+            &AttachedRenderSurface {
+                surface_id: "surface-1".to_string(),
+                backend: "d3d11".to_string(),
+                window_handle: Some(0),
+            },
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(registry.session_surface_count(&session_id), 1);
     }
 
     #[test]

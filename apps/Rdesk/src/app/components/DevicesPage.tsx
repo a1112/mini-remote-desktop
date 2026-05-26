@@ -324,7 +324,7 @@ export function DevicesPage() {
             style={{ fontSize: 13 }}
           >
             <Monitor className="w-3.5 h-3.5" />
-            {launchingDeviceId === "__local_test__" ? "Opening..." : "本机测试窗口"}
+            {launchingDeviceId === "__local_test__" ? "Opening..." : "测试窗口"}
           </button>
           <button
             className="flex items-center gap-2 px-3.5 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white transition-colors shadow-sm"

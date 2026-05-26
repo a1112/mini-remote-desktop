@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { getMockInvoke } from "../../test/mocks/tauri";
@@ -17,6 +17,7 @@ import {
   buildWebCodecsDecoderConfig,
   buildWebRtcDiagnosticsStageRows,
   WebRtcPresentationLatencyTracker,
+  localThreeFrameLatencyStatus,
   shouldAutoSwitchWebRtcVideoToWebCodecs,
   summarizeWebRtcInboundVideoStats,
 } from "./RemoteDisplayWindowPage";
@@ -156,6 +157,23 @@ const localDisplaySources = [
     preview_height: null,
   },
 ];
+
+const localWindowSource = {
+  ...remoteDisplaySource,
+  id: "windows:window:0x1234",
+  source_kind: "window",
+  title: "Calculator",
+  class_name: "ApplicationFrameWindow",
+  width: 900,
+  height: 700,
+  process_id: 4242,
+  app_name: "Calculator",
+  preview_data_url: null,
+  preview_width: null,
+  preview_height: null,
+};
+
+const localMixedSources = [...localDisplaySources, localWindowSource];
 
 describe("RemoteDisplayWindowPage", () => {
   beforeEach(() => {
@@ -756,6 +774,68 @@ describe("RemoteDisplayWindowPage", () => {
     });
   });
 
+  it("keeps remote display native rendering enabled when capability fallback omits d3d11", async () => {
+    const mockInvoke = getMockInvoke();
+    let resolveCapabilities: (value: ReturnType<typeof windowsCapabilities>) => void = () => {};
+    const capabilitiesPromise = new Promise<ReturnType<typeof windowsCapabilities>>((resolve) => {
+      resolveCapabilities = resolve;
+    });
+    const configureCalls: Record<string, unknown>[] = [];
+
+    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
+      if (command === "test_get_capabilities") {
+        return capabilitiesPromise;
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-p2p-quic-123-1",
+          session_id: "p2p-quic-123",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: false,
+          render_mode: "web",
+          native_surface_attached: false,
+          session_window_count: 1,
+        });
+      }
+      if (command === "configure_remote_display_native_surface") {
+        configureCalls.push(args ?? {});
+        return Promise.resolve({
+          label: "render-p2p-quic-123-1",
+          backend: args?.enabled ? "d3d11" : "web",
+          attached: Boolean(args?.enabled),
+          visible: Boolean(args?.visible),
+          parent_hwnd: "0xA",
+          hwnd: args?.enabled ? "0x14" : null,
+          rect: { x: 0, y: 56, width: 1280, height: 720 },
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay("p2p-quic-123");
+
+    await waitFor(() => {
+      expect(configureCalls.some((call) => call.enabled === true)).toBe(true);
+    });
+
+    await act(async () => {
+      resolveCapabilities({
+        ...windowsCapabilities(),
+        available_renderers: ["webview"],
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("render: D3D11 native")).toBeInTheDocument();
+    });
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 50));
+    });
+
+    expect(configureCalls.some((call) => call.enabled === false)).toBe(false);
+  });
+
   it("probes the D3D11 native surface before starting a local pipeline test", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
@@ -846,6 +926,73 @@ describe("RemoteDisplayWindowPage", () => {
     });
   });
 
+  it("classifies local E2E p95 latency against a three-frame budget", () => {
+    expect(localThreeFrameLatencyStatus(120, 24)).toEqual({
+      budgetMs: 25,
+      withinBudget: true,
+      label: "3帧内",
+    });
+    expect(localThreeFrameLatencyStatus(60, 55)).toEqual({
+      budgetMs: 50,
+      withinBudget: false,
+      label: "超过3帧",
+    });
+    expect(localThreeFrameLatencyStatus(null, 20)).toEqual({
+      budgetMs: null,
+      withinBudget: null,
+      label: "等待样本",
+    });
+  });
+
+  it("fails the local pipeline test when the run state disappears after start", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(windowsCapabilities());
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-local-display-test-1",
+          session_id: "local-display-test-1",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: false,
+          render_mode: "web",
+          native_surface_attached: false,
+          session_window_count: 1,
+        });
+      }
+      if (command === "test_harness_stop") {
+        return Promise.resolve(null);
+      }
+      if (command === "test_start_run") {
+        return Promise.resolve("run-missing");
+      }
+      if (command === "test_harness_get_metrics") {
+        return Promise.resolve({
+          is_running: true,
+          capture_fps: 0,
+          frame_count: 0,
+          total_latency_p95_ms: 0,
+          error_message: null,
+        });
+      }
+      if (command === "test_get_run") {
+        return Promise.resolve(null);
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay("local-display-test-1");
+
+    fireEvent.click(await screen.findByRole("button", { name: "Start local pipeline test" }));
+
+    await waitFor(() => {
+      expect(screen.getByText("测试运行状态丢失: run-missing")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Start local pipeline test" })).toBeEnabled();
+    });
+  });
+
   it("auto-selects a Web View compatible local pipeline before starting a local test", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
@@ -921,7 +1068,7 @@ describe("RemoteDisplayWindowPage", () => {
             transport_kind: "webrtc",
             fps: 144,
             render_display: false,
-            visual_preview: false,
+            visual_preview: true,
             zero_copy: false,
           }),
         })
@@ -992,7 +1139,7 @@ describe("RemoteDisplayWindowPage", () => {
             fps: 144,
             bitrate: 20_000_000,
             render_display: false,
-            visual_preview: false,
+            visual_preview: true,
             zero_copy: false,
           }),
         })
@@ -1513,7 +1660,7 @@ describe("RemoteDisplayWindowPage", () => {
             transport_kind: "webrtc",
             fps: 144,
             render_display: false,
-            visual_preview: false,
+            visual_preview: true,
             zero_copy: false,
           }),
         })
@@ -1595,7 +1742,7 @@ describe("RemoteDisplayWindowPage", () => {
           renderer_type: "linux",
           render_display: true,
           renderer_target_hwnd: "0x14",
-          visual_preview: false,
+          visual_preview: true,
           zero_copy: false,
         })
       );
@@ -1682,7 +1829,7 @@ describe("RemoteDisplayWindowPage", () => {
             render_display: true,
             renderer_target_hwnd: "0x14",
             transport_kind: "loopback",
-            visual_preview: false,
+            visual_preview: true,
           }),
         })
       );
@@ -2219,7 +2366,8 @@ describe("RemoteDisplayWindowPage", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "配置" }));
     fireEvent.click(await screen.findByRole("button", { name: "刷新捕获源" }));
-    fireEvent.change(await screen.findByLabelText("远端捕获源下拉"), {
+    expect((await screen.findByLabelText("被捕获设备") as HTMLSelectElement).value).toBe("remote");
+    fireEvent.change(await screen.findByLabelText("捕获源下拉"), {
       target: { value: "windows:window:0x1234" },
     });
 
@@ -2241,7 +2389,7 @@ describe("RemoteDisplayWindowPage", () => {
     });
   });
 
-  it("shows local display source selection for local preview sessions", async () => {
+  it("uses unified capture source controls for local capture sources", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {
       if (command === "test_get_capabilities") {
@@ -2260,7 +2408,7 @@ describe("RemoteDisplayWindowPage", () => {
         });
       }
       if (command === "ipc_list_local_capture_sources") {
-        return Promise.resolve(localDisplaySources);
+        return Promise.resolve(localMixedSources);
       }
       return Promise.resolve(null);
     });
@@ -2268,18 +2416,37 @@ describe("RemoteDisplayWindowPage", () => {
     renderRemoteDisplay("local-display-test-1");
 
     fireEvent.click(await screen.findByRole("button", { name: "配置" }));
-    expect(await screen.findByText("本机捕获源")).toBeInTheDocument();
-    fireEvent.click(await screen.findByRole("button", { name: "刷新捕获源" }));
-
-    const localSourceSelect = await screen.findByLabelText("本机捕获源下拉");
-    fireEvent.change(localSourceSelect, {
+    await waitFor(() => expect(screen.getAllByText("捕获源").length).toBeGreaterThan(0));
+    expect(screen.queryByText("本机捕获源")).not.toBeInTheDocument();
+    expect((screen.getByLabelText("被捕获设备") as HTMLSelectElement).value).toBe("local");
+    fireEvent.click(screen.getByRole("button", { name: "刷新捕获源" }));
+    await waitFor(() => expect(screen.getByLabelText("捕获源下拉")).toBeInTheDocument());
+    fireEvent.change(screen.getByLabelText("捕获源下拉"), {
       target: { value: "windows:display-shared:1" },
     });
+    await waitFor(() => {
+      expect(screen.getByText(/当前选择: 全屏 shared \/ Display 2/)).toBeInTheDocument();
+    });
+
+    fireEvent.click(await screen.findByRole("button", { name: "选择捕获源" }));
+    const picker = await screen.findByRole("dialog", { name: "捕获源选择" });
+    expect(within(picker).getByText("捕获源选择")).toBeInTheDocument();
+
+    fireEvent.click(within(picker).getByRole("button", { name: "采集方式 DXGI" }));
+    fireEvent.click(within(picker).getByRole("button", { name: "刷新" }));
+
+    await waitFor(() => {
+      expect(within(picker).getAllByText(/Display 2/).length).toBeGreaterThan(0);
+    });
+    expect(within(picker).getAllByText("Calculator").length).toBeGreaterThan(0);
+    expect(within(picker).getAllByText("预览不可用").length).toBeGreaterThan(0);
+
+    fireEvent.click(within(picker).getByRole("button", { name: "选择 Display 2 (D3D11 shared copy)" }));
 
     await waitFor(() => {
       expect(screen.getAllByText(/Display 2/).length).toBeGreaterThan(0);
     });
-    expect(screen.getByText(/3840x2160/)).toBeInTheDocument();
+    expect(screen.getAllByText(/3840x2160/).length).toBeGreaterThan(0);
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("ipc_list_local_capture_sources", {
         includePreviews: false,
@@ -2287,7 +2454,7 @@ describe("RemoteDisplayWindowPage", () => {
       });
       expect(mockInvoke).toHaveBeenCalledWith("ipc_list_local_capture_sources", {
         includePreviews: true,
-        limit: 2,
+        limit: 3,
       });
     });
     expect(mockInvoke).not.toHaveBeenCalledWith(
@@ -2296,8 +2463,135 @@ describe("RemoteDisplayWindowPage", () => {
     );
   });
 
+  it("filters window capture sources to DXGI and hides them for WinRT copy mode", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(windowsCapabilities());
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-local-display-test-1",
+          session_id: "local-display-test-1",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: false,
+          render_mode: "web",
+          native_surface_attached: false,
+          session_window_count: 1,
+        });
+      }
+      if (command === "ipc_list_local_capture_sources") {
+        return Promise.resolve(localMixedSources);
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay("local-display-test-1");
+
+    fireEvent.click(await screen.findByRole("button", { name: "测试配置" }));
+    fireEvent.click(await screen.findByRole("button", { name: "选择捕获源" }));
+    const picker = await screen.findByRole("dialog", { name: "捕获源选择" });
+    fireEvent.click(within(picker).getByRole("button", { name: "采集方式 DXGI" }));
+    fireEvent.click(within(picker).getByRole("button", { name: "刷新" }));
+
+    await waitFor(() => {
+      expect(within(picker).getAllByText("Calculator").length).toBeGreaterThan(0);
+    });
+
+    fireEvent.click(within(picker).getByRole("button", { name: "采集方式 WinRT" }));
+
+    await waitFor(() => {
+      expect(within(picker).queryAllByText("Calculator")).toHaveLength(0);
+    });
+    expect(within(picker).getByText(/Display 1/)).toBeInTheDocument();
+  });
+
   it("passes the selected local display source into native local test config", async () => {
     const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(windowsCapabilities());
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-local-display-test-1",
+          session_id: "local-display-test-1",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: false,
+          render_mode: "d3d11_native",
+          native_surface_attached: true,
+          session_window_count: 1,
+        });
+      }
+      if (command === "configure_remote_display_native_surface") {
+        return Promise.resolve({
+          label: "render-local-display-test-1",
+          backend: args?.enabled ? "d3d11" : "web",
+          attached: Boolean(args?.enabled),
+          visible: Boolean(args?.visible),
+          parent_hwnd: "0xA",
+          hwnd: args?.enabled ? "0x14" : null,
+          rect: { x: 0, y: 56, width: 1280, height: 720 },
+        });
+      }
+      if (command === "ipc_list_local_capture_sources") {
+        return Promise.resolve(localMixedSources);
+      }
+      if (command === "present_test_harness_frame_on_native_surface") {
+        return Promise.resolve(true);
+      }
+      if (command === "test_harness_stop") {
+        return Promise.resolve(null);
+      }
+      if (command === "test_start_run") {
+        return Promise.resolve("run-local-source");
+      }
+      if (command === "test_harness_get_metrics") {
+        return Promise.resolve({
+          is_running: true,
+          capture_fps: 120,
+          frame_count: 12,
+          total_latency_p95_ms: 8,
+          error_message: null,
+        });
+      }
+      if (command === "test_get_run") {
+        return Promise.resolve({ run_id: "run-local-source", status: "running", summary: null });
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay("local-display-test-1");
+
+    fireEvent.click(await screen.findByRole("button", { name: "测试配置" }));
+    fireEvent.click(await screen.findByRole("button", { name: "选择捕获源" }));
+    const picker = await screen.findByRole("dialog", { name: "捕获源选择" });
+    fireEvent.click(within(picker).getByRole("button", { name: "采集方式 DXGI" }));
+    fireEvent.click(within(picker).getByRole("button", { name: "刷新" }));
+    fireEvent.click(await within(picker).findByRole("button", { name: "选择 Display 2 (D3D11 shared copy)" }));
+    fireEvent.click(screen.getByRole("button", { name: "Start local pipeline test" }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_start_run",
+        expect.objectContaining({
+          scenarioId: "custom",
+          config: expect.objectContaining({
+            input_source: "screen",
+            source_id: "windows:display-shared:1",
+            source_kind: "display_shared",
+            display_id: "windows:display-shared:1",
+          }),
+        })
+      );
+    });
+  });
+
+  it("expands local matrix capture dimension over refreshed capture sources", async () => {
+    const mockInvoke = getMockInvoke();
+    let runIndex = 0;
     mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
       if (command === "test_get_capabilities") {
         return Promise.resolve(windowsCapabilities());
@@ -2335,7 +2629,96 @@ describe("RemoteDisplayWindowPage", () => {
         return Promise.resolve(null);
       }
       if (command === "test_start_run") {
-        return Promise.resolve("run-local-source");
+        runIndex += 1;
+        return Promise.resolve(`run-local-source-${runIndex}`);
+      }
+      if (command === "test_get_run") {
+        return Promise.resolve({
+          run_id: args?.runId,
+          status: "completed",
+          summary: {
+            capture_fps: 120,
+            total_latency_p95: 8,
+            dropped_frames: 0,
+            frame_count: 120,
+          },
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay("local-display-test-1");
+
+    fireEvent.click(await screen.findByRole("button", { name: "测试配置" }));
+    fireEvent.click(screen.getByRole("button", { name: "刷新捕获源" }));
+    await waitFor(() => expect(screen.getByLabelText("捕获源下拉")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "单次测试" }));
+    fireEvent.click(screen.getByRole("button", { name: "MATRIX 捕获源" }));
+    fireEvent.click(screen.getByRole("button", { name: "MATRIX FPS" }));
+    fireEvent.click(screen.getByRole("button", { name: "Start local pipeline test" }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_start_run",
+        expect.objectContaining({
+          config: expect.objectContaining({
+            source_id: "windows:display-shared:0",
+            source_kind: "display_shared",
+          }),
+        })
+      );
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_start_run",
+        expect.objectContaining({
+          config: expect.objectContaining({
+            source_id: "windows:display-shared:1",
+            source_kind: "display_shared",
+          }),
+        })
+      );
+    });
+  });
+
+  it("passes the selected local window source as a window input without display_id", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(windowsCapabilities());
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-local-display-test-1",
+          session_id: "local-display-test-1",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: false,
+          render_mode: "d3d11_native",
+          native_surface_attached: true,
+          session_window_count: 1,
+        });
+      }
+      if (command === "configure_remote_display_native_surface") {
+        return Promise.resolve({
+          label: "render-local-display-test-1",
+          backend: args?.enabled ? "d3d11" : "web",
+          attached: Boolean(args?.enabled),
+          visible: Boolean(args?.visible),
+          parent_hwnd: "0xA",
+          hwnd: args?.enabled ? "0x14" : null,
+          rect: { x: 0, y: 56, width: 1280, height: 720 },
+        });
+      }
+      if (command === "ipc_list_local_capture_sources") {
+        return Promise.resolve(localMixedSources);
+      }
+      if (command === "present_test_harness_frame_on_native_surface") {
+        return Promise.resolve(true);
+      }
+      if (command === "test_harness_stop") {
+        return Promise.resolve(null);
+      }
+      if (command === "test_start_run") {
+        return Promise.resolve("run-local-window-source");
       }
       if (command === "test_harness_get_metrics") {
         return Promise.resolve({
@@ -2347,7 +2730,11 @@ describe("RemoteDisplayWindowPage", () => {
         });
       }
       if (command === "test_get_run") {
-        return Promise.resolve({ run_id: "run-local-source", status: "running", summary: null });
+        return Promise.resolve({
+          run_id: "run-local-window-source",
+          status: "running",
+          summary: null,
+        });
       }
       return Promise.resolve(null);
     });
@@ -2355,23 +2742,29 @@ describe("RemoteDisplayWindowPage", () => {
     renderRemoteDisplay("local-display-test-1");
 
     fireEvent.click(await screen.findByRole("button", { name: "测试配置" }));
-    fireEvent.click(await screen.findByRole("button", { name: "刷新捕获源" }));
-    fireEvent.change(await screen.findByLabelText("本机捕获源下拉"), {
-      target: { value: "windows:display-shared:1" },
-    });
+    fireEvent.click(await screen.findByRole("button", { name: "选择捕获源" }));
+    const picker = await screen.findByRole("dialog", { name: "捕获源选择" });
+    fireEvent.click(within(picker).getByRole("button", { name: "采集方式 DXGI" }));
+    fireEvent.click(within(picker).getByRole("button", { name: "刷新" }));
+    fireEvent.click(await within(picker).findByRole("button", { name: "选择 Calculator" }));
     fireEvent.click(screen.getByRole("button", { name: "Start local pipeline test" }));
 
     await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith(
-        "test_start_run",
+      const startCall = mockInvoke.mock.calls.find(([command]) => command === "test_start_run");
+      expect(startCall?.[1]).toEqual(
         expect.objectContaining({
           scenarioId: "custom",
           config: expect.objectContaining({
-            source_id: "windows:display-shared:1",
-            source_kind: "display_shared",
-            display_id: "windows:display-shared:1",
+            input_source: "window",
+            source_id: "windows:window:0x1234",
+            source_kind: "window",
+            window_hwnd: "0x1234",
+            window_title: "Calculator",
           }),
         })
+      );
+      expect((startCall?.[1] as { config?: Record<string, unknown> }).config).not.toHaveProperty(
+        "display_id"
       );
     });
   });
@@ -2786,12 +3179,12 @@ describe("RemoteDisplayWindowPage", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "配置" }));
     await screen.findByLabelText("PICK");
-    await waitFor(() => expect(screen.getByLabelText("远端捕获源下拉")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByLabelText("捕获源下拉")).toBeInTheDocument());
 
     fireEvent.change(screen.getByLabelText("PICK"), { target: { value: "modal" } });
-    fireEvent.click(screen.getByRole("button", { name: "打开捕获源弹窗" }));
+    fireEvent.click(screen.getByRole("button", { name: "选择捕获源" }));
 
-    expect(await screen.findByText("远端捕获源选择")).toBeInTheDocument();
+    expect(await screen.findByText("捕获源选择")).toBeInTheDocument();
   });
 
   it("shows DX12 as unavailable until a D3D12 native renderer is available", async () => {

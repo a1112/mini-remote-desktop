@@ -127,6 +127,10 @@ const LAN_MEDIA_SENDER_MAX_CONSECUTIVE_FRAME_ERRORS: u32 = 8;
 
 #[cfg(windows)]
 static LOCAL_RENDER_REFRESH_HZ: OnceLock<Option<u32>> = OnceLock::new();
+#[cfg(windows)]
+static LAN_RENDER_NO_SURFACE_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(windows)]
+static LAN_RENDER_PRESENT_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 const LAN_MEDIA_SENDER_ERROR_LOG_INTERVAL: u32 = 3;
 const LAN_MEDIA_RECEIVER_MAX_CONSECUTIVE_DECODE_ERRORS: u32 = 8;
 const LAN_MEDIA_RECEIVER_DECODE_ERROR_LOG_INTERVAL: u32 = 3;
@@ -4994,6 +4998,16 @@ async fn render_lan_decoded_frame(
     session_id: &SessionId,
     decoded_frame: &DecodedFrame,
 ) -> Result<()> {
+    if app_state
+        .media_surface_renderers
+        .lock()
+        .await
+        .session_surface_count(session_id)
+        == 0
+    {
+        return Ok(());
+    }
+
     let render_frame = decoded_frame_to_render_frame(decoded_frame.clone())?;
     let render_profile = selected_media_profile(app_state, session_id).await;
     let max_pending_frames = lan_render_queue_capacity_for_profile(&render_profile);
@@ -5169,19 +5183,15 @@ async fn run_lan_render_worker(
             }
         }
 
-        let (next_frame, stale_drops) = app_state
+        let next_frame = app_state
             .media_render_queues
             .lock()
             .await
-            .take_latest_or_finish(&session_id);
+            .take_next_or_finish(&session_id);
         match next_frame {
             Some(next_frame) => {
                 let mut pipelines = app_state.media_pipelines.lock().await;
                 pipelines.record_queue_depth(session_id.clone(), 0);
-                if stale_drops > 0 {
-                    pipelines
-                        .increment_render_stale_frame_drops(session_id.clone(), stale_drops as u64);
-                }
                 frame = next_frame;
             }
             None => {
@@ -5326,6 +5336,14 @@ async fn render_lan_frame_once(
         render_registry.renderers_for_session(&session_id)
     };
     if renderers.is_empty() {
+        let no_surface_count = LAN_RENDER_NO_SURFACE_LOG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if no_surface_count <= 5 || no_surface_count % 120 == 0 {
+            tracing::warn!(
+                session_id = %session_id.0,
+                no_surface_count,
+                "lan-render no surface renderer for session"
+            );
+        }
         return Ok(LanRenderTaskOutcome::Idle);
     }
 
@@ -5376,6 +5394,17 @@ async fn render_lan_frame_once(
     }
 
     if rendered > 0 {
+        let present_log_count = LAN_RENDER_PRESENT_LOG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if present_log_count <= 5 || present_log_count % 120 == 0 {
+            tracing::info!(
+                session_id = %session_id.0,
+                renderer_count = renderers.len(),
+                rendered,
+                presented_frames,
+                present_skips,
+                "lan-render uploaded frame to native surface"
+            );
+        }
         Ok(LanRenderTaskOutcome::Rendered {
             upload_duration_ms,
             lock_wait_ms,
@@ -6180,10 +6209,8 @@ fn windows_lan_capture_backend_for_profile(
     nvenc_h264_available: bool,
 ) -> WindowsLanCaptureBackend {
     let backend = windows_lan_capture_backend(source_id, nvenc_h264_available);
-    if matches!(
-        backend,
-        WindowsLanCaptureBackend::DxgiShared | WindowsLanCaptureBackend::WinrtWindowShared
-    ) && windows_lan_profile_requires_scaling_path(source_width, source_height, profile)
+    if matches!(backend, WindowsLanCaptureBackend::WinrtWindowShared)
+        && windows_lan_profile_requires_scaling_path(source_width, source_height, profile)
     {
         WindowsLanCaptureBackend::Winrt
     } else {
@@ -10054,7 +10081,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_lan_capture_backend_for_profile_uses_scaling_path_for_reduced_display() {
+    fn windows_lan_capture_backend_for_profile_keeps_shared_for_reduced_display() {
         assert_eq!(
             windows_lan_capture_backend_for_profile(
                 "windows:display-shared:1",
@@ -10063,7 +10090,7 @@ mod tests {
                 &test_media_profile(1920, 1080),
                 false
             ),
-            WindowsLanCaptureBackend::Winrt
+            WindowsLanCaptureBackend::DxgiShared
         );
     }
 

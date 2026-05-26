@@ -70,8 +70,20 @@ pub async fn attach_render_surface(
     backend: String,
     window_handle: Option<i64>,
 ) -> IpcResponse {
+    tracing::info!(
+        session_id = %session_id.0,
+        surface_id = %surface_id,
+        backend = %backend,
+        window_handle = ?window_handle,
+        "render-surface ipc attach requested"
+    );
     let sessions = app_state.sessions.lock().await;
     if sessions.get(&session_id).is_none() {
+        tracing::warn!(
+            session_id = %session_id.0,
+            surface_id = %surface_id,
+            "render-surface ipc attach rejected: session not found"
+        );
         return IpcResponse::Error {
             code: "E404".to_string(),
             message: format!("Session not found: {}", session_id.0),
@@ -92,6 +104,13 @@ pub async fn attach_render_surface(
         .await
         .attach_surface(&session_id, &surface)
     {
+        tracing::warn!(
+            session_id = %session_id.0,
+            surface_id = %surface_id,
+            backend = %surface.backend,
+            error = %error,
+            "render-surface renderer attach failed"
+        );
         return IpcResponse::Error {
             code: "E_RENDER_ATTACH".to_string(),
             message: error,
@@ -104,6 +123,11 @@ pub async fn attach_render_surface(
         .await
         .attach_surface(session_id.clone(), surface);
 
+    tracing::info!(
+        session_id = %session_id.0,
+        surface_id = %surface_id,
+        "render-surface ipc attach completed"
+    );
     IpcResponse::RenderSurfaceAttached {
         session_id,
         surface_id,
@@ -116,7 +140,12 @@ pub async fn detach_render_surface(
     session_id: SessionId,
     surface_id: String,
 ) -> IpcResponse {
-    app_state
+    tracing::info!(
+        session_id = %session_id.0,
+        surface_id = %surface_id,
+        "render-surface ipc detach requested"
+    );
+    let removed_from_pipeline = app_state
         .media_pipelines
         .lock()
         .await
@@ -128,6 +157,12 @@ pub async fn detach_render_surface(
         .await
         .detach_surface(&session_id, &surface_id);
 
+    tracing::info!(
+        session_id = %session_id.0,
+        surface_id = %surface_id,
+        removed_from_pipeline,
+        "render-surface ipc detach completed"
+    );
     IpcResponse::RenderSurfaceDetached {
         session_id,
         surface_id,
