@@ -151,6 +151,8 @@ const KNOWN_STATUS_BY_ID: Record<string, CapabilityStatus> = {
   "decode.nvdec_hevc": "available",
   "decode.nvdec_hevc_main10": "available",
   "decode.software": "degraded",
+  "decode.ffmpeg_h264": "available",
+  "decode.ffmpeg_hevc": "available",
   "decode.linux_h264": "available",
   "decode.linux_hevc": "available",
   "decode.linux_hevc_main10": "available",
@@ -162,6 +164,7 @@ const KNOWN_STATUS_BY_ID: Record<string, CapabilityStatus> = {
   "render.webview": "degraded",
   "memory.cpu": "available",
   "memory.d3d11_shared": "available",
+  "service.ffmpeg": "available",
   "media.hevc_main_420_8bit": "supported",
 };
 

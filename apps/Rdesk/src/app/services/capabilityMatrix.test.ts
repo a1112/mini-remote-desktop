@@ -92,6 +92,16 @@ describe("buildCapabilitySnapshotFromEnvironment", () => {
     expect(statusOf(snapshot, "render.webview")).toBe("degraded");
   });
 
+  it("classifies optional FFmpeg legacy decoder capabilities as available", () => {
+    const snapshot = buildCapabilitySnapshotFromEnvironment({
+      ...windowsEnvironment,
+      available_decoders: ["ffmpeg_h264", "ffmpeg_hevc"],
+    });
+
+    expect(statusOf(snapshot, "decode.ffmpeg_h264")).toBe("available");
+    expect(statusOf(snapshot, "decode.ffmpeg_hevc")).toBe("available");
+  });
+
   it("classifies Linux legacy capabilities as available on Linux", () => {
     const snapshot = buildCapabilitySnapshotFromEnvironment(linuxEnvironment);
 
@@ -118,6 +128,46 @@ describe("buildCapabilitySnapshotFromEnvironment", () => {
 });
 
 describe("buildCapabilitySnapshotFromIpc", () => {
+  it("normalizes optional FFmpeg service and decoder capabilities", () => {
+    const ipcSnapshot: IpcCapabilitySnapshot = {
+      schema_version: 1,
+      platform: "windows",
+      service_version: "0.1.0",
+      capabilities: [
+        {
+          id: "service.ffmpeg",
+          domain: "service",
+          label: "FFmpeg tools",
+          status: "available",
+          platform: "windows",
+        },
+        {
+          id: "decode.ffmpeg_h264",
+          domain: "decode",
+          label: "FFmpeg H.264",
+          status: "available",
+          platform: "windows",
+        },
+        {
+          id: "decode.ffmpeg_hevc",
+          domain: "decode",
+          label: "FFmpeg HEVC",
+          status: "driver_missing",
+          platform: "windows",
+        },
+      ],
+      constraints: [],
+      profiles: [],
+      updated_at_ms: 1,
+    };
+
+    const snapshot = buildCapabilitySnapshotFromIpc(ipcSnapshot);
+
+    expect(statusOf(snapshot, "service.ffmpeg")).toBe("available");
+    expect(statusOf(snapshot, "decode.ffmpeg_h264")).toBe("available");
+    expect(statusOf(snapshot, "decode.ffmpeg_hevc")).toBe("driver_missing");
+  });
+
   it("preserves service-owned structured snapshot fields for UI evaluation", () => {
     const ipcSnapshot: IpcCapabilitySnapshot = {
       schema_version: 1,
