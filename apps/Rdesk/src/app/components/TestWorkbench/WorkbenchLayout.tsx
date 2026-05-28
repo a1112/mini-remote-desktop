@@ -23,6 +23,7 @@ import {
   MemoryStick,
   Monitor,
   Wifi,
+  BarChart3,
 } from "lucide-react";
 import * as commands from "../../adapters/tauri/commands";
 import type { SystemResourceSnapshot } from "../../adapters/tauri/types";
@@ -38,6 +39,7 @@ const navigation = [
   { name: "E2E", href: "/test/e2e", icon: Activity },
   { name: "Custom", href: "/test/custom", icon: Settings },
   { name: "Matrix", href: "/test/matrix", icon: Package },
+  { name: "Performance", href: "/test/performance", icon: BarChart3 },
   { name: "History", href: "/test/history", icon: History },
   { name: "Telemetry", href: "/test/telemetry", icon: LineChart },
 ];

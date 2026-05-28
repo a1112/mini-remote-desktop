@@ -1140,6 +1140,7 @@ class CoreTransportSuite:
                 {
                     "transport": r.transport,
                     "ok": r.ok,
+                    "skipped": False,
                     "reason": r.reason,
                     "selected_transport": r.selected_transport,
                     "frame_count": r.frame_count,
@@ -1180,7 +1181,7 @@ class CoreTransportSuite:
             lines.append(
                 "| {transport} | {ok} | {selected} | {frames} | {p95} | {p99} | {g100} | {g100r} | {g200} | {g200r} | {ae} | {qd} | {rs} | {roi} | {aumean} | {aup95} | {reason} |".format(
                     transport=r["transport"],
-                    ok="PASS" if r["ok"] else "FAIL",
+                    ok="SKIP" if r.get("skipped") else ("PASS" if r["ok"] else "FAIL"),
                     selected=r.get("selected_transport") or "-",
                     frames=r.get("frame_count", 0),
                     p95=j.get("p95", 0),
@@ -1245,22 +1246,70 @@ def load_config(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
+def default_repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def legacy_stack_skip_reason(root: Path) -> Optional[str]:
+    missing = [
+        str(path.relative_to(root))
+        for path in (root / "signaling-rs", root / "agent-rust")
+        if not path.exists()
+    ]
+    if not missing:
+        return None
+    return (
+        "legacy core transport suite skipped: missing "
+        + ", ".join(missing)
+        + "; current mainline uses apps/realtime-server and apps/mrd-service"
+    )
+
+
+def skipped_payload(suite: CoreTransportSuite, transports: List[str], reason: str) -> Dict[str, Any]:
+    return {
+        "suite": "python-core-transport",
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "log_dir": str(suite.log_dir),
+        "duration_sec": suite.duration_sec,
+        "thresholds": suite.thresholds,
+        "results": [
+            {
+                "transport": transport,
+                "ok": False,
+                "skipped": True,
+                "reason": reason,
+                "selected_transport": None,
+                "frame_count": 0,
+                "jitter_ms": {},
+                "tx_gap_ms": {},
+                "agent_error_count": 0,
+                "agent_quic_drop": 0,
+                "server_perf": {},
+                "raw": {},
+            }
+            for transport in transports
+        ],
+    }
+
+
 async def main_async(args):
     root = Path(args.root).resolve()
     cfg = load_config(Path(args.config).resolve())
     suite = CoreTransportSuite(root, cfg)
-    payload = await suite.run(args.transports)
+    reason = legacy_stack_skip_reason(root)
+    payload = skipped_payload(suite, args.transports, reason) if reason else await suite.run(args.transports)
     suite.write_reports(payload)
     print("suite_log_dir", suite.log_dir)
     print("suite_result", json.dumps(payload, ensure_ascii=False))
 
 
 def parse_args():
+    repo_root = default_repo_root()
     parser = argparse.ArgumentParser(description="Core transport automation suite")
-    parser.add_argument("--root", default="J:/ProjectTest/remote-desktop/mini-remote-desktop")
+    parser.add_argument("--root", default=str(repo_root))
     parser.add_argument(
         "--config",
-        default="J:/ProjectTest/remote-desktop/mini-remote-desktop/tests/python-core-transport/thresholds.json",
+        default=str(repo_root / "tests" / "python-core-transport" / "thresholds.json"),
     )
     parser.add_argument(
         "--transports",
@@ -1302,7 +1351,4 @@ if __name__ == "__main__":
         tmp_cfg.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
         args.config = str(tmp_cfg)
     asyncio.run(main_async(args))
-
-
-
 

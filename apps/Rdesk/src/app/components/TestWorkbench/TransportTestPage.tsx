@@ -12,6 +12,7 @@ import {
   type LanE2EAutomationCommands,
   type LanE2EAutomationReport,
 } from "../../services/lanE2eAutomationService";
+import { externalRunRecordFromLanE2EReport } from "../../services/lanE2eTelemetryService";
 import { chooseCapability } from "./capabilityMeta";
 import {
   buildCapabilitySnapshotFromIpc,
@@ -261,6 +262,20 @@ export function TransportTestPage() {
 
       setIsRunning(true);
       const requestedProfile = mediaProfileForTestProfile(testProfile);
+      const crossDeviceConfig: TestConfig = {
+        capture_type: "dxgi",
+        encoder_type: requestedProfile.codec === "hevc" ? "nvenc_hevc" : "nvenc_h264",
+        decoder_type: "nvdec",
+        renderer_type: "d3d11",
+        render_display: true,
+        zero_copy: true,
+        transport_kind: selectedTransport,
+        resolution: [requestedProfile.width, requestedProfile.height],
+        fps: requestedProfile.fps,
+        bitrate: requestedProfile.bitrate_mbps * 1_000_000,
+        duration_ms: 15_000,
+        warmup_ms: 500,
+      };
       const report = await runLanE2EAutomation(lanAutomationCommands, {
         scenarioId: "cross.e2e.remote_display_smoke",
         targetDeviceId: selectedPeer.device_id,
@@ -279,6 +294,14 @@ export function TransportTestPage() {
       setThroughputHistory([
         report.probeSnapshot?.bitrate_mbps ?? requestedProfile.bitrate_mbps,
       ]);
+      void commands.testRecordExternalRun(
+        externalRunRecordFromLanE2EReport(report, crossDeviceConfig, {
+          environment: capabilities,
+          peer: selectedPeer,
+          runMode: "manual",
+          runIdPrefix: "transport-lan",
+        })
+      );
       setIsRunning(false);
 
       if (report.status !== "completed") {

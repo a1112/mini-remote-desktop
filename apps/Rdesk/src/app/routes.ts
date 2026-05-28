@@ -19,6 +19,7 @@ import {
   TransportTestPage,
   CustomTestPage,
   MatrixTestPage,
+  PerformanceComparisonPage,
   TestHistoryPage,
   TestTelemetryPage,
 } from "./components/TestWorkbench";
@@ -58,6 +59,7 @@ export const router = createBrowserRouter([
       { path: "e2e", Component: E2ETestPage },
       { path: "custom", Component: CustomTestPage },
       { path: "matrix", Component: MatrixTestPage },
+      { path: "performance", Component: PerformanceComparisonPage },
       { path: "history", Component: TestHistoryPage },
       { path: "telemetry", Component: TestTelemetryPage },
       { path: "telemetry/:runId", Component: TestTelemetryPage },

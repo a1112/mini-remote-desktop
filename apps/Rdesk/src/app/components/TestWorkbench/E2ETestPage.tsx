@@ -11,6 +11,7 @@ import {
   type LanE2EAutomationReport,
   type LanE2EStatus,
 } from "../../services/lanE2eAutomationService";
+import { externalRunRecordFromLanE2EReport } from "../../services/lanE2eTelemetryService";
 import { capabilityAvailable, chooseCapability } from "./capabilityMeta";
 import {
   buildCapabilitySnapshotFromIpc,
@@ -66,6 +67,17 @@ function buildDefaultConfig(capabilities: EnvironmentSnapshot | null): TestConfi
     duration_ms: 10000,
     warmup_ms: 2000,
     input_source: capture === "synthetic" ? "synthetic" : "screen",
+  };
+}
+
+function configFromLanReport(baseConfig: TestConfig, report: LanE2EAutomationReport): TestConfig {
+  const profile = report.requestedProfile;
+  return {
+    ...baseConfig,
+    transport_kind: report.validationMode === "webrtc_rtp" ? "webrtc" : "quic",
+    resolution: profile ? [profile.width, profile.height] : baseConfig.resolution,
+    fps: profile?.fps ?? baseConfig.fps,
+    bitrate: profile?.bitrate_mbps ? profile.bitrate_mbps * 1_000_000 : baseConfig.bitrate,
   };
 }
 
@@ -230,6 +242,14 @@ export function E2ETestPage() {
     setLanReport(report);
     setLanRunState(report.status);
     publishLanAutomationReport(report);
+    void commands.testRecordExternalRun(
+      externalRunRecordFromLanE2EReport(report, configFromLanReport(currentConfig, report), {
+        environment: capabilities,
+        peer: report.peer ?? null,
+        runMode: "manual",
+        runIdPrefix: "e2e-lan",
+      })
+    );
     void commands.automationWriteReport(report).then((result) => {
       if (!result.ok) {
         console.error("Failed to write LAN E2E automation report", result.error);

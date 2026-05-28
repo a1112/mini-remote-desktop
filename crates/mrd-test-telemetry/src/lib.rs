@@ -19,6 +19,14 @@ pub struct TelemetryRunMetadata {
     pub finished_at: Option<u64>,
     #[serde(default)]
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_snapshot: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_snapshot: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classification: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -468,6 +476,10 @@ mod tests {
                 started_at: 1000,
                 finished_at: None,
                 tags: vec!["local".to_string()],
+                config_snapshot: None,
+                environment_snapshot: None,
+                summary: None,
+                classification: None,
             })
             .unwrap();
         store
@@ -513,6 +525,10 @@ mod tests {
                 started_at: 0,
                 finished_at: Some(3000),
                 tags: Vec::new(),
+                config_snapshot: None,
+                environment_snapshot: None,
+                summary: None,
+                classification: None,
             })
             .unwrap();
         for (name, timestamp, value) in [
@@ -571,6 +587,10 @@ mod tests {
                 started_at: 0,
                 finished_at: None,
                 tags: Vec::new(),
+                config_snapshot: None,
+                environment_snapshot: None,
+                summary: None,
+                classification: None,
             })
             .unwrap();
         let metrics_path = store.root().join("bad_run").join("metrics.jsonl");

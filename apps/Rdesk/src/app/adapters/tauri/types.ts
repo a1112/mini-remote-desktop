@@ -65,6 +65,7 @@ export type RunStatus =
   | "running"
   | "completed"
   | "failed"
+  | "skipped"
   | "cancelled";
 
 /**
@@ -128,6 +129,47 @@ export interface TestConfig {
   output_validation?: boolean;
 }
 
+export type TestRunScope = "local" | "cross_device";
+export type TestMemoryPath =
+  | "zero_copy_d3d11_shared"
+  | "cpu_copy"
+  | "webrtc_media_stream"
+  | "unknown";
+export type TestAccelerationMode = "hardware" | "software" | "browser" | "none" | "unknown";
+export type TestTransportPath = "none" | "webrtc" | "quic" | "loopback" | "unknown";
+export type TestRenderPath =
+  | "native_d3d11"
+  | "native_d3d12"
+  | "native_opengl"
+  | "native_macos"
+  | "native_linux"
+  | "browser_video"
+  | "webcodecs"
+  | "none"
+  | "unknown";
+
+export interface TestDeviceDescriptor {
+  device_id?: string | null;
+  device_name?: string | null;
+  platform?: string | null;
+  cpu?: string | null;
+  gpu?: string | null;
+  service_build_id?: string | null;
+  protocol_version?: number | null;
+  media_protocol_version?: number | null;
+}
+
+export interface TestClassification {
+  run_scope: TestRunScope;
+  memory_path: TestMemoryPath;
+  encode_accel: Exclude<TestAccelerationMode, "browser">;
+  decode_accel: TestAccelerationMode;
+  transport_path: TestTransportPath;
+  render_path: TestRenderPath;
+  local_device?: TestDeviceDescriptor | null;
+  peer_device?: TestDeviceDescriptor | null;
+}
+
 /**
  * Test run record - describes "one specific execution"
  */
@@ -141,6 +183,22 @@ export interface TestRun {
   config_snapshot: TestConfig;
   environment_snapshot: EnvironmentSnapshot;
   summary?: TestRunSummary;
+  classification?: TestClassification | null;
+}
+
+export interface ExternalTestRunRecord {
+  run_id?: string;
+  scenario_id: string;
+  run_mode?: RunMode;
+  status: RunStatus;
+  started_at: number;
+  finished_at?: number | null;
+  config_snapshot: TestConfig;
+  environment_snapshot?: EnvironmentSnapshot | null;
+  summary?: TestRunSummary | null;
+  classification?: TestClassification | null;
+  events?: TestStageEvent[];
+  artifacts?: Artifact[];
 }
 
 /**
@@ -256,6 +314,10 @@ export interface TestRunSummary {
   adaptation_reason?: string;
   error_message?: string;
   failure_reason?: FailureReason;
+  cpu_p95_percent?: number;
+  gpu_p95_percent?: number;
+  memory_peak_mb?: number;
+  network_peak_mbps?: number;
 }
 
 /**
@@ -313,7 +375,8 @@ export type ArtifactKind =
   | "encoded_sample"
   | "structured_log"
   | "raw_log"
-  | "summary_json";
+  | "summary_json"
+  | "lan_e2e_report";
 
 /**
  * Artifact record
@@ -677,6 +740,10 @@ export interface TelemetryRunMetadata {
   started_at: number;
   finished_at?: number | null;
   tags: string[];
+  config_snapshot?: TestConfig | null;
+  environment_snapshot?: EnvironmentSnapshot | null;
+  summary?: TestRunSummary | null;
+  classification?: TestClassification | null;
 }
 
 export interface TelemetryLogEntry {

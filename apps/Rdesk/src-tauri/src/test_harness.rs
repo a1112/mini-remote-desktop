@@ -2228,6 +2228,7 @@ impl TestHarness {
         let mut total_bitstream_bytes = 0_usize;
         let mut last_decode_error = None::<String>;
         let mut last_capture_success = Instant::now();
+        let mut reported_first_decoded_frame = false;
         let dump_first_access_unit_path = std::env::var("MRD_HARNESS_DUMP_FIRST_ACCESS_UNIT").ok();
         let mut dumped_first_access_unit = false;
         let update_web_preview = state.visual_preview;
@@ -2487,7 +2488,10 @@ impl TestHarness {
                 }
             }
 
-            if frame_count % 30 == 0 {
+            let should_publish_metrics = frame_count == 1
+                || frame_count % 30 == 0
+                || (!reported_first_decoded_frame && decoded_frames_total > 0);
+            if should_publish_metrics {
                 Self::update_metrics(
                     &metrics,
                     frame_count,
@@ -2506,6 +2510,9 @@ impl TestHarness {
                     &render_latencies,
                     &total_latencies,
                 );
+                if decoded_frames_total > 0 {
+                    reported_first_decoded_frame = true;
+                }
             }
         }
 

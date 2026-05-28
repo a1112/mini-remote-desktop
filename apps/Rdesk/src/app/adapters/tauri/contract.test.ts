@@ -972,6 +972,27 @@ describe('Tauri Adapter Contract', () => {
       });
     });
 
+    it('test_record_external_run calls correct command with record', async () => {
+      const mockInvoke = getMockInvoke();
+      const record = {
+        scenario_id: 'cross.e2e.remote_display_smoke',
+        run_mode: 'matrix' as const,
+        status: 'completed' as const,
+        started_at: 1000,
+        finished_at: 2000,
+        config_snapshot: {
+          transport_kind: 'webrtc' as const,
+        },
+      };
+      mockInvoke.mockResolvedValue('run-external');
+
+      await adapter.testRecordExternalRun(record);
+
+      expect(mockInvoke).toHaveBeenCalledWith('test_record_external_run', {
+        record,
+      });
+    });
+
     it('test_list_window_capture_targets calls correct command', async () => {
       const mockInvoke = getMockInvoke();
       mockInvoke.mockResolvedValue([]);
