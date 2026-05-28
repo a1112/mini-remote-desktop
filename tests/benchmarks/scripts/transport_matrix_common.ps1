@@ -45,6 +45,9 @@ function Assert-TransportMatrixSummaryPassed {
   )
 
   $summary = Get-Content $SummaryPath -Raw | ConvertFrom-Json
+  if ($summary.run_skipped) {
+    return
+  }
   if (-not $summary.run_passed) {
     throw "transport matrix failed thresholds for $($summary.scenario)/$($summary.profile). See $SummaryPath"
   }

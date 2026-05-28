@@ -1947,7 +1947,9 @@ export function RemoteDisplayWindowPage() {
   const [nativeSurface, setNativeSurface] =
     useState<NativeRenderSurfaceSnapshot | null>(null);
   const [renderMode, setRenderMode] = useState<RenderMode>(() =>
-    isTauriRuntime() ? defaultNativeRenderMode() : "web"
+    isTauriRuntime() && !isLocalPipelinePreviewSession(id ?? "local-preview")
+      ? defaultNativeRenderMode()
+      : "web"
   );
   const [capture, setCapture] = useState<CaptureType>("dxgi");
   const [encoder, setEncoder] = useState<EncoderType>("nvenc_hevc");

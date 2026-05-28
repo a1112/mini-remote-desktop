@@ -43,6 +43,7 @@ import type {
   // Test Workbench Types
   TestScenario,
   TestRun,
+  ExternalTestRunRecord,
   TestConfig,
   TestStageEvent,
   MetricSeries,
@@ -176,6 +177,27 @@ function browserDevCapabilities(): EnvironmentSnapshot | null {
     available_renderers: ['webview'],
     available_memory_modes: ['cpu'],
   };
+}
+
+async function browserDevTestRuns(params?: {
+  scenarioId?: string;
+  status?: string;
+  limit?: number;
+}): Promise<AdapterResult<TestRun[]>> {
+  if (!isLocalBrowserFallbackAllowed()) return { ok: true, value: [] };
+
+  try {
+    const response = await fetch('/dev-test-runs.json', { cache: 'no-store' });
+    if (!response.ok) return { ok: true, value: [] };
+    const runs = (await response.json()) as TestRun[];
+    const filtered = runs
+      .filter((run) => !params?.scenarioId || run.scenario_id === params.scenarioId)
+      .filter((run) => !params?.status || run.status === params.status)
+      .sort((a, b) => b.started_at - a.started_at);
+    return { ok: true, value: filtered.slice(0, params?.limit ?? filtered.length) };
+  } catch {
+    return { ok: true, value: [] };
+  }
 }
 
 // ============================================================================
@@ -1171,6 +1193,12 @@ export async function testStartRun(params: {
   });
 }
 
+export async function testRecordExternalRun(
+  record: ExternalTestRunRecord
+): Promise<AdapterResult<string>> {
+  return invokeAdapter<string>('test_record_external_run', { record });
+}
+
 /**
  * Stop a running test
  */
@@ -1186,6 +1214,9 @@ export async function testListRuns(params?: {
   status?: string;
   limit?: number;
 }): Promise<AdapterResult<TestRun[]>> {
+  if (import.meta.env.MODE !== 'test' && isLocalBrowserFallbackAllowed()) {
+    return browserDevTestRuns(params);
+  }
   return invokeAdapter<TestRun[]>('test_list_runs', params);
 }
 

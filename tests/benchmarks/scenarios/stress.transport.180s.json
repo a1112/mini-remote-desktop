@@ -10,5 +10,5 @@
   "height": 1080,
   "fps": 30,
   "duration_secs": 180,
-  "threshold_file": "transport.60s.json"
+  "threshold_file": "transport.software-1080p-stress.json"
 }

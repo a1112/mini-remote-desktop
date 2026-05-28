@@ -723,6 +723,9 @@ async fn browser_webrtc_preview_start(
 ) -> Result<BrowserWebrtcPreviewAnswer, String> {
     ensure_rustls_crypto_provider();
 
+    // The Tauri preview sender consumes encoded access units from the already
+    // running local test harness. Width/height/bitrate/source are applied when
+    // that harness run is started from the frontend.
     let _ = (width, height, bitrate_mbps, source_id);
     let session_id = SessionId(session_id);
     let fps = fps.unwrap_or(60).clamp(1, 144);
@@ -734,8 +737,6 @@ async fn browser_webrtc_preview_start(
         .unwrap()
         .subscribe_encoded_access_units();
     let mut host = state.webrtc_host.lock().await;
-    host.apply_remote_offer(session_id.clone(), offer_sdp)
-        .await?;
     match codec {
         VideoCodec::H264 => {
             host.prepare_browser_h264_sender(session_id.clone(), fps, &h264_profile)
@@ -755,6 +756,8 @@ async fn browser_webrtc_preview_start(
             );
         }
     }
+    host.apply_remote_offer(session_id.clone(), offer_sdp)
+        .await?;
     let answer = host.create_answer(session_id.clone()).await?;
     host.start_encoded_access_unit_sender_with_codec(
         session_id,
@@ -2657,6 +2660,21 @@ async fn test_start_run(
     .map_err(|e| e.to_string())?
 }
 
+#[tauri::command]
+async fn test_record_external_run(
+    state: tauri::State<'_, AppState>,
+    record: test_orchestrator::ExternalTestRunRecord,
+) -> Result<String, String> {
+    let orchestrator = state.test_orchestrator.clone();
+    tokio::task::spawn_blocking(move || {
+        orchestrator
+            .record_external_run(record)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Stop a test run
 #[tauri::command]
 async fn test_stop_run(state: tauri::State<'_, AppState>, run_id: String) -> Result<(), String> {
@@ -3579,6 +3597,7 @@ fn main() {
             test_list_capture_share_sources,
             test_list_capture_share_sources_with_previews,
             test_start_run,
+            test_record_external_run,
             test_stop_run,
             test_list_runs,
             test_get_run,

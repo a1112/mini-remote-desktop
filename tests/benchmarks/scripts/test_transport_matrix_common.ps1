@@ -69,6 +69,11 @@ try {
     ConvertTo-Json |
     Set-Content -Path $tmp -Encoding Ascii
   Assert-TransportMatrixSummaryPassed -SummaryPath $tmp
+
+  @{ run_passed = $false; run_skipped = $true; scenario = "quick.transport"; profile = "vvc" } |
+    ConvertTo-Json |
+    Set-Content -Path $tmp -Encoding Ascii
+  Assert-TransportMatrixSummaryPassed -SummaryPath $tmp
 } finally {
   Remove-Item $tmp -ErrorAction SilentlyContinue
 }

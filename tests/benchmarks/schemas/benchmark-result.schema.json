@@ -27,6 +27,7 @@
     "error_count",
     "restart_count",
     "failure_reason",
+    "run_skipped",
     "run_passed"
   ],
   "properties": {
@@ -67,6 +68,7 @@
     "frame_sink_ingest_p95_ms": { "type": ["number", "null"] },
     "render_upload_p95_ms": { "type": ["number", "null"] },
     "render_present_p95_ms": { "type": ["number", "null"] },
+    "run_skipped": { "type": "boolean" },
     "run_passed": { "type": "boolean" }
   },
   "additionalProperties": false

@@ -39,8 +39,11 @@ $summary.restart_count = $restartCount
 if (-not ($summary.PSObject.Properties.Name -contains 'failure_reason')) {
   $summary | Add-Member -NotePropertyName failure_reason -NotePropertyValue $null
 }
+if (-not ($summary.PSObject.Properties.Name -contains 'run_skipped')) {
+  $summary | Add-Member -NotePropertyName run_skipped -NotePropertyValue $false
+}
 
-if ($ThresholdPath -and (Test-Path $ThresholdPath)) {
+if ((-not $summary.run_skipped) -and $ThresholdPath -and (Test-Path $ThresholdPath)) {
   $thresholds = Get-Content $ThresholdPath -Raw | ConvertFrom-Json
   $summary.run_passed = (
     $summary.run_passed -and
@@ -93,13 +96,13 @@ $headers = @(
   'quic_receiver_duplicate_fragments','quic_receiver_rejected_fragments','quic_receiver_pending_frames',
   'quic_receiver_reassembly_drops','zero_write_access_unit_count',
   'warning_count','error_count','restart_count','encode_total_p95_ms','send_write_p95_ms','decode_total_p95_ms',
-  'frame_sink_ingest_p95_ms','render_upload_p95_ms','render_present_p95_ms','failure_reason','run_passed'
+  'frame_sink_ingest_p95_ms','render_upload_p95_ms','render_present_p95_ms','failure_reason','run_skipped','run_passed'
 )
 $row = [pscustomobject]@{}
 foreach ($header in $headers) { $row | Add-Member -NotePropertyName $header -NotePropertyValue $summary.$header }
 $row | Export-Csv -Path $csvPath -NoTypeInformation -Encoding Ascii
 
-$status = if ($summary.run_passed) { 'PASS' } else { 'FAIL' }
+$status = if ($summary.run_skipped) { 'SKIP' } elseif ($summary.run_passed) { 'PASS' } else { 'FAIL' }
 $report = @(
   "# Transport Benchmark Report",
   "",
@@ -113,6 +116,7 @@ $report = @(
   "## Result",
   "",
   "- Status: $status",
+  "- Skipped: $($summary.run_skipped)",
   "- Session established: $($summary.session_established)",
   "- First frame seen: $($summary.first_frame_seen)",
   "- First frame time ms: $($summary.first_frame_time_ms)",

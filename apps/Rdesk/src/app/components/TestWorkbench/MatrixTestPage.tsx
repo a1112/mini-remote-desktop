@@ -1,5 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Play, Grid3x3, CheckCircle2, XCircle, Clock, Loader2, Square, RefreshCw } from "lucide-react";
+import {
+  Bar,
+  CartesianGrid,
+  ComposedChart,
+  Legend,
+  Line,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
 import * as commands from "../../adapters/tauri/commands";
 import type {
   EnvironmentSnapshot,
@@ -24,6 +35,13 @@ import {
   type LanE2EAutomationCommands,
   type LanE2EAutomationReport,
 } from "../../services/lanE2eAutomationService";
+import {
+  externalRunRecordFromLanE2EReport,
+  summaryFromLanE2EReport,
+} from "../../services/lanE2eTelemetryService";
+import {
+  buildMatrixPerformanceSummary,
+} from "../../services/testClassificationService";
 import {
   readShowUnavailableCapabilities,
   useShowUnavailableCapabilities,
@@ -693,6 +711,13 @@ const MAX_MATRIX_RUNS = 300;
 const MAX_MATRIX_RENDER_ROWS = 250;
 const SKIP_YIELD_BATCH_SIZE = 20;
 const LOCAL_LAN_TARGET_ID = "__local__";
+const MATRIX_CHART_COLORS = {
+  fps: "#2563eb",
+  latency: "#dc2626",
+  budget: "#9333ea",
+  drop: "#ea580c",
+  frames: "#0891b2",
+};
 const CROSS_DEVICE_LOOPBACK_REASON =
   "Loopback 仅支持本机进程内测试；跨设备矩阵请显式选择 QUIC Datagram 或 WebRTC RTP。";
 
@@ -917,28 +942,6 @@ export function mediaProfileFromConfig(config: TestConfig): MediaProfile {
 
 function crossDeviceMinimumExpectedFps(profile: MediaProfile): number {
   return Math.max(1, Math.floor(Math.max(1, profile.fps) * 0.8));
-}
-
-function summaryFromLanReport(report: LanE2EAutomationReport): TestRunSummary {
-  const probe = report.probeSnapshot;
-  const adaptation = report.mediaAdaptationSnapshot ?? report.mediaPipelineSnapshot?.adaptation;
-  return {
-    total_duration_ms: Math.max(0, report.finishedAt - report.startedAt),
-    capture_fps: probe?.current_fps ?? undefined,
-    dropped_frames: probe?.frames_dropped ?? 0,
-    frame_count: probe?.frames_decoded ?? 0,
-    adaptation_state: adaptation?.state,
-    adaptation_ladder_index: adaptation?.ladder_index,
-    adaptation_current_profile: adaptation
-      ? formatMatrixMediaProfile(adaptation.current_profile)
-      : undefined,
-    adaptation_target_profile: adaptation
-      ? formatMatrixMediaProfile(adaptation.target_profile)
-      : undefined,
-    adaptation_reason: adaptation?.last_reason ?? undefined,
-    error_message: report.errorMessage,
-    failure_reason: report.failureReason ? "validation_failure" : undefined,
-  };
 }
 
 export function formatMatrixMediaProfile(profile: MediaProfile): string {
@@ -1713,8 +1716,15 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
             `matrix-lan-${sanitizeSessionPart(targetPeer.device_id)}-${Date.now()}-${i}`,
         });
 
-        const summary = summaryFromLanReport(report);
+        const summary = summaryFromLanE2EReport(report);
         const duration = Date.now() - startTime;
+        void commands.testRecordExternalRun(
+          externalRunRecordFromLanE2EReport(report, test.config, {
+            environment: capabilities,
+            peer: targetPeer,
+            runMode: "matrix",
+          })
+        );
 
         if (stopRequestedRef.current) {
           markSkipped("用户停止矩阵测试", duration);
@@ -1830,6 +1840,16 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
   const platformLabel = capabilities?.os_type ?? "windows";
   const visibleTests = tests.slice(0, MAX_MATRIX_RENDER_ROWS);
   const hiddenResultRows = tests.length - visibleTests.length;
+  const selectedPeerForCharts = lanPeers.find((peer) => peer.device_id === selectedLanTargetId) ?? null;
+  const matrixPerformanceSummary = useMemo(
+    () =>
+      buildMatrixPerformanceSummary(tests, capabilities, {
+        runScope: isRemoteCrossDeviceRun ? "cross_device" : "local",
+        peer: isRemoteCrossDeviceRun ? selectedPeerForCharts : null,
+      }),
+    [capabilities, isRemoteCrossDeviceRun, selectedPeerForCharts, tests]
+  );
+  const matrixChartRows = matrixPerformanceSummary.rows.slice(0, 40);
 
   const getStatusIcon = (status: MatrixTest["status"]) => {
     switch (status) {
@@ -2080,6 +2100,63 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
           </div>
         )}
       </div>
+
+      {matrixChartRows.length > 0 && (
+        <div className="mb-6 grid gap-4 xl:grid-cols-2">
+          <section className="rounded-lg border bg-card p-4">
+            <h2 className="mb-3 text-lg font-semibold">Current batch FPS</h2>
+            <ResponsiveContainer width="100%" height={260}>
+              <ComposedChart data={matrixChartRows}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="runId" tickFormatter={(_, index) => String(index + 1)} />
+                <YAxis />
+                <Tooltip />
+                <Legend />
+                <Bar dataKey="fpsAvg" name="Avg FPS" fill={MATRIX_CHART_COLORS.fps} />
+                <Line
+                  dataKey="threeFrameBudgetMs"
+                  name="3-frame ms"
+                  stroke={MATRIX_CHART_COLORS.budget}
+                  dot={false}
+                />
+              </ComposedChart>
+            </ResponsiveContainer>
+          </section>
+
+          <section className="rounded-lg border bg-card p-4">
+            <h2 className="mb-3 text-lg font-semibold">Current batch latency and drops</h2>
+            <ResponsiveContainer width="100%" height={260}>
+              <ComposedChart data={matrixChartRows}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="runId" tickFormatter={(_, index) => String(index + 1)} />
+                <YAxis yAxisId="left" />
+                <YAxis yAxisId="right" orientation="right" />
+                <Tooltip />
+                <Legend />
+                <Bar
+                  yAxisId="left"
+                  dataKey="latencyP95Ms"
+                  name="P95 ms"
+                  fill={MATRIX_CHART_COLORS.latency}
+                />
+                <Bar
+                  yAxisId="left"
+                  dataKey="frameCount"
+                  name="Frames"
+                  fill={MATRIX_CHART_COLORS.frames}
+                />
+                <Line
+                  yAxisId="right"
+                  dataKey="dropRatePct"
+                  name="Drop %"
+                  stroke={MATRIX_CHART_COLORS.drop}
+                  strokeWidth={2}
+                />
+              </ComposedChart>
+            </ResponsiveContainer>
+          </section>
+        </div>
+      )}
 
       {/* Test Results Grid */}
       {tests.length > 0 && (

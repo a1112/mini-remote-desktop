@@ -117,6 +117,90 @@ pub struct TestConfigData {
     pub output_validation: Option<bool>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TestRunScope {
+    Local,
+    CrossDevice,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TestMemoryPath {
+    ZeroCopyD3d11Shared,
+    CpuCopy,
+    WebrtcMediaStream,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TestAccelerationMode {
+    Hardware,
+    Software,
+    Browser,
+    None,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TestTransportPath {
+    None,
+    Webrtc,
+    Quic,
+    Loopback,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TestRenderPath {
+    NativeD3d11,
+    NativeD3d12,
+    NativeOpengl,
+    NativeMacos,
+    NativeLinux,
+    BrowserVideo,
+    Webcodecs,
+    None,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct TestDeviceDescriptor {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_build_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_protocol_version: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TestClassification {
+    pub run_scope: TestRunScope,
+    pub memory_path: TestMemoryPath,
+    pub encode_accel: TestAccelerationMode,
+    pub decode_accel: TestAccelerationMode,
+    pub transport_path: TestTransportPath,
+    pub render_path: TestRenderPath,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_device: Option<TestDeviceDescriptor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_device: Option<TestDeviceDescriptor>,
+}
+
 fn deserialize_optional_hwnd<'de, D>(deserializer: D) -> Result<Option<isize>, D::Error>
 where
     D: Deserializer<'de>,
@@ -173,6 +257,33 @@ pub struct TestRun {
     pub config_snapshot: TestConfigData,
     pub environment_snapshot: EnvironmentSnapshot,
     pub summary: Option<TestRunSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classification: Option<TestClassification>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExternalTestRunRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<RunId>,
+    pub scenario_id: String,
+    #[serde(default)]
+    pub run_mode: Option<RunMode>,
+    pub status: RunStatus,
+    pub started_at: u64,
+    #[serde(default)]
+    pub finished_at: Option<u64>,
+    #[serde(default)]
+    pub config_snapshot: TestConfigData,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_snapshot: Option<EnvironmentSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<TestRunSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classification: Option<TestClassification>,
+    #[serde(default)]
+    pub events: Vec<TestStageEvent>,
+    #[serde(default)]
+    pub artifacts: Vec<Artifact>,
 }
 
 /// Environment snapshot
@@ -207,6 +318,10 @@ pub struct TestRunSummary {
     pub frame_count: usize,
     pub error_message: Option<String>,
     pub failure_reason: Option<String>,
+    pub cpu_p95_percent: Option<f64>,
+    pub gpu_p95_percent: Option<f64>,
+    pub memory_peak_mb: Option<f64>,
+    pub network_peak_mbps: Option<f64>,
 }
 
 /// Test stage event
@@ -1001,8 +1116,14 @@ impl TestOrchestrator {
             started_at,
             finished_at: None,
             config_snapshot: config.clone(),
-            environment_snapshot: env_snapshot,
+            environment_snapshot: env_snapshot.clone(),
             summary: None,
+            classification: Some(derive_test_classification(
+                &config,
+                &env_snapshot,
+                TestRunScope::Local,
+                None,
+            )),
         };
 
         self.runs.lock().unwrap().insert(run_id.clone(), run);
@@ -1280,8 +1401,14 @@ impl TestOrchestrator {
             started_at,
             finished_at: None,
             config_snapshot: config.clone(),
-            environment_snapshot: env_snapshot,
+            environment_snapshot: env_snapshot.clone(),
             summary: None,
+            classification: Some(derive_test_classification(
+                &config,
+                &env_snapshot,
+                TestRunScope::Local,
+                None,
+            )),
         };
 
         self.runs.lock().unwrap().insert(run_id.clone(), run);
@@ -1486,8 +1613,14 @@ impl TestOrchestrator {
             started_at,
             finished_at: None,
             config_snapshot: config.clone(),
-            environment_snapshot: env_snapshot,
+            environment_snapshot: env_snapshot.clone(),
             summary: None,
+            classification: Some(derive_test_classification(
+                &config,
+                &env_snapshot,
+                TestRunScope::Local,
+                None,
+            )),
         };
 
         self.runs.lock().unwrap().insert(run_id.clone(), run);
@@ -2349,6 +2482,70 @@ impl TestOrchestrator {
         Ok(())
     }
 
+    pub fn record_external_run(&self, record: ExternalTestRunRecord) -> Result<RunId> {
+        let run_id = record.run_id.unwrap_or_else(generate_run_id);
+        let environment_snapshot = match record.environment_snapshot {
+            Some(snapshot) => snapshot,
+            None => self.get_capabilities()?,
+        };
+        let classification = record.classification.or_else(|| {
+            Some(derive_test_classification(
+                &record.config_snapshot,
+                &environment_snapshot,
+                TestRunScope::CrossDevice,
+                None,
+            ))
+        });
+        let run = TestRun {
+            run_id: run_id.clone(),
+            scenario_id: record.scenario_id,
+            run_mode: record.run_mode.unwrap_or(RunMode::Matrix),
+            status: record.status,
+            started_at: record.started_at,
+            finished_at: record.finished_at,
+            config_snapshot: record.config_snapshot,
+            environment_snapshot,
+            summary: record.summary,
+            classification,
+        };
+
+        self.runs.lock().unwrap().insert(run_id.clone(), run);
+        self.persist_run_by_id(&run_id);
+
+        if !record.events.is_empty() {
+            let events: Vec<_> = record
+                .events
+                .into_iter()
+                .map(|event| {
+                    append_event_to_store(&self.telemetry_store, &run_id, &event);
+                    event
+                })
+                .collect();
+            self.run_events
+                .lock()
+                .unwrap()
+                .insert(run_id.clone(), events);
+        }
+
+        if !record.artifacts.is_empty() {
+            let artifacts: Vec<_> = record
+                .artifacts
+                .into_iter()
+                .map(|mut artifact| {
+                    artifact.run_id = run_id.clone();
+                    artifact
+                })
+                .collect();
+            self.run_artifacts
+                .lock()
+                .unwrap()
+                .insert(run_id.clone(), artifacts);
+            self.persist_artifacts_by_id(&run_id);
+        }
+
+        Ok(run_id)
+    }
+
     /// Get a test run
     pub fn get_run(&self, run_id: &str) -> Option<TestRun> {
         self.runs.lock().unwrap().get(run_id).cloned()
@@ -2363,6 +2560,19 @@ impl TestOrchestrator {
     ) -> Vec<TestRun> {
         let runs = self.runs.lock().unwrap();
         let mut result: Vec<TestRun> = runs.values().cloned().collect();
+        drop(runs);
+
+        if let Ok(persisted_runs) = self.telemetry_store.list_runs(None) {
+            let mut known = result
+                .iter()
+                .map(|run| run.run_id.clone())
+                .collect::<std::collections::HashSet<_>>();
+            for metadata in persisted_runs {
+                if known.insert(metadata.run_id.clone()) {
+                    result.push(test_run_from_metadata(metadata));
+                }
+            }
+        }
 
         // Apply filters
         if let Some(sid) = scenario_id {
@@ -3452,6 +3662,10 @@ impl Default for TestRunSummary {
             frame_count: 0,
             error_message: None,
             failure_reason: None,
+            cpu_p95_percent: None,
+            gpu_p95_percent: None,
+            memory_peak_mb: None,
+            network_peak_mbps: None,
         }
     }
 }
@@ -3507,7 +3721,173 @@ fn harness_config_from_data(config: &TestConfigData) -> HarnessConfig {
     }
 }
 
+fn derive_test_classification(
+    config: &TestConfigData,
+    environment: &EnvironmentSnapshot,
+    run_scope: TestRunScope,
+    peer_device: Option<TestDeviceDescriptor>,
+) -> TestClassification {
+    let encoder = config.encoder_type.as_deref().unwrap_or("none");
+    let decoder = config.decoder_type.as_deref().unwrap_or("none");
+    let transport = config.transport_kind.as_deref().unwrap_or("loopback");
+    let renderer = config.renderer_type.as_deref().unwrap_or("none");
+    let render_display = config.render_display.unwrap_or(false);
+
+    let transport_path = match transport {
+        "webrtc" | "webrtc_rtp" => TestTransportPath::Webrtc,
+        "quic" | "quic_datagram" => TestTransportPath::Quic,
+        "loopback" => TestTransportPath::Loopback,
+        "none" => TestTransportPath::None,
+        _ => TestTransportPath::Unknown,
+    };
+    let memory_path = if matches!(transport_path, TestTransportPath::Webrtc)
+        && (!render_display || renderer == "webview")
+    {
+        TestMemoryPath::WebrtcMediaStream
+    } else if config.zero_copy == Some(true) {
+        TestMemoryPath::ZeroCopyD3d11Shared
+    } else if encoder == "none" && decoder == "none" && renderer == "none" {
+        TestMemoryPath::Unknown
+    } else {
+        TestMemoryPath::CpuCopy
+    };
+    let encode_accel = match encoder {
+        "none" => TestAccelerationMode::None,
+        "nvenc_h264" | "nvenc_hevc" | "nvenc_hevc_main10" | "nvenc_av1" | "videotoolbox_h264" => {
+            TestAccelerationMode::Hardware
+        }
+        "openh264" => TestAccelerationMode::Software,
+        _ => TestAccelerationMode::Unknown,
+    };
+    let decode_accel = match decoder {
+        "none" if matches!(transport_path, TestTransportPath::Webrtc) => {
+            TestAccelerationMode::Browser
+        }
+        "none" => TestAccelerationMode::None,
+        "nvdec" | "linux_h264" | "linux_hevc" | "linux_hevc_main10" | "videotoolbox" => {
+            TestAccelerationMode::Hardware
+        }
+        "software" => TestAccelerationMode::Software,
+        _ => TestAccelerationMode::Unknown,
+    };
+    let render_path = if matches!(transport_path, TestTransportPath::Webrtc)
+        && (!render_display || renderer == "webview")
+    {
+        TestRenderPath::BrowserVideo
+    } else if !render_display {
+        TestRenderPath::None
+    } else {
+        match renderer {
+            "d3d11" => TestRenderPath::NativeD3d11,
+            "d3d12" => TestRenderPath::NativeD3d12,
+            "opengl" => TestRenderPath::NativeOpengl,
+            "macos" | "metal" => TestRenderPath::NativeMacos,
+            "linux" => TestRenderPath::NativeLinux,
+            "webview" => TestRenderPath::BrowserVideo,
+            "webcodecs" => TestRenderPath::Webcodecs,
+            _ => TestRenderPath::Unknown,
+        }
+    };
+
+    TestClassification {
+        run_scope,
+        memory_path,
+        encode_accel,
+        decode_accel,
+        transport_path,
+        render_path,
+        local_device: Some(TestDeviceDescriptor {
+            device_id: None,
+            device_name: Some("local".to_string()),
+            platform: Some(environment.os_type.clone()),
+            cpu: Some(environment.cpu_brand.clone()),
+            gpu: Some(environment.gpu_info.clone()),
+            service_build_id: None,
+            protocol_version: None,
+            media_protocol_version: None,
+        }),
+        peer_device,
+    }
+}
+
+fn unknown_environment_snapshot() -> EnvironmentSnapshot {
+    EnvironmentSnapshot {
+        os_type: "unknown".to_string(),
+        cpu_brand: "Unknown CPU".to_string(),
+        cpu_cores: 0,
+        memory_gb: 0,
+        gpu_info: "Unknown GPU".to_string(),
+        available_captures: Vec::new(),
+        available_encoders: Vec::new(),
+        available_decoders: Vec::new(),
+        available_renderers: Vec::new(),
+        available_memory_modes: Vec::new(),
+    }
+}
+
+fn test_run_from_metadata(metadata: telemetry::TelemetryRunMetadata) -> TestRun {
+    let config_snapshot = metadata
+        .config_snapshot
+        .and_then(|value| serde_json::from_value::<TestConfigData>(value).ok())
+        .unwrap_or_default();
+    let environment_snapshot = metadata
+        .environment_snapshot
+        .and_then(|value| serde_json::from_value::<EnvironmentSnapshot>(value).ok())
+        .unwrap_or_else(unknown_environment_snapshot);
+    let summary = metadata
+        .summary
+        .and_then(|value| serde_json::from_value::<TestRunSummary>(value).ok());
+    let classification = metadata
+        .classification
+        .and_then(|value| serde_json::from_value::<TestClassification>(value).ok())
+        .or_else(|| {
+            Some(derive_test_classification(
+                &config_snapshot,
+                &environment_snapshot,
+                if metadata.tags.iter().any(|tag| tag == "cross_device") {
+                    TestRunScope::CrossDevice
+                } else {
+                    TestRunScope::Local
+                },
+                None,
+            ))
+        });
+    let status = serde_json::from_str::<RunStatus>(&format!("\"{}\"", metadata.status))
+        .unwrap_or(RunStatus::Completed);
+    let run_mode = metadata
+        .tags
+        .iter()
+        .find_map(|tag| serde_json::from_str::<RunMode>(&format!("\"{}\"", tag)).ok())
+        .unwrap_or(RunMode::Manual);
+
+    TestRun {
+        run_id: metadata.run_id,
+        scenario_id: metadata.scenario_id,
+        run_mode,
+        status,
+        started_at: metadata.started_at,
+        finished_at: metadata.finished_at,
+        config_snapshot,
+        environment_snapshot,
+        summary,
+        classification,
+    }
+}
+
 fn run_metadata_from_test_run(run: &TestRun) -> telemetry::TelemetryRunMetadata {
+    let mut tags = vec![serde_json::to_value(&run.run_mode)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "manual".to_string())];
+    if matches!(
+        run.classification
+            .as_ref()
+            .map(|classification| &classification.run_scope),
+        Some(TestRunScope::CrossDevice)
+    ) {
+        tags.push("cross_device".to_string());
+    }
+
     telemetry::TelemetryRunMetadata {
         run_id: run.run_id.clone(),
         scenario_id: run.scenario_id.clone(),
@@ -3517,10 +3897,17 @@ fn run_metadata_from_test_run(run: &TestRun) -> telemetry::TelemetryRunMetadata 
             .unwrap_or_else(|| format!("{:?}", run.status).to_ascii_lowercase()),
         started_at: run.started_at,
         finished_at: run.finished_at,
-        tags: vec![serde_json::to_value(&run.run_mode)
-            .ok()
-            .and_then(|value| value.as_str().map(str::to_string))
-            .unwrap_or_else(|| "manual".to_string())],
+        tags,
+        config_snapshot: serde_json::to_value(&run.config_snapshot).ok(),
+        environment_snapshot: serde_json::to_value(&run.environment_snapshot).ok(),
+        summary: run
+            .summary
+            .as_ref()
+            .and_then(|summary| serde_json::to_value(summary).ok()),
+        classification: run
+            .classification
+            .as_ref()
+            .and_then(|classification| serde_json::to_value(classification).ok()),
     }
 }
 
@@ -3801,6 +4188,59 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("Unsupported test scenario"));
+    }
+
+    #[test]
+    fn derives_local_zero_copy_hardware_classification() {
+        let classification = derive_test_classification(
+            &TestConfigData {
+                capture_type: Some("dxgi".to_string()),
+                encoder_type: Some("nvenc_h264".to_string()),
+                decoder_type: Some("nvdec".to_string()),
+                renderer_type: Some("d3d11".to_string()),
+                render_display: Some(true),
+                zero_copy: Some(true),
+                transport_kind: Some("loopback".to_string()),
+                ..Default::default()
+            },
+            &test_env(),
+            TestRunScope::Local,
+            None,
+        );
+
+        assert_eq!(classification.run_scope, TestRunScope::Local);
+        assert_eq!(
+            classification.memory_path,
+            TestMemoryPath::ZeroCopyD3d11Shared
+        );
+        assert_eq!(classification.encode_accel, TestAccelerationMode::Hardware);
+        assert_eq!(classification.decode_accel, TestAccelerationMode::Hardware);
+        assert_eq!(classification.render_path, TestRenderPath::NativeD3d11);
+    }
+
+    #[test]
+    fn derives_browser_webrtc_classification() {
+        let classification = derive_test_classification(
+            &TestConfigData {
+                capture_type: Some("dxgi".to_string()),
+                encoder_type: Some("nvenc_h264".to_string()),
+                decoder_type: Some("none".to_string()),
+                render_display: Some(false),
+                zero_copy: Some(false),
+                transport_kind: Some("webrtc".to_string()),
+                ..Default::default()
+            },
+            &test_env(),
+            TestRunScope::Local,
+            None,
+        );
+
+        assert_eq!(
+            classification.memory_path,
+            TestMemoryPath::WebrtcMediaStream
+        );
+        assert_eq!(classification.decode_accel, TestAccelerationMode::Browser);
+        assert_eq!(classification.render_path, TestRenderPath::BrowserVideo);
     }
 
     #[test]
@@ -4297,6 +4737,7 @@ mod tests {
                 config_snapshot: TestConfigData::default(),
                 environment_snapshot: test_env(),
                 summary: None,
+                classification: None,
             },
         );
 
@@ -4479,6 +4920,7 @@ mod tests {
                 config_snapshot: TestConfigData::default(),
                 environment_snapshot: test_env(),
                 summary: None,
+                classification: None,
             },
         );
 

@@ -1063,7 +1063,7 @@ describe("RemoteDisplayWindowPage", () => {
           scenarioId: "custom",
           config: expect.objectContaining({
             capture_type: "dxgi",
-            encoder_type: "nvenc_hevc",
+            encoder_type: "nvenc_h264",
             decoder_type: "none",
             transport_kind: "webrtc",
             fps: 144,

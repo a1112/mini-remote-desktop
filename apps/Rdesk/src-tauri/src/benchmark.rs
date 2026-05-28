@@ -66,6 +66,8 @@ pub struct BenchmarkSummary {
     pub nvdec_hevc_capability: String,
     pub nvdec_hevc_main10_capability: String,
     pub failure_reason: Option<String>,
+    #[serde(default)]
+    pub run_skipped: bool,
     pub run_passed: bool,
 }
 
@@ -184,6 +186,7 @@ impl BenchmarkSummary {
             nvdec_hevc_capability,
             nvdec_hevc_main10_capability,
             failure_reason: None,
+            run_skipped: false,
             run_passed: session_established && first_frame_seen && probe_complete,
         }
     }
@@ -290,6 +293,7 @@ impl BenchmarkSummary {
             nvdec_hevc_capability,
             nvdec_hevc_main10_capability,
             failure_reason: None,
+            run_skipped: false,
             run_passed: session_established && first_frame_seen && probe_complete,
         }
     }
@@ -337,6 +341,7 @@ impl BenchmarkSummary {
             "nvdec_hevc_capability",
             "nvdec_hevc_main10_capability",
             "failure_reason",
+            "run_skipped",
             "run_passed",
         ]
     }
@@ -384,6 +389,7 @@ impl BenchmarkSummary {
             self.nvdec_hevc_capability.clone(),
             self.nvdec_hevc_main10_capability.clone(),
             csv_escape_text(self.failure_reason.as_deref().unwrap_or_default()),
+            self.run_skipped.to_string(),
             self.run_passed.to_string(),
         ]
     }
@@ -611,6 +617,8 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    #[cfg(any(windows, target_os = "linux"))]
+    use mrd_encode_nvenc_av1::NvencAv1Encoder;
     use mrd_observability::{PipelineProbeSnapshot, StageId, StageStatsSnapshot};
     use mrd_proto::SessionId;
 
@@ -793,6 +801,7 @@ mod tests {
             nvdec_hevc_capability: String::new(),
             nvdec_hevc_main10_capability: String::new(),
             failure_reason,
+            run_skipped: false,
             run_passed,
         };
 
@@ -983,6 +992,24 @@ mod tests {
     }
 
     fn unsupported_encoder_backend_reason(value: &str) -> Option<String> {
+        if matches!(value, "nvenc_av1" | "av1_nvenc" | "nvenc-av1") {
+            #[cfg(any(windows, target_os = "linux"))]
+            {
+                if let Err(error) = NvencAv1Encoder::new(64, 64, 30) {
+                    return Some(format!(
+                        "NVENC AV1 benchmark skipped: current GPU/driver does not expose AV1 encode support ({error:?})"
+                    ));
+                }
+            }
+            #[cfg(not(any(windows, target_os = "linux")))]
+            {
+                return Some(
+                    "NVENC AV1 benchmark skipped: NVENC AV1 is unavailable on this platform"
+                        .to_string(),
+                );
+            }
+        }
+
         matches!(
             value,
             "software_vvc"
@@ -1050,7 +1077,7 @@ mod tests {
             quic_receiver_reassembly_drops: None,
             zero_write_access_unit_count: 0,
             warning_count: 0,
-            error_count: 1,
+            error_count: 0,
             restart_count: 0,
             encode_total_p95_ms: None,
             send_write_p95_ms: None,
@@ -1063,6 +1090,7 @@ mod tests {
             nvdec_hevc_capability: String::new(),
             nvdec_hevc_main10_capability: String::new(),
             failure_reason: Some(reason),
+            run_skipped: true,
             run_passed: false,
         };
 
@@ -1299,8 +1327,9 @@ mod tests {
         let (summary, probe) = run_harness_benchmark(&manifest, &session_id);
 
         assert!(!summary.run_passed);
+        assert!(summary.run_skipped);
         assert_eq!(summary.fps_observed, 0.0);
-        assert_eq!(summary.error_count, 1);
+        assert_eq!(summary.error_count, 0);
         assert_eq!(summary.encode_backend, "software_vvc");
         assert_eq!(summary.decode_backend, "software_vvc");
         assert!(summary
@@ -1395,6 +1424,7 @@ mod tests {
             nvdec_hevc_capability: "runtime=true wired=false".into(),
             nvdec_hevc_main10_capability: "runtime=false wired=false".into(),
             failure_reason: Some("encode produced no HEVC Main10 access units".into()),
+            run_skipped: false,
             run_passed: false,
         };
 

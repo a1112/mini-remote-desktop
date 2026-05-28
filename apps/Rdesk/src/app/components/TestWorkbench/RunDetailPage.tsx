@@ -122,6 +122,7 @@ export function RunDetailPage() {
     running: { label: "运行中", color: "bg-green-100 text-green-800" },
     completed: { label: "已完成", color: "bg-blue-100 text-blue-800" },
     failed: { label: "失败", color: "bg-red-100 text-red-800" },
+    skipped: { label: "已跳过", color: "bg-slate-100 text-slate-800" },
     cancelled: { label: "已取消", color: "bg-yellow-100 text-yellow-800" },
   };
 

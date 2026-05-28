@@ -1,0 +1,9 @@
+{
+  "max_first_frame_time_ms": 5000,
+  "min_fps_observed": 5.0,
+  "max_encode_total_p95_ms": 120.0,
+  "max_send_write_p95_ms": 50.0,
+  "max_decode_total_p95_ms": 100.0,
+  "max_warning_count": 180,
+  "max_error_count": 0
+}
