@@ -1,4 +1,9 @@
-use std::{fs, path::Path, time::Instant};
+use std::{
+    fs,
+    path::Path,
+    thread,
+    time::{Duration, Instant},
+};
 
 use mrd_decode::create_decoder;
 use mrd_encode_nvenc::NvencH264Encoder;
@@ -18,8 +23,42 @@ fn perf_h264_software_decode_reports_latency_distribution() {
         .unwrap_or(120);
     let case_name =
         std::env::var("MRD_COMPONENT_CASE_NAME").unwrap_or_else(|_| "decode.h264_software".into());
+    run_h264_decode_perf(
+        "h264_software",
+        "h264_software",
+        &case_name,
+        sample_count,
+        Duration::ZERO,
+    );
+}
+
+#[test]
+#[ignore]
+fn perf_h264_ffmpeg_decode_reports_latency_distribution() {
+    let sample_count = std::env::var("MRD_COMPONENT_SAMPLES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(60);
+    let case_name =
+        std::env::var("MRD_COMPONENT_CASE_NAME").unwrap_or_else(|_| "decode.ffmpeg_h264".into());
+    run_h264_decode_perf(
+        "ffmpeg_h264",
+        "ffmpeg_h264",
+        &case_name,
+        sample_count,
+        Duration::from_millis(20),
+    );
+}
+
+fn run_h264_decode_perf(
+    decoder_id: &str,
+    backend: &str,
+    case_name: &str,
+    sample_count: u64,
+    wait_after_push: Duration,
+) {
     let access_unit = encoded_access_unit();
-    let mut decoder = create_decoder("h264_software").expect("create h264 decoder");
+    let mut decoder = create_decoder(decoder_id).expect("create h264 decoder");
 
     let mut latencies_ms = Vec::with_capacity(sample_count as usize);
     let mut success_count = 0_u64;
@@ -33,10 +72,18 @@ fn perf_h264_software_decode_reports_latency_distribution() {
         let iter_started_at = Instant::now();
         match decoder.push_access_unit(&access_unit) {
             Ok(()) => {
-                let frames = decoder.drain_decoded_frames();
+                let mut frames = decoder.drain_decoded_frames();
+                if frames.is_empty() && !wait_after_push.is_zero() {
+                    let deadline = Instant::now() + wait_after_push;
+                    while frames.is_empty() && Instant::now() < deadline {
+                        thread::sleep(Duration::from_millis(2));
+                        frames = decoder.drain_decoded_frames();
+                    }
+                }
                 if let Some(frame) = frames.first() {
                     decoded_frame_bytes = match &frame.data {
                         DecodedFrameData::CpuRgb24(data) => Some(data.len()),
+                        DecodedFrameData::CpuNv12 { data, .. } => Some(data.len()),
                         _ => Some(0),
                     };
                     width = Some(frame.width as u32);
@@ -53,8 +100,8 @@ fn perf_h264_software_decode_reports_latency_distribution() {
 
     let result = ComponentResult::new(
         ComponentKind::Decode,
-        "h264_software",
-        case_name,
+        backend,
+        case_name.to_string(),
         started_at.elapsed().as_secs_f64(),
         success_count,
         failure_count,

@@ -339,6 +339,45 @@ describe("MatrixTestPage failure handling", () => {
     expect(screen.getByLabelText("NVENC HEVC Main10")).toBeInTheDocument();
   });
 
+  it("exposes FFmpeg decoders from capabilities and sends FFmpeg H.264 matrix runs", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(
+          windowsCapabilities({
+            available_encoders: ["openh264"],
+            available_decoders: ["software", "ffmpeg_h264", "ffmpeg_hevc"],
+            available_renderers: ["none"],
+            available_memory_modes: ["cpu"],
+          })
+        );
+      }
+      if (command === "test_start_run") return Promise.resolve("run-1");
+      if (command === "test_get_run") return Promise.resolve(null);
+      return Promise.resolve(null);
+    });
+
+    render(<MatrixTestPage runDelayMs={0} />);
+
+    expect(await screen.findByLabelText("FFmpeg H.264")).toBeInTheDocument();
+    expect(screen.getByLabelText("FFmpeg HEVC")).toBeInTheDocument();
+    setLabeledCheckbox("软件", false);
+    setLabeledCheckbox("FFmpeg H.264", true);
+    fireEvent.click(screen.getByRole("button", { name: /启动矩阵测试/ }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_start_run",
+        expect.objectContaining({
+          config: expect.objectContaining({
+            encoder_type: "openh264",
+            decoder_type: "ffmpeg_h264",
+          }),
+        })
+      );
+    });
+  });
+
   it("allows HEVC Main matrix runs over WebRTC RTP when decoder is compatible", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {

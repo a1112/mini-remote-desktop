@@ -658,6 +658,8 @@ impl TestOrchestrator {
                     "nvdec" => DecoderType::Nvdec,
                     "software" | "software_h264" | "h264_software" | "software-h264"
                     | "h264-software" | "openh264" => DecoderType::Software,
+                    "ffmpeg_h264" | "h264_ffmpeg" => DecoderType::FfmpegH264,
+                    "ffmpeg_hevc" | "hevc_ffmpeg" | "h265_ffmpeg" => DecoderType::FfmpegHevc,
                     "linux_h264" | "gstreamer_h264" | "vaapi_h264" => DecoderType::LinuxH264,
                     "linux_hevc" | "gstreamer_hevc" | "vaapi_hevc" => DecoderType::LinuxHevc,
                     "linux_hevc_main10" | "gstreamer_hevc_main10" | "vaapi_hevc_main10" => {
@@ -1025,6 +1027,11 @@ impl TestOrchestrator {
 
         // Detect available decoders
         let mut available_decoders = vec!["none".to_string(), "software".to_string()];
+        let ffmpeg_probe = mrd_ffmpeg::probe_ffmpeg(&mrd_ffmpeg::golden_settings());
+        if ffmpeg_probe.available {
+            available_decoders.push("ffmpeg_h264".to_string());
+            available_decoders.push("ffmpeg_hevc".to_string());
+        }
         #[cfg(windows)]
         {
             if mrd_decode_nvdec::NvdecDecoder::new().is_ok() {
@@ -2903,6 +2910,11 @@ fn decoder_supported_on_current_platform(decoder_type: &str) -> bool {
             | "software-h264"
             | "h264-software"
             | "openh264"
+            | "ffmpeg_h264"
+            | "h264_ffmpeg"
+            | "ffmpeg_hevc"
+            | "hevc_ffmpeg"
+            | "h265_ffmpeg"
     ) || matches!(decoder_type, "nvdec") && cfg!(windows)
         || matches!(
             decoder_type,
@@ -4476,6 +4488,34 @@ mod tests {
                 encoder: EncoderType::OpenH264,
                 decoder: DecoderType::Software,
             }
+        );
+
+        let ffmpeg_h264_config = TestConfigData {
+            capture_type: Some("synthetic".to_string()),
+            encoder_type: Some("openh264".to_string()),
+            decoder_type: Some("ffmpeg_h264".to_string()),
+            ..Default::default()
+        };
+
+        assert!(
+            orchestrator
+                .scenario_to_chain("matrix", &ffmpeg_h264_config)
+                .is_ok(),
+            "matrix should accept FFmpeg H.264 decoder"
+        );
+
+        let ffmpeg_hevc_config = TestConfigData {
+            capture_type: Some("synthetic".to_string()),
+            encoder_type: Some("nvenc_hevc".to_string()),
+            decoder_type: Some("ffmpeg_hevc".to_string()),
+            ..Default::default()
+        };
+
+        assert!(
+            orchestrator
+                .scenario_to_chain("matrix", &ffmpeg_hevc_config)
+                .is_ok(),
+            "matrix should accept FFmpeg HEVC decoder"
         );
 
         #[cfg(windows)]

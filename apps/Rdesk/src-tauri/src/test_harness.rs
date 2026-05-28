@@ -120,6 +120,8 @@ pub enum DecoderType {
     None,
     Nvdec,
     Software,
+    FfmpegH264,
+    FfmpegHevc,
     LinuxH264,
     LinuxHevc,
     LinuxHevcMain10,
@@ -1895,6 +1897,28 @@ impl TestHarness {
                             true,
                         )
                     }
+                    DecoderType::FfmpegH264 => {
+                        let enc = NvencH264Encoder::new_max_speed_with_bitrate(
+                            width,
+                            height,
+                            fps,
+                            speed_bitrate,
+                        )
+                        .map_err(|e| anyhow::anyhow!("NVENC 编码器初始化失败: {:?}", e))?;
+                        let dec = mrd_decode::create_decoder("ffmpeg_h264").map_err(|e| {
+                            anyhow::anyhow!("FFmpeg H.264 decoder init failed: {:?}", e)
+                        })?;
+                        (
+                            Some(Box::new(enc) as Box<dyn VideoEncoder>),
+                            Some(PipelineDecoder::Software(dec)),
+                            true,
+                        )
+                    }
+                    DecoderType::FfmpegHevc => {
+                        return Err(anyhow::anyhow!(
+                            "FFmpeg HEVC decoder cannot decode H.264 output"
+                        ));
+                    }
                     DecoderType::LinuxH264 => {
                         let enc = NvencH264Encoder::new_max_speed_with_bitrate(
                             width,
@@ -1979,6 +2003,20 @@ impl TestHarness {
                                 })?;
                                 (Some(enc), Some(PipelineDecoder::Software(dec)), true)
                             }
+                            DecoderType::FfmpegHevc => {
+                                let enc =
+                                    create_hevc_encoder(width, height, fps, speed_bitrate, main10)?;
+                                let dec =
+                                    mrd_decode::create_decoder("ffmpeg_hevc").map_err(|e| {
+                                        anyhow::anyhow!("FFmpeg HEVC decoder init failed: {:?}", e)
+                                    })?;
+                                (Some(enc), Some(PipelineDecoder::Software(dec)), true)
+                            }
+                            DecoderType::FfmpegH264 => {
+                                return Err(anyhow::anyhow!(
+                                    "FFmpeg H.264 decoder cannot decode NVENC HEVC output"
+                                ));
+                            }
                             DecoderType::LinuxH264 => {
                                 return Err(anyhow::anyhow!(
                                     "Linux H.264 hardware decoder cannot decode NVENC HEVC output"
@@ -2060,6 +2098,21 @@ impl TestHarness {
                                 true,
                             )
                         }
+                        DecoderType::FfmpegH264 => {
+                            let dec = mrd_decode::create_decoder("ffmpeg_h264").map_err(|e| {
+                                anyhow::anyhow!("FFmpeg H.264 decoder init failed: {:?}", e)
+                            })?;
+                            (
+                                Some(Box::new(enc) as Box<dyn VideoEncoder>),
+                                Some(PipelineDecoder::Software(dec)),
+                                true,
+                            )
+                        }
+                        DecoderType::FfmpegHevc => {
+                            return Err(anyhow::anyhow!(
+                                "FFmpeg HEVC decoder cannot decode OpenH264 output"
+                            ));
+                        }
                         DecoderType::LinuxH264 => (
                             Some(Box::new(enc) as Box<dyn VideoEncoder>),
                             Some(create_linux_h264_decoder()?),
@@ -2091,6 +2144,17 @@ impl TestHarness {
                                 anyhow::anyhow!("software decoder init failed: {:?}", e)
                             })?;
                             (Some(enc), Some(PipelineDecoder::Software(dec)), true)
+                        }
+                        DecoderType::FfmpegH264 => {
+                            let dec = mrd_decode::create_decoder("ffmpeg_h264").map_err(|e| {
+                                anyhow::anyhow!("FFmpeg H.264 decoder init failed: {:?}", e)
+                            })?;
+                            (Some(enc), Some(PipelineDecoder::Software(dec)), true)
+                        }
+                        DecoderType::FfmpegHevc => {
+                            return Err(anyhow::anyhow!(
+                                "FFmpeg HEVC decoder cannot decode VideoToolbox H.264 output"
+                            ));
                         }
                         DecoderType::VideoToolbox => {
                             (Some(enc), Some(create_videotoolbox_h264_decoder()?), true)
@@ -2157,6 +2221,16 @@ impl TestHarness {
                                     Some(PipelineDecoder::Software(dec)),
                                     true,
                                 )
+                            }
+                            DecoderType::FfmpegH264 => {
+                                return Err(anyhow::anyhow!(
+                                    "FFmpeg H.264 decoder cannot decode NVENC AV1 output"
+                                ));
+                            }
+                            DecoderType::FfmpegHevc => {
+                                return Err(anyhow::anyhow!(
+                                    "FFmpeg HEVC decoder cannot decode NVENC AV1 output"
+                                ));
                             }
                             DecoderType::LinuxH264 => {
                                 return Err(anyhow::anyhow!(
@@ -4794,6 +4868,8 @@ mod tests {
             Ok("none") => DecoderType::None,
             Ok("software") | Ok("software_h264") | Ok("h264_software") | Ok("software-h264")
             | Ok("h264-software") | Ok("openh264") => DecoderType::Software,
+            Ok("ffmpeg_h264") | Ok("h264_ffmpeg") => DecoderType::FfmpegH264,
+            Ok("ffmpeg_hevc") | Ok("hevc_ffmpeg") | Ok("h265_ffmpeg") => DecoderType::FfmpegHevc,
             Ok("linux_h264") | Ok("gstreamer_h264") | Ok("vaapi_h264") => DecoderType::LinuxH264,
             Ok("linux_hevc") | Ok("gstreamer_hevc") | Ok("vaapi_hevc") => DecoderType::LinuxHevc,
             Ok("linux_hevc_main10") | Ok("gstreamer_hevc_main10") | Ok("vaapi_hevc_main10") => {

@@ -106,6 +106,8 @@ const MATRIX_DIMENSIONS: MatrixDimension[] = [
       { id: "none", name: "None / encode only", enabled: false },
       { id: "nvdec", name: "NVDEC", enabled: true },
       { id: "software", name: "软件", enabled: true },
+      { id: "ffmpeg_h264", name: "FFmpeg H.264", enabled: false },
+      { id: "ffmpeg_hevc", name: "FFmpeg HEVC", enabled: false },
       {
         id: "linux_h264",
         name: "Linux H.264 HW",
@@ -536,6 +538,9 @@ function minimumExpectedFps(config: TestConfig, targetFps: number): number {
   if (config.encoder_type === "openh264") {
     return targetFps * 0.35;
   }
+  if (config.decoder_type === "ffmpeg_h264" || config.decoder_type === "ffmpeg_hevc") {
+    return targetFps * 0.35;
+  }
   if (config.decoder_type === "software") {
     return targetFps * 0.45;
   }
@@ -545,6 +550,9 @@ function minimumExpectedFps(config: TestConfig, targetFps: number): number {
 function maximumExpectedLatencyMs(config: TestConfig, targetFps: number): number {
   const frameBudgetMs = 1000 / targetFps;
   if (config.encoder_type === "openh264") {
+    return Math.max(120, frameBudgetMs * 8);
+  }
+  if (config.decoder_type === "ffmpeg_h264" || config.decoder_type === "ffmpeg_hevc") {
     return Math.max(120, frameBudgetMs * 8);
   }
   if (config.decoder_type === "software") {
@@ -589,8 +597,25 @@ function unsupportedMatrixReason(config: TestConfig): string | null {
   if (config.encoder_type === "nvenc_hevc_main10" && config.decoder_type === "linux_hevc") {
     return "NVENC HEVC Main10 requires the Linux HEVC Main10 decoder path";
   }
+  if (isHevcEncoder(config.encoder_type) && config.decoder_type === "ffmpeg_h264") {
+    return "FFmpeg H.264 decoder cannot decode NVENC HEVC output";
+  }
+  if (
+    (config.encoder_type === "nvenc_h264" ||
+      config.encoder_type === "openh264" ||
+      config.encoder_type === "videotoolbox_h264") &&
+    config.decoder_type === "ffmpeg_hevc"
+  ) {
+    return "FFmpeg HEVC decoder cannot decode H.264 output";
+  }
   if (config.encoder_type === "nvenc_av1" && config.decoder_type === "linux_h264") {
     return "Linux H.264 hardware decoder cannot decode NVENC AV1 output";
+  }
+  if (
+    config.encoder_type === "nvenc_av1" &&
+    (config.decoder_type === "ffmpeg_h264" || config.decoder_type === "ffmpeg_hevc")
+  ) {
+    return "FFmpeg H.264/HEVC decoders cannot decode NVENC AV1 output";
   }
   if (
     config.encoder_type === "nvenc_av1" &&
