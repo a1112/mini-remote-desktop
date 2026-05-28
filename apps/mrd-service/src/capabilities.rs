@@ -305,7 +305,7 @@ fn local_capabilities(
     add_transport_capabilities(&mut items, &platform);
     add_control_capabilities(&mut items, &platform);
     add_audio_capabilities(&mut items, &platform);
-    add_service_capabilities(&mut items, &platform);
+    add_service_capabilities(&mut items, &platform, probe_mode);
     add_security_capabilities(&mut items, &platform);
 
     items
@@ -682,6 +682,26 @@ fn add_decode_capabilities(
             "VideoToolbox decode is planned for native macOS parity.",
         );
     }
+
+    let (ffmpeg_status, ffmpeg_reason) = ffmpeg_tool_status(probe_mode);
+    push_item(
+        items,
+        platform,
+        CapabilityDomain::Decode,
+        "decode.ffmpeg_h264",
+        "FFmpeg H.264",
+        ffmpeg_status.clone(),
+        Some(ffmpeg_reason.as_str()),
+    );
+    push_item(
+        items,
+        platform,
+        CapabilityDomain::Decode,
+        "decode.ffmpeg_hevc",
+        "FFmpeg HEVC",
+        ffmpeg_status,
+        Some(ffmpeg_reason.as_str()),
+    );
 }
 
 fn add_render_capabilities(
@@ -1058,6 +1078,50 @@ fn classify_runtime_probe(label: &str, result: Result<(), String>) -> (Capabilit
     }
 }
 
+fn ffmpeg_tool_status(probe_mode: CapabilityProbeMode) -> (CapabilityStatus, String) {
+    match probe_mode {
+        CapabilityProbeMode::Static => (
+            CapabilityStatus::Supported,
+            "FFmpeg is optional tooling; runtime availability is determined by configured paths, managed install, or PATH."
+                .to_string(),
+        ),
+        CapabilityProbeMode::Runtime => {
+            static RESULT: OnceLock<(CapabilityStatus, String)> = OnceLock::new();
+            RESULT
+                .get_or_init(|| {
+                    let probe = mrd_ffmpeg::probe_ffmpeg(&mrd_ffmpeg::golden_settings());
+                    if probe.available {
+                        (
+                            CapabilityStatus::Available,
+                            format!(
+                                "FFmpeg probe succeeded with {} and {}.",
+                                probe
+                                    .ffmpeg_path
+                                    .as_ref()
+                                    .map(|path| path.display().to_string())
+                                    .unwrap_or_else(|| "ffmpeg".to_string()),
+                                probe
+                                    .ffprobe_path
+                                    .as_ref()
+                                    .map(|path| path.display().to_string())
+                                    .unwrap_or_else(|| "ffprobe".to_string())
+                            ),
+                        )
+                    } else {
+                        (
+                            CapabilityStatus::DriverMissing,
+                            probe.reason.unwrap_or_else(|| {
+                                "FFmpeg tools were not found in configured paths or PATH."
+                                    .to_string()
+                            }),
+                        )
+                    }
+                })
+                .clone()
+        }
+    }
+}
+
 fn add_transport_capabilities(items: &mut Vec<CapabilityItem>, platform: &CapabilityPlatform) {
     for (id, label) in [
         ("transport.loopback", "In-process loopback"),
@@ -1106,7 +1170,11 @@ fn add_audio_capabilities(items: &mut Vec<CapabilityItem>, platform: &Capability
     );
 }
 
-fn add_service_capabilities(items: &mut Vec<CapabilityItem>, platform: &CapabilityPlatform) {
+fn add_service_capabilities(
+    items: &mut Vec<CapabilityItem>,
+    platform: &CapabilityPlatform,
+    probe_mode: CapabilityProbeMode,
+) {
     push_available(
         items,
         platform,
@@ -1150,6 +1218,16 @@ fn add_service_capabilities(items: &mut Vec<CapabilityItem>, platform: &Capabili
             "HEVC Main 8-bit 4:2:0 is the default LAN high-performance profile when encoder and decoder probes pass.",
         );
     }
+    let (ffmpeg_status, ffmpeg_reason) = ffmpeg_tool_status(probe_mode);
+    push_item(
+        items,
+        platform,
+        CapabilityDomain::Service,
+        "service.ffmpeg",
+        "FFmpeg tools",
+        ffmpeg_status,
+        Some(ffmpeg_reason.as_str()),
+    );
 }
 
 fn add_security_capabilities(items: &mut Vec<CapabilityItem>, platform: &CapabilityPlatform) {
@@ -1515,5 +1593,39 @@ mod tests {
         assert!(lan_2k144
             .required_capabilities
             .contains(&"decode.nvdec_hevc".to_string()));
+    }
+
+    #[test]
+    fn static_snapshot_includes_optional_ffmpeg_capabilities() {
+        let snapshot = local_capability_snapshot_static();
+
+        let service = snapshot
+            .capabilities
+            .iter()
+            .find(|item| item.id == "service.ffmpeg")
+            .expect("service.ffmpeg capability");
+        assert!(matches!(
+            service.status,
+            CapabilityStatus::Supported | CapabilityStatus::Degraded
+        ));
+
+        assert!(snapshot
+            .capabilities
+            .iter()
+            .any(|item| item.id == "decode.ffmpeg_h264"));
+        assert!(snapshot
+            .capabilities
+            .iter()
+            .any(|item| item.id == "decode.ffmpeg_hevc"));
+    }
+
+    #[test]
+    fn default_profiles_do_not_require_ffmpeg() {
+        let snapshot = local_capability_snapshot_static();
+
+        assert!(snapshot.profiles.iter().all(|profile| profile
+            .required_capabilities
+            .iter()
+            .all(|id| !id.contains("ffmpeg"))));
     }
 }
