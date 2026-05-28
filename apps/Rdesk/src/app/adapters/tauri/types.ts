@@ -965,6 +965,41 @@ export interface DecodePolicyResponse {
   decode_policy: DecodePolicy;
 }
 
+export interface FfmpegDownloadSettings {
+  archive_url: string;
+  sha256_url?: string | null;
+  require_sha256: boolean;
+}
+
+export interface FfmpegSettings {
+  enabled: boolean;
+  channel: string;
+  install_dir?: string | null;
+  ffmpeg_path?: string | null;
+  ffprobe_path?: string | null;
+  download: FfmpegDownloadSettings;
+}
+
+export interface AppSettings {
+  decode_policy: DecodePolicy;
+  ffmpeg: FfmpegSettings;
+}
+
+export interface FfmpegProbeResult {
+  available: boolean;
+  ffmpeg_path?: string | null;
+  ffprobe_path?: string | null;
+  ffmpeg_version?: string | null;
+  ffprobe_version?: string | null;
+  reason?: string | null;
+}
+
+export interface FfmpegInstallResult {
+  install_dir: string;
+  probe: FfmpegProbeResult;
+  archive_sha256?: string | null;
+}
+
 /**
  * Test harness types - end-to-end pipeline visualization
  */

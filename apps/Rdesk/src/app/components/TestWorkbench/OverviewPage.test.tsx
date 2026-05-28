@@ -81,6 +81,17 @@ function mockOverviewData() {
       });
     }
 
+    if (command === "ffmpeg_probe") {
+      return Promise.resolve({
+        available: true,
+        ffmpeg_path: "C:\\ffmpeg\\bin\\ffmpeg.exe",
+        ffprobe_path: "C:\\ffmpeg\\bin\\ffprobe.exe",
+        ffmpeg_version: "ffmpeg version 8.1.1",
+        ffprobe_version: "ffprobe version 8.1.1",
+        reason: null,
+      });
+    }
+
     return Promise.resolve(null);
   });
 }
@@ -166,6 +177,17 @@ function mockOverviewDataWithActiveRun() {
       });
     }
 
+    if (command === "ffmpeg_probe") {
+      return Promise.resolve({
+        available: true,
+        ffmpeg_path: "C:\\ffmpeg\\bin\\ffmpeg.exe",
+        ffprobe_path: "C:\\ffmpeg\\bin\\ffprobe.exe",
+        ffmpeg_version: "ffmpeg version 8.1.1",
+        ffprobe_version: "ffprobe version 8.1.1",
+        reason: null,
+      });
+    }
+
     return Promise.resolve(null);
   });
 }
@@ -217,6 +239,58 @@ describe("OverviewPage", () => {
     expect(screen.getByText("lan.1600p165")).toBeInTheDocument();
     expect(screen.getAllByText("blocked").length).toBeGreaterThan(0);
     expect(screen.getAllByText(/transport.media_profile_control_v1/).length).toBeGreaterThan(0);
+  });
+
+  it("shows FFmpeg optional tooling status and actions", async () => {
+    mockOverviewData();
+    const mockInvoke = getMockInvoke();
+    const user = userEvent.setup();
+
+    render(<OverviewPage />);
+
+    expect(await screen.findByText("FFmpeg 可选工具")).toBeInTheDocument();
+    expect(screen.getByText("ffmpeg version 8.1.1")).toBeInTheDocument();
+    expect(screen.getByText("C:\\ffmpeg\\bin\\ffmpeg.exe")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /刷新 FFmpeg 状态/ }));
+    expect(mockInvoke).toHaveBeenCalledWith("ffmpeg_probe", undefined);
+
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "ffmpeg_download") {
+        return Promise.resolve({
+          install_dir: "C:\\ffmpeg",
+          archive_sha256: "a".repeat(64),
+          probe: {
+            available: true,
+            ffmpeg_path: "C:\\ffmpeg\\bin\\ffmpeg.exe",
+            ffprobe_path: "C:\\ffmpeg\\bin\\ffprobe.exe",
+            ffmpeg_version: "ffmpeg version 8.1.1",
+            ffprobe_version: "ffprobe version 8.1.1",
+            reason: null,
+          },
+        });
+      }
+      if (command === "ffmpeg_reset_golden_settings") {
+        return Promise.resolve({});
+      }
+      if (command === "ffmpeg_probe") {
+        return Promise.resolve({
+          available: true,
+          ffmpeg_path: "C:\\ffmpeg\\bin\\ffmpeg.exe",
+          ffprobe_path: "C:\\ffmpeg\\bin\\ffprobe.exe",
+          ffmpeg_version: "ffmpeg version 8.1.1",
+          ffprobe_version: "ffprobe version 8.1.1",
+          reason: null,
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    await user.click(screen.getByRole("button", { name: /下载或更新 FFmpeg/ }));
+    expect(mockInvoke).toHaveBeenCalledWith("ffmpeg_download", undefined);
+
+    await user.click(screen.getByRole("button", { name: /重置 FFmpeg 设置/ }));
+    expect(mockInvoke).toHaveBeenCalledWith("ffmpeg_reset_golden_settings", undefined);
   });
 
   it("shows realtime curves for the active test run", async () => {

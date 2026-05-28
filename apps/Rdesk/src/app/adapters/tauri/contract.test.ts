@@ -883,6 +883,68 @@ describe('Tauri Adapter Contract', () => {
         decodePolicy: 'nvdec',
       });
     });
+
+    it('ffmpeg_probe calls correct command', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue({
+        available: true,
+        ffmpeg_path: 'C:\\ffmpeg\\bin\\ffmpeg.exe',
+        ffprobe_path: 'C:\\ffmpeg\\bin\\ffprobe.exe',
+        ffmpeg_version: 'ffmpeg version 8.1.1',
+        ffprobe_version: 'ffprobe version 8.1.1',
+        reason: null,
+      });
+
+      const result = await adapter.ffmpegProbe();
+
+      expect(mockInvoke).toHaveBeenCalledWith('ffmpeg_probe', undefined);
+      expect(result.ok).toBe(true);
+    });
+
+    it('ffmpeg_download calls correct command', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue({
+        install_dir: 'C:\\ffmpeg',
+        archive_sha256: 'a'.repeat(64),
+        probe: {
+          available: true,
+          ffmpeg_path: 'C:\\ffmpeg\\bin\\ffmpeg.exe',
+          ffprobe_path: 'C:\\ffmpeg\\bin\\ffprobe.exe',
+          ffmpeg_version: 'ffmpeg version 8.1.1',
+          ffprobe_version: 'ffprobe version 8.1.1',
+          reason: null,
+        },
+      });
+
+      const result = await adapter.ffmpegDownload();
+
+      expect(mockInvoke).toHaveBeenCalledWith('ffmpeg_download', undefined);
+      expect(result.ok).toBe(true);
+    });
+
+    it('ffmpeg_reset_golden_settings calls correct command', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue({
+        decode_policy: 'auto',
+        ffmpeg: {
+          enabled: true,
+          channel: 'release-essentials',
+          install_dir: 'C:\\ffmpeg',
+          ffmpeg_path: null,
+          ffprobe_path: null,
+          download: {
+            archive_url: 'https://example.test/ffmpeg.zip',
+            sha256_url: 'https://example.test/ffmpeg.zip.sha256',
+            require_sha256: true,
+          },
+        },
+      });
+
+      const result = await adapter.ffmpegResetGoldenSettings();
+
+      expect(mockInvoke).toHaveBeenCalledWith('ffmpeg_reset_golden_settings', undefined);
+      expect(result.ok).toBe(true);
+    });
   });
 
   /**

@@ -8,6 +8,10 @@ import {
   Zap,
   Monitor,
   ArrowRight,
+  Download,
+  RefreshCw,
+  RotateCcw,
+  Wrench,
 } from "lucide-react";
 import {
   CartesianGrid,
@@ -25,6 +29,7 @@ import type {
   TestRun,
   EnvironmentSnapshot,
   MetricSeries,
+  FfmpegProbeResult,
 } from "../../adapters/tauri/types";
 import {
   buildCapabilitySnapshotFromIpc,
@@ -71,6 +76,8 @@ const REALTIME_CHART_COLORS = [
   "#be123c",
 ];
 
+type FfmpegBusyAction = "probe" | "download" | "reset";
+
 export function OverviewPage() {
   const navigate = useNavigate();
   const [scenarios, setScenarios] = useState<TestScenario[]>([]);
@@ -81,6 +88,9 @@ export function OverviewPage() {
   const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
   const [serviceCapabilitySnapshot, setServiceCapabilitySnapshot] =
     useState<CapabilitySnapshot | null>(null);
+  const [ffmpegProbe, setFfmpegProbe] = useState<FfmpegProbeResult | null>(null);
+  const [ffmpegBusyAction, setFfmpegBusyAction] = useState<FfmpegBusyAction | null>(null);
+  const [ffmpegStatusMessage, setFfmpegStatusMessage] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [showUnavailable, setShowUnavailable] = useShowUnavailableCapabilities();
 
@@ -143,11 +153,18 @@ export function OverviewPage() {
   async function loadOverviewData() {
     setLoading(true);
     try {
-      const [scenariosResult, runsResult, capsResult, serviceCapsResult] = await Promise.all([
+      const [
+        scenariosResult,
+        runsResult,
+        capsResult,
+        serviceCapsResult,
+        ffmpegProbeResult,
+      ] = await Promise.all([
         commands.testListScenarios(),
         commands.testListRuns({ limit: 5 }),
         commands.testGetCapabilities(),
         commands.ipcCapabilitySnapshot(),
+        commands.ffmpegProbe(),
       ]);
 
       if (scenariosResult.ok) setScenarios(scenariosResult.value);
@@ -159,10 +176,61 @@ export function OverviewPage() {
       if (serviceCapsResult.ok && serviceCapsResult.value) {
         setServiceCapabilitySnapshot(buildCapabilitySnapshotFromIpc(serviceCapsResult.value));
       }
+      if (ffmpegProbeResult.ok) {
+        setFfmpegProbe(ffmpegProbeResult.value);
+        setFfmpegStatusMessage(null);
+      } else {
+        setFfmpegStatusMessage(ffmpegProbeResult.error.message);
+      }
     } catch (error) {
       console.error("Failed to load overview data:", error);
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function refreshFfmpegStatus() {
+    setFfmpegBusyAction("probe");
+    try {
+      const result = await commands.ffmpegProbe();
+      if (result.ok) {
+        setFfmpegProbe(result.value);
+        setFfmpegStatusMessage("FFmpeg 状态已刷新");
+      } else {
+        setFfmpegStatusMessage(result.error.message);
+      }
+    } finally {
+      setFfmpegBusyAction(null);
+    }
+  }
+
+  async function downloadFfmpeg() {
+    setFfmpegBusyAction("download");
+    try {
+      const result = await commands.ffmpegDownload();
+      if (result.ok) {
+        setFfmpegProbe(result.value.probe);
+        setFfmpegStatusMessage(`FFmpeg 已安装到 ${result.value.install_dir}`);
+      } else {
+        setFfmpegStatusMessage(result.error.message);
+      }
+    } finally {
+      setFfmpegBusyAction(null);
+    }
+  }
+
+  async function resetFfmpegSettings() {
+    setFfmpegBusyAction("reset");
+    try {
+      const result = await commands.ffmpegResetGoldenSettings();
+      if (result.ok) {
+        setFfmpegStatusMessage("FFmpeg 设置已重置");
+        await refreshFfmpegStatus();
+      } else {
+        setFfmpegStatusMessage(result.error.message);
+      }
+    } finally {
+      setFfmpegBusyAction(null);
     }
   }
 
@@ -227,6 +295,15 @@ export function OverviewPage() {
               </div>
             )}
           </section>
+
+          <FfmpegToolingPanel
+            probe={ffmpegProbe}
+            busyAction={ffmpegBusyAction}
+            statusMessage={ffmpegStatusMessage}
+            onRefresh={refreshFfmpegStatus}
+            onDownload={downloadFfmpeg}
+            onReset={resetFfmpegSettings}
+          />
 
           {/* Structured Capability Matrix */}
           {capabilitySnapshot && (
@@ -432,6 +509,98 @@ export function OverviewPage() {
         </div>
       )}
     </div>
+  );
+}
+
+function FfmpegToolingPanel({
+  probe,
+  busyAction,
+  statusMessage,
+  onRefresh,
+  onDownload,
+  onReset,
+}: {
+  probe: FfmpegProbeResult | null;
+  busyAction: FfmpegBusyAction | null;
+  statusMessage: string | null;
+  onRefresh: () => void;
+  onDownload: () => void;
+  onReset: () => void;
+}) {
+  const status = !probe ? "skipped" : probe.available ? "available" : "driver_missing";
+  const statusText = !probe ? "未探测" : probe.available ? "可用" : "不可用";
+
+  return (
+    <section className="bg-card rounded-lg border p-6">
+      <div className="mb-4 flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+        <div>
+          <h2 className="flex items-center gap-2 text-lg font-semibold">
+            <Wrench className="h-5 w-5" />
+            FFmpeg 可选工具
+          </h2>
+          <div className="mt-2 flex flex-wrap items-center gap-2 text-sm">
+            <StatusBadge status={status} />
+            <span className="text-muted-foreground">{statusText}</span>
+          </div>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <button
+            type="button"
+            aria-label="刷新 FFmpeg 状态"
+            title="刷新 FFmpeg 状态"
+            disabled={busyAction !== null}
+            onClick={onRefresh}
+            className="inline-flex items-center gap-2 rounded-lg border px-3 py-2 text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            <RefreshCw className={["h-4 w-4", busyAction === "probe" ? "animate-spin" : ""].join(" ")} />
+            <span>刷新</span>
+          </button>
+          <button
+            type="button"
+            aria-label="下载或更新 FFmpeg"
+            title="下载或更新 FFmpeg"
+            disabled={busyAction !== null}
+            onClick={onDownload}
+            className="inline-flex items-center gap-2 rounded-lg border px-3 py-2 text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            <Download className="h-4 w-4" />
+            <span>{busyAction === "download" ? "处理中" : "下载/更新"}</span>
+          </button>
+          <button
+            type="button"
+            aria-label="重置 FFmpeg 设置"
+            title="重置 FFmpeg 设置"
+            disabled={busyAction !== null}
+            onClick={onReset}
+            className="inline-flex items-center gap-2 rounded-lg border px-3 py-2 text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            <RotateCcw className="h-4 w-4" />
+            <span>重置</span>
+          </button>
+        </div>
+      </div>
+
+      <div className="grid gap-3 text-sm md:grid-cols-2">
+        <div className="rounded-lg border bg-background/60 p-3">
+          <div className="text-xs text-muted-foreground">版本</div>
+          <div className="mt-1 break-words font-medium">
+            {probe?.ffmpeg_version ?? "未探测"}
+          </div>
+        </div>
+        <div className="rounded-lg border bg-background/60 p-3">
+          <div className="text-xs text-muted-foreground">路径</div>
+          <div className="mt-1 break-all font-mono text-xs">
+            {probe?.ffmpeg_path ?? "未配置"}
+          </div>
+        </div>
+      </div>
+
+      {(probe?.reason || statusMessage) && (
+        <div className="mt-3 rounded-lg border bg-background/60 p-3 text-sm text-muted-foreground">
+          {statusMessage ?? probe?.reason}
+        </div>
+      )}
+    </section>
   );
 }
 

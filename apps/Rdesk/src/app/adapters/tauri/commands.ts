@@ -17,6 +17,9 @@ import type {
   DeviceRegistrationResponse,
   DecodePolicy,
   DecodePolicyResponse,
+  AppSettings,
+  FfmpegInstallResult,
+  FfmpegProbeResult,
   HardwareInfo,
   SystemResourceSnapshot,
   NativeBackdropStatus,
@@ -1062,6 +1065,18 @@ export async function setDecodePolicy(
   return invokeAdapter<DecodePolicyResponse>('set_decode_policy', {
     decodePolicy,
   });
+}
+
+export async function ffmpegProbe(): Promise<AdapterResult<FfmpegProbeResult>> {
+  return invokeAdapter<FfmpegProbeResult>('ffmpeg_probe');
+}
+
+export async function ffmpegDownload(): Promise<AdapterResult<FfmpegInstallResult>> {
+  return invokeAdapter<FfmpegInstallResult>('ffmpeg_download');
+}
+
+export async function ffmpegResetGoldenSettings(): Promise<AdapterResult<AppSettings>> {
+  return invokeAdapter<AppSettings>('ffmpeg_reset_golden_settings');
 }
 
 // ============================================================================
