@@ -15,6 +15,7 @@ members = [
   "crates/mrd-encode-nvenc",
   "crates/mrd-encode-nvenc-av1",
   "crates/mrd-encode-openh264",
+  "crates/mrd-ffmpeg",
   "crates/mrd-ipc",
   "crates/mrd-observability",
   "crates/mrd-application",
