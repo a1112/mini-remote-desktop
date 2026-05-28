@@ -2331,7 +2331,9 @@ async fn set_decode_policy_with(
     decode_policy: DecodePolicy,
 ) -> Result<DecodePolicyResponse, String> {
     // Save policy to settings - actual decode policy application now happens in mrd-service
-    save_settings(settings_path, &AppSettings { decode_policy })?;
+    let mut settings = load_settings(settings_path)?;
+    settings.decode_policy = decode_policy;
+    save_settings(settings_path, &settings)?;
     Ok(DecodePolicyResponse {
         decode_policy: decode_policy.as_str().to_string(),
     })
@@ -3173,6 +3175,27 @@ mod tray_tests {
         assert!(enabled.is_some());
     }
 
+    #[tokio::test]
+    async fn set_decode_policy_preserves_ffmpeg_settings() {
+        let path = unique_settings_path("decode-policy-preserves-ffmpeg");
+        let mut settings = AppSettings::default();
+        settings.ffmpeg.enabled = false;
+        settings.ffmpeg.channel = "custom".to_string();
+        save_settings(&path, &settings).expect("save initial settings");
+
+        let response = set_decode_policy_with(&path, DecodePolicy::Nvdec)
+            .await
+            .expect("set decode policy");
+
+        let loaded = load_settings(&path).expect("load settings");
+        assert_eq!(response.decode_policy, "nvdec");
+        assert_eq!(loaded.decode_policy, DecodePolicy::Nvdec);
+        assert!(!loaded.ffmpeg.enabled);
+        assert_eq!(loaded.ffmpeg.channel, "custom");
+
+        std::fs::remove_file(&path).expect("cleanup temp settings");
+    }
+
     #[test]
     fn lan_e2e_autorun_navigation_forces_route_load() {
         let script = build_main_window_route_navigation_script(
@@ -3334,6 +3357,18 @@ mod tray_tests {
             single_instance_addr_from_env_value(Some(" ")),
             SINGLE_INSTANCE_ADDR.to_string()
         );
+    }
+
+    fn unique_settings_path(prefix: &str) -> std::path::PathBuf {
+        std::env::temp_dir()
+            .join("mini-remote-desktop-tests")
+            .join(format!(
+                "{prefix}-{}.json",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system time")
+                    .as_nanos()
+            ))
     }
 }
 

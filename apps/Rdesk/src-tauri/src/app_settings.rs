@@ -28,10 +28,21 @@ impl DecodePolicy {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppSettings {
     #[serde(default)]
     pub decode_policy: DecodePolicy,
+    #[serde(default = "mrd_ffmpeg::golden_settings")]
+    pub ffmpeg: mrd_ffmpeg::FfmpegSettings,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            decode_policy: DecodePolicy::default(),
+            ffmpeg: mrd_ffmpeg::golden_settings(),
+        }
+    }
 }
 
 pub fn default_settings_path() -> PathBuf {
@@ -110,6 +121,7 @@ mod tests {
             &path,
             &AppSettings {
                 decode_policy: DecodePolicy::Nvdec,
+                ..AppSettings::default()
             },
         )
         .expect("save settings");
@@ -120,11 +132,41 @@ mod tests {
             &path,
             &AppSettings {
                 decode_policy: DecodePolicy::Software,
+                ..AppSettings::default()
             },
         )
         .expect("save software settings");
         let software = load_settings(&path).expect("reload software settings");
         assert_eq!(software.decode_policy, DecodePolicy::Software);
+
+        std::fs::remove_file(&path).expect("cleanup temp settings");
+    }
+
+    #[test]
+    fn load_settings_defaults_ffmpeg_to_golden_values() {
+        let path = unique_settings_path("ffmpeg-defaults");
+
+        let settings = load_settings(&path).expect("load defaults");
+
+        assert!(settings.ffmpeg.enabled);
+        assert_eq!(
+            settings.ffmpeg,
+            mrd_ffmpeg::FfmpegSettings::golden_for_platform(mrd_ffmpeg::FfmpegPlatform::current())
+        );
+    }
+
+    #[test]
+    fn save_and_load_settings_roundtrip_ffmpeg_overrides() {
+        let path = unique_settings_path("ffmpeg-roundtrip");
+        let mut settings = AppSettings::default();
+        settings.ffmpeg.enabled = false;
+        settings.ffmpeg.channel = "custom".to_string();
+
+        save_settings(&path, &settings).expect("save settings");
+        let loaded = load_settings(&path).expect("load settings");
+
+        assert!(!loaded.ffmpeg.enabled);
+        assert_eq!(loaded.ffmpeg.channel, "custom");
 
         std::fs::remove_file(&path).expect("cleanup temp settings");
     }
@@ -137,5 +179,17 @@ mod tests {
         std::env::remove_var("RDESK_APP_SETTINGS_PATH");
 
         assert_eq!(path, override_path);
+    }
+
+    fn unique_settings_path(prefix: &str) -> std::path::PathBuf {
+        std::env::temp_dir()
+            .join("mini-remote-desktop-tests")
+            .join(format!(
+                "{prefix}-{}.json",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system time")
+                    .as_nanos()
+            ))
     }
 }
