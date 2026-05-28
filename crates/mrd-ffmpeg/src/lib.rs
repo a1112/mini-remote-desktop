@@ -672,6 +672,26 @@ mod tests {
         assert!(error.to_string().contains("checksum mismatch"));
     }
 
+    #[test]
+    fn install_archive_extracts_tools_and_probe_succeeds() {
+        let root = unique_temp_dir("mrd-ffmpeg-install");
+        let archive_path = root.join("ffmpeg.zip");
+        write_fake_ffmpeg_archive(&archive_path);
+        let expected_sha256 = file_sha256(&archive_path);
+        let install_dir = root.join("managed-ffmpeg");
+
+        let result = install_ffmpeg_archive(&archive_path, &install_dir, Some(&expected_sha256))
+            .expect("install archive");
+
+        assert!(result.probe.available);
+        assert_eq!(
+            result.archive_sha256.as_deref(),
+            Some(expected_sha256.as_str())
+        );
+        assert!(install_dir.join("bin").join(exe_name("ffmpeg")).is_file());
+        assert!(install_dir.join("bin").join(exe_name("ffprobe")).is_file());
+    }
+
     fn unique_temp_dir(prefix: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "{prefix}-{}",
@@ -709,6 +729,31 @@ mod tests {
             permissions.set_mode(0o755);
             std::fs::set_permissions(&path, permissions).expect("chmod fake tool");
         }
+    }
+
+    fn write_fake_ffmpeg_archive(path: &std::path::Path) {
+        let file = std::fs::File::create(path).expect("create fake archive");
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default().unix_permissions(0o755);
+        for tool in ["ffmpeg", "ffprobe"] {
+            zip.start_file(
+                format!("ffmpeg-release-essentials/bin/{}", exe_name(tool)),
+                options,
+            )
+            .expect("start zip file");
+            let script = if cfg!(windows) {
+                format!("@echo off\r\necho {tool} version test\r\nexit /b 0\r\n")
+            } else {
+                format!("#!/bin/sh\necho \"{tool} version test\"\nexit 0\n")
+            };
+            zip.write_all(script.as_bytes()).expect("write zip file");
+        }
+        zip.finish().expect("finish fake archive");
+    }
+
+    fn file_sha256(path: &std::path::Path) -> String {
+        let bytes = std::fs::read(path).expect("read file");
+        format!("{:x}", Sha256::digest(&bytes))
     }
 
     fn exe_name(name: &str) -> String {
