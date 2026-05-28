@@ -495,9 +495,9 @@ fn sync_reassembly_probe(
 fn decoded_frame_data_len(data: &DecodedFrameData) -> usize {
     match data {
         DecodedFrameData::CpuRgb24(bytes) | DecodedFrameData::CpuBgra32(bytes) => bytes.len(),
-        DecodedFrameData::CpuNv12 { data, .. } | DecodedFrameData::CpuP010 { data, .. } => {
-            data.len()
-        }
+        DecodedFrameData::CpuNv12 { data, .. }
+        | DecodedFrameData::CpuI420 { data, .. }
+        | DecodedFrameData::CpuP010 { data, .. } => data.len(),
         #[cfg(windows)]
         DecodedFrameData::D3D11SharedNv12 { .. } => 0,
         #[cfg(windows)]

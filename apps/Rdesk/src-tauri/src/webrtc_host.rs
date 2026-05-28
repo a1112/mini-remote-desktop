@@ -1591,6 +1591,7 @@ fn decoded_frame_data_kind(frame: &DecodedFrame) -> &'static str {
     match &frame.data {
         DecodedFrameData::CpuRgb24(_) => "Rgb24",
         DecodedFrameData::CpuBgra32(_) => "Bgra32",
+        DecodedFrameData::CpuI420 { .. } => "I420",
         DecodedFrameData::CpuNv12 { .. } => "Nv12",
         DecodedFrameData::CpuP010 { .. } => "P010",
         #[cfg(windows)]

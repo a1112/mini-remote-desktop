@@ -134,6 +134,12 @@ pub enum DecodedFrameData {
     CpuBgra32(Vec<u8>),
     /// CPU NV12 data with decoder pitch.
     CpuNv12 { data: Vec<u8>, pitch: usize },
+    /// CPU I420/YUV420 planar data with Y and UV pitches.
+    CpuI420 {
+        data: Vec<u8>,
+        y_pitch: usize,
+        uv_pitch: usize,
+    },
     /// CPU P010/P016 data with decoder pitch.
     CpuP010 { data: Vec<u8>, pitch: usize },
     /// D3D11 shared texture handle (zero-copy path)
@@ -171,6 +177,27 @@ impl DecodedFrame {
             height,
             timestamp_us,
             data: DecodedFrameData::CpuRgb24(data),
+        }
+    }
+
+    /// Create a decoded frame from CPU I420/YUV420 planar data
+    pub fn from_cpu_i420(
+        width: usize,
+        height: usize,
+        timestamp_us: u64,
+        y_pitch: usize,
+        uv_pitch: usize,
+        data: Vec<u8>,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            timestamp_us,
+            data: DecodedFrameData::CpuI420 {
+                data,
+                y_pitch,
+                uv_pitch,
+            },
         }
     }
 
@@ -300,6 +327,18 @@ impl DecodedFrame {
         }
     }
 
+    /// Get the CPU I420 data with Y and UV pitches if available
+    pub fn cpu_i420(&self) -> Option<(&[u8], usize, usize)> {
+        match &self.data {
+            DecodedFrameData::CpuI420 {
+                data,
+                y_pitch,
+                uv_pitch,
+            } => Some((data.as_slice(), *y_pitch, *uv_pitch)),
+            _ => None,
+        }
+    }
+
     /// Get the CPU P010/P016 data and pitch if available
     pub fn cpu_p010(&self) -> Option<(&[u8], usize)> {
         match &self.data {
@@ -314,6 +353,7 @@ impl DecodedFrame {
             DecodedFrameData::CpuRgb24(data)
             | DecodedFrameData::CpuBgra32(data)
             | DecodedFrameData::CpuNv12 { data, .. }
+            | DecodedFrameData::CpuI420 { data, .. }
             | DecodedFrameData::CpuP010 { data, .. } => Some(data.as_slice()),
             #[cfg(windows)]
             DecodedFrameData::D3D11SharedNv12 { .. } | DecodedFrameData::D3D11SharedP010 { .. } => {

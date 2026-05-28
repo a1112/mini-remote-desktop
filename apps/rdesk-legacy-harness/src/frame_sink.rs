@@ -18,8 +18,10 @@ pub struct DecodedFrameSnapshot {
 fn pixel_format_from_frame(frame: &DecodedFrame) -> PixelFormat {
     match &frame.data {
         DecodedFrameData::CpuRgb24(_) => PixelFormat::Rgb24,
-        DecodedFrameData::CpuBgra32(_) | DecodedFrameData::CpuP010 { .. } => PixelFormat::Bgra32,
+        DecodedFrameData::CpuBgra32(_) => PixelFormat::Bgra32,
+        DecodedFrameData::CpuI420 { .. } => PixelFormat::I420,
         DecodedFrameData::CpuNv12 { .. } => PixelFormat::Nv12,
+        DecodedFrameData::CpuP010 { .. } => PixelFormat::P010,
         #[cfg(windows)]
         DecodedFrameData::D3D11SharedNv12 { .. } | DecodedFrameData::D3D11SharedP010 { .. } => {
             PixelFormat::D3d11Texture

@@ -3247,6 +3247,15 @@ fn decoded_frame_to_render_frame(frame: &DecodedFrame) -> RenderFrame {
         DecodedFrameData::CpuBgra32(data) => {
             RenderFrame::from_bgra32(frame.width, frame.height, data.clone())
         }
+        DecodedFrameData::CpuI420 {
+            data,
+            y_pitch,
+            uv_pitch,
+        } => RenderFrame::from_rgb24(
+            frame.width,
+            frame.height,
+            cpu_i420_to_rgb24(data, frame.width, frame.height, *y_pitch, *uv_pitch),
+        ),
         DecodedFrameData::CpuNv12 { data, pitch } => RenderFrame::from_rgb24(
             frame.width,
             frame.height,
@@ -3354,6 +3363,49 @@ fn cpu_nv12_to_rgb24(nv12: &[u8], width: usize, height: usize, pitch: usize) -> 
             let y_sample = nv12[y_offset] as i32 - 16;
             let u = nv12[uv_offset] as i32 - 128;
             let v = nv12[uv_offset + 1] as i32 - 128;
+
+            let r = (298 * y_sample + 409 * v + 128) >> 8;
+            let g = (298 * y_sample - 100 * u - 208 * v + 128) >> 8;
+            let b = (298 * y_sample + 516 * u + 128) >> 8;
+
+            rgb[out_idx] = r.clamp(0, 255) as u8;
+            rgb[out_idx + 1] = g.clamp(0, 255) as u8;
+            rgb[out_idx + 2] = b.clamp(0, 255) as u8;
+            out_idx += 3;
+        }
+    }
+
+    rgb
+}
+
+fn cpu_i420_to_rgb24(
+    i420: &[u8],
+    width: usize,
+    height: usize,
+    y_pitch: usize,
+    uv_pitch: usize,
+) -> Vec<u8> {
+    let mut rgb = vec![0_u8; width * height * 3];
+    let chroma_height = height.div_ceil(2);
+    let u_base = y_pitch * height;
+    let v_base = u_base + uv_pitch * chroma_height;
+    let mut out_idx = 0;
+
+    for y in 0..height {
+        let y_row_start = y * y_pitch;
+        let uv_row_start = (y / 2) * uv_pitch;
+        for x in 0..width {
+            let y_offset = y_row_start + x;
+            let u_offset = u_base + uv_row_start + x / 2;
+            let v_offset = v_base + uv_row_start + x / 2;
+            if y_offset >= i420.len() || u_offset >= i420.len() || v_offset >= i420.len() {
+                out_idx += 3;
+                continue;
+            }
+
+            let y_sample = i420[y_offset] as i32 - 16;
+            let u = i420[u_offset] as i32 - 128;
+            let v = i420[v_offset] as i32 - 128;
 
             let r = (298 * y_sample + 409 * v + 128) >> 8;
             let g = (298 * y_sample - 100 * u - 208 * v + 128) >> 8;

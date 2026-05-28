@@ -83,6 +83,7 @@ fn run_h264_decode_perf(
                 if let Some(frame) = frames.first() {
                     decoded_frame_bytes = match &frame.data {
                         DecodedFrameData::CpuRgb24(data) => Some(data.len()),
+                        DecodedFrameData::CpuI420 { data, .. } => Some(data.len()),
                         DecodedFrameData::CpuNv12 { data, .. } => Some(data.len()),
                         _ => Some(0),
                     };
@@ -160,6 +161,7 @@ fn perf_nvenc_720p_decode_reports_latency_distribution() {
                 if let Some(frame) = frames.first() {
                     decoded_frame_bytes = match &frame.data {
                         DecodedFrameData::CpuRgb24(data) => Some(data.len()),
+                        DecodedFrameData::CpuI420 { data, .. } => Some(data.len()),
                         _ => Some(0),
                     };
                     width = Some(frame.width as u32);

@@ -1,13 +1,29 @@
 use mrd_decode::{available_decoder_descriptors, create_decoder, CodecKind, PixelFormat};
 
 #[test]
-fn software_hevc_av1_and_vvc_descriptors_are_exposed_as_rgb24_decoders() {
+fn production_software_descriptors_expose_planar_fast_paths_before_rgb_fallbacks() {
     let descriptors = available_decoder_descriptors();
-    for (id, codec) in [
-        ("software_hevc", CodecKind::Hevc),
-        ("software_hevc_main10", CodecKind::HevcMain10),
-        ("software_av1", CodecKind::Av1),
-        ("software_vvc", CodecKind::Vvc),
+    for (id, codec, expected_formats) in [
+        (
+            "software_hevc",
+            CodecKind::Hevc,
+            &[PixelFormat::Rgb24, PixelFormat::I420][..],
+        ),
+        (
+            "software_hevc_main10",
+            CodecKind::HevcMain10,
+            &[PixelFormat::P010][..],
+        ),
+        (
+            "software_av1",
+            CodecKind::Av1,
+            &[PixelFormat::Rgb24, PixelFormat::I420][..],
+        ),
+        (
+            "software_vvc",
+            CodecKind::Vvc,
+            &[PixelFormat::Rgb24, PixelFormat::I420, PixelFormat::P010][..],
+        ),
     ] {
         let descriptor = descriptors
             .iter()
@@ -15,7 +31,7 @@ fn software_hevc_av1_and_vvc_descriptors_are_exposed_as_rgb24_decoders() {
             .unwrap_or_else(|| panic!("missing descriptor {id}"));
 
         assert_eq!(descriptor.codec, codec);
-        assert!(descriptor.output_formats.contains(&PixelFormat::Rgb24));
+        assert_eq!(descriptor.output_formats, expected_formats);
     }
 }
 

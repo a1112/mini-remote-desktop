@@ -1012,6 +1012,7 @@ fn apply_decoded_frames_to_snapshot(
         snapshot.last_decoded_pixel_format = Some(match &frame.data {
             DecodedFrameData::CpuRgb24(_) => "Rgb24".to_string(),
             DecodedFrameData::CpuBgra32(_) => "Bgra32".to_string(),
+            DecodedFrameData::CpuI420 { .. } => "I420".to_string(),
             DecodedFrameData::CpuNv12 { .. } => "Nv12".to_string(),
             DecodedFrameData::CpuP010 { .. } => "P010".to_string(),
             #[cfg(windows)]

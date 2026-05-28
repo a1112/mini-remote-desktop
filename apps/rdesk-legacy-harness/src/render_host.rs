@@ -278,7 +278,9 @@ fn decoded_frame_snapshot_response(
         pixel_format: match snapshot.pixel_format {
             PixelFormat::Rgb24 => "Rgb24".to_string(),
             PixelFormat::Bgra32 => "Bgra32".to_string(),
+            PixelFormat::I420 => "I420".to_string(),
             PixelFormat::Nv12 => "Nv12".to_string(),
+            PixelFormat::P010 => "P010".to_string(),
             PixelFormat::D3d11Texture => "D3d11Texture".to_string(),
         },
         bytes: snapshot.bytes,
@@ -341,7 +343,9 @@ fn decoded_frame_to_render_frame(frame: &DecodedFrame) -> RenderFrame {
             pixel_format: RenderPixelFormat::Bgra32,
             data: RenderFrameData::Bgra32(data.clone()),
         },
-        DecodedFrameData::CpuNv12 { .. } | DecodedFrameData::CpuP010 { .. } => RenderFrame {
+        DecodedFrameData::CpuNv12 { .. }
+        | DecodedFrameData::CpuI420 { .. }
+        | DecodedFrameData::CpuP010 { .. } => RenderFrame {
             width: frame.width,
             height: frame.height,
             pixel_format: RenderPixelFormat::Rgb24,

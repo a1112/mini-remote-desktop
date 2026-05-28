@@ -5467,7 +5467,7 @@ fn decoded_frame_to_render_frame(frame: DecodedFrame) -> Result<RenderFrame> {
             }
             Ok(RenderFrame::from_bgra32(frame.width, frame.height, data))
         }
-        DecodedFrameData::CpuNv12 { .. } => {
+        DecodedFrameData::CpuNv12 { .. } | DecodedFrameData::CpuI420 { .. } => {
             let (width, height, rgb24) = decoded_frame_to_rgb24(frame)?;
             Ok(RenderFrame::from_rgb24(
                 width as usize,
@@ -6580,6 +6580,7 @@ fn decoded_frame_pixel_format(frame: &DecodedFrame) -> String {
     match &frame.data {
         DecodedFrameData::CpuRgb24(_) => "cpu_rgb24",
         DecodedFrameData::CpuBgra32(_) => "cpu_bgra32",
+        DecodedFrameData::CpuI420 { .. } => "cpu_i420",
         DecodedFrameData::CpuNv12 { .. } => "cpu_nv12",
         DecodedFrameData::CpuP010 { .. } => "cpu_p010",
         #[cfg(windows)]
@@ -6621,7 +6622,12 @@ fn decoded_frame_to_rgb24(frame: DecodedFrame) -> Result<(u32, u32, Vec<u8>)> {
         DecodedFrameData::CpuNv12 { data, pitch } => {
             nv12_to_rgb24(&data, pitch, frame.width, frame.height)?
         }
-        _ => anyhow::bail!("decoded frame is not CPU RGB/BGRA/NV12 backed"),
+        DecodedFrameData::CpuI420 {
+            data,
+            y_pitch,
+            uv_pitch,
+        } => i420_to_rgb24(&data, y_pitch, uv_pitch, frame.width, frame.height)?,
+        _ => anyhow::bail!("decoded frame is not CPU RGB/BGRA/NV12/I420 backed"),
     };
 
     Ok((frame.width as u32, frame.height as u32, rgb))
@@ -6696,6 +6702,56 @@ fn nv12_to_rgb24(data: &[u8], pitch: usize, width: usize, height: usize) -> Resu
             let uv_x = (x / 2) * 2;
             let u = data[uv_row + uv_x] as i32;
             let v = data[uv_row + uv_x + 1] as i32;
+            let c = (luma - 16).max(0);
+            let d = u - 128;
+            let e = v - 128;
+            rgb.push(clamp_yuv_to_u8((298 * c + 409 * e + 128) >> 8));
+            rgb.push(clamp_yuv_to_u8((298 * c - 100 * d - 208 * e + 128) >> 8));
+            rgb.push(clamp_yuv_to_u8((298 * c + 516 * d + 128) >> 8));
+        }
+    }
+    Ok(rgb)
+}
+
+fn i420_to_rgb24(
+    data: &[u8],
+    y_pitch: usize,
+    uv_pitch: usize,
+    width: usize,
+    height: usize,
+) -> Result<Vec<u8>> {
+    if y_pitch < width {
+        anyhow::bail!("I420 Y pitch is smaller than frame width");
+    }
+    let chroma_width = width.div_ceil(2);
+    if uv_pitch < chroma_width {
+        anyhow::bail!("I420 UV pitch is smaller than chroma width");
+    }
+    let chroma_height = height.div_ceil(2);
+    let y_bytes = y_pitch
+        .checked_mul(height)
+        .ok_or_else(|| anyhow::anyhow!("I420 luma byte size overflow"))?;
+    let uv_bytes = uv_pitch
+        .checked_mul(chroma_height)
+        .ok_or_else(|| anyhow::anyhow!("I420 chroma byte size overflow"))?;
+    let expected_len = y_bytes
+        .checked_add(uv_bytes)
+        .and_then(|bytes| bytes.checked_add(uv_bytes))
+        .ok_or_else(|| anyhow::anyhow!("I420 byte size overflow"))?;
+    if data.len() < expected_len {
+        anyhow::bail!("I420 frame has invalid byte length");
+    }
+
+    let u_base = y_bytes;
+    let v_base = y_bytes + uv_bytes;
+    let mut rgb = Vec::with_capacity(width * height * 3);
+    for y in 0..height {
+        let y_row = y * y_pitch;
+        let uv_row = (y / 2) * uv_pitch;
+        for x in 0..width {
+            let luma = data[y_row + x] as i32;
+            let u = data[u_base + uv_row + x / 2] as i32;
+            let v = data[v_base + uv_row + x / 2] as i32;
             let c = (luma - 16).max(0);
             let d = u - 128;
             let e = v - 128;

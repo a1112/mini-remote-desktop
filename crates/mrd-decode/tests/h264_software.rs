@@ -16,7 +16,7 @@ fn h264_software_descriptor_is_runtime_backed() {
 
     assert_eq!(descriptor.codec, CodecKind::H264);
     assert_eq!(descriptor.runtime_status, RuntimeStatus::RuntimeBacked);
-    assert!(descriptor.output_formats.contains(&PixelFormat::Rgb24));
+    assert!(descriptor.output_formats.contains(&PixelFormat::I420));
 }
 
 #[test]
@@ -28,7 +28,7 @@ fn h264_software_decoder_rejects_invalid_access_unit() {
 }
 
 #[test]
-fn h264_software_decoder_emits_rgb_frame_for_valid_access_unit() {
+fn h264_software_decoder_emits_i420_frame_for_valid_access_unit() {
     let mut rgb = Vec::with_capacity(16 * 16 * 3);
     for y in 0..16 {
         for x in 0..16 {
@@ -52,7 +52,15 @@ fn h264_software_decoder_emits_rgb_frame_for_valid_access_unit() {
     assert_eq!(frames[0].width, 16);
     assert_eq!(frames[0].height, 16);
     match &frames[0].data {
-        DecodedFrameData::CpuRgb24(data) => assert_eq!(data.len(), 16 * 16 * 3),
-        other => panic!("expected CpuRgb24 frame, got {other:?}"),
+        DecodedFrameData::CpuI420 {
+            data,
+            y_pitch,
+            uv_pitch,
+        } => {
+            assert_eq!(*y_pitch, 16);
+            assert_eq!(*uv_pitch, 8);
+            assert_eq!(data.len(), 16 * 16 * 3 / 2);
+        }
+        other => panic!("expected CpuI420 frame, got {other:?}"),
     }
 }
