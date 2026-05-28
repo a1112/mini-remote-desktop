@@ -1,8 +1,12 @@
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
+    fs,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::Command,
 };
+use thiserror::Error;
 
 const WINDOWS_RELEASE_ESSENTIALS_ARCHIVE_URL: &str =
     "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip";
@@ -67,6 +71,39 @@ pub struct FfmpegProbeResult {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FfmpegInstallResult {
+    pub install_dir: PathBuf,
+    pub probe: FfmpegProbeResult,
+    pub archive_sha256: Option<String>,
+}
+
+#[derive(Debug, Error)]
+pub enum FfmpegError {
+    #[error("FFmpeg optional tooling is disabled")]
+    Disabled,
+    #[error("managed FFmpeg download is not configured for this platform")]
+    DownloadNotConfigured,
+    #[error("FFmpeg install directory is not configured")]
+    InstallDirMissing,
+    #[error("FFmpeg checksum is required but no SHA256 source was configured")]
+    ChecksumMissing,
+    #[error("invalid SHA256 metadata")]
+    InvalidSha256,
+    #[error("FFmpeg archive checksum mismatch: expected {expected}, got {actual}")]
+    ChecksumMismatch { expected: String, actual: String },
+    #[error("FFmpeg network request failed: {0}")]
+    Request(String),
+    #[error("FFmpeg file operation failed for {path}: {message}")]
+    File { path: PathBuf, message: String },
+    #[error("FFmpeg archive extraction failed: {0}")]
+    Archive(String),
+    #[error("FFmpeg archive did not contain {0}")]
+    ExecutableMissing(&'static str),
+    #[error("installed FFmpeg probe failed: {0}")]
+    Probe(String),
+}
+
 impl FfmpegSettings {
     pub fn golden_for_platform(platform: FfmpegPlatform) -> Self {
         match platform {
@@ -113,7 +150,11 @@ pub fn probe_ffmpeg(settings: &FfmpegSettings) -> FfmpegProbeResult {
         return unavailable("FFmpeg optional tooling is disabled in settings.");
     }
 
-    let ffmpeg = resolve_tool("ffmpeg", settings.ffmpeg_path.as_deref(), settings.install_dir.as_deref());
+    let ffmpeg = resolve_tool(
+        "ffmpeg",
+        settings.ffmpeg_path.as_deref(),
+        settings.install_dir.as_deref(),
+    );
     let ffprobe = resolve_tool(
         "ffprobe",
         settings.ffprobe_path.as_deref(),
@@ -146,6 +187,155 @@ pub fn probe_ffmpeg(settings: &FfmpegSettings) -> FfmpegProbeResult {
     }
 }
 
+pub async fn download_ffmpeg(
+    settings: &FfmpegSettings,
+) -> Result<FfmpegInstallResult, FfmpegError> {
+    if !settings.enabled {
+        return Err(FfmpegError::Disabled);
+    }
+    if settings.download.archive_url.trim().is_empty() {
+        return Err(FfmpegError::DownloadNotConfigured);
+    }
+    let install_dir = settings
+        .install_dir
+        .clone()
+        .ok_or(FfmpegError::InstallDirMissing)?;
+
+    let expected_sha256 = if settings.download.require_sha256 {
+        let sha256_url = settings
+            .download
+            .sha256_url
+            .as_deref()
+            .ok_or(FfmpegError::ChecksumMissing)?;
+        let body = reqwest::get(sha256_url)
+            .await
+            .map_err(|error| FfmpegError::Request(error.to_string()))?
+            .error_for_status()
+            .map_err(|error| FfmpegError::Request(error.to_string()))?
+            .text()
+            .await
+            .map_err(|error| FfmpegError::Request(error.to_string()))?;
+        Some(parse_sha256(&body)?)
+    } else {
+        None
+    };
+
+    let archive_bytes = reqwest::get(&settings.download.archive_url)
+        .await
+        .map_err(|error| FfmpegError::Request(error.to_string()))?
+        .error_for_status()
+        .map_err(|error| FfmpegError::Request(error.to_string()))?
+        .bytes()
+        .await
+        .map_err(|error| FfmpegError::Request(error.to_string()))?;
+    let archive_path = unique_temp_path("mrd-ffmpeg-download", "zip");
+    fs::write(&archive_path, &archive_bytes).map_err(|error| FfmpegError::File {
+        path: archive_path.clone(),
+        message: error.to_string(),
+    })?;
+
+    let result = install_ffmpeg_archive(&archive_path, &install_dir, expected_sha256.as_deref());
+    let _ = fs::remove_file(&archive_path);
+    result
+}
+
+pub fn install_ffmpeg_archive(
+    archive_path: &Path,
+    install_dir: &Path,
+    expected_sha256: Option<&str>,
+) -> Result<FfmpegInstallResult, FfmpegError> {
+    let archive_sha256 = if let Some(expected) = expected_sha256 {
+        verify_sha256(archive_path, expected)?;
+        Some(expected.to_ascii_lowercase())
+    } else {
+        None
+    };
+
+    let parent = install_dir
+        .parent()
+        .ok_or_else(|| FfmpegError::File {
+            path: install_dir.to_path_buf(),
+            message: "install directory has no parent".to_string(),
+        })?
+        .to_path_buf();
+    fs::create_dir_all(&parent).map_err(|error| FfmpegError::File {
+        path: parent.clone(),
+        message: error.to_string(),
+    })?;
+    let staging_dir = parent.join(format!(
+        ".{}-tmp-{}",
+        install_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("ffmpeg"),
+        now_nanos()
+    ));
+    fs::create_dir_all(&staging_dir).map_err(|error| FfmpegError::File {
+        path: staging_dir.clone(),
+        message: error.to_string(),
+    })?;
+
+    if let Err(error) = extract_zip_archive(archive_path, &staging_dir)
+        .and_then(|_| promote_extracted_ffmpeg(&staging_dir, install_dir))
+    {
+        let _ = fs::remove_dir_all(&staging_dir);
+        return Err(error);
+    }
+
+    let settings = FfmpegSettings {
+        install_dir: Some(install_dir.to_path_buf()),
+        ..FfmpegSettings::golden_for_platform(FfmpegPlatform::current())
+    };
+    let probe = probe_ffmpeg(&settings);
+    if !probe.available {
+        return Err(FfmpegError::Probe(
+            probe
+                .reason
+                .clone()
+                .unwrap_or_else(|| "installed tools were unavailable".to_string()),
+        ));
+    }
+
+    Ok(FfmpegInstallResult {
+        install_dir: install_dir.to_path_buf(),
+        probe,
+        archive_sha256,
+    })
+}
+
+pub fn parse_sha256(raw: &str) -> Result<String, FfmpegError> {
+    raw.split_whitespace()
+        .find(|token| token.len() == 64 && token.chars().all(|ch| ch.is_ascii_hexdigit()))
+        .map(|token| token.to_ascii_lowercase())
+        .ok_or(FfmpegError::InvalidSha256)
+}
+
+pub fn verify_sha256(path: &Path, expected: &str) -> Result<(), FfmpegError> {
+    let expected = parse_sha256(expected)?;
+    let mut file = fs::File::open(path).map_err(|error| FfmpegError::File {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| FfmpegError::File {
+            path: path.to_path_buf(),
+            message: error.to_string(),
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let actual = format!("{:x}", hasher.finalize());
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(FfmpegError::ChecksumMismatch { expected, actual })
+    }
+}
+
 pub fn default_managed_install_dir_for_channel(channel: &str) -> PathBuf {
     if let Ok(appdata) = std::env::var("APPDATA") {
         return PathBuf::from(appdata)
@@ -174,6 +364,127 @@ fn default_download_settings() -> FfmpegDownloadSettings {
     FfmpegSettings::golden_for_platform(FfmpegPlatform::current()).download
 }
 
+fn extract_zip_archive(archive_path: &Path, destination: &Path) -> Result<(), FfmpegError> {
+    let file = fs::File::open(archive_path).map_err(|error| FfmpegError::File {
+        path: archive_path.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|error| FfmpegError::Archive(error.to_string()))?;
+
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|error| FfmpegError::Archive(error.to_string()))?;
+        let Some(enclosed_name) = entry.enclosed_name().map(PathBuf::from) else {
+            continue;
+        };
+        let output_path = destination.join(enclosed_name);
+        if entry.is_dir() {
+            fs::create_dir_all(&output_path).map_err(|error| FfmpegError::File {
+                path: output_path.clone(),
+                message: error.to_string(),
+            })?;
+            continue;
+        }
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent).map_err(|error| FfmpegError::File {
+                path: parent.to_path_buf(),
+                message: error.to_string(),
+            })?;
+        }
+        let mut output = fs::File::create(&output_path).map_err(|error| FfmpegError::File {
+            path: output_path.clone(),
+            message: error.to_string(),
+        })?;
+        std::io::copy(&mut entry, &mut output).map_err(|error| FfmpegError::File {
+            path: output_path.clone(),
+            message: error.to_string(),
+        })?;
+        output.flush().map_err(|error| FfmpegError::File {
+            path: output_path,
+            message: error.to_string(),
+        })?;
+    }
+    Ok(())
+}
+
+fn promote_extracted_ffmpeg(staging_dir: &Path, install_dir: &Path) -> Result<(), FfmpegError> {
+    let ffmpeg = find_tool_recursive(staging_dir, "ffmpeg")
+        .ok_or(FfmpegError::ExecutableMissing("ffmpeg"))?;
+    let _ffprobe = find_tool_recursive(staging_dir, "ffprobe")
+        .ok_or(FfmpegError::ExecutableMissing("ffprobe"))?;
+    let root = install_root_for_tool(&ffmpeg)?;
+
+    if install_dir.exists() {
+        fs::remove_dir_all(install_dir).map_err(|error| FfmpegError::File {
+            path: install_dir.to_path_buf(),
+            message: error.to_string(),
+        })?;
+    }
+    fs::rename(&root, install_dir).map_err(|error| FfmpegError::File {
+        path: install_dir.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    if staging_dir.exists() {
+        let _ = fs::remove_dir_all(staging_dir);
+    }
+    Ok(())
+}
+
+fn find_tool_recursive(root: &Path, tool: &str) -> Option<PathBuf> {
+    let names = tool_file_names(tool);
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = fs::read_dir(&dir).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| names.iter().any(|candidate| candidate == name))
+            {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+fn install_root_for_tool(tool_path: &Path) -> Result<PathBuf, FfmpegError> {
+    let parent = tool_path.parent().ok_or_else(|| FfmpegError::File {
+        path: tool_path.to_path_buf(),
+        message: "tool path has no parent".to_string(),
+    })?;
+    if parent
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("bin"))
+    {
+        return parent
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| FfmpegError::File {
+                path: tool_path.to_path_buf(),
+                message: "bin directory has no parent".to_string(),
+            });
+    }
+    Ok(parent.to_path_buf())
+}
+
+fn unique_temp_path(prefix: &str, extension: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("{prefix}-{}.{}", now_nanos(), extension))
+}
+
+fn now_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default()
+}
+
 fn unavailable(reason: impl Into<String>) -> FfmpegProbeResult {
     FfmpegProbeResult {
         available: false,
@@ -185,7 +496,11 @@ fn unavailable(reason: impl Into<String>) -> FfmpegProbeResult {
     }
 }
 
-fn resolve_tool(tool: &str, explicit_path: Option<&Path>, install_dir: Option<&Path>) -> Option<PathBuf> {
+fn resolve_tool(
+    tool: &str,
+    explicit_path: Option<&Path>,
+    install_dir: Option<&Path>,
+) -> Option<PathBuf> {
     if let Some(path) = explicit_path.filter(|path| path.is_file()) {
         return Some(path.to_path_buf());
     }
@@ -198,13 +513,20 @@ fn resolve_tool(tool: &str, explicit_path: Option<&Path>, install_dir: Option<&P
         }
     }
 
-    path_candidates(tool).into_iter().find(|candidate| candidate.is_file())
+    path_candidates(tool)
+        .into_iter()
+        .find(|candidate| candidate.is_file())
 }
 
 fn install_dir_candidates(install_dir: &Path, tool: &str) -> Vec<PathBuf> {
     tool_file_names(tool)
         .into_iter()
-        .flat_map(|file_name| [install_dir.join("bin").join(&file_name), install_dir.join(file_name)])
+        .flat_map(|file_name| {
+            [
+                install_dir.join("bin").join(&file_name),
+                install_dir.join(file_name),
+            ]
+        })
         .collect()
 }
 
@@ -327,6 +649,27 @@ mod tests {
 
         assert!(!result.available);
         assert!(result.reason.unwrap().contains("ffprobe"));
+    }
+
+    #[test]
+    fn parses_plain_and_filename_sha256_formats() {
+        let plain = parse_sha256("a".repeat(64).as_str()).expect("plain hash");
+        let named =
+            parse_sha256(format!("{}  ffmpeg-release-essentials.zip", "b".repeat(64)).as_str())
+                .expect("named hash");
+
+        assert_eq!(plain, "a".repeat(64));
+        assert_eq!(named, "b".repeat(64));
+    }
+
+    #[test]
+    fn checksum_mismatch_is_reported() {
+        let path = unique_temp_dir("mrd-ffmpeg-hash").join("archive.zip");
+        std::fs::write(&path, b"not the expected content").expect("write archive");
+
+        let error = verify_sha256(&path, &"0".repeat(64)).unwrap_err();
+
+        assert!(error.to_string().contains("checksum mismatch"));
     }
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {
