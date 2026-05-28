@@ -5660,6 +5660,9 @@ fn preferred_lan_receiver_decoder_candidates(codec: LanAccessUnitCodec) -> Vec<&
             vec!["nvdec_d3d11_shared", "nvdec"]
         }
         (LanAccessUnitCodec::H264, "nvdec_cpu" | "nvdec_cpu_nv12") => vec!["nvdec"],
+        (LanAccessUnitCodec::H264, "ffmpeg" | "ffmpeg_h264" | "h264_ffmpeg") => {
+            vec!["ffmpeg_h264", "h264_software"]
+        }
         (
             LanAccessUnitCodec::Hevc,
             "nvdec"
@@ -5672,6 +5675,9 @@ fn preferred_lan_receiver_decoder_candidates(codec: LanAccessUnitCodec) -> Vec<&
         }
         (LanAccessUnitCodec::Hevc, "nvdec_cpu" | "nvdec_cpu_nv12" | "nvdec_hevc") => {
             vec!["nvdec_hevc"]
+        }
+        (LanAccessUnitCodec::Hevc, "ffmpeg" | "ffmpeg_hevc" | "hevc_ffmpeg" | "h265_ffmpeg") => {
+            vec!["ffmpeg_hevc"]
         }
         _ => default_lan_receiver_decoder_candidates(codec).to_vec(),
     }
@@ -5710,32 +5716,37 @@ fn prioritize_lan_receiver_decoder_candidates(
 #[cfg(windows)]
 fn default_lan_receiver_decoder_candidates(codec: LanAccessUnitCodec) -> &'static [&'static str] {
     match codec {
-        LanAccessUnitCodec::H264 => &["nvdec_d3d11_shared", "nvdec", "h264_software"],
-        LanAccessUnitCodec::Hevc => &["nvdec_hevc_d3d11_shared", "nvdec_hevc"],
+        LanAccessUnitCodec::H264 => &[
+            "nvdec_d3d11_shared",
+            "nvdec",
+            "ffmpeg_h264",
+            "h264_software",
+        ],
+        LanAccessUnitCodec::Hevc => &["nvdec_hevc_d3d11_shared", "nvdec_hevc", "ffmpeg_hevc"],
     }
 }
 
 #[cfg(target_os = "linux")]
 fn default_lan_receiver_decoder_candidates(codec: LanAccessUnitCodec) -> &'static [&'static str] {
     match codec {
-        LanAccessUnitCodec::H264 => &["linux_h264", "h264_software"],
-        LanAccessUnitCodec::Hevc => &["linux_hevc"],
+        LanAccessUnitCodec::H264 => &["linux_h264", "ffmpeg_h264", "h264_software"],
+        LanAccessUnitCodec::Hevc => &["linux_hevc", "ffmpeg_hevc"],
     }
 }
 
 #[cfg(target_os = "macos")]
 fn default_lan_receiver_decoder_candidates(codec: LanAccessUnitCodec) -> &'static [&'static str] {
     match codec {
-        LanAccessUnitCodec::H264 => &["videotoolbox", "h264_software"],
-        LanAccessUnitCodec::Hevc => &[],
+        LanAccessUnitCodec::H264 => &["videotoolbox", "ffmpeg_h264", "h264_software"],
+        LanAccessUnitCodec::Hevc => &["ffmpeg_hevc"],
     }
 }
 
 #[cfg(all(not(windows), not(target_os = "macos"), not(target_os = "linux")))]
 fn default_lan_receiver_decoder_candidates(codec: LanAccessUnitCodec) -> &'static [&'static str] {
     match codec {
-        LanAccessUnitCodec::H264 => &["h264_software"],
-        LanAccessUnitCodec::Hevc => &[],
+        LanAccessUnitCodec::H264 => &["ffmpeg_h264", "h264_software"],
+        LanAccessUnitCodec::Hevc => &["ffmpeg_hevc"],
     }
 }
 
@@ -8457,14 +8468,19 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_receiver_decoder_defaults_to_d3d11_shared_nvdec() {
+    fn windows_receiver_decoder_defaults_to_hardware_then_ffmpeg_fallback() {
         assert_eq!(
             default_lan_receiver_decoder_candidates(LanAccessUnitCodec::H264),
-            &["nvdec_d3d11_shared", "nvdec", "h264_software"]
+            &[
+                "nvdec_d3d11_shared",
+                "nvdec",
+                "ffmpeg_h264",
+                "h264_software"
+            ]
         );
         assert_eq!(
             default_lan_receiver_decoder_candidates(LanAccessUnitCodec::Hevc),
-            &["nvdec_hevc_d3d11_shared", "nvdec_hevc"]
+            &["nvdec_hevc_d3d11_shared", "nvdec_hevc", "ffmpeg_hevc"]
         );
     }
 

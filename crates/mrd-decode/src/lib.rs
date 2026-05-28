@@ -7,14 +7,13 @@ use openh264::{
     decoder::{DecodedYUV, Decoder as OpenH264Decoder},
     formats::YUVSource,
 };
-#[cfg(target_os = "linux")]
-use std::process::{Command, Stdio};
-#[cfg(target_os = "linux")]
 use std::{
     io::{Read, Write},
-    process::{Child, ChildStdin},
+    path::PathBuf,
+    process::{Child, ChildStdin, Command, Stdio},
     sync::mpsc,
     thread,
+    time::Duration,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +29,7 @@ pub enum CodecKind {
 pub enum PixelFormat {
     Rgb24,
     Bgra32,
+    Nv12,
     D3d11Texture,
 }
 
@@ -42,6 +42,7 @@ pub struct DecoderDescriptor {
 }
 
 const RGB24_OUTPUTS: &[PixelFormat] = &[PixelFormat::Rgb24];
+const NV12_OUTPUTS: &[PixelFormat] = &[PixelFormat::Nv12];
 const D3D11_TEXTURE_OUTPUTS: &[PixelFormat] = &[PixelFormat::D3d11Texture];
 
 const H264_SOFTWARE_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
@@ -77,6 +78,20 @@ const VVC_SOFTWARE_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
     codec: CodecKind::Vvc,
     runtime_status: RuntimeStatus::RuntimeBacked,
     output_formats: RGB24_OUTPUTS,
+};
+
+const FFMPEG_H264_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
+    id: "ffmpeg_h264",
+    codec: CodecKind::H264,
+    runtime_status: RuntimeStatus::RuntimeBacked,
+    output_formats: NV12_OUTPUTS,
+};
+
+const FFMPEG_HEVC_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
+    id: "ffmpeg_hevc",
+    codec: CodecKind::Hevc,
+    runtime_status: RuntimeStatus::RuntimeBacked,
+    output_formats: NV12_OUTPUTS,
 };
 
 const NVDEC_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
@@ -159,6 +174,8 @@ pub fn available_decoder_descriptors() -> Vec<DecoderDescriptor> {
         HEVC_MAIN10_SOFTWARE_DESCRIPTOR.clone(),
         AV1_SOFTWARE_DESCRIPTOR.clone(),
         VVC_SOFTWARE_DESCRIPTOR.clone(),
+        FFMPEG_H264_DESCRIPTOR.clone(),
+        FFMPEG_HEVC_DESCRIPTOR.clone(),
         NVDEC_D3D11_SHARED_DESCRIPTOR.clone(),
         NVDEC_DESCRIPTOR.clone(),
         NVDEC_HEVC_D3D11_SHARED_DESCRIPTOR.clone(),
@@ -191,6 +208,12 @@ pub fn create_decoder(id: &str) -> Result<Box<dyn VideoDecoder>, PipelineError> 
         "software_av1" | "av1_software" => create_dav1d_decoder(),
         "software_vvc" | "vvc_software" | "software_h266" | "h266_software" => {
             create_vvdec_decoder()
+        }
+        "ffmpeg_h264" | "h264_ffmpeg" => {
+            Ok(Box::new(FfmpegCliDecoder::new(FfmpegDecodeCodec::H264)?))
+        }
+        "ffmpeg_hevc" | "hevc_ffmpeg" | "h265_ffmpeg" => {
+            Ok(Box::new(FfmpegCliDecoder::new(FfmpegDecodeCodec::Hevc)?))
         }
         "linux_h264" | "gstreamer_h264" | "vaapi_h264" => create_linux_h264_decoder(),
         "linux_hevc" | "gstreamer_hevc" | "vaapi_hevc" => create_linux_hevc_decoder(),
@@ -886,8 +909,316 @@ impl VideoDecoder for LinuxGstDecoder {
     }
 }
 
-#[cfg(target_os = "linux")]
-fn read_raw_rgb_frames(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FfmpegDecodeCodec {
+    H264,
+    Hevc,
+}
+
+impl FfmpegDecodeCodec {
+    fn label(self) -> &'static str {
+        match self {
+            Self::H264 => "H.264",
+            Self::Hevc => "HEVC",
+        }
+    }
+
+    fn input_format(self) -> &'static str {
+        match self {
+            Self::H264 => "h264",
+            Self::Hevc => "hevc",
+        }
+    }
+
+    fn parse_dimensions(self, access_unit: &[u8]) -> Result<Option<(usize, usize)>, PipelineError> {
+        match self {
+            Self::H264 => parse_h264_dimensions(access_unit),
+            Self::Hevc => parse_hevc_dimensions(access_unit),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FfmpegOutputPixelFormat {
+    Nv12,
+}
+
+impl FfmpegOutputPixelFormat {
+    fn ffmpeg_name(self) -> &'static str {
+        match self {
+            Self::Nv12 => "nv12",
+        }
+    }
+
+    fn frame_size(self, width: usize, height: usize) -> Result<usize, PipelineError> {
+        match self {
+            Self::Nv12 => nv12_frame_size(width, height),
+        }
+    }
+}
+
+pub struct FfmpegCliDecoder {
+    codec: FfmpegDecodeCodec,
+    ffmpeg_path: PathBuf,
+    output_format: FfmpegOutputPixelFormat,
+    child: Option<Child>,
+    stdin: Option<ChildStdin>,
+    frame_rx: Option<mpsc::Receiver<Vec<u8>>>,
+    dimensions: Option<(usize, usize)>,
+    pending_stream: Vec<u8>,
+    decoded_frames: Vec<CoreDecodedFrame>,
+    frame_index: u64,
+}
+
+impl FfmpegCliDecoder {
+    pub fn new(codec: FfmpegDecodeCodec) -> Result<Self, PipelineError> {
+        let settings = ffmpeg_settings_from_environment();
+        let probe = mrd_ffmpeg::probe_ffmpeg(&settings);
+        let Some(ffmpeg_path) = probe.ffmpeg_path else {
+            let reason = probe
+                .reason
+                .unwrap_or_else(|| "ffmpeg executable was not found".to_string());
+            return Err(PipelineError::Message(format!(
+                "FFmpeg {} decoder unavailable: {reason}",
+                codec.label()
+            )));
+        };
+
+        Self::new_with_ffmpeg_path(codec, ffmpeg_path)
+    }
+
+    pub fn new_with_ffmpeg_path(
+        codec: FfmpegDecodeCodec,
+        ffmpeg_path: PathBuf,
+    ) -> Result<Self, PipelineError> {
+        if !ffmpeg_path.is_file() {
+            return Err(PipelineError::Message(format!(
+                "FFmpeg executable not found: {}",
+                ffmpeg_path.display()
+            )));
+        }
+
+        Ok(Self {
+            codec,
+            ffmpeg_path,
+            output_format: FfmpegOutputPixelFormat::Nv12,
+            child: None,
+            stdin: None,
+            frame_rx: None,
+            dimensions: None,
+            pending_stream: Vec::new(),
+            decoded_frames: Vec::new(),
+            frame_index: 0,
+        })
+    }
+
+    fn start_process(&mut self, width: usize, height: usize) -> Result<(), PipelineError> {
+        if self.child.is_some() {
+            return Ok(());
+        }
+
+        let frame_size = self.output_format.frame_size(width, height)?;
+        let mut child = Command::new(&self.ffmpeg_path)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-probesize",
+                "32",
+                "-analyzeduration",
+                "0",
+                "-flags",
+                "low_delay",
+                "-f",
+                self.codec.input_format(),
+                "-i",
+                "pipe:0",
+                "-an",
+                "-sn",
+                "-dn",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                self.output_format.ffmpeg_name(),
+                "pipe:1",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| {
+                PipelineError::Message(format!(
+                    "spawn FFmpeg {} decoder failed ({}): {error}",
+                    self.codec.label(),
+                    self.ffmpeg_path.display()
+                ))
+            })?;
+
+        let stdout = child.stdout.take().ok_or_else(|| {
+            PipelineError::Message("FFmpeg decoder stdout pipe was not created".to_string())
+        })?;
+        let stdin = child.stdin.take().ok_or_else(|| {
+            PipelineError::Message("FFmpeg decoder stdin pipe was not created".to_string())
+        })?;
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || read_raw_video_frames(stdout, frame_size, tx));
+
+        self.stdin = Some(stdin);
+        self.frame_rx = Some(rx);
+        self.child = Some(child);
+        Ok(())
+    }
+
+    fn stop_process(&mut self) {
+        drop(self.stdin.take());
+        self.frame_rx = None;
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    fn write_access_unit(&mut self, access_unit: &[u8]) -> Result<(), PipelineError> {
+        let stdin = self.stdin.as_mut().ok_or_else(|| {
+            PipelineError::Message("FFmpeg decoder stdin is not available".to_string())
+        })?;
+        stdin
+            .write_all(access_unit)
+            .and_then(|()| stdin.flush())
+            .map_err(|error| {
+                PipelineError::Message(format!(
+                    "write {} access unit to FFmpeg decoder failed: {error}",
+                    self.codec.label()
+                ))
+            })
+    }
+
+    fn collect_frames(&mut self, wait_for_first: Option<Duration>) {
+        let Some((width, height)) = self.dimensions else {
+            return;
+        };
+        let Some(rx) = self.frame_rx.as_ref() else {
+            return;
+        };
+
+        let mut raw_frames = Vec::new();
+        if let Some(timeout) = wait_for_first {
+            if let Ok(frame) = rx.recv_timeout(timeout) {
+                raw_frames.push(frame);
+            }
+        }
+        while let Ok(frame) = rx.try_recv() {
+            raw_frames.push(frame);
+        }
+
+        for frame in raw_frames {
+            let timestamp_us = self.frame_index.saturating_mul(16_667);
+            self.frame_index = self.frame_index.saturating_add(1);
+            match self.output_format {
+                FfmpegOutputPixelFormat::Nv12 => self.decoded_frames.push(
+                    CoreDecodedFrame::from_cpu_nv12(width, height, timestamp_us, width, frame),
+                ),
+            }
+        }
+    }
+}
+
+impl Drop for FfmpegCliDecoder {
+    fn drop(&mut self) {
+        self.stop_process();
+    }
+}
+
+impl VideoDecoder for FfmpegCliDecoder {
+    fn push_access_unit(&mut self, access_unit: &[u8]) -> Result<(), PipelineError> {
+        if access_unit.is_empty() {
+            return Ok(());
+        }
+
+        if let Some((width, height)) = self.codec.parse_dimensions(access_unit)? {
+            if self
+                .dimensions
+                .is_some_and(|current| current != (width, height))
+            {
+                self.stop_process();
+                self.pending_stream.clear();
+            }
+            self.dimensions = Some((width, height));
+        }
+
+        if self.child.is_none() {
+            self.pending_stream.extend_from_slice(access_unit);
+            if let Some((width, height)) = self.dimensions {
+                self.start_process(width, height)?;
+                let pending = std::mem::take(&mut self.pending_stream);
+                self.write_access_unit(&pending)?;
+            } else if self.pending_stream.len() > 8 * 1024 * 1024 {
+                return Err(PipelineError::Message(format!(
+                    "FFmpeg {} decoder is waiting for an SPS NAL to discover stream dimensions",
+                    self.codec.label()
+                )));
+            }
+        } else {
+            self.write_access_unit(access_unit)?;
+        }
+
+        self.collect_frames(Some(Duration::from_millis(10)));
+        Ok(())
+    }
+
+    fn drain_decoded_frames(&mut self) -> Vec<CoreDecodedFrame> {
+        self.collect_frames(None);
+        std::mem::take(&mut self.decoded_frames)
+    }
+}
+
+fn ffmpeg_settings_from_environment() -> mrd_ffmpeg::FfmpegSettings {
+    let mut settings = mrd_ffmpeg::golden_settings();
+    if env_flag_enabled("MRD_FFMPEG_DISABLE") {
+        settings.enabled = false;
+    }
+    if let Ok(path) = std::env::var("MRD_FFMPEG_PATH") {
+        if !path.trim().is_empty() {
+            settings.ffmpeg_path = Some(PathBuf::from(path));
+        }
+    }
+    if let Ok(path) = std::env::var("MRD_FFPROBE_PATH") {
+        if !path.trim().is_empty() {
+            settings.ffprobe_path = Some(PathBuf::from(path));
+        }
+    }
+    if let Ok(path) = std::env::var("MRD_FFMPEG_INSTALL_DIR") {
+        if !path.trim().is_empty() {
+            settings.install_dir = Some(PathBuf::from(path));
+        }
+    }
+    settings
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn nv12_frame_size(width: usize, height: usize) -> Result<usize, PipelineError> {
+    if width % 2 != 0 || height % 2 != 0 {
+        return Err(PipelineError::Message(format!(
+            "NV12 output requires even dimensions, got {width}x{height}"
+        )));
+    }
+    width
+        .checked_mul(height)
+        .and_then(|luma| luma.checked_add(luma / 2))
+        .ok_or_else(|| PipelineError::Message("decoded NV12 frame size overflow".to_string()))
+}
+
+fn read_raw_video_frames(
     mut stdout: std::process::ChildStdout,
     frame_size: usize,
     tx: mpsc::Sender<Vec<u8>>,
@@ -903,6 +1234,15 @@ fn read_raw_rgb_frames(
             Err(_) => break,
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn read_raw_rgb_frames(
+    stdout: std::process::ChildStdout,
+    frame_size: usize,
+    tx: mpsc::Sender<Vec<u8>>,
+) {
+    read_raw_video_frames(stdout, frame_size, tx);
 }
 
 impl H264SoftwareDecoder {

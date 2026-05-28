@@ -278,6 +278,7 @@ fn decoded_frame_snapshot_response(
         pixel_format: match snapshot.pixel_format {
             PixelFormat::Rgb24 => "Rgb24".to_string(),
             PixelFormat::Bgra32 => "Bgra32".to_string(),
+            PixelFormat::Nv12 => "Nv12".to_string(),
             PixelFormat::D3d11Texture => "D3d11Texture".to_string(),
         },
         bytes: snapshot.bytes,

@@ -117,9 +117,8 @@ impl DecodedFrameSink {
 fn decoded_frame_pixel_format(frame: &DecodedFrame) -> PixelFormat {
     match &frame.data {
         DecodedFrameData::CpuRgb24(_) => PixelFormat::Rgb24,
-        DecodedFrameData::CpuBgra32(_)
-        | DecodedFrameData::CpuNv12 { .. }
-        | DecodedFrameData::CpuP010 { .. } => PixelFormat::Bgra32,
+        DecodedFrameData::CpuBgra32(_) | DecodedFrameData::CpuP010 { .. } => PixelFormat::Bgra32,
+        DecodedFrameData::CpuNv12 { .. } => PixelFormat::Nv12,
         #[cfg(windows)]
         DecodedFrameData::D3D11SharedNv12 { .. } | DecodedFrameData::D3D11SharedP010 { .. } => {
             PixelFormat::D3d11Texture

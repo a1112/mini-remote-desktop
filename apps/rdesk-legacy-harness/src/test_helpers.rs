@@ -299,6 +299,7 @@ pub fn decoded_frame_snapshot_response(
         pixel_format: match snapshot.pixel_format {
             mrd_decode::PixelFormat::Rgb24 => "Rgb24".to_string(),
             mrd_decode::PixelFormat::Bgra32 => "Bgra32".to_string(),
+            mrd_decode::PixelFormat::Nv12 => "Nv12".to_string(),
             mrd_decode::PixelFormat::D3d11Texture => "D3d11Texture".to_string(),
         },
         bytes: snapshot.bytes,

@@ -19,6 +19,23 @@ fn software_hevc_av1_and_vvc_descriptors_are_exposed_as_rgb24_decoders() {
     }
 }
 
+#[test]
+fn ffmpeg_descriptors_are_exposed_as_nv12_fallback_decoders() {
+    let descriptors = available_decoder_descriptors();
+    for (id, codec) in [
+        ("ffmpeg_h264", CodecKind::H264),
+        ("ffmpeg_hevc", CodecKind::Hevc),
+    ] {
+        let descriptor = descriptors
+            .iter()
+            .find(|descriptor| descriptor.id == id)
+            .unwrap_or_else(|| panic!("missing descriptor {id}"));
+
+        assert_eq!(descriptor.codec, codec);
+        assert!(descriptor.output_formats.contains(&PixelFormat::Nv12));
+    }
+}
+
 #[cfg(all(windows, feature = "software-rust-h265"))]
 #[test]
 fn software_hevc_main10_decodes_nvenc_main10_access_unit() {

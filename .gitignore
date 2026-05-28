@@ -46,6 +46,7 @@ client-qt/venv
 /logs
 /artifacts/benchmarks/
 /artifacts/component-matrix/
+/crates/mrd-decode/artifacts/
 /tests/benchmarks/tmp/
 /tests/component-matrix/tmp/
 
