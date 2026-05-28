@@ -1415,6 +1415,25 @@ async fn set_decode_policy(
     set_decode_policy_with(&state.settings_path, decode_policy).await
 }
 
+#[tauri::command]
+fn ffmpeg_probe(
+    state: tauri::State<'_, AppState>,
+) -> Result<mrd_ffmpeg::FfmpegProbeResult, String> {
+    ffmpeg_probe_at_path(&state.settings_path)
+}
+
+#[tauri::command]
+async fn ffmpeg_download(
+    state: tauri::State<'_, AppState>,
+) -> Result<mrd_ffmpeg::FfmpegInstallResult, String> {
+    ffmpeg_download_at_path(&state.settings_path).await
+}
+
+#[tauri::command]
+fn ffmpeg_reset_golden_settings(state: tauri::State<'_, AppState>) -> Result<AppSettings, String> {
+    reset_ffmpeg_settings_at_path(&state.settings_path)
+}
+
 // ============================================================================
 // Bootstrap Commands (Phase 6: bootstrap-only behavior)
 // ============================================================================
@@ -2339,6 +2358,29 @@ async fn set_decode_policy_with(
     })
 }
 
+fn ffmpeg_probe_at_path(
+    settings_path: &std::path::Path,
+) -> Result<mrd_ffmpeg::FfmpegProbeResult, String> {
+    let settings = load_settings(settings_path)?;
+    Ok(mrd_ffmpeg::probe_ffmpeg(&settings.ffmpeg))
+}
+
+async fn ffmpeg_download_at_path(
+    settings_path: &std::path::Path,
+) -> Result<mrd_ffmpeg::FfmpegInstallResult, String> {
+    let settings = load_settings(settings_path)?;
+    mrd_ffmpeg::download_ffmpeg(&settings.ffmpeg)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+fn reset_ffmpeg_settings_at_path(settings_path: &std::path::Path) -> Result<AppSettings, String> {
+    let mut settings = load_settings(settings_path)?;
+    settings.ffmpeg = mrd_ffmpeg::golden_settings();
+    save_settings(settings_path, &settings)?;
+    Ok(settings)
+}
+
 // ============================================================================
 // Test harness commands - end-to-end pipeline visualization
 // ============================================================================
@@ -3197,6 +3239,37 @@ mod tray_tests {
     }
 
     #[test]
+    fn reset_ffmpeg_settings_uses_golden_defaults() {
+        let path = unique_settings_path("ffmpeg-reset");
+        let mut settings = AppSettings::default();
+        settings.ffmpeg.enabled = false;
+        settings.ffmpeg.channel = "custom".to_string();
+        save_settings(&path, &settings).expect("save custom settings");
+
+        let settings = reset_ffmpeg_settings_at_path(&path).expect("reset ffmpeg");
+
+        assert!(settings.ffmpeg.enabled);
+        assert_eq!(settings.ffmpeg, mrd_ffmpeg::golden_settings());
+
+        std::fs::remove_file(&path).expect("cleanup temp settings");
+    }
+
+    #[test]
+    fn ffmpeg_probe_at_path_uses_saved_settings() {
+        let path = unique_settings_path("ffmpeg-probe-disabled");
+        let mut settings = AppSettings::default();
+        settings.ffmpeg.enabled = false;
+        save_settings(&path, &settings).expect("save disabled ffmpeg settings");
+
+        let result = ffmpeg_probe_at_path(&path).expect("probe ffmpeg");
+
+        assert!(!result.available);
+        assert!(result.reason.unwrap().contains("disabled"));
+
+        std::fs::remove_file(&path).expect("cleanup temp settings");
+    }
+
+    #[test]
     fn lan_e2e_autorun_navigation_forces_route_load() {
         let script = build_main_window_route_navigation_script(
             "/test/e2e?autorun=lan-e2e&displayModePolicy=temporary",
@@ -3572,6 +3645,9 @@ fn main() {
             nvdec_runtime_probe,
             decode_policy,
             set_decode_policy,
+            ffmpeg_probe,
+            ffmpeg_download,
+            ffmpeg_reset_golden_settings,
             // Bootstrap commands (Phase 6: bootstrap-only behavior)
             service_bootstrap_if_needed,
             service_wait_for_healthy,
