@@ -46,16 +46,56 @@ describe("SettingsModal - Component Behavior", () => {
     last_error: null,
   };
 
+  const ffmpegProbe = {
+    available: true,
+    ffmpeg_path: "C:\\ffmpeg\\bin\\ffmpeg.exe",
+    ffprobe_path: "C:\\ffmpeg\\bin\\ffprobe.exe",
+    ffmpeg_version: "ffmpeg version 8.1.1",
+    ffprobe_version: "ffprobe version 8.1.1",
+    reason: null,
+  };
+
+  const mockSettingsCommands = (mockInvoke: ReturnType<typeof getMockInvoke>) => {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "shell_get_status") return Promise.resolve(runningStatus);
+      if (cmd === "decode_policy") return Promise.resolve({ decode_policy: "auto" });
+      if (cmd === "set_decode_policy") return Promise.resolve({ decode_policy: "nvdec" });
+      if (cmd === "ffmpeg_probe") return Promise.resolve(ffmpegProbe);
+      if (cmd === "ffmpeg_download") {
+        return Promise.resolve({
+          install_dir: "C:\\ffmpeg",
+          archive_sha256: "a".repeat(64),
+          probe: ffmpegProbe,
+        });
+      }
+      if (cmd === "ffmpeg_reset_golden_settings") {
+        return Promise.resolve({
+          decode_policy: "auto",
+          ffmpeg: {
+            enabled: true,
+            channel: "release-essentials",
+            install_dir: "C:\\ffmpeg",
+            ffmpeg_path: null,
+            ffprobe_path: null,
+            download: {
+              archive_url: "https://example.test/ffmpeg.zip",
+              sha256_url: "https://example.test/ffmpeg.zip.sha256",
+              require_sha256: true,
+            },
+          },
+        });
+      }
+      return Promise.resolve(true);
+    });
+  };
+
   beforeEach(() => {
     vi.clearAllMocks();
   });
 
   it("should render without crashing", async () => {
     const mockInvoke = getMockInvoke();
-    mockInvoke.mockImplementation((cmd: string) => {
-      if (cmd === "shell_get_status") return Promise.resolve(runningStatus);
-      return Promise.resolve(true);
-    });
+    mockSettingsCommands(mockInvoke);
 
     render(<SettingsModal {...defaultProps} />);
 
@@ -66,10 +106,7 @@ describe("SettingsModal - Component Behavior", () => {
 
   it("should fetch service status on mount", async () => {
     const mockInvoke = getMockInvoke();
-    mockInvoke.mockImplementation((cmd: string) => {
-      if (cmd === "shell_get_status") return Promise.resolve(runningStatus);
-      return Promise.resolve(true);
-    });
+    mockSettingsCommands(mockInvoke);
 
     render(<SettingsModal {...defaultProps} />);
 
@@ -83,12 +120,9 @@ describe("SettingsModal - Component Behavior", () => {
     });
   });
 
-  it("should show deprecation notice for migrated features", async () => {
+  it("should show media decode settings with FFmpeg status", async () => {
     const mockInvoke = getMockInvoke();
-    mockInvoke.mockImplementation((cmd: string) => {
-      if (cmd === "shell_get_status") return Promise.resolve(runningStatus);
-      return Promise.resolve(true);
-    });
+    mockSettingsCommands(mockInvoke);
 
     render(<SettingsModal {...defaultProps} />);
 
@@ -99,17 +133,41 @@ describe("SettingsModal - Component Behavior", () => {
     // Navigate to network section
     await userEvent.click(screen.getByText("网络"));
 
+    expect(await screen.findByText("媒体解码")).toBeInTheDocument();
+    expect(screen.getByText("FFmpeg 可选工具")).toBeInTheDocument();
+    expect(screen.getByText("ffmpeg version 8.1.1")).toBeInTheDocument();
+    expect(screen.getByText("C:\\ffmpeg\\bin\\ffmpeg.exe")).toBeInTheDocument();
+  });
+
+  it("should update decode policy and run FFmpeg install actions", async () => {
+    const mockInvoke = getMockInvoke();
+    mockSettingsCommands(mockInvoke);
+
+    render(<SettingsModal {...defaultProps} />);
+
     await waitFor(() => {
-      expect(screen.getAllByText(/功能已迁移/).length).toBeGreaterThan(0);
+      expect(screen.getByText("设置")).toBeInTheDocument();
+    });
+
+    await userEvent.click(screen.getByText("网络"));
+    await userEvent.selectOptions(await screen.findByLabelText("解码策略"), "nvdec");
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("set_decode_policy", {
+        decodePolicy: "nvdec",
+      });
+    });
+
+    await userEvent.click(screen.getByRole("button", { name: "下载或更新 FFmpeg" }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("ffmpeg_download", undefined);
     });
   });
 
   it("should handle service status refresh on button click", async () => {
     const mockInvoke = getMockInvoke();
-    mockInvoke.mockImplementation((cmd: string) => {
-      if (cmd === "shell_get_status") return Promise.resolve(runningStatus);
-      return Promise.resolve(true);
-    });
+    mockSettingsCommands(mockInvoke);
 
     render(<SettingsModal {...defaultProps} />);
 
@@ -121,7 +179,7 @@ describe("SettingsModal - Component Behavior", () => {
     await userEvent.click(screen.getByText("网络"));
 
     // Now refresh button should be visible
-    const refreshButton = await screen.findByText("刷新");
+    const refreshButton = await screen.findByRole("button", { name: "刷新" });
     await userEvent.click(refreshButton);
 
     await waitFor(() => {
@@ -192,10 +250,7 @@ describe("SettingsModal - Component Behavior", () => {
 
   it("should close modal when close button is clicked", async () => {
     const mockInvoke = getMockInvoke();
-    mockInvoke.mockImplementation((cmd: string) => {
-      if (cmd === "shell_get_status") return Promise.resolve(runningStatus);
-      return Promise.resolve(true);
-    });
+    mockSettingsCommands(mockInvoke);
 
     render(<SettingsModal {...defaultProps} />);
 
@@ -217,10 +272,7 @@ describe("SettingsModal - Component Behavior", () => {
 
   it("should switch between sections when clicking nav items", async () => {
     const mockInvoke = getMockInvoke();
-    mockInvoke.mockImplementation((cmd: string) => {
-      if (cmd === "shell_get_status") return Promise.resolve(runningStatus);
-      return Promise.resolve(true);
-    });
+    mockSettingsCommands(mockInvoke);
 
     render(<SettingsModal {...defaultProps} />);
 

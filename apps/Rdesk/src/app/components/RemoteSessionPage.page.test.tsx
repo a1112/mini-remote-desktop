@@ -17,6 +17,15 @@ import { RemoteSessionPage } from './RemoteSessionPage';
 import type { Device } from './deviceData';
 
 const mockNavigate = vi.hoisted(() => vi.fn());
+const mockRuntimeState = vi.hoisted(() => ({ isTauri: false }));
+const mockListRemoteDisplayWindows = vi.hoisted(() => vi.fn());
+const mockOpenRemoteDisplayWindow = vi.hoisted(() => vi.fn());
+const mockGetSessionSnapshot = vi.hoisted(() => vi.fn());
+const mockGetProbeSnapshot = vi.hoisted(() => vi.fn());
+const mockStopSession = vi.hoisted(() => vi.fn());
+const mockGetDecodePolicy = vi.hoisted(() => vi.fn());
+const mockSetDecodePolicy = vi.hoisted(() => vi.fn());
+const mockFfmpegProbe = vi.hoisted(() => vi.fn());
 
 // Mock fetch globally to prevent HTTP requests
 globalThis.fetch = vi.fn();
@@ -65,7 +74,7 @@ vi.mock('../utils/tauriWindow', () => ({
 
 // Mock runtime utils
 vi.mock('../utils/runtime', () => ({
-  isTauriRuntime: () => false,
+  isTauriRuntime: () => mockRuntimeState.isTauri,
 }));
 
 // Mock services
@@ -75,8 +84,25 @@ vi.mock('../services/realtimeService', () => ({
   setDecodePolicy: () => Promise.reject(new Error('Deprecated')),
 }));
 
+vi.mock('../services/serviceLifecycleService', () => ({
+  getDecodePolicy: mockGetDecodePolicy,
+  setDecodePolicy: mockSetDecodePolicy,
+  ffmpegProbe: mockFfmpegProbe,
+}));
+
 vi.mock('../services/realtimeSessionService', () => ({
   getWebrtcHostSnapshot: () => Promise.reject(new Error('Deprecated')),
+}));
+
+vi.mock('../adapters/tauri', () => ({
+  listRemoteDisplayWindows: mockListRemoteDisplayWindows,
+  openRemoteDisplayWindow: mockOpenRemoteDisplayWindow,
+}));
+
+vi.mock('../services/ipcSessionService', () => ({
+  getSessionSnapshot: mockGetSessionSnapshot,
+  getProbeSnapshot: mockGetProbeSnapshot,
+  stopSession: mockStopSession,
 }));
 
 // Mock device service
@@ -143,6 +169,41 @@ vi.mock('./deviceData', () => ({
 describe('RemoteSessionPage - Page Level Tests', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockRuntimeState.isTauri = false;
+    mockListRemoteDisplayWindows.mockResolvedValue({ ok: true, value: [] });
+    mockOpenRemoteDisplayWindow.mockResolvedValue({
+      ok: true,
+      value: {
+        label: 'web-test-device-1',
+        session_id: 'test-device-1',
+        surface_id: 'web-test-device-1',
+        role: 'primary',
+        renderer_attached: true,
+        render_mode: 'd3d11_native',
+      },
+    });
+    mockGetSessionSnapshot.mockResolvedValue({
+      session_id: 'test-device-1',
+      state: 'streaming',
+      transport_kind: 'quic',
+      last_error: null,
+    });
+    mockGetProbeSnapshot.mockResolvedValue({
+      current_fps: 144,
+      frames_decoded: 42,
+      last_error: null,
+    });
+    mockStopSession.mockResolvedValue(undefined);
+    mockGetDecodePolicy.mockResolvedValue({ decode_policy: 'auto' });
+    mockSetDecodePolicy.mockResolvedValue({ decode_policy: 'nvdec' });
+    mockFfmpegProbe.mockResolvedValue({
+      available: true,
+      ffmpeg_path: 'C:\\ffmpeg\\bin\\ffmpeg.exe',
+      ffprobe_path: 'C:\\ffmpeg\\bin\\ffprobe.exe',
+      ffmpeg_version: 'ffmpeg version 8.1.1',
+      ffprobe_version: 'ffprobe version 8.1.1',
+      reason: null,
+    });
   });
 
   // ========================================================================
@@ -253,6 +314,27 @@ describe('RemoteSessionPage - Page Level Tests', () => {
       // Page should still render even though rendering features are disabled
       await waitFor(() => {
         expect(screen.getByText('Test PC')).toBeInTheDocument();
+      });
+    });
+  });
+
+  describe('media decode controls', () => {
+    it('loads FFmpeg fallback status and saves decode policy in Tauri sessions', async () => {
+      mockRuntimeState.isTauri = true;
+
+      render(
+        <MemoryRouter initialEntries={['/sessions/test-device-1']}>
+          <RemoteSessionPage />
+        </MemoryRouter>
+      );
+
+      expect(await screen.findByText('Decoder Policy')).toBeInTheDocument();
+      expect(screen.getByText('ffmpeg version 8.1.1')).toBeInTheDocument();
+
+      await userEvent.selectOptions(screen.getByLabelText('会话解码策略'), 'nvdec');
+
+      await waitFor(() => {
+        expect(mockSetDecodePolicy).toHaveBeenCalledWith('nvdec');
       });
     });
   });

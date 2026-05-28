@@ -11,10 +11,17 @@ import {
   Trash2,
   X,
   Settings,
+  Download,
+  RefreshCw,
+  RotateCcw,
 } from "lucide-react";
 import { useTheme } from "./ThemeContext";
 import { IpcSessionCard } from "./IpcSessionCard";
 import {
+  ffmpegDownload,
+  ffmpegProbe,
+  ffmpegResetGoldenSettings,
+  getDecodePolicy,
   setDecodePolicy,
   serviceHealthCheck,
   serviceRestart,
@@ -24,6 +31,7 @@ import {
   servicePid,
   type DecodePolicyResponse,
   type DecoderPolicy,
+  type FfmpegProbeResult,
 } from "../services/serviceLifecycleService";
 
 /**
@@ -34,6 +42,15 @@ type ServiceStatusInfo = {
   healthy: boolean;
   pid?: number;
 };
+
+type MediaAction = "policy" | "probe" | "download" | "reset";
+
+const decoderPolicyOptions: Array<{ value: DecoderPolicy; label: string }> = [
+  { value: "auto", label: "auto" },
+  { value: "software", label: "software" },
+  { value: "d3d11va", label: "d3d11va" },
+  { value: "nvdec", label: "nvdec" },
+];
 
 function Toggle({ value, onChange }: { value: boolean; onChange: (v: boolean) => void }) {
   return (
@@ -143,7 +160,11 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
   const [serviceStatusInfo, setServiceStatusInfo] = useState<ServiceStatusInfo | null>(null);
   const [serviceLoading, setServiceLoading] = useState(false);
   const [serviceError, setServiceError] = useState<string | null>(null);
-  const [showDeprecationNotice, setShowDeprecationNotice] = useState(false);
+  const [decodePolicy, setDecodePolicyState] = useState<DecodePolicyResponse | null>(null);
+  const [ffmpegStatus, setFfmpegStatus] = useState<FfmpegProbeResult | null>(null);
+  const [mediaAction, setMediaAction] = useState<MediaAction | null>(null);
+  const [mediaMessage, setMediaMessage] = useState<string | null>(null);
+  const [mediaError, setMediaError] = useState<string | null>(null);
 
   useEffect(() => {
     if (open) {
@@ -178,19 +199,95 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
       ]);
 
       setServiceStatusInfo({ running, healthy, pid: pid ?? undefined });
-
-      // NVDEC probe and decode policy moved to mrd-service
-      // These features are now managed through the service
-      setShowDeprecationNotice(true);
     } catch (error) {
       setServiceError(error instanceof Error ? error.message : "读取服务状态失败");
     } finally {
+      await refreshMediaSettings();
       setServiceLoading(false);
     }
   };
 
-  const updateDecodePolicy = async (_nextPolicy: DecoderPolicy) => {
-    alert("Decode Policy 功能已迁移到 mrd-service。请使用服务管理界面配置。");
+  const refreshMediaSettings = async () => {
+    setMediaError(null);
+    const [policyResult, ffmpegResult] = await Promise.allSettled([
+      getDecodePolicy(),
+      ffmpegProbe(),
+    ]);
+
+    if (policyResult.status === "fulfilled") {
+      setDecodePolicyState(policyResult.value);
+    } else {
+      setMediaError(
+        policyResult.reason instanceof Error ? policyResult.reason.message : "读取解码策略失败"
+      );
+    }
+
+    if (ffmpegResult.status === "fulfilled") {
+      setFfmpegStatus(ffmpegResult.value);
+    } else {
+      setMediaError((current) =>
+        current ??
+        (ffmpegResult.reason instanceof Error ? ffmpegResult.reason.message : "读取 FFmpeg 状态失败")
+      );
+    }
+  };
+
+  const updateDecodePolicy = async (nextPolicy: DecoderPolicy) => {
+    setMediaAction("policy");
+    setMediaError(null);
+    try {
+      const next = await setDecodePolicy(nextPolicy);
+      setDecodePolicyState(next);
+      setMediaMessage("解码策略已保存");
+    } catch (error) {
+      setMediaError(error instanceof Error ? error.message : "保存解码策略失败");
+    } finally {
+      setMediaAction(null);
+    }
+  };
+
+  const refreshFfmpegStatus = async () => {
+    setMediaAction("probe");
+    setMediaError(null);
+    try {
+      const next = await ffmpegProbe();
+      setFfmpegStatus(next);
+      setMediaMessage("FFmpeg 状态已刷新");
+    } catch (error) {
+      setMediaError(error instanceof Error ? error.message : "刷新 FFmpeg 状态失败");
+    } finally {
+      setMediaAction(null);
+    }
+  };
+
+  const downloadFfmpeg = async () => {
+    setMediaAction("download");
+    setMediaError(null);
+    try {
+      const result = await ffmpegDownload();
+      setFfmpegStatus(result.probe);
+      setMediaMessage(`FFmpeg 已安装到 ${result.install_dir}`);
+    } catch (error) {
+      setMediaError(error instanceof Error ? error.message : "下载 FFmpeg 失败");
+    } finally {
+      setMediaAction(null);
+    }
+  };
+
+  const resetFfmpegSettings = async () => {
+    setMediaAction("reset");
+    setMediaError(null);
+    try {
+      const settings = await ffmpegResetGoldenSettings();
+      setDecodePolicyState({ decode_policy: settings.decode_policy });
+      setMediaMessage("FFmpeg 设置已重置");
+      const next = await ffmpegProbe();
+      setFfmpegStatus(next);
+    } catch (error) {
+      setMediaError(error instanceof Error ? error.message : "重置 FFmpeg 设置失败");
+    } finally {
+      setMediaAction(null);
+    }
   };
 
   const runRealtimeAction = async (
@@ -430,36 +527,6 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                     />
                   </div>
 
-                  {/* NVDEC and Decode Policy features moved to mrd-service */}
-                  <div
-                    className={`mt-3 rounded-xl border p-3.5 ${
-                      isDark ? "bg-[#232323] border-gray-700" : "bg-gray-50 border-gray-200"
-                    }`}
-                  >
-                    <div className={isDark ? "text-gray-300" : "text-gray-700"} style={{ fontSize: 13 }}>
-                      NVDEC 和 Decode Policy
-                    </div>
-                    <div className={`mt-2 ${isDark ? "text-gray-400" : "text-gray-500"}`} style={{ fontSize: 12 }}>
-                      这些功能已迁移到 mrd-service。解码策略现在由服务内部管理。
-                    </div>
-                    <div
-                      className={`mt-3 rounded-lg px-3 py-2 ${isDark ? "bg-amber-900/20 text-amber-300" : "bg-amber-50 text-amber-700"}`}
-                      style={{ fontSize: 11 }}
-                    >
-                      功能迁移说明：NVDEC capability 探测和 Decode Policy 配置现在通过 mrd-service IPC 接口提供。
-                      请使用上面的 IPC Session Control 来管理会话和媒体设置。
-                    </div>
-                  </div>
-
-                  {showDeprecationNotice && (
-                    <div
-                      className={`mt-3 rounded-lg px-3 py-2 ${isDark ? "bg-amber-900/20 text-amber-300" : "bg-amber-50 text-amber-700"}`}
-                      style={{ fontSize: 12 }}
-                    >
-                      部分功能已迁移到 mrd-service。请使用 IPC Session Control 进行会话管理。
-                    </div>
-                  )}
-
                   {serviceError && (
                     <div
                       className={`mt-3 rounded-lg px-3 py-2 ${isDark ? "bg-red-900/20 text-red-300" : "bg-red-50 text-red-600"}`}
@@ -492,6 +559,138 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                       重启
                     </ActionButton>
                   </div>
+                </div>
+                <div className={`p-3.5 rounded-xl border mt-3 ${isDark ? "bg-[#2a2a2a] border-gray-700" : "bg-white border-gray-200"}`}>
+                  <div className="flex items-start justify-between gap-4">
+                    <div>
+                      <div className={isDark ? "text-gray-200" : "text-gray-800"} style={{ fontSize: 13 }}>
+                        媒体解码
+                      </div>
+                      <div className={`mt-0.5 ${isDark ? "text-gray-500" : "text-gray-400"}`} style={{ fontSize: 11 }}>
+                        配置跨设备远程接收端的解码策略和 FFmpeg 备用解码器。
+                      </div>
+                    </div>
+                    <div className={`px-2 py-1 rounded-md ${ffmpegStatus?.available ? "text-green-600 bg-green-500/10" : "text-amber-600 bg-amber-500/10"}`} style={{ fontSize: 11 }}>
+                      {ffmpegStatus?.available ? "FFmpeg 可用" : "FFmpeg 未就绪"}
+                    </div>
+                  </div>
+
+                  <div className="mt-3 flex items-center justify-between gap-4">
+                    <div>
+                      <label
+                        htmlFor="decode-policy-select"
+                        className={isDark ? "text-gray-300" : "text-gray-700"}
+                        style={{ fontSize: 12 }}
+                      >
+                        解码策略
+                      </label>
+                      <div className={`mt-0.5 ${isDark ? "text-gray-500" : "text-gray-400"}`} style={{ fontSize: 11 }}>
+                        auto 会优先选择可用硬件路径，并在失败时回退到软件/FFmpeg。
+                      </div>
+                    </div>
+                    <select
+                      id="decode-policy-select"
+                      aria-label="解码策略"
+                      value={decodePolicy?.decode_policy ?? "auto"}
+                      disabled={mediaAction !== null}
+                      onChange={(event) => void updateDecodePolicy(event.target.value as DecoderPolicy)}
+                      className={`rounded-lg border px-3 py-1.5 outline-none ${
+                        isDark
+                          ? "bg-[#232323] border-gray-600 text-gray-200 focus:border-blue-500"
+                          : "bg-white border-gray-200 text-gray-700 focus:border-blue-400"
+                      } disabled:cursor-not-allowed disabled:opacity-60`}
+                      style={{ fontSize: 12 }}
+                    >
+                      {decoderPolicyOptions.map((option) => (
+                        <option key={option.value} value={option.value}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className={`mt-3 rounded-lg border p-3 ${isDark ? "bg-[#232323] border-gray-700" : "bg-gray-50 border-gray-200"}`}>
+                    <div className="flex flex-wrap items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className={isDark ? "text-gray-300" : "text-gray-700"} style={{ fontSize: 12 }}>
+                          FFmpeg 可选工具
+                        </div>
+                        <div className={`mt-1 break-words ${isDark ? "text-gray-400" : "text-gray-500"}`} style={{ fontSize: 11 }}>
+                          {ffmpegStatus?.ffmpeg_version ?? "未探测"}
+                        </div>
+                        <div className={`mt-1 break-all font-mono ${isDark ? "text-gray-500" : "text-gray-400"}`} style={{ fontSize: 10 }}>
+                          {ffmpegStatus?.ffmpeg_path ?? "未配置"}
+                        </div>
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        <button
+                          type="button"
+                          aria-label="刷新 FFmpeg 状态"
+                          title="刷新 FFmpeg 状态"
+                          disabled={mediaAction !== null}
+                          onClick={() => void refreshFfmpegStatus()}
+                          className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 transition-colors ${
+                            isDark
+                              ? "border-gray-600 text-gray-300 hover:bg-gray-800"
+                              : "border-gray-200 text-gray-700 hover:bg-gray-100"
+                          } disabled:cursor-not-allowed disabled:opacity-60`}
+                          style={{ fontSize: 11 }}
+                        >
+                          <RefreshCw className={`h-3.5 w-3.5 ${mediaAction === "probe" ? "animate-spin" : ""}`} />
+                          刷新
+                        </button>
+                        <button
+                          type="button"
+                          aria-label="下载或更新 FFmpeg"
+                          title="下载或更新 FFmpeg"
+                          disabled={mediaAction !== null}
+                          onClick={() => void downloadFfmpeg()}
+                          className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 transition-colors ${
+                            isDark
+                              ? "border-gray-600 text-gray-300 hover:bg-gray-800"
+                              : "border-gray-200 text-gray-700 hover:bg-gray-100"
+                          } disabled:cursor-not-allowed disabled:opacity-60`}
+                          style={{ fontSize: 11 }}
+                        >
+                          <Download className="h-3.5 w-3.5" />
+                          下载/更新
+                        </button>
+                        <button
+                          type="button"
+                          aria-label="重置 FFmpeg 设置"
+                          title="重置 FFmpeg 设置"
+                          disabled={mediaAction !== null}
+                          onClick={() => void resetFfmpegSettings()}
+                          className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 transition-colors ${
+                            isDark
+                              ? "border-gray-600 text-gray-300 hover:bg-gray-800"
+                              : "border-gray-200 text-gray-700 hover:bg-gray-100"
+                          } disabled:cursor-not-allowed disabled:opacity-60`}
+                          style={{ fontSize: 11 }}
+                        >
+                          <RotateCcw className="h-3.5 w-3.5" />
+                          重置
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
+                  {(mediaMessage || mediaError || ffmpegStatus?.reason) && (
+                    <div
+                      className={`mt-3 rounded-lg px-3 py-2 ${
+                        mediaError
+                          ? isDark
+                            ? "bg-red-900/20 text-red-300"
+                            : "bg-red-50 text-red-600"
+                          : isDark
+                            ? "bg-blue-900/20 text-blue-300"
+                            : "bg-blue-50 text-blue-700"
+                      }`}
+                      style={{ fontSize: 12 }}
+                    >
+                      {mediaError ?? mediaMessage ?? ffmpegStatus?.reason}
+                    </div>
+                  )}
                 </div>
                 <IpcSessionCard />
               </SettingsSection>

@@ -61,6 +61,32 @@ describe('SettingsModal - Page Level Tests', () => {
     active_session_count: 0,
     last_error: null,
   };
+  const ffmpegProbe = {
+    available: true,
+    ffmpeg_path: 'C:\\ffmpeg\\bin\\ffmpeg.exe',
+    ffprobe_path: 'C:\\ffmpeg\\bin\\ffprobe.exe',
+    ffmpeg_version: 'ffmpeg version 8.1.1',
+    ffprobe_version: 'ffprobe version 8.1.1',
+    reason: null,
+  };
+
+  const mockSettingsCommands = (mockInvoke: ReturnType<typeof getMockInvoke>) => {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'shell_get_status') return Promise.resolve(runningStatus);
+      if (cmd === 'decode_policy') return Promise.resolve({ decode_policy: 'auto' });
+      if (cmd === 'set_decode_policy') return Promise.resolve({ decode_policy: 'nvdec' });
+      if (cmd === 'ffmpeg_probe') return Promise.resolve(ffmpegProbe);
+      if (cmd === 'ffmpeg_download') {
+        return Promise.resolve({
+          install_dir: 'C:\\ffmpeg',
+          archive_sha256: 'a'.repeat(64),
+          probe: ffmpegProbe,
+        });
+      }
+      if (cmd === 'ffmpeg_reset_golden_settings') return Promise.resolve({ decode_policy: 'auto' });
+      return Promise.resolve(true);
+    });
+  };
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -80,10 +106,7 @@ describe('SettingsModal - Page Level Tests', () => {
 
     it('renders modal when open', async () => {
       const mockInvoke = getMockInvoke();
-      mockInvoke.mockImplementation((cmd: string) => {
-        if (cmd === 'shell_get_status') return Promise.resolve(runningStatus);
-        return Promise.resolve(true);
-      });
+      mockSettingsCommands(mockInvoke);
 
       renderSettingsModal(true);
 
@@ -127,10 +150,7 @@ describe('SettingsModal - Page Level Tests', () => {
   describe('service status', () => {
     it('fetches service status on mount', async () => {
       const mockInvoke = getMockInvoke();
-      mockInvoke.mockImplementation((cmd: string) => {
-        if (cmd === 'shell_get_status') return Promise.resolve(runningStatus);
-        return Promise.resolve(true);
-      });
+      mockSettingsCommands(mockInvoke);
 
       renderSettingsModal(true);
 
@@ -150,10 +170,7 @@ describe('SettingsModal - Page Level Tests', () => {
 
     it('displays running status when service is active', async () => {
       const mockInvoke = getMockInvoke();
-      mockInvoke.mockImplementation((cmd: string) => {
-        if (cmd === 'shell_get_status') return Promise.resolve(runningStatus);
-        return Promise.resolve(true);
-      });
+      mockSettingsCommands(mockInvoke);
 
       renderSettingsModal(true);
 
@@ -204,22 +221,19 @@ describe('SettingsModal - Page Level Tests', () => {
       await userEvent.click(screen.getByText('网络'));
 
       await waitFor(() => {
-        expect(screen.getByText('刷新')).toBeInTheDocument();
+        expect(screen.getByRole('button', { name: '刷新' })).toBeInTheDocument();
       });
     });
   });
 
   // ========================================================================
-  // Migration State Messaging (Deprecated Features)
+  // Media Decode Settings
   // ========================================================================
 
-  describe('migration state messaging', () => {
-    it('shows deprecation notice for NVDEC features', async () => {
+  describe('media decode settings', () => {
+    it('shows decode policy and FFmpeg status', async () => {
       const mockInvoke = getMockInvoke();
-      mockInvoke.mockImplementation((cmd: string) => {
-        if (cmd === 'shell_get_status') return Promise.resolve(runningStatus);
-        return Promise.resolve(true);
-      });
+      mockSettingsCommands(mockInvoke);
 
       renderSettingsModal(true);
 
@@ -229,14 +243,14 @@ describe('SettingsModal - Page Level Tests', () => {
 
       await userEvent.click(screen.getByText('网络'));
 
-      await waitFor(() => {
-        expect(screen.getByText('NVDEC 和 Decode Policy')).toBeInTheDocument();
-      });
+      expect(await screen.findByText('媒体解码')).toBeInTheDocument();
+      expect(screen.getByText('FFmpeg 可选工具')).toBeInTheDocument();
+      expect(screen.getByText('ffmpeg version 8.1.1')).toBeInTheDocument();
     });
 
-    it('explains that decode policy is managed by mrd-service', async () => {
+    it('saves decode policy from the network settings panel', async () => {
       const mockInvoke = getMockInvoke();
-      mockInvoke.mockResolvedValue(true);
+      mockSettingsCommands(mockInvoke);
 
       renderSettingsModal(true);
 
@@ -245,11 +259,12 @@ describe('SettingsModal - Page Level Tests', () => {
       });
 
       await userEvent.click(screen.getByText('网络'));
+      await userEvent.selectOptions(await screen.findByLabelText('解码策略'), 'nvdec');
 
       await waitFor(() => {
-        const element = screen.getByText(/这些功能已迁移/);
-        expect(element).toBeInTheDocument();
-        expect(element.textContent).toContain('mrd-service');
+        expect(mockInvoke).toHaveBeenCalledWith('set_decode_policy', {
+          decodePolicy: 'nvdec',
+        });
       });
     });
 
@@ -347,10 +362,7 @@ describe('SettingsModal - Page Level Tests', () => {
   describe('user interactions', () => {
     it('closes modal when X button is clicked', async () => {
       const mockInvoke = getMockInvoke();
-      mockInvoke.mockImplementation((cmd: string) => {
-        if (cmd === 'shell_get_status') return Promise.resolve(runningStatus);
-        return Promise.resolve(true);
-      });
+      mockSettingsCommands(mockInvoke);
 
       const { onClose } = renderSettingsModal(true);
 
@@ -372,10 +384,7 @@ describe('SettingsModal - Page Level Tests', () => {
 
     it('closes modal when Escape key is pressed', async () => {
       const mockInvoke = getMockInvoke();
-      mockInvoke.mockImplementation((cmd: string) => {
-        if (cmd === 'shell_get_status') return Promise.resolve(runningStatus);
-        return Promise.resolve(true);
-      });
+      mockSettingsCommands(mockInvoke);
 
       const { onClose } = renderSettingsModal(true);
 
@@ -390,10 +399,7 @@ describe('SettingsModal - Page Level Tests', () => {
 
     it('switches between sections', async () => {
       const mockInvoke = getMockInvoke();
-      mockInvoke.mockImplementation((cmd: string) => {
-        if (cmd === 'shell_get_status') return Promise.resolve(runningStatus);
-        return Promise.resolve(true);
-      });
+      mockSettingsCommands(mockInvoke);
 
       renderSettingsModal(true);
 
@@ -418,10 +424,7 @@ describe('SettingsModal - Page Level Tests', () => {
 
     it('toggles switches in general section', async () => {
       const mockInvoke = getMockInvoke();
-      mockInvoke.mockImplementation((cmd: string) => {
-        if (cmd === 'shell_get_status') return Promise.resolve(runningStatus);
-        return Promise.resolve(true);
-      });
+      mockSettingsCommands(mockInvoke);
 
       renderSettingsModal(true);
 
@@ -498,13 +501,13 @@ describe('SettingsModal - Page Level Tests', () => {
   });
 
   // ========================================================================
-  // Degraded/Disabled States
+  // Media Tooling Actions
   // ========================================================================
 
-  describe('degraded/disabled migration state', () => {
-    it('shows deprecation notice for migrated features', async () => {
+  describe('media tooling actions', () => {
+    it('runs FFmpeg download from settings', async () => {
       const mockInvoke = getMockInvoke();
-      mockInvoke.mockResolvedValue(true);
+      mockSettingsCommands(mockInvoke);
 
       renderSettingsModal(true);
 
@@ -513,10 +516,10 @@ describe('SettingsModal - Page Level Tests', () => {
       });
 
       await userEvent.click(screen.getByText('网络'));
+      await userEvent.click(await screen.findByRole('button', { name: '下载或更新 FFmpeg' }));
 
       await waitFor(() => {
-        expect(screen.getByText('NVDEC 和 Decode Policy')).toBeInTheDocument();
-        expect(screen.getByText(/解码策略现在由服务内部管理/)).toBeInTheDocument();
+        expect(mockInvoke).toHaveBeenCalledWith('ffmpeg_download', undefined);
       });
     });
   });

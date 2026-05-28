@@ -13,14 +13,23 @@
 import * as tauriAdapter from '../adapters/tauri';
 import type {
   AdapterResult,
+  AppSettings,
   DecodePolicy,
   DecodePolicyResponse,
+  FfmpegInstallResult,
+  FfmpegProbeResult,
   ShutdownMode,
   ShellStatusSnapshot,
 } from '../adapters/tauri';
 
 // Re-export types from adapter
-export type { DecodePolicy, DecodePolicyResponse } from '../adapters/tauri';
+export type {
+  AppSettings,
+  DecodePolicy,
+  DecodePolicyResponse,
+  FfmpegInstallResult,
+  FfmpegProbeResult,
+} from '../adapters/tauri';
 
 /** @deprecated Use DecodePolicy instead */
 export type DecoderPolicy = DecodePolicy;
@@ -192,12 +201,34 @@ export const serviceStatus = getServiceStatus;
 export const servicePid = getServicePid;
 
 /**
+ * Read decode policy
+ */
+export const getDecodePolicy = async (): Promise<DecodePolicyResponse> => {
+  const result = await tauriAdapter.decodePolicy();
+  return unwrapAdapterResult(result);
+};
+
+/**
  * Set decode policy
- * @deprecated Decode policy is now managed by mrd-service
  */
 export const setDecodePolicy = async (
   decodePolicy: DecodePolicy
 ): Promise<DecodePolicyResponse> => {
   const result = await tauriAdapter.setDecodePolicy(decodePolicy);
+  return unwrapAdapterResult(result);
+};
+
+export const ffmpegProbe = async (): Promise<FfmpegProbeResult> => {
+  const result = await tauriAdapter.ffmpegProbe();
+  return unwrapAdapterResult(result);
+};
+
+export const ffmpegDownload = async (): Promise<FfmpegInstallResult> => {
+  const result = await tauriAdapter.ffmpegDownload();
+  return unwrapAdapterResult(result);
+};
+
+export const ffmpegResetGoldenSettings = async (): Promise<AppSettings> => {
+  const result = await tauriAdapter.ffmpegResetGoldenSettings();
   return unwrapAdapterResult(result);
 };

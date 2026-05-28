@@ -21,13 +21,13 @@ import {
 } from "lucide-react";
 import { useTheme } from "./ThemeContext";
 import {
+  ffmpegProbe,
   getDecodePolicy,
-  getNvdecRuntimeProbe,
   setDecodePolicy,
   type DecodePolicyResponse,
   type DecoderPolicy,
-  type NvdecRuntimeProbe,
-} from "../services/realtimeService";
+  type FfmpegProbeResult,
+} from "../services/serviceLifecycleService";
 import {
   getWebrtcHostSnapshot,
   type WebrtcHostSnapshot,
@@ -152,8 +152,10 @@ export function RemoteSessionPage() {
   const [isMaximized, setIsMaximized] = useState(false);
   // Rendering features disabled - now managed by mrd-service
   const [renderFeaturesDisabled, setRenderFeaturesDisabled] = useState(true);
-  const [nvdecProbe, setNvdecProbe] = useState<NvdecRuntimeProbe | null>(null);
   const [decodePolicy, setDecodePolicyState] = useState<DecodePolicyResponse | null>(null);
+  const [decodePolicyBusy, setDecodePolicyBusy] = useState(false);
+  const [decodePolicyMessage, setDecodePolicyMessage] = useState<string | null>(null);
+  const [ffmpegStatus, setFfmpegStatus] = useState<FfmpegProbeResult | null>(null);
   const [webrtcHostSnapshot, setWebrtcHostSnapshot] = useState<WebrtcHostSnapshot | null>(null);
   const [webRtcState, setWebRtcState] = useState<"idle" | "connecting" | "connected" | "failed">("idle");
   const [webRtcMessage, setWebRtcMessage] = useState("WebRTC waiting");
@@ -353,13 +355,53 @@ export function RemoteSessionPage() {
   //   ... context refresh code ...
   // }, []);
 
-  // NVDEC probe and decode policy refresh disabled - deprecated functions
-  // useEffect(() => {
-  //   ... nvdec probe refresh code ...
-  // }, []);
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
 
-  const handleUpdateDecodePolicy = async (_nextPolicy: DecoderPolicy) => {
-    alert("Decode Policy 功能已迁移到 mrd-service。此功能暂时不可用。");
+    let cancelled = false;
+    const refreshDecodeSettings = async () => {
+      const [policyResult, ffmpegResult] = await Promise.allSettled([
+        getDecodePolicy(),
+        ffmpegProbe(),
+      ]);
+      if (cancelled) return;
+
+      if (policyResult.status === "fulfilled") {
+        setDecodePolicyState(policyResult.value);
+      } else {
+        setDecodePolicyMessage(
+          policyResult.reason instanceof Error ? policyResult.reason.message : "读取解码策略失败",
+        );
+      }
+
+      if (ffmpegResult.status === "fulfilled") {
+        setFfmpegStatus(ffmpegResult.value);
+      } else {
+        setDecodePolicyMessage((message) =>
+          message ??
+          (ffmpegResult.reason instanceof Error ? ffmpegResult.reason.message : "读取 FFmpeg 状态失败"),
+        );
+      }
+    };
+
+    void refreshDecodeSettings();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const handleUpdateDecodePolicy = async (nextPolicy: DecoderPolicy) => {
+    setDecodePolicyBusy(true);
+    setDecodePolicyMessage(null);
+    try {
+      const next = await setDecodePolicy(nextPolicy);
+      setDecodePolicyState(next);
+      setDecodePolicyMessage("解码策略已保存");
+    } catch (error) {
+      setDecodePolicyMessage(error instanceof Error ? error.message : "保存解码策略失败");
+    } finally {
+      setDecodePolicyBusy(false);
+    }
   };
 
   // Render windows refresh disabled - functions no longer available
@@ -872,17 +914,23 @@ export function RemoteSessionPage() {
               <div className="rounded-md bg-white/6 px-2 py-2">
                 <div className="mb-2 flex items-center justify-between gap-2">
                   <span className="text-gray-400" style={{ fontSize: 10 }}>
-                    NVDEC Capability
+                    Decoder Policy
                   </span>
-                  <span className="text-gray-500" style={{ fontSize: 10 }}>
-                    {nvdecProbe?.backend ?? "windows-nvdec"}
+                  <span
+                    className={ffmpegStatus?.available ? "text-green-300" : "text-amber-300"}
+                    style={{ fontSize: 10 }}
+                  >
+                    {ffmpegStatus?.available ? "FFmpeg ready" : "FFmpeg optional"}
                   </span>
                 </div>
                 <div
                   className="rounded-md bg-black/20 px-2 py-1.5 text-gray-300"
                   style={{ fontSize: 10 }}
                 >
-                  {nvdecProbe?.summary ?? "未读取 NVDEC 状态"}
+                  <div>{ffmpegStatus?.ffmpeg_version ?? "未探测 FFmpeg"}</div>
+                  <div className="mt-1 break-all font-mono text-gray-500">
+                    {ffmpegStatus?.ffmpeg_path ?? "未配置 FFmpeg 路径"}
+                  </div>
                 </div>
                 <div className="mt-2 flex items-center justify-between gap-2 rounded-md bg-white/6 px-2 py-1.5">
                   <div>
@@ -894,18 +942,29 @@ export function RemoteSessionPage() {
                     </div>
                   </div>
                   <select
+                    aria-label="会话解码策略"
                     value={decodePolicy?.decode_policy ?? "auto"}
+                    disabled={decodePolicyBusy}
                     onChange={(event) =>
                       void handleUpdateDecodePolicy(event.target.value as DecoderPolicy)
                     }
-                    className="rounded-md border border-white/10 bg-black/20 px-2 py-1 text-gray-200 outline-none"
+                    className="rounded-md border border-white/10 bg-black/20 px-2 py-1 text-gray-200 outline-none disabled:cursor-not-allowed disabled:opacity-60"
                     style={{ fontSize: 10 }}
                   >
                     <option value="auto">auto</option>
                     <option value="software">software</option>
+                    <option value="d3d11va">d3d11va</option>
                     <option value="nvdec">nvdec</option>
                   </select>
                 </div>
+                {decodePolicyMessage ? (
+                  <div
+                    className="mt-2 rounded-md bg-white/6 px-2 py-1.5 text-gray-400"
+                    style={{ fontSize: 10 }}
+                  >
+                    {decodePolicyMessage}
+                  </div>
+                ) : null}
                 <div className="mt-2 grid grid-cols-2 gap-2">
                   <div
                     className="rounded-md bg-white/6 px-2 py-1.5 text-gray-300"
@@ -960,39 +1019,21 @@ export function RemoteSessionPage() {
                 </div>
                 <div className="mt-2 space-y-1">
                   {[
-                    { label: "H264", codec: "h264", bitDepthMinus8: 0 },
-                    { label: "HEVC", codec: "hevc", bitDepthMinus8: 0 },
-                    { label: "Main10", codec: "hevc", bitDepthMinus8: 2 },
-                  ].map((item) => {
-                    const capability = nvdecProbe?.capability_probes.find(
-                      (probe) =>
-                        probe.codec === item.codec &&
-                        probe.bit_depth_minus8 === item.bitDepthMinus8,
-                    );
-                    return (
-                      <div
-                        key={`${item.codec}-${item.bitDepthMinus8}`}
-                        className="rounded-md bg-white/6 px-2 py-1.5 text-gray-300"
-                        style={{ fontSize: 10 }}
-                      >
-                        <div className="flex items-center justify-between gap-2">
-                          <span>{item.label}</span>
-                          <span
-                            className={
-                              capability?.runtime_supported
-                                ? "text-green-300"
-                                : "text-amber-300"
-                            }
-                          >
-                            {capability?.runtime_supported ? "runtime" : "no-runtime"}
-                          </span>
-                        </div>
-                        <div className="mt-1 text-gray-500">
-                          {capability?.wired_supported ? "已接线" : capability?.wired_reason ?? "未读取"}
-                        </div>
+                    { label: "H264", chain: "NVDEC / FFmpeg / software" },
+                    { label: "HEVC", chain: "NVDEC / FFmpeg" },
+                    { label: "AV1", chain: "software" },
+                  ].map((item) => (
+                    <div
+                      key={item.label}
+                      className="rounded-md bg-white/6 px-2 py-1.5 text-gray-300"
+                      style={{ fontSize: 10 }}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span>{item.label}</span>
+                        <span className="text-gray-500">{item.chain}</span>
                       </div>
-                    );
-                  })}
+                    </div>
+                  ))}
                 </div>
               </div>
               {renderWindows.length > 0 ? (
