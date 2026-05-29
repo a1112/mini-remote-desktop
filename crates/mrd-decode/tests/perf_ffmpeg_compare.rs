@@ -22,20 +22,37 @@ fn perf_ffmpeg_decode_compare_reports_results() {
     fs::create_dir_all(&artifact_dir).expect("create artifact dir");
 
     let access_units = generate_h264_access_units(width, height, fps, samples);
-    let input_path = artifact_dir.join(format!("openh264-{width}x{height}-{samples}.h264"));
+    let encoded_frame_count = access_units.len();
+    assert!(encoded_frame_count > 0, "OpenH264 produced no access units");
+    let input_path = artifact_dir.join(format!(
+        "openh264-{width}x{height}-requested{samples}-encoded{encoded_frame_count}.h264"
+    ));
     write_h264_stream(&input_path, &access_units);
 
     let software = run_mrd_decoder("h264_software", &access_units);
     let nvdec = run_mrd_decoder("nvdec", &access_units);
-    let ffmpeg_rgb24 =
-        run_ffmpeg_decoder("ffmpeg_cli_rgb24", &ffmpeg, &input_path, samples, "rgb24");
-    let ffmpeg_nv12 = run_ffmpeg_decoder("ffmpeg_cli_nv12", &ffmpeg, &input_path, samples, "nv12");
+    let ffmpeg_rgb24 = run_ffmpeg_decoder(
+        "ffmpeg_cli_rgb24",
+        &ffmpeg,
+        &input_path,
+        encoded_frame_count,
+        "rgb24",
+    );
+    let ffmpeg_nv12 = run_ffmpeg_decoder(
+        "ffmpeg_cli_nv12",
+        &ffmpeg,
+        &input_path,
+        encoded_frame_count,
+        "nv12",
+    );
 
     let report = json!({
         "width": width,
         "height": height,
         "fps": fps,
-        "sample_count": samples,
+        "requested_sample_count": samples,
+        "sample_count": encoded_frame_count,
+        "encoded_frame_count": encoded_frame_count,
         "input_path": input_path,
         "backends": [software, nvdec, ffmpeg_rgb24, ffmpeg_nv12],
     });
@@ -130,7 +147,7 @@ fn run_ffmpeg_decoder(
     backend: &str,
     ffmpeg: &Path,
     input_path: &Path,
-    samples: usize,
+    expected_frames: usize,
     pixel_format: &str,
 ) -> serde_json::Value {
     if !ffmpeg.is_file() {
@@ -161,11 +178,11 @@ fn run_ffmpeg_decoder(
     json!({
         "backend": backend,
         "available": output.status.success(),
-        "decoded_frames": if output.status.success() { samples } else { 0 },
+        "decoded_frames": if output.status.success() { expected_frames } else { 0 },
         "errors": if output.status.success() { 0 } else { 1 },
         "elapsed_s": elapsed_s,
         "pixel_format": pixel_format,
-        "throughput_fps": if output.status.success() { samples as f64 / elapsed_s.max(f64::EPSILON) } else { 0.0 },
+        "throughput_fps": if output.status.success() { expected_frames as f64 / elapsed_s.max(f64::EPSILON) } else { 0.0 },
         "error": if output.status.success() { serde_json::Value::Null } else { json!(stderr) },
         "path": ffmpeg,
     })
@@ -192,13 +209,26 @@ fn ffmpeg_path() -> PathBuf {
 }
 
 fn artifact_dir() -> PathBuf {
-    std::env::var("MRD_FFMPEG_PERF_ARTIFACT_DIR")
+    let dir = std::env::var("MRD_FFMPEG_PERF_ARTIFACT_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             PathBuf::from("artifacts")
                 .join("ffmpeg-perf")
                 .join(timestamp())
-        })
+        });
+    if dir.is_absolute() {
+        dir
+    } else {
+        workspace_root().join(dir)
+    }
+}
+
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("mrd-decode crate should live under workspace crates directory")
+        .to_path_buf()
 }
 
 fn timestamp() -> String {
