@@ -1252,7 +1252,7 @@ fn default_constraints() -> Vec<CapabilityConstraint> {
                 "encode.openh264".to_string(),
                 "memory.d3d11_shared".to_string(),
             ],
-            status: CapabilityConstraintStatus::Block,
+            status: CapabilityConstraintStatus::RequiresCopy,
             reason: "OpenH264 requires CPU-backed input unless an explicit copy step is inserted."
                 .to_string(),
             fallback_ids: vec!["memory.cpu".to_string()],
@@ -1308,6 +1308,8 @@ fn default_profiles() -> Vec<CapabilityProfile> {
                 "encode.nvenc_hevc",
                 "decode.nvdec_hevc",
                 "media.hevc_main_420_8bit",
+                "render.d3d11",
+                "memory.d3d11_shared",
                 "transport.quic_datagram",
                 "transport.media_profile_control_v1",
             ],
@@ -1322,6 +1324,8 @@ fn default_profiles() -> Vec<CapabilityProfile> {
             vec![
                 "encode.nvenc_h264",
                 "decode.nvdec",
+                "render.d3d11",
+                "memory.d3d11_shared",
                 "transport.quic_datagram",
                 "transport.media_profile_control_v1",
             ],
@@ -1337,6 +1341,8 @@ fn default_profiles() -> Vec<CapabilityProfile> {
                 "encode.nvenc_hevc",
                 "decode.nvdec_hevc",
                 "media.hevc_main_420_8bit",
+                "render.d3d11",
+                "memory.d3d11_shared",
                 "transport.quic_datagram",
                 "transport.media_profile_control_v1",
             ],
@@ -1352,6 +1358,8 @@ fn default_profiles() -> Vec<CapabilityProfile> {
                 "encode.nvenc_hevc",
                 "decode.nvdec_hevc",
                 "media.hevc_main_420_8bit",
+                "render.d3d11",
+                "memory.d3d11_shared",
                 "transport.quic_datagram",
                 "transport.media_profile_control_v1",
             ],
@@ -1367,6 +1375,8 @@ fn default_profiles() -> Vec<CapabilityProfile> {
                 "encode.nvenc_hevc",
                 "decode.nvdec_hevc",
                 "media.hevc_main_420_8bit",
+                "render.d3d11",
+                "memory.d3d11_shared",
                 "transport.quic_datagram",
                 "transport.media_profile_control_v1",
             ],
@@ -1552,6 +1562,15 @@ mod tests {
             .constraints
             .iter()
             .any(|constraint| constraint.id == "openh264_requires_cpu_input"));
+        let openh264_constraint = snapshot
+            .constraints
+            .iter()
+            .find(|constraint| constraint.id == "openh264_requires_cpu_input")
+            .expect("OpenH264 CPU input constraint");
+        assert_eq!(
+            openh264_constraint.status,
+            CapabilityConstraintStatus::RequiresCopy
+        );
         assert!(snapshot
             .constraints
             .iter()
@@ -1589,6 +1608,12 @@ mod tests {
         assert!(lan_2k144
             .required_capabilities
             .contains(&"decode.nvdec_hevc".to_string()));
+        assert!(lan_2k144
+            .required_capabilities
+            .contains(&"render.d3d11".to_string()));
+        assert!(lan_2k144
+            .required_capabilities
+            .contains(&"memory.d3d11_shared".to_string()));
     }
 
     #[test]

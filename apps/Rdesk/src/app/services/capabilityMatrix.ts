@@ -262,6 +262,37 @@ const DOMAIN_BASELINE_ITEMS: Array<Omit<CapabilityItem, "platform">> = [
   },
 ];
 
+const BUILTIN_CAPABILITY_CONSTRAINTS: CapabilityConstraint[] = [
+  {
+    id: "openh264_requires_cpu_input",
+    applies_to: ["encode.openh264", "memory.d3d11_shared"],
+    status: "requires_copy",
+    reason: "OpenH264 requires CPU-backed input unless an explicit copy step is inserted.",
+    fallback_ids: ["memory.cpu"],
+  },
+  {
+    id: "d3d12_probe_only",
+    applies_to: ["render.d3d12_native"],
+    status: "block",
+    reason: "D3D12 native renderer is probe-only and not wired as mainline remote display.",
+    fallback_ids: ["render.d3d11", "render.webview"],
+  },
+  {
+    id: "opengl_d3d11_shared_interop_hybrid",
+    applies_to: ["render.opengl", "memory.d3d11_shared"],
+    status: "degrade",
+    reason:
+      "OpenGL accepts D3D11 shared NV12 through WGL/DX interop when available and readback fallback otherwise; D3D11 native remains preferred for parity.",
+    fallback_ids: ["render.d3d11"],
+  },
+  {
+    id: "webview_degraded_render",
+    applies_to: ["render.webview"],
+    status: "degrade",
+    reason: "WebView render is a visual fallback, not native renderer parity.",
+  },
+];
+
 export const BUILTIN_CAPABILITY_PROFILES: CapabilityProfile[] = [
   {
     id: "smoke.720p30",
@@ -270,8 +301,9 @@ export const BUILTIN_CAPABILITY_PROFILES: CapabilityProfile[] = [
     fps: 30,
     bitrate_mbps: 8,
     codec: "h264",
-    min_stable_fps_ratio: 0.4,
-    required_capabilities: ["encode.openh264", "decode.software", "transport.quic_datagram"],
+    min_stable_fps_ratio: 0.8,
+    max_drop_ratio: 0.02,
+    required_capabilities: ["transport.loopback", "encode.openh264", "decode.software"],
   },
   {
     id: "interactive.1080p60",
@@ -279,10 +311,36 @@ export const BUILTIN_CAPABILITY_PROFILES: CapabilityProfile[] = [
     height: 1080,
     fps: 60,
     bitrate_mbps: 20,
+    codec: "hevc",
+    min_stable_fps_ratio: 0.8,
+    max_drop_ratio: 0.02,
+    required_capabilities: [
+      "encode.nvenc_hevc",
+      "decode.nvdec_hevc",
+      "media.hevc_main_420_8bit",
+      "render.d3d11",
+      "memory.d3d11_shared",
+      "transport.quic_datagram",
+      "transport.media_profile_control_v1",
+    ],
+  },
+  {
+    id: "compat.h264.1080p60",
+    width: 1920,
+    height: 1080,
+    fps: 60,
+    bitrate_mbps: 20,
     codec: "h264",
-    latency_budget_ms: 50,
-    min_stable_fps_ratio: 0.6,
-    required_capabilities: ["encode.nvenc_h264", "decode.nvdec", "render.d3d11"],
+    min_stable_fps_ratio: 0.8,
+    max_drop_ratio: 0.02,
+    required_capabilities: [
+      "encode.nvenc_h264",
+      "decode.nvdec",
+      "render.d3d11",
+      "memory.d3d11_shared",
+      "transport.quic_datagram",
+      "transport.media_profile_control_v1",
+    ],
   },
   {
     id: "lan.2k144",
@@ -291,9 +349,8 @@ export const BUILTIN_CAPABILITY_PROFILES: CapabilityProfile[] = [
     fps: 144,
     bitrate_mbps: 64,
     codec: "hevc",
-    latency_budget_ms: 35,
-    min_stable_fps_ratio: 0.4,
-    max_drop_ratio: 0.05,
+    min_stable_fps_ratio: 0.8,
+    max_drop_ratio: 0.02,
     required_capabilities: [
       "encode.nvenc_hevc",
       "decode.nvdec_hevc",
@@ -311,9 +368,8 @@ export const BUILTIN_CAPABILITY_PROFILES: CapabilityProfile[] = [
     fps: 165,
     bitrate_mbps: 80,
     codec: "hevc",
-    latency_budget_ms: 35,
-    min_stable_fps_ratio: 0.4,
-    max_drop_ratio: 0.05,
+    min_stable_fps_ratio: 0.8,
+    max_drop_ratio: 0.02,
     required_capabilities: [
       "encode.nvenc_hevc",
       "decode.nvdec_hevc",
@@ -331,12 +387,16 @@ export const BUILTIN_CAPABILITY_PROFILES: CapabilityProfile[] = [
     fps: 60,
     bitrate_mbps: 80,
     codec: "hevc",
-    latency_budget_ms: 50,
+    min_stable_fps_ratio: 0.8,
+    max_drop_ratio: 0.02,
     required_capabilities: [
       "encode.nvenc_hevc",
       "decode.nvdec_hevc",
       "media.hevc_main_420_8bit",
       "render.d3d11",
+      "memory.d3d11_shared",
+      "transport.quic_datagram",
+      "transport.media_profile_control_v1",
     ],
   },
   {
@@ -346,7 +406,14 @@ export const BUILTIN_CAPABILITY_PROFILES: CapabilityProfile[] = [
     fps: 30,
     bitrate_mbps: 6,
     codec: "h264",
-    required_capabilities: ["encode.openh264", "decode.software", "render.webview"],
+    min_stable_fps_ratio: 0.8,
+    max_drop_ratio: 0.02,
+    required_capabilities: [
+      "capture.synthetic",
+      "encode.openh264",
+      "decode.software",
+      "render.webview",
+    ],
   },
 ];
 
@@ -361,7 +428,7 @@ export function buildCapabilitySnapshotFromEnvironment(
       ...buildLegacyCapabilities(environment, platform),
       ...DOMAIN_BASELINE_ITEMS.map((item) => ({ ...item, platform })),
     ],
-    constraints: [],
+    constraints: cloneCapabilityConstraints(BUILTIN_CAPABILITY_CONSTRAINTS),
     profiles: BUILTIN_CAPABILITY_PROFILES,
     recent_profile_results: [],
   };
@@ -423,8 +490,9 @@ export function evaluateCapabilityCombination(
   const reasons: string[] = [];
   const requiredFallbacks: string[] = [];
   let status: CapabilityEvaluation["status"] = "ready";
+  const requestedIds = requestedCapabilityIds(request);
 
-  for (const capabilityId of requestedCapabilityIds(request)) {
+  for (const capabilityId of requestedIds) {
     const capability = snapshot.capabilities.find((item) => item.id === capabilityId);
     if (!capability) {
       status = "blocked";
@@ -446,23 +514,44 @@ export function evaluateCapabilityCombination(
     }
   }
 
+  status = applyCapabilityConstraints(
+    snapshot.constraints,
+    requestedIds,
+    status,
+    reasons,
+    requiredFallbacks,
+    request.allowCpuCopy === true
+  );
+
   if (
     request.encoder === "openh264" &&
     request.memory === "d3d11_shared" &&
-    request.allowCpuCopy !== true
+    request.allowCpuCopy !== true &&
+    !hasApplyingConstraint(snapshot.constraints, requestedIds, "openh264_requires_cpu_input")
   ) {
     status = "blocked";
     reasons.push("OpenH264 requires CPU-backed input; insert a CPU copy step before using it.");
-    requiredFallbacks.push("memory.cpu");
+    appendFallbacks(requiredFallbacks, ["memory.cpu"]);
   }
 
-  if (request.renderer === "d3d12_native") {
+  if (
+    request.renderer === "d3d12_native" &&
+    !hasApplyingConstraint(snapshot.constraints, requestedIds, "d3d12_probe_only")
+  ) {
     status = "blocked";
     reasons.push("D3D12 native renderer is probe-only and is not wired into mainline remote display.");
-    requiredFallbacks.push("render.d3d11");
+    appendFallbacks(requiredFallbacks, ["render.d3d11"]);
   }
 
-  if (request.renderer === "opengl" && request.memory === "d3d11_shared") {
+  if (
+    request.renderer === "opengl" &&
+    request.memory === "d3d11_shared" &&
+    !hasApplyingConstraint(
+      snapshot.constraints,
+      requestedIds,
+      "opengl_d3d11_shared_interop_hybrid"
+    )
+  ) {
     if (status !== "blocked") {
       status = "degraded";
     }
@@ -471,12 +560,16 @@ export function evaluateCapabilityCombination(
     );
   }
 
-  if (request.renderer === "webview" && hasCapability(snapshot, "render.webview")) {
+  if (
+    request.renderer === "webview" &&
+    hasCapability(snapshot, "render.webview") &&
+    !hasApplyingConstraint(snapshot.constraints, requestedIds, "webview_degraded_render")
+  ) {
     if (status !== "blocked") {
       status = "degraded";
     }
     reasons.push("WebView render is a visual fallback, not native renderer parity.");
-    requiredFallbacks.push("render.d3d11");
+    appendFallbacks(requiredFallbacks, ["render.d3d11"]);
   }
 
   return { status, reasons, requiredFallbacks };
@@ -624,6 +717,7 @@ export function evaluateProfileSupport(
   }
 
   const reasons: string[] = [];
+  const requiredFallbacks: string[] = [];
   let status: CapabilityEvaluation["status"] = "ready";
 
   for (const capabilityId of profile.required_capabilities) {
@@ -648,10 +742,19 @@ export function evaluateProfileSupport(
     }
   }
 
+  status = applyCapabilityConstraints(
+    snapshot.constraints,
+    profile.required_capabilities,
+    status,
+    reasons,
+    requiredFallbacks,
+    false
+  );
+
   return {
     status,
     reasons,
-    requiredFallbacks: [],
+    requiredFallbacks,
   };
 }
 
@@ -741,6 +844,92 @@ function requestedCapabilityIds(request: CapabilityCombinationRequest): string[]
   if (request.transport) ids.push(`transport.${request.transport}`);
 
   return ids;
+}
+
+function applyCapabilityConstraints(
+  constraints: CapabilityConstraint[],
+  requestedIds: string[],
+  status: CapabilityEvaluation["status"],
+  reasons: string[],
+  requiredFallbacks: string[],
+  allowCopy: boolean
+): CapabilityEvaluation["status"] {
+  let currentStatus = status;
+  for (const constraint of constraints) {
+    if (!constraintAppliesToIds(constraint, requestedIds)) continue;
+    appendFallbacks(requiredFallbacks, constraint.fallback_ids);
+
+    if (constraint.status === "allow") continue;
+
+    if (constraint.status === "degrade") {
+      if (currentStatus !== "blocked" && currentStatus !== "skipped") {
+        currentStatus = "degraded";
+      }
+      reasons.push(constraint.reason);
+      continue;
+    }
+
+    if (constraint.status === "requires_probe") {
+      if (currentStatus !== "blocked") {
+        currentStatus = "skipped";
+      }
+      reasons.push(constraint.reason);
+      continue;
+    }
+
+    if (constraint.status === "requires_copy") {
+      if (allowCopy) {
+        if (currentStatus !== "blocked" && currentStatus !== "skipped") {
+          currentStatus = "degraded";
+        }
+      } else {
+        currentStatus = "blocked";
+      }
+      reasons.push(constraint.reason);
+      continue;
+    }
+
+    currentStatus = "blocked";
+    reasons.push(constraint.reason);
+  }
+  return currentStatus;
+}
+
+function constraintAppliesToIds(constraint: CapabilityConstraint, requestedIds: string[]): boolean {
+  return constraint.applies_to.every((target) =>
+    requestedIds.some((id) => capabilityIdMatchesTarget(id, target))
+  );
+}
+
+function hasApplyingConstraint(
+  constraints: CapabilityConstraint[],
+  requestedIds: string[],
+  constraintId: string
+): boolean {
+  return constraints.some(
+    (constraint) =>
+      constraint.id === constraintId && constraintAppliesToIds(constraint, requestedIds)
+  );
+}
+
+function capabilityIdMatchesTarget(id: string, target: string): boolean {
+  return id === target || id.startsWith(target.endsWith(".") ? target : `${target}.`);
+}
+
+function appendFallbacks(requiredFallbacks: string[], fallbackIds: string[] | undefined): void {
+  for (const fallbackId of fallbackIds ?? []) {
+    if (!requiredFallbacks.includes(fallbackId)) {
+      requiredFallbacks.push(fallbackId);
+    }
+  }
+}
+
+function cloneCapabilityConstraints(constraints: CapabilityConstraint[]): CapabilityConstraint[] {
+  return constraints.map((constraint) => ({
+    ...constraint,
+    applies_to: [...constraint.applies_to],
+    ...(constraint.fallback_ids ? { fallback_ids: [...constraint.fallback_ids] } : {}),
+  }));
 }
 
 function buildLegacyCapabilities(

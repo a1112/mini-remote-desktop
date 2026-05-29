@@ -132,6 +132,17 @@ describe("buildCapabilitySnapshotFromEnvironment", () => {
     expect(statusOf(snapshot, "encode.nvenc_av1")).toBe("unimplemented");
   });
 
+  it("seeds legacy fallback snapshots with the same built-in constraints as the service", () => {
+    const snapshot = buildCapabilitySnapshotFromEnvironment(windowsEnvironment);
+
+    expect(snapshot.constraints.map((constraint) => constraint.id)).toEqual([
+      "openh264_requires_cpu_input",
+      "d3d12_probe_only",
+      "opengl_d3d11_shared_interop_hybrid",
+      "webview_degraded_render",
+    ]);
+  });
+
   it("preserves unknown legacy values instead of dropping them", () => {
     const snapshot = buildCapabilitySnapshotFromEnvironment({
       ...windowsEnvironment,
@@ -387,6 +398,36 @@ describe("evaluateCapabilityCombination", () => {
     expect(result.reasons.join(" ")).toContain("CPU-backed input");
   });
 
+  it("applies service-owned block constraints to requested combinations", () => {
+    const snapshot: CapabilitySnapshot = {
+      ...withAvailableCapabilities(buildCapabilitySnapshotFromEnvironment(windowsEnvironment), [
+        "render.d3d11",
+        "memory.d3d11_shared",
+      ]),
+      constraints: [
+        {
+          id: "shared_memory_renderer_policy",
+          applies_to: ["render.d3d11", "memory.d3d11_shared"],
+          status: "block",
+          reason: "Shared texture render path is temporarily disabled by policy",
+          fallback_ids: ["memory.cpu"],
+        },
+      ],
+    };
+
+    const result = evaluateCapabilityCombination(
+      {
+        renderer: "d3d11",
+        memory: "d3d11_shared",
+      },
+      snapshot
+    );
+
+    expect(result.status).toBe("blocked");
+    expect(result.reasons.join(" ")).toContain("temporarily disabled by policy");
+    expect(result.requiredFallbacks).toContain("memory.cpu");
+  });
+
   it("blocks D3D12 native as a mainline remote display renderer until it is wired", () => {
     const snapshot = buildCapabilitySnapshotFromEnvironment(windowsEnvironment);
 
@@ -505,6 +546,67 @@ describe("service capability option mapping", () => {
 });
 
 describe("capability profiles", () => {
+  it("keeps built-in fallback profiles aligned with the service defaults", () => {
+    const smoke = getCapabilityProfile("smoke.720p30");
+    expect(smoke).toMatchObject({
+      min_stable_fps_ratio: 0.8,
+      max_drop_ratio: 0.02,
+    });
+    expect(smoke?.latency_budget_ms).toBeUndefined();
+    expect(smoke?.required_capabilities).toEqual([
+      "transport.loopback",
+      "encode.openh264",
+      "decode.software",
+    ]);
+
+    expect(getCapabilityProfile("interactive.1080p60")).toMatchObject({
+      codec: "hevc",
+      min_stable_fps_ratio: 0.8,
+      max_drop_ratio: 0.02,
+      required_capabilities: [
+        "encode.nvenc_hevc",
+        "decode.nvdec_hevc",
+        "media.hevc_main_420_8bit",
+        "render.d3d11",
+        "memory.d3d11_shared",
+        "transport.quic_datagram",
+        "transport.media_profile_control_v1",
+      ],
+    });
+    expect(getCapabilityProfile("interactive.1080p60")?.latency_budget_ms).toBeUndefined();
+
+    expect(getCapabilityProfile("compat.h264.1080p60")).toMatchObject({
+      codec: "h264",
+      min_stable_fps_ratio: 0.8,
+      max_drop_ratio: 0.02,
+      required_capabilities: [
+        "encode.nvenc_h264",
+        "decode.nvdec",
+        "render.d3d11",
+        "memory.d3d11_shared",
+        "transport.quic_datagram",
+        "transport.media_profile_control_v1",
+      ],
+    });
+    expect(getCapabilityProfile("compat.h264.1080p60")?.latency_budget_ms).toBeUndefined();
+
+    const quality = getCapabilityProfile("quality.4k60");
+    expect(quality).toMatchObject({
+      min_stable_fps_ratio: 0.8,
+      max_drop_ratio: 0.02,
+    });
+    expect(quality?.latency_budget_ms).toBeUndefined();
+    expect(quality?.required_capabilities).toEqual([
+      "encode.nvenc_hevc",
+      "decode.nvdec_hevc",
+      "media.hevc_main_420_8bit",
+      "render.d3d11",
+      "memory.d3d11_shared",
+      "transport.quic_datagram",
+      "transport.media_profile_control_v1",
+    ]);
+  });
+
   it("exposes a LAN 2K144 profile with required media capabilities", () => {
     const profile = getCapabilityProfile("lan.2k144");
 
@@ -566,6 +668,40 @@ describe("capability profiles", () => {
 
     expect(result.status).toBe("blocked");
     expect(result.reasons.join(" ")).toContain("transport.media_profile_control_v1");
+  });
+
+  it("applies service-owned constraints when evaluating profile support", () => {
+    const snapshot: CapabilitySnapshot = {
+      ...withAvailableCapabilities(buildCapabilitySnapshotFromEnvironment(windowsEnvironment), [
+        "render.d3d11",
+        "memory.d3d11_shared",
+      ]),
+      constraints: [
+        {
+          id: "profile_constraint",
+          applies_to: ["render.d3d11", "memory.d3d11_shared"],
+          status: "block",
+          reason: "Profile is blocked by service policy",
+          fallback_ids: ["memory.cpu"],
+        },
+      ],
+      profiles: [
+        {
+          id: "blocked.profile",
+          width: 1920,
+          height: 1080,
+          fps: 60,
+          bitrate_mbps: 20,
+          codec: "h264",
+          required_capabilities: ["render.d3d11", "memory.d3d11_shared"],
+        },
+      ],
+    };
+
+    const result = evaluateProfileSupport("blocked.profile", snapshot);
+
+    expect(result.status).toBe("blocked");
+    expect(result.reasons.join(" ")).toContain("Profile is blocked by service policy");
   });
 
   it("marks software fallback profiles as degraded instead of unavailable", () => {
