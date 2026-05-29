@@ -187,6 +187,10 @@ try {
     render_present_skipped_frames = 2
     render_queue_replacements = 7
     render_stale_frame_drops = 7
+    swap_chain_waitable_object = $true
+    swap_chain_present_mode = "waitable"
+    display_refresh_hz = 144
+    render_thread_priority = "above_normal"
     failure_reason = $null
     run_skipped = $false
     run_passed = $true
@@ -208,6 +212,10 @@ try {
   $csv = Import-Csv (Join-Path $summaryTmp "summary.csv")
   if ($csv.render_queue_replacements -ne "7") { throw "summary CSV must include render queue replacements" }
   if ($csv.render_stale_frame_drops -ne "7") { throw "summary CSV must include render stale frame drops" }
+  if ($csv.swap_chain_present_mode -ne "waitable") { throw "summary CSV must include swapchain present mode" }
+  if ($csv.display_refresh_hz -ne "144") { throw "summary CSV must include display refresh hz" }
+  $report = Get-Content (Join-Path $summaryTmp "reports/markdown-report.md") -Raw
+  if ($report -notmatch "swap_chain_present_mode \\| waitable") { throw "markdown report must include swapchain present mode" }
 } finally {
   Remove-Item $summaryTmp -Recurse -Force -ErrorAction SilentlyContinue
 }

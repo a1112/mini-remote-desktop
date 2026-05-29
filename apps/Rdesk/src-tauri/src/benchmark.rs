@@ -73,6 +73,14 @@ pub struct BenchmarkSummary {
     pub render_queue_replacements: Option<u64>,
     #[serde(default)]
     pub render_stale_frame_drops: Option<u64>,
+    #[serde(default)]
+    pub swap_chain_waitable_object: Option<bool>,
+    #[serde(default)]
+    pub swap_chain_present_mode: Option<String>,
+    #[serde(default)]
+    pub display_refresh_hz: Option<u32>,
+    #[serde(default)]
+    pub render_thread_priority: Option<String>,
     pub nvdec_runtime_summary: String,
     pub nvdec_h264_capability: String,
     pub nvdec_hevc_capability: String,
@@ -199,6 +207,10 @@ impl BenchmarkSummary {
             render_present_skipped_frames: Self::counter(probe, "render_present_skipped_frames"),
             render_queue_replacements: Self::counter(probe, "render_queue_replacements"),
             render_stale_frame_drops: Self::counter(probe, "render_stale_frame_drops"),
+            swap_chain_waitable_object: None,
+            swap_chain_present_mode: None,
+            display_refresh_hz: None,
+            render_thread_priority: None,
             nvdec_runtime_summary,
             nvdec_h264_capability,
             nvdec_hevc_capability,
@@ -315,6 +327,10 @@ impl BenchmarkSummary {
             ),
             render_queue_replacements: Self::counter(receiver_probe, "render_queue_replacements"),
             render_stale_frame_drops: Self::counter(receiver_probe, "render_stale_frame_drops"),
+            swap_chain_waitable_object: None,
+            swap_chain_present_mode: None,
+            display_refresh_hz: None,
+            render_thread_priority: None,
             nvdec_runtime_summary,
             nvdec_h264_capability,
             nvdec_hevc_capability,
@@ -369,6 +385,10 @@ impl BenchmarkSummary {
             "render_present_skipped_frames",
             "render_queue_replacements",
             "render_stale_frame_drops",
+            "swap_chain_waitable_object",
+            "swap_chain_present_mode",
+            "display_refresh_hz",
+            "render_thread_priority",
             "nvdec_runtime_summary",
             "nvdec_h264_capability",
             "nvdec_hevc_capability",
@@ -423,6 +443,10 @@ impl BenchmarkSummary {
             option_u64(self.render_present_skipped_frames),
             option_u64(self.render_queue_replacements),
             option_u64(self.render_stale_frame_drops),
+            option_bool(self.swap_chain_waitable_object),
+            self.swap_chain_present_mode.clone().unwrap_or_default(),
+            option_u32(self.display_refresh_hz),
+            self.render_thread_priority.clone().unwrap_or_default(),
             self.nvdec_runtime_summary.clone(),
             self.nvdec_h264_capability.clone(),
             self.nvdec_hevc_capability.clone(),
@@ -555,6 +579,14 @@ fn option_u64(value: Option<u64>) -> String {
     value.map(|item| item.to_string()).unwrap_or_default()
 }
 
+fn option_u32(value: Option<u32>) -> String {
+    value.map(|item| item.to_string()).unwrap_or_default()
+}
+
+fn option_bool(value: Option<bool>) -> String {
+    value.map(|item| item.to_string()).unwrap_or_default()
+}
+
 fn render_markdown_report(
     manifest: &BenchmarkManifest,
     summary: &BenchmarkSummary,
@@ -586,6 +618,10 @@ Duration: `{duration}s`\n\n\
 | frame_sink_ingest_p95_ms | {frame_sink_p95} |\n\
 | render_upload_p95_ms | {render_p95} |\n\
 | render_present_p95_ms | {present_p95} |\n\
+| swap_chain_waitable_object | {swap_chain_waitable} |\n\
+| swap_chain_present_mode | {swap_chain_present_mode} |\n\
+| display_refresh_hz | {display_refresh_hz} |\n\
+| render_thread_priority | {render_thread_priority} |\n\
 | keyframes | {keyframes} |\n\
 | dropped_frames | {dropped_frames} |\n\
 | quic_receiver_completed_frames | {quic_completed} |\n\
@@ -629,6 +665,16 @@ Duration: `{duration}s`\n\n\
         frame_sink_p95 = option_f64(summary.frame_sink_ingest_p95_ms),
         render_p95 = option_f64(summary.render_upload_p95_ms),
         present_p95 = option_f64(summary.render_present_p95_ms),
+        swap_chain_waitable = option_bool(summary.swap_chain_waitable_object),
+        swap_chain_present_mode = summary
+            .swap_chain_present_mode
+            .as_deref()
+            .unwrap_or_default(),
+        display_refresh_hz = option_u32(summary.display_refresh_hz),
+        render_thread_priority = summary
+            .render_thread_priority
+            .as_deref()
+            .unwrap_or_default(),
         keyframes = summary.keyframes,
         dropped_frames = summary.dropped_frames,
         quic_completed = option_u64(summary.quic_receiver_completed_frames),
@@ -844,6 +890,10 @@ mod tests {
             render_present_skipped_frames: Some(metrics.render_present_skipped_frames),
             render_queue_replacements: Some(metrics.render_queue_replacements),
             render_stale_frame_drops: Some(metrics.render_stale_frame_drops),
+            swap_chain_waitable_object: metrics.swap_chain_waitable_object,
+            swap_chain_present_mode: metrics.swap_chain_present_mode.clone(),
+            display_refresh_hz: metrics.display_refresh_hz,
+            render_thread_priority: metrics.render_thread_priority.clone(),
             nvdec_runtime_summary: String::new(),
             nvdec_h264_capability: String::new(),
             nvdec_hevc_capability: String::new(),
@@ -1194,6 +1244,10 @@ mod tests {
             render_present_skipped_frames: None,
             render_queue_replacements: None,
             render_stale_frame_drops: None,
+            swap_chain_waitable_object: None,
+            swap_chain_present_mode: None,
+            display_refresh_hz: None,
+            render_thread_priority: None,
             nvdec_runtime_summary: String::new(),
             nvdec_h264_capability: String::new(),
             nvdec_hevc_capability: String::new(),
@@ -1638,6 +1692,10 @@ mod tests {
             render_present_skipped_frames: Some(1),
             render_queue_replacements: Some(2),
             render_stale_frame_drops: Some(2),
+            swap_chain_waitable_object: Some(true),
+            swap_chain_present_mode: Some("waitable".into()),
+            display_refresh_hz: Some(144),
+            render_thread_priority: Some("above_normal".into()),
             nvdec_runtime_summary: "nvdec runtime libraries and core exports are present".into(),
             nvdec_h264_capability: "runtime=true wired=true".into(),
             nvdec_hevc_capability: "runtime=true wired=false".into(),
@@ -1663,6 +1721,16 @@ mod tests {
             .position(|column| *column == "render_queue_replacements")
             .expect("render replacement column");
         assert_eq!(row[render_replacements_index], "2");
+        let present_mode_index = header
+            .iter()
+            .position(|column| *column == "swap_chain_present_mode")
+            .expect("swapchain present mode column");
+        assert_eq!(row[present_mode_index], "waitable");
+        let refresh_index = header
+            .iter()
+            .position(|column| *column == "display_refresh_hz")
+            .expect("display refresh column");
+        assert_eq!(row[refresh_index], "144");
         let failure_reason_index = header
             .iter()
             .position(|column| *column == "failure_reason")

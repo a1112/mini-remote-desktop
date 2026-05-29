@@ -27,6 +27,10 @@ struct RenderSurface {
     render_target_view: windows::Win32::Graphics::Direct3D11::ID3D11RenderTargetView,
     max_frame_latency: Option<u32>,
     allow_tearing: bool,
+    waitable_object: bool,
+    frame_latency_waitable_object: Option<windows::Win32::Foundation::HANDLE>,
+    present_mode: D3d11PresentMode,
+    display_refresh_hz: Option<u32>,
     width: u32,
     height: u32,
 }
@@ -57,6 +61,7 @@ struct SharedBgraResourceCache {
 enum D3d11PresentStatus {
     Presented,
     SkippedStillDrawing,
+    SkippedFrameLatencyWait,
     NoTarget,
 }
 
@@ -66,7 +71,27 @@ impl D3d11PresentStatus {
         match self {
             Self::Presented => "presented",
             Self::SkippedStillDrawing => "skipped_still_drawing",
+            Self::SkippedFrameLatencyWait => "skipped_frame_latency_wait",
             Self::NoTarget => "no_target",
+        }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum D3d11PresentMode {
+    Nonblocking,
+    Blocking,
+    Waitable,
+}
+
+#[cfg(windows)]
+impl D3d11PresentMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Nonblocking => "nonblocking",
+            Self::Blocking => "blocking",
+            Self::Waitable => "waitable",
         }
     }
 }
@@ -125,6 +150,8 @@ const SHARED_NV12_SRV_CACHE_LIMIT: usize = 32;
 const SHARED_BGRA_RESOURCE_CACHE_LIMIT: usize = 16;
 #[cfg(windows)]
 const D3D11_LOW_LATENCY_MAX_FRAME_LATENCY: u32 = 1;
+#[cfg(windows)]
+const D3D11_WAITABLE_PRESENT_TIMEOUT_MS: u32 = 8;
 
 pub struct D3d11Renderer {
     #[cfg(windows)]
@@ -245,33 +272,102 @@ impl D3d11Renderer {
     }
 
     #[cfg(windows)]
-    fn present_flags(allow_tearing: bool) -> u32 {
+    fn env_bool(key: &str) -> bool {
+        matches!(
+            std::env::var(key),
+            Ok(value) if value == "1" || value.eq_ignore_ascii_case("true")
+        )
+    }
+
+    #[cfg(windows)]
+    fn present_mode() -> D3d11PresentMode {
+        if Self::env_bool("MRD_D3D11_RENDER_PRESENT_BLOCKING") {
+            D3d11PresentMode::Blocking
+        } else if Self::env_bool("MRD_D3D11_RENDER_WAITABLE_OBJECT") {
+            D3d11PresentMode::Waitable
+        } else {
+            D3d11PresentMode::Nonblocking
+        }
+    }
+
+    #[cfg(windows)]
+    fn waitable_present_timeout_ms() -> u32 {
+        std::env::var("MRD_D3D11_RENDER_WAITABLE_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|timeout| *timeout > 0)
+            .unwrap_or(D3D11_WAITABLE_PRESENT_TIMEOUT_MS)
+    }
+
+    #[cfg(windows)]
+    fn present_flags(present_mode: D3d11PresentMode, allow_tearing: bool) -> u32 {
         use windows::Win32::Graphics::Dxgi::{
             DXGI_PRESENT_ALLOW_TEARING, DXGI_PRESENT_DO_NOT_WAIT,
         };
 
-        if matches!(
-            std::env::var("MRD_D3D11_RENDER_PRESENT_BLOCKING"),
-            Ok(value) if value == "1" || value.eq_ignore_ascii_case("true")
-        ) {
-            return 0;
+        if present_mode == D3d11PresentMode::Blocking {
+            0
+        } else {
+            let mut flags = DXGI_PRESENT_DO_NOT_WAIT;
+            if allow_tearing {
+                flags |= DXGI_PRESENT_ALLOW_TEARING;
+            }
+            flags
         }
+    }
 
-        let mut flags = DXGI_PRESENT_DO_NOT_WAIT;
-        if allow_tearing {
-            flags |= DXGI_PRESENT_ALLOW_TEARING;
+    #[cfg(windows)]
+    fn wait_for_frame_latency(
+        waitable_object: Option<windows::Win32::Foundation::HANDLE>,
+    ) -> Result<bool, RenderError> {
+        use windows::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows::Win32::System::Threading::WaitForSingleObject;
+
+        let Some(waitable_object) = waitable_object else {
+            return Ok(true);
+        };
+        let result =
+            unsafe { WaitForSingleObject(waitable_object, Self::waitable_present_timeout_ms()) };
+        if result == WAIT_OBJECT_0 {
+            Ok(true)
+        } else if result == WAIT_TIMEOUT {
+            Ok(false)
+        } else {
+            Err(RenderError::Message(format!(
+                "wait for DXGI frame latency object failed: {result:?}"
+            )))
         }
-        flags
+    }
+
+    #[cfg(windows)]
+    fn validated_frame_latency_waitable_object(
+        handle: windows::Win32::Foundation::HANDLE,
+    ) -> Result<windows::Win32::Foundation::HANDLE, RenderError> {
+        if handle.0 == 0 {
+            Err(RenderError::Message(
+                "DXGI frame latency waitable object was not created".to_string(),
+            ))
+        } else {
+            Ok(handle)
+        }
     }
 
     #[cfg(windows)]
     fn present_swap_chain(
         swap_chain: &windows::Win32::Graphics::Dxgi::IDXGISwapChain1,
         allow_tearing: bool,
+        present_mode: D3d11PresentMode,
+        waitable_object: Option<windows::Win32::Foundation::HANDLE>,
     ) -> Result<D3d11PresentStatus, RenderError> {
         use windows::Win32::Graphics::Dxgi::DXGI_ERROR_WAS_STILL_DRAWING;
 
-        let hr = unsafe { swap_chain.Present(0, Self::present_flags(allow_tearing)) };
+        if present_mode == D3d11PresentMode::Waitable
+            && !Self::wait_for_frame_latency(waitable_object)?
+        {
+            return Ok(D3d11PresentStatus::SkippedFrameLatencyWait);
+        }
+
+        let hr = unsafe { swap_chain.Present(0, Self::present_flags(present_mode, allow_tearing)) };
         if hr == DXGI_ERROR_WAS_STILL_DRAWING {
             return Ok(D3d11PresentStatus::SkippedStillDrawing);
         }
@@ -317,22 +413,119 @@ impl D3d11Renderer {
     }
 
     #[cfg(windows)]
+    fn current_thread_priority_label() -> &'static str {
+        use windows::Win32::System::Threading::{
+            GetCurrentThread, GetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+            THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_HIGHEST, THREAD_PRIORITY_IDLE,
+            THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL, THREAD_PRIORITY_TIME_CRITICAL,
+        };
+
+        let priority = unsafe { GetThreadPriority(GetCurrentThread()) };
+        match priority {
+            value if value == THREAD_PRIORITY_IDLE.0 => "idle",
+            value if value == THREAD_PRIORITY_LOWEST.0 => "lowest",
+            value if value == THREAD_PRIORITY_BELOW_NORMAL.0 => "below_normal",
+            value if value == THREAD_PRIORITY_NORMAL.0 => "normal",
+            value if value == THREAD_PRIORITY_ABOVE_NORMAL.0 => "above_normal",
+            value if value == THREAD_PRIORITY_HIGHEST.0 => "highest",
+            value if value == THREAD_PRIORITY_TIME_CRITICAL.0 => "time_critical",
+            _ => "unknown",
+        }
+    }
+
+    #[cfg(windows)]
+    fn render_thread_priority_from_env() -> Option<(
+        &'static str,
+        windows::Win32::System::Threading::THREAD_PRIORITY,
+    )> {
+        use windows::Win32::System::Threading::{
+            THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_HIGHEST, THREAD_PRIORITY_NORMAL,
+        };
+
+        match std::env::var("MRD_RENDER_THREAD_PRIORITY")
+            .ok()?
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "normal" => Some(("normal", THREAD_PRIORITY_NORMAL)),
+            "above_normal" | "above-normal" => Some(("above_normal", THREAD_PRIORITY_ABOVE_NORMAL)),
+            "highest" => Some(("highest", THREAD_PRIORITY_HIGHEST)),
+            _ => None,
+        }
+    }
+
+    #[cfg(windows)]
+    fn configure_render_thread_priority() -> Result<(), RenderError> {
+        use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority};
+
+        let Some((_, priority)) = Self::render_thread_priority_from_env() else {
+            return Ok(());
+        };
+        unsafe { SetThreadPriority(GetCurrentThread(), priority) }.map_err(|error| {
+            RenderError::Message(format!("configure render thread priority failed: {error}"))
+        })
+    }
+
+    #[cfg(windows)]
+    fn display_refresh_hz_for_window(hwnd: windows::Win32::Foundation::HWND) -> Option<u32> {
+        use windows::core::PCWSTR;
+        use windows::Win32::Graphics::Gdi::{
+            EnumDisplaySettingsW, GetMonitorInfoW, MonitorFromWindow, DEVMODEW,
+            ENUM_CURRENT_SETTINGS, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
+        };
+
+        let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+        if monitor.0 == 0 {
+            return None;
+        }
+
+        let mut monitor_info = MONITORINFOEXW::default();
+        monitor_info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+        if !unsafe { GetMonitorInfoW(monitor, (&mut monitor_info as *mut MONITORINFOEXW).cast()) }
+            .as_bool()
+        {
+            return None;
+        }
+
+        let mut dev_mode = DEVMODEW {
+            dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+            ..Default::default()
+        };
+        let ok = unsafe {
+            EnumDisplaySettingsW(
+                PCWSTR(monitor_info.szDevice.as_ptr()),
+                ENUM_CURRENT_SETTINGS,
+                &mut dev_mode,
+            )
+            .as_bool()
+        };
+        ok.then_some(dev_mode.dmDisplayFrequency)
+            .filter(|refresh_hz| *refresh_hz > 0)
+    }
+
+    #[cfg(windows)]
     fn window_swap_chain_desc(
         width: u32,
         height: u32,
         allow_tearing: bool,
+        waitable_object: bool,
     ) -> windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_DESC1 {
         use windows::Win32::Graphics::Dxgi::Common::{
             DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
         };
         use windows::Win32::Graphics::Dxgi::{
             DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING,
-            DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT,
+            DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT, DXGI_SWAP_EFFECT_FLIP_DISCARD,
+            DXGI_USAGE_RENDER_TARGET_OUTPUT,
         };
 
         let mut flags = 0_u32;
         if allow_tearing {
             flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0 as u32;
+        }
+        if waitable_object {
+            flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32;
         }
 
         DXGI_SWAP_CHAIN_DESC1 {
@@ -381,7 +574,9 @@ impl D3d11Renderer {
     ) -> Result<Option<RenderSurface>, RenderError> {
         use windows::Win32::Foundation::{HWND, RECT};
         use windows::Win32::Graphics::Direct3D11::{ID3D11RenderTargetView, ID3D11Texture2D};
-        use windows::Win32::Graphics::Dxgi::{IDXGIDevice, IDXGIFactory2, IDXGISwapChain1};
+        use windows::Win32::Graphics::Dxgi::{
+            IDXGIDevice, IDXGIFactory2, IDXGISwapChain1, IDXGISwapChain2,
+        };
         use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 
         if window_handle == 0 {
@@ -395,6 +590,8 @@ impl D3d11Renderer {
         let width = (rect.right - rect.left).max(1) as u32;
         let height = (rect.bottom - rect.top).max(1) as u32;
 
+        Self::configure_render_thread_priority()?;
+
         let dxgi_device: IDXGIDevice = self
             .device
             .cast()
@@ -405,7 +602,10 @@ impl D3d11Renderer {
         let factory: IDXGIFactory2 = unsafe { adapter.GetParent() }
             .map_err(|error| RenderError::Message(format!("获取 DXGI factory 失败: {error}")))?;
         let allow_tearing = Self::check_tearing_support(&factory);
-        let swap_chain_desc = Self::window_swap_chain_desc(width, height, allow_tearing);
+        let present_mode = Self::present_mode();
+        let waitable_object = present_mode == D3d11PresentMode::Waitable;
+        let swap_chain_desc =
+            Self::window_swap_chain_desc(width, height, allow_tearing, waitable_object);
 
         let swap_chain: IDXGISwapChain1 = unsafe {
             factory.CreateSwapChainForHwnd(
@@ -417,6 +617,25 @@ impl D3d11Renderer {
             )
         }
         .map_err(|error| RenderError::Message(format!("创建 SwapChain 失败: {error}")))?;
+        let frame_latency_waitable_object = if waitable_object {
+            let swap_chain2: IDXGISwapChain2 = swap_chain.cast().map_err(|error| {
+                RenderError::Message(format!("转换 IDXGISwapChain2 失败: {error}"))
+            })?;
+            unsafe {
+                swap_chain2
+                    .SetMaximumFrameLatency(
+                        max_frame_latency.unwrap_or(D3D11_LOW_LATENCY_MAX_FRAME_LATENCY),
+                    )
+                    .map_err(|error| {
+                        RenderError::Message(format!("配置 DXGI swapchain 帧延迟失败: {error}"))
+                    })?
+            };
+            let handle = unsafe { swap_chain2.GetFrameLatencyWaitableObject() };
+            Some(Self::validated_frame_latency_waitable_object(handle)?)
+        } else {
+            None
+        };
+        let display_refresh_hz = Self::display_refresh_hz_for_window(hwnd);
 
         let back_buffer: ID3D11Texture2D = unsafe { swap_chain.GetBuffer(0) }
             .map_err(|error| RenderError::Message(format!("获取 back buffer 失败: {error}")))?;
@@ -435,6 +654,10 @@ impl D3d11Renderer {
             render_target_view,
             max_frame_latency,
             allow_tearing,
+            waitable_object,
+            frame_latency_waitable_object,
+            present_mode,
+            display_refresh_hz,
             width,
             height,
         }))
@@ -501,7 +724,12 @@ impl D3d11Renderer {
             self.context
                 .ClearRenderTargetView(&surface.render_target_view, &clear);
         }
-        Self::present_swap_chain(&surface.swap_chain, surface.allow_tearing)
+        Self::present_swap_chain(
+            &surface.swap_chain,
+            surface.allow_tearing,
+            surface.present_mode,
+            surface.frame_latency_waitable_object,
+        )
     }
 
     #[cfg(windows)]
@@ -576,7 +804,12 @@ impl D3d11Renderer {
                 0,
             );
         }
-        Self::present_swap_chain(&surface.swap_chain, surface.allow_tearing)
+        Self::present_swap_chain(
+            &surface.swap_chain,
+            surface.allow_tearing,
+            surface.present_mode,
+            surface.frame_latency_waitable_object,
+        )
     }
 
     #[cfg(windows)]
@@ -714,7 +947,12 @@ impl D3d11Renderer {
                 0,
             );
         }
-        Self::present_swap_chain(&surface.swap_chain, surface.allow_tearing)
+        Self::present_swap_chain(
+            &surface.swap_chain,
+            surface.allow_tearing,
+            surface.present_mode,
+            surface.frame_latency_waitable_object,
+        )
     }
 
     #[cfg(windows)]
@@ -976,6 +1214,8 @@ impl D3d11Renderer {
         let back_buffer = surface.back_buffer.clone();
         let swap_chain = surface.swap_chain.clone();
         let allow_tearing = surface.allow_tearing;
+        let present_mode = surface.present_mode;
+        let frame_latency_waitable_object = surface.frame_latency_waitable_object;
 
         let shared_handle = match &frame.data {
             RenderFrameData::D3D11SharedBgra { shared_handle, .. } => *shared_handle,
@@ -1022,7 +1262,12 @@ impl D3d11Renderer {
                 );
             }
         }
-        Self::present_swap_chain(&swap_chain, allow_tearing)
+        Self::present_swap_chain(
+            &swap_chain,
+            allow_tearing,
+            present_mode,
+            frame_latency_waitable_object,
+        )
     }
 
     #[cfg(windows)]
@@ -1063,6 +1308,8 @@ impl D3d11Renderer {
         let render_target_view = surface.render_target_view.clone();
         let swap_chain = surface.swap_chain.clone();
         let allow_tearing = surface.allow_tearing;
+        let present_mode = surface.present_mode;
+        let frame_latency_waitable_object = surface.frame_latency_waitable_object;
         let (y_srv, uv_srv) = self.shared_nv12_srvs(shared_handle_y, shared_handle_uv)?;
         let (vertex_shader, pixel_shader, sampler) = {
             let pipeline = self.ensure_shared_nv12_pipeline()?;
@@ -1110,7 +1357,12 @@ impl D3d11Renderer {
             self.context.Draw(3, 0);
             self.context.PSSetShaderResources(0, Some(&empty_srvs));
         }
-        Self::present_swap_chain(&swap_chain, allow_tearing)
+        Self::present_swap_chain(
+            &swap_chain,
+            allow_tearing,
+            present_mode,
+            frame_latency_waitable_object,
+        )
     }
 }
 
@@ -1204,7 +1456,8 @@ impl RendererInstance for D3d11Renderer {
                 D3d11PresentStatus::Presented => {
                     self.presented_frame_count += 1;
                 }
-                D3d11PresentStatus::SkippedStillDrawing => {
+                D3d11PresentStatus::SkippedStillDrawing
+                | D3d11PresentStatus::SkippedFrameLatencyWait => {
                     self.present_skipped_count += 1;
                 }
                 D3d11PresentStatus::NoTarget => {}
@@ -1225,10 +1478,33 @@ impl RendererInstance for D3d11Renderer {
             .and_then(|surface| surface.max_frame_latency);
         #[cfg(windows)]
         let swap_chain_allow_tearing = self.surface.as_ref().map(|surface| surface.allow_tearing);
+        #[cfg(windows)]
+        let swap_chain_waitable_object =
+            self.surface.as_ref().map(|surface| surface.waitable_object);
+        #[cfg(windows)]
+        let swap_chain_present_mode = self
+            .surface
+            .as_ref()
+            .map(|surface| surface.present_mode.as_str().to_string());
+        #[cfg(windows)]
+        let display_refresh_hz = self
+            .surface
+            .as_ref()
+            .and_then(|surface| surface.display_refresh_hz);
+        #[cfg(windows)]
+        let render_thread_priority = Some(Self::current_thread_priority_label().to_string());
         #[cfg(not(windows))]
         let swap_chain_max_frame_latency = None;
         #[cfg(not(windows))]
         let swap_chain_allow_tearing = None;
+        #[cfg(not(windows))]
+        let swap_chain_waitable_object = None;
+        #[cfg(not(windows))]
+        let swap_chain_present_mode = None;
+        #[cfg(not(windows))]
+        let display_refresh_hz = None;
+        #[cfg(not(windows))]
+        let render_thread_priority = None;
 
         RendererSnapshot {
             attached_to_target: self.attached_to_target,
@@ -1242,6 +1518,10 @@ impl RendererInstance for D3d11Renderer {
             low_latency_frame_latency_target: None,
             swap_chain_max_frame_latency,
             swap_chain_allow_tearing,
+            swap_chain_waitable_object,
+            swap_chain_present_mode,
+            display_refresh_hz,
+            render_thread_priority,
             last_width: self.last_width,
             last_height: self.last_height,
             last_pixel_format: self.last_pixel_format,
@@ -1253,7 +1533,9 @@ impl RendererInstance for D3d11Renderer {
 mod tests {
     use super::{fit_viewport_rect, D3d11RendererFactory};
     #[cfg(windows)]
-    use super::{should_clear_shared_present_surface, D3d11PresentStatus, D3d11Renderer};
+    use super::{
+        should_clear_shared_present_surface, D3d11PresentMode, D3d11PresentStatus, D3d11Renderer,
+    };
     use mrd_render::{RenderFrame, RenderPixelFormat, RenderTarget, RendererFactory};
 
     #[test]
@@ -1295,17 +1577,23 @@ mod tests {
 
         std::env::remove_var("MRD_D3D11_RENDER_PRESENT_BLOCKING");
         assert_eq!(
-            D3d11Renderer::present_flags(false),
+            D3d11Renderer::present_flags(D3d11PresentMode::Nonblocking, false),
             DXGI_PRESENT_DO_NOT_WAIT
         );
         assert_eq!(
-            D3d11Renderer::present_flags(true),
+            D3d11Renderer::present_flags(D3d11PresentMode::Nonblocking, true),
             DXGI_PRESENT_DO_NOT_WAIT | DXGI_PRESENT_ALLOW_TEARING
         );
 
         std::env::set_var("MRD_D3D11_RENDER_PRESENT_BLOCKING", "1");
-        assert_eq!(D3d11Renderer::present_flags(false), 0);
-        assert_eq!(D3d11Renderer::present_flags(true), 0);
+        assert_eq!(
+            D3d11Renderer::present_flags(D3d11PresentMode::Blocking, false),
+            0
+        );
+        assert_eq!(
+            D3d11Renderer::present_flags(D3d11PresentMode::Blocking, true),
+            0
+        );
         std::env::remove_var("MRD_D3D11_RENDER_PRESENT_BLOCKING");
     }
 
@@ -1334,6 +1622,10 @@ mod tests {
         assert_eq!(snapshot.low_latency_frame_latency_target, Some(1));
         assert_eq!(snapshot.swap_chain_max_frame_latency, None);
         assert_eq!(snapshot.swap_chain_allow_tearing, None);
+        assert_eq!(snapshot.swap_chain_waitable_object, None);
+        assert_eq!(snapshot.swap_chain_present_mode, None);
+        assert_eq!(snapshot.display_refresh_hz, None);
+        assert_eq!(snapshot.render_thread_priority.as_deref(), Some("normal"));
     }
 
     #[cfg(windows)]
@@ -1341,7 +1633,7 @@ mod tests {
     fn d3d11_swap_chain_desc_keeps_waitable_object_off_for_nonblocking_present() {
         use windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
 
-        let desc = D3d11Renderer::window_swap_chain_desc(16, 16, false);
+        let desc = D3d11Renderer::window_swap_chain_desc(16, 16, false, false);
 
         assert_eq!(
             desc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32,
@@ -1351,10 +1643,81 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn d3d11_swap_chain_desc_enables_waitable_object_when_requested() {
+        use windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+
+        let desc = D3d11Renderer::window_swap_chain_desc(16, 16, false, true);
+
+        assert_ne!(
+            desc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32,
+            0
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn d3d11_present_mode_uses_waitable_object_when_requested() {
+        std::env::remove_var("MRD_D3D11_RENDER_PRESENT_BLOCKING");
+        std::env::remove_var("MRD_D3D11_RENDER_WAITABLE_OBJECT");
+        assert_eq!(D3d11Renderer::present_mode().as_str(), "nonblocking");
+
+        std::env::set_var("MRD_D3D11_RENDER_WAITABLE_OBJECT", "1");
+        assert_eq!(D3d11Renderer::present_mode().as_str(), "waitable");
+
+        std::env::set_var("MRD_D3D11_RENDER_PRESENT_BLOCKING", "1");
+        assert_eq!(D3d11Renderer::present_mode().as_str(), "blocking");
+        std::env::remove_var("MRD_D3D11_RENDER_PRESENT_BLOCKING");
+        std::env::remove_var("MRD_D3D11_RENDER_WAITABLE_OBJECT");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn d3d11_waitable_object_requires_valid_handle() {
+        use windows::Win32::Foundation::HANDLE;
+
+        let err = D3d11Renderer::validated_frame_latency_waitable_object(HANDLE(0))
+            .expect_err("zero waitable handle must fail");
+
+        assert!(err
+            .to_string()
+            .contains("DXGI frame latency waitable object was not created"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn d3d11_render_thread_priority_env_accepts_safe_opt_in_values() {
+        std::env::remove_var("MRD_RENDER_THREAD_PRIORITY");
+        assert_eq!(D3d11Renderer::render_thread_priority_from_env(), None);
+
+        std::env::set_var("MRD_RENDER_THREAD_PRIORITY", "above_normal");
+        assert_eq!(
+            D3d11Renderer::render_thread_priority_from_env(),
+            Some((
+                "above_normal",
+                windows::Win32::System::Threading::THREAD_PRIORITY_ABOVE_NORMAL
+            ))
+        );
+
+        std::env::set_var("MRD_RENDER_THREAD_PRIORITY", "highest");
+        assert_eq!(
+            D3d11Renderer::render_thread_priority_from_env(),
+            Some((
+                "highest",
+                windows::Win32::System::Threading::THREAD_PRIORITY_HIGHEST
+            ))
+        );
+
+        std::env::set_var("MRD_RENDER_THREAD_PRIORITY", "time_critical");
+        assert_eq!(D3d11Renderer::render_thread_priority_from_env(), None);
+        std::env::remove_var("MRD_RENDER_THREAD_PRIORITY");
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn d3d11_swap_chain_desc_enables_tearing_when_supported() {
         use windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
 
-        let desc = D3d11Renderer::window_swap_chain_desc(16, 16, true);
+        let desc = D3d11Renderer::window_swap_chain_desc(16, 16, true, false);
 
         assert_ne!(desc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0 as u32, 0);
     }

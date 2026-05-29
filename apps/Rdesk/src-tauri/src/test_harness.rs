@@ -362,6 +362,10 @@ pub struct HarnessMetrics {
     pub render_present_skipped_frames: u64,
     pub render_queue_replacements: u64,
     pub render_stale_frame_drops: u64,
+    pub swap_chain_waitable_object: Option<bool>,
+    pub swap_chain_present_mode: Option<String>,
+    pub display_refresh_hz: Option<u32>,
+    pub render_thread_priority: Option<String>,
     pub render_present_gap_avg_ms: f64,
     pub render_present_gap_p50_ms: f64,
     pub render_present_gap_p95_ms: f64,
@@ -454,6 +458,10 @@ impl Default for HarnessMetrics {
             render_present_skipped_frames: 0,
             render_queue_replacements: 0,
             render_stale_frame_drops: 0,
+            swap_chain_waitable_object: None,
+            swap_chain_present_mode: None,
+            display_refresh_hz: None,
+            render_thread_priority: None,
             render_present_gap_avg_ms: 0.0,
             render_present_gap_p50_ms: 0.0,
             render_present_gap_p95_ms: 0.0,
@@ -730,7 +738,7 @@ enum RenderInput {
     Captured(CapturedFrame),
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct RenderPacingCounters {
     submitted_frames: u64,
     uploaded_frames: u64,
@@ -738,6 +746,10 @@ struct RenderPacingCounters {
     present_skipped_frames: u64,
     queue_replacements: u64,
     stale_frame_drops: u64,
+    swap_chain_waitable_object: Option<bool>,
+    swap_chain_present_mode: Option<String>,
+    display_refresh_hz: Option<u32>,
+    render_thread_priority: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2845,7 +2857,7 @@ impl TestHarness {
                     &decode_latencies,
                     &render_latencies,
                     &render_present_gaps,
-                    render_pacing,
+                    render_pacing.clone(),
                     &total_latencies,
                 );
                 if decoded_frames_total > 0 {
@@ -2885,7 +2897,7 @@ impl TestHarness {
             &decode_latencies,
             &render_latencies,
             &render_present_gaps,
-            render_pacing,
+            render_pacing.clone(),
             &total_latencies,
         );
 
@@ -2985,6 +2997,10 @@ impl TestHarness {
         m.render_present_skipped_frames = render_pacing.present_skipped_frames;
         m.render_queue_replacements = render_pacing.queue_replacements;
         m.render_stale_frame_drops = render_pacing.stale_frame_drops;
+        m.swap_chain_waitable_object = render_pacing.swap_chain_waitable_object;
+        m.swap_chain_present_mode = render_pacing.swap_chain_present_mode;
+        m.display_refresh_hz = render_pacing.display_refresh_hz;
+        m.render_thread_priority = render_pacing.render_thread_priority;
         m.render_present_gap_avg_ms = avg_present_gap.as_secs_f64() * 1000.0;
         m.render_present_gap_p50_ms = p50_present_gap.as_secs_f64() * 1000.0;
         m.render_present_gap_p95_ms = p95_present_gap.as_secs_f64() * 1000.0;
@@ -3005,6 +3021,10 @@ impl TestHarness {
         render_pacing.uploaded_frames = current_snapshot.uploaded_frame_count;
         render_pacing.presented_frames = current_snapshot.presented_frame_count;
         render_pacing.present_skipped_frames = current_snapshot.present_skipped_count;
+        render_pacing.swap_chain_waitable_object = current_snapshot.swap_chain_waitable_object;
+        render_pacing.swap_chain_present_mode = current_snapshot.swap_chain_present_mode.clone();
+        render_pacing.display_refresh_hz = current_snapshot.display_refresh_hz;
+        render_pacing.render_thread_priority = current_snapshot.render_thread_priority.clone();
 
         let previous_presented = previous_snapshot
             .map(|snapshot| snapshot.presented_frame_count)
@@ -4683,6 +4703,10 @@ mod tests {
                 low_latency_frame_latency_target: None,
                 swap_chain_max_frame_latency: None,
                 swap_chain_allow_tearing: None,
+                swap_chain_waitable_object: None,
+                swap_chain_present_mode: None,
+                display_refresh_hz: None,
+                render_thread_priority: None,
                 last_width: 1,
                 last_height: 1,
                 last_pixel_format: Some(RenderPixelFormat::Bgra32),
@@ -4704,6 +4728,10 @@ mod tests {
             low_latency_frame_latency_target: None,
             swap_chain_max_frame_latency: None,
             swap_chain_allow_tearing: None,
+            swap_chain_waitable_object: None,
+            swap_chain_present_mode: None,
+            display_refresh_hz: None,
+            render_thread_priority: None,
             last_width: 1,
             last_height: 1,
             last_pixel_format: Some(RenderPixelFormat::Bgra32),
@@ -4747,6 +4775,39 @@ mod tests {
         assert_eq!(counters.presented_frames, 4);
         assert_eq!(counters.present_skipped_frames, 2);
         assert_eq!(present_gaps, vec![Duration::from_millis(7)]);
+    }
+
+    #[test]
+    fn record_render_completion_tracks_swapchain_pacing_metadata() {
+        let previous = renderer_snapshot(7, 3, 1);
+        let mut current = renderer_snapshot(8, 4, 1);
+        current.swap_chain_waitable_object = Some(true);
+        current.swap_chain_present_mode = Some("waitable".to_string());
+        current.display_refresh_hz = Some(144);
+        current.render_thread_priority = Some("above_normal".to_string());
+        let mut counters = RenderPacingCounters::default();
+        let mut present_gaps = Vec::new();
+        let mut last_present_at = None;
+
+        TestHarness::record_render_completion(
+            &mut counters,
+            &mut present_gaps,
+            &mut last_present_at,
+            Some(&previous),
+            &current,
+            Instant::now(),
+        );
+
+        assert_eq!(counters.swap_chain_waitable_object, Some(true));
+        assert_eq!(
+            counters.swap_chain_present_mode.as_deref(),
+            Some("waitable")
+        );
+        assert_eq!(counters.display_refresh_hz, Some(144));
+        assert_eq!(
+            counters.render_thread_priority.as_deref(),
+            Some("above_normal")
+        );
     }
 
     fn captured_render_input_with_marker(marker: u8) -> RenderInput {
@@ -5291,6 +5352,7 @@ mod tests {
             present_skipped_frames: 1,
             queue_replacements: 2,
             stale_frame_drops: 2,
+            ..RenderPacingCounters::default()
         };
 
         TestHarness::update_metrics(

@@ -251,6 +251,14 @@ pub struct RendererSnapshot {
     pub swap_chain_max_frame_latency: Option<u32>,
     /// Whether the attached swap chain was created with tearing presents enabled.
     pub swap_chain_allow_tearing: Option<bool>,
+    /// Whether the attached swap chain exposes a frame-latency waitable object.
+    pub swap_chain_waitable_object: Option<bool>,
+    /// Presentation policy selected by the renderer, for example `nonblocking` or `waitable`.
+    pub swap_chain_present_mode: Option<String>,
+    /// Refresh rate of the display hosting the render target, when known.
+    pub display_refresh_hz: Option<u32>,
+    /// Effective render thread priority label, when the backend can query it.
+    pub render_thread_priority: Option<String>,
     pub last_width: usize,
     pub last_height: usize,
     pub last_pixel_format: Option<RenderPixelFormat>,

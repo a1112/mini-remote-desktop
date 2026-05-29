@@ -99,6 +99,7 @@ $headers = @(
   'frame_sink_ingest_p95_ms','render_upload_p95_ms','render_present_p95_ms',
   'render_submitted_frames','render_uploaded_frames','render_presented_frames','render_present_skipped_frames',
   'render_queue_replacements','render_stale_frame_drops',
+  'swap_chain_waitable_object','swap_chain_present_mode','display_refresh_hz','render_thread_priority',
   'failure_reason','run_skipped','run_passed'
 )
 $row = [pscustomobject]@{}
@@ -144,6 +145,10 @@ $report = @(
   "| render_present_skipped_frames | $($summary.render_present_skipped_frames) |",
   "| render_queue_replacements | $($summary.render_queue_replacements) |",
   "| render_stale_frame_drops | $($summary.render_stale_frame_drops) |",
+  "| swap_chain_waitable_object | $($summary.swap_chain_waitable_object) |",
+  "| swap_chain_present_mode | $($summary.swap_chain_present_mode) |",
+  "| display_refresh_hz | $($summary.display_refresh_hz) |",
+  "| render_thread_priority | $($summary.render_thread_priority) |",
   "| keyframes | $($summary.keyframes) |",
   "| dropped_frames | $($summary.dropped_frames) |",
   "| quic_receiver_completed_frames | $($summary.quic_receiver_completed_frames) |",
