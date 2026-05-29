@@ -72,6 +72,58 @@ describe("TransportTestPage execution targets", () => {
     expect(screen.queryByRole("button", { name: /WebRTC/ })).not.toBeInTheDocument();
   });
 
+  it("uses FFmpeg H.264 as the local decode fallback before software", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve({
+          os_type: "windows",
+          cpu_brand: "",
+          cpu_cores: 16,
+          memory_gb: 32,
+          gpu_info: "NVIDIA",
+          available_captures: ["synthetic", "dxgi"],
+          available_encoders: ["openh264", "nvenc_h264"],
+          available_decoders: ["software", "ffmpeg_h264", "none"],
+          available_renderers: ["none", "d3d11"],
+          available_memory_modes: ["cpu", "d3d11_shared"],
+        });
+      }
+      if (command === "ipc_capability_snapshot") {
+        return Promise.resolve(
+          serviceCapabilitySnapshot([
+            capabilityItem("transport.quic", "transport", "available"),
+            capabilityItem("capture.synthetic", "capture", "available"),
+            capabilityItem("encode.openh264", "encode", "degraded"),
+            capabilityItem("decode.ffmpeg_h264", "decode", "available"),
+            capabilityItem("decode.software", "decode", "degraded"),
+            capabilityItem("memory.cpu", "memory", "available"),
+          ])
+        );
+      }
+      if (command === "test_start_run") {
+        return Promise.resolve("run-ffmpeg");
+      }
+      return Promise.resolve(null);
+    });
+
+    render(<TransportTestPage />);
+
+    await screen.findByRole("button", { name: /QUIC/ });
+    fireEvent.click(screen.getByRole("button", { name: "启动测试" }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_start_run",
+        expect.objectContaining({
+          config: expect.objectContaining({
+            decoder_type: "ffmpeg_h264",
+          }),
+        })
+      );
+    });
+  });
+
   it("runs a cross-device transport test against the selected discovered peer", async () => {
     const mockInvoke = getMockInvoke();
     const peer = {

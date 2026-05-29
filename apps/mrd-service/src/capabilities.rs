@@ -673,13 +673,14 @@ fn add_decode_capabilities(
     }
 
     if matches!(platform, CapabilityPlatform::Macos) {
-        push_supported(
+        push_item(
             items,
             platform,
             CapabilityDomain::Decode,
             "decode.videotoolbox",
             "VideoToolbox decode",
-            "VideoToolbox decode is planned for native macOS parity.",
+            CapabilityStatus::Unimplemented,
+            Some("VideoToolbox decode is planned for native macOS parity but is not wired as a service-owned decode path."),
         );
     }
 
@@ -1617,6 +1618,18 @@ mod tests {
             .capabilities
             .iter()
             .any(|item| item.id == "decode.ffmpeg_hevc"));
+    }
+
+    #[test]
+    fn planned_macos_videotoolbox_decode_is_not_advertised_as_runnable() {
+        let capabilities =
+            local_capabilities(CapabilityPlatform::Macos, CapabilityProbeMode::Static);
+        let decode = capabilities
+            .iter()
+            .find(|item| item.id == "decode.videotoolbox")
+            .expect("macOS VideoToolbox decode capability");
+
+        assert_eq!(decode.status, CapabilityStatus::Unimplemented);
     }
 
     #[test]

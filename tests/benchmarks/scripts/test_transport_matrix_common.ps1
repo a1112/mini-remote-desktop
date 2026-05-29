@@ -140,9 +140,21 @@ try {
     -StdoutPath $stdout `
     -StderrPath $stderr
 
-  if ($exitCode -ne 7) { throw "Invoke-TransportMatrixCommand should return the native exit code" }
+  if ($exitCode.ExitCode -ne 7) { throw "Invoke-TransportMatrixCommand should return the native exit code" }
+  if ($exitCode.TimedOut) { throw "Invoke-TransportMatrixCommand should not mark a completed command as timed out" }
   if ((Get-Content $stdout -Raw) -notmatch "stdout-ok") { throw "Invoke-TransportMatrixCommand should capture stdout" }
   if ((Get-Content $stderr -Raw) -notmatch "stderr-ok") { throw "Invoke-TransportMatrixCommand should capture stderr" }
+
+  $timeoutResult = Invoke-TransportMatrixCommand `
+    -FilePath "powershell" `
+    -ArgumentList @("-NoProfile", "-Command", "Start-Sleep -Seconds 5; Write-Output 'too-late'; exit 0") `
+    -WorkingDirectory $processTmp `
+    -StdoutPath $stdout `
+    -StderrPath $stderr `
+    -TimeoutSeconds 1
+
+  if ($timeoutResult.ExitCode -ne 124) { throw "Invoke-TransportMatrixCommand should use 124 for timeouts" }
+  if (-not $timeoutResult.TimedOut) { throw "Invoke-TransportMatrixCommand should mark timed out commands" }
 } finally {
   Remove-Item $processTmp -Recurse -Force -ErrorAction SilentlyContinue
 }
@@ -236,6 +248,14 @@ try {
   } | ConvertTo-Json -Depth 8 | Set-Content -Path (Join-Path $summaryTmp "manifest.json") -Encoding Ascii
 
   & (Join-Path $scriptDir "summarize_transport_results.ps1") -RunDir $summaryTmp
+
+  $schema = Get-Content (Join-Path $repoRoot "tests/benchmarks/schemas/benchmark-result.schema.json") -Raw | ConvertFrom-Json
+  $schemaProperties = @($schema.properties.PSObject.Properties.Name)
+  $summarized = Get-Content (Join-Path $summaryTmp "summary.json") -Raw | ConvertFrom-Json
+  $extraProperties = @($summarized.PSObject.Properties.Name | Where-Object { $_ -notin $schemaProperties })
+  if ($extraProperties.Count -gt 0) {
+    throw "benchmark summary schema is missing properties: $($extraProperties -join ', ')"
+  }
 
   $csv = Import-Csv (Join-Path $summaryTmp "summary.csv")
   if ($csv.run_status -ne "PASS") { throw "summary CSV must expose PASS run_status" }

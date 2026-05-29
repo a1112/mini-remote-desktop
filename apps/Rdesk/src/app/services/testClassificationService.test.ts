@@ -104,6 +104,29 @@ describe("testClassificationService", () => {
     });
   });
 
+  it("classifies FFmpeg decode backends as software acceleration", () => {
+    for (const decoder of ["ffmpeg_h264", "ffmpeg_hevc"] as const) {
+      expect(
+        deriveTestClassification(
+          {
+            capture_type: "dxgi",
+            encoder_type: "nvenc_h264",
+            decoder_type: decoder,
+            renderer_type: "d3d11",
+            render_display: true,
+            transport_kind: "loopback",
+          },
+          {
+            ...env,
+            available_decoders: [decoder],
+          }
+        )
+      ).toMatchObject({
+        decode_accel: "software",
+      });
+    }
+  });
+
   it("classifies cross-device peer metadata", () => {
     const classification = deriveTestClassification(
       {

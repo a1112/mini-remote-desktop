@@ -1,6 +1,7 @@
 param(
   [string]$ScenarioPath = "tests/benchmarks/scenarios/quick.transport.json",
-  [string]$RepoRoot = "."
+  [string]$RepoRoot = ".",
+  [int]$TimeoutSeconds = 300
 )
 
 $ErrorActionPreference = "Stop"
@@ -69,10 +70,15 @@ $exitCode = Invoke-TransportMatrixCommand `
   -ArgumentList $cargoArgs `
   -WorkingDirectory $repo `
   -StdoutPath $hostStdout `
-  -StderrPath $hostStderr
+  -StderrPath $hostStderr `
+  -TimeoutSeconds $TimeoutSeconds
 
-if ($exitCode -ne 0) {
-  throw "benchmark cargo test failed with exit code $exitCode. See $hostStderr"
+if ($exitCode.TimedOut) {
+  throw "benchmark cargo test timed out after $TimeoutSeconds seconds. See $hostStdout and $hostStderr"
+}
+
+if ($exitCode.ExitCode -ne 0) {
+  throw "benchmark cargo test failed with exit code $($exitCode.ExitCode). See $hostStderr"
 }
 
 powershell -ExecutionPolicy Bypass -File (Join-Path $repo 'tests/benchmarks/scripts/summarize_transport_results.ps1') `

@@ -55,6 +55,21 @@ function Get-TransportMatrixRenderEnvironment {
   return $result
 }
 
+function Stop-TransportProcessTree {
+  param(
+    [Parameter(Mandatory = $true)]
+    [int]$ProcessId
+  )
+
+  $children = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+    Where-Object { $_.ParentProcessId -eq $ProcessId })
+  foreach ($child in $children) {
+    Stop-TransportProcessTree -ProcessId $child.ProcessId
+  }
+
+  Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+}
+
 function Invoke-TransportMatrixCommand {
   param(
     [Parameter(Mandatory = $true)]
@@ -65,19 +80,47 @@ function Invoke-TransportMatrixCommand {
     [Parameter(Mandatory = $true)]
     [string]$StdoutPath,
     [Parameter(Mandatory = $true)]
-    [string]$StderrPath
+    [string]$StderrPath,
+    [int]$TimeoutSeconds = 300
   )
 
-  $previousLocation = (Get-Location).Path
-  $previousErrorActionPreference = $ErrorActionPreference
-  try {
+  New-Item -ItemType File -Force -Path $StdoutPath | Out-Null
+  New-Item -ItemType File -Force -Path $StderrPath | Out-Null
+
+  $job = Start-Job -ScriptBlock {
+    param($FilePath, $ArgumentList, $WorkingDirectory, $StdoutPath, $StderrPath)
     Set-Location $WorkingDirectory
-    $ErrorActionPreference = "Continue"
     & $FilePath @ArgumentList > $StdoutPath 2> $StderrPath
-    return $LASTEXITCODE
-  } finally {
-    $ErrorActionPreference = $previousErrorActionPreference
-    Set-Location $previousLocation
+    if ($null -ne $LASTEXITCODE) {
+      return $LASTEXITCODE
+    }
+    return 0
+  } -ArgumentList $FilePath, $ArgumentList, $WorkingDirectory, $StdoutPath, $StderrPath
+
+  $completed = Wait-Job -Job $job -Timeout ([Math]::Max(1, $TimeoutSeconds))
+  if ($null -eq $completed) {
+    $jobProcessId = $job.ChildJobs[0].ProcessId
+    if ($null -ne $jobProcessId) {
+      $childProcesses = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object { $_.ParentProcessId -eq $jobProcessId })
+      foreach ($child in $childProcesses) {
+        Stop-TransportProcessTree -ProcessId $child.ProcessId
+      }
+    }
+    Stop-Job -Job $job -ErrorAction SilentlyContinue
+    Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+    return [pscustomobject]@{
+      ExitCode = 124
+      TimedOut = $true
+    }
+  }
+
+  $output = @(Receive-Job -Job $job)
+  Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+  $exitCode = if ($output.Count -gt 0) { [int]$output[-1] } else { 0 }
+  return [pscustomobject]@{
+    ExitCode = $exitCode
+    TimedOut = $false
   }
 }
 

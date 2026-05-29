@@ -30,6 +30,7 @@ import {
 type TransportType = "quic" | "webrtc";
 type TestProfile = "latency" | "throughput" | "stability";
 type TransportRunScope = "local" | "cross-device";
+type DecoderType = NonNullable<TestConfig["decoder_type"]>;
 
 const LOCAL_LAN_TARGET_ID = "__local__";
 
@@ -328,12 +329,16 @@ export function TransportTestPage() {
       "available_encoders",
       "openh264"
     );
-    const decoder = chooseCapability(
+    const decoderCandidates: DecoderType[] =
       capture === "linux"
         ? ["linux_h264", "software", "none"]
         : capture === "macos"
           ? ["videotoolbox", "software", "none"]
-          : ["nvdec", "software", "none"],
+          : encoder === "nvenc_hevc"
+            ? ["nvdec", "ffmpeg_hevc", "software", "none"]
+            : ["nvdec", "ffmpeg_h264", "software", "none"];
+    const decoder = chooseCapability(
+      decoderCandidates,
       capabilities,
       "available_decoders",
       "none"
