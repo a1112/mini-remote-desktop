@@ -1881,8 +1881,15 @@ function resourceNetworkSubtitle(snapshot: SystemResourceSnapshot | null) {
 
 function resourceGpuSubtitle(snapshot: SystemResourceSnapshot | null) {
   if (!snapshot?.gpu_metrics_available) return "GPU 指标不可用";
-  const scope = snapshot.gpu_metrics_scope === "process" ? "进程显存 / 系统利用率" : "系统 GPU";
-  return scope;
+  const usageScope = snapshot.gpu_usage_metrics_scope ?? snapshot.gpu_metrics_scope;
+  const memoryScope = snapshot.gpu_memory_metrics_scope ?? snapshot.gpu_metrics_scope;
+  if (memoryScope === "process" && usageScope === "system") {
+    return "进程显存 / 系统利用率";
+  }
+  if (memoryScope === "process") {
+    return "进程显存";
+  }
+  return "系统 GPU";
 }
 
 function DiagnosticStageList({ rows }: { rows: DiagnosticsStageRow[] }) {

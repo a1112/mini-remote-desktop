@@ -224,9 +224,10 @@ function ResourceMonitorStrip({
         snapshot.memory_usage_percent
       )} of system memory)`
     : "target memory";
-  const gpuScope = snapshot?.gpu_metrics_scope ?? "unavailable";
+  const gpuUsageScope = snapshot?.gpu_usage_metrics_scope ?? snapshot?.gpu_metrics_scope;
+  const gpuMemoryScope = snapshot?.gpu_memory_metrics_scope ?? snapshot?.gpu_metrics_scope;
   const gpuTitle = snapshot?.gpu_metrics_available
-    ? `${formatScopeLabel(gpuScope, targetTitle)} GPU ${gpuValue}`
+    ? `${formatGpuScopeLabel(gpuUsageScope, gpuMemoryScope, targetTitle)} GPU ${gpuValue}`
     : "GPU metrics unavailable";
   const networkScope = snapshot?.network_metrics_scope ?? "unavailable";
   const networkTitle = snapshot
@@ -366,4 +367,18 @@ function formatScopeLabel(scope: string | undefined, targetTitle: string) {
     default:
       return "Unavailable";
   }
+}
+
+function formatGpuScopeLabel(
+  usageScope: string | undefined,
+  memoryScope: string | undefined,
+  targetTitle: string
+) {
+  if (memoryScope === "process" && usageScope === "system") {
+    return `${targetTitle} VRAM / System utilization`;
+  }
+  if (memoryScope === "process") {
+    return `${targetTitle} VRAM`;
+  }
+  return formatScopeLabel(usageScope ?? memoryScope, targetTitle);
 }

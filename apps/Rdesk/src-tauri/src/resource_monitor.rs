@@ -7,9 +7,10 @@ use sysinfo::{Networks, Pid, System};
 #[derive(Debug, Clone, Default)]
 struct GpuSample {
     usage_percent: Option<f32>,
+    usage_scope: MetricScope,
     memory_used_mb: Option<u64>,
     memory_total_mb: Option<u64>,
-    scope: MetricScope,
+    memory_scope: MetricScope,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -43,15 +44,20 @@ pub struct SystemResourceSnapshot {
     pub target_name: String,
     pub target_pid: Option<u32>,
     pub target_found: bool,
+    pub cpu_metrics_available: bool,
+    pub cpu_metrics_scope: String,
     pub cpu_usage_percent: f32,
     pub memory_used_mb: u64,
     pub memory_total_mb: u64,
     pub memory_usage_percent: f32,
+    pub memory_metrics_scope: String,
     pub gpu_usage_percent: Option<f32>,
     pub gpu_memory_used_mb: Option<u64>,
     pub gpu_memory_total_mb: Option<u64>,
     pub gpu_metrics_available: bool,
     pub gpu_metrics_scope: String,
+    pub gpu_usage_metrics_scope: String,
+    pub gpu_memory_metrics_scope: String,
     pub network_rx_bps: u64,
     pub network_tx_bps: u64,
     pub network_metrics_available: bool,
@@ -93,6 +99,7 @@ impl ResourceMonitor {
         target_pid: Option<u32>,
         target_name: impl Into<String>,
     ) -> SystemResourceSnapshot {
+        self.system.refresh_cpu();
         self.system.refresh_memory();
         self.system.refresh_processes();
 
@@ -114,6 +121,11 @@ impl ResourceMonitor {
 
         let cpu_usage_percent =
             normalize_process_cpu(raw_cpu_usage, self.system.cpus().len().max(1));
+        let process_scope = if target_found {
+            MetricScope::Process
+        } else {
+            MetricScope::Unavailable
+        };
         let gpu = self.gpu_sample_for_pids(&target_pids);
         let network = self.network_sample();
 
@@ -121,6 +133,8 @@ impl ResourceMonitor {
             target_name,
             target_pid,
             target_found,
+            cpu_metrics_available: target_found,
+            cpu_metrics_scope: process_scope.as_str().to_string(),
             cpu_usage_percent,
             memory_used_mb: bytes_to_mb(memory_used),
             memory_total_mb: bytes_to_mb(memory_total),
@@ -129,11 +143,14 @@ impl ResourceMonitor {
             } else {
                 percent((memory_used as f32 / memory_total as f32) * 100.0)
             },
+            memory_metrics_scope: process_scope.as_str().to_string(),
             gpu_usage_percent: gpu.usage_percent,
             gpu_memory_used_mb: gpu.memory_used_mb,
             gpu_memory_total_mb: gpu.memory_total_mb,
             gpu_metrics_available: gpu.usage_percent.is_some() || gpu.memory_used_mb.is_some(),
-            gpu_metrics_scope: gpu.scope.as_str().to_string(),
+            gpu_metrics_scope: compat_gpu_scope(&gpu).as_str().to_string(),
+            gpu_usage_metrics_scope: gpu.usage_scope.as_str().to_string(),
+            gpu_memory_metrics_scope: gpu.memory_scope.as_str().to_string(),
             network_rx_bps: network.rx_bps,
             network_tx_bps: network.tx_bps,
             network_metrics_available: network.available,
@@ -269,16 +286,37 @@ fn sample_nvidia_gpu_for_pids(
     }
 
     let system_sample = sample_nvidia_system_gpu(nvidia_smi_available);
-    if let Some(process_sample) = sample_nvidia_process_gpu(nvidia_smi_available, target_pids) {
-        return GpuSample {
+    let process_sample = sample_nvidia_process_gpu(nvidia_smi_available, target_pids);
+    combine_nvidia_gpu_samples(system_sample, process_sample)
+}
+
+fn combine_nvidia_gpu_samples(
+    system_sample: GpuSample,
+    process_sample: Option<GpuSample>,
+) -> GpuSample {
+    if let Some(process_sample) = process_sample {
+        GpuSample {
             usage_percent: system_sample.usage_percent,
+            usage_scope: system_sample.usage_scope,
             memory_used_mb: process_sample.memory_used_mb,
             memory_total_mb: system_sample.memory_total_mb,
-            scope: MetricScope::Process,
-        };
+            memory_scope: process_sample.memory_scope,
+        }
+    } else {
+        system_sample
     }
+}
 
-    system_sample
+fn compat_gpu_scope(sample: &GpuSample) -> MetricScope {
+    if sample.memory_scope == MetricScope::Process {
+        MetricScope::Process
+    } else if sample.usage_scope == MetricScope::System
+        || sample.memory_scope == MetricScope::System
+    {
+        MetricScope::System
+    } else {
+        MetricScope::Unavailable
+    }
 }
 
 fn sample_nvidia_process_gpu(
@@ -371,9 +409,10 @@ fn parse_nvidia_smi_process_sample(text: &str, target_pids: &[u32]) -> Option<Gp
 
     matched.then_some(GpuSample {
         usage_percent: None,
+        usage_scope: MetricScope::Unavailable,
         memory_used_mb: Some(memory_used_mb),
         memory_total_mb: None,
-        scope: MetricScope::Process,
+        memory_scope: MetricScope::Process,
     })
 }
 
@@ -383,9 +422,10 @@ fn parse_nvidia_smi_system_sample(text: &str) -> Option<GpuSample> {
 
     Some(GpuSample {
         usage_percent: parts.next().and_then(|value| value.parse::<f32>().ok()),
+        usage_scope: MetricScope::System,
         memory_used_mb: parts.next().and_then(|value| value.parse::<u64>().ok()),
         memory_total_mb: parts.next().and_then(|value| value.parse::<u64>().ok()),
-        scope: MetricScope::System,
+        memory_scope: MetricScope::System,
     })
 }
 
@@ -398,9 +438,10 @@ mod tests {
         let sample = parse_nvidia_smi_process_sample("100, 256\n200, 1024\n", &[200]).unwrap();
 
         assert_eq!(sample.usage_percent, None);
+        assert_eq!(sample.usage_scope, MetricScope::Unavailable);
         assert_eq!(sample.memory_used_mb, Some(1024));
         assert_eq!(sample.memory_total_mb, None);
-        assert_eq!(sample.scope, MetricScope::Process);
+        assert_eq!(sample.memory_scope, MetricScope::Process);
     }
 
     #[test]
@@ -410,7 +451,7 @@ mod tests {
                 .unwrap();
 
         assert_eq!(sample.memory_used_mb, Some(768));
-        assert_eq!(sample.scope, MetricScope::Process);
+        assert_eq!(sample.memory_scope, MetricScope::Process);
     }
 
     #[test]
@@ -431,9 +472,25 @@ mod tests {
         let sample = parse_nvidia_smi_system_sample("39, 2048, 8192\n").unwrap();
 
         assert_eq!(sample.usage_percent, Some(39.0));
+        assert_eq!(sample.usage_scope, MetricScope::System);
         assert_eq!(sample.memory_used_mb, Some(2048));
         assert_eq!(sample.memory_total_mb, Some(8192));
-        assert_eq!(sample.scope, MetricScope::System);
+        assert_eq!(sample.memory_scope, MetricScope::System);
+    }
+
+    #[test]
+    fn nvidia_gpu_sample_keeps_usage_and_memory_scopes_separate() {
+        let system_sample = parse_nvidia_smi_system_sample("39, 2048, 8192\n").unwrap();
+        let process_sample = parse_nvidia_smi_process_sample("100, 256\n", &[100]).unwrap();
+
+        let sample = combine_nvidia_gpu_samples(system_sample, Some(process_sample));
+
+        assert_eq!(sample.usage_percent, Some(39.0));
+        assert_eq!(sample.usage_scope, MetricScope::System);
+        assert_eq!(sample.memory_used_mb, Some(256));
+        assert_eq!(sample.memory_total_mb, Some(8192));
+        assert_eq!(sample.memory_scope, MetricScope::Process);
+        assert_eq!(compat_gpu_scope(&sample), MetricScope::Process);
     }
 
     #[test]
