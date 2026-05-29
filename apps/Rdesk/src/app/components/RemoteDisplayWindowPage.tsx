@@ -121,14 +121,12 @@ type DiagnosticsSample = {
   droppedFrames: number | null;
   bitrateMbps: number | null;
   serviceCpuPercent: number | null;
-  serviceMemoryPercent: number | null;
   serviceMemoryMb: number | null;
   serviceGpuPercent: number | null;
   serviceGpuMemoryMb: number | null;
   serviceNetworkRxMbps: number | null;
   serviceNetworkTxMbps: number | null;
   displayCpuPercent: number | null;
-  displayMemoryPercent: number | null;
   displayMemoryMb: number | null;
   displayGpuPercent: number | null;
   displayGpuMemoryMb: number | null;
@@ -890,12 +888,12 @@ function hasDiagnosticsSampleValue(sample: DiagnosticsSample) {
     sample.droppedFrames,
     sample.bitrateMbps,
     sample.serviceCpuPercent,
-    sample.serviceMemoryPercent,
+    sample.serviceMemoryMb,
     sample.serviceGpuPercent,
     sample.serviceNetworkRxMbps,
     sample.serviceNetworkTxMbps,
     sample.displayCpuPercent,
-    sample.displayMemoryPercent,
+    sample.displayMemoryMb,
     sample.displayGpuPercent,
     sample.displayNetworkRxMbps,
     sample.displayNetworkTxMbps,
@@ -2484,10 +2482,6 @@ export function RemoteDisplayWindowPage() {
     serviceResourceSnapshot,
     (snapshot) => snapshot.cpu_metrics_available === false ? null : snapshot.cpu_usage_percent
   );
-  const diagnosticsServiceMemoryPercent = resourceMetric(
-    serviceResourceSnapshot,
-    (snapshot) => snapshot.memory_usage_percent
-  );
   const diagnosticsServiceMemoryMb = resourceMetric(
     serviceResourceSnapshot,
     (snapshot) => snapshot.memory_used_mb
@@ -2511,10 +2505,6 @@ export function RemoteDisplayWindowPage() {
   const diagnosticsDisplayCpuPercent = resourceMetric(
     displayResourceSnapshot,
     (snapshot) => snapshot.cpu_metrics_available === false ? null : snapshot.cpu_usage_percent
-  );
-  const diagnosticsDisplayMemoryPercent = resourceMetric(
-    displayResourceSnapshot,
-    (snapshot) => snapshot.memory_usage_percent
   );
   const diagnosticsDisplayMemoryMb = resourceMetric(
     displayResourceSnapshot,
@@ -2566,14 +2556,12 @@ export function RemoteDisplayWindowPage() {
     droppedFrames: diagnosticsDroppedFrames,
     bitrateMbps: diagnosticsBitrateMbps,
     serviceCpuPercent: diagnosticsServiceCpuPercent,
-    serviceMemoryPercent: diagnosticsServiceMemoryPercent,
     serviceMemoryMb: diagnosticsServiceMemoryMb,
     serviceGpuPercent: diagnosticsServiceGpuPercent,
     serviceGpuMemoryMb: diagnosticsServiceGpuMemoryMb,
     serviceNetworkRxMbps: diagnosticsServiceNetworkRxMbps,
     serviceNetworkTxMbps: diagnosticsServiceNetworkTxMbps,
     displayCpuPercent: diagnosticsDisplayCpuPercent,
-    displayMemoryPercent: diagnosticsDisplayMemoryPercent,
     displayMemoryMb: diagnosticsDisplayMemoryMb,
     displayGpuPercent: diagnosticsDisplayGpuPercent,
     displayGpuMemoryMb: diagnosticsDisplayGpuMemoryMb,
@@ -5562,14 +5550,14 @@ export function RemoteDisplayWindowPage() {
                     <div className="grid gap-3">
                       <DiagnosticMetricTile
                         title="mrd-service CPU / 内存"
-                        value={`${formatOptionalPercent(diagnosticsServiceCpuPercent)} / ${formatOptionalPercent(
-                          diagnosticsServiceMemoryPercent
+                        value={`${formatOptionalPercent(diagnosticsServiceCpuPercent)} / ${formatMb(
+                          diagnosticsServiceMemoryMb
                         )}`}
                         subtitle={`${dash(serviceResourceSnapshot?.target_name)} PID ${dash(
                           serviceResourceSnapshot?.target_pid
-                        )} / ${formatMb(diagnosticsServiceMemoryMb)}`}
+                        )}`}
                         samples={diagnosticsSamples}
-                        sampleValue={(sample) => sample.serviceCpuPercent}
+                        sampleValue={(sample) => sample.serviceMemoryMb}
                         colorClass="text-emerald-300"
                       />
                       <DiagnosticMetricTile
@@ -5593,14 +5581,12 @@ export function RemoteDisplayWindowPage() {
                       />
                       <DiagnosticMetricTile
                         title="接收显示 CPU / 内存"
-                        value={`${formatOptionalPercent(diagnosticsDisplayCpuPercent)} / ${formatOptionalPercent(
-                          diagnosticsDisplayMemoryPercent
-                        )}`}
-                        subtitle={`${dash(displayResourceSnapshot?.target_name)} / ${formatMb(
+                        value={`${formatOptionalPercent(diagnosticsDisplayCpuPercent)} / ${formatMb(
                           diagnosticsDisplayMemoryMb
                         )}`}
+                        subtitle={`${dash(displayResourceSnapshot?.target_name)}`}
                         samples={diagnosticsSamples}
-                        sampleValue={(sample) => sample.displayCpuPercent ?? sample.displayMemoryPercent}
+                        sampleValue={(sample) => sample.displayMemoryMb}
                         colorClass="text-cyan-300"
                       />
                       <DiagnosticMetricTile

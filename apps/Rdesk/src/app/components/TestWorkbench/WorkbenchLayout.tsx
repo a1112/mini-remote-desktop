@@ -220,9 +220,7 @@ function ResourceMonitorStrip({
   const targetValue = snapshot ? compactTargetName(snapshot.target_name) : "--";
   const gpuValue = formatGpuValue(snapshot);
   const memoryTitle = snapshot
-    ? `${targetTitle} memory ${formatMemory(snapshot.memory_used_mb)} (${formatPercent(
-        snapshot.memory_usage_percent
-      )} of system memory)`
+    ? `${targetTitle} memory ${formatMemory(snapshot.memory_used_mb)}`
     : "target memory";
   const gpuUsageScope = snapshot?.gpu_usage_metrics_scope ?? snapshot?.gpu_metrics_scope;
   const gpuMemoryScope = snapshot?.gpu_memory_metrics_scope ?? snapshot?.gpu_metrics_scope;

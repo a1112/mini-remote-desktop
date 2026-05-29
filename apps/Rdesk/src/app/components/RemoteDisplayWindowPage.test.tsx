@@ -658,6 +658,8 @@ describe("RemoteDisplayWindowPage", () => {
     expect(screen.getByText("资源占用曲线")).toBeInTheDocument();
     expect(screen.getByText("mrd-service CPU / 内存")).toBeInTheDocument();
     expect(screen.getByText("接收显示 CPU / 内存")).toBeInTheDocument();
+    expect(screen.getByText("13% / 256 MB")).toBeInTheDocument();
+    expect(screen.getByText("6.5% / 384 MB")).toBeInTheDocument();
     expect(screen.getByText("阶段延迟 P95")).toBeInTheDocument();
     expect(screen.getByText("sender.encode")).toBeInTheDocument();
     expect(screen.getByText("H.265 Main")).toBeInTheDocument();
