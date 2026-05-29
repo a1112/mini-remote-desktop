@@ -110,6 +110,28 @@ describe("buildCapabilitySnapshotFromEnvironment", () => {
     expect(statusOf(snapshot, "render.linux")).toBe("available");
   });
 
+  it("does not mark planned VideoToolbox decode as available from legacy fallback", () => {
+    const snapshot = buildCapabilitySnapshotFromEnvironment({
+      ...linuxEnvironment,
+      os_type: "macos",
+      available_captures: ["macos"],
+      available_encoders: ["videotoolbox_h264"],
+      available_decoders: ["videotoolbox"],
+      available_renderers: ["macos"],
+    });
+
+    expect(statusOf(snapshot, "decode.videotoolbox")).toBe("unimplemented");
+  });
+
+  it("does not mark unwired NVENC AV1 encode as available from legacy fallback", () => {
+    const snapshot = buildCapabilitySnapshotFromEnvironment({
+      ...windowsEnvironment,
+      available_encoders: ["nvenc_av1"],
+    });
+
+    expect(statusOf(snapshot, "encode.nvenc_av1")).toBe("unimplemented");
+  });
+
   it("preserves unknown legacy values instead of dropping them", () => {
     const snapshot = buildCapabilitySnapshotFromEnvironment({
       ...windowsEnvironment,

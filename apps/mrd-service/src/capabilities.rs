@@ -923,7 +923,7 @@ fn nvenc_av1_status(platform: &CapabilityPlatform) -> (CapabilityStatus, String)
         CapabilityPlatform::Windows | CapabilityPlatform::Linux
     ) {
         (
-            CapabilityStatus::Supported,
+            CapabilityStatus::Unimplemented,
             "NVENC AV1 is declared as a harness capability; service-owned runtime probe and LAN sender integration are not wired yet.".to_string(),
         )
     } else {
@@ -1143,19 +1143,14 @@ fn add_transport_capabilities(items: &mut Vec<CapabilityItem>, platform: &Capabi
 }
 
 fn add_control_capabilities(items: &mut Vec<CapabilityItem>, platform: &CapabilityPlatform) {
-    let status = if matches!(platform, CapabilityPlatform::Windows) {
-        CapabilityStatus::Supported
-    } else {
-        CapabilityStatus::Unimplemented
-    };
     push_item(
         items,
         platform,
         CapabilityDomain::Control,
         "control.keyboard_mouse",
         "Keyboard and mouse control",
-        status,
-        Some("Input injection is not yet a service-owned cross-platform adapter."),
+        CapabilityStatus::Unimplemented,
+        Some("Input injection is not yet wired as a service-owned adapter."),
     );
 }
 
@@ -1630,6 +1625,30 @@ mod tests {
             .expect("macOS VideoToolbox decode capability");
 
         assert_eq!(decode.status, CapabilityStatus::Unimplemented);
+    }
+
+    #[test]
+    fn unwired_nvenc_av1_is_not_advertised_as_runnable() {
+        let capabilities =
+            local_capabilities(CapabilityPlatform::Windows, CapabilityProbeMode::Static);
+        let av1 = capabilities
+            .iter()
+            .find(|item| item.id == "encode.nvenc_av1")
+            .expect("NVENC AV1 capability");
+
+        assert_eq!(av1.status, CapabilityStatus::Unimplemented);
+    }
+
+    #[test]
+    fn unwired_keyboard_mouse_control_is_not_advertised_as_runnable() {
+        let capabilities =
+            local_capabilities(CapabilityPlatform::Windows, CapabilityProbeMode::Static);
+        let control = capabilities
+            .iter()
+            .find(|item| item.id == "control.keyboard_mouse")
+            .expect("keyboard/mouse control capability");
+
+        assert_eq!(control.status, CapabilityStatus::Unimplemented);
     }
 
     #[test]

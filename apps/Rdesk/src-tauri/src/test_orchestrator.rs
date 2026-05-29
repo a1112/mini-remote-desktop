@@ -3892,7 +3892,7 @@ fn derive_test_classification(
         "nvdec" | "linux_h264" | "linux_hevc" | "linux_hevc_main10" | "videotoolbox" => {
             TestAccelerationMode::Hardware
         }
-        "software" => TestAccelerationMode::Software,
+        "software" | "ffmpeg_h264" | "ffmpeg_hevc" => TestAccelerationMode::Software,
         _ => TestAccelerationMode::Unknown,
     };
     let render_path = if matches!(transport_path, TestTransportPath::Webrtc)
@@ -4366,6 +4366,28 @@ mod tests {
         );
         assert_eq!(classification.decode_accel, TestAccelerationMode::Browser);
         assert_eq!(classification.render_path, TestRenderPath::BrowserVideo);
+    }
+
+    #[test]
+    fn derives_ffmpeg_decode_as_software_classification() {
+        for decoder in ["ffmpeg_h264", "ffmpeg_hevc"] {
+            let classification = derive_test_classification(
+                &TestConfigData {
+                    capture_type: Some("dxgi".to_string()),
+                    encoder_type: Some("nvenc_h264".to_string()),
+                    decoder_type: Some(decoder.to_string()),
+                    renderer_type: Some("d3d11".to_string()),
+                    render_display: Some(true),
+                    transport_kind: Some("loopback".to_string()),
+                    ..Default::default()
+                },
+                &test_env(),
+                TestRunScope::Local,
+                None,
+            );
+
+            assert_eq!(classification.decode_accel, TestAccelerationMode::Software);
+        }
     }
 
     #[test]
