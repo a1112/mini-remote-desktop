@@ -42,7 +42,7 @@ use mrd_render_macos::MacosRendererFactory;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -755,6 +755,143 @@ enum RenderCommand {
     Stop,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LatestRenderSubmit {
+    replaced_pending: bool,
+}
+
+#[derive(Default)]
+struct LatestRenderSlot {
+    pending: Option<RenderInput>,
+    stopping: bool,
+}
+
+impl LatestRenderSlot {
+    fn push_latest(&mut self, input: RenderInput) -> LatestRenderSubmit {
+        let replaced_pending = self.pending.replace(input).is_some();
+        LatestRenderSubmit { replaced_pending }
+    }
+
+    fn take_next(&mut self) -> Option<RenderInput> {
+        self.pending.take()
+    }
+
+    fn stop(&mut self) {
+        self.stopping = true;
+        self.pending = None;
+    }
+}
+
+struct LatestRenderShared {
+    slot: Mutex<LatestRenderSlot>,
+    ready: Condvar,
+}
+
+impl LatestRenderShared {
+    fn new() -> Self {
+        Self {
+            slot: Mutex::new(LatestRenderSlot::default()),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn push_latest(&self, input: RenderInput) -> LatestRenderSubmit {
+        let mut slot = self.slot.lock().unwrap();
+        let submit = slot.push_latest(input);
+        self.ready.notify_one();
+        submit
+    }
+
+    fn stop(&self) {
+        let mut slot = self.slot.lock().unwrap();
+        slot.stop();
+        self.ready.notify_one();
+    }
+}
+
+struct AsyncRenderCompletion {
+    result: std::result::Result<RenderCompletion, String>,
+    started_at: Instant,
+    completed_at: Instant,
+}
+
+struct LatestRenderScheduler {
+    shared: Arc<LatestRenderShared>,
+    completions: mpsc::Receiver<AsyncRenderCompletion>,
+    worker_done: mpsc::Receiver<()>,
+    worker_finished: Arc<AtomicBool>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl LatestRenderScheduler {
+    fn new(renderer: PipelineRenderer) -> Result<Self> {
+        let shared = Arc::new(LatestRenderShared::new());
+        let (completion_tx, completions) = mpsc::channel();
+        let (worker_done_tx, worker_done) = mpsc::channel();
+        let worker_shared = Arc::clone(&shared);
+        let worker_finished = Arc::new(AtomicBool::new(false));
+        let worker_finished_thread = Arc::clone(&worker_finished);
+        let worker = thread::Builder::new()
+            .name("mrd-latest-render-scheduler".to_string())
+            .spawn(move || {
+                run_latest_render_worker(renderer, worker_shared, completion_tx);
+                worker_finished_thread.store(true, Ordering::Relaxed);
+                let _ = worker_done_tx.send(());
+            })
+            .map_err(|error| anyhow::anyhow!("spawn latest render scheduler failed: {error}"))?;
+
+        Ok(Self {
+            shared,
+            completions,
+            worker_done,
+            worker_finished,
+            worker: Some(worker),
+        })
+    }
+
+    fn submit_latest(&self, input: RenderInput) -> LatestRenderSubmit {
+        self.shared.push_latest(input)
+    }
+
+    fn try_recv_completion(&self) -> Result<Option<AsyncRenderCompletion>> {
+        match self.completions.try_recv() {
+            Ok(completion) => Ok(Some(completion)),
+            Err(mpsc::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                if self.worker_finished.load(Ordering::Relaxed) {
+                    Ok(None)
+                } else {
+                    anyhow::bail!("latest render scheduler stopped")
+                }
+            }
+        }
+    }
+
+    fn stop(&self) {
+        self.shared.stop();
+    }
+
+    fn is_finished(&self) -> bool {
+        self.worker_finished.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for LatestRenderScheduler {
+    fn drop(&mut self) {
+        self.stop();
+        let worker_finished = self.is_finished()
+            || self
+                .worker_done
+                .recv_timeout(Duration::from_millis(NATIVE_RENDER_THREAD_STOP_TIMEOUT_MS))
+                .is_ok();
+        if let Some(worker) = self.worker.take() {
+            if worker_finished {
+                let _ = worker.join();
+            }
+        }
+    }
+}
+
 struct PipelineRenderer {
     sender: mpsc::SyncSender<RenderCommand>,
     render_thread: Option<thread::JoinHandle<()>>,
@@ -919,6 +1056,47 @@ impl Drop for PipelineRenderer {
             if render_finished {
                 let _ = render_thread.join();
             }
+        }
+    }
+}
+
+fn run_latest_render_worker(
+    mut renderer: PipelineRenderer,
+    shared: Arc<LatestRenderShared>,
+    completions: mpsc::Sender<AsyncRenderCompletion>,
+) {
+    loop {
+        let input = {
+            let mut slot = shared.slot.lock().unwrap();
+            loop {
+                if slot.stopping {
+                    return;
+                }
+                if let Some(input) = slot.take_next() {
+                    break input;
+                }
+                slot = shared.ready.wait(slot).unwrap();
+            }
+        };
+
+        let started_at = Instant::now();
+        let result = renderer
+            .submit_frame(input)
+            .map_err(|error| error.to_string());
+        let completed_at = Instant::now();
+        let failed = result.is_err();
+        if completions
+            .send(AsyncRenderCompletion {
+                result,
+                started_at,
+                completed_at,
+            })
+            .is_err()
+        {
+            return;
+        }
+        if failed {
+            return;
         }
     }
 }
@@ -2358,8 +2536,37 @@ impl TestHarness {
             None
         };
         let mut next_frame_at = Instant::now();
+        let render_scheduler = match state.renderer.take() {
+            Some(renderer) => match LatestRenderScheduler::new(renderer) {
+                Ok(scheduler) => Some(scheduler),
+                Err(error) => {
+                    let mut m = metrics.lock().unwrap();
+                    m.error_message = Some(error.to_string());
+                    m.is_running = false;
+                    running.store(false, Ordering::Relaxed);
+                    return;
+                }
+            },
+            None => None,
+        };
 
         while running.load(Ordering::Relaxed) {
+            if let Some(scheduler) = render_scheduler.as_ref() {
+                if let Err(error) = Self::drain_render_completions(
+                    scheduler,
+                    &mut render_pacing,
+                    &mut render_latencies,
+                    &mut render_present_gaps,
+                    &mut last_render_snapshot,
+                    &mut last_render_present_at,
+                ) {
+                    let mut m = metrics.lock().unwrap();
+                    m.error_message = Some(error.to_string());
+                    running.store(false, Ordering::Relaxed);
+                    break;
+                }
+            }
+
             if let Some(period) = frame_period {
                 let now = Instant::now();
                 if now < next_frame_at {
@@ -2512,7 +2719,7 @@ impl TestHarness {
                 None
             };
 
-            let should_prepare_render_input = state.renderer.is_some() || preview_due;
+            let should_prepare_render_input = render_scheduler.is_some() || preview_due;
             let render_input = if should_prepare_render_input {
                 decoded_frames
                     .last()
@@ -2540,36 +2747,30 @@ impl TestHarness {
                 None
             };
 
-            let render_latency = if let (Some(renderer), Some(input)) =
-                (state.renderer.as_mut(), render_input)
-            {
-                let previous_snapshot = last_render_snapshot.clone();
+            if let (Some(scheduler), Some(input)) = (render_scheduler.as_ref(), render_input) {
                 render_pacing.submitted_frames = render_pacing.submitted_frames.saturating_add(1);
-                let render_start = Instant::now();
-                match renderer.submit_frame(input) {
-                    Ok(completion) => {
-                        let completed_at = Instant::now();
-                        Self::record_render_completion(
-                            &mut render_pacing,
-                            &mut render_present_gaps,
-                            &mut last_render_present_at,
-                            previous_snapshot.as_ref(),
-                            &completion.snapshot,
-                            completed_at,
-                        );
-                        last_render_snapshot = Some(completion.snapshot);
-                        Some(completed_at.duration_since(render_start))
-                    }
-                    Err(error) => {
-                        let mut m = metrics.lock().unwrap();
-                        m.error_message = Some(error.to_string());
-                        running.store(false, Ordering::Relaxed);
-                        break;
-                    }
+                let submit = scheduler.submit_latest(input);
+                if submit.replaced_pending {
+                    render_pacing.queue_replacements =
+                        render_pacing.queue_replacements.saturating_add(1);
+                    render_pacing.stale_frame_drops =
+                        render_pacing.stale_frame_drops.saturating_add(1);
                 }
-            } else {
-                None
-            };
+
+                if let Err(error) = Self::drain_render_completions(
+                    scheduler,
+                    &mut render_pacing,
+                    &mut render_latencies,
+                    &mut render_present_gaps,
+                    &mut last_render_snapshot,
+                    &mut last_render_present_at,
+                ) {
+                    let mut m = metrics.lock().unwrap();
+                    m.error_message = Some(error.to_string());
+                    running.store(false, Ordering::Relaxed);
+                    break;
+                }
+            }
             let interactive_latency = interactive_start.elapsed();
 
             capture_latencies.push(capture_latency);
@@ -2582,9 +2783,6 @@ impl TestHarness {
             }
             if let Some(latency) = decode_latency {
                 decode_latencies.push(latency);
-            }
-            if let Some(latency) = render_latency {
-                render_latencies.push(latency);
             }
             total_latencies.push(pipeline_start.elapsed());
 
@@ -2653,6 +2851,20 @@ impl TestHarness {
                 if decoded_frames_total > 0 {
                     reported_first_decoded_frame = true;
                 }
+            }
+        }
+
+        if let Some(scheduler) = render_scheduler.as_ref() {
+            if let Err(error) = Self::stop_render_scheduler_and_drain(
+                scheduler,
+                &mut render_pacing,
+                &mut render_latencies,
+                &mut render_present_gaps,
+                &mut last_render_snapshot,
+                &mut last_render_present_at,
+            ) {
+                let mut m = metrics.lock().unwrap();
+                m.error_message = Some(error.to_string());
             }
         }
 
@@ -2803,6 +3015,70 @@ impl TestHarness {
             }
             *last_render_present_at = Some(completed_at);
         }
+    }
+
+    fn drain_render_completions(
+        scheduler: &LatestRenderScheduler,
+        render_pacing: &mut RenderPacingCounters,
+        render_latencies: &mut Vec<Duration>,
+        render_present_gaps: &mut Vec<Duration>,
+        last_render_snapshot: &mut Option<RendererSnapshot>,
+        last_render_present_at: &mut Option<Instant>,
+    ) -> Result<usize> {
+        let mut drained = 0;
+        while let Some(completion) = scheduler.try_recv_completion()? {
+            drained += 1;
+            match completion.result {
+                Ok(render_completion) => {
+                    let previous_snapshot = last_render_snapshot.clone();
+                    Self::record_render_completion(
+                        render_pacing,
+                        render_present_gaps,
+                        last_render_present_at,
+                        previous_snapshot.as_ref(),
+                        &render_completion.snapshot,
+                        completion.completed_at,
+                    );
+                    *last_render_snapshot = Some(render_completion.snapshot);
+                    render_latencies.push(
+                        completion
+                            .completed_at
+                            .saturating_duration_since(completion.started_at),
+                    );
+                }
+                Err(error) => anyhow::bail!("native render thread failed: {error}"),
+            }
+        }
+        Ok(drained)
+    }
+
+    fn stop_render_scheduler_and_drain(
+        scheduler: &LatestRenderScheduler,
+        render_pacing: &mut RenderPacingCounters,
+        render_latencies: &mut Vec<Duration>,
+        render_present_gaps: &mut Vec<Duration>,
+        last_render_snapshot: &mut Option<RendererSnapshot>,
+        last_render_present_at: &mut Option<Instant>,
+    ) -> Result<()> {
+        scheduler.stop();
+        let deadline = Instant::now() + Duration::from_millis(NATIVE_RENDER_THREAD_STOP_TIMEOUT_MS);
+        loop {
+            let drained = Self::drain_render_completions(
+                scheduler,
+                render_pacing,
+                render_latencies,
+                render_present_gaps,
+                last_render_snapshot,
+                last_render_present_at,
+            )?;
+            if scheduler.is_finished() || Instant::now() >= deadline {
+                break;
+            }
+            if drained == 0 {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+        Ok(())
     }
 
     fn broadcast_encoded_access_units(
@@ -4471,6 +4747,76 @@ mod tests {
         assert_eq!(counters.presented_frames, 4);
         assert_eq!(counters.present_skipped_frames, 2);
         assert_eq!(present_gaps, vec![Duration::from_millis(7)]);
+    }
+
+    fn captured_render_input_with_marker(marker: u8) -> RenderInput {
+        RenderInput::Captured(CapturedFrame::from_cpu(
+            1,
+            1,
+            FramePixelFormat::Bgra32,
+            1,
+            vec![marker, 0, 0, 255],
+        ))
+    }
+
+    fn render_input_marker(input: &RenderInput) -> u8 {
+        match input {
+            RenderInput::Captured(frame) => frame.data[0],
+            RenderInput::Decoded(frame) => match &frame.data {
+                DecodedFrameData::CpuRgb24(data) | DecodedFrameData::CpuBgra32(data) => data[0],
+                DecodedFrameData::CpuNv12 { data, .. }
+                | DecodedFrameData::CpuI420 { data, .. }
+                | DecodedFrameData::CpuP010 { data, .. } => data[0],
+                #[cfg(windows)]
+                DecodedFrameData::D3D11SharedNv12 { .. }
+                | DecodedFrameData::D3D11SharedP010 { .. } => 0,
+            },
+        }
+    }
+
+    #[test]
+    fn latest_render_slot_replaces_pending_frame_with_newest() {
+        let mut slot = LatestRenderSlot::default();
+
+        assert!(
+            !slot
+                .push_latest(captured_render_input_with_marker(1))
+                .replaced_pending
+        );
+        assert_eq!(
+            render_input_marker(&slot.take_next().expect("first frame")),
+            1
+        );
+
+        assert!(
+            !slot
+                .push_latest(captured_render_input_with_marker(2))
+                .replaced_pending
+        );
+        assert!(
+            slot.push_latest(captured_render_input_with_marker(3))
+                .replaced_pending
+        );
+
+        assert_eq!(
+            render_input_marker(&slot.take_next().expect("latest frame")),
+            3
+        );
+        assert!(slot.take_next().is_none());
+    }
+
+    #[test]
+    fn latest_render_slot_does_not_report_replacement_after_pending_is_taken() {
+        let mut slot = LatestRenderSlot::default();
+
+        slot.push_latest(captured_render_input_with_marker(7));
+        assert_eq!(render_input_marker(&slot.take_next().expect("frame")), 7);
+
+        assert!(
+            !slot
+                .push_latest(captured_render_input_with_marker(8))
+                .replaced_pending
+        );
     }
 
     #[test]

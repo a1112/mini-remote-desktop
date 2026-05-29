@@ -96,7 +96,10 @@ $headers = @(
   'quic_receiver_duplicate_fragments','quic_receiver_rejected_fragments','quic_receiver_pending_frames',
   'quic_receiver_reassembly_drops','zero_write_access_unit_count',
   'warning_count','error_count','restart_count','encode_total_p95_ms','send_write_p95_ms','decode_total_p95_ms',
-  'frame_sink_ingest_p95_ms','render_upload_p95_ms','render_present_p95_ms','failure_reason','run_skipped','run_passed'
+  'frame_sink_ingest_p95_ms','render_upload_p95_ms','render_present_p95_ms',
+  'render_submitted_frames','render_uploaded_frames','render_presented_frames','render_present_skipped_frames',
+  'render_queue_replacements','render_stale_frame_drops',
+  'failure_reason','run_skipped','run_passed'
 )
 $row = [pscustomobject]@{}
 foreach ($header in $headers) { $row | Add-Member -NotePropertyName $header -NotePropertyValue $summary.$header }
@@ -135,6 +138,12 @@ $report = @(
   "| frame_sink_ingest_p95_ms | $($summary.frame_sink_ingest_p95_ms) |",
   "| render_upload_p95_ms | $($summary.render_upload_p95_ms) |",
   "| render_present_p95_ms | $($summary.render_present_p95_ms) |",
+  "| render_submitted_frames | $($summary.render_submitted_frames) |",
+  "| render_uploaded_frames | $($summary.render_uploaded_frames) |",
+  "| render_presented_frames | $($summary.render_presented_frames) |",
+  "| render_present_skipped_frames | $($summary.render_present_skipped_frames) |",
+  "| render_queue_replacements | $($summary.render_queue_replacements) |",
+  "| render_stale_frame_drops | $($summary.render_stale_frame_drops) |",
   "| keyframes | $($summary.keyframes) |",
   "| dropped_frames | $($summary.dropped_frames) |",
   "| quic_receiver_completed_frames | $($summary.quic_receiver_completed_frames) |",

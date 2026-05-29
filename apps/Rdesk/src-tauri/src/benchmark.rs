@@ -61,6 +61,18 @@ pub struct BenchmarkSummary {
     pub frame_sink_ingest_p95_ms: Option<f64>,
     pub render_upload_p95_ms: Option<f64>,
     pub render_present_p95_ms: Option<f64>,
+    #[serde(default)]
+    pub render_submitted_frames: Option<u64>,
+    #[serde(default)]
+    pub render_uploaded_frames: Option<u64>,
+    #[serde(default)]
+    pub render_presented_frames: Option<u64>,
+    #[serde(default)]
+    pub render_present_skipped_frames: Option<u64>,
+    #[serde(default)]
+    pub render_queue_replacements: Option<u64>,
+    #[serde(default)]
+    pub render_stale_frame_drops: Option<u64>,
     pub nvdec_runtime_summary: String,
     pub nvdec_h264_capability: String,
     pub nvdec_hevc_capability: String,
@@ -181,6 +193,12 @@ impl BenchmarkSummary {
             frame_sink_ingest_p95_ms: stage_p95(StageId::FrameSinkIngest),
             render_upload_p95_ms: stage_p95(StageId::RenderUpload),
             render_present_p95_ms: stage_p95(StageId::RenderPresent),
+            render_submitted_frames: Self::counter(probe, "render_submitted_frames"),
+            render_uploaded_frames: Self::counter(probe, "render_uploaded_frames"),
+            render_presented_frames: Self::counter(probe, "render_presented_frames"),
+            render_present_skipped_frames: Self::counter(probe, "render_present_skipped_frames"),
+            render_queue_replacements: Self::counter(probe, "render_queue_replacements"),
+            render_stale_frame_drops: Self::counter(probe, "render_stale_frame_drops"),
             nvdec_runtime_summary,
             nvdec_h264_capability,
             nvdec_hevc_capability,
@@ -288,6 +306,15 @@ impl BenchmarkSummary {
             frame_sink_ingest_p95_ms: find_stage(receiver_probe, StageId::FrameSinkIngest),
             render_upload_p95_ms: find_stage(receiver_probe, StageId::RenderUpload),
             render_present_p95_ms: find_stage(receiver_probe, StageId::RenderPresent),
+            render_submitted_frames: Self::counter(receiver_probe, "render_submitted_frames"),
+            render_uploaded_frames: Self::counter(receiver_probe, "render_uploaded_frames"),
+            render_presented_frames: Self::counter(receiver_probe, "render_presented_frames"),
+            render_present_skipped_frames: Self::counter(
+                receiver_probe,
+                "render_present_skipped_frames",
+            ),
+            render_queue_replacements: Self::counter(receiver_probe, "render_queue_replacements"),
+            render_stale_frame_drops: Self::counter(receiver_probe, "render_stale_frame_drops"),
             nvdec_runtime_summary,
             nvdec_h264_capability,
             nvdec_hevc_capability,
@@ -336,6 +363,12 @@ impl BenchmarkSummary {
             "frame_sink_ingest_p95_ms",
             "render_upload_p95_ms",
             "render_present_p95_ms",
+            "render_submitted_frames",
+            "render_uploaded_frames",
+            "render_presented_frames",
+            "render_present_skipped_frames",
+            "render_queue_replacements",
+            "render_stale_frame_drops",
             "nvdec_runtime_summary",
             "nvdec_h264_capability",
             "nvdec_hevc_capability",
@@ -384,6 +417,12 @@ impl BenchmarkSummary {
             option_f64(self.frame_sink_ingest_p95_ms),
             option_f64(self.render_upload_p95_ms),
             option_f64(self.render_present_p95_ms),
+            option_u64(self.render_submitted_frames),
+            option_u64(self.render_uploaded_frames),
+            option_u64(self.render_presented_frames),
+            option_u64(self.render_present_skipped_frames),
+            option_u64(self.render_queue_replacements),
+            option_u64(self.render_stale_frame_drops),
             self.nvdec_runtime_summary.clone(),
             self.nvdec_h264_capability.clone(),
             self.nvdec_hevc_capability.clone(),
@@ -799,6 +838,12 @@ mod tests {
             frame_sink_ingest_p95_ms: nonzero_option(metrics.interactive_latency_p95_ms),
             render_upload_p95_ms: nonzero_option(metrics.render_latency_p95_ms),
             render_present_p95_ms: nonzero_option(metrics.render_present_gap_p95_ms),
+            render_submitted_frames: Some(metrics.render_submitted_frames),
+            render_uploaded_frames: Some(metrics.render_uploaded_frames),
+            render_presented_frames: Some(metrics.render_presented_frames),
+            render_present_skipped_frames: Some(metrics.render_present_skipped_frames),
+            render_queue_replacements: Some(metrics.render_queue_replacements),
+            render_stale_frame_drops: Some(metrics.render_stale_frame_drops),
             nvdec_runtime_summary: String::new(),
             nvdec_h264_capability: String::new(),
             nvdec_hevc_capability: String::new(),
@@ -1143,6 +1188,12 @@ mod tests {
             frame_sink_ingest_p95_ms: None,
             render_upload_p95_ms: None,
             render_present_p95_ms: None,
+            render_submitted_frames: None,
+            render_uploaded_frames: None,
+            render_presented_frames: None,
+            render_present_skipped_frames: None,
+            render_queue_replacements: None,
+            render_stale_frame_drops: None,
             nvdec_runtime_summary: String::new(),
             nvdec_h264_capability: String::new(),
             nvdec_hevc_capability: String::new(),
@@ -1313,7 +1364,14 @@ mod tests {
             1812.5,
             0,
             3,
-            vec![],
+            vec![
+                ("render_submitted_frames".into(), 1_440),
+                ("render_uploaded_frames".into(), 1_438),
+                ("render_presented_frames".into(), 1_437),
+                ("render_present_skipped_frames".into(), 1),
+                ("render_queue_replacements".into(), 2),
+                ("render_stale_frame_drops".into(), 2),
+            ],
             vec![
                 (
                     StageId::EncodeTotal,
@@ -1363,6 +1421,12 @@ mod tests {
         assert_eq!(summary.decode_total_p95_ms, Some(5.0));
         assert_eq!(summary.frame_sink_ingest_p95_ms, Some(1.5));
         assert_eq!(summary.render_upload_p95_ms, None);
+        assert_eq!(summary.render_submitted_frames, Some(1_440));
+        assert_eq!(summary.render_uploaded_frames, Some(1_438));
+        assert_eq!(summary.render_presented_frames, Some(1_437));
+        assert_eq!(summary.render_present_skipped_frames, Some(1));
+        assert_eq!(summary.render_queue_replacements, Some(2));
+        assert_eq!(summary.render_stale_frame_drops, Some(2));
         assert_eq!(summary.quic_receiver_completed_frames, None);
         assert!(!summary.nvdec_runtime_summary.is_empty());
         assert!(!summary.nvdec_h264_capability.is_empty());
@@ -1568,6 +1632,12 @@ mod tests {
             frame_sink_ingest_p95_ms: None,
             render_upload_p95_ms: None,
             render_present_p95_ms: None,
+            render_submitted_frames: Some(10),
+            render_uploaded_frames: Some(9),
+            render_presented_frames: Some(8),
+            render_present_skipped_frames: Some(1),
+            render_queue_replacements: Some(2),
+            render_stale_frame_drops: Some(2),
             nvdec_runtime_summary: "nvdec runtime libraries and core exports are present".into(),
             nvdec_h264_capability: "runtime=true wired=true".into(),
             nvdec_hevc_capability: "runtime=true wired=false".into(),
@@ -1586,7 +1656,13 @@ mod tests {
         assert_eq!(row[1], "quick.transport");
         assert_eq!(row[2], "webrtc");
         assert!(header.contains(&"quic_receiver_completed_frames"));
+        assert!(header.contains(&"render_queue_replacements"));
         assert!(header.contains(&"nvdec_hevc_main10_capability"));
+        let render_replacements_index = header
+            .iter()
+            .position(|column| *column == "render_queue_replacements")
+            .expect("render replacement column");
+        assert_eq!(row[render_replacements_index], "2");
         let failure_reason_index = header
             .iter()
             .position(|column| *column == "failure_reason")

@@ -138,3 +138,76 @@ try {
 } finally {
   Remove-Item $tmp -ErrorAction SilentlyContinue
 }
+
+$summaryTmp = Join-Path ([System.IO.Path]::GetTempPath()) ("mrd-transport-summary-run-{0}" -f ([guid]::NewGuid()))
+try {
+  New-Item -ItemType Directory -Force -Path (Join-Path $summaryTmp "logs") | Out-Null
+  New-Item -ItemType Directory -Force -Path (Join-Path $summaryTmp "reports") | Out-Null
+
+  [ordered]@{
+    run_id = "quick.transport-webrtc-test"
+    scenario = "quick.transport"
+    transport = "webrtc"
+    capture_backend = "dxgi"
+    encode_backend = "nvenc"
+    decode_backend = "nvdec"
+    renderer_backend = "d3d11_shared"
+    width = 2560
+    height = 1440
+    fps_target = 144
+    duration_secs = 20
+    session_established = $true
+    first_frame_seen = $true
+    first_frame_time_ms = 100.0
+    probe_complete = $true
+    fps_observed = 143.5
+    bitrate_kbps = 30000.0
+    keyframes = 0
+    dropped_frames = 0
+    quic_receiver_completed_frames = $null
+    quic_receiver_expired_frames = $null
+    quic_receiver_evicted_frames = $null
+    quic_receiver_duplicate_fragments = $null
+    quic_receiver_rejected_fragments = $null
+    quic_receiver_pending_frames = $null
+    quic_receiver_reassembly_drops = $null
+    zero_write_access_unit_count = 0
+    warning_count = 0
+    error_count = 0
+    restart_count = 0
+    encode_total_p95_ms = 0.4
+    send_write_p95_ms = 0.8
+    decode_total_p95_ms = 1.5
+    frame_sink_ingest_p95_ms = 2.0
+    render_upload_p95_ms = 0.2
+    render_present_p95_ms = 8.0
+    render_submitted_frames = 2849
+    render_uploaded_frames = 2841
+    render_presented_frames = 2839
+    render_present_skipped_frames = 2
+    render_queue_replacements = 7
+    render_stale_frame_drops = 7
+    failure_reason = $null
+    run_skipped = $false
+    run_passed = $true
+  } | ConvertTo-Json -Depth 8 | Set-Content -Path (Join-Path $summaryTmp "summary.json") -Encoding Ascii
+
+  [ordered]@{
+    run_id = "quick.transport-webrtc-test"
+    scenario = "quick.transport"
+    transport = "webrtc"
+    width = 2560
+    height = 1440
+    fps = 144
+    duration_secs = 20
+    git_commit = "abc123"
+  } | ConvertTo-Json -Depth 8 | Set-Content -Path (Join-Path $summaryTmp "manifest.json") -Encoding Ascii
+
+  & (Join-Path $scriptDir "summarize_transport_results.ps1") -RunDir $summaryTmp
+
+  $csv = Import-Csv (Join-Path $summaryTmp "summary.csv")
+  if ($csv.render_queue_replacements -ne "7") { throw "summary CSV must include render queue replacements" }
+  if ($csv.render_stale_frame_drops -ne "7") { throw "summary CSV must include render stale frame drops" }
+} finally {
+  Remove-Item $summaryTmp -Recurse -Force -ErrorAction SilentlyContinue
+}
