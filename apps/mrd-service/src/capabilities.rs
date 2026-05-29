@@ -51,19 +51,22 @@ pub fn peer_capability_snapshot(peer: &LanPeerInfo) -> CapabilitySnapshot {
         .iter()
         .map(|transport| format!("transport.{transport}"))
         .chain(peer.media_capabilities.iter().cloned())
-        .map(|id| CapabilityItem {
-            label: id.clone(),
-            domain: capability_domain_from_id(&id),
-            id,
-            status: CapabilityStatus::Available,
-            platform: CapabilityPlatform::Unknown,
-            reason: None,
-            detail: Some(format!("advertised by LAN peer {}", peer.device_id.0)),
-            requires: Vec::new(),
-            conflicts_with: Vec::new(),
-            depends_on: Vec::new(),
-            fallback_ids: Vec::new(),
-            last_probe_time_ms: None,
+        .map(|id| {
+            let (status, reason) = advertised_capability_status(&id);
+            CapabilityItem {
+                label: id.clone(),
+                domain: capability_domain_from_id(&id),
+                id,
+                status,
+                platform: CapabilityPlatform::Unknown,
+                reason,
+                detail: Some(format!("advertised by LAN peer {}", peer.device_id.0)),
+                requires: Vec::new(),
+                conflicts_with: Vec::new(),
+                depends_on: Vec::new(),
+                fallback_ids: Vec::new(),
+                last_probe_time_ms: None,
+            }
         })
         .collect();
 
@@ -238,6 +241,39 @@ fn capability_status_label(status: &CapabilityStatus) -> &'static str {
         CapabilityStatus::Unsupported => "unsupported",
         CapabilityStatus::Unknown => "unknown",
     }
+}
+
+fn advertised_capability_status(id: &str) -> (CapabilityStatus, Option<String>) {
+    if is_unwired_h266_software_capability(id) {
+        (
+            CapabilityStatus::Unimplemented,
+            Some(
+                "H.266/VVC software codec paths are capability-gated; VVenC/VVdeC are not wired as selectable service-owned LAN media paths."
+                    .to_string(),
+            ),
+        )
+    } else {
+        (CapabilityStatus::Available, None)
+    }
+}
+
+fn is_unwired_h266_software_capability(id: &str) -> bool {
+    let normalized = id.trim().to_ascii_lowercase().replace('-', "_");
+    matches!(
+        normalized.as_str(),
+        "software_vvc"
+            | "vvc_software"
+            | "software_h266"
+            | "h266_software"
+            | "encode.software_vvc"
+            | "encode.vvc_software"
+            | "encode.software_h266"
+            | "encode.h266_software"
+            | "decode.software_vvc"
+            | "decode.vvc_software"
+            | "decode.software_h266"
+            | "decode.h266_software"
+    )
 }
 
 fn reason(
@@ -441,6 +477,15 @@ fn add_encode_capabilities(
         "OpenH264",
         "Software encoder fallback; usable but below hardware path parity.",
     );
+    push_item(
+        items,
+        platform,
+        CapabilityDomain::Encode,
+        "encode.software_vvc",
+        "Software H.266/VVC encode",
+        CapabilityStatus::Unimplemented,
+        Some("H.266/VVC software encode is capability-gated; VVenC is not wired into the service-owned harness or LAN sender path."),
+    );
 
     let (h264_status, h264_reason) = match probe_mode {
         CapabilityProbeMode::Runtime => probe_nvenc_h264_status(platform),
@@ -519,6 +564,15 @@ fn add_decode_capabilities(
         "decode.software",
         "Software H.264 decode",
         "Software decoder fallback; usable but below hardware path parity.",
+    );
+    push_item(
+        items,
+        platform,
+        CapabilityDomain::Decode,
+        "decode.software_vvc",
+        "Software H.266/VVC decode",
+        CapabilityStatus::Unimplemented,
+        Some("H.266/VVC software decode requires the optional VVdeC lower layer and is not wired as a selectable service-owned decode path."),
     );
 
     let nvdec_status = if matches!(platform, CapabilityPlatform::Windows) {
@@ -1662,6 +1716,60 @@ mod tests {
             .expect("NVENC AV1 capability");
 
         assert_eq!(av1.status, CapabilityStatus::Unimplemented);
+    }
+
+    #[test]
+    fn h266_software_codec_paths_are_not_advertised_as_runnable() {
+        let capabilities =
+            local_capabilities(CapabilityPlatform::Windows, CapabilityProbeMode::Static);
+        let encode = capabilities
+            .iter()
+            .find(|item| item.id == "encode.software_vvc")
+            .expect("software VVC encode capability");
+        let decode = capabilities
+            .iter()
+            .find(|item| item.id == "decode.software_vvc")
+            .expect("software VVC decode capability");
+
+        assert_eq!(encode.status, CapabilityStatus::Unimplemented);
+        assert_eq!(decode.status, CapabilityStatus::Unimplemented);
+    }
+
+    #[test]
+    fn h266_peer_media_capabilities_are_not_advertised_as_runnable() {
+        let peer = LanPeerInfo {
+            device_id: mrd_proto::DeviceId("peer-vvc".to_string()),
+            device_name: "peer".to_string(),
+            device_type: "desktop".to_string(),
+            ip: "127.0.0.1".to_string(),
+            discovery_port: 0,
+            p2p_control_addr: "127.0.0.1:0".to_string(),
+            transports: vec!["quic".to_string()],
+            protocol_version: 1,
+            service_build_id: Some("test".to_string()),
+            media_protocol_version: Some(3),
+            media_capabilities: vec![
+                "encode.software_vvc".to_string(),
+                "decode.software_h266".to_string(),
+            ],
+            age_ms: 0,
+            p2p_available: true,
+        };
+
+        let snapshot = peer_capability_snapshot(&peer);
+        let encode = snapshot
+            .capabilities
+            .iter()
+            .find(|item| item.id == "encode.software_vvc")
+            .expect("peer software VVC encode capability");
+        let decode = snapshot
+            .capabilities
+            .iter()
+            .find(|item| item.id == "decode.software_h266")
+            .expect("peer software H.266 decode capability");
+
+        assert_eq!(encode.status, CapabilityStatus::Unimplemented);
+        assert_eq!(decode.status, CapabilityStatus::Unimplemented);
     }
 
     #[test]

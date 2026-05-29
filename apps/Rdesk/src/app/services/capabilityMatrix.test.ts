@@ -132,6 +132,31 @@ describe("buildCapabilitySnapshotFromEnvironment", () => {
     expect(statusOf(snapshot, "encode.nvenc_av1")).toBe("unimplemented");
   });
 
+  it("does not expose unwired H.266/VVC software codec paths as selectable legacy capabilities", () => {
+    const snapshot = buildCapabilitySnapshotFromEnvironment({
+      ...windowsEnvironment,
+      available_encoders: ["software_vvc", "vvc_software", "software_h266", "h266_software"],
+      available_decoders: ["software_vvc", "vvc_software", "software_h266", "h266_software"],
+    });
+
+    expect(statusOf(snapshot, "encode.software_vvc")).toBe("unimplemented");
+    expect(statusOf(snapshot, "encode.vvc_software")).toBe("unimplemented");
+    expect(statusOf(snapshot, "encode.software_h266")).toBe("unimplemented");
+    expect(statusOf(snapshot, "encode.h266_software")).toBe("unimplemented");
+    expect(statusOf(snapshot, "decode.software_vvc")).toBe("unimplemented");
+    expect(statusOf(snapshot, "decode.vvc_software")).toBe("unimplemented");
+    expect(statusOf(snapshot, "decode.software_h266")).toBe("unimplemented");
+    expect(statusOf(snapshot, "decode.h266_software")).toBe("unimplemented");
+    expect(capabilityOptionState(snapshot, "encoder", "software_vvc")).toBe("disabled");
+    expect(capabilityOptionState(snapshot, "decoder", "software_vvc")).toBe("disabled");
+    expect(environmentSnapshotFromCapabilitySnapshot(snapshot).available_encoders).not.toContain(
+      "software_vvc"
+    );
+    expect(environmentSnapshotFromCapabilitySnapshot(snapshot).available_decoders).not.toContain(
+      "software_vvc"
+    );
+  });
+
   it("seeds legacy fallback snapshots with the same built-in constraints as the service", () => {
     const snapshot = buildCapabilitySnapshotFromEnvironment(windowsEnvironment);
 
