@@ -2,6 +2,7 @@ $ErrorActionPreference = "Stop"
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 . (Join-Path $scriptDir "transport_matrix_common.ps1")
+$repoRoot = (Resolve-Path (Join-Path $scriptDir "..\..\..")).Path
 
 function Assert-ArrayEqual([object[]]$Actual, [object[]]$Expected, [string]$Message) {
   if ($Actual.Count -ne $Expected.Count) {
@@ -57,6 +58,66 @@ if ($null -ne $noBitrate) {
 }
 
 Assert-Throws { Get-TransportMatrixBitrateBps -Scenario ([pscustomobject]@{ bitrate_bps = 0 }) } "greater than zero" "Zero bitrate_bps must be rejected"
+
+$scenarioSpecs = @(
+  [pscustomobject]@{
+    path = "tests/benchmarks/scenarios/quick.transport.quic.openh264.h264_software.2k.json"
+    profile = "transport-quic-openh264-h264-software-2k"
+    encode = "openh264"
+    decode = "h264_software"
+  },
+  [pscustomobject]@{
+    path = "tests/benchmarks/scenarios/quick.transport.quic.openh264.ffmpeg_h264.2k.json"
+    profile = "transport-quic-openh264-ffmpeg-h264-2k"
+    encode = "openh264"
+    decode = "ffmpeg_h264"
+  },
+  [pscustomobject]@{
+    path = "tests/benchmarks/scenarios/quick.transport.quic.openh264.nvdec.2k.json"
+    profile = "transport-quic-openh264-nvdec-2k"
+    encode = "openh264"
+    decode = "nvdec"
+  },
+  [pscustomobject]@{
+    path = "tests/benchmarks/scenarios/quick.transport.quic.nvenc.nvdec.2k.json"
+    profile = "transport-quic-nvenc-nvdec-2k"
+    encode = "nvenc"
+    decode = "nvdec"
+  }
+)
+
+foreach ($spec in $scenarioSpecs) {
+  $scenarioPath = Join-Path $repoRoot $spec.path
+  if (-not (Test-Path $scenarioPath)) {
+    throw "Expected formal 2K transport scenario at $($spec.path)"
+  }
+  $scenario = Get-Content $scenarioPath -Raw | ConvertFrom-Json
+  if ($scenario.profile -ne $spec.profile) { throw "$($spec.path) profile mismatch" }
+  if ($scenario.transport -ne "quic_quinn") { throw "$($spec.path) should use quic_quinn" }
+  if ($scenario.encode_backend -ne $spec.encode) { throw "$($spec.path) encode backend mismatch" }
+  if ($scenario.decode_backend -ne $spec.decode) { throw "$($spec.path) decode backend mismatch" }
+  if ($scenario.width -ne 2560 -or $scenario.height -ne 1440) { throw "$($spec.path) should be 2560x1440" }
+  if ($scenario.fps -ne 30) { throw "$($spec.path) should target 30fps" }
+}
+
+$processTmp = Join-Path ([System.IO.Path]::GetTempPath()) ("mrd-transport-process-{0}" -f ([guid]::NewGuid()))
+New-Item -ItemType Directory -Force -Path $processTmp | Out-Null
+try {
+  $stdout = Join-Path $processTmp "stdout.log"
+  $stderr = Join-Path $processTmp "stderr.log"
+  $exitCode = Invoke-TransportMatrixCommand `
+    -FilePath "powershell" `
+    -ArgumentList @("-NoProfile", "-Command", "Write-Output 'stdout-ok'; [Console]::Error.WriteLine('stderr-ok'); exit 7") `
+    -WorkingDirectory $processTmp `
+    -StdoutPath $stdout `
+    -StderrPath $stderr
+
+  if ($exitCode -ne 7) { throw "Invoke-TransportMatrixCommand should return the native exit code" }
+  if ((Get-Content $stdout -Raw) -notmatch "stdout-ok") { throw "Invoke-TransportMatrixCommand should capture stdout" }
+  if ((Get-Content $stderr -Raw) -notmatch "stderr-ok") { throw "Invoke-TransportMatrixCommand should capture stderr" }
+} finally {
+  Remove-Item $processTmp -Recurse -Force -ErrorAction SilentlyContinue
+}
 
 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("mrd-transport-summary-{0}.json" -f ([guid]::NewGuid()))
 try {

@@ -39,6 +39,41 @@ encode/send/decode p95 latency, and NVDEC capability fields. These two scenarios
 use the same capture, transport, renderer, resolution, FPS, and duration; only the
 codec-specific encoder/decoder pair changes.
 
+2K H.264 decode comparison:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tests/benchmarks/scripts/run_transport_matrix.ps1 `
+  -ScenarioPath tests/benchmarks/scenarios/quick.transport.quic.openh264.h264_software.2k.json
+
+powershell -ExecutionPolicy Bypass -File tests/benchmarks/scripts/run_transport_matrix.ps1 `
+  -ScenarioPath tests/benchmarks/scenarios/quick.transport.quic.openh264.ffmpeg_h264.2k.json
+
+powershell -ExecutionPolicy Bypass -File tests/benchmarks/scripts/run_transport_matrix.ps1 `
+  -ScenarioPath tests/benchmarks/scenarios/quick.transport.quic.openh264.nvdec.2k.json
+```
+
+Use these scenarios when comparing decode latency under the same synthetic QUIC
+sender and OpenH264 encoder. A local run on 2026-05-28 produced:
+
+| Decoder | decode p95 | observed FPS | Notes |
+| --- | ---: | ---: | --- |
+| `h264_software` | `17.161ms` | `10.45` | Optimized I420 output; run failed only on encode p95 threshold. |
+| `ffmpeg_h264` | `5.467ms` | `11.00` | Optional CLI fallback. |
+| `nvdec` | `2.376ms` | `11.25` | Fastest decode path; still encode-bound by OpenH264. |
+
+The 2K FPS in the OpenH264 comparison is encode-bound. For a hardware 2K smoke
+comparison, run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tests/benchmarks/scripts/run_transport_matrix.ps1 `
+  -ScenarioPath tests/benchmarks/scenarios/quick.transport.quic.nvenc.nvdec.2k.json
+```
+
+For a 2K144 end-to-end hardware path, use
+`quick.transport.webrtc.nvenc.h264_nvdec.2k144.json`. A local run on 2026-05-28
+with DXGI, NVENC H.264, NVDEC, D3D11 shared textures, WebRTC, and 80Mbps observed
+`136.67fps`, with encode p95 `0.314ms` and decode p95 `1.396ms`.
+
 Paired LAN canary comparison:
 
 ```powershell

@@ -56,18 +56,15 @@ if (@($scenario.PSObject.Properties.Name) -contains "pace_to_fps") {
   Remove-Item Env:MRD_BENCH_PACE_TO_FPS -ErrorAction SilentlyContinue
 }
 
-$process = Start-Process `
+$exitCode = Invoke-TransportMatrixCommand `
   -FilePath "cargo" `
   -ArgumentList $cargoArgs `
   -WorkingDirectory $repo `
-  -RedirectStandardOutput $hostStdout `
-  -RedirectStandardError $hostStderr `
-  -WindowStyle Hidden `
-  -Wait `
-  -PassThru
+  -StdoutPath $hostStdout `
+  -StderrPath $hostStderr
 
-if ($process.ExitCode -ne 0) {
-  throw "benchmark cargo test failed with exit code $($process.ExitCode). See $hostStderr"
+if ($exitCode -ne 0) {
+  throw "benchmark cargo test failed with exit code $exitCode. See $hostStderr"
 }
 
 powershell -ExecutionPolicy Bypass -File (Join-Path $repo 'tests/benchmarks/scripts/summarize_transport_results.ps1') `

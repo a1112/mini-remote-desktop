@@ -38,6 +38,32 @@ function Get-TransportMatrixBitrateBps {
   return $null
 }
 
+function Invoke-TransportMatrixCommand {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$FilePath,
+    [string[]]$ArgumentList = @(),
+    [Parameter(Mandatory = $true)]
+    [string]$WorkingDirectory,
+    [Parameter(Mandatory = $true)]
+    [string]$StdoutPath,
+    [Parameter(Mandatory = $true)]
+    [string]$StderrPath
+  )
+
+  $previousLocation = (Get-Location).Path
+  $previousErrorActionPreference = $ErrorActionPreference
+  try {
+    Set-Location $WorkingDirectory
+    $ErrorActionPreference = "Continue"
+    & $FilePath @ArgumentList > $StdoutPath 2> $StderrPath
+    return $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $previousErrorActionPreference
+    Set-Location $previousLocation
+  }
+}
+
 function Assert-TransportMatrixSummaryPassed {
   param(
     [Parameter(Mandatory = $true)]
