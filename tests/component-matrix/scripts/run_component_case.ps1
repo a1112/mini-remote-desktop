@@ -1,10 +1,14 @@
 param(
   [Parameter(Mandatory = $true)]
   [string]$CasePath,
-  [string]$RepoRoot = "."
+  [string]$RepoRoot = ".",
+  [int]$TimeoutSeconds = 300
 )
 
 $ErrorActionPreference = "Stop"
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+. (Join-Path $scriptDir "component_matrix_common.ps1")
+
 $repo = (Resolve-Path $RepoRoot).Path
 $caseFile = Join-Path $repo $CasePath
 $case = Get-Content $caseFile -Raw | ConvertFrom-Json
@@ -40,23 +44,29 @@ $env:MRD_COMPONENT_SAMPLES = [string]$case.sample_count
 $env:MRD_COMPONENT_RESULT_PATH = $resultPath
 $env:MRD_COMPONENT_BACKEND = $case.backend
 
-$process = Start-Process `
+$result = Invoke-ComponentMatrixCommand `
   -FilePath "cargo" `
   -ArgumentList @("test", "-p", $case.crate, $case.test_name, "--", "--ignored", "--nocapture") `
   -WorkingDirectory $repo `
-  -RedirectStandardOutput $stdoutPath `
-  -RedirectStandardError $stderrPath `
-  -WindowStyle Hidden `
-  -Wait `
-  -PassThru
+  -StdoutPath $stdoutPath `
+  -StderrPath $stderrPath `
+  -TimeoutSeconds $TimeoutSeconds
 
-if ($process.ExitCode -ne 0) {
-  throw "component test failed with exit code $($process.ExitCode). See $stderrPath"
+$summaryWritten = Invoke-ComponentMatrixSummaryIfAvailable `
+  -RunDir $runDir `
+  -ThresholdPath $thresholdPath `
+  -SummarizerPath (Join-Path $repo 'tests/component-matrix/scripts/summarize_component_results.ps1')
+
+if ($result.ExitCode -ne 0) {
+  if ($result.TimedOut) {
+    throw "component test timed out after ${TimeoutSeconds}s. See $stderrPath"
+  }
+  throw "component test failed with exit code $($result.ExitCode). See $stderrPath"
 }
 
-powershell -ExecutionPolicy Bypass -File (Join-Path $repo 'tests/component-matrix/scripts/summarize_component_results.ps1') `
-  -RunDir $runDir `
-  -ThresholdPath $thresholdPath
+if (-not $summaryWritten) {
+  throw "component test did not write result.json at $resultPath"
+}
 
 Write-Output "Component case completed."
 Write-Output "Run directory: $runDir"

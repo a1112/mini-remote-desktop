@@ -378,6 +378,51 @@ describe("MatrixTestPage failure handling", () => {
     });
   });
 
+  it("prefers FFmpeg over software decode by default when NVDEC is unavailable", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(
+          windowsCapabilities({
+            available_encoders: ["openh264"],
+            available_decoders: ["software", "ffmpeg_h264"],
+            available_renderers: ["none"],
+            available_memory_modes: ["cpu"],
+          })
+        );
+      }
+      return Promise.resolve(null);
+    });
+
+    render(<MatrixTestPage />);
+
+    expect(await screen.findByLabelText("FFmpeg H.264")).toBeChecked();
+    expect(screen.getByLabelText("软件")).not.toBeChecked();
+  });
+
+  it("prefers NVDEC over software and FFmpeg decode by default when NVDEC is available", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(
+          windowsCapabilities({
+            available_encoders: ["nvenc_h264", "openh264"],
+            available_decoders: ["nvdec", "software", "ffmpeg_h264"],
+            available_renderers: ["none", "d3d11"],
+            available_memory_modes: ["cpu"],
+          })
+        );
+      }
+      return Promise.resolve(null);
+    });
+
+    render(<MatrixTestPage />);
+
+    expect(await screen.findByLabelText("NVDEC")).toBeChecked();
+    expect(screen.getByLabelText("FFmpeg H.264")).not.toBeChecked();
+    expect(screen.getByLabelText("软件")).not.toBeChecked();
+  });
+
   it("allows HEVC Main matrix runs over WebRTC RTP when decoder is compatible", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {

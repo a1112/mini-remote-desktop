@@ -4,6 +4,10 @@
   "max_encode_total_p95_ms": 8.0,
   "max_send_write_p95_ms": 8.0,
   "max_decode_total_p95_ms": 8.0,
+  "max_render_present_p95_ms": 10.0,
+  "max_render_queue_replacements": 30,
+  "max_render_stale_frame_drops": 30,
+  "max_render_present_skipped_frames": 60,
   "max_warning_count": 20,
   "max_error_count": 0
 }

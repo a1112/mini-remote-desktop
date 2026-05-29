@@ -285,6 +285,28 @@ function hasLinuxHardwareDecoder(availableDecoders: string[]): boolean {
   );
 }
 
+function shouldEnableDecoderByDefault(
+  option: MatrixOption,
+  os: HostOs,
+  availableDecoders: string[]
+): boolean {
+  const hasNvdec = availableDecoders.includes("nvdec");
+  const hasLinuxHardware = hasLinuxHardwareDecoder(availableDecoders);
+  const hasFfmpegH264 = availableDecoders.includes("ffmpeg_h264");
+
+  if (option.id === "nvdec") return hasNvdec;
+  if (option.id === "ffmpeg_h264") return !hasNvdec && !hasLinuxHardware && hasFfmpegH264;
+  if (option.id === "software") {
+    return (
+      !hasNvdec &&
+      !hasLinuxHardware &&
+      !hasFfmpegH264 &&
+      optionEnabledForOs(option, os)
+    );
+  }
+  return optionEnabledForOs(option, os);
+}
+
 function shouldEnableOptionByDefault(
   dimensionId: string,
   option: MatrixOption,
@@ -305,6 +327,9 @@ function shouldEnableOptionByDefault(
     hasLinuxHardwareDecoder(availableDecoders)
   ) {
     return false;
+  }
+  if (dimensionId === "decoder") {
+    return shouldEnableDecoderByDefault(option, os, availableDecoders);
   }
   return optionEnabledForOs(option, os);
 }

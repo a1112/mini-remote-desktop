@@ -43,8 +43,27 @@ if (-not ($summary.PSObject.Properties.Name -contains 'run_skipped')) {
   $summary | Add-Member -NotePropertyName run_skipped -NotePropertyValue $false
 }
 
+function Test-HasProperty($Object, [string]$Name) {
+  return @($Object.PSObject.Properties.Name) -contains $Name
+}
+
+function New-RateValue($Count, $DurationSecs) {
+  if ($null -eq $Count -or $null -eq $DurationSecs -or [double]$DurationSecs -le 0) {
+    return $null
+  }
+  return [Math]::Round(([double]$Count / [double]$DurationSecs), 4)
+}
+
+$summary | Add-Member -Force -NotePropertyName render_queue_replacement_rate -NotePropertyValue (New-RateValue $summary.render_queue_replacements $summary.duration_secs)
+$summary | Add-Member -Force -NotePropertyName render_stale_frame_drop_rate -NotePropertyValue (New-RateValue $summary.render_stale_frame_drops $summary.duration_secs)
+$summary | Add-Member -Force -NotePropertyName render_present_skipped_rate -NotePropertyValue (New-RateValue $summary.render_present_skipped_frames $summary.duration_secs)
+
 if ((-not $summary.run_skipped) -and $ThresholdPath -and (Test-Path $ThresholdPath)) {
   $thresholds = Get-Content $ThresholdPath -Raw | ConvertFrom-Json
+  $hasRenderPresentThreshold = Test-HasProperty $thresholds "max_render_present_p95_ms"
+  $hasRenderQueueThreshold = Test-HasProperty $thresholds "max_render_queue_replacements"
+  $hasRenderStaleThreshold = Test-HasProperty $thresholds "max_render_stale_frame_drops"
+  $hasRenderSkippedThreshold = Test-HasProperty $thresholds "max_render_present_skipped_frames"
   $summary.run_passed = (
     $summary.run_passed -and
     $summary.session_established -and
@@ -54,6 +73,10 @@ if ((-not $summary.run_skipped) -and $ThresholdPath -and (Test-Path $ThresholdPa
     (($null -eq $summary.encode_total_p95_ms) -or ($summary.encode_total_p95_ms -le $thresholds.max_encode_total_p95_ms)) -and
     (($null -eq $summary.send_write_p95_ms) -or ($summary.send_write_p95_ms -le $thresholds.max_send_write_p95_ms)) -and
     (($null -eq $summary.decode_total_p95_ms) -or ($summary.decode_total_p95_ms -le $thresholds.max_decode_total_p95_ms)) -and
+    ((-not $hasRenderPresentThreshold) -or ($null -eq $summary.render_present_p95_ms) -or ($summary.render_present_p95_ms -le $thresholds.max_render_present_p95_ms)) -and
+    ((-not $hasRenderQueueThreshold) -or ($null -eq $summary.render_queue_replacements) -or ($summary.render_queue_replacements -le $thresholds.max_render_queue_replacements)) -and
+    ((-not $hasRenderStaleThreshold) -or ($null -eq $summary.render_stale_frame_drops) -or ($summary.render_stale_frame_drops -le $thresholds.max_render_stale_frame_drops)) -and
+    ((-not $hasRenderSkippedThreshold) -or ($null -eq $summary.render_present_skipped_frames) -or ($summary.render_present_skipped_frames -le $thresholds.max_render_present_skipped_frames)) -and
     ($summary.warning_count -le $thresholds.max_warning_count) -and
     ($summary.error_count -le $thresholds.max_error_count)
   )
@@ -76,6 +99,18 @@ if ((-not $summary.run_skipped) -and $ThresholdPath -and (Test-Path $ThresholdPa
     if ($null -ne $summary.decode_total_p95_ms -and $summary.decode_total_p95_ms -gt $thresholds.max_decode_total_p95_ms) {
       $reasons += "decode p95 $($summary.decode_total_p95_ms)ms exceeded $($thresholds.max_decode_total_p95_ms)ms"
     }
+    if ($hasRenderPresentThreshold -and $null -ne $summary.render_present_p95_ms -and $summary.render_present_p95_ms -gt $thresholds.max_render_present_p95_ms) {
+      $reasons += "render present p95 $($summary.render_present_p95_ms)ms exceeded $($thresholds.max_render_present_p95_ms)ms"
+    }
+    if ($hasRenderQueueThreshold -and $null -ne $summary.render_queue_replacements -and $summary.render_queue_replacements -gt $thresholds.max_render_queue_replacements) {
+      $reasons += "render queue replacements $($summary.render_queue_replacements) exceeded $($thresholds.max_render_queue_replacements)"
+    }
+    if ($hasRenderStaleThreshold -and $null -ne $summary.render_stale_frame_drops -and $summary.render_stale_frame_drops -gt $thresholds.max_render_stale_frame_drops) {
+      $reasons += "render stale frame drops $($summary.render_stale_frame_drops) exceeded $($thresholds.max_render_stale_frame_drops)"
+    }
+    if ($hasRenderSkippedThreshold -and $null -ne $summary.render_present_skipped_frames -and $summary.render_present_skipped_frames -gt $thresholds.max_render_present_skipped_frames) {
+      $reasons += "render present skipped frames $($summary.render_present_skipped_frames) exceeded $($thresholds.max_render_present_skipped_frames)"
+    }
     if ($summary.warning_count -gt $thresholds.max_warning_count) {
       $reasons += "warning count $($summary.warning_count) exceeded $($thresholds.max_warning_count)"
     }
@@ -86,9 +121,12 @@ if ((-not $summary.run_skipped) -and $ThresholdPath -and (Test-Path $ThresholdPa
   }
 }
 
+$runStatus = if ($summary.run_skipped) { 'SKIP' } elseif ($summary.run_passed) { 'PASS' } else { 'FAIL' }
+$summary | Add-Member -Force -NotePropertyName run_status -NotePropertyValue $runStatus
 $summary | ConvertTo-Json -Depth 8 | Set-Content $summaryPath -Encoding Ascii
 
 $headers = @(
+  'run_status',
   'run_id','scenario','transport','capture_backend','encode_backend','decode_backend','renderer_backend',
   'width','height','fps_target','duration_secs','session_established','first_frame_seen','first_frame_time_ms',
   'probe_complete','fps_observed','bitrate_kbps','keyframes','dropped_frames',
@@ -99,6 +137,7 @@ $headers = @(
   'frame_sink_ingest_p95_ms','render_upload_p95_ms','render_present_p95_ms',
   'render_submitted_frames','render_uploaded_frames','render_presented_frames','render_present_skipped_frames',
   'render_queue_replacements','render_stale_frame_drops',
+  'render_queue_replacement_rate','render_stale_frame_drop_rate','render_present_skipped_rate',
   'swap_chain_waitable_object','swap_chain_present_mode','display_refresh_hz','render_thread_priority',
   'failure_reason','run_skipped','run_passed'
 )
@@ -106,7 +145,6 @@ $row = [pscustomobject]@{}
 foreach ($header in $headers) { $row | Add-Member -NotePropertyName $header -NotePropertyValue $summary.$header }
 $row | Export-Csv -Path $csvPath -NoTypeInformation -Encoding Ascii
 
-$status = if ($summary.run_skipped) { 'SKIP' } elseif ($summary.run_passed) { 'PASS' } else { 'FAIL' }
 $report = @(
   "# Transport Benchmark Report",
   "",
@@ -119,7 +157,7 @@ $report = @(
   "",
   "## Result",
   "",
-  "- Status: $status",
+  "- Status: $($summary.run_status)",
   "- Skipped: $($summary.run_skipped)",
   "- Session established: $($summary.session_established)",
   "- First frame seen: $($summary.first_frame_seen)",
@@ -145,6 +183,9 @@ $report = @(
   "| render_present_skipped_frames | $($summary.render_present_skipped_frames) |",
   "| render_queue_replacements | $($summary.render_queue_replacements) |",
   "| render_stale_frame_drops | $($summary.render_stale_frame_drops) |",
+  "| render_queue_replacement_rate | $($summary.render_queue_replacement_rate) |",
+  "| render_stale_frame_drop_rate | $($summary.render_stale_frame_drop_rate) |",
+  "| render_present_skipped_rate | $($summary.render_present_skipped_rate) |",
   "| swap_chain_waitable_object | $($summary.swap_chain_waitable_object) |",
   "| swap_chain_present_mode | $($summary.swap_chain_present_mode) |",
   "| display_refresh_hz | $($summary.display_refresh_hz) |",

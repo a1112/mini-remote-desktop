@@ -35,9 +35,24 @@ powershell -ExecutionPolicy Bypass -File tests/benchmarks/scripts/run_transport_
 ```
 
 Compare the generated `summary.json` files for observed FPS, bitrate, keyframes,
-encode/send/decode p95 latency, and NVDEC capability fields. These two scenarios
-use the same capture, transport, renderer, resolution, FPS, and duration; only the
+encode/send/decode/render p95 latency, render queue replacement/drop counters,
+swapchain present mode, and NVDEC capability fields. These two scenarios use the
+same capture, transport, renderer, resolution, FPS, and duration; only the
 codec-specific encoder/decoder pair changes.
+
+D3D11 waitable-object render pacing comparison:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tests/benchmarks/scripts/run_transport_matrix.ps1 `
+  -ScenarioPath tests/benchmarks/scenarios/quick.transport.webrtc.nvenc.h264_nvdec.2k144.waitable.json
+
+powershell -ExecutionPolicy Bypass -File tests/benchmarks/scripts/run_transport_matrix.ps1 `
+  -ScenarioPath tests/benchmarks/scenarios/quick.transport.webrtc.nvenc.hevc_nvdec.2k144.waitable.json
+```
+
+These scenarios set `MRD_D3D11_RENDER_WAITABLE_OBJECT=1` and
+`MRD_RENDER_THREAD_PRIORITY=above_normal` through the scenario file rather than
+requiring shell-local environment variables.
 
 2K H.264 decode comparison:
 
@@ -58,7 +73,7 @@ sender and OpenH264 encoder. A local run on 2026-05-28 produced:
 | Decoder | decode p95 | observed FPS | Notes |
 | --- | ---: | ---: | --- |
 | `h264_software` | `17.161ms` | `10.45` | Optimized I420 output; run failed only on encode p95 threshold. |
-| `ffmpeg_h264` | `5.467ms` | `11.00` | Optional CLI fallback. |
+| `ffmpeg_h264` | `5.467ms` | `11.00` | Optional CLI fallback; prefer `measured_throughput_fps` in FFmpeg compare artifacts. |
 | `nvdec` | `2.376ms` | `11.25` | Fastest decode path; still encode-bound by OpenH264. |
 
 The 2K FPS in the OpenH264 comparison is encode-bound. For a hardware 2K smoke

@@ -38,6 +38,23 @@ function Get-TransportMatrixBitrateBps {
   return $null
 }
 
+function Get-TransportMatrixRenderEnvironment {
+  param([object]$Scenario)
+
+  $result = @{}
+  $propertyNames = @($Scenario.PSObject.Properties.Name)
+  if ($propertyNames -contains "d3d11_waitable_object") {
+    $result.MRD_D3D11_RENDER_WAITABLE_OBJECT = if ($Scenario.d3d11_waitable_object) { "1" } else { "0" }
+  }
+  if (
+    $propertyNames -contains "render_thread_priority" -and
+    -not [string]::IsNullOrWhiteSpace([string]$Scenario.render_thread_priority)
+  ) {
+    $result.MRD_RENDER_THREAD_PRIORITY = [string]$Scenario.render_thread_priority
+  }
+  return $result
+}
+
 function Invoke-TransportMatrixCommand {
   param(
     [Parameter(Mandatory = $true)]

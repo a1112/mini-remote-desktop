@@ -24,18 +24,30 @@ fn perf_ffmpeg_decode_compare_reports_results() {
     let access_units = generate_h264_access_units(width, height, fps, samples);
     let encoded_frame_count = access_units.len();
     assert!(encoded_frame_count > 0, "OpenH264 produced no access units");
+    let warmup_frames = env_usize("MRD_FFMPEG_PERF_WARMUP_FRAMES")
+        .unwrap_or(5)
+        .min(encoded_frame_count.saturating_sub(1));
+    let measured_frame_count = encoded_frame_count.saturating_sub(warmup_frames);
     let input_path = artifact_dir.join(format!(
         "openh264-{width}x{height}-requested{samples}-encoded{encoded_frame_count}.h264"
     ));
     write_h264_stream(&input_path, &access_units);
+    let warmup_access_units = &access_units[..warmup_frames];
+    let measured_access_units = &access_units[warmup_frames..];
+    let measured_input_path = artifact_dir.join(format!(
+        "openh264-{width}x{height}-measured{measured_frame_count}.h264"
+    ));
+    write_h264_stream(&measured_input_path, measured_access_units);
 
-    let software = run_mrd_decoder("h264_software", &access_units);
-    let nvdec = run_mrd_decoder("nvdec", &access_units);
+    let software = run_mrd_decoder("h264_software", warmup_access_units, measured_access_units);
+    let nvdec = run_mrd_decoder("nvdec", warmup_access_units, measured_access_units);
     let ffmpeg_rgb24 = run_ffmpeg_decoder(
         "ffmpeg_cli_rgb24",
         &ffmpeg,
         &input_path,
         encoded_frame_count,
+        warmup_frames,
+        measured_frame_count,
         "rgb24",
     );
     let ffmpeg_nv12 = run_ffmpeg_decoder(
@@ -43,6 +55,8 @@ fn perf_ffmpeg_decode_compare_reports_results() {
         &ffmpeg,
         &input_path,
         encoded_frame_count,
+        warmup_frames,
+        measured_frame_count,
         "nv12",
     );
 
@@ -53,9 +67,27 @@ fn perf_ffmpeg_decode_compare_reports_results() {
         "requested_sample_count": samples,
         "sample_count": encoded_frame_count,
         "encoded_frame_count": encoded_frame_count,
+        "warmup_frames": warmup_frames,
+        "measured_frame_count": measured_frame_count,
         "input_path": input_path,
         "backends": [software, nvdec, ffmpeg_rgb24, ffmpeg_nv12],
     });
+    for backend in report["backends"].as_array().expect("backend array") {
+        assert!(
+            backend.get("measured_throughput_fps").is_some(),
+            "backend must expose measured_throughput_fps: {backend}"
+        );
+        assert_eq!(
+            backend.get("warmup_frames"),
+            Some(&json!(warmup_frames)),
+            "backend must expose warmup_frames: {backend}"
+        );
+        assert_eq!(
+            backend.get("measured_frames"),
+            Some(&json!(measured_frame_count)),
+            "backend must expose measured_frames: {backend}"
+        );
+    }
     let report_path = artifact_dir.join("ffmpeg-decode-compare.json");
     fs::write(
         &report_path,
@@ -111,7 +143,11 @@ fn write_h264_stream(path: &Path, access_units: &[Vec<u8>]) {
     fs::write(path, bytes).expect("write h264 stream");
 }
 
-fn run_mrd_decoder(id: &str, access_units: &[Vec<u8>]) -> serde_json::Value {
+fn run_mrd_decoder(
+    id: &str,
+    warmup_access_units: &[Vec<u8>],
+    measured_access_units: &[Vec<u8>],
+) -> serde_json::Value {
     let mut decoder = match create_decoder(id) {
         Ok(decoder) => decoder,
         Err(error) => {
@@ -119,20 +155,40 @@ fn run_mrd_decoder(id: &str, access_units: &[Vec<u8>]) -> serde_json::Value {
                 "backend": id,
                 "available": false,
                 "error": error.to_string(),
+                "warmup_frames": warmup_access_units.len(),
+                "measured_frames": 0,
+                "measured_throughput_fps": 0.0,
             });
         }
     };
 
-    let started = Instant::now();
-    let mut decoded_frames = 0_usize;
-    let mut errors = 0_usize;
-    for access_unit in access_units {
+    let total_started = Instant::now();
+    let warmup_started = Instant::now();
+    let mut warmup_decoded_frames = 0_usize;
+    let mut warmup_errors = 0_usize;
+    for access_unit in warmup_access_units {
         match decoder.push_access_unit(access_unit) {
-            Ok(()) => decoded_frames += decoder.drain_decoded_frames().len(),
-            Err(_) => errors += 1,
+            Ok(()) => warmup_decoded_frames += decoder.drain_decoded_frames().len(),
+            Err(_) => warmup_errors += 1,
         }
     }
-    let elapsed_s = started.elapsed().as_secs_f64();
+    warmup_decoded_frames += decoder.drain_decoded_frames().len();
+    let warmup_elapsed_s = warmup_started.elapsed().as_secs_f64();
+
+    let measured_started = Instant::now();
+    let mut measured_decoded_frames = 0_usize;
+    let mut measured_errors = 0_usize;
+    for access_unit in measured_access_units {
+        match decoder.push_access_unit(access_unit) {
+            Ok(()) => measured_decoded_frames += decoder.drain_decoded_frames().len(),
+            Err(_) => measured_errors += 1,
+        }
+    }
+    measured_decoded_frames += decoder.drain_decoded_frames().len();
+    let measured_elapsed_s = measured_started.elapsed().as_secs_f64();
+    let elapsed_s = total_started.elapsed().as_secs_f64();
+    let decoded_frames = warmup_decoded_frames + measured_decoded_frames;
+    let errors = warmup_errors + measured_errors;
     json!({
         "backend": id,
         "available": true,
@@ -140,6 +196,15 @@ fn run_mrd_decoder(id: &str, access_units: &[Vec<u8>]) -> serde_json::Value {
         "errors": errors,
         "elapsed_s": elapsed_s,
         "throughput_fps": decoded_frames as f64 / elapsed_s.max(f64::EPSILON),
+        "warmup_frames": warmup_access_units.len(),
+        "warmup_decoded_frames": warmup_decoded_frames,
+        "warmup_errors": warmup_errors,
+        "warmup_elapsed_s": warmup_elapsed_s,
+        "measured_frames": measured_access_units.len(),
+        "measured_decoded_frames": measured_decoded_frames,
+        "measured_errors": measured_errors,
+        "measured_elapsed_s": measured_elapsed_s,
+        "measured_throughput_fps": measured_decoded_frames as f64 / measured_elapsed_s.max(f64::EPSILON),
     })
 }
 
@@ -148,6 +213,8 @@ fn run_ffmpeg_decoder(
     ffmpeg: &Path,
     input_path: &Path,
     expected_frames: usize,
+    warmup_frames: usize,
+    measured_frames: usize,
     pixel_format: &str,
 ) -> serde_json::Value {
     if !ffmpeg.is_file() {
@@ -155,6 +222,9 @@ fn run_ffmpeg_decoder(
             "backend": backend,
             "available": false,
             "error": format!("ffmpeg executable not found: {}", ffmpeg.display()),
+            "warmup_frames": warmup_frames,
+            "measured_frames": 0,
+            "measured_throughput_fps": 0.0,
         });
     }
 
@@ -183,6 +253,11 @@ fn run_ffmpeg_decoder(
         "elapsed_s": elapsed_s,
         "pixel_format": pixel_format,
         "throughput_fps": if output.status.success() { expected_frames as f64 / elapsed_s.max(f64::EPSILON) } else { 0.0 },
+        "warmup_frames": warmup_frames,
+        "warmup_elapsed_s": serde_json::Value::Null,
+        "measured_frames": if output.status.success() { measured_frames } else { 0 },
+        "measured_elapsed_s": elapsed_s,
+        "measured_throughput_fps": if output.status.success() { measured_frames as f64 / elapsed_s.max(f64::EPSILON) } else { 0.0 },
         "error": if output.status.success() { serde_json::Value::Null } else { json!(stderr) },
         "path": ffmpeg,
     })

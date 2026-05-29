@@ -59,28 +59,50 @@ if ($null -ne $noBitrate) {
 
 Assert-Throws { Get-TransportMatrixBitrateBps -Scenario ([pscustomobject]@{ bitrate_bps = 0 }) } "greater than zero" "Zero bitrate_bps must be rejected"
 
+$renderEnv = Get-TransportMatrixRenderEnvironment -Scenario ([pscustomobject]@{
+  d3d11_waitable_object = $true
+  render_thread_priority = "above_normal"
+})
+if ($renderEnv.MRD_D3D11_RENDER_WAITABLE_OBJECT -ne "1") { throw "waitable render scenario should set waitable env" }
+if ($renderEnv.MRD_RENDER_THREAD_PRIORITY -ne "above_normal") { throw "render scenario should set thread priority env" }
+
+$defaultRenderEnv = Get-TransportMatrixRenderEnvironment -Scenario ([pscustomobject]@{ profile = "default" })
+if ($defaultRenderEnv.ContainsKey("MRD_D3D11_RENDER_WAITABLE_OBJECT")) { throw "default scenario should not set waitable env" }
+if ($defaultRenderEnv.ContainsKey("MRD_RENDER_THREAD_PRIORITY")) { throw "default scenario should not set render priority env" }
+
 $scenarioSpecs = @(
   [pscustomobject]@{
     path = "tests/benchmarks/scenarios/quick.transport.quic.openh264.h264_software.2k.json"
     profile = "transport-quic-openh264-h264-software-2k"
+    transport = "quic_quinn"
     encode = "openh264"
     decode = "h264_software"
   },
   [pscustomobject]@{
     path = "tests/benchmarks/scenarios/quick.transport.quic.openh264.ffmpeg_h264.2k.json"
     profile = "transport-quic-openh264-ffmpeg-h264-2k"
+    transport = "quic_quinn"
     encode = "openh264"
     decode = "ffmpeg_h264"
   },
   [pscustomobject]@{
     path = "tests/benchmarks/scenarios/quick.transport.quic.openh264.nvdec.2k.json"
     profile = "transport-quic-openh264-nvdec-2k"
+    transport = "quic_quinn"
     encode = "openh264"
     decode = "nvdec"
   },
   [pscustomobject]@{
     path = "tests/benchmarks/scenarios/quick.transport.quic.nvenc.nvdec.2k.json"
     profile = "transport-quic-nvenc-nvdec-2k"
+    transport = "quic_quinn"
+    encode = "nvenc"
+    decode = "nvdec"
+  },
+  [pscustomobject]@{
+    path = "tests/benchmarks/scenarios/quick.transport.webrtc.nvenc.h264_nvdec.2k144.waitable.json"
+    profile = "transport-webrtc-nvenc-h264-nvdec-2k144-waitable"
+    transport = "webrtc"
     encode = "nvenc"
     decode = "nvdec"
   }
@@ -93,11 +115,17 @@ foreach ($spec in $scenarioSpecs) {
   }
   $scenario = Get-Content $scenarioPath -Raw | ConvertFrom-Json
   if ($scenario.profile -ne $spec.profile) { throw "$($spec.path) profile mismatch" }
-  if ($scenario.transport -ne "quic_quinn") { throw "$($spec.path) should use quic_quinn" }
+  if ($scenario.transport -ne $spec.transport) { throw "$($spec.path) should use $($spec.transport)" }
   if ($scenario.encode_backend -ne $spec.encode) { throw "$($spec.path) encode backend mismatch" }
   if ($scenario.decode_backend -ne $spec.decode) { throw "$($spec.path) decode backend mismatch" }
   if ($scenario.width -ne 2560 -or $scenario.height -ne 1440) { throw "$($spec.path) should be 2560x1440" }
-  if ($scenario.fps -ne 30) { throw "$($spec.path) should target 30fps" }
+  if ($spec.path -like "*.2k144.waitable.json") {
+    if ($scenario.fps -ne 144) { throw "$($spec.path) should target 144fps" }
+    if (-not $scenario.d3d11_waitable_object) { throw "$($spec.path) should enable waitable object" }
+    if ($scenario.render_thread_priority -ne "above_normal") { throw "$($spec.path) should set render thread priority" }
+  } elseif ($scenario.fps -ne 30) {
+    throw "$($spec.path) should target 30fps"
+  }
 }
 
 $processTmp = Join-Path ([System.IO.Path]::GetTempPath()) ("mrd-transport-process-{0}" -f ([guid]::NewGuid()))
@@ -210,12 +238,39 @@ try {
   & (Join-Path $scriptDir "summarize_transport_results.ps1") -RunDir $summaryTmp
 
   $csv = Import-Csv (Join-Path $summaryTmp "summary.csv")
+  if ($csv.run_status -ne "PASS") { throw "summary CSV must expose PASS run_status" }
   if ($csv.render_queue_replacements -ne "7") { throw "summary CSV must include render queue replacements" }
   if ($csv.render_stale_frame_drops -ne "7") { throw "summary CSV must include render stale frame drops" }
+  if ($csv.render_queue_replacement_rate -ne "0.35") { throw "summary CSV must include render queue replacement rate" }
+  if ($csv.render_stale_frame_drop_rate -ne "0.35") { throw "summary CSV must include render stale frame drop rate" }
+  if ($csv.render_present_skipped_rate -ne "0.1") { throw "summary CSV must include render skipped frame rate" }
   if ($csv.swap_chain_present_mode -ne "waitable") { throw "summary CSV must include swapchain present mode" }
   if ($csv.display_refresh_hz -ne "144") { throw "summary CSV must include display refresh hz" }
   $report = Get-Content (Join-Path $summaryTmp "reports/markdown-report.md") -Raw
   if ($report -notmatch "swap_chain_present_mode \\| waitable") { throw "markdown report must include swapchain present mode" }
+
+  $thresholdPath = Join-Path $summaryTmp "strict-thresholds.json"
+  [ordered]@{
+    max_first_frame_time_ms = 5000
+    min_fps_observed = 120.0
+    max_encode_total_p95_ms = 8.0
+    max_send_write_p95_ms = 8.0
+    max_decode_total_p95_ms = 8.0
+    max_render_present_p95_ms = 7.0
+    max_render_queue_replacements = 3
+    max_render_stale_frame_drops = 3
+    max_render_present_skipped_frames = 1
+    max_warning_count = 20
+    max_error_count = 0
+  } | ConvertTo-Json -Depth 8 | Set-Content -Path $thresholdPath -Encoding Ascii
+
+  & (Join-Path $scriptDir "summarize_transport_results.ps1") -RunDir $summaryTmp -ThresholdPath $thresholdPath
+  $strict = Get-Content (Join-Path $summaryTmp "summary.json") -Raw | ConvertFrom-Json
+  if ($strict.run_passed) { throw "strict render threshold should fail the summary" }
+  if ($strict.failure_reason -notmatch "render present p95") { throw "failure reason should include render present threshold" }
+  if ($strict.failure_reason -notmatch "render queue replacements") { throw "failure reason should include render queue replacement threshold" }
+  $strictCsv = Import-Csv (Join-Path $summaryTmp "summary.csv")
+  if ($strictCsv.run_status -ne "FAIL") { throw "strict threshold CSV should expose FAIL run_status" }
 } finally {
   Remove-Item $summaryTmp -Recurse -Force -ErrorAction SilentlyContinue
 }

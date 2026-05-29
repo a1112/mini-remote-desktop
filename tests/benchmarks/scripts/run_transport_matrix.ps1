@@ -55,6 +55,14 @@ if (@($scenario.PSObject.Properties.Name) -contains "pace_to_fps") {
 } else {
   Remove-Item Env:MRD_BENCH_PACE_TO_FPS -ErrorAction SilentlyContinue
 }
+$renderEnvironment = Get-TransportMatrixRenderEnvironment -Scenario $scenario
+foreach ($key in @("MRD_D3D11_RENDER_WAITABLE_OBJECT", "MRD_RENDER_THREAD_PRIORITY")) {
+  if ($renderEnvironment.ContainsKey($key)) {
+    Set-Item -Path "Env:$key" -Value $renderEnvironment[$key]
+  } else {
+    Remove-Item -Path "Env:$key" -ErrorAction SilentlyContinue
+  }
+}
 
 $exitCode = Invoke-TransportMatrixCommand `
   -FilePath "cargo" `
