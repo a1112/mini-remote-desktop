@@ -380,6 +380,14 @@ pub struct HarnessMetrics {
 }
 
 impl HarnessMetrics {
+    pub fn observed_fps(&self) -> f64 {
+        if self.decoded_fps > 0.0 {
+            self.decoded_fps
+        } else {
+            self.capture_fps
+        }
+    }
+
     pub fn to_pipeline_comparison_result(
         &self,
         pipeline: impl Into<String>,
@@ -406,7 +414,7 @@ impl HarnessMetrics {
             )
             .with_transport_stage_ms(nonzero_ms(self.transport_latency_avg_ms))
             .with_total_time_ms(nonzero_ms(self.total_latency_avg_ms))
-            .with_avg_fps(nonzero_ms(self.capture_fps))
+            .with_avg_fps(nonzero_ms(self.observed_fps()))
             .with_total_bitstream_bytes(self.total_bitstream_bytes as u64)
     }
 }
@@ -4641,6 +4649,24 @@ mod tests {
         assert_eq!(result.avg_total_time_ms, Some(5.25));
         assert_eq!(result.avg_fps, Some(228.0));
         assert_eq!(result.total_bitstream_bytes, 5_000_000);
+    }
+
+    #[test]
+    fn harness_metrics_export_prefers_decoded_fps_for_receiver_observed_fps() {
+        let metrics = HarnessMetrics {
+            capture_fps: 144.0,
+            decoded_fps: 118.0,
+            ..HarnessMetrics::default()
+        };
+
+        let result = metrics.to_pipeline_comparison_result(
+            "capture-encode-decode-render",
+            "h264",
+            "d3d11-shared",
+            "webrtc",
+        );
+
+        assert_eq!(result.avg_fps, Some(118.0));
     }
 
     #[test]

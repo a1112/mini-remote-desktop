@@ -307,6 +307,8 @@ pub struct TestRunSummary {
     pub total_duration_ms: u64,
     pub first_frame_latency_ms: Option<f64>,
     pub capture_fps: Option<f64>,
+    pub observed_fps: Option<f64>,
+    pub decoded_fps: Option<f64>,
     pub encode_latency_p50: Option<f64>,
     pub encode_latency_p95: Option<f64>,
     pub transport_latency_p50: Option<f64>,
@@ -316,6 +318,10 @@ pub struct TestRunSummary {
     pub total_latency_p95: Option<f64>,
     pub dropped_frames: usize,
     pub frame_count: usize,
+    pub decoded_frames: usize,
+    pub render_presented_frames: u64,
+    pub render_present_skipped_frames: u64,
+    pub render_present_gap_p95_ms: Option<f64>,
     pub error_message: Option<String>,
     pub failure_reason: Option<String>,
     pub cpu_p95_percent: Option<f64>,
@@ -1271,6 +1277,27 @@ impl TestOrchestrator {
                         timestamp,
                         metrics.capture_fps,
                     );
+                    let observed_fps = metrics.observed_fps();
+                    let timestamp =
+                        push_metric_sample(run_series, "observed_fps", "fps", observed_fps);
+                    append_metric_to_store(
+                        &telemetry_store,
+                        &run_id_clone,
+                        "observed_fps",
+                        "fps",
+                        timestamp,
+                        observed_fps,
+                    );
+                    let timestamp =
+                        push_metric_sample(run_series, "decoded_fps", "fps", metrics.decoded_fps);
+                    append_metric_to_store(
+                        &telemetry_store,
+                        &run_id_clone,
+                        "decoded_fps",
+                        "fps",
+                        timestamp,
+                        metrics.decoded_fps,
+                    );
                     let timestamp = push_metric_sample(
                         run_series,
                         "encode_latency_p95_ms",
@@ -1312,6 +1339,20 @@ impl TestOrchestrator {
                         "ms",
                         timestamp,
                         metrics.decode_latency_p95_ms,
+                    );
+                    let timestamp = push_metric_sample(
+                        run_series,
+                        "render_present_gap_p95_ms",
+                        "ms",
+                        metrics.render_present_gap_p95_ms,
+                    );
+                    append_metric_to_store(
+                        &telemetry_store,
+                        &run_id_clone,
+                        "render_present_gap_p95_ms",
+                        "ms",
+                        timestamp,
+                        metrics.render_present_gap_p95_ms,
                     );
                     let timestamp = push_metric_sample(
                         run_series,
@@ -1539,6 +1580,7 @@ impl TestOrchestrator {
                         run.summary = Some(TestRunSummary {
                             total_duration_ms: now_ms().saturating_sub(run.started_at),
                             capture_fps: Some(result.fps),
+                            observed_fps: Some(result.fps),
                             total_latency_p95: Some(result.p95_frame_time_ms),
                             frame_count: result.frames_presented,
                             ..Default::default()
@@ -2664,6 +2706,8 @@ impl TestOrchestrator {
                 run.summary = Some(TestRunSummary {
                     total_duration_ms: now_ms() - run.started_at,
                     capture_fps: Some(metrics.capture_fps),
+                    observed_fps: Some(metrics.observed_fps()),
+                    decoded_fps: Some(metrics.decoded_fps),
                     encode_latency_p50: Some(metrics.encode_latency_p50_ms),
                     encode_latency_p95: Some(metrics.encode_latency_p95_ms),
                     transport_latency_p50: Some(metrics.transport_latency_p50_ms),
@@ -2673,6 +2717,10 @@ impl TestOrchestrator {
                     total_latency_p95: Some(metrics.total_latency_p95_ms),
                     dropped_frames: metrics.dropped_frames,
                     frame_count: metrics.frame_count,
+                    decoded_frames: metrics.decoded_frames,
+                    render_presented_frames: metrics.render_presented_frames,
+                    render_present_skipped_frames: metrics.render_present_skipped_frames,
+                    render_present_gap_p95_ms: Some(metrics.render_present_gap_p95_ms),
                     ..Default::default()
                 });
             }
@@ -3716,6 +3764,8 @@ impl Default for TestRunSummary {
             total_duration_ms: 0,
             first_frame_latency_ms: None,
             capture_fps: None,
+            observed_fps: None,
+            decoded_fps: None,
             encode_latency_p50: None,
             encode_latency_p95: None,
             transport_latency_p50: None,
@@ -3725,6 +3775,10 @@ impl Default for TestRunSummary {
             total_latency_p95: None,
             dropped_frames: 0,
             frame_count: 0,
+            decoded_frames: 0,
+            render_presented_frames: 0,
+            render_present_skipped_frames: 0,
+            render_present_gap_p95_ms: None,
             error_message: None,
             failure_reason: None,
             cpu_p95_percent: None,
@@ -3739,6 +3793,8 @@ fn summary_from_metrics(started_at: u64, metrics: &HarnessMetrics) -> TestRunSum
     TestRunSummary {
         total_duration_ms: now_ms().saturating_sub(started_at),
         capture_fps: Some(metrics.capture_fps),
+        observed_fps: Some(metrics.observed_fps()),
+        decoded_fps: Some(metrics.decoded_fps),
         encode_latency_p50: Some(metrics.encode_latency_p50_ms),
         encode_latency_p95: Some(metrics.encode_latency_p95_ms),
         transport_latency_p50: Some(metrics.transport_latency_p50_ms),
@@ -3748,6 +3804,10 @@ fn summary_from_metrics(started_at: u64, metrics: &HarnessMetrics) -> TestRunSum
         total_latency_p95: Some(metrics.total_latency_p95_ms),
         dropped_frames: metrics.dropped_frames,
         frame_count: metrics.frame_count,
+        decoded_frames: metrics.decoded_frames,
+        render_presented_frames: metrics.render_presented_frames,
+        render_present_skipped_frames: metrics.render_present_skipped_frames,
+        render_present_gap_p95_ms: Some(metrics.render_present_gap_p95_ms),
         error_message: metrics.error_message.clone(),
         ..Default::default()
     }
@@ -4349,6 +4409,29 @@ mod tests {
         let summary = run.summary.expect("completed run should include summary");
         assert!(summary.frame_count > 0);
         assert!(summary.capture_fps.unwrap_or_default() > 0.0);
+    }
+
+    #[test]
+    fn summary_from_metrics_exposes_receiver_and_render_pacing_metrics() {
+        let metrics = HarnessMetrics {
+            capture_fps: 144.0,
+            decoded_fps: 118.0,
+            decoded_frames: 1_180,
+            render_presented_frames: 1_170,
+            render_present_skipped_frames: 3,
+            render_present_gap_p95_ms: 7.4,
+            ..HarnessMetrics::default()
+        };
+
+        let summary = summary_from_metrics(now_ms(), &metrics);
+
+        assert_eq!(summary.capture_fps, Some(144.0));
+        assert_eq!(summary.observed_fps, Some(118.0));
+        assert_eq!(summary.decoded_fps, Some(118.0));
+        assert_eq!(summary.decoded_frames, 1_180);
+        assert_eq!(summary.render_presented_frames, 1_170);
+        assert_eq!(summary.render_present_skipped_frames, 3);
+        assert_eq!(summary.render_present_gap_p95_ms, Some(7.4));
     }
 
     #[cfg(any(windows, target_os = "macos"))]

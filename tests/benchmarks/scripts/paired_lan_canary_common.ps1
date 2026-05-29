@@ -294,6 +294,7 @@ function Convert-LocalSummaryToCanaryRow {
   $status = if ($Summary.run_passed) { "completed" } else { "failed" }
   $classification = if ($Summary.run_passed) { "completed" } elseif ($Summary.fps_observed -lt ($Profile.fps * 0.8)) { "threshold_miss" } else { "failed" }
   $localDropped = [int64](Select-CanaryValue $Summary.dropped_frames 0)
+  $renderPresentP95 = Select-CanaryValue $Summary.render_present_p95_ms $null
 
   [pscustomobject]@{
     id = $Profile.id
@@ -320,17 +321,20 @@ function Convert-LocalSummaryToCanaryRow {
     sample_sequence_gap_drops = $null
     sample_decode_error_drops = $null
     sample_transient_drops = $null
-    render_queue_replacements = 0
-    render_stale_frame_drops = 0
-    render_lock_drops = 0
-    render_present_skips = 0
+    render_queue_replacements = [int64](Select-CanaryValue $Summary.render_queue_replacements 0)
+    render_stale_frame_drops = [int64](Select-CanaryValue $Summary.render_stale_frame_drops 0)
+    render_lock_drops = [int64](Select-CanaryValue $Summary.render_lock_drops 0)
+    render_present_skips = [int64](Select-CanaryValue $Summary.render_present_skipped_frames 0)
+    render_presented_frames = [int64](Select-CanaryValue $Summary.render_presented_frames 0)
+    render_present_gap_p95_ms = [double](Select-CanaryValue $renderPresentP95 0)
     queue_depth = $null
     stage_p95_ms = [pscustomobject]@{
       encode = $Summary.encode_total_p95_ms
       transport = $Summary.send_write_p95_ms
       decode = $Summary.decode_total_p95_ms
       render_upload = $Summary.render_upload_p95_ms
-      present = $Summary.render_present_p95_ms
+      render_present_gap = $renderPresentP95
+      present = $renderPresentP95
     }
     raw_summary_path = $SummaryPath
     capture_source_summary = "local / dxgi / $($Summary.width)x$($Summary.height) / single-process baseline"

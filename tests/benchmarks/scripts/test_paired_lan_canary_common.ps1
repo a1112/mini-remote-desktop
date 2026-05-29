@@ -57,6 +57,30 @@ Assert-Equal $h264CrossChain "dxgi/nvenc_h264/quic_datagram_media_v3_or_v2/nvdec
 $hevcCrossChain = New-CanaryMediaChain -Mode "cross" -Codec "hevc"
 Assert-Equal $hevcCrossChain "dxgi/nvenc_hevc/quic_datagram_media_v3_or_v2/nvdec_hevc_d3d11_shared/d3d11_shared" "HEVC cross chain uses HEVC encode/decode labels"
 
+$localSummaryRow = Convert-LocalSummaryToCanaryRow `
+  -Profile ([pscustomobject]@{ id = "2k144"; width = 2560; height = 1440; fps = 144; bitrate_mbps = 80; duration_secs = 20 }) `
+  -Summary ([pscustomobject]@{
+    run_passed = $true
+    fps_observed = 143.4
+    width = 2560
+    height = 1440
+    fps_target = 144
+    session_established = $true
+    first_frame_seen = $true
+    first_frame_time_ms = 81.0
+    dropped_frames = 0
+    encode_total_p95_ms = 0.36
+    send_write_p95_ms = 1.72
+    decode_total_p95_ms = 1.41
+    frame_sink_ingest_p95_ms = 4.0
+    render_upload_p95_ms = 0.25
+    render_present_p95_ms = 8.01
+  }) `
+  -SummaryPath "raw/local-2k144.json"
+Assert-Equal $localSummaryRow.stage_p95_ms.'render_present_gap' 8.01 "Local summary exposes render present as canonical present-gap P95"
+Assert-Equal $localSummaryRow.render_present_gap_p95_ms 8.01 "Local summary carries render_present_gap_p95_ms for reports"
+Assert-Equal $localSummaryRow.stage_p95_ms.present 8.01 "Local summary keeps present P95 compatibility alias"
+
 $localRow = [pscustomobject]@{
   id = "1080p144"
   width = 1920
