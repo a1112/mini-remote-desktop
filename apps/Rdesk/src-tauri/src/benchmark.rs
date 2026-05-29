@@ -748,10 +748,13 @@ mod tests {
         let first_frame_seen =
             first_frame_time_ms.is_some() || metrics.decoded_frames > 0 || metrics.frame_count > 0;
         let probe = probe_from_metrics(manifest, session_id, &metrics, bitrate_kbps);
+        let render_probe_complete = manifest.renderer_backend == "none"
+            || (metrics.render_latency_p95_ms > 0.0 && metrics.render_present_gap_p95_ms > 0.0);
         let probe_complete = metrics.encoded_units > 0
             && metrics.decoded_frames > 0
             && metrics.encode_latency_p95_ms > 0.0
-            && metrics.decode_latency_p95_ms > 0.0;
+            && metrics.decode_latency_p95_ms > 0.0
+            && render_probe_complete;
         let failure_reason = harness_failure_reason(&metrics, first_frame_time_ms, probe_complete);
         let run_passed = first_frame_seen
             && probe_complete
@@ -775,7 +778,7 @@ mod tests {
             first_frame_seen,
             first_frame_time_ms,
             probe_complete,
-            fps_observed: metrics.decoded_fps.max(metrics.capture_fps),
+            fps_observed: observed_fps_for_summary(manifest, &metrics),
             bitrate_kbps,
             keyframes: 0,
             dropped_frames: metrics.dropped_frames as u64,
@@ -794,8 +797,8 @@ mod tests {
             send_write_p95_ms: nonzero_option(metrics.transport_latency_p95_ms),
             decode_total_p95_ms: nonzero_option(metrics.decode_latency_p95_ms),
             frame_sink_ingest_p95_ms: nonzero_option(metrics.interactive_latency_p95_ms),
-            render_upload_p95_ms: nonzero_option(metrics.render_latency_avg_ms),
-            render_present_p95_ms: nonzero_option(metrics.present_latency_avg_ms),
+            render_upload_p95_ms: nonzero_option(metrics.render_latency_p95_ms),
+            render_present_p95_ms: nonzero_option(metrics.render_present_gap_p95_ms),
             nvdec_runtime_summary: String::new(),
             nvdec_h264_capability: String::new(),
             nvdec_hevc_capability: String::new(),
@@ -855,11 +858,11 @@ mod tests {
             Some(manifest.capture_backend.clone()),
             Some(manifest.encode_backend.clone()),
             Some(manifest.transport.clone()),
-            metrics.decoded_fps.max(metrics.capture_fps),
+            observed_fps_for_summary(manifest, metrics),
             bitrate_kbps,
             metrics.dropped_frames as u64,
             0,
-            vec![],
+            render_counters_from_metrics(metrics),
             vec![
                 (
                     StageId::EncodeTotal,
@@ -901,17 +904,17 @@ mod tests {
                     StageId::RenderUpload,
                     stats_from_metrics(
                         metrics.render_latency_avg_ms,
-                        metrics.render_latency_avg_ms,
-                        metrics.render_latency_avg_ms,
+                        metrics.render_latency_p50_ms,
+                        metrics.render_latency_p95_ms,
                         0,
                     ),
                 ),
                 (
                     StageId::RenderPresent,
                     stats_from_metrics(
-                        metrics.present_latency_avg_ms,
-                        metrics.present_latency_avg_ms,
-                        metrics.present_latency_avg_ms,
+                        metrics.render_present_gap_avg_ms,
+                        metrics.render_present_gap_p50_ms,
+                        metrics.render_present_gap_p95_ms,
                         0,
                     ),
                 ),
@@ -919,17 +922,72 @@ mod tests {
         )
     }
 
+    fn observed_fps_for_summary(
+        manifest: &BenchmarkManifest,
+        metrics: &crate::test_harness::HarnessMetrics,
+    ) -> f64 {
+        if parse_decoder_backend(&manifest.decode_backend) != DecoderType::None
+            && metrics.decoded_fps > 0.0
+        {
+            metrics.decoded_fps
+        } else {
+            metrics.capture_fps
+        }
+    }
+
+    fn render_counters_from_metrics(
+        metrics: &crate::test_harness::HarnessMetrics,
+    ) -> Vec<(String, u64)> {
+        vec![
+            (
+                "render_submitted_frames".to_string(),
+                metrics.render_submitted_frames,
+            ),
+            (
+                "render_uploaded_frames".to_string(),
+                metrics.render_uploaded_frames,
+            ),
+            (
+                "render_presented_frames".to_string(),
+                metrics.render_presented_frames,
+            ),
+            (
+                "render_present_skipped_frames".to_string(),
+                metrics.render_present_skipped_frames,
+            ),
+            (
+                "render_queue_replacements".to_string(),
+                metrics.render_queue_replacements,
+            ),
+            (
+                "render_stale_frame_drops".to_string(),
+                metrics.render_stale_frame_drops,
+            ),
+        ]
+    }
+
     fn stats_from_metrics(avg: f64, p50: f64, p95: f64, bytes: u64) -> StageStatsSnapshot {
-        let mut samples = Vec::new();
+        let mut values = Vec::new();
         for value in [avg, p50, p95] {
             if value.is_finite() && value > 0.0 {
-                samples.push(value);
+                values.push(value);
             }
         }
-        if samples.is_empty() {
-            samples.push(0.0);
+        if values.is_empty() {
+            return StageStatsSnapshot::from_durations_ms(&[], bytes);
         }
-        StageStatsSnapshot::from_durations_ms(&samples, bytes)
+
+        let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        StageStatsSnapshot {
+            count: values.len() as u64,
+            bytes,
+            avg_ms: nonzero_option(avg),
+            p50_ms: nonzero_option(p50),
+            p95_ms: nonzero_option(p95),
+            p99_ms: nonzero_option(p95),
+            max_ms: Some(max),
+            jitter_ms: None,
+        }
     }
 
     fn parse_capture_backend(value: &str) -> CaptureType {
@@ -1150,6 +1208,97 @@ mod tests {
                 )
             })
             .unwrap_or(default)
+    }
+
+    #[test]
+    fn harness_summary_prefers_decoded_fps_when_decode_backend_is_active() {
+        let manifest = BenchmarkManifest {
+            run_id: "quick-webrtc-20260529-fps".into(),
+            scenario: "quick.transport".into(),
+            transport: "webrtc".into(),
+            capture_backend: "dxgi".into(),
+            encode_backend: "nvenc".into(),
+            decode_backend: "nvdec".into(),
+            renderer_backend: "d3d11".into(),
+            width: 2560,
+            height: 1440,
+            fps: 144,
+            duration_secs: 10,
+            git_commit: "abc123".into(),
+        };
+        let metrics = crate::test_harness::HarnessMetrics {
+            capture_fps: 144.0,
+            decoded_fps: 118.0,
+            ..crate::test_harness::HarnessMetrics::default()
+        };
+
+        assert_eq!(observed_fps_for_summary(&manifest, &metrics), 118.0);
+    }
+
+    #[test]
+    fn harness_probe_exports_render_upload_and_present_gap_p95() {
+        let manifest = BenchmarkManifest {
+            run_id: "quick-webrtc-20260529-render".into(),
+            scenario: "quick.transport".into(),
+            transport: "webrtc".into(),
+            capture_backend: "dxgi".into(),
+            encode_backend: "nvenc".into(),
+            decode_backend: "nvdec".into(),
+            renderer_backend: "d3d11".into(),
+            width: 2560,
+            height: 1440,
+            fps: 144,
+            duration_secs: 10,
+            git_commit: "abc123".into(),
+        };
+        let metrics = crate::test_harness::HarnessMetrics {
+            capture_fps: 144.0,
+            decoded_fps: 118.0,
+            render_latency_avg_ms: 0.20,
+            render_latency_p50_ms: 0.18,
+            render_latency_p95_ms: 0.35,
+            render_present_gap_avg_ms: 6.94,
+            render_present_gap_p50_ms: 6.90,
+            render_present_gap_p95_ms: 7.40,
+            render_submitted_frames: 1_440,
+            render_uploaded_frames: 1_439,
+            render_presented_frames: 1_438,
+            render_present_skipped_frames: 2,
+            ..crate::test_harness::HarnessMetrics::default()
+        };
+
+        let probe = probe_from_metrics(
+            &manifest,
+            &SessionId("session-render".into()),
+            &metrics,
+            0.0,
+        );
+        let render_upload = probe
+            .stages
+            .iter()
+            .find(|(stage, _)| *stage == StageId::RenderUpload)
+            .map(|(_, stats)| stats)
+            .expect("render upload stage");
+        let render_present = probe
+            .stages
+            .iter()
+            .find(|(stage, _)| *stage == StageId::RenderPresent)
+            .map(|(_, stats)| stats)
+            .expect("render present stage");
+
+        assert_eq!(probe.fps, 118.0);
+        assert_eq!(render_upload.p50_ms, Some(0.18));
+        assert_eq!(render_upload.p95_ms, Some(0.35));
+        assert_eq!(render_present.p50_ms, Some(6.90));
+        assert_eq!(render_present.p95_ms, Some(7.40));
+        assert!(probe
+            .counters
+            .iter()
+            .any(|(name, value)| name == "render_presented_frames" && *value == 1_438));
+        assert!(probe
+            .counters
+            .iter()
+            .any(|(name, value)| name == "render_present_skipped_frames" && *value == 2));
     }
 
     #[test]

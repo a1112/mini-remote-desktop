@@ -34,7 +34,9 @@ use mrd_pipeline_core::{
     CapturedFrame, DecodedFrame, DecodedFrameData, EncodedAccessUnit, FrameCapture,
     FramePixelFormat, VideoCodec, VideoDecoder, VideoEncoder,
 };
-use mrd_render::{RenderFrame, RenderFrameData, RenderTarget, RendererFactory, RendererInstance};
+use mrd_render::{
+    RenderFrame, RenderFrameData, RenderTarget, RendererFactory, RendererInstance, RendererSnapshot,
+};
 #[cfg(target_os = "macos")]
 use mrd_render_macos::MacosRendererFactory;
 use serde::{Deserialize, Serialize};
@@ -351,7 +353,18 @@ pub struct HarnessMetrics {
     pub decode_latency_p50_ms: f64,
     pub decode_latency_p95_ms: f64,
     pub render_latency_avg_ms: f64,
+    pub render_latency_p50_ms: f64,
+    pub render_latency_p95_ms: f64,
     pub present_latency_avg_ms: f64,
+    pub render_submitted_frames: u64,
+    pub render_uploaded_frames: u64,
+    pub render_presented_frames: u64,
+    pub render_present_skipped_frames: u64,
+    pub render_queue_replacements: u64,
+    pub render_stale_frame_drops: u64,
+    pub render_present_gap_avg_ms: f64,
+    pub render_present_gap_p50_ms: f64,
+    pub render_present_gap_p95_ms: f64,
     pub total_latency_avg_ms: f64,
     pub total_latency_p50_ms: f64,
     pub total_latency_p95_ms: f64,
@@ -424,7 +437,18 @@ impl Default for HarnessMetrics {
             decode_latency_p50_ms: 0.0,
             decode_latency_p95_ms: 0.0,
             render_latency_avg_ms: 0.0,
+            render_latency_p50_ms: 0.0,
+            render_latency_p95_ms: 0.0,
             present_latency_avg_ms: 0.0,
+            render_submitted_frames: 0,
+            render_uploaded_frames: 0,
+            render_presented_frames: 0,
+            render_present_skipped_frames: 0,
+            render_queue_replacements: 0,
+            render_stale_frame_drops: 0,
+            render_present_gap_avg_ms: 0.0,
+            render_present_gap_p50_ms: 0.0,
+            render_present_gap_p95_ms: 0.0,
             total_latency_avg_ms: 0.0,
             total_latency_p50_ms: 0.0,
             total_latency_p95_ms: 0.0,
@@ -698,9 +722,24 @@ enum RenderInput {
     Captured(CapturedFrame),
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct RenderPacingCounters {
+    submitted_frames: u64,
+    uploaded_frames: u64,
+    presented_frames: u64,
+    present_skipped_frames: u64,
+    queue_replacements: u64,
+    stale_frame_drops: u64,
+}
+
+#[derive(Debug, Clone)]
+struct RenderCompletion {
+    snapshot: RendererSnapshot,
+}
+
 struct RenderJob {
     input: RenderInput,
-    completion: mpsc::SyncSender<std::result::Result<(), String>>,
+    completion: mpsc::SyncSender<std::result::Result<RenderCompletion, String>>,
 }
 
 enum RenderCommand {
@@ -827,7 +866,7 @@ impl PipelineRenderer {
         None
     }
 
-    fn submit_frame(&mut self, input: RenderInput) -> Result<()> {
+    fn submit_frame(&mut self, input: RenderInput) -> Result<RenderCompletion> {
         if let Some(error) = self.last_error.lock().unwrap().clone() {
             anyhow::bail!("native render thread failed: {error}");
         }
@@ -837,7 +876,7 @@ impl PipelineRenderer {
             .send(RenderCommand::Frame(RenderJob { input, completion }))
             .map_err(|_| anyhow::anyhow!("native render thread stopped"))?;
         match done.recv_timeout(Duration::from_millis(NATIVE_RENDER_FRAME_TIMEOUT_MS)) {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(completion)) => Ok(completion),
             Ok(Err(error)) => anyhow::bail!("native render thread failed: {error}"),
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 let message = format!(
@@ -1004,18 +1043,7 @@ fn run_renderer_thread(
 
             for cmd in receiver {
                 match cmd {
-                    RenderCommand::Frame(job) => {
-                        let result = {
-                            let frame = render_input_to_frame(job.input);
-                            renderer
-                                .upload_frame(frame)
-                                .map_err(|error| {
-                                    anyhow::anyhow!("upload Linux render frame failed: {error}")
-                                })
-                                .map_err(|error| error.to_string())
-                        };
-                        let _ = job.completion.send(result);
-                    }
+                    RenderCommand::Frame(job) => complete_render_job(&mut renderer, job)?,
                     RenderCommand::Stop => break,
                 }
             }
@@ -1148,13 +1176,19 @@ fn upload_render_input(renderer: &mut dyn RendererInstance, input: RenderInput) 
 }
 
 fn complete_render_job(renderer: &mut dyn RendererInstance, job: RenderJob) -> Result<()> {
-    let result = upload_render_input(renderer, job.input);
-    let completion = result
-        .as_ref()
-        .map(|_| ())
-        .map_err(|error| error.to_string());
-    let _ = job.completion.send(completion);
-    result
+    match upload_render_input(renderer, job.input) {
+        Ok(()) => {
+            let completion = RenderCompletion {
+                snapshot: renderer.snapshot(),
+            };
+            let _ = job.completion.send(Ok(completion));
+            Ok(())
+        }
+        Err(error) => {
+            let _ = job.completion.send(Err(error.to_string()));
+            Err(error)
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -2292,7 +2326,11 @@ impl TestHarness {
         let mut transport_latencies = Vec::with_capacity(1000);
         let mut decode_latencies = Vec::with_capacity(1000);
         let mut render_latencies = Vec::with_capacity(1000);
+        let mut render_present_gaps = Vec::with_capacity(1000);
         let mut total_latencies = Vec::with_capacity(1000);
+        let mut render_pacing = RenderPacingCounters::default();
+        let mut last_render_snapshot = None::<RendererSnapshot>;
+        let mut last_render_present_at = None::<Instant>;
         let mut frame_count = 0_usize;
         let mut dropped_frames = 0_usize;
         let mut encoded_units_total = 0_usize;
@@ -2494,19 +2532,36 @@ impl TestHarness {
                 None
             };
 
-            let render_latency =
-                if let (Some(renderer), Some(input)) = (state.renderer.as_mut(), render_input) {
-                    let render_start = Instant::now();
-                    if let Err(error) = renderer.submit_frame(input) {
+            let render_latency = if let (Some(renderer), Some(input)) =
+                (state.renderer.as_mut(), render_input)
+            {
+                let previous_snapshot = last_render_snapshot.clone();
+                render_pacing.submitted_frames = render_pacing.submitted_frames.saturating_add(1);
+                let render_start = Instant::now();
+                match renderer.submit_frame(input) {
+                    Ok(completion) => {
+                        let completed_at = Instant::now();
+                        Self::record_render_completion(
+                            &mut render_pacing,
+                            &mut render_present_gaps,
+                            &mut last_render_present_at,
+                            previous_snapshot.as_ref(),
+                            &completion.snapshot,
+                            completed_at,
+                        );
+                        last_render_snapshot = Some(completion.snapshot);
+                        Some(completed_at.duration_since(render_start))
+                    }
+                    Err(error) => {
                         let mut m = metrics.lock().unwrap();
                         m.error_message = Some(error.to_string());
                         running.store(false, Ordering::Relaxed);
                         break;
                     }
-                    Some(render_start.elapsed())
-                } else {
-                    None
-                };
+                }
+            } else {
+                None
+            };
             let interactive_latency = interactive_start.elapsed();
 
             capture_latencies.push(capture_latency);
@@ -2532,6 +2587,7 @@ impl TestHarness {
                 &mut transport_latencies,
                 &mut decode_latencies,
                 &mut render_latencies,
+                &mut render_present_gaps,
                 &mut total_latencies,
             );
 
@@ -2582,6 +2638,8 @@ impl TestHarness {
                     &transport_latencies,
                     &decode_latencies,
                     &render_latencies,
+                    &render_present_gaps,
+                    render_pacing,
                     &total_latencies,
                 );
                 if decoded_frames_total > 0 {
@@ -2606,6 +2664,8 @@ impl TestHarness {
             &transport_latencies,
             &decode_latencies,
             &render_latencies,
+            &render_present_gaps,
+            render_pacing,
             &total_latencies,
         );
 
@@ -2629,6 +2689,8 @@ impl TestHarness {
         transport_latencies: &[Duration],
         decode_latencies: &[Duration],
         render_latencies: &[Duration],
+        render_present_gaps: &[Duration],
+        render_pacing: RenderPacingCounters,
         total_latencies: &[Duration],
     ) {
         let elapsed = start_time.elapsed().as_secs_f64();
@@ -2659,6 +2721,9 @@ impl TestHarness {
         let avg_dec = Self::compute_average(decode_latencies);
         let (p50_dec, p95_dec) = Self::compute_percentiles(decode_latencies);
         let avg_render = Self::compute_average(render_latencies);
+        let (p50_render, p95_render) = Self::compute_percentiles(render_latencies);
+        let avg_present_gap = Self::compute_average(render_present_gaps);
+        let (p50_present_gap, p95_present_gap) = Self::compute_percentiles(render_present_gaps);
         let avg_total = Self::compute_average(total_latencies);
         let (p50_total, p95_total) = Self::compute_percentiles(total_latencies);
 
@@ -2692,9 +2757,44 @@ impl TestHarness {
         m.decode_latency_p50_ms = p50_dec.as_secs_f64() * 1000.0;
         m.decode_latency_p95_ms = p95_dec.as_secs_f64() * 1000.0;
         m.render_latency_avg_ms = avg_render.as_secs_f64() * 1000.0;
+        m.render_latency_p50_ms = p50_render.as_secs_f64() * 1000.0;
+        m.render_latency_p95_ms = p95_render.as_secs_f64() * 1000.0;
+        m.render_submitted_frames = render_pacing.submitted_frames;
+        m.render_uploaded_frames = render_pacing.uploaded_frames;
+        m.render_presented_frames = render_pacing.presented_frames;
+        m.render_present_skipped_frames = render_pacing.present_skipped_frames;
+        m.render_queue_replacements = render_pacing.queue_replacements;
+        m.render_stale_frame_drops = render_pacing.stale_frame_drops;
+        m.render_present_gap_avg_ms = avg_present_gap.as_secs_f64() * 1000.0;
+        m.render_present_gap_p50_ms = p50_present_gap.as_secs_f64() * 1000.0;
+        m.render_present_gap_p95_ms = p95_present_gap.as_secs_f64() * 1000.0;
+        m.present_latency_avg_ms = m.render_present_gap_avg_ms;
         m.total_latency_avg_ms = avg_total.as_secs_f64() * 1000.0;
         m.total_latency_p50_ms = p50_total.as_secs_f64() * 1000.0;
         m.total_latency_p95_ms = p95_total.as_secs_f64() * 1000.0;
+    }
+
+    fn record_render_completion(
+        render_pacing: &mut RenderPacingCounters,
+        render_present_gaps: &mut Vec<Duration>,
+        last_render_present_at: &mut Option<Instant>,
+        previous_snapshot: Option<&RendererSnapshot>,
+        current_snapshot: &RendererSnapshot,
+        completed_at: Instant,
+    ) {
+        render_pacing.uploaded_frames = current_snapshot.uploaded_frame_count;
+        render_pacing.presented_frames = current_snapshot.presented_frame_count;
+        render_pacing.present_skipped_frames = current_snapshot.present_skipped_count;
+
+        let previous_presented = previous_snapshot
+            .map(|snapshot| snapshot.presented_frame_count)
+            .unwrap_or_default();
+        if current_snapshot.presented_frame_count > previous_presented {
+            if let Some(last_present_at) = *last_render_present_at {
+                render_present_gaps.push(completed_at.saturating_duration_since(last_present_at));
+            }
+            *last_render_present_at = Some(completed_at);
+        }
     }
 
     fn broadcast_encoded_access_units(
@@ -2744,6 +2844,7 @@ impl TestHarness {
         transport_latencies: &mut Vec<Duration>,
         decode_latencies: &mut Vec<Duration>,
         render_latencies: &mut Vec<Duration>,
+        render_present_gaps: &mut Vec<Duration>,
         total_latencies: &mut Vec<Duration>,
     ) {
         if capture_latencies.len() > 1000 {
@@ -2763,6 +2864,9 @@ impl TestHarness {
         }
         if render_latencies.len() > 1000 {
             render_latencies.remove(0);
+        }
+        if render_present_gaps.len() > 1000 {
+            render_present_gaps.remove(0);
         }
         if total_latencies.len() > 1000 {
             total_latencies.remove(0);
@@ -4302,6 +4406,65 @@ mod tests {
         }
     }
 
+    fn renderer_snapshot(
+        uploaded_frame_count: u64,
+        presented_frame_count: u64,
+        present_skipped_count: u64,
+    ) -> RendererSnapshot {
+        RendererSnapshot {
+            attached_to_target: true,
+            uploaded_frame_count,
+            presented_frame_count,
+            present_skipped_count,
+            last_present_status: Some("presented".to_string()),
+            low_latency_frame_latency_target: None,
+            swap_chain_max_frame_latency: None,
+            swap_chain_allow_tearing: None,
+            last_width: 1,
+            last_height: 1,
+            last_pixel_format: Some(RenderPixelFormat::Bgra32),
+        }
+    }
+
+    #[test]
+    fn record_render_completion_tracks_present_gap_only_on_new_present() {
+        let previous = renderer_snapshot(7, 3, 1);
+        let current = renderer_snapshot(8, 4, 1);
+        let same_present = renderer_snapshot(9, 4, 2);
+        let mut counters = RenderPacingCounters::default();
+        let mut present_gaps = Vec::new();
+        let previous_present_at = Instant::now();
+        let mut last_present_at = Some(previous_present_at);
+
+        TestHarness::record_render_completion(
+            &mut counters,
+            &mut present_gaps,
+            &mut last_present_at,
+            Some(&previous),
+            &current,
+            previous_present_at + Duration::from_millis(7),
+        );
+
+        assert_eq!(counters.uploaded_frames, 8);
+        assert_eq!(counters.presented_frames, 4);
+        assert_eq!(counters.present_skipped_frames, 1);
+        assert_eq!(present_gaps, vec![Duration::from_millis(7)]);
+
+        TestHarness::record_render_completion(
+            &mut counters,
+            &mut present_gaps,
+            &mut last_present_at,
+            Some(&current),
+            &same_present,
+            previous_present_at + Duration::from_millis(12),
+        );
+
+        assert_eq!(counters.uploaded_frames, 9);
+        assert_eq!(counters.presented_frames, 4);
+        assert_eq!(counters.present_skipped_frames, 2);
+        assert_eq!(present_gaps, vec![Duration::from_millis(7)]);
+    }
+
     #[test]
     fn render_job_sends_completion_after_upload() {
         let mut renderer = RecordingRenderer::default();
@@ -4323,7 +4486,12 @@ mod tests {
         )
         .expect("render job");
 
-        assert_eq!(completion_rx.recv().expect("completion"), Ok(()));
+        let completion = completion_rx
+            .recv()
+            .expect("completion")
+            .expect("successful completion");
+        assert_eq!(completion.snapshot.uploaded_frame_count, 1);
+        assert_eq!(completion.snapshot.presented_frame_count, 1);
         assert_eq!(renderer.uploaded, 1);
     }
 
@@ -4483,6 +4651,7 @@ mod tests {
         let mut transport_latencies = Vec::new();
         let mut decode_latencies = Vec::new();
         let mut render_latencies = Vec::new();
+        let mut render_present_gaps = Vec::new();
         let mut total_latencies = Vec::new();
 
         TestHarness::trim_latency_buffers(
@@ -4492,6 +4661,7 @@ mod tests {
             &mut transport_latencies,
             &mut decode_latencies,
             &mut render_latencies,
+            &mut render_present_gaps,
             &mut total_latencies,
         );
 
@@ -4502,6 +4672,7 @@ mod tests {
         assert!(transport_latencies.is_empty());
         assert!(decode_latencies.is_empty());
         assert!(render_latencies.is_empty());
+        assert!(render_present_gaps.is_empty());
         assert!(total_latencies.is_empty());
     }
 
@@ -4513,6 +4684,7 @@ mod tests {
         let mut transport_latencies = (0..=1000).map(Duration::from_millis).collect::<Vec<_>>();
         let mut decode_latencies = (0..=1000).map(Duration::from_millis).collect::<Vec<_>>();
         let mut render_latencies = (0..=1000).map(Duration::from_millis).collect::<Vec<_>>();
+        let mut render_present_gaps = (0..=1000).map(Duration::from_millis).collect::<Vec<_>>();
         let mut total_latencies = (0..=1000).map(Duration::from_millis).collect::<Vec<_>>();
 
         TestHarness::trim_latency_buffers(
@@ -4522,6 +4694,7 @@ mod tests {
             &mut transport_latencies,
             &mut decode_latencies,
             &mut render_latencies,
+            &mut render_present_gaps,
             &mut total_latencies,
         );
 
@@ -4531,6 +4704,7 @@ mod tests {
         assert_eq!(transport_latencies.len(), 1000);
         assert_eq!(decode_latencies.len(), 1000);
         assert_eq!(render_latencies.len(), 1000);
+        assert_eq!(render_present_gaps.len(), 1000);
         assert_eq!(total_latencies.len(), 1000);
         assert_eq!(capture_latencies[0], Duration::from_millis(1));
         assert_eq!(interactive_latencies[0], Duration::from_millis(1));
@@ -4538,6 +4712,7 @@ mod tests {
         assert_eq!(transport_latencies[0], Duration::from_millis(1));
         assert_eq!(decode_latencies[0], Duration::from_millis(1));
         assert_eq!(render_latencies[0], Duration::from_millis(1));
+        assert_eq!(render_present_gaps[0], Duration::from_millis(1));
         assert_eq!(total_latencies[0], Duration::from_millis(1));
     }
 
@@ -4650,6 +4825,8 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
+            RenderPacingCounters::default(),
             &total_latencies,
         );
 
@@ -4681,6 +4858,8 @@ mod tests {
             &[],
             &[],
             &[],
+            RenderPacingCounters::default(),
+            &[],
         );
 
         let snapshot = metrics.lock().unwrap();
@@ -4710,11 +4889,75 @@ mod tests {
             &[],
             &[],
             &[],
+            RenderPacingCounters::default(),
+            &[],
         );
 
         let snapshot = metrics.lock().unwrap();
         assert!(snapshot.capture_fps > 59.0 && snapshot.capture_fps <= 60.0);
         assert!(snapshot.decoded_fps > 24.0 && snapshot.decoded_fps <= 25.0);
+    }
+
+    #[test]
+    fn update_metrics_reports_render_present_gap_distribution() {
+        let metrics = Arc::new(Mutex::new(HarnessMetrics::default()));
+        let start_time = Instant::now() - Duration::from_secs(1);
+        let render_latencies = vec![
+            Duration::from_micros(180),
+            Duration::from_micros(210),
+            Duration::from_micros(350),
+        ];
+        let render_present_gaps = vec![
+            Duration::from_millis(6),
+            Duration::from_millis(7),
+            Duration::from_millis(9),
+        ];
+        let render_pacing = RenderPacingCounters {
+            submitted_frames: 12,
+            uploaded_frames: 11,
+            presented_frames: 10,
+            present_skipped_frames: 1,
+            queue_replacements: 2,
+            stale_frame_drops: 2,
+        };
+
+        TestHarness::update_metrics(
+            &metrics,
+            12,
+            0,
+            12,
+            12,
+            0,
+            0,
+            0,
+            &start_time,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &render_latencies,
+            &render_present_gaps,
+            render_pacing,
+            &[],
+        );
+
+        let snapshot = metrics.lock().unwrap();
+        assert!((snapshot.render_latency_p50_ms - 0.21).abs() < 0.001);
+        assert!((snapshot.render_latency_p95_ms - 0.35).abs() < 0.001);
+        assert_eq!(snapshot.render_submitted_frames, 12);
+        assert_eq!(snapshot.render_uploaded_frames, 11);
+        assert_eq!(snapshot.render_presented_frames, 10);
+        assert_eq!(snapshot.render_present_skipped_frames, 1);
+        assert_eq!(snapshot.render_queue_replacements, 2);
+        assert_eq!(snapshot.render_stale_frame_drops, 2);
+        assert!((snapshot.render_present_gap_avg_ms - (7.0 + (1.0 / 3.0))).abs() < 0.001);
+        assert_eq!(snapshot.render_present_gap_p50_ms, 7.0);
+        assert_eq!(snapshot.render_present_gap_p95_ms, 9.0);
+        assert_eq!(
+            snapshot.present_latency_avg_ms,
+            snapshot.render_present_gap_avg_ms
+        );
     }
 
     #[test]
