@@ -10,11 +10,14 @@
 //! - Works on Windows 10 1803+
 //!
 //! # Example
-//! ```ignore
+//! ```no_run
 //! use mrd_capture_winrt::WinrtCapture;
 //!
-//! // Capture from monitor
-//! let capture = WinrtCapture::from_monitor_index(0)?;
+//! fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     // Capture from monitor
+//!     let capture = WinrtCapture::from_monitor_index(0)?;
+//!     Ok(())
+//! }
 //! ```
 
 #[cfg(not(windows))]

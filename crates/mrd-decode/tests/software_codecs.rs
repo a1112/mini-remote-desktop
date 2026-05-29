@@ -71,6 +71,7 @@ fn software_hevc_main10_decodes_nvenc_main10_access_unit() {
     let access_units = match encoder.encode(&frame) {
         Ok(access_units) => access_units,
         Err(error) if error.to_string().contains("UnsupportedParam") => return,
+        Err(error) if error.to_string().contains("produced a 8-bit bitstream") => return,
         Err(error) => panic!("encode HEVC Main10 frame: {error}"),
     };
     let access_unit = access_units

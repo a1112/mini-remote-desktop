@@ -44,8 +44,10 @@ tools/ffmpeg-min/
 client-qt/venv
 /tools/ffmpeg_full_build/
 /logs
+/artifacts/benchmark-scenario-run-summary.json
 /artifacts/benchmarks/
 /artifacts/component-matrix/
+/artifacts/ffmpeg-perf/
 /crates/mrd-decode/artifacts/
 /tests/benchmarks/tmp/
 /tests/component-matrix/tmp/

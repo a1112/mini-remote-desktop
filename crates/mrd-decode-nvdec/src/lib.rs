@@ -3419,10 +3419,16 @@ mod imp {
             println!("  Max difference: {}", max_diff);
             assert!(max_diff <= 2, "results differ by more than 2");
 
-            assert!(
-                speedup > 1.5,
-                "integer version should be at least 1.5x faster"
-            );
+            if cfg!(debug_assertions) {
+                println!(
+                    "  Skipping speedup threshold in debug builds; run with --release to enforce it"
+                );
+            } else {
+                assert!(
+                    speedup > 1.5,
+                    "integer version should be at least 1.5x faster"
+                );
+            }
         }
 
         fn nv12_to_rgb_float(nv12: &[u8], width: usize, height: usize, pitch: usize) -> Vec<u8> {
