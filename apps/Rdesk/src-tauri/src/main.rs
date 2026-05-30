@@ -3542,6 +3542,15 @@ fn spawn_native_surface_control_input_forwarder() {
         return;
     }
 
+    let endpoint = mrd_ipc::transport::IpcEndpoint::service_from_env_or_default();
+    let _ = spawn_native_surface_control_input_forwarder_for_receiver(receiver, endpoint);
+}
+
+#[cfg(windows)]
+fn spawn_native_surface_control_input_forwarder_for_receiver(
+    receiver: std::sync::mpsc::Receiver<remote_display_surface::NativeSurfaceControlInput>,
+    endpoint: mrd_ipc::transport::IpcEndpoint,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let runtime = match tokio::runtime::Runtime::new() {
             Ok(runtime) => runtime,
@@ -3552,8 +3561,9 @@ fn spawn_native_surface_control_input_forwarder() {
         };
 
         for input in receiver {
+            let endpoint = endpoint.clone();
             runtime.block_on(async move {
-                let mut client = mrd_ipc::client::IpcClient::new();
+                let mut client = mrd_ipc::client::IpcClient::with_endpoint(endpoint);
                 let response = client
                     .send_request(mrd_ipc::IpcRequest::SendControlInput {
                         session_id: SessionId(input.session_id.clone()),
@@ -3568,7 +3578,74 @@ fn spawn_native_surface_control_input_forwarder() {
                 }
             });
         }
-    });
+    })
+}
+
+#[cfg(all(test, windows))]
+mod native_surface_control_forwarder_tests {
+    use super::*;
+    use mrd_ipc::transport::IpcEndpoint;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    fn test_endpoint(name: &str) -> IpcEndpoint {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        IpcEndpoint::named_pipe(format!(
+            r"\\.\pipe\rdesk-native-input-forwarder-{name}-{}-{unique}",
+            std::process::id()
+        ))
+    }
+
+    #[tokio::test]
+    async fn native_surface_control_forwarder_sends_input_to_service_ipc() {
+        let endpoint = test_endpoint("send-input");
+        let server = mrd_ipc::transport::IpcServer::bind_with_endpoint(endpoint.clone())
+            .await
+            .expect("bind ipc capture server");
+        let (request_sender, request_receiver) = tokio::sync::oneshot::channel();
+
+        let server_task = tokio::spawn(async move {
+            let mut stream = server.accept().await.expect("accept ipc client");
+            let request = stream.recv_request().await.expect("receive ipc request");
+            stream
+                .send_response(&mrd_ipc::IpcResponse::ControlInputAccepted {
+                    session_id: SessionId("native-forward-ipc-session".to_string()),
+                    lane: mrd_ipc::ControlInputLane::Realtime,
+                    event_count: 1,
+                })
+                .await
+                .expect("send ipc response");
+            request_sender.send(request).expect("publish request");
+        });
+
+        let (input_sender, input_receiver) = std::sync::mpsc::channel();
+        let worker =
+            spawn_native_surface_control_input_forwarder_for_receiver(input_receiver, endpoint);
+        input_sender
+            .send(remote_display_surface::NativeSurfaceControlInput {
+                session_id: "native-forward-ipc-session".to_string(),
+                event: mrd_ipc::ControlInputEvent::MouseMove { x: 7, y: 9 },
+            })
+            .expect("send native surface input");
+
+        let request = tokio::time::timeout(Duration::from_secs(2), request_receiver)
+            .await
+            .expect("forwarded request timeout")
+            .expect("forwarded request");
+        drop(input_sender);
+        worker.join().expect("forwarder worker exits");
+        server_task.await.expect("ipc capture task exits");
+
+        assert_eq!(
+            request,
+            mrd_ipc::IpcRequest::SendControlInput {
+                session_id: SessionId("native-forward-ipc-session".to_string()),
+                event: mrd_ipc::ControlInputEvent::MouseMove { x: 7, y: 9 },
+            }
+        );
+    }
 }
 
 fn main() {
