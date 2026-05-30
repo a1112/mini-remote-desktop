@@ -2337,12 +2337,76 @@ async fn accept_lan_control_input(
         }
     }
 
+    let event = crate::control_input::map_control_input_event_for_target_geometry(
+        event,
+        control_input_target_geometry(app_state, session_id).await,
+    );
+
     app_state
         .control_input()
         .lock()
         .await
-        .handle_event(event)
+        .handle_event(&event)
         .map_err(Into::into)
+}
+
+async fn control_input_target_geometry(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+) -> Option<crate::control_input::ControlInputTargetGeometry> {
+    let selection = app_state.capture_sources.lock().await.get(session_id)?;
+    let active_display_mode = app_state.display_modes.lock().await.active_mode(session_id);
+    let (source_width, source_height) =
+        control_input_source_size(&selection.source, active_display_mode.as_ref());
+    let negotiation = app_state.media_profiles.lock().await.get(session_id);
+    let frame_width = negotiation
+        .as_ref()
+        .map(|profile| profile.selected.width)
+        .filter(|width| *width > 0)
+        .unwrap_or(source_width);
+    let frame_height = negotiation
+        .as_ref()
+        .map(|profile| profile.selected.height)
+        .filter(|height| *height > 0)
+        .unwrap_or(source_height);
+    let (origin_x, origin_y) = control_input_source_origin(&selection.source);
+
+    Some(crate::control_input::ControlInputTargetGeometry {
+        frame_width,
+        frame_height,
+        source_width,
+        source_height,
+        origin_x,
+        origin_y,
+    })
+}
+
+fn control_input_source_size(
+    source: &CaptureSource,
+    active_display_mode: Option<&DisplayMode>,
+) -> (u32, u32) {
+    if is_display_capture_source(source) {
+        if let Some(mode) = active_display_mode.filter(|mode| mode.width > 0 && mode.height > 0) {
+            return (mode.width, mode.height);
+        }
+    }
+    (source.width, source.height)
+}
+
+fn control_input_source_origin(source: &CaptureSource) -> (i32, i32) {
+    if is_windows_display_capture_source(source) {
+        crate::display_mode::display_origin_for_source_id(&source.id).unwrap_or((0, 0))
+    } else {
+        (0, 0)
+    }
+}
+
+fn is_display_capture_source(source: &CaptureSource) -> bool {
+    matches!(source.source_kind.as_str(), "display" | "display_shared")
+}
+
+fn is_windows_display_capture_source(source: &CaptureSource) -> bool {
+    source.platform.eq_ignore_ascii_case("windows") && is_display_capture_source(source)
 }
 
 async fn accept_or_replay_lan_control_input(
@@ -7843,6 +7907,28 @@ fn is_valid_discovery_packet(magic: &str, app_id: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[derive(Clone)]
+    struct SharedRecordingInputInjector {
+        events: std::sync::Arc<std::sync::Mutex<Vec<mrd_input::InputEvent>>>,
+    }
+
+    impl SharedRecordingInputInjector {
+        fn new(events: std::sync::Arc<std::sync::Mutex<Vec<mrd_input::InputEvent>>>) -> Self {
+            Self { events }
+        }
+    }
+
+    impl mrd_input::InputInjector for SharedRecordingInputInjector {
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn inject(&mut self, event: &mrd_input::InputEvent) -> Result<(), mrd_input::InputError> {
+            self.events.lock().expect("record input event").push(*event);
+            Ok(())
+        }
+    }
+
     #[test]
     fn dynamic_window_fps_enters_active_tier_on_changed_frame() {
         let mut policy = DynamicWindowFpsPolicy::new(120);
@@ -8417,6 +8503,94 @@ mod tests {
         assert_eq!(snapshot.reliable.accepted_messages, 1);
         assert_eq!(snapshot.reliable.injected_messages, 1);
         assert_eq!(snapshot.realtime.injected_messages, 0);
+    }
+
+    #[tokio::test]
+    async fn accepted_lan_control_input_scales_mouse_move_to_selected_source_size() {
+        let target_state = Arc::new(AppState::new());
+        target_state.devices.lock().await.register(
+            DeviceId("target-device".to_string()),
+            "Target Device".to_string(),
+        );
+        let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        target_state
+            .replace_control_input_for_test(SharedRecordingInputInjector::new(recorded.clone()))
+            .await;
+        let session_id = SessionId("input-scale-session".to_string());
+        target_state.sessions.lock().await.insert(
+            session_id.clone(),
+            SessionSnapshot {
+                session_id: session_id.clone(),
+                transport: "quic".to_string(),
+                source_device_id: Some(DeviceId("controller-device".to_string())),
+                target_device_id: None,
+                local_listen_addr: None,
+                local_server_name: None,
+                local_cert_der_b64: None,
+                remote_listen_addr: None,
+                remote_server_name: None,
+                remote_cert_der_b64: None,
+                lifecycle_state: SessionLifecycleState::Listening,
+                last_error: None,
+                sender_active: true,
+                receiver_active: false,
+            },
+        );
+        target_state.capture_sources.lock().await.set(
+            session_id.clone(),
+            CaptureSourceSelection {
+                session_id: session_id.clone(),
+                source: CaptureSource {
+                    id: TEST_SYNTHETIC_CAPTURE_SOURCE_ID.to_string(),
+                    platform: "test".to_string(),
+                    source_kind: "display".to_string(),
+                    title: "Synthetic 2K desktop source".to_string(),
+                    class_name: "SyntheticCapture".to_string(),
+                    width: 2560,
+                    height: 1440,
+                    process_id: 0,
+                    app_name: Some("mrd-service test source".to_string()),
+                    bundle_identifier: None,
+                    preview_data_url: None,
+                    preview_width: None,
+                    preview_height: None,
+                },
+                status: "selected".to_string(),
+                reason: None,
+            },
+        );
+        let mut selected = default_media_profile();
+        selected.width = 1280;
+        selected.height = 720;
+        target_state.media_profiles.lock().await.set(
+            session_id.clone(),
+            MediaProfileNegotiation {
+                requested: selected.clone(),
+                selected,
+                status: "accepted".to_string(),
+                reason: None,
+                selected_source_id: Some(TEST_SYNTHETIC_CAPTURE_SOURCE_ID.to_string()),
+                selected_width: Some(1280),
+                selected_height: Some(720),
+                downgrade_reason: None,
+            },
+        );
+
+        let ack = accept_or_replay_lan_control_input(
+            &target_state,
+            &session_id,
+            "controller-device",
+            11,
+            &mrd_ipc::ControlInputEvent::MouseMove { x: 640, y: 360 },
+        )
+        .await;
+
+        assert!(ack.accepted);
+        assert_eq!(ack.lane, Some(mrd_ipc::ControlInputLane::Realtime));
+        assert_eq!(
+            recorded.lock().expect("recorded input").as_slice(),
+            &[mrd_input::InputEvent::MouseMove { x: 1280, y: 720 }]
+        );
     }
 
     #[tokio::test]

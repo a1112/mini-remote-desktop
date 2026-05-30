@@ -28,6 +28,14 @@ pub enum WindowsInputCommand {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WindowsVirtualScreen {
+    left: i32,
+    top: i32,
+    width: i32,
+    height: i32,
+}
+
 #[derive(Debug, Default)]
 pub struct WindowsSendInputInjector;
 
@@ -85,10 +93,7 @@ fn map_mouse_button(button: InputButton) -> Result<WindowsMouseButton, InputErro
 
 fn send_windows_input(command: WindowsInputCommand) -> Result<(), InputError> {
     match command {
-        WindowsInputCommand::MouseMove { x, y } => {
-            set_cursor_pos(x, y)?;
-            Ok(())
-        }
+        WindowsInputCommand::MouseMove { x, y } => send_input(mouse_move_input(x, y)),
         WindowsInputCommand::MouseButton { button, pressed } => {
             send_input(mouse_button_input(button, pressed))
         }
@@ -97,13 +102,6 @@ fn send_windows_input(command: WindowsInputCommand) -> Result<(), InputError> {
             virtual_key,
             pressed,
         } => send_input(key_input(virtual_key, pressed)),
-    }
-}
-
-fn set_cursor_pos(x: i32, y: i32) -> Result<(), InputError> {
-    unsafe {
-        ::windows::Win32::UI::WindowsAndMessaging::SetCursorPos(x, y)
-            .map_err(|err| InputError::Platform(err.to_string()))
     }
 }
 
@@ -124,6 +122,57 @@ fn send_input(
             ::windows::core::Error::from_thread().to_string(),
         ))
     }
+}
+
+fn mouse_move_input(x: i32, y: i32) -> ::windows::Win32::UI::Input::KeyboardAndMouse::INPUT {
+    mouse_move_input_for_virtual_screen(x, y, current_virtual_screen())
+}
+
+fn current_virtual_screen() -> WindowsVirtualScreen {
+    use ::windows::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+        SM_YVIRTUALSCREEN,
+    };
+
+    WindowsVirtualScreen {
+        left: unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) },
+        top: unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) },
+        width: unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) },
+        height: unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) },
+    }
+}
+
+fn mouse_move_input_for_virtual_screen(
+    x: i32,
+    y: i32,
+    virtual_screen: WindowsVirtualScreen,
+) -> ::windows::Win32::UI::Input::KeyboardAndMouse::INPUT {
+    use ::windows::Win32::UI::Input::KeyboardAndMouse::{
+        INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_MOVE,
+        MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT,
+    };
+
+    INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: absolute_mouse_axis(x, virtual_screen.left, virtual_screen.width),
+                dy: absolute_mouse_axis(y, virtual_screen.top, virtual_screen.height),
+                mouseData: 0,
+                dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
+}
+
+fn absolute_mouse_axis(coordinate: i32, origin: i32, extent: i32) -> i32 {
+    if extent <= 0 {
+        return 0;
+    }
+    let value = (i64::from(coordinate) - i64::from(origin)) * 65_535 / i64::from(extent);
+    value.clamp(0, 65_535) as i32
 }
 
 fn mouse_button_input(
@@ -261,6 +310,37 @@ mod tests {
             map_windows_input(&InputEvent::MouseWheel { delta: -240 }).expect("map wheel"),
             WindowsInputCommand::MouseWheel { delta: -240 }
         );
+    }
+
+    #[test]
+    fn windows_mouse_move_uses_sendinput_absolute_virtual_desktop_coordinates() {
+        use ::windows::Win32::UI::Input::KeyboardAndMouse::{
+            MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK,
+        };
+
+        let input = mouse_move_input_for_virtual_screen(
+            1920,
+            0,
+            WindowsVirtualScreen {
+                left: -1920,
+                top: 0,
+                width: 3840,
+                height: 2160,
+            },
+        );
+
+        unsafe {
+            assert_eq!(
+                input.r#type,
+                ::windows::Win32::UI::Input::KeyboardAndMouse::INPUT_MOUSE
+            );
+            assert_eq!(
+                input.Anonymous.mi.dwFlags,
+                MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
+            );
+            assert_eq!(input.Anonymous.mi.dx, 65_535);
+            assert_eq!(input.Anonymous.mi.dy, 0);
+        }
     }
 
     #[test]

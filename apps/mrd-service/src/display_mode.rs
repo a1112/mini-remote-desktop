@@ -27,6 +27,11 @@ pub fn display_device_name_for_source_id(source_id: &str) -> Result<String> {
     platform_display_device_name(source_index)
 }
 
+pub fn display_origin_for_source_id(source_id: &str) -> Result<(i32, i32)> {
+    let source_index = parse_display_source_index(Some(source_id))?.unwrap_or(0);
+    platform_display_origin(source_index)
+}
+
 pub fn set_display_mode(mode: &DisplayMode) -> Result<(Option<DisplayMode>, DisplayMode)> {
     let source_index = parse_display_source_index(mode.source_id.as_deref())?.unwrap_or(0);
     let previous = current_platform_display_mode(source_index).ok();
@@ -504,6 +509,12 @@ fn platform_display_device_name(source_index: u32) -> Result<String> {
     Ok(windows_display_target_for_source_index(source_index)?.device_name)
 }
 
+#[cfg(windows)]
+fn platform_display_origin(source_index: u32) -> Result<(i32, i32)> {
+    let target = windows_display_target_for_source_index(source_index)?;
+    Ok((target.left, target.top))
+}
+
 #[cfg(not(windows))]
 fn list_platform_display_modes(_source_index: Option<u32>) -> Result<Vec<DisplayMode>> {
     anyhow::bail!("display mode control is currently only available on Windows")
@@ -526,6 +537,11 @@ fn set_platform_display_mode(_source_index: u32, _mode: &DisplayMode) -> Result<
 
 #[cfg(not(windows))]
 fn platform_display_device_name(_source_index: u32) -> Result<String> {
+    anyhow::bail!("display mode control is currently only available on Windows")
+}
+
+#[cfg(not(windows))]
+fn platform_display_origin(_source_index: u32) -> Result<(i32, i32)> {
     anyhow::bail!("display mode control is currently only available on Windows")
 }
 

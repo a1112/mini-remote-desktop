@@ -119,8 +119,9 @@ Controlled side:
 1. The service receives a control frame.
 2. The frame is decoded and sequence-checked per lane.
 3. The service validates permissions and session state.
-4. The platform injector applies the event.
-5. Counters and last error are updated.
+4. Mouse move events are mapped from transmitted frame coordinates into the selected capture source dimensions. For Windows display sources, the selected monitor's virtual desktop origin is added before injection.
+5. The platform injector applies the event.
+6. Counters and last error are updated.
 
 ## Safety and Policy
 

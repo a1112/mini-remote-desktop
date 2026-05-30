@@ -13,6 +13,16 @@ pub struct ControlInputResult {
     pub event_count: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControlInputTargetGeometry {
+    pub frame_width: u32,
+    pub frame_height: u32,
+    pub source_width: u32,
+    pub source_height: u32,
+    pub origin_x: i32,
+    pub origin_y: i32,
+}
+
 #[derive(Debug, Clone, Default)]
 struct ControlLaneCounters {
     accepted_messages: u64,
@@ -162,6 +172,48 @@ fn lane_snapshot(
     }
 }
 
+pub fn map_control_input_event_for_target_geometry(
+    event: &ControlInputEvent,
+    geometry: Option<ControlInputTargetGeometry>,
+) -> ControlInputEvent {
+    let Some(geometry) = geometry else {
+        return event.clone();
+    };
+    match *event {
+        ControlInputEvent::MouseMove { x, y } => {
+            let x = scale_target_coordinate(
+                x,
+                geometry.frame_width,
+                geometry.source_width,
+                geometry.origin_x,
+            );
+            let y = scale_target_coordinate(
+                y,
+                geometry.frame_height,
+                geometry.source_height,
+                geometry.origin_y,
+            );
+            ControlInputEvent::MouseMove { x, y }
+        }
+        _ => event.clone(),
+    }
+}
+
+fn scale_target_coordinate(
+    coordinate: i32,
+    frame_extent: u32,
+    source_extent: u32,
+    origin: i32,
+) -> i32 {
+    if frame_extent == 0 || source_extent == 0 {
+        return coordinate;
+    }
+    let scaled = i64::from(coordinate) * i64::from(source_extent) / i64::from(frame_extent);
+    let max_source = i64::from(source_extent.saturating_sub(1));
+    let bounded = scaled.clamp(0, max_source) + i64::from(origin);
+    bounded.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+}
+
 fn input_event_from_ipc(event: &ControlInputEvent) -> Result<InputEvent, InputError> {
     match *event {
         ControlInputEvent::MouseMove { x, y } => Ok(InputEvent::MouseMove { x, y }),
@@ -216,6 +268,63 @@ mod tests {
                 pressed: true,
             }),
             ControlInputLane::Reliable
+        );
+    }
+
+    #[test]
+    fn target_geometry_scales_frame_mouse_move_to_capture_source_coordinates() {
+        let event = map_control_input_event_for_target_geometry(
+            &ControlInputEvent::MouseMove { x: 640, y: 360 },
+            Some(ControlInputTargetGeometry {
+                frame_width: 1280,
+                frame_height: 720,
+                source_width: 2560,
+                source_height: 1440,
+                origin_x: 0,
+                origin_y: 0,
+            }),
+        );
+
+        assert_eq!(event, ControlInputEvent::MouseMove { x: 1280, y: 720 });
+    }
+
+    #[test]
+    fn target_geometry_adds_display_origin_and_clamps_to_source_bounds() {
+        let event = map_control_input_event_for_target_geometry(
+            &ControlInputEvent::MouseMove { x: 1280, y: 720 },
+            Some(ControlInputTargetGeometry {
+                frame_width: 1280,
+                frame_height: 720,
+                source_width: 2560,
+                source_height: 1440,
+                origin_x: 1920,
+                origin_y: -120,
+            }),
+        );
+
+        assert_eq!(event, ControlInputEvent::MouseMove { x: 4479, y: 1319 });
+    }
+
+    #[test]
+    fn target_geometry_leaves_non_pointer_events_unchanged() {
+        let event = ControlInputEvent::Key {
+            key: ControlInputKey::VirtualKey { code: 0x41 },
+            pressed: true,
+        };
+
+        assert_eq!(
+            map_control_input_event_for_target_geometry(
+                &event,
+                Some(ControlInputTargetGeometry {
+                    frame_width: 1280,
+                    frame_height: 720,
+                    source_width: 2560,
+                    source_height: 1440,
+                    origin_x: 1920,
+                    origin_y: 0,
+                }),
+            ),
+            event
         );
     }
 }
