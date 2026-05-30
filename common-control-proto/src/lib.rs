@@ -601,6 +601,38 @@ mod tests {
     }
 
     #[test]
+    fn control_events_use_expected_channel_classes() {
+        let cases = [
+            (
+                ControlEvent::MouseMove { x: 1, y: 2 },
+                ChannelClass::Realtime,
+            ),
+            (
+                ControlEvent::MouseWheel { delta: -120 },
+                ChannelClass::Realtime,
+            ),
+            (
+                ControlEvent::MouseButton {
+                    button: 1,
+                    pressed: true,
+                },
+                ChannelClass::Reliable,
+            ),
+            (
+                ControlEvent::Key {
+                    key: 0x41,
+                    pressed: true,
+                },
+                ChannelClass::Reliable,
+            ),
+        ];
+
+        for (event, expected) in cases {
+            assert_eq!(event.channel_class(), expected, "{event:?}");
+        }
+    }
+
+    #[test]
     fn encode_decode_roundtrip_clipboard_set() {
         let frame = Frame {
             flags: 0,
