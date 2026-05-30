@@ -239,20 +239,29 @@ fn key_input(
     pressed: bool,
 ) -> ::windows::Win32::UI::Input::KeyboardAndMouse::INPUT {
     use ::windows::Win32::UI::Input::KeyboardAndMouse::{
-        INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY,
+        INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY,
+        KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, VIRTUAL_KEY,
     };
+
+    let scan_code = keyboard_scan_code(virtual_key);
+    let mut flags = KEYBD_EVENT_FLAGS(0);
+    if scan_code != 0 {
+        flags |= KEYEVENTF_SCANCODE;
+    }
+    if scan_code != 0 && is_extended_keyboard_scan_code(scan_code) {
+        flags |= KEYEVENTF_EXTENDEDKEY;
+    }
+    if !pressed {
+        flags |= KEYEVENTF_KEYUP;
+    }
 
     INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
             ki: KEYBDINPUT {
-                wVk: VIRTUAL_KEY(virtual_key),
-                wScan: 0,
-                dwFlags: if pressed {
-                    Default::default()
-                } else {
-                    KEYEVENTF_KEYUP
-                },
+                wVk: VIRTUAL_KEY(if scan_code == 0 { virtual_key } else { 0 }),
+                wScan: scan_code,
+                dwFlags: flags,
                 time: 0,
                 dwExtraInfo: 0,
             },
@@ -260,11 +269,24 @@ fn key_input(
     }
 }
 
+fn keyboard_scan_code(virtual_key: u16) -> u16 {
+    use ::windows::Win32::UI::Input::KeyboardAndMouse::{MapVirtualKeyW, MAPVK_VK_TO_VSC_EX};
+
+    unsafe { MapVirtualKeyW(u32::from(virtual_key), MAPVK_VK_TO_VSC_EX) as u16 }
+}
+
+fn is_extended_keyboard_scan_code(scan_code: u16) -> bool {
+    matches!(scan_code >> 8, 0xE0 | 0xE1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{InputButton, InputError, InputEvent, InputInjector, InputKey};
+    use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, Instant};
+
+    static KEYBOARD_SMOKE_EVENTS: OnceLock<Mutex<Vec<KeyboardSmokeEvent>>> = OnceLock::new();
 
     #[test]
     fn windows_mapping_mouse_buttons_preserves_button_and_pressed_state() {
@@ -361,6 +383,23 @@ mod tests {
     }
 
     #[test]
+    fn windows_key_input_populates_layout_scan_code() {
+        use ::windows::Win32::UI::Input::KeyboardAndMouse::KEYEVENTF_SCANCODE;
+
+        let input = key_input(0x41, true);
+
+        unsafe {
+            assert_eq!(
+                input.r#type,
+                ::windows::Win32::UI::Input::KeyboardAndMouse::INPUT_KEYBOARD
+            );
+            assert_eq!(input.Anonymous.ki.wVk.0, 0);
+            assert_ne!(input.Anonymous.ki.wScan, 0);
+            assert_eq!(input.Anonymous.ki.dwFlags, KEYEVENTF_SCANCODE);
+        }
+    }
+
+    #[test]
     fn windows_mapping_rejects_empty_virtual_key() {
         assert_eq!(
             map_windows_input(&InputEvent::Key {
@@ -413,6 +452,256 @@ mod tests {
         assert!(cursor_distance(after_move, start) > 10);
         assert!(moved.is_some());
         assert!(restored.is_some());
+    }
+
+    #[test]
+    #[ignore = "manual smoke test: creates a focused window and sends a key through SendInput"]
+    fn windows_sendinput_keyboard_smoke_sends_key_to_focused_test_window() {
+        let mut window = KeyboardSmokeWindow::create().expect("create keyboard smoke window");
+        window.focus();
+        let mut injector = WindowsSendInputInjector::new();
+
+        injector
+            .inject(&InputEvent::Key {
+                key: InputKey::VirtualKey(0x41),
+                pressed: true,
+            })
+            .expect("send key down");
+        injector
+            .inject(&InputEvent::Key {
+                key: InputKey::VirtualKey(0x41),
+                pressed: false,
+            })
+            .expect("send key up");
+
+        let events = window
+            .wait_for_key_events(0x41, Duration::from_millis(500))
+            .expect("wait for key events");
+        eprintln!(
+            "keyboard sendinput smoke focus={:?} events={:?}",
+            window.focus_snapshot(),
+            keyboard_smoke_events()
+                .lock()
+                .expect("read key smoke events")
+        );
+        assert!(events.key_down, "expected WM_KEYDOWN for virtual key 0x41");
+        assert!(events.key_up, "expected WM_KEYUP for virtual key 0x41");
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum KeyboardSmokeEvent {
+        KeyDown(u16),
+        KeyUp(u16),
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct KeyboardSmokeResult {
+        key_down: bool,
+        key_up: bool,
+    }
+
+    struct KeyboardSmokeWindow {
+        hwnd: windows::Win32::Foundation::HWND,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct KeyboardSmokeFocusSnapshot {
+        hwnd: isize,
+        foreground: isize,
+        focus: isize,
+    }
+
+    impl KeyboardSmokeWindow {
+        fn create() -> windows::core::Result<Self> {
+            use windows::core::PCWSTR;
+            use windows::Win32::Foundation::HINSTANCE;
+            use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+            use windows::Win32::UI::WindowsAndMessaging::{
+                CreateWindowExW, RegisterClassW, ShowWindow, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
+                SW_SHOW, WINDOW_EX_STYLE, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+            };
+
+            keyboard_smoke_events()
+                .lock()
+                .expect("clear events")
+                .clear();
+
+            let class_name = wide_null(&format!(
+                "MrdInputKeyboardSmoke{}{}",
+                std::process::id(),
+                current_time_millis()
+            ));
+            let title = wide_null("MRD input keyboard smoke");
+            unsafe {
+                let hmodule = GetModuleHandleW(None)?;
+                let hinstance = HINSTANCE(hmodule.0);
+                let window_class = WNDCLASSW {
+                    style: CS_HREDRAW | CS_VREDRAW,
+                    lpfnWndProc: Some(keyboard_smoke_wnd_proc),
+                    hInstance: hinstance,
+                    lpszClassName: PCWSTR(class_name.as_ptr()),
+                    ..Default::default()
+                };
+                if RegisterClassW(&window_class) == 0 {
+                    return Err(windows::core::Error::from_thread());
+                }
+
+                let hwnd = CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    PCWSTR(class_name.as_ptr()),
+                    PCWSTR(title.as_ptr()),
+                    WS_OVERLAPPEDWINDOW,
+                    CW_USEDEFAULT,
+                    CW_USEDEFAULT,
+                    320,
+                    160,
+                    None,
+                    None,
+                    Some(hinstance),
+                    None,
+                )?;
+                let _ = ShowWindow(hwnd, SW_SHOW);
+                let _ = windows::Win32::Graphics::Gdi::UpdateWindow(hwnd);
+                pump_window_messages();
+
+                Ok(Self { hwnd })
+            }
+        }
+
+        fn focus(&mut self) {
+            use windows::Win32::UI::Input::KeyboardAndMouse::{SetActiveWindow, SetFocus};
+            use windows::Win32::UI::WindowsAndMessaging::{BringWindowToTop, SetForegroundWindow};
+
+            unsafe {
+                let _ = BringWindowToTop(self.hwnd);
+                let _ = SetForegroundWindow(self.hwnd);
+                let _ = SetActiveWindow(self.hwnd);
+                let _ = SetFocus(Some(self.hwnd));
+            }
+            let deadline = Instant::now() + Duration::from_millis(300);
+            while Instant::now() < deadline {
+                pump_window_messages();
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn wait_for_key_events(
+            &mut self,
+            virtual_key: u16,
+            timeout: Duration,
+        ) -> windows::core::Result<KeyboardSmokeResult> {
+            let deadline = Instant::now() + timeout;
+            loop {
+                pump_window_messages();
+                let result = keyboard_smoke_result(virtual_key);
+                if result.key_down && result.key_up {
+                    return Ok(result);
+                }
+                if Instant::now() >= deadline {
+                    return Ok(result);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn focus_snapshot(&self) -> KeyboardSmokeFocusSnapshot {
+            unsafe {
+                KeyboardSmokeFocusSnapshot {
+                    hwnd: self.hwnd.0 as isize,
+                    foreground: windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow().0
+                        as isize,
+                    focus: windows::Win32::UI::Input::KeyboardAndMouse::GetFocus().0 as isize,
+                }
+            }
+        }
+    }
+
+    impl Drop for KeyboardSmokeWindow {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(self.hwnd);
+            }
+            pump_window_messages();
+        }
+    }
+
+    unsafe extern "system" fn keyboard_smoke_wnd_proc(
+        hwnd: windows::Win32::Foundation::HWND,
+        message: u32,
+        wparam: windows::Win32::Foundation::WPARAM,
+        lparam: windows::Win32::Foundation::LPARAM,
+    ) -> windows::Win32::Foundation::LRESULT {
+        use windows::Win32::UI::WindowsAndMessaging::{DefWindowProcW, WM_KEYDOWN, WM_KEYUP};
+
+        match message {
+            WM_KEYDOWN => {
+                keyboard_smoke_events()
+                    .lock()
+                    .expect("record key down")
+                    .push(KeyboardSmokeEvent::KeyDown(wparam.0 as u16));
+                windows::Win32::Foundation::LRESULT(0)
+            }
+            WM_KEYUP => {
+                keyboard_smoke_events()
+                    .lock()
+                    .expect("record key up")
+                    .push(KeyboardSmokeEvent::KeyUp(wparam.0 as u16));
+                windows::Win32::Foundation::LRESULT(0)
+            }
+            _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+        }
+    }
+
+    fn keyboard_smoke_events() -> &'static Mutex<Vec<KeyboardSmokeEvent>> {
+        KEYBOARD_SMOKE_EVENTS.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    fn keyboard_smoke_result(virtual_key: u16) -> KeyboardSmokeResult {
+        let ime_process_key = windows::Win32::UI::Input::KeyboardAndMouse::VK_PROCESSKEY.0;
+        let events = keyboard_smoke_events().lock().expect("read key events");
+        // Some active IMEs report injected key-down messages as VK_PROCESSKEY,
+        // while the key-up still carries the original virtual key.
+        KeyboardSmokeResult {
+            key_down: events.iter().any(|event| {
+                matches!(
+                    *event,
+                    KeyboardSmokeEvent::KeyDown(key)
+                        if key == virtual_key || key == ime_process_key
+                )
+            }),
+            key_up: events.iter().any(|event| {
+                matches!(
+                    *event,
+                    KeyboardSmokeEvent::KeyUp(key)
+                        if key == virtual_key || key == ime_process_key
+                )
+            }),
+        }
+    }
+
+    fn pump_window_messages() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+        };
+
+        unsafe {
+            let mut message = MSG::default();
+            while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+                let _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+    }
+
+    fn wide_null(value: &str) -> Vec<u16> {
+        value.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    fn current_time_millis() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or_default()
     }
 
     fn current_cursor_position() -> windows::core::Result<(i32, i32)> {
