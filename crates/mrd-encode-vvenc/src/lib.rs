@@ -85,18 +85,28 @@ mod imp {
 #[cfg(feature = "software-vvenc")]
 mod imp {
     use super::*;
-    use vvenc::{
-        ChromaFormat, Config, DecodingRefreshType, Encoder, LogLevel, Preset, Rational, YUVBuffer,
-        YUVComponent,
+    use std::{
+        ffi::CStr,
+        mem,
+        os::raw::{c_char, c_int},
+        ptr::NonNull,
     };
+    use vvenc_sys::*;
 
     pub struct Inner {
-        encoder: Encoder<u64>,
+        encoder: NonNull<vvencEncoder>,
         width: usize,
         height: usize,
-        fps: u32,
         frame_index: u64,
         output: Vec<u8>,
+    }
+
+    impl Drop for Inner {
+        fn drop(&mut self) {
+            unsafe {
+                vvenc_encoder_close(self.encoder.as_ptr());
+            }
+        }
     }
 
     impl Inner {
@@ -109,36 +119,49 @@ mod imp {
             validate_even_dimensions(width, height)?;
 
             let fps = fps.max(1);
-            let mut config = Config::new();
-            config
-                .set_preset(Preset::Faster)
-                .map_err(|error| PipelineError::message(format!("VVenC preset failed: {error}")))?;
-            config
-                .set_width(width as i32)
-                .set_height(height as i32)
-                .set_framerate(Rational {
-                    num: fps as i32,
-                    den: 1,
-                })
-                .set_ticks_per_second(1_000_000)
-                .set_frames_to_be_encoded(0)
-                .set_input_bit_depth([8, 8])
-                .set_target_bitrate((bitrate / 1000).max(1) as i32)
-                .set_num_threads(vvenc_thread_count())
-                .set_intra_period(fps as i32)
-                .set_gop_size(1)
-                .set_decoding_refresh_type(DecodingRefreshType::Idr)
-                .set_internal_chroma_format(ChromaFormat::Chroma420)
-                .set_log_level(LogLevel::Error);
+            let width_c = usize_to_c_int("width", width)?;
+            let height_c = usize_to_c_int("height", height)?;
+            let fps_c = u32_to_c_int("fps", fps)?;
+            let bitrate_bps = u32_to_c_int("bitrate bps", bitrate)?;
 
-            let encoder = Encoder::with_config(config)
-                .map_err(|error| PipelineError::message(format!("VVenC init failed: {error}")))?;
+            let mut config = unsafe { mem::zeroed::<vvenc_config>() };
+            vvenc_result(
+                "VVenC default config",
+                unsafe {
+                    vvenc_init_default(
+                        &mut config,
+                        width_c,
+                        height_c,
+                        fps_c,
+                        bitrate_bps,
+                        VVENC_AUTO_QP,
+                        vvencPresetMode_VVENC_FASTER,
+                    )
+                },
+                None,
+            )?;
+
+            config.m_numThreads = vvenc_thread_count();
+            config.m_verbosity = vvencMsgLevel_VVENC_ERROR;
+
+            let Some(encoder) = NonNull::new(unsafe { vvenc_encoder_create() }) else {
+                return Err(PipelineError::message("VVenC encoder allocation failed"));
+            };
+            if let Err(error) = vvenc_result(
+                "VVenC init",
+                unsafe { vvenc_encoder_open(encoder.as_ptr(), &mut config) },
+                Some(encoder),
+            ) {
+                unsafe {
+                    vvenc_encoder_close(encoder.as_ptr());
+                }
+                return Err(error);
+            }
 
             Ok(Self {
                 encoder,
                 width,
                 height,
-                fps,
                 frame_index: 0,
                 output: vec![0; vvenc_output_len(width, height)?],
             })
@@ -156,34 +179,37 @@ mod imp {
             }
             validate_even_dimensions(frame.width, frame.height)?;
 
-            let mut yuv = YUVBuffer::new(
-                frame.width as i32,
-                frame.height as i32,
-                ChromaFormat::Chroma420,
-            );
+            let mut yuv = OwnedYuvBuffer::new(frame.width, frame.height)?;
             write_yuv420_i16(frame, &mut yuv)?;
-            yuv.set_sequence_number(self.frame_index);
-            yuv.set_cts(frame.timestamp_us);
-            yuv.set_opaque(frame.timestamp_us);
+            yuv.raw.sequenceNumber = self.frame_index;
+            yuv.raw.cts = timestamp_to_i64(frame.timestamp_us);
+            yuv.raw.ctsValid = true;
 
-            let result = self
-                .encoder
-                .encode(&mut yuv, &mut self.output)
-                .map_err(|error| PipelineError::message(format!("VVenC encode failed: {error}")))?;
+            let mut access_unit = AccessUnitBuffer::new(&mut self.output)?;
+            let mut encode_done = false;
+            vvenc_result(
+                "VVenC encode",
+                unsafe {
+                    vvenc_encode(
+                        self.encoder.as_ptr(),
+                        &mut yuv.raw,
+                        &mut access_unit.raw,
+                        &mut encode_done,
+                    )
+                },
+                Some(self.encoder),
+            )?;
             self.frame_index += 1;
 
-            let Some(access_unit) = result else {
-                return Ok(Vec::new());
-            };
-            let bytes = access_unit.payload().to_vec();
+            let bytes = access_unit.payload()?.to_vec();
             if bytes.is_empty() {
                 return Ok(Vec::new());
             }
 
             Ok(vec![EncodedAccessUnit {
                 codec: VideoCodec::Vvc,
-                timestamp_us: access_unit.cts().unwrap_or(frame.timestamp_us),
-                is_keyframe: access_unit.rap() || annex_b_contains_vvc_keyframe(&bytes),
+                timestamp_us: access_unit.timestamp_us(frame.timestamp_us),
+                is_keyframe: access_unit.raw.rap || annex_b_contains_vvc_keyframe(&bytes),
                 bytes,
             }])
         }
@@ -194,7 +220,89 @@ mod imp {
     }
 
     pub fn probe_available() -> Result<(), PipelineError> {
-        Inner::new(16, 16, 30, 1_000_000).map(|_| ())
+        Inner::new(176, 144, 30, 1_000_000).map(|_| ())
+    }
+
+    struct OwnedYuvBuffer {
+        raw: vvencYUVBuffer,
+    }
+
+    impl OwnedYuvBuffer {
+        fn new(width: usize, height: usize) -> Result<Self, PipelineError> {
+            let mut raw = unsafe { mem::zeroed::<vvencYUVBuffer>() };
+            unsafe {
+                vvenc_YUVBuffer_alloc_buffer(
+                    &mut raw,
+                    vvencChromaFormat_VVENC_CHROMA_420,
+                    usize_to_c_int("width", width)?,
+                    usize_to_c_int("height", height)?,
+                );
+            }
+            if raw.planes.iter().any(|plane| plane.ptr.is_null()) {
+                unsafe {
+                    vvenc_YUVBuffer_free_buffer(&mut raw);
+                }
+                return Err(PipelineError::message("VVenC YUV buffer allocation failed"));
+            }
+            Ok(Self { raw })
+        }
+    }
+
+    impl Drop for OwnedYuvBuffer {
+        fn drop(&mut self) {
+            unsafe {
+                vvenc_YUVBuffer_free_buffer(&mut self.raw);
+            }
+        }
+    }
+
+    struct AccessUnitBuffer<'a> {
+        raw: vvencAccessUnit,
+        data: &'a mut [u8],
+    }
+
+    impl<'a> AccessUnitBuffer<'a> {
+        fn new(data: &'a mut [u8]) -> Result<Self, PipelineError> {
+            let payload_size = usize_to_c_int("VVenC output buffer", data.len())?;
+            let mut raw = unsafe { mem::zeroed::<vvencAccessUnit>() };
+            unsafe {
+                vvenc_accessUnit_default(&mut raw);
+            }
+            raw.payload = data.as_mut_ptr();
+            raw.payloadSize = payload_size;
+            raw.payloadUsedSize = 0;
+            Ok(Self { raw, data })
+        }
+
+        fn payload(&self) -> Result<&[u8], PipelineError> {
+            if self.raw.payloadUsedSize < 0 {
+                return Err(PipelineError::message(format!(
+                    "VVenC returned negative payload size {}",
+                    self.raw.payloadUsedSize
+                )));
+            }
+            let used = self.raw.payloadUsedSize as usize;
+            if used > self.data.len() {
+                return Err(PipelineError::message(format!(
+                    "VVenC payload overflow: used {used}, capacity {}",
+                    self.data.len()
+                )));
+            }
+            Ok(&self.data[..used])
+        }
+
+        fn timestamp_us(&self, fallback: u64) -> u64 {
+            if self.raw.ctsValid && self.raw.cts >= 0 {
+                self.raw.cts as u64
+            } else {
+                fallback
+            }
+        }
+    }
+
+    struct PlaneMut<'a> {
+        data: &'a mut [i16],
+        stride: usize,
     }
 
     fn validate_even_dimensions(width: usize, height: usize) -> Result<(), PipelineError> {
@@ -215,6 +323,52 @@ mod imp {
         std::thread::available_parallelism()
             .map(|count| count.get().clamp(1, 8) as i32)
             .unwrap_or(1)
+    }
+
+    fn usize_to_c_int(label: &str, value: usize) -> Result<c_int, PipelineError> {
+        c_int::try_from(value).map_err(|_| {
+            PipelineError::message(format!("{label} does not fit in VVenC c_int: {value}"))
+        })
+    }
+
+    fn u32_to_c_int(label: &str, value: u32) -> Result<c_int, PipelineError> {
+        c_int::try_from(value).map_err(|_| {
+            PipelineError::message(format!("{label} does not fit in VVenC c_int: {value}"))
+        })
+    }
+
+    fn timestamp_to_i64(timestamp_us: u64) -> i64 {
+        timestamp_us.min(i64::MAX as u64) as i64
+    }
+
+    fn vvenc_result(
+        context: &str,
+        code: c_int,
+        encoder: Option<NonNull<vvencEncoder>>,
+    ) -> Result<(), PipelineError> {
+        if code == ErrorCodes_VVENC_OK {
+            return Ok(());
+        }
+
+        let last_error =
+            encoder.and_then(|encoder| unsafe { c_string(vvenc_get_last_error(encoder.as_ptr())) });
+        let error_name = unsafe { c_string(vvenc_get_error_msg(code)) };
+        let mut message = format!(
+            "{context} failed: {} ({code})",
+            error_name.unwrap_or_else(|| "unknown VVenC error".to_string())
+        );
+        if let Some(last_error) = last_error.filter(|error| !error.is_empty()) {
+            message.push_str(": ");
+            message.push_str(&last_error);
+        }
+        Err(PipelineError::message(message))
+    }
+
+    unsafe fn c_string(value: *const c_char) -> Option<String> {
+        if value.is_null() {
+            return None;
+        }
+        Some(CStr::from_ptr(value).to_string_lossy().into_owned())
     }
 
     fn vvenc_output_len(width: usize, height: usize) -> Result<usize, PipelineError> {
@@ -246,7 +400,7 @@ mod imp {
 
     fn write_yuv420_i16(
         frame: &CapturedFrame,
-        yuv: &mut YUVBuffer<u64>,
+        yuv: &mut OwnedYuvBuffer,
     ) -> Result<(), PipelineError> {
         let expected_len = frame_input_len(frame)?;
         if frame.data.len() != expected_len {
@@ -256,15 +410,13 @@ mod imp {
             )));
         }
 
-        let mut y_plane = yuv.plane_mut(YUVComponent::Y);
-        let mut u_plane = yuv.plane_mut(YUVComponent::U);
-        let mut v_plane = yuv.plane_mut(YUVComponent::V);
-        let y_stride = y_plane.stride() as usize;
-        let u_stride = u_plane.stride() as usize;
-        let v_stride = v_plane.stride() as usize;
-        let y_data = y_plane.data_mut();
-        let u_data = u_plane.data_mut();
-        let v_data = v_plane.data_mut();
+        let (y_plane, u_plane, v_plane) = planes_mut(yuv)?;
+        let y_stride = y_plane.stride;
+        let u_stride = u_plane.stride;
+        let v_stride = v_plane.stride;
+        let y_data = y_plane.data;
+        let u_data = u_plane.data;
+        let v_data = v_plane.data;
 
         if frame.pixel_format == FramePixelFormat::Nv12 {
             let y_size = frame.width * frame.height;
@@ -314,6 +466,47 @@ mod imp {
         }
 
         Ok(())
+    }
+
+    fn planes_mut(
+        yuv: &mut OwnedYuvBuffer,
+    ) -> Result<(PlaneMut<'_>, PlaneMut<'_>, PlaneMut<'_>), PipelineError> {
+        let y_plane = yuv.raw.planes[0];
+        let u_plane = yuv.raw.planes[1];
+        let v_plane = yuv.raw.planes[2];
+        unsafe {
+            Ok((
+                plane_mut("Y", y_plane)?,
+                plane_mut("U", u_plane)?,
+                plane_mut("V", v_plane)?,
+            ))
+        }
+    }
+
+    unsafe fn plane_mut<'a>(
+        label: &str,
+        plane: vvencYUVPlane,
+    ) -> Result<PlaneMut<'a>, PipelineError> {
+        if plane.ptr.is_null() {
+            return Err(PipelineError::message(format!(
+                "VVenC {label} plane pointer is null"
+            )));
+        }
+        if plane.height < 0 || plane.stride < 0 {
+            return Err(PipelineError::message(format!(
+                "VVenC {label} plane has invalid shape {}x{} stride {}",
+                plane.width, plane.height, plane.stride
+            )));
+        }
+        let height = plane.height as usize;
+        let stride = plane.stride as usize;
+        let len = height
+            .checked_mul(stride)
+            .ok_or_else(|| PipelineError::message("VVenC plane size overflow"))?;
+        Ok(PlaneMut {
+            data: std::slice::from_raw_parts_mut(plane.ptr, len),
+            stride,
+        })
     }
 
     fn read_rgb(frame: &CapturedFrame, x: usize, y: usize, bytes_per_pixel: usize) -> (u8, u8, u8) {
@@ -401,5 +594,28 @@ mod tests {
 
         assert!(error.to_string().contains("software-vvenc"));
         assert!(!vvenc_software_compiled());
+    }
+
+    #[test]
+    #[cfg(feature = "software-vvenc")]
+    fn feature_build_initializes_and_encodes_with_vvenc() {
+        assert!(vvenc_software_compiled());
+        probe_vvenc_software_encoder_available().unwrap();
+
+        let width = 176;
+        let height = 144;
+        let mut encoder = VvencSoftwareEncoder::new(width, height, 30).unwrap();
+        let frame = CapturedFrame::from_cpu(
+            width,
+            height,
+            FramePixelFormat::Nv12,
+            12_345,
+            vec![128; width * height * 3 / 2],
+        );
+
+        let access_units = encoder.encode(&frame).unwrap();
+        assert!(access_units
+            .iter()
+            .all(|access_unit| access_unit.codec == VideoCodec::Vvc));
     }
 }

@@ -4,9 +4,9 @@
 
 **Goal:** Make `software_vvc` a real feature-gated local harness and benchmark codec path instead of an ambiguous legacy alias.
 
-**Architecture:** Add a dedicated `mrd-encode-vvenc` crate that implements `VideoEncoder` with a no-system-library default build and a `software-vvenc` feature for the real VVenC backend. Wire Rdesk's harness and benchmark parser to `EncoderType::SoftwareVvc`, and keep service/UI capabilities disabled unless the feature/probe says the VVenC/VVdeC path is usable.
+**Architecture:** Add a dedicated `mrd-encode-vvenc` crate that implements `VideoEncoder` with a no-system-library default build and a `software-vvenc` feature for the real VVenC backend. Wire Rdesk's harness and benchmark parser to `EncoderType::SoftwareVvc`, and keep service/UI capabilities disabled unless the feature/probe says the VVenC/VVdeC path is usable. Use `vvenc-sys` directly for the Windows feature build because the higher-level `vvenc` wrapper does not compile cleanly against MSVC-generated VVenC bindings.
 
-**Tech Stack:** Rust workspace crates, `vvenc`/`vvenc-sys` optional dependency, existing `mrd-decode` VVdeC path, Rdesk Tauri benchmark harness, Vitest capability matrix tests.
+**Tech Stack:** Rust workspace crates, optional `vvenc-sys` dependency, repo-local VVenC CMake bootstrap, existing `mrd-decode` VVdeC path, Rdesk Tauri benchmark harness, Vitest capability matrix tests.
 
 ---
 
@@ -31,10 +31,25 @@
 - Modify: `Cargo.toml`
 
 **Steps:**
-1. Add the crate as a workspace member with `vvenc` as an optional dependency.
+1. Add the crate as a workspace member with `vvenc-sys` as an optional dependency.
 2. Export `VvencSoftwareEncoder::new` and `new_with_bitrate`.
 3. In default builds, return a clear `PipelineError` saying VVenC is not compiled.
 4. With `software-vvenc`, convert CPU BGRA/RGBA/RGB24/NV12 frames to 8-bit 4:2:0 planes for VVenC and emit `VideoCodec::Vvc` Annex-B access units.
+
+**Implementation note:** the final Windows path depends on `vvenc-sys` rather than the safe `vvenc` wrapper. The wrapper's 0.1.2 release fails to compile on this MSVC host due generated binding type mismatches (`__va_list_tag`, `i32/u32`, and `i64/u64`). The local wrapper calls the C API directly, initializes with `vvenc_init_default`, and keeps preset-derived GOP parameters intact because forcing a one-frame GOP caused `vvenc_encoder_open` to fail during VVenC's dependent-parameter initialization.
+
+### Task 2b: Local VVenC Bootstrap
+
+**Files:**
+- Create: `tools/vvenc/setup_vvenc.ps1`
+- Create: `tools/vvenc/README.md`
+- Create: `tools/vvenc/.gitignore`
+
+**Steps:**
+1. Clone Fraunhofer VVenC `v1.14.0` into ignored `tools/vvenc/src`.
+2. Build and install with CMake/Visual Studio under ignored `tools/vvenc/install`.
+3. Validate `tools/vvenc/install/lib/pkgconfig/libvvenc.pc` through `pkg-config`.
+4. Generate ignored `tools/vvenc/env.local.ps1` for local `PKG_CONFIG_PATH` and `PATH` setup.
 
 ### Task 3: Rdesk Integration
 
