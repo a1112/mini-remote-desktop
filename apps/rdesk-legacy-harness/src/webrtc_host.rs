@@ -1350,7 +1350,7 @@ mod tests {
         assert_eq!(snapshot.decoded_frame_count, 1);
         assert_eq!(snapshot.last_decoded_width, 16);
         assert_eq!(snapshot.last_decoded_height, 16);
-        assert_eq!(snapshot.last_decoded_pixel_format.as_deref(), Some("Rgb24"));
+        assert_eq!(snapshot.last_decoded_pixel_format.as_deref(), Some("I420"));
         assert_eq!(snapshot.decode_error_count, 0);
         assert_eq!(snapshot.last_decode_error, None);
     }

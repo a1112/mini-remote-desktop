@@ -1427,9 +1427,34 @@ function mapClientPointToRemoteFrame(
   clientY: number,
   rect: DOMRect,
   frameSize: { width: number; height: number }
-): { x: number; y: number } {
-  const relativeX = rect.width > 0 ? (clientX - rect.left) / rect.width : 0;
-  const relativeY = rect.height > 0 ? (clientY - rect.top) / rect.height : 0;
+): { x: number; y: number } | null {
+  if (rect.width <= 0 || rect.height <= 0 || frameSize.width <= 0 || frameSize.height <= 0) {
+    return null;
+  }
+
+  const frameAspect = frameSize.width / frameSize.height;
+  const rectAspect = rect.width / rect.height;
+  let contentWidth = rect.width;
+  let contentHeight = rect.height;
+  let offsetX = 0;
+  let offsetY = 0;
+
+  if (rectAspect > frameAspect) {
+    contentWidth = rect.height * frameAspect;
+    offsetX = (rect.width - contentWidth) / 2;
+  } else if (rectAspect < frameAspect) {
+    contentHeight = rect.width / frameAspect;
+    offsetY = (rect.height - contentHeight) / 2;
+  }
+
+  const localX = clientX - rect.left - offsetX;
+  const localY = clientY - rect.top - offsetY;
+  if (localX < 0 || localY < 0 || localX > contentWidth || localY > contentHeight) {
+    return null;
+  }
+
+  const relativeX = localX / contentWidth;
+  const relativeY = localY / contentHeight;
   return {
     x: clamp(Math.round(relativeX * frameSize.width), 0, frameSize.width - 1),
     y: clamp(Math.round(relativeY * frameSize.height), 0, frameSize.height - 1),
@@ -2057,6 +2082,7 @@ export function RemoteDisplayWindowPage() {
   const webVideoFrameCountRef = useRef(0);
   const webRtcReceiverStatsRef = useRef<WebRtcReceiverStats | null>(null);
   const webPresentationLatencyStatsRef = useRef<WebRtcPresentationLatencyStats | null>(null);
+  const lastRemoteControlPointRef = useRef<{ x: number; y: number } | null>(null);
 
   const [context, setContext] = useState<RemoteDisplayWindowContext | null>(null);
   const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
@@ -2917,6 +2943,16 @@ export function RemoteDisplayWindowPage() {
     [controlInputEnabled, sessionId]
   );
 
+  const sendRemotePointerMoveIfNeeded = useCallback(
+    (point: { x: number; y: number }) => {
+      const lastPoint = lastRemoteControlPointRef.current;
+      if (lastPoint?.x === point.x && lastPoint.y === point.y) return;
+      lastRemoteControlPointRef.current = point;
+      sendControlInputEvent({ kind: "mouse_move", ...point });
+    },
+    [sendControlInputEvent]
+  );
+
   const controlPointFromPointerEvent = useCallback(
     (event: ReactPointerEvent<HTMLDivElement>) => {
       const rect = event.currentTarget.getBoundingClientRect();
@@ -2933,13 +2969,12 @@ export function RemoteDisplayWindowPage() {
   const handleRemotePointerMove = useCallback(
     (event: ReactPointerEvent<HTMLDivElement>) => {
       if (!controlInputEnabled) return;
+      const point = controlPointFromPointerEvent(event);
+      if (!point) return;
       event.preventDefault();
-      sendControlInputEvent({
-        kind: "mouse_move",
-        ...controlPointFromPointerEvent(event),
-      });
+      sendRemotePointerMoveIfNeeded(point);
     },
-    [controlInputEnabled, controlPointFromPointerEvent, sendControlInputEvent]
+    [controlInputEnabled, controlPointFromPointerEvent, sendRemotePointerMoveIfNeeded]
   );
 
   const handleRemotePointerDown = useCallback(
@@ -2947,16 +2982,24 @@ export function RemoteDisplayWindowPage() {
       if (!controlInputEnabled) return;
       const button = mapPointerButton(event.button);
       if (!button) return;
+      const point = controlPointFromPointerEvent(event);
+      if (!point) return;
       event.preventDefault();
       event.currentTarget.focus();
       event.currentTarget.setPointerCapture?.(event.pointerId);
+      sendRemotePointerMoveIfNeeded(point);
       sendControlInputEvent({
         kind: "mouse_button",
         button,
         pressed: true,
       });
     },
-    [controlInputEnabled, sendControlInputEvent]
+    [
+      controlInputEnabled,
+      controlPointFromPointerEvent,
+      sendControlInputEvent,
+      sendRemotePointerMoveIfNeeded,
+    ]
   );
 
   const handleRemotePointerUp = useCallback(
@@ -2964,15 +3007,23 @@ export function RemoteDisplayWindowPage() {
       if (!controlInputEnabled) return;
       const button = mapPointerButton(event.button);
       if (!button) return;
+      const point = controlPointFromPointerEvent(event);
+      if (!point) return;
       event.preventDefault();
       event.currentTarget.releasePointerCapture?.(event.pointerId);
+      sendRemotePointerMoveIfNeeded(point);
       sendControlInputEvent({
         kind: "mouse_button",
         button,
         pressed: false,
       });
     },
-    [controlInputEnabled, sendControlInputEvent]
+    [
+      controlInputEnabled,
+      controlPointFromPointerEvent,
+      sendControlInputEvent,
+      sendRemotePointerMoveIfNeeded,
+    ]
   );
 
   const handleRemoteWheel = useCallback(
@@ -3018,6 +3069,7 @@ export function RemoteDisplayWindowPage() {
 
   const handleRemoteBlur = useCallback(
     (_event: ReactFocusEvent<HTMLDivElement>) => {
+      lastRemoteControlPointRef.current = null;
       sendControlInputEvent({ kind: "release_all" });
     },
     [sendControlInputEvent]
@@ -3026,6 +3078,7 @@ export function RemoteDisplayWindowPage() {
   useEffect(() => {
     if (!controlInputEnabled) return;
     return () => {
+      lastRemoteControlPointRef.current = null;
       void ipcSendControlInput(sessionId, { kind: "release_all" });
     };
   }, [controlInputEnabled, sessionId]);

@@ -288,11 +288,11 @@ fn windows_signed_high_word(value: usize) -> i32 {
 }
 
 #[cfg(windows)]
-fn windows_surface_input_event_from_message(
+fn windows_surface_input_events_from_message(
     message: u32,
     wparam: usize,
     lparam: isize,
-) -> Option<mrd_ipc::ControlInputEvent> {
+) -> Vec<mrd_ipc::ControlInputEvent> {
     use windows::Win32::UI::WindowsAndMessaging::{
         WM_CANCELMODE, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
         WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP,
@@ -302,39 +302,43 @@ fn windows_surface_input_event_from_message(
     match message {
         WM_MOUSEMOVE => {
             let (x, y) = windows_mouse_coordinates_from_lparam(lparam);
-            Some(mrd_ipc::ControlInputEvent::MouseMove { x, y })
+            vec![mrd_ipc::ControlInputEvent::MouseMove { x, y }]
         }
-        WM_MOUSEWHEEL => Some(mrd_ipc::ControlInputEvent::MouseWheel {
+        WM_MOUSEWHEEL => vec![mrd_ipc::ControlInputEvent::MouseWheel {
             delta: windows_signed_high_word(wparam),
-        }),
-        WM_LBUTTONDOWN => Some(mouse_button_event(mrd_ipc::ControlInputButton::Left, true)),
-        WM_LBUTTONUP => Some(mouse_button_event(mrd_ipc::ControlInputButton::Left, false)),
-        WM_RBUTTONDOWN => Some(mouse_button_event(mrd_ipc::ControlInputButton::Right, true)),
-        WM_RBUTTONUP => Some(mouse_button_event(
-            mrd_ipc::ControlInputButton::Right,
-            false,
-        )),
-        WM_MBUTTONDOWN => Some(mouse_button_event(
-            mrd_ipc::ControlInputButton::Middle,
-            true,
-        )),
-        WM_MBUTTONUP => Some(mouse_button_event(
-            mrd_ipc::ControlInputButton::Middle,
-            false,
-        )),
+        }],
+        WM_LBUTTONDOWN => mouse_button_events(lparam, mrd_ipc::ControlInputButton::Left, true),
+        WM_LBUTTONUP => mouse_button_events(lparam, mrd_ipc::ControlInputButton::Left, false),
+        WM_RBUTTONDOWN => mouse_button_events(lparam, mrd_ipc::ControlInputButton::Right, true),
+        WM_RBUTTONUP => mouse_button_events(lparam, mrd_ipc::ControlInputButton::Right, false),
+        WM_MBUTTONDOWN => mouse_button_events(lparam, mrd_ipc::ControlInputButton::Middle, true),
+        WM_MBUTTONUP => mouse_button_events(lparam, mrd_ipc::ControlInputButton::Middle, false),
         WM_XBUTTONDOWN | WM_XBUTTONUP => {
             let button = match (wparam >> 16) & 0xffff {
                 1 => mrd_ipc::ControlInputButton::X1,
                 2 => mrd_ipc::ControlInputButton::X2,
-                _ => return None,
+                _ => return Vec::new(),
             };
-            Some(mouse_button_event(button, message == WM_XBUTTONDOWN))
+            mouse_button_events(lparam, button, message == WM_XBUTTONDOWN)
         }
-        WM_KEYDOWN | WM_SYSKEYDOWN => key_event(wparam, true),
-        WM_KEYUP | WM_SYSKEYUP => key_event(wparam, false),
-        WM_KILLFOCUS | WM_CANCELMODE => Some(mrd_ipc::ControlInputEvent::ReleaseAll),
-        _ => None,
+        WM_KEYDOWN | WM_SYSKEYDOWN => key_event(wparam, true).into_iter().collect(),
+        WM_KEYUP | WM_SYSKEYUP => key_event(wparam, false).into_iter().collect(),
+        WM_KILLFOCUS | WM_CANCELMODE => vec![mrd_ipc::ControlInputEvent::ReleaseAll],
+        _ => Vec::new(),
     }
+}
+
+#[cfg(windows)]
+fn mouse_button_events(
+    lparam: isize,
+    button: mrd_ipc::ControlInputButton,
+    pressed: bool,
+) -> Vec<mrd_ipc::ControlInputEvent> {
+    let (x, y) = windows_mouse_coordinates_from_lparam(lparam);
+    vec![
+        mrd_ipc::ControlInputEvent::MouseMove { x, y },
+        mouse_button_event(button, pressed),
+    ]
 }
 
 #[cfg(windows)]
@@ -407,10 +411,11 @@ impl NativeRenderSurface {
             wparam: WPARAM,
             lparam: LPARAM,
         ) -> LRESULT {
-            if let Some(event) =
-                windows_surface_input_event_from_message(message, wparam.0, lparam.0)
-            {
-                forward_windows_surface_input(hwnd, event);
+            let events = windows_surface_input_events_from_message(message, wparam.0, lparam.0);
+            if !events.is_empty() {
+                for event in events {
+                    forward_windows_surface_input(hwnd, event);
+                }
                 return LRESULT(0);
             }
             DefWindowProcW(hwnd, message, wparam, lparam)
@@ -752,52 +757,72 @@ mod remote_display_surface_input_tests {
             (-2, 300)
         );
         assert_eq!(
-            windows_surface_input_event_from_message(WM_MOUSEMOVE, 0, lparam(640, 360)),
-            Some(mrd_ipc::ControlInputEvent::MouseMove { x: 640, y: 360 })
+            windows_surface_input_events_from_message(WM_MOUSEMOVE, 0, lparam(640, 360)),
+            vec![mrd_ipc::ControlInputEvent::MouseMove { x: 640, y: 360 }]
         );
     }
 
     #[test]
     fn remote_display_surface_input_maps_button_and_wheel_messages() {
         assert_eq!(
-            windows_surface_input_event_from_message(WM_LBUTTONDOWN, 0, lparam(0, 0)),
-            Some(mrd_ipc::ControlInputEvent::MouseButton {
-                button: mrd_ipc::ControlInputButton::Left,
-                pressed: true,
-            })
+            windows_surface_input_events_from_message(WM_LBUTTONDOWN, 0, lparam(0, 0)),
+            vec![
+                mrd_ipc::ControlInputEvent::MouseMove { x: 0, y: 0 },
+                mrd_ipc::ControlInputEvent::MouseButton {
+                    button: mrd_ipc::ControlInputButton::Left,
+                    pressed: true,
+                },
+            ]
         );
         assert_eq!(
-            windows_surface_input_event_from_message(WM_LBUTTONUP, 0, lparam(0, 0)),
-            Some(mrd_ipc::ControlInputEvent::MouseButton {
-                button: mrd_ipc::ControlInputButton::Left,
-                pressed: false,
-            })
+            windows_surface_input_events_from_message(WM_LBUTTONUP, 0, lparam(0, 0)),
+            vec![
+                mrd_ipc::ControlInputEvent::MouseMove { x: 0, y: 0 },
+                mrd_ipc::ControlInputEvent::MouseButton {
+                    button: mrd_ipc::ControlInputButton::Left,
+                    pressed: false,
+                },
+            ]
         );
         assert_eq!(
-            windows_surface_input_event_from_message(WM_MOUSEWHEEL, (120_u16 as usize) << 16, 0),
-            Some(mrd_ipc::ControlInputEvent::MouseWheel { delta: 120 })
+            windows_surface_input_events_from_message(WM_MOUSEWHEEL, (120_u16 as usize) << 16, 0),
+            vec![mrd_ipc::ControlInputEvent::MouseWheel { delta: 120 }]
+        );
+    }
+
+    #[test]
+    fn remote_display_surface_input_moves_cursor_before_button_press() {
+        assert_eq!(
+            windows_surface_input_events_from_message(WM_LBUTTONDOWN, 0, lparam(640, 360)),
+            vec![
+                mrd_ipc::ControlInputEvent::MouseMove { x: 640, y: 360 },
+                mrd_ipc::ControlInputEvent::MouseButton {
+                    button: mrd_ipc::ControlInputButton::Left,
+                    pressed: true,
+                },
+            ]
         );
     }
 
     #[test]
     fn remote_display_surface_input_maps_key_and_focus_loss_messages() {
         assert_eq!(
-            windows_surface_input_event_from_message(WM_KEYDOWN, 0x41, 0),
-            Some(mrd_ipc::ControlInputEvent::Key {
+            windows_surface_input_events_from_message(WM_KEYDOWN, 0x41, 0),
+            vec![mrd_ipc::ControlInputEvent::Key {
                 key: mrd_ipc::ControlInputKey::VirtualKey { code: 0x41 },
                 pressed: true,
-            })
+            }]
         );
         assert_eq!(
-            windows_surface_input_event_from_message(WM_KEYUP, 0x41, 0),
-            Some(mrd_ipc::ControlInputEvent::Key {
+            windows_surface_input_events_from_message(WM_KEYUP, 0x41, 0),
+            vec![mrd_ipc::ControlInputEvent::Key {
                 key: mrd_ipc::ControlInputKey::VirtualKey { code: 0x41 },
                 pressed: false,
-            })
+            }]
         );
         assert_eq!(
-            windows_surface_input_event_from_message(WM_KILLFOCUS, 0, 0),
-            Some(mrd_ipc::ControlInputEvent::ReleaseAll)
+            windows_surface_input_events_from_message(WM_KILLFOCUS, 0, 0),
+            vec![mrd_ipc::ControlInputEvent::ReleaseAll]
         );
     }
 }

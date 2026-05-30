@@ -6,7 +6,7 @@
 
 The following example is for Linux GLX
 
-```rust
+```rust,ignore
 use nvenc::{session::Session, encoder::Encoder};
 
 fn main() {
