@@ -1498,6 +1498,25 @@ mod tests {
             .await;
         let server = IpcServer::new(app_state.clone());
         let session_id = SessionId("control-input-session".to_string());
+        app_state.sessions.lock().await.insert(
+            session_id.clone(),
+            SessionSnapshot {
+                session_id: session_id.clone(),
+                transport: "quic".to_string(),
+                source_device_id: Some(DeviceId("controller-device".to_string())),
+                target_device_id: None,
+                local_listen_addr: None,
+                local_server_name: None,
+                local_cert_der_b64: None,
+                remote_listen_addr: None,
+                remote_server_name: None,
+                remote_cert_der_b64: None,
+                lifecycle_state: SessionLifecycleState::Listening,
+                last_error: None,
+                sender_active: true,
+                receiver_active: false,
+            },
+        );
 
         let response = server
             .handle_request(IpcRequest::SendControlInput {
@@ -1532,6 +1551,87 @@ mod tests {
         assert_eq!(snapshot.reliable.injected_messages, 1);
         assert_eq!(snapshot.reliable.failed_messages, 0);
         assert_eq!(snapshot.realtime.accepted_messages, 0);
+    }
+
+    #[tokio::test]
+    async fn control_input_request_rejects_missing_session() {
+        let app_state = Arc::new(AppState::new());
+        app_state
+            .replace_control_input_for_test(mrd_input::RecordingInputInjector::available())
+            .await;
+        let server = IpcServer::new(app_state.clone());
+        let session_id = SessionId("missing-control-input-session".to_string());
+
+        let response = server
+            .handle_request(IpcRequest::SendControlInput {
+                session_id: session_id.clone(),
+                event: mrd_ipc::ControlInputEvent::MouseButton {
+                    button: mrd_ipc::ControlInputButton::Left,
+                    pressed: true,
+                },
+            })
+            .await;
+
+        match response {
+            IpcResponse::Error { code, message } => {
+                assert_eq!(code, "E_CONTROL_INPUT");
+                assert!(message.contains("session not found"));
+            }
+            other => panic!("expected missing session control input error, got {other:?}"),
+        }
+        let snapshot = app_state.control_input().lock().await.snapshot(session_id);
+        assert_eq!(snapshot.reliable.accepted_messages, 0);
+        assert_eq!(snapshot.reliable.injected_messages, 0);
+    }
+
+    #[tokio::test]
+    async fn control_input_request_rejects_closed_session() {
+        let app_state = Arc::new(AppState::new());
+        app_state
+            .replace_control_input_for_test(mrd_input::RecordingInputInjector::available())
+            .await;
+        let server = IpcServer::new(app_state.clone());
+        let session_id = SessionId("closed-control-input-session".to_string());
+        app_state.sessions.lock().await.insert(
+            session_id.clone(),
+            SessionSnapshot {
+                session_id: session_id.clone(),
+                transport: "quic".to_string(),
+                source_device_id: Some(DeviceId("controller-device".to_string())),
+                target_device_id: None,
+                local_listen_addr: None,
+                local_server_name: None,
+                local_cert_der_b64: None,
+                remote_listen_addr: None,
+                remote_server_name: None,
+                remote_cert_der_b64: None,
+                lifecycle_state: SessionLifecycleState::Closed,
+                last_error: None,
+                sender_active: false,
+                receiver_active: false,
+            },
+        );
+
+        let response = server
+            .handle_request(IpcRequest::SendControlInput {
+                session_id: session_id.clone(),
+                event: mrd_ipc::ControlInputEvent::Key {
+                    key: mrd_ipc::ControlInputKey::VirtualKey { code: 0x41 },
+                    pressed: true,
+                },
+            })
+            .await;
+
+        match response {
+            IpcResponse::Error { code, message } => {
+                assert_eq!(code, "E_CONTROL_INPUT");
+                assert!(message.to_ascii_lowercase().contains("closed"));
+            }
+            other => panic!("expected closed session control input error, got {other:?}"),
+        }
+        let snapshot = app_state.control_input().lock().await.snapshot(session_id);
+        assert_eq!(snapshot.reliable.accepted_messages, 0);
+        assert_eq!(snapshot.reliable.injected_messages, 0);
     }
 
     #[tokio::test]
@@ -1600,6 +1700,25 @@ mod tests {
             .await;
         let server = IpcServer::new(app_state.clone());
         let session_id = SessionId("control-input-failure-session".to_string());
+        app_state.sessions.lock().await.insert(
+            session_id.clone(),
+            SessionSnapshot {
+                session_id: session_id.clone(),
+                transport: "quic".to_string(),
+                source_device_id: Some(DeviceId("controller-device".to_string())),
+                target_device_id: None,
+                local_listen_addr: None,
+                local_server_name: None,
+                local_cert_der_b64: None,
+                remote_listen_addr: None,
+                remote_server_name: None,
+                remote_cert_der_b64: None,
+                lifecycle_state: SessionLifecycleState::Listening,
+                last_error: None,
+                sender_active: true,
+                receiver_active: false,
+            },
+        );
 
         let response = server
             .handle_request(IpcRequest::SendControlInput {

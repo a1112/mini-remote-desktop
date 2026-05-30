@@ -110,6 +110,8 @@ const LAN_INPUT_CONTROL_TRANSPORT: &str = "input_control_v1";
 const LAN_CONTROL_INPUT_ACK_TIMEOUT: Duration = Duration::from_millis(250);
 const LAN_CONTROL_INPUT_REALTIME_ATTEMPTS: usize = 1;
 const LAN_CONTROL_INPUT_RELIABLE_ATTEMPTS: usize = 3;
+const LAN_CONTROL_INPUT_DEDUPE_WINDOW_MS: u64 = 10_000;
+const LAN_CONTROL_INPUT_DEDUPE_CACHE_LIMIT: usize = 4096;
 const LAN_MEDIA_PROTOCOL_VERSION: u32 = 3;
 const LAN_CAPTURE_DXGI_CAPABILITY: &str = "dxgi_capture";
 const LAN_ENCODE_NVENC_H264_CAPABILITY: &str = "nvenc_h264";
@@ -137,6 +139,7 @@ static LAN_RENDER_NO_SURFACE_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(windows)]
 static LAN_RENDER_PRESENT_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 static LAN_DISCOVERY_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(0);
+static LAN_CONTROL_INPUT_EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
 const LAN_MEDIA_SENDER_ERROR_LOG_INTERVAL: u32 = 3;
 const LAN_MEDIA_RECEIVER_MAX_CONSECUTIVE_DECODE_ERRORS: u32 = 8;
 const LAN_MEDIA_RECEIVER_DECODE_ERROR_LOG_INTERVAL: u32 = 3;
@@ -238,6 +241,7 @@ pub struct LanDiscoveryState {
     running: AtomicBool,
     last_probe_ms: AtomicU64,
     peers: Mutex<HashMap<String, StoredLanPeer>>,
+    recent_control_inputs: Mutex<HashMap<LanControlInputDedupeKey, LanControlInputAckState>>,
     probe_requested: Notify,
     peer_changed: Notify,
 }
@@ -250,6 +254,7 @@ impl LanDiscoveryState {
             running: AtomicBool::new(false),
             last_probe_ms: AtomicU64::new(0),
             peers: Mutex::new(HashMap::new()),
+            recent_control_inputs: Mutex::new(HashMap::new()),
             probe_requested: Notify::new(),
             peer_changed: Notify::new(),
         }
@@ -414,6 +419,22 @@ struct StoredLanPeer {
     media_protocol_version: Option<u32>,
     media_capabilities: Vec<String>,
     last_seen_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct LanControlInputDedupeKey {
+    source_device_id: String,
+    session_id: String,
+    event_id: u64,
+}
+
+#[derive(Debug, Clone)]
+struct LanControlInputAckState {
+    accepted: bool,
+    message: Option<String>,
+    lane: Option<ControlInputLane>,
+    event_count: u32,
+    timestamp_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -597,6 +618,8 @@ enum LanDiscoveryPacket {
         instance_id: String,
         session_id: String,
         source_device_id: String,
+        #[serde(default)]
+        event_id: u64,
         event: ControlInputEvent,
         timestamp_ms: u64,
     },
@@ -606,6 +629,8 @@ enum LanDiscoveryPacket {
         app_id: String,
         instance_id: String,
         session_id: String,
+        #[serde(default)]
+        event_id: u64,
         accepted: bool,
         message: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1361,6 +1386,7 @@ pub async fn request_lan_control_input(
     let target =
         peer_control_addr_with_input_control_capability(app_state, &peer_device_id).await?;
     let source_device_id = local_device_id(app_state).await?;
+    let event_id = next_control_input_event_id();
 
     let socket = UdpSocket::bind(("0.0.0.0", 0))
         .await
@@ -1371,6 +1397,7 @@ pub async fn request_lan_control_input(
         instance_id: app_state.lan_discovery.instance_id.clone(),
         session_id: session_id.0.clone(),
         source_device_id,
+        event_id,
         event: event.clone(),
         timestamp_ms: now_ms(),
     };
@@ -1398,12 +1425,16 @@ pub async fn request_lan_control_input(
                 magic,
                 app_id,
                 session_id: ack_session_id,
+                event_id: ack_event_id,
                 accepted,
                 message,
                 lane,
                 event_count,
                 ..
-            } if is_valid_discovery_packet(&magic, &app_id) && ack_session_id == session_id.0 => {
+            } if is_valid_discovery_packet(&magic, &app_id)
+                && ack_session_id == session_id.0
+                && ack_event_id == event_id =>
+            {
                 if accepted {
                     return Ok(crate::control_input::ControlInputResult {
                         lane: lane.context("LAN peer accepted control input without lane")?,
@@ -1424,6 +1455,13 @@ pub async fn request_lan_control_input(
         "LAN control input request timed out after {} attempt(s)",
         attempts
     )
+}
+
+fn next_control_input_event_id() -> u64 {
+    LAN_CONTROL_INPUT_EVENT_COUNTER
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1)
+        .max(1)
 }
 
 fn control_input_request_attempts(event: &ControlInputEvent) -> usize {
@@ -2117,6 +2155,7 @@ async fn handle_packet(
             instance_id,
             session_id,
             source_device_id,
+            event_id,
             event,
             ..
         } => {
@@ -2127,20 +2166,18 @@ async fn handle_packet(
             }
 
             let session_id_value = SessionId(session_id.clone());
-            let input_result = accept_lan_control_input(app_state, &session_id_value, &event).await;
-            let (accepted, message, lane, event_count) = match input_result {
-                Ok(result) => (
-                    true,
-                    Some("injected".to_string()),
-                    Some(result.lane),
-                    result.event_count,
-                ),
-                Err(error) => (false, Some(error.to_string()), None, 0),
-            };
+            let ack_state = accept_or_replay_lan_control_input(
+                app_state,
+                &session_id_value,
+                &source_device_id,
+                event_id,
+                &event,
+            )
+            .await;
             tracing::debug!(
                 session_id = %session_id,
                 source_device_id = %source_device_id,
-                accepted,
+                accepted = ack_state.accepted,
                 "handled LAN control input"
             );
             let ack = LanDiscoveryPacket::ControlInputAck {
@@ -2148,10 +2185,11 @@ async fn handle_packet(
                 app_id: DISCOVERY_APP_ID.to_string(),
                 instance_id: app_state.lan_discovery.instance_id.clone(),
                 session_id,
-                accepted,
-                message,
-                lane,
-                event_count,
+                event_id,
+                accepted: ack_state.accepted,
+                message: ack_state.message,
+                lane: ack_state.lane,
+                event_count: ack_state.event_count,
                 timestamp_ms: now_ms(),
             };
             send_packet(socket, &ack, addr).await?;
@@ -2305,6 +2343,74 @@ async fn accept_lan_control_input(
         .await
         .handle_event(event)
         .map_err(Into::into)
+}
+
+async fn accept_or_replay_lan_control_input(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+    source_device_id: &str,
+    event_id: u64,
+    event: &ControlInputEvent,
+) -> LanControlInputAckState {
+    let now = now_ms();
+    let key = (event_id != 0).then(|| LanControlInputDedupeKey {
+        source_device_id: source_device_id.to_string(),
+        session_id: session_id.0.clone(),
+        event_id,
+    });
+    if let Some(key) = key.as_ref() {
+        let mut cache = app_state.lan_discovery.recent_control_inputs.lock().await;
+        prune_recent_control_inputs(&mut cache, now);
+        if let Some(cached) = cache.get(key).cloned() {
+            return cached;
+        }
+    }
+
+    let ack_state = match accept_lan_control_input(app_state, session_id, event).await {
+        Ok(result) => LanControlInputAckState {
+            accepted: true,
+            message: Some("injected".to_string()),
+            lane: Some(result.lane),
+            event_count: result.event_count,
+            timestamp_ms: now,
+        },
+        Err(error) => LanControlInputAckState {
+            accepted: false,
+            message: Some(error.to_string()),
+            lane: None,
+            event_count: 0,
+            timestamp_ms: now,
+        },
+    };
+
+    if let Some(key) = key {
+        let mut cache = app_state.lan_discovery.recent_control_inputs.lock().await;
+        cache.insert(key, ack_state.clone());
+        prune_recent_control_inputs(&mut cache, now);
+    }
+
+    ack_state
+}
+
+fn prune_recent_control_inputs(
+    cache: &mut HashMap<LanControlInputDedupeKey, LanControlInputAckState>,
+    now: u64,
+) {
+    let cutoff = now.saturating_sub(LAN_CONTROL_INPUT_DEDUPE_WINDOW_MS);
+    cache.retain(|_, ack| ack.timestamp_ms >= cutoff);
+    if cache.len() <= LAN_CONTROL_INPUT_DEDUPE_CACHE_LIMIT {
+        return;
+    }
+
+    let remove_count = cache.len() - LAN_CONTROL_INPUT_DEDUPE_CACHE_LIMIT;
+    let mut oldest = cache
+        .iter()
+        .map(|(key, ack)| (key.clone(), ack.timestamp_ms))
+        .collect::<Vec<_>>();
+    oldest.sort_by_key(|(_, timestamp_ms)| *timestamp_ms);
+    for (key, _) in oldest.into_iter().take(remove_count) {
+        cache.remove(&key);
+    }
 }
 
 async fn accept_lan_media_profile_update(
@@ -8394,6 +8500,72 @@ mod tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert_eq!(result.lane, mrd_ipc::ControlInputLane::Reliable);
         assert_eq!(result.event_count, 1);
+    }
+
+    #[tokio::test]
+    async fn duplicate_reliable_lan_control_input_replays_ack_without_reinjecting() {
+        let target_state = Arc::new(AppState::new());
+        target_state.devices.lock().await.register(
+            DeviceId("target-device".to_string()),
+            "Target Device".to_string(),
+        );
+        target_state
+            .replace_control_input_for_test(mrd_input::RecordingInputInjector::available())
+            .await;
+        let session_id = SessionId("input-dedupe-session".to_string());
+        target_state.sessions.lock().await.insert(
+            session_id.clone(),
+            SessionSnapshot {
+                session_id: session_id.clone(),
+                transport: "quic".to_string(),
+                source_device_id: Some(DeviceId("controller-device".to_string())),
+                target_device_id: None,
+                local_listen_addr: None,
+                local_server_name: None,
+                local_cert_der_b64: None,
+                remote_listen_addr: None,
+                remote_server_name: None,
+                remote_cert_der_b64: None,
+                lifecycle_state: SessionLifecycleState::Listening,
+                last_error: None,
+                sender_active: true,
+                receiver_active: false,
+            },
+        );
+
+        let event = mrd_ipc::ControlInputEvent::Key {
+            key: mrd_ipc::ControlInputKey::VirtualKey { code: 0x41 },
+            pressed: true,
+        };
+
+        let first = accept_or_replay_lan_control_input(
+            &target_state,
+            &session_id,
+            "controller-device",
+            42,
+            &event,
+        )
+        .await;
+        let second = accept_or_replay_lan_control_input(
+            &target_state,
+            &session_id,
+            "controller-device",
+            42,
+            &event,
+        )
+        .await;
+
+        assert!(first.accepted);
+        assert_eq!(second.accepted, first.accepted);
+        assert_eq!(second.lane, first.lane);
+        assert_eq!(second.event_count, first.event_count);
+        let snapshot = target_state
+            .control_input()
+            .lock()
+            .await
+            .snapshot(session_id);
+        assert_eq!(snapshot.reliable.accepted_messages, 1);
+        assert_eq!(snapshot.reliable.injected_messages, 1);
     }
 
     #[tokio::test]

@@ -197,12 +197,26 @@ pub async fn send_control_input(
     session_id: SessionId,
     event: ControlInputEvent,
 ) -> IpcResponse {
-    let route_to_peer = {
+    let route_to_peer = match {
         let sessions = app_state.sessions.lock().await;
-        sessions
-            .get(&session_id)
-            .and_then(|snapshot| snapshot.target_device_id.as_ref())
-            .is_some()
+        sessions.get(&session_id).cloned()
+    } {
+        Some(snapshot) if snapshot.lifecycle_state.is_terminal() => {
+            return IpcResponse::Error {
+                code: "E_CONTROL_INPUT".to_string(),
+                message: format!(
+                    "control input rejected for {} session",
+                    snapshot.lifecycle_state
+                ),
+            };
+        }
+        Some(snapshot) => snapshot.target_device_id.is_some(),
+        None => {
+            return IpcResponse::Error {
+                code: "E_CONTROL_INPUT".to_string(),
+                message: format!("session not found: {}", session_id.0),
+            };
+        }
     };
 
     let result = if route_to_peer {
