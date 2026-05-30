@@ -287,6 +287,41 @@ describe("buildCapabilitySnapshotFromIpc", () => {
     const support = evaluateProfileSupport("smoke.720p30", snapshot);
     expect(support.status).toBe("ready");
   });
+
+  it("keeps service-owned H.266/VVC software codec capabilities selectable when probed", () => {
+    const ipcSnapshot: IpcCapabilitySnapshot = {
+      schema_version: 1,
+      platform: "windows",
+      service_version: "0.1.0",
+      capabilities: [
+        {
+          id: "encode.software_vvc",
+          domain: "encode",
+          label: "Software H.266/VVC encode",
+          status: "available",
+          platform: "windows",
+        },
+        {
+          id: "decode.software_vvc",
+          domain: "decode",
+          label: "Software H.266/VVC decode",
+          status: "supported",
+          platform: "windows",
+        },
+      ],
+      constraints: [],
+      profiles: [],
+      updated_at_ms: 1,
+    };
+
+    const snapshot = buildCapabilitySnapshotFromIpc(ipcSnapshot);
+    const environment = environmentSnapshotFromCapabilitySnapshot(snapshot, windowsEnvironment);
+
+    expect(capabilityOptionState(snapshot, "encoder", "software_vvc")).toBe("selectable");
+    expect(capabilityOptionState(snapshot, "decoder", "software_vvc")).toBe("selectable");
+    expect(environment.available_encoders).toContain("software_vvc");
+    expect(environment.available_decoders).toContain("software_vvc");
+  });
 });
 
 describe("evaluateCapabilityCombination", () => {

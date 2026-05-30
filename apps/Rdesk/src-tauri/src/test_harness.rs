@@ -29,6 +29,7 @@ use mrd_encode_nvenc::{NvencH264Encoder, NvencHevcEncoder};
 #[cfg(any(windows, target_os = "linux"))]
 use mrd_encode_nvenc_av1::NvencAv1Encoder;
 use mrd_encode_openh264::OpenH264Encoder;
+use mrd_encode_vvenc::VvencSoftwareEncoder;
 use mrd_observability::PipelineComparisonResult;
 use mrd_pipeline_core::{
     CapturedFrame, DecodedFrame, DecodedFrameData, EncodedAccessUnit, FrameCapture,
@@ -112,6 +113,7 @@ pub enum EncoderType {
     NvencHevcMain10,
     NvencAv1,
     OpenH264,
+    SoftwareVvc,
     VideoToolboxH264,
 }
 
@@ -1998,6 +2000,10 @@ impl TestHarness {
                 encoder: EncoderType::NvencHevc | EncoderType::NvencHevcMain10,
                 ..
             } => VideoCodec::Hevc,
+            TestChain::Custom {
+                encoder: EncoderType::SoftwareVvc,
+                ..
+            } => VideoCodec::Vvc,
             _ => VideoCodec::H264,
         };
 
@@ -2360,6 +2366,45 @@ impl TestHarness {
                             Some(create_videotoolbox_h264_decoder()?),
                             true,
                         ),
+                    }
+                }
+                EncoderType::SoftwareVvc => {
+                    let enc = create_vvenc_encoder(width, height, fps, speed_bitrate)?;
+                    match decoder {
+                        DecoderType::None => (Some(enc), None, false),
+                        DecoderType::Software => {
+                            let dec = mrd_decode::create_decoder("software_vvc").map_err(|e| {
+                                anyhow::anyhow!("software_vvc decoder init failed: {:?}", e)
+                            })?;
+                            (Some(enc), Some(PipelineDecoder::Software(dec)), true)
+                        }
+                        DecoderType::Nvdec => {
+                            return Err(anyhow::anyhow!(
+                                "NVDEC decoder cannot decode VVenC H.266/VVC output"
+                            ));
+                        }
+                        DecoderType::FfmpegH264 => {
+                            return Err(anyhow::anyhow!(
+                                "FFmpeg H.264 decoder cannot decode VVenC H.266/VVC output"
+                            ));
+                        }
+                        DecoderType::FfmpegHevc => {
+                            return Err(anyhow::anyhow!(
+                                "FFmpeg HEVC decoder cannot decode VVenC H.266/VVC output"
+                            ));
+                        }
+                        DecoderType::LinuxH264
+                        | DecoderType::LinuxHevc
+                        | DecoderType::LinuxHevcMain10 => {
+                            return Err(anyhow::anyhow!(
+                                "Linux hardware decoders cannot decode VVenC H.266/VVC output"
+                            ));
+                        }
+                        DecoderType::VideoToolbox => {
+                            return Err(anyhow::anyhow!(
+                                "VideoToolbox decoder cannot decode VVenC H.266/VVC output"
+                            ));
+                        }
                     }
                 }
                 EncoderType::VideoToolboxH264 => {
@@ -3379,6 +3424,17 @@ fn create_hevc_encoder(
     }
 }
 
+fn create_vvenc_encoder(
+    width: usize,
+    height: usize,
+    fps: u32,
+    bitrate: u32,
+) -> Result<Box<dyn VideoEncoder>> {
+    let encoder = VvencSoftwareEncoder::new_with_bitrate(width, height, fps, bitrate)
+        .map_err(|e| anyhow::anyhow!("VVenC H.266/VVC encoder init failed: {:?}", e))?;
+    Ok(Box::new(encoder) as Box<dyn VideoEncoder>)
+}
+
 fn create_hevc_nvdec_decoder(
     use_shared_texture_decode: bool,
     d3d11_device_ptr: Option<*mut core::ffi::c_void>,
@@ -3529,6 +3585,7 @@ fn comparison_labels(chain: &TestChain) -> (&'static str, &'static str) {
                 EncoderType::NvencHevc => "hevc",
                 EncoderType::NvencHevcMain10 => "hevc-main10",
                 EncoderType::OpenH264 => "h264-software",
+                EncoderType::SoftwareVvc => "vvc-software",
                 EncoderType::NvencH264 | EncoderType::VideoToolboxH264 => "h264",
             };
             (pipeline, codec)
@@ -4952,6 +5009,30 @@ mod tests {
     }
 
     #[test]
+    fn software_vvc_encoder_aliases_map_to_vvenc() {
+        fn with_encoder_env(value: &str) -> EncoderType {
+            std::env::set_var("MRD_HARNESS_ENCODER", value);
+            let encoder = env_encoder_type();
+            std::env::remove_var("MRD_HARNESS_ENCODER");
+            encoder
+        }
+
+        assert_eq!(with_encoder_env("software_vvc"), EncoderType::SoftwareVvc);
+        assert_eq!(with_encoder_env("vvc_software"), EncoderType::SoftwareVvc);
+        assert_eq!(with_encoder_env("software_h266"), EncoderType::SoftwareVvc);
+        assert_eq!(with_encoder_env("vvenc"), EncoderType::SoftwareVvc);
+        assert!(!encoder_allows_zero_copy(&EncoderType::SoftwareVvc));
+        assert_eq!(
+            comparison_labels(&TestChain::Custom {
+                capture: CaptureType::Synthetic,
+                encoder: EncoderType::SoftwareVvc,
+                decoder: DecoderType::None,
+            }),
+            ("capture-encode", "vvc-software")
+        );
+    }
+
+    #[test]
     fn hevc_custom_chains_export_captest_comparison_labels() {
         let hevc = TestChain::Custom {
             capture: CaptureType::Dxgi,
@@ -5582,6 +5663,11 @@ mod tests {
             Ok("none") => EncoderType::None,
             Ok("openh264") | Ok("software_h264") | Ok("h264_software") | Ok("software-h264")
             | Ok("h264-software") | Ok("sw_h264") => EncoderType::OpenH264,
+            Ok("software_vvc") | Ok("vvc_software") | Ok("software_h266") | Ok("h266_software")
+            | Ok("software-vvc") | Ok("vvc-software") | Ok("software-h266")
+            | Ok("h266-software") | Ok("vvenc") | Ok("vvc") | Ok("h266") | Ok("h.266") => {
+                EncoderType::SoftwareVvc
+            }
             Ok("nvenc_av1") => EncoderType::NvencAv1,
             Ok("nvenc_hevc") | Ok("hevc") => EncoderType::NvencHevc,
             Ok("nvenc_hevc_main10") | Ok("hevc_main10") | Ok("hevc-main10") => {

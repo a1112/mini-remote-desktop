@@ -245,13 +245,8 @@ fn capability_status_label(status: &CapabilityStatus) -> &'static str {
 
 fn advertised_capability_status(id: &str) -> (CapabilityStatus, Option<String>) {
     if is_unwired_h266_software_capability(id) {
-        (
-            CapabilityStatus::Unimplemented,
-            Some(
-                "H.266/VVC software codec paths are capability-gated; VVenC/VVdeC are not wired as selectable service-owned LAN media paths."
-                    .to_string(),
-            ),
-        )
+        let (status, reason) = software_vvc_combined_status(CapabilityProbeMode::Static);
+        (status, Some(reason))
     } else {
         (CapabilityStatus::Available, None)
     }
@@ -477,14 +472,15 @@ fn add_encode_capabilities(
         "OpenH264",
         "Software encoder fallback; usable but below hardware path parity.",
     );
+    let (vvc_encode_status, vvc_encode_reason) = software_vvc_encode_status(probe_mode);
     push_item(
         items,
         platform,
         CapabilityDomain::Encode,
         "encode.software_vvc",
         "Software H.266/VVC encode",
-        CapabilityStatus::Unimplemented,
-        Some("H.266/VVC software encode is capability-gated; VVenC is not wired into the service-owned harness or LAN sender path."),
+        vvc_encode_status,
+        Some(vvc_encode_reason.as_str()),
     );
 
     let (h264_status, h264_reason) = match probe_mode {
@@ -565,14 +561,15 @@ fn add_decode_capabilities(
         "Software H.264 decode",
         "Software decoder fallback; usable but below hardware path parity.",
     );
+    let (vvc_decode_status, vvc_decode_reason) = software_vvc_decode_status(probe_mode);
     push_item(
         items,
         platform,
         CapabilityDomain::Decode,
         "decode.software_vvc",
         "Software H.266/VVC decode",
-        CapabilityStatus::Unimplemented,
-        Some("H.266/VVC software decode requires the optional VVdeC lower layer and is not wired as a selectable service-owned decode path."),
+        vvc_decode_status,
+        Some(vvc_decode_reason.as_str()),
     );
 
     let nvdec_status = if matches!(platform, CapabilityPlatform::Windows) {
@@ -1174,6 +1171,83 @@ fn ffmpeg_tool_status(probe_mode: CapabilityProbeMode) -> (CapabilityStatus, Str
                 })
                 .clone()
         }
+    }
+}
+
+fn software_vvc_combined_status(probe_mode: CapabilityProbeMode) -> (CapabilityStatus, String) {
+    let (encode_status, encode_reason) = software_vvc_encode_status(probe_mode);
+    let (decode_status, decode_reason) = software_vvc_decode_status(probe_mode);
+    if capability_status_runs(&encode_status) && capability_status_runs(&decode_status) {
+        (
+            CapabilityStatus::Supported,
+            format!(
+                "VVenC encode and VVdeC decode are feature-gated and available: {encode_reason}; {decode_reason}"
+            ),
+        )
+    } else if !capability_status_runs(&encode_status) {
+        (encode_status, encode_reason)
+    } else {
+        (decode_status, decode_reason)
+    }
+}
+
+fn software_vvc_encode_status(probe_mode: CapabilityProbeMode) -> (CapabilityStatus, String) {
+    if !cfg!(feature = "production-vvc-software-codec") {
+        return (
+            CapabilityStatus::Unimplemented,
+            "H.266/VVC software encode requires mrd-service feature production-vvc-software-codec, mrd-encode-vvenc feature software-vvenc, and libvvenc >= 1.13.0."
+                .to_string(),
+        );
+    }
+
+    match probe_mode {
+        CapabilityProbeMode::Static => (
+            CapabilityStatus::Supported,
+            "H.266/VVC software encode is compiled through VVenC; runtime probe is pending."
+                .to_string(),
+        ),
+        CapabilityProbeMode::Runtime => {
+            match mrd_encode_vvenc::probe_vvenc_software_encoder_available() {
+                Ok(()) => (
+                    CapabilityStatus::Available,
+                    "H.266/VVC software encode is available through VVenC.".to_string(),
+                ),
+                Err(error) => (
+                    CapabilityStatus::DriverMissing,
+                    format!(
+                        "H.266/VVC software encode requires a working libvvenc runtime: {error}"
+                    ),
+                ),
+            }
+        }
+    }
+}
+
+fn software_vvc_decode_status(probe_mode: CapabilityProbeMode) -> (CapabilityStatus, String) {
+    if !cfg!(feature = "production-vvc-software-codec") {
+        return (
+            CapabilityStatus::Unimplemented,
+            "H.266/VVC software decode requires mrd-service feature production-vvc-software-codec and mrd-decode feature software-vvdec."
+                .to_string(),
+        );
+    }
+
+    match probe_mode {
+        CapabilityProbeMode::Static => (
+            CapabilityStatus::Supported,
+            "H.266/VVC software decode is compiled through VVdeC; runtime probe is pending."
+                .to_string(),
+        ),
+        CapabilityProbeMode::Runtime => match mrd_decode::create_decoder("software_vvc") {
+            Ok(_) => (
+                CapabilityStatus::Available,
+                "H.266/VVC software decode is available through VVdeC.".to_string(),
+            ),
+            Err(error) => (
+                CapabilityStatus::DriverMissing,
+                format!("H.266/VVC software decode requires a working VVdeC runtime: {error}"),
+            ),
+        },
     }
 }
 

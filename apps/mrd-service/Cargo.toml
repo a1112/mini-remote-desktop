@@ -18,6 +18,7 @@ axum = { workspace = true, features = ["ws"] }
 mrd-application = { path = "../../crates/mrd-application" }
 mrd-decode = { path = "../../crates/mrd-decode" }
 mrd-encode-openh264 = { path = "../../crates/mrd-encode-openh264" }
+mrd-encode-vvenc = { path = "../../crates/mrd-encode-vvenc" }
 mrd-ffmpeg = { path = "../../crates/mrd-ffmpeg" }
 mrd-ipc = { path = "../../crates/mrd-ipc" }
 mrd-pipeline-core = { path = "../../crates/mrd-pipeline-core" }
@@ -54,3 +55,10 @@ mrd-codec-videotoolbox = { path = "../../crates/mrd-codec-videotoolbox" }
 [target.'cfg(target_os = "linux")'.dependencies]
 mrd-capture-pipewire = { path = "../../crates/mrd-capture-pipewire", features = ["portal"] }
 mrd-encode-nvenc = { path = "../../crates/mrd-encode-nvenc" }
+
+[features]
+default = []
+production-vvc-software-codec = [
+  "mrd-decode/production-vvc-software-codec",
+  "mrd-encode-vvenc/production-vvc-software-codec",
+]

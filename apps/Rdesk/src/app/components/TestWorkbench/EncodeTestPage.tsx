@@ -22,6 +22,7 @@ type EncoderType =
   | "nvenc_hevc_main10"
   | "nvenc_av1"
   | "openh264"
+  | "software_vvc"
   | "videotoolbox_h264";
 
 interface EncoderOption {
@@ -75,6 +76,14 @@ const ENCODER_OPTIONS: EncoderOption[] = [
     icon: <Cpu className="h-5 w-5 text-orange-500" />,
   },
   {
+    id: "software_vvc",
+    name: "VVenC H.266/VVC",
+    description: "H.266/VVC 软件编码器，需启用 VVenC feature 与本机 libvvenc",
+    type: "software",
+    available: true,
+    icon: <Cpu className="h-5 w-5 text-fuchsia-500" />,
+  },
+  {
     id: "videotoolbox_h264",
     name: "VideoToolbox H.264",
     description: "macOS Apple 硬件 H.264 编码器",
@@ -113,6 +122,21 @@ function buildEncodeRun(
       config: {
         capture_type: "synthetic",
         encoder_type: "openh264",
+        decoder_type: "none",
+        zero_copy: false,
+        bitrate,
+        duration_ms: 30_000,
+        visual_preview: false,
+      },
+    };
+  }
+
+  if (encoder === "software_vvc") {
+    return {
+      scenarioId: "encode.software_vvc",
+      config: {
+        capture_type: "synthetic",
+        encoder_type: "software_vvc",
         decoder_type: "none",
         zero_copy: false,
         bitrate,
@@ -169,7 +193,9 @@ export function EncodeTestPage() {
   const selectedIsSoftware = selectedOption?.type === "software";
   const isLinux = capabilities?.os_type === "linux";
   const selectedPathNote = selectedIsSoftware
-    ? "OpenH264/software H.264 使用 CPU-backed synthetic capture，zero_copy 会被关闭；这是软件 fallback 基线，不代表 2K144 主串流路径。"
+    ? selectedEncoder === "software_vvc"
+      ? "VVenC H.266/VVC 使用 CPU-backed synthetic capture，zero_copy 会被关闭；这是实验软件链路，需 feature/probe 通过后才可运行。"
+      : "OpenH264/software H.264 使用 CPU-backed synthetic capture，zero_copy 会被关闭；这是软件 fallback 基线，不代表 2K144 主串流路径。"
     : isLinux
       ? "Linux 硬件编码基准使用 synthetic 输入 + GStreamer NVENC，避免编码页触发桌面采集/Portal；端到端页面再验证真实采集链路。"
       : "硬件编码默认使用 DXGI + D3D11 shared zero-copy，更接近真实桌面串流链路。";

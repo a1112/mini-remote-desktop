@@ -17,7 +17,7 @@ import {
 } from "./useCapabilityVisibility";
 
 type DecoderType = "nvdec" | "software" | "linux_h264" | "linux_hevc" | "linux_hevc_main10" | "videotoolbox";
-type DecodeCodec = "h264" | "hevc" | "hevc_main10" | "av1";
+type DecodeCodec = "h264" | "hevc" | "hevc_main10" | "av1" | "vvc";
 
 interface DecoderOption {
   id: DecoderType;
@@ -133,6 +133,12 @@ const CODEC_OPTIONS: CodecOption[] = [
     description: "NVENC AV1 -> NVDEC 或软件解码，取决于 GPU 代际能力和 FFmpeg runtime。",
     supportedDecoders: ["nvdec", "software"],
   },
+  {
+    id: "vvc",
+    name: "H.266/VVC",
+    description: "VVenC H.266/VVC -> VVdeC 软件解码，需启用 VVC 软件 codec feature。",
+    supportedDecoders: ["software"],
+  },
 ];
 
 const DEFAULT_DECODE_PROFILE: DecodeProfile = {
@@ -232,12 +238,15 @@ function buildDecodeRun(
           ? "nvenc_hevc_main10"
           : codec === "av1"
             ? "nvenc_av1"
-            : "openh264";
+            : codec === "vvc"
+              ? "software_vvc"
+              : "openh264";
     return {
       scenarioId: "custom",
       config: {
         ...common,
-        capture_type: encoderType === "openh264" ? "synthetic" : "dxgi",
+        capture_type:
+          encoderType === "openh264" || encoderType === "software_vvc" ? "synthetic" : "dxgi",
         encoder_type: encoderType,
         decoder_type: "software",
         zero_copy: false,
@@ -296,6 +305,7 @@ function buildDecodeRun(
     hevc: "nvenc_hevc",
     hevc_main10: "nvenc_hevc_main10",
     av1: "nvenc_av1",
+    vvc: "software_vvc",
   };
 
   return {

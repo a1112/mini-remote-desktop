@@ -119,6 +119,12 @@ const ENCODER_OPTIONS: EncoderOption[] = [
     icon: <Cpu className="h-5 w-5" />,
   },
   {
+    id: "software_vvc",
+    name: "VVenC H.266/VVC",
+    description: "软件 H.266/VVC 编码器 - 需启用 VVenC feature 与本机 libvvenc",
+    icon: <Cpu className="h-5 w-5" />,
+  },
+  {
     id: "videotoolbox_h264",
     name: "VideoToolbox H.264",
     description: "macOS VideoToolbox - Apple 硬件 H.264 编码",
@@ -421,6 +427,13 @@ export function CustomTestPage() {
       selectedDecoder === "videotoolbox"
     ) {
       return "VideoToolbox H.264 解码器不能解码 NVENC AV1/HEVC 输出。";
+    }
+    if (
+      selectedEncoder === "software_vvc" &&
+      selectedDecoder !== "none" &&
+      selectedDecoder !== "software"
+    ) {
+      return "VVenC H.266/VVC 输出当前只能走软件 VVdeC 解码或 encode-only。";
     }
     return null;
   };

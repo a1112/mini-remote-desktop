@@ -16,6 +16,7 @@ const PLATFORM_TAGS: Record<string, string> = {
   nvenc_hevc: "NVIDIA",
   nvenc_hevc_main10: "NVIDIA",
   nvenc_av1: "NVIDIA",
+  software_vvc: "VVenC",
   nvdec: "NVIDIA",
   linux_h264: "Linux",
   linux_hevc: "Linux",

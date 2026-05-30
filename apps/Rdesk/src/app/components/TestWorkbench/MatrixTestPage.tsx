@@ -70,6 +70,10 @@ function isHevcEncoder(encoder?: TestConfig["encoder_type"]): boolean {
   return encoder === "nvenc_hevc" || encoder === "nvenc_hevc_main10";
 }
 
+function isVvcEncoder(encoder?: TestConfig["encoder_type"]): boolean {
+  return encoder === "software_vvc";
+}
+
 const MATRIX_DIMENSIONS: MatrixDimension[] = [
   {
     id: "capture",
@@ -90,6 +94,7 @@ const MATRIX_DIMENSIONS: MatrixDimension[] = [
       { id: "nvenc_hevc", name: "NVENC HEVC Main", enabled: true },
       { id: "nvenc_hevc_main10", name: "NVENC HEVC Main10", enabled: false },
       { id: "openh264", name: "OpenH264", enabled: true },
+      { id: "software_vvc", name: "VVenC H.266/VVC", enabled: false },
       { id: "nvenc_av1", name: "NVENC AV1", enabled: false },
       {
         id: "videotoolbox_h264",
@@ -563,6 +568,9 @@ function minimumExpectedFps(config: TestConfig, targetFps: number): number {
   if (config.encoder_type === "openh264") {
     return targetFps * 0.35;
   }
+  if (config.encoder_type === "software_vvc") {
+    return targetFps * 0.2;
+  }
   if (config.decoder_type === "ffmpeg_h264" || config.decoder_type === "ffmpeg_hevc") {
     return targetFps * 0.35;
   }
@@ -576,6 +584,9 @@ function maximumExpectedLatencyMs(config: TestConfig, targetFps: number): number
   const frameBudgetMs = 1000 / targetFps;
   if (config.encoder_type === "openh264") {
     return Math.max(120, frameBudgetMs * 8);
+  }
+  if (config.encoder_type === "software_vvc") {
+    return Math.max(250, frameBudgetMs * 16);
   }
   if (config.decoder_type === "ffmpeg_h264" || config.decoder_type === "ffmpeg_hevc") {
     return Math.max(120, frameBudgetMs * 8);
@@ -688,6 +699,13 @@ function unsupportedMatrixReason(config: TestConfig): string | null {
     config.decoder_type === "videotoolbox"
   ) {
     return "VideoToolbox decoder path is H.264-only in this matrix";
+  }
+  if (
+    isVvcEncoder(config.encoder_type) &&
+    config.decoder_type !== "none" &&
+    config.decoder_type !== "software"
+  ) {
+    return "VVenC H.266/VVC output requires VVdeC software decode or encode-only mode";
   }
   return null;
 }
@@ -972,13 +990,14 @@ function crossDeviceUnsupportedTransportReason(config: TestConfig): string | nul
 export function mediaProfileFromConfig(config: TestConfig): MediaProfile {
   const [width, height] = config.resolution ?? [1920, 1080];
   const hevc = config.encoder_type === "nvenc_hevc" || config.encoder_type === "nvenc_hevc_main10";
+  const vvc = config.encoder_type === "software_vvc";
   const main10 = config.encoder_type === "nvenc_hevc_main10";
   const profile: MediaProfile = {
     width,
     height,
     fps: config.fps ?? 60,
     bitrate_mbps: Math.max(1, Math.round((config.bitrate ?? 20_000_000) / 1_000_000)),
-    codec: hevc ? "hevc" : "h264",
+    codec: vvc ? "vvc" : hevc ? "hevc" : "h264",
   };
   if (hevc) {
     profile.codec_profile = main10 ? "main10" : "main";

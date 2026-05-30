@@ -283,6 +283,7 @@ function encodeAccelFromConfig(config: TestConfig): TestClassification["encode_a
     case "videotoolbox_h264":
       return "hardware";
     case "openh264":
+    case "software_vvc":
       return "software";
     case undefined:
       return "unknown";

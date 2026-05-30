@@ -29,6 +29,7 @@ mrd-decode = { path = "../../../crates/mrd-decode" }
 mrd-decode-nvdec = { path = "../../../crates/mrd-decode-nvdec" }
 mrd-encode-nvenc = { path = "../../../crates/mrd-encode-nvenc" }
 mrd-encode-openh264 = { path = "../../../crates/mrd-encode-openh264" }
+mrd-encode-vvenc = { path = "../../../crates/mrd-encode-vvenc" }
 mrd-ffmpeg = { path = "../../../crates/mrd-ffmpeg" }
 mrd-observability = { path = "../../../crates/mrd-observability" }
 mrd-render = { path = "../../../crates/mrd-render" }
@@ -101,4 +102,4 @@ x11 = { version = "2.21", features = ["xlib"] }
 # DO NOT REMOVE!!
 custom-protocol = [ "tauri/custom-protocol" ]
 production-software-codecs = [ "mrd-decode/production-software-codecs" ]
-production-vvc-software-codec = [ "mrd-decode/production-vvc-software-codec" ]
+production-vvc-software-codec = [ "mrd-decode/production-vvc-software-codec", "mrd-encode-vvenc/production-vvc-software-codec" ]

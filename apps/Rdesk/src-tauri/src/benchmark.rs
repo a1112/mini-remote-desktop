@@ -1104,6 +1104,9 @@ mod tests {
             "nvenc_hevc" => EncoderType::NvencHevc,
             "nvenc_hevc_main10" => EncoderType::NvencHevcMain10,
             "nvenc_av1" => EncoderType::NvencAv1,
+            "software_vvc" | "vvc_software" | "software_h266" | "h266_software"
+            | "software-vvc" | "vvc-software" | "software-h266" | "h266-software" | "vvenc"
+            | "vvc" | "h266" | "h.266" => EncoderType::SoftwareVvc,
             _ => EncoderType::NvencH264,
         }
     }
@@ -1163,7 +1166,7 @@ mod tests {
             }
         }
 
-        matches!(
+        if matches!(
             value,
             "software_vvc"
                 | "vvc_software"
@@ -1177,10 +1180,14 @@ mod tests {
                 | "vvc"
                 | "h266"
                 | "h.266"
-        )
-        .then(|| {
-            "H.266/VVC benchmark encode is capability-gated: VVenC software encode is not wired into the harness; NVIDIA and browser hardware H.266 paths are unavailable".to_string()
-        })
+        ) && !mrd_encode_vvenc::vvenc_software_compiled()
+        {
+            return Some(
+                "H.266/VVC benchmark encode requires mrd-encode-vvenc feature software-vvenc and libvvenc >= 1.13.0".to_string(),
+            );
+        }
+
+        None
     }
 
     fn unsupported_benchmark_result(
@@ -1574,6 +1581,24 @@ mod tests {
     }
 
     #[test]
+    fn benchmark_vvc_encoder_backend_parses_to_software_vvc() {
+        assert_eq!(
+            parse_encoder_backend("software_vvc"),
+            EncoderType::SoftwareVvc
+        );
+        assert_eq!(
+            parse_encoder_backend("vvc_software"),
+            EncoderType::SoftwareVvc
+        );
+        assert_eq!(
+            parse_encoder_backend("software_h266"),
+            EncoderType::SoftwareVvc
+        );
+        assert_eq!(parse_encoder_backend("vvenc"), EncoderType::SoftwareVvc);
+    }
+
+    #[cfg(not(feature = "production-vvc-software-codec"))]
+    #[test]
     fn benchmark_h266_encoder_backend_is_capability_gated() {
         let manifest = BenchmarkManifest {
             run_id: "quick-webrtc-20260308-vvc".into(),
@@ -1603,7 +1628,7 @@ mod tests {
             .failure_reason
             .as_deref()
             .expect("failure reason")
-            .contains("VVenC software encode is not wired"));
+            .contains("mrd-encode-vvenc feature software-vvenc"));
         assert_eq!(probe.codec.as_deref(), Some("vvc"));
     }
 

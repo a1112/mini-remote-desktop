@@ -98,6 +98,7 @@ export interface TestConfig {
     | "nvenc_hevc_main10"
     | "nvenc_av1"
     | "openh264"
+    | "software_vvc"
     | "videotoolbox_h264";
   decoder_type?: "none" | "nvdec" | "software" | "ffmpeg_h264" | "ffmpeg_hevc" | "linux_h264" | "linux_hevc" | "linux_hevc_main10" | "videotoolbox";
   renderer_type?: "d3d11" | "d3d12" | "opengl" | "macos" | "linux" | "webview";
@@ -1026,6 +1027,7 @@ export type EncoderType =
   | 'nvenc_hevc_main10'
   | 'nvenc_av1'
   | 'openh264'
+  | 'software_vvc'
   | 'videotoolbox_h264';
 export type DecoderType = 'none' | 'nvdec' | 'software' | 'linux_h264' | 'linux_hevc' | 'linux_hevc_main10' | 'videotoolbox';
 
