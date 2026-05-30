@@ -7958,6 +7958,229 @@ mod tests {
     }
 
     #[cfg(windows)]
+    static KEYBOARD_SMOKE_EVENTS: OnceLock<StdMutex<Vec<KeyboardSmokeEvent>>> = OnceLock::new();
+
+    #[cfg(windows)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum KeyboardSmokeEvent {
+        KeyDown(u16),
+        KeyUp(u16),
+    }
+
+    #[cfg(windows)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct KeyboardSmokeResult {
+        key_down: bool,
+        key_up: bool,
+    }
+
+    #[cfg(windows)]
+    struct KeyboardSmokeWindow {
+        hwnd: windows::Win32::Foundation::HWND,
+    }
+
+    #[cfg(windows)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct KeyboardSmokeFocusSnapshot {
+        hwnd: isize,
+        foreground: isize,
+        focus: isize,
+    }
+
+    #[cfg(windows)]
+    impl KeyboardSmokeWindow {
+        fn create() -> windows::core::Result<Self> {
+            use windows::core::PCWSTR;
+            use windows::Win32::Foundation::HINSTANCE;
+            use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+            use windows::Win32::UI::WindowsAndMessaging::{
+                CreateWindowExW, RegisterClassW, ShowWindow, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
+                SW_SHOW, WINDOW_EX_STYLE, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+            };
+
+            keyboard_smoke_events()
+                .lock()
+                .expect("clear keyboard smoke events")
+                .clear();
+
+            let class_name = wide_null(&format!(
+                "MrdServiceKeyboardSmoke{}{}",
+                std::process::id(),
+                now_ms()
+            ));
+            let title = wide_null("MRD service LAN input keyboard smoke");
+            unsafe {
+                let hmodule = GetModuleHandleW(None)?;
+                let hinstance = HINSTANCE(hmodule.0);
+                let window_class = WNDCLASSW {
+                    style: CS_HREDRAW | CS_VREDRAW,
+                    lpfnWndProc: Some(keyboard_smoke_wnd_proc),
+                    hInstance: hinstance,
+                    lpszClassName: PCWSTR(class_name.as_ptr()),
+                    ..Default::default()
+                };
+                if RegisterClassW(&window_class) == 0 {
+                    return Err(windows::core::Error::from_thread());
+                }
+
+                let hwnd = CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    PCWSTR(class_name.as_ptr()),
+                    PCWSTR(title.as_ptr()),
+                    WS_OVERLAPPEDWINDOW,
+                    CW_USEDEFAULT,
+                    CW_USEDEFAULT,
+                    360,
+                    180,
+                    None,
+                    None,
+                    Some(hinstance),
+                    None,
+                )?;
+                let _ = ShowWindow(hwnd, SW_SHOW);
+                let _ = windows::Win32::Graphics::Gdi::UpdateWindow(hwnd);
+                pump_keyboard_smoke_window_messages();
+
+                Ok(Self { hwnd })
+            }
+        }
+
+        fn focus(&mut self) {
+            use windows::Win32::UI::Input::KeyboardAndMouse::{SetActiveWindow, SetFocus};
+            use windows::Win32::UI::WindowsAndMessaging::{BringWindowToTop, SetForegroundWindow};
+
+            unsafe {
+                let _ = BringWindowToTop(self.hwnd);
+                let _ = SetForegroundWindow(self.hwnd);
+                let _ = SetActiveWindow(self.hwnd);
+                let _ = SetFocus(Some(self.hwnd));
+            }
+            let deadline = Instant::now() + Duration::from_millis(300);
+            while Instant::now() < deadline {
+                pump_keyboard_smoke_window_messages();
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        async fn wait_for_key_events(
+            &mut self,
+            virtual_key: u16,
+            timeout: Duration,
+        ) -> windows::core::Result<KeyboardSmokeResult> {
+            let deadline = Instant::now() + timeout;
+            loop {
+                pump_keyboard_smoke_window_messages();
+                let result = keyboard_smoke_result(virtual_key);
+                if result.key_down && result.key_up {
+                    return Ok(result);
+                }
+                if Instant::now() >= deadline {
+                    return Ok(result);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        fn focus_snapshot(&self) -> KeyboardSmokeFocusSnapshot {
+            unsafe {
+                KeyboardSmokeFocusSnapshot {
+                    hwnd: self.hwnd.0 as isize,
+                    foreground: windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow().0
+                        as isize,
+                    focus: windows::Win32::UI::Input::KeyboardAndMouse::GetFocus().0 as isize,
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for KeyboardSmokeWindow {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(self.hwnd);
+            }
+            pump_keyboard_smoke_window_messages();
+        }
+    }
+
+    #[cfg(windows)]
+    unsafe extern "system" fn keyboard_smoke_wnd_proc(
+        hwnd: windows::Win32::Foundation::HWND,
+        message: u32,
+        wparam: windows::Win32::Foundation::WPARAM,
+        lparam: windows::Win32::Foundation::LPARAM,
+    ) -> windows::Win32::Foundation::LRESULT {
+        use windows::Win32::UI::WindowsAndMessaging::{DefWindowProcW, WM_KEYDOWN, WM_KEYUP};
+
+        match message {
+            WM_KEYDOWN => {
+                keyboard_smoke_events()
+                    .lock()
+                    .expect("record keyboard smoke key down")
+                    .push(KeyboardSmokeEvent::KeyDown(wparam.0 as u16));
+                windows::Win32::Foundation::LRESULT(0)
+            }
+            WM_KEYUP => {
+                keyboard_smoke_events()
+                    .lock()
+                    .expect("record keyboard smoke key up")
+                    .push(KeyboardSmokeEvent::KeyUp(wparam.0 as u16));
+                windows::Win32::Foundation::LRESULT(0)
+            }
+            _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+        }
+    }
+
+    #[cfg(windows)]
+    fn keyboard_smoke_events() -> &'static StdMutex<Vec<KeyboardSmokeEvent>> {
+        KEYBOARD_SMOKE_EVENTS.get_or_init(|| StdMutex::new(Vec::new()))
+    }
+
+    #[cfg(windows)]
+    fn keyboard_smoke_result(virtual_key: u16) -> KeyboardSmokeResult {
+        let ime_process_key = windows::Win32::UI::Input::KeyboardAndMouse::VK_PROCESSKEY.0;
+        let events = keyboard_smoke_events()
+            .lock()
+            .expect("read keyboard smoke events");
+        KeyboardSmokeResult {
+            key_down: events.iter().any(|event| {
+                matches!(
+                    *event,
+                    KeyboardSmokeEvent::KeyDown(key)
+                        if key == virtual_key || key == ime_process_key
+                )
+            }),
+            key_up: events.iter().any(|event| {
+                matches!(
+                    *event,
+                    KeyboardSmokeEvent::KeyUp(key)
+                        if key == virtual_key || key == ime_process_key
+                )
+            }),
+        }
+    }
+
+    #[cfg(windows)]
+    fn pump_keyboard_smoke_window_messages() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+        };
+
+        unsafe {
+            let mut message = MSG::default();
+            while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+                let _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn wide_null(value: &str) -> Vec<u16> {
+        value.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    #[cfg(windows)]
     fn current_cursor_position() -> windows::core::Result<(i32, i32)> {
         let mut point = windows::Win32::Foundation::POINT::default();
         unsafe {
@@ -8733,6 +8956,154 @@ mod tests {
         assert!(moved.is_some());
         assert_eq!(snapshot.realtime.accepted_messages, 1);
         assert_eq!(snapshot.realtime.injected_messages, 1);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "manual smoke test: sends a key through LAN control input into a focused window"]
+    async fn lan_control_input_sendinput_keyboard_smoke_sends_key_through_udp_handler() {
+        let mut window = KeyboardSmokeWindow::create().expect("create keyboard smoke window");
+        window.focus();
+
+        let controller_state = Arc::new(AppState::new());
+        controller_state.devices.lock().await.register(
+            DeviceId("controller-device".to_string()),
+            "Controller Device".to_string(),
+        );
+        let session_id = SessionId("input-sendinput-keyboard-smoke-session".to_string());
+        controller_state.sessions.lock().await.insert(
+            session_id.clone(),
+            SessionSnapshot {
+                session_id: session_id.clone(),
+                transport: "quic".to_string(),
+                source_device_id: None,
+                target_device_id: Some(DeviceId("target-device".to_string())),
+                local_listen_addr: None,
+                local_server_name: None,
+                local_cert_der_b64: None,
+                remote_listen_addr: None,
+                remote_server_name: None,
+                remote_cert_der_b64: None,
+                lifecycle_state: SessionLifecycleState::Connected,
+                last_error: None,
+                sender_active: false,
+                receiver_active: true,
+            },
+        );
+
+        let target_state = Arc::new(AppState::new());
+        target_state.devices.lock().await.register(
+            DeviceId("target-device".to_string()),
+            "Target Device".to_string(),
+        );
+        target_state.sessions.lock().await.insert(
+            session_id.clone(),
+            SessionSnapshot {
+                session_id: session_id.clone(),
+                transport: "quic".to_string(),
+                source_device_id: Some(DeviceId("controller-device".to_string())),
+                target_device_id: None,
+                local_listen_addr: None,
+                local_server_name: None,
+                local_cert_der_b64: None,
+                remote_listen_addr: None,
+                remote_server_name: None,
+                remote_cert_der_b64: None,
+                lifecycle_state: SessionLifecycleState::Listening,
+                last_error: None,
+                sender_active: true,
+                receiver_active: false,
+            },
+        );
+
+        let service_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let service_addr = service_socket.local_addr().unwrap();
+        let handler_socket = service_socket.clone();
+        let handler_state = target_state.clone();
+        let handler = tokio::spawn(async move {
+            let mut buffer = vec![0_u8; DISCOVERY_PACKET_BUFFER_BYTES];
+            for _ in 0..2 {
+                let (len, addr) = handler_socket.recv_from(&mut buffer).await.unwrap();
+                handle_packet(&handler_socket, &handler_state, &buffer[..len], addr)
+                    .await
+                    .unwrap();
+            }
+        });
+
+        controller_state
+            .lan_discovery
+            .upsert_peer(
+                LanAnnouncement {
+                    magic: DISCOVERY_MAGIC.to_string(),
+                    app_id: DISCOVERY_APP_ID.to_string(),
+                    instance_id: "target-instance".to_string(),
+                    device_id: "target-device".to_string(),
+                    device_name: "Target Device".to_string(),
+                    device_type: "rdesk".to_string(),
+                    protocol_version: PROTOCOL_VERSION,
+                    discovery_port: service_addr.port(),
+                    transports: vec!["quic".to_string(), LAN_INPUT_CONTROL_TRANSPORT.to_string()],
+                    service_build_id: Some(service_build_id()),
+                    media_protocol_version: Some(LAN_MEDIA_PROTOCOL_VERSION),
+                    media_capabilities: vec![LAN_INPUT_CONTROL_CAPABILITY.to_string()],
+                    timestamp_ms: now_ms(),
+                },
+                service_addr,
+            )
+            .await;
+
+        let key_down = request_lan_control_input(
+            &controller_state,
+            &session_id,
+            mrd_ipc::ControlInputEvent::Key {
+                key: mrd_ipc::ControlInputKey::VirtualKey { code: 0x41 },
+                pressed: true,
+            },
+        )
+        .await
+        .expect("control input key-down ack");
+        let key_up = request_lan_control_input(
+            &controller_state,
+            &session_id,
+            mrd_ipc::ControlInputEvent::Key {
+                key: mrd_ipc::ControlInputKey::VirtualKey { code: 0x41 },
+                pressed: false,
+            },
+        )
+        .await
+        .expect("control input key-up ack");
+        handler.await.unwrap();
+
+        let events = window
+            .wait_for_key_events(0x41, Duration::from_millis(500))
+            .await
+            .expect("wait for LAN SendInput key events");
+        let snapshot = target_state
+            .control_input()
+            .lock()
+            .await
+            .snapshot(session_id.clone());
+
+        eprintln!(
+            "lan keyboard sendinput smoke key_down={:?} key_up={:?} focus={:?} events={:?} lane_down={:?} lane_up={:?} snapshot={:?}",
+            events.key_down,
+            events.key_up,
+            window.focus_snapshot(),
+            keyboard_smoke_events()
+                .lock()
+                .expect("read keyboard smoke events"),
+            key_down.lane,
+            key_up.lane,
+            snapshot.reliable
+        );
+        assert_eq!(key_down.lane, mrd_ipc::ControlInputLane::Reliable);
+        assert_eq!(key_up.lane, mrd_ipc::ControlInputLane::Reliable);
+        assert_eq!(key_down.event_count, 1);
+        assert_eq!(key_up.event_count, 1);
+        assert!(events.key_down);
+        assert!(events.key_up);
+        assert_eq!(snapshot.reliable.accepted_messages, 2);
+        assert_eq!(snapshot.reliable.injected_messages, 2);
     }
 
     #[tokio::test]
