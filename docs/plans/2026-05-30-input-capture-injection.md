@@ -131,6 +131,12 @@ Run:
 cargo test -p mrd-input
 ```
 
+Optional manual Windows runtime smoke:
+
+```powershell
+cargo test -p mrd-input windows_sendinput_mouse_move_smoke_moves_and_restores_cursor -- --ignored --nocapture
+```
+
 ### Task 4: Extend IPC Contracts For Input Events
 
 **Files:**

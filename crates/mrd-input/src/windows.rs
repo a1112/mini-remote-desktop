@@ -171,7 +171,8 @@ fn absolute_mouse_axis(coordinate: i32, origin: i32, extent: i32) -> i32 {
     if extent <= 0 {
         return 0;
     }
-    let value = (i64::from(coordinate) - i64::from(origin)) * 65_535 / i64::from(extent);
+    let offset = i64::from(coordinate) - i64::from(origin);
+    let value = ((offset * 65_536) + i64::from(extent / 2)) / i64::from(extent);
     value.clamp(0, 65_535) as i32
 }
 
@@ -262,7 +263,8 @@ fn key_input(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{InputButton, InputError, InputEvent, InputKey};
+    use crate::{InputButton, InputError, InputEvent, InputInjector, InputKey};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn windows_mapping_mouse_buttons_preserves_button_and_pressed_state() {
@@ -368,5 +370,82 @@ mod tests {
             .expect_err("zero virtual key should be invalid"),
             InputError::InvalidEvent("virtual key must be non-zero".to_string())
         );
+    }
+
+    #[test]
+    #[ignore = "manual smoke test: moves the local cursor and restores it"]
+    fn windows_sendinput_mouse_move_smoke_moves_and_restores_cursor() {
+        let start = current_cursor_position().expect("read starting cursor position");
+        let target = (start.0.saturating_add(80), start.1.saturating_add(80));
+        let mut injector = WindowsSendInputInjector::new();
+
+        injector
+            .inject(&InputEvent::MouseMove {
+                x: target.0,
+                y: target.1,
+            })
+            .expect("move cursor with SendInput");
+        let after_move = current_cursor_position().expect("read cursor after SendInput move");
+        let moved = wait_for_cursor_near(target, 4, Duration::from_millis(300))
+            .expect("cursor reaches SendInput target");
+
+        injector
+            .inject(&InputEvent::MouseMove {
+                x: start.0,
+                y: start.1,
+            })
+            .expect("restore cursor with SendInput");
+        let after_restore = current_cursor_position().expect("read cursor after SendInput restore");
+        let restored = wait_for_cursor_near(start, 4, Duration::from_millis(300))
+            .expect("cursor returns to starting position");
+        force_cursor_position(start).expect("force exact cursor restore after smoke");
+
+        eprintln!(
+            "sendinput smoke virtual_screen={:?} start={:?} target={:?} after_move={:?} moved={:?} after_restore={:?} restored={:?}",
+            current_virtual_screen(),
+            start,
+            target,
+            after_move,
+            moved,
+            after_restore,
+            restored
+        );
+        assert!(cursor_distance(after_move, start) > 10);
+        assert!(moved.is_some());
+        assert!(restored.is_some());
+    }
+
+    fn current_cursor_position() -> windows::core::Result<(i32, i32)> {
+        let mut point = ::windows::Win32::Foundation::POINT::default();
+        unsafe {
+            ::windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut point)?;
+        }
+        Ok((point.x, point.y))
+    }
+
+    fn wait_for_cursor_near(
+        expected: (i32, i32),
+        tolerance: i32,
+        timeout: Duration,
+    ) -> windows::core::Result<Option<(i32, i32)>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let current = current_cursor_position()?;
+            if cursor_distance(current, expected) <= tolerance {
+                return Ok(Some(current));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn cursor_distance(left: (i32, i32), right: (i32, i32)) -> i32 {
+        left.0.abs_diff(right.0).max(left.1.abs_diff(right.1)) as i32
+    }
+
+    fn force_cursor_position(position: (i32, i32)) -> windows::core::Result<()> {
+        unsafe { ::windows::Win32::UI::WindowsAndMessaging::SetCursorPos(position.0, position.1) }
     }
 }
