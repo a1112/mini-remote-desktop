@@ -7929,6 +7929,110 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[derive(Debug, Clone, Copy)]
+    struct WindowsTestVirtualScreen {
+        left: i32,
+        top: i32,
+        width: i32,
+        height: i32,
+    }
+
+    #[cfg(windows)]
+    struct CursorRestoreGuard {
+        position: (i32, i32),
+    }
+
+    #[cfg(windows)]
+    impl CursorRestoreGuard {
+        fn new(position: (i32, i32)) -> Self {
+            Self { position }
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for CursorRestoreGuard {
+        fn drop(&mut self) {
+            let _ = force_cursor_position(self.position);
+        }
+    }
+
+    #[cfg(windows)]
+    fn current_cursor_position() -> windows::core::Result<(i32, i32)> {
+        let mut point = windows::Win32::Foundation::POINT::default();
+        unsafe {
+            windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut point)?;
+        }
+        Ok((point.x, point.y))
+    }
+
+    #[cfg(windows)]
+    fn current_virtual_screen() -> WindowsTestVirtualScreen {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+            SM_YVIRTUALSCREEN,
+        };
+
+        WindowsTestVirtualScreen {
+            left: unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) },
+            top: unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) },
+            width: unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) },
+            height: unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) },
+        }
+    }
+
+    #[cfg(windows)]
+    fn cursor_smoke_target(
+        start: (i32, i32),
+        screen: WindowsTestVirtualScreen,
+        delta: i32,
+    ) -> (i32, i32) {
+        let right = screen.left.saturating_add(screen.width.saturating_sub(1));
+        let bottom = screen.top.saturating_add(screen.height.saturating_sub(1));
+        (
+            offset_inside_range(start.0, screen.left, right, delta),
+            offset_inside_range(start.1, screen.top, bottom, delta),
+        )
+    }
+
+    #[cfg(windows)]
+    fn offset_inside_range(value: i32, min: i32, max: i32, delta: i32) -> i32 {
+        if value.saturating_add(delta) <= max {
+            value.saturating_add(delta)
+        } else {
+            value.saturating_sub(delta).max(min)
+        }
+    }
+
+    #[cfg(windows)]
+    async fn wait_for_cursor_near(
+        expected: (i32, i32),
+        tolerance: i32,
+        timeout: Duration,
+    ) -> windows::core::Result<Option<(i32, i32)>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let current = current_cursor_position()?;
+            if cursor_distance(current, expected) <= tolerance {
+                return Ok(Some(current));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[cfg(windows)]
+    fn cursor_distance(left: (i32, i32), right: (i32, i32)) -> i32 {
+        left.0.abs_diff(right.0).max(left.1.abs_diff(right.1)) as i32
+    }
+
+    #[cfg(windows)]
+    fn force_cursor_position(position: (i32, i32)) -> windows::core::Result<()> {
+        unsafe { windows::Win32::UI::WindowsAndMessaging::SetCursorPos(position.0, position.1) }
+    }
+
     #[test]
     fn dynamic_window_fps_enters_active_tier_on_changed_frame() {
         let mut policy = DynamicWindowFpsPolicy::new(120);
@@ -8503,6 +8607,132 @@ mod tests {
         assert_eq!(snapshot.reliable.accepted_messages, 1);
         assert_eq!(snapshot.reliable.injected_messages, 1);
         assert_eq!(snapshot.realtime.injected_messages, 0);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "manual smoke test: moves the local cursor through LAN control input and restores it"]
+    async fn lan_control_input_sendinput_smoke_moves_cursor_through_udp_handler() {
+        let start = current_cursor_position().expect("read starting cursor position");
+        let _restore = CursorRestoreGuard::new(start);
+        let target = cursor_smoke_target(start, current_virtual_screen(), 80);
+        assert_ne!(target, start, "smoke target must move the cursor");
+
+        let controller_state = Arc::new(AppState::new());
+        controller_state.devices.lock().await.register(
+            DeviceId("controller-device".to_string()),
+            "Controller Device".to_string(),
+        );
+        let session_id = SessionId("input-sendinput-smoke-session".to_string());
+        controller_state.sessions.lock().await.insert(
+            session_id.clone(),
+            SessionSnapshot {
+                session_id: session_id.clone(),
+                transport: "quic".to_string(),
+                source_device_id: None,
+                target_device_id: Some(DeviceId("target-device".to_string())),
+                local_listen_addr: None,
+                local_server_name: None,
+                local_cert_der_b64: None,
+                remote_listen_addr: None,
+                remote_server_name: None,
+                remote_cert_der_b64: None,
+                lifecycle_state: SessionLifecycleState::Connected,
+                last_error: None,
+                sender_active: false,
+                receiver_active: true,
+            },
+        );
+
+        let target_state = Arc::new(AppState::new());
+        target_state.devices.lock().await.register(
+            DeviceId("target-device".to_string()),
+            "Target Device".to_string(),
+        );
+        target_state.sessions.lock().await.insert(
+            session_id.clone(),
+            SessionSnapshot {
+                session_id: session_id.clone(),
+                transport: "quic".to_string(),
+                source_device_id: Some(DeviceId("controller-device".to_string())),
+                target_device_id: None,
+                local_listen_addr: None,
+                local_server_name: None,
+                local_cert_der_b64: None,
+                remote_listen_addr: None,
+                remote_server_name: None,
+                remote_cert_der_b64: None,
+                lifecycle_state: SessionLifecycleState::Listening,
+                last_error: None,
+                sender_active: true,
+                receiver_active: false,
+            },
+        );
+
+        let service_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let service_addr = service_socket.local_addr().unwrap();
+        let handler_socket = service_socket.clone();
+        let handler_state = target_state.clone();
+        let handler = tokio::spawn(async move {
+            let mut buffer = vec![0_u8; DISCOVERY_PACKET_BUFFER_BYTES];
+            let (len, addr) = handler_socket.recv_from(&mut buffer).await.unwrap();
+            handle_packet(&handler_socket, &handler_state, &buffer[..len], addr)
+                .await
+                .unwrap();
+        });
+
+        controller_state
+            .lan_discovery
+            .upsert_peer(
+                LanAnnouncement {
+                    magic: DISCOVERY_MAGIC.to_string(),
+                    app_id: DISCOVERY_APP_ID.to_string(),
+                    instance_id: "target-instance".to_string(),
+                    device_id: "target-device".to_string(),
+                    device_name: "Target Device".to_string(),
+                    device_type: "rdesk".to_string(),
+                    protocol_version: PROTOCOL_VERSION,
+                    discovery_port: service_addr.port(),
+                    transports: vec!["quic".to_string(), LAN_INPUT_CONTROL_TRANSPORT.to_string()],
+                    service_build_id: Some(service_build_id()),
+                    media_protocol_version: Some(LAN_MEDIA_PROTOCOL_VERSION),
+                    media_capabilities: vec![LAN_INPUT_CONTROL_CAPABILITY.to_string()],
+                    timestamp_ms: now_ms(),
+                },
+                service_addr,
+            )
+            .await;
+
+        let result = request_lan_control_input(
+            &controller_state,
+            &session_id,
+            mrd_ipc::ControlInputEvent::MouseMove {
+                x: target.0,
+                y: target.1,
+            },
+        )
+        .await
+        .expect("control input ack");
+        handler.await.unwrap();
+        let moved = wait_for_cursor_near(target, 4, Duration::from_millis(500))
+            .await
+            .expect("wait for LAN SendInput cursor target");
+        let snapshot = target_state
+            .control_input()
+            .lock()
+            .await
+            .snapshot(session_id.clone());
+
+        eprintln!(
+            "lan sendinput smoke start={start:?} target={target:?} moved={moved:?} lane={:?} snapshot={:?}",
+            result.lane,
+            snapshot.realtime
+        );
+        assert_eq!(result.lane, mrd_ipc::ControlInputLane::Realtime);
+        assert_eq!(result.event_count, 1);
+        assert!(moved.is_some());
+        assert_eq!(snapshot.realtime.accepted_messages, 1);
+        assert_eq!(snapshot.realtime.injected_messages, 1);
     }
 
     #[tokio::test]
