@@ -1,18 +1,39 @@
 function Get-TransportMatrixCargoFeatureArgs {
-  param([string]$DecodeBackend)
+  param(
+    [string]$EncodeBackend = "",
+    [string]$DecodeBackend = ""
+  )
 
+  $encode = $EncodeBackend.ToLowerInvariant()
   $decode = $DecodeBackend.ToLowerInvariant()
+  $softwareCodecsPattern = '^(software_hevc|hevc_software|software_hevc_main10|hevc_main10_software|software_av1|av1_software)$'
+  $vvcPattern = '^(software_vvc|vvc_software|software_h266|h266_software|software-vvc|vvc-software|software-h266|h266-software|vvenc|vvc|h266|h\.266)$'
+  $features = @()
+
   switch -Regex ($decode) {
-    '^(software_hevc|hevc_software|software_hevc_main10|hevc_main10_software|software_av1|av1_software)$' {
-      return @("--features", "production-software-codecs")
+    $softwareCodecsPattern {
+      $features += "production-software-codecs"
     }
-    '^(software_vvc|vvc_software|software_h266|h266_software)$' {
-      return @("--features", "production-vvc-software-codec")
-    }
-    default {
-      return @()
+    $vvcPattern {
+      $features += "production-vvc-software-codec"
     }
   }
+
+  if ($features -notcontains "production-vvc-software-codec" -and $encode -match $vvcPattern) {
+    $features += "mrd-encode-vvenc/software-vvenc"
+  }
+
+  if ($features.Count -eq 0) {
+    return @()
+  }
+
+  $uniqueFeatures = @()
+  foreach ($feature in $features) {
+    if ($uniqueFeatures -notcontains $feature) {
+      $uniqueFeatures += $feature
+    }
+  }
+  return @("--features", ($uniqueFeatures -join ","))
 }
 
 function Get-TransportMatrixBitrateBps {

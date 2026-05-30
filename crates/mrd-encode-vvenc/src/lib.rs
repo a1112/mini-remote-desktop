@@ -98,7 +98,8 @@ mod imp {
         width: usize,
         height: usize,
         frame_index: u64,
-        output: Vec<u8>,
+        input: OwnedYuvBuffer,
+        output: OwnedAccessUnit,
     }
 
     impl Drop for Inner {
@@ -142,6 +143,7 @@ mod imp {
             )?;
 
             config.m_numThreads = vvenc_thread_count();
+            config.m_RCNumPasses = 1;
             config.m_verbosity = vvencMsgLevel_VVENC_ERROR;
 
             let Some(encoder) = NonNull::new(unsafe { vvenc_encoder_create() }) else {
@@ -163,7 +165,8 @@ mod imp {
                 width,
                 height,
                 frame_index: 0,
-                output: vec![0; vvenc_output_len(width, height)?],
+                input: OwnedYuvBuffer::new(width, height)?,
+                output: OwnedAccessUnit::new(vvenc_output_len(width, height)?)?,
             })
         }
 
@@ -179,21 +182,20 @@ mod imp {
             }
             validate_even_dimensions(frame.width, frame.height)?;
 
-            let mut yuv = OwnedYuvBuffer::new(frame.width, frame.height)?;
-            write_yuv420_i16(frame, &mut yuv)?;
-            yuv.raw.sequenceNumber = self.frame_index;
-            yuv.raw.cts = timestamp_to_i64(frame.timestamp_us);
-            yuv.raw.ctsValid = true;
+            write_yuv420_i16(frame, &mut self.input)?;
+            self.input.raw.sequenceNumber = self.frame_index;
+            self.input.raw.cts = timestamp_to_i64(frame.timestamp_us);
+            self.input.raw.ctsValid = true;
+            self.output.reset_for_encode();
 
-            let mut access_unit = AccessUnitBuffer::new(&mut self.output)?;
             let mut encode_done = false;
             vvenc_result(
                 "VVenC encode",
                 unsafe {
                     vvenc_encode(
                         self.encoder.as_ptr(),
-                        &mut yuv.raw,
-                        &mut access_unit.raw,
+                        &mut self.input.raw,
+                        &mut self.output.raw,
                         &mut encode_done,
                     )
                 },
@@ -201,15 +203,15 @@ mod imp {
             )?;
             self.frame_index += 1;
 
-            let bytes = access_unit.payload()?.to_vec();
+            let bytes = self.output.payload()?.to_vec();
             if bytes.is_empty() {
                 return Ok(Vec::new());
             }
 
             Ok(vec![EncodedAccessUnit {
                 codec: VideoCodec::Vvc,
-                timestamp_us: access_unit.timestamp_us(frame.timestamp_us),
-                is_keyframe: access_unit.raw.rap || annex_b_contains_vvc_keyframe(&bytes),
+                timestamp_us: self.output.timestamp_us(frame.timestamp_us),
+                is_keyframe: self.output.raw.rap || annex_b_contains_vvc_keyframe(&bytes),
                 bytes,
             }])
         }
@@ -256,22 +258,32 @@ mod imp {
         }
     }
 
-    struct AccessUnitBuffer<'a> {
+    struct OwnedAccessUnit {
         raw: vvencAccessUnit,
-        data: &'a mut [u8],
     }
 
-    impl<'a> AccessUnitBuffer<'a> {
-        fn new(data: &'a mut [u8]) -> Result<Self, PipelineError> {
-            let payload_size = usize_to_c_int("VVenC output buffer", data.len())?;
+    impl OwnedAccessUnit {
+        fn new(payload_len: usize) -> Result<Self, PipelineError> {
+            let payload_size = usize_to_c_int("VVenC output buffer", payload_len)?;
             let mut raw = unsafe { mem::zeroed::<vvencAccessUnit>() };
             unsafe {
                 vvenc_accessUnit_default(&mut raw);
+                vvenc_accessUnit_alloc_payload(&mut raw, payload_size);
             }
-            raw.payload = data.as_mut_ptr();
-            raw.payloadSize = payload_size;
-            raw.payloadUsedSize = 0;
-            Ok(Self { raw, data })
+            if raw.payload.is_null() || raw.payloadSize < payload_size {
+                unsafe {
+                    vvenc_accessUnit_free_payload(&mut raw);
+                }
+                return Err(PipelineError::message(
+                    "VVenC access unit payload allocation failed",
+                ));
+            }
+            Ok(Self { raw })
+        }
+
+        fn reset_for_encode(&mut self) {
+            self.raw.payloadUsedSize = 0;
+            self.raw.rap = false;
         }
 
         fn payload(&self) -> Result<&[u8], PipelineError> {
@@ -282,13 +294,21 @@ mod imp {
                 )));
             }
             let used = self.raw.payloadUsedSize as usize;
-            if used > self.data.len() {
+            let capacity = usize::try_from(self.raw.payloadSize).map_err(|_| {
+                PipelineError::message(format!(
+                    "VVenC returned invalid payload capacity {}",
+                    self.raw.payloadSize
+                ))
+            })?;
+            if used > capacity {
                 return Err(PipelineError::message(format!(
-                    "VVenC payload overflow: used {used}, capacity {}",
-                    self.data.len()
+                    "VVenC payload overflow: used {used}, capacity {capacity}"
                 )));
             }
-            Ok(&self.data[..used])
+            if self.raw.payload.is_null() {
+                return Err(PipelineError::message("VVenC payload pointer is null"));
+            }
+            Ok(unsafe { std::slice::from_raw_parts(self.raw.payload, used) })
         }
 
         fn timestamp_us(&self, fallback: u64) -> u64 {
@@ -296,6 +316,14 @@ mod imp {
                 self.raw.cts as u64
             } else {
                 fallback
+            }
+        }
+    }
+
+    impl Drop for OwnedAccessUnit {
+        fn drop(&mut self) {
+            unsafe {
+                vvenc_accessUnit_free_payload(&mut self.raw);
             }
         }
     }
@@ -617,5 +645,69 @@ mod tests {
         assert!(access_units
             .iter()
             .all(|access_unit| access_unit.codec == VideoCodec::Vvc));
+    }
+
+    #[test]
+    #[cfg(feature = "software-vvenc")]
+    fn feature_build_encodes_720p_bgra_without_crashing() {
+        let width = 1280;
+        let height = 720;
+        let mut encoder = VvencSoftwareEncoder::new_with_bitrate(width, height, 30, 8_000_000)
+            .expect("create VVenC encoder");
+        let mut data = vec![0_u8; width * height * 4];
+        for y in 0..height {
+            for x in 0..width {
+                let idx = (y * width + x) * 4;
+                data[idx] = x as u8;
+                data[idx + 1] = y as u8;
+                data[idx + 2] = 192;
+                data[idx + 3] = 255;
+            }
+        }
+        let frame = CapturedFrame::from_cpu(width, height, FramePixelFormat::Bgra32, 16_667, data);
+
+        let access_units = encoder.encode(&frame).expect("encode 720p BGRA");
+        assert!(access_units
+            .iter()
+            .all(|access_unit| access_unit.codec == VideoCodec::Vvc));
+    }
+
+    #[test]
+    #[cfg(feature = "software-vvenc")]
+    fn feature_build_encodes_repeated_720p_bgra_without_crashing() {
+        let width = 1280;
+        let height = 720;
+        let mut encoder = VvencSoftwareEncoder::new_with_bitrate(width, height, 30, 8_000_000)
+            .expect("create VVenC encoder");
+        let mut total_access_units = 0;
+
+        for frame_index in 0..90_u64 {
+            let phase = (frame_index & 0xff) as u8;
+            let mut data = vec![0_u8; width * height * 4];
+            for y in 0..height {
+                for x in 0..width {
+                    let idx = (y * width + x) * 4;
+                    data[idx] = (x as u8).wrapping_add(phase);
+                    data[idx + 1] = (y as u8).wrapping_add(phase / 2);
+                    data[idx + 2] = 192_u8.wrapping_sub(phase / 3);
+                    data[idx + 3] = 255;
+                }
+            }
+            let frame = CapturedFrame::from_cpu(
+                width,
+                height,
+                FramePixelFormat::Bgra32,
+                frame_index * 33_333,
+                data,
+            );
+
+            let access_units = encoder.encode(&frame).expect("encode repeated 720p BGRA");
+            total_access_units += access_units.len();
+        }
+
+        assert!(
+            total_access_units > 0,
+            "VVenC should emit at least one access unit after repeated frames"
+        );
     }
 }

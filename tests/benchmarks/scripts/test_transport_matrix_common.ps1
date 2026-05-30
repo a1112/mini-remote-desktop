@@ -39,6 +39,12 @@ Assert-ArrayEqual $av1Args @("--features", "production-software-codecs") "AV1 so
 $vvcArgs = Get-TransportMatrixCargoFeatureArgs -DecodeBackend "software_vvc"
 Assert-ArrayEqual $vvcArgs @("--features", "production-vvc-software-codec") "VVC software matrix enables VVC software codec"
 
+$vvcEncodeOnlyArgs = Get-TransportMatrixCargoFeatureArgs -EncodeBackend "software_vvc" -DecodeBackend "none"
+Assert-ArrayEqual $vvcEncodeOnlyArgs @("--features", "mrd-encode-vvenc/software-vvenc") "VVC encode-only matrix enables VVenC encoder feature"
+
+$vvcEncodeDecodeArgs = Get-TransportMatrixCargoFeatureArgs -EncodeBackend "software_vvc" -DecodeBackend "software_vvc"
+Assert-ArrayEqual $vvcEncodeDecodeArgs @("--features", "production-vvc-software-codec") "VVC encode/decode matrix uses aggregate VVC software codec feature"
+
 $noneArgs = Get-TransportMatrixCargoFeatureArgs -DecodeBackend "nvdec"
 Assert-ArrayEqual $noneArgs @() "Hardware decode matrix does not enable software codec features"
 

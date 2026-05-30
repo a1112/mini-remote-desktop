@@ -27,7 +27,7 @@ $hostStdout = Join-Path $logsDir 'host.stdout.log'
 $hostStderr = Join-Path $logsDir 'host.stderr.log'
 $thresholdPath = Join-Path $repo ("tests/benchmarks/thresholds/{0}" -f $scenario.threshold_file)
 $cargoArgs = @("test", "-p", "app") +
-  (Get-TransportMatrixCargoFeatureArgs -DecodeBackend $scenario.decode_backend) +
+  (Get-TransportMatrixCargoFeatureArgs -EncodeBackend $scenario.encode_backend -DecodeBackend $scenario.decode_backend) +
   @("benchmark_run_writes_requested_artifacts", "--", "--nocapture")
 
 $env:MRD_BENCH_ARTIFACT_ROOT = $repo
