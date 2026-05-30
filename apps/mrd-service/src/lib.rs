@@ -8,6 +8,7 @@ pub mod browser_webcodecs_preview;
 pub mod browser_webrtc_preview;
 pub mod capabilities;
 pub mod capture_source;
+pub mod control_input;
 pub mod display_mode;
 pub mod handlers;
 pub mod ipc_server;

@@ -1280,15 +1280,25 @@ fn add_transport_capabilities(items: &mut Vec<CapabilityItem>, platform: &Capabi
 }
 
 fn add_control_capabilities(items: &mut Vec<CapabilityItem>, platform: &CapabilityPlatform) {
-    push_item(
-        items,
-        platform,
-        CapabilityDomain::Control,
-        "control.keyboard_mouse",
-        "Keyboard and mouse control",
-        CapabilityStatus::Unimplemented,
-        Some("Input injection is not yet wired as a service-owned adapter."),
-    );
+    if matches!(platform, CapabilityPlatform::Windows) {
+        push_available(
+            items,
+            platform,
+            CapabilityDomain::Control,
+            "control.keyboard_mouse",
+            "Keyboard and mouse control",
+        );
+    } else {
+        push_item(
+            items,
+            platform,
+            CapabilityDomain::Control,
+            "control.keyboard_mouse",
+            "Keyboard and mouse control",
+            CapabilityStatus::Unsupported,
+            Some("Input injection is currently implemented only for Windows SendInput."),
+        );
+    }
 }
 
 fn add_audio_capabilities(items: &mut Vec<CapabilityItem>, platform: &CapabilityPlatform) {
@@ -1860,7 +1870,7 @@ mod tests {
     }
 
     #[test]
-    fn unwired_keyboard_mouse_control_is_not_advertised_as_runnable() {
+    fn keyboard_mouse_control_is_available_on_windows_static_snapshot() {
         let capabilities =
             local_capabilities(CapabilityPlatform::Windows, CapabilityProbeMode::Static);
         let control = capabilities
@@ -1868,7 +1878,7 @@ mod tests {
             .find(|item| item.id == "control.keyboard_mouse")
             .expect("keyboard/mouse control capability");
 
-        assert_eq!(control.status, CapabilityStatus::Unimplemented);
+        assert_eq!(control.status, CapabilityStatus::Available);
     }
 
     #[test]

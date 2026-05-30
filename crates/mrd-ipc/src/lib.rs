@@ -707,6 +707,18 @@ mod wire {
         pub dropped_messages: u64,
         /// Messages coalesced by lane policy.
         pub coalesced_messages: u64,
+        /// Messages accepted by the service for this lane.
+        #[serde(default)]
+        pub accepted_messages: u64,
+        /// Messages injected successfully on the controlled side.
+        #[serde(default)]
+        pub injected_messages: u64,
+        /// Messages that failed injection or validation.
+        #[serde(default)]
+        pub failed_messages: u64,
+        /// Last lane-specific error.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub last_error: Option<String>,
     }
 
     /// Runtime control channel state for a session.
@@ -718,6 +730,79 @@ mod wire {
         pub reliable: ControlChannelLaneSnapshot,
         /// Realtime control lane.
         pub realtime: ControlChannelLaneSnapshot,
+    }
+
+    /// Mouse button carried by a service-owned control input request.
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ControlInputButton {
+        /// Primary mouse button.
+        Left,
+        /// Secondary mouse button.
+        Right,
+        /// Middle mouse button.
+        Middle,
+        /// First extended mouse button.
+        X1,
+        /// Second extended mouse button.
+        X2,
+    }
+
+    /// Keyboard key carried by a service-owned control input request.
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    pub enum ControlInputKey {
+        /// Windows virtual-key code.
+        VirtualKey {
+            /// Numeric virtual-key code.
+            code: u16,
+        },
+    }
+
+    /// Normalized control input event sent to mrd-service.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    pub enum ControlInputEvent {
+        /// Absolute mouse position in remote frame coordinates.
+        MouseMove {
+            /// X coordinate.
+            x: i32,
+            /// Y coordinate.
+            y: i32,
+        },
+        /// Mouse button transition.
+        MouseButton {
+            /// Button id.
+            button: ControlInputButton,
+            /// Whether the button is pressed.
+            pressed: bool,
+        },
+        /// Mouse wheel delta.
+        MouseWheel {
+            /// Wheel delta.
+            delta: i32,
+        },
+        /// Keyboard key transition.
+        Key {
+            /// Key id.
+            key: ControlInputKey,
+            /// Whether the key is pressed.
+            pressed: bool,
+        },
+        /// Release all pressed keys and mouse buttons tracked by the service.
+        ReleaseAll,
+    }
+
+    /// Control lane selected for an accepted input event.
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ControlInputLane {
+        /// Reliable ordered control lane.
+        Reliable,
+        /// Realtime low-latency control lane.
+        Realtime,
+        /// Local cleanup path, for example release-all.
+        Cleanup,
     }
 
     /// One paired device identity known by the local service.
@@ -985,6 +1070,13 @@ mod wire {
             /// Target session id.
             session_id: SessionId,
         },
+        /// Send a keyboard or mouse event to the service-owned control path.
+        SendControlInput {
+            /// Target session id.
+            session_id: SessionId,
+            /// Normalized input event.
+            event: ControlInputEvent,
+        },
         /// Start or refresh local pairing intent for a device.
         PairDevice {
             /// Peer device id.
@@ -1149,6 +1241,15 @@ mod wire {
         ControlChannelSnapshot {
             /// Reliable/realtime lane snapshot.
             snapshot: ControlChannelSnapshot,
+        },
+        /// Control input event accepted by the service.
+        ControlInputAccepted {
+            /// Target session id.
+            session_id: SessionId,
+            /// Lane selected by the service.
+            lane: ControlInputLane,
+            /// Number of input events applied or queued.
+            event_count: u32,
         },
         /// Pairing operation result.
         PairingUpdated {

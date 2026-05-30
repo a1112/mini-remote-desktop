@@ -14,6 +14,7 @@ mod browser_webcodecs_preview;
 mod browser_webrtc_preview;
 mod capabilities;
 mod capture_source;
+mod control_input;
 mod display_mode;
 mod handlers;
 mod ipc_server;

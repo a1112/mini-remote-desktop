@@ -7,6 +7,7 @@
 // of truth for all session orchestration, transport runtime,
 // and media control.
 
+use crate::control_input::ControlInputRegistry;
 use base64::{engine::general_purpose, Engine as _};
 use image::{codecs::png::PngEncoder, ColorType, ImageEncoder};
 use mrd_application::ports::SessionSnapshot;
@@ -1443,6 +1444,8 @@ pub struct AppState {
     pub peer_media_capabilities: Arc<Mutex<SessionPeerMediaCapabilityRegistry>>,
     /// Cached local capability facts refreshed outside request handling.
     pub capability_snapshot: Arc<Mutex<CapabilitySnapshotRegistry>>,
+    /// Service-owned keyboard and mouse injection state.
+    pub control_input: Arc<Mutex<ControlInputRegistry>>,
     /// Receiver pipeline state keyed by session.
     pub media_pipelines: Arc<Mutex<MediaPipelineRegistry>>,
     /// Native renderer instances keyed by receiver session/surface.
@@ -1491,6 +1494,7 @@ impl AppState {
                 SessionPeerMediaCapabilityRegistry::default(),
             )),
             capability_snapshot: Arc::new(Mutex::new(CapabilitySnapshotRegistry::default())),
+            control_input: Arc::new(Mutex::new(ControlInputRegistry::default())),
             media_pipelines: Arc::new(Mutex::new(MediaPipelineRegistry::default())),
             #[cfg(windows)]
             media_surface_renderers: Arc::new(Mutex::new(MediaSurfaceRendererRegistry::default())),
@@ -1565,6 +1569,11 @@ impl AppState {
         self.capability_snapshot.clone()
     }
 
+    /// Get a clone of the service-owned control input registry.
+    pub fn control_input(&self) -> Arc<Mutex<ControlInputRegistry>> {
+        self.control_input.clone()
+    }
+
     /// Return the currently cached local capability snapshot without running runtime probes.
     pub async fn cached_capability_snapshot(&self) -> CapabilitySnapshot {
         self.capability_snapshot.lock().await.snapshot()
@@ -1601,6 +1610,14 @@ impl AppState {
     #[cfg(test)]
     pub async fn replace_capability_snapshot_for_test(&self, snapshot: CapabilitySnapshot) {
         self.capability_snapshot.lock().await.replace(snapshot);
+    }
+
+    #[cfg(test)]
+    pub async fn replace_control_input_for_test<I>(&self, injector: I)
+    where
+        I: mrd_input::InputInjector + 'static,
+    {
+        *self.control_input.lock().await = ControlInputRegistry::with_injector(injector);
     }
 
     /// Get a clone of the receiver media pipeline registry.

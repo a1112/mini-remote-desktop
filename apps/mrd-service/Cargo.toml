@@ -20,6 +20,7 @@ mrd-decode = { path = "../../crates/mrd-decode" }
 mrd-encode-openh264 = { path = "../../crates/mrd-encode-openh264" }
 mrd-encode-vvenc = { path = "../../crates/mrd-encode-vvenc" }
 mrd-ffmpeg = { path = "../../crates/mrd-ffmpeg" }
+mrd-input = { path = "../../crates/mrd-input" }
 mrd-ipc = { path = "../../crates/mrd-ipc" }
 mrd-pipeline-core = { path = "../../crates/mrd-pipeline-core" }
 mrd-proto = { path = "../../crates/mrd-proto" }

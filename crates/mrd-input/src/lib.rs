@@ -34,9 +34,19 @@ pub enum InputError {
     Platform(String),
 }
 
-pub trait InputInjector {
+pub trait InputInjector: Send {
     fn is_available(&self) -> bool;
     fn inject(&mut self, event: &InputEvent) -> Result<(), InputError>;
+}
+
+impl<T: InputInjector + ?Sized> InputInjector for Box<T> {
+    fn is_available(&self) -> bool {
+        (**self).is_available()
+    }
+
+    fn inject(&mut self, event: &InputEvent) -> Result<(), InputError> {
+        (**self).inject(event)
+    }
 }
 
 #[derive(Debug, Clone)]

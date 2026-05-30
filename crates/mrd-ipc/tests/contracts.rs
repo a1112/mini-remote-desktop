@@ -6,6 +6,7 @@ use mrd_ipc::{
     CapabilityConstraintStatus, CapabilityDomain, CapabilityItem, CapabilityPlatform,
     CapabilityProfile, CapabilitySnapshot, CapabilityStatus, CaptureSource, CaptureSourceSelection,
     ControlChannelLaneSnapshot, ControlChannelReliability, ControlChannelSnapshot,
+    ControlInputButton, ControlInputEvent, ControlInputKey, ControlInputLane,
     DeviceIdentitySnapshot, DeviceInfo, IpcRequest, IpcResponse, MediaAdaptationSnapshot,
     MediaPipelineSnapshot, MediaProfile, MediaProfileNegotiation, MediaSenderTransportSnapshot,
     MediaStageMetrics, PairedDeviceIdentity, ScenarioEvaluation, ScenarioEvaluationReason,
@@ -464,6 +465,10 @@ fn serialize_deserialize_policy_identity_control_and_telemetry_contracts() {
             queued_messages: 2,
             dropped_messages: 0,
             coalesced_messages: 0,
+            accepted_messages: 4,
+            injected_messages: 4,
+            failed_messages: 0,
+            last_error: None,
         },
         realtime: ControlChannelLaneSnapshot {
             name: "ctrl_rt".to_string(),
@@ -473,6 +478,10 @@ fn serialize_deserialize_policy_identity_control_and_telemetry_contracts() {
             queued_messages: 0,
             dropped_messages: 3,
             coalesced_messages: 9,
+            accepted_messages: 12,
+            injected_messages: 12,
+            failed_messages: 1,
+            last_error: Some("coalesced stale pointer sample".to_string()),
         },
     };
     let response = IpcResponse::ControlChannelSnapshot {
@@ -524,6 +533,55 @@ fn serialize_deserialize_policy_identity_control_and_telemetry_contracts() {
     let response = IpcResponse::TelemetryBundle { bundle };
     let json = serde_json::to_string(&response).unwrap();
     assert!(json.contains("TelemetryBundle"));
+    let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(response, deserialized);
+}
+
+#[test]
+fn serialize_deserialize_control_input_contracts() {
+    let session_id = test_session_id();
+    let request = IpcRequest::SendControlInput {
+        session_id: session_id.clone(),
+        event: ControlInputEvent::MouseButton {
+            button: ControlInputButton::Left,
+            pressed: true,
+        },
+    };
+    let json = serde_json::to_string(&request).unwrap();
+    assert!(json.contains("SendControlInput"));
+    assert!(json.contains("\"button\":\"left\""));
+    let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(request, deserialized);
+
+    let key_request = IpcRequest::SendControlInput {
+        session_id: session_id.clone(),
+        event: ControlInputEvent::Key {
+            key: ControlInputKey::VirtualKey { code: 0x41 },
+            pressed: false,
+        },
+    };
+    let json = serde_json::to_string(&key_request).unwrap();
+    assert!(json.contains("\"kind\":\"virtual_key\""));
+    let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(key_request, deserialized);
+
+    let release_request = IpcRequest::SendControlInput {
+        session_id: session_id.clone(),
+        event: ControlInputEvent::ReleaseAll,
+    };
+    let json = serde_json::to_string(&release_request).unwrap();
+    assert!(json.contains("\"kind\":\"release_all\""));
+    let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(release_request, deserialized);
+
+    let response = IpcResponse::ControlInputAccepted {
+        session_id,
+        lane: ControlInputLane::Reliable,
+        event_count: 1,
+    };
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("ControlInputAccepted"));
+    assert!(json.contains("\"lane\":\"reliable\""));
     let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
     assert_eq!(response, deserialized);
 }
@@ -919,6 +977,10 @@ fn serialize_deserialize_all_request_types() {
         },
         IpcRequest::GetControlChannelSnapshot {
             session_id: test_session_id(),
+        },
+        IpcRequest::SendControlInput {
+            session_id: test_session_id(),
+            event: ControlInputEvent::MouseMove { x: 120, y: 80 },
         },
         IpcRequest::PairDevice {
             device_id: test_device_id(),

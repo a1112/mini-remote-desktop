@@ -527,8 +527,32 @@ impl IpcServer {
             }
 
             IpcRequest::GetControlChannelSnapshot { session_id } => {
-                IpcResponse::ControlChannelSnapshot {
-                    snapshot: control_channel_snapshot(session_id),
+                let snapshot = self
+                    .app_state
+                    .control_input()
+                    .lock()
+                    .await
+                    .snapshot(session_id);
+                IpcResponse::ControlChannelSnapshot { snapshot }
+            }
+
+            IpcRequest::SendControlInput { session_id, event } => {
+                let result = self
+                    .app_state
+                    .control_input()
+                    .lock()
+                    .await
+                    .handle_event(&event);
+                match result {
+                    Ok(result) => IpcResponse::ControlInputAccepted {
+                        session_id,
+                        lane: result.lane,
+                        event_count: result.event_count,
+                    },
+                    Err(error) => IpcResponse::Error {
+                        code: "E_CONTROL_INPUT".to_string(),
+                        message: error.to_string(),
+                    },
                 }
             }
 
@@ -1215,30 +1239,6 @@ fn transport_policy_snapshot(
     }
 }
 
-fn control_channel_snapshot(session_id: SessionId) -> mrd_ipc::ControlChannelSnapshot {
-    mrd_ipc::ControlChannelSnapshot {
-        session_id,
-        reliable: mrd_ipc::ControlChannelLaneSnapshot {
-            name: "ctrl_rel".to_string(),
-            reliability: mrd_ipc::ControlChannelReliability::ReliableOrdered,
-            ordered: true,
-            max_retransmits: None,
-            queued_messages: 0,
-            dropped_messages: 0,
-            coalesced_messages: 0,
-        },
-        realtime: mrd_ipc::ControlChannelLaneSnapshot {
-            name: "ctrl_rt".to_string(),
-            reliability: mrd_ipc::ControlChannelReliability::UnreliableRealtime,
-            ordered: false,
-            max_retransmits: Some(0),
-            queued_messages: 0,
-            dropped_messages: 0,
-            coalesced_messages: 0,
-        },
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1504,6 +1504,98 @@ mod tests {
             _ => panic!("Expected preflight error response"),
         }
         assert!(app_state.sessions.lock().await.get(&session_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn control_input_request_updates_reliable_lane_counters() {
+        let app_state = Arc::new(AppState::new());
+        app_state
+            .replace_control_input_for_test(mrd_input::RecordingInputInjector::available())
+            .await;
+        let server = IpcServer::new(app_state.clone());
+        let session_id = SessionId("control-input-session".to_string());
+
+        let response = server
+            .handle_request(IpcRequest::SendControlInput {
+                session_id: session_id.clone(),
+                event: mrd_ipc::ControlInputEvent::MouseButton {
+                    button: mrd_ipc::ControlInputButton::Left,
+                    pressed: true,
+                },
+            })
+            .await;
+
+        assert_eq!(
+            response,
+            IpcResponse::ControlInputAccepted {
+                session_id: session_id.clone(),
+                lane: mrd_ipc::ControlInputLane::Reliable,
+                event_count: 1,
+            }
+        );
+
+        let snapshot = match server
+            .handle_request(IpcRequest::GetControlChannelSnapshot {
+                session_id: session_id.clone(),
+            })
+            .await
+        {
+            IpcResponse::ControlChannelSnapshot { snapshot } => snapshot,
+            other => panic!("expected control snapshot, got {other:?}"),
+        };
+
+        assert_eq!(snapshot.reliable.accepted_messages, 1);
+        assert_eq!(snapshot.reliable.injected_messages, 1);
+        assert_eq!(snapshot.reliable.failed_messages, 0);
+        assert_eq!(snapshot.realtime.accepted_messages, 0);
+    }
+
+    #[tokio::test]
+    async fn control_input_request_records_injection_failure() {
+        let app_state = Arc::new(AppState::new());
+        app_state
+            .replace_control_input_for_test(mrd_input::UnsupportedInputInjector::new(
+                "blocked by test",
+            ))
+            .await;
+        let server = IpcServer::new(app_state.clone());
+        let session_id = SessionId("control-input-failure-session".to_string());
+
+        let response = server
+            .handle_request(IpcRequest::SendControlInput {
+                session_id: session_id.clone(),
+                event: mrd_ipc::ControlInputEvent::Key {
+                    key: mrd_ipc::ControlInputKey::VirtualKey { code: 0x41 },
+                    pressed: true,
+                },
+            })
+            .await;
+
+        match response {
+            IpcResponse::Error { code, message } => {
+                assert_eq!(code, "E_CONTROL_INPUT");
+                assert!(message.contains("blocked by test"));
+            }
+            other => panic!("expected control input error, got {other:?}"),
+        }
+
+        let snapshot = match server
+            .handle_request(IpcRequest::GetControlChannelSnapshot {
+                session_id: session_id.clone(),
+            })
+            .await
+        {
+            IpcResponse::ControlChannelSnapshot { snapshot } => snapshot,
+            other => panic!("expected control snapshot, got {other:?}"),
+        };
+
+        assert_eq!(snapshot.reliable.accepted_messages, 1);
+        assert_eq!(snapshot.reliable.injected_messages, 0);
+        assert_eq!(snapshot.reliable.failed_messages, 1);
+        assert_eq!(
+            snapshot.reliable.last_error.as_deref(),
+            Some("input injector unavailable: blocked by test")
+        );
     }
 
     fn set_capability_status(
