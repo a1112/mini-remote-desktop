@@ -741,15 +741,19 @@ fn init_x11_threads() {
 mod remote_display_surface_input_tests {
     use super::*;
     use std::ffi::OsStr;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::os::windows::ffi::OsStrExt;
-    use std::time::Duration;
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, SendMessageW, CS_HREDRAW,
-        CS_VREDRAW, HMENU, WINDOW_EX_STYLE, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN,
-        WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WNDCLASSW, WS_OVERLAPPED,
+        BringWindowToTop, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+        PeekMessageW, RegisterClassW, SendMessageW, SetForegroundWindow, ShowWindow,
+        TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, HMENU, MSG, PM_REMOVE, SW_SHOW,
+        WINDOW_EX_STYLE, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
+        WM_MOUSEMOVE, WM_MOUSEWHEEL, WNDCLASSW, WS_OVERLAPPED, WS_OVERLAPPEDWINDOW,
     };
 
     fn lparam(x: i16, y: i16) -> isize {
@@ -818,6 +822,454 @@ mod remote_display_surface_input_tests {
             unsafe {
                 let _ = DestroyWindow(self.0);
             }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct WindowsTestVirtualScreen {
+        left: i32,
+        top: i32,
+        width: i32,
+        height: i32,
+    }
+
+    struct CursorRestoreGuard {
+        position: (i32, i32),
+    }
+
+    impl CursorRestoreGuard {
+        fn new(position: (i32, i32)) -> Self {
+            Self { position }
+        }
+    }
+
+    impl Drop for CursorRestoreGuard {
+        fn drop(&mut self) {
+            let _ = force_cursor_position(self.position);
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum KeyboardSmokeEvent {
+        KeyDown(u16),
+        KeyUp(u16),
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct KeyboardSmokeResult {
+        key_down: bool,
+        key_up: bool,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct KeyboardSmokeFocusSnapshot {
+        hwnd: isize,
+        foreground: isize,
+        focus: isize,
+    }
+
+    static KEYBOARD_SMOKE_EVENTS: OnceLock<Mutex<Vec<KeyboardSmokeEvent>>> = OnceLock::new();
+
+    struct KeyboardSmokeWindow {
+        hwnd: HWND,
+    }
+
+    impl KeyboardSmokeWindow {
+        fn create() -> windows::core::Result<Self> {
+            keyboard_smoke_events()
+                .lock()
+                .expect("clear keyboard smoke events")
+                .clear();
+
+            let class_name = wide(&format!(
+                "RdeskNativeInputE2eKeyboardSmoke{}{}",
+                std::process::id(),
+                current_time_millis()
+            ));
+            let title = wide("Rdesk native input E2E smoke");
+            unsafe {
+                let hmodule = GetModuleHandleW(None)?;
+                let hinstance = HINSTANCE(hmodule.0);
+                let window_class = WNDCLASSW {
+                    style: CS_HREDRAW | CS_VREDRAW,
+                    lpfnWndProc: Some(keyboard_smoke_wnd_proc),
+                    hInstance: hinstance,
+                    lpszClassName: PCWSTR(class_name.as_ptr()),
+                    ..Default::default()
+                };
+                if RegisterClassW(&window_class) == 0 {
+                    return Err(windows::core::Error::from_win32());
+                }
+
+                let hwnd = CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    PCWSTR(class_name.as_ptr()),
+                    PCWSTR(title.as_ptr()),
+                    WS_OVERLAPPEDWINDOW,
+                    CW_USEDEFAULT,
+                    CW_USEDEFAULT,
+                    320,
+                    160,
+                    HWND(0),
+                    HMENU(0),
+                    hinstance,
+                    None,
+                );
+                if hwnd.0 == 0 {
+                    return Err(windows::core::Error::from_win32());
+                }
+                let _ = ShowWindow(hwnd, SW_SHOW);
+                let _ = windows::Win32::Graphics::Gdi::UpdateWindow(hwnd);
+                pump_window_messages();
+                Ok(Self { hwnd })
+            }
+        }
+
+        fn focus(&mut self) {
+            use windows::Win32::UI::Input::KeyboardAndMouse::{SetActiveWindow, SetFocus};
+
+            unsafe {
+                let _ = BringWindowToTop(self.hwnd);
+                let _ = SetForegroundWindow(self.hwnd);
+                let _ = SetActiveWindow(self.hwnd);
+                let _ = SetFocus(self.hwnd);
+            }
+            let deadline = Instant::now() + Duration::from_millis(300);
+            while Instant::now() < deadline {
+                pump_window_messages();
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn wait_for_key_events(
+            &mut self,
+            virtual_key: u16,
+            timeout: Duration,
+        ) -> windows::core::Result<KeyboardSmokeResult> {
+            let deadline = Instant::now() + timeout;
+            loop {
+                pump_window_messages();
+                let result = keyboard_smoke_result(virtual_key);
+                if result.key_down && result.key_up {
+                    return Ok(result);
+                }
+                if Instant::now() >= deadline {
+                    return Ok(result);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn focus_snapshot(&self) -> KeyboardSmokeFocusSnapshot {
+            unsafe {
+                KeyboardSmokeFocusSnapshot {
+                    hwnd: self.hwnd.0 as isize,
+                    foreground: windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow().0
+                        as isize,
+                    focus: windows::Win32::UI::Input::KeyboardAndMouse::GetFocus().0 as isize,
+                }
+            }
+        }
+    }
+
+    impl Drop for KeyboardSmokeWindow {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = DestroyWindow(self.hwnd);
+            }
+            pump_window_messages();
+        }
+    }
+
+    unsafe extern "system" fn keyboard_smoke_wnd_proc(
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> windows::Win32::Foundation::LRESULT {
+        match message {
+            WM_KEYDOWN => {
+                keyboard_smoke_events()
+                    .lock()
+                    .expect("record key down")
+                    .push(KeyboardSmokeEvent::KeyDown(wparam.0 as u16));
+                windows::Win32::Foundation::LRESULT(0)
+            }
+            WM_KEYUP => {
+                keyboard_smoke_events()
+                    .lock()
+                    .expect("record key up")
+                    .push(KeyboardSmokeEvent::KeyUp(wparam.0 as u16));
+                windows::Win32::Foundation::LRESULT(0)
+            }
+            _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+        }
+    }
+
+    fn keyboard_smoke_events() -> &'static Mutex<Vec<KeyboardSmokeEvent>> {
+        KEYBOARD_SMOKE_EVENTS.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    fn keyboard_smoke_result(virtual_key: u16) -> KeyboardSmokeResult {
+        let ime_process_key = windows::Win32::UI::Input::KeyboardAndMouse::VK_PROCESSKEY.0;
+        let events = keyboard_smoke_events().lock().expect("read key events");
+        KeyboardSmokeResult {
+            key_down: events.iter().any(|event| {
+                matches!(
+                    *event,
+                    KeyboardSmokeEvent::KeyDown(key)
+                        if key == virtual_key || key == ime_process_key
+                )
+            }),
+            key_up: events.iter().any(|event| {
+                matches!(
+                    *event,
+                    KeyboardSmokeEvent::KeyUp(key)
+                        if key == virtual_key || key == ime_process_key
+                )
+            }),
+        }
+    }
+
+    fn pump_window_messages() {
+        unsafe {
+            let mut message = MSG::default();
+            while PeekMessageW(&mut message, HWND(0), 0, 0, PM_REMOVE).as_bool() {
+                let _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+    }
+
+    fn current_time_millis() -> u128 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or_default()
+    }
+
+    fn current_virtual_screen() -> WindowsTestVirtualScreen {
+        unsafe {
+            WindowsTestVirtualScreen {
+                left: windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+                    windows::Win32::UI::WindowsAndMessaging::SM_XVIRTUALSCREEN,
+                ),
+                top: windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+                    windows::Win32::UI::WindowsAndMessaging::SM_YVIRTUALSCREEN,
+                ),
+                width: windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+                    windows::Win32::UI::WindowsAndMessaging::SM_CXVIRTUALSCREEN,
+                ),
+                height: windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+                    windows::Win32::UI::WindowsAndMessaging::SM_CYVIRTUALSCREEN,
+                ),
+            }
+        }
+    }
+
+    fn current_cursor_position() -> windows::core::Result<(i32, i32)> {
+        let mut point = windows::Win32::Foundation::POINT::default();
+        unsafe {
+            windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut point)?;
+        }
+        Ok((point.x, point.y))
+    }
+
+    fn force_cursor_position(position: (i32, i32)) -> windows::core::Result<()> {
+        unsafe { windows::Win32::UI::WindowsAndMessaging::SetCursorPos(position.0, position.1) }
+    }
+
+    fn cursor_smoke_target(
+        start: (i32, i32),
+        screen: WindowsTestVirtualScreen,
+        offset: i32,
+    ) -> (i32, i32) {
+        let min_x = screen.left;
+        let min_y = screen.top;
+        let max_x = screen.left + screen.width.saturating_sub(1);
+        let max_y = screen.top + screen.height.saturating_sub(1);
+        let add = (
+            (start.0 + offset).clamp(min_x, max_x),
+            (start.1 + offset).clamp(min_y, max_y),
+        );
+        if add != start {
+            return add;
+        }
+        (
+            (start.0 - offset).clamp(min_x, max_x),
+            (start.1 - offset).clamp(min_y, max_y),
+        )
+    }
+
+    fn wait_for_cursor_near(
+        expected: (i32, i32),
+        tolerance: i32,
+        timeout: Duration,
+    ) -> windows::core::Result<Option<(i32, i32)>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let current = current_cursor_position()?;
+            if cursor_distance(current, expected) <= tolerance {
+                return Ok(Some(current));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn cursor_distance(left: (i32, i32), right: (i32, i32)) -> i32 {
+        left.0.abs_diff(right.0).max(left.1.abs_diff(right.1)) as i32
+    }
+
+    fn reserve_udp_port() -> u16 {
+        std::net::UdpSocket::bind(("127.0.0.1", 0))
+            .expect("reserve UDP port")
+            .local_addr()
+            .expect("reserved UDP addr")
+            .port()
+    }
+
+    fn service_ipc_endpoint(name: &str) -> mrd_ipc::transport::IpcEndpoint {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        mrd_ipc::transport::IpcEndpoint::named_pipe(format!(
+            r"\\.\pipe\rdesk-native-input-e2e-{name}-{}-{unique}",
+            std::process::id()
+        ))
+    }
+
+    fn app_state_with_lan_port(port: u16, peer_port: u16) -> Arc<mrd_service::AppState> {
+        let tray: mrd_service::app_state::TrayPortRef =
+            Arc::new(std::sync::Mutex::new(mrd_service::NoOpTray::new()));
+        Arc::new(mrd_service::AppState::with_tray_and_lan_discovery_config(
+            tray,
+            mrd_service::lan_discovery::LanDiscoveryConfig {
+                enabled: true,
+                discovery_port: port,
+                probe_endpoints: vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), peer_port)],
+                announce_interval: Duration::from_millis(50),
+                peer_ttl: Duration::from_secs(5),
+            },
+        ))
+    }
+
+    async fn wait_for_lan_peer(
+        app_state: &Arc<mrd_service::AppState>,
+        device_id: &mrd_proto::DeviceId,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if app_state
+                .lan_discovery
+                .peer_control_addr(device_id)
+                .await
+                .is_some()
+            {
+                return;
+            }
+            if Instant::now() >= deadline {
+                let snapshot = app_state.lan_discovery.snapshot().await;
+                panic!("LAN peer {device_id:?} not discovered; snapshot={snapshot:?}");
+            }
+            app_state.lan_discovery.request_probe();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn wait_for_service_ipc(endpoint: mrd_ipc::transport::IpcEndpoint) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let mut client = mrd_ipc::client::IpcClient::with_endpoint(endpoint.clone());
+            if let Ok(mrd_ipc::IpcResponse::ServiceHealth { status }) = client
+                .send_request(mrd_ipc::IpcRequest::ServiceHealth)
+                .await
+            {
+                if status.running && status.healthy {
+                    return;
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!("service IPC endpoint did not become ready: {endpoint:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn recv_std_channel<T: Send + 'static>(
+        receiver: Arc<Mutex<std::sync::mpsc::Receiver<T>>>,
+        timeout: Duration,
+        label: &str,
+    ) -> T {
+        let label = label.to_string();
+        tokio::task::spawn_blocking(move || {
+            receiver
+                .lock()
+                .expect("lock std receiver")
+                .recv_timeout(timeout)
+        })
+        .await
+        .expect("blocking receive task")
+        .unwrap_or_else(|error| panic!("{label}: {error}"))
+    }
+
+    async fn send_release_all_over_service_ipc(
+        endpoint: mrd_ipc::transport::IpcEndpoint,
+        session_id: mrd_proto::SessionId,
+    ) -> mrd_ipc::IpcResponse {
+        let mut client = mrd_ipc::client::IpcClient::with_endpoint(endpoint);
+        client
+            .send_request(mrd_ipc::IpcRequest::SendControlInput {
+                session_id,
+                event: mrd_ipc::ControlInputEvent::ReleaseAll,
+            })
+            .await
+            .expect("service IPC ReleaseAll response")
+    }
+
+    async fn send_key_over_service_ipc(
+        endpoint: mrd_ipc::transport::IpcEndpoint,
+        session_id: mrd_proto::SessionId,
+        pressed: bool,
+    ) -> mrd_ipc::IpcResponse {
+        let mut client = mrd_ipc::client::IpcClient::with_endpoint(endpoint);
+        client
+            .send_request(mrd_ipc::IpcRequest::SendControlInput {
+                session_id,
+                event: mrd_ipc::ControlInputEvent::Key {
+                    key: mrd_ipc::ControlInputKey::VirtualKey { code: 0x41 },
+                    pressed,
+                },
+            })
+            .await
+            .expect("service IPC key response")
+    }
+
+    fn session_snapshot(
+        session_id: mrd_proto::SessionId,
+        source_device_id: Option<mrd_proto::DeviceId>,
+        target_device_id: Option<mrd_proto::DeviceId>,
+        sender_active: bool,
+        receiver_active: bool,
+    ) -> mrd_application::ports::SessionSnapshot {
+        mrd_application::ports::SessionSnapshot {
+            session_id,
+            transport: "quic".to_string(),
+            source_device_id,
+            target_device_id,
+            local_listen_addr: None,
+            local_server_name: None,
+            local_cert_der_b64: None,
+            remote_listen_addr: None,
+            remote_server_name: None,
+            remote_cert_der_b64: None,
+            lifecycle_state: mrd_application::ports::SessionLifecycleState::Connected,
+            last_error: None,
+            sender_active,
+            receiver_active,
         }
     }
 
@@ -937,6 +1389,296 @@ mod remote_display_surface_input_tests {
             input.event,
             mrd_ipc::ControlInputEvent::MouseMove { x: 42, y: 24 }
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "manual smoke test: native WndProc -> Rdesk IPC forwarder -> service IPC -> LAN -> SendInput target window"]
+    async fn remote_display_surface_native_input_smoke_reaches_lan_sendinput_target_window() {
+        let start_cursor = current_cursor_position().expect("read starting cursor position");
+        let _cursor_restore = CursorRestoreGuard::new(start_cursor);
+        let cursor_target = cursor_smoke_target(start_cursor, current_virtual_screen(), 80);
+        assert_ne!(cursor_target, start_cursor, "cursor smoke target must move");
+
+        let mut keyboard_window =
+            KeyboardSmokeWindow::create().expect("create keyboard smoke window");
+        keyboard_window.focus();
+
+        let controller_device_id = mrd_proto::DeviceId("native-controller-device".to_string());
+        let target_device_id = mrd_proto::DeviceId("native-target-device".to_string());
+        let session_id = mrd_proto::SessionId("native-input-full-e2e-smoke-session".to_string());
+
+        let controller_port = reserve_udp_port();
+        let target_port = reserve_udp_port();
+        let controller_state = app_state_with_lan_port(controller_port, target_port);
+        let target_state = app_state_with_lan_port(target_port, controller_port);
+        controller_state.devices.lock().await.register(
+            controller_device_id.clone(),
+            "Native Controller Device".to_string(),
+        );
+        target_state
+            .devices
+            .lock()
+            .await
+            .register(target_device_id.clone(), "Native Target Device".to_string());
+        controller_state.sessions.lock().await.insert(
+            session_id.clone(),
+            session_snapshot(
+                session_id.clone(),
+                None,
+                Some(target_device_id.clone()),
+                false,
+                true,
+            ),
+        );
+        target_state.sessions.lock().await.insert(
+            session_id.clone(),
+            session_snapshot(
+                session_id.clone(),
+                Some(controller_device_id.clone()),
+                None,
+                true,
+                false,
+            ),
+        );
+
+        mrd_service::lan_discovery::start_lan_discovery(target_state.clone())
+            .await
+            .expect("start target LAN discovery");
+        mrd_service::lan_discovery::start_lan_discovery(controller_state.clone())
+            .await
+            .expect("start controller LAN discovery");
+        wait_for_lan_peer(&controller_state, &target_device_id).await;
+        let warmup = mrd_service::lan_discovery::request_lan_control_input(
+            &controller_state,
+            &session_id,
+            mrd_ipc::ControlInputEvent::ReleaseAll,
+        )
+        .await
+        .expect("warm up LAN control input channel");
+        assert_eq!(warmup.lane, mrd_ipc::ControlInputLane::Cleanup);
+
+        let endpoint = service_ipc_endpoint("full");
+        let controller_server = mrd_service::ipc_server::IpcServer::new_with_endpoint(
+            controller_state.clone(),
+            endpoint.clone(),
+        );
+        let server_task = tokio::spawn(async move {
+            let _ = controller_server.run().await;
+        });
+        wait_for_service_ipc(endpoint.clone()).await;
+        let ipc_warmup =
+            send_release_all_over_service_ipc(endpoint.clone(), session_id.clone()).await;
+        assert_eq!(
+            ipc_warmup,
+            mrd_ipc::IpcResponse::ControlInputAccepted {
+                session_id: session_id.clone(),
+                lane: mrd_ipc::ControlInputLane::Cleanup,
+                event_count: 0,
+            }
+        );
+        let direct_key_down =
+            send_key_over_service_ipc(endpoint.clone(), session_id.clone(), true).await;
+        let direct_key_up =
+            send_key_over_service_ipc(endpoint.clone(), session_id.clone(), false).await;
+        assert_eq!(
+            direct_key_down,
+            mrd_ipc::IpcResponse::ControlInputAccepted {
+                session_id: session_id.clone(),
+                lane: mrd_ipc::ControlInputLane::Reliable,
+                event_count: 1,
+            }
+        );
+        assert_eq!(
+            direct_key_up,
+            mrd_ipc::IpcResponse::ControlInputAccepted {
+                session_id: session_id.clone(),
+                lane: mrd_ipc::ControlInputLane::Reliable,
+                event_count: 1,
+            }
+        );
+        let direct_key_events = keyboard_window
+            .wait_for_key_events(0x41, Duration::from_secs(2))
+            .expect("wait for direct service IPC key events");
+        assert!(direct_key_events.key_down);
+        assert!(direct_key_events.key_up);
+        keyboard_smoke_events()
+            .lock()
+            .expect("clear direct IPC key events")
+            .clear();
+        keyboard_window.focus();
+
+        let (forward_sender, forward_receiver) = std::sync::mpsc::channel();
+        let (worker_sender, worker_receiver) = std::sync::mpsc::channel();
+        let (observed_sender, observed_receiver) = std::sync::mpsc::channel();
+        let (response_sender, response_receiver) = std::sync::mpsc::channel();
+        let observed_receiver = Arc::new(Mutex::new(observed_receiver));
+        let response_receiver = Arc::new(Mutex::new(response_receiver));
+        assert!(
+            install_control_input_forwarder(forward_sender),
+            "native surface input forwarder should only be installed once in this smoke"
+        );
+        let _proxy = std::thread::spawn(move || {
+            for input in forward_receiver {
+                let _ = observed_sender.send(input.clone());
+                let _ = worker_sender.send(input);
+            }
+        });
+        let _forwarder =
+            crate::spawn_native_surface_control_input_forwarder_for_receiver_with_reporter(
+                worker_receiver,
+                endpoint,
+                Some(response_sender),
+            );
+
+        let parent = TestParentWindow::create();
+        let parent_hwnd = parent.0;
+        let mut surface = NativeRenderSurface::create(
+            parent_hwnd.0,
+            NativeSurfaceRect {
+                x: 0,
+                y: 0,
+                width: 128,
+                height: 128,
+            },
+            false,
+        )
+        .expect("create native render surface");
+        surface.set_control_session_id(Some(session_id.0.clone()));
+
+        keyboard_window.focus();
+        unsafe {
+            SendMessageW(surface.hwnd, WM_KEYDOWN, WPARAM(0x41), LPARAM(0));
+            SendMessageW(surface.hwnd, WM_KEYUP, WPARAM(0x41), LPARAM(0));
+        }
+        let observed_down = recv_std_channel(
+            observed_receiver.clone(),
+            Duration::from_secs(1),
+            "native key-down left WndProc forwarder",
+        )
+        .await;
+        let observed_up = recv_std_channel(
+            observed_receiver.clone(),
+            Duration::from_secs(1),
+            "native key-up left WndProc forwarder",
+        )
+        .await;
+        assert_eq!(observed_down.session_id, session_id.0);
+        assert_eq!(observed_up.session_id, session_id.0);
+        assert_eq!(
+            observed_down.event,
+            mrd_ipc::ControlInputEvent::Key {
+                key: mrd_ipc::ControlInputKey::VirtualKey { code: 0x41 },
+                pressed: true,
+            }
+        );
+        assert_eq!(
+            observed_up.event,
+            mrd_ipc::ControlInputEvent::Key {
+                key: mrd_ipc::ControlInputKey::VirtualKey { code: 0x41 },
+                pressed: false,
+            }
+        );
+        let response_down = recv_std_channel(
+            response_receiver.clone(),
+            Duration::from_secs(10),
+            "native key-down service IPC response",
+        )
+        .await;
+        let response_up = recv_std_channel(
+            response_receiver.clone(),
+            Duration::from_secs(10),
+            "native key-up service IPC response",
+        )
+        .await;
+        assert_eq!(response_down.0, session_id.0);
+        assert_eq!(response_up.0, session_id.0);
+        assert_eq!(
+            response_down.1.expect("native key-down IPC request"),
+            mrd_ipc::IpcResponse::ControlInputAccepted {
+                session_id: session_id.clone(),
+                lane: mrd_ipc::ControlInputLane::Reliable,
+                event_count: 1,
+            }
+        );
+        assert_eq!(
+            response_up.1.expect("native key-up IPC request"),
+            mrd_ipc::IpcResponse::ControlInputAccepted {
+                session_id: session_id.clone(),
+                lane: mrd_ipc::ControlInputLane::Reliable,
+                event_count: 1,
+            }
+        );
+
+        let key_events = keyboard_window
+            .wait_for_key_events(0x41, Duration::from_secs(5))
+            .expect("wait for full native input smoke key events");
+        assert!(key_events.key_down);
+        assert!(key_events.key_up);
+        unsafe {
+            SendMessageW(
+                surface.hwnd,
+                WM_MOUSEMOVE,
+                WPARAM(0),
+                LPARAM(lparam(cursor_target.0 as i16, cursor_target.1 as i16)),
+            );
+        }
+        let observed_mouse = recv_std_channel(
+            observed_receiver.clone(),
+            Duration::from_secs(1),
+            "native mouse move left WndProc forwarder",
+        )
+        .await;
+        assert_eq!(observed_mouse.session_id, session_id.0);
+        assert_eq!(
+            observed_mouse.event,
+            mrd_ipc::ControlInputEvent::MouseMove {
+                x: cursor_target.0,
+                y: cursor_target.1,
+            }
+        );
+        let mouse_response = recv_std_channel(
+            response_receiver.clone(),
+            Duration::from_secs(10),
+            "native mouse move service IPC response",
+        )
+        .await;
+        assert_eq!(mouse_response.0, session_id.0);
+        assert_eq!(
+            mouse_response.1.expect("native mouse move IPC request"),
+            mrd_ipc::IpcResponse::ControlInputAccepted {
+                session_id: session_id.clone(),
+                lane: mrd_ipc::ControlInputLane::Realtime,
+                event_count: 1,
+            }
+        );
+        let moved = wait_for_cursor_near(cursor_target, 2, Duration::from_secs(2))
+            .expect("wait for full native input smoke cursor move");
+        assert!(
+            moved.is_some(),
+            "cursor did not move near target: target={cursor_target:?} start={start_cursor:?}"
+        );
+
+        let target_snapshot = target_state
+            .control_input()
+            .lock()
+            .await
+            .snapshot(session_id.clone());
+        server_task.abort();
+        eprintln!(
+            "native input full smoke key_events={key_events:?} focus={:?} events={:?} reliable={:?} realtime={:?}",
+            keyboard_window.focus_snapshot(),
+            keyboard_smoke_events()
+                .lock()
+                .expect("read keyboard smoke events"),
+            target_snapshot.reliable,
+            target_snapshot.realtime
+        );
+        assert_eq!(target_snapshot.reliable.accepted_messages, 6);
+        assert_eq!(target_snapshot.reliable.injected_messages, 4);
+        assert_eq!(target_snapshot.reliable.failed_messages, 0);
+        assert_eq!(target_snapshot.realtime.accepted_messages, 1);
+        assert_eq!(target_snapshot.realtime.injected_messages, 1);
+        assert_eq!(target_snapshot.realtime.failed_messages, 0);
     }
 }
 

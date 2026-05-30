@@ -3551,6 +3551,17 @@ fn spawn_native_surface_control_input_forwarder_for_receiver(
     receiver: std::sync::mpsc::Receiver<remote_display_surface::NativeSurfaceControlInput>,
     endpoint: mrd_ipc::transport::IpcEndpoint,
 ) -> std::thread::JoinHandle<()> {
+    spawn_native_surface_control_input_forwarder_for_receiver_with_reporter(
+        receiver, endpoint, None,
+    )
+}
+
+#[cfg(windows)]
+fn spawn_native_surface_control_input_forwarder_for_receiver_with_reporter(
+    receiver: std::sync::mpsc::Receiver<remote_display_surface::NativeSurfaceControlInput>,
+    endpoint: mrd_ipc::transport::IpcEndpoint,
+    reporter: Option<std::sync::mpsc::Sender<(String, Result<mrd_ipc::IpcResponse, String>)>>,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let runtime = match tokio::runtime::Runtime::new() {
             Ok(runtime) => runtime,
@@ -3562,6 +3573,7 @@ fn spawn_native_surface_control_input_forwarder_for_receiver(
 
         for input in receiver {
             let endpoint = endpoint.clone();
+            let reporter = reporter.clone();
             runtime.block_on(async move {
                 let mut client = mrd_ipc::client::IpcClient::with_endpoint(endpoint);
                 let response = client
@@ -3570,11 +3582,28 @@ fn spawn_native_surface_control_input_forwarder_for_receiver(
                         event: input.event,
                     })
                     .await;
-                if let Err(error) = response {
-                    eprintln!(
-                        "native surface input forward failed session_id={} error={error}",
-                        input.session_id
-                    );
+                match response {
+                    Ok(response) => {
+                        if let mrd_ipc::IpcResponse::Error { code, message } = &response {
+                            eprintln!(
+                                "native surface input forward rejected session_id={} code={} message={}",
+                                input.session_id, code, message
+                            );
+                        }
+                        if let Some(reporter) = reporter {
+                            let _ = reporter.send((input.session_id, Ok(response)));
+                        }
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        eprintln!(
+                            "native surface input forward failed session_id={} error={message}",
+                            input.session_id
+                        );
+                        if let Some(reporter) = reporter {
+                            let _ = reporter.send((input.session_id, Err(message)));
+                        }
+                    }
                 }
             });
         }
