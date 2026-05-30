@@ -9106,6 +9106,165 @@ mod tests {
         assert_eq!(snapshot.reliable.injected_messages, 2);
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "manual smoke test: sends a key through service IPC, LAN control input, and SendInput"]
+    async fn ipc_control_input_keyboard_smoke_routes_to_lan_sendinput_target_window() {
+        let mut window = KeyboardSmokeWindow::create().expect("create keyboard smoke window");
+        window.focus();
+
+        let controller_state = Arc::new(AppState::new());
+        controller_state.devices.lock().await.register(
+            DeviceId("controller-device".to_string()),
+            "Controller Device".to_string(),
+        );
+        let controller_server = crate::ipc_server::IpcServer::new(controller_state.clone());
+        let session_id = SessionId("ipc-input-sendinput-keyboard-smoke-session".to_string());
+        controller_state.sessions.lock().await.insert(
+            session_id.clone(),
+            SessionSnapshot {
+                session_id: session_id.clone(),
+                transport: "quic".to_string(),
+                source_device_id: None,
+                target_device_id: Some(DeviceId("target-device".to_string())),
+                local_listen_addr: None,
+                local_server_name: None,
+                local_cert_der_b64: None,
+                remote_listen_addr: None,
+                remote_server_name: None,
+                remote_cert_der_b64: None,
+                lifecycle_state: SessionLifecycleState::Connected,
+                last_error: None,
+                sender_active: false,
+                receiver_active: true,
+            },
+        );
+
+        let target_state = Arc::new(AppState::new());
+        target_state.devices.lock().await.register(
+            DeviceId("target-device".to_string()),
+            "Target Device".to_string(),
+        );
+        target_state.sessions.lock().await.insert(
+            session_id.clone(),
+            SessionSnapshot {
+                session_id: session_id.clone(),
+                transport: "quic".to_string(),
+                source_device_id: Some(DeviceId("controller-device".to_string())),
+                target_device_id: None,
+                local_listen_addr: None,
+                local_server_name: None,
+                local_cert_der_b64: None,
+                remote_listen_addr: None,
+                remote_server_name: None,
+                remote_cert_der_b64: None,
+                lifecycle_state: SessionLifecycleState::Listening,
+                last_error: None,
+                sender_active: true,
+                receiver_active: false,
+            },
+        );
+
+        let service_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let service_addr = service_socket.local_addr().unwrap();
+        let handler_socket = service_socket.clone();
+        let handler_state = target_state.clone();
+        let handler = tokio::spawn(async move {
+            let mut buffer = vec![0_u8; DISCOVERY_PACKET_BUFFER_BYTES];
+            for _ in 0..2 {
+                let (len, addr) = handler_socket.recv_from(&mut buffer).await.unwrap();
+                handle_packet(&handler_socket, &handler_state, &buffer[..len], addr)
+                    .await
+                    .unwrap();
+            }
+        });
+
+        controller_state
+            .lan_discovery
+            .upsert_peer(
+                LanAnnouncement {
+                    magic: DISCOVERY_MAGIC.to_string(),
+                    app_id: DISCOVERY_APP_ID.to_string(),
+                    instance_id: "target-instance".to_string(),
+                    device_id: "target-device".to_string(),
+                    device_name: "Target Device".to_string(),
+                    device_type: "rdesk".to_string(),
+                    protocol_version: PROTOCOL_VERSION,
+                    discovery_port: service_addr.port(),
+                    transports: vec!["quic".to_string(), LAN_INPUT_CONTROL_TRANSPORT.to_string()],
+                    service_build_id: Some(service_build_id()),
+                    media_protocol_version: Some(LAN_MEDIA_PROTOCOL_VERSION),
+                    media_capabilities: vec![LAN_INPUT_CONTROL_CAPABILITY.to_string()],
+                    timestamp_ms: now_ms(),
+                },
+                service_addr,
+            )
+            .await;
+
+        let key_down = controller_server
+            .handle_request(mrd_ipc::IpcRequest::SendControlInput {
+                session_id: session_id.clone(),
+                event: mrd_ipc::ControlInputEvent::Key {
+                    key: mrd_ipc::ControlInputKey::VirtualKey { code: 0x41 },
+                    pressed: true,
+                },
+            })
+            .await;
+        let key_up = controller_server
+            .handle_request(mrd_ipc::IpcRequest::SendControlInput {
+                session_id: session_id.clone(),
+                event: mrd_ipc::ControlInputEvent::Key {
+                    key: mrd_ipc::ControlInputKey::VirtualKey { code: 0x41 },
+                    pressed: false,
+                },
+            })
+            .await;
+        handler.await.unwrap();
+
+        let events = window
+            .wait_for_key_events(0x41, Duration::from_millis(500))
+            .await
+            .expect("wait for IPC LAN SendInput key events");
+        let snapshot = target_state
+            .control_input()
+            .lock()
+            .await
+            .snapshot(session_id.clone());
+
+        eprintln!(
+            "ipc lan keyboard sendinput smoke key_down={:?} key_up={:?} focus={:?} events={:?} response_down={:?} response_up={:?} snapshot={:?}",
+            events.key_down,
+            events.key_up,
+            window.focus_snapshot(),
+            keyboard_smoke_events()
+                .lock()
+                .expect("read keyboard smoke events"),
+            key_down,
+            key_up,
+            snapshot.reliable
+        );
+        assert_eq!(
+            key_down,
+            mrd_ipc::IpcResponse::ControlInputAccepted {
+                session_id: session_id.clone(),
+                lane: mrd_ipc::ControlInputLane::Reliable,
+                event_count: 1,
+            }
+        );
+        assert_eq!(
+            key_up,
+            mrd_ipc::IpcResponse::ControlInputAccepted {
+                session_id: session_id.clone(),
+                lane: mrd_ipc::ControlInputLane::Reliable,
+                event_count: 1,
+            }
+        );
+        assert!(events.key_down);
+        assert!(events.key_up);
+        assert_eq!(snapshot.reliable.accepted_messages, 2);
+        assert_eq!(snapshot.reliable.injected_messages, 2);
+    }
+
     #[tokio::test]
     async fn accepted_lan_control_input_scales_mouse_move_to_selected_source_size() {
         let target_state = Arc::new(AppState::new());

@@ -137,6 +137,7 @@ Optional manual Windows runtime smoke:
 cargo test -p mrd-input windows_sendinput_mouse_move_smoke_moves_and_restores_cursor -- --ignored --nocapture
 cargo test -p mrd-service lan_control_input_sendinput_smoke_moves_cursor_through_udp_handler -- --ignored --nocapture
 cargo test -p mrd-service lan_control_input_sendinput_keyboard_smoke_sends_key_through_udp_handler -- --ignored --nocapture
+cargo test -p mrd-service ipc_control_input_keyboard_smoke_routes_to_lan_sendinput_target_window -- --ignored --nocapture
 ```
 
 ### Task 4: Extend IPC Contracts For Input Events
