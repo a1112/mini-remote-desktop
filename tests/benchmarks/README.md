@@ -48,11 +48,16 @@ powershell -ExecutionPolicy Bypass -File tests/benchmarks/scripts/run_transport_
 
 powershell -ExecutionPolicy Bypass -File tests/benchmarks/scripts/run_transport_matrix.ps1 `
   -ScenarioPath tests/benchmarks/scenarios/quick.transport.webrtc.nvenc.hevc_nvdec.2k144.waitable.json
+
+powershell -ExecutionPolicy Bypass -File tests/benchmarks/scripts/run_transport_matrix.ps1 `
+  -ScenarioPath tests/benchmarks/scenarios/quick.transport.webrtc.nvenc.av1_nvdec.2k144.waitable.json
 ```
 
 These scenarios set `MRD_D3D11_RENDER_WAITABLE_OBJECT=1` and
 `MRD_RENDER_THREAD_PRIORITY=above_normal` through the scenario file rather than
-requiring shell-local environment variables.
+requiring shell-local environment variables. D3D11 scenarios at 120fps or above
+also default to this waitable/above-normal render pacing policy in
+`run_transport_matrix.ps1` unless the scenario explicitly overrides it.
 
 2K H.264 decode comparison:
 

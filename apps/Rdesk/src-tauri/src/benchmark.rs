@@ -1151,7 +1151,7 @@ mod tests {
         if matches!(value, "nvenc_av1" | "av1_nvenc" | "nvenc-av1") {
             #[cfg(any(windows, target_os = "linux"))]
             {
-                if let Err(error) = NvencAv1Encoder::new(64, 64, 30) {
+                if let Err(error) = NvencAv1Encoder::probe_av1_available() {
                     return Some(format!(
                         "NVENC AV1 benchmark skipped: current GPU/driver does not expose AV1 encode support ({error:?})"
                     ));
@@ -1630,6 +1630,14 @@ mod tests {
             .expect("failure reason")
             .contains("mrd-encode-vvenc feature software-vvenc"));
         assert_eq!(probe.codec.as_deref(), Some("vvc"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn benchmark_nvenc_av1_capability_probe_does_not_reject_supported_hardware() {
+        if NvencAv1Encoder::probe_av1_available().is_ok() {
+            assert_eq!(unsupported_encoder_backend_reason("nvenc_av1"), None);
+        }
     }
 
     #[test]

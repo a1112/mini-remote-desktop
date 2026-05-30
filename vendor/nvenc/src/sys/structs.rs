@@ -440,9 +440,10 @@ pub struct NVencConfigAV1 {
     color_range: u32,
     chroma_sample_position: u32,
     use_b_frames_as_ref: NVencBFrameRefMode,
-    film_grain_params: NVencFilmGrainParamsAV1,
+    film_grain_params: *mut NVencFilmGrainParamsAV1,
     num_fwd_refs: NVencNumRefFrames,
     num_bwd_refs: NVencNumRefFrames,
+    output_bit_depth: NVencBitDepth,
     input_bit_depth: NVencBitDepth,
     ltr_num_frames: u32,
     num_temporal_layers: u32,
@@ -583,6 +584,22 @@ pub struct NVencPresetConfig {
     pub preset_cfg: NVencConfig,
     rsvd1: [u32; 256],
     rsvd2: [*mut c_void; 64],
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NVencConfigAV1;
+    use std::mem::{offset_of, size_of};
+
+    #[test]
+    fn av1_config_matches_sdk_13_layout() {
+        assert_eq!(offset_of!(NVencConfigAV1, film_grain_params), 96);
+        assert_eq!(offset_of!(NVencConfigAV1, num_fwd_refs), 104);
+        assert_eq!(offset_of!(NVencConfigAV1, input_bit_depth), 116);
+        assert_eq!(offset_of!(NVencConfigAV1, rsvd1), 132);
+        assert_eq!(offset_of!(NVencConfigAV1, rsvd3), 1056);
+        assert_eq!(size_of::<NVencConfigAV1>(), 1552);
+    }
 }
 
 pub const NV_ENC_PRESET_CONFIG_VER: u32 = struct_version(5) | (1 << 31);

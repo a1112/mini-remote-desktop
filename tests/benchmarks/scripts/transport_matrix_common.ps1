@@ -64,14 +64,30 @@ function Get-TransportMatrixRenderEnvironment {
 
   $result = @{}
   $propertyNames = @($Scenario.PSObject.Properties.Name)
+  $rendererBackend = if ($propertyNames -contains "renderer_backend") {
+    ([string]$Scenario.renderer_backend).ToLowerInvariant()
+  } else {
+    ""
+  }
+  $fps = if ($propertyNames -contains "fps" -and $null -ne $Scenario.fps) {
+    [int]$Scenario.fps
+  } else {
+    0
+  }
+  $highRefreshD3d11 = $fps -ge 120 -and $rendererBackend -match '^d3d11'
+
   if ($propertyNames -contains "d3d11_waitable_object") {
     $result.MRD_D3D11_RENDER_WAITABLE_OBJECT = if ($Scenario.d3d11_waitable_object) { "1" } else { "0" }
+  } elseif ($highRefreshD3d11) {
+    $result.MRD_D3D11_RENDER_WAITABLE_OBJECT = "1"
   }
   if (
     $propertyNames -contains "render_thread_priority" -and
     -not [string]::IsNullOrWhiteSpace([string]$Scenario.render_thread_priority)
   ) {
     $result.MRD_RENDER_THREAD_PRIORITY = [string]$Scenario.render_thread_priority
+  } elseif ($highRefreshD3d11) {
+    $result.MRD_RENDER_THREAD_PRIORITY = "above_normal"
   }
   return $result
 }

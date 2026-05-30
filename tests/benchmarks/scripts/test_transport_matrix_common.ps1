@@ -76,6 +76,22 @@ $defaultRenderEnv = Get-TransportMatrixRenderEnvironment -Scenario ([pscustomobj
 if ($defaultRenderEnv.ContainsKey("MRD_D3D11_RENDER_WAITABLE_OBJECT")) { throw "default scenario should not set waitable env" }
 if ($defaultRenderEnv.ContainsKey("MRD_RENDER_THREAD_PRIORITY")) { throw "default scenario should not set render priority env" }
 
+$highRefreshRenderEnv = Get-TransportMatrixRenderEnvironment -Scenario ([pscustomobject]@{
+  renderer_backend = "d3d11_shared"
+  fps = 144
+})
+if ($highRefreshRenderEnv.MRD_D3D11_RENDER_WAITABLE_OBJECT -ne "1") { throw "high refresh D3D11 scenario should default to waitable env" }
+if ($highRefreshRenderEnv.MRD_RENDER_THREAD_PRIORITY -ne "above_normal") { throw "high refresh D3D11 scenario should default render priority env" }
+
+$explicitNonWaitableRenderEnv = Get-TransportMatrixRenderEnvironment -Scenario ([pscustomobject]@{
+  renderer_backend = "d3d11_shared"
+  fps = 144
+  d3d11_waitable_object = $false
+  render_thread_priority = "normal"
+})
+if ($explicitNonWaitableRenderEnv.MRD_D3D11_RENDER_WAITABLE_OBJECT -ne "0") { throw "explicit high refresh waitable=false should be preserved" }
+if ($explicitNonWaitableRenderEnv.MRD_RENDER_THREAD_PRIORITY -ne "normal") { throw "explicit high refresh render priority should be preserved" }
+
 $scenarioSpecs = @(
   [pscustomobject]@{
     path = "tests/benchmarks/scenarios/quick.transport.quic.openh264.h264_software.2k.json"
@@ -111,6 +127,13 @@ $scenarioSpecs = @(
     transport = "webrtc"
     encode = "nvenc"
     decode = "nvdec"
+  },
+  [pscustomobject]@{
+    path = "tests/benchmarks/scenarios/quick.transport.webrtc.nvenc.av1_nvdec.2k144.waitable.json"
+    profile = "transport-webrtc-nvenc-av1-nvdec-2k144-waitable"
+    transport = "webrtc"
+    encode = "nvenc_av1"
+    decode = "nvdec_av1"
   }
 )
 
