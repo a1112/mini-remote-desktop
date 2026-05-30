@@ -8,7 +8,7 @@ use openh264::{
     formats::YUVSource,
 };
 use std::{
-    io::{Read, Write},
+    io::{BufRead, BufReader, Read, Write},
     path::PathBuf,
     process::{Child, ChildStdin, Command, Stdio},
     sync::mpsc,
@@ -101,6 +101,13 @@ const FFMPEG_HEVC_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
     output_formats: NV12_OUTPUTS,
 };
 
+const FFMPEG_VVC_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
+    id: "ffmpeg_vvc",
+    codec: CodecKind::Vvc,
+    runtime_status: RuntimeStatus::RuntimeBacked,
+    output_formats: I420_OUTPUTS,
+};
+
 const NVDEC_DESCRIPTOR: DecoderDescriptor = DecoderDescriptor {
     id: "nvdec",
     codec: CodecKind::H264,
@@ -183,6 +190,7 @@ pub fn available_decoder_descriptors() -> Vec<DecoderDescriptor> {
         VVC_SOFTWARE_DESCRIPTOR.clone(),
         FFMPEG_H264_DESCRIPTOR.clone(),
         FFMPEG_HEVC_DESCRIPTOR.clone(),
+        FFMPEG_VVC_DESCRIPTOR.clone(),
         NVDEC_D3D11_SHARED_DESCRIPTOR.clone(),
         NVDEC_DESCRIPTOR.clone(),
         NVDEC_HEVC_D3D11_SHARED_DESCRIPTOR.clone(),
@@ -221,6 +229,9 @@ pub fn create_decoder(id: &str) -> Result<Box<dyn VideoDecoder>, PipelineError> 
         }
         "ffmpeg_hevc" | "hevc_ffmpeg" | "h265_ffmpeg" => {
             Ok(Box::new(FfmpegCliDecoder::new(FfmpegDecodeCodec::Hevc)?))
+        }
+        "ffmpeg_vvc" | "vvc_ffmpeg" | "ffmpeg_h266" | "h266_ffmpeg" => {
+            Ok(Box::new(FfmpegCliDecoder::new(FfmpegDecodeCodec::Vvc)?))
         }
         "linux_h264" | "gstreamer_h264" | "vaapi_h264" => create_linux_h264_decoder(),
         "linux_hevc" | "gstreamer_hevc" | "vaapi_hevc" => create_linux_hevc_decoder(),
@@ -461,6 +472,7 @@ impl Dav1dSoftwareDecoder {
 pub struct VvdecSoftwareDecoder {
     decoder: vvdec::Decoder,
     decoded_frames: Vec<CoreDecodedFrame>,
+    input_index: u64,
     frame_index: u64,
 }
 
@@ -477,6 +489,7 @@ impl VvdecSoftwareDecoder {
         Ok(Self {
             decoder,
             decoded_frames: Vec::new(),
+            input_index: 0,
             frame_index: 0,
         })
     }
@@ -920,6 +933,7 @@ impl VideoDecoder for LinuxGstDecoder {
 pub enum FfmpegDecodeCodec {
     H264,
     Hevc,
+    Vvc,
 }
 
 impl FfmpegDecodeCodec {
@@ -927,6 +941,7 @@ impl FfmpegDecodeCodec {
         match self {
             Self::H264 => "H.264",
             Self::Hevc => "HEVC",
+            Self::Vvc => "VVC",
         }
     }
 
@@ -934,6 +949,7 @@ impl FfmpegDecodeCodec {
         match self {
             Self::H264 => "h264",
             Self::Hevc => "hevc",
+            Self::Vvc => "vvc",
         }
     }
 
@@ -941,6 +957,7 @@ impl FfmpegDecodeCodec {
         match self {
             Self::H264 => parse_h264_dimensions(access_unit),
             Self::Hevc => parse_hevc_dimensions(access_unit),
+            Self::Vvc => Ok(None),
         }
     }
 }
@@ -948,19 +965,25 @@ impl FfmpegDecodeCodec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FfmpegOutputPixelFormat {
     Nv12,
+    I420,
 }
 
 impl FfmpegOutputPixelFormat {
     fn ffmpeg_name(self) -> &'static str {
         match self {
             Self::Nv12 => "nv12",
+            Self::I420 => "yuv420p",
         }
     }
 
     fn frame_size(self, width: usize, height: usize) -> Result<usize, PipelineError> {
         match self {
-            Self::Nv12 => nv12_frame_size(width, height),
+            Self::Nv12 | Self::I420 => yuv420_8bit_frame_size(width, height),
         }
+    }
+
+    fn can_start_without_dimensions(self) -> bool {
+        matches!(self, Self::I420)
     }
 }
 
@@ -970,7 +993,7 @@ pub struct FfmpegCliDecoder {
     output_format: FfmpegOutputPixelFormat,
     child: Option<Child>,
     stdin: Option<ChildStdin>,
-    frame_rx: Option<mpsc::Receiver<Vec<u8>>>,
+    frame_rx: Option<mpsc::Receiver<FfmpegDecodedFrame>>,
     dimensions: Option<(usize, usize)>,
     pending_stream: Vec<u8>,
     decoded_frames: Vec<CoreDecodedFrame>,
@@ -1008,7 +1031,10 @@ impl FfmpegCliDecoder {
         Ok(Self {
             codec,
             ffmpeg_path,
-            output_format: FfmpegOutputPixelFormat::Nv12,
+            output_format: match codec {
+                FfmpegDecodeCodec::Vvc => FfmpegOutputPixelFormat::I420,
+                FfmpegDecodeCodec::H264 | FfmpegDecodeCodec::Hevc => FfmpegOutputPixelFormat::Nv12,
+            },
             child: None,
             stdin: None,
             frame_rx: None,
@@ -1019,36 +1045,52 @@ impl FfmpegCliDecoder {
         })
     }
 
-    fn start_process(&mut self, width: usize, height: usize) -> Result<(), PipelineError> {
+    fn start_process(&mut self, dimensions: Option<(usize, usize)>) -> Result<(), PipelineError> {
         if self.child.is_some() {
             return Ok(());
         }
 
-        let frame_size = self.output_format.frame_size(width, height)?;
+        let mut args = vec![
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-probesize",
+            "32",
+            "-analyzeduration",
+            "0",
+            "-flags",
+            "low_delay",
+            "-f",
+            self.codec.input_format(),
+            "-i",
+            "pipe:0",
+            "-an",
+            "-sn",
+            "-dn",
+        ];
+        match self.output_format {
+            FfmpegOutputPixelFormat::Nv12 => {
+                args.extend([
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    self.output_format.ffmpeg_name(),
+                    "pipe:1",
+                ]);
+            }
+            FfmpegOutputPixelFormat::I420 => {
+                args.extend([
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-pix_fmt",
+                    self.output_format.ffmpeg_name(),
+                    "pipe:1",
+                ]);
+            }
+        }
+
         let mut child = Command::new(&self.ffmpeg_path)
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-probesize",
-                "32",
-                "-analyzeduration",
-                "0",
-                "-flags",
-                "low_delay",
-                "-f",
-                self.codec.input_format(),
-                "-i",
-                "pipe:0",
-                "-an",
-                "-sn",
-                "-dn",
-                "-f",
-                "rawvideo",
-                "-pix_fmt",
-                self.output_format.ffmpeg_name(),
-                "pipe:1",
-            ])
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -1068,7 +1110,22 @@ impl FfmpegCliDecoder {
             PipelineError::Message("FFmpeg decoder stdin pipe was not created".to_string())
         })?;
         let (tx, rx) = mpsc::channel();
-        thread::spawn(move || read_raw_video_frames(stdout, frame_size, tx));
+        match self.output_format {
+            FfmpegOutputPixelFormat::Nv12 => {
+                let (width, height) = dimensions.ok_or_else(|| {
+                    PipelineError::Message(
+                        "FFmpeg rawvideo decoder requires known dimensions".to_string(),
+                    )
+                })?;
+                let frame_size = self.output_format.frame_size(width, height)?;
+                thread::spawn(move || {
+                    read_ffmpeg_raw_video_frames(stdout, width, height, frame_size, tx)
+                });
+            }
+            FfmpegOutputPixelFormat::I420 => {
+                thread::spawn(move || read_y4m_frames(stdout, tx));
+            }
+        }
 
         self.stdin = Some(stdin);
         self.frame_rx = Some(rx);
@@ -1101,9 +1158,6 @@ impl FfmpegCliDecoder {
     }
 
     fn collect_frames(&mut self, wait_for_first: Option<Duration>) {
-        let Some((width, height)) = self.dimensions else {
-            return;
-        };
         let Some(rx) = self.frame_rx.as_ref() else {
             return;
         };
@@ -1121,10 +1175,28 @@ impl FfmpegCliDecoder {
         for frame in raw_frames {
             let timestamp_us = self.frame_index.saturating_mul(16_667);
             self.frame_index = self.frame_index.saturating_add(1);
+            self.dimensions = Some((frame.width, frame.height));
             match self.output_format {
-                FfmpegOutputPixelFormat::Nv12 => self.decoded_frames.push(
-                    CoreDecodedFrame::from_cpu_nv12(width, height, timestamp_us, width, frame),
-                ),
+                FfmpegOutputPixelFormat::Nv12 => {
+                    self.decoded_frames.push(CoreDecodedFrame::from_cpu_nv12(
+                        frame.width,
+                        frame.height,
+                        timestamp_us,
+                        frame.width,
+                        frame.data,
+                    ))
+                }
+                FfmpegOutputPixelFormat::I420 => {
+                    let uv_pitch = frame.width / 2;
+                    self.decoded_frames.push(CoreDecodedFrame::from_cpu_i420(
+                        frame.width,
+                        frame.height,
+                        timestamp_us,
+                        frame.width,
+                        uv_pitch,
+                        frame.data,
+                    ));
+                }
             }
         }
     }
@@ -1156,7 +1228,11 @@ impl VideoDecoder for FfmpegCliDecoder {
         if self.child.is_none() {
             self.pending_stream.extend_from_slice(access_unit);
             if let Some((width, height)) = self.dimensions {
-                self.start_process(width, height)?;
+                self.start_process(Some((width, height)))?;
+                let pending = std::mem::take(&mut self.pending_stream);
+                self.write_access_unit(&pending)?;
+            } else if self.output_format.can_start_without_dimensions() {
+                self.start_process(None)?;
                 let pending = std::mem::take(&mut self.pending_stream);
                 self.write_access_unit(&pending)?;
             } else if self.pending_stream.len() > 8 * 1024 * 1024 {
@@ -1213,16 +1289,18 @@ fn env_flag_enabled(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn nv12_frame_size(width: usize, height: usize) -> Result<usize, PipelineError> {
+fn yuv420_8bit_frame_size(width: usize, height: usize) -> Result<usize, PipelineError> {
     if width % 2 != 0 || height % 2 != 0 {
         return Err(PipelineError::Message(format!(
-            "NV12 output requires even dimensions, got {width}x{height}"
+            "8-bit 4:2:0 output requires even dimensions, got {width}x{height}"
         )));
     }
     width
         .checked_mul(height)
         .and_then(|luma| luma.checked_add(luma / 2))
-        .ok_or_else(|| PipelineError::Message("decoded NV12 frame size overflow".to_string()))
+        .ok_or_else(|| {
+            PipelineError::Message("decoded 8-bit 4:2:0 frame size overflow".to_string())
+        })
 }
 
 fn read_raw_video_frames(
@@ -1240,6 +1318,92 @@ fn read_raw_video_frames(
             }
             Err(_) => break,
         }
+    }
+}
+
+fn read_ffmpeg_raw_video_frames(
+    mut stdout: std::process::ChildStdout,
+    width: usize,
+    height: usize,
+    frame_size: usize,
+    tx: mpsc::Sender<FfmpegDecodedFrame>,
+) {
+    loop {
+        let mut data = vec![0_u8; frame_size];
+        match stdout.read_exact(&mut data) {
+            Ok(()) => {
+                if tx
+                    .send(FfmpegDecodedFrame {
+                        width,
+                        height,
+                        data,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+fn read_y4m_frames(stdout: std::process::ChildStdout, tx: mpsc::Sender<FfmpegDecodedFrame>) {
+    let mut reader = BufReader::new(stdout);
+    let mut header = String::new();
+    if reader.read_line(&mut header).is_err() {
+        return;
+    }
+    let Some((width, height)) = parse_y4m_dimensions(&header) else {
+        return;
+    };
+    let Ok(frame_size) = yuv420_8bit_frame_size(width, height) else {
+        return;
+    };
+
+    loop {
+        let mut frame_header = String::new();
+        match reader.read_line(&mut frame_header) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        if !frame_header.starts_with("FRAME") {
+            break;
+        }
+
+        let mut data = vec![0_u8; frame_size];
+        if reader.read_exact(&mut data).is_err() {
+            break;
+        }
+        if tx
+            .send(FfmpegDecodedFrame {
+                width,
+                height,
+                data,
+            })
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
+fn parse_y4m_dimensions(header: &str) -> Option<(usize, usize)> {
+    if !header.starts_with("YUV4MPEG2") {
+        return None;
+    }
+    let mut width = None;
+    let mut height = None;
+    for token in header.split_whitespace().skip(1) {
+        if let Some(value) = token.strip_prefix('W') {
+            width = value.parse::<usize>().ok();
+        } else if let Some(value) = token.strip_prefix('H') {
+            height = value.parse::<usize>().ok();
+        }
+    }
+    match (width, height) {
+        (Some(width), Some(height)) if width > 0 && height > 0 => Some((width, height)),
+        _ => None,
     }
 }
 
@@ -1356,10 +1520,11 @@ impl VideoDecoder for VvdecSoftwareDecoder {
             return Ok(());
         }
 
-        let timestamp_us = self.frame_index.saturating_mul(16_667);
         let mut au = vvdec::AccessUnit::new(access_unit);
-        au.cts = Some(timestamp_us);
-        au.is_random_access_point = true;
+        au.cts = Some(self.input_index.saturating_mul(16_667));
+        au.dts = Some(self.input_index.saturating_mul(16_667));
+        self.input_index = self.input_index.saturating_add(1);
+        au.is_random_access_point = vvc_access_unit_contains_random_access_point(access_unit);
         match self.decoder.decode::<&[u8], _>(au) {
             Ok(Some(frame)) => self.push_frame(frame),
             Ok(None) => Ok(()),
@@ -1373,6 +1538,41 @@ impl VideoDecoder for VvdecSoftwareDecoder {
     fn drain_decoded_frames(&mut self) -> Vec<CoreDecodedFrame> {
         std::mem::take(&mut self.decoded_frames)
     }
+}
+
+struct FfmpegDecodedFrame {
+    width: usize,
+    height: usize,
+    data: Vec<u8>,
+}
+
+#[cfg(feature = "software-vvdec")]
+fn vvc_access_unit_contains_random_access_point(access_unit: &[u8]) -> bool {
+    let mut offset = 0usize;
+    while offset + 5 < access_unit.len() {
+        let nal_offset = if access_unit[offset..].starts_with(&[0, 0, 0, 1]) {
+            offset + 4
+        } else if access_unit[offset..].starts_with(&[0, 0, 1]) {
+            offset + 3
+        } else {
+            offset += 1;
+            continue;
+        };
+
+        if vvc_nal_is_random_access_point(&access_unit[nal_offset..]) {
+            return true;
+        }
+        offset = nal_offset + 2;
+    }
+    false
+}
+
+#[cfg(feature = "software-vvdec")]
+fn vvc_nal_is_random_access_point(nal: &[u8]) -> bool {
+    if nal.len() < 2 {
+        return false;
+    }
+    matches!((nal[1] >> 3) & 0x1f, 7 | 8 | 9 | 10)
 }
 
 impl VideoDecoder for H264SoftwareDecoder {

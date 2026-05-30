@@ -95,11 +95,12 @@ describe("buildCapabilitySnapshotFromEnvironment", () => {
   it("classifies optional FFmpeg legacy decoder capabilities as available", () => {
     const snapshot = buildCapabilitySnapshotFromEnvironment({
       ...windowsEnvironment,
-      available_decoders: ["ffmpeg_h264", "ffmpeg_hevc"],
+      available_decoders: ["ffmpeg_h264", "ffmpeg_hevc", "ffmpeg_vvc"],
     });
 
     expect(statusOf(snapshot, "decode.ffmpeg_h264")).toBe("available");
     expect(statusOf(snapshot, "decode.ffmpeg_hevc")).toBe("available");
+    expect(statusOf(snapshot, "decode.ffmpeg_vvc")).toBe("available");
   });
 
   it("classifies Linux legacy capabilities as available on Linux", () => {

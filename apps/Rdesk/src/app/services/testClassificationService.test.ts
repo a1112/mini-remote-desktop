@@ -105,7 +105,7 @@ describe("testClassificationService", () => {
   });
 
   it("classifies FFmpeg decode backends as software acceleration", () => {
-    for (const decoder of ["ffmpeg_h264", "ffmpeg_hevc"] as const) {
+    for (const decoder of ["ffmpeg_h264", "ffmpeg_hevc", "ffmpeg_vvc"] as const) {
       expect(
         deriveTestClassification(
           {

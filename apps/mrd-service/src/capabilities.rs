@@ -751,6 +751,15 @@ fn add_decode_capabilities(
         CapabilityDomain::Decode,
         "decode.ffmpeg_hevc",
         "FFmpeg HEVC",
+        ffmpeg_status.clone(),
+        Some(ffmpeg_reason.as_str()),
+    );
+    push_item(
+        items,
+        platform,
+        CapabilityDomain::Decode,
+        "decode.ffmpeg_vvc",
+        "FFmpeg VVC",
         ffmpeg_status,
         Some(ffmpeg_reason.as_str()),
     );
@@ -1766,6 +1775,10 @@ mod tests {
             .capabilities
             .iter()
             .any(|item| item.id == "decode.ffmpeg_hevc"));
+        assert!(snapshot
+            .capabilities
+            .iter()
+            .any(|item| item.id == "decode.ffmpeg_vvc"));
     }
 
     #[test]

@@ -309,6 +309,7 @@ function decodeAccelFromConfig(
     case "software":
     case "ffmpeg_h264":
     case "ffmpeg_hevc":
+    case "ffmpeg_vvc":
       return "software";
     case undefined:
       return "unknown";

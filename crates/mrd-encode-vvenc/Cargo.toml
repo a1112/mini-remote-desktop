@@ -8,6 +8,9 @@ license.workspace = true
 mrd-pipeline-core = { path = "../mrd-pipeline-core" }
 vvenc-sys = { version = "0.1.0", optional = true }
 
+[dev-dependencies]
+mrd-decode = { path = "../mrd-decode", features = ["production-vvc-software-codec"] }
+
 [features]
 default = []
 production-vvc-software-codec = ["software-vvenc"]

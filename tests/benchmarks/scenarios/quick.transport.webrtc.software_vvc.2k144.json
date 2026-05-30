@@ -4,7 +4,7 @@
   "transport": "webrtc",
   "capture_backend": "dxgi",
   "encode_backend": "software_vvc",
-  "decode_backend": "none",
+  "decode_backend": "ffmpeg_vvc",
   "renderer_backend": "d3d11_shared",
   "width": 2560,
   "height": 1440,
@@ -12,5 +12,5 @@
   "duration_secs": 20,
   "bitrate_bps": 80000000,
   "pace_to_fps": true,
-  "threshold_file": "transport.2k144.json"
+  "threshold_file": "transport.software-vvc.2k144.json"
 }

@@ -100,7 +100,7 @@ export interface TestConfig {
     | "openh264"
     | "software_vvc"
     | "videotoolbox_h264";
-  decoder_type?: "none" | "nvdec" | "software" | "ffmpeg_h264" | "ffmpeg_hevc" | "linux_h264" | "linux_hevc" | "linux_hevc_main10" | "videotoolbox";
+  decoder_type?: "none" | "nvdec" | "software" | "ffmpeg_h264" | "ffmpeg_hevc" | "ffmpeg_vvc" | "linux_h264" | "linux_hevc" | "linux_hevc_main10" | "videotoolbox";
   renderer_type?: "d3d11" | "d3d12" | "opengl" | "macos" | "linux" | "webview";
   render_display?: boolean;
   renderer_target_hwnd?: string;
@@ -1029,7 +1029,7 @@ export type EncoderType =
   | 'openh264'
   | 'software_vvc'
   | 'videotoolbox_h264';
-export type DecoderType = 'none' | 'nvdec' | 'software' | 'linux_h264' | 'linux_hevc' | 'linux_hevc_main10' | 'videotoolbox';
+export type DecoderType = 'none' | 'nvdec' | 'software' | 'ffmpeg_h264' | 'ffmpeg_hevc' | 'ffmpeg_vvc' | 'linux_h264' | 'linux_hevc' | 'linux_hevc_main10' | 'videotoolbox';
 
 export interface TestMatrixConfig {
   capture: CaptureType;

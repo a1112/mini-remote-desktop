@@ -2461,6 +2461,7 @@ fn test_harness_set_custom(
         "nvdec" => DecoderType::Nvdec,
         "software" | "software_h264" | "h264_software" | "software-h264" | "h264-software"
         | "openh264" => DecoderType::Software,
+        "ffmpeg_vvc" | "vvc_ffmpeg" | "ffmpeg_h266" | "h266_ffmpeg" => DecoderType::FfmpegVvc,
         "linux_h264" | "gstreamer_h264" | "vaapi_h264" => DecoderType::LinuxH264,
         "linux_hevc" | "gstreamer_hevc" | "vaapi_hevc" => DecoderType::LinuxHevc,
         "linux_hevc_main10" | "gstreamer_hevc_main10" | "vaapi_hevc_main10" => {

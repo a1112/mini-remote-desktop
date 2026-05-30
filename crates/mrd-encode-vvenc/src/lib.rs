@@ -611,6 +611,8 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "software-vvenc")]
+    use mrd_pipeline_core::VideoDecoder;
 
     #[test]
     #[cfg(not(feature = "software-vvenc"))]
@@ -708,6 +710,44 @@ mod tests {
         assert!(
             total_access_units > 0,
             "VVenC should emit at least one access unit after repeated frames"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "software-vvenc")]
+    fn feature_build_decodes_repeated_vvenc_access_units_with_ffmpeg_vvc() {
+        use mrd_decode::{FfmpegCliDecoder, FfmpegDecodeCodec};
+
+        let width = 176;
+        let height = 144;
+        let mut encoder = VvencSoftwareEncoder::new_with_bitrate(width, height, 144, 2_000_000)
+            .expect("create VVenC encoder");
+        let Ok(mut decoder) = FfmpegCliDecoder::new(FfmpegDecodeCodec::Vvc) else {
+            return;
+        };
+        let mut decoded_frames = 0;
+
+        for frame_index in 0..180_u64 {
+            let phase = (frame_index & 0xff) as u8;
+            let frame = CapturedFrame::from_cpu(
+                width,
+                height,
+                FramePixelFormat::Nv12,
+                frame_index * 6_944,
+                vec![phase; width * height * 3 / 2],
+            );
+
+            for access_unit in encoder.encode(&frame).expect("encode VVC frame") {
+                decoder
+                    .push_access_unit(&access_unit.bytes)
+                    .expect("FFmpeg native VVC should accept VVenC access unit stream");
+                decoded_frames += decoder.drain_decoded_frames().len();
+            }
+        }
+
+        assert!(
+            decoded_frames > 0,
+            "VVdeC should decode at least one VVenC frame"
         );
     }
 }

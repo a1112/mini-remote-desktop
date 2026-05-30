@@ -143,6 +143,14 @@ $scenarioSpecs = @(
     transport = "webrtc"
     encode = "nvenc_av1"
     decode = "nvdec_av1"
+  },
+  [pscustomobject]@{
+    path = "tests/benchmarks/scenarios/quick.transport.webrtc.software_vvc.2k144.json"
+    profile = "transport-webrtc-software-vvc-2k144"
+    transport = "webrtc"
+    encode = "software_vvc"
+    decode = "ffmpeg_vvc"
+    threshold_file = "transport.software-vvc.2k144.json"
   }
 )
 
@@ -156,11 +164,14 @@ foreach ($spec in $scenarioSpecs) {
   if ($scenario.transport -ne $spec.transport) { throw "$($spec.path) should use $($spec.transport)" }
   if ($scenario.encode_backend -ne $spec.encode) { throw "$($spec.path) encode backend mismatch" }
   if ($scenario.decode_backend -ne $spec.decode) { throw "$($spec.path) decode backend mismatch" }
+  if ($spec.PSObject.Properties.Name -contains "threshold_file" -and $scenario.threshold_file -ne $spec.threshold_file) { throw "$($spec.path) threshold file mismatch" }
   if ($scenario.width -ne 2560 -or $scenario.height -ne 1440) { throw "$($spec.path) should be 2560x1440" }
-  if ($spec.path -like "*.2k144.waitable.json") {
+  if ($spec.path -like "*.2k144*.json") {
     if ($scenario.fps -ne 144) { throw "$($spec.path) should target 144fps" }
-    if (-not $scenario.d3d11_waitable_object) { throw "$($spec.path) should enable waitable object" }
-    if ($scenario.render_thread_priority -ne "above_normal") { throw "$($spec.path) should set render thread priority" }
+    if ($spec.path -like "*.2k144.waitable.json") {
+      if (-not $scenario.d3d11_waitable_object) { throw "$($spec.path) should enable waitable object" }
+      if ($scenario.render_thread_priority -ne "above_normal") { throw "$($spec.path) should set render thread priority" }
+    }
   } elseif ($scenario.fps -ne 30) {
     throw "$($spec.path) should target 30fps"
   }

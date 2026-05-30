@@ -161,6 +161,7 @@ const KNOWN_STATUS_BY_ID: Record<string, CapabilityStatus> = {
   "decode.h266_software": "unimplemented",
   "decode.ffmpeg_h264": "available",
   "decode.ffmpeg_hevc": "available",
+  "decode.ffmpeg_vvc": "available",
   "decode.linux_h264": "available",
   "decode.linux_hevc": "available",
   "decode.linux_hevc_main10": "available",

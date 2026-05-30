@@ -666,6 +666,9 @@ impl TestOrchestrator {
                     | "h264-software" | "openh264" => DecoderType::Software,
                     "ffmpeg_h264" | "h264_ffmpeg" => DecoderType::FfmpegH264,
                     "ffmpeg_hevc" | "hevc_ffmpeg" | "h265_ffmpeg" => DecoderType::FfmpegHevc,
+                    "ffmpeg_vvc" | "vvc_ffmpeg" | "ffmpeg_h266" | "h266_ffmpeg" => {
+                        DecoderType::FfmpegVvc
+                    }
                     "linux_h264" | "gstreamer_h264" | "vaapi_h264" => DecoderType::LinuxH264,
                     "linux_hevc" | "gstreamer_hevc" | "vaapi_hevc" => DecoderType::LinuxHevc,
                     "linux_hevc_main10" | "gstreamer_hevc_main10" | "vaapi_hevc_main10" => {
@@ -3892,7 +3895,7 @@ fn derive_test_classification(
         "nvdec" | "linux_h264" | "linux_hevc" | "linux_hevc_main10" | "videotoolbox" => {
             TestAccelerationMode::Hardware
         }
-        "software" | "ffmpeg_h264" | "ffmpeg_hevc" => TestAccelerationMode::Software,
+        "software" | "ffmpeg_h264" | "ffmpeg_hevc" | "ffmpeg_vvc" => TestAccelerationMode::Software,
         _ => TestAccelerationMode::Unknown,
     };
     let render_path = if matches!(transport_path, TestTransportPath::Webrtc)

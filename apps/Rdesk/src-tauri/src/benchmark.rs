@@ -1128,6 +1128,7 @@ mod tests {
             | "vvc_software"
             | "software_h266"
             | "h266_software" => DecoderType::Software,
+            "ffmpeg_vvc" | "vvc_ffmpeg" | "ffmpeg_h266" | "h266_ffmpeg" => DecoderType::FfmpegVvc,
             #[cfg(target_os = "linux")]
             "linux_h264" => DecoderType::LinuxH264,
             #[cfg(target_os = "linux")]
