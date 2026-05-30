@@ -35,6 +35,8 @@ import type {
   CaptureSourceSelection,
   DisplayMode,
   DisplayModeChange,
+  ControlInputAccepted,
+  ControlInputEvent,
   AdaptiveMediaConfig,
   MediaAdaptationSnapshot,
   MediaProfile,
@@ -111,6 +113,7 @@ function environmentFromCapabilitySnapshot(snapshot: CapabilitySnapshot): Enviro
   const decoders: string[] = ['none'];
   const renderers: string[] = ['none'];
   const memoryModes: string[] = [];
+  const controls: string[] = [];
 
   for (const capability of snapshot.capabilities) {
     if (
@@ -129,6 +132,7 @@ function environmentFromCapabilitySnapshot(snapshot: CapabilitySnapshot): Enviro
     if (domain === 'decode') decoders.push(value);
     if (domain === 'render') renderers.push(value === 'd3d12_native' ? 'd3d12' : value);
     if (domain === 'memory') memoryModes.push(value);
+    if (domain === 'control') controls.push(value);
   }
 
   return {
@@ -142,6 +146,7 @@ function environmentFromCapabilitySnapshot(snapshot: CapabilitySnapshot): Enviro
     available_decoders: Array.from(new Set(decoders)),
     available_renderers: Array.from(new Set(renderers)),
     available_memory_modes: Array.from(new Set(memoryModes)),
+    available_controls: Array.from(new Set(controls)),
   };
 }
 
@@ -179,6 +184,7 @@ function browserDevCapabilities(): EnvironmentSnapshot | null {
     available_decoders: ['none', 'software'],
     available_renderers: ['webview'],
     available_memory_modes: ['cpu'],
+    available_controls: [],
   };
 }
 
@@ -649,6 +655,32 @@ export async function ipcConfigureMediaAdaptation(
       config,
     },
     responseField<MediaAdaptationSnapshot>('snapshot')
+  );
+}
+
+/**
+ * Send normalized keyboard/mouse input for a remote control session.
+ */
+export async function ipcSendControlInput(
+  sessionId: string,
+  event: ControlInputEvent
+): Promise<AdapterResult<ControlInputAccepted>> {
+  return invokeBridgeOrTauri<ControlInputAccepted>(
+    'ipc_send_control_input',
+    {
+      sessionId,
+      event,
+    },
+    {
+      type: 'SendControlInput',
+      session_id: sessionId,
+      event,
+    },
+    (response) => ({
+      session_id: response.session_id as string,
+      lane: response.lane as ControlInputAccepted['lane'],
+      event_count: response.event_count as number,
+    })
   );
 }
 

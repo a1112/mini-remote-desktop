@@ -5,9 +5,9 @@ use anyhow::{Context, Result};
 use mrd_application::ports::{SessionLifecycleState, SessionSnapshot};
 use mrd_encode_openh264::OpenH264Encoder;
 use mrd_ipc::{
-    CaptureSource, CaptureSourceSelection, DisplayMode, DisplayModeChange, LanDiscoverySnapshot,
-    LanPeerInfo, MediaProfile, MediaProfileNegotiation, MediaSenderTransportSnapshot,
-    MediaStageMetrics, MediaTestImpairmentSnapshot,
+    CaptureSource, CaptureSourceSelection, ControlInputEvent, ControlInputLane, DisplayMode,
+    DisplayModeChange, LanDiscoverySnapshot, LanPeerInfo, MediaProfile, MediaProfileNegotiation,
+    MediaSenderTransportSnapshot, MediaStageMetrics, MediaTestImpairmentSnapshot,
 };
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use mrd_pipeline_core::FrameCapture;
@@ -106,6 +106,10 @@ const LAN_QUIC_PERSISTENT_MEDIA_TRANSPORT: &str = "quic_stream_media_v3";
 const LAN_MEDIA_PROFILE_CONTROL_TRANSPORT: &str = "media_profile_control_v1";
 const LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT: &str = "capture_source_control_v1";
 const LAN_DISPLAY_MODE_CONTROL_TRANSPORT: &str = "display_mode_control_v1";
+const LAN_INPUT_CONTROL_TRANSPORT: &str = "input_control_v1";
+const LAN_CONTROL_INPUT_ACK_TIMEOUT: Duration = Duration::from_millis(250);
+const LAN_CONTROL_INPUT_REALTIME_ATTEMPTS: usize = 1;
+const LAN_CONTROL_INPUT_RELIABLE_ATTEMPTS: usize = 3;
 const LAN_MEDIA_PROTOCOL_VERSION: u32 = 3;
 const LAN_CAPTURE_DXGI_CAPABILITY: &str = "dxgi_capture";
 const LAN_ENCODE_NVENC_H264_CAPABILITY: &str = "nvenc_h264";
@@ -115,6 +119,7 @@ const LAN_DECODE_NVDEC_HEVC_CAPABILITY: &str = "decode.nvdec_hevc";
 const LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY: &str = "media.hevc_main_420_8bit";
 const LAN_RENDER_D3D11_NATIVE_CAPABILITY: &str = "d3d11_native_render";
 const LAN_RENDER_D3D11_SHARED_NV12_CAPABILITY: &str = "render.d3d11_shared_nv12";
+const LAN_INPUT_CONTROL_CAPABILITY: &str = "control.keyboard_mouse";
 #[cfg(target_os = "macos")]
 const LAN_CAPTURE_MACOS_CAPABILITY: &str = "macos_capture";
 #[cfg(target_os = "macos")]
@@ -131,6 +136,7 @@ static LOCAL_RENDER_REFRESH_HZ: OnceLock<Option<u32>> = OnceLock::new();
 static LAN_RENDER_NO_SURFACE_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(windows)]
 static LAN_RENDER_PRESENT_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
+static LAN_DISCOVERY_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 const LAN_MEDIA_SENDER_ERROR_LOG_INTERVAL: u32 = 3;
 const LAN_MEDIA_RECEIVER_MAX_CONSECUTIVE_DECODE_ERRORS: u32 = 8;
 const LAN_MEDIA_RECEIVER_DECODE_ERROR_LOG_INTERVAL: u32 = 3;
@@ -582,6 +588,29 @@ enum LanDiscoveryPacket {
         message: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         change: Option<DisplayModeChange>,
+        timestamp_ms: u64,
+    },
+    ControlInput {
+        magic: String,
+        #[serde(default = "default_app_id")]
+        app_id: String,
+        instance_id: String,
+        session_id: String,
+        source_device_id: String,
+        event: ControlInputEvent,
+        timestamp_ms: u64,
+    },
+    ControlInputAck {
+        magic: String,
+        #[serde(default = "default_app_id")]
+        app_id: String,
+        instance_id: String,
+        session_id: String,
+        accepted: bool,
+        message: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lane: Option<ControlInputLane>,
+        event_count: u32,
         timestamp_ms: u64,
     },
 }
@@ -1323,6 +1352,91 @@ pub async fn request_lan_media_profile_update(
     }
 }
 
+pub async fn request_lan_control_input(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+    event: ControlInputEvent,
+) -> Result<crate::control_input::ControlInputResult> {
+    let peer_device_id = session_remote_peer(app_state, session_id).await?;
+    let target =
+        peer_control_addr_with_input_control_capability(app_state, &peer_device_id).await?;
+    let source_device_id = local_device_id(app_state).await?;
+
+    let socket = UdpSocket::bind(("0.0.0.0", 0))
+        .await
+        .context("failed to bind LAN control input UDP socket")?;
+    let packet = LanDiscoveryPacket::ControlInput {
+        magic: DISCOVERY_MAGIC.to_string(),
+        app_id: DISCOVERY_APP_ID.to_string(),
+        instance_id: app_state.lan_discovery.instance_id.clone(),
+        session_id: session_id.0.clone(),
+        source_device_id,
+        event: event.clone(),
+        timestamp_ms: now_ms(),
+    };
+
+    let mut buffer = vec![0_u8; DISCOVERY_PACKET_BUFFER_BYTES];
+    let attempts = control_input_request_attempts(&event);
+    for attempt in 0..attempts {
+        send_packet(&socket, &packet, target).await?;
+
+        let received = timeout(LAN_CONTROL_INPUT_ACK_TIMEOUT, socket.recv_from(&mut buffer)).await;
+        let (len, _) = match received {
+            Ok(received) => received?,
+            Err(_) if attempt + 1 < attempts => continue,
+            Err(_) => {
+                anyhow::bail!(
+                    "LAN control input request timed out after {} attempt(s)",
+                    attempts
+                );
+            }
+        };
+
+        let ack: LanDiscoveryPacket = serde_json::from_slice(&buffer[..len])?;
+        match ack {
+            LanDiscoveryPacket::ControlInputAck {
+                magic,
+                app_id,
+                session_id: ack_session_id,
+                accepted,
+                message,
+                lane,
+                event_count,
+                ..
+            } if is_valid_discovery_packet(&magic, &app_id) && ack_session_id == session_id.0 => {
+                if accepted {
+                    return Ok(crate::control_input::ControlInputResult {
+                        lane: lane.context("LAN peer accepted control input without lane")?,
+                        event_count,
+                    });
+                } else {
+                    anyhow::bail!(
+                        "LAN peer rejected control input: {}",
+                        message.unwrap_or_else(|| "unknown reason".to_string())
+                    );
+                }
+            }
+            _ => anyhow::bail!("unexpected LAN control input response"),
+        };
+    }
+
+    anyhow::bail!(
+        "LAN control input request timed out after {} attempt(s)",
+        attempts
+    )
+}
+
+fn control_input_request_attempts(event: &ControlInputEvent) -> usize {
+    match event {
+        ControlInputEvent::MouseMove { .. } | ControlInputEvent::MouseWheel { .. } => {
+            LAN_CONTROL_INPUT_REALTIME_ATTEMPTS
+        }
+        ControlInputEvent::MouseButton { .. }
+        | ControlInputEvent::Key { .. }
+        | ControlInputEvent::ReleaseAll => LAN_CONTROL_INPUT_RELIABLE_ATTEMPTS,
+    }
+}
+
 pub async fn request_lan_capture_sources(
     app_state: &Arc<AppState>,
     session_id: &SessionId,
@@ -1997,6 +2111,52 @@ async fn handle_packet(
             send_packet(socket, &ack, addr).await?;
         }
         LanDiscoveryPacket::DisplayModeRestoreAck { .. } => {}
+        LanDiscoveryPacket::ControlInput {
+            magic,
+            app_id,
+            instance_id,
+            session_id,
+            source_device_id,
+            event,
+            ..
+        } => {
+            if !is_valid_discovery_packet(&magic, &app_id)
+                || instance_id == app_state.lan_discovery.instance_id()
+            {
+                return Ok(());
+            }
+
+            let session_id_value = SessionId(session_id.clone());
+            let input_result = accept_lan_control_input(app_state, &session_id_value, &event).await;
+            let (accepted, message, lane, event_count) = match input_result {
+                Ok(result) => (
+                    true,
+                    Some("injected".to_string()),
+                    Some(result.lane),
+                    result.event_count,
+                ),
+                Err(error) => (false, Some(error.to_string()), None, 0),
+            };
+            tracing::debug!(
+                session_id = %session_id,
+                source_device_id = %source_device_id,
+                accepted,
+                "handled LAN control input"
+            );
+            let ack = LanDiscoveryPacket::ControlInputAck {
+                magic: DISCOVERY_MAGIC.to_string(),
+                app_id: DISCOVERY_APP_ID.to_string(),
+                instance_id: app_state.lan_discovery.instance_id.clone(),
+                session_id,
+                accepted,
+                message,
+                lane,
+                event_count,
+                timestamp_ms: now_ms(),
+            };
+            send_packet(socket, &ack, addr).await?;
+        }
+        LanDiscoveryPacket::ControlInputAck { .. } => {}
     }
 
     Ok(())
@@ -2119,6 +2279,32 @@ async fn accept_lan_remote_session(
         media: Some(local_media),
         media_profile: Some(negotiation),
     }
+}
+
+async fn accept_lan_control_input(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+    event: &ControlInputEvent,
+) -> Result<crate::control_input::ControlInputResult> {
+    {
+        let sessions = app_state.sessions.lock().await;
+        let snapshot = sessions
+            .get(session_id)
+            .with_context(|| format!("session not found: {}", session_id.0))?;
+        if snapshot.lifecycle_state.is_terminal() {
+            anyhow::bail!(
+                "control input rejected for {} session",
+                snapshot.lifecycle_state
+            );
+        }
+    }
+
+    app_state
+        .control_input()
+        .lock()
+        .await
+        .handle_event(event)
+        .map_err(Into::into)
 }
 
 async fn accept_lan_media_profile_update(
@@ -2473,6 +2659,21 @@ async fn build_announcement(app_state: &Arc<AppState>) -> Option<LanAnnouncement
             .map(|(id, name)| (id.0.clone(), name.clone()))
     }?;
 
+    let mut transports = vec![
+        "quic".to_string(),
+        LAN_QUIC_MEDIA_TRANSPORT.to_string(),
+        LAN_QUIC_MEDIA_PROFILE_TRANSPORT.to_string(),
+        LAN_QUIC_MEDIA_V2_TRANSPORT.to_string(),
+        LAN_QUIC_MEDIA_V3_TRANSPORT.to_string(),
+        LAN_QUIC_RELIABLE_MEDIA_TRANSPORT.to_string(),
+        LAN_QUIC_PERSISTENT_MEDIA_TRANSPORT.to_string(),
+        LAN_MEDIA_PROFILE_CONTROL_TRANSPORT.to_string(),
+        LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT.to_string(),
+        LAN_DISPLAY_MODE_CONTROL_TRANSPORT.to_string(),
+    ];
+    #[cfg(windows)]
+    transports.push(LAN_INPUT_CONTROL_TRANSPORT.to_string());
+
     Some(LanAnnouncement {
         magic: DISCOVERY_MAGIC.to_string(),
         app_id: DISCOVERY_APP_ID.to_string(),
@@ -2482,18 +2683,7 @@ async fn build_announcement(app_state: &Arc<AppState>) -> Option<LanAnnouncement
         device_type: "rdesk".to_string(),
         protocol_version: PROTOCOL_VERSION,
         discovery_port: app_state.lan_discovery.discovery_port(),
-        transports: vec![
-            "quic".to_string(),
-            LAN_QUIC_MEDIA_TRANSPORT.to_string(),
-            LAN_QUIC_MEDIA_PROFILE_TRANSPORT.to_string(),
-            LAN_QUIC_MEDIA_V2_TRANSPORT.to_string(),
-            LAN_QUIC_MEDIA_V3_TRANSPORT.to_string(),
-            LAN_QUIC_RELIABLE_MEDIA_TRANSPORT.to_string(),
-            LAN_QUIC_PERSISTENT_MEDIA_TRANSPORT.to_string(),
-            LAN_MEDIA_PROFILE_CONTROL_TRANSPORT.to_string(),
-            LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT.to_string(),
-            LAN_DISPLAY_MODE_CONTROL_TRANSPORT.to_string(),
-        ],
+        transports,
         service_build_id: Some(service_build_id()),
         media_protocol_version: Some(LAN_MEDIA_PROTOCOL_VERSION),
         media_capabilities: lan_media_capabilities(),
@@ -2537,6 +2727,7 @@ fn lan_media_capabilities() -> Vec<String> {
             LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY.to_string(),
             LAN_RENDER_D3D11_NATIVE_CAPABILITY.to_string(),
             LAN_RENDER_D3D11_SHARED_NV12_CAPABILITY.to_string(),
+            LAN_INPUT_CONTROL_CAPABILITY.to_string(),
             crate::display_mode::capability_name().to_string(),
         ]);
     }
@@ -2871,6 +3062,34 @@ async fn peer_control_addr_with_display_mode_capability(
         anyhow::bail!(
             "LAN peer does not advertise required display mode control [{}]: {} supports {}. Rebuild and restart the peer mrd-service/Rdesk from the latest main branch",
             LAN_DISPLAY_MODE_CONTROL_TRANSPORT,
+            peer_device_id.0,
+            format_peer_transports(&peer_transports)
+        );
+    }
+    Ok(target)
+}
+
+async fn peer_control_addr_with_input_control_capability(
+    app_state: &Arc<AppState>,
+    peer_device_id: &DeviceId,
+) -> Result<SocketAddr> {
+    let target = app_state
+        .lan_discovery
+        .peer_control_addr(peer_device_id)
+        .await
+        .with_context(|| format!("LAN peer not found: {}", peer_device_id.0))?;
+    let peer_transports = app_state
+        .lan_discovery
+        .peer_transports(peer_device_id)
+        .await
+        .with_context(|| format!("LAN peer not found: {}", peer_device_id.0))?;
+    if !peer_transports
+        .iter()
+        .any(|transport| transport.eq_ignore_ascii_case(LAN_INPUT_CONTROL_TRANSPORT))
+    {
+        anyhow::bail!(
+            "LAN peer does not advertise required input control [{}]: {} supports {}. Rebuild and restart the peer mrd-service/Rdesk from the latest main branch",
+            LAN_INPUT_CONTROL_TRANSPORT,
             peer_device_id.0,
             format_peer_transports(&peer_transports)
         );
@@ -7494,7 +7713,8 @@ async fn active_window_capture_count(app_state: &Arc<AppState>) -> u32 {
 }
 
 fn new_instance_id() -> String {
-    format!("mrd-{}-{}", std::process::id(), now_ms())
+    let sequence = LAN_DISCOVERY_INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("mrd-{}-{}-{}", std::process::id(), now_ms(), sequence)
 }
 
 fn default_app_id() -> String {
@@ -7773,6 +7993,14 @@ mod tests {
         assert!(decision.delay <= Duration::from_millis(5));
     }
 
+    #[test]
+    fn lan_instance_ids_are_unique_within_same_process_millisecond() {
+        let ids = (0..8).map(|_| new_instance_id()).collect::<Vec<_>>();
+        let unique_ids = ids.iter().collect::<std::collections::HashSet<_>>();
+
+        assert_eq!(unique_ids.len(), ids.len());
+    }
+
     #[tokio::test]
     async fn snapshot_exposes_recent_peer() {
         let state = LanDiscoveryState::default();
@@ -7870,6 +8098,27 @@ mod tests {
             .contains(&LAN_QUIC_MEDIA_V3_TRANSPORT.to_string()));
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn announcement_advertises_keyboard_mouse_input_control() {
+        let app_state = Arc::new(AppState::new());
+        app_state.devices.lock().await.register(
+            DeviceId("local-device".to_string()),
+            "Local Device".to_string(),
+        );
+
+        let announcement = build_announcement(&app_state)
+            .await
+            .expect("registered device announcement");
+
+        assert!(announcement
+            .transports
+            .contains(&LAN_INPUT_CONTROL_TRANSPORT.to_string()));
+        assert!(announcement
+            .media_capabilities
+            .contains(&LAN_INPUT_CONTROL_CAPABILITY.to_string()));
+    }
+
     #[test]
     fn service_build_id_prefers_runtime_override() {
         let build_id = service_build_id_from_lookup(|key| {
@@ -7913,6 +8162,311 @@ mod tests {
             .expect("peer addr");
 
         assert_eq!(addr.to_string(), "192.168.1.50:21117");
+    }
+
+    #[tokio::test]
+    async fn request_lan_control_input_forwards_to_peer_injector() {
+        let controller_state = Arc::new(AppState::new());
+        controller_state.devices.lock().await.register(
+            DeviceId("controller-device".to_string()),
+            "Controller Device".to_string(),
+        );
+        let session_id = SessionId("input-session".to_string());
+        controller_state.sessions.lock().await.insert(
+            session_id.clone(),
+            SessionSnapshot {
+                session_id: session_id.clone(),
+                transport: "quic".to_string(),
+                source_device_id: None,
+                target_device_id: Some(DeviceId("target-device".to_string())),
+                local_listen_addr: None,
+                local_server_name: None,
+                local_cert_der_b64: None,
+                remote_listen_addr: None,
+                remote_server_name: None,
+                remote_cert_der_b64: None,
+                lifecycle_state: SessionLifecycleState::Connected,
+                last_error: None,
+                sender_active: false,
+                receiver_active: true,
+            },
+        );
+
+        let target_state = Arc::new(AppState::new());
+        target_state.devices.lock().await.register(
+            DeviceId("target-device".to_string()),
+            "Target Device".to_string(),
+        );
+        target_state
+            .replace_control_input_for_test(mrd_input::RecordingInputInjector::available())
+            .await;
+        target_state.sessions.lock().await.insert(
+            session_id.clone(),
+            SessionSnapshot {
+                session_id: session_id.clone(),
+                transport: "quic".to_string(),
+                source_device_id: Some(DeviceId("controller-device".to_string())),
+                target_device_id: None,
+                local_listen_addr: None,
+                local_server_name: None,
+                local_cert_der_b64: None,
+                remote_listen_addr: None,
+                remote_server_name: None,
+                remote_cert_der_b64: None,
+                lifecycle_state: SessionLifecycleState::Listening,
+                last_error: None,
+                sender_active: true,
+                receiver_active: false,
+            },
+        );
+
+        let service_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let service_addr = service_socket.local_addr().unwrap();
+        let handler_socket = service_socket.clone();
+        let handler_state = target_state.clone();
+        let handler = tokio::spawn(async move {
+            let mut buffer = vec![0_u8; DISCOVERY_PACKET_BUFFER_BYTES];
+            let (len, addr) = handler_socket.recv_from(&mut buffer).await.unwrap();
+            handle_packet(&handler_socket, &handler_state, &buffer[..len], addr)
+                .await
+                .unwrap();
+        });
+
+        controller_state
+            .lan_discovery
+            .upsert_peer(
+                LanAnnouncement {
+                    magic: DISCOVERY_MAGIC.to_string(),
+                    app_id: DISCOVERY_APP_ID.to_string(),
+                    instance_id: "target-instance".to_string(),
+                    device_id: "target-device".to_string(),
+                    device_name: "Target Device".to_string(),
+                    device_type: "rdesk".to_string(),
+                    protocol_version: PROTOCOL_VERSION,
+                    discovery_port: service_addr.port(),
+                    transports: vec!["quic".to_string(), LAN_INPUT_CONTROL_TRANSPORT.to_string()],
+                    service_build_id: Some(service_build_id()),
+                    media_protocol_version: Some(LAN_MEDIA_PROTOCOL_VERSION),
+                    media_capabilities: vec![LAN_INPUT_CONTROL_CAPABILITY.to_string()],
+                    timestamp_ms: now_ms(),
+                },
+                service_addr,
+            )
+            .await;
+
+        let result = request_lan_control_input(
+            &controller_state,
+            &session_id,
+            mrd_ipc::ControlInputEvent::MouseButton {
+                button: mrd_ipc::ControlInputButton::Left,
+                pressed: true,
+            },
+        )
+        .await
+        .expect("control input ack");
+
+        assert_eq!(result.lane, mrd_ipc::ControlInputLane::Reliable);
+        assert_eq!(result.event_count, 1);
+        handler.await.unwrap();
+
+        let snapshot = target_state
+            .control_input()
+            .lock()
+            .await
+            .snapshot(session_id.clone());
+        assert_eq!(snapshot.reliable.accepted_messages, 1);
+        assert_eq!(snapshot.reliable.injected_messages, 1);
+        assert_eq!(snapshot.realtime.injected_messages, 0);
+    }
+
+    #[tokio::test]
+    async fn reliable_lan_control_input_retries_after_missing_ack() {
+        let controller_state = Arc::new(AppState::new());
+        controller_state.devices.lock().await.register(
+            DeviceId("controller-device".to_string()),
+            "Controller Device".to_string(),
+        );
+        let session_id = SessionId("input-retry-session".to_string());
+        controller_state.sessions.lock().await.insert(
+            session_id.clone(),
+            SessionSnapshot {
+                session_id: session_id.clone(),
+                transport: "quic".to_string(),
+                source_device_id: None,
+                target_device_id: Some(DeviceId("target-device".to_string())),
+                local_listen_addr: None,
+                local_server_name: None,
+                local_cert_der_b64: None,
+                remote_listen_addr: None,
+                remote_server_name: None,
+                remote_cert_der_b64: None,
+                lifecycle_state: SessionLifecycleState::Connected,
+                last_error: None,
+                sender_active: false,
+                receiver_active: true,
+            },
+        );
+
+        let target_state = Arc::new(AppState::new());
+        target_state.devices.lock().await.register(
+            DeviceId("target-device".to_string()),
+            "Target Device".to_string(),
+        );
+        target_state
+            .replace_control_input_for_test(mrd_input::RecordingInputInjector::available())
+            .await;
+        target_state.sessions.lock().await.insert(
+            session_id.clone(),
+            SessionSnapshot {
+                session_id: session_id.clone(),
+                transport: "quic".to_string(),
+                source_device_id: Some(DeviceId("controller-device".to_string())),
+                target_device_id: None,
+                local_listen_addr: None,
+                local_server_name: None,
+                local_cert_der_b64: None,
+                remote_listen_addr: None,
+                remote_server_name: None,
+                remote_cert_der_b64: None,
+                lifecycle_state: SessionLifecycleState::Listening,
+                last_error: None,
+                sender_active: true,
+                receiver_active: false,
+            },
+        );
+
+        let service_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let service_addr = service_socket.local_addr().unwrap();
+        let handler_socket = service_socket.clone();
+        let handler_state = target_state.clone();
+        let attempts = Arc::new(AtomicU64::new(0));
+        let handler_attempts = attempts.clone();
+        let handler = tokio::spawn(async move {
+            let mut buffer = vec![0_u8; DISCOVERY_PACKET_BUFFER_BYTES];
+            let (_len, _addr) = handler_socket.recv_from(&mut buffer).await.unwrap();
+            handler_attempts.fetch_add(1, Ordering::SeqCst);
+
+            let (len, addr) = handler_socket.recv_from(&mut buffer).await.unwrap();
+            handler_attempts.fetch_add(1, Ordering::SeqCst);
+            handle_packet(&handler_socket, &handler_state, &buffer[..len], addr)
+                .await
+                .unwrap();
+        });
+
+        controller_state
+            .lan_discovery
+            .upsert_peer(
+                LanAnnouncement {
+                    magic: DISCOVERY_MAGIC.to_string(),
+                    app_id: DISCOVERY_APP_ID.to_string(),
+                    instance_id: "target-instance".to_string(),
+                    device_id: "target-device".to_string(),
+                    device_name: "Target Device".to_string(),
+                    device_type: "rdesk".to_string(),
+                    protocol_version: PROTOCOL_VERSION,
+                    discovery_port: service_addr.port(),
+                    transports: vec!["quic".to_string(), LAN_INPUT_CONTROL_TRANSPORT.to_string()],
+                    service_build_id: Some(service_build_id()),
+                    media_protocol_version: Some(LAN_MEDIA_PROTOCOL_VERSION),
+                    media_capabilities: vec![LAN_INPUT_CONTROL_CAPABILITY.to_string()],
+                    timestamp_ms: now_ms(),
+                },
+                service_addr,
+            )
+            .await;
+
+        let result = request_lan_control_input(
+            &controller_state,
+            &session_id,
+            mrd_ipc::ControlInputEvent::MouseButton {
+                button: mrd_ipc::ControlInputButton::Left,
+                pressed: true,
+            },
+        )
+        .await;
+
+        if result.is_err() {
+            handler.abort();
+        }
+        let result = result.expect("reliable control input should retry after a missing ack");
+        handler.await.unwrap();
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(result.lane, mrd_ipc::ControlInputLane::Reliable);
+        assert_eq!(result.event_count, 1);
+    }
+
+    #[tokio::test]
+    async fn realtime_lan_control_input_does_not_retry_without_ack() {
+        let controller_state = Arc::new(AppState::new());
+        controller_state.devices.lock().await.register(
+            DeviceId("controller-device".to_string()),
+            "Controller Device".to_string(),
+        );
+        let session_id = SessionId("input-realtime-session".to_string());
+        controller_state.sessions.lock().await.insert(
+            session_id.clone(),
+            SessionSnapshot {
+                session_id: session_id.clone(),
+                transport: "quic".to_string(),
+                source_device_id: None,
+                target_device_id: Some(DeviceId("target-device".to_string())),
+                local_listen_addr: None,
+                local_server_name: None,
+                local_cert_der_b64: None,
+                remote_listen_addr: None,
+                remote_server_name: None,
+                remote_cert_der_b64: None,
+                lifecycle_state: SessionLifecycleState::Connected,
+                last_error: None,
+                sender_active: false,
+                receiver_active: true,
+            },
+        );
+
+        let service_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let service_addr = service_socket.local_addr().unwrap();
+        let handler_socket = service_socket.clone();
+        let attempts = Arc::new(AtomicU64::new(0));
+        let handler_attempts = attempts.clone();
+        let handler = tokio::spawn(async move {
+            let mut buffer = vec![0_u8; DISCOVERY_PACKET_BUFFER_BYTES];
+            let (_len, _addr) = handler_socket.recv_from(&mut buffer).await.unwrap();
+            handler_attempts.fetch_add(1, Ordering::SeqCst);
+        });
+
+        controller_state
+            .lan_discovery
+            .upsert_peer(
+                LanAnnouncement {
+                    magic: DISCOVERY_MAGIC.to_string(),
+                    app_id: DISCOVERY_APP_ID.to_string(),
+                    instance_id: "target-instance".to_string(),
+                    device_id: "target-device".to_string(),
+                    device_name: "Target Device".to_string(),
+                    device_type: "rdesk".to_string(),
+                    protocol_version: PROTOCOL_VERSION,
+                    discovery_port: service_addr.port(),
+                    transports: vec!["quic".to_string(), LAN_INPUT_CONTROL_TRANSPORT.to_string()],
+                    service_build_id: Some(service_build_id()),
+                    media_protocol_version: Some(LAN_MEDIA_PROTOCOL_VERSION),
+                    media_capabilities: vec![LAN_INPUT_CONTROL_CAPABILITY.to_string()],
+                    timestamp_ms: now_ms(),
+                },
+                service_addr,
+            )
+            .await;
+
+        let result = request_lan_control_input(
+            &controller_state,
+            &session_id,
+            mrd_ipc::ControlInputEvent::MouseMove { x: 10, y: 20 },
+        )
+        .await;
+
+        handler.await.unwrap();
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

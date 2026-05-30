@@ -1,4 +1,14 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type FocusEvent as ReactFocusEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+  type WheelEvent as ReactWheelEvent,
+} from "react";
 import { useParams, useSearchParams } from "react-router";
 import {
   Activity,
@@ -27,6 +37,7 @@ import {
   currentRemoteDisplayWindowContext,
   getSystemResourceSnapshot,
   ipcMediaPipelineSnapshot,
+  ipcSendControlInput,
   presentRemotePreviewFrameOnNativeSurface,
   presentTestHarnessFrameOnNativeSurface,
   testGetCapabilities,
@@ -36,6 +47,8 @@ import {
   testStartRun,
   testStopRun,
   type CaptureType,
+  type ControlInputButton,
+  type ControlInputEvent,
   type DecoderType,
   type EncoderType,
   type EnvironmentSnapshot,
@@ -1390,6 +1403,104 @@ function bitrateFromSearch(searchParams: URLSearchParams): BitrateKey | null {
   );
 }
 
+function resolutionDimensions(resolution: ResolutionKey): { width: number; height: number } {
+  const [width, height] = resolution.split("x").map(Number) as [number, number];
+  return { width, height };
+}
+
+function keyboardMouseControlAvailable(
+  capabilities: EnvironmentSnapshot | null,
+  sessionSnapshot: SessionRuntimeSnapshot | null,
+  isLocalPipelinePreview: boolean
+): boolean {
+  if (isLocalPipelinePreview) return false;
+  if (sessionSnapshot?.role && sessionSnapshot.role !== "controller") return false;
+  return capabilities?.available_controls?.includes("keyboard_mouse") ?? false;
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function mapClientPointToRemoteFrame(
+  clientX: number,
+  clientY: number,
+  rect: DOMRect,
+  frameSize: { width: number; height: number }
+): { x: number; y: number } {
+  const relativeX = rect.width > 0 ? (clientX - rect.left) / rect.width : 0;
+  const relativeY = rect.height > 0 ? (clientY - rect.top) / rect.height : 0;
+  return {
+    x: clamp(Math.round(relativeX * frameSize.width), 0, frameSize.width - 1),
+    y: clamp(Math.round(relativeY * frameSize.height), 0, frameSize.height - 1),
+  };
+}
+
+function mapPointerButton(button: number): ControlInputButton | null {
+  if (button === 0) return "left";
+  if (button === 1) return "middle";
+  if (button === 2) return "right";
+  if (button === 3) return "x1";
+  if (button === 4) return "x2";
+  return null;
+}
+
+function virtualKeyFromKeyboardEvent(
+  event: Pick<KeyboardEvent, "key" | "code">
+): number | null {
+  if (/^Key[A-Z]$/.test(event.code)) return event.code.charCodeAt(3);
+  if (/^Digit[0-9]$/.test(event.code)) return event.code.charCodeAt(5);
+  if (/^Numpad[0-9]$/.test(event.code)) return 0x60 + Number(event.code.slice(6));
+
+  switch (event.key) {
+    case "Backspace":
+      return 0x08;
+    case "Tab":
+      return 0x09;
+    case "Enter":
+      return 0x0d;
+    case "Shift":
+      return 0x10;
+    case "Control":
+      return 0x11;
+    case "Alt":
+      return 0x12;
+    case "Pause":
+      return 0x13;
+    case "CapsLock":
+      return 0x14;
+    case "Escape":
+      return 0x1b;
+    case " ":
+    case "Spacebar":
+      return 0x20;
+    case "PageUp":
+      return 0x21;
+    case "PageDown":
+      return 0x22;
+    case "End":
+      return 0x23;
+    case "Home":
+      return 0x24;
+    case "ArrowLeft":
+      return 0x25;
+    case "ArrowUp":
+      return 0x26;
+    case "ArrowRight":
+      return 0x27;
+    case "ArrowDown":
+      return 0x28;
+    case "Insert":
+      return 0x2d;
+    case "Delete":
+      return 0x2e;
+    case "Meta":
+      return 0x5b;
+    default:
+      return null;
+  }
+}
+
 type LocalWebViewProfile = {
   capture: CaptureType;
   encoder: EncoderType;
@@ -2383,6 +2494,38 @@ export function RemoteDisplayWindowPage() {
       : probeSnapshot?.media_probe_width && probeSnapshot?.media_probe_height
         ? `${probeSnapshot.media_probe_width} / ${probeSnapshot.media_probe_height}`
         : undefined;
+  const remoteInputFrameSize = useMemo(() => {
+    const fallback = resolutionDimensions(resolution);
+    return {
+      width:
+        mediaPipelineSnapshot?.active_width ??
+        probeSnapshot?.latest_frame_width ??
+        probeSnapshot?.media_probe_width ??
+        mediaProfileNegotiation?.selected.width ??
+        fallback.width,
+      height:
+        mediaPipelineSnapshot?.active_height ??
+        probeSnapshot?.latest_frame_height ??
+        probeSnapshot?.media_probe_height ??
+        mediaProfileNegotiation?.selected.height ??
+        fallback.height,
+    };
+  }, [
+    mediaPipelineSnapshot?.active_height,
+    mediaPipelineSnapshot?.active_width,
+    mediaProfileNegotiation?.selected.height,
+    mediaProfileNegotiation?.selected.width,
+    probeSnapshot?.latest_frame_height,
+    probeSnapshot?.latest_frame_width,
+    probeSnapshot?.media_probe_height,
+    probeSnapshot?.media_probe_width,
+    resolution,
+  ]);
+  const controlInputEnabled = keyboardMouseControlAvailable(
+    capabilities,
+    sessionSnapshot,
+    isLocalPipelinePreview
+  );
   const hasRemoteFrames = remoteFramesReceived > 0 || remoteFramesDecoded > 0;
   const remoteProbeTarget =
     probeSnapshot?.media_probe_width &&
@@ -2763,6 +2906,129 @@ export function RemoteDisplayWindowPage() {
       document.removeEventListener("keydown", closeOnEscape);
     };
   }, [diagnosticsVisible]);
+
+  const sendControlInputEvent = useCallback(
+    (event: ControlInputEvent) => {
+      if (!controlInputEnabled) return;
+      void ipcSendControlInput(sessionId, event).then((result) => {
+        if (!result.ok) setLastError(result.error.message);
+      });
+    },
+    [controlInputEnabled, sessionId]
+  );
+
+  const controlPointFromPointerEvent = useCallback(
+    (event: ReactPointerEvent<HTMLDivElement>) => {
+      const rect = event.currentTarget.getBoundingClientRect();
+      return mapClientPointToRemoteFrame(
+        event.clientX,
+        event.clientY,
+        rect,
+        remoteInputFrameSize
+      );
+    },
+    [remoteInputFrameSize]
+  );
+
+  const handleRemotePointerMove = useCallback(
+    (event: ReactPointerEvent<HTMLDivElement>) => {
+      if (!controlInputEnabled) return;
+      event.preventDefault();
+      sendControlInputEvent({
+        kind: "mouse_move",
+        ...controlPointFromPointerEvent(event),
+      });
+    },
+    [controlInputEnabled, controlPointFromPointerEvent, sendControlInputEvent]
+  );
+
+  const handleRemotePointerDown = useCallback(
+    (event: ReactPointerEvent<HTMLDivElement>) => {
+      if (!controlInputEnabled) return;
+      const button = mapPointerButton(event.button);
+      if (!button) return;
+      event.preventDefault();
+      event.currentTarget.focus();
+      event.currentTarget.setPointerCapture?.(event.pointerId);
+      sendControlInputEvent({
+        kind: "mouse_button",
+        button,
+        pressed: true,
+      });
+    },
+    [controlInputEnabled, sendControlInputEvent]
+  );
+
+  const handleRemotePointerUp = useCallback(
+    (event: ReactPointerEvent<HTMLDivElement>) => {
+      if (!controlInputEnabled) return;
+      const button = mapPointerButton(event.button);
+      if (!button) return;
+      event.preventDefault();
+      event.currentTarget.releasePointerCapture?.(event.pointerId);
+      sendControlInputEvent({
+        kind: "mouse_button",
+        button,
+        pressed: false,
+      });
+    },
+    [controlInputEnabled, sendControlInputEvent]
+  );
+
+  const handleRemoteWheel = useCallback(
+    (event: ReactWheelEvent<HTMLDivElement>) => {
+      if (!controlInputEnabled) return;
+      const delta = Math.trunc(-event.deltaY);
+      if (delta === 0) return;
+      event.preventDefault();
+      sendControlInputEvent({ kind: "mouse_wheel", delta });
+    },
+    [controlInputEnabled, sendControlInputEvent]
+  );
+
+  const handleRemoteKeyDown = useCallback(
+    (event: ReactKeyboardEvent<HTMLDivElement>) => {
+      if (!controlInputEnabled || event.repeat) return;
+      const code = virtualKeyFromKeyboardEvent(event);
+      if (code === null) return;
+      event.preventDefault();
+      sendControlInputEvent({
+        kind: "key",
+        key: { kind: "virtual_key", code },
+        pressed: true,
+      });
+    },
+    [controlInputEnabled, sendControlInputEvent]
+  );
+
+  const handleRemoteKeyUp = useCallback(
+    (event: ReactKeyboardEvent<HTMLDivElement>) => {
+      if (!controlInputEnabled) return;
+      const code = virtualKeyFromKeyboardEvent(event);
+      if (code === null) return;
+      event.preventDefault();
+      sendControlInputEvent({
+        kind: "key",
+        key: { kind: "virtual_key", code },
+        pressed: false,
+      });
+    },
+    [controlInputEnabled, sendControlInputEvent]
+  );
+
+  const handleRemoteBlur = useCallback(
+    (_event: ReactFocusEvent<HTMLDivElement>) => {
+      sendControlInputEvent({ kind: "release_all" });
+    },
+    [sendControlInputEvent]
+  );
+
+  useEffect(() => {
+    if (!controlInputEnabled) return;
+    return () => {
+      void ipcSendControlInput(sessionId, { kind: "release_all" });
+    };
+  }, [controlInputEnabled, sessionId]);
 
   const title = useMemo(() => {
     if (context?.label) return context.label;
@@ -6301,8 +6567,18 @@ export function RemoteDisplayWindowPage() {
 
       <div
         ref={renderAreaRef}
+        data-testid="remote-render-area"
         data-native-render-area="true"
+        tabIndex={controlInputEnabled ? 0 : -1}
+        onPointerMove={handleRemotePointerMove}
+        onPointerDown={handleRemotePointerDown}
+        onPointerUp={handleRemotePointerUp}
+        onWheel={handleRemoteWheel}
+        onKeyDown={handleRemoteKeyDown}
+        onKeyUp={handleRemoteKeyUp}
+        onBlur={handleRemoteBlur}
         className="relative min-h-0 flex-1 overflow-hidden bg-black"
+        style={{ touchAction: "none" }}
       >
         <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,#172033_0,#05070a_58%,#000_100%)]" />
         {webPreviewUsesVideo && (

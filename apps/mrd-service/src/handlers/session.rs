@@ -4,7 +4,7 @@
 
 use crate::app_state::AppState;
 use mrd_application::ports::{SessionLifecycleState, SessionSnapshot};
-use mrd_ipc::{DisplayMode, IpcResponse, MediaProfile};
+use mrd_ipc::{ControlInputEvent, DisplayMode, IpcResponse, MediaProfile};
 use mrd_proto::{DeviceId, SessionId};
 use std::sync::Arc;
 
@@ -191,6 +191,44 @@ pub async fn configure_media_adaptation(
     }
 }
 
+/// Handle a control input request.
+pub async fn send_control_input(
+    app_state: &Arc<AppState>,
+    session_id: SessionId,
+    event: ControlInputEvent,
+) -> IpcResponse {
+    let route_to_peer = {
+        let sessions = app_state.sessions.lock().await;
+        sessions
+            .get(&session_id)
+            .and_then(|snapshot| snapshot.target_device_id.as_ref())
+            .is_some()
+    };
+
+    let result = if route_to_peer {
+        crate::lan_discovery::request_lan_control_input(app_state, &session_id, event).await
+    } else {
+        app_state
+            .control_input()
+            .lock()
+            .await
+            .handle_event(&event)
+            .map_err(Into::into)
+    };
+
+    match result {
+        Ok(result) => IpcResponse::ControlInputAccepted {
+            session_id,
+            lane: result.lane,
+            event_count: result.event_count,
+        },
+        Err(error) => IpcResponse::Error {
+            code: "E_CONTROL_INPUT".to_string(),
+            message: error.to_string(),
+        },
+    }
+}
+
 /// Handle a remote capture source listing request.
 pub async fn list_remote_capture_sources(
     app_state: &Arc<AppState>,
@@ -359,6 +397,18 @@ pub async fn stop_session(app_state: &Arc<AppState>, session_id: SessionId) -> I
             },
         );
         drop(sessions);
+        if let Err(error) = app_state
+            .control_input()
+            .lock()
+            .await
+            .handle_event(&ControlInputEvent::ReleaseAll)
+        {
+            tracing::warn!(
+                session_id = %session_id.0,
+                %error,
+                "failed to release active control input while stopping session"
+            );
+        }
         app_state
             .media_tasks
             .lock()
@@ -634,6 +684,54 @@ mod tests {
         assert_eq!(stored.lifecycle_state, SessionLifecycleState::Closed);
         assert!(!stored.sender_active);
         assert!(!stored.receiver_active);
+    }
+
+    #[tokio::test]
+    async fn stop_session_releases_active_control_input() {
+        let app_state = Arc::new(AppState::new());
+        app_state
+            .replace_control_input_for_test(mrd_input::RecordingInputInjector::available())
+            .await;
+        let session_id = SessionId("control-stop-session".to_string());
+        {
+            let mut sessions = app_state.sessions.lock().await;
+            sessions.insert(
+                session_id.clone(),
+                SessionSnapshot {
+                    session_id: session_id.clone(),
+                    transport: "quic".to_string(),
+                    source_device_id: Some(DeviceId("controller-device".to_string())),
+                    target_device_id: None,
+                    local_listen_addr: None,
+                    local_server_name: None,
+                    local_cert_der_b64: None,
+                    remote_listen_addr: None,
+                    remote_server_name: None,
+                    remote_cert_der_b64: None,
+                    lifecycle_state: SessionLifecycleState::Listening,
+                    last_error: None,
+                    sender_active: true,
+                    receiver_active: false,
+                },
+            );
+        }
+
+        app_state
+            .control_input()
+            .lock()
+            .await
+            .handle_event(&mrd_ipc::ControlInputEvent::Key {
+                key: mrd_ipc::ControlInputKey::VirtualKey { code: 0x41 },
+                pressed: true,
+            })
+            .expect("key down");
+
+        let response = stop_session(&app_state, session_id.clone()).await;
+        assert!(matches!(response, IpcResponse::SessionStopped { .. }));
+
+        let snapshot = app_state.control_input().lock().await.snapshot(session_id);
+        assert_eq!(snapshot.reliable.accepted_messages, 2);
+        assert_eq!(snapshot.reliable.injected_messages, 2);
     }
 
     #[tokio::test]

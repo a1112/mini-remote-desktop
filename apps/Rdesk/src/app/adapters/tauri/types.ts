@@ -216,6 +216,46 @@ export interface EnvironmentSnapshot {
   available_decoders: string[];
   available_renderers?: string[];
   available_memory_modes?: string[];
+  available_controls?: string[];
+}
+
+export type ControlInputButton = "left" | "right" | "middle" | "x1" | "x2";
+
+export type ControlInputKey = {
+  kind: "virtual_key";
+  code: number;
+};
+
+export type ControlInputEvent =
+  | {
+      kind: "mouse_move";
+      x: number;
+      y: number;
+    }
+  | {
+      kind: "mouse_button";
+      button: ControlInputButton;
+      pressed: boolean;
+    }
+  | {
+      kind: "mouse_wheel";
+      delta: number;
+    }
+  | {
+      kind: "key";
+      key: ControlInputKey;
+      pressed: boolean;
+    }
+  | {
+      kind: "release_all";
+    };
+
+export type ControlInputLane = "reliable" | "realtime" | "cleanup";
+
+export interface ControlInputAccepted {
+  session_id: string;
+  lane: ControlInputLane;
+  event_count: number;
 }
 
 export interface WindowCaptureTarget {

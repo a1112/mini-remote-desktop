@@ -160,6 +160,20 @@ impl RemoteDisplaySurfaceManager {
     }
 
     #[cfg(windows)]
+    pub fn set_control_session_id(
+        &mut self,
+        label: &str,
+        session_id: Option<String>,
+    ) -> Result<(), String> {
+        let surface = self
+            .surfaces
+            .get_mut(label)
+            .ok_or_else(|| format!("native render surface not found: {label}"))?;
+        surface.set_control_session_id(session_id);
+        Ok(())
+    }
+
+    #[cfg(windows)]
     pub fn detach(&mut self, label: &str, _window: Option<&WebviewWindow>) -> Result<bool, String> {
         Ok(self.surfaces.remove(label).is_some())
     }
@@ -237,6 +251,135 @@ fn handle_hex(handle: isize) -> String {
 }
 
 #[cfg(windows)]
+#[derive(Debug, Clone)]
+pub struct NativeSurfaceControlInput {
+    pub session_id: String,
+    pub event: mrd_ipc::ControlInputEvent,
+}
+
+#[cfg(windows)]
+static NATIVE_SURFACE_INPUT_FORWARDER: std::sync::OnceLock<
+    std::sync::mpsc::Sender<NativeSurfaceControlInput>,
+> = std::sync::OnceLock::new();
+
+#[cfg(windows)]
+pub fn install_control_input_forwarder(
+    sender: std::sync::mpsc::Sender<NativeSurfaceControlInput>,
+) -> bool {
+    NATIVE_SURFACE_INPUT_FORWARDER.set(sender).is_ok()
+}
+
+#[cfg(windows)]
+struct WindowsSurfaceInputContext {
+    session_id: Option<String>,
+}
+
+#[cfg(windows)]
+fn windows_mouse_coordinates_from_lparam(lparam: isize) -> (i32, i32) {
+    let raw = lparam as u32;
+    let x = i16::from_ne_bytes((raw as u16).to_ne_bytes()) as i32;
+    let y = i16::from_ne_bytes(((raw >> 16) as u16).to_ne_bytes()) as i32;
+    (x, y)
+}
+
+#[cfg(windows)]
+fn windows_signed_high_word(value: usize) -> i32 {
+    i16::from_ne_bytes(((value >> 16) as u16).to_ne_bytes()) as i32
+}
+
+#[cfg(windows)]
+fn windows_surface_input_event_from_message(
+    message: u32,
+    wparam: usize,
+    lparam: isize,
+) -> Option<mrd_ipc::ControlInputEvent> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        WM_CANCELMODE, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
+        WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP,
+        WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
+    };
+
+    match message {
+        WM_MOUSEMOVE => {
+            let (x, y) = windows_mouse_coordinates_from_lparam(lparam);
+            Some(mrd_ipc::ControlInputEvent::MouseMove { x, y })
+        }
+        WM_MOUSEWHEEL => Some(mrd_ipc::ControlInputEvent::MouseWheel {
+            delta: windows_signed_high_word(wparam),
+        }),
+        WM_LBUTTONDOWN => Some(mouse_button_event(mrd_ipc::ControlInputButton::Left, true)),
+        WM_LBUTTONUP => Some(mouse_button_event(mrd_ipc::ControlInputButton::Left, false)),
+        WM_RBUTTONDOWN => Some(mouse_button_event(mrd_ipc::ControlInputButton::Right, true)),
+        WM_RBUTTONUP => Some(mouse_button_event(
+            mrd_ipc::ControlInputButton::Right,
+            false,
+        )),
+        WM_MBUTTONDOWN => Some(mouse_button_event(
+            mrd_ipc::ControlInputButton::Middle,
+            true,
+        )),
+        WM_MBUTTONUP => Some(mouse_button_event(
+            mrd_ipc::ControlInputButton::Middle,
+            false,
+        )),
+        WM_XBUTTONDOWN | WM_XBUTTONUP => {
+            let button = match (wparam >> 16) & 0xffff {
+                1 => mrd_ipc::ControlInputButton::X1,
+                2 => mrd_ipc::ControlInputButton::X2,
+                _ => return None,
+            };
+            Some(mouse_button_event(button, message == WM_XBUTTONDOWN))
+        }
+        WM_KEYDOWN | WM_SYSKEYDOWN => key_event(wparam, true),
+        WM_KEYUP | WM_SYSKEYUP => key_event(wparam, false),
+        WM_KILLFOCUS | WM_CANCELMODE => Some(mrd_ipc::ControlInputEvent::ReleaseAll),
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+fn mouse_button_event(
+    button: mrd_ipc::ControlInputButton,
+    pressed: bool,
+) -> mrd_ipc::ControlInputEvent {
+    mrd_ipc::ControlInputEvent::MouseButton { button, pressed }
+}
+
+#[cfg(windows)]
+fn key_event(wparam: usize, pressed: bool) -> Option<mrd_ipc::ControlInputEvent> {
+    let code = u16::try_from(wparam).ok()?;
+    Some(mrd_ipc::ControlInputEvent::Key {
+        key: mrd_ipc::ControlInputKey::VirtualKey { code },
+        pressed,
+    })
+}
+
+#[cfg(windows)]
+unsafe fn windows_surface_input_context_mut(
+    hwnd: windows::Win32::Foundation::HWND,
+) -> Option<&'static mut WindowsSurfaceInputContext> {
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, GWLP_USERDATA};
+    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowsSurfaceInputContext;
+    ptr.as_mut()
+}
+
+#[cfg(windows)]
+fn forward_windows_surface_input(
+    hwnd: windows::Win32::Foundation::HWND,
+    event: mrd_ipc::ControlInputEvent,
+) {
+    let Some(session_id) = (unsafe {
+        windows_surface_input_context_mut(hwnd).and_then(|context| context.session_id.clone())
+    }) else {
+        return;
+    };
+    let Some(sender) = NATIVE_SURFACE_INPUT_FORWARDER.get() else {
+        return;
+    };
+    let _ = sender.send(NativeSurfaceControlInput { session_id, event });
+}
+
+#[cfg(windows)]
 struct NativeRenderSurface {
     parent_hwnd: isize,
     hwnd: windows::Win32::Foundation::HWND,
@@ -252,9 +395,10 @@ impl NativeRenderSurface {
         use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
         use windows::Win32::System::LibraryLoader::GetModuleHandleW;
         use windows::Win32::UI::WindowsAndMessaging::{
-            CreateWindowExW, DefWindowProcW, LoadCursorW, RegisterClassW, SetWindowPos, CS_HREDRAW,
-            CS_VREDRAW, HMENU, IDC_ARROW, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_SHOWWINDOW,
-            WINDOW_EX_STYLE, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
+            CreateWindowExW, DefWindowProcW, LoadCursorW, RegisterClassW, SetWindowLongPtrW,
+            SetWindowPos, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HMENU, IDC_ARROW, SWP_HIDEWINDOW,
+            SWP_NOACTIVATE, SWP_SHOWWINDOW, WINDOW_EX_STYLE, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN,
+            WS_CLIPSIBLINGS, WS_VISIBLE,
         };
 
         unsafe extern "system" fn wnd_proc(
@@ -263,6 +407,12 @@ impl NativeRenderSurface {
             wparam: WPARAM,
             lparam: LPARAM,
         ) -> LRESULT {
+            if let Some(event) =
+                windows_surface_input_event_from_message(message, wparam.0, lparam.0)
+            {
+                forward_windows_surface_input(hwnd, event);
+                return LRESULT(0);
+            }
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
 
@@ -317,6 +467,11 @@ impl NativeRenderSurface {
         };
         if hwnd.0 == 0 {
             return Err("create native render surface failed".to_string());
+        }
+
+        let context = Box::new(WindowsSurfaceInputContext { session_id: None });
+        unsafe {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(context) as isize);
         }
 
         unsafe {
@@ -386,12 +541,26 @@ impl NativeRenderSurface {
     fn render_target_handle(&self) -> isize {
         self.hwnd.0
     }
+
+    fn set_control_session_id(&mut self, session_id: Option<String>) {
+        unsafe {
+            if let Some(context) = windows_surface_input_context_mut(self.hwnd) {
+                context.session_id = session_id;
+            }
+        }
+    }
 }
 
 #[cfg(windows)]
 impl Drop for NativeRenderSurface {
     fn drop(&mut self) {
         unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::{SetWindowLongPtrW, GWLP_USERDATA};
+            let ptr =
+                SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0) as *mut WindowsSurfaceInputContext;
+            if !ptr.is_null() {
+                drop(Box::from_raw(ptr));
+            }
             let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(self.hwnd);
         }
     }
@@ -561,6 +730,76 @@ fn init_x11_threads() {
     INIT.call_once(|| unsafe {
         let _ = x11::xlib::XInitThreads();
     });
+}
+
+#[cfg(all(test, windows))]
+mod remote_display_surface_input_tests {
+    use super::*;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+        WM_MOUSEWHEEL,
+    };
+
+    fn lparam(x: i16, y: i16) -> isize {
+        ((u16::from_ne_bytes(y.to_ne_bytes()) as u32) << 16
+            | u16::from_ne_bytes(x.to_ne_bytes()) as u32) as isize
+    }
+
+    #[test]
+    fn remote_display_surface_input_maps_signed_mouse_coordinates() {
+        assert_eq!(
+            windows_mouse_coordinates_from_lparam(lparam(-2, 300)),
+            (-2, 300)
+        );
+        assert_eq!(
+            windows_surface_input_event_from_message(WM_MOUSEMOVE, 0, lparam(640, 360)),
+            Some(mrd_ipc::ControlInputEvent::MouseMove { x: 640, y: 360 })
+        );
+    }
+
+    #[test]
+    fn remote_display_surface_input_maps_button_and_wheel_messages() {
+        assert_eq!(
+            windows_surface_input_event_from_message(WM_LBUTTONDOWN, 0, lparam(0, 0)),
+            Some(mrd_ipc::ControlInputEvent::MouseButton {
+                button: mrd_ipc::ControlInputButton::Left,
+                pressed: true,
+            })
+        );
+        assert_eq!(
+            windows_surface_input_event_from_message(WM_LBUTTONUP, 0, lparam(0, 0)),
+            Some(mrd_ipc::ControlInputEvent::MouseButton {
+                button: mrd_ipc::ControlInputButton::Left,
+                pressed: false,
+            })
+        );
+        assert_eq!(
+            windows_surface_input_event_from_message(WM_MOUSEWHEEL, (120_u16 as usize) << 16, 0),
+            Some(mrd_ipc::ControlInputEvent::MouseWheel { delta: 120 })
+        );
+    }
+
+    #[test]
+    fn remote_display_surface_input_maps_key_and_focus_loss_messages() {
+        assert_eq!(
+            windows_surface_input_event_from_message(WM_KEYDOWN, 0x41, 0),
+            Some(mrd_ipc::ControlInputEvent::Key {
+                key: mrd_ipc::ControlInputKey::VirtualKey { code: 0x41 },
+                pressed: true,
+            })
+        );
+        assert_eq!(
+            windows_surface_input_event_from_message(WM_KEYUP, 0x41, 0),
+            Some(mrd_ipc::ControlInputEvent::Key {
+                key: mrd_ipc::ControlInputKey::VirtualKey { code: 0x41 },
+                pressed: false,
+            })
+        );
+        assert_eq!(
+            windows_surface_input_event_from_message(WM_KILLFOCUS, 0, 0),
+            Some(mrd_ipc::ControlInputEvent::ReleaseAll)
+        );
+    }
 }
 
 #[cfg(target_os = "macos")]

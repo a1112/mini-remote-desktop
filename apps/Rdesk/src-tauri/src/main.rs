@@ -125,6 +125,13 @@ struct DecodePolicyResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct ControlInputAcceptedDto {
+    session_id: String,
+    lane: mrd_ipc::ControlInputLane,
+    event_count: u32,
+}
+
+#[derive(Debug, Serialize)]
 struct ClientDiagnostics {
     app_pid: u32,
     app_exe_path: Option<String>,
@@ -898,6 +905,23 @@ async fn configure_remote_display_native_surface(
         service_action_label
     );
 
+    #[cfg(windows)]
+    if snapshot.attached {
+        if let Some(context) = context.as_ref() {
+            if let Err(error) = set_native_surface_control_session_for_label(
+                &app_handle,
+                state.inner().clone(),
+                label.clone(),
+                Some(context.session_id.clone()),
+            ) {
+                eprintln!(
+                    "render-surface input session bind failed label={label} session_id={} error={error}",
+                    context.session_id
+                );
+            }
+        }
+    }
+
     if snapshot.attached && context.is_none() {
         let _ = detach_native_surface_for_label(&app_handle, state.inner().clone(), label.clone());
         return Err("remote display window context is not registered".to_string());
@@ -1065,6 +1089,31 @@ fn detach_native_surface_for_label(
         .lock()
         .unwrap()
         .detach(&label, None)
+}
+
+#[cfg(windows)]
+fn set_native_surface_control_session_for_label(
+    app_handle: &AppHandle,
+    state: AppState,
+    label: String,
+    session_id: Option<String>,
+) -> Result<(), String> {
+    let app_handle = app_handle.clone();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    app_handle
+        .run_on_main_thread(move || {
+            let result = state
+                .remote_display_surfaces
+                .lock()
+                .unwrap()
+                .set_control_session_id(&label, session_id);
+            let _ = sender.send(result);
+        })
+        .map_err(|error| format!("schedule native surface input session update failed: {error}"))?;
+
+    receiver
+        .recv()
+        .map_err(|error| format!("native surface input session update failed: {error}"))?
 }
 
 fn render_mode_for_native_surface(snapshot: &NativeRenderSurfaceSnapshot) -> &'static str {
@@ -1809,6 +1858,39 @@ async fn ipc_configure_media_adaptation(
 
     match response {
         IpcResponse::MediaAdaptationConfigured { snapshot, .. } => Ok(snapshot),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+/// Send keyboard/mouse control input via mrd-service IPC.
+#[tauri::command]
+async fn ipc_send_control_input(
+    session_id: String,
+    event: mrd_ipc::ControlInputEvent,
+) -> Result<ControlInputAcceptedDto, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+    use mrd_proto::SessionId;
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::SendControlInput {
+            session_id: SessionId(session_id),
+            event,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::ControlInputAccepted {
+            session_id,
+            lane,
+            event_count,
+        } => Ok(ControlInputAcceptedDto {
+            session_id: session_id.0,
+            lane,
+            event_count,
+        }),
         IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
         _ => Err("Unexpected response".to_string()),
     }
@@ -3453,9 +3535,47 @@ fn prefer_x11_backend_for_linux_native_render() {
     }
 }
 
+#[cfg(windows)]
+fn spawn_native_surface_control_input_forwarder() {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    if !remote_display_surface::install_control_input_forwarder(sender) {
+        return;
+    }
+
+    std::thread::spawn(move || {
+        let runtime = match tokio::runtime::Runtime::new() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                eprintln!("native surface input forwarder runtime failed: {error}");
+                return;
+            }
+        };
+
+        for input in receiver {
+            runtime.block_on(async move {
+                let mut client = mrd_ipc::client::IpcClient::new();
+                let response = client
+                    .send_request(mrd_ipc::IpcRequest::SendControlInput {
+                        session_id: SessionId(input.session_id.clone()),
+                        event: input.event,
+                    })
+                    .await;
+                if let Err(error) = response {
+                    eprintln!(
+                        "native surface input forward failed session_id={} error={error}",
+                        input.session_id
+                    );
+                }
+            });
+        }
+    });
+}
+
 fn main() {
     #[cfg(target_os = "linux")]
     prefer_x11_backend_for_linux_native_render();
+    #[cfg(windows)]
+    spawn_native_surface_control_input_forwarder();
 
     let settings_path = default_settings_path();
     let _settings = load_settings(&settings_path).unwrap_or_else(|error| {
@@ -3663,6 +3783,7 @@ fn main() {
             ipc_start_lan_remote_session,
             ipc_update_media_profile,
             ipc_configure_media_adaptation,
+            ipc_send_control_input,
             ipc_list_local_capture_sources,
             ipc_list_remote_capture_sources,
             ipc_select_remote_capture_source,
