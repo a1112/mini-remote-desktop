@@ -84,6 +84,24 @@ pub fn peer_capability_snapshot(peer: &LanPeerInfo) -> CapabilitySnapshot {
     }
 }
 
+pub fn apply_control_input_capability_status(
+    snapshot: &mut CapabilitySnapshot,
+    input_injector_available: bool,
+) {
+    if input_injector_available {
+        return;
+    }
+
+    if let Some(item) = snapshot
+        .capabilities
+        .iter_mut()
+        .find(|item| item.id == "control.keyboard_mouse")
+    {
+        item.status = CapabilityStatus::Unsupported;
+        item.reason = Some("Input injector is unavailable on this host.".to_string());
+    }
+}
+
 fn evaluate_against_snapshot(
     snapshot: &CapabilitySnapshot,
     scenario_id: &str,

@@ -1576,7 +1576,13 @@ impl AppState {
 
     /// Return the currently cached local capability snapshot without running runtime probes.
     pub async fn cached_capability_snapshot(&self) -> CapabilitySnapshot {
-        self.capability_snapshot.lock().await.snapshot()
+        let mut snapshot = self.capability_snapshot.lock().await.snapshot();
+        let input_injector_available = self.control_input.lock().await.is_available();
+        crate::capabilities::apply_control_input_capability_status(
+            &mut snapshot,
+            input_injector_available,
+        );
+        snapshot
     }
 
     /// Refresh the local capability snapshot on a blocking worker without delaying IPC handlers.

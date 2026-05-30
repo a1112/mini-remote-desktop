@@ -1419,6 +1419,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn capability_snapshot_marks_keyboard_mouse_unavailable_when_injector_is_unavailable() {
+        let app_state = Arc::new(AppState::new());
+        let cached = crate::capabilities::local_capability_snapshot_static();
+        app_state.replace_capability_snapshot_for_test(cached).await;
+        app_state
+            .replace_control_input_for_test(mrd_input::UnsupportedInputInjector::new(
+                "blocked by test",
+            ))
+            .await;
+        let server = IpcServer::new(app_state);
+
+        let response = server.handle_request(IpcRequest::CapabilitySnapshot).await;
+
+        let snapshot = match response {
+            IpcResponse::CapabilitySnapshot { snapshot } => snapshot,
+            other => panic!("expected capability snapshot, got {other:?}"),
+        };
+        let control = snapshot
+            .capabilities
+            .iter()
+            .find(|item| item.id == "control.keyboard_mouse")
+            .expect("keyboard/mouse control capability");
+        assert_eq!(control.status, CapabilityStatus::Unsupported);
+        assert!(control
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Input injector is unavailable"));
+    }
+
+    #[tokio::test]
     async fn start_session_preflight_blocks_unsupported_transport_before_start() {
         let app_state = Arc::new(AppState::new());
         let mut cached = crate::capabilities::local_capability_snapshot_static();

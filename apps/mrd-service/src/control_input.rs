@@ -54,6 +54,10 @@ impl ControlInputRegistry {
         }
     }
 
+    pub fn is_available(&self) -> bool {
+        self.injector.is_available()
+    }
+
     pub fn handle_event(
         &mut self,
         event: &ControlInputEvent,

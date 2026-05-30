@@ -2777,8 +2777,10 @@ async fn build_announcement(app_state: &Arc<AppState>) -> Option<LanAnnouncement
         LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT.to_string(),
         LAN_DISPLAY_MODE_CONTROL_TRANSPORT.to_string(),
     ];
-    #[cfg(windows)]
-    transports.push(LAN_INPUT_CONTROL_TRANSPORT.to_string());
+    let input_control_available = app_state.control_input().lock().await.is_available();
+    if input_control_available {
+        transports.push(LAN_INPUT_CONTROL_TRANSPORT.to_string());
+    }
 
     Some(LanAnnouncement {
         magic: DISCOVERY_MAGIC.to_string(),
@@ -2792,7 +2794,7 @@ async fn build_announcement(app_state: &Arc<AppState>) -> Option<LanAnnouncement
         transports,
         service_build_id: Some(service_build_id()),
         media_protocol_version: Some(LAN_MEDIA_PROTOCOL_VERSION),
-        media_capabilities: lan_media_capabilities(),
+        media_capabilities: lan_media_capabilities_with_input_control(input_control_available),
         timestamp_ms: now_ms(),
     })
 }
@@ -2816,6 +2818,10 @@ fn service_build_id_from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Stri
 }
 
 fn lan_media_capabilities() -> Vec<String> {
+    lan_media_capabilities_with_input_control(cfg!(windows))
+}
+
+fn lan_media_capabilities_with_input_control(input_control_available: bool) -> Vec<String> {
     let mut capabilities = vec![
         LAN_QUIC_MEDIA_V2_TRANSPORT.to_string(),
         LAN_QUIC_MEDIA_V3_TRANSPORT.to_string(),
@@ -2833,9 +2839,11 @@ fn lan_media_capabilities() -> Vec<String> {
             LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY.to_string(),
             LAN_RENDER_D3D11_NATIVE_CAPABILITY.to_string(),
             LAN_RENDER_D3D11_SHARED_NV12_CAPABILITY.to_string(),
-            LAN_INPUT_CONTROL_CAPABILITY.to_string(),
             crate::display_mode::capability_name().to_string(),
         ]);
+        if input_control_available {
+            capabilities.push(LAN_INPUT_CONTROL_CAPABILITY.to_string());
+        }
     }
     #[cfg(target_os = "macos")]
     {
@@ -8221,6 +8229,32 @@ mod tests {
             .transports
             .contains(&LAN_INPUT_CONTROL_TRANSPORT.to_string()));
         assert!(announcement
+            .media_capabilities
+            .contains(&LAN_INPUT_CONTROL_CAPABILITY.to_string()));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn announcement_omits_keyboard_mouse_input_control_when_injector_unavailable() {
+        let app_state = Arc::new(AppState::new());
+        app_state.devices.lock().await.register(
+            DeviceId("local-device".to_string()),
+            "Local Device".to_string(),
+        );
+        app_state
+            .replace_control_input_for_test(mrd_input::UnsupportedInputInjector::new(
+                "blocked by test",
+            ))
+            .await;
+
+        let announcement = build_announcement(&app_state)
+            .await
+            .expect("registered device announcement");
+
+        assert!(!announcement
+            .transports
+            .contains(&LAN_INPUT_CONTROL_TRANSPORT.to_string()));
+        assert!(!announcement
             .media_capabilities
             .contains(&LAN_INPUT_CONTROL_CAPABILITY.to_string()));
     }
