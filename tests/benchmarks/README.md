@@ -14,6 +14,10 @@ powershell -ExecutionPolicy Bypass -File tests/benchmarks/scripts/run_transport_
   -ScenarioPath tests/benchmarks/scenarios/quick.transport.json
 ```
 
+`run_transport_matrix.ps1` runs the benchmark test in Cargo release mode by
+default. Add `-Debug` only when investigating harness behavior and not comparing
+performance numbers.
+
 Quick NVENC runs:
 
 ```powershell
@@ -112,7 +116,9 @@ Reports are written to `target/codex-matrix-compare/`:
 - `matrix-comparison-report.json` and `.md`
 
 Use `-SkipLocal` or `-SkipCross` when collecting only one side, and `-NoBuild`
-when the app and service binaries have already been built.
+when the app and service binaries have already been built. Local benchmark
+canaries use Cargo release mode by default; add `-DebugLocalBenchmark` only for
+local harness debugging.
 
 Steady baseline:
 

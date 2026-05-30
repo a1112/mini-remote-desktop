@@ -36,6 +36,23 @@ function Get-TransportMatrixCargoFeatureArgs {
   return @("--features", ($uniqueFeatures -join ","))
 }
 
+function Get-TransportMatrixCargoTestArgs {
+  param(
+    [string]$EncodeBackend = "",
+    [string]$DecodeBackend = "",
+    [bool]$Release = $true
+  )
+
+  $args = @("test")
+  if ($Release) {
+    $args += "--release"
+  }
+  $args += @("-p", "app")
+  $args += Get-TransportMatrixCargoFeatureArgs -EncodeBackend $EncodeBackend -DecodeBackend $DecodeBackend
+  $args += @("benchmark_run_writes_requested_artifacts", "--", "--nocapture")
+  return $args
+}
+
 function Get-TransportMatrixBitrateBps {
   param([object]$Scenario)
 

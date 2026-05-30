@@ -1,7 +1,8 @@
 param(
   [string]$ScenarioPath = "tests/benchmarks/scenarios/quick.transport.json",
   [string]$RepoRoot = ".",
-  [int]$TimeoutSeconds = 300
+  [int]$TimeoutSeconds = 300,
+  [switch]$Debug
 )
 
 $ErrorActionPreference = "Stop"
@@ -13,7 +14,8 @@ $scenario = Get-Content $scenarioFile -Raw | ConvertFrom-Json
 $gitCommit = (git -C $repo rev-parse --short HEAD).Trim()
 $date = Get-Date -Format 'yyyy-MM-dd'
 $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$runId = "$($scenario.scenario)-$($scenario.transport)-$timestamp-$gitCommit"
+$cargoProfile = if ($Debug) { "debug" } else { "release" }
+$runId = "$($scenario.scenario)-$($scenario.transport)-$cargoProfile-$timestamp-$gitCommit"
 $runDir = Join-Path $repo ("artifacts/benchmarks/{0}/{1}/{2}" -f $date, $scenario.profile, $runId)
 $logsDir = Join-Path $runDir "logs"
 $reportsDir = Join-Path $runDir "reports"
@@ -26,9 +28,10 @@ New-Item -ItemType File -Force -Path (Join-Path $logsDir 'signaling.stderr.log')
 $hostStdout = Join-Path $logsDir 'host.stdout.log'
 $hostStderr = Join-Path $logsDir 'host.stderr.log'
 $thresholdPath = Join-Path $repo ("tests/benchmarks/thresholds/{0}" -f $scenario.threshold_file)
-$cargoArgs = @("test", "-p", "app") +
-  (Get-TransportMatrixCargoFeatureArgs -EncodeBackend $scenario.encode_backend -DecodeBackend $scenario.decode_backend) +
-  @("benchmark_run_writes_requested_artifacts", "--", "--nocapture")
+$cargoArgs = Get-TransportMatrixCargoTestArgs `
+  -EncodeBackend $scenario.encode_backend `
+  -DecodeBackend $scenario.decode_backend `
+  -Release:(-not $Debug)
 
 $env:MRD_BENCH_ARTIFACT_ROOT = $repo
 $env:MRD_BENCH_SCENARIO = $scenario.scenario

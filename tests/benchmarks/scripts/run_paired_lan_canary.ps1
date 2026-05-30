@@ -22,6 +22,7 @@ param(
   [switch]$SkipLocal,
   [switch]$SkipCross,
   [switch]$NoBuild,
+  [switch]$DebugLocalBenchmark,
   [switch]$NoRenderProfileCap,
   [switch]$KeepTauriOpen
 )
@@ -30,6 +31,7 @@ $ErrorActionPreference = "Stop"
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 . (Join-Path $scriptDir "paired_lan_canary_common.ps1")
+. (Join-Path $scriptDir "transport_matrix_common.ps1")
 
 function Resolve-RepoPath([string]$Path) {
   (Resolve-Path $Path).Path
@@ -192,7 +194,7 @@ function Get-IPv4BroadcastAddress([string]$IPAddress, [int]$PrefixLength) {
   [System.Net.IPAddress]::new($broadcast).ToString()
 }
 
-function Invoke-LocalCanaryProfile($Repo, $Profile, $GitCommit, [string]$Codec) {
+function Invoke-LocalCanaryProfile($Repo, $Profile, $GitCommit, [string]$Codec, [bool]$ReleaseBenchmark = $true) {
   $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
   $date = Get-Date -Format 'yyyy-MM-dd'
   $runId = "paired-local-$($Profile.id)-$timestamp-$GitCommit"
@@ -215,18 +217,23 @@ function Invoke-LocalCanaryProfile($Repo, $Profile, $GitCommit, [string]$Codec) 
     Set-EnvVar "MRD_BENCH_GIT_COMMIT" $GitCommit $savedEnv
     Set-EnvVar "MRD_BENCH_TRANSPORT" "quic_datagram" $savedEnv
     Set-EnvVar "MRD_BENCH_CAPTURE_BACKEND" "dxgi" $savedEnv
-    if ((Normalize-CanaryCodec $Codec) -eq "hevc") {
-      Set-EnvVar "MRD_BENCH_ENCODE_BACKEND" "nvenc_hevc" $savedEnv
+    $encodeBackend = if ((Normalize-CanaryCodec $Codec) -eq "hevc") {
+      "nvenc_hevc"
     } else {
-      Set-EnvVar "MRD_BENCH_ENCODE_BACKEND" "nvenc_h264" $savedEnv
+      "nvenc_h264"
     }
+    Set-EnvVar "MRD_BENCH_ENCODE_BACKEND" $encodeBackend $savedEnv
     Set-EnvVar "MRD_BENCH_DECODE_BACKEND" "nvdec" $savedEnv
     Set-EnvVar "MRD_BENCH_RENDERER_BACKEND" "d3d11_shared" $savedEnv
     Set-EnvVar "MRD_BENCH_BITRATE_BPS" ([string]([int64]$Profile.bitrate_mbps * 1000000)) $savedEnv
 
     $stdout = Join-Path $logsDir "host.stdout.log"
     $stderr = Join-Path $logsDir "host.stderr.log"
-    $process = Start-Process -FilePath "cargo" -ArgumentList @("test", "-p", "app", "benchmark_run_writes_requested_artifacts", "--", "--nocapture") -WorkingDirectory $Repo -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WindowStyle Hidden -Wait -PassThru
+    $cargoArgs = Get-TransportMatrixCargoTestArgs `
+      -EncodeBackend $encodeBackend `
+      -DecodeBackend "nvdec" `
+      -Release:$ReleaseBenchmark
+    $process = Start-Process -FilePath "cargo" -ArgumentList $cargoArgs -WorkingDirectory $Repo -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WindowStyle Hidden -Wait -PassThru
     if ($process.ExitCode -ne 0) {
       throw "local canary cargo test failed for $($Profile.id), see $stderr"
     }
@@ -393,7 +400,7 @@ $localRows = @()
 if (-not $SkipLocal) {
   foreach ($profile in $profiles) {
     Write-Host "Running local canary $($profile.id)"
-    $localRows += Invoke-LocalCanaryProfile -Repo $repo -Profile $profile -GitCommit $gitCommit -Codec $Codec
+    $localRows += Invoke-LocalCanaryProfile -Repo $repo -Profile $profile -GitCommit $gitCommit -Codec $Codec -ReleaseBenchmark:(-not $DebugLocalBenchmark)
   }
 }
 

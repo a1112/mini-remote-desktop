@@ -48,6 +48,15 @@ Assert-ArrayEqual $vvcEncodeDecodeArgs @("--features", "production-vvc-software-
 $noneArgs = Get-TransportMatrixCargoFeatureArgs -DecodeBackend "nvdec"
 Assert-ArrayEqual $noneArgs @() "Hardware decode matrix does not enable software codec features"
 
+$releaseCargoArgs = Get-TransportMatrixCargoTestArgs -EncodeBackend "nvenc_av1" -DecodeBackend "nvdec_av1"
+Assert-ArrayEqual $releaseCargoArgs @("test", "--release", "-p", "app", "benchmark_run_writes_requested_artifacts", "--", "--nocapture") "Transport benchmarks should default to release cargo tests"
+
+$debugCargoArgs = Get-TransportMatrixCargoTestArgs -EncodeBackend "nvenc_av1" -DecodeBackend "nvdec_av1" -Release:$false
+Assert-ArrayEqual $debugCargoArgs @("test", "-p", "app", "benchmark_run_writes_requested_artifacts", "--", "--nocapture") "Transport benchmarks should allow debug cargo tests for local debugging"
+
+$vvcCargoArgs = Get-TransportMatrixCargoTestArgs -EncodeBackend "software_vvc" -DecodeBackend "software_vvc"
+Assert-ArrayEqual $vvcCargoArgs @("test", "--release", "-p", "app", "--features", "production-vvc-software-codec", "benchmark_run_writes_requested_artifacts", "--", "--nocapture") "Transport benchmark cargo args should preserve codec feature flags"
+
 $bitrateBps = Get-TransportMatrixBitrateBps -Scenario ([pscustomobject]@{ bitrate_bps = 12000000 })
 if ($bitrateBps -ne "12000000") {
   throw "bitrate_bps scenario field should pass through unchanged"
