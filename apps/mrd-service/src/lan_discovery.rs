@@ -3083,13 +3083,19 @@ async fn close_existing_display_lan_sender_sessions_for_source(
             .list_all()
             .into_iter()
             .filter(|snapshot| {
+                let selected_source = capture_sources.get(&snapshot.session_id);
+                let selected_source_is_window = selected_source
+                    .as_ref()
+                    .is_some_and(|selection| is_window_capture_source(&selection.source));
+                let same_controller = snapshot.source_device_id.as_ref() == Some(&source_device_id);
+                let same_capture_source = selected_source.as_ref().is_some_and(|selection| {
+                    selection.source.id.eq_ignore_ascii_case(&next_source.id)
+                });
                 snapshot.session_id != *next_session_id
-                    && snapshot.source_device_id.as_ref() == Some(&source_device_id)
+                    && (same_controller || same_capture_source)
                     && snapshot.sender_active
                     && normalize_transport_kind(&snapshot.transport) == "quic"
-                    && !capture_sources
-                        .get(&snapshot.session_id)
-                        .is_some_and(|selection| is_window_capture_source(&selection.source))
+                    && !selected_source_is_window
                     && !snapshot.lifecycle_state.is_terminal()
             })
             .map(|snapshot| snapshot.session_id)
@@ -10822,12 +10828,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn display_sender_selection_closes_only_existing_display_sessions_from_same_source() {
+    async fn display_sender_selection_closes_existing_display_sessions_for_same_controller_or_source(
+    ) {
         let app_state = Arc::new(AppState::default());
         let next_session = SessionId("new-display-controller-a".to_string());
         let old_display = SessionId("old-display-controller-a".to_string());
         let old_window = SessionId("old-window-controller-a".to_string());
-        let other_source = SessionId("display-controller-b".to_string());
+        let other_controller_other_source = SessionId("display-controller-b-other".to_string());
+        let other_controller_same_source = SessionId("display-controller-b-same".to_string());
 
         {
             let mut sessions = app_state.sessions.lock().await;
@@ -10844,8 +10852,12 @@ mod tests {
                 sender_snapshot_for_source(&old_window, "controller-a"),
             );
             sessions.insert(
-                other_source.clone(),
-                sender_snapshot_for_source(&other_source, "controller-b"),
+                other_controller_other_source.clone(),
+                sender_snapshot_for_source(&other_controller_other_source, "controller-b"),
+            );
+            sessions.insert(
+                other_controller_same_source.clone(),
+                sender_snapshot_for_source(&other_controller_same_source, "controller-b"),
             );
         }
 
@@ -10873,10 +10885,21 @@ mod tests {
         .await;
         store_capture_source_selection(
             &app_state,
-            &other_source,
+            &other_controller_other_source,
             CaptureSourceSelection {
-                session_id: other_source.clone(),
+                session_id: other_controller_other_source.clone(),
                 source: test_display_capture_source("windows:display-shared:1"),
+                status: "selected".to_string(),
+                reason: None,
+            },
+        )
+        .await;
+        store_capture_source_selection(
+            &app_state,
+            &other_controller_same_source,
+            CaptureSourceSelection {
+                session_id: other_controller_same_source.clone(),
+                source: test_display_capture_source("windows:display-shared:2"),
                 status: "selected".to_string(),
                 reason: None,
             },
@@ -10901,10 +10924,31 @@ mod tests {
             sessions.get(&old_window).unwrap().lifecycle_state,
             SessionLifecycleState::Listening
         );
-        assert!(sessions.get(&other_source).unwrap().sender_active);
+        assert!(
+            sessions
+                .get(&other_controller_other_source)
+                .unwrap()
+                .sender_active
+        );
         assert_eq!(
-            sessions.get(&other_source).unwrap().lifecycle_state,
+            sessions
+                .get(&other_controller_other_source)
+                .unwrap()
+                .lifecycle_state,
             SessionLifecycleState::Listening
+        );
+        assert_eq!(
+            sessions
+                .get(&other_controller_same_source)
+                .unwrap()
+                .lifecycle_state,
+            SessionLifecycleState::Closed
+        );
+        assert!(
+            !sessions
+                .get(&other_controller_same_source)
+                .unwrap()
+                .sender_active
         );
     }
 
