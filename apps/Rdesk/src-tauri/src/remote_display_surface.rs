@@ -740,14 +740,85 @@ fn init_x11_threads() {
 #[cfg(all(test, windows))]
 mod remote_display_surface_input_tests {
     use super::*;
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use std::time::Duration;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, WPARAM};
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::{
-        WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-        WM_MOUSEWHEEL,
+        CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, SendMessageW, CS_HREDRAW,
+        CS_VREDRAW, HMENU, WINDOW_EX_STYLE, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN,
+        WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WNDCLASSW, WS_OVERLAPPED,
     };
 
     fn lparam(x: i16, y: i16) -> isize {
         ((u16::from_ne_bytes(y.to_ne_bytes()) as u32) << 16
             | u16::from_ne_bytes(x.to_ne_bytes()) as u32) as isize
+    }
+
+    fn wide(value: &str) -> Vec<u16> {
+        OsStr::new(value)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    struct TestParentWindow(HWND);
+
+    impl TestParentWindow {
+        fn create() -> Self {
+            unsafe extern "system" fn wnd_proc(
+                hwnd: HWND,
+                message: u32,
+                wparam: WPARAM,
+                lparam: LPARAM,
+            ) -> windows::Win32::Foundation::LRESULT {
+                unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+            }
+
+            let class_name = wide("RdeskRemoteDisplayNativeSurfaceTestParent");
+            let title = wide("Rdesk Native Surface Test Parent");
+            let hmodule = unsafe { GetModuleHandleW(None) }.expect("get module handle");
+            let hinstance = HINSTANCE(hmodule.0);
+            let window_class = WNDCLASSW {
+                style: CS_HREDRAW | CS_VREDRAW,
+                lpfnWndProc: Some(wnd_proc),
+                hInstance: hinstance,
+                lpszClassName: PCWSTR(class_name.as_ptr()),
+                ..Default::default()
+            };
+            unsafe {
+                RegisterClassW(&window_class);
+            }
+
+            let hwnd = unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    PCWSTR(class_name.as_ptr()),
+                    PCWSTR(title.as_ptr()),
+                    WS_OVERLAPPED,
+                    0,
+                    0,
+                    128,
+                    128,
+                    HWND(0),
+                    HMENU(0),
+                    hinstance,
+                    None,
+                )
+            };
+            assert_ne!(hwnd.0, 0, "create parent window");
+            Self(hwnd)
+        }
+    }
+
+    impl Drop for TestParentWindow {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = DestroyWindow(self.0);
+            }
+        }
     }
 
     #[test]
@@ -823,6 +894,48 @@ mod remote_display_surface_input_tests {
         assert_eq!(
             windows_surface_input_events_from_message(WM_KILLFOCUS, 0, 0),
             vec![mrd_ipc::ControlInputEvent::ReleaseAll]
+        );
+    }
+
+    #[test]
+    fn remote_display_surface_input_forwards_wndproc_events_with_session_id() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        assert!(
+            install_control_input_forwarder(sender),
+            "native surface input forwarder should only be installed once in tests"
+        );
+
+        let parent = TestParentWindow::create();
+        let parent_hwnd = parent.0;
+        let mut surface = NativeRenderSurface::create(
+            parent_hwnd.0,
+            NativeSurfaceRect {
+                x: 0,
+                y: 0,
+                width: 128,
+                height: 128,
+            },
+            false,
+        )
+        .expect("create native render surface");
+        surface.set_control_session_id(Some("native-forward-session".to_string()));
+
+        unsafe {
+            SendMessageW(
+                surface.hwnd,
+                WM_MOUSEMOVE,
+                WPARAM(0),
+                LPARAM(lparam(42, 24)),
+            );
+        }
+
+        let input = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("forwarded native surface control input");
+        assert_eq!(input.session_id, "native-forward-session");
+        assert_eq!(
+            input.event,
+            mrd_ipc::ControlInputEvent::MouseMove { x: 42, y: 24 }
         );
     }
 }
