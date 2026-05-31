@@ -65,6 +65,8 @@ Keep service render pacing available, but make it policy-aware:
 - `paced_fifo`: keep the current `render_pacing_wait` behavior.
 - `latest`: do not wait a full refresh interval when a fresher frame is already queued. Prefer the newest frame over cadence preservation.
 
+When D3D11 waitable swapchain mode is enabled, skip service-side render pacing. The DXGI frame-latency waitable object becomes the pacing source, and stacking it with `render_pacing_wait` adds an extra refresh-sized delay.
+
 This separates display cadence health from the local pipeline latency budget.
 
 ### D3D11 Waitable Policy

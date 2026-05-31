@@ -61,6 +61,10 @@ const LAN_RENDER_MAX_FPS_ENV: &str = "MRD_LAN_RENDER_MAX_FPS";
 const LAN_RENDER_QUEUE_CAPACITY_ENV: &str = "MRD_LAN_RENDER_QUEUE_CAPACITY";
 #[cfg(windows)]
 const LAN_RENDER_QUEUE_POLICY_ENV: &str = "MRD_LAN_RENDER_QUEUE_POLICY";
+#[cfg(windows)]
+const D3D11_RENDER_PRESENT_BLOCKING_ENV: &str = "MRD_D3D11_RENDER_PRESENT_BLOCKING";
+#[cfg(windows)]
+const D3D11_RENDER_WAITABLE_OBJECT_ENV: &str = "MRD_D3D11_RENDER_WAITABLE_OBJECT";
 const PROTOCOL_VERSION: u32 = 1;
 const ANNOUNCE_INTERVAL_SECS: u64 = 3;
 const PEER_TTL_SECS: u64 = 12;
@@ -4692,8 +4696,28 @@ fn lan_render_queue_policy_for_profile_with_override(
 }
 
 #[cfg(windows)]
-fn lan_render_policy_allows_pacing(policy: LanRenderQueuePolicy, profile: &MediaProfile) -> bool {
-    policy == LanRenderQueuePolicy::PacedFifo && lan_render_pacing_enabled_for_profile(profile)
+fn lan_render_waitable_swapchain_pacing_enabled() -> bool {
+    env_bool_override(
+        std::env::var(D3D11_RENDER_PRESENT_BLOCKING_ENV)
+            .ok()
+            .as_deref(),
+    ) != Some(true)
+        && env_bool_override(
+            std::env::var(D3D11_RENDER_WAITABLE_OBJECT_ENV)
+                .ok()
+                .as_deref(),
+        ) == Some(true)
+}
+
+#[cfg(windows)]
+fn lan_render_policy_allows_service_pacing(
+    policy: LanRenderQueuePolicy,
+    profile: &MediaProfile,
+    waitable_swapchain_pacing: bool,
+) -> bool {
+    policy == LanRenderQueuePolicy::PacedFifo
+        && !waitable_swapchain_pacing
+        && lan_render_pacing_enabled_for_profile(profile)
 }
 
 #[cfg(windows)]
@@ -5717,7 +5741,11 @@ async fn pace_lan_render_frame(
     profile: &MediaProfile,
     policy: LanRenderQueuePolicy,
 ) {
-    if !lan_render_policy_allows_pacing(policy, profile) {
+    if !lan_render_policy_allows_service_pacing(
+        policy,
+        profile,
+        lan_render_waitable_swapchain_pacing_enabled(),
+    ) {
         return;
     }
 
@@ -12471,13 +12499,20 @@ mod tests {
             ..MediaProfile::default()
         };
 
-        assert!(!lan_render_policy_allows_pacing(
+        assert!(!lan_render_policy_allows_service_pacing(
             LanRenderQueuePolicy::Latest,
-            &high_fps
+            &high_fps,
+            false
         ));
-        assert!(lan_render_policy_allows_pacing(
+        assert!(lan_render_policy_allows_service_pacing(
             LanRenderQueuePolicy::PacedFifo,
-            &high_fps
+            &high_fps,
+            false
+        ));
+        assert!(!lan_render_policy_allows_service_pacing(
+            LanRenderQueuePolicy::PacedFifo,
+            &high_fps,
+            true
         ));
     }
 

@@ -97,7 +97,7 @@ Expected: FAIL until worker uses `take_latest_or_finish`.
 In `run_lan_render_worker`:
 
 - read `lan_render_queue_policy_for_profile(&render_profile)`
-- bypass `pace_lan_render_frame` when policy is `Latest`
+- bypass `pace_lan_render_frame` when policy is `Latest` or D3D11 waitable swapchain pacing is active
 - after rendering, use `take_latest_or_finish` for latest policy
 - increment `render_stale_frame_drops` by the dropped backlog count
 - record `render_queue_policy` in the pipeline snapshot
