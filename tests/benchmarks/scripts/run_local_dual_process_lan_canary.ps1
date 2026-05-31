@@ -17,6 +17,8 @@ param(
   [string]$CaptureSourceKind = "display_shared",
   [string]$RenderDisplaySourceId = "",
   [int]$RenderMaxFps = 0,
+  [ValidateSet("blocking", "nonblocking", "waitable")]
+  [string]$RenderPresentMode = "blocking",
   [double]$LossPct = 0,
   [int]$BaseDelayMs = 0,
   [int]$JitterMs = 0,
@@ -298,6 +300,8 @@ function Invoke-LocalDualProcessProfile {
     [string]$CaptureSourceId = "",
     [string]$CaptureSourceKind = "display_shared",
     [int]$RenderMaxFps = 0,
+    [ValidateSet("blocking", "nonblocking", "waitable")]
+    [string]$RenderPresentMode = "blocking",
     [int]$TauriStartupGraceSecs = 90,
     [switch]$NoMotionStimulus,
     [switch]$NoRenderProfileCap,
@@ -364,7 +368,23 @@ function Invoke-LocalDualProcessProfile {
       }
     }
 
-    Set-EnvVar "MRD_D3D11_RENDER_PRESENT_BLOCKING" "true" $savedEnv
+    switch ($RenderPresentMode) {
+      "blocking" {
+        Set-EnvVar "MRD_D3D11_RENDER_PRESENT_BLOCKING" "true" $savedEnv
+        Set-EnvVar "MRD_D3D11_RENDER_WAITABLE_OBJECT" "false" $savedEnv
+        Set-EnvVar "MRD_RENDER_THREAD_PRIORITY" "normal" $savedEnv
+      }
+      "waitable" {
+        Set-EnvVar "MRD_D3D11_RENDER_PRESENT_BLOCKING" "false" $savedEnv
+        Set-EnvVar "MRD_D3D11_RENDER_WAITABLE_OBJECT" "true" $savedEnv
+        Set-EnvVar "MRD_RENDER_THREAD_PRIORITY" "above_normal" $savedEnv
+      }
+      default {
+        Set-EnvVar "MRD_D3D11_RENDER_PRESENT_BLOCKING" "false" $savedEnv
+        Set-EnvVar "MRD_D3D11_RENDER_WAITABLE_OBJECT" "false" $savedEnv
+        Set-EnvVar "MRD_RENDER_THREAD_PRIORITY" "normal" $savedEnv
+      }
+    }
 
     $controller = Start-LocalServiceInstance `
       -ServiceExe $runServiceExe `
@@ -632,6 +652,7 @@ foreach ($profile in $profiles) {
     -CaptureSourceId $CaptureSourceId `
     -CaptureSourceKind $CaptureSourceKind `
     -RenderMaxFps $RenderMaxFps `
+    -RenderPresentMode $RenderPresentMode `
     -TauriStartupGraceSecs $TauriStartupGraceSecs `
     -NoMotionStimulus:$NoMotionStimulus `
     -NoRenderProfileCap:$NoRenderProfileCap `
@@ -651,6 +672,7 @@ $report | Add-Member -Force -NotePropertyName "capture_source_request" -NoteProp
 })
 $report | Add-Member -Force -NotePropertyName "render_display_source_request" -NotePropertyValue $(if ($RenderDisplaySourceId.Trim()) { $RenderDisplaySourceId.Trim() } else { $null })
 $report | Add-Member -Force -NotePropertyName "render_max_fps_override" -NotePropertyValue $(if ($RenderMaxFps -gt 0) { $RenderMaxFps } else { $null })
+$report | Add-Member -Force -NotePropertyName "render_present_mode_request" -NotePropertyValue $RenderPresentMode
 $report | Add-Member -Force -NotePropertyName "tauri_window_visible" -NotePropertyValue ([bool]$ShowTauriWindow)
 $report | Add-Member -Force -NotePropertyName "codec_request" -NotePropertyValue ([pscustomobject]@{
   codec = $Codec

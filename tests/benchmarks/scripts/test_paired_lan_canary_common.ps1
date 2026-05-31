@@ -672,5 +672,7 @@ Assert-True ($localDualScript -match "cargo build -p mrd-service") "Local dual c
 Assert-True ($localDualScript -match "cargo build -p app --no-default-features") "Local dual canary prebuilds the same Tauri shell target used by tauri dev"
 Assert-True ($localDualScript -match "CARGO_TARGET_DIR") "Local dual canary keeps prebuild and Tauri dev on the same cargo target"
 Assert-True ($localDualScript -match "MRD_LAN_E2E_RENDER_DISPLAY_SOURCE_ID") "Local dual canary can route the receiver window to an explicit display source"
+Assert-True ($localDualScript -match "RenderPresentMode") "Local dual canary exposes render present mode selection"
+Assert-True ($localDualScript -match "MRD_D3D11_RENDER_WAITABLE_OBJECT") "Local dual canary can enable waitable D3D11 present"
 
 Write-Host "paired LAN canary common tests passed"
