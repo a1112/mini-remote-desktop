@@ -316,6 +316,9 @@ mod wire {
         /// Receiver-side render pacing target after local display refresh caps.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub render_pacing_target_fps: Option<u32>,
+        /// Receiver-side render queue policy, for example `latest` or `paced_fifo`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub render_queue_policy: Option<String>,
         pub stage_metrics: Vec<MediaStageMetrics>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub test_impairment: Option<MediaTestImpairmentSnapshot>,

@@ -759,6 +759,7 @@ fn serialize_deserialize_media_pipeline_snapshot_contract() {
             render_lock_drops: 1,
             render_present_skips: 2,
             render_pacing_target_fps: Some(144),
+            render_queue_policy: Some("latest".to_string()),
             stage_metrics: vec![MediaStageMetrics {
                 stage: "decode".to_string(),
                 p50_ms: Some(1.0),

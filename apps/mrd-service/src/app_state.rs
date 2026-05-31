@@ -300,6 +300,7 @@ struct MediaPipelineState {
     render_lock_drops: u64,
     render_present_skips: u64,
     render_pacing_target_fps: Option<u32>,
+    render_queue_policy: Option<String>,
     stage_samples: HashMap<String, VecDeque<f64>>,
     stage_summaries: HashMap<String, MediaStageMetrics>,
     test_impairment: Option<MediaTestImpairmentSnapshot>,
@@ -579,6 +580,17 @@ impl MediaPipelineRegistry {
             .render_pacing_target_fps = fps;
     }
 
+    pub fn set_render_queue_policy(
+        &mut self,
+        session_id: SessionId,
+        policy: Option<impl Into<String>>,
+    ) {
+        self.pipelines
+            .entry(session_id)
+            .or_default()
+            .render_queue_policy = policy.map(Into::into);
+    }
+
     pub fn record_stage_duration_ms(
         &mut self,
         session_id: SessionId,
@@ -678,6 +690,7 @@ impl MediaPipelineRegistry {
             render_lock_drops: state.map_or(0, |state| state.render_lock_drops),
             render_present_skips: state.map_or(0, |state| state.render_present_skips),
             render_pacing_target_fps: state.and_then(|state| state.render_pacing_target_fps),
+            render_queue_policy: state.and_then(|state| state.render_queue_policy.clone()),
             stage_metrics,
             test_impairment: state.and_then(|state| state.test_impairment.clone()),
             sender_transport: state
@@ -2003,6 +2016,18 @@ mod tests {
         assert_eq!(snapshot.render_stale_frame_drops, 5);
         assert_eq!(snapshot.render_lock_drops, 2);
         assert_eq!(snapshot.render_present_skips, 4);
+    }
+
+    #[test]
+    fn media_pipeline_registry_exposes_render_queue_policy() {
+        let mut registry = MediaPipelineRegistry::default();
+        let session_id = SessionId("render-policy-session".to_string());
+
+        registry.set_render_queue_policy(session_id.clone(), Some("latest"));
+
+        let snapshot = registry.snapshot(&session_id);
+
+        assert_eq!(snapshot.render_queue_policy.as_deref(), Some("latest"));
     }
 
     #[cfg(windows)]

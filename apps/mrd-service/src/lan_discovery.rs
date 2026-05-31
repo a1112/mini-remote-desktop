@@ -1,6 +1,6 @@
-#[cfg(windows)]
-use crate::app_state::MediaRenderQueueEnqueue;
 use crate::app_state::{AppState, DecodedVideoFrameStats, MediaProbeFrameStats};
+#[cfg(windows)]
+use crate::app_state::{MediaRenderQueueEnqueue, MediaRenderQueueRegistry};
 use anyhow::{Context, Result};
 use mrd_application::ports::{SessionLifecycleState, SessionSnapshot};
 use mrd_encode_openh264::OpenH264Encoder;
@@ -59,6 +59,8 @@ const LAN_CAPTURE_PUMP_ENV: &str = "MRD_LAN_CAPTURE_PUMP";
 const LAN_RENDER_PACING_ENV: &str = "MRD_LAN_RENDER_PACING";
 const LAN_RENDER_MAX_FPS_ENV: &str = "MRD_LAN_RENDER_MAX_FPS";
 const LAN_RENDER_QUEUE_CAPACITY_ENV: &str = "MRD_LAN_RENDER_QUEUE_CAPACITY";
+#[cfg(windows)]
+const LAN_RENDER_QUEUE_POLICY_ENV: &str = "MRD_LAN_RENDER_QUEUE_POLICY";
 const PROTOCOL_VERSION: u32 = 1;
 const ANNOUNCE_INTERVAL_SECS: u64 = 3;
 const PEER_TTL_SECS: u64 = 12;
@@ -4642,6 +4644,63 @@ fn lan_render_pacing_enabled_for_profile(profile: &MediaProfile) -> bool {
 }
 
 #[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LanRenderQueuePolicy {
+    PacedFifo,
+    Latest,
+}
+
+#[cfg(windows)]
+impl LanRenderQueuePolicy {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PacedFifo => "paced_fifo",
+            Self::Latest => "latest",
+        }
+    }
+}
+
+#[cfg(windows)]
+fn lan_render_queue_policy_from_env_value(value: Option<&str>) -> Option<LanRenderQueuePolicy> {
+    match value?.trim().to_ascii_lowercase().as_str() {
+        "latest" | "low_latency" | "low-latency" | "latency" => Some(LanRenderQueuePolicy::Latest),
+        "paced_fifo" | "paced-fifo" | "fifo" => Some(LanRenderQueuePolicy::PacedFifo),
+        "" => None,
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+fn lan_render_queue_policy_for_profile(profile: &MediaProfile) -> LanRenderQueuePolicy {
+    lan_render_queue_policy_for_profile_with_override(
+        profile,
+        lan_render_queue_policy_from_env_value(
+            std::env::var(LAN_RENDER_QUEUE_POLICY_ENV).ok().as_deref(),
+        ),
+    )
+}
+
+#[cfg(windows)]
+fn lan_render_queue_policy_for_profile_with_override(
+    profile: &MediaProfile,
+    override_policy: Option<LanRenderQueuePolicy>,
+) -> LanRenderQueuePolicy {
+    if let Some(policy) = override_policy {
+        return policy;
+    }
+    if profile.fps >= LAN_RENDER_PACING_DEFAULT_MIN_FPS {
+        LanRenderQueuePolicy::Latest
+    } else {
+        LanRenderQueuePolicy::PacedFifo
+    }
+}
+
+#[cfg(windows)]
+fn lan_render_policy_allows_pacing(policy: LanRenderQueuePolicy, profile: &MediaProfile) -> bool {
+    policy == LanRenderQueuePolicy::PacedFifo && lan_render_pacing_enabled_for_profile(profile)
+}
+
+#[cfg(windows)]
 fn lan_render_queue_capacity_for_profile(profile: &MediaProfile) -> usize {
     if lan_render_pacing_enabled_for_profile(profile) {
         lan_render_queue_capacity_from_env_value(
@@ -5413,6 +5472,7 @@ async fn render_lan_decoded_frame(
 
     let render_frame = decoded_frame_to_render_frame(decoded_frame.clone())?;
     let render_profile = selected_media_profile(app_state, session_id).await;
+    let render_queue_policy = lan_render_queue_policy_for_profile(&render_profile);
     let max_pending_frames = lan_render_queue_capacity_for_profile(&render_profile);
     let render_pacing_target_fps = lan_render_cap_target_fps_for_profile(&render_profile);
     let (enqueue, enqueue_gap_ms) = {
@@ -5428,6 +5488,7 @@ async fn render_lan_decoded_frame(
     if let Some(enqueue_gap_ms) = enqueue_gap_ms {
         let mut pipelines = app_state.media_pipelines.lock().await;
         pipelines.set_render_pacing_target_fps(session_id.clone(), render_pacing_target_fps);
+        pipelines.set_render_queue_policy(session_id.clone(), Some(render_queue_policy.as_str()));
         pipelines.record_stage_duration_ms(
             session_id.clone(),
             "render_enqueue_gap",
@@ -5439,6 +5500,11 @@ async fn render_lan_decoded_frame(
             .lock()
             .await
             .set_render_pacing_target_fps(session_id.clone(), render_pacing_target_fps);
+        app_state
+            .media_pipelines
+            .lock()
+            .await
+            .set_render_queue_policy(session_id.clone(), Some(render_queue_policy.as_str()));
     }
     match enqueue {
         MediaRenderQueueEnqueue::Start(frame) => {
@@ -5449,6 +5515,9 @@ async fn render_lan_decoded_frame(
             pipelines.record_queue_depth(session_id.clone(), depth as u32);
             if replaced {
                 pipelines.increment_render_queue_replacements(session_id.clone(), 1);
+                if render_queue_policy == LanRenderQueuePolicy::Latest {
+                    pipelines.increment_render_stale_frame_drops(session_id.clone(), 1);
+                }
             }
         }
     }
@@ -5507,12 +5576,19 @@ async fn run_lan_render_worker(
     let mut timer_resolution = MediaTimerResolution::default();
     loop {
         let render_profile = selected_media_profile(&app_state, &session_id).await;
+        let render_queue_policy = lan_render_queue_policy_for_profile(&render_profile);
         if render_profile_requests_high_resolution_timer(&render_profile) {
             timer_resolution.request();
         } else {
             timer_resolution.release();
         }
-        pace_lan_render_frame(&app_state, &session_id, &render_profile).await;
+        pace_lan_render_frame(
+            &app_state,
+            &session_id,
+            &render_profile,
+            render_queue_policy,
+        )
+        .await;
         match render_lan_frame_once(app_state.clone(), session_id.clone(), frame).await {
             Ok(LanRenderTaskOutcome::Rendered {
                 upload_duration_ms,
@@ -5586,11 +5662,21 @@ async fn run_lan_render_worker(
             }
         }
 
-        let next_frame = app_state
-            .media_render_queues
-            .lock()
-            .await
-            .take_next_or_finish(&session_id);
+        let (next_frame, stale_drops) = {
+            let mut render_queues = app_state.media_render_queues.lock().await;
+            take_next_lan_render_frame_for_policy(
+                &mut render_queues,
+                &session_id,
+                render_queue_policy,
+            )
+        };
+        if stale_drops > 0 {
+            app_state
+                .media_pipelines
+                .lock()
+                .await
+                .increment_render_stale_frame_drops(session_id.clone(), stale_drops as u64);
+        }
         match next_frame {
             Some(next_frame) => {
                 let mut pipelines = app_state.media_pipelines.lock().await;
@@ -5614,8 +5700,9 @@ async fn pace_lan_render_frame(
     app_state: &Arc<AppState>,
     session_id: &SessionId,
     profile: &MediaProfile,
+    policy: LanRenderQueuePolicy,
 ) {
-    if !lan_render_pacing_enabled_for_profile(profile) {
+    if !lan_render_policy_allows_pacing(policy, profile) {
         return;
     }
 
@@ -5689,6 +5776,18 @@ async fn sleep_until_lan_render_frame(
         } else {
             std::hint::spin_loop();
         }
+    }
+}
+
+#[cfg(windows)]
+fn take_next_lan_render_frame_for_policy(
+    render_queues: &mut MediaRenderQueueRegistry,
+    session_id: &SessionId,
+    policy: LanRenderQueuePolicy,
+) -> (Option<RenderFrame>, usize) {
+    match policy {
+        LanRenderQueuePolicy::Latest => render_queues.take_latest_or_finish(session_id),
+        LanRenderQueuePolicy::PacedFifo => (render_queues.take_next_or_finish(session_id), 0),
     }
 }
 
@@ -12234,6 +12333,146 @@ mod tests {
         assert_eq!(lan_render_pacing_from_env_value(Some("off")), Some(false));
         assert_eq!(lan_render_pacing_from_env_value(Some("1")), Some(true));
         assert_eq!(lan_render_pacing_from_env_value(Some("true")), Some(true));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn render_queue_policy_env_parses_values() {
+        assert_eq!(lan_render_queue_policy_from_env_value(None), None);
+        assert_eq!(lan_render_queue_policy_from_env_value(Some("")), None);
+        assert_eq!(
+            lan_render_queue_policy_from_env_value(Some("latest")),
+            Some(LanRenderQueuePolicy::Latest)
+        );
+        assert_eq!(
+            lan_render_queue_policy_from_env_value(Some("low_latency")),
+            Some(LanRenderQueuePolicy::Latest)
+        );
+        assert_eq!(
+            lan_render_queue_policy_from_env_value(Some("paced_fifo")),
+            Some(LanRenderQueuePolicy::PacedFifo)
+        );
+        assert_eq!(
+            lan_render_queue_policy_from_env_value(Some("fifo")),
+            Some(LanRenderQueuePolicy::PacedFifo)
+        );
+        assert_eq!(
+            lan_render_queue_policy_from_env_value(Some("invalid")),
+            None
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn render_queue_policy_defaults_high_refresh_to_latest() {
+        let high_fps = MediaProfile {
+            width: 2560,
+            height: 1440,
+            fps: 144,
+            bitrate_mbps: 80,
+            codec: "hevc".to_string(),
+            ..MediaProfile::default()
+        };
+        let low_fps = MediaProfile {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            bitrate_mbps: 20,
+            codec: "h264".to_string(),
+            ..MediaProfile::default()
+        };
+
+        assert_eq!(
+            lan_render_queue_policy_for_profile_with_override(&high_fps, None),
+            LanRenderQueuePolicy::Latest
+        );
+        assert_eq!(
+            lan_render_queue_policy_for_profile_with_override(&low_fps, None),
+            LanRenderQueuePolicy::PacedFifo
+        );
+        assert_eq!(
+            lan_render_queue_policy_for_profile_with_override(
+                &high_fps,
+                Some(LanRenderQueuePolicy::PacedFifo)
+            ),
+            LanRenderQueuePolicy::PacedFifo
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn latest_render_queue_policy_skips_pacing_wait() {
+        let high_fps = MediaProfile {
+            width: 2560,
+            height: 1440,
+            fps: 144,
+            bitrate_mbps: 80,
+            codec: "hevc".to_string(),
+            ..MediaProfile::default()
+        };
+
+        assert!(!lan_render_policy_allows_pacing(
+            LanRenderQueuePolicy::Latest,
+            &high_fps
+        ));
+        assert!(lan_render_policy_allows_pacing(
+            LanRenderQueuePolicy::PacedFifo,
+            &high_fps
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn latest_render_queue_policy_takes_latest_and_reports_stale_drops() {
+        let mut registry = crate::app_state::MediaRenderQueueRegistry::default();
+        let session_id = SessionId("latest-render-policy-session".to_string());
+        let first = RenderFrame::from_rgb24(1, 1, vec![1, 2, 3]);
+        let second = RenderFrame::from_rgb24(1, 1, vec![4, 5, 6]);
+        let third = RenderFrame::from_rgb24(1, 1, vec![7, 8, 9]);
+        let fourth = RenderFrame::from_rgb24(1, 1, vec![10, 11, 12]);
+
+        match registry.enqueue_bounded(session_id.clone(), first, 3) {
+            MediaRenderQueueEnqueue::Start(_) => {}
+            other => panic!("expected render worker start, got {other:?}"),
+        }
+        registry.enqueue_bounded(session_id.clone(), second, 3);
+        registry.enqueue_bounded(session_id.clone(), third, 3);
+        registry.enqueue_bounded(session_id.clone(), fourth.clone(), 3);
+
+        let (next, dropped) = take_next_lan_render_frame_for_policy(
+            &mut registry,
+            &session_id,
+            LanRenderQueuePolicy::Latest,
+        );
+
+        assert_eq!(next, Some(fourth));
+        assert_eq!(dropped, 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn paced_fifo_render_queue_policy_takes_next_without_stale_drops() {
+        let mut registry = crate::app_state::MediaRenderQueueRegistry::default();
+        let session_id = SessionId("paced-render-policy-session".to_string());
+        let first = RenderFrame::from_rgb24(1, 1, vec![1, 2, 3]);
+        let second = RenderFrame::from_rgb24(1, 1, vec![4, 5, 6]);
+        let third = RenderFrame::from_rgb24(1, 1, vec![7, 8, 9]);
+
+        match registry.enqueue_bounded(session_id.clone(), first, 3) {
+            MediaRenderQueueEnqueue::Start(_) => {}
+            other => panic!("expected render worker start, got {other:?}"),
+        }
+        registry.enqueue_bounded(session_id.clone(), second.clone(), 3);
+        registry.enqueue_bounded(session_id.clone(), third, 3);
+
+        let (next, dropped) = take_next_lan_render_frame_for_policy(
+            &mut registry,
+            &session_id,
+            LanRenderQueuePolicy::PacedFifo,
+        );
+
+        assert_eq!(next, Some(second));
+        assert_eq!(dropped, 0);
     }
 
     #[cfg(windows)]
