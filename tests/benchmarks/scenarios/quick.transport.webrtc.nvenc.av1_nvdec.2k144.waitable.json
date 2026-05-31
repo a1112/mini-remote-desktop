@@ -11,6 +11,7 @@
   "fps": 144,
   "duration_secs": 20,
   "bitrate_bps": 80000000,
+  "av1_mode": "high_refresh",
   "pace_to_fps": true,
   "threshold_file": "transport.2k144.json",
   "d3d11_waitable_object": true,

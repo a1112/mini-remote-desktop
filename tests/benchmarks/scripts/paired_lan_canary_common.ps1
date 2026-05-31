@@ -318,7 +318,10 @@ function Convert-LocalSummaryToCanaryRow {
   )
 
   $status = if ($Summary.run_passed) { "completed" } else { "failed" }
-  $classification = if ($Summary.run_passed) { "completed" } elseif ($Summary.fps_observed -lt ($Profile.fps * 0.8)) { "threshold_miss" } else { "failed" }
+  $failureReason = [string](Select-CanaryValue $Summary.failure_reason "")
+  $isThresholdMiss = ($Summary.fps_observed -lt ($Profile.fps * 0.8)) -or
+    ($failureReason -match "exceeded|below|threshold|render present collapse")
+  $classification = if ($Summary.run_passed) { "completed" } elseif ($isThresholdMiss) { "threshold_miss" } else { "failed" }
   $localDropped = [int64](Select-CanaryValue $Summary.dropped_frames 0)
   $renderPresentP95 = Select-CanaryValue $Summary.render_present_p95_ms $null
 
@@ -359,6 +362,11 @@ function Convert-LocalSummaryToCanaryRow {
       transport = $Summary.send_write_p95_ms
       decode = $Summary.decode_total_p95_ms
       render_upload = $Summary.render_upload_p95_ms
+      render_submit_wait = $Summary.render_submit_wait_p95_ms
+      render_execute = $Summary.render_execute_p95_ms
+      render_prepare_wait = $Summary.render_prepare_wait_p95_ms
+      render_shared_resource = $Summary.render_shared_resource_p95_ms
+      render_draw_present = $Summary.render_draw_present_p95_ms
       render_present_gap = $renderPresentP95
       present = $renderPresentP95
     }
@@ -367,7 +375,7 @@ function Convert-LocalSummaryToCanaryRow {
     active_display_mode_summary = "-"
     requested_codec = Normalize-CanaryCodec $RequestedCodec
     active_codec = Normalize-CanaryCodec $RequestedCodec
-    error_message = $null
+    error_message = if ($Summary.run_passed) { $null } else { Select-CanaryValue $Summary.failure_reason $null }
   }
 }
 
@@ -1020,6 +1028,9 @@ function Write-CanaryJsonAndMarkdown {
     $lines += ""
     $lines += "- Codec: $($Report.codec_request.codec)"
     $lines += "- CodecProfile: $(if ($Report.codec_request.codec_profile) { $Report.codec_request.codec_profile } else { '-' })"
+    if ($Report.codec_request.av1_mode) {
+      $lines += "- Av1Mode: $($Report.codec_request.av1_mode)"
+    }
     $lines += "- BitDepth: $(if ($Report.codec_request.bit_depth) { $Report.codec_request.bit_depth } else { '-' })"
     $lines += "- ChromaSubsampling: $(if ($Report.codec_request.chroma_subsampling) { $Report.codec_request.chroma_subsampling } else { '-' })"
     $lines += "- PixelFormat: $(if ($Report.codec_request.pixel_format) { $Report.codec_request.pixel_format } else { '-' })"

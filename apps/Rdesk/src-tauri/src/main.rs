@@ -1323,12 +1323,16 @@ fn render_frame_from_png_data_url(data_url: &str) -> Result<mrd_render::RenderFr
         .map_err(|error| format!("decode remote preview data URL failed: {error}"))?;
     let image = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
         .map_err(|error| format!("decode remote preview PNG failed: {error}"))?
-        .to_rgb8();
+        .to_rgba8();
     let (width, height) = image.dimensions();
-    Ok(mrd_render::RenderFrame::from_rgb24(
+    let mut bgra = image.into_raw();
+    for pixel in bgra.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    Ok(mrd_render::RenderFrame::from_bgra32(
         width as usize,
         height as usize,
-        image.into_raw(),
+        bgra,
     ))
 }
 
@@ -2699,7 +2703,7 @@ mod frame_encoding_tests {
     }
 
     #[test]
-    fn png_data_url_is_decoded_as_rgb_render_frame() {
+    fn png_data_url_is_decoded_as_bgra_render_frame() {
         let image = image::RgbImage::from_raw(1, 1, vec![10, 20, 30]).unwrap();
         let mut png = std::io::Cursor::new(Vec::new());
         image::DynamicImage::ImageRgb8(image)
@@ -2714,8 +2718,8 @@ mod frame_encoding_tests {
 
         assert_eq!(frame.width, 1);
         assert_eq!(frame.height, 1);
-        assert_eq!(frame.pixel_format, mrd_render::RenderPixelFormat::Rgb24);
-        assert_eq!(frame.as_rgb24(), Some(&[10, 20, 30][..]));
+        assert_eq!(frame.pixel_format, mrd_render::RenderPixelFormat::Bgra32);
+        assert_eq!(frame.as_bgra32(), Some(&[30, 20, 10, 255][..]));
     }
 }
 

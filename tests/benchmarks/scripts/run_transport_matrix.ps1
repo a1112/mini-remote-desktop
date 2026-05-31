@@ -59,8 +59,14 @@ if (@($scenario.PSObject.Properties.Name) -contains "pace_to_fps") {
 } else {
   Remove-Item Env:MRD_BENCH_PACE_TO_FPS -ErrorAction SilentlyContinue
 }
+$av1Mode = Get-TransportMatrixAv1Mode -Scenario $scenario
+if ($null -ne $av1Mode) {
+  $env:MRD_BENCH_NVENC_AV1_MODE = $av1Mode
+} else {
+  Remove-Item Env:MRD_BENCH_NVENC_AV1_MODE -ErrorAction SilentlyContinue
+}
 $renderEnvironment = Get-TransportMatrixRenderEnvironment -Scenario $scenario
-foreach ($key in @("MRD_D3D11_RENDER_WAITABLE_OBJECT", "MRD_RENDER_THREAD_PRIORITY")) {
+foreach ($key in @("MRD_D3D11_RENDER_WAITABLE_OBJECT", "MRD_RENDER_THREAD_PRIORITY", "MRD_OPENGL_ALLOW_READBACK_FALLBACK")) {
   if ($renderEnvironment.ContainsKey($key)) {
     Set-Item -Path "Env:$key" -Value $renderEnvironment[$key]
   } else {

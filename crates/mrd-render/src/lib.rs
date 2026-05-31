@@ -267,6 +267,12 @@ pub struct RendererSnapshot {
     pub waitable_timeout_count: Option<u64>,
     /// Last waitable-object wait duration in milliseconds.
     pub last_waitable_wait_ms: Option<f64>,
+    /// Last render-frame waitable prepare duration in milliseconds.
+    pub last_render_prepare_wait_ms: Option<f64>,
+    /// Last shared texture/resource/SRV preparation duration in milliseconds.
+    pub last_render_shared_resource_ms: Option<f64>,
+    /// Last D3D draw/copy plus present duration in milliseconds.
+    pub last_render_draw_present_ms: Option<f64>,
     pub last_width: usize,
     pub last_height: usize,
     pub last_pixel_format: Option<RenderPixelFormat>,

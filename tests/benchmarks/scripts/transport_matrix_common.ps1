@@ -76,6 +76,42 @@ function Get-TransportMatrixBitrateBps {
   return $null
 }
 
+function Get-TransportMatrixAv1Mode {
+  param([object]$Scenario)
+
+  $propertyNames = @($Scenario.PSObject.Properties.Name)
+  $encodeBackend = if ($propertyNames -contains "encode_backend") {
+    ([string]$Scenario.encode_backend).ToLowerInvariant()
+  } else {
+    ""
+  }
+  if ($encodeBackend -notin @("nvenc_av1", "av1_nvenc", "nvenc-av1")) {
+    return $null
+  }
+
+  if (
+    $propertyNames -contains "av1_mode" -and
+    -not [string]::IsNullOrWhiteSpace([string]$Scenario.av1_mode)
+  ) {
+    $mode = ([string]$Scenario.av1_mode).Trim()
+    if ($mode -notin @("low_latency", "ultra_low_latency", "high_refresh")) {
+      throw "scenario av1_mode must be low_latency, ultra_low_latency, or high_refresh"
+    }
+    return $mode
+  }
+
+  $fps = if ($propertyNames -contains "fps" -and $null -ne $Scenario.fps) {
+    [int]$Scenario.fps
+  } else {
+    0
+  }
+  if ($fps -ge 120) {
+    return "high_refresh"
+  }
+
+  return $null
+}
+
 function Get-TransportMatrixRenderEnvironment {
   param([object]$Scenario)
 
@@ -105,6 +141,9 @@ function Get-TransportMatrixRenderEnvironment {
     $result.MRD_RENDER_THREAD_PRIORITY = [string]$Scenario.render_thread_priority
   } elseif ($highRefreshD3d11) {
     $result.MRD_RENDER_THREAD_PRIORITY = "above_normal"
+  }
+  if ($propertyNames -contains "opengl_allow_readback_fallback") {
+    $result.MRD_OPENGL_ALLOW_READBACK_FALLBACK = if ($Scenario.opengl_allow_readback_fallback) { "1" } else { "0" }
   }
   return $result
 }

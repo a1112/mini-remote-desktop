@@ -12,6 +12,8 @@ param(
   [ValidateSet("h264", "hevc", "av1")]
   [string]$Codec = "h264",
   [string]$CodecProfile = "",
+  [ValidateSet("low_latency", "ultra_low_latency", "high_refresh")]
+  [string]$Av1Mode = "high_refresh",
   [int]$BitDepth = 0,
   [string]$ChromaSubsampling = "",
   [string]$PixelFormat = "",
@@ -194,7 +196,7 @@ function Get-IPv4BroadcastAddress([string]$IPAddress, [int]$PrefixLength) {
   [System.Net.IPAddress]::new($broadcast).ToString()
 }
 
-function Invoke-LocalCanaryProfile($Repo, $Profile, $GitCommit, [string]$Codec, [bool]$ReleaseBenchmark = $true) {
+function Invoke-LocalCanaryProfile($Repo, $Profile, $GitCommit, [string]$Codec, [string]$Av1Mode, [bool]$ReleaseBenchmark = $true) {
   $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
   $date = Get-Date -Format 'yyyy-MM-dd'
   $runId = "paired-local-$($Profile.id)-$timestamp-$GitCommit"
@@ -222,6 +224,7 @@ function Invoke-LocalCanaryProfile($Repo, $Profile, $GitCommit, [string]$Codec, 
     Set-EnvVar "MRD_BENCH_DECODE_BACKEND" $backends.local_decoder $savedEnv
     Set-EnvVar "MRD_BENCH_RENDERER_BACKEND" "d3d11_shared" $savedEnv
     Set-EnvVar "MRD_BENCH_BITRATE_BPS" ([string]([int64]$Profile.bitrate_mbps * 1000000)) $savedEnv
+    Set-EnvVar "MRD_BENCH_NVENC_AV1_MODE" $Av1Mode $savedEnv
 
     $stdout = Join-Path $logsDir "host.stdout.log"
     $stderr = Join-Path $logsDir "host.stderr.log"
@@ -234,7 +237,18 @@ function Invoke-LocalCanaryProfile($Repo, $Profile, $GitCommit, [string]$Codec, 
       throw "local canary cargo test failed for $($Profile.id), see $stderr"
     }
 
-    powershell -ExecutionPolicy Bypass -File (Join-Path $Repo "tests/benchmarks/scripts/summarize_transport_results.ps1") -RunDir $runDir
+    $summarizeArgs = @(
+      "-ExecutionPolicy", "Bypass",
+      "-File", (Join-Path $Repo "tests/benchmarks/scripts/summarize_transport_results.ps1"),
+      "-RunDir", $runDir
+    )
+    if ([string]$Profile.id -match "^2k144") {
+      $thresholdPath = Join-Path $Repo "tests/benchmarks/thresholds/transport.2k144.json"
+      if (Test-Path $thresholdPath) {
+        $summarizeArgs += @("-ThresholdPath", $thresholdPath)
+      }
+    }
+    powershell @summarizeArgs
     $summaryPath = Join-Path $runDir "summary.json"
     $summary = Get-Content $summaryPath -Raw | ConvertFrom-Json
     Convert-LocalSummaryToCanaryRow -Profile $Profile -Summary $summary -SummaryPath $summaryPath -RequestedCodec $Codec
@@ -396,7 +410,7 @@ $localRows = @()
 if (-not $SkipLocal) {
   foreach ($profile in $profiles) {
     Write-Host "Running local canary $($profile.id)"
-    $localRows += Invoke-LocalCanaryProfile -Repo $repo -Profile $profile -GitCommit $gitCommit -Codec $Codec -ReleaseBenchmark:(-not $DebugLocalBenchmark)
+    $localRows += Invoke-LocalCanaryProfile -Repo $repo -Profile $profile -GitCommit $gitCommit -Codec $Codec -Av1Mode $Av1Mode -ReleaseBenchmark:(-not $DebugLocalBenchmark)
   }
 }
 
@@ -419,14 +433,17 @@ if (-not $SkipCross) {
 
 $localReport = New-PairedLanCanaryReport -Mode "local" -Rows $localRows -GitCommit $gitCommit -Codec $Codec
 $crossReport = New-PairedLanCanaryReport -Mode "cross" -Rows $crossRows -GitCommit $gitCommit -Codec $Codec
-$crossReport | Add-Member -Force -NotePropertyName "codec_request" -NotePropertyValue ([pscustomobject]@{
+$codecRequest = [pscustomobject]@{
   codec = $Codec
   codec_profile = if ($CodecProfile.Trim()) { $CodecProfile.Trim() } else { $null }
   bit_depth = if ($BitDepth -gt 0) { $BitDepth } else { $null }
   chroma_subsampling = if ($ChromaSubsampling.Trim()) { $ChromaSubsampling.Trim() } else { $null }
   pixel_format = if ($PixelFormat.Trim()) { $PixelFormat.Trim() } else { $null }
   hdr_enabled = $HdrEnabled
-})
+  av1_mode = $Av1Mode
+}
+$localReport | Add-Member -Force -NotePropertyName "codec_request" -NotePropertyValue $codecRequest
+$crossReport | Add-Member -Force -NotePropertyName "codec_request" -NotePropertyValue $codecRequest
 $crossReport | Add-Member -Force -NotePropertyName "render_max_fps_override" -NotePropertyValue $(if ($RenderMaxFps -gt 0) { $RenderMaxFps } else { $null })
 $comparisonRows = @(Compare-PairedLanCanaryRows -LocalRows $localRows -CrossRows $crossRows -RatioThreshold $RatioThreshold)
 

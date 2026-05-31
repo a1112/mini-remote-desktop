@@ -2406,20 +2406,20 @@ impl TestOrchestrator {
                 data,
                 y_pitch,
                 uv_pitch,
-            } => RenderFrame::from_rgb24(
+            } => RenderFrame::from_bgra32(
                 frame.width,
                 frame.height,
-                Self::cpu_i420_to_rgb24(data, frame.width, frame.height, *y_pitch, *uv_pitch),
+                Self::cpu_i420_to_bgra32(data, frame.width, frame.height, *y_pitch, *uv_pitch),
             ),
-            DecodedFrameData::CpuNv12 { data, pitch } => RenderFrame::from_rgb24(
+            DecodedFrameData::CpuNv12 { data, pitch } => RenderFrame::from_bgra32(
                 frame.width,
                 frame.height,
-                Self::cpu_nv12_to_rgb24(data, frame.width, frame.height, *pitch),
+                Self::cpu_nv12_to_bgra32(data, frame.width, frame.height, *pitch),
             ),
-            DecodedFrameData::CpuP010 { data, pitch } => RenderFrame::from_rgb24(
+            DecodedFrameData::CpuP010 { data, pitch } => RenderFrame::from_bgra32(
                 frame.width,
                 frame.height,
-                Self::cpu_p010_to_rgb24(data, frame.width, frame.height, *pitch),
+                Self::cpu_p010_to_bgra32(data, frame.width, frame.height, *pitch),
             ),
             #[cfg(windows)]
             DecodedFrameData::D3D11SharedNv12 {
@@ -2473,89 +2473,262 @@ impl TestOrchestrator {
         rgb
     }
 
-    fn cpu_i420_to_rgb24(
+    fn cpu_nv12_to_bgra32(nv12: &[u8], width: usize, height: usize, pitch: usize) -> Vec<u8> {
+        let mut bgra = vec![0_u8; width * height * 4];
+        let uv_base = pitch * height;
+
+        for y in (0..height).step_by(2) {
+            let y0_row = y * pitch;
+            let y1_row = (y + 1).min(height.saturating_sub(1)) * pitch;
+            let uv_row_start = uv_base + (y / 2) * pitch;
+            let out0_row = y * width * 4;
+            let out1_row = (y + 1).min(height.saturating_sub(1)) * width * 4;
+
+            for x in (0..width).step_by(2) {
+                let uv_offset = uv_row_start + (x / 2) * 2;
+                if uv_offset + 1 >= nv12.len() {
+                    continue;
+                }
+
+                let u = nv12[uv_offset];
+                let v = nv12[uv_offset + 1];
+                let y0_offset = y0_row + x;
+                if y0_offset < nv12.len() {
+                    Self::write_limited_bgra_pixel(
+                        &mut bgra,
+                        out0_row + x * 4,
+                        nv12[y0_offset],
+                        u,
+                        v,
+                    );
+                }
+                if x + 1 < width {
+                    let y0_next = y0_offset + 1;
+                    if y0_next < nv12.len() {
+                        Self::write_limited_bgra_pixel(
+                            &mut bgra,
+                            out0_row + (x + 1) * 4,
+                            nv12[y0_next],
+                            u,
+                            v,
+                        );
+                    }
+                }
+                if y + 1 < height {
+                    let y1_offset = y1_row + x;
+                    if y1_offset < nv12.len() {
+                        Self::write_limited_bgra_pixel(
+                            &mut bgra,
+                            out1_row + x * 4,
+                            nv12[y1_offset],
+                            u,
+                            v,
+                        );
+                    }
+                    if x + 1 < width {
+                        let y1_next = y1_offset + 1;
+                        if y1_next < nv12.len() {
+                            Self::write_limited_bgra_pixel(
+                                &mut bgra,
+                                out1_row + (x + 1) * 4,
+                                nv12[y1_next],
+                                u,
+                                v,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        bgra
+    }
+
+    fn cpu_i420_to_bgra32(
         i420: &[u8],
         width: usize,
         height: usize,
         y_pitch: usize,
         uv_pitch: usize,
     ) -> Vec<u8> {
-        let mut rgb = vec![0_u8; width * height * 3];
+        let mut bgra = vec![0_u8; width * height * 4];
         let chroma_height = height.div_ceil(2);
         let u_base = y_pitch * height;
         let v_base = u_base + uv_pitch * chroma_height;
-        let mut out_idx = 0;
 
-        for y in 0..height {
-            let y_row_start = y * y_pitch;
+        for y in (0..height).step_by(2) {
+            let y0_row = y * y_pitch;
+            let y1_row = (y + 1).min(height.saturating_sub(1)) * y_pitch;
             let uv_row_start = (y / 2) * uv_pitch;
-            for x in 0..width {
-                let y_offset = y_row_start + x;
-                let u_offset = u_base + uv_row_start + x / 2;
-                let v_offset = v_base + uv_row_start + x / 2;
-                if y_offset >= i420.len() || u_offset >= i420.len() || v_offset >= i420.len() {
-                    out_idx += 3;
+            let out0_row = y * width * 4;
+            let out1_row = (y + 1).min(height.saturating_sub(1)) * width * 4;
+
+            for x in (0..width).step_by(2) {
+                let uv_offset = uv_row_start + x / 2;
+                let u_offset = u_base + uv_offset;
+                let v_offset = v_base + uv_offset;
+                if u_offset >= i420.len() || v_offset >= i420.len() {
                     continue;
                 }
 
-                let y_sample = i420[y_offset] as i32 - 16;
-                let u = i420[u_offset] as i32 - 128;
-                let v = i420[v_offset] as i32 - 128;
-
-                let r = (298 * y_sample + 409 * v + 128) >> 8;
-                let g = (298 * y_sample - 100 * u - 208 * v + 128) >> 8;
-                let b = (298 * y_sample + 516 * u + 128) >> 8;
-
-                rgb[out_idx] = r.clamp(0, 255) as u8;
-                rgb[out_idx + 1] = g.clamp(0, 255) as u8;
-                rgb[out_idx + 2] = b.clamp(0, 255) as u8;
-                out_idx += 3;
+                let u = i420[u_offset];
+                let v = i420[v_offset];
+                let y0_offset = y0_row + x;
+                if y0_offset < i420.len() {
+                    Self::write_limited_bgra_pixel(
+                        &mut bgra,
+                        out0_row + x * 4,
+                        i420[y0_offset],
+                        u,
+                        v,
+                    );
+                }
+                if x + 1 < width {
+                    let y0_next = y0_offset + 1;
+                    if y0_next < i420.len() {
+                        Self::write_limited_bgra_pixel(
+                            &mut bgra,
+                            out0_row + (x + 1) * 4,
+                            i420[y0_next],
+                            u,
+                            v,
+                        );
+                    }
+                }
+                if y + 1 < height {
+                    let y1_offset = y1_row + x;
+                    if y1_offset < i420.len() {
+                        Self::write_limited_bgra_pixel(
+                            &mut bgra,
+                            out1_row + x * 4,
+                            i420[y1_offset],
+                            u,
+                            v,
+                        );
+                    }
+                    if x + 1 < width {
+                        let y1_next = y1_offset + 1;
+                        if y1_next < i420.len() {
+                            Self::write_limited_bgra_pixel(
+                                &mut bgra,
+                                out1_row + (x + 1) * 4,
+                                i420[y1_next],
+                                u,
+                                v,
+                            );
+                        }
+                    }
+                }
             }
         }
 
-        rgb
+        bgra
     }
 
-    fn cpu_p010_to_rgb24(p010: &[u8], width: usize, height: usize, pitch: usize) -> Vec<u8> {
-        let mut rgb = vec![0_u8; width * height * 3];
+    fn cpu_p010_to_bgra32(p010: &[u8], width: usize, height: usize, pitch: usize) -> Vec<u8> {
+        let mut bgra = vec![0_u8; width * height * 4];
         let uv_base = pitch * height;
-        let mut out_idx = 0;
 
-        for y in 0..height {
+        for y in (0..height).step_by(2) {
+            let y0_row = y * pitch;
+            let y1_row = (y + 1).min(height.saturating_sub(1)) * pitch;
             let uv_row_start = uv_base + (y / 2) * pitch;
-            for x in 0..width {
-                let y_offset = y * pitch + x * 2;
+            let out0_row = y * width * 4;
+            let out1_row = (y + 1).min(height.saturating_sub(1)) * width * 4;
+
+            for x in (0..width).step_by(2) {
                 let uv_offset = uv_row_start + (x / 2) * 4;
-                if y_offset + 1 >= p010.len() || uv_offset + 3 >= p010.len() {
-                    out_idx += 3;
+                if uv_offset + 3 >= p010.len() {
                     continue;
                 }
 
-                let y_sample =
-                    (u16::from_le_bytes([p010[y_offset], p010[y_offset + 1]]) >> 6) as i32;
-                let u =
-                    (u16::from_le_bytes([p010[uv_offset], p010[uv_offset + 1]]) >> 6) as i32 - 512;
-                let v = (u16::from_le_bytes([p010[uv_offset + 2], p010[uv_offset + 3]]) >> 6)
-                    as i32
-                    - 512;
-
-                let r = y_sample + ((1436 * v) >> 10);
-                let g = y_sample - ((352 * u + 731 * v) >> 10);
-                let b = y_sample + ((1815 * u) >> 10);
-
-                rgb[out_idx] = Self::clamp_10bit_to_8bit(r);
-                rgb[out_idx + 1] = Self::clamp_10bit_to_8bit(g);
-                rgb[out_idx + 2] = Self::clamp_10bit_to_8bit(b);
-                out_idx += 3;
+                let u10 = u16::from_le_bytes([p010[uv_offset], p010[uv_offset + 1]]) >> 6;
+                let v10 = u16::from_le_bytes([p010[uv_offset + 2], p010[uv_offset + 3]]) >> 6;
+                let y0_offset = y0_row + x * 2;
+                if y0_offset + 1 < p010.len() {
+                    let y10 = u16::from_le_bytes([p010[y0_offset], p010[y0_offset + 1]]) >> 6;
+                    Self::write_p010_bgra_pixel(&mut bgra, out0_row + x * 4, y10, u10, v10);
+                }
+                if x + 1 < width {
+                    let y0_next = y0_offset + 2;
+                    if y0_next + 1 < p010.len() {
+                        let y10 = u16::from_le_bytes([p010[y0_next], p010[y0_next + 1]]) >> 6;
+                        Self::write_p010_bgra_pixel(
+                            &mut bgra,
+                            out0_row + (x + 1) * 4,
+                            y10,
+                            u10,
+                            v10,
+                        );
+                    }
+                }
+                if y + 1 < height {
+                    let y1_offset = y1_row + x * 2;
+                    if y1_offset + 1 < p010.len() {
+                        let y10 = u16::from_le_bytes([p010[y1_offset], p010[y1_offset + 1]]) >> 6;
+                        Self::write_p010_bgra_pixel(&mut bgra, out1_row + x * 4, y10, u10, v10);
+                    }
+                    if x + 1 < width {
+                        let y1_next = y1_offset + 2;
+                        if y1_next + 1 < p010.len() {
+                            let y10 = u16::from_le_bytes([p010[y1_next], p010[y1_next + 1]]) >> 6;
+                            Self::write_p010_bgra_pixel(
+                                &mut bgra,
+                                out1_row + (x + 1) * 4,
+                                y10,
+                                u10,
+                                v10,
+                            );
+                        }
+                    }
+                }
             }
         }
 
-        rgb
+        bgra
+    }
+
+    #[inline]
+    fn write_limited_bgra_pixel(bgra: &mut [u8], offset: usize, y: u8, u: u8, v: u8) {
+        if offset + 3 >= bgra.len() {
+            return;
+        }
+        let y_sample = y as i32 - 16;
+        let u = u as i32 - 128;
+        let v = v as i32 - 128;
+
+        let r = (298 * y_sample + 409 * v + 128) >> 8;
+        let g = (298 * y_sample - 100 * u - 208 * v + 128) >> 8;
+        let b = (298 * y_sample + 516 * u + 128) >> 8;
+
+        bgra[offset] = b.clamp(0, 255) as u8;
+        bgra[offset + 1] = g.clamp(0, 255) as u8;
+        bgra[offset + 2] = r.clamp(0, 255) as u8;
+        bgra[offset + 3] = 255;
+    }
+
+    #[inline]
+    fn write_p010_bgra_pixel(bgra: &mut [u8], offset: usize, y10: u16, u10: u16, v10: u16) {
+        if offset + 3 >= bgra.len() {
+            return;
+        }
+        let y_sample = y10 as i32;
+        let u = u10 as i32 - 512;
+        let v = v10 as i32 - 512;
+
+        let r = y_sample + ((1436 * v) >> 10);
+        let g = y_sample - ((352 * u + 731 * v) >> 10);
+        let b = y_sample + ((1815 * u) >> 10);
+
+        bgra[offset] = Self::clamp_10bit_to_8bit(b);
+        bgra[offset + 1] = Self::clamp_10bit_to_8bit(g);
+        bgra[offset + 2] = Self::clamp_10bit_to_8bit(r);
+        bgra[offset + 3] = 255;
     }
 
     #[inline]
     fn clamp_10bit_to_8bit(value: i32) -> u8 {
-        ((value.clamp(0, 1023) + 2) >> 2) as u8
+        (((value.clamp(0, 1023) + 2) >> 2).min(255)) as u8
     }
 
     /// Stop a running test

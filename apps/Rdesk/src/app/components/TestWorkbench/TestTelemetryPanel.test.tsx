@@ -39,7 +39,7 @@ describe("TestTelemetryPanel", () => {
     expect(await screen.findByText("e2e.local")).toBeInTheDocument();
     expect(screen.getByText("Capture FPS")).toBeInTheDocument();
     expect(screen.getByText("Decode Latency P95")).toBeInTheDocument();
-    expect(screen.getByText("单位：fps")).toBeInTheDocument();
+    expect(await screen.findByText("单位：fps")).toBeInTheDocument();
 
     const sourceSelect = screen.getByLabelText("测试日志");
     await userEvent.selectOptions(sourceSelect, "raw_log");

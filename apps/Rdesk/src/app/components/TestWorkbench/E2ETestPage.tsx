@@ -18,6 +18,7 @@ import {
   environmentSnapshotFromCapabilitySnapshot,
   type CapabilitySnapshot,
 } from "../../services/capabilityMatrix";
+import { RenderBreakdownMetrics } from "../RenderBreakdownMetrics";
 
 function buildDefaultConfig(capabilities: EnvironmentSnapshot | null): TestConfig {
   const capture = chooseCapability(
@@ -505,6 +506,8 @@ export function E2ETestPage() {
           />
         </section>
       )}
+
+      {metrics && <RenderBreakdownMetrics metrics={metrics} />}
 
       {/* Frame Display */}
       <section className="bg-card rounded-lg border p-4">

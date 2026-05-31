@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use mrd_decode::PixelFormat;
 use mrd_pipeline_core::{DecodedFrame, DecodedFrameData};
@@ -18,9 +18,9 @@ pub struct DecodedFrameSnapshot {
 #[derive(Debug, Default)]
 pub struct DecodedFrameSink {
     snapshots: HashMap<SessionId, DecodedFrameSnapshot>,
-    latest_frames: HashMap<SessionId, DecodedFrame>,
+    latest_frames: HashMap<SessionId, Arc<DecodedFrame>>,
     source_snapshots: HashMap<(SessionId, String), DecodedFrameSnapshot>,
-    latest_source_frames: HashMap<(SessionId, String), DecodedFrame>,
+    latest_source_frames: HashMap<(SessionId, String), Arc<DecodedFrame>>,
 }
 
 #[allow(dead_code)]
@@ -55,7 +55,9 @@ impl DecodedFrameSink {
                 bytes,
             },
         );
-        self.latest_frames.insert(session_id.clone(), frame.clone());
+        let frame = Arc::new(frame);
+        self.latest_frames
+            .insert(session_id.clone(), Arc::clone(&frame));
 
         let source_key = (session_id.clone(), source_id);
         let source_frame_count = self
@@ -81,7 +83,7 @@ impl DecodedFrameSink {
     }
 
     pub fn latest_frame(&self, session_id: &SessionId) -> Option<&DecodedFrame> {
-        self.latest_frames.get(session_id)
+        self.latest_frames.get(session_id).map(Arc::as_ref)
     }
 
     pub fn source_snapshot(
@@ -100,6 +102,7 @@ impl DecodedFrameSink {
     ) -> Option<&DecodedFrame> {
         self.latest_source_frames
             .get(&(session_id.clone(), source_id.to_string()))
+            .map(Arc::as_ref)
     }
 
     pub fn list_sources(&self, session_id: &SessionId) -> Vec<String> {
@@ -206,6 +209,34 @@ mod tests {
         assert_eq!(
             sink.list_sources(&session_id),
             vec!["video-track-1".to_string()]
+        );
+    }
+}
+#[cfg(test)]
+mod storage_tests {
+    use super::{DecodedFrameSink, DEFAULT_SOURCE_ID};
+    use mrd_pipeline_core::DecodedFrame;
+    use mrd_proto::SessionId;
+
+    #[test]
+    fn default_source_latest_frame_reuses_session_frame_storage() {
+        let mut sink = DecodedFrameSink::default();
+        let session_id = SessionId("session-1".into());
+        sink.ingest_frame(
+            session_id.clone(),
+            DecodedFrame::from_cpu_rgb24(4, 4, 0, vec![7; 4 * 4 * 3]),
+        );
+
+        let latest = sink
+            .latest_frame(&session_id)
+            .expect("session latest frame");
+        let source_latest = sink
+            .latest_frame_for_source(&session_id, DEFAULT_SOURCE_ID)
+            .expect("source latest frame");
+
+        assert_eq!(
+            latest.cpu_bytes().unwrap().as_ptr(),
+            source_latest.cpu_bytes().unwrap().as_ptr()
         );
     }
 }

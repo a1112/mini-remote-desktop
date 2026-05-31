@@ -81,12 +81,60 @@ $localSummaryRow = Convert-LocalSummaryToCanaryRow `
     decode_total_p95_ms = 1.41
     frame_sink_ingest_p95_ms = 4.0
     render_upload_p95_ms = 0.25
+    render_submit_wait_p95_ms = 0.07
+    render_execute_p95_ms = 0.18
+    render_prepare_wait_p95_ms = 0.02
+    render_shared_resource_p95_ms = 0.09
+    render_draw_present_p95_ms = 0.11
     render_present_p95_ms = 8.01
   }) `
   -SummaryPath "raw/local-2k144.json"
 Assert-Equal $localSummaryRow.stage_p95_ms.'render_present_gap' 8.01 "Local summary exposes render present as canonical present-gap P95"
 Assert-Equal $localSummaryRow.render_present_gap_p95_ms 8.01 "Local summary carries render_present_gap_p95_ms for reports"
 Assert-Equal $localSummaryRow.stage_p95_ms.present 8.01 "Local summary keeps present P95 compatibility alias"
+Assert-Equal $localSummaryRow.stage_p95_ms.'render_submit_wait' 0.07 "Local summary exposes render submit wait P95"
+Assert-Equal $localSummaryRow.stage_p95_ms.'render_execute' 0.18 "Local summary exposes renderer execute P95"
+Assert-Equal $localSummaryRow.stage_p95_ms.'render_prepare_wait' 0.02 "Local summary exposes render prepare wait P95"
+Assert-Equal $localSummaryRow.stage_p95_ms.'render_shared_resource' 0.09 "Local summary exposes render shared resource P95"
+Assert-Equal $localSummaryRow.stage_p95_ms.'render_draw_present' 0.11 "Local summary exposes render draw/present P95"
+
+$failedLocalSummaryRow = Convert-LocalSummaryToCanaryRow `
+  -Profile ([pscustomobject]@{ id = "2k144"; width = 2560; height = 1440; fps = 144; bitrate_mbps = 80; duration_secs = 20 }) `
+  -Summary ([pscustomobject]@{
+    run_passed = $false
+    failure_reason = "render present collapse: presented 3 of 654 render frames, minimum 65"
+    fps_observed = 106.8
+    width = 2560
+    height = 1440
+    fps_target = 144
+    session_established = $true
+    first_frame_seen = $true
+    first_frame_time_ms = 384.0
+    dropped_frames = 0
+    encode_total_p95_ms = 5.8
+    send_write_p95_ms = 0.2
+    decode_total_p95_ms = 6.1
+    render_present_p95_ms = 537.4
+  }) `
+  -SummaryPath "raw/local-2k144-failed.json"
+Assert-Equal $failedLocalSummaryRow.error_message "render present collapse: presented 3 of 654 render frames, minimum 65" "Failed local canary rows carry benchmark failure reason"
+
+$localThresholdMissRow = Convert-LocalSummaryToCanaryRow `
+  -Profile ([pscustomobject]@{ id = "2k144"; width = 2560; height = 1440; fps = 144; bitrate_mbps = 80; duration_secs = 20 }) `
+  -Summary ([pscustomobject]@{
+    run_passed = $false
+    failure_reason = "render execute p95 16.5ms exceeded 8.0ms"
+    fps_observed = 143.0
+    width = 2560
+    height = 1440
+    fps_target = 144
+    session_established = $true
+    first_frame_seen = $true
+    first_frame_time_ms = 120.0
+    dropped_frames = 0
+  }) `
+  -SummaryPath "raw/local-2k144-threshold.json"
+Assert-Equal $localThresholdMissRow.classification "threshold_miss" "Failed local threshold breaches are classified as threshold misses"
 
 $localRow = [pscustomobject]@{
   id = "1080p144"
@@ -678,6 +726,14 @@ $localDualScript = Get-Content -Path (Join-Path $scriptDir "run_local_dual_proce
 $pairedLanScript = Get-Content -Path (Join-Path $scriptDir "run_paired_lan_canary.ps1") -Raw
 Assert-True ($pairedLanScript -match 'ValidateSet\("h264", "hevc", "av1"\)') "Paired LAN canary accepts AV1 codec selection"
 Assert-True ($localDualScript -match 'ValidateSet\("h264", "hevc", "av1"\)') "Local dual canary accepts AV1 codec selection"
+Assert-True ($pairedLanScript -match 'ValidateSet\("low_latency", "ultra_low_latency", "high_refresh"\)') "Paired LAN canary accepts AV1 mode selection"
+Assert-True ($localDualScript -match 'ValidateSet\("low_latency", "ultra_low_latency", "high_refresh"\)') "Local dual canary accepts AV1 mode selection"
+Assert-True ($pairedLanScript -match '\[string\]\$Av1Mode = "high_refresh"') "Paired LAN canary defaults AV1 to the stable high-refresh mode"
+Assert-True ($localDualScript -match '\[string\]\$Av1Mode = "high_refresh"') "Local dual canary defaults AV1 to the stable high-refresh mode"
+Assert-True ($pairedLanScript -match 'MRD_BENCH_NVENC_AV1_MODE') "Paired LAN local benchmark forwards AV1 mode to the harness"
+Assert-True ($pairedLanScript -match 'transport\.2k144\.json') "Paired LAN local 2K144 benchmark uses the 2K144 threshold profile"
+Assert-True ($pairedLanScript -match '-ThresholdPath') "Paired LAN local benchmark passes threshold files to the summarizer"
+Assert-True ($pairedLanScript -match '\$localReport \| Add-Member -Force -NotePropertyName "codec_request"') "Paired LAN local report records codec request metadata"
 Assert-True ($localDualScript -match "cargo build -p mrd-service") "Local dual canary prebuilds the service executable"
 Assert-True ($localDualScript -match "cargo build -p app --no-default-features") "Local dual canary prebuilds the same Tauri shell target used by tauri dev"
 Assert-True ($localDualScript -match "CARGO_TARGET_DIR") "Local dual canary keeps prebuild and Tauri dev on the same cargo target"

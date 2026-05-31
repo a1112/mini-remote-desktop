@@ -57,6 +57,33 @@ Assert-ArrayEqual $debugCargoArgs @("test", "-p", "app", "benchmark_run_writes_r
 $vvcCargoArgs = Get-TransportMatrixCargoTestArgs -EncodeBackend "software_vvc" -DecodeBackend "software_vvc"
 Assert-ArrayEqual $vvcCargoArgs @("test", "--release", "-p", "app", "--features", "production-vvc-software-codec", "benchmark_run_writes_requested_artifacts", "--", "--nocapture") "Transport benchmark cargo args should preserve codec feature flags"
 
+$explicitAv1Mode = Get-TransportMatrixAv1Mode -Scenario ([pscustomobject]@{ encode_backend = "nvenc_av1"; av1_mode = "ultra_low_latency"; fps = 144 })
+if ($explicitAv1Mode -ne "ultra_low_latency") { throw "transport matrix should preserve explicit AV1 mode" }
+
+$highRefreshAv1Mode = Get-TransportMatrixAv1Mode -Scenario ([pscustomobject]@{ encode_backend = "nvenc_av1"; fps = 144 })
+if ($highRefreshAv1Mode -ne "high_refresh") { throw "transport matrix should default high-refresh AV1 runs to high_refresh mode" }
+
+$defaultAv1Mode = Get-TransportMatrixAv1Mode -Scenario ([pscustomobject]@{ encode_backend = "nvenc_av1"; fps = 60 })
+if ($null -ne $defaultAv1Mode) { throw "transport matrix should leave non-high-refresh AV1 mode at harness default" }
+
+$nonAv1Mode = Get-TransportMatrixAv1Mode -Scenario ([pscustomobject]@{ encode_backend = "nvenc"; fps = 144 })
+if ($null -ne $nonAv1Mode) { throw "transport matrix should not set AV1 mode for non-AV1 encoders" }
+
+$threshold2k144 = Get-Content (Join-Path $repoRoot "tests/benchmarks/thresholds/transport.2k144.json") -Raw | ConvertFrom-Json
+foreach ($thresholdName in @(
+  "max_render_execute_p95_ms",
+  "max_render_prepare_wait_p95_ms",
+  "max_render_shared_resource_p95_ms",
+  "max_render_draw_present_p95_ms"
+)) {
+  if (-not ($threshold2k144.PSObject.Properties.Name -contains $thresholdName)) {
+    throw "transport.2k144.json must include $thresholdName"
+  }
+  if ([double]$threshold2k144.$thresholdName -le 0) {
+    throw "transport.2k144.json $thresholdName must be positive"
+  }
+}
+
 $bitrateBps = Get-TransportMatrixBitrateBps -Scenario ([pscustomobject]@{ bitrate_bps = 12000000 })
 if ($bitrateBps -ne "12000000") {
   throw "bitrate_bps scenario field should pass through unchanged"
@@ -143,6 +170,7 @@ $scenarioSpecs = @(
     transport = "webrtc"
     encode = "nvenc_av1"
     decode = "nvdec_av1"
+    av1_mode = "high_refresh"
   },
   [pscustomobject]@{
     path = "tests/benchmarks/scenarios/quick.transport.webrtc.software_vvc.2k144.json"
@@ -165,6 +193,7 @@ foreach ($spec in $scenarioSpecs) {
   if ($scenario.encode_backend -ne $spec.encode) { throw "$($spec.path) encode backend mismatch" }
   if ($scenario.decode_backend -ne $spec.decode) { throw "$($spec.path) decode backend mismatch" }
   if ($spec.PSObject.Properties.Name -contains "threshold_file" -and $scenario.threshold_file -ne $spec.threshold_file) { throw "$($spec.path) threshold file mismatch" }
+  if ($spec.PSObject.Properties.Name -contains "av1_mode" -and $scenario.av1_mode -ne $spec.av1_mode) { throw "$($spec.path) AV1 mode mismatch" }
   if ($scenario.width -ne 2560 -or $scenario.height -ne 1440) { throw "$($spec.path) should be 2560x1440" }
   if ($spec.path -like "*.2k144*.json") {
     if ($scenario.fps -ne 144) { throw "$($spec.path) should target 144fps" }
@@ -269,6 +298,11 @@ try {
     decode_total_p95_ms = 1.5
     frame_sink_ingest_p95_ms = 2.0
     render_upload_p95_ms = 0.2
+    render_submit_wait_p95_ms = 0.03
+    render_execute_p95_ms = 0.17
+    render_prepare_wait_p95_ms = 0.01
+    render_shared_resource_p95_ms = 0.06
+    render_draw_present_p95_ms = 0.11
     render_present_p95_ms = 8.0
     render_submitted_frames = 2849
     render_uploaded_frames = 2841
@@ -295,12 +329,18 @@ try {
     duration_secs = 20
     git_commit = "abc123"
   } | ConvertTo-Json -Depth 8 | Set-Content -Path (Join-Path $summaryTmp "manifest.json") -Encoding Ascii
+  New-Item -ItemType Directory -Force -Path (Join-Path $summaryTmp "logs") | Out-Null
+  @"
+warning: failed to save last-use data
+database or disk is full
+"@ | Set-Content -Path (Join-Path $summaryTmp "logs/host.stderr.log") -Encoding Ascii
 
   & (Join-Path $scriptDir "summarize_transport_results.ps1") -RunDir $summaryTmp
 
   $schema = Get-Content (Join-Path $repoRoot "tests/benchmarks/schemas/benchmark-result.schema.json") -Raw | ConvertFrom-Json
   $schemaProperties = @($schema.properties.PSObject.Properties.Name)
   $summarized = Get-Content (Join-Path $summaryTmp "summary.json") -Raw | ConvertFrom-Json
+  if ($summarized.error_count -ne 0) { throw "cargo cache warning text must not be counted as benchmark errors" }
   $extraProperties = @($summarized.PSObject.Properties.Name | Where-Object { $_ -notin $schemaProperties })
   if ($extraProperties.Count -gt 0) {
     throw "benchmark summary schema is missing properties: $($extraProperties -join ', ')"
@@ -313,6 +353,11 @@ try {
   if ($csv.render_queue_replacement_rate -ne "0.35") { throw "summary CSV must include render queue replacement rate" }
   if ($csv.render_stale_frame_drop_rate -ne "0.35") { throw "summary CSV must include render stale frame drop rate" }
   if ($csv.render_present_skipped_rate -ne "0.1") { throw "summary CSV must include render skipped frame rate" }
+  if ($csv.render_submit_wait_p95_ms -ne "0.03") { throw "summary CSV must include render submit wait p95" }
+  if ($csv.render_execute_p95_ms -ne "0.17") { throw "summary CSV must include render execute p95" }
+  if ($csv.render_prepare_wait_p95_ms -ne "0.01") { throw "summary CSV must include render prepare wait p95" }
+  if ($csv.render_shared_resource_p95_ms -ne "0.06") { throw "summary CSV must include render shared resource p95" }
+  if ($csv.render_draw_present_p95_ms -ne "0.11") { throw "summary CSV must include render draw present p95" }
   if ($csv.swap_chain_present_mode -ne "waitable") { throw "summary CSV must include swapchain present mode" }
   if ($csv.display_refresh_hz -ne "144") { throw "summary CSV must include display refresh hz" }
   $report = Get-Content (Join-Path $summaryTmp "reports/markdown-report.md") -Raw
@@ -325,10 +370,15 @@ try {
     max_encode_total_p95_ms = 8.0
     max_send_write_p95_ms = 8.0
     max_decode_total_p95_ms = 8.0
+    max_render_execute_p95_ms = 0.1
+    max_render_prepare_wait_p95_ms = 0.005
+    max_render_shared_resource_p95_ms = 0.05
+    max_render_draw_present_p95_ms = 0.1
     max_render_present_p95_ms = 7.0
     max_render_queue_replacements = 3
     max_render_stale_frame_drops = 3
     max_render_present_skipped_frames = 1
+    max_render_present_skipped_rate = 0.05
     max_warning_count = 20
     max_error_count = 0
   } | ConvertTo-Json -Depth 8 | Set-Content -Path $thresholdPath -Encoding Ascii
@@ -337,9 +387,27 @@ try {
   $strict = Get-Content (Join-Path $summaryTmp "summary.json") -Raw | ConvertFrom-Json
   if ($strict.run_passed) { throw "strict render threshold should fail the summary" }
   if ($strict.failure_reason -notmatch "render present p95") { throw "failure reason should include render present threshold" }
+  if ($strict.failure_reason -notmatch "render draw/present p95") { throw "failure reason should include render draw/present threshold" }
+  if ($strict.failure_reason -notmatch "render execute p95") { throw "failure reason should include render execute threshold" }
+  if ($strict.failure_reason -notmatch "render shared resource p95") { throw "failure reason should include render shared resource threshold" }
   if ($strict.failure_reason -notmatch "render queue replacements") { throw "failure reason should include render queue replacement threshold" }
+  if ($strict.failure_reason -notmatch "render present skipped rate") { throw "failure reason should include render present skipped rate threshold" }
   $strictCsv = Import-Csv (Join-Path $summaryTmp "summary.csv")
   if ($strictCsv.run_status -ne "FAIL") { throw "strict threshold CSV should expose FAIL run_status" }
+
+  $openglReadbackEnv = Get-TransportMatrixRenderEnvironment -Scenario ([pscustomobject]@{
+    opengl_allow_readback_fallback = $true
+  })
+  if ($openglReadbackEnv["MRD_OPENGL_ALLOW_READBACK_FALLBACK"] -ne "1") {
+    throw "OpenGL readback fallback opt-in should set MRD_OPENGL_ALLOW_READBACK_FALLBACK=1"
+  }
+
+  $openglReadbackDisabledEnv = Get-TransportMatrixRenderEnvironment -Scenario ([pscustomobject]@{
+    opengl_allow_readback_fallback = $false
+  })
+  if ($openglReadbackDisabledEnv["MRD_OPENGL_ALLOW_READBACK_FALLBACK"] -ne "0") {
+    throw "OpenGL readback fallback explicit opt-out should set MRD_OPENGL_ALLOW_READBACK_FALLBACK=0"
+  }
 } finally {
   Remove-Item $summaryTmp -Recurse -Force -ErrorAction SilentlyContinue
 }

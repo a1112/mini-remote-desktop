@@ -22,6 +22,11 @@ pub enum StageId {
     DecodeTotal,
     FrameSinkIngest,
     RenderUpload,
+    RenderSubmitWait,
+    RenderExecute,
+    RenderPrepareWait,
+    RenderSharedResource,
+    RenderDrawPresent,
     RenderPresent,
 }
 

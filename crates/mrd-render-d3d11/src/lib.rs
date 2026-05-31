@@ -175,6 +175,9 @@ pub struct D3d11Renderer {
     waitable_wait_total_ms: f64,
     waitable_timeout_count: u64,
     last_waitable_wait_ms: Option<f64>,
+    last_render_prepare_wait_ms: Option<f64>,
+    last_render_shared_resource_ms: Option<f64>,
+    last_render_draw_present_ms: Option<f64>,
     last_width: usize,
     last_height: usize,
     last_pixel_format: Option<RenderPixelFormat>,
@@ -254,6 +257,9 @@ impl D3d11Renderer {
                 waitable_wait_total_ms: 0.0,
                 waitable_timeout_count: 0,
                 last_waitable_wait_ms: None,
+                last_render_prepare_wait_ms: None,
+                last_render_shared_resource_ms: None,
+                last_render_draw_present_ms: None,
                 last_width: 0,
                 last_height: 0,
                 last_pixel_format: None,
@@ -478,6 +484,29 @@ impl D3d11Renderer {
         if timed_out {
             self.waitable_timeout_count = self.waitable_timeout_count.saturating_add(1);
         }
+    }
+
+    #[cfg(windows)]
+    fn duration_ms(duration: std::time::Duration) -> f64 {
+        duration.as_secs_f64() * 1000.0
+    }
+
+    #[cfg(windows)]
+    fn reset_last_render_breakdown(&mut self) {
+        self.last_render_prepare_wait_ms = None;
+        self.last_render_shared_resource_ms = None;
+        self.last_render_draw_present_ms = None;
+    }
+
+    #[cfg(windows)]
+    fn record_draw_present<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Self) -> Result<T, RenderError>,
+    ) -> Result<T, RenderError> {
+        let started = std::time::Instant::now();
+        let result = operation(self);
+        self.last_render_draw_present_ms = Some(Self::duration_ms(started.elapsed()));
+        result
     }
 
     #[cfg(windows)]
@@ -1255,7 +1284,9 @@ impl D3d11Renderer {
             }
         };
 
+        let shared_started = std::time::Instant::now();
         let source_resource = self.shared_bgra_resource(shared_handle)?;
+        self.last_render_shared_resource_ms = Some(Self::duration_ms(shared_started.elapsed()));
         let target_resource: ID3D11Resource = back_buffer.cast().map_err(|error| {
             RenderError::Message(format!("cast back buffer to resource failed: {error}"))
         })?;
@@ -1266,6 +1297,7 @@ impl D3d11Renderer {
             return Ok(D3d11PresentStatus::NoTarget);
         }
 
+        let draw_started = std::time::Instant::now();
         unsafe {
             if frame.width == surface_width as usize && frame.height == surface_height as usize {
                 self.context
@@ -1291,7 +1323,9 @@ impl D3d11Renderer {
                 );
             }
         }
-        Self::present_swap_chain(&swap_chain, allow_tearing, present_mode)
+        let present_status = Self::present_swap_chain(&swap_chain, allow_tearing, present_mode)?;
+        self.last_render_draw_present_ms = Some(Self::duration_ms(draw_started.elapsed()));
+        Ok(present_status)
     }
 
     #[cfg(windows)]
@@ -1333,6 +1367,7 @@ impl D3d11Renderer {
         let swap_chain = surface.swap_chain.clone();
         let allow_tearing = surface.allow_tearing;
         let present_mode = surface.present_mode;
+        let shared_started = std::time::Instant::now();
         let (y_srv, uv_srv) = self.shared_nv12_srvs(shared_handle_y, shared_handle_uv)?;
         let (vertex_shader, pixel_shader, sampler) = {
             let pipeline = self.ensure_shared_nv12_pipeline()?;
@@ -1342,6 +1377,7 @@ impl D3d11Renderer {
                 pipeline.sampler.clone(),
             )
         };
+        self.last_render_shared_resource_ms = Some(Self::duration_ms(shared_started.elapsed()));
 
         let (viewport_x, viewport_y, viewport_width, viewport_height) =
             fit_viewport_rect(surface_width, surface_height, frame.width, frame.height);
@@ -1357,6 +1393,7 @@ impl D3d11Renderer {
         let samplers = [Some(sampler)];
         let empty_srvs: [Option<ID3D11ShaderResourceView>; 2] = [None, None];
 
+        let draw_started = std::time::Instant::now();
         unsafe {
             if should_clear_shared_present_surface(
                 surface_width,
@@ -1380,7 +1417,9 @@ impl D3d11Renderer {
             self.context.Draw(3, 0);
             self.context.PSSetShaderResources(0, Some(&empty_srvs));
         }
-        Self::present_swap_chain(&swap_chain, allow_tearing, present_mode)
+        let present_status = Self::present_swap_chain(&swap_chain, allow_tearing, present_mode)?;
+        self.last_render_draw_present_ms = Some(Self::duration_ms(draw_started.elapsed()));
+        Ok(present_status)
     }
 }
 
@@ -1427,7 +1466,11 @@ impl RendererInstance for D3d11Renderer {
         #[cfg(windows)]
         {
             use mrd_render::RenderFrameData;
-            if let Some(present_status) = self.prepare_waitable_frame_latency()? {
+            self.reset_last_render_breakdown();
+            let prepare_started = std::time::Instant::now();
+            let waitable_skip = self.prepare_waitable_frame_latency()?;
+            self.last_render_prepare_wait_ms = Some(Self::duration_ms(prepare_started.elapsed()));
+            if let Some(present_status) = waitable_skip {
                 self.present_skipped_count += 1;
                 self.last_present_status = Some(present_status.as_str());
                 self.last_width = frame.width;
@@ -1435,45 +1478,42 @@ impl RendererInstance for D3d11Renderer {
                 self.last_pixel_format = Some(frame.pixel_format);
                 return Ok(());
             }
+            self.last_render_shared_resource_ms = Some(0.0);
 
             let present_status = match &frame.data {
-                RenderFrameData::Rgb24(_) =>
-                {
-                    #[cfg(windows)]
+                RenderFrameData::Rgb24(_) => {
                     if self.surface.is_some() {
-                        self.present_uploaded_frame(&frame)?
+                        self.record_draw_present(|renderer| {
+                            renderer.present_uploaded_frame(&frame)
+                        })?
                     } else {
-                        self.present_clear_frame(&frame)?
+                        self.record_draw_present(|renderer| renderer.present_clear_frame(&frame))?
                     }
                 }
-                RenderFrameData::Bgra32(_) =>
-                {
-                    #[cfg(windows)]
+                RenderFrameData::Bgra32(_) => {
                     if self.surface.is_some() {
-                        self.present_uploaded_frame_bgra(&frame)?
+                        self.record_draw_present(|renderer| {
+                            renderer.present_uploaded_frame_bgra(&frame)
+                        })?
                     } else {
-                        self.present_clear_frame(&frame)?
+                        self.record_draw_present(|renderer| renderer.present_clear_frame(&frame))?
                     }
                 }
                 #[cfg(windows)]
-                RenderFrameData::D3D11SharedBgra { .. } =>
-                {
-                    #[cfg(windows)]
+                RenderFrameData::D3D11SharedBgra { .. } => {
                     if self.surface.is_some() {
                         self.present_shared_bgra_frame(&frame)?
                     } else {
-                        self.present_clear_frame(&frame)?
+                        self.record_draw_present(|renderer| renderer.present_clear_frame(&frame))?
                     }
                 }
                 #[cfg(windows)]
                 RenderFrameData::D3D11SharedNv12 { .. }
-                | RenderFrameData::D3D11SharedP010 { .. } =>
-                {
-                    #[cfg(windows)]
+                | RenderFrameData::D3D11SharedP010 { .. } => {
                     if self.surface.is_some() {
                         self.present_shared_texture_frame(&frame)?
                     } else {
-                        self.present_clear_frame(&frame)?
+                        self.record_draw_present(|renderer| renderer.present_clear_frame(&frame))?
                     }
                 }
             };
@@ -1569,6 +1609,9 @@ impl RendererInstance for D3d11Renderer {
             waitable_wait_total_ms,
             waitable_timeout_count,
             last_waitable_wait_ms,
+            last_render_prepare_wait_ms: self.last_render_prepare_wait_ms,
+            last_render_shared_resource_ms: self.last_render_shared_resource_ms,
+            last_render_draw_present_ms: self.last_render_draw_present_ms,
             last_width: self.last_width,
             last_height: self.last_height,
             last_pixel_format: self.last_pixel_format,

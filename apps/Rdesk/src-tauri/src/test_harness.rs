@@ -117,6 +117,37 @@ pub enum EncoderType {
     VideoToolboxH264,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NvencAv1Mode {
+    LowLatency,
+    UltraLowLatency,
+    HighRefresh,
+}
+
+fn parse_nvenc_av1_mode_value(value: Option<&str>) -> NvencAv1Mode {
+    match value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("ultra_low_latency" | "ultra-low-latency" | "ull" | "p6") => {
+            NvencAv1Mode::UltraLowLatency
+        }
+        Some("high_refresh" | "high-refresh" | "high_refresh_rate" | "high-refresh-rate") => {
+            NvencAv1Mode::HighRefresh
+        }
+        _ => NvencAv1Mode::LowLatency,
+    }
+}
+
+fn configured_nvenc_av1_mode() -> NvencAv1Mode {
+    let value = std::env::var("MRD_BENCH_NVENC_AV1_MODE")
+        .ok()
+        .or_else(|| std::env::var("MRD_HARNESS_NVENC_AV1_MODE").ok());
+    parse_nvenc_av1_mode_value(value.as_deref())
+}
+
 /// Available decoder types
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -358,6 +389,21 @@ pub struct HarnessMetrics {
     pub render_latency_avg_ms: f64,
     pub render_latency_p50_ms: f64,
     pub render_latency_p95_ms: f64,
+    pub render_submit_wait_latency_avg_ms: f64,
+    pub render_submit_wait_latency_p50_ms: f64,
+    pub render_submit_wait_latency_p95_ms: f64,
+    pub render_execute_latency_avg_ms: f64,
+    pub render_execute_latency_p50_ms: f64,
+    pub render_execute_latency_p95_ms: f64,
+    pub render_prepare_wait_latency_avg_ms: f64,
+    pub render_prepare_wait_latency_p50_ms: f64,
+    pub render_prepare_wait_latency_p95_ms: f64,
+    pub render_shared_resource_latency_avg_ms: f64,
+    pub render_shared_resource_latency_p50_ms: f64,
+    pub render_shared_resource_latency_p95_ms: f64,
+    pub render_draw_present_latency_avg_ms: f64,
+    pub render_draw_present_latency_p50_ms: f64,
+    pub render_draw_present_latency_p95_ms: f64,
     pub present_latency_avg_ms: f64,
     pub render_submitted_frames: u64,
     pub render_uploaded_frames: u64,
@@ -454,6 +500,21 @@ impl Default for HarnessMetrics {
             render_latency_avg_ms: 0.0,
             render_latency_p50_ms: 0.0,
             render_latency_p95_ms: 0.0,
+            render_submit_wait_latency_avg_ms: 0.0,
+            render_submit_wait_latency_p50_ms: 0.0,
+            render_submit_wait_latency_p95_ms: 0.0,
+            render_execute_latency_avg_ms: 0.0,
+            render_execute_latency_p50_ms: 0.0,
+            render_execute_latency_p95_ms: 0.0,
+            render_prepare_wait_latency_avg_ms: 0.0,
+            render_prepare_wait_latency_p50_ms: 0.0,
+            render_prepare_wait_latency_p95_ms: 0.0,
+            render_shared_resource_latency_avg_ms: 0.0,
+            render_shared_resource_latency_p50_ms: 0.0,
+            render_shared_resource_latency_p95_ms: 0.0,
+            render_draw_present_latency_avg_ms: 0.0,
+            render_draw_present_latency_p50_ms: 0.0,
+            render_draw_present_latency_p95_ms: 0.0,
             present_latency_avg_ms: 0.0,
             render_submitted_frames: 0,
             render_uploaded_frames: 0,
@@ -758,6 +819,14 @@ struct RenderPacingCounters {
 #[derive(Debug, Clone)]
 struct RenderCompletion {
     snapshot: RendererSnapshot,
+    upload_started_at: Instant,
+    upload_completed_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct RenderUploadTiming {
+    started_at: Instant,
+    completed_at: Instant,
 }
 
 struct RenderJob {
@@ -1369,18 +1438,29 @@ fn run_d3d11_render_loop(
     Ok(())
 }
 
-fn upload_render_input(renderer: &mut dyn RendererInstance, input: RenderInput) -> Result<()> {
+fn upload_render_input(
+    renderer: &mut dyn RendererInstance,
+    input: RenderInput,
+) -> Result<RenderUploadTiming> {
     let frame = render_input_to_frame(input);
+    let started_at = Instant::now();
     renderer
         .upload_frame(frame)
-        .map_err(|error| anyhow::anyhow!("upload frame to renderer failed: {error}"))
+        .map_err(|error| anyhow::anyhow!("upload frame to renderer failed: {error}"))?;
+    let completed_at = Instant::now();
+    Ok(RenderUploadTiming {
+        started_at,
+        completed_at,
+    })
 }
 
 fn complete_render_job(renderer: &mut dyn RendererInstance, job: RenderJob) -> Result<()> {
     match upload_render_input(renderer, job.input) {
-        Ok(()) => {
+        Ok(timing) => {
             let completion = RenderCompletion {
                 snapshot: renderer.snapshot(),
+                upload_started_at: timing.started_at,
+                upload_completed_at: timing.completed_at,
             };
             let _ = job.completion.send(Ok(completion));
             Ok(())
@@ -2481,12 +2561,28 @@ impl TestHarness {
                 EncoderType::NvencAv1 => {
                     #[cfg(any(windows, target_os = "linux"))]
                     {
-                        let enc = NvencAv1Encoder::new_low_latency_with_bitrate(
-                            width,
-                            height,
-                            fps,
-                            low_latency_bitrate,
-                        )
+                        let mode = configured_nvenc_av1_mode();
+                        let enc = match mode {
+                            NvencAv1Mode::LowLatency => {
+                                NvencAv1Encoder::new_low_latency_with_bitrate(
+                                    width,
+                                    height,
+                                    fps,
+                                    low_latency_bitrate,
+                                )
+                            }
+                            NvencAv1Mode::UltraLowLatency => {
+                                NvencAv1Encoder::new_ultra_low_latency_with_bitrate(
+                                    width,
+                                    height,
+                                    fps,
+                                    low_latency_bitrate,
+                                )
+                            }
+                            NvencAv1Mode::HighRefresh => {
+                                NvencAv1Encoder::new_high_refresh_rate(width, height, fps)
+                            }
+                        }
                         .map_err(|e| anyhow::anyhow!("NVENC AV1 encoder init failed: {:?}", e))?;
                         match decoder {
                             DecoderType::None => {
@@ -2601,6 +2697,11 @@ impl TestHarness {
         let mut transport_latencies = Vec::with_capacity(1000);
         let mut decode_latencies = Vec::with_capacity(1000);
         let mut render_latencies = Vec::with_capacity(1000);
+        let mut render_submit_wait_latencies = Vec::with_capacity(1000);
+        let mut render_execute_latencies = Vec::with_capacity(1000);
+        let mut render_prepare_wait_latencies = Vec::with_capacity(1000);
+        let mut render_shared_resource_latencies = Vec::with_capacity(1000);
+        let mut render_draw_present_latencies = Vec::with_capacity(1000);
         let mut render_present_gaps = Vec::with_capacity(1000);
         let mut total_latencies = Vec::with_capacity(1000);
         let mut render_pacing = RenderPacingCounters::default();
@@ -2645,6 +2746,11 @@ impl TestHarness {
                     scheduler,
                     &mut render_pacing,
                     &mut render_latencies,
+                    &mut render_submit_wait_latencies,
+                    &mut render_execute_latencies,
+                    &mut render_prepare_wait_latencies,
+                    &mut render_shared_resource_latencies,
+                    &mut render_draw_present_latencies,
                     &mut render_present_gaps,
                     &mut last_render_snapshot,
                     &mut last_render_present_at,
@@ -2830,11 +2936,7 @@ impl TestHarness {
             } else {
                 None
             };
-            let render_preview_input = if update_web_preview {
-                render_input.clone()
-            } else {
-                None
-            };
+            let render_preview_input = render_preview_input_for_frame(&render_input, preview_due);
 
             if let (Some(scheduler), Some(input)) = (render_scheduler.as_ref(), render_input) {
                 render_pacing.submitted_frames = render_pacing.submitted_frames.saturating_add(1);
@@ -2850,6 +2952,11 @@ impl TestHarness {
                     scheduler,
                     &mut render_pacing,
                     &mut render_latencies,
+                    &mut render_submit_wait_latencies,
+                    &mut render_execute_latencies,
+                    &mut render_prepare_wait_latencies,
+                    &mut render_shared_resource_latencies,
+                    &mut render_draw_present_latencies,
                     &mut render_present_gaps,
                     &mut last_render_snapshot,
                     &mut last_render_present_at,
@@ -2882,6 +2989,11 @@ impl TestHarness {
                 &mut transport_latencies,
                 &mut decode_latencies,
                 &mut render_latencies,
+                &mut render_submit_wait_latencies,
+                &mut render_execute_latencies,
+                &mut render_prepare_wait_latencies,
+                &mut render_shared_resource_latencies,
+                &mut render_draw_present_latencies,
                 &mut render_present_gaps,
                 &mut total_latencies,
             );
@@ -2933,6 +3045,11 @@ impl TestHarness {
                     &transport_latencies,
                     &decode_latencies,
                     &render_latencies,
+                    &render_submit_wait_latencies,
+                    &render_execute_latencies,
+                    &render_prepare_wait_latencies,
+                    &render_shared_resource_latencies,
+                    &render_draw_present_latencies,
                     &render_present_gaps,
                     render_pacing.clone(),
                     &total_latencies,
@@ -2948,6 +3065,11 @@ impl TestHarness {
                 scheduler,
                 &mut render_pacing,
                 &mut render_latencies,
+                &mut render_submit_wait_latencies,
+                &mut render_execute_latencies,
+                &mut render_prepare_wait_latencies,
+                &mut render_shared_resource_latencies,
+                &mut render_draw_present_latencies,
                 &mut render_present_gaps,
                 &mut last_render_snapshot,
                 &mut last_render_present_at,
@@ -2973,6 +3095,11 @@ impl TestHarness {
             &transport_latencies,
             &decode_latencies,
             &render_latencies,
+            &render_submit_wait_latencies,
+            &render_execute_latencies,
+            &render_prepare_wait_latencies,
+            &render_shared_resource_latencies,
+            &render_draw_present_latencies,
             &render_present_gaps,
             render_pacing.clone(),
             &total_latencies,
@@ -2998,6 +3125,11 @@ impl TestHarness {
         transport_latencies: &[Duration],
         decode_latencies: &[Duration],
         render_latencies: &[Duration],
+        render_submit_wait_latencies: &[Duration],
+        render_execute_latencies: &[Duration],
+        render_prepare_wait_latencies: &[Duration],
+        render_shared_resource_latencies: &[Duration],
+        render_draw_present_latencies: &[Duration],
         render_present_gaps: &[Duration],
         render_pacing: RenderPacingCounters,
         total_latencies: &[Duration],
@@ -3031,6 +3163,21 @@ impl TestHarness {
         let (p50_dec, p95_dec) = Self::compute_percentiles(decode_latencies);
         let avg_render = Self::compute_average(render_latencies);
         let (p50_render, p95_render) = Self::compute_percentiles(render_latencies);
+        let avg_render_submit_wait = Self::compute_average(render_submit_wait_latencies);
+        let (p50_render_submit_wait, p95_render_submit_wait) =
+            Self::compute_percentiles(render_submit_wait_latencies);
+        let avg_render_execute = Self::compute_average(render_execute_latencies);
+        let (p50_render_execute, p95_render_execute) =
+            Self::compute_percentiles(render_execute_latencies);
+        let avg_render_prepare_wait = Self::compute_average(render_prepare_wait_latencies);
+        let (p50_render_prepare_wait, p95_render_prepare_wait) =
+            Self::compute_percentiles(render_prepare_wait_latencies);
+        let avg_render_shared_resource = Self::compute_average(render_shared_resource_latencies);
+        let (p50_render_shared_resource, p95_render_shared_resource) =
+            Self::compute_percentiles(render_shared_resource_latencies);
+        let avg_render_draw_present = Self::compute_average(render_draw_present_latencies);
+        let (p50_render_draw_present, p95_render_draw_present) =
+            Self::compute_percentiles(render_draw_present_latencies);
         let avg_present_gap = Self::compute_average(render_present_gaps);
         let (p50_present_gap, p95_present_gap) = Self::compute_percentiles(render_present_gaps);
         let avg_total = Self::compute_average(total_latencies);
@@ -3068,6 +3215,21 @@ impl TestHarness {
         m.render_latency_avg_ms = avg_render.as_secs_f64() * 1000.0;
         m.render_latency_p50_ms = p50_render.as_secs_f64() * 1000.0;
         m.render_latency_p95_ms = p95_render.as_secs_f64() * 1000.0;
+        m.render_submit_wait_latency_avg_ms = avg_render_submit_wait.as_secs_f64() * 1000.0;
+        m.render_submit_wait_latency_p50_ms = p50_render_submit_wait.as_secs_f64() * 1000.0;
+        m.render_submit_wait_latency_p95_ms = p95_render_submit_wait.as_secs_f64() * 1000.0;
+        m.render_execute_latency_avg_ms = avg_render_execute.as_secs_f64() * 1000.0;
+        m.render_execute_latency_p50_ms = p50_render_execute.as_secs_f64() * 1000.0;
+        m.render_execute_latency_p95_ms = p95_render_execute.as_secs_f64() * 1000.0;
+        m.render_prepare_wait_latency_avg_ms = avg_render_prepare_wait.as_secs_f64() * 1000.0;
+        m.render_prepare_wait_latency_p50_ms = p50_render_prepare_wait.as_secs_f64() * 1000.0;
+        m.render_prepare_wait_latency_p95_ms = p95_render_prepare_wait.as_secs_f64() * 1000.0;
+        m.render_shared_resource_latency_avg_ms = avg_render_shared_resource.as_secs_f64() * 1000.0;
+        m.render_shared_resource_latency_p50_ms = p50_render_shared_resource.as_secs_f64() * 1000.0;
+        m.render_shared_resource_latency_p95_ms = p95_render_shared_resource.as_secs_f64() * 1000.0;
+        m.render_draw_present_latency_avg_ms = avg_render_draw_present.as_secs_f64() * 1000.0;
+        m.render_draw_present_latency_p50_ms = p50_render_draw_present.as_secs_f64() * 1000.0;
+        m.render_draw_present_latency_p95_ms = p95_render_draw_present.as_secs_f64() * 1000.0;
         m.render_submitted_frames = render_pacing.submitted_frames;
         m.render_uploaded_frames = render_pacing.uploaded_frames;
         m.render_presented_frames = render_pacing.presented_frames;
@@ -3118,6 +3280,11 @@ impl TestHarness {
         scheduler: &LatestRenderScheduler,
         render_pacing: &mut RenderPacingCounters,
         render_latencies: &mut Vec<Duration>,
+        render_submit_wait_latencies: &mut Vec<Duration>,
+        render_execute_latencies: &mut Vec<Duration>,
+        render_prepare_wait_latencies: &mut Vec<Duration>,
+        render_shared_resource_latencies: &mut Vec<Duration>,
+        render_draw_present_latencies: &mut Vec<Duration>,
         render_present_gaps: &mut Vec<Duration>,
         last_render_snapshot: &mut Option<RendererSnapshot>,
         last_render_present_at: &mut Option<Instant>,
@@ -3136,12 +3303,30 @@ impl TestHarness {
                         &render_completion.snapshot,
                         completion.completed_at,
                     );
+                    let upload_started_at = render_completion.upload_started_at;
+                    let upload_completed_at = render_completion.upload_completed_at;
+                    Self::push_optional_ms(
+                        render_prepare_wait_latencies,
+                        render_completion.snapshot.last_render_prepare_wait_ms,
+                    );
+                    Self::push_optional_ms(
+                        render_shared_resource_latencies,
+                        render_completion.snapshot.last_render_shared_resource_ms,
+                    );
+                    Self::push_optional_ms(
+                        render_draw_present_latencies,
+                        render_completion.snapshot.last_render_draw_present_ms,
+                    );
                     *last_render_snapshot = Some(render_completion.snapshot);
                     render_latencies.push(
                         completion
                             .completed_at
                             .saturating_duration_since(completion.started_at),
                     );
+                    render_submit_wait_latencies
+                        .push(upload_started_at.saturating_duration_since(completion.started_at));
+                    render_execute_latencies
+                        .push(upload_completed_at.saturating_duration_since(upload_started_at));
                 }
                 Err(error) => anyhow::bail!("native render thread failed: {error}"),
             }
@@ -3153,6 +3338,11 @@ impl TestHarness {
         scheduler: &LatestRenderScheduler,
         render_pacing: &mut RenderPacingCounters,
         render_latencies: &mut Vec<Duration>,
+        render_submit_wait_latencies: &mut Vec<Duration>,
+        render_execute_latencies: &mut Vec<Duration>,
+        render_prepare_wait_latencies: &mut Vec<Duration>,
+        render_shared_resource_latencies: &mut Vec<Duration>,
+        render_draw_present_latencies: &mut Vec<Duration>,
         render_present_gaps: &mut Vec<Duration>,
         last_render_snapshot: &mut Option<RendererSnapshot>,
         last_render_present_at: &mut Option<Instant>,
@@ -3164,6 +3354,11 @@ impl TestHarness {
                 scheduler,
                 render_pacing,
                 render_latencies,
+                render_submit_wait_latencies,
+                render_execute_latencies,
+                render_prepare_wait_latencies,
+                render_shared_resource_latencies,
+                render_draw_present_latencies,
                 render_present_gaps,
                 last_render_snapshot,
                 last_render_present_at,
@@ -3218,6 +3413,15 @@ impl TestHarness {
         Duration::from_nanos((total_nanos / latencies.len() as u128).min(u64::MAX as u128) as u64)
     }
 
+    fn push_optional_ms(latencies: &mut Vec<Duration>, value_ms: Option<f64>) {
+        let Some(value_ms) = value_ms else {
+            return;
+        };
+        if value_ms.is_finite() && value_ms >= 0.0 {
+            latencies.push(Duration::from_secs_f64(value_ms / 1000.0));
+        }
+    }
+
     fn trim_latency_buffers(
         capture_latencies: &mut Vec<Duration>,
         interactive_latencies: &mut Vec<Duration>,
@@ -3225,6 +3429,11 @@ impl TestHarness {
         transport_latencies: &mut Vec<Duration>,
         decode_latencies: &mut Vec<Duration>,
         render_latencies: &mut Vec<Duration>,
+        render_submit_wait_latencies: &mut Vec<Duration>,
+        render_execute_latencies: &mut Vec<Duration>,
+        render_prepare_wait_latencies: &mut Vec<Duration>,
+        render_shared_resource_latencies: &mut Vec<Duration>,
+        render_draw_present_latencies: &mut Vec<Duration>,
         render_present_gaps: &mut Vec<Duration>,
         total_latencies: &mut Vec<Duration>,
     ) {
@@ -3245,6 +3454,21 @@ impl TestHarness {
         }
         if render_latencies.len() > 1000 {
             render_latencies.remove(0);
+        }
+        if render_submit_wait_latencies.len() > 1000 {
+            render_submit_wait_latencies.remove(0);
+        }
+        if render_execute_latencies.len() > 1000 {
+            render_execute_latencies.remove(0);
+        }
+        if render_prepare_wait_latencies.len() > 1000 {
+            render_prepare_wait_latencies.remove(0);
+        }
+        if render_shared_resource_latencies.len() > 1000 {
+            render_shared_resource_latencies.remove(0);
+        }
+        if render_draw_present_latencies.len() > 1000 {
+            render_draw_present_latencies.remove(0);
         }
         if render_present_gaps.len() > 1000 {
             render_present_gaps.remove(0);
@@ -3708,6 +3932,17 @@ fn render_input_to_frame(input: RenderInput) -> RenderFrame {
     }
 }
 
+fn render_preview_input_for_frame(
+    render_input: &Option<RenderInput>,
+    preview_due: bool,
+) -> Option<RenderInput> {
+    if preview_due {
+        render_input.clone()
+    } else {
+        None
+    }
+}
+
 fn render_input_to_preview_bgra(
     input: RenderInput,
     max_width: usize,
@@ -3748,20 +3983,20 @@ fn decoded_frame_to_render_frame(frame: &DecodedFrame) -> RenderFrame {
             data,
             y_pitch,
             uv_pitch,
-        } => RenderFrame::from_rgb24(
+        } => RenderFrame::from_bgra32(
             frame.width,
             frame.height,
-            cpu_i420_to_rgb24(data, frame.width, frame.height, *y_pitch, *uv_pitch),
+            cpu_i420_to_bgra32(data, frame.width, frame.height, *y_pitch, *uv_pitch),
         ),
-        DecodedFrameData::CpuNv12 { data, pitch } => RenderFrame::from_rgb24(
+        DecodedFrameData::CpuNv12 { data, pitch } => RenderFrame::from_bgra32(
             frame.width,
             frame.height,
-            cpu_nv12_to_rgb24(data, frame.width, frame.height, *pitch),
+            cpu_nv12_to_bgra32(data, frame.width, frame.height, *pitch),
         ),
-        DecodedFrameData::CpuP010 { data, pitch } => RenderFrame::from_rgb24(
+        DecodedFrameData::CpuP010 { data, pitch } => RenderFrame::from_bgra32(
             frame.width,
             frame.height,
-            cpu_p010_to_rgb24(data, frame.width, frame.height, *pitch),
+            cpu_p010_to_bgra32(data, frame.width, frame.height, *pitch),
         ),
         #[cfg(windows)]
         DecodedFrameData::D3D11SharedNv12 {
@@ -3811,10 +4046,10 @@ fn captured_frame_to_render_frame(frame: &CapturedFrame) -> RenderFrame {
             frame.height,
             rgba32_to_bgra32(&frame.data, frame.width, frame.height),
         ),
-        FramePixelFormat::Nv12 => RenderFrame::from_rgb24(
+        FramePixelFormat::Nv12 => RenderFrame::from_bgra32(
             frame.width,
             frame.height,
-            cpu_nv12_to_rgb24(&frame.data, frame.width, frame.height, frame.width),
+            cpu_nv12_to_bgra32(&frame.data, frame.width, frame.height, frame.width),
         ),
     }
 }
@@ -3838,6 +4073,65 @@ fn rgb24_to_bgra32(rgb: &[u8], width: usize, height: usize) -> Vec<u8> {
         dst[2] = src[0];
         dst[3] = 255;
     }
+    bgra
+}
+
+fn cpu_nv12_to_bgra32(nv12: &[u8], width: usize, height: usize, pitch: usize) -> Vec<u8> {
+    let mut bgra = vec![0_u8; width * height * 4];
+    let uv_base = pitch * height;
+
+    for y in (0..height).step_by(2) {
+        let y0_row = y * pitch;
+        let y1_row = (y + 1).min(height.saturating_sub(1)) * pitch;
+        let uv_row_start = uv_base + (y / 2) * pitch;
+        let out0_row = y * width * 4;
+        let out1_row = (y + 1).min(height.saturating_sub(1)) * width * 4;
+
+        for x in (0..width).step_by(2) {
+            let uv_offset = uv_row_start + (x / 2) * 2;
+            if uv_offset + 1 >= nv12.len() {
+                continue;
+            }
+
+            let u = nv12[uv_offset];
+            let v = nv12[uv_offset + 1];
+            let y0_offset = y0_row + x;
+            if y0_offset < nv12.len() {
+                write_limited_bgra_pixel(&mut bgra, out0_row + x * 4, nv12[y0_offset], u, v);
+            }
+            if x + 1 < width {
+                let y0_next = y0_offset + 1;
+                if y0_next < nv12.len() {
+                    write_limited_bgra_pixel(
+                        &mut bgra,
+                        out0_row + (x + 1) * 4,
+                        nv12[y0_next],
+                        u,
+                        v,
+                    );
+                }
+            }
+            if y + 1 < height {
+                let y1_offset = y1_row + x;
+                if y1_offset < nv12.len() {
+                    write_limited_bgra_pixel(&mut bgra, out1_row + x * 4, nv12[y1_offset], u, v);
+                }
+                if x + 1 < width {
+                    let y1_next = y1_offset + 1;
+                    if y1_next < nv12.len() {
+                        write_limited_bgra_pixel(
+                            &mut bgra,
+                            out1_row + (x + 1) * 4,
+                            nv12[y1_next],
+                            u,
+                            v,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     bgra
 }
 
@@ -3875,89 +4169,167 @@ fn cpu_nv12_to_rgb24(nv12: &[u8], width: usize, height: usize, pitch: usize) -> 
     rgb
 }
 
-fn cpu_i420_to_rgb24(
+fn cpu_i420_to_bgra32(
     i420: &[u8],
     width: usize,
     height: usize,
     y_pitch: usize,
     uv_pitch: usize,
 ) -> Vec<u8> {
-    let mut rgb = vec![0_u8; width * height * 3];
+    let mut bgra = vec![0_u8; width * height * 4];
     let chroma_height = height.div_ceil(2);
     let u_base = y_pitch * height;
     let v_base = u_base + uv_pitch * chroma_height;
-    let mut out_idx = 0;
 
-    for y in 0..height {
-        let y_row_start = y * y_pitch;
+    for y in (0..height).step_by(2) {
+        let y0_row = y * y_pitch;
+        let y1_row = (y + 1).min(height.saturating_sub(1)) * y_pitch;
         let uv_row_start = (y / 2) * uv_pitch;
-        for x in 0..width {
-            let y_offset = y_row_start + x;
-            let u_offset = u_base + uv_row_start + x / 2;
-            let v_offset = v_base + uv_row_start + x / 2;
-            if y_offset >= i420.len() || u_offset >= i420.len() || v_offset >= i420.len() {
-                out_idx += 3;
+        let out0_row = y * width * 4;
+        let out1_row = (y + 1).min(height.saturating_sub(1)) * width * 4;
+
+        for x in (0..width).step_by(2) {
+            let uv_offset = uv_row_start + x / 2;
+            let u_offset = u_base + uv_offset;
+            let v_offset = v_base + uv_offset;
+            if u_offset >= i420.len() || v_offset >= i420.len() {
                 continue;
             }
 
-            let y_sample = i420[y_offset] as i32 - 16;
-            let u = i420[u_offset] as i32 - 128;
-            let v = i420[v_offset] as i32 - 128;
-
-            let r = (298 * y_sample + 409 * v + 128) >> 8;
-            let g = (298 * y_sample - 100 * u - 208 * v + 128) >> 8;
-            let b = (298 * y_sample + 516 * u + 128) >> 8;
-
-            rgb[out_idx] = r.clamp(0, 255) as u8;
-            rgb[out_idx + 1] = g.clamp(0, 255) as u8;
-            rgb[out_idx + 2] = b.clamp(0, 255) as u8;
-            out_idx += 3;
+            let u = i420[u_offset];
+            let v = i420[v_offset];
+            let y0_offset = y0_row + x;
+            if y0_offset < i420.len() {
+                write_limited_bgra_pixel(&mut bgra, out0_row + x * 4, i420[y0_offset], u, v);
+            }
+            if x + 1 < width {
+                let y0_next = y0_offset + 1;
+                if y0_next < i420.len() {
+                    write_limited_bgra_pixel(
+                        &mut bgra,
+                        out0_row + (x + 1) * 4,
+                        i420[y0_next],
+                        u,
+                        v,
+                    );
+                }
+            }
+            if y + 1 < height {
+                let y1_offset = y1_row + x;
+                if y1_offset < i420.len() {
+                    write_limited_bgra_pixel(&mut bgra, out1_row + x * 4, i420[y1_offset], u, v);
+                }
+                if x + 1 < width {
+                    let y1_next = y1_offset + 1;
+                    if y1_next < i420.len() {
+                        write_limited_bgra_pixel(
+                            &mut bgra,
+                            out1_row + (x + 1) * 4,
+                            i420[y1_next],
+                            u,
+                            v,
+                        );
+                    }
+                }
+            }
         }
     }
 
-    rgb
+    bgra
 }
 
-fn cpu_p010_to_rgb24(p010: &[u8], width: usize, height: usize, pitch: usize) -> Vec<u8> {
-    let mut rgb = vec![0_u8; width * height * 3];
+fn cpu_p010_to_bgra32(p010: &[u8], width: usize, height: usize, pitch: usize) -> Vec<u8> {
+    let mut bgra = vec![0_u8; width * height * 4];
     let uv_base = pitch * height;
-    let mut out_idx = 0;
 
-    for y in 0..height {
-        let y_row_start = y * pitch;
+    for y in (0..height).step_by(2) {
+        let y0_row = y * pitch;
+        let y1_row = (y + 1).min(height.saturating_sub(1)) * pitch;
         let uv_row_start = uv_base + (y / 2) * pitch;
-        for x in 0..width {
-            let y_offset = y_row_start + x * 2;
+        let out0_row = y * width * 4;
+        let out1_row = (y + 1).min(height.saturating_sub(1)) * width * 4;
+
+        for x in (0..width).step_by(2) {
             let uv_offset = uv_row_start + (x / 2) * 4;
-            if y_offset + 1 >= p010.len() || uv_offset + 3 >= p010.len() {
-                out_idx += 3;
+            if uv_offset + 3 >= p010.len() {
                 continue;
             }
 
-            let y10 = u16::from_le_bytes([p010[y_offset], p010[y_offset + 1]]) >> 6;
             let u10 = u16::from_le_bytes([p010[uv_offset], p010[uv_offset + 1]]) >> 6;
             let v10 = u16::from_le_bytes([p010[uv_offset + 2], p010[uv_offset + 3]]) >> 6;
-            let y_sample = y10 as i32;
-            let u = u10 as i32 - 512;
-            let v = v10 as i32 - 512;
-
-            let r = y_sample + ((1436 * v) >> 10);
-            let g = y_sample - ((352 * u + 731 * v) >> 10);
-            let b = y_sample + ((1815 * u) >> 10);
-
-            rgb[out_idx] = clamp_10bit_to_8bit(r);
-            rgb[out_idx + 1] = clamp_10bit_to_8bit(g);
-            rgb[out_idx + 2] = clamp_10bit_to_8bit(b);
-            out_idx += 3;
+            let y0_offset = y0_row + x * 2;
+            if y0_offset + 1 < p010.len() {
+                let y10 = u16::from_le_bytes([p010[y0_offset], p010[y0_offset + 1]]) >> 6;
+                write_p010_bgra_pixel(&mut bgra, out0_row + x * 4, y10, u10, v10);
+            }
+            if x + 1 < width {
+                let y0_next = y0_offset + 2;
+                if y0_next + 1 < p010.len() {
+                    let y10 = u16::from_le_bytes([p010[y0_next], p010[y0_next + 1]]) >> 6;
+                    write_p010_bgra_pixel(&mut bgra, out0_row + (x + 1) * 4, y10, u10, v10);
+                }
+            }
+            if y + 1 < height {
+                let y1_offset = y1_row + x * 2;
+                if y1_offset + 1 < p010.len() {
+                    let y10 = u16::from_le_bytes([p010[y1_offset], p010[y1_offset + 1]]) >> 6;
+                    write_p010_bgra_pixel(&mut bgra, out1_row + x * 4, y10, u10, v10);
+                }
+                if x + 1 < width {
+                    let y1_next = y1_offset + 2;
+                    if y1_next + 1 < p010.len() {
+                        let y10 = u16::from_le_bytes([p010[y1_next], p010[y1_next + 1]]) >> 6;
+                        write_p010_bgra_pixel(&mut bgra, out1_row + (x + 1) * 4, y10, u10, v10);
+                    }
+                }
+            }
         }
     }
 
-    rgb
+    bgra
+}
+
+#[inline]
+fn write_limited_bgra_pixel(bgra: &mut [u8], offset: usize, y: u8, u: u8, v: u8) {
+    if offset + 3 >= bgra.len() {
+        return;
+    }
+    let y_sample = y as i32 - 16;
+    let u = u as i32 - 128;
+    let v = v as i32 - 128;
+
+    let r = (298 * y_sample + 409 * v + 128) >> 8;
+    let g = (298 * y_sample - 100 * u - 208 * v + 128) >> 8;
+    let b = (298 * y_sample + 516 * u + 128) >> 8;
+
+    bgra[offset] = b.clamp(0, 255) as u8;
+    bgra[offset + 1] = g.clamp(0, 255) as u8;
+    bgra[offset + 2] = r.clamp(0, 255) as u8;
+    bgra[offset + 3] = 255;
+}
+
+#[inline]
+fn write_p010_bgra_pixel(bgra: &mut [u8], offset: usize, y10: u16, u10: u16, v10: u16) {
+    if offset + 3 >= bgra.len() {
+        return;
+    }
+    let y_sample = y10 as i32;
+    let u = u10 as i32 - 512;
+    let v = v10 as i32 - 512;
+
+    let r = y_sample + ((1436 * v) >> 10);
+    let g = y_sample - ((352 * u + 731 * v) >> 10);
+    let b = y_sample + ((1815 * u) >> 10);
+
+    bgra[offset] = clamp_10bit_to_8bit(b);
+    bgra[offset + 1] = clamp_10bit_to_8bit(g);
+    bgra[offset + 2] = clamp_10bit_to_8bit(r);
+    bgra[offset + 3] = 255;
 }
 
 #[inline]
 fn clamp_10bit_to_8bit(value: i32) -> u8 {
-    ((value.clamp(0, 1023) + 2) >> 2) as u8
+    (((value.clamp(0, 1023) + 2) >> 2).min(255)) as u8
 }
 
 fn downsample_frame(frame: &CapturedFrame, max_width: usize) -> Result<(Vec<u8>, usize, usize)> {
@@ -4763,8 +5135,8 @@ fn bytes_per_pixel(format: FramePixelFormat) -> usize {
 mod tests {
     use super::*;
     use mrd_render::{
-        RenderError, RenderFrame, RenderPixelFormat, RenderTarget, RendererInstance,
-        RendererSnapshot,
+        RenderError, RenderFrame, RenderFrameData, RenderPixelFormat, RenderTarget,
+        RendererInstance, RendererSnapshot,
     };
 
     #[derive(Default)]
@@ -4800,6 +5172,9 @@ mod tests {
                 waitable_wait_total_ms: None,
                 waitable_timeout_count: None,
                 last_waitable_wait_ms: None,
+                last_render_prepare_wait_ms: None,
+                last_render_shared_resource_ms: None,
+                last_render_draw_present_ms: None,
                 last_width: 1,
                 last_height: 1,
                 last_pixel_format: Some(RenderPixelFormat::Bgra32),
@@ -4829,6 +5204,9 @@ mod tests {
             waitable_wait_total_ms: None,
             waitable_timeout_count: None,
             last_waitable_wait_ms: None,
+            last_render_prepare_wait_ms: None,
+            last_render_shared_resource_ms: None,
+            last_render_draw_present_ms: None,
             last_width: 1,
             last_height: 1,
             last_pixel_format: Some(RenderPixelFormat::Bgra32),
@@ -4978,6 +5356,17 @@ mod tests {
     }
 
     #[test]
+    fn render_preview_input_is_only_cloned_when_preview_is_due() {
+        let input = Some(captured_render_input_with_marker(9));
+
+        assert!(render_preview_input_for_frame(&input, false).is_none());
+        assert_eq!(
+            render_input_marker(&render_preview_input_for_frame(&input, true).expect("preview")),
+            9
+        );
+    }
+
+    #[test]
     fn render_job_sends_completion_after_upload() {
         let mut renderer = RecordingRenderer::default();
         let (completion_tx, completion_rx) = mpsc::sync_channel(1);
@@ -5004,7 +5393,29 @@ mod tests {
             .expect("successful completion");
         assert_eq!(completion.snapshot.uploaded_frame_count, 1);
         assert_eq!(completion.snapshot.presented_frame_count, 1);
+        assert!(completion.upload_completed_at >= completion.upload_started_at);
         assert_eq!(renderer.uploaded, 1);
+    }
+
+    #[test]
+    fn nvenc_av1_mode_parser_accepts_latency_modes() {
+        assert_eq!(
+            parse_nvenc_av1_mode_value(Some("ultra_low_latency")),
+            NvencAv1Mode::UltraLowLatency
+        );
+        assert_eq!(
+            parse_nvenc_av1_mode_value(Some("ull")),
+            NvencAv1Mode::UltraLowLatency
+        );
+        assert_eq!(
+            parse_nvenc_av1_mode_value(Some("high_refresh")),
+            NvencAv1Mode::HighRefresh
+        );
+        assert_eq!(
+            parse_nvenc_av1_mode_value(Some("p6")),
+            NvencAv1Mode::UltraLowLatency
+        );
+        assert_eq!(parse_nvenc_av1_mode_value(None), NvencAv1Mode::LowLatency);
     }
 
     #[cfg(windows)]
@@ -5015,6 +5426,85 @@ mod tests {
 
         assert!(render_frame.is_shared_texture());
         assert_eq!(render_frame.shared_bgra_handle(), Some(77));
+    }
+
+    #[test]
+    fn decoded_cpu_nv12_maps_to_bgra_render_frame() {
+        let frame = DecodedFrame::from_cpu_nv12(2, 2, 0, 2, vec![16, 235, 16, 235, 128, 128]);
+
+        let render_frame = decoded_frame_to_render_frame(&frame);
+
+        assert_eq!(render_frame.pixel_format, RenderPixelFormat::Bgra32);
+        assert_eq!(
+            render_frame.data,
+            RenderFrameData::Bgra32(vec![
+                0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255, 255, 255, 255, 255,
+            ])
+        );
+    }
+
+    #[test]
+    fn decoded_cpu_i420_maps_to_bgra_render_frame() {
+        let frame = DecodedFrame::from_cpu_i420(2, 2, 0, 2, 1, vec![16, 235, 16, 235, 128, 128]);
+
+        let render_frame = decoded_frame_to_render_frame(&frame);
+
+        assert_eq!(render_frame.pixel_format, RenderPixelFormat::Bgra32);
+        assert_eq!(
+            render_frame.data,
+            RenderFrameData::Bgra32(vec![
+                0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255, 255, 255, 255, 255,
+            ])
+        );
+    }
+
+    #[test]
+    fn decoded_cpu_p010_maps_to_bgra_render_frame() {
+        let frame = DecodedFrame::from_cpu_p010(
+            2,
+            2,
+            0,
+            4,
+            vec![0, 0, 192, 255, 0, 0, 192, 255, 0, 128, 0, 128],
+        );
+
+        let render_frame = decoded_frame_to_render_frame(&frame);
+
+        assert_eq!(render_frame.pixel_format, RenderPixelFormat::Bgra32);
+        assert_eq!(
+            render_frame.data,
+            RenderFrameData::Bgra32(vec![
+                0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255, 255, 255, 255, 255,
+            ])
+        );
+    }
+
+    #[test]
+    fn captured_cpu_nv12_maps_to_bgra_render_frame() {
+        let frame = CapturedFrame::from_cpu(
+            2,
+            2,
+            FramePixelFormat::Nv12,
+            0,
+            vec![16, 235, 16, 235, 128, 128],
+        );
+
+        let render_frame = captured_frame_to_render_frame(&frame);
+
+        assert_eq!(render_frame.pixel_format, RenderPixelFormat::Bgra32);
+        assert_eq!(
+            render_frame.data,
+            RenderFrameData::Bgra32(vec![
+                0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255, 255, 255, 255, 255,
+            ])
+        );
+    }
+
+    #[test]
+    fn cpu_nv12_to_bgra32_preserves_bgra_channel_order() {
+        let bgra = cpu_nv12_to_bgra32(&[81, 90, 240], 1, 1, 1);
+
+        assert_eq!(bgra, vec![0, 0, 255, 255]);
     }
 
     #[test]
@@ -5030,17 +5520,22 @@ mod tests {
 
     #[test]
     fn software_h264_encoder_aliases_map_to_openh264() {
-        fn with_encoder_env(value: &str) -> EncoderType {
-            std::env::set_var("MRD_HARNESS_ENCODER", value);
-            let encoder = env_encoder_type();
-            std::env::remove_var("MRD_HARNESS_ENCODER");
-            encoder
-        }
-
-        assert_eq!(with_encoder_env("openh264"), EncoderType::OpenH264);
-        assert_eq!(with_encoder_env("software_h264"), EncoderType::OpenH264);
-        assert_eq!(with_encoder_env("h264_software"), EncoderType::OpenH264);
-        assert_eq!(with_encoder_env("software-h264"), EncoderType::OpenH264);
+        assert_eq!(
+            parse_harness_encoder_type(Some("openh264")),
+            EncoderType::OpenH264
+        );
+        assert_eq!(
+            parse_harness_encoder_type(Some("software_h264")),
+            EncoderType::OpenH264
+        );
+        assert_eq!(
+            parse_harness_encoder_type(Some("h264_software")),
+            EncoderType::OpenH264
+        );
+        assert_eq!(
+            parse_harness_encoder_type(Some("software-h264")),
+            EncoderType::OpenH264
+        );
         assert!(!encoder_allows_zero_copy(&EncoderType::OpenH264));
         assert_eq!(
             comparison_labels(&TestChain::OpenH264),
@@ -5050,17 +5545,22 @@ mod tests {
 
     #[test]
     fn software_vvc_encoder_aliases_map_to_vvenc() {
-        fn with_encoder_env(value: &str) -> EncoderType {
-            std::env::set_var("MRD_HARNESS_ENCODER", value);
-            let encoder = env_encoder_type();
-            std::env::remove_var("MRD_HARNESS_ENCODER");
-            encoder
-        }
-
-        assert_eq!(with_encoder_env("software_vvc"), EncoderType::SoftwareVvc);
-        assert_eq!(with_encoder_env("vvc_software"), EncoderType::SoftwareVvc);
-        assert_eq!(with_encoder_env("software_h266"), EncoderType::SoftwareVvc);
-        assert_eq!(with_encoder_env("vvenc"), EncoderType::SoftwareVvc);
+        assert_eq!(
+            parse_harness_encoder_type(Some("software_vvc")),
+            EncoderType::SoftwareVvc
+        );
+        assert_eq!(
+            parse_harness_encoder_type(Some("vvc_software")),
+            EncoderType::SoftwareVvc
+        );
+        assert_eq!(
+            parse_harness_encoder_type(Some("software_h266")),
+            EncoderType::SoftwareVvc
+        );
+        assert_eq!(
+            parse_harness_encoder_type(Some("vvenc")),
+            EncoderType::SoftwareVvc
+        );
         assert!(!encoder_allows_zero_copy(&EncoderType::SoftwareVvc));
         assert_eq!(
             comparison_labels(&TestChain::Custom {
@@ -5198,6 +5698,26 @@ mod tests {
     }
 
     #[test]
+    fn harness_metrics_serializes_d3d11_render_execute_breakdown_fields() {
+        let value = serde_json::to_value(HarnessMetrics::default()).expect("serialize metrics");
+        let object = value.as_object().expect("metrics object");
+
+        for key in [
+            "render_prepare_wait_latency_avg_ms",
+            "render_prepare_wait_latency_p50_ms",
+            "render_prepare_wait_latency_p95_ms",
+            "render_shared_resource_latency_avg_ms",
+            "render_shared_resource_latency_p50_ms",
+            "render_shared_resource_latency_p95_ms",
+            "render_draw_present_latency_avg_ms",
+            "render_draw_present_latency_p50_ms",
+            "render_draw_present_latency_p95_ms",
+        ] {
+            assert!(object.contains_key(key), "{key} must be serialized");
+        }
+    }
+
+    #[test]
     fn trim_latency_buffers_handles_encode_only_samples() {
         let mut capture_latencies = Vec::new();
         let mut interactive_latencies = Vec::new();
@@ -5205,6 +5725,11 @@ mod tests {
         let mut transport_latencies = Vec::new();
         let mut decode_latencies = Vec::new();
         let mut render_latencies = Vec::new();
+        let mut render_submit_wait_latencies = Vec::new();
+        let mut render_execute_latencies = Vec::new();
+        let mut render_prepare_wait_latencies = Vec::new();
+        let mut render_shared_resource_latencies = Vec::new();
+        let mut render_draw_present_latencies = Vec::new();
         let mut render_present_gaps = Vec::new();
         let mut total_latencies = Vec::new();
 
@@ -5215,6 +5740,11 @@ mod tests {
             &mut transport_latencies,
             &mut decode_latencies,
             &mut render_latencies,
+            &mut render_submit_wait_latencies,
+            &mut render_execute_latencies,
+            &mut render_prepare_wait_latencies,
+            &mut render_shared_resource_latencies,
+            &mut render_draw_present_latencies,
             &mut render_present_gaps,
             &mut total_latencies,
         );
@@ -5226,6 +5756,9 @@ mod tests {
         assert!(transport_latencies.is_empty());
         assert!(decode_latencies.is_empty());
         assert!(render_latencies.is_empty());
+        assert!(render_prepare_wait_latencies.is_empty());
+        assert!(render_shared_resource_latencies.is_empty());
+        assert!(render_draw_present_latencies.is_empty());
         assert!(render_present_gaps.is_empty());
         assert!(total_latencies.is_empty());
     }
@@ -5238,6 +5771,16 @@ mod tests {
         let mut transport_latencies = (0..=1000).map(Duration::from_millis).collect::<Vec<_>>();
         let mut decode_latencies = (0..=1000).map(Duration::from_millis).collect::<Vec<_>>();
         let mut render_latencies = (0..=1000).map(Duration::from_millis).collect::<Vec<_>>();
+        let mut render_submit_wait_latencies =
+            (0..=1000).map(Duration::from_millis).collect::<Vec<_>>();
+        let mut render_execute_latencies =
+            (0..=1000).map(Duration::from_millis).collect::<Vec<_>>();
+        let mut render_prepare_wait_latencies =
+            (0..=1000).map(Duration::from_millis).collect::<Vec<_>>();
+        let mut render_shared_resource_latencies =
+            (0..=1000).map(Duration::from_millis).collect::<Vec<_>>();
+        let mut render_draw_present_latencies =
+            (0..=1000).map(Duration::from_millis).collect::<Vec<_>>();
         let mut render_present_gaps = (0..=1000).map(Duration::from_millis).collect::<Vec<_>>();
         let mut total_latencies = (0..=1000).map(Duration::from_millis).collect::<Vec<_>>();
 
@@ -5248,6 +5791,11 @@ mod tests {
             &mut transport_latencies,
             &mut decode_latencies,
             &mut render_latencies,
+            &mut render_submit_wait_latencies,
+            &mut render_execute_latencies,
+            &mut render_prepare_wait_latencies,
+            &mut render_shared_resource_latencies,
+            &mut render_draw_present_latencies,
             &mut render_present_gaps,
             &mut total_latencies,
         );
@@ -5258,6 +5806,11 @@ mod tests {
         assert_eq!(transport_latencies.len(), 1000);
         assert_eq!(decode_latencies.len(), 1000);
         assert_eq!(render_latencies.len(), 1000);
+        assert_eq!(render_submit_wait_latencies.len(), 1000);
+        assert_eq!(render_execute_latencies.len(), 1000);
+        assert_eq!(render_prepare_wait_latencies.len(), 1000);
+        assert_eq!(render_shared_resource_latencies.len(), 1000);
+        assert_eq!(render_draw_present_latencies.len(), 1000);
         assert_eq!(render_present_gaps.len(), 1000);
         assert_eq!(total_latencies.len(), 1000);
         assert_eq!(capture_latencies[0], Duration::from_millis(1));
@@ -5266,6 +5819,14 @@ mod tests {
         assert_eq!(transport_latencies[0], Duration::from_millis(1));
         assert_eq!(decode_latencies[0], Duration::from_millis(1));
         assert_eq!(render_latencies[0], Duration::from_millis(1));
+        assert_eq!(render_submit_wait_latencies[0], Duration::from_millis(1));
+        assert_eq!(render_execute_latencies[0], Duration::from_millis(1));
+        assert_eq!(render_prepare_wait_latencies[0], Duration::from_millis(1));
+        assert_eq!(
+            render_shared_resource_latencies[0],
+            Duration::from_millis(1)
+        );
+        assert_eq!(render_draw_present_latencies[0], Duration::from_millis(1));
         assert_eq!(render_present_gaps[0], Duration::from_millis(1));
         assert_eq!(total_latencies[0], Duration::from_millis(1));
     }
@@ -5380,6 +5941,11 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
             RenderPacingCounters::default(),
             &total_latencies,
         );
@@ -5405,6 +5971,11 @@ mod tests {
             0,
             0,
             &start_time,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
             &[],
             &[],
             &[],
@@ -5443,6 +6014,11 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
             RenderPacingCounters::default(),
             &[],
         );
@@ -5460,6 +6036,16 @@ mod tests {
             Duration::from_micros(180),
             Duration::from_micros(210),
             Duration::from_micros(350),
+        ];
+        let render_submit_wait_latencies = vec![
+            Duration::from_micros(30),
+            Duration::from_micros(60),
+            Duration::from_micros(90),
+        ];
+        let render_execute_latencies = vec![
+            Duration::from_micros(150),
+            Duration::from_micros(180),
+            Duration::from_micros(260),
         ];
         let render_present_gaps = vec![
             Duration::from_millis(6),
@@ -5492,6 +6078,11 @@ mod tests {
             &[],
             &[],
             &render_latencies,
+            &render_submit_wait_latencies,
+            &render_execute_latencies,
+            &[],
+            &[],
+            &[],
             &render_present_gaps,
             render_pacing,
             &[],
@@ -5500,6 +6091,10 @@ mod tests {
         let snapshot = metrics.lock().unwrap();
         assert!((snapshot.render_latency_p50_ms - 0.21).abs() < 0.001);
         assert!((snapshot.render_latency_p95_ms - 0.35).abs() < 0.001);
+        assert!((snapshot.render_submit_wait_latency_p50_ms - 0.06).abs() < 0.001);
+        assert!((snapshot.render_submit_wait_latency_p95_ms - 0.09).abs() < 0.001);
+        assert!((snapshot.render_execute_latency_p50_ms - 0.18).abs() < 0.001);
+        assert!((snapshot.render_execute_latency_p95_ms - 0.26).abs() < 0.001);
         assert_eq!(snapshot.render_submitted_frames, 12);
         assert_eq!(snapshot.render_uploaded_frames, 11);
         assert_eq!(snapshot.render_presented_frames, 10);
@@ -5513,6 +6108,61 @@ mod tests {
             snapshot.present_latency_avg_ms,
             snapshot.render_present_gap_avg_ms
         );
+    }
+
+    #[test]
+    fn update_metrics_reports_d3d11_render_execute_breakdown_distribution() {
+        let metrics = Arc::new(Mutex::new(HarnessMetrics::default()));
+        let start_time = Instant::now() - Duration::from_secs(1);
+        let render_prepare_wait_latencies = vec![
+            Duration::from_micros(10),
+            Duration::from_micros(20),
+            Duration::from_micros(30),
+        ];
+        let render_shared_resource_latencies = vec![
+            Duration::from_micros(800),
+            Duration::from_micros(1_200),
+            Duration::from_micros(1_500),
+        ];
+        let render_draw_present_latencies = vec![
+            Duration::from_micros(1_400),
+            Duration::from_micros(1_700),
+            Duration::from_micros(2_100),
+        ];
+
+        TestHarness::update_metrics(
+            &metrics,
+            12,
+            0,
+            12,
+            12,
+            0,
+            0,
+            0,
+            &start_time,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &render_prepare_wait_latencies,
+            &render_shared_resource_latencies,
+            &render_draw_present_latencies,
+            &[],
+            RenderPacingCounters::default(),
+            &[],
+        );
+
+        let snapshot = metrics.lock().unwrap();
+        assert!((snapshot.render_prepare_wait_latency_p50_ms - 0.02).abs() < 0.001);
+        assert!((snapshot.render_prepare_wait_latency_p95_ms - 0.03).abs() < 0.001);
+        assert!((snapshot.render_shared_resource_latency_p50_ms - 1.2).abs() < 0.001);
+        assert!((snapshot.render_shared_resource_latency_p95_ms - 1.5).abs() < 0.001);
+        assert!((snapshot.render_draw_present_latency_p50_ms - 1.7).abs() < 0.001);
+        assert!((snapshot.render_draw_present_latency_p95_ms - 2.1).abs() < 0.001);
     }
 
     #[test]
@@ -5698,24 +6348,40 @@ mod tests {
         }
     }
 
-    fn env_encoder_type() -> EncoderType {
-        match std::env::var("MRD_HARNESS_ENCODER").as_deref() {
-            Ok("none") => EncoderType::None,
-            Ok("openh264") | Ok("software_h264") | Ok("h264_software") | Ok("software-h264")
-            | Ok("h264-software") | Ok("sw_h264") => EncoderType::OpenH264,
-            Ok("software_vvc") | Ok("vvc_software") | Ok("software_h266") | Ok("h266_software")
-            | Ok("software-vvc") | Ok("vvc-software") | Ok("software-h266")
-            | Ok("h266-software") | Ok("vvenc") | Ok("vvc") | Ok("h266") | Ok("h.266") => {
-                EncoderType::SoftwareVvc
-            }
-            Ok("nvenc_av1") => EncoderType::NvencAv1,
-            Ok("nvenc_hevc") | Ok("hevc") => EncoderType::NvencHevc,
-            Ok("nvenc_hevc_main10") | Ok("hevc_main10") | Ok("hevc-main10") => {
+    fn parse_harness_encoder_type(value: Option<&str>) -> EncoderType {
+        match value {
+            Some("none") => EncoderType::None,
+            Some("openh264")
+            | Some("software_h264")
+            | Some("h264_software")
+            | Some("software-h264")
+            | Some("h264-software")
+            | Some("sw_h264") => EncoderType::OpenH264,
+            Some("software_vvc")
+            | Some("vvc_software")
+            | Some("software_h266")
+            | Some("h266_software")
+            | Some("software-vvc")
+            | Some("vvc-software")
+            | Some("software-h266")
+            | Some("h266-software")
+            | Some("vvenc")
+            | Some("vvc")
+            | Some("h266")
+            | Some("h.266") => EncoderType::SoftwareVvc,
+            Some("nvenc_av1") => EncoderType::NvencAv1,
+            Some("nvenc_hevc") | Some("hevc") => EncoderType::NvencHevc,
+            Some("nvenc_hevc_main10") | Some("hevc_main10") | Some("hevc-main10") => {
                 EncoderType::NvencHevcMain10
             }
-            Ok("videotoolbox_h264") | Ok("videotoolbox") => EncoderType::VideoToolboxH264,
+            Some("videotoolbox_h264") | Some("videotoolbox") => EncoderType::VideoToolboxH264,
             _ => EncoderType::NvencH264,
         }
+    }
+
+    fn env_encoder_type() -> EncoderType {
+        let value = std::env::var("MRD_HARNESS_ENCODER").ok();
+        parse_harness_encoder_type(value.as_deref())
     }
 
     fn env_decoder_type() -> DecoderType {

@@ -12,6 +12,7 @@ import {
 } from "lucide-react";
 import * as commands from "../adapters/tauri/commands";
 import type { HarnessMetrics, TestChain, TestChainOption } from "../adapters/tauri/types";
+import { RenderBreakdownMetrics } from "./RenderBreakdownMetrics";
 
 const FRAME_UPDATE_INTERVAL_MS = 100;
 const METRICS_UPDATE_INTERVAL_MS = 200;
@@ -255,6 +256,8 @@ export function TestPage() {
             />
           </div>
         )}
+
+        {metrics && <RenderBreakdownMetrics metrics={metrics} />}
 
         {/* Detailed Metrics */}
         {metrics && (

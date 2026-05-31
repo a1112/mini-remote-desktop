@@ -60,6 +60,16 @@ pub struct BenchmarkSummary {
     pub decode_total_p95_ms: Option<f64>,
     pub frame_sink_ingest_p95_ms: Option<f64>,
     pub render_upload_p95_ms: Option<f64>,
+    #[serde(default)]
+    pub render_submit_wait_p95_ms: Option<f64>,
+    #[serde(default)]
+    pub render_execute_p95_ms: Option<f64>,
+    #[serde(default)]
+    pub render_prepare_wait_p95_ms: Option<f64>,
+    #[serde(default)]
+    pub render_shared_resource_p95_ms: Option<f64>,
+    #[serde(default)]
+    pub render_draw_present_p95_ms: Option<f64>,
     pub render_present_p95_ms: Option<f64>,
     #[serde(default)]
     pub render_submitted_frames: Option<u64>,
@@ -124,6 +134,51 @@ impl BenchmarkSummary {
             .map(|(_, value)| *value)
     }
 
+    fn renderer_enabled(renderer_backend: &str) -> bool {
+        !renderer_backend.eq_ignore_ascii_case("none")
+    }
+
+    fn nonzero_counter(value: Option<u64>) -> Option<u64> {
+        value.filter(|value| *value > 0)
+    }
+
+    fn render_health_failure_reason(
+        renderer_backend: &str,
+        render_submitted_frames: Option<u64>,
+        render_uploaded_frames: Option<u64>,
+        render_presented_frames: Option<u64>,
+    ) -> Option<String> {
+        if !Self::renderer_enabled(renderer_backend) {
+            return None;
+        }
+
+        if let Some(submitted_frames) = render_submitted_frames {
+            if submitted_frames >= 30 {
+                let uploaded_frames = render_uploaded_frames.unwrap_or(0);
+                let minimum_uploaded = (submitted_frames / 10).max(3);
+                if uploaded_frames < minimum_uploaded {
+                    return Some(format!(
+                        "render upload starvation: uploaded {uploaded_frames} of {submitted_frames} submitted render frames, minimum {minimum_uploaded}"
+                    ));
+                }
+            }
+        }
+
+        let uploaded_frames = match render_uploaded_frames {
+            Some(value) if value >= 30 => value,
+            _ => return None,
+        };
+        let presented_frames = render_presented_frames.unwrap_or(0);
+        let minimum_presented = (uploaded_frames / 10).max(3);
+        if presented_frames < minimum_presented {
+            return Some(format!(
+                "render present collapse: presented {presented_frames} of {uploaded_frames} uploaded render frames, minimum {minimum_presented}"
+            ));
+        }
+
+        None
+    }
+
     pub fn from_probe(
         manifest: &BenchmarkManifest,
         probe: &PipelineProbeSnapshot,
@@ -157,6 +212,20 @@ impl BenchmarkSummary {
                 .iter()
                 .any(|(candidate, stats)| candidate == stage && stats.count > 0)
         });
+        let render_submitted_frames = Self::counter(probe, "render_submitted_frames");
+        let render_uploaded_frames = Self::counter(probe, "render_uploaded_frames");
+        let render_presented_frames = Self::counter(probe, "render_presented_frames");
+        let render_present_skipped_frames = Self::counter(probe, "render_present_skipped_frames");
+        let render_queue_replacements = Self::counter(probe, "render_queue_replacements");
+        let render_stale_frame_drops = Self::counter(probe, "render_stale_frame_drops");
+        let failure_reason = Self::render_health_failure_reason(
+            &manifest.renderer_backend,
+            Self::nonzero_counter(render_submitted_frames),
+            Self::nonzero_counter(render_uploaded_frames),
+            render_presented_frames,
+        );
+        let run_passed =
+            session_established && first_frame_seen && probe_complete && failure_reason.is_none();
 
         Self {
             run_id: manifest.run_id.clone(),
@@ -200,13 +269,18 @@ impl BenchmarkSummary {
             decode_total_p95_ms: stage_p95(StageId::DecodeTotal),
             frame_sink_ingest_p95_ms: stage_p95(StageId::FrameSinkIngest),
             render_upload_p95_ms: stage_p95(StageId::RenderUpload),
+            render_submit_wait_p95_ms: stage_p95(StageId::RenderSubmitWait),
+            render_execute_p95_ms: stage_p95(StageId::RenderExecute),
+            render_prepare_wait_p95_ms: stage_p95(StageId::RenderPrepareWait),
+            render_shared_resource_p95_ms: stage_p95(StageId::RenderSharedResource),
+            render_draw_present_p95_ms: stage_p95(StageId::RenderDrawPresent),
             render_present_p95_ms: stage_p95(StageId::RenderPresent),
-            render_submitted_frames: Self::counter(probe, "render_submitted_frames"),
-            render_uploaded_frames: Self::counter(probe, "render_uploaded_frames"),
-            render_presented_frames: Self::counter(probe, "render_presented_frames"),
-            render_present_skipped_frames: Self::counter(probe, "render_present_skipped_frames"),
-            render_queue_replacements: Self::counter(probe, "render_queue_replacements"),
-            render_stale_frame_drops: Self::counter(probe, "render_stale_frame_drops"),
+            render_submitted_frames,
+            render_uploaded_frames,
+            render_presented_frames,
+            render_present_skipped_frames,
+            render_queue_replacements,
+            render_stale_frame_drops,
             swap_chain_waitable_object: None,
             swap_chain_present_mode: None,
             display_refresh_hz: None,
@@ -215,9 +289,9 @@ impl BenchmarkSummary {
             nvdec_h264_capability,
             nvdec_hevc_capability,
             nvdec_hevc_main10_capability,
-            failure_reason: None,
+            failure_reason,
             run_skipped: false,
-            run_passed: session_established && first_frame_seen && probe_complete,
+            run_passed,
         }
     }
 
@@ -257,6 +331,21 @@ impl BenchmarkSummary {
             .filter(|_| manifest.duration_secs > 0)
             .map(|frames| frames as f64 / manifest.duration_secs as f64)
             .unwrap_or(receiver_probe.fps);
+        let render_submitted_frames = Self::counter(receiver_probe, "render_submitted_frames");
+        let render_uploaded_frames = Self::counter(receiver_probe, "render_uploaded_frames");
+        let render_presented_frames = Self::counter(receiver_probe, "render_presented_frames");
+        let render_present_skipped_frames =
+            Self::counter(receiver_probe, "render_present_skipped_frames");
+        let render_queue_replacements = Self::counter(receiver_probe, "render_queue_replacements");
+        let render_stale_frame_drops = Self::counter(receiver_probe, "render_stale_frame_drops");
+        let failure_reason = Self::render_health_failure_reason(
+            &manifest.renderer_backend,
+            Self::nonzero_counter(render_submitted_frames),
+            Self::nonzero_counter(render_uploaded_frames),
+            render_presented_frames,
+        );
+        let run_passed =
+            session_established && first_frame_seen && probe_complete && failure_reason.is_none();
 
         Self {
             run_id: manifest.run_id.clone(),
@@ -317,16 +406,21 @@ impl BenchmarkSummary {
             decode_total_p95_ms: find_stage(receiver_probe, StageId::DecodeTotal),
             frame_sink_ingest_p95_ms: find_stage(receiver_probe, StageId::FrameSinkIngest),
             render_upload_p95_ms: find_stage(receiver_probe, StageId::RenderUpload),
-            render_present_p95_ms: find_stage(receiver_probe, StageId::RenderPresent),
-            render_submitted_frames: Self::counter(receiver_probe, "render_submitted_frames"),
-            render_uploaded_frames: Self::counter(receiver_probe, "render_uploaded_frames"),
-            render_presented_frames: Self::counter(receiver_probe, "render_presented_frames"),
-            render_present_skipped_frames: Self::counter(
+            render_submit_wait_p95_ms: find_stage(receiver_probe, StageId::RenderSubmitWait),
+            render_execute_p95_ms: find_stage(receiver_probe, StageId::RenderExecute),
+            render_prepare_wait_p95_ms: find_stage(receiver_probe, StageId::RenderPrepareWait),
+            render_shared_resource_p95_ms: find_stage(
                 receiver_probe,
-                "render_present_skipped_frames",
+                StageId::RenderSharedResource,
             ),
-            render_queue_replacements: Self::counter(receiver_probe, "render_queue_replacements"),
-            render_stale_frame_drops: Self::counter(receiver_probe, "render_stale_frame_drops"),
+            render_draw_present_p95_ms: find_stage(receiver_probe, StageId::RenderDrawPresent),
+            render_present_p95_ms: find_stage(receiver_probe, StageId::RenderPresent),
+            render_submitted_frames,
+            render_uploaded_frames,
+            render_presented_frames,
+            render_present_skipped_frames,
+            render_queue_replacements,
+            render_stale_frame_drops,
             swap_chain_waitable_object: None,
             swap_chain_present_mode: None,
             display_refresh_hz: None,
@@ -335,9 +429,9 @@ impl BenchmarkSummary {
             nvdec_h264_capability,
             nvdec_hevc_capability,
             nvdec_hevc_main10_capability,
-            failure_reason: None,
+            failure_reason,
             run_skipped: false,
-            run_passed: session_established && first_frame_seen && probe_complete,
+            run_passed,
         }
     }
 
@@ -378,6 +472,11 @@ impl BenchmarkSummary {
             "decode_total_p95_ms",
             "frame_sink_ingest_p95_ms",
             "render_upload_p95_ms",
+            "render_submit_wait_p95_ms",
+            "render_execute_p95_ms",
+            "render_prepare_wait_p95_ms",
+            "render_shared_resource_p95_ms",
+            "render_draw_present_p95_ms",
             "render_present_p95_ms",
             "render_submitted_frames",
             "render_uploaded_frames",
@@ -436,6 +535,11 @@ impl BenchmarkSummary {
             option_f64(self.decode_total_p95_ms),
             option_f64(self.frame_sink_ingest_p95_ms),
             option_f64(self.render_upload_p95_ms),
+            option_f64(self.render_submit_wait_p95_ms),
+            option_f64(self.render_execute_p95_ms),
+            option_f64(self.render_prepare_wait_p95_ms),
+            option_f64(self.render_shared_resource_p95_ms),
+            option_f64(self.render_draw_present_p95_ms),
             option_f64(self.render_present_p95_ms),
             option_u64(self.render_submitted_frames),
             option_u64(self.render_uploaded_frames),
@@ -617,6 +721,11 @@ Duration: `{duration}s`\n\n\
 | decode_total_p95_ms | {decode_p95} |\n\
 | frame_sink_ingest_p95_ms | {frame_sink_p95} |\n\
 | render_upload_p95_ms | {render_p95} |\n\
+| render_submit_wait_p95_ms | {render_submit_wait_p95} |\n\
+| render_execute_p95_ms | {render_execute_p95} |\n\
+| render_prepare_wait_p95_ms | {render_prepare_wait_p95} |\n\
+| render_shared_resource_p95_ms | {render_shared_resource_p95} |\n\
+| render_draw_present_p95_ms | {render_draw_present_p95} |\n\
 | render_present_p95_ms | {present_p95} |\n\
 | swap_chain_waitable_object | {swap_chain_waitable} |\n\
 | swap_chain_present_mode | {swap_chain_present_mode} |\n\
@@ -664,6 +773,11 @@ Duration: `{duration}s`\n\n\
         decode_p95 = option_f64(summary.decode_total_p95_ms),
         frame_sink_p95 = option_f64(summary.frame_sink_ingest_p95_ms),
         render_p95 = option_f64(summary.render_upload_p95_ms),
+        render_submit_wait_p95 = option_f64(summary.render_submit_wait_p95_ms),
+        render_execute_p95 = option_f64(summary.render_execute_p95_ms),
+        render_prepare_wait_p95 = option_f64(summary.render_prepare_wait_p95_ms),
+        render_shared_resource_p95 = option_f64(summary.render_shared_resource_p95_ms),
+        render_draw_present_p95 = option_f64(summary.render_draw_present_p95_ms),
         present_p95 = option_f64(summary.render_present_p95_ms),
         swap_chain_waitable = option_bool(summary.swap_chain_waitable_object),
         swap_chain_present_mode = summary
@@ -840,12 +954,17 @@ mod tests {
             && metrics.encode_latency_p95_ms > 0.0
             && metrics.decode_latency_p95_ms > 0.0
             && render_probe_complete;
-        let failure_reason = harness_failure_reason(&metrics, first_frame_time_ms, probe_complete);
+        let failure_reason = harness_failure_reason(
+            &metrics,
+            &manifest.renderer_backend,
+            first_frame_time_ms,
+            probe_complete,
+        );
         let run_passed = first_frame_seen
             && probe_complete
             && metrics.encode_failures == 0
             && metrics.decode_failures == 0
-            && metrics.error_message.is_none();
+            && failure_reason.is_none();
 
         let summary = BenchmarkSummary {
             run_id: manifest.run_id.clone(),
@@ -883,6 +1002,13 @@ mod tests {
             decode_total_p95_ms: nonzero_option(metrics.decode_latency_p95_ms),
             frame_sink_ingest_p95_ms: nonzero_option(metrics.interactive_latency_p95_ms),
             render_upload_p95_ms: nonzero_option(metrics.render_latency_p95_ms),
+            render_submit_wait_p95_ms: nonzero_option(metrics.render_submit_wait_latency_p95_ms),
+            render_execute_p95_ms: nonzero_option(metrics.render_execute_latency_p95_ms),
+            render_prepare_wait_p95_ms: nonzero_option(metrics.render_prepare_wait_latency_p95_ms),
+            render_shared_resource_p95_ms: nonzero_option(
+                metrics.render_shared_resource_latency_p95_ms,
+            ),
+            render_draw_present_p95_ms: nonzero_option(metrics.render_draw_present_latency_p95_ms),
             render_present_p95_ms: nonzero_option(metrics.render_present_gap_p95_ms),
             render_submitted_frames: Some(metrics.render_submitted_frames),
             render_uploaded_frames: Some(metrics.render_uploaded_frames),
@@ -908,6 +1034,7 @@ mod tests {
 
     fn harness_failure_reason(
         metrics: &crate::test_harness::HarnessMetrics,
+        renderer_backend: &str,
         first_frame_time_ms: Option<f64>,
         probe_complete: bool,
     ) -> Option<String> {
@@ -925,6 +1052,14 @@ mod tests {
         }
         if !probe_complete {
             return Some("benchmark probe did not collect all required stage metrics".to_string());
+        }
+        if let Some(reason) = BenchmarkSummary::render_health_failure_reason(
+            renderer_backend,
+            BenchmarkSummary::nonzero_counter(Some(metrics.render_submitted_frames)),
+            BenchmarkSummary::nonzero_counter(Some(metrics.render_uploaded_frames)),
+            Some(metrics.render_presented_frames),
+        ) {
+            return Some(reason);
         }
         None
     }
@@ -1001,6 +1136,51 @@ mod tests {
                         metrics.render_latency_avg_ms,
                         metrics.render_latency_p50_ms,
                         metrics.render_latency_p95_ms,
+                        0,
+                    ),
+                ),
+                (
+                    StageId::RenderSubmitWait,
+                    stats_from_metrics(
+                        metrics.render_submit_wait_latency_avg_ms,
+                        metrics.render_submit_wait_latency_p50_ms,
+                        metrics.render_submit_wait_latency_p95_ms,
+                        0,
+                    ),
+                ),
+                (
+                    StageId::RenderExecute,
+                    stats_from_metrics(
+                        metrics.render_execute_latency_avg_ms,
+                        metrics.render_execute_latency_p50_ms,
+                        metrics.render_execute_latency_p95_ms,
+                        0,
+                    ),
+                ),
+                (
+                    StageId::RenderPrepareWait,
+                    stats_from_metrics(
+                        metrics.render_prepare_wait_latency_avg_ms,
+                        metrics.render_prepare_wait_latency_p50_ms,
+                        metrics.render_prepare_wait_latency_p95_ms,
+                        0,
+                    ),
+                ),
+                (
+                    StageId::RenderSharedResource,
+                    stats_from_metrics(
+                        metrics.render_shared_resource_latency_avg_ms,
+                        metrics.render_shared_resource_latency_p50_ms,
+                        metrics.render_shared_resource_latency_p95_ms,
+                        0,
+                    ),
+                ),
+                (
+                    StageId::RenderDrawPresent,
+                    stats_from_metrics(
+                        metrics.render_draw_present_latency_avg_ms,
+                        metrics.render_draw_present_latency_p50_ms,
+                        metrics.render_draw_present_latency_p95_ms,
                         0,
                     ),
                 ),
@@ -1245,6 +1425,11 @@ mod tests {
             decode_total_p95_ms: None,
             frame_sink_ingest_p95_ms: None,
             render_upload_p95_ms: None,
+            render_submit_wait_p95_ms: None,
+            render_execute_p95_ms: None,
+            render_prepare_wait_p95_ms: None,
+            render_shared_resource_p95_ms: None,
+            render_draw_present_p95_ms: None,
             render_present_p95_ms: None,
             render_submitted_frames: None,
             render_uploaded_frames: None,
@@ -1370,6 +1555,21 @@ mod tests {
             render_latency_avg_ms: 0.20,
             render_latency_p50_ms: 0.18,
             render_latency_p95_ms: 0.35,
+            render_submit_wait_latency_avg_ms: 0.03,
+            render_submit_wait_latency_p50_ms: 0.02,
+            render_submit_wait_latency_p95_ms: 0.06,
+            render_execute_latency_avg_ms: 0.17,
+            render_execute_latency_p50_ms: 0.16,
+            render_execute_latency_p95_ms: 0.29,
+            render_prepare_wait_latency_avg_ms: 0.01,
+            render_prepare_wait_latency_p50_ms: 0.01,
+            render_prepare_wait_latency_p95_ms: 0.02,
+            render_shared_resource_latency_avg_ms: 0.08,
+            render_shared_resource_latency_p50_ms: 0.07,
+            render_shared_resource_latency_p95_ms: 0.11,
+            render_draw_present_latency_avg_ms: 0.08,
+            render_draw_present_latency_p50_ms: 0.08,
+            render_draw_present_latency_p95_ms: 0.16,
             render_present_gap_avg_ms: 6.94,
             render_present_gap_p50_ms: 6.90,
             render_present_gap_p95_ms: 7.40,
@@ -1398,10 +1598,50 @@ mod tests {
             .find(|(stage, _)| *stage == StageId::RenderPresent)
             .map(|(_, stats)| stats)
             .expect("render present stage");
+        let render_submit_wait = probe
+            .stages
+            .iter()
+            .find(|(stage, _)| *stage == StageId::RenderSubmitWait)
+            .map(|(_, stats)| stats)
+            .expect("render submit wait stage");
+        let render_execute = probe
+            .stages
+            .iter()
+            .find(|(stage, _)| *stage == StageId::RenderExecute)
+            .map(|(_, stats)| stats)
+            .expect("render execute stage");
+        let render_prepare_wait = probe
+            .stages
+            .iter()
+            .find(|(stage, _)| *stage == StageId::RenderPrepareWait)
+            .map(|(_, stats)| stats)
+            .expect("render prepare wait stage");
+        let render_shared_resource = probe
+            .stages
+            .iter()
+            .find(|(stage, _)| *stage == StageId::RenderSharedResource)
+            .map(|(_, stats)| stats)
+            .expect("render shared resource stage");
+        let render_draw_present = probe
+            .stages
+            .iter()
+            .find(|(stage, _)| *stage == StageId::RenderDrawPresent)
+            .map(|(_, stats)| stats)
+            .expect("render draw present stage");
 
         assert_eq!(probe.fps, 118.0);
         assert_eq!(render_upload.p50_ms, Some(0.18));
         assert_eq!(render_upload.p95_ms, Some(0.35));
+        assert_eq!(render_submit_wait.p50_ms, Some(0.02));
+        assert_eq!(render_submit_wait.p95_ms, Some(0.06));
+        assert_eq!(render_execute.p50_ms, Some(0.16));
+        assert_eq!(render_execute.p95_ms, Some(0.29));
+        assert_eq!(render_prepare_wait.p50_ms, Some(0.01));
+        assert_eq!(render_prepare_wait.p95_ms, Some(0.02));
+        assert_eq!(render_shared_resource.p50_ms, Some(0.07));
+        assert_eq!(render_shared_resource.p95_ms, Some(0.11));
+        assert_eq!(render_draw_present.p50_ms, Some(0.08));
+        assert_eq!(render_draw_present.p95_ms, Some(0.16));
         assert_eq!(render_present.p50_ms, Some(6.90));
         assert_eq!(render_present.p95_ms, Some(7.40));
         assert!(probe
@@ -1494,6 +1734,160 @@ mod tests {
         assert!(!summary.nvdec_h264_capability.is_empty());
         assert!(!summary.nvdec_hevc_capability.is_empty());
         assert!(!summary.nvdec_hevc_main10_capability.is_empty());
+    }
+
+    #[test]
+    fn benchmark_summary_fails_when_renderer_present_collapses() {
+        let probe = PipelineProbeSnapshot::from_parts(
+            SessionId("session-present-collapse".into()),
+            "session-primary".into(),
+            Some("dxgi".into()),
+            Some("av1".into()),
+            Some("webrtc".into()),
+            134.0,
+            80_000.0,
+            0,
+            0,
+            vec![
+                ("render_submitted_frames".into(), 1_575),
+                ("render_uploaded_frames".into(), 1_575),
+                ("render_presented_frames".into(), 2),
+                ("render_present_skipped_frames".into(), 1_093),
+                ("render_queue_replacements".into(), 1_573),
+                ("render_stale_frame_drops".into(), 1_573),
+            ],
+            vec![
+                (
+                    StageId::EncodeTotal,
+                    StageStatsSnapshot::from_durations_ms(&[2.0, 4.0], 3000),
+                ),
+                (
+                    StageId::SendWrite,
+                    StageStatsSnapshot::from_durations_ms(&[0.1, 0.2], 3000),
+                ),
+                (
+                    StageId::DecodeTotal,
+                    StageStatsSnapshot::from_durations_ms(&[2.0, 4.0], 3000),
+                ),
+                (
+                    StageId::FrameSinkIngest,
+                    StageStatsSnapshot::from_durations_ms(&[0.2, 0.4], 3000),
+                ),
+                (
+                    StageId::RenderUpload,
+                    StageStatsSnapshot::from_durations_ms(&[1.0, 20.0], 3000),
+                ),
+                (
+                    StageId::RenderPresent,
+                    StageStatsSnapshot::from_durations_ms(&[6.0, 8.0], 3000),
+                ),
+            ],
+        );
+
+        let summary = BenchmarkSummary::from_probe(
+            &BenchmarkManifest {
+                run_id: "quick-webrtc-20260531-av1-collapse".into(),
+                scenario: "quick.transport".into(),
+                transport: "webrtc".into(),
+                capture_backend: "dxgi".into(),
+                encode_backend: "nvenc_av1".into(),
+                decode_backend: "nvdec_av1".into(),
+                renderer_backend: "d3d11".into(),
+                width: 2560,
+                height: 1440,
+                fps: 144,
+                duration_secs: 20,
+                git_commit: "abc123".into(),
+            },
+            &probe,
+            true,
+            true,
+            386.0,
+        );
+
+        assert!(!summary.run_passed);
+        assert!(summary
+            .failure_reason
+            .as_deref()
+            .expect("failure reason")
+            .contains("render present collapse"));
+    }
+
+    #[test]
+    fn benchmark_summary_fails_when_renderer_upload_starves() {
+        let probe = PipelineProbeSnapshot::from_parts(
+            SessionId("session-upload-starvation".into()),
+            "session-primary".into(),
+            Some("dxgi".into()),
+            Some("av1".into()),
+            Some("webrtc".into()),
+            122.0,
+            80_000.0,
+            0,
+            0,
+            vec![
+                ("render_submitted_frames".into(), 2_430),
+                ("render_uploaded_frames".into(), 25),
+                ("render_presented_frames".into(), 25),
+                ("render_present_skipped_frames".into(), 590),
+                ("render_queue_replacements".into(), 1_813),
+                ("render_stale_frame_drops".into(), 1_813),
+            ],
+            vec![
+                (
+                    StageId::EncodeTotal,
+                    StageStatsSnapshot::from_durations_ms(&[2.0, 4.0], 3000),
+                ),
+                (
+                    StageId::SendWrite,
+                    StageStatsSnapshot::from_durations_ms(&[0.1, 0.2], 3000),
+                ),
+                (
+                    StageId::DecodeTotal,
+                    StageStatsSnapshot::from_durations_ms(&[2.0, 4.0], 3000),
+                ),
+                (
+                    StageId::FrameSinkIngest,
+                    StageStatsSnapshot::from_durations_ms(&[0.2, 0.4], 3000),
+                ),
+                (
+                    StageId::RenderUpload,
+                    StageStatsSnapshot::from_durations_ms(&[1.0, 20.0], 3000),
+                ),
+                (
+                    StageId::RenderPresent,
+                    StageStatsSnapshot::from_durations_ms(&[6.0, 39.0], 3000),
+                ),
+            ],
+        );
+
+        let summary = BenchmarkSummary::from_probe(
+            &BenchmarkManifest {
+                run_id: "quick-webrtc-20260531-av1-upload-starvation".into(),
+                scenario: "quick.transport".into(),
+                transport: "webrtc".into(),
+                capture_backend: "dxgi".into(),
+                encode_backend: "nvenc_av1".into(),
+                decode_backend: "nvdec_av1".into(),
+                renderer_backend: "d3d11".into(),
+                width: 2560,
+                height: 1440,
+                fps: 144,
+                duration_secs: 20,
+                git_commit: "abc123".into(),
+            },
+            &probe,
+            true,
+            true,
+            384.0,
+        );
+
+        assert!(!summary.run_passed);
+        assert!(summary
+            .failure_reason
+            .as_deref()
+            .expect("failure reason")
+            .contains("render upload starvation"));
     }
 
     #[test]
@@ -1719,6 +2113,11 @@ mod tests {
             decode_total_p95_ms: None,
             frame_sink_ingest_p95_ms: None,
             render_upload_p95_ms: None,
+            render_submit_wait_p95_ms: None,
+            render_execute_p95_ms: None,
+            render_prepare_wait_p95_ms: None,
+            render_shared_resource_p95_ms: None,
+            render_draw_present_p95_ms: None,
             render_present_p95_ms: None,
             render_submitted_frames: Some(10),
             render_uploaded_frames: Some(9),
@@ -1749,6 +2148,9 @@ mod tests {
         assert_eq!(row[2], "webrtc");
         assert!(header.contains(&"quic_receiver_completed_frames"));
         assert!(header.contains(&"render_queue_replacements"));
+        assert!(header.contains(&"render_prepare_wait_p95_ms"));
+        assert!(header.contains(&"render_shared_resource_p95_ms"));
+        assert!(header.contains(&"render_draw_present_p95_ms"));
         assert!(header.contains(&"nvdec_hevc_main10_capability"));
         let render_replacements_index = header
             .iter()

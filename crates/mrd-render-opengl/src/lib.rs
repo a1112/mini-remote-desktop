@@ -114,6 +114,9 @@ impl OpenglRenderer {
                 waitable_wait_total_ms: None,
                 waitable_timeout_count: None,
                 last_waitable_wait_ms: None,
+                last_render_prepare_wait_ms: None,
+                last_render_shared_resource_ms: None,
+                last_render_draw_present_ms: None,
                 last_width: 0,
                 last_height: 0,
                 last_pixel_format: None,
@@ -279,6 +282,19 @@ fn choose_shared_texture_path(
     } else {
         SharedTexturePath::ReadbackFallback
     }
+}
+
+#[cfg(windows)]
+fn allow_shared_texture_readback_fallback() -> bool {
+    std::env::var("MRD_OPENGL_ALLOW_READBACK_FALLBACK")
+        .ok()
+        .as_deref()
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
 }
 
 #[cfg(windows)]
@@ -1347,11 +1363,24 @@ impl WindowsGlSurface {
         bridge: &D3d11ReadbackBridge,
     ) -> Result<SharedTexturePath, RenderError> {
         let path = choose_shared_texture_path(true, !self.interop_disabled);
+        let allow_readback_fallback = allow_shared_texture_readback_fallback();
         if path != SharedTexturePath::WglDxInterop {
+            if path == SharedTexturePath::ReadbackFallback && !allow_readback_fallback {
+                return Err(RenderError::Message(
+                    "OpenGL hybrid D3D11 readback fallback is disabled; set MRD_OPENGL_ALLOW_READBACK_FALLBACK=1 to allow the slow GPU readback path"
+                        .to_string(),
+                ));
+            }
             return Ok(path);
         }
 
         if InteropNv12Key::from_frame(frame).is_none() {
+            if !allow_readback_fallback {
+                return Err(RenderError::Message(
+                    "OpenGL hybrid readback fallback for non-NV12 shared textures is disabled; set MRD_OPENGL_ALLOW_READBACK_FALLBACK=1 to allow the slow GPU readback path"
+                        .to_string(),
+                ));
+            }
             return Ok(SharedTexturePath::ReadbackFallback);
         }
 
@@ -1366,6 +1395,11 @@ impl WindowsGlSurface {
         match self.present_nv12_interop(frame, bridge) {
             Ok(()) => Ok(SharedTexturePath::WglDxInterop),
             Err(error) => {
+                if !allow_readback_fallback {
+                    return Err(RenderError::Message(format!(
+                        "OpenGL WGL/DX interop unavailable and readback fallback is disabled: {error}"
+                    )));
+                }
                 eprintln!("OpenGL WGL/DX interop unavailable; falling back to readback: {error}");
                 self.interop_disabled = true;
                 Ok(SharedTexturePath::ReadbackFallback)
@@ -1748,5 +1782,34 @@ mod tests {
             InteropNv12Key::from_frame(&RenderFrame::from_rgb24(1, 1, vec![0; 3])),
             None
         );
+    }
+}
+#[cfg(all(test, windows))]
+mod readback_fallback_policy_tests {
+    use super::allow_shared_texture_readback_fallback;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn readback_fallback_is_disabled_unless_explicitly_enabled() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("MRD_OPENGL_ALLOW_READBACK_FALLBACK");
+        }
+        assert!(!allow_shared_texture_readback_fallback());
+
+        unsafe {
+            std::env::set_var("MRD_OPENGL_ALLOW_READBACK_FALLBACK", "1");
+        }
+        assert!(allow_shared_texture_readback_fallback());
+
+        unsafe {
+            std::env::set_var("MRD_OPENGL_ALLOW_READBACK_FALLBACK", "false");
+        }
+        assert!(!allow_shared_texture_readback_fallback());
+        unsafe {
+            std::env::remove_var("MRD_OPENGL_ALLOW_READBACK_FALLBACK");
+        }
     }
 }

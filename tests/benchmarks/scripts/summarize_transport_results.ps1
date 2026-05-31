@@ -17,7 +17,7 @@ $summary = Get-Content $summaryPath -Raw | ConvertFrom-Json
 $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
 
 $warningPattern = '(?i)\bwarning\b|Warning:'
-$errorPattern = '(?i)\berror:\b|panic|(^|\s)FAILED(\s|$)'
+$errorPattern = '(?i)\berror:\b|panic|(?-i:(^|\s)FAILED(\s|$))'
 $restartPattern = '(?i)\brestart\b|recreated'
 
 $warningCount = 0
@@ -61,9 +61,14 @@ $summary | Add-Member -Force -NotePropertyName render_present_skipped_rate -Note
 if ((-not $summary.run_skipped) -and $ThresholdPath -and (Test-Path $ThresholdPath)) {
   $thresholds = Get-Content $ThresholdPath -Raw | ConvertFrom-Json
   $hasRenderPresentThreshold = Test-HasProperty $thresholds "max_render_present_p95_ms"
+  $hasRenderExecuteThreshold = Test-HasProperty $thresholds "max_render_execute_p95_ms"
+  $hasRenderPrepareWaitThreshold = Test-HasProperty $thresholds "max_render_prepare_wait_p95_ms"
+  $hasRenderSharedResourceThreshold = Test-HasProperty $thresholds "max_render_shared_resource_p95_ms"
+  $hasRenderDrawPresentThreshold = Test-HasProperty $thresholds "max_render_draw_present_p95_ms"
   $hasRenderQueueThreshold = Test-HasProperty $thresholds "max_render_queue_replacements"
   $hasRenderStaleThreshold = Test-HasProperty $thresholds "max_render_stale_frame_drops"
   $hasRenderSkippedThreshold = Test-HasProperty $thresholds "max_render_present_skipped_frames"
+  $hasRenderSkippedRateThreshold = Test-HasProperty $thresholds "max_render_present_skipped_rate"
   $summary.run_passed = (
     $summary.run_passed -and
     $summary.session_established -and
@@ -73,10 +78,15 @@ if ((-not $summary.run_skipped) -and $ThresholdPath -and (Test-Path $ThresholdPa
     (($null -eq $summary.encode_total_p95_ms) -or ($summary.encode_total_p95_ms -le $thresholds.max_encode_total_p95_ms)) -and
     (($null -eq $summary.send_write_p95_ms) -or ($summary.send_write_p95_ms -le $thresholds.max_send_write_p95_ms)) -and
     (($null -eq $summary.decode_total_p95_ms) -or ($summary.decode_total_p95_ms -le $thresholds.max_decode_total_p95_ms)) -and
+    ((-not $hasRenderExecuteThreshold) -or ($null -eq $summary.render_execute_p95_ms) -or ($summary.render_execute_p95_ms -le $thresholds.max_render_execute_p95_ms)) -and
+    ((-not $hasRenderPrepareWaitThreshold) -or ($null -eq $summary.render_prepare_wait_p95_ms) -or ($summary.render_prepare_wait_p95_ms -le $thresholds.max_render_prepare_wait_p95_ms)) -and
+    ((-not $hasRenderSharedResourceThreshold) -or ($null -eq $summary.render_shared_resource_p95_ms) -or ($summary.render_shared_resource_p95_ms -le $thresholds.max_render_shared_resource_p95_ms)) -and
+    ((-not $hasRenderDrawPresentThreshold) -or ($null -eq $summary.render_draw_present_p95_ms) -or ($summary.render_draw_present_p95_ms -le $thresholds.max_render_draw_present_p95_ms)) -and
     ((-not $hasRenderPresentThreshold) -or ($null -eq $summary.render_present_p95_ms) -or ($summary.render_present_p95_ms -le $thresholds.max_render_present_p95_ms)) -and
     ((-not $hasRenderQueueThreshold) -or ($null -eq $summary.render_queue_replacements) -or ($summary.render_queue_replacements -le $thresholds.max_render_queue_replacements)) -and
     ((-not $hasRenderStaleThreshold) -or ($null -eq $summary.render_stale_frame_drops) -or ($summary.render_stale_frame_drops -le $thresholds.max_render_stale_frame_drops)) -and
     ((-not $hasRenderSkippedThreshold) -or ($null -eq $summary.render_present_skipped_frames) -or ($summary.render_present_skipped_frames -le $thresholds.max_render_present_skipped_frames)) -and
+    ((-not $hasRenderSkippedRateThreshold) -or ($null -eq $summary.render_present_skipped_rate) -or ($summary.render_present_skipped_rate -le $thresholds.max_render_present_skipped_rate)) -and
     ($summary.warning_count -le $thresholds.max_warning_count) -and
     ($summary.error_count -le $thresholds.max_error_count)
   )
@@ -102,6 +112,18 @@ if ((-not $summary.run_skipped) -and $ThresholdPath -and (Test-Path $ThresholdPa
     if ($hasRenderPresentThreshold -and $null -ne $summary.render_present_p95_ms -and $summary.render_present_p95_ms -gt $thresholds.max_render_present_p95_ms) {
       $reasons += "render present p95 $($summary.render_present_p95_ms)ms exceeded $($thresholds.max_render_present_p95_ms)ms"
     }
+    if ($hasRenderExecuteThreshold -and $null -ne $summary.render_execute_p95_ms -and $summary.render_execute_p95_ms -gt $thresholds.max_render_execute_p95_ms) {
+      $reasons += "render execute p95 $($summary.render_execute_p95_ms)ms exceeded $($thresholds.max_render_execute_p95_ms)ms"
+    }
+    if ($hasRenderPrepareWaitThreshold -and $null -ne $summary.render_prepare_wait_p95_ms -and $summary.render_prepare_wait_p95_ms -gt $thresholds.max_render_prepare_wait_p95_ms) {
+      $reasons += "render prepare wait p95 $($summary.render_prepare_wait_p95_ms)ms exceeded $($thresholds.max_render_prepare_wait_p95_ms)ms"
+    }
+    if ($hasRenderSharedResourceThreshold -and $null -ne $summary.render_shared_resource_p95_ms -and $summary.render_shared_resource_p95_ms -gt $thresholds.max_render_shared_resource_p95_ms) {
+      $reasons += "render shared resource p95 $($summary.render_shared_resource_p95_ms)ms exceeded $($thresholds.max_render_shared_resource_p95_ms)ms"
+    }
+    if ($hasRenderDrawPresentThreshold -and $null -ne $summary.render_draw_present_p95_ms -and $summary.render_draw_present_p95_ms -gt $thresholds.max_render_draw_present_p95_ms) {
+      $reasons += "render draw/present p95 $($summary.render_draw_present_p95_ms)ms exceeded $($thresholds.max_render_draw_present_p95_ms)ms"
+    }
     if ($hasRenderQueueThreshold -and $null -ne $summary.render_queue_replacements -and $summary.render_queue_replacements -gt $thresholds.max_render_queue_replacements) {
       $reasons += "render queue replacements $($summary.render_queue_replacements) exceeded $($thresholds.max_render_queue_replacements)"
     }
@@ -110,6 +132,9 @@ if ((-not $summary.run_skipped) -and $ThresholdPath -and (Test-Path $ThresholdPa
     }
     if ($hasRenderSkippedThreshold -and $null -ne $summary.render_present_skipped_frames -and $summary.render_present_skipped_frames -gt $thresholds.max_render_present_skipped_frames) {
       $reasons += "render present skipped frames $($summary.render_present_skipped_frames) exceeded $($thresholds.max_render_present_skipped_frames)"
+    }
+    if ($hasRenderSkippedRateThreshold -and $null -ne $summary.render_present_skipped_rate -and $summary.render_present_skipped_rate -gt $thresholds.max_render_present_skipped_rate) {
+      $reasons += "render present skipped rate $($summary.render_present_skipped_rate)/s exceeded $($thresholds.max_render_present_skipped_rate)/s"
     }
     if ($summary.warning_count -gt $thresholds.max_warning_count) {
       $reasons += "warning count $($summary.warning_count) exceeded $($thresholds.max_warning_count)"
@@ -134,7 +159,8 @@ $headers = @(
   'quic_receiver_duplicate_fragments','quic_receiver_rejected_fragments','quic_receiver_pending_frames',
   'quic_receiver_reassembly_drops','zero_write_access_unit_count',
   'warning_count','error_count','restart_count','encode_total_p95_ms','send_write_p95_ms','decode_total_p95_ms',
-  'frame_sink_ingest_p95_ms','render_upload_p95_ms','render_present_p95_ms',
+  'frame_sink_ingest_p95_ms','render_upload_p95_ms','render_submit_wait_p95_ms','render_execute_p95_ms',
+  'render_prepare_wait_p95_ms','render_shared_resource_p95_ms','render_draw_present_p95_ms','render_present_p95_ms',
   'render_submitted_frames','render_uploaded_frames','render_presented_frames','render_present_skipped_frames',
   'render_queue_replacements','render_stale_frame_drops',
   'render_queue_replacement_rate','render_stale_frame_drop_rate','render_present_skipped_rate',
@@ -176,6 +202,11 @@ $report = @(
   "| decode_total_p95_ms | $($summary.decode_total_p95_ms) |",
   "| frame_sink_ingest_p95_ms | $($summary.frame_sink_ingest_p95_ms) |",
   "| render_upload_p95_ms | $($summary.render_upload_p95_ms) |",
+  "| render_submit_wait_p95_ms | $($summary.render_submit_wait_p95_ms) |",
+  "| render_execute_p95_ms | $($summary.render_execute_p95_ms) |",
+  "| render_prepare_wait_p95_ms | $($summary.render_prepare_wait_p95_ms) |",
+  "| render_shared_resource_p95_ms | $($summary.render_shared_resource_p95_ms) |",
+  "| render_draw_present_p95_ms | $($summary.render_draw_present_p95_ms) |",
   "| render_present_p95_ms | $($summary.render_present_p95_ms) |",
   "| render_submitted_frames | $($summary.render_submitted_frames) |",
   "| render_uploaded_frames | $($summary.render_uploaded_frames) |",

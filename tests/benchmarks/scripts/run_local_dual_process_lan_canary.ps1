@@ -9,6 +9,8 @@ param(
   [ValidateSet("h264", "hevc", "av1")]
   [string]$Codec = "h264",
   [string]$CodecProfile = "",
+  [ValidateSet("low_latency", "ultra_low_latency", "high_refresh")]
+  [string]$Av1Mode = "high_refresh",
   [int]$BitDepth = 0,
   [string]$ChromaSubsampling = "",
   [string]$PixelFormat = "",
@@ -433,6 +435,7 @@ function Invoke-LocalDualProcessProfile {
     Set-EnvVar "MRD_LAN_E2E_PROFILE_FPS" ([string]$Profile.fps) $savedEnv
     Set-EnvVar "MRD_LAN_E2E_PROFILE_BITRATE_MBPS" ([string]$Profile.bitrate_mbps) $savedEnv
     Set-EnvVar "MRD_LAN_E2E_PROFILE_CODEC" $Codec $savedEnv
+    Set-EnvVar "MRD_BENCH_NVENC_AV1_MODE" $Av1Mode $savedEnv
     if ($CodecProfile.Trim()) {
       Set-EnvVar "MRD_LAN_E2E_PROFILE_CODEC_PROFILE" $CodecProfile.Trim() $savedEnv
     }
@@ -675,6 +678,7 @@ $report | Add-Member -Force -NotePropertyName "tauri_window_visible" -NoteProper
 $report | Add-Member -Force -NotePropertyName "codec_request" -NotePropertyValue ([pscustomobject]@{
   codec = $Codec
   codec_profile = if ($CodecProfile.Trim()) { $CodecProfile.Trim() } else { $null }
+  av1_mode = $Av1Mode
   bit_depth = if ($BitDepth -gt 0) { $BitDepth } else { $null }
   chroma_subsampling = if ($ChromaSubsampling.Trim()) { $ChromaSubsampling.Trim() } else { $null }
   pixel_format = if ($PixelFormat.Trim()) { $PixelFormat.Trim() } else { $null }

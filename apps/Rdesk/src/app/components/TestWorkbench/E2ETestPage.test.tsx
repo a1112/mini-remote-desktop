@@ -5,6 +5,65 @@ import { getMockInvoke } from "../../../test/mocks/tauri";
 import { E2ETestPage } from "./E2ETestPage";
 
 describe("E2ETestPage LAN automation", () => {
+  it("shows the render pipeline execution breakdown from harness metrics", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve({
+          os_type: "windows",
+          cpu_brand: "test",
+          cpu_cores: 8,
+          memory_gb: 16,
+          gpu_info: "NVIDIA",
+          available_captures: ["dxgi", "synthetic"],
+          available_encoders: ["nvenc_hevc", "openh264"],
+          available_decoders: ["nvdec", "software"],
+          available_renderers: ["d3d11"],
+          available_memory_modes: ["cpu", "d3d11_shared"],
+        });
+      }
+      if (command === "ipc_capability_snapshot") return Promise.resolve(null);
+      if (command === "test_start_run") return Promise.resolve("run-render-breakdown");
+      if (command === "test_get_run") return Promise.resolve(null);
+      if (command === "test_harness_get_metrics") {
+        return Promise.resolve({
+          is_running: true,
+          capture_fps: 144,
+          encode_latency_p95_ms: 2.1,
+          decode_latency_p95_ms: 2.3,
+          render_latency_p95_ms: 0.7,
+          render_submit_wait_latency_p95_ms: 0.04,
+          render_execute_latency_p95_ms: 0.56,
+          render_prepare_wait_latency_p95_ms: 0.01,
+          render_shared_resource_latency_p95_ms: 0.02,
+          render_draw_present_latency_p95_ms: 0.53,
+          render_present_gap_p95_ms: 8.7,
+          render_queue_replacements: 3,
+          render_stale_frame_drops: 3,
+          frame_count: 240,
+          dropped_frames: 0,
+          resolution: [2560, 1440],
+        });
+      }
+      if (command === "test_harness_get_frames") return Promise.resolve([null, null]);
+      return Promise.resolve(null);
+    });
+
+    render(
+      <MemoryRouter>
+        <E2ETestPage />
+      </MemoryRouter>
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: /启动测试/ }));
+
+    expect(await screen.findByText("Render Pipeline Breakdown")).toBeInTheDocument();
+    expect(screen.getByText("Render Execute P95:")).toBeInTheDocument();
+    expect(screen.getByText("0.56 ms")).toBeInTheDocument();
+    expect(screen.getByText("Draw/Present P95:")).toBeInTheDocument();
+    expect(screen.getByText("0.53 ms")).toBeInTheDocument();
+  });
+
   it("builds the local E2E config from service capability status", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {
