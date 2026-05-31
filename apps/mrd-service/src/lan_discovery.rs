@@ -4682,17 +4682,13 @@ fn lan_render_queue_policy_for_profile(profile: &MediaProfile) -> LanRenderQueue
 
 #[cfg(windows)]
 fn lan_render_queue_policy_for_profile_with_override(
-    profile: &MediaProfile,
+    _profile: &MediaProfile,
     override_policy: Option<LanRenderQueuePolicy>,
 ) -> LanRenderQueuePolicy {
     if let Some(policy) = override_policy {
         return policy;
     }
-    if profile.fps >= LAN_RENDER_PACING_DEFAULT_MIN_FPS {
-        LanRenderQueuePolicy::Latest
-    } else {
-        LanRenderQueuePolicy::PacedFifo
-    }
+    LanRenderQueuePolicy::PacedFifo
 }
 
 #[cfg(windows)]
@@ -12428,7 +12424,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn render_queue_policy_defaults_high_refresh_to_latest() {
+    fn render_queue_policy_defaults_to_paced_fifo_and_allows_latest_override() {
         let high_fps = MediaProfile {
             width: 2560,
             height: 1440,
@@ -12448,7 +12444,7 @@ mod tests {
 
         assert_eq!(
             lan_render_queue_policy_for_profile_with_override(&high_fps, None),
-            LanRenderQueuePolicy::Latest
+            LanRenderQueuePolicy::PacedFifo
         );
         assert_eq!(
             lan_render_queue_policy_for_profile_with_override(&low_fps, None),
@@ -12457,9 +12453,9 @@ mod tests {
         assert_eq!(
             lan_render_queue_policy_for_profile_with_override(
                 &high_fps,
-                Some(LanRenderQueuePolicy::PacedFifo)
+                Some(LanRenderQueuePolicy::Latest)
             ),
-            LanRenderQueuePolicy::PacedFifo
+            LanRenderQueuePolicy::Latest
         );
     }
 

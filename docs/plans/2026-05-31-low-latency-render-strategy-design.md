@@ -54,7 +54,7 @@ Add an explicit LAN native render queue policy:
 - `paced_fifo`: existing behavior for stable frame cadence.
 - `latest`: latency-first behavior that presents the newest available frame and drops stale queued frames.
 
-For high-refresh native LAN sessions, default to `latest` unless `MRD_LAN_RENDER_QUEUE_POLICY=paced_fifo` overrides it.
+Default native LAN sessions to `paced_fifo`. The latest-frame policy remains available as an explicit low-latency experiment through `MRD_LAN_RENDER_QUEUE_POLICY=latest` or `MRD_LAN_RENDER_QUEUE_POLICY=low_latency`. This keeps the stable visual path as the default while still making latency-first behavior measurable.
 
 The `latest` policy uses the existing `MediaRenderQueueRegistry::take_latest_or_finish` path. When it drops older queued frames, increment `render_stale_frame_drops`. This makes the existing counter meaningful in the service-owned LAN path.
 
@@ -131,4 +131,3 @@ Manual benchmark validation:
 - 2K144 HEVC/NVDEC/D3D11 LAN canary.
 - 2K144 waitable comparison.
 - Compare `render_upload`, `render_present`, `render_pacing_wait`, `render_present_gap`, `render_stale_frame_drops`, and observed render FPS.
-

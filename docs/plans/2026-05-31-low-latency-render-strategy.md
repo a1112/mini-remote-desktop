@@ -4,7 +4,7 @@
 
 **Goal:** Add a latency-first native LAN render strategy that keeps the newest frame, records stale-frame drops, exposes D3D11 swapchain pacing metadata, and makes waitable-swapchain waits visible.
 
-**Architecture:** Keep the stable paced path available, but add an explicit render queue policy. High-refresh native LAN sessions default to a latest-frame policy, while `MRD_LAN_RENDER_QUEUE_POLICY=paced_fifo` preserves the existing paced FIFO behavior. D3D11 waitable-swapchain waits move to a pre-render boundary and are exported through renderer snapshots and service pipeline metrics.
+**Architecture:** Keep the stable paced path as the default, but add an explicit render queue policy. `MRD_LAN_RENDER_QUEUE_POLICY=latest` or `low_latency` enables the latency-first latest-frame path, while the default `paced_fifo` preserves visual cadence. D3D11 waitable-swapchain waits move to a pre-render boundary and are exported through renderer snapshots and service pipeline metrics.
 
 **Tech Stack:** Rust workspace, Windows D3D11/DXGI via `windows`, Tauri IPC types, React/TypeScript diagnostics UI, Cargo tests, Vitest tests, PowerShell LAN/benchmark scripts.
 
@@ -22,7 +22,7 @@
 Add tests in `apps/mrd-service/src/lan_discovery.rs`:
 
 - `render_queue_policy_env_parses_values`
-- `render_queue_policy_defaults_high_refresh_to_latest`
+- `render_queue_policy_defaults_to_paced_fifo_and_allows_latest_override`
 - `latest_render_queue_policy_skips_pacing_wait`
 
 Add a test in `apps/mrd-service/src/app_state.rs` that `take_latest_or_finish` stale drops can be propagated to `MediaPipelineSnapshot`.
@@ -48,7 +48,7 @@ Add:
 - `lan_render_queue_policy_for_profile(profile)`
 - `render_queue_policy` field on `MediaPipelineSnapshot`
 
-Default high-refresh profiles (`fps >= 120`) to `latest`; keep lower FPS behavior unchanged unless explicitly overridden.
+Default profiles to `paced_fifo`; enable `latest` only when explicitly requested with `MRD_LAN_RENDER_QUEUE_POLICY=latest`, `low_latency`, or `latency`.
 
 **Step 4: Run tests**
 
@@ -294,9 +294,8 @@ Run a 1080p60 smoke and a 2K144 HEVC/NVDEC/D3D11 canary. Compare:
 - `render_waitable_wait`
 - observed render FPS
 
-Expected: latest policy reduces service-side render pacing wait and keeps decode/main pipeline independent. Present gap remains bounded by display refresh and should be reported separately from the 3 ms local pipeline target.
+Expected: default paced FIFO keeps visual integrity stable. Explicit latest policy reduces service-side render pacing wait and keeps decode/main pipeline independent, but can increase stale-frame drops under overloaded or same-host fixtures. Present gap remains bounded by display refresh and should be reported separately from the 3 ms local pipeline target.
 
 **Step 5: Commit final verification notes if artifacts or docs change**
 
 Commit only source/docs changes. Do not commit generated benchmark artifacts unless explicitly requested.
-
