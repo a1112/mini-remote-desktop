@@ -171,6 +171,10 @@ pub struct D3d11Renderer {
     presented_frame_count: u64,
     present_skipped_count: u64,
     last_present_status: Option<&'static str>,
+    waitable_wait_count: u64,
+    waitable_wait_total_ms: f64,
+    waitable_timeout_count: u64,
+    last_waitable_wait_ms: Option<f64>,
     last_width: usize,
     last_height: usize,
     last_pixel_format: Option<RenderPixelFormat>,
@@ -246,6 +250,10 @@ impl D3d11Renderer {
                 presented_frame_count: 0,
                 present_skipped_count: 0,
                 last_present_status: None,
+                waitable_wait_count: 0,
+                waitable_wait_total_ms: 0.0,
+                waitable_timeout_count: 0,
+                last_waitable_wait_ms: None,
                 last_width: 0,
                 last_height: 0,
                 last_pixel_format: None,
@@ -319,19 +327,21 @@ impl D3d11Renderer {
     #[cfg(windows)]
     fn wait_for_frame_latency(
         waitable_object: Option<windows::Win32::Foundation::HANDLE>,
-    ) -> Result<bool, RenderError> {
+    ) -> Result<(bool, f64), RenderError> {
         use windows::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
         use windows::Win32::System::Threading::WaitForSingleObject;
 
         let Some(waitable_object) = waitable_object else {
-            return Ok(true);
+            return Ok((true, 0.0));
         };
+        let started = std::time::Instant::now();
         let result =
             unsafe { WaitForSingleObject(waitable_object, Self::waitable_present_timeout_ms()) };
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
         if result == WAIT_OBJECT_0 {
-            Ok(true)
+            Ok((true, elapsed_ms))
         } else if result == WAIT_TIMEOUT {
-            Ok(false)
+            Ok((false, elapsed_ms))
         } else {
             Err(RenderError::Message(format!(
                 "wait for DXGI frame latency object failed: {result:?}"
@@ -357,15 +367,8 @@ impl D3d11Renderer {
         swap_chain: &windows::Win32::Graphics::Dxgi::IDXGISwapChain1,
         allow_tearing: bool,
         present_mode: D3d11PresentMode,
-        waitable_object: Option<windows::Win32::Foundation::HANDLE>,
     ) -> Result<D3d11PresentStatus, RenderError> {
         use windows::Win32::Graphics::Dxgi::DXGI_ERROR_WAS_STILL_DRAWING;
-
-        if present_mode == D3d11PresentMode::Waitable
-            && !Self::wait_for_frame_latency(waitable_object)?
-        {
-            return Ok(D3d11PresentStatus::SkippedFrameLatencyWait);
-        }
 
         let hr = unsafe { swap_chain.Present(0, Self::present_flags(present_mode, allow_tearing)) };
         if hr == DXGI_ERROR_WAS_STILL_DRAWING {
@@ -465,6 +468,36 @@ impl D3d11Renderer {
         unsafe { SetThreadPriority(GetCurrentThread(), priority) }.map_err(|error| {
             RenderError::Message(format!("configure render thread priority failed: {error}"))
         })
+    }
+
+    #[cfg(windows)]
+    fn record_waitable_wait_metrics(&mut self, wait_ms: f64, timed_out: bool) {
+        self.waitable_wait_count = self.waitable_wait_count.saturating_add(1);
+        self.waitable_wait_total_ms += wait_ms.max(0.0);
+        self.last_waitable_wait_ms = Some(wait_ms.max(0.0));
+        if timed_out {
+            self.waitable_timeout_count = self.waitable_timeout_count.saturating_add(1);
+        }
+    }
+
+    #[cfg(windows)]
+    fn prepare_waitable_frame_latency(
+        &mut self,
+    ) -> Result<Option<D3d11PresentStatus>, RenderError> {
+        let Some(surface) = self.surface.as_ref() else {
+            return Ok(None);
+        };
+        if surface.present_mode != D3d11PresentMode::Waitable {
+            return Ok(None);
+        }
+
+        let (ready, wait_ms) = Self::wait_for_frame_latency(surface.frame_latency_waitable_object)?;
+        self.record_waitable_wait_metrics(wait_ms, !ready);
+        if ready {
+            Ok(None)
+        } else {
+            Ok(Some(D3d11PresentStatus::SkippedFrameLatencyWait))
+        }
     }
 
     #[cfg(windows)]
@@ -728,7 +761,6 @@ impl D3d11Renderer {
             &surface.swap_chain,
             surface.allow_tearing,
             surface.present_mode,
-            surface.frame_latency_waitable_object,
         )
     }
 
@@ -808,7 +840,6 @@ impl D3d11Renderer {
             &surface.swap_chain,
             surface.allow_tearing,
             surface.present_mode,
-            surface.frame_latency_waitable_object,
         )
     }
 
@@ -951,7 +982,6 @@ impl D3d11Renderer {
             &surface.swap_chain,
             surface.allow_tearing,
             surface.present_mode,
-            surface.frame_latency_waitable_object,
         )
     }
 
@@ -1215,7 +1245,6 @@ impl D3d11Renderer {
         let swap_chain = surface.swap_chain.clone();
         let allow_tearing = surface.allow_tearing;
         let present_mode = surface.present_mode;
-        let frame_latency_waitable_object = surface.frame_latency_waitable_object;
 
         let shared_handle = match &frame.data {
             RenderFrameData::D3D11SharedBgra { shared_handle, .. } => *shared_handle,
@@ -1262,12 +1291,7 @@ impl D3d11Renderer {
                 );
             }
         }
-        Self::present_swap_chain(
-            &swap_chain,
-            allow_tearing,
-            present_mode,
-            frame_latency_waitable_object,
-        )
+        Self::present_swap_chain(&swap_chain, allow_tearing, present_mode)
     }
 
     #[cfg(windows)]
@@ -1309,7 +1333,6 @@ impl D3d11Renderer {
         let swap_chain = surface.swap_chain.clone();
         let allow_tearing = surface.allow_tearing;
         let present_mode = surface.present_mode;
-        let frame_latency_waitable_object = surface.frame_latency_waitable_object;
         let (y_srv, uv_srv) = self.shared_nv12_srvs(shared_handle_y, shared_handle_uv)?;
         let (vertex_shader, pixel_shader, sampler) = {
             let pipeline = self.ensure_shared_nv12_pipeline()?;
@@ -1357,12 +1380,7 @@ impl D3d11Renderer {
             self.context.Draw(3, 0);
             self.context.PSSetShaderResources(0, Some(&empty_srvs));
         }
-        Self::present_swap_chain(
-            &swap_chain,
-            allow_tearing,
-            present_mode,
-            frame_latency_waitable_object,
-        )
+        Self::present_swap_chain(&swap_chain, allow_tearing, present_mode)
     }
 }
 
@@ -1409,6 +1427,15 @@ impl RendererInstance for D3d11Renderer {
         #[cfg(windows)]
         {
             use mrd_render::RenderFrameData;
+            if let Some(present_status) = self.prepare_waitable_frame_latency()? {
+                self.present_skipped_count += 1;
+                self.last_present_status = Some(present_status.as_str());
+                self.last_width = frame.width;
+                self.last_height = frame.height;
+                self.last_pixel_format = Some(frame.pixel_format);
+                return Ok(());
+            }
+
             let present_status = match &frame.data {
                 RenderFrameData::Rgb24(_) =>
                 {
@@ -1493,6 +1520,14 @@ impl RendererInstance for D3d11Renderer {
             .and_then(|surface| surface.display_refresh_hz);
         #[cfg(windows)]
         let render_thread_priority = Some(Self::current_thread_priority_label().to_string());
+        #[cfg(windows)]
+        let waitable_wait_count = Some(self.waitable_wait_count);
+        #[cfg(windows)]
+        let waitable_wait_total_ms = Some(self.waitable_wait_total_ms);
+        #[cfg(windows)]
+        let waitable_timeout_count = Some(self.waitable_timeout_count);
+        #[cfg(windows)]
+        let last_waitable_wait_ms = self.last_waitable_wait_ms;
         #[cfg(not(windows))]
         let swap_chain_max_frame_latency = None;
         #[cfg(not(windows))]
@@ -1505,6 +1540,14 @@ impl RendererInstance for D3d11Renderer {
         let display_refresh_hz = None;
         #[cfg(not(windows))]
         let render_thread_priority = None;
+        #[cfg(not(windows))]
+        let waitable_wait_count = None;
+        #[cfg(not(windows))]
+        let waitable_wait_total_ms = None;
+        #[cfg(not(windows))]
+        let waitable_timeout_count = None;
+        #[cfg(not(windows))]
+        let last_waitable_wait_ms = None;
 
         RendererSnapshot {
             attached_to_target: self.attached_to_target,
@@ -1522,6 +1565,10 @@ impl RendererInstance for D3d11Renderer {
             swap_chain_present_mode,
             display_refresh_hz,
             render_thread_priority,
+            waitable_wait_count,
+            waitable_wait_total_ms,
+            waitable_timeout_count,
+            last_waitable_wait_ms,
             last_width: self.last_width,
             last_height: self.last_height,
             last_pixel_format: self.last_pixel_format,
@@ -1536,7 +1583,9 @@ mod tests {
     use super::{
         should_clear_shared_present_surface, D3d11PresentMode, D3d11PresentStatus, D3d11Renderer,
     };
-    use mrd_render::{RenderFrame, RenderPixelFormat, RenderTarget, RendererFactory};
+    use mrd_render::{
+        RenderFrame, RenderPixelFormat, RenderTarget, RendererFactory, RendererInstance,
+    };
 
     #[test]
     fn fit_viewport_rect_preserves_source_aspect_ratio() {
@@ -1626,6 +1675,26 @@ mod tests {
         assert_eq!(snapshot.swap_chain_present_mode, None);
         assert_eq!(snapshot.display_refresh_hz, None);
         assert_eq!(snapshot.render_thread_priority.as_deref(), Some("normal"));
+        assert_eq!(snapshot.waitable_wait_count, Some(0));
+        assert_eq!(snapshot.waitable_wait_total_ms, Some(0.0));
+        assert_eq!(snapshot.waitable_timeout_count, Some(0));
+        assert_eq!(snapshot.last_waitable_wait_ms, None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn d3d11_records_waitable_wait_metrics_for_snapshots() {
+        let mut renderer = D3d11Renderer::new().expect("d3d11 renderer");
+
+        renderer.record_waitable_wait_metrics(0.75, false);
+        renderer.record_waitable_wait_metrics(1.25, true);
+
+        let snapshot = renderer.snapshot();
+
+        assert_eq!(snapshot.waitable_wait_count, Some(2));
+        assert_eq!(snapshot.waitable_wait_total_ms, Some(2.0));
+        assert_eq!(snapshot.waitable_timeout_count, Some(1));
+        assert_eq!(snapshot.last_waitable_wait_ms, Some(1.25));
     }
 
     #[cfg(windows)]

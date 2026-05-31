@@ -230,7 +230,7 @@ pub struct RendererDescriptor {
     pub supported_formats: &'static [RenderPixelFormat],
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RendererSnapshot {
     pub attached_to_target: bool,
     /// Frames accepted by the renderer upload boundary.
@@ -259,6 +259,14 @@ pub struct RendererSnapshot {
     pub display_refresh_hz: Option<u32>,
     /// Effective render thread priority label, when the backend can query it.
     pub render_thread_priority: Option<String>,
+    /// Number of frame-latency waitable-object waits completed by the renderer.
+    pub waitable_wait_count: Option<u64>,
+    /// Total waitable-object wait duration in milliseconds.
+    pub waitable_wait_total_ms: Option<f64>,
+    /// Number of waitable-object waits that timed out.
+    pub waitable_timeout_count: Option<u64>,
+    /// Last waitable-object wait duration in milliseconds.
+    pub last_waitable_wait_ms: Option<f64>,
     pub last_width: usize,
     pub last_height: usize,
     pub last_pixel_format: Option<RenderPixelFormat>,
