@@ -6,7 +6,7 @@ param(
   [int]$BitrateMbps = 20,
   [ValidateSet("none", "temporary", "required")]
   [string]$DisplayModePolicy = "temporary",
-  [ValidateSet("h264", "hevc")]
+  [ValidateSet("h264", "hevc", "av1")]
   [string]$Codec = "h264",
   [string]$CodecProfile = "",
   [int]$BitDepth = 0,
@@ -547,9 +547,8 @@ function Invoke-LocalDualProcessProfile {
 
     $row = Convert-CrossReportToCanaryRow -Profile $Profile -Report $report -ReportPath $reportPath
     $row | Add-Member -Force -NotePropertyName "mode" -NotePropertyValue "local-dual-process"
-    $encoderLabel = if ($Codec -eq "hevc") { "nvenc_hevc" } else { "nvenc_h264" }
-    $decoderLabel = if ($Codec -eq "hevc") { "nvdec_hevc_d3d11_shared" } else { "nvdec" }
-    $row | Add-Member -Force -NotePropertyName "chain" -NotePropertyValue "local_dual_process/dxgi/$encoderLabel/quic_datagram_media_v3_or_v2/$decoderLabel/d3d11_shared"
+    $backends = Get-CanaryCodecBackends -Codec $Codec
+    $row | Add-Member -Force -NotePropertyName "chain" -NotePropertyValue "local_dual_process/dxgi/$($backends.encoder)/quic_datagram_media_v3_or_v2/$($backends.decoder)/d3d11_shared"
     $row | Add-Member -Force -NotePropertyName "controller_pipe" -NotePropertyValue $controllerPipe
     $row | Add-Member -Force -NotePropertyName "peer_pipe" -NotePropertyValue $peerPipe
     $row | Add-Member -Force -NotePropertyName "controller_discovery_port" -NotePropertyValue $ports.controller
@@ -662,9 +661,8 @@ foreach ($profile in $profiles) {
 }
 
 $report = New-PairedLanCanaryReport -Mode "local-dual-process" -Rows $rows -GitCommit $gitCommit -Codec $Codec
-$encoderLabel = if ($Codec -eq "hevc") { "nvenc_hevc" } else { "nvenc_h264" }
-$decoderLabel = if ($Codec -eq "hevc") { "nvdec_hevc_d3d11_shared" } else { "nvdec" }
-$report | Add-Member -Force -NotePropertyName "chain" -NotePropertyValue "local_dual_process/dxgi/$encoderLabel/quic_datagram_media_v3_or_v2/$decoderLabel/d3d11_shared"
+$backends = Get-CanaryCodecBackends -Codec $Codec
+$report | Add-Member -Force -NotePropertyName "chain" -NotePropertyValue "local_dual_process/dxgi/$($backends.encoder)/quic_datagram_media_v3_or_v2/$($backends.decoder)/d3d11_shared"
 $report | Add-Member -Force -NotePropertyName "test_impairment_config" -NotePropertyValue $impairment
 $report | Add-Member -Force -NotePropertyName "capture_source_request" -NotePropertyValue ([pscustomobject]@{
   id = if ($CaptureSourceId.Trim()) { $CaptureSourceId.Trim() } else { $null }

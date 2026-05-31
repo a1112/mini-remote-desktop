@@ -54,7 +54,38 @@ function Normalize-CanaryCodec {
   if ($normalized -in @("hevc", "h265")) {
     return "hevc"
   }
+  if ($normalized -eq "av1") {
+    return "av1"
+  }
   "h264"
+}
+
+function Get-CanaryCodecBackends {
+  param([string]$Codec = "h264")
+
+  switch (Normalize-CanaryCodec $Codec) {
+    "hevc" {
+      return [pscustomobject]@{
+        encoder = "nvenc_hevc"
+        decoder = "nvdec_hevc_d3d11_shared"
+        local_decoder = "nvdec"
+      }
+    }
+    "av1" {
+      return [pscustomobject]@{
+        encoder = "nvenc_av1"
+        decoder = "nvdec_av1"
+        local_decoder = "nvdec_av1"
+      }
+    }
+    default {
+      return [pscustomobject]@{
+        encoder = "nvenc_h264"
+        decoder = "nvdec"
+        local_decoder = "nvdec"
+      }
+    }
+  }
 }
 
 function Resolve-PairedLanCanaryTargetDeviceId {
@@ -95,14 +126,9 @@ function New-CanaryMediaChain {
     [string]$Codec = "h264"
   )
 
-  $normalized = Normalize-CanaryCodec $Codec
-  if ($normalized -eq "hevc") {
-    $encoder = "nvenc_hevc"
-    $decoder = "nvdec_hevc_d3d11_shared"
-  } else {
-    $encoder = "nvenc_h264"
-    $decoder = "nvdec"
-  }
+  $backends = Get-CanaryCodecBackends -Codec $Codec
+  $encoder = $backends.encoder
+  $decoder = $backends.decoder
 
   switch ($Mode) {
     "local-dual-process" { return "local_dual_process/dxgi/$encoder/quic_datagram_media_v3_or_v2/$decoder/d3d11_shared" }

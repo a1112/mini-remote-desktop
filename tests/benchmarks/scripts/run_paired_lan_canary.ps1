@@ -9,7 +9,7 @@ param(
   [double]$RatioThreshold = 0.8,
   [ValidateSet("none", "temporary", "required")]
   [string]$DisplayModePolicy = "temporary",
-  [ValidateSet("h264", "hevc")]
+  [ValidateSet("h264", "hevc", "av1")]
   [string]$Codec = "h264",
   [string]$CodecProfile = "",
   [int]$BitDepth = 0,
@@ -217,21 +217,17 @@ function Invoke-LocalCanaryProfile($Repo, $Profile, $GitCommit, [string]$Codec, 
     Set-EnvVar "MRD_BENCH_GIT_COMMIT" $GitCommit $savedEnv
     Set-EnvVar "MRD_BENCH_TRANSPORT" "quic_datagram" $savedEnv
     Set-EnvVar "MRD_BENCH_CAPTURE_BACKEND" "dxgi" $savedEnv
-    $encodeBackend = if ((Normalize-CanaryCodec $Codec) -eq "hevc") {
-      "nvenc_hevc"
-    } else {
-      "nvenc_h264"
-    }
-    Set-EnvVar "MRD_BENCH_ENCODE_BACKEND" $encodeBackend $savedEnv
-    Set-EnvVar "MRD_BENCH_DECODE_BACKEND" "nvdec" $savedEnv
+    $backends = Get-CanaryCodecBackends -Codec $Codec
+    Set-EnvVar "MRD_BENCH_ENCODE_BACKEND" $backends.encoder $savedEnv
+    Set-EnvVar "MRD_BENCH_DECODE_BACKEND" $backends.local_decoder $savedEnv
     Set-EnvVar "MRD_BENCH_RENDERER_BACKEND" "d3d11_shared" $savedEnv
     Set-EnvVar "MRD_BENCH_BITRATE_BPS" ([string]([int64]$Profile.bitrate_mbps * 1000000)) $savedEnv
 
     $stdout = Join-Path $logsDir "host.stdout.log"
     $stderr = Join-Path $logsDir "host.stderr.log"
     $cargoArgs = Get-TransportMatrixCargoTestArgs `
-      -EncodeBackend $encodeBackend `
-      -DecodeBackend "nvdec" `
+      -EncodeBackend $backends.encoder `
+      -DecodeBackend $backends.local_decoder `
       -Release:$ReleaseBenchmark
     $process = Start-Process -FilePath "cargo" -ArgumentList $cargoArgs -WorkingDirectory $Repo -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WindowStyle Hidden -Wait -PassThru
     if ($process.ExitCode -ne 0) {

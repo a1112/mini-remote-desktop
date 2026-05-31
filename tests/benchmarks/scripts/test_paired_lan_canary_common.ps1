@@ -56,6 +56,13 @@ $h264CrossChain = New-CanaryMediaChain -Mode "cross" -Codec "h264"
 Assert-Equal $h264CrossChain "dxgi/nvenc_h264/quic_datagram_media_v3_or_v2/nvdec/d3d11_shared" "H.264 cross chain remains the default"
 $hevcCrossChain = New-CanaryMediaChain -Mode "cross" -Codec "hevc"
 Assert-Equal $hevcCrossChain "dxgi/nvenc_hevc/quic_datagram_media_v3_or_v2/nvdec_hevc_d3d11_shared/d3d11_shared" "HEVC cross chain uses HEVC encode/decode labels"
+$av1LocalChain = New-CanaryMediaChain -Mode "local" -Codec "av1"
+Assert-Equal $av1LocalChain "dxgi/nvenc_av1/quic/nvdec_av1/d3d11_shared" "AV1 local chain uses AV1 encode/decode labels"
+$av1CrossChain = New-CanaryMediaChain -Mode "cross" -Codec "av1"
+Assert-Equal $av1CrossChain "dxgi/nvenc_av1/quic_datagram_media_v3_or_v2/nvdec_av1/d3d11_shared" "AV1 cross chain uses AV1 encode/decode labels"
+$av1LocalDualChain = New-CanaryMediaChain -Mode "local-dual-process" -Codec "av1"
+Assert-Equal $av1LocalDualChain "local_dual_process/dxgi/nvenc_av1/quic_datagram_media_v3_or_v2/nvdec_av1/d3d11_shared" "AV1 local dual chain uses AV1 encode/decode labels"
+Assert-Equal (Normalize-CanaryCodec "av1") "av1" "AV1 codec normalizes to av1"
 
 $localSummaryRow = Convert-LocalSummaryToCanaryRow `
   -Profile ([pscustomobject]@{ id = "2k144"; width = 2560; height = 1440; fps = 144; bitrate_mbps = 80; duration_secs = 20 }) `
@@ -668,6 +675,9 @@ $tauriBuildEnv = New-LocalDualProcessTauriEnvPlan `
 Assert-Equal $tauriBuildEnv.CARGO_TARGET_DIR ([System.IO.Path]::Combine("tmp", "repo", "target")) "Build local dual canary also pins Tauri to the workspace cargo target"
 
 $localDualScript = Get-Content -Path (Join-Path $scriptDir "run_local_dual_process_lan_canary.ps1") -Raw
+$pairedLanScript = Get-Content -Path (Join-Path $scriptDir "run_paired_lan_canary.ps1") -Raw
+Assert-True ($pairedLanScript -match 'ValidateSet\("h264", "hevc", "av1"\)') "Paired LAN canary accepts AV1 codec selection"
+Assert-True ($localDualScript -match 'ValidateSet\("h264", "hevc", "av1"\)') "Local dual canary accepts AV1 codec selection"
 Assert-True ($localDualScript -match "cargo build -p mrd-service") "Local dual canary prebuilds the service executable"
 Assert-True ($localDualScript -match "cargo build -p app --no-default-features") "Local dual canary prebuilds the same Tauri shell target used by tauri dev"
 Assert-True ($localDualScript -match "CARGO_TARGET_DIR") "Local dual canary keeps prebuild and Tauri dev on the same cargo target"
