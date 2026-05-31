@@ -875,9 +875,18 @@ export interface MediaPipelineSnapshot {
   dropped_frames: number;
   render_presented_frames?: number;
   render_queue_replacements?: number;
+  render_stale_frame_drops?: number;
   render_lock_drops?: number;
   render_present_skips?: number;
   render_pacing_target_fps?: number | null;
+  render_queue_policy?: string | null;
+  swap_chain_max_frame_latency?: number | null;
+  swap_chain_allow_tearing?: boolean | null;
+  swap_chain_waitable_object?: boolean | null;
+  swap_chain_present_mode?: string | null;
+  display_refresh_hz?: number | null;
+  render_thread_priority?: string | null;
+  render_waitable_timeouts?: number;
   stage_metrics: MediaStageMetrics[];
   test_impairment?: MediaTestImpairmentSnapshot | null;
   sender_transport?: MediaSenderTransportSnapshot | null;

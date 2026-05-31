@@ -16,7 +16,7 @@ use mrd_pipeline_core::{
 };
 use mrd_proto::{DeviceId, SessionId};
 #[cfg(windows)]
-use mrd_render::RenderFrame;
+use mrd_render::{RenderFrame, RendererSnapshot};
 use mrd_transport_quic_quinn::{
     fragment_access_unit, fragment_media_payload_v3, is_quic_media_v3_datagram, QuicAuFrame,
     QuicAuReassembler, QuicAuReassemblerConfig, QuicAuReassemblerStats, QuicMediaCodec,
@@ -5449,6 +5449,9 @@ enum LanRenderTaskOutcome {
         lock_wait_ms: f64,
         presented_frames: u64,
         present_skips: u64,
+        waitable_wait_ms: f64,
+        waitable_waits: u64,
+        waitable_timeouts: u64,
     },
     Dropped,
     Idle,
@@ -5595,6 +5598,9 @@ async fn run_lan_render_worker(
                 lock_wait_ms,
                 presented_frames,
                 present_skips,
+                waitable_wait_ms,
+                waitable_waits,
+                waitable_timeouts,
             }) => {
                 {
                     let mut pipelines = app_state.media_pipelines.lock().await;
@@ -5623,6 +5629,19 @@ async fn run_lan_render_worker(
                     }
                     if present_skips > 0 {
                         pipelines.increment_render_present_skips(session_id.clone(), present_skips);
+                    }
+                    if waitable_waits > 0 {
+                        pipelines.record_stage_duration_ms(
+                            session_id.clone(),
+                            "render_waitable_wait",
+                            waitable_wait_ms / waitable_waits as f64,
+                        );
+                    }
+                    if waitable_timeouts > 0 {
+                        pipelines.increment_render_waitable_timeouts(
+                            session_id.clone(),
+                            waitable_timeouts,
+                        );
                     }
                 }
                 if presented_frames > 0 {
@@ -5854,6 +5873,10 @@ async fn render_lan_frame_once(
     let mut lock_wait_ms = 0.0_f64;
     let mut presented_frames = 0_u64;
     let mut present_skips = 0_u64;
+    let mut waitable_wait_ms = 0.0_f64;
+    let mut waitable_waits = 0_u64;
+    let mut waitable_timeouts = 0_u64;
+    let mut renderer_snapshots = Vec::<RendererSnapshot>::new();
     for renderer in &renderers {
         let lock_started = Instant::now();
         let Some(mut renderer) =
@@ -5872,8 +5895,13 @@ async fn render_lan_frame_once(
         renderer
             .upload_frame(frame.clone())
             .map_err(|error| anyhow::anyhow!("upload frame to D3D11 renderer failed: {error}"))?;
-        upload_duration_ms += upload_started.elapsed().as_secs_f64() * 1000.0;
         let after = renderer.snapshot();
+        let wait_delta = renderer_snapshot_waitable_delta(&before, &after);
+        let upload_elapsed_ms = upload_started.elapsed().as_secs_f64() * 1000.0;
+        upload_duration_ms += (upload_elapsed_ms - wait_delta.wait_ms).max(0.0);
+        waitable_wait_ms += wait_delta.wait_ms;
+        waitable_waits = waitable_waits.saturating_add(wait_delta.waits);
+        waitable_timeouts = waitable_timeouts.saturating_add(wait_delta.timeouts);
         let uploaded_delta = after
             .uploaded_frame_count
             .saturating_sub(before.uploaded_frame_count);
@@ -5892,10 +5920,17 @@ async fn render_lan_frame_once(
         }
         presented_frames = presented_frames.saturating_add(presented_delta);
         present_skips = present_skips.saturating_add(skipped_delta);
+        renderer_snapshots.push(after);
         rendered += 1;
     }
 
     if rendered > 0 {
+        {
+            let mut pipelines = app_state.media_pipelines.lock().await;
+            for snapshot in &renderer_snapshots {
+                pipelines.record_renderer_snapshot(session_id.clone(), snapshot);
+            }
+        }
         let present_log_count = LAN_RENDER_PRESENT_LOG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
         if present_log_count <= 5 || present_log_count % 120 == 0 {
             tracing::info!(
@@ -5912,9 +5947,38 @@ async fn render_lan_frame_once(
             lock_wait_ms,
             presented_frames,
             present_skips,
+            waitable_wait_ms,
+            waitable_waits,
+            waitable_timeouts,
         })
     } else {
         Ok(LanRenderTaskOutcome::Idle)
+    }
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct RendererWaitableDelta {
+    wait_ms: f64,
+    waits: u64,
+    timeouts: u64,
+}
+
+#[cfg(windows)]
+fn renderer_snapshot_waitable_delta(
+    before: &RendererSnapshot,
+    after: &RendererSnapshot,
+) -> RendererWaitableDelta {
+    let before_waits = before.waitable_wait_count.unwrap_or_default();
+    let after_waits = after.waitable_wait_count.unwrap_or_default();
+    let before_total = before.waitable_wait_total_ms.unwrap_or_default();
+    let after_total = after.waitable_wait_total_ms.unwrap_or_default();
+    let before_timeouts = before.waitable_timeout_count.unwrap_or_default();
+    let after_timeouts = after.waitable_timeout_count.unwrap_or_default();
+    RendererWaitableDelta {
+        wait_ms: (after_total - before_total).max(0.0),
+        waits: after_waits.saturating_sub(before_waits),
+        timeouts: after_timeouts.saturating_sub(before_timeouts),
     }
 }
 

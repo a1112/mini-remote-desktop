@@ -602,14 +602,24 @@ describe("RemoteDisplayWindowPage", () => {
           queue_depth: 0,
           dropped_frames: 2,
           render_queue_replacements: 1,
+          render_stale_frame_drops: 4,
           render_lock_drops: 2,
           render_present_skips: 3,
+          render_queue_policy: "latest",
+          swap_chain_max_frame_latency: 1,
+          swap_chain_allow_tearing: true,
+          swap_chain_waitable_object: true,
+          swap_chain_present_mode: "waitable",
+          display_refresh_hz: 144,
+          render_thread_priority: "highest",
+          render_waitable_timeouts: 1,
           stage_metrics: [
             { stage: "sender.capture", p95_ms: 1.7, samples: 20 },
             { stage: "sender.encode", p95_ms: 2.4, samples: 20 },
             { stage: "sender.send_datagram", p95_ms: 3.1, samples: 20 },
             { stage: "receiver.decode", p95_ms: 1.2, samples: 20 },
             { stage: "render_lock_wait", p95_ms: 0.3, samples: 20 },
+            { stage: "render_waitable_wait", p95_ms: 0.8, samples: 20 },
             { stage: "receiver.present", p95_ms: 4.6, samples: 20 },
           ],
         });
@@ -668,9 +678,13 @@ describe("RemoteDisplayWindowPage", () => {
     expect(screen.getByText("NVDEC HEVC / D3D11")).toBeInTheDocument();
     expect(screen.getByText("DXGINative")).toBeInTheDocument();
     expect(screen.getByText("渲染丢帧细分")).toBeInTheDocument();
-    expect(screen.getByText("队列 1 / 锁 2 / Present 3")).toBeInTheDocument();
+    expect(screen.getByText("队列 1 / 过期 4 / 锁 2 / Present 3")).toBeInTheDocument();
+    expect(screen.getByText("渲染策略")).toBeInTheDocument();
+    expect(screen.getByText("latest / waitable / tearing / 144 Hz")).toBeInTheDocument();
     expect(screen.getByText("渲染锁等待 p95")).toBeInTheDocument();
     expect(screen.getAllByText("0.30 ms").length).toBeGreaterThan(0);
+    expect(screen.getByText("Waitable 等待 p95")).toBeInTheDocument();
+    expect(screen.getByText("0.80 ms / timeout 1")).toBeInTheDocument();
 
     fireEvent.click(diagnosticsChip);
     fireEvent.mouseLeave(diagnosticsChip.parentElement ?? diagnosticsChip);

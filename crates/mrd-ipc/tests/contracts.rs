@@ -760,6 +760,13 @@ fn serialize_deserialize_media_pipeline_snapshot_contract() {
             render_present_skips: 2,
             render_pacing_target_fps: Some(144),
             render_queue_policy: Some("latest".to_string()),
+            swap_chain_max_frame_latency: Some(1),
+            swap_chain_allow_tearing: Some(true),
+            swap_chain_waitable_object: Some(true),
+            swap_chain_present_mode: Some("waitable".to_string()),
+            display_refresh_hz: Some(144),
+            render_thread_priority: Some("highest".to_string()),
+            render_waitable_timeouts: 1,
             stage_metrics: vec![MediaStageMetrics {
                 stage: "decode".to_string(),
                 p50_ms: Some(1.0),

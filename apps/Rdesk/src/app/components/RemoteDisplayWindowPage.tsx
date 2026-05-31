@@ -2596,6 +2596,10 @@ export function RemoteDisplayWindowPage() {
     "receiver.render_lock_wait",
     "render_lock_wait",
   ]);
+  const stageRenderWaitableWaitP95Ms = findStageP95(mediaPipelineSnapshot, [
+    "receiver.render_waitable_wait",
+    "render_waitable_wait",
+  ]);
   const diagnosticsFps =
     probeSnapshot?.current_fps ??
     webVideoFps ??
@@ -2640,8 +2644,28 @@ export function RemoteDisplayWindowPage() {
     metrics?.dropped_frames ?? webRtcReceiverStats?.framesDropped ?? remoteDropTotal ?? null;
   const diagnosticsRenderQueueReplacements =
     mediaPipelineSnapshot?.render_queue_replacements ?? null;
+  const diagnosticsRenderStaleFrameDrops =
+    mediaPipelineSnapshot?.render_stale_frame_drops ?? null;
   const diagnosticsRenderLockDrops = mediaPipelineSnapshot?.render_lock_drops ?? null;
   const diagnosticsRenderPresentSkips = mediaPipelineSnapshot?.render_present_skips ?? null;
+  const diagnosticsRenderQueuePolicy = mediaPipelineSnapshot?.render_queue_policy ?? null;
+  const diagnosticsSwapChainPresentMode = mediaPipelineSnapshot?.swap_chain_present_mode ?? null;
+  const diagnosticsSwapChainTearing =
+    typeof mediaPipelineSnapshot?.swap_chain_allow_tearing === "boolean"
+      ? mediaPipelineSnapshot.swap_chain_allow_tearing
+        ? "tearing"
+        : "no tearing"
+      : null;
+  const diagnosticsDisplayRefreshHz = mediaPipelineSnapshot?.display_refresh_hz ?? null;
+  const diagnosticsRenderPolicySummary = [
+    diagnosticsRenderQueuePolicy,
+    diagnosticsSwapChainPresentMode,
+    diagnosticsSwapChainTearing,
+    typeof diagnosticsDisplayRefreshHz === "number" ? formatHz(diagnosticsDisplayRefreshHz) : null,
+  ]
+    .filter((value): value is string => Boolean(value))
+    .join(" / ");
+  const diagnosticsRenderWaitableTimeouts = mediaPipelineSnapshot?.render_waitable_timeouts ?? null;
   const diagnosticsDropRatio =
     metrics && metrics.frame_count > 0
       ? metrics.dropped_frames / metrics.frame_count * 100
@@ -5980,11 +6004,20 @@ export function RemoteDisplayWindowPage() {
                       ["丢包/掉帧", `${formatPercent(diagnosticsDropRatio)} / ${formatCount(diagnosticsDroppedFrames)}`],
                       [
                         "渲染丢帧细分",
-                        `队列 ${formatCount(diagnosticsRenderQueueReplacements)} / 锁 ${formatCount(
+                        `队列 ${formatCount(diagnosticsRenderQueueReplacements)} / 过期 ${formatCount(
+                          diagnosticsRenderStaleFrameDrops
+                        )} / 锁 ${formatCount(
                           diagnosticsRenderLockDrops
                         )} / Present ${formatCount(diagnosticsRenderPresentSkips)}`,
                       ],
+                      ["渲染策略", dash(diagnosticsRenderPolicySummary)],
                       ["渲染锁等待 p95", formatMs(stageRenderLockWaitP95Ms)],
+                      [
+                        "Waitable 等待 p95",
+                        `${formatMs(stageRenderWaitableWaitP95Ms)} / timeout ${formatCount(
+                          diagnosticsRenderWaitableTimeouts
+                        )}`,
+                      ],
                       ["队列深度", formatCount(diagnosticsQueueDepth)],
                       ["码率", formatMbps(diagnosticsBitrateMbps)],
                     ]}

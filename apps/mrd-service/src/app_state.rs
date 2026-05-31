@@ -19,7 +19,7 @@ use mrd_ipc::{
 };
 use mrd_proto::{DeviceId, SessionId};
 #[cfg(windows)]
-use mrd_render::{BoxedRenderer, RenderFrame, RenderTarget, RendererFactory};
+use mrd_render::{BoxedRenderer, RenderFrame, RenderTarget, RendererFactory, RendererSnapshot};
 #[cfg(windows)]
 use mrd_render_d3d11::D3d11RendererFactory;
 use std::collections::{HashMap, VecDeque};
@@ -301,6 +301,13 @@ struct MediaPipelineState {
     render_present_skips: u64,
     render_pacing_target_fps: Option<u32>,
     render_queue_policy: Option<String>,
+    swap_chain_max_frame_latency: Option<u32>,
+    swap_chain_allow_tearing: Option<bool>,
+    swap_chain_waitable_object: Option<bool>,
+    swap_chain_present_mode: Option<String>,
+    display_refresh_hz: Option<u32>,
+    render_thread_priority: Option<String>,
+    render_waitable_timeouts: u64,
     stage_samples: HashMap<String, VecDeque<f64>>,
     stage_summaries: HashMap<String, MediaStageMetrics>,
     test_impairment: Option<MediaTestImpairmentSnapshot>,
@@ -591,6 +598,22 @@ impl MediaPipelineRegistry {
             .render_queue_policy = policy.map(Into::into);
     }
 
+    #[cfg(windows)]
+    pub fn record_renderer_snapshot(&mut self, session_id: SessionId, snapshot: &RendererSnapshot) {
+        let state = self.pipelines.entry(session_id).or_default();
+        state.swap_chain_max_frame_latency = snapshot.swap_chain_max_frame_latency;
+        state.swap_chain_allow_tearing = snapshot.swap_chain_allow_tearing;
+        state.swap_chain_waitable_object = snapshot.swap_chain_waitable_object;
+        state.swap_chain_present_mode = snapshot.swap_chain_present_mode.clone();
+        state.display_refresh_hz = snapshot.display_refresh_hz;
+        state.render_thread_priority = snapshot.render_thread_priority.clone();
+    }
+
+    pub fn increment_render_waitable_timeouts(&mut self, session_id: SessionId, count: u64) {
+        let state = self.pipelines.entry(session_id).or_default();
+        state.render_waitable_timeouts = state.render_waitable_timeouts.saturating_add(count);
+    }
+
     pub fn record_stage_duration_ms(
         &mut self,
         session_id: SessionId,
@@ -691,6 +714,14 @@ impl MediaPipelineRegistry {
             render_present_skips: state.map_or(0, |state| state.render_present_skips),
             render_pacing_target_fps: state.and_then(|state| state.render_pacing_target_fps),
             render_queue_policy: state.and_then(|state| state.render_queue_policy.clone()),
+            swap_chain_max_frame_latency: state
+                .and_then(|state| state.swap_chain_max_frame_latency),
+            swap_chain_allow_tearing: state.and_then(|state| state.swap_chain_allow_tearing),
+            swap_chain_waitable_object: state.and_then(|state| state.swap_chain_waitable_object),
+            swap_chain_present_mode: state.and_then(|state| state.swap_chain_present_mode.clone()),
+            display_refresh_hz: state.and_then(|state| state.display_refresh_hz),
+            render_thread_priority: state.and_then(|state| state.render_thread_priority.clone()),
+            render_waitable_timeouts: state.map_or(0, |state| state.render_waitable_timeouts),
             stage_metrics,
             test_impairment: state.and_then(|state| state.test_impairment.clone()),
             sender_transport: state
@@ -2028,6 +2059,54 @@ mod tests {
         let snapshot = registry.snapshot(&session_id);
 
         assert_eq!(snapshot.render_queue_policy.as_deref(), Some("latest"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn media_pipeline_registry_exposes_renderer_swapchain_pacing_metadata() {
+        use mrd_render::RendererSnapshot;
+
+        let mut registry = MediaPipelineRegistry::default();
+        let session_id = SessionId("render-swapchain-session".to_string());
+
+        registry.record_renderer_snapshot(
+            session_id.clone(),
+            &RendererSnapshot {
+                attached_to_target: true,
+                uploaded_frame_count: 4,
+                presented_frame_count: 4,
+                present_skipped_count: 0,
+                last_present_status: Some("presented".to_string()),
+                low_latency_frame_latency_target: Some(1),
+                swap_chain_max_frame_latency: Some(1),
+                swap_chain_allow_tearing: Some(true),
+                swap_chain_waitable_object: Some(true),
+                swap_chain_present_mode: Some("waitable".to_string()),
+                display_refresh_hz: Some(144),
+                render_thread_priority: Some("highest".to_string()),
+                waitable_wait_count: Some(2),
+                waitable_wait_total_ms: Some(1.25),
+                waitable_timeout_count: Some(1),
+                last_waitable_wait_ms: Some(0.75),
+                last_width: 2560,
+                last_height: 1440,
+                last_pixel_format: None,
+            },
+        );
+        registry.increment_render_waitable_timeouts(session_id.clone(), 1);
+
+        let snapshot = registry.snapshot(&session_id);
+
+        assert_eq!(snapshot.swap_chain_max_frame_latency, Some(1));
+        assert_eq!(snapshot.swap_chain_allow_tearing, Some(true));
+        assert_eq!(snapshot.swap_chain_waitable_object, Some(true));
+        assert_eq!(
+            snapshot.swap_chain_present_mode.as_deref(),
+            Some("waitable")
+        );
+        assert_eq!(snapshot.display_refresh_hz, Some(144));
+        assert_eq!(snapshot.render_thread_priority.as_deref(), Some("highest"));
+        assert_eq!(snapshot.render_waitable_timeouts, 1);
     }
 
     #[cfg(windows)]

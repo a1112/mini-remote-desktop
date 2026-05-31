@@ -319,6 +319,21 @@ mod wire {
         /// Receiver-side render queue policy, for example `latest` or `paced_fifo`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub render_queue_policy: Option<String>,
+        /// Actual swap-chain frame latency configured on the attached renderer surface.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub swap_chain_max_frame_latency: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub swap_chain_allow_tearing: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub swap_chain_waitable_object: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub swap_chain_present_mode: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub display_refresh_hz: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub render_thread_priority: Option<String>,
+        #[serde(default)]
+        pub render_waitable_timeouts: u64,
         pub stage_metrics: Vec<MediaStageMetrics>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub test_impairment: Option<MediaTestImpairmentSnapshot>,
