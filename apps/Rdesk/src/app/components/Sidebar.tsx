@@ -3,6 +3,7 @@ import { AppVersionBadge } from "./AppVersionBadge";
 import { useState, useEffect, useRef } from "react";
 import { deviceService } from "../services/deviceService";
 import { useTheme } from "./ThemeContext";
+import { useAuth } from "./AuthContext";
 import { NavLink, useLocation, useNavigate } from "react-router";
 import {
   Monitor,
@@ -56,11 +57,32 @@ const iconMap: Record<string, typeof Monitor> = {
   Smartphone,
 };
 
+type DeviceActionStatus = {
+  kind: "success" | "error";
+  message: string;
+};
+
+type DeviceMenuItem = {
+  icon?: typeof Monitor;
+  label?: string;
+  action?: () => void | Promise<void>;
+  type?: "divider";
+  danger?: boolean;
+  submenu?: "management";
+  disabled?: boolean;
+  title?: string;
+};
+
+const unsupportedDeviceActionTitle = "暂未接入本机服务能力";
+
 export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: SidebarProps) {
   const { devices, refresh, currentDeviceId } = useDevices({ pollInterval: 30000, enabled: true });
   const [devicesExpanded, setDevicesExpanded] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [submenuOpen, setSubmenuOpen] = useState<string | null>(null);
+  const [actionStatus, setActionStatus] = useState<DeviceActionStatus | null>(null);
+  const actionStatusTimerRef = useRef<number | null>(null);
+  const { isLoggedIn, user } = useAuth();
 
   const handleRefresh = async () => {
     setRefreshing(true);
@@ -80,29 +102,22 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
   const onlineDevices = devices.filter((d) => d.status === "online");
   const offlineDevices = devices.filter((d) => d.status === "offline");
 
-  // 模拟启用/禁用设备操作
-  const handleToggleDevice = (deviceId: string, deviceName: string) => {
-    console.log(`切换设备状态: ${deviceName} (${deviceId})`);
-    setContextMenu(null);
-    setSubmenuOpen(null);
-    // TODO: 实际实现此功能
-    alert("启用/禁用设备功能为模拟操作");
+  const showActionStatus = (next: DeviceActionStatus) => {
+    setActionStatus(next);
+    if (actionStatusTimerRef.current !== null) {
+      window.clearTimeout(actionStatusTimerRef.current);
+    }
+    actionStatusTimerRef.current = window.setTimeout(() => {
+      setActionStatus(null);
+      actionStatusTimerRef.current = null;
+    }, 3000);
   };
 
-  // 模拟管理操作
-  const handleManagementAction = (action: string, deviceId: string, deviceName: string) => {
-    console.log(`执行管理操作: ${action} on ${deviceName} (${deviceId})`);
-    setContextMenu(null);
-    setSubmenuOpen(null);
-    // TODO: 实际实现这些操作
-    const actionLabels: Record<string, string> = {
-      restart: "重启",
-      shutdown: "关机",
-      wol: "Wake-on-LAN",
-      info: "设备信息",
-    };
-    alert(`${actionLabels[action] || action} 功能为模拟操作`);
-  };
+  useEffect(() => () => {
+    if (actionStatusTimerRef.current !== null) {
+      window.clearTimeout(actionStatusTimerRef.current);
+    }
+  }, []);
 
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
@@ -187,23 +202,32 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
     setContextMenu(null);
   };
 
-  // 退出绑定
-  const handleUnbind = async (deviceId: string) => {
-    // TODO: 调用 API 退出绑定
-    console.log(`退出绑定设备 ${deviceId}`);
+  const handleUnbind = async (deviceId: string, deviceName: string) => {
     setContextMenu(null);
+    setSubmenuOpen(null);
+
+    if (!isLoggedIn || !user) {
+      showActionStatus({ kind: "error", message: "请先登录后再退出绑定" });
+      return;
+    }
+
+    try {
+      const success = await deviceService.unbindDevice(user.id, deviceId);
+      if (!success) {
+        showActionStatus({ kind: "error", message: `退出绑定失败：${deviceName}` });
+        return;
+      }
+      await refresh();
+      showActionStatus({ kind: "success", message: `已退出绑定：${deviceName}` });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "未知错误";
+      showActionStatus({ kind: "error", message: `退出绑定失败：${message}` });
+    }
   };
 
   // 菜单项定义（用于非二级菜单渲染）
   const getTopLevelMenuItems = () => {
-    const items: Array<{
-      icon?: any;
-      label?: string;
-      action?: () => void;
-      type?: "divider";
-      danger?: boolean;
-      submenu?: string;
-    }> = [];
+    const items: DeviceMenuItem[] = [];
     const activeContextMenu = contextMenu;
 
     if (!activeContextMenu) {
@@ -214,17 +238,33 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
     if (isContextOnline) {
       items.push(
         { icon: Play, label: "远程桌面", action: () => { navigate(`/devices/${activeContextMenu.deviceId}`); setContextMenu(null); } },
-        { icon: FolderIcon, label: "文件传输", action: () => { navigate(`/devices/${activeContextMenu.deviceId}`); setContextMenu(null); } },
-        { icon: Terminal, label: "远程终端", action: () => { navigate(`/devices/${activeContextMenu.deviceId}`); setContextMenu(null); } },
+        { icon: FolderIcon, label: "文件传输", disabled: true, title: unsupportedDeviceActionTitle },
+        { icon: Terminal, label: "远程终端", disabled: true, title: unsupportedDeviceActionTitle },
         { type: "divider" as const }
       );
     }
 
     // 通用菜单
     items.push(
-      { icon: Pencil, label: "重命名", action: () => contextMenuDevice && handleStartRename(activeContextMenu.deviceId, contextMenuDevice.name) },
-      { icon: Star, label: "收藏设备", action: () => setContextMenu(null) },
-      { icon: Copy, label: "复制 ID", action: () => contextMenuDevice && handleCopyId(contextMenuDevice.deviceId) },
+      {
+        icon: Pencil,
+        label: "重命名",
+        action: () => {
+          if (contextMenuDevice) {
+            handleStartRename(activeContextMenu.deviceId, contextMenuDevice.name);
+          }
+        },
+      },
+      { icon: Star, label: "收藏设备", disabled: true, title: unsupportedDeviceActionTitle },
+      {
+        icon: Copy,
+        label: "复制 ID",
+        action: () => {
+          if (contextMenuDevice) {
+            handleCopyId(contextMenuDevice.deviceId);
+          }
+        },
+      },
       { type: "divider" as const }
     );
 
@@ -232,7 +272,8 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
     items.push({
       icon: Ban,
       label: "禁用设备",
-      action: () => contextMenuDevice && handleToggleDevice(activeContextMenu.deviceId, contextMenuDevice.name)
+      disabled: true,
+      title: unsupportedDeviceActionTitle,
     });
 
     items.push({ type: "divider" as const });
@@ -240,15 +281,25 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
     // 在线设备特有菜单
     if (isContextOnline) {
       items.push(
-        { icon: LogOut, label: "退出绑定", action: () => contextMenuDevice && handleUnbind(contextMenuDevice.deviceId) },
-        { icon: Power, label: "断开连接", action: () => setContextMenu(null), danger: true }
+        {
+          icon: LogOut,
+          label: "退出绑定",
+          action: () => {
+            if (contextMenuDevice) {
+              return handleUnbind(contextMenuDevice.deviceId, contextMenuDevice.name);
+            }
+          },
+          disabled: !isLoggedIn || !user,
+          title: !isLoggedIn || !user ? "请先登录后再退出绑定" : undefined,
+        },
+        { icon: Power, label: "断开连接", disabled: true, title: unsupportedDeviceActionTitle, danger: true }
       );
     }
 
     // 移除设备和管理子菜单
     items.push(
-      { icon: Trash2, label: "移除设备", action: () => setContextMenu(null), danger: true },
-      { icon: Settings, label: "管理", submenu: "management" }
+      { icon: Trash2, label: "移除设备", disabled: true, title: unsupportedDeviceActionTitle, danger: true },
+      { icon: Settings, label: "管理", submenu: "management", title: unsupportedDeviceActionTitle }
     );
 
     return items;
@@ -256,10 +307,10 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
 
   // 管理子菜单项
   const getManagementSubmenuItems = () => [
-    { icon: RotateCw, label: "重启", action: "restart" },
-    { icon: Power, label: "关机", action: "shutdown" },
-    { icon: Zap, label: "Wake-on-LAN", action: "wol" },
-    { icon: Info, label: "设备信息", action: "info" },
+    { icon: RotateCw, label: "重启", disabled: true, title: unsupportedDeviceActionTitle },
+    { icon: Power, label: "关机", disabled: true, title: unsupportedDeviceActionTitle },
+    { icon: Zap, label: "Wake-on-LAN", disabled: true, title: unsupportedDeviceActionTitle },
+    { icon: Info, label: "设备信息", disabled: true, title: unsupportedDeviceActionTitle },
   ];
 
   return (
@@ -565,6 +616,19 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
         </div>
       )}
 
+      {actionStatus && !collapsed && (
+        <div
+          role="status"
+          className={`mx-2 mb-2 rounded-md border px-2 py-1 text-xs ${
+            actionStatus.kind === "success"
+              ? isDark ? "border-green-900/60 bg-green-950/40 text-green-300" : "border-green-200 bg-green-50 text-green-700"
+              : isDark ? "border-red-900/60 bg-red-950/40 text-red-300" : "border-red-200 bg-red-50 text-red-700"
+          }`}
+        >
+          {actionStatus.message}
+        </div>
+      )}
+
       <AppVersionBadge collapsed={collapsed} isDark={isDark} />
 
       {/* Context menu */}
@@ -587,17 +651,22 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
             const ItemIcon = item.icon;
             const isDanger = item.danger;
             const hasSubmenu = item.submenu === "management";
+            const isDisabled = Boolean(item.disabled);
 
             return (
               <div key={index} className="relative">
                 <button
                   className={`w-full flex items-center justify-between gap-2.5 px-3 py-1.5 text-left transition-colors ${
-                    isDanger
+                    isDisabled
+                      ? isDark ? "text-gray-600 cursor-not-allowed" : "text-gray-400 cursor-not-allowed"
+                      : isDanger
                       ? isDark ? "text-red-400 hover:bg-red-900/30" : "text-red-500 hover:bg-red-50"
                       : isDark ? "text-gray-300 hover:bg-gray-700" : "text-gray-600 hover:bg-gray-50"
                   }`}
                   style={{ fontSize: 12 }}
-                  onClick={item.action}
+                  disabled={isDisabled}
+                  title={item.title}
+                  onClick={() => { if (item.action) void item.action(); }}
                   onMouseEnter={() => hasSubmenu && setSubmenuOpen("management")}
                 >
                   <span className="flex items-center gap-2.5">
@@ -620,9 +689,12 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
                       return (
                         <button
                           key={subIndex}
-                          onClick={() => handleManagementAction(subItem.action, contextMenuDevice!.id, contextMenuDevice!.name)}
+                          disabled={subItem.disabled}
+                          title={subItem.title}
                           className={`w-full flex items-center gap-2.5 px-3 py-1.5 text-left transition-colors ${
-                            isDark ? "text-gray-300 hover:bg-gray-700" : "text-gray-600 hover:bg-gray-50"
+                            subItem.disabled
+                              ? isDark ? "text-gray-600 cursor-not-allowed" : "text-gray-400 cursor-not-allowed"
+                              : isDark ? "text-gray-300 hover:bg-gray-700" : "text-gray-600 hover:bg-gray-50"
                           }`}
                           style={{ fontSize: 12 }}
                         >

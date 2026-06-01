@@ -424,8 +424,9 @@ class DeviceRegistrationService {
    * @param userId 用户ID
    * @returns 解绑结果
    */
-  async unbindDevice(userId: string): Promise<boolean> {
-    if (!this.deviceInfo) {
+  async unbindDevice(userId: string, deviceId?: string): Promise<boolean> {
+    const targetDeviceId = deviceId ?? this.deviceInfo?.device_id;
+    if (!targetDeviceId) {
       console.warn("[DeviceService] 设备未注册，无法解绑");
       return false;
     }
@@ -439,7 +440,7 @@ class DeviceRegistrationService {
           ...(userToken ? { "Authorization": `Bearer ${userToken}` } : {}),
         },
         body: JSON.stringify({
-          device_id: this.deviceInfo.device_id,
+          device_id: targetDeviceId,
           user_id: userId,
         }),
       });
