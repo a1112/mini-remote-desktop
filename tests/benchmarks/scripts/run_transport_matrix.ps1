@@ -59,6 +59,14 @@ if (@($scenario.PSObject.Properties.Name) -contains "pace_to_fps") {
 } else {
   Remove-Item Env:MRD_BENCH_PACE_TO_FPS -ErrorAction SilentlyContinue
 }
+$sourceEnvironment = Get-TransportMatrixSourceEnvironment -Scenario $scenario
+foreach ($key in @("MRD_BENCH_SOURCE_ID", "MRD_BENCH_DISPLAY_ID")) {
+  if ($sourceEnvironment.ContainsKey($key)) {
+    Set-Item -Path "Env:$key" -Value $sourceEnvironment[$key]
+  } else {
+    Remove-Item -Path "Env:$key" -ErrorAction SilentlyContinue
+  }
+}
 $av1Mode = Get-TransportMatrixAv1Mode -Scenario $scenario
 if ($null -ne $av1Mode) {
   $env:MRD_BENCH_NVENC_AV1_MODE = $av1Mode

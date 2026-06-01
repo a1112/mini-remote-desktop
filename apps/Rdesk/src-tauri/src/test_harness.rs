@@ -1000,6 +1000,7 @@ impl PipelineRenderer {
         width: usize,
         height: usize,
         target_hwnd: Option<isize>,
+        target_display_ref: Option<String>,
         use_shared_texture_decode: bool,
     ) -> Result<Self> {
         let (sender, receiver) = mpsc::sync_channel(1);
@@ -1016,9 +1017,14 @@ impl PipelineRenderer {
             let render_thread = thread::Builder::new()
                 .name("mrd-test-render".to_string())
                 .spawn(move || {
-                    if let Err(error) =
-                        run_d3d11_renderer_thread(renderer, width, height, target_hwnd, receiver)
-                    {
+                    if let Err(error) = run_d3d11_renderer_thread(
+                        renderer,
+                        width,
+                        height,
+                        target_hwnd,
+                        target_display_ref.as_deref(),
+                        receiver,
+                    ) {
                         if let Ok(mut last_error) = thread_error.lock() {
                             *last_error = Some(error.to_string());
                         }
@@ -1051,6 +1057,7 @@ impl PipelineRenderer {
                         width,
                         height,
                         target_hwnd,
+                        target_display_ref.as_deref(),
                         receiver,
                     ) {
                         if let Ok(mut last_error) = thread_error.lock() {
@@ -1074,9 +1081,14 @@ impl PipelineRenderer {
         let render_thread = thread::Builder::new()
             .name("mrd-test-render".to_string())
             .spawn(move || {
-                if let Err(error) =
-                    run_renderer_thread(renderer_type, width, height, target_hwnd, receiver)
-                {
+                if let Err(error) = run_renderer_thread(
+                    renderer_type,
+                    width,
+                    height,
+                    target_hwnd,
+                    target_display_ref.as_deref(),
+                    receiver,
+                ) {
                     if let Ok(mut last_error) = thread_error.lock() {
                         *last_error = Some(error.to_string());
                     }
@@ -1200,6 +1212,7 @@ fn run_renderer_thread(
     width: usize,
     height: usize,
     target_hwnd: Option<isize>,
+    target_display_ref: Option<&str>,
     receiver: mpsc::Receiver<RenderCommand>,
 ) -> Result<()> {
     match renderer_type {
@@ -1208,7 +1221,11 @@ fn run_renderer_thread(
             {
                 let window = match target_hwnd {
                     Some(_) => None,
-                    None => Some(D3d11TestWindow::new(width, height)?),
+                    None => Some(D3d11TestWindow::new_on_display(
+                        width,
+                        height,
+                        target_display_ref,
+                    )?),
                 };
                 let hwnd = target_hwnd.unwrap_or_else(|| {
                     window
@@ -1268,7 +1285,11 @@ fn run_renderer_thread(
             {
                 let window = match target_hwnd {
                     Some(_) => None,
-                    None => Some(D3d11TestWindow::new(width, height)?),
+                    None => Some(D3d11TestWindow::new_on_display(
+                        width,
+                        height,
+                        target_display_ref,
+                    )?),
                 };
                 let hwnd = target_hwnd.unwrap_or_else(|| {
                     window
@@ -1338,11 +1359,16 @@ fn run_d3d11_renderer_thread(
     width: usize,
     height: usize,
     target_hwnd: Option<isize>,
+    target_display_ref: Option<&str>,
     receiver: mpsc::Receiver<RenderCommand>,
 ) -> Result<()> {
     let window = match target_hwnd {
         Some(_) => None,
-        None => Some(D3d11TestWindow::new(width, height)?),
+        None => Some(D3d11TestWindow::new_on_display(
+            width,
+            height,
+            target_display_ref,
+        )?),
     };
     let hwnd = target_hwnd.unwrap_or_else(|| {
         window
@@ -1363,11 +1389,16 @@ fn run_opengl_hybrid_renderer_thread(
     width: usize,
     height: usize,
     target_hwnd: Option<isize>,
+    target_display_ref: Option<&str>,
     receiver: mpsc::Receiver<RenderCommand>,
 ) -> Result<()> {
     let window = match target_hwnd {
         Some(_) => None,
-        None => Some(D3d11TestWindow::new(width, height)?),
+        None => Some(D3d11TestWindow::new_on_display(
+            width,
+            height,
+            target_display_ref,
+        )?),
     };
     let hwnd = target_hwnd.unwrap_or_else(|| {
         window
@@ -1632,7 +1663,11 @@ struct D3d11TestWindow {
 
 #[cfg(windows)]
 impl D3d11TestWindow {
-    fn new(frame_width: usize, frame_height: usize) -> Result<Self> {
+    fn new_on_display(
+        frame_width: usize,
+        frame_height: usize,
+        display_ref: Option<&str>,
+    ) -> Result<Self> {
         use std::ffi::OsStr;
         use std::os::windows::ffi::OsStrExt;
         use windows::core::PCWSTR;
@@ -1688,14 +1723,15 @@ impl D3d11TestWindow {
 
         let width = frame_width.clamp(640, 1280) as i32;
         let height = frame_height.clamp(360, 800) as i32;
+        let origin = d3d11_test_window_origin(display_ref)?;
         let hwnd = unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 PCWSTR(class_name.as_ptr()),
                 PCWSTR(title.as_ptr()),
                 WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
+                origin.map(|(left, _)| left).unwrap_or(CW_USEDEFAULT),
+                origin.map(|(_, top)| top).unwrap_or(CW_USEDEFAULT),
                 width,
                 height,
                 HWND(0),
@@ -1742,6 +1778,29 @@ impl Drop for D3d11TestWindow {
             let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(self.hwnd);
         }
     }
+}
+
+#[cfg(windows)]
+fn d3d11_test_window_origin(display_ref: Option<&str>) -> Result<Option<(i32, i32)>> {
+    let Some(display_ref) = display_ref.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+
+    let selection =
+        select_windows_display_ref(Some(display_ref), windows_display_device_name_for_source_id)?;
+    let target = match selection {
+        WindowsDisplaySelection::DeviceName(device_name) => enumerate_windows_display_targets()?
+            .into_iter()
+            .find(|target| target.device_name.eq_ignore_ascii_case(&device_name))
+            .ok_or_else(|| {
+                anyhow::anyhow!("Windows display target not found for device {device_name}")
+            })?,
+        WindowsDisplaySelection::Index(source_index) => {
+            windows_display_target_for_source_index(source_index)?
+        }
+    };
+
+    Ok(Some((target.left + 32, target.top + 32)))
 }
 
 pub struct TestHarness {
@@ -2107,6 +2166,7 @@ impl TestHarness {
                     width,
                     height,
                     config.renderer_target_hwnd,
+                    display_ref(config).map(str::to_string),
                     use_shared_texture_decode,
                 )
             })

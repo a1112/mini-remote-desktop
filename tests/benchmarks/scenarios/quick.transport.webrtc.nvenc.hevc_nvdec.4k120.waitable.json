@@ -11,6 +11,8 @@
   "fps": 120,
   "duration_secs": 20,
   "bitrate_bps": 120000000,
+  "source_id": "windows:display-shared:1",
+  "display_id": "windows:display-shared:1",
   "pace_to_fps": true,
   "d3d11_waitable_object": true,
   "render_thread_priority": "above_normal",

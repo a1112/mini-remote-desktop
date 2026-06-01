@@ -101,6 +101,16 @@ if ($null -ne $noBitrate) {
 
 Assert-Throws { Get-TransportMatrixBitrateBps -Scenario ([pscustomobject]@{ bitrate_bps = 0 }) } "greater than zero" "Zero bitrate_bps must be rejected"
 
+$sourceEnv = Get-TransportMatrixSourceEnvironment -Scenario ([pscustomobject]@{
+  source_id = " windows:display-shared:1 "
+  display_id = "windows:display-shared:1"
+})
+if ($sourceEnv.MRD_BENCH_SOURCE_ID -ne "windows:display-shared:1") { throw "scenario source_id should set MRD_BENCH_SOURCE_ID" }
+if ($sourceEnv.MRD_BENCH_DISPLAY_ID -ne "windows:display-shared:1") { throw "scenario display_id should set MRD_BENCH_DISPLAY_ID" }
+
+$emptySourceEnv = Get-TransportMatrixSourceEnvironment -Scenario ([pscustomobject]@{ profile = "default"; source_id = "" })
+if ($emptySourceEnv.ContainsKey("MRD_BENCH_SOURCE_ID")) { throw "empty scenario source_id should leave MRD_BENCH_SOURCE_ID unset" }
+
 $renderEnv = Get-TransportMatrixRenderEnvironment -Scenario ([pscustomobject]@{
   d3d11_waitable_object = $true
   render_thread_priority = "above_normal"
@@ -243,6 +253,8 @@ foreach ($spec in $scenarioSpecs) {
     }
   } elseif ($spec.path -like "*.4k120*.json") {
     if ($scenario.fps -ne 120) { throw "$($spec.path) should target 120fps" }
+    if ($scenario.source_id -ne "windows:display-shared:1") { throw "$($spec.path) should target the 4K120 capture source" }
+    if ($scenario.display_id -ne "windows:display-shared:1") { throw "$($spec.path) should target the 4K120 render display" }
     if (-not $scenario.d3d11_waitable_object) { throw "$($spec.path) should enable waitable object" }
     if ($scenario.render_thread_priority -ne "above_normal") { throw "$($spec.path) should set render thread priority" }
   } elseif ($scenario.fps -ne 30) {
@@ -324,6 +336,11 @@ try {
     probe_complete = $true
     fps_observed = 143.5
     bitrate_kbps = 30000.0
+    target_bitrate_kbps = 120000.0
+    encoded_fps = 143.9
+    decoded_fps = 143.5
+    zero_copy_enabled = $true
+    total_bitstream_bytes = 75000000
     keyframes = 0
     dropped_frames = 0
     quic_receiver_completed_frames = $null
@@ -394,6 +411,11 @@ database or disk is full
 
   $csv = Import-Csv (Join-Path $summaryTmp "summary.csv")
   if ($csv.run_status -ne "PASS") { throw "summary CSV must expose PASS run_status" }
+  if ($csv.target_bitrate_kbps -ne "120000") { throw "summary CSV must include target bitrate" }
+  if ($csv.encoded_fps -ne "143.9") { throw "summary CSV must include encoded FPS" }
+  if ($csv.decoded_fps -ne "143.5") { throw "summary CSV must include decoded FPS" }
+  if ($csv.zero_copy_enabled -ne "True") { throw "summary CSV must include zero-copy status" }
+  if ($csv.total_bitstream_bytes -ne "75000000") { throw "summary CSV must include bitstream byte count" }
   if ($csv.render_queue_replacements -ne "7") { throw "summary CSV must include render queue replacements" }
   if ($csv.render_stale_frame_drops -ne "7") { throw "summary CSV must include render stale frame drops" }
   if ($csv.render_queue_replacement_rate -ne "0.35") { throw "summary CSV must include render queue replacement rate" }
@@ -409,6 +431,10 @@ database or disk is full
   if ($csv.swap_chain_present_mode -ne "waitable") { throw "summary CSV must include swapchain present mode" }
   if ($csv.display_refresh_hz -ne "144") { throw "summary CSV must include display refresh hz" }
   $report = Get-Content (Join-Path $summaryTmp "reports/markdown-report.md") -Raw
+  if ($report -notmatch "target_bitrate_kbps \\| 120000") { throw "markdown report must include target bitrate" }
+  if ($report -notmatch "encoded_fps \\| 143.9") { throw "markdown report must include encoded FPS" }
+  if ($report -notmatch "zero_copy_enabled \\| True") { throw "markdown report must include zero-copy status" }
+  if ($report -notmatch "total_bitstream_bytes \\| 75000000") { throw "markdown report must include bitstream bytes" }
   if ($report -notmatch "swap_chain_max_frame_latency \\| 1") { throw "markdown report must include swapchain max frame latency" }
   if ($report -notmatch "swap_chain_allow_tearing \\| True") { throw "markdown report must include swapchain tearing policy" }
   if ($report -notmatch "swap_chain_present_mode \\| waitable") { throw "markdown report must include swapchain present mode" }

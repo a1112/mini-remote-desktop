@@ -76,6 +76,26 @@ function Get-TransportMatrixBitrateBps {
   return $null
 }
 
+function Get-TransportMatrixSourceEnvironment {
+  param([object]$Scenario)
+
+  $result = @{}
+  $propertyNames = @($Scenario.PSObject.Properties.Name)
+  if (
+    $propertyNames -contains "source_id" -and
+    -not [string]::IsNullOrWhiteSpace([string]$Scenario.source_id)
+  ) {
+    $result.MRD_BENCH_SOURCE_ID = ([string]$Scenario.source_id).Trim()
+  }
+  if (
+    $propertyNames -contains "display_id" -and
+    -not [string]::IsNullOrWhiteSpace([string]$Scenario.display_id)
+  ) {
+    $result.MRD_BENCH_DISPLAY_ID = ([string]$Scenario.display_id).Trim()
+  }
+  return $result
+}
+
 function Get-TransportMatrixAv1Mode {
   param([object]$Scenario)
 

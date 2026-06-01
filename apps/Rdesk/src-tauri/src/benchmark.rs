@@ -42,6 +42,16 @@ pub struct BenchmarkSummary {
     pub probe_complete: bool,
     pub fps_observed: f64,
     pub bitrate_kbps: f64,
+    #[serde(default)]
+    pub target_bitrate_kbps: Option<f64>,
+    #[serde(default)]
+    pub encoded_fps: Option<f64>,
+    #[serde(default)]
+    pub decoded_fps: Option<f64>,
+    #[serde(default)]
+    pub zero_copy_enabled: Option<bool>,
+    #[serde(default)]
+    pub total_bitstream_bytes: Option<u64>,
     pub keyframes: u64,
     pub dropped_frames: u64,
     pub quic_receiver_completed_frames: Option<u64>,
@@ -249,6 +259,11 @@ impl BenchmarkSummary {
             probe_complete,
             fps_observed: probe.fps,
             bitrate_kbps: probe.bitrate_kbps,
+            target_bitrate_kbps: None,
+            encoded_fps: None,
+            decoded_fps: None,
+            zero_copy_enabled: None,
+            total_bitstream_bytes: None,
             keyframes: probe.keyframes,
             dropped_frames: probe.dropped_frames,
             quic_receiver_completed_frames: Self::counter(probe, "quic_receiver_completed_frames"),
@@ -371,6 +386,11 @@ impl BenchmarkSummary {
             probe_complete,
             fps_observed,
             bitrate_kbps: sender_probe.bitrate_kbps,
+            target_bitrate_kbps: None,
+            encoded_fps: None,
+            decoded_fps: None,
+            zero_copy_enabled: None,
+            total_bitstream_bytes: None,
             keyframes: sender_probe.keyframes.max(receiver_probe.keyframes),
             dropped_frames: sender_probe
                 .dropped_frames
@@ -462,6 +482,11 @@ impl BenchmarkSummary {
             "probe_complete",
             "fps_observed",
             "bitrate_kbps",
+            "target_bitrate_kbps",
+            "encoded_fps",
+            "decoded_fps",
+            "zero_copy_enabled",
+            "total_bitstream_bytes",
             "keyframes",
             "dropped_frames",
             "quic_receiver_completed_frames",
@@ -527,6 +552,11 @@ impl BenchmarkSummary {
             self.probe_complete.to_string(),
             self.fps_observed.to_string(),
             self.bitrate_kbps.to_string(),
+            option_f64(self.target_bitrate_kbps),
+            option_f64(self.encoded_fps),
+            option_f64(self.decoded_fps),
+            option_bool(self.zero_copy_enabled),
+            option_u64(self.total_bitstream_bytes),
             self.keyframes.to_string(),
             self.dropped_frames.to_string(),
             option_u64(self.quic_receiver_completed_frames),
@@ -944,6 +974,8 @@ mod tests {
             bitrate: std::env::var("MRD_BENCH_BITRATE_BPS")
                 .ok()
                 .and_then(|value| value.parse::<u32>().ok()),
+            source_id: env_string("MRD_BENCH_SOURCE_ID"),
+            display_id: env_string("MRD_BENCH_DISPLAY_ID"),
             renderer: Some(parse_renderer_backend(&manifest.renderer_backend)),
             transport: Some(parse_transport_backend(&manifest.transport)),
             zero_copy: Some(benchmark_zero_copy_enabled(manifest)),
@@ -1000,6 +1032,11 @@ mod tests {
             probe_complete,
             fps_observed: observed_fps_for_summary(manifest, &metrics),
             bitrate_kbps,
+            target_bitrate_kbps: configured_target_bitrate_kbps(),
+            encoded_fps: nonzero_option(metrics.encoded_fps),
+            decoded_fps: nonzero_option(metrics.decoded_fps),
+            zero_copy_enabled: Some(benchmark_zero_copy_enabled(manifest)),
+            total_bitstream_bytes: Some(metrics.total_bitstream_bytes as u64),
             keyframes: 0,
             dropped_frames: metrics.dropped_frames as u64,
             quic_receiver_completed_frames: None,
@@ -1425,6 +1462,11 @@ mod tests {
             probe_complete: false,
             fps_observed: 0.0,
             bitrate_kbps: 0.0,
+            target_bitrate_kbps: configured_target_bitrate_kbps(),
+            encoded_fps: None,
+            decoded_fps: None,
+            zero_copy_enabled: Some(benchmark_zero_copy_enabled(manifest)),
+            total_bitstream_bytes: Some(0),
             keyframes: 0,
             dropped_frames: 0,
             quic_receiver_completed_frames: None,
@@ -1496,6 +1538,14 @@ mod tests {
         } else {
             None
         }
+    }
+
+    fn configured_target_bitrate_kbps() -> Option<f64> {
+        std::env::var("MRD_BENCH_BITRATE_BPS")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .map(|value| value / 1000.0)
     }
 
     fn env_string(key: &str) -> Option<String> {
@@ -2115,6 +2165,11 @@ mod tests {
             probe_complete: false,
             fps_observed: 29.5,
             bitrate_kbps: 1400.0,
+            target_bitrate_kbps: Some(8000.0),
+            encoded_fps: Some(30.0),
+            decoded_fps: Some(29.5),
+            zero_copy_enabled: Some(false),
+            total_bitstream_bytes: Some(3_500_000),
             keyframes: 1,
             dropped_frames: 0,
             quic_receiver_completed_frames: None,
@@ -2173,9 +2228,34 @@ mod tests {
         assert!(header.contains(&"render_prepare_wait_p95_ms"));
         assert!(header.contains(&"render_shared_resource_p95_ms"));
         assert!(header.contains(&"render_draw_present_p95_ms"));
+        assert!(header.contains(&"target_bitrate_kbps"));
+        assert!(header.contains(&"encoded_fps"));
+        assert!(header.contains(&"decoded_fps"));
+        assert!(header.contains(&"zero_copy_enabled"));
+        assert!(header.contains(&"total_bitstream_bytes"));
         assert!(header.contains(&"swap_chain_max_frame_latency"));
         assert!(header.contains(&"swap_chain_allow_tearing"));
         assert!(header.contains(&"nvdec_hevc_main10_capability"));
+        let target_bitrate_index = header
+            .iter()
+            .position(|column| *column == "target_bitrate_kbps")
+            .expect("target bitrate column");
+        assert_eq!(row[target_bitrate_index], "8000");
+        let encoded_fps_index = header
+            .iter()
+            .position(|column| *column == "encoded_fps")
+            .expect("encoded fps column");
+        assert_eq!(row[encoded_fps_index], "30");
+        let zero_copy_index = header
+            .iter()
+            .position(|column| *column == "zero_copy_enabled")
+            .expect("zero copy column");
+        assert_eq!(row[zero_copy_index], "false");
+        let bitstream_index = header
+            .iter()
+            .position(|column| *column == "total_bitstream_bytes")
+            .expect("total bitstream bytes column");
+        assert_eq!(row[bitstream_index], "3500000");
         let render_replacements_index = header
             .iter()
             .position(|column| *column == "render_queue_replacements")
