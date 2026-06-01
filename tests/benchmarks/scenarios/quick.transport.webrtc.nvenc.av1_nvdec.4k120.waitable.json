@@ -1,0 +1,19 @@
+{
+  "scenario": "quick.transport",
+  "profile": "transport-webrtc-nvenc-av1-nvdec-4k120-waitable",
+  "transport": "webrtc",
+  "capture_backend": "dxgi",
+  "encode_backend": "nvenc_av1",
+  "decode_backend": "nvdec_av1",
+  "renderer_backend": "d3d11_shared",
+  "width": 3840,
+  "height": 2160,
+  "fps": 120,
+  "duration_secs": 20,
+  "bitrate_bps": 120000000,
+  "av1_mode": "high_refresh",
+  "pace_to_fps": true,
+  "d3d11_waitable_object": true,
+  "render_thread_priority": "above_normal",
+  "threshold_file": "transport.4k120.json"
+}

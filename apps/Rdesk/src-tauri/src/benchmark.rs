@@ -84,6 +84,10 @@ pub struct BenchmarkSummary {
     #[serde(default)]
     pub render_stale_frame_drops: Option<u64>,
     #[serde(default)]
+    pub swap_chain_max_frame_latency: Option<u32>,
+    #[serde(default)]
+    pub swap_chain_allow_tearing: Option<bool>,
+    #[serde(default)]
     pub swap_chain_waitable_object: Option<bool>,
     #[serde(default)]
     pub swap_chain_present_mode: Option<String>,
@@ -281,6 +285,8 @@ impl BenchmarkSummary {
             render_present_skipped_frames,
             render_queue_replacements,
             render_stale_frame_drops,
+            swap_chain_max_frame_latency: None,
+            swap_chain_allow_tearing: None,
             swap_chain_waitable_object: None,
             swap_chain_present_mode: None,
             display_refresh_hz: None,
@@ -421,6 +427,8 @@ impl BenchmarkSummary {
             render_present_skipped_frames,
             render_queue_replacements,
             render_stale_frame_drops,
+            swap_chain_max_frame_latency: None,
+            swap_chain_allow_tearing: None,
             swap_chain_waitable_object: None,
             swap_chain_present_mode: None,
             display_refresh_hz: None,
@@ -484,6 +492,8 @@ impl BenchmarkSummary {
             "render_present_skipped_frames",
             "render_queue_replacements",
             "render_stale_frame_drops",
+            "swap_chain_max_frame_latency",
+            "swap_chain_allow_tearing",
             "swap_chain_waitable_object",
             "swap_chain_present_mode",
             "display_refresh_hz",
@@ -547,6 +557,8 @@ impl BenchmarkSummary {
             option_u64(self.render_present_skipped_frames),
             option_u64(self.render_queue_replacements),
             option_u64(self.render_stale_frame_drops),
+            option_u32(self.swap_chain_max_frame_latency),
+            option_bool(self.swap_chain_allow_tearing),
             option_bool(self.swap_chain_waitable_object),
             self.swap_chain_present_mode.clone().unwrap_or_default(),
             option_u32(self.display_refresh_hz),
@@ -727,6 +739,8 @@ Duration: `{duration}s`\n\n\
 | render_shared_resource_p95_ms | {render_shared_resource_p95} |\n\
 | render_draw_present_p95_ms | {render_draw_present_p95} |\n\
 | render_present_p95_ms | {present_p95} |\n\
+| swap_chain_max_frame_latency | {swap_chain_max_frame_latency} |\n\
+| swap_chain_allow_tearing | {swap_chain_allow_tearing} |\n\
 | swap_chain_waitable_object | {swap_chain_waitable} |\n\
 | swap_chain_present_mode | {swap_chain_present_mode} |\n\
 | display_refresh_hz | {display_refresh_hz} |\n\
@@ -779,6 +793,8 @@ Duration: `{duration}s`\n\n\
         render_shared_resource_p95 = option_f64(summary.render_shared_resource_p95_ms),
         render_draw_present_p95 = option_f64(summary.render_draw_present_p95_ms),
         present_p95 = option_f64(summary.render_present_p95_ms),
+        swap_chain_max_frame_latency = option_u32(summary.swap_chain_max_frame_latency),
+        swap_chain_allow_tearing = option_bool(summary.swap_chain_allow_tearing),
         swap_chain_waitable = option_bool(summary.swap_chain_waitable_object),
         swap_chain_present_mode = summary
             .swap_chain_present_mode
@@ -1016,6 +1032,8 @@ mod tests {
             render_present_skipped_frames: Some(metrics.render_present_skipped_frames),
             render_queue_replacements: Some(metrics.render_queue_replacements),
             render_stale_frame_drops: Some(metrics.render_stale_frame_drops),
+            swap_chain_max_frame_latency: metrics.swap_chain_max_frame_latency,
+            swap_chain_allow_tearing: metrics.swap_chain_allow_tearing,
             swap_chain_waitable_object: metrics.swap_chain_waitable_object,
             swap_chain_present_mode: metrics.swap_chain_present_mode.clone(),
             display_refresh_hz: metrics.display_refresh_hz,
@@ -1437,6 +1455,8 @@ mod tests {
             render_present_skipped_frames: None,
             render_queue_replacements: None,
             render_stale_frame_drops: None,
+            swap_chain_max_frame_latency: None,
+            swap_chain_allow_tearing: None,
             swap_chain_waitable_object: None,
             swap_chain_present_mode: None,
             display_refresh_hz: None,
@@ -2125,6 +2145,8 @@ mod tests {
             render_present_skipped_frames: Some(1),
             render_queue_replacements: Some(2),
             render_stale_frame_drops: Some(2),
+            swap_chain_max_frame_latency: Some(1),
+            swap_chain_allow_tearing: Some(true),
             swap_chain_waitable_object: Some(true),
             swap_chain_present_mode: Some("waitable".into()),
             display_refresh_hz: Some(144),
@@ -2151,6 +2173,8 @@ mod tests {
         assert!(header.contains(&"render_prepare_wait_p95_ms"));
         assert!(header.contains(&"render_shared_resource_p95_ms"));
         assert!(header.contains(&"render_draw_present_p95_ms"));
+        assert!(header.contains(&"swap_chain_max_frame_latency"));
+        assert!(header.contains(&"swap_chain_allow_tearing"));
         assert!(header.contains(&"nvdec_hevc_main10_capability"));
         let render_replacements_index = header
             .iter()
@@ -2162,6 +2186,16 @@ mod tests {
             .position(|column| *column == "swap_chain_present_mode")
             .expect("swapchain present mode column");
         assert_eq!(row[present_mode_index], "waitable");
+        let frame_latency_index = header
+            .iter()
+            .position(|column| *column == "swap_chain_max_frame_latency")
+            .expect("swapchain frame latency column");
+        assert_eq!(row[frame_latency_index], "1");
+        let allow_tearing_index = header
+            .iter()
+            .position(|column| *column == "swap_chain_allow_tearing")
+            .expect("swapchain tearing column");
+        assert_eq!(row[allow_tearing_index], "true");
         let refresh_index = header
             .iter()
             .position(|column| *column == "display_refresh_hz")

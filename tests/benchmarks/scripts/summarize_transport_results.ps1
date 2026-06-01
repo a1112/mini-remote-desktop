@@ -164,6 +164,7 @@ $headers = @(
   'render_submitted_frames','render_uploaded_frames','render_presented_frames','render_present_skipped_frames',
   'render_queue_replacements','render_stale_frame_drops',
   'render_queue_replacement_rate','render_stale_frame_drop_rate','render_present_skipped_rate',
+  'swap_chain_max_frame_latency','swap_chain_allow_tearing',
   'swap_chain_waitable_object','swap_chain_present_mode','display_refresh_hz','render_thread_priority',
   'failure_reason','run_skipped','run_passed'
 )
@@ -217,6 +218,8 @@ $report = @(
   "| render_queue_replacement_rate | $($summary.render_queue_replacement_rate) |",
   "| render_stale_frame_drop_rate | $($summary.render_stale_frame_drop_rate) |",
   "| render_present_skipped_rate | $($summary.render_present_skipped_rate) |",
+  "| swap_chain_max_frame_latency | $($summary.swap_chain_max_frame_latency) |",
+  "| swap_chain_allow_tearing | $($summary.swap_chain_allow_tearing) |",
   "| swap_chain_waitable_object | $($summary.swap_chain_waitable_object) |",
   "| swap_chain_present_mode | $($summary.swap_chain_present_mode) |",
   "| display_refresh_hz | $($summary.display_refresh_hz) |",

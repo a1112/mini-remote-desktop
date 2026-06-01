@@ -1135,6 +1135,12 @@ export interface HarnessMetrics {
   render_draw_present_latency_p95_ms?: number;
   render_queue_replacements?: number;
   render_stale_frame_drops?: number;
+  swap_chain_max_frame_latency?: number | null;
+  swap_chain_allow_tearing?: boolean | null;
+  swap_chain_waitable_object?: boolean | null;
+  swap_chain_present_mode?: string | null;
+  display_refresh_hz?: number | null;
+  render_thread_priority?: string | null;
   render_present_gap_p50_ms?: number;
   render_present_gap_p95_ms?: number;
   present_latency_avg_ms: number;

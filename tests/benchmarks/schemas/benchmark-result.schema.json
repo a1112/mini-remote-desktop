@@ -82,6 +82,8 @@
     "render_queue_replacement_rate": { "type": ["number", "null"] },
     "render_stale_frame_drop_rate": { "type": ["number", "null"] },
     "render_present_skipped_rate": { "type": ["number", "null"] },
+    "swap_chain_max_frame_latency": { "type": ["integer", "null"], "minimum": 1 },
+    "swap_chain_allow_tearing": { "type": ["boolean", "null"] },
     "swap_chain_waitable_object": { "type": ["boolean", "null"] },
     "swap_chain_present_mode": { "type": ["string", "null"] },
     "display_refresh_hz": { "type": ["integer", "null"], "minimum": 1 },

@@ -411,6 +411,8 @@ pub struct HarnessMetrics {
     pub render_present_skipped_frames: u64,
     pub render_queue_replacements: u64,
     pub render_stale_frame_drops: u64,
+    pub swap_chain_max_frame_latency: Option<u32>,
+    pub swap_chain_allow_tearing: Option<bool>,
     pub swap_chain_waitable_object: Option<bool>,
     pub swap_chain_present_mode: Option<String>,
     pub display_refresh_hz: Option<u32>,
@@ -522,6 +524,8 @@ impl Default for HarnessMetrics {
             render_present_skipped_frames: 0,
             render_queue_replacements: 0,
             render_stale_frame_drops: 0,
+            swap_chain_max_frame_latency: None,
+            swap_chain_allow_tearing: None,
             swap_chain_waitable_object: None,
             swap_chain_present_mode: None,
             display_refresh_hz: None,
@@ -810,6 +814,8 @@ struct RenderPacingCounters {
     present_skipped_frames: u64,
     queue_replacements: u64,
     stale_frame_drops: u64,
+    swap_chain_max_frame_latency: Option<u32>,
+    swap_chain_allow_tearing: Option<bool>,
     swap_chain_waitable_object: Option<bool>,
     swap_chain_present_mode: Option<String>,
     display_refresh_hz: Option<u32>,
@@ -3236,6 +3242,8 @@ impl TestHarness {
         m.render_present_skipped_frames = render_pacing.present_skipped_frames;
         m.render_queue_replacements = render_pacing.queue_replacements;
         m.render_stale_frame_drops = render_pacing.stale_frame_drops;
+        m.swap_chain_max_frame_latency = render_pacing.swap_chain_max_frame_latency;
+        m.swap_chain_allow_tearing = render_pacing.swap_chain_allow_tearing;
         m.swap_chain_waitable_object = render_pacing.swap_chain_waitable_object;
         m.swap_chain_present_mode = render_pacing.swap_chain_present_mode;
         m.display_refresh_hz = render_pacing.display_refresh_hz;
@@ -3260,6 +3268,8 @@ impl TestHarness {
         render_pacing.uploaded_frames = current_snapshot.uploaded_frame_count;
         render_pacing.presented_frames = current_snapshot.presented_frame_count;
         render_pacing.present_skipped_frames = current_snapshot.present_skipped_count;
+        render_pacing.swap_chain_max_frame_latency = current_snapshot.swap_chain_max_frame_latency;
+        render_pacing.swap_chain_allow_tearing = current_snapshot.swap_chain_allow_tearing;
         render_pacing.swap_chain_waitable_object = current_snapshot.swap_chain_waitable_object;
         render_pacing.swap_chain_present_mode = current_snapshot.swap_chain_present_mode.clone();
         render_pacing.display_refresh_hz = current_snapshot.display_refresh_hz;
@@ -5256,6 +5266,8 @@ mod tests {
     fn record_render_completion_tracks_swapchain_pacing_metadata() {
         let previous = renderer_snapshot(7, 3, 1);
         let mut current = renderer_snapshot(8, 4, 1);
+        current.swap_chain_max_frame_latency = Some(1);
+        current.swap_chain_allow_tearing = Some(true);
         current.swap_chain_waitable_object = Some(true);
         current.swap_chain_present_mode = Some("waitable".to_string());
         current.display_refresh_hz = Some(144);
@@ -5273,6 +5285,8 @@ mod tests {
             Instant::now(),
         );
 
+        assert_eq!(counters.swap_chain_max_frame_latency, Some(1));
+        assert_eq!(counters.swap_chain_allow_tearing, Some(true));
         assert_eq!(counters.swap_chain_waitable_object, Some(true));
         assert_eq!(
             counters.swap_chain_present_mode.as_deref(),
@@ -5712,6 +5726,12 @@ mod tests {
             "render_draw_present_latency_avg_ms",
             "render_draw_present_latency_p50_ms",
             "render_draw_present_latency_p95_ms",
+            "swap_chain_max_frame_latency",
+            "swap_chain_allow_tearing",
+            "swap_chain_waitable_object",
+            "swap_chain_present_mode",
+            "display_refresh_hz",
+            "render_thread_priority",
         ] {
             assert!(object.contains_key(key), "{key} must be serialized");
         }
