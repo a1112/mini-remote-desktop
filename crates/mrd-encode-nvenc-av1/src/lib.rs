@@ -22,8 +22,8 @@ mod imp {
         NVencBufferFormat, NVencPicFlags, NVencPicStruct, NVencPicType, NVencTuningInfo,
     };
     use nvenc::sys::guids::{
-        NV_ENC_AV1_PROFILE_MAIN_GUID, NV_ENC_CODEC_AV1_GUID, NV_ENC_PRESET_P3_GUID,
-        NV_ENC_PRESET_P6_GUID,
+        NV_ENC_AV1_PROFILE_MAIN_GUID, NV_ENC_CODEC_AV1_GUID, NV_ENC_PRESET_P1_GUID,
+        NV_ENC_PRESET_P3_GUID, NV_ENC_PRESET_P6_GUID,
     };
     use nvenc::sys::structs::Guid;
     use windows::Win32::Foundation::{HANDLE, HMODULE};
@@ -125,9 +125,19 @@ mod imp {
             height: usize,
             fps: u32,
         ) -> Result<Self, PipelineError> {
+            Self::new_high_refresh_rate_with_bitrate(width, height, fps, 6_000_000)
+        }
+
+        pub fn new_high_refresh_rate_with_bitrate(
+            width: usize,
+            height: usize,
+            fps: u32,
+            bitrate: u32,
+        ) -> Result<Self, PipelineError> {
             let width = width.max(2);
             let height = height.max(2);
             let fps = fps.max(1);
+            let bitrate = bitrate.max(1);
             let (device, context) = create_d3d11_device().map_err(|error| {
                 PipelineError::message(format!("create d3d11 device failed: {error}"))
             })?;
@@ -136,26 +146,24 @@ mod imp {
                 PipelineError::message(format!("nvenc open_dx failed: {error:?}"))
             })?;
             ensure_av1_codec_supported(&session)?;
-            ensure_av1_preset_supported(&session, NV_ENC_PRESET_P6_GUID)?;
+            let preset_guid = select_av1_high_refresh_preset(&session)?;
             let (session, mut preset) = session
                 .get_encode_preset_config_ex(
                     NV_ENC_CODEC_AV1_GUID,
-                    NV_ENC_PRESET_P6_GUID,
+                    preset_guid.clone(),
                     NVencTuningInfo::UltraLowLatency,
                 )
                 .map_err(|error| {
                     PipelineError::message(format!("nvenc preset config failed: {error:?}"))
                 })?;
             preset.preset_cfg.profile_guid = NV_ENC_AV1_PROFILE_MAIN_GUID;
-            // Lower bitrate for faster encoding
-            preset.preset_cfg.rc_params.average_bit_rate = 6_000_000;
+            preset.preset_cfg.rc_params.average_bit_rate = bitrate;
             preset.preset_cfg.frame_interval_p = 1;
-            // Shorter GOP for high refresh rate
-            preset.preset_cfg.gop_len = fps.min(60);
+            preset.preset_cfg.gop_len = fps * 2;
 
             let init = InitParams {
                 encode_guid: NV_ENC_CODEC_AV1_GUID,
-                preset_guid: NV_ENC_PRESET_P6_GUID,
+                preset_guid,
                 resolution: [width as u32, height as u32],
                 aspect_ratio: [width as u32, height as u32],
                 frame_rate: [fps, 1],
@@ -573,6 +581,33 @@ mod imp {
         ))
     }
 
+    fn select_av1_high_refresh_preset(
+        session: &Session<NeedsConfig>,
+    ) -> Result<Guid, PipelineError> {
+        let presets = session
+            .get_encode_presets(NV_ENC_CODEC_AV1_GUID)
+            .map_err(|error| {
+                PipelineError::message(format!("NVENC AV1 preset query failed: {error:?}"))
+            })?;
+
+        if presets
+            .iter()
+            .any(|preset| preset == &NV_ENC_PRESET_P1_GUID)
+        {
+            return Ok(NV_ENC_PRESET_P1_GUID);
+        }
+        if presets
+            .iter()
+            .any(|preset| preset == &NV_ENC_PRESET_P6_GUID)
+        {
+            return Ok(NV_ENC_PRESET_P6_GUID);
+        }
+
+        Err(PipelineError::message(
+            "NVENC AV1 unavailable: required high-refresh AV1 preset is not supported by this GPU/driver",
+        ))
+    }
+
     fn create_d3d11_device() -> anyhow::Result<(ID3D11Device, ID3D11DeviceContext)> {
         let mut device = None::<ID3D11Device>;
         let mut context = None::<ID3D11DeviceContext>;
@@ -828,7 +863,16 @@ impl NvencAv1Encoder {
         height: usize,
         fps: u32,
     ) -> Result<Self, PipelineError> {
-        Self::new_low_latency(width, height, fps)
+        Self::new_high_refresh_rate_with_bitrate(width, height, fps, 6_000_000)
+    }
+
+    pub fn new_high_refresh_rate_with_bitrate(
+        width: usize,
+        height: usize,
+        fps: u32,
+        bitrate: u32,
+    ) -> Result<Self, PipelineError> {
+        Self::new_low_latency_with_bitrate(width, height, fps, bitrate)
     }
 
     pub fn preferred_input_memory_kind() -> mrd_pipeline_core::FrameMemoryKind {

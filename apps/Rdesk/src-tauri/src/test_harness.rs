@@ -2654,7 +2654,12 @@ impl TestHarness {
                                 )
                             }
                             NvencAv1Mode::HighRefresh => {
-                                NvencAv1Encoder::new_high_refresh_rate(width, height, fps)
+                                NvencAv1Encoder::new_high_refresh_rate_with_bitrate(
+                                    width,
+                                    height,
+                                    fps,
+                                    low_latency_bitrate,
+                                )
                             }
                         }
                         .map_err(|e| anyhow::anyhow!("NVENC AV1 encoder init failed: {:?}", e))?;
