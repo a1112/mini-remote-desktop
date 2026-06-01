@@ -33,7 +33,7 @@ use mrd_encode_vvenc::VvencSoftwareEncoder;
 use mrd_observability::PipelineComparisonResult;
 use mrd_pipeline_core::{
     CapturedFrame, DecodedFrame, DecodedFrameData, EncodedAccessUnit, FrameCapture,
-    FramePixelFormat, VideoCodec, VideoDecoder, VideoEncoder,
+    FramePixelFormat, PipelineError, VideoCodec, VideoDecoder, VideoEncoder,
 };
 use mrd_render::{
     RenderFrame, RenderFrameData, RenderTarget, RendererFactory, RendererInstance, RendererSnapshot,
@@ -146,6 +146,10 @@ fn configured_nvenc_av1_mode() -> NvencAv1Mode {
         .ok()
         .or_else(|| std::env::var("MRD_HARNESS_NVENC_AV1_MODE").ok());
     parse_nvenc_av1_mode_value(value.as_deref())
+}
+
+fn prefer_max_speed_nvenc_for_hardware_decode(width: usize, height: usize, fps: u32) -> bool {
+    fps >= 120 && width.saturating_mul(height) >= 2560usize.saturating_mul(1440)
 }
 
 /// Available decoder types
@@ -2114,9 +2118,13 @@ impl TestHarness {
         let (encoder, decoder, use_decoder) = match chain {
             TestChain::CaptureOnly => (None, None, false),
             TestChain::NvencNvdec => {
-                let encoder =
-                    NvencH264Encoder::new_with_bitrate(width, height, fps, low_latency_bitrate)
-                        .map_err(|e| anyhow::anyhow!("NVENC 编码器初始化失败: {:?}", e))?;
+                let encoder = create_h264_encoder_for_hardware_decode(
+                    width,
+                    height,
+                    fps,
+                    low_latency_bitrate,
+                )
+                .map_err(|e| anyhow::anyhow!("NVENC 编码器初始化失败: {:?}", e))?;
                 let decoder =
                     create_h264_nvdec_decoder(use_shared_texture_decode, renderer_d3d11_device_ptr)
                         .map_err(|e| anyhow::anyhow!("NVDEC 解码器初始化失败: {e}"))?;
@@ -2187,7 +2195,7 @@ impl TestHarness {
                         (Some(Box::new(enc) as Box<dyn VideoEncoder>), None, false)
                     }
                     DecoderType::Nvdec => {
-                        let enc = NvencH264Encoder::new_with_bitrate(
+                        let enc = create_h264_encoder_for_hardware_decode(
                             width,
                             height,
                             fps,
@@ -3676,6 +3684,8 @@ fn create_hevc_encoder(
     {
         let encoder = if main10 {
             NvencHevcEncoder::new_main10_with_bitrate(width, height, fps, bitrate)
+        } else if prefer_max_speed_nvenc_for_hardware_decode(width, height, fps) {
+            NvencHevcEncoder::new_max_speed_with_bitrate(width, height, fps, bitrate)
         } else {
             NvencHevcEncoder::new_main_with_bitrate(width, height, fps, bitrate)
         }
@@ -3687,6 +3697,19 @@ fn create_hevc_encoder(
     {
         let _ = (width, height, fps, bitrate, main10);
         anyhow::bail!("NVENC HEVC encoder is only available on Windows")
+    }
+}
+
+fn create_h264_encoder_for_hardware_decode(
+    width: usize,
+    height: usize,
+    fps: u32,
+    bitrate: u32,
+) -> Result<NvencH264Encoder, PipelineError> {
+    if prefer_max_speed_nvenc_for_hardware_decode(width, height, fps) {
+        NvencH264Encoder::new_max_speed_with_bitrate(width, height, fps, bitrate)
+    } else {
+        NvencH264Encoder::new_with_bitrate(width, height, fps, bitrate)
     }
 }
 
@@ -5430,6 +5453,14 @@ mod tests {
             NvencAv1Mode::UltraLowLatency
         );
         assert_eq!(parse_nvenc_av1_mode_value(None), NvencAv1Mode::LowLatency);
+    }
+
+    #[test]
+    fn high_refresh_hardware_decode_prefers_max_speed_nvenc_for_2k_and_above() {
+        assert!(prefer_max_speed_nvenc_for_hardware_decode(2560, 1440, 120));
+        assert!(prefer_max_speed_nvenc_for_hardware_decode(3840, 2160, 120));
+        assert!(!prefer_max_speed_nvenc_for_hardware_decode(2560, 1440, 60));
+        assert!(!prefer_max_speed_nvenc_for_hardware_decode(1920, 1080, 144));
     }
 
     #[cfg(windows)]
