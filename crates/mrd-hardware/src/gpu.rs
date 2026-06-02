@@ -87,7 +87,6 @@ pub fn detect_gpu_caps() -> GpuCaps {
 
     #[cfg(not(windows))]
     {
-        let _ = detect_gpu_caps_windows;
         GpuCaps::new()
     }
 }
