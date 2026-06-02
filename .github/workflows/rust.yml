@@ -34,6 +34,7 @@ jobs:
           libpipewire-0.3-dev \
           libx11-dev \
           libxrandr-dev \
+          libxcb-randr0-dev \
           libxkbcommon-dev \
           libxkbcommon-x11-dev
     - name: Build
