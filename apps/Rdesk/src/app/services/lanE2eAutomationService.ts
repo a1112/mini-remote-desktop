@@ -762,7 +762,11 @@ export async function runLanE2EAutomation(
             : undefined;
         sampleFpsTargetDurationMs =
           minSampleDurationMs > 0 &&
-          isWithinSampleDurationTolerance(sampleFpsElapsedMs, minSampleDurationMs)
+          isWithinSampleDurationTolerance(
+            sampleFpsElapsedMs,
+            minSampleDurationMs,
+            sampleIntervalMs
+          )
             ? minSampleDurationMs
             : undefined;
         sampleObservedFpsAtTargetDuration =
@@ -992,10 +996,15 @@ function hasReachedSampleDuration(
 
 function isWithinSampleDurationTolerance(
   sampleDurationMs: number,
-  targetDurationMs: number
+  targetDurationMs: number,
+  sampleIntervalMs = 0
 ): boolean {
-  const toleranceMs = sampleDurationToleranceFor(targetDurationMs);
-  return Math.abs(sampleDurationMs - targetDurationMs) <= toleranceMs;
+  const earlyToleranceMs = sampleDurationToleranceFor(targetDurationMs);
+  const lateToleranceMs = earlyToleranceMs + Math.max(0, sampleIntervalMs);
+  return (
+    sampleDurationMs + earlyToleranceMs >= targetDurationMs &&
+    sampleDurationMs - targetDurationMs <= lateToleranceMs
+  );
 }
 
 function sampleDurationToleranceFor(minSampleDurationMs: number): number {

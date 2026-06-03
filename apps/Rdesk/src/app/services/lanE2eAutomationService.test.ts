@@ -1754,6 +1754,91 @@ describe("runLanE2EAutomation", () => {
     expect(result.sampleObservedRenderFpsAtTargetDuration).toBe(99);
   });
 
+  it("reports target-duration FPS when the FPS sample window overshoots by one poll interval", async () => {
+    let currentTime = 0;
+    let probeIndex = 0;
+    let pipelineIndex = 0;
+    const decodedFrames = [0, 120];
+    const presentedFrames = [1, 1, 121, 121];
+    const ipcProbeSnapshot = vi.fn().mockImplementation(() => {
+      const frameCount = decodedFrames[Math.min(probeIndex, decodedFrames.length - 1)];
+      probeIndex += 1;
+      currentTime += currentTime === 0 ? 10 : 1_200;
+      return Promise.resolve(
+        ok({
+          session_id: "unused",
+          frames_received: frameCount,
+          frames_decoded: frameCount,
+          frames_dropped: 0,
+          sequence_gap_drops: 0,
+          decode_error_drops: 0,
+          transient_drops: 0,
+          current_fps: 10,
+          bitrate_mbps: 20,
+          media_probe_valid: true,
+          media_probe_format: "h264",
+          media_probe_width: 1920,
+          media_probe_height: 1080,
+          media_probe_target_fps: 60,
+          media_probe_target_bitrate_mbps: 20,
+          media_probe_payload_bytes: 55555,
+          last_media_sequence: frameCount,
+          last_media_timestamp_us: 123456,
+          last_media_payload_hash: "fnv1a64:abc123",
+          last_error: null,
+        })
+      );
+    });
+    const ipcMediaPipelineSnapshot = vi.fn().mockImplementation(() => {
+      const renderPresentedFrames =
+        presentedFrames[Math.min(pipelineIndex, presentedFrames.length - 1)];
+      pipelineIndex += 1;
+      return Promise.resolve(
+        ok({
+          session_id: "unused",
+          attached_surfaces: [DEFAULT_ATTACHED_SURFACE],
+          active_decoder: "nvdec",
+          active_renderer: "d3d11",
+          queue_depth: 0,
+          dropped_frames: 0,
+          render_presented_frames: renderPresentedFrames,
+          render_queue_replacements: 0,
+          render_lock_drops: 0,
+          stage_metrics: [],
+          adaptation: null,
+        })
+      );
+    });
+    const commands = withCaptureSourceCommands(
+      createCommands({ ipcProbeSnapshot, ipcMediaPipelineSnapshot })
+    );
+
+    const result = await runLanE2EAutomation(commands, {
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      requestedProfile: {
+        width: 1920,
+        height: 1080,
+        fps: 60,
+        bitrate_mbps: 20,
+        codec: "h264",
+      },
+      sampleIntervalMs: 500,
+      timeoutMs: 2_000,
+      minSampleDurationMs: 1_000,
+      minDecodedFrames: 1,
+      minFps: 1,
+      now: () => currentTime,
+      createSessionId: () => "lan-e2e-test-session",
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.sampleFpsElapsedMs).toBe(1_200);
+    expect(result.sampleFpsTargetDurationMs).toBe(1_000);
+    expect(result.sampleObservedFpsAtTargetDuration).toBe(120);
+    expect(result.sampleObservedRenderFpsAtTargetDuration).toBe(120);
+  });
+
   it("omits target-duration FPS when the FPS sample window exceeds tolerance", async () => {
     let currentTime = 0;
     let probeIndex = 0;
