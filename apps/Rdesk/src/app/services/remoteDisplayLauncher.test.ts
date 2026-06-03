@@ -169,6 +169,26 @@ describe("launchRemoteDisplayForDevice", () => {
     });
   });
 
+  it("recognizes browser-style MacIntel target labels as macOS LAN P2P devices", async () => {
+    await launchRemoteDisplayForDevice("remote-mac", {
+      sessionId: "p2p-quic-macintel-session",
+      transportKind: "quic",
+      targetOs: "MacIntel / quic",
+      lanP2P: true,
+    });
+
+    expect(mocks.startLanRemoteSession).toHaveBeenCalledWith(
+      "p2p-quic-macintel-session",
+      "remote-mac",
+      "quic",
+      MACOS_HEVC_2K144_PROFILE
+    );
+    expect(mocks.openRemoteDisplayWindow).toHaveBeenCalledWith({
+      sessionId: "p2p-quic-session",
+      requestedProfile: MACOS_HEVC_2K144_PROFILE,
+    });
+  });
+
   it("selects a remote capture source before opening the display window", async () => {
     const result = await launchRemoteDisplayForDevice("remote-device", {
       sessionId: "p2p-quic-session",

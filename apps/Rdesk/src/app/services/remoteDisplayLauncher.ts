@@ -65,8 +65,11 @@ function defaultRemoteMediaProfileForTarget(targetOs?: string): MediaProfile {
 function isMacOsTarget(targetOs?: string): boolean {
   const normalized = (targetOs ?? "").trim().toLowerCase();
   return (
+    normalized === "mac" ||
     normalized.includes("macos") ||
     normalized.includes("mac os") ||
+    normalized.includes("macintel") ||
+    normalized.includes("macintosh") ||
     normalized.includes("darwin") ||
     normalized.includes("osx") ||
     normalized.includes("os x")
