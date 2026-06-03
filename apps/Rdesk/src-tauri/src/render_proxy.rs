@@ -91,6 +91,7 @@ struct RenderProxyState {
     h264_pixel_buffer_decoder: Option<mrd_codec_videotoolbox::VideoToolboxH264PixelBufferDecoder>,
     hevc_pixel_buffer_decoder: Option<mrd_codec_videotoolbox::VideoToolboxHevcPixelBufferDecoder>,
     h264_decoder: Option<Box<dyn VideoDecoder>>,
+    hevc_decoder: Option<Box<dyn VideoDecoder>>,
 }
 
 #[cfg(target_os = "macos")]
@@ -209,6 +210,7 @@ impl RenderProxyRegistry {
             h264_pixel_buffer_decoder: None,
             hevc_pixel_buffer_decoder: None,
             h264_decoder: None,
+            hevc_decoder: None,
         }));
         let task_path = path.clone();
         let task = tokio::spawn(async move {
@@ -701,9 +703,9 @@ async fn handle_macos_render_proxy_connection(
 
         let ack = match header.pixel_format {
             RenderProxyPixelFormat::H264 => upload_render_proxy_h264_access_unit(&state, payload)
-                .unwrap_or_else(|_| empty_render_proxy_ack()),
+                .unwrap_or_else(|error| render_proxy_upload_error_ack(&header, error)),
             RenderProxyPixelFormat::Hevc => upload_render_proxy_hevc_access_unit(&state, payload)
-                .unwrap_or_else(|_| empty_render_proxy_ack()),
+                .unwrap_or_else(|error| render_proxy_upload_error_ack(&header, error)),
             RenderProxyPixelFormat::Rgb24
             | RenderProxyPixelFormat::Bgra32
             | RenderProxyPixelFormat::Nv12 => {
@@ -729,7 +731,7 @@ async fn handle_macos_render_proxy_connection(
                     }
                 };
                 upload_render_proxy_frame(&state, frame)
-                    .unwrap_or_else(|_| empty_render_proxy_ack())
+                    .unwrap_or_else(|error| render_proxy_upload_error_ack(&header, error))
             }
         };
         if stream.write_all(&encode_ack(&ack)).await.is_err() {
@@ -848,6 +850,23 @@ fn upload_render_proxy_hevc_access_unit(
     let mut state = state
         .lock()
         .map_err(|_| "macOS render proxy state lock was poisoned".to_string())?;
+    if macos_render_proxy_cv_pixel_buffer_decode_enabled() {
+        match upload_render_proxy_hevc_pixel_buffer_locked(&mut state, &payload, started) {
+            Ok(ack) => return Ok(ack),
+            Err(_) => {
+                state.hevc_pixel_buffer_decoder = None;
+            }
+        }
+    }
+    upload_render_proxy_hevc_cpu_locked(&mut state, &payload, started)
+}
+
+#[cfg(target_os = "macos")]
+fn upload_render_proxy_hevc_pixel_buffer_locked(
+    state: &mut RenderProxyState,
+    payload: &[u8],
+    started: std::time::Instant,
+) -> Result<RenderProxyAck, String> {
     if state.hevc_pixel_buffer_decoder.is_none() {
         let decoder =
             mrd_codec_videotoolbox::VideoToolboxHevcPixelBufferDecoder::new().map_err(|error| {
@@ -872,6 +891,50 @@ fn upload_render_proxy_hevc_access_unit(
         let stats = state
             .render_queue
             .enqueue_latest(RenderProxyQueuedFrame::CvPixelBufferNv12(decoded_frame))?;
+        render_stats.add(stats);
+    }
+    flush_render_proxy_queue_stats(&state.render_queue, &mut render_stats)?;
+    Ok(RenderProxyAck {
+        presented_frames: render_stats.presented_frames,
+        present_skips: render_stats.present_skips,
+        queue_replacements: render_stats.queue_replacements,
+        upload_duration_ms: started.elapsed().as_secs_f64() * 1000.0,
+        decode_duration_ms,
+        draw_present_duration_ms: render_stats.draw_present_duration_ms,
+        next_drawable_duration_ms: render_stats.next_drawable_duration_ms,
+        encode_commit_duration_ms: render_stats.encode_commit_duration_ms,
+        max_drawable_count: render_stats.max_drawable_count,
+        display_sync_enabled: render_stats.display_sync_enabled,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn upload_render_proxy_hevc_cpu_locked(
+    state: &mut RenderProxyState,
+    payload: &[u8],
+    started: std::time::Instant,
+) -> Result<RenderProxyAck, String> {
+    if state.hevc_decoder.is_none() {
+        let decoder = mrd_codec_videotoolbox::VideoToolboxHevcDecoder::new()
+            .map_err(|error| format!("create VideoToolbox HEVC decoder failed: {error}"))?;
+        state.hevc_decoder = Some(Box::new(decoder));
+    }
+    let decoder = state
+        .hevc_decoder
+        .as_mut()
+        .ok_or_else(|| "VideoToolbox HEVC decoder missing".to_string())?;
+    let decode_started = std::time::Instant::now();
+    decoder
+        .push_access_unit(payload)
+        .map_err(|error| format!("VideoToolbox HEVC decode failed: {error}"))?;
+    let decoded_frames = decoder.drain_decoded_frames();
+    let decode_duration_ms = decode_started.elapsed().as_secs_f64() * 1000.0;
+    let mut render_stats = RenderProxyRenderStats::default();
+    for decoded_frame in decoded_frames {
+        let frame = decoded_frame_to_render_frame(decoded_frame)?;
+        let stats = state
+            .render_queue
+            .enqueue_latest(RenderProxyQueuedFrame::RenderFrame(frame))?;
         render_stats.add(stats);
     }
     flush_render_proxy_queue_stats(&state.render_queue, &mut render_stats)?;
@@ -1061,6 +1124,23 @@ fn macos_env_u32(name: &str, default_value: u32) -> u32 {
 }
 
 #[cfg(target_os = "macos")]
+fn render_proxy_upload_error_ack(
+    header: &mrd_ipc::render_proxy::RenderProxyFrameHeader,
+    error: String,
+) -> RenderProxyAck {
+    tracing::warn!(
+        pixel_format = ?header.pixel_format,
+        width = header.width,
+        height = header.height,
+        sequence = header.sequence,
+        payload_len = header.payload_len,
+        %error,
+        "macOS render proxy upload failed"
+    );
+    empty_render_proxy_ack()
+}
+
+#[cfg(target_os = "macos")]
 fn empty_render_proxy_ack() -> RenderProxyAck {
     RenderProxyAck {
         presented_frames: 0,
@@ -1108,10 +1188,10 @@ fn decoded_frame_to_render_frame(frame: DecodedFrame) -> Result<RenderFrame, Str
             pitch,
         )),
         DecodedFrameData::CpuI420 { .. } => {
-            Err("VideoToolbox H.264 proxy decode returned unsupported I420 frame".to_string())
+            Err("VideoToolbox proxy decode returned unsupported I420 frame".to_string())
         }
         DecodedFrameData::CpuP010 { .. } => {
-            Err("VideoToolbox H.264 proxy decode returned unsupported P010 frame".to_string())
+            Err("VideoToolbox proxy decode returned unsupported P010 frame".to_string())
         }
         #[cfg(windows)]
         DecodedFrameData::D3D11SharedNv12 { .. } | DecodedFrameData::D3D11SharedP010 { .. } => {
@@ -1253,5 +1333,18 @@ mod tests {
         std::env::set_var(MACOS_RENDER_PROXY_DECODE_ENV, "true");
         assert!(macos_render_proxy_decode_enabled());
         std::env::remove_var(MACOS_RENDER_PROXY_DECODE_ENV);
+    }
+
+    #[test]
+    fn cv_pixel_buffer_decode_env_defaults_on_and_accepts_falsey_override() {
+        std::env::remove_var(MACOS_RENDER_PROXY_CVPIXELBUFFER_DECODE_ENV);
+        assert!(macos_render_proxy_cv_pixel_buffer_decode_enabled());
+
+        std::env::set_var(MACOS_RENDER_PROXY_CVPIXELBUFFER_DECODE_ENV, "off");
+        assert!(!macos_render_proxy_cv_pixel_buffer_decode_enabled());
+
+        std::env::set_var(MACOS_RENDER_PROXY_CVPIXELBUFFER_DECODE_ENV, "1");
+        assert!(macos_render_proxy_cv_pixel_buffer_decode_enabled());
+        std::env::remove_var(MACOS_RENDER_PROXY_CVPIXELBUFFER_DECODE_ENV);
     }
 }
