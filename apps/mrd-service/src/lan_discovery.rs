@@ -6497,7 +6497,7 @@ async fn render_lan_hevc_access_unit_frame(
     timestamp_us: u64,
     profile: &MediaProfile,
 ) -> Result<bool> {
-    if !macos_render_proxy_compressed_media_enabled() {
+    if !macos_render_proxy_compressed_media_enabled_for_profile(profile) {
         return Ok(false);
     }
     if app_state
