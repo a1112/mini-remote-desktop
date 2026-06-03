@@ -3042,16 +3042,7 @@ fn lan_media_capabilities_with_input_control(input_control_available: bool) -> V
     }
     #[cfg(target_os = "macos")]
     {
-        capabilities.extend([
-            LAN_CAPTURE_MACOS_CAPABILITY.to_string(),
-            LAN_ENCODE_VIDEOTOOLBOX_H264_CAPABILITY.to_string(),
-            LAN_ENCODE_VIDEOTOOLBOX_HEVC_CAPABILITY.to_string(),
-            LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY.to_string(),
-            LAN_DECODE_VIDEOTOOLBOX_CAPABILITY.to_string(),
-            LAN_RENDER_MACOS_NATIVE_CAPABILITY.to_string(),
-            "openh264_fallback".to_string(),
-            "software_decode".to_string(),
-        ]);
+        capabilities.extend(macos_lan_media_capabilities());
     }
     #[cfg(target_os = "linux")]
     {
@@ -3072,6 +3063,69 @@ fn lan_media_capabilities_with_input_control(input_control_available: bool) -> V
         capabilities.push(LAN_INPUT_CONTROL_CAPABILITY.to_string());
     }
     capabilities
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy)]
+struct MacosLanMediaCapabilityProbe {
+    videotoolbox_h264_encoder: bool,
+    videotoolbox_hevc_encoder: bool,
+    videotoolbox_hevc_decoder: bool,
+}
+
+#[cfg(target_os = "macos")]
+fn macos_lan_media_capabilities() -> Vec<String> {
+    static MACOS_LAN_MEDIA_CAPABILITIES: OnceLock<Vec<String>> = OnceLock::new();
+    MACOS_LAN_MEDIA_CAPABILITIES
+        .get_or_init(|| {
+            macos_lan_media_capabilities_from_probe(probe_macos_lan_media_capabilities())
+        })
+        .clone()
+}
+
+#[cfg(target_os = "macos")]
+fn probe_macos_lan_media_capabilities() -> MacosLanMediaCapabilityProbe {
+    MacosLanMediaCapabilityProbe {
+        videotoolbox_h264_encoder: mrd_codec_videotoolbox::VideoToolboxH264Encoder::new(
+            640, 480, 30,
+        )
+        .is_ok(),
+        videotoolbox_hevc_encoder: mrd_codec_videotoolbox::VideoToolboxHevcEncoder::new(
+            640, 480, 30,
+        )
+        .is_ok(),
+        videotoolbox_hevc_decoder: videotoolbox_decoder_enabled()
+            && mrd_codec_videotoolbox::VideoToolboxHevcDecoder::new().is_ok(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_lan_media_capabilities_from_probe(probe: MacosLanMediaCapabilityProbe) -> Vec<String> {
+    let mut capabilities = vec![
+        LAN_CAPTURE_MACOS_CAPABILITY.to_string(),
+        LAN_RENDER_MACOS_NATIVE_CAPABILITY.to_string(),
+        "openh264_fallback".to_string(),
+        "software_decode".to_string(),
+    ];
+    if probe.videotoolbox_h264_encoder {
+        capabilities.push(LAN_ENCODE_VIDEOTOOLBOX_H264_CAPABILITY.to_string());
+    }
+    if probe.videotoolbox_hevc_encoder {
+        capabilities.push(LAN_ENCODE_VIDEOTOOLBOX_HEVC_CAPABILITY.to_string());
+        capabilities.push(LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY.to_string());
+    }
+    if probe.videotoolbox_hevc_decoder {
+        capabilities.push(LAN_DECODE_VIDEOTOOLBOX_CAPABILITY.to_string());
+    }
+    capabilities
+}
+
+#[cfg(target_os = "macos")]
+fn videotoolbox_decoder_enabled() -> bool {
+    !matches!(
+        std::env::var("MRD_DISABLE_VIDEOTOOLBOX_DECODER").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    )
 }
 
 async fn send_packet(
@@ -3444,7 +3498,6 @@ fn missing_profile_receiver_media_capabilities(
                     "decode.videotoolbox",
                     "videotoolbox",
                     "decode.videotoolbox_hevc",
-                    "videotoolbox_hevc",
                     "decode.linux_hevc",
                     "linux_hevc",
                     "decode.ffmpeg_hevc",
@@ -10506,15 +10559,34 @@ mod tests {
             assert!(peer.media_capabilities.contains(&capability.to_string()));
         }
         #[cfg(target_os = "macos")]
-        for capability in [
-            LAN_CAPTURE_MACOS_CAPABILITY,
-            LAN_ENCODE_VIDEOTOOLBOX_H264_CAPABILITY,
-            LAN_ENCODE_VIDEOTOOLBOX_HEVC_CAPABILITY,
-            LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY,
-            LAN_DECODE_VIDEOTOOLBOX_CAPABILITY,
-            LAN_RENDER_MACOS_NATIVE_CAPABILITY,
-        ] {
-            assert!(peer.media_capabilities.contains(&capability.to_string()));
+        {
+            for capability in [
+                LAN_CAPTURE_MACOS_CAPABILITY,
+                LAN_RENDER_MACOS_NATIVE_CAPABILITY,
+            ] {
+                assert!(peer.media_capabilities.contains(&capability.to_string()));
+            }
+            let probe = probe_macos_lan_media_capabilities();
+            assert_eq!(
+                peer.media_capabilities
+                    .contains(&LAN_ENCODE_VIDEOTOOLBOX_H264_CAPABILITY.to_string()),
+                probe.videotoolbox_h264_encoder
+            );
+            assert_eq!(
+                peer.media_capabilities
+                    .contains(&LAN_ENCODE_VIDEOTOOLBOX_HEVC_CAPABILITY.to_string()),
+                probe.videotoolbox_hevc_encoder
+            );
+            assert_eq!(
+                peer.media_capabilities
+                    .contains(&LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY.to_string()),
+                probe.videotoolbox_hevc_encoder
+            );
+            assert_eq!(
+                peer.media_capabilities
+                    .contains(&LAN_DECODE_VIDEOTOOLBOX_CAPABILITY.to_string()),
+                probe.videotoolbox_hevc_decoder
+            );
         }
         assert!(peer
             .media_capabilities
@@ -10580,6 +10652,40 @@ mod tests {
             .contains(&LAN_INPUT_CONTROL_CAPABILITY.to_string()));
         assert!(!lan_media_capabilities_with_input_control(false)
             .contains(&LAN_INPUT_CONTROL_CAPABILITY.to_string()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_lan_media_capabilities_follow_videotoolbox_probe() {
+        let without_videotoolbox =
+            macos_lan_media_capabilities_from_probe(MacosLanMediaCapabilityProbe {
+                videotoolbox_h264_encoder: false,
+                videotoolbox_hevc_encoder: false,
+                videotoolbox_hevc_decoder: false,
+            });
+        assert!(without_videotoolbox.contains(&LAN_CAPTURE_MACOS_CAPABILITY.to_string()));
+        assert!(without_videotoolbox.contains(&LAN_RENDER_MACOS_NATIVE_CAPABILITY.to_string()));
+        assert!(
+            !without_videotoolbox.contains(&LAN_ENCODE_VIDEOTOOLBOX_H264_CAPABILITY.to_string())
+        );
+        assert!(
+            !without_videotoolbox.contains(&LAN_ENCODE_VIDEOTOOLBOX_HEVC_CAPABILITY.to_string())
+        );
+        assert!(
+            !without_videotoolbox.contains(&LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY.to_string())
+        );
+        assert!(!without_videotoolbox.contains(&LAN_DECODE_VIDEOTOOLBOX_CAPABILITY.to_string()));
+
+        let with_videotoolbox =
+            macos_lan_media_capabilities_from_probe(MacosLanMediaCapabilityProbe {
+                videotoolbox_h264_encoder: true,
+                videotoolbox_hevc_encoder: true,
+                videotoolbox_hevc_decoder: true,
+            });
+        assert!(with_videotoolbox.contains(&LAN_ENCODE_VIDEOTOOLBOX_H264_CAPABILITY.to_string()));
+        assert!(with_videotoolbox.contains(&LAN_ENCODE_VIDEOTOOLBOX_HEVC_CAPABILITY.to_string()));
+        assert!(with_videotoolbox.contains(&LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY.to_string()));
+        assert!(with_videotoolbox.contains(&LAN_DECODE_VIDEOTOOLBOX_CAPABILITY.to_string()));
     }
 
     #[test]
@@ -12116,6 +12222,25 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("hevc decoder"));
         assert!(message.contains("mac-controller"));
+    }
+
+    #[test]
+    fn selected_hevc_profile_does_not_treat_videotoolbox_encoder_as_decoder() {
+        let error = ensure_peer_can_receive_selected_media(
+            "mac-controller",
+            &MediaProfile {
+                width: 2560,
+                height: 1440,
+                fps: 144,
+                bitrate_mbps: 40,
+                codec: "hevc".to_string(),
+                ..MediaProfile::default()
+            },
+            &[LAN_ENCODE_VIDEOTOOLBOX_HEVC_CAPABILITY.to_string()],
+        )
+        .expect_err("VideoToolbox HEVC encoder capability is not a decoder capability");
+
+        assert!(error.to_string().contains("hevc decoder"));
     }
 
     #[test]
