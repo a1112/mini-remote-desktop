@@ -231,7 +231,8 @@ const QUIC_DATAGRAM_MEDIA_V2_CAPABILITY = "quic_datagram_media_v2";
 const QUIC_DATAGRAM_MEDIA_V3_CAPABILITY = "quic_datagram_media_v3";
 const MEDIA_PROFILE_CONTROL_CAPABILITY = "media_profile_control_v1";
 interface RequiredPlatformMediaCapabilityProfile {
-  id: "windows" | "macos" | "linux";
+  id: "windows" | "macos_hevc" | "macos_h264" | "linux";
+  platform: "windows" | "macos" | "linux";
   label: string;
   verifyHint: string;
   capabilities: string[][];
@@ -240,6 +241,7 @@ interface RequiredPlatformMediaCapabilityProfile {
 const REQUIRED_PLATFORM_MEDIA_CAPABILITY_PROFILES: RequiredPlatformMediaCapabilityProfile[] = [
   {
     id: "windows",
+    platform: "windows",
     label: "Windows",
     verifyHint: "verify DXGI/NVENC/NVDEC/D3D11 native support",
     capabilities: [
@@ -250,20 +252,33 @@ const REQUIRED_PLATFORM_MEDIA_CAPABILITY_PROFILES: RequiredPlatformMediaCapabili
     ],
   },
   {
-    id: "macos",
-    label: "macOS",
-    verifyHint: "verify ScreenCaptureKit/VideoToolbox/Metal native support",
+    id: "macos_hevc",
+    platform: "macos",
+    label: "macOS HEVC",
+    verifyHint: "verify ScreenCaptureKit/VideoToolbox HEVC/Metal native support",
     capabilities: [
       ["macos_capture", "capture.macos"],
-      ["videotoolbox_h264", "encode.videotoolbox_h264"],
       ["videotoolbox_hevc", "encode.videotoolbox_hevc"],
-      ["decode.videotoolbox_hevc", "videotoolbox", "decode.videotoolbox"],
+      ["decode.videotoolbox_hevc"],
       ["media.hevc_main_420_8bit"],
       ["macos_native_render", "render.macos"],
     ],
   },
   {
+    id: "macos_h264",
+    platform: "macos",
+    label: "macOS H.264",
+    verifyHint: "verify ScreenCaptureKit/VideoToolbox H.264/Metal native support",
+    capabilities: [
+      ["macos_capture", "capture.macos"],
+      ["videotoolbox_h264", "encode.videotoolbox_h264"],
+      ["decode.videotoolbox_h264"],
+      ["macos_native_render", "render.macos"],
+    ],
+  },
+  {
     id: "linux",
+    platform: "linux",
     label: "Linux",
     verifyHint: "verify PipeWire/Linux decode/native render support",
     capabilities: [
@@ -1483,7 +1498,7 @@ function peerSupportsTransport(peer: LanPeerInfo, transportKind: string): boolea
 }
 
 function defaultLanMediaProfileForPeer(peer: LanPeerInfo): MediaProfile {
-  if (peerSupportsMacosNativeMedia(peer)) {
+  if (peerSupportsMacosHevcNativeMedia(peer)) {
     return { ...DEFAULT_LAN_MACOS_HEVC_MEDIA_PROFILE };
   }
   return peerSupportsHevcMain(peer)
@@ -1491,13 +1506,14 @@ function defaultLanMediaProfileForPeer(peer: LanPeerInfo): MediaProfile {
     : { ...DEFAULT_LAN_H264_FALLBACK_MEDIA_PROFILE };
 }
 
-function peerSupportsMacosNativeMedia(peer: LanPeerInfo): boolean {
+function peerSupportsMacosHevcNativeMedia(peer: LanPeerInfo): boolean {
   const mediaCapabilities = (peer.media_capabilities ?? []).map((capability) =>
     capability.toLowerCase()
   );
   return REQUIRED_PLATFORM_MEDIA_CAPABILITY_PROFILES.some(
     (profile) =>
-      profile.id === "macos" &&
+      profile.platform === "macos" &&
+      profile.id === "macos_hevc" &&
       platformMediaProfileMatches(profile, mediaCapabilities)
   );
 }
