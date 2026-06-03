@@ -230,6 +230,10 @@ impl SessionPeerMediaCapabilityRegistry {
         self.capabilities.insert(session_id, capabilities);
     }
 
+    pub fn get(&self, session_id: &SessionId) -> Option<Vec<String>> {
+        self.capabilities.get(session_id).cloned()
+    }
+
     pub fn supports(&self, session_id: &SessionId, capability: &str) -> bool {
         self.capabilities
             .get(session_id)

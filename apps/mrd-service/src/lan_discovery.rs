@@ -2347,6 +2347,13 @@ async fn accept_lan_remote_session(
         Ok(value) => value,
         Err(error) => return LanRemoteAcceptResult::rejected(error.to_string()),
     };
+    if let Err(error) = ensure_peer_can_receive_selected_media(
+        source_device_id.0.as_str(),
+        &negotiation.selected,
+        &source_media_capabilities,
+    ) {
+        return LanRemoteAcceptResult::rejected(error.to_string());
+    }
     let (listener, bootstrap) = match QuinnServerListener::bind("0.0.0.0:0").await {
         Ok(value) => value,
         Err(error) => {
@@ -2627,6 +2634,17 @@ async fn accept_lan_media_profile_update(
     if let Some(mode) = active_display_mode.as_ref() {
         reconcile_negotiation_to_display_mode(&mut negotiation, mode);
     }
+    let peer_media_capabilities = app_state
+        .peer_media_capabilities
+        .lock()
+        .await
+        .get(session_id)
+        .unwrap_or_default();
+    ensure_peer_can_receive_selected_media(
+        session_id.0.as_str(),
+        &negotiation.selected,
+        &peer_media_capabilities,
+    )?;
     app_state
         .media_profiles
         .lock()
@@ -3368,6 +3386,72 @@ fn missing_profile_media_capabilities(
                     &[LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY],
                 ),
             ],
+        ),
+    }
+}
+
+fn ensure_peer_can_receive_selected_media(
+    peer_label: &str,
+    profile: &MediaProfile,
+    peer_media_capabilities: &[String],
+) -> Result<()> {
+    let missing_capabilities =
+        missing_profile_receiver_media_capabilities(profile, peer_media_capabilities);
+    if !missing_capabilities.is_empty() {
+        anyhow::bail!(
+            "LAN peer cannot receive selected media profile {} [{}]: {} supports {}. Rebuild and restart the peer mrd-service/Rdesk from the latest main branch",
+            format_media_profile(profile),
+            missing_capabilities.join(", "),
+            peer_label,
+            format_peer_capabilities(peer_media_capabilities)
+        );
+    }
+    Ok(())
+}
+
+fn missing_profile_receiver_media_capabilities(
+    profile: &MediaProfile,
+    peer_media_capabilities: &[String],
+) -> Vec<String> {
+    match LanAccessUnitCodec::from_profile(profile) {
+        LanAccessUnitCodec::H264 => missing_capability_groups(
+            peer_media_capabilities,
+            &[(
+                "h264 decoder",
+                &[
+                    "decode.nvdec",
+                    "nvdec",
+                    "decode.videotoolbox",
+                    "videotoolbox",
+                    "decode.linux_h264",
+                    "linux_h264",
+                    "decode.ffmpeg_h264",
+                    "ffmpeg_h264",
+                    "decode.software",
+                    "h264_software",
+                    "software_decode",
+                ],
+            )],
+        ),
+        LanAccessUnitCodec::Hevc => missing_capability_groups(
+            peer_media_capabilities,
+            &[(
+                "hevc decoder",
+                &[
+                    "decode.nvdec_hevc",
+                    "nvdec_hevc",
+                    "nvdec_hevc_d3d11_shared",
+                    "decode.videotoolbox",
+                    "videotoolbox",
+                    "decode.videotoolbox_hevc",
+                    "videotoolbox_hevc",
+                    "decode.linux_hevc",
+                    "linux_hevc",
+                    "decode.ffmpeg_hevc",
+                    "ffmpeg_hevc",
+                    "software_decode",
+                ],
+            )],
         ),
     }
 }
@@ -12011,6 +12095,137 @@ mod tests {
             ],
         )
         .expect("macOS VideoToolbox HEVC peer should pass HEVC request preflight");
+    }
+
+    #[test]
+    fn selected_hevc_profile_requires_receiver_hevc_decoder_capabilities() {
+        let error = ensure_peer_can_receive_selected_media(
+            "mac-controller",
+            &MediaProfile {
+                width: 2560,
+                height: 1440,
+                fps: 144,
+                bitrate_mbps: 40,
+                codec: "hevc".to_string(),
+                ..MediaProfile::default()
+            },
+            &["videotoolbox_h264".to_string()],
+        )
+        .expect_err("HEVC stream should require a HEVC-capable receiver");
+
+        let message = error.to_string();
+        assert!(message.contains("hevc decoder"));
+        assert!(message.contains("mac-controller"));
+    }
+
+    #[test]
+    fn selected_hevc_profile_accepts_macos_videotoolbox_receiver() {
+        ensure_peer_can_receive_selected_media(
+            "mac-controller",
+            &MediaProfile {
+                width: 2560,
+                height: 1440,
+                fps: 144,
+                bitrate_mbps: 40,
+                codec: "HEVC".to_string(),
+                ..MediaProfile::default()
+            },
+            &["videotoolbox".to_string(), "software_decode".to_string()],
+        )
+        .expect("macOS VideoToolbox receiver should pass HEVC selected profile preflight");
+    }
+
+    #[tokio::test]
+    async fn remote_session_accept_rejects_source_without_selected_hevc_decoder() {
+        let app_state = Arc::new(AppState::new());
+        app_state
+            .devices
+            .lock()
+            .await
+            .register(DeviceId("mac-target".to_string()), "Mac Target".to_string());
+
+        let result = accept_lan_remote_session(
+            &app_state,
+            SessionId("session-hevc-receiver-missing".to_string()),
+            DeviceId("mac-controller".to_string()),
+            "quic".to_string(),
+            vec!["videotoolbox_h264".to_string()],
+            Some(MediaProfile {
+                width: 2560,
+                height: 1440,
+                fps: 144,
+                bitrate_mbps: 40,
+                codec: "hevc".to_string(),
+                ..MediaProfile::default()
+            }),
+        )
+        .await;
+
+        assert!(!result.accepted);
+        assert!(result
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("hevc decoder"));
+        assert!(app_state
+            .sessions
+            .lock()
+            .await
+            .get(&SessionId("session-hevc-receiver-missing".to_string()))
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn media_profile_update_rejects_receiver_without_selected_hevc_decoder() {
+        let app_state = Arc::new(AppState::new());
+        let session_id = SessionId("session-hevc-update-receiver-missing".to_string());
+        app_state.sessions.lock().await.insert(
+            session_id.clone(),
+            SessionSnapshot {
+                session_id: session_id.clone(),
+                transport: "quic".to_string(),
+                source_device_id: Some(DeviceId("mac-controller".to_string())),
+                target_device_id: None,
+                local_listen_addr: None,
+                local_server_name: None,
+                local_cert_der_b64: None,
+                remote_listen_addr: None,
+                remote_server_name: None,
+                remote_cert_der_b64: None,
+                lifecycle_state: SessionLifecycleState::Listening,
+                last_error: None,
+                sender_active: true,
+                receiver_active: false,
+            },
+        );
+        app_state
+            .peer_media_capabilities
+            .lock()
+            .await
+            .set(session_id.clone(), vec!["videotoolbox_h264".to_string()]);
+
+        let error = accept_lan_media_profile_update(
+            &app_state,
+            &session_id,
+            MediaProfile {
+                width: 2560,
+                height: 1440,
+                fps: 144,
+                bitrate_mbps: 40,
+                codec: "hevc".to_string(),
+                ..MediaProfile::default()
+            },
+        )
+        .await
+        .expect_err("HEVC update should require receiver HEVC decoder caps");
+
+        assert!(error.to_string().contains("hevc decoder"));
+        assert!(app_state
+            .media_profiles
+            .lock()
+            .await
+            .get(&session_id)
+            .is_none());
     }
 
     #[test]
