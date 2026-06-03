@@ -91,7 +91,7 @@ type ResolutionKey =
   | "3440x1440"
   | "3840x2160";
 type FpsKey = "30" | "60" | "120" | "144" | "165" | "180" | "249";
-type BitrateKey = "8" | "20" | "50" | "80" | "100" | "120";
+type BitrateKey = "8" | "20" | "40" | "50" | "80" | "100" | "120";
 type TestStatus = "idle" | "starting" | "running" | "stopping" | "completed" | "failed";
 type WebPreviewMode = "idle" | "connecting" | "webrtc" | "webcodecs" | "failed";
 type WebPreviewEngine = "webrtc" | "webcodecs";
@@ -379,6 +379,7 @@ const fpsOptions: Option<FpsKey>[] = [
 const bitrateOptions: Option<BitrateKey>[] = [
   { value: "8", label: "8 Mbps" },
   { value: "20", label: "20 Mbps" },
+  { value: "40", label: "40 Mbps" },
   { value: "50", label: "50 Mbps" },
   { value: "80", label: "80 Mbps" },
   { value: "100", label: "100 Mbps" },

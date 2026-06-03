@@ -2669,7 +2669,7 @@ describe("RemoteDisplayWindowPage", () => {
     });
   });
 
-  it("keeps remote media profile updates at 144 FPS on macOS controllers", async () => {
+  it("keeps remote macOS profile updates at 2K144 and 40 Mbps from the window URL", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
       if (command === "test_get_capabilities") {
@@ -2713,19 +2713,22 @@ describe("RemoteDisplayWindowPage", () => {
           frames_decoded: 1,
           frames_dropped: 0,
           current_fps: 144,
-          bitrate_mbps: 20,
+          bitrate_mbps: 40,
           media_probe_valid: true,
-          media_probe_width: 1920,
-          media_probe_height: 1080,
+          media_probe_width: 2560,
+          media_probe_height: 1440,
           media_probe_target_fps: 144,
-          media_probe_target_bitrate_mbps: 20,
+          media_probe_target_bitrate_mbps: 40,
           last_error: null,
         });
       }
       return Promise.resolve(null);
     });
 
-    renderRemoteDisplay("p2p-quic-mac");
+    renderRemoteDisplay(
+      "p2p-quic-mac",
+      "?surface=surface-1&profileWidth=2560&profileHeight=1440&profileFps=144&profileBitrateMbps=40"
+    );
 
     fireEvent.click(await screen.findByRole("button", { name: "配置" }));
     fireEvent.click(await screen.findByRole("button", { name: "应用远端" }));
@@ -2734,7 +2737,10 @@ describe("RemoteDisplayWindowPage", () => {
       expect(mockInvoke).toHaveBeenCalledWith("ipc_update_media_profile", {
         sessionId: "p2p-quic-mac",
         requestedProfile: expect.objectContaining({
+          width: 2560,
+          height: 1440,
           fps: 144,
+          bitrate_mbps: 40,
           codec: "hevc",
         }),
       });
