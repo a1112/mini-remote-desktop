@@ -102,7 +102,7 @@ const DECODER_OPTIONS: DecoderOption[] = [
   {
     id: "videotoolbox",
     name: "VideoToolbox",
-    description: "macOS Apple H.264 硬件解码器，当前为实验路径",
+    description: "macOS Apple H.264/HEVC 硬件解码器，当前为实验路径",
     type: "hardware",
     icon: <Monitor className="h-5 w-5 text-blue-500" />,
   },
@@ -118,8 +118,8 @@ const CODEC_OPTIONS: CodecOption[] = [
   {
     id: "hevc",
     name: "HEVC",
-    description: "NVENC HEVC -> 硬件或软件解码，Windows/NVIDIA、Linux GStreamer 与 FFmpeg fallback 路径。",
-    supportedDecoders: ["nvdec", "software", "linux_hevc", "linux_hevc_main10"],
+    description: "HEVC -> 硬件或软件解码，Windows/NVIDIA、macOS VideoToolbox、Linux GStreamer 与 FFmpeg fallback 路径。",
+    supportedDecoders: ["nvdec", "software", "linux_hevc", "linux_hevc_main10", "videotoolbox"],
   },
   {
     id: "hevc_main10",
@@ -255,12 +255,14 @@ function buildDecodeRun(
   }
 
   if (decoder === "videotoolbox") {
+    const encoderType: TestConfig["encoder_type"] =
+      codec === "hevc" ? "videotoolbox_hevc" : "videotoolbox_h264";
     return {
       scenarioId: "custom",
       config: {
         ...common,
         capture_type: "macos",
-        encoder_type: "videotoolbox_h264",
+        encoder_type: encoderType,
         decoder_type: "videotoolbox",
         renderer_type: "macos",
         zero_copy: false,

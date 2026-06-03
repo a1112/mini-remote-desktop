@@ -756,7 +756,7 @@ fn add_decode_capabilities(
             CapabilityDomain::Decode,
             "decode.videotoolbox",
             "VideoToolbox decode",
-            "VideoToolbox H.264 decode is wired for the macOS LAN media receiver path.",
+            "VideoToolbox H.264/HEVC decode is wired for the macOS LAN media receiver path.",
         );
     }
 

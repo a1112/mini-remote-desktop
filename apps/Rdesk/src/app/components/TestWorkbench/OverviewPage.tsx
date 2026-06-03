@@ -248,7 +248,7 @@ export function OverviewPage() {
       ).length
     : 0;
   const lan2k144ProfileId =
-    capabilitySnapshot?.platform === "macos" ? "lan.macos.2k144" : "lan.2k144";
+    capabilitySnapshot?.platform === "macos" ? "lan.macos.hevc.2k144" : "lan.2k144";
   const lan2k144Evaluation = capabilitySnapshot
     ? evaluateProfileSupport(lan2k144ProfileId, capabilitySnapshot)
     : null;

@@ -2398,7 +2398,7 @@ export function RemoteDisplayWindowPage() {
     [matrixModeEnabled]
   );
   const browserWebViewFpsLimitReason = `Web View 当前接入上限为 ${WEB_VIEW_MAX_FPS} FPS；更高档位需要 native 渲染或后续浏览器媒体链路。`;
-  const browserHardwareH264Available = useMemo(() => {
+  const browserHardwarePreviewEncoderAvailable = useMemo(() => {
     if (!capabilities?.available_encoders?.length) return true;
     const hardwareEncoders =
       hostOs === "macos"
@@ -2424,12 +2424,12 @@ export function RemoteDisplayWindowPage() {
             : isLocalPipelinePreview &&
                 renderMode === "web" &&
                 Number(option.value) > 30 &&
-                !browserHardwareH264Available
+                !browserHardwarePreviewEncoderAvailable
               ? "网页高帧率预览需要硬件 H.264 或 HEVC Main 编码器；当前平台只允许 30 FPS 诊断档。"
               : null,
       })),
     [
-      browserHardwareH264Available,
+      browserHardwarePreviewEncoderAvailable,
       browserWebViewFpsLimitReason,
       isLocalPipelinePreview,
       renderMode,

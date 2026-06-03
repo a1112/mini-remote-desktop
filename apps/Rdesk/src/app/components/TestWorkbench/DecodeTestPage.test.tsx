@@ -190,6 +190,52 @@ describe("DecodeTestPage backend contract", () => {
     });
   });
 
+  it("starts VideoToolbox HEVC decode with the macOS hardware encoder path", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve({
+          os_type: "macos",
+          cpu_brand: "test",
+          cpu_cores: 12,
+          memory_gb: 32,
+          gpu_info: "Apple",
+          available_captures: ["macos", "synthetic"],
+          available_encoders: ["videotoolbox_h264", "videotoolbox_hevc", "openh264"],
+          available_decoders: ["videotoolbox", "software"],
+          available_renderers: ["macos"],
+          available_memory_modes: ["cpu"],
+        });
+      }
+      if (command === "test_start_run") return Promise.resolve("run-videotoolbox-hevc");
+      return Promise.resolve(null);
+    });
+
+    render(<DecodeTestPage />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /^选择解码器 VideoToolbox$/ }));
+    const hevcButton = screen.getByText("HEVC").closest("button");
+    expect(hevcButton).not.toBeNull();
+    fireEvent.click(hevcButton!);
+    fireEvent.click(screen.getByRole("button", { name: /启动测试/ }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_start_run",
+        expect.objectContaining({
+          scenarioId: "custom",
+          config: expect.objectContaining({
+            capture_type: "macos",
+            encoder_type: "videotoolbox_hevc",
+            decoder_type: "videotoolbox",
+            renderer_type: "macos",
+            render_display: false,
+          }),
+        })
+      );
+    });
+  });
+
   it("starts NVDEC with an explicit 2K 144Hz decode profile", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {

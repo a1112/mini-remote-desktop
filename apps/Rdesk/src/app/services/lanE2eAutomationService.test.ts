@@ -33,12 +33,17 @@ const H264_FALLBACK_REQUESTED_PROFILE = {
   codec: "h264",
 };
 
-const MACOS_H264_2K144_REQUESTED_PROFILE = {
+const MACOS_HEVC_2K144_REQUESTED_PROFILE = {
   width: 2560,
   height: 1440,
   fps: 144,
-  bitrate_mbps: 80,
-  codec: "h264",
+  bitrate_mbps: 40,
+  codec: "hevc",
+  codec_profile: "main",
+  bit_depth: 8,
+  chroma_subsampling: "4:2:0",
+  pixel_format: "nv12",
+  hdr_enabled: false,
 };
 
 const DEFAULT_CAPTURE_SOURCES = [
@@ -2396,7 +2401,9 @@ describe("runLanE2EAutomation", () => {
                 "quic_datagram_media_v3",
                 "macos_capture",
                 "videotoolbox_h264",
+                "videotoolbox_hevc",
                 "videotoolbox",
+                "media.hevc_main_420_8bit",
                 "macos_native_render",
               ],
               age_ms: 10,
@@ -2412,13 +2419,13 @@ describe("runLanE2EAutomation", () => {
           frames_decoded: 3,
           frames_dropped: 0,
           current_fps: 144,
-          bitrate_mbps: 80,
+          bitrate_mbps: 40,
           media_probe_valid: true,
-          media_probe_format: "compressed_h264_test_pattern",
+          media_probe_format: "compressed_hevc_test_pattern",
           media_probe_width: 2560,
           media_probe_height: 1440,
           media_probe_target_fps: 144,
-          media_probe_target_bitrate_mbps: 80,
+          media_probe_target_bitrate_mbps: 40,
           media_probe_payload_bytes: 55555,
           last_media_sequence: 3,
           last_media_timestamp_us: 123456,
@@ -2439,12 +2446,12 @@ describe("runLanE2EAutomation", () => {
     });
 
     expect(result.status).toBe("completed");
-    expect(result.requestedProfile).toEqual(MACOS_H264_2K144_REQUESTED_PROFILE);
+    expect(result.requestedProfile).toEqual(MACOS_HEVC_2K144_REQUESTED_PROFILE);
     expect(commands.ipcStartLanRemoteSession).toHaveBeenCalledWith(
       "lan-e2e-test-session",
       "agent-device",
       "quic",
-      MACOS_H264_2K144_REQUESTED_PROFILE
+      MACOS_HEVC_2K144_REQUESTED_PROFILE
     );
   });
 
