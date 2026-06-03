@@ -500,6 +500,10 @@ function isNvencSharedTextureEncoder(encoder: EncoderType) {
 }
 
 function isHevcEncoder(encoder: EncoderType) {
+  return encoder === "nvenc_hevc" || encoder === "nvenc_hevc_main10" || encoder === "videotoolbox_hevc";
+}
+
+function isNvencHevcEncoder(encoder: EncoderType) {
   return encoder === "nvenc_hevc" || encoder === "nvenc_hevc_main10";
 }
 
@@ -2522,7 +2526,7 @@ export function RemoteDisplayWindowPage() {
       );
       return;
     }
-    if (isHevcEncoder(encoder) && (decoder === "software" || decoder === "linux_h264")) {
+    if (isNvencHevcEncoder(encoder) && (decoder === "software" || decoder === "linux_h264")) {
       const preferredLinuxDecoder = encoder === "nvenc_hevc_main10" ? "linux_hevc_main10" : "linux_hevc";
       setDecoder(
         capabilities?.available_decoders.includes("nvdec")
