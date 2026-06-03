@@ -17,6 +17,32 @@ const mocks = vi.hoisted(() => ({
   initialize: vi.fn(),
 }));
 
+const DEFAULT_HEVC_1080P60_PROFILE = {
+  width: 1920,
+  height: 1080,
+  fps: 60,
+  bitrate_mbps: 20,
+  codec: "hevc",
+  codec_profile: "main",
+  bit_depth: 8,
+  chroma_subsampling: "4:2:0",
+  pixel_format: "nv12",
+  hdr_enabled: false,
+};
+
+const MACOS_HEVC_2K144_PROFILE = {
+  width: 2560,
+  height: 1440,
+  fps: 144,
+  bitrate_mbps: 40,
+  codec: "hevc",
+  codec_profile: "main",
+  bit_depth: 8,
+  chroma_subsampling: "4:2:0",
+  pixel_format: "nv12",
+  hdr_enabled: false,
+};
+
 vi.mock("../adapters/tauri", () => ({
   openRemoteDisplayWindow: mocks.openRemoteDisplayWindow,
 }));
@@ -115,18 +141,23 @@ describe("launchRemoteDisplayForDevice", () => {
       "p2p-quic-session",
       "remote-device",
       "quic",
-      {
-        width: 1920,
-        height: 1080,
-        fps: 60,
-        bitrate_mbps: 20,
-        codec: "hevc",
-        codec_profile: "main",
-        bit_depth: 8,
-        chroma_subsampling: "4:2:0",
-        pixel_format: "nv12",
-        hdr_enabled: false,
-      }
+      DEFAULT_HEVC_1080P60_PROFILE
+    );
+  });
+
+  it("requests the macOS VideoToolbox HEVC 2K144 profile for macOS LAN P2P remote display", async () => {
+    await launchRemoteDisplayForDevice("remote-mac", {
+      sessionId: "p2p-quic-mac-session",
+      transportKind: "quic",
+      targetOs: "macOS Sonoma",
+      lanP2P: true,
+    });
+
+    expect(mocks.startLanRemoteSession).toHaveBeenCalledWith(
+      "p2p-quic-mac-session",
+      "remote-mac",
+      "quic",
+      MACOS_HEVC_2K144_PROFILE
     );
   });
 
@@ -194,18 +225,7 @@ describe("launchRemoteDisplayForDevice", () => {
       "remote-app-session",
       "remote-device",
       "quic",
-      {
-        width: 1920,
-        height: 1080,
-        fps: 60,
-        bitrate_mbps: 20,
-        codec: "hevc",
-        codec_profile: "main",
-        bit_depth: 8,
-        chroma_subsampling: "4:2:0",
-        pixel_format: "nv12",
-        hdr_enabled: false,
-      }
+      DEFAULT_HEVC_1080P60_PROFILE
     );
     expect(mocks.listRemoteCaptureSources).toHaveBeenCalledWith(
       "p2p-quic-session",
@@ -215,6 +235,30 @@ describe("launchRemoteDisplayForDevice", () => {
     expect(catalog.sessionId).toBe("p2p-quic-session");
     expect(catalog.windows.map((source) => source.id)).toEqual(["windows:window:0x1234"]);
     expect(catalog.displays.map((source) => source.id)).toEqual(["windows:display:0"]);
+  });
+
+  it("uses the macOS VideoToolbox HEVC profile for LAN remote application catalog sessions", async () => {
+    const catalog = await prepareRemoteApplicationCatalogForDevice("remote-mac", {
+      sessionId: "remote-mac-app-session",
+      transportKind: "quic",
+      targetOs: "Darwin 23",
+      lanP2P: true,
+      includePreviews: true,
+      limit: 12,
+    });
+
+    expect(mocks.startLanRemoteSession).toHaveBeenCalledWith(
+      "remote-mac-app-session",
+      "remote-mac",
+      "quic",
+      MACOS_HEVC_2K144_PROFILE
+    );
+    expect(mocks.listRemoteCaptureSources).toHaveBeenCalledWith(
+      "p2p-quic-session",
+      true,
+      12
+    );
+    expect(catalog.sessionId).toBe("p2p-quic-session");
   });
 
   it("opens a selected remote application using an existing application session", async () => {

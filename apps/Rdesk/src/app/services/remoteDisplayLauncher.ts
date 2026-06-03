@@ -43,11 +43,11 @@ const DEFAULT_REMOTE_MEDIA_PROFILE: MediaProfile = {
   hdr_enabled: false,
 };
 
-const DEFAULT_REMOTE_APPLICATION_MEDIA_PROFILE: MediaProfile = {
-  width: 1920,
-  height: 1080,
-  fps: 60,
-  bitrate_mbps: 20,
+const DEFAULT_REMOTE_MACOS_HEVC_MEDIA_PROFILE: MediaProfile = {
+  width: 2560,
+  height: 1440,
+  fps: 144,
+  bitrate_mbps: 40,
   codec: "hevc",
   codec_profile: "main",
   bit_depth: 8,
@@ -55,6 +55,23 @@ const DEFAULT_REMOTE_APPLICATION_MEDIA_PROFILE: MediaProfile = {
   pixel_format: "nv12",
   hdr_enabled: false,
 };
+
+function defaultRemoteMediaProfileForTarget(targetOs?: string): MediaProfile {
+  return isMacOsTarget(targetOs)
+    ? { ...DEFAULT_REMOTE_MACOS_HEVC_MEDIA_PROFILE }
+    : { ...DEFAULT_REMOTE_MEDIA_PROFILE };
+}
+
+function isMacOsTarget(targetOs?: string): boolean {
+  const normalized = (targetOs ?? "").trim().toLowerCase();
+  return (
+    normalized.includes("macos") ||
+    normalized.includes("mac os") ||
+    normalized.includes("darwin") ||
+    normalized.includes("osx") ||
+    normalized.includes("os x")
+  );
+}
 
 type RemoteDisplayLaunchOptions = {
   transportKind?: TransportKind;
@@ -129,7 +146,8 @@ export async function launchRemoteDisplayForDevice(
           sessionId,
           targetDeviceId,
           transportKind,
-          options?.requestedProfile ?? DEFAULT_REMOTE_MEDIA_PROFILE
+          options?.requestedProfile ??
+            defaultRemoteMediaProfileForTarget(options?.targetOs)
         )
       : await startSession(sessionId, targetDeviceId, transportKind);
 
@@ -186,8 +204,6 @@ export async function prepareRemoteApplicationCatalogForDevice(
         await launchRemoteDisplayForDevice(targetDeviceId, {
           ...options,
           openWindow: false,
-          requestedProfile:
-            options?.requestedProfile ?? DEFAULT_REMOTE_APPLICATION_MEDIA_PROFILE,
         })
       ).sessionId;
 
@@ -230,8 +246,6 @@ export async function launchRemoteApplicationForDevice(
         await launchRemoteDisplayForDevice(targetDeviceId, {
           ...options,
           openWindow: false,
-          requestedProfile:
-            options?.requestedProfile ?? DEFAULT_REMOTE_APPLICATION_MEDIA_PROFILE,
         })
       ).sessionId;
 
