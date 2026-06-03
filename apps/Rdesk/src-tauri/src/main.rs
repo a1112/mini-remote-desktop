@@ -259,10 +259,37 @@ fn open_remote_display_window(
     surface_id: Option<String>,
     preferred_display_source_id: Option<String>,
     avoid_capture_source_id: Option<String>,
+    profile_width: Option<u32>,
+    profile_height: Option<u32>,
+    profile_fps: Option<u32>,
+    profile_bitrate_mbps: Option<u32>,
+    profile_codec: Option<String>,
+    profile_codec_profile: Option<String>,
+    profile_bit_depth: Option<u32>,
+    profile_chroma_subsampling: Option<String>,
+    profile_pixel_format: Option<String>,
+    profile_hdr_enabled: Option<bool>,
 ) -> Result<RenderWindowContext, String> {
     let spec = {
         let mut registry = state.render_window_registry.lock().unwrap();
-        registry.reserve_window(SessionId(session_id), surface_id)?
+        let query_params = remote_display_profile_query_params(
+            profile_width,
+            profile_height,
+            profile_fps,
+            profile_bitrate_mbps,
+            profile_codec,
+            profile_codec_profile,
+            profile_bit_depth,
+            profile_chroma_subsampling,
+            profile_pixel_format,
+            profile_hdr_enabled,
+        );
+        let session_id = SessionId(session_id);
+        if query_params.is_empty() {
+            registry.reserve_window(session_id, surface_id)?
+        } else {
+            registry.reserve_window_with_query(session_id, surface_id, query_params)?
+        }
     };
 
     let context = {
@@ -304,6 +331,46 @@ fn open_remote_display_window(
     });
 
     Ok(context)
+}
+
+fn remote_display_profile_query_params(
+    profile_width: Option<u32>,
+    profile_height: Option<u32>,
+    profile_fps: Option<u32>,
+    profile_bitrate_mbps: Option<u32>,
+    profile_codec: Option<String>,
+    profile_codec_profile: Option<String>,
+    profile_bit_depth: Option<u32>,
+    profile_chroma_subsampling: Option<String>,
+    profile_pixel_format: Option<String>,
+    profile_hdr_enabled: Option<bool>,
+) -> Vec<(String, String)> {
+    let mut params = Vec::new();
+    push_remote_display_query_param(&mut params, "profileWidth", profile_width);
+    push_remote_display_query_param(&mut params, "profileHeight", profile_height);
+    push_remote_display_query_param(&mut params, "profileFps", profile_fps);
+    push_remote_display_query_param(&mut params, "profileBitrateMbps", profile_bitrate_mbps);
+    push_remote_display_query_param(&mut params, "profileCodec", profile_codec);
+    push_remote_display_query_param(&mut params, "profileCodecProfile", profile_codec_profile);
+    push_remote_display_query_param(&mut params, "profileBitDepth", profile_bit_depth);
+    push_remote_display_query_param(
+        &mut params,
+        "profileChromaSubsampling",
+        profile_chroma_subsampling,
+    );
+    push_remote_display_query_param(&mut params, "profilePixelFormat", profile_pixel_format);
+    push_remote_display_query_param(&mut params, "profileHdrEnabled", profile_hdr_enabled);
+    params
+}
+
+fn push_remote_display_query_param<T: ToString>(
+    params: &mut Vec<(String, String)>,
+    key: &str,
+    value: Option<T>,
+) {
+    if let Some(value) = value {
+        params.push((key.to_string(), value.to_string()));
+    }
 }
 
 fn build_remote_display_window(

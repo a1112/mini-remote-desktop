@@ -124,6 +124,11 @@ export async function launchRemoteDisplayForDevice(
   const sessionId =
     options?.sessionId ??
     createSessionId(targetIsLocal ? "local-display-test" : `p2p-${transportKind}`);
+  const lanRequestedProfile =
+    !targetIsLocal && options?.lanP2P
+      ? (options?.requestedProfile ??
+        defaultRemoteMediaProfileForTarget(options?.targetOs))
+      : undefined;
 
   if (!tauriRuntime) {
     saveWebRemoteSession({
@@ -146,8 +151,7 @@ export async function launchRemoteDisplayForDevice(
           sessionId,
           targetDeviceId,
           transportKind,
-          options?.requestedProfile ??
-            defaultRemoteMediaProfileForTarget(options?.targetOs)
+          lanRequestedProfile
         )
       : await startSession(sessionId, targetDeviceId, transportKind);
 
@@ -169,7 +173,13 @@ export async function launchRemoteDisplayForDevice(
     return result;
   }
 
-  const windowResult = await openRemoteDisplayWindow({ sessionId: startedSessionId });
+  const windowParams: Parameters<typeof openRemoteDisplayWindow>[0] = {
+    sessionId: startedSessionId,
+  };
+  if (lanRequestedProfile) {
+    windowParams.requestedProfile = lanRequestedProfile;
+  }
+  const windowResult = await openRemoteDisplayWindow(windowParams);
   if (!windowResult.ok) {
     throw new Error(windowResult.error.message);
   }
@@ -253,7 +263,14 @@ export async function launchRemoteApplicationForDevice(
   let windowResult: Awaited<ReturnType<typeof openRemoteDisplayWindow>>;
   try {
     captureSourceSelection = await selectRemoteCaptureSource(sessionId, sourceId);
-    windowResult = await openRemoteDisplayWindow({ sessionId });
+    const requestedProfile = usingExistingSession
+      ? options?.requestedProfile
+      : options?.requestedProfile ?? defaultRemoteMediaProfileForTarget(options?.targetOs);
+    const windowParams: Parameters<typeof openRemoteDisplayWindow>[0] = { sessionId };
+    if (requestedProfile) {
+      windowParams.requestedProfile = requestedProfile;
+    }
+    windowResult = await openRemoteDisplayWindow(windowParams);
     if (!windowResult.ok) {
       throw new Error(windowResult.error.message);
     }

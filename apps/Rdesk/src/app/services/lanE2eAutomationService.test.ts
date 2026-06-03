@@ -458,6 +458,7 @@ describe("runLanE2EAutomation", () => {
     expect(commands.openRemoteDisplayWindow).toHaveBeenCalledWith({
       sessionId: "lan-e2e-test-session",
       avoidCaptureSourceId: "DISPLAY1",
+      requestedProfile: DEFAULT_REQUESTED_PROFILE,
     });
     expect(commands.ipcStopSession).toHaveBeenCalledWith("lan-e2e-test-session");
     expect(result.stages.map((stage) => `${stage.stage}:${stage.status}`)).toContain(
@@ -503,6 +504,7 @@ describe("runLanE2EAutomation", () => {
     expect(commands.openRemoteDisplayWindow).toHaveBeenCalledWith({
       sessionId: "lan-e2e-test-session",
       avoidCaptureSourceId: "DXGIShared:\\\\.\\DISPLAY3",
+      requestedProfile: DEFAULT_REQUESTED_PROFILE,
     });
   });
 

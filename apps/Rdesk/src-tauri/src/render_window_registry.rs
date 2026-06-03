@@ -68,12 +68,21 @@ impl RenderWindowRegistry {
         session_id: SessionId,
         surface_id: Option<String>,
     ) -> Result<PendingRenderWindow, String> {
+        self.reserve_window_with_query(session_id, surface_id, Vec::new())
+    }
+
+    pub fn reserve_window_with_query(
+        &mut self,
+        session_id: SessionId,
+        surface_id: Option<String>,
+        query_params: Vec<(String, String)>,
+    ) -> Result<PendingRenderWindow, String> {
         let next_id = self.next_ids.entry(session_id.clone()).or_insert(1);
         let label = format!("render-{}-{}", session_id.0, *next_id);
         let surface_id = surface_id.unwrap_or_else(|| format!("surface-{}", *next_id));
         *next_id += 1;
 
-        let url = remote_display_url(&session_id.0, &surface_id)?;
+        let url = remote_display_url_with_query(&session_id.0, &surface_id, &query_params)?;
         Ok(PendingRenderWindow {
             label,
             session_id,
@@ -394,8 +403,36 @@ fn parse_render_window_dimension(
 }
 
 fn remote_display_url(session_id: &str, surface_id: &str) -> Result<WebviewUrl, String> {
+    remote_display_url_with_query(session_id, surface_id, &[])
+}
+
+fn remote_display_url_with_query(
+    session_id: &str,
+    surface_id: &str,
+    query_params: &[(String, String)],
+) -> Result<WebviewUrl, String> {
     let path = format!("/display/{session_id}?surface={surface_id}");
+    let path = query_params.iter().fold(path, |mut path, (key, value)| {
+        path.push('&');
+        path.push_str(key);
+        path.push('=');
+        path.push_str(&url_query_escape(value));
+        path
+    });
     Ok(WebviewUrl::App(path.into()))
+}
+
+fn url_query_escape(value: &str) -> String {
+    let mut output = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                output.push(byte as char)
+            }
+            _ => output.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    output
 }
 
 #[cfg(test)]

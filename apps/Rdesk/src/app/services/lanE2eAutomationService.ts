@@ -189,6 +189,7 @@ export interface LanE2EAutomationCommands {
     sessionId: string;
     preferredDisplaySourceId?: string;
     avoidCaptureSourceId?: string;
+    requestedProfile?: MediaProfile;
   }): Promise<AdapterResult<RemoteDisplayWindowContext>>;
   ipcSessionSnapshot(sessionId: string): Promise<AdapterResult<SessionRuntimeSnapshot>>;
   ipcProbeSnapshot(sessionId: string): Promise<AdapterResult<ProbeSnapshot>>;
@@ -597,6 +598,7 @@ export async function runLanE2EAutomation(
           ...(captureSource
             ? { avoidCaptureSourceId: captureSourceDisplayPlacementRef(captureSource) }
             : {}),
+          ...(requestedProfile ? { requestedProfile } : {}),
         }),
         "display_window_failed"
       );

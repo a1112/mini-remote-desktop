@@ -115,6 +115,44 @@ describe('Tauri Adapter Contract', () => {
       });
     });
 
+    it('openRemoteDisplayWindow forwards requested media profile query fields', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue({});
+
+      await adapter.openRemoteDisplayWindow({
+        sessionId: 'session-1',
+        requestedProfile: {
+          width: 2560,
+          height: 1440,
+          fps: 144,
+          bitrate_mbps: 40,
+          codec: 'hevc',
+          codec_profile: 'main',
+          bit_depth: 8,
+          chroma_subsampling: '4:2:0',
+          pixel_format: 'nv12',
+          hdr_enabled: false,
+        },
+      });
+
+      expect(mockInvoke).toHaveBeenCalledWith('open_remote_display_window', {
+        sessionId: 'session-1',
+        surfaceId: null,
+        preferredDisplaySourceId: null,
+        avoidCaptureSourceId: null,
+        profileWidth: 2560,
+        profileHeight: 1440,
+        profileFps: 144,
+        profileBitrateMbps: 40,
+        profileCodec: 'hevc',
+        profileCodecProfile: 'main',
+        profileBitDepth: 8,
+        profileChromaSubsampling: '4:2:0',
+        profilePixelFormat: 'nv12',
+        profileHdrEnabled: false,
+      });
+    });
+
     it('browser WebRTC preview start passes selected source id', async () => {
       const mockInvoke = getMockInvoke();
       mockInvoke.mockResolvedValue({

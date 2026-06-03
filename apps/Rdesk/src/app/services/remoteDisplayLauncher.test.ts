@@ -143,6 +143,10 @@ describe("launchRemoteDisplayForDevice", () => {
       "quic",
       DEFAULT_HEVC_1080P60_PROFILE
     );
+    expect(mocks.openRemoteDisplayWindow).toHaveBeenCalledWith({
+      sessionId: "p2p-quic-session",
+      requestedProfile: DEFAULT_HEVC_1080P60_PROFILE,
+    });
   });
 
   it("requests the macOS VideoToolbox HEVC 2K144 profile for macOS LAN P2P remote display", async () => {
@@ -159,6 +163,10 @@ describe("launchRemoteDisplayForDevice", () => {
       "quic",
       MACOS_HEVC_2K144_PROFILE
     );
+    expect(mocks.openRemoteDisplayWindow).toHaveBeenCalledWith({
+      sessionId: "p2p-quic-session",
+      requestedProfile: MACOS_HEVC_2K144_PROFILE,
+    });
   });
 
   it("selects a remote capture source before opening the display window", async () => {

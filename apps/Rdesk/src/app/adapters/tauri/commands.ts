@@ -255,6 +255,7 @@ export async function openRemoteDisplayWindow(params: {
   surfaceId?: string | null;
   preferredDisplaySourceId?: string | null;
   avoidCaptureSourceId?: string | null;
+  requestedProfile?: MediaProfile | null;
 }): Promise<AdapterResult<RemoteDisplayWindowContext>> {
   if (shouldUseServiceBridge()) {
     return {
@@ -276,7 +277,24 @@ export async function openRemoteDisplayWindow(params: {
     surfaceId: params.surfaceId ?? null,
     preferredDisplaySourceId: params.preferredDisplaySourceId ?? null,
     avoidCaptureSourceId: params.avoidCaptureSourceId ?? null,
+    ...remoteDisplayProfileArgs(params.requestedProfile),
   });
+}
+
+function remoteDisplayProfileArgs(profile?: MediaProfile | null) {
+  if (!profile) return {};
+  return {
+    profileWidth: profile.width,
+    profileHeight: profile.height,
+    profileFps: profile.fps,
+    profileBitrateMbps: profile.bitrate_mbps,
+    profileCodec: profile.codec,
+    profileCodecProfile: profile.codec_profile ?? null,
+    profileBitDepth: profile.bit_depth ?? null,
+    profileChromaSubsampling: profile.chroma_subsampling ?? null,
+    profilePixelFormat: profile.pixel_format ?? null,
+    profileHdrEnabled: profile.hdr_enabled ?? null,
+  };
 }
 
 export async function listRemoteDisplayWindows(
