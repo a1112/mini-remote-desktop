@@ -3416,7 +3416,9 @@ export function RemoteDisplayWindowPage() {
           "videotoolbox"
         )
       );
-      setFps((value) => (value === "120" || value === "144" ? "60" : value));
+      if (isLocalPipelinePreview) {
+        setFps((value) => (value === "120" || value === "144" ? "60" : value));
+      }
       setRenderMode((value) => (value === "d3d11_native" ? "metal_native" : value));
       return;
     }
@@ -3466,7 +3468,7 @@ export function RemoteDisplayWindowPage() {
     }
 
     setRenderMode("web");
-  }, [capabilities]);
+  }, [capabilities, isLocalPipelinePreview]);
 
   useEffect(() => {
     if (

@@ -118,6 +118,21 @@ function linuxCapabilities() {
   };
 }
 
+function macosCapabilities() {
+  return {
+    os_type: "macos",
+    cpu_brand: "Apple",
+    cpu_cores: 8,
+    memory_gb: 16,
+    gpu_info: "Apple GPU",
+    available_captures: ["macos", "synthetic"],
+    available_encoders: ["videotoolbox_hevc", "videotoolbox_h264", "openh264"],
+    available_decoders: ["videotoolbox", "software"],
+    available_renderers: ["macos"],
+    available_memory_modes: ["cpu"],
+  };
+}
+
 const remoteDisplaySource = {
   id: "windows:display-shared:0",
   platform: "windows",
@@ -2650,6 +2665,78 @@ describe("RemoteDisplayWindowPage", () => {
           pixel_format: "nv12",
           hdr_enabled: false,
         },
+      });
+    });
+  });
+
+  it("keeps remote media profile updates at 144 FPS on macOS controllers", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(macosCapabilities());
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-p2p-quic-mac-1",
+          session_id: "p2p-quic-mac",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: false,
+          render_mode: "macos_native",
+          native_surface_attached: false,
+          session_window_count: 1,
+        });
+      }
+      if (command === "configure_remote_display_native_surface") {
+        return Promise.resolve({
+          label: "render-p2p-quic-mac-1",
+          backend: "macos",
+          attached: true,
+          visible: true,
+          parent_hwnd: "0xA",
+          hwnd: "0x14",
+          rect: { x: 0, y: 0, width: 1280, height: 720 },
+        });
+      }
+      if (command === "ipc_update_media_profile") {
+        return Promise.resolve({
+          requested: args?.requestedProfile,
+          selected: args?.requestedProfile,
+          status: "accepted",
+          reason: null,
+        });
+      }
+      if (command === "ipc_probe_snapshot") {
+        return Promise.resolve({
+          session_id: "p2p-quic-mac",
+          frames_received: 1,
+          frames_decoded: 1,
+          frames_dropped: 0,
+          current_fps: 144,
+          bitrate_mbps: 20,
+          media_probe_valid: true,
+          media_probe_width: 1920,
+          media_probe_height: 1080,
+          media_probe_target_fps: 144,
+          media_probe_target_bitrate_mbps: 20,
+          last_error: null,
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay("p2p-quic-mac");
+
+    fireEvent.click(await screen.findByRole("button", { name: "配置" }));
+    fireEvent.click(await screen.findByRole("button", { name: "应用远端" }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("ipc_update_media_profile", {
+        sessionId: "p2p-quic-mac",
+        requestedProfile: expect.objectContaining({
+          fps: 144,
+          codec: "hevc",
+        }),
       });
     });
   });
