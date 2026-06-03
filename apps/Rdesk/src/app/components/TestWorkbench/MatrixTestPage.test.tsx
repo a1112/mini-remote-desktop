@@ -62,6 +62,24 @@ function mockMacCapabilities(command: string) {
   return undefined;
 }
 
+function mockMacHevcCapabilities(command: string) {
+  if (command === "test_get_capabilities") {
+    return Promise.resolve({
+      os_type: "macos",
+      cpu_brand: "",
+      cpu_cores: 8,
+      memory_gb: 32,
+      gpu_info: "",
+      available_captures: ["macos", "synthetic"],
+      available_encoders: ["videotoolbox_hevc", "videotoolbox_h264", "openh264"],
+      available_decoders: ["videotoolbox", "software"],
+      available_renderers: ["none", "macos"],
+      available_memory_modes: ["cpu"],
+    });
+  }
+  return undefined;
+}
+
 function mockLinuxCapabilities(command: string) {
   if (command === "test_get_capabilities") {
     return Promise.resolve({
@@ -167,6 +185,26 @@ describe("MatrixTestPage failure handling", () => {
       pixel_format: "p010",
       hdr_enabled: false,
     });
+
+    expect(
+      mediaProfileFromConfig({
+        encoder_type: "videotoolbox_hevc",
+        resolution: [2560, 1440],
+        fps: 144,
+        bitrate: 40_000_000,
+      })
+    ).toEqual({
+      width: 2560,
+      height: 1440,
+      fps: 144,
+      bitrate_mbps: 40,
+      codec: "hevc",
+      codec_profile: "main",
+      bit_depth: 8,
+      chroma_subsampling: "4:2:0",
+      pixel_format: "nv12",
+      hdr_enabled: false,
+    });
   });
 
   it("requires HEVC peer media capabilities for HEVC cross-device matrix profiles", () => {
@@ -211,6 +249,52 @@ describe("MatrixTestPage failure handling", () => {
         hdr_enabled: false,
       })
     ).toMatch(/nvenc_hevc.*nvdec_hevc.*media\.hevc_main_420_8bit/);
+  });
+
+  it("accepts macOS VideoToolbox media capabilities for HEVC cross-device matrix profiles", () => {
+    const peer = {
+      device_id: "mac-peer",
+      device_name: "Mac Peer",
+      device_type: "desktop",
+      ip: "192.168.1.52",
+      discovery_port: 21116,
+      p2p_control_addr: "192.168.1.52:21116",
+      transports: [
+        "quic",
+        "quic_datagram",
+        "quic_datagram_2k144",
+        "quic_datagram_media_v3",
+        "media_profile_control_v1",
+      ],
+      protocol_version: 1,
+      service_build_id: "test-build",
+      media_protocol_version: 3,
+      media_capabilities: [
+        "quic_datagram_media_v3",
+        "macos_capture",
+        "videotoolbox_hevc",
+        "videotoolbox",
+        "media.hevc_main_420_8bit",
+        "macos_native_render",
+      ],
+      age_ms: 20,
+      p2p_available: true,
+    };
+
+    expect(
+      crossDevicePeerSkipReason(peer, "quic", {
+        width: 2560,
+        height: 1440,
+        fps: 144,
+        bitrate_mbps: 40,
+        codec: "hevc",
+        codec_profile: "main",
+        bit_depth: 8,
+        chroma_subsampling: "4:2:0",
+        pixel_format: "nv12",
+        hdr_enabled: false,
+      })
+    ).toBeNull();
   });
 
   it("formats matrix media profiles with HEVC codec and chroma metadata", () => {
@@ -553,6 +637,24 @@ describe("MatrixTestPage failure handling", () => {
     expect(screen.queryByLabelText("D3D11 shared texture")).not.toBeInTheDocument();
   });
 
+  it("defaults macOS matrix runs to VideoToolbox HEVC encode and decode when available", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      const macCapabilities = mockMacHevcCapabilities(command);
+      if (macCapabilities) return macCapabilities;
+      return Promise.resolve(null);
+    });
+
+    render(<MatrixTestPage />);
+
+    await screen.findByLabelText("VideoToolbox HEVC");
+    expect(screen.getByLabelText("VideoToolbox HEVC")).toBeChecked();
+    expect(screen.getByLabelText("VideoToolbox H.264")).not.toBeChecked();
+    expect(screen.getByLabelText("OpenH264")).not.toBeChecked();
+    expect(screen.getByLabelText("VideoToolbox")).toBeChecked();
+    expect(screen.getByLabelText("软件")).not.toBeChecked();
+  });
+
   it("loads Linux-specific matrix dimensions from environment capabilities", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {
@@ -695,6 +797,7 @@ describe("MatrixTestPage failure handling", () => {
 
     await screen.findByLabelText("macOS");
     fireEvent.click(screen.getByLabelText("VideoToolbox H.264"));
+    fireEvent.click(screen.getByLabelText("OpenH264"));
     fireEvent.click(screen.getByLabelText("720p"));
     fireEvent.click(screen.getByLabelText("30 FPS"));
     fireEvent.click(screen.getByRole("button", { name: /启动矩阵测试/ }));

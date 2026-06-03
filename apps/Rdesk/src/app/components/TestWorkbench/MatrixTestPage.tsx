@@ -272,7 +272,7 @@ function defaultEncodersForOs(os: HostOs): string[] {
 
 function defaultDecodersForOs(os: HostOs): string[] {
   if (os === "windows") return ["nvdec", "software", "none"];
-  if (os === "macos") return ["software", "none"];
+  if (os === "macos") return ["videotoolbox", "software", "none"];
   if (os === "linux") return ["linux_h264", "linux_hevc", "linux_hevc_main10", "software", "none"];
   return ["software", "none"];
 }
@@ -307,14 +307,17 @@ function shouldEnableDecoderByDefault(
 ): boolean {
   const hasNvdec = availableDecoders.includes("nvdec");
   const hasLinuxHardware = hasLinuxHardwareDecoder(availableDecoders);
+  const hasVideoToolbox = availableDecoders.includes("videotoolbox");
   const hasFfmpegH264 = availableDecoders.includes("ffmpeg_h264");
 
   if (option.id === "nvdec") return hasNvdec;
+  if (option.id === "videotoolbox") return hasVideoToolbox;
   if (option.id === "ffmpeg_h264") return !hasNvdec && !hasLinuxHardware && hasFfmpegH264;
   if (option.id === "software") {
     return (
       !hasNvdec &&
       !hasLinuxHardware &&
+      !hasVideoToolbox &&
       !hasFfmpegH264 &&
       optionEnabledForOs(option, os)
     );
@@ -330,9 +333,19 @@ function shouldEnableOptionByDefault(
   availableDecoders: string[]
 ): boolean {
   if (dimensionId === "encoder") {
-    const hasHevc = availableEncoders.includes("nvenc_hevc");
-    const hasHardwareH264 = availableEncoders.includes("nvenc_h264");
+    const hasHevc =
+      availableEncoders.includes("nvenc_hevc") ||
+      availableEncoders.includes("videotoolbox_hevc");
+    const hasHardwareH264 =
+      availableEncoders.includes("nvenc_h264") ||
+      availableEncoders.includes("videotoolbox_h264");
     if (option.id === "nvenc_h264") return !hasHevc && hasHardwareH264;
+    if (option.id === "videotoolbox_hevc") {
+      return availableEncoders.includes("videotoolbox_hevc");
+    }
+    if (option.id === "videotoolbox_h264") {
+      return !hasHevc && availableEncoders.includes("videotoolbox_h264");
+    }
     if (option.id === "openh264") return !hasHevc && !hasHardwareH264;
   }
   if (
@@ -1003,7 +1016,7 @@ function crossDeviceUnsupportedTransportReason(config: TestConfig): string | nul
 
 export function mediaProfileFromConfig(config: TestConfig): MediaProfile {
   const [width, height] = config.resolution ?? [1920, 1080];
-  const hevc = config.encoder_type === "nvenc_hevc" || config.encoder_type === "nvenc_hevc_main10";
+  const hevc = isHevcEncoder(config.encoder_type);
   const vvc = config.encoder_type === "software_vvc";
   const main10 = config.encoder_type === "nvenc_hevc_main10";
   const profile: MediaProfile = {
@@ -1083,35 +1096,72 @@ export function crossDevicePeerSkipReason(
     mediaProtocolVersion >= 2 &&
     (transports.includes("quic_datagram_media_v2") ||
       mediaCapabilities.includes("quic_datagram_media_v2"));
-  const codec = profile?.codec?.toLowerCase() ?? "h264";
-  const requiredMediaCapabilities =
-    codec === "hevc"
-      ? [
-          ["dxgi_capture"],
-          ["nvenc_hevc", "encode.nvenc_hevc"],
-          ["nvdec_hevc", "decode.nvdec_hevc"],
-          ["d3d11_native_render"],
-          ["media.hevc_main_420_8bit"],
-        ]
-      : [
-          ["dxgi_capture"],
-          ["nvenc_h264", "encode.nvenc_h264"],
-          ["nvdec", "decode.nvdec"],
-          ["d3d11_native_render"],
-        ];
-  const missingMediaCapabilities = requiredMediaCapabilities
-    .filter((aliases) => !aliases.some((capability) => mediaCapabilities.includes(capability)))
-    .map((aliases) => aliases[0]);
   if (!hasMediaV3 && !hasMediaV2) {
     return `LAN peer is not on a compatible QUIC media protocol: ${peer.device_id} reports media protocol ${
       mediaProtocolVersion || "unknown"
     }`;
   }
-  return missingMediaCapabilities.length === 0
-    ? null
-    : `LAN peer is missing required Windows media capabilities [${missingMediaCapabilities.join(
-        ", "
-      )}]: ${peer.device_id}`;
+
+  const codec = profile?.codec?.toLowerCase() ?? "h264";
+  const requiredMediaCapabilityProfiles =
+    codec === "hevc"
+      ? [
+          {
+            label: "Windows HEVC",
+            capabilities: [
+              ["dxgi_capture", "capture.dxgi"],
+              ["nvenc_hevc", "encode.nvenc_hevc"],
+              ["nvdec_hevc", "decode.nvdec_hevc"],
+              ["d3d11_native_render", "render.d3d11"],
+              ["media.hevc_main_420_8bit"],
+            ],
+          },
+          {
+            label: "macOS VideoToolbox HEVC",
+            capabilities: [
+              ["macos_capture", "capture.macos"],
+              ["videotoolbox_hevc", "encode.videotoolbox_hevc"],
+              ["videotoolbox", "decode.videotoolbox"],
+              ["media.hevc_main_420_8bit"],
+              ["macos_native_render", "render.macos"],
+            ],
+          },
+        ]
+      : [
+          {
+            label: "Windows H.264",
+            capabilities: [
+              ["dxgi_capture", "capture.dxgi"],
+              ["nvenc_h264", "encode.nvenc_h264"],
+              ["nvdec", "decode.nvdec"],
+              ["d3d11_native_render", "render.d3d11"],
+            ],
+          },
+          {
+            label: "macOS VideoToolbox H.264",
+            capabilities: [
+              ["macos_capture", "capture.macos"],
+              ["videotoolbox_h264", "encode.videotoolbox_h264"],
+              ["videotoolbox", "decode.videotoolbox"],
+              ["macos_native_render", "render.macos"],
+            ],
+          },
+        ];
+  const missingByProfile = requiredMediaCapabilityProfiles.map((capabilityProfile) => ({
+    label: capabilityProfile.label,
+    missing: capabilityProfile.capabilities
+      .filter((aliases) => !aliases.some((capability) => mediaCapabilities.includes(capability)))
+      .map((aliases) => aliases[0]),
+  }));
+  if (missingByProfile.some((result) => result.missing.length === 0)) {
+    return null;
+  }
+  const closestProfile = missingByProfile.reduce((best, current) =>
+    current.missing.length < best.missing.length ? current : best
+  );
+  return `LAN peer is missing required ${closestProfile.label} media capabilities [${closestProfile.missing.join(
+    ", "
+  )}]: ${peer.device_id}`;
 }
 
 function crossDeviceReportSkipReason(report: LanE2EAutomationReport): string | null {
