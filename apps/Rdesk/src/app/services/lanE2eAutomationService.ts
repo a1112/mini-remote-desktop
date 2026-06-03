@@ -318,6 +318,13 @@ const DEFAULT_LAN_MACOS_HEVC_MEDIA_PROFILE: MediaProfile = {
   pixel_format: "nv12",
   hdr_enabled: false,
 };
+const DEFAULT_LAN_MACOS_H264_MEDIA_PROFILE: MediaProfile = {
+  width: 2560,
+  height: 1440,
+  fps: 144,
+  bitrate_mbps: 80,
+  codec: "h264",
+};
 const ADAPTIVE_STARTUP_SAFE_MIN_FPS = 120;
 const ADAPTIVE_STARTUP_SAFE_MIN_BITRATE_MBPS = 80;
 const ADAPTIVE_STARTUP_SAFE_BITRATE_RATIO = 0.8;
@@ -1501,19 +1508,33 @@ function defaultLanMediaProfileForPeer(peer: LanPeerInfo): MediaProfile {
   if (peerSupportsMacosHevcNativeMedia(peer)) {
     return { ...DEFAULT_LAN_MACOS_HEVC_MEDIA_PROFILE };
   }
+  if (peerSupportsMacosH264NativeMedia(peer)) {
+    return { ...DEFAULT_LAN_MACOS_H264_MEDIA_PROFILE };
+  }
   return peerSupportsHevcMain(peer)
     ? { ...DEFAULT_LAN_HEVC_MEDIA_PROFILE }
     : { ...DEFAULT_LAN_H264_FALLBACK_MEDIA_PROFILE };
 }
 
 function peerSupportsMacosHevcNativeMedia(peer: LanPeerInfo): boolean {
+  return peerSupportsMacosNativeMediaProfile(peer, "macos_hevc");
+}
+
+function peerSupportsMacosH264NativeMedia(peer: LanPeerInfo): boolean {
+  return peerSupportsMacosNativeMediaProfile(peer, "macos_h264");
+}
+
+function peerSupportsMacosNativeMediaProfile(
+  peer: LanPeerInfo,
+  profileId: RequiredPlatformMediaCapabilityProfile["id"]
+): boolean {
   const mediaCapabilities = (peer.media_capabilities ?? []).map((capability) =>
     capability.toLowerCase()
   );
   return REQUIRED_PLATFORM_MEDIA_CAPABILITY_PROFILES.some(
     (profile) =>
       profile.platform === "macos" &&
-      profile.id === "macos_hevc" &&
+      profile.id === profileId &&
       platformMediaProfileMatches(profile, mediaCapabilities)
   );
 }

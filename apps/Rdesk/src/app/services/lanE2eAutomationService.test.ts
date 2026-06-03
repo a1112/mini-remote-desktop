@@ -33,6 +33,14 @@ const H264_FALLBACK_REQUESTED_PROFILE = {
   codec: "h264",
 };
 
+const MACOS_H264_2K144_REQUESTED_PROFILE = {
+  width: 2560,
+  height: 1440,
+  fps: 144,
+  bitrate_mbps: 80,
+  codec: "h264",
+};
+
 const MACOS_HEVC_2K144_REQUESTED_PROFILE = {
   width: 2560,
   height: 1440,
@@ -2498,6 +2506,27 @@ describe("runLanE2EAutomation", () => {
           ],
         })
       ),
+      ipcProbeSnapshot: vi.fn().mockResolvedValue(
+        ok({
+          session_id: "unused",
+          frames_received: 4,
+          frames_decoded: 3,
+          frames_dropped: 0,
+          current_fps: 144,
+          bitrate_mbps: 80,
+          media_probe_valid: true,
+          media_probe_format: "compressed_h264_test_pattern",
+          media_probe_width: 2560,
+          media_probe_height: 1440,
+          media_probe_target_fps: 144,
+          media_probe_target_bitrate_mbps: 80,
+          media_probe_payload_bytes: 55555,
+          last_media_sequence: 3,
+          last_media_timestamp_us: 123456,
+          last_media_payload_hash: "fnv1a64:abc123",
+          last_error: null,
+        })
+      ),
     });
 
     const result = await runLanE2EAutomation(commands, {
@@ -2511,12 +2540,12 @@ describe("runLanE2EAutomation", () => {
     });
 
     expect(result.status).toBe("completed");
-    expect(result.requestedProfile).toEqual(H264_FALLBACK_REQUESTED_PROFILE);
+    expect(result.requestedProfile).toEqual(MACOS_H264_2K144_REQUESTED_PROFILE);
     expect(commands.ipcStartLanRemoteSession).toHaveBeenCalledWith(
       "lan-e2e-test-session",
       "agent-device",
       "quic",
-      H264_FALLBACK_REQUESTED_PROFILE
+      MACOS_H264_2K144_REQUESTED_PROFILE
     );
   });
 
