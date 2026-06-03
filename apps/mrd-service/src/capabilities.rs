@@ -555,21 +555,27 @@ fn add_encode_capabilities(
     );
 
     if matches!(platform, CapabilityPlatform::Macos) {
-        push_supported(
+        let (h264_status, h264_reason) =
+            macos_videotoolbox_h264_encode_status(platform, probe_mode);
+        push_item(
             items,
             platform,
             CapabilityDomain::Encode,
             "encode.videotoolbox_h264",
             "VideoToolbox H.264",
-            "VideoToolbox encode is wired in the Rdesk harness path.",
+            h264_status,
+            Some(h264_reason.as_str()),
         );
-        push_supported(
+        let (hevc_status, hevc_reason) =
+            macos_videotoolbox_hevc_encode_status(platform, probe_mode);
+        push_item(
             items,
             platform,
             CapabilityDomain::Encode,
             "encode.videotoolbox_hevc",
             "VideoToolbox HEVC",
-            "VideoToolbox HEVC encode is wired in the Rdesk harness path.",
+            hevc_status,
+            Some(hevc_reason.as_str()),
         );
     }
 }
@@ -750,13 +756,37 @@ fn add_decode_capabilities(
     }
 
     if matches!(platform, CapabilityPlatform::Macos) {
-        push_supported(
+        let (h264_status, h264_reason) =
+            macos_videotoolbox_h264_decode_status(platform, probe_mode);
+        push_item(
+            items,
+            platform,
+            CapabilityDomain::Decode,
+            "decode.videotoolbox_h264",
+            "VideoToolbox H.264 decode",
+            h264_status,
+            Some(h264_reason.as_str()),
+        );
+        let (hevc_status, hevc_reason) =
+            macos_videotoolbox_hevc_decode_status(platform, probe_mode);
+        push_item(
+            items,
+            platform,
+            CapabilityDomain::Decode,
+            "decode.videotoolbox_hevc",
+            "VideoToolbox HEVC decode",
+            hevc_status,
+            Some(hevc_reason.as_str()),
+        );
+        let (decode_status, decode_reason) = macos_videotoolbox_decode_status(platform, probe_mode);
+        push_item(
             items,
             platform,
             CapabilityDomain::Decode,
             "decode.videotoolbox",
             "VideoToolbox decode",
-            "VideoToolbox H.264/HEVC decode is wired for the macOS LAN media receiver path.",
+            decode_status,
+            Some(decode_reason.as_str()),
         );
     }
 
@@ -915,6 +945,261 @@ fn static_windows_runtime_status(label: &str) -> (CapabilityStatus, String) {
     (
         CapabilityStatus::Supported,
         format!("{label} is platform-declared on Windows; runtime probe refresh is pending."),
+    )
+}
+
+fn static_macos_runtime_status(label: &str) -> (CapabilityStatus, String) {
+    (
+        CapabilityStatus::Supported,
+        format!("{label} is platform-declared on macOS; runtime probe refresh is pending."),
+    )
+}
+
+fn unsupported_macos_status(label: &str) -> (CapabilityStatus, String) {
+    (
+        CapabilityStatus::Unsupported,
+        format!("{label} is only supported on macOS in the current product mode."),
+    )
+}
+
+fn macos_videotoolbox_h264_encode_status(
+    platform: &CapabilityPlatform,
+    probe_mode: CapabilityProbeMode,
+) -> (CapabilityStatus, String) {
+    if !matches!(platform, CapabilityPlatform::Macos) {
+        return unsupported_macos_status("VideoToolbox H.264 encode");
+    }
+
+    match probe_mode {
+        CapabilityProbeMode::Static => static_macos_runtime_status("VideoToolbox H.264 encode"),
+        CapabilityProbeMode::Runtime => {
+            #[cfg(target_os = "macos")]
+            {
+                static RESULT: OnceLock<(CapabilityStatus, String)> = OnceLock::new();
+                RESULT
+                    .get_or_init(|| {
+                        classify_runtime_probe(
+                            "VideoToolbox H.264 encode",
+                            mrd_codec_videotoolbox::VideoToolboxH264Encoder::new(640, 480, 30)
+                                .map(|_| ())
+                                .map_err(|error| error.to_string()),
+                        )
+                    })
+                    .clone()
+            }
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                unsupported_macos_status("VideoToolbox H.264 encode")
+            }
+        }
+    }
+}
+
+fn macos_videotoolbox_hevc_encode_status(
+    platform: &CapabilityPlatform,
+    probe_mode: CapabilityProbeMode,
+) -> (CapabilityStatus, String) {
+    if !matches!(platform, CapabilityPlatform::Macos) {
+        return unsupported_macos_status("VideoToolbox HEVC encode");
+    }
+
+    match probe_mode {
+        CapabilityProbeMode::Static => static_macos_runtime_status("VideoToolbox HEVC encode"),
+        CapabilityProbeMode::Runtime => {
+            #[cfg(target_os = "macos")]
+            {
+                static RESULT: OnceLock<(CapabilityStatus, String)> = OnceLock::new();
+                RESULT
+                    .get_or_init(|| {
+                        classify_runtime_probe(
+                            "VideoToolbox HEVC encode",
+                            mrd_codec_videotoolbox::VideoToolboxHevcEncoder::new(640, 480, 30)
+                                .map(|_| ())
+                                .map_err(|error| error.to_string()),
+                        )
+                    })
+                    .clone()
+            }
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                unsupported_macos_status("VideoToolbox HEVC encode")
+            }
+        }
+    }
+}
+
+fn macos_videotoolbox_h264_decode_status(
+    platform: &CapabilityPlatform,
+    probe_mode: CapabilityProbeMode,
+) -> (CapabilityStatus, String) {
+    if !matches!(platform, CapabilityPlatform::Macos) {
+        return unsupported_macos_status("VideoToolbox H.264 decode");
+    }
+
+    match probe_mode {
+        CapabilityProbeMode::Static => static_macos_runtime_status("VideoToolbox H.264 decode"),
+        CapabilityProbeMode::Runtime => {
+            if !videotoolbox_decoder_enabled() {
+                return (
+                    CapabilityStatus::Unsupported,
+                    "VideoToolbox decode is disabled by MRD_DISABLE_VIDEOTOOLBOX_DECODER."
+                        .to_string(),
+                );
+            }
+
+            #[cfg(target_os = "macos")]
+            {
+                static RESULT: OnceLock<(CapabilityStatus, String)> = OnceLock::new();
+                RESULT
+                    .get_or_init(|| {
+                        classify_runtime_probe(
+                            "VideoToolbox H.264 decode",
+                            mrd_codec_videotoolbox::VideoToolboxH264Decoder::new()
+                                .map(|_| ())
+                                .map_err(|error| error.to_string()),
+                        )
+                    })
+                    .clone()
+            }
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                unsupported_macos_status("VideoToolbox H.264 decode")
+            }
+        }
+    }
+}
+
+fn macos_videotoolbox_hevc_decode_status(
+    platform: &CapabilityPlatform,
+    probe_mode: CapabilityProbeMode,
+) -> (CapabilityStatus, String) {
+    if !matches!(platform, CapabilityPlatform::Macos) {
+        return unsupported_macos_status("VideoToolbox HEVC decode");
+    }
+
+    match probe_mode {
+        CapabilityProbeMode::Static => static_macos_runtime_status("VideoToolbox HEVC decode"),
+        CapabilityProbeMode::Runtime => {
+            if !videotoolbox_decoder_enabled() {
+                return (
+                    CapabilityStatus::Unsupported,
+                    "VideoToolbox decode is disabled by MRD_DISABLE_VIDEOTOOLBOX_DECODER."
+                        .to_string(),
+                );
+            }
+
+            #[cfg(target_os = "macos")]
+            {
+                static RESULT: OnceLock<(CapabilityStatus, String)> = OnceLock::new();
+                RESULT
+                    .get_or_init(|| {
+                        classify_runtime_probe(
+                            "VideoToolbox HEVC decode",
+                            mrd_codec_videotoolbox::VideoToolboxHevcDecoder::new()
+                                .map(|_| ())
+                                .map_err(|error| error.to_string()),
+                        )
+                    })
+                    .clone()
+            }
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                unsupported_macos_status("VideoToolbox HEVC decode")
+            }
+        }
+    }
+}
+
+fn macos_videotoolbox_decode_status(
+    platform: &CapabilityPlatform,
+    probe_mode: CapabilityProbeMode,
+) -> (CapabilityStatus, String) {
+    if !matches!(platform, CapabilityPlatform::Macos) {
+        return unsupported_macos_status("VideoToolbox decode");
+    }
+
+    if matches!(probe_mode, CapabilityProbeMode::Static) {
+        return static_macos_runtime_status("VideoToolbox H.264/HEVC decode");
+    }
+
+    let (h264_status, h264_reason) = macos_videotoolbox_h264_decode_status(platform, probe_mode);
+    let (hevc_status, hevc_reason) = macos_videotoolbox_hevc_decode_status(platform, probe_mode);
+    let h264_runs = capability_status_runs(&h264_status);
+    let hevc_runs = capability_status_runs(&hevc_status);
+    match (h264_runs, hevc_runs) {
+        (true, true) => (
+            CapabilityStatus::Available,
+            "VideoToolbox H.264 and HEVC decode runtime probes succeeded.".to_string(),
+        ),
+        (true, false) => (
+            CapabilityStatus::Degraded,
+            format!(
+                "VideoToolbox H.264 decode is available, but HEVC decode is not: {hevc_reason}"
+            ),
+        ),
+        (false, true) => (
+            CapabilityStatus::Degraded,
+            format!(
+                "VideoToolbox HEVC decode is available, but H.264 decode is not: {h264_reason}"
+            ),
+        ),
+        (false, false)
+            if matches!(&h264_status, CapabilityStatus::Unsupported)
+                && matches!(&hevc_status, CapabilityStatus::Unsupported) =>
+        {
+            (
+                CapabilityStatus::Unsupported,
+                format!("{h264_reason}; {hevc_reason}"),
+            )
+        }
+        (false, false) => (
+            CapabilityStatus::DriverMissing,
+            format!("{h264_reason}; {hevc_reason}"),
+        ),
+    }
+}
+
+fn macos_hevc_main_media_profile_status(
+    platform: &CapabilityPlatform,
+    probe_mode: CapabilityProbeMode,
+) -> (CapabilityStatus, String) {
+    if !matches!(platform, CapabilityPlatform::Macos) {
+        return (
+            CapabilityStatus::Supported,
+            "HEVC Main 8-bit 4:2:0 is declared for this platform when paired with HEVC encoder and decoder capabilities."
+                .to_string(),
+        );
+    }
+
+    match probe_mode {
+        CapabilityProbeMode::Static => (
+            CapabilityStatus::Supported,
+            "HEVC Main 8-bit 4:2:0 is platform-declared on macOS; runtime probe refresh is pending."
+                .to_string(),
+        ),
+        CapabilityProbeMode::Runtime => {
+            let (encode_status, encode_reason) =
+                macos_videotoolbox_hevc_encode_status(platform, probe_mode);
+            if capability_status_runs(&encode_status) {
+                (
+                    CapabilityStatus::Available,
+                    "VideoToolbox HEVC encoder supports HEVC Main 8-bit 4:2:0.".to_string(),
+                )
+            } else {
+                (encode_status, encode_reason)
+            }
+        }
+    }
+}
+
+fn videotoolbox_decoder_enabled() -> bool {
+    !matches!(
+        std::env::var("MRD_DISABLE_VIDEOTOOLBOX_DECODER").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
     )
 }
 
@@ -1377,13 +1662,23 @@ fn add_service_capabilities(
         platform,
         CapabilityPlatform::Windows | CapabilityPlatform::Linux | CapabilityPlatform::Macos
     ) {
-        push_supported(
+        let (status, reason) = if matches!(platform, CapabilityPlatform::Macos) {
+            macos_hevc_main_media_profile_status(platform, probe_mode)
+        } else {
+            (
+                CapabilityStatus::Supported,
+                "HEVC Main 8-bit 4:2:0 is the default LAN high-performance profile when encoder and decoder probes pass."
+                    .to_string(),
+            )
+        };
+        push_item(
             items,
             platform,
             CapabilityDomain::Service,
             "media.hevc_main_420_8bit",
             "HEVC Main 8-bit 4:2:0",
-            "HEVC Main 8-bit 4:2:0 is the default LAN high-performance profile when encoder and decoder probes pass.",
+            status,
+            Some(reason.as_str()),
         );
     }
     let (ffmpeg_status, ffmpeg_reason) = ffmpeg_tool_status(probe_mode);
@@ -1529,7 +1824,7 @@ fn default_profiles() -> Vec<CapabilityProfile> {
             vec![
                 "capture.macos",
                 "encode.videotoolbox_h264",
-                "decode.videotoolbox",
+                "decode.videotoolbox_h264",
                 "memory.cpu",
                 "transport.quic_datagram",
                 "transport.media_profile_control_v1",
@@ -1545,7 +1840,7 @@ fn default_profiles() -> Vec<CapabilityProfile> {
             vec![
                 "capture.macos",
                 "encode.videotoolbox_hevc",
-                "decode.videotoolbox",
+                "decode.videotoolbox_hevc",
                 "media.hevc_main_420_8bit",
                 "memory.cpu",
                 "transport.quic_datagram",
@@ -1853,12 +2148,18 @@ mod tests {
     fn macos_videotoolbox_decode_is_advertised_for_lan_receiver_path() {
         let capabilities =
             local_capabilities(CapabilityPlatform::Macos, CapabilityProbeMode::Static);
-        let decode = capabilities
-            .iter()
-            .find(|item| item.id == "decode.videotoolbox")
-            .expect("macOS VideoToolbox decode capability");
+        for id in [
+            "decode.videotoolbox",
+            "decode.videotoolbox_h264",
+            "decode.videotoolbox_hevc",
+        ] {
+            let decode = capabilities
+                .iter()
+                .find(|item| item.id == id)
+                .expect("macOS VideoToolbox decode capability");
 
-        assert_eq!(decode.status, CapabilityStatus::Supported);
+            assert_eq!(decode.status, CapabilityStatus::Supported);
+        }
     }
 
     #[test]
@@ -1908,7 +2209,10 @@ mod tests {
             .contains(&"encode.videotoolbox_h264".to_string()));
         assert!(profile
             .required_capabilities
-            .contains(&"decode.videotoolbox".to_string()));
+            .contains(&"decode.videotoolbox_h264".to_string()));
+        assert!(!profile
+            .required_capabilities
+            .contains(&"decode.videotoolbox_hevc".to_string()));
         assert!(!profile
             .required_capabilities
             .contains(&"render.macos".to_string()));
@@ -1934,7 +2238,10 @@ mod tests {
             .contains(&"encode.videotoolbox_hevc".to_string()));
         assert!(profile
             .required_capabilities
-            .contains(&"decode.videotoolbox".to_string()));
+            .contains(&"decode.videotoolbox_hevc".to_string()));
+        assert!(!profile
+            .required_capabilities
+            .contains(&"decode.videotoolbox_h264".to_string()));
         assert!(profile
             .required_capabilities
             .contains(&"media.hevc_main_420_8bit".to_string()));
@@ -1944,6 +2251,34 @@ mod tests {
         assert!(!profile
             .required_capabilities
             .contains(&"render.d3d11".to_string()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_runtime_videotoolbox_capabilities_follow_runtime_probes() {
+        let capabilities =
+            local_capabilities(CapabilityPlatform::Macos, CapabilityProbeMode::Runtime);
+        let status_runs = |id: &str| {
+            let item = capabilities
+                .iter()
+                .find(|item| item.id == id)
+                .unwrap_or_else(|| panic!("missing capability {id}"));
+            capability_status_runs(&item.status)
+        };
+        let h264_encode =
+            mrd_codec_videotoolbox::VideoToolboxH264Encoder::new(640, 480, 30).is_ok();
+        let hevc_encode =
+            mrd_codec_videotoolbox::VideoToolboxHevcEncoder::new(640, 480, 30).is_ok();
+        let h264_decode = videotoolbox_decoder_enabled()
+            && mrd_codec_videotoolbox::VideoToolboxH264Decoder::new().is_ok();
+        let hevc_decode = videotoolbox_decoder_enabled()
+            && mrd_codec_videotoolbox::VideoToolboxHevcDecoder::new().is_ok();
+
+        assert_eq!(status_runs("encode.videotoolbox_h264"), h264_encode);
+        assert_eq!(status_runs("encode.videotoolbox_hevc"), hevc_encode);
+        assert_eq!(status_runs("decode.videotoolbox_h264"), h264_decode);
+        assert_eq!(status_runs("decode.videotoolbox_hevc"), hevc_decode);
+        assert_eq!(status_runs("media.hevc_main_420_8bit"), hevc_encode);
     }
 
     #[test]

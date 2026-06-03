@@ -157,6 +157,10 @@ const LAN_ENCODE_VIDEOTOOLBOX_HEVC_CAPABILITY: &str = "videotoolbox_hevc";
 #[cfg(target_os = "macos")]
 const LAN_DECODE_VIDEOTOOLBOX_CAPABILITY: &str = "videotoolbox";
 #[cfg(target_os = "macos")]
+const LAN_DECODE_VIDEOTOOLBOX_H264_CAPABILITY: &str = "decode.videotoolbox_h264";
+#[cfg(target_os = "macos")]
+const LAN_DECODE_VIDEOTOOLBOX_HEVC_CAPABILITY: &str = "decode.videotoolbox_hevc";
+#[cfg(target_os = "macos")]
 const LAN_RENDER_MACOS_NATIVE_CAPABILITY: &str = "macos_native_render";
 const LAN_MEDIA_SENDER_MAX_CONSECUTIVE_FRAME_ERRORS: u32 = 8;
 
@@ -3070,6 +3074,7 @@ fn lan_media_capabilities_with_input_control(input_control_available: bool) -> V
 struct MacosLanMediaCapabilityProbe {
     videotoolbox_h264_encoder: bool,
     videotoolbox_hevc_encoder: bool,
+    videotoolbox_h264_decoder: bool,
     videotoolbox_hevc_decoder: bool,
 }
 
@@ -3094,6 +3099,8 @@ fn probe_macos_lan_media_capabilities() -> MacosLanMediaCapabilityProbe {
             640, 480, 30,
         )
         .is_ok(),
+        videotoolbox_h264_decoder: videotoolbox_decoder_enabled()
+            && mrd_codec_videotoolbox::VideoToolboxH264Decoder::new().is_ok(),
         videotoolbox_hevc_decoder: videotoolbox_decoder_enabled()
             && mrd_codec_videotoolbox::VideoToolboxHevcDecoder::new().is_ok(),
     }
@@ -3114,7 +3121,13 @@ fn macos_lan_media_capabilities_from_probe(probe: MacosLanMediaCapabilityProbe) 
         capabilities.push(LAN_ENCODE_VIDEOTOOLBOX_HEVC_CAPABILITY.to_string());
         capabilities.push(LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY.to_string());
     }
+    if probe.videotoolbox_h264_decoder {
+        capabilities.push(LAN_DECODE_VIDEOTOOLBOX_H264_CAPABILITY.to_string());
+    }
     if probe.videotoolbox_hevc_decoder {
+        capabilities.push(LAN_DECODE_VIDEOTOOLBOX_HEVC_CAPABILITY.to_string());
+    }
+    if probe.videotoolbox_h264_decoder && probe.videotoolbox_hevc_decoder {
         capabilities.push(LAN_DECODE_VIDEOTOOLBOX_CAPABILITY.to_string());
     }
     capabilities
@@ -3475,6 +3488,7 @@ fn missing_profile_receiver_media_capabilities(
                 &[
                     "decode.nvdec",
                     "nvdec",
+                    "decode.videotoolbox_h264",
                     "decode.videotoolbox",
                     "videotoolbox",
                     "decode.linux_h264",
@@ -3495,9 +3509,9 @@ fn missing_profile_receiver_media_capabilities(
                     "decode.nvdec_hevc",
                     "nvdec_hevc",
                     "nvdec_hevc_d3d11_shared",
+                    "decode.videotoolbox_hevc",
                     "decode.videotoolbox",
                     "videotoolbox",
-                    "decode.videotoolbox_hevc",
                     "decode.linux_hevc",
                     "linux_hevc",
                     "decode.ffmpeg_hevc",
@@ -10584,6 +10598,16 @@ mod tests {
             );
             assert_eq!(
                 peer.media_capabilities
+                    .contains(&LAN_DECODE_VIDEOTOOLBOX_H264_CAPABILITY.to_string()),
+                probe.videotoolbox_h264_decoder
+            );
+            assert_eq!(
+                peer.media_capabilities
+                    .contains(&LAN_DECODE_VIDEOTOOLBOX_HEVC_CAPABILITY.to_string()),
+                probe.videotoolbox_hevc_decoder
+            );
+            assert_eq!(
+                peer.media_capabilities
                     .contains(&LAN_DECODE_VIDEOTOOLBOX_CAPABILITY.to_string()),
                 probe.videotoolbox_hevc_decoder
             );
@@ -10661,6 +10685,7 @@ mod tests {
             macos_lan_media_capabilities_from_probe(MacosLanMediaCapabilityProbe {
                 videotoolbox_h264_encoder: false,
                 videotoolbox_hevc_encoder: false,
+                videotoolbox_h264_decoder: false,
                 videotoolbox_hevc_decoder: false,
             });
         assert!(without_videotoolbox.contains(&LAN_CAPTURE_MACOS_CAPABILITY.to_string()));
@@ -10674,17 +10699,48 @@ mod tests {
         assert!(
             !without_videotoolbox.contains(&LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY.to_string())
         );
+        assert!(
+            !without_videotoolbox.contains(&LAN_DECODE_VIDEOTOOLBOX_H264_CAPABILITY.to_string())
+        );
+        assert!(
+            !without_videotoolbox.contains(&LAN_DECODE_VIDEOTOOLBOX_HEVC_CAPABILITY.to_string())
+        );
         assert!(!without_videotoolbox.contains(&LAN_DECODE_VIDEOTOOLBOX_CAPABILITY.to_string()));
+
+        let h264_decode_only =
+            macos_lan_media_capabilities_from_probe(MacosLanMediaCapabilityProbe {
+                videotoolbox_h264_encoder: false,
+                videotoolbox_hevc_encoder: false,
+                videotoolbox_h264_decoder: true,
+                videotoolbox_hevc_decoder: false,
+            });
+        assert!(h264_decode_only.contains(&LAN_DECODE_VIDEOTOOLBOX_H264_CAPABILITY.to_string()));
+        assert!(!h264_decode_only.contains(&LAN_DECODE_VIDEOTOOLBOX_HEVC_CAPABILITY.to_string()));
+        assert!(!h264_decode_only.contains(&LAN_DECODE_VIDEOTOOLBOX_CAPABILITY.to_string()));
+
+        let hevc_decode_only =
+            macos_lan_media_capabilities_from_probe(MacosLanMediaCapabilityProbe {
+                videotoolbox_h264_encoder: false,
+                videotoolbox_hevc_encoder: false,
+                videotoolbox_h264_decoder: false,
+                videotoolbox_hevc_decoder: true,
+            });
+        assert!(!hevc_decode_only.contains(&LAN_DECODE_VIDEOTOOLBOX_H264_CAPABILITY.to_string()));
+        assert!(hevc_decode_only.contains(&LAN_DECODE_VIDEOTOOLBOX_HEVC_CAPABILITY.to_string()));
+        assert!(!hevc_decode_only.contains(&LAN_DECODE_VIDEOTOOLBOX_CAPABILITY.to_string()));
 
         let with_videotoolbox =
             macos_lan_media_capabilities_from_probe(MacosLanMediaCapabilityProbe {
                 videotoolbox_h264_encoder: true,
                 videotoolbox_hevc_encoder: true,
+                videotoolbox_h264_decoder: true,
                 videotoolbox_hevc_decoder: true,
             });
         assert!(with_videotoolbox.contains(&LAN_ENCODE_VIDEOTOOLBOX_H264_CAPABILITY.to_string()));
         assert!(with_videotoolbox.contains(&LAN_ENCODE_VIDEOTOOLBOX_HEVC_CAPABILITY.to_string()));
         assert!(with_videotoolbox.contains(&LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY.to_string()));
+        assert!(with_videotoolbox.contains(&LAN_DECODE_VIDEOTOOLBOX_H264_CAPABILITY.to_string()));
+        assert!(with_videotoolbox.contains(&LAN_DECODE_VIDEOTOOLBOX_HEVC_CAPABILITY.to_string()));
         assert!(with_videotoolbox.contains(&LAN_DECODE_VIDEOTOOLBOX_CAPABILITY.to_string()));
     }
 
@@ -12244,6 +12300,23 @@ mod tests {
     }
 
     #[test]
+    fn selected_h264_profile_accepts_macos_videotoolbox_h264_receiver() {
+        ensure_peer_can_receive_selected_media(
+            "mac-controller",
+            &MediaProfile {
+                width: 2560,
+                height: 1440,
+                fps: 144,
+                bitrate_mbps: 80,
+                codec: "H264".to_string(),
+                ..MediaProfile::default()
+            },
+            &["decode.videotoolbox_h264".to_string()],
+        )
+        .expect("macOS VideoToolbox H.264 receiver should pass H.264 selected profile preflight");
+    }
+
+    #[test]
     fn selected_hevc_profile_accepts_macos_videotoolbox_receiver() {
         ensure_peer_can_receive_selected_media(
             "mac-controller",
@@ -12255,7 +12328,7 @@ mod tests {
                 codec: "HEVC".to_string(),
                 ..MediaProfile::default()
             },
-            &["videotoolbox".to_string(), "software_decode".to_string()],
+            &["decode.videotoolbox_hevc".to_string()],
         )
         .expect("macOS VideoToolbox receiver should pass HEVC selected profile preflight");
     }
