@@ -315,6 +315,52 @@ describe("MatrixTestPage failure handling", () => {
     ).toBeNull();
   });
 
+  it("rejects generic VideoToolbox decode for HEVC cross-device matrix profiles", () => {
+    const peer = {
+      device_id: "mac-peer",
+      device_name: "Mac Peer",
+      device_type: "desktop",
+      ip: "192.168.1.52",
+      discovery_port: 21116,
+      p2p_control_addr: "192.168.1.52:21116",
+      transports: [
+        "quic",
+        "quic_datagram",
+        "quic_datagram_2k144",
+        "quic_datagram_media_v3",
+        "media_profile_control_v1",
+      ],
+      protocol_version: 1,
+      service_build_id: "test-build",
+      media_protocol_version: 3,
+      media_capabilities: [
+        "quic_datagram_media_v3",
+        "macos_capture",
+        "videotoolbox_hevc",
+        "decode.videotoolbox",
+        "media.hevc_main_420_8bit",
+        "macos_native_render",
+      ],
+      age_ms: 20,
+      p2p_available: true,
+    };
+
+    const skipReason = crossDevicePeerSkipReason(peer, "quic", {
+      width: 2560,
+      height: 1440,
+      fps: 144,
+      bitrate_mbps: 40,
+      codec: "hevc",
+      codec_profile: "main",
+      bit_depth: 8,
+      chroma_subsampling: "4:2:0",
+      pixel_format: "nv12",
+      hdr_enabled: false,
+    });
+
+    expect(skipReason).toContain("decode.videotoolbox_hevc");
+  });
+
   it("formats matrix media profiles with HEVC codec and chroma metadata", () => {
     expect(
       formatMatrixMediaProfile({

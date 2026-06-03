@@ -776,8 +776,8 @@ function peerSupportsMacosVideoToolboxProfile(
       : ["videotoolbox_h264", "encode.videotoolbox_h264"];
   const codecDecoder =
     codec === "hevc"
-      ? ["decode.videotoolbox_hevc", "videotoolbox", "decode.videotoolbox"]
-      : ["decode.videotoolbox_h264", "videotoolbox", "decode.videotoolbox"];
+      ? ["decode.videotoolbox_hevc"]
+      : ["decode.videotoolbox_h264"];
   const capabilityGroups = [
     ["macos_capture", "capture.macos"],
     codecEncoder,

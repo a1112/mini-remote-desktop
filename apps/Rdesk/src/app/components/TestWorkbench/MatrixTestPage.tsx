@@ -1192,7 +1192,7 @@ export function crossDevicePeerSkipReason(
             capabilities: [
               ["macos_capture", "capture.macos"],
               ["videotoolbox_hevc", "encode.videotoolbox_hevc"],
-              ["decode.videotoolbox_hevc", "videotoolbox", "decode.videotoolbox"],
+              ["decode.videotoolbox_hevc"],
               ["media.hevc_main_420_8bit"],
               ["macos_native_render", "render.macos"],
             ],
@@ -1213,7 +1213,7 @@ export function crossDevicePeerSkipReason(
             capabilities: [
               ["macos_capture", "capture.macos"],
               ["videotoolbox_h264", "encode.videotoolbox_h264"],
-              ["decode.videotoolbox_h264", "videotoolbox", "decode.videotoolbox"],
+              ["decode.videotoolbox_h264"],
               ["macos_native_render", "render.macos"],
             ],
           },

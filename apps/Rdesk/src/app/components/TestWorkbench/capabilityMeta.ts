@@ -130,16 +130,12 @@ function capabilityAliases(key: CapabilityKey, id: string): string[] {
     return [
       "videotoolbox_h264",
       "decode.videotoolbox_h264",
-      "videotoolbox",
-      "decode.videotoolbox",
     ];
   }
   if (key === "available_decoders" && id === "videotoolbox_hevc") {
     return [
       "videotoolbox_hevc",
       "decode.videotoolbox_hevc",
-      "videotoolbox",
-      "decode.videotoolbox",
     ];
   }
   return [id];
