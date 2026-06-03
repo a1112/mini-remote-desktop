@@ -587,8 +587,27 @@ impl TestOrchestrator {
             "e2e.local" => Ok(TestChain::NvencNvdec),
             "e2e.macos_local" => Ok(TestChain::Custom {
                 capture: CaptureType::Macos,
-                encoder: EncoderType::VideoToolboxH264,
-                decoder: DecoderType::Software,
+                encoder: match config
+                    .encoder_type
+                    .as_deref()
+                    .unwrap_or("videotoolbox_hevc")
+                {
+                    "videotoolbox_hevc" | "hevc" => EncoderType::VideoToolboxHevc,
+                    "videotoolbox_h264" | "videotoolbox" | "h264" => EncoderType::VideoToolboxH264,
+                    "openh264" | "software_h264" | "h264_software" | "software-h264"
+                    | "h264-software" | "sw_h264" => EncoderType::OpenH264,
+                    other => anyhow::bail!("Unsupported macOS E2E encoder: {}", other),
+                },
+                decoder: match config.decoder_type.as_deref().unwrap_or("videotoolbox") {
+                    "videotoolbox" => DecoderType::VideoToolbox,
+                    "software" | "software_h264" | "h264_software" | "software-h264"
+                    | "h264-software" | "openh264" | "software_hevc" | "hevc_software"
+                    | "software-hevc" | "hevc-software" => DecoderType::Software,
+                    "ffmpeg_h264" | "ffmpeg-h264" => DecoderType::FfmpegH264,
+                    "ffmpeg_hevc" | "ffmpeg-hevc" => DecoderType::FfmpegHevc,
+                    "none" => DecoderType::None,
+                    other => anyhow::bail!("Unsupported macOS E2E decoder: {}", other),
+                },
             }),
             #[cfg(target_os = "linux")]
             "e2e.linux_local" => Ok(TestChain::Custom {
@@ -621,9 +640,19 @@ impl TestOrchestrator {
                 encoder: EncoderType::VideoToolboxH264,
                 decoder: DecoderType::None,
             }),
+            "encode.videotoolbox_hevc" => Ok(TestChain::Custom {
+                capture: CaptureType::Synthetic,
+                encoder: EncoderType::VideoToolboxHevc,
+                decoder: DecoderType::None,
+            }),
             "decode.videotoolbox_h264" => Ok(TestChain::Custom {
                 capture: CaptureType::Synthetic,
                 encoder: EncoderType::VideoToolboxH264,
+                decoder: DecoderType::VideoToolbox,
+            }),
+            "decode.videotoolbox_hevc" => Ok(TestChain::Custom {
+                capture: CaptureType::Synthetic,
+                encoder: EncoderType::VideoToolboxHevc,
                 decoder: DecoderType::VideoToolbox,
             }),
             "custom" | "matrix" => Ok(TestChain::Custom {
@@ -653,6 +682,7 @@ impl TestOrchestrator {
                     Some("videotoolbox_h264") | Some("videotoolbox") => {
                         EncoderType::VideoToolboxH264
                     }
+                    Some("videotoolbox_hevc") => EncoderType::VideoToolboxHevc,
                     Some(other) => {
                         anyhow::bail!("Unsupported encoder for {}: {}", scenario_id, other)
                     }
@@ -807,6 +837,18 @@ impl TestOrchestrator {
                 },
             },
             TestScenario {
+                scenario_id: "encode.videotoolbox_hevc".to_string(),
+                scenario_kind: ScenarioKind::Encode,
+                component_scope: vec!["videotoolbox".to_string()],
+                display_name: "VideoToolbox HEVC 编码测试".to_string(),
+                description: "测试 macOS VideoToolbox HEVC 硬件编码器性能".to_string(),
+                supports_matrix: true,
+                default_config: TestConfigData {
+                    encoder_type: Some("videotoolbox_hevc".to_string()),
+                    ..Default::default()
+                },
+            },
+            TestScenario {
                 scenario_id: "decode.nvdec_h264".to_string(),
                 scenario_kind: ScenarioKind::Decode,
                 component_scope: vec!["nvdec".to_string()],
@@ -844,6 +886,19 @@ impl TestOrchestrator {
                 description: "测试 macOS VideoToolbox H.264 硬件解码器性能".to_string(),
                 supports_matrix: true,
                 default_config: TestConfigData {
+                    decoder_type: Some("videotoolbox".to_string()),
+                    ..Default::default()
+                },
+            },
+            TestScenario {
+                scenario_id: "decode.videotoolbox_hevc".to_string(),
+                scenario_kind: ScenarioKind::Decode,
+                component_scope: vec!["videotoolbox".to_string()],
+                display_name: "VideoToolbox HEVC 解码测试".to_string(),
+                description: "测试 macOS VideoToolbox HEVC 硬件解码器性能".to_string(),
+                supports_matrix: true,
+                default_config: TestConfigData {
+                    encoder_type: Some("videotoolbox_hevc".to_string()),
                     decoder_type: Some("videotoolbox".to_string()),
                     ..Default::default()
                 },
@@ -1030,6 +1085,9 @@ impl TestOrchestrator {
         {
             if mrd_codec_videotoolbox::VideoToolboxH264Encoder::new(640, 480, 30).is_ok() {
                 available_encoders.push("videotoolbox_h264".to_string());
+            }
+            if mrd_codec_videotoolbox::VideoToolboxHevcEncoder::new(640, 480, 30).is_ok() {
+                available_encoders.push("videotoolbox_hevc".to_string());
             }
         }
 
@@ -3136,11 +3194,14 @@ fn scenario_supported_on_current_platform(scenario_id: &str) -> bool {
         | "e2e.local" => cfg!(windows),
         "render.probe" | "render.d3d12" | "render.opengl" => cfg!(windows),
         "single_window.local" => cfg!(windows) || cfg!(target_os = "macos"),
-        "capture.macos" | "encode.videotoolbox_h264" | "e2e.macos_local" => {
-            cfg!(target_os = "macos")
-        }
+        "capture.macos"
+        | "encode.videotoolbox_h264"
+        | "encode.videotoolbox_hevc"
+        | "e2e.macos_local" => cfg!(target_os = "macos"),
         "capture.linux" | "decode.linux_h264" | "e2e.linux_local" => cfg!(target_os = "linux"),
-        "decode.videotoolbox_h264" => cfg!(target_os = "macos") && videotoolbox_decoder_enabled(),
+        "decode.videotoolbox_h264" | "decode.videotoolbox_hevc" => {
+            cfg!(target_os = "macos") && videotoolbox_decoder_enabled()
+        }
         "encode.openh264" | "custom" | "matrix" => true,
         _ => true,
     }
@@ -3173,7 +3234,10 @@ fn encoder_supported_on_current_platform(encoder_type: &str) -> bool {
             | "hevc_main10"
             | "hevc-main10"
     ) && (cfg!(windows) || cfg!(target_os = "linux"))
-        || matches!(encoder_type, "videotoolbox_h264" | "videotoolbox") && cfg!(target_os = "macos")
+        || matches!(
+            encoder_type,
+            "videotoolbox_h264" | "videotoolbox_hevc" | "videotoolbox"
+        ) && cfg!(target_os = "macos")
 }
 
 fn decoder_supported_on_current_platform(decoder_type: &str) -> bool {
@@ -3886,9 +3950,8 @@ fn derive_test_classification(
     };
     let encode_accel = match encoder {
         "none" => TestAccelerationMode::None,
-        "nvenc_h264" | "nvenc_hevc" | "nvenc_hevc_main10" | "nvenc_av1" | "videotoolbox_h264" => {
-            TestAccelerationMode::Hardware
-        }
+        "nvenc_h264" | "nvenc_hevc" | "nvenc_hevc_main10" | "nvenc_av1" | "videotoolbox_h264"
+        | "videotoolbox_hevc" => TestAccelerationMode::Hardware,
         "openh264" => TestAccelerationMode::Software,
         _ => TestAccelerationMode::Unknown,
     };
@@ -4522,6 +4585,9 @@ mod tests {
         assert!(scenarios
             .iter()
             .any(|scenario| scenario.scenario_id == "decode.videotoolbox_h264"));
+        assert!(scenarios
+            .iter()
+            .any(|scenario| scenario.scenario_id == "decode.videotoolbox_hevc"));
         assert!(!scenarios
             .iter()
             .any(|scenario| scenario.scenario_id == "capture.dxgi"));
@@ -4654,7 +4720,14 @@ mod tests {
 
         let ffmpeg_hevc_config = TestConfigData {
             capture_type: Some("synthetic".to_string()),
-            encoder_type: Some("nvenc_hevc".to_string()),
+            encoder_type: Some(
+                if cfg!(target_os = "macos") {
+                    "videotoolbox_hevc"
+                } else {
+                    "nvenc_hevc"
+                }
+                .to_string(),
+            ),
             decoder_type: Some("ffmpeg_hevc".to_string()),
             ..Default::default()
         };
@@ -4720,6 +4793,24 @@ mod tests {
                     capture: CaptureType::Macos,
                     encoder: EncoderType::VideoToolboxH264,
                     decoder: DecoderType::Software,
+                }
+            );
+
+            let videotoolbox_hevc_config = TestConfigData {
+                capture_type: Some("macos".to_string()),
+                encoder_type: Some("videotoolbox_hevc".to_string()),
+                decoder_type: Some("videotoolbox".to_string()),
+                ..Default::default()
+            };
+
+            assert_eq!(
+                orchestrator
+                    .scenario_to_chain("matrix", &videotoolbox_hevc_config)
+                    .unwrap(),
+                TestChain::Custom {
+                    capture: CaptureType::Macos,
+                    encoder: EncoderType::VideoToolboxHevc,
+                    decoder: DecoderType::VideoToolbox,
                 }
             );
         }

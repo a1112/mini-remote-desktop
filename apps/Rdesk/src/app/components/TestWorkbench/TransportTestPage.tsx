@@ -321,7 +321,7 @@ export function TransportTestPage() {
     );
     const encoder = chooseCapability(
       capture === "macos"
-        ? ["videotoolbox_h264", "openh264"]
+        ? ["videotoolbox_hevc", "videotoolbox_h264", "openh264"]
         : capture === "linux"
           ? ["nvenc_hevc", "nvenc_h264", "openh264"]
           : ["nvenc_hevc", "nvenc_h264", "openh264"],

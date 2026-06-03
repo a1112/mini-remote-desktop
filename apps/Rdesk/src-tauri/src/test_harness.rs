@@ -23,7 +23,10 @@ use mrd_capture_pipewire::PipewireScreenCapture;
 #[cfg(windows)]
 use mrd_capture_winrt::WinrtCapture;
 #[cfg(target_os = "macos")]
-use mrd_codec_videotoolbox::{VideoToolboxH264Decoder, VideoToolboxH264Encoder};
+use mrd_codec_videotoolbox::{
+    VideoToolboxH264Decoder, VideoToolboxH264Encoder, VideoToolboxHevcDecoder,
+    VideoToolboxHevcEncoder,
+};
 use mrd_decode_nvdec::{NvdecDecoder, NvdecOutputMode};
 use mrd_encode_nvenc::{NvencH264Encoder, NvencHevcEncoder};
 #[cfg(any(windows, target_os = "linux"))]
@@ -115,6 +118,7 @@ pub enum EncoderType {
     OpenH264,
     SoftwareVvc,
     VideoToolboxH264,
+    VideoToolboxHevc,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2147,7 +2151,10 @@ impl TestHarness {
                 ..
             } => VideoCodec::Av1,
             TestChain::Custom {
-                encoder: EncoderType::NvencHevc | EncoderType::NvencHevcMain10,
+                encoder:
+                    EncoderType::NvencHevc
+                    | EncoderType::NvencHevcMain10
+                    | EncoderType::VideoToolboxHevc,
                 ..
             } => VideoCodec::Hevc,
             TestChain::Custom {
@@ -2628,6 +2635,57 @@ impl TestHarness {
                         DecoderType::Nvdec => {
                             return Err(anyhow::anyhow!(
                                 "VideoToolbox encoder with NVDEC decoder is not a macOS-native path"
+                            ));
+                        }
+                    }
+                }
+                EncoderType::VideoToolboxHevc => {
+                    let enc = create_videotoolbox_hevc_encoder(
+                        width,
+                        height,
+                        fps,
+                        config.bitrate.unwrap_or(low_latency_bitrate),
+                    )?;
+                    match decoder {
+                        DecoderType::None => (Some(enc), None, false),
+                        DecoderType::Software => {
+                            let dec = mrd_decode::create_decoder("software_hevc").map_err(|e| {
+                                anyhow::anyhow!("software HEVC decoder init failed: {:?}", e)
+                            })?;
+                            (Some(enc), Some(PipelineDecoder::Software(dec)), true)
+                        }
+                        DecoderType::FfmpegHevc => {
+                            let dec = mrd_decode::create_decoder("ffmpeg_hevc").map_err(|e| {
+                                anyhow::anyhow!("FFmpeg HEVC decoder init failed: {:?}", e)
+                            })?;
+                            (Some(enc), Some(PipelineDecoder::Software(dec)), true)
+                        }
+                        DecoderType::FfmpegH264 => {
+                            return Err(anyhow::anyhow!(
+                                "FFmpeg H.264 decoder cannot decode VideoToolbox HEVC output"
+                            ));
+                        }
+                        DecoderType::FfmpegVvc => {
+                            return Err(anyhow::anyhow!(
+                                "FFmpeg VVC decoder cannot decode VideoToolbox HEVC output"
+                            ));
+                        }
+                        DecoderType::VideoToolbox => {
+                            (Some(enc), Some(create_videotoolbox_hevc_decoder()?), true)
+                        }
+                        DecoderType::LinuxH264 => {
+                            return Err(anyhow::anyhow!(
+                                "Linux H.264 hardware decoder cannot decode VideoToolbox HEVC output"
+                            ));
+                        }
+                        DecoderType::LinuxHevc | DecoderType::LinuxHevcMain10 => {
+                            return Err(anyhow::anyhow!(
+                                "Linux HEVC hardware decode is not a macOS VideoToolbox local path"
+                            ));
+                        }
+                        DecoderType::Nvdec => {
+                            return Err(anyhow::anyhow!(
+                                "VideoToolbox HEVC encoder with NVDEC decoder is not a macOS-native path"
                             ));
                         }
                     }
@@ -3843,6 +3901,26 @@ fn create_videotoolbox_h264_encoder(
     }
 }
 
+fn create_videotoolbox_hevc_encoder(
+    width: usize,
+    height: usize,
+    fps: u32,
+    bitrate: u32,
+) -> Result<Box<dyn VideoEncoder>> {
+    #[cfg(target_os = "macos")]
+    {
+        let encoder = VideoToolboxHevcEncoder::new_with_bitrate(width, height, fps, bitrate)
+            .map_err(|e| anyhow::anyhow!("VideoToolbox HEVC encoder init failed: {:?}", e))?;
+        Ok(Box::new(encoder) as Box<dyn VideoEncoder>)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (width, height, fps, bitrate);
+        anyhow::bail!("VideoToolbox HEVC encoder is only available on macOS")
+    }
+}
+
 fn create_videotoolbox_h264_decoder() -> Result<PipelineDecoder> {
     #[cfg(target_os = "macos")]
     {
@@ -3858,6 +3936,24 @@ fn create_videotoolbox_h264_decoder() -> Result<PipelineDecoder> {
     #[cfg(not(target_os = "macos"))]
     {
         anyhow::bail!("VideoToolbox H.264 decoder is only available on macOS")
+    }
+}
+
+fn create_videotoolbox_hevc_decoder() -> Result<PipelineDecoder> {
+    #[cfg(target_os = "macos")]
+    {
+        if !videotoolbox_decoder_enabled() {
+            anyhow::bail!("VideoToolbox decoder is disabled by MRD_DISABLE_VIDEOTOOLBOX_DECODER");
+        }
+
+        let decoder = VideoToolboxHevcDecoder::new()
+            .map_err(|e| anyhow::anyhow!("VideoToolbox HEVC decoder init failed: {:?}", e))?;
+        Ok(PipelineDecoder::VideoToolbox(Box::new(decoder)))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        anyhow::bail!("VideoToolbox HEVC decoder is only available on macOS")
     }
 }
 
@@ -3897,6 +3993,7 @@ fn comparison_labels(chain: &TestChain) -> (&'static str, &'static str) {
                 EncoderType::OpenH264 => "h264-software",
                 EncoderType::SoftwareVvc => "vvc-software",
                 EncoderType::NvencH264 | EncoderType::VideoToolboxH264 => "h264",
+                EncoderType::VideoToolboxHevc => "hevc",
             };
             (pipeline, codec)
         }
@@ -5619,6 +5716,23 @@ mod tests {
     }
 
     #[test]
+    fn videotoolbox_hevc_encoder_alias_maps_to_hevc() {
+        assert_eq!(
+            parse_harness_encoder_type(Some("videotoolbox_hevc")),
+            EncoderType::VideoToolboxHevc
+        );
+        assert!(!encoder_allows_zero_copy(&EncoderType::VideoToolboxHevc));
+        assert_eq!(
+            comparison_labels(&TestChain::Custom {
+                capture: CaptureType::Synthetic,
+                encoder: EncoderType::VideoToolboxHevc,
+                decoder: DecoderType::None,
+            }),
+            ("capture-encode", "hevc")
+        );
+    }
+
+    #[test]
     fn software_vvc_encoder_aliases_map_to_vvenc() {
         assert_eq!(
             parse_harness_encoder_type(Some("software_vvc")),
@@ -6436,6 +6550,7 @@ mod tests {
                 EncoderType::NvencHevcMain10
             }
             Some("videotoolbox_h264") | Some("videotoolbox") => EncoderType::VideoToolboxH264,
+            Some("videotoolbox_hevc") => EncoderType::VideoToolboxHevc,
             _ => EncoderType::NvencH264,
         }
     }

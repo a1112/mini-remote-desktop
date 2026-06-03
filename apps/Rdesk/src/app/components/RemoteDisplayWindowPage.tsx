@@ -333,6 +333,7 @@ const encoderOptions: Option<EncoderType>[] = [
   { value: "nvenc_hevc", label: "NVENC HEVC Main" },
   { value: "nvenc_hevc_main10", label: "NVENC HEVC Main10" },
   { value: "videotoolbox_h264", label: "VideoToolbox H.264" },
+  { value: "videotoolbox_hevc", label: "VideoToolbox HEVC" },
   { value: "openh264", label: "OpenH264" },
   { value: "nvenc_av1", label: "NVENC AV1" },
 ];
@@ -1169,7 +1170,7 @@ function isH264PreviewEncoder(encoder: EncoderType) {
 }
 
 export function webRtcPreviewCodecForEncoder(encoder: EncoderType): "h264" | "hevc" | "av1" | null {
-  if (encoder === "nvenc_hevc") return "hevc";
+  if (encoder === "nvenc_hevc" || encoder === "videotoolbox_hevc") return "hevc";
   if (encoder === "nvenc_av1") return "av1";
   if (isH264PreviewEncoder(encoder)) return "h264";
   return null;
@@ -1611,12 +1612,15 @@ function resolveLocalWebViewPlan({
   }
 
   const hevcPreviewAllowed =
-    hostOs === "windows" &&
-    capabilities?.available_encoders?.includes("nvenc_hevc") &&
-    (webPreviewEngine === "webcodecs" || hevcWebRtcSupported);
+    (hostOs === "windows" &&
+      capabilities?.available_encoders?.includes("nvenc_hevc") &&
+      (webPreviewEngine === "webcodecs" || hevcWebRtcSupported)) ||
+    (hostOs === "macos" &&
+      webPreviewEngine === "webcodecs" &&
+      capabilities?.available_encoders?.includes("videotoolbox_hevc"));
   const preferredEncoders: EncoderType[] =
     hostOs === "macos"
-      ? ["openh264", "videotoolbox_h264"]
+      ? [...(hevcPreviewAllowed ? (["videotoolbox_hevc"] as const) : []), "videotoolbox_h264", "openh264"]
       : hostOs === "windows"
         ? ["nvenc_h264", ...(hevcPreviewAllowed ? (["nvenc_hevc"] as const) : []), "openh264"]
         : ["openh264"];
@@ -1626,13 +1630,14 @@ function resolveLocalWebViewPlan({
     hostOs === "macos" ? ["videotoolbox_h264"] : ["nvenc_h264"];
   const hardwarePreviewEncoders: EncoderType[] = [
     ...hardwareH264Encoders,
+    ...(hevcPreviewAllowed && hostOs === "macos" ? (["videotoolbox_hevc"] as const) : []),
     ...(hevcPreviewAllowed ? (["nvenc_hevc"] as const) : []),
   ];
   const requiresHardwarePreviewEncoder = targetFpsNumber > 30;
   const selectedPreviewCodec =
     webPreviewEngine === "webrtc"
       ? webRtcPreviewCodecForEncoder(encoder)
-      : encoder === "nvenc_hevc"
+      : encoder === "nvenc_hevc" || encoder === "videotoolbox_hevc"
         ? "hevc"
         : isH264PreviewEncoder(encoder)
           ? "h264"
@@ -2300,7 +2305,9 @@ export function RemoteDisplayWindowPage() {
     const targetFps = Number(fps);
     const needsHardwarePreviewEncoder = Number.isFinite(targetFps) && targetFps > 30;
     const allowed = visibleEncoderOptions.filter((option) => {
-      const webCodecsHevc = webPreviewEngine === "webcodecs" && option.value === "nvenc_hevc";
+      const webCodecsHevc =
+        webPreviewEngine === "webcodecs" &&
+        (option.value === "nvenc_hevc" || option.value === "videotoolbox_hevc");
       const webRtcHevc =
         webPreviewEngine === "webrtc" &&
         option.value === "nvenc_hevc" &&
@@ -2308,7 +2315,12 @@ export function RemoteDisplayWindowPage() {
       const hevcPreview = webCodecsHevc || webRtcHevc;
       if (!isH264PreviewEncoder(option.value) && !hevcPreview) return false;
       if (!needsHardwarePreviewEncoder) return true;
-      return option.value === "nvenc_h264" || option.value === "videotoolbox_h264" || hevcPreview;
+      return (
+        option.value === "nvenc_h264" ||
+        option.value === "videotoolbox_h264" ||
+        option.value === "videotoolbox_hevc" ||
+        hevcPreview
+      );
     });
     return allowed.length > 0 ? allowed : visibleEncoderOptions;
   }, [fps, visibleEncoderOptions, webPreviewEngine]);
@@ -2390,7 +2402,7 @@ export function RemoteDisplayWindowPage() {
     if (!capabilities?.available_encoders?.length) return true;
     const hardwareEncoders =
       hostOs === "macos"
-        ? ["videotoolbox_h264"]
+        ? ["videotoolbox_h264", "videotoolbox_hevc"]
         : webPreviewEngine === "webcodecs"
           ? ["nvenc_h264", "nvenc_hevc"]
           : browserSupportsHevcWebrtcVideo()
@@ -3392,8 +3404,8 @@ export function RemoteDisplayWindowPage() {
         pickAvailable(
           value,
           capabilities.available_encoders,
-          ["videotoolbox_h264", "openh264"],
-          "videotoolbox_h264"
+          ["videotoolbox_hevc", "videotoolbox_h264", "openh264"],
+          "videotoolbox_hevc"
         )
       );
       setDecoder((value) =>

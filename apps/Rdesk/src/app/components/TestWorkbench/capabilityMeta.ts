@@ -24,6 +24,7 @@ const PLATFORM_TAGS: Record<string, string> = {
   macos: "macOS",
   metal: "macOS",
   videotoolbox_h264: "macOS",
+  videotoolbox_hevc: "macOS",
   videotoolbox: "macOS",
   linux: "Linux",
   pipewire: "Linux",

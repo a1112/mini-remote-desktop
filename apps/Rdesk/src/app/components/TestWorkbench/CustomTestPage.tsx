@@ -130,6 +130,12 @@ const ENCODER_OPTIONS: EncoderOption[] = [
     description: "macOS VideoToolbox - Apple 硬件 H.264 编码",
     icon: <Zap className="h-5 w-5" />,
   },
+  {
+    id: "videotoolbox_hevc",
+    name: "VideoToolbox HEVC",
+    description: "macOS VideoToolbox - Apple 硬件 HEVC 编码",
+    icon: <Zap className="h-5 w-5" />,
+  },
 ];
 
 const DECODER_OPTIONS: DecoderOption[] = [
@@ -206,7 +212,11 @@ const TRANSPORT_OPTIONS: TransportOption[] = [
 ];
 
 function isHevcEncoder(encoder: EncoderId): boolean {
-  return encoder === "nvenc_hevc" || encoder === "nvenc_hevc_main10";
+  return encoder === "nvenc_hevc" || encoder === "nvenc_hevc_main10" || encoder === "videotoolbox_hevc";
+}
+
+function isH264Encoder(encoder: EncoderId): boolean {
+  return encoder === "nvenc_h264" || encoder === "openh264" || encoder === "videotoolbox_h264";
 }
 
 function resolveRendererType(
@@ -215,7 +225,12 @@ function resolveRendererType(
   decoder: DecoderId,
   capabilities: EnvironmentSnapshot | null
 ): RendererId {
-  if (capture === "macos" || encoder === "videotoolbox_h264" || decoder === "videotoolbox") {
+  if (
+    capture === "macos" ||
+    encoder === "videotoolbox_h264" ||
+    encoder === "videotoolbox_hevc" ||
+    decoder === "videotoolbox"
+  ) {
     return "macos";
   }
   if (capture === "linux") {
@@ -381,7 +396,9 @@ export function CustomTestPage() {
         return "当前 GPU/驱动未暴露 NVENC AV1 编码能力。RTX 30 系通常支持 AV1 解码，但不支持 AV1 NVENC 编码。";
       }
       if (isHevcEncoder(selectedEncoder)) {
-        return "当前 GPU/驱动未暴露 NVENC HEVC 编码能力。";
+        return selectedEncoder === "videotoolbox_hevc"
+          ? "当前环境未暴露 VideoToolbox HEVC 编码能力。"
+          : "当前 GPU/驱动未暴露 NVENC HEVC 编码能力。";
       }
       return "当前环境未暴露所选编码器能力。";
     }
@@ -412,21 +429,24 @@ export function CustomTestPage() {
       return "NVENC HEVC Main10 请使用 Linux HEVC Main10 硬解路径。";
     }
     if (
-      (selectedEncoder === "nvenc_h264" ||
-        selectedEncoder === "openh264" ||
-        selectedEncoder === "videotoolbox_h264") &&
+      isH264Encoder(selectedEncoder) &&
       (selectedDecoder === "linux_hevc" || selectedDecoder === "linux_hevc_main10")
     ) {
       return "Linux HEVC 硬解不能解码 H.264 输出。";
     }
-    if (selectedEncoder === "videotoolbox_h264" && selectedDecoder === "nvdec") {
-      return "VideoToolbox H.264 是 macOS 原生路径，请选择 VideoToolbox、软件解码或 encode-only。";
+    if (
+      (selectedEncoder === "videotoolbox_h264" || selectedEncoder === "videotoolbox_hevc") &&
+      selectedDecoder === "nvdec"
+    ) {
+      return "VideoToolbox 是 macOS 原生路径，请选择 VideoToolbox、软件解码或 encode-only。";
     }
     if (
-      (selectedEncoder === "nvenc_av1" || isHevcEncoder(selectedEncoder)) &&
+      (selectedEncoder === "nvenc_av1" ||
+        selectedEncoder === "nvenc_hevc" ||
+        selectedEncoder === "nvenc_hevc_main10") &&
       selectedDecoder === "videotoolbox"
     ) {
-      return "VideoToolbox H.264 解码器不能解码 NVENC AV1/HEVC 输出。";
+      return "VideoToolbox 解码器不能解码 NVENC AV1/HEVC 输出。";
     }
     if (
       selectedEncoder === "software_vvc" &&

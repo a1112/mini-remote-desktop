@@ -67,11 +67,15 @@ interface MatrixOption {
 type HostOs = "windows" | "macos" | "linux" | "other";
 
 function isHevcEncoder(encoder?: TestConfig["encoder_type"]): boolean {
-  return encoder === "nvenc_hevc" || encoder === "nvenc_hevc_main10";
+  return encoder === "nvenc_hevc" || encoder === "nvenc_hevc_main10" || encoder === "videotoolbox_hevc";
 }
 
 function isVvcEncoder(encoder?: TestConfig["encoder_type"]): boolean {
   return encoder === "software_vvc";
+}
+
+function isH264Encoder(encoder?: TestConfig["encoder_type"]): boolean {
+  return encoder === "nvenc_h264" || encoder === "openh264" || encoder === "videotoolbox_h264";
 }
 
 const MATRIX_DIMENSIONS: MatrixDimension[] = [
@@ -99,6 +103,12 @@ const MATRIX_DIMENSIONS: MatrixDimension[] = [
       {
         id: "videotoolbox_h264",
         name: "VideoToolbox H.264",
+        enabled: false,
+        defaultEnabledOn: ["macos"],
+      },
+      {
+        id: "videotoolbox_hevc",
+        name: "VideoToolbox HEVC",
         enabled: false,
         defaultEnabledOn: ["macos"],
       },
@@ -256,7 +266,7 @@ function defaultEncodersForOs(os: HostOs): string[] {
   if (os === "windows") {
     return ["nvenc_h264", "nvenc_hevc", "nvenc_hevc_main10", "openh264", "nvenc_av1"];
   }
-  if (os === "macos") return ["videotoolbox_h264", "openh264"];
+  if (os === "macos") return ["videotoolbox_hevc", "videotoolbox_h264", "openh264"];
   return ["openh264"];
 }
 
@@ -561,6 +571,9 @@ function minimumExpectedFps(config: TestConfig, targetFps: number): number {
     if (config.encoder_type === "openh264") {
       return targetFps * 0.3;
     }
+    if (config.encoder_type === "videotoolbox_hevc") {
+      return targetFps * 0.8;
+    }
     if (config.encoder_type === "videotoolbox_h264") {
       return targetFps * 0.35;
     }
@@ -628,18 +641,16 @@ function unsupportedMatrixReason(config: TestConfig): string | null {
     return "D3D11 shared texture input requires direct render or NVENC GPU encoders";
   }
   if (isHevcEncoder(config.encoder_type) && config.decoder_type === "linux_h264") {
-    return "Linux H.264 hardware decoder cannot decode NVENC HEVC output";
+    return "Linux H.264 hardware decoder cannot decode HEVC output";
   }
   if (config.encoder_type === "nvenc_hevc_main10" && config.decoder_type === "linux_hevc") {
     return "NVENC HEVC Main10 requires the Linux HEVC Main10 decoder path";
   }
   if (isHevcEncoder(config.encoder_type) && config.decoder_type === "ffmpeg_h264") {
-    return "FFmpeg H.264 decoder cannot decode NVENC HEVC output";
+    return "FFmpeg H.264 decoder cannot decode HEVC output";
   }
   if (
-    (config.encoder_type === "nvenc_h264" ||
-      config.encoder_type === "openh264" ||
-      config.encoder_type === "videotoolbox_h264") &&
+    isH264Encoder(config.encoder_type) &&
     config.decoder_type === "ffmpeg_hevc"
   ) {
     return "FFmpeg HEVC decoder cannot decode H.264 output";
@@ -660,9 +671,7 @@ function unsupportedMatrixReason(config: TestConfig): string | null {
     return "Linux HEVC hardware decoder cannot decode NVENC AV1 output";
   }
   if (
-    (config.encoder_type === "nvenc_h264" ||
-      config.encoder_type === "openh264" ||
-      config.encoder_type === "videotoolbox_h264") &&
+    isH264Encoder(config.encoder_type) &&
     (config.decoder_type === "linux_hevc" || config.decoder_type === "linux_hevc_main10")
   ) {
     return "Linux HEVC hardware decoder cannot decode H.264 output";
@@ -691,14 +700,19 @@ function unsupportedMatrixReason(config: TestConfig): string | null {
   if (config.renderer_type === "opengl" && config.zero_copy) {
     return "OpenGL renderer requires CPU memory input";
   }
-  if (config.encoder_type === "videotoolbox_h264" && config.decoder_type === "nvdec") {
-    return "VideoToolbox H.264 output should use VideoToolbox, software, or encode-only decode modes";
+  if (
+    (config.encoder_type === "videotoolbox_h264" || config.encoder_type === "videotoolbox_hevc") &&
+    config.decoder_type === "nvdec"
+  ) {
+    return "VideoToolbox output should use VideoToolbox, software, or encode-only decode modes";
   }
   if (
-    (config.encoder_type === "nvenc_av1" || isHevcEncoder(config.encoder_type)) &&
+    (config.encoder_type === "nvenc_av1" ||
+      config.encoder_type === "nvenc_hevc" ||
+      config.encoder_type === "nvenc_hevc_main10") &&
     config.decoder_type === "videotoolbox"
   ) {
-    return "VideoToolbox decoder path is H.264-only in this matrix";
+    return "VideoToolbox decoder path is only wired for local VideoToolbox H.264/HEVC in this matrix";
   }
   if (
     isVvcEncoder(config.encoder_type) &&

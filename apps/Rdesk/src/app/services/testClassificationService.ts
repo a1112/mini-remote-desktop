@@ -281,6 +281,7 @@ function encodeAccelFromConfig(config: TestConfig): TestClassification["encode_a
     case "nvenc_hevc_main10":
     case "nvenc_av1":
     case "videotoolbox_h264":
+    case "videotoolbox_hevc":
       return "hardware";
     case "openh264":
     case "software_vvc":

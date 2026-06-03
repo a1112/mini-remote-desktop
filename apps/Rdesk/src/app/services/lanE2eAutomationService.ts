@@ -250,7 +250,9 @@ const REQUIRED_PLATFORM_MEDIA_CAPABILITY_PROFILES: RequiredPlatformMediaCapabili
     capabilities: [
       "macos_capture",
       "videotoolbox_h264",
+      "videotoolbox_hevc",
       "videotoolbox",
+      "media.hevc_main_420_8bit",
       "macos_native_render",
     ],
   },

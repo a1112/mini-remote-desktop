@@ -2554,6 +2554,7 @@ fn test_harness_set_custom(
         "openh264" | "software_h264" | "h264_software" | "software-h264" | "h264-software"
         | "sw_h264" => EncoderType::OpenH264,
         "videotoolbox_h264" | "videotoolbox" => EncoderType::VideoToolboxH264,
+        "videotoolbox_hevc" => EncoderType::VideoToolboxHevc,
         _ => return Err(format!("Unsupported encoder type: {}", encoder)),
     };
     let decoder = match decoder.as_str() {

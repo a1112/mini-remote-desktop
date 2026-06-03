@@ -23,7 +23,8 @@ type EncoderType =
   | "nvenc_av1"
   | "openh264"
   | "software_vvc"
-  | "videotoolbox_h264";
+  | "videotoolbox_h264"
+  | "videotoolbox_hevc";
 
 interface EncoderOption {
   id: EncoderType;
@@ -91,6 +92,14 @@ const ENCODER_OPTIONS: EncoderOption[] = [
     available: true,
     icon: <Zap className="h-5 w-5 text-blue-500" />,
   },
+  {
+    id: "videotoolbox_hevc",
+    name: "VideoToolbox HEVC",
+    description: "macOS Apple 硬件 HEVC 编码器，适合高分辨率高刷新",
+    type: "hardware",
+    available: true,
+    icon: <Zap className="h-5 w-5 text-emerald-500" />,
+  },
 ];
 
 interface EncoderMetrics {
@@ -152,6 +161,21 @@ function buildEncodeRun(
       config: {
         capture_type: "synthetic",
         encoder_type: "videotoolbox_h264",
+        decoder_type: "none",
+        zero_copy: false,
+        bitrate,
+        duration_ms: 30_000,
+        visual_preview: false,
+      },
+    };
+  }
+
+  if (encoder === "videotoolbox_hevc") {
+    return {
+      scenarioId: "encode.videotoolbox_hevc",
+      config: {
+        capture_type: "synthetic",
+        encoder_type: "videotoolbox_hevc",
         decoder_type: "none",
         zero_copy: false,
         bitrate,

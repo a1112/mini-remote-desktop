@@ -1336,6 +1336,7 @@ mod tests {
             "none" => EncoderType::None,
             "openh264" | "openh264_speed" => EncoderType::OpenH264,
             "videotoolbox" | "videotoolbox_h264" => EncoderType::VideoToolboxH264,
+            "videotoolbox_hevc" => EncoderType::VideoToolboxHevc,
             "nvenc_hevc" => EncoderType::NvencHevc,
             "nvenc_hevc_main10" => EncoderType::NvencHevcMain10,
             "nvenc_av1" => EncoderType::NvencAv1,
