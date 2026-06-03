@@ -2022,6 +2022,7 @@ for raw_path in sorted(glob.glob(os.path.join(output_root, "raw", "local-dual-*.
     probe = report.get("probeSnapshot") or {}
     pipeline = report.get("mediaPipelineSnapshot") or {}
     capture = report.get("captureSource") or {}
+    requested_profile = report.get("requestedProfile") or {}
     fps_elapsed = report.get("sampleObservedFps")
     fps_target = report.get("sampleObservedFpsAtTargetDuration")
     fps = fps_target
@@ -2063,6 +2064,7 @@ for raw_path in sorted(glob.glob(os.path.join(output_root, "raw", "local-dual-*.
         "sample_fps_elapsed_ms": report.get("sampleFpsElapsedMs"),
         "sample_fps_target_duration_ms": report.get("sampleFpsTargetDurationMs"),
         "sample_target_duration_ms": thresholds.get("minSampleDurationMs"),
+        "requested_fps": requested_profile.get("fps"),
         "sample_render_frames_presented": report.get("sampleRenderFramesPresented"),
         "sample_frames_decoded": report.get("sampleFramesDecoded"),
         "render_queue_policy": pipeline.get("render_queue_policy"),
@@ -2193,13 +2195,50 @@ with open(md_path, "w", encoding="utf-8") as file:
         else:
             capture_text = "-"
         capture_text = capture_text.replace("|", "\\|")
+        requested_fps = row.get("requested_fps")
+        sender_encode_p95 = row.get("sender_encode_p95_ms")
+        fps_headroom_note = ""
+        if (
+            row.get("status") == "completed"
+            and isinstance(requested_fps, (int, float))
+            and requested_fps > 0
+            and (
+                (isinstance(fps_target, (int, float)) and fps_target < requested_fps * 0.9)
+                or (isinstance(render_target, (int, float)) and render_target < requested_fps * 0.9)
+            )
+        ):
+            encode_note = (
+                f"; sender.encode p95 {sender_encode_p95:.2f}ms"
+                if isinstance(sender_encode_p95, (int, float))
+                else ""
+            )
+            target_fps_text = f"{fps_target:.1f}" if isinstance(fps_target, (int, float)) else "-"
+            target_render_text = (
+                f"{render_target:.1f}" if isinstance(render_target, (int, float)) else "-"
+            )
+            fps_headroom_note = (
+                f"below requested {requested_fps:.0f}fps"
+                f" (target fps {target_fps_text}, render {target_render_text}{encode_note})"
+            )
+        notes_parts = []
+        if error:
+            notes_parts.append(error)
+        elif codec_fallback:
+            notes_parts.append(codec_fallback)
+        elif warnings_text:
+            notes_parts.append(warnings_text)
+        if fps_headroom_note:
+            notes_parts.append(fps_headroom_note.replace("|", "\\|"))
+        if fps_note:
+            notes_parts.append(fps_note)
+        notes_text = "; ".join(notes_parts) if notes_parts else "-"
         file.write(
             f"| {row['id']} | {row['status']} | {row['fps_observed']:.1f} | {render_fps_text} | "
             f"{replacement_text} | {present_skip_text} | {repeat_text} | {next_drawable_text} | "
             f"{row['decoded_frames']} | {presented_text} | {codec_text} | "
             f"{row.get('active_encoder') or '-'} | "
             f"{row.get('active_decoder') or '-'} | {row.get('active_renderer') or '-'} | "
-            f"{capture_text} | {error or codec_fallback or warnings_text or fps_note or '-'} |\n"
+            f"{capture_text} | {notes_text} |\n"
         )
 
 print(json_path)
