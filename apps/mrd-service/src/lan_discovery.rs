@@ -1,6 +1,6 @@
 use crate::app_state::{AppState, DecodedVideoFrameStats, MediaProbeFrameStats};
-#[cfg(windows)]
-use crate::app_state::{MediaRenderQueueEnqueue, MediaRenderQueueRegistry};
+#[cfg(any(windows, target_os = "macos"))]
+use crate::app_state::{MediaRenderFrame, MediaRenderQueueEnqueue, MediaRenderQueueRegistry};
 use anyhow::{Context, Result};
 use mrd_application::ports::{SessionLifecycleState, SessionSnapshot};
 use mrd_encode_openh264::OpenH264Encoder;
@@ -15,13 +15,13 @@ use mrd_pipeline_core::{
     CapturedFrame, DecodedFrame, DecodedFrameData, FramePixelFormat, VideoDecoder, VideoEncoder,
 };
 use mrd_proto::{DeviceId, SessionId};
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 use mrd_render::{RenderFrame, RendererSnapshot};
 use mrd_transport_quic_quinn::{
     fragment_access_unit, fragment_media_payload_v3, is_quic_media_v3_datagram, QuicAuFrame,
     QuicAuReassembler, QuicAuReassemblerConfig, QuicAuReassemblerStats, QuicMediaCodec,
-    QuicMediaFrame, QuicMediaPayloadType, QuicMediaReassembler, QuinnDatagramEndpoint,
-    QuinnServerBootstrap, QuinnServerListener, QUIC_AU_FRAGMENT_HEADER_LEN,
+    QuicMediaFragment, QuicMediaFrame, QuicMediaPayloadType, QuicMediaReassembler,
+    QuinnDatagramEndpoint, QuinnServerBootstrap, QuinnServerListener, QUIC_AU_FRAGMENT_HEADER_LEN,
     QUIC_MEDIA_V3_FRAGMENT_HEADER_LEN,
 };
 use serde::{Deserialize, Serialize};
@@ -30,9 +30,11 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 #[cfg(target_os = "macos")]
-use std::sync::{Condvar as StdCondvar, Mutex as StdMutex};
-#[cfg(windows)]
-use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock, TryLockError};
+use std::sync::Condvar as StdCondvar;
+#[cfg(any(windows, target_os = "macos"))]
+use std::sync::{Mutex as StdMutex, OnceLock};
+#[cfg(any(windows, target_os = "macos"))]
+use std::sync::{MutexGuard as StdMutexGuard, TryLockError};
 #[cfg(any(windows, target_os = "macos"))]
 use std::thread;
 #[cfg(target_os = "macos")]
@@ -56,11 +58,19 @@ const LAN_TEST_IMPAIRMENT_SEED_ENV: &str = "MRD_LAN_TEST_IMPAIRMENT_SEED";
 const LAN_RELIABLE_WHOLE_FRAME_ENV: &str = "MRD_LAN_RELIABLE_WHOLE_FRAME";
 #[cfg(target_os = "macos")]
 const LAN_CAPTURE_PUMP_ENV: &str = "MRD_LAN_CAPTURE_PUMP";
+#[cfg(target_os = "macos")]
+const LAN_CAPTURE_PUMP_DRIVES_SENDER_ENV: &str = "MRD_LAN_CAPTURE_PUMP_DRIVES_SENDER";
+#[cfg(target_os = "macos")]
+const LAN_CAPTURE_PUMP_REPEAT_LATEST_ENV: &str = "MRD_LAN_CAPTURE_PUMP_REPEAT_LATEST";
+#[cfg(target_os = "macos")]
+const LAN_CAPTURE_PUMP_REPEAT_PACING_FPS_ENV: &str = "MRD_LAN_CAPTURE_PUMP_REPEAT_PACING_FPS";
 const LAN_RENDER_PACING_ENV: &str = "MRD_LAN_RENDER_PACING";
 const LAN_RENDER_MAX_FPS_ENV: &str = "MRD_LAN_RENDER_MAX_FPS";
 const LAN_RENDER_QUEUE_CAPACITY_ENV: &str = "MRD_LAN_RENDER_QUEUE_CAPACITY";
-#[cfg(windows)]
 const LAN_RENDER_QUEUE_POLICY_ENV: &str = "MRD_LAN_RENDER_QUEUE_POLICY";
+const LAN_MEDIA_PAYLOAD_HASH_ENV: &str = "MRD_LAN_MEDIA_PAYLOAD_HASH";
+#[cfg(target_os = "macos")]
+const MACOS_RENDER_PROXY_COMPRESSED_MEDIA_ENV: &str = "MRD_MACOS_RENDER_PROXY_COMPRESSED_MEDIA";
 #[cfg(windows)]
 const D3D11_RENDER_PRESENT_BLOCKING_ENV: &str = "MRD_D3D11_RENDER_PRESENT_BLOCKING";
 #[cfg(windows)]
@@ -91,6 +101,7 @@ const LAN_QUIC_DATAGRAM_SEND_BUDGET_MIN_BITRATE_MBPS: u32 = 80;
 const LAN_QUIC_DATAGRAM_SEND_BUDGET_MIN_FPS: u32 = 120;
 const LAN_QUIC_DATAGRAM_SEND_BUDGET: Duration = Duration::from_millis(4);
 const LAN_MEDIA_HIGH_RESOLUTION_TIMER_MIN_FPS: u32 = 90;
+#[cfg(windows)]
 const LAN_MEDIA_HIGH_RESOLUTION_TIMER_PERIOD_MS: u32 = 1;
 const LAN_MEDIA_PRECISE_SLEEP_MIN_FPS: u32 = 90;
 const LAN_MEDIA_PRECISE_SLEEP_GUARD: Duration = Duration::from_millis(2);
@@ -110,6 +121,8 @@ const LAN_QUIC_MEDIA_V3_TRANSPORT: &str = "quic_datagram_media_v3";
 const LAN_QUIC_RELIABLE_MEDIA_TRANSPORT: &str = "quic_stream_media_v2";
 const LAN_QUIC_PERSISTENT_MEDIA_TRANSPORT: &str = "quic_stream_media_v3";
 const LAN_MEDIA_PROFILE_CONTROL_TRANSPORT: &str = "media_profile_control_v1";
+const LAN_MEDIA_CONTROL_REQUEST_KEYFRAME: &[u8] = b"request_keyframe";
+const LAN_MEDIA_KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(20);
 const LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT: &str = "capture_source_control_v1";
 const LAN_DISPLAY_MODE_CONTROL_TRANSPORT: &str = "display_mode_control_v1";
 const LAN_INPUT_CONTROL_TRANSPORT: &str = "input_control_v1";
@@ -119,13 +132,20 @@ const LAN_CONTROL_INPUT_RELIABLE_ATTEMPTS: usize = 3;
 const LAN_CONTROL_INPUT_DEDUPE_WINDOW_MS: u64 = 10_000;
 const LAN_CONTROL_INPUT_DEDUPE_CACHE_LIMIT: usize = 4096;
 const LAN_MEDIA_PROTOCOL_VERSION: u32 = 3;
+#[cfg(windows)]
 const LAN_CAPTURE_DXGI_CAPABILITY: &str = "dxgi_capture";
+#[cfg(windows)]
 const LAN_ENCODE_NVENC_H264_CAPABILITY: &str = "nvenc_h264";
+#[cfg(windows)]
 const LAN_ENCODE_NVENC_HEVC_CAPABILITY: &str = "encode.nvenc_hevc";
+#[cfg(windows)]
 const LAN_DECODE_NVDEC_CAPABILITY: &str = "nvdec";
+#[cfg(windows)]
 const LAN_DECODE_NVDEC_HEVC_CAPABILITY: &str = "decode.nvdec_hevc";
 const LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY: &str = "media.hevc_main_420_8bit";
+#[cfg(windows)]
 const LAN_RENDER_D3D11_NATIVE_CAPABILITY: &str = "d3d11_native_render";
+#[cfg(windows)]
 const LAN_RENDER_D3D11_SHARED_NV12_CAPABILITY: &str = "render.d3d11_shared_nv12";
 const LAN_INPUT_CONTROL_CAPABILITY: &str = "control.keyboard_mouse";
 #[cfg(target_os = "macos")]
@@ -133,16 +153,18 @@ const LAN_CAPTURE_MACOS_CAPABILITY: &str = "macos_capture";
 #[cfg(target_os = "macos")]
 const LAN_ENCODE_VIDEOTOOLBOX_H264_CAPABILITY: &str = "videotoolbox_h264";
 #[cfg(target_os = "macos")]
+const LAN_ENCODE_VIDEOTOOLBOX_HEVC_CAPABILITY: &str = "videotoolbox_hevc";
+#[cfg(target_os = "macos")]
 const LAN_DECODE_VIDEOTOOLBOX_CAPABILITY: &str = "videotoolbox";
 #[cfg(target_os = "macos")]
 const LAN_RENDER_MACOS_NATIVE_CAPABILITY: &str = "macos_native_render";
 const LAN_MEDIA_SENDER_MAX_CONSECUTIVE_FRAME_ERRORS: u32 = 8;
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 static LOCAL_RENDER_REFRESH_HZ: OnceLock<Option<u32>> = OnceLock::new();
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 static LAN_RENDER_NO_SURFACE_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 static LAN_RENDER_PRESENT_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 static LAN_DISCOVERY_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static LAN_CONTROL_INPUT_EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -153,6 +175,8 @@ const LAN_MEDIA_RECEIVER_DECODE_ERROR_LOG_INTERVAL: u32 = 3;
 const LAN_CAPTURE_PUMP_QUEUE_CAPACITY: usize = 2;
 #[cfg(target_os = "macos")]
 const LAN_CAPTURE_PUMP_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(target_os = "macos")]
+const LAN_CAPTURE_PUMP_REPEAT_GRACE_MAX: Duration = Duration::from_millis(4);
 #[cfg(target_os = "macos")]
 const LAN_CAPTURE_PUMP_ERROR_BACKOFF: Duration = Duration::from_millis(5);
 const LAN_MEDIA_REASSEMBLER_FRAME_TIMEOUT_MS: u64 = 1_500;
@@ -177,9 +201,6 @@ const LAN_MEDIA_SENDER_STATS_INTERVAL: Duration = Duration::from_secs(1);
 const LAN_MEDIA_SENDER_STATS_SAMPLE_LIMIT: usize = 240;
 const LAN_MEDIA_CODEC_H264: u8 = 1;
 const LAN_MEDIA_CODEC_HEVC: u8 = 2;
-const LAN_PREVIEW_FRAME_INTERVAL: u64 = 120;
-const LAN_PREVIEW_MAX_WIDTH: u32 = 480;
-const LAN_PREVIEW_MAX_HEIGHT: u32 = 270;
 
 #[derive(Debug, Clone)]
 pub struct LanDiscoveryConfig {
@@ -756,6 +777,14 @@ struct LanSenderEncoder {
     encoder: Box<dyn VideoEncoder + Send>,
 }
 
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct LanSenderStatsPayload {
     sequence: u64,
@@ -848,6 +877,70 @@ impl LanSenderStatsTracker {
 
     fn frame_completed(&mut self) {
         self.frame_count = self.frame_count.saturating_add(1);
+        self.sender_transport.frames_completed =
+            self.sender_transport.frames_completed.saturating_add(1);
+    }
+
+    fn record_repeated_latest_frame(&mut self) {
+        self.sender_transport.repeated_latest_frames = self
+            .sender_transport
+            .repeated_latest_frames
+            .saturating_add(1);
+    }
+
+    fn record_captured_frame(&mut self, frame: &CapturedFrame) {
+        self.sender_transport.capture_frame_samples = self
+            .sender_transport
+            .capture_frame_samples
+            .saturating_add(1);
+        match captured_frame_memory_path(frame) {
+            "macos_cv_pixel_buffer" => {
+                self.sender_transport.capture_macos_cv_pixel_buffer_frames = self
+                    .sender_transport
+                    .capture_macos_cv_pixel_buffer_frames
+                    .saturating_add(1);
+            }
+            "cpu" => {
+                self.sender_transport.capture_cpu_frames =
+                    self.sender_transport.capture_cpu_frames.saturating_add(1);
+            }
+            _ => {}
+        }
+        match frame.pixel_format {
+            FramePixelFormat::Bgra32 => {
+                self.sender_transport.capture_bgra32_frames = self
+                    .sender_transport
+                    .capture_bgra32_frames
+                    .saturating_add(1);
+            }
+            FramePixelFormat::Rgba32 => {
+                self.sender_transport.capture_rgba32_frames = self
+                    .sender_transport
+                    .capture_rgba32_frames
+                    .saturating_add(1);
+            }
+            FramePixelFormat::Rgb24 => {
+                self.sender_transport.capture_rgb24_frames =
+                    self.sender_transport.capture_rgb24_frames.saturating_add(1);
+            }
+            FramePixelFormat::Nv12 => {
+                self.sender_transport.capture_nv12_frames =
+                    self.sender_transport.capture_nv12_frames.saturating_add(1);
+            }
+        }
+    }
+
+    fn record_encoded_access_unit(&mut self, bytes: usize, is_keyframe: bool) {
+        self.sender_transport.access_units_encoded =
+            self.sender_transport.access_units_encoded.saturating_add(1);
+        if is_keyframe {
+            self.sender_transport.keyframes_encoded =
+                self.sender_transport.keyframes_encoded.saturating_add(1);
+        }
+        self.sender_transport.encoded_access_unit_bytes = self
+            .sender_transport
+            .encoded_access_unit_bytes
+            .saturating_add(bytes as u64);
     }
 
     fn record_datagram_frame(&mut self, report: LanSenderDatagramFrameReport) {
@@ -2911,15 +3004,14 @@ fn lan_media_capabilities_with_input_control(input_control_available: bool) -> V
             LAN_RENDER_D3D11_SHARED_NV12_CAPABILITY.to_string(),
             crate::display_mode::capability_name().to_string(),
         ]);
-        if input_control_available {
-            capabilities.push(LAN_INPUT_CONTROL_CAPABILITY.to_string());
-        }
     }
     #[cfg(target_os = "macos")]
     {
         capabilities.extend([
             LAN_CAPTURE_MACOS_CAPABILITY.to_string(),
             LAN_ENCODE_VIDEOTOOLBOX_H264_CAPABILITY.to_string(),
+            LAN_ENCODE_VIDEOTOOLBOX_HEVC_CAPABILITY.to_string(),
+            LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY.to_string(),
             LAN_DECODE_VIDEOTOOLBOX_CAPABILITY.to_string(),
             LAN_RENDER_MACOS_NATIVE_CAPABILITY.to_string(),
             "openh264_fallback".to_string(),
@@ -2940,6 +3032,9 @@ fn lan_media_capabilities_with_input_control(input_control_available: bool) -> V
             "openh264_fallback".to_string(),
             "software_decode".to_string(),
         ]);
+    }
+    if input_control_available {
+        capabilities.push(LAN_INPUT_CONTROL_CAPABILITY.to_string());
     }
     capabilities
 }
@@ -3153,13 +3248,13 @@ async fn close_lan_media_sessions(
             .lock()
             .await
             .remove(&session_id);
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         app_state
             .media_surface_renderers
             .lock()
             .await
             .detach_session(&session_id);
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         app_state
             .media_render_queues
             .lock()
@@ -3325,6 +3420,10 @@ fn fit_capture_sources_ack_packet(
     message: Option<String>,
     sources: Vec<CaptureSource>,
 ) -> LanDiscoveryPacket {
+    let sources = sources
+        .into_iter()
+        .map(strip_capture_source_preview)
+        .collect();
     let mut packet = LanDiscoveryPacket::CaptureSourcesAck {
         magic: DISCOVERY_MAGIC.to_string(),
         app_id: DISCOVERY_APP_ID.to_string(),
@@ -3341,13 +3440,6 @@ fn fit_capture_sources_ack_packet(
             break;
         };
 
-        if let Some(index) = largest_preview_source_index(sources) {
-            sources[index].preview_data_url = None;
-            sources[index].preview_width = None;
-            sources[index].preview_height = None;
-            continue;
-        }
-
         if sources.len() > 1 {
             sources.pop();
             continue;
@@ -3359,24 +3451,17 @@ fn fit_capture_sources_ack_packet(
     packet
 }
 
+fn strip_capture_source_preview(mut source: CaptureSource) -> CaptureSource {
+    source.preview_data_url = None;
+    source.preview_width = None;
+    source.preview_height = None;
+    source
+}
+
 fn serialized_packet_len(packet: &LanDiscoveryPacket) -> usize {
     serde_json::to_vec(packet)
         .map(|bytes| bytes.len())
         .unwrap_or(usize::MAX)
-}
-
-fn largest_preview_source_index(sources: &[CaptureSource]) -> Option<usize> {
-    sources
-        .iter()
-        .enumerate()
-        .filter_map(|(index, source)| {
-            source
-                .preview_data_url
-                .as_ref()
-                .map(|preview| (index, preview.len()))
-        })
-        .max_by_key(|(_, preview_len)| *preview_len)
-        .map(|(index, _)| index)
 }
 
 async fn spawn_quic_media_sender(
@@ -3498,12 +3583,19 @@ async fn send_quic_media_loop(
         .max_datagram_size()
         .unwrap_or(LAN_QUIC_FALLBACK_DATAGRAM_BYTES)
         .max(QUIC_MEDIA_V3_FRAGMENT_HEADER_LEN.max(QUIC_AU_FRAGMENT_HEADER_LEN) + 1);
+    let keyframe_requests = Arc::new(AtomicU64::new(0));
+    let _control_reader = spawn_lan_media_control_reader(
+        endpoint.clone(),
+        session_id.clone(),
+        keyframe_requests.clone(),
+    );
 
     let mut frame_id = 1_u64;
     let mut active_capture_config: Option<LanCaptureConfigKey> = None;
     let mut capture: Option<LanSenderFrameCapture> = None;
     let mut encoder: Option<LanSenderEncoder> = None;
     let mut encoder_config: Option<(usize, usize, u32, u32, LanAccessUnitCodec)> = None;
+    let mut pending_keyframe_request = false;
     let mut consecutive_frame_errors = 0_u32;
     let mut next_frame_at = Instant::now();
     let mut active_frame_interval = Duration::ZERO;
@@ -3534,9 +3626,13 @@ async fn send_quic_media_loop(
         .await
         .supports(&session_id, LAN_QUIC_MEDIA_PROFILE_TRANSPORT);
     loop {
-        let loop_started = Instant::now();
         if !session_allows_media(&app_state, &session_id).await {
             return Ok(());
+        }
+        let new_keyframe_requests = keyframe_requests.swap(0, Ordering::Relaxed);
+        if new_keyframe_requests > 0 {
+            pending_keyframe_request = true;
+            sender_stats.record_ms("sender.keyframe_request", new_keyframe_requests as f64);
         }
         let profile = selected_media_profile(&app_state, &session_id).await;
         media_timer_resolution.update_for_profile(&profile);
@@ -3573,7 +3669,12 @@ async fn send_quic_media_loop(
             dynamic_window_fps_policy = None;
             dynamic_window_fps_decision = None;
         }
-        let frame_interval = if selected_source_is_window {
+        let capture_repeats_latest_frame = capture
+            .as_ref()
+            .is_some_and(LanSenderFrameCapture::repeats_latest_frame);
+        let frame_interval = if capture_repeats_latest_frame {
+            macos_capture_pump_repeat_frame_interval(&profile)
+        } else if selected_source_is_window {
             media_frame_interval_for_dynamic_decision(&profile, dynamic_window_fps_decision)
         } else {
             media_frame_interval(&profile)
@@ -3582,15 +3683,23 @@ async fn send_quic_media_loop(
             active_frame_interval = frame_interval;
             next_frame_at = Instant::now() + frame_interval;
         }
-        if let Some(delay_until) =
+        let capture_drives_sender_pacing = capture
+            .as_ref()
+            .is_some_and(LanSenderFrameCapture::drives_sender_pacing);
+        if capture_drives_sender_pacing {
+            next_frame_at = Instant::now() + frame_interval;
+        } else if let Some(delay_until) =
             schedule_next_media_frame(Instant::now(), &mut next_frame_at, frame_interval)
         {
+            let pacing_started = Instant::now();
             sleep_until_media_frame(delay_until, &profile).await;
+            sender_stats.record_elapsed("sender.pacing_wait", pacing_started);
         }
+        let loop_started = Instant::now();
 
         if !lan_capture_config_matches(active_capture_config.as_ref(), &source_id, &profile) {
             match create_lan_frame_capture(&source_id, &profile).await {
-                Ok(next_capture) => match LanSenderFrameCapture::new(next_capture) {
+                Ok(next_capture) => match LanSenderFrameCapture::new(next_capture, &profile) {
                     Ok(next_sender_capture) => {
                         capture = Some(next_sender_capture);
                         encoder = None;
@@ -3665,8 +3774,8 @@ async fn send_quic_media_loop(
                     .context("failed to capture LAN desktop frame")
             });
         sender_stats.record_elapsed("sender.capture", capture_started);
-        let raw_frame = match raw_frame_result {
-            Ok(frame) => frame,
+        let raw_capture = match raw_frame_result {
+            Ok(capture) => capture,
             Err(error) => {
                 let error_source_id = active_capture_config
                     .as_ref()
@@ -3706,6 +3815,11 @@ async fn send_quic_media_loop(
                 continue;
             }
         };
+        if raw_capture.repeated_latest_frame {
+            sender_stats.record_repeated_latest_frame();
+        }
+        let raw_frame = raw_capture.frame;
+        sender_stats.record_captured_frame(&raw_frame);
         let capture_memory_path = captured_frame_memory_path(&raw_frame).to_string();
         if let Some(policy) = dynamic_window_fps_policy.as_mut() {
             dynamic_window_fps_decision = Some(policy.update(
@@ -3764,6 +3878,7 @@ async fn send_quic_media_loop(
                     });
                     {
                         let mut pipelines = app_state.media_pipelines.lock().await;
+                        pipelines.set_active_encoder(session_id.clone(), next_encoder.backend);
                         pipelines.set_active_media_profile(session_id.clone(), &runtime_profile);
                         pipelines.set_codec_fallback_reason(session_id.clone(), fallback_reason);
                     }
@@ -3788,6 +3903,13 @@ async fn send_quic_media_loop(
                     .await?;
                     continue;
                 }
+            }
+        }
+
+        if pending_keyframe_request {
+            if let Some(encoder) = encoder.as_mut() {
+                encoder.encoder.request_keyframe();
+                pending_keyframe_request = false;
             }
         }
 
@@ -3835,6 +3957,7 @@ async fn send_quic_media_loop(
                 }
                 LanAccessUnitCodec::Hevc => access_unit.is_keyframe,
             };
+            sender_stats.record_encoded_access_unit(access_unit.bytes.len(), is_keyframe);
             let fragment_started = Instant::now();
             let fragments = if media_v3_supported {
                 match fragment_media_payload_v3(
@@ -4167,6 +4290,18 @@ async fn send_quic_media_loop(
                 dynamic_window_fps_decision,
                 test_impairment.snapshot(),
             ) {
+                {
+                    let mut pipelines = app_state.media_pipelines.lock().await;
+                    pipelines.set_stage_metrics(session_id.clone(), stats_payload.metrics.clone());
+                    pipelines.set_test_impairment(
+                        session_id.clone(),
+                        stats_payload.test_impairment.clone(),
+                    );
+                    pipelines.set_sender_transport(
+                        session_id.clone(),
+                        stats_payload.sender_transport.clone(),
+                    );
+                }
                 let stats_send_started = Instant::now();
                 if let Err(error) =
                     send_lan_sender_stats_datagram(&endpoint, max_datagram_size, &stats_payload)
@@ -4259,7 +4394,24 @@ fn create_lan_hevc_encoder(
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn create_lan_hevc_encoder(
+    width: usize,
+    height: usize,
+    fps: u32,
+    bitrate: u32,
+) -> Result<(&'static str, Box<dyn VideoEncoder + Send>)> {
+    mrd_codec_videotoolbox::VideoToolboxHevcEncoder::new_with_bitrate(width, height, fps, bitrate)
+        .map(|encoder| {
+            (
+                "videotoolbox_hevc",
+                Box::new(encoder) as Box<dyn VideoEncoder + Send>,
+            )
+        })
+        .map_err(|error| anyhow::anyhow!(error.to_string()))
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn create_lan_hevc_encoder(
     _width: usize,
     _height: usize,
@@ -4384,10 +4536,26 @@ fn should_log_media_receiver_decode_error(consecutive_decode_errors: u32) -> boo
         || consecutive_decode_errors.is_multiple_of(LAN_MEDIA_RECEIVER_DECODE_ERROR_LOG_INTERVAL)
 }
 
-struct LanMediaFrameOrderer {
+trait LanOrderedMediaFrame {
+    fn frame_id(&self) -> u32;
+}
+
+impl LanOrderedMediaFrame for QuicAuFrame {
+    fn frame_id(&self) -> u32 {
+        self.frame_id
+    }
+}
+
+impl LanOrderedMediaFrame for QuicMediaFrame {
+    fn frame_id(&self) -> u32 {
+        self.frame_id
+    }
+}
+
+struct LanMediaFrameOrderer<T = QuicAuFrame> {
     next_frame_id: Option<u32>,
     max_pending_frames: usize,
-    pending: BTreeMap<u32, QuicAuFrame>,
+    pending: BTreeMap<u32, T>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4397,7 +4565,7 @@ enum LanReliableMediaSendMode {
     Persistent,
 }
 
-impl LanMediaFrameOrderer {
+impl<T: LanOrderedMediaFrame> LanMediaFrameOrderer<T> {
     fn new(max_pending_frames: usize) -> Self {
         Self {
             next_frame_id: None,
@@ -4406,16 +4574,17 @@ impl LanMediaFrameOrderer {
         }
     }
 
-    fn push(&mut self, frame: QuicAuFrame) -> Vec<QuicAuFrame> {
+    fn push(&mut self, frame: T) -> Vec<T> {
+        let frame_id = frame.frame_id();
         if self
             .next_frame_id
-            .is_some_and(|next_frame_id| frame.frame_id < next_frame_id)
+            .is_some_and(|next_frame_id| frame_id < next_frame_id)
         {
             return Vec::new();
         }
 
-        self.next_frame_id.get_or_insert(frame.frame_id);
-        self.pending.entry(frame.frame_id).or_insert(frame);
+        self.next_frame_id.get_or_insert(frame_id);
+        self.pending.entry(frame_id).or_insert(frame);
 
         let mut ready = self.drain_contiguous();
         if ready.is_empty() && self.pending.len() >= self.max_pending_frames {
@@ -4427,7 +4596,7 @@ impl LanMediaFrameOrderer {
         ready
     }
 
-    fn drain_contiguous(&mut self) -> Vec<QuicAuFrame> {
+    fn drain_contiguous(&mut self) -> Vec<T> {
         let mut ready = Vec::new();
         while let Some(next_frame_id) = self.next_frame_id {
             let Some(frame) = self.pending.remove(&next_frame_id) else {
@@ -4627,6 +4796,52 @@ fn lan_capture_pump_enabled() -> bool {
     env_bool_override(std::env::var(LAN_CAPTURE_PUMP_ENV).ok().as_deref()).unwrap_or(true)
 }
 
+#[cfg(target_os = "macos")]
+fn lan_capture_pump_drives_sender() -> bool {
+    env_bool_override(
+        std::env::var(LAN_CAPTURE_PUMP_DRIVES_SENDER_ENV)
+            .ok()
+            .as_deref(),
+    )
+    .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn lan_capture_pump_repeat_latest() -> bool {
+    env_bool_override(
+        std::env::var(LAN_CAPTURE_PUMP_REPEAT_LATEST_ENV)
+            .ok()
+            .as_deref(),
+    )
+    .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_capture_pump_repeat_pacing_fps(profile: &MediaProfile) -> u32 {
+    std::env::var(LAN_CAPTURE_PUMP_REPEAT_PACING_FPS_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|fps| *fps > 0)
+        .unwrap_or_else(|| profile.fps.max(1))
+        .clamp(profile.fps.max(1), 240)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_capture_pump_repeat_frame_interval(profile: &MediaProfile) -> Duration {
+    media_frame_interval_for_fps(macos_capture_pump_repeat_pacing_fps(profile))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_capture_pump_repeat_grace_timeout(profile: &MediaProfile) -> Duration {
+    (media_frame_interval_for_fps(macos_lan_capture_stream_fps(profile)) / 2)
+        .min(LAN_CAPTURE_PUMP_REPEAT_GRACE_MAX)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_capture_pump_repeat_frame_interval(profile: &MediaProfile) -> Duration {
+    media_frame_interval(profile)
+}
+
 fn env_bool_override(value: Option<&str>) -> Option<bool> {
     match value?.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
@@ -4636,7 +4851,17 @@ fn env_bool_override(value: Option<&str>) -> Option<bool> {
     }
 }
 
-#[cfg(windows)]
+#[cfg(target_os = "macos")]
+fn macos_render_proxy_compressed_media_enabled() -> bool {
+    env_bool_override(
+        std::env::var(MACOS_RENDER_PROXY_COMPRESSED_MEDIA_ENV)
+            .ok()
+            .as_deref(),
+    )
+    .unwrap_or(true)
+}
+
+#[cfg(any(windows, target_os = "macos"))]
 fn lan_render_pacing_enabled_for_profile(profile: &MediaProfile) -> bool {
     if let Some(enabled) =
         lan_render_pacing_from_env_value(std::env::var(LAN_RENDER_PACING_ENV).ok().as_deref())
@@ -4647,14 +4872,21 @@ fn lan_render_pacing_enabled_for_profile(profile: &MediaProfile) -> bool {
     profile.fps >= LAN_RENDER_PACING_DEFAULT_MIN_FPS
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LanRenderQueuePolicy {
     PacedFifo,
     Latest,
 }
 
-#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LanMediaPayloadHashMode {
+    Full,
+    Metadata,
+    Disabled,
+}
+
+#[cfg(any(windows, target_os = "macos"))]
 impl LanRenderQueuePolicy {
     fn as_str(self) -> &'static str {
         match self {
@@ -4664,7 +4896,7 @@ impl LanRenderQueuePolicy {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn lan_render_queue_policy_from_env_value(value: Option<&str>) -> Option<LanRenderQueuePolicy> {
     match value?.trim().to_ascii_lowercase().as_str() {
         "latest" | "low_latency" | "low-latency" | "latency" => Some(LanRenderQueuePolicy::Latest),
@@ -4674,7 +4906,7 @@ fn lan_render_queue_policy_from_env_value(value: Option<&str>) -> Option<LanRend
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn lan_render_queue_policy_for_profile(profile: &MediaProfile) -> LanRenderQueuePolicy {
     lan_render_queue_policy_for_profile_with_override(
         profile,
@@ -4684,15 +4916,89 @@ fn lan_render_queue_policy_for_profile(profile: &MediaProfile) -> LanRenderQueue
     )
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn lan_render_queue_policy_for_profile_with_override(
-    _profile: &MediaProfile,
+    profile: &MediaProfile,
     override_policy: Option<LanRenderQueuePolicy>,
 ) -> LanRenderQueuePolicy {
     if let Some(policy) = override_policy {
         return policy;
     }
+    #[cfg(target_os = "macos")]
+    if profile.fps >= LAN_RENDER_PACING_DEFAULT_MIN_FPS {
+        return LanRenderQueuePolicy::Latest;
+    }
     LanRenderQueuePolicy::PacedFifo
+}
+
+fn lan_media_payload_hash_mode_from_env_value(
+    value: Option<&str>,
+) -> Option<LanMediaPayloadHashMode> {
+    match value?.trim().to_ascii_lowercase().as_str() {
+        "full" | "fnv" | "fnv1a64" => Some(LanMediaPayloadHashMode::Full),
+        "metadata" | "meta" | "cheap" => Some(LanMediaPayloadHashMode::Metadata),
+        "disabled" | "disable" | "off" | "none" | "0" | "false" => {
+            Some(LanMediaPayloadHashMode::Disabled)
+        }
+        "" => None,
+        _ => None,
+    }
+}
+
+fn lan_media_payload_hash_mode_for_profile(profile: &MediaProfile) -> LanMediaPayloadHashMode {
+    lan_media_payload_hash_mode_for_profile_with_override(
+        profile,
+        lan_media_payload_hash_mode_from_env_value(
+            std::env::var(LAN_MEDIA_PAYLOAD_HASH_ENV).ok().as_deref(),
+        ),
+    )
+}
+
+fn lan_media_payload_hash_mode_for_profile_with_override(
+    profile: &MediaProfile,
+    override_mode: Option<LanMediaPayloadHashMode>,
+) -> LanMediaPayloadHashMode {
+    if let Some(mode) = override_mode {
+        return mode;
+    }
+    if profile.fps >= LAN_RENDER_PACING_DEFAULT_MIN_FPS {
+        return LanMediaPayloadHashMode::Metadata;
+    }
+    LanMediaPayloadHashMode::Full
+}
+
+fn lan_media_payload_hash_for_profile(
+    profile: &MediaProfile,
+    sequence: u64,
+    timestamp_us: u64,
+    encoded_payload: &[u8],
+) -> String {
+    lan_media_payload_hash_for_mode(
+        lan_media_payload_hash_mode_for_profile(profile),
+        profile,
+        sequence,
+        timestamp_us,
+        encoded_payload,
+    )
+}
+
+fn lan_media_payload_hash_for_mode(
+    mode: LanMediaPayloadHashMode,
+    profile: &MediaProfile,
+    sequence: u64,
+    timestamp_us: u64,
+    encoded_payload: &[u8],
+) -> String {
+    match mode {
+        LanMediaPayloadHashMode::Full => {
+            format!("fnv1a64:{:016x}", fnv1a64(encoded_payload))
+        }
+        LanMediaPayloadHashMode::Metadata => format!(
+            "fnv1a64:meta:{:016x}",
+            fnv1a64_media_metadata(profile, sequence, timestamp_us, encoded_payload.len())
+        ),
+        LanMediaPayloadHashMode::Disabled => "fnv1a64:disabled".to_string(),
+    }
 }
 
 #[cfg(windows)]
@@ -4710,6 +5016,16 @@ fn lan_render_waitable_swapchain_pacing_enabled() -> bool {
 }
 
 #[cfg(windows)]
+fn native_render_waitable_swapchain_pacing_enabled() -> bool {
+    lan_render_waitable_swapchain_pacing_enabled()
+}
+
+#[cfg(target_os = "macos")]
+fn native_render_waitable_swapchain_pacing_enabled() -> bool {
+    false
+}
+
+#[cfg(any(windows, target_os = "macos"))]
 fn lan_render_policy_allows_service_pacing(
     policy: LanRenderQueuePolicy,
     profile: &MediaProfile,
@@ -4720,7 +5036,7 @@ fn lan_render_policy_allows_service_pacing(
         && lan_render_pacing_enabled_for_profile(profile)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn lan_render_queue_capacity_for_profile(profile: &MediaProfile) -> usize {
     if lan_render_pacing_enabled_for_profile(profile) {
         lan_render_queue_capacity_from_env_value(
@@ -4731,7 +5047,18 @@ fn lan_render_queue_capacity_for_profile(profile: &MediaProfile) -> usize {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
+fn lan_render_queue_capacity_for_policy(
+    profile: &MediaProfile,
+    policy: LanRenderQueuePolicy,
+) -> usize {
+    match policy {
+        LanRenderQueuePolicy::Latest => 1,
+        LanRenderQueuePolicy::PacedFifo => lan_render_queue_capacity_for_profile(profile),
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
 fn lan_render_queue_capacity_from_env_value(value: Option<&str>) -> usize {
     value
         .and_then(|value| value.trim().parse::<usize>().ok())
@@ -4740,22 +5067,22 @@ fn lan_render_queue_capacity_from_env_value(value: Option<&str>) -> usize {
         .unwrap_or(LAN_RENDER_PACING_DEFAULT_MAX_PENDING_FRAMES)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn lan_render_pacing_target_fps(profile: &MediaProfile) -> u32 {
     lan_render_pacing_target_fps_from_values(profile.fps, lan_local_render_refresh_hz())
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub(crate) fn lan_local_render_fps_cap() -> Option<u32> {
     lan_local_render_refresh_hz()
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub(crate) fn lan_local_render_fps_cap() -> Option<u32> {
     None
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn lan_render_cap_target_fps_for_profile(profile: &MediaProfile) -> Option<u32> {
     if profile.fps >= LAN_RENDER_PACING_DEFAULT_MIN_FPS {
         Some(lan_render_pacing_target_fps(profile))
@@ -4764,7 +5091,7 @@ fn lan_render_cap_target_fps_for_profile(profile: &MediaProfile) -> Option<u32> 
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn lan_render_pacing_target_fps_from_values(
     profile_fps: u32,
     local_refresh_hz: Option<u32>,
@@ -4789,6 +5116,19 @@ fn lan_local_render_refresh_hz() -> Option<u32> {
     *LOCAL_RENDER_REFRESH_HZ.get_or_init(crate::display_mode::highest_current_refresh_hz)
 }
 
+#[cfg(target_os = "macos")]
+fn lan_local_render_refresh_hz() -> Option<u32> {
+    if let Some(refresh_hz) = std::env::var(LAN_RENDER_MAX_FPS_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|value| *value > 0)
+    {
+        return Some(refresh_hz);
+    }
+
+    *LOCAL_RENDER_REFRESH_HZ.get_or_init(mrd_capture_macos::highest_current_display_refresh_hz)
+}
+
 fn lan_render_pacing_from_env_value(value: Option<&str>) -> Option<bool> {
     env_bool_override(value)
 }
@@ -4801,6 +5141,120 @@ fn h264_access_unit_is_keyframe(metadata_is_keyframe: bool, payload: &[u8]) -> b
         || h264_avcc_nal_types(payload)
             .into_iter()
             .any(|nal_type| nal_type == 5)
+}
+
+fn encode_lan_keyframe_request_datagram(
+    profile: &MediaProfile,
+    sequence: u32,
+    max_datagram_size: usize,
+) -> Result<bytes::Bytes> {
+    let fragments = fragment_media_payload_v3(
+        QuicMediaPayloadType::Control,
+        QuicMediaCodec::None,
+        lan_media_profile_id(profile),
+        sequence,
+        now_us(),
+        false,
+        LAN_MEDIA_CONTROL_REQUEST_KEYFRAME,
+        max_datagram_size.max(QUIC_MEDIA_V3_FRAGMENT_HEADER_LEN + 1),
+    )
+    .context("failed to encode LAN keyframe request control datagram")?;
+    fragments
+        .into_iter()
+        .next()
+        .context("LAN keyframe request control datagram encoder produced no fragments")
+}
+
+fn decode_lan_keyframe_request_datagram(datagram: &[u8]) -> Result<bool> {
+    if !is_quic_media_v3_datagram(datagram) {
+        return Ok(false);
+    }
+    let fragment = QuicMediaFragment::decode(datagram)
+        .context("failed to decode LAN media control datagram")?;
+    Ok(fragment.payload_type == QuicMediaPayloadType::Control
+        && fragment.codec == QuicMediaCodec::None
+        && fragment.fragment_index == 0
+        && fragment.fragment_count == 1
+        && fragment.payload.as_ref() == LAN_MEDIA_CONTROL_REQUEST_KEYFRAME)
+}
+
+async fn maybe_send_lan_keyframe_request(
+    endpoint: &QuinnDatagramEndpoint,
+    session_id: &SessionId,
+    profile: &MediaProfile,
+    sequence: &mut u32,
+    last_sent_at: &mut Option<Instant>,
+    stats: &mut LanSenderStatsTracker,
+) {
+    let now = Instant::now();
+    if last_sent_at.is_some_and(|last| {
+        now.checked_duration_since(last)
+            .is_some_and(|elapsed| elapsed < LAN_MEDIA_KEYFRAME_REQUEST_MIN_INTERVAL)
+    }) {
+        return;
+    }
+    *last_sent_at = Some(now);
+    *sequence = sequence.wrapping_add(1).max(1);
+    let max_datagram_size = endpoint
+        .max_datagram_size()
+        .unwrap_or(LAN_QUIC_FALLBACK_DATAGRAM_BYTES);
+    match encode_lan_keyframe_request_datagram(profile, *sequence, max_datagram_size) {
+        Ok(datagram) => match endpoint.send_datagram(datagram) {
+            Ok(()) => {
+                stats.record_ms("receiver.request_keyframe", 1.0);
+            }
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    session_id = %session_id.0,
+                    "LAN media receiver failed to send keyframe request"
+                );
+            }
+        },
+        Err(error) => {
+            tracing::debug!(
+                %error,
+                session_id = %session_id.0,
+                "LAN media receiver failed to encode keyframe request"
+            );
+        }
+    }
+}
+
+fn spawn_lan_media_control_reader(
+    endpoint: QuinnDatagramEndpoint,
+    session_id: SessionId,
+    keyframe_requests: Arc<AtomicU64>,
+) -> AbortOnDrop {
+    AbortOnDrop(tokio::spawn(async move {
+        loop {
+            let datagram = match endpoint.read_datagram().await {
+                Ok(datagram) => datagram,
+                Err(error) => {
+                    tracing::debug!(
+                        %error,
+                        session_id = %session_id.0,
+                        "LAN media sender control reader stopped"
+                    );
+                    break;
+                }
+            };
+            match decode_lan_keyframe_request_datagram(&datagram) {
+                Ok(true) => {
+                    keyframe_requests.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::debug!(
+                        %error,
+                        session_id = %session_id.0,
+                        bytes = datagram.len(),
+                        "LAN media sender ignored invalid control datagram"
+                    );
+                }
+            }
+        }
+    }))
 }
 
 async fn set_session_last_error(
@@ -4860,6 +5314,9 @@ async fn receive_quic_media_loop(
     let mut media_v3_reassembler = QuicMediaReassembler::new(lan_media_reassembler_config());
     let mut frame_orderer =
         LanMediaFrameOrderer::new(LAN_MEDIA_RECEIVER_REORDER_MAX_PENDING_FRAMES);
+    #[cfg(target_os = "macos")]
+    let mut media_v3_frame_orderer =
+        LanMediaFrameOrderer::<QuicMediaFrame>::new(LAN_MEDIA_RECEIVER_REORDER_MAX_PENDING_FRAMES);
     let mut decoder = create_lan_receiver_decoder(&app_state, &session_id)
         .await
         .context("failed to create LAN media receiver decoder")?;
@@ -4918,6 +5375,17 @@ async fn receive_quic_media_loop(
     };
     let mut datagram_media_enabled = true;
     let mut receiver_stats = LanSenderStatsTracker::new(Instant::now());
+    let mut keyframe_request_sequence = 0_u32;
+    let mut last_keyframe_request_at = None;
+    maybe_send_lan_keyframe_request(
+        &endpoint,
+        &session_id,
+        &initial_media_profile,
+        &mut keyframe_request_sequence,
+        &mut last_keyframe_request_at,
+        &mut receiver_stats,
+    )
+    .await;
     loop {
         if !session_allows_media(&app_state, &session_id).await {
             return Ok(());
@@ -5016,27 +5484,66 @@ async fn receive_quic_media_loop(
         }
         let reassemble_started = Instant::now();
         let reassembled_frame = if is_quic_media_v3_datagram(&media_message) {
-            match media_v3_reassembler
+            let reassembled_v3_frame = media_v3_reassembler
                 .push_datagram(&media_message)
-                .context("failed to reassemble LAN QUIC media v3 frame")?
+                .context("failed to reassemble LAN QUIC media v3 frame")?;
+            receiver_stats.record_elapsed("receiver.reassemble", reassemble_started);
+            let Some(frame) = reassembled_v3_frame else {
+                continue;
+            };
+
+            #[cfg(target_os = "macos")]
+            if quic_media_v3_compressed_direct_render_candidate(&frame)
+                && macos_render_proxy_compressed_media_surface_available(&app_state, &session_id)
+                    .await
             {
-                Some(frame) => {
-                    quic_media_v3_frame_to_legacy_frame(
-                        &app_state,
-                        &session_id,
-                        frame,
-                        media_v3_reassembler.stats(),
-                    )
-                    .await?
+                let proxy_forward_started = Instant::now();
+                if render_lan_quic_media_v3_compressed_access_unit_frame(
+                    &app_state,
+                    &session_id,
+                    &mut media_v3_frame_orderer,
+                    frame.clone(),
+                    media_v3_reassembler.stats(),
+                    &mut receiver_stats,
+                    &mut consecutive_decode_errors,
+                    &mut decoder_waits_for_keyframe,
+                    &endpoint,
+                    &mut keyframe_request_sequence,
+                    &mut last_keyframe_request_at,
+                )
+                .await
+                {
+                    let proxy_forward_ms = duration_as_millis(proxy_forward_started.elapsed());
+                    receiver_stats.record_ms("receiver.proxy_forward", proxy_forward_ms);
+                    app_state
+                        .media_pipelines
+                        .lock()
+                        .await
+                        .record_stage_duration_ms(
+                            session_id.clone(),
+                            "receiver.proxy_forward_direct_v3",
+                            proxy_forward_ms,
+                        );
+                    flush_lan_receiver_stage_metrics(&app_state, &session_id, &mut receiver_stats)
+                        .await;
+                    continue;
                 }
-                None => None,
             }
+
+            quic_media_v3_frame_to_legacy_frame(
+                &app_state,
+                &session_id,
+                frame,
+                media_v3_reassembler.stats(),
+            )
+            .await?
         } else {
-            reassembler
+            let reassembled_frame = reassembler
                 .push_datagram(&media_message)
-                .context("failed to reassemble LAN QUIC media v2 frame")?
+                .context("failed to reassemble LAN QUIC media v2 frame")?;
+            receiver_stats.record_elapsed("receiver.reassemble", reassemble_started);
+            reassembled_frame
         };
-        receiver_stats.record_elapsed("receiver.reassemble", reassemble_started);
 
         if let Some(frame) = reassembled_frame {
             let ready_frames = frame_orderer.push(frame);
@@ -5108,7 +5615,112 @@ async fn receive_quic_media_loop(
                                 frame.payload.len() as u64,
                                 now_ms(),
                             );
+                            maybe_send_lan_keyframe_request(
+                                &endpoint,
+                                &session_id,
+                                &envelope.profile,
+                                &mut keyframe_request_sequence,
+                                &mut last_keyframe_request_at,
+                                &mut receiver_stats,
+                            )
+                            .await;
                             continue;
+                        }
+
+                        #[cfg(target_os = "macos")]
+                        if matches!(
+                            frame_codec,
+                            LanAccessUnitCodec::H264 | LanAccessUnitCodec::Hevc
+                        ) {
+                            let proxy_forward_started = Instant::now();
+                            let proxy_result = match frame_codec {
+                                LanAccessUnitCodec::H264 => {
+                                    render_lan_h264_access_unit_frame(
+                                        &app_state,
+                                        &session_id,
+                                        bytes::Bytes::from(envelope.payload.clone()),
+                                        envelope.sequence,
+                                        envelope.timestamp_us,
+                                        &envelope.profile,
+                                    )
+                                    .await
+                                }
+                                LanAccessUnitCodec::Hevc => {
+                                    render_lan_hevc_access_unit_frame(
+                                        &app_state,
+                                        &session_id,
+                                        bytes::Bytes::from(envelope.payload.clone()),
+                                        envelope.sequence,
+                                        envelope.timestamp_us,
+                                        &envelope.profile,
+                                    )
+                                    .await
+                                }
+                            };
+                            match proxy_result {
+                                Ok(true) => {
+                                    receiver_stats.record_elapsed(
+                                        "receiver.proxy_forward",
+                                        proxy_forward_started,
+                                    );
+                                    consecutive_decode_errors = 0;
+                                    decoder_waits_for_keyframe = false;
+                                    continue;
+                                }
+                                Ok(false)
+                                    if macos_render_proxy_compressed_media_surface_available(
+                                        &app_state,
+                                        &session_id,
+                                    )
+                                    .await =>
+                                {
+                                    receiver_stats.record_elapsed(
+                                        "receiver.proxy_forward",
+                                        proxy_forward_started,
+                                    );
+                                    app_state.probes.lock().await.record_transient_frame_drop(
+                                        &session_id,
+                                        frame.payload.len() as u64,
+                                        now_ms(),
+                                    );
+                                    maybe_send_lan_keyframe_request(
+                                        &endpoint,
+                                        &session_id,
+                                        &envelope.profile,
+                                        &mut keyframe_request_sequence,
+                                        &mut last_keyframe_request_at,
+                                        &mut receiver_stats,
+                                    )
+                                    .await;
+                                    decoder_waits_for_keyframe = true;
+                                    continue;
+                                }
+                                Ok(false) => {}
+                                Err(error) => {
+                                    receiver_stats.record_elapsed(
+                                        "receiver.proxy_forward",
+                                        proxy_forward_started,
+                                    );
+                                    tracing::warn!(
+                                        %error,
+                                        session_id = %session_id.0,
+                                        sequence = envelope.sequence,
+                                        codec = frame_codec.display_name(),
+                                        "LAN media receiver failed to forward access unit to macOS render proxy"
+                                    );
+                                    app_state.probes.lock().await.record_probe_drop(
+                                        &session_id,
+                                        frame.payload.len() as u64,
+                                        now_ms(),
+                                        format!(
+                                            "failed to forward LAN {} access unit to macOS render proxy: {error:#}",
+                                            frame_codec.display_name()
+                                        ),
+                                    );
+                                    decoder_waits_for_keyframe = true;
+                                    continue;
+                                }
+                            }
                         }
 
                         let decode_started = Instant::now();
@@ -5287,14 +5899,199 @@ async fn receive_quic_media_loop(
                 }
             }
         }
-        if let Some(metrics) = receiver_stats.take_stage_metrics(Instant::now()) {
-            app_state
-                .media_pipelines
-                .lock()
+        flush_lan_receiver_stage_metrics(&app_state, &session_id, &mut receiver_stats).await;
+    }
+}
+
+async fn flush_lan_receiver_stage_metrics(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+    receiver_stats: &mut LanSenderStatsTracker,
+) {
+    if let Some(metrics) = receiver_stats.take_stage_metrics(Instant::now()) {
+        app_state
+            .media_pipelines
+            .lock()
+            .await
+            .set_stage_metrics(session_id.clone(), metrics);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn quic_media_v3_compressed_direct_render_candidate(frame: &QuicMediaFrame) -> bool {
+    macos_render_proxy_compressed_media_enabled()
+        && frame.payload_type == QuicMediaPayloadType::AccessUnit
+        && matches!(frame.codec, QuicMediaCodec::H264 | QuicMediaCodec::Hevc)
+}
+
+#[cfg(target_os = "macos")]
+async fn macos_render_proxy_compressed_media_surface_available(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+) -> bool {
+    if !macos_render_proxy_compressed_media_enabled() {
+        return false;
+    }
+    app_state
+        .media_surface_renderers
+        .lock()
+        .await
+        .session_surface_count(session_id)
+        > 0
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+async fn render_lan_quic_media_v3_compressed_access_unit_frame(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+    frame_orderer: &mut LanMediaFrameOrderer<QuicMediaFrame>,
+    frame: QuicMediaFrame,
+    reassembler_stats: QuicAuReassemblerStats,
+    receiver_stats: &mut LanSenderStatsTracker,
+    consecutive_decode_errors: &mut u32,
+    decoder_waits_for_keyframe: &mut bool,
+    endpoint: &QuinnDatagramEndpoint,
+    keyframe_request_sequence: &mut u32,
+    last_keyframe_request_at: &mut Option<Instant>,
+) -> bool {
+    if !quic_media_v3_compressed_direct_render_candidate(&frame) {
+        return false;
+    }
+
+    let frame_codec = frame.codec;
+    let mut profile = selected_media_profile(app_state, session_id).await;
+    let expected_profile_id = lan_media_profile_id(&profile);
+    if frame.profile_id != expected_profile_id {
+        tracing::debug!(
+            session_id = %session_id.0,
+            frame_id = frame.frame_id,
+            expected_profile_id,
+            received_profile_id = frame.profile_id,
+            completed = reassembler_stats.completed_frames,
+            expired = reassembler_stats.expired_frames,
+            evicted = reassembler_stats.evicted_frames,
+            duplicate = reassembler_stats.duplicate_fragments,
+            rejected = reassembler_stats.rejected_fragments,
+            pending = reassembler_stats.pending_frames,
+            codec = ?frame_codec,
+            "LAN media receiver dropped stale v3 compressed profile frame before legacy envelope conversion"
+        );
+        app_state.probes.lock().await.record_transient_frame_drop(
+            session_id,
+            frame.payload.len() as u64,
+            now_ms(),
+        );
+        return true;
+    }
+
+    profile.codec = match frame_codec {
+        QuicMediaCodec::H264 => "h264".to_string(),
+        QuicMediaCodec::Hevc => "hevc".to_string(),
+        _ => return false,
+    };
+    normalize_lan_media_profile(&mut profile);
+
+    let ready_frames = frame_orderer.push(frame);
+    receiver_stats.record_ms("receiver.ready_frames", ready_frames.len() as f64);
+    for ready_frame in ready_frames {
+        if *decoder_waits_for_keyframe && !ready_frame.is_keyframe() {
+            app_state.probes.lock().await.record_transient_frame_drop(
+                session_id,
+                ready_frame.payload.len() as u64,
+                now_ms(),
+            );
+            maybe_send_lan_keyframe_request(
+                endpoint,
+                session_id,
+                &profile,
+                keyframe_request_sequence,
+                last_keyframe_request_at,
+                receiver_stats,
+            )
+            .await;
+            continue;
+        }
+
+        let render_result = match frame_codec {
+            QuicMediaCodec::H264 => {
+                render_lan_h264_access_unit_frame(
+                    app_state,
+                    session_id,
+                    ready_frame.payload.clone(),
+                    u64::from(ready_frame.frame_id),
+                    ready_frame.timestamp_us,
+                    &profile,
+                )
                 .await
-                .set_stage_metrics(session_id.clone(), metrics);
+            }
+            QuicMediaCodec::Hevc => {
+                render_lan_hevc_access_unit_frame(
+                    app_state,
+                    session_id,
+                    ready_frame.payload.clone(),
+                    u64::from(ready_frame.frame_id),
+                    ready_frame.timestamp_us,
+                    &profile,
+                )
+                .await
+            }
+            _ => return false,
+        };
+        match render_result {
+            Ok(true) => {
+                *consecutive_decode_errors = 0;
+                *decoder_waits_for_keyframe = false;
+            }
+            Ok(false) => {
+                app_state.probes.lock().await.record_transient_frame_drop(
+                    session_id,
+                    ready_frame.payload.len() as u64,
+                    now_ms(),
+                );
+                maybe_send_lan_keyframe_request(
+                    endpoint,
+                    session_id,
+                    &profile,
+                    keyframe_request_sequence,
+                    last_keyframe_request_at,
+                    receiver_stats,
+                )
+                .await;
+                *decoder_waits_for_keyframe = true;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    session_id = %session_id.0,
+                    sequence = ready_frame.frame_id,
+                    codec = ?frame_codec,
+                    "LAN media receiver failed to forward v3 compressed access unit to macOS render proxy"
+                );
+                app_state.probes.lock().await.record_probe_drop(
+                    session_id,
+                    ready_frame.payload.len() as u64,
+                    now_ms(),
+                    format!(
+                        "failed to forward LAN v3 {:?} access unit to macOS render proxy: {error:#}",
+                        frame_codec
+                    ),
+                );
+                maybe_send_lan_keyframe_request(
+                    endpoint,
+                    session_id,
+                    &profile,
+                    keyframe_request_sequence,
+                    last_keyframe_request_at,
+                    receiver_stats,
+                )
+                .await;
+                *decoder_waits_for_keyframe = true;
+            }
         }
     }
+
+    true
 }
 
 async fn quic_media_v3_frame_to_legacy_frame(
@@ -5381,8 +6178,12 @@ async fn record_lan_decoded_frames(
     encoded_payload: &[u8],
 ) {
     for decoded_frame in decoded_frames {
-        #[cfg(windows)]
-        if let Err(error) = render_lan_decoded_frame(app_state, session_id, &decoded_frame).await {
+        let width = decoded_frame.width as u32;
+        let height = decoded_frame.height as u32;
+        let decoded_pixel_format = decoded_frame_pixel_format(&decoded_frame);
+
+        #[cfg(any(windows, target_os = "macos"))]
+        if let Err(error) = render_lan_decoded_frame(app_state, session_id, decoded_frame).await {
             tracing::warn!(
                 %error,
                 session_id = %session_id.0,
@@ -5391,9 +6192,6 @@ async fn record_lan_decoded_frames(
             );
         }
 
-        let width = decoded_frame.width as u32;
-        let height = decoded_frame.height as u32;
-        let decoded_pixel_format = decoded_frame_pixel_format(&decoded_frame);
         app_state
             .media_pipelines
             .lock()
@@ -5414,26 +6212,8 @@ async fn record_lan_decoded_frames(
                 format!("receiver.format.{decoded_pixel_format}"),
                 1.0,
             );
-        let payload_hash = format!("fnv1a64:{:016x}", fnv1a64(encoded_payload));
-        let preview_frame = if should_update_lan_preview(sequence) {
-            match decoded_frame_to_preview_rgb24(decoded_frame) {
-                Ok(preview_frame) => Some(preview_frame),
-                Err(error) => {
-                    tracing::debug!(
-                        %error,
-                        session_id = %session_id.0,
-                        sequence,
-                        "LAN media preview frame was not CPU-readable"
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        let (preview_width, preview_height, preview_rgb24) = preview_frame
-            .map(|(width, height, rgb24)| (Some(width), Some(height), Some(rgb24)))
-            .unwrap_or((None, None, None));
+        let payload_hash =
+            lan_media_payload_hash_for_profile(profile, sequence, timestamp_us, encoded_payload);
 
         app_state.probes.lock().await.record_decoded_video_frame(
             session_id,
@@ -5447,25 +6227,28 @@ async fn record_lan_decoded_frames(
                 target_bitrate_mbps: profile.bitrate_mbps,
                 encoded_bytes: encoded_payload.len() as u32,
                 format: decoded_video_probe_format(&profile.codec),
-                pixel_format: preview_rgb24
-                    .as_ref()
-                    .map(|_| "rgb24".to_string())
-                    .unwrap_or(decoded_pixel_format),
+                pixel_format: decoded_pixel_format,
                 payload_hash,
-                preview_width,
-                preview_height,
-                rgb24: preview_rgb24,
+                preview_width: None,
+                preview_height: None,
+                rgb24: None,
             },
             now_ms(),
         );
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 #[derive(Debug)]
 enum LanRenderTaskOutcome {
     Rendered {
         upload_duration_ms: f64,
+        render_proxy_upload_ms: Option<f64>,
+        render_proxy_transport_ms: Option<f64>,
+        render_proxy_decode_ms: Option<f64>,
+        render_proxy_draw_present_ms: Option<f64>,
+        render_proxy_next_drawable_ms: Option<f64>,
+        render_proxy_encode_commit_ms: Option<f64>,
         lock_wait_ms: f64,
         presented_frames: u64,
         present_skips: u64,
@@ -5477,11 +6260,11 @@ enum LanRenderTaskOutcome {
     Idle,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 async fn render_lan_decoded_frame(
     app_state: &Arc<AppState>,
     session_id: &SessionId,
-    decoded_frame: &DecodedFrame,
+    decoded_frame: DecodedFrame,
 ) -> Result<()> {
     if app_state
         .media_surface_renderers
@@ -5493,10 +6276,11 @@ async fn render_lan_decoded_frame(
         return Ok(());
     }
 
-    let render_frame = decoded_frame_to_render_frame(decoded_frame.clone())?;
+    let render_frame = MediaRenderFrame::Decoded(decoded_frame_to_render_frame(decoded_frame)?);
     let render_profile = selected_media_profile(app_state, session_id).await;
     let render_queue_policy = lan_render_queue_policy_for_profile(&render_profile);
-    let max_pending_frames = lan_render_queue_capacity_for_profile(&render_profile);
+    let max_pending_frames =
+        lan_render_queue_capacity_for_policy(&render_profile, render_queue_policy);
     let render_pacing_target_fps = lan_render_cap_target_fps_for_profile(&render_profile);
     let (enqueue, enqueue_gap_ms) = {
         let mut render_queues = app_state.media_render_queues.lock().await;
@@ -5537,9 +6321,11 @@ async fn render_lan_decoded_frame(
             let mut pipelines = app_state.media_pipelines.lock().await;
             pipelines.record_queue_depth(session_id.clone(), depth as u32);
             if replaced {
-                pipelines.increment_render_queue_replacements(session_id.clone(), 1);
                 if render_queue_policy == LanRenderQueuePolicy::Latest {
+                    pipelines.record_render_queue_replacements(session_id.clone(), 1);
                     pipelines.increment_render_stale_frame_drops(session_id.clone(), 1);
+                } else {
+                    pipelines.increment_render_queue_replacements(session_id.clone(), 1);
                 }
             }
         }
@@ -5547,11 +6333,227 @@ async fn render_lan_decoded_frame(
     Ok(())
 }
 
-#[cfg(windows)]
+#[cfg(target_os = "macos")]
+async fn render_lan_h264_access_unit_frame(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+    payload: bytes::Bytes,
+    sequence: u64,
+    timestamp_us: u64,
+    profile: &MediaProfile,
+) -> Result<bool> {
+    if !macos_render_proxy_compressed_media_enabled() {
+        return Ok(false);
+    }
+    if app_state
+        .media_surface_renderers
+        .lock()
+        .await
+        .session_surface_count(session_id)
+        == 0
+    {
+        return Ok(false);
+    }
+
+    let payload_len = payload.len();
+    let payload_hash =
+        lan_media_payload_hash_for_profile(profile, sequence, timestamp_us, &payload);
+    let render_queue_policy = lan_render_queue_policy_for_profile(profile);
+    let max_pending_frames = lan_render_queue_capacity_for_policy(profile, render_queue_policy);
+    let render_pacing_target_fps = lan_render_cap_target_fps_for_profile(profile);
+    let render_frame = MediaRenderFrame::H264AccessUnit {
+        width: profile.width as usize,
+        height: profile.height as usize,
+        timestamp_us,
+        payload,
+    };
+    let (enqueue, enqueue_gap_ms) = {
+        let mut render_queues = app_state.media_render_queues.lock().await;
+        let now = Instant::now();
+        let enqueue_gap_ms = render_queues
+            .record_enqueued(session_id, now)
+            .map(duration_as_millis);
+        let enqueue =
+            render_queues.enqueue_bounded(session_id.clone(), render_frame, max_pending_frames);
+        (enqueue, enqueue_gap_ms)
+    };
+
+    {
+        let mut pipelines = app_state.media_pipelines.lock().await;
+        pipelines.set_active_decoder(session_id.clone(), "rdesk_videotoolbox");
+        pipelines.record_active_media_sample(
+            session_id.clone(),
+            profile,
+            profile.width,
+            profile.height,
+            "proxy_h264",
+        );
+        pipelines.record_stage_duration_ms(session_id.clone(), "receiver.format.proxy_h264", 1.0);
+        pipelines.set_render_pacing_target_fps(session_id.clone(), render_pacing_target_fps);
+        pipelines.set_render_queue_policy(session_id.clone(), Some(render_queue_policy.as_str()));
+        if let Some(enqueue_gap_ms) = enqueue_gap_ms {
+            pipelines.record_stage_duration_ms(
+                session_id.clone(),
+                "render_enqueue_gap",
+                enqueue_gap_ms,
+            );
+        }
+    }
+
+    match enqueue {
+        MediaRenderQueueEnqueue::Start(frame) => {
+            spawn_lan_render_worker(app_state.clone(), session_id.clone(), frame);
+        }
+        MediaRenderQueueEnqueue::Queued { replaced, depth } => {
+            let mut pipelines = app_state.media_pipelines.lock().await;
+            pipelines.record_queue_depth(session_id.clone(), depth as u32);
+            if replaced {
+                if render_queue_policy == LanRenderQueuePolicy::Latest {
+                    pipelines.record_render_queue_replacements(session_id.clone(), 1);
+                    pipelines.increment_render_stale_frame_drops(session_id.clone(), 1);
+                } else {
+                    pipelines.increment_render_queue_replacements(session_id.clone(), 1);
+                }
+            }
+        }
+    }
+
+    app_state.probes.lock().await.record_decoded_video_frame(
+        session_id,
+        DecodedVideoFrameStats {
+            bytes_received: payload_len as u64,
+            sequence,
+            timestamp_us,
+            width: profile.width,
+            height: profile.height,
+            target_fps: profile.fps,
+            target_bitrate_mbps: profile.bitrate_mbps,
+            encoded_bytes: payload_len as u32,
+            format: decoded_video_probe_format(&profile.codec),
+            pixel_format: "proxy_h264".to_string(),
+            payload_hash,
+            preview_width: None,
+            preview_height: None,
+            rgb24: None,
+        },
+        now_ms(),
+    );
+    Ok(true)
+}
+
+#[cfg(target_os = "macos")]
+async fn render_lan_hevc_access_unit_frame(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+    payload: bytes::Bytes,
+    sequence: u64,
+    timestamp_us: u64,
+    profile: &MediaProfile,
+) -> Result<bool> {
+    if !macos_render_proxy_compressed_media_enabled() {
+        return Ok(false);
+    }
+    if app_state
+        .media_surface_renderers
+        .lock()
+        .await
+        .session_surface_count(session_id)
+        == 0
+    {
+        return Ok(false);
+    }
+
+    let payload_len = payload.len();
+    let payload_hash =
+        lan_media_payload_hash_for_profile(profile, sequence, timestamp_us, &payload);
+    let render_queue_policy = lan_render_queue_policy_for_profile(profile);
+    let max_pending_frames = lan_render_queue_capacity_for_policy(profile, render_queue_policy);
+    let render_pacing_target_fps = lan_render_cap_target_fps_for_profile(profile);
+    let render_frame = MediaRenderFrame::HevcAccessUnit {
+        width: profile.width as usize,
+        height: profile.height as usize,
+        timestamp_us,
+        payload,
+    };
+    let (enqueue, enqueue_gap_ms) = {
+        let mut render_queues = app_state.media_render_queues.lock().await;
+        let now = Instant::now();
+        let enqueue_gap_ms = render_queues
+            .record_enqueued(session_id, now)
+            .map(duration_as_millis);
+        let enqueue =
+            render_queues.enqueue_bounded(session_id.clone(), render_frame, max_pending_frames);
+        (enqueue, enqueue_gap_ms)
+    };
+
+    {
+        let mut pipelines = app_state.media_pipelines.lock().await;
+        pipelines.set_active_decoder(session_id.clone(), "rdesk_videotoolbox_hevc");
+        pipelines.record_active_media_sample(
+            session_id.clone(),
+            profile,
+            profile.width,
+            profile.height,
+            "proxy_hevc",
+        );
+        pipelines.record_stage_duration_ms(session_id.clone(), "receiver.format.proxy_hevc", 1.0);
+        pipelines.set_render_pacing_target_fps(session_id.clone(), render_pacing_target_fps);
+        pipelines.set_render_queue_policy(session_id.clone(), Some(render_queue_policy.as_str()));
+        if let Some(enqueue_gap_ms) = enqueue_gap_ms {
+            pipelines.record_stage_duration_ms(
+                session_id.clone(),
+                "render_enqueue_gap",
+                enqueue_gap_ms,
+            );
+        }
+    }
+
+    match enqueue {
+        MediaRenderQueueEnqueue::Start(frame) => {
+            spawn_lan_render_worker(app_state.clone(), session_id.clone(), frame);
+        }
+        MediaRenderQueueEnqueue::Queued { replaced, depth } => {
+            let mut pipelines = app_state.media_pipelines.lock().await;
+            pipelines.record_queue_depth(session_id.clone(), depth as u32);
+            if replaced {
+                if render_queue_policy == LanRenderQueuePolicy::Latest {
+                    pipelines.record_render_queue_replacements(session_id.clone(), 1);
+                    pipelines.increment_render_stale_frame_drops(session_id.clone(), 1);
+                } else {
+                    pipelines.increment_render_queue_replacements(session_id.clone(), 1);
+                }
+            }
+        }
+    }
+
+    app_state.probes.lock().await.record_decoded_video_frame(
+        session_id,
+        DecodedVideoFrameStats {
+            bytes_received: payload_len as u64,
+            sequence,
+            timestamp_us,
+            width: profile.width,
+            height: profile.height,
+            target_fps: profile.fps,
+            target_bitrate_mbps: profile.bitrate_mbps,
+            encoded_bytes: payload_len as u32,
+            format: decoded_video_probe_format(&profile.codec),
+            pixel_format: "proxy_hevc".to_string(),
+            payload_hash,
+            preview_width: None,
+            preview_height: None,
+            rgb24: None,
+        },
+        now_ms(),
+    );
+    Ok(true)
+}
+
+#[cfg(any(windows, target_os = "macos"))]
 fn spawn_lan_render_worker(
     app_state: Arc<AppState>,
     session_id: SessionId,
-    first_frame: RenderFrame,
+    first_frame: MediaRenderFrame,
 ) {
     let fallback_app_state = app_state.clone();
     let fallback_session_id = session_id.clone();
@@ -5560,6 +6562,7 @@ fn spawn_lan_render_worker(
     let spawn_result = thread::Builder::new()
         .name("mrd-lan-render".to_string())
         .spawn(move || {
+            #[cfg(windows)]
             configure_lan_render_thread_priority();
             handle.block_on(run_lan_render_worker(app_state, session_id, first_frame));
         });
@@ -5589,11 +6592,11 @@ fn configure_lan_render_thread_priority() {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 async fn run_lan_render_worker(
     app_state: Arc<AppState>,
     session_id: SessionId,
-    first_frame: RenderFrame,
+    first_frame: MediaRenderFrame,
 ) {
     let mut frame = first_frame;
     let mut timer_resolution = MediaTimerResolution::default();
@@ -5615,6 +6618,12 @@ async fn run_lan_render_worker(
         match render_lan_frame_once(app_state.clone(), session_id.clone(), frame).await {
             Ok(LanRenderTaskOutcome::Rendered {
                 upload_duration_ms,
+                render_proxy_upload_ms,
+                render_proxy_transport_ms,
+                render_proxy_decode_ms,
+                render_proxy_draw_present_ms,
+                render_proxy_next_drawable_ms,
+                render_proxy_encode_commit_ms,
                 lock_wait_ms,
                 presented_frames,
                 present_skips,
@@ -5629,6 +6638,48 @@ async fn run_lan_render_worker(
                         "render_upload",
                         upload_duration_ms,
                     );
+                    if let Some(render_proxy_upload_ms) = render_proxy_upload_ms {
+                        pipelines.record_stage_duration_ms(
+                            session_id.clone(),
+                            "render_proxy_upload",
+                            render_proxy_upload_ms,
+                        );
+                    }
+                    if let Some(render_proxy_transport_ms) = render_proxy_transport_ms {
+                        pipelines.record_stage_duration_ms(
+                            session_id.clone(),
+                            "render_proxy_transport",
+                            render_proxy_transport_ms,
+                        );
+                    }
+                    if let Some(render_proxy_decode_ms) = render_proxy_decode_ms {
+                        pipelines.record_stage_duration_ms(
+                            session_id.clone(),
+                            "render_proxy_decode",
+                            render_proxy_decode_ms,
+                        );
+                    }
+                    if let Some(render_proxy_draw_present_ms) = render_proxy_draw_present_ms {
+                        pipelines.record_stage_duration_ms(
+                            session_id.clone(),
+                            "render_proxy_draw_present",
+                            render_proxy_draw_present_ms,
+                        );
+                    }
+                    if let Some(render_proxy_next_drawable_ms) = render_proxy_next_drawable_ms {
+                        pipelines.record_stage_duration_ms(
+                            session_id.clone(),
+                            "render_proxy_next_drawable",
+                            render_proxy_next_drawable_ms,
+                        );
+                    }
+                    if let Some(render_proxy_encode_commit_ms) = render_proxy_encode_commit_ms {
+                        pipelines.record_stage_duration_ms(
+                            session_id.clone(),
+                            "render_proxy_encode_commit",
+                            render_proxy_encode_commit_ms,
+                        );
+                    }
                     if lock_wait_ms > 0.0 {
                         pipelines.record_stage_duration_ms(
                             session_id.clone(),
@@ -5734,7 +6785,7 @@ async fn run_lan_render_worker(
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 async fn pace_lan_render_frame(
     app_state: &Arc<AppState>,
     session_id: &SessionId,
@@ -5744,7 +6795,7 @@ async fn pace_lan_render_frame(
     if !lan_render_policy_allows_service_pacing(
         policy,
         profile,
-        lan_render_waitable_swapchain_pacing_enabled(),
+        native_render_waitable_swapchain_pacing_enabled(),
     ) {
         return;
     }
@@ -5788,7 +6839,7 @@ async fn pace_lan_render_frame(
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 async fn sleep_until_lan_render_frame(
     app_state: &Arc<AppState>,
     session_id: &SessionId,
@@ -5822,30 +6873,30 @@ async fn sleep_until_lan_render_frame(
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn take_next_lan_render_frame_for_policy(
     render_queues: &mut MediaRenderQueueRegistry,
     session_id: &SessionId,
     policy: LanRenderQueuePolicy,
-) -> (Option<RenderFrame>, usize) {
+) -> (Option<MediaRenderFrame>, usize) {
     match policy {
         LanRenderQueuePolicy::Latest => render_queues.take_latest_or_finish(session_id),
         LanRenderQueuePolicy::PacedFifo => (render_queues.take_next_or_finish(session_id), 0),
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn should_interrupt_render_pacing_sleep(pending_depth: usize, _max_pending_frames: usize) -> bool {
     pending_depth > 0
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn render_profile_requests_high_resolution_timer(profile: &MediaProfile) -> bool {
     lan_render_pacing_enabled_for_profile(profile)
         && lan_render_pacing_target_fps(profile) >= LAN_RENDER_PACING_PRECISE_SLEEP_MIN_FPS
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn render_pacing_precise_sleep_guard(target_fps: u32) -> Duration {
     if target_fps < LAN_RENDER_PACING_PRECISE_SLEEP_MIN_FPS {
         return Duration::ZERO;
@@ -5854,7 +6905,7 @@ fn render_pacing_precise_sleep_guard(target_fps: u32) -> Duration {
     LAN_RENDER_PACING_PRECISE_SLEEP_GUARD.min(render_pacing_frame_interval(target_fps) / 2)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn lan_render_pacing_render_start_delay(delay: Duration, target_fps: u32) -> Duration {
     if target_fps < LAN_RENDER_PACING_PRECISE_SLEEP_MIN_FPS {
         return delay;
@@ -5865,16 +6916,16 @@ fn lan_render_pacing_render_start_delay(delay: Duration, target_fps: u32) -> Dur
     )
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn render_pacing_frame_interval(fps: u32) -> Duration {
     Duration::from_micros((1_000_000 / u64::from(fps.max(1))).max(1))
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 async fn render_lan_frame_once(
     app_state: Arc<AppState>,
     session_id: SessionId,
-    frame: RenderFrame,
+    frame: MediaRenderFrame,
 ) -> Result<LanRenderTaskOutcome> {
     let renderers = {
         let render_registry = app_state.media_surface_renderers.lock().await;
@@ -5897,11 +6948,25 @@ async fn render_lan_frame_once(
     let mut lock_wait_ms = 0.0_f64;
     let mut presented_frames = 0_u64;
     let mut present_skips = 0_u64;
+    let mut render_queue_replacements = 0_u64;
     let mut waitable_wait_ms = 0.0_f64;
     let mut waitable_waits = 0_u64;
     let mut waitable_timeouts = 0_u64;
+    let mut render_proxy_upload_ms = 0.0_f64;
+    let mut render_proxy_transport_ms = 0.0_f64;
+    let mut render_proxy_decode_ms = 0.0_f64;
+    let mut render_proxy_draw_present_ms = 0.0_f64;
+    let mut render_proxy_next_drawable_ms = 0.0_f64;
+    let mut render_proxy_encode_commit_ms = 0.0_f64;
+    let mut render_proxy_samples = 0_u64;
+    let mut render_proxy_decode_samples = 0_u64;
+    let mut render_proxy_draw_present_samples = 0_u64;
+    let mut render_proxy_next_drawable_samples = 0_u64;
+    let mut render_proxy_encode_commit_samples = 0_u64;
     let mut renderer_snapshots = Vec::<RendererSnapshot>::new();
-    for renderer in &renderers {
+    let renderer_count = renderers.len();
+    let mut frame_for_last_renderer = Some(frame);
+    for (renderer_index, renderer) in renderers.iter().enumerate() {
         let lock_started = Instant::now();
         let Some(mut renderer) =
             wait_for_mutex_guard(renderer.as_ref(), LAN_RENDER_SURFACE_RENDERER_LOCK_TIMEOUT)
@@ -5916,16 +6981,55 @@ async fn render_lan_frame_once(
         lock_wait_ms += lock_started.elapsed().as_secs_f64() * 1000.0;
         let before = renderer.snapshot();
         let upload_started = Instant::now();
-        renderer
-            .upload_frame(frame.clone())
-            .map_err(|error| anyhow::anyhow!("upload frame to D3D11 renderer failed: {error}"))?;
+        let frame_for_renderer = if renderer_index + 1 == renderer_count {
+            frame_for_last_renderer
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("render frame was already consumed"))?
+        } else {
+            frame_for_last_renderer
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("render frame was already consumed"))?
+                .clone()
+        };
+        upload_lan_render_frame(renderer.as_mut(), frame_for_renderer)
+            .map_err(|error| anyhow::anyhow!("upload frame to native renderer failed: {error}"))?;
         let after = renderer.snapshot();
         let wait_delta = renderer_snapshot_waitable_delta(&before, &after);
         let upload_elapsed_ms = upload_started.elapsed().as_secs_f64() * 1000.0;
-        upload_duration_ms += (upload_elapsed_ms - wait_delta.wait_ms).max(0.0);
+        let upload_without_wait_ms = (upload_elapsed_ms - wait_delta.wait_ms).max(0.0);
+        upload_duration_ms += upload_without_wait_ms;
+        if renderer_snapshot_uses_render_proxy(&after) {
+            if let Some(proxy_upload_ms) = after.last_render_draw_present_ms {
+                render_proxy_upload_ms += proxy_upload_ms;
+                render_proxy_transport_ms += (upload_without_wait_ms - proxy_upload_ms).max(0.0);
+                if let Some(proxy_decode_ms) = after.last_render_prepare_wait_ms {
+                    render_proxy_decode_ms += proxy_decode_ms;
+                    render_proxy_decode_samples = render_proxy_decode_samples.saturating_add(1);
+                }
+                if let Some(proxy_draw_present_ms) = after.last_render_shared_resource_ms {
+                    render_proxy_draw_present_ms += proxy_draw_present_ms;
+                    render_proxy_draw_present_samples =
+                        render_proxy_draw_present_samples.saturating_add(1);
+                }
+                if let Some(proxy_next_drawable_ms) = after.last_render_wait_for_drawable_ms {
+                    render_proxy_next_drawable_ms += proxy_next_drawable_ms;
+                    render_proxy_next_drawable_samples =
+                        render_proxy_next_drawable_samples.saturating_add(1);
+                }
+                if let Some(proxy_encode_commit_ms) = after.last_render_encode_commit_ms {
+                    render_proxy_encode_commit_ms += proxy_encode_commit_ms;
+                    render_proxy_encode_commit_samples =
+                        render_proxy_encode_commit_samples.saturating_add(1);
+                }
+                render_proxy_samples = render_proxy_samples.saturating_add(1);
+            }
+        }
         waitable_wait_ms += wait_delta.wait_ms;
         waitable_waits = waitable_waits.saturating_add(wait_delta.waits);
         waitable_timeouts = waitable_timeouts.saturating_add(wait_delta.timeouts);
+        render_queue_replacements = render_queue_replacements.saturating_add(
+            renderer_snapshot_render_queue_replacement_delta(&before, &after),
+        );
         let uploaded_delta = after
             .uploaded_frame_count
             .saturating_sub(before.uploaded_frame_count);
@@ -5954,6 +7058,8 @@ async fn render_lan_frame_once(
             for snapshot in &renderer_snapshots {
                 pipelines.record_renderer_snapshot(session_id.clone(), snapshot);
             }
+            pipelines
+                .record_render_queue_replacements(session_id.clone(), render_queue_replacements);
         }
         let present_log_count = LAN_RENDER_PRESENT_LOG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
         if present_log_count <= 5 || present_log_count % 120 == 0 {
@@ -5968,6 +7074,17 @@ async fn render_lan_frame_once(
         }
         Ok(LanRenderTaskOutcome::Rendered {
             upload_duration_ms,
+            render_proxy_upload_ms: (render_proxy_samples > 0).then_some(render_proxy_upload_ms),
+            render_proxy_transport_ms: (render_proxy_samples > 0)
+                .then_some(render_proxy_transport_ms),
+            render_proxy_decode_ms: (render_proxy_decode_samples > 0)
+                .then_some(render_proxy_decode_ms),
+            render_proxy_draw_present_ms: (render_proxy_draw_present_samples > 0)
+                .then_some(render_proxy_draw_present_ms),
+            render_proxy_next_drawable_ms: (render_proxy_next_drawable_samples > 0)
+                .then_some(render_proxy_next_drawable_ms),
+            render_proxy_encode_commit_ms: (render_proxy_encode_commit_samples > 0)
+                .then_some(render_proxy_encode_commit_ms),
             lock_wait_ms,
             presented_frames,
             present_skips,
@@ -5980,7 +7097,50 @@ async fn render_lan_frame_once(
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
+fn renderer_snapshot_uses_render_proxy(snapshot: &RendererSnapshot) -> bool {
+    snapshot
+        .swap_chain_present_mode
+        .as_deref()
+        .is_some_and(|mode| mode.starts_with("render_proxy"))
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn renderer_snapshot_render_queue_replacement_delta(
+    before: &RendererSnapshot,
+    after: &RendererSnapshot,
+) -> u64 {
+    after
+        .render_queue_replacements
+        .unwrap_or_default()
+        .saturating_sub(before.render_queue_replacements.unwrap_or_default())
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn upload_lan_render_frame(
+    renderer: &mut dyn mrd_render::RendererInstance,
+    frame: MediaRenderFrame,
+) -> Result<(), mrd_render::RenderError> {
+    match frame {
+        MediaRenderFrame::Decoded(frame) => renderer.upload_frame(frame),
+        #[cfg(target_os = "macos")]
+        MediaRenderFrame::H264AccessUnit {
+            width,
+            height,
+            timestamp_us,
+            payload,
+        } => renderer.upload_h264_access_unit(width, height, timestamp_us, payload),
+        #[cfg(target_os = "macos")]
+        MediaRenderFrame::HevcAccessUnit {
+            width,
+            height,
+            timestamp_us,
+            payload,
+        } => renderer.upload_hevc_access_unit(width, height, timestamp_us, payload),
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
 #[derive(Default)]
 struct RendererWaitableDelta {
     wait_ms: f64,
@@ -5988,7 +7148,7 @@ struct RendererWaitableDelta {
     timeouts: u64,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn renderer_snapshot_waitable_delta(
     before: &RendererSnapshot,
     after: &RendererSnapshot,
@@ -6006,7 +7166,7 @@ fn renderer_snapshot_waitable_delta(
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn wait_for_mutex_guard<'a, T>(
     mutex: &'a StdMutex<T>,
     wait_timeout: Duration,
@@ -6016,7 +7176,9 @@ fn wait_for_mutex_guard<'a, T>(
     loop {
         match mutex.try_lock() {
             Ok(guard) => return Ok(Some(guard)),
-            Err(TryLockError::Poisoned(_)) => return Err("D3D11 renderer lock was poisoned".into()),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err("native renderer lock was poisoned".into())
+            }
             Err(TryLockError::WouldBlock) => {
                 if started.elapsed() >= wait_timeout {
                     return Ok(None);
@@ -6032,7 +7194,7 @@ fn wait_for_mutex_guard<'a, T>(
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn decoded_frame_to_render_frame(frame: DecodedFrame) -> Result<RenderFrame> {
     match frame.data {
         DecodedFrameData::CpuRgb24(data) => {
@@ -6057,7 +7219,30 @@ fn decoded_frame_to_render_frame(frame: DecodedFrame) -> Result<RenderFrame> {
             }
             Ok(RenderFrame::from_bgra32(frame.width, frame.height, data))
         }
-        DecodedFrameData::CpuNv12 { .. } | DecodedFrameData::CpuI420 { .. } => {
+        DecodedFrameData::CpuNv12 { data, pitch } => {
+            if pitch < frame.width {
+                anyhow::bail!("decoded NV12 render frame pitch is smaller than width");
+            }
+            let y_bytes = pitch
+                .checked_mul(frame.height)
+                .ok_or_else(|| anyhow::anyhow!("decoded NV12 luma byte size overflow"))?;
+            let uv_bytes = pitch
+                .checked_mul(frame.height.div_ceil(2))
+                .ok_or_else(|| anyhow::anyhow!("decoded NV12 chroma byte size overflow"))?;
+            let expected_len = y_bytes
+                .checked_add(uv_bytes)
+                .ok_or_else(|| anyhow::anyhow!("decoded NV12 byte size overflow"))?;
+            if data.len() < expected_len {
+                anyhow::bail!("decoded NV12 render frame has invalid byte length");
+            }
+            Ok(RenderFrame::from_nv12(
+                frame.width,
+                frame.height,
+                data,
+                pitch,
+            ))
+        }
+        DecodedFrameData::CpuI420 { .. } => {
             let (width, height, rgb24) = decoded_frame_to_rgb24(frame)?;
             Ok(RenderFrame::from_rgb24(
                 width as usize,
@@ -6066,7 +7251,7 @@ fn decoded_frame_to_render_frame(frame: DecodedFrame) -> Result<RenderFrame> {
             ))
         }
         DecodedFrameData::CpuP010 { .. } => {
-            anyhow::bail!("CPU P010 decoded frames are not supported by the D3D11 renderer yet")
+            anyhow::bail!("CPU P010 decoded frames are not supported by the native renderer yet")
         }
         #[cfg(windows)]
         DecodedFrameData::D3D11SharedNv12 {
@@ -6229,6 +7414,12 @@ fn create_lan_video_decoder(backend: &str) -> Result<Box<dyn VideoDecoder>> {
             .map(|decoder| Box::new(decoder) as Box<dyn VideoDecoder>)
             .map_err(|error| anyhow::anyhow!(error.to_string()));
     }
+    #[cfg(target_os = "macos")]
+    if backend == "videotoolbox_hevc" {
+        return mrd_codec_videotoolbox::VideoToolboxHevcDecoder::new()
+            .map(|decoder| Box::new(decoder) as Box<dyn VideoDecoder>)
+            .map_err(|error| anyhow::anyhow!(error.to_string()));
+    }
 
     mrd_decode::create_decoder(backend).map_err(|error| anyhow::anyhow!(error.to_string()))
 }
@@ -6238,7 +7429,14 @@ fn preferred_lan_receiver_decoder_candidates(codec: LanAccessUnitCodec) -> Vec<&
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase();
-    match (codec, preferred.as_str()) {
+    preferred_lan_receiver_decoder_candidates_from_preference(codec, preferred.as_str())
+}
+
+fn preferred_lan_receiver_decoder_candidates_from_preference(
+    codec: LanAccessUnitCodec,
+    preferred: &str,
+) -> Vec<&'static str> {
+    match (codec, preferred) {
         (LanAccessUnitCodec::H264, "software" | "h264_software" | "openh264") => {
             vec!["h264_software"]
         }
@@ -6253,13 +7451,13 @@ fn preferred_lan_receiver_decoder_candidates(codec: LanAccessUnitCodec) -> Vec<&
         (LanAccessUnitCodec::H264, "ffmpeg" | "ffmpeg_h264" | "h264_ffmpeg") => {
             vec!["ffmpeg_h264", "h264_software"]
         }
+        #[cfg(target_os = "macos")]
+        (LanAccessUnitCodec::Hevc, "videotoolbox" | "videotoolbox_hevc" | "hevc") => {
+            vec!["videotoolbox_hevc", "ffmpeg_hevc"]
+        }
         (
             LanAccessUnitCodec::Hevc,
-            "nvdec"
-            | "hevc"
-            | "nvdec_hevc_d3d11_shared"
-            | "nvdec_d3d11_shared_hevc"
-            | "d3d11_shared",
+            "nvdec" | "nvdec_hevc_d3d11_shared" | "nvdec_d3d11_shared_hevc" | "d3d11_shared",
         ) => {
             vec!["nvdec_hevc_d3d11_shared", "nvdec_hevc"]
         }
@@ -6328,7 +7526,7 @@ fn default_lan_receiver_decoder_candidates(codec: LanAccessUnitCodec) -> &'stati
 fn default_lan_receiver_decoder_candidates(codec: LanAccessUnitCodec) -> &'static [&'static str] {
     match codec {
         LanAccessUnitCodec::H264 => &["videotoolbox", "ffmpeg_h264", "h264_software"],
-        LanAccessUnitCodec::Hevc => &["ffmpeg_hevc"],
+        LanAccessUnitCodec::Hevc => &["videotoolbox_hevc", "ffmpeg_hevc"],
     }
 }
 
@@ -6377,6 +7575,8 @@ enum LanFrameCapture {
     Winrt(mrd_capture_winrt::WinrtCapture),
     #[cfg(target_os = "macos")]
     Macos(mrd_capture_macos::MacosScreenCapture),
+    #[cfg(target_os = "macos")]
+    MacosSyntheticCv(MacosSyntheticCvPixelBufferCapture),
     #[cfg(target_os = "linux")]
     Pipewire(mrd_capture_pipewire::PipewireScreenCapture),
     #[cfg(test)]
@@ -6402,6 +7602,8 @@ impl LanFrameCapture {
             LanFrameCapture::Macos(capture) => capture
                 .capture_frame()
                 .map_err(|error| anyhow::anyhow!(error.to_string())),
+            #[cfg(target_os = "macos")]
+            LanFrameCapture::MacosSyntheticCv(capture) => capture.capture_frame(),
             #[cfg(target_os = "linux")]
             LanFrameCapture::Pipewire(capture) => capture
                 .capture_frame()
@@ -6422,23 +7624,50 @@ enum LanSenderFrameCapture {
     Pumped(MacosPumpedLanFrameCapture),
 }
 
+struct LanCapturedSenderFrame {
+    frame: CapturedFrame,
+    repeated_latest_frame: bool,
+}
+
 impl LanSenderFrameCapture {
-    fn new(capture: LanFrameCapture) -> Result<Self> {
+    fn new(capture: LanFrameCapture, profile: &MediaProfile) -> Result<Self> {
         #[cfg(target_os = "macos")]
         {
             if matches!(capture, LanFrameCapture::Macos(_)) && lan_capture_pump_enabled() {
-                return Ok(Self::Pumped(MacosPumpedLanFrameCapture::new(capture)?));
+                return Ok(Self::Pumped(MacosPumpedLanFrameCapture::new(
+                    capture,
+                    macos_capture_pump_repeat_grace_timeout(profile),
+                )?));
             }
         }
 
         Ok(Self::Direct(capture))
     }
 
-    fn capture_frame(&mut self) -> Result<CapturedFrame> {
+    fn capture_frame(&mut self) -> Result<LanCapturedSenderFrame> {
         match self {
-            Self::Direct(capture) => capture.capture_frame(),
+            Self::Direct(capture) => Ok(LanCapturedSenderFrame {
+                frame: capture.capture_frame()?,
+                repeated_latest_frame: false,
+            }),
             #[cfg(target_os = "macos")]
             Self::Pumped(capture) => capture.capture_frame(),
+        }
+    }
+
+    fn drives_sender_pacing(&self) -> bool {
+        match self {
+            Self::Direct(_) => false,
+            #[cfg(target_os = "macos")]
+            Self::Pumped(_) => lan_capture_pump_drives_sender(),
+        }
+    }
+
+    fn repeats_latest_frame(&self) -> bool {
+        match self {
+            Self::Direct(_) => false,
+            #[cfg(target_os = "macos")]
+            Self::Pumped(_) => lan_capture_pump_repeat_latest(),
         }
     }
 }
@@ -6448,22 +7677,25 @@ struct MacosPumpedLanFrameCapture {
     shared: Arc<(StdMutex<MacosPumpedLanFrameState>, StdCondvar)>,
     stop: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
+    repeat_grace_timeout: Duration,
 }
 
 #[cfg(target_os = "macos")]
 #[derive(Debug)]
 struct MacosPumpedLanFrameState {
     frames: VecDeque<CapturedFrame>,
+    latest_frame: Option<CapturedFrame>,
     sequence: u64,
     error: Option<String>,
 }
 
 #[cfg(target_os = "macos")]
 impl MacosPumpedLanFrameCapture {
-    fn new(mut capture: LanFrameCapture) -> Result<Self> {
+    fn new(mut capture: LanFrameCapture, repeat_grace_timeout: Duration) -> Result<Self> {
         let shared = Arc::new((
             StdMutex::new(MacosPumpedLanFrameState {
                 frames: VecDeque::new(),
+                latest_frame: None,
                 sequence: 0,
                 error: None,
             }),
@@ -6483,6 +7715,7 @@ impl MacosPumpedLanFrameCapture {
                                 while state.frames.len() >= LAN_CAPTURE_PUMP_QUEUE_CAPACITY {
                                     state.frames.pop_front();
                                 }
+                                state.latest_frame = Some(frame.clone());
                                 state.frames.push_back(frame);
                                 state.sequence = state.sequence.wrapping_add(1).max(1);
                                 state.error = None;
@@ -6506,24 +7739,58 @@ impl MacosPumpedLanFrameCapture {
             shared,
             stop,
             worker: Some(worker),
+            repeat_grace_timeout,
         })
     }
 
-    fn capture_frame(&mut self) -> Result<CapturedFrame> {
+    fn capture_frame(&mut self) -> Result<LanCapturedSenderFrame> {
         let deadline = StdInstant::now() + LAN_CAPTURE_PUMP_WAIT_TIMEOUT;
         let (lock, cvar) = &*self.shared;
         let mut state = lock
             .lock()
             .map_err(|_| anyhow::anyhow!("macOS LAN capture pump state poisoned"))?;
+        let mut waited_for_repeat_grace = false;
 
         loop {
             if let Some(frame) = state.frames.pop_back() {
                 state.frames.clear();
-                return Ok(frame);
+                return Ok(LanCapturedSenderFrame {
+                    frame,
+                    repeated_latest_frame: false,
+                });
             }
 
             if let Some(error) = state.error.take() {
                 anyhow::bail!("macOS LAN capture pump failed: {error}");
+            }
+
+            if lan_capture_pump_repeat_latest() {
+                if state.latest_frame.is_some()
+                    && !waited_for_repeat_grace
+                    && !self.repeat_grace_timeout.is_zero()
+                {
+                    let now = StdInstant::now();
+                    if now < deadline {
+                        let wait = self
+                            .repeat_grace_timeout
+                            .min(deadline.saturating_duration_since(now));
+                        let (guard, _) = cvar.wait_timeout(state, wait).map_err(|_| {
+                            anyhow::anyhow!("macOS LAN capture pump state poisoned")
+                        })?;
+                        state = guard;
+                        waited_for_repeat_grace = true;
+                        continue;
+                    }
+                }
+
+                if let Some(frame) = state.latest_frame.as_ref() {
+                    let mut repeated = frame.clone();
+                    repeated.timestamp_us = now_us();
+                    return Ok(LanCapturedSenderFrame {
+                        frame: repeated,
+                        repeated_latest_frame: true,
+                    });
+                }
             }
 
             let now = StdInstant::now();
@@ -6548,6 +7815,180 @@ impl Drop for MacosPumpedLanFrameCapture {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "CoreVideo", kind = "framework")]
+unsafe extern "C" {
+    fn CVPixelBufferCreate(
+        allocator: *const std::ffi::c_void,
+        width: usize,
+        height: usize,
+        pixel_format_type: u32,
+        pixel_buffer_attributes: *const std::ffi::c_void,
+        pixel_buffer_out: *mut *mut std::ffi::c_void,
+    ) -> i32;
+    fn CVPixelBufferLockBaseAddress(pixel_buffer: *mut std::ffi::c_void, lock_flags: u64) -> i32;
+    fn CVPixelBufferUnlockBaseAddress(pixel_buffer: *mut std::ffi::c_void, lock_flags: u64) -> i32;
+    fn CVPixelBufferGetBaseAddressOfPlane(
+        pixel_buffer: *mut std::ffi::c_void,
+        plane_index: usize,
+    ) -> *mut std::ffi::c_void;
+    fn CVPixelBufferGetBytesPerRowOfPlane(
+        pixel_buffer: *mut std::ffi::c_void,
+        plane_index: usize,
+    ) -> usize;
+    fn CVPixelBufferGetHeightOfPlane(
+        pixel_buffer: *mut std::ffi::c_void,
+        plane_index: usize,
+    ) -> usize;
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFRelease(cf: *const std::ffi::c_void);
+}
+
+#[cfg(target_os = "macos")]
+const MACOS_SYNTHETIC_CV_SUCCESS: i32 = 0;
+#[cfg(target_os = "macos")]
+const MACOS_SYNTHETIC_CV_PIXEL_FORMAT_NV12_VIDEO_RANGE: u32 = u32::from_be_bytes(*b"420v");
+#[cfg(target_os = "macos")]
+const MACOS_SYNTHETIC_CV_BUFFER_POOL_CAPACITY: usize = 16;
+
+#[cfg(target_os = "macos")]
+struct MacosSyntheticCvPixelBuffer {
+    ptr: *mut std::ffi::c_void,
+}
+
+#[cfg(target_os = "macos")]
+unsafe impl Send for MacosSyntheticCvPixelBuffer {}
+
+#[cfg(target_os = "macos")]
+impl MacosSyntheticCvPixelBuffer {
+    fn new_nv12(width: usize, height: usize) -> Result<Self> {
+        let mut pixel_buffer = std::ptr::null_mut();
+        let status = unsafe {
+            CVPixelBufferCreate(
+                std::ptr::null(),
+                width,
+                height,
+                MACOS_SYNTHETIC_CV_PIXEL_FORMAT_NV12_VIDEO_RANGE,
+                std::ptr::null(),
+                &mut pixel_buffer,
+            )
+        };
+        if status != MACOS_SYNTHETIC_CV_SUCCESS || pixel_buffer.is_null() {
+            anyhow::bail!("CVPixelBufferCreate(NV12 synthetic capture) failed: status={status}");
+        }
+        Ok(Self { ptr: pixel_buffer })
+    }
+
+    fn as_ptr(&self) -> *mut std::ffi::c_void {
+        self.ptr
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MacosSyntheticCvPixelBuffer {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe {
+                CFRelease(self.ptr.cast_const());
+            }
+            self.ptr = std::ptr::null_mut();
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct MacosSyntheticCvPixelBufferCapture {
+    width: usize,
+    height: usize,
+    frame_index: u64,
+    buffers: Vec<MacosSyntheticCvPixelBuffer>,
+}
+
+#[cfg(target_os = "macos")]
+impl MacosSyntheticCvPixelBufferCapture {
+    fn new(profile: &MediaProfile) -> Result<Self> {
+        let width = even_dimension(profile.width as usize).max(2);
+        let height = even_dimension(profile.height as usize).max(2);
+        let mut buffers = Vec::with_capacity(MACOS_SYNTHETIC_CV_BUFFER_POOL_CAPACITY);
+        for _ in 0..MACOS_SYNTHETIC_CV_BUFFER_POOL_CAPACITY {
+            buffers.push(MacosSyntheticCvPixelBuffer::new_nv12(width, height)?);
+        }
+        tracing::info!(
+            source_id = crate::capture_source::TEST_SYNTHETIC_CV_CAPTURE_SOURCE_ID,
+            width,
+            height,
+            pool_capacity = buffers.len(),
+            "created macOS synthetic CVPixelBuffer LAN capture"
+        );
+        Ok(Self {
+            width,
+            height,
+            frame_index: 0,
+            buffers,
+        })
+    }
+
+    fn capture_frame(&mut self) -> Result<CapturedFrame> {
+        let buffer_index = (self.frame_index as usize) % self.buffers.len();
+        let pixel_buffer = self.buffers[buffer_index].as_ptr();
+        self.fill_pixel_buffer(pixel_buffer)?;
+        let timestamp_us = now_us();
+        self.frame_index = self.frame_index.wrapping_add(1);
+        CapturedFrame::from_macos_cv_pixel_buffer(
+            self.width,
+            self.height,
+            FramePixelFormat::Nv12,
+            timestamp_us,
+            pixel_buffer,
+        )
+        .ok_or_else(|| anyhow::anyhow!("failed to retain synthetic macOS CVPixelBuffer frame"))
+    }
+
+    fn fill_pixel_buffer(&self, pixel_buffer: *mut std::ffi::c_void) -> Result<()> {
+        let status = unsafe { CVPixelBufferLockBaseAddress(pixel_buffer, 0) };
+        if status != MACOS_SYNTHETIC_CV_SUCCESS {
+            anyhow::bail!("CVPixelBufferLockBaseAddress(synthetic) failed: status={status}");
+        }
+
+        let y_value = 16_u8.saturating_add((self.frame_index % 220) as u8);
+        let fill_result = Self::fill_plane(pixel_buffer, 0, y_value)
+            .and_then(|_| Self::fill_plane(pixel_buffer, 1, 128));
+        let unlock_status = unsafe { CVPixelBufferUnlockBaseAddress(pixel_buffer, 0) };
+        if let Err(error) = fill_result {
+            return Err(error);
+        }
+        if unlock_status != MACOS_SYNTHETIC_CV_SUCCESS {
+            anyhow::bail!(
+                "CVPixelBufferUnlockBaseAddress(synthetic) failed: status={unlock_status}"
+            );
+        }
+        Ok(())
+    }
+
+    fn fill_plane(
+        pixel_buffer: *mut std::ffi::c_void,
+        plane_index: usize,
+        value: u8,
+    ) -> Result<()> {
+        let base = unsafe { CVPixelBufferGetBaseAddressOfPlane(pixel_buffer, plane_index) };
+        if base.is_null() {
+            anyhow::bail!("synthetic CVPixelBuffer plane {plane_index} base address is null");
+        }
+        let stride = unsafe { CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer, plane_index) };
+        let rows = unsafe { CVPixelBufferGetHeightOfPlane(pixel_buffer, plane_index) };
+        let len = stride
+            .checked_mul(rows)
+            .ok_or_else(|| anyhow::anyhow!("synthetic CVPixelBuffer plane size overflow"))?;
+        let plane = unsafe { std::slice::from_raw_parts_mut(base.cast::<u8>(), len) };
+        plane.fill(value);
+        Ok(())
     }
 }
 
@@ -6665,6 +8106,13 @@ async fn create_lan_frame_capture(
 
     #[cfg(target_os = "macos")]
     {
+        if crate::capture_source::test_synthetic_cv_capture_enabled()
+            && crate::capture_source::is_test_synthetic_cv_capture_source_id(source_id)
+        {
+            return Ok(LanFrameCapture::MacosSyntheticCv(
+                MacosSyntheticCvPixelBufferCapture::new(_profile)?,
+            ));
+        }
         return create_macos_lan_frame_capture(source_id, _profile);
     }
 
@@ -6700,7 +8148,12 @@ fn create_macos_lan_frame_capture(
 
 #[cfg(target_os = "macos")]
 fn macos_lan_capture_stream_fps(profile: &MediaProfile) -> u32 {
-    profile.fps.max(1).saturating_mul(2).clamp(1, 240)
+    let requested_fps = if lan_capture_pump_enabled() && lan_capture_pump_drives_sender() {
+        profile.fps.max(1)
+    } else {
+        profile.fps.max(1).saturating_mul(2)
+    };
+    requested_fps.clamp(1, 240)
 }
 
 #[cfg(windows)]
@@ -6865,6 +8318,13 @@ fn capture_source_kind_from_id(source_id: &str) -> Option<String> {
 }
 
 fn captured_frame_memory_path(frame: &CapturedFrame) -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        if frame.macos_cv_pixel_buffer().is_some() {
+            return "macos_cv_pixel_buffer";
+        }
+    }
+
     #[cfg(windows)]
     {
         if frame.d3d11_shared_bgra().is_some() {
@@ -6885,6 +8345,20 @@ fn prepare_frame_for_h264(frame: CapturedFrame, profile: &MediaProfile) -> Resul
     }
 
     let (target_width, target_height) = h264_target_dimensions(frame.width, frame.height, profile);
+
+    #[cfg(target_os = "macos")]
+    if frame.macos_cv_pixel_buffer().is_some() {
+        if target_width == frame.width && target_height == frame.height {
+            return Ok(frame);
+        }
+        anyhow::bail!(
+            "macOS CVPixelBuffer capture requires exact selected profile dimensions: source {}x{}, selected {}x{}",
+            frame.width,
+            frame.height,
+            target_width,
+            target_height
+        );
+    }
 
     #[cfg(windows)]
     if frame.d3d11_shared_bgra().is_some() {
@@ -6985,6 +8459,7 @@ fn h264_target_dimensions(width: usize, height: usize, profile: &MediaProfile) -
     (target_width.max(2), target_height.max(2))
 }
 
+#[cfg(any(windows, test))]
 fn window_h264_capture_dimensions(width: usize, height: usize) -> (usize, usize) {
     (even_dimension(width).max(2), even_dimension(height).max(2))
 }
@@ -7162,10 +8637,6 @@ fn find_h264_start_code(payload: &[u8], from: usize) -> Option<(usize, usize)> {
     None
 }
 
-fn should_update_lan_preview(sequence: u64) -> bool {
-    sequence <= 1 || sequence.is_multiple_of(LAN_PREVIEW_FRAME_INTERVAL)
-}
-
 fn decoded_frame_pixel_format(frame: &DecodedFrame) -> String {
     match &frame.data {
         DecodedFrameData::CpuRgb24(_) => "cpu_rgb24",
@@ -7221,48 +8692,6 @@ fn decoded_frame_to_rgb24(frame: DecodedFrame) -> Result<(u32, u32, Vec<u8>)> {
     };
 
     Ok((frame.width as u32, frame.height as u32, rgb))
-}
-
-fn decoded_frame_to_preview_rgb24(frame: DecodedFrame) -> Result<(u32, u32, Vec<u8>)> {
-    let (width, height, rgb) = decoded_frame_to_rgb24(frame)?;
-    let (target_width, target_height) =
-        preview_dimensions(width, height, LAN_PREVIEW_MAX_WIDTH, LAN_PREVIEW_MAX_HEIGHT);
-    if target_width == width && target_height == height {
-        return Ok((width, height, rgb));
-    }
-
-    let source_width = width as usize;
-    let source_height = height as usize;
-    let target_width = target_width as usize;
-    let target_height = target_height as usize;
-    let mut scaled = Vec::with_capacity(target_width * target_height * 3);
-    for y in 0..target_height {
-        let source_y = y * source_height / target_height;
-        for x in 0..target_width {
-            let source_x = x * source_width / target_width;
-            let offset = (source_y * source_width + source_x) * 3;
-            scaled.extend_from_slice(&rgb[offset..offset + 3]);
-        }
-    }
-
-    Ok((target_width as u32, target_height as u32, scaled))
-}
-
-fn preview_dimensions(width: u32, height: u32, max_width: u32, max_height: u32) -> (u32, u32) {
-    if width == 0 || height == 0 {
-        return (1, 1);
-    }
-    if width <= max_width && height <= max_height {
-        return (width, height);
-    }
-
-    let scale = (max_width.max(1) as f64 / width as f64)
-        .min(max_height.max(1) as f64 / height as f64)
-        .min(1.0);
-    (
-        ((width as f64 * scale).round() as u32).max(1),
-        ((height as f64 * scale).round() as u32).max(1),
-    )
 }
 
 fn nv12_to_rgb24(data: &[u8], pitch: usize, width: usize, height: usize) -> Result<Vec<u8>> {
@@ -7719,7 +9148,11 @@ fn apply_lan_media_profile_defaults(profile: &mut MediaProfile) {
 }
 
 fn media_frame_interval(profile: &MediaProfile) -> Duration {
-    Duration::from_micros((1_000_000 / u64::from(profile.fps.max(1))).max(1))
+    media_frame_interval_for_fps(profile.fps)
+}
+
+fn media_frame_interval_for_fps(fps: u32) -> Duration {
+    Duration::from_micros((1_000_000 / u64::from(fps.max(1))).max(1))
 }
 
 fn media_frame_interval_for_dynamic_decision(
@@ -7893,12 +9326,36 @@ fn decoded_video_probe_format(codec: &str) -> String {
     }
 }
 
+const FNV1A64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
+
 fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    fnv1a64_extend(FNV1A64_OFFSET_BASIS, bytes)
+}
+
+fn fnv1a64_extend(mut hash: u64, bytes: &[u8]) -> u64 {
     for byte in bytes {
         hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        hash = hash.wrapping_mul(FNV1A64_PRIME);
     }
+    hash
+}
+
+fn fnv1a64_media_metadata(
+    profile: &MediaProfile,
+    sequence: u64,
+    timestamp_us: u64,
+    encoded_payload_len: usize,
+) -> u64 {
+    let mut hash = FNV1A64_OFFSET_BASIS;
+    hash = fnv1a64_extend(hash, &profile.width.to_le_bytes());
+    hash = fnv1a64_extend(hash, &profile.height.to_le_bytes());
+    hash = fnv1a64_extend(hash, &profile.fps.to_le_bytes());
+    hash = fnv1a64_extend(hash, &profile.bitrate_mbps.to_le_bytes());
+    hash = fnv1a64_extend(hash, profile.codec.as_bytes());
+    hash = fnv1a64_extend(hash, &sequence.to_le_bytes());
+    hash = fnv1a64_extend(hash, &timestamp_us.to_le_bytes());
+    hash = fnv1a64_extend(hash, &(encoded_payload_len as u64).to_le_bytes());
     hash
 }
 
@@ -7916,6 +9373,13 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn now_us() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as u64
 }
 
 fn duration_as_millis(duration: Duration) -> f64 {
@@ -8802,6 +10266,8 @@ mod tests {
         for capability in [
             LAN_CAPTURE_MACOS_CAPABILITY,
             LAN_ENCODE_VIDEOTOOLBOX_H264_CAPABILITY,
+            LAN_ENCODE_VIDEOTOOLBOX_HEVC_CAPABILITY,
+            LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY,
             LAN_DECODE_VIDEOTOOLBOX_CAPABILITY,
             LAN_RENDER_MACOS_NATIVE_CAPABILITY,
         ] {
@@ -8862,6 +10328,14 @@ mod tests {
             .contains(&LAN_INPUT_CONTROL_TRANSPORT.to_string()));
         assert!(!announcement
             .media_capabilities
+            .contains(&LAN_INPUT_CONTROL_CAPABILITY.to_string()));
+    }
+
+    #[test]
+    fn lan_media_capabilities_follow_input_control_availability() {
+        assert!(lan_media_capabilities_with_input_control(true)
+            .contains(&LAN_INPUT_CONTROL_CAPABILITY.to_string()));
+        assert!(!lan_media_capabilities_with_input_control(false)
             .contains(&LAN_INPUT_CONTROL_CAPABILITY.to_string()));
     }
 
@@ -10057,9 +11531,7 @@ mod tests {
         assert_eq!(snapshot.media_probe_target_fps, Some(60));
         assert_eq!(snapshot.media_probe_target_bitrate_mbps, Some(5));
         assert!(snapshot.media_probe_payload_bytes.unwrap_or_default() > 0);
-        if let Some(data_url) = snapshot.latest_frame_data_url.as_deref() {
-            assert!(data_url.starts_with("data:image/png;base64,"));
-        }
+        assert!(snapshot.latest_frame_data_url.is_none());
         let session_snapshot = controller_state
             .sessions
             .lock()
@@ -10358,6 +11830,19 @@ mod tests {
     }
 
     #[test]
+    fn lan_media_frame_orderer_handles_v3_media_frames() {
+        let mut orderer = LanMediaFrameOrderer::<QuicMediaFrame>::new(8);
+
+        let first = orderer.push(test_quic_media_frame(1, true));
+        let third = orderer.push(test_quic_media_frame(3, false));
+        let ready = orderer.push(test_quic_media_frame(2, false));
+
+        assert_eq!(media_frame_ids(&first), vec![1]);
+        assert!(third.is_empty());
+        assert_eq!(media_frame_ids(&ready), vec![2, 3]);
+    }
+
+    #[test]
     fn lan_media_frame_orderer_skips_gap_when_pending_limit_is_reached() {
         let mut orderer = LanMediaFrameOrderer::new(2);
 
@@ -10427,6 +11912,56 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_receiver_decoder_defaults_to_videotoolbox_then_ffmpeg_fallback() {
+        assert_eq!(
+            default_lan_receiver_decoder_candidates(LanAccessUnitCodec::H264),
+            &["videotoolbox", "ffmpeg_h264", "h264_software"]
+        );
+        assert_eq!(
+            default_lan_receiver_decoder_candidates(LanAccessUnitCodec::Hevc),
+            &["videotoolbox_hevc", "ffmpeg_hevc"]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_receiver_decoder_videotoolbox_preference_is_codec_specific() {
+        assert_eq!(
+            preferred_lan_receiver_decoder_candidates_from_preference(
+                LanAccessUnitCodec::H264,
+                "videotoolbox"
+            ),
+            vec!["videotoolbox", "h264_software"]
+        );
+        assert_eq!(
+            preferred_lan_receiver_decoder_candidates_from_preference(
+                LanAccessUnitCodec::Hevc,
+                "videotoolbox"
+            ),
+            vec!["videotoolbox_hevc", "ffmpeg_hevc"]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_receiver_decoder_backends_create_videotoolbox_decoders() {
+        let h264 =
+            create_lan_video_decoder("videotoolbox").expect("create H.264 VideoToolbox decoder");
+        assert_eq!(
+            h264.output_memory_kind(),
+            mrd_pipeline_core::FrameMemoryKind::Cpu
+        );
+
+        let hevc = create_lan_video_decoder("videotoolbox_hevc")
+            .expect("create HEVC VideoToolbox decoder");
+        assert_eq!(
+            hevc.output_memory_kind(),
+            mrd_pipeline_core::FrameMemoryKind::Cpu
+        );
+    }
+
     fn test_quic_au_frame(frame_id: u32, is_keyframe: bool) -> QuicAuFrame {
         let payload = [frame_id as u8, u8::from(is_keyframe)];
         let datagrams =
@@ -10440,6 +11975,26 @@ mod tests {
     }
 
     fn frame_ids(frames: &[QuicAuFrame]) -> Vec<u32> {
+        frames.iter().map(|frame| frame.frame_id).collect()
+    }
+
+    fn test_quic_media_frame(frame_id: u32, is_keyframe: bool) -> QuicMediaFrame {
+        QuicMediaFrame {
+            payload_type: QuicMediaPayloadType::AccessUnit,
+            codec: QuicMediaCodec::H264,
+            profile_id: 123,
+            frame_id,
+            timestamp_us: u64::from(frame_id),
+            flags: if is_keyframe {
+                mrd_transport_quic_quinn::QUIC_MEDIA_V3_FLAG_KEYFRAME
+            } else {
+                0
+            },
+            payload: bytes::Bytes::from_static(b"h264-au"),
+        }
+    }
+
+    fn media_frame_ids(frames: &[QuicMediaFrame]) -> Vec<u32> {
         frames.iter().map(|frame| frame.frame_id).collect()
     }
 
@@ -11508,6 +13063,90 @@ mod tests {
         assert_eq!(macos_lan_capture_stream_fps(&high_refresh), 240);
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_capture_pump_repeat_pacing_defaults_to_headroom() {
+        let profile = MediaProfile {
+            width: 2560,
+            height: 1440,
+            fps: 144,
+            bitrate_mbps: 80,
+            codec: "h264".to_string(),
+            ..MediaProfile::default()
+        };
+
+        assert_eq!(macos_capture_pump_repeat_pacing_fps(&profile), 144);
+        assert_eq!(
+            macos_capture_pump_repeat_frame_interval(&profile),
+            media_frame_interval_for_fps(144)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_capture_pump_repeat_grace_uses_capture_headroom() {
+        let profile = MediaProfile {
+            width: 1280,
+            height: 720,
+            fps: 60,
+            bitrate_mbps: 10,
+            codec: "h264".to_string(),
+            ..MediaProfile::default()
+        };
+
+        assert_eq!(
+            macos_capture_pump_repeat_grace_timeout(&profile),
+            LAN_CAPTURE_PUMP_REPEAT_GRACE_MAX
+        );
+
+        let high_refresh = MediaProfile {
+            fps: 165,
+            ..profile
+        };
+        assert_eq!(
+            macos_capture_pump_repeat_grace_timeout(&high_refresh),
+            media_frame_interval_for_fps(240) / 2
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_capture_pump_waits_for_fresh_frame_before_repeating_latest() {
+        let latest_frame = CapturedFrame::from_cpu(1, 1, FramePixelFormat::Bgra32, 1, vec![0; 4]);
+        let fresh_frame = CapturedFrame::from_cpu(1, 1, FramePixelFormat::Bgra32, 2, vec![1; 4]);
+        let shared = Arc::new((
+            StdMutex::new(MacosPumpedLanFrameState {
+                frames: VecDeque::new(),
+                latest_frame: Some(latest_frame),
+                sequence: 1,
+                error: None,
+            }),
+            StdCondvar::new(),
+        ));
+        let producer_shared = shared.clone();
+        let producer = thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(5));
+            let (lock, cvar) = &*producer_shared;
+            let mut state = lock.lock().expect("capture pump state");
+            state.latest_frame = Some(fresh_frame.clone());
+            state.frames.push_back(fresh_frame);
+            state.sequence = state.sequence.wrapping_add(1).max(1);
+            cvar.notify_all();
+        });
+        let mut capture = MacosPumpedLanFrameCapture {
+            shared,
+            stop: Arc::new(AtomicBool::new(false)),
+            worker: None,
+            repeat_grace_timeout: Duration::from_millis(50),
+        };
+
+        let captured = capture.capture_frame().expect("capture pumped frame");
+        producer.join().expect("producer thread");
+
+        assert!(!captured.repeated_latest_frame);
+        assert_eq!(captured.frame.timestamp_us, 2);
+    }
+
     #[cfg(windows)]
     #[test]
     fn prepare_frame_for_h264_accepts_exact_d3d11_shared_frame() {
@@ -11566,7 +13205,7 @@ mod tests {
     }
 
     #[test]
-    fn capture_sources_ack_trims_preview_payload_to_udp_budget() {
+    fn capture_sources_ack_strips_preview_payload_before_udp_fit() {
         let sources = (0..24)
             .map(|index| mrd_ipc::CaptureSource {
                 id: format!("windows:window:0x{:X}", index + 0x1000),
@@ -11579,7 +13218,7 @@ mod tests {
                 process_id: 4242 + index,
                 app_name: Some(format!("Target App {index}")),
                 bundle_identifier: None,
-                preview_data_url: Some(format!("data:image/png;base64,{}", "A".repeat(8_000))),
+                preview_data_url: Some(format!("legacy-preview-payload-{}", "A".repeat(8_000))),
                 preview_width: Some(240),
                 preview_height: Some(135),
             })
@@ -11599,10 +13238,9 @@ mod tests {
         };
         assert!(sources
             .iter()
-            .any(|source| source.preview_data_url.is_some()));
-        assert!(sources
-            .iter()
-            .any(|source| source.preview_data_url.is_none()));
+            .all(|source| source.preview_data_url.is_none()));
+        assert!(sources.iter().all(|source| source.preview_width.is_none()));
+        assert!(sources.iter().all(|source| source.preview_height.is_none()));
     }
 
     #[test]
@@ -11924,6 +13562,8 @@ mod tests {
                 capture_memory_path: Some("d3d11_shared_bgra".to_string()),
                 dynamic_fps_tier: None,
                 target_fps: Some(144),
+                frames_completed: 122,
+                repeated_latest_frames: 3,
                 datagram_fragments_attempted: 4,
                 datagram_fragments_sent: 3,
                 datagram_fragments_delayed: 0,
@@ -11934,6 +13574,7 @@ mod tests {
                 datagram_frames_cut_short_for_budget: 0,
                 reliable_fragments_sent: 0,
                 reliable_frames_sent: 0,
+                ..MediaSenderTransportSnapshot::default()
             },
             test_impairment: None,
         };
@@ -11972,7 +13613,34 @@ mod tests {
             cut_short_for_budget: true,
         });
         tracker.record_reliable_frame(7, true);
+        tracker.record_repeated_latest_frame();
+        tracker.record_captured_frame(&CapturedFrame::from_cpu(
+            1,
+            1,
+            FramePixelFormat::Bgra32,
+            0,
+            vec![0; 4],
+        ));
+        tracker.record_captured_frame(&CapturedFrame::from_cpu(
+            2,
+            2,
+            FramePixelFormat::Nv12,
+            0,
+            vec![0; 6],
+        ));
+        tracker.record_encoded_access_unit(1_024, true);
+        tracker.record_encoded_access_unit(256, false);
+        tracker.frame_completed();
 
+        assert_eq!(tracker.sender_transport.frames_completed, 1);
+        assert_eq!(tracker.sender_transport.repeated_latest_frames, 1);
+        assert_eq!(tracker.sender_transport.capture_frame_samples, 2);
+        assert_eq!(tracker.sender_transport.capture_cpu_frames, 2);
+        assert_eq!(tracker.sender_transport.capture_bgra32_frames, 1);
+        assert_eq!(tracker.sender_transport.capture_nv12_frames, 1);
+        assert_eq!(tracker.sender_transport.access_units_encoded, 2);
+        assert_eq!(tracker.sender_transport.keyframes_encoded, 1);
+        assert_eq!(tracker.sender_transport.encoded_access_unit_bytes, 1_280);
         assert_eq!(tracker.sender_transport.datagram_fragments_attempted, 9);
         assert_eq!(tracker.sender_transport.datagram_fragments_sent, 5);
         assert_eq!(tracker.sender_transport.datagram_fragments_delayed, 1);
@@ -12158,7 +13826,9 @@ mod tests {
         let backends = preferred_lan_h264_encoder_backends();
         #[cfg(windows)]
         assert_eq!(backends, ["nvenc_h264", "openh264"]);
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
+        assert_eq!(backends, ["videotoolbox_h264", "openh264"]);
+        #[cfg(not(any(windows, target_os = "macos")))]
         assert_eq!(backends, ["openh264"]);
     }
 
@@ -12423,7 +14093,7 @@ mod tests {
         assert_eq!(lan_render_pacing_from_env_value(Some("true")), Some(true));
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn render_queue_policy_env_parses_values() {
         assert_eq!(lan_render_queue_policy_from_env_value(None), None);
@@ -12450,9 +14120,9 @@ mod tests {
         );
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
-    fn render_queue_policy_defaults_to_paced_fifo_and_allows_latest_override() {
+    fn render_queue_policy_defaults_by_platform_and_allows_latest_override() {
         let high_fps = MediaProfile {
             width: 2560,
             height: 1440,
@@ -12470,9 +14140,14 @@ mod tests {
             ..MediaProfile::default()
         };
 
+        #[cfg(windows)]
+        let expected_high_fps_default = LanRenderQueuePolicy::PacedFifo;
+        #[cfg(target_os = "macos")]
+        let expected_high_fps_default = LanRenderQueuePolicy::Latest;
+
         assert_eq!(
             lan_render_queue_policy_for_profile_with_override(&high_fps, None),
-            LanRenderQueuePolicy::PacedFifo
+            expected_high_fps_default
         );
         assert_eq!(
             lan_render_queue_policy_for_profile_with_override(&low_fps, None),
@@ -12487,7 +14162,121 @@ mod tests {
         );
     }
 
-    #[cfg(windows)]
+    #[test]
+    fn media_payload_hash_mode_defaults_to_metadata_for_high_fps() {
+        let high_fps = MediaProfile {
+            width: 2560,
+            height: 1440,
+            fps: 144,
+            bitrate_mbps: 80,
+            codec: "h264".to_string(),
+            ..MediaProfile::default()
+        };
+        let low_fps = MediaProfile {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            bitrate_mbps: 20,
+            codec: "h264".to_string(),
+            ..MediaProfile::default()
+        };
+
+        assert_eq!(
+            lan_media_payload_hash_mode_for_profile_with_override(&high_fps, None),
+            LanMediaPayloadHashMode::Metadata
+        );
+        assert_eq!(
+            lan_media_payload_hash_mode_for_profile_with_override(&low_fps, None),
+            LanMediaPayloadHashMode::Full
+        );
+        assert_eq!(
+            lan_media_payload_hash_mode_from_env_value(Some("full")),
+            Some(LanMediaPayloadHashMode::Full)
+        );
+        assert_eq!(
+            lan_media_payload_hash_mode_from_env_value(Some("metadata")),
+            Some(LanMediaPayloadHashMode::Metadata)
+        );
+        assert_eq!(
+            lan_media_payload_hash_mode_from_env_value(Some("off")),
+            Some(LanMediaPayloadHashMode::Disabled)
+        );
+
+        let payload = [1, 2, 3, 4, 5, 6, 7, 8];
+        assert_eq!(
+            lan_media_payload_hash_for_mode(
+                LanMediaPayloadHashMode::Full,
+                &high_fps,
+                42,
+                123_456,
+                &payload
+            ),
+            format!("fnv1a64:{:016x}", fnv1a64(&payload))
+        );
+        assert!(lan_media_payload_hash_for_mode(
+            LanMediaPayloadHashMode::Metadata,
+            &high_fps,
+            42,
+            123_456,
+            &payload
+        )
+        .starts_with("fnv1a64:meta:"));
+        assert_eq!(
+            lan_media_payload_hash_for_mode(
+                LanMediaPayloadHashMode::Disabled,
+                &high_fps,
+                42,
+                123_456,
+                &payload
+            ),
+            "fnv1a64:disabled"
+        );
+    }
+
+    #[test]
+    fn lan_keyframe_request_control_datagram_roundtrips() {
+        let profile = MediaProfile {
+            width: 1920,
+            height: 1080,
+            fps: 144,
+            bitrate_mbps: 80,
+            codec: "h264".to_string(),
+            ..MediaProfile::default()
+        };
+        let datagram =
+            encode_lan_keyframe_request_datagram(&profile, 7, LAN_QUIC_FALLBACK_DATAGRAM_BYTES)
+                .expect("encode keyframe request");
+
+        assert!(decode_lan_keyframe_request_datagram(&datagram).expect("decode request"));
+    }
+
+    #[test]
+    fn lan_keyframe_request_decoder_ignores_access_units() {
+        let profile = MediaProfile {
+            width: 1920,
+            height: 1080,
+            fps: 144,
+            bitrate_mbps: 80,
+            codec: "h264".to_string(),
+            ..MediaProfile::default()
+        };
+        let datagram = fragment_media_payload_v3(
+            QuicMediaPayloadType::AccessUnit,
+            QuicMediaCodec::H264,
+            lan_media_profile_id(&profile),
+            1,
+            123,
+            true,
+            &[0, 0, 0, 1, 0x65],
+            LAN_QUIC_FALLBACK_DATAGRAM_BYTES,
+        )
+        .expect("fragment access unit")
+        .remove(0);
+
+        assert!(!decode_lan_keyframe_request_datagram(&datagram).expect("decode access unit"));
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn latest_render_queue_policy_skips_pacing_wait() {
         let high_fps = MediaProfile {
@@ -12514,17 +14303,25 @@ mod tests {
             &high_fps,
             true
         ));
+        assert_eq!(
+            lan_render_queue_capacity_for_policy(&high_fps, LanRenderQueuePolicy::Latest),
+            1
+        );
+        assert_eq!(
+            lan_render_queue_capacity_for_policy(&high_fps, LanRenderQueuePolicy::PacedFifo),
+            lan_render_queue_capacity_for_profile(&high_fps)
+        );
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn latest_render_queue_policy_takes_latest_and_reports_stale_drops() {
         let mut registry = crate::app_state::MediaRenderQueueRegistry::default();
         let session_id = SessionId("latest-render-policy-session".to_string());
-        let first = RenderFrame::from_rgb24(1, 1, vec![1, 2, 3]);
-        let second = RenderFrame::from_rgb24(1, 1, vec![4, 5, 6]);
-        let third = RenderFrame::from_rgb24(1, 1, vec![7, 8, 9]);
-        let fourth = RenderFrame::from_rgb24(1, 1, vec![10, 11, 12]);
+        let first = MediaRenderFrame::Decoded(RenderFrame::from_rgb24(1, 1, vec![1, 2, 3]));
+        let second = MediaRenderFrame::Decoded(RenderFrame::from_rgb24(1, 1, vec![4, 5, 6]));
+        let third = MediaRenderFrame::Decoded(RenderFrame::from_rgb24(1, 1, vec![7, 8, 9]));
+        let fourth = MediaRenderFrame::Decoded(RenderFrame::from_rgb24(1, 1, vec![10, 11, 12]));
 
         match registry.enqueue_bounded(session_id.clone(), first, 3) {
             MediaRenderQueueEnqueue::Start(_) => {}
@@ -12544,14 +14341,14 @@ mod tests {
         assert_eq!(dropped, 2);
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn paced_fifo_render_queue_policy_takes_next_without_stale_drops() {
         let mut registry = crate::app_state::MediaRenderQueueRegistry::default();
         let session_id = SessionId("paced-render-policy-session".to_string());
-        let first = RenderFrame::from_rgb24(1, 1, vec![1, 2, 3]);
-        let second = RenderFrame::from_rgb24(1, 1, vec![4, 5, 6]);
-        let third = RenderFrame::from_rgb24(1, 1, vec![7, 8, 9]);
+        let first = MediaRenderFrame::Decoded(RenderFrame::from_rgb24(1, 1, vec![1, 2, 3]));
+        let second = MediaRenderFrame::Decoded(RenderFrame::from_rgb24(1, 1, vec![4, 5, 6]));
+        let third = MediaRenderFrame::Decoded(RenderFrame::from_rgb24(1, 1, vec![7, 8, 9]));
 
         match registry.enqueue_bounded(session_id.clone(), first, 3) {
             MediaRenderQueueEnqueue::Start(_) => {}
@@ -12570,7 +14367,7 @@ mod tests {
         assert_eq!(dropped, 0);
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn render_queue_capacity_env_keeps_bounded_burst_backlog() {
         assert_eq!(
@@ -12589,7 +14386,7 @@ mod tests {
         );
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn render_pacing_defaults_to_interruptible_refresh_cap() {
         let high_fps = MediaProfile {
@@ -12655,7 +14452,7 @@ mod tests {
         assert_eq!(lan_render_cap_target_fps_for_profile(&low_fps), None);
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn surface_renderer_lock_waits_through_short_contention() {
         let mutex = Arc::new(std::sync::Mutex::new(()));
@@ -12893,21 +14690,6 @@ mod tests {
     }
 
     #[test]
-    fn decoded_preview_downscales_large_frames() {
-        let frame = DecodedFrame {
-            width: 1920,
-            height: 1080,
-            timestamp_us: 0,
-            data: DecodedFrameData::CpuRgb24(vec![128; 1920 * 1080 * 3]),
-        };
-
-        let (width, height, rgb) = decoded_frame_to_preview_rgb24(frame).unwrap();
-
-        assert_eq!((width, height), (480, 270));
-        assert_eq!(rgb.len(), 480 * 270 * 3);
-    }
-
-    #[test]
     fn media_frame_scheduler_does_not_add_processing_time_to_interval() {
         let start = Instant::now();
         let interval = Duration::from_millis(16);
@@ -13075,7 +14857,7 @@ mod tests {
             &session_id,
             vec![frame],
             1024,
-            LAN_PREVIEW_FRAME_INTERVAL,
+            60,
             123_456,
             &profile,
             &[1, 2, 3, 4],
@@ -13085,14 +14867,259 @@ mod tests {
         let snapshot = app_state.probes.lock().await.snapshot(&session_id);
 
         assert_eq!(snapshot.frames_decoded, 1);
-        assert_eq!(
-            snapshot.last_media_sequence,
-            Some(LAN_PREVIEW_FRAME_INTERVAL)
-        );
+        assert_eq!(snapshot.last_media_sequence, Some(60));
         assert!(snapshot.latest_frame_data_url.is_none());
     }
 
-    #[cfg(windows)]
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn upload_lan_render_frame_dispatches_macos_compressed_access_units() {
+        use mrd_render::{RenderError, RenderTarget, RendererInstance, RendererSnapshot};
+
+        #[derive(Default)]
+        struct CompressedDispatchRenderer {
+            decoded_uploads: u64,
+            h264_upload: Option<(usize, usize, u64, Vec<u8>)>,
+            hevc_upload: Option<(usize, usize, u64, Vec<u8>)>,
+        }
+
+        impl RendererInstance for CompressedDispatchRenderer {
+            fn attach_target(&mut self, _target: RenderTarget) -> Result<(), RenderError> {
+                Ok(())
+            }
+
+            fn upload_frame(&mut self, _frame: RenderFrame) -> Result<(), RenderError> {
+                self.decoded_uploads += 1;
+                Ok(())
+            }
+
+            fn upload_h264_access_unit(
+                &mut self,
+                width: usize,
+                height: usize,
+                timestamp_us: u64,
+                payload: bytes::Bytes,
+            ) -> Result<(), RenderError> {
+                self.h264_upload = Some((width, height, timestamp_us, payload.to_vec()));
+                Ok(())
+            }
+
+            fn upload_hevc_access_unit(
+                &mut self,
+                width: usize,
+                height: usize,
+                timestamp_us: u64,
+                payload: bytes::Bytes,
+            ) -> Result<(), RenderError> {
+                self.hevc_upload = Some((width, height, timestamp_us, payload.to_vec()));
+                Ok(())
+            }
+
+            fn snapshot(&self) -> RendererSnapshot {
+                RendererSnapshot {
+                    attached_to_target: true,
+                    uploaded_frame_count: self.decoded_uploads,
+                    presented_frame_count: self.decoded_uploads,
+                    present_skipped_count: 0,
+                    render_queue_replacements: None,
+                    last_present_status: None,
+                    low_latency_frame_latency_target: None,
+                    swap_chain_max_frame_latency: None,
+                    swap_chain_allow_tearing: None,
+                    swap_chain_waitable_object: None,
+                    swap_chain_present_mode: None,
+                    display_refresh_hz: None,
+                    render_thread_priority: None,
+                    waitable_wait_count: None,
+                    waitable_wait_total_ms: None,
+                    waitable_timeout_count: None,
+                    last_waitable_wait_ms: None,
+                    last_render_prepare_wait_ms: None,
+                    last_render_shared_resource_ms: None,
+                    last_render_wait_for_drawable_ms: None,
+                    last_render_encode_commit_ms: None,
+                    last_render_draw_present_ms: None,
+                    last_width: 0,
+                    last_height: 0,
+                    last_pixel_format: None,
+                }
+            }
+        }
+
+        let mut renderer = CompressedDispatchRenderer::default();
+
+        upload_lan_render_frame(
+            &mut renderer,
+            MediaRenderFrame::H264AccessUnit {
+                width: 640,
+                height: 360,
+                timestamp_us: 123,
+                payload: bytes::Bytes::from_static(b"h264-au"),
+            },
+        )
+        .expect("dispatch H.264 access unit");
+        upload_lan_render_frame(
+            &mut renderer,
+            MediaRenderFrame::HevcAccessUnit {
+                width: 1280,
+                height: 720,
+                timestamp_us: 456,
+                payload: bytes::Bytes::from_static(b"hevc-au"),
+            },
+        )
+        .expect("dispatch HEVC access unit");
+
+        assert_eq!(renderer.decoded_uploads, 0);
+        assert_eq!(
+            renderer.h264_upload,
+            Some((640, 360, 123, b"h264-au".to_vec()))
+        );
+        assert_eq!(
+            renderer.hevc_upload,
+            Some((1280, 720, 456, b"hevc-au".to_vec()))
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_compressed_proxy_requires_surface_before_claiming_access_units() {
+        use mrd_render::{RenderError, RenderTarget, RendererInstance, RendererSnapshot};
+
+        struct NoopSurfaceRenderer;
+
+        impl RendererInstance for NoopSurfaceRenderer {
+            fn attach_target(&mut self, _target: RenderTarget) -> Result<(), RenderError> {
+                Ok(())
+            }
+
+            fn upload_frame(&mut self, _frame: RenderFrame) -> Result<(), RenderError> {
+                Ok(())
+            }
+
+            fn upload_h264_access_unit(
+                &mut self,
+                _width: usize,
+                _height: usize,
+                _timestamp_us: u64,
+                _payload: bytes::Bytes,
+            ) -> Result<(), RenderError> {
+                Ok(())
+            }
+
+            fn upload_hevc_access_unit(
+                &mut self,
+                _width: usize,
+                _height: usize,
+                _timestamp_us: u64,
+                _payload: bytes::Bytes,
+            ) -> Result<(), RenderError> {
+                Ok(())
+            }
+
+            fn snapshot(&self) -> RendererSnapshot {
+                RendererSnapshot {
+                    attached_to_target: true,
+                    uploaded_frame_count: 0,
+                    presented_frame_count: 0,
+                    present_skipped_count: 0,
+                    render_queue_replacements: None,
+                    last_present_status: None,
+                    low_latency_frame_latency_target: None,
+                    swap_chain_max_frame_latency: None,
+                    swap_chain_allow_tearing: None,
+                    swap_chain_waitable_object: None,
+                    swap_chain_present_mode: None,
+                    display_refresh_hz: None,
+                    render_thread_priority: None,
+                    waitable_wait_count: None,
+                    waitable_wait_total_ms: None,
+                    waitable_timeout_count: None,
+                    last_waitable_wait_ms: None,
+                    last_render_prepare_wait_ms: None,
+                    last_render_shared_resource_ms: None,
+                    last_render_wait_for_drawable_ms: None,
+                    last_render_encode_commit_ms: None,
+                    last_render_draw_present_ms: None,
+                    last_width: 0,
+                    last_height: 0,
+                    last_pixel_format: None,
+                }
+            }
+        }
+
+        let app_state = Arc::new(AppState::new());
+        let session_id = SessionId("macos-compressed-surface-gate".to_string());
+        let profile = MediaProfile {
+            width: 1280,
+            height: 720,
+            fps: 60,
+            bitrate_mbps: 8,
+            codec: "h264".to_string(),
+            ..MediaProfile::default()
+        };
+
+        assert!(
+            !macos_render_proxy_compressed_media_surface_available(&app_state, &session_id).await
+        );
+        assert!(!render_lan_h264_access_unit_frame(
+            &app_state,
+            &session_id,
+            bytes::Bytes::from_static(b"h264-au"),
+            1,
+            123,
+            &profile,
+        )
+        .await
+        .expect("missing surface should not error"));
+        assert_eq!(
+            app_state
+                .media_render_queues
+                .lock()
+                .await
+                .pending_depth(&session_id),
+            0
+        );
+        assert_eq!(
+            app_state
+                .probes
+                .lock()
+                .await
+                .snapshot(&session_id)
+                .frames_decoded,
+            0
+        );
+
+        app_state
+            .media_surface_renderers
+            .lock()
+            .await
+            .insert_renderer_for_test(&session_id, "surface-1", Box::new(NoopSurfaceRenderer));
+
+        assert!(
+            macos_render_proxy_compressed_media_surface_available(&app_state, &session_id).await
+        );
+        assert!(render_lan_h264_access_unit_frame(
+            &app_state,
+            &session_id,
+            bytes::Bytes::from_static(b"h264-au"),
+            2,
+            456,
+            &profile,
+        )
+        .await
+        .expect("surface should accept compressed proxy frame"));
+        assert_eq!(
+            app_state
+                .probes
+                .lock()
+                .await
+                .snapshot(&session_id)
+                .frames_decoded,
+            1
+        );
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
     #[tokio::test]
     async fn d3d11_present_skip_is_not_counted_as_presented_frame() {
         use mrd_render::{RenderError, RenderTarget, RendererInstance, RendererSnapshot};
@@ -13119,6 +15146,7 @@ mod tests {
                     uploaded_frame_count: self.uploaded,
                     presented_frame_count: 0,
                     present_skipped_count: self.skipped,
+                    render_queue_replacements: None,
                     last_present_status: Some("skipped_still_drawing".to_string()),
                     low_latency_frame_latency_target: None,
                     swap_chain_max_frame_latency: None,
@@ -13133,6 +15161,8 @@ mod tests {
                     last_waitable_wait_ms: None,
                     last_render_prepare_wait_ms: None,
                     last_render_shared_resource_ms: None,
+                    last_render_wait_for_drawable_ms: None,
+                    last_render_encode_commit_ms: None,
                     last_render_draw_present_ms: None,
                     last_width: 1,
                     last_height: 1,
@@ -13159,7 +15189,7 @@ mod tests {
         let outcome = render_lan_frame_once(
             app_state,
             session_id,
-            RenderFrame::from_bgra32(1, 1, vec![0, 0, 0, 255]),
+            MediaRenderFrame::Decoded(RenderFrame::from_bgra32(1, 1, vec![0, 0, 0, 255])),
         )
         .await
         .expect("render one frame");
@@ -13175,6 +15205,54 @@ mod tests {
             }
             other => panic!("unexpected render outcome: {other:?}"),
         }
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn renderer_snapshot_render_queue_replacement_delta_uses_cumulative_counter() {
+        use mrd_render::RendererSnapshot;
+
+        fn snapshot(replacements: Option<u64>) -> RendererSnapshot {
+            RendererSnapshot {
+                attached_to_target: true,
+                uploaded_frame_count: 0,
+                presented_frame_count: 0,
+                present_skipped_count: 0,
+                render_queue_replacements: replacements,
+                last_present_status: None,
+                low_latency_frame_latency_target: None,
+                swap_chain_max_frame_latency: None,
+                swap_chain_allow_tearing: None,
+                swap_chain_waitable_object: None,
+                swap_chain_present_mode: None,
+                display_refresh_hz: None,
+                render_thread_priority: None,
+                waitable_wait_count: None,
+                waitable_wait_total_ms: None,
+                waitable_timeout_count: None,
+                last_waitable_wait_ms: None,
+                last_render_prepare_wait_ms: None,
+                last_render_shared_resource_ms: None,
+                last_render_wait_for_drawable_ms: None,
+                last_render_encode_commit_ms: None,
+                last_render_draw_present_ms: None,
+                last_width: 1,
+                last_height: 1,
+                last_pixel_format: None,
+            }
+        }
+
+        assert_eq!(
+            renderer_snapshot_render_queue_replacement_delta(
+                &snapshot(Some(2)),
+                &snapshot(Some(5))
+            ),
+            3
+        );
+        assert_eq!(
+            renderer_snapshot_render_queue_replacement_delta(&snapshot(None), &snapshot(Some(1))),
+            1
+        );
     }
 
     #[tokio::test]

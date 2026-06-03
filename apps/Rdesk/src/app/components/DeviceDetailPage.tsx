@@ -513,13 +513,7 @@ function RemoteTab({ device }: { device: Device }) {
       </div>
 
       {/* Screen */}
-      <div className="flex-1 relative overflow-hidden cursor-crosshair select-none">
-        <img
-          src="https://images.unsplash.com/photo-1610529027273-97aa4ba7188c?crop=entropy&cs=tinysrgb&fit=max&fm=jpg&ixid=M3w3Nzg4Nzd8MHwxfHNlYXJjaHwxfHx3aW5kb3dzJTIwZGVza3RvcCUyMHdhbGxwYXBlciUyMGxhbmRzY2FwZXxlbnwxfHx8fDE3NzI2MjE0NTB8MA&ixlib=rb-4.1.0&q=80&w=1080"
-          alt="Remote desktop"
-          className="w-full h-full object-cover opacity-90"
-          draggable={false}
-        />
+      <div className="flex-1 relative overflow-hidden cursor-crosshair select-none bg-[#070b14]">
         <div className="absolute inset-0 bg-[#070b14]" />
         <div className="absolute inset-0 flex items-center justify-center px-6">
           <div className="w-full max-w-3xl rounded-xl border border-white/10 bg-white/[0.03] p-5 text-gray-200 shadow-2xl">
@@ -1250,18 +1244,9 @@ function AppsTab({ device }: { device: Device }) {
                   className={`group overflow-hidden rounded-xl border shadow-sm transition-colors ${isDark ? "border-gray-700 bg-[#202020] hover:border-cyan-700" : "border-gray-200 bg-white hover:border-cyan-300"}`}
                 >
                   <div className={`flex h-28 items-center justify-center border-b ${isDark ? "border-gray-700 bg-[#151515]" : "border-gray-100 bg-gray-50"}`}>
-                    {source.preview_data_url ? (
-                      <img
-                        src={source.preview_data_url}
-                        alt={remoteCaptureSourceTitle(source)}
-                        className="h-full w-full object-cover"
-                        draggable={false}
-                      />
-                    ) : (
-                      <div className={`flex h-14 w-14 items-center justify-center rounded-2xl ${remoteCaptureSourceAccent(source)}`}>
-                        <SourceIcon className="h-7 w-7 text-white" />
-                      </div>
-                    )}
+                    <div className={`flex h-14 w-14 items-center justify-center rounded-2xl ${remoteCaptureSourceAccent(source)}`}>
+                      <SourceIcon className="h-7 w-7 text-white" />
+                    </div>
                   </div>
                   <div className="p-4">
                     <div className="flex items-start gap-3">

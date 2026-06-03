@@ -7,7 +7,7 @@
     "beforeDevCommand": "npm run build:service:dev && npm run dev -- --host 127.0.0.1 --port 9531 --strictPort",
     "beforeBuildCommand": "npm run build:service && npm run build",
     "frontendDist": "../dist",
-    "devUrl": "http://localhost:9531"
+    "devUrl": "http://127.0.0.1:9531"
   },
   "app": {
     "withGlobalTauri": true,

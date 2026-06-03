@@ -15,7 +15,9 @@ mod quic_host;
 #[cfg(test)]
 mod quic_transport_harness;
 mod remote_display_surface;
+mod render_host;
 mod render_probe;
+mod render_proxy;
 mod render_window_registry;
 mod resource_monitor;
 mod service_manager;
@@ -81,6 +83,7 @@ const LAN_E2E_CAPTURE_SOURCE_KIND_ENV: &str = "MRD_LAN_E2E_CAPTURE_SOURCE_KIND";
 const LAN_E2E_RENDER_DISPLAY_SOURCE_ID_ENV: &str = "MRD_LAN_E2E_RENDER_DISPLAY_SOURCE_ID";
 const LAN_E2E_EXPECTED_PEER_BUILD_ID_ENV: &str = "MRD_LAN_E2E_EXPECTED_PEER_BUILD_ID";
 const LAN_E2E_RENDER_PROFILE_CAP_ENV: &str = "MRD_LAN_E2E_RENDER_PROFILE_CAP";
+const LAN_E2E_RENDER_DISPLAY_ENV: &str = "MRD_LAN_E2E_RENDER_DISPLAY";
 const LAN_E2E_ADAPTIVE_ENV: &str = "MRD_LAN_E2E_ADAPTIVE";
 
 static APP_IS_QUITTING: AtomicBool = AtomicBool::new(false);
@@ -107,6 +110,7 @@ struct AppState {
     // Remote display windows: frameless web chrome plus optional native DX11 surface.
     render_window_registry: std::sync::Arc<std::sync::Mutex<RenderWindowRegistry>>,
     remote_display_surfaces: std::sync::Arc<std::sync::Mutex<RemoteDisplaySurfaceManager>>,
+    render_proxy: std::sync::Arc<render_proxy::RenderProxyRegistry>,
     // Local browser WebRTC preview host for the remote display window Web mode.
     webrtc_host: std::sync::Arc<tokio::sync::Mutex<webrtc_host::WebrtcHost>>,
 }
@@ -311,11 +315,12 @@ fn build_remote_display_window(
 ) -> Result<(), String> {
     let label = spec.label.clone();
     let session_id = spec.session_id.0.clone();
+    let (window_width, window_height) = render_window_registry::render_window_initial_inner_size();
     let window = WebviewWindowBuilder::new(app, spec.label.clone(), spec.url)
         .title(format!("Rdesk Display {}", spec.session_id.0))
         .decorations(false)
         .resizable(true)
-        .inner_size(1280.0, 800.0)
+        .inner_size(window_width, window_height)
         .min_inner_size(720.0, 420.0)
         .visible(false)
         .build()
@@ -869,7 +874,7 @@ async fn configure_remote_display_native_surface(
     )?;
     drop(window);
 
-    let (context, service_action) = {
+    let (context, service_action, recorded_optimistic_attach) = {
         let mut registry = state.render_window_registry.lock().unwrap();
         let context = registry.context_for_label(&app_handle, &label);
         let service_action = context.as_ref().map(|_| {
@@ -880,7 +885,17 @@ async fn configure_remote_display_native_surface(
                 snapshot.hwnd.as_deref(),
             )
         });
-        (context, service_action)
+        let recorded_optimistic_attach =
+            matches!(service_action, Some(NativeSurfaceServiceAction::Attach));
+        if recorded_optimistic_attach {
+            registry.record_native_surface_service_binding(
+                &label,
+                snapshot.attached,
+                &snapshot.backend,
+                snapshot.hwnd.as_deref(),
+            );
+        }
+        (context, service_action, recorded_optimistic_attach)
     };
 
     let service_action_label = match service_action.as_ref() {
@@ -930,15 +945,37 @@ async fn configure_remote_display_native_surface(
     if let Some(context) = context.clone() {
         let result = match service_action.unwrap_or(NativeSurfaceServiceAction::Unchanged) {
             NativeSurfaceServiceAction::Attach => {
+                let render_proxy_endpoint = if snapshot.backend == "macos" {
+                    let window_handle = snapshot
+                        .hwnd
+                        .as_deref()
+                        .and_then(parse_native_handle)
+                        .ok_or_else(|| {
+                            "macOS native render surface is missing a render target handle"
+                                .to_string()
+                        })?;
+                    state.render_proxy.attach_surface(
+                        &context.session_id,
+                        &context.surface_id,
+                        window_handle as isize,
+                    )?
+                } else {
+                    None
+                };
                 eprintln!(
-                    "render-surface ui ipc attach session_id={} surface_id={} backend={} hwnd={:?}",
-                    context.session_id, context.surface_id, snapshot.backend, snapshot.hwnd
+                    "render-surface ui ipc attach session_id={} surface_id={} backend={} hwnd={:?} render_proxy={}",
+                    context.session_id,
+                    context.surface_id,
+                    snapshot.backend,
+                    snapshot.hwnd,
+                    render_proxy_endpoint.as_deref().unwrap_or("-")
                 );
                 send_attach_render_surface(
                     context.session_id.clone(),
                     context.surface_id.clone(),
                     snapshot.backend.clone(),
                     snapshot.hwnd.as_deref().and_then(parse_native_handle),
+                    render_proxy_endpoint,
                 )
                 .await
             }
@@ -947,6 +984,9 @@ async fn configure_remote_display_native_surface(
                     "render-surface ui ipc detach session_id={} surface_id={}",
                     context.session_id, context.surface_id
                 );
+                state
+                    .render_proxy
+                    .detach_surface(&context.session_id, &context.surface_id);
                 send_detach_render_surface(context.session_id.clone(), context.surface_id.clone())
                     .await
             }
@@ -959,6 +999,9 @@ async fn configure_remote_display_native_surface(
                 context.session_id, context.surface_id
             );
             if snapshot.attached {
+                state
+                    .render_proxy
+                    .detach_surface(&context.session_id, &context.surface_id);
                 let _ = detach_native_surface_for_label(
                     &app_handle,
                     state.inner().clone(),
@@ -972,6 +1015,18 @@ async fn configure_remote_display_native_surface(
                 {
                     notify_remote_render_surface_configured(context, snapshot.clone());
                 }
+                if recorded_optimistic_attach {
+                    state
+                        .render_window_registry
+                        .lock()
+                        .unwrap()
+                        .record_native_surface_service_binding(
+                            &label,
+                            false,
+                            &snapshot.backend,
+                            None,
+                        );
+                }
                 return Err(error);
             }
             tracing::warn!(%error, "failed to notify mrd-service about detached native render surface");
@@ -980,16 +1035,18 @@ async fn configure_remote_display_native_surface(
                 "render-surface ui ipc ok label={label} session_id={} surface_id={} action={service_action_label}",
                 context.session_id, context.surface_id
             );
-            state
-                .render_window_registry
-                .lock()
-                .unwrap()
-                .record_native_surface_service_binding(
-                    &label,
-                    snapshot.attached,
-                    &snapshot.backend,
-                    snapshot.hwnd.as_deref(),
-                );
+            if !recorded_optimistic_attach {
+                state
+                    .render_window_registry
+                    .lock()
+                    .unwrap()
+                    .record_native_surface_service_binding(
+                        &label,
+                        snapshot.attached,
+                        &snapshot.backend,
+                        snapshot.hwnd.as_deref(),
+                    );
+            }
         }
     }
 
@@ -1151,6 +1208,7 @@ async fn send_attach_render_surface(
     surface_id: String,
     backend: String,
     window_handle: Option<i64>,
+    render_proxy_endpoint: Option<String>,
 ) -> Result<(), String> {
     use mrd_ipc::{IpcRequest, IpcResponse};
 
@@ -1161,6 +1219,7 @@ async fn send_attach_render_surface(
             surface_id,
             backend,
             window_handle,
+            render_proxy_endpoint,
         })
         .await
         .map_err(|error| error.to_string())?;
@@ -1207,26 +1266,6 @@ fn present_test_harness_frame_on_native_surface(
     };
 
     present_native_probe_frame(target)
-}
-
-#[tauri::command]
-fn present_remote_preview_frame_on_native_surface(
-    window: WebviewWindow,
-    state: tauri::State<'_, AppState>,
-    data_url: String,
-) -> Result<bool, String> {
-    let label = window.label().to_string();
-    let target = state
-        .remote_display_surfaces
-        .lock()
-        .unwrap()
-        .render_target_handle(&label);
-    let Some(target) = target else {
-        return Ok(false);
-    };
-
-    let frame = render_frame_from_png_data_url(&data_url)?;
-    present_native_frame(target, frame)
 }
 
 #[cfg(target_os = "macos")]
@@ -1309,31 +1348,6 @@ fn present_native_probe_frame(_target: isize) -> Result<bool, String> {
 #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 fn present_native_frame(_target: isize, _frame: mrd_render::RenderFrame) -> Result<bool, String> {
     Ok(false)
-}
-
-fn render_frame_from_png_data_url(data_url: &str) -> Result<mrd_render::RenderFrame, String> {
-    use base64::Engine;
-
-    let encoded = data_url
-        .trim()
-        .strip_prefix("data:image/png;base64,")
-        .ok_or_else(|| "remote preview frame is not a PNG data URL".to_string())?;
-    let png = base64::engine::general_purpose::STANDARD
-        .decode(encoded)
-        .map_err(|error| format!("decode remote preview data URL failed: {error}"))?;
-    let image = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
-        .map_err(|error| format!("decode remote preview PNG failed: {error}"))?
-        .to_rgba8();
-    let (width, height) = image.dimensions();
-    let mut bgra = image.into_raw();
-    for pixel in bgra.chunks_exact_mut(4) {
-        pixel.swap(0, 2);
-    }
-    Ok(mrd_render::RenderFrame::from_bgra32(
-        width as usize,
-        height as usize,
-        bgra,
-    ))
 }
 
 fn build_native_probe_frame(width: usize, height: usize) -> mrd_render::RenderFrame {
@@ -2608,89 +2622,9 @@ async fn test_harness_get_comparison_result(
     .map_err(|e| e.to_string())?
 }
 
-type HarnessFramePayload = Option<(String, usize, usize, u64)>;
-type HarnessFramesResponse = (HarnessFramePayload, HarnessFramePayload);
-
-#[tauri::command]
-async fn test_harness_get_frames(
-    state: tauri::State<'_, AppState>,
-    include_captured: Option<bool>,
-    include_rendered: Option<bool>,
-    last_captured_generation: Option<u64>,
-    last_rendered_generation: Option<u64>,
-) -> Result<HarnessFramesResponse, String> {
-    let include_captured = include_captured.unwrap_or(true);
-    let include_rendered = include_rendered.unwrap_or(true);
-    let test_harness = state.test_harness.clone();
-
-    tokio::task::spawn_blocking(move || {
-        let (captured, rendered) = test_harness.lock().unwrap().get_latest_frames_since(
-            include_captured,
-            include_rendered,
-            last_captured_generation,
-            last_rendered_generation,
-        );
-
-        let captured_base64 = if include_captured {
-            captured.and_then(|(data, width, height, generation)| {
-                encode_bgra_png_base64(&data, width, height)
-                    .map(|png| (png, width, height, generation))
-            })
-        } else {
-            None
-        };
-
-        let rendered_base64 = if include_rendered {
-            rendered.and_then(|(data, width, height, generation)| {
-                encode_bgra_png_base64(&data, width, height)
-                    .map(|png| (png, width, height, generation))
-            })
-        } else {
-            None
-        };
-
-        (captured_base64, rendered_base64)
-    })
-    .await
-    .map_err(|error| error.to_string())
-}
-
-fn encode_bgra_png_base64(bgra: &[u8], width: usize, height: usize) -> Option<String> {
-    use base64::Engine;
-
-    let rgba = convert_bgra_to_rgba(bgra);
-    let image = image::RgbaImage::from_raw(width as u32, height as u32, rgba)?;
-    let mut png = std::io::Cursor::new(Vec::new());
-    image::DynamicImage::ImageRgba8(image)
-        .write_to(&mut png, image::ImageFormat::Png)
-        .ok()?;
-    Some(base64::engine::general_purpose::STANDARD.encode(png.into_inner()))
-}
-
-fn convert_bgra_to_rgba(bgra: &[u8]) -> Vec<u8> {
-    bgra.chunks_exact(4)
-        .flat_map(|chunk| [chunk[2], chunk[1], chunk[0], chunk[3]])
-        .collect()
-}
-
 #[cfg(test)]
 mod frame_encoding_tests {
     use super::*;
-    use base64::Engine;
-
-    #[test]
-    fn bgra_frame_is_encoded_as_png() {
-        let bgra = [
-            0, 0, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255, 255, 255, 255, 255,
-        ];
-
-        let encoded = encode_bgra_png_base64(&bgra, 2, 2).unwrap();
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .unwrap();
-
-        assert_eq!(&decoded[..8], b"\x89PNG\r\n\x1a\n");
-    }
 
     #[test]
     fn native_probe_frame_is_bgra_and_non_empty() {
@@ -2700,26 +2634,6 @@ mod frame_encoding_tests {
         assert_eq!(frame.height, 48);
         assert_eq!(frame.pixel_format, mrd_render::RenderPixelFormat::Bgra32);
         assert_eq!(frame.as_bgra32().unwrap().len(), 64 * 48 * 4);
-    }
-
-    #[test]
-    fn png_data_url_is_decoded_as_bgra_render_frame() {
-        let image = image::RgbImage::from_raw(1, 1, vec![10, 20, 30]).unwrap();
-        let mut png = std::io::Cursor::new(Vec::new());
-        image::DynamicImage::ImageRgb8(image)
-            .write_to(&mut png, image::ImageFormat::Png)
-            .unwrap();
-        let data_url = format!(
-            "data:image/png;base64,{}",
-            base64::engine::general_purpose::STANDARD.encode(png.into_inner())
-        );
-
-        let frame = render_frame_from_png_data_url(&data_url).unwrap();
-
-        assert_eq!(frame.width, 1);
-        assert_eq!(frame.height, 1);
-        assert_eq!(frame.pixel_format, mrd_render::RenderPixelFormat::Bgra32);
-        assert_eq!(frame.as_bgra32(), Some(&[30, 20, 10, 255][..]));
     }
 }
 
@@ -2751,7 +2665,7 @@ fn test_list_window_capture_targets() -> Result<Vec<test_orchestrator::WindowCap
     test_orchestrator::list_window_capture_targets().map_err(|e| e.to_string())
 }
 
-/// List platform window capture targets and attach best-effort screenshot previews.
+/// Legacy preview command. Image payloads are disabled; returns target metadata only.
 #[tauri::command]
 fn test_list_window_capture_targets_with_previews(
     limit: Option<usize>,
@@ -3086,6 +3000,7 @@ struct LanE2eAutorunLaunchConfig {
     render_display_source_id: Option<String>,
     expected_peer_build_id: Option<String>,
     render_profile_cap: Option<String>,
+    render_display: Option<String>,
     adaptive: Option<String>,
 }
 
@@ -3126,6 +3041,7 @@ where
         render_display_source_id: non_empty_env(env(LAN_E2E_RENDER_DISPLAY_SOURCE_ID_ENV)),
         expected_peer_build_id: non_empty_env(env(LAN_E2E_EXPECTED_PEER_BUILD_ID_ENV)),
         render_profile_cap: non_empty_env(env(LAN_E2E_RENDER_PROFILE_CAP_ENV)),
+        render_display: non_empty_env(env(LAN_E2E_RENDER_DISPLAY_ENV)),
         adaptive: non_empty_env(env(LAN_E2E_ADAPTIVE_ENV)),
     })
 }
@@ -3172,6 +3088,7 @@ fn build_lan_e2e_autorun_route(config: LanE2eAutorunLaunchConfig) -> String {
         config.expected_peer_build_id,
     );
     push_query_param(&mut params, "renderProfileCap", config.render_profile_cap);
+    push_query_param(&mut params, "renderDisplay", config.render_display);
     push_query_param(&mut params, "adaptive", config.adaptive);
 
     let query = params
@@ -3280,12 +3197,13 @@ mod tray_tests {
             render_display_source_id: Some("windows:display-shared:0".to_string()),
             expected_peer_build_id: Some("abc123def456".to_string()),
             render_profile_cap: Some("false".to_string()),
+            render_display: Some("false".to_string()),
             adaptive: Some("true".to_string()),
         });
 
         assert_eq!(
             route,
-            "/test/e2e?autorun=lan-e2e&targetDeviceId=agent%20device%2F1&transport=quic&timeoutMs=2500&minSampleDurationMs=1500&minDecodedFrames=2&minFps=5&stopOnComplete=false&width=1920&height=1080&fps=180&bitrateMbps=20&codec=hevc&codecProfile=main&bitDepth=8&chromaSubsampling=4%3A2%3A0&pixelFormat=nv12&hdrEnabled=false&displayModePolicy=temporary&captureSourceId=windows%3Adisplay-shared%3A1&captureSourceKind=display&renderDisplaySourceId=windows%3Adisplay-shared%3A0&expectedPeerBuildId=abc123def456&renderProfileCap=false&adaptive=true"
+            "/test/e2e?autorun=lan-e2e&targetDeviceId=agent%20device%2F1&transport=quic&timeoutMs=2500&minSampleDurationMs=1500&minDecodedFrames=2&minFps=5&stopOnComplete=false&width=1920&height=1080&fps=180&bitrateMbps=20&codec=hevc&codecProfile=main&bitDepth=8&chromaSubsampling=4%3A2%3A0&pixelFormat=nv12&hdrEnabled=false&displayModePolicy=temporary&captureSourceId=windows%3Adisplay-shared%3A1&captureSourceKind=display&renderDisplaySourceId=windows%3Adisplay-shared%3A0&expectedPeerBuildId=abc123def456&renderProfileCap=false&renderDisplay=false&adaptive=true"
         );
     }
 
@@ -3723,6 +3641,7 @@ fn main() {
         std::sync::Arc::new(std::sync::Mutex::new(RenderWindowRegistry::default()));
     let remote_display_surfaces =
         std::sync::Arc::new(std::sync::Mutex::new(RemoteDisplaySurfaceManager::default()));
+    let render_proxy = std::sync::Arc::new(render_proxy::RenderProxyRegistry::default());
     let webrtc_host =
         std::sync::Arc::new(tokio::sync::Mutex::new(webrtc_host::WebrtcHost::default()));
 
@@ -3746,6 +3665,7 @@ fn main() {
             resource_monitor,
             render_window_registry,
             remote_display_surfaces,
+            render_proxy,
             webrtc_host,
         })
         .on_menu_event(|app, event| {
@@ -3869,7 +3789,6 @@ fn main() {
             browser_webrtc_preview_stop,
             configure_remote_display_native_surface,
             present_test_harness_frame_on_native_surface,
-            present_remote_preview_frame_on_native_surface,
             get_client_diagnostics,
             open_diagnostics_folder,
             automation_write_report,
@@ -3931,7 +3850,6 @@ fn main() {
             test_harness_get_chain,
             test_harness_get_metrics,
             test_harness_get_comparison_result,
-            test_harness_get_frames,
             // Test Workbench commands (new unified test API)
             test_list_scenarios,
             test_get_capabilities,

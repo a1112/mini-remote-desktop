@@ -11,7 +11,6 @@
 
 use anyhow::Result;
 use base64::Engine;
-use image::{codecs::png::PngEncoder, ColorType, ImageEncoder};
 use mrd_pipeline_core::{
     CapturedFrame, DecodedFrame, DecodedFrameData, EncodedAccessUnit, FramePixelFormat,
     VideoEncoder,
@@ -3335,26 +3334,9 @@ pub fn list_window_capture_targets_with_previews(
     limit: Option<usize>,
 ) -> Result<Vec<WindowCaptureTarget>> {
     let mut targets = list_window_capture_targets_impl()?;
-    let limit = limit.unwrap_or(24).min(32);
-
-    for target in targets.iter_mut().take(limit) {
-        let Ok(hwnd) = parse_hwnd(&target.hwnd) else {
-            continue;
-        };
-        let Ok(probe) = probe_window_first_frame(hwnd, Duration::from_millis(250)) else {
-            continue;
-        };
-        let Ok((preview_data_url, preview_width, preview_height)) =
-            window_preview_data_url(&probe.frame, 320, 180)
-        else {
-            continue;
-        };
-
-        target.preview_data_url = Some(preview_data_url);
-        target.preview_width = Some(preview_width);
-        target.preview_height = Some(preview_height);
+    if let Some(limit) = limit {
+        targets.truncate(limit);
     }
-
     Ok(targets)
 }
 
@@ -3365,11 +3347,11 @@ pub fn list_capture_share_sources() -> Result<Vec<CaptureShareSourceTarget>> {
 pub fn list_capture_share_sources_with_previews(
     limit: Option<usize>,
 ) -> Result<Vec<CaptureShareSourceTarget>> {
-    list_capture_share_sources_impl(true, limit)
+    list_capture_share_sources_impl(false, limit)
 }
 
 fn list_capture_share_sources_impl(
-    include_previews: bool,
+    _include_previews: bool,
     limit: Option<usize>,
 ) -> Result<Vec<CaptureShareSourceTarget>> {
     let mut sources = list_display_share_sources_impl()?;
@@ -3387,32 +3369,8 @@ fn list_capture_share_sources_impl(
         }
     }
 
-    if include_previews {
-        let limit = limit.unwrap_or(24).min(32);
-        for source in sources
-            .iter_mut()
-            .filter(|source| source.source_kind == "window")
-            .take(limit)
-        {
-            let Some(hwnd) = source.hwnd.as_deref() else {
-                continue;
-            };
-            let Ok(hwnd) = parse_hwnd(hwnd) else {
-                continue;
-            };
-            let Ok(probe) = probe_window_first_frame(hwnd, Duration::from_millis(250)) else {
-                continue;
-            };
-            let Ok((preview_data_url, preview_width, preview_height)) =
-                window_preview_data_url(&probe.frame, 320, 180)
-            else {
-                continue;
-            };
-
-            source.preview_data_url = Some(preview_data_url);
-            source.preview_width = Some(preview_width);
-            source.preview_height = Some(preview_height);
-        }
+    if let Some(limit) = limit {
+        sources.truncate(limit);
     }
 
     Ok(sources)
@@ -3800,138 +3758,12 @@ fn probe_window_first_frame(_hwnd: isize, _timeout: Duration) -> Result<WindowCa
     anyhow::bail!("window capture is only available on Windows and macOS")
 }
 
-fn window_preview_data_url(
-    frame: &CapturedFrame,
-    max_width: usize,
-    max_height: usize,
-) -> Result<(String, u32, u32)> {
-    if frame.width == 0 || frame.height == 0 || max_width == 0 || max_height == 0 {
-        anyhow::bail!("window preview frame has invalid dimensions");
-    }
-
-    let scale = (max_width as f64 / frame.width as f64)
-        .min(max_height as f64 / frame.height as f64)
-        .min(1.0);
-    let preview_width = ((frame.width as f64 * scale).round() as usize)
-        .max(1)
-        .min(max_width);
-    let preview_height = ((frame.height as f64 * scale).round() as usize)
-        .max(1)
-        .min(max_height);
-
-    let mut rgba = Vec::with_capacity(preview_width * preview_height * 4);
-    match frame.pixel_format {
-        FramePixelFormat::Nv12 => {
-            let required_len = nv12_frame_len(frame.width, frame.height)
-                .ok_or_else(|| anyhow::anyhow!("window preview NV12 byte size overflow"))?;
-            if frame.data.len() < required_len {
-                anyhow::bail!(
-                    "window preview NV12 frame is truncated: {} < {}",
-                    frame.data.len(),
-                    required_len
-                );
-            }
-            for y in 0..preview_height {
-                let source_y = y * frame.height / preview_height;
-                for x in 0..preview_width {
-                    let source_x = x * frame.width / preview_width;
-                    let (r, g, b) = sample_nv12_rgb(frame, source_x, source_y);
-                    rgba.extend_from_slice(&[r, g, b, 255]);
-                }
-            }
-        }
-        FramePixelFormat::Bgra32 | FramePixelFormat::Rgba32 | FramePixelFormat::Rgb24 => {
-            let bytes_per_pixel = match frame.pixel_format {
-                FramePixelFormat::Bgra32 | FramePixelFormat::Rgba32 => 4,
-                FramePixelFormat::Rgb24 => 3,
-                FramePixelFormat::Nv12 => unreachable!("NV12 handled above"),
-            };
-            let source_stride = frame
-                .width
-                .checked_mul(bytes_per_pixel)
-                .ok_or_else(|| anyhow::anyhow!("window preview stride overflow"))?;
-            let required_len = source_stride
-                .checked_mul(frame.height)
-                .ok_or_else(|| anyhow::anyhow!("window preview byte size overflow"))?;
-            if frame.data.len() < required_len {
-                anyhow::bail!(
-                    "window preview frame is truncated: {} < {}",
-                    frame.data.len(),
-                    required_len
-                );
-            }
-
-            for y in 0..preview_height {
-                let source_y = y * frame.height / preview_height;
-                for x in 0..preview_width {
-                    let source_x = x * frame.width / preview_width;
-                    let source_index = source_y * source_stride + source_x * bytes_per_pixel;
-                    match frame.pixel_format {
-                        FramePixelFormat::Bgra32 => {
-                            rgba.push(frame.data[source_index + 2]);
-                            rgba.push(frame.data[source_index + 1]);
-                            rgba.push(frame.data[source_index]);
-                            rgba.push(frame.data[source_index + 3]);
-                        }
-                        FramePixelFormat::Rgba32 => {
-                            rgba.extend_from_slice(&frame.data[source_index..source_index + 4]);
-                        }
-                        FramePixelFormat::Rgb24 => {
-                            rgba.push(frame.data[source_index]);
-                            rgba.push(frame.data[source_index + 1]);
-                            rgba.push(frame.data[source_index + 2]);
-                            rgba.push(255);
-                        }
-                        FramePixelFormat::Nv12 => unreachable!("NV12 handled above"),
-                    }
-                }
-            }
-        }
-    }
-
-    let mut png = Vec::new();
-    PngEncoder::new(&mut png).write_image(
-        &rgba,
-        preview_width as u32,
-        preview_height as u32,
-        ColorType::Rgba8.into(),
-    )?;
-    let encoded = base64::engine::general_purpose::STANDARD.encode(png);
-
-    Ok((
-        format!("data:image/png;base64,{encoded}"),
-        preview_width as u32,
-        preview_height as u32,
-    ))
-}
-
 fn nv12_frame_len(width: usize, height: usize) -> Option<usize> {
     width.checked_mul(height).and_then(|y_size| {
         width
             .checked_mul(height.div_ceil(2))
             .and_then(|uv_size| y_size.checked_add(uv_size))
     })
-}
-
-fn sample_nv12_rgb(frame: &CapturedFrame, x: usize, y: usize) -> (u8, u8, u8) {
-    let y_size = frame.width * frame.height;
-    let luma = frame.data[y * frame.width + x] as i32;
-    let uv_row = y_size + (y / 2) * frame.width;
-    let uv_x = (x / 2) * 2;
-    let u = frame.data[uv_row + uv_x] as i32;
-    let v = frame.data[uv_row + uv_x + 1] as i32;
-    let c = (luma - 16).max(0);
-    let d = u - 128;
-    let e = v - 128;
-    (
-        clamp_yuv_to_u8((298 * c + 409 * e + 128) >> 8),
-        clamp_yuv_to_u8((298 * c - 100 * d - 208 * e + 128) >> 8),
-        clamp_yuv_to_u8((298 * c + 516 * d + 128) >> 8),
-    )
-}
-
-fn clamp_yuv_to_u8(value: i32) -> u8 {
-    value.clamp(0, 255) as u8
 }
 
 impl Default for TestRunSummary {
@@ -4765,24 +4597,6 @@ mod tests {
         assert_eq!(probe.access_units[0].timestamp_us, input.timestamp_us);
         assert_eq!(probe.access_units[0].bytes, input.bytes);
         assert!(probe.access_units[0].is_keyframe);
-    }
-
-    #[test]
-    fn window_preview_data_url_downscales_and_encodes_png() {
-        let frame = CapturedFrame::from_cpu(
-            2,
-            2,
-            FramePixelFormat::Bgra32,
-            0,
-            vec![
-                0, 0, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255, 255, 255, 255, 255,
-            ],
-        );
-
-        let (data_url, width, height) = window_preview_data_url(&frame, 1, 1).unwrap();
-
-        assert_eq!((width, height), (1, 1));
-        assert!(data_url.starts_with("data:image/png;base64,"));
     }
 
     #[test]

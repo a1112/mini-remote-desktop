@@ -32,16 +32,25 @@ async fn service_evaluates_lan_profile_and_exposes_policy_identity_telemetry() {
     match evaluation {
         IpcResponse::ScenarioProfileEvaluated { evaluation } => {
             assert_eq!(evaluation.scenario_id, "lan.2k144");
-            assert!(matches!(
-                evaluation.status,
-                mrd_ipc::ScenarioEvaluationStatus::Ready
-                    | mrd_ipc::ScenarioEvaluationStatus::Degraded
-            ));
             assert!(evaluation
                 .required_capabilities
                 .iter()
                 .any(|capability| capability == "transport.quic_datagram"));
             assert!(evaluation.transport_kind.as_deref() == Some("quic"));
+            match evaluation.status {
+                mrd_ipc::ScenarioEvaluationStatus::Ready
+                | mrd_ipc::ScenarioEvaluationStatus::Degraded => {
+                    assert!(evaluation.missing_capabilities.is_empty());
+                    assert!(evaluation.fallback_profile.is_none());
+                }
+                mrd_ipc::ScenarioEvaluationStatus::Blocked => {
+                    assert!(!evaluation.missing_capabilities.is_empty());
+                    assert!(evaluation.fallback_profile.is_some());
+                }
+                mrd_ipc::ScenarioEvaluationStatus::Skipped => {
+                    panic!("local LAN profile evaluation should not be skipped")
+                }
+            }
         }
         other => panic!(
             "Expected ScenarioProfileEvaluated response, got {:?}",

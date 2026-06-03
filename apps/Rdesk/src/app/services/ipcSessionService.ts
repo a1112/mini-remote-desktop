@@ -262,10 +262,10 @@ export const configureMediaAdaptation = async (
 };
 
 /**
- * List local capture sources with best-effort screenshot previews.
+ * List local capture sources. Image previews are disabled on native paths.
  */
 export const listLocalCaptureSources = async (
-  includePreviews = true,
+  includePreviews = false,
   limit?: number
 ): Promise<CaptureSource[]> => {
   const result = await tauriAdapter.ipcListLocalCaptureSources(includePreviews, limit);
@@ -273,11 +273,11 @@ export const listLocalCaptureSources = async (
 };
 
 /**
- * List remote capture sources with best-effort screenshot previews.
+ * List remote capture sources. Image previews are disabled on native paths.
  */
 export const listRemoteCaptureSources = async (
   sessionId: string,
-  includePreviews = true,
+  includePreviews = false,
   limit?: number
 ): Promise<CaptureSource[]> => {
   const result = await tauriAdapter.ipcListRemoteCaptureSources(

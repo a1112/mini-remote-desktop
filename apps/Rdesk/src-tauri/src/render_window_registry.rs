@@ -4,6 +4,15 @@ use mrd_proto::SessionId;
 use serde::Serialize;
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
+const DEFAULT_RENDER_WINDOW_WIDTH: f64 = 1280.0;
+const DEFAULT_RENDER_WINDOW_HEIGHT: f64 = 800.0;
+const MIN_RENDER_WINDOW_WIDTH: f64 = 720.0;
+const MIN_RENDER_WINDOW_HEIGHT: f64 = 420.0;
+const MAX_RENDER_WINDOW_WIDTH: f64 = 4096.0;
+const MAX_RENDER_WINDOW_HEIGHT: f64 = 2304.0;
+const RENDER_WINDOW_WIDTH_ENV: &str = "MRD_RENDER_WINDOW_WIDTH";
+const RENDER_WINDOW_HEIGHT_ENV: &str = "MRD_RENDER_WINDOW_HEIGHT";
+
 pub struct PendingRenderWindow {
     pub label: String,
     pub session_id: SessionId,
@@ -104,11 +113,12 @@ impl RenderWindowRegistry {
         *next_id += 1;
 
         let url = remote_display_url(&session_id.0, &surface_id)?;
+        let (window_width, window_height) = render_window_initial_inner_size();
         WebviewWindowBuilder::new(app, label.clone(), url)
             .title(format!("Rdesk Display {}", session_id.0))
             .decorations(false)
             .resizable(true)
-            .inner_size(1280.0, 800.0)
+            .inner_size(window_width, window_height)
             .min_inner_size(720.0, 420.0)
             .build()
             .map_err(|error| format!("创建渲染窗口失败: {error}"))?;
@@ -341,6 +351,48 @@ impl RenderWindowRegistry {
     }
 }
 
+pub fn render_window_initial_inner_size() -> (f64, f64) {
+    render_window_initial_inner_size_from_env(
+        std::env::var(RENDER_WINDOW_WIDTH_ENV).ok(),
+        std::env::var(RENDER_WINDOW_HEIGHT_ENV).ok(),
+    )
+}
+
+fn render_window_initial_inner_size_from_env(
+    width: Option<String>,
+    height: Option<String>,
+) -> (f64, f64) {
+    (
+        parse_render_window_dimension(
+            width,
+            DEFAULT_RENDER_WINDOW_WIDTH,
+            MIN_RENDER_WINDOW_WIDTH,
+            MAX_RENDER_WINDOW_WIDTH,
+        ),
+        parse_render_window_dimension(
+            height,
+            DEFAULT_RENDER_WINDOW_HEIGHT,
+            MIN_RENDER_WINDOW_HEIGHT,
+            MAX_RENDER_WINDOW_HEIGHT,
+        ),
+    )
+}
+
+fn parse_render_window_dimension(
+    value: Option<String>,
+    default_value: f64,
+    min_value: f64,
+    max_value: f64,
+) -> f64 {
+    value
+        .as_deref()
+        .map(str::trim)
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .map(|value| value.clamp(min_value, max_value))
+        .unwrap_or(default_value)
+}
+
 fn remote_display_url(session_id: &str, surface_id: &str) -> Result<WebviewUrl, String> {
     let path = format!("/display/{session_id}?surface={surface_id}");
     Ok(WebviewUrl::App(path.into()))
@@ -429,6 +481,35 @@ mod tests {
         assert_eq!(context.render_mode, "d3d11_native");
         assert!(context.native_surface_attached);
         assert_eq!(context.session_window_count, 2);
+    }
+
+    #[test]
+    fn render_window_initial_inner_size_defaults_and_clamps_env_values() {
+        assert_eq!(
+            super::render_window_initial_inner_size_from_env(None, None),
+            (1280.0, 800.0)
+        );
+        assert_eq!(
+            super::render_window_initial_inner_size_from_env(
+                Some("2400".to_string()),
+                Some("1440".to_string())
+            ),
+            (2400.0, 1440.0)
+        );
+        assert_eq!(
+            super::render_window_initial_inner_size_from_env(
+                Some("12".to_string()),
+                Some("nan".to_string())
+            ),
+            (720.0, 800.0)
+        );
+        assert_eq!(
+            super::render_window_initial_inner_size_from_env(
+                Some("99999".to_string()),
+                Some("99999".to_string())
+            ),
+            (4096.0, 2304.0)
+        );
     }
 
     #[test]

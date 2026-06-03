@@ -4,6 +4,16 @@ use thiserror::Error;
 
 pub mod encoder_config;
 
+#[cfg(target_os = "macos")]
+use std::{ffi::c_void, ptr::NonNull};
+
+#[cfg(target_os = "macos")]
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFRetain(cf: *const c_void) -> *const c_void;
+    fn CFRelease(cf: *const c_void);
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RuntimeStatus {
     ProfileOnly,
@@ -36,12 +46,80 @@ pub enum FramePixelFormat {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum FrameMemoryKind {
     Cpu,
+    #[cfg(target_os = "macos")]
+    MacosCvPixelBuffer,
     #[cfg(windows)]
     D3D11SharedBgra,
     #[cfg(windows)]
     D3D11SharedNv12,
     #[cfg(windows)]
     D3D11SharedP010,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+pub struct MacosCvPixelBufferFrame {
+    pixel_buffer: NonNull<c_void>,
+    pub pixel_format: FramePixelFormat,
+}
+
+#[cfg(target_os = "macos")]
+unsafe impl Send for MacosCvPixelBufferFrame {}
+
+#[cfg(target_os = "macos")]
+unsafe impl Sync for MacosCvPixelBufferFrame {}
+
+#[cfg(target_os = "macos")]
+impl MacosCvPixelBufferFrame {
+    pub fn retain(
+        pixel_buffer: *mut c_void,
+        pixel_format: FramePixelFormat,
+    ) -> Option<MacosCvPixelBufferFrame> {
+        let pixel_buffer = NonNull::new(pixel_buffer)?;
+        unsafe {
+            CFRetain(pixel_buffer.as_ptr().cast_const());
+        }
+        Some(Self {
+            pixel_buffer,
+            pixel_format,
+        })
+    }
+
+    pub fn as_ptr(&self) -> *mut c_void {
+        self.pixel_buffer.as_ptr()
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Clone for MacosCvPixelBufferFrame {
+    fn clone(&self) -> Self {
+        unsafe {
+            CFRetain(self.pixel_buffer.as_ptr().cast_const());
+        }
+        Self {
+            pixel_buffer: self.pixel_buffer,
+            pixel_format: self.pixel_format,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl PartialEq for MacosCvPixelBufferFrame {
+    fn eq(&self, other: &Self) -> bool {
+        self.pixel_buffer == other.pixel_buffer && self.pixel_format == other.pixel_format
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Eq for MacosCvPixelBufferFrame {}
+
+#[cfg(target_os = "macos")]
+impl Drop for MacosCvPixelBufferFrame {
+    fn drop(&mut self) {
+        unsafe {
+            CFRelease(self.pixel_buffer.as_ptr().cast_const());
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -60,6 +138,9 @@ pub struct CapturedFrame {
     pub pixel_format: FramePixelFormat,
     pub timestamp_us: u64,
     pub data: Vec<u8>,
+    #[cfg(target_os = "macos")]
+    #[serde(skip)]
+    pub macos_cv_pixel_buffer: Option<MacosCvPixelBufferFrame>,
     #[cfg(windows)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub d3d11_shared_bgra: Option<D3D11SharedBgraFrame>,
@@ -79,9 +160,32 @@ impl CapturedFrame {
             pixel_format,
             timestamp_us,
             data,
+            #[cfg(target_os = "macos")]
+            macos_cv_pixel_buffer: None,
             #[cfg(windows)]
             d3d11_shared_bgra: None,
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn from_macos_cv_pixel_buffer(
+        width: usize,
+        height: usize,
+        pixel_format: FramePixelFormat,
+        timestamp_us: u64,
+        pixel_buffer: *mut c_void,
+    ) -> Option<Self> {
+        Some(Self {
+            width,
+            height,
+            pixel_format,
+            timestamp_us,
+            data: Vec::new(),
+            macos_cv_pixel_buffer: Some(MacosCvPixelBufferFrame::retain(
+                pixel_buffer,
+                pixel_format,
+            )?),
+        })
     }
 
     #[cfg(windows)]
@@ -98,6 +202,8 @@ impl CapturedFrame {
             pixel_format: FramePixelFormat::Bgra32,
             timestamp_us,
             data: Vec::new(),
+            #[cfg(target_os = "macos")]
+            macos_cv_pixel_buffer: None,
             d3d11_shared_bgra: Some(D3D11SharedBgraFrame {
                 shared_handle,
                 width: width as u32,
@@ -109,6 +215,11 @@ impl CapturedFrame {
 
     pub fn is_cpu_backed(&self) -> bool {
         !self.data.is_empty()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn macos_cv_pixel_buffer(&self) -> Option<&MacosCvPixelBufferFrame> {
+        self.macos_cv_pixel_buffer.as_ref()
     }
 
     #[cfg(windows)]
@@ -419,6 +530,8 @@ pub trait VideoEncoder {
     fn input_memory_kind(&self) -> FrameMemoryKind {
         FrameMemoryKind::Cpu
     }
+
+    fn request_keyframe(&mut self) {}
 
     fn encode(&mut self, frame: &CapturedFrame) -> Result<Vec<EncodedAccessUnit>, PipelineError>;
 }

@@ -46,7 +46,7 @@ fn test_capture_source() -> CaptureSource {
         process_id: 4242,
         app_name: Some("Target App".to_string()),
         bundle_identifier: None,
-        preview_data_url: Some("data:image/png;base64,AAAA".to_string()),
+        preview_data_url: Some("legacy-preview-token".to_string()),
         preview_width: Some(320),
         preview_height: Some(180),
     }
@@ -706,6 +706,7 @@ fn serialize_deserialize_render_surface_control_contracts() {
         surface_id: "surface-1".to_string(),
         backend: "d3d11".to_string(),
         window_handle: Some(0x1234),
+        render_proxy_endpoint: None,
     };
     let json = serde_json::to_string(&attach).unwrap();
     let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
@@ -737,7 +738,9 @@ fn serialize_deserialize_media_pipeline_snapshot_contract() {
                 surface_id: "surface-1".to_string(),
                 backend: "d3d11".to_string(),
                 window_handle: Some(0x1234),
+                render_proxy_endpoint: None,
             }],
+            active_encoder: Some("nvenc_hevc".to_string()),
             active_decoder: Some("nvdec".to_string()),
             active_renderer: Some("d3d11".to_string()),
             active_codec: Some("hevc".to_string()),
@@ -779,6 +782,11 @@ fn serialize_deserialize_media_pipeline_snapshot_contract() {
                 capture_memory_path: Some("d3d11_shared_bgra".to_string()),
                 dynamic_fps_tier: Some("active".to_string()),
                 target_fps: Some(144),
+                frames_completed: 12,
+                repeated_latest_frames: 2,
+                access_units_encoded: 12,
+                keyframes_encoded: 1,
+                encoded_access_unit_bytes: 65_536,
                 datagram_fragments_attempted: 4,
                 datagram_fragments_sent: 3,
                 datagram_fragments_delayed: 0,
@@ -789,6 +797,7 @@ fn serialize_deserialize_media_pipeline_snapshot_contract() {
                 datagram_frames_cut_short_for_budget: 0,
                 reliable_fragments_sent: 0,
                 reliable_frames_sent: 0,
+                ..MediaSenderTransportSnapshot::default()
             },
             adaptation: Some(MediaAdaptationSnapshot {
                 enabled: true,

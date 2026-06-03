@@ -30,7 +30,6 @@ describe("TestPage render diagnostics", () => {
           resolution: [2560, 1440],
         });
       }
-      if (command === "test_harness_get_frames") return Promise.resolve([null, null]);
       return Promise.resolve(null);
     });
 

@@ -348,6 +348,12 @@ export interface TestRunSummary {
   total_latency_p95?: number;
   dropped_frames: number;
   frame_count: number;
+  render_fps?: number;
+  render_frame_count?: number;
+  render_queue_replacements?: number;
+  render_queue_replacement_ratio?: number;
+  render_present_skips?: number;
+  render_present_skip_ratio?: number;
   adaptation_state?: string;
   adaptation_ladder_index?: number;
   adaptation_current_profile?: string;
@@ -754,6 +760,7 @@ export interface AttachedRenderSurface {
   surface_id: string;
   backend: string;
   window_handle?: number | null;
+  render_proxy_endpoint?: string | null;
 }
 
 export interface MediaStageMetrics {
@@ -843,6 +850,18 @@ export interface MediaAdaptationSnapshot {
 }
 
 export interface MediaSenderTransportSnapshot {
+  frames_completed?: number;
+  repeated_latest_frames?: number;
+  capture_frame_samples?: number;
+  capture_cpu_frames?: number;
+  capture_macos_cv_pixel_buffer_frames?: number;
+  capture_bgra32_frames?: number;
+  capture_rgba32_frames?: number;
+  capture_rgb24_frames?: number;
+  capture_nv12_frames?: number;
+  access_units_encoded?: number;
+  keyframes_encoded?: number;
+  encoded_access_unit_bytes?: number;
   datagram_fragments_attempted: number;
   datagram_fragments_sent: number;
   datagram_fragments_delayed: number;
@@ -858,6 +877,7 @@ export interface MediaSenderTransportSnapshot {
 export interface MediaPipelineSnapshot {
   session_id: string;
   attached_surfaces: AttachedRenderSurface[];
+  active_encoder?: string | null;
   active_decoder?: string | null;
   active_renderer?: string | null;
   active_codec?: string | null;
@@ -1178,8 +1198,6 @@ export interface PipelineComparisonResult {
   avg_fps?: number | null;
   total_bitstream_bytes: number;
 }
-
-export type FrameData = [string, number, number, number?]; // [base64_data, width, height, generation]
 
 /**
  * Error response shape from Tauri commands

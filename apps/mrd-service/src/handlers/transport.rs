@@ -69,6 +69,7 @@ pub async fn attach_render_surface(
     surface_id: String,
     backend: String,
     window_handle: Option<i64>,
+    render_proxy_endpoint: Option<String>,
 ) -> IpcResponse {
     tracing::info!(
         session_id = %session_id.0,
@@ -95,9 +96,10 @@ pub async fn attach_render_surface(
         surface_id: surface_id.clone(),
         backend,
         window_handle,
+        render_proxy_endpoint,
     };
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     if let Err(error) = app_state
         .media_surface_renderers
         .lock()
@@ -150,7 +152,7 @@ pub async fn detach_render_surface(
         .lock()
         .await
         .detach_surface(&session_id, &surface_id);
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     app_state
         .media_surface_renderers
         .lock()
@@ -314,6 +316,7 @@ mod tests {
             session_id.clone(),
             "surface-1".to_string(),
             "web".to_string(),
+            None,
             None,
         )
         .await;

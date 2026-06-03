@@ -8,9 +8,11 @@
 // and media control.
 
 use crate::control_input::ControlInputRegistry;
-use base64::{engine::general_purpose, Engine as _};
-use image::{codecs::png::PngEncoder, ColorType, ImageEncoder};
 use mrd_application::ports::SessionSnapshot;
+#[cfg(target_os = "macos")]
+use mrd_ipc::render_proxy::{
+    decode_ack, encode_frame_header, RenderProxyFrameHeader, RenderProxyPixelFormat,
+};
 use mrd_ipc::{
     AttachedRenderSurface, AuditEvent, AuditLogQuery, CapabilitySnapshot, CaptureSourceSelection,
     MediaAdaptationSnapshot, MediaPipelineSnapshot, MediaProfile, MediaProfileNegotiation,
@@ -19,16 +21,24 @@ use mrd_ipc::{
 };
 use mrd_proto::{DeviceId, SessionId};
 #[cfg(windows)]
-use mrd_render::{BoxedRenderer, RenderFrame, RenderTarget, RendererFactory, RendererSnapshot};
+use mrd_render::RendererFactory;
+#[cfg(any(windows, target_os = "macos"))]
+use mrd_render::{
+    BoxedRenderer, RenderError, RenderFrame, RenderFrameData, RenderTarget, RendererSnapshot,
+};
 #[cfg(windows)]
 use mrd_render_d3d11::D3d11RendererFactory;
 use std::collections::{HashMap, VecDeque};
+#[cfg(target_os = "macos")]
+use std::io::{Read, Write};
+#[cfg(target_os = "macos")]
+use std::os::unix::net::UnixStream as StdUnixStream;
 use std::sync::Arc;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 use std::sync::Mutex as StdMutex;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 use std::time::Duration;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 use tokio::time::Instant;
 use tokio::{sync::Mutex, task::AbortHandle};
 
@@ -279,6 +289,7 @@ pub struct MediaPipelineRegistry {
 #[derive(Debug, Clone, Default)]
 struct MediaPipelineState {
     attached_surfaces: HashMap<String, AttachedRenderSurface>,
+    active_encoder: Option<String>,
     active_decoder: Option<String>,
     active_renderer: Option<String>,
     active_codec: Option<String>,
@@ -315,34 +326,54 @@ struct MediaPipelineState {
     adaptation: Option<MediaAdaptationSnapshot>,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 #[derive(Debug, PartialEq, Eq)]
 pub enum MediaRenderQueueEnqueue {
-    Start(RenderFrame),
+    Start(MediaRenderFrame),
     Queued { replaced: bool, depth: usize },
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MediaRenderFrame {
+    Decoded(RenderFrame),
+    #[cfg(target_os = "macos")]
+    H264AccessUnit {
+        width: usize,
+        height: usize,
+        timestamp_us: u64,
+        payload: bytes::Bytes,
+    },
+    #[cfg(target_os = "macos")]
+    HevcAccessUnit {
+        width: usize,
+        height: usize,
+        timestamp_us: u64,
+        payload: bytes::Bytes,
+    },
+}
+
+#[cfg(any(windows, target_os = "macos"))]
 #[derive(Default)]
 struct MediaRenderQueueState {
     running: bool,
-    pending: VecDeque<RenderFrame>,
+    pending: VecDeque<MediaRenderFrame>,
     last_enqueue_at: Option<Instant>,
     last_present_at: Option<Instant>,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 #[derive(Default)]
 pub struct MediaRenderQueueRegistry {
     queues: HashMap<SessionId, MediaRenderQueueState>,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 impl MediaRenderQueueRegistry {
     pub fn enqueue_latest(
         &mut self,
         session_id: SessionId,
-        frame: RenderFrame,
+        frame: MediaRenderFrame,
     ) -> MediaRenderQueueEnqueue {
         self.enqueue_bounded(session_id, frame, 1)
     }
@@ -350,7 +381,7 @@ impl MediaRenderQueueRegistry {
     pub fn enqueue_bounded(
         &mut self,
         session_id: SessionId,
-        frame: RenderFrame,
+        frame: MediaRenderFrame,
         max_pending_frames: usize,
     ) -> MediaRenderQueueEnqueue {
         let state = self.queues.entry(session_id).or_default();
@@ -373,7 +404,7 @@ impl MediaRenderQueueRegistry {
         }
     }
 
-    pub fn take_next_or_finish(&mut self, session_id: &SessionId) -> Option<RenderFrame> {
+    pub fn take_next_or_finish(&mut self, session_id: &SessionId) -> Option<MediaRenderFrame> {
         let state = self.queues.get_mut(session_id)?;
 
         if let Some(frame) = state.pending.pop_front() {
@@ -387,7 +418,7 @@ impl MediaRenderQueueRegistry {
     pub fn take_latest_or_finish(
         &mut self,
         session_id: &SessionId,
-    ) -> (Option<RenderFrame>, usize) {
+    ) -> (Option<MediaRenderFrame>, usize) {
         let Some(state) = self.queues.get_mut(session_id) else {
             return (None, 0);
         };
@@ -447,7 +478,7 @@ impl MediaRenderQueueRegistry {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn render_frame_interval(fps: u32) -> Option<Duration> {
     if fps == 0 {
         return None;
@@ -506,6 +537,10 @@ impl MediaPipelineRegistry {
         self.pipelines.entry(session_id).or_default().active_decoder = Some(decoder.into());
     }
 
+    pub fn set_active_encoder(&mut self, session_id: SessionId, encoder: impl Into<String>) {
+        self.pipelines.entry(session_id).or_default().active_encoder = Some(encoder.into());
+    }
+
     pub fn set_active_media_profile(&mut self, session_id: SessionId, profile: &MediaProfile) {
         let state = self.pipelines.entry(session_id).or_default();
         state.active_codec = Some(profile.codec.clone());
@@ -562,6 +597,11 @@ impl MediaPipelineRegistry {
         state.dropped_frames = state.dropped_frames.saturating_add(count);
     }
 
+    pub fn record_render_queue_replacements(&mut self, session_id: SessionId, count: u64) {
+        let state = self.pipelines.entry(session_id).or_default();
+        state.render_queue_replacements = state.render_queue_replacements.saturating_add(count);
+    }
+
     pub fn increment_render_stale_frame_drops(&mut self, session_id: SessionId, count: u64) {
         let state = self.pipelines.entry(session_id).or_default();
         state.render_stale_frame_drops = state.render_stale_frame_drops.saturating_add(count);
@@ -598,7 +638,7 @@ impl MediaPipelineRegistry {
             .render_queue_policy = policy.map(Into::into);
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     pub fn record_renderer_snapshot(&mut self, session_id: SessionId, snapshot: &RendererSnapshot) {
         let state = self.pipelines.entry(session_id).or_default();
         state.swap_chain_max_frame_latency = snapshot.swap_chain_max_frame_latency;
@@ -691,6 +731,7 @@ impl MediaPipelineRegistry {
             attached_surfaces: state
                 .map(|state| state.attached_surfaces.values().cloned().collect())
                 .unwrap_or_default(),
+            active_encoder: state.and_then(|state| state.active_encoder.clone()),
             active_decoder: state.and_then(|state| state.active_decoder.clone()),
             active_renderer: state.and_then(|state| state.active_renderer.clone()),
             active_codec: state.and_then(|state| state.active_codec.clone()),
@@ -737,17 +778,17 @@ impl MediaPipelineRegistry {
 }
 
 /// Native renderer instances owned by mrd-service for receiver sessions.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub(crate) type SharedSurfaceRenderer = Arc<StdMutex<BoxedRenderer>>;
 
 /// Native renderer instances owned by mrd-service for receiver sessions.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 #[derive(Default)]
 pub struct MediaSurfaceRendererRegistry {
     renderers: HashMap<(SessionId, String), SharedSurfaceRenderer>,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 impl MediaSurfaceRendererRegistry {
     pub fn attach_surface(
         &mut self,
@@ -761,12 +802,12 @@ impl MediaSurfaceRendererRegistry {
             window_handle = ?surface.window_handle,
             "render-surface renderer attach requested"
         );
-        if surface.backend != "d3d11" {
+        if !surface_backend_matches_platform(&surface.backend) {
             tracing::info!(
                 session_id = %session_id.0,
                 surface_id = %surface.surface_id,
                 backend = %surface.backend,
-                "render-surface renderer attach skipped: non-d3d11 backend"
+                "render-surface renderer attach skipped: backend does not match this platform"
             );
             return Ok(());
         }
@@ -780,15 +821,18 @@ impl MediaSurfaceRendererRegistry {
             );
             return Ok(());
         }
-        let window_handle = surface
-            .window_handle
-            .ok_or_else(|| format!("render surface {} is missing HWND", surface.surface_id))?;
-        let mut renderer = D3d11RendererFactory
-            .create()
-            .map_err(|error| format!("create D3D11 renderer failed: {error}"))?;
+        let window_handle = surface.window_handle.ok_or_else(|| {
+            format!(
+                "render surface {} is missing native handle",
+                surface.surface_id
+            )
+        })?;
+        let mut renderer = create_platform_surface_renderer(surface)?;
         renderer
             .attach_target(RenderTarget::WindowHandle(window_handle as isize))
-            .map_err(|error| format!("attach D3D11 renderer target failed: {error}"))?;
+            .map_err(|error| {
+                format!("attach {} renderer target failed: {error}", surface.backend)
+            })?;
         self.renderers
             .insert(key, Arc::new(StdMutex::new(renderer)));
         tracing::info!(
@@ -844,9 +888,11 @@ impl MediaSurfaceRendererRegistry {
         for renderer in self.renderers_for_session(session_id) {
             renderer
                 .lock()
-                .map_err(|_| "D3D11 renderer lock was poisoned".to_string())?
+                .map_err(|_| "native surface renderer lock was poisoned".to_string())?
                 .upload_frame(frame.clone())
-                .map_err(|error| format!("upload frame to D3D11 renderer failed: {error}"))?;
+                .map_err(|error| {
+                    format!("upload frame to native surface renderer failed: {error}")
+                })?;
             rendered += 1;
         }
         Ok(rendered)
@@ -870,6 +916,391 @@ impl MediaSurfaceRendererRegistry {
             (session_id.clone(), surface_id.into()),
             Arc::new(StdMutex::new(renderer)),
         );
+    }
+}
+
+#[cfg(windows)]
+fn surface_backend_matches_platform(backend: &str) -> bool {
+    backend == "d3d11"
+}
+
+#[cfg(windows)]
+fn create_platform_surface_renderer(
+    surface: &AttachedRenderSurface,
+) -> Result<BoxedRenderer, String> {
+    if surface.backend != "d3d11" {
+        return Err(format!(
+            "unsupported Windows native render backend: {}",
+            surface.backend
+        ));
+    }
+    D3d11RendererFactory
+        .create()
+        .map_err(|error| format!("create D3D11 renderer failed: {error}"))
+}
+
+#[cfg(target_os = "macos")]
+fn surface_backend_matches_platform(backend: &str) -> bool {
+    matches!(backend, "macos" | "metal")
+}
+
+#[cfg(target_os = "macos")]
+fn create_platform_surface_renderer(
+    surface: &AttachedRenderSurface,
+) -> Result<BoxedRenderer, String> {
+    if !surface_backend_matches_platform(&surface.backend) {
+        return Err(format!(
+            "unsupported macOS native render backend: {}",
+            surface.backend
+        ));
+    }
+    let endpoint = surface.render_proxy_endpoint.clone().ok_or_else(|| {
+        format!(
+            "macOS render surface {} is missing render proxy endpoint",
+            surface.surface_id
+        )
+    })?;
+    Ok(Box::new(MacosRenderProxyRenderer::new(endpoint)))
+}
+
+#[cfg(target_os = "macos")]
+struct MacosRenderProxyRenderer {
+    endpoint: String,
+    stream: Option<StdUnixStream>,
+    snapshot: RendererSnapshot,
+    sequence: u64,
+}
+
+#[cfg(target_os = "macos")]
+impl MacosRenderProxyRenderer {
+    fn new(endpoint: String) -> Self {
+        Self {
+            endpoint,
+            stream: None,
+            snapshot: RendererSnapshot {
+                attached_to_target: false,
+                uploaded_frame_count: 0,
+                presented_frame_count: 0,
+                present_skipped_count: 0,
+                render_queue_replacements: Some(0),
+                last_present_status: None,
+                low_latency_frame_latency_target: None,
+                swap_chain_max_frame_latency: None,
+                swap_chain_allow_tearing: None,
+                swap_chain_waitable_object: None,
+                swap_chain_present_mode: Some("render_proxy".to_string()),
+                display_refresh_hz: None,
+                render_thread_priority: None,
+                waitable_wait_count: None,
+                waitable_wait_total_ms: None,
+                waitable_timeout_count: None,
+                last_waitable_wait_ms: None,
+                last_render_prepare_wait_ms: None,
+                last_render_shared_resource_ms: None,
+                last_render_wait_for_drawable_ms: None,
+                last_render_encode_commit_ms: None,
+                last_render_draw_present_ms: None,
+                last_width: 0,
+                last_height: 0,
+                last_pixel_format: None,
+            },
+            sequence: 0,
+        }
+    }
+
+    fn ensure_stream(&mut self) -> Result<&mut StdUnixStream, RenderError> {
+        if self.stream.is_none() {
+            let stream = StdUnixStream::connect(&self.endpoint).map_err(|error| {
+                RenderError::Message(format!("connect macOS render proxy failed: {error}"))
+            })?;
+            let timeout = Some(Duration::from_millis(250));
+            let _ = stream.set_read_timeout(timeout);
+            let _ = stream.set_write_timeout(timeout);
+            self.stream = Some(stream);
+        }
+        self.stream
+            .as_mut()
+            .ok_or_else(|| RenderError::Message("macOS render proxy stream missing".to_string()))
+    }
+
+    fn send_payload(
+        &mut self,
+        header: &RenderProxyFrameHeader,
+        payload: &[u8],
+    ) -> Result<mrd_ipc::render_proxy::RenderProxyAck, RenderError> {
+        let header_bytes = encode_frame_header(header);
+        let mut ack_bytes = [0_u8; mrd_ipc::render_proxy::ACK_LEN];
+        let stream = self.ensure_stream()?;
+        stream.write_all(&header_bytes).map_err(|error| {
+            RenderError::Message(format!("write macOS render proxy header failed: {error}"))
+        })?;
+        stream.write_all(payload).map_err(|error| {
+            RenderError::Message(format!("write macOS render proxy payload failed: {error}"))
+        })?;
+        stream.read_exact(&mut ack_bytes).map_err(|error| {
+            RenderError::Message(format!("read macOS render proxy ack failed: {error}"))
+        })?;
+        decode_ack(&ack_bytes).map_err(RenderError::Message)
+    }
+
+    fn send_payload_with_reconnect(
+        &mut self,
+        header: &RenderProxyFrameHeader,
+        payload: &[u8],
+    ) -> Result<mrd_ipc::render_proxy::RenderProxyAck, RenderError> {
+        match self.send_payload(header, payload) {
+            Ok(ack) => Ok(ack),
+            Err(first_error) => {
+                self.stream = None;
+                self.send_payload(header, payload).map_err(|second_error| {
+                    RenderError::Message(format!(
+                        "{first_error}; retry after reconnect failed: {second_error}"
+                    ))
+                })
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl mrd_render::RendererInstance for MacosRenderProxyRenderer {
+    fn attach_target(&mut self, target: RenderTarget) -> Result<(), RenderError> {
+        let RenderTarget::WindowHandle(window_handle) = target;
+        if window_handle == 0 {
+            return Err(RenderError::Message(
+                "macOS render proxy requires a non-null surface handle".to_string(),
+            ));
+        }
+        self.snapshot.attached_to_target = true;
+        Ok(())
+    }
+
+    fn upload_frame(&mut self, frame: RenderFrame) -> Result<(), RenderError> {
+        let width = u32::try_from(frame.width)
+            .map_err(|_| RenderError::Message("render proxy frame width overflow".to_string()))?;
+        let height = u32::try_from(frame.height)
+            .map_err(|_| RenderError::Message("render proxy frame height overflow".to_string()))?;
+        let (pixel_format, payload, row_pitch) = match frame.data {
+            RenderFrameData::Rgb24(data) => (RenderProxyPixelFormat::Rgb24, data, 0_usize),
+            RenderFrameData::Bgra32(data) => (RenderProxyPixelFormat::Bgra32, data, 0_usize),
+            RenderFrameData::Nv12 { data, pitch } => (RenderProxyPixelFormat::Nv12, data, pitch),
+            #[cfg(windows)]
+            RenderFrameData::D3D11SharedBgra { .. }
+            | RenderFrameData::D3D11SharedNv12 { .. }
+            | RenderFrameData::D3D11SharedP010 { .. } => {
+                return Err(RenderError::Message(
+                    "macOS render proxy does not accept D3D11 shared textures".to_string(),
+                ))
+            }
+        };
+        let payload_len = u32::try_from(payload.len()).map_err(|_| {
+            RenderError::Message("render proxy frame payload length overflow".to_string())
+        })?;
+        let header = RenderProxyFrameHeader {
+            pixel_format,
+            width,
+            height,
+            sequence: self.sequence,
+            timestamp_us: 0,
+            payload_len,
+            row_pitch: u32::try_from(row_pitch)
+                .map_err(|_| RenderError::Message("render proxy row pitch overflow".to_string()))?,
+        };
+        self.sequence = self.sequence.saturating_add(1);
+        let ack = self.send_payload_with_reconnect(&header, &payload)?;
+        self.snapshot.uploaded_frame_count = self.snapshot.uploaded_frame_count.saturating_add(1);
+        self.snapshot.presented_frame_count = self
+            .snapshot
+            .presented_frame_count
+            .saturating_add(ack.presented_frames);
+        self.snapshot.present_skipped_count = self
+            .snapshot
+            .present_skipped_count
+            .saturating_add(ack.present_skips);
+        self.snapshot.render_queue_replacements = Some(
+            self.snapshot
+                .render_queue_replacements
+                .unwrap_or_default()
+                .saturating_add(ack.queue_replacements),
+        );
+        self.snapshot.last_present_status = if ack.presented_frames > 0 {
+            Some("presented".to_string())
+        } else if ack.present_skips > 0 {
+            Some("skipped".to_string())
+        } else {
+            Some("not_presented".to_string())
+        };
+        record_render_proxy_present_config(&mut self.snapshot, &ack);
+        self.snapshot.last_render_prepare_wait_ms =
+            finite_positive_duration_ms(ack.decode_duration_ms);
+        self.snapshot.last_render_shared_resource_ms =
+            finite_positive_duration_ms(ack.draw_present_duration_ms);
+        self.snapshot.last_render_wait_for_drawable_ms =
+            finite_positive_duration_ms(ack.next_drawable_duration_ms);
+        self.snapshot.last_render_encode_commit_ms =
+            finite_positive_duration_ms(ack.encode_commit_duration_ms);
+        self.snapshot.last_render_draw_present_ms = Some(ack.upload_duration_ms);
+        self.snapshot.last_width = frame.width;
+        self.snapshot.last_height = frame.height;
+        self.snapshot.last_pixel_format = Some(frame.pixel_format);
+        Ok(())
+    }
+
+    fn upload_h264_access_unit(
+        &mut self,
+        width: usize,
+        height: usize,
+        timestamp_us: u64,
+        payload: bytes::Bytes,
+    ) -> Result<(), RenderError> {
+        let width = u32::try_from(width)
+            .map_err(|_| RenderError::Message("render proxy H.264 width overflow".to_string()))?;
+        let height = u32::try_from(height)
+            .map_err(|_| RenderError::Message("render proxy H.264 height overflow".to_string()))?;
+        let payload_len = u32::try_from(payload.len()).map_err(|_| {
+            RenderError::Message("render proxy H.264 payload length overflow".to_string())
+        })?;
+        let header = RenderProxyFrameHeader {
+            pixel_format: RenderProxyPixelFormat::H264,
+            width,
+            height,
+            sequence: self.sequence,
+            timestamp_us,
+            payload_len,
+            row_pitch: 0,
+        };
+        self.sequence = self.sequence.saturating_add(1);
+        let ack = self.send_payload_with_reconnect(&header, &payload)?;
+        self.snapshot.uploaded_frame_count = self.snapshot.uploaded_frame_count.saturating_add(1);
+        self.snapshot.presented_frame_count = self
+            .snapshot
+            .presented_frame_count
+            .saturating_add(ack.presented_frames);
+        self.snapshot.present_skipped_count = self
+            .snapshot
+            .present_skipped_count
+            .saturating_add(ack.present_skips);
+        self.snapshot.render_queue_replacements = Some(
+            self.snapshot
+                .render_queue_replacements
+                .unwrap_or_default()
+                .saturating_add(ack.queue_replacements),
+        );
+        self.snapshot.last_present_status = if ack.presented_frames > 0 {
+            Some("presented".to_string())
+        } else if ack.present_skips > 0 {
+            Some("skipped".to_string())
+        } else {
+            Some("not_presented".to_string())
+        };
+        record_render_proxy_present_config(&mut self.snapshot, &ack);
+        self.snapshot.last_render_prepare_wait_ms =
+            finite_positive_duration_ms(ack.decode_duration_ms);
+        self.snapshot.last_render_shared_resource_ms =
+            finite_positive_duration_ms(ack.draw_present_duration_ms);
+        self.snapshot.last_render_wait_for_drawable_ms =
+            finite_positive_duration_ms(ack.next_drawable_duration_ms);
+        self.snapshot.last_render_encode_commit_ms =
+            finite_positive_duration_ms(ack.encode_commit_duration_ms);
+        self.snapshot.last_render_draw_present_ms = Some(ack.upload_duration_ms);
+        self.snapshot.last_width = width as usize;
+        self.snapshot.last_height = height as usize;
+        Ok(())
+    }
+
+    fn upload_hevc_access_unit(
+        &mut self,
+        width: usize,
+        height: usize,
+        timestamp_us: u64,
+        payload: bytes::Bytes,
+    ) -> Result<(), RenderError> {
+        let width = u32::try_from(width)
+            .map_err(|_| RenderError::Message("render proxy HEVC width overflow".to_string()))?;
+        let height = u32::try_from(height)
+            .map_err(|_| RenderError::Message("render proxy HEVC height overflow".to_string()))?;
+        let payload_len = u32::try_from(payload.len()).map_err(|_| {
+            RenderError::Message("render proxy HEVC payload length overflow".to_string())
+        })?;
+        let header = RenderProxyFrameHeader {
+            pixel_format: RenderProxyPixelFormat::Hevc,
+            width,
+            height,
+            sequence: self.sequence,
+            timestamp_us,
+            payload_len,
+            row_pitch: 0,
+        };
+        self.sequence = self.sequence.saturating_add(1);
+        let ack = self.send_payload_with_reconnect(&header, &payload)?;
+        self.snapshot.uploaded_frame_count = self.snapshot.uploaded_frame_count.saturating_add(1);
+        self.snapshot.presented_frame_count = self
+            .snapshot
+            .presented_frame_count
+            .saturating_add(ack.presented_frames);
+        self.snapshot.present_skipped_count = self
+            .snapshot
+            .present_skipped_count
+            .saturating_add(ack.present_skips);
+        self.snapshot.render_queue_replacements = Some(
+            self.snapshot
+                .render_queue_replacements
+                .unwrap_or_default()
+                .saturating_add(ack.queue_replacements),
+        );
+        self.snapshot.last_present_status = if ack.presented_frames > 0 {
+            Some("presented".to_string())
+        } else if ack.present_skips > 0 {
+            Some("skipped".to_string())
+        } else {
+            Some("not_presented".to_string())
+        };
+        record_render_proxy_present_config(&mut self.snapshot, &ack);
+        self.snapshot.last_render_prepare_wait_ms =
+            finite_positive_duration_ms(ack.decode_duration_ms);
+        self.snapshot.last_render_shared_resource_ms =
+            finite_positive_duration_ms(ack.draw_present_duration_ms);
+        self.snapshot.last_render_wait_for_drawable_ms =
+            finite_positive_duration_ms(ack.next_drawable_duration_ms);
+        self.snapshot.last_render_encode_commit_ms =
+            finite_positive_duration_ms(ack.encode_commit_duration_ms);
+        self.snapshot.last_render_draw_present_ms = Some(ack.upload_duration_ms);
+        self.snapshot.last_width = width as usize;
+        self.snapshot.last_height = height as usize;
+        Ok(())
+    }
+
+    fn snapshot(&self) -> RendererSnapshot {
+        self.snapshot.clone()
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn finite_positive_duration_ms(value: f64) -> Option<f64> {
+    (value.is_finite() && value > 0.0).then_some(value)
+}
+
+#[cfg(target_os = "macos")]
+fn record_render_proxy_present_config(
+    snapshot: &mut RendererSnapshot,
+    ack: &mrd_ipc::render_proxy::RenderProxyAck,
+) {
+    if let Some(max_drawable_count) = ack.max_drawable_count {
+        snapshot.swap_chain_max_frame_latency = Some(max_drawable_count);
+    }
+    if let Some(display_sync_enabled) = ack.display_sync_enabled {
+        snapshot.swap_chain_allow_tearing = Some(!display_sync_enabled);
+        snapshot.swap_chain_present_mode =
+            Some(render_proxy_present_mode(display_sync_enabled).to_string());
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn render_proxy_present_mode(display_sync_enabled: bool) -> &'static str {
+    if display_sync_enabled {
+        "render_proxy_metal_display_sync"
+    } else {
+        "render_proxy_metal_immediate"
     }
 }
 
@@ -957,7 +1388,6 @@ struct DecodedPreviewFrame {
     width: u32,
     height: u32,
     pixel_format: String,
-    data_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1066,17 +1496,11 @@ impl ProbeRegistry {
         stats.last_media_sequence = Some(frame.sequence);
         stats.last_media_timestamp_us = Some(frame.timestamp_us);
         stats.last_media_payload_hash = Some(frame.payload_hash);
-        if let Some(rgb24) = frame.rgb24 {
-            let preview_width = frame.preview_width.unwrap_or(frame.width);
-            let preview_height = frame.preview_height.unwrap_or(frame.height);
-            let data_url = encode_rgb24_png_data_url(preview_width, preview_height, &rgb24);
-            stats.latest_frame = Some(DecodedPreviewFrame {
-                width: preview_width,
-                height: preview_height,
-                pixel_format: frame.pixel_format,
-                data_url,
-            });
-        }
+        stats.latest_frame = Some(DecodedPreviewFrame {
+            width: frame.preview_width.unwrap_or(frame.width),
+            height: frame.preview_height.unwrap_or(frame.height),
+            pixel_format: frame.pixel_format,
+        });
         stats.last_error = None;
     }
 
@@ -1177,10 +1601,7 @@ impl ProbeRegistry {
             last_media_sequence: stats.last_media_sequence,
             last_media_timestamp_us: stats.last_media_timestamp_us,
             last_media_payload_hash: stats.last_media_payload_hash.clone(),
-            latest_frame_data_url: stats
-                .latest_frame
-                .as_ref()
-                .and_then(|frame| frame.data_url.clone()),
+            latest_frame_data_url: None,
             latest_frame_width: stats.latest_frame.as_ref().map(|frame| frame.width),
             latest_frame_height: stats.latest_frame.as_ref().map(|frame| frame.height),
             latest_frame_pixel_format: stats
@@ -1190,24 +1611,6 @@ impl ProbeRegistry {
             last_error: stats.last_error.clone(),
         }
     }
-}
-
-fn encode_rgb24_png_data_url(width: u32, height: u32, rgb24: &[u8]) -> Option<String> {
-    let expected_len = (width as usize)
-        .checked_mul(height as usize)?
-        .checked_mul(3)?;
-    if width == 0 || height == 0 || rgb24.len() != expected_len {
-        return None;
-    }
-
-    let mut png = Vec::new();
-    PngEncoder::new(&mut png)
-        .write_image(rgb24, width, height, ColorType::Rgb8.into())
-        .ok()?;
-    Some(format!(
-        "data:image/png;base64,{}",
-        general_purpose::STANDARD.encode(png)
-    ))
 }
 
 /// Shell state - tracks UI presence and service lifecycle
@@ -1493,10 +1896,10 @@ pub struct AppState {
     /// Receiver pipeline state keyed by session.
     pub media_pipelines: Arc<Mutex<MediaPipelineRegistry>>,
     /// Native renderer instances keyed by receiver session/surface.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     pub media_surface_renderers: Arc<Mutex<MediaSurfaceRendererRegistry>>,
     /// Drop-oldest receiver render queues keyed by session.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     pub media_render_queues: Arc<Mutex<MediaRenderQueueRegistry>>,
     /// Abort handles for active media tasks keyed by session.
     pub media_tasks: Arc<Mutex<MediaTaskRegistry>>,
@@ -1540,9 +1943,9 @@ impl AppState {
             capability_snapshot: Arc::new(Mutex::new(CapabilitySnapshotRegistry::default())),
             control_input: Arc::new(Mutex::new(ControlInputRegistry::default())),
             media_pipelines: Arc::new(Mutex::new(MediaPipelineRegistry::default())),
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             media_surface_renderers: Arc::new(Mutex::new(MediaSurfaceRendererRegistry::default())),
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             media_render_queues: Arc::new(Mutex::new(MediaRenderQueueRegistry::default())),
             media_tasks: Arc::new(Mutex::new(MediaTaskRegistry::default())),
         }
@@ -1676,12 +2079,12 @@ impl AppState {
     }
 
     /// Get a clone of the native receiver renderer registry.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     pub fn media_surface_renderers(&self) -> Arc<Mutex<MediaSurfaceRendererRegistry>> {
         self.media_surface_renderers.clone()
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     pub fn media_render_queues(&self) -> Arc<Mutex<MediaRenderQueueRegistry>> {
         self.media_render_queues.clone()
     }
@@ -1845,7 +2248,7 @@ mod tests {
     }
 
     #[test]
-    fn probe_registry_exposes_latest_decoded_video_preview() {
+    fn probe_registry_exposes_latest_decoded_video_metadata_without_image() {
         let mut registry = ProbeRegistry::default();
         let session_id = SessionId("decoded-video-session".to_string());
 
@@ -1881,10 +2284,7 @@ mod tests {
         assert_eq!(snapshot.latest_frame_width, Some(2));
         assert_eq!(snapshot.latest_frame_height, Some(2));
         assert_eq!(snapshot.latest_frame_pixel_format.as_deref(), Some("rgb24"));
-        assert!(snapshot
-            .latest_frame_data_url
-            .as_deref()
-            .is_some_and(|value| value.starts_with("data:image/png;base64,")));
+        assert!(snapshot.latest_frame_data_url.is_none());
     }
 
     #[test]
@@ -2050,6 +2450,21 @@ mod tests {
     }
 
     #[test]
+    fn media_pipeline_registry_can_record_queue_replacement_without_double_counting_drop() {
+        let mut registry = MediaPipelineRegistry::default();
+        let session_id = SessionId("render-replacement-only-session".to_string());
+
+        registry.record_render_queue_replacements(session_id.clone(), 3);
+        registry.increment_render_stale_frame_drops(session_id.clone(), 3);
+
+        let snapshot = registry.snapshot(&session_id);
+
+        assert_eq!(snapshot.dropped_frames, 3);
+        assert_eq!(snapshot.render_queue_replacements, 3);
+        assert_eq!(snapshot.render_stale_frame_drops, 3);
+    }
+
+    #[test]
     fn media_pipeline_registry_exposes_render_queue_policy() {
         let mut registry = MediaPipelineRegistry::default();
         let session_id = SessionId("render-policy-session".to_string());
@@ -2076,6 +2491,7 @@ mod tests {
                 uploaded_frame_count: 4,
                 presented_frame_count: 4,
                 present_skipped_count: 0,
+                render_queue_replacements: None,
                 last_present_status: Some("presented".to_string()),
                 low_latency_frame_latency_target: Some(1),
                 swap_chain_max_frame_latency: Some(1),
@@ -2090,6 +2506,8 @@ mod tests {
                 last_waitable_wait_ms: Some(0.75),
                 last_render_prepare_wait_ms: Some(0.05),
                 last_render_shared_resource_ms: Some(0.02),
+                last_render_wait_for_drawable_ms: None,
+                last_render_encode_commit_ms: None,
                 last_render_draw_present_ms: Some(0.7),
                 last_width: 2560,
                 last_height: 1440,
@@ -2112,7 +2530,7 @@ mod tests {
         assert_eq!(snapshot.render_waitable_timeouts, 1);
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn media_surface_renderer_registry_returns_shared_session_renderers() {
         use mrd_render::{RenderError, RenderTarget, RendererInstance, RendererSnapshot};
@@ -2138,6 +2556,7 @@ mod tests {
                     uploaded_frame_count: self.uploads.load(Ordering::SeqCst) as u64,
                     presented_frame_count: self.uploads.load(Ordering::SeqCst) as u64,
                     present_skipped_count: 0,
+                    render_queue_replacements: None,
                     last_present_status: Some("presented".to_string()),
                     low_latency_frame_latency_target: None,
                     swap_chain_max_frame_latency: None,
@@ -2152,6 +2571,8 @@ mod tests {
                     last_waitable_wait_ms: None,
                     last_render_prepare_wait_ms: None,
                     last_render_shared_resource_ms: None,
+                    last_render_wait_for_drawable_ms: None,
+                    last_render_encode_commit_ms: None,
                     last_render_draw_present_ms: None,
                     last_width: 1,
                     last_height: 1,
@@ -2196,7 +2617,7 @@ mod tests {
         assert_eq!(uploads_b.load(Ordering::SeqCst), 0);
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn media_surface_renderer_registry_reuses_existing_surface_on_duplicate_attach() {
         use mrd_ipc::AttachedRenderSurface;
@@ -2219,6 +2640,7 @@ mod tests {
                     uploaded_frame_count: 0,
                     presented_frame_count: 0,
                     present_skipped_count: 0,
+                    render_queue_replacements: None,
                     last_present_status: None,
                     low_latency_frame_latency_target: None,
                     swap_chain_max_frame_latency: None,
@@ -2233,6 +2655,8 @@ mod tests {
                     last_waitable_wait_ms: None,
                     last_render_prepare_wait_ms: None,
                     last_render_shared_resource_ms: None,
+                    last_render_wait_for_drawable_ms: None,
+                    last_render_encode_commit_ms: None,
                     last_render_draw_present_ms: None,
                     last_width: 1,
                     last_height: 1,
@@ -2249,13 +2673,26 @@ mod tests {
             &session_id,
             &AttachedRenderSurface {
                 surface_id: "surface-1".to_string(),
-                backend: "d3d11".to_string(),
+                backend: platform_surface_backend_for_test().to_string(),
                 window_handle: Some(0),
+                render_proxy_endpoint: None,
             },
         );
 
         assert!(result.is_ok());
         assert_eq!(registry.session_surface_count(&session_id), 1);
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    fn platform_surface_backend_for_test() -> &'static str {
+        #[cfg(windows)]
+        {
+            "d3d11"
+        }
+        #[cfg(target_os = "macos")]
+        {
+            "macos"
+        }
     }
 
     #[test]
@@ -2304,14 +2741,14 @@ mod tests {
         );
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn media_render_queue_keeps_latest_frame_while_worker_is_running() {
         let mut registry = MediaRenderQueueRegistry::default();
         let session_id = SessionId("render-queue-session".to_string());
-        let first = RenderFrame::from_rgb24(1, 1, vec![1, 2, 3]);
-        let second = RenderFrame::from_rgb24(1, 1, vec![4, 5, 6]);
-        let third = RenderFrame::from_rgb24(1, 1, vec![7, 8, 9]);
+        let first = MediaRenderFrame::Decoded(RenderFrame::from_rgb24(1, 1, vec![1, 2, 3]));
+        let second = MediaRenderFrame::Decoded(RenderFrame::from_rgb24(1, 1, vec![4, 5, 6]));
+        let third = MediaRenderFrame::Decoded(RenderFrame::from_rgb24(1, 1, vec![7, 8, 9]));
 
         match registry.enqueue_latest(session_id.clone(), first.clone()) {
             MediaRenderQueueEnqueue::Start(frame) => assert_eq!(frame, first),
@@ -2340,16 +2777,16 @@ mod tests {
         }
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn media_render_queue_can_hold_a_small_paced_backlog() {
         let mut registry = MediaRenderQueueRegistry::default();
         let session_id = SessionId("render-queue-paced-session".to_string());
-        let first = RenderFrame::from_rgb24(1, 1, vec![1, 2, 3]);
-        let second = RenderFrame::from_rgb24(1, 1, vec![4, 5, 6]);
-        let third = RenderFrame::from_rgb24(1, 1, vec![7, 8, 9]);
-        let fourth = RenderFrame::from_rgb24(1, 1, vec![10, 11, 12]);
-        let fifth = RenderFrame::from_rgb24(1, 1, vec![13, 14, 15]);
+        let first = MediaRenderFrame::Decoded(RenderFrame::from_rgb24(1, 1, vec![1, 2, 3]));
+        let second = MediaRenderFrame::Decoded(RenderFrame::from_rgb24(1, 1, vec![4, 5, 6]));
+        let third = MediaRenderFrame::Decoded(RenderFrame::from_rgb24(1, 1, vec![7, 8, 9]));
+        let fourth = MediaRenderFrame::Decoded(RenderFrame::from_rgb24(1, 1, vec![10, 11, 12]));
+        let fifth = MediaRenderFrame::Decoded(RenderFrame::from_rgb24(1, 1, vec![13, 14, 15]));
 
         match registry.enqueue_bounded(session_id.clone(), first.clone(), 3) {
             MediaRenderQueueEnqueue::Start(frame) => assert_eq!(frame, first),
@@ -2397,15 +2834,15 @@ mod tests {
         assert_eq!(registry.take_next_or_finish(&session_id), None);
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn media_render_queue_can_take_latest_and_drop_stale_backlog() {
         let mut registry = MediaRenderQueueRegistry::default();
         let session_id = SessionId("render-queue-latest-session".to_string());
-        let first = RenderFrame::from_rgb24(1, 1, vec![1, 2, 3]);
-        let second = RenderFrame::from_rgb24(1, 1, vec![4, 5, 6]);
-        let third = RenderFrame::from_rgb24(1, 1, vec![7, 8, 9]);
-        let fourth = RenderFrame::from_rgb24(1, 1, vec![10, 11, 12]);
+        let first = MediaRenderFrame::Decoded(RenderFrame::from_rgb24(1, 1, vec![1, 2, 3]));
+        let second = MediaRenderFrame::Decoded(RenderFrame::from_rgb24(1, 1, vec![4, 5, 6]));
+        let third = MediaRenderFrame::Decoded(RenderFrame::from_rgb24(1, 1, vec![7, 8, 9]));
+        let fourth = MediaRenderFrame::Decoded(RenderFrame::from_rgb24(1, 1, vec![10, 11, 12]));
 
         match registry.enqueue_bounded(session_id.clone(), first.clone(), 3) {
             MediaRenderQueueEnqueue::Start(frame) => assert_eq!(frame, first),
@@ -2427,7 +2864,7 @@ mod tests {
         }
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn media_render_queue_paces_early_frames_to_target_fps() {
         use std::time::Duration;
@@ -2458,7 +2895,7 @@ mod tests {
         );
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn media_render_queue_records_enqueue_and_present_gaps() {
         use std::time::Duration;
@@ -2529,7 +2966,7 @@ mod tests {
             process_id: 4242,
             app_name: Some("Target App".to_string()),
             bundle_identifier: None,
-            preview_data_url: Some("data:image/png;base64,AAAA".to_string()),
+            preview_data_url: Some("legacy-preview-token".to_string()),
             preview_width: Some(320),
             preview_height: Some(180),
         };

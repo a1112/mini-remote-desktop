@@ -3607,50 +3607,6 @@ impl TestHarness {
         };
         metrics.to_pipeline_comparison_result(pipeline, codec, memory_path, transport)
     }
-
-    pub fn get_latest_frames_since(
-        &self,
-        include_captured: bool,
-        include_rendered: bool,
-        last_captured_generation: Option<u64>,
-        last_rendered_generation: Option<u64>,
-    ) -> (
-        Option<(Vec<u8>, usize, usize, u64)>,
-        Option<(Vec<u8>, usize, usize, u64)>,
-    ) {
-        let buf = self.frame_buffer.lock().unwrap();
-        let captured = include_captured
-            .then(|| {
-                buf.captured
-                    .as_ref()
-                    .filter(|_| last_captured_generation != Some(buf.captured_generation))
-                    .map(|data| {
-                        (
-                            data.clone(),
-                            buf.captured_width,
-                            buf.captured_height,
-                            buf.captured_generation,
-                        )
-                    })
-            })
-            .flatten();
-        let rendered = include_rendered
-            .then(|| {
-                buf.rendered
-                    .as_ref()
-                    .filter(|_| last_rendered_generation != Some(buf.rendered_generation))
-                    .map(|data| {
-                        (
-                            data.clone(),
-                            buf.rendered_width,
-                            buf.rendered_height,
-                            buf.rendered_generation,
-                        )
-                    })
-            })
-            .flatten();
-        (captured, rendered)
-    }
 }
 
 impl Drop for TestHarness {
@@ -4053,6 +4009,9 @@ fn render_input_to_preview_bgra(
             frame.width,
             frame.height,
         ),
+        RenderFrameData::Nv12 { .. } => {
+            anyhow::bail!("NV12 render preview conversion is not implemented")
+        }
         #[cfg(windows)]
         RenderFrameData::D3D11SharedBgra { .. } => {
             anyhow::bail!("D3D11 shared texture preview is not CPU-readable")
@@ -5258,6 +5217,7 @@ mod tests {
                 uploaded_frame_count: self.uploaded as u64,
                 presented_frame_count: self.uploaded as u64,
                 present_skipped_count: 0,
+                render_queue_replacements: None,
                 last_present_status: Some("presented".to_string()),
                 low_latency_frame_latency_target: None,
                 swap_chain_max_frame_latency: None,
@@ -5272,6 +5232,8 @@ mod tests {
                 last_waitable_wait_ms: None,
                 last_render_prepare_wait_ms: None,
                 last_render_shared_resource_ms: None,
+                last_render_wait_for_drawable_ms: None,
+                last_render_encode_commit_ms: None,
                 last_render_draw_present_ms: None,
                 last_width: 1,
                 last_height: 1,
@@ -5290,6 +5252,7 @@ mod tests {
             uploaded_frame_count,
             presented_frame_count,
             present_skipped_count,
+            render_queue_replacements: None,
             last_present_status: Some("presented".to_string()),
             low_latency_frame_latency_target: None,
             swap_chain_max_frame_latency: None,
@@ -5304,6 +5267,8 @@ mod tests {
             last_waitable_wait_ms: None,
             last_render_prepare_wait_ms: None,
             last_render_shared_resource_ms: None,
+            last_render_wait_for_drawable_ms: None,
+            last_render_encode_commit_ms: None,
             last_render_draw_present_ms: None,
             last_width: 1,
             last_height: 1,
@@ -6279,26 +6244,6 @@ mod tests {
         assert!((snapshot.render_shared_resource_latency_p95_ms - 1.5).abs() < 0.001);
         assert!((snapshot.render_draw_present_latency_p50_ms - 1.7).abs() < 0.001);
         assert!((snapshot.render_draw_present_latency_p95_ms - 2.1).abs() < 0.001);
-    }
-
-    #[test]
-    fn latest_frames_since_filters_unchanged_preview_frames() {
-        let harness = TestHarness::new().expect("create harness");
-        {
-            let mut frame_buffer = harness.frame_buffer.lock().unwrap();
-            frame_buffer.rendered = Some(vec![0, 0, 0, 255]);
-            frame_buffer.rendered_width = 1;
-            frame_buffer.rendered_height = 1;
-            frame_buffer.rendered_generation = 3;
-        }
-
-        let (_, rendered) = harness.get_latest_frames_since(false, true, None, None);
-        let (_, unchanged) = harness.get_latest_frames_since(false, true, None, Some(3));
-        let (captured, _) = harness.get_latest_frames_since(false, false, None, None);
-
-        assert_eq!(rendered.expect("rendered frame").3, 3);
-        assert!(unchanged.is_none());
-        assert!(captured.is_none());
     }
 
     #[test]

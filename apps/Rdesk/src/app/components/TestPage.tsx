@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect } from "react";
 import {
   Play,
   Square,
@@ -14,7 +14,6 @@ import * as commands from "../adapters/tauri/commands";
 import type { HarnessMetrics, TestChain, TestChainOption } from "../adapters/tauri/types";
 import { RenderBreakdownMetrics } from "./RenderBreakdownMetrics";
 
-const FRAME_UPDATE_INTERVAL_MS = 100;
 const METRICS_UPDATE_INTERVAL_MS = 200;
 
 const TEST_CHAINS: TestChainOption[] = [
@@ -57,11 +56,8 @@ export function TestPage() {
   const [isRunning, setIsRunning] = useState(false);
   const [selectedChain, setSelectedChain] = useState<TestChain>("linux_openh264");
   const [metrics, setMetrics] = useState<HarnessMetrics | null>(null);
-  const [capturedFrame, setCapturedFrame] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [showChainDropdown, setShowChainDropdown] = useState(false);
-
-  const capturedCanvasRef = useRef<HTMLCanvasElement>(null);
 
   // Update metrics periodically
   useEffect(() => {
@@ -76,42 +72,6 @@ export function TestPage() {
 
     return () => clearInterval(interval);
   }, [isRunning]);
-
-  // Get captured frame
-  useEffect(() => {
-    if (!isRunning) return;
-
-    const interval = setInterval(async () => {
-      const framesResult = await commands.testHarnessGetFrames();
-      if (framesResult.ok) {
-        const [captured] = framesResult.value;
-        if (captured) {
-          setCapturedFrame(captured[0]);
-        }
-      }
-    }, FRAME_UPDATE_INTERVAL_MS);
-
-    return () => clearInterval(interval);
-  }, [isRunning]);
-
-  // Draw frame to canvas
-  useEffect(() => {
-    if (capturedFrame && capturedCanvasRef.current) {
-      const canvas = capturedCanvasRef.current;
-      const ctx = canvas.getContext("2d");
-      if (ctx) {
-        const img = new Image();
-        img.onload = () => {
-          if (canvas.width !== img.width || canvas.height !== img.height) {
-            canvas.width = img.width;
-            canvas.height = img.height;
-          }
-          ctx.drawImage(img, 0, 0);
-        };
-        img.src = `data:image/png;base64,${capturedFrame}`;
-      }
-    }
-  }, [capturedFrame]);
 
   const handleChainChange = async (chain: TestChain) => {
     if (isRunning) {
@@ -142,7 +102,6 @@ export function TestPage() {
     if (result.ok) {
       setIsRunning(false);
       setMetrics(null);
-      setCapturedFrame(null);
     } else {
       setError(result.error.message);
     }
@@ -293,16 +252,9 @@ export function TestPage() {
             捕获画面（实时）
           </h3>
           <div className="aspect-video bg-black rounded flex items-center justify-center">
-            {capturedFrame ? (
-              <canvas
-                ref={capturedCanvasRef}
-                className="max-w-full max-h-full"
-              />
-            ) : (
-              <p className="text-muted-foreground text-sm">
-                {isRunning ? "正在捕获..." : "等待启动..."}
-              </p>
-            )}
+            <p className="text-muted-foreground text-sm">
+              {isRunning ? "图片预览已封印，查看原生窗口和指标" : "等待启动..."}
+            </p>
           </div>
         </div>
       </div>

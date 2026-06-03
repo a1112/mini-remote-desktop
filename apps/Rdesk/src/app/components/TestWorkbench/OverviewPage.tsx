@@ -247,8 +247,10 @@ export function OverviewPage() {
         (capability) => !shouldShowCapabilityStatus(capability.status, false)
       ).length
     : 0;
+  const lan2k144ProfileId =
+    capabilitySnapshot?.platform === "macos" ? "lan.macos.2k144" : "lan.2k144";
   const lan2k144Evaluation = capabilitySnapshot
-    ? evaluateProfileSupport("lan.2k144", capabilitySnapshot)
+    ? evaluateProfileSupport(lan2k144ProfileId, capabilitySnapshot)
     : null;
   const lan1600p165Evaluation = capabilitySnapshot
     ? evaluateProfileSupport("lan.1600p165", capabilitySnapshot)
@@ -333,7 +335,7 @@ export function OverviewPage() {
                   <div className="rounded-lg border bg-background/70 px-3 py-2 text-sm">
                     <div className="text-xs text-muted-foreground">Profile readiness</div>
                     <div className="mt-1 flex flex-wrap items-center gap-2">
-                      <span className="font-medium">lan.2k144</span>
+                      <span className="font-medium">{lan2k144ProfileId}</span>
                       <StatusBadge status={lan2k144Evaluation?.status ?? "blocked"} />
                       <span className="font-medium">lan.1600p165</span>
                       <StatusBadge status={lan1600p165Evaluation?.status ?? "blocked"} />

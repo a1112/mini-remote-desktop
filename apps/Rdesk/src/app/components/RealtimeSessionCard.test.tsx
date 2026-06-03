@@ -45,7 +45,6 @@ describe("RealtimeSessionCard", () => {
         sinkHeight={720}
         sinkPixelFormat="Rgb24"
         sinkBytes={2764800}
-        sinkPreviewUrl="data:image/png;base64,abc123"
         loading={false}
         error={null}
         events={[
@@ -93,6 +92,6 @@ describe("RealtimeSessionCard", () => {
     expect(html).toContain("Rgb24");
     expect(html).toContain("Decoded Frame Sink");
     expect(html).toContain("2764800");
-    expect(html).toContain("Decoded frame preview");
+    expect(html).toContain("图片预览已封印");
   });
 });

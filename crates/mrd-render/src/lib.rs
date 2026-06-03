@@ -4,6 +4,7 @@ pub use mrd_pipeline_core::RuntimeStatus;
 pub enum RenderPixelFormat {
     Rgb24,
     Bgra32,
+    Nv12,
     /// D3D11 shared BGRA texture (zero-copy direct capture-render path)
     #[cfg(windows)]
     D3D11SharedBgra,
@@ -24,6 +25,8 @@ pub enum RenderFrameData {
     Rgb24(Vec<u8>),
     /// CPU BGRA32 data
     Bgra32(Vec<u8>),
+    /// CPU NV12 data with a single row pitch for both planes
+    Nv12 { data: Vec<u8>, pitch: usize },
     /// D3D11 shared texture handle (zero-copy path)
     #[cfg(windows)]
     D3D11SharedBgra {
@@ -76,6 +79,16 @@ impl RenderFrame {
             height,
             pixel_format: RenderPixelFormat::Bgra32,
             data: RenderFrameData::Bgra32(data),
+        }
+    }
+
+    /// Create a frame from CPU NV12 data.
+    pub fn from_nv12(width: usize, height: usize, data: Vec<u8>, pitch: usize) -> Self {
+        Self {
+            width,
+            height,
+            pixel_format: RenderPixelFormat::Nv12,
+            data: RenderFrameData::Nv12 { data, pitch },
         }
     }
 
@@ -154,6 +167,14 @@ impl RenderFrame {
     pub fn as_bgra32(&self) -> Option<&[u8]> {
         match &self.data {
             RenderFrameData::Bgra32(data) => Some(data.as_slice()),
+            _ => None,
+        }
+    }
+
+    /// Get the CPU NV12 data and pitch if available.
+    pub fn as_nv12(&self) -> Option<(&[u8], usize)> {
+        match &self.data {
+            RenderFrameData::Nv12 { data, pitch } => Some((data.as_slice(), *pitch)),
             _ => None,
         }
     }
@@ -243,6 +264,8 @@ pub struct RendererSnapshot {
     /// Frames skipped by a non-blocking present path, for example
     /// `DXGI_ERROR_WAS_STILL_DRAWING` on D3D11.
     pub present_skipped_count: u64,
+    /// Frames replaced inside a renderer-owned latest-frame queue before presentation.
+    pub render_queue_replacements: Option<u64>,
     /// Last presentation status reported by the renderer.
     pub last_present_status: Option<String>,
     /// Renderer low-latency frame latency target, when the backend supports one.
@@ -271,6 +294,10 @@ pub struct RendererSnapshot {
     pub last_render_prepare_wait_ms: Option<f64>,
     /// Last shared texture/resource/SRV preparation duration in milliseconds.
     pub last_render_shared_resource_ms: Option<f64>,
+    /// Last wait for a platform drawable/backbuffer before encoding draw work.
+    pub last_render_wait_for_drawable_ms: Option<f64>,
+    /// Last render command encode plus commit duration in milliseconds.
+    pub last_render_encode_commit_ms: Option<f64>,
     /// Last D3D draw/copy plus present duration in milliseconds.
     pub last_render_draw_present_ms: Option<f64>,
     pub last_width: usize,
@@ -292,6 +319,28 @@ pub enum RenderError {
 pub trait RendererInstance: Send {
     fn attach_target(&mut self, target: RenderTarget) -> Result<(), RenderError>;
     fn upload_frame(&mut self, frame: RenderFrame) -> Result<(), RenderError>;
+    fn upload_h264_access_unit(
+        &mut self,
+        _width: usize,
+        _height: usize,
+        _timestamp_us: u64,
+        _payload: bytes::Bytes,
+    ) -> Result<(), RenderError> {
+        Err(RenderError::Message(
+            "renderer does not accept compressed H.264 access units".to_string(),
+        ))
+    }
+    fn upload_hevc_access_unit(
+        &mut self,
+        _width: usize,
+        _height: usize,
+        _timestamp_us: u64,
+        _payload: bytes::Bytes,
+    ) -> Result<(), RenderError> {
+        Err(RenderError::Message(
+            "renderer does not accept compressed HEVC access units".to_string(),
+        ))
+    }
     fn snapshot(&self) -> RendererSnapshot;
 }
 

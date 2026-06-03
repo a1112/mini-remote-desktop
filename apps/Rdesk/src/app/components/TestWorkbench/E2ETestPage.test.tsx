@@ -45,7 +45,6 @@ describe("E2ETestPage LAN automation", () => {
           resolution: [2560, 1440],
         });
       }
-      if (command === "test_harness_get_frames") return Promise.resolve([null, null]);
       return Promise.resolve(null);
     });
 
@@ -471,6 +470,36 @@ describe("E2ETestPage LAN automation", () => {
       expect.objectContaining({
         preferredDisplaySourceId: "windows:display-shared:0",
       })
+    );
+  });
+
+  it("honors autorun renderDisplay=false for LAN diagnostics", async () => {
+    const mockInvoke = installSuccessfulLanAutomationMock();
+
+    render(
+      <MemoryRouter
+        initialEntries={[
+          "/test/e2e?autorun=lan-e2e&targetDeviceId=agent-device&transport=quic&renderDisplay=0",
+        ]}
+      >
+        <E2ETestPage />
+      </MemoryRouter>
+    );
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "automation_write_report",
+        expect.objectContaining({
+          report: expect.objectContaining({
+            status: "completed",
+            displayWindow: undefined,
+          }),
+        })
+      );
+    });
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      "open_remote_display_window",
+      expect.anything()
     );
   });
 });

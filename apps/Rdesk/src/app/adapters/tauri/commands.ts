@@ -44,7 +44,6 @@ import type {
   MediaPipelineSnapshot,
   ProbeSnapshot,
   HarnessMetrics,
-  FrameData,
   // Test Workbench Types
   TestScenario,
   TestRun,
@@ -318,14 +317,6 @@ export async function configureRemoteDisplayNativeSurface(params: {
 
 export async function presentTestHarnessFrameOnNativeSurface(): Promise<AdapterResult<boolean>> {
   return invokeAdapter<boolean>('present_test_harness_frame_on_native_surface');
-}
-
-export async function presentRemotePreviewFrameOnNativeSurface(
-  dataUrl: string
-): Promise<AdapterResult<boolean>> {
-  return invokeAdapter<boolean>('present_remote_preview_frame_on_native_surface', {
-    dataUrl,
-  });
 }
 
 export async function browserWebrtcPreviewStart(params: {
@@ -688,7 +679,7 @@ export async function ipcSendControlInput(
  * List local capture sources from the mrd-service host.
  */
 export async function ipcListLocalCaptureSources(
-  includePreviews = true,
+  includePreviews = false,
   limit?: number
 ): Promise<AdapterResult<CaptureSource[]>> {
   const args = {
@@ -712,7 +703,7 @@ export async function ipcListLocalCaptureSources(
  */
 export async function ipcListRemoteCaptureSources(
   sessionId: string,
-  includePreviews = true,
+  includePreviews = false,
   limit?: number
 ): Promise<AdapterResult<CaptureSource[]>> {
   const args = {
@@ -1200,7 +1191,8 @@ export async function testListWindowCaptureTargets(): Promise<AdapterResult<Wind
 }
 
 /**
- * List platform window capture targets with best-effort screenshot previews.
+ * List platform window capture targets through the legacy preview command.
+ * Image payloads are disabled; this returns metadata only.
  */
 export async function testListWindowCaptureTargetsWithPreviews(
   limit = 24
@@ -1220,7 +1212,8 @@ export async function testListCaptureShareSources(): Promise<
 }
 
 /**
- * List screen/window sharing sources with best-effort preview frames where supported.
+ * List screen/window sharing sources through the legacy preview command.
+ * Image payloads are disabled; this returns metadata only.
  */
 export async function testListCaptureShareSourcesWithPreviews(
   limit = 24
@@ -1414,26 +1407,4 @@ export async function testHarnessGetMetrics(): Promise<AdapterResult<HarnessMetr
  */
 export async function testHarnessGetComparisonResult(): Promise<AdapterResult<PipelineComparisonResult>> {
   return invokeAdapter<PipelineComparisonResult>('test_harness_get_comparison_result');
-}
-
-/**
- * Get latest captured and rendered frames as base64
- */
-export async function testHarnessGetFrames(params?: {
-  includeCaptured?: boolean;
-  includeRendered?: boolean;
-  lastCapturedGeneration?: number;
-  lastRenderedGeneration?: number;
-}): Promise<
-  AdapterResult<[FrameData | null, FrameData | null]>
-> {
-  return invokeAdapter<[FrameData | null, FrameData | null]>(
-    'test_harness_get_frames',
-    {
-      includeCaptured: params?.includeCaptured ?? true,
-      includeRendered: params?.includeRendered ?? true,
-      lastCapturedGeneration: params?.lastCapturedGeneration,
-      lastRenderedGeneration: params?.lastRenderedGeneration,
-    }
-  );
 }

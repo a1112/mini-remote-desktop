@@ -8,6 +8,8 @@
 
 /// Client-side helpers for connecting to the local service IPC endpoint.
 pub mod client;
+/// Binary render-proxy framing used between Rdesk and mrd-service.
+pub mod render_proxy;
 /// Transport abstractions used by IPC client/server implementations.
 pub mod transport;
 
@@ -154,6 +156,8 @@ mod wire {
         pub backend: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub window_handle: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub render_proxy_endpoint: Option<String>,
     }
 
     /// Aggregated latency metrics for one media pipeline stage.
@@ -194,6 +198,30 @@ mod wire {
         pub dynamic_fps_tier: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub target_fps: Option<u32>,
+        #[serde(default)]
+        pub frames_completed: u64,
+        #[serde(default)]
+        pub repeated_latest_frames: u64,
+        #[serde(default)]
+        pub capture_frame_samples: u64,
+        #[serde(default)]
+        pub capture_cpu_frames: u64,
+        #[serde(default)]
+        pub capture_macos_cv_pixel_buffer_frames: u64,
+        #[serde(default)]
+        pub capture_bgra32_frames: u64,
+        #[serde(default)]
+        pub capture_rgba32_frames: u64,
+        #[serde(default)]
+        pub capture_rgb24_frames: u64,
+        #[serde(default)]
+        pub capture_nv12_frames: u64,
+        #[serde(default)]
+        pub access_units_encoded: u64,
+        #[serde(default)]
+        pub keyframes_encoded: u64,
+        #[serde(default)]
+        pub encoded_access_unit_bytes: u64,
         pub datagram_fragments_attempted: u64,
         pub datagram_fragments_sent: u64,
         pub datagram_fragments_delayed: u64,
@@ -259,6 +287,8 @@ mod wire {
     pub struct MediaPipelineSnapshot {
         pub session_id: SessionId,
         pub attached_surfaces: Vec<AttachedRenderSurface>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub active_encoder: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub active_decoder: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1028,6 +1058,8 @@ mod wire {
             backend: String,
             #[serde(default, skip_serializing_if = "Option::is_none")]
             window_handle: Option<i64>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            render_proxy_endpoint: Option<String>,
         },
         /// Detach a native render surface from a session media pipeline.
         DetachRenderSurface {

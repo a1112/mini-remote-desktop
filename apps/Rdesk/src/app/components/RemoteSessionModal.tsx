@@ -135,15 +135,8 @@ export function RemoteSessionModal({ device, onClose }: RemoteSessionModalProps)
           </div>
         </div>
 
-        {/* Remote screen simulation */}
+        {/* Remote native surface placeholder */}
         <div className="flex-1 relative bg-[#1a1a2e] overflow-hidden cursor-crosshair select-none">
-          <img
-            src="https://images.unsplash.com/photo-1651832710372-a2b0da73a98f?crop=entropy&cs=tinysrgb&fit=max&fm=jpg&ixid=M3w3Nzg4Nzd8MHwxfHNlYXJjaHwxfHxyZW1vdGUlMjBkZXNrdG9wJTIwY29tcHV0ZXIlMjBzY3JlZW58ZW58MXx8fHwxNzcyNjE5MDE0fDA&ixlib=rb-4.1.0&q=80&w=1080"
-            alt="Remote screen"
-            className="w-full h-full object-cover opacity-90"
-            draggable={false}
-          />
-
           {/* Connection quality overlay */}
           <div className="absolute top-3 right-3 flex flex-col gap-2 items-end">
             <div className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg bg-black/60 backdrop-blur-sm border border-white/10 text-gray-300" style={{ fontSize: 11 }}>

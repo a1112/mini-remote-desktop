@@ -176,9 +176,9 @@ function shareSourceToWindowTarget(source: CaptureShareSourceTarget): WindowCapt
     app_name: source.app_name,
     bundle_identifier: source.bundle_identifier,
     window_layer: source.window_layer,
-    preview_data_url: source.preview_data_url,
-    preview_width: source.preview_width,
-    preview_height: source.preview_height,
+    preview_data_url: undefined,
+    preview_width: undefined,
+    preview_height: undefined,
   };
 }
 
@@ -1241,23 +1241,14 @@ function ShareSourcePickerDialog({
 function ShareSourcePreviewThumb({ source }: { source: CaptureShareSourceTarget }) {
   return (
     <div className="flex aspect-video w-full items-center justify-center overflow-hidden rounded border bg-muted">
-      {source.preview_data_url ? (
-        <img
-          src={source.preview_data_url}
-          alt=""
-          className="h-full w-full object-contain"
-          draggable={false}
-        />
-      ) : (
-        <div className="flex flex-col items-center gap-2 text-muted-foreground">
-          {source.source_kind === "screen" || source.source_kind === "portal" ? (
-            <Monitor className="h-5 w-5" />
-          ) : (
-            <ImageOff className="h-5 w-5" />
-          )}
-          <span className="text-xs">{shareSourceKindLabel(source)}</span>
-        </div>
-      )}
+      <div className="flex flex-col items-center gap-2 text-muted-foreground">
+        {source.source_kind === "screen" || source.source_kind === "portal" ? (
+          <Monitor className="h-5 w-5" />
+        ) : (
+          <ImageOff className="h-5 w-5" />
+        )}
+        <span className="text-xs">{shareSourceKindLabel(source)}</span>
+      </div>
     </div>
   );
 }
@@ -1265,19 +1256,10 @@ function ShareSourcePreviewThumb({ source }: { source: CaptureShareSourceTarget 
 function WindowPreviewThumb({ target }: { target: WindowCaptureTarget }) {
   return (
     <div className="flex aspect-video w-full items-center justify-center overflow-hidden rounded border bg-muted">
-      {target.preview_data_url ? (
-        <img
-          src={target.preview_data_url}
-          alt=""
-          className="h-full w-full object-contain"
-          draggable={false}
-        />
-      ) : (
-        <div className="flex flex-col items-center gap-2 text-muted-foreground">
-          <ImageOff className="h-5 w-5" />
-          <span className="text-xs">No preview</span>
-        </div>
-      )}
+      <div className="flex flex-col items-center gap-2 text-muted-foreground">
+        <ImageOff className="h-5 w-5" />
+        <span className="text-xs">原生链路</span>
+      </div>
     </div>
   );
 }

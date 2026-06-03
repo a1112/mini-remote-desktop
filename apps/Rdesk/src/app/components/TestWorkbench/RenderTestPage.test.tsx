@@ -221,7 +221,7 @@ describe("RenderTestPage platform capabilities", () => {
     expect(screen.queryByRole("button", { name: /Direct3D 11/ })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Direct3D 12/ })).not.toBeInTheDocument();
     expect(screen.getByText("实时画面")).toBeInTheDocument();
-    expect(screen.getByText("启动测试后显示渲染输入帧")).toBeInTheDocument();
+    expect(screen.getByText("启动测试后查看原生渲染指标")).toBeInTheDocument();
   });
 
   it("uses Linux capture and the Linux renderer when running on Linux", async () => {
@@ -260,9 +260,6 @@ describe("RenderTestPage platform capabilities", () => {
           dropped_frames: 0,
           resolution: [1920, 1080],
         });
-      }
-      if (command === "test_harness_get_frames") {
-        return Promise.resolve([null, ["AAAA", 2, 2, 7]]);
       }
       return Promise.resolve(null);
     });
@@ -328,7 +325,6 @@ describe("RenderTestPage platform capabilities", () => {
           resolution: [1920, 1080],
         });
       }
-      if (command === "test_harness_get_frames") return Promise.resolve([null, null]);
       return Promise.resolve(null);
     });
 
@@ -356,7 +352,7 @@ describe("RenderTestPage platform capabilities", () => {
     );
   });
 
-  it("displays rendered preview frames while the native Metal run is active", async () => {
+  it("keeps native Metal runs off the PNG preview path", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {
       if (command === "test_get_capabilities") {
@@ -393,9 +389,6 @@ describe("RenderTestPage platform capabilities", () => {
           resolution: [1920, 1080],
         });
       }
-      if (command === "test_harness_get_frames") {
-        return Promise.resolve([null, ["AAAA", 2, 2, 7]]);
-      }
       if (command === "test_get_run") {
         return Promise.resolve({
           run_id: "run-metal",
@@ -419,7 +412,9 @@ describe("RenderTestPage platform capabilities", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: /启动测试/ }));
 
-    const image = await screen.findByRole("img", { name: "Render preview" });
-    expect(image).toHaveAttribute("src", "data:image/png;base64,AAAA");
+    expect(
+      await screen.findByText("图片预览已封印，查看原生渲染窗口和指标")
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("img", { name: "Render preview" })).not.toBeInTheDocument();
   });
 });

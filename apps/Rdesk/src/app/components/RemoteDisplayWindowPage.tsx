@@ -38,7 +38,6 @@ import {
   getSystemResourceSnapshot,
   ipcMediaPipelineSnapshot,
   ipcSendControlInput,
-  presentRemotePreviewFrameOnNativeSurface,
   presentTestHarnessFrameOnNativeSurface,
   testGetCapabilities,
   testGetRun,
@@ -106,6 +105,8 @@ type LocalTestSelection = Partial<LocalWebViewProfile> & {
 };
 
 const METRICS_POLL_MS = 500;
+const REMOTE_NATIVE_DIAGNOSTICS_POLL_MS = 500;
+const REMOTE_WEB_DIAGNOSTICS_POLL_MS = 1_000;
 const WEB_PREVIEW_CONNECT_TIMEOUT_MS = 8_000;
 const WEB_VIEW_MAX_FPS = 144;
 const DIAGNOSTICS_SAMPLE_LIMIT = 60;
@@ -2060,6 +2061,11 @@ export function RemoteDisplayWindowPage() {
   const renderAreaRef = useRef<HTMLDivElement | null>(null);
   const syncAnimationFrameRef = useRef<number | null>(null);
   const syncTimerIdsRef = useRef<number[]>([]);
+  const nativeSurfaceSyncStateRef = useRef<{
+    key: string;
+    snapshot: NativeRenderSurfaceSnapshot | null;
+    inFlight?: Promise<NativeRenderSurfaceSnapshot | null>;
+  } | null>(null);
   const webPreviewVideoRef = useRef<HTMLVideoElement | null>(null);
   const webCodecsCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const webCodecsTransferredCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -2070,7 +2076,6 @@ export function RemoteDisplayWindowPage() {
   const webRtcStatsCountersRef = useRef<WebRtcInboundVideoCounters | null>(null);
   const autoStartRequestedRef = useRef<string | null>(null);
   const autoCaptureSourceRequestedRef = useRef<string | null>(null);
-  const nativePreviewFrameKeyRef = useRef<string | null>(null);
   const linuxNativeProfileAppliedRef = useRef(false);
   const diagnosticsCurrentRef = useRef<DiagnosticsSample | null>(null);
   const diagnosticsSamplesRef = useRef<DiagnosticsSample[]>([]);
@@ -2510,16 +2515,6 @@ export function RemoteDisplayWindowPage() {
           : "Native";
   const remoteFramesReceived = probeSnapshot?.frames_received ?? 0;
   const remoteFramesDecoded = probeSnapshot?.frames_decoded ?? 0;
-  const remoteFrameDataUrl = probeSnapshot?.latest_frame_data_url ?? null;
-  const nativeSurfaceAttached =
-    isNative && Boolean(nativeSurface?.attached || context?.native_surface_attached);
-  const showRemotePreviewFrame = !nativeSurfaceAttached && Boolean(remoteFrameDataUrl);
-  const remoteFrameAspectRatio =
-    probeSnapshot?.latest_frame_width && probeSnapshot?.latest_frame_height
-      ? `${probeSnapshot.latest_frame_width} / ${probeSnapshot.latest_frame_height}`
-      : probeSnapshot?.media_probe_width && probeSnapshot?.media_probe_height
-        ? `${probeSnapshot.media_probe_width} / ${probeSnapshot.media_probe_height}`
-        : undefined;
   const remoteInputFrameSize = useMemo(() => {
     const fallback = resolutionDimensions(resolution);
     return {
@@ -3536,28 +3531,50 @@ export function RemoteDisplayWindowPage() {
     const rect = element.getBoundingClientRect();
     if (isNative && (rect.width <= 0 || rect.height <= 0)) return null;
 
-    const visible = options?.visible ?? !testSettingsOpen;
+    const enabled = isNative && nativeRenderAvailable;
+    const visible = enabled && (options?.visible ?? !testSettingsOpen);
     const scale = nativeRendererType === "macos" ? 1 : window.devicePixelRatio || 1;
-    const result = await configureRemoteDisplayNativeSurface({
-      enabled: isNative && nativeRenderAvailable,
-      visible: isNative && nativeRenderAvailable && visible,
+    const payload = {
+      enabled,
+      visible,
       rect: {
         x: Math.round(rect.left * scale),
         y: Math.round(rect.top * scale),
         width: Math.round(rect.width * scale),
         height: Math.round(rect.height * scale),
       },
-    });
-
-    if (result.ok) {
-      setNativeSurface(result.value);
-      setLastError(null);
-      return result.value;
-    } else {
-      setLastError(result.error.message);
-      if (isNative) setRenderMode("web");
-      return null;
+    };
+    const key = JSON.stringify(payload);
+    const currentSync = nativeSurfaceSyncStateRef.current;
+    if (currentSync?.key === key) {
+      if (currentSync.inFlight) return currentSync.inFlight;
+      if (currentSync.snapshot) return currentSync.snapshot;
     }
+
+    const inFlight = (async () => {
+      const result = await configureRemoteDisplayNativeSurface(payload);
+
+      if (result.ok) {
+        nativeSurfaceSyncStateRef.current = { key, snapshot: result.value };
+        setNativeSurface(result.value);
+        setLastError(null);
+        return result.value;
+      } else {
+        if (nativeSurfaceSyncStateRef.current?.key === key) {
+          nativeSurfaceSyncStateRef.current = null;
+        }
+        setLastError(result.error.message);
+        if (isNative) setRenderMode("web");
+        return null;
+      }
+    })();
+
+    nativeSurfaceSyncStateRef.current = {
+      key,
+      snapshot: currentSync?.snapshot ?? null,
+      inFlight,
+    };
+    return inFlight;
   }, [isNative, nativeRenderAvailable, nativeRendererType, testSettingsOpen]);
 
   const openTestSettings = useCallback(() => {
@@ -4591,58 +4608,18 @@ export function RemoteDisplayWindowPage() {
     };
 
     void poll();
+    const pollIntervalMs = isNative
+      ? REMOTE_NATIVE_DIAGNOSTICS_POLL_MS
+      : REMOTE_WEB_DIAGNOSTICS_POLL_MS;
     const interval = window.setInterval(() => {
       void poll();
-    }, 1_000);
+    }, pollIntervalMs);
 
     return () => {
       cancelled = true;
       window.clearInterval(interval);
     };
-  }, [isLocalPipelinePreview, sessionId, testStatus]);
-
-  useEffect(() => {
-    if (
-      isLocalPipelinePreview ||
-      !isTauriRuntime() ||
-      !isNative ||
-      !nativeSurfaceAttached ||
-      !remoteFrameDataUrl
-    ) {
-      return;
-    }
-
-    const frameKey =
-      probeSnapshot?.last_media_payload_hash ??
-      `${probeSnapshot?.last_media_sequence ?? "unknown"}:${remoteFrameDataUrl.length}`;
-    if (nativePreviewFrameKeyRef.current === frameKey) {
-      return;
-    }
-    nativePreviewFrameKeyRef.current = frameKey;
-
-    let cancelled = false;
-    void presentRemotePreviewFrameOnNativeSurface(remoteFrameDataUrl).then((result) => {
-      if (cancelled) return;
-      if (!result.ok) {
-        setLastError(result.error.message);
-        return;
-      }
-      if (!result.value) {
-        setLastError("Native render surface is not attached");
-      }
-    });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [
-    isLocalPipelinePreview,
-    isNative,
-    nativeSurfaceAttached,
-    probeSnapshot?.last_media_payload_hash,
-    probeSnapshot?.last_media_sequence,
-    remoteFrameDataUrl,
-  ]);
+  }, [isLocalPipelinePreview, isNative, sessionId, testStatus]);
 
   const noDragSelector =
     'button, a, input, select, textarea, [role="button"], [data-no-drag="true"]';
@@ -4889,32 +4866,6 @@ export function RemoteDisplayWindowPage() {
     transport,
   ]);
 
-  const hydrateCaptureSourcePreviews = useCallback(async (sources: CaptureSource[]) => {
-    if (sources.length === 0) return;
-
-    try {
-      const previewLimit = Math.min(sources.length, 24);
-      const previewSources = isLocalPipelinePreview
-        ? await listLocalCaptureSources(true, previewLimit)
-        : await listRemoteCaptureSources(sessionId, true, previewLimit);
-      const previewById = new Map(previewSources.map((source) => [source.id, source]));
-      setCaptureSources((currentSources) =>
-        currentSources.map((source) => {
-          const preview = previewById.get(source.id);
-          if (!preview?.preview_data_url) return source;
-          return {
-            ...source,
-            preview_data_url: preview.preview_data_url,
-            preview_width: preview.preview_width,
-            preview_height: preview.preview_height,
-          };
-        })
-      );
-    } catch {
-      // Keep source selection usable when preview capture is slow or unsupported.
-    }
-  }, [isLocalPipelinePreview, sessionId]);
-
   const handleRefreshCaptureSources = useCallback(async () => {
     setCaptureSourcesLoading(true);
     setLastError(null);
@@ -4927,9 +4878,6 @@ export function RemoteDisplayWindowPage() {
         : await listRemoteCaptureSources(sessionId, false, 24);
       const nextSources = Array.isArray(sources) ? sources : [];
       setCaptureSources(nextSources);
-      void hydrateCaptureSourcePreviews(
-        nextSources.filter((source) => captureSourceAllowedForCapture(source, capture))
-      );
       setTestMessage(
         nextSources.length > 0
           ? `已获取 ${nextSources.length} 个捕获源（${
@@ -4947,7 +4895,7 @@ export function RemoteDisplayWindowPage() {
     } finally {
       setCaptureSourcesLoading(false);
     }
-  }, [capture, hydrateCaptureSourcePreviews, isLocalPipelinePreview, sessionId]);
+  }, [isLocalPipelinePreview, sessionId]);
 
   const handleSelectCaptureSource = useCallback(
     async (source: CaptureSource) => {
@@ -4987,19 +4935,6 @@ export function RemoteDisplayWindowPage() {
       setCaptureSourceSelection(null);
     }
   }, [capture, captureSourceSelection]);
-
-  useEffect(() => {
-    if (!captureSourcePickerOpen || filteredCaptureSources.length === 0) return;
-    const missingPreviewSources = filteredCaptureSources.filter(
-      (source) => !source.preview_data_url
-    );
-    if (missingPreviewSources.length === 0) return;
-    void hydrateCaptureSourcePreviews(filteredCaptureSources);
-  }, [
-    captureSourcePickerOpen,
-    filteredCaptureSources,
-    hydrateCaptureSourcePreviews,
-  ]);
 
   useEffect(() => {
     if (
@@ -5636,17 +5571,10 @@ export function RemoteDisplayWindowPage() {
             ].join(" ")}
           >
             <div className="aspect-video bg-slate-950">
-              {source.preview_data_url ? (
-                <img
-                  src={source.preview_data_url}
-                  alt=""
-                  className="h-full w-full object-cover"
-                />
-              ) : (
-                <div className="flex h-full w-full items-center justify-center text-[10px] text-slate-600">
-                  {captureSourcesLoading ? "正在生成预览" : "预览不可用"}
-                </div>
-              )}
+              <div className="flex h-full w-full flex-col items-center justify-center gap-2 text-[10px] text-slate-600">
+                <Monitor className="h-6 w-6 text-slate-700" />
+                <span>{captureSourcesLoading ? "正在枚举" : "原生链路"}</span>
+              </div>
             </div>
             <div className="space-y-1 px-3 py-2">
               <div className="flex items-center gap-2">
@@ -6713,14 +6641,6 @@ export function RemoteDisplayWindowPage() {
             </div>
           </div>
         )}
-        {!isLocalPipelinePreview && showRemotePreviewFrame && remoteFrameDataUrl && (
-          <img
-            src={remoteFrameDataUrl}
-            alt="Remote desktop frame"
-            className="absolute inset-0 h-full w-full object-contain"
-            style={remoteFrameAspectRatio ? { aspectRatio: remoteFrameAspectRatio } : undefined}
-          />
-        )}
         {isLocalPipelinePreview && !isNative && webPreviewMode === "connecting" && (
           <div className="absolute inset-0 flex items-center justify-center">
             <div className="rounded-md border border-cyan-400/20 bg-black/55 px-4 py-3 text-center backdrop-blur">
@@ -6732,7 +6652,7 @@ export function RemoteDisplayWindowPage() {
             </div>
           </div>
         )}
-        {!isLocalPipelinePreview && !hasRemoteFrames && !remoteFrameDataUrl && (
+        {!isLocalPipelinePreview && !hasRemoteFrames && (
           <div className="absolute inset-0 flex items-center justify-center px-6">
             <div className="max-w-xl rounded-xl border border-white/10 bg-black/45 px-6 py-5 text-center shadow-2xl backdrop-blur">
               <Network className="mx-auto mb-3 h-9 w-9 text-cyan-300" />

@@ -5,12 +5,14 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+bytes = { workspace = true }
 mrd-render = { path = "../mrd-render" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics-types = "0.2"
 dispatch2 = "0.3"
 metal = "0.33"
+mrd-codec-videotoolbox = { path = "../mrd-codec-videotoolbox" }
 objc = "0.2"
 
 [dev-dependencies]

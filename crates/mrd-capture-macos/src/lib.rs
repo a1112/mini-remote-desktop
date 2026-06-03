@@ -16,6 +16,7 @@ use screencapturekit::{
 };
 use std::{
     env,
+    ffi::c_void,
     sync::{Arc, Condvar, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -23,9 +24,33 @@ use std::{
 const BGRA_FOURCC: u32 = u32::from_be_bytes(*b"BGRA");
 const NV12_VIDEO_RANGE_FOURCC: u32 = u32::from_be_bytes(*b"420v");
 const DEFAULT_STREAM_FPS: u32 = 60;
-const DEFAULT_QUEUE_DEPTH: u32 = 4;
+const DEFAULT_QUEUE_DEPTH: u32 = 8;
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_millis(1_000);
 const NEXT_FRAME_TIMEOUT: Duration = Duration::from_millis(500);
+const CV_RETURN_SUCCESS: CVReturn = 0;
+const CV_TIME_IS_INDEFINITE: CVTimeFlags = 1 << 0;
+
+type CVDisplayLinkRef = *mut c_void;
+type CVReturn = i32;
+type CVTimeFlags = i32;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct CVTime {
+    time_value: i64,
+    time_scale: i32,
+    flags: i32,
+}
+
+#[link(name = "CoreVideo", kind = "framework")]
+extern "C" {
+    fn CVDisplayLinkCreateWithCGDisplay(
+        display_id: u32,
+        display_link_out: *mut CVDisplayLinkRef,
+    ) -> CVReturn;
+    fn CVDisplayLinkGetNominalOutputVideoRefreshPeriod(display_link: CVDisplayLinkRef) -> CVTime;
+    fn CVDisplayLinkRelease(display_link: CVDisplayLinkRef);
+}
 
 pub struct MacosScreenCapture {
     coregraphics: Option<CoreGraphicsScreenCapture>,
@@ -46,6 +71,7 @@ pub struct MacosDisplayCaptureTarget {
     pub title: String,
     pub width: u32,
     pub height: u32,
+    pub refresh_hz: Option<u32>,
     pub is_main: bool,
 }
 
@@ -221,6 +247,11 @@ impl MacosScreenCapture {
 
 impl FrameCapture for MacosScreenCapture {
     fn output_memory_kind(&self) -> FrameMemoryKind {
+        if self.active_backend == MacosCaptureBackend::ScreenCaptureKit
+            && macos_capture_direct_cv_pixel_buffer_enabled()
+        {
+            return FrameMemoryKind::MacosCvPixelBuffer;
+        }
         FrameMemoryKind::Cpu
     }
 
@@ -259,6 +290,7 @@ pub fn enumerate_display_capture_targets() -> Result<Vec<MacosDisplayCaptureTarg
             .map_err(|_| PipelineError::message("macOS display width is too large"))?;
         let height = u32::try_from(display.pixels_high())
             .map_err(|_| PipelineError::message("macOS display height is too large"))?;
+        let refresh_hz = display_refresh_hz(&display);
         if width == 0 || height == 0 {
             continue;
         }
@@ -275,11 +307,57 @@ pub fn enumerate_display_capture_targets() -> Result<Vec<MacosDisplayCaptureTarg
             title,
             width,
             height,
+            refresh_hz,
             is_main,
         });
     }
 
     Ok(targets)
+}
+
+pub fn highest_current_display_refresh_hz() -> Option<u32> {
+    enumerate_display_capture_targets()
+        .ok()?
+        .into_iter()
+        .filter_map(|target| target.refresh_hz)
+        .max()
+}
+
+fn display_refresh_hz(display: &CGDisplay) -> Option<u32> {
+    display
+        .display_mode()
+        .and_then(|mode| display_refresh_hz_from_rate(mode.refresh_rate()))
+        .or_else(|| display_refresh_hz_from_core_video(display.id))
+}
+
+fn display_refresh_hz_from_core_video(display_id: u32) -> Option<u32> {
+    let mut display_link: CVDisplayLinkRef = std::ptr::null_mut();
+    let created = unsafe { CVDisplayLinkCreateWithCGDisplay(display_id, &mut display_link) };
+    if created != CV_RETURN_SUCCESS || display_link.is_null() {
+        return None;
+    }
+
+    let time = unsafe { CVDisplayLinkGetNominalOutputVideoRefreshPeriod(display_link) };
+    unsafe { CVDisplayLinkRelease(display_link) };
+    display_refresh_hz_from_core_video_time(time)
+}
+
+fn display_refresh_hz_from_core_video_time(time: CVTime) -> Option<u32> {
+    if time.time_value <= 0 || time.time_scale <= 0 || time.flags & CV_TIME_IS_INDEFINITE != 0 {
+        return None;
+    }
+    display_refresh_hz_from_rate(time.time_scale as f64 / time.time_value as f64)
+}
+
+fn display_refresh_hz_from_rate(refresh_rate: f64) -> Option<u32> {
+    if !refresh_rate.is_finite() || refresh_rate <= 0.0 {
+        return None;
+    }
+    let refresh_hz = refresh_rate.round();
+    if refresh_hz < 1.0 || refresh_hz > u32::MAX as f64 {
+        return None;
+    }
+    Some(refresh_hz as u32)
 }
 
 pub fn enumerate_window_capture_targets() -> Result<Vec<MacosWindowCaptureTarget>, PipelineError> {
@@ -835,6 +913,36 @@ fn handle_screencapturekit_sample(
         return;
     }
 
+    if pixel_format == NV12_VIDEO_RANGE_FOURCC && macos_capture_direct_cv_pixel_buffer_enabled() {
+        let width = buffer.width();
+        let height = buffer.height();
+        let timestamp_us = match now_us() {
+            Ok(timestamp_us) => timestamp_us,
+            Err(error) => {
+                set_screencapturekit_error(
+                    shared,
+                    format!("ScreenCaptureKit timestamp failed: {error}"),
+                );
+                return;
+            }
+        };
+        let Some(frame) = CapturedFrame::from_macos_cv_pixel_buffer(
+            width,
+            height,
+            FramePixelFormat::Nv12,
+            timestamp_us,
+            buffer.as_ptr(),
+        ) else {
+            set_screencapturekit_error(
+                shared,
+                "ScreenCaptureKit returned a null CVPixelBuffer".to_string(),
+            );
+            return;
+        };
+        publish_screencapturekit_frame(shared, frame);
+        return;
+    }
+
     let guard = match buffer.lock(CVPixelBufferLockFlags::READ_ONLY) {
         Ok(guard) => guard,
         Err(status) => {
@@ -877,6 +985,13 @@ fn handle_screencapturekit_sample(
     };
 
     let frame = CapturedFrame::from_cpu(width, height, frame_pixel_format, timestamp_us, packed);
+    publish_screencapturekit_frame(shared, frame);
+}
+
+fn publish_screencapturekit_frame(
+    shared: &Arc<(Mutex<ScreenCaptureKitState>, Condvar)>,
+    frame: CapturedFrame,
+) {
     let (lock, cvar) = &**shared;
     if let Ok(mut state) = lock.lock() {
         state.latest = Some(frame);
@@ -987,6 +1102,15 @@ fn screencapturekit_pixel_format() -> PixelFormat {
     }
 }
 
+fn macos_capture_direct_cv_pixel_buffer_enabled() -> bool {
+    env::var("MRD_MACOS_CAPTURE_DIRECT_CVPIXELBUFFER")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        .map(|value| !matches!(value, "0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO"))
+        .unwrap_or(true)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct CaptureBackendPreference {
     force_coregraphics: bool,
@@ -1037,7 +1161,10 @@ fn now_us() -> Result<u64, PipelineError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{capture_backend_preference, pixel_dimensions_for_scale, repack_bgra};
+    use super::{
+        capture_backend_preference, display_refresh_hz_from_core_video_time,
+        display_refresh_hz_from_rate, pixel_dimensions_for_scale, repack_bgra, CVTime,
+    };
     use std::{env, sync::Mutex};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -1104,5 +1231,41 @@ mod tests {
     fn window_pixel_dimensions_apply_display_scale() {
         assert_eq!(pixel_dimensions_for_scale(640.0, 360.0, 2.0), (1280, 720));
         assert_eq!(pixel_dimensions_for_scale(0.0, 1.0, 2.0), (2, 2));
+    }
+
+    #[test]
+    fn display_refresh_hz_from_rate_uses_positive_rounded_rates() {
+        assert_eq!(display_refresh_hz_from_rate(59.94), Some(60));
+        assert_eq!(display_refresh_hz_from_rate(120.0), Some(120));
+        assert_eq!(display_refresh_hz_from_rate(0.0), None);
+        assert_eq!(display_refresh_hz_from_rate(f64::NAN), None);
+    }
+
+    #[test]
+    fn display_refresh_hz_from_core_video_time_uses_nominal_period() {
+        assert_eq!(
+            display_refresh_hz_from_core_video_time(CVTime {
+                time_value: 1,
+                time_scale: 120,
+                flags: 0,
+            }),
+            Some(120)
+        );
+        assert_eq!(
+            display_refresh_hz_from_core_video_time(CVTime {
+                time_value: 1001,
+                time_scale: 120_000,
+                flags: 0,
+            }),
+            Some(120)
+        );
+        assert_eq!(
+            display_refresh_hz_from_core_video_time(CVTime {
+                time_value: 0,
+                time_scale: 120,
+                flags: 0,
+            }),
+            None
+        );
     }
 }

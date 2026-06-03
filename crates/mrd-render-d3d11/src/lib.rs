@@ -731,6 +731,9 @@ impl D3d11Renderer {
         let data = match &frame.data {
             RenderFrameData::Rgb24(data) => data,
             RenderFrameData::Bgra32(data) => data,
+            RenderFrameData::Nv12 { .. } => {
+                return [0.05, 0.05, 0.05, 1.0];
+            }
             #[cfg(windows)]
             RenderFrameData::D3D11SharedBgra { .. } => {
                 return [0.05, 0.05, 0.05, 1.0];
@@ -1499,6 +1502,11 @@ impl RendererInstance for D3d11Renderer {
                         self.record_draw_present(|renderer| renderer.present_clear_frame(&frame))?
                     }
                 }
+                RenderFrameData::Nv12 { .. } => {
+                    return Err(RenderError::Message(
+                        "D3D11 renderer does not accept CPU NV12 frame data".to_string(),
+                    ));
+                }
                 #[cfg(windows)]
                 RenderFrameData::D3D11SharedBgra { .. } => {
                     if self.surface.is_some() {
@@ -1594,6 +1602,7 @@ impl RendererInstance for D3d11Renderer {
             uploaded_frame_count: self.uploaded_frame_count,
             presented_frame_count: self.presented_frame_count,
             present_skipped_count: self.present_skipped_count,
+            render_queue_replacements: None,
             last_present_status: self.last_present_status.map(str::to_string),
             #[cfg(windows)]
             low_latency_frame_latency_target: Some(Self::low_latency_frame_latency_target()),
@@ -1611,6 +1620,8 @@ impl RendererInstance for D3d11Renderer {
             last_waitable_wait_ms,
             last_render_prepare_wait_ms: self.last_render_prepare_wait_ms,
             last_render_shared_resource_ms: self.last_render_shared_resource_ms,
+            last_render_wait_for_drawable_ms: None,
+            last_render_encode_commit_ms: None,
             last_render_draw_present_ms: self.last_render_draw_present_ms,
             last_width: self.last_width,
             last_height: self.last_height,

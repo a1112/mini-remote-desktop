@@ -1,30 +1,27 @@
 use anyhow::Result;
 use mrd_ipc::CaptureSource;
-use std::time::{Duration, Instant};
 
 const DEFAULT_CAPTURE_SOURCE_LIMIT: usize = 24;
 const MAX_CAPTURE_SOURCE_LIMIT: usize = 48;
-#[cfg(any(windows, target_os = "macos"))]
-const PREVIEW_MAX_WIDTH: usize = 240;
-#[cfg(any(windows, target_os = "macos"))]
-const PREVIEW_MAX_HEIGHT: usize = 135;
-const PREVIEW_FRAME_TIMEOUT_MS: u64 = 90;
-const PREVIEW_TOTAL_BUDGET_MS: u64 = 1_800;
+#[cfg(target_os = "macos")]
+pub const TEST_SYNTHETIC_CV_CAPTURE_SOURCE_ID: &str = "test:synthetic-cv";
+#[cfg(target_os = "macos")]
+const TEST_SYNTHETIC_CV_CAPTURE_ENV: &str = "MRD_LAN_TEST_SYNTHETIC_CAPTURE";
 
 pub fn list_capture_sources(
-    include_previews: bool,
+    _include_previews: bool,
     limit: Option<u32>,
 ) -> Result<Vec<CaptureSource>> {
     let mut sources = list_capture_sources_impl()?;
+    #[cfg(target_os = "macos")]
+    if test_synthetic_cv_capture_enabled() {
+        sources.push(test_synthetic_cv_capture_source());
+    }
     let limit = limit
         .map(|value| value as usize)
         .unwrap_or(DEFAULT_CAPTURE_SOURCE_LIMIT)
         .clamp(1, MAX_CAPTURE_SOURCE_LIMIT);
     sources.truncate(limit);
-
-    if include_previews {
-        attach_capture_source_previews(&mut sources);
-    }
 
     Ok(sources)
 }
@@ -33,6 +30,11 @@ pub fn find_capture_source(source_id: &str) -> Result<CaptureSource> {
     let source_id = source_id.trim();
     if source_id.is_empty() {
         anyhow::bail!("capture source id is empty");
+    }
+
+    #[cfg(target_os = "macos")]
+    if test_synthetic_cv_capture_enabled() && is_test_synthetic_cv_capture_source_id(source_id) {
+        return Ok(test_synthetic_cv_capture_source());
     }
 
     list_capture_sources(false, Some(MAX_CAPTURE_SOURCE_LIMIT as u32))?
@@ -67,6 +69,47 @@ pub fn default_capture_source(include_previews: bool) -> Result<CaptureSource> {
     let sources = list_capture_sources(include_previews, Some(MAX_CAPTURE_SOURCE_LIMIT as u32))?;
     preferred_capture_source(&sources)
         .ok_or_else(|| anyhow::anyhow!("no capture sources are available"))
+}
+
+#[cfg(target_os = "macos")]
+pub fn test_synthetic_cv_capture_enabled() -> bool {
+    test_synthetic_cv_capture_enabled_from_env_value(
+        std::env::var(TEST_SYNTHETIC_CV_CAPTURE_ENV).ok().as_deref(),
+    )
+}
+
+#[cfg(target_os = "macos")]
+pub fn is_test_synthetic_cv_capture_source_id(source_id: &str) -> bool {
+    let source_id = source_id.trim();
+    source_id.eq_ignore_ascii_case(TEST_SYNTHETIC_CV_CAPTURE_SOURCE_ID)
+        || source_id.eq_ignore_ascii_case("synthetic-cv")
+}
+
+#[cfg(target_os = "macos")]
+pub fn test_synthetic_cv_capture_source() -> CaptureSource {
+    CaptureSource {
+        id: TEST_SYNTHETIC_CV_CAPTURE_SOURCE_ID.to_string(),
+        platform: "macos".to_string(),
+        source_kind: "display".to_string(),
+        title: "Synthetic 2K144 CVPixelBuffer".to_string(),
+        class_name: "SyntheticCVPixelBuffer".to_string(),
+        width: 2560,
+        height: 1440,
+        process_id: 0,
+        app_name: Some("mrd-service benchmark source".to_string()),
+        bundle_identifier: None,
+        preview_data_url: None,
+        preview_width: None,
+        preview_height: None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn test_synthetic_cv_capture_enabled_from_env_value(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
 }
 
 #[cfg(windows)]
@@ -490,95 +533,6 @@ fn list_capture_sources_impl() -> Result<Vec<CaptureSource>> {
     anyhow::bail!("remote window capture source enumeration is currently only available on Windows, macOS, and Linux")
 }
 
-fn attach_capture_source_previews(sources: &mut [CaptureSource]) {
-    let started_at = Instant::now();
-    for source in sources.iter_mut() {
-        let Some(frame_timeout) = preview_frame_timeout_for_elapsed(started_at.elapsed()) else {
-            break;
-        };
-        let Ok((preview_data_url, preview_width, preview_height)) =
-            capture_source_preview_data_url(&source.id, frame_timeout)
-        else {
-            continue;
-        };
-        source.preview_data_url = Some(preview_data_url);
-        source.preview_width = Some(preview_width);
-        source.preview_height = Some(preview_height);
-    }
-}
-
-fn preview_frame_timeout_for_elapsed(elapsed: Duration) -> Option<Duration> {
-    let budget = Duration::from_millis(PREVIEW_TOTAL_BUDGET_MS);
-    let remaining = budget.checked_sub(elapsed)?;
-    if remaining.is_zero() {
-        return None;
-    }
-    Some(remaining.min(Duration::from_millis(PREVIEW_FRAME_TIMEOUT_MS)))
-}
-
-#[cfg(windows)]
-fn capture_source_preview_data_url(
-    source_id: &str,
-    frame_timeout: Duration,
-) -> Result<(String, u32, u32)> {
-    let mut capture = match parse_windows_capture_source_ref(source_id)? {
-        WindowsCaptureSourceRef::Window(hwnd) => {
-            mrd_capture_winrt::WinrtCapture::from_window_handle(hwnd)
-                .map_err(|error| anyhow::anyhow!(error.to_string()))?
-        }
-        WindowsCaptureSourceRef::Display { index }
-        | WindowsCaptureSourceRef::DisplayShared { index } => {
-            create_windows_monitor_capture(source_id, index)?
-        }
-    };
-    capture
-        .start()
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    let frame = capture
-        .capture_frame_with_timeout(frame_timeout)
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    let _ = capture.stop();
-    frame_preview_data_url(&frame, PREVIEW_MAX_WIDTH, PREVIEW_MAX_HEIGHT)
-}
-
-#[cfg(target_os = "macos")]
-fn capture_source_preview_data_url(
-    source_id: &str,
-    frame_timeout: Duration,
-) -> Result<(String, u32, u32)> {
-    let mut capture = match parse_macos_capture_source_ref(source_id)? {
-        MacosCaptureSourceRef::Display { display_id } => {
-            mrd_capture_macos::MacosScreenCapture::new_display_id(display_id)
-        }
-        MacosCaptureSourceRef::Window { window_id } => {
-            mrd_capture_macos::MacosScreenCapture::new_window(window_id)
-        }
-    }
-    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    let frame = capture
-        .capture_frame_with_timeout(frame_timeout)
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    frame_preview_data_url(&frame, PREVIEW_MAX_WIDTH, PREVIEW_MAX_HEIGHT)
-}
-
-#[cfg(target_os = "linux")]
-fn capture_source_preview_data_url(
-    _source_id: &str,
-    _frame_timeout: Duration,
-) -> Result<(String, u32, u32)> {
-    anyhow::bail!("Linux capture previews require the async capture path and are not wired yet")
-}
-
-#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
-fn capture_source_preview_data_url(
-    _source_id: &str,
-    _frame_timeout: Duration,
-) -> Result<(String, u32, u32)> {
-    anyhow::bail!(
-        "remote window capture previews are currently only available on Windows, macOS, and Linux"
-    )
-}
-
 #[cfg(windows)]
 fn parse_windows_capture_source_ref(source_id: &str) -> Result<WindowsCaptureSourceRef> {
     let trimmed = source_id.trim();
@@ -705,152 +659,8 @@ fn parse_windows_hwnd_value(source_id: &str, value: &str) -> Result<isize> {
     Ok(hwnd as isize)
 }
 
-#[cfg(any(windows, target_os = "macos"))]
-fn frame_preview_data_url(
-    frame: &mrd_pipeline_core::CapturedFrame,
-    max_width: usize,
-    max_height: usize,
-) -> Result<(String, u32, u32)> {
-    use base64::Engine;
-    use image::{codecs::png::PngEncoder, ColorType, ImageEncoder};
-    use mrd_pipeline_core::FramePixelFormat;
-
-    if frame.width == 0 || frame.height == 0 || max_width == 0 || max_height == 0 {
-        anyhow::bail!("capture preview frame has invalid dimensions");
-    }
-
-    let scale = (max_width as f64 / frame.width as f64)
-        .min(max_height as f64 / frame.height as f64)
-        .min(1.0);
-    let preview_width = ((frame.width as f64 * scale).round() as usize)
-        .max(1)
-        .min(max_width);
-    let preview_height = ((frame.height as f64 * scale).round() as usize)
-        .max(1)
-        .min(max_height);
-
-    let mut rgba = Vec::with_capacity(preview_width * preview_height * 4);
-    match frame.pixel_format {
-        FramePixelFormat::Nv12 => {
-            let required_len = nv12_frame_len(frame.width, frame.height)
-                .ok_or_else(|| anyhow::anyhow!("capture preview NV12 byte size overflow"))?;
-            if frame.data.len() < required_len {
-                anyhow::bail!(
-                    "capture preview NV12 frame is truncated: {} < {}",
-                    frame.data.len(),
-                    required_len
-                );
-            }
-            for y in 0..preview_height {
-                let source_y = y * frame.height / preview_height;
-                for x in 0..preview_width {
-                    let source_x = x * frame.width / preview_width;
-                    let (r, g, b) = sample_nv12_rgb(frame, source_x, source_y);
-                    rgba.extend_from_slice(&[r, g, b, 255]);
-                }
-            }
-        }
-        FramePixelFormat::Bgra32 | FramePixelFormat::Rgba32 | FramePixelFormat::Rgb24 => {
-            let bytes_per_pixel = match frame.pixel_format {
-                FramePixelFormat::Bgra32 | FramePixelFormat::Rgba32 => 4,
-                FramePixelFormat::Rgb24 => 3,
-                FramePixelFormat::Nv12 => unreachable!("NV12 handled above"),
-            };
-            let source_stride = frame
-                .width
-                .checked_mul(bytes_per_pixel)
-                .ok_or_else(|| anyhow::anyhow!("capture preview stride overflow"))?;
-            let required_len = source_stride
-                .checked_mul(frame.height)
-                .ok_or_else(|| anyhow::anyhow!("capture preview byte size overflow"))?;
-            if frame.data.len() < required_len {
-                anyhow::bail!(
-                    "capture preview frame is truncated: {} < {}",
-                    frame.data.len(),
-                    required_len
-                );
-            }
-
-            for y in 0..preview_height {
-                let source_y = y * frame.height / preview_height;
-                for x in 0..preview_width {
-                    let source_x = x * frame.width / preview_width;
-                    let source_index = source_y * source_stride + source_x * bytes_per_pixel;
-                    match frame.pixel_format {
-                        FramePixelFormat::Bgra32 => {
-                            rgba.push(frame.data[source_index + 2]);
-                            rgba.push(frame.data[source_index + 1]);
-                            rgba.push(frame.data[source_index]);
-                            rgba.push(frame.data[source_index + 3]);
-                        }
-                        FramePixelFormat::Rgba32 => {
-                            rgba.extend_from_slice(&frame.data[source_index..source_index + 4]);
-                        }
-                        FramePixelFormat::Rgb24 => {
-                            rgba.push(frame.data[source_index]);
-                            rgba.push(frame.data[source_index + 1]);
-                            rgba.push(frame.data[source_index + 2]);
-                            rgba.push(255);
-                        }
-                        FramePixelFormat::Nv12 => unreachable!("NV12 handled above"),
-                    }
-                }
-            }
-        }
-    }
-
-    let mut png = Vec::new();
-    PngEncoder::new(&mut png).write_image(
-        &rgba,
-        preview_width as u32,
-        preview_height as u32,
-        ColorType::Rgba8.into(),
-    )?;
-    let encoded = base64::engine::general_purpose::STANDARD.encode(png);
-
-    Ok((
-        format!("data:image/png;base64,{encoded}"),
-        preview_width as u32,
-        preview_height as u32,
-    ))
-}
-
-#[cfg(any(windows, target_os = "macos"))]
-fn nv12_frame_len(width: usize, height: usize) -> Option<usize> {
-    width.checked_mul(height).and_then(|y_size| {
-        width
-            .checked_mul(height.div_ceil(2))
-            .and_then(|uv_size| y_size.checked_add(uv_size))
-    })
-}
-
-#[cfg(any(windows, target_os = "macos"))]
-fn sample_nv12_rgb(frame: &mrd_pipeline_core::CapturedFrame, x: usize, y: usize) -> (u8, u8, u8) {
-    let y_size = frame.width * frame.height;
-    let luma = frame.data[y * frame.width + x] as i32;
-    let uv_row = y_size + (y / 2) * frame.width;
-    let uv_x = (x / 2) * 2;
-    let u = frame.data[uv_row + uv_x] as i32;
-    let v = frame.data[uv_row + uv_x + 1] as i32;
-    let c = (luma - 16).max(0);
-    let d = u - 128;
-    let e = v - 128;
-    (
-        clamp_yuv_to_u8((298 * c + 409 * e + 128) >> 8),
-        clamp_yuv_to_u8((298 * c - 100 * d - 208 * e + 128) >> 8),
-        clamp_yuv_to_u8((298 * c + 516 * d + 128) >> 8),
-    )
-}
-
-#[cfg(any(windows, target_os = "macos"))]
-fn clamp_yuv_to_u8(value: i32) -> u8 {
-    value.clamp(0, 255) as u8
-}
-
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use mrd_ipc::CaptureSource;
 
     fn source(id: &str, source_kind: &str) -> CaptureSource {
@@ -924,22 +734,6 @@ mod tests {
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].id, "windows:display:2");
         assert_eq!(sources[0].title, "Display 3 (full screen copy)");
-    }
-
-    #[test]
-    fn preview_timeout_stays_inside_lan_request_budget() {
-        assert_eq!(
-            super::preview_frame_timeout_for_elapsed(Duration::from_millis(0)),
-            Some(Duration::from_millis(90))
-        );
-        assert_eq!(
-            super::preview_frame_timeout_for_elapsed(Duration::from_millis(1_750)),
-            Some(Duration::from_millis(50))
-        );
-        assert_eq!(
-            super::preview_frame_timeout_for_elapsed(Duration::from_millis(1_800)),
-            None
-        );
     }
 
     #[cfg(windows)]
@@ -1030,6 +824,43 @@ mod tests {
             super::parse_macos_capture_source_ref("5678").unwrap(),
             super::MacosCaptureSourceRef::Window { window_id: 5678 }
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn synthetic_cv_capture_env_parses_truthy_values_only() {
+        assert!(super::test_synthetic_cv_capture_enabled_from_env_value(
+            Some("1")
+        ));
+        assert!(super::test_synthetic_cv_capture_enabled_from_env_value(
+            Some("true")
+        ));
+        assert!(super::test_synthetic_cv_capture_enabled_from_env_value(
+            Some("on")
+        ));
+        assert!(!super::test_synthetic_cv_capture_enabled_from_env_value(
+            Some("0")
+        ));
+        assert!(!super::test_synthetic_cv_capture_enabled_from_env_value(
+            Some("off")
+        ));
+        assert!(!super::test_synthetic_cv_capture_enabled_from_env_value(
+            None
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn synthetic_cv_capture_source_uses_2k_display_like_shape() {
+        let source = super::test_synthetic_cv_capture_source();
+
+        assert_eq!(source.id, super::TEST_SYNTHETIC_CV_CAPTURE_SOURCE_ID);
+        assert_eq!(source.platform, "macos");
+        assert_eq!(source.source_kind, "display");
+        assert_eq!((source.width, source.height), (2560, 1440));
+        assert!(super::is_test_synthetic_cv_capture_source_id(
+            "synthetic-cv"
+        ));
     }
 
     #[cfg(target_os = "macos")]

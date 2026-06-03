@@ -330,6 +330,7 @@ impl IpcServer {
                 surface_id,
                 backend,
                 window_handle,
+                render_proxy_endpoint,
             } => {
                 transport_handlers::attach_render_surface(
                     &self.app_state,
@@ -337,6 +338,7 @@ impl IpcServer {
                     surface_id,
                     backend,
                     window_handle,
+                    render_proxy_endpoint,
                 )
                 .await
             }
@@ -1115,6 +1117,12 @@ fn transport_capability_id(transport_kind: &str) -> &'static str {
 }
 
 fn scenario_id_for_profile(profile: &MediaProfile) -> &'static str {
+    if cfg!(target_os = "macos") && profile.codec.eq_ignore_ascii_case("hevc") {
+        return "lan.macos.hevc.2k144";
+    }
+    if cfg!(target_os = "macos") && profile.codec.eq_ignore_ascii_case("h264") {
+        return "lan.macos.2k144";
+    }
     if profile.width >= 3840 || profile.height >= 2160 {
         "quality.4k60"
     } else if profile.height >= 1600 && profile.fps >= 165 {
@@ -1519,6 +1527,51 @@ mod tests {
             _ => panic!("Expected preflight error response"),
         }
         assert!(app_state.sessions.lock().await.get(&session_id).is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_h264_2k144_profile_uses_native_preflight_profile() {
+        let profile = mrd_ipc::MediaProfile {
+            width: 2560,
+            height: 1440,
+            fps: 144,
+            bitrate_mbps: 80,
+            codec: "h264".to_string(),
+            ..mrd_ipc::MediaProfile::default()
+        };
+
+        assert_eq!(scenario_id_for_profile(&profile), "lan.macos.2k144");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_hevc_2k144_profile_uses_native_hevc_preflight_profile() {
+        let profile = mrd_ipc::MediaProfile {
+            width: 2560,
+            height: 1440,
+            fps: 144,
+            bitrate_mbps: 80,
+            codec: "hevc".to_string(),
+            ..mrd_ipc::MediaProfile::default()
+        };
+
+        assert_eq!(scenario_id_for_profile(&profile), "lan.macos.hevc.2k144");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_h264_smoke_profile_uses_native_preflight_profile() {
+        let profile = mrd_ipc::MediaProfile {
+            width: 1280,
+            height: 720,
+            fps: 60,
+            bitrate_mbps: 10,
+            codec: "h264".to_string(),
+            ..mrd_ipc::MediaProfile::default()
+        };
+
+        assert_eq!(scenario_id_for_profile(&profile), "lan.macos.2k144");
     }
 
     #[tokio::test]

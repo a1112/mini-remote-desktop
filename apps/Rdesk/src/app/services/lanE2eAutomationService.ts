@@ -63,6 +63,7 @@ export type LanE2EFailureReason =
   | "no_remote_frames"
   | "media_profile_mismatch"
   | "profile_downgraded"
+  | "performance_threshold"
   | "runtime_error"
   | "stop_failed";
 
@@ -90,6 +91,7 @@ export interface LanE2EAutomationOptions {
   preferredRenderDisplaySourceId?: string;
   expectedPeerBuildId?: string;
   renderProfileCap?: boolean;
+  renderDisplay?: boolean;
   adaptive?: boolean;
   adaptiveConfig?: AdaptiveMediaConfig;
   faultPlan?: CrossDeviceFaultPlan;
@@ -124,9 +126,15 @@ export interface LanE2EAutomationReport {
   sampleSequenceGapDrops?: number;
   sampleDecodeErrorDrops?: number;
   sampleTransientDrops?: number;
+  sampleFpsElapsedMs?: number;
+  sampleFpsTargetDurationMs?: number;
   sampleObservedFps?: number;
+  sampleObservedFpsAtTargetDuration?: number;
   sampleRenderFramesPresented: number;
   sampleObservedRenderFps?: number;
+  sampleObservedRenderFpsAtTargetDuration?: number;
+  sampleRenderQueueReplacements?: number;
+  sampleRenderPresentSkips?: number;
   thresholds: {
     minSampleDurationMs: number;
     minDecodedFrames: number;
@@ -272,6 +280,13 @@ const DEFAULT_LAN_H264_FALLBACK_MEDIA_PROFILE: MediaProfile = {
   bitrate_mbps: 80,
   codec: "h264",
 };
+const DEFAULT_LAN_MACOS_H264_MEDIA_PROFILE: MediaProfile = {
+  width: 2560,
+  height: 1440,
+  fps: 144,
+  bitrate_mbps: 80,
+  codec: "h264",
+};
 const ADAPTIVE_STARTUP_SAFE_MIN_FPS = 120;
 const ADAPTIVE_STARTUP_SAFE_MIN_BITRATE_MBPS = 80;
 const ADAPTIVE_STARTUP_SAFE_BITRATE_RATIO = 0.8;
@@ -302,6 +317,7 @@ export async function runLanE2EAutomation(
   const transportKind = options.transportKind ?? "quic";
   const displayModePolicy = options.displayModePolicy ?? "none";
   const renderProfileCapEnabled = options.renderProfileCap ?? true;
+  const renderDisplayEnabled = options.renderDisplay ?? true;
   const requestMediaProfile = shouldRequestMediaProfile(scenarioId, transportKind);
   let requestedProfile = options.requestedProfile;
   const validationMode = transportKind === "webrtc" ? "webrtc_rtp" : "quic_datagram";
@@ -324,10 +340,17 @@ export async function runLanE2EAutomation(
   let sampleSequenceGapDrops: number | undefined;
   let sampleDecodeErrorDrops: number | undefined;
   let sampleTransientDrops: number | undefined;
+  let sampleFpsElapsedMs: number | undefined;
+  let sampleFpsTargetDurationMs: number | undefined;
   let sampleObservedFps: number | undefined;
+  let sampleObservedFpsAtTargetDuration: number | undefined;
   let sampleRenderFramesPresented = 0;
   let sampleObservedRenderFps: number | undefined;
+  let sampleObservedRenderFpsAtTargetDuration: number | undefined;
+  let sampleRenderQueueReplacements: number | undefined;
+  let sampleRenderPresentSkips: number | undefined;
   let renderCappedProfileApplied = false;
+  let sampleFpsBaselineDeferred = false;
   let sampleFpsBaseline:
     | {
         framesDecoded: number;
@@ -336,6 +359,8 @@ export async function runLanE2EAutomation(
         decodeErrorDrops: number;
         transientDrops: number;
         renderPresentedFrames: number;
+        renderQueueReplacements: number;
+        renderPresentSkips: number;
         sampleDurationMs: number;
       }
     | undefined;
@@ -382,9 +407,15 @@ export async function runLanE2EAutomation(
     sampleSequenceGapDrops,
     sampleDecodeErrorDrops,
     sampleTransientDrops,
+    sampleFpsElapsedMs,
+    sampleFpsTargetDurationMs,
     sampleObservedFps,
+    sampleObservedFpsAtTargetDuration,
     sampleRenderFramesPresented,
     sampleObservedRenderFps,
+    sampleObservedRenderFpsAtTargetDuration,
+    sampleRenderQueueReplacements,
+    sampleRenderPresentSkips,
     thresholds: {
       minSampleDurationMs,
       minDecodedFrames,
@@ -548,38 +579,42 @@ export async function runLanE2EAutomation(
       stage("adaptation", "completed");
     }
 
+    if (renderDisplayEnabled) {
+      stage("display", "started");
+      displayWindow = await unwrap(
+        commands.openRemoteDisplayWindow({
+          sessionId,
+          ...(options.preferredRenderDisplaySourceId
+            ? { preferredDisplaySourceId: options.preferredRenderDisplaySourceId }
+            : {}),
+          ...(captureSource
+            ? { avoidCaptureSourceId: captureSourceDisplayPlacementRef(captureSource) }
+            : {}),
+        }),
+        "display_window_failed"
+      );
+
+      const nativeSurface = await waitForRemoteDisplayNativeSurface(
+        commands,
+        sessionId,
+        displayWindow,
+        timeoutMs,
+        now
+      );
+      displayWindow = nativeSurface.displayWindow;
+      mediaPipelineSnapshot = nativeSurface.mediaPipelineSnapshot;
+      if (!nativeSurface.attached) {
+        stage("display", "failed", nativeSurface.message);
+        return finish("failed", "display_window_failed", nativeSurface.message);
+      }
+      stage("display", "completed");
+    } else {
+      stage("display", "skipped", "Render display disabled for diagnostics");
+    }
+
     stage("receiver", "started");
     await unwrap(commands.ipcStartReceiver(sessionId), "receiver_start_failed");
     stage("receiver", "completed");
-
-    stage("display", "started");
-    displayWindow = await unwrap(
-      commands.openRemoteDisplayWindow({
-        sessionId,
-        ...(options.preferredRenderDisplaySourceId
-          ? { preferredDisplaySourceId: options.preferredRenderDisplaySourceId }
-          : {}),
-        ...(captureSource
-          ? { avoidCaptureSourceId: captureSourceDisplayPlacementRef(captureSource) }
-          : {}),
-      }),
-      "display_window_failed"
-    );
-
-    const nativeSurface = await waitForRemoteDisplayNativeSurface(
-      commands,
-      sessionId,
-      displayWindow,
-      timeoutMs,
-      now
-    );
-    displayWindow = nativeSurface.displayWindow;
-    mediaPipelineSnapshot = nativeSurface.mediaPipelineSnapshot;
-    if (!nativeSurface.attached) {
-      stage("display", "failed", nativeSurface.message);
-      return finish("failed", "display_window_failed", nativeSurface.message);
-    }
-    stage("display", "completed");
 
     if (scenarioId === "cross.fault.recovery") {
       const faultPlan = options.faultPlan ?? { type: "network.pause_peer" as const, durationMs: 1000 };
@@ -655,24 +690,49 @@ export async function runLanE2EAutomation(
         sampleSequenceGapDrops = undefined;
         sampleDecodeErrorDrops = undefined;
         sampleTransientDrops = undefined;
+        sampleFpsElapsedMs = undefined;
+        sampleFpsTargetDurationMs = undefined;
         sampleObservedFps = undefined;
+        sampleObservedFpsAtTargetDuration = undefined;
         sampleRenderFramesPresented = 0;
         sampleObservedRenderFps = undefined;
+        sampleObservedRenderFpsAtTargetDuration = undefined;
+        sampleRenderQueueReplacements = undefined;
+        sampleRenderPresentSkips = undefined;
         sampleFpsBaseline = undefined;
+        sampleFpsBaselineDeferred = false;
         await sleep(sampleIntervalMs);
         continue;
       }
       sampleDurationMs = now() - sampleStartedAt;
+      const renderPresentedFrames = mediaPipelineSnapshot.render_presented_frames;
+      const sampleFpsBaselineReady =
+        !displayWindow ||
+        typeof renderPresentedFrames !== "number" ||
+        renderPresentedFrames > 0;
+      if (!sampleFpsBaseline && !sampleFpsBaselineReady) {
+        sampleFpsBaselineDeferred = true;
+        await sleep(sampleIntervalMs);
+        continue;
+      }
       if (!sampleFpsBaseline) {
+        const waitForDeltaSample = sampleFpsBaselineDeferred;
         sampleFpsBaseline = {
           framesDecoded: probeSnapshot.frames_decoded,
           framesDropped: probeSnapshot.frames_dropped,
           sequenceGapDrops: probeSnapshot.sequence_gap_drops ?? 0,
           decodeErrorDrops: probeSnapshot.decode_error_drops ?? 0,
           transientDrops: probeSnapshot.transient_drops ?? 0,
-          renderPresentedFrames: mediaPipelineSnapshot.render_presented_frames ?? 0,
+          renderPresentedFrames: renderPresentedFrames ?? 0,
+          renderQueueReplacements: mediaPipelineSnapshot.render_queue_replacements ?? 0,
+          renderPresentSkips: mediaPipelineSnapshot.render_present_skips ?? 0,
           sampleDurationMs,
         };
+        sampleFpsBaselineDeferred = false;
+        if (waitForDeltaSample) {
+          await sleep(sampleIntervalMs);
+          continue;
+        }
       } else {
         sampleFramesDecoded = Math.max(
           0,
@@ -694,11 +754,20 @@ export async function runLanE2EAutomation(
           0,
           (probeSnapshot.transient_drops ?? 0) - sampleFpsBaseline.transientDrops
         );
-        const sampleFpsElapsedMs =
+        sampleFpsElapsedMs =
           sampleDurationMs - sampleFpsBaseline.sampleDurationMs;
         sampleObservedFps =
           sampleFpsElapsedMs > 0
             ? (sampleFramesDecoded * 1000) / sampleFpsElapsedMs
+            : undefined;
+        sampleFpsTargetDurationMs =
+          minSampleDurationMs > 0 &&
+          isWithinSampleDurationTolerance(sampleFpsElapsedMs, minSampleDurationMs)
+            ? minSampleDurationMs
+            : undefined;
+        sampleObservedFpsAtTargetDuration =
+          sampleFpsTargetDurationMs != null
+            ? (sampleFramesDecoded * 1000) / sampleFpsTargetDurationMs
             : undefined;
         sampleRenderFramesPresented = Math.max(
           0,
@@ -709,6 +778,20 @@ export async function runLanE2EAutomation(
           sampleFpsElapsedMs > 0
             ? (sampleRenderFramesPresented * 1000) / sampleFpsElapsedMs
             : undefined;
+        sampleObservedRenderFpsAtTargetDuration =
+          sampleFpsTargetDurationMs != null
+            ? (sampleRenderFramesPresented * 1000) / sampleFpsTargetDurationMs
+            : undefined;
+        sampleRenderQueueReplacements = Math.max(
+          0,
+          (mediaPipelineSnapshot.render_queue_replacements ?? 0) -
+            sampleFpsBaseline.renderQueueReplacements
+        );
+        sampleRenderPresentSkips = Math.max(
+          0,
+          (mediaPipelineSnapshot.render_present_skips ?? 0) -
+            sampleFpsBaseline.renderPresentSkips
+        );
       }
       const fpsForThreshold = sampleObservedFps ?? probeSnapshot.current_fps ?? 0;
 
@@ -728,8 +811,11 @@ export async function runLanE2EAutomation(
         validationMode
       );
       const profileMismatch = describeProfileProbeFailure(profileProbeResult);
+      const sampleReadinessDurationMs = sampleFpsBaseline
+        ? sampleFpsElapsedMs ?? 0
+        : sampleDurationMs;
       const sampleDurationReady = hasReachedSampleDuration(
-        sampleDurationMs,
+        sampleReadinessDurationMs,
         minSampleDurationMs
       );
       if (!options.adaptive && profileMismatch && sampleDurationReady) {
@@ -763,7 +849,8 @@ export async function runLanE2EAutomation(
     }
 
     const finalFps = sampleObservedFps ?? probeSnapshot?.current_fps ?? 0;
-    const message = `LAN ${formatValidationMode(validationMode)} did not reach threshold: decoded ${probeSnapshot?.frames_decoded ?? 0}/${minDecodedFrames}, fps ${finalFps}/${minFps}, sample ${sampleDurationMs}/${minSampleDurationMs} ms`;
+    const finalSampleDurationMs = sampleFpsElapsedMs ?? sampleDurationMs;
+    const message = `LAN ${formatValidationMode(validationMode)} did not reach threshold: decoded ${probeSnapshot?.frames_decoded ?? 0}/${minDecodedFrames}, fps ${finalFps}/${minFps}, sample ${finalSampleDurationMs}/${minSampleDurationMs} ms`;
     stage("assert", "failed", message);
     return finish("failed", "no_remote_frames", message);
   } catch (error) {
@@ -901,6 +988,14 @@ function hasReachedSampleDuration(
   minSampleDurationMs: number
 ): boolean {
   return sampleDurationMs + sampleDurationToleranceFor(minSampleDurationMs) >= minSampleDurationMs;
+}
+
+function isWithinSampleDurationTolerance(
+  sampleDurationMs: number,
+  targetDurationMs: number
+): boolean {
+  const toleranceMs = sampleDurationToleranceFor(targetDurationMs);
+  return Math.abs(sampleDurationMs - targetDurationMs) <= toleranceMs;
 }
 
 function sampleDurationToleranceFor(minSampleDurationMs: number): number {
@@ -1362,9 +1457,26 @@ function peerSupportsTransport(peer: LanPeerInfo, transportKind: string): boolea
 }
 
 function defaultLanMediaProfileForPeer(peer: LanPeerInfo): MediaProfile {
+  if (peerSupportsMacosNativeH264(peer)) {
+    return { ...DEFAULT_LAN_MACOS_H264_MEDIA_PROFILE };
+  }
   return peerSupportsHevcMain(peer)
     ? { ...DEFAULT_LAN_HEVC_MEDIA_PROFILE }
     : { ...DEFAULT_LAN_H264_FALLBACK_MEDIA_PROFILE };
+}
+
+function peerSupportsMacosNativeH264(peer: LanPeerInfo): boolean {
+  const mediaCapabilities = (peer.media_capabilities ?? []).map((capability) =>
+    capability.toLowerCase()
+  );
+  const macosProfile = REQUIRED_PLATFORM_MEDIA_CAPABILITY_PROFILES.find(
+    (profile) => profile.id === "macos"
+  );
+  return (
+    macosProfile?.capabilities.every((capability) =>
+      mediaCapabilities.includes(capability.toLowerCase())
+    ) ?? false
+  );
 }
 
 function peerSupportsHevcMain(peer: LanPeerInfo): boolean {

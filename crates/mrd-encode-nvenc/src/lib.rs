@@ -1145,6 +1145,10 @@ mod imp {
             FrameMemoryKind::D3D11SharedBgra
         }
 
+        fn request_keyframe(&mut self) {
+            NvencH264Encoder::request_keyframe(self);
+        }
+
         fn encode(
             &mut self,
             frame: &CapturedFrame,

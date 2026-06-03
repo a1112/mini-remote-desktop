@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Play, Square, Monitor, Palette, Layers, ImageOff } from "lucide-react";
 import * as commands from "../../adapters/tauri/commands";
-import type { EnvironmentSnapshot, FrameData, MetricSeries, TestConfig } from "../../adapters/tauri/types";
+import type { EnvironmentSnapshot, MetricSeries, TestConfig } from "../../adapters/tauri/types";
 import { capabilityAvailable, capabilityTag, chooseCapability, unavailableText } from "./capabilityMeta";
 import {
   buildCapabilitySnapshotFromIpc,
@@ -115,10 +115,6 @@ export function RenderTestPage() {
   const [serviceCapabilitySnapshot, setServiceCapabilitySnapshot] =
     useState<CapabilitySnapshot | null>(null);
   const [startError, setStartError] = useState<string | null>(null);
-  const [previewFrame, setPreviewFrame] = useState<FrameData | null>(null);
-  const lastCapturedGenerationRef = useRef<number | undefined>(undefined);
-  const lastRenderedGenerationRef = useRef<number | undefined>(undefined);
-  const frameRequestInFlightRef = useRef(false);
   const [showUnavailable] = useShowUnavailableCapabilities();
 
   const selectedOption = RENDERER_OPTIONS.find((o) => o.id === selectedRenderer);
@@ -268,24 +264,6 @@ export function RenderTestPage() {
           });
         }
 
-        if (!frameRequestInFlightRef.current) {
-          frameRequestInFlightRef.current = true;
-          const framesResult = await commands.testHarnessGetFrames({
-            includeCaptured: false,
-            includeRendered: true,
-            lastCapturedGeneration: lastCapturedGenerationRef.current,
-            lastRenderedGeneration: lastRenderedGenerationRef.current,
-          });
-          frameRequestInFlightRef.current = false;
-
-          if (framesResult.ok) {
-            const [capturedFrame, renderedFrame] = framesResult.value;
-            const nextFrame = renderedFrame ?? capturedFrame ?? null;
-            if (renderedFrame) lastRenderedGenerationRef.current = renderedFrame[3];
-            if (capturedFrame) lastCapturedGenerationRef.current = capturedFrame[3];
-            if (nextFrame) setPreviewFrame(nextFrame);
-          }
-        }
       }
 
       if (currentRunId) {
@@ -337,10 +315,6 @@ export function RenderTestPage() {
     }
 
     setMetrics(null);
-    setPreviewFrame(null);
-    lastCapturedGenerationRef.current = undefined;
-    lastRenderedGenerationRef.current = undefined;
-    frameRequestInFlightRef.current = false;
     setStartError(null);
     setCurrentRunId(null);
     setCurrentRunUsesProbe(false);
@@ -594,16 +568,10 @@ export function RenderTestPage() {
         <div className="aspect-video rounded bg-black flex items-center justify-center overflow-hidden">
           {currentRunUsesWebView && isRunning ? (
             <WebViewRenderPreview mode={selectedMode} onSample={handleWebViewRenderSample} />
-          ) : previewFrame ? (
-            <img
-              src={`data:image/png;base64,${previewFrame[0]}`}
-              alt="Render preview"
-              className="h-full w-full object-contain"
-            />
           ) : (
             <div className="text-center text-sm text-muted-foreground">
               <ImageOff className="mx-auto mb-2 h-8 w-8" />
-              {isRunning ? "等待渲染帧..." : "启动测试后显示渲染输入帧"}
+              {isRunning ? "图片预览已封印，查看原生渲染窗口和指标" : "启动测试后查看原生渲染指标"}
             </div>
           )}
         </div>
@@ -612,7 +580,7 @@ export function RenderTestPage() {
             ? "WebView 测试直接嵌套在实时画面区域，覆盖浏览器合成、CSS 动画和页面绘制路径。"
             : isIndependentRenderProbe(selectedRenderer)
             ? "D3D12/OpenGL 当前执行独立渲染 probe；启动后会弹出原生渲染窗口，指标来自后端可见窗口渲染循环。"
-            : "预览来自测试 harness 的最新渲染输入帧；原生渲染器仍按所选后端执行上传/呈现链路。"}
+            : "测试不再导出 PNG/base64 预览帧；原生渲染器按所选后端执行上传/呈现链路，结果通过指标和原生窗口验证。"}
         </p>
       </div>
 

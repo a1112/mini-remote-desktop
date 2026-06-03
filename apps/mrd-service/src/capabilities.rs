@@ -563,6 +563,14 @@ fn add_encode_capabilities(
             "VideoToolbox H.264",
             "VideoToolbox encode is wired in the Rdesk harness path.",
         );
+        push_supported(
+            items,
+            platform,
+            CapabilityDomain::Encode,
+            "encode.videotoolbox_hevc",
+            "VideoToolbox HEVC",
+            "VideoToolbox HEVC encode is wired in the Rdesk harness path.",
+        );
     }
 }
 
@@ -742,14 +750,13 @@ fn add_decode_capabilities(
     }
 
     if matches!(platform, CapabilityPlatform::Macos) {
-        push_item(
+        push_supported(
             items,
             platform,
             CapabilityDomain::Decode,
             "decode.videotoolbox",
             "VideoToolbox decode",
-            CapabilityStatus::Unimplemented,
-            Some("VideoToolbox decode is planned for native macOS parity but is not wired as a service-owned decode path."),
+            "VideoToolbox H.264 decode is wired for the macOS LAN media receiver path.",
         );
     }
 
@@ -893,7 +900,7 @@ fn add_memory_capabilities(
 fn static_nvenc_status(platform: &CapabilityPlatform, label: &str) -> (CapabilityStatus, String) {
     if matches!(
         platform,
-        CapabilityPlatform::Windows | CapabilityPlatform::Linux
+        CapabilityPlatform::Windows | CapabilityPlatform::Linux | CapabilityPlatform::Macos
     ) {
         (
             CapabilityStatus::Supported,
@@ -1368,7 +1375,7 @@ fn add_service_capabilities(
     );
     if matches!(
         platform,
-        CapabilityPlatform::Windows | CapabilityPlatform::Linux
+        CapabilityPlatform::Windows | CapabilityPlatform::Linux | CapabilityPlatform::Macos
     ) {
         push_supported(
             items,
@@ -1508,6 +1515,39 @@ fn default_profiles() -> Vec<CapabilityProfile> {
                 "media.hevc_main_420_8bit",
                 "render.d3d11",
                 "memory.d3d11_shared",
+                "transport.quic_datagram",
+                "transport.media_profile_control_v1",
+            ],
+        ),
+        profile(
+            "lan.macos.2k144",
+            2560,
+            1440,
+            144,
+            80,
+            "h264",
+            vec![
+                "capture.macos",
+                "encode.videotoolbox_h264",
+                "decode.videotoolbox",
+                "memory.cpu",
+                "transport.quic_datagram",
+                "transport.media_profile_control_v1",
+            ],
+        ),
+        profile(
+            "lan.macos.hevc.2k144",
+            2560,
+            1440,
+            144,
+            40,
+            "hevc",
+            vec![
+                "capture.macos",
+                "encode.videotoolbox_hevc",
+                "decode.videotoolbox",
+                "media.hevc_main_420_8bit",
+                "memory.cpu",
                 "transport.quic_datagram",
                 "transport.media_profile_control_v1",
             ],
@@ -1810,7 +1850,7 @@ mod tests {
     }
 
     #[test]
-    fn planned_macos_videotoolbox_decode_is_not_advertised_as_runnable() {
+    fn macos_videotoolbox_decode_is_advertised_for_lan_receiver_path() {
         let capabilities =
             local_capabilities(CapabilityPlatform::Macos, CapabilityProbeMode::Static);
         let decode = capabilities
@@ -1818,7 +1858,92 @@ mod tests {
             .find(|item| item.id == "decode.videotoolbox")
             .expect("macOS VideoToolbox decode capability");
 
-        assert_eq!(decode.status, CapabilityStatus::Unimplemented);
+        assert_eq!(decode.status, CapabilityStatus::Supported);
+    }
+
+    #[test]
+    fn macos_videotoolbox_hevc_encode_is_advertised_for_lan_sender_path() {
+        let capabilities =
+            local_capabilities(CapabilityPlatform::Macos, CapabilityProbeMode::Static);
+        let encode = capabilities
+            .iter()
+            .find(|item| item.id == "encode.videotoolbox_hevc")
+            .expect("macOS VideoToolbox HEVC encode capability");
+
+        assert_eq!(encode.status, CapabilityStatus::Supported);
+    }
+
+    #[test]
+    fn macos_hevc_main_media_profile_capability_is_advertised() {
+        let capabilities =
+            local_capabilities(CapabilityPlatform::Macos, CapabilityProbeMode::Static);
+        let media = capabilities
+            .iter()
+            .find(|item| item.id == "media.hevc_main_420_8bit")
+            .expect("macOS HEVC Main 8-bit 4:2:0 media capability");
+
+        assert_eq!(media.status, CapabilityStatus::Supported);
+    }
+
+    #[test]
+    fn macos_snapshot_exposes_native_2k144_profile() {
+        let snapshot = local_capability_snapshot_static();
+
+        let profile = snapshot
+            .profiles
+            .iter()
+            .find(|profile| profile.id == "lan.macos.2k144")
+            .expect("lan.macos.2k144 profile");
+
+        assert_eq!(profile.width, 2560);
+        assert_eq!(profile.height, 1440);
+        assert_eq!(profile.fps, 144);
+        assert_eq!(profile.bitrate_mbps, 80);
+        assert_eq!(profile.codec, "h264");
+        assert!(profile
+            .required_capabilities
+            .contains(&"capture.macos".to_string()));
+        assert!(profile
+            .required_capabilities
+            .contains(&"encode.videotoolbox_h264".to_string()));
+        assert!(profile
+            .required_capabilities
+            .contains(&"decode.videotoolbox".to_string()));
+        assert!(!profile
+            .required_capabilities
+            .contains(&"render.macos".to_string()));
+    }
+
+    #[test]
+    fn macos_snapshot_exposes_native_hevc_2k144_profile() {
+        let snapshot = local_capability_snapshot_static();
+
+        let profile = snapshot
+            .profiles
+            .iter()
+            .find(|profile| profile.id == "lan.macos.hevc.2k144")
+            .expect("lan.macos.hevc.2k144 profile");
+
+        assert_eq!(profile.width, 2560);
+        assert_eq!(profile.height, 1440);
+        assert_eq!(profile.fps, 144);
+        assert_eq!(profile.bitrate_mbps, 40);
+        assert_eq!(profile.codec, "hevc");
+        assert!(profile
+            .required_capabilities
+            .contains(&"encode.videotoolbox_hevc".to_string()));
+        assert!(profile
+            .required_capabilities
+            .contains(&"decode.videotoolbox".to_string()));
+        assert!(profile
+            .required_capabilities
+            .contains(&"media.hevc_main_420_8bit".to_string()));
+        assert!(!profile
+            .required_capabilities
+            .contains(&"encode.nvenc_hevc".to_string()));
+        assert!(!profile
+            .required_capabilities
+            .contains(&"render.d3d11".to_string()));
     }
 
     #[test]

@@ -12,11 +12,30 @@ import { deriveTestClassification } from "./testClassificationService";
 export function summaryFromLanE2EReport(report: LanE2EAutomationReport): TestRunSummary {
   const probe = report.probeSnapshot;
   const adaptation = report.mediaAdaptationSnapshot ?? report.mediaPipelineSnapshot?.adaptation;
+  const renderFrameCount = report.sampleRenderFramesPresented;
+  const renderQueueReplacements =
+    report.sampleRenderQueueReplacements ??
+    report.mediaPipelineSnapshot?.render_queue_replacements;
+  const renderPresentSkips =
+    report.sampleRenderPresentSkips ??
+    report.mediaPipelineSnapshot?.render_present_skips;
   return {
     total_duration_ms: Math.max(0, report.finishedAt - report.startedAt),
-    capture_fps: report.sampleObservedFps ?? probe?.current_fps ?? undefined,
+    capture_fps:
+      report.sampleObservedFpsAtTargetDuration ??
+      report.sampleObservedFps ??
+      probe?.current_fps ??
+      undefined,
     dropped_frames: report.sampleFramesDropped ?? probe?.frames_dropped ?? 0,
     frame_count: report.sampleFramesDecoded ?? probe?.frames_decoded ?? 0,
+    render_fps:
+      report.sampleObservedRenderFpsAtTargetDuration ??
+      report.sampleObservedRenderFps,
+    render_frame_count: renderFrameCount,
+    render_queue_replacements: renderQueueReplacements,
+    render_queue_replacement_ratio: finiteRatio(renderQueueReplacements, renderFrameCount),
+    render_present_skips: renderPresentSkips,
+    render_present_skip_ratio: finiteRatio(renderPresentSkips, renderFrameCount),
     adaptation_state: adaptation?.state,
     adaptation_ladder_index: adaptation?.ladder_index,
     adaptation_current_profile: adaptation
@@ -29,6 +48,19 @@ export function summaryFromLanE2EReport(report: LanE2EAutomationReport): TestRun
     error_message: report.errorMessage,
     failure_reason: report.failureReason ? "validation_failure" : undefined,
   };
+}
+
+function finiteRatio(numerator: number | undefined, denominator: number | undefined) {
+  if (
+    typeof numerator !== "number" ||
+    typeof denominator !== "number" ||
+    !Number.isFinite(numerator) ||
+    !Number.isFinite(denominator) ||
+    denominator <= 0
+  ) {
+    return undefined;
+  }
+  return numerator / denominator;
 }
 
 export function externalRunRecordFromLanE2EReport(

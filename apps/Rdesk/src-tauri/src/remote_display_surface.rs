@@ -79,6 +79,13 @@ impl RemoteDisplaySurfaceManager {
     ) -> Result<NativeRenderSurfaceSnapshot, String> {
         let label = window.label().to_string();
         let rect = normalize_rect(rect);
+        let mode = macos_native_surface_mode();
+        if mode.uses_overlay_window() && macos_native_surface_debug_logging_enabled() {
+            eprintln!(
+                "render-surface macos {mode:?} configure label={label} enabled={enabled} visible={visible} rect={rect:?} existing={}",
+                self.surfaces.contains_key(&label)
+            );
+        }
 
         if !enabled {
             if let Some(surface) = self.surfaces.remove(&label) {
@@ -103,6 +110,13 @@ impl RemoteDisplaySurfaceManager {
             .ns_view()
             .map_err(|error| format!("get remote display WebView NSView failed: {error}"))?
             as isize;
+        if mode.uses_overlay_window() && macos_native_surface_debug_logging_enabled() {
+            eprintln!(
+                "render-surface macos {mode:?} handles label={label} parent={} webview={}",
+                handle_hex(parent_ns_window),
+                handle_hex(webview_ns_view)
+            );
+        }
 
         if let Some(surface) = self.surfaces.get_mut(&label) {
             surface.move_to(window, rect, visible)?;
@@ -1687,7 +1701,34 @@ struct NativeRenderSurface {
     parent_ns_window: isize,
     webview_ns_view: isize,
     ns_view: isize,
+    overlay_ns_window: Option<isize>,
+    mode: MacosNativeSurfaceMode,
+    rect: NativeSurfaceRect,
     visible: bool,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MacosNativeSurfaceMode {
+    ChildView,
+    ChildWindow,
+    TopLevelWindow,
+}
+
+#[cfg(target_os = "macos")]
+impl MacosNativeSurfaceMode {
+    fn uses_overlay_window(self) -> bool {
+        matches!(
+            self,
+            MacosNativeSurfaceMode::ChildWindow | MacosNativeSurfaceMode::TopLevelWindow
+        )
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct MacosNativeSurfaceHandles {
+    ns_view: isize,
+    overlay_ns_window: Option<isize>,
 }
 
 #[cfg(target_os = "macos")]
@@ -1699,14 +1740,18 @@ impl NativeRenderSurface {
         rect: NativeSurfaceRect,
         visible: bool,
     ) -> Result<Self, String> {
-        let ns_view = run_on_main_thread(window, move || unsafe {
-            create_macos_native_surface(parent_ns_window, webview_ns_view, rect, visible)
+        let mode = macos_native_surface_mode();
+        let handles = run_on_main_thread(window, move || unsafe {
+            create_macos_native_surface(mode, parent_ns_window, webview_ns_view, rect, visible)
         })?;
 
         Ok(Self {
             parent_ns_window,
             webview_ns_view,
-            ns_view,
+            ns_view: handles.ns_view,
+            overlay_ns_window: handles.overlay_ns_window,
+            mode,
+            rect,
             visible,
         })
     }
@@ -1717,20 +1762,48 @@ impl NativeRenderSurface {
         rect: NativeSurfaceRect,
         visible: bool,
     ) -> Result<(), String> {
+        if self.overlay_ns_window.is_some() && macos_native_surface_debug_logging_enabled() {
+            eprintln!(
+                "render-surface macos {:?} move current_rect={:?} next_rect={rect:?} current_visible={} next_visible={visible}",
+                self.mode, self.rect, self.visible
+            );
+        }
+        if self.rect == rect && self.visible == visible {
+            if self.overlay_ns_window.is_some() && macos_native_surface_debug_logging_enabled() {
+                eprintln!(
+                    "render-surface macos {:?} move skipped unchanged",
+                    self.mode
+                );
+            }
+            return Ok(());
+        }
         let ns_view = self.ns_view;
+        let overlay_ns_window = self.overlay_ns_window;
         let parent_ns_window = self.parent_ns_window;
         let webview_ns_view = self.webview_ns_view;
+        let mode = self.mode;
         run_on_main_thread(window, move || unsafe {
-            move_macos_native_surface(parent_ns_window, webview_ns_view, ns_view, rect, visible)
+            move_macos_native_surface(
+                mode,
+                parent_ns_window,
+                webview_ns_view,
+                ns_view,
+                overlay_ns_window,
+                rect,
+                visible,
+            )
         })?;
+        self.rect = rect;
         self.visible = visible;
         Ok(())
     }
 
     fn remove(self, window: &WebviewWindow) -> Result<(), String> {
         let ns_view = self.ns_view;
+        let overlay_ns_window = self.overlay_ns_window;
+        let mode = self.mode;
         run_on_main_thread(window, move || unsafe {
-            remove_macos_native_surface(ns_view);
+            remove_macos_native_surface(self.parent_ns_window, ns_view, overlay_ns_window, mode);
             Ok(())
         })
     }
@@ -1773,16 +1846,20 @@ where
 #[cfg(target_os = "macos")]
 #[allow(deprecated, unexpected_cfgs)]
 unsafe fn create_macos_native_surface(
+    mode: MacosNativeSurfaceMode,
     parent_ns_window: isize,
     webview_ns_view: isize,
     rect: NativeSurfaceRect,
     visible: bool,
-) -> Result<isize, String> {
+) -> Result<MacosNativeSurfaceHandles, String> {
     use cocoa::{
-        appkit::{NSView, NSWindowOrderingMode},
+        appkit::{
+            NSBackingStoreBuffered, NSView, NSWindow, NSWindowOrderingMode, NSWindowStyleMask,
+        },
         base::{id, nil, NO, YES},
+        foundation::{NSPoint, NSRect, NSSize},
     };
-    use objc::{msg_send, sel, sel_impl};
+    use objc::{class, msg_send, sel, sel_impl};
 
     let ns_window = parent_ns_window as id;
     let webview = webview_ns_view as id;
@@ -1796,6 +1873,89 @@ unsafe fn create_macos_native_surface(
     }
 
     let frame = rect_to_content_view_frame(content_view, webview, rect);
+    let fullscreen = macos_native_surface_fullscreen_enabled(mode);
+    if mode.uses_overlay_window() {
+        if macos_native_surface_debug_logging_enabled() {
+            eprintln!(
+                "render-surface macos {mode:?} create rect={rect:?} frame=({}, {}, {}, {}) visible={visible} fullscreen={fullscreen}",
+                frame.origin.x, frame.origin.y, frame.size.width, frame.size.height
+            );
+        }
+        let window_frame: NSRect = msg_send![content_view, convertRect: frame toView: nil];
+        let requested_screen_frame: NSRect =
+            msg_send![ns_window, convertRectToScreen: window_frame];
+        let surface_frame =
+            macos_overlay_surface_frame(ns_window, requested_screen_frame, fullscreen);
+        if macos_native_surface_debug_logging_enabled() {
+            eprintln!(
+                "render-surface macos {mode:?} create surface_frame=({}, {}, {}, {}) requested_screen_frame=({}, {}, {}, {})",
+                surface_frame.origin.x,
+                surface_frame.origin.y,
+                surface_frame.size.width,
+                surface_frame.size.height,
+                requested_screen_frame.origin.x,
+                requested_screen_frame.origin.y,
+                requested_screen_frame.size.width,
+                requested_screen_frame.size.height
+            );
+        }
+        let overlay_window: id = NSWindow::alloc(nil).initWithContentRect_styleMask_backing_defer_(
+            surface_frame,
+            NSWindowStyleMask::NSBorderlessWindowMask,
+            NSBackingStoreBuffered,
+            NO,
+        );
+        if overlay_window == nil {
+            return Err("create macOS native render child NSWindow failed".to_string());
+        }
+        let child_frame = NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(surface_frame.size.width, surface_frame.size.height),
+        );
+        let view: id = NSView::alloc(nil).initWithFrame_(child_frame);
+        if view == nil {
+            let _: () = msg_send![overlay_window, release];
+            return Err("create macOS native render child-window NSView failed".to_string());
+        }
+
+        let _: () = msg_send![overlay_window, setReleasedWhenClosed: NO];
+        view.setWantsLayer(YES);
+        view.setAutoresizingMask_(0);
+        overlay_window.setContentView_(view);
+        let _: () = msg_send![overlay_window, setOpaque: YES];
+        if mode == MacosNativeSurfaceMode::ChildWindow {
+            let _: () = msg_send![
+                ns_window,
+                addChildWindow: overlay_window
+                ordered: NSWindowOrderingMode::NSWindowAbove
+            ];
+        }
+        let activate_on_create = mode == MacosNativeSurfaceMode::TopLevelWindow
+            && (fullscreen || macos_native_surface_activate_on_create_enabled());
+        if activate_on_create {
+            let app: id = msg_send![class!(NSApplication), sharedApplication];
+            if app != nil {
+                let _: () = msg_send![app, activateIgnoringOtherApps: YES];
+            }
+            let _: () = msg_send![ns_window, makeKeyAndOrderFront: nil];
+        }
+        if visible {
+            if activate_on_create {
+                let _: () = msg_send![overlay_window, orderFrontRegardless];
+            } else {
+                let _: () = msg_send![overlay_window, orderFront: nil];
+            }
+        } else {
+            let _: () = msg_send![overlay_window, orderOut: nil];
+        }
+        // Keep one retain count owned by the surface manager until remove().
+        let _: id = msg_send![view, retain];
+        return Ok(MacosNativeSurfaceHandles {
+            ns_view: view as isize,
+            overlay_ns_window: Some(overlay_window as isize),
+        });
+    }
+
     let view: id = NSView::alloc(nil).initWithFrame_(frame);
     if view == nil {
         return Err("create macOS native render NSView failed".to_string());
@@ -1814,15 +1974,20 @@ unsafe fn create_macos_native_surface(
 
     // Keep one retain count owned by the surface manager until remove().
     let _: id = msg_send![view, retain];
-    Ok(view as isize)
+    Ok(MacosNativeSurfaceHandles {
+        ns_view: view as isize,
+        overlay_ns_window: None,
+    })
 }
 
 #[cfg(target_os = "macos")]
 #[allow(deprecated, unexpected_cfgs)]
 unsafe fn move_macos_native_surface(
+    mode: MacosNativeSurfaceMode,
     parent_ns_window: isize,
     webview_ns_view: isize,
     ns_view: isize,
+    overlay_ns_window: Option<isize>,
     rect: NativeSurfaceRect,
     visible: bool,
 ) -> Result<(), String> {
@@ -1845,6 +2010,65 @@ unsafe fn move_macos_native_surface(
     }
 
     let frame = rect_to_content_view_frame(content_view, webview, rect);
+    let fullscreen = macos_native_surface_fullscreen_enabled(mode);
+    if let Some(overlay_ns_window) = overlay_ns_window {
+        let overlay_window = overlay_ns_window as id;
+        if overlay_window == nil {
+            return Err("macOS native surface child window pointer is null".to_string());
+        }
+        if macos_native_surface_debug_logging_enabled() {
+            eprintln!(
+                "render-surface macos {mode:?} move begin rect={rect:?} frame=({}, {}, {}, {}) visible={visible} fullscreen={fullscreen}",
+                frame.origin.x, frame.origin.y, frame.size.width, frame.size.height
+            );
+        }
+        let window_frame: cocoa::foundation::NSRect =
+            msg_send![content_view, convertRect: frame toView: nil];
+        let requested_screen_frame: cocoa::foundation::NSRect =
+            msg_send![ns_window, convertRectToScreen: window_frame];
+        let surface_frame =
+            macos_overlay_surface_frame(ns_window, requested_screen_frame, fullscreen);
+        if macos_native_surface_debug_logging_enabled() {
+            eprintln!(
+                "render-surface macos {mode:?} move surface_frame=({}, {}, {}, {}) requested_screen_frame=({}, {}, {}, {})",
+                surface_frame.origin.x,
+                surface_frame.origin.y,
+                surface_frame.size.width,
+                surface_frame.size.height,
+                requested_screen_frame.origin.x,
+                requested_screen_frame.origin.y,
+                requested_screen_frame.size.width,
+                requested_screen_frame.size.height
+            );
+        }
+        let _: () = msg_send![overlay_window, setFrame: surface_frame display: YES];
+        if macos_native_surface_debug_logging_enabled() {
+            eprintln!("render-surface macos {mode:?} move setFrame ok");
+        }
+        view.setFrameOrigin(cocoa::foundation::NSPoint::new(0.0, 0.0));
+        view.setFrameSize(surface_frame.size);
+        if macos_native_surface_debug_logging_enabled() {
+            eprintln!("render-surface macos {mode:?} move resize view ok");
+        }
+        if visible {
+            if fullscreen {
+                let _: () = msg_send![overlay_window, orderFrontRegardless];
+            } else {
+                let _: () = msg_send![overlay_window, orderFront: nil];
+            }
+        } else {
+            let _: () = msg_send![overlay_window, orderOut: nil];
+        }
+        if macos_native_surface_debug_logging_enabled() {
+            eprintln!("render-surface macos {mode:?} move visibility ok");
+        }
+        sync_macos_surface_layer_frame(view);
+        if macos_native_surface_debug_logging_enabled() {
+            eprintln!("render-surface macos {mode:?} move sync layer ok");
+        }
+        return Ok(());
+    }
+
     view.setFrameOrigin(frame.origin);
     view.setFrameSize(frame.size);
     let _: () = msg_send![view, setHidden: if visible { NO } else { YES }];
@@ -1860,15 +2084,122 @@ unsafe fn move_macos_native_surface(
 
 #[cfg(target_os = "macos")]
 #[allow(deprecated, unexpected_cfgs)]
-unsafe fn remove_macos_native_surface(ns_view: isize) {
+unsafe fn remove_macos_native_surface(
+    parent_ns_window: isize,
+    ns_view: isize,
+    overlay_ns_window: Option<isize>,
+    mode: MacosNativeSurfaceMode,
+) {
     use cocoa::{appkit::NSView, base::id};
     use objc::{msg_send, sel, sel_impl};
+
+    if let Some(overlay_ns_window) = overlay_ns_window {
+        let parent_window = parent_ns_window as id;
+        let overlay_window = overlay_ns_window as id;
+        if !parent_window.is_null() && !overlay_window.is_null() {
+            if mode == MacosNativeSurfaceMode::ChildWindow {
+                let _: () = msg_send![parent_window, removeChildWindow: overlay_window];
+            }
+            let _: () = msg_send![overlay_window, orderOut: cocoa::base::nil];
+            let _: () = msg_send![overlay_window, close];
+            let _: () = msg_send![overlay_window, release];
+        }
+    }
 
     let view = ns_view as id;
     if !view.is_null() {
         view.removeFromSuperview();
         let _: () = msg_send![view, release];
     }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_native_surface_mode() -> MacosNativeSurfaceMode {
+    match std::env::var("MRD_MACOS_NATIVE_SURFACE_MODE")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+    {
+        Some(value) if matches!(value.as_str(), "child_window" | "window" | "overlay_window") => {
+            MacosNativeSurfaceMode::ChildWindow
+        }
+        Some(value)
+            if matches!(
+                value.as_str(),
+                "top_level_window" | "top-level-window" | "detached_window" | "dedicated_window"
+            ) =>
+        {
+            MacosNativeSurfaceMode::TopLevelWindow
+        }
+        _ => MacosNativeSurfaceMode::ChildView,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_native_surface_fullscreen_enabled(mode: MacosNativeSurfaceMode) -> bool {
+    mode == MacosNativeSurfaceMode::TopLevelWindow
+        && macos_env_flag_enabled("MRD_MACOS_NATIVE_SURFACE_FULLSCREEN")
+}
+
+#[cfg(target_os = "macos")]
+fn macos_native_surface_debug_logging_enabled() -> bool {
+    macos_env_flag_enabled("MRD_MACOS_NATIVE_SURFACE_DEBUG")
+}
+
+#[cfg(target_os = "macos")]
+fn macos_native_surface_activate_on_create_enabled() -> bool {
+    macos_env_flag_enabled("MRD_MACOS_NATIVE_SURFACE_ACTIVATE_ON_CREATE")
+}
+
+#[cfg(target_os = "macos")]
+fn macos_env_flag_enabled(name: &str) -> bool {
+    matches!(
+        std::env::var(name)
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+#[cfg(target_os = "macos")]
+#[allow(deprecated)]
+unsafe fn macos_overlay_surface_frame(
+    ns_window: cocoa::base::id,
+    requested_screen_frame: cocoa::foundation::NSRect,
+    fullscreen: bool,
+) -> cocoa::foundation::NSRect {
+    if !fullscreen {
+        return requested_screen_frame;
+    }
+    macos_window_screen_frame(ns_window).unwrap_or(requested_screen_frame)
+}
+
+#[cfg(target_os = "macos")]
+#[allow(deprecated)]
+unsafe fn macos_window_screen_frame(
+    ns_window: cocoa::base::id,
+) -> Option<cocoa::foundation::NSRect> {
+    use cocoa::base::{id, nil};
+    use objc::{class, msg_send, sel, sel_impl};
+
+    let screen: id = if ns_window == nil {
+        nil
+    } else {
+        msg_send![ns_window, screen]
+    };
+    let screen: id = if screen == nil {
+        msg_send![class!(NSScreen), mainScreen]
+    } else {
+        screen
+    };
+    if screen == nil {
+        return None;
+    }
+    Some(msg_send![screen, frame])
 }
 
 #[cfg(target_os = "macos")]

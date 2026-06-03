@@ -111,7 +111,7 @@ describe("buildCapabilitySnapshotFromEnvironment", () => {
     expect(statusOf(snapshot, "render.linux")).toBe("available");
   });
 
-  it("does not mark planned VideoToolbox decode as available from legacy fallback", () => {
+  it("marks wired VideoToolbox decode as available from legacy fallback", () => {
     const snapshot = buildCapabilitySnapshotFromEnvironment({
       ...linuxEnvironment,
       os_type: "macos",
@@ -121,7 +121,7 @@ describe("buildCapabilitySnapshotFromEnvironment", () => {
       available_renderers: ["macos"],
     });
 
-    expect(statusOf(snapshot, "decode.videotoolbox")).toBe("unimplemented");
+    expect(statusOf(snapshot, "decode.videotoolbox")).toBe("available");
   });
 
   it("does not mark unwired NVENC AV1 encode as available from legacy fallback", () => {
@@ -686,6 +686,49 @@ describe("capability profiles", () => {
     expect(profile?.required_capabilities).toContain("transport.media_profile_control_v1");
   });
 
+  it("exposes a native macOS 2K144 profile", () => {
+    const profile = getCapabilityProfile("lan.macos.2k144");
+
+    expect(profile).toMatchObject({
+      id: "lan.macos.2k144",
+      width: 2560,
+      height: 1440,
+      fps: 144,
+      bitrate_mbps: 80,
+      codec: "h264",
+    });
+    expect(profile?.required_capabilities).toEqual([
+      "capture.macos",
+      "encode.videotoolbox_h264",
+      "decode.videotoolbox",
+      "memory.cpu",
+      "transport.quic_datagram",
+      "transport.media_profile_control_v1",
+    ]);
+  });
+
+  it("exposes a native macOS HEVC 2K144 profile tuned for VideoToolbox", () => {
+    const profile = getCapabilityProfile("lan.macos.hevc.2k144");
+
+    expect(profile).toMatchObject({
+      id: "lan.macos.hevc.2k144",
+      width: 2560,
+      height: 1440,
+      fps: 144,
+      bitrate_mbps: 40,
+      codec: "hevc",
+    });
+    expect(profile?.required_capabilities).toEqual([
+      "capture.macos",
+      "encode.videotoolbox_hevc",
+      "decode.videotoolbox",
+      "media.hevc_main_420_8bit",
+      "memory.cpu",
+      "transport.quic_datagram",
+      "transport.media_profile_control_v1",
+    ]);
+  });
+
   it("exposes a native 1600p165 LAN profile for 16:10 high-refresh peers", () => {
     const profile = getCapabilityProfile("lan.1600p165");
 
@@ -717,6 +760,26 @@ describe("capability profiles", () => {
     );
 
     const result = evaluateProfileSupport("lan.2k144", snapshot);
+
+    expect(result.status).toBe("ready");
+    expect(result.reasons).toEqual([]);
+  });
+
+  it("marks the native macOS 2K144 profile ready on a complete macOS snapshot", () => {
+    const snapshot = withAvailableCapabilities(
+      buildCapabilitySnapshotFromEnvironment({
+        ...linuxEnvironment,
+        os_type: "macos",
+        available_captures: ["macos", "synthetic"],
+        available_encoders: ["videotoolbox_h264", "openh264"],
+        available_decoders: ["videotoolbox", "software"],
+        available_renderers: ["macos", "webview"],
+        available_memory_modes: ["cpu"],
+      }),
+      ["transport.quic_datagram", "transport.media_profile_control_v1"]
+    );
+
+    const result = evaluateProfileSupport("lan.macos.2k144", snapshot);
 
     expect(result.status).toBe("ready");
     expect(result.reasons).toEqual([]);

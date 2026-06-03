@@ -22,12 +22,11 @@ const baseTargets = [
   },
 ];
 
-const previewTargets = baseTargets.map((target) => ({
+const windowTargets = baseTargets.map((target) => ({
   ...target,
-  preview_data_url:
-    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAFgwJ/lHbX9QAAAABJRU5ErkJggg==",
-  preview_width: 1,
-  preview_height: 1,
+  preview_data_url: null,
+  preview_width: null,
+  preview_height: null,
 }));
 
 const windowsShareSources = [
@@ -43,7 +42,7 @@ const windowsShareSources = [
     is_primary: true,
     requires_system_picker: false,
   },
-  ...previewTargets.map((target) => ({
+  ...windowTargets.map((target) => ({
     id: `windows:window:${target.hwnd}`,
     platform: "windows",
     source_kind: "window",
@@ -57,9 +56,9 @@ const windowsShareSources = [
     hwnd: target.hwnd,
     class_name: target.class_name,
     process_id: target.process_id,
-    preview_data_url: target.preview_data_url,
-    preview_width: target.preview_width,
-    preview_height: target.preview_height,
+    preview_data_url: null,
+    preview_width: null,
+    preview_height: null,
   })),
 ];
 

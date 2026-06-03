@@ -1,5 +1,3 @@
-import { invoke } from "@tauri-apps/api/core";
-
 /**
  * Render host service
  *
@@ -18,7 +16,6 @@ export type RenderHostSnapshot = {
     pixel_format: string;
     bytes: number;
   } | null;
-  preview_data_url: string | null;
   renderer_backend: string | null;
   renderer_snapshot: {
     attached_to_target: boolean;

@@ -129,9 +129,9 @@ const remoteDisplaySource = {
   process_id: 0,
   app_name: "Display",
   bundle_identifier: null,
-  preview_data_url: "data:image/png;base64,BBBB",
-  preview_width: 240,
-  preview_height: 135,
+  preview_data_url: null,
+  preview_width: null,
+  preview_height: null,
 };
 
 const localDisplaySources = [
@@ -755,7 +755,7 @@ describe("RemoteDisplayWindowPage", () => {
           latest_frame_width: 2560,
           latest_frame_height: 1440,
           latest_frame_pixel_format: "d3d11_shared_nv12",
-          latest_frame_data_url: "data:image/png;base64,AAAA",
+          latest_frame_data_url: null,
           last_error: null,
         });
       }
@@ -873,7 +873,7 @@ describe("RemoteDisplayWindowPage", () => {
           latest_frame_width: 2560,
           latest_frame_height: 1440,
           latest_frame_pixel_format: "d3d11_shared_nv12",
-          latest_frame_data_url: "data:image/png;base64,AAAA",
+          latest_frame_data_url: null,
           last_error: null,
         });
       }
@@ -980,7 +980,7 @@ describe("RemoteDisplayWindowPage", () => {
           latest_frame_width: 1600,
           latest_frame_height: 900,
           latest_frame_pixel_format: "d3d11_shared_nv12",
-          latest_frame_data_url: "data:image/png;base64,AAAA",
+          latest_frame_data_url: null,
           last_error: null,
         });
       }
@@ -1093,7 +1093,7 @@ describe("RemoteDisplayWindowPage", () => {
           media_probe_height: 1440,
           latest_frame_width: 2560,
           latest_frame_height: 1440,
-          latest_frame_data_url: "data:image/png;base64,AAAA",
+          latest_frame_data_url: null,
           last_error: null,
         });
       }
@@ -1205,9 +1205,9 @@ describe("RemoteDisplayWindowPage", () => {
           session_id: "local-display-test-1",
           surface_id: "surface-1",
           role: "controller",
-          renderer_attached: false,
-          render_mode: "web",
-          native_surface_attached: false,
+          renderer_attached: true,
+          render_mode: "d3d11_native",
+          native_surface_attached: true,
           session_window_count: 1,
         });
       }
@@ -1428,6 +1428,20 @@ describe("RemoteDisplayWindowPage", () => {
           session_window_count: 1,
         });
       }
+      if (command === "configure_remote_display_native_surface") {
+        return Promise.resolve({
+          label: "render-local-display-test-1",
+          backend: "d3d11",
+          attached: true,
+          visible: true,
+          parent_hwnd: "0xA",
+          hwnd: "0x14",
+          rect: { x: 0, y: 56, width: 1280, height: 720 },
+        });
+      }
+      if (command === "present_test_harness_frame_on_native_surface") {
+        return Promise.resolve(true);
+      }
       if (command === "test_harness_stop") {
         return Promise.resolve(null);
       }
@@ -1454,7 +1468,7 @@ describe("RemoteDisplayWindowPage", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Start local pipeline test" }));
 
     await waitFor(() => {
-      expect(screen.getByText("测试运行状态丢失: run-missing")).toBeInTheDocument();
+      expect(screen.getAllByText("测试运行状态丢失: run-missing").length).toBeGreaterThan(0);
       expect(screen.getByRole("button", { name: "Start local pipeline test" })).toBeEnabled();
     });
   });
@@ -2506,9 +2520,6 @@ describe("RemoteDisplayWindowPage", () => {
           last_error: null,
         });
       }
-      if (command === "present_remote_preview_frame_on_native_surface") {
-        return Promise.resolve(true);
-      }
       if (command === "ipc_list_remote_capture_sources") {
         return Promise.resolve([remoteDisplaySource]);
       }
@@ -2797,9 +2808,9 @@ describe("RemoteDisplayWindowPage", () => {
             process_id: 4242,
             app_name: "Target App",
             bundle_identifier: null,
-            preview_data_url: "data:image/png;base64,AAAA",
-            preview_width: 240,
-            preview_height: 135,
+            preview_data_url: null,
+            preview_width: null,
+            preview_height: null,
           },
         ]);
       }
@@ -2843,11 +2854,12 @@ describe("RemoteDisplayWindowPage", () => {
         includePreviews: false,
         limit: 24,
       });
-      expect(mockInvoke).toHaveBeenCalledWith("ipc_list_remote_capture_sources", {
-        sessionId: "p2p-quic-123",
-        includePreviews: true,
-        limit: 1,
-      });
+      expect(mockInvoke).not.toHaveBeenCalledWith(
+        "ipc_list_remote_capture_sources",
+        expect.objectContaining({
+          includePreviews: true,
+        })
+      );
       expect(mockInvoke).toHaveBeenCalledWith("ipc_select_remote_capture_source", {
         sessionId: "p2p-quic-123",
         sourceId: "windows:window:0x1234",
@@ -2905,7 +2917,7 @@ describe("RemoteDisplayWindowPage", () => {
       expect(within(picker).getAllByText(/Display 2/).length).toBeGreaterThan(0);
     });
     expect(within(picker).getAllByText("Calculator").length).toBeGreaterThan(0);
-    expect(within(picker).getAllByText("预览不可用").length).toBeGreaterThan(0);
+    expect(within(picker).getAllByText("原生链路").length).toBeGreaterThan(0);
 
     fireEvent.click(within(picker).getByRole("button", { name: "选择 Display 2 (D3D11 shared copy)" }));
 
@@ -2918,10 +2930,12 @@ describe("RemoteDisplayWindowPage", () => {
         includePreviews: false,
         limit: 24,
       });
-      expect(mockInvoke).toHaveBeenCalledWith("ipc_list_local_capture_sources", {
-        includePreviews: true,
-        limit: 3,
-      });
+      expect(mockInvoke).not.toHaveBeenCalledWith(
+        "ipc_list_local_capture_sources",
+        expect.objectContaining({
+          includePreviews: true,
+        })
+      );
     });
     expect(mockInvoke).not.toHaveBeenCalledWith(
       "ipc_select_remote_capture_source",
@@ -3331,7 +3345,7 @@ describe("RemoteDisplayWindowPage", () => {
     });
   });
 
-  it("renders the latest decoded remote desktop preview frame", async () => {
+  it("does not render decoded remote desktop data URLs as preview frames", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {
       if (command === "test_get_capabilities") {
@@ -3388,7 +3402,7 @@ describe("RemoteDisplayWindowPage", () => {
           last_media_sequence: 3,
           last_media_timestamp_us: 3000,
           last_media_payload_hash: "fnv1a64:abc123",
-          latest_frame_data_url: "data:image/png;base64,REMOTE",
+          latest_frame_data_url: "legacy-frame-payload",
           latest_frame_width: 1280,
           latest_frame_height: 720,
           latest_frame_pixel_format: "rgb24",
@@ -3421,12 +3435,14 @@ describe("RemoteDisplayWindowPage", () => {
       );
     });
 
-    const frame = await screen.findByAltText("Remote desktop frame");
-    expect(frame).toHaveAttribute("src", "data:image/png;base64,REMOTE");
-    expect(frame).toHaveStyle({ aspectRatio: "1280 / 720" });
+    await screen.findByText(/remote rx 3/);
+    expect(screen.queryByAltText("Remote desktop frame")).toBeNull();
+    expect(mockInvoke.mock.calls.some(([command]) => String(command).includes("preview_frame"))).toBe(
+      false
+    );
   });
 
-  it("does not cover an attached native remote surface with the low-frequency preview frame", async () => {
+  it("does not present decoded data URLs onto an attached native remote surface", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {
       if (command === "test_get_capabilities") {
@@ -3483,7 +3499,7 @@ describe("RemoteDisplayWindowPage", () => {
           last_media_sequence: 3,
           last_media_timestamp_us: 3000,
           last_media_payload_hash: "fnv1a64:abc123",
-          latest_frame_data_url: "data:image/png;base64,REMOTE",
+          latest_frame_data_url: "legacy-frame-payload",
           latest_frame_width: 1280,
           latest_frame_height: 720,
           latest_frame_pixel_format: "rgb24",
@@ -3508,11 +3524,9 @@ describe("RemoteDisplayWindowPage", () => {
 
     await screen.findByText(/remote rx 3/);
     expect(screen.queryByAltText("Remote desktop frame")).toBeNull();
-    await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("present_remote_preview_frame_on_native_surface", {
-        dataUrl: "data:image/png;base64,REMOTE",
-      });
-    });
+    expect(mockInvoke.mock.calls.some(([command]) => String(command).includes("preview_frame"))).toBe(
+      false
+    );
   });
 
   it("blocks remote receiver start when no remote capture source is available", async () => {
@@ -3573,7 +3587,7 @@ describe("RemoteDisplayWindowPage", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "Start remote receiver" }));
 
-    await screen.findByText("远端未发现可捕获的全屏/窗口源，无法启动接收");
+    expect((await screen.findAllByText("远端未发现可捕获的全屏/窗口源，无法启动接收")).length).toBeGreaterThan(0);
     expect(mockInvoke).not.toHaveBeenCalledWith("ipc_start_receiver", expect.anything());
   });
 

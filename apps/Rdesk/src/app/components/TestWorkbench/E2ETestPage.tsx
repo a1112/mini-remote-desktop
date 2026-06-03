@@ -112,7 +112,6 @@ export function E2ETestPage() {
   const [isRunning, setIsRunning] = useState(false);
   const [currentRunId, setCurrentRunId] = useState<string | null>(null);
   const [metrics, setMetrics] = useState<HarnessMetrics | null>(null);
-  const [capturedFrame, setCapturedFrame] = useState<string | null>(null);
   const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
   const [, setServiceCapabilitySnapshot] = useState<CapabilitySnapshot | null>(null);
   const [lanRunState, setLanRunState] = useState<LanE2EStatus | "idle">("idle");
@@ -191,10 +190,6 @@ export function E2ETestPage() {
         setMetrics(metricsResult.value);
       }
 
-      const framesResult = await commands.testHarnessGetFrames();
-      if (framesResult.ok && framesResult.value[0]) {
-        setCapturedFrame(framesResult.value[0][0]);
-      }
     }, 200);
 
     return () => clearInterval(interval);
@@ -516,17 +511,9 @@ export function E2ETestPage() {
           实时画面
         </h2>
         <div className="aspect-video bg-black rounded flex items-center justify-center">
-          {capturedFrame ? (
-            <img
-              src={`data:image/png;base64,${capturedFrame}`}
-              alt="Captured frame"
-              className="max-w-full max-h-full"
-            />
-          ) : (
-            <p className="text-muted-foreground text-sm">
-              {isRunning ? "正在捕获..." : "等待启动..."}
-            </p>
-          )}
+          <p className="text-muted-foreground text-sm">
+            {isRunning ? "图片预览已封印，查看远程显示窗口和指标" : "等待启动..."}
+          </p>
         </div>
       </section>
     </div>
@@ -704,6 +691,7 @@ function buildLanAutomationOptionsFromSearchParams(
       searchParams.get("renderDisplaySourceId") ?? searchParams.get("renderSourceId") ?? undefined,
     expectedPeerBuildId: searchParams.get("expectedPeerBuildId") ?? undefined,
     renderProfileCap: parseOptionalBoolean(searchParams.get("renderProfileCap")),
+    renderDisplay: parseOptionalBoolean(searchParams.get("renderDisplay")),
     adaptive,
     adaptiveConfig: adaptive
       ? {
@@ -778,8 +766,13 @@ function parsePositiveNumber(value: string | null): number | undefined {
 }
 
 function parseOptionalBoolean(value: string | null): boolean | undefined {
-  if (value === "true") return true;
-  if (value === "false") return false;
+  const normalized = value?.trim().toLowerCase();
+  if (normalized === "true" || normalized === "1" || normalized === "on" || normalized === "yes") {
+    return true;
+  }
+  if (normalized === "false" || normalized === "0" || normalized === "off" || normalized === "no") {
+    return false;
+  }
   return undefined;
 }
 

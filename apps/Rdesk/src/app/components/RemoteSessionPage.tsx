@@ -81,7 +81,6 @@ type RenderFrame = {
 };
 
 type RenderHostSnapshot = {
-  preview_data_url?: string;
   frame?: RenderFrame;
   renderer_backend?: string;
   surface_count?: number;
@@ -678,55 +677,46 @@ export function RemoteSessionPage() {
 
       {/* Remote screen — full area */}
       <div className="flex-1 relative overflow-hidden cursor-crosshair select-none">
-        {renderSnapshot?.preview_data_url ? (
-          <img
-            src={renderSnapshot.preview_data_url}
-            alt="Remote desktop"
-            className="w-full h-full object-contain bg-black"
-            draggable={false}
-          />
-        ) : (
-          <div className="flex h-full w-full items-center justify-center bg-[#090d14] px-6">
-            <div className="w-full max-w-3xl rounded-xl border border-white/10 bg-black/35 p-5 text-gray-200 shadow-2xl backdrop-blur-sm">
-              <div className="flex items-center justify-between gap-4 border-b border-white/10 pb-4">
-                <div className="min-w-0">
-                  <div className="flex items-center gap-2 text-sm font-semibold text-white">
-                    <Monitor className="h-4 w-4 text-blue-300" />
-                    {isWebRemoteSession ? "网页渲染路径承载画面" : "原生显示窗口承载画面"}
-                  </div>
-                  <div className="mt-1 text-xs text-gray-400">
-                    {isWebRemoteSession
-                      ? "浏览器页面使用 WebRTC video 承载本机 mrd-service 采集流，不再映射到外部 D3D11 原生窗口。"
-                      : "Rdesk 前端保留管理和状态，远程帧由后台原生窗口走 D3D11/Metal 渲染链路。"}
-                  </div>
+        <div className="flex h-full w-full items-center justify-center bg-[#090d14] px-6">
+          <div className="w-full max-w-3xl rounded-xl border border-white/10 bg-black/35 p-5 text-gray-200 shadow-2xl backdrop-blur-sm">
+            <div className="flex items-center justify-between gap-4 border-b border-white/10 pb-4">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2 text-sm font-semibold text-white">
+                  <Monitor className="h-4 w-4 text-blue-300" />
+                  {isWebRemoteSession ? "网页渲染路径承载画面" : "原生显示窗口承载画面"}
                 </div>
-                <button
-                  onClick={() => void handlePopOutWindow()}
-                  className="shrink-0 rounded-md bg-blue-500/20 px-3 py-1.5 text-xs text-blue-100 hover:bg-blue-500/30"
-                >
-                  {isWebRemoteSession ? "打开网页渲染" : "打开显示窗口"}
-                </button>
+                <div className="mt-1 text-xs text-gray-400">
+                  {isWebRemoteSession
+                    ? "浏览器页面使用 WebRTC video 承载本机 mrd-service 采集流，不再映射到外部 D3D11 原生窗口。"
+                    : "Rdesk 前端保留管理和状态，远程帧由后台原生窗口走 D3D11/Metal 渲染链路。"}
+                </div>
               </div>
-              <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-                <DisplayMetric label="窗口" value={`${currentRenderWindowCount}`} />
-                <DisplayMetric label="渲染" value={nativeDisplayMode} />
-                <DisplayMetric
-                  label="接收 FPS"
-                  value={remoteFps === null ? "-" : remoteFps.toFixed(1)}
-                />
-                <DisplayMetric label="解码帧" value={`${probeSnapshot?.frames_decoded ?? 0}`} />
-              </div>
-              <div className="mt-4 rounded-md bg-white/6 px-3 py-2 text-xs text-gray-300">
-                {effectiveDisplayLaunchMessage}
-                {activeDisplayWindow ? (
-                  <span className="ml-2 text-gray-500">
-                    {activeDisplayWindow.label} · {activeDisplayWindow.surface_id}
-                  </span>
-                ) : null}
-              </div>
+              <button
+                onClick={() => void handlePopOutWindow()}
+                className="shrink-0 rounded-md bg-blue-500/20 px-3 py-1.5 text-xs text-blue-100 hover:bg-blue-500/30"
+              >
+                {isWebRemoteSession ? "打开网页渲染" : "打开显示窗口"}
+              </button>
+            </div>
+            <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+              <DisplayMetric label="窗口" value={`${currentRenderWindowCount}`} />
+              <DisplayMetric label="渲染" value={nativeDisplayMode} />
+              <DisplayMetric
+                label="接收 FPS"
+                value={remoteFps === null ? "-" : remoteFps.toFixed(1)}
+              />
+              <DisplayMetric label="解码帧" value={`${probeSnapshot?.frames_decoded ?? 0}`} />
+            </div>
+            <div className="mt-4 rounded-md bg-white/6 px-3 py-2 text-xs text-gray-300">
+              {effectiveDisplayLaunchMessage}
+              {activeDisplayWindow ? (
+                <span className="ml-2 text-gray-500">
+                  {activeDisplayWindow.label} · {activeDisplayWindow.surface_id}
+                </span>
+              ) : null}
             </div>
           </div>
-        )}
+        </div>
 
         {/* Connection quality overlay */}
         <div className="absolute top-3 right-3 flex items-center gap-2 px-2.5 py-1.5 rounded-lg bg-black/60 backdrop-blur-sm border border-white/10 text-gray-300" style={{ fontSize: 11 }}>
