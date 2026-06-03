@@ -96,10 +96,14 @@ function macosConfigFromLanPeer(
     codec === "hevc"
       ? ["videotoolbox_hevc", "encode.videotoolbox_hevc"]
       : ["videotoolbox_h264", "encode.videotoolbox_h264"];
+  const decoderAliases =
+    codec === "hevc"
+      ? ["decode.videotoolbox_hevc", "videotoolbox", "decode.videotoolbox"]
+      : ["decode.videotoolbox_h264", "videotoolbox", "decode.videotoolbox"];
   const capabilityGroups = [
     ["macos_capture", "capture.macos"],
     encoderAliases,
-    ["videotoolbox", "decode.videotoolbox"],
+    decoderAliases,
     ["macos_native_render", "render.macos"],
   ];
   if (codec === "hevc") {

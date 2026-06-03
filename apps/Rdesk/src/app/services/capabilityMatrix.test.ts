@@ -124,6 +124,21 @@ describe("buildCapabilitySnapshotFromEnvironment", () => {
     expect(statusOf(snapshot, "decode.videotoolbox")).toBe("available");
   });
 
+  it("marks codec-specific VideoToolbox decode as available from legacy fallback", () => {
+    const snapshot = buildCapabilitySnapshotFromEnvironment({
+      ...linuxEnvironment,
+      os_type: "macos",
+      available_captures: ["macos"],
+      available_encoders: ["videotoolbox_h264", "videotoolbox_hevc"],
+      available_decoders: ["videotoolbox_h264", "videotoolbox_hevc"],
+      available_renderers: ["macos"],
+    });
+
+    expect(statusOf(snapshot, "decode.videotoolbox_h264")).toBe("available");
+    expect(statusOf(snapshot, "decode.videotoolbox_hevc")).toBe("available");
+    expect(capabilityOptionState(snapshot, "decoder", "videotoolbox")).toBe("selectable");
+  });
+
   it("does not mark unwired NVENC AV1 encode as available from legacy fallback", () => {
     const snapshot = buildCapabilitySnapshotFromEnvironment({
       ...windowsEnvironment,
@@ -700,7 +715,7 @@ describe("capability profiles", () => {
     expect(profile?.required_capabilities).toEqual([
       "capture.macos",
       "encode.videotoolbox_h264",
-      "decode.videotoolbox",
+      "decode.videotoolbox_h264",
       "memory.cpu",
       "transport.quic_datagram",
       "transport.media_profile_control_v1",
@@ -721,7 +736,7 @@ describe("capability profiles", () => {
     expect(profile?.required_capabilities).toEqual([
       "capture.macos",
       "encode.videotoolbox_hevc",
-      "decode.videotoolbox",
+      "decode.videotoolbox_hevc",
       "media.hevc_main_420_8bit",
       "memory.cpu",
       "transport.quic_datagram",
@@ -772,7 +787,7 @@ describe("capability profiles", () => {
         os_type: "macos",
         available_captures: ["macos", "synthetic"],
         available_encoders: ["videotoolbox_h264", "openh264"],
-        available_decoders: ["videotoolbox", "software"],
+        available_decoders: ["videotoolbox_h264", "software"],
         available_renderers: ["macos", "webview"],
         available_memory_modes: ["cpu"],
       }),

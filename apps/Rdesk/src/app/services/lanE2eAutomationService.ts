@@ -234,7 +234,7 @@ interface RequiredPlatformMediaCapabilityProfile {
   id: "windows" | "macos" | "linux";
   label: string;
   verifyHint: string;
-  capabilities: string[];
+  capabilities: string[][];
 }
 
 const REQUIRED_PLATFORM_MEDIA_CAPABILITY_PROFILES: RequiredPlatformMediaCapabilityProfile[] = [
@@ -242,26 +242,34 @@ const REQUIRED_PLATFORM_MEDIA_CAPABILITY_PROFILES: RequiredPlatformMediaCapabili
     id: "windows",
     label: "Windows",
     verifyHint: "verify DXGI/NVENC/NVDEC/D3D11 native support",
-    capabilities: ["dxgi_capture", "nvenc_h264", "nvdec", "d3d11_native_render"],
+    capabilities: [
+      ["dxgi_capture", "capture.dxgi"],
+      ["nvenc_h264", "encode.nvenc_h264"],
+      ["nvdec", "decode.nvdec"],
+      ["d3d11_native_render", "render.d3d11"],
+    ],
   },
   {
     id: "macos",
     label: "macOS",
     verifyHint: "verify ScreenCaptureKit/VideoToolbox/Metal native support",
     capabilities: [
-      "macos_capture",
-      "videotoolbox_h264",
-      "videotoolbox_hevc",
-      "videotoolbox",
-      "media.hevc_main_420_8bit",
-      "macos_native_render",
+      ["macos_capture", "capture.macos"],
+      ["videotoolbox_h264", "encode.videotoolbox_h264"],
+      ["videotoolbox_hevc", "encode.videotoolbox_hevc"],
+      ["decode.videotoolbox_hevc", "videotoolbox", "decode.videotoolbox"],
+      ["media.hevc_main_420_8bit"],
+      ["macos_native_render", "render.macos"],
     ],
   },
   {
     id: "linux",
     label: "Linux",
     verifyHint: "verify PipeWire/Linux decode/native render support",
-    capabilities: ["pipewire_capture", "software_decode"],
+    capabilities: [
+      ["pipewire_capture", "capture.linux"],
+      ["software_decode", "decode.software", "software"],
+    ],
   },
 ];
 const DEFAULT_LAN_HEVC_MEDIA_PROFILE: MediaProfile = {
@@ -1487,13 +1495,10 @@ function peerSupportsMacosNativeMedia(peer: LanPeerInfo): boolean {
   const mediaCapabilities = (peer.media_capabilities ?? []).map((capability) =>
     capability.toLowerCase()
   );
-  const macosProfile = REQUIRED_PLATFORM_MEDIA_CAPABILITY_PROFILES.find(
-    (profile) => profile.id === "macos"
-  );
-  return (
-    macosProfile?.capabilities.every((capability) =>
-      mediaCapabilities.includes(capability.toLowerCase())
-    ) ?? false
+  return REQUIRED_PLATFORM_MEDIA_CAPABILITY_PROFILES.some(
+    (profile) =>
+      profile.id === "macos" &&
+      platformMediaProfileMatches(profile, mediaCapabilities)
   );
 }
 
@@ -1514,17 +1519,28 @@ function findSupportedPlatformMediaCapabilityProfile(
   mediaCapabilities: string[]
 ): RequiredPlatformMediaCapabilityProfile | undefined {
   return REQUIRED_PLATFORM_MEDIA_CAPABILITY_PROFILES.find((profile) =>
-    profile.capabilities.every((capability) => mediaCapabilities.includes(capability))
+    platformMediaProfileMatches(profile, mediaCapabilities)
   );
 }
 
 function describeMissingPlatformMediaCapabilities(mediaCapabilities: string[]): string {
   return REQUIRED_PLATFORM_MEDIA_CAPABILITY_PROFILES.map((profile) => {
-    const missing = profile.capabilities.filter(
-      (capability) => !mediaCapabilities.includes(capability)
-    );
+    const missing = profile.capabilities
+      .filter((aliases) =>
+        !aliases.some((capability) => mediaCapabilities.includes(capability.toLowerCase()))
+      )
+      .map((aliases) => aliases[0] ?? "unknown");
     return `${profile.label}: ${missing.length > 0 ? missing.join(", ") : "none"}`;
   }).join("; ");
+}
+
+function platformMediaProfileMatches(
+  profile: RequiredPlatformMediaCapabilityProfile,
+  mediaCapabilities: string[]
+): boolean {
+  return profile.capabilities.every((aliases) =>
+    aliases.some((capability) => mediaCapabilities.includes(capability.toLowerCase()))
+  );
 }
 
 function buildPeerNotReadyMessage(peer: LanPeerInfo, transportKind: string): string {

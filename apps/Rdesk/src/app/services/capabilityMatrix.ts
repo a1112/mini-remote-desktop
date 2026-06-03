@@ -167,6 +167,8 @@ const KNOWN_STATUS_BY_ID: Record<string, CapabilityStatus> = {
   "decode.linux_hevc": "available",
   "decode.linux_hevc_main10": "available",
   "decode.videotoolbox": "available",
+  "decode.videotoolbox_h264": "available",
+  "decode.videotoolbox_hevc": "available",
   "render.d3d11": "available",
   "render.opengl": "supported",
   "render.linux": "available",
@@ -383,7 +385,7 @@ export const BUILTIN_CAPABILITY_PROFILES: CapabilityProfile[] = [
     required_capabilities: [
       "capture.macos",
       "encode.videotoolbox_h264",
-      "decode.videotoolbox",
+      "decode.videotoolbox_h264",
       "memory.cpu",
       "transport.quic_datagram",
       "transport.media_profile_control_v1",
@@ -401,7 +403,7 @@ export const BUILTIN_CAPABILITY_PROFILES: CapabilityProfile[] = [
     required_capabilities: [
       "capture.macos",
       "encode.videotoolbox_hevc",
-      "decode.videotoolbox",
+      "decode.videotoolbox_hevc",
       "media.hevc_main_420_8bit",
       "memory.cpu",
       "transport.quic_datagram",
@@ -662,7 +664,11 @@ export function capabilityForOption(
 ): CapabilityItem | null {
   const capabilityId = capabilityIdForLegacyOption(dimensionId, optionId);
   if (!snapshot || !capabilityId) return null;
-  return snapshot.capabilities.find((item) => item.id === capabilityId) ?? null;
+  const capabilityIds = capabilityIdsForLegacyOption(dimensionId, optionId);
+  const matches = capabilityIds
+    .map((id) => snapshot.capabilities.find((item) => item.id === id))
+    .filter((item): item is CapabilityItem => item !== undefined);
+  return matches.find((item) => capabilityStatusIsSelectable(item.status)) ?? matches[0] ?? null;
 }
 
 export function capabilityOptionState(
@@ -691,6 +697,15 @@ export function shouldShowCapabilityOptionForSnapshot(
   const capability = capabilityForOption(snapshot, dimensionId, optionId);
   if (!capability) return showUnavailable;
   return showUnavailable || capabilityStatusIsVisibleByDefault(capability.status);
+}
+
+function capabilityIdsForLegacyOption(dimensionId: string, optionId: string): string[] {
+  const capabilityId = capabilityIdForLegacyOption(dimensionId, optionId);
+  if (!capabilityId) return [];
+  if (dimensionId === "decoder" && optionId === "videotoolbox") {
+    return [capabilityId, "decode.videotoolbox_h264", "decode.videotoolbox_hevc"];
+  }
+  return [capabilityId];
 }
 
 export function environmentSnapshotFromCapabilitySnapshot(

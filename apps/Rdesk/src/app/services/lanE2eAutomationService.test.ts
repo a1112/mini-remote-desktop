@@ -2404,7 +2404,7 @@ describe("runLanE2EAutomation", () => {
                 "macos_capture",
                 "videotoolbox_h264",
                 "videotoolbox_hevc",
-                "videotoolbox",
+                "decode.videotoolbox_hevc",
                 "media.hevc_main_420_8bit",
                 "macos_native_render",
               ],

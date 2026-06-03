@@ -1150,6 +1150,32 @@ function pickAvailable<T extends string>(
   return preferred.find((value) => available.includes(value)) ?? fallback;
 }
 
+function decoderOptionAvailable(
+  available: readonly string[] | undefined,
+  decoder: DecoderType
+): boolean {
+  if (!available || available.length === 0) return false;
+  if (available.includes(decoder)) return true;
+  if (decoder !== "videotoolbox") return false;
+  return (
+    available.includes("videotoolbox_h264") ||
+    available.includes("videotoolbox_hevc") ||
+    available.includes("decode.videotoolbox_h264") ||
+    available.includes("decode.videotoolbox_hevc")
+  );
+}
+
+function pickAvailableDecoder(
+  current: DecoderType,
+  available: readonly string[] | undefined,
+  preferred: readonly DecoderType[],
+  fallback: DecoderType
+): DecoderType {
+  if (!available || available.length === 0) return current;
+  if (decoderOptionAvailable(available, current)) return current;
+  return preferred.find((value) => decoderOptionAvailable(available, value)) ?? fallback;
+}
+
 function uniqueValues<T extends string>(values: readonly T[]): T[] {
   return values.filter((value, index) => values.indexOf(value) === index);
 }
@@ -2328,7 +2354,9 @@ export function RemoteDisplayWindowPage() {
   const visibleDecoderOptions = useMemo(
     () =>
       capabilities?.available_decoders?.length
-        ? decoderOptions.filter((option) => capabilities.available_decoders.includes(option.value))
+        ? decoderOptions.filter((option) =>
+            decoderOptionAvailable(capabilities.available_decoders, option.value)
+          )
         : decoderOptions,
     [capabilities]
   );
@@ -2381,7 +2409,7 @@ export function RemoteDisplayWindowPage() {
         ...option,
         disabledReason:
           capabilities?.available_decoders?.length &&
-          !capabilities.available_decoders.includes(option.value)
+          !decoderOptionAvailable(capabilities.available_decoders, option.value)
             ? "当前平台能力未报告该解码器"
             : null,
       })),
@@ -3410,7 +3438,7 @@ export function RemoteDisplayWindowPage() {
         )
       );
       setDecoder((value) =>
-        pickAvailable(
+        pickAvailableDecoder(
           value,
           capabilities.available_decoders,
           ["videotoolbox", "software", "none"],
@@ -4665,7 +4693,11 @@ export function RemoteDisplayWindowPage() {
     if (hostOs === "macos") {
       setCapture("macos");
       setEncoder("videotoolbox_h264");
-      setDecoder(capabilities?.available_decoders.includes("videotoolbox") ? "videotoolbox" : "software");
+      setDecoder(
+        decoderOptionAvailable(capabilities?.available_decoders, "videotoolbox")
+          ? "videotoolbox"
+          : "software"
+      );
       setTransport("quic");
       setResolution("1920x1080");
       setFps("60");

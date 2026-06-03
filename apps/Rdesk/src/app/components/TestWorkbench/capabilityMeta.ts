@@ -53,7 +53,7 @@ export function capabilityAvailable(
 ): boolean {
   const values = capabilities?.[key];
   if (!values) return fallback;
-  return values.includes(id);
+  return capabilityAliases(key, id).some((alias) => values.includes(alias));
 }
 
 export function unavailableText(
@@ -76,4 +76,17 @@ export function chooseCapability<T extends string>(
   if (match) return match;
   if (fallback !== undefined) return fallback;
   return candidates[0] as T;
+}
+
+function capabilityAliases(key: CapabilityKey, id: string): string[] {
+  if (key === "available_decoders" && id === "videotoolbox") {
+    return [
+      "videotoolbox",
+      "videotoolbox_h264",
+      "videotoolbox_hevc",
+      "decode.videotoolbox_h264",
+      "decode.videotoolbox_hevc",
+    ];
+  }
+  return [id];
 }

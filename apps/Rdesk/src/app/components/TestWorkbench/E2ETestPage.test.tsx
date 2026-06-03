@@ -466,7 +466,7 @@ describe("E2ETestPage LAN automation", () => {
           "quic_datagram_media_v3",
           "macos_capture",
           "videotoolbox_hevc",
-          "videotoolbox",
+          "decode.videotoolbox_hevc",
           "media.hevc_main_420_8bit",
           "macos_native_render",
         ],

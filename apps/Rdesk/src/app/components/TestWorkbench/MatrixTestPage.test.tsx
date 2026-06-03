@@ -72,7 +72,7 @@ function mockMacHevcCapabilities(command: string) {
       gpu_info: "",
       available_captures: ["macos", "synthetic"],
       available_encoders: ["videotoolbox_hevc", "videotoolbox_h264", "openh264"],
-      available_decoders: ["videotoolbox", "software"],
+      available_decoders: ["videotoolbox_hevc", "software"],
       available_renderers: ["none", "macos"],
       available_memory_modes: ["cpu"],
     });
@@ -273,7 +273,7 @@ describe("MatrixTestPage failure handling", () => {
         "quic_datagram_media_v3",
         "macos_capture",
         "videotoolbox_hevc",
-        "videotoolbox",
+        "decode.videotoolbox_hevc",
         "media.hevc_main_420_8bit",
         "macos_native_render",
       ],

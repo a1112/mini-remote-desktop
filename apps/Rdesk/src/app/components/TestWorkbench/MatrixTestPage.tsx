@@ -300,6 +300,17 @@ function hasLinuxHardwareDecoder(availableDecoders: string[]): boolean {
   );
 }
 
+function decoderOptionAvailable(availableDecoders: string[], decoder: string): boolean {
+  if (availableDecoders.includes(decoder)) return true;
+  if (decoder !== "videotoolbox") return false;
+  return (
+    availableDecoders.includes("videotoolbox_h264") ||
+    availableDecoders.includes("videotoolbox_hevc") ||
+    availableDecoders.includes("decode.videotoolbox_h264") ||
+    availableDecoders.includes("decode.videotoolbox_hevc")
+  );
+}
+
 function shouldEnableDecoderByDefault(
   option: MatrixOption,
   os: HostOs,
@@ -307,7 +318,7 @@ function shouldEnableDecoderByDefault(
 ): boolean {
   const hasNvdec = availableDecoders.includes("nvdec");
   const hasLinuxHardware = hasLinuxHardwareDecoder(availableDecoders);
-  const hasVideoToolbox = availableDecoders.includes("videotoolbox");
+  const hasVideoToolbox = decoderOptionAvailable(availableDecoders, "videotoolbox");
   const hasFfmpegH264 = availableDecoders.includes("ffmpeg_h264");
 
   if (option.id === "nvdec") return hasNvdec;
@@ -388,7 +399,7 @@ function createMatrixDimensions(
       case "encoder":
         return availableEncoders.includes(optionId);
       case "decoder":
-        return availableDecoders.includes(optionId);
+        return decoderOptionAvailable(availableDecoders, optionId);
       case "renderer":
         if (optionId === "renderer_none") {
           return availableRenderers.includes("none");
@@ -1121,7 +1132,7 @@ export function crossDevicePeerSkipReason(
             capabilities: [
               ["macos_capture", "capture.macos"],
               ["videotoolbox_hevc", "encode.videotoolbox_hevc"],
-              ["videotoolbox", "decode.videotoolbox"],
+              ["decode.videotoolbox_hevc", "videotoolbox", "decode.videotoolbox"],
               ["media.hevc_main_420_8bit"],
               ["macos_native_render", "render.macos"],
             ],
@@ -1142,7 +1153,7 @@ export function crossDevicePeerSkipReason(
             capabilities: [
               ["macos_capture", "capture.macos"],
               ["videotoolbox_h264", "encode.videotoolbox_h264"],
-              ["videotoolbox", "decode.videotoolbox"],
+              ["decode.videotoolbox_h264", "videotoolbox", "decode.videotoolbox"],
               ["macos_native_render", "render.macos"],
             ],
           },

@@ -127,7 +127,7 @@ function macosCapabilities() {
     gpu_info: "Apple GPU",
     available_captures: ["macos", "synthetic"],
     available_encoders: ["videotoolbox_hevc", "videotoolbox_h264", "openh264"],
-    available_decoders: ["videotoolbox", "software"],
+    available_decoders: ["videotoolbox_h264", "videotoolbox_hevc", "software"],
     available_renderers: ["macos"],
     available_memory_modes: ["cpu"],
   };
@@ -1209,7 +1209,7 @@ describe("RemoteDisplayWindowPage", () => {
           gpu_info: "Apple GPU",
           available_captures: ["macos", "synthetic"],
           available_encoders: ["videotoolbox_h264", "openh264"],
-          available_decoders: ["videotoolbox", "software"],
+          available_decoders: ["videotoolbox_h264", "software"],
           available_renderers: ["macos"],
           available_memory_modes: ["cpu"],
         });
