@@ -896,7 +896,8 @@ function requestedCapabilityIds(request: CapabilityCombinationRequest): string[]
 
   if (request.capture) ids.push(`capture.${request.capture}`);
   if (request.encoder) ids.push(`encode.${request.encoder}`);
-  if (request.decoder && request.decoder !== "none") ids.push(`decode.${request.decoder}`);
+  const decoderCapabilityId = requestedDecoderCapabilityId(request);
+  if (decoderCapabilityId) ids.push(decoderCapabilityId);
   if (request.renderer && request.renderer !== "none") {
     ids.push(
       request.renderer === "d3d12_native" ? "render.d3d12_native" : `render.${request.renderer}`
@@ -906,6 +907,22 @@ function requestedCapabilityIds(request: CapabilityCombinationRequest): string[]
   if (request.transport) ids.push(`transport.${request.transport}`);
 
   return ids;
+}
+
+function requestedDecoderCapabilityId(request: CapabilityCombinationRequest): string | null {
+  if (!request.decoder || request.decoder === "none") return null;
+  if (request.decoder !== "videotoolbox") return `decode.${request.decoder}`;
+  if (request.encoder === "videotoolbox_hevc" || request.encoder === "hevc") {
+    return "decode.videotoolbox_hevc";
+  }
+  if (
+    request.encoder === "videotoolbox_h264" ||
+    request.encoder === "openh264" ||
+    request.encoder === "h264"
+  ) {
+    return "decode.videotoolbox_h264";
+  }
+  return "decode.videotoolbox";
 }
 
 function applyCapabilityConstraints(

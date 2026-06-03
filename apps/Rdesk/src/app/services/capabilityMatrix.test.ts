@@ -439,6 +439,72 @@ describe("evaluateCapabilityCombination", () => {
     expect(result.reasons.join(" ")).toContain("decode.software");
   });
 
+  it("maps generic VideoToolbox decode to the H.264 decoder capability for H.264 encoders", () => {
+    const snapshot = buildCapabilitySnapshotFromEnvironment({
+      ...linuxEnvironment,
+      os_type: "macos",
+      available_captures: ["macos"],
+      available_encoders: ["videotoolbox_h264", "openh264"],
+      available_decoders: ["videotoolbox_h264"],
+      available_renderers: ["macos"],
+    });
+
+    const result = evaluateCapabilityCombination(
+      {
+        encoder: "videotoolbox_h264",
+        decoder: "videotoolbox",
+      },
+      snapshot
+    );
+
+    expect(result.status).toBe("ready");
+    expect(result.reasons).toEqual([]);
+  });
+
+  it("maps generic VideoToolbox decode to the HEVC decoder capability for HEVC encoders", () => {
+    const snapshot = buildCapabilitySnapshotFromEnvironment({
+      ...linuxEnvironment,
+      os_type: "macos",
+      available_captures: ["macos"],
+      available_encoders: ["videotoolbox_hevc"],
+      available_decoders: ["videotoolbox_hevc"],
+      available_renderers: ["macos"],
+    });
+
+    const result = evaluateCapabilityCombination(
+      {
+        encoder: "videotoolbox_hevc",
+        decoder: "videotoolbox",
+      },
+      snapshot
+    );
+
+    expect(result.status).toBe("ready");
+    expect(result.reasons).toEqual([]);
+  });
+
+  it("blocks generic VideoToolbox decode for HEVC when only H.264 decode is exposed", () => {
+    const snapshot = buildCapabilitySnapshotFromEnvironment({
+      ...linuxEnvironment,
+      os_type: "macos",
+      available_captures: ["macos"],
+      available_encoders: ["videotoolbox_hevc"],
+      available_decoders: ["videotoolbox_h264"],
+      available_renderers: ["macos"],
+    });
+
+    const result = evaluateCapabilityCombination(
+      {
+        encoder: "videotoolbox_hevc",
+        decoder: "videotoolbox",
+      },
+      snapshot
+    );
+
+    expect(result.status).toBe("blocked");
+    expect(result.reasons.join(" ")).toContain("decode.videotoolbox_hevc");
+  });
+
   it("blocks a Linux request for Windows-only NVIDIA hardware stages", () => {
     const snapshot = buildCapabilitySnapshotFromEnvironment(linuxEnvironment);
 
