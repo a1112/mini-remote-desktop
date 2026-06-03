@@ -21,6 +21,8 @@ use mrd_pipeline_core::{DecodedFrame, DecodedFrameData, VideoDecoder};
 #[cfg(target_os = "macos")]
 use mrd_render::{RenderFrame, RenderTarget, RendererInstance, RendererSnapshot};
 #[cfg(target_os = "macos")]
+use nix::sys::socket::{setsockopt, sockopt};
+#[cfg(target_os = "macos")]
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
@@ -56,6 +58,8 @@ const MACOS_RENDER_PROXY_DOUBLE_BUFFER_FALLBACK_THRESHOLD_MS_ENV: &str =
     "MRD_MACOS_RENDER_PROXY_DOUBLE_BUFFER_FALLBACK_THRESHOLD_MS";
 #[cfg(target_os = "macos")]
 const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+#[cfg(target_os = "macos")]
+const MACOS_RENDER_PROXY_SOCKET_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 #[cfg(target_os = "macos")]
 const DEFAULT_SLOW_PRESENT_RESET_THRESHOLD_MS: f64 = 32.0;
 #[cfg(target_os = "macos")]
@@ -661,6 +665,7 @@ async fn run_macos_render_proxy(listener: UnixListener, state: Arc<Mutex<RenderP
         let Ok((stream, _)) = listener.accept().await else {
             break;
         };
+        configure_macos_render_proxy_socket(&stream);
         handle_macos_render_proxy_connection(stream, state.clone()).await;
     }
 }
@@ -791,6 +796,30 @@ async fn read_render_proxy_payload_bytes(
         }
     }
     Ok(payload.freeze())
+}
+
+#[cfg(target_os = "macos")]
+fn configure_macos_render_proxy_socket(stream: &UnixStream) {
+    if let Err(error) = setsockopt(
+        stream,
+        sockopt::SndBuf,
+        &MACOS_RENDER_PROXY_SOCKET_BUFFER_BYTES,
+    ) {
+        tracing::debug!(
+            %error,
+            "failed to set macOS render proxy socket send buffer"
+        );
+    }
+    if let Err(error) = setsockopt(
+        stream,
+        sockopt::RcvBuf,
+        &MACOS_RENDER_PROXY_SOCKET_BUFFER_BYTES,
+    ) {
+        tracing::debug!(
+            %error,
+            "failed to set macOS render proxy socket receive buffer"
+        );
+    }
 }
 
 #[cfg(target_os = "macos")]

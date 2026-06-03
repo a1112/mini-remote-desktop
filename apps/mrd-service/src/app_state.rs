@@ -28,9 +28,11 @@ use mrd_render::{
 };
 #[cfg(windows)]
 use mrd_render_d3d11::D3d11RendererFactory;
+#[cfg(target_os = "macos")]
+use nix::sys::socket::{setsockopt, sockopt};
 use std::collections::{HashMap, VecDeque};
 #[cfg(target_os = "macos")]
-use std::io::{Read, Write};
+use std::io::{self, IoSlice, Read, Write};
 #[cfg(target_os = "macos")]
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::sync::Arc;
@@ -44,6 +46,8 @@ use tokio::{sync::Mutex, task::AbortHandle};
 
 const MEDIA_STAGE_SAMPLE_LIMIT: usize = 240;
 const AUDIT_EVENT_LIMIT: usize = 1_000;
+#[cfg(target_os = "macos")]
+const MACOS_RENDER_PROXY_SOCKET_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 
 /// Session registry tracking all active sessions
 #[derive(Debug, Default)]
@@ -1016,6 +1020,7 @@ impl MacosRenderProxyRenderer {
             let timeout = Some(Duration::from_millis(250));
             let _ = stream.set_read_timeout(timeout);
             let _ = stream.set_write_timeout(timeout);
+            configure_macos_render_proxy_socket(&stream);
             self.stream = Some(stream);
         }
         self.stream
@@ -1031,10 +1036,7 @@ impl MacosRenderProxyRenderer {
         let header_bytes = encode_frame_header(header);
         let mut ack_bytes = [0_u8; mrd_ipc::render_proxy::ACK_LEN];
         let stream = self.ensure_stream()?;
-        stream.write_all(&header_bytes).map_err(|error| {
-            RenderError::Message(format!("write macOS render proxy header failed: {error}"))
-        })?;
-        stream.write_all(payload).map_err(|error| {
+        write_all_vectored_pair(stream, &header_bytes, payload).map_err(|error| {
             RenderError::Message(format!("write macOS render proxy payload failed: {error}"))
         })?;
         stream.read_exact(&mut ack_bytes).map_err(|error| {
@@ -1060,6 +1062,56 @@ impl MacosRenderProxyRenderer {
             }
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn configure_macos_render_proxy_socket(stream: &StdUnixStream) {
+    if let Err(error) = setsockopt(
+        stream,
+        sockopt::SndBuf,
+        &MACOS_RENDER_PROXY_SOCKET_BUFFER_BYTES,
+    ) {
+        tracing::debug!(
+            %error,
+            "failed to set macOS render proxy socket send buffer"
+        );
+    }
+    if let Err(error) = setsockopt(
+        stream,
+        sockopt::RcvBuf,
+        &MACOS_RENDER_PROXY_SOCKET_BUFFER_BYTES,
+    ) {
+        tracing::debug!(
+            %error,
+            "failed to set macOS render proxy socket receive buffer"
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn write_all_vectored_pair<W: Write>(
+    writer: &mut W,
+    mut first: &[u8],
+    mut second: &[u8],
+) -> io::Result<()> {
+    while !first.is_empty() || !second.is_empty() {
+        let slices = [IoSlice::new(first), IoSlice::new(second)];
+        let written = writer.write_vectored(&slices)?;
+        if written == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "failed to write macOS render proxy payload",
+            ));
+        }
+        if written < first.len() {
+            first = &first[written..];
+        } else {
+            let second_written = written.saturating_sub(first.len()).min(second.len());
+            first = &[];
+            second = &second[second_written..];
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -2181,6 +2233,23 @@ mod tests {
 
         assert_eq!(registered.0, DeviceId("explicit-device".to_string()));
         assert_eq!(registered.1, "Explicit Device");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_render_proxy_vectored_write_preserves_frame_bytes() {
+        let (mut writer, mut reader) = StdUnixStream::pair().expect("create stream pair");
+        let header = b"MRDR-header";
+        let payload = b"nv12-payload";
+
+        write_all_vectored_pair(&mut writer, header, payload).expect("write frame bytes");
+
+        let mut frame = vec![0_u8; header.len() + payload.len()];
+        reader.read_exact(&mut frame).expect("read frame bytes");
+
+        let mut expected = Vec::from(header.as_slice());
+        expected.extend_from_slice(payload);
+        assert_eq!(frame, expected);
     }
 
     #[test]

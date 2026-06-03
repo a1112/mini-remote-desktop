@@ -58,7 +58,7 @@ tauri-plugin-fs = { git = "https://github.com/tauri-apps/plugins-workspace", ver
 window-vibrancy = "0.7.1"
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.29", features = ["signal", "process"] }
+nix = { version = "0.29", features = ["signal", "process", "socket"] }
 
 [dev-dependencies]
 openh264 = "0.8"
