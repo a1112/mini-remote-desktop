@@ -96,6 +96,37 @@ function mockOverviewData() {
   });
 }
 
+function mockOverviewDataWithCapabilities(capabilities: Record<string, unknown>) {
+  const mockInvoke = getMockInvoke();
+
+  mockInvoke.mockImplementation((command: string) => {
+    if (command === "test_list_scenarios") {
+      return Promise.resolve([]);
+    }
+
+    if (command === "test_list_runs") {
+      return Promise.resolve([]);
+    }
+
+    if (command === "test_get_capabilities") {
+      return Promise.resolve(capabilities);
+    }
+
+    if (command === "ffmpeg_probe") {
+      return Promise.resolve({
+        available: true,
+        ffmpeg_path: "C:\\ffmpeg\\bin\\ffmpeg.exe",
+        ffprobe_path: "C:\\ffmpeg\\bin\\ffprobe.exe",
+        ffmpeg_version: "ffmpeg version 8.1.1",
+        ffprobe_version: "ffprobe version 8.1.1",
+        reason: null,
+      });
+    }
+
+    return Promise.resolve(null);
+  });
+}
+
 function mockOverviewDataWithActiveRun() {
   const mockInvoke = getMockInvoke();
 
@@ -239,6 +270,26 @@ describe("OverviewPage", () => {
     expect(screen.getByText("lan.1600p165")).toBeInTheDocument();
     expect(screen.getAllByText("blocked").length).toBeGreaterThan(0);
     expect(screen.getAllByText(/transport.media_profile_control_v1/).length).toBeGreaterThan(0);
+  });
+
+  it("uses the macOS H.264 2K144 profile when VideoToolbox HEVC is unavailable", async () => {
+    mockOverviewDataWithCapabilities({
+      os_type: "macos",
+      cpu_brand: "Apple M",
+      cpu_cores: 8,
+      memory_gb: 32,
+      gpu_info: "Apple GPU",
+      available_captures: ["macos", "synthetic"],
+      available_encoders: ["videotoolbox_h264", "openh264"],
+      available_decoders: ["videotoolbox_h264", "software"],
+      available_renderers: ["macos", "webview"],
+      available_memory_modes: ["cpu"],
+    });
+
+    render(<OverviewPage />);
+
+    expect(await screen.findByText("lan.macos.2k144")).toBeInTheDocument();
+    expect(screen.queryByText("lan.macos.hevc.2k144")).not.toBeInTheDocument();
   });
 
   it("shows FFmpeg optional tooling status and actions", async () => {

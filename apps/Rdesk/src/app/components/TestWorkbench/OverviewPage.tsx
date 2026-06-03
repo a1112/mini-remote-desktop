@@ -247,11 +247,27 @@ export function OverviewPage() {
         (capability) => !shouldShowCapabilityStatus(capability.status, false)
       ).length
     : 0;
-  const lan2k144ProfileId =
-    capabilitySnapshot?.platform === "macos" ? "lan.macos.hevc.2k144" : "lan.2k144";
-  const lan2k144Evaluation = capabilitySnapshot
-    ? evaluateProfileSupport(lan2k144ProfileId, capabilitySnapshot)
-    : null;
+  const macosHevc2k144Evaluation =
+    capabilitySnapshot?.platform === "macos"
+      ? evaluateProfileSupport("lan.macos.hevc.2k144", capabilitySnapshot)
+      : null;
+  const macosH2642k144Evaluation =
+    capabilitySnapshot?.platform === "macos"
+      ? evaluateProfileSupport("lan.macos.2k144", capabilitySnapshot)
+      : null;
+  const lan2k144ProfileId = capabilitySnapshot?.platform === "macos"
+    ? macosHevc2k144Evaluation && macosHevc2k144Evaluation.status !== "blocked"
+      ? "lan.macos.hevc.2k144"
+      : "lan.macos.2k144"
+    : "lan.2k144";
+  const lan2k144Evaluation =
+    capabilitySnapshot?.platform === "macos"
+      ? lan2k144ProfileId === "lan.macos.hevc.2k144"
+        ? macosHevc2k144Evaluation
+        : macosH2642k144Evaluation
+      : capabilitySnapshot
+        ? evaluateProfileSupport(lan2k144ProfileId, capabilitySnapshot)
+        : null;
   const lan1600p165Evaluation = capabilitySnapshot
     ? evaluateProfileSupport("lan.1600p165", capabilitySnapshot)
     : null;
