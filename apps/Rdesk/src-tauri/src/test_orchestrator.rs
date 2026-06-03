@@ -1106,11 +1106,16 @@ impl TestOrchestrator {
         }
         #[cfg(target_os = "macos")]
         {
-            if videotoolbox_decoder_enabled()
-                && mrd_codec_videotoolbox::VideoToolboxH264Decoder::new().is_ok()
-            {
-                available_decoders.push("videotoolbox".to_string());
-            }
+            let decoder_enabled = videotoolbox_decoder_enabled();
+            let h264_decoder_available =
+                decoder_enabled && mrd_codec_videotoolbox::VideoToolboxH264Decoder::new().is_ok();
+            let hevc_decoder_available =
+                decoder_enabled && mrd_codec_videotoolbox::VideoToolboxHevcDecoder::new().is_ok();
+            append_macos_videotoolbox_decoder_capabilities(
+                &mut available_decoders,
+                h264_decoder_available,
+                hevc_decoder_available,
+            );
         }
         #[cfg(target_os = "linux")]
         {
@@ -3273,6 +3278,22 @@ fn decoder_supported_on_current_platform(decoder_type: &str) -> bool {
             && videotoolbox_decoder_enabled()
 }
 
+fn append_macos_videotoolbox_decoder_capabilities(
+    available_decoders: &mut Vec<String>,
+    h264_decoder_available: bool,
+    hevc_decoder_available: bool,
+) {
+    if h264_decoder_available {
+        available_decoders.push("videotoolbox_h264".to_string());
+    }
+    if hevc_decoder_available {
+        available_decoders.push("videotoolbox_hevc".to_string());
+    }
+    if h264_decoder_available && hevc_decoder_available {
+        available_decoders.push("videotoolbox".to_string());
+    }
+}
+
 fn renderer_supported_on_current_platform(renderer_type: &str) -> bool {
     matches!(renderer_type, "none")
         || matches!(renderer_type, "d3d11") && cfg!(windows)
@@ -4374,6 +4395,28 @@ mod tests {
             available_renderers: vec!["none".to_string()],
             available_memory_modes: vec!["cpu".to_string()],
         }
+    }
+
+    #[test]
+    fn macos_videotoolbox_decoder_capability_aliases_are_codec_specific() {
+        let mut h264_only = Vec::new();
+        append_macos_videotoolbox_decoder_capabilities(&mut h264_only, true, false);
+        assert_eq!(h264_only, vec!["videotoolbox_h264".to_string()]);
+
+        let mut hevc_only = Vec::new();
+        append_macos_videotoolbox_decoder_capabilities(&mut hevc_only, false, true);
+        assert_eq!(hevc_only, vec!["videotoolbox_hevc".to_string()]);
+
+        let mut both = Vec::new();
+        append_macos_videotoolbox_decoder_capabilities(&mut both, true, true);
+        assert_eq!(
+            both,
+            vec![
+                "videotoolbox_h264".to_string(),
+                "videotoolbox_hevc".to_string(),
+                "videotoolbox".to_string(),
+            ]
+        );
     }
 
     #[test]
