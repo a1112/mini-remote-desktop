@@ -3,7 +3,12 @@ import { useNavigate } from "react-router";
 import { Play, Settings, Monitor, Cpu, Zap, Network } from "lucide-react";
 import * as commands from "../../adapters/tauri/commands";
 import type { EnvironmentSnapshot, TestConfig } from "../../adapters/tauri/types";
-import { capabilityAvailable, capabilityTag, unavailableText } from "./capabilityMeta";
+import {
+  capabilityAvailable,
+  capabilityTag,
+  decoderCapabilityAvailableForConfig,
+  unavailableText,
+} from "./capabilityMeta";
 import {
   buildCapabilitySnapshotFromIpc,
   capabilityOptionState,
@@ -406,6 +411,14 @@ export function CustomTestPage() {
       return selectedDecoder === "videotoolbox"
         ? "VideoToolbox 解码当前为实验路径，需显式启用后才可测试。"
         : "当前平台未暴露所选解码能力。";
+    }
+    if (
+      selectedDecoder === "videotoolbox" &&
+      !decoderCapabilityAvailableForConfig(capabilities, selectedDecoder, selectedEncoder)
+    ) {
+      return selectedEncoder === "videotoolbox_hevc"
+        ? "当前环境未暴露 VideoToolbox HEVC 解码能力。"
+        : "当前环境未暴露 VideoToolbox H.264 解码能力。";
     }
     if (!isRendererAvailable) {
       return "当前平台未暴露所选渲染能力。";

@@ -78,6 +78,30 @@ export function chooseCapability<T extends string>(
   return candidates[0] as T;
 }
 
+export function decoderCapabilityAvailableForConfig(
+  capabilities: EnvironmentSnapshot | null,
+  decoderId: string | null | undefined,
+  encoderId?: string | null,
+  fallback = false
+): boolean {
+  if (!decoderId || decoderId === "none") return true;
+  if (decoderId !== "videotoolbox") {
+    return capabilityAvailable(capabilities, "available_decoders", decoderId, fallback);
+  }
+  return videoToolboxDecoderAvailableForEncoder(capabilities, encoderId, fallback);
+}
+
+export function videoToolboxDecoderAvailableForEncoder(
+  capabilities: EnvironmentSnapshot | null,
+  encoderId?: string | null,
+  fallback = false
+): boolean {
+  if (encoderId === "videotoolbox_hevc" || encoderId === "hevc") {
+    return capabilityAvailable(capabilities, "available_decoders", "videotoolbox_hevc", fallback);
+  }
+  return capabilityAvailable(capabilities, "available_decoders", "videotoolbox_h264", fallback);
+}
+
 function capabilityAliases(key: CapabilityKey, id: string): string[] {
   if (key === "available_decoders" && id === "videotoolbox") {
     return [
@@ -86,6 +110,22 @@ function capabilityAliases(key: CapabilityKey, id: string): string[] {
       "videotoolbox_hevc",
       "decode.videotoolbox_h264",
       "decode.videotoolbox_hevc",
+    ];
+  }
+  if (key === "available_decoders" && id === "videotoolbox_h264") {
+    return [
+      "videotoolbox_h264",
+      "decode.videotoolbox_h264",
+      "videotoolbox",
+      "decode.videotoolbox",
+    ];
+  }
+  if (key === "available_decoders" && id === "videotoolbox_hevc") {
+    return [
+      "videotoolbox_hevc",
+      "decode.videotoolbox_hevc",
+      "videotoolbox",
+      "decode.videotoolbox",
     ];
   }
   return [id];

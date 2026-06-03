@@ -145,4 +145,44 @@ describe("CustomTestPage platform capabilities", () => {
     expect(webrtc).toBeEnabled();
     expect(screen.queryByText("HEVC 未接入")).not.toBeInTheDocument();
   });
+
+  it("blocks VideoToolbox HEVC custom runs without HEVC decode capability", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve({
+          os_type: "macos",
+          cpu_brand: "test",
+          cpu_cores: 12,
+          memory_gb: 32,
+          gpu_info: "Apple",
+          available_captures: ["macos", "synthetic"],
+          available_encoders: ["videotoolbox_h264", "videotoolbox_hevc", "openh264"],
+          available_decoders: ["videotoolbox_h264", "software", "none"],
+          available_renderers: ["macos", "none"],
+          available_memory_modes: ["cpu"],
+        });
+      }
+      if (command === "test_start_run") return Promise.resolve("run-should-not-start");
+      return Promise.resolve(null);
+    });
+
+    render(
+      <MemoryRouter>
+        <CustomTestPage />
+      </MemoryRouter>
+    );
+
+    const encoder = await screen.findByRole("radio", { name: /VideoToolbox HEVC/ });
+    fireEvent.click(encoder);
+    const decoder = screen
+      .getAllByRole("radio")
+      .find((radio) => (radio as HTMLInputElement).value === "videotoolbox");
+    expect(decoder).toBeDefined();
+    fireEvent.click(decoder!);
+
+    expect(screen.getByRole("button", { name: /启动测试/ })).toBeDisabled();
+    expect(screen.getByText("当前环境未暴露 VideoToolbox HEVC 解码能力。")).toBeInTheDocument();
+    expect(mockInvoke).not.toHaveBeenCalledWith("test_start_run", expect.anything());
+  });
 });

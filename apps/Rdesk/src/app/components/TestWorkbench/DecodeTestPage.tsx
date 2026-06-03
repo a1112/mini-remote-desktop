@@ -2,7 +2,13 @@ import { useEffect, useState, type ReactNode } from "react";
 import { Play, Square, Cpu, Monitor, Clock, Gauge } from "lucide-react";
 import * as commands from "../../adapters/tauri/commands";
 import type { EnvironmentSnapshot, TestConfig } from "../../adapters/tauri/types";
-import { capabilityAvailable, capabilityTag, chooseCapability, unavailableText } from "./capabilityMeta";
+import {
+  capabilityAvailable,
+  capabilityTag,
+  chooseCapability,
+  decoderCapabilityAvailableForConfig,
+  unavailableText,
+} from "./capabilityMeta";
 import {
   buildCapabilitySnapshotFromIpc,
   capabilityForOption,
@@ -208,7 +214,7 @@ function hasCapability(
   value: string
 ): boolean {
   if (!capabilities) return false;
-  return capabilities[key]?.includes(value) ?? false;
+  return capabilityAvailable(capabilities, key, value);
 }
 
 function buildDecodeRun(
@@ -334,7 +340,14 @@ function missingChainCapability(
   if (config.encoder_type && !hasCapability(capabilities, "available_encoders", config.encoder_type)) {
     return config.encoder_type;
   }
-  if (config.decoder_type && !hasCapability(capabilities, "available_decoders", config.decoder_type)) {
+  if (
+    config.decoder_type &&
+    !decoderCapabilityAvailableForConfig(
+      capabilities,
+      config.decoder_type,
+      config.encoder_type
+    )
+  ) {
     return config.decoder_type;
   }
   if (config.renderer_type && !hasCapability(capabilities, "available_renderers", config.renderer_type)) {

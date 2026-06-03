@@ -202,7 +202,7 @@ describe("DecodeTestPage backend contract", () => {
           gpu_info: "Apple",
           available_captures: ["macos", "synthetic"],
           available_encoders: ["videotoolbox_h264", "videotoolbox_hevc", "openh264"],
-          available_decoders: ["videotoolbox", "software"],
+          available_decoders: ["videotoolbox_hevc", "software"],
           available_renderers: ["macos"],
           available_memory_modes: ["cpu"],
         });
@@ -234,6 +234,41 @@ describe("DecodeTestPage backend contract", () => {
         })
       );
     });
+  });
+
+  it("does not start VideoToolbox HEVC decode when only H.264 decode is available", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve({
+          os_type: "macos",
+          cpu_brand: "test",
+          cpu_cores: 12,
+          memory_gb: 32,
+          gpu_info: "Apple",
+          available_captures: ["macos", "synthetic"],
+          available_encoders: ["videotoolbox_h264", "videotoolbox_hevc", "openh264"],
+          available_decoders: ["videotoolbox_h264", "software"],
+          available_renderers: ["macos"],
+          available_memory_modes: ["cpu"],
+        });
+      }
+      if (command === "test_start_run") return Promise.resolve("run-should-not-start");
+      return Promise.resolve(null);
+    });
+
+    render(<DecodeTestPage />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /^选择解码器 VideoToolbox$/ }));
+    const hevcButton = screen.getByText("HEVC").closest("button");
+    expect(hevcButton).not.toBeNull();
+    fireEvent.click(hevcButton!);
+
+    expect(screen.getByRole("button", { name: /启动测试/ })).toBeDisabled();
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      "test_start_run",
+      expect.anything()
+    );
   });
 
   it("starts NVDEC with an explicit 2K 144Hz decode profile", async () => {
