@@ -263,9 +263,8 @@ export async function launchRemoteApplicationForDevice(
   let windowResult: Awaited<ReturnType<typeof openRemoteDisplayWindow>>;
   try {
     captureSourceSelection = await selectRemoteCaptureSource(sessionId, sourceId);
-    const requestedProfile = usingExistingSession
-      ? options?.requestedProfile
-      : options?.requestedProfile ?? defaultRemoteMediaProfileForTarget(options?.targetOs);
+    const requestedProfile =
+      options?.requestedProfile ?? defaultRemoteMediaProfileForTarget(options?.targetOs);
     const windowParams: Parameters<typeof openRemoteDisplayWindow>[0] = { sessionId };
     if (requestedProfile) {
       windowParams.requestedProfile = requestedProfile;

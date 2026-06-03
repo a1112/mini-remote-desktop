@@ -288,7 +288,33 @@ describe("launchRemoteDisplayForDevice", () => {
     );
     expect(mocks.openRemoteDisplayWindow).toHaveBeenCalledWith({
       sessionId: "remote-app-session",
+      requestedProfile: DEFAULT_HEVC_1080P60_PROFILE,
     });
     expect(result.sessionId).toBe("remote-app-session");
+  });
+
+  it("keeps the macOS VideoToolbox profile when opening an app from an existing catalog session", async () => {
+    const result = await launchRemoteApplicationForDevice(
+      "remote-mac",
+      "macos:window:0x1234",
+      {
+        sessionId: "remote-mac-app-session",
+        sessionAlreadyStarted: true,
+        transportKind: "quic",
+        targetOs: "macOS Sonoma",
+        lanP2P: true,
+      }
+    );
+
+    expect(mocks.startLanRemoteSession).not.toHaveBeenCalled();
+    expect(mocks.selectRemoteCaptureSource).toHaveBeenCalledWith(
+      "remote-mac-app-session",
+      "macos:window:0x1234"
+    );
+    expect(mocks.openRemoteDisplayWindow).toHaveBeenCalledWith({
+      sessionId: "remote-mac-app-session",
+      requestedProfile: MACOS_HEVC_2K144_PROFILE,
+    });
+    expect(result.sessionId).toBe("remote-mac-app-session");
   });
 });
