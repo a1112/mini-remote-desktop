@@ -1290,7 +1290,13 @@ pub async fn request_lan_remote_session(
         .peer_media_capabilities(target_device_id)
         .await
         .with_context(|| format!("LAN peer not found: {}", target_device_id.0))?;
-    ensure_peer_supports_requested_media(target_device_id, transport_kind, &peer_transports)?;
+    ensure_peer_supports_requested_media(
+        target_device_id,
+        transport_kind,
+        &peer_transports,
+        requested_profile.as_ref(),
+        &peer_media_capabilities,
+    )?;
 
     let (source_device_id, source_device_name) = {
         let devices = app_state.devices.lock().await;
@@ -1417,7 +1423,18 @@ pub async fn request_lan_media_profile_update(
         .peer_transports(&peer_device_id)
         .await
         .with_context(|| format!("LAN peer not found: {}", peer_device_id.0))?;
-    ensure_peer_supports_requested_media(&peer_device_id, "quic", &peer_transports)?;
+    let peer_media_capabilities = app_state
+        .lan_discovery
+        .peer_media_capabilities(&peer_device_id)
+        .await
+        .with_context(|| format!("LAN peer not found: {}", peer_device_id.0))?;
+    ensure_peer_supports_requested_media(
+        &peer_device_id,
+        "quic",
+        &peer_transports,
+        Some(&requested_profile),
+        &peer_media_capabilities,
+    )?;
 
     let source_device_id = {
         let devices = app_state.devices.lock().await;
@@ -3268,6 +3285,8 @@ fn ensure_peer_supports_requested_media(
     target_device_id: &DeviceId,
     transport_kind: &str,
     peer_transports: &[String],
+    requested_profile: Option<&MediaProfile>,
+    peer_media_capabilities: &[String],
 ) -> Result<()> {
     let transport = normalize_transport_kind(transport_kind);
     if transport == "quic" {
@@ -3294,8 +3313,93 @@ fn ensure_peer_supports_requested_media(
                 format_peer_transports(peer_transports)
             );
         }
+        let profile = requested_profile
+            .cloned()
+            .unwrap_or_else(default_media_profile);
+        let missing_capabilities =
+            missing_profile_media_capabilities(&profile, peer_media_capabilities);
+        if !missing_capabilities.is_empty() {
+            anyhow::bail!(
+                "LAN peer does not advertise required media capabilities for {} [{}]: {} supports {}. Rebuild and restart the peer mrd-service/Rdesk from the latest main branch",
+                format_media_profile(&profile),
+                missing_capabilities.join(", "),
+                target_device_id.0,
+                format_peer_capabilities(peer_media_capabilities)
+            );
+        }
     }
     Ok(())
+}
+
+fn missing_profile_media_capabilities(
+    profile: &MediaProfile,
+    peer_media_capabilities: &[String],
+) -> Vec<String> {
+    match LanAccessUnitCodec::from_profile(profile) {
+        LanAccessUnitCodec::H264 => missing_capability_groups(
+            peer_media_capabilities,
+            &[(
+                "h264 encoder",
+                &[
+                    "encode.nvenc_h264",
+                    "nvenc_h264",
+                    "encode.videotoolbox_h264",
+                    "videotoolbox_h264",
+                    "encode.openh264",
+                    "openh264_fallback",
+                    "openh264",
+                ],
+            )],
+        ),
+        LanAccessUnitCodec::Hevc => missing_capability_groups(
+            peer_media_capabilities,
+            &[
+                (
+                    "hevc encoder",
+                    &[
+                        "encode.nvenc_hevc",
+                        "nvenc_hevc",
+                        "encode.videotoolbox_hevc",
+                        "videotoolbox_hevc",
+                    ],
+                ),
+                (
+                    LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY,
+                    &[LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY],
+                ),
+            ],
+        ),
+    }
+}
+
+fn missing_capability_groups(
+    peer_media_capabilities: &[String],
+    groups: &[(&'static str, &'static [&'static str])],
+) -> Vec<String> {
+    groups
+        .iter()
+        .filter(|(_, aliases)| {
+            !aliases.iter().any(|alias| {
+                peer_media_capabilities
+                    .iter()
+                    .any(|capability| capability.eq_ignore_ascii_case(alias))
+            })
+        })
+        .map(|(label, aliases)| {
+            if aliases.len() == 1 && aliases[0] == *label {
+                (*label).to_string()
+            } else {
+                format!("{label} ({})", aliases.join(" | "))
+            }
+        })
+        .collect()
+}
+
+fn format_media_profile(profile: &MediaProfile) -> String {
+    format!(
+        "{}x{} @ {} FPS / {} Mbps / {}",
+        profile.width, profile.height, profile.fps, profile.bitrate_mbps, profile.codec
+    )
 }
 
 async fn peer_control_addr_with_capture_source_capability(
@@ -3410,6 +3514,14 @@ fn format_peer_transports(peer_transports: &[String]) -> String {
         "none".to_string()
     } else {
         peer_transports.join(", ")
+    }
+}
+
+fn format_peer_capabilities(peer_media_capabilities: &[String]) -> String {
+    if peer_media_capabilities.is_empty() {
+        "none".to_string()
+    } else {
+        peer_media_capabilities.join(", ")
     }
 }
 
@@ -11856,6 +11968,52 @@ mod tests {
     }
 
     #[test]
+    fn requested_hevc_profile_requires_peer_hevc_media_capabilities() {
+        let error = ensure_peer_supports_requested_media(
+            &DeviceId("mac-target".to_string()),
+            "quic",
+            &test_required_lan_media_transports(),
+            Some(&MediaProfile {
+                width: 2560,
+                height: 1440,
+                fps: 144,
+                bitrate_mbps: 40,
+                codec: "hevc".to_string(),
+                ..MediaProfile::default()
+            }),
+            &["videotoolbox_h264".to_string()],
+        )
+        .expect_err("HEVC request should require HEVC encoder and media profile caps");
+
+        let message = error.to_string();
+        assert!(message.contains("hevc encoder"));
+        assert!(message.contains(LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY));
+        assert!(message.contains("mac-target"));
+    }
+
+    #[test]
+    fn requested_hevc_profile_accepts_macos_videotoolbox_capabilities() {
+        ensure_peer_supports_requested_media(
+            &DeviceId("mac-target".to_string()),
+            "quic",
+            &test_required_lan_media_transports(),
+            Some(&MediaProfile {
+                width: 2560,
+                height: 1440,
+                fps: 144,
+                bitrate_mbps: 40,
+                codec: "HEVC".to_string(),
+                ..MediaProfile::default()
+            }),
+            &[
+                "videotoolbox_hevc".to_string(),
+                LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY.to_string(),
+            ],
+        )
+        .expect("macOS VideoToolbox HEVC peer should pass HEVC request preflight");
+    }
+
+    #[test]
     fn lan_media_reassembler_config_allows_decode_backpressure() {
         let config = lan_media_reassembler_config();
 
@@ -12023,6 +12181,15 @@ mod tests {
 
     fn frame_ids(frames: &[QuicAuFrame]) -> Vec<u32> {
         frames.iter().map(|frame| frame.frame_id).collect()
+    }
+
+    fn test_required_lan_media_transports() -> Vec<String> {
+        vec![
+            LAN_QUIC_MEDIA_TRANSPORT.to_string(),
+            LAN_QUIC_MEDIA_PROFILE_TRANSPORT.to_string(),
+            LAN_QUIC_MEDIA_V2_TRANSPORT.to_string(),
+            LAN_MEDIA_PROFILE_CONTROL_TRANSPORT.to_string(),
+        ]
     }
 
     fn test_quic_media_frame(frame_id: u32, is_keyframe: bool) -> QuicMediaFrame {
