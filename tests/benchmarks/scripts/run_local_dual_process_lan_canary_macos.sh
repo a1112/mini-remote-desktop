@@ -1467,6 +1467,20 @@ if render_display:
     thresholds = report.get("thresholds") or {}
     min_decoded_frames = thresholds.get("minDecodedFrames")
     min_fps = thresholds.get("minFps")
+    min_render_fps = thresholds.get("minRenderFps")
+    requested_profile = report.get("requestedProfile") or {}
+    profile_fps = requested_profile.get("fps")
+    if not isinstance(min_render_fps, (int, float)):
+        min_render_fps = min_fps
+    if isinstance(profile_fps, (int, float)) and profile_fps >= 120:
+        high_refresh_min_render_fps = profile_fps * 0.8
+        if not isinstance(min_render_fps, (int, float)):
+            min_render_fps = high_refresh_min_render_fps
+        else:
+            min_render_fps = max(min_render_fps, high_refresh_min_render_fps)
+    if isinstance(min_render_fps, (int, float)) and min_render_fps > 0:
+        thresholds["minRenderFps"] = min_render_fps
+        report["thresholds"] = thresholds
     render_fps = report.get("sampleObservedRenderFpsAtTargetDuration")
     if not isinstance(render_fps, (int, float)):
         render_fps = report.get("sampleObservedRenderFps")
@@ -1477,11 +1491,11 @@ if render_display:
                 f"native render-presented sample {presented_value:.0f}/"
                 f"{min_decoded_frames:.0f} frames below threshold"
             )
-    if isinstance(min_fps, (int, float)) and min_fps > 0:
-        if not isinstance(render_fps, (int, float)) or render_fps < min_fps:
+    if isinstance(min_render_fps, (int, float)) and min_render_fps > 0:
+        if not isinstance(render_fps, (int, float)) or render_fps < min_render_fps:
             render_fps_value = render_fps if isinstance(render_fps, (int, float)) else 0
             failures.append(
-                f"native render FPS {render_fps_value:.1f}/{min_fps:.1f} below threshold"
+                f"native render FPS {render_fps_value:.1f}/{min_render_fps:.1f} below threshold"
             )
     render_present_skips = report.get("sampleRenderPresentSkips")
     if not isinstance(render_present_skips, (int, float)):
