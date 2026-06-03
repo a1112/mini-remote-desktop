@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { getMockInvoke } from "../../../test/mocks/tauri";
-import { TransportTestPage } from "./TransportTestPage";
+import { TransportTestPage, crossDeviceConfigForPeer } from "./TransportTestPage";
 
 describe("TransportTestPage execution targets", () => {
   function capabilityItem(id: string, domain: string, status: string, reason?: string) {
@@ -121,6 +121,106 @@ describe("TransportTestPage execution targets", () => {
           }),
         })
       );
+    });
+  });
+
+  it("uses the local macOS VideoToolbox HEVC transport chain when available", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve({
+          os_type: "macos",
+          cpu_brand: "",
+          cpu_cores: 8,
+          memory_gb: 32,
+          gpu_info: "Apple",
+          available_captures: ["macos", "synthetic"],
+          available_encoders: ["videotoolbox_hevc", "videotoolbox_h264", "openh264"],
+          available_decoders: ["videotoolbox", "software", "none"],
+          available_renderers: ["none", "macos"],
+          available_memory_modes: ["cpu"],
+        });
+      }
+      if (command === "ipc_capability_snapshot") return Promise.resolve(null);
+      if (command === "test_start_run") return Promise.resolve("run-macos-hevc");
+      return Promise.resolve(null);
+    });
+
+    render(<TransportTestPage />);
+
+    await screen.findByRole("button", { name: /QUIC/ });
+    fireEvent.click(screen.getByRole("button", { name: "启动测试" }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_start_run",
+        expect.objectContaining({
+          config: expect.objectContaining({
+            capture_type: "macos",
+            encoder_type: "videotoolbox_hevc",
+            decoder_type: "videotoolbox",
+            bitrate: 20_000_000,
+          }),
+        })
+      );
+    });
+  });
+
+  it("describes macOS cross-device transport records with VideoToolbox HEVC", () => {
+    const peer = {
+      device_id: "mac-agent",
+      device_name: "Mac Agent",
+      device_type: "desktop",
+      ip: "192.168.1.52",
+      discovery_port: 21116,
+      p2p_control_addr: "192.168.1.52:21116",
+      transports: [
+        "quic",
+        "quic_datagram",
+        "quic_datagram_2k144",
+        "quic_datagram_media_v3",
+        "media_profile_control_v1",
+      ],
+      protocol_version: 1,
+      media_protocol_version: 3,
+      media_capabilities: [
+        "macos_capture",
+        "videotoolbox_hevc",
+        "videotoolbox",
+        "media.hevc_main_420_8bit",
+        "macos_native_render",
+      ],
+      age_ms: 40,
+      p2p_available: true,
+    };
+
+    expect(
+      crossDeviceConfigForPeer(
+        peer,
+        {
+          width: 1280,
+          height: 720,
+          fps: 30,
+          bitrate_mbps: 20,
+          codec: "hevc",
+          codec_profile: "main",
+          bit_depth: 8,
+          chroma_subsampling: "4:2:0",
+          pixel_format: "nv12",
+          hdr_enabled: false,
+        },
+        "quic"
+      )
+    ).toMatchObject({
+      capture_type: "macos",
+      encoder_type: "videotoolbox_hevc",
+      decoder_type: "videotoolbox",
+      renderer_type: "macos",
+      zero_copy: false,
+      transport_kind: "quic",
+      resolution: [1280, 720],
+      fps: 30,
+      bitrate: 20_000_000,
     });
   });
 

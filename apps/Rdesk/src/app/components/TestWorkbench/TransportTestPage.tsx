@@ -263,20 +263,11 @@ export function TransportTestPage() {
 
       setIsRunning(true);
       const requestedProfile = mediaProfileForTestProfile(testProfile);
-      const crossDeviceConfig: TestConfig = {
-        capture_type: "dxgi",
-        encoder_type: requestedProfile.codec === "hevc" ? "nvenc_hevc" : "nvenc_h264",
-        decoder_type: "nvdec",
-        renderer_type: "d3d11",
-        render_display: true,
-        zero_copy: true,
-        transport_kind: selectedTransport,
-        resolution: [requestedProfile.width, requestedProfile.height],
-        fps: requestedProfile.fps,
-        bitrate: requestedProfile.bitrate_mbps * 1_000_000,
-        duration_ms: 15_000,
-        warmup_ms: 500,
-      };
+      const crossDeviceConfig = crossDeviceConfigForPeer(
+        selectedPeer,
+        requestedProfile,
+        selectedTransport
+      );
       const report = await runLanE2EAutomation(lanAutomationCommands, {
         scenarioId: "cross.e2e.remote_display_smoke",
         targetDeviceId: selectedPeer.device_id,
@@ -313,8 +304,9 @@ export function TransportTestPage() {
       return;
     }
 
+    const hostOs = normalizeHostOs(capabilities?.os_type);
     const capture = chooseCapability(
-      ["synthetic", "macos", "linux", "dxgi"],
+      captureCandidatesForHost(hostOs),
       capabilities,
       "available_captures",
       "synthetic"
@@ -350,7 +342,10 @@ export function TransportTestPage() {
       transport_kind: selectedTransport,
       resolution: [1280, 720],
       fps: testProfile === "throughput" ? 60 : 30,
-      bitrate: encoder === "nvenc_hevc" ? 20_000_000 : testProfile === "throughput" ? 20_000_000 : 5_000_000,
+      bitrate:
+        isHevcEncoder(encoder) || testProfile === "throughput"
+          ? 20_000_000
+          : 5_000_000,
       duration_ms: 10_000,
       warmup_ms: 500,
       input_source: capture === "synthetic" ? "synthetic" : "screen",
@@ -735,6 +730,91 @@ function mediaProfileForTestProfile(testProfile: TestProfile): MediaProfile {
     chroma_subsampling: "4:2:0",
     pixel_format: "nv12",
     hdr_enabled: false,
+  };
+}
+
+function normalizeHostOs(osType?: string): "windows" | "macos" | "linux" | "other" {
+  const normalized = osType?.toLowerCase() ?? "";
+  if (normalized.includes("windows") || normalized === "win32") return "windows";
+  if (normalized.includes("mac") || normalized === "darwin") return "macos";
+  if (normalized.includes("linux")) return "linux";
+  return "other";
+}
+
+function captureCandidatesForHost(
+  hostOs: ReturnType<typeof normalizeHostOs>
+): NonNullable<TestConfig["capture_type"]>[] {
+  if (hostOs === "macos") return ["macos", "synthetic", "linux", "dxgi"];
+  if (hostOs === "linux") return ["linux", "synthetic", "macos", "dxgi"];
+  return ["synthetic", "dxgi", "macos", "linux"];
+}
+
+function isHevcEncoder(encoder?: TestConfig["encoder_type"]): boolean {
+  return encoder === "nvenc_hevc" || encoder === "videotoolbox_hevc";
+}
+
+function peerHasMediaCapabilities(peer: LanPeerInfo, capabilityGroups: string[][]): boolean {
+  const mediaCapabilities = (peer.media_capabilities ?? []).map((capability) =>
+    capability.toLowerCase()
+  );
+  return capabilityGroups.every((aliases) =>
+    aliases.some((capability) => mediaCapabilities.includes(capability))
+  );
+}
+
+function peerSupportsMacosVideoToolboxProfile(
+  peer: LanPeerInfo,
+  requestedProfile: MediaProfile
+): boolean {
+  const codec = requestedProfile.codec?.toLowerCase() ?? "h264";
+  const codecEncoder =
+    codec === "hevc"
+      ? ["videotoolbox_hevc", "encode.videotoolbox_hevc"]
+      : ["videotoolbox_h264", "encode.videotoolbox_h264"];
+  const capabilityGroups = [
+    ["macos_capture", "capture.macos"],
+    codecEncoder,
+    ["videotoolbox", "decode.videotoolbox"],
+    ["macos_native_render", "render.macos"],
+  ];
+  if (codec === "hevc") {
+    capabilityGroups.push(["media.hevc_main_420_8bit"]);
+  }
+  return peerHasMediaCapabilities(peer, capabilityGroups);
+}
+
+export function crossDeviceConfigForPeer(
+  peer: LanPeerInfo,
+  requestedProfile: MediaProfile,
+  transportKind: TransportType
+): TestConfig {
+  const codec = requestedProfile.codec?.toLowerCase() ?? "h264";
+  const common = {
+    render_display: true,
+    transport_kind: transportKind,
+    resolution: [requestedProfile.width, requestedProfile.height] as [number, number],
+    fps: requestedProfile.fps,
+    bitrate: requestedProfile.bitrate_mbps * 1_000_000,
+    duration_ms: 15_000,
+    warmup_ms: 500,
+  };
+  if (peerSupportsMacosVideoToolboxProfile(peer, requestedProfile)) {
+    return {
+      ...common,
+      capture_type: "macos",
+      encoder_type: codec === "hevc" ? "videotoolbox_hevc" : "videotoolbox_h264",
+      decoder_type: "videotoolbox",
+      renderer_type: "macos",
+      zero_copy: false,
+    };
+  }
+  return {
+    ...common,
+    capture_type: "dxgi",
+    encoder_type: codec === "hevc" ? "nvenc_hevc" : "nvenc_h264",
+    decoder_type: "nvdec",
+    renderer_type: "d3d11",
+    zero_copy: true,
   };
 }
 
