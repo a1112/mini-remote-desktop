@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { Monitor } from "lucide-react";
 
-import { type Device, mergeDevices } from "./deviceData";
+import { lanPeerPlatformLabel, type Device, mergeDevices } from "./deviceData";
 
 const device = (overrides: Partial<Device>): Device => ({
   id: "base-id",
@@ -29,6 +29,59 @@ const device = (overrides: Partial<Device>): Device => ({
 });
 
 describe("mergeDevices", () => {
+  it("infers macOS LAN peers from native media capabilities", () => {
+    expect(
+      lanPeerPlatformLabel({
+        device_type: "rdesk",
+        media_capabilities: [
+          "macos_capture",
+          "videotoolbox_hevc",
+          "videotoolbox",
+          "media.hevc_main_420_8bit",
+          "macos_native_render",
+        ],
+      })
+    ).toBe("macOS");
+  });
+
+  it("prefers P2P platform labels over stale server OS labels", () => {
+    const merged = mergeDevices(
+      [
+        device({
+          id: "server-id",
+          deviceId: "peer-device",
+          os: "Windows",
+          discoverySources: ["server"],
+          primarySource: "server",
+          sourceLabel: "服务器",
+          isLocal: false,
+          serverAvailable: true,
+        }),
+      ],
+      [
+        device({
+          id: "peer-device",
+          deviceId: "peer-device",
+          os: "macOS / quic_datagram",
+          discoverySources: ["lan_p2p"],
+          primarySource: "lan_p2p",
+          sourceLabel: "P2P 局域网",
+          isLocal: false,
+          p2pAvailable: true,
+          serverAvailable: false,
+        }),
+      ],
+      null
+    );
+
+    expect(merged[0]).toMatchObject({
+      os: "macOS / quic_datagram",
+      primarySource: "lan_p2p",
+      p2pAvailable: true,
+      serverAvailable: true,
+    });
+  });
+
   it("keeps the computer hostname for the local device instead of a server display name", () => {
     const merged = mergeDevices(
       [

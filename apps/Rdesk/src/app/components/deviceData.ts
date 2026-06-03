@@ -135,6 +135,53 @@ const formatLanLastSeen = (ageMs: number) => {
 
 const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
 
+export function lanPeerPlatformLabel(
+  peer: Pick<LanPeerInfo, "device_type" | "media_capabilities">
+): string {
+  const mediaCapabilities = (peer.media_capabilities ?? []).map((capability) =>
+    capability.toLowerCase()
+  );
+  const hasAny = (aliases: string[]) =>
+    aliases.some((capability) => mediaCapabilities.includes(capability));
+
+  if (
+    hasAny([
+      "macos_capture",
+      "capture.macos",
+      "videotoolbox_hevc",
+      "encode.videotoolbox_hevc",
+      "videotoolbox_h264",
+      "encode.videotoolbox_h264",
+      "macos_native_render",
+      "render.macos",
+    ])
+  ) {
+    return "macOS";
+  }
+
+  if (
+    hasAny([
+      "dxgi_capture",
+      "capture.dxgi",
+      "nvenc_h264",
+      "encode.nvenc_h264",
+      "nvenc_hevc",
+      "encode.nvenc_hevc",
+      "d3d11_native_render",
+      "render.d3d11",
+    ])
+  ) {
+    return "Windows";
+  }
+
+  if (hasAny(["pipewire_capture", "capture.pipewire", "linux_native_render", "render.linux"])) {
+    return "Linux";
+  }
+
+  const deviceType = peer.device_type.trim();
+  return deviceType && deviceType.toLowerCase() !== "rdesk" ? deviceType : "Rdesk LAN";
+}
+
 function mergeLanPeers(peerSets: LanPeerInfo[][]): LanPeerInfo[] {
   const byDeviceId = new Map<string, LanPeerInfo>();
   for (const peers of peerSets) {
@@ -153,7 +200,7 @@ const lanPeerToDevice = (peer: LanPeerInfo): Device =>
     id: peer.device_id,
     name: peer.device_name,
     deviceId: peer.device_id,
-    os: `${peer.device_type || "Rdesk LAN"} / ${peer.transports.join(", ") || "direct"}`,
+    os: `${lanPeerPlatformLabel(peer)} / ${peer.transports.join(", ") || "direct"}`,
     icon: Monitor,
     status: peer.p2p_available ? "online" : "offline",
     location: `P2P ${peer.p2p_control_addr}`,
@@ -228,7 +275,7 @@ function mergeDevice(existing: Device, incoming: Device): Device {
     ...existing,
     id: serverSide?.id ?? localSide?.id ?? p2pSide?.id ?? existing.id,
     name: localSide?.name ?? p2pSide?.name ?? serverSide?.name ?? incoming.name,
-    os: serverSide?.os ?? localSide?.os ?? p2pSide?.os ?? incoming.os,
+    os: localSide?.os ?? p2pSide?.os ?? serverSide?.os ?? incoming.os,
     icon: serverSide?.icon ?? localSide?.icon ?? p2pSide?.icon ?? incoming.icon,
     status,
     location: p2pSide?.location ?? localSide?.location ?? serverSide?.location ?? incoming.location,
