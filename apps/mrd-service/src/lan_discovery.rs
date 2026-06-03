@@ -10609,7 +10609,7 @@ mod tests {
             assert_eq!(
                 peer.media_capabilities
                     .contains(&LAN_DECODE_VIDEOTOOLBOX_CAPABILITY.to_string()),
-                probe.videotoolbox_hevc_decoder
+                probe.videotoolbox_h264_decoder && probe.videotoolbox_hevc_decoder
             );
         }
         assert!(peer
