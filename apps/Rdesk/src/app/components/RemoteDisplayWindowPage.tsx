@@ -1436,6 +1436,52 @@ function bitrateFromSearch(searchParams: URLSearchParams): BitrateKey | null {
   );
 }
 
+function profileCodecFromSearch(searchParams: URLSearchParams): "h264" | "hevc" | null {
+  const value = searchParams.get("codec") ?? searchParams.get("profileCodec");
+  const normalized = value?.trim().toLowerCase();
+  if (!normalized) return null;
+  if (normalized === "hevc" || normalized === "h265" || normalized === "h.265") return "hevc";
+  return "h264";
+}
+
+function profileCodecProfileFromSearch(searchParams: URLSearchParams): string | null {
+  return searchParams.get("codecProfile") ?? searchParams.get("profileCodecProfile");
+}
+
+function profileBitDepthFromSearch(searchParams: URLSearchParams): number | null {
+  const value = searchParams.get("bitDepth") ?? searchParams.get("profileBitDepth");
+  if (!value) return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function encoderForRequestedProfileCodec(
+  codec: "h264" | "hevc",
+  hostOs: HostOs,
+  availableEncoders: readonly string[] | undefined,
+  codecProfile: string | null,
+  bitDepth: number | null
+): EncoderType {
+  const main10 =
+    codec === "hevc" &&
+    (codecProfile?.trim().toLowerCase() === "main10" || bitDepth === 10);
+  const candidates: EncoderType[] =
+    codec === "hevc"
+      ? main10
+        ? ["nvenc_hevc_main10", "nvenc_hevc", "videotoolbox_hevc"]
+        : hostOs === "macos"
+          ? ["videotoolbox_hevc", "nvenc_hevc"]
+          : ["nvenc_hevc", "videotoolbox_hevc"]
+      : hostOs === "macos"
+        ? ["videotoolbox_h264", "nvenc_h264", "openh264"]
+        : hostOs === "windows"
+          ? ["nvenc_h264", "videotoolbox_h264", "openh264"]
+          : ["openh264", "nvenc_h264", "videotoolbox_h264"];
+  const fallback = candidates[0] ?? "openh264";
+  if (!availableEncoders || availableEncoders.length === 0) return fallback;
+  return candidates.find((candidate) => availableEncoders.includes(candidate)) ?? fallback;
+}
+
 function resolutionDimensions(resolution: ResolutionKey): { width: number; height: number } {
   const [width, height] = resolution.split("x").map(Number) as [number, number];
   return { width, height };
@@ -2224,14 +2270,43 @@ export function RemoteDisplayWindowPage() {
   const requestedResolution = useMemo(() => resolutionFromSearch(searchParams), [searchParams]);
   const requestedFps = useMemo(() => fpsFromSearch(searchParams), [searchParams]);
   const requestedBitrate = useMemo(() => bitrateFromSearch(searchParams), [searchParams]);
+  const requestedCodec = useMemo(() => profileCodecFromSearch(searchParams), [searchParams]);
+  const requestedCodecProfile = useMemo(
+    () => profileCodecProfileFromSearch(searchParams),
+    [searchParams]
+  );
+  const requestedBitDepth = useMemo(() => profileBitDepthFromSearch(searchParams), [searchParams]);
+  const requestedEncoder = requestedCodec
+    ? encoderForRequestedProfileCodec(
+        requestedCodec,
+        hostOs,
+        capabilities?.available_encoders,
+        requestedCodecProfile,
+        requestedBitDepth
+      )
+    : null;
   const queryProfileKey = useMemo(
     () =>
-      requestedResolution !== null || requestedFps !== null || requestedBitrate !== null
+      requestedResolution !== null ||
+      requestedFps !== null ||
+      requestedBitrate !== null ||
+      requestedCodec !== null
         ? `${sessionId}:${requestedResolution ?? ""}:${requestedFps ?? ""}:${
             requestedBitrate ?? ""
-          }`
+          }:${requestedCodec ?? ""}:${requestedCodecProfile ?? ""}:${
+            requestedBitDepth ?? ""
+          }:${requestedEncoder ?? ""}`
         : null,
-    [requestedBitrate, requestedFps, requestedResolution, sessionId]
+    [
+      requestedBitDepth,
+      requestedBitrate,
+      requestedCodec,
+      requestedCodecProfile,
+      requestedEncoder,
+      requestedFps,
+      requestedResolution,
+      sessionId,
+    ]
   );
   const queryProfileNeedsApply =
     queryProfileKey !== null && queryProfileAppliedKey !== queryProfileKey;
@@ -5369,13 +5444,18 @@ export function RemoteDisplayWindowPage() {
     if (requestedBitrate !== null && requestedBitrate !== bitrate) {
       setBitrate(requestedBitrate);
     }
+    if (requestedEncoder !== null && requestedEncoder !== encoder) {
+      setEncoder(requestedEncoder);
+    }
     setQueryProfileAppliedKey(queryProfileKey);
   }, [
     bitrate,
+    encoder,
     fps,
     queryProfileAppliedKey,
     queryProfileKey,
     requestedBitrate,
+    requestedEncoder,
     requestedFps,
     requestedResolution,
     resolution,

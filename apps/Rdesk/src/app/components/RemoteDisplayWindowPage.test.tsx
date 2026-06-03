@@ -2756,7 +2756,7 @@ describe("RemoteDisplayWindowPage", () => {
     });
   });
 
-  it("keeps remote macOS profile updates at 2K144 and 40 Mbps from the window URL", async () => {
+  it("keeps remote macOS H.264 profile updates from the window URL", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
       if (command === "test_get_capabilities") {
@@ -2800,12 +2800,12 @@ describe("RemoteDisplayWindowPage", () => {
           frames_decoded: 1,
           frames_dropped: 0,
           current_fps: 144,
-          bitrate_mbps: 40,
+          bitrate_mbps: 80,
           media_probe_valid: true,
           media_probe_width: 2560,
           media_probe_height: 1440,
           media_probe_target_fps: 144,
-          media_probe_target_bitrate_mbps: 40,
+          media_probe_target_bitrate_mbps: 80,
           last_error: null,
         });
       }
@@ -2814,7 +2814,7 @@ describe("RemoteDisplayWindowPage", () => {
 
     renderRemoteDisplay(
       "p2p-quic-mac",
-      "?surface=surface-1&profileWidth=2560&profileHeight=1440&profileFps=144&profileBitrateMbps=40"
+      "?surface=surface-1&profileWidth=2560&profileHeight=1440&profileFps=144&profileBitrateMbps=80&profileCodec=h264"
     );
 
     fireEvent.click(await screen.findByRole("button", { name: "配置" }));
@@ -2827,9 +2827,9 @@ describe("RemoteDisplayWindowPage", () => {
           width: 2560,
           height: 1440,
           fps: 144,
-          bitrate_mbps: 40,
-          codec: "hevc",
-          codec_profile: "main",
+          bitrate_mbps: 80,
+          codec: "h264",
+          codec_profile: "high",
           bit_depth: 8,
           chroma_subsampling: "4:2:0",
           pixel_format: "nv12",
