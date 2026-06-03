@@ -1083,10 +1083,10 @@ impl TestOrchestrator {
         }
         #[cfg(target_os = "macos")]
         {
-            if mrd_codec_videotoolbox::VideoToolboxH264Encoder::new(640, 480, 30).is_ok() {
+            if macos_videotoolbox_h264_encoder_available() {
                 available_encoders.push("videotoolbox_h264".to_string());
             }
-            if mrd_codec_videotoolbox::VideoToolboxHevcEncoder::new(640, 480, 30).is_ok() {
+            if macos_videotoolbox_hevc_encoder_available() {
                 available_encoders.push("videotoolbox_hevc".to_string());
             }
         }
@@ -1106,15 +1106,10 @@ impl TestOrchestrator {
         }
         #[cfg(target_os = "macos")]
         {
-            let decoder_enabled = videotoolbox_decoder_enabled();
-            let h264_decoder_available =
-                decoder_enabled && mrd_codec_videotoolbox::VideoToolboxH264Decoder::new().is_ok();
-            let hevc_decoder_available =
-                decoder_enabled && mrd_codec_videotoolbox::VideoToolboxHevcDecoder::new().is_ok();
             append_macos_videotoolbox_decoder_capabilities(
                 &mut available_decoders,
-                h264_decoder_available,
-                hevc_decoder_available,
+                macos_videotoolbox_h264_decoder_available(),
+                macos_videotoolbox_hevc_decoder_available(),
             );
         }
         #[cfg(target_os = "linux")]
@@ -3199,14 +3194,12 @@ fn scenario_supported_on_current_platform(scenario_id: &str) -> bool {
         | "e2e.local" => cfg!(windows),
         "render.probe" | "render.d3d12" | "render.opengl" => cfg!(windows),
         "single_window.local" => cfg!(windows) || cfg!(target_os = "macos"),
-        "capture.macos"
-        | "encode.videotoolbox_h264"
-        | "encode.videotoolbox_hevc"
-        | "e2e.macos_local" => cfg!(target_os = "macos"),
+        "capture.macos" | "e2e.macos_local" => cfg!(target_os = "macos"),
+        "encode.videotoolbox_h264" => macos_videotoolbox_h264_encoder_available(),
+        "encode.videotoolbox_hevc" => macos_videotoolbox_hevc_encoder_available(),
         "capture.linux" | "decode.linux_h264" | "e2e.linux_local" => cfg!(target_os = "linux"),
-        "decode.videotoolbox_h264" | "decode.videotoolbox_hevc" => {
-            cfg!(target_os = "macos") && videotoolbox_decoder_enabled()
-        }
+        "decode.videotoolbox_h264" => macos_videotoolbox_h264_decoder_available(),
+        "decode.videotoolbox_hevc" => macos_videotoolbox_hevc_decoder_available(),
         "encode.openh264" | "custom" | "matrix" => true,
         _ => true,
     }
@@ -3242,7 +3235,7 @@ fn encoder_supported_on_current_platform(encoder_type: &str) -> bool {
         || matches!(
             encoder_type,
             "videotoolbox_h264" | "videotoolbox_hevc" | "videotoolbox"
-        ) && cfg!(target_os = "macos")
+        ) && macos_videotoolbox_encoder_available(encoder_type)
 }
 
 fn decoder_supported_on_current_platform(decoder_type: &str) -> bool {
@@ -3276,6 +3269,80 @@ fn decoder_supported_on_current_platform(decoder_type: &str) -> bool {
         || matches!(decoder_type, "videotoolbox")
             && cfg!(target_os = "macos")
             && videotoolbox_decoder_enabled()
+}
+
+fn decoder_supported_for_config(decoder_type: &str, encoder_type: Option<&str>) -> bool {
+    if decoder_type == "videotoolbox" {
+        return macos_videotoolbox_decoder_available_for_encoder(encoder_type);
+    }
+    decoder_supported_on_current_platform(decoder_type)
+}
+
+fn macos_videotoolbox_decoder_available_for_encoder(encoder_type: Option<&str>) -> bool {
+    macos_videotoolbox_decoder_available_for_encoder_with(
+        encoder_type,
+        macos_videotoolbox_h264_decoder_available(),
+        macos_videotoolbox_hevc_decoder_available(),
+    )
+}
+
+fn macos_videotoolbox_decoder_available_for_encoder_with(
+    encoder_type: Option<&str>,
+    h264_decoder_available: bool,
+    hevc_decoder_available: bool,
+) -> bool {
+    match encoder_type {
+        Some("videotoolbox_hevc") | Some("hevc") => hevc_decoder_available,
+        _ => h264_decoder_available,
+    }
+}
+
+fn macos_videotoolbox_encoder_available(encoder_type: &str) -> bool {
+    match encoder_type {
+        "videotoolbox_hevc" => macos_videotoolbox_hevc_encoder_available(),
+        "videotoolbox_h264" | "videotoolbox" => macos_videotoolbox_h264_encoder_available(),
+        _ => false,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_videotoolbox_h264_encoder_available() -> bool {
+    mrd_codec_videotoolbox::VideoToolboxH264Encoder::new(640, 480, 30).is_ok()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_videotoolbox_h264_encoder_available() -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn macos_videotoolbox_hevc_encoder_available() -> bool {
+    mrd_codec_videotoolbox::VideoToolboxHevcEncoder::new(640, 480, 30).is_ok()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_videotoolbox_hevc_encoder_available() -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn macos_videotoolbox_h264_decoder_available() -> bool {
+    videotoolbox_decoder_enabled() && mrd_codec_videotoolbox::VideoToolboxH264Decoder::new().is_ok()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_videotoolbox_h264_decoder_available() -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn macos_videotoolbox_hevc_decoder_available() -> bool {
+    videotoolbox_decoder_enabled() && mrd_codec_videotoolbox::VideoToolboxHevcDecoder::new().is_ok()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_videotoolbox_hevc_decoder_available() -> bool {
+    false
 }
 
 fn append_macos_videotoolbox_decoder_capabilities(
@@ -3312,6 +3379,17 @@ fn validate_scenario_for_current_platform(
     }
 
     if !matches!(scenario_id, "custom" | "matrix") {
+        if scenario_id == "e2e.macos_local" {
+            let decoder_type = config.decoder_type.as_deref().unwrap_or("videotoolbox");
+            if !decoder_supported_for_config(decoder_type, config.encoder_type.as_deref()) {
+                anyhow::bail!(
+                    "Decoder type {} is not supported for {} on {}",
+                    decoder_type,
+                    scenario_id,
+                    os_type
+                );
+            }
+        }
         return Ok(());
     }
 
@@ -3337,7 +3415,7 @@ fn validate_scenario_for_current_platform(
     }
 
     let decoder_type = config.decoder_type.as_deref().unwrap_or("software");
-    if !decoder_supported_on_current_platform(decoder_type) {
+    if !decoder_supported_for_config(decoder_type, Some(encoder_type)) {
         anyhow::bail!(
             "Decoder type {} is not supported on {}",
             decoder_type,
@@ -4420,6 +4498,28 @@ mod tests {
     }
 
     #[test]
+    fn macos_videotoolbox_decoder_support_follows_encoder_codec() {
+        assert!(macos_videotoolbox_decoder_available_for_encoder_with(
+            Some("videotoolbox_h264"),
+            true,
+            false
+        ));
+        assert!(macos_videotoolbox_decoder_available_for_encoder_with(
+            None, true, false
+        ));
+        assert!(!macos_videotoolbox_decoder_available_for_encoder_with(
+            Some("videotoolbox_hevc"),
+            true,
+            false
+        ));
+        assert!(macos_videotoolbox_decoder_available_for_encoder_with(
+            Some("videotoolbox_hevc"),
+            false,
+            true
+        ));
+    }
+
+    #[test]
     fn scenario_dispatch_rejects_unsupported_scenarios() {
         let orchestrator = TestOrchestrator::default();
         let error = orchestrator
@@ -4625,12 +4725,30 @@ mod tests {
         assert!(scenarios
             .iter()
             .any(|scenario| scenario.scenario_id == "e2e.macos_local"));
-        assert!(scenarios
-            .iter()
-            .any(|scenario| scenario.scenario_id == "decode.videotoolbox_h264"));
-        assert!(scenarios
-            .iter()
-            .any(|scenario| scenario.scenario_id == "decode.videotoolbox_hevc"));
+        assert_eq!(
+            scenarios
+                .iter()
+                .any(|scenario| scenario.scenario_id == "encode.videotoolbox_h264"),
+            macos_videotoolbox_h264_encoder_available()
+        );
+        assert_eq!(
+            scenarios
+                .iter()
+                .any(|scenario| scenario.scenario_id == "encode.videotoolbox_hevc"),
+            macos_videotoolbox_hevc_encoder_available()
+        );
+        assert_eq!(
+            scenarios
+                .iter()
+                .any(|scenario| scenario.scenario_id == "decode.videotoolbox_h264"),
+            macos_videotoolbox_h264_decoder_available()
+        );
+        assert_eq!(
+            scenarios
+                .iter()
+                .any(|scenario| scenario.scenario_id == "decode.videotoolbox_hevc"),
+            macos_videotoolbox_hevc_decoder_available()
+        );
         assert!(!scenarios
             .iter()
             .any(|scenario| scenario.scenario_id == "capture.dxgi"));
